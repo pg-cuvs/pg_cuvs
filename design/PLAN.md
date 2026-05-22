@@ -59,6 +59,23 @@ Cost_total = Cost_IPC + Cost_GPU_kernel + Cost_CPU_recheck
 
 ## 3단계 로드맵
 
+### 전제조건: GPU 개발 환경 프로비저닝
+
+Phase 1 구현 전 완료해야 하는 인프라 체크포인트.
+
+```bash
+cd infra/terraform
+cp terraform.tfvars.example terraform.tfvars  # project_id 등 입력
+terraform init && terraform apply
+terraform output env_gpu_snippet >> ../../.env.gpu  # .env.gpu 자동 생성
+ssh ubuntu@<ip> "tail -5 /var/log/pg_cuvs_setup.log"  # setup complete 확인
+make sync && make gpu-build  # 첫 빌드 성공 확인
+```
+
+상세 가이드: `.claude/skills/pg-cuvs-dev/SKILL.md`
+
+---
+
 ### Phase 1: Proof of Mechanism (현재)
 
 **목표**: GPU 검색이 실제로 PostgreSQL 쿼리 파이프라인에서 동작함을 증명

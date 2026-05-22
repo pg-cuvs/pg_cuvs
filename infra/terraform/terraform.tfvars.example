@@ -1,0 +1,9 @@
+project_id       = "your-gcp-project-id"
+region           = "asia-northeast3"
+zone             = "asia-northeast3-b"
+instance_name    = "pg-cuvs-dev"
+machine_type     = "g2-standard-4"
+disk_size_gb     = 100
+ssh_user         = "ubuntu"
+ssh_pub_key_path = "~/.ssh/id_rsa.pub"
+preemptible      = false
