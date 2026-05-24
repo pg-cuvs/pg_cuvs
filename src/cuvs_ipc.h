@@ -34,9 +34,10 @@
  * Reply status codes
  * ---------------------------------------------------------------- */
 #define CUVS_STATUS_OK           0
-#define CUVS_STATUS_ERROR        1
+#define CUVS_STATUS_ERROR        1   /* daemon up but operation failed */
 #define CUVS_STATUS_OOM_FALLBACK 2   /* VRAM exhausted → caller must use CPU */
 #define CUVS_STATUS_NOT_FOUND    3   /* index OID not loaded */
+#define CUVS_STATUS_UNAVAILABLE  4   /* daemon unreachable (connect failed) */
 
 /* ----------------------------------------------------------------
  * Command frame (sent over UDS, fixed size)

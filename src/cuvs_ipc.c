@@ -278,11 +278,13 @@ cuvs_ipc_search(
 
     shm_fd = shm_write_query(shm_key, query_vec, dim);
     if (shm_fd < 0)
-        goto cleanup;
+        goto cleanup;       /* rc stays CUVS_STATUS_ERROR — our side issue */
 
     sock = uds_connect(socket_path);
-    if (sock < 0)
+    if (sock < 0) {
+        rc = CUVS_STATUS_UNAVAILABLE;   /* daemon not reachable */
         goto cleanup;
+    }
 
     CuvsCmdFrame cmd = {
         .op        = CUVS_OP_SEARCH,
@@ -378,6 +380,7 @@ cuvs_ipc_build(
     if (sock < 0) {
         fprintf(stderr, "[cuvs_ipc_build] uds_connect FAILED errno=%d (%s)\n",
                 errno, strerror(errno));
+        rc = CUVS_STATUS_UNAVAILABLE;   /* daemon not reachable */
         goto cleanup;
     }
 

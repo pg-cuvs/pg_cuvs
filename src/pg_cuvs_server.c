@@ -116,30 +116,55 @@ tids_file_path(char *out, size_t outlen,
     snprintf(out, outlen, "%s/%u_%u.tids", dir, db_oid, index_oid);
 }
 
+/* Forward decls used by save_index. */
+static int write_tids_atomic(const char *tids_tmp,
+                             int64_t n_vecs, uint32_t dim, uint32_t metric,
+                             const uint64_t *tids);
+static int fsync_path(const char *path);
+
+/* save_index: persist a registry entry to disk atomically.
+ * Same contract as handle_build's persistence path: tmp + rename + fsync.
+ * Returns 0 on success, -1 on any failure (caller must NOT proceed to free
+ * VRAM state, e.g., evict_lru must abort eviction on failure). */
 static int
 save_index(IndexEntry *e)
 {
-    char idx_path[512], tids_path[512];
-    index_file_path(idx_path, sizeof(idx_path), g_index_dir, e->db_oid, e->index_oid);
-    tids_file_path(tids_path, sizeof(tids_path), g_index_dir, e->db_oid, e->index_oid);
+    char idx_final[512],  idx_tmp[576];
+    char tids_final[512], tids_tmp[576];
+    index_file_path(idx_final,  sizeof(idx_final),  g_index_dir, e->db_oid, e->index_oid);
+    tids_file_path(tids_final,  sizeof(tids_final), g_index_dir, e->db_oid, e->index_oid);
+    snprintf(idx_tmp,  sizeof(idx_tmp),  "%s.tmp", idx_final);
+    snprintf(tids_tmp, sizeof(tids_tmp), "%s.tmp", tids_final);
 
-    if (cuvs_cagra_serialize(e->handle, idx_path) != 0)
-    {
-        fprintf(stderr, "pg_cuvs_server: failed to serialize index %u/%u\n",
+    if (write_tids_atomic(tids_tmp, e->n_vecs, e->dim, e->metric, e->tids) != 0)
+        return -1;
+
+    if (cuvs_cagra_serialize(e->handle, idx_tmp) != 0) {
+        fprintf(stderr, "save_index: cuvs_cagra_serialize FAILED for %u/%u\n",
                 e->db_oid, e->index_oid);
+        unlink(tids_tmp);
         return -1;
     }
+    if (fsync_path(idx_tmp) != 0)
+        fprintf(stderr, "save_index: WARN fsync %s failed errno=%d\n", idx_tmp, errno);
 
-    FILE *f = fopen(tids_path, "wb");
-    if (!f)
+    if (rename(tids_tmp, tids_final) != 0) {
+        fprintf(stderr, "save_index: rename %s -> %s FAILED errno=%d (%s)\n",
+                tids_tmp, tids_final, errno, strerror(errno));
+        unlink(tids_tmp);
+        unlink(idx_tmp);
         return -1;
-
-    /* Header: n_vecs + dim + metric */
-    fwrite(&e->n_vecs,  sizeof(int64_t),  1, f);
-    fwrite(&e->dim,     sizeof(uint32_t), 1, f);
-    fwrite(&e->metric,  sizeof(uint32_t), 1, f);
-    fwrite(e->tids, sizeof(uint64_t), (size_t)e->n_vecs, f);
-    fclose(f);
+    }
+    if (rename(idx_tmp, idx_final) != 0) {
+        fprintf(stderr, "save_index: rename %s -> %s FAILED errno=%d (%s); "
+                        "unlinking tids to avoid mismatch\n",
+                idx_tmp, idx_final, errno, strerror(errno));
+        unlink(tids_final);
+        unlink(idx_tmp);
+        return -1;
+    }
+    int dir_fd = open(g_index_dir, O_RDONLY);
+    if (dir_fd >= 0) { fsync(dir_fd); close(dir_fd); }
 
     fprintf(stderr, "pg_cuvs_server: saved index %u/%u (%lld vecs)\n",
             e->db_oid, e->index_oid, (long long)e->n_vecs);
@@ -267,7 +292,9 @@ find_lru_index(void)
     return lru;
 }
 
-/* Evict the LRU index to free VRAM. Returns bytes freed, or 0. */
+/* Evict the LRU index to free VRAM. Returns bytes freed, or 0.
+ * If save_index fails (disk full, permission, cuVS error), abort eviction —
+ * we must not lose VRAM state when we couldn't persist it. */
 static size_t
 evict_lru(void)
 {
@@ -275,7 +302,12 @@ evict_lru(void)
     if (!e)
         return 0;
 
-    save_index(e);
+    if (save_index(e) != 0) {
+        fprintf(stderr, "evict_lru: save_index FAILED for %u/%u; aborting eviction "
+                        "(VRAM still holds index)\n",
+                e->db_oid, e->index_oid);
+        return 0;
+    }
     cuvs_cagra_free(e->handle);
     free(e->tids);
     size_t freed = e->vram_bytes;
@@ -492,13 +524,78 @@ handle_search(int client_fd, const CuvsCmdFrame *cmd)
 }
 
 /* ----------------------------------------------------------------
+ * Atomic tids file write helper.
+ * Writes to <tids_tmp> path, fsyncs, returns 0 on success, -1 on failure.
+ * On failure the tmp file is unlinked.
+ * ---------------------------------------------------------------- */
+static int
+write_tids_atomic(const char *tids_tmp,
+                  int64_t n_vecs, uint32_t dim, uint32_t metric,
+                  const uint64_t *tids)
+{
+    FILE *f = fopen(tids_tmp, "wb");
+    if (!f) {
+        fprintf(stderr, "write_tids_atomic: fopen %s FAILED errno=%d (%s)\n",
+                tids_tmp, errno, strerror(errno));
+        return -1;
+    }
+    int ok = 1;
+    if (fwrite(&n_vecs, sizeof(int64_t),  1, f) != 1) ok = 0;
+    if (fwrite(&dim,    sizeof(uint32_t), 1, f) != 1) ok = 0;
+    if (fwrite(&metric, sizeof(uint32_t), 1, f) != 1) ok = 0;
+    if (fwrite(tids,    sizeof(uint64_t), (size_t)n_vecs, f)
+        != (size_t)n_vecs) ok = 0;
+    if (ok && fsync(fileno(f)) != 0) {
+        fprintf(stderr, "write_tids_atomic: fsync %s FAILED errno=%d\n",
+                tids_tmp, errno);
+        ok = 0;
+    }
+    if (fclose(f) != 0) {
+        fprintf(stderr, "write_tids_atomic: fclose %s FAILED errno=%d\n",
+                tids_tmp, errno);
+        ok = 0;
+    }
+    if (!ok) {
+        unlink(tids_tmp);
+        return -1;
+    }
+    return 0;
+}
+
+/* fsync a file by path (re-opens it RDONLY). Best-effort; returns 0/-1. */
+static int
+fsync_path(const char *path)
+{
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return -1;
+    int rc = fsync(fd);
+    close(fd);
+    return rc;
+}
+
+/* ----------------------------------------------------------------
  * Handle BUILD command
+ *
+ * Atomicity contract (B-1 + B-2 + B-3):
+ *   Either CREATE INDEX succeeds with VRAM + disk both committed, or it
+ *   fails with no state change (existing index, if any, untouched).
+ *
+ * Sequence:
+ *   1. Build new VRAM index (do NOT drop existing yet).
+ *   2. Write tids.tmp atomically (fwrite count + fsync + fclose checked).
+ *   3. Serialize cagra.tmp and fsync.
+ *   4. Atomic rename: tmp -> final.
+ *   5. fsync directory.
+ *   6. Swap registry: free existing, install new.
+ *
+ * Any failure before step 4 → unlink tmps, free new resources, error reply.
+ * Failure between renames is logged; partial state may persist on disk but
+ * registry is rolled back so memory state stays consistent.
  * ---------------------------------------------------------------- */
 static void
 handle_build(int client_fd, const CuvsCmdFrame *cmd)
 {
     DBG("[handle_build] reading index_dir...\n");
-    /* Read index_dir from socket */
     char index_dir[256] = {0};
     if (recv_all(client_fd, index_dir, sizeof(index_dir)) < 0)
     {
@@ -530,24 +627,14 @@ handle_build(int client_fd, const CuvsCmdFrame *cmd)
         return;
     }
 
-    const float    *vecs = (const float *)mem;
-    const uint64_t *tids = (const uint64_t *)((const char *)mem + vec_bytes);
+    const float    *vecs    = (const float *)mem;
+    const uint64_t *tids_in = (const uint64_t *)((const char *)mem + vec_bytes);
 
     pthread_mutex_lock(&g_index_mutex);
 
-    /* Drop existing index for this OID if present */
-    IndexEntry *existing = find_index(cmd->db_oid, cmd->index_oid);
-    if (existing)
-    {
-        cuvs_cagra_free(existing->handle);
-        free(existing->tids);
-        int idx = (int)(existing - g_indexes);
-        for (int i = idx; i < g_n_indexes - 1; i++)
-            g_indexes[i] = g_indexes[i+1];
-        g_n_indexes--;
-    }
-
-    /* VRAM check */
+    /* VRAM accounting: cuvs_cagra_build allocates BEFORE we free the old
+     * index, so peak VRAM = existing + new. Ask for full 'needed' from
+     * ensure_vram regardless of same-OID replacement. */
     size_t needed = estimate_vram_bytes(cmd->n_vecs, (int)cmd->dim);
     if (ensure_vram(needed) < 0)
     {
@@ -562,8 +649,8 @@ handle_build(int client_fd, const CuvsCmdFrame *cmd)
 
     DBG("[handle_build] calling cuvs_cagra_build n_vecs=%lld dim=%u...\n",
             (long long)cmd->n_vecs, cmd->dim);
-    CuvsCagraIndex handle = cuvs_cagra_build(vecs, cmd->n_vecs, (int)cmd->dim);
-    if (!handle)
+    CuvsCagraIndex new_handle = cuvs_cagra_build(vecs, cmd->n_vecs, (int)cmd->dim);
+    if (!new_handle)
     {
         fprintf(stderr, "[handle_build] cuvs_cagra_build returned NULL\n");
         pthread_mutex_unlock(&g_index_mutex);
@@ -573,60 +660,101 @@ handle_build(int client_fd, const CuvsCmdFrame *cmd)
     }
     DBG("[handle_build] cuvs_cagra_build OK\n");
 
-    /* Store TID mapping */
-    uint64_t *my_tids = malloc(tid_bytes);
-    if (!my_tids)
+    uint64_t *new_tids = malloc(tid_bytes);
+    if (!new_tids)
     {
-        cuvs_cagra_free(handle);
+        cuvs_cagra_free(new_handle);
         pthread_mutex_unlock(&g_index_mutex);
         munmap(mem, total);
         send_error(client_fd, "malloc tids failed");
         return;
     }
-    memcpy(my_tids, tids, tid_bytes);
+    memcpy(new_tids, tids_in, tid_bytes);
     munmap(mem, total);
 
-    DBG("[handle_build] storing tids and IndexEntry...\n");
-    if (g_n_indexes >= MAX_INDEXES)
-    {
-        evict_lru();
-    }
-
-    IndexEntry *e = &g_indexes[g_n_indexes++];
-    e->db_oid      = cmd->db_oid;
-    e->index_oid   = cmd->index_oid;
-    e->dim         = cmd->dim;
-    e->metric      = cmd->metric;
-    e->n_vecs      = cmd->n_vecs;
-    e->handle      = handle;
-    e->tids        = my_tids;
-    e->vram_bytes  = needed;
-    e->last_search = time(NULL);
-    e->valid       = 1;
-
-    /* Persist to disk */
+    /* --- Disk persistence: tmp -> rename pattern --- */
     const char *save_dir = (index_dir[0] != '\0') ? index_dir : g_index_dir;
     mkdir(save_dir, 0700);
 
-    char idx_path[512], tids_path[512];
-    index_file_path(idx_path, sizeof(idx_path), save_dir, e->db_oid, e->index_oid);
-    tids_file_path(tids_path, sizeof(tids_path), save_dir, e->db_oid, e->index_oid);
+    char idx_final[512],  idx_tmp[576];
+    char tids_final[512], tids_tmp[576];
+    index_file_path(idx_final,  sizeof(idx_final),  save_dir, cmd->db_oid, cmd->index_oid);
+    tids_file_path(tids_final,  sizeof(tids_final), save_dir, cmd->db_oid, cmd->index_oid);
+    snprintf(idx_tmp,  sizeof(idx_tmp),  "%s.tmp", idx_final);
+    snprintf(tids_tmp, sizeof(tids_tmp), "%s.tmp", tids_final);
 
-    DBG("[handle_build] cuvs_cagra_serialize(%s)...\n", idx_path);
-    int ser_rc = cuvs_cagra_serialize(handle, idx_path);
-    DBG("[handle_build] serialize rc=%d\n", ser_rc);
+    if (write_tids_atomic(tids_tmp, cmd->n_vecs, cmd->dim, cmd->metric, new_tids) != 0)
+        goto persist_fail;
+    DBG("[handle_build] tids.tmp written + fsynced\n");
 
-    FILE *f = fopen(tids_path, "wb");
-    if (f)
-    {
-        fwrite(&e->n_vecs, sizeof(int64_t),  1, f);
-        fwrite(&e->dim,    sizeof(uint32_t), 1, f);
-        fwrite(&e->metric, sizeof(uint32_t), 1, f);
-        fwrite(e->tids, sizeof(uint64_t), (size_t)e->n_vecs, f);
-        fclose(f);
-        DBG("[handle_build] tids written to %s\n", tids_path);
+    DBG("[handle_build] cuvs_cagra_serialize(%s)...\n", idx_tmp);
+    if (cuvs_cagra_serialize(new_handle, idx_tmp) != 0) {
+        fprintf(stderr, "[handle_build] cuvs_cagra_serialize FAILED (path=%s)\n", idx_tmp);
+        goto persist_fail;
+    }
+    if (fsync_path(idx_tmp) != 0)
+        fprintf(stderr, "[handle_build] WARN: fsync %s failed errno=%d\n", idx_tmp, errno);
+    DBG("[handle_build] cagra.tmp written + fsynced\n");
+
+    /* Commit point: atomic renames. tids first, then cagra (the file
+     * startup_load_indexes scans for). If second rename fails, log and
+     * unlink whatever we renamed to leave consistent state. */
+    if (rename(tids_tmp, tids_final) != 0) {
+        fprintf(stderr, "[handle_build] rename %s -> %s FAILED errno=%d (%s)\n",
+                tids_tmp, tids_final, errno, strerror(errno));
+        goto persist_fail;
+    }
+    if (rename(idx_tmp, idx_final) != 0) {
+        fprintf(stderr, "[handle_build] rename %s -> %s FAILED errno=%d (%s); "
+                        "unlinking tids to avoid mismatch\n",
+                idx_tmp, idx_final, errno, strerror(errno));
+        unlink(tids_final);
+        goto persist_fail;
+    }
+    /* fsync directory so the rename(s) are durable. */
+    int dir_fd = open(save_dir, O_RDONLY);
+    if (dir_fd >= 0) { fsync(dir_fd); close(dir_fd); }
+
+    DBG("[handle_build] disk commit OK\n");
+
+    /* --- Swap into registry --- */
+    IndexEntry *existing = find_index(cmd->db_oid, cmd->index_oid);
+    if (existing) {
+        cuvs_cagra_free(existing->handle);
+        free(existing->tids);
+        existing->dim         = cmd->dim;
+        existing->metric      = cmd->metric;
+        existing->n_vecs      = cmd->n_vecs;
+        existing->handle      = new_handle;
+        existing->tids        = new_tids;
+        existing->vram_bytes  = needed;
+        existing->last_search = time(NULL);
+        existing->valid       = 1;
     } else {
-        fprintf(stderr, "[handle_build] fopen tids FAILED errno=%d (%s)\n", errno, strerror(errno));
+        if (g_n_indexes >= MAX_INDEXES)
+            evict_lru();
+        if (g_n_indexes >= MAX_INDEXES) {
+            /* No slot available — roll back disk state and fail. */
+            fprintf(stderr, "[handle_build] registry full; rolling back disk commit\n");
+            unlink(idx_final);
+            unlink(tids_final);
+            cuvs_cagra_free(new_handle);
+            free(new_tids);
+            pthread_mutex_unlock(&g_index_mutex);
+            send_error(client_fd, "index registry full");
+            return;
+        }
+        IndexEntry *e = &g_indexes[g_n_indexes++];
+        e->db_oid      = cmd->db_oid;
+        e->index_oid   = cmd->index_oid;
+        e->dim         = cmd->dim;
+        e->metric      = cmd->metric;
+        e->n_vecs      = cmd->n_vecs;
+        e->handle      = new_handle;
+        e->tids        = new_tids;
+        e->vram_bytes  = needed;
+        e->last_search = time(NULL);
+        e->valid       = 1;
     }
 
     pthread_mutex_unlock(&g_index_mutex);
@@ -635,9 +763,20 @@ handle_build(int client_fd, const CuvsCmdFrame *cmd)
     fprintf(stderr, "pg_cuvs_server: built index %u/%u (%lld vecs, %zu MB VRAM)\n",
             cmd->db_oid, cmd->index_oid, (long long)cmd->n_vecs, needed / (1024*1024));
 
-    CuvsReplyHeader hdr = {0};
-    hdr.status = CUVS_STATUS_OK;
-    send_all(client_fd, &hdr, sizeof(hdr));
+    CuvsReplyHeader hdr_ok = {0};
+    hdr_ok.status = CUVS_STATUS_OK;
+    send_all(client_fd, &hdr_ok, sizeof(hdr_ok));
+    return;
+
+persist_fail:
+    /* Disk persistence failed before commit. Existing entry (if any) remains
+     * intact in registry. Clean up new resources and tmp files. */
+    unlink(idx_tmp);
+    unlink(tids_tmp);
+    cuvs_cagra_free(new_handle);
+    free(new_tids);
+    pthread_mutex_unlock(&g_index_mutex);
+    send_error(client_fd, "disk persistence failed");
 }
 
 /* ----------------------------------------------------------------
@@ -694,12 +833,22 @@ sigterm_handler(int sig)
     fprintf(stderr, "pg_cuvs_server: SIGTERM received, serializing indexes...\n");
 
     pthread_mutex_lock(&g_index_mutex);
+    int saved = 0, failed = 0;
     for (int i = 0; i < g_n_indexes; i++)
     {
-        if (g_indexes[i].valid)
-            save_index(&g_indexes[i]);
+        if (!g_indexes[i].valid)
+            continue;
+        if (save_index(&g_indexes[i]) == 0) {
+            saved++;
+        } else {
+            failed++;
+            fprintf(stderr, "sigterm: save_index FAILED for %u/%u "
+                            "(operator must REINDEX after restart)\n",
+                    g_indexes[i].db_oid, g_indexes[i].index_oid);
+        }
     }
     pthread_mutex_unlock(&g_index_mutex);
+    fprintf(stderr, "sigterm: %d indexes saved, %d failed\n", saved, failed);
 
     if (g_server_fd >= 0)
     {

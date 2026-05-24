@@ -262,11 +262,36 @@ cuvs_ambuild(Relation heapRel, Relation indexRel, IndexInfo *indexInfo)
     free(bs.tids);
 
     if (rc != CUVS_STATUS_OK)
-        ereport(WARNING,
-                (errmsg("pg_cuvs: daemon returned status %d during BUILD; "
-                        "index may not be GPU-accelerated", rc),
-                 errhint("Check pg_cuvs_server is running. "
-                         "Queries will fall back to pgvector HNSW.")));
+    {
+        /* DDL durability contract: CREATE INDEX must produce a durable
+         * index on success. We fail the transaction so the catalog entry
+         * is rolled back and the user knows to retry. */
+        const char *hint;
+        switch (rc)
+        {
+            case CUVS_STATUS_UNAVAILABLE:
+                hint = "pg_cuvs_server is not reachable. Start it and retry "
+                       "CREATE INDEX, or use SET enable_cuvs = off + pgvector "
+                       "HNSW if GPU acceleration is not required.";
+                break;
+            case CUVS_STATUS_OOM_FALLBACK:
+                hint = "GPU VRAM exhausted. Free VRAM (drop other cagra "
+                       "indexes or restart pg_cuvs_server) and retry, or use "
+                       "pgvector HNSW instead.";
+                break;
+            default:
+                hint = "Check pg_cuvs_server journal (journalctl -u "
+                       "pg-cuvs-server) for the underlying error. "
+                       "Common causes: disk full or permission denied on "
+                       "cuvs.index_dir.";
+                break;
+        }
+        ereport(ERROR,
+                (errcode(ERRCODE_INTERNAL_ERROR),
+                 errmsg("pg_cuvs: BUILD failed (status %d); CREATE INDEX "
+                        "aborted to preserve catalog durability", rc),
+                 errhint("%s", hint)));
+    }
 
     return result;
 }
@@ -373,17 +398,34 @@ cuvs_gettuple(IndexScanDesc scan, ScanDirection dir)
 
         if (rc != CUVS_STATUS_OK)
         {
-            /* Record error for circuit breaker */
-            cuvs_circuit_record_error((uint32_t)index_oid,
-                                      cuvs_circuit_breaker_threshold);
+            /* Record error for circuit breaker. UNAVAILABLE is not an
+             * index-specific failure, so don't count it toward the breaker. */
+            if (rc != CUVS_STATUS_UNAVAILABLE)
+                cuvs_circuit_record_error((uint32_t)index_oid,
+                                          cuvs_circuit_breaker_threshold);
 
-            if (rc == CUVS_STATUS_OOM_FALLBACK)
-                ereport(WARNING,
-                        (errmsg("pg_cuvs: VRAM exhausted, falling back to CPU")));
-            else
-                ereport(WARNING,
-                        (errmsg("pg_cuvs: daemon unreachable (status %d), "
-                                "falling back to CPU", rc)));
+            switch (rc)
+            {
+                case CUVS_STATUS_UNAVAILABLE:
+                    ereport(WARNING,
+                            (errmsg("pg_cuvs: pg_cuvs_server unreachable, "
+                                    "falling back to CPU")));
+                    break;
+                case CUVS_STATUS_OOM_FALLBACK:
+                    ereport(WARNING,
+                            (errmsg("pg_cuvs: VRAM exhausted, falling back to CPU")));
+                    break;
+                case CUVS_STATUS_NOT_FOUND:
+                    ereport(WARNING,
+                            (errmsg("pg_cuvs: index not loaded on daemon, "
+                                    "falling back to CPU")));
+                    break;
+                default:
+                    ereport(WARNING,
+                            (errmsg("pg_cuvs: GPU search failed (status %d), "
+                                    "falling back to CPU", rc)));
+                    break;
+            }
             return false;
         }
 
