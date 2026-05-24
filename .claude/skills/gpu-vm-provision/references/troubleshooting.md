@@ -37,7 +37,8 @@
 | systemd `status 209/STDOUT, Permission denied` | [failures/runtime-gotchas.md](failures/runtime-gotchas.md) |
 | Daemon: `shm_open FAILED errno=13 (Permission denied)` | [failures/runtime-gotchas.md](failures/runtime-gotchas.md) |
 | Client: `daemon returned status 1` but daemon log shows success | [failures/runtime-gotchas.md](failures/runtime-gotchas.md) |
-| Daemon: `code=dumped, status=11/SEGV` after `cuvs_cagra_serialize` | [failures/cuvs-serialize-sigsegv.md](failures/cuvs-serialize-sigsegv.md) |
+| Daemon: `code=dumped, status=11/SEGV` after `cuvs_cagra_serialize` | [failures/cuvs-serialize-sigsegv.md](failures/cuvs-serialize-sigsegv.md) (RESOLVED — dataset 라이프타임 버그) |
+| CAGRA search: `RAFT failure ... num_cta_per_query * 32 must be >= topk` | [cuvs-26x-quirks.md](cuvs-26x-quirks.md) - search_params 제약 절 |
 
 ## VM 자체가 망가짐 (catastrophic)
 

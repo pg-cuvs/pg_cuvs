@@ -23,6 +23,13 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+
+/* Compile-time debug logging. Enable via -DPG_CUVS_DEBUG=1 in Makefile or env.
+ * Hot-path traces are off by default; error paths still log unconditionally. */
+#ifndef PG_CUVS_DEBUG
+#define PG_CUVS_DEBUG 0
+#endif
+#define DBG(...) do { if (PG_CUVS_DEBUG) { fprintf(stderr, __VA_ARGS__); } } while (0)
 #include <errno.h>
 #include <signal.h>
 #include <pthread.h>
@@ -229,7 +236,14 @@ startup_load_indexes(void)
     while ((ent = readdir(dir)) != NULL)
     {
         uint32_t db_oid, index_oid;
-        /* Parse filenames of the form "<db_oid>_<index_oid>.cagra" */
+        /* Parse filenames of the form "<db_oid>_<index_oid>.cagra".
+         * sscanf returns conversion count regardless of literal match — must
+         * also verify suffix to avoid double-loading on .tids files. */
+        size_t namelen = strlen(ent->d_name);
+        const char *suffix = ".cagra";
+        size_t suflen = strlen(suffix);
+        if (namelen <= suflen) continue;
+        if (strcmp(ent->d_name + namelen - suflen, suffix) != 0) continue;
         if (sscanf(ent->d_name, "%u_%u.cagra", &db_oid, &index_oid) == 2)
             load_index(db_oid, index_oid);
     }
@@ -419,10 +433,10 @@ handle_search(int client_fd, const CuvsCmdFrame *cmd)
         return;
     }
 
-    fprintf(stderr, "[handle_search] calling cuvs_cagra_search k=%d dim=%u...\n",
-            k, cmd->dim); fflush(stderr);
+    DBG("[handle_search] calling cuvs_cagra_search k=%d dim=%u...\n",
+            k, cmd->dim);
     int ret = cuvs_cagra_search(e->handle, query, (int)cmd->dim, k, raw);
-    fprintf(stderr, "[handle_search] cuvs_cagra_search rc=%d\n", ret); fflush(stderr);
+    DBG("[handle_search] cuvs_cagra_search rc=%d\n", ret);
     munmap(query, vec_bytes);
 
     if (ret != 0)
@@ -483,30 +497,30 @@ handle_search(int client_fd, const CuvsCmdFrame *cmd)
 static void
 handle_build(int client_fd, const CuvsCmdFrame *cmd)
 {
-    fprintf(stderr, "[handle_build] reading index_dir...\n"); fflush(stderr);
+    DBG("[handle_build] reading index_dir...\n");
     /* Read index_dir from socket */
     char index_dir[256] = {0};
     if (recv_all(client_fd, index_dir, sizeof(index_dir)) < 0)
     {
-        fprintf(stderr, "[handle_build] recv index_dir FAILED errno=%d\n", errno); fflush(stderr);
+        DBG("[handle_build] recv index_dir FAILED errno=%d\n", errno);
         send_error(client_fd, "recv index_dir failed");
         return;
     }
-    fprintf(stderr, "[handle_build] got index_dir=%s\n", index_dir); fflush(stderr);
+    DBG("[handle_build] got index_dir=%s\n", index_dir);
 
     size_t vec_bytes = (size_t)cmd->n_vecs * cmd->dim * sizeof(float);
     size_t tid_bytes = (size_t)cmd->n_vecs * sizeof(uint64_t);
     size_t total     = vec_bytes + tid_bytes;
 
-    fprintf(stderr, "[handle_build] shm_open(%s)...\n", cmd->shm_key); fflush(stderr);
+    DBG("[handle_build] shm_open(%s)...\n", cmd->shm_key);
     int shm_fd = shm_open(cmd->shm_key, O_RDONLY, 0);
     if (shm_fd < 0)
     {
-        fprintf(stderr, "[handle_build] shm_open FAILED errno=%d (%s)\n", errno, strerror(errno)); fflush(stderr);
+        DBG("[handle_build] shm_open FAILED errno=%d (%s)\n", errno, strerror(errno));
         send_error(client_fd, "shm_open failed");
         return;
     }
-    fprintf(stderr, "[handle_build] shm_open OK fd=%d\n", shm_fd); fflush(stderr);
+    DBG("[handle_build] shm_open OK fd=%d\n", shm_fd);
 
     void *mem = mmap(NULL, total, PROT_READ, MAP_SHARED, shm_fd, 0);
     close(shm_fd);
@@ -546,18 +560,18 @@ handle_build(int client_fd, const CuvsCmdFrame *cmd)
         return;
     }
 
-    fprintf(stderr, "[handle_build] calling cuvs_cagra_build n_vecs=%lld dim=%u...\n",
-            (long long)cmd->n_vecs, cmd->dim); fflush(stderr);
+    DBG("[handle_build] calling cuvs_cagra_build n_vecs=%lld dim=%u...\n",
+            (long long)cmd->n_vecs, cmd->dim);
     CuvsCagraIndex handle = cuvs_cagra_build(vecs, cmd->n_vecs, (int)cmd->dim);
     if (!handle)
     {
-        fprintf(stderr, "[handle_build] cuvs_cagra_build returned NULL\n"); fflush(stderr);
+        DBG("[handle_build] cuvs_cagra_build returned NULL\n");
         pthread_mutex_unlock(&g_index_mutex);
         munmap(mem, total);
         send_error(client_fd, "cuvs_cagra_build failed");
         return;
     }
-    fprintf(stderr, "[handle_build] cuvs_cagra_build OK\n"); fflush(stderr);
+    DBG("[handle_build] cuvs_cagra_build OK\n");
 
     /* Store TID mapping */
     uint64_t *my_tids = malloc(tid_bytes);
@@ -572,7 +586,7 @@ handle_build(int client_fd, const CuvsCmdFrame *cmd)
     memcpy(my_tids, tids, tid_bytes);
     munmap(mem, total);
 
-    fprintf(stderr, "[handle_build] storing tids and IndexEntry...\n"); fflush(stderr);
+    DBG("[handle_build] storing tids and IndexEntry...\n");
     if (g_n_indexes >= MAX_INDEXES)
     {
         evict_lru();
@@ -598,9 +612,9 @@ handle_build(int client_fd, const CuvsCmdFrame *cmd)
     index_file_path(idx_path, sizeof(idx_path), save_dir, e->db_oid, e->index_oid);
     tids_file_path(tids_path, sizeof(tids_path), save_dir, e->db_oid, e->index_oid);
 
-    fprintf(stderr, "[handle_build] cuvs_cagra_serialize(%s) [include_dataset=false]...\n", idx_path); fflush(stderr);
+    DBG("[handle_build] cuvs_cagra_serialize(%s)...\n", idx_path);
     int ser_rc = cuvs_cagra_serialize(handle, idx_path);
-    fprintf(stderr, "[handle_build] serialize rc=%d\n", ser_rc); fflush(stderr);
+    DBG("[handle_build] serialize rc=%d\n", ser_rc);
 
     FILE *f = fopen(tids_path, "wb");
     if (f)
@@ -610,13 +624,13 @@ handle_build(int client_fd, const CuvsCmdFrame *cmd)
         fwrite(&e->metric, sizeof(uint32_t), 1, f);
         fwrite(e->tids, sizeof(uint64_t), (size_t)e->n_vecs, f);
         fclose(f);
-        fprintf(stderr, "[handle_build] tids written to %s\n", tids_path); fflush(stderr);
+        DBG("[handle_build] tids written to %s\n", tids_path);
     } else {
-        fprintf(stderr, "[handle_build] fopen tids FAILED errno=%d (%s)\n", errno, strerror(errno)); fflush(stderr);
+        DBG("[handle_build] fopen tids FAILED errno=%d (%s)\n", errno, strerror(errno));
     }
 
     pthread_mutex_unlock(&g_index_mutex);
-    fprintf(stderr, "[handle_build] sending OK reply\n"); fflush(stderr);
+    DBG("[handle_build] sending OK reply\n");
 
     fprintf(stderr, "pg_cuvs_server: built index %u/%u (%lld vecs, %zu MB VRAM)\n",
             cmd->db_oid, cmd->index_oid, (long long)cmd->n_vecs, needed / (1024*1024));
@@ -635,7 +649,7 @@ connection_thread(void *arg)
     int client_fd = *(int *)arg;
     free(arg);
 
-    fprintf(stderr, "pg_cuvs_server: client connected (fd=%d)\n", client_fd);
+    DBG("pg_cuvs_server: client connected (fd=%d)\n", client_fd);
     fflush(stderr);
 
     CuvsCmdFrame cmd;
@@ -647,7 +661,7 @@ connection_thread(void *arg)
         return NULL;
     }
 
-    fprintf(stderr, "pg_cuvs_server: received cmd op=%u db=%u idx=%u dim=%u n_vecs=%lld shm=%s\n",
+    DBG("pg_cuvs_server: received cmd op=%u db=%u idx=%u dim=%u n_vecs=%lld shm=%s\n",
             cmd.op, cmd.db_oid, cmd.index_oid, cmd.dim, (long long)cmd.n_vecs, cmd.shm_key);
     fflush(stderr);
 
