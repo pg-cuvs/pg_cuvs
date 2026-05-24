@@ -49,9 +49,25 @@ typedef struct {
  * GUCs
  * ---------------------------------------------------------------- */
 bool  enable_cuvs                 = true;
+bool  cuvs_debug                  = false;
 char *cuvs_socket_path            = NULL;
 char *cuvs_index_dir              = NULL;
 int   cuvs_circuit_breaker_threshold = 3;
+
+/* ----------------------------------------------------------------
+ * Last-search stats (process-local; one slot per backend)
+ *
+ * Populated at the end of cuvs_gettuple on a successful CAGRA search.
+ * Exposed via pg_cuvs_last_search_* SQL functions and (when
+ * cuvs.debug = on) via NOTICE messages that interleave with EXPLAIN
+ * VERBOSE client output.
+ * ---------------------------------------------------------------- */
+static uint32_t cuvs_last_latency_us = 0;
+static int32    cuvs_last_n_results = -1;        /* -1 = no scan yet */
+static int32    cuvs_last_k_requested = 0;
+static Oid      cuvs_last_index_oid = InvalidOid;
+static uint32_t cuvs_last_metric    = 0;
+static int32    cuvs_last_dim       = 0;
 
 void _PG_init(void);
 
@@ -64,6 +80,17 @@ _PG_init(void)
         "When off, pg_cuvs AM routes all queries to pgvector CPU path.",
         &enable_cuvs,
         true,
+        PGC_USERSET,
+        0, NULL, NULL, NULL);
+
+    DefineCustomBoolVariable(
+        "cuvs.debug",
+        "Emit per-search NOTICE messages with daemon latency and metric.",
+        "Pairs with EXPLAIN VERBOSE so the client sees GPU-side stats inline. "
+        "Off by default; rely on pg_cuvs_last_search_* functions for "
+        "scriptable access without log spam.",
+        &cuvs_debug,
+        false,
         PGC_USERSET,
         0, NULL, NULL, NULL);
 
@@ -386,6 +413,7 @@ cuvs_gettuple(IndexScanDesc scan, ScanDirection dir)
                 metric = CUVS_METRIC_IP;
         }
 
+        uint32_t latency_us = 0;
         int rc = cuvs_ipc_search(
             cuvs_socket_path,
             (uint32_t)MyDatabaseId,
@@ -394,7 +422,8 @@ cuvs_gettuple(IndexScanDesc scan, ScanDirection dir)
             dim, k, metric,
             ss->tids,
             ss->distances,
-            &ss->n_results);
+            &ss->n_results,
+            &latency_us);
 
         if (rc != CUVS_STATUS_OK)
         {
@@ -432,6 +461,25 @@ cuvs_gettuple(IndexScanDesc scan, ScanDirection dir)
         /* Successful search — reset consecutive error count */
         cuvs_circuit_record_success((uint32_t)index_oid);
         ss->cur = 0;
+
+        /* Record per-search stats for pg_cuvs_last_search_* and EXPLAIN. */
+        cuvs_last_latency_us   = latency_us;
+        cuvs_last_n_results    = ss->n_results;
+        cuvs_last_k_requested  = k;
+        cuvs_last_index_oid    = index_oid;
+        cuvs_last_metric       = metric;
+        cuvs_last_dim          = dim;
+
+        if (cuvs_debug)
+        {
+            static const char * const metric_names[] = {"l2", "cosine", "ip"};
+            const char *mname = (metric < 3) ? metric_names[metric] : "?";
+            ereport(NOTICE,
+                    (errmsg("pg_cuvs: cagra scan oid=%u dim=%d metric=%s "
+                            "k=%d n=%d latency_us=%u",
+                            (uint32_t)index_oid, dim, mname,
+                            k, ss->n_results, latency_us)));
+        }
     }
 
     /* Iterate stored results */
@@ -507,4 +555,64 @@ pg_cuvs_reset_circuit(PG_FUNCTION_ARGS)
                     index_oid)));
 
     PG_RETURN_VOID();
+}
+
+/* ----------------------------------------------------------------
+ * pg_cuvs_last_search_* — process-local last-scan stats.
+ * Returns the stats from the most recent successful cagra index scan
+ * in this backend. NULL if no scan has happened yet.
+ * Use these for scriptable inspection; set cuvs.debug=on to also see
+ * them inline with EXPLAIN VERBOSE output via NOTICE.
+ * ---------------------------------------------------------------- */
+PG_FUNCTION_INFO_V1(pg_cuvs_last_search_latency_us);
+Datum
+pg_cuvs_last_search_latency_us(PG_FUNCTION_ARGS)
+{
+    if (cuvs_last_n_results < 0)
+        PG_RETURN_NULL();
+    PG_RETURN_INT32((int32)cuvs_last_latency_us);
+}
+
+PG_FUNCTION_INFO_V1(pg_cuvs_last_search_n_results);
+Datum
+pg_cuvs_last_search_n_results(PG_FUNCTION_ARGS)
+{
+    if (cuvs_last_n_results < 0)
+        PG_RETURN_NULL();
+    PG_RETURN_INT32(cuvs_last_n_results);
+}
+
+PG_FUNCTION_INFO_V1(pg_cuvs_last_search_k);
+Datum
+pg_cuvs_last_search_k(PG_FUNCTION_ARGS)
+{
+    if (cuvs_last_n_results < 0)
+        PG_RETURN_NULL();
+    PG_RETURN_INT32(cuvs_last_k_requested);
+}
+
+PG_FUNCTION_INFO_V1(pg_cuvs_last_search_index);
+Datum
+pg_cuvs_last_search_index(PG_FUNCTION_ARGS)
+{
+    if (cuvs_last_n_results < 0)
+        PG_RETURN_NULL();
+    PG_RETURN_OID(cuvs_last_index_oid);
+}
+
+PG_FUNCTION_INFO_V1(pg_cuvs_last_search_metric);
+Datum
+pg_cuvs_last_search_metric(PG_FUNCTION_ARGS)
+{
+    if (cuvs_last_n_results < 0)
+        PG_RETURN_NULL();
+    const char *name;
+    switch (cuvs_last_metric)
+    {
+        case CUVS_METRIC_L2:     name = "l2";     break;
+        case CUVS_METRIC_COSINE: name = "cosine"; break;
+        case CUVS_METRIC_IP:     name = "ip";     break;
+        default:                 name = "unknown"; break;
+    }
+    PG_RETURN_TEXT_P(cstring_to_text(name));
 }

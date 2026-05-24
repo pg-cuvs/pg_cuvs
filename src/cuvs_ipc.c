@@ -275,6 +275,9 @@ cuvs_ipc_search(
     int  sock   = -1;
     int  rc     = CUVS_STATUS_ERROR;
 
+    if (latency_us_out) *latency_us_out = 0;
+    if (n_out)          *n_out = 0;
+
     make_shm_key(shm_key, sizeof(shm_key));
 
     shm_fd = shm_write_query(shm_key, query_vec, dim);

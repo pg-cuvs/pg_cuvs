@@ -25,13 +25,16 @@
 
 **날짜**: 2026-05-22
 
+**상태**: 구현 완료. Phase 설명은 ADR-015/016의 최신 게이트가 대체한다.
+
 **문제**: PG의 process-per-connection 모델에서 백엔드마다 CUDA 컨텍스트를 생성하면 VRAM이 빠르게 고갈된다.
 
 **결정**: `pg_cuvs_server` 별도 데몬이 CUDA 컨텍스트를 단독 소유. 백엔드는 shared memory IPC로 요청만 던진다.
 
 **결과**:
-- Phase 1: in-process 호출로 동작 검증 (간단)
-- Phase 2: `cuvs_ipc.c` + 별도 데몬으로 전환
+- 초기 구상은 Phase 1에서 in-process 호출로 동작을 검증하고 Phase 2에서 sidecar로 전환하는 것이었다.
+- 2026-05-25 기준 실제 구현은 Phase 1 proof-of-mechanism 중 UDS + `shm_open` IPC와 `pg_cuvs_server` sidecar까지 진입했다.
+- 이후 계획은 Phase 1.5에서 durability/test/ops hardening을 먼저 닫고 Phase 2로 넘어간다.
 - GPU 데몬이 죽어도 PG는 살아있음 → CPU 경로(pgvector HNSW)로 계속 서비스
 
 **대안**: pg_duckdb처럼 in-process 링크. 거부 — 연결당 컨텍스트 비용이 비현실적.
@@ -68,15 +71,17 @@
 
 ---
 
-## ADR-005 — Phase 1은 brute force, CAGRA는 Phase 2
+## ADR-005 — 초기 Phase 1 brute-force 범위 결정
 
 **날짜**: 2026-05-22
 
+**상태**: 대체됨. CAGRA build/search/persistence PoC가 Phase 1 중 구현되었고, 최신 단계 관리는 ADR-015/016과 `design/PLAN.md`를 따른다.
+
 **문제**: CAGRA 인덱스 빌드/persist 로직이 복잡한데, 먼저 GPU 호출 경로 자체를 검증하고 싶다.
 
-**결정**: Phase 1은 `cuvs_brute_force_search`로 매 쿼리마다 코퍼스를 GPU에 올려서 exact search. 인덱스 영속성 없음. Phase 2부터 CAGRA + persist + 캐시.
+**결정**: 초기 결정은 Phase 1을 `cuvs_brute_force_search`로 매 쿼리마다 코퍼스를 GPU에 올리는 exact search로 제한하고, CAGRA + persist + cache는 후속 단계에서 구현하는 것이었다.
 
-**결과**: `src/cuvs_wrapper.cu`의 brute_force 함수만 작동. CAGRA 함수는 stub.
+**결과**: 이 결정은 구현 진행 중 superseded 되었다. 2026-05-25 기준 `src/cuvs_wrapper.cu`에는 CAGRA build/search/serialize/deserialize wrapper가 있으며, daemon path도 존재한다. 남은 쟁점은 "CAGRA를 할지 말지"가 아니라 DDL durability, test coverage, write/staleness, observability를 운영 계약으로 고정하는 것이다.
 
 **대안**: 처음부터 CAGRA. 거부 — Phase 1의 목표는 "GPU 경로 살아있음"을 증명하는 것이지 성능이 아님.
 
@@ -144,7 +149,7 @@
 **결과**:
 - 다중 백엔드 동시 처리가 `accept()` 루프로 자연스럽게 처리됨
 - 디버깅 시 `nc -U /tmp/.s.pg_cuvs.<pid>`로 직접 테스트 가능
-- Phase 2 `pg_stat_gpu` 통계 쿼리를 동일 소켓으로 확장 가능
+- Phase 2 `pg_stat_gpu_search` 통계 쿼리를 동일 소켓으로 확장 가능
 - `cuvs.socket_path` GUC 미설정 시 기본값: `/tmp/.s.pg_cuvs.<postmaster_pid>`
 
 **대안**: POSIX shm + 세마포어. 거부 — 다중 백엔드 큐 관리를 직접 구현해야 하고, 운영 디버깅이 어려움. 레이턴시 차이(수 마이크로초)는 CAGRA 검색 ms 대비 무시 가능.
@@ -266,3 +271,91 @@ Vamana build(GPU) → DiskANN binary → CPU Vamana search  (대규모, NVMe)
 - VACUUM 전까지 stale 인덱스 허용 — recall 저하는 있으나 정확도(exact match)는 heap recheck로 보장
 
 **대안**: Background Worker 주기적 재빌드. 보류 — AUTOVACUUM 연동이 더 단순하며 PG 생태계 관례와 일치. 필요 시 Phase 2에서 워밍업 Background Worker 추가 가능.
+
+---
+
+## ADR-015 — Phase 1.5 Test & Ops Hardening 게이트
+
+**날짜**: 2026-05-25
+
+**문제**: Phase 1 proof-of-mechanism 이후 sidecar, CAGRA build/search, persistence가 빠르게 들어왔지만, Phase 2 기능을 얹기 전에 durability, failure mode, test coverage, playbook 기준선이 충분히 고정되지 않았다. 이 상태에서 DiskANN, write path, tiered cache를 추가하면 기존 결함과 신규 결함의 원인 분리가 어려워진다.
+
+**결정**: Phase 2 전에 **Phase 1.5 — Test & Ops Hardening** 단계를 둔다.
+
+Phase 1.5 범위:
+- `CREATE INDEX USING cagra` durability 계약 확정.
+- unit, integration, GPU e2e coverage 확장.
+- failure injection hook 추가.
+- daemon signal safety 정리.
+- planner path에서 CUDA runtime 직접 호출 제거.
+- 운영 log level 정리.
+- GPU VM build/test, daemon restart, index failure, persistence corruption, VRAM OOM, rollback playbook 작성.
+
+**결과**:
+- Phase 2 시작 전 현재 동작 계약을 회귀 테스트로 잠근다.
+- 운영 장애 대응 절차를 코드와 함께 유지한다.
+- Phase 2 기능 추가 시 `pg_stat_gpu_search`와 e2e tests를 기준으로 회귀를 빠르게 찾는다.
+
+**대안**: Phase 2 기능 구현과 테스트 강화를 병행. 거부 — C/CUDA/PostgreSQL extension 조합에서는 failure mode가 겹치기 쉬워 원인 분리가 어렵다.
+
+---
+
+## ADR-016 — `CREATE INDEX USING cagra` 성공 조건: VRAM build + disk persistence
+
+**날짜**: 2026-05-25
+
+**문제**: `CREATE INDEX`가 성공했는데 `.cagra` 또는 `.tids` artifact가 디스크에 남지 않으면, PostgreSQL catalog에는 index가 존재하지만 daemon restart 후 GPU index를 복구할 수 없다. 이는 DDL durability 기대와 맞지 않는다.
+
+**결정**: `CREATE INDEX USING cagra`는 다음 조건이 모두 성공해야 성공으로 간주한다.
+
+- daemon 연결 성공.
+- VRAM CAGRA build 성공.
+- `.cagra` serialize 성공.
+- `.tids` mapping persistence 성공.
+- tmp write, file fsync, atomic rename, directory fsync 성공.
+
+실패 시:
+- `pg_cuvs_server`는 build failure 또는 persistence failure status를 반환한다.
+- `cuvs_ambuild()`는 `ereport(ERROR)`로 `CREATE INDEX`를 실패시킨다.
+- PostgreSQL catalog 변경은 transaction rollback으로 취소된다.
+- SELECT search path의 daemon failure는 기존 원칙대로 CPU fallback 가능하되, DDL path는 fallback success로 처리하지 않는다.
+
+**결과**:
+- SQL DDL 성공 의미가 persistent GPU index artifact 존재와 일치한다.
+- daemon restart 후 index 복구 가능성이 DDL 성공 계약에 포함된다.
+- build 중 기존 index가 있는 경우 새 build/persist가 완전히 성공하기 전까지 기존 resident index를 유지해야 한다.
+
+**대안**:
+- daemon unavailable 또는 persistence failure를 WARNING으로만 남기고 CPU fallback. 거부 — catalog와 artifact 상태가 불일치한다.
+- VRAM build만 성공하면 DDL 성공. 거부 — restart durability가 깨진다.
+
+---
+
+## ADR-017 — Phase 2 Observability: `pg_stat_gpu_search`
+
+**날짜**: 2026-05-25
+
+**문제**: GPU search, fallback, cache reload, daemon error가 PostgreSQL SQL 표면에서 관측되지 않으면 Phase 2의 planner/executor 개선, write/staleness 정책, VRAM tiered cache를 검증하기 어렵다.
+
+**결정**: Phase 2 초반에 `pg_stat_gpu_search`를 추가한다.
+
+MVP:
+- stats source of truth는 `pg_cuvs_server` memory에 둔다.
+- extension function이 IPC `STATUS` 또는 `STATS` command로 daemon stats를 조회한다.
+- SQL view `pg_stat_gpu_search`가 per-index counters와 latency/fallback/cache 정보를 노출한다.
+
+초기 지표:
+- database OID, index OID, index name.
+- calls, success, fallback, error.
+- requested k, returned k, rows returned.
+- average latency, p95 latency.
+- GPU kernel time, IPC time, CPU recheck time.
+- VRAM cache hits/misses, reload count.
+- last status, last error, last search timestamp.
+
+**결과**:
+- Phase 2 기능의 운영성과 성능을 SQL에서 확인할 수 있다.
+- playbook이 log scraping에만 의존하지 않는다.
+- 추후 PostgreSQL native `pgstat` integration으로 확장할 수 있다.
+
+**대안**: daemon log만 사용. 거부 — SQL 운영자가 index별 상태와 fallback reason을 조회하기 어렵다.

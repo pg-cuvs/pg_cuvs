@@ -75,13 +75,14 @@ Benchmark results (DBpedia 1M, 1536d, L4 GPU):
 
 ## Roadmap
 
-See [design/PLAN.md](design/PLAN.md) for the full three-phase plan.
+See [design/PLAN.md](design/PLAN.md) for the full phased plan.
 
 | Phase | Goal | Status |
 |-------|------|--------|
-| 1 — Proof of Mechanism | In-memory GPU search, IPC architecture, cost model | In progress |
-| 2 — Production Ready | DiskANN AM, VRAM/RAM/NVMe tiered caching, `pg_stat_gpu` | Planned |
-| 3 — Scale Out | S3-backed immutable index snapshots, multi-GPU | Planned |
+| 1 — Proof of Mechanism | PostgreSQL pipeline + sidecar CAGRA search | In progress |
+| 1.5 — Test & Ops Hardening | DDL durability, test coverage, GPU e2e, playbooks | Planned |
+| 2 — Production Ready | `pg_stat_gpu_search`, planner/write correctness, tiered cache, DiskANN prep | Planned |
+| 3 — Scale Out | S3-backed immutable index snapshots, replicas, multi-GPU | Planned |
 
 ## Requirements
 

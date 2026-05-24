@@ -61,18 +61,51 @@ the pg_cuvs_server shall serialize the built index to
 serialization format.
 ```
 
+**PERSIST-02A**
+```
+When `CREATE INDEX USING cagra` completes successfully,
+the pg_cuvs_server shall have also persisted the corresponding TID mapping to
+`<cuvs.index_dir>/<database_oid>_<index_oid>.tids`.
+```
+
+**PERSIST-02B**
+```
+When persisting a cagra index or TID mapping,
+the pg_cuvs_server shall write to a temporary file, fsync the file, atomically
+rename it into place, and fsync the containing directory before reporting
+success to the PostgreSQL backend.
+```
+
+**PERSIST-02C**
+```
+When VRAM build succeeds but either `.cagra` serialization or `.tids`
+persistence fails,
+the pg_cuvs_server shall report a build failure status to the PostgreSQL backend
+and the pg_cuvs extension shall fail `CREATE INDEX` with ERROR so PostgreSQL
+rolls back the catalog entry.
+```
+
+**PERSIST-02D**
+```
+When rebuilding an existing cagra index,
+the pg_cuvs_server shall not replace the currently resident index until the new
+VRAM index and both persistent artifacts have been created successfully.
+```
+
 **PERSIST-03**
 ```
 When pg_cuvs_server receives SIGTERM,
-the pg_cuvs_server shall serialize all VRAM-resident indexes to `cuvs.index_dir`
-before releasing CUDA resources and exiting.
+the signal handler shall only request shutdown using signal-safe operations, and
+the main server loop shall serialize all VRAM-resident indexes to
+`cuvs.index_dir` before releasing CUDA resources and exiting.
 ```
 
 **PERSIST-04**
 ```
 When pg_cuvs_server starts,
-the pg_cuvs_server shall scan `cuvs.index_dir` and load all indexes whose
-corresponding PostgreSQL index OIDs still exist in `pg_catalog.pg_index`.
+the pg_cuvs_server shall scan `cuvs.index_dir` and load only indexes that have a
+valid `.cagra` and `.tids` artifact pair and whose corresponding PostgreSQL
+index OIDs still exist in `pg_catalog.pg_index`.
 ```
 
 **PERSIST-05**
@@ -212,7 +245,39 @@ diskann results only when the cagra candidate set is below `k`.
 
 ---
 
-## 7. Phase 3 — S3 연동 (Q8)
+## 7. 운영 가시성 — `pg_stat_gpu_search`
+
+**STAT-01**
+```
+When GPU search, GPU fallback, index reload, or daemon-side search error occurs,
+the pg_cuvs_server shall update per-index search statistics.
+```
+
+**STAT-02**
+```
+The pg_cuvs extension shall expose a SQL view named `pg_stat_gpu_search` that
+retrieves daemon-maintained statistics through an IPC status or stats command.
+```
+
+**STAT-03**
+```
+The `pg_stat_gpu_search` view shall include at least database OID, index OID,
+index name, call counts, success counts, fallback counts, error counts,
+requested k, returned k, rows returned, average latency, p95 latency, GPU kernel
+time, IPC time, VRAM cache hit/miss counts, reload count, last status, last
+error, and last search timestamp.
+```
+
+**STAT-04**
+```
+When a search falls back to CPU,
+the pg_cuvs extension or pg_cuvs_server shall record a machine-readable fallback
+reason suitable for playbook diagnosis.
+```
+
+---
+
+## 8. Phase 3 — S3 연동 (Q8)
 
 **S3-01**
 ```
@@ -245,7 +310,7 @@ read-only replicas shall load indexes from S3 without rebuilding from heap.
 
 ---
 
-## 8. 코스트 모델 (ADR-003)
+## 9. 코스트 모델 (ADR-003)
 
 **COST-01**
 ```
@@ -267,9 +332,65 @@ the `cuvsamcostestimate` function shall scale `startup_cost` by
 proportional to vector size.
 ```
 
+**COST-04**
+```
+When estimating cagra index scan cost,
+the `cuvsamcostestimate` function shall not call CUDA runtime APIs directly.
+```
+
+**COST-05**
+```
+When a query has an explicit LIMIT that can be used as top-k,
+the pg_cuvs extension shall pass that k value to pg_cuvs_server instead of using
+a fixed constant.
+```
+
+**COST-06**
+```
+When determining the cuVS distance metric for a cagra search,
+the pg_cuvs extension shall derive L2, cosine, or inner product from the
+operator or operator class identity, not from a strategy-number heuristic.
+```
+
 ---
 
-## 9. 운영 인터페이스 (GUC 목록)
+## 10. 테스트 및 운영 플레이북
+
+**TEST-01**
+```
+Before Phase 2 feature work begins,
+the project shall provide unit tests for circuit breaker behavior, TID
+encoding/decoding, persisted artifact discovery, atomic persistence helpers,
+IPC status mapping, and failure-injection hooks.
+```
+
+**TEST-02**
+```
+Before Phase 2 feature work begins,
+the project shall provide integration tests covering extension load, GUC
+registration, access method registration, daemon-unavailable DDL failure,
+daemon-unavailable SELECT fallback, and daemon status-code handling.
+```
+
+**TEST-03**
+```
+Before Phase 2 feature work begins,
+the project shall provide GPU VM e2e tests covering successful cagra build,
+valid `.cagra` and `.tids` persistence, daemon restart reload, expected nearest
+neighbor search, SELECT fallback when daemon is down, persistence failure causing
+CREATE INDEX failure, and VRAM budget exhaustion behavior.
+```
+
+**TEST-04**
+```
+The project shall provide operational playbooks for GPU VM build/test, daemon
+restart recovery, CREATE INDEX failure diagnosis, persistence corruption
+recovery, VRAM OOM fallback, and rollback/cleanup.
+```
+
+---
+
+## 11. 운영 인터페이스 (GUC 목록)
 
 | GUC | 타입 | 기본값 | 설명 |
 |-----|------|--------|------|
