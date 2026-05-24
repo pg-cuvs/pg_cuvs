@@ -419,7 +419,10 @@ handle_search(int client_fd, const CuvsCmdFrame *cmd)
         return;
     }
 
+    fprintf(stderr, "[handle_search] calling cuvs_cagra_search k=%d dim=%u...\n",
+            k, cmd->dim); fflush(stderr);
     int ret = cuvs_cagra_search(e->handle, query, (int)cmd->dim, k, raw);
+    fprintf(stderr, "[handle_search] cuvs_cagra_search rc=%d\n", ret); fflush(stderr);
     munmap(query, vec_bytes);
 
     if (ret != 0)
@@ -595,10 +598,9 @@ handle_build(int client_fd, const CuvsCmdFrame *cmd)
     index_file_path(idx_path, sizeof(idx_path), save_dir, e->db_oid, e->index_oid);
     tids_file_path(tids_path, sizeof(tids_path), save_dir, e->db_oid, e->index_oid);
 
-    /* TODO Phase 1.5: cuvs::neighbors::cagra::serialize hangs in cuVS 26.04 — investigate.
-     * For Phase 1 demo, skip serialization (no SIGTERM persistence). */
-    fprintf(stderr, "[handle_build] skipping serialize (Phase 1 demo)\n"); fflush(stderr);
-    (void)idx_path;
+    fprintf(stderr, "[handle_build] cuvs_cagra_serialize(%s) [include_dataset=false]...\n", idx_path); fflush(stderr);
+    int ser_rc = cuvs_cagra_serialize(handle, idx_path);
+    fprintf(stderr, "[handle_build] serialize rc=%d\n", ser_rc); fflush(stderr);
 
     FILE *f = fopen(tids_path, "wb");
     if (f)

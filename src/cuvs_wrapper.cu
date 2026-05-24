@@ -26,13 +26,24 @@
 #include <stdexcept>
 
 /* Opaque CAGRA index wrapper.
- * raft::device_resources has a deleted move constructor in cuVS 25.x+,
- * so we hold it via unique_ptr and create a fresh one per operation. */
+ *
+ * The dataset (d_corpus) MUST outlive the index because cagra::index holds an
+ * mdspan view into the dataset's device memory rather than owning it. If the
+ * dataset is freed (e.g., function-scope local), the index has dangling
+ * pointers. Symptom: SIGSEGV on serialize(include_dataset=true) and on search.
+ *
+ * raft::device_resources has a deleted move constructor in cuVS 25.x+, so we
+ * create a fresh one per operation rather than storing it.
+ */
 struct CuvsCagraIndexImpl {
+    /* dataset MUST be declared before idx so destruction is reverse order:
+     * idx destroyed first, then dataset. */
+    raft::device_matrix<float, int64_t> dataset;
     cuvs::neighbors::cagra::index<float, uint32_t> idx;
 
-    explicit CuvsCagraIndexImpl(cuvs::neighbors::cagra::index<float, uint32_t> &&idx_)
-        : idx(std::move(idx_))
+    CuvsCagraIndexImpl(raft::device_matrix<float, int64_t> &&d,
+                       cuvs::neighbors::cagra::index<float, uint32_t> &&i)
+        : dataset(std::move(d)), idx(std::move(i))
     {}
 };
 
@@ -121,7 +132,8 @@ cuvs_cagra_build(const float *vecs, int64_t n_vecs, int dim)
     try {
         raft::device_resources res;
 
-        /* Upload corpus to device */
+        /* Upload corpus to device. d_corpus will be moved into the impl
+         * struct below so its memory stays alive for the index's lifetime. */
         auto d_corpus = raft::make_device_matrix<float, int64_t>(res, n_vecs, (int64_t)dim);
         raft::copy(d_corpus.data_handle(), vecs, n_vecs * dim, res.get_stream());
         res.sync_stream();
@@ -136,10 +148,17 @@ cuvs_cagra_build(const float *vecs, int64_t n_vecs, int dim)
             params,
             raft::make_const_mdspan(d_corpus.view()));
 
+        /* Re-attach dataset explicitly so the index owns a valid view that
+         * matches our retained d_corpus memory. */
+        idx.update_dataset(res, raft::make_const_mdspan(d_corpus.view()));
         res.sync_stream();
 
-        return new CuvsCagraIndexImpl(std::move(idx));
+        return new CuvsCagraIndexImpl(std::move(d_corpus), std::move(idx));
+    } catch (const std::exception &e) {
+        fprintf(stderr, "[cuvs_cagra_build] exception: %s\n", e.what());
+        return nullptr;
     } catch (...) {
+        fprintf(stderr, "[cuvs_cagra_build] unknown exception\n");
         return nullptr;
     }
 }
@@ -169,6 +188,15 @@ cuvs_cagra_search(
         auto d_distances = raft::make_device_matrix<float,    int64_t>(res, 1, top_k);
 
         cuvs::neighbors::cagra::search_params sparams;
+        /* CAGRA multi-cta search requires:
+         *   num_cta_per_query * 32 >= top_k
+         * where num_cta_per_query = max(search_width, ceil(itopk_size / 32))
+         * Default itopk_size=64, search_width=1 → num_cta=2 → max top_k=64.
+         * Round itopk_size up to a multiple of 32 that satisfies top_k. */
+        int itopk = ((top_k + 31) / 32) * 32;
+        if (itopk < 64) itopk = 64;
+        sparams.itopk_size = itopk;
+
         cuvs::neighbors::cagra::search(
             res, sparams, impl->idx,
             raft::make_const_mdspan(d_queries.view()),
@@ -188,7 +216,11 @@ cuvs_cagra_search(
             results[i].distance = h_distances[i];
         }
         return 0;
+    } catch (const std::exception &e) {
+        fprintf(stderr, "[cuvs_cagra_search] exception: %s\n", e.what());
+        return 1;
     } catch (...) {
+        fprintf(stderr, "[cuvs_cagra_search] unknown exception\n");
         return 1;
     }
 }
@@ -205,7 +237,8 @@ cuvs_cagra_serialize(CuvsCagraIndex index, const char *path)
     try {
         CuvsCagraIndexImpl *impl = static_cast<CuvsCagraIndexImpl *>(index);
         raft::device_resources res;
-        /* include_dataset=true so the index is self-contained */
+        /* include_dataset=true: works now because impl->dataset keeps the
+         * device memory alive that idx's view points to. */
         cuvs::neighbors::cagra::serialize(res, std::string(path), impl->idx, true);
         res.sync_stream();
         return 0;
@@ -227,8 +260,19 @@ cuvs_cagra_deserialize(const char *path, int dim)
         cuvs::neighbors::cagra::deserialize(res, path, &idx);
         res.sync_stream();
         (void)dim;  /* dim is encoded in the serialized index */
-        return new CuvsCagraIndexImpl(std::move(idx));
+
+        /* After deserialize with include_dataset=true at save time, the index
+         * owns its own dataset (allocated internally during deserialize).
+         * We pass an empty placeholder device_matrix so the impl struct's
+         * field stays valid; idx's internal dataset is what matters. */
+        auto empty = raft::make_device_matrix<float, int64_t>(res, (int64_t)0, (int64_t)0);
+        res.sync_stream();
+        return new CuvsCagraIndexImpl(std::move(empty), std::move(idx));
+    } catch (const std::exception &e) {
+        fprintf(stderr, "[cuvs_cagra_deserialize] exception: %s\n", e.what());
+        return nullptr;
     } catch (...) {
+        fprintf(stderr, "[cuvs_cagra_deserialize] unknown exception\n");
         return nullptr;
     }
 }
