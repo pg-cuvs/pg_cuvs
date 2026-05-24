@@ -267,7 +267,8 @@ cuvs_ipc_search(
     uint32_t      metric,
     uint64_t     *tids_out,
     float        *dist_out,
-    int          *n_out)
+    int          *n_out,
+    uint32_t     *latency_us_out)
 {
     char shm_key[64];
     int  shm_fd = -1;
@@ -305,6 +306,8 @@ cuvs_ipc_search(
         goto cleanup;
 
     rc = (int)hdr.status;
+    if (latency_us_out)
+        *latency_us_out = hdr.latency_us;
 
     if (hdr.status == CUVS_STATUS_OK && hdr.n_results > 0)
     {
