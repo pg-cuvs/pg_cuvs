@@ -45,6 +45,9 @@ def main():
     ap.add_argument("--ks", default="10,100")
     ap.add_argument("--mode", choices=["gpu", "cpu"], required=True)
     ap.add_argument("--single-query-n", type=int, default=2000)
+    ap.add_argument("--bf-queries", type=int, default=2000,
+                    help="query subset for the exact brute-force baseline "
+                         "(recall is 1.0 by definition; caps slow CPU flat)")
     args = ap.parse_args()
 
     import faiss
@@ -73,6 +76,21 @@ def main():
                             recall=round(rec, 4), qps=round(qps, 1), p50_ms=round(p50, 3),
                             p95_ms=round(p95, 3), p99_ms=round(p99, 3), n_queries=nq, notes="")
 
+    def run_flat(system, index, build_time, gpu_mb):
+        # exact brute force: recall is 1.0 by definition; use a query subset
+        # (cheap proof + bounds slow CPU flat). One operating point.
+        bfq = min(args.bf_queries, nq)
+        I, qps, (p50, p95, p99) = time_search(index, queries[:bfq], kmax, min(sq_n, bfq))
+        for k in ks:
+            rec = recall_at_k(I[:, :k], gt[:bfq, :k], k)
+            emit_result(args.out, system=system, dataset=args.dataset, N=n, dim=d,
+                        metric="cosine(L2-normed)", k=k, param_set="exact",
+                        build_time_s=round(build_time, 3), index_bytes=None,
+                        host_mem_mb=round(host_mem_mb(), 1), gpu_mem_mb=gpu_mb,
+                        recall=round(rec, 4), qps=round(qps, 1), p50_ms=round(p50, 3),
+                        p95_ms=round(p95, 3), p99_ms=round(p99, 3), n_queries=bfq,
+                        notes="exact brute force baseline")
+
     if args.mode == "gpu":
         res = faiss.StandardGpuResources()
         gpu_before = gpu_mem_used_mb()
@@ -92,6 +110,11 @@ def main():
         bt = time.perf_counter() - t0
         run("faiss-gpu-ivfpq", ivfpq, bt, "nprobe", [1, 4, 8, 16, 32, 64, 128, 256],
             round(gpu_mem_used_mb() - gpu_before, 1))
+        del ivfpq
+        # exact GPU brute force (recall 1.0 baseline)
+        flat = faiss.GpuIndexFlatL2(res, d, faiss.GpuIndexFlatConfig())
+        t0 = time.perf_counter(); flat.add(corpus); bft = time.perf_counter() - t0
+        run_flat("faiss-gpu-flat", flat, bft, round(gpu_mem_used_mb() - gpu_before, 1))
     else:
         # CPU IVFFlat
         quant = faiss.IndexFlatL2(d)
@@ -107,6 +130,10 @@ def main():
         bt = time.perf_counter() - t0
         run("faiss-cpu-hnsw", hnsw, bt, "hnsw.efSearch", [16, 32, 64, 128, 256],
             float("nan"))
+        # exact CPU brute force (recall 1.0 baseline; query subset for speed)
+        flat = faiss.IndexFlatL2(d)
+        t0 = time.perf_counter(); flat.add(corpus); bft = time.perf_counter() - t0
+        run_flat("faiss-cpu-flat", flat, bft, float("nan"))
     return 0
 
 

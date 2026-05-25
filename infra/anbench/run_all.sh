@@ -44,6 +44,11 @@ for sys in hnsw ivfflat; do
         --n "$N" --system "$sys" --out "$RUN" --ks "$KS" || echo "[run_all] WARN $sys failed"
 done
 
+# --- Tier A: pgvector exact (seqscan, no index) = in-PG brute-force baseline ---
+step "pgvector exact (seqscan) N=$N"
+python infra/anbench/run_pg.py --corpus "$CORPUS" --queries "$Q" --gt "$GT" \
+    --n "$N" --system exact --out "$RUN" --ks "$KS" || echo "[run_all] WARN exact failed"
+
 # --- Tier A: pg_cuvs (GPU via sidecar) ---
 if [ "$GPU_FITS" = "1" ]; then
     step "pg_cuvs N=$N (raise daemon --max-vram-mb=$DAEMON_VRAM_MB)"

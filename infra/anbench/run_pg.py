@@ -126,12 +126,16 @@ def main():
     ap.add_argument("--queries", required=True)
     ap.add_argument("--gt", required=True)
     ap.add_argument("--n", type=int, required=True)
-    ap.add_argument("--system", required=True, choices=["pg_cuvs", "hnsw", "ivfflat"])
+    ap.add_argument("--system", required=True,
+                    choices=["pg_cuvs", "hnsw", "ivfflat", "exact"])
     ap.add_argument("--out", required=True)
     ap.add_argument("--dataset", default="cohere-wiki-en-1024")
     ap.add_argument("--ks", default="10,100")
     ap.add_argument("--dbname", default="postgres")
     ap.add_argument("--index-dir", default="/tmp/cuvs_indexes")
+    ap.add_argument("--exact-queries", type=int, default=200,
+                    help="query subset for the exact seqscan baseline (slow; "
+                         "recall is 1.0 by definition)")
     args = ap.parse_args()
 
     import psycopg
@@ -150,38 +154,50 @@ def main():
     conn.commit()
 
     load_table(conn, args.corpus, args.n, dim)
-    gpu_before = gpu_mem_used_mb() if args.system == "pg_cuvs" else float("nan")
-    bt, idx_bytes = build_index(conn, args.system, args.n, args.index_dir)
-    gpu_after = gpu_mem_used_mb() if args.system == "pg_cuvs" else float("nan")
 
-    if args.system == "pg_cuvs":
-        sweeps = [(None, "k=100(fixed)")]
-        set_prefix = f"SET cuvs.index_dir = '{args.index_dir}'"
-    elif args.system == "hnsw":
-        sweeps = [(f"SET hnsw.ef_search={v}", f"ef_search={v}")
-                  for v in (10, 20, 40, 80, 120, 200, 400)]
+    if args.system == "exact":
+        # exact in-PG baseline: no ANN index -> seqscan computes all distances.
+        with conn.cursor() as cur:
+            for nm in ("t_hnsw", "t_ivf", "t_cagra"):
+                cur.execute("DROP INDEX IF EXISTS " + nm)
+        conn.commit()
+        bt, idx_bytes, gpu_before, gpu_after = 0.0, 0, float("nan"), float("nan")
+        sweeps = [("SET enable_cuvs=off; SET enable_indexscan=off; "
+                   "SET enable_bitmapscan=off", "exact-seqscan")]
         set_prefix = None
+        eq = min(args.exact_queries, nq)
+        qset, gtset, n_rep, sysname = queries[:eq], gt[:eq], eq, "pgvector-exact"
+        note = "exact seqscan baseline (query subset)"
     else:
-        sweeps = [(f"SET ivfflat.probes={v}", f"probes={v}")
-                  for v in (1, 4, 8, 16, 32, 64, 128)]
-        set_prefix = None
+        gpu_before = gpu_mem_used_mb() if args.system == "pg_cuvs" else float("nan")
+        bt, idx_bytes = build_index(conn, args.system, args.n, args.index_dir)
+        gpu_after = gpu_mem_used_mb() if args.system == "pg_cuvs" else float("nan")
+        if args.system == "pg_cuvs":
+            sweeps = [(None, "k=100(fixed)")]
+            set_prefix = f"SET cuvs.index_dir = '{args.index_dir}'"
+            sysname, note = "pg_cuvs", "k hardcoded 100 internally"
+        elif args.system == "hnsw":
+            sweeps = [(f"SET hnsw.ef_search={v}", f"ef_search={v}")
+                      for v in (10, 20, 40, 80, 120, 200, 400)]
+            set_prefix, sysname, note = None, "pgvector-hnsw", ""
+        else:
+            sweeps = [(f"SET ivfflat.probes={v}", f"probes={v}")
+                      for v in (1, 4, 8, 16, 32, 64, 128)]
+            set_prefix, sysname, note = None, "pgvector-ivfflat", ""
+        qset, gtset, n_rep = queries, gt, nq
 
     for set_sql, label in sweeps:
         full_set = "; ".join(x for x in (set_prefix, set_sql) if x)
-        ids, qps, (p50, p95, p99) = run_queries(conn, queries, kmax, full_set or None)
+        ids, qps, (p50, p95, p99) = run_queries(conn, qset, kmax, full_set or None)
         for k in ks:
-            rec = recall_at_k(ids[:, :k], gt[:, :k], k)
-            emit_result(args.out, system=("pg_cuvs" if args.system == "pg_cuvs"
-                                          else f"pgvector-{args.system}"),
-                        dataset=args.dataset, N=args.n, dim=dim,
+            rec = recall_at_k(ids[:, :k], gtset[:, :k], k)
+            emit_result(args.out, system=sysname, dataset=args.dataset, N=args.n, dim=dim,
                         metric="cosine(L2-normed)", k=k, param_set=label,
-                        build_time_s=round(bt, 3), index_bytes=idx_bytes,
-                        host_mem_mb=None,
+                        build_time_s=round(bt, 3), index_bytes=idx_bytes, host_mem_mb=None,
                         gpu_mem_mb=(round(gpu_after - gpu_before, 1)
                                     if args.system == "pg_cuvs" else None),
                         recall=round(rec, 4), qps=round(qps, 1), p50_ms=round(p50, 3),
-                        p95_ms=round(p95, 3), p99_ms=round(p99, 3), n_queries=nq,
-                        notes=("k hardcoded 100 internally" if args.system == "pg_cuvs" else ""))
+                        p95_ms=round(p95, 3), p99_ms=round(p99, 3), n_queries=n_rep, notes=note)
     conn.close()
     return 0
 
