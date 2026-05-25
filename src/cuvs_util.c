@@ -18,14 +18,16 @@
 int
 cuvs_parse_index_filename(const char *name, uint32_t *db_oid, uint32_t *index_oid)
 {
+    size_t namelen;
+    const char *suffix = ".cagra";
+    size_t suflen = strlen(suffix);
+
     if (!name)
         return -1;
 
     /* sscanf returns conversion count regardless of literal match — must
      * also verify the ".cagra" suffix to avoid matching .tids files. */
-    size_t namelen = strlen(name);
-    const char *suffix = ".cagra";
-    size_t suflen = strlen(suffix);
+    namelen = strlen(name);
     if (namelen <= suflen)
         return -1;
     if (strcmp(name + namelen - suflen, suffix) != 0)
@@ -63,6 +65,9 @@ cuvs_crc32(const void *data, size_t len)
 {
     static uint32_t table[256];
     static int      table_init = 0;
+    const unsigned char *p = (const unsigned char *)data;
+    uint32_t crc = 0xFFFFFFFFu;
+
     if (!table_init)
     {
         for (uint32_t i = 0; i < 256; i++)
@@ -75,8 +80,6 @@ cuvs_crc32(const void *data, size_t len)
         table_init = 1;
     }
 
-    const unsigned char *p = (const unsigned char *)data;
-    uint32_t crc = 0xFFFFFFFFu;
     for (size_t i = 0; i < len; i++)
         crc = table[(crc ^ p[i]) & 0xFFu] ^ (crc >> 8);
     return crc ^ 0xFFFFFFFFu;
@@ -105,9 +108,12 @@ cuvs_tids_write(FILE *f, int64_t n_vecs, uint32_t dim, uint32_t metric,
 int
 cuvs_tids_read(FILE *f, CuvsTidsHeader *hdr_out, uint64_t **tids_out)
 {
+    CuvsTidsHeader hdr;
+    size_t body_bytes;
+    uint64_t *tids;
+
     *tids_out = NULL;
 
-    CuvsTidsHeader hdr;
     if (fread(&hdr, sizeof(hdr), 1, f) != 1)
         return -1;
     if (hdr.magic != CUVS_TIDS_MAGIC)
@@ -117,8 +123,8 @@ cuvs_tids_read(FILE *f, CuvsTidsHeader *hdr_out, uint64_t **tids_out)
     if (hdr.n_vecs <= 0 || hdr.n_vecs > CUVS_TIDS_MAX_VECS)
         return -1;
 
-    size_t body_bytes = (size_t)hdr.n_vecs * sizeof(uint64_t);
-    uint64_t *tids = malloc(body_bytes);
+    body_bytes = (size_t)hdr.n_vecs * sizeof(uint64_t);
+    tids = malloc(body_bytes);
     if (!tids)
         return -1;
 
