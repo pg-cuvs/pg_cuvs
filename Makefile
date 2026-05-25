@@ -268,5 +268,28 @@ gpu-bench-1m:
 gpu-shell:
 	ssh -tt $(GCP_VM)
 
+# ---- Comparative ANN benchmark (infra/anbench) -------------------------
+# pg_cuvs vs pgvector(hnsw/ivfflat) vs raw cuvs vs faiss-gpu/cpu on the same
+# real dataset (Cohere wiki en, 1024d, cosine). Runs entirely on the VM.
+.PHONY: gpu-anbench gpu-anbench-5m gpu-anbench-agg
+
+# One corpus size (default 1M). Override: make gpu-anbench N=5000000
+gpu-anbench:
+	@mkdir -p design/anbench
+	ssh $(GCP_VM) "cd ~/pg_cuvs && N=$(if $(N),$(N),1000000) KS=$(if $(KS),$(KS),10,100) \
+		bash infra/anbench/run_all.sh 2>&1" \
+		| tee design/anbench/run_N$(if $(N),$(N),1000000)_$(shell date +%Y%m%d_%H%M).log
+
+# Large tier (GPU-feasible max at 1024d).
+gpu-anbench-5m:
+	$(MAKE) gpu-anbench N=5000000
+
+# Aggregate results into summary.csv/txt + Pareto plots, then pull back locally.
+gpu-anbench-agg:
+	@mkdir -p design/anbench
+	ssh $(GCP_VM) "cd ~/pg_cuvs && source ~/miniforge3/bin/activate cuvs_py && \
+		pip install -q matplotlib 2>/dev/null; python infra/anbench/aggregate.py"
+	rsync -avz $(GCP_VM):~/pg_cuvs/design/anbench/ design/anbench/
+
 # Convenience: full cycle on the VM (sync → build → install → test).
 gpu-cycle: sync gpu-build gpu-install gpu-test

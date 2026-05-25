@@ -40,3 +40,6 @@ miniforge3/
 
 # Benchmark output (kept in design/ folder)
 design/bench_*.log
+
+# Comparative ANN benchmark outputs (results/plots/logs; large, regenerable)
+design/anbench/
