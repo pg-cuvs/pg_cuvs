@@ -383,9 +383,43 @@ CREATE INDEX failure, and VRAM budget exhaustion behavior.
 
 **TEST-04**
 ```
+Before Phase 2 feature work begins,
+the project shall provide large-dataset GPU VM benchmarks covering at least
+10K, 1M, and 10M vector tiers where feasible, dimensions 384, 768, and 1536,
+and k values 10, 100, and 1000.
+```
+
+**TEST-05**
+```
+The large-dataset benchmark shall record CREATE INDEX build time, peak backend
+RSS, daemon RSS, GPU VRAM usage, artifact sizes, daemon restart reload time,
+cold and warm backend planning time, execution latency p50/p95/p99, fallback
+counts, JIT section presence in EXPLAIN ANALYZE, and backend CUDA context
+presence in nvidia-smi.
+```
+
+**TEST-06**
+```
+The project shall not set global JIT thresholds in automated post-install
+scripts until large-dataset benchmarks or Phase 2 cost-model experiments show
+that JIT is triggered for pg_cuvs vector-search queries and causes unacceptable
+latency variance.
+```
+
+**TEST-07**
+```
+When JIT is triggered for pg_cuvs vector-search queries,
+the project shall determine any recommended `jit_above_cost`,
+`jit_inline_above_cost`, or `jit_optimize_above_cost` values through a threshold
+sweep rather than a fixed guess.
+```
+
+**TEST-08**
+```
 The project shall provide operational playbooks for GPU VM build/test, daemon
-restart recovery, CREATE INDEX failure diagnosis, persistence corruption
-recovery, VRAM OOM fallback, and rollback/cleanup.
+large-dataset benchmark, JIT threshold sweep, restart recovery, CREATE INDEX
+failure diagnosis, persistence corruption recovery, VRAM OOM fallback, and
+rollback/cleanup.
 ```
 
 ---

@@ -98,6 +98,8 @@ make gpu-postinstall
 - **`shared_preload_libraries = 'pg_cuvs'` 설정** (첫 쿼리 planning 95ms -> 0.4ms, ADR-018)
 - postgresql restart
 
+JIT 설정은 여기서 변경하지 않는다. 현재 cagra query cost에서는 PostgreSQL JIT이 트리거되지 않으며, 향후 cost model 확장 후 대규모 데이터 benchmark에서 실제 `JIT:` 발생과 latency variance를 확인한 뒤 threshold sweep으로 결정한다.
+
 **중요**: libstdc++/libgcc_s 두 파일만 링크하라. conda env lib 디렉터리 전체를 ldconfig에 등록하면 VM이 망가진다 (troubleshooting.md의 "ldconfig 사고" 참조). postinstall.sh는 이 두 파일만 건드린다.
 
 **왜 shared_preload_libraries인가**: libcuvs.so는 812MB라 백엔드가 처음 dlopen할 때 planning이 ~95ms 걸린다. postmaster가 시작 시 한 번 로드하면 모든 백엔드가 fork로 매핑을 상속해 첫 쿼리부터 pgvector 수준(<1ms)이 된다 (PG-Strom과 동일 패턴).

@@ -127,20 +127,63 @@ Makefile target 방향:
 - `gpu-test-e2e`
 - `gpu-test-all`
 
-#### 5. Operational Safety
+#### 5. Large Dataset Benchmark & JIT Decision Gate
+
+Phase 1.5에서 대규모 데이터 테스트를 먼저 수행한다. 목적은 Phase 2 기능 검증이 아니라 운영 기준선을 고정하는 것이다. 특히 JIT threshold는 추정값으로 정하지 않고, 대규모 데이터와 현실적인 cost model에서 측정한 뒤 결정한다.
+
+Dataset tiers:
+- Small: 10K vectors.
+- Medium: 1M vectors.
+- Large: 10M vectors.
+- Stress: configured VRAM budget 또는 physical VRAM 한계 근처.
+
+Dimensions:
+- 384.
+- 768.
+- 1536.
+
+Query k:
+- 10.
+- 100.
+- 1000.
+
+측정 항목:
+- `CREATE INDEX USING cagra` build time.
+- peak backend RSS during `cuvs_ambuild()`.
+- daemon RSS and GPU VRAM.
+- `.cagra` and `.tids` artifact size.
+- daemon restart reload time.
+- cold backend planning time.
+- warm backend planning time.
+- execution latency p50/p95/p99.
+- fallback count and fallback reason.
+- `EXPLAIN (ANALYZE)`의 `JIT:` section 발생 여부.
+- `nvidia-smi` 기준 backend별 CUDA context 생성 여부.
+
+JIT 결정 규칙:
+- `shared_preload_libraries = 'pg_cuvs'`는 이미 실험으로 확정된 필수 설정이다.
+- JIT threshold는 Phase 1.5에서 자동 적용하지 않는다.
+- 대규모 데이터 또는 Phase 2 cost model 확장 후 `JIT:`가 발생하고 latency가 튀는 경우에만 threshold sweep을 수행한다.
+- threshold sweep 후보는 기본값, 1e6, 1e7, 1e8 등으로 두고, vector-search p95/p99가 튀지 않는 가장 낮은 값을 선택한다.
+- mixed analytical workload가 있으면 JIT 이득을 별도 측정하고 전역 설정 여부를 다시 판단한다.
+
+#### 6. Operational Safety
 
 Phase 2 전에 정리할 항목:
 - daemon signal handler는 flag만 set한다. CUDA serialize, mutex, file I/O는 main loop의 graceful shutdown path에서 수행한다.
 - planner cost path에서 CUDA runtime을 직접 touch하지 않는다. daemon status cache 또는 conservative cost로 대체한다. (구현 완료: `cuvsamcostestimate`에서 `cuvs_gpu_available()` 제거.)
 - 첫 쿼리 planning 비용은 `shared_preload_libraries = 'pg_cuvs'`로 제거한다. libcuvs.so(812MB)를 postmaster가 한 번 dlopen하고 백엔드가 fork로 상속 → 95ms -> 0.4ms. `make gpu-postinstall`이 설정. (ADR-018.)
+- JIT 설정은 대규모 benchmark와 threshold sweep 없이 변경하지 않는다.
 - `fprintf(stderr)`는 log level macro로 정리한다: ERROR, WARN, INFO, DEBUG.
 - `PG_CUVS_DEBUG`는 hot-path trace 전용으로 유지한다.
 
-#### 6. Playbook
+#### 7. Playbook
 
 `docs/playbooks/`에 다음 문서를 둔다.
 
 - `gpu-vm-build-and-test.md`
+- `large-dataset-benchmark.md`
+- `jit-threshold-sweep.md`
 - `daemon-restart-recovery.md`
 - `create-index-failure-diagnosis.md`
 - `persistence-corruption-recovery.md`
@@ -158,6 +201,8 @@ Phase 2 전에 정리할 항목:
 Phase 1.5 완료 기준:
 - durability DDL 계약이 구현되어 GPU VM e2e로 검증된다.
 - failure injection으로 주요 실패 경로를 재현할 수 있다.
+- 대규모 데이터 benchmark가 최소 1M/1536d와 VRAM budget stress case를 포함해 실행된다.
+- JIT threshold는 측정 결과가 필요성을 보인 경우에만 결정된다.
 - regression/e2e target이 문서화된 명령 하나로 실행된다.
 - 운영 playbook이 최소 복구 흐름을 포함한다.
 
