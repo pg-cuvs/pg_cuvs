@@ -99,10 +99,8 @@ def build_index(conn, system, n, index_dir):
 def run_queries(conn, queries, kmax, set_sql, warmup=200, sq_n=2000):
     """Run queries one statement at a time; return (ids array, qps, percentiles).
     set_sql: optional 'SET hnsw.ef_search=...' run per connection."""
-    # Inline the query vector as a literal rather than a bind parameter:
-    # pg_cuvs's cagra scan crashes the backend when the ORDER BY vector arrives
-    # as an extended-protocol Param (works with a Const). Inlining keeps all PG
-    # systems on the same path and avoids that pg_cuvs bug.
+    # Inline the query vector as a literal rather than a bind parameter so all
+    # PG systems run an identical statement shape (simple, comparable).
     nq = len(queries)
 
     def vec_literal(v):
@@ -133,36 +131,6 @@ def run_queries(conn, queries, kmax, set_sql, warmup=200, sq_n=2000):
     return ids, nq / total, percentiles_ms(lat)
 
 
-def run_queries_per_conn(dbname, queries, kmax, set_prefix, n_queries):
-    """pg_cuvs can only serve ONE vector query per backend connection -- a
-    second cagra search in the same session segfaults the backend. So open a
-    fresh connection per query. We time ONLY execute+fetch (not connect), and
-    report QPS as 1/mean(execute) (the no-reconnect-overhead estimate). The
-    per-query-connection requirement is itself a reported limitation."""
-    import psycopg
-    nq = min(n_queries, len(queries))
-    ids = np.full((nq, kmax), -1, dtype=np.int64)
-    lat = []
-    for i in range(nq):
-        c = psycopg.connect(dbname=dbname, autocommit=True)
-        try:
-            cur = c.cursor()
-            if set_prefix:
-                cur.execute(set_prefix)
-            lit = "[" + ",".join(repr(float(x)) for x in queries[i].tolist()) + "]"
-            t1 = time.perf_counter()
-            cur.execute(f"SELECT id FROM t ORDER BY embedding <-> '{lit}'::vector LIMIT {kmax}")
-            rows = cur.fetchall()
-            lat.append(time.perf_counter() - t1)
-            for j, r in enumerate(rows):
-                ids[i, j] = r[0]
-        finally:
-            c.close()
-    import numpy as _np
-    qps = nq / float(_np.sum(lat)) if lat else float("nan")
-    return ids, qps, percentiles_ms(lat)
-
-
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--corpus", required=True)
@@ -179,9 +147,6 @@ def main():
     ap.add_argument("--exact-queries", type=int, default=200,
                     help="query subset for the exact seqscan baseline (slow; "
                          "recall is 1.0 by definition)")
-    ap.add_argument("--pgcuvs-queries", type=int, default=2000,
-                    help="query count for pg_cuvs (one fresh connection each, "
-                         "since it segfaults on a 2nd query per connection)")
     ap.add_argument("--max-queries", type=int, default=2000,
                     help="cap per-query SQL count for hnsw/ivfflat sweeps "
                          "(2000 is plenty for a stable recall@k estimate)")
@@ -230,8 +195,7 @@ def main():
             sweeps = [(None, "k=100(fixed)")]
             set_prefix = f"SET cuvs.index_dir = '{args.index_dir}'"
             sysname = "pg_cuvs"
-            note = ("k hardcoded 100 internally; 1 query per connection "
-                    "(2nd cagra query per backend segfaults); qps=1/mean(execute)")
+            note = "k hardcoded 100 internally (LIMIT not wired to GPU top-k)"
         elif args.system == "hnsw":
             sweeps = [(f"SET hnsw.ef_search={v}", f"ef_search={v}")
                       for v in (10, 20, 40, 80, 120, 200, 400)]
@@ -240,25 +204,14 @@ def main():
             sweeps = [(f"SET ivfflat.probes={v}", f"probes={v}")
                       for v in (1, 4, 8, 16, 32, 64, 128)]
             set_prefix, sysname, note = None, "pgvector-ivfflat", ""
-        if args.system in ("hnsw", "ivfflat"):
-            qcap = min(args.max_queries, nq)
-            qset, gtset, n_rep = queries[:qcap], gt[:qcap], qcap
-        else:  # pg_cuvs: per-conn loop caps to --pgcuvs-queries itself
-            qset, gtset, n_rep = queries, gt, nq
+        qcap = min(args.max_queries, nq)
+        qset, gtset, n_rep = queries[:qcap], gt[:qcap], qcap
 
     for set_sql, label in sweeps:
         full_set = "; ".join(x for x in (set_prefix, set_sql) if x)
-        if args.system == "pg_cuvs":
-            # fresh connection per query (see run_queries_per_conn); capped.
-            n_rep = min(args.pgcuvs_queries, nq)
-            ids, qps, (p50, p95, p99) = run_queries_per_conn(
-                args.dbname, qset, kmax, full_set or None, n_rep)
-            gtset_eff = gtset[:n_rep]
-        else:
-            ids, qps, (p50, p95, p99) = run_queries(conn, qset, kmax, full_set or None)
-            gtset_eff = gtset
+        ids, qps, (p50, p95, p99) = run_queries(conn, qset, kmax, full_set or None)
         for k in ks:
-            rec = recall_at_k(ids[:, :k], gtset_eff[:, :k], k)
+            rec = recall_at_k(ids[:, :k], gtset[:, :k], k)
             emit_result(args.out, system=sysname, dataset=args.dataset, N=args.n, dim=dim,
                         metric="cosine(L2-normed)", k=k, param_set=label,
                         build_time_s=round(bt, 3), index_bytes=idx_bytes, host_mem_mb=None,
