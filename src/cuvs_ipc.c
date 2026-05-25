@@ -261,6 +261,9 @@ cuvs_ipc_search(
     if (hdr.status == CUVS_STATUS_OK && hdr.n_results > 0)
     {
         int n = (int)hdr.n_results;
+        fprintf(stderr, "[ipcsearch-dbg] hdr.n_results=%d requested_k=%d\n", n, k);
+        /* Defensive: never write more than the caller's k-sized buffers. */
+        int n_write = (n > k) ? k : n;
         CuvsResult *results = malloc(n * sizeof(CuvsResult));
         if (!results)
         {
@@ -275,12 +278,12 @@ cuvs_ipc_search(
             goto cleanup;
         }
 
-        for (int i = 0; i < n; i++)
+        for (int i = 0; i < n_write; i++)
         {
             tids_out[i] = results[i].tid;
             dist_out[i] = results[i].distance;
         }
-        *n_out = n;
+        *n_out = n_write;
         free(results);
     }
     else
