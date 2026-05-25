@@ -99,23 +99,32 @@ def build_index(conn, system, n, index_dir):
 def run_queries(conn, queries, kmax, set_sql, warmup=200, sq_n=2000):
     """Run queries one statement at a time; return (ids array, qps, percentiles).
     set_sql: optional 'SET hnsw.ef_search=...' run per connection."""
-    import pgvector.psycopg
-    pgvector.psycopg.register_vector(conn)
+    # Inline the query vector as a literal rather than a bind parameter:
+    # pg_cuvs's cagra scan crashes the backend when the ORDER BY vector arrives
+    # as an extended-protocol Param (works with a Const). Inlining keeps all PG
+    # systems on the same path and avoids that pg_cuvs bug.
     nq = len(queries)
+
+    def vec_literal(v):
+        return "[" + ",".join(repr(float(x)) for x in v.tolist()) + "]"
+
     with conn.cursor() as cur:
         if set_sql:
             cur.execute(set_sql)
-        q = "SELECT id FROM t ORDER BY embedding <-> %s LIMIT %s"
+
+        def one(i):
+            cur.execute(f"SELECT id FROM t ORDER BY embedding <-> "
+                        f"'{vec_literal(queries[i])}'::vector LIMIT {kmax}")
+            return cur.fetchall()
+
         for i in range(min(warmup, nq)):
-            cur.execute(q, (queries[i], kmax))
-            cur.fetchall()
+            one(i)
         ids = np.full((nq, kmax), -1, dtype=np.int64)
         lat = []
         t0 = time.perf_counter()
         for i in range(nq):
             t1 = time.perf_counter()
-            cur.execute(q, (queries[i], kmax))
-            rows = cur.fetchall()
+            rows = one(i)
             if i < sq_n:
                 lat.append(time.perf_counter() - t1)
             for j, r in enumerate(rows):
@@ -189,6 +198,12 @@ def main():
                       for v in (1, 4, 8, 16, 32, 64, 128)]
             set_prefix, sysname, note = None, "pgvector-ivfflat", ""
         qset, gtset, n_rep = queries, gt, nq
+
+    # Query in autocommit mode: pg_cuvs's cagra scan crashes the backend when a
+    # search runs inside an open transaction block (autocommit=False). Each
+    # query as its own transaction is also the realistic app pattern.
+    conn.commit()
+    conn.autocommit = True
 
     for set_sql, label in sweeps:
         full_set = "; ".join(x for x in (set_prefix, set_sql) if x)

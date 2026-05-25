@@ -67,8 +67,12 @@ if [ "$GPU_FITS" = "1" ]; then
     step "raw cuvs CAGRA N=$N"
     python infra/anbench/run_cuvs.py --corpus "$CORPUS" --queries "$Q" --gt "$GT" \
         --n "$N" --out "$RUN" --ks "$KS" || echo "[run_all] WARN cuvs failed"
+    # Hybrid: GPU CAGRA build -> CPU HNSW search (no GPU/daemon at query time)
+    step "cagra->hnsw (GPU build, CPU search) N=$N"
+    python infra/anbench/run_cagra_hnsw.py --corpus "$CORPUS" --queries "$Q" --gt "$GT" \
+        --n "$N" --out "$RUN" --ks "$KS" || echo "[run_all] WARN cagra-hnsw failed"
 else
-    echo "[run_all] SKIP cuvs: exceeds GPU VRAM budget (OOM finding)"
+    echo "[run_all] SKIP cuvs + cagra-hnsw: exceeds GPU VRAM budget (OOM finding)"
 fi
 
 # --- Tier B: faiss-gpu ---
