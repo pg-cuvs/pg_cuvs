@@ -133,6 +133,36 @@ def run_queries(conn, queries, kmax, set_sql, warmup=200, sq_n=2000):
     return ids, nq / total, percentiles_ms(lat)
 
 
+def run_queries_per_conn(dbname, queries, kmax, set_prefix, n_queries):
+    """pg_cuvs can only serve ONE vector query per backend connection -- a
+    second cagra search in the same session segfaults the backend. So open a
+    fresh connection per query. We time ONLY execute+fetch (not connect), and
+    report QPS as 1/mean(execute) (the no-reconnect-overhead estimate). The
+    per-query-connection requirement is itself a reported limitation."""
+    import psycopg
+    nq = min(n_queries, len(queries))
+    ids = np.full((nq, kmax), -1, dtype=np.int64)
+    lat = []
+    for i in range(nq):
+        c = psycopg.connect(dbname=dbname, autocommit=True)
+        try:
+            cur = c.cursor()
+            if set_prefix:
+                cur.execute(set_prefix)
+            lit = "[" + ",".join(repr(float(x)) for x in queries[i].tolist()) + "]"
+            t1 = time.perf_counter()
+            cur.execute(f"SELECT id FROM t ORDER BY embedding <-> '{lit}'::vector LIMIT {kmax}")
+            rows = cur.fetchall()
+            lat.append(time.perf_counter() - t1)
+            for j, r in enumerate(rows):
+                ids[i, j] = r[0]
+        finally:
+            c.close()
+    import numpy as _np
+    qps = nq / float(_np.sum(lat)) if lat else float("nan")
+    return ids, qps, percentiles_ms(lat)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--corpus", required=True)
@@ -149,6 +179,9 @@ def main():
     ap.add_argument("--exact-queries", type=int, default=200,
                     help="query subset for the exact seqscan baseline (slow; "
                          "recall is 1.0 by definition)")
+    ap.add_argument("--pgcuvs-queries", type=int, default=2000,
+                    help="query count for pg_cuvs (one fresh connection each, "
+                         "since it segfaults on a 2nd query per connection)")
     args = ap.parse_args()
 
     import psycopg
@@ -193,7 +226,9 @@ def main():
         if args.system == "pg_cuvs":
             sweeps = [(None, "k=100(fixed)")]
             set_prefix = f"SET cuvs.index_dir = '{args.index_dir}'"
-            sysname, note = "pg_cuvs", "k hardcoded 100 internally"
+            sysname = "pg_cuvs"
+            note = ("k hardcoded 100 internally; 1 query per connection "
+                    "(2nd cagra query per backend segfaults); qps=1/mean(execute)")
         elif args.system == "hnsw":
             sweeps = [(f"SET hnsw.ef_search={v}", f"ef_search={v}")
                       for v in (10, 20, 40, 80, 120, 200, 400)]
@@ -206,9 +241,17 @@ def main():
 
     for set_sql, label in sweeps:
         full_set = "; ".join(x for x in (set_prefix, set_sql) if x)
-        ids, qps, (p50, p95, p99) = run_queries(conn, qset, kmax, full_set or None)
+        if args.system == "pg_cuvs":
+            # fresh connection per query (see run_queries_per_conn); capped.
+            n_rep = min(args.pgcuvs_queries, nq)
+            ids, qps, (p50, p95, p99) = run_queries_per_conn(
+                args.dbname, qset, kmax, full_set or None, n_rep)
+            gtset_eff = gtset[:n_rep]
+        else:
+            ids, qps, (p50, p95, p99) = run_queries(conn, qset, kmax, full_set or None)
+            gtset_eff = gtset
         for k in ks:
-            rec = recall_at_k(ids[:, :k], gtset[:, :k], k)
+            rec = recall_at_k(ids[:, :k], gtset_eff[:, :k], k)
             emit_result(args.out, system=sysname, dataset=args.dataset, N=args.n, dim=dim,
                         metric="cosine(L2-normed)", k=k, param_set=label,
                         build_time_s=round(bt, 3), index_bytes=idx_bytes, host_mem_mb=None,
