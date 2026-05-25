@@ -41,6 +41,50 @@ int cuvs_parse_index_filename(const char *name, uint32_t *db_oid, uint32_t *inde
 const char *cuvs_status_str(int status);
 
 /* ----------------------------------------------------------------
+ * Versioned, checksummed .tids on-disk sidecar format.
+ *
+ * Layout: [CuvsTidsHeader (32 bytes)] [n_vecs * uint64_t TID body].
+ * LITTLE-ENDIAN ONLY: the daemon is x86-64 and the Makefile sets
+ * RAFT_SYSTEM_LITTLE_ENDIAN=1; no byte-swap is performed. Legacy
+ * headerless .tids files are intentionally rejected by the magic check
+ * (pre-1.0, no shipped users -> reREINDEX such indexes).
+ * ---------------------------------------------------------------- */
+#define CUVS_TIDS_MAGIC    0x53444954u   /* 'TIDS' little-endian */
+#define CUVS_TIDS_VERSION  1u
+#define CUVS_TIDS_MAX_VECS 1000000000LL  /* sanity cap on n_vecs */
+
+typedef struct CuvsTidsHeader {
+    uint32_t magic;
+    uint32_t version;
+    int64_t  n_vecs;
+    uint32_t dim;
+    uint32_t metric;
+    uint32_t body_crc32;   /* crc32 over n_vecs*8 bytes of TID body */
+    uint32_t reserved;     /* must be 0 */
+} CuvsTidsHeader;          /* 32 bytes, LE-only, x86-64 daemon */
+
+/* Standard table-based CRC-32 (IEEE 802.3, reflected, poly 0xEDB88320). */
+uint32_t cuvs_crc32(const void *data, size_t len);
+
+/* Write header + TID body to an open FILE*. Returns 0 on success, -1 on a
+ * short/failed fwrite. Caller is responsible for fflush/fsync/rename. */
+int cuvs_tids_write(FILE *f, int64_t n_vecs, uint32_t dim, uint32_t metric,
+                    const uint64_t *tids);
+
+/* Read + validate a .tids file from an open FILE*. On success returns 0,
+ * fills *hdr_out, and allocates *tids_out via malloc (caller frees).
+ * Validates magic, version, n_vecs range (0 < n_vecs <= CUVS_TIDS_MAX_VECS),
+ * full body read, and body crc32. On any failure returns -1 and frees only
+ * what it allocated (leaving *tids_out NULL). */
+int cuvs_tids_read(FILE *f, CuvsTidsHeader *hdr_out, uint64_t **tids_out);
+
+#ifdef CUVS_TEST_HOOKS
+/* Test-only fault injection: returns 1 if env var `name` is set, else 0.
+ * Compiled in ONLY under CUVS_TEST_HOOKS; absent from production builds. */
+int cuvs_fault(const char *name);
+#endif
+
+/* ----------------------------------------------------------------
  * Circuit breaker state (per index, process-local). Moved here from
  * cuvs_ipc.h so it can be linked by daemon + extension + tests.
  * ---------------------------------------------------------------- */

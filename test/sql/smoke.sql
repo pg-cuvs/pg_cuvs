@@ -25,8 +25,8 @@ SHOW cuvs.circuit_breaker_threshold;
 SELECT proname FROM pg_proc WHERE proname = 'pg_cuvs_reset_circuit';
 
 -- CREATE INDEX USING cagra on a small table.
--- With no daemon running, the index is built (ambuild issues WARNING)
--- but the table is accessible via HNSW fallback.
+-- With no daemon running, cuvs_ambuild now ereport(ERROR)s for DDL
+-- durability, so this CREATE INDEX fails unless a daemon is reachable.
 CREATE TABLE smoke_items (id bigint, embedding vector(4));
 INSERT INTO smoke_items VALUES
     (1, '[1,0,0,0]'), (2, '[0,1,0,0]'),

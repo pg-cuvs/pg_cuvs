@@ -38,6 +38,8 @@
 #define CUVS_STATUS_OOM_FALLBACK 2   /* VRAM exhausted → caller must use CPU */
 #define CUVS_STATUS_NOT_FOUND    3   /* index OID not loaded */
 #define CUVS_STATUS_UNAVAILABLE  4   /* daemon unreachable (connect failed) */
+#define CUVS_STATUS_BUILD_FAILED   5   /* GPU index build failed */
+#define CUVS_STATUS_PERSIST_FAILED 6   /* build OK, disk persist failed */
 
 /* ----------------------------------------------------------------
  * Command frame (sent over UDS, fixed size)

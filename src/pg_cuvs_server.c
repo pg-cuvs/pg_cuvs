@@ -179,25 +179,37 @@ load_index(uint32_t db_oid, uint32_t index_oid)
     index_file_path(idx_path, sizeof(idx_path), g_index_dir, db_oid, index_oid);
     tids_file_path(tids_path, sizeof(tids_path), g_index_dir, db_oid, index_oid);
 
-    /* Read TIDs file first to get n_vecs and dim */
+    /* Read + validate the versioned, checksummed .tids sidecar. A reject
+     * (bad magic/version/range/crc, legacy headerless format) means this
+     * pair must be skipped; the index must be REINDEXed. */
     FILE *f = fopen(tids_path, "rb");
     if (!f)
         return -1;
 
-    int64_t  n_vecs;
-    uint32_t dim, metric;
-    fread(&n_vecs,  sizeof(int64_t),  1, f);
-    fread(&dim,     sizeof(uint32_t), 1, f);
-    fread(&metric,  sizeof(uint32_t), 1, f);
-
-    uint64_t *tids = malloc((size_t)n_vecs * sizeof(uint64_t));
-    if (!tids)
+    CuvsTidsHeader thdr;
+    uint64_t *tids = NULL;
+    if (cuvs_tids_read(f, &thdr, &tids) != 0)
     {
         fclose(f);
+        fprintf(stderr, "pg_cuvs_server: .tids validation failed for %u/%u, skip\n",
+                db_oid, index_oid);
         return -1;
     }
-    fread(tids, sizeof(uint64_t), (size_t)n_vecs, f);
     fclose(f);
+
+    int64_t  n_vecs = thdr.n_vecs;
+    uint32_t dim    = thdr.dim;
+    uint32_t metric = thdr.metric;
+
+    /* Header sanity: n_vecs already validated > 0 by cuvs_tids_read; require
+     * a non-zero dimension before trusting the cagra side. */
+    if (dim == 0)
+    {
+        fprintf(stderr, "pg_cuvs_server: .tids header dim=0 for %u/%u, skip\n",
+                db_oid, index_oid);
+        free(tids);
+        return -1;
+    }
 
     /* VRAM preflight check */
     size_t needed = estimate_vram_bytes(n_vecs, (int)dim);
@@ -392,13 +404,19 @@ recv_all(int fd, void *buf, size_t len)
 }
 
 static void
-send_error(int client_fd, const char *msg)
+send_error_code(int client_fd, int status, const char *msg)
 {
     CuvsReplyHeader hdr = {0};
-    hdr.status = CUVS_STATUS_ERROR;
+    hdr.status = status;
     hdr.n_results = 0;
     strncpy(hdr.error, msg, sizeof(hdr.error) - 1);
     send_all(client_fd, &hdr, sizeof(hdr));
+}
+
+static void
+send_error(int client_fd, const char *msg)
+{
+    send_error_code(client_fd, CUVS_STATUS_ERROR, msg);
 }
 
 /* ----------------------------------------------------------------
@@ -534,12 +552,12 @@ write_tids_atomic(const char *tids_tmp,
                 tids_tmp, errno, strerror(errno));
         return -1;
     }
-    int ok = 1;
-    if (fwrite(&n_vecs, sizeof(int64_t),  1, f) != 1) ok = 0;
-    if (fwrite(&dim,    sizeof(uint32_t), 1, f) != 1) ok = 0;
-    if (fwrite(&metric, sizeof(uint32_t), 1, f) != 1) ok = 0;
-    if (fwrite(tids,    sizeof(uint64_t), (size_t)n_vecs, f)
-        != (size_t)n_vecs) ok = 0;
+    int ok = (cuvs_tids_write(f, n_vecs, dim, metric, tids) == 0);
+    if (ok && fflush(f) != 0) {
+        fprintf(stderr, "write_tids_atomic: fflush %s FAILED errno=%d\n",
+                tids_tmp, errno);
+        ok = 0;
+    }
     if (ok && fsync(fileno(f)) != 0) {
         fprintf(stderr, "write_tids_atomic: fsync %s FAILED errno=%d\n",
                 tids_tmp, errno);
@@ -650,7 +668,7 @@ handle_build(int client_fd, const CuvsCmdFrame *cmd)
         fprintf(stderr, "[handle_build] cuvs_cagra_build returned NULL\n");
         pthread_mutex_unlock(&g_index_mutex);
         munmap(mem, total);
-        send_error(client_fd, "cuvs_cagra_build failed");
+        send_error_code(client_fd, CUVS_STATUS_BUILD_FAILED, "cuvs_cagra_build failed");
         return;
     }
     DBG("[handle_build] cuvs_cagra_build OK\n");
@@ -661,7 +679,7 @@ handle_build(int client_fd, const CuvsCmdFrame *cmd)
         cuvs_cagra_free(new_handle);
         pthread_mutex_unlock(&g_index_mutex);
         munmap(mem, total);
-        send_error(client_fd, "malloc tids failed");
+        send_error_code(client_fd, CUVS_STATUS_BUILD_FAILED, "malloc tids failed");
         return;
     }
     memcpy(new_tids, tids_in, tid_bytes);
@@ -678,27 +696,54 @@ handle_build(int client_fd, const CuvsCmdFrame *cmd)
     snprintf(idx_tmp,  sizeof(idx_tmp),  "%s.tmp", idx_final);
     snprintf(tids_tmp, sizeof(tids_tmp), "%s.tmp", tids_final);
 
+#ifdef CUVS_TEST_HOOKS
+    if (cuvs_fault("CUVS_FAULT_TIDS_WRITE")) {
+        fprintf(stderr, "[handle_build] fault injection: CUVS_FAULT_TIDS_WRITE\n");
+        goto persist_fail;
+    }
+#endif
     if (write_tids_atomic(tids_tmp, cmd->n_vecs, cmd->dim, cmd->metric, new_tids) != 0)
         goto persist_fail;
     DBG("[handle_build] tids.tmp written + fsynced\n");
 
+#ifdef CUVS_TEST_HOOKS
+    if (cuvs_fault("CUVS_FAULT_SERIALIZE")) {
+        fprintf(stderr, "[handle_build] fault injection: CUVS_FAULT_SERIALIZE\n");
+        goto persist_fail;
+    }
+#endif
     DBG("[handle_build] cuvs_cagra_serialize(%s)...\n", idx_tmp);
     if (cuvs_cagra_serialize(new_handle, idx_tmp) != 0) {
         fprintf(stderr, "[handle_build] cuvs_cagra_serialize FAILED (path=%s)\n", idx_tmp);
         goto persist_fail;
     }
-    if (fsync_path(idx_tmp) != 0)
-        fprintf(stderr, "[handle_build] WARN: fsync %s failed errno=%d\n", idx_tmp, errno);
+    if (fsync_path(idx_tmp) != 0) {
+        fprintf(stderr, "[handle_build] fsync %s failed errno=%d; aborting commit\n", idx_tmp, errno);
+        goto persist_fail;
+    }
     DBG("[handle_build] cagra.tmp written + fsynced\n");
 
     /* Commit point: atomic renames. tids first, then cagra (the file
      * startup_load_indexes scans for). If second rename fails, log and
      * unlink whatever we renamed to leave consistent state. */
+#ifdef CUVS_TEST_HOOKS
+    if (cuvs_fault("CUVS_FAULT_RENAME_TIDS")) {
+        fprintf(stderr, "[handle_build] fault injection: CUVS_FAULT_RENAME_TIDS\n");
+        goto persist_fail;
+    }
+#endif
     if (rename(tids_tmp, tids_final) != 0) {
         fprintf(stderr, "[handle_build] rename %s -> %s FAILED errno=%d (%s)\n",
                 tids_tmp, tids_final, errno, strerror(errno));
         goto persist_fail;
     }
+#ifdef CUVS_TEST_HOOKS
+    if (cuvs_fault("CUVS_FAULT_RENAME_CAGRA")) {
+        fprintf(stderr, "[handle_build] fault injection: CUVS_FAULT_RENAME_CAGRA\n");
+        unlink(tids_final);
+        goto persist_fail;
+    }
+#endif
     if (rename(idx_tmp, idx_final) != 0) {
         fprintf(stderr, "[handle_build] rename %s -> %s FAILED errno=%d (%s); "
                         "unlinking tids to avoid mismatch\n",
@@ -736,7 +781,7 @@ handle_build(int client_fd, const CuvsCmdFrame *cmd)
             cuvs_cagra_free(new_handle);
             free(new_tids);
             pthread_mutex_unlock(&g_index_mutex);
-            send_error(client_fd, "index registry full");
+            send_error_code(client_fd, CUVS_STATUS_PERSIST_FAILED, "index registry full");
             return;
         }
         IndexEntry *e = &g_indexes[g_n_indexes++];
@@ -771,7 +816,7 @@ persist_fail:
     cuvs_cagra_free(new_handle);
     free(new_tids);
     pthread_mutex_unlock(&g_index_mutex);
-    send_error(client_fd, "disk persistence failed");
+    send_error_code(client_fd, CUVS_STATUS_PERSIST_FAILED, "disk persistence failed");
 }
 
 /* ----------------------------------------------------------------

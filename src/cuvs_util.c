@@ -10,6 +10,7 @@
 #include "cuvs_ipc.h"   /* CUVS_STATUS_* defines (PG-free, CUDA-free) */
 
 #include <string.h>
+#include <stdlib.h>
 
 /* ----------------------------------------------------------------
  * Index filename parsing: "<db_oid>_<index_oid>.cagra"
@@ -47,9 +48,104 @@ cuvs_status_str(int status)
         case CUVS_STATUS_OOM_FALLBACK: return "oom_fallback";
         case CUVS_STATUS_NOT_FOUND:    return "not_found";
         case CUVS_STATUS_UNAVAILABLE:  return "unavailable";
+        case CUVS_STATUS_BUILD_FAILED:   return "build_failed";
+        case CUVS_STATUS_PERSIST_FAILED: return "persist_failed";
         default:                       return "unknown";
     }
 }
+
+/* ----------------------------------------------------------------
+ * CRC-32 (IEEE 802.3, reflected, poly 0xEDB88320) and versioned .tids I/O.
+ * LE-only: see cuvs_util.h header comment.
+ * ---------------------------------------------------------------- */
+uint32_t
+cuvs_crc32(const void *data, size_t len)
+{
+    static uint32_t table[256];
+    static int      table_init = 0;
+    if (!table_init)
+    {
+        for (uint32_t i = 0; i < 256; i++)
+        {
+            uint32_t c = i;
+            for (int k = 0; k < 8; k++)
+                c = (c & 1) ? (0xEDB88320u ^ (c >> 1)) : (c >> 1);
+            table[i] = c;
+        }
+        table_init = 1;
+    }
+
+    const unsigned char *p = (const unsigned char *)data;
+    uint32_t crc = 0xFFFFFFFFu;
+    for (size_t i = 0; i < len; i++)
+        crc = table[(crc ^ p[i]) & 0xFFu] ^ (crc >> 8);
+    return crc ^ 0xFFFFFFFFu;
+}
+
+int
+cuvs_tids_write(FILE *f, int64_t n_vecs, uint32_t dim, uint32_t metric,
+                const uint64_t *tids)
+{
+    CuvsTidsHeader hdr;
+    hdr.magic      = CUVS_TIDS_MAGIC;
+    hdr.version    = CUVS_TIDS_VERSION;
+    hdr.n_vecs     = n_vecs;
+    hdr.dim        = dim;
+    hdr.metric     = metric;
+    hdr.body_crc32 = cuvs_crc32(tids, (size_t)n_vecs * sizeof(uint64_t));
+    hdr.reserved   = 0;
+
+    if (fwrite(&hdr, sizeof(hdr), 1, f) != 1)
+        return -1;
+    if (fwrite(tids, sizeof(uint64_t), (size_t)n_vecs, f) != (size_t)n_vecs)
+        return -1;
+    return 0;
+}
+
+int
+cuvs_tids_read(FILE *f, CuvsTidsHeader *hdr_out, uint64_t **tids_out)
+{
+    *tids_out = NULL;
+
+    CuvsTidsHeader hdr;
+    if (fread(&hdr, sizeof(hdr), 1, f) != 1)
+        return -1;
+    if (hdr.magic != CUVS_TIDS_MAGIC)
+        return -1;
+    if (hdr.version != CUVS_TIDS_VERSION)
+        return -1;
+    if (hdr.n_vecs <= 0 || hdr.n_vecs > CUVS_TIDS_MAX_VECS)
+        return -1;
+
+    size_t body_bytes = (size_t)hdr.n_vecs * sizeof(uint64_t);
+    uint64_t *tids = malloc(body_bytes);
+    if (!tids)
+        return -1;
+
+    if (fread(tids, sizeof(uint64_t), (size_t)hdr.n_vecs, f) != (size_t)hdr.n_vecs)
+    {
+        free(tids);
+        return -1;
+    }
+    if (cuvs_crc32(tids, body_bytes) != hdr.body_crc32)
+    {
+        free(tids);
+        return -1;
+    }
+
+    if (hdr_out)
+        *hdr_out = hdr;
+    *tids_out = tids;
+    return 0;
+}
+
+#ifdef CUVS_TEST_HOOKS
+int
+cuvs_fault(const char *name)
+{
+    return getenv(name) != NULL;
+}
+#endif
 
 /* ----------------------------------------------------------------
  * Circuit breaker state (process-local)

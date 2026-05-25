@@ -10,6 +10,7 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
 
 static int g_pass = 0;
 static int g_fail = 0;
@@ -89,6 +90,10 @@ test_status_str(void)
            "status not_found");
     ASSERT(strcmp(cuvs_status_str(CUVS_STATUS_UNAVAILABLE), "unavailable") == 0,
            "status unavailable");
+    ASSERT(strcmp(cuvs_status_str(CUVS_STATUS_BUILD_FAILED), "build_failed") == 0,
+           "status build_failed");
+    ASSERT(strcmp(cuvs_status_str(CUVS_STATUS_PERSIST_FAILED), "persist_failed") == 0,
+           "status persist_failed");
     ASSERT(strcmp(cuvs_status_str(42), "unknown") == 0, "status out-of-range");
     ASSERT(strcmp(cuvs_status_str(-1), "unknown") == 0, "status negative");
 }
@@ -139,6 +144,156 @@ test_circuit_breaker(void)
     ASSERT(cuvs_n_circuit_breakers == 0, "reset_all count back to zero");
 }
 
+static void
+test_crc32(void)
+{
+    /* Standard CRC-32 (IEEE 802.3) check vectors. */
+    ASSERT(cuvs_crc32("", 0) == 0x00000000u, "crc32 empty");
+    ASSERT(cuvs_crc32("123456789", 9) == 0xCBF43926u, "crc32 check string");
+    ASSERT(cuvs_crc32("a", 1) == 0xE8B7BE43u, "crc32 single byte");
+
+    /* Sensitivity: a one-byte change must change the crc. */
+    ASSERT(cuvs_crc32("123456789", 9) != cuvs_crc32("123456780", 9),
+           "crc32 detects single-byte diff");
+}
+
+static void
+test_tids_roundtrip(void)
+{
+    const int64_t  n = 5;
+    const uint32_t dim = 128, metric = 1;
+    uint64_t tids[5] = { 0, 1, 0xFFFFFFFFFFFFFFFFull, 42, 0xABCDEF01ull };
+
+    FILE *f = tmpfile();
+    ASSERT(f != NULL, "tmpfile open (write)");
+    ASSERT(cuvs_tids_write(f, n, dim, metric, tids) == 0, "tids_write ok");
+    rewind(f);
+
+    CuvsTidsHeader hdr;
+    uint64_t *out = NULL;
+    ASSERT(cuvs_tids_read(f, &hdr, &out) == 0, "tids_read ok");
+    ASSERT(hdr.magic == CUVS_TIDS_MAGIC, "rt magic");
+    ASSERT(hdr.version == CUVS_TIDS_VERSION, "rt version");
+    ASSERT(hdr.n_vecs == n, "rt n_vecs");
+    ASSERT(hdr.dim == dim, "rt dim");
+    ASSERT(hdr.metric == metric, "rt metric");
+    ASSERT(hdr.reserved == 0, "rt reserved zero");
+    if (out)
+    {
+        ASSERT(memcmp(out, tids, sizeof(tids)) == 0, "rt tids body identity");
+        free(out);
+    }
+    fclose(f);
+}
+
+/* Write a valid .tids into a tmpfile, optionally let the caller corrupt the
+ * raw bytes, then assert cuvs_tids_read rejects it. */
+static void
+test_tids_rejections(void)
+{
+    const int64_t  n = 4;
+    const uint32_t dim = 16, metric = 0;
+    uint64_t tids[4] = { 10, 20, 30, 40 };
+
+    /* bad magic */
+    {
+        FILE *f = tmpfile();
+        cuvs_tids_write(f, n, dim, metric, tids);
+        rewind(f);
+        uint32_t bad = 0xDEADBEEFu;
+        fwrite(&bad, sizeof(bad), 1, f);   /* overwrite magic */
+        rewind(f);
+        CuvsTidsHeader h; uint64_t *o = NULL;
+        ASSERT(cuvs_tids_read(f, &h, &o) == -1, "reject bad magic");
+        ASSERT(o == NULL, "bad magic leaves out NULL");
+        fclose(f);
+    }
+
+    /* bad version */
+    {
+        FILE *f = tmpfile();
+        cuvs_tids_write(f, n, dim, metric, tids);
+        fseek(f, sizeof(uint32_t), SEEK_SET);  /* version field */
+        uint32_t badv = 999u;
+        fwrite(&badv, sizeof(badv), 1, f);
+        rewind(f);
+        CuvsTidsHeader h; uint64_t *o = NULL;
+        ASSERT(cuvs_tids_read(f, &h, &o) == -1, "reject bad version");
+        fclose(f);
+    }
+
+    /* n_vecs <= 0 */
+    {
+        FILE *f = tmpfile();
+        cuvs_tids_write(f, n, dim, metric, tids);
+        fseek(f, offsetof(CuvsTidsHeader, n_vecs), SEEK_SET);
+        int64_t zero = 0;
+        fwrite(&zero, sizeof(zero), 1, f);
+        rewind(f);
+        CuvsTidsHeader h; uint64_t *o = NULL;
+        ASSERT(cuvs_tids_read(f, &h, &o) == -1, "reject n_vecs<=0");
+        fclose(f);
+    }
+
+    /* n_vecs > CAP */
+    {
+        FILE *f = tmpfile();
+        cuvs_tids_write(f, n, dim, metric, tids);
+        fseek(f, offsetof(CuvsTidsHeader, n_vecs), SEEK_SET);
+        int64_t huge = CUVS_TIDS_MAX_VECS + 1;
+        fwrite(&huge, sizeof(huge), 1, f);
+        rewind(f);
+        CuvsTidsHeader h; uint64_t *o = NULL;
+        ASSERT(cuvs_tids_read(f, &h, &o) == -1, "reject n_vecs>CAP");
+        fclose(f);
+    }
+
+    /* truncated body: header claims n=4 but only 2 TIDs present */
+    {
+        FILE *f = tmpfile();
+        CuvsTidsHeader h;
+        h.magic = CUVS_TIDS_MAGIC; h.version = CUVS_TIDS_VERSION;
+        h.n_vecs = n; h.dim = dim; h.metric = metric;
+        h.body_crc32 = cuvs_crc32(tids, sizeof(tids)); h.reserved = 0;
+        fwrite(&h, sizeof(h), 1, f);
+        fwrite(tids, sizeof(uint64_t), 2, f);   /* short body */
+        rewind(f);
+        CuvsTidsHeader hr; uint64_t *o = NULL;
+        ASSERT(cuvs_tids_read(f, &hr, &o) == -1, "reject truncated body");
+        ASSERT(o == NULL, "truncated body frees alloc");
+        fclose(f);
+    }
+
+    /* corrupted body: flip a byte so crc mismatches */
+    {
+        FILE *f = tmpfile();
+        cuvs_tids_write(f, n, dim, metric, tids);
+        fseek(f, sizeof(CuvsTidsHeader), SEEK_SET);  /* first body byte */
+        unsigned char b;
+        fread(&b, 1, 1, f);
+        fseek(f, sizeof(CuvsTidsHeader), SEEK_SET);
+        b ^= 0xFFu;
+        fwrite(&b, 1, 1, f);
+        rewind(f);
+        CuvsTidsHeader h; uint64_t *o = NULL;
+        ASSERT(cuvs_tids_read(f, &h, &o) == -1, "reject crc mismatch");
+        ASSERT(o == NULL, "crc mismatch frees alloc");
+        fclose(f);
+    }
+}
+
+#ifdef CUVS_TEST_HOOKS
+static void
+test_fault_hook(void)
+{
+    unsetenv("CUVS_FAULT_DUMMY");
+    ASSERT(cuvs_fault("CUVS_FAULT_DUMMY") == 0, "fault unset returns 0");
+    setenv("CUVS_FAULT_DUMMY", "1", 1);
+    ASSERT(cuvs_fault("CUVS_FAULT_DUMMY") == 1, "fault set returns 1");
+    unsetenv("CUVS_FAULT_DUMMY");
+}
+#endif
+
 int
 main(void)
 {
@@ -146,6 +301,12 @@ main(void)
     test_parse_index_filename();
     test_status_str();
     test_circuit_breaker();
+    test_crc32();
+    test_tids_roundtrip();
+    test_tids_rejections();
+#ifdef CUVS_TEST_HOOKS
+    test_fault_hook();
+#endif
 
     printf("[INFO] cuvs_util unit tests: %d passed, %d failed\n", g_pass, g_fail);
     if (g_fail == 0)
