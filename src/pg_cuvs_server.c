@@ -25,12 +25,9 @@
 #include <string.h>
 #include <unistd.h>
 
-/* Compile-time debug logging. Enable via -DPG_CUVS_DEBUG=1 in Makefile or env.
- * Hot-path traces are off by default; error paths still log unconditionally. */
-#ifndef PG_CUVS_DEBUG
-#define PG_CUVS_DEBUG 0
-#endif
-#define DBG(...) do { if (PG_CUVS_DEBUG) { fprintf(stderr, __VA_ARGS__); } } while (0)
+/* Leveled logging (LOG_ERROR/WARN/INFO unconditional, LOG_DEBUG gated by
+ * PG_CUVS_DEBUG) is provided by cuvs_util.h. Enable hot-path traces via
+ * -DPG_CUVS_DEBUG=1 in the Makefile or env. */
 #include <errno.h>
 #include <signal.h>
 #include <pthread.h>
@@ -141,24 +138,24 @@ save_index(IndexEntry *e)
         return -1;
 
     if (cuvs_cagra_serialize(e->handle, idx_tmp) != 0) {
-        fprintf(stderr, "save_index: cuvs_cagra_serialize FAILED for %u/%u\n",
+        LOG_ERROR("save_index: cuvs_cagra_serialize FAILED for %u/%u\n",
                 e->db_oid, e->index_oid);
         unlink(tids_tmp);
         return -1;
     }
     if (fsync_path(idx_tmp) != 0)
-        fprintf(stderr, "save_index: WARN fsync %s failed errno=%d\n", idx_tmp, errno);
+        LOG_WARN("save_index: fsync %s failed errno=%d\n", idx_tmp, errno);
 
     if (rename(tids_tmp, tids_final) != 0) {
-        fprintf(stderr, "save_index: rename %s -> %s FAILED errno=%d (%s)\n",
+        LOG_ERROR("save_index: rename %s -> %s FAILED errno=%d (%s)\n",
                 tids_tmp, tids_final, errno, strerror(errno));
         unlink(tids_tmp);
         unlink(idx_tmp);
         return -1;
     }
     if (rename(idx_tmp, idx_final) != 0) {
-        fprintf(stderr, "save_index: rename %s -> %s FAILED errno=%d (%s); "
-                        "unlinking tids to avoid mismatch\n",
+        LOG_ERROR("save_index: rename %s -> %s FAILED errno=%d (%s); "
+                  "unlinking tids to avoid mismatch\n",
                 idx_tmp, idx_final, errno, strerror(errno));
         unlink(tids_final);
         unlink(idx_tmp);
@@ -167,7 +164,7 @@ save_index(IndexEntry *e)
     int dir_fd = open(g_index_dir, O_RDONLY);
     if (dir_fd >= 0) { fsync(dir_fd); close(dir_fd); }
 
-    fprintf(stderr, "pg_cuvs_server: saved index %u/%u (%lld vecs)\n",
+    LOG_INFO("pg_cuvs_server: saved index %u/%u (%lld vecs)\n",
             e->db_oid, e->index_oid, (long long)e->n_vecs);
     return 0;
 }
@@ -191,7 +188,7 @@ load_index(uint32_t db_oid, uint32_t index_oid)
     if (cuvs_tids_read(f, &thdr, &tids) != 0)
     {
         fclose(f);
-        fprintf(stderr, "pg_cuvs_server: .tids validation failed for %u/%u, skip\n",
+        LOG_ERROR("pg_cuvs_server: .tids validation failed for %u/%u, skip\n",
                 db_oid, index_oid);
         return -1;
     }
@@ -205,7 +202,7 @@ load_index(uint32_t db_oid, uint32_t index_oid)
      * a non-zero dimension before trusting the cagra side. */
     if (dim == 0)
     {
-        fprintf(stderr, "pg_cuvs_server: .tids header dim=0 for %u/%u, skip\n",
+        LOG_ERROR("pg_cuvs_server: .tids header dim=0 for %u/%u, skip\n",
                 db_oid, index_oid);
         free(tids);
         return -1;
@@ -216,14 +213,14 @@ load_index(uint32_t db_oid, uint32_t index_oid)
     size_t free_vram = gpu_free_vram_bytes();
     if (g_max_vram_bytes > 0 && total_vram_used() + needed > g_max_vram_bytes)
     {
-        fprintf(stderr, "pg_cuvs_server: VRAM budget exceeded loading %u/%u, skip\n",
+        LOG_WARN("pg_cuvs_server: VRAM budget exceeded loading %u/%u, skip\n",
                 db_oid, index_oid);
         free(tids);
         return -1;
     }
     if (needed > free_vram)
     {
-        fprintf(stderr, "pg_cuvs_server: insufficient VRAM loading %u/%u, skip\n",
+        LOG_WARN("pg_cuvs_server: insufficient VRAM loading %u/%u, skip\n",
                 db_oid, index_oid);
         free(tids);
         return -1;
@@ -255,7 +252,7 @@ load_index(uint32_t db_oid, uint32_t index_oid)
     e->last_search = time(NULL);
     e->valid       = 1;
 
-    fprintf(stderr, "pg_cuvs_server: loaded index %u/%u (%lld vecs, %zu MB VRAM)\n",
+    LOG_INFO("pg_cuvs_server: loaded index %u/%u (%lld vecs, %zu MB VRAM)\n",
             db_oid, index_oid, (long long)n_vecs, needed / (1024*1024));
     return 0;
 }
@@ -310,8 +307,8 @@ evict_lru(void)
         return 0;
 
     if (save_index(e) != 0) {
-        fprintf(stderr, "evict_lru: save_index FAILED for %u/%u; aborting eviction "
-                        "(VRAM still holds index)\n",
+        LOG_ERROR("evict_lru: save_index FAILED for %u/%u; aborting eviction "
+                  "(VRAM still holds index)\n",
                 e->db_oid, e->index_oid);
         return 0;
     }
@@ -478,10 +475,10 @@ handle_search(int client_fd, const CuvsCmdFrame *cmd)
         return;
     }
 
-    DBG("[handle_search] calling cuvs_cagra_search k=%d dim=%u...\n",
+    LOG_DEBUG("[handle_search] calling cuvs_cagra_search k=%d dim=%u...\n",
             k, cmd->dim);
     int ret = cuvs_cagra_search(e->handle, query, (int)cmd->dim, k, raw);
-    DBG("[handle_search] cuvs_cagra_search rc=%d\n", ret);
+    LOG_DEBUG("[handle_search] cuvs_cagra_search rc=%d\n", ret);
     munmap(query, vec_bytes);
 
     if (ret != 0)
@@ -548,23 +545,23 @@ write_tids_atomic(const char *tids_tmp,
 {
     FILE *f = fopen(tids_tmp, "wb");
     if (!f) {
-        fprintf(stderr, "write_tids_atomic: fopen %s FAILED errno=%d (%s)\n",
+        LOG_ERROR("write_tids_atomic: fopen %s FAILED errno=%d (%s)\n",
                 tids_tmp, errno, strerror(errno));
         return -1;
     }
     int ok = (cuvs_tids_write(f, n_vecs, dim, metric, tids) == 0);
     if (ok && fflush(f) != 0) {
-        fprintf(stderr, "write_tids_atomic: fflush %s FAILED errno=%d\n",
+        LOG_ERROR("write_tids_atomic: fflush %s FAILED errno=%d\n",
                 tids_tmp, errno);
         ok = 0;
     }
     if (ok && fsync(fileno(f)) != 0) {
-        fprintf(stderr, "write_tids_atomic: fsync %s FAILED errno=%d\n",
+        LOG_ERROR("write_tids_atomic: fsync %s FAILED errno=%d\n",
                 tids_tmp, errno);
         ok = 0;
     }
     if (fclose(f) != 0) {
-        fprintf(stderr, "write_tids_atomic: fclose %s FAILED errno=%d\n",
+        LOG_ERROR("write_tids_atomic: fclose %s FAILED errno=%d\n",
                 tids_tmp, errno);
         ok = 0;
     }
@@ -608,29 +605,29 @@ fsync_path(const char *path)
 static void
 handle_build(int client_fd, const CuvsCmdFrame *cmd)
 {
-    DBG("[handle_build] reading index_dir...\n");
+    LOG_DEBUG("[handle_build] reading index_dir...\n");
     char index_dir[256] = {0};
     if (recv_all(client_fd, index_dir, sizeof(index_dir)) < 0)
     {
-        fprintf(stderr, "[handle_build] recv index_dir FAILED errno=%d\n", errno);
+        LOG_ERROR("[handle_build] recv index_dir FAILED errno=%d\n", errno);
         send_error(client_fd, "recv index_dir failed");
         return;
     }
-    DBG("[handle_build] got index_dir=%s\n", index_dir);
+    LOG_DEBUG("[handle_build] got index_dir=%s\n", index_dir);
 
     size_t vec_bytes = (size_t)cmd->n_vecs * cmd->dim * sizeof(float);
     size_t tid_bytes = (size_t)cmd->n_vecs * sizeof(uint64_t);
     size_t total     = vec_bytes + tid_bytes;
 
-    DBG("[handle_build] shm_open(%s)...\n", cmd->shm_key);
+    LOG_DEBUG("[handle_build] shm_open(%s)...\n", cmd->shm_key);
     int shm_fd = shm_open(cmd->shm_key, O_RDONLY, 0);
     if (shm_fd < 0)
     {
-        fprintf(stderr, "[handle_build] shm_open FAILED errno=%d (%s)\n", errno, strerror(errno));
+        LOG_ERROR("[handle_build] shm_open FAILED errno=%d (%s)\n", errno, strerror(errno));
         send_error(client_fd, "shm_open failed");
         return;
     }
-    DBG("[handle_build] shm_open OK fd=%d\n", shm_fd);
+    LOG_DEBUG("[handle_build] shm_open OK fd=%d\n", shm_fd);
 
     void *mem = mmap(NULL, total, PROT_READ, MAP_SHARED, shm_fd, 0);
     close(shm_fd);
@@ -660,18 +657,18 @@ handle_build(int client_fd, const CuvsCmdFrame *cmd)
         return;
     }
 
-    DBG("[handle_build] calling cuvs_cagra_build n_vecs=%lld dim=%u...\n",
+    LOG_DEBUG("[handle_build] calling cuvs_cagra_build n_vecs=%lld dim=%u...\n",
             (long long)cmd->n_vecs, cmd->dim);
     CuvsCagraIndex new_handle = cuvs_cagra_build(vecs, cmd->n_vecs, (int)cmd->dim);
     if (!new_handle)
     {
-        fprintf(stderr, "[handle_build] cuvs_cagra_build returned NULL\n");
+        LOG_ERROR("[handle_build] cuvs_cagra_build returned NULL\n");
         pthread_mutex_unlock(&g_index_mutex);
         munmap(mem, total);
         send_error_code(client_fd, CUVS_STATUS_BUILD_FAILED, "cuvs_cagra_build failed");
         return;
     }
-    DBG("[handle_build] cuvs_cagra_build OK\n");
+    LOG_DEBUG("[handle_build] cuvs_cagra_build OK\n");
 
     uint64_t *new_tids = malloc(tid_bytes);
     if (!new_tids)
@@ -698,55 +695,55 @@ handle_build(int client_fd, const CuvsCmdFrame *cmd)
 
 #ifdef CUVS_TEST_HOOKS
     if (cuvs_fault("CUVS_FAULT_TIDS_WRITE")) {
-        fprintf(stderr, "[handle_build] fault injection: CUVS_FAULT_TIDS_WRITE\n");
+        LOG_ERROR("[handle_build] fault injection: CUVS_FAULT_TIDS_WRITE\n");
         goto persist_fail;
     }
 #endif
     if (write_tids_atomic(tids_tmp, cmd->n_vecs, cmd->dim, cmd->metric, new_tids) != 0)
         goto persist_fail;
-    DBG("[handle_build] tids.tmp written + fsynced\n");
+    LOG_DEBUG("[handle_build] tids.tmp written + fsynced\n");
 
 #ifdef CUVS_TEST_HOOKS
     if (cuvs_fault("CUVS_FAULT_SERIALIZE")) {
-        fprintf(stderr, "[handle_build] fault injection: CUVS_FAULT_SERIALIZE\n");
+        LOG_ERROR("[handle_build] fault injection: CUVS_FAULT_SERIALIZE\n");
         goto persist_fail;
     }
 #endif
-    DBG("[handle_build] cuvs_cagra_serialize(%s)...\n", idx_tmp);
+    LOG_DEBUG("[handle_build] cuvs_cagra_serialize(%s)...\n", idx_tmp);
     if (cuvs_cagra_serialize(new_handle, idx_tmp) != 0) {
-        fprintf(stderr, "[handle_build] cuvs_cagra_serialize FAILED (path=%s)\n", idx_tmp);
+        LOG_ERROR("[handle_build] cuvs_cagra_serialize FAILED (path=%s)\n", idx_tmp);
         goto persist_fail;
     }
     if (fsync_path(idx_tmp) != 0) {
-        fprintf(stderr, "[handle_build] fsync %s failed errno=%d; aborting commit\n", idx_tmp, errno);
+        LOG_ERROR("[handle_build] fsync %s failed errno=%d; aborting commit\n", idx_tmp, errno);
         goto persist_fail;
     }
-    DBG("[handle_build] cagra.tmp written + fsynced\n");
+    LOG_DEBUG("[handle_build] cagra.tmp written + fsynced\n");
 
     /* Commit point: atomic renames. tids first, then cagra (the file
      * startup_load_indexes scans for). If second rename fails, log and
      * unlink whatever we renamed to leave consistent state. */
 #ifdef CUVS_TEST_HOOKS
     if (cuvs_fault("CUVS_FAULT_RENAME_TIDS")) {
-        fprintf(stderr, "[handle_build] fault injection: CUVS_FAULT_RENAME_TIDS\n");
+        LOG_ERROR("[handle_build] fault injection: CUVS_FAULT_RENAME_TIDS\n");
         goto persist_fail;
     }
 #endif
     if (rename(tids_tmp, tids_final) != 0) {
-        fprintf(stderr, "[handle_build] rename %s -> %s FAILED errno=%d (%s)\n",
+        LOG_ERROR("[handle_build] rename %s -> %s FAILED errno=%d (%s)\n",
                 tids_tmp, tids_final, errno, strerror(errno));
         goto persist_fail;
     }
 #ifdef CUVS_TEST_HOOKS
     if (cuvs_fault("CUVS_FAULT_RENAME_CAGRA")) {
-        fprintf(stderr, "[handle_build] fault injection: CUVS_FAULT_RENAME_CAGRA\n");
+        LOG_ERROR("[handle_build] fault injection: CUVS_FAULT_RENAME_CAGRA\n");
         unlink(tids_final);
         goto persist_fail;
     }
 #endif
     if (rename(idx_tmp, idx_final) != 0) {
-        fprintf(stderr, "[handle_build] rename %s -> %s FAILED errno=%d (%s); "
-                        "unlinking tids to avoid mismatch\n",
+        LOG_ERROR("[handle_build] rename %s -> %s FAILED errno=%d (%s); "
+                  "unlinking tids to avoid mismatch\n",
                 idx_tmp, idx_final, errno, strerror(errno));
         unlink(tids_final);
         goto persist_fail;
@@ -755,7 +752,7 @@ handle_build(int client_fd, const CuvsCmdFrame *cmd)
     int dir_fd = open(save_dir, O_RDONLY);
     if (dir_fd >= 0) { fsync(dir_fd); close(dir_fd); }
 
-    DBG("[handle_build] disk commit OK\n");
+    LOG_DEBUG("[handle_build] disk commit OK\n");
 
     /* --- Swap into registry --- */
     IndexEntry *existing = find_index(cmd->db_oid, cmd->index_oid);
@@ -775,7 +772,7 @@ handle_build(int client_fd, const CuvsCmdFrame *cmd)
             evict_lru();
         if (g_n_indexes >= MAX_INDEXES) {
             /* No slot available — roll back disk state and fail. */
-            fprintf(stderr, "[handle_build] registry full; rolling back disk commit\n");
+            LOG_ERROR("[handle_build] registry full; rolling back disk commit\n");
             unlink(idx_final);
             unlink(tids_final);
             cuvs_cagra_free(new_handle);
@@ -798,9 +795,9 @@ handle_build(int client_fd, const CuvsCmdFrame *cmd)
     }
 
     pthread_mutex_unlock(&g_index_mutex);
-    DBG("[handle_build] sending OK reply\n");
+    LOG_DEBUG("[handle_build] sending OK reply\n");
 
-    fprintf(stderr, "pg_cuvs_server: built index %u/%u (%lld vecs, %zu MB VRAM)\n",
+    LOG_INFO("pg_cuvs_server: built index %u/%u (%lld vecs, %zu MB VRAM)\n",
             cmd->db_oid, cmd->index_oid, (long long)cmd->n_vecs, needed / (1024*1024));
 
     CuvsReplyHeader hdr_ok = {0};
@@ -828,19 +825,19 @@ connection_thread(void *arg)
     int client_fd = *(int *)arg;
     free(arg);
 
-    DBG("pg_cuvs_server: client connected (fd=%d)\n", client_fd);
+    LOG_DEBUG("pg_cuvs_server: client connected (fd=%d)\n", client_fd);
     fflush(stderr);
 
     CuvsCmdFrame cmd;
     if (recv_all(client_fd, &cmd, sizeof(cmd)) < 0)
     {
-        fprintf(stderr, "pg_cuvs_server: recv_all CMD failed (errno=%d)\n", errno);
+        LOG_ERROR("pg_cuvs_server: recv_all CMD failed (errno=%d)\n", errno);
         fflush(stderr);
         close(client_fd);
         return NULL;
     }
 
-    DBG("pg_cuvs_server: received cmd op=%u db=%u idx=%u dim=%u n_vecs=%lld shm=%s\n",
+    LOG_DEBUG("pg_cuvs_server: received cmd op=%u db=%u idx=%u dim=%u n_vecs=%lld shm=%s\n",
             cmd.op, cmd.db_oid, cmd.index_oid, cmd.dim, (long long)cmd.n_vecs, cmd.shm_key);
     fflush(stderr);
 
@@ -862,15 +859,30 @@ connection_thread(void *arg)
 }
 
 /* ----------------------------------------------------------------
- * Signal handler — serialize indexes on SIGTERM
+ * Signal handling — async-signal-safe flag + deferred graceful shutdown
+ *
+ * sigterm_handler does the minimum legal in a signal handler: set the
+ * volatile flag. All heavy work (mutex, CUDA serialize, file I/O) is
+ * deferred to graceful_shutdown(), run from the main thread after the
+ * accept loop is interrupted. This avoids deadlock (the handler could
+ * fire while a connection thread holds g_index_mutex) and undefined
+ * behavior from non-async-signal-safe calls.
  * ---------------------------------------------------------------- */
 static void
 sigterm_handler(int sig)
 {
     (void)sig;
     g_shutdown = 1;
+}
 
-    fprintf(stderr, "pg_cuvs_server: SIGTERM received, serializing indexes...\n");
+/* Graceful shutdown — main-thread context, safe to use mutex/CUDA/file I/O.
+ * Locking g_index_mutex waits for any in-flight connection thread to finish
+ * its critical section before we serialize. Does NOT call exit(); the caller
+ * returns from main() normally. */
+static void
+graceful_shutdown(void)
+{
+    LOG_INFO("pg_cuvs_server: SIGTERM received, serializing indexes...\n");
 
     pthread_mutex_lock(&g_index_mutex);
     int saved = 0, failed = 0;
@@ -882,13 +894,13 @@ sigterm_handler(int sig)
             saved++;
         } else {
             failed++;
-            fprintf(stderr, "sigterm: save_index FAILED for %u/%u "
-                            "(operator must REINDEX after restart)\n",
+            LOG_ERROR("sigterm: save_index FAILED for %u/%u "
+                      "(operator must REINDEX after restart)\n",
                     g_indexes[i].db_oid, g_indexes[i].index_oid);
         }
     }
     pthread_mutex_unlock(&g_index_mutex);
-    fprintf(stderr, "sigterm: %d indexes saved, %d failed\n", saved, failed);
+    LOG_INFO("sigterm: %d indexes saved, %d failed\n", saved, failed);
 
     if (g_server_fd >= 0)
     {
@@ -896,8 +908,7 @@ sigterm_handler(int sig)
         unlink(g_socket_path);
     }
 
-    fprintf(stderr, "pg_cuvs_server: shutdown complete\n");
-    exit(0);
+    LOG_INFO("pg_cuvs_server: shutdown complete\n");
 }
 
 /* ----------------------------------------------------------------
@@ -917,12 +928,19 @@ main(int argc, char **argv)
             g_max_vram_bytes = (size_t)atol(argv[++i]) * 1024 * 1024;
     }
 
-    fprintf(stderr, "pg_cuvs_server: starting (socket=%s index-dir=%s)\n",
+    LOG_INFO("pg_cuvs_server: starting (socket=%s index-dir=%s)\n",
             g_socket_path, g_index_dir);
 
-    /* SIGTERM handler */
-    signal(SIGTERM, sigterm_handler);
-    signal(SIGINT,  sigterm_handler);
+    /* Install SIGTERM/SIGINT via sigaction WITHOUT SA_RESTART so a signal
+     * interrupts a blocked accept() (returns -1/EINTR) and we can break out
+     * of the loop to run graceful_shutdown() in the main thread. */
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = sigterm_handler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;  /* no SA_RESTART */
+    sigaction(SIGTERM, &sa, NULL);
+    sigaction(SIGINT,  &sa, NULL);
 
     /* Load persisted indexes */
     startup_load_indexes();
@@ -956,7 +974,7 @@ main(int argc, char **argv)
         return 1;
     }
 
-    fprintf(stderr, "pg_cuvs_server: listening on %s\n", g_socket_path);
+    LOG_INFO("pg_cuvs_server: listening on %s\n", g_socket_path);
 
     /* Accept loop */
     while (!g_shutdown)
@@ -964,8 +982,11 @@ main(int argc, char **argv)
         int client_fd = accept(g_server_fd, NULL, NULL);
         if (client_fd < 0)
         {
+            /* sigaction installed handlers WITHOUT SA_RESTART, so a SIGTERM/
+             * SIGINT during accept() returns EINTR. We were signalled (or
+             * g_shutdown was set between iterations) -> stop accepting. */
             if (errno == EINTR)
-                continue;
+                break;
             if (!g_shutdown)
                 perror("accept");
             break;
@@ -981,6 +1002,11 @@ main(int argc, char **argv)
         pthread_create(&tid, &attr, connection_thread, fd_ptr);
         pthread_attr_destroy(&attr);
     }
+
+    /* Deferred graceful shutdown in the main thread (safe for mutex / CUDA
+     * serialize / file I/O). In-flight detached connection threads holding
+     * g_index_mutex are waited on by the lock inside graceful_shutdown. */
+    graceful_shutdown();
 
     return 0;
 }
