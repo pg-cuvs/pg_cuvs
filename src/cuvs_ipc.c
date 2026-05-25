@@ -10,13 +10,10 @@
  */
 
 #include "cuvs_ipc.h"
+#include "cuvs_util.h"   /* leveled logging macros (LOG_ERROR/WARN/INFO/DEBUG) */
 
-/* Compile-time debug logging. Enable via -DPG_CUVS_DEBUG=1 to trace IPC.
- * Error paths (FAILED) still log unconditionally to PG/system log. */
-#ifndef PG_CUVS_DEBUG
-#define PG_CUVS_DEBUG 0
-#endif
-#define DBG(...) do { if (PG_CUVS_DEBUG) { fprintf(stderr, __VA_ARGS__); } } while (0)
+/* Hot-path IPC traces (LOG_DEBUG) are gated by PG_CUVS_DEBUG; enable via
+ * -DPG_CUVS_DEBUG=1. Error paths (LOG_ERROR) always log unconditionally. */
 
 #include <string.h>
 #include <stdio.h>
@@ -305,19 +302,19 @@ cuvs_ipc_build(
     int  rc     = CUVS_STATUS_ERROR;
 
     make_shm_key(shm_key, sizeof(shm_key));
-    DBG("[cuvs_ipc_build] shm_key=%s socket=%s n_vecs=%lld dim=%d\n",
+    LOG_DEBUG("[cuvs_ipc_build] shm_key=%s socket=%s n_vecs=%lld dim=%d\n",
         shm_key, socket_path, (long long)n_vecs, dim);
 
     shm_fd = shm_write_build_payload(shm_key, vecs, tids, n_vecs, dim);
     if (shm_fd < 0) {
-        fprintf(stderr, "[cuvs_ipc_build] shm_write FAILED errno=%d (%s)\n",
+        LOG_ERROR("[cuvs_ipc_build] shm_write FAILED errno=%d (%s)\n",
                 errno, strerror(errno));
         goto cleanup;
     }
 
     sock = uds_connect_ex(socket_path, 600);  /* BUILD can take minutes */
     if (sock < 0) {
-        fprintf(stderr, "[cuvs_ipc_build] uds_connect FAILED errno=%d (%s)\n",
+        LOG_ERROR("[cuvs_ipc_build] uds_connect FAILED errno=%d (%s)\n",
                 errno, strerror(errno));
         rc = CUVS_STATUS_UNAVAILABLE;   /* daemon not reachable */
         goto cleanup;

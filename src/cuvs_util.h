@@ -14,6 +14,32 @@
 #include <stddef.h>
 
 /* ----------------------------------------------------------------
+ * Leveled logging macros (PG-free; stderr only).
+ *
+ * ERROR/WARN/INFO are UNCONDITIONAL — they always print. Only DEBUG is
+ * gated behind PG_CUVS_DEBUG (hot-path trace only). Each macro prepends a
+ * level tag to the caller's printf format string. Callers must pass a
+ * string literal as the first argument (the format), e.g.
+ *     LOG_ERROR("save_index FAILED for %u/%u\n", db, idx);
+ *
+ * The "[TAG] " fmt concatenation requires a string-literal format and the
+ * ##__VA_ARGS__ GNU extension (available under both -std=gnu11 for the
+ * daemon and gcc for the PGXS .so build).
+ * ---------------------------------------------------------------- */
+#ifndef PG_CUVS_DEBUG
+#define PG_CUVS_DEBUG 0
+#endif
+
+#define LOG_ERROR(fmt, ...) \
+    do { fprintf(stderr, "[ERROR] " fmt, ##__VA_ARGS__); } while (0)
+#define LOG_WARN(fmt, ...) \
+    do { fprintf(stderr, "[WARN] " fmt, ##__VA_ARGS__); } while (0)
+#define LOG_INFO(fmt, ...) \
+    do { fprintf(stderr, "[INFO] " fmt, ##__VA_ARGS__); } while (0)
+#define LOG_DEBUG(fmt, ...) \
+    do { if (PG_CUVS_DEBUG) fprintf(stderr, "[DEBUG] " fmt, ##__VA_ARGS__); } while (0)
+
+/* ----------------------------------------------------------------
  * TID encode/decode (heap TID <-> uint64 block<<16|offset)
  * ---------------------------------------------------------------- */
 static inline uint64_t
