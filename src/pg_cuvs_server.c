@@ -646,11 +646,15 @@ handle_build(int client_fd, const CuvsCmdFrame *cmd)
     /* Reject degenerate or overflowing payload sizes before any allocation.
      * n_vecs*dim*4 can wrap size_t on a 32-bit-ish product (e.g. n_vecs ~2^31,
      * dim ~2^20), producing a tiny mmap that the build then reads past. */
-    if (cmd->n_vecs <= 0 || cmd->dim == 0)
+    /* CAGRA cannot build a neighborhood graph from a single point; cuVS
+     * ABORTS the process (uncatchable) on n_vecs==1, taking down the daemon
+     * for every backend. Require >= 2 and reject cleanly here. (The backend
+     * already short-circuits n_vecs==0 without an IPC call.) */
+    if (cmd->n_vecs < 2 || cmd->dim == 0)
     {
         LOG_ERROR("[handle_build] invalid payload n_vecs=%lld dim=%u\n",
                   (long long)cmd->n_vecs, cmd->dim);
-        send_error(client_fd, "invalid build payload (empty n_vecs/dim)");
+        send_error(client_fd, "CAGRA build needs at least 2 vectors");
         return;
     }
     {
