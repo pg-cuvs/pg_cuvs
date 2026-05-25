@@ -98,6 +98,33 @@ install-server: server
 
 .PHONY: server install-server
 
+# ---- pg_cuvs_server_test binary (fault injection) ------------------------
+# Same sources as the production daemon, but compiled with -DCUVS_TEST_HOOKS
+# so the cuvs_fault() env-var hooks in handle_build are live. NEVER install
+# this over the production binary. Object files use a _test suffix so they do
+# not clobber the production .o files.
+SERVER_TEST_BIN     = pg_cuvs_server_test
+SERVER_TEST_CFLAGS  = $(SERVER_CFLAGS) -DCUVS_TEST_HOOKS
+
+src/pg_cuvs_server_test.o: src/pg_cuvs_server.c src/cuvs_ipc.h src/cuvs_util.h src/cuvs_wrapper.h
+	$(CC) $(SERVER_TEST_CFLAGS) -c $< -o $@
+
+src/cuvs_ipc_server_test.o: src/cuvs_ipc.c src/cuvs_ipc.h
+	$(CC) $(SERVER_TEST_CFLAGS) -c $< -o $@
+
+src/cuvs_util_server_test.o: src/cuvs_util.c src/cuvs_util.h src/cuvs_ipc.h
+	$(CC) $(SERVER_TEST_CFLAGS) -c $< -o $@
+
+$(SERVER_TEST_BIN): src/pg_cuvs_server_test.o src/cuvs_ipc_server_test.o src/cuvs_util_server_test.o src/cuvs_wrapper.o
+	$(CXX) -o $@ $^ $(SERVER_LDFLAGS)
+
+server-test: $(SERVER_TEST_BIN)
+
+install-server-test: server-test
+	install -m 755 $(SERVER_TEST_BIN) $(shell $(PG_CONFIG) --bindir)/
+
+.PHONY: server-test install-server-test
+
 # ---- Local unit tests ----------------------------------------------------
 # No-framework unit tests for the dependency-free helpers in cuvs_util.c.
 # Deliberately independent of PGXS/pg_config/CUDA so it runs on a laptop.
@@ -114,7 +141,8 @@ test-unit: test/unit/test_cuvs_util.c src/cuvs_util.c src/cuvs_util.h src/cuvs_i
 -include .env.gpu
 export
 
-.PHONY: vm-start vm-stop sync gpu-build gpu-test gpu-bench gpu-shell
+.PHONY: vm-start vm-stop sync gpu-build gpu-test gpu-bench gpu-shell \
+	gpu-test-unit gpu-test-regress gpu-test-daemon gpu-test-e2e gpu-test-all
 
 vm-start:
 	@test -n "$(GCP_INSTANCE)" || (echo "ERROR: set GCP_INSTANCE in .env.gpu"; exit 1)
@@ -170,6 +198,40 @@ gpu-postinstall:
 # Piped over stdin (bash -s); plain ssh, no remote TTY needed.
 gpu-e2e:
 	ssh $(GCP_VM) "bash -s" < infra/scripts/e2e-smoke.sh
+
+# ---- Integration test suite (Phase 1.5 #3) -----------------------------
+# Layered test targets. Unit tests run locally (no toolchain needed);
+# the rest run on the GPU VM where PG + CUDA + daemon are available.
+
+# Unit tests for the dependency-free helpers (cuvs_util). Runs on the VM
+# for parity with the build toolchain; identical to local `make test-unit`.
+gpu-test-unit:
+	ssh -tt $(GCP_VM) "cd ~/pg_cuvs && \
+		source ~/miniforge3/bin/activate $(CONDA_ENV) && \
+		make test-unit"
+
+# PG regression suite (smoke + cpu_fallback). Requires a daemon up for the
+# CREATE INDEX paths; the production pg-cuvs-server systemd unit must be
+# active and cuvs.index_dir set to its --index-dir.
+gpu-test-regress:
+	ssh -tt $(GCP_VM) "cd ~/pg_cuvs && \
+		source ~/miniforge3/bin/activate $(CONDA_ENV) && \
+		make installcheck"
+
+# Fault-injection daemon integration tests. Builds the CUVS_TEST_HOOKS
+# daemon, drives daemon-down / persist-fault / clean-build scenarios on a
+# TEST socket + index dir, then restores the production daemon. Piped over
+# stdin (bash -s); CONDA_ENV is forwarded so the script can compile.
+gpu-test-daemon:
+	CONDA_ENV=$(CONDA_ENV) ssh $(GCP_VM) "CONDA_ENV=$(CONDA_ENV) bash -s" \
+		< infra/scripts/integration-test.sh
+
+# End-to-end durability smoke (alias of gpu-e2e for naming symmetry).
+gpu-test-e2e:
+	ssh $(GCP_VM) "bash -s" < infra/scripts/e2e-smoke.sh
+
+# Full ladder: unit -> regress -> daemon faults -> e2e durability.
+gpu-test-all: gpu-test-unit gpu-test-regress gpu-test-daemon gpu-test-e2e
 
 gpu-server-start:
 	ssh -tt $(GCP_VM) "pg_cuvs_server \
