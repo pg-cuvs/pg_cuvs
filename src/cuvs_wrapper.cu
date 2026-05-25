@@ -24,6 +24,57 @@
 #include <vector>
 #include <fstream>
 #include <stdexcept>
+#include <mutex>
+
+/* ----------------------------------------------------------------
+ * device_resources pool
+ *
+ * Each cuVS call needs a raft::device_resources (a CUDA stream + lazily
+ * created cuBLAS/cuSOLVER handles). Creating one per call repeats that setup,
+ * and the daemon spawns a NEW thread per request (so thread_local would never
+ * be reused). Instead we keep a process-global free-list and hand resources
+ * out via RAII: a request borrows one (creating lazily if none free) and
+ * returns it on scope exit. Sequential reuse across threads is safe because
+ * the streams/handles are bound to the (shared) CUDA context, not a thread,
+ * and the free-list guarantees only one thread uses a given object at a time.
+ *
+ * device_resources has a deleted move ctor in cuVS 25.x+, so the pool holds
+ * unique_ptr (movable) rather than the objects by value.
+ * ---------------------------------------------------------------- */
+namespace {
+
+std::mutex g_res_mutex;
+std::vector<std::unique_ptr<raft::device_resources>> g_res_pool;
+
+std::unique_ptr<raft::device_resources> acquire_res()
+{
+    {
+        std::lock_guard<std::mutex> lk(g_res_mutex);
+        if (!g_res_pool.empty()) {
+            auto r = std::move(g_res_pool.back());
+            g_res_pool.pop_back();
+            return r;
+        }
+    }
+    return std::make_unique<raft::device_resources>();
+}
+
+void release_res(std::unique_ptr<raft::device_resources> r)
+{
+    std::lock_guard<std::mutex> lk(g_res_mutex);
+    g_res_pool.push_back(std::move(r));
+}
+
+/* RAII: borrow on construction, return to the pool on destruction (incl.
+ * exception unwinding). Use `auto& res = pr.get();`. */
+struct PooledRes {
+    std::unique_ptr<raft::device_resources> r;
+    PooledRes() : r(acquire_res()) {}
+    ~PooledRes() { if (r) release_res(std::move(r)); }
+    raft::device_resources &get() { return *r; }
+};
+
+} // namespace
 
 /* Opaque CAGRA index wrapper.
  *
@@ -32,8 +83,8 @@
  * dataset is freed (e.g., function-scope local), the index has dangling
  * pointers. Symptom: SIGSEGV on serialize(include_dataset=true) and on search.
  *
- * raft::device_resources has a deleted move constructor in cuVS 25.x+, so we
- * create a fresh one per operation rather than storing it.
+ * raft::device_resources has a deleted move constructor in cuVS 25.x+; the
+ * pool above holds them via unique_ptr and hands them out with PooledRes.
  */
 struct CuvsCagraIndexImpl {
     /* dataset MUST be declared before idx so destruction is reverse order:
@@ -83,7 +134,7 @@ cuvs_brute_force_search(
     CuvsSearchResult *results)
 {
     try {
-        raft::device_resources res;
+        PooledRes _pr; raft::device_resources &res = _pr.get();
 
         auto d_corpus = raft::make_device_matrix<float, int64_t>(res, n_corpus, (int64_t)dim);
         raft::copy(d_corpus.data_handle(), corpus_vecs, n_corpus * dim, res.get_stream());
@@ -130,7 +181,7 @@ extern "C" CuvsCagraIndex
 cuvs_cagra_build(const float *vecs, int64_t n_vecs, int dim)
 {
     try {
-        raft::device_resources res;
+        PooledRes _pr; raft::device_resources &res = _pr.get();
 
         /* Upload corpus to device. d_corpus will be moved into the impl
          * struct below so its memory stays alive for the index's lifetime. */
@@ -179,7 +230,7 @@ cuvs_cagra_search(
 
     try {
         CuvsCagraIndexImpl *impl = static_cast<CuvsCagraIndexImpl *>(index);
-        raft::device_resources res;
+        PooledRes _pr; raft::device_resources &res = _pr.get();
 
         auto d_queries = raft::make_device_matrix<float, int64_t>(res, (int64_t)1, (int64_t)dim);
         raft::copy(d_queries.data_handle(), query_vec, dim, res.get_stream());
@@ -236,7 +287,7 @@ cuvs_cagra_serialize(CuvsCagraIndex index, const char *path)
 
     try {
         CuvsCagraIndexImpl *impl = static_cast<CuvsCagraIndexImpl *>(index);
-        raft::device_resources res;
+        PooledRes _pr; raft::device_resources &res = _pr.get();
         /* include_dataset=true: works now because impl->dataset keeps the
          * device memory alive that idx's view points to. */
         cuvs::neighbors::cagra::serialize(res, std::string(path), impl->idx, true);
@@ -255,7 +306,7 @@ extern "C" CuvsCagraIndex
 cuvs_cagra_deserialize(const char *path, int dim)
 {
     try {
-        raft::device_resources res;
+        PooledRes _pr; raft::device_resources &res = _pr.get();
         cuvs::neighbors::cagra::index<float, uint32_t> idx(res);
         cuvs::neighbors::cagra::deserialize(res, path, &idx);
         res.sync_stream();
@@ -285,4 +336,25 @@ cuvs_cagra_free(CuvsCagraIndex index)
 {
     if (index)
         delete static_cast<CuvsCagraIndexImpl *>(index);
+}
+
+/* ----------------------------------------------------------------
+ * Warm-up: pay the one-time GPU init cost (CUDA primary context, RMM pool,
+ * cuBLAS/cuSOLVER handles, kernel JIT) at daemon startup instead of on the
+ * first client query. Runs a tiny brute-force search; also primes one entry
+ * in the device_resources pool. Safe to call once at boot.
+ * ---------------------------------------------------------------- */
+extern "C" void
+cuvs_warmup(void)
+{
+    try {
+        const int n = 64, dim = 16, k = 8;
+        std::vector<float> corpus((size_t)n * dim), query(dim, 0.1f);
+        for (size_t i = 0; i < corpus.size(); i++)
+            corpus[i] = (float)(i % 7) * 0.1f;
+        CuvsSearchResult out[8];
+        (void)cuvs_brute_force_search(corpus.data(), query.data(), n, dim, k, out);
+    } catch (...) {
+        /* warm-up is best-effort; a failure here must not stop the daemon */
+    }
 }

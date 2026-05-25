@@ -952,6 +952,18 @@ main(int argc, char **argv)
     /* Load persisted indexes */
     startup_load_indexes();
 
+    /* Warm up the GPU now so the first client query doesn't pay the one-time
+     * CUDA context / RMM / cuBLAS / kernel init (hundreds of ms). */
+    {
+        struct timespec w0, w1;
+        clock_gettime(CLOCK_MONOTONIC, &w0);
+        cuvs_warmup();
+        clock_gettime(CLOCK_MONOTONIC, &w1);
+        double ms = (w1.tv_sec - w0.tv_sec) * 1000.0 +
+                    (w1.tv_nsec - w0.tv_nsec) / 1e6;
+        LOG_INFO("pg_cuvs_server: GPU warm-up done in %.0f ms\n", ms);
+    }
+
     /* Create UDS socket */
     g_server_fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (g_server_fd < 0)

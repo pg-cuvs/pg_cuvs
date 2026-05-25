@@ -73,6 +73,10 @@ size_t cuvs_vram_free_bytes(void);
 /* GPU availability check — returns 1 if CUDA device is accessible. */
 int cuvs_gpu_available(void);
 
+/* Warm-up: trigger one-time GPU init (context, RMM, cuBLAS, kernels) now so
+ * the first client query does not pay it. Best-effort; call once at startup. */
+void cuvs_warmup(void);
+
 #ifdef __cplusplus
 }
 #endif
