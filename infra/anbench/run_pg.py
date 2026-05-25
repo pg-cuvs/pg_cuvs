@@ -80,7 +80,11 @@ def build_index(conn, system, n, index_dir):
             name = "t_ivf"
         else:
             raise SystemExit(f"unknown system {system}")
-        cur.execute("DROP INDEX IF EXISTS " + name)
+        # Drop ALL ANN indexes first so only the target index exists -- otherwise
+        # the planner may pick a leftover index from a previous system on the
+        # same table (e.g. choose ivfflat while we think we are testing cagra).
+        for nm in ("t_hnsw", "t_ivf", "t_cagra"):
+            cur.execute("DROP INDEX IF EXISTS " + nm)
         conn.commit()
         t0 = time.perf_counter()
         cur.execute(sql)
