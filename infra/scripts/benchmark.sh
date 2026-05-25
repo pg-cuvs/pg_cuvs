@@ -172,8 +172,11 @@ SQL
         fi
         FIRST=0
     fi
-    FB=$(grep -ic "falling back" /tmp/bench_stderr.$$ 2>/dev/null || echo 0)
-    FALLBACKS=$((FALLBACKS + FB))
+    # grep -c prints "0" AND exits non-zero on no-match; a trailing
+    # "|| echo 0" would then emit "0\n0" and break the $(( )) arithmetic
+    # (which under set -e aborted the whole loop after one iteration).
+    FB=$(grep -ic "falling back" /tmp/bench_stderr.$$ 2>/dev/null | head -1)
+    FALLBACKS=$((FALLBACKS + ${FB:-0}))
 done
 rm -f /tmp/bench_stderr.$$
 
