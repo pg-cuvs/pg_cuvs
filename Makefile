@@ -136,12 +136,23 @@ test-unit: test/unit/test_cuvs_util.c src/cuvs_util.c src/cuvs_util.h src/cuvs_i
 
 .PHONY: test-unit
 
+# ---- Benchmark harness (Phase 1.5 #5) ----------------------------------
+# Parameterized large-dataset benchmark. Runs the bash harness; N/DIM/K/M
+# are passed through ONLY when set on the make command line, so the script's
+# own small sanity defaults apply otherwise. Invoked on the VM by `gpu-bench`
+# (and `gpu-bench-1m` for the PLAN 1M/1536 completion gate).
+benchmark:
+	$(if $(N),N=$(N)) $(if $(DIM),DIM=$(DIM)) $(if $(K),K=$(K)) $(if $(M),M=$(M)) \
+		bash infra/scripts/benchmark.sh
+
+.PHONY: benchmark
+
 # ---- GCP remote orchestration ------------------------------------------
 # Load .env.gpu (gitignored) for GCP_VM, GCP_INSTANCE, GCP_ZONE, etc.
 -include .env.gpu
 export
 
-.PHONY: vm-start vm-stop sync gpu-build gpu-test gpu-bench gpu-shell \
+.PHONY: vm-start vm-stop sync gpu-build gpu-test gpu-bench gpu-bench-1m gpu-shell \
 	gpu-test-unit gpu-test-regress gpu-test-daemon gpu-test-e2e gpu-test-all
 
 vm-start:
@@ -223,7 +234,8 @@ gpu-test-regress:
 # TEST socket + index dir, then restores the production daemon. Piped over
 # stdin (bash -s); CONDA_ENV is forwarded so the script can compile.
 gpu-test-daemon:
-	CONDA_ENV=$(CONDA_ENV) ssh $(GCP_VM) "CONDA_ENV=$(CONDA_ENV) bash -s" \
+	ssh $(GCP_VM) "source ~/miniforge3/bin/activate $(CONDA_ENV) && \
+		CONDA_ENV=$(CONDA_ENV) bash -s" \
 		< infra/scripts/integration-test.sh
 
 # End-to-end durability smoke (alias of gpu-e2e for naming symmetry).
@@ -239,11 +251,19 @@ gpu-server-start:
 		--index-dir \$$(psql -t -c 'SHOW data_directory' | tr -d ' ')/cuvs_indexes \
 		--max-vram-mb 20480 &"
 
+# Default sanity benchmark on the VM (small size from benchmark.sh defaults).
+# N/DIM/K/M forwarded to the remote `make benchmark` only when set locally.
 gpu-bench:
 	@mkdir -p design
 	ssh $(GCP_VM) "cd ~/pg_cuvs && \
 		source ~/miniforge3/bin/activate $(CONDA_ENV) && \
-		make benchmark 2>&1" | tee design/bench_$(shell date +%Y%m%d_%H%M).log
+		make benchmark $(if $(N),N=$(N)) $(if $(DIM),DIM=$(DIM)) $(if $(K),K=$(K)) $(if $(M),M=$(M)) 2>&1" \
+		| tee design/bench_$(shell date +%Y%m%d_%H%M).log
+
+# PLAN completion-gate run: 1M rows x 1536 dim (large VRAM-stress case).
+# Explicit target so the heavy run is never the default. Reuses gpu-bench.
+gpu-bench-1m:
+	$(MAKE) gpu-bench N=1000000 DIM=1536
 
 gpu-shell:
 	ssh -tt $(GCP_VM)

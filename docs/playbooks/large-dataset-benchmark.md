@@ -184,3 +184,32 @@ LIMIT 1;
   (malloc 사용). PLAN.md Phase 2 §5 streaming handoff로 에스컬레이션.
 - `EXPLAIN (ANALYZE)`에 `JIT:` 섹션이 있고 p95 latency가 p50의 3배 이상이면:
   jit-threshold-sweep.md를 실행한다. 측정 없이 `jit = off`를 적용하지 않는다 (ADR-018).
+
+---
+
+## 7. How to run (harness)
+
+위 §4의 수동 절차는 `infra/scripts/benchmark.sh`로 자동화되어 있다.
+로컬 노트북에는 toolchain/daemon이 없으므로 **VM에서 leader가 실행**한다.
+
+```bash
+# Default sanity 실행 (10000 x 384, k=10, M=100 queries). 빠르게 동작 확인.
+make gpu-bench
+
+# PLAN 완료 게이트 실행 (1M x 1536d, VRAM-stress). 명시적 타깃.
+make gpu-bench-1m
+
+# 임의 크기: N/DIM/K/M 를 넘겨 특정 셀만 실행.
+make gpu-bench N=1000000 DIM=384 K=100
+```
+
+출력은 `make gpu-bench`가 `design/bench_<timestamp>.log`로 tee 한다.
+모든 metric은 `metric: value` 형태이며 끝에 `[bench] SUMMARY` 블록으로 모인다:
+`build_time_s`, `cagra_bytes`, `tids_bytes`, `vram_used_mb_after_build`,
+`cold_planning_ms`, `warm_planning_ms`, `exec_p50_ms`/`p95`/`p99`,
+`fallbacks`, `reload_time_s`, `compute_apps`, 그리고 핵심 게이트 datum인
+`jit_section: yes/no`.
+
+**핵심:** `jit_section: yes`이면 §3 분기에 따라 p95/p99를 보고
+jit-threshold-sweep.md sweep 필요 여부를 결정한다. `jit_section: no`이면
+threshold 변경 불필요.
