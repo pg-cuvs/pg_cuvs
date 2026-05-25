@@ -75,9 +75,15 @@ send_all(int fd, const void *buf, size_t len)
     while (sent < len)
     {
         ssize_t n = write(fd, p + sent, len - sent);
-        if (n <= 0)
+        if (n < 0)
+        {
+            if (errno == EINTR)
+                continue;   /* retry: a signal interrupted the write */
             return -1;
-        sent += n;
+        }
+        if (n == 0)
+            return -1;      /* peer closed */
+        sent += (size_t)n;
     }
     return 0;
 }
@@ -90,9 +96,19 @@ recv_all(int fd, void *buf, size_t len)
     while (received < len)
     {
         ssize_t n = read(fd, p + received, len - received);
-        if (n <= 0)
+        if (n < 0)
+        {
+            if (errno == EINTR)
+                continue;   /* retry: a signal interrupted the read. Large
+                             * builds block here for minutes, so a stray
+                             * backend signal must not abort the wait and
+                             * spuriously fail a CREATE INDEX the daemon
+                             * actually completed. */
             return -1;
-        received += n;
+        }
+        if (n == 0)
+            return -1;      /* peer closed */
+        received += (size_t)n;
     }
     return 0;
 }
