@@ -22,6 +22,8 @@
 #   7. single-row build  -> clean error (n_vecs<2), daemon stays alive.
 #   8. pg_stat_gpu_search -> search_count increments; daemon-down view is empty
 #                       (never errors) and the backend survives.
+#   9. opclass metric + cuvs.k -> cosine index reports metric=cosine; cuvs.k
+#                       flows through to the daemon's requested_k.
 #
 # Requires: pg_cuvs installed; the production pg-cuvs-server systemd unit
 # (stopped during the run, restarted at cleanup); CONDA_ENV exported so the
@@ -476,6 +478,35 @@ if run_sql "SELECT count(*) AS n FROM pg_stat_gpu_search;"; then
 else
     fail "stats: daemon-down view query ERRORed (should be empty, not error): $OUT"
 fi
+psql -d "$DB" -c "DROP TABLE IF EXISTS it_items;" >/dev/null 2>&1 || true
+
+# --- Scenario 9: opclass metric + cuvs.k -------------------------------------
+# metric is derived from the index opclass and baked into the CAGRA graph;
+# the view must report 'cosine' for a cosine index. cuvs.k must flow through to
+# the daemon's requested_k.
+echo "[it] --- scenario 9: opclass metric + cuvs.k ---"
+fresh_fixture
+start_test_daemon
+run_sql "CREATE INDEX it_cos ON it_items USING cagra (embedding vector_cosine_ops);" >/dev/null
+run_sql "SET enable_seqscan=off; SET cuvs.k=9;
+         SELECT id FROM it_items ORDER BY embedding <=> '[1,0,0,0]'::vector LIMIT 3;" >/dev/null
+MROW=$(psql -d "$DB" -At 2>/dev/null <<SQL | tail -1
+SET cuvs.socket_path='$TEST_SOCK';
+SET cuvs.index_dir='$TEST_IDX';
+SELECT metric||'|'||requested_k FROM pg_stat_gpu_search WHERE index_oid='it_cos'::regclass;
+SQL
+)
+if [ "$MROW" = "cosine|9" ]; then
+    pass "stats: cosine opclass -> metric=cosine, cuvs.k=9 -> requested_k=9"
+else
+    fail "stats: expected 'cosine|9', got '$MROW'"
+fi
+if kill -0 "$DAEMON_PID" 2>/dev/null; then
+    pass "metric: daemon alive after cosine build+search"
+else
+    fail "metric: daemon DIED on cosine build/search"
+fi
+stop_test_daemon
 psql -d "$DB" -c "DROP TABLE IF EXISTS it_items;" >/dev/null 2>&1 || true
 
 echo "[it] === summary ==="

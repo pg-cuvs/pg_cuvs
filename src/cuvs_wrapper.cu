@@ -11,6 +11,7 @@
  */
 
 #include "cuvs_wrapper.h"
+#include "cuvs_ipc.h"   /* CUVS_METRIC_* (PG-free, CUDA-free defines) */
 
 #include <cuvs/neighbors/brute_force.hpp>
 #include <cuvs/neighbors/cagra.hpp>  /* serialize/deserialize merged here in cuVS 25.x+ */
@@ -186,8 +187,20 @@ cuvs_brute_force_search(
 /* ----------------------------------------------------------------
  * CAGRA index build
  * ---------------------------------------------------------------- */
+/* Map a CUVS_METRIC_* code to the cuVS DistanceType baked into the graph. */
+static cuvs::distance::DistanceType
+cuvs_distance_type(uint32_t metric)
+{
+    switch (metric) {
+        case CUVS_METRIC_COSINE: return cuvs::distance::DistanceType::CosineExpanded;
+        case CUVS_METRIC_IP:     return cuvs::distance::DistanceType::InnerProduct;
+        case CUVS_METRIC_L2:
+        default:                 return cuvs::distance::DistanceType::L2Expanded;
+    }
+}
+
 extern "C" CuvsCagraIndex
-cuvs_cagra_build(const float *vecs, int64_t n_vecs, int dim)
+cuvs_cagra_build(const float *vecs, int64_t n_vecs, int dim, uint32_t metric)
 {
     PooledRes _pr;
     try {
@@ -199,8 +212,10 @@ cuvs_cagra_build(const float *vecs, int64_t n_vecs, int dim)
         raft::copy(d_corpus.data_handle(), vecs, n_vecs * dim, res.get_stream());
         res.sync_stream();
 
-        /* CAGRA build parameters (defaults are good for Phase 1) */
+        /* CAGRA build parameters (defaults are good for Phase 1). The metric is
+         * baked into the graph here; search inherits it. */
         cuvs::neighbors::cagra::index_params params;
+        params.metric                = cuvs_distance_type(metric);
         params.graph_degree          = 64;
         params.intermediate_graph_degree = 128;
 
@@ -385,7 +400,7 @@ cuvs_warmup(void)
         /* cagra build+search warms the CAGRA-specific kernels so the first
          * real cagra query on a freshly booted daemon is not the one that
          * pays kernel load (~100 ms). */
-        CuvsCagraIndex idx = cuvs_cagra_build(corpus.data(), n, dim);
+        CuvsCagraIndex idx = cuvs_cagra_build(corpus.data(), n, dim, CUVS_METRIC_L2);
         if (idx) {
             (void)cuvs_cagra_search(idx, query.data(), dim, k, out);
             cuvs_cagra_free(idx);

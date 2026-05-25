@@ -370,6 +370,20 @@ test_lat_histogram(void)
     ASSERT(cuvs_lat_percentile(hist, CUVS_LAT_BUCKETS, 0.99) == 1024u, "skewed p99 -> 1024 (tail)");
 }
 
+static void
+test_metric_from_opclass(void)
+{
+    ASSERT(cuvs_metric_from_opclass_name("vector_l2_ops")     == CUVS_METRIC_L2,     "l2 opclass -> L2");
+    ASSERT(cuvs_metric_from_opclass_name("vector_cosine_ops") == CUVS_METRIC_COSINE, "cosine opclass -> COSINE");
+    ASSERT(cuvs_metric_from_opclass_name("vector_ip_ops")     == CUVS_METRIC_IP,     "ip opclass -> IP");
+    ASSERT(cuvs_metric_from_opclass_name("bogus_ops")         == -1, "unknown opclass -> -1");
+    ASSERT(cuvs_metric_from_opclass_name("")                  == -1, "empty opclass -> -1");
+    ASSERT(cuvs_metric_from_opclass_name(NULL)                == -1, "NULL opclass -> -1");
+    /* status string for the new metric-mismatch code. */
+    ASSERT(strcmp(cuvs_status_str(CUVS_STATUS_METRIC_MISMATCH), "metric_mismatch") == 0,
+           "status_str METRIC_MISMATCH");
+}
+
 int
 main(void)
 {
@@ -381,6 +395,7 @@ main(void)
     test_tids_roundtrip();
     test_tids_rejections();
     test_lat_histogram();
+    test_metric_from_opclass();
 #ifdef CUVS_TEST_HOOKS
     test_fault_hook();
 #endif

@@ -41,6 +41,7 @@
 #define CUVS_STATUS_BUILD_FAILED   5   /* GPU index build failed */
 #define CUVS_STATUS_PERSIST_FAILED 6   /* build OK, disk persist failed */
 #define CUVS_STATUS_DIM_MISMATCH   7   /* query dim != index dim → user error */
+#define CUVS_STATUS_METRIC_MISMATCH 8  /* index built with a different metric → REINDEX */
 
 /* ----------------------------------------------------------------
  * Command frame (sent over UDS, fixed size)
@@ -102,6 +103,8 @@ typedef struct CuvsIndexStats {
     uint64_t search_count;      /* successful (CUVS_STATUS_OK) searches */
     uint64_t error_count;       /* searches that ended non-OK and were attributable */
     uint64_t total_latency_us;  /* avg = total_latency_us / search_count */
+    uint32_t last_requested_k;  /* top-k of the most recent OK search (reflects cuvs.k) */
+    uint32_t last_returned_k;   /* rows the most recent OK search actually returned */
     uint32_t p50_us;
     uint32_t p95_us;
     uint32_t p99_us;

@@ -53,8 +53,28 @@ cuvs_status_str(int status)
         case CUVS_STATUS_BUILD_FAILED:   return "build_failed";
         case CUVS_STATUS_PERSIST_FAILED: return "persist_failed";
         case CUVS_STATUS_DIM_MISMATCH:   return "dim_mismatch";
+        case CUVS_STATUS_METRIC_MISMATCH: return "metric_mismatch";
         default:                       return "unknown";
     }
+}
+
+/* ----------------------------------------------------------------
+ * Opclass name -> CUVS_METRIC_*. Returns -1 for an unrecognized name.
+ * Pure (no PG/CUDA); the PG glue resolves the index's opclass name and
+ * calls this so build and search agree on the metric.
+ * ---------------------------------------------------------------- */
+int
+cuvs_metric_from_opclass_name(const char *name)
+{
+    if (!name)
+        return -1;
+    if (strcmp(name, "vector_l2_ops") == 0)
+        return CUVS_METRIC_L2;
+    if (strcmp(name, "vector_cosine_ops") == 0)
+        return CUVS_METRIC_COSINE;
+    if (strcmp(name, "vector_ip_ops") == 0)
+        return CUVS_METRIC_IP;
+    return -1;
 }
 
 /* ----------------------------------------------------------------

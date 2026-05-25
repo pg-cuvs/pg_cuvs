@@ -27,6 +27,9 @@
 #include "catalog/index.h"
 #include "catalog/namespace.h"
 #include "catalog/pg_type.h"
+#include "commands/defrem.h"
+#include "nodes/pg_list.h"
+#include "nodes/value.h"
 #include "nodes/pathnodes.h"
 #include "optimizer/cost.h"
 #include "storage/bufmgr.h"
@@ -58,6 +61,7 @@ bool  cuvs_debug                  = false;
 char *cuvs_socket_path            = NULL;
 char *cuvs_index_dir              = NULL;
 int   cuvs_circuit_breaker_threshold = 3;
+int   cuvs_k                      = 100;   /* GPU top-k (pgvector ef_search analog) */
 
 /* ----------------------------------------------------------------
  * Last-search stats (process-local; one slot per backend)
@@ -125,6 +129,17 @@ _PG_init(void)
         3, 1, 100,
         PGC_USERSET,
         0, NULL, NULL, NULL);
+
+    DefineCustomIntVariable(
+        "cuvs.k",
+        "GPU top-k candidates fetched per cagra index scan.",
+        "Analogous to hnsw.ef_search: the AM cannot read SQL LIMIT directly, so "
+        "this bounds how many neighbors the GPU returns. The executor then "
+        "applies the query's LIMIT. Larger values raise recall and VRAM/latency.",
+        &cuvs_k,
+        100, 1, 2000,
+        PGC_USERSET,
+        0, NULL, NULL, NULL);
 }
 
 /* Resolve cuvs.index_dir: if empty, default to DataDir/cuvs_indexes */
@@ -186,6 +201,46 @@ cuvsamcostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
     *indexSelectivity = 1.0;
     *indexCorrelation = 0.0;
     *indexPages       = 0.0;
+}
+
+/* ----------------------------------------------------------------
+ * Determine a cagra index's metric from its operator class.
+ *
+ * The three opclasses (vector_l2_ops / vector_cosine_ops / vector_ip_ops)
+ * each create their own operator family. We resolve those three opfamily
+ * OIDs once (by name, under the cagra AM) and compare the index's opfamily.
+ * Used identically at build and scan so the two always agree. An unknown
+ * family falls back to L2 with a one-time WARNING.
+ * ---------------------------------------------------------------- */
+static uint32_t
+cuvs_index_metric(Relation indexRel)
+{
+    static bool resolved = false;
+    static Oid  opf_l2 = InvalidOid, opf_cos = InvalidOid, opf_ip = InvalidOid;
+    Oid relam = indexRel->rd_rel->relam;
+    Oid idxopf;
+
+    if (!resolved)
+    {
+        Oid c;
+        c = get_opclass_oid(relam, list_make1(makeString("vector_l2_ops")), true);
+        opf_l2  = OidIsValid(c) ? get_opclass_family(c) : InvalidOid;
+        c = get_opclass_oid(relam, list_make1(makeString("vector_cosine_ops")), true);
+        opf_cos = OidIsValid(c) ? get_opclass_family(c) : InvalidOid;
+        c = get_opclass_oid(relam, list_make1(makeString("vector_ip_ops")), true);
+        opf_ip  = OidIsValid(c) ? get_opclass_family(c) : InvalidOid;
+        resolved = true;
+    }
+
+    idxopf = indexRel->rd_opfamily[0];
+    if (OidIsValid(opf_cos) && idxopf == opf_cos) return CUVS_METRIC_COSINE;
+    if (OidIsValid(opf_ip)  && idxopf == opf_ip)  return CUVS_METRIC_IP;
+    if (OidIsValid(opf_l2)  && idxopf == opf_l2)  return CUVS_METRIC_L2;
+
+    ereport(WARNING,
+            (errmsg("pg_cuvs: unrecognized opclass family for cagra index %u; assuming L2",
+                    RelationGetRelid(indexRel))));
+    return CUVS_METRIC_L2;
 }
 
 /* ----------------------------------------------------------------
@@ -267,7 +322,7 @@ cuvs_ambuild(Relation heapRel, Relation indexRel, IndexInfo *indexInfo)
 
     CuvsBuildState bs;
     memset(&bs, 0, sizeof(bs));
-    bs.metric = CUVS_METRIC_L2;  /* default; TODO: derive from opclass */
+    bs.metric = cuvs_index_metric(indexRel);  /* baked into the CAGRA graph */
 
     /* Scan all live heap tuples, collect vectors + TIDs */
     bs.reltuples = table_index_build_scan(
@@ -436,22 +491,15 @@ cuvs_gettuple(IndexScanDesc scan, ScanDirection dir)
         Datum query_datum = scan->orderByData[0].sk_argument;
         PgVector *qvec    = DatumGetPgVector(query_datum);
         int       dim     = (int)qvec->dim;
-        int       k       = 100;  /* default top-k; TODO: planner hint */
+        int       k       = cuvs_k;  /* GPU top-k; SQL LIMIT applied by executor */
 
         ss->tids      = palloc(k * sizeof(uint64_t));
         ss->distances = palloc(k * sizeof(float));
 
-        /* Determine metric from operator class */
-        uint32_t metric = CUVS_METRIC_L2;
-        if (scan->numberOfOrderBys > 0)
-        {
-            Oid opno = scan->orderByData[0].sk_strategy;
-            /* Heuristic: cosine op strategy = 2, ip = 3 */
-            if (opno == 2)
-                metric = CUVS_METRIC_COSINE;
-            else if (opno == 3)
-                metric = CUVS_METRIC_IP;
-        }
+        /* Metric is determined by the index's operator class (same source as
+         * build), not the ORDER BY strategy number (all three opclasses use
+         * strategy 1, so the old heuristic never fired and forced L2). */
+        uint32_t metric = cuvs_index_metric(scan->indexRelation);
 
         uint32_t latency_us = 0;
         int rc = cuvs_ipc_search(
@@ -470,12 +518,24 @@ cuvs_gettuple(IndexScanDesc scan, ScanDirection dir)
             /* Record error for circuit breaker. UNAVAILABLE (daemon down) and
              * DIM_MISMATCH (user error) are not index-specific GPU failures,
              * so don't count them toward the breaker. */
-            if (rc != CUVS_STATUS_UNAVAILABLE && rc != CUVS_STATUS_DIM_MISMATCH)
+            if (rc != CUVS_STATUS_UNAVAILABLE && rc != CUVS_STATUS_DIM_MISMATCH
+                && rc != CUVS_STATUS_METRIC_MISMATCH)
                 cuvs_circuit_record_error((uint32_t)index_oid,
                                           cuvs_circuit_breaker_threshold);
 
             switch (rc)
             {
+                case CUVS_STATUS_METRIC_MISMATCH:
+                    /* The index was built with a different metric (e.g. built
+                     * before opclass-metric support, always L2). cuVS bakes the
+                     * metric into the graph, so the only fix is a rebuild. Fail
+                     * loudly rather than silently return wrong-metric results. */
+                    ereport(ERROR,
+                            (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+                             errmsg("pg_cuvs: cagra index was built with a different "
+                                    "distance metric than this query's operator class"),
+                             errhint("REINDEX the index to rebuild it with the current metric.")));
+                    break;
                 case CUVS_STATUS_DIM_MISMATCH:
                     /* User error: query/index dimension differ. Fail loudly
                      * like pgvector does, rather than silently returning no
@@ -717,7 +777,7 @@ pg_cuvs_last_search_metric(PG_FUNCTION_ARGS)
  * the view must stay queryable while the daemon restarts. (See plan: a
  * future liveness column can distinguish "down" from "idle".)
  * ---------------------------------------------------------------- */
-#define GPU_STATS_NCOLS 17
+#define GPU_STATS_NCOLS 19
 
 static const char *
 cuvs_metric_name(uint32_t metric)
@@ -814,6 +874,9 @@ pg_cuvs_gpu_search_stats(PG_FUNCTION_ARGS)
             values[16] = TimestampTzGetDatum(time_t_to_timestamptz((pg_time_t) s->last_search_at));
         else
             nulls[16] = true;
+
+        values[17] = Int32GetDatum((int32) s->last_requested_k);
+        values[18] = Int32GetDatum((int32) s->last_returned_k);
 
         tuplestore_putvalues(tupstore, tupdesc, values, nulls);
     }

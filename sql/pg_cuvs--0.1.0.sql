@@ -107,7 +107,9 @@ CREATE FUNCTION pg_cuvs_gpu_search_stats(
     OUT p99_latency_us  integer,
     OUT last_status     text,
     OUT last_error      text,
-    OUT last_search_at  timestamptz
+    OUT last_search_at  timestamptz,
+    OUT requested_k     integer,
+    OUT returned_k      integer
 )
 RETURNS SETOF record
 AS '$libdir/pg_cuvs', 'pg_cuvs_gpu_search_stats'

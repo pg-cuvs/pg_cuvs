@@ -44,10 +44,13 @@ int cuvs_brute_force_search(
  */
 typedef void *CuvsCagraIndex;
 
+/* metric is a CUVS_METRIC_* value (see cuvs_ipc.h). It is baked into the
+ * CAGRA graph at build time; search inherits it. */
 CuvsCagraIndex cuvs_cagra_build(
     const float *vecs,
     int64_t      n_vecs,
-    int          dim
+    int          dim,
+    uint32_t     metric
 );
 
 int cuvs_cagra_search(

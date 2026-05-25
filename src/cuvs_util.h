@@ -66,6 +66,9 @@ int cuvs_parse_index_filename(const char *name, uint32_t *db_oid, uint32_t *inde
  * ---------------------------------------------------------------- */
 const char *cuvs_status_str(int status);
 
+/* Opclass name -> CUVS_METRIC_* (cuvs_ipc.h); -1 if unrecognized. */
+int cuvs_metric_from_opclass_name(const char *name);
+
 /* ----------------------------------------------------------------
  * Latency histogram (per-index, daemon-side). Log2-spaced fixed buckets:
  * bucket 0 = {0 us}; bucket k (k>=1) covers [2^(k-1), 2^k) us. 32 buckets

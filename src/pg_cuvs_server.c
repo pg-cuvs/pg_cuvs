@@ -63,7 +63,9 @@ typedef struct IndexEntry {
     uint64_t        error_count;      /* attributable non-OK searches */
     uint64_t        total_latency_us; /* sum of OK latencies (for avg) */
     uint32_t        lat_buckets[CUVS_LAT_BUCKETS];
-    uint32_t        last_status;      /* CUVS_STATUS_* of most recent search */
+    uint32_t        last_status;       /* CUVS_STATUS_* of most recent search */
+    uint32_t        last_requested_k;  /* top-k of last OK search (reflects cuvs.k) */
+    uint32_t        last_returned_k;   /* rows last OK search returned */
     char            last_error[128];
 } IndexEntry;
 
@@ -77,6 +79,8 @@ reset_entry_stats(IndexEntry *e)
     e->total_latency_us = 0;
     memset(e->lat_buckets, 0, sizeof(e->lat_buckets));
     e->last_status      = 0;
+    e->last_requested_k = 0;
+    e->last_returned_k  = 0;
     e->last_error[0]    = '\0';
 }
 
@@ -500,6 +504,23 @@ handle_search(int client_fd, const CuvsCmdFrame *cmd)
 
     e->last_search = time(NULL);
 
+    /* The metric is baked into the CAGRA graph at build time. A query carrying
+     * a different opclass metric means this index was built before the
+     * build-metric fix (always-L2) and must be REINDEXed — otherwise we'd
+     * silently return results from a wrong-metric graph. Reject it. */
+    if (cmd->metric != e->metric)
+    {
+        CuvsReplyHeader hdr = {0};
+        hdr.status = CUVS_STATUS_METRIC_MISMATCH;
+        snprintf(hdr.error, sizeof(hdr.error),
+                 "index built with metric %u but queried with metric %u; REINDEX required",
+                 e->metric, cmd->metric);
+        record_search_stat(e, CUVS_STATUS_METRIC_MISMATCH, 0, hdr.error);
+        pthread_mutex_unlock(&g_index_mutex);
+        send_all(client_fd, &hdr, sizeof(hdr));
+        return;
+    }
+
     /* Map shm query vector */
     size_t vec_bytes = (size_t)cmd->dim * sizeof(float);
     int shm_fd = shm_open(cmd->shm_key, O_RDONLY, 0);
@@ -597,6 +618,8 @@ handle_search(int client_fd, const CuvsCmdFrame *cmd)
         (t1.tv_nsec - t0.tv_nsec) / 1000);
 
     record_search_stat(e, CUVS_STATUS_OK, latency_us, NULL);
+    e->last_requested_k = cmd->k;
+    e->last_returned_k  = (uint32_t)n_valid;
 
     pthread_mutex_unlock(&g_index_mutex);
 
@@ -763,7 +786,7 @@ handle_build(int client_fd, const CuvsCmdFrame *cmd)
 
     LOG_DEBUG("[handle_build] calling cuvs_cagra_build n_vecs=%lld dim=%u...\n",
             (long long)cmd->n_vecs, cmd->dim);
-    CuvsCagraIndex new_handle = cuvs_cagra_build(vecs, cmd->n_vecs, (int)cmd->dim);
+    CuvsCagraIndex new_handle = cuvs_cagra_build(vecs, cmd->n_vecs, (int)cmd->dim, cmd->metric);
     if (!new_handle)
     {
         LOG_ERROR("[handle_build] cuvs_cagra_build returned NULL\n");
@@ -961,6 +984,8 @@ handle_stats(int client_fd, const CuvsCmdFrame *cmd)
         s->vram_bytes       = e->vram_bytes;
         s->resident         = 1;
         s->last_status      = e->last_status;
+        s->last_requested_k = e->last_requested_k;
+        s->last_returned_k  = e->last_returned_k;
         s->search_count     = e->search_count;
         s->error_count      = e->error_count;
         s->total_latency_us = e->total_latency_us;
