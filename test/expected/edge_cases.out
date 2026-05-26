@@ -196,7 +196,6 @@ CREATE INDEX ec_empty_cagra ON ec_empty USING cagra (embedding vector_l2_ops);
 SET enable_seqscan = off;
 SELECT count(*) AS empty_table_rows
 FROM (SELECT id FROM ec_empty ORDER BY embedding <-> '[1,0,0,0]'::vector LIMIT 5) s;
-WARNING:  pg_cuvs: index not loaded on daemon, falling back to CPU
  empty_table_rows 
 ------------------
                 0

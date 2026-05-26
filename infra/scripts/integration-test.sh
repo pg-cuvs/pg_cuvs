@@ -30,6 +30,11 @@
 #                       daemon untouched); a normal build under a high cap succeeds.
 #  12. VRAM tiered cache -> a small budget forces LRU eviction on build and reload
 #                       on search-miss; pg_stat_gpu_cache reflects evictions/reloads.
+#  13. clean daemon stop -> socket unlinked; plan-time socket gate fires;
+#                       query returns correct CPU result (not empty, not ERROR).
+#  14. daemon crash (kill -9) -> socket lingers; first N queries ERROR (UNAVAILABLE)
+#                       + increment circuit breaker; breaker opens; next query
+#                       replans to CPU and returns correct result.
 #
 # Requires: pg_cuvs installed; the production pg-cuvs-server systemd unit
 # (stopped during the run, restarted at cleanup); CONDA_ENV exported so the
@@ -710,6 +715,110 @@ else
 fi
 stop_test_daemon
 psql -d "$DB" -c "DROP TABLE IF EXISTS cc1, cc2;" >/dev/null 2>&1 || true
+
+# --- Scenario 13: clean daemon stop → socket gate → plan-time CPU reroute ------
+# When the daemon is cleanly stopped (SIGTERM unlinks its socket), the plan-time
+# socket-existence gate raises the cagra cost to 1e9. The planner routes to
+# seqscan/CPU and the query returns correct results — no ERROR, no empty result.
+echo ""
+echo "[it] --- Scenario 13: clean daemon stop -> socket gate -> CPU reroute ---"
+
+start_test_daemon
+run_sql "
+DROP TABLE IF EXISTS sc13;
+CREATE TABLE sc13 (id int, embedding vector(4));
+INSERT INTO sc13 SELECT g, format('[%s,0,0,0]', g)::vector
+    FROM generate_series(1,1000) g;
+ANALYZE sc13;
+CREATE INDEX sc13_cagra ON sc13 USING cagra (embedding vector_l2_ops);" >/dev/null \
+    || fail "sc13: setup failed: $OUT"
+
+run_sql "EXPLAIN (COSTS OFF) SELECT id FROM sc13 ORDER BY embedding <-> '[42,0,0,0]'::vector LIMIT 1;"
+echo "$OUT" | grep -q "sc13_cagra" \
+    && pass "sc13: GPU path chosen while daemon is up" \
+    || fail "sc13: expected cagra scan while daemon up; got: $OUT"
+
+stop_test_daemon
+[ ! -S "$TEST_SOCK" ] \
+    && pass "sc13: socket removed after clean stop" \
+    || fail "sc13: socket still present after clean stop"
+
+run_sql "EXPLAIN (COSTS OFF) SELECT id FROM sc13 ORDER BY embedding <-> '[42,0,0,0]'::vector LIMIT 1;"
+echo "$OUT" | grep -q "Seq Scan" \
+    && pass "sc13: Seq Scan chosen after clean stop (socket gate fired)" \
+    || fail "sc13: expected Seq Scan after clean stop; got: $OUT"
+
+SC13_ID=$(psql -d "$DB" -At 2>/dev/null <<SQL
+SET cuvs.socket_path='$TEST_SOCK';
+SET cuvs.index_dir='$TEST_IDX';
+SELECT id FROM sc13 ORDER BY embedding <-> '[42,0,0,0]'::vector LIMIT 1;
+SQL
+)
+[ "$SC13_ID" = "42" ] \
+    && pass "sc13: CPU result correct after clean stop (id=42)" \
+    || fail "sc13: wrong CPU result; expected 42, got: '$SC13_ID'"
+
+psql -d "$DB" -c "DROP TABLE IF EXISTS sc13;" >/dev/null 2>&1 || true
+
+# --- Scenario 14: daemon crash → stale socket → ERROR → breaker → CPU ----------
+# kill -9 leaves the socket file in place (stale socket). The plan-time socket
+# gate does NOT fire (socket exists), so the planner picks the GPU path. The
+# executor then gets CUVS_STATUS_UNAVAILABLE → ERROR + circuit-breaker increment.
+# After cuvs.circuit_breaker_threshold (default 3) errors in ONE backend session,
+# the breaker opens; the next query in that session replans to CPU via the breaker
+# gate and returns the correct result.
+echo ""
+echo "[it] --- Scenario 14: daemon crash -> stale socket -> breaker -> CPU ---"
+
+start_test_daemon
+run_sql "
+DROP TABLE IF EXISTS sc14;
+CREATE TABLE sc14 (id int, embedding vector(4));
+INSERT INTO sc14 SELECT g, format('[%s,0,0,0]', g)::vector
+    FROM generate_series(1,1000) g;
+ANALYZE sc14;
+CREATE INDEX sc14_cagra ON sc14 USING cagra (embedding vector_l2_ops);" >/dev/null \
+    || fail "sc14: setup failed: $OUT"
+
+run_sql "EXPLAIN (COSTS OFF) SELECT id FROM sc14 ORDER BY embedding <-> '[42,0,0,0]'::vector LIMIT 1;"
+echo "$OUT" | grep -q "sc14_cagra" \
+    && pass "sc14: GPU path chosen while daemon is up" \
+    || fail "sc14: expected cagra scan while daemon up; got: $OUT"
+
+# Simulate crash: SIGKILL leaves the socket file in place
+kill -9 "$DAEMON_PID" 2>/dev/null || true
+wait "$DAEMON_PID" 2>/dev/null || true
+DAEMON_PID=""
+
+[ -S "$TEST_SOCK" ] \
+    && pass "sc14: socket lingers after kill -9 (stale socket)" \
+    || fail "sc14: socket unexpectedly removed after kill -9"
+
+# Single psql session (one backend) with ON_ERROR_STOP=0 so the connection
+# survives ERRORs. Three BEGIN/ROLLBACK cycles accumulate 3 breaker errors, then
+# the 4th query in the same session replans via the open breaker to Seq Scan/CPU.
+SC14_OUT=$(psql -d "$DB" -v ON_ERROR_STOP=0 -At 2>&1 <<SQL
+SET cuvs.socket_path='$TEST_SOCK';
+SET cuvs.index_dir='$TEST_IDX';
+BEGIN; SELECT id FROM sc14 ORDER BY embedding <-> '[42,0,0,0]'::vector LIMIT 1; ROLLBACK;
+BEGIN; SELECT id FROM sc14 ORDER BY embedding <-> '[42,0,0,0]'::vector LIMIT 1; ROLLBACK;
+BEGIN; SELECT id FROM sc14 ORDER BY embedding <-> '[42,0,0,0]'::vector LIMIT 1; ROLLBACK;
+SELECT id FROM sc14 ORDER BY embedding <-> '[42,0,0,0]'::vector LIMIT 1;
+SQL
+)
+
+echo "$SC14_OUT" | grep -q "GPU daemon unavailable" \
+    && pass "sc14: queries 1-3 errored with UNAVAILABLE (breaker accumulating)" \
+    || fail "sc14: expected UNAVAILABLE errors after kill -9; got: $SC14_OUT"
+
+# The 4th query result (tuples-only mode) is the only bare integer in the output
+SC14_ID=$(echo "$SC14_OUT" | grep -E '^[0-9]+$' | tail -1)
+[ "$SC14_ID" = "42" ] \
+    && pass "sc14: query 4 returns CPU correct result (id=42) after breaker opens" \
+    || fail "sc14: expected id=42 via breaker after crash; got: '$SC14_ID'"
+
+rm -f "$TEST_SOCK"
+psql -d "$DB" -c "DROP TABLE IF EXISTS sc14;" >/dev/null 2>&1 || true
 
 echo "[it] === summary ==="
 if [ "$FAILED" = "0" ]; then

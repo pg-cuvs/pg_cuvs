@@ -243,6 +243,41 @@ cuvs_index_delete_drift_stale(Oid index_oid, double live_rows)
            > cuvs_max_stale_fraction;
 }
 
+/* Plan-time daemon availability gate. The daemon creates its UDS socket only
+ * after full startup (warmup + index loading). A missing socket means the
+ * daemon is not yet ready or was cleanly shut down; silently raise cost so the
+ * planner routes to seqscan/pgvector instead of a GPU index that cannot serve.
+ *
+ * A crash leaves the socket file in place (stale socket). That case is handled
+ * at runtime: UNAVAILABLE → ERROR + circuit-breaker record. After N consecutive
+ * errors the breaker opens and this plan-time gate fires on the next query too. */
+static bool
+cuvs_daemon_socket_ready(void)
+{
+    struct stat st;
+
+    if (cuvs_socket_path == NULL || cuvs_socket_path[0] == '\0')
+        return false;
+    return stat(cuvs_socket_path, &st) == 0;
+}
+
+/* Plan-time artifact-existence gate. The daemon writes a .tids file when it
+ * completes a build. An index created on an empty table (ambuildempty path)
+ * skips the daemon entirely, so no .tids exists. Without this gate, a query on
+ * such an index would reach amgettuple, get CUVS_STATUS_NOT_FOUND from the
+ * daemon, and ERROR. Instead, silence it at plan time: no .tids → no GPU
+ * artifact → route to seqscan/CPU. */
+static bool
+cuvs_index_has_artifact(Oid index_oid)
+{
+    char        path[MAXPGPATH];
+    struct stat st;
+
+    snprintf(path, sizeof(path), "%s/%u_%u.tids",
+             get_index_dir(), (uint32_t) MyDatabaseId, (uint32_t) index_oid);
+    return stat(path, &st) == 0;
+}
+
 /* ----------------------------------------------------------------
  * Cost model
  *
@@ -261,11 +296,11 @@ cuvs_index_delete_drift_stale(Oid index_oid, double live_rows)
  * IMPORTANT: This runs in the planner on every query — once per candidate
  * index path. It must NOT touch the CUDA runtime: cudaGetDeviceCount() etc.
  * lazily initialize the CUDA context per backend, which costs ~100ms the
- * first time and inflates Planning Time. Daemon availability is checked at
- * runtime by cuvs_ipc_search; if the daemon is down, gettuple returns
- * CUVS_STATUS_UNAVAILABLE and the executor falls back to CPU with a
- * WARNING. The cost path short-circuits the GPU route when it is explicitly
- * off (enable_cuvs / circuit breaker) or the index is stale (.stale sidecar). */
+ * first time and inflates Planning Time. Six plan-time gates short-circuit the
+ * GPU route without IPC or CUDA: enable_cuvs (GUC), circuit breaker (repeated
+ * runtime failures), .stale sidecar (heap writes since build), delete-drift
+ * (.tids header vs live-row estimate), socket existence (daemon ready), and
+ * artifact existence (no .tids = empty-table build, no GPU artifact). */
 static void
 cuvsamcostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
                    Cost *indexStartupCost, Cost *indexTotalCost,
@@ -279,22 +314,26 @@ cuvsamcostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
     (void) root;
     (void) loop_count;
 
-    /* No CUDA / no IPC in the planner. Four gates turn the GPU path off:
-     * enable_cuvs (GUC), the circuit breaker (repeated runtime failures), the
-     * .stale sidecar (heap writes since build), and delete-drift (build count
-     * from the .tids header vs the live-row estimate). All are local file/state
-     * reads, not IPC. Without the stale/drift gates the planner keeps choosing a
-     * stale CAGRA index whose scan returns no rows or has eroded recall. dim is
-     * folded into the per-query constant rather than opening the index here. */
+    /* Six gates turn the GPU path off — all local file/state reads, no IPC.
+     * Cost is set to 1e15 (> PG disable_cost 1e10) so the gated index loses
+     * even when enable_seqscan = off, preventing empty-result or ERROR paths.
+     *  1. enable_cuvs GUC
+     *  2. circuit breaker (repeated runtime failures → breaker open)
+     *  3. .stale sidecar (heap write marked index stale since build)
+     *  4. delete-drift (.tids build count vs planner live-row estimate)
+     *  5. socket existence (missing → daemon cleanly stopped or not yet started)
+     *  6. artifact existence (no .tids → index was built on empty table) */
     gpu_off = !enable_cuvs
            || cuvs_circuit_is_open((uint32_t) index_oid)
            || cuvs_index_is_stale(index_oid)
-           || cuvs_index_delete_drift_stale(index_oid, path->indexinfo->rel->tuples);
+           || cuvs_index_delete_drift_stale(index_oid, path->indexinfo->rel->tuples)
+           || !cuvs_daemon_socket_ready()
+           || !cuvs_index_has_artifact(index_oid);
 
     if (gpu_off)
     {
-        *indexStartupCost = 1e9;
-        *indexTotalCost   = 1e9;
+        *indexStartupCost = 1e15;
+        *indexTotalCost   = 1e15;
     }
     else
     {
@@ -721,10 +760,12 @@ cuvs_gettuple(IndexScanDesc scan, ScanDirection dir)
 
         if (rc != CUVS_STATUS_OK)
         {
-            /* Record error for circuit breaker. UNAVAILABLE (daemon down) and
-             * DIM_MISMATCH (user error) are not index-specific GPU failures,
-             * so don't count them toward the breaker. */
-            if (rc != CUVS_STATUS_UNAVAILABLE && rc != CUVS_STATUS_DIM_MISMATCH
+            /* Record error for circuit breaker. DIM_MISMATCH and METRIC_MISMATCH
+             * are user/config errors, not repeatable GPU failures. STALE is
+             * already gated at plan time. Everything else — including UNAVAILABLE
+             * (daemon crash after planning) — counts so the breaker opens and
+             * subsequent queries replan to CPU via the socket-existence gate. */
+            if (rc != CUVS_STATUS_DIM_MISMATCH
                 && rc != CUVS_STATUS_METRIC_MISMATCH && rc != CUVS_STATUS_STALE)
                 cuvs_circuit_record_error((uint32_t)index_oid,
                                           cuvs_circuit_breaker_threshold);
@@ -765,23 +806,37 @@ cuvs_gettuple(IndexScanDesc scan, ScanDirection dir)
                                     "match the cagra index dimension", dim)));
                     break;
                 case CUVS_STATUS_UNAVAILABLE:
-                    ereport(WARNING,
-                            (errmsg("pg_cuvs: pg_cuvs_server unreachable, "
-                                    "falling back to CPU")));
+                    /* Daemon was reachable at plan time (socket existed) but
+                     * unreachable now — crash or restart between plan and execute.
+                     * ERROR aborts this query; the breaker records the failure so
+                     * the next query replans to CPU via the socket-existence gate. */
+                    ereport(ERROR,
+                            (errcode(ERRCODE_CONNECTION_FAILURE),
+                             errmsg("pg_cuvs: GPU daemon unavailable after planning; "
+                                    "retry will use CPU while breaker is open"),
+                             errhint("The daemon crashed or restarted between plan and "
+                                     "execute time. Subsequent queries replan to CPU "
+                                     "automatically once the breaker opens.")));
                     break;
                 case CUVS_STATUS_OOM_FALLBACK:
-                    ereport(WARNING,
-                            (errmsg("pg_cuvs: VRAM exhausted, falling back to CPU")));
+                    ereport(ERROR,
+                            (errcode(ERRCODE_OUT_OF_MEMORY),
+                             errmsg("pg_cuvs: GPU VRAM exhausted; "
+                                    "retry will use CPU while breaker is open"),
+                             errhint("REINDEX or reduce cuvs.k to lower GPU memory use.")));
                     break;
                 case CUVS_STATUS_NOT_FOUND:
-                    ereport(WARNING,
-                            (errmsg("pg_cuvs: index not loaded on daemon, "
-                                    "falling back to CPU")));
+                    ereport(ERROR,
+                            (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+                             errmsg("pg_cuvs: cagra index not loaded on GPU daemon; "
+                                    "retry will use CPU while breaker is open"),
+                             errhint("REINDEX the index to reload it on the daemon.")));
                     break;
                 default:
-                    ereport(WARNING,
-                            (errmsg("pg_cuvs: GPU search failed (status %d), "
-                                    "falling back to CPU", rc)));
+                    ereport(ERROR,
+                            (errcode(ERRCODE_INTERNAL_ERROR),
+                             errmsg("pg_cuvs: GPU search failed (status %d); "
+                                    "retry will use CPU while breaker is open", rc)));
                     break;
             }
             return false;
