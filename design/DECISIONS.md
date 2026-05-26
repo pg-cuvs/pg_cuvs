@@ -216,15 +216,16 @@
 
 ---
 
-## ADR-012 — Phase 2 DiskANN: cuVS Vamana 네이티브 방식
+## ADR-012 — Phase 3B DiskANN/Vamana: cuVS Vamana 네이티브 방식
 
 **날짜**: 2026-05-23
+**상태**: Phase 2에서 Phase 3B로 이관됨
 
-**문제**: PLAN.md는 "CAGRA로 GPU 빌드 후 HNSW 포맷으로 변환"을 Phase 2 DiskANN 방식으로 언급했다. 그러나 cuVS에 더 직접적인 경로가 있는지 확인이 필요했다.
+**문제**: 초기 PLAN.md는 "CAGRA로 GPU 빌드 후 HNSW 포맷으로 변환"을 DiskANN 방식으로 언급했다. 그러나 cuVS에 더 직접적인 경로가 있는지 확인이 필요했다. Product Phase 2가 single-node CAGRA core로 고정되면서 DiskANN/Vamana는 Phase 3B로 이관됐다.
 
 **조사**: cuVS에 `cuvs.neighbors.vamana`가 존재하며, DiskANN 바이너리 포맷으로 직접 저장/로드 가능(`vamana.save()` / `vamana.load()`). CAGRA→HNSW 변환 레이어 불필요.
 
-**결정**: Phase 2 DiskANN은 두 경로를 모두 지원.
+**결정**: Phase 3B DiskANN/Vamana는 두 경로를 모두 지원한다.
 
 ```
 CAGRA build(GPU) → HNSW format → CPU HNSW search   (중간 규모, RAM 상주)

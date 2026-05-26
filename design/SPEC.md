@@ -11,6 +11,13 @@ The <주체> shall <행동>
 이 문서는 `/ouroboros:interview` 세션에서 확정된 설계 결정을 GEARS 형식으로 정교화한 것이다.
 ADR은 `design/DECISIONS.md` 참조. 이 문서는 ADR을 검증 가능한 요구사항으로 변환한다.
 
+Scope note:
+- 이 파일은 Phase 2 전용 완료 기준이 아니라 pg_cuvs의 전체 제품/장기 요구사항이다.
+- Phase별 완료 판정은 `design/PLAN.md`와 해당 phase audit 문서를 따른다.
+- Product Phase 2 single-node core 완료 판정은 `docs/phase2-exit-criteria.md`가 canonical이다.
+- 이 파일의 요구사항 중 일부는 Phase 3 또는 deferred enhancement로 남을 수 있으며,
+  그런 경우 각 항목에 phase note를 둔다.
+
 ---
 
 ## 1. IPC 레이어 (ADR-002)
@@ -225,7 +232,10 @@ the pg_cuvs extension shall emit a WARNING or trigger a lazy rebuild policy.
 
 ---
 
-## 6. Phase 2 — DiskANN (Q7)
+## 6. Phase 3B — DiskANN / Vamana Local NVMe (Q7)
+
+Phase 2 completion does not require DiskANN. DiskANN/Vamana belongs to Product
+Phase 3B, after Phase 3A pending-delta correctness.
 
 **DISKANN-01**
 ```
@@ -275,18 +285,29 @@ retrieves daemon-maintained statistics through an IPC status or stats command.
 
 **STAT-03**
 ```
-The `pg_stat_gpu_search` view shall include at least database OID, index OID,
-index name, call counts, success counts, fallback counts, error counts,
-requested k, returned k, rows returned, average latency, p95 latency, GPU kernel
-time, IPC time, VRAM cache hit/miss counts, reload count, last status, last
-error, and last search timestamp.
+For Product Phase 2 single-node core, the observability surface shall expose:
+per-index database OID, index OID, index name, dimension, metric, vector count,
+VRAM bytes, resident flag, search count, error count, average latency,
+p50/p95/p99 wall-clock latency, last status, last error, last search timestamp,
+requested k, returned k, stale flag, and stale timestamp via `pg_stat_gpu_search`;
+and daemon-global cache hit/miss/eviction/reload/persist-failure/residency
+counters via a separate cache stats view.
+```
+
+**STAT-03A — Target Observability**
+```
+For a later observability phase, the pg_cuvs extension should add detailed
+fallback reason, rows-returned aggregates, GPU kernel time, IPC time,
+CPU recheck time, and per-index cache/reload counters when those measurements
+are available without distorting hot-path latency.
 ```
 
 **STAT-04**
 ```
 When a search falls back to CPU,
-the pg_cuvs extension or pg_cuvs_server shall record a machine-readable fallback
-reason suitable for playbook diagnosis.
+the pg_cuvs extension or pg_cuvs_server shall expose enough machine-readable
+status for playbook diagnosis. Product Phase 2 exposes stale/error status and
+global cache counters; detailed fallback reason is a deferred enhancement.
 ```
 
 ---
