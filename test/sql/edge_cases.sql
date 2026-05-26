@@ -90,12 +90,22 @@ MOVE BACKWARD ALL IN c;   -- rewind through all rows (exercises backward)
 CLOSE c;
 COMMIT;
 
+-- ---- Parameterized query vector (PREPARE/EXECUTE $1): the bind-param path
+--      through gettuple must be crash-free. A self-match query (the vector
+--      equals an indexed point) has a deterministic top-1 (distance 0). ----
+PREPARE ec_knn(vector) AS SELECT id FROM ec ORDER BY embedding <-> $1 LIMIT 1;
+EXECUTE ec_knn('[1,0,0,0]');   -- self-match -> id 1
+EXECUTE ec_knn('[0,1,0,0]');   -- self-match -> id 2
+DEALLOCATE ec_knn;
+
 RESET enable_seqscan;
 RESET enable_bitmapscan;
 
 -- ============================================================================
--- k=100 cap (KNOWN LIMITATION): the GPU search hardcodes k=100, so even a
--- larger LIMIT returns at most 100 rows. This test LOCKS that behavior.
+-- k cap: the GPU search returns at most cuvs.k candidates (default 100), so a
+-- larger LIMIT still yields <=100 rows at the default. This test LOCKS the
+-- default-cuvs.k behavior. (Step 2 replaced the old hardcoded k=100 with the
+-- cuvs.k GUC; the default keeps this contract.)
 -- ============================================================================
 CREATE TABLE ec_big (id bigint, embedding vector(4));
 INSERT INTO ec_big
