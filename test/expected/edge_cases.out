@@ -472,6 +472,15 @@ SELECT stale FROM pg_stat_gpu_search WHERE index_oid = 'ec_cagra'::regclass;
  f
 (1 row)
 
+-- DELETE + VACUUM exercises the ambulkdelete path -> marks the index stale.
+DELETE FROM ec WHERE id = 99;
+VACUUM ec;
+SELECT stale FROM pg_stat_gpu_search WHERE index_oid = 'ec_cagra'::regclass;
+ stale 
+-------
+ t
+(1 row)
+
 -- ============================================================================
 -- Cleanup
 -- ============================================================================

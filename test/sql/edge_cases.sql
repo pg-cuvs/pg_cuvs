@@ -295,6 +295,10 @@ SELECT id FROM ec ORDER BY embedding <-> '[1,0,0,0]'::vector LIMIT 1;
 -- REINDEX rebuilds the graph from the current heap and clears staleness.
 REINDEX INDEX ec_cagra;
 SELECT stale FROM pg_stat_gpu_search WHERE index_oid = 'ec_cagra'::regclass;
+-- DELETE + VACUUM exercises the ambulkdelete path -> marks the index stale.
+DELETE FROM ec WHERE id = 99;
+VACUUM ec;
+SELECT stale FROM pg_stat_gpu_search WHERE index_oid = 'ec_cagra'::regclass;
 
 -- ============================================================================
 -- Cleanup
