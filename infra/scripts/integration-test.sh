@@ -621,7 +621,8 @@ SET cuvs.index_dir='$TEST_IDX';
 SELECT (evictions >= 1)||'|'||(reloads >= 1)||'|'||(resident_count <= 2) FROM pg_stat_gpu_cache;
 SQL
 )
-if [ "$CSTAT" = "t|t|t" ]; then
+# NB: boolean concatenated via || renders as 'true'/'false' (not the tabular t/f).
+if [ "$CSTAT" = "true|true|true" ]; then
     pass "cache: evictions>=1, reloads>=1, resident_count<=2 (tiered cache works)"
 else
     fail "cache: unexpected pg_stat_gpu_cache row: '$CSTAT'"
