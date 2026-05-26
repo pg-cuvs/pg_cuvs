@@ -363,6 +363,39 @@ cleanup:
 }
 
 /* ----------------------------------------------------------------
+ * Public API: cuvs_ipc_cache_stats
+ * ---------------------------------------------------------------- */
+int
+cuvs_ipc_cache_stats(const char *socket_path, CuvsCacheStats *out)
+{
+    int sock = uds_connect(socket_path);
+    int rc;
+    CuvsCmdFrame cmd;
+    CuvsReplyHeader hdr;
+
+    if (sock < 0)
+        return CUVS_STATUS_UNAVAILABLE;   /* daemon down -> caller treats as empty */
+
+    memset(&cmd, 0, sizeof(cmd));
+    cmd.op = CUVS_OP_CACHE_STATS;
+
+    rc = CUVS_STATUS_ERROR;
+    if (send_all(sock, &cmd, sizeof(cmd)) == 0
+        && recv_all(sock, &hdr, sizeof(hdr)) == 0)
+    {
+        rc = (int) hdr.status;
+        if (hdr.status == CUVS_STATUS_OK && hdr.n_results >= 1)
+        {
+            if (recv_all(sock, out, sizeof(*out)) < 0)
+                rc = CUVS_STATUS_ERROR;
+        }
+    }
+
+    close(sock);
+    return rc;
+}
+
+/* ----------------------------------------------------------------
  * Public API: cuvs_ipc_mark_stale
  * ---------------------------------------------------------------- */
 int

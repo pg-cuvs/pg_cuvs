@@ -23,6 +23,7 @@
 #define CUVS_OP_BUILD     2
 #define CUVS_OP_STATUS    3   /* per-index search stats; index_oid==0 = all in db */
 #define CUVS_OP_MARK_STALE 4  /* flag an index stale after a heap write */
+#define CUVS_OP_CACHE_STATS 5 /* daemon-global VRAM cache counters */
 
 /* ----------------------------------------------------------------
  * Distance metrics (mirror pgvector operator names)
@@ -186,6 +187,23 @@ int cuvs_ipc_stats(
     int             max,
     int            *n_out
 );
+
+/* ----------------------------------------------------------------
+ * CACHE_STATS reply payload (CUVS_OP_CACHE_STATS): daemon-global VRAM cache
+ * counters. Reply is CuvsReplyHeader (status=OK, n_results=1) + one struct.
+ * ---------------------------------------------------------------- */
+typedef struct CuvsCacheStats {
+    uint64_t hits;              /* searches served from a resident index */
+    uint64_t misses;            /* searches whose index was not resident */
+    uint64_t evictions;         /* LRU evictions performed */
+    uint64_t reloads;           /* indexes reloaded from disk after a miss */
+    uint64_t persist_failures;  /* eviction aborted because save_index failed */
+    uint32_t resident_count;    /* indexes currently VRAM-resident */
+    uint64_t vram_used_bytes;   /* sum of resident vram_bytes */
+    uint64_t vram_budget_bytes; /* g_max_vram_bytes; 0 = unlimited */
+} CuvsCacheStats;
+
+int cuvs_ipc_cache_stats(const char *socket_path, CuvsCacheStats *out);
 
 /*
  * cuvs_ipc_mark_stale — flag an index stale after a heap write (CUVS_OP_MARK_STALE).

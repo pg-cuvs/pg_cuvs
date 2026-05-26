@@ -114,6 +114,15 @@ static IndexEntry  g_indexes[MAX_INDEXES];
 static int         g_n_indexes   = 0;
 static pthread_mutex_t g_index_mutex = PTHREAD_MUTEX_INITIALIZER;
 
+/* Daemon-global VRAM cache counters (mutated under g_index_mutex). Exposed via
+ * CUVS_OP_CACHE_STATS / pg_stat_gpu_cache. Per-index counters can't track this
+ * because eviction destroys the IndexEntry. */
+static uint64_t g_cache_hits        = 0;
+static uint64_t g_cache_misses      = 0;
+static uint64_t g_cache_evictions   = 0;
+static uint64_t g_cache_reloads     = 0;
+static uint64_t g_cache_persist_fail = 0;
+
 /* ----------------------------------------------------------------
  * Configuration
  * ---------------------------------------------------------------- */
@@ -179,6 +188,7 @@ static int write_tids_atomic(const char *tids_tmp,
                              int64_t n_vecs, uint32_t dim, uint32_t metric,
                              const uint64_t *tids);
 static int fsync_path(const char *path);
+static int ensure_vram(size_t needed);   /* defined after the LRU section */
 
 /* save_index: persist a registry entry to disk atomically.
  * Same contract as handle_build's persistence path: tmp + rename + fsync.
@@ -275,20 +285,15 @@ load_index(uint32_t db_oid, uint32_t index_oid)
         return -1;
     }
 
-    /* VRAM preflight check */
+    /* VRAM make-room: evict LRU resident indexes to fit (tiered cache). Same
+     * path as build, so a search miss on a non-resident index reloads it by
+     * evicting the least-recently-used one. If it still won't fit after full
+     * eviction, skip (caller falls back to CPU). */
     size_t needed = estimate_vram_bytes(n_vecs, (int)dim);
-    size_t free_vram = gpu_free_vram_bytes();
-    if (g_max_vram_bytes > 0 && total_vram_used() + needed > g_max_vram_bytes)
+    if (ensure_vram(needed) != 0)
     {
-        LOG_WARN("pg_cuvs_server: VRAM budget exceeded loading %u/%u, skip\n",
-                db_oid, index_oid);
-        free(tids);
-        return -1;
-    }
-    if (needed > free_vram)
-    {
-        LOG_WARN("pg_cuvs_server: insufficient VRAM loading %u/%u, skip\n",
-                db_oid, index_oid);
+        LOG_WARN("pg_cuvs_server: insufficient VRAM loading %u/%u even after "
+                 "eviction, skip\n", db_oid, index_oid);
         free(tids);
         return -1;
     }
@@ -396,6 +401,7 @@ evict_lru(void)
         LOG_ERROR("evict_lru: save_index FAILED for %u/%u; aborting eviction "
                   "(VRAM still holds index)\n",
                 e->db_oid, e->index_oid);
+        g_cache_persist_fail++;
         return 0;
     }
     cuvs_cagra_free(e->handle);
@@ -408,6 +414,7 @@ evict_lru(void)
         g_indexes[i] = g_indexes[i+1];
     g_n_indexes--;
 
+    g_cache_evictions++;
     return freed;
 }
 
@@ -419,9 +426,11 @@ ensure_vram(size_t needed)
     /* Layer 1: preflight check */
     if (g_max_vram_bytes > 0 && total_vram_used() + needed > g_max_vram_bytes)
     {
-        /* Layer 2: LRU eviction loop */
+        /* Layer 2: LRU eviction loop. Stop if evict_lru makes no progress
+         * (returns 0, e.g. save_index keeps failing) to avoid an infinite loop. */
         while (g_n_indexes > 0 && total_vram_used() + needed > g_max_vram_bytes)
-            evict_lru();
+            if (evict_lru() == 0)
+                break;
 
         if (total_vram_used() + needed > g_max_vram_bytes)
             return -1;  /* Layer 3: caller falls back to CPU */
@@ -430,7 +439,8 @@ ensure_vram(size_t needed)
     size_t free_vram = gpu_free_vram_bytes();
     while (g_n_indexes > 0 && needed > free_vram)
     {
-        evict_lru();
+        if (evict_lru() == 0)
+            break;
         free_vram = gpu_free_vram_bytes();
     }
 
@@ -514,11 +524,19 @@ handle_search(int client_fd, const CuvsCmdFrame *cmd)
     pthread_mutex_lock(&g_index_mutex);
 
     IndexEntry *e = find_index(cmd->db_oid, cmd->index_oid);
-    if (!e)
+    if (e)
     {
-        /* Try to load from disk */
+        g_cache_hits++;             /* already VRAM-resident */
+    }
+    else
+    {
+        g_cache_misses++;           /* not resident */
+        /* Try to (re)load from disk, evicting LRU to fit if needed. */
         if (load_index(cmd->db_oid, cmd->index_oid) == 0)
+        {
+            g_cache_reloads++;
             e = find_index(cmd->db_oid, cmd->index_oid);
+        }
     }
 
     if (!e)
@@ -1101,6 +1119,33 @@ handle_mark_stale(int client_fd, const CuvsCmdFrame *cmd)
 }
 
 /* ----------------------------------------------------------------
+ * Handle CACHE_STATS command (CUVS_OP_CACHE_STATS): daemon-global counters.
+ * ---------------------------------------------------------------- */
+static void
+handle_cache_stats(int client_fd)
+{
+    CuvsCacheStats cs;
+    memset(&cs, 0, sizeof(cs));
+
+    pthread_mutex_lock(&g_index_mutex);
+    cs.hits             = g_cache_hits;
+    cs.misses           = g_cache_misses;
+    cs.evictions        = g_cache_evictions;
+    cs.reloads          = g_cache_reloads;
+    cs.persist_failures = g_cache_persist_fail;
+    cs.resident_count   = (uint32_t) g_n_indexes;
+    cs.vram_used_bytes  = total_vram_used();
+    cs.vram_budget_bytes = g_max_vram_bytes;
+    pthread_mutex_unlock(&g_index_mutex);
+
+    CuvsReplyHeader hdr = {0};
+    hdr.status    = CUVS_STATUS_OK;
+    hdr.n_results = 1;
+    send_all(client_fd, &hdr, sizeof(hdr));
+    send_all(client_fd, &cs, sizeof(cs));
+}
+
+/* ----------------------------------------------------------------
  * Per-connection thread
  * ---------------------------------------------------------------- */
 static void *
@@ -1138,6 +1183,9 @@ connection_thread(void *arg)
             break;
         case CUVS_OP_MARK_STALE:
             handle_mark_stale(client_fd, &cmd);
+            break;
+        case CUVS_OP_CACHE_STATS:
+            handle_cache_stats(client_fd);
             break;
         default:
             send_error(client_fd, "unknown op");

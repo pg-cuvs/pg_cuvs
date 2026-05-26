@@ -129,3 +129,34 @@ COMMENT ON VIEW pg_stat_gpu_search IS
   'GPU CAGRA per-index search stats: counts, fallbacks/errors, and '
   'approximate p50/p95/p99 latency. Counters reset on index rebuild or '
   'daemon restart; empty while the daemon is down.';
+
+-- ----------------------------------------------------------------
+-- pg_stat_gpu_cache — daemon-global VRAM tiered-cache counters.
+-- One row normally; empty while the daemon is down. Column order must match
+-- the SRF in src/pg_cuvs.c (pg_cuvs_gpu_cache_stats).
+-- ----------------------------------------------------------------
+CREATE FUNCTION pg_cuvs_gpu_cache_stats(
+    OUT hits             bigint,
+    OUT misses           bigint,
+    OUT evictions        bigint,
+    OUT reloads          bigint,
+    OUT persist_failures bigint,
+    OUT resident_count   integer,
+    OUT vram_used_mb     bigint,
+    OUT vram_budget_mb   bigint
+)
+RETURNS SETOF record
+AS '$libdir/pg_cuvs', 'pg_cuvs_gpu_cache_stats'
+LANGUAGE C;
+
+COMMENT ON FUNCTION pg_cuvs_gpu_cache_stats() IS
+  'Daemon-global VRAM tiered-cache counters (hits/misses/evictions/reloads). '
+  'Backs the pg_stat_gpu_cache view. Empty when the daemon is unavailable.';
+
+CREATE VIEW pg_stat_gpu_cache AS
+  SELECT * FROM pg_cuvs_gpu_cache_stats();
+
+COMMENT ON VIEW pg_stat_gpu_cache IS
+  'GPU VRAM cache: cumulative hit/miss/eviction/reload counters, resident '
+  'index count, and VRAM used vs budget (MB). Counters are daemon-lifetime; '
+  'empty while the daemon is down.';

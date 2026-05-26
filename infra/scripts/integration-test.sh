@@ -28,6 +28,8 @@
 #                       restart; REINDEX clears it.
 #  11. build memory cap -> an oversized build ERRORs (fail-fast, catalog rollback,
 #                       daemon untouched); a normal build under a high cap succeeds.
+#  12. VRAM tiered cache -> a small budget forces LRU eviction on build and reload
+#                       on search-miss; pg_stat_gpu_cache reflects evictions/reloads.
 #
 # Requires: pg_cuvs installed; the production pg-cuvs-server systemd unit
 # (stopped during the run, restarted at cleanup); CONDA_ENV exported so the
@@ -60,11 +62,13 @@ SQL
 
 start_test_daemon() {
     # Extra env (fault vars) passed as "VAR=1" arguments before the binary.
-    echo "[it] start test daemon ($*)"
+    # TEST_VRAM_MB (default 20480) overrides the VRAM budget so a scenario can
+    # force LRU eviction with a small cap.
+    echo "[it] start test daemon ($*) vram=${TEST_VRAM_MB:-20480}MB"
     env "$@" "$TEST_BIN" \
         --socket "$TEST_SOCK" \
         --index-dir "$TEST_IDX" \
-        --max-vram-mb 20480 \
+        --max-vram-mb "${TEST_VRAM_MB:-20480}" \
         >/tmp/pg_cuvs_test_daemon.log 2>&1 &
     DAEMON_PID=$!
     # Wait for readiness by polling for the UDS, which the daemon binds only
@@ -583,6 +587,52 @@ else
 fi
 stop_test_daemon
 psql -d "$DB" -c "DROP TABLE IF EXISTS mem_items, it_items;" >/dev/null 2>&1 || true
+
+# --- Scenario 12: VRAM tiered cache (evict-to-fit + reload + cache stats) -----
+# Start the daemon with a small VRAM budget so two ~3 MB indexes cannot both be
+# resident. Building the second evicts the first; searching the first reloads it
+# (evicting the second). pg_stat_gpu_cache must reflect evictions and reloads.
+echo "[it] --- scenario 12: VRAM tiered cache ---"
+stop_test_daemon
+rm -rf "$TEST_IDX"; mkdir -p "$TEST_IDX"
+TEST_VRAM_MB=4 start_test_daemon   # vector(512)x1500 ~= 3 MB each; budget fits one
+psql -d "$DB" -v ON_ERROR_STOP=1 >/dev/null <<SQL
+CREATE EXTENSION IF NOT EXISTS vector;
+CREATE EXTENSION IF NOT EXISTS pg_cuvs;
+DROP TABLE IF EXISTS cc1, cc2;
+CREATE TABLE cc1 (id bigint, embedding vector(512));
+CREATE TABLE cc2 (id bigint, embedding vector(512));
+INSERT INTO cc1 SELECT g, (SELECT ('['||string_agg((random())::text,',')||']')::vector(512)
+                           FROM generate_series(1,512)) FROM generate_series(1,1500) g;
+INSERT INTO cc2 SELECT g, (SELECT ('['||string_agg((random())::text,',')||']')::vector(512)
+                           FROM generate_series(1,512)) FROM generate_series(1,1500) g;
+SQL
+run_sql "CREATE INDEX cc1_idx ON cc1 USING cagra (embedding vector_l2_ops);" >/dev/null \
+    || fail "cache: build cc1 failed: $OUT"
+run_sql "CREATE INDEX cc2_idx ON cc2 USING cagra (embedding vector_l2_ops);" >/dev/null \
+    || fail "cache: build cc2 failed: $OUT"   # this build should evict cc1
+# Search cc1 (likely evicted) -> reload. Force the GPU path.
+run_sql "SET enable_seqscan=off;
+         SELECT id FROM cc1 ORDER BY embedding <-> (SELECT embedding FROM cc1 WHERE id=1) LIMIT 3;" >/dev/null \
+    || fail "cache: search cc1 failed: $OUT"
+CSTAT=$(psql -d "$DB" -At 2>/dev/null <<SQL | tail -1
+SET cuvs.socket_path='$TEST_SOCK';
+SET cuvs.index_dir='$TEST_IDX';
+SELECT (evictions >= 1)||'|'||(reloads >= 1)||'|'||(resident_count <= 2) FROM pg_stat_gpu_cache;
+SQL
+)
+if [ "$CSTAT" = "t|t|t" ]; then
+    pass "cache: evictions>=1, reloads>=1, resident_count<=2 (tiered cache works)"
+else
+    fail "cache: unexpected pg_stat_gpu_cache row: '$CSTAT'"
+fi
+if kill -0 "$DAEMON_PID" 2>/dev/null; then
+    pass "cache: daemon alive after eviction/reload cycle"
+else
+    fail "cache: daemon died during eviction/reload"
+fi
+stop_test_daemon
+psql -d "$DB" -c "DROP TABLE IF EXISTS cc1, cc2;" >/dev/null 2>&1 || true
 
 echo "[it] === summary ==="
 if [ "$FAILED" = "0" ]; then

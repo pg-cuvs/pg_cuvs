@@ -1078,3 +1078,66 @@ pg_cuvs_gpu_search_stats(PG_FUNCTION_ARGS)
 
     return (Datum) 0;
 }
+
+/* ----------------------------------------------------------------
+ * pg_cuvs_gpu_cache_stats() — daemon-global VRAM tiered-cache counters,
+ * backing the pg_stat_gpu_cache view. One row normally; zero rows when the
+ * daemon is unreachable (same convention as pg_stat_gpu_search).
+ * ---------------------------------------------------------------- */
+#define GPU_CACHE_NCOLS 8
+
+PG_FUNCTION_INFO_V1(pg_cuvs_gpu_cache_stats);
+Datum
+pg_cuvs_gpu_cache_stats(PG_FUNCTION_ARGS)
+{
+    ReturnSetInfo   *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+    TupleDesc        tupdesc;
+    Tuplestorestate *tupstore;
+    MemoryContext    per_query_ctx;
+    MemoryContext    oldcontext;
+    CuvsCacheStats   cs;
+    int              rc;
+
+    if (rsinfo == NULL || !IsA(rsinfo, ReturnSetInfo))
+        ereport(ERROR,
+                (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                 errmsg("set-valued function called in context that cannot accept a set")));
+    if (!(rsinfo->allowedModes & SFRM_Materialize))
+        ereport(ERROR,
+                (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                 errmsg("materialize mode required, but it is not allowed in this context")));
+    if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+        ereport(ERROR,
+                (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                 errmsg("return type must be a row type")));
+
+    per_query_ctx = rsinfo->econtext->ecxt_per_query_memory;
+    oldcontext = MemoryContextSwitchTo(per_query_ctx);
+    tupstore = tuplestore_begin_heap(true, false, work_mem);
+    rsinfo->returnMode = SFRM_Materialize;
+    rsinfo->setResult  = tupstore;
+    rsinfo->setDesc    = tupdesc;
+    MemoryContextSwitchTo(oldcontext);
+
+    memset(&cs, 0, sizeof(cs));
+    rc = cuvs_ipc_cache_stats(cuvs_socket_path, &cs);
+    if (rc == CUVS_STATUS_OK)
+    {
+        Datum values[GPU_CACHE_NCOLS];
+        bool  nulls[GPU_CACHE_NCOLS];
+
+        memset(nulls, 0, sizeof(nulls));
+        values[0] = Int64GetDatum((int64) cs.hits);
+        values[1] = Int64GetDatum((int64) cs.misses);
+        values[2] = Int64GetDatum((int64) cs.evictions);
+        values[3] = Int64GetDatum((int64) cs.reloads);
+        values[4] = Int64GetDatum((int64) cs.persist_failures);
+        values[5] = Int32GetDatum((int32) cs.resident_count);
+        values[6] = Int64GetDatum((int64) (cs.vram_used_bytes / (1024 * 1024)));
+        values[7] = Int64GetDatum((int64) (cs.vram_budget_bytes / (1024 * 1024)));
+        tuplestore_putvalues(tupstore, tupdesc, values, nulls);
+    }
+    /* daemon down (UNAVAILABLE) -> empty result, not an error */
+
+    return (Datum) 0;
+}
