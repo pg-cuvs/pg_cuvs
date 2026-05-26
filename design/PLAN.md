@@ -366,10 +366,10 @@ MVP 계약:
 - stale 상태, stale row count estimate, last write LSN 또는 timestamp를 `pg_stat_gpu_search`에 노출한다.
 - `REINDEX`는 현재 heap snapshot 기준으로 fresh artifact를 build/persist하고 daemon resident entry를 atomic swap한다.
 
-후속 확장:
-- pending-delta table 또는 small in-memory delta exact search.
-- stale ratio threshold 이하에서는 CAGRA result + delta correction.
-- autovacuum hook 또는 background worker lazy rebuild.
+Phase 3 필수 확장:
+- pending-delta table 또는 small in-memory delta exact search는 Phase 3 필수 기능으로 올린다.
+- Phase 2 MVP는 write 후 정합성을 위해 GPU CAGRA를 CPU fallback으로 막는다.
+- Phase 3는 stale 상태에서도 base CAGRA + pending-delta exact search + tombstone merge로 GPU path를 유지한다.
 
 검증:
 - INSERT 후 GPU stale marker가 켜지고 query가 CPU fallback한다.
@@ -466,7 +466,7 @@ Phase 2는 다음 조건을 모두 만족해야 완료로 본다.
 
 ### Phase 3 — Scale Out / Large Index Storage
 
-목표: 단일 노드 VRAM resident CAGRA의 한계를 넘어 NVMe, S3, replica, multi-GPU로 확장한다.
+목표: 단일 노드 VRAM resident CAGRA의 한계를 넘어 NVMe, S3, replica, multi-GPU로 확장한다. 또한 write-heavy workload에서 Phase 2의 stale CPU fallback을 성능적으로 극복하기 위해 pending-delta/delta exact search를 필수 기능으로 추가한다.
 
 #### 1. DiskANN / Vamana
 
@@ -476,7 +476,49 @@ Phase 2는 다음 조건을 모두 만족해야 완료로 본다.
 - CAGRA는 hot set, DiskANN은 cold set으로 역할 분리.
 - 같은 column에 hot/cold index가 공존하는 tiered search를 구현한다.
 
-#### 2. S3-backed Immutable Index Snapshots
+#### 2. Pending Delta / Delta Exact Search
+
+Phase 2의 stale fallback은 정합성을 지키지만, 쓰기가 발생한 순간 GPU path를 포기한다. 운영 workload에 INSERT/UPDATE가 조금이라도 섞이면 너무 보수적이므로 Phase 3에서는 pending-delta를 필수 기능으로 구현한다.
+
+목표:
+- 마지막 successful CAGRA build/REINDEX 이후의 INSERT/UPDATE를 pending-delta store에 보관한다.
+- DELETE/UPDATE old version은 tombstone set에 기록한다.
+- query 시 base CAGRA search와 pending-delta exact search를 함께 수행한다.
+- base candidates, delta candidates, tombstone filtering 결과를 top-k merge한다.
+- PostgreSQL heap recheck/MVCC는 마지막 방어선으로 유지한다.
+
+검색 흐름:
+```
+query vector
+  -> base CAGRA search over immutable graph
+  -> exact search over pending-delta rows
+  -> remove tombstoned TIDs
+  -> merge top-k candidates
+  -> PostgreSQL heap recheck / MVCC visibility
+```
+
+구현 항목:
+- pending-delta 저장소: in-memory MVP 후 durable sidecar/WAL-like artifact 검토.
+- delta entry schema: TID, vector, op type, write generation, optional xmin/xmax metadata.
+- tombstone set: base CAGRA에 남아 있을 수 있는 deleted/updated-old TID 제거.
+- merge algorithm: base result와 delta exact result의 metric-compatible distance ordering 보장.
+- threshold policy: `cuvs.rebuild_threshold` 초과 시 `REINDEX`/lazy rebuild 권고 또는 background rebuild trigger.
+- stats: `pg_stat_gpu_search`에 `delta_count`, `tombstone_count`, `delta_search_us`, `delta_merged`, `stale_but_corrected` 계열 컬럼 추가.
+- rebuild compaction: successful REINDEX 후 pending-delta/tombstone을 비우고 새 base generation으로 교체.
+
+정합성 원칙:
+- pending-delta가 없으면 INSERT된 새 벡터가 CAGRA 후보에 절대 나오지 않으므로 stale GPU search는 틀릴 수 있다.
+- pending-delta exact search가 들어오기 전까지 Phase 2의 CPU fallback 정책을 유지한다.
+- delta merge가 실패하거나 delta artifact가 손상되면 GPU path를 사용하지 않고 CPU fallback한다.
+
+검증:
+- INSERT 후 REINDEX 전에도 새 row가 GPU+delta merged top-k에 포함된다.
+- UPDATE는 old TID tombstone + new vector delta로 처리된다.
+- DELETE된 base TID는 CAGRA 후보에서 오더라도 merge 단계에서 제거된다.
+- delta threshold 초과 시 rebuild 권고/trigger가 발생한다.
+- daemon restart 후 durable delta/tombstone 정책에 따라 정합성이 유지되거나 안전하게 CPU fallback한다.
+
+#### 3. S3-backed Immutable Index Snapshots
 
 구현 항목:
 - local `cuvs.index_dir` artifact를 S3 snapshot으로 확장한다.
@@ -485,21 +527,21 @@ Phase 2는 다음 조건을 모두 만족해야 완료로 본다.
 - local NVMe는 cache, S3는 재사용 가능한 artifact store로 취급한다.
 - index artifact는 WAL 대상이 아닌 derived data로 유지한다.
 
-#### 3. Replica / Multi-node Loading
+#### 4. Replica / Multi-node Loading
 
 구현 항목:
 - primary에서 build 후 S3 upload.
 - read replica는 heap scan rebuild 없이 S3에서 download/load.
 - catalog OID, relfilenode 변화, manifest version mapping을 관리한다.
 
-#### 4. Async Prefetch / Warmup
+#### 5. Async Prefetch / Warmup
 
 구현 항목:
 - daemon startup 시 metadata만 scan하고 hot index를 background prefetch한다.
 - NVMe cache miss 시 S3 download 후 VRAM promotion한다.
 - warmup 상태와 miss reason을 stats view에 노출한다.
 
-#### 5. Multi-GPU / Sharding
+#### 6. Multi-GPU / Sharding
 
 구현 항목:
 - shard 단위 index build/search.
@@ -509,6 +551,7 @@ Phase 2는 다음 조건을 모두 만족해야 완료로 본다.
 
 Phase 3 완료 기준:
 - 100M+ vector를 단일 VRAM resident 전제로 두지 않고 검색한다.
+- write-heavy workload에서 pending-delta/delta exact search로 stale CPU fallback 없이 정합한 top-k를 반환한다.
 - S3 snapshot에서 새 daemon 또는 read replica가 index를 복구한다.
 - hot CAGRA + cold DiskANN tiered search가 동작한다.
 - partial upload, stale manifest, missing local cache의 복구 경로가 있다.

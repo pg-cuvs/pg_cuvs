@@ -186,27 +186,41 @@ emit an ERROR-level log entry, and fall back to CPU until
 
 ---
 
-## 5. 쓰기 처리 — Lazy Rebuild (Q9)
+## 5. 쓰기 처리 — Stale Safety, Lazy Rebuild, Delta Correction (Q9)
 
 **WRITE-01**
 ```
 When a row is inserted, updated, or deleted in a table that has a cagra index,
-the pg_cuvs extension shall record the affected TID in an in-memory pending-delta
-set without modifying the VRAM-resident index.
+the pg_cuvs extension shall mark the cagra index stale without modifying the
+VRAM-resident base index.
 ```
 
 **WRITE-02**
 ```
-While the pending-delta set for a cagra index exceeds `cuvs.rebuild_threshold`
-(default: 10% of index size),
-the pg_cuvs extension shall emit a WARNING advising the operator to run VACUUM.
+While a cagra index is stale and no valid pending-delta correction path exists,
+the pg_cuvs extension shall not use the stale GPU CAGRA path for query results.
+The default policy is CPU fallback.
 ```
 
 **WRITE-03**
 ```
-When AUTOVACUUM or manual VACUUM processes a table that has a cagra index,
-the pg_cuvs_server shall rebuild the index from the current heap state and
-replace the resident VRAM index atomically.
+When REINDEX rebuilds a stale cagra index from the current heap state,
+the pg_cuvs_server shall replace the resident VRAM index atomically and clear
+the stale marker only after durable persistence succeeds.
+```
+
+**WRITE-04**
+```
+In Phase 3, the pg_cuvs extension shall provide a pending-delta correction path:
+INSERT/UPDATE new versions are searched with exact distance over a delta store,
+DELETE/UPDATE old versions are filtered with a tombstone set, and base CAGRA
+candidates plus delta candidates are merged before PostgreSQL heap recheck.
+```
+
+**WRITE-05**
+```
+While the pending-delta set for a cagra index exceeds `cuvs.rebuild_threshold`,
+the pg_cuvs extension shall emit a WARNING or trigger a lazy rebuild policy.
 ```
 
 ---
@@ -433,7 +447,7 @@ rollback/cleanup.
 | `cuvs.index_dir` | string | `$PGDATA/cuvs_indexes/` | 인덱스 직렬화 경로 |
 | `cuvs.max_vram_mb` | int | 0 (unlimited) | VRAM 사용 상한 |
 | `cuvs.circuit_breaker_threshold` | int | 3 | 연속 실패 임계값 |
-| `cuvs.rebuild_threshold` | float | 0.10 | delta 비율 임계값 (VACUUM 권고) |
+| `cuvs.rebuild_threshold` | float | 0.10 | delta 비율 임계값 (REINDEX/lazy rebuild 권고) |
 | `cuvs.export_hnsw` | bool | off | CAGRA 빌드 시 HNSW 병행 export |
 | `cuvs.s3_bucket` | string | '' | Phase 3 S3 버킷 (비어있으면 비활성) |
 | `cuvs.cluster_id` | string | '' | Phase 3 멀티노드 식별자 |

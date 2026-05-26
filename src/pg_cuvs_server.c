@@ -56,6 +56,8 @@ typedef struct IndexEntry {
     size_t          vram_bytes;   /* estimated VRAM usage */
     time_t          last_search;  /* for LRU eviction; also stats last_search_at */
     int             valid;
+    int             stale;        /* 1 if heap writes happened since build (REINDEX needed) */
+    time_t          stale_since;  /* when first marked stale; 0 if fresh */
 
     /* Search stats (pg_stat_gpu_search). Reset on (re)build/load — they
      * describe the currently resident index instance, not a persisted total. */
@@ -162,6 +164,14 @@ tids_file_path(char *out, size_t outlen,
                const char *dir, uint32_t db_oid, uint32_t index_oid)
 {
     snprintf(out, outlen, "%s/%u_%u.tids", dir, db_oid, index_oid);
+}
+
+/* Sidecar marking an index stale; persists staleness across daemon restarts. */
+static void
+stale_file_path(char *out, size_t outlen,
+                const char *dir, uint32_t db_oid, uint32_t index_oid)
+{
+    snprintf(out, outlen, "%s/%u_%u.stale", dir, db_oid, index_oid);
 }
 
 /* Forward decls used by save_index. */
@@ -309,6 +319,24 @@ load_index(uint32_t db_oid, uint32_t index_oid)
     e->last_search = time(NULL);
     e->valid       = 1;
     reset_entry_stats(e);
+
+    /* Restore staleness from the .stale sidecar so a daemon restart does not
+     * silently resurrect a write-stale index as fresh. */
+    {
+        char stale_path[512];
+        struct stat st;
+        stale_file_path(stale_path, sizeof(stale_path), g_index_dir, db_oid, index_oid);
+        if (stat(stale_path, &st) == 0)
+        {
+            e->stale = 1;
+            e->stale_since = st.st_mtime;
+        }
+        else
+        {
+            e->stale = 0;
+            e->stale_since = 0;
+        }
+    }
 
     LOG_INFO("pg_cuvs_server: loaded index %u/%u (%lld vecs, %zu MB VRAM)\n",
             db_oid, index_oid, (long long)n_vecs, needed / (1024*1024));
@@ -503,6 +531,20 @@ handle_search(int client_fd, const CuvsCmdFrame *cmd)
     }
 
     e->last_search = time(NULL);
+
+    /* Stale: heap writes happened since the build, so the CAGRA graph is missing
+     * rows. Don't search a stale graph — tell the backend to use the CPU path
+     * (correct, current results) until a REINDEX rebuilds the graph. */
+    if (e->stale)
+    {
+        CuvsReplyHeader hdr = {0};
+        hdr.status = CUVS_STATUS_STALE;
+        strncpy(hdr.error, "index stale (writes since build)", sizeof(hdr.error) - 1);
+        record_search_stat(e, CUVS_STATUS_STALE, 0, hdr.error);
+        pthread_mutex_unlock(&g_index_mutex);
+        send_all(client_fd, &hdr, sizeof(hdr));
+        return;
+    }
 
     /* The metric is baked into the CAGRA graph at build time. A query carrying
      * a different opclass metric means this index was built before the
@@ -879,6 +921,15 @@ handle_build(int client_fd, const CuvsCmdFrame *cmd)
     int dir_fd = open(save_dir, O_RDONLY);
     if (dir_fd >= 0) { fsync(dir_fd); close(dir_fd); }
 
+    /* A rebuild produces a fresh graph reflecting the current heap — clear any
+     * persisted staleness marker. */
+    {
+        char stale_path[512];
+        stale_file_path(stale_path, sizeof(stale_path), save_dir,
+                        cmd->db_oid, cmd->index_oid);
+        unlink(stale_path);
+    }
+
     LOG_DEBUG("[handle_build] disk commit OK\n");
 
     /* --- Swap into registry --- */
@@ -894,6 +945,8 @@ handle_build(int client_fd, const CuvsCmdFrame *cmd)
         existing->vram_bytes  = needed;
         existing->last_search = time(NULL);
         existing->valid       = 1;
+        existing->stale       = 0;     /* rebuilt -> fresh */
+        existing->stale_since = 0;
         reset_entry_stats(existing);   /* fresh index instance */
     } else {
         if (g_n_indexes >= MAX_INDEXES)
@@ -920,6 +973,8 @@ handle_build(int client_fd, const CuvsCmdFrame *cmd)
         e->vram_bytes  = needed;
         e->last_search = time(NULL);
         e->valid       = 1;
+        e->stale       = 0;
+        e->stale_since = 0;
         reset_entry_stats(e);
     }
 
@@ -993,6 +1048,8 @@ handle_stats(int client_fd, const CuvsCmdFrame *cmd)
         s->p95_us = cuvs_lat_percentile(e->lat_buckets, CUVS_LAT_BUCKETS, 0.95);
         s->p99_us = cuvs_lat_percentile(e->lat_buckets, CUVS_LAT_BUCKETS, 0.99);
         s->last_search_at   = (int64_t)e->last_search;
+        s->stale            = (uint32_t)e->stale;
+        s->stale_since      = (int64_t)e->stale_since;
         strncpy(s->last_error, e->last_error, sizeof(s->last_error) - 1);
     }
 
@@ -1004,6 +1061,43 @@ handle_stats(int client_fd, const CuvsCmdFrame *cmd)
     send_all(client_fd, &hdr, sizeof(hdr));
     if (n > 0)
         send_all(client_fd, stats, (size_t)n * sizeof(CuvsIndexStats));
+}
+
+/* ----------------------------------------------------------------
+ * Handle MARK_STALE command (CUVS_OP_MARK_STALE)
+ *
+ * A backend write hook (aminsert/ambulkdelete) flags an index stale after a
+ * heap write. We set the in-memory flag AND touch a .stale sidecar so the
+ * staleness survives a daemon restart. Idempotent.
+ * ---------------------------------------------------------------- */
+static void
+handle_mark_stale(int client_fd, const CuvsCmdFrame *cmd)
+{
+    char stale_path[512];
+    time_t now = time(NULL);
+
+    pthread_mutex_lock(&g_index_mutex);
+
+    IndexEntry *e = find_index(cmd->db_oid, cmd->index_oid);
+    if (e && !e->stale)
+    {
+        e->stale = 1;
+        e->stale_since = now;
+    }
+
+    /* Persist the marker even if the index is not currently resident, so a
+     * later load_index picks it up. */
+    stale_file_path(stale_path, sizeof(stale_path), g_index_dir,
+                    cmd->db_oid, cmd->index_oid);
+    int fd = open(stale_path, O_WRONLY | O_CREAT, 0600);
+    if (fd >= 0)
+        close(fd);
+
+    pthread_mutex_unlock(&g_index_mutex);
+
+    CuvsReplyHeader hdr = {0};
+    hdr.status = CUVS_STATUS_OK;
+    send_all(client_fd, &hdr, sizeof(hdr));
 }
 
 /* ----------------------------------------------------------------
@@ -1041,6 +1135,9 @@ connection_thread(void *arg)
             break;
         case CUVS_OP_STATUS:
             handle_stats(client_fd, &cmd);
+            break;
+        case CUVS_OP_MARK_STALE:
+            handle_mark_stale(client_fd, &cmd);
             break;
         default:
             send_error(client_fd, "unknown op");

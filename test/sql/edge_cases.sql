@@ -283,6 +283,20 @@ SELECT id FROM ec ORDER BY embedding <-> '[1,0,0,0]'::vector LIMIT 5;
 SET enable_cuvs = on;
 
 -- ============================================================================
+-- Step 4: staleness — a heap write marks the index stale; REINDEX clears it.
+-- Assert deterministic facts only (stale boolean; CPU-exact result).
+-- ============================================================================
+-- ec_cagra was rebuilt during DDL churn above, so it starts fresh.
+INSERT INTO ec VALUES (99, '[0.5,0.5,0,0]');   -- aminsert -> marks index stale
+SELECT stale FROM pg_stat_gpu_search WHERE index_oid = 'ec_cagra'::regclass;
+-- Default planner on this tiny table prefers seqscan, so the query returns the
+-- correct CPU-exact nearest (id=1) even while the GPU index is stale.
+SELECT id FROM ec ORDER BY embedding <-> '[1,0,0,0]'::vector LIMIT 1;
+-- REINDEX rebuilds the graph from the current heap and clears staleness.
+REINDEX INDEX ec_cagra;
+SELECT stale FROM pg_stat_gpu_search WHERE index_oid = 'ec_cagra'::regclass;
+
+-- ============================================================================
 -- Cleanup
 -- ============================================================================
 DROP TABLE ec, ec_big, ec_empty, ec_one, ec_d1, ec_d2000, ec_dup, ec_null,

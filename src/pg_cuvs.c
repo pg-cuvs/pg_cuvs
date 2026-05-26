@@ -537,12 +537,22 @@ cuvs_gettuple(IndexScanDesc scan, ScanDirection dir)
              * DIM_MISMATCH (user error) are not index-specific GPU failures,
              * so don't count them toward the breaker. */
             if (rc != CUVS_STATUS_UNAVAILABLE && rc != CUVS_STATUS_DIM_MISMATCH
-                && rc != CUVS_STATUS_METRIC_MISMATCH)
+                && rc != CUVS_STATUS_METRIC_MISMATCH && rc != CUVS_STATUS_STALE)
                 cuvs_circuit_record_error((uint32_t)index_oid,
                                           cuvs_circuit_breaker_threshold);
 
             switch (rc)
             {
+                case CUVS_STATUS_STALE:
+                    /* Writes happened since build; the GPU graph is missing rows.
+                     * Fall back to the CPU path for correct, current results. */
+                    ereport(WARNING,
+                            (errmsg("pg_cuvs: cagra index is stale (writes since "
+                                    "build); using CPU fallback"),
+                             errhint("REINDEX the index to re-enable GPU search.")));
+                    /* Phase 3: delta correction plugs in here
+                     * (stale && delta-available -> GPU+delta, else fallback). */
+                    break;
                 case CUVS_STATUS_METRIC_MISMATCH:
                     /* The index was built with a different metric (e.g. built
                      * before opclass-metric support, always L2). cuVS bakes the
@@ -663,6 +673,53 @@ cuvs_endscan(IndexScanDesc scan)
     scan->opaque = NULL;
 }
 
+/* Flag this index stale on the daemon after a heap write. Best-effort: a
+ * daemon that is down must not fail the user's write (the next reachable
+ * write or a REINDEX re-establishes the marker). */
+static void
+cuvs_mark_index_stale(Relation indexRel)
+{
+    (void) cuvs_ipc_mark_stale(cuvs_socket_path,
+                               (uint32_t) MyDatabaseId,
+                               (uint32_t) RelationGetRelid(indexRel));
+}
+
+/* aminsert fires per inserted/updated row. CAGRA keeps no incremental per-row
+ * structure, so we don't store a tuple — we only need to mark the index stale
+ * once. Dedup via rd_amcache (relcache-lifetime; cleared on REINDEX's relcache
+ * invalidation, so post-REINDEX writes re-mark correctly). */
+static bool
+cuvs_aminsert(Relation indexRel, Datum *values, bool *isnull,
+              ItemPointer heap_tid, Relation heapRel,
+              IndexUniqueCheck checkUnique, bool indexUnchanged,
+              IndexInfo *indexInfo)
+{
+    (void) values; (void) isnull; (void) heap_tid; (void) heapRel;
+    (void) checkUnique; (void) indexUnchanged; (void) indexInfo;
+
+    if (indexRel->rd_amcache == NULL)
+    {
+        cuvs_mark_index_stale(indexRel);
+        /* sentinel: presence means "already marked stale this relcache life" */
+        indexRel->rd_amcache = MemoryContextAllocZero(indexRel->rd_indexcxt,
+                                                      sizeof(bool));
+    }
+    return false;   /* no index entry stored */
+}
+
+/* ambulkdelete runs once per VACUUM when dead tuples (DELETE/UPDATE) are
+ * removed. Mark the index stale so the next query falls back to CPU. */
+static IndexBulkDeleteResult *
+cuvs_ambulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
+                  IndexBulkDeleteCallback callback, void *callback_state)
+{
+    (void) callback; (void) callback_state;
+    if (stats == NULL)
+        stats = (IndexBulkDeleteResult *) palloc0(sizeof(IndexBulkDeleteResult));
+    cuvs_mark_index_stale(info->index);
+    return stats;
+}
+
 /* VACUUM calls amvacuumcleanup once per index. A CAGRA index is an immutable
  * GPU snapshot (rebuilt only by REINDEX), so there is nothing to clean up —
  * but the handler must exist, otherwise VACUUM (and autovacuum) ERROR with
@@ -693,8 +750,8 @@ cuvsamhandler(PG_FUNCTION_ARGS)
 
     amroutine->ambuild           = cuvs_ambuild;
     amroutine->ambuildempty      = cuvs_ambuildempty;
-    amroutine->aminsert          = NULL;    /* lazy rebuild via AUTOVACUUM */
-    amroutine->ambulkdelete      = NULL;
+    amroutine->aminsert          = cuvs_aminsert;     /* marks index stale */
+    amroutine->ambulkdelete      = cuvs_ambulkdelete; /* marks index stale */
     amroutine->amvacuumcleanup   = cuvs_amvacuumcleanup;
 
     amroutine->ambeginscan       = cuvs_beginscan;
@@ -795,7 +852,7 @@ pg_cuvs_last_search_metric(PG_FUNCTION_ARGS)
  * the view must stay queryable while the daemon restarts. (See plan: a
  * future liveness column can distinguish "down" from "idle".)
  * ---------------------------------------------------------------- */
-#define GPU_STATS_NCOLS 19
+#define GPU_STATS_NCOLS 21
 
 static const char *
 cuvs_metric_name(uint32_t metric)
@@ -895,6 +952,11 @@ pg_cuvs_gpu_search_stats(PG_FUNCTION_ARGS)
 
         values[17] = Int32GetDatum((int32) s->last_requested_k);
         values[18] = Int32GetDatum((int32) s->last_returned_k);
+        values[19] = BoolGetDatum(s->stale != 0);
+        if (s->stale_since != 0)
+            values[20] = TimestampTzGetDatum(time_t_to_timestamptz((pg_time_t) s->stale_since));
+        else
+            nulls[20] = true;
 
         tuplestore_putvalues(tupstore, tupdesc, values, nulls);
     }

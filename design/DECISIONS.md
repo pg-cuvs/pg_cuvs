@@ -260,17 +260,24 @@ Vamana build(GPU) → DiskANN binary → CPU Vamana search  (대규모, NVMe)
 ## ADR-014 — 쓰기 처리: AUTOVACUUM 연동 Lazy Rebuild
 
 **날짜**: 2026-05-23
+**상태**: 보완됨. Phase 2/3 분리는 `design/PLAN.md` 최신본을 따른다.
 
 **문제**: CAGRA는 정적 그래프 인덱스라 INSERT/UPDATE/DELETE 시 실시간 업데이트가 불가능하다.
 
-**결정**: pgvector HNSW와 동일한 접근 방식 채택. INSERT/UPDATE/DELETE 시 영향받은 TID를 인메모리 pending-delta set에 기록. AUTOVACUUM 또는 수동 VACUUM 시 pg_cuvs_server가 현재 heap 상태로 인덱스를 재빌드하고 VRAM을 원자적으로 교체.
+**결정**:
+- Phase 2 MVP는 write event를 binary stale marker로 기록하고, stale index에 대해서는 GPU CAGRA search를 사용하지 않는다. 기본 동작은 CPU fallback이다.
+- stale marker는 daemon restart 후 사라지면 오래된 artifact를 fresh처럼 로드할 수 있으므로 durable sidecar 정책을 사용한다.
+- pending-delta / delta exact search는 write-heavy workload에서 GPU path를 유지하기 위한 필수 기능이지만, Phase 2 MVP의 정합성 게이트와 분리해 Phase 3 필수 항목으로 올린다.
 
 **결과**:
-- 별도 스케줄러 없이 PostgreSQL 기존 유지보수 사이클 재활용
-- delta 비율이 `cuvs.rebuild_threshold`(기본 10%) 초과 시 VACUUM 권고 WARNING 발생
-- VACUUM 전까지 stale 인덱스 허용 — recall 저하는 있으나 정확도(exact match)는 heap recheck로 보장
+- Phase 2에서는 쓰기 후 조용한 오답을 피한다. INSERT된 새 벡터는 base CAGRA에 없으므로 heap recheck만으로는 누락을 보정할 수 없다.
+- Phase 3 pending-delta가 들어오면 base CAGRA result와 delta exact result를 merge해 REINDEX 전에도 정합한 top-k를 유지한다.
+- delta 비율이 `cuvs.rebuild_threshold`를 초과하면 REINDEX/lazy rebuild 권고 또는 background rebuild trigger로 이어진다.
 
-**대안**: Background Worker 주기적 재빌드. 보류 — AUTOVACUUM 연동이 더 단순하며 PG 생태계 관례와 일치. 필요 시 Phase 2에서 워밍업 Background Worker 추가 가능.
+**대안**:
+- stale index를 계속 GPU로 검색. 거부 — INSERT/UPDATE new row 누락으로 오답 가능.
+- Phase 2에서 pending-delta까지 한 번에 구현. 보류 — delta store, tombstone, rollback/durability, top-k merge까지 같이 필요해 Step 4 MVP 범위를 넘는다.
+- Background Worker 주기적 재빌드. 보류 — pending-delta threshold와 결합해 Phase 3에서 재검토.
 
 ---
 

@@ -24,6 +24,8 @@
 #                       (never errors) and the backend survives.
 #   9. opclass metric + cuvs.k -> cosine index reports metric=cosine; cuvs.k
 #                       flows through to the daemon's requested_k.
+#  10. staleness -> a heap write marks the index stale; .stale survives a daemon
+#                       restart; REINDEX clears it.
 #
 # Requires: pg_cuvs installed; the production pg-cuvs-server systemd unit
 # (stopped during the run, restarted at cleanup); CONDA_ENV exported so the
@@ -506,6 +508,35 @@ if kill -0 "$DAEMON_PID" 2>/dev/null; then
 else
     fail "metric: daemon DIED on cosine build/search"
 fi
+stop_test_daemon
+psql -d "$DB" -c "DROP TABLE IF EXISTS it_items;" >/dev/null 2>&1 || true
+
+# --- Scenario 10: staleness persists across daemon restart -------------------
+# A heap write marks the index stale; the .stale sidecar must keep it stale
+# after a daemon restart; REINDEX clears it.
+echo "[it] --- scenario 10: staleness + .stale persistence ---"
+fresh_fixture
+start_test_daemon
+run_sql "CREATE INDEX it_st ON it_items USING cagra (embedding vector_l2_ops);" >/dev/null
+run_sql "INSERT INTO it_items VALUES (99, '[0.5,0.5,0,0]');" >/dev/null   # aminsert -> mark stale
+st_query() {
+    psql -d "$DB" -At 2>/dev/null <<SQL | tail -1
+SET cuvs.socket_path='$TEST_SOCK';
+SET cuvs.index_dir='$TEST_IDX';
+SELECT stale FROM pg_stat_gpu_search WHERE index_oid='it_st'::regclass;
+SQL
+}
+[ "$(st_query)" = "t" ] && pass "stale: INSERT marked index stale" \
+    || fail "stale: INSERT did not mark stale (got '$(st_query)')"
+# Restart the daemon — .stale sidecar must survive.
+stop_test_daemon
+start_test_daemon
+[ "$(st_query)" = "t" ] && pass "stale: persisted across daemon restart (.stale)" \
+    || fail "stale: lost after restart (got '$(st_query)')"
+# REINDEX rebuilds and clears staleness.
+run_sql "REINDEX INDEX it_st;" >/dev/null
+[ "$(st_query)" = "f" ] && pass "stale: REINDEX cleared staleness" \
+    || fail "stale: REINDEX did not clear (got '$(st_query)')"
 stop_test_daemon
 psql -d "$DB" -c "DROP TABLE IF EXISTS it_items;" >/dev/null 2>&1 || true
 

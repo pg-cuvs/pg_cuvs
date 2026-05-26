@@ -22,6 +22,7 @@
 #define CUVS_OP_SEARCH    1
 #define CUVS_OP_BUILD     2
 #define CUVS_OP_STATUS    3   /* per-index search stats; index_oid==0 = all in db */
+#define CUVS_OP_MARK_STALE 4  /* flag an index stale after a heap write */
 
 /* ----------------------------------------------------------------
  * Distance metrics (mirror pgvector operator names)
@@ -42,6 +43,7 @@
 #define CUVS_STATUS_PERSIST_FAILED 6   /* build OK, disk persist failed */
 #define CUVS_STATUS_DIM_MISMATCH   7   /* query dim != index dim → user error */
 #define CUVS_STATUS_METRIC_MISMATCH 8  /* index built with a different metric → REINDEX */
+#define CUVS_STATUS_STALE          9   /* index stale (writes since build) → CPU fallback */
 
 /* ----------------------------------------------------------------
  * Command frame (sent over UDS, fixed size)
@@ -109,6 +111,8 @@ typedef struct CuvsIndexStats {
     uint32_t p95_us;
     uint32_t p99_us;
     int64_t  last_search_at;    /* epoch seconds; 0 if never searched */
+    uint32_t stale;             /* 1 if writes happened since build (REINDEX needed) */
+    int64_t  stale_since;       /* epoch seconds the index was first marked stale; 0 if fresh */
     char     last_error[128];
 } CuvsIndexStats;
 
@@ -181,6 +185,17 @@ int cuvs_ipc_stats(
     CuvsIndexStats *out,
     int             max,
     int            *n_out
+);
+
+/*
+ * cuvs_ipc_mark_stale — flag an index stale after a heap write (CUVS_OP_MARK_STALE).
+ * Best-effort: returns CUVS_STATUS_UNAVAILABLE if the daemon is down (the write
+ * itself must not fail because the GPU sidecar is unreachable).
+ */
+int cuvs_ipc_mark_stale(
+    const char *socket_path,
+    uint32_t    db_oid,
+    uint32_t    index_oid
 );
 
 /* Circuit breaker state machine moved to cuvs_util.h (structural commit). */
