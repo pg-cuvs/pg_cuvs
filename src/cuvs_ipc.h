@@ -131,6 +131,9 @@ typedef struct CuvsIndexStats {
     uint32_t warmup_duration_ms; /* wall-clock ms of last download+load cycle */
     uint32_t download_count;     /* GCS downloads for this index */
     uint64_t cache_miss_count;   /* searches that found this index not resident */
+    /* Phase 3E: multi-GPU */
+    uint32_t gpu_device_id;      /* CUDA device this index lives on; 0xFFFFFFFF if cold */
+    uint32_t _pad1;              /* alignment to 8-byte boundary */
 } CuvsIndexStats;
 
 /* ----------------------------------------------------------------
@@ -208,21 +211,23 @@ int cuvs_ipc_stats(
 );
 
 /* ----------------------------------------------------------------
- * CACHE_STATS reply payload (CUVS_OP_CACHE_STATS): daemon-global VRAM cache
- * counters. Reply is CuvsReplyHeader (status=OK, n_results=1) + one struct.
+ * CACHE_STATS reply payload (CUVS_OP_CACHE_STATS): per-GPU VRAM cache
+ * counters. Reply is CuvsReplyHeader (status=OK, n_results=N_GPUs) + N structs.
  * ---------------------------------------------------------------- */
 typedef struct CuvsCacheStats {
+    uint32_t gpu_device_id;     /* Phase 3E: which GPU this row describes */
+    uint32_t resident_count;    /* indexes currently VRAM-resident on this GPU */
     uint64_t hits;              /* searches served from a resident index */
     uint64_t misses;            /* searches whose index was not resident */
     uint64_t evictions;         /* LRU evictions performed */
     uint64_t reloads;           /* indexes reloaded from disk after a miss */
     uint64_t persist_failures;  /* eviction aborted because save_index failed */
-    uint32_t resident_count;    /* indexes currently VRAM-resident */
     uint64_t vram_used_bytes;   /* sum of resident vram_bytes */
     uint64_t vram_budget_bytes; /* g_max_vram_bytes; 0 = unlimited */
 } CuvsCacheStats;
 
-int cuvs_ipc_cache_stats(const char *socket_path, CuvsCacheStats *out);
+int cuvs_ipc_cache_stats(const char *socket_path, CuvsCacheStats *out,
+                         int max, int *n_out);
 
 /*
  * cuvs_ipc_mark_stale — flag an index stale after a heap write (CUVS_OP_MARK_STALE).

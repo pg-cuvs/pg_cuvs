@@ -531,14 +531,14 @@ SELECT id FROM ec ORDER BY embedding <-> '[0,0,0.5,0.5]'::vector LIMIT 1;
 (1 row)
 
 RESET enable_seqscan;
--- DELETE + VACUUM exercises the ambulkdelete tombstone/fallback path. This
--- regression observes the fail-closed stale fallback contract.
+-- DELETE + VACUUM exercises the ambulkdelete tombstone path (Phase 3A-4).
+-- Small deletes use tombstones and do NOT mark the index stale.
 DELETE FROM ec WHERE id = 99;
 VACUUM ec;
 SELECT stale FROM pg_stat_gpu_search WHERE index_oid = 'ec_cagra'::regclass;
  stale 
 -------
- t
+ f
 (1 row)
 
 -- ============================================================================

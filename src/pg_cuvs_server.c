@@ -95,6 +95,7 @@ typedef struct IndexEntry {
     uint64_t        delta_merged_count; /* searches where daemon merged delta on GPU */
     char            last_error[128];
     WarmupState      warmup_state;     /* Phase 3D: WARMUP_HOT for resident indexes */
+    uint32_t        gpu_device_id;    /* Phase 3E: which CUDA device this index lives on */
 } IndexEntry;
 
 /* Zero just the stat counters of a (re)initialized entry. The slot may carry
@@ -154,6 +155,7 @@ typedef struct ColdIndexEntry {
     uint32_t    warmup_duration_ms;
     uint64_t    download_count;
     uint64_t    cache_miss_count;
+    uint32_t    gpu_device_id;
     int         valid;
 } ColdIndexEntry;
 
@@ -169,12 +171,19 @@ static uint64_t g_cache_evictions   = 0;
 static uint64_t g_cache_reloads     = 0;
 static uint64_t g_cache_persist_fail = 0;
 
+/* Phase 3E: per-device GPU state. */
+static CuvsGpuDeviceInfo g_gpus[CUVS_MAX_GPUS];
+static int      g_n_gpus          = 0;
+static int      g_allowed_gpus[CUVS_MAX_GPUS];
+static int      g_n_allowed_gpus  = 0;   /* 0 = use all detected */
+static size_t   g_max_vram_per_gpu[CUVS_MAX_GPUS];
+
 /* ----------------------------------------------------------------
  * Configuration
  * ---------------------------------------------------------------- */
 static char   g_socket_path[256]  = "/tmp/.s.pg_cuvs.server";
 static char   g_index_dir[256]    = "/tmp/pg_cuvs_indexes";
-static size_t g_max_vram_bytes    = 0;   /* 0 = unlimited */
+static size_t g_max_vram_bytes    = 0;   /* 0 = unlimited; applied per-device */
 static int    g_server_fd         = -1;
 static volatile int g_shutdown    = 0;
 static char   g_snapshot_uri[512] = ""; /* "gs://bucket[/prefix]"; empty = disabled */
@@ -408,19 +417,68 @@ estimate_vram_bytes(int64_t n_vecs, int dim)
 }
 
 static size_t
-total_vram_used(void)
+total_vram_used(int device_id)
 {
     size_t total = 0;
     for (int i = 0; i < g_n_indexes; i++)
-        if (g_indexes[i].valid)
+        if (g_indexes[i].valid && g_indexes[i].gpu_device_id == (uint32_t)device_id)
             total += g_indexes[i].vram_bytes + g_indexes[i].delta_vram_bytes;
     return total;
 }
 
 static size_t
-gpu_free_vram_bytes(void)
+gpu_free_vram_bytes(int device_id)
 {
-    return cuvs_vram_free_bytes();
+    return cuvs_vram_free_bytes_on(device_id);
+}
+
+/* Phase 3E: return the allowed GPU index (in g_allowed_gpus) for a device_id,
+ * or the device_id itself if no restriction is configured. */
+static int
+is_gpu_allowed(int device_id)
+{
+    if (g_n_allowed_gpus == 0)
+        return 1;
+    for (int i = 0; i < g_n_allowed_gpus; i++)
+        if (g_allowed_gpus[i] == device_id)
+            return 1;
+    return 0;
+}
+
+static int
+n_usable_gpus(void)
+{
+    return (g_n_allowed_gpus > 0) ? g_n_allowed_gpus : g_n_gpus;
+}
+
+static int
+usable_gpu(int i)
+{
+    return (g_n_allowed_gpus > 0) ? g_allowed_gpus[i] : i;
+}
+
+/* Pick the GPU with the most VRAM headroom for a new index of `needed` bytes.
+ * Returns device_id or -1 if no device can fit. */
+static int
+pick_gpu_for_index(size_t needed)
+{
+    int best = -1;
+    size_t best_headroom = 0;
+    int n = n_usable_gpus();
+    for (int i = 0; i < n; i++)
+    {
+        int dev = usable_gpu(i);
+        size_t budget = g_max_vram_per_gpu[dev];
+        size_t used   = total_vram_used(dev);
+        if (budget > 0 && used + needed > budget)
+            continue;
+        size_t headroom = (budget > 0) ? (budget - used) : gpu_free_vram_bytes(dev);
+        if (headroom > best_headroom || best < 0) {
+            best_headroom = headroom;
+            best = dev;
+        }
+    }
+    return best;
 }
 
 /* ----------------------------------------------------------------
@@ -507,7 +565,7 @@ delta_cand_cmp(const void *a, const void *b)
 static void
 free_delta_cache(IndexEntry *e)
 {
-    if (e->delta_idx) { cuvs_bf_free(e->delta_idx); e->delta_idx = NULL; }
+    if (e->delta_idx) { cuvs_bf_free(e->delta_idx, e->gpu_device_id); e->delta_idx = NULL; }
     if (e->delta_tids) { free(e->delta_tids); e->delta_tids = NULL; }
     if (e->delta_vecs_host) { free(e->delta_vecs_host); e->delta_vecs_host = NULL; }
     e->n_delta          = 0;
@@ -552,7 +610,7 @@ refresh_delta_cache(IndexEntry *e)
      * failure below does not retry on every search. */
     uint32_t prev_gen    = e->delta_generation;
     int64_t  prev_cached = e->delta_n_cached;
-    if (e->delta_idx) { cuvs_bf_free(e->delta_idx); e->delta_idx = NULL; }
+    if (e->delta_idx) { cuvs_bf_free(e->delta_idx, e->gpu_device_id); e->delta_idx = NULL; }
     e->n_delta          = 0;
     e->delta_vram_bytes = 0;
     e->delta_mtime      = (int64_t) st.st_mtime;
@@ -591,8 +649,9 @@ refresh_delta_cache(IndexEntry *e)
 
     /* VRAM: best-effort, NON-evicting (never evict a base index for the delta). */
     needed = (size_t) hdr.n_rows * ((size_t) hdr.dim * sizeof(float) + sizeof(uint64_t));
-    if ((g_max_vram_bytes > 0 && total_vram_used() + needed > g_max_vram_bytes)
-        || needed > gpu_free_vram_bytes())
+    if ((g_max_vram_per_gpu[e->gpu_device_id] > 0
+         && total_vram_used(e->gpu_device_id) + needed > g_max_vram_per_gpu[e->gpu_device_id])
+        || needed > gpu_free_vram_bytes(e->gpu_device_id))
     {
         fclose(f);
         goto fail_cleanup;              /* no spare VRAM -> backend CPU-merges */
@@ -632,9 +691,9 @@ refresh_delta_cache(IndexEntry *e)
                 }
                 if (ok)
                 {
-                    if (e->delta_idx) { cuvs_bf_free(e->delta_idx); e->delta_idx = NULL; }
+                    if (e->delta_idx) { cuvs_bf_free(e->delta_idx, e->gpu_device_id); e->delta_idx = NULL; }
                     e->delta_idx = cuvs_bf_build(e->delta_vecs_host, hdr.n_rows,
-                                                 (int) hdr.dim, hdr.metric);
+                                                 (int) hdr.dim, hdr.metric, e->gpu_device_id);
                     if (e->delta_idx)
                     {
                         e->n_delta          = hdr.n_rows;
@@ -668,7 +727,7 @@ refresh_delta_cache(IndexEntry *e)
         }
         if (ok)
         {
-            e->delta_idx = cuvs_bf_build(vecs, hdr.n_rows, (int) hdr.dim, hdr.metric);
+            e->delta_idx = cuvs_bf_build(vecs, hdr.n_rows, (int) hdr.dim, hdr.metric, e->gpu_device_id);
             if (e->delta_idx)
             {
                 e->delta_tids       = tids;  tids = NULL;
@@ -699,7 +758,7 @@ static int write_tids_atomic(const char *tids_tmp,
                              int64_t n_vecs, uint32_t dim, uint32_t metric,
                              const uint64_t *tids);
 static int fsync_path(const char *path);
-static int ensure_vram(size_t needed);   /* defined after the LRU section */
+static int ensure_vram(size_t needed, int device_id);   /* defined after the LRU section */
 
 /* save_index: persist a registry entry to disk atomically.
  * Same contract as handle_build's persistence path: tmp + rename + fsync.
@@ -725,7 +784,7 @@ save_index(IndexEntry *e)
     if (write_tids_atomic(tids_tmp, e->n_vecs, e->dim, e->metric, e->tids) != 0)
         return -1;
 
-    if (cuvs_cagra_serialize(e->handle, idx_tmp) != 0) {
+    if (cuvs_cagra_serialize(e->handle, idx_tmp, e->gpu_device_id) != 0) {
         LOG_ERROR("save_index: cuvs_cagra_serialize FAILED for %u/%u\n",
                 e->db_oid, e->index_oid);
         unlink(tids_tmp);
@@ -801,15 +860,23 @@ load_index(uint32_t db_oid, uint32_t index_oid)
      * evicting the least-recently-used one. If it still won't fit after full
      * eviction, skip (caller falls back to CPU). */
     size_t needed = estimate_vram_bytes(n_vecs, (int)dim);
-    if (ensure_vram(needed) != 0)
+    int target_gpu = pick_gpu_for_index(needed);
+    if (target_gpu < 0)
     {
-        LOG_WARN("pg_cuvs_server: insufficient VRAM loading %u/%u even after "
-                 "eviction, skip\n", db_oid, index_oid);
+        LOG_WARN("pg_cuvs_server: no GPU can fit %u/%u (%zu bytes), skip\n",
+                 db_oid, index_oid, needed);
+        free(tids);
+        return -1;
+    }
+    if (ensure_vram(needed, target_gpu) != 0)
+    {
+        LOG_WARN("pg_cuvs_server: insufficient VRAM on GPU %d loading %u/%u, skip\n",
+                 target_gpu, db_oid, index_oid);
         free(tids);
         return -1;
     }
 
-    CuvsCagraIndex handle = cuvs_cagra_deserialize(idx_path, (int)dim);
+    CuvsCagraIndex handle = cuvs_cagra_deserialize(idx_path, (int)dim, target_gpu);
     if (!handle)
     {
         free(tids);
@@ -818,7 +885,7 @@ load_index(uint32_t db_oid, uint32_t index_oid)
 
     if (g_n_indexes >= MAX_INDEXES)
     {
-        cuvs_cagra_free(handle);
+        cuvs_cagra_free(handle, target_gpu);
         free(tids);
         return -1;
     }
@@ -834,6 +901,7 @@ load_index(uint32_t db_oid, uint32_t index_oid)
     e->vram_bytes  = needed;
     e->last_search = time(NULL);
     e->valid       = 1;
+    e->gpu_device_id = (uint32_t)target_gpu;
     /* Delta cache starts empty; this slot may carry stale delta fields from a
      * previously evicted index. It is lazily (re)built in handle_search. */
     e->delta_idx = NULL; e->delta_tids = NULL; e->n_delta = 0;
@@ -948,12 +1016,14 @@ startup_load_indexes(void)
  * LRU eviction
  * ---------------------------------------------------------------- */
 static IndexEntry *
-find_lru_index(void)
+find_lru_index(int device_id)
 {
     IndexEntry *lru = NULL;
     for (int i = 0; i < g_n_indexes; i++)
     {
         if (!g_indexes[i].valid)
+            continue;
+        if (g_indexes[i].gpu_device_id != (uint32_t)device_id)
             continue;
         if (!lru || g_indexes[i].last_search < lru->last_search)
             lru = &g_indexes[i];
@@ -961,29 +1031,26 @@ find_lru_index(void)
     return lru;
 }
 
-/* Evict the LRU index to free VRAM. Returns bytes freed, or 0.
- * If save_index fails (disk full, permission, cuVS error), abort eviction —
- * we must not lose VRAM state when we couldn't persist it. */
+/* Evict the LRU index on a specific GPU to free VRAM. Returns bytes freed, or 0. */
 static size_t
-evict_lru(void)
+evict_lru(int device_id)
 {
-    IndexEntry *e = find_lru_index();
+    IndexEntry *e = find_lru_index(device_id);
     if (!e)
         return 0;
 
     if (save_index(e) != 0) {
-        LOG_ERROR("evict_lru: save_index FAILED for %u/%u; aborting eviction "
+        LOG_ERROR("evict_lru: save_index FAILED for %u/%u on GPU %u; aborting eviction "
                   "(VRAM still holds index)\n",
-                e->db_oid, e->index_oid);
+                e->db_oid, e->index_oid, e->gpu_device_id);
         g_cache_persist_fail++;
         return 0;
     }
-    free_delta_cache(e);   /* release the GPU delta cache with the index */
-    cuvs_cagra_free(e->handle);
+    free_delta_cache(e);
+    cuvs_cagra_free(e->handle, e->gpu_device_id);
     free(e->tids);
     size_t freed = e->vram_bytes;
 
-    /* Remove from registry by shifting */
     int idx = (int)(e - g_indexes);
     for (int i = idx; i < g_n_indexes - 1; i++)
         g_indexes[i] = g_indexes[i+1];
@@ -993,30 +1060,27 @@ evict_lru(void)
     return freed;
 }
 
-/* Ensure there is enough VRAM for `needed` bytes.
- * Returns 0 on success, -1 if even after full eviction there isn't enough. */
+/* Ensure there is enough VRAM on `device_id` for `needed` bytes. */
 static int
-ensure_vram(size_t needed)
+ensure_vram(size_t needed, int device_id)
 {
-    /* Layer 1: preflight check */
-    if (g_max_vram_bytes > 0 && total_vram_used() + needed > g_max_vram_bytes)
+    size_t budget = g_max_vram_per_gpu[device_id];
+    if (budget > 0 && total_vram_used(device_id) + needed > budget)
     {
-        /* Layer 2: LRU eviction loop. Stop if evict_lru makes no progress
-         * (returns 0, e.g. save_index keeps failing) to avoid an infinite loop. */
-        while (g_n_indexes > 0 && total_vram_used() + needed > g_max_vram_bytes)
-            if (evict_lru() == 0)
+        while (g_n_indexes > 0 && total_vram_used(device_id) + needed > budget)
+            if (evict_lru(device_id) == 0)
                 break;
 
-        if (total_vram_used() + needed > g_max_vram_bytes)
-            return -1;  /* Layer 3: caller falls back to CPU */
+        if (total_vram_used(device_id) + needed > budget)
+            return -1;
     }
 
-    size_t free_vram = gpu_free_vram_bytes();
+    size_t free_vram = gpu_free_vram_bytes(device_id);
     while (g_n_indexes > 0 && needed > free_vram)
     {
-        if (evict_lru() == 0)
+        if (evict_lru(device_id) == 0)
             break;
-        free_vram = gpu_free_vram_bytes();
+        free_vram = gpu_free_vram_bytes(device_id);
     }
 
     return (needed <= free_vram) ? 0 : -1;
@@ -1230,7 +1294,7 @@ handle_search(int client_fd, const CuvsCmdFrame *cmd)
 
     LOG_DEBUG("[handle_search] calling cuvs_cagra_search k=%d dim=%u...\n",
             k, cmd->dim);
-    int ret = cuvs_cagra_search(e->handle, query, (int)cmd->dim, k, raw);
+    int ret = cuvs_cagra_search(e->handle, query, (int)cmd->dim, k, raw, e->gpu_device_id);
     LOG_DEBUG("[handle_search] cuvs_cagra_search rc=%d\n", ret);
 
     if (ret != 0)
@@ -1274,7 +1338,7 @@ handle_search(int client_fd, const CuvsCmdFrame *cmd)
         CuvsSearchResult *draw = malloc((size_t) eff_k * sizeof(CuvsSearchResult));
         CuvsResult       *cand = malloc((size_t) (k + eff_k) * sizeof(CuvsResult));
         if (draw && cand
-            && cuvs_bf_search(e->delta_idx, query, (int) cmd->dim, eff_k, draw) == 0)
+            && cuvs_bf_search(e->delta_idx, query, (int) cmd->dim, eff_k, draw, e->gpu_device_id) == 0)
         {
             int n_total = 0;
             for (int i = 0; i < k; i++)            /* base candidates */
@@ -1531,20 +1595,21 @@ handle_build(int client_fd, const CuvsCmdFrame *cmd)
      * index, so peak VRAM = existing + new. Ask for full 'needed' from
      * ensure_vram regardless of same-OID replacement. */
     size_t needed = estimate_vram_bytes(cmd->n_vecs, (int)cmd->dim);
-    if (ensure_vram(needed) < 0)
+    int target_gpu = pick_gpu_for_index(needed);
+    if (target_gpu < 0 || ensure_vram(needed, target_gpu) < 0)
     {
         pthread_mutex_unlock(&g_index_mutex);
         munmap(mem, total);
         CuvsReplyHeader hdr = {0};
         hdr.status = CUVS_STATUS_OOM_FALLBACK;
-        strncpy(hdr.error, "VRAM exhausted", sizeof(hdr.error) - 1);
+        strncpy(hdr.error, "VRAM exhausted on all GPUs", sizeof(hdr.error) - 1);
         send_all(client_fd, &hdr, sizeof(hdr));
         return;
     }
 
-    LOG_DEBUG("[handle_build] calling cuvs_cagra_build n_vecs=%lld dim=%u...\n",
-            (long long)cmd->n_vecs, cmd->dim);
-    CuvsCagraIndex new_handle = cuvs_cagra_build(vecs, cmd->n_vecs, (int)cmd->dim, cmd->metric);
+    LOG_DEBUG("[handle_build] calling cuvs_cagra_build n_vecs=%lld dim=%u gpu=%d...\n",
+            (long long)cmd->n_vecs, cmd->dim, target_gpu);
+    CuvsCagraIndex new_handle = cuvs_cagra_build(vecs, cmd->n_vecs, (int)cmd->dim, cmd->metric, target_gpu);
     if (!new_handle)
     {
         LOG_ERROR("[handle_build] cuvs_cagra_build returned NULL\n");
@@ -1558,7 +1623,7 @@ handle_build(int client_fd, const CuvsCmdFrame *cmd)
     uint64_t *new_tids = malloc(tid_bytes);
     if (!new_tids)
     {
-        cuvs_cagra_free(new_handle);
+        cuvs_cagra_free(new_handle, target_gpu);
         pthread_mutex_unlock(&g_index_mutex);
         munmap(mem, total);
         send_error_code(client_fd, CUVS_STATUS_BUILD_FAILED, "malloc tids failed");
@@ -1595,7 +1660,7 @@ handle_build(int client_fd, const CuvsCmdFrame *cmd)
     }
 #endif
     LOG_DEBUG("[handle_build] cuvs_cagra_serialize(%s)...\n", idx_tmp);
-    if (cuvs_cagra_serialize(new_handle, idx_tmp) != 0) {
+    if (cuvs_cagra_serialize(new_handle, idx_tmp, target_gpu) != 0) {
         LOG_ERROR("[handle_build] cuvs_cagra_serialize FAILED (path=%s)\n", idx_tmp);
         goto persist_fail;
     }
@@ -1651,8 +1716,9 @@ handle_build(int client_fd, const CuvsCmdFrame *cmd)
     /* --- Swap into registry --- */
     IndexEntry *existing = find_index(cmd->db_oid, cmd->index_oid);
     if (existing) {
-        cuvs_cagra_free(existing->handle);
+        cuvs_cagra_free(existing->handle, existing->gpu_device_id);
         free(existing->tids);
+        existing->gpu_device_id = (uint32_t)target_gpu;
         existing->dim         = cmd->dim;
         existing->metric      = cmd->metric;
         existing->n_vecs      = cmd->n_vecs;
@@ -1669,13 +1735,12 @@ handle_build(int client_fd, const CuvsCmdFrame *cmd)
         reset_entry_stats(existing);   /* fresh index instance */
     } else {
         if (g_n_indexes >= MAX_INDEXES)
-            evict_lru();
+            evict_lru(target_gpu);
         if (g_n_indexes >= MAX_INDEXES) {
-            /* No slot available — roll back disk state and fail. */
             LOG_ERROR("[handle_build] registry full; rolling back disk commit\n");
             unlink(idx_final);
             unlink(tids_final);
-            cuvs_cagra_free(new_handle);
+            cuvs_cagra_free(new_handle, target_gpu);
             free(new_tids);
             pthread_mutex_unlock(&g_index_mutex);
             send_error_code(client_fd, CUVS_STATUS_PERSIST_FAILED, "index registry full");
@@ -1698,6 +1763,7 @@ handle_build(int client_fd, const CuvsCmdFrame *cmd)
         e->delta_generation = 0; e->delta_mtime = 0; e->delta_vram_bytes = 0;
         e->delta_vecs_host = NULL; e->delta_n_cached = 0;
         e->warmup_state = WARMUP_HOT;
+        e->gpu_device_id = (uint32_t)target_gpu;
         reset_entry_stats(e);
     }
 
@@ -1751,7 +1817,7 @@ persist_fail:
      * intact in registry. Clean up new resources and tmp files. */
     unlink(idx_tmp);
     unlink(tids_tmp);
-    cuvs_cagra_free(new_handle);
+    cuvs_cagra_free(new_handle, target_gpu);
     free(new_tids);
     pthread_mutex_unlock(&g_index_mutex);
     send_error_code(client_fd, CUVS_STATUS_PERSIST_FAILED, "disk persistence failed");
@@ -1818,6 +1884,8 @@ handle_stats(int client_fd, const CuvsCmdFrame *cmd)
         s->warmup_duration_ms = 0;
         s->download_count     = 0;
         s->cache_miss_count   = 0;
+        s->gpu_device_id      = e->gpu_device_id;
+        s->_pad1              = 0;
     }
 
     /* Phase 3D: also emit cold (not-yet-resident) entries so operators can
@@ -1842,6 +1910,8 @@ handle_stats(int client_fd, const CuvsCmdFrame *cmd)
         s->warmup_duration_ms = ce->warmup_duration_ms;
         s->download_count     = (uint32_t)ce->download_count;
         s->cache_miss_count   = ce->cache_miss_count;
+        s->gpu_device_id      = 0xFFFFFFFF;
+        s->_pad1              = 0;
     }
 
     pthread_mutex_unlock(&g_index_mutex);
@@ -1892,30 +1962,43 @@ handle_mark_stale(int client_fd, const CuvsCmdFrame *cmd)
 }
 
 /* ----------------------------------------------------------------
- * Handle CACHE_STATS command (CUVS_OP_CACHE_STATS): daemon-global counters.
+ * Handle CACHE_STATS command (CUVS_OP_CACHE_STATS): per-GPU counters.
+ * Phase 3E: one CuvsCacheStats row per usable GPU device.
  * ---------------------------------------------------------------- */
 static void
 handle_cache_stats(int client_fd)
 {
-    CuvsCacheStats cs;
-    memset(&cs, 0, sizeof(cs));
+    CuvsCacheStats rows[CUVS_MAX_GPUS];
+    int n_rows = 0;
 
     pthread_mutex_lock(&g_index_mutex);
-    cs.hits             = g_cache_hits;
-    cs.misses           = g_cache_misses;
-    cs.evictions        = g_cache_evictions;
-    cs.reloads          = g_cache_reloads;
-    cs.persist_failures = g_cache_persist_fail;
-    cs.resident_count   = (uint32_t) g_n_indexes;
-    cs.vram_used_bytes  = total_vram_used();
-    cs.vram_budget_bytes = g_max_vram_bytes;
+    int n = n_usable_gpus();
+    for (int gi = 0; gi < n && n_rows < CUVS_MAX_GPUS; gi++)
+    {
+        int dev = usable_gpu(gi);
+        CuvsCacheStats *cs = &rows[n_rows++];
+        memset(cs, 0, sizeof(*cs));
+        cs->gpu_device_id    = (uint32_t)dev;
+        cs->hits             = g_cache_hits;
+        cs->misses           = g_cache_misses;
+        cs->evictions        = g_cache_evictions;
+        cs->reloads          = g_cache_reloads;
+        cs->persist_failures = g_cache_persist_fail;
+        cs->resident_count   = 0;
+        for (int j = 0; j < g_n_indexes; j++)
+            if (g_indexes[j].valid && g_indexes[j].gpu_device_id == (uint32_t)dev)
+                cs->resident_count++;
+        cs->vram_used_bytes  = total_vram_used(dev);
+        cs->vram_budget_bytes = g_max_vram_per_gpu[dev];
+    }
     pthread_mutex_unlock(&g_index_mutex);
 
     CuvsReplyHeader hdr = {0};
     hdr.status    = CUVS_STATUS_OK;
-    hdr.n_results = 1;
+    hdr.n_results = (uint32_t)n_rows;
     send_all(client_fd, &hdr, sizeof(hdr));
-    send_all(client_fd, &cs, sizeof(cs));
+    if (n_rows > 0)
+        send_all(client_fd, rows, (size_t)n_rows * sizeof(CuvsCacheStats));
 }
 
 /* ----------------------------------------------------------------
@@ -2061,6 +2144,18 @@ main(int argc, char **argv)
             if (n >= 1 && n <= 8)
                 g_warmup_nthreads = n;
         }
+        else if (strcmp(argv[i], "--gpu-devices") == 0 && i+1 < argc)
+        {
+            char buf[256];
+            strncpy(buf, argv[++i], sizeof(buf) - 1);
+            buf[sizeof(buf) - 1] = '\0';
+            char *tok = strtok(buf, ",");
+            while (tok && g_n_allowed_gpus < CUVS_MAX_GPUS)
+            {
+                g_allowed_gpus[g_n_allowed_gpus++] = atoi(tok);
+                tok = strtok(NULL, ",");
+            }
+        }
     }
 
     LOG_INFO("pg_cuvs_server: starting (socket=%s index-dir=%s snapshot=%s)\n",
@@ -2083,19 +2178,55 @@ main(int argc, char **argv)
     if (g_snapshot_uri[0] != '\0')
         curl_global_init(CURL_GLOBAL_DEFAULT);
 
+    /* Phase 3E: GPU detection */
+    g_n_gpus = cuvs_detect_gpus(g_gpus, CUVS_MAX_GPUS);
+    if (g_n_gpus == 0)
+    {
+        LOG_ERROR("pg_cuvs_server: no CUDA GPUs detected\n");
+        return 1;
+    }
+    /* Validate --gpu-devices against detected GPUs */
+    for (int i = 0; i < g_n_allowed_gpus; i++)
+    {
+        if (g_allowed_gpus[i] >= g_n_gpus)
+        {
+            LOG_ERROR("pg_cuvs_server: --gpu-devices references GPU %d but only %d detected\n",
+                      g_allowed_gpus[i], g_n_gpus);
+            return 1;
+        }
+    }
+    /* Initialize per-device VRAM budgets */
+    {
+        int n = n_usable_gpus();
+        for (int i = 0; i < n; i++)
+        {
+            int dev = usable_gpu(i);
+            g_max_vram_per_gpu[dev] = g_max_vram_bytes;
+            LOG_INFO("GPU %d (%s): %.0f MB total, budget %s\n",
+                     dev, g_gpus[dev].name,
+                     g_gpus[dev].total_vram_bytes / (1024.0 * 1024),
+                     g_max_vram_bytes ? "limited" : "unlimited");
+        }
+    }
+
     /* Load persisted indexes */
     startup_load_indexes();
 
-    /* Warm up the GPU now so the first client query doesn't pay the one-time
-     * CUDA context / RMM / cuBLAS / kernel init (hundreds of ms). */
+    /* Per-device GPU warm-up so the first client query doesn't pay the
+     * one-time CUDA context / RMM / cuBLAS / kernel init (hundreds of ms). */
     {
-        struct timespec w0, w1;
-        clock_gettime(CLOCK_MONOTONIC, &w0);
-        cuvs_warmup();
-        clock_gettime(CLOCK_MONOTONIC, &w1);
-        double ms = (w1.tv_sec - w0.tv_sec) * 1000.0 +
-                    (w1.tv_nsec - w0.tv_nsec) / 1e6;
-        LOG_INFO("pg_cuvs_server: GPU warm-up done in %.0f ms\n", ms);
+        int n = n_usable_gpus();
+        for (int gi = 0; gi < n; gi++)
+        {
+            int dev = usable_gpu(gi);
+            struct timespec w0, w1;
+            clock_gettime(CLOCK_MONOTONIC, &w0);
+            cuvs_warmup_device(dev);
+            clock_gettime(CLOCK_MONOTONIC, &w1);
+            double ms = (w1.tv_sec - w0.tv_sec) * 1000.0 +
+                        (w1.tv_nsec - w0.tv_nsec) / 1e6;
+            LOG_INFO("GPU %d warm-up done in %.0f ms\n", dev, ms);
+        }
     }
 
     /* Create UDS socket */

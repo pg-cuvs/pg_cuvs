@@ -28,42 +28,53 @@
 #include <mutex>
 
 /* ----------------------------------------------------------------
- * device_resources pool
+ * Per-device device_resources pool (Phase 3E)
  *
  * Each cuVS call needs a raft::device_resources (a CUDA stream + lazily
  * created cuBLAS/cuSOLVER handles). Creating one per call repeats that setup,
  * and the daemon spawns a NEW thread per request (so thread_local would never
- * be reused). Instead we keep a process-global free-list and hand resources
+ * be reused). Instead we keep a per-device free-list and hand resources
  * out via RAII: a request borrows one (creating lazily if none free) and
  * returns it on scope exit. Sequential reuse across threads is safe because
- * the streams/handles are bound to the (shared) CUDA context, not a thread,
- * and the free-list guarantees only one thread uses a given object at a time.
+ * the streams/handles are bound to a specific CUDA device context, and the
+ * free-list guarantees only one thread uses a given object at a time.
+ *
+ * raft::device_resources objects are permanently bound to the CUDA device
+ * they were created on. A resource created on GPU-0 cannot be used for
+ * GPU-2 operations. Each device gets its own pool.
  *
  * device_resources has a deleted move ctor in cuVS 25.x+, so the pool holds
  * unique_ptr (movable) rather than the objects by value.
  * ---------------------------------------------------------------- */
 namespace {
 
-std::mutex g_res_mutex;
-std::vector<std::unique_ptr<raft::device_resources>> g_res_pool;
+struct DevicePool {
+    std::mutex mutex;
+    std::vector<std::unique_ptr<raft::device_resources>> pool;
+};
 
-std::unique_ptr<raft::device_resources> acquire_res()
+static DevicePool g_device_pools[CUVS_MAX_GPUS];
+
+std::unique_ptr<raft::device_resources> acquire_res(int device_id)
 {
+    DevicePool &dp = g_device_pools[device_id];
     {
-        std::lock_guard<std::mutex> lk(g_res_mutex);
-        if (!g_res_pool.empty()) {
-            auto r = std::move(g_res_pool.back());
-            g_res_pool.pop_back();
+        std::lock_guard<std::mutex> lk(dp.mutex);
+        if (!dp.pool.empty()) {
+            auto r = std::move(dp.pool.back());
+            dp.pool.pop_back();
             return r;
         }
     }
+    cudaSetDevice(device_id);
     return std::make_unique<raft::device_resources>();
 }
 
-void release_res(std::unique_ptr<raft::device_resources> r)
+void release_res(int device_id, std::unique_ptr<raft::device_resources> r)
 {
-    std::lock_guard<std::mutex> lk(g_res_mutex);
-    g_res_pool.push_back(std::move(r));
+    DevicePool &dp = g_device_pools[device_id];
+    std::lock_guard<std::mutex> lk(dp.mutex);
+    dp.pool.push_back(std::move(r));
 }
 
 /* RAII: borrow on construction, return to the pool on destruction. If a cuVS
@@ -72,12 +83,20 @@ void release_res(std::unique_ptr<raft::device_resources> r)
  * daemon, since one process serves every backend). poison() makes the
  * destructor DESTROY the resource instead of pooling it, so a failed request
  * cannot corrupt healthy ones. Declare PooledRes OUTSIDE the try block and
- * call poison() in the catch so it is still alive when the catch runs. */
+ * call poison() in the catch so it is still alive when the catch runs.
+ *
+ * cudaSetDevice is per-thread state. Since the daemon spawns one pthread per
+ * connection and each handles exactly one request, setting the device in the
+ * constructor is safe -- no other thread can race the device selection within
+ * the same PooledRes lifetime. */
 struct PooledRes {
     std::unique_ptr<raft::device_resources> r;
+    int dev;
     bool poisoned = false;
-    PooledRes() : r(acquire_res()) {}
-    ~PooledRes() { if (r && !poisoned) release_res(std::move(r)); }
+    explicit PooledRes(int device_id) : r(acquire_res(device_id)), dev(device_id) {
+        cudaSetDevice(device_id);
+    }
+    ~PooledRes() { if (r && !poisoned) release_res(dev, std::move(r)); }
     raft::device_resources &get() { return *r; }
     void poison() { poisoned = true; }
 };
@@ -127,6 +146,34 @@ struct CuvsBfIndexImpl {
 };
 
 /* ----------------------------------------------------------------
+ * GPU detection (Phase 3E)
+ * ---------------------------------------------------------------- */
+extern "C" int
+cuvs_detect_gpus(CuvsGpuDeviceInfo *out, int max_devices)
+{
+    int device_count = 0;
+    cudaError_t err = cudaGetDeviceCount(&device_count);
+    if (err != cudaSuccess || device_count <= 0)
+        return 0;
+
+    int n = (device_count < max_devices) ? device_count : max_devices;
+    for (int i = 0; i < n; i++) {
+        cudaDeviceProp prop;
+        if (cudaGetDeviceProperties(&prop, i) != cudaSuccess) {
+            out[i].device_id = i;
+            out[i].total_vram_bytes = 0;
+            out[i].name[0] = '\0';
+            continue;
+        }
+        out[i].device_id = i;
+        out[i].total_vram_bytes = prop.totalGlobalMem;
+        strncpy(out[i].name, prop.name, sizeof(out[i].name) - 1);
+        out[i].name[sizeof(out[i].name) - 1] = '\0';
+    }
+    return n;
+}
+
+/* ----------------------------------------------------------------
  * GPU availability check
  * ---------------------------------------------------------------- */
 extern "C" int
@@ -141,11 +188,18 @@ cuvs_gpu_available(void)
  * VRAM query
  * ---------------------------------------------------------------- */
 extern "C" size_t
-cuvs_vram_free_bytes(void)
+cuvs_vram_free_bytes_on(int device_id)
 {
     size_t free_bytes = 0, total_bytes = 0;
+    cudaSetDevice(device_id);
     cudaMemGetInfo(&free_bytes, &total_bytes);
     return free_bytes;
+}
+
+extern "C" size_t
+cuvs_vram_free_bytes(void)
+{
+    return cuvs_vram_free_bytes_on(0);
 }
 
 /* ----------------------------------------------------------------
@@ -160,9 +214,10 @@ cuvs_brute_force_search(
     int               dim,
     int               top_k,
     uint32_t          metric,
-    CuvsSearchResult *results)
+    CuvsSearchResult *results,
+    int               device_id)
 {
-    PooledRes _pr;
+    PooledRes _pr(device_id);
     try {
         raft::device_resources &res = _pr.get();
 
@@ -209,9 +264,10 @@ cuvs_brute_force_search(
  * Resident brute-force index (Phase 3B delta cache): build once, search many.
  * ---------------------------------------------------------------- */
 extern "C" CuvsBfIndex
-cuvs_bf_build(const float *vecs, int64_t n, int dim, uint32_t metric)
+cuvs_bf_build(const float *vecs, int64_t n, int dim, uint32_t metric,
+              int device_id)
 {
-    PooledRes _pr;
+    PooledRes _pr(device_id);
     try {
         raft::device_resources &res = _pr.get();
 
@@ -245,7 +301,8 @@ cuvs_bf_search(
     const float      *query_vec,
     int               dim,
     int               top_k,
-    CuvsSearchResult *results)
+    CuvsSearchResult *results,
+    int               device_id)
 {
     if (!index)
         return 1;
@@ -259,7 +316,7 @@ cuvs_bf_search(
     if (top_k <= 0)
         return 0;
 
-    PooledRes _pr;
+    PooledRes _pr(device_id);
     try {
         raft::device_resources &res = _pr.get();
 
@@ -300,10 +357,12 @@ cuvs_bf_search(
 }
 
 extern "C" void
-cuvs_bf_free(CuvsBfIndex index)
+cuvs_bf_free(CuvsBfIndex index, int device_id)
 {
-    if (index)
+    if (index) {
+        cudaSetDevice(device_id);
         delete static_cast<CuvsBfIndexImpl *>(index);
+    }
 }
 
 /* ----------------------------------------------------------------
@@ -322,9 +381,10 @@ cuvs_distance_type(uint32_t metric)
 }
 
 extern "C" CuvsCagraIndex
-cuvs_cagra_build(const float *vecs, int64_t n_vecs, int dim, uint32_t metric)
+cuvs_cagra_build(const float *vecs, int64_t n_vecs, int dim, uint32_t metric,
+                 int device_id)
 {
-    PooledRes _pr;
+    PooledRes _pr(device_id);
     try {
         raft::device_resources &res = _pr.get();
 
@@ -372,7 +432,8 @@ cuvs_cagra_search(
     const float     *query_vec,
     int              dim,
     int              top_k,
-    CuvsSearchResult *results)
+    CuvsSearchResult *results,
+    int              device_id)
 {
     if (!index)
         return 1;
@@ -390,7 +451,7 @@ cuvs_cagra_search(
         return 2;
     }
 
-    PooledRes _pr;
+    PooledRes _pr(device_id);
     try {
         raft::device_resources &res = _pr.get();
 
@@ -404,7 +465,7 @@ cuvs_cagra_search(
         /* CAGRA multi-cta search requires:
          *   num_cta_per_query * 32 >= top_k
          * where num_cta_per_query = max(search_width, ceil(itopk_size / 32))
-         * Default itopk_size=64, search_width=1 → num_cta=2 → max top_k=64.
+         * Default itopk_size=64, search_width=1 -> num_cta=2 -> max top_k=64.
          * Round itopk_size up to a multiple of 32 that satisfies top_k. */
         int itopk = ((top_k + 31) / 32) * 32;
         if (itopk < 64) itopk = 64;
@@ -444,14 +505,14 @@ cuvs_cagra_search(
  * CAGRA index serialize / deserialize
  * ---------------------------------------------------------------- */
 extern "C" int
-cuvs_cagra_serialize(CuvsCagraIndex index, const char *path)
+cuvs_cagra_serialize(CuvsCagraIndex index, const char *path, int device_id)
 {
     if (!index)
         return 1;
 
     try {
         CuvsCagraIndexImpl *impl = static_cast<CuvsCagraIndexImpl *>(index);
-        PooledRes _pr; raft::device_resources &res = _pr.get();
+        PooledRes _pr(device_id); raft::device_resources &res = _pr.get();
         /* include_dataset=true: works now because impl->dataset keeps the
          * device memory alive that idx's view points to. */
         cuvs::neighbors::cagra::serialize(res, std::string(path), impl->idx, true);
@@ -467,10 +528,10 @@ cuvs_cagra_serialize(CuvsCagraIndex index, const char *path)
 }
 
 extern "C" CuvsCagraIndex
-cuvs_cagra_deserialize(const char *path, int dim)
+cuvs_cagra_deserialize(const char *path, int dim, int device_id)
 {
     try {
-        PooledRes _pr; raft::device_resources &res = _pr.get();
+        PooledRes _pr(device_id); raft::device_resources &res = _pr.get();
         cuvs::neighbors::cagra::index<float, uint32_t> idx(res);
         cuvs::neighbors::cagra::deserialize(res, path, &idx);
         res.sync_stream();
@@ -496,20 +557,22 @@ cuvs_cagra_deserialize(const char *path, int dim)
  * CAGRA index free
  * ---------------------------------------------------------------- */
 extern "C" void
-cuvs_cagra_free(CuvsCagraIndex index)
+cuvs_cagra_free(CuvsCagraIndex index, int device_id)
 {
-    if (index)
+    if (index) {
+        cudaSetDevice(device_id);
         delete static_cast<CuvsCagraIndexImpl *>(index);
+    }
 }
 
 /* ----------------------------------------------------------------
  * Warm-up: pay the one-time GPU init cost (CUDA primary context, RMM pool,
  * cuBLAS/cuSOLVER handles, kernel JIT) at daemon startup instead of on the
  * first client query. Runs a tiny brute-force search; also primes one entry
- * in the device_resources pool. Safe to call once at boot.
+ * in the device_resources pool. Safe to call once per device at boot.
  * ---------------------------------------------------------------- */
 extern "C" void
-cuvs_warmup(void)
+cuvs_warmup_device(int device_id)
 {
     try {
         const int n = 512, dim = 16, k = 8;
@@ -519,16 +582,23 @@ cuvs_warmup(void)
         CuvsSearchResult out[8];
         /* brute force warms CUDA context / RMM / cuBLAS (gemm) */
         (void)cuvs_brute_force_search(corpus.data(), query.data(), n, dim, k,
-                                      CUVS_METRIC_L2, out);
+                                      CUVS_METRIC_L2, out, device_id);
         /* cagra build+search warms the CAGRA-specific kernels so the first
          * real cagra query on a freshly booted daemon is not the one that
          * pays kernel load (~100 ms). */
-        CuvsCagraIndex idx = cuvs_cagra_build(corpus.data(), n, dim, CUVS_METRIC_L2);
+        CuvsCagraIndex idx = cuvs_cagra_build(corpus.data(), n, dim, CUVS_METRIC_L2,
+                                               device_id);
         if (idx) {
-            (void)cuvs_cagra_search(idx, query.data(), dim, k, out);
-            cuvs_cagra_free(idx);
+            (void)cuvs_cagra_search(idx, query.data(), dim, k, out, device_id);
+            cuvs_cagra_free(idx, device_id);
         }
     } catch (...) {
         /* warm-up is best-effort; a failure here must not stop the daemon */
     }
+}
+
+extern "C" void
+cuvs_warmup(void)
+{
+    cuvs_warmup_device(0);
 }

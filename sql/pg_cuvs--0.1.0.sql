@@ -121,7 +121,8 @@ CREATE FUNCTION pg_cuvs_gpu_search_stats(
     OUT last_warmup_at     timestamptz,
     OUT warmup_duration_ms integer,
     OUT download_count     bigint,
-    OUT cache_miss_count   bigint
+    OUT cache_miss_count   bigint,
+    OUT gpu_device_id      integer
 )
 RETURNS SETOF record
 AS '$libdir/pg_cuvs', 'pg_cuvs_gpu_search_stats'
@@ -146,6 +147,7 @@ COMMENT ON VIEW pg_stat_gpu_search IS
 -- the SRF in src/pg_cuvs.c (pg_cuvs_gpu_cache_stats).
 -- ----------------------------------------------------------------
 CREATE FUNCTION pg_cuvs_gpu_cache_stats(
+    OUT gpu_device_id    integer,
     OUT hits             bigint,
     OUT misses           bigint,
     OUT evictions        bigint,

@@ -1873,7 +1873,7 @@ pg_cuvs_last_search_metric(PG_FUNCTION_ARGS)
  * the view must stay queryable while the daemon restarts. (See plan: a
  * future liveness column can distinguish "down" from "idle".)
  * ---------------------------------------------------------------- */
-#define GPU_STATS_NCOLS 31
+#define GPU_STATS_NCOLS 32
 
 static const char *
 cuvs_metric_name(uint32_t metric)
@@ -2003,6 +2003,11 @@ pg_cuvs_gpu_search_stats(PG_FUNCTION_ARGS)
         values[28] = Int32GetDatum((int32) s->warmup_duration_ms);
         values[29] = Int64GetDatum((int64) s->download_count);
         values[30] = Int64GetDatum((int64) s->cache_miss_count);
+        /* Phase 3E: GPU device */
+        if (s->gpu_device_id != 0xFFFFFFFF)
+            values[31] = Int32GetDatum((int32) s->gpu_device_id);
+        else
+            nulls[31] = true;
 
         tuplestore_putvalues(tupstore, tupdesc, values, nulls);
     }
@@ -2015,7 +2020,7 @@ pg_cuvs_gpu_search_stats(PG_FUNCTION_ARGS)
  * backing the pg_stat_gpu_cache view. One row normally; zero rows when the
  * daemon is unreachable (same convention as pg_stat_gpu_search).
  * ---------------------------------------------------------------- */
-#define GPU_CACHE_NCOLS 8
+#define GPU_CACHE_NCOLS 9
 
 PG_FUNCTION_INFO_V1(pg_cuvs_gpu_cache_stats);
 Datum
@@ -2050,23 +2055,31 @@ pg_cuvs_gpu_cache_stats(PG_FUNCTION_ARGS)
     rsinfo->setDesc    = tupdesc;
     MemoryContextSwitchTo(oldcontext);
 
-    memset(&cs, 0, sizeof(cs));
-    rc = cuvs_ipc_cache_stats(cuvs_socket_path, &cs);
-    if (rc == CUVS_STATUS_OK)
     {
-        Datum values[GPU_CACHE_NCOLS];
-        bool  nulls[GPU_CACHE_NCOLS];
+        CuvsCacheStats rows[CUVS_MAX_GPUS];
+        int n_rows = 0;
+        rc = cuvs_ipc_cache_stats(cuvs_socket_path, rows, CUVS_MAX_GPUS, &n_rows);
+        if (rc == CUVS_STATUS_OK)
+        {
+            for (int i = 0; i < n_rows; i++)
+            {
+                CuvsCacheStats *cs = &rows[i];
+                Datum values[GPU_CACHE_NCOLS];
+                bool  nulls[GPU_CACHE_NCOLS];
 
-        memset(nulls, 0, sizeof(nulls));
-        values[0] = Int64GetDatum((int64) cs.hits);
-        values[1] = Int64GetDatum((int64) cs.misses);
-        values[2] = Int64GetDatum((int64) cs.evictions);
-        values[3] = Int64GetDatum((int64) cs.reloads);
-        values[4] = Int64GetDatum((int64) cs.persist_failures);
-        values[5] = Int32GetDatum((int32) cs.resident_count);
-        values[6] = Int64GetDatum((int64) (cs.vram_used_bytes / (1024 * 1024)));
-        values[7] = Int64GetDatum((int64) (cs.vram_budget_bytes / (1024 * 1024)));
-        tuplestore_putvalues(tupstore, tupdesc, values, nulls);
+                memset(nulls, 0, sizeof(nulls));
+                values[0] = Int32GetDatum((int32) cs->gpu_device_id);
+                values[1] = Int64GetDatum((int64) cs->hits);
+                values[2] = Int64GetDatum((int64) cs->misses);
+                values[3] = Int64GetDatum((int64) cs->evictions);
+                values[4] = Int64GetDatum((int64) cs->reloads);
+                values[5] = Int64GetDatum((int64) cs->persist_failures);
+                values[6] = Int32GetDatum((int32) cs->resident_count);
+                values[7] = Int64GetDatum((int64) (cs->vram_used_bytes / (1024 * 1024)));
+                values[8] = Int64GetDatum((int64) (cs->vram_budget_bytes / (1024 * 1024)));
+                tuplestore_putvalues(tupstore, tupdesc, values, nulls);
+            }
+        }
     }
     /* daemon down (UNAVAILABLE) -> empty result, not an error */
 

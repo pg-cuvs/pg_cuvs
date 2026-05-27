@@ -370,15 +370,17 @@ cleanup:
  * Public API: cuvs_ipc_cache_stats
  * ---------------------------------------------------------------- */
 int
-cuvs_ipc_cache_stats(const char *socket_path, CuvsCacheStats *out)
+cuvs_ipc_cache_stats(const char *socket_path, CuvsCacheStats *out,
+                     int max, int *n_out)
 {
     int sock = uds_connect(socket_path);
     int rc;
     CuvsCmdFrame cmd;
     CuvsReplyHeader hdr;
 
+    *n_out = 0;
     if (sock < 0)
-        return CUVS_STATUS_UNAVAILABLE;   /* daemon down -> caller treats as empty */
+        return CUVS_STATUS_UNAVAILABLE;
 
     memset(&cmd, 0, sizeof(cmd));
     cmd.op = CUVS_OP_CACHE_STATS;
@@ -388,10 +390,20 @@ cuvs_ipc_cache_stats(const char *socket_path, CuvsCacheStats *out)
         && recv_all(sock, &hdr, sizeof(hdr)) == 0)
     {
         rc = (int) hdr.status;
-        if (hdr.status == CUVS_STATUS_OK && hdr.n_results >= 1)
+        if (hdr.status == CUVS_STATUS_OK && hdr.n_results > 0)
         {
-            if (recv_all(sock, out, sizeof(*out)) < 0)
+            int n = (int)hdr.n_results;
+            if (n > max) n = max;
+            if (recv_all(sock, out, (size_t)n * sizeof(*out)) < 0)
                 rc = CUVS_STATUS_ERROR;
+            else
+                *n_out = n;
+            /* drain any extra rows beyond max */
+            for (int i = n; i < (int)hdr.n_results; i++)
+            {
+                CuvsCacheStats discard;
+                recv_all(sock, &discard, sizeof(discard));
+            }
         }
     }
 
