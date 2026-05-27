@@ -111,7 +111,12 @@ CREATE FUNCTION pg_cuvs_gpu_search_stats(
     OUT requested_k     integer,
     OUT returned_k      integer,
     OUT stale           boolean,
-    OUT stale_since     timestamptz
+    OUT stale_since     timestamptz,
+    OUT delta_rows         bigint,
+    OUT delta_generation   bigint,
+    OUT delta_vram_bytes   bigint,
+    OUT delta_merged_count bigint,
+    OUT delta_search_mode  text
 )
 RETURNS SETOF record
 AS '$libdir/pg_cuvs', 'pg_cuvs_gpu_search_stats'

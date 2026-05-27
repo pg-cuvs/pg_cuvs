@@ -469,8 +469,26 @@ Phase 3E 완료 기준:
 - GPU별 VRAM budget과 eviction policy가 서로 간섭하지 않는다.
 - single-GPU fallback 또는 degraded mode가 명확하다.
 
+#### Phase 3F — Operational Playbooks / Runbooks
+
+목표:
+- Phase 3A-3E의 실제 운영 표면이 고정된 뒤 최종 운영 playbook을 작성한다. Phase 3D 중간 상태에서 replica/object-storage playbook을 자세히 만들면 3E multi-GPU/sharding 도입 후 절차가 다시 바뀌므로, Phase 3 최종 playbook은 3E 완료 이후로 둔다.
+
+구현 항목:
+- replica bootstrap / instance replacement runbook.
+- object storage permission failure, corrupt manifest, heap compatibility mismatch 대응.
+- async warmup/cache hydration 진단.
+- multi-GPU shard warmup, per-GPU VRAM pressure, shard failure/degraded mode 복구.
+- capacity planning: VRAM, NVMe, object storage artifact size, delta growth.
+- on-call triage: stats view, daemon logs, PostgreSQL warnings/errors, GCS audit/logging 확인 순서.
+
+Phase 3F 완료 기준:
+- Phase 3A-3E의 기능/관측성 표면을 기준으로 `docs/playbooks/`에 최종 운영 runbook을 작성한다.
+- 각 playbook은 최소 하나의 검증된 GPU VM 또는 replica 시나리오를 근거로 한다.
+- Phase 1.5 playbook은 baseline 문서로 유지하고, Phase 3 playbook은 multi-node/multi-GPU 운영 절차를 별도 문서로 둔다.
+
 Phase 3 전체 완료 기준:
-- Phase 3A-3E의 subphase 완료 기준을 모두 만족한다.
+- Phase 3A-3F의 subphase 완료 기준을 모두 만족한다.
 - 각 subphase는 독립적으로 중단/릴리스 가능하며, 다음 subphase 미완료가 이전 subphase의 정합성을 깨지 않는다.
 
 ---

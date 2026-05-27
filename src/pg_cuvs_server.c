@@ -70,6 +70,8 @@ typedef struct IndexEntry {
     uint32_t        delta_generation; /* base .tids body_crc32 the cache was built on */
     int64_t         delta_mtime;      /* .delta st_mtime when the cache was built */
     size_t          delta_vram_bytes; /* estimated VRAM held by the delta cache */
+    float          *delta_vecs_host; /* host copy for incremental rebuild (Phase 3A-4) */
+    int64_t         delta_n_cached;  /* rows in current GPU BF + host buffer */
 
     /* Search stats (pg_stat_gpu_search). Reset on (re)build/load — they
      * describe the currently resident index instance, not a persisted total. */
@@ -80,6 +82,7 @@ typedef struct IndexEntry {
     uint32_t        last_status;       /* CUVS_STATUS_* of most recent search */
     uint32_t        last_requested_k;  /* top-k of last OK search (reflects cuvs.k) */
     uint32_t        last_returned_k;   /* rows last OK search returned */
+    uint64_t        delta_merged_count; /* searches where daemon merged delta on GPU */
     char            last_error[128];
 } IndexEntry;
 
@@ -93,9 +96,10 @@ reset_entry_stats(IndexEntry *e)
     e->total_latency_us = 0;
     memset(e->lat_buckets, 0, sizeof(e->lat_buckets));
     e->last_status      = 0;
-    e->last_requested_k = 0;
-    e->last_returned_k  = 0;
-    e->last_error[0]    = '\0';
+    e->last_requested_k    = 0;
+    e->last_returned_k    = 0;
+    e->delta_merged_count = 0;
+    e->last_error[0]      = '\0';
 }
 
 /* Record a completed search on an entry. Caller MUST hold g_index_mutex. */
@@ -259,7 +263,9 @@ free_delta_cache(IndexEntry *e)
 {
     if (e->delta_idx) { cuvs_bf_free(e->delta_idx); e->delta_idx = NULL; }
     if (e->delta_tids) { free(e->delta_tids); e->delta_tids = NULL; }
+    if (e->delta_vecs_host) { free(e->delta_vecs_host); e->delta_vecs_host = NULL; }
     e->n_delta          = 0;
+    e->delta_n_cached   = 0;
     e->delta_generation = 0;
     e->delta_mtime      = 0;
     e->delta_vram_bytes = 0;
@@ -294,27 +300,33 @@ refresh_delta_cache(IndexEntry *e)
     if ((int64_t) st.st_mtime == e->delta_mtime)
         return;                         /* unchanged -> reuse current cache */
 
-    /* The file changed. Drop the old cache and record the new mtime up front so
-     * a persistent failure below does not retry on every search. */
-    free_delta_cache(e);
-    e->delta_mtime = (int64_t) st.st_mtime;
+    /* The file changed. Save previous state for incremental check, then
+     * selectively clear: free the GPU index but keep host buffers if the
+     * generation might still match. Record new mtime up front so a persistent
+     * failure below does not retry on every search. */
+    uint32_t prev_gen    = e->delta_generation;
+    int64_t  prev_cached = e->delta_n_cached;
+    if (e->delta_idx) { cuvs_bf_free(e->delta_idx); e->delta_idx = NULL; }
+    e->n_delta          = 0;
+    e->delta_vram_bytes = 0;
+    e->delta_mtime      = (int64_t) st.st_mtime;
 
     f = fopen(path, "rb");
     if (!f)
-        return;
+        goto fail_cleanup;
     if (cuvs_delta_read_header(f, &hdr) != 0
         || cuvs_delta_validate(&hdr, (int64_t) st.st_size - (int64_t) sizeof(hdr)) != 0
         || hdr.dim != e->dim || hdr.metric != e->metric)
     {
         fclose(f);
-        return;
+        goto fail_cleanup;
     }
 
     /* Generation: the delta must belong to the current base build's .tids. */
     tids_file_path(tids_path, sizeof(tids_path), g_index_dir, e->db_oid, e->index_oid);
     {
         FILE *tf = fopen(tids_path, "rb");
-        if (!tf) { fclose(f); return; }
+        if (!tf) { fclose(f); goto fail_cleanup; }
         got = fread(&th, 1, sizeof(th), tf);
         fclose(tf);
     }
@@ -322,13 +334,13 @@ refresh_delta_cache(IndexEntry *e)
         || th.body_crc32 != hdr.base_tids_crc32)
     {
         fclose(f);
-        return;                         /* stale delta from an old base -> base-only */
+        goto fail_cleanup;              /* stale delta from an old base -> base-only */
     }
     e->delta_generation = hdr.base_tids_crc32;
     if (hdr.n_rows == 0)
     {
         fclose(f);
-        return;                         /* empty delta -> base-only */
+        goto fail_cleanup;              /* empty delta -> base-only */
     }
 
     /* VRAM: best-effort, NON-evicting (never evict a base index for the delta). */
@@ -337,10 +349,64 @@ refresh_delta_cache(IndexEntry *e)
         || needed > gpu_free_vram_bytes())
     {
         fclose(f);
-        return;                         /* no spare VRAM -> backend CPU-merges */
+        goto fail_cleanup;              /* no spare VRAM -> backend CPU-merges */
     }
 
     rec_bytes = cuvs_delta_record_bytes(hdr.dim);
+
+    /* Phase 3A-4 incremental path: if the generation matches, the file just
+     * grew (append-only), and we still have the host-side buffers, read only
+     * the new records and rebuild the GPU BF from the full host buffer. */
+    if (hdr.base_tids_crc32 == prev_gen
+        && hdr.n_rows > prev_cached
+        && e->delta_vecs_host != NULL && e->delta_tids != NULL)
+    {
+        int64_t new_rows = hdr.n_rows - prev_cached;
+        float    *new_vecs = realloc(e->delta_vecs_host,
+                                     (size_t) hdr.n_rows * hdr.dim * sizeof(float));
+        uint64_t *new_tids = realloc(e->delta_tids,
+                                     (size_t) hdr.n_rows * sizeof(uint64_t));
+        rec = malloc(rec_bytes);
+        if (new_vecs && new_tids && rec)
+        {
+            e->delta_vecs_host = new_vecs;
+            e->delta_tids      = new_tids;
+            long seek_off = (long) sizeof(hdr) + (long)(prev_cached * rec_bytes);
+            if (fseek(f, seek_off, SEEK_SET) == 0)
+            {
+                int ok = 1;
+                for (int64_t i = 0; i < new_rows; i++)
+                {
+                    int64_t idx = prev_cached + i;
+                    if (fread(rec, 1, rec_bytes, f) != rec_bytes) { ok = 0; break; }
+                    memcpy(&e->delta_tids[idx], rec, sizeof(uint64_t));
+                    memcpy(&e->delta_vecs_host[(size_t) idx * hdr.dim],
+                           rec + sizeof(uint64_t),
+                           (size_t) hdr.dim * sizeof(float));
+                }
+                if (ok)
+                {
+                    if (e->delta_idx) { cuvs_bf_free(e->delta_idx); e->delta_idx = NULL; }
+                    e->delta_idx = cuvs_bf_build(e->delta_vecs_host, hdr.n_rows,
+                                                 (int) hdr.dim, hdr.metric);
+                    if (e->delta_idx)
+                    {
+                        e->n_delta          = hdr.n_rows;
+                        e->delta_n_cached   = hdr.n_rows;
+                        e->delta_vram_bytes = needed;
+                        LOG_INFO("pg_cuvs_server: delta cache %u/%u incremental (%lld -> %lld rows)\n",
+                                e->db_oid, e->index_oid,
+                                (long long) prev_cached, (long long) hdr.n_rows);
+                    }
+                }
+            }
+        }
+        free(rec);
+        fclose(f);
+        return;
+    }
+
+    /* Full rebuild path */
     vecs = malloc((size_t) hdr.n_rows * hdr.dim * sizeof(float));
     tids = malloc((size_t) hdr.n_rows * sizeof(uint64_t));
     rec  = malloc(rec_bytes);
@@ -359,8 +425,10 @@ refresh_delta_cache(IndexEntry *e)
             e->delta_idx = cuvs_bf_build(vecs, hdr.n_rows, (int) hdr.dim, hdr.metric);
             if (e->delta_idx)
             {
-                e->delta_tids       = tids;  tids = NULL;   /* ownership moved */
+                e->delta_tids       = tids;  tids = NULL;
+                e->delta_vecs_host  = vecs;  vecs = NULL;
                 e->n_delta          = hdr.n_rows;
+                e->delta_n_cached   = hdr.n_rows;
                 e->delta_vram_bytes = needed;
                 LOG_INFO("pg_cuvs_server: delta cache %u/%u built (%lld rows, %zu KB VRAM)\n",
                         e->db_oid, e->index_oid, (long long) e->n_delta, needed / 1024);
@@ -371,6 +439,13 @@ refresh_delta_cache(IndexEntry *e)
     free(tids);
     free(rec);
     fclose(f);
+    return;
+
+fail_cleanup:
+    if (e->delta_tids) { free(e->delta_tids); e->delta_tids = NULL; }
+    if (e->delta_vecs_host) { free(e->delta_vecs_host); e->delta_vecs_host = NULL; }
+    e->delta_n_cached   = 0;
+    e->delta_generation = 0;
 }
 
 /* Forward decls used by save_index. */
@@ -517,6 +592,7 @@ load_index(uint32_t db_oid, uint32_t index_oid)
      * previously evicted index. It is lazily (re)built in handle_search. */
     e->delta_idx = NULL; e->delta_tids = NULL; e->n_delta = 0;
     e->delta_generation = 0; e->delta_mtime = 0; e->delta_vram_bytes = 0;
+    e->delta_vecs_host = NULL; e->delta_n_cached = 0;
     reset_entry_stats(e);
 
     /* Restore staleness from the .stale sidecar so a daemon restart does not
@@ -957,6 +1033,7 @@ handle_search(int client_fd, const CuvsCmdFrame *cmd)
             n_valid = (n_total < k) ? n_total : k;
             memcpy(results, cand, (size_t) n_valid * sizeof(CuvsResult));
             delta_merged = 1;
+            e->delta_merged_count++;
         }
         free(draw);
         free(cand);
@@ -1464,6 +1541,12 @@ handle_stats(int client_fd, const CuvsCmdFrame *cmd)
         s->stale            = (uint32_t)e->stale;
         s->stale_since      = (int64_t)e->stale_since;
         strncpy(s->last_error, e->last_error, sizeof(s->last_error) - 1);
+        s->delta_rows         = e->n_delta;
+        s->delta_generation   = e->delta_generation;
+        s->delta_vram_bytes   = e->delta_vram_bytes;
+        s->delta_merged_count = e->delta_merged_count;
+        s->delta_search_mode  = (e->delta_idx && e->n_delta > 0) ? 2 : 0;
+        s->_pad0              = 0;
     }
 
     pthread_mutex_unlock(&g_index_mutex);

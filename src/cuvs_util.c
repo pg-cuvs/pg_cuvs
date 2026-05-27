@@ -285,6 +285,50 @@ cuvs_delta_read_header(FILE *f, CuvsDeltaHeader *out)
     return 0;
 }
 
+/* ----------------------------------------------------------------
+ * Tombstone sidecar helpers (Phase 3A-4)
+ * ---------------------------------------------------------------- */
+void
+cuvs_tombstone_header_init(CuvsTombstoneHeader *h, uint32_t base_tids_crc32)
+{
+    h->magic           = CUVS_TOMBSTONE_MAGIC;
+    h->version         = CUVS_TOMBSTONE_VERSION;
+    h->n_entries       = 0;
+    h->base_tids_crc32 = base_tids_crc32;
+    h->reserved        = 0;
+    h->_pad0           = 0;
+}
+
+int
+cuvs_tombstone_validate(const CuvsTombstoneHeader *h, int64_t body_bytes)
+{
+    if (h->magic != CUVS_TOMBSTONE_MAGIC)   return -1;
+    if (h->version != CUVS_TOMBSTONE_VERSION) return -1;
+    if (h->reserved != 0)                    return -1;
+    if (h->n_entries < 0 || h->n_entries > CUVS_TIDS_MAX_VECS) return -1;
+    if (body_bytes < 0)                      return -1;
+    if ((uint64_t)body_bytes != (uint64_t)h->n_entries * sizeof(CuvsTombstoneRecord))
+        return -1;
+    return 0;
+}
+
+int
+cuvs_tombstone_read_header(FILE *f, CuvsTombstoneHeader *out)
+{
+    CuvsTombstoneHeader h;
+    if (fread(&h, sizeof(h), 1, f) != 1)
+        return -1;
+    if (h.magic != CUVS_TOMBSTONE_MAGIC)
+        return -1;
+    if (h.version != CUVS_TOMBSTONE_VERSION)
+        return -1;
+    if (h.reserved != 0)
+        return -1;
+    if (out)
+        *out = h;
+    return 0;
+}
+
 #ifdef CUVS_TEST_HOOKS
 int
 cuvs_fault(const char *name)

@@ -119,6 +119,13 @@ typedef struct CuvsIndexStats {
     uint32_t stale;             /* 1 if writes happened since build (REINDEX needed) */
     int64_t  stale_since;       /* epoch seconds the index was first marked stale; 0 if fresh */
     char     last_error[128];
+    /* Phase 3A-3 delta stats (wire ABI extension — co-deploy daemon+extension) */
+    int64_t  delta_rows;         /* pending-delta rows in daemon GPU cache */
+    uint32_t delta_generation;   /* base_tids_crc32 the delta cache was built on */
+    uint64_t delta_vram_bytes;   /* VRAM held by the delta brute-force cache */
+    uint64_t delta_merged_count; /* searches where daemon merged delta on GPU */
+    uint32_t delta_search_mode;  /* 0=none, 1=cpu, 2=gpu (what last search used) */
+    uint32_t _pad0;              /* alignment to 8-byte boundary */
 } CuvsIndexStats;
 
 /* ----------------------------------------------------------------

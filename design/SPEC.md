@@ -494,10 +494,21 @@ sweep rather than a fixed guess.
 
 **TEST-08**
 ```
-The project shall provide operational playbooks for GPU VM build/test, daemon
-large-dataset benchmark, JIT threshold sweep, restart recovery, CREATE INDEX
-failure diagnosis, persistence corruption recovery, VRAM OOM fallback, and
-rollback/cleanup.
+Before Phase 2 feature work begins, the project shall provide baseline
+operational playbooks for GPU VM build/test, daemon large-dataset benchmark,
+JIT threshold sweep, restart recovery, CREATE INDEX failure diagnosis,
+persistence corruption recovery, VRAM OOM fallback, and rollback/cleanup.
+```
+
+**TEST-09**
+```
+Final Phase 3 operational playbooks shall be written after Phase 3E multi-GPU /
+sharding behavior is complete. These runbooks shall cover replica bootstrap,
+object-storage artifact recovery, heap-compatibility mismatch, async warmup and
+cache hydration, multi-GPU shard warmup, per-GPU VRAM pressure, shard
+failure/degraded mode, and capacity planning. Earlier Phase 3 documents shall
+capture contracts and acceptance criteria, not detailed operational runbooks
+that would become stale before 3E.
 ```
 
 ---

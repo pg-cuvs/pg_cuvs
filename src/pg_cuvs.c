@@ -37,6 +37,9 @@
 #include "storage/bufmgr.h"
 #include "storage/fd.h"
 #include "storage/itemptr.h"
+#include "utils/snapmgr.h"
+#include "access/xact.h"
+#include "access/transam.h"
 
 #include <sys/stat.h>
 #include <sys/file.h>   /* flock */
@@ -76,6 +79,7 @@ int   cuvs_max_build_mem_mb       = 0;     /* 0 = auto (MemAvailable * safety_ra
 double cuvs_build_mem_safety_ratio = 0.5;  /* auto-limit fraction of MemAvailable */
 double cuvs_max_stale_fraction     = 0.10; /* deleted-since-build fraction that reroutes to CPU */
 int   cuvs_max_delta_rows          = 10000; /* pending-insert delta cap; 0 disables delta (Phase 3A) */
+int   cuvs_delta_search_mode       = 0;    /* 0=auto, 1=cpu, 2=gpu (Phase 3A-3) */
 char *cuvs_snapshot_uri            = NULL;  /* "gs://bucket[/prefix]" — empty = disabled (Phase 3C) */
 char *cuvs_cluster_id              = NULL;  /* multi-node identifier for GCS path (Phase 3C) */
 char *cuvs_gcs_key_file            = NULL;  /* service account JSON path; "" = instance metadata (Phase 3C) */
@@ -197,6 +201,18 @@ _PG_init(void)
         "absorb the delta). 0 disables the delta and falls back to mark-stale.",
         &cuvs_max_delta_rows,
         10000, 0, INT_MAX,
+        PGC_USERSET,
+        0, NULL, NULL, NULL);
+
+    DefineCustomIntVariable(
+        "cuvs.delta_search",
+        "Delta search mode: 0=auto, 1=cpu, 2=gpu.",
+        "Controls how pending-delta rows are searched during a cagra scan. "
+        "auto (0): GPU-merge when daemon can, CPU-exact fallback otherwise. "
+        "cpu (1): always CPU-exact merge, ignore daemon delta cache. "
+        "gpu (2): GPU-only, no CPU fallback (may miss delta rows).",
+        &cuvs_delta_search_mode,
+        0, 0, 2,
         PGC_USERSET,
         0, NULL, NULL, NULL);
 
@@ -418,6 +434,60 @@ cuvs_delta_unlink(Oid index_oid)
     (void) unlink(path);
 }
 
+/* ----------------------------------------------------------------
+ * Phase 3A-4 tombstone sidecar
+ *
+ * Records dead TIDs from ambulkdelete so base CAGRA results can be
+ * filtered before merge, avoiding wasted k-slots on dead tuples.
+ * ---------------------------------------------------------------- */
+static void
+cuvs_tombstone_path(Oid index_oid, char *buf, size_t buflen)
+{
+    snprintf(buf, buflen, "%s/%u_%u.tombstone",
+             get_index_dir(), (uint32_t) MyDatabaseId, (uint32_t) index_oid);
+}
+
+static void
+cuvs_tombstone_unlink(Oid index_oid)
+{
+    char path[MAXPGPATH];
+    cuvs_tombstone_path(index_oid, path, sizeof(path));
+    (void) unlink(path);
+}
+
+static bool
+cuvs_index_tombstone_unusable(Oid index_oid)
+{
+    char                 path[MAXPGPATH];
+    FILE                *f;
+    CuvsTombstoneHeader  hdr;
+    long                 fsize;
+    uint32_t             base_crc;
+
+    cuvs_tombstone_path(index_oid, path, sizeof(path));
+    f = AllocateFile(path, PG_BINARY_R);
+    if (f == NULL)
+        return false;   /* no tombstones -> fine */
+
+    if (cuvs_tombstone_read_header(f, &hdr) != 0
+        || fseek(f, 0, SEEK_END) != 0
+        || (fsize = ftell(f)) < (long) sizeof(hdr))
+    {
+        FreeFile(f);
+        return true;
+    }
+    FreeFile(f);
+
+    if (cuvs_tombstone_validate(&hdr, (int64_t) fsize - (int64_t) sizeof(hdr)) != 0)
+        return true;
+    if (hdr.n_entries > (int64_t) cuvs_max_delta_rows)
+        return true;
+    if (!cuvs_read_tids_crc(index_oid, &base_crc)
+        || base_crc != hdr.base_tids_crc32)
+        return true;
+    return false;
+}
+
 /* pread/pwrite full-length wrappers (retry partials and EINTR). 0 on success. */
 static int
 cuvs_pwrite_all(int fd, off_t off, const void *buf, size_t len)
@@ -497,7 +567,7 @@ cuvsamcostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
     (void) root;
     (void) loop_count;
 
-    /* Seven gates turn the GPU path off — all local file/state reads, no IPC.
+    /* Eight gates turn the GPU path off — all local file/state reads, no IPC.
      * Cost is set to 1e15 (> PG disable_cost 1e10) so the gated index loses
      * even when enable_seqscan = off, preventing empty-result or ERROR paths.
      *  1. enable_cuvs GUC
@@ -506,16 +576,16 @@ cuvsamcostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
      *  4. delete-drift (.tids build count vs planner live-row estimate)
      *  5. socket existence (missing → daemon cleanly stopped or not yet started)
      *  6. artifact existence (no .tids → index was built on empty table)
-     *  7. delta unusable (.delta corrupt / generation mismatch / over cap →
-     *     can't merge pending inserts, so route to CPU; a usable delta keeps the
-     *     GPU path and is merged at scan time) */
+     *  7. delta unusable (.delta corrupt / generation mismatch / over cap)
+     *  8. tombstone unusable (.tombstone corrupt / over cap / gen mismatch) */
     gpu_off = !enable_cuvs
            || cuvs_circuit_is_open((uint32_t) index_oid)
            || cuvs_index_is_stale(index_oid)
            || cuvs_index_delete_drift_stale(index_oid, path->indexinfo->rel->tuples)
            || !cuvs_daemon_socket_ready()
            || !cuvs_index_has_artifact(index_oid)
-           || cuvs_index_delta_unusable(index_oid);
+           || cuvs_index_delta_unusable(index_oid)
+           || cuvs_index_tombstone_unusable(index_oid);
 
     if (gpu_off)
     {
@@ -842,9 +912,10 @@ cuvs_ambuild(Relation heapRel, Relation indexRel, IndexInfo *indexInfo)
     }
 
     /* Phase 3A: the fresh base absorbs all current rows, so any pending-insert
-     * delta from before this (RE)build is obsolete. Drop it; the new base .tids
-     * CRC also invalidates a leftover via the generation guard as a backstop. */
+     * delta and tombstones from before this (RE)build are obsolete. Drop them;
+     * the new base .tids CRC also invalidates leftovers via generation guard. */
     cuvs_delta_unlink(RelationGetRelid(indexRel));
+    cuvs_tombstone_unlink(RelationGetRelid(indexRel));
 
     return result;
 }
@@ -931,6 +1002,80 @@ cuvs_cand_cmp(const void *a, const void *b, void *arg)
     if (x->dist < y->dist) return -1;   /* smaller distance = nearer */
     if (x->dist > y->dist) return 1;
     return 0;
+}
+
+/* Phase 3A-4: filter base CAGRA + delta results against tombstoned TIDs.
+ * Snapshot-aware per WRITE-04B: only filter if the delete xact committed and
+ * is visible to the current snapshot. No tombstones = no-op. */
+static void
+cuvs_apply_tombstones(CuvsScanState *ss, Oid index_oid)
+{
+    char                 path[MAXPGPATH];
+    int                  fd;
+    CuvsTombstoneHeader  hdr;
+    off_t                fsize;
+    uint32_t             base_crc;
+    CuvsTombstoneRecord *recs;
+    int                  out = 0;
+
+    cuvs_tombstone_path(index_oid, path, sizeof(path));
+    fd = OpenTransientFile(path, O_RDONLY | PG_BINARY);
+    if (fd < 0)
+        return;
+
+    fsize = lseek(fd, 0, SEEK_END);
+    if (fsize < (off_t) sizeof(hdr)
+        || cuvs_pread_all(fd, 0, &hdr, sizeof(hdr)) != 0
+        || hdr.magic != CUVS_TOMBSTONE_MAGIC
+        || hdr.version != CUVS_TOMBSTONE_VERSION
+        || cuvs_tombstone_validate(&hdr, (int64_t) fsize - (int64_t) sizeof(hdr)) != 0
+        || !cuvs_read_tids_crc(index_oid, &base_crc)
+        || base_crc != hdr.base_tids_crc32
+        || hdr.n_entries == 0)
+    {
+        CloseTransientFile(fd);
+        return;
+    }
+
+    {
+        size_t recs_bytes = (size_t) hdr.n_entries * sizeof(CuvsTombstoneRecord);
+        Snapshot snap = GetActiveSnapshot();
+
+        recs = (CuvsTombstoneRecord *) palloc(recs_bytes);
+        if (cuvs_pread_all(fd, (off_t) sizeof(hdr), recs, recs_bytes) != 0)
+        {
+            CloseTransientFile(fd);
+            pfree(recs);
+            return;
+        }
+        CloseTransientFile(fd);
+
+        for (int i = 0; i < ss->n_results; i++)
+        {
+            bool dead = false;
+            for (int64_t t = 0; t < hdr.n_entries; t++)
+            {
+                if (recs[t].tid == ss->tids[i])
+                {
+                    TransactionId xid = (TransactionId) recs[t].delete_xid;
+                    if (TransactionIdDidCommit(xid)
+                        && !XidInMVCCSnapshot(xid, snap))
+                    {
+                        dead = true;
+                        break;
+                    }
+                }
+            }
+            if (!dead)
+            {
+                ss->tids[out]      = ss->tids[i];
+                ss->distances[out] = ss->distances[i];
+                out++;
+            }
+        }
+        ss->n_results = out;
+        pfree(recs);
+    }
 }
 
 /* Merge the .delta pending-insert vectors into the base result set already in
@@ -1222,12 +1367,19 @@ cuvs_gettuple(IndexScanDesc scan, ScanDirection dir)
         cuvs_circuit_record_success((uint32_t)index_oid);
         ss->cur = 0;
 
-        /* Phase 3B: the daemon merges the .delta on the GPU when it can; skip the
-         * CPU merge then. Otherwise (daemon delta unavailable — VRAM short or a
-         * generation race) fall back to the Phase 3A CPU-exact merge so pending
-         * INSERT/UPDATE rows are still reflected without a rebuild. */
-        if (cuvs_max_delta_rows > 0 && !delta_merged)
-            cuvs_merge_delta(ss, index_oid, qvec->x, dim, k, metric);
+        /* Phase 3A-3 tri-mode delta search: auto=GPU-then-CPU, cpu=always CPU,
+         * gpu=GPU-only (no CPU fallback). */
+        if (cuvs_max_delta_rows > 0)
+        {
+            int do_cpu = (cuvs_delta_search_mode == 1)
+                      || (cuvs_delta_search_mode == 0 && !delta_merged);
+            if (do_cpu)
+                cuvs_merge_delta(ss, index_oid, qvec->x, dim, k, metric);
+        }
+
+        /* Phase 3A-4: filter dead TIDs via tombstones (snapshot-aware). */
+        if (cuvs_max_delta_rows > 0)
+            cuvs_apply_tombstones(ss, index_oid);
 
         /* Record per-search stats for pg_cuvs_last_search_* and EXPLAIN. */
         cuvs_last_latency_us   = latency_us;
@@ -1445,16 +1597,135 @@ cuvs_aminsert(Relation indexRel, Datum *values, bool *isnull,
     return false;   /* no in-index entry stored */
 }
 
-/* ambulkdelete runs once per VACUUM when dead tuples (DELETE/UPDATE) are
- * removed. Mark the index stale so the next query falls back to CPU. */
+/* Phase 3A-4: append a single dead TID to the .tombstone sidecar.
+ * Returns true on success, false on any failure (caller marks stale). */
+static bool
+cuvs_tombstone_append(Relation indexRel, uint64_t tid, uint64_t delete_xid)
+{
+    char                 path[MAXPGPATH];
+    int                  fd;
+    CuvsTombstoneHeader  hdr;
+    off_t                fsize, rec_off;
+    CuvsTombstoneRecord  rec;
+    bool                 ok = false;
+
+    cuvs_tombstone_path(RelationGetRelid(indexRel), path, sizeof(path));
+    fd = OpenTransientFile(path, O_RDWR | O_CREAT | PG_BINARY);
+    if (fd < 0) return false;
+    if (flock(fd, LOCK_EX) != 0) { CloseTransientFile(fd); return false; }
+    (void) fchmod(fd, 0644);
+
+    fsize = lseek(fd, 0, SEEK_END);
+    if (fsize < 0) goto done;
+
+    if (fsize == 0)
+    {
+        uint32_t base_crc;
+        if (!cuvs_read_tids_crc(RelationGetRelid(indexRel), &base_crc))
+            goto done;
+        cuvs_tombstone_header_init(&hdr, base_crc);
+    }
+    else if (fsize < (off_t) sizeof(hdr)
+             || cuvs_pread_all(fd, 0, &hdr, sizeof(hdr)) != 0
+             || hdr.magic != CUVS_TOMBSTONE_MAGIC
+             || hdr.version != CUVS_TOMBSTONE_VERSION)
+    {
+        goto done;
+    }
+
+    if (hdr.n_entries >= (int64_t) cuvs_max_delta_rows)
+        goto done;
+
+    rec.tid        = tid;
+    rec.delete_xid = delete_xid;
+    rec_off = (off_t) sizeof(hdr) + (off_t) hdr.n_entries * (off_t) sizeof(rec);
+
+    if (cuvs_pwrite_all(fd, rec_off, &rec, sizeof(rec)) != 0)
+        goto done;
+    hdr.n_entries++;
+    if (cuvs_pwrite_all(fd, 0, &hdr, sizeof(hdr)) != 0)
+        goto done;
+    if (ftruncate(fd, (off_t) sizeof(hdr) + (off_t) hdr.n_entries * (off_t) sizeof(rec)) != 0)
+        goto done;
+    if (pg_fsync(fd) != 0)
+        goto done;
+    ok = true;
+
+done:
+    flock(fd, LOCK_UN);
+    CloseTransientFile(fd);
+    return ok;
+}
+
+/* ambulkdelete: Phase 3A-4 records dead TIDs as tombstones instead of
+ * unconditionally marking stale. Falls back to mark-stale if tombstone
+ * append fails or exceeds the cap. */
 static IndexBulkDeleteResult *
 cuvs_ambulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
                   IndexBulkDeleteCallback callback, void *callback_state)
 {
-    (void) callback; (void) callback_state;
+    Relation    indexRel = info->index;
+    Oid         index_oid = RelationGetRelid(indexRel);
+    bool        all_ok = true;
+
     if (stats == NULL)
         stats = (IndexBulkDeleteResult *) palloc0(sizeof(IndexBulkDeleteResult));
-    cuvs_mark_index_stale(info->index);
+
+    if (cuvs_max_delta_rows <= 0)
+    {
+        cuvs_mark_index_stale(indexRel);
+        return stats;
+    }
+
+    if (cuvs_index_is_stale(index_oid))
+        return stats;
+
+    {
+        char            tids_path[MAXPGPATH];
+        FILE           *f;
+        CuvsTidsHeader  thdr;
+        uint64_t       *base_tids = NULL;
+
+        snprintf(tids_path, sizeof(tids_path), "%s/%u_%u.tids",
+                 get_index_dir(),
+                 (uint32_t) MyDatabaseId,
+                 (uint32_t) index_oid);
+        f = AllocateFile(tids_path, PG_BINARY_R);
+        if (f && cuvs_tids_read(f, &thdr, &base_tids) == 0)
+        {
+            TransactionId delete_xid = GetCurrentTransactionId();
+            for (int64_t i = 0; i < thdr.n_vecs; i++)
+            {
+                uint32_t blk;
+                uint16_t off;
+                ItemPointerData iptr;
+
+                cuvs_tid_decode(base_tids[i], &blk, &off);
+                ItemPointerSet(&iptr, blk, off);
+
+                if (callback(&iptr, callback_state))
+                {
+                    stats->tuples_removed += 1;
+                    if (!cuvs_tombstone_append(indexRel, base_tids[i],
+                                              (uint64_t) delete_xid))
+                    {
+                        all_ok = false;
+                        break;
+                    }
+                }
+            }
+            free(base_tids);
+        }
+        else
+        {
+            all_ok = false;
+        }
+        if (f) FreeFile(f);
+    }
+
+    if (!all_ok)
+        cuvs_mark_index_stale(indexRel);
+
     return stats;
 }
 
@@ -1590,7 +1861,7 @@ pg_cuvs_last_search_metric(PG_FUNCTION_ARGS)
  * the view must stay queryable while the daemon restarts. (See plan: a
  * future liveness column can distinguish "down" from "idle".)
  * ---------------------------------------------------------------- */
-#define GPU_STATS_NCOLS 21
+#define GPU_STATS_NCOLS 26
 
 static const char *
 cuvs_metric_name(uint32_t metric)
@@ -1695,6 +1966,14 @@ pg_cuvs_gpu_search_stats(PG_FUNCTION_ARGS)
             values[20] = TimestampTzGetDatum(time_t_to_timestamptz((pg_time_t) s->stale_since));
         else
             nulls[20] = true;
+
+        values[21] = Int64GetDatum(s->delta_rows);
+        values[22] = Int64GetDatum((int64) s->delta_generation);
+        values[23] = Int64GetDatum((int64) s->delta_vram_bytes);
+        values[24] = Int64GetDatum((int64) s->delta_merged_count);
+        values[25] = CStringGetTextDatum(
+            s->delta_search_mode == 2 ? "gpu" :
+            s->delta_search_mode == 1 ? "cpu" : "none");
 
         tuplestore_putvalues(tupstore, tupdesc, values, nulls);
     }

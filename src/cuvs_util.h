@@ -175,6 +175,36 @@ int cuvs_delta_validate(const CuvsDeltaHeader *h, int64_t body_bytes);
  * the file size) via cuvs_delta_validate. */
 int cuvs_delta_read_header(FILE *f, CuvsDeltaHeader *out);
 
+/* ----------------------------------------------------------------
+ * Versioned .tombstone sidecar (Phase 3A-4).
+ *
+ * Layout: [CuvsTombstoneHeader (32 bytes)] [n_entries * CuvsTombstoneRecord].
+ * Records dead TIDs from DELETE/UPDATE-old so base CAGRA results can be
+ * filtered before merge. The backend does snapshot-aware filtering using
+ * delete_xid (the daemon has no MVCC knowledge). Tied to a base build via
+ * base_tids_crc32, like .delta.
+ * ---------------------------------------------------------------- */
+#define CUVS_TOMBSTONE_MAGIC   0x424D4F54u  /* 'TOMB' little-endian */
+#define CUVS_TOMBSTONE_VERSION 1u
+
+typedef struct CuvsTombstoneHeader {
+    uint32_t magic;
+    uint32_t version;
+    int64_t  n_entries;
+    uint32_t base_tids_crc32;
+    uint32_t reserved;          /* must be 0 */
+    uint64_t _pad0;             /* pad to 32 bytes */
+} CuvsTombstoneHeader;          /* 32 bytes */
+
+typedef struct CuvsTombstoneRecord {
+    uint64_t tid;               /* heap TID of the dead tuple */
+    uint64_t delete_xid;        /* xact ID that deleted/updated this tuple */
+} CuvsTombstoneRecord;          /* 16 bytes */
+
+void cuvs_tombstone_header_init(CuvsTombstoneHeader *h, uint32_t base_tids_crc32);
+int  cuvs_tombstone_validate(const CuvsTombstoneHeader *h, int64_t body_bytes);
+int  cuvs_tombstone_read_header(FILE *f, CuvsTombstoneHeader *out);
+
 #ifdef CUVS_TEST_HOOKS
 /* Test-only fault injection: returns 1 if env var `name` is set, else 0.
  * Compiled in ONLY under CUVS_TEST_HOOKS; absent from production builds. */
