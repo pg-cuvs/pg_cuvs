@@ -39,10 +39,10 @@ resource "google_compute_instance" "pg_cuvs_dev" {
   machine_type = var.machine_type
   tags         = ["pg-cuvs-dev"]
 
-  # GPU (A100 default; see variables.tf accelerator_type)
+  # GPU (A100 default; see variables.tf accelerator_type / gpu_count)
   guest_accelerator {
     type  = var.accelerator_type
-    count = 1
+    count = var.gpu_count
   }
 
   scheduling {

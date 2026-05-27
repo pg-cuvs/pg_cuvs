@@ -51,6 +51,12 @@ variable "ssh_pub_key_path" {
   default     = "~/.ssh/id_rsa.pub"
 }
 
+variable "gpu_count" {
+  description = "Number of GPUs (1=a2-highgpu-1g, 2=a2-highgpu-2g, 4=a2-highgpu-4g, 8=a2-highgpu-8g)"
+  type        = number
+  default     = 1
+}
+
 variable "preemptible" {
   description = "Use preemptible VM to reduce cost (stops after 24h)"
   type        = bool
