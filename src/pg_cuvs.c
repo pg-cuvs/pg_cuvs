@@ -1291,6 +1291,11 @@ cuvs_delta_append(Relation indexRel, uint64_t tid, const float *vec, int dim,
         CloseTransientFile(fd);
         return false;
     }
+    /* Sibling artifacts (.cagra/.tids) are 0644; the daemon reads .delta too, so
+     * match them rather than the 0600 OpenTransientFile default. Access is gated
+     * by the index directory's own permissions (0700 in production), and the
+     * vectors are already readable via .cagra. */
+    (void) fchmod(fd, 0644);
 
     fsize = lseek(fd, 0, SEEK_END);
     if (fsize < 0)
