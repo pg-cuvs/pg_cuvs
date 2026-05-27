@@ -541,6 +541,33 @@ SELECT stale FROM pg_stat_gpu_search WHERE index_oid = 'ec_cagra'::regclass;
 (1 row)
 
 -- ============================================================================
+-- Step 5: pending-delta merge for cosine + IP metrics (Phase 3A).
+-- The CPU delta distance must match the daemon's cuVS scale per metric so the
+-- merge orders correctly: cosine = 1 - cossim (ascending), IP = raw dot
+-- (descending). Probe a vector whose new delta row is the unique extremum, so
+-- the merge must surface it first regardless of CAGRA approximation on the base.
+-- ============================================================================
+-- cosine: id 99 equals the probe direction -> cosine distance 0 -> nearest.
+INSERT INTO ec_cos VALUES (99, '[0.5,0.5,0,0]');
+SET enable_seqscan = off;
+SELECT id FROM ec_cos ORDER BY embedding <=> '[0.5,0.5,0,0]'::vector LIMIT 1;
+ id 
+----
+ 99
+(1 row)
+
+RESET enable_seqscan;
+-- ip: id 99 has the unique largest inner product with the probe -> nearest.
+INSERT INTO ec_ip VALUES (99, '[2,2,0,0]');
+SET enable_seqscan = off;
+SELECT id FROM ec_ip ORDER BY embedding <#> '[1,1,0,0]'::vector LIMIT 1;
+ id 
+----
+ 99
+(1 row)
+
+RESET enable_seqscan;
+-- ============================================================================
 -- Cleanup
 -- ============================================================================
 DROP TABLE ec, ec_big, ec_empty, ec_one, ec_d1, ec_d2000, ec_dup, ec_null,
