@@ -293,11 +293,12 @@ SELECT id FROM ec ORDER BY embedding <-> '[1,0,0,0]'::vector LIMIT 5;
 SET enable_cuvs = on;
 
 -- ============================================================================
--- Step 4: pending delta (Phase 3A) + DELETE staleness.
+-- Step 4: pending delta (Phase 3A) + DELETE fallback.
 -- INSERT/UPDATE no longer mark the index stale; they append the new vector to
 -- the .delta sidecar so the GPU path stays usable and a query merges the new
--- vectors (CPU-exact) with the base CAGRA results. Only DELETE/VACUUM
--- (ambulkdelete) still marks stale. Assert deterministic facts only.
+-- vectors (CPU-exact or daemon GPU delta) with the base CAGRA results.
+-- DELETE/VACUUM uses the tombstone path when safe and falls back to stale when
+-- tombstone recording is unavailable/unsafe. Assert deterministic facts only.
 -- ============================================================================
 -- ec_cagra was rebuilt during DDL churn above, so it starts fresh.
 INSERT INTO ec VALUES (99, '[0.5,0.5,0,0]');   -- aminsert -> .delta append (NOT stale)
@@ -330,8 +331,8 @@ SELECT stale FROM pg_stat_gpu_search WHERE index_oid = 'ec_cagra'::regclass;
 SET enable_seqscan = off;
 SELECT id FROM ec ORDER BY embedding <-> '[0,0,0.5,0.5]'::vector LIMIT 1;
 RESET enable_seqscan;
--- DELETE + VACUUM exercises the ambulkdelete path -> marks the index stale
--- (Phase 3A defers delete tombstones; deletes still force a rebuild).
+-- DELETE + VACUUM exercises the ambulkdelete tombstone/fallback path. This
+-- regression observes the fail-closed stale fallback contract.
 DELETE FROM ec WHERE id = 99;
 VACUUM ec;
 SELECT stale FROM pg_stat_gpu_search WHERE index_oid = 'ec_cagra'::regclass;

@@ -200,9 +200,10 @@ emit an ERROR-level log entry, and fall back to CPU until
 In Phase 2, when a row is inserted, updated, or deleted in a table that has a
 cagra index, the pg_cuvs extension shall mark the cagra index stale without
 modifying the VRAM-resident base index.
-In Phase 3A, INSERT/UPDATE new versions may instead append to a valid pending
-delta artifact and leave the base CAGRA index searchable. DELETE/VACUUM and
-delta-write failure shall continue to mark the index stale and route to CPU.
+In Phase 3A, INSERT/UPDATE new versions append to a valid pending-delta
+artifact and leave the base CAGRA index searchable. DELETE/VACUUM records
+tombstones when possible; delta/tombstone write failure or cap exhaustion shall
+mark the index stale and route to CPU.
 ```
 
 **WRITE-02**
@@ -228,9 +229,9 @@ INSERT/UPDATE new versions are searched with exact distance over a bounded
 delta store, and base CAGRA candidates plus delta candidates are over-fetched,
 merged, and re-ranked before PostgreSQL heap recheck. The CPU merge path is the
 correctness fallback; the daemon-side resident GPU delta cache is the
-performance path. Phase 3A does not implement DELETE/UPDATE-old tombstone
-correction; those paths remain covered by heap recheck, delete-drift gating,
-and stale CPU reroute.
+performance path. DELETE/UPDATE-old versions are represented by a bounded
+tombstone sidecar populated from `ambulkdelete`; the backend applies those
+tombstones with snapshot visibility before returning candidates.
 ```
 
 **WRITE-04A**
@@ -245,10 +246,10 @@ fresh.
 
 **WRITE-04B**
 ```
-When tombstone correction is implemented in a later increment, it shall be
-snapshot-aware. A global tombstone shall not remove an UPDATE old tuple that
-remains visible to an older transaction snapshot. Heap recheck is not
-sufficient to recover candidates removed before the access method returns them.
+Tombstone correction shall be snapshot-aware. A global tombstone shall not
+remove an UPDATE old tuple that remains visible to an older transaction
+snapshot. Heap recheck is not sufficient to recover candidates removed before
+the access method returns them.
 ```
 
 **WRITE-04C**
@@ -260,10 +261,11 @@ heap recheck removes candidates and fewer than k visible rows remain.
 
 **WRITE-05**
 ```
-While the pending-delta set for a cagra index exceeds `cuvs.rebuild_threshold`,
-`cuvs.max_delta_rows`, or another configured resource limit, the pg_cuvs
-extension shall stop using GPU+delta correction and fall back to CPU until a
-successful REINDEX or explicit rebuild policy restores a compact base index.
+While the pending-delta or tombstone set for a cagra index exceeds
+`cuvs.rebuild_threshold`, `cuvs.max_delta_rows`, or another configured resource
+limit, the pg_cuvs extension shall stop using GPU+delta correction and fall back
+to CPU until a successful REINDEX or explicit rebuild policy restores a compact
+base index.
 ```
 
 ---

@@ -533,15 +533,16 @@ fi
 stop_test_daemon
 psql -d "$DB" -c "DROP TABLE IF EXISTS it_items;" >/dev/null 2>&1 || true
 
-# --- Scenario 10: staleness persists across daemon restart -------------------
-# DELETE+VACUUM (ambulkdelete) marks the index stale; the .stale sidecar must
-# keep it stale after a daemon restart; REINDEX clears it. (Phase 3A: INSERT no
-# longer marks stale — it appends to the .delta sidecar; see Scenario 15.)
+# --- Scenario 10: fail-closed staleness persists across daemon restart --------
+# DELETE+VACUUM normally records tombstones; when that path is unavailable or
+# unsafe, ambulkdelete marks the index stale. This scenario keeps coverage for
+# the .stale sidecar persistence contract; INSERT no longer marks stale because
+# it appends to .delta instead (see Scenario 15).
 echo "[it] --- scenario 10: staleness + .stale persistence ---"
 fresh_fixture
 start_test_daemon
 run_sql "CREATE INDEX it_st ON it_items USING cagra (embedding vector_l2_ops);" >/dev/null
-run_sql "DELETE FROM it_items WHERE id = 8; VACUUM it_items;" >/dev/null   # ambulkdelete -> mark stale
+run_sql "DELETE FROM it_items WHERE id = 8; VACUUM it_items;" >/dev/null   # ambulkdelete -> tombstone or stale fallback
 st_query() {
     psql -d "$DB" -At 2>/dev/null <<SQL | tail -1
 SET cuvs.socket_path='$TEST_SOCK';
@@ -576,9 +577,9 @@ run_sql "EXPLAIN (COSTS OFF) SELECT id FROM it_big ORDER BY embedding <-> '[5,35
 echo "$OUT" | grep -q "it_big_cagra" \
     && pass "stale-reroute: fresh planner picks cagra (test is non-vacuous)" \
     || fail "stale-reroute: fresh planner did not pick cagra (table too small?): $OUT"
-# DELETE + VACUUM (ambulkdelete) marks it stale; the same query must now avoid
-# the GPU path and return correct CPU results — not the empty result a stale
-# cagra scan gives. (Phase 3A: INSERT no longer marks stale; only DELETE does.)
+# DELETE + VACUUM may force the stale fallback when tombstone correction is not
+# usable; the same query must then avoid the GPU path and return correct CPU
+# results, not the empty result a stale cagra scan gives.
 # Delete a large fraction (> id 50000, keeping id 5): VACUUM bypasses index
 # vacuuming when dead tuples touch < ~2% of pages, so a tiny delete on a big
 # table would not call ambulkdelete at all (see PLAN Phase 2 staleness note).

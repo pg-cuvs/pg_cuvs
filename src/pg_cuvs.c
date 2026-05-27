@@ -1551,7 +1551,8 @@ done:
  * — no rebuild, no stale reroute. The daemon is NOT told stale, so it keeps
  * serving the base search. Fail closed: on any delta error (or the delta cap),
  * mark the index stale so the planner routes to CPU and the row is never lost.
- * DELETE/VACUUM still mark stale via ambulkdelete (Phase 3A defers tombstones). */
+ * DELETE/VACUUM use the tombstone path via ambulkdelete, with stale as the
+ * fail-closed fallback when tombstones cannot be recorded safely. */
 static bool
 cuvs_aminsert(Relation indexRel, Datum *values, bool *isnull,
               ItemPointer heap_tid, Relation heapRel,
@@ -1759,8 +1760,8 @@ cuvsamhandler(PG_FUNCTION_ARGS)
 
     amroutine->ambuild           = cuvs_ambuild;
     amroutine->ambuildempty      = cuvs_ambuildempty;
-    amroutine->aminsert          = cuvs_aminsert;     /* marks index stale */
-    amroutine->ambulkdelete      = cuvs_ambulkdelete; /* marks index stale */
+    amroutine->aminsert          = cuvs_aminsert;     /* appends pending delta */
+    amroutine->ambulkdelete      = cuvs_ambulkdelete; /* tombstone or stale fallback */
     amroutine->amvacuumcleanup   = cuvs_amvacuumcleanup;
 
     amroutine->ambeginscan       = cuvs_beginscan;
