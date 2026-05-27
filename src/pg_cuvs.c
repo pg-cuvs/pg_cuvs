@@ -1280,7 +1280,11 @@ cuvs_delta_append(Relation indexRel, uint64_t tid, const float *vec, int dim,
 
     fd = OpenTransientFile(path, O_RDWR | O_CREAT | PG_BINARY);
     if (fd < 0)
+    {
+        ereport(WARNING, (errmsg("pg_cuvs DBG: delta open failed path=%s errno=%d (%s)",
+                                 path, errno, strerror(errno))));
         return false;
+    }
     /* Serialize concurrent appends from other backends (O_CREAT does not
      * truncate, so racing creators share one file; flock orders the writes). */
     if (flock(fd, LOCK_EX) != 0)
@@ -1330,6 +1334,10 @@ cuvs_delta_append(Relation indexRel, uint64_t tid, const float *vec, int dim,
     ok = true;
 
 done:
+    if (!ok)
+        ereport(WARNING, (errmsg("pg_cuvs DBG: delta append failed after open "
+                                 "fsize=%ld n_rows=%ld errno=%d (%s)",
+                                 (long) fsize, (long) hdr.n_rows, errno, strerror(errno))));
     flock(fd, LOCK_UN);
     CloseTransientFile(fd);
     return ok;
