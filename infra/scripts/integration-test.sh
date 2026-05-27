@@ -911,7 +911,9 @@ SELECT (SELECT oid FROM pg_database WHERE datname=current_database())
        || '_' || 'sc15_cagra'::regclass::oid || '.delta';
 SQL
 )
-truncate -s 10 "$TEST_IDX/$SC15_DELTA" 2>/dev/null || true
+# The .delta is written by the postgres backend (mode 0600), so corrupt it via
+# sudo — the test runner (ubuntu) cannot write a postgres-owned file directly.
+sudo truncate -s 10 "$TEST_IDX/$SC15_DELTA" 2>/dev/null || true
 run_sql "EXPLAIN (COSTS OFF) SELECT id FROM sc15 ORDER BY embedding <-> '[2000,2000,2000,2000]'::vector LIMIT 1;"
 echo "$OUT" | grep -q "Seq Scan" \
     && pass "sc15: corrupt .delta reroutes to Seq Scan (gate fail-closed)" \
