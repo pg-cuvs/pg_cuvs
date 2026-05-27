@@ -24,8 +24,9 @@
 #                       (never errors) and the backend survives.
 #   9. opclass metric + cuvs.k -> cosine index reports metric=cosine; cuvs.k
 #                       flows through to the daemon's requested_k.
-#  10. staleness -> a heap write marks the index stale; .stale survives a daemon
-#                       restart; REINDEX clears it.
+#  10. delete correction -> normal DELETE+VACUUM uses tombstones without stale;
+#                       stale fallback still persists across daemon restart when
+#                       tombstones are disabled/unavailable; REINDEX clears it.
 #  11. build memory cap -> an oversized build ERRORs (fail-fast, catalog rollback,
 #                       daemon untouched); a normal build under a high cap succeeds.
 #  12. VRAM tiered cache -> a small budget forces LRU eviction on build and reload
@@ -533,16 +534,15 @@ fi
 stop_test_daemon
 psql -d "$DB" -c "DROP TABLE IF EXISTS it_items;" >/dev/null 2>&1 || true
 
-# --- Scenario 10: fail-closed staleness persists across daemon restart --------
-# DELETE+VACUUM normally records tombstones; when that path is unavailable or
-# unsafe, ambulkdelete marks the index stale. This scenario keeps coverage for
-# the .stale sidecar persistence contract; INSERT no longer marks stale because
-# it appends to .delta instead (see Scenario 15).
-echo "[it] --- scenario 10: staleness + .stale persistence ---"
+# --- Scenario 10: tombstones + fail-closed stale fallback --------------------
+# DELETE+VACUUM normally records tombstones and keeps the base CAGRA usable.
+# When tombstone correction is disabled/unavailable, ambulkdelete marks the
+# index stale; the .stale sidecar must survive daemon restart and REINDEX clears
+# it. INSERT no longer marks stale because it appends to .delta (see Sc 15).
+echo "[it] --- scenario 10: tombstones + stale fallback persistence ---"
 fresh_fixture
 start_test_daemon
 run_sql "CREATE INDEX it_st ON it_items USING cagra (embedding vector_l2_ops);" >/dev/null
-run_sql "DELETE FROM it_items WHERE id = 8; VACUUM it_items;" >/dev/null   # ambulkdelete -> tombstone or stale fallback
 st_query() {
     psql -d "$DB" -At 2>/dev/null <<SQL | tail -1
 SET cuvs.socket_path='$TEST_SOCK';
@@ -550,9 +550,18 @@ SET cuvs.index_dir='$TEST_IDX';
 SELECT stale FROM pg_stat_gpu_search WHERE index_oid='it_st'::regclass;
 SQL
 }
-[ "$(st_query)" = "t" ] && pass "stale: DELETE+VACUUM marked index stale" \
-    || fail "stale: DELETE+VACUUM did not mark stale (got '$(st_query)')"
-# Restart the daemon — .stale sidecar must survive.
+# Normal Phase 3A-4 path: ambulkdelete records a tombstone, not .stale.
+run_sql "DELETE FROM it_items WHERE id = 8; VACUUM it_items;" >/dev/null
+[ "$(st_query)" = "f" ] && pass "tombstone: DELETE+VACUUM kept index non-stale" \
+    || fail "tombstone: DELETE+VACUUM unexpectedly marked stale (got '$(st_query)')"
+# Force stale fallback by disabling the tombstone/delta cap for this backend.
+run_sql "REINDEX INDEX it_st;
+SET cuvs.max_delta_rows = 0;
+DELETE FROM it_items WHERE id = 7;
+VACUUM it_items;" >/dev/null
+[ "$(st_query)" = "t" ] && pass "stale: tombstone-disabled DELETE+VACUUM marked index stale" \
+    || fail "stale: tombstone-disabled DELETE+VACUUM did not mark stale (got '$(st_query)')"
+# Restart the daemon — fallback .stale sidecar must survive.
 stop_test_daemon
 start_test_daemon
 [ "$(st_query)" = "t" ] && pass "stale: persisted across daemon restart (.stale)" \
