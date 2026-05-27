@@ -66,11 +66,14 @@ echo "before: l2=[$BEFORE] cos=[$BEFORE_COS] ip=[$BEFORE_IP]"
 
 echo "[e2e] inspect newest .tids header magic (expect 'TIDS' = 54 49 44 53 LE)"
 # Newest .tids = the index we just built. Older files may be legacy-format.
-TIDS=$(ls -t "$IDX_DIR"/*.tids 2>/dev/null | head -1)
+# The index dir is owned by postgres (mode 0700) — the daemon and the PG backend
+# both run as postgres — so this script (run as the deploy user) must use sudo to
+# list and read the artifacts.
+TIDS=$(sudo sh -c "ls -t '$IDX_DIR'/*.tids 2>/dev/null" | head -1)
 MAGIC_OK=0
 if [ -n "$TIDS" ]; then
-    xxd -l 8 "$TIDS"
-    if [ "$(xxd -l 4 -p "$TIDS")" = "54494453" ]; then
+    sudo xxd -l 8 "$TIDS"
+    if [ "$(sudo xxd -l 4 -p "$TIDS")" = "54494453" ]; then
         MAGIC_OK=1
         echo "[e2e] .tids magic OK (versioned+crc32 header)"
     else
