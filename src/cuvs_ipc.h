@@ -78,6 +78,8 @@ typedef struct CuvsReplyHeader {
     uint32_t status;        /* CUVS_STATUS_* */
     uint32_t n_results;
     uint32_t latency_us;
+    uint32_t delta_merged;  /* 1 if the daemon already merged the .delta into results
+                             * (Phase 3B); backend then skips its CPU merge */
     char     error[128];
 } CuvsReplyHeader;
 
@@ -145,7 +147,8 @@ int cuvs_ipc_search(
     uint64_t     *tids_out,
     float        *dist_out,
     int          *n_out,
-    uint32_t     *latency_us_out   /* daemon-reported wall-clock; 0 if unknown */
+    uint32_t     *latency_us_out,  /* daemon-reported wall-clock; 0 if unknown */
+    int          *delta_merged_out /* OUT: 1 if daemon merged .delta (may be NULL) */
 );
 
 /*

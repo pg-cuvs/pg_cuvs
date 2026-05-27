@@ -23,6 +23,7 @@ typedef struct CuvsSearchResult {
  * dim          — vector dimension
  * top_k        — number of results to return
  * results      — caller-allocated array of CuvsSearchResult[top_k]
+ * metric       — CUVS_METRIC_* (see cuvs_ipc.h)
  *
  * Returns 0 on success, non-zero on failure.
  */
@@ -32,8 +33,38 @@ int cuvs_brute_force_search(
     int64_t         n_corpus,
     int             dim,
     int             top_k,
+    uint32_t        metric,
     CuvsSearchResult *results
 );
+
+/*
+ * Resident brute-force index (Phase 3B delta cache).
+ *
+ * cuvs_bf_build uploads the corpus once and keeps it device-resident inside an
+ * opaque handle, so repeated searches reuse it (build-once / search-many). Used
+ * by the daemon to hold a per-index GPU brute-force index over the pending
+ * `.delta` vectors. metric is a CUVS_METRIC_* value (same scale as the CAGRA
+ * base index). cuvs_bf_search returns 0 on success, 2 on dim mismatch, 1 on
+ * other failure; top_k must be <= the corpus size the index was built with.
+ */
+typedef void *CuvsBfIndex;
+
+CuvsBfIndex cuvs_bf_build(
+    const float *vecs,
+    int64_t      n,
+    int          dim,
+    uint32_t     metric
+);
+
+int cuvs_bf_search(
+    CuvsBfIndex      index,
+    const float     *query_vec,
+    int              dim,
+    int              top_k,
+    CuvsSearchResult *results
+);
+
+void cuvs_bf_free(CuvsBfIndex index);
 
 /*
  * cuvs_cagra_build / cuvs_cagra_search

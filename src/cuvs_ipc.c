@@ -214,15 +214,17 @@ cuvs_ipc_search(
     uint64_t     *tids_out,
     float        *dist_out,
     int          *n_out,
-    uint32_t     *latency_us_out)
+    uint32_t     *latency_us_out,
+    int          *delta_merged_out)
 {
     char shm_key[64];
     int  shm_fd = -1;
     int  sock   = -1;
     int  rc     = CUVS_STATUS_ERROR;
 
-    if (latency_us_out) *latency_us_out = 0;
-    if (n_out)          *n_out = 0;
+    if (latency_us_out)   *latency_us_out = 0;
+    if (n_out)            *n_out = 0;
+    if (delta_merged_out) *delta_merged_out = 0;
 
     make_shm_key(shm_key, sizeof(shm_key));
 
@@ -257,6 +259,8 @@ cuvs_ipc_search(
     rc = (int)hdr.status;
     if (latency_us_out)
         *latency_us_out = hdr.latency_us;
+    if (delta_merged_out)
+        *delta_merged_out = (hdr.delta_merged != 0);
 
     if (hdr.status == CUVS_STATUS_OK && hdr.n_results > 0)
     {

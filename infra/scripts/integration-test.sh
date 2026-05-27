@@ -830,11 +830,13 @@ SC14_ID=$(echo "$SC14_OUT" | grep -E '^[0-9]+$' | tail -1)
 rm -f "$TEST_SOCK"
 psql -d "$DB" -c "DROP TABLE IF EXISTS sc14;" >/dev/null 2>&1 || true
 
-# --- Scenario 15: pending-delta merge (Phase 3A CPU MVP) ----------------------
+# --- Scenario 15: pending-delta merge (Phase 3A CPU MVP + 3B daemon GPU merge) -
 # INSERT/UPDATE after a build append the new vector to the .delta sidecar instead
-# of marking the index stale. The daemon keeps serving the base CAGRA and the
-# backend merges base + CPU-exact delta candidates, so a query sees the new rows
-# without a rebuild. REINDEX absorbs the delta; a corrupt delta reroutes to CPU.
+# of marking the index stale. Phase 3B: the daemon replays .delta into a resident
+# GPU brute-force cache and merges it with the base CAGRA inside handle_search, so
+# a query sees the new rows without a rebuild and without backend CPU work. The
+# result must match pgvector ground truth (L2 here; cosine/IP below). REINDEX
+# absorbs the delta; a corrupt delta reroutes to CPU.
 echo ""
 echo "[it] --- Scenario 15: pending-delta merge (Phase 3A) ---"
 
@@ -928,8 +930,63 @@ SQL
     && pass "sc15: corrupt-delta query returns correct CPU result (id=10000002)" \
     || fail "sc15: corrupt-delta wrong result (got '$SC15_CORRUPT', want 10000002)"
 
+# Confirm the daemon actually built a resident GPU delta cache (i.e. it took the
+# GPU-merge path, not a silent CPU fallback). LOG_INFO is unconditional.
+grep -q "delta cache .* built" /tmp/pg_cuvs_test_daemon.log \
+    && pass "sc15: daemon built a resident GPU delta cache (GPU-merge path taken)" \
+    || fail "sc15: daemon never built a delta cache (GPU merge not exercised)"
+
+# Phase 3B: the daemon-side GPU merge must match pgvector ground truth for cosine
+# and IP too (not just L2). Small tables + enable_seqscan=off force the cagra
+# path so the daemon merges the .delta on the GPU; the probe makes the pending
+# row the unique nearest, and GPU result must equal the enable_cuvs=off result.
+run_sql "
+DROP TABLE IF EXISTS sc15c;
+CREATE TABLE sc15c (id bigint, embedding vector(4));
+INSERT INTO sc15c VALUES (1,'[1,0,0,0]'),(2,'[0,1,0,0]'),(3,'[0,0,1,0]'),(4,'[0,0,0,1]');
+CREATE INDEX sc15c_cagra ON sc15c USING cagra (embedding vector_cosine_ops);
+INSERT INTO sc15c VALUES (99,'[0.5,0.5,0,0]');
+DROP TABLE IF EXISTS sc15i;
+CREATE TABLE sc15i (id bigint, embedding vector(4));
+INSERT INTO sc15i VALUES (1,'[1,0,0,0]'),(2,'[0,1,0,0]'),(3,'[0,0,1,0]'),(4,'[0,0,0,1]');
+CREATE INDEX sc15i_cagra ON sc15i USING cagra (embedding vector_ip_ops);
+INSERT INTO sc15i VALUES (99,'[2,2,0,0]');" >/dev/null \
+    || fail "sc15: cosine/ip setup failed: $OUT"
+
+SC15COS_GPU=$(psql -d "$DB" -At 2>/dev/null <<SQL | tail -1
+SET cuvs.socket_path='$TEST_SOCK';
+SET cuvs.index_dir='$TEST_IDX';
+SET enable_seqscan=off;
+SELECT id FROM sc15c ORDER BY embedding <=> '[0.5,0.5,0,0]'::vector LIMIT 1;
+SQL
+)
+SC15COS_CPU=$(psql -d "$DB" -At 2>/dev/null <<SQL | tail -1
+SET enable_cuvs=off;
+SELECT id FROM sc15c ORDER BY embedding <=> '[0.5,0.5,0,0]'::vector LIMIT 1;
+SQL
+)
+[ "$SC15COS_GPU" = "99" ] && [ "$SC15COS_GPU" = "$SC15COS_CPU" ] \
+    && pass "sc15: cosine daemon GPU merge matches ground truth (id=99)" \
+    || fail "sc15: cosine GPU ($SC15COS_GPU) != CPU ($SC15COS_CPU) / want 99"
+
+SC15IP_GPU=$(psql -d "$DB" -At 2>/dev/null <<SQL | tail -1
+SET cuvs.socket_path='$TEST_SOCK';
+SET cuvs.index_dir='$TEST_IDX';
+SET enable_seqscan=off;
+SELECT id FROM sc15i ORDER BY embedding <#> '[1,1,0,0]'::vector LIMIT 1;
+SQL
+)
+SC15IP_CPU=$(psql -d "$DB" -At 2>/dev/null <<SQL | tail -1
+SET enable_cuvs=off;
+SELECT id FROM sc15i ORDER BY embedding <#> '[1,1,0,0]'::vector LIMIT 1;
+SQL
+)
+[ "$SC15IP_GPU" = "99" ] && [ "$SC15IP_GPU" = "$SC15IP_CPU" ] \
+    && pass "sc15: IP daemon GPU merge matches ground truth (id=99)" \
+    || fail "sc15: IP GPU ($SC15IP_GPU) != CPU ($SC15IP_CPU) / want 99"
+
 stop_test_daemon
-psql -d "$DB" -c "DROP TABLE IF EXISTS sc15;" >/dev/null 2>&1 || true
+psql -d "$DB" -c "DROP TABLE IF EXISTS sc15; DROP TABLE IF EXISTS sc15c; DROP TABLE IF EXISTS sc15i;" >/dev/null 2>&1 || true
 
 echo "[it] === summary ==="
 if [ "$FAILED" = "0" ]; then

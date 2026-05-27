@@ -1070,6 +1070,7 @@ cuvs_gettuple(IndexScanDesc scan, ScanDirection dir)
         uint32_t metric = cuvs_index_metric(scan->indexRelation);
 
         uint32_t latency_us = 0;
+        int      delta_merged = 0;
         int rc = cuvs_ipc_search(
             cuvs_socket_path,
             (uint32_t)MyDatabaseId,
@@ -1079,7 +1080,8 @@ cuvs_gettuple(IndexScanDesc scan, ScanDirection dir)
             ss->tids,
             ss->distances,
             &ss->n_results,
-            &latency_us);
+            &latency_us,
+            &delta_merged);
 
         if (rc != CUVS_STATUS_OK)
         {
@@ -1169,10 +1171,11 @@ cuvs_gettuple(IndexScanDesc scan, ScanDirection dir)
         cuvs_circuit_record_success((uint32_t)index_oid);
         ss->cur = 0;
 
-        /* Phase 3A: merge pending-insert delta vectors (CPU-exact) into the base
-         * candidate set so INSERT/UPDATE since the build are reflected without a
-         * rebuild. No-op when delta is disabled or absent. */
-        if (cuvs_max_delta_rows > 0)
+        /* Phase 3B: the daemon merges the .delta on the GPU when it can; skip the
+         * CPU merge then. Otherwise (daemon delta unavailable — VRAM short or a
+         * generation race) fall back to the Phase 3A CPU-exact merge so pending
+         * INSERT/UPDATE rows are still reflected without a rebuild. */
+        if (cuvs_max_delta_rows > 0 && !delta_merged)
             cuvs_merge_delta(ss, index_oid, qvec->x, dim, k, metric);
 
         /* Record per-search stats for pg_cuvs_last_search_* and EXPLAIN. */

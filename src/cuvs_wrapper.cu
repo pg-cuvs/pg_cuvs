@@ -106,6 +106,26 @@ struct CuvsCagraIndexImpl {
     {}
 };
 
+/* Forward decl: defined below, but cuvs_brute_force_search / cuvs_bf_build (above
+ * the definition) need the metric -> cuVS DistanceType mapping. */
+static cuvs::distance::DistanceType cuvs_distance_type(uint32_t metric);
+
+/* Opaque resident brute-force index (Phase 3B delta cache). Like CAGRA, the
+ * dataset must outlive the index, so we retain d_corpus alongside it; n bounds
+ * a defensive top_k clamp (brute_force cannot return more than the corpus). */
+struct CuvsBfIndexImpl {
+    raft::device_matrix<float, int64_t>     dataset;
+    cuvs::neighbors::brute_force::index<float> idx;
+    int     dim;
+    int64_t n;
+
+    CuvsBfIndexImpl(raft::device_matrix<float, int64_t> &&d,
+                    cuvs::neighbors::brute_force::index<float> &&i,
+                    int dm, int64_t nn)
+        : dataset(std::move(d)), idx(std::move(i)), dim(dm), n(nn)
+    {}
+};
+
 /* ----------------------------------------------------------------
  * GPU availability check
  * ---------------------------------------------------------------- */
@@ -139,6 +159,7 @@ cuvs_brute_force_search(
     int64_t           n_corpus,
     int               dim,
     int               top_k,
+    uint32_t          metric,
     CuvsSearchResult *results)
 {
     PooledRes _pr;
@@ -157,7 +178,7 @@ cuvs_brute_force_search(
         auto index = cuvs::neighbors::brute_force::build(
             res,
             raft::make_const_mdspan(d_corpus.view()),
-            cuvs::distance::DistanceType::L2Expanded);
+            cuvs_distance_type(metric));
 
         cuvs::neighbors::brute_force::search(
             res, index,
@@ -182,6 +203,107 @@ cuvs_brute_force_search(
         _pr.poison();
         return 1;
     }
+}
+
+/* ----------------------------------------------------------------
+ * Resident brute-force index (Phase 3B delta cache): build once, search many.
+ * ---------------------------------------------------------------- */
+extern "C" CuvsBfIndex
+cuvs_bf_build(const float *vecs, int64_t n, int dim, uint32_t metric)
+{
+    PooledRes _pr;
+    try {
+        raft::device_resources &res = _pr.get();
+
+        /* Upload corpus once; retained in the impl so the index's view stays
+         * valid for the handle's lifetime (mirror of the CAGRA dataset rule). */
+        auto d_corpus = raft::make_device_matrix<float, int64_t>(res, n, (int64_t)dim);
+        raft::copy(d_corpus.data_handle(), vecs, n * dim, res.get_stream());
+        res.sync_stream();
+
+        auto idx = cuvs::neighbors::brute_force::build(
+            res,
+            raft::make_const_mdspan(d_corpus.view()),
+            cuvs_distance_type(metric));
+        res.sync_stream();
+
+        return new CuvsBfIndexImpl(std::move(d_corpus), std::move(idx), dim, n);
+    } catch (const std::exception &e) {
+        fprintf(stderr, "[cuvs_bf_build] exception: %s\n", e.what());
+        _pr.poison();
+        return nullptr;
+    } catch (...) {
+        fprintf(stderr, "[cuvs_bf_build] unknown exception\n");
+        _pr.poison();
+        return nullptr;
+    }
+}
+
+extern "C" int
+cuvs_bf_search(
+    CuvsBfIndex       index,
+    const float      *query_vec,
+    int               dim,
+    int               top_k,
+    CuvsSearchResult *results)
+{
+    if (!index)
+        return 1;
+
+    CuvsBfIndexImpl *impl = static_cast<CuvsBfIndexImpl *>(index);
+    if (dim != impl->dim)
+        return 2;
+    /* brute_force cannot return more neighbors than the corpus holds. */
+    if ((int64_t)top_k > impl->n)
+        top_k = (int)impl->n;
+    if (top_k <= 0)
+        return 0;
+
+    PooledRes _pr;
+    try {
+        raft::device_resources &res = _pr.get();
+
+        auto d_queries = raft::make_device_matrix<float, int64_t>(res, (int64_t)1, (int64_t)dim);
+        raft::copy(d_queries.data_handle(), query_vec, dim, res.get_stream());
+
+        auto d_indices   = raft::make_device_matrix<int64_t, int64_t>(res, 1, top_k);
+        auto d_distances = raft::make_device_matrix<float,   int64_t>(res, 1, top_k);
+
+        cuvs::neighbors::brute_force::search(
+            res, impl->idx,
+            raft::make_const_mdspan(d_queries.view()),
+            d_indices.view(),
+            d_distances.view());
+
+        res.sync_stream();
+
+        std::vector<int64_t> h_indices(top_k);
+        std::vector<float>   h_distances(top_k);
+        raft::copy(h_indices.data(),   d_indices.data_handle(),   top_k, res.get_stream());
+        raft::copy(h_distances.data(), d_distances.data_handle(), top_k, res.get_stream());
+        res.sync_stream();
+
+        for (int i = 0; i < top_k; i++) {
+            results[i].item_id  = h_indices[i];
+            results[i].distance = h_distances[i];
+        }
+        return 0;
+    } catch (const std::exception &e) {
+        fprintf(stderr, "[cuvs_bf_search] exception: %s\n", e.what());
+        _pr.poison();
+        return 1;
+    } catch (...) {
+        fprintf(stderr, "[cuvs_bf_search] unknown exception\n");
+        _pr.poison();
+        return 1;
+    }
+}
+
+extern "C" void
+cuvs_bf_free(CuvsBfIndex index)
+{
+    if (index)
+        delete static_cast<CuvsBfIndexImpl *>(index);
 }
 
 /* ----------------------------------------------------------------
@@ -396,7 +518,8 @@ cuvs_warmup(void)
             corpus[i] = (float)((i * 2654435761u) % 1000) / 1000.0f;
         CuvsSearchResult out[8];
         /* brute force warms CUDA context / RMM / cuBLAS (gemm) */
-        (void)cuvs_brute_force_search(corpus.data(), query.data(), n, dim, k, out);
+        (void)cuvs_brute_force_search(corpus.data(), query.data(), n, dim, k,
+                                      CUVS_METRIC_L2, out);
         /* cagra build+search warms the CAGRA-specific kernels so the first
          * real cagra query on a freshly booted daemon is not the one that
          * pays kernel load (~100 ms). */
