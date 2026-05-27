@@ -442,17 +442,23 @@ Phase 3C 완료 기준:
 
 #### Phase 3D — Replica / Multi-node Loading + Async Warmup
 
+Delivered scope:
+- daemon startup no longer blocks on GCS hydration. Missing local artifacts are registered as cold entries, the UDS socket opens, and background warmup workers download/load artifacts progressively.
+- fixed-size warmup thread pool with bounded queue and `--warmup-threads` / `cuvs.warmup_threads`.
+- query-time cache miss handling: if a cold artifact is requested before warmup completes, the daemon records the miss, queues or requeues warmup, and the backend falls back to CPU until the index becomes hot.
+- `pg_stat_gpu_search` exposes warmup state, last warmup timestamp, warmup duration, download count, and cache miss count for hot and cold entries.
+
 구현 항목:
 - primary에서 build 후 object storage upload.
 - read replica는 heap scan rebuild 없이 object storage에서 download/load.
 - catalog OID, relfilenode 변화, manifest version mapping을 관리한다.
-- daemon startup 시 metadata만 scan하고 hot index를 background prefetch한다.
+- daemon startup 시 metadata만 scan하고 cold index를 background prefetch한다.
 - NVMe cache miss 시 object storage download 후 VRAM promotion한다.
 - warmup 상태와 miss reason을 stats view에 노출한다.
 
 Phase 3D 완료 기준:
 - 새 daemon 또는 read replica가 heap rebuild 없이 object storage snapshot에서 index를 복구한다.
-- startup은 metadata scan으로 빠르게 시작하고, hot artifact는 background warmup으로 적재한다.
+- startup은 metadata scan으로 빠르게 시작하고, cold artifact는 background warmup으로 적재한다.
 - warmup/cache miss/download/reload 상태가 stats view에 노출된다.
 
 #### Phase 3E — Multi-GPU / Sharding

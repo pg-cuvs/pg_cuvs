@@ -367,9 +367,12 @@ heap/table data.
 ```
 Where `cuvs.snapshot_uri` is configured,
 when pg_cuvs_server starts and a local index file is missing from `cuvs.index_dir`,
-the pg_cuvs_server shall download the index from object storage to local NVMe cache
-using io_uring async prefetch before servicing queries, but only after verifying
-that the local PostgreSQL heap is compatible with the manifest's heap identity.
+the pg_cuvs_server shall register the index as cold, open its query socket
+without waiting for object-storage hydration, and download/load the artifact via
+bounded background warmup workers. Queries that arrive before warmup completes
+shall fall back to CPU or requeue warmup rather than observing a partially loaded
+GPU index. Warmup shall only load artifacts whose manifest heap identity is
+compatible with the local PostgreSQL heap.
 ```
 
 **OBJSTORE-03**
@@ -528,3 +531,4 @@ that would become stale before 3E.
 | `cuvs.export_hnsw` | bool | off | CAGRA 빌드 시 HNSW 병행 export |
 | `cuvs.snapshot_uri` | string | '' | Phase 3C object storage root, e.g. `gs://bucket/prefix` (비어있으면 비활성) |
 | `cuvs.cluster_id` | string | '' | Phase 3 멀티노드 식별자 |
+| `cuvs.warmup_threads` | int | 2 | Phase 3D background artifact download/load worker count |
