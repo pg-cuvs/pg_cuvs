@@ -481,6 +481,11 @@ Scope decision:
 - GPU별 VRAM budget, resident index count, search count, evictions, reloads, failures를 추적한다.
 - planner/backend가 CUDA를 직접 touch하지 않는 기존 계약을 유지한다.
 
+3E-1 verified evidence:
+- multi-GPU VM에서 두 physical CAGRA indexes가 서로 다른 GPUs에 resident함을 확인했다: `mgpu_a_cagra -> GPU 0`, `mgpu_b_cagra -> GPU 1`.
+- `pg_stat_gpu_search`는 per-index `gpu_device_id`를 노출하고, `pg_stat_gpu_cache`는 GPU별 `resident_count`/VRAM usage를 별도 row로 반환한다.
+- 이 검증은 index-level placement의 acceptance이며, partitioned logical-table integration과 degraded/failure policy는 3E 후속 subphase에 남긴다.
+
 3E-2 Placement and degraded policy:
 - GPU unavailable, VRAM pressure, placement failure, reload failure를 구분한다.
 - index placement 실패 시 DDL은 명확한 ERROR, SELECT는 CPU fallback 또는 circuit-breaker reroute로 닫는다.
