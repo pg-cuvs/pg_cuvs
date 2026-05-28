@@ -394,7 +394,46 @@ pg_cuvs_server: listening on /tmp/.s.pg_cuvs
 
 ---
 
-### Step 7 — 회귀 테스트
+### Step 7 — E2E smoke test (첫 SELECT 검색)
+
+daemon이 떴으니 실제로 인덱스를 만들고 GPU 검색이 동작하는지 확인한다.
+
+```bash
+ssh $GCP_VM "psql -d postgres" << 'EOF'
+CREATE EXTENSION IF NOT EXISTS vector;
+CREATE EXTENSION IF NOT EXISTS pg_cuvs;
+SELECT amname FROM pg_am WHERE amname = 'cagra';
+CREATE TABLE _smoke (id int, v vector(4));
+INSERT INTO _smoke VALUES (1,'[1,0,0,0]'),(2,'[0,1,0,0]'),(3,'[0,0,1,0]'),(4,'[0,0,0,1]');
+CREATE INDEX ON _smoke USING cagra (v vector_l2_ops);
+SET cuvs.debug = on;
+SELECT id FROM _smoke ORDER BY v <-> '[1,0,0,0]'::vector LIMIT 1;
+SET cuvs.debug = off;
+DROP TABLE _smoke;
+EOF
+```
+
+**기대 출력:**
+```
+ amname
+--------
+ cagra
+(1 row)
+
+NOTICE:  pg_cuvs: cagra scan ...
+ id
+----
+  1
+(1 row)
+```
+**→ `id = 1`:** GPU 검색 정상 동작  
+**→ `NOTICE` 없이 결과만 나옴:** CPU fallback 중 — daemon 로그 확인  
+**→ `BUILD failed (status 4)`:** daemon 미기동 → Step 6 재수행  
+**→ `could not load library`:** rpath 문제 → Step 2~3 재빌드
+
+---
+
+### Step 8 — 회귀 테스트
 
 ```bash
 # make gpu-test 가 실제로 하는 것 (Makefile:198):
