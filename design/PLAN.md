@@ -512,6 +512,14 @@ Scope decision:
 - planner shape를 `EXPLAIN (COSTS OFF)`로 기록한다. PostgreSQL이 partition append/merge를 어떻게 구성하는지 문서에 남긴다.
 - multi-GPU VM에서는 child partition indexes가 2개 이상 GPU에 분산 resident해야 한다.
 
+3E-3 verified evidence:
+- `infra/scripts/multigpu-partition-recipe.sql` provides the parent-table query recipe and correctness check; `infra/scripts/benchmark-multigpu.sh` provides the benchmark harness.
+- multi-GPU VM hash partition distribution was balanced: p0 10023 rows, p1 9977 rows.
+- child CAGRA indexes were distributed across GPUs: `recipe_p0_cagra -> GPU 1`, `recipe_p1_cagra -> GPU 0`.
+- parent-table query planned as `Limit -> Merge Append -> Index Scan using recipe_p0_cagra / recipe_p1_cagra`, with no direct child-partition query required.
+- global top-k matched CPU exact (`enable_cuvs=off`) exactly: `{42,1157,1342,3219,13538,14144,14689,16814,17103,19806}`.
+- per-GPU stats moved independently during the parent-table query: GPU 0 hits=2, GPU 1 hits=2.
+
 3E-4 Multi-GPU hardware acceptance:
 - ephemeral 4/8-GPU VM 또는 DGX/HGX급 노드에서 검증한다.
 - 여러 physical CAGRA indexes가 서로 다른 GPUs에 resident함을 stats와 daemon log로 확인한다.
