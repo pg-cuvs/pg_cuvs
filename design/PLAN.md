@@ -678,6 +678,22 @@ Phase 3G 완료 기준:
 - follow-up 3종(shard delta cache, snapshot manifest ext, degraded partial recall)은 명시적으로 3G 범위 밖으로 분리한다.
 - vector-clustering shard assignment은 후속 범위가 아니라 제외 항목이다. 비용은 큰데 3G의 all-shard fanout/CPU global merge 목표에는 직접 기여하지 않는다.
 
+3G-1~3G-4 verified evidence (2026-05-28, single-GPU A100 VM):
+- unit `make test-unit`: 162 passed, 0 failed (incl. 새 `cuvs_auto_shard_count` 12 케이스: fits→1, needs 2/4, n_gpus/max_shards cap, n_vecs/2 floor, cannot-fit→0).
+- PG regression(smoke/cpu_fallback/edge_cases) 3/3, full integration suite(Scenario 1-20, 새 Scenario 20 포함), e2e durability 모두 green.
+- Scenario 20(단일 GPU, shards co-resident): parallel==sequential==CPU exact(L2/cosine/IP), `cuvs.shard_overfetch=32` correctness 유지, `cuvs.shard_count=0` auto가 fitting index를 unsharded(1)로 resolve, parallel 경로 corrupt-shard fail-closed→CPU. `shard_count<=1`/overfetch 0 default 경로는 3F와 byte-identical.
+
+3G-5 verified evidence (2026-05-28, 2x A100 `a2-highgpu-2g` VM `pg-cuvs-dev-mgpu`, us-central1-f):
+- **auto shard count + GPU spread**: 600K vecs dim 64 (VRAM est 192 MB) under `--max-vram-mb 128`(per-GPU) with `cuvs.shard_count=0` → 데몬 로그 `auto shard count: 600000 vecs dim 64 -> 2 shard(s)`, **shard 0 → GPU 0, shard 1 → GPU 1**(`pg_stat_gpu_shards` distinct_gpus=2, contiguous ranges `[0,300000)`/`[300000,600000)`).
+- **correctness/recall**: clustered 데이터(2048 clusters)에서 sharded parallel top-k == `enable_cuvs=off` CPU exact, recall@10 = **30/30 (1.0)** across 3 queries; query self-vector always #1. (uniform-random 데이터는 CAGRA가 unsharded에서도 recall ~0이라 ANN 한계이지 sharding 결함 아님 — unsharded/sharded 동일 동작 확인.)
+- **parallel == sequential**: `cuvs.parallel_fanout` on/off 결과 set 완전 일치(10/10) — 병렬 dispatch가 결과를 바꾸지 않음.
+- **counters 양쪽 GPU**: 모든 query가 shard 0(GPU 0)·shard 1(GPU 1) `search_count`를 동일하게 증가(예: 800/800).
+- **latency parallel < sequential**: q400 query set 1200 searches A/B(restart로 stats reset), 데몬 측정 평균 latency SEQ **1492 µs** vs PAR **1053 µs**(~30% 감소, sum→max). 주의: `pg_stat_gpu_search.p50`은 log2 버킷이라 둘 다 [1024,2048)→2048로 양자화되어 구분 불가 → 정밀한 `avg_latency_us`(=total/count)로 비교함.
+- **fail-closed(parallel 경로)**: shard 0 `.s000.cagra` 손상 후 reload → `shard 0 artifact crc mismatch ... skip`, logical index 미등록(`pg_stat_gpu_shards` 0 rows), 쿼리는 partial 없이 fail-closed(“cagra index not loaded ... retry will use CPU” ERROR + REINDEX HINT; breaker/`enable_cuvs=off`/REINDEX로 CPU 복구). NOT_FOUND/breaker는 기존 계약이며 3G fanout 변경과 무관.
+- VM stop 후 `TERMINATED` 확인; machine type `a2-highgpu-2g`(2x A100 40GB, ~$7.35/hr on-demand), ~25분 runtime ≈ $3.
+
+Phase 3G status: **COMPLETE**. 3G-1 parallel fanout(safe-by-construction lock-free window), 3G-2 auto VRAM shard count, 3G-3 `cuvs.shard_overfetch`까지 SW 검증(3G-4)과 2x A100 hardware acceptance(3G-5)를 통과했다. sharded `CREATE INDEX`가 GPU별로 동시에 fanout되어 sequential 대비 per-query latency를 낮추고, `cuvs.shard_count=0`이 VRAM 기준으로 shard 수를 자동 결정하며, recall/fail-closed/delta·tombstone 계약을 유지한다. follow-up(shard-aware GPU delta cache, object-snapshot manifest 확장, degraded partial recall)은 별도 phase로 분리한다.
+
 #### Phase 3H — Operational Playbooks / Runbooks
 
 목표:
