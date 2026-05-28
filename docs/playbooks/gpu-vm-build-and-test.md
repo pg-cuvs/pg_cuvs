@@ -370,7 +370,7 @@ make gpu-postinstall
 
 ---
 
-### Step 5.5 — pg_cuvs_server daemon 시작
+### Step 6 — pg_cuvs_server daemon 시작
 
 `gpu-postinstall`은 PostgreSQL만 재시작한다. **daemon은 별도로 시작해야 한다.**
 
@@ -394,7 +394,7 @@ pg_cuvs_server: listening on /tmp/.s.pg_cuvs
 
 ---
 
-### Step 6 — 회귀 테스트
+### Step 7 — 회귀 테스트
 
 ```bash
 # make gpu-test 가 실제로 하는 것 (Makefile:198):
