@@ -112,6 +112,16 @@ typedef struct CuvsTidsHeader {
 /* Standard table-based CRC-32 (IEEE 802.3, reflected, poly 0xEDB88320). */
 uint32_t cuvs_crc32(const void *data, size_t len);
 
+/* Streaming CRC-32 for data that does not fit in one buffer (e.g. a large
+ * .cagra artifact read in chunks). Usage:
+ *     uint32_t s = cuvs_crc32_stream_begin();
+ *     s = cuvs_crc32_stream_update(s, buf, n);   // repeat per chunk
+ *     uint32_t crc = cuvs_crc32_stream_end(s);
+ * cuvs_crc32(d,n) == end(update(begin(), d, n)). */
+uint32_t cuvs_crc32_stream_begin(void);
+uint32_t cuvs_crc32_stream_update(uint32_t state, const void *data, size_t len);
+uint32_t cuvs_crc32_stream_end(uint32_t state);
+
 /* Write header + TID body to an open FILE*. Returns 0 on success, -1 on a
  * short/failed fwrite. Caller is responsible for fflush/fsync/rename. */
 int cuvs_tids_write(FILE *f, int64_t n_vecs, uint32_t dim, uint32_t metric,
@@ -123,6 +133,65 @@ int cuvs_tids_write(FILE *f, int64_t n_vecs, uint32_t dim, uint32_t metric,
  * full body read, and body crc32. On any failure returns -1 and frees only
  * what it allocated (leaving *tids_out NULL). */
 int cuvs_tids_read(FILE *f, CuvsTidsHeader *hdr_out, uint64_t **tids_out);
+
+/* ----------------------------------------------------------------
+ * Versioned, checksummed .shards manifest (Phase 3F multi-GPU sharding).
+ *
+ * Marks a logical CAGRA index as split into N standalone CAGRA shard
+ * artifacts (`<db>_<idx>.s%03u.cagra`), each a contiguous build-order range
+ * of the global `.tids`. The manifest is the commit marker: a build renames
+ * all shard `.cagra` + global `.tids` first, then renames `.shards` last.
+ * Reload refuses a logical sharded index unless the manifest validates AND
+ * its base_tids_crc32 matches the current `.tids` body_crc32 (generation).
+ *
+ * Layout: [CuvsShardsHeader (40 bytes)] [shard_count * CuvsShardRecord (40)].
+ * LITTLE-ENDIAN ONLY, like .tids. The record body has its own crc32 in the
+ * header. cuvs_shards_read also enforces two semantic invariants so a
+ * structurally-valid-but-incoherent manifest fails closed: shard offsets are
+ * contiguous from 0 and the per-shard n_vecs sum to the header n_vecs.
+ * ---------------------------------------------------------------- */
+#define CUVS_SHARDS_MAGIC   0x53524853u   /* 'SHRS' little-endian */
+#define CUVS_SHARDS_VERSION 1u
+#define CUVS_SHARDS_MAX     256           /* sanity cap on shard_count */
+
+typedef struct CuvsShardsHeader {
+    uint32_t magic;
+    uint32_t version;
+    uint32_t shard_count;
+    uint32_t base_tids_crc32;  /* global .tids body_crc32 — generation token */
+    int64_t  n_vecs;           /* total vectors across all shards (== .tids n_vecs) */
+    uint32_t dim;
+    uint32_t metric;
+    uint32_t body_crc32;       /* crc32 over shard_count * CuvsShardRecord */
+    uint32_t reserved;         /* must be 0 */
+} CuvsShardsHeader;            /* 40 bytes, LE-only */
+
+typedef struct CuvsShardRecord {
+    uint32_t shard_id;
+    uint32_t gpu_device_id;    /* GPU assigned at build (advisory; reload re-places) */
+    int64_t  tid_offset;       /* global TID start offset of this shard's [start,end) */
+    int64_t  n_vecs;           /* vectors in this shard */
+    uint32_t dim;
+    uint32_t metric;
+    uint32_t artifact_crc32;   /* crc32 of the shard's .cagra file bytes */
+    uint32_t reserved;         /* must be 0 */
+} CuvsShardRecord;             /* 40 bytes, LE-only */
+
+/* Write manifest header + record body to an open FILE*. Sets magic/version/
+ * body_crc32/reserved internally from (shard_count, n_vecs, dim, metric,
+ * base_tids_crc32, recs). Returns 0 on success, -1 on a short/failed fwrite.
+ * Caller fflush/fsync/renames. */
+int cuvs_shards_write(FILE *f, uint32_t shard_count, int64_t n_vecs,
+                      uint32_t dim, uint32_t metric, uint32_t base_tids_crc32,
+                      const CuvsShardRecord *recs);
+
+/* Read + validate a .shards manifest. On success returns 0, fills *hdr_out,
+ * and allocates *recs_out via malloc (caller frees). Validates magic, version,
+ * reserved==0, shard_count in [1,CUVS_SHARDS_MAX], n_vecs/dim ranges, full
+ * body read, body crc32, AND the semantic invariants (contiguous offsets from
+ * 0, per-shard n_vecs sum == header n_vecs, each record reserved==0). On any
+ * failure returns -1 and leaves *recs_out NULL. */
+int cuvs_shards_read(FILE *f, CuvsShardsHeader *hdr_out, CuvsShardRecord **recs_out);
 
 /* ----------------------------------------------------------------
  * Versioned .delta pending-insert sidecar (Phase 3A).

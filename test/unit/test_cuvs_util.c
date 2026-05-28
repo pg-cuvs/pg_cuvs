@@ -91,6 +91,13 @@ test_parse_index_filename(void)
     db = ix = 999;
     ASSERT(cuvs_parse_index_filename("0_0.cagra", &db, &ix) == 0, "zero oids parse");
     ASSERT(db == 0 && ix == 0, "zero oids values");
+
+    /* Phase 3F: shard artifacts ("<db>_<idx>.sNNN.cagra") must NOT be parsed as
+     * an unsharded index, even though they end in ".cagra". */
+    ASSERT(cuvs_parse_index_filename("16384_24576.s000.cagra", &db, &ix) == -1,
+           "reject shard artifact .s000.cagra");
+    ASSERT(cuvs_parse_index_filename("1_2.s015.cagra", &db, &ix) == -1,
+           "reject shard artifact .s015.cagra");
 }
 
 static void
@@ -314,6 +321,200 @@ test_tids_rejections(void)
     }
 }
 
+/* Build a coherent 3-shard manifest covering [0,100): 40 + 35 + 25. */
+static void
+make_good_shards(CuvsShardRecord recs[3], uint32_t dim, uint32_t metric)
+{
+    int64_t sizes[3] = { 40, 35, 25 };
+    int64_t off = 0;
+    for (uint32_t i = 0; i < 3; i++)
+    {
+        recs[i].shard_id      = i;
+        recs[i].gpu_device_id = i % 2;
+        recs[i].tid_offset    = off;
+        recs[i].n_vecs        = sizes[i];
+        recs[i].dim           = dim;
+        recs[i].metric        = metric;
+        recs[i].artifact_crc32 = 0xA5A50000u + i;
+        recs[i].reserved      = 0;
+        off += sizes[i];
+    }
+}
+
+static void
+test_shards_roundtrip(void)
+{
+    const uint32_t dim = 128, metric = CUVS_METRIC_L2;
+    const int64_t  n = 100;
+    CuvsShardRecord recs[3];
+    make_good_shards(recs, dim, metric);
+
+    FILE *f = tmpfile();
+    ASSERT(f != NULL, "shards tmpfile open");
+    ASSERT(cuvs_shards_write(f, 3, n, dim, metric, 0xDEADBEEFu, recs) == 0,
+           "shards_write ok");
+    rewind(f);
+
+    CuvsShardsHeader hdr;
+    CuvsShardRecord *out = NULL;
+    ASSERT(cuvs_shards_read(f, &hdr, &out) == 0, "shards_read ok");
+    ASSERT(hdr.magic == CUVS_SHARDS_MAGIC, "rt shards magic");
+    ASSERT(hdr.version == CUVS_SHARDS_VERSION, "rt shards version");
+    ASSERT(hdr.shard_count == 3, "rt shard_count");
+    ASSERT(hdr.base_tids_crc32 == 0xDEADBEEFu, "rt base generation token");
+    ASSERT(hdr.n_vecs == n, "rt n_vecs");
+    ASSERT(hdr.dim == dim, "rt dim");
+    ASSERT(hdr.metric == metric, "rt metric");
+    ASSERT(hdr.reserved == 0, "rt shards reserved zero");
+    if (out)
+    {
+        ASSERT(out[1].tid_offset == 40, "rt shard1 offset");
+        ASSERT(out[2].tid_offset == 75, "rt shard2 offset");
+        ASSERT(out[2].n_vecs == 25, "rt shard2 n_vecs");
+        ASSERT(memcmp(out, recs, sizeof(recs)) == 0, "rt shard records identity");
+        free(out);
+    }
+    fclose(f);
+}
+
+static void
+test_shards_rejections(void)
+{
+    const uint32_t dim = 16, metric = CUVS_METRIC_L2;
+    const int64_t  n = 100;
+    CuvsShardRecord recs[3];
+
+    /* bad magic */
+    {
+        FILE *f = tmpfile();
+        make_good_shards(recs, dim, metric);
+        cuvs_shards_write(f, 3, n, dim, metric, 0, recs);
+        rewind(f);
+        uint32_t bad = 0xDEADBEEFu;
+        fwrite(&bad, sizeof(bad), 1, f);
+        rewind(f);
+        CuvsShardsHeader h; CuvsShardRecord *o = NULL;
+        ASSERT(cuvs_shards_read(f, &h, &o) == -1, "reject bad magic");
+        ASSERT(o == NULL, "bad magic leaves out NULL");
+        fclose(f);
+    }
+
+    /* bad version */
+    {
+        FILE *f = tmpfile();
+        make_good_shards(recs, dim, metric);
+        cuvs_shards_write(f, 3, n, dim, metric, 0, recs);
+        fseek(f, offsetof(CuvsShardsHeader, version), SEEK_SET);
+        uint32_t badv = 999u;
+        fwrite(&badv, sizeof(badv), 1, f);
+        rewind(f);
+        CuvsShardsHeader h; CuvsShardRecord *o = NULL;
+        ASSERT(cuvs_shards_read(f, &h, &o) == -1, "reject bad version");
+        fclose(f);
+    }
+
+    /* shard_count == 0 */
+    {
+        FILE *f = tmpfile();
+        make_good_shards(recs, dim, metric);
+        cuvs_shards_write(f, 3, n, dim, metric, 0, recs);
+        fseek(f, offsetof(CuvsShardsHeader, shard_count), SEEK_SET);
+        uint32_t zero = 0;
+        fwrite(&zero, sizeof(zero), 1, f);
+        rewind(f);
+        CuvsShardsHeader h; CuvsShardRecord *o = NULL;
+        ASSERT(cuvs_shards_read(f, &h, &o) == -1, "reject shard_count==0");
+        fclose(f);
+    }
+
+    /* shard_count > MAX */
+    {
+        FILE *f = tmpfile();
+        make_good_shards(recs, dim, metric);
+        cuvs_shards_write(f, 3, n, dim, metric, 0, recs);
+        fseek(f, offsetof(CuvsShardsHeader, shard_count), SEEK_SET);
+        uint32_t huge = CUVS_SHARDS_MAX + 1;
+        fwrite(&huge, sizeof(huge), 1, f);
+        rewind(f);
+        CuvsShardsHeader h; CuvsShardRecord *o = NULL;
+        ASSERT(cuvs_shards_read(f, &h, &o) == -1, "reject shard_count>MAX");
+        fclose(f);
+    }
+
+    /* corrupted record body: flip a byte so body crc mismatches */
+    {
+        FILE *f = tmpfile();
+        make_good_shards(recs, dim, metric);
+        cuvs_shards_write(f, 3, n, dim, metric, 0, recs);
+        fseek(f, sizeof(CuvsShardsHeader), SEEK_SET);  /* first record byte */
+        unsigned char b;
+        fread(&b, 1, 1, f);
+        fseek(f, sizeof(CuvsShardsHeader), SEEK_SET);
+        b ^= 0xFFu;
+        fwrite(&b, 1, 1, f);
+        rewind(f);
+        CuvsShardsHeader h; CuvsShardRecord *o = NULL;
+        ASSERT(cuvs_shards_read(f, &h, &o) == -1, "reject body crc mismatch");
+        ASSERT(o == NULL, "crc mismatch frees alloc");
+        fclose(f);
+    }
+
+    /* semantic: non-contiguous offsets (gap) — body crc still valid */
+    {
+        FILE *f = tmpfile();
+        make_good_shards(recs, dim, metric);
+        recs[1].tid_offset = 41;        /* should be 40 -> gap */
+        cuvs_shards_write(f, 3, n, dim, metric, 0, recs);
+        rewind(f);
+        CuvsShardsHeader h; CuvsShardRecord *o = NULL;
+        ASSERT(cuvs_shards_read(f, &h, &o) == -1, "reject non-contiguous offset");
+        ASSERT(o == NULL, "non-contiguous frees alloc");
+        fclose(f);
+    }
+
+    /* semantic: per-shard n_vecs sum != header n_vecs */
+    {
+        FILE *f = tmpfile();
+        make_good_shards(recs, dim, metric);
+        cuvs_shards_write(f, 3, n + 1, dim, metric, 0, recs);  /* sum=100, hdr=101 */
+        rewind(f);
+        CuvsShardsHeader h; CuvsShardRecord *o = NULL;
+        ASSERT(cuvs_shards_read(f, &h, &o) == -1, "reject sum != header n_vecs");
+        fclose(f);
+    }
+
+    /* semantic: out-of-order shard_id */
+    {
+        FILE *f = tmpfile();
+        make_good_shards(recs, dim, metric);
+        recs[0].shard_id = 1; recs[1].shard_id = 0;  /* swapped ids, offsets stay */
+        cuvs_shards_write(f, 3, n, dim, metric, 0, recs);
+        rewind(f);
+        CuvsShardsHeader h; CuvsShardRecord *o = NULL;
+        ASSERT(cuvs_shards_read(f, &h, &o) == -1, "reject out-of-order shard_id");
+        fclose(f);
+    }
+
+    /* truncated record body: header claims 3 shards but only 1 present */
+    {
+        FILE *f = tmpfile();
+        make_good_shards(recs, dim, metric);
+        CuvsShardsHeader h;
+        h.magic = CUVS_SHARDS_MAGIC; h.version = CUVS_SHARDS_VERSION;
+        h.shard_count = 3; h.base_tids_crc32 = 0; h.n_vecs = n;
+        h.dim = dim; h.metric = metric;
+        h.body_crc32 = cuvs_crc32(recs, 3 * sizeof(CuvsShardRecord));
+        h.reserved = 0;
+        fwrite(&h, sizeof(h), 1, f);
+        fwrite(recs, sizeof(CuvsShardRecord), 1, f);   /* short body */
+        rewind(f);
+        CuvsShardsHeader hr; CuvsShardRecord *o = NULL;
+        ASSERT(cuvs_shards_read(f, &hr, &o) == -1, "reject truncated record body");
+        ASSERT(o == NULL, "truncated body frees alloc");
+        fclose(f);
+    }
+}
+
 #ifdef CUVS_TEST_HOOKS
 static void
 test_fault_hook(void)
@@ -458,6 +659,8 @@ main(void)
     test_crc32();
     test_tids_roundtrip();
     test_tids_rejections();
+    test_shards_roundtrip();
+    test_shards_rejections();
     test_delta_format();
     test_lat_histogram();
     test_metric_from_opclass();

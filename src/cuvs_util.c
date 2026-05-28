@@ -18,21 +18,18 @@
 int
 cuvs_parse_index_filename(const char *name, uint32_t *db_oid, uint32_t *index_oid)
 {
-    size_t namelen;
-    const char *suffix = ".cagra";
-    size_t suflen = strlen(suffix);
+    int consumed = 0;
 
     if (!name)
         return -1;
 
-    /* sscanf returns conversion count regardless of literal match — must
-     * also verify the ".cagra" suffix to avoid matching .tids files. */
-    namelen = strlen(name);
-    if (namelen <= suflen)
-        return -1;
-    if (strcmp(name + namelen - suflen, suffix) != 0)
-        return -1;
-    if (sscanf(name, "%u_%u.cagra", db_oid, index_oid) == 2)
+    /* Require the ENTIRE name to match "<db>_<index>.cagra". The %n captures
+     * how many chars were consumed once the ".cagra" literal matches; requiring
+     * consumed == strlen(name) rejects trailing extensions (".cagra.bak") and,
+     * importantly, Phase 3F shard artifacts ("<db>_<idx>.s000.cagra") whose
+     * ".cagra" suffix would otherwise fool a plain suffix check. */
+    if (sscanf(name, "%u_%u.cagra%n", db_oid, index_oid, &consumed) == 2
+        && consumed == (int)strlen(name))
         return 0;
     return -1;
 }
@@ -140,29 +137,52 @@ cuvs_lat_percentile(const uint32_t *buckets, int nbuckets, double q)
  * CRC-32 (IEEE 802.3, reflected, poly 0xEDB88320) and versioned .tids I/O.
  * LE-only: see cuvs_util.h header comment.
  * ---------------------------------------------------------------- */
+static uint32_t crc32_table[256];
+static int      crc32_table_init = 0;
+
+static void
+crc32_ensure_table(void)
+{
+    if (crc32_table_init)
+        return;
+    for (uint32_t i = 0; i < 256; i++)
+    {
+        uint32_t c = i;
+        for (int k = 0; k < 8; k++)
+            c = (c & 1) ? (0xEDB88320u ^ (c >> 1)) : (c >> 1);
+        crc32_table[i] = c;
+    }
+    crc32_table_init = 1;
+}
+
+uint32_t
+cuvs_crc32_stream_begin(void)
+{
+    crc32_ensure_table();
+    return 0xFFFFFFFFu;
+}
+
+uint32_t
+cuvs_crc32_stream_update(uint32_t crc, const void *data, size_t len)
+{
+    const unsigned char *p = (const unsigned char *)data;
+    crc32_ensure_table();
+    for (size_t i = 0; i < len; i++)
+        crc = crc32_table[(crc ^ p[i]) & 0xFFu] ^ (crc >> 8);
+    return crc;
+}
+
+uint32_t
+cuvs_crc32_stream_end(uint32_t crc)
+{
+    return crc ^ 0xFFFFFFFFu;
+}
+
 uint32_t
 cuvs_crc32(const void *data, size_t len)
 {
-    static uint32_t table[256];
-    static int      table_init = 0;
-    const unsigned char *p = (const unsigned char *)data;
-    uint32_t crc = 0xFFFFFFFFu;
-
-    if (!table_init)
-    {
-        for (uint32_t i = 0; i < 256; i++)
-        {
-            uint32_t c = i;
-            for (int k = 0; k < 8; k++)
-                c = (c & 1) ? (0xEDB88320u ^ (c >> 1)) : (c >> 1);
-            table[i] = c;
-        }
-        table_init = 1;
-    }
-
-    for (size_t i = 0; i < len; i++)
-        crc = table[(crc ^ p[i]) & 0xFFu] ^ (crc >> 8);
-    return crc ^ 0xFFFFFFFFu;
+    return cuvs_crc32_stream_end(
+        cuvs_crc32_stream_update(cuvs_crc32_stream_begin(), data, len));
 }
 
 int
@@ -227,6 +247,106 @@ cuvs_tids_read(FILE *f, CuvsTidsHeader *hdr_out, uint64_t **tids_out)
         *hdr_out = hdr;
     *tids_out = tids;
     return 0;
+}
+
+/* ----------------------------------------------------------------
+ * Versioned .shards manifest I/O (Phase 3F multi-GPU sharding).
+ * ---------------------------------------------------------------- */
+int
+cuvs_shards_write(FILE *f, uint32_t shard_count, int64_t n_vecs,
+                  uint32_t dim, uint32_t metric, uint32_t base_tids_crc32,
+                  const CuvsShardRecord *recs)
+{
+    CuvsShardsHeader hdr;
+    size_t body_bytes = (size_t)shard_count * sizeof(CuvsShardRecord);
+
+    hdr.magic           = CUVS_SHARDS_MAGIC;
+    hdr.version         = CUVS_SHARDS_VERSION;
+    hdr.shard_count     = shard_count;
+    hdr.base_tids_crc32 = base_tids_crc32;
+    hdr.n_vecs          = n_vecs;
+    hdr.dim             = dim;
+    hdr.metric          = metric;
+    hdr.body_crc32      = cuvs_crc32(recs, body_bytes);
+    hdr.reserved        = 0;
+
+    if (fwrite(&hdr, sizeof(hdr), 1, f) != 1)
+        return -1;
+    if (fwrite(recs, sizeof(CuvsShardRecord), shard_count, f) != shard_count)
+        return -1;
+    return 0;
+}
+
+int
+cuvs_shards_read(FILE *f, CuvsShardsHeader *hdr_out, CuvsShardRecord **recs_out)
+{
+    CuvsShardsHeader hdr;
+    CuvsShardRecord *recs;
+    size_t body_bytes;
+    int64_t sum_n;
+
+    *recs_out = NULL;
+
+    if (fread(&hdr, sizeof(hdr), 1, f) != 1)
+        return -1;
+    if (hdr.magic != CUVS_SHARDS_MAGIC)
+        return -1;
+    if (hdr.version != CUVS_SHARDS_VERSION)
+        return -1;
+    if (hdr.reserved != 0)
+        return -1;
+    if (hdr.shard_count == 0 || hdr.shard_count > CUVS_SHARDS_MAX)
+        return -1;
+    if (hdr.n_vecs <= 0 || hdr.n_vecs > CUVS_TIDS_MAX_VECS)
+        return -1;
+    if (hdr.dim == 0)
+        return -1;
+
+    body_bytes = (size_t)hdr.shard_count * sizeof(CuvsShardRecord);
+    recs = malloc(body_bytes);
+    if (!recs)
+        return -1;
+
+    if (fread(recs, sizeof(CuvsShardRecord), hdr.shard_count, f) != hdr.shard_count)
+    {
+        free(recs);
+        return -1;
+    }
+    if (cuvs_crc32(recs, body_bytes) != hdr.body_crc32)
+    {
+        free(recs);
+        return -1;
+    }
+
+    /* Semantic invariants: a structurally valid manifest must describe a
+     * complete, gap-free covering of [0, n_vecs). Reject otherwise (fail
+     * closed) so a corrupt/incoherent manifest never yields a partial index. */
+    sum_n = 0;
+    for (uint32_t i = 0; i < hdr.shard_count; i++)
+    {
+        if (recs[i].reserved != 0)
+            goto reject;
+        if (recs[i].shard_id != i)              /* records ordered by shard id */
+            goto reject;
+        if (recs[i].tid_offset != sum_n)        /* contiguous from 0 */
+            goto reject;
+        if (recs[i].n_vecs <= 0 || recs[i].n_vecs > CUVS_TIDS_MAX_VECS)
+            goto reject;
+        if (recs[i].dim != hdr.dim || recs[i].metric != hdr.metric)
+            goto reject;
+        sum_n += recs[i].n_vecs;
+    }
+    if (sum_n != hdr.n_vecs)                     /* full coverage */
+        goto reject;
+
+    if (hdr_out)
+        *hdr_out = hdr;
+    *recs_out = recs;
+    return 0;
+
+reject:
+    free(recs);
+    return -1;
 }
 
 /* ----------------------------------------------------------------
