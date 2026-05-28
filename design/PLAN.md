@@ -731,6 +731,23 @@ Phase 3H 완료 기준:
 - 각 playbook은 최소 하나의 검증된 GPU VM 또는 replica 시나리오를 근거로 한다.
 - Phase 1.5 playbook은 baseline 문서로 유지하고, Phase 3 playbook은 multi-node/multi-GPU 운영 절차를 별도 문서로 둔다.
 
+**3H-light 완료(2026-05-28)**: DiskANN/벤치마크 전에 baseline을 고정. 기존 Phase
+1.5/2 playbook 8종에 더해 Phase 3 표면을 커버하는 4종을 `docs/playbooks/`에 추가하고
+`docs/playbooks/README.md` 색인을 작성했다(6절 형식, 이번 세션 검증 시나리오 근거):
+- `gpu-vm-lifecycle.md` — VM start/stop/reset, ephemeral IP, **stop/start 후 NVIDIA
+  driver mismatch → reset**, GCS용 SA 부착, mgpu start/stop+비용.
+- `multi-gpu-sharding-ops.md` — shard_count(0/1/N), `pg_stat_gpu_shards` 배치,
+  parallel_fanout(+p50 log2-bucket→avg 사용), shard_overfetch, 손상 shard fail-closed→
+  REINDEX, whole-unit eviction+reload.
+- `gcs-snapshot-ops.md` — SA/IAM/bucket, upload→download round-trip 검증, sharded 복원
+  (`.relfilenode` warmup), heap relfilenode 거부. (검증 중 발견·수정한 PUT→POST/JSON
+  공백 버그도 명시.)
+- `drop-and-write-path-diagnosis.md` — DROP 데몬 정리(+재시작 zombie 검증), delta/
+  tombstone/stale, sharded GPU delta cache(delta_search_mode).
+- **3H-full(이후)**: replica bootstrap(true multi-node), DiskANN 운영, capacity-planning
+  수치(벤치마크 의존), release upgrade runbook, benchmark runbook 갱신은 3B/벤치마크
+  이후로 분리.
+
 Phase 3 전체 완료 기준:
 - Phase 3A-3H의 subphase 완료 기준을 모두 만족한다.
 - 각 subphase는 독립적으로 중단/릴리스 가능하며, 다음 subphase 미완료가 이전 subphase의 정합성을 깨지 않는다.
