@@ -178,10 +178,13 @@ static int
 json_get_str(const char *json, const char *key, char *out, size_t out_sz)
 {
     char pat[128];
-    snprintf(pat, sizeof(pat), "\"%s\":\"", key);
+    snprintf(pat, sizeof(pat), "\"%s\":", key);
     const char *p = strstr(json, pat);
     if (!p) return -1;
     p += strlen(pat);
+    while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;  /* tolerate pretty-print ws */
+    if (*p != '"') return -1;
+    p++;                                  /* opening quote */
     size_t i = 0;
     while (*p && *p != '"' && i + 1 < out_sz)
         out[i++] = *p++;
@@ -228,9 +231,12 @@ static const char *
 json_find_obj(const char *json, const char *key)
 {
     char pat[128];
-    snprintf(pat, sizeof(pat), "\"%s\":{", key);
+    snprintf(pat, sizeof(pat), "\"%s\":", key);
     const char *p = strstr(json, pat);
-    return p ? p + strlen(pat) : NULL;
+    if (!p) return NULL;
+    p += strlen(pat);
+    while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;  /* tolerate pretty-print ws */
+    return (*p == '{') ? p + 1 : NULL;
 }
 
 /* ----------------------------------------------------------------
