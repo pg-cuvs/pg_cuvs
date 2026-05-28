@@ -46,6 +46,9 @@ typedef struct CuvsManifest {
     int64_t  cagra_size_bytes;
     char     tids_sha256[65];
     int64_t  tids_size_bytes;
+    uint32_t shard_count;          /* 0/1 = unsharded; >=2 = sharded */
+    char     shards_sha256[65];    /* SHA256 of the .shards manifest file (sharded only) */
+    int64_t  shards_size_bytes;
 } CuvsManifest;
 
 /* ----------------------------------------------------------------
@@ -106,6 +109,39 @@ int cuvs_objstore_download(
     uint32_t    index_oid,
     uint32_t    local_relfilenode,
     uint64_t   *build_timestamp_out  /* may be NULL */
+);
+
+/*
+ * cuvs_objstore_upload_sharded — upload sharded CAGRA artifacts + manifest to GCS.
+ *
+ * Uploads: index.tids, index.shards, index.s000.cagra .. index.sNNN.cagra,
+ * then manifest.json (versioned + latest alias) last for atomicity.
+ * Upload failure is non-fatal (best-effort); returns -1 on any failure.
+ *
+ * GCS paths written:
+ *   gs://<bucket>/<prefix>/pg_cuvs/<cluster>/<db>/<idx>/<ts>/index.tids
+ *   gs://<bucket>/<prefix>/pg_cuvs/<cluster>/<db>/<idx>/<ts>/index.shards
+ *   gs://<bucket>/<prefix>/pg_cuvs/<cluster>/<db>/<idx>/<ts>/index.s000.cagra
+ *   ...
+ *   gs://<bucket>/<prefix>/pg_cuvs/<cluster>/<db>/<idx>/<ts>/manifest.json
+ *   gs://<bucket>/<prefix>/pg_cuvs/<cluster>/<db>/<idx>/latest/manifest.json (alias)
+ *
+ * Returns 0 on success, -1 on any failure.
+ */
+int cuvs_objstore_upload_sharded(
+    const char *snapshot_uri,
+    const char *cluster_id,
+    const char *gcs_key_file,
+    const char *index_dir,        /* dir holding <db>_<idx>.* artifacts */
+    uint32_t    db_oid,
+    uint32_t    table_oid,
+    uint32_t    index_oid,
+    uint32_t    relfilenode,
+    uint32_t    metric,           /* CUVS_METRIC_* */
+    uint32_t    dim,
+    int64_t     vector_count,
+    uint32_t    base_generation,
+    uint32_t    shard_count
 );
 
 /*

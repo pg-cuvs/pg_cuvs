@@ -2069,6 +2069,44 @@ objstore_upload_thread(void *arg)
     return NULL;
 }
 
+/* Phase 3G.2: sharded variant — uploads the whole artifact set (.tids + .shards
+ * + N .sNNN.cagra) located under index_dir. Detached + non-fatal, like the
+ * unsharded path above. */
+typedef struct {
+    char     snapshot_uri[512];
+    char     cluster_id[128];
+    char     gcs_key_file[512];
+    char     index_dir[512];
+    uint32_t db_oid;
+    uint32_t table_oid;
+    uint32_t index_oid;
+    uint32_t relfilenode;
+    uint32_t metric;
+    uint32_t dim;
+    int64_t  vector_count;
+    uint32_t shard_count;
+} ShardedUploadArgs;
+
+static void *
+objstore_upload_sharded_thread(void *arg)
+{
+    ShardedUploadArgs *a = (ShardedUploadArgs *)arg;
+    int rc = cuvs_objstore_upload_sharded(
+        a->snapshot_uri, a->cluster_id, a->gcs_key_file, a->index_dir,
+        a->db_oid, a->table_oid, a->index_oid, a->relfilenode,
+        a->metric, a->dim, a->vector_count,
+        0,   /* base_generation: not tracked at upload time */
+        a->shard_count);
+    if (rc == 0)
+        LOG_INFO("objstore: uploaded sharded index %u/%u (%u shards) to %s\n",
+                 a->db_oid, a->index_oid, a->shard_count, a->snapshot_uri);
+    else
+        LOG_WARN("objstore: sharded upload FAILED for %u/%u (non-fatal, local artifacts intact)\n",
+                 a->db_oid, a->index_oid);
+    free(a);
+    return NULL;
+}
+
 /* ----------------------------------------------------------------
  * Phase 3F: sharded BUILD path (cuvs.shard_count >= 2).
  *
@@ -2376,6 +2414,45 @@ build_sharded(int client_fd, const CuvsCmdFrame *cmd, const char *index_dir,
     CuvsReplyHeader hdr_ok = {0};
     hdr_ok.status = CUVS_STATUS_OK;
     send_all(client_fd, &hdr_ok, sizeof(hdr_ok));
+
+    /* Phase 3G.2: snapshot the whole sharded artifact set to GCS (detached,
+     * non-fatal). The local artifacts are already durable; upload failure only
+     * costs a replica the warmup fast-path. */
+    if (g_snapshot_uri[0] != '\0' && cmd->relfilenode != 0)
+    {
+        ShardedUploadArgs *sa = malloc(sizeof(*sa));
+        if (sa)
+        {
+            strncpy(sa->snapshot_uri, g_snapshot_uri, sizeof(sa->snapshot_uri) - 1);
+            strncpy(sa->cluster_id,   g_cluster_id,   sizeof(sa->cluster_id)   - 1);
+            strncpy(sa->gcs_key_file, g_gcs_key_file, sizeof(sa->gcs_key_file) - 1);
+            strncpy(sa->index_dir,    save_dir,        sizeof(sa->index_dir)    - 1);
+            sa->snapshot_uri[sizeof(sa->snapshot_uri) - 1] = '\0';
+            sa->cluster_id[sizeof(sa->cluster_id) - 1]     = '\0';
+            sa->gcs_key_file[sizeof(sa->gcs_key_file) - 1] = '\0';
+            sa->index_dir[sizeof(sa->index_dir) - 1]       = '\0';
+            sa->db_oid       = cmd->db_oid;
+            sa->table_oid    = cmd->table_oid;
+            sa->index_oid    = cmd->index_oid;
+            sa->relfilenode  = cmd->relfilenode;
+            sa->metric       = cmd->metric;
+            sa->dim          = cmd->dim;
+            sa->vector_count = cmd->n_vecs;
+            sa->shard_count  = (uint32_t) sc;
+
+            pthread_t up_tid;
+            pthread_attr_t up_attr;
+            pthread_attr_init(&up_attr);
+            pthread_attr_setdetachstate(&up_attr, PTHREAD_CREATE_DETACHED);
+            if (pthread_create(&up_tid, &up_attr, objstore_upload_sharded_thread, sa) != 0)
+            {
+                LOG_WARN("objstore: failed to spawn sharded upload thread for %u/%u\n",
+                         cmd->db_oid, cmd->index_oid);
+                free(sa);
+            }
+            pthread_attr_destroy(&up_attr);
+        }
+    }
 }
 
 /* ----------------------------------------------------------------

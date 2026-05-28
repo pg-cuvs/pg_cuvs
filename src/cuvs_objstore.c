@@ -712,34 +712,68 @@ gcs_fetch_string(const char *bucket, const char *object_name, const char *token)
 static void
 manifest_to_json(const CuvsManifest *m, char *out, size_t out_sz)
 {
-    snprintf(out, out_sz,
-        "{\n"
-        "  \"pg_cuvs_version\": \"%s\",\n"
-        "  \"database_oid\": %u,\n"
-        "  \"table_oid\": %u,\n"
-        "  \"index_oid\": %u,\n"
-        "  \"relfilenode\": %u,\n"
-        "  \"base_generation\": %u,\n"
-        "  \"metric\": \"%s\",\n"
-        "  \"dim\": %u,\n"
-        "  \"vector_count\": %lld,\n"
-        "  \"build_timestamp\": %lld,\n"
-        "  \"artifacts\": {\n"
-        "    \"cagra\": {\"sha256\": \"%s\", \"size_bytes\": %lld},\n"
-        "    \"tids\":  {\"sha256\": \"%s\", \"size_bytes\": %lld}\n"
-        "  }\n"
-        "}\n",
-        m->pg_cuvs_version,
-        m->database_oid, m->table_oid, m->index_oid, m->relfilenode,
-        m->base_generation, m->metric_name, m->dim,
-        (long long)m->vector_count, (long long)m->build_timestamp,
-        m->cagra_sha256, (long long)m->cagra_size_bytes,
-        m->tids_sha256,  (long long)m->tids_size_bytes);
+    if (m->shard_count >= 2) {
+        snprintf(out, out_sz,
+            "{\n"
+            "  \"pg_cuvs_version\": \"%s\",\n"
+            "  \"database_oid\": %u,\n"
+            "  \"table_oid\": %u,\n"
+            "  \"index_oid\": %u,\n"
+            "  \"relfilenode\": %u,\n"
+            "  \"base_generation\": %u,\n"
+            "  \"metric\": \"%s\",\n"
+            "  \"dim\": %u,\n"
+            "  \"vector_count\": %lld,\n"
+            "  \"build_timestamp\": %lld,\n"
+            "  \"shard_count\": %u,\n"
+            "  \"artifacts\": {\n"
+            "    \"tids\":   {\"sha256\": \"%s\", \"size_bytes\": %lld},\n"
+            "    \"shards\": {\"sha256\": \"%s\", \"size_bytes\": %lld}\n"
+            "  }\n"
+            "}\n",
+            m->pg_cuvs_version,
+            m->database_oid, m->table_oid, m->index_oid, m->relfilenode,
+            m->base_generation, m->metric_name, m->dim,
+            (long long)m->vector_count, (long long)m->build_timestamp,
+            m->shard_count,
+            m->tids_sha256,   (long long)m->tids_size_bytes,
+            m->shards_sha256, (long long)m->shards_size_bytes);
+    } else {
+        snprintf(out, out_sz,
+            "{\n"
+            "  \"pg_cuvs_version\": \"%s\",\n"
+            "  \"database_oid\": %u,\n"
+            "  \"table_oid\": %u,\n"
+            "  \"index_oid\": %u,\n"
+            "  \"relfilenode\": %u,\n"
+            "  \"base_generation\": %u,\n"
+            "  \"metric\": \"%s\",\n"
+            "  \"dim\": %u,\n"
+            "  \"vector_count\": %lld,\n"
+            "  \"build_timestamp\": %lld,\n"
+            "  \"shard_count\": %u,\n"
+            "  \"artifacts\": {\n"
+            "    \"cagra\": {\"sha256\": \"%s\", \"size_bytes\": %lld},\n"
+            "    \"tids\":  {\"sha256\": \"%s\", \"size_bytes\": %lld}\n"
+            "  }\n"
+            "}\n",
+            m->pg_cuvs_version,
+            m->database_oid, m->table_oid, m->index_oid, m->relfilenode,
+            m->base_generation, m->metric_name, m->dim,
+            (long long)m->vector_count, (long long)m->build_timestamp,
+            m->shard_count,
+            m->cagra_sha256, (long long)m->cagra_size_bytes,
+            m->tids_sha256,  (long long)m->tids_size_bytes);
+    }
 }
 
 static int
 manifest_from_json(const char *json, CuvsManifest *m)
 {
+    const char *tids;
+    const char *cagra;
+    const char *shards;
+
     memset(m, 0, sizeof(*m));
     if (json_get_str(json,  "pg_cuvs_version", m->pg_cuvs_version,
                      sizeof(m->pg_cuvs_version)) != 0)   return -1;
@@ -754,17 +788,35 @@ manifest_from_json(const char *json, CuvsManifest *m)
     if (json_get_i64(json,  "vector_count",   &m->vector_count)     != 0) return -1;
     if (json_get_i64(json,  "build_timestamp",&m->build_timestamp)  != 0) return -1;
 
-    /* Nested: "artifacts": { "cagra": {...}, "tids": {...} } */
-    const char *cagra = json_find_obj(json, "cagra");
-    const char *tids  = json_find_obj(json, "tids");
-    if (!cagra || !tids) return -1;
+    /* shard_count: default 0 if absent (back-compat with pre-3G.2 manifests) */
+    m->shard_count = 0;
+    json_get_u32(json, "shard_count", &m->shard_count);
 
-    if (json_get_str(cagra, "sha256",     m->cagra_sha256,
-                     sizeof(m->cagra_sha256)) != 0)       return -1;
-    if (json_get_i64(cagra, "size_bytes", &m->cagra_size_bytes) != 0) return -1;
-    if (json_get_str(tids,  "sha256",     m->tids_sha256,
-                     sizeof(m->tids_sha256))  != 0)       return -1;
-    if (json_get_i64(tids,  "size_bytes", &m->tids_size_bytes)  != 0) return -1;
+    if (m->shard_count >= 2) {
+        /* Sharded: require tids + shards; no cagra block */
+        tids   = json_find_obj(json, "tids");
+        shards = json_find_obj(json, "shards");
+        if (!tids || !shards) return -1;
+
+        if (json_get_str(tids,   "sha256",     m->tids_sha256,
+                         sizeof(m->tids_sha256))   != 0)  return -1;
+        if (json_get_i64(tids,   "size_bytes", &m->tids_size_bytes)   != 0) return -1;
+        if (json_get_str(shards, "sha256",     m->shards_sha256,
+                         sizeof(m->shards_sha256)) != 0)  return -1;
+        if (json_get_i64(shards, "size_bytes", &m->shards_size_bytes) != 0) return -1;
+    } else {
+        /* Unsharded: require cagra + tids (original behavior) */
+        cagra = json_find_obj(json, "cagra");
+        tids  = json_find_obj(json, "tids");
+        if (!cagra || !tids) return -1;
+
+        if (json_get_str(cagra, "sha256",     m->cagra_sha256,
+                         sizeof(m->cagra_sha256)) != 0)       return -1;
+        if (json_get_i64(cagra, "size_bytes", &m->cagra_size_bytes) != 0) return -1;
+        if (json_get_str(tids,  "sha256",     m->tids_sha256,
+                         sizeof(m->tids_sha256))  != 0)       return -1;
+        if (json_get_i64(tids,  "size_bytes", &m->tids_size_bytes)  != 0) return -1;
+    }
     return 0;
 }
 
@@ -915,6 +967,141 @@ cuvs_objstore_upload(
 }
 
 /* ----------------------------------------------------------------
+ * Public API: upload (sharded)
+ * ---------------------------------------------------------------- */
+
+int
+cuvs_objstore_upload_sharded(
+    const char *snapshot_uri,
+    const char *cluster_id,
+    const char *gcs_key_file,
+    const char *index_dir,
+    uint32_t    db_oid,
+    uint32_t    table_oid,
+    uint32_t    index_oid,
+    uint32_t    relfilenode,
+    uint32_t    metric,
+    uint32_t    dim,
+    int64_t     vector_count,
+    uint32_t    base_generation,
+    uint32_t    shard_count)
+{
+    char     bucket[256] = "", prefix[512] = "";
+    char     token[2048];
+    char     tids_path[1024], shards_path[1024], shard_path[1024];
+    char     tids_sha[65], shards_sha[65];
+    char     vprefix[1024], lprefix[1024], obj[1280];
+    char     manifest_json[4096];
+    int64_t  build_ts;
+    struct   stat st;
+    uint32_t s;
+    CuvsManifest m;
+    const char *metric_names[] = {"l2", "cosine", "ip"};
+
+    if (!snapshot_uri || snapshot_uri[0] == '\0')
+        return 0;
+
+    if (parse_gcs_uri(snapshot_uri, bucket, sizeof(bucket),
+                      prefix, sizeof(prefix)) != 0) {
+        LOG_WARN("[objstore] invalid snapshot_uri: %s\n", snapshot_uri);
+        return -1;
+    }
+
+    if (get_gcs_token(gcs_key_file, token, sizeof(token)) != 0)
+        return -1;
+
+    /* Construct local paths */
+    snprintf(tids_path,   sizeof(tids_path),   "%s/%u_%u.tids",   index_dir, db_oid, index_oid);
+    snprintf(shards_path, sizeof(shards_path), "%s/%u_%u.shards", index_dir, db_oid, index_oid);
+
+    /* SHA256 + size of .tids and .shards */
+    if (cuvs_sha256_file(tids_path,   tids_sha)   != 0 ||
+        cuvs_sha256_file(shards_path, shards_sha) != 0) {
+        LOG_WARN("[objstore] SHA256 computation failed for %u/%u (sharded)\n",
+                 db_oid, index_oid);
+        return -1;
+    }
+
+    int64_t tids_sz   = (stat(tids_path,   &st) == 0) ? (int64_t)st.st_size : -1;
+    int64_t shards_sz = (stat(shards_path, &st) == 0) ? (int64_t)st.st_size : -1;
+
+    /* Build manifest */
+    build_ts = (int64_t)time(NULL);
+    memset(&m, 0, sizeof(m));
+    strncpy(m.pg_cuvs_version, "0.1.0", sizeof(m.pg_cuvs_version) - 1);
+    m.database_oid      = db_oid;
+    m.table_oid         = table_oid;
+    m.index_oid         = index_oid;
+    m.relfilenode       = relfilenode;
+    m.base_generation   = base_generation;
+    m.dim               = dim;
+    m.vector_count      = vector_count;
+    m.build_timestamp   = build_ts;
+    m.shard_count       = shard_count;
+    m.tids_size_bytes   = tids_sz;
+    m.shards_size_bytes = shards_sz;
+    memcpy(m.tids_sha256,   tids_sha,   sizeof(m.tids_sha256));
+    memcpy(m.shards_sha256, shards_sha, sizeof(m.shards_sha256));
+    strncpy(m.metric_name,
+            (metric < 3) ? metric_names[metric] : "l2",
+            sizeof(m.metric_name) - 1);
+
+    manifest_to_json(&m, manifest_json, sizeof(manifest_json));
+
+    build_versioned_prefix(prefix, cluster_id, db_oid, index_oid,
+                           build_ts, vprefix, sizeof(vprefix));
+    build_latest_prefix(prefix, cluster_id, db_oid, index_oid,
+                        lprefix, sizeof(lprefix));
+
+    /* Upload all shard .cagra files first */
+    for (s = 0; s < shard_count; s++) {
+        snprintf(shard_path, sizeof(shard_path),
+                 "%s/%u_%u.s%03u.cagra", index_dir, db_oid, index_oid, s);
+        snprintf(obj, sizeof(obj), "%s/index.s%03u.cagra", vprefix, s);
+        if (gcs_upload_file(bucket, obj, shard_path, token) != 0) {
+            LOG_WARN("[objstore] upload shard %u .cagra FAILED for %u/%u\n",
+                     s, db_oid, index_oid);
+            return -1;
+        }
+        LOG_INFO("[objstore] uploaded %s\n", obj);
+    }
+
+    /* Upload .tids */
+    snprintf(obj, sizeof(obj), "%s/index.tids", vprefix);
+    if (gcs_upload_file(bucket, obj, tids_path, token) != 0) {
+        LOG_WARN("[objstore] upload .tids FAILED for %u/%u\n", db_oid, index_oid);
+        return -1;
+    }
+    LOG_INFO("[objstore] uploaded %s\n", obj);
+
+    /* Upload .shards manifest */
+    snprintf(obj, sizeof(obj), "%s/index.shards", vprefix);
+    if (gcs_upload_file(bucket, obj, shards_path, token) != 0) {
+        LOG_WARN("[objstore] upload .shards FAILED for %u/%u\n", db_oid, index_oid);
+        return -1;
+    }
+    LOG_INFO("[objstore] uploaded %s\n", obj);
+
+    /* Versioned manifest — the authoritative record (uploaded last) */
+    snprintf(obj, sizeof(obj), "%s/manifest.json", vprefix);
+    if (gcs_upload_string(bucket, obj, manifest_json, token) != 0) {
+        LOG_WARN("[objstore] upload versioned manifest FAILED for %u/%u\n",
+                 db_oid, index_oid);
+        return -1;
+    }
+
+    /* Latest alias */
+    snprintf(obj, sizeof(obj), "%s/manifest.json", lprefix);
+    if (gcs_upload_string(bucket, obj, manifest_json, token) != 0)
+        LOG_WARN("[objstore] upload latest manifest FAILED for %u/%u "
+                 "(non-fatal; versioned copy is intact)\n", db_oid, index_oid);
+
+    LOG_INFO("[objstore] sharded snapshot complete %u/%u shards=%u ts=%lld relfilenode=%u\n",
+             db_oid, index_oid, shard_count, (long long)build_ts, relfilenode);
+    return 0;
+}
+
+/* ----------------------------------------------------------------
  * Public API: download
  * ---------------------------------------------------------------- */
 
@@ -984,57 +1171,132 @@ cuvs_objstore_download(
     build_versioned_prefix(prefix, cluster_id, db_oid, index_oid,
                            m.build_timestamp, vprefix, sizeof(vprefix));
 
-    char cagra_path[1024], tids_path[1024];
-    snprintf(cagra_path, sizeof(cagra_path),
-             "%s/%u_%u.cagra", index_dir, db_oid, index_oid);
-    snprintf(tids_path, sizeof(tids_path),
-             "%s/%u_%u.tids",  index_dir, db_oid, index_oid);
-
     LOG_INFO("[objstore] downloading %u/%u from GCS "
-             "(ts=%lld relfilenode=%u)\n",
+             "(ts=%lld relfilenode=%u shards=%u)\n",
              db_oid, index_oid,
-             (long long)m.build_timestamp, m.relfilenode);
+             (long long)m.build_timestamp, m.relfilenode, m.shard_count);
 
-    /* Download .tids first (smaller — fail fast on auth/connectivity issues) */
-    snprintf(obj, sizeof(obj), "%s/index.tids", vprefix);
-    if (gcs_download_file(bucket, obj, tids_path, token) != 0) {
-        LOG_WARN("[objstore] download .tids FAILED for %u/%u\n",
-                 db_oid, index_oid);
-        return -1;
+    if (m.shard_count >= 2) {
+        /* ---- Sharded download path ---- */
+        char tids_path[1024], shards_path[1024], shard_path[1024];
+        char got_sha[65];
+        uint32_t s;
+
+        snprintf(tids_path,   sizeof(tids_path),
+                 "%s/%u_%u.tids",   index_dir, db_oid, index_oid);
+        snprintf(shards_path, sizeof(shards_path),
+                 "%s/%u_%u.shards", index_dir, db_oid, index_oid);
+
+        /* Download .tids first */
+        snprintf(obj, sizeof(obj), "%s/index.tids", vprefix);
+        if (gcs_download_file(bucket, obj, tids_path, token) != 0) {
+            LOG_WARN("[objstore] download .tids FAILED for %u/%u (sharded)\n",
+                     db_oid, index_oid);
+            return -1;
+        }
+
+        /* Verify .tids SHA256 */
+        if (cuvs_sha256_file(tids_path, got_sha) != 0 ||
+            strcmp(got_sha, m.tids_sha256) != 0) {
+            LOG_WARN("[objstore] .tids SHA256 MISMATCH %u/%u "
+                     "(got=%s expected=%s) — discarding\n",
+                     db_oid, index_oid, got_sha, m.tids_sha256);
+            unlink(tids_path);
+            return -1;
+        }
+
+        /* Download .shards */
+        snprintf(obj, sizeof(obj), "%s/index.shards", vprefix);
+        if (gcs_download_file(bucket, obj, shards_path, token) != 0) {
+            LOG_WARN("[objstore] download .shards FAILED for %u/%u\n",
+                     db_oid, index_oid);
+            unlink(tids_path);
+            return -1;
+        }
+
+        /* Verify .shards SHA256 */
+        if (cuvs_sha256_file(shards_path, got_sha) != 0 ||
+            strcmp(got_sha, m.shards_sha256) != 0) {
+            LOG_WARN("[objstore] .shards SHA256 MISMATCH %u/%u "
+                     "(got=%s expected=%s) — discarding\n",
+                     db_oid, index_oid, got_sha, m.shards_sha256);
+            unlink(tids_path);
+            unlink(shards_path);
+            return -1;
+        }
+
+        /* Download each shard .cagra (integrity verified at load via .shards CRCs) */
+        for (s = 0; s < m.shard_count; s++) {
+            snprintf(shard_path, sizeof(shard_path),
+                     "%s/%u_%u.s%03u.cagra", index_dir, db_oid, index_oid, s);
+            snprintf(obj, sizeof(obj), "%s/index.s%03u.cagra", vprefix, s);
+            if (gcs_download_file(bucket, obj, shard_path, token) != 0) {
+                uint32_t k;
+                LOG_WARN("[objstore] download shard %u .cagra FAILED for %u/%u\n",
+                         s, db_oid, index_oid);
+                unlink(tids_path);
+                unlink(shards_path);
+                for (k = 0; k < s; k++) {
+                    snprintf(shard_path, sizeof(shard_path),
+                             "%s/%u_%u.s%03u.cagra", index_dir, db_oid, index_oid, k);
+                    unlink(shard_path);
+                }
+                return -1;
+            }
+        }
+
+        LOG_INFO("[objstore] sharded download verified OK for %u/%u "
+                 "(%u shards)\n", db_oid, index_oid, m.shard_count);
+    } else {
+        /* ---- Unsharded download path (original behavior) ---- */
+        char cagra_path[1024], tids_path[1024];
+        char got_sha[65];
+
+        snprintf(cagra_path, sizeof(cagra_path),
+                 "%s/%u_%u.cagra", index_dir, db_oid, index_oid);
+        snprintf(tids_path, sizeof(tids_path),
+                 "%s/%u_%u.tids",  index_dir, db_oid, index_oid);
+
+        /* Download .tids first (smaller — fail fast on auth/connectivity issues) */
+        snprintf(obj, sizeof(obj), "%s/index.tids", vprefix);
+        if (gcs_download_file(bucket, obj, tids_path, token) != 0) {
+            LOG_WARN("[objstore] download .tids FAILED for %u/%u\n",
+                     db_oid, index_oid);
+            return -1;
+        }
+
+        /* Verify .tids SHA256 before proceeding to the large .cagra download */
+        if (cuvs_sha256_file(tids_path, got_sha) != 0 ||
+            strcmp(got_sha, m.tids_sha256) != 0) {
+            LOG_WARN("[objstore] .tids SHA256 MISMATCH %u/%u "
+                     "(got=%s expected=%s) — discarding\n",
+                     db_oid, index_oid, got_sha, m.tids_sha256);
+            unlink(tids_path);
+            return -1;
+        }
+
+        /* Download .cagra (may be several GB — generous timeout set in helper) */
+        snprintf(obj, sizeof(obj), "%s/index.cagra", vprefix);
+        if (gcs_download_file(bucket, obj, cagra_path, token) != 0) {
+            LOG_WARN("[objstore] download .cagra FAILED for %u/%u\n",
+                     db_oid, index_oid);
+            unlink(tids_path);
+            return -1;
+        }
+
+        /* Verify .cagra SHA256 */
+        if (cuvs_sha256_file(cagra_path, got_sha) != 0 ||
+            strcmp(got_sha, m.cagra_sha256) != 0) {
+            LOG_WARN("[objstore] .cagra SHA256 MISMATCH %u/%u "
+                     "(got=%s expected=%s) — discarding\n",
+                     db_oid, index_oid, got_sha, m.cagra_sha256);
+            unlink(tids_path);
+            unlink(cagra_path);
+            return -1;
+        }
+
+        LOG_INFO("[objstore] download verified OK for %u/%u\n", db_oid, index_oid);
     }
-
-    /* Verify .tids SHA256 before proceeding to the large .cagra download */
-    char got_sha[65];
-    if (cuvs_sha256_file(tids_path, got_sha) != 0 ||
-        strcmp(got_sha, m.tids_sha256) != 0) {
-        LOG_WARN("[objstore] .tids SHA256 MISMATCH %u/%u "
-                 "(got=%s expected=%s) — discarding\n",
-                 db_oid, index_oid, got_sha, m.tids_sha256);
-        unlink(tids_path);
-        return -1;
-    }
-
-    /* Download .cagra (may be several GB — generous timeout set in helper) */
-    snprintf(obj, sizeof(obj), "%s/index.cagra", vprefix);
-    if (gcs_download_file(bucket, obj, cagra_path, token) != 0) {
-        LOG_WARN("[objstore] download .cagra FAILED for %u/%u\n",
-                 db_oid, index_oid);
-        unlink(tids_path);
-        return -1;
-    }
-
-    /* Verify .cagra SHA256 */
-    if (cuvs_sha256_file(cagra_path, got_sha) != 0 ||
-        strcmp(got_sha, m.cagra_sha256) != 0) {
-        LOG_WARN("[objstore] .cagra SHA256 MISMATCH %u/%u "
-                 "(got=%s expected=%s) — discarding\n",
-                 db_oid, index_oid, got_sha, m.cagra_sha256);
-        unlink(tids_path);
-        unlink(cagra_path);
-        return -1;
-    }
-
-    LOG_INFO("[objstore] download verified OK for %u/%u\n", db_oid, index_oid);
 
     if (build_timestamp_out)
         *build_timestamp_out = (uint64_t)m.build_timestamp;
