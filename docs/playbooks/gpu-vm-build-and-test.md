@@ -447,13 +447,20 @@ NOTICE:  pg_cuvs: cagra scan ...
 
 ### Step 8 — 회귀 테스트
 
+> **주의:** `make installcheck`는 반드시 `~/pg_cuvs/` 디렉토리 안에서 실행해야 한다.  
+> 홈 디렉토리에서 치면 `No rule to make target 'installcheck'` 에러가 난다.
+
 ```bash
-# make gpu-test 가 실제로 하는 것 (Makefile:198):
+# VM 안에서 직접:
+cd ~/pg_cuvs
+make installcheck
+
+# 로컬 래퍼 (make gpu-test 가 실제로 하는 것, Makefile:198):
 ssh -tt $GCP_VM "cd ~/pg_cuvs && \
     source ~/miniforge3/bin/activate $CONDA_ENV && \
     make installcheck"
 
-# 또는 래퍼:
+# 또는:
 make gpu-test
 ```
 
