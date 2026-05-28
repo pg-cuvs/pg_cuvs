@@ -165,11 +165,11 @@ static int            g_n_cold_indexes = 0;
 /* Daemon-global VRAM cache counters (mutated under g_index_mutex). Exposed via
  * CUVS_OP_CACHE_STATS / pg_stat_gpu_cache. Per-index counters can't track this
  * because eviction destroys the IndexEntry. */
-static uint64_t g_cache_hits        = 0;
-static uint64_t g_cache_misses      = 0;
-static uint64_t g_cache_evictions   = 0;
-static uint64_t g_cache_reloads     = 0;
-static uint64_t g_cache_persist_fail = 0;
+static uint64_t g_cache_hits[CUVS_MAX_GPUS];
+static uint64_t g_cache_misses[CUVS_MAX_GPUS];
+static uint64_t g_cache_evictions[CUVS_MAX_GPUS];
+static uint64_t g_cache_reloads[CUVS_MAX_GPUS];
+static uint64_t g_cache_persist_fail[CUVS_MAX_GPUS];
 
 /* Phase 3E: per-device GPU state. */
 static CuvsGpuDeviceInfo g_gpus[CUVS_MAX_GPUS];
@@ -868,14 +868,18 @@ load_index(uint32_t db_oid, uint32_t index_oid)
         LOG_WARN("pg_cuvs_server: no GPU can fit %u/%u (%zu bytes), skip\n",
                  db_oid, index_oid, needed);
         free(tids);
-        return -1;
+        return -2;  /* VRAM: index too large for any GPU budget */
     }
     if (ensure_vram(needed, target_gpu) != 0)
     {
-        LOG_WARN("pg_cuvs_server: insufficient VRAM on GPU %d loading %u/%u, skip\n",
-                 target_gpu, db_oid, index_oid);
+        LOG_WARN("pg_cuvs_server: VRAM exhausted on GPU %d loading %u/%u "
+                 "(budget %zu MB, used %zu MB, needed %zu MB)\n",
+                 target_gpu, db_oid, index_oid,
+                 g_max_vram_per_gpu[target_gpu] / (1024*1024),
+                 total_vram_used(target_gpu) / (1024*1024),
+                 needed / (1024*1024));
         free(tids);
-        return -1;
+        return -2;  /* VRAM: exhausted after eviction */
     }
 
     CuvsCagraIndex handle = cuvs_cagra_deserialize(idx_path, (int)dim, target_gpu);
@@ -1045,7 +1049,7 @@ evict_lru(int device_id)
         LOG_ERROR("evict_lru: save_index FAILED for %u/%u on GPU %u; aborting eviction "
                   "(VRAM still holds index)\n",
                 e->db_oid, e->index_oid, e->gpu_device_id);
-        g_cache_persist_fail++;
+        g_cache_persist_fail[device_id]++;
         return 0;
     }
     free_delta_cache(e);
@@ -1058,7 +1062,7 @@ evict_lru(int device_id)
         g_indexes[i] = g_indexes[i+1];
     g_n_indexes--;
 
-    g_cache_evictions++;
+    g_cache_evictions[device_id]++;
     return freed;
 }
 
@@ -1167,52 +1171,65 @@ handle_search(int client_fd, const CuvsCmdFrame *cmd)
     IndexEntry *e = find_index(cmd->db_oid, cmd->index_oid);
     if (e)
     {
-        g_cache_hits++;             /* already VRAM-resident */
+        g_cache_hits[e->gpu_device_id]++;
     }
     else
     {
-        g_cache_misses++;           /* not resident */
-        /* Try to (re)load from disk, evicting LRU to fit if needed. */
-        if (load_index(cmd->db_oid, cmd->index_oid) == 0)
+        int load_rc = load_index(cmd->db_oid, cmd->index_oid);
+        if (load_rc == 0)
         {
-            g_cache_reloads++;
             e = find_index(cmd->db_oid, cmd->index_oid);
-        }
-    }
-
-    if (!e)
-    {
-        /* Phase 3D: if GCS is configured, check the cold registry. If this
-         * index is known-but-not-resident, enqueue a background download
-         * (if not already queued/downloading). The current query still gets
-         * NOT_FOUND -> CPU fallback; once the download completes, subsequent
-         * queries will find the index resident. */
-        if (g_snapshot_uri[0] != '\0')
-        {
-            for (int i = 0; i < g_n_cold_indexes; i++)
+            if (e)
             {
-                ColdIndexEntry *ce = &g_cold_indexes[i];
-                if (ce->valid && ce->db_oid == cmd->db_oid &&
-                    ce->index_oid == cmd->index_oid)
-                {
-                    ce->cache_miss_count++;
-                    if (ce->warmup_state == WARMUP_COLD ||
-                        ce->warmup_state == WARMUP_FAILED)
-                    {
-                        ce->warmup_state = WARMUP_QUEUED;
-                        warmup_enqueue(ce->db_oid, ce->index_oid,
-                                       ce->relfilenode, ce->table_oid, 1);
-                    }
-                    break;
-                }
+                g_cache_reloads[e->gpu_device_id]++;
+                g_cache_misses[e->gpu_device_id]++;
             }
         }
+        else
+        {
+            g_cache_misses[usable_gpu(0)]++;
+        }
 
-        pthread_mutex_unlock(&g_index_mutex);
-        CuvsReplyHeader hdr = {0};
-        hdr.status = CUVS_STATUS_NOT_FOUND;
-        send_all(client_fd, &hdr, sizeof(hdr));
-        return;
+        if (!e)
+        {
+            /* Distinguish VRAM exhaustion (-2) from file-not-found (-1). */
+            int reply_status;
+            if (load_rc == -2)
+            {
+                reply_status = CUVS_STATUS_OOM_FALLBACK;
+            }
+            else
+            {
+                reply_status = CUVS_STATUS_NOT_FOUND;
+                /* Phase 3D: check cold registry for GCS download. */
+                if (g_snapshot_uri[0] != '\0')
+                {
+                    for (int i = 0; i < g_n_cold_indexes; i++)
+                    {
+                        ColdIndexEntry *ce = &g_cold_indexes[i];
+                        if (ce->valid && ce->db_oid == cmd->db_oid &&
+                            ce->index_oid == cmd->index_oid)
+                        {
+                            ce->cache_miss_count++;
+                            if (ce->warmup_state == WARMUP_COLD ||
+                                ce->warmup_state == WARMUP_FAILED)
+                            {
+                                ce->warmup_state = WARMUP_QUEUED;
+                                warmup_enqueue(ce->db_oid, ce->index_oid,
+                                               ce->relfilenode, ce->table_oid, 1);
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+
+            pthread_mutex_unlock(&g_index_mutex);
+            CuvsReplyHeader hdr = {0};
+            hdr.status = (uint32_t)reply_status;
+            send_all(client_fd, &hdr, sizeof(hdr));
+            return;
+        }
     }
 
     e->last_search = time(NULL);
@@ -1598,13 +1615,32 @@ handle_build(int client_fd, const CuvsCmdFrame *cmd)
      * ensure_vram regardless of same-OID replacement. */
     size_t needed = estimate_vram_bytes(cmd->n_vecs, (int)cmd->dim);
     int target_gpu = pick_gpu_for_index(needed);
-    if (target_gpu < 0 || ensure_vram(needed, target_gpu) < 0)
+    if (target_gpu < 0)
     {
+        LOG_WARN("[handle_build] index %u/%u (%zu bytes) too large for any GPU budget\n",
+                 cmd->db_oid, cmd->index_oid, needed);
         pthread_mutex_unlock(&g_index_mutex);
         munmap(mem, total);
         CuvsReplyHeader hdr = {0};
         hdr.status = CUVS_STATUS_OOM_FALLBACK;
-        strncpy(hdr.error, "VRAM exhausted on all GPUs", sizeof(hdr.error) - 1);
+        strncpy(hdr.error, "index too large for any GPU VRAM budget", sizeof(hdr.error) - 1);
+        send_all(client_fd, &hdr, sizeof(hdr));
+        return;
+    }
+    if (ensure_vram(needed, target_gpu) < 0)
+    {
+        LOG_WARN("[handle_build] VRAM exhausted on GPU %d for %u/%u "
+                 "(budget %zu MB, used %zu MB, needed %zu MB)\n",
+                 target_gpu, cmd->db_oid, cmd->index_oid,
+                 g_max_vram_per_gpu[target_gpu] / (1024*1024),
+                 total_vram_used(target_gpu) / (1024*1024),
+                 needed / (1024*1024));
+        pthread_mutex_unlock(&g_index_mutex);
+        munmap(mem, total);
+        CuvsReplyHeader hdr = {0};
+        hdr.status = CUVS_STATUS_OOM_FALLBACK;
+        snprintf(hdr.error, sizeof(hdr.error),
+                 "VRAM exhausted on GPU %d after eviction", target_gpu);
         send_all(client_fd, &hdr, sizeof(hdr));
         return;
     }
@@ -1981,11 +2017,11 @@ handle_cache_stats(int client_fd)
         CuvsCacheStats *cs = &rows[n_rows++];
         memset(cs, 0, sizeof(*cs));
         cs->gpu_device_id    = (uint32_t)dev;
-        cs->hits             = g_cache_hits;
-        cs->misses           = g_cache_misses;
-        cs->evictions        = g_cache_evictions;
-        cs->reloads          = g_cache_reloads;
-        cs->persist_failures = g_cache_persist_fail;
+        cs->hits             = g_cache_hits[dev];
+        cs->misses           = g_cache_misses[dev];
+        cs->evictions        = g_cache_evictions[dev];
+        cs->reloads          = g_cache_reloads[dev];
+        cs->persist_failures = g_cache_persist_fail[dev];
         cs->resident_count   = 0;
         for (int j = 0; j < g_n_indexes; j++)
             if (g_indexes[j].valid && g_indexes[j].gpu_device_id == (uint32_t)dev)
@@ -2187,7 +2223,7 @@ main(int argc, char **argv)
         LOG_ERROR("pg_cuvs_server: no CUDA GPUs detected\n");
         return 1;
     }
-    /* Validate --gpu-devices against detected GPUs */
+    /* Validate and deduplicate --gpu-devices against detected GPUs */
     for (int i = 0; i < g_n_allowed_gpus; i++)
     {
         if (g_allowed_gpus[i] >= g_n_gpus)
@@ -2195,6 +2231,16 @@ main(int argc, char **argv)
             LOG_ERROR("pg_cuvs_server: --gpu-devices references GPU %d but only %d detected\n",
                       g_allowed_gpus[i], g_n_gpus);
             return 1;
+        }
+        for (int j = i + 1; j < g_n_allowed_gpus; j++)
+        {
+            if (g_allowed_gpus[i] == g_allowed_gpus[j])
+            {
+                for (int k = j; k < g_n_allowed_gpus - 1; k++)
+                    g_allowed_gpus[k] = g_allowed_gpus[k + 1];
+                g_n_allowed_gpus--;
+                j--;
+            }
         }
     }
     /* Initialize per-device VRAM budgets */

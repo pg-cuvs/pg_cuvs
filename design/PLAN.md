@@ -497,14 +497,37 @@ Scope decision:
 - global top-k correctness는 `enable_cuvs=off` CPU exact result와 비교한다.
 - single-GPU VM에서는 planner shape와 correctness만 검증하고, 실제 GPU별 placement는 multi-GPU VM에서 acceptance로 검증한다.
 
+3E-3 checklist:
+- hash/range/list partition 중 최소 하나의 권장 DDL recipe를 `infra/scripts/` 또는 `docs/recipes/`에 둔다.
+- parent table query만 사용한다. 사용자가 child partition을 직접 query해야 하는 recipe는 완료로 보지 않는다.
+- 각 child partition에 physical CAGRA index를 생성하고, `pg_stat_gpu_search.index_name/gpu_device_id/resident`로 배치를 확인한다.
+- parent query의 global top-k 결과를 `enable_cuvs=off` CPU exact query와 비교한다.
+- planner shape를 `EXPLAIN (COSTS OFF)`로 기록한다. PostgreSQL이 partition append/merge를 어떻게 구성하는지 문서에 남긴다.
+- multi-GPU VM에서는 child partition indexes가 2개 이상 GPU에 분산 resident해야 한다.
+
 3E-4 Multi-GPU hardware acceptance:
 - ephemeral 4/8-GPU VM 또는 DGX/HGX급 노드에서 검증한다.
 - 여러 physical CAGRA indexes가 서로 다른 GPUs에 resident함을 stats와 daemon log로 확인한다.
 - concurrent searches가 GPU별로 dispatch되고, per-GPU VRAM/cache counters가 독립적으로 움직이는지 검증한다.
 
+3E-4 checklist:
+- daemon startup log와 SQL stats에서 usable GPU count가 기대값과 일치한다.
+- 최소 2개 이상의 CAGRA indexes가 서로 다른 GPUs에 resident한다.
+- `pg_stat_gpu_cache`가 GPU별 row를 반환하고, `resident_count`, `vram_used_mb`, `evictions`, `reloads`, `search_count`가 device별로 독립적으로 갱신된다.
+- VRAM pressure 테스트에서 target GPU의 LRU만 evict되고 다른 GPU의 resident indexes는 유지된다.
+- concurrent search benchmark가 GPU별 dispatch를 실제로 발생시킨다. 단순 sequential smoke만으로는 3E-4 완료로 보지 않는다.
+- GPU unavailable 또는 placement failure 시나리오가 3E-2 정책과 같은 결과를 낸다.
+- multi-GPU VM은 검증 후 stop/delete하거나 비용 상태를 명시적으로 보고한다.
+
 3E-5 Optional/future internal sub-index sharding:
 - 단일 non-partitioned table / 단일 logical CAGRA index를 여러 GPU shard로 나누는 설계는 별도 고급 기능으로 둔다.
 - 이 기능은 CAGRA graph split, per-shard over-fetch, daemon fanout, top-k merge, recall policy를 새로 요구하므로 3E MVP 완료 기준에 넣지 않는다.
+
+3E-5 decision record:
+- 3E MVP에서는 internal sub-index sharding을 구현하지 않는다.
+- 후속 단계로 승격하려면 별도 ADR/plan이 필요하다.
+- ADR에는 shard assignment, per-shard artifact naming, build/serialize/load, query fanout, `k + slop`, daemon top-k merge, recall evaluation, shard failure semantics, snapshot/delta/tombstone compatibility를 포함해야 한다.
+- 이 결정을 통해 Phase 3E의 완료 기준은 "여러 physical CAGRA indexes를 여러 GPUs에 배치/검색"으로 고정하고, "하나의 physical CAGRA index를 여러 GPUs에 split"은 future work로 둔다.
 
 Phase 3E 완료 기준:
 - daemon-level multi-GPU runtime이 여러 CUDA devices를 관리하고, physical CAGRA indexes를 GPU별로 배치/검색할 수 있다.

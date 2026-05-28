@@ -66,7 +66,12 @@ std::unique_ptr<raft::device_resources> acquire_res(int device_id)
             return r;
         }
     }
-    cudaSetDevice(device_id);
+    cudaError_t err = cudaSetDevice(device_id);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "[acquire_res] cudaSetDevice(%d) failed: %s\n",
+                device_id, cudaGetErrorString(err));
+        throw std::runtime_error("cudaSetDevice failed in acquire_res");
+    }
     return std::make_unique<raft::device_resources>();
 }
 
@@ -94,7 +99,13 @@ struct PooledRes {
     int dev;
     bool poisoned = false;
     explicit PooledRes(int device_id) : r(acquire_res(device_id)), dev(device_id) {
-        cudaSetDevice(device_id);
+        cudaError_t err = cudaSetDevice(device_id);
+        if (err != cudaSuccess) {
+            fprintf(stderr, "[PooledRes] cudaSetDevice(%d) failed: %s\n",
+                    device_id, cudaGetErrorString(err));
+            poisoned = true;
+            throw std::runtime_error("cudaSetDevice failed");
+        }
     }
     ~PooledRes() { if (r && !poisoned) release_res(dev, std::move(r)); }
     raft::device_resources &get() { return *r; }
@@ -158,14 +169,28 @@ cuvs_detect_gpus(CuvsGpuDeviceInfo *out, int max_devices)
 
     int n = (device_count < max_devices) ? device_count : max_devices;
     for (int i = 0; i < n; i++) {
+        out[i].device_id = i;
+        out[i].total_vram_bytes = 0;
+        out[i].name[0] = '\0';
+
         cudaDeviceProp prop;
         if (cudaGetDeviceProperties(&prop, i) != cudaSuccess) {
-            out[i].device_id = i;
-            out[i].total_vram_bytes = 0;
-            out[i].name[0] = '\0';
+            fprintf(stderr, "[cuvs_detect_gpus] GPU %d: cudaGetDeviceProperties failed, treating as unavailable\n", i);
             continue;
         }
-        out[i].device_id = i;
+        if (cudaSetDevice(i) != cudaSuccess) {
+            fprintf(stderr, "[cuvs_detect_gpus] GPU %d: cudaSetDevice failed, treating as unavailable\n", i);
+            continue;
+        }
+        void *probe = NULL;
+        cudaError_t probe_err = cudaMalloc(&probe, 1);
+        if (probe_err != cudaSuccess) {
+            fprintf(stderr, "[cuvs_detect_gpus] GPU %d: health probe cudaMalloc failed (%s), treating as unavailable\n",
+                    i, cudaGetErrorString(probe_err));
+            continue;
+        }
+        cudaFree(probe);
+
         out[i].total_vram_bytes = prop.totalGlobalMem;
         strncpy(out[i].name, prop.name, sizeof(out[i].name) - 1);
         out[i].name[sizeof(out[i].name) - 1] = '\0';
@@ -191,7 +216,8 @@ extern "C" size_t
 cuvs_vram_free_bytes_on(int device_id)
 {
     size_t free_bytes = 0, total_bytes = 0;
-    cudaSetDevice(device_id);
+    if (cudaSetDevice(device_id) != cudaSuccess)
+        return 0;
     cudaMemGetInfo(&free_bytes, &total_bytes);
     return free_bytes;
 }
@@ -360,7 +386,8 @@ extern "C" void
 cuvs_bf_free(CuvsBfIndex index, int device_id)
 {
     if (index) {
-        cudaSetDevice(device_id);
+        if (cudaSetDevice(device_id) != cudaSuccess)
+            fprintf(stderr, "[cuvs_bf_free] cudaSetDevice(%d) failed\n", device_id);
         delete static_cast<CuvsBfIndexImpl *>(index);
     }
 }
@@ -560,7 +587,8 @@ extern "C" void
 cuvs_cagra_free(CuvsCagraIndex index, int device_id)
 {
     if (index) {
-        cudaSetDevice(device_id);
+        if (cudaSetDevice(device_id) != cudaSuccess)
+            fprintf(stderr, "[cuvs_cagra_free] cudaSetDevice(%d) failed\n", device_id);
         delete static_cast<CuvsCagraIndexImpl *>(index);
     }
 }

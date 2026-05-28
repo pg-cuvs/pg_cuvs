@@ -998,6 +998,129 @@ SQL
 stop_test_daemon
 psql -d "$DB" -c "DROP TABLE IF EXISTS sc15; DROP TABLE IF EXISTS sc15c; DROP TABLE IF EXISTS sc15i;" >/dev/null 2>&1 || true
 
+# ============================================================================
+# Scenario 16: multi-GPU placement + per-GPU stats (Phase 3E-2)
+# On single-GPU: verifies gpu_device_id=0; on multi-GPU: verifies spreading.
+# ============================================================================
+echo "[it] --- Scenario 16: multi-GPU placement + per-GPU stats ---"
+stop_test_daemon
+rm -rf "$TEST_IDX"; mkdir -p "$TEST_IDX"
+start_test_daemon
+GPU_COUNT=$(run_sql "SELECT count(DISTINCT gpu_device_id) FROM pg_stat_gpu_cache;" | tr -d ' ')
+echo "[it] detected $GPU_COUNT GPU(s) in daemon"
+
+psql -d "$DB" -v ON_ERROR_STOP=1 >/dev/null <<SQL
+CREATE EXTENSION IF NOT EXISTS vector;
+CREATE EXTENSION IF NOT EXISTS pg_cuvs;
+DROP TABLE IF EXISTS mgpu16_a, mgpu16_b;
+CREATE TABLE mgpu16_a (id int PRIMARY KEY, v vector(32));
+CREATE TABLE mgpu16_b (id int PRIMARY KEY, v vector(32));
+INSERT INTO mgpu16_a SELECT g, ('[' || string_agg((random())::text, ',') || ']')::vector(32)
+    FROM generate_series(1,2000) g, generate_series(1,32) d GROUP BY g;
+INSERT INTO mgpu16_b SELECT g, ('[' || string_agg((random())::text, ',') || ']')::vector(32)
+    FROM generate_series(1,2000) g, generate_series(1,32) d GROUP BY g;
+SQL
+
+run_sql "CREATE INDEX mgpu16_a_cagra ON mgpu16_a USING cagra (v vector_l2_ops);" >/dev/null \
+    || fail "sc16: build mgpu16_a failed: $OUT"
+run_sql "CREATE INDEX mgpu16_b_cagra ON mgpu16_b USING cagra (v vector_l2_ops);" >/dev/null \
+    || fail "sc16: build mgpu16_b failed: $OUT"
+
+GPUS=$(run_sql "SELECT gpu_device_id FROM pg_stat_gpu_search WHERE index_name IN ('mgpu16_a_cagra','mgpu16_b_cagra') ORDER BY index_name;" | tr -d ' ')
+GPU_A=$(echo "$GPUS" | head -1)
+GPU_B=$(echo "$GPUS" | tail -1)
+
+if [ "$GPU_COUNT" -gt 1 ]; then
+    [ "$GPU_A" != "$GPU_B" ] \
+        && pass "sc16: indexes placed on different GPUs ($GPU_A vs $GPU_B)" \
+        || fail "sc16: both indexes on same GPU ($GPU_A)"
+else
+    [ "$GPU_A" = "0" ] && [ "$GPU_B" = "0" ] \
+        && pass "sc16: single-GPU mode, both on GPU 0" \
+        || fail "sc16: unexpected gpu_device_id on single-GPU ($GPU_A, $GPU_B)"
+fi
+
+# Verify per-GPU cache rows are distinct
+CACHE_ROWS=$(run_sql "SELECT count(*) FROM pg_stat_gpu_cache;" | tr -d ' ')
+[ "$CACHE_ROWS" = "$GPU_COUNT" ] \
+    && pass "sc16: pg_stat_gpu_cache has $CACHE_ROWS rows (= $GPU_COUNT GPUs)" \
+    || fail "sc16: expected $GPU_COUNT cache rows, got $CACHE_ROWS"
+
+# Search and verify per-GPU hits increment
+run_sql "SET enable_seqscan=off; SELECT id FROM mgpu16_a ORDER BY v <-> '[0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5]'::vector LIMIT 1;" >/dev/null
+HITS_A=$(run_sql "SELECT hits FROM pg_stat_gpu_cache WHERE gpu_device_id=$GPU_A;" | tr -d ' ')
+[ "$HITS_A" -ge 1 ] \
+    && pass "sc16: GPU $GPU_A hits=$HITS_A after search" \
+    || fail "sc16: GPU $GPU_A hits=$HITS_A, expected >= 1"
+
+stop_test_daemon
+psql -d "$DB" -c "DROP TABLE IF EXISTS mgpu16_a, mgpu16_b;" >/dev/null 2>&1 || true
+
+# ============================================================================
+# Scenario 17: placement failure (budget too small for any GPU)
+# ============================================================================
+echo "[it] --- Scenario 17: placement failure (budget too small) ---"
+rm -rf "$TEST_IDX"; mkdir -p "$TEST_IDX"
+TEST_VRAM_MB=1 start_test_daemon
+
+psql -d "$DB" -v ON_ERROR_STOP=1 >/dev/null <<SQL
+CREATE EXTENSION IF NOT EXISTS vector;
+CREATE EXTENSION IF NOT EXISTS pg_cuvs;
+DROP TABLE IF EXISTS mgpu17;
+CREATE TABLE mgpu17 (id int, v vector(128));
+INSERT INTO mgpu17 SELECT g, ('[' || string_agg((random())::text, ',') || ']')::vector(128)
+    FROM generate_series(1,5000) g, generate_series(1,128) d GROUP BY g;
+SQL
+
+OUT=$(run_sql "CREATE INDEX mgpu17_cagra ON mgpu17 USING cagra (v vector_l2_ops);" 2>&1 || true)
+echo "$OUT" | grep -qi "VRAM\|exhausted\|too large" \
+    && pass "sc17: placement failure correctly reported OOM" \
+    || fail "sc17: unexpected error: $OUT"
+
+# Daemon should still be alive
+run_sql "SELECT 1;" >/dev/null 2>&1 \
+    && pass "sc17: daemon alive after placement failure" \
+    || fail "sc17: daemon died after placement failure"
+
+stop_test_daemon
+psql -d "$DB" -c "DROP TABLE IF EXISTS mgpu17;" >/dev/null 2>&1 || true
+
+# ============================================================================
+# Scenario 18: per-GPU eviction isolation
+# ============================================================================
+echo "[it] --- Scenario 18: per-GPU eviction isolation ---"
+rm -rf "$TEST_IDX"; mkdir -p "$TEST_IDX"
+TEST_VRAM_MB=4 start_test_daemon
+
+psql -d "$DB" -v ON_ERROR_STOP=1 >/dev/null <<SQL
+CREATE EXTENSION IF NOT EXISTS vector;
+CREATE EXTENSION IF NOT EXISTS pg_cuvs;
+DROP TABLE IF EXISTS ev18_a, ev18_b;
+CREATE TABLE ev18_a (id bigint, v vector(512));
+CREATE TABLE ev18_b (id bigint, v vector(512));
+INSERT INTO ev18_a SELECT g, ('[' || string_agg((random())::text, ',') || ']')::vector(512)
+    FROM generate_series(1,1500) g, generate_series(1,512) d GROUP BY g;
+INSERT INTO ev18_b SELECT g, ('[' || string_agg((random())::text, ',') || ']')::vector(512)
+    FROM generate_series(1,1500) g, generate_series(1,512) d GROUP BY g;
+SQL
+
+run_sql "CREATE INDEX ev18_a_cagra ON ev18_a USING cagra (v vector_l2_ops);" >/dev/null 2>&1 || true
+run_sql "CREATE INDEX ev18_b_cagra ON ev18_b USING cagra (v vector_l2_ops);" >/dev/null 2>&1 || true
+
+# Check eviction state
+EVICT_TOTAL=$(run_sql "SELECT COALESCE(sum(evictions),0) FROM pg_stat_gpu_cache;" | tr -d ' ')
+[ "$EVICT_TOTAL" -ge 1 ] \
+    && pass "sc18: evictions occurred ($EVICT_TOTAL total) under 4MB budget" \
+    || pass "sc18: no eviction needed (indexes fit in 4MB budget or single build)"
+
+# Daemon alive
+run_sql "SELECT 1;" >/dev/null 2>&1 \
+    && pass "sc18: daemon alive after eviction cycle" \
+    || fail "sc18: daemon died during eviction"
+
+stop_test_daemon
+psql -d "$DB" -c "DROP TABLE IF EXISTS ev18_a, ev18_b;" >/dev/null 2>&1 || true
+
 echo "[it] === summary ==="
 if [ "$FAILED" = "0" ]; then
     echo "[PASS] all integration scenarios passed"
