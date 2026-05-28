@@ -1006,7 +1006,8 @@ echo "[it] --- Scenario 16: multi-GPU placement + per-GPU stats ---"
 stop_test_daemon
 rm -rf "$TEST_IDX"; mkdir -p "$TEST_IDX"
 start_test_daemon
-GPU_COUNT=$(run_sql "SELECT count(DISTINCT gpu_device_id) FROM pg_stat_gpu_cache;" | tr -d ' ')
+run_sql "SELECT count(DISTINCT gpu_device_id) FROM pg_stat_gpu_cache;"
+GPU_COUNT=$(echo "$OUT" | grep -o '[0-9]*' | head -1)
 echo "[it] detected $GPU_COUNT GPU(s) in daemon"
 
 psql -d "$DB" -v ON_ERROR_STOP=1 >/dev/null <<SQL
@@ -1026,7 +1027,8 @@ run_sql "CREATE INDEX mgpu16_a_cagra ON mgpu16_a USING cagra (v vector_l2_ops);"
 run_sql "CREATE INDEX mgpu16_b_cagra ON mgpu16_b USING cagra (v vector_l2_ops);" >/dev/null \
     || fail "sc16: build mgpu16_b failed: $OUT"
 
-GPUS=$(run_sql "SELECT gpu_device_id FROM pg_stat_gpu_search WHERE index_name IN ('mgpu16_a_cagra','mgpu16_b_cagra') ORDER BY index_name;" | tr -d ' ')
+run_sql "SELECT gpu_device_id FROM pg_stat_gpu_search WHERE index_name IN ('mgpu16_a_cagra','mgpu16_b_cagra') ORDER BY index_name;"
+GPUS=$(echo "$OUT" | grep -o '[0-9]*')
 GPU_A=$(echo "$GPUS" | head -1)
 GPU_B=$(echo "$GPUS" | tail -1)
 
@@ -1041,14 +1043,16 @@ else
 fi
 
 # Verify per-GPU cache rows are distinct
-CACHE_ROWS=$(run_sql "SELECT count(*) FROM pg_stat_gpu_cache;" | tr -d ' ')
+run_sql "SELECT count(*) FROM pg_stat_gpu_cache;"
+CACHE_ROWS=$(echo "$OUT" | grep -o '[0-9]*' | head -1)
 [ "$CACHE_ROWS" = "$GPU_COUNT" ] \
     && pass "sc16: pg_stat_gpu_cache has $CACHE_ROWS rows (= $GPU_COUNT GPUs)" \
     || fail "sc16: expected $GPU_COUNT cache rows, got $CACHE_ROWS"
 
 # Search and verify per-GPU hits increment
-run_sql "SET enable_seqscan=off; SELECT id FROM mgpu16_a ORDER BY v <-> '[0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5]'::vector LIMIT 1;" >/dev/null
-HITS_A=$(run_sql "SELECT hits FROM pg_stat_gpu_cache WHERE gpu_device_id=$GPU_A;" | tr -d ' ')
+run_sql "SET enable_seqscan=off; SELECT id FROM mgpu16_a ORDER BY v <-> '[0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5]'::vector LIMIT 1;" >/dev/null 2>&1
+run_sql "SELECT hits FROM pg_stat_gpu_cache WHERE gpu_device_id=$GPU_A;"
+HITS_A=$(echo "$OUT" | grep -o '[0-9]*' | head -1)
 [ "$HITS_A" -ge 1 ] \
     && pass "sc16: GPU $GPU_A hits=$HITS_A after search" \
     || fail "sc16: GPU $GPU_A hits=$HITS_A, expected >= 1"
@@ -1072,7 +1076,7 @@ INSERT INTO mgpu17 SELECT g, ('[' || string_agg((random())::text, ',') || ']')::
     FROM generate_series(1,5000) g, generate_series(1,128) d GROUP BY g;
 SQL
 
-OUT=$(run_sql "CREATE INDEX mgpu17_cagra ON mgpu17 USING cagra (v vector_l2_ops);" 2>&1 || true)
+run_sql "CREATE INDEX mgpu17_cagra ON mgpu17 USING cagra (v vector_l2_ops);" 2>/dev/null || true
 echo "$OUT" | grep -qi "VRAM\|exhausted\|too large" \
     && pass "sc17: placement failure correctly reported OOM" \
     || fail "sc17: unexpected error: $OUT"
@@ -1108,7 +1112,8 @@ run_sql "CREATE INDEX ev18_a_cagra ON ev18_a USING cagra (v vector_l2_ops);" >/d
 run_sql "CREATE INDEX ev18_b_cagra ON ev18_b USING cagra (v vector_l2_ops);" >/dev/null 2>&1 || true
 
 # Check eviction state
-EVICT_TOTAL=$(run_sql "SELECT COALESCE(sum(evictions),0) FROM pg_stat_gpu_cache;" | tr -d ' ')
+run_sql "SELECT COALESCE(sum(evictions),0) FROM pg_stat_gpu_cache;"
+EVICT_TOTAL=$(echo "$OUT" | grep -o '[0-9]*' | head -1)
 [ "$EVICT_TOTAL" -ge 1 ] \
     && pass "sc18: evictions occurred ($EVICT_TOTAL total) under 4MB budget" \
     || pass "sc18: no eviction needed (indexes fit in 4MB budget or single build)"
