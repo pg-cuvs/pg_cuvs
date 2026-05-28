@@ -426,10 +426,22 @@ NOTICE:  pg_cuvs: cagra scan ...
   1
 (1 row)
 ```
-**→ `id = 1`:** GPU 검색 정상 동작  
-**→ `NOTICE` 없이 결과만 나옴:** CPU fallback 중 — daemon 로그 확인  
+**→ `id = 1` + NOTICE 있음:** GPU 검색 정상 동작  
+**→ NOTICE 없이 `Seq Scan`:** 테이블이 너무 작아 planner가 seqscan 선택 — 정상. 아래 강제 확인법 사용  
 **→ `BUILD failed (status 4)`:** daemon 미기동 → Step 6 재수행  
 **→ `could not load library`:** rpath 문제 → Step 2~3 재빌드
+
+> **소규모 테이블에서 GPU path 강제 확인:**  
+> PostgreSQL planner는 행 수가 적으면 항상 seqscan을 선택한다.  
+> cagra index 사용 여부를 확인하려면 `enable_seqscan = off`로 강제해야 한다.
+> ```sql
+> SET enable_seqscan = off;
+> SET cuvs.debug = on;
+> SELECT id FROM _smoke ORDER BY v <-> '[1,0,0,0]'::vector LIMIT 1;
+> -- NOTICE: pg_cuvs: cagra scan ... 이 나와야 함
+> SET enable_seqscan = on;
+> SET cuvs.debug = off;
+> ```
 
 ---
 
