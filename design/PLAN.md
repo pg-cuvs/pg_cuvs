@@ -466,7 +466,7 @@ Phase 3D 완료 기준:
 Scope decision:
 - Phase 3E의 본체는 PostgreSQL partitioning recipe가 아니라 **daemon-level multi-GPU runtime**이다.
 - PostgreSQL partitioning은 하나의 logical parent table을 여러 physical CAGRA indexes로 나누어 multi-GPU runtime을 활용하는 integration recipe일 뿐이다.
-- 단일 physical CAGRA index를 여러 GPU shard로 자동 분할하는 internal sub-index sharding은 3E MVP가 아니라 optional/future subphase다.
+- 단일 physical CAGRA index를 여러 GPU shard로 자동 분할하는 internal sub-index sharding은 3E MVP가 아니라 별도 Phase 3F다.
 - 이미 완료된 Phase 3A/3C/3D 번호는 유지한다. 3E 내부 subphase만 분리한다.
 
 3E-0 Architecture decision:
@@ -534,43 +534,93 @@ Scope decision:
 - GPU unavailable 또는 placement failure 시나리오가 3E-2 정책과 같은 결과를 낸다.
 - multi-GPU VM은 검증 후 stop/delete하거나 비용 상태를 명시적으로 보고한다.
 
-3E-5 Optional/future internal sub-index sharding:
-- 단일 non-partitioned table / 단일 logical CAGRA index를 여러 GPU shard로 나누는 설계는 별도 고급 기능으로 둔다.
-- 이 기능은 CAGRA graph split, per-shard over-fetch, daemon fanout, top-k merge, recall policy를 새로 요구하므로 3E MVP 완료 기준에 넣지 않는다.
-
-3E-5 decision record:
-- 3E MVP에서는 internal sub-index sharding을 구현하지 않는다.
-- 후속 단계로 승격하려면 별도 ADR/plan이 필요하다.
-- ADR에는 shard assignment, per-shard artifact naming, build/serialize/load, query fanout, `k + slop`, daemon top-k merge, recall evaluation, shard failure semantics, snapshot/delta/tombstone compatibility를 포함해야 한다.
-- 이 결정을 통해 Phase 3E의 완료 기준은 "여러 physical CAGRA indexes를 여러 GPUs에 배치/검색"으로 고정하고, "하나의 physical CAGRA index를 여러 GPUs에 split"은 future work로 둔다.
+3E-4 verified evidence:
+- multi-GPU VM detected GPU 0 and GPU 1 at daemon startup.
+- 2+ CAGRA indexes were resident on different GPUs.
+- `pg_stat_gpu_cache` returned independent per-GPU counters; targeted searches incremented hits on each GPU separately.
+- concurrent benchmark passed: 805 TPS, 8052 transactions, with GPU 0 and GPU 1 each recording +8052 hits.
+- VRAM pressure eviction isolation passed: GPU 0 evictions=1 while GPU 1 evictions=0.
+- `--gpu-devices` restriction passed: GPU 0 only, one cache row exposed.
+- multi-GPU VM was stopped after validation (`TERMINATED`).
 
 Phase 3E 완료 기준:
 - daemon-level multi-GPU runtime이 여러 CUDA devices를 관리하고, physical CAGRA indexes를 GPU별로 배치/검색할 수 있다.
 - GPU별 VRAM budget과 eviction policy가 서로 간섭하지 않는다.
 - GPU unavailable / placement failure / VRAM pressure에 대한 degraded mode가 명확하다.
 - partitioned parent table recipe는 하나의 logical table query로 보이면서 여러 physical CAGRA indexes를 multi-GPU runtime에 태우는 방식을 검증한다.
-- internal sub-index sharding은 명시적으로 future work로 남긴다.
 
-#### Phase 3F — Operational Playbooks / Runbooks
+Phase 3E status: MVP complete. 3E-1 placement, 3E-2 degraded/placement policy,
+3E-3 partitioned logical-table integration, and 3E-4 hardware acceptance passed.
+True single-index multi-GPU CAGRA sharding is split out as Phase 3F.
+
+#### Phase 3F — True Multi-GPU CAGRA Sharding
 
 목표:
-- Phase 3A-3E의 실제 운영 표면이 고정된 뒤 최종 운영 playbook을 작성한다. Phase 3D 중간 상태에서 replica/object-storage playbook을 자세히 만들면 3E multi-GPU/sharding 도입 후 절차가 다시 바뀌므로, Phase 3 최종 playbook은 3E 완료 이후로 둔다.
+- 단일 non-partitioned table / 단일 logical CAGRA index를 내부적으로 N개 shard로 나누고, 하나의 query를 여러 GPUs에 fanout한 뒤 daemon에서 global top-k를 merge한다.
+- 사용자 SQL/DDL surface는 기존과 같다: `CREATE INDEX ... USING cagra (...)`와 parent/child partition 직접 query 없이 일반 table query를 유지한다.
+- Phase 3E의 index-level multi-GPU runtime은 기반으로 사용하지만, Phase 3F는 별도 artifact/runtime/query-merge 기능으로 취급한다.
+
+Shard model:
+- 첫 구현은 build-order contiguous ranges로 shard한다. 즉 global `.tids` 배열의 `[start,end)` range가 shard 하나에 대응한다.
+- Vector clustering 기반 shard assignment는 recall/cost trade-off가 커서 후속 연구로 둔다.
+- 각 shard는 독립 cuVS CAGRA artifact이며 하나의 GPU에 resident한다. shard 하나가 여러 GPUs에 걸치지 않고, logical index가 여러 shard/GPU를 소유한다.
+
+Artifact contract:
+- legacy unsharded index는 현재처럼 `<db>_<index>.cagra` + `<db>_<index>.tids`를 유지한다.
+- sharded index는 global `<db>_<index>.tids`를 generation/TID source of truth로 유지하고, `<db>_<index>.shards` manifest를 commit marker로 추가한다.
+- shard artifacts는 예: `<db>_<index>.s000.cagra`, `<db>_<index>.s001.cagra` 형태를 사용한다.
+- `.shards` manifest는 shard count, shard id, global TID start offset, n_vecs, dim, metric, assigned gpu, artifact checksum, base `.tids` CRC를 포함한다.
+- durable DDL contract는 all-or-nothing이다. 모든 shard `.cagra.tmp`, global `.tids.tmp`, `.shards.tmp`를 fsync한 뒤 final rename하고, `.shards` manifest rename을 마지막 commit marker로 삼는다. startup은 manifest가 없거나 shard/checksum이 맞지 않으면 logical sharded index를 load하지 않는다.
+
+Daemon/runtime design:
+- `IndexEntry`는 unsharded entry와 sharded logical entry를 구분한다. sharded logical entry는 `ShardEntry[]`를 소유한다.
+- `ShardEntry`는 shard id, `CuvsCagraIndex` handle, global TID offset, n_vecs, gpu_device_id, vram_bytes, search/error counters, last status를 가진다.
+- build는 `cuvs.shard_count` 또는 auto policy로 shard count를 결정한다. auto는 per-GPU VRAM budget과 `estimate_vram_bytes()`를 기준으로 단일 GPU에 들어가지 않는 index를 split한다.
+- placement는 3E-1/3E-2의 VRAM-aware policy를 shard 단위로 적용한다. 한 logical index의 shards는 가능한 한 여러 GPUs에 spread하고, 특정 GPU restriction(`--gpu-devices`)을 존중한다.
+- search는 one IPC request per logical index를 유지한다. daemon이 shard별 CAGRA search를 병렬 실행하고, metric-aware comparator로 global top-k를 merge해서 기존 reply format(TIDs + distances)을 반환한다.
+- per-shard request k는 최소 `k`로 시작한다. 그래야 global top-k가 한 shard에 몰리는 경우도 후보 부족으로 놓치지 않는다. 추후 `cuvs.shard_overfetch`로 `k + slop`을 조정할 수 있다.
+- shard 하나라도 unavailable/reload 실패/VRAM failure이면 partial ANN result를 반환하지 않는다. 기본 정책은 SELECT CPU fallback, DDL/REINDEX ERROR다. partial degraded recall은 별도 opt-in GUC 없이는 허용하지 않는다.
+
+Delta/tombstone compatibility:
+- `.delta` generation은 global `.tids` CRC에 계속 묶는다.
+- 1차 구현은 sharded base search와 backend CPU delta merge fallback을 유지한다. daemon-side GPU delta cache를 shard별로 split하는 것은 후속 최적화다.
+- `.tombstone`은 global TID 기준으로 유지하고 backend snapshot-aware filtering을 계속 적용한다.
+- REINDEX는 global `.tids`, `.shards`, shard `.cagra` artifacts, `.delta`, `.tombstone`을 같은 generation 경계로 정리한다.
+
+Observability:
+- `pg_stat_gpu_search`는 logical index row를 유지한다. unsharded index는 `gpu_device_id`를 표시하고, sharded index는 `gpu_device_id`를 NULL/unknown으로 두거나 대표값 없이 `shard_count`를 노출한다.
+- 새 view `pg_stat_gpu_shards`를 추가해 `index_oid`, `index_name`, `shard_id`, `gpu_device_id`, `n_vecs`, `resident`, `vram_used_mb`, `search_count`, `error_count`, `last_status`를 노출한다.
+- `pg_stat_gpu_cache`는 기존 per-GPU counters를 유지하며 shard resident count도 resident_count에 포함한다.
+
+Phase 3F 완료 기준:
+- single non-partitioned table + single logical CAGRA index에서 `cuvs.shard_count=2`로 build하면 두 shard가 GPU 0/1에 분산 resident한다.
+- parent/partition 없이 일반 table query가 daemon shard fanout을 사용하고, top-k result가 `enable_cuvs=off` CPU exact와 일치한다.
+- concurrent benchmark에서 GPU 0/1 shard search counters가 모두 증가한다.
+- daemon restart 후 `.shards` manifest와 shard artifacts로 rebuild 없이 reload한다.
+- shard artifact 하나가 손상되면 partial result가 아니라 CPU fallback 또는 ERROR로 fail closed한다.
+- delta/tombstone이 존재하는 상태에서도 INSERT/UPDATE/DELETE correctness contract를 유지한다.
+
+#### Phase 3G — Operational Playbooks / Runbooks
+
+목표:
+- Phase 3A-3F의 실제 운영 표면이 고정된 뒤 최종 운영 playbook을 작성한다. Phase 3D 중간 상태에서 replica/object-storage playbook을 자세히 만들면 3F true sharding 도입 후 절차가 다시 바뀌므로, Phase 3 최종 playbook은 3F true sharding 완료 이후로 둔다.
 
 구현 항목:
 - replica bootstrap / instance replacement runbook.
 - object storage permission failure, corrupt manifest, heap compatibility mismatch 대응.
 - async warmup/cache hydration 진단.
 - multi-GPU runtime warmup, per-GPU VRAM pressure, placement failure/degraded mode 복구.
+- true sharding manifest corruption, missing shard, shard reload failure, shard-level stats 진단.
 - capacity planning: VRAM, NVMe, object storage artifact size, delta growth.
 - on-call triage: stats view, daemon logs, PostgreSQL warnings/errors, GCS audit/logging 확인 순서.
 
-Phase 3F 완료 기준:
-- Phase 3A-3E의 기능/관측성 표면을 기준으로 `docs/playbooks/`에 최종 운영 runbook을 작성한다.
+Phase 3G 완료 기준:
+- Phase 3A-3F의 기능/관측성 표면을 기준으로 `docs/playbooks/`에 최종 운영 runbook을 작성한다.
 - 각 playbook은 최소 하나의 검증된 GPU VM 또는 replica 시나리오를 근거로 한다.
 - Phase 1.5 playbook은 baseline 문서로 유지하고, Phase 3 playbook은 multi-node/multi-GPU 운영 절차를 별도 문서로 둔다.
 
 Phase 3 전체 완료 기준:
-- Phase 3A-3F의 subphase 완료 기준을 모두 만족한다.
+- Phase 3A-3G의 subphase 완료 기준을 모두 만족한다.
 - 각 subphase는 독립적으로 중단/릴리스 가능하며, 다음 subphase 미완료가 이전 subphase의 정합성을 깨지 않는다.
 
 ---

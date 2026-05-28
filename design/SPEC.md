@@ -348,6 +348,16 @@ status for playbook diagnosis. Product Phase 2 exposes stale/error status and
 global cache counters; detailed fallback reason is a deferred enhancement.
 ```
 
+**STAT-05 — Multi-GPU Shard Observability**
+```
+When a logical cagra index is internally split across multiple GPU shards, the
+pg_cuvs extension shall expose shard-level placement and health through a SQL
+view such as `pg_stat_gpu_shards`. At minimum it shall report index identity,
+shard id, GPU device id, vector count, resident state, VRAM bytes, search count,
+error count, and last status. A sharded logical index shall not be represented
+as if it lived on a single GPU in `pg_stat_gpu_search`.
+```
+
 ---
 
 ## 8. Phase 3C — Object Storage Snapshot (Q8)
@@ -393,7 +403,53 @@ the index artifact.
 
 ---
 
-## 9. 코스트 모델 (ADR-003)
+## 9. Phase 3F — True Multi-GPU CAGRA Sharding
+
+**MGPU-01 — Logical Index Sharding**
+```
+The pg_cuvs daemon shall support a logical cagra index whose base CAGRA graph is
+split into multiple independent shard artifacts, each resident on exactly one
+GPU. The SQL surface remains a single PostgreSQL index; query execution fans out
+inside the daemon and returns one global top-k result set to the backend.
+```
+
+**MGPU-02 — Artifact Contract**
+```
+A sharded cagra index shall preserve the global `.tids` sidecar as the
+generation and heap-TID source of truth. A `.shards` manifest shall describe
+each shard's id, global TID offset, vector count, metric, dimension, assigned
+GPU, artifact path, checksum, and base `.tids` CRC. The manifest is the commit
+marker; startup shall not load a sharded index when the manifest or any shard
+artifact is missing, corrupt, or generation-incompatible.
+```
+
+**MGPU-03 — Query Fanout and Merge**
+```
+For a sharded cagra search, pg_cuvs_server shall execute CAGRA search on every
+resident shard, request at least k candidates per shard, and perform a
+metric-compatible daemon-side merge to produce the final top-k TIDs/distances.
+The backend IPC reply format shall remain a single ordered result stream.
+```
+
+**MGPU-04 — Fail-Closed Shard Semantics**
+```
+If any shard of a logical cagra index is unavailable, fails to reload, has a
+corrupt artifact, or cannot fit in its assigned GPU's VRAM, pg_cuvs shall not
+serve partial ANN results by default. SELECT shall fall back to CPU; CREATE
+INDEX / REINDEX shall ERROR unless all shards build and persist successfully.
+```
+
+**MGPU-05 — Delta/Tombstone Compatibility**
+```
+Pending delta and tombstone artifacts remain tied to the global `.tids` CRC.
+The initial sharded implementation may keep backend CPU delta merge as the
+correctness fallback, but tombstone filtering must remain snapshot-aware and
+must apply to the merged shard result before returning heap TIDs to PostgreSQL.
+```
+
+---
+
+## 10. 코스트 모델 (ADR-003)
 
 **COST-01**
 ```
@@ -437,7 +493,7 @@ operator or operator class identity, not from a strategy-number heuristic.
 
 ---
 
-## 10. 테스트 및 운영 플레이북
+## 11. 테스트 및 운영 플레이북
 
 **TEST-01**
 ```
@@ -507,18 +563,19 @@ persistence corruption recovery, VRAM OOM fallback, and rollback/cleanup.
 
 **TEST-09**
 ```
-Final Phase 3 operational playbooks shall be written after Phase 3E multi-GPU
-runtime behavior is complete. These runbooks shall cover replica bootstrap,
+Final Phase 3 operational playbooks shall be written after Phase 3F true
+multi-GPU CAGRA sharding behavior is complete. These runbooks shall cover replica bootstrap,
 object-storage artifact recovery, heap-compatibility mismatch, async warmup and
 cache hydration, multi-GPU placement/warmup, per-GPU VRAM pressure, placement
-failure/degraded mode, and capacity planning. Earlier Phase 3 documents shall
-capture contracts and acceptance criteria, not detailed operational runbooks
-that would become stale before 3E.
+failure/degraded mode, true-sharding manifest or shard-artifact failures, and
+capacity planning. Earlier Phase 3 documents shall capture contracts and
+acceptance criteria, not detailed operational runbooks that would become stale
+before 3F.
 ```
 
 ---
 
-## 11. 운영 인터페이스 (GUC 목록)
+## 12. 운영 인터페이스 (GUC 목록)
 
 | GUC | 타입 | 기본값 | 설명 |
 |-----|------|--------|------|
@@ -532,3 +589,5 @@ that would become stale before 3E.
 | `cuvs.snapshot_uri` | string | '' | Phase 3C object storage root, e.g. `gs://bucket/prefix` (비어있으면 비활성) |
 | `cuvs.cluster_id` | string | '' | Phase 3 멀티노드 식별자 |
 | `cuvs.warmup_threads` | int | 2 | Phase 3D background artifact download/load worker count |
+| `cuvs.shard_count` | int | 0 (auto/off) | Phase 3F logical CAGRA internal shard count; 0 keeps current unsharded behavior unless auto policy is enabled |
+| `cuvs.shard_overfetch` | int | 0 (auto) | Additional candidates per shard for daemon-side global top-k merge |
