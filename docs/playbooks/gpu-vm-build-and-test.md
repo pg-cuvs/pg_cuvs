@@ -14,25 +14,84 @@ GPU VM에서 pg_cuvs를 처음 빌드하거나 재빌드할 때 사용한다.
 
 ---
 
-## 2. 확인 명령 (Diagnostic commands)
+## 2. 진단
+
+### VM 상태 확인
+
+VM이 꺼진 경우 먼저 기동한다.
 
 ```bash
-# VM 상태 확인
-make vm-start          # VM이 꺼져 있을 때
+# make vm-start 가 실제로 하는 것 (Makefile:166):
+gcloud compute instances start $GCP_INSTANCE --zone $GCP_ZONE
+# SSH가 응답할 때까지 3초 간격으로 폴링
+until ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=no $GCP_VM true 2>/dev/null; do sleep 3; done
+echo "VM ready: $GCP_VM"
 
-# 빌드 로그 확인 (VM에서)
-ssh $GCP_VM "tail -50 /tmp/pg_cuvs_build.log"
+# 또는 래퍼:
+make vm-start
+```
 
-# 설치된 .so 확인
-ssh $GCP_VM "ls -la \$(pg_config --pkglibdir)/pg_cuvs.so"
+**기대 출력:**
+```
+VM ready: ubuntu@35.224.x.x
+```
+**-> 정상:** 진단 2로  
+**-> timeout 무한 반복:** IP가 변경됐을 가능성 → `gpu-vm-lifecycle.md` "IP 변경 후" Step으로
 
-# conda 환경 확인
-ssh $GCP_VM "source ~/miniforge3/bin/activate ${CONDA_ENV} && echo \$CONDA_PREFIX && ls \$CONDA_PREFIX/lib/libcuvs.so"
+---
 
-# rpath 확인
+### conda 환경 확인
+
+```bash
+ssh $GCP_VM "source ~/miniforge3/bin/activate ${CONDA_ENV} && \
+  echo CONDA_PREFIX=\$CONDA_PREFIX && \
+  ls \$CONDA_PREFIX/lib/libcuvs.so && \
+  echo OK"
+```
+
+**기대 출력:**
+```
+CONDA_PREFIX=/home/ubuntu/miniforge3/envs/rapids
+/home/ubuntu/miniforge3/envs/rapids/lib/libcuvs.so
+OK
+```
+**-> 정상:** 진단 3으로  
+**-> `CONDA_PREFIX=` (빈 값):** 원인 A  
+**-> `No such file or directory` (libcuvs.so 없음):** 원인 A
+
+---
+
+### rpath 확인
+
+```bash
 ssh $GCP_VM "source ~/miniforge3/bin/activate ${CONDA_ENV} && \
   objdump -x \$(pg_config --pkglibdir)/pg_cuvs.so | grep RPATH"
 ```
+
+**기대 출력:**
+```
+  RPATH                /home/ubuntu/miniforge3/envs/rapids/lib
+```
+**-> 정상:** 진단 4로  
+**-> 출력 없음:** 원인 B → Step 1(sync)부터 전체 재빌드 필요
+
+---
+
+### 빌드 로그 확인
+
+빌드 실패 시 VM의 로그를 확인한다.
+
+```bash
+ssh $GCP_VM "tail -50 /tmp/pg_cuvs_build.log"
+```
+
+**기대 출력:**
+```
+gcc ... -o pg_cuvs.so
+```
+**-> `#include <cuvs/neighbors/cagra.hpp>` not found:** 원인 A  
+**-> `-lcuvs` 링크 실패:** 원인 A  
+**-> `libcuvs.so: cannot open shared object file` (런타임):** 원인 B
 
 ---
 
@@ -41,79 +100,234 @@ ssh $GCP_VM "source ~/miniforge3/bin/activate ${CONDA_ENV} && \
 ### A. conda 환경이 활성화되지 않음
 `CONDA_PREFIX`가 비어 있어 `CUVS_INCLUDE`/`CUVS_LIB`이 해결되지 않는다.
 증상: `#include <cuvs/neighbors/cagra.hpp> not found` 또는 `-lcuvs` 링크 실패.
+-> 복구 Step 1(sync)부터 전체 빌드 순서 수행
 
 ### B. rpath가 없어 postmaster가 libcuvs.so를 못 찾음
 `shared_preload_libraries = 'pg_cuvs'` 재시작 시 `libcuvs.so: cannot open shared object file`.
 `SHLIB_LINK`의 `-Wl,-rpath,$(CUVS_LIB)` 누락이 원인.
+-> 복구 Step 1부터 전체 재빌드 수행
 
 ### C. conda env lib 전체를 ldconfig에 등록한 경우 (심각)
 VM이 부팅 불능 또는 `/usr/bin/python3` 같은 시스템 바이너리가 동작하지 않는다.
 `libstdc++.so.6` + `libgcc_s.so.1` 두 파일만 `/usr/local/lib`에 심볼릭 링크해야 한다.
 복구: `design/` 디렉터리의 troubleshooting.md "ldconfig 사고" 항목 참조.
+-> Escalation 항목으로
 
 ### D. pg_cuvs_server 바이너리가 오래됨
 `gpu-server` 단계를 건너뛰어 새 IPC 프로토콜과 구버전 daemon이 불일치한다.
+-> 복구 Step 4로
 
 ### E. shared_preload_libraries 미설정
 `make gpu-postinstall`이 아직 실행되지 않아 첫 쿼리 planning이 ~95ms 소요된다 (ADR-018).
+-> 복구 Step 5로
 
 ---
 
-## 4. 복구 절차 (Recovery steps)
+## 4. Step-by-step 복구
 
-### 표준 전체 빌드 순서
+### Step 0 (선택) — VM 기동
+
+VM이 TERMINATED 상태일 때만 실행한다.
 
 ```bash
-# 1. 로컬 -> VM 동기화
+# make vm-start 가 실제로 하는 것 (Makefile:166):
+gcloud compute instances start $GCP_INSTANCE --zone $GCP_ZONE
+until ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=no $GCP_VM true 2>/dev/null; do sleep 3; done
+echo "VM ready: $GCP_VM"
+
+# 또는 래퍼:
+make vm-start
+```
+
+**기대 출력:**
+```
+VM ready: ubuntu@35.224.x.x
+```
+**-> 성공:** Step 1로  
+**-> SSH 폴링이 1분 이상 반복:** IP 변경 → `gpu-vm-lifecycle.md` "IP 변경 후"로  
+**-> `ERROR: set GCP_INSTANCE in .env.gpu`:** `.env.gpu` 파일에 `GCP_INSTANCE` 설정 필요
+
+---
+
+### Step 1 — 로컬 소스 동기화
+
+`.o`, `.bc`, `.so`, `.env.gpu`는 VM에서 생성/관리하므로 rsync 대상에서 제외한다.
+
+```bash
+# make sync 가 실제로 하는 것 (Makefile:179):
+rsync -avz --delete \
+    --exclude '.git' \
+    --exclude 'src/*.o' \
+    --exclude 'src/*.bc' \
+    --exclude '*.so' \
+    --exclude '.env.gpu' \
+    ./ $GCP_VM:~/pg_cuvs/
+
+# 또는 래퍼:
 make sync
+```
 
-# 2. VM에서 빌드 (.o 파일은 rsync 제외 대상이므로 VM에서 클린 빌드)
+**기대 출력:**
+```
+sending incremental file list
+...
+sent N bytes  received M bytes  ...
+```
+**-> 성공:** Step 2로  
+**-> `ssh: connect to host ... Connection refused`:** Step 0으로 (VM이 꺼짐)  
+**-> `rsync: [sender] change_dir "/..." failed`:** 로컬 경로 확인
+
+---
+
+### Step 2 — GPU VM에서 빌드
+
+conda 환경 활성화 후 `make`를 실행하고 로그를 `/tmp/pg_cuvs_build.log`에 저장한다.
+
+```bash
+# make gpu-build 가 실제로 하는 것 (Makefile:188):
+ssh -tt $GCP_VM "cd ~/pg_cuvs && \
+    source ~/miniforge3/bin/activate $CONDA_ENV && \
+    make 2>&1 | tee /tmp/pg_cuvs_build.log"
+
+# 또는 래퍼:
 make gpu-build
+```
 
-# 3. PG 확장 설치 (sudo make install)
+**기대 출력 (마지막 줄):**
+```
+gcc ... -shared -o pg_cuvs.so ...
+```
+**-> 성공:** Step 3으로  
+**-> `cagra.hpp: No such file or directory`:** 원인 A — `$CONDA_ENV` 환경변수가 `.env.gpu`에 있는지 확인  
+**-> `-lcuvs: not found`:** 원인 A — conda env 내 libcuvs.so 존재 여부 확인  
+**-> 기타 컴파일 오류:** `ssh $GCP_VM "tail -50 /tmp/pg_cuvs_build.log"` 로 상세 확인
+
+---
+
+### Step 3 — PG 확장 설치
+
+```bash
+# make gpu-install 가 실제로 하는 것 (Makefile:193):
+ssh -tt $GCP_VM "cd ~/pg_cuvs && \
+    source ~/miniforge3/bin/activate $CONDA_ENV && \
+    sudo -E make install"
+
+# 또는 래퍼:
 make gpu-install
+```
 
-# 4. pg_cuvs_server 바이너리 빌드 + 설치
+**기대 출력:**
+```
+/usr/bin/install ... pg_cuvs.so '/usr/lib/postgresql/.../lib'
+/usr/bin/install ... pg_cuvs.control '/usr/share/postgresql/.../extension/'
+```
+**-> 성공:** Step 4로  
+**-> `sudo: make: command not found`:** `sudo -E`가 PATH를 승계하지 못함 — VM에서 `/etc/sudoers`의 `secure_path` 확인  
+**-> `Permission denied`:** VM의 PG 설치 경로 권한 문제
+
+---
+
+### Step 4 — pg_cuvs_server 바이너리 빌드 + 설치
+
+```bash
+# make gpu-server 가 실제로 하는 것 (Makefile:203):
+ssh -tt $GCP_VM "cd ~/pg_cuvs && \
+    source ~/miniforge3/bin/activate $CONDA_ENV && \
+    make server && sudo make install-server"
+
+# 또는 래퍼:
 make gpu-server
-
-# 5. post-install 설정 (shared_preload_libraries, libstdc++ 심링크, PG restart)
-make gpu-postinstall
-
-# 6. 회귀 테스트
-make gpu-test
 ```
 
-### conda 환경 문제 수동 확인
+**기대 출력:**
+```
+gcc ... -o pg_cuvs_server ...
+install ... pg_cuvs_server '/usr/local/bin/'
+```
+**-> 성공:** Step 5로  
+**-> 컴파일 오류:** Step 2 실패와 동일하게 빌드 로그 확인  
+**-> `install-server: No rule to make target`:** Makefile에 `install-server` 타겟 없음 — 코드 확인 필요
+
+---
+
+### Step 5 — post-install 설정
+
+`shared_preload_libraries` 추가, `libstdc++` 심볼릭 링크, PG 재시작을 수행한다. idempotent.
 
 ```bash
-ssh -tt $GCP_VM "source ~/miniforge3/bin/activate ${CONDA_ENV} && \
-  echo CONDA_PREFIX=\$CONDA_PREFIX && \
-  ls \$CONDA_PREFIX/lib/libcuvs.so && \
-  echo OK"
+# make gpu-postinstall 가 실제로 하는 것 (Makefile:212):
+CONDA_ENV=$CONDA_ENV ssh $GCP_VM "CONDA_ENV=$CONDA_ENV bash -s" \
+    < infra/scripts/postinstall.sh
+
+# 또는 래퍼:
+make gpu-postinstall
 ```
 
-`CONDA_ENV` 변수는 로컬의 `.env.gpu`에 정의되어 있어야 한다.
+**기대 출력:**
+```
+shared_preload_libraries ... pg_cuvs
+restarting postgresql ...
+```
+**-> 성공:** Step 6으로  
+**-> `bash -s` 에서 스크립트 미실행:** `infra/scripts/postinstall.sh` 파일 존재 여부 확인  
+**-> PG restart 실패:** `ssh $GCP_VM "sudo systemctl status postgresql"` 로 상세 확인
 
-### shared_preload_libraries 수동 확인 / 재적용
-
+설정 확인:
 ```bash
-# postinstall 재실행 (idempotent)
-make gpu-postinstall
-
-# 확인
 ssh $GCP_VM "psql -d postgres -c 'SHOW shared_preload_libraries;'"
-# 출력에 pg_cuvs 포함 여부 확인
+# pg_cuvs 포함 여부 확인
 ```
 
 ---
 
-## 5. 검증 명령 (Verification commands)
+### Step 6 — 회귀 테스트
 
 ```bash
-# installcheck (smoke + cpu_fallback 회귀 테스트)
-make gpu-test
+# make gpu-test 가 실제로 하는 것 (Makefile:198):
+ssh -tt $GCP_VM "cd ~/pg_cuvs && \
+    source ~/miniforge3/bin/activate $CONDA_ENV && \
+    make installcheck"
 
-# E2E 수동 smoke test
+# 또는 래퍼:
+make gpu-test
+```
+
+**기대 출력:**
+```
+...
+All N tests passed.
+```
+**-> 성공:** 빌드 완료  
+**-> IPC 관련 오류 (`pg_cuvs_server` 응답 없음):** daemon 상태 확인 → `ssh $GCP_VM "sudo systemctl is-active pg-cuvs-server"` → 비활성이면 `sudo systemctl start pg-cuvs-server`  
+**-> regression diff 존재:** 예상 출력과 실제 출력 비교 — `results/` vs `expected/` 확인
+
+---
+
+## 5. 검증 체크리스트
+
+- [ ] `make gpu-test` — `All N tests passed.` 확인
+
+```bash
+make gpu-test
+```
+
+- [ ] 설치된 .so 확인
+
+```bash
+ssh $GCP_VM "ls -la \$(pg_config --pkglibdir)/pg_cuvs.so"
+```
+**기대 출력:** `-rwxr-xr-x 1 root root ... pg_cuvs.so`
+
+- [ ] shared_preload_libraries 설정 확인
+
+```bash
+ssh $GCP_VM "psql -d postgres -c 'SHOW shared_preload_libraries;'"
+```
+**기대 출력:** `pg_cuvs` 포함
+
+- [ ] E2E smoke test
+
+```bash
 ssh $GCP_VM "psql -d postgres" << 'EOF'
 CREATE EXTENSION IF NOT EXISTS vector;
 CREATE EXTENSION IF NOT EXISTS pg_cuvs;
@@ -124,11 +338,15 @@ CREATE INDEX ON _smoke USING cagra (v vector_l2_ops);
 SELECT id FROM _smoke ORDER BY v <-> '[1,0,0,0]'::vector LIMIT 1;
 DROP TABLE _smoke;
 EOF
-
-# daemon 로그 확인
-ssh $GCP_VM "sudo journalctl -u pg-cuvs-server -n 20 --no-pager"
-# "built index ... vecs" 메시지 확인
 ```
+**기대 출력:** `SELECT amname` -> `cagra`, 마지막 SELECT -> `1`
+
+- [ ] daemon 로그 확인
+
+```bash
+ssh $GCP_VM "sudo journalctl -u pg-cuvs-server -n 20 --no-pager"
+```
+**기대 출력:** `built index ... vecs` 메시지 포함
 
 ---
 
