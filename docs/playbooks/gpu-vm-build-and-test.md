@@ -195,17 +195,19 @@ VM ready: ubuntu@35.224.x.x
 
 ### Step 1 — 로컬 소스 동기화
 
-`.o`, `.bc`, `.so`, `.env.gpu`는 VM에서 생성/관리하므로 rsync 대상에서 제외한다.
+로컬 소스를 VM에 미러링한다. **소스는 로컬이 정본, 바이너리는 VM이 정본** 원칙에 따라
+빌드 결과물은 제외한다.
 
 ```bash
 # make sync 가 실제로 하는 것 (Makefile:179):
 rsync -avz --delete \
-    --exclude '.git' \
-    --exclude 'src/*.o' \
-    --exclude 'src/*.bc' \
-    --exclude '*.so' \
-    --exclude '.env.gpu' \
+    --exclude '.git' \       # git 메타데이터 — VM에 불필요
+    --exclude 'src/*.o' \    # VM에서 nvcc로 컴파일된 오브젝트 — 로컬 것으로 덮으면 GPU 아키텍처 불일치
+    --exclude 'src/*.bc' \   # LLVM 비트코드(PG JIT용) — 마찬가지
+    --exclude '*.so' \       # 빌드 결과물 — sync 방향이 로컬→VM이므로 제외
+    --exclude '.env.gpu' \   # GCP 자격증명 포함 — VM에 올리면 안 됨
     ./ $GCP_VM:~/pg_cuvs/
+# --delete: 로컬에서 삭제한 파일은 VM에서도 삭제 (파일명 변경 시 VM에 구버전 좀비 방지)
 
 # 또는 래퍼:
 make sync
