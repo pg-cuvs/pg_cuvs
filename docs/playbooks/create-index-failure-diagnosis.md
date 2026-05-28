@@ -47,6 +47,15 @@ ERROR:  pg_cuvs: BUILD failed (status N); ...
 
 ### Step 2A — daemon 상태 확인 (status=4)
 
+psql 안에서 나가지 않고 확인하려면 `\!` 메타 커맨드를 사용한다:
+
+```sql
+-- psql 안에서 바로 실행
+\! sudo systemctl is-active pg-cuvs-server
+```
+
+또는 bash에서:
+
 ```bash
 sudo systemctl is-active pg-cuvs-server
 ```
@@ -181,16 +190,17 @@ IPC status code별 원인과 힌트 메시지:
 
 ### Step 1 — daemon 시작 (UNAVAILABLE 복구)
 
+psql 안에서 나가지 않고 바로 실행:
+
+```sql
+\! sudo systemctl start pg-cuvs-server
+\! sudo journalctl -u pg-cuvs-server -n 20 --no-pager
+```
+
+또는 bash에서:
+
 ```bash
 sudo systemctl start pg-cuvs-server
-```
-
-**기대 출력:**
-```
-(출력 없음, 즉시 복귀)
-```
-
-```bash
 sudo journalctl -u pg-cuvs-server -n 20 --no-pager
 ```
 
