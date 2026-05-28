@@ -350,6 +350,53 @@ reject:
 }
 
 /* ----------------------------------------------------------------
+ * Auto VRAM-based shard count (Phase 3G). Pure arithmetic, no CUDA — the
+ * daemon supplies the runtime inputs (per-GPU VRAM budget, usable GPU count)
+ * and this decides how many shards a logical index needs.
+ *
+ * Returns:
+ *   1            -> unsharded (fits one GPU, or budget unknown/unlimited, or
+ *                   corpus too small to shard). Preserves legacy behavior.
+ *   2..max       -> split into this many contiguous shards.
+ *   0            -> does not fit even when maximally sharded -> caller fails
+ *                   closed (build error), never a partial/over-budget index.
+ *
+ * `needed` mirrors estimate_vram_bytes() in pg_cuvs_server.c exactly:
+ * n_vecs * (dim*sizeof(float) + 16*4). Keep the two in sync.
+ * ---------------------------------------------------------------- */
+int
+cuvs_auto_shard_count(int64_t n_vecs, int dim, size_t per_gpu_budget_bytes,
+                      int n_gpus, int max_shards)
+{
+    if (n_vecs <= 0 || dim <= 0 || n_gpus <= 0)
+        return 1;
+    if (per_gpu_budget_bytes == 0)
+        return 1;                       /* unlimited/unknown budget: don't auto-shard */
+
+    size_t needed = (size_t) n_vecs * ((size_t) dim * sizeof(float) + 16 * 4);
+    if (needed <= per_gpu_budget_bytes)
+        return 1;                       /* fits a single GPU */
+
+    /* Cap shard count by usable GPUs, the sanity max, and the >=2-vectors-per-
+     * shard floor (CAGRA aborts on a 1-vector shard). */
+    int cap = n_gpus;
+    if (max_shards > 0 && cap > max_shards)
+        cap = max_shards;
+    if ((int64_t) cap > n_vecs / 2)
+        cap = (int) (n_vecs / 2);
+    if (cap < 2)
+        return 0;                       /* can't split enough to fit */
+
+    /* ceil(needed / per_gpu_budget_bytes) shards of ~equal size. */
+    int want = (int) ((needed + per_gpu_budget_bytes - 1) / per_gpu_budget_bytes);
+    if (want < 2)
+        want = 2;
+    if (want > cap)
+        return 0;                       /* even cap shards each exceed budget */
+    return want;
+}
+
+/* ----------------------------------------------------------------
  * Versioned .delta pending-insert sidecar I/O (Phase 3A).
  * ---------------------------------------------------------------- */
 void

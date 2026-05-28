@@ -193,6 +193,14 @@ int cuvs_shards_write(FILE *f, uint32_t shard_count, int64_t n_vecs,
  * failure returns -1 and leaves *recs_out NULL. */
 int cuvs_shards_read(FILE *f, CuvsShardsHeader *hdr_out, CuvsShardRecord **recs_out);
 
+/* Decide how many shards a logical CAGRA index needs (Phase 3G auto count).
+ * Pure arithmetic over the daemon's runtime inputs; no CUDA. Returns 1 for
+ * unsharded (fits one GPU / unknown budget / too small), 2..max_shards for a
+ * split, or 0 when it cannot fit even maximally sharded (caller fails closed).
+ * `needed` bytes mirror estimate_vram_bytes(): n_vecs*(dim*4 + 64). */
+int cuvs_auto_shard_count(int64_t n_vecs, int dim, size_t per_gpu_budget_bytes,
+                          int n_gpus, int max_shards);
+
 /* ----------------------------------------------------------------
  * Versioned .delta pending-insert sidecar (Phase 3A).
  *

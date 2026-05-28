@@ -449,7 +449,75 @@ must apply to the merged shard result before returning heap TIDs to PostgreSQL.
 
 ---
 
-## 10. 코스트 모델 (ADR-003)
+## 10. Phase 3G — True Sharding Optimization / Productization
+
+**MGPUOPT-01 — Parallel All-Shard Fanout**
+```
+The pg_cuvs daemon shall support parallel fanout across all shards of a logical
+CAGRA index. Each shard search may run on its assigned GPU concurrently, and
+the daemon shall merge the returned candidates into one metric-compatible global
+top-k result before replying to PostgreSQL. The merge may remain daemon-side CPU
+top-k selection unless profiling shows that GPU-side merge is necessary.
+Parallel fanout must preserve the Phase 3F fail-closed semantics: a missing,
+corrupt, or failed shard shall not produce a silent partial result by default.
+```
+
+**MGPUOPT-02 — Auto VRAM-Based Shard Count**
+```
+The pg_cuvs build path shall support an automatic shard-count policy based on
+estimated index VRAM, available GPU set, and per-GPU VRAM budget. An explicit
+`cuvs.shard_count=N` shall remain a deterministic override for tests,
+benchmarks, and operator control. If the automatic policy cannot find a feasible
+placement, CREATE INDEX / REINDEX shall fail rather than building an unsafe
+partial index.
+```
+
+**MGPUOPT-03 — Shard-Aware Delta Cache**
+```
+The daemon-side GPU delta cache shall integrate with sharded base indexes.
+Delta candidates may initially be stored as a global GPU brute-force cache, but
+the search path shall be aware of sharded base results and shall merge base and
+delta candidates consistently. Backend CPU delta merge remains the correctness
+fallback when the daemon cannot use the GPU delta path.
+```
+
+**MGPUOPT-04 — Per-Shard Candidate Sizing**
+```
+The daemon shall support per-shard candidate sizing beyond the Phase 3F
+minimum of k candidates per shard. Over-fetch (`k + slop`) and adaptive policies
+shall be validated against CPU exact results or an explicit recall target before
+becoming default behavior.
+```
+
+**MGPUOPT-05 — Snapshot/Warmup Integration**
+```
+Object-storage manifests and async warmup shall fully cover sharded artifacts:
+the global `.tids`, `.shards` manifest, and every shard `.sNNN.cagra` file. A
+replica shall load a sharded logical index only when the complete artifact set
+is present, checksum-valid, and heap-compatible.
+```
+
+**MGPUOPT-06 — Degraded Recall Policy**
+```
+The default query path shall remain all-shard fanout with fail-closed behavior.
+Any partial-recall mode shall require explicit opt-in and shall expose its
+recall trade-off in observability and documentation.
+```
+
+**MGPUOPT-07 — Excluded: Vector-Clustering Shard Assignment**
+```
+Vector-clustering shard assignment is not part of Phase 3G or its immediate
+follow-up scope. It requires an expensive out-of-core or distributed clustering
+job over the same large corpus that already exceeds a single GPU, and it brings
+little benefit while pg_cuvs uses all-shard fanout. The feature may be revisited
+only as part of a future incremental segment-rebuild index architecture where
+cluster assignment enables rebuilding changed segments instead of the full
+CAGRA graph.
+```
+
+---
+
+## 11. 코스트 모델 (ADR-003)
 
 **COST-01**
 ```
@@ -493,7 +561,7 @@ operator or operator class identity, not from a strategy-number heuristic.
 
 ---
 
-## 11. 테스트 및 운영 플레이북
+## 12. 테스트 및 운영 플레이북
 
 **TEST-01**
 ```
@@ -563,19 +631,20 @@ persistence corruption recovery, VRAM OOM fallback, and rollback/cleanup.
 
 **TEST-09**
 ```
-Final Phase 3 operational playbooks shall be written after Phase 3F true
-multi-GPU CAGRA sharding behavior is complete. These runbooks shall cover replica bootstrap,
-object-storage artifact recovery, heap-compatibility mismatch, async warmup and
-cache hydration, multi-GPU placement/warmup, per-GPU VRAM pressure, placement
-failure/degraded mode, true-sharding manifest or shard-artifact failures, and
-capacity planning. Earlier Phase 3 documents shall capture contracts and
-acceptance criteria, not detailed operational runbooks that would become stale
-before 3F.
+Final Phase 3 operational playbooks shall be written after Phase 3G true
+sharding optimization/productization is complete. These runbooks shall cover
+replica bootstrap, object-storage artifact recovery, heap-compatibility
+mismatch, async warmup and cache hydration, multi-GPU placement/warmup,
+per-GPU VRAM pressure, placement failure/degraded mode, true-sharding manifest
+or shard-artifact failures, parallel fanout, shard count sizing, shard-aware
+delta cache behavior, per-shard over-fetch tuning, and capacity planning.
+Earlier Phase 3 documents shall capture contracts and acceptance criteria, not
+detailed operational runbooks that would become stale before 3G.
 ```
 
 ---
 
-## 12. 운영 인터페이스 (GUC 목록)
+## 13. 운영 인터페이스 (GUC 목록)
 
 | GUC | 타입 | 기본값 | 설명 |
 |-----|------|--------|------|
@@ -589,5 +658,5 @@ before 3F.
 | `cuvs.snapshot_uri` | string | '' | Phase 3C object storage root, e.g. `gs://bucket/prefix` (비어있으면 비활성) |
 | `cuvs.cluster_id` | string | '' | Phase 3 멀티노드 식별자 |
 | `cuvs.warmup_threads` | int | 2 | Phase 3D background artifact download/load worker count |
-| `cuvs.shard_count` | int | 0 (auto/off) | Phase 3F logical CAGRA internal shard count; 0 keeps current unsharded behavior unless auto policy is enabled |
-| `cuvs.shard_overfetch` | int | 0 (auto) | Additional candidates per shard for daemon-side global top-k merge |
+| `cuvs.shard_count` | int | 0 (off) | Phase 3F/3G logical CAGRA internal shard count; explicit positive values force deterministic sharding, auto policy is Phase 3G |
+| `cuvs.shard_overfetch` | int | 0 (auto) | Phase 3G additional candidates per shard for daemon-side global top-k merge |

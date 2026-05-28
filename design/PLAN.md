@@ -301,7 +301,7 @@ Phase 2.1 완료 기준(전부 충족):
 
 ### Phase 3 — Scale Out / Large Index Storage
 
-목표: Phase 2의 single-node CAGRA core를 운영 workload와 대규모 저장소로 확장한다. Phase 3는 하나의 거대한 milestone이 아니라, 각각 독립적으로 검증 가능한 5개 subphase로 진행한다.
+목표: Phase 2의 single-node CAGRA core를 운영 workload와 대규모 저장소로 확장한다. Phase 3는 하나의 거대한 milestone이 아니라, 각각 독립적으로 검증 가능한 subphase로 진행한다.
 
 #### Phase 3A — Pending Delta / Delta Exact Search
 
@@ -559,9 +559,9 @@ True single-index multi-GPU CAGRA sharding is split out as Phase 3F.
 - SW MVP 먼저, HW acceptance(3F-6)는 별도 게이트.
 - MVP fanout은 sequential(기존 `g_index_mutex` 직렬화 유지). parallel fanout은 follow-up.
 - shard count는 explicit `cuvs.shard_count=N`. 기본값 `0`/`1`은 기존 unsharded 동작을 byte-identical하게 유지하고 `N>=2`에서만 sharding 활성화. auto shard count는 follow-up.
-- shard 분할은 build-order contiguous range. clustering 기반 assignment는 follow-up.
+- shard 분할은 build-order contiguous range. clustering 기반 assignment는 현재 로드맵에서 제외한다.
 - fail-closed: shard 하나라도 실패면 partial 금지(SELECT CPU fallback, DDL ERROR).
-- 3F sub-phase 진행 순서: 3F-1 artifact+build → 3F-2 daemon runtime+reload → 3F-3 sequential fanout search+merge → 3F-4 fail-closed+delta/tombstone → 3F-5 SW MVP verification → 3F-6 multi-GPU hardware acceptance(완료 게이트) → 3F-7 follow-up(parallel fanout, auto count, clustering, daemon-side shard delta cache, per-shard k+slop, partial degraded mode, object snapshot manifest 확장).
+- 3F sub-phase 진행 순서: 3F-1 artifact+build → 3F-2 daemon runtime+reload → 3F-3 sequential fanout search+merge → 3F-4 fail-closed+delta/tombstone → 3F-5 SW MVP verification → 3F-6 multi-GPU hardware acceptance(완료 게이트) → 3F-7 follow-up(parallel fanout, auto count, daemon-side shard delta cache, per-shard k+slop, partial degraded mode, object snapshot manifest 확장).
 
 목표:
 - 단일 non-partitioned table / 단일 logical CAGRA index를 내부적으로 N개 shard로 나누고, 하나의 query를 여러 GPUs에 fanout한 뒤 daemon에서 global top-k를 merge한다.
@@ -570,7 +570,7 @@ True single-index multi-GPU CAGRA sharding is split out as Phase 3F.
 
 Shard model:
 - 첫 구현은 build-order contiguous ranges로 shard한다. 즉 global `.tids` 배열의 `[start,end)` range가 shard 하나에 대응한다.
-- Vector clustering 기반 shard assignment는 recall/cost trade-off가 커서 후속 연구로 둔다.
+- Vector clustering 기반 shard assignment는 제외한다. 이 작업은 대규모 데이터에 대해 k-means/assignment를 반복 수행해야 하므로 단순 full scan보다 비싸고, 기본 all-shard fanout 구조에서는 shard pruning 이득도 거의 없다. segment-level incremental rebuild 같은 별도 인덱스 아키텍처를 도입할 때만 다시 검토한다.
 - 각 shard는 독립 cuVS CAGRA artifact이며 하나의 GPU에 resident한다. shard 하나가 여러 GPUs에 걸치지 않고, logical index가 여러 shard/GPU를 소유한다.
 
 Artifact contract:
@@ -583,7 +583,7 @@ Artifact contract:
 Daemon/runtime design:
 - `IndexEntry`는 unsharded entry와 sharded logical entry를 구분한다. sharded logical entry는 `ShardEntry[]`를 소유한다.
 - `ShardEntry`는 shard id, `CuvsCagraIndex` handle, global TID offset, n_vecs, gpu_device_id, vram_bytes, search/error counters, last status를 가진다.
-- build는 `cuvs.shard_count` 또는 auto policy로 shard count를 결정한다. auto는 per-GPU VRAM budget과 `estimate_vram_bytes()`를 기준으로 단일 GPU에 들어가지 않는 index를 split한다.
+- 3F build는 explicit `cuvs.shard_count=N`으로 shard count를 결정한다. auto VRAM-based shard count는 Phase 3G에서 다룬다.
 - placement는 3E-1/3E-2의 VRAM-aware policy를 shard 단위로 적용한다. 한 logical index의 shards는 가능한 한 여러 GPUs에 spread하고, 특정 GPU restriction(`--gpu-devices`)을 존중한다.
 - search는 one IPC request per logical index를 유지한다. daemon이 shard별 CAGRA search를 병렬 실행하고, metric-aware comparator로 global top-k를 merge해서 기존 reply format(TIDs + distances)을 반환한다.
 - per-shard request k는 최소 `k`로 시작한다. 그래야 global top-k가 한 shard에 몰리는 경우도 후보 부족으로 놓치지 않는다. 추후 `cuvs.shard_overfetch`로 `k + slop`을 조정할 수 있다.
@@ -616,7 +616,7 @@ Phase 3F 완료 기준:
 - **3F-4 Fail-closed + delta/tombstone correctness**: missing/corrupt/reload-failed shard는 partial result가 아니라 CPU fallback/DDL ERROR로 닫는다. `.delta`와 `.tombstone`은 global `.tids` CRC 기준으로 유지하고 snapshot-aware filtering을 보존한다.
 - **3F-5 SW MVP verification**: single non-partitioned table에서 `SET cuvs.shard_count=2`로 shard artifacts, manifest, restart reload, top-k CPU exact match, corrupt shard fail-closed, delta/tombstone correctness를 검증한다.
 - **3F-6 Multi-GPU hardware acceptance**: 2x A100 또는 동급 multi-GPU VM에서 shard 0/1이 GPU 0/1에 분산 resident하고, concurrent benchmark에서 shard별 counters가 증가하며, restart/corruption/fail-closed가 유지됨을 검증한다. 검증 후 VM stop/delete와 비용 상태를 보고한다.
-- **3F-7 Boundary**: parallel fanout, auto VRAM-based shard count, vector-clustering shard assignment, daemon-side shard-aware GPU delta cache, per-shard adaptive `k + slop`, optional degraded partial recall mode, object snapshot manifest extension for shard artifacts는 3F MVP 범위 밖이며 Phase 3G에서 다룬다.
+- **3F-7 Boundary**: parallel fanout, auto VRAM-based shard count, daemon-side shard-aware GPU delta cache, per-shard adaptive `k + slop`, optional degraded partial recall mode, object snapshot manifest extension for shard artifacts는 3F MVP 범위 밖이다. Vector-clustering shard assignment는 3G로 넘기지 않고 제외한다.
 
 3F-1~3F-5 verified evidence (2026-05-28, single-GPU A100 VM):
 - artifact format unit tests green: `cuvs_shards_write/read` round-trip + 8 rejection cases (bad magic/version, shard_count 0/>MAX, body crc, non-contiguous offsets, sum != n_vecs, out-of-order shard_id, truncated body); plus `cuvs_parse_index_filename` rejects `.sNNN.cagra`. `make test-unit`: 150 passed, 0 failed.
@@ -637,30 +637,46 @@ Phase 3F 완료 기준:
 - multi-GPU fail-closed: corrupting the GPU-1 shard artifact was caught on reload (`shard 1 artifact crc mismatch ... skip`), the logical index was not registered (0 `pg_stat_gpu_shards` rows), and the query fell back to CPU with correct results (`MGPU_FAILCLOSED_CPU_OK`).
 - VM stopped after acceptance (`TERMINATED`); machine type `a2-highgpu-2g` (2x A100 40GB, ~$7.35/hr on-demand), ~30 min runtime ≈ $3-4.
 
-Phase 3F status: **COMPLETE**. 3F-1..3F-5 (SW MVP) and 3F-6 (2x A100 hardware acceptance) passed. A single non-partitioned `CREATE INDEX ... USING cagra` with `cuvs.shard_count>=2` now builds, reloads, and serves a single logical index sharded across multiple physical GPUs with global top-k merge, fail-closed durability, and delta/tombstone correctness. The 3F-7 optimizations (parallel fanout, auto shard count, clustering assignment, daemon-side shard delta cache, etc.) move to Phase 3G.
+Phase 3F status: **COMPLETE**. 3F-1..3F-5 (SW MVP) and 3F-6 (2x A100 hardware acceptance) passed. A single non-partitioned `CREATE INDEX ... USING cagra` with `cuvs.shard_count>=2` now builds, reloads, and serves a single logical index sharded across multiple physical GPUs with global top-k merge, fail-closed durability, and delta/tombstone correctness. The 3F-7 productization items (parallel fanout, auto shard count, over-fetch, daemon-side shard delta cache, object snapshot extension, etc.) move to Phase 3G/follow-up. Vector-clustering shard assignment is explicitly excluded unless a future incremental segment-rebuild architecture justifies it.
 
 #### Phase 3G — True Sharding Optimization / Productization
 
 목표:
 - Phase 3F의 sequential/manual-shard true sharding MVP를 운영 가능한 고성능 기능으로 확장한다.
-- 3F가 correctness/durability/fail-closed를 닫는 단계라면, 3G는 latency, automation, recall tuning, snapshot/delta integration을 개선하는 단계다.
+- 3F가 correctness/durability/fail-closed를 닫는 단계라면, 3G는 latency(parallel fanout), automation(auto shard count), recall 방어(over-fetch)를 닫는 단계다.
+- 3G **본범위는 Core productization 3종**으로 고정한다(ADR-022). delta-cache/snapshot/partial-recall은 follow-up으로 분리한다. vector-clustering shard assignment는 제외한다.
 
-구현 항목:
-- parallel fanout: shard별 search를 여러 GPU에서 동시 실행하고, per-query latency를 sequential fanout 대비 줄인다.
-- auto VRAM-based shard count: `estimate_vram_bytes`, per-GPU budget, usable GPU set을 기준으로 shard count를 자동 결정한다. explicit `cuvs.shard_count=N` override는 유지한다.
-- vector-clustering shard assignment: build-order contiguous split을 넘어 recall/cost를 고려한 shard assignment를 연구/구현한다.
-- daemon-side shard-aware GPU delta cache: `.delta`를 shard별로 배치하거나 global delta cache를 fanout merge에 통합해 backend CPU delta merge 의존을 줄인다.
-- per-shard adaptive `k + slop`: shard별 recall/underfill을 관측해 over-fetch를 조정한다.
-- optional degraded partial recall mode: shard 일부 실패 시 기본 fail-closed는 유지하되, 명시적 opt-in에서 partial degraded 결과를 허용할지 결정한다.
-- object snapshot manifest extension: `.shards` manifest와 shard artifacts를 3C/3D object snapshot 및 async warmup과 완전히 통합한다.
+3G-0 lock (결정):
+- 본범위 = 3G-1 parallel fanout + 3G-2 auto VRAM-based shard count + 3G-3 `cuvs.shard_overfetch`.
+- HW gate는 3G 끝(3G-5)에 둔다 — 단일 GPU SW 검증 후 2x A100 한 번의 유료 run으로 닫는다(3F-6 방식).
+- `cuvs.shard_count` 의미: `0` = **auto**(데몬이 VRAM로 derive, 한 GPU에 들어가면 1/unsharded로 resolve → 작은 index 동작 불변), `1` = 강제 unsharded, `N>=2` = 강제 N(3F 동작).
+- `cuvs.parallel_fanout`(bool, default on): sharded search per-query 토글. A/B + kill switch.
+- `cuvs.shard_overfetch`(int, default 0): shard별 `k + overfetch`, global merge top-k 유지. default 0 = 3F byte-identical.
+- follow-up(3G 범위 밖): shard-aware GPU delta cache, object-snapshot manifest extension, degraded partial recall.
+- excluded: vector-clustering shard assignment. Clustering large enough to need sharding is itself an expensive out-of-core/distributed job, often more expensive than the scans it tries to optimize. It is not justified for all-shard fanout; revisit only if pg_cuvs introduces incremental cluster/segment rebuilds.
+
+3G 핵심 재사용(재작성 금지):
+- multi-source merge: `delta_cand_cmp` + `g_merge_metric` + `qsort`(`pg_cuvs_server.c`, 3F sharded merge에서 사용). parallel fanout은 dispatch만 바꾸고 merge는 동일.
+- placement helper: `estimate_vram_bytes`, `pick_gpu_for_index`, `total_vram_used`, `n_usable_gpus`/`usable_gpu`, `g_max_vram_per_gpu[]`. auto count는 이 위의 arithmetic.
+- non-evictable sharded entry(`gpu_device_id=0xFFFFFFFF`): shard handle + `tids` 가 search 수명 동안 안정적 → lock-free window의 근거.
+- 관측: `pg_stat_gpu_search` p50/p95/p99 + `shard_count` 재사용(새 스키마 없음).
+
+3G execution plan:
+- **3G-0 Design lock**: scope/HW gate/GUC 의미를 ADR-022와 본 절에 고정.
+- **3G-1 Parallel fanout**: (a) within-query thread-per-shard dispatch(mutex 유지, `sum -> max(shard_i)`), (b) **safe-by-construction lock-free window** — mutex 안에서 shard descriptor + `tids` + metric을 스냅샷하고 GPU dispatch+join만 mutex 밖에서 실행한 뒤, 다시 lock을 잡고 oid로 entry를 re-find해 counters/collect/merge/stats를 갱신한다(unlock 이후 `IndexEntry*` 재사용 금지; collect+qsort merge는 `g_merge_metric` 직렬성 유지를 위해 re-lock 구간에서). inflight refcount/deferred-free는 도입하지 않는다 — sharded non-evictable + REINDEX의 PG AccessExclusiveLock 직렬화로 free-during-search race가 없기 때문이며, 이 불변식이 깨지는 future feature가 들어오면 재도입한다(ADR-022). `cuvs.parallel_fanout=off`는 기존 sequential 경로 유지. cuVS resource pool은 per-device mutex라 multi-device 동시 dispatch 안전(`cudaSetDevice`는 thread-local).
+- **3G-2 Auto VRAM shard count**: 순수 helper `cuvs_auto_shard_count(n_vecs, dim, per_gpu_budget, n_gpus, max_shards)`를 `cuvs_util`에 추가(unit-test). build dispatch에서 `cmd->shard_count==0`이면 derive(>=2 → `build_sharded`, 1 → unsharded, 0/neg → fail-closed build error). `1`/`N>=2`는 강제.
+- **3G-3 `cuvs.shard_overfetch`**: GUC + `CuvsCmdFrame` 필드. fanout에서 shard별 `sk = min(shard.n_vecs, k + overfetch)`, merge는 global top-k.
+- **3G-4 SW verification(단일 GPU)**: unit(`cuvs_auto_shard_count`), integration Scenario 20(parallel==sequential==CPU exact L2/cosine/IP, auto count resolve, overfetch correctness, parallel 경로 fail-closed, default 경로 byte-identical), e2e reload.
+- **3G-5 Multi-GPU hardware acceptance(완료 게이트)**: 2x A100에서 auto count가 GPU0/1로 `>=2` shard 분산, `pgbench-shard.sql` A/B로 parallel p50 < sequential p50, recall preserved, reload + corrupt-shard fail-closed. VM stop + 비용 보고. 증거는 본 문서에 기록.
 
 Phase 3G 완료 기준:
-- parallel fanout이 multi-GPU hardware에서 sequential fanout 대비 latency 개선을 보이고 correctness를 유지한다.
-- auto shard count가 deterministic override와 함께 동작하고, VRAM budget 초과 케이스를 fail-closed로 처리한다.
-- shard assignment/over-fetch 정책이 CPU exact 또는 agreed recall target 대비 검증된다.
-- shard-aware delta path가 INSERT/UPDATE correctness를 유지하고 fallback 경로가 명확하다.
-- object snapshot download/reload가 sharded artifacts 전체에 대해 manifest/checksum 기반으로 동작한다.
-- degraded partial recall mode는 구현하거나, 구현하지 않는다면 명시적으로 기각하고 fail-closed-only 정책을 유지한다.
+- parallel fanout이 2x A100에서 sequential fanout 대비 latency를 개선하고(병렬 p50 < 직렬 p50) correctness/recall을 유지한다.
+- `cuvs.shard_count=0` auto가 작은 index는 1(unsharded), 단일 GPU budget 초과 index는 `>=2`로 resolve하고, 전부 안 들어가면 fail-closed build error로 처리한다. explicit `1`/`N>=2` override는 유지된다.
+- `cuvs.shard_overfetch`가 correctness를 유지하면서 shard별 요청 k를 늘린다(default 0 = 3F byte-identical).
+- parallel 경로에서도 corrupt/missing shard는 partial 없이 fail-closed(SELECT CPU fallback / DDL ERROR)한다.
+- default 경로(`shard_count` unset/1, overfetch 0, parallel on이지만 unsharded)는 3F와 동작 동일.
+- follow-up 3종(shard delta cache, snapshot manifest ext, degraded partial recall)은 명시적으로 3G 범위 밖으로 분리한다.
+- vector-clustering shard assignment은 후속 범위가 아니라 제외 항목이다. 비용은 큰데 3G의 all-shard fanout/CPU global merge 목표에는 직접 기여하지 않는다.
 
 #### Phase 3H — Operational Playbooks / Runbooks
 

@@ -649,6 +649,38 @@ test_metric_from_opclass(void)
            "status_str METRIC_MISMATCH");
 }
 
+static void
+test_auto_shard_count(void)
+{
+    /* dim 16 => 16*sizeof(float) + 16*4 = 128 bytes/vector (mirrors
+     * estimate_vram_bytes). needed(1000,16) = 128000 bytes. */
+    const size_t GB = (size_t) 1 << 30;
+
+    /* Fits one GPU -> unsharded. */
+    ASSERT(cuvs_auto_shard_count(1000, 16, GB, 4, 256) == 1, "fits one GPU -> 1");
+    /* Unlimited/unknown budget -> never auto-shard. */
+    ASSERT(cuvs_auto_shard_count(1000000, 16, 0, 4, 256) == 1, "budget 0 -> 1");
+    /* Degenerate inputs -> 1 (treat as unsharded, don't crash). */
+    ASSERT(cuvs_auto_shard_count(0, 16, GB, 4, 256) == 1, "0 vecs -> 1");
+    ASSERT(cuvs_auto_shard_count(1000, 0, GB, 4, 256) == 1, "0 dim -> 1");
+    ASSERT(cuvs_auto_shard_count(1000, 16, GB, 0, 256) == 1, "0 gpus -> 1");
+
+    /* Over single-GPU budget -> split. */
+    ASSERT(cuvs_auto_shard_count(1000, 16, 64000, 4, 256) == 2, "needs 2 shards");
+    ASSERT(cuvs_auto_shard_count(1000, 16, 32000, 4, 256) == 4, "needs 4 shards, 4 gpus -> 4");
+    ASSERT(cuvs_auto_shard_count(1000, 16, 32000, 8, 256) == 4, "needs 4, 8 gpus -> 4");
+    /* Not enough GPUs to fit -> fail closed (0). */
+    ASSERT(cuvs_auto_shard_count(1000, 16, 32000, 2, 256) == 0, "needs 4 but 2 gpus -> 0");
+
+    /* max_shards cap below requirement -> fail closed; generous cap -> full split. */
+    ASSERT(cuvs_auto_shard_count(1000, 16, 1000, 256, 4)   == 0,   "needs 128 but max 4 -> 0");
+    ASSERT(cuvs_auto_shard_count(1000, 16, 1000, 256, 256) == 128, "needs 128, cap 256 -> 128");
+
+    /* >=2 vectors/shard floor: a 2-vec corpus can't split, so an unmeetable
+     * budget fails closed rather than producing 1-vector shards. */
+    ASSERT(cuvs_auto_shard_count(2, 16, 100, 4, 256) == 0, "2 vecs cannot split -> 0");
+}
+
 int
 main(void)
 {
@@ -661,6 +693,7 @@ main(void)
     test_tids_rejections();
     test_shards_roundtrip();
     test_shards_rejections();
+    test_auto_shard_count();
     test_delta_format();
     test_lat_histogram();
     test_metric_from_opclass();

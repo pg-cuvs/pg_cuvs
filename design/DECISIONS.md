@@ -463,3 +463,32 @@ MVP:
 **대안**:
 - cuVS `cuvs::neighbors::mg` SHARDED 모드 직접 사용. 보류 — 기존 daemon의 per-device pool/placement/eviction/delta/tombstone 계층과의 통합 비용이 크고, artifact durability 계약을 그대로 재사용하려면 shard = 독립 CAGRA artifact 모델이 더 단순.
 - PostgreSQL partitioning recipe(3E-3)로 대체. 거부 — 그건 multiple physical index의 integration recipe이고, 3F는 단일 logical index의 internal sharding으로 사용자 DDL surface를 바꾸지 않는 것이 목표.
+
+## ADR-022 — Phase 3G True Sharding 최적화/제품화 (Core) 설계 lock
+
+**날짜**: 2026-05-28
+
+**문제**: Phase 3F는 단일 logical CAGRA index의 multi-GPU sharding을 correctness/durability/fail-closed까지 닫았지만, 세 가지가 운영 품질을 막는다. (1) `handle_search`가 fanout 전체를 `g_index_mutex` 아래에서 직렬 실행하므로 query latency가 `sum(shard_i)`이고 동시 query도 GPU dispatch에서 직렬화된다. (2) shard count가 수동(`cuvs.shard_count=N`)이라 운영자가 VRAM sizing을 직접 계산해야 한다. (3) shard별 search가 `k`만 가져와서 shard 수가 늘면 recall 방어 수단이 없다.
+
+**결정**: 3G의 본범위를 **Core productization** 세 항목으로 고정한다.
+- **parallel fanout**: shard별 search를 thread로 동시 dispatch하고 기존 `delta_cand_cmp` merge를 재사용한다. 1단계는 mutex를 쥔 채 within-query 병렬(`sum -> max(shard_i)`), 2단계는 GPU dispatch 구간만 mutex 밖에서 실행하는 **lock-free window**로 cross-query 동시성까지 연다. lock-free window는 **safe-by-construction**으로 설계한다: mutex 안에서 shard descriptor(handle/gpu/tid_offset/n_vecs) + `tids` 포인터 + metric을 스냅샷하고, mutex를 풀고 parallel dispatch + join한 뒤, 다시 lock을 잡고 `(db_oid,index_oid)`로 entry를 **re-find**해서 counters/merge/stats만 갱신한다(`evict_lru`가 `g_indexes[]`를 value로 compaction해 struct를 이동시킬 수 있으므로 unlock 이후 `IndexEntry*`는 재사용하지 않는다). g_merge_metric 글로벌을 쓰는 collect+qsort merge는 re-lock 구간에서 수행해 직렬성을 유지한다(GPU dispatch만 병렬). inflight refcount/deferred-free는 **도입하지 않는다** — 현재 지원 workload에서 방어할 실제 race가 없기 때문이다(아래 불변식 참조). `cuvs.parallel_fanout`(bool, default on) per-query 토글로 A/B 및 kill switch를 제공한다.
+- **lock-free 안전성 불변식(필수 유지)**: (1) sharded entry는 `gpu_device_id=0xFFFFFFFF`로 LRU eviction에서 제외되어 `evict_lru`/free 경로의 대상이 되지 않는다. (2) shard handle과 `tids` 메모리는 search snapshot 이후 free되지 않는다 — 이를 free하는 경로(REINDEX/DROP)는 PostgreSQL `AccessExclusiveLock`으로 동시 search와 직렬화되고, eviction은 (1)로 배제된다. 이 두 전제가 깨지는 future feature(sharded eviction, online shard replacement, lock-free/CONCURRENTLY REINDEX 지원 등)가 들어오면 **inflight refcount + drain(또는 deferred-free)을 반드시 재도입**해야 lock-free window가 안전하다.
+- **auto VRAM-based shard count**: `cuvs.shard_count=0`을 **auto**로 정의한다. 데몬이 per-GPU budget과 `estimate_vram_bytes()` 기준으로 derive하되, **한 GPU에 들어가면 1(unsharded)로 resolve**하므로 작은 index의 기존 동작은 byte-identical하게 유지된다. `1`은 강제 unsharded, `N>=2`는 강제 N(3F 동작). 순수 helper `cuvs_auto_shard_count()`를 `cuvs_util`에 두어 CUDA 없이 unit-test한다.
+- **`cuvs.shard_overfetch`**(int, default 0): shard별 요청 `k + overfetch`, global merge는 top-k 유지. default 0은 3F 동작 byte-identical, 운영자가 scale에서 recall을 위해 올린다.
+
+**HW gate**: 3F-6과 동일하게 단일 GPU SW 검증 후 **2x A100 한 번의 유료 run**으로 닫는다 — parallel latency < sequential, recall preserved, shard placement/counter 확인, fail-closed 유지, VM stop + 비용 보고까지가 3G 완료 기준.
+
+**결과**:
+- 새 GUC `cuvs.parallel_fanout`, `cuvs.shard_overfetch`. `cuvs.shard_count=0`의 의미가 unsharded→auto로 바뀌는 것이 유일한 default-semantics 변경이며, 작은 index는 여전히 1로 resolve된다.
+- `CuvsCmdFrame`에 SEARCH용 `shard_overfetch`/`parallel_fanout` 필드 추가(extension+daemon lockstep rebuild). 관측은 기존 `pg_stat_gpu_search` p50/p95/p99 + `shard_count`로 충분, 새 스키마 없음.
+- 구현/검증은 3G-0(design lock) → 3G-1(parallel fanout) → 3G-2(auto count) → 3G-3(overfetch) → 3G-4(SW 검증) → 3G-5(2x A100 acceptance)로 끊고, 3G-5 통과를 Phase 3G 완료 기준으로 본다.
+
+**follow-up으로 분리(3G 범위 밖)**:
+- daemon-side shard-aware GPU delta cache(기존 Phase 3B `refresh_delta_cache`/`cuvs_bf_search` GPU delta path를 fanout merge에 통합; 현재 sharded는 `delta_merged=0`로 backend CPU merge에 위임).
+- object-snapshot manifest extension(3C `CuvsManifest`/`cuvs_objstore`를 `.shards` + per-shard `.sNNN.cagra`까지 확장).
+- vector-clustering shard assignment, degraded partial-recall opt-in(아니면 fail-closed-only 유지).
+
+**대안**:
+- 한 번에 full 3G(7개 항목 전부). 거부 — clustering은 recall 실험 성격이라 shippable latency win(parallel fanout)을 지연시킨다. correctness/latency를 먼저 닫고 delta-cache/snapshot은 그 구조 위에 붙인다.
+- parallel fanout을 mutex를 쥔 채 within-query 병렬로만 구현. 보류 — cross-query 직렬화라는 핵심 병목을 못 풀기 때문에 lock-free window(2단계)까지 간다.
+- lock-free window에 inflight refcount + cond-wait drain 추가(원안). 거부 — sharded non-evictable + REINDEX의 PG AccessExclusiveLock 직렬화로 free-during-search race가 지원 workload에서 발생하지 않으므로, 그 machinery는 불가능한 시나리오를 방어하는 over-engineering이고 cond-wait 중 entry 이동 같은 새 동시성 버그를 들여온다. safe-by-construction(스냅샷 + oid re-find) + 불변식 문서화로 대체한다.

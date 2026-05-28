@@ -1428,6 +1428,34 @@ send_error(int client_fd, const char *msg)
     send_error_code(client_fd, CUVS_STATUS_ERROR, msg);
 }
 
+/* Phase 3G: one shard's search, run on its own thread for parallel fanout.
+ * Each shard lives on a distinct GPU and uses the per-device cuVS resource pool
+ * (cuvs_wrapper.cu), which is independently locked per device — concurrent
+ * dispatch across devices is safe, and two shards on the same device serialize
+ * correctly on that device's pool mutex. `cudaSetDevice` is per-thread, set
+ * inside cuvs_cagra_search via PooledRes, so each worker binds its own device. */
+typedef struct ShardSearchArg {
+    CuvsCagraIndex    handle;
+    const float      *query;
+    int               dim;
+    int               sk;          /* per-shard request k (k + overfetch, clamped to n_vecs) */
+    uint32_t          gpu_device_id;
+    int64_t           tid_offset;  /* snapshot: global TID start of this shard */
+    int64_t           shard_n_vecs;/* snapshot: vectors in this shard */
+    CuvsSearchResult *out;         /* caller-allocated [sk]; NULL when sk==0 */
+    int               rc;          /* 0 = OK (also for skipped sk==0 shards) */
+    int               threaded;    /* 1 if dispatched on its own pthread */
+} ShardSearchArg;
+
+static void *
+shard_search_worker(void *p)
+{
+    ShardSearchArg *a = (ShardSearchArg *) p;
+    a->rc = cuvs_cagra_search(a->handle, a->query, a->dim, a->sk, a->out,
+                              (int) a->gpu_device_id);
+    return NULL;
+}
+
 /* ----------------------------------------------------------------
  * Handle SEARCH command
  * ---------------------------------------------------------------- */
@@ -1574,65 +1602,140 @@ handle_search(int client_fd, const CuvsCmdFrame *cmd)
 
     int k = (int)cmd->k;
 
-    /* Phase 3F: sharded fanout. Search every shard for its top-k, map each
-     * shard-local id to a global TID via the shard's tid_offset, merge all
-     * candidates by distance (metric-aware), and return the global top-k. One
-     * IPC request per logical index; the reply format is unchanged. Delta is
-     * left to the backend CPU merge (delta_merged=0). Fail closed: any shard
-     * search failure returns OOM_FALLBACK (CPU), never a partial result. */
+    /* Phase 3F/3G: sharded fanout. Search every shard for its top-(k+overfetch),
+     * map each shard-local id to a global TID via the shard's tid_offset, merge
+     * all candidates by distance (metric-aware), and return the global top-k.
+     * One IPC request per logical index; the reply format is unchanged. Phase 3G
+     * dispatches the per-shard searches concurrently (one pthread per shard) when
+     * cuvs.parallel_fanout is on, cutting latency from sum(shard_i) toward
+     * max(shard_i); off runs them sequentially (A/B baseline / kill switch).
+     * cuvs.shard_overfetch widens each shard's request for recall at scale.
+     * Delta is left to the backend CPU merge (delta_merged=0). Fail closed: any
+     * shard search failure returns OOM_FALLBACK (CPU), never a partial result. */
     if (e->shard_count >= 2)
     {
-        int sc = e->shard_count;
-        CuvsSearchResult *sraw = malloc((size_t)k * sizeof(CuvsSearchResult));
-        CuvsResult       *cand = malloc((size_t)sc * (size_t)k * sizeof(CuvsResult));
-        CuvsResult       *out  = malloc((size_t)k * sizeof(CuvsResult));
-        if (!sraw || !cand || !out)
+        int sc        = e->shard_count;
+        int overfetch = (int) cmd->shard_overfetch;
+        int eff_k     = k + overfetch;
+        if (eff_k < k) eff_k = k;            /* guard against overflow */
+        int parallel  = (cmd->parallel_fanout != 0);
+        uint32_t snap_db  = e->db_oid;
+        uint32_t snap_idx = e->index_oid;
+
+        ShardSearchArg *args    = calloc((size_t) sc, sizeof(ShardSearchArg));
+        pthread_t      *threads = calloc((size_t) sc, sizeof(pthread_t));
+        if (!args || !threads)
         {
-            free(sraw); free(cand); free(out);
+            free(args); free(threads);
             munmap(query, vec_bytes);
             pthread_mutex_unlock(&g_index_mutex);
             send_error(client_fd, "malloc failed");
             return;
         }
 
-        int n_total   = 0;
-        int shard_err = 0;
+        /* Snapshot each shard's descriptor and allocate its result buffer, then
+         * drop the lock for the GPU dispatch. The shard handles and the `tids`
+         * block stay valid lock-free by construction (ADR-022): sharded entries
+         * are non-evictable, and same-index REINDEX/DROP is serialized against
+         * this search by PostgreSQL's AccessExclusiveLock, so nothing frees them
+         * mid-search. We must NOT reuse `e` after unlocking, though: a concurrent
+         * eviction of some other index compacts g_indexes[] by value and can move
+         * this struct — so we re-find by OID after the parallel window. */
+        int64_t total_sk = 0;
+        int     alloc_ok = 1;
         for (int s = 0; s < sc; s++)
         {
             ShardEntry *se = &e->shards[s];
-            int sk = (int)(se->n_vecs < (int64_t)k ? se->n_vecs : k);
-            if (sk <= 0)
-                continue;
-            int rc = cuvs_cagra_search(se->handle, query, (int)cmd->dim, sk,
-                                       sraw, se->gpu_device_id);
-            if (rc != 0)
+            int sk = (int) (se->n_vecs < (int64_t) eff_k ? se->n_vecs : eff_k);
+            if (sk < 0) sk = 0;
+            args[s].handle        = se->handle;
+            args[s].query         = query;
+            args[s].dim           = (int) cmd->dim;
+            args[s].sk            = sk;
+            args[s].gpu_device_id = se->gpu_device_id;
+            args[s].tid_offset    = se->tid_offset;
+            args[s].shard_n_vecs  = se->n_vecs;
+            args[s].rc            = 0;       /* skipped (sk==0) shards = OK / no candidates */
+            if (sk > 0)
             {
-                se->error_count++;
-                se->last_status = CUVS_STATUS_OOM_FALLBACK;
-                shard_err = 1;
-                break;               /* fail closed: no partial ANN result */
-            }
-            se->search_count++;
-            se->last_status = CUVS_STATUS_OK;
-            for (int j = 0; j < sk; j++)
-            {
-                int64_t id = sraw[j].item_id;
-                if (id < 0 || id >= se->n_vecs)
-                    continue;
-                int64_t gid = se->tid_offset + id;
-                if (gid < 0 || gid >= e->n_vecs)
-                    continue;
-                cand[n_total].tid      = e->tids[gid];
-                cand[n_total].distance = sraw[j].distance;
-                n_total++;
+                args[s].out = malloc((size_t) sk * sizeof(CuvsSearchResult));
+                if (!args[s].out) { alloc_ok = 0; break; }
+                total_sk += sk;
             }
         }
-        munmap(query, vec_bytes);
-        free(sraw);
+        if (!alloc_ok)
+        {
+            for (int s = 0; s < sc; s++) free(args[s].out);
+            free(args); free(threads);
+            munmap(query, vec_bytes);
+            pthread_mutex_unlock(&g_index_mutex);
+            send_error(client_fd, "malloc failed");
+            return;
+        }
+
+        pthread_mutex_unlock(&g_index_mutex);   /* ---- lock-free GPU dispatch ---- */
+
+        /* Parallel spawns one worker per non-empty shard; sequential runs them
+         * inline (cuvs.parallel_fanout = off). A pthread_create failure degrades
+         * that shard to inline execution (no leak, still correct). */
+        for (int s = 0; s < sc; s++)
+        {
+            if (args[s].sk <= 0) continue;
+            if (parallel &&
+                pthread_create(&threads[s], NULL, shard_search_worker, &args[s]) == 0)
+                args[s].threaded = 1;
+            else
+                shard_search_worker(&args[s]);
+        }
+        for (int s = 0; s < sc; s++)
+            if (args[s].threaded)
+                pthread_join(threads[s], NULL);
+
+        munmap(query, vec_bytes);            /* workers are done reading the query */
+
+        /* Re-acquire the lock to update counters and merge. Re-find by OID since
+         * the struct may have moved (eviction compaction) while we were unlocked.
+         * The g_merge_metric global + qsort run here so the merge stays
+         * serialized; only the GPU dispatch above was concurrent. */
+        pthread_mutex_lock(&g_index_mutex);
+        e = find_index(snap_db, snap_idx);
+        if (!e)
+        {
+            /* Cannot happen for the supported workload (ADR-022 invariant);
+             * fail closed to CPU rather than risk touching freed memory. */
+            for (int s = 0; s < sc; s++) free(args[s].out);
+            free(args); free(threads);
+            pthread_mutex_unlock(&g_index_mutex);
+            CuvsReplyHeader hdr = {0};
+            hdr.status = CUVS_STATUS_OOM_FALLBACK;
+            strncpy(hdr.error, "sharded index vanished mid-search; CPU fallback",
+                    sizeof(hdr.error) - 1);
+            send_all(client_fd, &hdr, sizeof(hdr));
+            return;
+        }
+
+        /* Record per-shard outcomes; any shard failure fails the whole query
+         * closed (CPU fallback), never a partial ANN result. */
+        int shard_err = 0;
+        for (int s = 0; s < sc; s++)
+        {
+            if (args[s].rc != 0)
+            {
+                e->shards[s].error_count++;
+                e->shards[s].last_status = CUVS_STATUS_OOM_FALLBACK;
+                shard_err = 1;
+            }
+            else if (args[s].sk > 0)
+            {
+                e->shards[s].search_count++;
+                e->shards[s].last_status = CUVS_STATUS_OK;
+            }
+        }
 
         if (shard_err)
         {
-            free(cand); free(out);
+            for (int s = 0; s < sc; s++) free(args[s].out);
+            free(args); free(threads);
             CuvsReplyHeader hdr = {0};
             hdr.status = CUVS_STATUS_OOM_FALLBACK;
             strncpy(hdr.error, "sharded search failed on a shard; CPU fallback",
@@ -1643,10 +1746,42 @@ handle_search(int client_fd, const CuvsCmdFrame *cmd)
             return;
         }
 
-        g_merge_metric = e->metric;     /* read by delta_cand_cmp under the lock */
-        qsort(cand, (size_t)n_total, sizeof(CuvsResult), delta_cand_cmp);
+        CuvsResult *cand = malloc((size_t) (total_sk > 0 ? total_sk : 1) * sizeof(CuvsResult));
+        CuvsResult *out  = malloc((size_t) k * sizeof(CuvsResult));
+        if (!cand || !out)
+        {
+            for (int s = 0; s < sc; s++) free(args[s].out);
+            free(args); free(threads); free(cand); free(out);
+            pthread_mutex_unlock(&g_index_mutex);
+            send_error(client_fd, "malloc failed");
+            return;
+        }
+
+        /* Collect candidates, mapping each shard-local id to a global TID. Uses
+         * the snapshot tid_offset/n_vecs (stable per the invariant) and the
+         * re-found entry's tids/n_vecs. */
+        int n_total = 0;
+        for (int s = 0; s < sc; s++)
+        {
+            int64_t toff = args[s].tid_offset;
+            for (int j = 0; j < args[s].sk; j++)
+            {
+                int64_t id = args[s].out[j].item_id;
+                if (id < 0 || id >= args[s].shard_n_vecs) continue;
+                int64_t gid = toff + id;
+                if (gid < 0 || gid >= e->n_vecs) continue;
+                cand[n_total].tid      = e->tids[gid];
+                cand[n_total].distance = args[s].out[j].distance;
+                n_total++;
+            }
+            free(args[s].out);
+        }
+        free(args); free(threads);
+
+        g_merge_metric = e->metric;          /* read by delta_cand_cmp under the lock */
+        qsort(cand, (size_t) n_total, sizeof(CuvsResult), delta_cand_cmp);
         int n_valid = (n_total < k) ? n_total : k;
-        memcpy(out, cand, (size_t)n_valid * sizeof(CuvsResult));
+        memcpy(out, cand, (size_t) n_valid * sizeof(CuvsResult));
         free(cand);
 
         clock_gettime(CLOCK_MONOTONIC, &t1);
@@ -1655,17 +1790,17 @@ handle_search(int client_fd, const CuvsCmdFrame *cmd)
             (t1.tv_nsec - t0.tv_nsec) / 1000);
         record_search_stat(e, CUVS_STATUS_OK, latency_us, NULL);
         e->last_requested_k = cmd->k;
-        e->last_returned_k  = (uint32_t)n_valid;
+        e->last_returned_k  = (uint32_t) n_valid;
         pthread_mutex_unlock(&g_index_mutex);
 
         CuvsReplyHeader hdr = {0};
         hdr.status       = CUVS_STATUS_OK;
-        hdr.n_results    = (uint32_t)n_valid;
+        hdr.n_results    = (uint32_t) n_valid;
         hdr.latency_us   = latency_us;
         hdr.delta_merged = 0;
         send_all(client_fd, &hdr, sizeof(hdr));
         if (n_valid > 0)
-            send_all(client_fd, out, (size_t)n_valid * sizeof(CuvsResult));
+            send_all(client_fd, out, (size_t) n_valid * sizeof(CuvsResult));
         free(out);
         return;
     }
@@ -1952,7 +2087,7 @@ objstore_upload_thread(void *arg)
 static void
 build_sharded(int client_fd, const CuvsCmdFrame *cmd, const char *index_dir,
               const float *vecs, const uint64_t *tids_in,
-              size_t total, void *mem)
+              size_t total, void *mem, int shard_count)
 {
     int64_t  n_vecs    = cmd->n_vecs;
     uint32_t dim       = cmd->dim;
@@ -1960,7 +2095,7 @@ build_sharded(int client_fd, const CuvsCmdFrame *cmd, const char *index_dir,
     size_t   tid_bytes = (size_t)n_vecs * sizeof(uint64_t);
 
     /* Clamp shard count so every shard holds >= 2 vectors (CAGRA aborts on 1). */
-    int sc = (int)cmd->shard_count;
+    int sc = shard_count;
     if (sc > CUVS_SHARDS_MAX)
         sc = CUVS_SHARDS_MAX;
     if ((int64_t)sc > n_vecs / 2)
@@ -1972,9 +2107,9 @@ build_sharded(int client_fd, const CuvsCmdFrame *cmd, const char *index_dir,
                         "shard_count too high for corpus (need >= 2 vectors per shard)");
         return;
     }
-    if (sc != (int)cmd->shard_count)
-        LOG_WARN("[build_sharded] clamped shard_count %u -> %d for %lld vecs\n",
-                 cmd->shard_count, sc, (long long)n_vecs);
+    if (sc != shard_count)
+        LOG_WARN("[build_sharded] clamped shard_count %d -> %d for %lld vecs\n",
+                 shard_count, sc, (long long)n_vecs);
 
     const char *save_dir = (index_dir[0] != '\0') ? index_dir : g_index_dir;
     mkdir(save_dir, 0700);
@@ -2325,12 +2460,49 @@ handle_build(int client_fd, const CuvsCmdFrame *cmd)
     const float    *vecs    = (const float *)mem;
     const uint64_t *tids_in = (const uint64_t *)((const char *)mem + vec_bytes);
 
-    /* Phase 3F: sharded build path. Self-contained (owns munmap + reply).
-     * Default (shard_count 0/1) falls through to the unsharded path below,
-     * byte-identical to pre-3F behavior. */
-    if (cmd->shard_count >= 2)
+    /* Phase 3F/3G: resolve the shard count, then dispatch.
+     *   cmd->shard_count == 0 -> Phase 3G auto: derive from VRAM. Resolves to 1
+     *      (unsharded) whenever the index fits one GPU, so small-index behavior
+     *      is byte-identical to pre-3G. 0 from the helper means it won't fit even
+     *      maximally sharded -> fail closed (CREATE INDEX aborts).
+     *   cmd->shard_count == 1 -> forced unsharded.
+     *   cmd->shard_count >= 2 -> forced N (build_sharded clamps to the corpus).
+     * The build_sharded path is self-contained (owns munmap + reply); the
+     * unsharded fall-through below is byte-identical to pre-3F behavior. */
+    int resolved_sc = (int)cmd->shard_count;
+    if (cmd->shard_count == 0)
     {
-        build_sharded(client_fd, cmd, index_dir, vecs, tids_in, total, mem);
+        /* Per-GPU budget: the smallest positive budget across usable GPUs (most
+         * conservative; 0 if all are unlimited, which the helper treats as
+         * "don't auto-shard"). */
+        size_t budget = 0;
+        int ng = n_usable_gpus();
+        for (int i = 0; i < ng; i++)
+        {
+            size_t b = g_max_vram_per_gpu[usable_gpu(i)];
+            if (b > 0 && (budget == 0 || b < budget))
+                budget = b;
+        }
+        resolved_sc = cuvs_auto_shard_count(cmd->n_vecs, (int)cmd->dim, budget,
+                                            ng, CUVS_SHARDS_MAX);
+        if (resolved_sc == 0)
+        {
+            munmap(mem, total);
+            CuvsReplyHeader hdr = {0};
+            hdr.status = CUVS_STATUS_OOM_FALLBACK;
+            strncpy(hdr.error,
+                    "index too large for GPU VRAM even when fully sharded",
+                    sizeof(hdr.error) - 1);
+            send_all(client_fd, &hdr, sizeof(hdr));
+            return;
+        }
+        LOG_INFO("[handle_build] auto shard count: %u/%u %lld vecs dim %u -> %d shard(s)\n",
+                 cmd->db_oid, cmd->index_oid, (long long)cmd->n_vecs, cmd->dim, resolved_sc);
+    }
+
+    if (resolved_sc >= 2)
+    {
+        build_sharded(client_fd, cmd, index_dir, vecs, tids_in, total, mem, resolved_sc);
         return;
     }
 

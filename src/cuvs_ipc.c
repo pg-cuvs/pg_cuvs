@@ -211,6 +211,8 @@ cuvs_ipc_search(
     int           dim,
     int           k,
     uint32_t      metric,
+    uint32_t      shard_overfetch,
+    int           parallel_fanout,
     uint64_t     *tids_out,
     float        *dist_out,
     int          *n_out,
@@ -239,13 +241,15 @@ cuvs_ipc_search(
     }
 
     CuvsCmdFrame cmd = {
-        .op        = CUVS_OP_SEARCH,
-        .db_oid    = db_oid,
-        .index_oid = index_oid,
-        .k         = (uint32_t)k,
-        .metric    = metric,
-        .dim       = (uint32_t)dim,
-        .n_vecs    = 0,
+        .op              = CUVS_OP_SEARCH,
+        .db_oid          = db_oid,
+        .index_oid       = index_oid,
+        .k               = (uint32_t)k,
+        .metric          = metric,
+        .dim             = (uint32_t)dim,
+        .n_vecs          = 0,
+        .shard_overfetch = shard_overfetch,
+        .parallel_fanout = (uint32_t)(parallel_fanout ? 1 : 0),
     };
     strncpy(cmd.shm_key, shm_key, sizeof(cmd.shm_key) - 1);
 

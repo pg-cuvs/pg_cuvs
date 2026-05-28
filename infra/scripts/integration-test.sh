@@ -1223,6 +1223,124 @@ echo "$OUT" | grep -q 'FAILCLOSED_CPU_OK' \
 stop_test_daemon
 psql -d "$DB" -c "DROP TABLE IF EXISTS s19;" >/dev/null 2>&1 || true
 
+# --- Scenario 20: Phase 3G parallel fanout + auto count + overfetch ------------
+# On a single-GPU VM the shards co-reside on one device; the logical contracts
+# (correctness under parallel dispatch, the overfetch knob, auto-count resolving
+# to unsharded when it fits, and fail-closed under the parallel path) are what
+# matter here. The parallel-vs-sequential LATENCY win is proven on 2x A100 (3G-5).
+echo "[it] --- Scenario 20: parallel fanout + auto shard count + overfetch (Phase 3G) ---"
+rm -rf "$TEST_IDX"; mkdir -p "$TEST_IDX"
+start_test_daemon
+
+psql -d "$DB" -v ON_ERROR_STOP=1 >/dev/null <<SQL
+CREATE EXTENSION IF NOT EXISTS vector;
+CREATE EXTENSION IF NOT EXISTS pg_cuvs;
+DROP TABLE IF EXISTS s20;
+CREATE TABLE s20 (id bigint, v vector(16));
+INSERT INTO s20 SELECT g, ('[' || string_agg((random())::text, ',') || ']')::vector(16)
+    FROM generate_series(1,2000) g, generate_series(1,16) d GROUP BY g;
+SQL
+
+run_sql "SET cuvs.shard_count=2; CREATE INDEX s20_l2  ON s20 USING cagra (v vector_l2_ops);
+         SET cuvs.shard_count=2; CREATE INDEX s20_cos ON s20 USING cagra (v vector_cosine_ops);
+         SET cuvs.shard_count=2; CREATE INDEX s20_ip  ON s20 USING cagra (v vector_ip_ops);" >/dev/null 2>&1 \
+    && pass "sc20: sharded CREATE INDEX (L2/cosine/IP) succeeded" \
+    || fail "sc20: sharded CREATE INDEX failed"
+
+# Parallel fanout correctness: parallel == sequential == CPU exact, all metrics.
+# L2 uses <->, cosine <=>, IP <#>. Each shard is searched concurrently when
+# parallel_fanout=on; the global top-k must be identical to the CPU exact set.
+run_sql "SET cuvs.k=10; SET enable_seqscan=off;
+SET enable_cuvs=on;  SET cuvs.parallel_fanout=on;
+CREATE TEMP TABLE l2_par  AS SELECT id FROM s20 ORDER BY v <->  (SELECT v FROM s20 WHERE id=42) LIMIT 10;
+SET cuvs.parallel_fanout=off;
+CREATE TEMP TABLE l2_seq  AS SELECT id FROM s20 ORDER BY v <->  (SELECT v FROM s20 WHERE id=42) LIMIT 10;
+SET enable_cuvs=off; SET enable_seqscan=on;
+CREATE TEMP TABLE l2_cpu  AS SELECT id FROM s20 ORDER BY v <->  (SELECT v FROM s20 WHERE id=42) LIMIT 10;
+SELECT CASE WHEN (SELECT array_agg(id ORDER BY id) FROM l2_par)=(SELECT array_agg(id ORDER BY id) FROM l2_cpu)
+             AND (SELECT array_agg(id ORDER BY id) FROM l2_seq)=(SELECT array_agg(id ORDER BY id) FROM l2_cpu)
+            THEN 'L2_PAR_OK' ELSE 'L2_PAR_DIFF' END;"
+echo "$OUT" | grep -q 'L2_PAR_OK' \
+    && pass "sc20: L2 parallel == sequential == CPU exact" \
+    || fail "sc20: L2 parallel/sequential differs from CPU exact"
+
+run_sql "SET cuvs.k=10; SET enable_seqscan=off;
+SET enable_cuvs=on; SET cuvs.parallel_fanout=on;
+CREATE TEMP TABLE cos_par AS SELECT id FROM s20 ORDER BY v <=> (SELECT v FROM s20 WHERE id=42) LIMIT 10;
+SET enable_cuvs=off; SET enable_seqscan=on;
+CREATE TEMP TABLE cos_cpu AS SELECT id FROM s20 ORDER BY v <=> (SELECT v FROM s20 WHERE id=42) LIMIT 10;
+SELECT CASE WHEN (SELECT array_agg(id ORDER BY id) FROM cos_par)=(SELECT array_agg(id ORDER BY id) FROM cos_cpu)
+            THEN 'COS_PAR_OK' ELSE 'COS_PAR_DIFF' END;"
+echo "$OUT" | grep -q 'COS_PAR_OK' \
+    && pass "sc20: cosine parallel == CPU exact" \
+    || fail "sc20: cosine parallel differs from CPU exact"
+
+run_sql "SET cuvs.k=10; SET enable_seqscan=off;
+SET enable_cuvs=on; SET cuvs.parallel_fanout=on;
+CREATE TEMP TABLE ip_par AS SELECT id FROM s20 ORDER BY v <#> (SELECT v FROM s20 WHERE id=42) LIMIT 10;
+SET enable_cuvs=off; SET enable_seqscan=on;
+CREATE TEMP TABLE ip_cpu AS SELECT id FROM s20 ORDER BY v <#> (SELECT v FROM s20 WHERE id=42) LIMIT 10;
+SELECT CASE WHEN (SELECT array_agg(id ORDER BY id) FROM ip_par)=(SELECT array_agg(id ORDER BY id) FROM ip_cpu)
+            THEN 'IP_PAR_OK' ELSE 'IP_PAR_DIFF' END;"
+echo "$OUT" | grep -q 'IP_PAR_OK' \
+    && pass "sc20: IP parallel == CPU exact" \
+    || fail "sc20: IP parallel differs from CPU exact"
+
+# Over-fetch: widening per-shard k must not change correctness vs CPU exact.
+run_sql "SET cuvs.k=10; SET enable_seqscan=off;
+SET enable_cuvs=on; SET cuvs.parallel_fanout=on; SET cuvs.shard_overfetch=32;
+CREATE TEMP TABLE of_gpu AS SELECT id FROM s20 ORDER BY v <-> (SELECT v FROM s20 WHERE id=123) LIMIT 10;
+SET enable_cuvs=off; SET enable_seqscan=on;
+CREATE TEMP TABLE of_cpu AS SELECT id FROM s20 ORDER BY v <-> (SELECT v FROM s20 WHERE id=123) LIMIT 10;
+SELECT CASE WHEN (SELECT array_agg(id ORDER BY id) FROM of_gpu)=(SELECT array_agg(id ORDER BY id) FROM of_cpu)
+            THEN 'OVERFETCH_OK' ELSE 'OVERFETCH_DIFF' END;"
+echo "$OUT" | grep -q 'OVERFETCH_OK' \
+    && pass "sc20: shard_overfetch=32 keeps top-k == CPU exact" \
+    || fail "sc20: shard_overfetch changed results"
+
+# Auto shard count: cuvs.shard_count=0 on an index that fits one GPU resolves to
+# unsharded (no shard rows, shard_count=0), so small-index behavior is unchanged.
+run_sql "SET cuvs.shard_count=0; CREATE INDEX s20_auto ON s20 USING cagra (v vector_l2_ops);" >/dev/null 2>&1 \
+    && pass "sc20: auto CREATE INDEX (shard_count=0) succeeded" \
+    || fail "sc20: auto CREATE INDEX failed"
+run_sql "SELECT count(*) FROM pg_stat_gpu_shards WHERE index_name='s20_auto';"
+AUTOSH=$(echo "$OUT" | grep -E '^\s*[0-9]+\s*$' | tr -d ' ' | head -1)
+run_sql "SELECT shard_count FROM pg_stat_gpu_search WHERE index_name='s20_auto';"
+AUTOSC=$(echo "$OUT" | grep -E '^\s*[0-9]+\s*$' | tr -d ' ' | head -1)
+{ [ "$AUTOSH" = "0" ] && { [ "$AUTOSC" = "0" ] || [ "$AUTOSC" = "1" ]; }; } \
+    && pass "sc20: auto count resolved a fitting index to unsharded (shards=$AUTOSH, shard_count=$AUTOSC)" \
+    || fail "sc20: auto count did not resolve to unsharded (shards=$AUTOSH, shard_count=$AUTOSC)"
+# The auto/unsharded index still answers correctly with parallel_fanout on (flag
+# is a no-op for unsharded indexes).
+run_sql "SET cuvs.k=10; SET enable_cuvs=on; SET enable_seqscan=off; SET cuvs.parallel_fanout=on;
+SELECT count(*) FROM (SELECT id FROM s20 ORDER BY v <-> (SELECT v FROM s20 WHERE id=42) LIMIT 10) q;"
+AUTON=$(echo "$OUT" | grep -E '^\s*[0-9]+\s*$' | tr -d ' ' | head -1)
+[ "$AUTON" -ge 1 ] \
+    && pass "sc20: unsharded auto index answers under parallel_fanout=on ($AUTON rows)" \
+    || fail "sc20: unsharded auto index returned no rows"
+
+# Fail-closed under the parallel path: corrupt a shard of s20_l2, restart, and a
+# parallel-fanout query must fall back to CPU (correct), never a partial result.
+run_sql "DROP INDEX s20_cos; DROP INDEX s20_ip; DROP INDEX s20_auto;" >/dev/null 2>&1 || true
+SHARD0=$(ls "$TEST_IDX"/*_*.s000.cagra 2>/dev/null | head -1)
+stop_test_daemon
+if [ -n "$SHARD0" ]; then
+    printf '\xDE\xAD\xBE\xEF' | dd of="$SHARD0" bs=1 seek=2000 count=4 conv=notrunc 2>/dev/null
+fi
+start_test_daemon
+run_sql "SET cuvs.k=10; SET enable_cuvs=on; SET enable_seqscan=on; SET cuvs.parallel_fanout=on;
+CREATE TEMP TABLE fc20g AS SELECT id FROM s20 ORDER BY v <-> (SELECT v FROM s20 WHERE id=42) LIMIT 10;
+SET enable_cuvs=off;
+CREATE TEMP TABLE fc20c AS SELECT id FROM s20 ORDER BY v <-> (SELECT v FROM s20 WHERE id=42) LIMIT 10;
+SELECT CASE WHEN (SELECT array_agg(id ORDER BY id) FROM fc20g)=(SELECT array_agg(id ORDER BY id) FROM fc20c)
+            THEN 'PAR_FAILCLOSED_OK' ELSE 'PAR_FAILCLOSED_BAD' END;"
+echo "$OUT" | grep -q 'PAR_FAILCLOSED_OK' \
+    && pass "sc20: parallel-path fail-closed -> CPU fallback correct" \
+    || fail "sc20: parallel-path fail-closed incorrect"
+
+stop_test_daemon
+psql -d "$DB" -c "DROP TABLE IF EXISTS s20;" >/dev/null 2>&1 || true
+
 echo "[it] === summary ==="
 if [ "$FAILED" = "0" ]; then
     echo "[PASS] all integration scenarios passed"

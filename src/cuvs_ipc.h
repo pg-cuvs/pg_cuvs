@@ -61,7 +61,9 @@ typedef struct CuvsCmdFrame {
     char     shm_key[64];   /* shm_open name for payload data */
     uint32_t table_oid;     /* BUILD: heap relation OID (for manifest) */
     uint32_t relfilenode;   /* BUILD: heap relfilenode (heap compat identity, ADR-013) */
-    uint32_t shard_count;   /* BUILD: Phase 3F; 0/1 = unsharded, >=2 = split into N shards */
+    uint32_t shard_count;   /* BUILD: Phase 3F; 0=auto (3G), 1=unsharded, >=2 = N shards */
+    uint32_t shard_overfetch; /* SEARCH: Phase 3G; per-shard request k = k + this (recall slop) */
+    uint32_t parallel_fanout; /* SEARCH: Phase 3G; 1 = dispatch shards concurrently, 0 = sequential */
 } CuvsCmdFrame;
 
 /*
@@ -164,6 +166,8 @@ int cuvs_ipc_search(
     int           dim,
     int           k,
     uint32_t      metric,
+    uint32_t      shard_overfetch, /* Phase 3G: per-shard k+slop; ignored if unsharded */
+    int           parallel_fanout, /* Phase 3G: 1=concurrent shard dispatch, 0=sequential */
     uint64_t     *tids_out,
     float        *dist_out,
     int          *n_out,

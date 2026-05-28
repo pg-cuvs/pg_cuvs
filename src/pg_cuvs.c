@@ -80,7 +80,9 @@ double cuvs_build_mem_safety_ratio = 0.5;  /* auto-limit fraction of MemAvailabl
 double cuvs_max_stale_fraction     = 0.10; /* deleted-since-build fraction that reroutes to CPU */
 int   cuvs_max_delta_rows          = 10000; /* pending-insert delta cap; 0 disables delta (Phase 3A) */
 int   cuvs_delta_search_mode       = 0;    /* 0=auto, 1=cpu, 2=gpu (Phase 3A-3) */
-int   cuvs_shard_count             = 0;    /* 0/1 = unsharded; >=2 splits index into N GPU shards (Phase 3F) */
+int   cuvs_shard_count             = 0;    /* 0 = auto (Phase 3G); 1 = unsharded; >=2 = N GPU shards (Phase 3F) */
+int   cuvs_shard_overfetch         = 0;    /* per-shard request k = k + this; recall slop at scale (Phase 3G) */
+bool  cuvs_parallel_fanout         = true; /* dispatch shards concurrently in the daemon (Phase 3G) */
 char *cuvs_snapshot_uri            = NULL;  /* "gs://bucket[/prefix]" — empty = disabled (Phase 3C) */
 char *cuvs_cluster_id              = NULL;  /* multi-node identifier for GCS path (Phase 3C) */
 char *cuvs_gcs_key_file            = NULL;  /* service account JSON path; "" = instance metadata (Phase 3C) */
@@ -227,6 +229,30 @@ _PG_init(void)
         "global top-k at query time. Read at CREATE INDEX/REINDEX time only.",
         &cuvs_shard_count,
         0, 0, CUVS_SHARDS_MAX,
+        PGC_USERSET,
+        0, NULL, NULL, NULL);
+
+    DefineCustomIntVariable(
+        "cuvs.shard_overfetch",
+        "Extra candidates fetched per shard before the global top-k merge (Phase 3G).",
+        "Each shard of a sharded index is searched for k + this many candidates; the "
+        "daemon then merges a global top-k. 0 (default) keeps the legacy per-shard k "
+        "and is byte-identical to Phase 3F. Raise it to defend recall as shard count "
+        "grows. Ignored for unsharded indexes. Read per SEARCH.",
+        &cuvs_shard_overfetch,
+        0, 0, 4096,
+        PGC_USERSET,
+        0, NULL, NULL, NULL);
+
+    DefineCustomBoolVariable(
+        "cuvs.parallel_fanout",
+        "Dispatch a sharded index's per-shard searches concurrently in the daemon (Phase 3G).",
+        "on (default) fans out to all shards in parallel and merges a global top-k, "
+        "cutting per-query latency from the sum of per-shard times toward the max. "
+        "off forces the legacy sequential fanout (useful for A/B latency comparison "
+        "and as a kill switch). No effect on unsharded indexes. Read per SEARCH.",
+        &cuvs_parallel_fanout,
+        true,
         PGC_USERSET,
         0, NULL, NULL, NULL);
 
@@ -1298,6 +1324,8 @@ cuvs_gettuple(IndexScanDesc scan, ScanDirection dir)
             (uint32_t)index_oid,
             qvec->x,
             dim, k, metric,
+            (uint32_t)cuvs_shard_overfetch,
+            cuvs_parallel_fanout ? 1 : 0,
             ss->tids,
             ss->distances,
             &ss->n_results,
