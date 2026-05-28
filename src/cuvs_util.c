@@ -368,18 +368,22 @@ int
 cuvs_auto_shard_count(int64_t n_vecs, int dim, size_t per_gpu_budget_bytes,
                       int n_gpus, int max_shards)
 {
+    size_t needed;
+    int    cap;
+    int    want;
+
     if (n_vecs <= 0 || dim <= 0 || n_gpus <= 0)
         return 1;
     if (per_gpu_budget_bytes == 0)
         return 1;                       /* unlimited/unknown budget: don't auto-shard */
 
-    size_t needed = (size_t) n_vecs * ((size_t) dim * sizeof(float) + 16 * 4);
+    needed = (size_t) n_vecs * ((size_t) dim * sizeof(float) + 16 * 4);
     if (needed <= per_gpu_budget_bytes)
         return 1;                       /* fits a single GPU */
 
     /* Cap shard count by usable GPUs, the sanity max, and the >=2-vectors-per-
      * shard floor (CAGRA aborts on a 1-vector shard). */
-    int cap = n_gpus;
+    cap = n_gpus;
     if (max_shards > 0 && cap > max_shards)
         cap = max_shards;
     if ((int64_t) cap > n_vecs / 2)
@@ -388,7 +392,7 @@ cuvs_auto_shard_count(int64_t n_vecs, int dim, size_t per_gpu_budget_bytes,
         return 0;                       /* can't split enough to fit */
 
     /* ceil(needed / per_gpu_budget_bytes) shards of ~equal size. */
-    int want = (int) ((needed + per_gpu_budget_bytes - 1) / per_gpu_budget_bytes);
+    want = (int) ((needed + per_gpu_budget_bytes - 1) / per_gpu_budget_bytes);
     if (want < 2)
         want = 2;
     if (want > cap)
