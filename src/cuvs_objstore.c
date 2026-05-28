@@ -534,16 +534,19 @@ gcs_upload_file(const char *bucket, const char *object_name,
     if (!curl) { fclose(f); curl_slist_free_all(hdrs); return -1; }
 
     RespBuf rb = {NULL, 0, 0};
-    curl_easy_setopt(curl, CURLOPT_URL,              url);
-    curl_easy_setopt(curl, CURLOPT_UPLOAD,           1L);
-    curl_easy_setopt(curl, CURLOPT_HTTPHEADER,       hdrs);
-    curl_easy_setopt(curl, CURLOPT_READFUNCTION,     read_from_file);
-    curl_easy_setopt(curl, CURLOPT_READDATA,         f);
-    curl_easy_setopt(curl, CURLOPT_INFILESIZE_LARGE, (curl_off_t)st.st_size);
-    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION,    write_to_buf);
-    curl_easy_setopt(curl, CURLOPT_WRITEDATA,        &rb);
-    curl_easy_setopt(curl, CURLOPT_TIMEOUT,          7200L); /* 2 h for large files */
-    curl_easy_setopt(curl, CURLOPT_FAILONERROR,      1L);
+    /* The GCS JSON media-upload endpoint (/upload/.../o?uploadType=media)
+     * requires POST; a PUT (CURLOPT_UPLOAD) returns HTTP 404. Stream the file as
+     * the POST body via the read callback with a known length. */
+    curl_easy_setopt(curl, CURLOPT_URL,                 url);
+    curl_easy_setopt(curl, CURLOPT_POST,                1L);
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE_LARGE, (curl_off_t)st.st_size);
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER,          hdrs);
+    curl_easy_setopt(curl, CURLOPT_READFUNCTION,        read_from_file);
+    curl_easy_setopt(curl, CURLOPT_READDATA,            f);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION,       write_to_buf);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA,           &rb);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT,             7200L); /* 2 h for large files */
+    curl_easy_setopt(curl, CURLOPT_FAILONERROR,         1L);
 
     CURLcode rc = curl_easy_perform(curl);
     long     http_code = 0;
