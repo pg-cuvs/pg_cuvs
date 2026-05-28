@@ -492,6 +492,13 @@ Scope decision:
 - GPU별 eviction은 다른 GPU의 resident indexes에 영향을 주지 않아야 한다.
 - `cuvs.max_vram_mb`는 global-only가 아니라 per-device budget으로 해석하거나 별도 per-GPU override를 둔다.
 
+3E-2 verified evidence:
+- single-GPU VM: unit tests 120/120, integration 18 scenarios all pass.
+- single-GPU VM: 1MB budget placement failure reports OOM while daemon stays alive.
+- single-GPU VM: 4MB budget eviction-isolation scenario triggers `evictions=1` and daemon stays alive.
+- multi-GPU VM: per-GPU cache counters are independent (`hits=1` on GPU 0 and `hits=1` on GPU 1 after targeted searches).
+- multi-GPU VM: index spreading remains verified with physical indexes resident on GPU 0 and GPU 1.
+
 3E-3 Partitioned logical-table integration:
 - 하나의 parent table에 대한 query가 child partition CAGRA indexes를 사용하고, 각 physical index가 3E runtime에 의해 GPU별로 분산 배치되는 recipe를 문서화/검증한다.
 - global top-k correctness는 `enable_cuvs=off` CPU exact result와 비교한다.
