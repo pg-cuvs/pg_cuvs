@@ -336,29 +336,37 @@ install ... pg_cuvs_server '/usr/local/bin/'
 
 `shared_preload_libraries` 추가, `libstdc++` 심볼릭 링크, PG 재시작을 수행한다. idempotent.
 
+**VM 안에서 직접:**
+
+```bash
+bash ~/pg_cuvs/infra/scripts/postinstall.sh
+```
+
+**로컬 래퍼 (동일한 동작 — stdin으로 스크립트를 전송):**
+
 ```bash
 # make gpu-postinstall 가 실제로 하는 것 (Makefile:212):
 CONDA_ENV=$CONDA_ENV ssh $GCP_VM "CONDA_ENV=$CONDA_ENV bash -s" \
     < infra/scripts/postinstall.sh
 
-# 또는 래퍼:
+# 또는:
 make gpu-postinstall
 ```
 
 **기대 출력:**
 ```
-shared_preload_libraries ... pg_cuvs
-restarting postgresql ...
-```
-**-> 성공:** Step 6으로  
-**-> `bash -s` 에서 스크립트 미실행:** `infra/scripts/postinstall.sh` 파일 존재 여부 확인  
-**-> PG restart 실패:** `ssh $GCP_VM "sudo systemctl status postgresql"` 로 상세 확인
+[postinstall] shared_preload_libraries setup ...
+[postinstall] restart PostgreSQL
+ shared_preload_libraries
+--------------------------
+ pg_cuvs
+(1 row)
 
-설정 확인:
-```bash
-ssh $GCP_VM "psql -d postgres -c 'SHOW shared_preload_libraries;'"
-# pg_cuvs 포함 여부 확인
+[postinstall] DONE
 ```
+**→ 성공:** Step 6으로  
+**→ `shared_preload_libraries already present`:** 이미 설정됨 — 정상, Step 6으로  
+**→ PG restart 실패:** `sudo systemctl status postgresql` 로 상세 확인
 
 ---
 
