@@ -437,3 +437,29 @@ MVP:
 **대안**:
 - recv timeout만 늘림. 거부 — 타임아웃이 원인이 아니라 `EINTR`이 원인이며, 600s 안에서도 발생.
 - 클라이언트에서 build 결과를 재조회(idempotent re-check). 보류 — 현재 불필요. orphan 정리/재시도 계약은 Phase 2 write-path 작업에서 함께 다룬다.
+
+---
+
+## ADR-021 — Phase 3F True Multi-GPU CAGRA Sharding 설계 lock
+
+**날짜**: 2026-05-28
+
+**문제**: Phase 3E는 index-level multi-GPU(인덱스 하나는 GPU 하나에 통째로 resident, 서로 다른 인덱스를 GPU별로 분산)까지 닫았다. 단일 logical CAGRA index가 GPU 한 장 VRAM보다 크거나 너무 hot한 경우는 3E로 해결되지 않는다.
+
+**결정**: 단일 non-partitioned table의 단일 logical CAGRA index를 N개 shard로 분할한다. 핵심 결정:
+- shard = 독립 cuVS CAGRA artifact 하나, GPU 한 장에 resident. logical index가 여러 shard/GPU를 소유. shard 하나가 여러 GPU에 걸치지 않는다.
+- shard 분할 기준은 **build-order contiguous range**(global `.tids`의 `[start,end)`). vector-clustering 기반 assignment는 recall/cost trade-off가 커서 follow-up.
+- shard count는 **explicit `cuvs.shard_count=N` GUC**로 결정. 기본값 `0`/`1`은 기존 unsharded 경로를 byte-identical하게 유지하고, `N>=2`일 때만 sharding 활성화. auto VRAM-기반 split은 follow-up.
+- search는 logical index당 IPC 한 번 유지. 데몬이 shard별 CAGRA search를 실행하고 metric-aware comparator로 global top-k를 merge해 기존 reply format을 반환. MVP는 **sequential fanout**(기존 `g_index_mutex` 직렬화 모델 유지), parallel fanout은 follow-up.
+- **fail-closed**: shard 하나라도 missing/corrupt/reload 실패면 partial ANN result를 절대 반환하지 않는다. SELECT는 CPU fallback, DDL/REINDEX는 ERROR.
+- durable DDL은 all-or-nothing: 모든 shard `.cagra.tmp` + global `.tids.tmp` + `.shards.tmp`를 fsync한 뒤 rename하고, `.shards` manifest rename을 마지막 commit marker로 삼는다. manifest가 없거나 shard/checksum이 안 맞으면 logical sharded index를 load하지 않는다.
+- delta/tombstone은 global `.tids` CRC와 global TID 기준을 유지한다. 1차 구현은 backend CPU delta merge fallback을 그대로 쓰고(데몬은 sharded reply에 `delta_merged=0`), daemon-side shard-aware GPU delta cache는 follow-up.
+
+**결과**:
+- artifact: legacy unsharded는 `<db>_<idx>.cagra` + `.tids` 유지. sharded는 global `.tids` + `.shards` manifest + `<db>_<idx>.s%03u.cagra`.
+- 새 관측 view `pg_stat_gpu_shards`(shard별 GPU/resident/stats)와 `pg_stat_gpu_search`의 `shard_count` 컬럼 추가.
+- 구현/검증은 3F-0(design lock) → 3F-5(SW MVP, 단일 GPU VM 검증 가능) → 3F-6(2x A100 hardware acceptance)까지 sub-phase로 끊고, 3F-6 통과를 Phase 3F 완료 기준으로 본다.
+
+**대안**:
+- cuVS `cuvs::neighbors::mg` SHARDED 모드 직접 사용. 보류 — 기존 daemon의 per-device pool/placement/eviction/delta/tombstone 계층과의 통합 비용이 크고, artifact durability 계약을 그대로 재사용하려면 shard = 독립 CAGRA artifact 모델이 더 단순.
+- PostgreSQL partitioning recipe(3E-3)로 대체. 거부 — 그건 multiple physical index의 integration recipe이고, 3F는 단일 logical index의 internal sharding으로 사용자 DDL surface를 바꾸지 않는 것이 목표.

@@ -1126,6 +1126,103 @@ run_sql "SELECT 1;" >/dev/null 2>&1 \
 stop_test_daemon
 psql -d "$DB" -c "DROP TABLE IF EXISTS ev18_a, ev18_b;" >/dev/null 2>&1 || true
 
+# --- Scenario 19: Phase 3F single-index multi-GPU sharding ---------------------
+# Build a sharded CAGRA index (cuvs.shard_count=2), verify contiguous shard
+# placement + artifacts, top-k correctness vs CPU exact, manifest reload after a
+# daemon restart, and fail-closed on a corrupt shard artifact. Shards may
+# co-reside on one GPU on a single-GPU VM — the logical contract is what matters.
+echo "[it] --- Scenario 19: multi-GPU CAGRA sharding (Phase 3F) ---"
+rm -rf "$TEST_IDX"; mkdir -p "$TEST_IDX"
+start_test_daemon
+
+psql -d "$DB" -v ON_ERROR_STOP=1 >/dev/null <<SQL
+CREATE EXTENSION IF NOT EXISTS vector;
+CREATE EXTENSION IF NOT EXISTS pg_cuvs;
+DROP TABLE IF EXISTS s19;
+CREATE TABLE s19 (id bigint, v vector(16));
+INSERT INTO s19 SELECT g, ('[' || string_agg((random())::text, ',') || ']')::vector(16)
+    FROM generate_series(1,2000) g, generate_series(1,16) d GROUP BY g;
+SQL
+
+run_sql "SET cuvs.shard_count=2; CREATE INDEX s19_cagra ON s19 USING cagra (v vector_l2_ops);" >/dev/null 2>&1 \
+    && pass "sc19: sharded CREATE INDEX succeeded" \
+    || fail "sc19: sharded CREATE INDEX failed"
+
+# Two contiguous shards, both resident.
+run_sql "SELECT count(*) FROM pg_stat_gpu_shards WHERE index_name='s19_cagra' AND resident;"
+NSHARD=$(echo "$OUT" | grep -E '^\s*[0-9]+\s*$' | tr -d ' ' | head -1)
+[ "$NSHARD" = "2" ] \
+    && pass "sc19: 2 shards resident" \
+    || fail "sc19: expected 2 resident shards, got '$NSHARD'"
+
+run_sql "SELECT shard_count FROM pg_stat_gpu_search WHERE index_name='s19_cagra';"
+SC=$(echo "$OUT" | grep -E '^\s*[0-9]+\s*$' | tr -d ' ' | head -1)
+[ "$SC" = "2" ] \
+    && pass "sc19: pg_stat_gpu_search reports shard_count=2" \
+    || fail "sc19: shard_count column wrong ('$SC')"
+
+# Artifacts on disk: .shards manifest + 2 shard .cagra files (the manifest is
+# the commit marker, renamed last).
+NMANIFEST=$(ls "$TEST_IDX"/*.shards 2>/dev/null | wc -l | tr -d ' ')
+NSCAGRA=$(ls "$TEST_IDX"/*.s0??.cagra 2>/dev/null | wc -l | tr -d ' ')
+[ "$NMANIFEST" -ge 1 ] && [ "$NSCAGRA" -ge 2 ] \
+    && pass "sc19: artifacts present (.shards x$NMANIFEST, shard .cagra x$NSCAGRA)" \
+    || fail "sc19: missing artifacts (.shards=$NMANIFEST, shard .cagra=$NSCAGRA)"
+
+# Top-k correctness: sharded GPU fanout == CPU exact (set comparison).
+run_sql "SET cuvs.k=10;
+SET enable_cuvs=on; SET enable_seqscan=off;
+CREATE TEMP TABLE g19 AS SELECT id FROM s19 ORDER BY v <-> (SELECT v FROM s19 WHERE id=42) LIMIT 10;
+SET enable_cuvs=off; SET enable_seqscan=on;
+CREATE TEMP TABLE c19 AS SELECT id FROM s19 ORDER BY v <-> (SELECT v FROM s19 WHERE id=42) LIMIT 10;
+SELECT CASE WHEN (SELECT array_agg(id ORDER BY id) FROM g19)=(SELECT array_agg(id ORDER BY id) FROM c19)
+            THEN 'SHARD_TOPK_MATCH' ELSE 'SHARD_TOPK_DIFF' END;"
+echo "$OUT" | grep -q 'SHARD_TOPK_MATCH' \
+    && pass "sc19: sharded top-k matches CPU exact" \
+    || fail "sc19: sharded top-k DIFFERS from CPU exact"
+
+# Manifest reload: restart daemon, confirm it reloads from .shards (no rebuild).
+stop_test_daemon
+start_test_daemon
+grep -q 'loaded sharded index' /tmp/pg_cuvs_test_daemon.log \
+    && pass "sc19: daemon reloaded sharded index from manifest after restart" \
+    || fail "sc19: sharded index not reloaded from manifest"
+run_sql "SET cuvs.k=10; SET enable_cuvs=on; SET enable_seqscan=off;
+SELECT count(*) FROM (SELECT id FROM s19 ORDER BY v <-> (SELECT v FROM s19 WHERE id=42) LIMIT 10) q;"
+RELN=$(echo "$OUT" | grep -E '^\s*[0-9]+\s*$' | tr -d ' ' | head -1)
+[ "$RELN" -ge 1 ] \
+    && pass "sc19: query works after manifest reload ($RELN rows)" \
+    || fail "sc19: query returned no rows after reload"
+
+# Fail-closed: corrupt a shard artifact, restart, expect it NOT loaded and the
+# query to fall back to CPU (correct results), never a partial GPU result.
+SHARD0=$(ls "$TEST_IDX"/*.s000.cagra 2>/dev/null | head -1)
+stop_test_daemon
+if [ -n "$SHARD0" ]; then
+    printf '\xDE\xAD\xBE\xEF' | dd of="$SHARD0" bs=1 seek=2000 count=4 conv=notrunc 2>/dev/null
+fi
+start_test_daemon
+grep -q 'artifact crc mismatch' /tmp/pg_cuvs_test_daemon.log \
+    && pass "sc19: corrupt shard detected (crc mismatch) on reload" \
+    || fail "sc19: corrupt shard NOT detected"
+run_sql "SELECT count(*) FROM pg_stat_gpu_shards WHERE index_name='s19_cagra';"
+FCROWS=$(echo "$OUT" | grep -E '^\s*[0-9]+\s*$' | tr -d ' ' | head -1)
+[ "$FCROWS" = "0" ] \
+    && pass "sc19: corrupt sharded index not registered (fail closed)" \
+    || fail "sc19: corrupt sharded index registered ($FCROWS shard rows)"
+run_sql "SET cuvs.k=10; SET enable_cuvs=on; SET enable_seqscan=on;
+CREATE TEMP TABLE fcg AS SELECT id FROM s19 ORDER BY v <-> (SELECT v FROM s19 WHERE id=42) LIMIT 10;
+SET enable_cuvs=off;
+CREATE TEMP TABLE fcc AS SELECT id FROM s19 ORDER BY v <-> (SELECT v FROM s19 WHERE id=42) LIMIT 10;
+SELECT CASE WHEN (SELECT array_agg(id ORDER BY id) FROM fcg)=(SELECT array_agg(id ORDER BY id) FROM fcc)
+            THEN 'FAILCLOSED_CPU_OK' ELSE 'FAILCLOSED_BAD' END;"
+echo "$OUT" | grep -q 'FAILCLOSED_CPU_OK' \
+    && pass "sc19: CPU fallback correct when shards fail to load" \
+    || fail "sc19: CPU fallback incorrect on shard failure"
+
+stop_test_daemon
+psql -d "$DB" -c "DROP TABLE IF EXISTS s19;" >/dev/null 2>&1 || true
+
 echo "[it] === summary ==="
 if [ "$FAILED" = "0" ]; then
     echo "[PASS] all integration scenarios passed"

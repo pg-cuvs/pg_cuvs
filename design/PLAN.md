@@ -555,6 +555,14 @@ True single-index multi-GPU CAGRA sharding is split out as Phase 3F.
 
 #### Phase 3F — True Multi-GPU CAGRA Sharding
 
+3F-0 Design lock (확정 결정, ADR-021):
+- SW MVP 먼저, HW acceptance(3F-6)는 별도 게이트.
+- MVP fanout은 sequential(기존 `g_index_mutex` 직렬화 유지). parallel fanout은 follow-up.
+- shard count는 explicit `cuvs.shard_count=N`. 기본값 `0`/`1`은 기존 unsharded 동작을 byte-identical하게 유지하고 `N>=2`에서만 sharding 활성화. auto shard count는 follow-up.
+- shard 분할은 build-order contiguous range. clustering 기반 assignment는 follow-up.
+- fail-closed: shard 하나라도 실패면 partial 금지(SELECT CPU fallback, DDL ERROR).
+- 3F sub-phase 진행 순서: 3F-1 artifact+build → 3F-2 daemon runtime+reload → 3F-3 sequential fanout search+merge → 3F-4 fail-closed+delta/tombstone → 3F-5 SW MVP verification → 3F-6 multi-GPU hardware acceptance(완료 게이트) → 3F-7 follow-up(parallel fanout, auto count, clustering, daemon-side shard delta cache, per-shard k+slop, partial degraded mode, object snapshot manifest 확장).
+
 목표:
 - 단일 non-partitioned table / 단일 logical CAGRA index를 내부적으로 N개 shard로 나누고, 하나의 query를 여러 GPUs에 fanout한 뒤 daemon에서 global top-k를 merge한다.
 - 사용자 SQL/DDL surface는 기존과 같다: `CREATE INDEX ... USING cagra (...)`와 parent/child partition 직접 query 없이 일반 table query를 유지한다.
@@ -600,27 +608,72 @@ Phase 3F 완료 기준:
 - shard artifact 하나가 손상되면 partial result가 아니라 CPU fallback 또는 ERROR로 fail closed한다.
 - delta/tombstone이 존재하는 상태에서도 INSERT/UPDATE/DELETE correctness contract를 유지한다.
 
-#### Phase 3G — Operational Playbooks / Runbooks
+3F execution plan:
+- **3F-0 Design lock**: SW MVP 먼저, hardware acceptance 별도. Sequential fanout 먼저, parallel fanout 후속. Explicit `cuvs.shard_count=N` 먼저, auto shard count 후속. 기본값 0/1은 기존 unsharded 동작을 유지한다.
+- **3F-1 Sharded artifact + build MVP**: `cuvs.shard_count` GUC, global `.tids`, `.shards` manifest, shard `.sNNN.cagra` artifacts, build-order contiguous range split, all-or-nothing durable DDL을 구현한다.
+- **3F-2 Daemon runtime + reload**: `IndexEntry`를 unsharded/sharded로 구분하고 `ShardEntry[]`를 추가한다. startup reload는 legacy `.cagra`와 sharded `.shards` manifest를 모두 지원한다. `pg_stat_gpu_shards`와 logical-row `shard_count` 관측성을 추가한다.
+- **3F-3 Sequential fanout search + merge**: 한 IPC search는 logical index 하나를 요청하고, daemon은 shard들을 순차 검색한 뒤 metric-aware global top-k를 merge한다. 기존 reply format을 유지한다.
+- **3F-4 Fail-closed + delta/tombstone correctness**: missing/corrupt/reload-failed shard는 partial result가 아니라 CPU fallback/DDL ERROR로 닫는다. `.delta`와 `.tombstone`은 global `.tids` CRC 기준으로 유지하고 snapshot-aware filtering을 보존한다.
+- **3F-5 SW MVP verification**: single non-partitioned table에서 `SET cuvs.shard_count=2`로 shard artifacts, manifest, restart reload, top-k CPU exact match, corrupt shard fail-closed, delta/tombstone correctness를 검증한다.
+- **3F-6 Multi-GPU hardware acceptance**: 2x A100 또는 동급 multi-GPU VM에서 shard 0/1이 GPU 0/1에 분산 resident하고, concurrent benchmark에서 shard별 counters가 증가하며, restart/corruption/fail-closed가 유지됨을 검증한다. 검증 후 VM stop/delete와 비용 상태를 보고한다.
+- **3F-7 Boundary**: parallel fanout, auto VRAM-based shard count, vector-clustering shard assignment, daemon-side shard-aware GPU delta cache, per-shard adaptive `k + slop`, optional degraded partial recall mode, object snapshot manifest extension for shard artifacts는 3F MVP 범위 밖이며 Phase 3G에서 다룬다.
+
+3F-1~3F-5 verified evidence (2026-05-28, single-GPU A100 VM):
+- artifact format unit tests green: `cuvs_shards_write/read` round-trip + 8 rejection cases (bad magic/version, shard_count 0/>MAX, body crc, non-contiguous offsets, sum != n_vecs, out-of-order shard_id, truncated body); plus `cuvs_parse_index_filename` rejects `.sNNN.cagra`. `make test-unit`: 150 passed, 0 failed.
+- `SET cuvs.shard_count=2` build wrote `<db>_<idx>.tids` (16032 B) + `.shards` manifest (120 B = 40 header + 2×40 records) + `.s000.cagra` + `.s001.cagra`, no legacy `.cagra`. Daemon log: `built sharded index ... (2000 vecs, 2 shards)`, shard 0/1 contiguous ranges `[0,1000)` / `[1000,2000)`.
+- `pg_stat_gpu_shards` reported 2 resident shards with per-shard GPU/offset/n_vecs; `pg_stat_gpu_search.shard_count=2` with logical `gpu_device_id` NULL.
+- top-k correctness: sharded GPU fanout == `enable_cuvs=off` CPU exact, both as a set and in exact distance order across multiple query vectors (qid=42/100/500/777/1500). Results mixed ids from both shard ranges, proving cross-shard merge + global TID mapping.
+- daemon restart reloaded the sharded index from the `.shards` manifest with no rebuild (`loaded sharded index ...`), and post-reload queries stayed correct (`RELOAD_TOPK_MATCH`).
+- fail-closed: corrupting one shard `.cagra` was caught on reload (`shard 0 artifact crc mismatch ... skip`); the logical index was not registered (0 `pg_stat_gpu_shards` rows) and the query fell back to CPU with correct results (`FAILCLOSED_CPU_CORRECT`).
+- delta/tombstone: INSERT into a sharded table was found via backend CPU delta merge (`DELTA_MATCH`); DELETE excluded the dead TID via snapshot-aware tombstone filtering (same global-TID, backend-side path as unsharded; tombstone result-shortening below k is the pre-existing universal behavior, not sharding-specific).
+- no regressions: PG regression suite (smoke/cpu_fallback/edge_cases) 3/3, full fault-injection integration suite incl. new Scenario 19, and e2e durability smoke all green. `shard_count<=1` default path is byte-identical to pre-3F behavior.
+- 3F-6 (2x A100 hardware acceptance: shard0->GPU0/shard1->GPU1, concurrent benchmark, multi-GPU reload/corruption) remains the Phase 3F completion gate and is pending.
+
+#### Phase 3G — True Sharding Optimization / Productization
 
 목표:
-- Phase 3A-3F의 실제 운영 표면이 고정된 뒤 최종 운영 playbook을 작성한다. Phase 3D 중간 상태에서 replica/object-storage playbook을 자세히 만들면 3F true sharding 도입 후 절차가 다시 바뀌므로, Phase 3 최종 playbook은 3F true sharding 완료 이후로 둔다.
+- Phase 3F의 sequential/manual-shard true sharding MVP를 운영 가능한 고성능 기능으로 확장한다.
+- 3F가 correctness/durability/fail-closed를 닫는 단계라면, 3G는 latency, automation, recall tuning, snapshot/delta integration을 개선하는 단계다.
+
+구현 항목:
+- parallel fanout: shard별 search를 여러 GPU에서 동시 실행하고, per-query latency를 sequential fanout 대비 줄인다.
+- auto VRAM-based shard count: `estimate_vram_bytes`, per-GPU budget, usable GPU set을 기준으로 shard count를 자동 결정한다. explicit `cuvs.shard_count=N` override는 유지한다.
+- vector-clustering shard assignment: build-order contiguous split을 넘어 recall/cost를 고려한 shard assignment를 연구/구현한다.
+- daemon-side shard-aware GPU delta cache: `.delta`를 shard별로 배치하거나 global delta cache를 fanout merge에 통합해 backend CPU delta merge 의존을 줄인다.
+- per-shard adaptive `k + slop`: shard별 recall/underfill을 관측해 over-fetch를 조정한다.
+- optional degraded partial recall mode: shard 일부 실패 시 기본 fail-closed는 유지하되, 명시적 opt-in에서 partial degraded 결과를 허용할지 결정한다.
+- object snapshot manifest extension: `.shards` manifest와 shard artifacts를 3C/3D object snapshot 및 async warmup과 완전히 통합한다.
+
+Phase 3G 완료 기준:
+- parallel fanout이 multi-GPU hardware에서 sequential fanout 대비 latency 개선을 보이고 correctness를 유지한다.
+- auto shard count가 deterministic override와 함께 동작하고, VRAM budget 초과 케이스를 fail-closed로 처리한다.
+- shard assignment/over-fetch 정책이 CPU exact 또는 agreed recall target 대비 검증된다.
+- shard-aware delta path가 INSERT/UPDATE correctness를 유지하고 fallback 경로가 명확하다.
+- object snapshot download/reload가 sharded artifacts 전체에 대해 manifest/checksum 기반으로 동작한다.
+- degraded partial recall mode는 구현하거나, 구현하지 않는다면 명시적으로 기각하고 fail-closed-only 정책을 유지한다.
+
+#### Phase 3H — Operational Playbooks / Runbooks
+
+목표:
+- Phase 3A-3G의 실제 운영 표면이 고정된 뒤 최종 운영 playbook을 작성한다.
 
 구현 항목:
 - replica bootstrap / instance replacement runbook.
 - object storage permission failure, corrupt manifest, heap compatibility mismatch 대응.
 - async warmup/cache hydration 진단.
 - multi-GPU runtime warmup, per-GPU VRAM pressure, placement failure/degraded mode 복구.
-- true sharding manifest corruption, missing shard, shard reload failure, shard-level stats 진단.
+- true sharding 운영: `.shards` manifest validation, missing/corrupt shard artifact, shard reload failure, `pg_stat_gpu_shards` 진단, shard-level restart recovery.
+- true sharding 성능: sequential/parallel fanout 비교, shard count sizing, per-shard over-fetch tuning.
 - capacity planning: VRAM, NVMe, object storage artifact size, delta growth.
 - on-call triage: stats view, daemon logs, PostgreSQL warnings/errors, GCS audit/logging 확인 순서.
 
-Phase 3G 완료 기준:
-- Phase 3A-3F의 기능/관측성 표면을 기준으로 `docs/playbooks/`에 최종 운영 runbook을 작성한다.
+Phase 3H 완료 기준:
+- Phase 3A-3G의 기능/관측성 표면을 기준으로 `docs/playbooks/`에 최종 운영 runbook을 작성한다.
 - 각 playbook은 최소 하나의 검증된 GPU VM 또는 replica 시나리오를 근거로 한다.
 - Phase 1.5 playbook은 baseline 문서로 유지하고, Phase 3 playbook은 multi-node/multi-GPU 운영 절차를 별도 문서로 둔다.
 
 Phase 3 전체 완료 기준:
-- Phase 3A-3G의 subphase 완료 기준을 모두 만족한다.
+- Phase 3A-3H의 subphase 완료 기준을 모두 만족한다.
 - 각 subphase는 독립적으로 중단/릴리스 가능하며, 다음 subphase 미완료가 이전 subphase의 정합성을 깨지 않는다.
 
 ---
