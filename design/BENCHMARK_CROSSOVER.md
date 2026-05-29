@@ -157,35 +157,41 @@ concurrency=8, iso-recall target=0.95(미달 시 sweep 최대값 채택), `maint
 | 1,000,000 | 384 | CAGRA | **28.3** | **1,196** | **1,197** | 0.978 | k=128 |
 | 100,000 | 1536 | HNSW | 151.5 | 14,230 | 471 | 0.975 | ef=320 |
 | 100,000 | 1536 | CAGRA | **7.48** | **1,605** | **916** | 0.956 | k=128 |
+| 1,000,000 | 1536 | HNSW | 2,721 | 14,969 | 400 | 0.910 | ef=320 |
+| 1,000,000 | 1536 | CAGRA | **75.3** | **1,702** | **893** | 0.995 | k=256 |
 
 ### 발견
 
-- **CAGRA latency floor가 N에 거의 불변.** dim=384에서 871→1,146→1,228→**1,196 us**
-  (N 1k→1M, 1000×). VRAM-resident GPU라 데이터가 커져도 쿼리 지연이 ~1.2ms로 평평.
-  HNSW는 224→865→8,232→**13,700 us**로 급증 → **latency crossover ≈ N 10k–100k**
-  (작은 N=HNSW 승 **H3**, 큰 N=CAGRA 압승 **H1**; 1M에서 11.5×).
-- **Build 우위가 N·dim 둘 다에서 확대.** CAGRA build = 9×(100k×384) → 13×(1M×384) →
-  **20×(100k×1536)**. HNSW build은 1M에서 366 s(6분), dim 1536에서 151 s vs CAGRA 28 s/7.5 s
-  — **H2 확인, 스케일에서 격차 심화**.
-- **dim은 CAGRA floor를 조금(1.2→1.6 ms), HNSW latency를 크게(8.2→14.2 ms @100k) 올린다** —
-  높은 차원일수록 GPU가 유리.
-- **Recall은 거의 전 구간 CAGRA ≥ HNSW** (dim 1536만 HNSW 0.975 vs CAGRA 0.956로 근소 역전,
-  단 그 셀에서 CAGRA가 latency 8.9×·build 20× 우위).
-- **QPS crossover도 10k–100k.** CAGRA QPS ~평평(900–1,900 = 단일 GPU daemon throughput
-  천장); HNSW는 N에 반비례(24,513→432). 1M에서 CAGRA 1,197 vs HNSW 432 = 2.8×. 동시
-  throughput 천장은 multi-GPU sharding / `cuvs.parallel_fanout`(Phase 3F)이 올릴 지점.
+- **CAGRA latency floor가 N에 거의 불변.** dim=384에서 871→1,146→1,228→1,196 us (1k→1M).
+  dim=1536에서도 1,605→**1,702 us** (100k→1M). HNSW는 dim 384: 224→13,700 us,
+  dim 1536: 14,230→**14,969 us** → **latency crossover ≈ N 10k–100k** (**H1·H3 확인**).
+- **Build 우위가 N·dim 둘 다에서 계속 확대.** 9×(100k×384) → 13×(1M×384) → 20×(100k×1536)
+  → **36×(1M×1536)**. HNSW build은 1M×1536에서 **2,721s(45분)** — `maintenance_work_mem=2GB`
+  한계로 디스크 spill 모드, dim 1536에서 내부 구조가 RAM을 초과. CAGRA는 A100 40GB에 전체를
+  올려 75s 완료 — **H2 확인, 스케일에서 격차 심화**.
+- **Recall도 1M×1536에서 CAGRA 압승.** CAGRA 0.995 vs HNSW 0.910 (둘 다 sweep 상한). HNSW는
+  1M×1536에서 0.95 target 미달 — 빌드 품질 저하(spill) + 거리 집중 이중 영향. 100k×1536의
+  근소 역전(HNSW 0.975 vs CAGRA 0.956)은 1M에서 완전히 뒤집힌다.
+- **dim↑ 일수록 GPU가 더 유리.** HNSW latency: dim 384@1M→13,700 vs dim 1536@1M→14,969 (9%
+  증가). CAGRA: 1,196→1,702 (42% 증가). 절대치는 더 오르지만 격차는 CAGRA 쪽에 더 유리.
+- **QPS: 1M×1536에서 CAGRA가 HNSW를 QPS로도 역전.** CAGRA 893 > HNSW 400. N·dim이 커져
+  HNSW의 per-query 비용이 GPU daemon 오버헤드보다 높아지면 daemon 천장도 HNSW보다 낮지 않다.
+  소규모(N≤10k)에선 여전히 HNSW QPS 압도적(최대 24,513), 대규모에선 역전.
 
-### "when to use" 1차 결론 (L2, clustered, k=10 기준)
+### "when to use" 최종 결론 (L2, clustered, k=10, 단일 A100 기준)
 
 ```text
-N <~ 10k                          -> pgvector HNSW (CPU): 더 낮은 단일 latency + 높은 QPS
-N >~ 100k  또는  높은 dim(1536+)   -> pg_cuvs CAGRA (GPU): 낮은 tail latency + 빠른 build,
-                                      1M·고차원일수록 격차 확대(build 13–20×, latency ~10×)
-높은 동시 QPS                      -> 단일 GPU daemon 천장(~1k–2k QPS) 주의 → 멀티-GPU 필요
+N <~ 10k                            -> pgvector HNSW (CPU)
+                                       단일 쿼리 latency + QPS 모두 압도적
+N >~ 100k  또는  dim >= 1536         -> pg_cuvs CAGRA (GPU)
+                                       latency 8–12×, build 9–36×, recall도 우위
+                                       N·dim이 클수록 격차 확대 (1M×1536: build 36×, latency 8.8×)
+동시 QPS 목표 (소~중 N)              -> 단일 GPU daemon 천장(~1k QPS) 주의 → 멀티-GPU 필요
+동시 QPS 목표 (대규모 N)             -> HNSW 자체가 병목, CAGRA가 QPS도 우위
 ```
 
 ### 한계 / 다음
 
 단일 A100·clustered 합성·k=10. iso-recall은 근사(행별 `recall_at_k` 병기). 미측정:
-**H4 cost($/QPS)**, dim 1536의 N-sweep·1M×1536, 10M, 실제 임베딩셋, 경쟁자(pgvectorscale/
-VectorChord), multi-GPU sharded CAGRA의 QPS 천장. → full / competitive baseline 단계.
+**H4 cost($/QPS)**, N 10M+, 실제 임베딩셋, 경쟁자(pgvectorscale/VectorChord),
+multi-GPU sharded CAGRA의 QPS 천장. → full / competitive baseline 단계.
