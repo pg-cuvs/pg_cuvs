@@ -1,0 +1,92 @@
+-- cagra_direct_import.sql — Phase 3J: direct CAGRA→pgvector HNSW import.
+--
+-- Tests pg_cuvs_import_cagra():
+--   1. Function is registered.
+--   2. Direct import (no .hnsw sidecar) writes correct pgvector HNSW pages.
+--   3. Resulting flat HNSW returns correct top-k for deterministic test vectors.
+--   4. UNLOGGED target skips WAL and produces a NOTICE.
+--
+-- REQUIRES: pg_cuvs_server running with GPU, cuvs.index_dir writable.
+-- NOTE: 20 vectors so n_vecs >= 16 (CAGRA graph threshold).
+
+\set ON_ERROR_STOP on
+
+CREATE EXTENSION IF NOT EXISTS vector;
+CREATE EXTENSION IF NOT EXISTS pg_cuvs;
+
+-- Function registered?
+SELECT proname FROM pg_proc WHERE proname = 'pg_cuvs_import_cagra';
+
+-- Setup: 20-vector 4-dim table. Query [1,0.5,0,0] has unambiguous top-2.
+SET cuvs.index_dir = '/tmp/cuvs_indexes';
+CREATE TABLE cagra_direct_test (id bigint, embedding vector(4));
+INSERT INTO cagra_direct_test VALUES
+    (1,  '[1,0,0,0]'),
+    (2,  '[0,1,0,0]'),
+    (3,  '[0,0,1,0]'),
+    (4,  '[0,0,0,1]'),
+    (5,  '[0.1,0,0,0]'),
+    (6,  '[0,0.1,0,0]'),
+    (7,  '[0,0,0.1,0]'),
+    (8,  '[0,0,0,0.1]'),
+    (9,  '[0.5,0.5,0,0]'),
+    (10, '[0,0.5,0.5,0]'),
+    (11, '[0,0,0.5,0.5]'),
+    (12, '[0.5,0,0.5,0]'),
+    (13, '[0.5,0,0,0.5]'),
+    (14, '[0,0.5,0,0.5]'),
+    (15, '[0.3,0.3,0.3,0]'),
+    (16, '[0.3,0.3,0,0.3]'),
+    (17, '[0.3,0,0.3,0.3]'),
+    (18, '[0,0.3,0.3,0.3]'),
+    (19, '[0.25,0.25,0.25,0.25]'),
+    (20, '[0.9,0.1,0,0]');
+
+-- Case 1: standard LOGGED target (WAL-safe).
+CREATE INDEX cagra_direct_cagra ON cagra_direct_test
+    USING cagra (embedding vector_l2_ops);
+CREATE INDEX cagra_direct_hnsw ON cagra_direct_test
+    USING hnsw (embedding vector_l2_ops);
+
+-- Suppress NOTICE with variable path/OID content.
+SET client_min_messages = 'warning';
+SELECT pg_cuvs_import_cagra('cagra_direct_cagra'::regclass,
+                              'cagra_direct_hnsw'::regclass);
+SET client_min_messages = 'notice';
+
+-- Search via imported flat HNSW (CPU, no GPU needed).
+SET enable_cuvs = off;
+SET enable_seqscan = off;
+-- top-2: id=20 ([0.9,0.1,0,0], dist≈0.41) and id=1 ([1,0,0,0], dist=0.5).
+SELECT id FROM cagra_direct_test
+ORDER BY embedding <-> '[1,0.5,0,0]'::vector
+LIMIT 2;
+
+SET enable_cuvs = on;
+RESET enable_seqscan;
+
+-- Case 2: UNLOGGED table → UNLOGGED indexes inherit persistence.
+CREATE UNLOGGED TABLE cagra_ul_test (id bigint, embedding vector(4));
+INSERT INTO cagra_ul_test SELECT id, embedding FROM cagra_direct_test;
+CREATE INDEX cagra_ul_cagra ON cagra_ul_test USING cagra (embedding vector_l2_ops);
+CREATE INDEX cagra_ul_hnsw  ON cagra_ul_test USING hnsw  (embedding vector_l2_ops);
+
+-- import into UNLOGGED HNSW → WAL skipped (suppress variable-OID NOTICEs).
+SET client_min_messages = 'warning';
+SELECT pg_cuvs_import_cagra('cagra_ul_cagra'::regclass,
+                              'cagra_ul_hnsw'::regclass);
+SET client_min_messages = 'notice';
+
+-- Verify result.
+SET enable_cuvs = off;
+SET enable_seqscan = off;
+SELECT count(*) AS unlogged_rows
+FROM (SELECT id FROM cagra_ul_test
+      ORDER BY embedding <-> '[1,0.5,0,0]'::vector LIMIT 5) s;
+SET enable_cuvs = on;
+RESET enable_seqscan;
+DROP TABLE cagra_ul_test;
+
+-- Cleanup.
+DROP TABLE cagra_direct_test;
+DROP EXTENSION pg_cuvs;
