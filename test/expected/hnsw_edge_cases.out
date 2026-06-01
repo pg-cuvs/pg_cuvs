@@ -115,7 +115,6 @@ SET cuvs.cpu_hnsw_fallback = off;
 CREATE INDEX ec_ddl_hnsw  ON ec_ddl USING hnsw  (embedding vector_l2_ops);
 SET client_min_messages = 'warning';
 SELECT pg_cuvs_import_hnsw('ec_ddl_cagra'::regclass, 'ec_ddl_hnsw'::regclass);
-WARNING:  you don't own a lock of type ExclusiveLock
  pg_cuvs_import_hnsw 
 ---------------------
  

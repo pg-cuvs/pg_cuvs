@@ -56,7 +56,6 @@ CREATE INDEX pgvec_hnsw_idx ON hnsw_import_test
 SET client_min_messages = 'warning';
 SELECT pg_cuvs_import_hnsw('cagra_import_idx'::regclass,
                              'pgvec_hnsw_idx'::regclass);
-WARNING:  you don't own a lock of type ExclusiveLock
  pg_cuvs_import_hnsw 
 ---------------------
  
