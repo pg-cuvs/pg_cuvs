@@ -257,25 +257,36 @@ AS '$libdir/pg_cuvs', 'pg_cuvs_import_cagra'
 LANGUAGE C;
 
 -- ----------------------------------------------------------------
--- pg_cuvs_import(cagra_oid, mode) — unified GPU import (no CPU HNSW build)
--- Creates HNSW index on parent table WITHOUT running pgvector's CPU ambuild.
--- mode: 'nsw'|'hnsw'|'hnswlib'|'hnswlib_file'
--- Returns: OID of newly created HNSW index (regclass).
+-- pg_cuvs_build_hnsw(cagra_oid, mode) — GPU-accelerated HNSW creation.
+-- Creates pgvector HNSW from CAGRA WITHOUT pgvector CPU build (285s).
+-- Returns: regclass OID of the newly created HNSW index.
 -- ----------------------------------------------------------------
-CREATE FUNCTION pg_cuvs_import(
+CREATE FUNCTION pg_cuvs_build_hnsw(
     cagra_oid regclass,
-    mode      text DEFAULT 'hnsw'
+    mode      text DEFAULT 'nsw'
 )
 RETURNS regclass
-AS '$libdir/pg_cuvs', 'pg_cuvs_import'
+AS '$libdir/pg_cuvs', 'pg_cuvs_build_hnsw'
 LANGUAGE C;
 
-COMMENT ON FUNCTION pg_cuvs_import(regclass, text) IS
-  'Unified GPU import: creates pgvector HNSW index WITHOUT running '
-  'pgvector CPU build (285s eliminated). Uses INDEX_CREATE_SKIP_BUILD. '
-  'mode: nsw (flat NSW), hnsw (hierarchical+heuristic), '
-  'hnswlib (/dev/shm, no disk), hnswlib_file (disk sidecar). '
-  'Returns OID of the newly created HNSW index.';
+COMMENT ON FUNCTION pg_cuvs_build_hnsw(regclass, text) IS
+  'Build pgvector HNSW from CAGRA index without pgvector CPU build. '
+  'Uses INDEX_CREATE_SKIP_BUILD — the 285s CPU HNSW build is eliminated. '
+  ''
+  'Recommended modes: '
+  '  ''nsw''     (default) Flat NSW via IPC. 117s, 2.4x vs native. '
+  '             Empirically equal quality at ef>=40. '
+  '  ''hnswlib'' from_cagra() hierarchy via /dev/shm. 139s, 2.0x. '
+  '             Slight recall advantage at ef<20. '
+  ''
+  'Hidden modes (kept for research, not recommended): '
+  '  ''hnsw''         Direct hierarchy w/ heuristic neighbor selection. '
+  '                   Currently 144s with no quality gain over ''nsw''. '
+  '                   Kept pending future improvement of level assignment. '
+  '  ''hnswlib_file''  Disk-based sidecar. Superceded by ''hnswlib'' (shm). '
+  ''
+  'Returns OID of the new HNSW index (regclass). '
+  'Example: SELECT pg_cuvs_build_hnsw(''my_cagra''::regclass);';
 
 COMMENT ON FUNCTION pg_cuvs_import_cagra(regclass, regclass, text) IS
   'Phase 3J: Direct CAGRA graph import into pgvector HNSW format. '

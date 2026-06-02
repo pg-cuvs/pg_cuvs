@@ -1581,12 +1581,12 @@ pg_cuvs_import_cagra(PG_FUNCTION_ARGS)
 }
 
 /* ================================================================
- * pg_cuvs_import — unified GPU import: creates HNSW WITHOUT CPU build.
+ * pg_cuvs_build_hnsw — unified GPU import: creates HNSW WITHOUT CPU build.
  *
  * Uses INDEX_CREATE_SKIP_BUILD so pgvector's CPU ambuild() is never called.
  * The 285s CPU HNSW build is eliminated entirely.
  *
- * Usage: SELECT pg_cuvs_import('my_cagra'::regclass, 'hnsw');
+ * Usage: SELECT pg_cuvs_build_hnsw('my_cagra'::regclass, 'hnsw');
  * Returns: OID of the newly created HNSW index (regclass).
  * ================================================================ */
 
@@ -1710,18 +1710,33 @@ create_empty_hnsw(Oid cagra_oid)
     return hnsw_oid;
 }
 
-PG_FUNCTION_INFO_V1(pg_cuvs_import);
+PG_FUNCTION_INFO_V1(pg_cuvs_build_hnsw);
 Datum
-pg_cuvs_import(PG_FUNCTION_ARGS)
+pg_cuvs_build_hnsw(PG_FUNCTION_ARGS)
 {
     Oid         cagra_oid = PG_GETARG_OID(0);
     const char *mode = (PG_NARGS() >= 2 && !PG_ARGISNULL(1)) ?
-                       text_to_cstring(PG_GETARG_TEXT_PP(1)) : "hnsw";
+                       text_to_cstring(PG_GETARG_TEXT_PP(1)) : "nsw";
 
-    /* Create empty HNSW on parent table — no CPU build! */
+    /* Create empty HNSW on parent table — INDEX_CREATE_SKIP_BUILD, no CPU build */
     Oid hnsw_oid = create_empty_hnsw(cagra_oid);
 
-    /* Fill with GPU-built graph via existing import functions */
+    /* Dispatch to implementation functions by mode.
+     *
+     * RECOMMENDED modes:
+     *   'nsw'     — flat NSW via IPC adjacency. 117s, 2.4x speedup.
+     *               Empirically equal quality at ef>=40 (Cohere 1M×1024 benchmark).
+     *   'hnswlib' — from_cagra() hierarchy via /dev/shm (no disk I/O). 139s, 2.0x.
+     *               Slight recall advantage at ef<20.
+     *
+     * HIDDEN modes (kept for research, not recommended):
+     *   'hnsw'         — direct hierarchy with heuristic neighbor selection.
+     *                    Currently 144s with no quality gain over 'nsw'.
+     *                    Retained pending future improvement of level assignment
+     *                    (proper heuristic could eventually match hnswlib quality).
+     *   'hnswlib_file' — uses on-disk .hnsw sidecar from build time.
+     *                    Superceded by 'hnswlib' (shm path, same quality, no disk I/O).
+     */
     char *sql;
     if (strcmp(mode, "nsw") == 0 || strcmp(mode, "hnsw") == 0)
         sql = psprintf(
@@ -1731,7 +1746,7 @@ pg_cuvs_import(PG_FUNCTION_ARGS)
         sql = psprintf(
             "SELECT pg_cuvs_import_hnsw('%u'::regclass, '%u'::regclass, true)",
             cagra_oid, hnsw_oid);
-    else
+    else  /* hnswlib_file */
         sql = psprintf(
             "SELECT pg_cuvs_import_hnsw('%u'::regclass, '%u'::regclass, false)",
             cagra_oid, hnsw_oid);
@@ -1742,7 +1757,7 @@ pg_cuvs_import(PG_FUNCTION_ARGS)
 
     if (spi_rc < 0)
         ereport(ERROR,
-                (errmsg("pg_cuvs_import: SPI failed (rc=%d) for mode='%s'",
+                (errmsg("pg_cuvs_build_hnsw: SPI failed (rc=%d) for mode='%s'",
                         spi_rc, mode)));
 
     PG_RETURN_OID(hnsw_oid);

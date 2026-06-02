@@ -42,4 +42,4 @@ Datum pg_cuvs_import_cagra(PG_FUNCTION_ARGS);
  * Creates HNSW index on parent table WITHOUT calling pgvector CPU build.
  * Returns OID of new HNSW index.
  */
-Datum pg_cuvs_import(PG_FUNCTION_ARGS);
+Datum pg_cuvs_build_hnsw(PG_FUNCTION_ARGS);
