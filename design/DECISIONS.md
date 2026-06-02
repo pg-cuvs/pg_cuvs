@@ -955,3 +955,55 @@ REINDEX INDEX t_hnsw;  -- pgvector 재빌드, LOGGED
 
 병렬 페이지 write와 Bulk WAL은 PG internals 의존도가 높아 단기 구현 대상 제외.
 UNLOGGED + REINDEX 패턴을 OPS_GPU_PLAYBOOK에 추가하여 운영 패턴으로 권장.
+
+---
+
+## ADR-037 — Phase 3J: pg_cuvs_build_hnsw() 통합 API + INDEX_CREATE_SKIP_BUILD
+
+**날짜**: 2026-06-02
+**상태**: 결정됨 + 구현 완료 (테스트 7/7 PASS)
+
+### 배경
+
+Phase 3I 구현 중 근본적인 문제 발견: `pg_cuvs_import_hnsw(cagra_oid, hnsw_oid)` 사용 패턴에서 타겟 HNSW 인덱스를 미리 `CREATE INDEX USING hnsw`로 만들어야 했고, 이때 pgvector가 CPU로 전체 HNSW 빌드를 수행했다(1M×1024 기준 ~285s). GPU 가속을 쓰더라도 285s CPU 빌드를 먼저 지불하는 구조였다.
+
+추가로 `pg_cuvs_import_hnsw`(hnswlib 경유)와 `pg_cuvs_import_cagra`(직접 변환) 두 함수가 같은 목적으로 혼재해 API 표면이 혼란스러웠다.
+
+### 결정
+
+**1. INDEX_CREATE_SKIP_BUILD 활용**: `create_empty_hnsw()` 내부에서 `index_create()`를 `INDEX_CREATE_SKIP_BUILD` 플래그로 호출해 pgvector `ambuild()` 호출을 건너뛴다. HNSW 인덱스 catalog entry만 생성하고 실제 그래프 채우기는 pg_cuvs가 담당한다.
+
+**2. 통합 API**: `pg_cuvs_build_hnsw(cagra_oid regclass, mode text DEFAULT 'nsw') RETURNS regclass`로 두 함수를 통합. 내부적으로 `create_empty_hnsw()` 후 mode에 따라 static C helper를 호출한다. SQL-등록 없는 내부 helper로 리팩터링해 SPI 불필요.
+
+**3. 4-way 모드**:
+
+| 모드 | 방식 | 권장 |
+|------|------|------|
+| `nsw` (기본) | CAGRA adjacency 직접 변환, flat NSW | 권장 |
+| `hnsw` | heuristic neighbor selection으로 계층 구성 | 연구용 |
+| `hnswlib` | from_cagra() via /dev/shm | 권장 |
+| `hnswlib_file` | from_cagra() via disk | 연구용 |
+
+**4. Sequence counter**: `hnsw_build_seq` atomic counter로 동일 CAGRA에서 여러 번 호출 시 인덱스 이름 충돌 방지 (`pg_cuvs_hnsw_{cagra_oid}_{seq}` 형식).
+
+### 4-way 벤치마크 결과 (Cohere 1024d, N=1M, A100-40GB, 2026-06-02)
+
+| 모드 | 합계 | speedup vs native 285s |
+|------|------|------------------------|
+| nsw (기본, 권장) | 117s | **2.4×** |
+| hnsw | 144s | 2.0× |
+| hnswlib (권장) | 139s | 2.0× |
+| hnswlib_file | 151s | 1.9× |
+| pgvector native | 285s | 1.0× |
+
+### 영향
+
+- 기존 `pg_cuvs_import_hnsw`, `pg_cuvs_import_cagra` SQL 함수 제거
+- SQL 표면: `pg_cuvs_build_hnsw(cagra_oid, mode DEFAULT 'nsw')` 하나
+- `cuvs.cpu_hnsw_fallback=on` 불필요 (nsw 모드)
+- 테스트 스위트 재구성: `smoke cpu_fallback edge_cases cpu_hnsw_fallback build_hnsw build_hnsw_edge metrics` 7/7 PASS
+
+### 대안
+
+- 기존 두 함수 유지. 거부 — 285s CPU 빌드 페널티가 GPU 가속 가치를 반감시킨다.
+- `CREATE INDEX USING cagra WITH (export_hnsw=on)` 옵션으로 자동화. 보류 — 사용자가 명시적으로 변환 시점을 제어하는 것이 운영상 더 직관적. CAGRA 인덱스와 HNSW 인덱스를 독립적으로 관리 가능.
