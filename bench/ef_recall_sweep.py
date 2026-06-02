@@ -28,7 +28,7 @@ import psycopg2
 CORPUS_FBIN  = Path("/home/ubuntu/anbench/data/corpus.fbin")
 QUERIES_FBIN = Path("/home/ubuntu/anbench/data/queries_10k.fbin")
 GT_NPY       = Path("/home/ubuntu/anbench/data/gt_1000000.npy")
-IDX_DIR      = "/tmp/cuvs_indexes"
+IDX_DIR      = "/dev/shm/cuvs_indexes"  # 42G tmpfs — keeps .cagra off /dev/root
 TABLE        = "ef_bench"
 CAGRA_IDX    = "ef_bench_cagra"
 N_QUERIES    = 100
