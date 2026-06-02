@@ -27,10 +27,10 @@ import psycopg2
 # ── config ────────────────────────────────────────────────────────────────────
 CORPUS_FBIN  = Path("/home/ubuntu/anbench/data/corpus.fbin")
 QUERIES_FBIN = Path("/home/ubuntu/anbench/data/queries_10k.fbin")
-GT_NPY       = Path("/home/ubuntu/anbench/data/gt_1000000.npy")
 IDX_DIR      = "/dev/shm/cuvs_indexes"  # 42G tmpfs — keeps .cagra off /dev/root
 TABLE        = "ef_bench"
 CAGRA_IDX    = "ef_bench_cagra"
+N_CORPUS     = 500_000   # 1M×1024 HNSW ~7-8GB; 500K ~4GB fits in 13G free
 N_QUERIES    = 100
 K            = 10
 EF_VALUES    = [10, 20, 40, 80, 160, 320]
@@ -108,22 +108,19 @@ def drop_hnsw_indexes(conn):
             cur.execute(f"DROP INDEX IF EXISTS {name}")
     conn.commit()
 
-def recall_at_k(result_ids_1indexed, gt_0indexed, k):
-    res = {r - 1 for r in result_ids_1indexed[:k]}
-    gts = set(gt_0indexed[:k].tolist())
-    return len(res & gts) / k
+def recall_at_k(result_ids, gt_ids, k):
+    return len(set(result_ids[:k]) & set(gt_ids[:k])) / k
 
 # ── main ──────────────────────────────────────────────────────────────────────
 def main():
     log("=== ef-recall sweep: pg_cuvs_build_hnsw 4-mode pareto ===")
 
     log("Reading corpus ...")
-    corpus  = read_fbin(CORPUS_FBIN)
+    corpus  = read_fbin(CORPUS_FBIN, max_vecs=N_CORPUS)
     log(f"  corpus  {corpus.shape}")
     queries = read_fbin(QUERIES_FBIN, max_vecs=N_QUERIES)
     log(f"  queries {queries.shape}")
-    gt = np.load(GT_NPY)[:N_QUERIES]
-    log(f"  gt      {gt.shape}")
+    n, dim = corpus.shape
 
     dsn  = os.environ.get("PGDSN", "dbname=contrib_regression")
     conn = psycopg2.connect(dsn)
@@ -135,7 +132,28 @@ def main():
     conn.commit()
 
     load_vectors(conn, TABLE, corpus)
-    n, dim = corpus.shape
+
+    # ── ground truth via seqscan ──────────────────────────────────────────────
+    log(f"Computing ground truth ({N_QUERIES} queries via seqscan) ...")
+    gt = {}
+    with conn.cursor() as cur:
+        cur.execute("SET enable_indexscan = off")
+        cur.execute("SET enable_bitmapscan = off")
+        cur.execute("SET enable_cuvs = off")
+        for qi in range(N_QUERIES):
+            vec_str = "[" + ",".join(f"{v:.6f}" for v in queries[qi].tolist()) + "]"
+            cur.execute(
+                f"SELECT id FROM {TABLE} ORDER BY embedding <-> %s::vector LIMIT %s",
+                (vec_str, K)
+            )
+            gt[qi] = [r[0] for r in cur.fetchall()]  # 1-indexed SQL ids
+            if (qi + 1) % 20 == 0:
+                log(f"  GT {qi+1}/{N_QUERIES}")
+        cur.execute("RESET enable_indexscan")
+        cur.execute("RESET enable_bitmapscan")
+        cur.execute("RESET enable_cuvs")
+    conn.commit()
+    log("GT done.")
 
     # ── CAGRA build ───────────────────────────────────────────────────────────
     log("Building CAGRA index ...")
