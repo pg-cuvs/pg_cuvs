@@ -14,6 +14,23 @@ RESULT_FIELDS = [
 ]
 
 
+def setup_pg_session(conn, build_mem_gb=16, parallel_workers=7):
+    """Apply required session-level settings for pg_cuvs / pgvector benchmarks.
+
+    Must be called on every new psycopg connection before issuing
+    CREATE INDEX or other build-heavy operations.  These settings are
+    session-scoped and reset to postgresql.conf defaults on reconnect —
+    never assume a prior connection's SET survives.
+
+    Args:
+        conn: open psycopg connection (autocommit=True recommended)
+        build_mem_gb: maintenance_work_mem in GB (default 16)
+        parallel_workers: max_parallel_maintenance_workers (default 7)
+    """
+    conn.execute(f"SET maintenance_work_mem = '{build_mem_gb}GB'")
+    conn.execute(f"SET max_parallel_maintenance_workers = {parallel_workers}")
+
+
 def read_fbin(path, count=None, offset=0):
     """Read a big-ann .fbin: int32 n, int32 dim, then n*dim float32 row-major.
     Returns a (count, dim) float32 array (mmap-backed view sliced to a copy-free
