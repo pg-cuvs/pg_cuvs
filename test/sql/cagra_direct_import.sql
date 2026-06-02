@@ -66,8 +66,10 @@ CREATE UNLOGGED TABLE cagra_ul_test (id bigint, embedding vector(4));
 INSERT INTO cagra_ul_test SELECT id, embedding FROM cagra_direct_test;
 CREATE INDEX cagra_ul_cagra ON cagra_ul_test USING cagra (embedding vector_l2_ops);
 
--- UNLOGGED HNSW build — NOTICE about WAL skip is emitted.
+-- UNLOGGED HNSW build — suppress variable-OID NOTICEs.
+SET client_min_messages = 'warning';
 SELECT pg_cuvs_build_hnsw('cagra_ul_cagra'::regclass) IS NOT NULL AS hnsw_created;
+SET client_min_messages = 'notice';
 
 -- Verify result.
 SET enable_cuvs = off;
