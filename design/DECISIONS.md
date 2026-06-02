@@ -886,7 +886,7 @@ CAGRA → from_cagra() (~30s) → .hnsw 파일 → 파싱 → pgvector pages (~5
 
 ## ADR-034 — CAGRA 빌드 PostgreSQL 오버헤드 감소 로드맵
 
-**날짜**: 2026-06-02  
+**날짜**: 2026-06-02 (2026-06-03 구현 설계 보강)
 **상태**: 계획
 
 ### 배경
@@ -915,12 +915,52 @@ pg_cuvs CAGRA 빌드는 동일 데이터를 cuVS lib 직접 사용할 때보다 
 
 단기(double memcpy + parallel workers)만 구현. Streaming/pipeline은 cuVS public API 변화를 모니터링 후 재평가.
 
+### 4A-1 double memcpy 제거: 구현 설계
+
+현재 데이터 경로: `cuvs_build_callback()`(pg_cuvs.c:943)이 매 tuple마다 `memcpy`로 heap memory의 flat buffer에 복사 → scan 완료 후 `cuvs_ipc_build()`(cuvs_ipc.c:536)가 `shm_write_build_payload()`(cuvs_ipc.c:130)를 호출 → `shm_open` + `mmap` + `memcpy` x 2(cuvs_ipc.c:162-163)로 POSIX shm 세그먼트에 이중 복사. 즉 동일 데이터가 heap buffer → shm으로 한 번 더 복사된다.
+
+변경 대상 함수:
+- `grow_build_buffers()`(pg_cuvs.c:877): 현재 `realloc(bs->vectors, ...)` + `realloc(bs->tids, ...)`로 heap memory를 키운다. 변경 후에는 POSIX shm 세그먼트 위에서 `ftruncate`로 확장한다.
+- `cuvs_ambuild()`(pg_cuvs.c:957): scan 시작 전에 `shm_open` + 초기 `ftruncate` + `mmap`을 수행하고, `CuvsBuildState`에 shm fd와 mmap base를 저장한다.
+- `shm_write_build_payload()`(cuvs_ipc.c:130): `shm_open` + `mmap` + `memcpy` x 2를 제거하고, `cuvs_ambuild`가 이미 만든 shm 이름만 IPC frame에 전달한다.
+
+shm 크기 결정: `cuvs_ambuild()`의 preflight 단계(pg_cuvs.c:966-995)가 `reltuples * (dim * sizeof(float) + sizeof(ItemPointerData))`로 corpus 크기를 추정한다. 이 추정치를 shm 초기 크기로 사용한다. 실제 live tuple 수가 추정치를 초과하면 `grow_build_buffers()`에서 `ftruncate`로 shm을 확장하고 `mremap`(Linux) 또는 `munmap` + 재`mmap`으로 매핑을 갱신한다. `cuvs.max_build_mem_mb`가 설정되어 있으면 이 값이 상한이다.
+
+실패 처리: `shm_open` 또는 `ftruncate` 실패 시 기존 heap 경로(realloc + 이중 memcpy)로 degraded fallback한다. WARNING 로그를 남기고, fallback 사실을 `pg_stat_gpu_search`에서 관측 가능하게 한다. 데이터 경로가 바뀌지 않으므로 정합성 영향 없음.
+
+### 4A-2 parallel maintenance workers: 구현 설계
+
+현재 `cuvs_ambuild()`는 `table_index_build_scan(heapRel, indexRel, indexInfo, true, true, cuvs_build_callback, &bs, NULL)`(pg_cuvs.c:998)로 단일 프로세스 순차 스캔을 수행한다. 마지막 인자 `NULL`이 `ParallelTableScanDesc`이고, 이를 넘기면 병렬 스캔이 된다.
+
+API 선택: PostgreSQL은 `table_index_build_scan()`에 `ParallelTableScanDesc`를 넘기는 방식과 `table_parallel_index_build_scan()`을 사용하는 방식을 모두 지원한다. 어떤 방식이 pg_cuvs의 "scan 완료 후 한 번 merge" 패턴에 맞는지는 구현 시점에 PG 버전별 API를 조사해 결정한다. 현시점에서 고정하지 않는다.
+
+worker 구조: 각 worker가 독립적인 partial buffer(vectors + tids)를 heap memory(또는 4A-1 완료 후 shm)에 누적한다. scan 완료 후 leader가 partial buffer들을 단일 연속 buffer로 merge한다. merge는 단순 memcpy 연접이므로 O(N) — 정렬이 필요 없다(CAGRA build는 벡터 순서에 의존하지 않는다). IPC는 merge된 단일 buffer를 기존 경로로 전달한다.
+
+thread safety: 현재 `CuvsBuildState`는 단일 프로세스 전제로 설계되어 있다(`bs->vectors`, `bs->tids`, `bs->n_vecs`를 lock 없이 갱신). parallel workers 도입 시 worker별 독립 `CuvsBuildState`를 만들고, leader가 scan 완료 후 합산한다. 공유 상태가 없으므로 lock이 불필요하다.
+
+GUC: PostgreSQL 표준 `max_parallel_maintenance_workers` GUC를 읽어 worker 수를 결정한다. pg_cuvs 자체 GUC를 추가하지 않는다 — pgvector HNSW parallel build, btree parallel build 등 다른 AM도 이 GUC를 사용하므로 운영자에게 일관된 표면을 제공한다. `max_parallel_maintenance_workers = 0`이면 기존 단일 프로세스 경로를 그대로 탄다.
+
+AM handler: `amcanparallel`을 등록하지 않는다. `amcanparallel`은 parallel index scan(검색 병렬화)용 콜백이고, 여기서 다루는 것은 build 병렬화다. PostgreSQL build 병렬화는 AM handler 콜백이 아니라 `ambuild()` 내부에서 `table_index_build_scan`의 parallel 인자를 사용하는 방식이다(btree `_bt_parallel_scan_and_sort` 참조). `amestimateparallelscan`, `aminitparallelscan`, `amparallelrescan`은 scan 병렬화 전용이므로 등록 불필요.
+
+### 결과
+
+- 4A-1(double memcpy 제거): heap scan 중 벡터가 shm에 직접 쌓이므로 scan 완료 후 `shm_write_build_payload`의 memcpy x 2가 제거된다. daemon 측 `handle_build`의 `shm_open` + `mmap` 경로는 변경 없음.
+- 4A-2(parallel workers): N=1M에서 heap scan ~15-20s 구간이 worker 수에 비례해 줄어든다. IPC 이후 경로(daemon, GPU build)는 변경 없음. `max_parallel_maintenance_workers = 0`이면 기존 동작과 byte-identical.
+- 단기 목표: 55s → 4A-1 후 ~50s → 4A-2 후 ~30-35s.
+
+### 대안
+
+- shm 대신 `palloc`으로 PG shared memory에 직접 할당. 거부 — PG shared_buffers는 크기가 고정이고 4GB 벡터 데이터를 담기에 부적합. POSIX shm은 프로세스간 공유가 목적이고 크기 제한이 시스템 메모리 한도.
+- worker별 partial buffer 대신 single shared buffer + atomic counter. 거부 — `CuvsBuildState` lock-free 접근이 복잡하고, worker별 독립 buffer + 완료 후 merge가 더 단순하며 btree parallel build 선례와 일치.
+- `cuvs.build_parallel_workers` 자체 GUC 추가. 보류 — `max_parallel_maintenance_workers`가 PostgreSQL 표준이고 다른 AM과 일관. pg_cuvs 고유 요구가 생기면 그때 추가.
+- streaming/pipeline으로 한 번에 해결. 거부 — cuVS에 incremental build API가 없어 전체 corpus를 한 번에 넘겨야 한다. scan과 GPU transfer를 겹치려면 cuVS API 변경이 필요.
+
 ---
 
 ## ADR-035 — import_hnsw 페이지 write 병목 감소 로드맵
 
-**날짜**: 2026-06-02  
-**상태**: 계획
+**날짜**: 2026-06-02 (2026-06-03 거부 근거 보강)
+**상태**: 계획 (병렬 page write / Bulk WAL은 단기 제외)
 
 ### 배경
 
@@ -930,7 +970,7 @@ pg_cuvs CAGRA 빌드는 동일 데이터를 cuVS lib 직접 사용할 때보다 
 ### 현재 적용된 개선
 
 - **UNLOGGED 타겟** (ADR-033): WAL 생략 → ~28s (LOGGED ~57s 대비 50% 절감)
-- **Phase 3J direct path** (ADR 미정): `from_cagra()` 제거 → 전체 ~22s 절감
+- **Phase 3J direct path** (ADR-036): `from_cagra()` 제거 → 전체 ~22s 절감
 
 ### 추가 개선 방향
 
@@ -939,6 +979,24 @@ pg_cuvs CAGRA 빌드는 동일 데이터를 cuVS lib 직접 사용할 때보다 
 | **병렬 페이지 write** | ~15-25s | 높음 | PG parallel worker로 페이지 범위 분할; buffer manager 조율 복잡 |
 | **Bulk WAL** | ~10-15s | 높음 | 범위 단위 WAL 레코드; PG WAL internals 수정 필요 |
 | **UNLOGGED + 주기적 REINDEX** | 0 (이미 가능) | 낮음 | import → UNLOGGED; crash 허용 window 후 REINDEX로 LOGGED 전환 |
+
+### 병렬 page write 거부 근거
+
+`ReadBuffer(rel, P_NEW)`는 relation의 현재 끝에 한 블록을 순차 할당한다. 여러 worker가 동시에 `P_NEW`를 호출하면 buffer manager의 relation extension lock(`RelationExtensionLockWaiterCount`)에서 직렬화되므로, parallel worker를 써도 블록 할당 자체는 순차 병목이 남는다.
+
+pgvector HNSW 페이지의 `nextblkno`(다음 element page 포인터, `PgvHnswPageOpaque` 필드)는 N-1번째 페이지의 opaque에 N번째 블록 번호를 기록하는 cross-page 의존성이 있다. 페이지 범위를 worker별로 분할하면 범위 경계의 `nextblkno` 링크를 사후에 patch해야 하고, 이 patch 자체가 추가 `ReadBuffer(BUFFER_LOCK_EXCLUSIVE)` + `MarkBufferDirty` + WAL을 요구한다.
+
+WAL 레코드 순서도 문제다. `log_newpage_buffer`는 호출 순서대로 WAL LSN을 발급받는데, 여러 worker가 비순차적으로 WAL을 쓰면 crash recovery 시 페이지 replay 순서가 논리적 블록 순서와 달라진다. full-page image 방식이라 replay 순서가 결과에 영향을 주지는 않지만, WAL volume spike와 checkpoint 부하가 커질 수 있다.
+
+이런 이유로 PG 코어에서도 HNSW/GIN 같은 linked-page 인덱스의 build를 병렬화하지 않는다(btree parallel build는 sort 단계를 병렬화하고 page write는 단일 프로세스). pg_cuvs가 이를 독자적으로 구현하려면 PG buffer manager internals에 깊이 의존하게 되어 PG 버전 간 호환 비용이 높다.
+
+### Bulk WAL 거부 근거
+
+PostgreSQL 15에서 `log_newpage_range(rel, forknum, startblk, endblk)`가 추가되었다(src/backend/access/transam/xloginsert.c). 이 API는 지정 블록 범위의 full-page image를 한 번에 WAL에 기록해 per-page `log_newpage_buffer` 호출 오버헤드를 줄인다. pg_cuvs target은 PG16+이므로 API 자체는 사용 가능하다.
+
+쓰지 않는 이유: `log_newpage_range`는 이미 디스크에 기록된 블록 범위를 WAL로 복사하는 API다. 현재 pg_cuvs import 경로는 `ReadBuffer(P_NEW)` → buffer pool에 페이지를 구성 → `MarkBufferDirty` → `log_newpage_buffer` → `UnlockReleaseBuffer`의 순서로 buffer manager를 통해 쓴다. `log_newpage_range`를 쓰려면 전체 페이지를 buffer manager 밖에서(`smgrextend` 또는 direct file write) 먼저 디스크에 기록한 뒤 범위 단위로 WAL을 남기는 패턴이 필요하다. 이는 현재 buffer-manager-through 경로를 완전히 바꾸는 것이고, pgvector의 build path와도 달라져 호환성 검증 비용이 높다.
+
+대안으로 buffer manager를 유지하면서 페이지를 일정 범위(예: 1000개)씩 모아 한 번에 WAL을 쓰는 batched 방식을 생각할 수 있지만, 이는 `log_newpage_range`가 아니라 별도 WAL 레코드 타입을 정의해야 하므로 PG extension이 할 수 있는 범위를 넘는다.
 
 ### UNLOGGED + REINDEX 패턴 (지금 사용 가능)
 
@@ -955,6 +1013,18 @@ REINDEX INDEX t_hnsw;  -- pgvector 재빌드, LOGGED
 
 병렬 페이지 write와 Bulk WAL은 PG internals 의존도가 높아 단기 구현 대상 제외.
 UNLOGGED + REINDEX 패턴을 OPS_GPU_PLAYBOOK에 추가하여 운영 패턴으로 권장.
+
+### 결과
+
+- 단기 개선은 ADR-033(UNLOGGED ~28s)과 ADR-036(from_cagra 제거 ~22s 절감)으로 닫혔다.
+- LOGGED 경로의 추가 개선(병렬 page write, Bulk WAL)은 PG internals 발전을 모니터링하다 재검토한다. 재검토 조건: PG 코어에 인덱스 build용 bulk page write API가 추가되거나, `ReadBuffer` concurrent extension 제약이 완화되는 경우.
+- UNLOGGED + REINDEX 패턴이 현재 가장 빠른 실용 경로(~28s)이며 OPS_GPU_PLAYBOOK에 문서화됐다.
+
+### 대안
+
+- buffer manager를 우회해 `smgrextend`로 직접 디스크에 쓰고 `log_newpage_range`로 WAL. 거부 — pgvector 페이지 포맷 재현 + buffer manager 우회는 PG 버전 간 호환 리스크가 크고, crash 시 buffer pool과 디스크 상태 불일치 위험이 있다.
+- 현재 per-page `log_newpage_buffer`를 유지하되 WAL compression(`wal_compression = on`)으로 I/O 절감. 보류 — import 페이지는 entropy가 높은 float 벡터라 압축률이 낮을 수 있음. 별도 실측이 필요하며, 전역 설정이라 pg_cuvs만을 위해 켜기 어려움.
+- import를 포기하고 pgvector native build에 맡김. 거부 — native build 285s vs import 28s(UNLOGGED). 현재 개선 없이도 10x 이상 빠르다.
 
 ---
 
