@@ -851,10 +851,13 @@ CAGRA → from_cagra() (~30s) → .hnsw 파일 → 파싱 → pgvector pages (~5
 
 ### 결정
 
-새 SQL 함수 `pg_cuvs_import_cagra(cagra_oid, hnsw_oid)`:
+새 SQL 함수 `pg_cuvs_import_cagra(cagra_oid, hnsw_oid)`를 `pg_cuvs_import_hnsw`와 동등한 옵션으로 제공:
 - 새 IPC 명령 `CUVS_OP_EXPORT_ADJACENCY`: 데몬이 GPU adjacency + 벡터 → shared memory
-- flat pgvector HNSW (all nodes level 0) 직접 작성
+- CAGRA 그래프를 pgvector HNSW 포맷에 **NSW(flat)** 구조로 직접 기록
+  - 모든 노드 level 0, HNSW 계층 없음
+  - Level 0 neighbor 수: graph_degree(64~128), import_hnsw의 2M(32)보다 많음
 - `cpu_hnsw_fallback=on` 불필요, `.hnsw` 파일 불필요
+- 선택 기준: N <= 5M + 빠른 빌드 = import_cagra / N > 10M + HNSW 보장 = import_hnsw
 
 ### 실측 결과 (Cohere 1024d, N=1M, A100-40GB, 2026-06-01)
 

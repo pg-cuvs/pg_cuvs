@@ -249,11 +249,17 @@ AS '$libdir/pg_cuvs', 'pg_cuvs_import_cagra'
 LANGUAGE C STRICT;
 
 COMMENT ON FUNCTION pg_cuvs_import_cagra(regclass, regclass) IS
-  'Phase 3J: Direct CAGRA→pgvector HNSW import without hnswlib intermediate. '
-  'Fetches CAGRA adjacency + corpus vectors from daemon via IPC (no .hnsw file). '
-  'Produces a flat HNSW (all nodes at level 0); may need higher ef_search for '
-  'equivalent recall vs pg_cuvs_import_hnsw() which uses multi-level hierarchy. '
+  'Phase 3J: Direct CAGRA graph import into pgvector HNSW format. '
+  'Fetches CAGRA adjacency + corpus vectors from daemon via IPC (no .hnsw file, '
+  'no from_cagra() conversion). Stores the flat CAGRA graph (NSW) directly — '
+  'all nodes at level 0, no hierarchy. '
+  'Trade-off vs pg_cuvs_import_hnsw(): '
+  '  faster build (~119s vs ~140s at 1M×1024); '
+  '  higher level-0 neighbor count (graph_degree vs 2M); '
+  '  no HNSW hierarchy — may need higher ef_search at very large N (>10M). '
+  'Empirically: recall@10 identical at N=1M (0.9963 vs 0.9962). '
   'Does NOT require cuvs.cpu_hnsw_fallback=on. '
   'OFFLINE: acquires AccessExclusiveLock; UNLOGGED target skips WAL (~2x faster). '
+  'Use pg_cuvs_import_hnsw() for standard HNSW hierarchy (via hnswlib). '
   'Example: SELECT pg_cuvs_import_cagra(''my_cagra_idx''::regclass, '
   '''my_hnsw_idx''::regclass);';

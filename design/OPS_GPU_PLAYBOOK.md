@@ -172,7 +172,30 @@ sudo systemctl start pg-cuvs-server
 
 ---
 
-## 3. GPU Build Accelerator (3I) 운영
+## 3. GPU Build Accelerator (3I/3J) 운영
+
+### 3.0 import 함수 선택 가이드
+
+두 함수는 동등한 옵션입니다. 트레이드오프를 보고 선택합니다.
+
+| | `pg_cuvs_import_cagra` (Phase 3J) | `pg_cuvs_import_hnsw` (Phase 3I) |
+|--|--|--|
+| 그래프 구조 | NSW (flat, level 0만) | HNSW (계층적, multi-level) |
+| Level 0 neighbor | graph_degree 64~128 (CAGRA 최적) | 2M 기본 32 (heuristic) |
+| from_cagra() | 없음 | 필요 (~30s) |
+| .hnsw 파일 | 없음 | 필요 |
+| cpu_hnsw_fallback=on | 불필요 | 필요 |
+| 빌드 합계 (1M×1024) | ~119s | ~140s |
+| recall@10 실측 (N=1M) | 0.9963 (ef=200) | 0.9962 (ef=200) |
+| N > 10M | ef 높이면 해결 가능 | 계층 탐색 효율 보장 |
+| UNLOGGED 지원 | [O] | [O] |
+
+**권장 기준**:
+- N <= 5M, 빠른 빌드 우선 -> `pg_cuvs_import_cagra`
+- N > 10M, HNSW 표준 보장 필요 -> `pg_cuvs_import_hnsw`
+- 가장 빠른 경로 -> `pg_cuvs_import_cagra` + UNLOGGED (~96s vs native 285s, 3.0x)
+
+---
 
 ### 3.1 offline import 절차
 
