@@ -732,3 +732,55 @@ cleanup:
     if (sock >= 0)          close(sock);
     return rc;
 }
+
+/* ----------------------------------------------------------------
+ * Phase 3J: request daemon to run from_cagra() on a loaded CAGRA index
+ * and serialize the resulting multi-level HNSW to /dev/shm (no disk I/O).
+ * The path is returned in shm_path_out; caller must unlink after reading.
+ * ---------------------------------------------------------------- */
+int
+cuvs_ipc_export_hnsw_shm(
+    const char *socket_path,
+    uint32_t    db_oid,
+    uint32_t    index_oid,
+    char       *shm_path_out,
+    size_t      shm_path_len)
+{
+    int sock = -1;
+    int rc   = CUVS_STATUS_ERROR;
+
+    /* from_cagra() can take 30s+ for large indexes */
+    sock = uds_connect_ex(socket_path, 120);
+    if (sock < 0)
+        return CUVS_STATUS_UNAVAILABLE;
+
+    CuvsCmdFrame cmd = {
+        .op        = CUVS_OP_EXPORT_HNSW_SHM,
+        .db_oid    = db_oid,
+        .index_oid = index_oid,
+    };
+    if (send_all(sock, &cmd, sizeof(cmd)) < 0)
+        goto cleanup;
+
+    CuvsReplyHeader hdr;
+    if (recv_all(sock, &hdr, sizeof(hdr)) < 0)
+        goto cleanup;
+
+    if (hdr.status != CUVS_STATUS_OK) {
+        rc = (int)hdr.status;
+        goto cleanup;
+    }
+
+    /* Daemon puts the /dev/shm path in hdr.error[] */
+    if (hdr.error[0] == '\0') {
+        LOG_ERROR("[export_hnsw_shm] empty path in reply\n");
+        goto cleanup;
+    }
+    strncpy(shm_path_out, hdr.error, shm_path_len - 1);
+    shm_path_out[shm_path_len - 1] = '\0';
+    rc = CUVS_STATUS_OK;
+
+cleanup:
+    if (sock >= 0) close(sock);
+    return rc;
+}

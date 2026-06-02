@@ -53,6 +53,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <unistd.h>
 
 #include "cuvs_ipc.h"
 #include "cuvs_util.h"
@@ -450,8 +451,12 @@ PG_FUNCTION_INFO_V1(pg_cuvs_import_hnsw);
 Datum
 pg_cuvs_import_hnsw(PG_FUNCTION_ARGS)
 {
-    Oid         cagra_oid = PG_GETARG_OID(0);
-    Oid         hnsw_oid  = PG_GETARG_OID(1);
+    Oid  cagra_oid = PG_GETARG_OID(0);
+    Oid  hnsw_oid  = PG_GETARG_OID(1);
+    /* Optional 3rd arg: use_shm boolean (DEFAULT false).
+     * When true, from_cagra() is run in the daemon and the .hnsw is written
+     * to /dev/shm/ (no disk I/O) instead of the on-disk index_dir sidecar. */
+    bool use_shm  = (PG_NARGS() >= 3 && !PG_ARGISNULL(2)) ? PG_GETARG_BOOL(2) : false;
 
     /* ---- 0. pgvector compatibility check ---- */
     /* pg_cuvs_import_hnsw is pinned to pgvector HNSW_VERSION=1 (stable since
@@ -565,8 +570,25 @@ pg_cuvs_import_hnsw(PG_FUNCTION_ARGS)
     char tids_path[1024];
     const char *idir = hnsw_get_index_dir();
 
-    snprintf(hnsw_path, sizeof(hnsw_path), "%s/%u_%u.hnsw", idir, db_oid, index_oid);
-    snprintf(tids_path, sizeof(tids_path), "%s/%u_%u.tids", idir, db_oid, index_oid);
+    if (use_shm)
+    {
+        /* Request daemon to run from_cagra() → /dev/shm (no disk I/O) */
+        if (!cuvs_socket_path || cuvs_socket_path[0] == '\0')
+            ereport(ERROR, (errmsg("pg_cuvs: daemon socket not set")));
+        int shm_rc = cuvs_ipc_export_hnsw_shm(
+            cuvs_socket_path, db_oid, index_oid, hnsw_path, sizeof(hnsw_path));
+        if (shm_rc != CUVS_STATUS_OK)
+            ereport(ERROR,
+                    (errmsg("pg_cuvs: export_hnsw_shm failed (status=%d); "
+                            "ensure cagra index %u is loaded in daemon", shm_rc, cagra_oid)));
+        /* .tids comes from the regular index_dir sidecar */
+        snprintf(tids_path, sizeof(tids_path), "%s/%u_%u.tids", idir, db_oid, index_oid);
+    }
+    else
+    {
+        snprintf(hnsw_path, sizeof(hnsw_path), "%s/%u_%u.hnsw", idir, db_oid, index_oid);
+        snprintf(tids_path, sizeof(tids_path), "%s/%u_%u.tids", idir, db_oid, index_oid);
+    }
 
     /* ---- 3. Parse hnswlib binary header ---- */
     FILE *hf = fopen(hnsw_path, "rb");
@@ -1077,8 +1099,12 @@ pg_cuvs_import_hnsw(PG_FUNCTION_ARGS)
 
     ereport(NOTICE,
             (errmsg("pg_cuvs: imported %zu elements (dim=%d, M=%d) from "
-                    "\"%s\" into hnsw index %u",
-                    N, dim, M, hnsw_path, hnsw_oid)));
+                    "\"%s\" (use_shm=%d) into hnsw index %u",
+                    N, dim, M, hnsw_path, (int)use_shm, hnsw_oid)));
+
+    /* Clean up /dev/shm file after successful import */
+    if (use_shm)
+        unlink(hnsw_path);
 
     PG_RETURN_VOID();
 }
@@ -1149,7 +1175,9 @@ heuristic_select_neighbors(
         for (int j = 0; j < n_sel && !dominated; j++)
         {
             const float *s_vec = all_vecs + (size_t)out_selected[j] * dim;
-            if (vec_dist_sq(c_vec, s_vec, dim) <= d_q_c)
+            /* hnswlib condition: reject if any selected s is closer to c than q is
+             * (strict < matches getNeighborsByHeuristic2 in hnswalg.h line 470) */
+            if (vec_dist_sq(c_vec, s_vec, dim) < d_q_c)
                 dominated = true;
         }
 

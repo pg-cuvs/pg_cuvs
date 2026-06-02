@@ -3412,6 +3412,55 @@ handle_export_adjacency(int client_fd, const CuvsCmdFrame *cmd)
 }
 
 /* ----------------------------------------------------------------
+ * Handle EXPORT_HNSW_SHM command (CUVS_OP_EXPORT_HNSW_SHM, Phase 3J).
+ *
+ * Runs from_cagra() on the loaded CAGRA index and writes the resulting
+ * multi-level HNSW to /dev/shm/ (RAM-backed, no disk I/O).  Returns the
+ * /dev/shm path in reply.error[] so the backend can open and parse it,
+ * then unlink after reading.
+ * ---------------------------------------------------------------- */
+static void
+handle_export_hnsw_shm(int client_fd, const CuvsCmdFrame *cmd)
+{
+    uint32_t db  = cmd->db_oid;
+    uint32_t idx = cmd->index_oid;
+
+    pthread_mutex_lock(&g_index_mutex);
+    IndexEntry *e = find_index(db, idx);
+    if (!e || !e->valid || !e->handle || e->shard_count >= 2)
+    {
+        pthread_mutex_unlock(&g_index_mutex);
+        send_error_code(client_fd, CUVS_STATUS_NOT_FOUND,
+                        "index not loaded or sharded");
+        return;
+    }
+    CuvsCagraIndex handle = e->handle;
+    int            gpu    = (int)e->gpu_device_id;
+    pthread_mutex_unlock(&g_index_mutex);
+
+    /* Generate unique /dev/shm path */
+    static int hnsw_shm_seq = 0;
+    char shm_path[256];
+    snprintf(shm_path, sizeof(shm_path), "/dev/shm/pg_cuvs_hnsw_%d_%d",
+             (int)getpid(),
+             __atomic_fetch_add(&hnsw_shm_seq, 1, __ATOMIC_RELAXED));
+
+    /* Serialize HNSW to /dev/shm (reuses existing cuvs_hnsw_serialize) */
+    if (cuvs_hnsw_serialize(handle, shm_path, gpu) != 0)
+    {
+        send_error(client_fd, "from_cagra/serialize failed");
+        return;
+    }
+
+    LOG_INFO("[handle_export_hnsw_shm] %u/%u → %s\n", db, idx, shm_path);
+
+    CuvsReplyHeader reply = {0};
+    reply.status = CUVS_STATUS_OK;
+    strncpy(reply.error, shm_path, sizeof(reply.error) - 1);
+    send_all(client_fd, &reply, sizeof(reply));
+}
+
+/* ----------------------------------------------------------------
  * Handle CACHE_STATS command (CUVS_OP_CACHE_STATS): per-GPU counters.
  * Phase 3E: one CuvsCacheStats row per usable GPU device.
  * ---------------------------------------------------------------- */
@@ -3583,6 +3632,9 @@ connection_thread(void *arg)
             break;
         case CUVS_OP_EXPORT_ADJACENCY:
             handle_export_adjacency(client_fd, &cmd);
+            break;
+        case CUVS_OP_EXPORT_HNSW_SHM:
+            handle_export_hnsw_shm(client_fd, &cmd);
             break;
         default:
             send_error(client_fd, "unknown op");

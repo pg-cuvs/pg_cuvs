@@ -27,6 +27,7 @@
 #define CUVS_OP_SHARD_STATS 6 /* Phase 3F: per-shard stats for sharded indexes */
 #define CUVS_OP_DROP_INDEX  7 /* Phase 3G.1: free a dropped index + unlink its artifacts */
 #define CUVS_OP_EXPORT_ADJACENCY 8 /* Phase 3J: export CAGRA adjacency+vecs via shm */
+#define CUVS_OP_EXPORT_HNSW_SHM  9 /* Phase 3J: run from_cagra() → /dev/shm, return path */
 
 /* ----------------------------------------------------------------
  * Distance metrics (mirror pgvector operator names)
@@ -222,6 +223,20 @@ int cuvs_ipc_build(
  *   [float    vecs[n_vecs * dim]]           corpus vectors (row-major float32)
  *   [uint64_t tids[n_vecs]]                 heap TIDs (block<<16|offset)
  */
+/*
+ * cuvs_ipc_export_hnsw_shm — Phase 3J: run from_cagra() on the loaded CAGRA
+ * index and serialize the resulting multi-level HNSW to /dev/shm (no disk I/O).
+ * The path is returned in shm_path_out (caller must unlink after reading).
+ * Returns CUVS_STATUS_OK on success, NOT_FOUND if index not loaded.
+ */
+int cuvs_ipc_export_hnsw_shm(
+    const char *socket_path,
+    uint32_t    db_oid,
+    uint32_t    index_oid,
+    char       *shm_path_out,  /* caller-allocated, at least 128 chars */
+    size_t      shm_path_len
+);
+
 int cuvs_ipc_export_adjacency(
     const char  *socket_path,
     uint32_t     db_oid,

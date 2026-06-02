@@ -219,12 +219,16 @@ COMMENT ON VIEW pg_stat_gpu_shards IS
 -- existing pgvector HNSW relation.  The target relation is truncated and
 -- fully rebuilt from the sidecar; call this only on an offline index.
 -- ----------------------------------------------------------------
-CREATE FUNCTION pg_cuvs_import_hnsw(cagra_oid regclass, hnsw_oid regclass)
+CREATE FUNCTION pg_cuvs_import_hnsw(
+    cagra_oid regclass,
+    hnsw_oid  regclass,
+    use_shm   boolean DEFAULT false
+)
 RETURNS void
 AS '$libdir/pg_cuvs', 'pg_cuvs_import_hnsw'
-LANGUAGE C STRICT;
+LANGUAGE C;
 
-COMMENT ON FUNCTION pg_cuvs_import_hnsw(regclass, regclass) IS
+COMMENT ON FUNCTION pg_cuvs_import_hnsw(regclass, regclass, boolean) IS
   'Phase 3I-2: Import the hnswlib binary sidecar written alongside a CAGRA '
   'index into an existing pgvector HNSW index relation. '
   'OFFLINE OPERATION: acquires AccessExclusiveLock on the target HNSW index, '
