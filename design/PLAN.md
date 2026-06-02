@@ -849,7 +849,9 @@ cuVS HNSW graph를 pgvector HNSW 내부 페이지 포맷으로 변환한다.
 - 4-way 모드: nsw(117s/2.4×, 권장), hnsw(144s), hnswlib(139s/2.0×, 권장), hnswlib_file(151s).
 - recall@10 단일 측정: nsw=0.9963, hnswlib=0.9962 (Cohere 1024d, N=1M).
 - 테스트 스위트 7/7 PASS (build_hnsw, build_hnsw_edge, metrics 포함).
-- **잔여**: GPU-less VM pg_dump/restore 검증, ef-recall pareto 비교 (nsw vs hnswlib).
+- **잔여**: GPU-less VM pg_dump/restore 검증.
+- **ef-recall pareto 완료 (2026-06-02)**: nsw/hnsw/hnswlib 세 모드 recall curve 동일 확인.
+  nsw 권장 default 유지 근거 확보. (bench/results/ef_recall_sweep.csv, ADR-037)
 
 ---
 

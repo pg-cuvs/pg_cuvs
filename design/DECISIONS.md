@@ -986,7 +986,7 @@ Phase 3I 구현 중 근본적인 문제 발견: `pg_cuvs_import_hnsw(cagra_oid, 
 
 **4. Sequence counter**: `hnsw_build_seq` atomic counter로 동일 CAGRA에서 여러 번 호출 시 인덱스 이름 충돌 방지 (`pg_cuvs_hnsw_{cagra_oid}_{seq}` 형식).
 
-### 4-way 벤치마크 결과 (Cohere 1024d, N=1M, A100-40GB, 2026-06-02)
+### 4-way 벤치마크 결과 (Cohere 1024d, N=1M, A100-40GB, 2026-06-02, ADR-037 Phase 3J)
 
 | 모드 | 합계 | speedup vs native 285s |
 |------|------|------------------------|
@@ -995,6 +995,19 @@ Phase 3I 구현 중 근본적인 문제 발견: `pg_cuvs_import_hnsw(cagra_oid, 
 | hnswlib (권장) | 139s | 2.0× |
 | hnswlib_file | 151s | 1.9× |
 | pgvector native | 285s | 1.0× |
+
+### ef-recall pareto (Cohere 1024d, N=500K, A100-40GB, 2026-06-02, bench/results/ef_recall_sweep.csv)
+
+| ef_search | nsw | hnsw | hnswlib | QPS(nsw/hnsw/hnswlib at ef=80) |
+|-----------|-----|------|---------|-------------------------------|
+| 10 | 0.740 | 0.720 | 0.733 | — |
+| 20 | 0.841 | 0.833 | 0.845 | — |
+| 40 | 0.923 | 0.920 | 0.925 | — |
+| 80 | 0.969 | 0.968 | 0.967 | 81 / 81 / 83 QPS |
+| 160 | 0.986 | 0.984 | 0.984 | — |
+| 320 | 0.997 | 0.997 | 0.997 | — |
+
+**핵심 발견**: 세 모드의 recall curve가 사실상 동일하다. nsw(계층 없음)가 hnswlib(진짜 HNSW 계층)보다 ef_search를 더 높여야 한다는 우려는 실증적으로 틀렸다. CAGRA 그래프의 높은 품질이 계층 부재를 상쇄한다. nsw의 빌드 속도 우위(5.73× vs native)는 recall 패널티 없이 유지된다. → nsw 권장 default 유지 근거 확인.
 
 ### 영향
 
