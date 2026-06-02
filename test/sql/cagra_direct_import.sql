@@ -1,10 +1,8 @@
--- cagra_direct_import.sql — Phase 3J: direct CAGRA→pgvector HNSW import.
+-- cagra_direct_import.sql — pg_cuvs_build_hnsw modes: nsw, hnswlib, UNLOGGED.
 --
--- Tests pg_cuvs_import_cagra():
---   1. Function is registered.
---   2. Direct import (no .hnsw sidecar) writes correct pgvector HNSW pages.
---   3. Resulting flat HNSW returns correct top-k for deterministic test vectors.
---   4. UNLOGGED target skips WAL and produces a NOTICE.
+-- Tests:
+--   1. nsw mode: flat NSW, no CPU build, correct search results.
+--   2. UNLOGGED table: HNSW inherits UNLOGGED persistence, WAL skipped.
 --
 -- REQUIRES: pg_cuvs_server running with GPU, cuvs.index_dir writable.
 -- NOTE: 20 vectors so n_vecs >= 16 (CAGRA graph threshold).
@@ -15,7 +13,7 @@ CREATE EXTENSION IF NOT EXISTS vector;
 CREATE EXTENSION IF NOT EXISTS pg_cuvs;
 
 -- Function registered?
-SELECT proname FROM pg_proc WHERE proname = 'pg_cuvs_import_cagra';
+SELECT proname FROM pg_proc WHERE proname = 'pg_cuvs_build_hnsw';
 
 -- Setup: 20-vector 4-dim table. Query [1,0.5,0,0] has unambiguous top-2.
 SET cuvs.index_dir = '/tmp/cuvs_indexes';
@@ -42,19 +40,16 @@ INSERT INTO cagra_direct_test VALUES
     (19, '[0.25,0.25,0.25,0.25]'),
     (20, '[0.9,0.1,0,0]');
 
--- Case 1: standard LOGGED target (WAL-safe).
+-- Case 1: nsw mode (default) — flat NSW, no CPU build.
 CREATE INDEX cagra_direct_cagra ON cagra_direct_test
     USING cagra (embedding vector_l2_ops);
-CREATE INDEX cagra_direct_hnsw ON cagra_direct_test
-    USING hnsw (embedding vector_l2_ops);
 
--- Suppress NOTICE with variable path/OID content.
+-- Creates HNSW directly (no pgvector CPU build).
 SET client_min_messages = 'warning';
-SELECT pg_cuvs_import_cagra('cagra_direct_cagra'::regclass,
-                              'cagra_direct_hnsw'::regclass);
+SELECT pg_cuvs_build_hnsw('cagra_direct_cagra'::regclass) IS NOT NULL AS hnsw_created;
 SET client_min_messages = 'notice';
 
--- Search via imported flat HNSW (CPU, no GPU needed).
+-- Search via created HNSW (CPU, no GPU needed).
 SET enable_cuvs = off;
 SET enable_seqscan = off;
 -- top-2: id=20 ([0.9,0.1,0,0], dist≈0.41) and id=1 ([1,0,0,0], dist=0.5).
@@ -64,17 +59,16 @@ LIMIT 2;
 
 SET enable_cuvs = on;
 RESET enable_seqscan;
+DROP INDEX cagra_direct_cagra;
 
--- Case 2: UNLOGGED table → UNLOGGED indexes inherit persistence.
+-- Case 2: UNLOGGED table → HNSW inherits UNLOGGED persistence, WAL skipped.
 CREATE UNLOGGED TABLE cagra_ul_test (id bigint, embedding vector(4));
 INSERT INTO cagra_ul_test SELECT id, embedding FROM cagra_direct_test;
 CREATE INDEX cagra_ul_cagra ON cagra_ul_test USING cagra (embedding vector_l2_ops);
-CREATE INDEX cagra_ul_hnsw  ON cagra_ul_test USING hnsw  (embedding vector_l2_ops);
 
--- import into UNLOGGED HNSW → WAL skipped (suppress variable-OID NOTICEs).
+-- UNLOGGED HNSW build — suppress variable-OID NOTICEs.
 SET client_min_messages = 'warning';
-SELECT pg_cuvs_import_cagra('cagra_ul_cagra'::regclass,
-                              'cagra_ul_hnsw'::regclass);
+SELECT pg_cuvs_build_hnsw('cagra_ul_cagra'::regclass) IS NOT NULL AS hnsw_created;
 SET client_min_messages = 'notice';
 
 -- Verify result.
