@@ -1680,27 +1680,30 @@ create_empty_hnsw(Oid cagra_oid)
 
     /* INDEX_CREATE_SKIP_BUILD: catalog entries created, ambuild() skipped.
      * pgvector CPU build (285s for 1M×1024) is never called. */
+    Oid tablespace = heap_rel->rd_rel->reltablespace;
+    if (!OidIsValid(tablespace))
+        tablespace = MyDatabaseTableSpace;
+
     Oid hnsw_oid = index_create(
         heap_rel,
         idx_name,
-        InvalidOid,
-        InvalidOid,
-        InvalidOid,
-        InvalidRelFileNumber,
+        InvalidOid,           /* auto-assign OID */
+        InvalidOid,           /* parentIndexRelid */
+        InvalidOid,           /* parentConstraintId */
+        InvalidRelFileNumber, /* auto relfilenode */
         iinfo,
         list_make1(makeString(col_name)),
         get_am_oid("hnsw", false),
-        DEFAULTTABLESPACE_OID,
-        &collation,
-        &hnsw_opclass,
-        &coloption,
-        NULL,
-        (Datum) 0,
-        INDEX_CREATE_SKIP_BUILD,
-        0,
-        false,
-        true,
-        NULL);
+        tablespace,
+        &collation,           /* collationObjectId */
+        &hnsw_opclass,        /* classObjectId */
+        &coloption,           /* coloptions */
+        (Datum) 0,            /* reloptions: defaults (m=16, ef=64) */
+        INDEX_CREATE_SKIP_BUILD,  /* flags: skip pgvector CPU build */
+        0,                    /* constr_flags */
+        false,                /* allow_system_table_mods */
+        true,                 /* is_internal */
+        NULL);                /* constraintId */
 
     table_close(heap_rel, ShareLock);
     CommandCounterIncrement();
