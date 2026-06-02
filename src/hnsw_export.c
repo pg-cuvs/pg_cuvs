@@ -48,6 +48,7 @@
 #include "commands/extension.h"  /* get_extension_oid */
 #include "miscadmin.h"
 
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
