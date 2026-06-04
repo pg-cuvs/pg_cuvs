@@ -820,7 +820,8 @@ refresh_delta_cache(IndexEntry *e)
                 {
                     if (e->delta_idx) { cuvs_bf_free(e->delta_idx, dg); e->delta_idx = NULL; }
                     e->delta_idx = cuvs_bf_build(e->delta_vecs_host, hdr.n_rows,
-                                                 (int) hdr.dim, hdr.metric, dg);
+                                                 (int) hdr.dim, hdr.metric,
+                                                 0 /* float32: CPU-exact equivalence */, dg);
                     if (e->delta_idx)
                     {
                         e->n_delta          = hdr.n_rows;
@@ -854,7 +855,8 @@ refresh_delta_cache(IndexEntry *e)
         }
         if (ok)
         {
-            e->delta_idx = cuvs_bf_build(vecs, hdr.n_rows, (int) hdr.dim, hdr.metric, dg);
+            e->delta_idx = cuvs_bf_build(vecs, hdr.n_rows, (int) hdr.dim, hdr.metric,
+                                         0 /* float32: CPU-exact equivalence */, dg);
             if (e->delta_idx)
             {
                 e->delta_tids       = tids;  tids = NULL;

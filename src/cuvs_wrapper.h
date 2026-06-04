@@ -61,6 +61,12 @@ int cuvs_brute_force_search(
  * `.delta` vectors. metric is a CUVS_METRIC_* value (same scale as the CAGRA
  * base index). cuvs_bf_search returns 0 on success, 2 on dim mismatch, 1 on
  * other failure; top_k must be <= the corpus size the index was built with.
+ *
+ * Phase 3L: `precision` selects the resident numeric type — 0 = float32,
+ * 1 = float16. float16 halves the dataset VRAM and raises throughput; the
+ * search path converts the query to the matching type. The `.vectors` sidecar
+ * on disk is always float32; precision only affects the device-resident copy.
+ * The delta cache always uses float32 (precision=0) for CPU-exact equivalence.
  */
 typedef void *CuvsBfIndex;
 
@@ -69,6 +75,7 @@ CuvsBfIndex cuvs_bf_build(
     int64_t      n,
     int          dim,
     uint32_t     metric,
+    uint32_t     precision,   /* 0 = float32, 1 = float16 */
     int          device_id
 );
 

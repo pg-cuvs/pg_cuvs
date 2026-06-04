@@ -21,6 +21,7 @@
 #include <raft/core/host_mdarray.hpp>
 
 #include <cuda_runtime.h>
+#include <cuda_fp16.h>   /* Phase 3L: half precision for brute-force (cuvs.bf_precision) */
 #include <cstring>
 #include <memory>
 #include <vector>
@@ -150,20 +151,28 @@ struct CuvsHnswIndexImpl {
     uint32_t metric;
 };
 
-/* Opaque resident brute-force index (Phase 3B delta cache). Like CAGRA, the
- * dataset must outlive the index, so we retain d_corpus alongside it; n bounds
- * a defensive top_k clamp (brute_force cannot return more than the corpus). */
+/* Opaque resident brute-force index (Phase 3B delta cache + Phase 3L main BF).
+ * Like CAGRA, the dataset must outlive the index, so we retain it alongside;
+ * n bounds a defensive top_k clamp (brute_force cannot return more than the
+ * corpus). Phase 3L: the resident copy is either float32 or float16 — exactly
+ * one variant pair is active (the other is null). Heap-owned so the index's
+ * dataset view stays valid for the handle's lifetime. */
 struct CuvsBfIndexImpl {
-    raft::device_matrix<float, int64_t>     dataset;
-    cuvs::neighbors::brute_force::index<float> idx;
-    int     dim;
-    int64_t n;
+    int      dim;
+    int64_t  n;
+    uint32_t precision;   /* 0 = float32, 1 = float16 */
 
-    CuvsBfIndexImpl(raft::device_matrix<float, int64_t> &&d,
-                    cuvs::neighbors::brute_force::index<float> &&i,
-                    int dm, int64_t nn)
-        : dataset(std::move(d)), idx(std::move(i)), dim(dm), n(nn)
-    {}
+    raft::device_matrix<float, int64_t>        *ds_f32  = nullptr;
+    cuvs::neighbors::brute_force::index<float>  *idx_f32 = nullptr;
+    raft::device_matrix<half, int64_t>          *ds_f16  = nullptr;
+    cuvs::neighbors::brute_force::index<half>   *idx_f16 = nullptr;
+
+    CuvsBfIndexImpl(int dm, int64_t nn, uint32_t prec)
+        : dim(dm), n(nn), precision(prec) {}
+    ~CuvsBfIndexImpl() {
+        delete idx_f32; delete ds_f32;
+        delete idx_f16; delete ds_f16;
+    }
 };
 
 /* ----------------------------------------------------------------
@@ -301,25 +310,50 @@ cuvs_brute_force_search(
  * ---------------------------------------------------------------- */
 extern "C" CuvsBfIndex
 cuvs_bf_build(const float *vecs, int64_t n, int dim, uint32_t metric,
-              int device_id)
+              uint32_t precision, int device_id)
 {
     PooledRes _pr(device_id);
     try {
         raft::device_resources &res = _pr.get();
+        const size_t total = (size_t)n * (size_t)dim;
 
         /* Upload corpus once; retained in the impl so the index's view stays
-         * valid for the handle's lifetime (mirror of the CAGRA dataset rule). */
-        auto d_corpus = raft::make_device_matrix<float, int64_t>(res, n, (int64_t)dim);
-        raft::copy(d_corpus.data_handle(), vecs, n * dim, res.get_stream());
-        res.sync_stream();
+         * valid for the handle's lifetime (mirror of the CAGRA dataset rule).
+         * unique_ptr makes a mid-build throw clean up the partial impl. */
+        std::unique_ptr<CuvsBfIndexImpl> impl(new CuvsBfIndexImpl(dim, n, precision));
 
-        auto idx = cuvs::neighbors::brute_force::build(
-            res,
-            raft::make_const_mdspan(d_corpus.view()),
-            cuvs_distance_type(metric));
-        res.sync_stream();
-
-        return new CuvsBfIndexImpl(std::move(d_corpus), std::move(idx), dim, n);
+        if (precision == 1 /* float16 */) {
+            /* Convert host float32 -> host half once, then upload. half search
+             * accumulates in float32 inside cuVS, so recall is preserved while
+             * the resident dataset uses half the VRAM bandwidth. */
+            impl->ds_f16 = new raft::device_matrix<half, int64_t>(
+                raft::make_device_matrix<half, int64_t>(res, n, (int64_t)dim));
+            {
+                std::vector<half> h_half(total);
+                for (size_t i = 0; i < total; i++)
+                    h_half[i] = __float2half(vecs[i]);
+                raft::copy(impl->ds_f16->data_handle(), h_half.data(), total, res.get_stream());
+                res.sync_stream();
+            }
+            auto idx = cuvs::neighbors::brute_force::build(
+                res,
+                raft::make_const_mdspan(impl->ds_f16->view()),
+                cuvs_distance_type(metric));
+            res.sync_stream();
+            impl->idx_f16 = new cuvs::neighbors::brute_force::index<half>(std::move(idx));
+        } else {
+            impl->ds_f32 = new raft::device_matrix<float, int64_t>(
+                raft::make_device_matrix<float, int64_t>(res, n, (int64_t)dim));
+            raft::copy(impl->ds_f32->data_handle(), vecs, total, res.get_stream());
+            res.sync_stream();
+            auto idx = cuvs::neighbors::brute_force::build(
+                res,
+                raft::make_const_mdspan(impl->ds_f32->view()),
+                cuvs_distance_type(metric));
+            res.sync_stream();
+            impl->idx_f32 = new cuvs::neighbors::brute_force::index<float>(std::move(idx));
+        }
+        return impl.release();
     } catch (const std::exception &e) {
         fprintf(stderr, "[cuvs_bf_build] exception: %s\n", e.what());
         _pr.poison();
@@ -356,17 +390,31 @@ cuvs_bf_search(
     try {
         raft::device_resources &res = _pr.get();
 
-        auto d_queries = raft::make_device_matrix<float, int64_t>(res, (int64_t)1, (int64_t)dim);
-        raft::copy(d_queries.data_handle(), query_vec, dim, res.get_stream());
-
         auto d_indices   = raft::make_device_matrix<int64_t, int64_t>(res, 1, top_k);
         auto d_distances = raft::make_device_matrix<float,   int64_t>(res, 1, top_k);
 
-        cuvs::neighbors::brute_force::search(
-            res, impl->idx,
-            raft::make_const_mdspan(d_queries.view()),
-            d_indices.view(),
-            d_distances.view());
+        if (impl->precision == 1 /* float16 */) {
+            auto d_queries = raft::make_device_matrix<half, int64_t>(res, (int64_t)1, (int64_t)dim);
+            {
+                std::vector<half> h_q(dim);
+                for (int i = 0; i < dim; i++)
+                    h_q[i] = __float2half(query_vec[i]);
+                raft::copy(d_queries.data_handle(), h_q.data(), dim, res.get_stream());
+            }
+            cuvs::neighbors::brute_force::search(
+                res, *impl->idx_f16,
+                raft::make_const_mdspan(d_queries.view()),
+                d_indices.view(),
+                d_distances.view());
+        } else {
+            auto d_queries = raft::make_device_matrix<float, int64_t>(res, (int64_t)1, (int64_t)dim);
+            raft::copy(d_queries.data_handle(), query_vec, dim, res.get_stream());
+            cuvs::neighbors::brute_force::search(
+                res, *impl->idx_f32,
+                raft::make_const_mdspan(d_queries.view()),
+                d_indices.view(),
+                d_distances.view());
+        }
 
         res.sync_stream();
 
