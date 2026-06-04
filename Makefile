@@ -15,7 +15,7 @@ EXTVERSION     = 0.1.0
 DATA           = sql/pg_cuvs--$(EXTVERSION).sql \
                  sql/pg_cuvs--0.1.0--0.2.0.sql
 MODULE_big     = pg_cuvs
-REGRESS        = smoke cpu_fallback edge_cases cpu_hnsw_fallback build_hnsw build_hnsw_edge metrics
+REGRESS        = smoke cpu_fallback edge_cases cpu_hnsw_fallback build_hnsw build_hnsw_edge pg_cuvs_hnsw metrics
 REGRESS_OPTS   = --inputdir=test --outputdir=test
 
 # C source files + the CUDA-compiled wrapper (built below by nvcc).
@@ -313,6 +313,22 @@ gpu-cohere-result:
 
 gpu-shell:
 	ssh -tt $(GCP_VM)
+
+# Report the VM's current power state and external IP (ephemeral IPs change on
+# stop/start, so .env.gpu's GCP_VM can go stale). Usage: make vm-ip
+vm-ip:
+	@gcloud compute instances describe $(GCP_INSTANCE) --zone $(GCP_ZONE) \
+		$(if $(GCP_PROJECT),--project $(GCP_PROJECT)) \
+		--format='value(status,networkInterfaces[0].accessConfigs[0].natIP)'
+.PHONY: vm-ip
+
+# Run ad-hoc SQL on the VM's postgres DB from stdin. For introspection and
+# Phase 3K integration checks. Usage: make gpu-sql < query.sql  (or via heredoc)
+gpu-sql:
+	ssh -o StrictHostKeyChecking=accept-new $(GCP_VM) \
+		"source ~/miniforge3/bin/activate $(CONDA_ENV) && \
+		psql -d $(if $(DB),$(DB),postgres) -P pager=off -A -F '|'"
+.PHONY: gpu-sql
 
 # ---- Comparative ANN benchmark (infra/anbench) -------------------------
 # pg_cuvs vs pgvector(hnsw/ivfflat) vs raw cuvs vs faiss-gpu/cpu on the same
