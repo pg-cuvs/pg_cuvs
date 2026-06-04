@@ -185,6 +185,9 @@ cuvs_xact_callback(XactEvent event, void *arg)
 void
 _PG_init(void)
 {
+    /* Phase 3K: register pg_cuvs_hnsw WITH(source, mode, ...) reloptions. */
+    cuvs_hnsw_init_reloptions();
+
     DefineCustomBoolVariable(
         "enable_cuvs",
         "Enable GPU-accelerated vector search via pg_cuvs.",

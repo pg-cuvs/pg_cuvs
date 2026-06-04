@@ -45,8 +45,12 @@
 #include "utils/relcache.h"
 #include "utils/builtins.h"
 #include "catalog/index.h"       /* index_create, INDEX_CREATE_SKIP_BUILD, BuildIndexInfo */
+#include "catalog/pg_am.h"        /* AMOID, Form_pg_am */
 #include "commands/defrem.h"     /* get_am_oid */
 #include "commands/extension.h"  /* get_extension_oid */
+#include "access/amapi.h"        /* IndexAmRoutine, makeNode(T_IndexAmRoutine) */
+#include "access/reloptions.h"   /* relopt_kind, add_*_reloption, build_reloptions */
+#include "utils/regproc.h"       /* regclassin */
 #include "miscadmin.h"
 #include "nodes/pg_list.h"       /* list_make1 */
 #include "access/genam.h"        /* GetSysCacheOid3 */
@@ -513,10 +517,13 @@ fill_hnsw_from_hnswlib(Oid cagra_oid, Oid hnsw_oid, bool use_shm)
                     (errmsg("pg_cuvs: \"%s\" is not an index", name)));
         }
 
-        /* Must use the 'hnsw' access method */
+        /* Must use the 'hnsw' or 'pg_cuvs_hnsw' access method. The latter is
+         * the Phase 3K AM whose ambuild fills its own relation in pgvector
+         * page format, so it is a valid conversion target as well. */
         {
-            Oid hnsw_amoid = get_am_oid("hnsw", true);
-            if (!OidIsValid(hnsw_amoid) || cf->relam != hnsw_amoid)
+            Oid hnsw_amoid      = get_am_oid("hnsw", true);
+            Oid cuvs_hnsw_amoid = get_am_oid("pg_cuvs_hnsw", true);
+            if (cf->relam != hnsw_amoid && cf->relam != cuvs_hnsw_amoid)
             {
                 char *name = pstrdup(NameStr(cf->relname));
                 ReleaseSysCache(tup);
@@ -1248,8 +1255,9 @@ fill_hnsw_from_cagra_ipc(Oid cagra_oid, Oid hnsw_oid, const char *mode)
             ReleaseSysCache(tup);
             ereport(ERROR, (errmsg("pg_cuvs: \"%s\" is not an index", name)));
         }
-        Oid hnsw_amoid = get_am_oid("hnsw", true);
-        if (!OidIsValid(hnsw_amoid) || cf->relam != hnsw_amoid)
+        Oid hnsw_amoid      = get_am_oid("hnsw", true);
+        Oid cuvs_hnsw_amoid = get_am_oid("pg_cuvs_hnsw", true);  /* Phase 3K AM */
+        if (cf->relam != hnsw_amoid && cf->relam != cuvs_hnsw_amoid)
         {
             char *name = pstrdup(NameStr(cf->relname));
             ReleaseSysCache(tup);
@@ -1709,6 +1717,16 @@ pg_cuvs_build_hnsw(PG_FUNCTION_ARGS)
     const char *mode = (PG_NARGS() >= 2 && !PG_ARGISNULL(1)) ?
                        text_to_cstring(PG_GETARG_TEXT_PP(1)) : "nsw";
 
+    /* Phase 3K (ADR-038): the function form is deprecated in favor of the
+     * CREATE INDEX ... USING pg_cuvs_hnsw DDL, which integrates with the
+     * catalog, DROP INDEX/REINDEX, and pg_dump. Kept working for back-compat. */
+    ereport(NOTICE,
+            (errmsg("pg_cuvs_build_hnsw() is deprecated; prefer "
+                    "CREATE INDEX ... USING pg_cuvs_hnsw (col opclass) "
+                    "WITH (source = '<cagra index>', mode = '<mode>')"),
+             errhint("The DDL form integrates with pg_indexes, DROP INDEX, "
+                     "REINDEX, and pg_dump.")));
+
     /* Create empty HNSW on parent table — INDEX_CREATE_SKIP_BUILD, no CPU build */
     Oid hnsw_oid = create_empty_hnsw(cagra_oid);
 
@@ -1734,4 +1752,185 @@ pg_cuvs_build_hnsw(PG_FUNCTION_ARGS)
         fill_hnsw_from_hnswlib(cagra_oid, hnsw_oid, false);
 
     PG_RETURN_OID(hnsw_oid);
+}
+
+/* ================================================================
+ * Phase 3K — pg_cuvs_hnsw access method (ADR-038).
+ *
+ * Exposes the pg_cuvs_build_hnsw() conversion as standard DDL:
+ *
+ *   CREATE INDEX my_idx ON items USING pg_cuvs_hnsw (embedding vector_l2_ops)
+ *     WITH (source = 'my_cagra', mode = 'nsw');
+ *
+ * ambuild() writes pgvector-HNSW page format into the index's OWN relation
+ * (reusing fill_hnsw_from_cagra_ipc / fill_hnsw_from_hnswlib). The read path
+ * (scan/cost/insert/bulkdelete/vacuum) is delegated to pgvector's hnsw AM by
+ * copying its IndexAmRoutine and overriding only ambuild + amoptions. A single
+ * catalog index results, so pg_indexes / DROP INDEX / REINDEX / pg_dump behave
+ * naturally.
+ * ================================================================ */
+
+/* WITH() storage. The m / ef_construction prefix mirrors pgvector's HnswOptions
+ * so that any delegated pgvector code inspecting rd_options sees a compatible
+ * layout; source / mode are pg_cuvs extensions. */
+typedef struct CuvsHnswOptions
+{
+    int32 vl_len_;          /* varlena header — do not access directly */
+    int   m;                /* pgvector HnswOptions-compatible */
+    int   ef_construction;  /* pgvector HnswOptions-compatible */
+    int   source_offset;    /* relopt string offset: source CAGRA index name */
+    int   mode_offset;      /* relopt string offset: conversion mode */
+} CuvsHnswOptions;
+
+static relopt_kind cuvs_hnsw_relopt_kind;
+
+/* Restrict mode to the four conversion strategies fill_* understand. */
+static void
+cuvs_hnsw_validate_mode(const char *value)
+{
+    if (value == NULL || value[0] == '\0')
+        return;  /* empty -> default applied in ambuild */
+    if (strcmp(value, "nsw") != 0 && strcmp(value, "hnsw") != 0 &&
+        strcmp(value, "hnswlib") != 0 && strcmp(value, "hnswlib_file") != 0)
+        ereport(ERROR,
+                (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+                 errmsg("pg_cuvs_hnsw: invalid mode \"%s\"", value),
+                 errhint("Valid modes: nsw (default), hnsw, hnswlib, hnswlib_file.")));
+}
+
+/* One-time relopt registration; called from _PG_init. */
+void
+cuvs_hnsw_init_reloptions(void)
+{
+    cuvs_hnsw_relopt_kind = add_reloption_kind();
+    add_string_reloption(cuvs_hnsw_relopt_kind, "source",
+                         "Source CAGRA index whose graph is converted to HNSW",
+                         "", NULL, AccessExclusiveLock);
+    add_string_reloption(cuvs_hnsw_relopt_kind, "mode",
+                         "Conversion mode: nsw (default), hnsw, hnswlib, hnswlib_file",
+                         "nsw", cuvs_hnsw_validate_mode, AccessExclusiveLock);
+    add_int_reloption(cuvs_hnsw_relopt_kind, "m",
+                      "pgvector HNSW M; informational (graph degree drives layout)",
+                      16, 2, 100, AccessExclusiveLock);
+    add_int_reloption(cuvs_hnsw_relopt_kind, "ef_construction",
+                      "pgvector HNSW efConstruction; informational",
+                      64, 4, 1000, AccessExclusiveLock);
+}
+
+static bytea *
+cuvs_hnsw_amoptions(Datum reloptions, bool validate)
+{
+    static const relopt_parse_elt tab[] = {
+        {"m",               RELOPT_TYPE_INT,    offsetof(CuvsHnswOptions, m)},
+        {"ef_construction", RELOPT_TYPE_INT,    offsetof(CuvsHnswOptions, ef_construction)},
+        {"source",          RELOPT_TYPE_STRING, offsetof(CuvsHnswOptions, source_offset)},
+        {"mode",            RELOPT_TYPE_STRING, offsetof(CuvsHnswOptions, mode_offset)},
+    };
+    return (bytea *) build_reloptions(reloptions, validate,
+                                      cuvs_hnsw_relopt_kind,
+                                      sizeof(CuvsHnswOptions),
+                                      tab, lengthof(tab));
+}
+
+/* ambuild: convert the source CAGRA graph into THIS index's own relation. */
+static IndexBuildResult *
+cuvs_hnsw_ambuild(Relation heapRel, Relation indexRel, IndexInfo *indexInfo)
+{
+    (void) indexInfo;
+
+    CuvsHnswOptions *opts = (CuvsHnswOptions *) indexRel->rd_options;
+    if (opts == NULL || opts->source_offset == 0)
+        ereport(ERROR,
+                (errcode(ERRCODE_INVALID_TABLE_DEFINITION),
+                 errmsg("pg_cuvs_hnsw: missing required option \"source\""),
+                 errhint("CREATE INDEX ... USING pg_cuvs_hnsw (col vector_l2_ops) "
+                         "WITH (source = 'my_cagra_index', mode = 'nsw');")));
+
+    const char *source_name = (const char *) opts + opts->source_offset;
+    const char *mode = (opts->mode_offset != 0)
+        ? (const char *) opts + opts->mode_offset : "nsw";
+    if (mode[0] == '\0')
+        mode = "nsw";
+    if (source_name[0] == '\0')
+        ereport(ERROR,
+                (errcode(ERRCODE_INVALID_TABLE_DEFINITION),
+                 errmsg("pg_cuvs_hnsw: option \"source\" must name a CAGRA index")));
+
+    /* Resolve source name (schema-qualified, search_path aware) to an OID. */
+    Oid cagra_oid = DatumGetObjectId(
+        DirectFunctionCall1(regclassin, CStringGetDatum((char *) source_name)));
+
+    /* Source must be a cagra index on the same table we are indexing. */
+    {
+        HeapTuple ixtup = SearchSysCache1(INDEXRELID, ObjectIdGetDatum(cagra_oid));
+        if (!HeapTupleIsValid(ixtup))
+            ereport(ERROR,
+                    (errmsg("pg_cuvs_hnsw: source \"%s\" is not an index", source_name)));
+        Oid src_heap = ((Form_pg_index) GETSTRUCT(ixtup))->indrelid;
+        ReleaseSysCache(ixtup);
+        if (src_heap != RelationGetRelid(heapRel))
+            ereport(ERROR,
+                    (errmsg("pg_cuvs_hnsw: source index \"%s\" is on a different "
+                            "table than the one being indexed", source_name)));
+
+        Oid cagra_am = get_am_oid("cagra", true);
+        HeapTuple ctup = SearchSysCache1(RELOID, ObjectIdGetDatum(cagra_oid));
+        Oid src_relam = HeapTupleIsValid(ctup)
+            ? ((Form_pg_class) GETSTRUCT(ctup))->relam : InvalidOid;
+        if (HeapTupleIsValid(ctup))
+            ReleaseSysCache(ctup);
+        if (!OidIsValid(cagra_am) || src_relam != cagra_am)
+            ereport(ERROR,
+                    (errmsg("pg_cuvs_hnsw: source \"%s\" must be a cagra index",
+                            source_name),
+                     errhint("Build it first: CREATE INDEX ... USING cagra (col opclass).")));
+    }
+
+    /* Fill THIS index's relation (pgvector page format) from the CAGRA graph.
+     * fill_* open the target by OID with AccessExclusiveLock; re-locking an
+     * object this backend already holds (the index under construction) is a
+     * no-op re-grant, and the freshly created relation has 0 blocks so no
+     * truncate happens. */
+    Oid self_oid = RelationGetRelid(indexRel);
+    if (strcmp(mode, "nsw") == 0 || strcmp(mode, "hnsw") == 0)
+        fill_hnsw_from_cagra_ipc(cagra_oid, self_oid, mode);
+    else if (strcmp(mode, "hnswlib") == 0)
+        fill_hnsw_from_hnswlib(cagra_oid, self_oid, true);
+    else  /* hnswlib_file */
+        fill_hnsw_from_hnswlib(cagra_oid, self_oid, false);
+
+    /* Element pages are one-per-vector after the metapage (block 0). */
+    IndexBuildResult *result = palloc0(sizeof(IndexBuildResult));
+    BlockNumber nblocks = RelationGetNumberOfBlocks(indexRel);
+    double ntuples = (nblocks > 0) ? (double) (nblocks - 1) : 0.0;
+    result->heap_tuples  = ntuples;
+    result->index_tuples = ntuples;
+    return result;
+}
+
+PG_FUNCTION_INFO_V1(pg_cuvs_hnsw_handler);
+Datum
+pg_cuvs_hnsw_handler(PG_FUNCTION_ARGS)
+{
+    /* Borrow pgvector hnsw's IndexAmRoutine for the entire read path, then
+     * override only the build + options entry points (Phase 3K). Copying the
+     * routine inherits amsupport / amcanorderbyop / scan / cost / vacuum so the
+     * built index is served by pgvector's own hnsw code. */
+    Oid hnsw_am = get_am_oid("hnsw", false);
+    HeapTuple amtup = SearchSysCache1(AMOID, ObjectIdGetDatum(hnsw_am));
+    if (!HeapTupleIsValid(amtup))
+        ereport(ERROR, (errmsg("pg_cuvs_hnsw: pgvector hnsw access method not found")));
+    Oid amhandler = ((Form_pg_am) GETSTRUCT(amtup))->amhandler;
+    ReleaseSysCache(amtup);
+    if (!OidIsValid(amhandler))
+        ereport(ERROR, (errmsg("pg_cuvs_hnsw: pgvector hnsw AM has no handler")));
+
+    IndexAmRoutine *amroutine = (IndexAmRoutine *)
+        DatumGetPointer(OidFunctionCall1(amhandler, (Datum) 0));
+
+    amroutine->ambuild   = cuvs_hnsw_ambuild;   /* GPU CAGRA -> HNSW pages */
+    amroutine->amoptions = cuvs_hnsw_amoptions;  /* WITH (source, mode, ...) */
+    /* ambuildempty / aminsert / scan / cost / vacuum stay pgvector's. */
+
+    PG_RETURN_POINTER(amroutine);
 }

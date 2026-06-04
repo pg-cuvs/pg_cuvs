@@ -27,3 +27,15 @@
  * Returns OID of newly created HNSW index (regclass).
  */
 Datum pg_cuvs_build_hnsw(PG_FUNCTION_ARGS);
+
+/*
+ * Phase 3K (ADR-038): pg_cuvs_hnsw access method.
+ *
+ *   CREATE INDEX my_idx ON items USING pg_cuvs_hnsw (embedding vector_l2_ops)
+ *     WITH (source = 'my_cagra', mode = 'nsw');
+ *
+ * cuvs_hnsw_init_reloptions() registers the WITH (source, mode, ...) options
+ * and must be called once from _PG_init before any CREATE INDEX runs.
+ */
+void  cuvs_hnsw_init_reloptions(void);
+Datum pg_cuvs_hnsw_handler(PG_FUNCTION_ARGS);

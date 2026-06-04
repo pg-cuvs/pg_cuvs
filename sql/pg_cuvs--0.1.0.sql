@@ -36,6 +36,54 @@ FOR TYPE vector USING cagra AS
     FUNCTION 1 vector_negative_inner_product(vector, vector);
 
 -- ----------------------------------------------------------------
+-- pg_cuvs_hnsw access method (Phase 3K, ADR-038)
+--
+-- Exposes the GPU CAGRA -> pgvector-HNSW conversion as standard CREATE INDEX
+-- DDL:  CREATE INDEX my_idx ON items USING pg_cuvs_hnsw (embedding vector_l2_ops)
+--         WITH (source = 'my_cagra', mode = 'nsw');
+-- The handler borrows pgvector hnsw's IndexAmRoutine for the read path and
+-- overrides only ambuild (CAGRA->HNSW page conversion) and amoptions
+-- (WITH (source, mode, ...)). See src/hnsw_export.c.
+-- ----------------------------------------------------------------
+CREATE FUNCTION pg_cuvs_hnsw_handler(internal)
+RETURNS index_am_handler
+AS '$libdir/pg_cuvs', 'pg_cuvs_hnsw_handler'
+LANGUAGE C;
+
+CREATE ACCESS METHOD pg_cuvs_hnsw
+TYPE INDEX
+HANDLER pg_cuvs_hnsw_handler;
+
+COMMENT ON ACCESS METHOD pg_cuvs_hnsw IS
+  'GPU-built CAGRA -> pgvector HNSW index (pg_cuvs Phase 3K). '
+  'CREATE INDEX ... USING pg_cuvs_hnsw (col vector_l2_ops) '
+  'WITH (source = ''my_cagra'', mode = ''nsw'').';
+
+-- Operator classes MUST mirror pgvector's hnsw opclass support functions
+-- exactly, because the delegated scan resolves them via index_getprocinfo on
+-- THIS opclass. Verified against pgvector 0.8.0:
+--   l2     : proc 1 = vector_l2_squared_distance
+--   ip     : proc 1 = vector_negative_inner_product
+--   cosine : proc 1 = vector_negative_inner_product, proc 2 = vector_norm
+-- (cosine proc 1 is the negative inner product, NOT cosine_distance — pgvector
+--  normalizes at build time via proc 2 and ranks by inner product.)
+CREATE OPERATOR CLASS vector_l2_ops
+DEFAULT FOR TYPE vector USING pg_cuvs_hnsw AS
+    OPERATOR 1 <-> (vector, vector) FOR ORDER BY float_ops,
+    FUNCTION 1 vector_l2_squared_distance(vector, vector);
+
+CREATE OPERATOR CLASS vector_ip_ops
+FOR TYPE vector USING pg_cuvs_hnsw AS
+    OPERATOR 1 <#> (vector, vector) FOR ORDER BY float_ops,
+    FUNCTION 1 vector_negative_inner_product(vector, vector);
+
+CREATE OPERATOR CLASS vector_cosine_ops
+FOR TYPE vector USING pg_cuvs_hnsw AS
+    OPERATOR 1 <=> (vector, vector) FOR ORDER BY float_ops,
+    FUNCTION 1 vector_negative_inner_product(vector, vector),
+    FUNCTION 2 vector_norm(vector);
+
+-- ----------------------------------------------------------------
 -- pg_cuvs_reset_circuit(index_name text)
 -- Re-enables GPU routing after circuit breaker trips (FALLBACK-04).
 -- ----------------------------------------------------------------
