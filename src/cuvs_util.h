@@ -135,6 +135,45 @@ int cuvs_tids_write(FILE *f, int64_t n_vecs, uint32_t dim, uint32_t metric,
 int cuvs_tids_read(FILE *f, CuvsTidsHeader *hdr_out, uint64_t **tids_out);
 
 /* ----------------------------------------------------------------
+ * Versioned, checksummed .vectors sidecar (Phase 3L brute-force mode).
+ *
+ * Holds the raw row-major vector matrix so the daemon can build a resident
+ * GPU brute-force index (CuvsBfIndex) for exact search, independent of the
+ * CAGRA graph. Mirrors the .tids format exactly: same header shape, a crc32
+ * over the body, little-endian only. No base_tids_crc32 is stored here — a
+ * .vectors generation is tied to the sibling .tids body_crc32 by the daemon
+ * at load time (a REINDEX rewrites both), exactly like .delta.
+ *
+ * Layout: [CuvsVectorsHeader (32 bytes)] [n_vecs * dim * float32 body].
+ * LITTLE-ENDIAN ONLY, x86-64 daemon.
+ * ---------------------------------------------------------------- */
+#define CUVS_VECTORS_MAGIC   0x53434556u   /* 'VECS' little-endian */
+#define CUVS_VECTORS_VERSION 1u
+#define CUVS_VECTORS_MAX_DIM 65535u        /* sanity cap on dim (corrupt header) */
+
+typedef struct CuvsVectorsHeader {
+    uint32_t magic;
+    uint32_t version;
+    int64_t  n_vecs;
+    uint32_t dim;
+    uint32_t metric;
+    uint32_t body_crc32;   /* crc32 over n_vecs*dim*4 bytes of float body */
+    uint32_t reserved;     /* must be 0 */
+} CuvsVectorsHeader;        /* 32 bytes, LE-only, x86-64 daemon */
+
+/* Write header + float body to an open FILE*. Returns 0 on success, -1 on a
+ * short/failed fwrite. Caller is responsible for fflush/fsync/rename. */
+int cuvs_vectors_write(FILE *f, int64_t n_vecs, uint32_t dim, uint32_t metric,
+                       const float *vecs);
+
+/* Read + validate a .vectors file from an open FILE*. On success returns 0,
+ * fills *hdr_out, and allocates *vecs_out via malloc (caller frees). Validates
+ * magic, version, n_vecs range (0 < n_vecs <= CUVS_TIDS_MAX_VECS), dim range
+ * (0 < dim <= CUVS_VECTORS_MAX_DIM), reserved==0, full body read, and body
+ * crc32. On any failure returns -1 and leaves *vecs_out NULL. */
+int cuvs_vectors_read(FILE *f, CuvsVectorsHeader *hdr_out, float **vecs_out);
+
+/* ----------------------------------------------------------------
  * Versioned, checksummed .shards manifest (Phase 3F multi-GPU sharding).
  *
  * Marks a logical CAGRA index as split into N standalone CAGRA shard

@@ -321,6 +321,138 @@ test_tids_rejections(void)
     }
 }
 
+/* ---- .vectors sidecar (Phase 3L) — mirrors the .tids tests above ---- */
+static void
+test_vectors_roundtrip(void)
+{
+    const int64_t  n = 3;
+    const uint32_t dim = 4, metric = CUVS_METRIC_L2;
+    /* row-major n*dim float matrix */
+    float vecs[3 * 4] = {
+        1.0f, 0.0f, 0.0f, 0.0f,
+        0.5f, 0.5f, 0.0f, 0.0f,
+        0.25f, 0.25f, 0.25f, 0.25f,
+    };
+
+    FILE *f = tmpfile();
+    ASSERT(f != NULL, "vectors tmpfile open (write)");
+    ASSERT(cuvs_vectors_write(f, n, dim, metric, vecs) == 0, "vectors_write ok");
+    rewind(f);
+
+    CuvsVectorsHeader hdr;
+    float *out = NULL;
+    ASSERT(cuvs_vectors_read(f, &hdr, &out) == 0, "vectors_read ok");
+    ASSERT(hdr.magic == CUVS_VECTORS_MAGIC, "rt magic");
+    ASSERT(hdr.version == CUVS_VECTORS_VERSION, "rt version");
+    ASSERT(hdr.n_vecs == n, "rt n_vecs");
+    ASSERT(hdr.dim == dim, "rt dim");
+    ASSERT(hdr.metric == metric, "rt metric");
+    ASSERT(hdr.reserved == 0, "rt reserved zero");
+    if (out)
+    {
+        ASSERT(memcmp(out, vecs, sizeof(vecs)) == 0, "rt vectors body identity");
+        free(out);
+    }
+    fclose(f);
+}
+
+static void
+test_vectors_rejections(void)
+{
+    const int64_t  n = 2;
+    const uint32_t dim = 4, metric = 0;
+    float vecs[2 * 4] = { 1, 2, 3, 4, 5, 6, 7, 8 };
+
+    /* bad magic */
+    {
+        FILE *f = tmpfile();
+        cuvs_vectors_write(f, n, dim, metric, vecs);
+        rewind(f);
+        uint32_t bad = 0xDEADBEEFu;
+        fwrite(&bad, sizeof(bad), 1, f);
+        rewind(f);
+        CuvsVectorsHeader h; float *o = NULL;
+        ASSERT(cuvs_vectors_read(f, &h, &o) == -1, "reject bad magic");
+        ASSERT(o == NULL, "bad magic leaves out NULL");
+        fclose(f);
+    }
+
+    /* dim == 0 */
+    {
+        FILE *f = tmpfile();
+        cuvs_vectors_write(f, n, dim, metric, vecs);
+        fseek(f, offsetof(CuvsVectorsHeader, dim), SEEK_SET);
+        uint32_t zero = 0;
+        fwrite(&zero, sizeof(zero), 1, f);
+        rewind(f);
+        CuvsVectorsHeader h; float *o = NULL;
+        ASSERT(cuvs_vectors_read(f, &h, &o) == -1, "reject dim==0");
+        fclose(f);
+    }
+
+    /* dim > CAP */
+    {
+        FILE *f = tmpfile();
+        cuvs_vectors_write(f, n, dim, metric, vecs);
+        fseek(f, offsetof(CuvsVectorsHeader, dim), SEEK_SET);
+        uint32_t huge = CUVS_VECTORS_MAX_DIM + 1;
+        fwrite(&huge, sizeof(huge), 1, f);
+        rewind(f);
+        CuvsVectorsHeader h; float *o = NULL;
+        ASSERT(cuvs_vectors_read(f, &h, &o) == -1, "reject dim>CAP");
+        fclose(f);
+    }
+
+    /* truncated body: header claims n=2 but only 1 vector present */
+    {
+        FILE *f = tmpfile();
+        CuvsVectorsHeader h;
+        h.magic = CUVS_VECTORS_MAGIC; h.version = CUVS_VECTORS_VERSION;
+        h.n_vecs = n; h.dim = dim; h.metric = metric;
+        h.body_crc32 = cuvs_crc32(vecs, sizeof(vecs)); h.reserved = 0;
+        fwrite(&h, sizeof(h), 1, f);
+        fwrite(vecs, sizeof(float), (size_t)dim, f);   /* short body */
+        rewind(f);
+        CuvsVectorsHeader hr; float *o = NULL;
+        ASSERT(cuvs_vectors_read(f, &hr, &o) == -1, "reject truncated body");
+        ASSERT(o == NULL, "truncated body frees alloc");
+        fclose(f);
+    }
+
+    /* corrupted body: flip a byte so crc mismatches */
+    {
+        FILE *f = tmpfile();
+        cuvs_vectors_write(f, n, dim, metric, vecs);
+        fseek(f, sizeof(CuvsVectorsHeader), SEEK_SET);
+        unsigned char b;
+        fread(&b, 1, 1, f);
+        fseek(f, sizeof(CuvsVectorsHeader), SEEK_SET);
+        b ^= 0xFFu;
+        fwrite(&b, 1, 1, f);
+        rewind(f);
+        CuvsVectorsHeader h; float *o = NULL;
+        ASSERT(cuvs_vectors_read(f, &h, &o) == -1, "reject crc mismatch");
+        ASSERT(o == NULL, "crc mismatch frees alloc");
+        fclose(f);
+    }
+
+    /* reserved != 0 */
+    {
+        FILE *f = tmpfile();
+        CuvsVectorsHeader h;
+        h.magic = CUVS_VECTORS_MAGIC; h.version = CUVS_VECTORS_VERSION;
+        h.n_vecs = n; h.dim = dim; h.metric = metric;
+        h.body_crc32 = cuvs_crc32(vecs, sizeof(vecs)); h.reserved = 1;
+        fwrite(&h, sizeof(h), 1, f);
+        fwrite(vecs, sizeof(float), (size_t)n * dim, f);
+        rewind(f);
+        CuvsVectorsHeader hr; float *o = NULL;
+        ASSERT(cuvs_vectors_read(f, &hr, &o) == -1, "reject reserved != 0");
+        ASSERT(o == NULL, "reserved!=0 leaves out NULL");
+        fclose(f);
+    }
+}
+
 /* Build a coherent 3-shard manifest covering [0,100): 40 + 35 + 25. */
 static void
 make_good_shards(CuvsShardRecord recs[3], uint32_t dim, uint32_t metric)
@@ -691,6 +823,8 @@ main(void)
     test_crc32();
     test_tids_roundtrip();
     test_tids_rejections();
+    test_vectors_roundtrip();
+    test_vectors_rejections();
     test_shards_roundtrip();
     test_shards_rejections();
     test_auto_shard_count();
