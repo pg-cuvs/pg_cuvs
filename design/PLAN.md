@@ -843,13 +843,13 @@ cuVS HNSW graph를 pgvector HNSW 내부 페이지 포맷으로 변환한다.
 - 레벨 구조가 다르면 recall 저하 가능 — `ef_construction` 파라미터 튜닝 필요.
 - 변환 중 fsync/WAL 처리를 올바르게 해야 crash-safe.
 
-3I-2 구현 현황 (2026-06-02, ADR-037):
-- **API 변경**: `CREATE INDEX USING cagra WITH (export_hnsw=on)` → `pg_cuvs_build_hnsw(cagra_oid, mode DEFAULT 'nsw') RETURNS regclass`
-- `INDEX_CREATE_SKIP_BUILD`로 285s CPU pgvector 빌드 제거. pgvector catalog entry만 생성.
+3I-2 구현 현황 (2026-06-02, ADR-031b/036/037):
+- **ADR-031b (AccessExclusiveLock 수정)**: `pg_cuvs_import_hnsw`가 `ExclusiveLock`으로 target을 열어 truncate+재작성 도중 concurrent SELECT가 반쯤 지워진 페이지를 읽을 수 있던 correctness 버그 수정. `AccessExclusiveLock`으로 변경. (`src/hnsw_export.c`)
+- **ADR-036 (pg_cuvs_import_cagra)**: hnswlib `.hnsw` 중간 파일 없이 CAGRA adjacency를 IPC로 직접 pgvector 페이지로 변환. import_hnsw 대비 전체 1.18× 빠름 (119s vs 140.7s, Cohere 1024d 1M). flat NSW 구조(level 0만), recall=0.9963.
+- **ADR-037 (pg_cuvs_build_hnsw 통합 API)**: `pg_cuvs_import_cagra`를 `pg_cuvs_build_hnsw(cagra_oid, mode DEFAULT 'nsw') RETURNS regclass`로 통합. `INDEX_CREATE_SKIP_BUILD`로 285s CPU pgvector 빌드 제거. pgvector catalog entry만 생성.
 - 4-way 모드: nsw(117s/2.4×, 권장), hnsw(144s), hnswlib(139s/2.0×, 권장), hnswlib_file(151s).
 - recall@10 단일 측정: nsw=0.9963, hnswlib=0.9962 (Cohere 1024d, N=1M).
 - 테스트 스위트 7/7 PASS (build_hnsw, build_hnsw_edge, metrics 포함).
-- **잔여**: GPU-less VM pg_dump/restore 검증.
 - **ef-recall pareto 완료 (2026-06-02)**: nsw/hnsw/hnswlib 세 모드 recall curve 동일 확인.
   nsw 권장 default 유지 근거 확보. (bench/results/ef_recall_sweep.csv, ADR-037)
 
