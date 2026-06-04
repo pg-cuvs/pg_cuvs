@@ -1047,6 +1047,7 @@ heap scan + varlena decode ~15-20s는 PG 오버헤드 45s 중 가장 큰 단일 
 현실적 대응:
 - parallel workers(4A-2)가 wall-clock 분산으로 유일한 단기 가속 수단이다.
 - PLAIN storage(`ALTER TABLE ... SET STORAGE PLAIN`)는 사용자 선택이며, 빌드 성능 ~25-35% 개선이 가능하나 일반 쿼리 성능 저하 트레이드오프가 있다. **ADR-043에서 벡터 전용 테이블 + PLAIN storage를 best practice로 확정하고, `cuvs_ambuild()`에서 EXTENDED storage 자동 감지 시 NOTICE를 출력하기로 결정했다.** NOTICE 구현은 release hardening에 포함(syscache 읽기 + ereport 한 줄).
+- **TOAST vs PLAIN 실증 벤치마크**(ADR-043 §실증 검증): release hardening에서 N=1M dim=1024 Cohere A100으로 EXTENDED vs PLAIN의 빌드 시간, heap 크기, 검색 latency(GPU/CPU), INSERT throughput을 실측한다. 결과를 ADR-043 테이블과 `docs/best-practices.md`에 반영한다.
 - 장기 모니터링 대상: pgvector fixed-length storage 지원 여부, PG 코어 TOAST prefetch/streaming API.
 
 ### 4B — import_hnsw 페이지 write 병목 감소

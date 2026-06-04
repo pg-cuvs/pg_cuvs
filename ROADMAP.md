@@ -74,6 +74,7 @@
 - `cuvs_ambuild()`에서 indexed column의 `attstorage`가 EXTENDED('x')인지 syscache로 확인 → NOTICE 출력
 - `docs/best-practices.md`에 벡터 전용 테이블 + PLAIN storage 권장 스키마 패턴 문서화
 - pg_cuvs가 storage를 강제 변경하지 않음 (사용자 선택 존중)
+- **TOAST vs PLAIN 실증 벤치마크**: N=1M dim=1024 Cohere A100에서 EXTENDED vs PLAIN의 빌드 시간, heap 크기, 검색 latency(GPU+CPU), INSERT throughput 실측. 결과를 ADR-043 테이블과 `docs/best-practices.md`에 반영
 
 스펙: ADR-043 | [design/PLAN.md — Phase 4A 장기 항목](design/PLAN.md)
 
