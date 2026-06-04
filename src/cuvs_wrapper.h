@@ -120,6 +120,35 @@ int cuvs_cagra_search(
 void cuvs_cagra_free(CuvsCagraIndex index, int device_id);
 
 /*
+ * Phase 3M: batched search — n_queries queries in one GPU dispatch.
+ * queries is [n_queries][dim] row-major; results is [n_queries][top_k] row-major
+ * (results[q*top_k + j] = j-th neighbor of query q). cuVS cagra/brute_force
+ * search accept a Q×dim query matrix, so the whole batch is one kernel launch.
+ * Caller must pass top_k <= corpus size. cuvs_bf_search_batch pads any tail
+ * slots [n, top_k) with item_id = -1 when the BF corpus has fewer than top_k
+ * vectors. Both return 0 on success, 2 on dim mismatch, 1 on other failure.
+ */
+int cuvs_cagra_search_batch(
+    CuvsCagraIndex   index,
+    const float     *queries,
+    int              n_queries,
+    int              dim,
+    int              top_k,
+    CuvsSearchResult *results,
+    int              device_id
+);
+
+int cuvs_bf_search_batch(
+    CuvsBfIndex      index,
+    const float     *queries,
+    int              n_queries,
+    int              dim,
+    int              top_k,
+    CuvsSearchResult *results,
+    int              device_id
+);
+
+/*
  * cuVS CPU HNSW index (Phase 3I-1)
  *
  * After CAGRA build, cuvs_hnsw_serialize() converts the GPU graph to a

@@ -587,6 +587,170 @@ cuvs_cagra_search(
 }
 
 /* ----------------------------------------------------------------
+ * Phase 3M: batched search — Q queries in one GPU dispatch.
+ * queries is Q*dim row-major; results is Q*top_k row-major
+ * (results[q*top_k + j] = j-th neighbor of query q). One kernel launch for the
+ * whole batch (cuVS cagra/brute_force search take a Q×dim query matrix), so the
+ * fixed per-call overhead is amortized across Q. The caller must pass
+ * top_k <= corpus size.
+ * ---------------------------------------------------------------- */
+extern "C" int
+cuvs_cagra_search_batch(
+    CuvsCagraIndex   index,
+    const float     *queries,
+    int              n_queries,
+    int              dim,
+    int              top_k,
+    CuvsSearchResult *results,
+    int              device_id)
+{
+    if (!index)
+        return 1;
+    if (n_queries <= 0 || top_k <= 0)
+        return 0;
+
+    CuvsCagraIndexImpl *impl = static_cast<CuvsCagraIndexImpl *>(index);
+    if ((int64_t)dim != impl->idx.dim()) {
+        fprintf(stderr,
+                "[cuvs_cagra_search_batch] dim mismatch: query=%d index=%lld; refusing\n",
+                dim, (long long)impl->idx.dim());
+        return 2;
+    }
+
+    PooledRes _pr(device_id);
+    try {
+        raft::device_resources &res = _pr.get();
+        int64_t Q = n_queries;
+        size_t  n = (size_t)Q * (size_t)top_k;
+
+        auto d_queries = raft::make_device_matrix<float, int64_t>(res, Q, (int64_t)dim);
+        raft::copy(d_queries.data_handle(), queries, (size_t)Q * dim, res.get_stream());
+
+        auto d_indices   = raft::make_device_matrix<uint32_t, int64_t>(res, Q, top_k);
+        auto d_distances = raft::make_device_matrix<float,    int64_t>(res, Q, top_k);
+
+        cuvs::neighbors::cagra::search_params sparams;
+        int itopk = ((top_k + 31) / 32) * 32;
+        if (itopk < 64) itopk = 64;
+        sparams.itopk_size = itopk;
+
+        cuvs::neighbors::cagra::search(
+            res, sparams, impl->idx,
+            raft::make_const_mdspan(d_queries.view()),
+            d_indices.view(),
+            d_distances.view());
+        res.sync_stream();
+
+        std::vector<uint32_t> h_indices(n);
+        std::vector<float>    h_distances(n);
+        raft::copy(h_indices.data(),   d_indices.data_handle(),   n, res.get_stream());
+        raft::copy(h_distances.data(), d_distances.data_handle(), n, res.get_stream());
+        res.sync_stream();
+
+        for (size_t i = 0; i < n; i++) {
+            results[i].item_id  = (int64_t)h_indices[i];
+            results[i].distance = h_distances[i];
+        }
+        return 0;
+    } catch (const std::exception &e) {
+        fprintf(stderr, "[cuvs_cagra_search_batch] exception: %s\n", e.what());
+        _pr.poison();
+        return 1;
+    } catch (...) {
+        fprintf(stderr, "[cuvs_cagra_search_batch] unknown exception\n");
+        _pr.poison();
+        return 1;
+    }
+}
+
+extern "C" int
+cuvs_bf_search_batch(
+    CuvsBfIndex      index,
+    const float     *queries,
+    int              n_queries,
+    int              dim,
+    int              top_k,
+    CuvsSearchResult *results,
+    int              device_id)
+{
+    if (!index)
+        return 1;
+    if (n_queries <= 0 || top_k <= 0)
+        return 0;
+
+    CuvsBfIndexImpl *impl = static_cast<CuvsBfIndexImpl *>(index);
+    if (dim != impl->dim)
+        return 2;
+    /* brute_force cannot return more neighbors than the corpus holds; the tail
+     * slots [bk, top_k) are padded with a sentinel so the Q*top_k layout holds. */
+    int bk = top_k;
+    if ((int64_t)bk > impl->n)
+        bk = (int)impl->n;
+
+    PooledRes _pr(device_id);
+    try {
+        raft::device_resources &res = _pr.get();
+        int64_t Q = n_queries;
+        size_t  nb = (size_t)Q * (size_t)bk;
+
+        auto d_indices   = raft::make_device_matrix<int64_t, int64_t>(res, Q, bk);
+        auto d_distances = raft::make_device_matrix<float,   int64_t>(res, Q, bk);
+
+        if (impl->precision == 1 /* float16 */) {
+            auto d_q = raft::make_device_matrix<half, int64_t>(res, Q, (int64_t)dim);
+            {
+                std::vector<half> h_q((size_t)Q * dim);
+                for (size_t i = 0; i < (size_t)Q * dim; i++)
+                    h_q[i] = __float2half(queries[i]);
+                raft::copy(d_q.data_handle(), h_q.data(), (size_t)Q * dim, res.get_stream());
+            }
+            cuvs::neighbors::brute_force::search(
+                res, *impl->idx_f16,
+                raft::make_const_mdspan(d_q.view()),
+                d_indices.view(),
+                d_distances.view());
+        } else {
+            auto d_q = raft::make_device_matrix<float, int64_t>(res, Q, (int64_t)dim);
+            raft::copy(d_q.data_handle(), queries, (size_t)Q * dim, res.get_stream());
+            cuvs::neighbors::brute_force::search(
+                res, *impl->idx_f32,
+                raft::make_const_mdspan(d_q.view()),
+                d_indices.view(),
+                d_distances.view());
+        }
+        res.sync_stream();
+
+        std::vector<int64_t> h_indices(nb);
+        std::vector<float>   h_distances(nb);
+        raft::copy(h_indices.data(),   d_indices.data_handle(),   nb, res.get_stream());
+        raft::copy(h_distances.data(), d_distances.data_handle(), nb, res.get_stream());
+        res.sync_stream();
+
+        for (int64_t q = 0; q < Q; q++) {
+            for (int j = 0; j < top_k; j++) {
+                CuvsSearchResult *r = &results[(size_t)q * top_k + j];
+                if (j < bk) {
+                    r->item_id  = h_indices[(size_t)q * bk + j];
+                    r->distance = h_distances[(size_t)q * bk + j];
+                } else {
+                    r->item_id  = -1;            /* sentinel: no neighbor */
+                    r->distance = 3.402823466e+38f;
+                }
+            }
+        }
+        return 0;
+    } catch (const std::exception &e) {
+        fprintf(stderr, "[cuvs_bf_search_batch] exception: %s\n", e.what());
+        _pr.poison();
+        return 1;
+    } catch (...) {
+        fprintf(stderr, "[cuvs_bf_search_batch] unknown exception\n");
+        _pr.poison();
+        return 1;
+    }
+}
+
+/* ----------------------------------------------------------------
  * CAGRA index serialize / deserialize
  * ---------------------------------------------------------------- */
 extern "C" int
