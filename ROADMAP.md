@@ -23,6 +23,7 @@
 |-------|------|------|
 | 3L | GPU brute force 검색 모드 (`cuvs.search_mode='brute_force'`) | 2 |
 | 3M | 배치 검색 API (`pg_cuvs_batch_search`) | 2 |
+| 3N | OFFSET-aware K 자동 조정 (ORM pagination 호환) | 2 |
 | 3A | Pending delta / delta exact search | 3 |
 | 4A-1 | CAGRA 빌드 double memcpy 제거 | 4 |
 | 4A-2 | parallel maintenance workers | 4 |
@@ -105,6 +106,25 @@
 - Q=1000, dim=1024 기준 단일 쿼리 반복 대비 throughput 유의미하게 향상
 
 스펙: [design/PLAN.md — Phase 3M](design/PLAN.md) | ADR-040
+
+---
+
+#### 3N — OFFSET-aware K 자동 조정
+**왜**: ORM pagination(Django, Rails, Spring Data, SQLAlchemy)이 `LIMIT K OFFSET N` 문법을 사용하는데 현재 pg_cuvs는 OFFSET을 인식하지 못함. DDL(3K) 이후 DML까지 "PostgreSQL 인덱스답게" 동작하는 범위를 확장.
+
+구현 항목:
+- `cuvsamcostestimate()` 또는 `cuvs_beginscan()`에서 Plan의 LIMIT+OFFSET 감지
+- IPC의 K를 `offset + limit`으로 계산해 전달 (daemon 변경 없음)
+- `cuvs_gettuple()`에서 앞 offset개 skip 후 반환
+- `offset > cuvs.max_offset_warning`(기본 1000) 시 NOTICE 경고
+- regression test: OFFSET 0/10/100 결과 일관성
+
+완료 기준:
+- `SELECT ... ORDER BY ... <-> ... LIMIT 10 OFFSET N`이 CAGRA/BF/sharded 경로에서 정상 동작
+- OFFSET 0일 때 기존 동작 동일 (regression 없음)
+- Django/SQLAlchemy의 `.offset().limit()` 패턴이 GPU 인덱스를 사용함을 `EXPLAIN`으로 확인
+
+스펙: [design/PLAN.md — Phase 3N](design/PLAN.md) | ADR-042
 
 ---
 
