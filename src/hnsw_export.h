@@ -10,6 +10,8 @@
 
 #include "postgres.h"
 #include "fmgr.h"
+#include "nodes/execnodes.h"   /* IndexInfo */
+#include "utils/relcache.h"    /* Relation */
 
 /*
  * pg_cuvs_build_hnsw(cagra_oid regclass, mode text DEFAULT 'nsw')
@@ -39,3 +41,15 @@ Datum pg_cuvs_build_hnsw(PG_FUNCTION_ARGS);
  */
 void  cuvs_hnsw_init_reloptions(void);
 Datum pg_cuvs_hnsw_handler(PG_FUNCTION_ARGS);
+
+/*
+ * Phase 3K: shared heap-scan + CAGRA build (defined in pg_cuvs.c). Used by
+ * cuvs_ambuild (USING cagra) and the source-less pg_cuvs_hnsw path, which
+ * builds an ephemeral CAGRA under build_index_oid and drops it after the HNSW
+ * conversion. On an empty heap, sets *out_n_vecs = 0 and builds nothing.
+ */
+void cuvs_build_cagra_from_heap(Relation heapRel, Relation indexRel,
+                                IndexInfo *indexInfo,
+                                uint32_t build_index_oid, uint32_t shard_count,
+                                bool use_cpu_hnsw,
+                                int64_t *out_n_vecs, double *out_reltuples);

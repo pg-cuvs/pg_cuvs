@@ -1832,30 +1832,71 @@ cuvs_hnsw_amoptions(Datum reloptions, bool validate)
                                       tab, lengthof(tab));
 }
 
-/* ambuild: convert the source CAGRA graph into THIS index's own relation. */
+/* ambuild: build a pgvector-HNSW index, served by pgvector (Phase 3K).
+ *
+ * Two modes (ADR-041):
+ *   WITH (source = 'my_cagra')  reuse an existing CAGRA index (saves a build;
+ *                               keeps the CAGRA for GPU search alongside).
+ *   source omitted              build an EPHEMERAL CAGRA from the heap, convert
+ *                               it into this index's pages, then drop it. One
+ *                               self-contained DDL; REINDEX rebuilds from the
+ *                               heap with no source dependency. The CAGRA is an
+ *                               intermediate build artifact (like a .o), so it
+ *                               is dropped — to keep a CAGRA, use source mode. */
 static IndexBuildResult *
 cuvs_hnsw_ambuild(Relation heapRel, Relation indexRel, IndexInfo *indexInfo)
 {
-    (void) indexInfo;
-
     CuvsHnswOptions *opts = (CuvsHnswOptions *) indexRel->rd_options;
-    if (opts == NULL || opts->source_offset == 0)
-        ereport(ERROR,
-                (errcode(ERRCODE_INVALID_TABLE_DEFINITION),
-                 errmsg("pg_cuvs_hnsw: missing required option \"source\""),
-                 errhint("CREATE INDEX ... USING pg_cuvs_hnsw (col vector_l2_ops) "
-                         "WITH (source = 'my_cagra_index', mode = 'nsw');")));
-
-    const char *source_name = (const char *) opts + opts->source_offset;
-    const char *mode = (opts->mode_offset != 0)
+    const char *source_name = (opts != NULL && opts->source_offset != 0)
+        ? (const char *) opts + opts->source_offset : "";
+    const char *mode = (opts != NULL && opts->mode_offset != 0)
         ? (const char *) opts + opts->mode_offset : "nsw";
     if (mode[0] == '\0')
         mode = "nsw";
-    if (source_name[0] == '\0')
-        ereport(ERROR,
-                (errcode(ERRCODE_INVALID_TABLE_DEFINITION),
-                 errmsg("pg_cuvs_hnsw: option \"source\" must name a CAGRA index")));
 
+    Oid self_oid = RelationGetRelid(indexRel);
+    IndexBuildResult *result = palloc0(sizeof(IndexBuildResult));
+
+    /* ── Source-less: ephemeral CAGRA built from the heap, then dropped. ── */
+    if (source_name[0] == '\0')
+    {
+        int64_t n_vecs    = 0;
+        double  reltuples = 0.0;
+
+        /* Build an ephemeral CAGRA under THIS index's OID. shard_count=1
+         * (a sharded CAGRA cannot export its adjacency); no .hnsw sidecar. */
+        cuvs_build_cagra_from_heap(heapRel, indexRel, indexInfo,
+                                   (uint32_t) self_oid, 1, false,
+                                   &n_vecs, &reltuples);
+        result->heap_tuples  = reltuples;
+        result->index_tuples = (double) n_vecs;
+        if (n_vecs == 0)
+            return result;  /* empty heap — empty index */
+
+        /* Convert, then ALWAYS drop the ephemeral CAGRA (success or error) so
+         * the daemon keeps no orphan. Dropping inside ambuild also avoids the
+         * abort-time zombie that object_access_hook cannot catch for a failed
+         * CREATE INDEX (it only sees explicit DROPs of cagra-AM indexes). */
+        PG_TRY();
+        {
+            if (strcmp(mode, "nsw") == 0 || strcmp(mode, "hnsw") == 0)
+                fill_hnsw_from_cagra_ipc(self_oid, self_oid, mode);
+            else if (strcmp(mode, "hnswlib") == 0)
+                fill_hnsw_from_hnswlib(self_oid, self_oid, true);
+            else  /* hnswlib_file */
+                fill_hnsw_from_hnswlib(self_oid, self_oid, false);
+        }
+        PG_FINALLY();
+        {
+            cuvs_ipc_drop(cuvs_socket_path, (uint32_t) MyDatabaseId,
+                          (uint32_t) self_oid);
+        }
+        PG_END_TRY();
+
+        return result;
+    }
+
+    /* ── Source mode: reuse an existing CAGRA index. ── */
     /* Resolve source name (schema-qualified, search_path aware) to an OID. */
     Oid cagra_oid = DatumGetObjectId(
         DirectFunctionCall1(regclassin, CStringGetDatum((char *) source_name)));
@@ -1891,7 +1932,6 @@ cuvs_hnsw_ambuild(Relation heapRel, Relation indexRel, IndexInfo *indexInfo)
      * object this backend already holds (the index under construction) is a
      * no-op re-grant, and the freshly created relation has 0 blocks so no
      * truncate happens. */
-    Oid self_oid = RelationGetRelid(indexRel);
     if (strcmp(mode, "nsw") == 0 || strcmp(mode, "hnsw") == 0)
         fill_hnsw_from_cagra_ipc(cagra_oid, self_oid, mode);
     else if (strcmp(mode, "hnswlib") == 0)
@@ -1900,11 +1940,12 @@ cuvs_hnsw_ambuild(Relation heapRel, Relation indexRel, IndexInfo *indexInfo)
         fill_hnsw_from_hnswlib(cagra_oid, self_oid, false);
 
     /* Element pages are one-per-vector after the metapage (block 0). */
-    IndexBuildResult *result = palloc0(sizeof(IndexBuildResult));
-    BlockNumber nblocks = RelationGetNumberOfBlocks(indexRel);
-    double ntuples = (nblocks > 0) ? (double) (nblocks - 1) : 0.0;
-    result->heap_tuples  = ntuples;
-    result->index_tuples = ntuples;
+    {
+        BlockNumber nblocks = RelationGetNumberOfBlocks(indexRel);
+        double ntuples = (nblocks > 0) ? (double) (nblocks - 1) : 0.0;
+        result->heap_tuples  = ntuples;
+        result->index_tuples = ntuples;
+    }
     return result;
 }
 

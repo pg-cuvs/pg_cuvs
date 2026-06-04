@@ -78,17 +78,63 @@ DROP INDEX ph_hnsw2;
 SELECT count(*) FROM pg_indexes
 WHERE tablename = 'ph_test' AND indexname = 'ph_hnsw2';
 
--- ── Error cases (do not abort the script) ────────────────────────
+-- ── Error case (do not abort the script) ─────────────────────────
+-- Omitting source is now valid (ephemeral build — see the source-less section
+-- below), so the only remaining error is a source that is not a cagra index.
 \set ON_ERROR_STOP off
 
--- Missing required 'source' option.
-CREATE INDEX ph_bad ON ph_test USING pg_cuvs_hnsw (embedding vector_l2_ops);
-
--- Source exists but is not a cagra index (ph_hnsw uses pg_cuvs_hnsw AM).
+-- Source given but is not a cagra index (ph_hnsw uses the pg_cuvs_hnsw AM).
 CREATE INDEX ph_bad2 ON ph_test USING pg_cuvs_hnsw (embedding vector_l2_ops)
     WITH (source = 'ph_hnsw');
 
 \set ON_ERROR_STOP on
+
+-- ── Source-less mode (ADR-041): ephemeral CAGRA from heap, auto-dropped ──
+-- No source CAGRA: ambuild builds a temporary CAGRA on the GPU, converts it
+-- into this index's pages, then drops it. One self-contained DDL.
+SET client_min_messages = 'warning';
+CREATE INDEX ph_hnsw_solo ON ph_test USING pg_cuvs_hnsw (embedding vector_l2_ops);
+SET client_min_messages = 'notice';
+
+-- First-class catalog index using the pg_cuvs_hnsw AM, no source needed.
+SELECT i.indexname, a.amname
+FROM pg_indexes i
+JOIN pg_class c ON c.relname = i.indexname
+JOIN pg_am a ON a.oid = c.relam
+WHERE i.tablename = 'ph_test' AND i.indexname = 'ph_hnsw_solo';
+
+-- Served by pgvector HNSW (GPU off). Top-1 must be id=20.
+SET enable_cuvs = off; SET enable_seqscan = off;
+SELECT id FROM ph_test ORDER BY embedding <-> '[1,0.5,0,0]' LIMIT 1;
+RESET enable_cuvs; RESET enable_seqscan;
+
+-- REINDEX rebuilds from the heap with NO source CAGRA dependency.
+SET client_min_messages = 'warning';
+REINDEX INDEX ph_hnsw_solo;
+SET client_min_messages = 'notice';
+SET enable_cuvs = off; SET enable_seqscan = off;
+SELECT id FROM ph_test ORDER BY embedding <-> '[1,0.5,0,0]' LIMIT 1;
+RESET enable_cuvs; RESET enable_seqscan;
+
+-- The ephemeral CAGRA must be dropped — no daemon registry entry lingers
+-- under this index's OID (count must be 0).
+SELECT count(*) AS leftover_ephemeral_cagra
+FROM pg_stat_gpu_search s
+JOIN pg_class c ON c.oid = s.index_oid
+WHERE c.relname = 'ph_hnsw_solo';
+
+DROP INDEX ph_hnsw_solo;
+
+-- Source-less with a NON-L2 metric: the ephemeral CAGRA must be built with the
+-- COSINE metric (not the old L2 fallback), otherwise fill_* raises a metric
+-- mismatch and CREATE INDEX fails. Success here proves AM-agnostic metric.
+SET client_min_messages = 'warning';
+CREATE INDEX ph_hnsw_cos ON ph_test USING pg_cuvs_hnsw (embedding vector_cosine_ops);
+SET client_min_messages = 'notice';
+SELECT a.amname
+FROM pg_class c JOIN pg_am a ON a.oid = c.relam
+WHERE c.relname = 'ph_hnsw_cos';
+DROP INDEX ph_hnsw_cos;
 
 -- Cleanup.
 DROP TABLE ph_test CASCADE;
