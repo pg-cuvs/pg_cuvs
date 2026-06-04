@@ -1,4 +1,14 @@
 
+## 프로젝트 문서 구조
+
+| 파일 | 역할 | 언제 읽는가 |
+|------|------|-------------|
+| `ROADMAP.md` | 구현 순서 및 미완료 이슈 목록. Wave별 우선순위와 각 항목의 완료 기준. | 세션 시작 시, "다음에 뭘 해야 하나" 파악할 때 |
+| `design/PLAN.md` | 각 Phase의 상세 스펙, 구현 항목, 완료 기준, 검증 증거. ADR 참조 포함. | 특정 Phase 구현 전 설계 확인 시 |
+| `design/DECISIONS.md` | ADR(Architecture Decision Record) 목록. 결정 배경, 대안, 기각 이유. | 설계 결정의 근거가 궁금할 때, 새 ADR 추가 시 |
+
+**관계**: ROADMAP.md는 "무엇을 어떤 순서로" 결정한다. PLAN.md는 "어떻게"의 스펙이다. DECISIONS.md는 "왜"의 기록이다. 새 설계 결정은 DECISIONS.md에 ADR로 먼저 기록하고, 해당 Phase 스펙은 PLAN.md에, 구현 순서 변경은 ROADMAP.md에 반영한다.
+
 ---
 
 ## Karpathy Coding Guidelines
