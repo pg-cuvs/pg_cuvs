@@ -191,6 +191,34 @@ int cuvs_ipc_search(
 );
 
 /*
+ * cuvs_ipc_search_batch — Phase 3M batch search (Q queries, one round-trip).
+ *
+ * queries is [n_queries][dim] row-major. The daemon runs one batched GPU
+ * dispatch and returns up to K = min(k, corpus) neighbors per query into
+ * tids_out / dist_out (each must hold n_queries*k; only the first
+ * n_queries*(*k_out) entries are written, row-major [q*(*k_out) + j]).
+ * Returns CUVS_STATUS_OK on success, or the same status codes as cuvs_ipc_search.
+ */
+int cuvs_ipc_search_batch(
+    const char   *socket_path,
+    uint32_t      db_oid,
+    uint32_t      index_oid,
+    const float  *queries,         /* n_queries * dim, row-major */
+    uint32_t      n_queries,
+    int           dim,
+    int           k,
+    uint32_t      metric,
+    uint32_t      shard_overfetch, /* Phase 3G: per-shard k+slop; ignored if unsharded */
+    int           parallel_fanout, /* Phase 3G: 1=concurrent shard dispatch */
+    uint32_t      search_mode,     /* Phase 3L: 0=cagra, 1=brute_force */
+    uint32_t      bf_precision,    /* Phase 3L: 0=float32, 1=float16 (BF only) */
+    uint64_t     *tids_out,        /* n_queries * k */
+    float        *dist_out,        /* n_queries * k */
+    uint32_t     *k_out,           /* OUT: per-query result stride K (<= k) */
+    uint32_t     *latency_us_out   /* daemon wall-clock; 0 if unknown (may be NULL) */
+);
+
+/*
  * cuvs_ipc_build — send a BUILD command to the daemon.
  *
  * vecs:  corpus vectors, shape [n_vecs][dim], row-major float32
