@@ -255,18 +255,19 @@ cuvs_tids_read(FILE *f, CuvsTidsHeader *hdr_out, uint64_t **tids_out)
  * ---------------------------------------------------------------- */
 int
 cuvs_vectors_write(FILE *f, int64_t n_vecs, uint32_t dim, uint32_t metric,
-                   const float *vecs)
+                   uint32_t base_tids_crc32, const float *vecs)
 {
     CuvsVectorsHeader hdr;
     size_t body_n = (size_t)n_vecs * (size_t)dim;
 
-    hdr.magic      = CUVS_VECTORS_MAGIC;
-    hdr.version    = CUVS_VECTORS_VERSION;
-    hdr.n_vecs     = n_vecs;
-    hdr.dim        = dim;
-    hdr.metric     = metric;
-    hdr.body_crc32 = cuvs_crc32(vecs, body_n * sizeof(float));
-    hdr.reserved   = 0;
+    hdr.magic           = CUVS_VECTORS_MAGIC;
+    hdr.version         = CUVS_VECTORS_VERSION;
+    hdr.n_vecs          = n_vecs;
+    hdr.dim             = dim;
+    hdr.metric          = metric;
+    hdr.body_crc32      = cuvs_crc32(vecs, body_n * sizeof(float));
+    hdr.base_tids_crc32 = base_tids_crc32;
+    hdr.reserved        = 0;
 
     if (fwrite(&hdr, sizeof(hdr), 1, f) != 1)
         return -1;

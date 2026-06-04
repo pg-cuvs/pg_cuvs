@@ -139,12 +139,13 @@ int cuvs_tids_read(FILE *f, CuvsTidsHeader *hdr_out, uint64_t **tids_out);
  *
  * Holds the raw row-major vector matrix so the daemon can build a resident
  * GPU brute-force index (CuvsBfIndex) for exact search, independent of the
- * CAGRA graph. Mirrors the .tids format exactly: same header shape, a crc32
- * over the body, little-endian only. No base_tids_crc32 is stored here — a
- * .vectors generation is tied to the sibling .tids body_crc32 by the daemon
- * at load time (a REINDEX rewrites both), exactly like .delta.
+ * CAGRA graph. Mirrors the .tids format: same header shape plus a crc32 over
+ * the body, little-endian only. base_tids_crc32 ties this sidecar to its
+ * build's .tids body_crc32 (generation token, like .delta/.shards): a REINDEX
+ * rewrites the .tids and changes that crc, so a torn build (new .tids, stale
+ * .vectors) is detected at load and brute_force fails closed until REINDEX.
  *
- * Layout: [CuvsVectorsHeader (32 bytes)] [n_vecs * dim * float32 body].
+ * Layout: [CuvsVectorsHeader (36 bytes)] [n_vecs * dim * float32 body].
  * LITTLE-ENDIAN ONLY, x86-64 daemon.
  * ---------------------------------------------------------------- */
 #define CUVS_VECTORS_MAGIC   0x53434556u   /* 'VECS' little-endian */
@@ -157,14 +158,16 @@ typedef struct CuvsVectorsHeader {
     int64_t  n_vecs;
     uint32_t dim;
     uint32_t metric;
-    uint32_t body_crc32;   /* crc32 over n_vecs*dim*4 bytes of float body */
-    uint32_t reserved;     /* must be 0 */
-} CuvsVectorsHeader;        /* 32 bytes, LE-only, x86-64 daemon */
+    uint32_t body_crc32;      /* crc32 over n_vecs*dim*4 bytes of float body */
+    uint32_t base_tids_crc32; /* sibling .tids body_crc32 @ build (generation token) */
+    uint32_t reserved;        /* must be 0 */
+} CuvsVectorsHeader;          /* 36 bytes, LE-only, x86-64 daemon */
 
-/* Write header + float body to an open FILE*. Returns 0 on success, -1 on a
+/* Write header + float body to an open FILE*. base_tids_crc32 is the build's
+ * .tids body_crc32 (generation token). Returns 0 on success, -1 on a
  * short/failed fwrite. Caller is responsible for fflush/fsync/rename. */
 int cuvs_vectors_write(FILE *f, int64_t n_vecs, uint32_t dim, uint32_t metric,
-                       const float *vecs);
+                       uint32_t base_tids_crc32, const float *vecs);
 
 /* Read + validate a .vectors file from an open FILE*. On success returns 0,
  * fills *hdr_out, and allocates *vecs_out via malloc (caller frees). Validates

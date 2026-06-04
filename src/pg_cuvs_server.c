@@ -2483,6 +2483,34 @@ build_sharded(int client_fd, const CuvsCmdFrame *cmd, const char *index_dir,
         off += shard_n;
     }
 
+    /* Phase 3L: persist one global `.vectors` sidecar (same build-order layout
+     * as the global `.tids`) while `vecs` is still mapped. Per-shard BF indexes
+     * are sliced from this at load time by tid_offset. Best-effort: a failure
+     * leaves brute_force unavailable but never fails the sharded build. */
+    char vecs_final[512], vecs_tmp[576];
+    int  vectors_committed = 0;
+    vectors_file_path(vecs_final, sizeof(vecs_final), save_dir, cmd->db_oid, cmd->index_oid);
+    snprintf(vecs_tmp, sizeof(vecs_tmp), "%s.tmp", vecs_final);
+    if (ok)
+    {
+        uint32_t tids_gen = cuvs_crc32(new_tids, tid_bytes);
+        FILE *vf = fopen(vecs_tmp, "wb");
+        int vok = (vf != NULL);
+        if (vok && cuvs_vectors_write(vf, n_vecs, dim, metric, tids_gen, vecs) != 0) vok = 0;
+        if (vok && fflush(vf) != 0) vok = 0;
+        if (vok && fsync(fileno(vf)) != 0) vok = 0;
+        if (vf && fclose(vf) != 0) vok = 0;
+        if (vok) {
+            vectors_committed = 1;
+        } else {
+            if (vf) unlink(vecs_tmp);
+            unlink(vecs_final);   /* drop any stale prior sidecar */
+            LOG_WARN("[build_sharded] .vectors sidecar not written for %u/%u; "
+                     "brute_force unavailable until REINDEX\n",
+                     cmd->db_oid, cmd->index_oid);
+        }
+    }
+
     munmap(mem, total);   /* vecs no longer needed past the build loop */
 
     if (!ok)
@@ -2534,6 +2562,7 @@ build_sharded(int client_fd, const CuvsCmdFrame *cmd, const char *index_dir,
             cuvs_cagra_free(shards[j].handle, shards[j].gpu_device_id);
             unlink(shard_tmp[j]);
         }
+        unlink(vecs_tmp);   /* Phase 3L: drop our un-committed sidecar tmp */
         pthread_mutex_unlock(&g_index_mutex);
         free(new_tids); free(shards); free(recs); free(shard_tmp); free(shard_final);
         send_error_code(client_fd, CUVS_STATUS_PERSIST_FAILED, "sharded persist failed");
@@ -2555,6 +2584,7 @@ build_sharded(int client_fd, const CuvsCmdFrame *cmd, const char *index_dir,
         for (int j = 0; j < renamed; j++) unlink(shard_final[j]);
         unlink(tids_final); unlink(shards_finalp);
         unlink(tids_tmp);   unlink(shards_tmp);
+        unlink(vecs_tmp);   /* Phase 3L: .vectors not yet renamed; drop tmp */
         for (int j = renamed; j < sc; j++) unlink(shard_tmp[j]);
         for (int j = 0; j < sc; j++)
             cuvs_cagra_free(shards[j].handle, shards[j].gpu_device_id);
@@ -2566,6 +2596,20 @@ build_sharded(int client_fd, const CuvsCmdFrame *cmd, const char *index_dir,
 
     int dir_fd = open(save_dir, O_RDONLY);
     if (dir_fd >= 0) { fsync(dir_fd); close(dir_fd); }
+
+    /* Phase 3L: commit the global .vectors sidecar (non-fatal, like unsharded).
+     * The generation token guards a torn post-commit, pre-vectors crash. */
+    if (vectors_committed) {
+        if (rename(vecs_tmp, vecs_final) != 0) {
+            LOG_WARN("[build_sharded] rename %s -> %s failed errno=%d; brute_force unavailable\n",
+                     vecs_tmp, vecs_final, errno);
+            unlink(vecs_tmp); unlink(vecs_final);
+            vectors_committed = 0;
+        } else {
+            int vdir_fd = open(save_dir, O_RDONLY);
+            if (vdir_fd >= 0) { fsync(vdir_fd); close(vdir_fd); }
+        }
+    }
 
     /* Clear staleness marker and any legacy unsharded .cagra for this OID so a
      * reload sees only the sharded artifacts. Also remove orphan shard files
@@ -2887,11 +2931,41 @@ handle_build(int client_fd, const CuvsCmdFrame *cmd)
         return;
     }
     memcpy(new_tids, tids_in, tid_bytes);
-    munmap(mem, total);
 
     /* --- Disk persistence: tmp -> rename pattern --- */
     const char *save_dir = (index_dir[0] != '\0') ? index_dir : g_index_dir;
     mkdir(save_dir, 0700);
+
+    /* Phase 3L: persist the raw vector matrix as a `.vectors` sidecar for GPU
+     * brute-force search, written from `vecs` (the shm payload) while it is
+     * still mapped — munmap follows. Best-effort: a write failure leaves
+     * brute_force unavailable for this index but never fails the CAGRA build.
+     * The generation token (this build's .tids body_crc32) lets the daemon
+     * reject a stale sidecar after a torn build. Renamed at the commit point. */
+    uint32_t tids_gen = cuvs_crc32(new_tids, (size_t)cmd->n_vecs * sizeof(uint64_t));
+    char vecs_final[512], vecs_tmp[576];
+    int  vectors_committed = 0;
+    vectors_file_path(vecs_final, sizeof(vecs_final), save_dir, cmd->db_oid, cmd->index_oid);
+    snprintf(vecs_tmp, sizeof(vecs_tmp), "%s.tmp", vecs_final);
+    {
+        FILE *vf = fopen(vecs_tmp, "wb");
+        int vok = (vf != NULL);
+        if (vok && cuvs_vectors_write(vf, cmd->n_vecs, cmd->dim, cmd->metric, tids_gen, vecs) != 0)
+            vok = 0;
+        if (vok && fflush(vf) != 0) vok = 0;
+        if (vok && fsync(fileno(vf)) != 0) vok = 0;
+        if (vf && fclose(vf) != 0) vok = 0;
+        if (vok) {
+            vectors_committed = 1;   /* tmp ready; renamed at the commit point */
+        } else {
+            if (vf) unlink(vecs_tmp);
+            unlink(vecs_final);      /* drop any stale prior sidecar */
+            LOG_WARN("[handle_build] .vectors sidecar not written for %u/%u; "
+                     "brute_force unavailable until REINDEX\n",
+                     cmd->db_oid, cmd->index_oid);
+        }
+    }
+    munmap(mem, total);
 
     char idx_final[512],  idx_tmp[576];
     char tids_final[512], tids_tmp[576];
@@ -2958,6 +3032,23 @@ handle_build(int client_fd, const CuvsCmdFrame *cmd)
     /* fsync directory so the rename(s) are durable. */
     int dir_fd = open(save_dir, O_RDONLY);
     if (dir_fd >= 0) { fsync(dir_fd); close(dir_fd); }
+
+    /* Phase 3L: commit the .vectors sidecar. Non-fatal — the index is already
+     * durably committed above (cagra + tids renamed); a rename failure only
+     * disables brute_force. The generation token guards a torn post-cagra,
+     * pre-vectors crash: a stale sidecar is rejected at load. */
+    if (vectors_committed) {
+        if (rename(vecs_tmp, vecs_final) != 0) {
+            LOG_WARN("[handle_build] rename %s -> %s failed errno=%d; brute_force unavailable\n",
+                     vecs_tmp, vecs_final, errno);
+            unlink(vecs_tmp);
+            unlink(vecs_final);
+            vectors_committed = 0;
+        } else {
+            int vdir_fd = open(save_dir, O_RDONLY);
+            if (vdir_fd >= 0) { fsync(vdir_fd); close(vdir_fd); }
+        }
+    }
 
     /* A rebuild produces a fresh graph reflecting the current heap — clear any
      * persisted staleness marker. */
@@ -3041,6 +3132,7 @@ handle_build(int client_fd, const CuvsCmdFrame *cmd)
             LOG_ERROR("[handle_build] registry full; rolling back disk commit\n");
             unlink(idx_final);
             unlink(tids_final);
+            if (vectors_committed) unlink(vecs_final);
             cuvs_cagra_free(new_handle, target_gpu);
             free(new_tids);
             pthread_mutex_unlock(&g_index_mutex);
@@ -3122,9 +3214,12 @@ handle_build(int client_fd, const CuvsCmdFrame *cmd)
 
 persist_fail:
     /* Disk persistence failed before commit. Existing entry (if any) remains
-     * intact in registry. Clean up new resources and tmp files. */
+     * intact in registry. Clean up new resources and tmp files. The prior
+     * `.vectors` (if any) is left intact — it still matches the surviving
+     * (un-renamed) prior `.tids`/`.cagra`; only our new tmp is removed. */
     unlink(idx_tmp);
     unlink(tids_tmp);
+    unlink(vecs_tmp);
     cuvs_cagra_free(new_handle, target_gpu);
     free(new_tids);
     pthread_mutex_unlock(&g_index_mutex);
@@ -3329,6 +3424,7 @@ handle_drop(int client_fd, const CuvsCmdFrame *cmd)
     tids_file_path(p, sizeof(p), g_index_dir, db, idx);        unlink(p); /* .tids */
     shards_manifest_path(p, sizeof(p), g_index_dir, db, idx);  unlink(p); /* .shards */
     delta_file_path(p, sizeof(p), g_index_dir, db, idx);       unlink(p); /* .delta */
+    vectors_file_path(p, sizeof(p), g_index_dir, db, idx);     unlink(p); /* .vectors */
     stale_file_path(p, sizeof(p), g_index_dir, db, idx);       unlink(p); /* .stale */
     relfilenode_file_path(p, sizeof(p), g_index_dir, db, idx); unlink(p); /* .relfilenode */
     snprintf(p, sizeof(p), "%s/%u_%u.tombstone", g_index_dir, db, idx); unlink(p);

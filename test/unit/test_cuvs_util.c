@@ -336,7 +336,7 @@ test_vectors_roundtrip(void)
 
     FILE *f = tmpfile();
     ASSERT(f != NULL, "vectors tmpfile open (write)");
-    ASSERT(cuvs_vectors_write(f, n, dim, metric, vecs) == 0, "vectors_write ok");
+    ASSERT(cuvs_vectors_write(f, n, dim, metric, 0xCAFEF00Du, vecs) == 0, "vectors_write ok");
     rewind(f);
 
     CuvsVectorsHeader hdr;
@@ -347,6 +347,7 @@ test_vectors_roundtrip(void)
     ASSERT(hdr.n_vecs == n, "rt n_vecs");
     ASSERT(hdr.dim == dim, "rt dim");
     ASSERT(hdr.metric == metric, "rt metric");
+    ASSERT(hdr.base_tids_crc32 == 0xCAFEF00Du, "rt generation token");
     ASSERT(hdr.reserved == 0, "rt reserved zero");
     if (out)
     {
@@ -366,7 +367,7 @@ test_vectors_rejections(void)
     /* bad magic */
     {
         FILE *f = tmpfile();
-        cuvs_vectors_write(f, n, dim, metric, vecs);
+        cuvs_vectors_write(f, n, dim, metric, 0, vecs);
         rewind(f);
         uint32_t bad = 0xDEADBEEFu;
         fwrite(&bad, sizeof(bad), 1, f);
@@ -380,7 +381,7 @@ test_vectors_rejections(void)
     /* dim == 0 */
     {
         FILE *f = tmpfile();
-        cuvs_vectors_write(f, n, dim, metric, vecs);
+        cuvs_vectors_write(f, n, dim, metric, 0, vecs);
         fseek(f, offsetof(CuvsVectorsHeader, dim), SEEK_SET);
         uint32_t zero = 0;
         fwrite(&zero, sizeof(zero), 1, f);
@@ -393,7 +394,7 @@ test_vectors_rejections(void)
     /* dim > CAP */
     {
         FILE *f = tmpfile();
-        cuvs_vectors_write(f, n, dim, metric, vecs);
+        cuvs_vectors_write(f, n, dim, metric, 0, vecs);
         fseek(f, offsetof(CuvsVectorsHeader, dim), SEEK_SET);
         uint32_t huge = CUVS_VECTORS_MAX_DIM + 1;
         fwrite(&huge, sizeof(huge), 1, f);
@@ -409,7 +410,7 @@ test_vectors_rejections(void)
         CuvsVectorsHeader h;
         h.magic = CUVS_VECTORS_MAGIC; h.version = CUVS_VECTORS_VERSION;
         h.n_vecs = n; h.dim = dim; h.metric = metric;
-        h.body_crc32 = cuvs_crc32(vecs, sizeof(vecs)); h.reserved = 0;
+        h.body_crc32 = cuvs_crc32(vecs, sizeof(vecs)); h.base_tids_crc32 = 0; h.reserved = 0;
         fwrite(&h, sizeof(h), 1, f);
         fwrite(vecs, sizeof(float), (size_t)dim, f);   /* short body */
         rewind(f);
@@ -422,7 +423,7 @@ test_vectors_rejections(void)
     /* corrupted body: flip a byte so crc mismatches */
     {
         FILE *f = tmpfile();
-        cuvs_vectors_write(f, n, dim, metric, vecs);
+        cuvs_vectors_write(f, n, dim, metric, 0, vecs);
         fseek(f, sizeof(CuvsVectorsHeader), SEEK_SET);
         unsigned char b;
         fread(&b, 1, 1, f);
@@ -442,7 +443,7 @@ test_vectors_rejections(void)
         CuvsVectorsHeader h;
         h.magic = CUVS_VECTORS_MAGIC; h.version = CUVS_VECTORS_VERSION;
         h.n_vecs = n; h.dim = dim; h.metric = metric;
-        h.body_crc32 = cuvs_crc32(vecs, sizeof(vecs)); h.reserved = 1;
+        h.body_crc32 = cuvs_crc32(vecs, sizeof(vecs)); h.base_tids_crc32 = 0; h.reserved = 1;
         fwrite(&h, sizeof(h), 1, f);
         fwrite(vecs, sizeof(float), (size_t)n * dim, f);
         rewind(f);
