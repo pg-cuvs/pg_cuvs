@@ -66,7 +66,27 @@
 
 ---
 
-### Wave 2 — 신규 기능, 리스크 낮음 (순차)
+### Wave 2 — 핵심 기능 (순차)
+
+#### 3A-1 — Pending Delta CPU-exact MVP
+**왜 먼저**: RAG/검색 시스템은 문서가 계속 추가/수정된다. INSERT 하나만 해도 GPU path가 완전히 포기되는 현재 구조로는 streaming write가 있는 모든 워크로드에서 pg_cuvs를 쓸 수 없다. 3A-1은 `.delta` sidecar + backend CPU exact merge만으로 "INSERT 후 GPU path 유지"를 달성하는 가장 보수적인 경로이며, GPU delta cache(3A-2)나 tombstone(3A-4) 없이도 correctness가 보장된다.
+
+구현 항목:
+- `aminsert`에서 `.delta` sidecar에 (TID, vector, generation) append — 성공 시 `MARK_STALE` 전송 안 함
+- `.delta` append 실패 시 기존 stale path로 fail-closed
+- query 시 base CAGRA search(k+slop) + CPU exact search over delta rows + top-k merge
+- generation mismatch 시 CPU reroute
+- `cuvs.max_delta_rows` 초과 시 GPU+delta 중단 + REINDEX 권고
+- REINDEX 후 `.delta` compaction
+
+완료 기준:
+- INSERT 후 REINDEX 전에도 새 row가 GPU+delta merged top-k에 포함됨
+- L2/cosine/IP 각각에서 GPU+delta 결과가 pgvector ground truth와 일치
+- delta threshold 초과 시 CPU reroute 발생
+
+스펙: [design/PLAN.md — Phase 3A](design/PLAN.md) (3A-1)
+
+---
 
 #### 3L — GPU Brute Force 검색 모드
 **왜**: `cuvs_brute_force_search` / `CuvsBfIndex` 인프라가 이미 구현됨. 구현 비용 낮음. 3M의 BF 배치 경로 전제.
