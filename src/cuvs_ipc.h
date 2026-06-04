@@ -28,6 +28,7 @@
 #define CUVS_OP_DROP_INDEX  7 /* Phase 3G.1: free a dropped index + unlink its artifacts */
 #define CUVS_OP_EXPORT_ADJACENCY 8 /* Phase 3J: export CAGRA adjacency+vecs via shm */
 #define CUVS_OP_EXPORT_HNSW_SHM  9 /* Phase 3J: run from_cagra() → /dev/shm, return path */
+#define CUVS_OP_SEARCH_BATCH    10 /* Phase 3M: Q queries in one request, Q×K reply via shm */
 
 /* ----------------------------------------------------------------
  * Distance metrics (mirror pgvector operator names)
@@ -49,6 +50,7 @@
 #define CUVS_STATUS_DIM_MISMATCH   7   /* query dim != index dim → user error */
 #define CUVS_STATUS_METRIC_MISMATCH 8  /* index built with a different metric → REINDEX */
 #define CUVS_STATUS_STALE          9   /* index stale (writes since build) → CPU fallback */
+#define CUVS_STATUS_NO_VECTORS    10   /* Phase 3L: brute_force requested but .vectors sidecar missing → REINDEX */
 
 /* ----------------------------------------------------------------
  * Command frame (sent over UDS, fixed size)
@@ -57,10 +59,10 @@ typedef struct CuvsCmdFrame {
     uint32_t op;            /* CUVS_OP_* */
     uint32_t db_oid;        /* PostgreSQL database OID */
     uint32_t index_oid;     /* PostgreSQL index OID */
-    uint32_t k;             /* top-k for SEARCH */
+    uint32_t k;             /* top-k for SEARCH / SEARCH_BATCH */
     uint32_t metric;        /* CUVS_METRIC_* */
     uint32_t dim;           /* vector dimension */
-    int64_t  n_vecs;        /* BUILD: corpus size; SEARCH: unused */
+    int64_t  n_vecs;        /* BUILD: corpus size; SEARCH_BATCH: Q query count; SEARCH: unused */
     char     shm_key[64];   /* shm_open name for payload data */
     uint32_t table_oid;     /* BUILD: heap relation OID (for manifest) */
     uint32_t relfilenode;   /* BUILD: heap relfilenode (heap compat identity, ADR-013) */
@@ -68,6 +70,9 @@ typedef struct CuvsCmdFrame {
     uint32_t shard_overfetch; /* SEARCH: Phase 3G; per-shard request k = k + this (recall slop) */
     uint32_t parallel_fanout; /* SEARCH: Phase 3G; 1 = dispatch shards concurrently, 0 = sequential */
     uint32_t use_cpu_hnsw;  /* SEARCH: Phase 3I-1; 1 = use CPU HNSW instead of GPU CAGRA */
+    uint32_t search_mode;   /* SEARCH/SEARCH_BATCH: Phase 3L; 0=cagra (default), 1=brute_force */
+    uint32_t bf_precision;  /* SEARCH/SEARCH_BATCH: Phase 3L; 0=float32, 1=float16 (BF only) */
+    uint32_t bf_batch_wait_us; /* SEARCH: Phase 3L; daemon BF micro-batch window (0=off) */
 } CuvsCmdFrame;
 
 /*
@@ -175,6 +180,9 @@ int cuvs_ipc_search(
     uint32_t      shard_overfetch, /* Phase 3G: per-shard k+slop; ignored if unsharded */
     int           parallel_fanout, /* Phase 3G: 1=concurrent shard dispatch, 0=sequential */
     uint32_t      use_cpu_hnsw,    /* Phase 3I-1: 1=prefer CPU HNSW over GPU CAGRA */
+    uint32_t      search_mode,     /* Phase 3L: 0=cagra (default), 1=brute_force */
+    uint32_t      bf_precision,    /* Phase 3L: 0=float32, 1=float16 (BF only) */
+    uint32_t      bf_batch_wait_us,/* Phase 3L: daemon BF micro-batch window μs (0=off) */
     uint64_t     *tids_out,
     float        *dist_out,
     int          *n_out,

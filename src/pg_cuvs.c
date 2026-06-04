@@ -93,6 +93,22 @@ char *cuvs_snapshot_uri            = NULL;  /* "gs://bucket[/prefix]" — empty 
 char *cuvs_cluster_id              = NULL;  /* multi-node identifier for GCS path (Phase 3C) */
 char *cuvs_gcs_key_file            = NULL;  /* service account JSON path; "" = instance metadata (Phase 3C) */
 int   cuvs_warmup_threads          = 2;    /* background download/load threads in daemon (Phase 3D) */
+int   cuvs_search_mode             = 0;    /* 0=cagra (default), 1=brute_force (Phase 3L) */
+int   cuvs_bf_precision            = 0;    /* 0=float32 (default), 1=float16 (Phase 3L) */
+int   cuvs_bf_batch_wait_us        = 0;    /* daemon BF micro-batch window μs; 0=off (Phase 3L) */
+int   cuvs_max_batch_queries       = 1024; /* pg_cuvs_batch_search Q cap (Phase 3M) */
+
+/* Enum option tables for the Phase 3L GUCs (string in SQL, mapped to int in C). */
+static const struct config_enum_entry cuvs_search_mode_options[] = {
+    {"cagra",       0, false},
+    {"brute_force", 1, false},
+    {NULL, 0, false}
+};
+static const struct config_enum_entry cuvs_bf_precision_options[] = {
+    {"float32", 0, false},
+    {"float16", 1, false},
+    {NULL, 0, false}
+};
 
 /* ----------------------------------------------------------------
  * Last-search stats (process-local; one slot per backend)
@@ -298,6 +314,52 @@ _PG_init(void)
         "gpu (2): GPU-only, no CPU fallback (may miss delta rows).",
         &cuvs_delta_search_mode,
         0, 0, 2,
+        PGC_USERSET,
+        0, NULL, NULL, NULL);
+
+    DefineCustomEnumVariable(
+        "cuvs.search_mode",
+        "Search algorithm for cagra indexes: cagra (ANN, default) or brute_force (GPU exact).",
+        "Phase 3L. brute_force runs an exact GPU k-NN over the index's .vectors "
+        "sidecar (recall=1.0) instead of the CAGRA graph; useful for small indexes, "
+        "ground-truth generation, or when CAGRA recall is insufficient. Requires the "
+        ".vectors sidecar, which CREATE INDEX USING cagra writes automatically.",
+        &cuvs_search_mode,
+        0,
+        cuvs_search_mode_options,
+        PGC_USERSET,
+        0, NULL, NULL, NULL);
+
+    DefineCustomEnumVariable(
+        "cuvs.bf_precision",
+        "Numeric precision of the resident GPU brute-force index: float32 (default) or float16.",
+        "Phase 3L. float16 halves the brute-force VRAM footprint and raises throughput "
+        "at a small recall cost. Only affects cuvs.search_mode='brute_force'. Changing it "
+        "rebuilds the resident BF index on the next brute_force search.",
+        &cuvs_bf_precision,
+        0,
+        cuvs_bf_precision_options,
+        PGC_USERSET,
+        0, NULL, NULL, NULL);
+
+    DefineCustomIntVariable(
+        "cuvs.bf_batch_wait_us",
+        "Daemon brute-force micro-batch window in microseconds (0 = disabled).",
+        "Phase 3L. When > 0, the daemon coalesces concurrent brute_force search "
+        "requests arriving within this window into a single GPU dispatch, raising "
+        "throughput for bandwidth-bound BF search. 0 dispatches each request immediately.",
+        &cuvs_bf_batch_wait_us,
+        0, 0, 10000,
+        PGC_USERSET,
+        0, NULL, NULL, NULL);
+
+    DefineCustomIntVariable(
+        "cuvs.max_batch_queries",
+        "Maximum number of query vectors accepted by pg_cuvs_batch_search in one call.",
+        "Phase 3M. Bounds the request/reply shared-memory size (Q*dim*4 in, Q*k*12 out). "
+        "A call with more than this many queries raises an error.",
+        &cuvs_max_batch_queries,
+        1024, 1, 4096,
         PGC_USERSET,
         0, NULL, NULL, NULL);
 
@@ -1481,6 +1543,9 @@ cuvs_gettuple(IndexScanDesc scan, ScanDirection dir)
             (uint32_t)cuvs_shard_overfetch,
             cuvs_parallel_fanout ? 1 : 0,
             cuvs_cpu_hnsw_fallback ? 1 : 0,  /* Phase 3I-1 */
+            (uint32_t)cuvs_search_mode,      /* Phase 3L: 0=cagra, 1=brute_force */
+            (uint32_t)cuvs_bf_precision,     /* Phase 3L: 0=float32, 1=float16 */
+            (uint32_t)cuvs_bf_batch_wait_us, /* Phase 3L: BF micro-batch window μs */
             ss->tids,
             ss->distances,
             &ss->n_results,
