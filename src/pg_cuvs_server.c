@@ -72,6 +72,12 @@ typedef struct ShardEntry {
     uint64_t        error_count;   /* failed shard searches */
     uint32_t        last_status;   /* CUVS_STATUS_* of the last shard search */
     int             valid;         /* 1 once the shard is built/loaded */
+
+    /* Phase 3L: resident GPU brute-force index over this shard's vector range
+     * [tid_offset, tid_offset + n_vecs). Lazily built on the first BF search;
+     * NULL until then. Freed with the shard. */
+    CuvsBfIndex     bf_idx;
+    size_t          bf_vram_bytes; /* estimated VRAM held by bf_idx */
 } ShardEntry;
 
 typedef struct IndexEntry {
@@ -109,6 +115,18 @@ typedef struct IndexEntry {
     size_t          delta_vram_bytes; /* estimated VRAM held by the delta cache */
     float          *delta_vecs_host; /* host copy for incremental rebuild (Phase 3A-4) */
     int64_t         delta_n_cached;  /* rows in current GPU BF + host buffer */
+
+    /* Phase 3L: resident GPU brute-force index over the full base vector matrix
+     * (the `.vectors` sidecar), used when a search request sets search_mode=BF.
+     * Lazily (re)built in handle_search when `.vectors` appears/changes; freed
+     * on eviction. main_bf_idx==NULL means no resident BF index. */
+    CuvsBfIndex     main_bf_idx;        /* unsharded BF index; NULL if none */
+    int64_t         main_bf_n;          /* vectors in the BF index */
+    size_t          main_bf_vram_bytes; /* estimated VRAM held by main_bf_idx */
+    int64_t         main_bf_mtime;      /* .vectors st_mtime when the BF was built */
+    uint32_t        main_bf_generation; /* base .tids body_crc32 the BF was built on */
+    uint32_t        bf_precision;       /* precision of the resident BF index(es):
+                                         * 0=float32, 1=float16 (cuvs.bf_precision) */
 
     /* Search stats (pg_stat_gpu_search). Reset on (re)build/load — they
      * describe the currently resident index instance, not a persisted total. */
@@ -589,6 +607,15 @@ delta_file_path(char *out, size_t outlen,
     snprintf(out, outlen, "%s/%u_%u.delta", dir, db_oid, index_oid);
 }
 
+/* Phase 3L: raw vector matrix sidecar for GPU brute-force search; written at
+ * build time alongside `.cagra`/`.tids`, loaded into a resident CuvsBfIndex. */
+static void
+vectors_file_path(char *out, size_t outlen,
+                  const char *dir, uint32_t db_oid, uint32_t index_oid)
+{
+    snprintf(out, outlen, "%s/%u_%u.vectors", dir, db_oid, index_oid);
+}
+
 /* Phase 3C: heap compatibility sidecar; written by the extension at build time.
  * Format: "<relfilenode> <table_oid>\n" */
 static void
@@ -659,6 +686,19 @@ free_delta_cache(IndexEntry *e)
     e->delta_generation = 0;
     e->delta_mtime      = 0;
     e->delta_vram_bytes = 0;
+}
+
+/* Phase 3L: release an entry's resident GPU brute-force index over the full
+ * base vector matrix. Unsharded only — sharded per-shard bf_idx is freed in
+ * free_index_shards. Caller holds g_index_mutex. */
+static void
+free_main_bf_cache(IndexEntry *e)
+{
+    if (e->main_bf_idx) { cuvs_bf_free(e->main_bf_idx, delta_gpu_of(e)); e->main_bf_idx = NULL; }
+    e->main_bf_n          = 0;
+    e->main_bf_vram_bytes = 0;
+    e->main_bf_mtime      = 0;
+    e->main_bf_generation = 0;
 }
 
 /* Make e's GPU delta cache match the current `.delta` file. Cheap when nothing
@@ -1168,6 +1208,9 @@ load_index(uint32_t db_oid, uint32_t index_oid)
     e->delta_idx = NULL; e->delta_tids = NULL; e->n_delta = 0;
     e->delta_generation = 0; e->delta_mtime = 0; e->delta_vram_bytes = 0;
     e->delta_vecs_host = NULL; e->delta_n_cached = 0;
+    /* Phase 3L: main BF cache starts empty; lazily built on a BF search. */
+    e->main_bf_idx = NULL; e->main_bf_n = 0; e->main_bf_vram_bytes = 0;
+    e->main_bf_mtime = 0; e->main_bf_generation = 0; e->bf_precision = 0;
     e->warmup_state = WARMUP_HOT;
     reset_entry_stats(e);
 
@@ -1357,6 +1400,7 @@ evict_lru(int device_id)
                 e->shards[s].gpu_device_id == (uint32_t)device_id)
                 freed += e->shards[s].vram_bytes;
         free_delta_cache(e);
+        free_main_bf_cache(e);
         free_index_shards(e);
         free(e->tids);
     }
@@ -1370,6 +1414,7 @@ evict_lru(int device_id)
             return 0;
         }
         free_delta_cache(e);
+        free_main_bf_cache(e);
         cuvs_cagra_free(e->handle, e->gpu_device_id);
         free(e->tids);
         freed = e->vram_bytes;
@@ -2201,8 +2246,13 @@ free_index_shards(IndexEntry *e)
         return;
     }
     for (int s = 0; s < e->shard_count; s++)
+    {
         if (e->shards[s].valid && e->shards[s].handle)
             cuvs_cagra_free(e->shards[s].handle, e->shards[s].gpu_device_id);
+        /* Phase 3L: release this shard's resident brute-force index, if any. */
+        if (e->shards[s].bf_idx)
+            cuvs_bf_free(e->shards[s].bf_idx, e->shards[s].gpu_device_id);
+    }
     free(e->shards);
     e->shards = NULL;
     e->shard_count = 0;
@@ -2581,6 +2631,9 @@ build_sharded(int client_fd, const CuvsCmdFrame *cmd, const char *index_dir,
     e->delta_idx = NULL; e->delta_tids = NULL; e->n_delta = 0;
     e->delta_generation = 0; e->delta_mtime = 0; e->delta_vram_bytes = 0;
     e->delta_vecs_host = NULL; e->delta_n_cached = 0;
+    /* Phase 3L: main BF cache starts empty; sharded uses per-shard bf_idx. */
+    e->main_bf_idx = NULL; e->main_bf_n = 0; e->main_bf_vram_bytes = 0;
+    e->main_bf_mtime = 0; e->main_bf_generation = 0; e->bf_precision = 0;
     e->warmup_state  = WARMUP_HOT;
     e->gpu_device_id = 0xFFFFFFFFu;   /* sharded: no single device, not LRU-evictable */
     e->shard_count   = sc;
@@ -3008,6 +3061,9 @@ handle_build(int client_fd, const CuvsCmdFrame *cmd)
         e->delta_idx = NULL; e->delta_tids = NULL; e->n_delta = 0;
         e->delta_generation = 0; e->delta_mtime = 0; e->delta_vram_bytes = 0;
         e->delta_vecs_host = NULL; e->delta_n_cached = 0;
+        /* Phase 3L: main BF cache starts empty; lazily built on a BF search. */
+        e->main_bf_idx = NULL; e->main_bf_n = 0; e->main_bf_vram_bytes = 0;
+        e->main_bf_mtime = 0; e->main_bf_generation = 0; e->bf_precision = 0;
         e->warmup_state = WARMUP_HOT;
         e->gpu_device_id = (uint32_t)target_gpu;
         e->shard_count = 0;     /* unsharded; slot may be reused post-eviction */
