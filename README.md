@@ -11,7 +11,7 @@ pg_cuvs is **not** a replacement for pgvector. It is a GPU acceleration layer th
 It supports two complementary modes:
 
 - **GPU search tier**: keep CAGRA indexes resident in GPU VRAM and use the GPU as a candidate generator.
-- **GPU build accelerator tier**: use nearby GPUs to build indexes quickly, then import the result into a standard pgvector HNSW index and serve queries on CPU.
+- **GPU build accelerator tier**: use nearby GPUs to build indexes quickly, then convert the result into a standard pgvector HNSW index (`USING pg_cuvs_hnsw`) and serve queries on CPU.
 
 ```sql
 -- No query changes required. pg_cuvs accelerates this transparently.
@@ -53,7 +53,7 @@ If the GPU service dies, PostgreSQL **gracefully degrades** to CPU-based pgvecto
 | Index | Storage | Use Case |
 |-------|---------|----------|
 | `USING cagra` | GPU VRAM | Low latency, hot data, fits in GPU VRAM |
-| `USING cagra` + `pg_cuvs_import_hnsw` → `USING hnsw` | GPU build / CPU serve | Fast build (13x vs pgvector), then pgvector HNSW CPU search |
+| `USING pg_cuvs_hnsw` (converts a `USING cagra` source) | GPU build / CPU serve | Fast GPU build (13x vs pgvector), then served by pgvector HNSW on CPU |
 
 > **DiskANN/NVMe cold tier** (Phase 3B): spike completed, no-go for now — cuVS PQFlash
 > API is unstable in cuVS 26.04 and DiskANN at 50M×384 timed out at 2 GB cache.
@@ -73,7 +73,7 @@ Small tables route to CPU; large tables route to GPU automatically.
 |----------|-----------------|-------|
 | N < 10K, any dim | pgvector HNSW | IPC + daemon round-trip overhead exceeds GPU search benefit |
 | N 100K–10M, VRAM fits index | pg_cuvs CAGRA (GPU search) | Hot tier, low latency; crossover vs pgvector appears around N≈50K (synthetic clustered data; verify with your embedding distribution) |
-| Fast build/rebuild needed, CPU serving preferred | CAGRA build + `pg_cuvs_import_hnsw` | 14x faster than pgvector native build at 1M×384; serves as standard pgvector HNSW afterward |
+| Fast build/rebuild needed, CPU serving preferred | CAGRA build + `USING pg_cuvs_hnsw` | 14x faster than pgvector native build at 1M×384; serves as standard pgvector HNSW afterward |
 | On-prem RAG, embedding GPU pool already available | Reuse GPU for batch index build via 3I | GPU pool not idle; online search stays on pgvector HNSW CPU path |
 | Larger-than-VRAM / billion-scale / NVMe cold tier | pgvectorscale DiskANN or VectorChord | pg_cuvs 3B DiskANN path is a no-go in cuVS 26.04; revisit when demand is confirmed |
 | Multi-GPU horizontal scale | pg_cuvs CAGRA with `shard_count` | Recall improves with sharding; latency increases due to merge overhead |
@@ -83,7 +83,7 @@ Small tables route to CPU; large tables route to GPU automatically.
 | Feature | Status | Verified on |
 |---------|--------|-------------|
 | CAGRA GPU search | Production-tested | A100 VM, MIG, multi-GPU |
-| GPU Build Accelerator (`pg_cuvs_import_hnsw`) | Production-tested | VM E2E, 1M×384, recall=1.0 |
+| GPU Build Accelerator (`USING pg_cuvs_hnsw`) | Production-tested | VM E2E, 1M×384, recall=1.0 |
 | Multi-GPU sharding (`shard_count`) | Production-tested | 2×A100, shard_count=1/2 |
 | MIG (Multi-Instance GPU) | Verified | No code change; `CUDA_VISIBLE_DEVICES=MIG-uuid` |
 | GCS snapshot restore | Production-tested | Phase 3G |
@@ -101,7 +101,7 @@ Implemented on GCP (NVIDIA A100-40GB × 2, PostgreSQL 16), VM E2E verified:
 - [x] Cost model with `startup_cost=1000` (models CUDA context + transfer overhead)
 - [x] `enable_cuvs`, `cuvs.cpu_hnsw_fallback` GUCs for runtime GPU toggle and CPU fallback
 - [x] `pg_stat_gpu_search` view: per-index GPU stats (build time, search count, p50/p95 latency, recall)
-- [x] `pg_cuvs_import_hnsw(cagra_oid, hnsw_oid)`: CAGRA-to-pgvector HNSW page-level import
+- [x] `CREATE INDEX ... USING pg_cuvs_hnsw WITH (source = '<cagra>')`: CAGRA-to-pgvector HNSW DDL (Phase 3K), served by pgvector
 - [x] Multi-GPU sharding (`shard_count`), GCS snapshot restore (Phase 3G)
 - [x] MIG verified (no code changes needed)
 
@@ -127,7 +127,8 @@ See [design/PLAN.md](design/PLAN.md) for the full product-roadmap plan. Some com
 | 1.5 — Test & Ops Hardening | DDL durability, large-data benchmarks, GPU e2e, playbooks | Done |
 | 2 — Production Ready | `pg_stat_gpu_search`, LIMIT-k/metric, write/staleness, large-build memory, tiered cache | Done |
 | 3A~3G — Scale Out | pending-delta, snapshots, replicas, multi-GPU sharding, query optimization | Done (3G complete; 3B DiskANN → **no-go**, see PHASE_3B_DECISION.md) |
-| 3I — GPU Build Accelerator | `pg_cuvs_import_hnsw`: CAGRA build → pgvector HNSW export (13x faster build, recall=1.0 @ 1M×384) | Done (VM E2E verified, MIG tested) |
+| 3I — GPU Build Accelerator | CAGRA build → pgvector HNSW export (13x faster build, recall=1.0 @ 1M×384) | Done (VM E2E verified, MIG tested) |
+| 3K — HNSW DDL | `CREATE INDEX ... USING pg_cuvs_hnsw`: standard DDL surface for the build accelerator | Done (VM E2E, installcheck 8/8) |
 | 3H — Ops Playbooks | sizing guide, when-to-use, runbooks | In progress |
 | Release Hardening | compat matrix, known limitations, README, upgrade path | Planned |
 
@@ -144,21 +145,23 @@ See [design/PLAN.md](design/PLAN.md) for the full product-roadmap plan. Some com
 | CMake | 3.26 | 3.26 |
 | OS | Ubuntu 22.04 | Ubuntu 20.04 |
 
-`pg_cuvs_import_hnsw` is pinned to pgvector's HNSW page layout (`HNSW_VERSION=1`, stable
-since pgvector 0.5.0 / Aug 2023). A pgvector major version bump that changes the on-disk
-format would require a matching update to `src/hnsw_export.c`.
+`pg_cuvs_hnsw` (via `src/hnsw_export.c`) is pinned to pgvector's HNSW page layout
+(`HNSW_VERSION=1`, stable since pgvector 0.5.0 / Aug 2023) and mirrors pgvector 0.8.0's
+hnsw opclass support functions. A pgvector major version bump that changes the on-disk
+format or opclass procs would require a matching update to `src/hnsw_export.c` and the
+`pg_cuvs_hnsw` operator classes.
 
 ## Known Limitations
 
 | Limitation | Detail |
 |------------|--------|
-| `pg_cuvs_import_hnsw` is offline-only | Acquires `AccessExclusiveLock`; blocks all concurrent queries on the target HNSW index until commit |
+| `USING pg_cuvs_hnsw` build is offline | A `CREATE INDEX` build takes normal index-build locks; there is no `CONCURRENTLY` support for the GPU import path |
 | pgvector layout dependency | `hnsw_export.c` hardcodes pgvector 0.5.0+ page format; pgvector major version upgrade requires validation |
 | DiskANN / NVMe cold tier not supported | Phase 3B was spiked and abandoned; cuVS 26.04 PQFlash API is unstable. See `design/PHASE_3B_DECISION.md` |
 | MIG requires VM reboot on GCP | `nvidia-smi -mig 1` only sets pending mode; reboot required to activate or deactivate |
 | GCS snapshot restore requires bucket setup | Phase 3G restore path needs `cuvs.gcs_bucket` GUC set and credentials available |
 | `parallel_fanout` at N > 5M unverified | Parallel dispatch may help at large scale; current measurement only covers N ≤ 100K |
-| Import crash leaves index empty | Crash during `pg_cuvs_import_hnsw` recovers to pre-truncation or empty state; re-import required |
+| Crash during build rolls back | A crash during the `USING pg_cuvs_hnsw` build rolls back the `CREATE INDEX` (no partial index left behind); re-run required |
 | No online index swap | No built-in equivalent of `CREATE INDEX CONCURRENTLY` for import; use table rename pattern for minimal downtime |
 
 ## Requirements
@@ -190,21 +193,30 @@ CREATE EXTENSION pgvector;
 CREATE EXTENSION pg_cuvs;
 ```
 
-### GPU Build Accelerator (Phase 3I) Quick Start
+### GPU Build Accelerator (Phase 3I / 3K) Quick Start
 
 ```sql
--- Build CAGRA index (GPU; sidecar .hnsw written automatically)
+-- 1. Build a CAGRA graph on the GPU (requires the daemon + GPU).
 CREATE INDEX my_cagra ON items USING cagra (embedding vector_l2_ops);
 
--- Create empty pgvector HNSW target
-CREATE INDEX my_hnsw ON items USING hnsw (embedding vector_l2_ops);
+-- 2. Convert it to a pgvector-format HNSW index via standard DDL (Phase 3K).
+--    No pgvector CPU build (skip-build): the CAGRA graph is written directly
+--    into this index's own pages (~66s for 1M×384). The read path is served by
+--    pgvector's hnsw AM, so the result is a first-class catalog index
+--    (pg_indexes / DROP INDEX / REINDEX / pg_dump all work).
+CREATE INDEX my_hnsw ON items USING pg_cuvs_hnsw (embedding vector_l2_ops)
+    WITH (source = 'my_cagra', mode = 'nsw');
 
--- Import: GPU-built index → pgvector pages (offline, ~66s for 1M×384)
-SELECT pg_cuvs_import_hnsw('my_cagra'::regclass, 'my_hnsw'::regclass);
+-- 3. (optional) Drop the CAGRA index to reclaim GPU VRAM — my_hnsw is independent.
+DROP INDEX my_cagra;
 
--- Serve queries via standard pgvector (GPU not required)
+-- 4. Serve queries via standard pgvector HNSW on CPU (GPU not required).
 SELECT * FROM items ORDER BY embedding <-> $1 LIMIT 10;
 ```
+
+> The older `SELECT pg_cuvs_import_hnsw(cagra, hnsw)` two-step form (create an
+> empty `USING hnsw` target, then import) is removed. `pg_cuvs_build_hnsw(cagra,
+> mode)` still works but is deprecated in favor of the DDL above.
 
 ## Usage
 
