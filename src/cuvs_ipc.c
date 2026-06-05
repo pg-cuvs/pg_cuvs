@@ -166,6 +166,40 @@ shm_write_build_payload(const char   *shm_key,
     return fd;
 }
 
+/* Phase 3M: write [uint32 Q][uint32 dim][Q*dim float32] into a new shm segment
+ * for a batch search request. Returns shm fd or -1. */
+static int
+shm_write_query_batch(const char *shm_key, const float *queries,
+                      uint32_t n_queries, int dim)
+{
+    size_t hdr_bytes = 2 * sizeof(uint32_t);
+    size_t vec_bytes = (size_t)n_queries * (size_t)dim * sizeof(float);
+    size_t total     = hdr_bytes + vec_bytes;
+
+    int fd = shm_open(shm_key, O_CREAT | O_RDWR, 0666);
+    if (fd < 0)
+        return -1;
+    fchmod(fd, 0666);
+    if (ftruncate(fd, (off_t)total) < 0)
+    {
+        shm_unlink(shm_key);
+        close(fd);
+        return -1;
+    }
+    void *mem = mmap(NULL, total, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (mem == MAP_FAILED)
+    {
+        shm_unlink(shm_key);
+        close(fd);
+        return -1;
+    }
+    ((uint32_t *)mem)[0] = n_queries;
+    ((uint32_t *)mem)[1] = (uint32_t)dim;
+    memcpy((char *)mem + hdr_bytes, queries, vec_bytes);
+    munmap(mem, total);
+    return fd;
+}
+
 /* Write query vector into a new shm segment. Returns shm fd or -1. */
 static int
 shm_write_query(const char *shm_key, const float *query_vec, int dim)
@@ -214,6 +248,9 @@ cuvs_ipc_search(
     uint32_t      shard_overfetch,
     int           parallel_fanout,
     uint32_t      use_cpu_hnsw,
+    uint32_t      search_mode,
+    uint32_t      bf_precision,
+    uint32_t      bf_batch_wait_us,
     uint64_t     *tids_out,
     float        *dist_out,
     int          *n_out,
@@ -252,6 +289,9 @@ cuvs_ipc_search(
         .shard_overfetch = shard_overfetch,
         .parallel_fanout = (uint32_t)(parallel_fanout ? 1 : 0),
         .use_cpu_hnsw    = use_cpu_hnsw,
+        .search_mode     = search_mode,
+        .bf_precision    = bf_precision,
+        .bf_batch_wait_us = bf_batch_wait_us,
     };
     strncpy(cmd.shm_key, shm_key, sizeof(cmd.shm_key) - 1);
 
@@ -306,6 +346,133 @@ cleanup:
     if (shm_fd >= 0)
         close(shm_fd);
     shm_unlink(shm_key);
+    return rc;
+}
+
+/* ----------------------------------------------------------------
+ * Public API: cuvs_ipc_search_batch (Phase 3M)
+ *
+ * Q queries in one request shm ([Q][dim][Q*dim f32]); the daemon runs one
+ * batched GPU dispatch and returns Q*K results via a daemon-allocated reply
+ * shm ([Q][K][tids Q*K u64][dists Q*K f32]), with the reply shm key in
+ * hdr.error[] and K in hdr.delta_merged (reusing the export_adjacency reply
+ * mechanism). The backend owns both shm segments and unlinks them here.
+ * tids_out/dist_out must hold Q*k; the daemon clamps K = min(k, corpus) and
+ * *k_out reports the actual per-query stride.
+ * ---------------------------------------------------------------- */
+int
+cuvs_ipc_search_batch(
+    const char   *socket_path,
+    uint32_t      db_oid,
+    uint32_t      index_oid,
+    const float  *queries,
+    uint32_t      n_queries,
+    int           dim,
+    int           k,
+    uint32_t      metric,
+    uint32_t      shard_overfetch,
+    int           parallel_fanout,
+    uint32_t      search_mode,
+    uint32_t      bf_precision,
+    uint64_t     *tids_out,
+    float        *dist_out,
+    uint32_t     *k_out,
+    uint32_t     *latency_us_out)
+{
+    char   req_key[64];
+    int    shm_fd   = -1;
+    int    sock     = -1;
+    int    reply_fd = -1;
+    void  *rmem     = MAP_FAILED;
+    size_t rtotal   = 0;
+    int    rc       = CUVS_STATUS_ERROR;
+    char   reply_key[128];
+
+    reply_key[0] = '\0';
+    if (k_out)          *k_out = 0;
+    if (latency_us_out) *latency_us_out = 0;
+
+    make_shm_key(req_key, sizeof(req_key));
+    shm_fd = shm_write_query_batch(req_key, queries, n_queries, dim);
+    if (shm_fd < 0)
+        goto cleanup;       /* our-side error -> CUVS_STATUS_ERROR */
+
+    /* A large batch can take longer than a single search; use a generous
+     * timeout (mirrors export_adjacency). */
+    sock = uds_connect_ex(socket_path, 120);
+    if (sock < 0)
+    {
+        rc = CUVS_STATUS_UNAVAILABLE;
+        goto cleanup;
+    }
+
+    CuvsCmdFrame cmd = {
+        .op              = CUVS_OP_SEARCH_BATCH,
+        .db_oid          = db_oid,
+        .index_oid       = index_oid,
+        .k               = (uint32_t)k,
+        .metric          = metric,
+        .dim             = (uint32_t)dim,
+        .n_vecs          = (int64_t)n_queries,   /* SEARCH_BATCH: Q query count */
+        .shard_overfetch = shard_overfetch,
+        .parallel_fanout = (uint32_t)(parallel_fanout ? 1 : 0),
+        .search_mode     = search_mode,
+        .bf_precision    = bf_precision,
+    };
+    strncpy(cmd.shm_key, req_key, sizeof(cmd.shm_key) - 1);
+    if (send_all(sock, &cmd, sizeof(cmd)) < 0)
+        goto cleanup;
+
+    CuvsReplyHeader hdr;
+    if (recv_all(sock, &hdr, sizeof(hdr)) < 0)
+        goto cleanup;
+    rc = (int)hdr.status;
+    if (latency_us_out)
+        *latency_us_out = hdr.latency_us;
+    if (hdr.status != CUVS_STATUS_OK)
+        goto cleanup;
+
+    /* Daemon packs: n_results=Q, delta_merged=K (per-query result count),
+     * reply shm key in error[]. */
+    uint32_t Q = hdr.n_results;
+    uint32_t K = hdr.delta_merged;
+    strncpy(reply_key, hdr.error, sizeof(reply_key) - 1);
+    reply_key[sizeof(reply_key) - 1] = '\0';
+    if (Q != n_queries || K == 0 || (int)K > k || reply_key[0] == '\0')
+    {
+        rc = CUVS_STATUS_ERROR;
+        goto cleanup;
+    }
+
+    /* reply shm layout: [uint32 Q][uint32 K][tids Q*K u64][dists Q*K f32] */
+    size_t hdr_bytes  = 2 * sizeof(uint32_t);
+    size_t tids_bytes = (size_t)Q * (size_t)K * sizeof(uint64_t);
+    size_t dist_bytes = (size_t)Q * (size_t)K * sizeof(float);
+    rtotal = hdr_bytes + tids_bytes + dist_bytes;
+
+    reply_fd = shm_open(reply_key, O_RDONLY, 0666);
+    if (reply_fd < 0)
+        goto cleanup;
+    rmem = mmap(NULL, rtotal, PROT_READ, MAP_SHARED, reply_fd, 0);
+    if (rmem == MAP_FAILED)
+        goto cleanup;
+
+    {
+        const char *p = (const char *)rmem + hdr_bytes;
+        memcpy(tids_out, p,              tids_bytes);
+        memcpy(dist_out, p + tids_bytes, dist_bytes);
+    }
+    if (k_out)
+        *k_out = K;
+    rc = CUVS_STATUS_OK;
+
+cleanup:
+    if (rmem != MAP_FAILED) munmap(rmem, rtotal);
+    if (reply_fd >= 0)      close(reply_fd);
+    if (reply_key[0])       shm_unlink(reply_key);
+    if (shm_fd >= 0)        close(shm_fd);
+    shm_unlink(req_key);
+    if (sock >= 0)          close(sock);
     return rc;
 }
 

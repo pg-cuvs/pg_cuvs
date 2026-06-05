@@ -135,6 +135,48 @@ int cuvs_tids_write(FILE *f, int64_t n_vecs, uint32_t dim, uint32_t metric,
 int cuvs_tids_read(FILE *f, CuvsTidsHeader *hdr_out, uint64_t **tids_out);
 
 /* ----------------------------------------------------------------
+ * Versioned, checksummed .vectors sidecar (Phase 3L brute-force mode).
+ *
+ * Holds the raw row-major vector matrix so the daemon can build a resident
+ * GPU brute-force index (CuvsBfIndex) for exact search, independent of the
+ * CAGRA graph. Mirrors the .tids format: same header shape plus a crc32 over
+ * the body, little-endian only. base_tids_crc32 ties this sidecar to its
+ * build's .tids body_crc32 (generation token, like .delta/.shards): a REINDEX
+ * rewrites the .tids and changes that crc, so a torn build (new .tids, stale
+ * .vectors) is detected at load and brute_force fails closed until REINDEX.
+ *
+ * Layout: [CuvsVectorsHeader (36 bytes)] [n_vecs * dim * float32 body].
+ * LITTLE-ENDIAN ONLY, x86-64 daemon.
+ * ---------------------------------------------------------------- */
+#define CUVS_VECTORS_MAGIC   0x53434556u   /* 'VECS' little-endian */
+#define CUVS_VECTORS_VERSION 1u
+#define CUVS_VECTORS_MAX_DIM 65535u        /* sanity cap on dim (corrupt header) */
+
+typedef struct CuvsVectorsHeader {
+    uint32_t magic;
+    uint32_t version;
+    int64_t  n_vecs;
+    uint32_t dim;
+    uint32_t metric;
+    uint32_t body_crc32;      /* crc32 over n_vecs*dim*4 bytes of float body */
+    uint32_t base_tids_crc32; /* sibling .tids body_crc32 @ build (generation token) */
+    uint32_t reserved;        /* must be 0 */
+} CuvsVectorsHeader;          /* 36 bytes, LE-only, x86-64 daemon */
+
+/* Write header + float body to an open FILE*. base_tids_crc32 is the build's
+ * .tids body_crc32 (generation token). Returns 0 on success, -1 on a
+ * short/failed fwrite. Caller is responsible for fflush/fsync/rename. */
+int cuvs_vectors_write(FILE *f, int64_t n_vecs, uint32_t dim, uint32_t metric,
+                       uint32_t base_tids_crc32, const float *vecs);
+
+/* Read + validate a .vectors file from an open FILE*. On success returns 0,
+ * fills *hdr_out, and allocates *vecs_out via malloc (caller frees). Validates
+ * magic, version, n_vecs range (0 < n_vecs <= CUVS_TIDS_MAX_VECS), dim range
+ * (0 < dim <= CUVS_VECTORS_MAX_DIM), reserved==0, full body read, and body
+ * crc32. On any failure returns -1 and leaves *vecs_out NULL. */
+int cuvs_vectors_read(FILE *f, CuvsVectorsHeader *hdr_out, float **vecs_out);
+
+/* ----------------------------------------------------------------
  * Versioned, checksummed .shards manifest (Phase 3F multi-GPU sharding).
  *
  * Marks a logical CAGRA index as split into N standalone CAGRA shard
@@ -309,3 +351,25 @@ void cuvs_circuit_record_success(uint32_t index_oid); /* reset consecutive_error
 void cuvs_circuit_reset(uint32_t index_oid);          /* also clears open flag */
 int  cuvs_circuit_is_open(uint32_t index_oid);
 void cuvs_circuit_reset_all(void);                    /* zeroes all breaker state */
+
+/* ----------------------------------------------------------------
+ * Phase 3L-9: brute-force micro-batch grouping (pure, daemon + test).
+ *
+ * The daemon's BF batch worker collects concurrent brute_force requests and
+ * coalesces those targeting the SAME (db_oid, index_oid, precision, dim) into a
+ * single cuvs_bf_search_batch dispatch. cuvs_bf_batch_group is the pure
+ * indexing core (no threads, no CUDA): it assigns each request a group id so
+ * requests with an identical key share a group. Group ids are dense and
+ * assigned in first-seen order. O(n^2) but n is bounded by the batch cap.
+ * ---------------------------------------------------------------- */
+typedef struct CuvsBfKey {
+    uint32_t db_oid;
+    uint32_t index_oid;
+    uint32_t precision;   /* 0=float32, 1=float16 */
+    uint32_t dim;
+} CuvsBfKey;
+
+/* group_id_out[i] = group of request i (requests with equal keys share it);
+ * *n_groups_out = number of distinct keys. group_id_out must hold n ints. */
+void cuvs_bf_batch_group(const CuvsBfKey *keys, int n,
+                         int *group_id_out, int *n_groups_out);

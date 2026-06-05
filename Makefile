@@ -15,7 +15,7 @@ EXTVERSION     = 0.1.0
 DATA           = sql/pg_cuvs--$(EXTVERSION).sql \
                  sql/pg_cuvs--0.1.0--0.2.0.sql
 MODULE_big     = pg_cuvs
-REGRESS        = smoke cpu_fallback edge_cases cpu_hnsw_fallback build_hnsw build_hnsw_edge pg_cuvs_hnsw metrics
+REGRESS        = smoke cpu_fallback edge_cases cpu_hnsw_fallback build_hnsw build_hnsw_edge pg_cuvs_hnsw metrics brute_force pg_cuvs_batch
 REGRESS_OPTS   = --inputdir=test --outputdir=test
 
 # C source files + the CUDA-compiled wrapper (built below by nvcc).
@@ -47,6 +47,13 @@ SHLIB_LINK     = -L$(CUVS_LIB) -lcuvs -lcudart \
 PG_CONFIG     ?= pg_config
 PGXS         := $(shell $(PG_CONFIG) --pgxs)
 include $(PGXS)
+
+# PGXS's implicit .c->.o rule does NOT track header dependencies, so a change to
+# a shared header (e.g. a wire struct in cuvs_ipc.h) would otherwise leave stale
+# extension objects linked against the old layout — an ABI mismatch vs the
+# daemon. Force every extension object to rebuild when ANY project header
+# changes. (The server objects already list their header prereqs explicitly.)
+$(OBJS): $(wildcard src/*.h)
 
 # Build CUDA object before linking the .so. Pattern rule overrides PGXS
 # default for this specific file since .cu needs nvcc, not gcc.

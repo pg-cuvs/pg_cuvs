@@ -250,6 +250,78 @@ cuvs_tids_read(FILE *f, CuvsTidsHeader *hdr_out, uint64_t **tids_out)
 }
 
 /* ----------------------------------------------------------------
+ * Versioned .vectors sidecar I/O (Phase 3L brute-force mode).
+ * Mirrors cuvs_tids_write/read; body is the row-major float matrix.
+ * ---------------------------------------------------------------- */
+int
+cuvs_vectors_write(FILE *f, int64_t n_vecs, uint32_t dim, uint32_t metric,
+                   uint32_t base_tids_crc32, const float *vecs)
+{
+    CuvsVectorsHeader hdr;
+    size_t body_n = (size_t)n_vecs * (size_t)dim;
+
+    hdr.magic           = CUVS_VECTORS_MAGIC;
+    hdr.version         = CUVS_VECTORS_VERSION;
+    hdr.n_vecs          = n_vecs;
+    hdr.dim             = dim;
+    hdr.metric          = metric;
+    hdr.body_crc32      = cuvs_crc32(vecs, body_n * sizeof(float));
+    hdr.base_tids_crc32 = base_tids_crc32;
+    hdr.reserved        = 0;
+
+    if (fwrite(&hdr, sizeof(hdr), 1, f) != 1)
+        return -1;
+    if (fwrite(vecs, sizeof(float), body_n, f) != body_n)
+        return -1;
+    return 0;
+}
+
+int
+cuvs_vectors_read(FILE *f, CuvsVectorsHeader *hdr_out, float **vecs_out)
+{
+    CuvsVectorsHeader hdr;
+    size_t body_n;
+    float *vecs;
+
+    *vecs_out = NULL;
+
+    if (fread(&hdr, sizeof(hdr), 1, f) != 1)
+        return -1;
+    if (hdr.magic != CUVS_VECTORS_MAGIC)
+        return -1;
+    if (hdr.version != CUVS_VECTORS_VERSION)
+        return -1;
+    if (hdr.n_vecs <= 0 || hdr.n_vecs > CUVS_TIDS_MAX_VECS)
+        return -1;
+    if (hdr.dim == 0 || hdr.dim > CUVS_VECTORS_MAX_DIM)
+        return -1;
+    /* reserved must be 0 (forward-compat, like .tids). */
+    if (hdr.reserved != 0)
+        return -1;
+
+    body_n = (size_t)hdr.n_vecs * (size_t)hdr.dim;
+    vecs = malloc(body_n * sizeof(float));
+    if (!vecs)
+        return -1;
+
+    if (fread(vecs, sizeof(float), body_n, f) != body_n)
+    {
+        free(vecs);
+        return -1;
+    }
+    if (cuvs_crc32(vecs, body_n * sizeof(float)) != hdr.body_crc32)
+    {
+        free(vecs);
+        return -1;
+    }
+
+    if (hdr_out)
+        *hdr_out = hdr;
+    *vecs_out = vecs;
+    return 0;
+}
+
+/* ----------------------------------------------------------------
  * Versioned .shards manifest I/O (Phase 3F multi-GPU sharding).
  * ---------------------------------------------------------------- */
 int
@@ -582,4 +654,35 @@ cuvs_circuit_reset_all(void)
 {
     memset(cuvs_circuit_breakers, 0, sizeof(cuvs_circuit_breakers));
     cuvs_n_circuit_breakers = 0;
+}
+
+/* ----------------------------------------------------------------
+ * Phase 3L-9: brute-force micro-batch grouping (pure).
+ * ---------------------------------------------------------------- */
+void
+cuvs_bf_batch_group(const CuvsBfKey *keys, int n,
+                    int *group_id_out, int *n_groups_out)
+{
+    int ng = 0;
+    for (int i = 0; i < n; i++)
+    {
+        int g = -1;
+        /* Reuse the group of the first earlier request with an identical key. */
+        for (int j = 0; j < i; j++)
+        {
+            if (keys[j].db_oid    == keys[i].db_oid &&
+                keys[j].index_oid == keys[i].index_oid &&
+                keys[j].precision == keys[i].precision &&
+                keys[j].dim       == keys[i].dim)
+            {
+                g = group_id_out[j];
+                break;
+            }
+        }
+        if (g < 0)
+            g = ng++;               /* new key -> next dense, first-seen group id */
+        group_id_out[i] = g;
+    }
+    if (n_groups_out)
+        *n_groups_out = ng;
 }

@@ -26,6 +26,9 @@
 #include "access/amapi.h"
 #include "access/heapam.h"
 #include "access/tableam.h"
+#include "access/table.h"          /* table_open/table_close (Phase 3M) */
+#include "access/relation.h"       /* index_open/index_close (Phase 3M) */
+#include "utils/array.h"           /* deconstruct_array, ARR_ELEMTYPE (Phase 3M) */
 #include "catalog/index.h"
 #include "catalog/namespace.h"
 #include "catalog/pg_type.h"
@@ -93,6 +96,22 @@ char *cuvs_snapshot_uri            = NULL;  /* "gs://bucket[/prefix]" — empty 
 char *cuvs_cluster_id              = NULL;  /* multi-node identifier for GCS path (Phase 3C) */
 char *cuvs_gcs_key_file            = NULL;  /* service account JSON path; "" = instance metadata (Phase 3C) */
 int   cuvs_warmup_threads          = 2;    /* background download/load threads in daemon (Phase 3D) */
+int   cuvs_search_mode             = 0;    /* 0=cagra (default), 1=brute_force (Phase 3L) */
+int   cuvs_bf_precision            = 0;    /* 0=float32 (default), 1=float16 (Phase 3L) */
+int   cuvs_bf_batch_wait_us        = 0;    /* daemon BF micro-batch window μs; 0=off (Phase 3L) */
+int   cuvs_max_batch_queries       = 1024; /* pg_cuvs_batch_search Q cap (Phase 3M) */
+
+/* Enum option tables for the Phase 3L GUCs (string in SQL, mapped to int in C). */
+static const struct config_enum_entry cuvs_search_mode_options[] = {
+    {"cagra",       0, false},
+    {"brute_force", 1, false},
+    {NULL, 0, false}
+};
+static const struct config_enum_entry cuvs_bf_precision_options[] = {
+    {"float32", 0, false},
+    {"float16", 1, false},
+    {NULL, 0, false}
+};
 
 /* ----------------------------------------------------------------
  * Last-search stats (process-local; one slot per backend)
@@ -298,6 +317,52 @@ _PG_init(void)
         "gpu (2): GPU-only, no CPU fallback (may miss delta rows).",
         &cuvs_delta_search_mode,
         0, 0, 2,
+        PGC_USERSET,
+        0, NULL, NULL, NULL);
+
+    DefineCustomEnumVariable(
+        "cuvs.search_mode",
+        "Search algorithm for cagra indexes: cagra (ANN, default) or brute_force (GPU exact).",
+        "Phase 3L. brute_force runs an exact GPU k-NN over the index's .vectors "
+        "sidecar (recall=1.0) instead of the CAGRA graph; useful for small indexes, "
+        "ground-truth generation, or when CAGRA recall is insufficient. Requires the "
+        ".vectors sidecar, which CREATE INDEX USING cagra writes automatically.",
+        &cuvs_search_mode,
+        0,
+        cuvs_search_mode_options,
+        PGC_USERSET,
+        0, NULL, NULL, NULL);
+
+    DefineCustomEnumVariable(
+        "cuvs.bf_precision",
+        "Numeric precision of the resident GPU brute-force index: float32 (default) or float16.",
+        "Phase 3L. float16 halves the brute-force VRAM footprint and raises throughput "
+        "at a small recall cost. Only affects cuvs.search_mode='brute_force'. Changing it "
+        "rebuilds the resident BF index on the next brute_force search.",
+        &cuvs_bf_precision,
+        0,
+        cuvs_bf_precision_options,
+        PGC_USERSET,
+        0, NULL, NULL, NULL);
+
+    DefineCustomIntVariable(
+        "cuvs.bf_batch_wait_us",
+        "Daemon brute-force micro-batch window in microseconds (0 = disabled).",
+        "Phase 3L. When > 0, the daemon coalesces concurrent brute_force search "
+        "requests arriving within this window into a single GPU dispatch, raising "
+        "throughput for bandwidth-bound BF search. 0 dispatches each request immediately.",
+        &cuvs_bf_batch_wait_us,
+        0, 0, 10000,
+        PGC_USERSET,
+        0, NULL, NULL, NULL);
+
+    DefineCustomIntVariable(
+        "cuvs.max_batch_queries",
+        "Maximum number of query vectors accepted by pg_cuvs_batch_search in one call.",
+        "Phase 3M. Bounds the request/reply shared-memory size (Q*dim*4 in, Q*k*12 out). "
+        "A call with more than this many queries raises an error.",
+        &cuvs_max_batch_queries,
+        1024, 1, 4096,
         PGC_USERSET,
         0, NULL, NULL, NULL);
 
@@ -763,6 +828,19 @@ cuvsamcostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
     {
         *indexStartupCost = 1e15;
         *indexTotalCost   = 1e15;
+    }
+    else if (cuvs_search_mode == 1)
+    {
+        /* Phase 3L (ADR-039): brute_force is exact GPU k-NN — latency is
+         * bandwidth-bound in the corpus size N, not in cuvs.k. Model it as a
+         * small N-scaled cost with no per-k term; still far below a disabled
+         * seqscan so the GPU path is chosen whenever the user opts into
+         * brute_force. A missing .vectors sidecar is NOT gated here: it surfaces
+         * as a clear ERROR at execution, not a silent CPU fallback. */
+        double n = path->indexinfo->rel->tuples;
+        if (n < 1) n = 1;
+        *indexStartupCost = CUVS_STARTUP_COST;
+        *indexTotalCost   = CUVS_STARTUP_COST + CUVS_ROWS_COST * n;
     }
     else
     {
@@ -1481,6 +1559,9 @@ cuvs_gettuple(IndexScanDesc scan, ScanDirection dir)
             (uint32_t)cuvs_shard_overfetch,
             cuvs_parallel_fanout ? 1 : 0,
             cuvs_cpu_hnsw_fallback ? 1 : 0,  /* Phase 3I-1 */
+            (uint32_t)cuvs_search_mode,      /* Phase 3L: 0=cagra, 1=brute_force */
+            (uint32_t)cuvs_bf_precision,     /* Phase 3L: 0=float32, 1=float16 */
+            (uint32_t)cuvs_bf_batch_wait_us, /* Phase 3L: BF micro-batch window μs */
             ss->tids,
             ss->distances,
             &ss->n_results,
@@ -1495,7 +1576,8 @@ cuvs_gettuple(IndexScanDesc scan, ScanDirection dir)
              * (daemon crash after planning) — counts so the breaker opens and
              * subsequent queries replan to CPU via the socket-existence gate. */
             if (rc != CUVS_STATUS_DIM_MISMATCH
-                && rc != CUVS_STATUS_METRIC_MISMATCH && rc != CUVS_STATUS_STALE)
+                && rc != CUVS_STATUS_METRIC_MISMATCH && rc != CUVS_STATUS_STALE
+                && rc != CUVS_STATUS_NO_VECTORS)
                 cuvs_circuit_record_error((uint32_t)index_oid,
                                           cuvs_circuit_breaker_threshold);
 
@@ -1560,6 +1642,17 @@ cuvs_gettuple(IndexScanDesc scan, ScanDirection dir)
                              errmsg("pg_cuvs: cagra index not loaded on GPU daemon; "
                                     "retry will use CPU while breaker is open"),
                              errhint("REINDEX the index to reload it on the daemon.")));
+                    break;
+                case CUVS_STATUS_NO_VECTORS:
+                    /* Phase 3L: brute_force requested but the .vectors sidecar is
+                     * missing or stale. User/config error — fail loudly with
+                     * guidance rather than silently returning ANN/no rows. */
+                    ereport(ERROR,
+                            (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+                             errmsg("pg_cuvs: brute_force search requires a .vectors "
+                                    "sidecar that is missing or stale for this index"),
+                             errhint("REINDEX the index to (re)build the brute_force "
+                                     "vector sidecar, or SET cuvs.search_mode='cagra'.")));
                     break;
                 default:
                     ereport(ERROR,
@@ -2070,7 +2163,7 @@ pg_cuvs_last_search_metric(PG_FUNCTION_ARGS)
  * the view must stay queryable while the daemon restarts. (See plan: a
  * future liveness column can distinguish "down" from "idle".)
  * ---------------------------------------------------------------- */
-#define GPU_STATS_NCOLS 34
+#define GPU_STATS_NCOLS 35
 
 static const char *
 cuvs_metric_name(uint32_t metric)
@@ -2082,6 +2175,223 @@ cuvs_metric_name(uint32_t metric)
         case CUVS_METRIC_IP:     return "ip";
         default:                 return "unknown";
     }
+}
+
+/* ----------------------------------------------------------------
+ * Phase 3M: pg_cuvs_batch_search(rel regclass, queries vector[], k int)
+ *   RETURNS TABLE(query_idx int, ctid tid, distance float4)
+ *
+ * Sends Q queries to the daemon in one IPC round-trip (one batched GPU
+ * dispatch) and returns up to K = min(k, n_vecs) neighbors per query. Mirrors
+ * the single-query semantics: raw ctids + daemon distance, no internal heap
+ * visibility filtering (the caller JOINs on ctid for MVCC, exactly like the AM
+ * scan sets xs_recheck). Honors cuvs.search_mode / cuvs.bf_precision, so it
+ * works in brute_force mode too once a .vectors sidecar exists.
+ * ---------------------------------------------------------------- */
+PG_FUNCTION_INFO_V1(pg_cuvs_batch_search);
+Datum
+pg_cuvs_batch_search(PG_FUNCTION_ARGS)
+{
+    ReturnSetInfo  *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+    TupleDesc       tupdesc;
+    Tuplestorestate *tupstore;
+    MemoryContext   per_query_ctx, oldcontext;
+
+    Oid        table_oid = PG_GETARG_OID(0);
+    ArrayType *qarr      = PG_GETARG_ARRAYTYPE_P(1);
+    int        k         = PG_GETARG_INT32(2);
+
+    if (rsinfo == NULL || !IsA(rsinfo, ReturnSetInfo))
+        ereport(ERROR,
+                (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                 errmsg("set-valued function called in context that cannot accept a set")));
+    if (!(rsinfo->allowedModes & SFRM_Materialize))
+        ereport(ERROR,
+                (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                 errmsg("materialize mode required, but it is not allowed in this context")));
+    if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+        ereport(ERROR,
+                (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                 errmsg("return type must be a row type")));
+
+    if (k < 1 || k > 2000)
+        ereport(ERROR,
+                (errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
+                 errmsg("pg_cuvs_batch_search: k must be between 1 and 2000")));
+
+    /* --- Resolve the USING cagra index on the table. --- */
+    Relation  heapRel = table_open(table_oid, AccessShareLock);
+    List     *indexes = RelationGetIndexList(heapRel);
+    Oid       cagra_am = get_am_oid("cagra", true);
+    Oid       index_oid = InvalidOid;
+    ListCell *lc;
+
+    foreach(lc, indexes)
+    {
+        Oid       io = lfirst_oid(lc);
+        Relation  ir = index_open(io, AccessShareLock);
+        bool      is_cagra = (OidIsValid(cagra_am) && ir->rd_rel->relam == cagra_am);
+        index_close(ir, AccessShareLock);
+        if (is_cagra) { index_oid = io; break; }
+    }
+    list_free(indexes);
+    if (!OidIsValid(index_oid))
+    {
+        table_close(heapRel, AccessShareLock);
+        ereport(ERROR,
+                (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+                 errmsg("pg_cuvs_batch_search: no \"USING cagra\" index on relation \"%s\"",
+                        get_rel_name(table_oid))));
+    }
+
+    {
+        Relation indexRel = index_open(index_oid, AccessShareLock);
+        uint32_t metric   = cuvs_index_metric(indexRel);
+        index_close(indexRel, AccessShareLock);
+        table_close(heapRel, AccessShareLock);
+
+        /* --- Deconstruct queries vector[] into a row-major float buffer. --- */
+        Oid    elemtype = ARR_ELEMTYPE(qarr);
+        int16  elmlen;
+        bool   elmbyval;
+        char   elmalign;
+        Datum *elems;
+        bool  *elnulls;
+        int    Q;
+        int    dim = 0;
+        float *qbuf = NULL;
+
+        get_typlenbyvalalign(elemtype, &elmlen, &elmbyval, &elmalign);
+        deconstruct_array(qarr, elemtype, elmlen, elmbyval, elmalign,
+                          &elems, &elnulls, &Q);
+
+        if (Q < 1)
+            ereport(ERROR,
+                    (errcode(ERRCODE_DATA_EXCEPTION),
+                     errmsg("pg_cuvs_batch_search: queries array is empty")));
+        if (Q > cuvs_max_batch_queries)
+            ereport(ERROR,
+                    (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+                     errmsg("pg_cuvs_batch_search: %d queries exceeds cuvs.max_batch_queries (%d)",
+                            Q, cuvs_max_batch_queries)));
+
+        for (int q = 0; q < Q; q++)
+        {
+            PgVector *v;
+            if (elnulls[q])
+                ereport(ERROR,
+                        (errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+                         errmsg("pg_cuvs_batch_search: NULL query vector at index %d", q)));
+            v = DatumGetPgVector(elems[q]);
+            if (q == 0)
+            {
+                dim  = (int) v->dim;
+                qbuf = palloc((size_t) Q * (size_t) dim * sizeof(float));
+            }
+            else if ((int) v->dim != dim)
+                ereport(ERROR,
+                        (errcode(ERRCODE_DATA_EXCEPTION),
+                         errmsg("pg_cuvs_batch_search: query %d has dim %d, expected %d",
+                                q, (int) v->dim, dim)));
+            memcpy(qbuf + (size_t) q * dim, v->x, (size_t) dim * sizeof(float));
+        }
+
+        /* --- One IPC round-trip; honors search_mode / bf_precision. --- */
+        {
+            uint64_t *tids = palloc((size_t) Q * (size_t) k * sizeof(uint64_t));
+            float    *dists = palloc((size_t) Q * (size_t) k * sizeof(float));
+            uint32_t  Kout = 0, latency_us = 0;
+            int rc = cuvs_ipc_search_batch(
+                cuvs_socket_path, (uint32_t) MyDatabaseId, (uint32_t) index_oid,
+                qbuf, (uint32_t) Q, dim, k, metric,
+                (uint32_t) cuvs_shard_overfetch, cuvs_parallel_fanout ? 1 : 0,
+                (uint32_t) cuvs_search_mode, (uint32_t) cuvs_bf_precision,
+                tids, dists, &Kout, &latency_us);
+
+            if (rc != CUVS_STATUS_OK)
+            {
+                switch (rc)
+                {
+                    case CUVS_STATUS_NO_VECTORS:
+                        ereport(ERROR,
+                                (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+                                 errmsg("pg_cuvs_batch_search: brute_force requires a .vectors "
+                                        "sidecar that is missing or stale for this index"),
+                                 errhint("REINDEX the index, or SET cuvs.search_mode='cagra'.")));
+                        break;
+                    case CUVS_STATUS_DIM_MISMATCH:
+                        ereport(ERROR,
+                                (errcode(ERRCODE_DATA_EXCEPTION),
+                                 errmsg("pg_cuvs_batch_search: query dim %d does not match the "
+                                        "cagra index dimension", dim)));
+                        break;
+                    case CUVS_STATUS_METRIC_MISMATCH:
+                        ereport(ERROR,
+                                (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+                                 errmsg("pg_cuvs_batch_search: index built with a different metric "
+                                        "than this query's operator class"),
+                                 errhint("REINDEX the index.")));
+                        break;
+                    case CUVS_STATUS_STALE:
+                        ereport(ERROR,
+                                (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+                                 errmsg("pg_cuvs_batch_search: cagra index is stale (writes since build)"),
+                                 errhint("REINDEX the index.")));
+                        break;
+                    case CUVS_STATUS_UNAVAILABLE:
+                        ereport(ERROR,
+                                (errcode(ERRCODE_CONNECTION_FAILURE),
+                                 errmsg("pg_cuvs_batch_search: GPU daemon unavailable")));
+                        break;
+                    case CUVS_STATUS_NOT_FOUND:
+                        ereport(ERROR,
+                                (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+                                 errmsg("pg_cuvs_batch_search: cagra index not loaded on the GPU daemon"),
+                                 errhint("REINDEX the index to reload it on the daemon.")));
+                        break;
+                    default:
+                        ereport(ERROR,
+                                (errcode(ERRCODE_INTERNAL_ERROR),
+                                 errmsg("pg_cuvs_batch_search: batch search failed (status %d)", rc)));
+                        break;
+                }
+            }
+
+            /* --- Materialize (query_idx, ctid, distance) rows. --- */
+            per_query_ctx = rsinfo->econtext->ecxt_per_query_memory;
+            oldcontext = MemoryContextSwitchTo(per_query_ctx);
+            tupstore = tuplestore_begin_heap(true, false, work_mem);
+            rsinfo->returnMode = SFRM_Materialize;
+            rsinfo->setResult  = tupstore;
+            rsinfo->setDesc    = tupdesc;
+            MemoryContextSwitchTo(oldcontext);
+
+            for (int q = 0; q < Q; q++)
+            {
+                for (uint32_t j = 0; j < Kout; j++)
+                {
+                    uint64_t        tid = tids[(size_t) q * Kout + j];
+                    uint32_t        blk;
+                    uint16_t        off;
+                    ItemPointerData iptr;
+                    Datum           values[3];
+                    bool            isnull[3] = {false, false, false};
+
+                    if (tid == 0)
+                        continue;   /* sentinel: this query had fewer than K neighbors */
+
+                    cuvs_tid_decode(tid, &blk, &off);
+                    ItemPointerSet(&iptr, blk, off);
+                    values[0] = Int32GetDatum(q);
+                    values[1] = PointerGetDatum(&iptr);
+                    values[2] = Float4GetDatum(dists[(size_t) q * Kout + j]);
+                    tuplestore_putvalues(tupstore, tupdesc, values, isnull);
+                }
+            }
+        }
+    }
+
+    return (Datum) 0;
 }
 
 PG_FUNCTION_INFO_V1(pg_cuvs_gpu_search_stats);
@@ -2211,10 +2521,14 @@ pg_cuvs_gpu_search_stats(PG_FUNCTION_ARGS)
         /* Phase 3F: shard count (0/1 = unsharded). */
         values[32] = Int32GetDatum((int32) s->shard_count);
 
-        /* Phase 3I-1: last search mode for this index. */
+        /* Phase 3I-1 / 3L: last search mode for this index. */
         values[33] = CStringGetTextDatum(
             s->search_mode == 1 ? "cpu_hnsw" :
-            s->search_mode == 2 ? "cpu_fallback" : "gpu_cagra");
+            s->search_mode == 2 ? "cpu_fallback" :
+            s->search_mode == 3 ? "brute_force" : "gpu_cagra");
+
+        /* Phase 3L-9: coalesced brute_force micro-batch dispatch count. */
+        values[34] = Int64GetDatum((int64) s->bf_batch_count);
 
         tuplestore_putvalues(tupstore, tupdesc, values, nulls);
     }
@@ -2227,7 +2541,7 @@ pg_cuvs_gpu_search_stats(PG_FUNCTION_ARGS)
  * backing the pg_stat_gpu_cache view. One row normally; zero rows when the
  * daemon is unreachable (same convention as pg_stat_gpu_search).
  * ---------------------------------------------------------------- */
-#define GPU_CACHE_NCOLS 9
+#define GPU_CACHE_NCOLS 11
 
 PG_FUNCTION_INFO_V1(pg_cuvs_gpu_cache_stats);
 Datum
@@ -2284,6 +2598,9 @@ pg_cuvs_gpu_cache_stats(PG_FUNCTION_ARGS)
                 values[6] = Int32GetDatum((int32) cs->resident_count);
                 values[7] = Int64GetDatum((int64) (cs->vram_used_bytes / (1024 * 1024)));
                 values[8] = Int64GetDatum((int64) (cs->vram_budget_bytes / (1024 * 1024)));
+                /* Phase 3L: resident brute-force index VRAM + precision. */
+                values[9] = Int64GetDatum((int64) (cs->bf_vram_bytes / (1024 * 1024)));
+                values[10] = CStringGetTextDatum(cs->bf_precision == 1 ? "float16" : "float32");
                 tuplestore_putvalues(tupstore, tupdesc, values, nulls);
             }
         }

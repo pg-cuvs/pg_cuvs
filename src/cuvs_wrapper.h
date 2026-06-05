@@ -61,6 +61,12 @@ int cuvs_brute_force_search(
  * `.delta` vectors. metric is a CUVS_METRIC_* value (same scale as the CAGRA
  * base index). cuvs_bf_search returns 0 on success, 2 on dim mismatch, 1 on
  * other failure; top_k must be <= the corpus size the index was built with.
+ *
+ * Phase 3L: `precision` selects the resident numeric type — 0 = float32,
+ * 1 = float16. float16 halves the dataset VRAM and raises throughput; the
+ * search path converts the query to the matching type. The `.vectors` sidecar
+ * on disk is always float32; precision only affects the device-resident copy.
+ * The delta cache always uses float32 (precision=0) for CPU-exact equivalence.
  */
 typedef void *CuvsBfIndex;
 
@@ -69,6 +75,7 @@ CuvsBfIndex cuvs_bf_build(
     int64_t      n,
     int          dim,
     uint32_t     metric,
+    uint32_t     precision,   /* 0 = float32, 1 = float16 */
     int          device_id
 );
 
@@ -111,6 +118,35 @@ int cuvs_cagra_search(
 );
 
 void cuvs_cagra_free(CuvsCagraIndex index, int device_id);
+
+/*
+ * Phase 3M: batched search — n_queries queries in one GPU dispatch.
+ * queries is [n_queries][dim] row-major; results is [n_queries][top_k] row-major
+ * (results[q*top_k + j] = j-th neighbor of query q). cuVS cagra/brute_force
+ * search accept a Q×dim query matrix, so the whole batch is one kernel launch.
+ * Caller must pass top_k <= corpus size. cuvs_bf_search_batch pads any tail
+ * slots [n, top_k) with item_id = -1 when the BF corpus has fewer than top_k
+ * vectors. Both return 0 on success, 2 on dim mismatch, 1 on other failure.
+ */
+int cuvs_cagra_search_batch(
+    CuvsCagraIndex   index,
+    const float     *queries,
+    int              n_queries,
+    int              dim,
+    int              top_k,
+    CuvsSearchResult *results,
+    int              device_id
+);
+
+int cuvs_bf_search_batch(
+    CuvsBfIndex      index,
+    const float     *queries,
+    int              n_queries,
+    int              dim,
+    int              top_k,
+    CuvsSearchResult *results,
+    int              device_id
+);
 
 /*
  * cuVS CPU HNSW index (Phase 3I-1)
