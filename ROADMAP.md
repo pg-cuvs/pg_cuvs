@@ -14,15 +14,16 @@
 | 3E/3F/3G | Multi-GPU sharding (placement, parallel fanout, auto shard count, DROP cleanup, snapshot, delta cache, eviction) |
 | 3I | GPU Build Accelerator — CAGRA→pgvector HNSW export (`pg_cuvs_build_hnsw`), CPU HNSW fallback, GPU-less dump/restore |
 | 3K | `CREATE INDEX ... USING pg_cuvs_hnsw` DDL 전환 + `source` optional(heap에서 ephemeral CAGRA 빌드) + metric 선검증. `pg_cuvs_build_hnsw()` deprecate. installcheck 8/8 (ADR-038/041) |
+| 3L | GPU brute force 검색 모드 (`.vectors` sidecar, `search_mode`/`bf_precision` GUC, micro-batching, sharded BF). installcheck 11/11, recall@10=1.0 (ADR-039) |
+| 3M | 배치 검색 API (`CUVS_OP_SEARCH_BATCH`, `pg_cuvs_batch_search` SRF, CAGRA/BF/sharded 지원). installcheck 11/11, Q×K top-k 일치 (ADR-040) |
 | 3H-full | 운영 runbook 4종 추가 (capacity-planning, replica-bootstrap, release-upgrade, benchmark-runbook) + 기존 3H-light. TBD: streaming 물리복제 / cross-version upgrade 검증 |
 | 3B | DiskANN/NVMe cold tier — **NO-GO** (cuVS 26.04 PQFlash 미완성, 재검토 조건: 1B+ 수요 또는 cuVS stable) |
+| 하드닝 | `index_dir` reloption — cross-session seqscan 폴백 근절. 인덱스가 빌드 디렉터리를 `pg_class.reloptions`에 self-describe (reloption > 세션 GUC > `$PGDATA` 3단계). installcheck 11/11, no-GUC 연결에서 Index Scan 실증 (ADR-045) |
 
 ### 미완료
 
 | Phase | 내용 | Wave |
 |-------|------|------|
-| 3L | GPU brute force 검색 모드 (`cuvs.search_mode='brute_force'`) | 2 |
-| 3M | 배치 검색 API (`pg_cuvs_batch_search`) | 2 |
 | 3A | Pending delta / delta exact search | 3 |
 | 4A-1 | CAGRA 빌드 double memcpy 제거 | 4 |
 | 4A-2 | parallel maintenance workers | 4 |
