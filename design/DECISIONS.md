@@ -1597,3 +1597,49 @@ pg_cuvs의 데이터 경로(빌드/검색/export)에서 PG backend - daemon - GP
 
 - Nsight Compute (ncu): 거부 — 커널 내부 warp/SM 레벨 최적화용이며, 현 단계에서는 커널 간(IPC vs GPU vs memcpy) 비용 분배가 우선이다. nsys가 적합하다.
 - dtrace/SystemTap: 거부 — perf로 충분한 범위를 커버하고, 추가 도구의 설치/학습 비용이 불필요하다. A100 VM은 Linux이므로 perf가 네이티브 지원된다.
+
+## ADR-045 — 인덱스 self-describing: `index_dir` reloption (cross-session seqscan 폴백 근절)
+
+**날짜**: 2026-06-05
+**상태**: 구현 완료
+
+### 배경
+
+같은 유효한 cagra 인덱스에 대해, 인덱스를 빌드한 세션은 GPU `Index Scan`을 받는데 **별도 연결**은 동일 쿼리에 `Seq Scan`으로 폴백하는 현상이 관측됐다. 근본 원인을 코드 분석 + AI council(Codex 교차검증)으로 확정했다:
+
+- 플래너 비용함수 `cuvsamcostestimate()`의 8개 `gpu_off` 게이트 중 `cuvs_index_has_artifact()` 등은 `get_index_dir()/<db>_<idx>.<ext>` 경로의 아티팩트(`.tids` 등)를 `stat`한다.
+- `get_index_dir()`는 **세션-로컬 GUC** `cuvs.index_dir`(`PGC_SUSET`)를 읽고, 비어 있으면 `$PGDATA/cuvs_indexes`로 폴백한다.
+- 빌드 세션 A가 `SET cuvs.index_dir='/tmp/cuvs_indexes'`로 빌드하면 데몬은 거기에 아티팩트를 기록한다. GUC를 설정하지 않은 별도 세션 B는 `get_index_dir()`가 `$PGDATA/cuvs_indexes`를 반환 → 엉뚱한 디렉터리를 `stat` → `!has_artifact`로 `gpu_off` 발동 → cost `1e15` → Seq Scan.
+
+핵심 진단: **디렉터리 해석은 프로세스-로컬 상태인데, 아티팩트는 `(db_oid, index_oid)`로만 키잉되는 영속 cross-backend 상태**다. 영속·공유 아티팩트의 위치를 프로세스-로컬 설정으로 해석하면, 설정을 맞추지 않은 백엔드는 조용히 폴백한다(silent degrade). 실행(search)은 데몬이 자기 `g_index_dir`+VRAM 캐시로 서빙하므로 영향이 없고, **플래너 게이트 한정** 버그다.
+
+### 결정
+
+인덱스를 **자기서술(self-describing)** 하게 만든다 — CAGRA AM에 `index_dir` **reloption**을 추가하여 빌드 당시 디렉터리를 `pg_class.reloptions`(카탈로그, cross-backend stable)에 영속한다. 디렉터리 해석은 **3단계 우선순위**:
+
+1. 인덱스 `index_dir` reloption (카탈로그 영속 — 세션 GUC와 무관)
+2. 세션 GUC `cuvs.index_dir`
+3. `$PGDATA/cuvs_indexes` 폴백
+
+(2)+(3)은 기존 `get_index_dir()` 그대로다. reloption이 없으면 `rd_options==NULL`로 기존 경로를 타므로 **순수 additive**(기존 인덱스/테스트 무회귀, byte-identical).
+
+구현 요점:
+- reloption 인프라는 `pg_cuvs_hnsw` AM의 기존 기계(`add_reloption_kind`/`add_string_reloption`/`build_reloptions`/`amoptions`)를 미러링한다(`src/pg_cuvs.c`의 `CuvsCagraOptions`, `cuvs_cagra_init_reloptions`, `cuvs_cagra_amoptions`). 빌드-타임 불변이므로 `AccessExclusiveLock`.
+- 리졸버 3종: `cuvs_reloption_index_dir(Relation)`(rd_options 직접 읽기), `cuvs_resolve_index_dir_rel(Relation)`(빌드/인서트/벌크삭제 — relcache open 불필요), `cuvs_resolve_index_dir(Oid)`(플래너 게이트·공유 path builder — `try_index_open(oid, NoLock)`).
+- **플래너에서 reloption 읽기**: `IndexOptInfo`에는 `rd_options`가 없으므로 게이트는 relcache를 열어야 한다. cost-estimation 시점에 플래너가 이미 `get_relation_info()`에서 같은 엔트리를 열어 락을 transitive하게 보유하므로 `try_index_open(oid, **NoLock**)`은 refcount-only relcache lookup이다 — IPC/CUDA/lock-manager 트래픽 없음, 게이트가 이미 수행하는 `stat()`/`fread()`보다 훨씬 저렴. 동시 DROP 레이스는 `try_index_open`이 NULL 반환 → 폴백으로 방어. 결과 문자열은 close 전에 static 버퍼로 복사해 dangling을 방지.
+- `get_index_dir()` 9개 호출부 스왑: 6개 Oid-게이트/공유 helper → `cuvs_resolve_index_dir(index_oid)`; 3개 Relation 사이트(빌드 `cuvs_ipc_build` 인자, `.relfilenode` write, ambulkdelete tids read) → `cuvs_resolve_index_dir_rel(indexRel)`. per-row aminsert/ambulkdelete writer는 공유 helper를 통해 reloption 해석을 transitive하게 상속(relcache lookup은 기존 per-row flock+파일 I/O 대비 무시 가능).
+
+### 결과
+
+- VM(A100-40GB, PG16) `make installcheck` **11/11** — 기존 10개 byte-identical(무회귀, reloption 부재 시 GUC 경로 불변) + 신규 `reloption_dir` GREEN.
+- **Cross-session 실증**(별도 연결, `SHOW cuvs.index_dir` = empty):
+  - `WITH (index_dir='/tmp/cuvs_indexes')`로 빌드한 인덱스 → `Index Scan`(reloption이 카탈로그에서 빌드-타임 디렉터리 해석). **수정됨**.
+  - 세션 GUC만으로 빌드한(no reloption) 인덱스 → `Seq Scan`(게이트가 `$PGDATA`를 보고 `/tmp`의 아티팩트를 못 찾음). 비-reloption 인덱스에는 footgun이 잔존 → reloption 사용이 권장 패턴임을 확인.
+- 변경 파일: `src/pg_cuvs.c`(reloption 인프라 + 리졸버 3종 + 9 스왑), `test/sql/reloption_dir.sql` + `test/expected/reloption_dir.out`, `Makefile`(REGRESS). IPC ABI/온디스크 포맷/SQL 시그니처/`.control` **무변경**, 마이그레이션 없음.
+
+### 대안
+
+- **GUC를 `PGC_SUSET`→`PGC_SIGHUP`(서버 전역)으로 변경**: 거부(이번 수정에서 번들 안 함). footgun을 reloption 없는 인덱스에도 원천 차단하지만, 9개 테스트의 per-session `SET cuvs.index_dir`을 깨고 `postgresql.conf` 마이그레이션을 강제하며 로컬 테스트 편의를 해친다. reloption은 무회귀로 버그를 직접 해결하므로 우선. 필요 시 별도 하드닝 항목으로 분리 가능.
+- **빌드-타임 디렉터리를 별도 meta 사이드카에 기록**: 거부. 사이드카 자체의 위치를 찾는 chicken-and-egg가 재발한다(카탈로그만이 cross-backend stable한 앵커).
+- **path builder에 `dir`를 인자로 전달(시그니처 변경)**: 거부. 게이트/라이터별로 해석 컨텍스트(Oid vs Relation)가 달라 ~14개 호출부 churn이 발생한다. per-row 비용이 파일 I/O에 지배되어 무시 가능하므로, 공유 helper를 Oid 기반으로 두는 최소 변경이 더 surgical하다.
+- **reloption을 자동 캡처(미지정 시 빌드가 resolved dir를 reloptions에 기록)**: 거부. `pg_class.reloptions`는 사용자 `WITH` 입력이며, 계산값을 사후 기록하려면 카탈로그 UPDATE가 필요해 hacky하다. 명시적 `WITH (index_dir=...)`가 깔끔하고 의도가 드러난다.
