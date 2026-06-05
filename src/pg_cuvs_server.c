@@ -138,6 +138,7 @@ typedef struct IndexEntry {
     uint32_t        last_requested_k;  /* top-k of last OK search (reflects cuvs.k) */
     uint32_t        last_returned_k;   /* rows last OK search returned */
     uint64_t        delta_merged_count; /* searches where daemon merged delta on GPU */
+    uint64_t        bf_batch_count;     /* Phase 3L-9: coalesced BF batch dispatches */
     char            last_error[128];
     WarmupState      warmup_state;     /* Phase 3D: WARMUP_HOT for resident indexes */
     uint32_t        gpu_device_id;    /* Phase 3E: which CUDA device this index lives on */
@@ -160,6 +161,7 @@ reset_entry_stats(IndexEntry *e)
     e->last_requested_k    = 0;
     e->last_returned_k    = 0;
     e->delta_merged_count = 0;
+    e->bf_batch_count     = 0;
     e->last_error[0]      = '\0';
 }
 
@@ -1985,6 +1987,82 @@ handle_search(int client_fd, const CuvsCmdFrame *cmd)
      * exactly. Sharded BF runs in the fanout block below. */
     if (cmd->search_mode == 1 && e->shard_count < 2)
     {
+        /* Phase 3L-9: micro-batched path. When bf_batch_wait_us>0 and the batch
+         * worker is up, hand this request to the worker instead of dispatching
+         * inline: release g_index_mutex (lock order is index-then-bf), enqueue,
+         * and block until the worker fills our result. The query shm stays mapped
+         * (req.query points at it) until we reply. On a full queue we degrade to
+         * the immediate path below by re-acquiring the lock and re-finding e. */
+        if (cmd->bf_batch_wait_us > 0 && g_bf_worker_started)
+        {
+            CuvsBfKey     key  = { cmd->db_oid, cmd->index_oid, cmd->bf_precision, cmd->dim };
+            CuvsResult   *rout = malloc((size_t) k * sizeof(CuvsResult));
+            int           enqueued = 0;
+            CuvsBfRequest req;
+
+            pthread_mutex_unlock(&g_index_mutex);   /* release BEFORE taking g_bf_mtx */
+
+            if (rout)
+            {
+                req.key     = key;   req.query  = query;  req.k = k;
+                req.wait_us = cmd->bf_batch_wait_us;
+                req.out     = rout;  req.n_out  = 0;
+                req.status  = CUVS_STATUS_ERROR; req.done = 0;
+
+                pthread_mutex_lock(&g_bf_mtx);
+                if (g_bf_queue_n < CUVS_BF_BATCH_MAX)
+                {
+                    g_bf_queue[g_bf_queue_n++] = &req;
+                    enqueued = 1;
+                    pthread_cond_signal(&g_bf_cond);
+                    while (!req.done)                       /* spurious-wakeup safe */
+                        pthread_cond_wait(&g_bf_done_cond, &g_bf_mtx);
+                }
+                pthread_mutex_unlock(&g_bf_mtx);
+            }
+
+            if (enqueued)
+            {
+                munmap(query, vec_bytes);
+                CuvsReplyHeader hdr = {0};
+                hdr.status = (uint32_t) req.status;
+                if (req.status == CUVS_STATUS_OK)
+                {
+                    hdr.n_results = (uint32_t) req.n_out;
+                    send_all(client_fd, &hdr, sizeof(hdr));
+                    if (req.n_out > 0)
+                        send_all(client_fd, rout, (size_t) req.n_out * sizeof(CuvsResult));
+                }
+                else
+                {
+                    if (req.status == CUVS_STATUS_NO_VECTORS)
+                        strncpy(hdr.error,
+                                "brute_force requested but the .vectors sidecar is "
+                                "missing or stale; REINDEX to enable it",
+                                sizeof(hdr.error) - 1);
+                    send_all(client_fd, &hdr, sizeof(hdr));
+                }
+                free(rout);
+                return;
+            }
+
+            /* Could not enqueue (queue full / malloc fail): degrade to the
+             * immediate path. Re-acquire the lock and re-find the entry. */
+            free(rout);
+            pthread_mutex_lock(&g_index_mutex);
+            e = find_index(cmd->db_oid, cmd->index_oid);
+            if (!e)
+            {
+                munmap(query, vec_bytes);
+                pthread_mutex_unlock(&g_index_mutex);
+                CuvsReplyHeader hdr = {0};
+                hdr.status = CUVS_STATUS_NOT_FOUND;
+                send_all(client_fd, &hdr, sizeof(hdr));
+                return;
+            }
+            /* fall through to the immediate path with e + the still-mapped query */
+        }
+
         refresh_main_bf_cache(e, cmd->bf_precision);
         if (!e->main_bf_idx)
         {
@@ -3987,6 +4065,7 @@ handle_stats(int client_fd, const CuvsCmdFrame *cmd)
         s->gpu_device_id      = e->gpu_device_id;   /* 0xFFFFFFFF when sharded */
         s->shard_count        = (uint32_t)e->shard_count;
         s->search_mode        = e->last_search_mode; /* Phase 3I-1 */
+        s->bf_batch_count     = e->bf_batch_count;   /* Phase 3L-9 */
     }
 
     /* Phase 3D: also emit cold (not-yet-resident) entries so operators can
@@ -4529,20 +4608,145 @@ bf_batch_fail_all_locked(int status)
     pthread_cond_broadcast(&g_bf_done_cond);
 }
 
-/* Phase 3L-9: process the currently queued BF requests. Caller holds g_bf_mtx.
- *
- * CP-B scaffold: degrade — fail every queued request with OOM_FALLBACK so a
- * producer (once CP-C wires one) retries on the immediate path. Nothing
- * enqueues until CP-C, so with the default bf_batch_wait_us=0 this is inert.
- * CP-C replaces this body with the real coalesced batch dispatch. */
+/* Phase 3L-9: run one coalesced group (requests in `batch` with gid[i]==g, all
+ * sharing a (db,index,precision,dim) key) as a single cuvs_bf_search_batch
+ * dispatch. Acquires g_index_mutex for the GPU work (eviction-safe, mirrors the
+ * immediate path); the caller must NOT hold g_bf_mtx here. Writes each member's
+ * out/n_out/status (but not `done` — the caller sets that after all groups). */
+static void
+bf_batch_run_group(CuvsBfRequest **batch, const int *gid, int n, int g)
+{
+    int idx[CUVS_BF_BATCH_MAX], Q = 0;
+    for (int i = 0; i < n; i++)
+        if (gid[i] == g)
+            idx[Q++] = i;
+    if (Q == 0)
+        return;
+
+    CuvsBfRequest *r0   = batch[idx[0]];
+    int            dim  = (int) r0->key.dim;
+    int            maxk = 0;
+    for (int i = 0; i < Q; i++)
+        if (batch[idx[i]]->k > maxk)
+            maxk = batch[idx[i]]->k;
+
+    pthread_mutex_lock(&g_index_mutex);
+    IndexEntry *e = find_index(r0->key.db_oid, r0->key.index_oid);
+    if (!e && load_index(r0->key.db_oid, r0->key.index_oid) == 0)
+        e = find_index(r0->key.db_oid, r0->key.index_oid);
+
+    int status = CUVS_STATUS_OK;
+    if (!e)
+        status = CUVS_STATUS_NOT_FOUND;
+    else if (e->stale)
+        status = CUVS_STATUS_STALE;
+    else
+    {
+        refresh_main_bf_cache(e, r0->key.precision);
+        if (!e->main_bf_idx)
+            status = CUVS_STATUS_NO_VECTORS;
+    }
+    if (status != CUVS_STATUS_OK)
+    {
+        if (e)
+            record_search_stat(e, status, 0, NULL);
+        pthread_mutex_unlock(&g_index_mutex);
+        for (int i = 0; i < Q; i++) { batch[idx[i]]->status = status; batch[idx[i]]->n_out = 0; }
+        return;
+    }
+
+    int K = (int) ((int64_t) maxk < e->n_vecs ? (int64_t) maxk : e->n_vecs);
+    float            *queries = malloc((size_t) Q * (size_t) dim * sizeof(float));
+    CuvsSearchResult *raw     = malloc((size_t) Q * (size_t) K * sizeof(CuvsSearchResult));
+    if (!queries || !raw)
+    {
+        free(queries); free(raw);
+        pthread_mutex_unlock(&g_index_mutex);
+        for (int i = 0; i < Q; i++) { batch[idx[i]]->status = CUVS_STATUS_OOM_FALLBACK; batch[idx[i]]->n_out = 0; }
+        return;
+    }
+    for (int i = 0; i < Q; i++)
+        memcpy(queries + (size_t) i * dim, batch[idx[i]]->query, (size_t) dim * sizeof(float));
+
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    int ret = cuvs_bf_search_batch(e->main_bf_idx, queries, Q, dim, K, raw, delta_gpu_of(e));
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    uint32_t latency_us = (uint32_t) ((t1.tv_sec - t0.tv_sec) * 1000000 +
+                                      (t1.tv_nsec - t0.tv_nsec) / 1000);
+
+    if (ret != 0)
+    {
+        record_search_stat(e, CUVS_STATUS_OOM_FALLBACK, 0, NULL);
+        pthread_mutex_unlock(&g_index_mutex);
+        free(queries); free(raw);
+        for (int i = 0; i < Q; i++) { batch[idx[i]]->status = CUVS_STATUS_OOM_FALLBACK; batch[idx[i]]->n_out = 0; }
+        return;
+    }
+
+    for (int i = 0; i < Q; i++)
+    {
+        CuvsBfRequest *r  = batch[idx[i]];
+        int            ki = (r->k < K) ? r->k : K;
+        int            nv = 0;
+        for (int j = 0; j < ki; j++)
+        {
+            int64_t id = raw[(size_t) i * K + j].item_id;
+            if (id < 0 || id >= e->n_vecs) continue;
+            r->out[nv].tid      = e->tids[id];
+            r->out[nv].distance = raw[(size_t) i * K + j].distance;
+            nv++;
+        }
+        r->n_out  = nv;
+        r->status = CUVS_STATUS_OK;
+        record_search_stat(e, CUVS_STATUS_OK, latency_us, NULL);   /* per request */
+    }
+    e->bf_batch_count++;            /* one coalesced GPU dispatch served Q requests */
+    e->last_search_mode = 3;        /* gpu_bf */
+    e->last_requested_k = (uint32_t) r0->k;
+    e->last_returned_k  = (uint32_t) batch[idx[0]]->n_out;
+    pthread_mutex_unlock(&g_index_mutex);
+    free(queries);
+    free(raw);
+}
+
+/* Phase 3L-9: process the currently queued BF requests. Caller holds g_bf_mtx;
+ * returns holding it. Snapshots + clears the queue (so producers can fill the
+ * next batch), releases g_bf_mtx, groups by key, runs one cuvs_bf_search_batch
+ * per group, then re-locks and wakes every producer in this batch. */
 static void
 bf_batch_process_locked(void)
 {
-    bf_batch_fail_all_locked(CUVS_STATUS_OOM_FALLBACK);
+    int n = g_bf_queue_n;
+    if (n == 0)
+        return;
+
+    CuvsBfRequest *batch[CUVS_BF_BATCH_MAX];
+    for (int i = 0; i < n; i++)
+        batch[i] = g_bf_queue[i];
+    g_bf_queue_n = 0;
+    pthread_mutex_unlock(&g_bf_mtx);
+
+    CuvsBfKey keys[CUVS_BF_BATCH_MAX];
+    int       gid[CUVS_BF_BATCH_MAX];
+    int       ng = 0;
+    for (int i = 0; i < n; i++)
+        keys[i] = batch[i]->key;
+    cuvs_bf_batch_group(keys, n, gid, &ng);
+
+    for (int g = 0; g < ng; g++)
+        bf_batch_run_group(batch, gid, n, g);
+
+    pthread_mutex_lock(&g_bf_mtx);
+    for (int i = 0; i < n; i++)
+        batch[i]->done = 1;
+    pthread_cond_broadcast(&g_bf_done_cond);
 }
 
 /* Phase 3L-9: the single BF micro-batch consumer thread. Idle (1s poll) until a
- * request is enqueued or shutdown; drains the queue via bf_batch_process_locked. */
+ * request is enqueued or shutdown. On the first queued request it waits that
+ * request's bf_batch_wait_us window (lock released, so more accumulate) then
+ * coalesces everything queued into one batch. */
 static void *
 bf_batch_worker_thread(void *arg)
 {
@@ -4558,8 +4762,22 @@ bf_batch_worker_thread(void *arg)
                 break;
         if (g_shutdown)
             break;
-        if (g_bf_queue_n > 0)
-            bf_batch_process_locked();
+        if (g_bf_queue_n == 0)
+            continue;
+
+        /* Accumulation window: let concurrent requests pile up before the GPU
+         * dispatch. Released lock during the sleep so producers can enqueue. */
+        uint32_t window = g_bf_queue[0]->wait_us;
+        if (window > 10000) window = 10000;   /* GUC max; defensive */
+        if (window > 0)
+        {
+            /* window us -> ns; window<=10000 keeps tv_nsec well under 1e9. */
+            struct timespec ws = { 0, (long) window * 1000 };
+            pthread_mutex_unlock(&g_bf_mtx);
+            nanosleep(&ws, NULL);
+            pthread_mutex_lock(&g_bf_mtx);
+        }
+        bf_batch_process_locked();
     }
     /* Shutdown: fail any still-queued requests so producers never hang. */
     bf_batch_fail_all_locked(CUVS_STATUS_UNAVAILABLE);

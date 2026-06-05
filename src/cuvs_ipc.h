@@ -148,8 +148,10 @@ typedef struct CuvsIndexStats {
     uint32_t gpu_device_id;      /* CUDA device this index lives on; 0xFFFFFFFF if cold or sharded */
     /* Phase 3F: 0/1 = unsharded; >=2 = sharded logical index spanning N GPUs */
     uint32_t shard_count;
-    /* Phase 3I-1: 0=gpu_cagra, 1=cpu_hnsw, 2=cpu_fallback */
+    /* Phase 3I-1/3L: 0=gpu_cagra, 1=cpu_hnsw, 2=cpu_fallback, 3=gpu_bf */
     uint32_t search_mode;
+    /* Phase 3L-9: coalesced brute_force micro-batch dispatches for this index */
+    uint64_t bf_batch_count;
 } CuvsIndexStats;
 
 /* ----------------------------------------------------------------

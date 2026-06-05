@@ -172,7 +172,8 @@ CREATE FUNCTION pg_cuvs_gpu_search_stats(
     OUT cache_miss_count   bigint,
     OUT gpu_device_id      integer,
     OUT shard_count        integer,
-    OUT search_mode        text
+    OUT search_mode        text,
+    OUT bf_batch_count     bigint
 )
 RETURNS SETOF record
 AS '$libdir/pg_cuvs', 'pg_cuvs_gpu_search_stats'

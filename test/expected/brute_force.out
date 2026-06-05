@@ -78,6 +78,36 @@ FROM pg_stat_gpu_cache WHERE gpu_device_id = 0;
  t
 (1 row)
 
+-- ── micro-batching (Phase 3L-9): bf_batch_wait_us>0 routes through the daemon
+--    batch worker. Serial here = a batch of 1, which must still be exact, and
+--    the coalescing counter must advance. (Only bf_l2 exists at this point.) ──
+SET enable_cuvs = off; SET enable_seqscan = on;
+CREATE TEMP TABLE gt_mb AS
+    SELECT id FROM bf_test
+    ORDER BY embedding <-> '[0.5,0.3,0.1,0.7,0.2,0.4,0.6,0.15]' LIMIT 10;
+RESET enable_cuvs;
+SET cuvs.bf_batch_wait_us = 2000;
+SET cuvs.search_mode = 'brute_force'; SET enable_seqscan = off;
+CREATE TEMP TABLE bf_mb AS
+    SELECT id FROM bf_test
+    ORDER BY embedding <-> '[0.5,0.3,0.1,0.7,0.2,0.4,0.6,0.15]' LIMIT 10;
+RESET cuvs.bf_batch_wait_us; RESET cuvs.search_mode; RESET enable_seqscan;
+-- recall safety net: the batched path returns the exact GT top-10.
+SELECT count(*) = 10 AS mb_recall_ok
+FROM bf_mb WHERE id IN (SELECT id FROM gt_mb);
+ mb_recall_ok 
+--------------
+ t
+(1 row)
+
+-- coalescing observable: the batch worker served at least one dispatch.
+SELECT bf_batch_count > 0 AS mb_coalesced
+FROM pg_stat_gpu_search WHERE index_name = 'bf_l2';
+ mb_coalesced 
+--------------
+ t
+(1 row)
+
 -- ── cosine ───────────────────────────────────────────────────────
 SET client_min_messages = 'warning';
 CREATE INDEX bf_cos ON bf_test USING cagra (embedding vector_cosine_ops);
