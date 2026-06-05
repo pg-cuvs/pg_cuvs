@@ -31,6 +31,7 @@
 | 4A-1 | CAGRA 빌드 double memcpy 제거 | 4 (**quick win**: ~2-5s, 난이도 낮음, 4A-2 enabler) |
 | 4A-2 | parallel maintenance workers — heap scan/detoast 병렬화 | 4 (~8-12s/~10-14%, 난이도 중간; 빌드 일회성이라 긴급도만↓) |
 | 3N | OFFSET-aware K 자동 조정 (ORM pagination 호환) | backlog |
+| 하드닝 | orphan artifact GC (`pg_cuvs_gc_orphans()`) — 데몬-down DROP / DROP DATABASE / 재시작 좀비 재로드로 인한 VRAM+디스크 누수 근절. ADR-009 정정 반영. 설계만 완료(ADR-046), 구현 대기 | backlog |
 
 ---
 
