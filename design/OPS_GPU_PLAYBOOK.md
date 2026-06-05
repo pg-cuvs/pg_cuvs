@@ -281,3 +281,51 @@ sudo journalctl -u pg-cuvs-server -n 50
 | MIG reboot 필요 | GCP A100 MIG 활성화/비활성화 시 VM 재부팅 |
 | GCS 버킷 필요 | Phase 3G snapshot restore는 GCS 버킷 설정 필요 |
 | parallel_fanout N>5M | 대규모 검증 미완료 (가설) |
+
+---
+
+## 6. Orphan artifact 정리 (ADR-046)
+
+데몬은 standalone sidecar(ADR-002)라 PG 카탈로그를 보지 못한다. 다음 경우 `index_dir`에 카탈로그에 없는 orphan artifact가 남고, 데몬 재시작 시 **좀비로 재로드**된다(VRAM+디스크 누수):
+
+- **데몬-down 중 DROP INDEX/TABLE**: `cuvs_ipc_drop`이 UNAVAILABLE로 실패, PG DROP은 commit되나 artifact 잔존.
+- **DROP DATABASE**: `object_access_hook`이 타 DB의 per-index DROP을 보지 못해 통지 없음 → 전부 orphan.
+
+### 6.1 자동 정리 (권장) — `pg_cuvs_gc_orphans()`
+
+backend가 카탈로그(`pg_index`/`pg_database`)와 대조해 정리한다.
+
+```sql
+-- dry-run: 무엇이 정리 대상인지만 보고 (아무것도 삭제 안 함)
+SELECT * FROM pg_cuvs_gc_orphans();
+
+-- 실제 정리: 데몬이 살아있으면 VRAM free + unlink, 죽었으면 backend가 파일 직접 unlink
+SELECT * FROM pg_cuvs_gc_orphans(true);
+```
+
+`reason` 값:
+- `missing_in_catalog` — 현재 DB에 인덱스 OID 없음(정리 대상).
+- `dead_database` — `db_oid`가 `pg_database`에 없음(DROP DATABASE 잔재, 정리 대상).
+- `unverifiable_other_db` — 현존하는 **다른** DB 소유. 이 backend는 그 DB 카탈로그를 못 보므로 **건드리지 않음**. 정리하려면 **해당 DB에 접속해** 함수를 실행한다.
+
+주의: `index_dir`이 per-index reloption(ADR-045)으로 데몬 기본 디렉터리 밖에 지정된 인덱스는 이 함수의 스캔 대상이 아니다(데몬 기본 `index_dir`만 스캔).
+
+### 6.2 수동 정리 (데몬이 뜨지 않거나 SQL 불가 시)
+
+`index_dir`은 postgres 소유 `0700`이다. **`sudo rm <glob>`은 ubuntu 셸의 글로브 확장이 권한 없어 조용히 실패**하므로 쓰지 말 것. root가 디렉터리를 읽는 `find ... -delete`를 사용한다.
+
+```bash
+# 1. 데몬 정지
+sudo systemctl stop pg-cuvs-server
+
+# 2. 카탈로그에 없는 <db>_<idx>.* 를 확인 후 삭제
+#    (db_oid/index_oid는 SELECT oid FROM pg_database / pg_class 로 교차 확인)
+IDIR=/tmp/cuvs_indexes   # 또는 SHOW cuvs.index_dir / $PGDATA/cuvs_indexes
+sudo find "$IDIR" -maxdepth 1 -type f -name '<db>_<idx>.*' -print   # 먼저 확인
+sudo find "$IDIR" -maxdepth 1 -type f -name '<db>_<idx>.*' -delete  # 삭제
+
+# 3. 데몬 시작
+sudo systemctl start pg-cuvs-server
+```
+
+가능하면 6.1의 `pg_cuvs_gc_orphans(true)`를 우선 사용한다(카탈로그 대조로 정상 인덱스 오삭제를 방지).

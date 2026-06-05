@@ -327,3 +327,29 @@ COMMENT ON FUNCTION pg_cuvs_batch_search(regclass, vector[], integer) IS
   'Phase 3M: batch GPU k-NN. Q queries in one IPC round-trip / GPU dispatch. '
   'Returns (query_idx, ctid, distance); JOIN on ctid for MVCC-visible rows. '
   'Honors cuvs.search_mode and cuvs.bf_precision (brute_force needs .vectors).';
+
+
+-- ----------------------------------------------------------------
+-- pg_cuvs_gc_orphans(do_delete) — ADR-046 orphan artifact GC.
+-- Reconciles the daemon's index_dir against the catalog (the daemon is a
+-- standalone sidecar with no catalog access). Reports/removes artifacts left
+-- by daemon-down DROP or DROP DATABASE that would otherwise be reloaded as
+-- zombies on restart. do_delete=false (default) is a dry run.
+-- ----------------------------------------------------------------
+CREATE FUNCTION pg_cuvs_gc_orphans(
+    do_delete       boolean DEFAULT false,
+    OUT db_oid      oid,
+    OUT index_oid   oid,
+    OUT reason      text,
+    OUT action      text
+)
+RETURNS SETOF record
+AS '$libdir/pg_cuvs', 'pg_cuvs_gc_orphans'
+LANGUAGE C;
+
+COMMENT ON FUNCTION pg_cuvs_gc_orphans(boolean) IS
+  'ADR-046: garbage-collect orphan GPU index artifacts in index_dir whose OIDs '
+  'are absent from the catalog (daemon-down DROP, DROP DATABASE). reason is one '
+  'of missing_in_catalog / dead_database / unverifiable_other_db (other live DB '
+  '— rerun there). do_delete=false (default) reports only; do_delete=true frees '
+  'VRAM + unlinks via the daemon, or unlinks files directly when it is down.';

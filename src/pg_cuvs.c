@@ -48,12 +48,14 @@
 #include "catalog/objectaccess.h"   /* object_access_hook, OAT_DROP (Phase 3G.1) */
 #include "catalog/pg_class.h"       /* RelationRelationId, RELKIND_INDEX, Form_pg_class */
 #include "utils/syscache.h"         /* SearchSysCache1(RELOID) */
+#include "commands/dbcommands.h"    /* get_database_name (ADR-046 orphan GC) */
 #include "catalog/pg_opfamily.h"    /* OPFAMILYOID, Form_pg_opfamily */
 
 #include <sys/stat.h>
 #include <sys/file.h>   /* flock */
 #include <fcntl.h>      /* O_RDWR, O_CREAT */
 #include <unistd.h>     /* lseek, pread, pwrite, ftruncate, unlink */
+#include <dirent.h>     /* opendir/readdir (ADR-046 orphan GC) */
 #include <errno.h>
 #include <math.h>       /* sqrt (cosine distance) */
 
@@ -190,8 +192,10 @@ cuvs_xact_callback(XactEvent event, void *arg)
                 ereport(WARNING,
                         (errmsg("pg_cuvs: daemon DROP-notify failed for index %u (status %d)",
                                 ioid, rc),
-                         errhint("GPU VRAM/artifacts for the dropped index may persist "
-                                 "until the daemon restarts.")));
+                         errhint("GPU VRAM/artifacts for the dropped index may persist; "
+                                 "a daemon restart will NOT clean them (it reloads them as "
+                                 "zombies). Run SELECT pg_cuvs_gc_orphans(true); to reclaim "
+                                 "them, or follow the manual cleanup in OPS_GPU_PLAYBOOK.")));
         }
     }
 
@@ -2797,6 +2801,206 @@ pg_cuvs_gpu_shard_stats(PG_FUNCTION_ARGS)
         values[10] = BoolGetDatum(r->resident != 0);
         values[11] = CStringGetTextDatum(cuvs_status_str((int) r->last_status));
 
+        tuplestore_putvalues(tupstore, tupdesc, values, nulls);
+    }
+
+    return (Datum) 0;
+}
+
+/* ----------------------------------------------------------------
+ * pg_cuvs_gc_orphans(do_delete boolean DEFAULT false) — ADR-046
+ *
+ * Backend-driven reconciliation of the daemon's index_dir against the
+ * PostgreSQL catalog. The daemon is a standalone sidecar (ADR-002) with no
+ * catalog access, so it cannot tell a live artifact from one left behind by a
+ * daemon-down DROP or a DROP DATABASE; on restart startup_load_indexes() reloads
+ * them as zombies (VRAM + disk leak). A backend HAS the catalog, so it does the
+ * reconciliation here.
+ *
+ * Each artifact identity ("<db>_<idx>.cagra" unsharded, or "<db>_<idx>.shards"
+ * sharded) is classified:
+ *   - db_oid == MyDatabaseId, index OID absent from pg_class -> missing_in_catalog
+ *   - db_oid not in pg_database                              -> dead_database
+ *   - db_oid is some OTHER live database                     -> unverifiable_other_db
+ *     (this backend cannot read that DB's catalog -> conservatively skipped;
+ *      run the function in that database to reclaim it).
+ * Live indexes in the current DB are not reported.
+ *
+ * do_delete=false (default): dry-run, reports candidates, removes nothing.
+ * do_delete=true: for each orphan, cuvs_ipc_drop() (daemon frees VRAM + unlinks
+ *   the whole artifact family); if the daemon is unreachable, the backend
+ *   directly unlinks every "<db>_<idx>.*" file in index_dir.
+ * ---------------------------------------------------------------- */
+#define GC_ORPHANS_NCOLS 4
+
+/* Direct-unlink fallback (daemon down): remove every "<db>_<idx>." prefixed file
+ * in idir. The trailing dot makes "12_3." not match "12_34.cagra". Returns the
+ * number unlinked, or -1 if the directory cannot be opened. */
+static int
+gc_unlink_family(const char *idir, uint32_t db_oid, uint32_t index_oid)
+{
+    char            prefix[64];
+    char            path[MAXPGPATH];
+    DIR            *dir;
+    struct dirent  *ent;
+    size_t          plen;
+    int             removed = 0;
+
+    snprintf(prefix, sizeof(prefix), "%u_%u.", db_oid, index_oid);
+    plen = strlen(prefix);
+
+    dir = opendir(idir);
+    if (dir == NULL)
+        return -1;
+    while ((ent = readdir(dir)) != NULL)
+    {
+        if (strncmp(ent->d_name, prefix, plen) == 0)
+        {
+            snprintf(path, sizeof(path), "%s/%s", idir, ent->d_name);
+            if (unlink(path) == 0)
+                removed++;
+        }
+    }
+    closedir(dir);
+    return removed;
+}
+
+PG_FUNCTION_INFO_V1(pg_cuvs_gc_orphans);
+Datum
+pg_cuvs_gc_orphans(PG_FUNCTION_ARGS)
+{
+    /* (db, idx) identity collected from a ".cagra"/".shards" anchor file. */
+    typedef struct { uint32_t db; uint32_t idx; } GcId;
+    bool             do_delete = PG_GETARG_BOOL(0);
+    ReturnSetInfo   *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+    TupleDesc        tupdesc;
+    Tuplestorestate *tupstore;
+    MemoryContext    per_query_ctx;
+    MemoryContext    oldcontext;
+    const char      *idir;
+    DIR             *dir;
+    struct dirent   *ent;
+    GcId            *ids = NULL;
+    int              n_ids = 0, cap = 0;
+
+    if (rsinfo == NULL || !IsA(rsinfo, ReturnSetInfo))
+        ereport(ERROR,
+                (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                 errmsg("set-valued function called in context that cannot accept a set")));
+    if (!(rsinfo->allowedModes & SFRM_Materialize))
+        ereport(ERROR,
+                (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                 errmsg("materialize mode required, but it is not allowed in this context")));
+    if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+        ereport(ERROR,
+                (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                 errmsg("return type must be a row type")));
+
+    per_query_ctx = rsinfo->econtext->ecxt_per_query_memory;
+    oldcontext = MemoryContextSwitchTo(per_query_ctx);
+    tupstore = tuplestore_begin_heap(true, false, work_mem);
+    rsinfo->returnMode = SFRM_Materialize;
+    rsinfo->setResult  = tupstore;
+    rsinfo->setDesc    = tupdesc;
+    MemoryContextSwitchTo(oldcontext);
+
+    idir = get_index_dir();
+
+    /* Pass 1: collect identity anchors, then close the dir BEFORE any unlink.
+     * Mutating the directory while readdir() is mid-stream is unspecified by
+     * POSIX, so deletion must happen after the scan completes. */
+    dir = opendir(idir);
+    if (dir == NULL)
+    {
+        ereport(NOTICE,
+                (errmsg("pg_cuvs_gc_orphans: index_dir \"%s\" not accessible (%m); nothing to do",
+                        idir)));
+        return (Datum) 0;
+    }
+    while ((ent = readdir(dir)) != NULL)
+    {
+        uint32_t db_oid, index_oid;
+        char     tail[16] = {0};
+
+        /* Identity anchors only: unsharded ".cagra" or sharded ".shards". */
+        if (cuvs_parse_index_filename(ent->d_name, &db_oid, &index_oid) != 0)
+        {
+            if (!(sscanf(ent->d_name, "%u_%u.%15s", &db_oid, &index_oid, tail) == 3
+                  && strcmp(tail, "shards") == 0))
+                continue;
+        }
+        if (n_ids == cap)
+        {
+            cap = cap ? cap * 2 : 16;
+            ids = ids ? repalloc(ids, cap * sizeof(GcId))
+                      : palloc(cap * sizeof(GcId));
+        }
+        ids[n_ids].db = db_oid;
+        ids[n_ids].idx = index_oid;
+        n_ids++;
+    }
+    closedir(dir);
+
+    /* Pass 2: classify against catalog authority, act, emit. */
+    for (int i = 0; i < n_ids; i++)
+    {
+        uint32_t    db_oid = ids[i].db;
+        uint32_t    index_oid = ids[i].idx;
+        const char *reason;
+        const char *action;
+        bool        is_orphan;
+        Datum       values[GC_ORPHANS_NCOLS];
+        bool        nulls[GC_ORPHANS_NCOLS];
+
+        if (db_oid == (uint32_t) MyDatabaseId)
+        {
+            HeapTuple tup = SearchSysCache1(RELOID, ObjectIdGetDatum((Oid) index_oid));
+            if (HeapTupleIsValid(tup))
+            {
+                ReleaseSysCache(tup);
+                continue;   /* live index in this DB — not an orphan */
+            }
+            reason = "missing_in_catalog";
+            is_orphan = true;
+        }
+        else
+        {
+            char *dbname = get_database_name((Oid) db_oid);
+            if (dbname == NULL)
+            {
+                reason = "dead_database";
+                is_orphan = true;
+            }
+            else
+            {
+                pfree(dbname);
+                reason = "unverifiable_other_db";   /* conservatively keep */
+                is_orphan = false;
+            }
+        }
+
+        if (!is_orphan)
+            action = "skipped";
+        else if (!do_delete)
+            action = "would_delete";
+        else
+        {
+            int rc = cuvs_ipc_drop(cuvs_socket_path, db_oid, index_oid);
+            if (rc == CUVS_STATUS_OK)
+                action = "deleted";                 /* daemon freed VRAM + unlinked */
+            else
+            {
+                /* daemon down/unreachable — reclaim disk directly */
+                int n = gc_unlink_family(idir, db_oid, index_oid);
+                action = (n >= 0) ? "deleted" : "delete_failed";
+            }
+        }
+
+        memset(nulls, 0, sizeof(nulls));
+        values[0] = ObjectIdGetDatum((Oid) db_oid);
+        values[1] = ObjectIdGetDatum((Oid) index_oid);
+        values[2] = CStringGetTextDatum(reason);
+        values[3] = CStringGetTextDatum(action);
         tuplestore_putvalues(tupstore, tupdesc, values, nulls);
     }
 
