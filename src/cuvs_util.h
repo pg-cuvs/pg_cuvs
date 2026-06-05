@@ -351,3 +351,25 @@ void cuvs_circuit_record_success(uint32_t index_oid); /* reset consecutive_error
 void cuvs_circuit_reset(uint32_t index_oid);          /* also clears open flag */
 int  cuvs_circuit_is_open(uint32_t index_oid);
 void cuvs_circuit_reset_all(void);                    /* zeroes all breaker state */
+
+/* ----------------------------------------------------------------
+ * Phase 3L-9: brute-force micro-batch grouping (pure, daemon + test).
+ *
+ * The daemon's BF batch worker collects concurrent brute_force requests and
+ * coalesces those targeting the SAME (db_oid, index_oid, precision, dim) into a
+ * single cuvs_bf_search_batch dispatch. cuvs_bf_batch_group is the pure
+ * indexing core (no threads, no CUDA): it assigns each request a group id so
+ * requests with an identical key share a group. Group ids are dense and
+ * assigned in first-seen order. O(n^2) but n is bounded by the batch cap.
+ * ---------------------------------------------------------------- */
+typedef struct CuvsBfKey {
+    uint32_t db_oid;
+    uint32_t index_oid;
+    uint32_t precision;   /* 0=float32, 1=float16 */
+    uint32_t dim;
+} CuvsBfKey;
+
+/* group_id_out[i] = group of request i (requests with equal keys share it);
+ * *n_groups_out = number of distinct keys. group_id_out must hold n ints. */
+void cuvs_bf_batch_group(const CuvsBfKey *keys, int n,
+                         int *group_id_out, int *n_groups_out);

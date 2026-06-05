@@ -454,6 +454,66 @@ test_vectors_rejections(void)
     }
 }
 
+/* ---- BF micro-batch grouping (Phase 3L-9) ---- */
+static void
+test_bf_batch_group(void)
+{
+    /* 5 requests, 2 distinct keys (A and B) interleaved: A B A A B. */
+    CuvsBfKey keys[5] = {
+        {1, 10, 0, 8},   /* A */
+        {1, 20, 0, 8},   /* B */
+        {1, 10, 0, 8},   /* A */
+        {1, 10, 0, 8},   /* A */
+        {1, 20, 0, 8},   /* B */
+    };
+    int gid[5];
+    int ng = -1;
+    cuvs_bf_batch_group(keys, 5, gid, &ng);
+    ASSERT(ng == 2, "two distinct keys -> 2 groups");
+    ASSERT(gid[0] == 0, "req0 (A) -> first-seen group 0");
+    ASSERT(gid[1] == 1, "req1 (B) -> first-seen group 1");
+    ASSERT(gid[2] == 0 && gid[3] == 0, "later A's share group 0");
+    ASSERT(gid[4] == 1, "later B shares group 1");
+    ASSERT(gid[0] != gid[1], "A and B are different groups");
+
+    /* precision distinguishes groups (same db/index/dim, different precision). */
+    {
+        CuvsBfKey kp[2] = { {1, 10, 0, 8}, {1, 10, 1, 8} };
+        int g[2], n = -1;
+        cuvs_bf_batch_group(kp, 2, g, &n);
+        ASSERT(n == 2 && g[0] != g[1], "precision distinguishes groups");
+    }
+    /* dim distinguishes groups. */
+    {
+        CuvsBfKey kd[2] = { {1, 10, 0, 8}, {1, 10, 0, 16} };
+        int g[2], n = -1;
+        cuvs_bf_batch_group(kd, 2, g, &n);
+        ASSERT(n == 2 && g[0] != g[1], "dim distinguishes groups");
+    }
+    /* index_oid distinguishes groups. */
+    {
+        CuvsBfKey ki[2] = { {1, 10, 0, 8}, {1, 11, 0, 8} };
+        int g[2], n = -1;
+        cuvs_bf_batch_group(ki, 2, g, &n);
+        ASSERT(n == 2 && g[0] != g[1], "index_oid distinguishes groups");
+    }
+    /* single request -> one group. */
+    {
+        CuvsBfKey k1[1] = { {1, 10, 0, 8} };
+        int g[1], n = -1;
+        cuvs_bf_batch_group(k1, 1, g, &n);
+        ASSERT(n == 1 && g[0] == 0, "single request -> one group");
+    }
+    /* all identical -> one group, every id 0. */
+    {
+        CuvsBfKey ks[4] = { {2,5,1,16}, {2,5,1,16}, {2,5,1,16}, {2,5,1,16} };
+        int g[4], n = -1;
+        cuvs_bf_batch_group(ks, 4, g, &n);
+        ASSERT(n == 1 && g[0]==0 && g[1]==0 && g[2]==0 && g[3]==0,
+               "all identical -> single group");
+    }
+}
+
 /* Build a coherent 3-shard manifest covering [0,100): 40 + 35 + 25. */
 static void
 make_good_shards(CuvsShardRecord recs[3], uint32_t dim, uint32_t metric)
@@ -826,6 +886,7 @@ main(void)
     test_tids_rejections();
     test_vectors_roundtrip();
     test_vectors_rejections();
+    test_bf_batch_group();
     test_shards_roundtrip();
     test_shards_rejections();
     test_auto_shard_count();

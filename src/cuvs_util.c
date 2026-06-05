@@ -655,3 +655,34 @@ cuvs_circuit_reset_all(void)
     memset(cuvs_circuit_breakers, 0, sizeof(cuvs_circuit_breakers));
     cuvs_n_circuit_breakers = 0;
 }
+
+/* ----------------------------------------------------------------
+ * Phase 3L-9: brute-force micro-batch grouping (pure).
+ * ---------------------------------------------------------------- */
+void
+cuvs_bf_batch_group(const CuvsBfKey *keys, int n,
+                    int *group_id_out, int *n_groups_out)
+{
+    int ng = 0;
+    for (int i = 0; i < n; i++)
+    {
+        int g = -1;
+        /* Reuse the group of the first earlier request with an identical key. */
+        for (int j = 0; j < i; j++)
+        {
+            if (keys[j].db_oid    == keys[i].db_oid &&
+                keys[j].index_oid == keys[i].index_oid &&
+                keys[j].precision == keys[i].precision &&
+                keys[j].dim       == keys[i].dim)
+            {
+                g = group_id_out[j];
+                break;
+            }
+        }
+        if (g < 0)
+            g = ng++;               /* new key -> next dense, first-seen group id */
+        group_id_out[i] = g;
+    }
+    if (n_groups_out)
+        *n_groups_out = ng;
+}
