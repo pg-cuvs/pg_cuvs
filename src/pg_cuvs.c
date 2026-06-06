@@ -818,6 +818,42 @@ cuvs_index_tombstone_unusable(Oid index_oid)
     return false;
 }
 
+/* Phase 3A recall: the number of pending dead TIDs the .tombstone records for
+ * the current base build, or 0 if there is no usable tombstone (missing,
+ * corrupt, or belonging to a previous build). A query over-fetches the base by
+ * this count so dead-TID filtering cannot starve the live top-k. Pure file
+ * reads; mirrors cuvs_index_tombstone_unusable but returns the entry count. */
+static int64_t
+cuvs_tombstone_count(Oid index_oid)
+{
+    char                 path[MAXPGPATH];
+    FILE                *f;
+    CuvsTombstoneHeader  hdr;
+    long                 fsize;
+    uint32_t             base_crc;
+
+    cuvs_tombstone_path(index_oid, path, sizeof(path));
+    f = AllocateFile(path, PG_BINARY_R);
+    if (f == NULL)
+        return 0;
+
+    if (cuvs_tombstone_read_header(f, &hdr) != 0
+        || fseek(f, 0, SEEK_END) != 0
+        || (fsize = ftell(f)) < (long) sizeof(hdr))
+    {
+        FreeFile(f);
+        return 0;
+    }
+    FreeFile(f);
+
+    if (cuvs_tombstone_validate(&hdr, (int64_t) fsize - (int64_t) sizeof(hdr)) != 0)
+        return 0;
+    if (!cuvs_read_tids_crc(index_oid, &base_crc)
+        || base_crc != hdr.base_tids_crc32)
+        return 0;       /* belongs to a previous base build */
+    return hdr.n_entries;
+}
+
 /* pread/pwrite full-length wrappers (retry partials and EINTR). 0 on success. */
 static int
 cuvs_pwrite_all(int fd, off_t off, const void *buf, size_t len)
@@ -1702,6 +1738,20 @@ cuvs_gettuple(IndexScanDesc scan, ScanDirection dir)
         PgVector *qvec    = DatumGetPgVector(query_datum);
         int       dim     = (int)qvec->dim;
         int       k       = cuvs_k;  /* GPU top-k; SQL LIMIT applied by executor */
+
+        /* Phase 3A recall: over-fetch the base by the pending dead-TID count so
+         * tombstone filtering (cuvs_apply_tombstones, below) cannot drop the
+         * live result below cuvs_k when the base's nearest candidates are all
+         * tombstoned. Bounded to one extra cuvs_k so a large tombstone set
+         * cannot blow up GPU work — heavier delete drift is caught first by the
+         * delete-drift gate. No-op when there are no tombstones, so the common
+         * path is unchanged. */
+        if (cuvs_max_delta_rows > 0)
+        {
+            int64_t n_tomb = cuvs_tombstone_count(index_oid);
+            if (n_tomb > 0)
+                k += (int) Min(n_tomb, (int64_t) cuvs_k);
+        }
 
         ss->tids      = palloc(k * sizeof(uint64_t));
         ss->distances = palloc(k * sizeof(float));
