@@ -107,7 +107,7 @@ TID 기준 필터(샤딩 무관).
 → Step 3 (write 정합 확인)으로
 
 ### E. delta_search_mode가 cpu
-`cuvs.delta_search_mode`(0=auto/1=cpu/2=gpu) 또는 GPU delta cache 미가용이면 cpu.
+`cuvs.delta_search`(auto/cpu/gpu, 기본 auto) 또는 GPU delta cache 미가용이면 cpu.
 delta가 `cuvs.max_delta_rows` 초과면 GPU+delta 중지 → REINDEX 권고.
 → Step 4 (GPU delta path 회복)로
 
@@ -242,7 +242,7 @@ SELECT delta_search_mode FROM pg_stat_gpu_search WHERE index_name='<idx>';
 
 ```sql
 -- GPU delta를 강제로 확인하고 싶을 때 (관측용)
-SET cuvs.delta_search_mode = 2;   -- gpu (auto가 기본)
+SET cuvs.delta_search = 'gpu';   -- gpu (auto가 기본)
 ```
 
 ---
