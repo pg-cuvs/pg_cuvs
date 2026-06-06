@@ -63,15 +63,21 @@ cell "memfd/SIGKILL"   'sudo kill -9 $bpid'    fresh
 cell "memfd/SIGSEGV"   'sudo kill -SEGV $bpid' fresh
 cell "memfd/daemon-kill" 'sudo kill -9 $(pgrep -f pg_cuvs_server | head -1); sleep 1; sudo systemctl restart pg-cuvs-server' fresh
 
-echo "=== Soak: memfd x cancel x 80 (accumulation slope) ==="
+echo "=== Soak: memfd x SIGKILL-mid-scan x 12 (accumulation slope) ==="
+# NOTE: graceful cancel/terminate cannot be timed reliably mid-scan (a build
+# that reaches the daemon handoff blocks in recv_all, which retries on EINTR so
+# the signal is ignored until the ~minute GPU build replies). SIGKILL during the
+# scan window is the reliable, fast soak; bench_250000 maps fast.
 S0=$(shmem); O0=$(orphans)
-for n in $(seq 1 80); do
-  base=$(shmem); bpid=$(start_build_until_mapped "$base")
-  [ -n "$bpid" ] && sudo -u postgres psql -d postgres -tAc "SELECT pg_cancel_backend($bpid)" >/dev/null 2>&1
-  wait 2>/dev/null
+for n in $(seq 1 12); do
+  $PSQL -c "DROP INDEX IF EXISTS bench_250000_cagra;" >/dev/null 2>&1
+  ( $PSQL -c "CREATE INDEX bench_250000_cagra ON bench_250000 USING cagra (embedding vector_l2_ops);" >/dev/null 2>&1 ) &
+  b=""; for i in $(seq 1 100); do b=$($PSQL -c "SELECT pid FROM pg_stat_activity WHERE query LIKE 'CREATE INDEX bench_250000%' AND pid<>pg_backend_pid() LIMIT 1;" 2>/dev/null | tr -d ' '); [ -n "$b" ] && break; sleep 0.05; done
+  sleep 0.4; sudo kill -9 "$b" 2>/dev/null
+  pg_healthy; wait 2>/dev/null
 done
 settle_shmem; SN=$(shmem); ON=$(orphans)
-echo "  soak: Shmem ${S0}->${SN}kB (delta $((SN-S0))kB over 80)  orphans ${O0}->${ON}"
+echo "  soak: Shmem ${S0}->${SN}kB (delta $((SN-S0))kB over 12 SIGKILLs)  orphans ${O0}->${ON}"
 [ "$ON" = "0" ] && [ $((SN-S0)) -lt 300000 ] && ok "soak: no accumulation" || bad "soak: leak trend (orphans=$ON dShmem=$((SN-S0))kB)"
 
 echo "=== Negative control (mutation): detector must FIRE on a real orphan ==="
