@@ -28,6 +28,7 @@ src/*.o
 # Local unit-test binaries
 /test-unit
 /test-build-shm
+/test-build-corpus
 test/results/
 test/regression.diffs
 test/regression.out

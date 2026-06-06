@@ -154,9 +154,12 @@ install-server-test: server-test
 # Deliberately independent of PGXS/pg_config/CUDA so it runs on a laptop.
 # librt exists on Linux (CI/VM) but not macOS — link it only where present.
 TEST_RT_LIB := $(shell [ "$$(uname -s)" = "Linux" ] && echo -lrt)
-test-unit: test/unit/test_cuvs_util.c src/cuvs_util.c src/cuvs_util.h src/cuvs_ipc.h
+test-unit: test/unit/test_cuvs_util.c src/cuvs_util.c src/cuvs_util.h src/cuvs_ipc.h \
+           test/unit/test_build_corpus.c src/cuvs_build_corpus.c src/cuvs_build_corpus.h
 	$(CC) -I src -DCUVS_TEST_HOOKS -o test-unit test/unit/test_cuvs_util.c src/cuvs_util.c $(TEST_RT_LIB)
 	./test-unit
+	$(CC) -I src -o test-build-corpus test/unit/test_build_corpus.c src/cuvs_build_corpus.c $(TEST_RT_LIB)
+	./test-build-corpus
 
 .PHONY: test-unit
 
