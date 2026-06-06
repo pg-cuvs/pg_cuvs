@@ -1,0 +1,162 @@
+-- pending_delta.sql — Phase 3A completion-criteria regression (deterministic).
+--
+-- Covers the gaps NOT already locked by edge_cases.sql Step 4/5 (which exercises
+-- the INSERT/UPDATE/DELETE delta happy paths). Here we assert the harder 3A
+-- completion criteria:
+--   * Scenario A: delta cap overflow fail-closes to `.stale` (CPU reroute).
+--   * Scenario B: the resident GPU brute-force delta cache is actually built and
+--     merged on the daemon (PLAN "Integration Sc 15").
+--   * Scenario C: cuvs.delta_search tri-mode (auto|cpu|gpu) keeps the merge correct.
+--   * Scenario D: cuvs.max_delta_rows = 0 reverts to Phase 2 (INSERT marks stale).
+--
+-- Philosophy (same as edge_cases.sql): a GPU/CAGRA scan is APPROXIMATE, so the
+-- exact id ordering is not guaranteed. We assert only DETERMINISTIC facts:
+--   * booleans/counts from pg_stat_gpu_search (daemon-authoritative),
+--   * the unique-extremum probe — a query vector EQUAL to a delta row has
+--     distance 0, so it is the unique nearest regardless of base-graph
+--     approximation, so the merge must surface it first.
+-- pg_regress cannot read the daemon log, so "GPU delta cache was built" is
+-- asserted via its observable side effects (delta_rows / delta_merged_count /
+-- delta_vram_bytes), not a log line.
+--
+-- Requires a running pg_cuvs_server and a daemon-writable cuvs.index_dir.
+-- NO \set ON_ERROR_STOP (parity with edge_cases): the cap-overflow path may emit
+-- a WARNING/HINT that must be captured while the script continues.
+CREATE EXTENSION IF NOT EXISTS vector;
+NOTICE:  extension "vector" already exists, skipping
+CREATE EXTENSION IF NOT EXISTS pg_cuvs;
+NOTICE:  extension "pg_cuvs" already exists, skipping
+SET cuvs.index_dir = '/tmp/cuvs_indexes';
+-- ============================================================================
+-- Scenario A — delta cap overflow fail-closes to stale.
+-- With cuvs.max_delta_rows = 2, the first two INSERTs append to .delta; the
+-- third cannot, so aminsert marks the index stale (fail-closed) rather than
+-- silently dropping the new row. Assert the deterministic `stale` flip.
+-- ============================================================================
+CREATE TABLE pd_cap (id bigint, embedding vector(4));
+INSERT INTO pd_cap VALUES (1,'[1,0,0,0]'),(2,'[0,1,0,0]'),(3,'[0,0,1,0]'),(4,'[0,0,0,1]');
+CREATE INDEX pd_cap_cagra ON pd_cap USING cagra (embedding vector_l2_ops);
+-- fresh build is not stale.
+SELECT stale AS cap_fresh_stale
+FROM pg_stat_gpu_search WHERE index_oid = 'pd_cap_cagra'::regclass;
+ cap_fresh_stale 
+-----------------
+ f
+(1 row)
+
+SET cuvs.max_delta_rows = 2;
+INSERT INTO pd_cap VALUES (101,'[0.9,0.1,0,0]');   -- delta row 1 (appended)
+INSERT INTO pd_cap VALUES (102,'[0.8,0.2,0,0]');   -- delta row 2 (at cap)
+INSERT INTO pd_cap VALUES (103,'[0.7,0.3,0,0]');   -- exceeds cap -> mark stale
+SELECT stale AS cap_overflow_stale
+FROM pg_stat_gpu_search WHERE index_oid = 'pd_cap_cagra'::regclass;
+ cap_overflow_stale 
+--------------------
+ t
+(1 row)
+
+RESET cuvs.max_delta_rows;
+-- ============================================================================
+-- Scenario B — Sc 15: resident GPU delta cache is actually built + merged.
+-- After appending delta rows (within cap) and running ONE GPU search, the daemon
+-- must have lazily built the resident GPU brute-force delta cache and merged it
+-- with the base CAGRA result. Assert the deterministic proxies:
+--   delta_rows = #appended, a GPU merge happened (delta_merged_count >= 1),
+--   and the cache holds VRAM (delta_vram_bytes > 0).
+-- ============================================================================
+CREATE TABLE pd_gpu (id bigint, embedding vector(4));
+INSERT INTO pd_gpu SELECT g, ('['||g||',0,0,0]')::vector FROM generate_series(1,16) g;
+CREATE INDEX pd_gpu_cagra ON pd_gpu USING cagra (embedding vector_l2_ops);
+-- append 3 delta rows far from the base cluster (default cap; delta_search auto).
+INSERT INTO pd_gpu VALUES (101,'[100,0,0,0]'),(102,'[101,0,0,0]'),(103,'[102,0,0,0]');
+-- warm a GPU search to trigger the daemon's lazy delta-cache build + merge.
+SET enable_seqscan = off;
+SELECT count(*) AS warm
+FROM (SELECT id FROM pd_gpu ORDER BY embedding <-> '[100,0,0,0]'::vector LIMIT 1) s;
+ warm 
+------
+    1
+(1 row)
+
+RESET enable_seqscan;
+SELECT (delta_rows = 3)          AS delta_rows_ok,
+       (delta_merged_count >= 1) AS gpu_delta_merged,
+       (delta_vram_bytes > 0)    AS delta_cache_resident
+FROM pg_stat_gpu_search WHERE index_oid = 'pd_gpu_cagra'::regclass;
+ delta_rows_ok | gpu_delta_merged | delta_cache_resident 
+---------------+------------------+----------------------
+ t             | t                | t
+(1 row)
+
+-- the unique-extremum probe (id 101 == query vector) must surface via the merge.
+SET enable_seqscan = off;
+SELECT id FROM pd_gpu ORDER BY embedding <-> '[100,0,0,0]'::vector LIMIT 1;  -- 101
+ id  
+-----
+ 101
+(1 row)
+
+RESET enable_seqscan;
+-- ============================================================================
+-- Scenario C — cuvs.delta_search tri-mode correctness.
+-- cuvs.delta_search is an INTEGER GUC: 0=auto, 1=cpu, 2=gpu. (PLAN/ROADMAP prose
+-- describes it as auto|cpu|gpu; the GUC itself takes 0/1/2 — a doc/impl mismatch
+-- tracked for reconciliation.) The merge must return the correct top-1 in every
+-- mode. We assert correctness (the extremum probe), NOT daemon counters: the GUC
+-- is backend-only (not forwarded to the daemon), so the daemon merges on GPU
+-- whenever a cache is present regardless of mode — counter deltas are not a
+-- per-mode signal. The user-facing contract is result correctness in all modes.
+-- ============================================================================
+SET enable_seqscan = off;
+SET cuvs.delta_search = 0;   -- auto: GPU-merge when daemon can, CPU-exact fallback
+SELECT id FROM pd_gpu ORDER BY embedding <-> '[101,0,0,0]'::vector LIMIT 1;  -- 102
+ id  
+-----
+ 102
+(1 row)
+
+SET cuvs.delta_search = 1;   -- cpu: always CPU-exact merge
+SELECT id FROM pd_gpu ORDER BY embedding <-> '[101,0,0,0]'::vector LIMIT 1;  -- 102
+ id  
+-----
+ 102
+(1 row)
+
+SET cuvs.delta_search = 2;   -- gpu: GPU-only (daemon merge), no CPU fallback
+SELECT id FROM pd_gpu ORDER BY embedding <-> '[101,0,0,0]'::vector LIMIT 1;  -- 102
+ id  
+-----
+ 102
+(1 row)
+
+RESET cuvs.delta_search;
+RESET enable_seqscan;
+-- ============================================================================
+-- Scenario D — delta disabled (cuvs.max_delta_rows = 0) reverts to Phase 2:
+-- INSERT marks the index stale (no .delta append). Locks the GUC=0 path.
+-- ============================================================================
+CREATE TABLE pd_off (id bigint, embedding vector(4));
+INSERT INTO pd_off VALUES (1,'[1,0,0,0]'),(2,'[0,1,0,0]'),(3,'[0,0,1,0]'),(4,'[0,0,0,1]');
+CREATE INDEX pd_off_cagra ON pd_off USING cagra (embedding vector_l2_ops);
+SELECT stale AS off_fresh_stale
+FROM pg_stat_gpu_search WHERE index_oid = 'pd_off_cagra'::regclass;
+ off_fresh_stale 
+-----------------
+ f
+(1 row)
+
+SET cuvs.max_delta_rows = 0;
+INSERT INTO pd_off VALUES (5,'[1,1,0,0]');   -- delta disabled -> mark stale
+SELECT stale AS off_insert_stale
+FROM pg_stat_gpu_search WHERE index_oid = 'pd_off_cagra'::regclass;
+ off_insert_stale 
+------------------
+ t
+(1 row)
+
+RESET cuvs.max_delta_rows;
+-- ============================================================================
+-- Cleanup
+-- ============================================================================
+DROP TABLE pd_cap, pd_gpu, pd_off;
+DROP EXTENSION pg_cuvs;

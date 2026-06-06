@@ -15,8 +15,15 @@ EXTVERSION     = 0.1.0
 DATA           = sql/pg_cuvs--$(EXTVERSION).sql \
                  sql/pg_cuvs--0.1.0--0.2.0.sql
 MODULE_big     = pg_cuvs
-REGRESS        = smoke cpu_fallback edge_cases cpu_hnsw_fallback build_hnsw build_hnsw_edge pg_cuvs_hnsw metrics brute_force pg_cuvs_batch reloption_dir gc_orphans release_hardening
+REGRESS        = smoke cpu_fallback edge_cases cpu_hnsw_fallback build_hnsw build_hnsw_edge pg_cuvs_hnsw metrics brute_force pg_cuvs_batch reloption_dir gc_orphans release_hardening pending_delta delta_recall
 REGRESS_OPTS   = --inputdir=test --outputdir=test
+
+# Isolation tests (pg_isolation_regress) for concurrent-session correctness that
+# pg_regress cannot express: snapshot-aware tombstone filtering and write/query
+# interleaving. Specs live in test/specs/*.spec, expected in test/expected/*.out.
+# The daemon + GPU must be up, same as REGRESS.
+ISOLATION      = delta_tombstone_snapshot delta_interleaving
+ISOLATION_OPTS = --inputdir=test --outputdir=test
 
 # C source files + the CUDA-compiled wrapper (built below by nvcc).
 # PGXS only knows how to build .c → .o; the .cu → .o rule is custom,
@@ -167,6 +174,16 @@ installcheck-nogpu: test-unit
 
 .PHONY: installcheck-nogpu
 
+# ---- Isolation-only installcheck ----------------------------------------
+# Runs ONLY the isolation suite (concurrent-session correctness), without
+# re-running the full REGRESS suite. Mirrors the ISOLATION branch of the PGXS
+# `installcheck` rule; ISOLATION_OPTS gets --dbname appended by PGXS when
+# ISOLATION is set. Requires a running daemon + GPU, like installcheck.
+installcheck-isolation:
+	$(pg_isolation_regress_installcheck) $(ISOLATION_OPTS) $(ISOLATION)
+
+.PHONY: installcheck-isolation
+
 # ---- Benchmark harness (Phase 1.5 #5) ----------------------------------
 # Parameterized large-dataset benchmark. Runs the bash harness; N/DIM/K/M
 # are passed through ONLY when set on the make command line, so the script's
@@ -194,7 +211,8 @@ VM_HOST = $(if $(VM_IP),$(GCP_USER)@$(VM_IP),$(GCP_VM))
 unexport VM_IP VM_HOST
 
 .PHONY: vm-start vm-stop sync gpu-build gpu-test gpu-bench gpu-bench-1m gpu-shell \
-	gpu-test-unit gpu-test-regress gpu-test-daemon gpu-test-e2e gpu-test-all
+	gpu-test-unit gpu-test-regress gpu-test-isolation gpu-test-daemon gpu-test-e2e \
+	gpu-test-delta-restart gpu-test-all
 
 vm-start:
 	@test -n "$(GCP_INSTANCE)" || (echo "ERROR: set GCP_INSTANCE in .env.gpu"; exit 1)
@@ -272,6 +290,13 @@ gpu-test-regress:
 		source ~/miniforge3/bin/activate $(CONDA_ENV) && \
 		make installcheck"
 
+# Isolation suite (snapshot-aware tombstone, write/query interleaving). Same
+# daemon + GPU prerequisites as gpu-test-regress; runs only the isolation specs.
+gpu-test-isolation:
+	ssh -tt $(VM_HOST) "cd ~/pg_cuvs && \
+		source ~/miniforge3/bin/activate $(CONDA_ENV) && \
+		make installcheck-isolation"
+
 # Fault-injection daemon integration tests. Builds the CUVS_TEST_HOOKS
 # daemon, drives daemon-down / persist-fault / clean-build scenarios on a
 # TEST socket + index dir, then restores the production daemon. Piped over
@@ -285,8 +310,14 @@ gpu-test-daemon:
 gpu-test-e2e:
 	ssh $(VM_HOST) "bash -s" < infra/scripts/e2e-smoke.sh
 
-# Full ladder: unit -> regress -> daemon faults -> e2e durability.
-gpu-test-all: gpu-test-unit gpu-test-regress gpu-test-daemon gpu-test-e2e
+# Phase 3A pending-delta durability + fail-closed across a daemon restart.
+# Piped over stdin (bash -s); plain ssh, no remote TTY needed.
+gpu-test-delta-restart:
+	ssh $(VM_HOST) "bash -s" < infra/scripts/delta-restart-e2e.sh
+
+# Full ladder: unit -> regress -> isolation -> daemon faults -> e2e durability.
+gpu-test-all: gpu-test-unit gpu-test-regress gpu-test-isolation gpu-test-daemon \
+	gpu-test-e2e gpu-test-delta-restart
 
 gpu-server-start:
 	ssh -tt $(VM_HOST) "pg_cuvs_server \
