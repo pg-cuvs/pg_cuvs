@@ -1,0 +1,50 @@
+-- delta_recall.sql — Phase 3A recall under delete-drift (TDD red -> green).
+--
+-- Gap (3A-1 over-fetch/slop): when the base CAGRA's top-cuvs.k candidates are all
+-- tombstoned (deleted + vacuumed), a naive merge filters every dead TID and
+-- returns FEWER than the SQL LIMIT, even though enough LIVE rows exist just
+-- beyond the top-k. The fix over-fetches the base by the pending-tombstone count
+-- so dead-TID filtering cannot starve recall.
+--
+-- Deterministic by construction: the 10 deleted rows sit in a tight near cluster
+-- (distance ~0.01 of origin) and the live rows sit far (distance >= 1000), so the
+-- base's 10 nearest to '[0,0,0,0]' are unambiguously the dead ones. With
+-- cuvs.k=10 the UNFIXED merge yields 0 live rows; the FIXED merge yields >= LIMIT
+-- live rows from the far cluster. We assert the LIVE COUNT (deterministic), not
+-- ids (CAGRA ordering is approximate).
+--
+-- The deletion is kept SUB-THRESHOLD (10 of 400 rows = 2.5%) so the delete-drift
+-- gate does NOT reroute to CPU — the GPU+delta path is exercised, which is where
+-- the shortfall lives. (Heavier deletion is already caught by the drift gate.)
+--
+-- Expected (fixed): live_topk = 5. Against the pre-fix code this yields 0
+-- (the red state that motivates the fix). Requires a running pg_cuvs_server.
+
+CREATE EXTENSION IF NOT EXISTS vector;
+CREATE EXTENSION IF NOT EXISTS pg_cuvs;
+SET cuvs.index_dir = '/tmp/cuvs_indexes';
+
+CREATE TABLE dr (id bigint, embedding vector(4));
+-- near cluster (ids 1..10) within ~0.01 of origin.
+INSERT INTO dr SELECT g, ('['||(g*0.001)||',0,0,0]')::vector FROM generate_series(1,10) g;
+-- far cluster (ids 11..400) at distance >= 1000.
+INSERT INTO dr SELECT g, ('['||(1000+g)||',0,0,0]')::vector FROM generate_series(11,400) g;
+CREATE INDEX dr_cagra ON dr USING cagra (embedding vector_l2_ops);
+
+-- Cap the GPU top-k at 10 so the base returns exactly the near cluster.
+SET cuvs.k = 10;
+-- Delete the entire near cluster and VACUUM -> 10 tombstones over the base's
+-- top-10 candidates (2.5% of rows, below the delete-drift reroute threshold).
+DELETE FROM dr WHERE id <= 10;
+VACUUM dr;
+
+-- GPU+delta path. The base top-10 are all tombstoned; recall must still return
+-- LIMIT live rows from beyond the top-10 (the far cluster). Unfixed: < 5.
+SET enable_seqscan = off;
+SELECT count(*) AS live_topk
+FROM (SELECT id FROM dr ORDER BY embedding <-> '[0,0,0,0]'::vector LIMIT 5) s;
+RESET enable_seqscan;
+RESET cuvs.k;
+
+DROP TABLE dr;
+DROP EXTENSION pg_cuvs;

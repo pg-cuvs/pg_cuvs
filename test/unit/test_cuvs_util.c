@@ -784,6 +784,71 @@ test_delta_format(void)
     ASSERT(hr.base_tids_crc32 == base_crc, "generation token preserved on read");
 }
 
+/* Mirror of test_delta_format for the .tombstone sidecar (Phase 3A-4): round-trip
+ * a header through a FILE* and assert validate accepts the exact body and rejects
+ * a truncated/oversized body, bad magic/version/reserved, and a negative entry
+ * count. Records are fixed 16 bytes ({tid, delete_xid}); there is no dim field. */
+static void
+test_tombstone_format(void)
+{
+    const uint32_t base_crc = 0xFEEDFACEu;
+    const int64_t  n   = 3;
+    const size_t   rec = sizeof(CuvsTombstoneRecord);
+
+    ASSERT(rec == 2 * sizeof(uint64_t), "tombstone record is 16 bytes");
+    ASSERT(sizeof(CuvsTombstoneHeader) == 32, "tombstone header is 32 bytes");
+
+    /* init + round-trip a header through a FILE*. */
+    CuvsTombstoneHeader h;
+    cuvs_tombstone_header_init(&h, base_crc);
+    h.n_entries = n;
+    ASSERT(h.magic == CUVS_TOMBSTONE_MAGIC, "init magic");
+    ASSERT(h.version == CUVS_TOMBSTONE_VERSION, "init version");
+    ASSERT(h.reserved == 0, "init reserved zero");
+    ASSERT(h.base_tids_crc32 == base_crc, "init generation token");
+
+    FILE *f = tmpfile();
+    ASSERT(f != NULL, "tombstone tmpfile open");
+    fwrite(&h, sizeof(h), 1, f);
+    /* n records of {tid, delete_xid} — content does not matter for validate. */
+    for (int64_t i = 0; i < n; i++)
+    {
+        CuvsTombstoneRecord r;
+        r.tid        = cuvs_tid_encode((uint32_t) i, (uint16_t) i);
+        r.delete_xid = (uint64_t) (1000 + i);
+        fwrite(&r, sizeof(r), 1, f);
+    }
+    rewind(f);
+
+    CuvsTombstoneHeader hr;
+    ASSERT(cuvs_tombstone_read_header(f, &hr) == 0, "tombstone read_header ok");
+    ASSERT(hr.n_entries == n, "tombstone header round-trip");
+    ASSERT(cuvs_tombstone_validate(&hr, (int64_t) (n * (int64_t) rec)) == 0,
+           "validate accepts exact body size");
+    ASSERT(cuvs_tombstone_validate(&hr, (int64_t) (n * (int64_t) rec) - 1) == -1,
+           "validate rejects truncated body");
+    ASSERT(cuvs_tombstone_validate(&hr, (int64_t) (n * (int64_t) rec) + rec) == -1,
+           "validate rejects oversized body");
+    fclose(f);
+
+    /* field rejections */
+    CuvsTombstoneHeader b;
+    cuvs_tombstone_header_init(&b, base_crc); b.n_entries = n;
+    b.magic = 0xDEADBEEFu;
+    ASSERT(cuvs_tombstone_validate(&b, (int64_t)(n * (int64_t) rec)) == -1, "reject bad magic");
+    cuvs_tombstone_header_init(&b, base_crc); b.n_entries = n;
+    b.version = 99u;
+    ASSERT(cuvs_tombstone_validate(&b, (int64_t)(n * (int64_t) rec)) == -1, "reject bad version");
+    cuvs_tombstone_header_init(&b, base_crc); b.n_entries = n;
+    b.reserved = 1u;
+    ASSERT(cuvs_tombstone_validate(&b, (int64_t)(n * (int64_t) rec)) == -1, "reject reserved != 0");
+    cuvs_tombstone_header_init(&b, base_crc); b.n_entries = -1;
+    ASSERT(cuvs_tombstone_validate(&b, 0) == -1, "reject negative n_entries");
+
+    /* generation token survives a round-trip so the gate can compare it. */
+    ASSERT(hr.base_tids_crc32 == base_crc, "generation token preserved on read");
+}
+
 static void
 test_lat_histogram(void)
 {
@@ -891,6 +956,7 @@ main(void)
     test_shards_rejections();
     test_auto_shard_count();
     test_delta_format();
+    test_tombstone_format();
     test_lat_histogram();
     test_metric_from_opclass();
 #ifdef CUVS_TEST_HOOKS
