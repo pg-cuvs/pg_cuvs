@@ -221,19 +221,26 @@ int cuvs_ipc_search_batch(
 );
 
 /*
- * cuvs_ipc_build — send a BUILD command to the daemon.
+ * cuvs_ipc_build — send a BUILD command to the daemon (ADR-048).
  *
- * vecs:  corpus vectors, shape [n_vecs][dim], row-major float32
- * tids:  corresponding heap TIDs, length n_vecs
+ * The corpus ([vectors][tids] contiguous) is handed off by tier:
+ *   CORPUS_MEMFD — corpus->fd is passed to the daemon via SCM_RIGHTS (no name,
+ *                  no orphan possible); heap_vecs/heap_tids ignored.
+ *   CORPUS_SHM   — corpus->shm_name carries the segment; caller owns its
+ *                  lifetime (this fn does not unlink it).
+ *   CORPUS_HEAP  — heap_vecs/heap_tids are copied into a fresh named shm here
+ *                  and unlinked here before returning (legacy path).
  *
  * Returns CUVS_STATUS_OK on success.
  */
+struct CuvsBuildCorpus;   /* full definition in cuvs_build_corpus.h */
 int cuvs_ipc_build(
     const char    *socket_path,
     uint32_t       db_oid,
     uint32_t       index_oid,
-    const float   *vecs,
-    const uint64_t *tids,
+    const struct CuvsBuildCorpus *corpus, /* tier + fd + shm_name */
+    const float   *heap_vecs,   /* CORPUS_HEAP only; NULL otherwise */
+    const uint64_t *heap_tids,  /* CORPUS_HEAP only; NULL otherwise */
     int64_t        n_vecs,
     int            dim,
     uint32_t       metric,

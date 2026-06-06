@@ -20,6 +20,7 @@
 #include "cuvs_util.h"
 #include "cuvs_wrapper.h"
 #include "cuvs_objstore.h"
+#include "cuvs_build_corpus.h"   /* ADR-048: cuvs_fd_recv (SCM_RIGHTS build payload) */
 #include <curl/curl.h>
 
 #include <stdio.h>
@@ -3534,13 +3535,16 @@ handle_build(int client_fd, const CuvsCmdFrame *cmd)
 {
     LOG_DEBUG("[handle_build] reading index_dir...\n");
     char index_dir[256] = {0};
-    if (recv_all(client_fd, index_dir, sizeof(index_dir)) < 0)
+    /* ADR-048: the backend may pass the corpus as an SCM_RIGHTS memfd alongside
+     * index_dir (memfd tier); passed_fd is -1 for the shm/heap tiers. */
+    int  passed_fd = -1;
+    if (cuvs_fd_recv(client_fd, index_dir, sizeof(index_dir), &passed_fd) < 0)
     {
         LOG_ERROR("[handle_build] recv index_dir FAILED errno=%d\n", errno);
         send_error(client_fd, "recv index_dir failed");
         return;
     }
-    LOG_DEBUG("[handle_build] got index_dir=%s\n", index_dir);
+    LOG_DEBUG("[handle_build] got index_dir=%s passed_fd=%d\n", index_dir, passed_fd);
 
     /* Reject degenerate or overflowing payload sizes before any allocation.
      * n_vecs*dim*4 can wrap size_t on a 32-bit-ish product (e.g. n_vecs ~2^31,
@@ -3553,6 +3557,7 @@ handle_build(int client_fd, const CuvsCmdFrame *cmd)
     {
         LOG_ERROR("[handle_build] invalid payload n_vecs=%lld dim=%u\n",
                   (long long)cmd->n_vecs, cmd->dim);
+        if (passed_fd >= 0) close(passed_fd);
         send_error(client_fd, "CAGRA build needs at least 2 vectors");
         return;
     }
@@ -3562,6 +3567,7 @@ handle_build(int client_fd, const CuvsCmdFrame *cmd)
         {
             LOG_ERROR("[handle_build] payload size overflow n_vecs=%lld dim=%u\n",
                       (long long)cmd->n_vecs, cmd->dim);
+            if (passed_fd >= 0) close(passed_fd);
             send_error(client_fd, "build payload size overflow");
             return;
         }
@@ -3571,18 +3577,30 @@ handle_build(int client_fd, const CuvsCmdFrame *cmd)
     size_t tid_bytes = (size_t)cmd->n_vecs * sizeof(uint64_t);
     size_t total     = vec_bytes + tid_bytes;
 
-    LOG_DEBUG("[handle_build] shm_open(%s)...\n", cmd->shm_key);
-    int shm_fd = shm_open(cmd->shm_key, O_RDONLY, 0);
-    if (shm_fd < 0)
+    /* ADR-048: memfd tier hands over the corpus as a passed fd (no /dev/shm
+     * name, so a crashed build can never leave an orphan); the shm/heap tiers
+     * name it in cmd->shm_key. Either way the mapping outlives the fd close. */
+    void *mem;
+    if (passed_fd >= 0)
     {
-        LOG_ERROR("[handle_build] shm_open FAILED errno=%d (%s)\n", errno, strerror(errno));
-        send_error(client_fd, "shm_open failed");
-        return;
+        LOG_DEBUG("[handle_build] mmap passed memfd fd=%d total=%zu\n", passed_fd, total);
+        mem = mmap(NULL, total, PROT_READ, MAP_SHARED, passed_fd, 0);
+        close(passed_fd);   /* mapping holds the memory; daemon's ref is dropped here */
     }
-    LOG_DEBUG("[handle_build] shm_open OK fd=%d\n", shm_fd);
-
-    void *mem = mmap(NULL, total, PROT_READ, MAP_SHARED, shm_fd, 0);
-    close(shm_fd);
+    else
+    {
+        LOG_DEBUG("[handle_build] shm_open(%s)...\n", cmd->shm_key);
+        int shm_fd = shm_open(cmd->shm_key, O_RDONLY, 0);
+        if (shm_fd < 0)
+        {
+            LOG_ERROR("[handle_build] shm_open FAILED errno=%d (%s)\n", errno, strerror(errno));
+            send_error(client_fd, "shm_open failed");
+            return;
+        }
+        LOG_DEBUG("[handle_build] shm_open OK fd=%d\n", shm_fd);
+        mem = mmap(NULL, total, PROT_READ, MAP_SHARED, shm_fd, 0);
+        close(shm_fd);
+    }
     if (mem == MAP_FAILED)
     {
         send_error(client_fd, "mmap failed");

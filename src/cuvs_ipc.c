@@ -11,6 +11,7 @@
 
 #include "cuvs_ipc.h"
 #include "cuvs_util.h"   /* leveled logging macros (LOG_ERROR/WARN/INFO/DEBUG) */
+#include "cuvs_build_corpus.h"   /* ADR-048: tiered corpus handoff + SCM_RIGHTS */
 
 /* Hot-path IPC traces (LOG_DEBUG) are gated by PG_CUVS_DEBUG; enable via
  * -DPG_CUVS_DEBUG=1. Error paths (LOG_ERROR) always log unconditionally. */
@@ -704,8 +705,9 @@ cuvs_ipc_build(
     const char    *socket_path,
     uint32_t       db_oid,
     uint32_t       index_oid,
-    const float   *vecs,
-    const uint64_t *tids,
+    const struct CuvsBuildCorpus *corpus,
+    const float   *heap_vecs,
+    const uint64_t *heap_tids,
     int64_t        n_vecs,
     int            dim,
     uint32_t       metric,
@@ -715,21 +717,36 @@ cuvs_ipc_build(
     uint32_t       shard_count,
     uint32_t       use_cpu_hnsw)
 {
-    char shm_key[64];
-    int  shm_fd = -1;
-    int  sock   = -1;
-    int  rc     = CUVS_STATUS_ERROR;
+    char shm_key[64] = "";
+    int  legacy_shm_fd = -1;   /* CORPUS_HEAP only: created + unlinked here */
+    int  pass_fd = -1;         /* CORPUS_MEMFD only: passed via SCM_RIGHTS */
+    int  sock = -1;
+    int  rc   = CUVS_STATUS_ERROR;
+    CuvsCmdFrame cmd;
+    char dir_buf[256] = {0};
+    CuvsReplyHeader hdr;
 
-    make_shm_key(shm_key, sizeof(shm_key));
-    LOG_DEBUG("[cuvs_ipc_build] shm_key=%s socket=%s n_vecs=%lld dim=%d\n",
-        shm_key, socket_path, (long long)n_vecs, dim);
-
-    shm_fd = shm_write_build_payload(shm_key, vecs, tids, n_vecs, dim);
-    if (shm_fd < 0) {
-        LOG_ERROR("[cuvs_ipc_build] shm_write FAILED errno=%d (%s)\n",
-                errno, strerror(errno));
-        goto cleanup;
+    /* Stage the payload by tier. */
+    if (corpus->kind == CORPUS_MEMFD)
+    {
+        pass_fd = corpus->fd;                 /* anonymous; daemon mmaps the fd */
     }
+    else if (corpus->kind == CORPUS_SHM)
+    {
+        strncpy(shm_key, corpus->shm_name, sizeof(shm_key) - 1);  /* daemon shm_open by name */
+    }
+    else  /* CORPUS_HEAP: copy into a fresh named shm, unlinked at cleanup */
+    {
+        make_shm_key(shm_key, sizeof(shm_key));
+        legacy_shm_fd = shm_write_build_payload(shm_key, heap_vecs, heap_tids, n_vecs, dim);
+        if (legacy_shm_fd < 0) {
+            LOG_ERROR("[cuvs_ipc_build] shm_write FAILED errno=%d (%s)\n",
+                    errno, strerror(errno));
+            goto cleanup;
+        }
+    }
+    LOG_DEBUG("[cuvs_ipc_build] tier=%d shm_key=%s pass_fd=%d socket=%s n_vecs=%lld dim=%d\n",
+        (int)corpus->kind, shm_key, pass_fd, socket_path, (long long)n_vecs, dim);
 
     sock = uds_connect_ex(socket_path, 600);  /* BUILD can take minutes */
     if (sock < 0) {
@@ -739,37 +756,29 @@ cuvs_ipc_build(
         goto cleanup;
     }
 
-    CuvsCmdFrame cmd = {
-        .op           = CUVS_OP_BUILD,
-        .db_oid       = db_oid,
-        .index_oid    = index_oid,
-        .k            = 0,
-        .metric       = metric,
-        .dim          = (uint32_t)dim,
-        .n_vecs       = n_vecs,
-        .table_oid    = table_oid,
-        .relfilenode  = relfilenode,
-        .shard_count  = shard_count,
-        .use_cpu_hnsw = use_cpu_hnsw,  /* Phase 3I-1: 1 = serialize .hnsw sidecar */
-    };
-    strncpy(cmd.shm_key, shm_key, sizeof(cmd.shm_key) - 1);
+    memset(&cmd, 0, sizeof(cmd));
+    cmd.op           = CUVS_OP_BUILD;
+    cmd.db_oid       = db_oid;
+    cmd.index_oid    = index_oid;
+    cmd.metric       = metric;
+    cmd.dim          = (uint32_t)dim;
+    cmd.n_vecs       = n_vecs;
+    cmd.table_oid    = table_oid;
+    cmd.relfilenode  = relfilenode;
+    cmd.shard_count  = shard_count;
+    cmd.use_cpu_hnsw = use_cpu_hnsw;  /* Phase 3I-1: 1 = serialize .hnsw sidecar */
+    strncpy(cmd.shm_key, shm_key, sizeof(cmd.shm_key) - 1);  /* "" for memfd tier */
 
-    /*
-     * Pack index_dir into the reserved area of the command. We reuse
-     * the shm_key field convention: append a second null-terminated
-     * string immediately after CuvsCmdFrame in a wrapper struct.
-     */
     if (send_all(sock, &cmd, sizeof(cmd)) < 0)
         goto cleanup;
 
-    /* Send index_dir as a fixed 256-byte field. */
-    char dir_buf[256] = {0};
+    /* index_dir (fixed 256B) carries the SCM_RIGHTS fd for the memfd tier; for
+     * shm/heap pass_fd is -1 and only the bytes are sent. Daemon recvmsg's both. */
     if (index_dir)
         strncpy(dir_buf, index_dir, sizeof(dir_buf) - 1);
-    if (send_all(sock, dir_buf, sizeof(dir_buf)) < 0)
+    if (cuvs_fd_send(sock, pass_fd, dir_buf, sizeof(dir_buf)) < 0)
         goto cleanup;
 
-    CuvsReplyHeader hdr;
     if (recv_all(sock, &hdr, sizeof(hdr)) < 0)
         goto cleanup;
 
@@ -778,9 +787,13 @@ cuvs_ipc_build(
 cleanup:
     if (sock >= 0)
         close(sock);
-    if (shm_fd >= 0)
-        close(shm_fd);
-    shm_unlink(shm_key);
+    /* Only the legacy heap-tier shm is owned here; the memfd/shm corpus lifetime
+     * belongs to the caller (released via cuvs_corpus_close). */
+    if (legacy_shm_fd >= 0)
+    {
+        close(legacy_shm_fd);
+        shm_unlink(shm_key);
+    }
     return rc;
 }
 
