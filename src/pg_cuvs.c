@@ -116,6 +116,13 @@ static const struct config_enum_entry cuvs_bf_precision_options[] = {
     {"float16", 1, false},
     {NULL, 0, false}
 };
+/* Phase 3A delta search mode (string in SQL, mapped to int in C). */
+static const struct config_enum_entry cuvs_delta_search_options[] = {
+    {"auto", 0, false},
+    {"cpu",  1, false},
+    {"gpu",  2, false},
+    {NULL, 0, false}
+};
 
 /* ----------------------------------------------------------------
  * Last-search stats (process-local; one slot per backend)
@@ -362,15 +369,16 @@ _PG_init(void)
         PGC_USERSET,
         0, NULL, NULL, NULL);
 
-    DefineCustomIntVariable(
+    DefineCustomEnumVariable(
         "cuvs.delta_search",
-        "Delta search mode: 0=auto, 1=cpu, 2=gpu.",
+        "Delta search mode for a cagra scan: auto (default), cpu, or gpu.",
         "Controls how pending-delta rows are searched during a cagra scan. "
-        "auto (0): GPU-merge when daemon can, CPU-exact fallback otherwise. "
-        "cpu (1): always CPU-exact merge, ignore daemon delta cache. "
-        "gpu (2): GPU-only, no CPU fallback (may miss delta rows).",
+        "auto: GPU-merge when the daemon can, CPU-exact fallback otherwise. "
+        "cpu: always CPU-exact merge, ignore the daemon delta cache. "
+        "gpu: GPU-only, no CPU fallback (may miss delta rows).",
         &cuvs_delta_search_mode,
-        0, 0, 2,
+        0,
+        cuvs_delta_search_options,
         PGC_USERSET,
         0, NULL, NULL, NULL);
 

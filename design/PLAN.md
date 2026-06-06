@@ -348,7 +348,7 @@ query vector
 Delivered scope:
 - **3A-1 CPU-exact MVP**: backend-side `.delta` append + CPU exact merge로 INSERT/UPDATE new version을 보정한다.
 - **3A-2 GPU delta cache core**: daemon이 `.delta`를 generation/mtime 기준 lazy reload하고, resident GPU brute-force delta cache를 base CAGRA 결과와 merge한다. IPC reply의 `delta_merged` flag로 backend가 CPU merge fallback을 생략할지 결정한다.
-- **3A-3 delta controls/stats**: `cuvs.delta_search`(정수 GUC: 0=auto, 1=cpu, 2=gpu)와 `pg_stat_gpu_search` delta columns(`delta_rows`, `delta_generation`, `delta_vram_bytes`, `delta_merged_count`, `delta_search_mode`)로 delta 경로를 관측·강제할 수 있다. (GUC는 `DefineCustomIntVariable`이라 정수만 받는다 — `auto`/`cpu`/`gpu` 문자열은 `invalid value` ERROR. 향후 enum 전환은 ADR-047 후속 항목.)
+- **3A-3 delta controls/stats**: `cuvs.delta_search`(enum GUC: `auto`(기본)|`cpu`|`gpu`)와 `pg_stat_gpu_search` delta columns(`delta_rows`, `delta_generation`, `delta_vram_bytes`, `delta_merged_count`, `delta_search_mode`)로 delta 경로를 관측·강제할 수 있다. (GUC는 `DefineCustomEnumVariable`이라 `SET cuvs.delta_search='cpu'` 형태의 문자열 라벨을 받는다 — 잘못된 라벨은 `invalid value` ERROR. SRF 출력 컬럼 `delta_search_mode`는 마지막 검색이 실제 쓴 모드(gpu/cpu/none)로 GUC와 별개.)
 - **3A-4 tombstone/cleanup**: `.tombstone` sidecar와 snapshot-aware backend filtering으로 DELETE/UPDATE-old dead TID를 보정한다. `ambulkdelete`는 dead TID를 tombstone으로 기록하고, tombstone append 실패·cap 초과·unusable 상태에서만 stale fallback으로 닫힌다.
 - daemon-side GPU delta cache는 성능 경로이고, backend CPU merge/tombstone filter는 daemon이 merge하지 못한 경우의 correctness fallback이다.
 

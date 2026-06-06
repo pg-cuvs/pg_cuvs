@@ -99,36 +99,38 @@ SELECT id FROM pd_gpu ORDER BY embedding <-> '[100,0,0,0]'::vector LIMIT 1;  -- 
 RESET enable_seqscan;
 -- ============================================================================
 -- Scenario C — cuvs.delta_search tri-mode correctness.
--- cuvs.delta_search is an INTEGER GUC: 0=auto, 1=cpu, 2=gpu. (PLAN/ROADMAP prose
--- describes it as auto|cpu|gpu; the GUC itself takes 0/1/2 — a doc/impl mismatch
--- tracked for reconciliation.) The merge must return the correct top-1 in every
--- mode. We assert correctness (the extremum probe), NOT daemon counters: the GUC
--- is backend-only (not forwarded to the daemon), so the daemon merges on GPU
--- whenever a cache is present regardless of mode — counter deltas are not a
--- per-mode signal. The user-facing contract is result correctness in all modes.
+-- cuvs.delta_search is an ENUM GUC: auto (default), cpu, gpu. The merge must
+-- return the correct top-1 in every mode. We assert correctness (the extremum
+-- probe), NOT daemon counters: the GUC is backend-only (not forwarded to the
+-- daemon), so the daemon merges on GPU whenever a cache is present regardless of
+-- mode — counter deltas are not a per-mode signal. The user-facing contract is
+-- result correctness in all three modes. An invalid label must ERROR.
 -- ============================================================================
 SET enable_seqscan = off;
-SET cuvs.delta_search = 0;   -- auto: GPU-merge when daemon can, CPU-exact fallback
+SET cuvs.delta_search = 'auto';   -- GPU-merge when daemon can, CPU-exact fallback
 SELECT id FROM pd_gpu ORDER BY embedding <-> '[101,0,0,0]'::vector LIMIT 1;  -- 102
  id  
 -----
  102
 (1 row)
 
-SET cuvs.delta_search = 1;   -- cpu: always CPU-exact merge
+SET cuvs.delta_search = 'cpu';    -- always CPU-exact merge
 SELECT id FROM pd_gpu ORDER BY embedding <-> '[101,0,0,0]'::vector LIMIT 1;  -- 102
  id  
 -----
  102
 (1 row)
 
-SET cuvs.delta_search = 2;   -- gpu: GPU-only (daemon merge), no CPU fallback
+SET cuvs.delta_search = 'gpu';    -- GPU-only (daemon merge), no CPU fallback
 SELECT id FROM pd_gpu ORDER BY embedding <-> '[101,0,0,0]'::vector LIMIT 1;  -- 102
  id  
 -----
  102
 (1 row)
 
+SET cuvs.delta_search = 'bogus';  -- invalid enum label -> ERROR
+ERROR:  invalid value for parameter "cuvs.delta_search": "bogus"
+HINT:  Available values: auto, cpu, gpu.
 RESET cuvs.delta_search;
 RESET enable_seqscan;
 -- ============================================================================
