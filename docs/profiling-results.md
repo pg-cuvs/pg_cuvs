@@ -215,3 +215,30 @@ journalctl -u pg-cuvs-server | grep -E 'handle_build|built index'
   detoast 제거)·4A-2 parallel maintenance workers(heap scan 분산)가 다음 레버. memfd는 그 둘의 enabler
   (worker buffer도 corpus 위에 직접).
 - **peak RSS −32%**(= corpus 크기)는 대규모/동시-빌드/메모리-제약 환경에서 fit-vs-OOM을 가름.
+
+---
+
+## 8. 빌드 병렬화: parallel maintenance workers (ADR-058, 2026-06-07)
+
+`table_index_build_scan`을 PostgreSQL parallel index build로 병렬화(워커별 named-shm partial → 리더가 memfd로
+merge). north-star = backend 오버헤드(=total − GPU floor) 제거율.
+
+### bench_500000 (dim1024) — workers=0 vs 4
+
+| workers | total | GPU floor | backend 오버헤드 |
+|---------|-------|-----------|------------------|
+| 0 (단일) | 39.2 s | ~33 s | **~6.2 s** |
+| 4 (병렬) | 36.5 s | ~32 s | **~4.5 s (−27%)** |
+
+- **정합**: 고유-벡터 데이터에서 self-NN 단일=병렬 5/5(merge가 (vec,tid) pairing 보존). installcheck 15/15 무회귀.
+- **한계(merge가 병목)**: 단일 경로는 corpus를 1회만 씀(memfd 직접). 병렬은 worker가 partial에 1회 쓰고
+  **리더가 모든 partial을 최종 memfd로 다시 복사(merge)** = corpus 2-pass. backend(병렬) ≈ 분산스캔(~1.2s) +
+  **merge 복사(~3s)** ≈ 4.5s. 즉 스캔은 ~5배 빨라졌으나 **merge가 절감분을 대부분 먹어** 순이득 −27%에 그침.
+  merge 복사가 4A-2 이득의 상한(ADR-057이 없앤 복사를 부분 재도입).
+- **wall-clock은 GPU floor(~33s) 지배라 marginal**(39→36s). 가치는 backend 오버헤드 제거(north-star).
+- **다음 레버**: (a) **merge 복사 제거** — 데몬이 worker별 다중 partial을 직접 mmap(프로토콜 변경)하면 2-pass→
+  1-pass, 분산스캔 이득이 그대로 살아남. (b) **PLAIN storage(§4)** — detoast 자체 제거(직교).
+
+> 주의: 이 문서의 1M 벤치 테이블(bench1m/bench_500000)은 uncorrelated subquery 생성이라 **모든 행이 동일
+> 벡터**(InitPlan 1회 평가) — 빌드 시간/오버헤드 측정엔 유효하나 **recall 측정엔 무효**. recall은 고유-벡터
+> 테이블(예: `array_agg(random() ...) GROUP BY id`)로 별도 검증.
