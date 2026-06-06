@@ -408,3 +408,6 @@ gpu-anbench-agg:
 
 # Convenience: full cycle on the VM (sync → build → install → test).
 gpu-cycle: sync gpu-build gpu-install gpu-test
+check-extend:
+	ssh $$(VM_HOST) "find /usr/local/include ~/miniforge3 /opt/conda -name cagra.h -path '*/cuvs/*' 2>/dev/null | head -3 && echo --- && grep -i extend \$$(find /usr/local/include ~/miniforge3 /opt/conda -name cagra.h -path '*/cuvs/*' 2>/dev/null | head -1) 2>/dev/null | head -40"
+
