@@ -1120,7 +1120,7 @@ heap scan + varlena decode ~15-20s는 PG 오버헤드 45s 중 가장 큰 단일 
 
 현실적 대응:
 - parallel workers(4A-2)가 wall-clock 분산으로 유일한 단기 가속 수단이다.
-- PLAIN storage(`ALTER TABLE ... SET STORAGE PLAIN`)는 사용자 선택이며, 빌드 성능 ~25-35% 개선이 가능하나 일반 쿼리 성능 저하 트레이드오프가 있다. OPS_GPU_PLAYBOOK에 "빌드 성능 최적화 팁"으로 안내한다.
+- PLAIN storage(`ALTER TABLE ... SET STORAGE PLAIN`)는 사용자 선택이며, 빌드 성능 개선이 가능하나 일반 쿼리 성능 저하 트레이드오프가 있다. OPS_GPU_PLAYBOOK에 "빌드 성능 최적화 팁"으로 안내한다. *(이 단락의 "~45s PG 오버헤드"·"~25-35% 개선"은 ADR-044 프로파일링 이전 추정 — 실측은 backend ~15.5s, PLAIN 빌드 절감 ~8%. `docs/best-practices.md` §1 참조.)*
 - 장기 모니터링 대상: pgvector fixed-length storage 지원 여부, PG 코어 TOAST prefetch/streaming API.
 
 ### 4B — import_hnsw 페이지 write 병목 감소

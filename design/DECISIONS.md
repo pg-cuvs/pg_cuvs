@@ -1541,7 +1541,7 @@ pg_cuvs의 데이터 경로(빌드/검색/export)에서 PG backend - daemon - GP
   - **4A-2 (parallel workers)**: heap scan+detoast 병렬화 → backend ~15.5s→~7s, **~8-12s(~10-14%)**, 난이도 중간.
   - 빌드가 일회성(CREATE INDEX/REINDEX)이라 쿼리 경로 대비 **긴급도만 낮을 뿐 저가치 아님**. 빌드 속도가 우선이면 4A-1→4A-2.
 - **적응형 마이크로배칭 → CAGRA 단일 쿼리엔 제한적**(IPC 33% 상한), BF 모드·동시성 throughput에 한정해 가치.
-- **ADR-043 PLAIN 권장 → 유지하되 문구를 8% 빌드 절감 + 디스크/INSERT 이득으로 보정**.
+- **ADR-043 PLAIN 권장 → 유지하되 문구를 8% 빌드 절감 + 디스크/INSERT 이득으로 보정** *(적용됨 2026-06-07: `docs/best-practices.md` §1 + `src/pg_cuvs.c` TOAST NOTICE 주석의 "~25-35%"를 실측 ~8%로 보정, main heap 134× 팽창 트레이드오프 명시)*.
 - **ADR-035 병렬 page write 제외 → 유지**(buffer manager 39% 거부 근거 강화).
 
 ### 대안

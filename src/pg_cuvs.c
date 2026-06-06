@@ -1736,8 +1736,11 @@ cuvs_ambuild(Relation heapRel, Relation indexRel, IndexInfo *indexInfo)
     /* Wave 1 release-hardening: build-time advisories (ADR-043 / OBJSTORE-03).
      * Emitted once per CREATE INDEX / REINDEX; never force a change. */
     {
-        /* (1) TOAST: a toastable vector column pays detoast overhead (~25-35%
-         * of build heap scan) when rows are large enough to be stored out-of-line.
+        /* (1) TOAST: a toastable vector column pays detoast overhead when rows
+         * are large enough to be stored out-of-line. Measured (ADR-044, 1M×1024):
+         * detoast ~6.8s of the ~15.5s build backend, i.e. ~8% of total build time
+         * (PLAIN also wins ~10% on INSERT + total disk). An earlier estimate of
+         * "~25-35%" was an over-claim corrected by VM profiling.
          * pgvector's `vector` default storage is EXTERNAL ('e'); EXTENDED ('x')
          * also toasts. Only warn when the declared dimension is large enough that
          * rows actually TOAST (~2KB) — small vectors stay inline regardless of
