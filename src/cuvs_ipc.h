@@ -73,16 +73,28 @@ typedef struct CuvsCmdFrame {
     uint32_t search_mode;   /* SEARCH/SEARCH_BATCH: Phase 3L; 0=cagra (default), 1=brute_force */
     uint32_t bf_precision;  /* SEARCH/SEARCH_BATCH: Phase 3L; 0=float32, 1=float16 (BF only) */
     uint32_t bf_batch_wait_us; /* SEARCH: Phase 3L; daemon BF micro-batch window (0=off) */
+    uint32_t n_partials;    /* BUILD: ADR-059; 0 = single corpus (shm_key/passed fd),
+                             * >0 = N worker partials follow the index_dir frame as a
+                             * CuvsPartialDesc list (daemon mmaps each → direct H2D). */
 } CuvsCmdFrame;
 
 /*
- * shm layout for BUILD:
+ * shm layout for BUILD (single corpus, n_partials == 0):
  *   [float32 vectors: n_vecs × dim]  (row-major)
  *   [uint64_t tids:   n_vecs]        (block << 16 | offset)
  *
  * shm layout for SEARCH:
  *   [float32 query:   dim]
+ *
+ * ADR-059 multi-partial BUILD (n_partials > 0): after the cmd frame and the
+ * index_dir frame, the leader sends n_partials × CuvsPartialDesc. Each names a
+ * worker's named-shm partial with the same [vectors][tids] layout above (sized
+ * to that partial's n_vecs). Σ desc.n_vecs == cmd.n_vecs.
  */
+typedef struct CuvsPartialDesc {
+    char     shm_name[64];  /* named-shm segment (shm_open by the daemon) */
+    int64_t  n_vecs;        /* vectors in this partial; 0 = skip */
+} CuvsPartialDesc;
 
 /* ----------------------------------------------------------------
  * Reply frame (sent over UDS, variable size)
@@ -249,6 +261,33 @@ int cuvs_ipc_build(
     uint32_t       relfilenode, /* heap relfilenode (heap compat identity) */
     uint32_t       shard_count, /* Phase 3F: 0/1 = unsharded, >=2 = N shards */
     uint32_t       use_cpu_hnsw /* Phase 3I-1: 1 = serialize .hnsw sidecar */
+);
+
+/*
+ * cuvs_ipc_build_multi — ADR-059: send a BUILD command referencing N worker
+ * named-shm partials instead of one merged corpus. The daemon shm_open's each
+ * partial and streams it straight to the GPU (cuvs_cagra_build_multi), removing
+ * the leader's merge copy. The caller (parallel-build leader) owns the partials'
+ * lifetime — it unlinks them after this returns.
+ *
+ * No SCM_RIGHTS fd is passed (pass_fd = -1); partials are named. Σ partials[i].
+ * n_vecs must equal total. Empty partials (n_vecs == 0) may be included and are
+ * skipped by the daemon. Returns CUVS_STATUS_OK on success.
+ */
+int cuvs_ipc_build_multi(
+    const char    *socket_path,
+    uint32_t       db_oid,
+    uint32_t       index_oid,
+    const CuvsPartialDesc *partials,
+    uint32_t       n_partials,
+    int64_t        total,       /* Σ partials[i].n_vecs */
+    int            dim,
+    uint32_t       metric,
+    const char    *index_dir,
+    uint32_t       table_oid,
+    uint32_t       relfilenode,
+    uint32_t       shard_count,
+    uint32_t       use_cpu_hnsw
 );
 
 /*

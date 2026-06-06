@@ -939,6 +939,81 @@ test_auto_shard_count(void)
     ASSERT(cuvs_auto_shard_count(2, 16, 100, 4, 256) == 0, "2 vecs cannot split -> 0");
 }
 
+/* ADR-059: cuvs_vectors_write_multi must produce byte-identical output to
+ * cuvs_vectors_write over the logically concatenated corpus — this is the
+ * sidecar half of the multi-partial build correctness invariant (the GPU build
+ * half is the VM self-NN single==parallel check). */
+static void
+test_vectors_write_multi(void)
+{
+    const uint32_t dim = 4, metric = CUVS_METRIC_L2, gen = 0xABCD1234u;
+    /* 6 vectors, row-major. */
+    float vecs[6 * 4] = {
+        1,0,0,0,   0,1,0,0,   0,0,1,0,
+        0,0,0,1,   2,2,2,2,   3,1,4,1,
+    };
+
+    /* (1) [2,1,3] partitioning == single 6-vec corpus, byte-for-byte. */
+    {
+        const int64_t n_each[3] = { 2, 1, 3 };
+        const float  *parts[3]  = { &vecs[0], &vecs[2 * 4], &vecs[3 * 4] };
+        unsigned char *bs = NULL, *bm = NULL;
+        long ns = 0, nm = 0;
+        FILE *f;
+
+        f = tmpfile(); ASSERT(f != NULL, "wm: single tmpfile");
+        ASSERT(cuvs_vectors_write(f, 6, dim, metric, gen, vecs) == 0, "wm: single write");
+        fflush(f); ns = ftell(f); rewind(f);
+        bs = malloc(ns); ASSERT(fread(bs, 1, ns, f) == (size_t)ns, "wm: single readback"); fclose(f);
+
+        f = tmpfile(); ASSERT(f != NULL, "wm: multi tmpfile");
+        ASSERT(cuvs_vectors_write_multi(f, n_each, 3, dim, metric, gen, parts) == 0, "wm: multi write");
+        fflush(f); nm = ftell(f); rewind(f);
+        bm = malloc(nm); ASSERT(fread(bm, 1, nm, f) == (size_t)nm, "wm: multi readback"); fclose(f);
+
+        ASSERT(ns == nm, "wm: same byte length");
+        if (bs && bm && ns == nm)
+            ASSERT(memcmp(bs, bm, ns) == 0, "wm: multi-partition == single corpus (byte-identical)");
+        free(bs); free(bm);
+    }
+
+    /* (2) empty partition (n_each==0, ptr may be NULL) is skipped: [2,0,4] == single 6. */
+    {
+        const int64_t n_each[3] = { 2, 0, 4 };
+        const float  *parts[3]  = { &vecs[0], NULL, &vecs[2 * 4] };
+        unsigned char *bm = NULL, *bs = NULL;
+        long nm = 0, ns = 0;
+        FILE *f;
+
+        f = tmpfile(); ASSERT(f != NULL, "wm: empty-part tmpfile");
+        ASSERT(cuvs_vectors_write_multi(f, n_each, 3, dim, metric, gen, parts) == 0, "wm: empty-part write");
+        fflush(f); nm = ftell(f); rewind(f);
+        bm = malloc(nm); ASSERT(fread(bm, 1, nm, f) == (size_t)nm, "wm: empty-part readback"); fclose(f);
+
+        f = tmpfile(); cuvs_vectors_write(f, 6, dim, metric, gen, vecs);
+        fflush(f); ns = ftell(f); rewind(f);
+        bs = malloc(ns); ASSERT(fread(bs, 1, ns, f) == (size_t)ns, "wm: ref readback"); fclose(f);
+
+        ASSERT(nm == ns && bm && bs && memcmp(bm, bs, nm) == 0, "wm: empty partition skipped == single");
+        free(bm); free(bs);
+    }
+
+    /* (3) a multi-written file reads back with body == concatenation. */
+    {
+        const int64_t n_each[2] = { 4, 2 };
+        const float  *parts[2]  = { &vecs[0], &vecs[4 * 4] };
+        CuvsVectorsHeader h;
+        float *o = NULL;
+        FILE *f = tmpfile();
+        cuvs_vectors_write_multi(f, n_each, 2, dim, metric, gen, parts);
+        rewind(f);
+        ASSERT(cuvs_vectors_read(f, &h, &o) == 0, "wm: read multi-written ok");
+        ASSERT(h.n_vecs == 6, "wm: read n_vecs == 6");
+        if (o) { ASSERT(memcmp(o, vecs, sizeof(vecs)) == 0, "wm: read body == concatenation"); free(o); }
+        fclose(f);
+    }
+}
+
 int
 main(void)
 {
@@ -950,6 +1025,7 @@ main(void)
     test_tids_roundtrip();
     test_tids_rejections();
     test_vectors_roundtrip();
+    test_vectors_write_multi();
     test_vectors_rejections();
     test_bf_batch_group();
     test_shards_roundtrip();

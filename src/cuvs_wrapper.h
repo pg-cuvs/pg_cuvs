@@ -108,6 +108,23 @@ CuvsCagraIndex cuvs_cagra_build(
     int          device_id
 );
 
+/*
+ * ADR-059: build a CAGRA index from N host partitions without host-side
+ * concatenation. d_corpus[total][dim] is allocated once and each partition i
+ * ([n_each[i]][dim] at vecs[i]) is copied to its row offset. Σ n_each == total.
+ * Used by the daemon to stream parallel-build worker partials straight to the
+ * GPU (no leader merge copy). cuvs_cagra_build is the n_parts==1 special case.
+ */
+CuvsCagraIndex cuvs_cagra_build_multi(
+    const float **vecs,
+    const int64_t *n_each,
+    int           n_parts,
+    int64_t       total,
+    int           dim,
+    uint32_t      metric,
+    int           device_id
+);
+
 int cuvs_cagra_search(
     CuvsCagraIndex   index,
     const float     *query_vec,

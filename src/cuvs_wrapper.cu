@@ -469,18 +469,35 @@ cuvs_distance_type(uint32_t metric)
     }
 }
 
+/* ADR-059: build a CAGRA index from N host partitions WITHOUT host-side
+ * concatenation. One device matrix [total][dim] is allocated and each partition
+ * is copied to its row offset (N H2D copies vs one). This lets the daemon stream
+ * parallel-build worker partials (separate named-shm segments) straight to the
+ * GPU, eliminating the leader's merge copy (ADR-058 bottleneck).
+ *
+ * Correctness: CAGRA is order-independent and the daemon pairs (vector[i],
+ * tid[i]) positionally, so concatenating partitions (each partition's pairs kept
+ * in order) is equivalent to a single contiguous corpus. n_parts==1 reduces to a
+ * single offset-0 copy — byte-identical to the legacy single-corpus build. */
 extern "C" CuvsCagraIndex
-cuvs_cagra_build(const float *vecs, int64_t n_vecs, int dim, uint32_t metric,
-                 int device_id)
+cuvs_cagra_build_multi(const float **vecs, const int64_t *n_each, int n_parts,
+                       int64_t total, int dim, uint32_t metric, int device_id)
 {
     PooledRes _pr(device_id);
     try {
         raft::device_resources &res = _pr.get();
 
-        /* Upload corpus to device. d_corpus will be moved into the impl
-         * struct below so its memory stays alive for the index's lifetime. */
-        auto d_corpus = raft::make_device_matrix<float, int64_t>(res, n_vecs, (int64_t)dim);
-        raft::copy(d_corpus.data_handle(), vecs, n_vecs * dim, res.get_stream());
+        /* One device matrix for the whole corpus; moved into the impl below so
+         * its memory stays alive for the index's lifetime. */
+        auto d_corpus = raft::make_device_matrix<float, int64_t>(res, total, (int64_t)dim);
+        int64_t off = 0;   /* running row offset into d_corpus */
+        for (int i = 0; i < n_parts; i++) {
+            if (n_each[i] <= 0)
+                continue;   /* empty worker share: nothing to copy */
+            raft::copy(d_corpus.data_handle() + off * (int64_t)dim,
+                       vecs[i], n_each[i] * (int64_t)dim, res.get_stream());
+            off += n_each[i];
+        }
         res.sync_stream();
 
         /* CAGRA build parameters (defaults are good for Phase 1). The metric is
@@ -502,14 +519,24 @@ cuvs_cagra_build(const float *vecs, int64_t n_vecs, int dim, uint32_t metric,
 
         return new CuvsCagraIndexImpl(std::move(d_corpus), std::move(idx));
     } catch (const std::exception &e) {
-        fprintf(stderr, "[cuvs_cagra_build] exception: %s\n", e.what());
+        fprintf(stderr, "[cuvs_cagra_build_multi] exception: %s\n", e.what());
         _pr.poison();
         return nullptr;
     } catch (...) {
-        fprintf(stderr, "[cuvs_cagra_build] unknown exception\n");
+        fprintf(stderr, "[cuvs_cagra_build_multi] unknown exception\n");
         _pr.poison();
         return nullptr;
     }
+}
+
+extern "C" CuvsCagraIndex
+cuvs_cagra_build(const float *vecs, int64_t n_vecs, int dim, uint32_t metric,
+                 int device_id)
+{
+    /* Single-partition special case of the multi-partition build. */
+    const float  *parts[1]  = { vecs };
+    const int64_t n_each[1] = { n_vecs };
+    return cuvs_cagra_build_multi(parts, n_each, 1, n_vecs, dim, metric, device_id);
 }
 
 /* ----------------------------------------------------------------

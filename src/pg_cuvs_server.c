@@ -16,6 +16,14 @@
  *                  --max-vram-mb 20480
  */
 
+/* The Makefile builds with -D_POSIX_C_SOURCE=200809L, which hides glibc's
+ * __USE_MISC extensions (e.g. MAP_ANONYMOUS, used by the ADR-059 multi-shard
+ * fallback). Re-enable them; additive alongside _POSIX_C_SOURCE. Must precede
+ * any system header. */
+#ifndef _DEFAULT_SOURCE
+#define _DEFAULT_SOURCE 1
+#endif
+
 #include "cuvs_ipc.h"
 #include "cuvs_util.h"
 #include "cuvs_wrapper.h"
@@ -3530,6 +3538,19 @@ build_sharded(int client_fd, const CuvsCmdFrame *cmd, const char *index_dir,
  * Failure between renames is logged; partial state may persist on disk but
  * registry is rolled back so memory state stays consistent.
  * ---------------------------------------------------------------- */
+/* ADR-059: upper bound on parallel-build worker partials accepted from a single
+ * BUILD frame (defensive against a malformed n_partials). A real build has at
+ * most max_parallel_maintenance_workers + 1 participants. */
+#define CUVS_BUILD_MAX_PARTIALS 256
+
+static void handle_build_multi(int client_fd, const CuvsCmdFrame *cmd,
+                               const char *index_dir);
+static void finish_build_commit(int client_fd, const CuvsCmdFrame *cmd,
+                                const char *save_dir, CuvsCagraIndex new_handle,
+                                uint64_t *new_tids, int target_gpu, size_t needed,
+                                int vectors_committed, const char *vecs_tmp,
+                                const char *vecs_final);
+
 static void
 handle_build(int client_fd, const CuvsCmdFrame *cmd)
 {
@@ -3571,6 +3592,18 @@ handle_build(int client_fd, const CuvsCmdFrame *cmd)
             send_error(client_fd, "build payload size overflow");
             return;
         }
+    }
+
+    /* ADR-059: the parallel-build leader can hand off N worker named-shm
+     * partials instead of one merged corpus. That path is self-contained
+     * (receives the descriptor list, mmaps each partial, builds via direct
+     * multi-H2D). The multi path never carries an SCM_RIGHTS fd. */
+    if (cmd->n_partials > 0)
+    {
+        if (passed_fd >= 0)
+            close(passed_fd);
+        handle_build_multi(client_fd, cmd, index_dir);
+        return;
     }
 
     size_t vec_bytes = (size_t)cmd->n_vecs * cmd->dim * sizeof(float);
@@ -3752,6 +3785,23 @@ handle_build(int client_fd, const CuvsCmdFrame *cmd)
     }
     munmap(mem, total);
 
+    /* ADR-059: the persist/commit/registry/reply sequence is shared with the
+     * multi-partial build path (handle_build_multi). */
+    finish_build_commit(client_fd, cmd, save_dir, new_handle, new_tids,
+                        target_gpu, needed, vectors_committed, vecs_tmp, vecs_final);
+}
+
+/* Persist a freshly built CAGRA index (tmp+rename), swap it into the registry,
+ * and reply OK — the durable commit tail shared by the single-corpus and ADR-059
+ * multi-partial build paths. On entry the caller holds g_index_mutex, has built
+ * new_handle, assembled the contiguous new_tids, and staged the .vectors sidecar
+ * (vectors_committed + vecs_tmp/vecs_final). This releases g_index_mutex. */
+static void
+finish_build_commit(int client_fd, const CuvsCmdFrame *cmd, const char *save_dir,
+                    CuvsCagraIndex new_handle, uint64_t *new_tids, int target_gpu,
+                    size_t needed, int vectors_committed, const char *vecs_tmp,
+                    const char *vecs_final)
+{
     char idx_final[512],  idx_tmp[576];
     char tids_final[512], tids_tmp[576];
     index_file_path(idx_final,  sizeof(idx_final),  save_dir, cmd->db_oid, cmd->index_oid);
@@ -4009,6 +4059,276 @@ persist_fail:
     free(new_tids);
     pthread_mutex_unlock(&g_index_mutex);
     send_error_code(client_fd, CUVS_STATUS_PERSIST_FAILED, "disk persistence failed");
+}
+
+/* ----------------------------------------------------------------
+ * ADR-059: multi-partial CAGRA build.
+ *
+ * The parallel-build leader hands off N worker named-shm partials (each
+ * [vectors][tids] for its scanned share) instead of one merged corpus. We mmap
+ * each partial and, for the common single-shard case, build via
+ * cuvs_cagra_build_multi — streaming each partial straight to the GPU with no
+ * host-side corpus copy (eliminating the leader merge that capped ADR-058). The
+ * global TID array (small) is assembled host-side for persistence; the .vectors
+ * sidecar is streamed from the partials. Multi-shard falls back to a contiguous
+ * host assembly + build_sharded. The leader owns the partials' lifetime and
+ * unlinks them after we reply.
+ * ---------------------------------------------------------------- */
+static void
+handle_build_multi(int client_fd, const CuvsCmdFrame *cmd, const char *index_dir)
+{
+    uint32_t       n_parts   = cmd->n_partials;
+    CuvsPartialDesc *descs    = NULL;
+    const float  **part_vecs  = NULL;
+    int64_t       *n_each     = NULL;
+    void         **maps       = NULL;
+    size_t        *map_lens   = NULL;
+    uint64_t      *new_tids   = NULL;
+    int            nmapped    = 0;
+    int64_t        total      = cmd->n_vecs;
+    size_t         per_vec    = (size_t)cmd->dim * sizeof(float);
+    size_t         vec_bytes  = (size_t)total * per_vec;
+    size_t         tid_bytes  = (size_t)total * sizeof(uint64_t);
+    const char    *err        = NULL;
+    int            status     = CUVS_STATUS_ERROR;
+    int            resolved_sc;
+    const char    *save_dir;
+
+    if (n_parts == 0 || n_parts > CUVS_BUILD_MAX_PARTIALS)
+    {
+        LOG_ERROR("[handle_build_multi] invalid n_partials=%u\n", n_parts);
+        send_error(client_fd, "invalid n_partials");
+        return;
+    }
+
+    descs     = malloc((size_t)n_parts * sizeof(*descs));
+    part_vecs = malloc((size_t)n_parts * sizeof(*part_vecs));
+    n_each    = malloc((size_t)n_parts * sizeof(*n_each));
+    maps      = malloc((size_t)n_parts * sizeof(*maps));
+    map_lens  = malloc((size_t)n_parts * sizeof(*map_lens));
+    if (!descs || !part_vecs || !n_each || !maps || !map_lens)
+    {
+        err = "malloc (partial bookkeeping) failed";
+        goto fail;
+    }
+
+    if (recv_all(client_fd, descs, (size_t)n_parts * sizeof(*descs)) < 0)
+    {
+        err = "recv partial descriptors failed";
+        goto fail;
+    }
+
+    /* Validate the list before touching shm: name format + Σ n_vecs == corpus
+     * size (so positional (vector,tid) pairing across partials is complete). */
+    {
+        int64_t sum = 0;
+        for (uint32_t i = 0; i < n_parts; i++)
+        {
+            if (descs[i].n_vecs < 0)  { err = "negative partial n_vecs"; goto fail; }
+            if (descs[i].n_vecs == 0) continue;
+            if (strncmp(descs[i].shm_name, "/pg_cuvs_bld_", 13) != 0)
+            {
+                err = "partial shm name not /pg_cuvs_bld_*";
+                goto fail;
+            }
+            sum += descs[i].n_vecs;
+        }
+        if (sum != total)
+        {
+            LOG_ERROR("[handle_build_multi] sum partial n_vecs %lld != total %lld\n",
+                      (long long)sum, (long long)total);
+            err = "partial n_vecs sum != corpus size";
+            goto fail;
+        }
+    }
+
+    /* mmap each non-empty partial (host) after verifying its exact size. */
+    for (uint32_t i = 0; i < n_parts; i++)
+    {
+        size_t pvb, ptb, plen;
+        int    pfd;
+        struct stat st;
+        void  *pm;
+
+        if (descs[i].n_vecs == 0)
+            continue;
+        pvb  = (size_t)descs[i].n_vecs * per_vec;
+        ptb  = (size_t)descs[i].n_vecs * sizeof(uint64_t);
+        plen = pvb + ptb;
+
+        pfd = shm_open(descs[i].shm_name, O_RDONLY, 0);
+        if (pfd < 0)              { err = "shm_open partial failed"; goto fail; }
+        if (fstat(pfd, &st) != 0) { close(pfd); err = "fstat partial failed"; goto fail; }
+        if ((size_t)st.st_size != plen)
+        {
+            LOG_ERROR("[handle_build_multi] partial %s size %lld != expected %zu\n",
+                      descs[i].shm_name, (long long)st.st_size, plen);
+            close(pfd);
+            err = "partial size mismatch";
+            goto fail;
+        }
+        pm = mmap(NULL, plen, PROT_READ, MAP_SHARED, pfd, 0);
+        close(pfd);
+        if (pm == MAP_FAILED)     { err = "mmap partial failed"; goto fail; }
+
+        maps[nmapped]      = pm;
+        map_lens[nmapped]  = plen;
+        part_vecs[nmapped] = (const float *)pm;
+        n_each[nmapped]    = descs[i].n_vecs;
+        nmapped++;
+    }
+    if (nmapped == 0)             { err = "no non-empty partials"; goto fail; }
+
+    LOG_INFO("[handle_build_multi] %d partial(s), total=%lld dim=%u (direct multi-H2D)\n",
+             nmapped, (long long)total, cmd->dim);
+
+    /* Assemble the global TID array (small: total*8 bytes). */
+    new_tids = malloc(tid_bytes);
+    if (!new_tids)                { err = "malloc tids failed"; goto fail; }
+    {
+        size_t toff = 0;
+        for (int j = 0; j < nmapped; j++)
+        {
+            size_t pvb = (size_t)n_each[j] * per_vec;
+            size_t ptb = (size_t)n_each[j] * sizeof(uint64_t);
+            memcpy((char *)new_tids + toff, (const char *)maps[j] + pvb, ptb);
+            toff += ptb;
+        }
+    }
+
+    /* Resolve shard count — identical policy to the single-corpus path. */
+    resolved_sc = (int)cmd->shard_count;
+    if (cmd->shard_count == 0)
+    {
+        size_t budget = 0;
+        int ng = n_usable_gpus();
+        for (int i = 0; i < ng; i++)
+        {
+            size_t b = g_max_vram_per_gpu[usable_gpu(i)];
+            if (b > 0 && (budget == 0 || b < budget))
+                budget = b;
+        }
+        resolved_sc = cuvs_auto_shard_count(total, (int)cmd->dim, budget, ng, CUVS_SHARDS_MAX);
+        if (resolved_sc == 0)
+        {
+            status = CUVS_STATUS_OOM_FALLBACK;
+            err = "index too large for GPU VRAM even when fully sharded";
+            goto fail;
+        }
+    }
+
+    save_dir = (index_dir[0] != '\0') ? index_dir : g_index_dir;
+    mkdir(save_dir, 0700);
+
+    /* Multi-shard fallback: partials cross shard boundaries, so assemble a
+     * contiguous [vecs][tids] corpus (anonymous mmap, released by build_sharded's
+     * munmap) and reuse the existing sharded build. Rare large-index path. */
+    if (resolved_sc >= 2)
+    {
+        size_t corpus_bytes = vec_bytes + tid_bytes;
+        void  *mem = mmap(NULL, corpus_bytes, PROT_READ | PROT_WRITE,
+                          MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        size_t voff = 0;
+        if (mem == MAP_FAILED)    { err = "mmap merged corpus failed"; goto fail; }
+        for (int j = 0; j < nmapped; j++)
+        {
+            size_t pvb = (size_t)n_each[j] * per_vec;
+            memcpy((char *)mem + voff, maps[j], pvb);
+            voff += pvb;
+        }
+        memcpy((char *)mem + vec_bytes, new_tids, tid_bytes);
+
+        for (int j = 0; j < nmapped; j++)
+            munmap(maps[j], map_lens[j]);    /* copied out; release partials */
+        free(new_tids); new_tids = NULL;
+        free(descs); free(part_vecs); free(n_each); free(maps); free(map_lens);
+
+        build_sharded(client_fd, cmd, index_dir,
+                      (const float *)mem,
+                      (const uint64_t *)((char *)mem + vec_bytes),
+                      corpus_bytes, mem, resolved_sc);
+        return;   /* build_sharded owns the reply + munmap(mem) */
+    }
+
+    /* Single shard: direct multi-H2D — the ADR-059 win (no host corpus copy). */
+    pthread_mutex_lock(&g_index_mutex);
+    {
+        size_t needed = estimate_vram_bytes(total, (int)cmd->dim);
+        int    target_gpu = pick_gpu_for_index(needed);
+        CuvsCagraIndex new_handle;
+        uint32_t tids_gen;
+        char vecs_final[512], vecs_tmp[576];
+        int  vectors_committed = 0;
+
+        if (target_gpu < 0)
+        {
+            pthread_mutex_unlock(&g_index_mutex);
+            status = CUVS_STATUS_OOM_FALLBACK;
+            err = "index too large for any GPU VRAM budget";
+            goto fail;
+        }
+        if (ensure_vram(needed, target_gpu) < 0)
+        {
+            pthread_mutex_unlock(&g_index_mutex);
+            status = CUVS_STATUS_OOM_FALLBACK;
+            err = "VRAM exhausted after eviction";
+            goto fail;
+        }
+
+        new_handle = cuvs_cagra_build_multi(part_vecs, n_each, nmapped, total,
+                                            (int)cmd->dim, cmd->metric, target_gpu);
+        if (!new_handle)
+        {
+            pthread_mutex_unlock(&g_index_mutex);
+            status = CUVS_STATUS_BUILD_FAILED;
+            err = "cuvs_cagra_build_multi failed";
+            goto fail;
+        }
+
+        /* .vectors sidecar streamed from the partials (no contiguous host copy). */
+        tids_gen = cuvs_crc32(new_tids, tid_bytes);
+        vectors_file_path(vecs_final, sizeof(vecs_final), save_dir, cmd->db_oid, cmd->index_oid);
+        snprintf(vecs_tmp, sizeof(vecs_tmp), "%s.tmp", vecs_final);
+        {
+            FILE *vf = fopen(vecs_tmp, "wb");
+            int vok = (vf != NULL);
+            if (vok && cuvs_vectors_write_multi(vf, n_each, nmapped, cmd->dim,
+                                                cmd->metric, tids_gen, part_vecs) != 0)
+                vok = 0;
+            if (vok && fflush(vf) != 0) vok = 0;
+            if (vok && fsync(fileno(vf)) != 0) vok = 0;
+            if (vf && fclose(vf) != 0) vok = 0;
+            if (vok)
+                vectors_committed = 1;
+            else
+            {
+                if (vf) unlink(vecs_tmp);
+                unlink(vecs_final);
+                LOG_WARN("[handle_build_multi] .vectors sidecar not written for %u/%u; "
+                         "brute_force unavailable until REINDEX\n",
+                         cmd->db_oid, cmd->index_oid);
+            }
+        }
+
+        /* Done with the partials; the GPU build holds its own device copy. */
+        for (int j = 0; j < nmapped; j++)
+            munmap(maps[j], map_lens[j]);
+        free(descs); free(part_vecs); free(n_each); free(maps); free(map_lens);
+
+        finish_build_commit(client_fd, cmd, save_dir, new_handle, new_tids,
+                            target_gpu, needed, vectors_committed, vecs_tmp, vecs_final);
+        return;   /* new_tids ownership passed to the registry */
+    }
+
+fail:
+    for (int j = 0; j < nmapped; j++)
+        munmap(maps[j], map_lens[j]);
+    free(new_tids);
+    free(descs); free(part_vecs); free(n_each); free(maps); free(map_lens);
+    if (status == CUVS_STATUS_ERROR)
+        send_error(client_fd, err ? err : "multi-partial build failed");
+    else
+        send_error_code(client_fd, status, err ? err : "multi-partial build failed");
 }
 
 /* ----------------------------------------------------------------

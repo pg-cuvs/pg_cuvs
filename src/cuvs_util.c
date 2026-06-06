@@ -276,6 +276,54 @@ cuvs_vectors_write(FILE *f, int64_t n_vecs, uint32_t dim, uint32_t metric,
     return 0;
 }
 
+/* ADR-059: write the .vectors sidecar from N partitions without a contiguous
+ * host copy. The body crc32 is accumulated incrementally over the partitions in
+ * concatenation order, then the body is written partition-by-partition. Output
+ * is byte-identical to cuvs_vectors_write over the logically concatenated
+ * corpus (Σ n_each rows). Empty partitions (n_each[i] <= 0) are skipped. */
+int
+cuvs_vectors_write_multi(FILE *f, const int64_t *n_each, int n_parts, uint32_t dim,
+                         uint32_t metric, uint32_t base_tids_crc32,
+                         const float *const *part_vecs)
+{
+    CuvsVectorsHeader hdr;
+    int64_t  total = 0;
+    uint32_t crc = cuvs_crc32_stream_begin();
+    int      i;
+
+    for (i = 0; i < n_parts; i++)
+    {
+        size_t body_n;
+        if (n_each[i] <= 0)
+            continue;
+        body_n = (size_t)n_each[i] * (size_t)dim;
+        crc = cuvs_crc32_stream_update(crc, part_vecs[i], body_n * sizeof(float));
+        total += n_each[i];
+    }
+
+    hdr.magic           = CUVS_VECTORS_MAGIC;
+    hdr.version         = CUVS_VECTORS_VERSION;
+    hdr.n_vecs          = total;
+    hdr.dim             = dim;
+    hdr.metric          = metric;
+    hdr.body_crc32      = cuvs_crc32_stream_end(crc);
+    hdr.base_tids_crc32 = base_tids_crc32;
+    hdr.reserved        = 0;
+
+    if (fwrite(&hdr, sizeof(hdr), 1, f) != 1)
+        return -1;
+    for (i = 0; i < n_parts; i++)
+    {
+        size_t body_n;
+        if (n_each[i] <= 0)
+            continue;
+        body_n = (size_t)n_each[i] * (size_t)dim;
+        if (fwrite(part_vecs[i], sizeof(float), body_n, f) != body_n)
+            return -1;
+    }
+    return 0;
+}
+
 int
 cuvs_vectors_read(FILE *f, CuvsVectorsHeader *hdr_out, float **vecs_out)
 {

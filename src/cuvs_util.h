@@ -169,6 +169,14 @@ typedef struct CuvsVectorsHeader {
 int cuvs_vectors_write(FILE *f, int64_t n_vecs, uint32_t dim, uint32_t metric,
                        uint32_t base_tids_crc32, const float *vecs);
 
+/* ADR-059: write the .vectors sidecar from N partitions (part_vecs[i] is
+ * [n_each[i]][dim], concatenated in order) without a contiguous host copy.
+ * Body crc32 is streamed over the partitions. Output is byte-identical to
+ * cuvs_vectors_write over the concatenated corpus. Returns 0 / -1. */
+int cuvs_vectors_write_multi(FILE *f, const int64_t *n_each, int n_parts,
+                             uint32_t dim, uint32_t metric,
+                             uint32_t base_tids_crc32, const float *const *part_vecs);
+
 /* Read + validate a .vectors file from an open FILE*. On success returns 0,
  * fills *hdr_out, and allocates *vecs_out via malloc (caller frees). Validates
  * magic, version, n_vecs range (0 < n_vecs <= CUVS_TIDS_MAX_VECS), dim range

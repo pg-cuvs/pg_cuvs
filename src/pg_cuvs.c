@@ -1376,7 +1376,6 @@ cuvs_build_parallel(Relation heapRel, Relation indexRel, IndexInfo *indexInfo,
     CuvsPartialSlot *slots;
     int64      total = 0;
     double     reltuples = 0;
-    CuvsBuildCorpus final;
     int        rc = CUVS_STATUS_OK;
 
     EnterParallelMode();
@@ -1446,61 +1445,30 @@ cuvs_build_parallel(Relation heapRel, Relation indexRel, IndexInfo *indexInfo,
         return true;   /* empty table — nothing to build */
     }
 
-    /* Merge: concat each partial's [vecs][tids] into one memfd corpus. */
+    /* ADR-059: hand the worker partials to the daemon directly — no leader
+     * merge copy. The daemon shm_open's each named-shm partial and streams it to
+     * the GPU (cuvs_cagra_build_multi). We own the partials and unlink them after
+     * the daemon replies; on any error the flock reaper (ADR-057) is the backstop. */
     {
-        Size vec_total = (Size) total * dim * sizeof(float);
-        Size tid_total = (Size) total * sizeof(uint64_t);
+        CuvsPartialDesc *descs =
+            (CuvsPartialDesc *) palloc(nparticipants * sizeof(CuvsPartialDesc));
+        uint32  ndesc = 0;
 
-        memset(&final, 0, sizeof(final));
-        final.kind = CORPUS_HEAP;
-        final.fd = -1;
-        if (cuvs_corpus_open(&final, vec_total + tid_total) != 0
-            || final.kind == CORPUS_HEAP)
+        for (i = 0; i < nparticipants; i++)
         {
-            if (final.kind != CORPUS_NONE)
-                cuvs_corpus_close(&final);
-            for (i = 0; i < nparticipants; i++)
-                if (slots[i].shm_name[0])
-                    shm_unlink(slots[i].shm_name);
-            pfree(slots);
-            ereport(ERROR,
-                    (errcode(ERRCODE_OUT_OF_MEMORY),
-                     errmsg("pg_cuvs: parallel build: merged corpus unavailable: %m")));
+            if (slots[i].n_vecs == 0 || slots[i].shm_name[0] == '\0')
+                continue;   /* empty worker share: nothing to hand off */
+            strlcpy(descs[ndesc].shm_name, slots[i].shm_name,
+                    sizeof(descs[ndesc].shm_name));
+            descs[ndesc].n_vecs = slots[i].n_vecs;
+            ndesc++;
         }
 
         PG_TRY();
         {
-            Size voff = 0, toff = 0;
-            for (i = 0; i < nparticipants; i++)
-            {
-                Size  pvb, ptb;
-                int   pfd;
-                void *pm;
-
-                if (slots[i].n_vecs == 0)
-                    continue;
-                pvb = (Size) slots[i].n_vecs * dim * sizeof(float);
-                ptb = (Size) slots[i].n_vecs * sizeof(uint64_t);
-                pfd = shm_open(slots[i].shm_name, O_RDONLY, 0);
-                if (pfd < 0)
-                    ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR),
-                                    errmsg("pg_cuvs: parallel merge: open partial %s: %m",
-                                           slots[i].shm_name)));
-                pm = mmap(NULL, pvb + ptb, PROT_READ, MAP_SHARED, pfd, 0);
-                close(pfd);
-                if (pm == MAP_FAILED)
-                    ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR),
-                                    errmsg("pg_cuvs: parallel merge: mmap partial: %m")));
-                memcpy((char *) final.base + voff, pm, pvb);
-                memcpy((char *) final.base + vec_total + toff, (char *) pm + pvb, ptb);
-                munmap(pm, pvb + ptb);
-                voff += pvb;
-                toff += ptb;
-            }
-
-            rc = cuvs_ipc_build(
+            rc = cuvs_ipc_build_multi(
                 cuvs_socket_path, (uint32_t) MyDatabaseId, build_index_oid,
-                &final, NULL, NULL, total, dim, metric,
+                descs, ndesc, total, dim, metric,
                 cuvs_resolve_index_dir_rel(indexRel),
                 (uint32_t) RelationGetRelid(heapRel),
                 (uint32_t) heapRel->rd_rel->relfilenode,
@@ -1516,10 +1484,10 @@ cuvs_build_parallel(Relation heapRel, Relation indexRel, IndexInfo *indexInfo,
         }
         PG_FINALLY();
         {
-            cuvs_corpus_close(&final);
             for (i = 0; i < nparticipants; i++)
                 if (slots[i].shm_name[0])
                     shm_unlink(slots[i].shm_name);
+            pfree(descs);
         }
         PG_END_TRY();
     }

@@ -798,6 +798,91 @@ cleanup:
 }
 
 /* ----------------------------------------------------------------
+ * Public API: cuvs_ipc_build_multi (ADR-059)
+ *
+ * Like cuvs_ipc_build but references N worker named-shm partials instead of one
+ * merged corpus. Sends the cmd frame (n_partials > 0), the index_dir frame (no
+ * SCM_RIGHTS fd), then the CuvsPartialDesc list. The daemon mmaps each partial
+ * and streams it straight to the GPU — no host merge. The caller owns the
+ * partials and unlinks them after this returns.
+ * ---------------------------------------------------------------- */
+int
+cuvs_ipc_build_multi(
+    const char    *socket_path,
+    uint32_t       db_oid,
+    uint32_t       index_oid,
+    const CuvsPartialDesc *partials,
+    uint32_t       n_partials,
+    int64_t        total,
+    int            dim,
+    uint32_t       metric,
+    const char    *index_dir,
+    uint32_t       table_oid,
+    uint32_t       relfilenode,
+    uint32_t       shard_count,
+    uint32_t       use_cpu_hnsw)
+{
+    int  sock = -1;
+    int  rc   = CUVS_STATUS_ERROR;
+    CuvsCmdFrame cmd;
+    char dir_buf[256] = {0};
+    CuvsReplyHeader hdr;
+
+    if (n_partials == 0 || partials == NULL)
+    {
+        LOG_ERROR("[cuvs_ipc_build_multi] no partials (n_partials=%u)\n", n_partials);
+        return CUVS_STATUS_ERROR;
+    }
+
+    sock = uds_connect_ex(socket_path, 600);  /* BUILD can take minutes */
+    if (sock < 0) {
+        LOG_ERROR("[cuvs_ipc_build_multi] uds_connect FAILED errno=%d (%s)\n",
+                errno, strerror(errno));
+        return CUVS_STATUS_UNAVAILABLE;
+    }
+
+    memset(&cmd, 0, sizeof(cmd));
+    cmd.op           = CUVS_OP_BUILD;
+    cmd.db_oid       = db_oid;
+    cmd.index_oid    = index_oid;
+    cmd.metric       = metric;
+    cmd.dim          = (uint32_t)dim;
+    cmd.n_vecs       = total;
+    cmd.table_oid    = table_oid;
+    cmd.relfilenode  = relfilenode;
+    cmd.shard_count  = shard_count;
+    cmd.use_cpu_hnsw = use_cpu_hnsw;
+    cmd.n_partials   = n_partials;   /* daemon takes the multi-partial path */
+    /* cmd.shm_key stays "" — no single corpus segment. */
+
+    LOG_DEBUG("[cuvs_ipc_build_multi] n_partials=%u total=%lld dim=%d socket=%s\n",
+        n_partials, (long long)total, dim, socket_path);
+
+    if (send_all(sock, &cmd, sizeof(cmd)) < 0)
+        goto cleanup;
+
+    /* index_dir frame: no SCM_RIGHTS fd for the multi-partial path. */
+    if (index_dir)
+        strncpy(dir_buf, index_dir, sizeof(dir_buf) - 1);
+    if (cuvs_fd_send(sock, -1, dir_buf, sizeof(dir_buf)) < 0)
+        goto cleanup;
+
+    /* Partial descriptor list (fixed-size records). */
+    if (send_all(sock, partials, (size_t)n_partials * sizeof(CuvsPartialDesc)) < 0)
+        goto cleanup;
+
+    if (recv_all(sock, &hdr, sizeof(hdr)) < 0)
+        goto cleanup;
+
+    rc = (int)hdr.status;
+
+cleanup:
+    if (sock >= 0)
+        close(sock);
+    return rc;   /* caller owns the partials' lifetime */
+}
+
+/* ----------------------------------------------------------------
  * Phase 3J: export CAGRA adjacency list + corpus vectors from daemon.
  *
  * Sends CUVS_OP_EXPORT_ADJACENCY; daemon packs adj+vecs+tids into a
