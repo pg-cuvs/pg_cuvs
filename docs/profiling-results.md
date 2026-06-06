@@ -242,3 +242,28 @@ merge). north-star = backend 오버헤드(=total − GPU floor) 제거율.
 > 주의: 이 문서의 1M 벤치 테이블(bench1m/bench_500000)은 uncorrelated subquery 생성이라 **모든 행이 동일
 > 벡터**(InitPlan 1회 평가) — 빌드 시간/오버헤드 측정엔 유효하나 **recall 측정엔 무효**. recall은 고유-벡터
 > 테이블(예: `array_agg(random() ...) GROUP BY id`)로 별도 검증.
+
+---
+
+## 9. 빌드 merge 복사 제거: 데몬 multi-partial direct H2D (ADR-059, 2026-06-07)
+
+ADR-058의 상한이던 **리더 merge 복사**를 제거 — 리더가 worker partial을 최종 corpus로 연접하는 대신 N개
+descriptor를 데몬에 넘기고, 데몬이 각 partial을 mmap해 **device 행렬 1개에 offset별 직접 H2D**
+(`cuvs_cagra_build_multi`). host corpus 복사 0.
+
+### bench_500000 (dim1024) — backend 오버헤드 (total − GPU floor)
+
+| 구성 | total wall | GPU floor(데몬 저널) | backend 오버헤드 |
+|------|-----------|---------------------|------------------|
+| 단일(w0, memfd) | 39.35 s | ~33 s | **~6.3 s** |
+| 병렬(w4, ADR-059 multi-partial) | 36.67 s | ~33 s | **~3.7 s** |
+
+- **merge 복사 소멸 실증**: 데몬 로그 `[handle_build_multi] 2 partial(s) ... (direct multi-H2D)` — 연접 단계
+  없음. ADR-058 병렬 backend ~4.5s(merge 포함) 대비 감소(저널 1s 해상도 내 노이즈 존재).
+- **wall-clock은 여전히 GPU floor(~33s/37s ≈ 89%) 지배** → 빌드 시간 자체는 marginal. 가치는 north-star
+  (backend 오버헤드 제거).
+- **구조적 이득**: 리더가 더 이상 2번째 full corpus(merge 버퍼)를 들지 않음 → backend peak RSS −corpus(~2GB,
+  500k×1024). single-shard 직접 경로; multi-shard(대형)는 host 조립 + `build_sharded` 폴백.
+- **정합**: 고유-벡터 self-NN 단일==병렬 5/5(§ADR-059), installcheck 15/15 + iso 2/2, sidecar byte-identity
+  단위. /dev/shm 고아 0.
+- **남은 레버**: PLAIN storage(§4, detoast 제거) — 단일/병렬 양쪽 직교 적용.

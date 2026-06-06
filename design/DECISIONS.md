@@ -2098,3 +2098,48 @@ worker 크래시 시 partial orphan은 ADR-057 flock reaper가 회수.
 - **데몬이 worker별 다중 shm을 직접 mmap**(merge 복사 제거): 데몬 프로토콜·sharding 대수술 → 보류. merge 복사가
   4A-2 이득의 상한. 추가 절감은 **PLAIN storage**(detoast 제거, ADR-043)와 결합이 직교적으로 가장 큼.
 
+## ADR-059 — 빌드 merge 복사 제거: 데몬 multi-partial direct H2D (ADR-058 §4A-2b)
+
+**날짜**: 2026-06-07
+**상태**: 구현·검증 완료
+**관련**: ADR-058(parallel workers — merge가 병목), ADR-057(corpus/reaper 재사용), ADR-043(PLAIN — 직교 보완)
+
+### 배경
+
+ADR-058 병렬 빌드의 상한은 **리더 merge 복사**였다: 워커별 named-shm partial을 리더가 최종 memfd corpus로
+연접(corpus 2-pass, ~3s/~4GB host 복사)해 데몬에 넘겼다 — ADR-057이 없앤 복사를 부분 재도입. ADR-058이 보류로
+남긴 "데몬이 worker별 다중 shm을 직접 mmap"을 구현해 merge를 제거한다.
+
+### 결정
+
+리더는 partial을 merge하지 않고 **N개 descriptor(shm_name, n_vecs) 리스트**를 데몬에 전달한다
+(`cuvs_ipc_build_multi`, `CuvsCmdFrame.n_partials`; 0이면 기존 단일 corpus 경로 byte-identical). 데몬
+`handle_build_multi`는 리스트를 **검증**(Σn_vecs==total, 이름 `/pg_cuvs_bld_*` 형식, 각 shm 크기 ==
+n_vecs_i*(dim*4+8))하고 각 partial을 mmap한 뒤, **single-shard(흔한 경우)는 device 행렬 1개에 partial별 offset
+H2D**(`cuvs_cagra_build_multi` — 단일 `raft::copy`를 N회로 분할) → **host corpus 복사 0**. global tids만 호스트
+조립(작음, total*8B). `.vectors` sidecar는 partial에서 스트리밍(`cuvs_vectors_write_multi`, 증분 crc → 연접과
+byte-identical). multi-shard(대형, partial이 shard 경계 교차)는 host 연속 조립 후 기존 `build_sharded` 폴백.
+persist/registry/reply tail은 단일 경로와 공유(`finish_build_commit`로 추출).
+
+**정합 근거**: CAGRA 순서 독립 + positional (vec,tid) pairing → partition 연접 == 단일 corpus. n_parts==1은
+offset-0 단일 copy라 기존 `cuvs_cagra_build`와 동일(위임). 리더는 데몬 reply 후 partial unlink, 크래시 시
+ADR-057 flock reaper backstop(누수 클래스 불변 — 노출 시간만 김).
+
+### 결과 (VM A100/PG16)
+
+- **정합(핵심)**: 고유-벡터 50k×128 self-NN **단일(w0) 5/5 == 병렬(w4 multi-partial) 5/5**, 데몬 로그가
+  `[handle_build_multi] direct multi-H2D` 확인. installcheck 15/15 + isolation 2/2 GREEN. sidecar
+  byte-identity 단위(`cuvs_vectors_write_multi` == 단일, +empty-partition skip) 로컬 227 passed.
+- **오버헤드(north-star)**: bench_500000 dim1024 — backend(total−GPU floor) **단일 ~6.3s(39.35s−~33s) →
+  병렬 multi-partial ~3.7s(36.67s−~33s)**. merge 복사 제거를 데몬 로그로 실증(연접 단계 소멸). wall-clock은
+  GPU floor(~33s/37s≈89%) 지배라 marginal(저널 1s 해상도 내 노이즈). 구조적 이득: 리더가 더 이상 2번째 full
+  corpus(merge 버퍼)를 들지 않음 → backend peak RSS −corpus(~2GB). /dev/shm 고아 0.
+- **남은 레버**: PLAIN storage(detoast 제거, ADR-043 — 직교, 단일/병렬 양쪽 적용).
+
+### 대안 기각 / 한계
+
+- **multi-shard도 direct H2D**: partial이 shard 경계 교차 → 1차는 host 조립 + `build_sharded` 폴백(현 동작 보존).
+  대형 인덱스만 해당. 후속에서 shard-aware 분배 가능.
+- **wall-clock 천장**: GPU build(~33s)가 빌드를 지배 → 어떤 backend 최적화도 wall-clock을 ~33s 밑으로 못 내림.
+  ADR-059의 가치는 north-star(backend 오버헤드·peak RSS 제거)이지 wall-clock이 아니다.
+
