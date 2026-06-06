@@ -983,6 +983,43 @@ Phase 3N 완료 기준:
 - Django QuerySet slicing(`qs[100:110]`), SQLAlchemy `.offset(100).limit(10)` 패턴으로 GPU 인덱스가 사용됨을 `EXPLAIN`으로 확인한다.
 - large offset(>1000) 시 NOTICE 경고가 발생한다.
 
+#### fp16 입력 벡터 (트리거: cuVS C API fp16 지원 확인)
+
+`CREATE INDEX ... WITH (precision=fp16)` reloption 추가. float32 대비 VRAM ~50% 절감. 동일 예산에서 인덱스 크기 2× 향상.
+
+전제: `cuvsCagraBuild` dataset 인자에 `CUDA_R_16F` dtype 전달 가능 여부 VM 헤더 검증 필요.
+
+완료 기준:
+- cuVS C API fp16 지원 확인 + recall 저하 < 0.5% 실측.
+- N=1M dim=1024 기준 VRAM 사용량 float32 대비 ≥45% 절감 확인.
+- 기존 test suite PASS.
+
+스펙: ADR-054
+
+---
+
+#### EXPLAIN ANALYZE GPU 타이밍 (트리거: 명시 진단 수요)
+
+PG custom scan node의 `ExplainCustomScan` 콜백에서 GPU kernel time / IPC latency를 `EXPLAIN ANALYZE` output에 주입. daemon 응답 프레임에 `gpu_kernel_us`, `ipc_roundtrip_us` 추가.
+
+완료 기준:
+- `EXPLAIN (ANALYZE)` output에 `GPU kernel: Xms, IPC: Yms` 행 표시 확인.
+- 기존 test suite PASS.
+
+스펙: ADR-055
+
+---
+
+#### VACUUM 연동 tombstone 정리 (트리거: 3Q 완료)
+
+`ambulkdelete` hook에서 tombstone 비율이 `cuvs.compact_on_delete_ratio`를 초과하면 `CUVS_OP_COMPACT` 호출. PG autovacuum 스케줄을 재활용해 별도 bgworker 불필요.
+
+4C(full REINDEX bgworker)와 동일 `CUVS_OP_COMPACT` 공유 — 병행 가능. `ambulkdelete`가 동기 호출이므로 threshold 설계 또는 비동기 dispatch 검토 필요.
+
+완료 기준: autovacuum 실행 후 tombstone 자동 정리 e2e 확인. 기존 test suite PASS.
+
+스펙: ADR-056
+
 ---
 
 Phase 3 전체 완료 기준:
@@ -1127,6 +1164,40 @@ REINDEX INDEX t_hnsw;  -- pgvector 재빌드, LOGGED
 
 ---
 
+## Phase 3R — CAGRA 빌드 파라미터 reloption
+
+목표: `graph_degree`, `intermediate_graph_degree`, `build_algo`를 `CREATE INDEX ... WITH (...)` reloption으로 노출해 사용자가 recall↔build-time·VRAM 트레이드오프를 직접 제어할 수 있도록 한다. (ADR-052)
+
+### 구현 항목
+
+#### 1. reloption 추가
+
+| reloption | 타입 | cuVS 기본값 | 범위 |
+|-----------|------|-------------|------|
+| `graph_degree` | int | 64 | 8–512 |
+| `intermediate_graph_degree` | int | 128 | 8–1024 |
+| `build_algo` | enum str | `IVF_PQ` | `IVF_PQ`, `NN_DESCENT` |
+
+`relopt_kind` 등록 + `cuvs_relopts` 파싱에 추가.
+
+#### 2. IPC 전달
+
+`CuvsCmdFrame` 또는 별도 `CuvsIndexParams` struct에 3개 필드 추가. daemon의 `cuvsCagraIndexParams` 직접 설정 후 `cuvsCagraBuild` 호출.
+
+#### 3. 기본값 처리
+
+reloption 미지정(0/NULL) → cuVS 기본값 통과. 값 지정 시만 override.
+
+### 완료 기준
+
+- `WITH (graph_degree=32)` 빌드 시 cuVS params 반영 확인 (daemon 로그 또는 인덱스 메타 검증)
+- `WITH (build_algo='NN_DESCENT')` 빌드 성공
+- 기존 test suite(`make gpu-test-all`) 전수 PASS
+
+스펙: ADR-052
+
+---
+
 ## Phase 3O — Pre-filter ANN (필터 검색)
 
 목표: WHERE 조건을 cuVS bitvector mask로 daemon에 전달해, GPU가 조건을 만족하는 벡터만 탐색한다. 고선택성 필터에서 GPU 후보 품질을 높이고 IPC·recheck 낭비를 줄인다. (ADR-048)
@@ -1157,6 +1228,43 @@ REINDEX INDEX t_hnsw;  -- pgvector 재빌드, LOGGED
 - fallback 경로 integration 시나리오 1건 추가.
 
 스펙: ADR-048
+
+---
+
+## Phase 3S — statement_timeout / 취소 전파
+
+목표: PG의 `statement_timeout` 및 `pg_cancel_backend()`가 daemon IPC로 전파되도록 한다. GPU 검색이 걸려도 backend가 timeout 이후 무기한 대기하지 않아 연결 고갈을 방지한다. (ADR-053)
+
+### 구현 항목
+
+#### 1. backend 측
+
+- `cuvs_ipc_search()` 내부 recv를 `poll(fd, cuvs.ipc_timeout_ms)` 루프로 교체.
+- 루프 내 `CHECK_FOR_INTERRUPTS()` 호출 — PG cancel signal 즉시 감지.
+- 취소 감지 또는 poll timeout 시:
+  1. daemon에 `CUVS_OP_CANCEL` 전송 (best-effort, 실패 무시).
+  2. `ereport(ERROR, ...)` 반환 — PG 트랜잭션 rollback.
+
+#### 2. daemon 측
+
+- `CUVS_OP_CANCEL` 수신 시 해당 연결의 진행 중 검색 중단.
+- cuVS 검색 자체가 non-cancellable이면: worker thread join + 짧은 timeout 후 결과 폐기, 연결 상태 초기화.
+- cancel 처리 후 `CUVS_STATUS_CANCELLED` 응답.
+
+#### 3. GUC
+
+| GUC | 기본값 | 설명 |
+|-----|--------|------|
+| `cuvs.ipc_timeout_ms` | 5000 | poll 상한 (ms). 0=무기한 대기(이전 동작). |
+
+### 완료 기준
+
+- `SET statement_timeout = '1s'` 후 인위적으로 느린 GPU 검색에서 1초 이내 오류 반환 확인
+- 취소 후 연결 정상 재사용 확인 (연결 고갈 없음)
+- `cuvs.ipc_timeout_ms=0` 시 이전 동작 유지 (regression 없음)
+- 기존 test suite(`make gpu-test-all`) 전수 PASS
+
+스펙: ADR-053
 
 ---
 
