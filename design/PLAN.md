@@ -1197,6 +1197,65 @@ REINDEX INDEX t_hnsw;  -- pgvector 재빌드, LOGGED
 
 ---
 
+## Phase 3Q — CAGRA Streaming Updates
+
+목표: cuVS 26.04 C API(`cuvsCagraExtend`, `cuvsCagraMerge`, `cuvsFilter`)를 활용해 INSERT/DELETE/UPDATE를 .delta 파일 없이 VRAM 내에서 직접 처리한다. delta 누적에 따른 search-time CPU/GPU 병합 비용을 제거하고, recall을 유지한 채 실시간 인덱스 업데이트를 지원한다. (ADR-051)
+
+**전제 조건**: cuVS 26.04 이상 (VM 헤더 검증 완료, 2026-06-06).
+
+### 구현 항목
+
+#### 1. IPC 확장
+
+| Op | 방향 | 설명 |
+|----|------|------|
+| `CUVS_OP_EXTEND` | backend → daemon | shm에 새 벡터+TID 기록, daemon이 `cuvsCagraExtend` 후 disk serialize |
+| `CUVS_OP_COMPACT` | backend → daemon | `cuvsCagraMerge(filter=tombstone bitvector)` → 새 인덱스 atomic swap |
+
+`CuvsCmdFrame`에 `extend_shm_key[64]`(EXTEND용) 추가.
+
+#### 2. EXTEND 경로 (INSERT/UPDATE)
+
+- `aminsert`: shm에 새 벡터 + TID 기록 → `CUVS_OP_EXTEND` IPC
+- daemon: `cuvsCagraExtend(res, &params, new_dataset, index)` 호출
+  - `params.max_chunk_size = cuvs.extend_chunk_size` (0=auto)
+- daemon: 성공 후 disk serialize (`.cagra` + `.tids` 갱신) — 내구성 보장
+- VRAM 예산 카운터 갱신 (extend로 인덱스 grow 반영)
+- EXTEND 실패 시: 3A tombstone + delta append fallback + WARNING (graceful degradation)
+
+#### 3. COMPACT 경로 (DELETE/tombstone 제거)
+
+- `CUVS_OP_COMPACT` IPC: backend가 tombstone bitvector를 shm에 기록
+- daemon: `cuvsCagraMerge(res, params, [index], 1, filter, output_index)` 호출
+  - `filter` = tombstone bitvector (`cuvsFilter` wrapping)
+- 새 인덱스 atomic swap → old VRAM 해제
+- disk serialize (갱신된 `.cagra` + `.tids`)
+
+#### 4. GUC
+
+| GUC | 기본값 | 설명 |
+|-----|--------|------|
+| `cuvs.extend_chunk_size` | `0` (auto) | `cuvsCagraExtendParams.max_chunk_size` 직접 매핑 |
+| `cuvs.compact_on_delete_ratio` | `0.1` | tombstone 비율이 이 값 초과 시 COMPACT 자동 트리거 권장 |
+
+#### 5. 3A .delta 경로 deprecated
+
+- 3Q 완료 후 `aminsert`의 delta file append 경로 제거
+- tombstone 메커니즘은 유지 (COMPACT op의 filter 소스로 재활용)
+- 3A `cuvs.delta_search` GUC: deprecated 표기 (EXTEND 경로에서 불필요)
+
+### 완료 기준
+
+- INSERT/DELETE/UPDATE e2e 검증: recall@10 동일성, .delta 파일 미생성 확인
+- VRAM 예산 갱신 정확성: extend 후 `pg_stat_gpu_cache.vram_bytes` 반영 확인
+- COMPACT 후 tombstone 비율 0 확인
+- 기존 test suite(`make gpu-test-all`) 전수 PASS
+- `cuvs.extend_chunk_size=0`(auto) 기준 N=100K INSERT p99 레이턴시 측정
+
+스펙: ADR-051
+
+---
+
 ## Phase 4C — Background Compaction + CREATE INDEX CONCURRENTLY 정합성
 
 목표: delta 수동 REINDEX 운용 부담을 제거하고, CREATE INDEX CONCURRENTLY의 DELETE 정합성을 검증·보장한다. (ADR-050)

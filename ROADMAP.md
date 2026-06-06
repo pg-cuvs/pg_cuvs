@@ -32,6 +32,7 @@
 | 4A-2 | parallel maintenance workers — heap scan/detoast 병렬화 (~8-12s/~10-14%, 난이도 중간) | 릴리스 후 기능 |
 | 3O | Pre-filter ANN — WHERE 조건을 cuVS bitvector mask로 daemon에 전달, 고선택성 필터 GPU 품질 향상 | 릴리스 후 기능 |
 | 3P | IVF-PQ — 새 AM `USING ivfpq` (product quantization, VRAM 10–100× 절감, 100M+ 대용량) | 릴리스 후 기능 |
+| 3Q | CAGRA Streaming Updates — `cuvsCagraExtend`(INSERT) + `cuvsCagraMerge`+cuvsFilter(DELETE/컴팩션) 실시간 인덱스 업데이트, .delta 경로 대체 | 릴리스 후 기능 |
 | 4C | Background Compaction + CONCURRENTLY 정합성 — PG bgworker auto-REINDEX + DELETE 정합 검증 | 릴리스 후 기능 |
 | 3C / 3D | GCS artifact snapshot 본체 / Replica async warmup | 트리거 (multi-node 수요) |
 | fallback 관측성 · circuit breaker 전역화 · SQL latency split | 운영 하드닝 잔여 | 트리거 |
@@ -108,6 +109,20 @@
 완료 기준: N=1M build 성공, recall@10 ≥ 0.90, VRAM CAGRA 대비 10× 절감 실측, 기존 test suite PASS
 
 스펙: [design/PLAN.md — Phase 3P](design/PLAN.md) | ADR-049
+
+#### 3Q — CAGRA Streaming Updates
+**왜**: 3P 완료 후. cuVS 26.04 C API(`cuvsCagraExtend`, `cuvsCagraMerge`, `cuvsFilter`)로 INSERT/DELETE를 .delta 파일 없이 VRAM 내에서 직접 처리. delta 누적에 따른 search-time 병합 비용을 제거하고 recall 유지.
+
+구현 항목:
+- `CUVS_OP_EXTEND`: IPC op + daemon `cuvsCagraExtend` + disk serialize(내구성)
+- `CUVS_OP_COMPACT`: `cuvsCagraMerge(filter=tombstone bitvector)` → new index atomic swap → old VRAM 해제
+- GUC `cuvs.extend_chunk_size` (`max_chunk_size` 제어, 0=auto)
+- VRAM 예산 갱신 (extend grow 반영)
+- `aminsert` → `CUVS_OP_EXTEND` 전환, 3A .delta 경로 deprecated
+
+완료 기준: INSERT/DELETE/UPDATE e2e 검증(recall@10 동일성), .delta 미생성 확인, 기존 test suite PASS
+
+스펙: [design/PLAN.md — Phase 3Q](design/PLAN.md) | ADR-051
 
 #### 4C — Background Compaction + CREATE INDEX CONCURRENTLY 정합성
 **왜**: 3P 완료 후. delta 수동 REINDEX 운용 부담 제거. CONCURRENTLY DELETE 정합성 검증은 4C 착수 전 선행 필수.
