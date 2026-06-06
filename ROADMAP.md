@@ -30,6 +30,9 @@
 |-------|------|------|
 | 4A-1 | CAGRA 빌드 double memcpy 제거 (**quick win**: ~2-5s, 난이도 낮음, 4A-2 enabler) | 릴리스 후 기능 |
 | 4A-2 | parallel maintenance workers — heap scan/detoast 병렬화 (~8-12s/~10-14%, 난이도 중간) | 릴리스 후 기능 |
+| 3O | Pre-filter ANN — WHERE 조건을 cuVS bitvector mask로 daemon에 전달, 고선택성 필터 GPU 품질 향상 | 릴리스 후 기능 |
+| 3P | IVF-PQ — 새 AM `USING ivfpq` (product quantization, VRAM 10–100× 절감, 100M+ 대용량) | 릴리스 후 기능 |
+| 4C | Background Compaction + CONCURRENTLY 정합성 — PG bgworker auto-REINDEX + DELETE 정합 검증 | 릴리스 후 기능 |
 | 3C / 3D | GCS artifact snapshot 본체 / Replica async warmup | 트리거 (multi-node 수요) |
 | fallback 관측성 · circuit breaker 전역화 · SQL latency split | 운영 하드닝 잔여 | 트리거 |
 | 3N | OFFSET-aware K 자동 조정 (ORM pagination 호환) | 트리거 (ORM 요구) |
@@ -78,6 +81,46 @@
 완료 기준: workers=4 기준 build ≤ 35s (현재 55s)
 
 스펙: [design/PLAN.md — Phase 4A](design/PLAN.md) | ADR-034 §4A-2
+
+#### 3O — Pre-filter ANN (필터 검색)
+**왜**: 4A-2 완료 후. WHERE 조건을 cuVS bitvector mask로 daemon에 전달해 GPU가 조건을 만족하는 벡터만 탐색. 고선택성 필터에서 IPC·recheck 낭비 제거.
+
+구현 항목:
+- `CuvsCmdFrame`에 `filter_shm_key[64]` 추가
+- backend: filter 조건 → TID 비트맵 → shm 전달
+- daemon: cuVS filtered search API 호출
+- fallback: 비트맵 shm 실패 시 기존 post-filter 경로 + WARNING
+- GUC `cuvs.prefilter_threshold` (밀도 기반 pre/post 자동 전환)
+
+완료 기준: 고선택성 WHERE 쿼리에서 pre-filter 경로 동작 확인, recall@10 동일성, 기존 test suite PASS
+
+스펙: [design/PLAN.md — Phase 3O](design/PLAN.md) | ADR-048
+
+#### 3P — IVF-PQ (추가 cuVS 알고리즘)
+**왜**: 3O 완료 후. CAGRA는 VRAM에 float32 전체 보유 필요 — 대용량(100M+) 환경에서 비실용적. IVF-PQ로 VRAM 10–100× 절감.
+
+구현 항목:
+- 새 AM handler `pg_cuvs_ivfpq_handler` 등록 (`CREATE INDEX USING ivfpq`)
+- reloption: `n_lists`, `pq_bits`, `pq_dim`
+- GUC: `cuvs.ivfpq_n_probes`
+- daemon: `CUVS_OP_BUILD_IVFPQ`, `CUVS_OP_SEARCH_IVFPQ` op 추가
+
+완료 기준: N=1M build 성공, recall@10 ≥ 0.90, VRAM CAGRA 대비 10× 절감 실측, 기존 test suite PASS
+
+스펙: [design/PLAN.md — Phase 3P](design/PLAN.md) | ADR-049
+
+#### 4C — Background Compaction + CREATE INDEX CONCURRENTLY 정합성
+**왜**: 3P 완료 후. delta 수동 REINDEX 운용 부담 제거. CONCURRENTLY DELETE 정합성 검증은 4C 착수 전 선행 필수.
+
+구현 항목:
+- 4C-0 선행: REINDEX CONCURRENTLY 동작 검증 + DELETE concurrent build isolation 테스트
+- `cuvs_compaction_worker` bgworker 등록
+- GUC: `cuvs.auto_compact`, `cuvs.auto_compact_check_interval`, `cuvs.auto_compact_threshold`
+- `pg_stat_gpu_search`에 `last_compact_at`, `compact_count` 컬럼 추가
+
+완료 기준: auto_compact=on에서 delta 초과 인덱스 자동 REINDEX e2e 검증, CONCURRENTLY DELETE isolation GREEN, 기존 test suite PASS
+
+스펙: [design/PLAN.md — Phase 4C](design/PLAN.md) | ADR-050
 
 ---
 

@@ -1127,6 +1127,113 @@ REINDEX INDEX t_hnsw;  -- pgvector 재빌드, LOGGED
 
 ---
 
+## Phase 3O — Pre-filter ANN (필터 검색)
+
+목표: WHERE 조건을 cuVS bitvector mask로 daemon에 전달해, GPU가 조건을 만족하는 벡터만 탐색한다. 고선택성 필터에서 GPU 후보 품질을 높이고 IPC·recheck 낭비를 줄인다. (ADR-048)
+
+### 구현 항목
+
+**3O-1 — IPC 프레임 확장**:
+- `CuvsCmdFrame`에 `filter_shm_key[64]` 추가 (비트맵 shm 이름; 빈 문자열 = unfiltered).
+- `CuvsBuildShm` 패턴과 동일하게 backend가 비트맵 shm 세그먼트를 생성·전달·소멸.
+
+**3O-2 — backend 비트맵 생성**:
+- `cuvs_beginscan` / `cuvs_rescan`에서 `scan->xs_recheck_itup` filter 조건을 heap TID 비트맵으로 평가.
+- 비트맵 밀도가 `cuvs.prefilter_threshold` 이하이면 pre-filter 경로, 초과이면 기존 post-filter 경로.
+
+**3O-3 — daemon filtered search**:
+- `CUVS_OP_SEARCH`에서 `filter_shm_key`가 있으면 cuVS CAGRA filtered_search API 호출.
+- cuVS bitvector mask 포맷으로 변환 후 `SearchParams::sample_filter` 전달.
+
+**3O-4 — fallback 및 테스트**:
+- 비트맵 shm 생성 실패 시 기존 unfiltered + post-filter 경로로 graceful degradation + WARNING.
+- isolation test: concurrent filter + ANN 정합 확인. recall 비교(pre-filter vs post-filter, 동일 결과 보장).
+
+### 완료 기준
+
+- `SELECT ... WHERE category = $1 ORDER BY embedding <-> $2 LIMIT 10` 쿼리에서 pre-filter 경로 동작 확인 (`EXPLAIN` + `pg_stat_gpu_search.search_mode` 확인).
+- recall@10 동일성: pre-filter와 post-filter가 동일한 top-k 반환 (deterministic 데이터셋 기준).
+- 기존 test suite(`make gpu-test-all`) 전수 PASS.
+- fallback 경로 integration 시나리오 1건 추가.
+
+스펙: ADR-048
+
+---
+
+## Phase 3P — IVF-PQ 및 추가 cuVS 알고리즘
+
+목표: `CREATE INDEX USING ivfpq`로 product quantization 기반 GPU 인덱스를 지원한다. CAGRA 대비 VRAM 10–100× 절감, 대용량(100M+) 데이터셋 대응. (ADR-049)
+
+### 구현 항목
+
+**3P-1 — 새 AM handler 등록**:
+- `pg_cuvs_ivfpq_handler` 등록 (`CREATE ACCESS METHOD ivfpq TYPE INDEX HANDLER ...`).
+- reloption: `n_lists`(IVF 클러스터 수, 기본 1024), `pq_bits`(코드워드 비트, 기본 8), `pq_dim`(서브공간 수, 기본 dim/2).
+- GUC: `cuvs.ivfpq_n_probes`(탐색 클러스터 수, 기본 64 — recall/speed 트레이드오프).
+
+**3P-2 — IPC op 추가**:
+- `CUVS_OP_BUILD_IVFPQ`, `CUVS_OP_SEARCH_IVFPQ` 추가.
+- build 경로: 동일 shm 코퍼스 전달 → daemon이 cuVS `IvfPq::build()` → serialize.
+- search 경로: 동일 shm query 전달 → daemon이 cuVS `IvfPq::search()`.
+
+**3P-3 — daemon IVF-PQ 경로**:
+- `IndexEntry`에 `ivfpq` 타입 추가 (CAGRA handle과 별개).
+- persist/load: cuVS IVF-PQ serialize/deserialize.
+- VRAM budget 계산: PQ 압축 코드 크기 기준 (float32의 `pq_bits/32` 비율).
+
+**3P-4 — 테스트 및 문서**:
+- smoke: `CREATE INDEX USING ivfpq` + search recall@10 ≥ 0.90 (n_probes=64 기준).
+- 기존 CAGRA 경로 회귀 없음.
+- `docs/algorithm-selection-guide.md`: CAGRA vs IVF-PQ 선택 기준 문서화.
+
+### 완료 기준
+
+- N=1M, dim=1024 데이터셋에서 `CREATE INDEX USING ivfpq` build 성공.
+- recall@10 ≥ 0.90 (CAGRA 대비 트레이드오프 허용).
+- VRAM 사용량이 동일 데이터셋 CAGRA 대비 10× 이상 절감 실측.
+- 기존 test suite(`make gpu-test-all`) 전수 PASS.
+
+스펙: ADR-049
+
+---
+
+## Phase 4C — Background Compaction + CREATE INDEX CONCURRENTLY 정합성
+
+목표: delta 수동 REINDEX 운용 부담을 제거하고, CREATE INDEX CONCURRENTLY의 DELETE 정합성을 검증·보장한다. (ADR-050)
+
+### 구현 항목
+
+**4C-0 — REINDEX CONCURRENTLY 선행 검증** (착수 전 필수):
+- `REINDEX INDEX CONCURRENTLY`가 pg_cuvs AM에서 올바르게 동작하는지 검증.
+- DELETE가 섞인 concurrent build isolation 시나리오 추가 (`pg_isolation_regress`).
+- 필요 시 `cuvs_ambuild` 시작 시점에 기존 delta/tombstone 명시적 무효화 경로 추가.
+
+**4C-1 — background worker 등록**:
+- `_PG_init`에서 `cuvs_compaction_worker` bgworker 등록.
+- `cuvs.auto_compact = on|off` GUC (기본 off).
+- `cuvs.auto_compact_check_interval` GUC (기본 60s, 폴링 주기).
+- `cuvs.auto_compact_threshold` GUC (delta_rows 절대값 또는 base 대비 %, 기본 10%).
+
+**4C-2 — compaction 실행 로직**:
+- `pg_stat_gpu_search`에서 `delta_rows > threshold` 인덱스 식별.
+- SPI 또는 별도 libpq connection으로 `REINDEX INDEX CONCURRENTLY <oid>` 실행.
+- 실행 중 daemon restart / 인덱스 DROP 등 경쟁 조건 안전 처리.
+
+**4C-3 — 관측성**:
+- `pg_stat_gpu_search`에 `last_compact_at`(마지막 compaction epoch), `compact_count`(총 횟수) 컬럼 추가.
+- compaction 실행·완료·실패를 PG log에 기록.
+
+### 완료 기준
+
+- `cuvs.auto_compact = on`에서 delta_rows > threshold인 인덱스가 자동 REINDEX됨 (e2e 검증).
+- REINDEX 후 delta_rows = 0, search recall 유지.
+- CREATE INDEX CONCURRENTLY + concurrent DELETE isolation 시나리오 GREEN.
+- 기존 test suite(`make gpu-test-all`) 전수 PASS.
+
+스펙: ADR-050
+
+---
+
 ## 기술 위험 및 대응
 
 | 위험 | 대응 |
