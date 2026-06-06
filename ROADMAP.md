@@ -21,12 +21,12 @@
 | 하드닝 | `index_dir` reloption — cross-session seqscan 폴백 근절. 인덱스가 빌드 디렉터리를 `pg_class.reloptions`에 self-describe (reloption > 세션 GUC > `$PGDATA` 3단계). installcheck GREEN, no-GUC 연결에서 Index Scan 실증 (ADR-045) |
 | 하드닝 | orphan artifact GC (`pg_cuvs_gc_orphans(do_delete)`) — 데몬-down DROP / DROP DATABASE / 재시작 좀비 재로드로 인한 VRAM+디스크 누수 근절. backend가 `index_dir`을 `pg_index`/`pg_database`와 대조(daemon은 sidecar라 카탈로그 불가). dry-run 기본. installcheck GREEN(gc_orphans) + 데몬-down e2e 검증. ADR-009 정정 반영 (ADR-046) |
 | 4-preflight | 연산 지역성 프로파일링 완료 (A100/PG16, N=1M dim=1024). 검색 GPU:IPC≈2:1(GPU-bound), 빌드 GPU 82%/backend 18%, export buffer-mgr 39%, TOAST vs PLAIN 8%. 측정 근거로 4A 하향. `docs/profiling-results.md` (ADR-044) |
+| Release-hardening | 빌드-time 권고 emit 3종 — TOAST NOTICE(고차원 toastable→PLAIN 권고), index_dir이 $PGDATA 하위면 WARNING(basebackup 비대), pgvector 0.5–0.8 밖이면 WARNING(HNSW 포맷 drift). `docs/best-practices.md`. installcheck GREEN(release_hardening) + 수동 e2e (ADR-043/ADR-013/ADR-038) |
 
 ### 미완료
 
 | Phase | 내용 | 트랙 |
 |-------|------|------|
-| Release-hardening | TOAST NOTICE + index_dir WARNING + pgvector 가드 + best-practices | 릴리스 전 확정 |
 | 3A | Pending delta / delta exact search | 릴리스 후 기능 |
 | 4A-1 | CAGRA 빌드 double memcpy 제거 (**quick win**: ~2-5s, 난이도 낮음, 4A-2 enabler) | 릴리스 후 기능 |
 | 4A-2 | parallel maintenance workers — heap scan/detoast 병렬화 (~8-12s/~10-14%, 난이도 중간) | 릴리스 후 기능 |
@@ -40,26 +40,7 @@
 
 > **원칙(2026-06-06)**: '완료' 표가 완료의 단일 진실. 아래 번호 Wave는 **미완 순차 작업만** 담는다 — 완료된 Phase는 시퀀스에서 제외(상세는 완료 표 + `design/PLAN.md`). **분산·운영 하드닝 등 조건/트리거 기반 항목은 번호 없는 '트리거 기반 백로그'로 분리**해 순차 경로와 섞지 않는다. 이로써 "번호 = 실행 순서"를 유지한다(완료/추가 때마다 꼬이던 문제 근절).
 
-### Wave 1 — 릴리스 전 확정
-
-#### Release-hardening — ambuild/build-time emit 묶음 + best-practices
-**왜 먼저**: 릴리스 게이트. 셋 다 동일한 ambuild/build-time emit(syscache 읽기 + ereport)이라 한 묶음으로 처리. 측정·설계는 끝났고 구현 비용 최소.
-
-구현 항목:
-- **TOAST storage NOTICE** (ADR-043): `cuvs_ambuild()`에서 indexed column의 `attstorage`가 EXTENDED('x')면 NOTICE — 벡터 전용 테이블은 PLAIN으로 ~25-35% 빌드 절감(강제 변경 X). 실측 표는 4-preflight 산출물(`docs/profiling-results.md`)·ADR-043 사용.
-- **index_dir WARNING** (감사 #6 / OBJSTORE-03): resolved `index_dir`이 `$PGDATA` 트리 하위면 1회 WARNING — `pg_basebackup` 비대/standby 프로비저닝 비용. 같은 NVMe 형제 디렉터리 권장(지역성↔백업 직교).
-- **pgvector 버전 가드 WARNING** (3K 잔여): 설치 pgvector 버전을 known-good 범위(0.5.0~0.8.x, HNSW_VERSION=1)와 대조 → 벗어나면 WARNING(on-disk 포맷 drift 위험). GPU 매트릭스 CI 대신 저비용 가드.
-- `docs/best-practices.md`: 벡터 전용 테이블 + PLAIN storage + index_dir 배치 권장 스키마 패턴 문서화.
-
-완료 기준:
-- EXTENDED 컬럼에 CAGRA 빌드 시 NOTICE, `$PGDATA` 하위 index_dir에 WARNING, 범위 밖 pgvector에 WARNING (installcheck로 검증).
-- `docs/best-practices.md` 작성.
-
-스펙: ADR-043 / ADR-013(OBJSTORE-03) / ADR-038(3K 잔여) | `design/OPS_GPU_PLAYBOOK.md`
-
----
-
-### Wave 2 — 릴리스 후 기능 (순차)
+### Wave 1 — 릴리스 후 기능 (순차)
 
 RAG/검색 시스템은 문서가 계속 추가/수정된다. INSERT 하나만 해도 GPU path가 완전히 포기되는 현재 구조로는 streaming write가 있는 모든 워크로드에서 pg_cuvs를 실운용할 수 없다. **3L에서 완성한 `CuvsBfIndex` 인프라를 3A-2 GPU delta cache가 직접 재사용한다.**
 
