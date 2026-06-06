@@ -1,5 +1,5 @@
 #!/bin/bash
-# ADR-048 leak/orphan verification harness.
+# ADR-057 leak/orphan verification harness.
 #
 # Invariant after any death + settle: /dev/shm has no pg_cuvs_bld_* orphan AND
 # /proc/meminfo Shmem returns to ~baseline (catches memfd anon + named shm).

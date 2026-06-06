@@ -183,3 +183,35 @@ journalctl -u pg-cuvs-server | grep -E 'handle_build|built index'
 
 # export WAL: pg_stat_wal 델타 (CREATE INDEX USING pg_cuvs_hnsw 전후)
 ```
+
+---
+
+## 7. 빌드 corpus 핸드오프: memfd 하이브리드 (ADR-057, 2026-06-07)
+
+빌드 corpus를 익명 memfd에 모아 `SCM_RIGHTS`로 데몬에 fd를 넘기는 무복사·누수-안전 핸드오프. 측정 환경
+동일(A100/PG16). **north-star = raw cuVS 대비 backend 오버헤드 제거율**로 프레이밍한다.
+
+### 빌드 오버헤드 분해 (N=500k dim=1024, memfd tier)
+
+| 구성요소 | 시간 | 비고 |
+|----------|------|------|
+| **GPU build** (데몬: H2D + 그래프 구축) | **~33 s** | cuVS-native와 공유(천장). journal `corpus via memfd`→`built index` |
+| **backend 오버헤드** (scan + detoast + memfd fill + 무복사 IPC) | **~6 s** | pg_cuvs가 cuVS 위에 얹는 PG 오버헤드 |
+| **빌드 wall-clock (합계)** | **39.2 s** | `\timing` |
+
+### old(heap+이중복사) vs new(memfd) A/B — N=500k dim=1024
+
+| 지표 | old (heap+shm 복사) | new (memfd) | 차이 |
+|------|--------------------|-------------|------|
+| 빌드 wall-clock | 40.3 s | 39.2 s | −1.1s (GPU 지배라 marginal) |
+| backend peak RSS | 6146 MB | 4189 MB | **−1957 MB (−32%)** = corpus 크기(이중버퍼 1개 제거) |
+| **copy 오버헤드** | heap→shm memcpy(corpus 전체) | **0 (데몬이 corpus 직접 mmap)** | 무복사 |
+
+### 핵심 결론 (ADR-034 §4A-1 대체)
+
+- **copy 오버헤드를 ~0으로**: 데몬이 backend가 채운 corpus를 그대로 mmap → heap→shm 복사 소멸. memfd라
+  **/dev/shm 이름 없음 → 크래시 고아 누수 구조적 불가**(SIGKILL/SIGSEGV/OOM-killer 매트릭스 + soak 실증).
+- **남은 backend 오버헤드 ~6s = detoast + heap scan**. north-star(오버헤드→0)를 위해선 PLAIN storage(§4,
+  detoast 제거)·4A-2 parallel maintenance workers(heap scan 분산)가 다음 레버. memfd는 그 둘의 enabler
+  (worker buffer도 corpus 위에 직접).
+- **peak RSS −32%**(= corpus 크기)는 대규모/동시-빌드/메모리-제약 환경에서 fit-vs-OOM을 가름.

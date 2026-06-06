@@ -11,7 +11,7 @@
 
 #include "cuvs_ipc.h"
 #include "cuvs_util.h"   /* leveled logging macros (LOG_ERROR/WARN/INFO/DEBUG) */
-#include "cuvs_build_corpus.h"   /* ADR-048: tiered corpus handoff + SCM_RIGHTS */
+#include "cuvs_build_corpus.h"   /* ADR-057: tiered corpus handoff + SCM_RIGHTS */
 
 /* Hot-path IPC traces (LOG_DEBUG) are gated by PG_CUVS_DEBUG; enable via
  * -DPG_CUVS_DEBUG=1. Error paths (LOG_ERROR) always log unconditionally. */

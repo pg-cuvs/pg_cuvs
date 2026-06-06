@@ -62,7 +62,7 @@
 #include "cuvs_wrapper.h"
 #include "cuvs_ipc.h"
 #include "cuvs_util.h"
-#include "cuvs_build_corpus.h"   /* ADR-048: leak-safe tiered build-corpus handoff */
+#include "cuvs_build_corpus.h"   /* ADR-057: leak-safe tiered build-corpus handoff */
 #include "hnsw_export.h"
 
 PG_MODULE_MAGIC;
@@ -519,13 +519,13 @@ _PG_init(void)
     object_access_hook = cuvs_object_access;
     RegisterXactCallback(cuvs_xact_callback, NULL);
 
-    /* ADR-048: test seam — CUVS_FORCE_CORPUS=memfd|shm|heap pins the build tier
+    /* ADR-057: test seam — CUVS_FORCE_CORPUS=memfd|shm|heap pins the build tier
      * for every backend (inherited from the postmaster env). Unset => auto. Used
      * by the leak-verification harness to exercise the T2 reaper / heap path on
      * a memfd-capable host. */
     cuvs_corpus_force_kind(getenv("CUVS_FORCE_CORPUS"));
 
-    /* ADR-048: at server (re)start, reclaim any T2 build-corpus shm orphans a
+    /* ADR-057: at server (re)start, reclaim any T2 build-corpus shm orphans a
      * crashed/killed build left in a previous lifetime. The default memfd tier
      * leaves no /dev/shm name (nothing to reap); this only matters where memfd
      * is unavailable (old kernel / seccomp) and named shm is used. flock-based:
@@ -1125,7 +1125,7 @@ typedef struct CuvsBuildState {
     uint32_t metric;      /* CUVS_METRIC_* */
     double   reltuples;
     size_t   cap_bytes;   /* build memory limit (0 = none); see Step 5 */
-    /* ADR-048: vectors accumulate in a leak-safe corpus (memfd -> shm -> heap).
+    /* ADR-057: vectors accumulate in a leak-safe corpus (memfd -> shm -> heap).
      * For memfd/shm tiers, `vectors` aliases corpus.base; for the heap tier the
      * corpus is CORPUS_HEAP and `vectors` is a plain malloc'd buffer. */
     CuvsBuildCorpus corpus;
@@ -1274,7 +1274,7 @@ cuvs_build_cagra_from_heap(Relation heapRel, Relation indexRel, IndexInfo *index
                              "docs/playbooks/large-dataset-benchmark.md.")));
     }
 
-    /* ADR-048: when the column has a declared dimension (vector(N), the common
+    /* ADR-057: when the column has a declared dimension (vector(N), the common
      * case), accumulate vectors directly in a leak-safe corpus (memfd -> shm)
      * sized to the row estimate — no heap->shm copy, and a crash cannot orphan
      * the segment. A column with no declared dim falls back to the heap tier

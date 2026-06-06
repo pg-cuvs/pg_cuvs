@@ -221,7 +221,7 @@ int cuvs_ipc_search_batch(
 );
 
 /*
- * cuvs_ipc_build — send a BUILD command to the daemon (ADR-048).
+ * cuvs_ipc_build — send a BUILD command to the daemon (ADR-057).
  *
  * The corpus ([vectors][tids] contiguous) is handed off by tier:
  *   CORPUS_MEMFD — corpus->fd is passed to the daemon via SCM_RIGHTS (no name,

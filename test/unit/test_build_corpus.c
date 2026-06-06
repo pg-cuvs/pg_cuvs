@@ -4,7 +4,7 @@
  * No framework, no PostgreSQL, no CUDA, no GPU. Build + run via `make test-unit`.
  * Returns non-zero on any failure.
  *
- * Proves the ADR-048 corpus handoff is correct without a daemon:
+ * Proves the ADR-057 corpus handoff is correct without a daemon:
  *  - tier selection (forced + auto),
  *  - grow/finalize produce the daemon's byte-exact [vectors][tids] layout,
  *  - SCM_RIGHTS fd passing round-trips an fd over a socketpair,

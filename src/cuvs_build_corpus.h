@@ -1,6 +1,6 @@
 /*
  * cuvs_build_corpus.h — leak-safe build-payload handoff for the CAGRA index
- * build (ADR-048). The backend accumulates the corpus (vectors + TIDs) in a
+ * build (ADR-057). The backend accumulates the corpus (vectors + TIDs) in a
  * single buffer and hands it to the GPU daemon. Three tiers, selected at
  * runtime, all producing the daemon's [vectors][tids] contiguous layout:
  *

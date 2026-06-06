@@ -20,7 +20,7 @@
 #include "cuvs_util.h"
 #include "cuvs_wrapper.h"
 #include "cuvs_objstore.h"
-#include "cuvs_build_corpus.h"   /* ADR-048: cuvs_fd_recv (SCM_RIGHTS build payload) */
+#include "cuvs_build_corpus.h"   /* ADR-057: cuvs_fd_recv (SCM_RIGHTS build payload) */
 #include <curl/curl.h>
 
 #include <stdio.h>
@@ -3535,7 +3535,7 @@ handle_build(int client_fd, const CuvsCmdFrame *cmd)
 {
     LOG_DEBUG("[handle_build] reading index_dir...\n");
     char index_dir[256] = {0};
-    /* ADR-048: the backend may pass the corpus as an SCM_RIGHTS memfd alongside
+    /* ADR-057: the backend may pass the corpus as an SCM_RIGHTS memfd alongside
      * index_dir (memfd tier); passed_fd is -1 for the shm/heap tiers. */
     int  passed_fd = -1;
     if (cuvs_fd_recv(client_fd, index_dir, sizeof(index_dir), &passed_fd) < 0)
@@ -3577,7 +3577,7 @@ handle_build(int client_fd, const CuvsCmdFrame *cmd)
     size_t tid_bytes = (size_t)cmd->n_vecs * sizeof(uint64_t);
     size_t total     = vec_bytes + tid_bytes;
 
-    /* ADR-048: memfd tier hands over the corpus as a passed fd (no /dev/shm
+    /* ADR-057: memfd tier hands over the corpus as a passed fd (no /dev/shm
      * name, so a crashed build can never leave an orphan); the shm/heap tiers
      * name it in cmd->shm_key. Either way the mapping outlives the fd close. */
     void *mem;
