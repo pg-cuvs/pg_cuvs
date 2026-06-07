@@ -30,7 +30,7 @@
 
 | Phase | 내용 | 트랙 |
 |-------|------|------|
-| 3O | Pre-filter ANN — WHERE 조건을 cuVS bitvector mask로 daemon에 전달, 고선택성 필터 GPU 품질 향상 | 릴리스 후 기능 |
+| 3O | Pre-filter ANN — WHERE 조건을 cuVS bitvector mask로 daemon에 전달, 고선택성 필터 GPU 품질 향상. **보류(2026-06-07, 접근 미정)**: PG AM이 비-인덱스-컬럼 qual을 안 넘겨 원안(bitvector)은 custom-scan+멀티세션·고위험; 저비용 대안=iterative over-fetch(접근 A). 실수요 시 A부터 (ADR-048) | 릴리스 후 기능(보류) |
 | 3S | statement_timeout / 취소 전파 — UDS recv timeout + CHECK_FOR_INTERRUPTS + CUVS_OP_CANCEL, 연결 고갈 방지 | 릴리스 후 기능 |
 | 3P | IVF-PQ — 새 AM `USING ivfpq` (product quantization, VRAM 10–100× 절감, 100M+ 대용량) | 릴리스 후 기능 |
 | 3Q | CAGRA Streaming Updates — `cuvsCagraExtend`(INSERT) + `cuvsCagraMerge`+cuvsFilter(DELETE/컴팩션) 실시간 인덱스 업데이트, .delta 경로 대체 | 릴리스 후 기능 |
