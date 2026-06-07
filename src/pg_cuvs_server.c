@@ -54,7 +54,8 @@
 /* ----------------------------------------------------------------
  * Index registry
  * ---------------------------------------------------------------- */
-#define MAX_INDEXES 64
+#define MAX_INDEXES      64    /* hot/VRAM-resident slot cap */
+#define MAX_COLD_INDEXES 1024  /* cold registry cap (disk/GCS-tracked, startup scan) */
 
 /* Phase 3D: per-index warmup lifecycle state. */
 typedef enum WarmupState {
@@ -219,7 +220,7 @@ typedef struct ColdIndexEntry {
     int         valid;
 } ColdIndexEntry;
 
-static ColdIndexEntry g_cold_indexes[MAX_INDEXES];
+static ColdIndexEntry g_cold_indexes[MAX_COLD_INDEXES];
 static int            g_n_cold_indexes = 0;
 
 /* Daemon-global VRAM cache counters (mutated under g_index_mutex). Exposed via
@@ -367,8 +368,9 @@ warmup_dequeue(WarmupJob *out)
     return 0;
 }
 
-/* Forward declarations for warmup worker. */
+/* Forward declarations for warmup worker and load paths. */
 static int load_index(uint32_t db_oid, uint32_t index_oid);
+static size_t evict_lru(int device_id);
 
 static void *
 warmup_worker_thread(void *arg)
@@ -1249,6 +1251,8 @@ load_index_sharded(uint32_t db_oid, uint32_t index_oid,
     }
 
     if (g_n_indexes >= MAX_INDEXES)
+        evict_lru(usable_gpu(0));
+    if (g_n_indexes >= MAX_INDEXES)
     {
         free(recs);
         return -1;
@@ -1444,6 +1448,8 @@ load_index(uint32_t db_oid, uint32_t index_oid)
     }
 
     if (g_n_indexes >= MAX_INDEXES)
+        evict_lru(target_gpu);
+    if (g_n_indexes >= MAX_INDEXES)
     {
         cuvs_cagra_free(handle, target_gpu);
         free(tids);
@@ -1575,7 +1581,7 @@ startup_load_indexes(void)
         read_relfilenode_sidecar(g_index_dir, db_oid, index_oid,
                                  &local_rfn, &local_table_oid);
 
-        if (g_n_cold_indexes < MAX_INDEXES)
+        if (g_n_cold_indexes < MAX_COLD_INDEXES)
         {
             ColdIndexEntry *ce = &g_cold_indexes[g_n_cold_indexes++];
             ce->db_oid            = db_oid;
@@ -4369,11 +4375,18 @@ handle_stats(int client_fd, const CuvsCmdFrame *cmd)
 {
     pthread_mutex_lock(&g_index_mutex);
 
-    /* Bounded by MAX_INDEXES; gather under the lock, send after unlocking. */
-    CuvsIndexStats stats[MAX_INDEXES];
+    /* Heap-allocated: hot (up to MAX_INDEXES) + cold (up to MAX_COLD_INDEXES). */
+    int max_stats = g_n_indexes + g_n_cold_indexes + 1;
+    CuvsIndexStats *stats = malloc((size_t)max_stats * sizeof(CuvsIndexStats));
+    if (!stats)
+    {
+        pthread_mutex_unlock(&g_index_mutex);
+        send_error(client_fd, "stats: out of memory");
+        return;
+    }
     uint32_t n = 0;
 
-    for (int i = 0; i < g_n_indexes && n < MAX_INDEXES; i++)
+    for (int i = 0; i < g_n_indexes && n < (uint32_t)max_stats; i++)
     {
         IndexEntry *e = &g_indexes[i];
         if (!e->valid)
@@ -4431,7 +4444,7 @@ handle_stats(int client_fd, const CuvsCmdFrame *cmd)
 
     /* Phase 3D: also emit cold (not-yet-resident) entries so operators can
      * see warmup progress in pg_stat_gpu_search. */
-    for (int i = 0; i < g_n_cold_indexes && n < MAX_INDEXES; i++)
+    for (int i = 0; i < g_n_cold_indexes && n < (uint32_t)max_stats; i++)
     {
         ColdIndexEntry *ce = &g_cold_indexes[i];
         if (!ce->valid)
@@ -4463,6 +4476,7 @@ handle_stats(int client_fd, const CuvsCmdFrame *cmd)
     send_all(client_fd, &hdr, sizeof(hdr));
     if (n > 0)
         send_all(client_fd, stats, (size_t)n * sizeof(CuvsIndexStats));
+    free(stats);
 }
 
 /* ----------------------------------------------------------------
