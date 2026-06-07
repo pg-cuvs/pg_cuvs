@@ -1022,15 +1022,12 @@ PG custom scan node의 `ExplainCustomScan` 콜백에서 GPU kernel time / IPC la
 
 ---
 
-#### Subtransaction-aware DROP 수집 (트리거: SAVEPOINT+DROP 실측 문제)
+#### Subtransaction-aware DROP 수집
 
-`RegisterSubXactCallback` + `SUBXACT_EVENT_ABORT_SUB`로 롤백된 SAVEPOINT 내 DROP OID를 `cuvs_pending_drops`에서 제거. 각 엔트리에 `SubTransactionId` 태깅 필요.
-
-현재 한계: `SAVEPOINT s; DROP INDEX; ROLLBACK TO s; COMMIT;` 시 살아있는 인덱스의 artifact가 조기 삭제 → stale 처리 → REINDEX 복구. ADR-023 commit-only 단순화의 알려진 한계로 의도적 보류.
-
-완료 기준: SAVEPOINT 롤백 후 인덱스 artifact 보존 확인, 기존 test suite PASS.
-
-스펙: ADR-060
+**상태: 구현·검증 완료 (2026-06-07, ADR-060).** `cuvs_pending_drops`를 `(Oid, SubTransactionId)` 태깅 +
+`RegisterSubXactCallback`(ABORT_SUB 폐기 / COMMIT_SUB 부모 reparent)으로 해결. `SAVEPOINT s; DROP INDEX;
+ROLLBACK TO s; COMMIT;` 후 인덱스 GPU artifact 생존(`pg_stat_gpu_search` resident=1 실증), 실제 drop은 정상 발사.
+신규 `drop_subxact` 회귀 + installcheck 17/17 + iso 2/2. 상세는 ADR-060.
 
 ---
 
