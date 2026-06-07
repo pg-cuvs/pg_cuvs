@@ -1192,6 +1192,12 @@ REINDEX INDEX t_hnsw;  -- pgvector 재빌드, LOGGED
 
 ## Phase 3R — CAGRA 빌드 파라미터 reloption
 
+**상태: 구현·검증 완료 (2026-06-07, ADR-052).** 완료 요약: reloption 3종(`graph_degree`/`intermediate_graph_degree`/
+`build_algo`) → IPC frame → 데몬 → cuVS `cagra::index_params`(26.04 `graph_build_params` variant). `build_algo`는
+소문자 `auto|ivf_pq|nn_descent`(기본 `auto`=cuVS 휴리스틱; 설계의 `IVF_PQ` 강제 대신). DDL validator + 빌드 전
+`intermediate >= graph_degree` fail-closed. 검증: 파라미터 실적용 실증(`.cagra` adjacency 크기 Δ = n×Δgraph_degree×4,
+정확), installcheck 16/16(신규 `build_params`) + iso 2/2. 상세는 ADR-052. (아래는 원안.)
+
 목표: `graph_degree`, `intermediate_graph_degree`, `build_algo`를 `CREATE INDEX ... WITH (...)` reloption으로 노출해 사용자가 recall↔build-time·VRAM 트레이드오프를 직접 제어할 수 있도록 한다. (ADR-052)
 
 ### 구현 항목
