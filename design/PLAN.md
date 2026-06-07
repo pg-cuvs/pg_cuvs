@@ -1022,6 +1022,18 @@ PG custom scan node의 `ExplainCustomScan` 콜백에서 GPU kernel time / IPC la
 
 ---
 
+#### Subtransaction-aware DROP 수집 (트리거: SAVEPOINT+DROP 실측 문제)
+
+`RegisterSubXactCallback` + `SUBXACT_EVENT_ABORT_SUB`로 롤백된 SAVEPOINT 내 DROP OID를 `cuvs_pending_drops`에서 제거. 각 엔트리에 `SubTransactionId` 태깅 필요.
+
+현재 한계: `SAVEPOINT s; DROP INDEX; ROLLBACK TO s; COMMIT;` 시 살아있는 인덱스의 artifact가 조기 삭제 → stale 처리 → REINDEX 복구. ADR-023 commit-only 단순화의 알려진 한계로 의도적 보류.
+
+완료 기준: SAVEPOINT 롤백 후 인덱스 artifact 보존 확인, 기존 test suite PASS.
+
+스펙: ADR-057
+
+---
+
 Phase 3 전체 완료 기준:
 - Phase 3A-3N의 subphase 완료 기준을 모두 만족한다.
 - 각 subphase는 독립적으로 중단/릴리스 가능하며, 다음 subphase 미완료가 이전 subphase의 정합성을 깨지 않는다.
