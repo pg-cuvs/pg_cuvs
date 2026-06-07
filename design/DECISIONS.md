@@ -2299,3 +2299,75 @@ PostgreSQL 수준에서 실제 활용하는 유일한 사례가 된다 — cuVS 
 기술 기여(코드, 벤치마크)가 마케팅보다 효과적. 홍보는 링크 등재 이후 자연스럽게.
 
 상세 계획: [docs/ecosystem-strategy.md](../docs/ecosystem-strategy.md)
+
+---
+
+## ADR-063 — D wedge filter spike: Function API 우선 + Custom Scan 로드맵
+
+**날짜**: 2026-06-08
+**상태**: 결정됨
+**관련**: ADR-061(D wedge 전략), ADR-039(3L BF exact)
+
+### 배경
+
+ADR-061에서 GPU exact filtered brute-force(D wedge) 경로를 다음 구현 트랙으로 결정했다.
+이 스파이크는 (1) 데몬·IPC 삽입점을 코드에서 확정하고, (2) PostgreSQL 측 filter
+포착 옵션을 분석해 구현 우선순위를 결정한다. 구현(executor 통합)은 별도 세션.
+
+### 삽입점 확정 (코드 기반)
+
+| 레이어 | 파일 | 현재 상태 | 필요 변경 |
+|--------|------|-----------|-----------|
+| IPC 프레임 | `src/cuvs_ipc.h:CuvsCmdFrame` (line 65) | `search_mode`(BF/CAGRA) 있음, filter 필드 없음 | `uint32_t use_prefilter;` + `char filter_shm_key[64];` 추가 |
+| 데몬 search handler | `src/pg_cuvs_server.c:handle_search` (~line 2118) | `cuvs_bf_search(e->main_bf_idx, query, dim, bk, raw, ...)` | filter shm 열어 bitset 전달 |
+| wrapper | `src/cuvs_wrapper.h:cuvs_bf_search` (line 82) | 6인자, filter 없음 | `cuvs_bf_search_filtered()` 추가(기존 서명 보존) |
+| PG backend | `src/pg_cuvs.c` AM scan | non-index qual 미수신(AM 제약) | 별도 접근 필요(아래) |
+
+**데몬 측은 IPC 프로토콜 변경 최소화로 처리 가능**: `CuvsCmdFrame`에 필드 추가는
+기존 `use_cpu_hnsw`/`search_mode` 추가 패턴과 동일. 와이어 ABI 변경이므로
+daemon+extension 동시 배포 필요(기존 co-deploy 규칙 적용).
+
+### PG 측 filter 포착 옵션 분석
+
+**옵션 A: Custom Scan Node**
+- planner_hook에서 `IndexScan → CustomScan` 교체, non-index qual(`WHERE tenant_id = 5`) 포착
+- 장점: SQL 투명(기존 쿼리 변경 불필요)
+- **결정적 단점: pgvector 호환성 파괴**. IndexScan은 pgvector AM(`<->`연산자)이 생성하는
+  표준 plan이다. Custom Scan이 이를 가로채면 pgvector가 동시에 로드된 환경에서
+  `amcostestimate` 충돌 및 플랜 예측 불가 발생. pg_cuvs의 핵심 포지셔닝이 pgvector
+  생태계 위에서 작동하는 것이므로 호환성 손해는 수용 불가.
+- **결론: 기각**. 별도 ADR에서 "호환성 손해 vs 투명성 이득" 트레이드오프를
+  명시적으로 결정한 후에만 재고.
+
+**옵션 B: Function API** (스파이크 채택)
+- `cuvs_filtered_knn(index regclass, query vector, filter_col text, filter_val anyelement, k int) → TABLE(tid bigint, distance float4)` SQL 함수
+- AM 제약 완전 우회. `<->`연산자·pgvector 플랜 경로 일절 건드리지 않음 → **호환성 보존**
+- GPU prefilter 경로(IPC → daemon → cuVS BITSET) end-to-end 검증 가능
+- 장점: 구현 ~100 LOC, 즉시 테스트, optimizer blind(cost 추정 없음)이지만 spike 목적엔 충분
+- 단점: 쿼리 명시적 변경 필요. 프로덕션 UX는 옵션 C/D로 개선
+
+**옵션 C: GUC 세션 변수**
+- `SET cuvs.prefilter_col = 'tenant_id'; SET cuvs.prefilter_val = '5';`
+- 타입 안전성 없음, 병렬 쿼리 위험, 프로덕션 부적합 → **기각**
+
+**옵션 D: Bitmap Heap Scan 협력 (`amgetbitmap`)**
+- AM이 `amgetbitmap`으로 매칭 벡터 TID 비트맵 반환 → PG가 filter 비트맵과 AND
+- 장점: SQL 투명, pgvector 호환 유지
+- 단점: BitmapScan 경로는 LIMIT pushdown 불가 → k개를 정확히 잘라낼 수 없어 전체 스캔 필요.
+  "filtered top-k"와 "필터된 모든 벡터 스캔" 의미가 다름 → **기각(정확성 문제)**
+
+### 결정
+
+**스파이크: 옵션 B(Function API)** — `cuvs_filtered_knn()` SQL 함수로 GPU prefilter
+경로를 end-to-end 검증. pgvector 호환성 완전 보존.
+
+**로드맵**: Function API 검증 후, 사용성이 필요하면 옵션 A(Custom Scan)를 별도 ADR로
+재검토. 단, Custom Scan 채택 시 "pgvector AM 플랜과의 충돌 허용 범위"를 명시해야 함.
+
+### 다음 단계 (별도 세션)
+
+1. `CuvsCmdFrame`에 `use_prefilter` + `filter_shm_key[64]` 필드 추가
+2. `cuvs_bf_search_filtered(index, query, dim, k, bitset_ptr, bitset_bytes, results, device_id)` 추가
+3. `handle_search`에서 `use_prefilter=1` 시 shm 열어 bitset 전달
+4. `cuvs_filtered_knn()` SQL 함수 구현 (pg_cuvs.c 신규 함수, AM scan 아님)
+5. bitset 생성: `filter_col = filter_val` WHERE절을 함수 내 heap scan으로 평가 → uint64_t 배열
