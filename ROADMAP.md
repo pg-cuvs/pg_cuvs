@@ -50,45 +50,10 @@
 
 ### 릴리스 후 기능 (순차)
 
-> **3A Pending Delta는 완료**(완료 표 참조). streaming write(INSERT/UPDATE/DELETE) 후 REINDEX 없이 GPU+delta 병합으로 정합한 top-k를 반환한다. 3L `CuvsBfIndex`를 3A-2 GPU delta cache가 재사용. 상세 스펙·검증은 [design/PLAN.md — Phase 3A](design/PLAN.md), 결정은 ADR-047. 순차 경로는 4A부터다.
-
-#### 4A — 빌드 성능 (4-preflight 측정으로 범위·기대치 재조정)
-
-> **2026-06-05 4-preflight 측정 결론**: 빌드 wall-clock 83.5s = backend(heap/detoast/memcpy/shm) ~15.5s(18%) **직렬 후** GPU CAGRA build ~68s(82%). ADR-034의 "PG overhead 45s" 추정은 틀렸고 backend는 ~15.5s가 천장이다.
-> - **4A-1 (double memcpy)**: ~2-5s(~3-6%)지만 **난이도 낮음 → quick win**(memcpy ~1.7s + realloc page fault 완화). shm 직접 할당이 4A-2의 enabler라 먼저 착수.
-> - **4A-2 (parallel workers)**: backend heap scan+detoast(~12s) 병렬화 → ~15.5s→~7s, **~8-12s(~10-14%) 절감**, 난이도 중간. 절대 이득 크나 작업량 많음.
-> - 둘 다 빌드가 일회성(CREATE INDEX/REINDEX)이라 쿼리 경로 대비 **긴급도만 낮을 뿐 저가치 아님**. 빌드 속도가 우선이면 4A-1→4A-2.
-> - **결합 효과 ("PG 오버헤드 제거율"로 평가)**: PLAIN(detoast 제거, 15.5s→8.7s) + 4A-1(realloc page fault + double memcpy 제거) + 4A-2(heap scan 분산)를 모두 적용하면 backend ~15.5s→~2-4s로 거의 소멸 → 빌드 83.5s→**~70-72s ≈ cuVS native의 ~95%**, MVCC/durability 유지한 채. 비율(17%)로 작아 보여도 절대 14.5s는 전부 제거 가능한 PG 오버헤드 → "Postgres 안전성 + cuVS native 속도".
-> - **천장**: 어떤 4A도 빌드를 ~68s(GPU build) 밑으로 못 내린다. 그 이하는 cuVS build 파라미터(graph_degree 등) 또는 streaming(cuVS incremental API 부재) 필요. 빌드 가속이 실수요로 올라오면 **GPU build 파라미터 튜닝을 4A와 함께** 검토.
-> 상세: `docs/profiling-results.md` §3·§6, ADR-044.
-
-##### 4A-1 — CAGRA 빌드 double memcpy 제거
-**왜**: 4A-1의 shm 직접 할당이 4A-2 worker buffer와 결합해야 double memcpy 완전 제거.
-
-구현 항목:
-- `cuvs_ambuild()`에서 scan 전 `shm_open` + `ftruncate` + `mmap`
-- `grow_build_buffers()` `realloc` → `ftruncate` + `mremap` 교체
-- `shm_write_build_payload()` memcpy×2 제거
-- `shm_open` 실패 시 heap 경로 degraded fallback + WARNING
-
-완료 기준: N=1M dim=1024 Cohere A100 기준 build ≤ 50s (현재 55s)
-
-스펙: [design/PLAN.md — Phase 4A](design/PLAN.md) | ADR-034 §4A-1
-
-##### 4A-2 — parallel maintenance workers
-**왜**: 4A-1 완료 후. worker별 buffer가 shm 위에 올라가야 double memcpy 경로가 완전히 제거됨.
-
-구현 항목:
-- `table_index_build_scan()` parallel 인자 전달 (구현 시 PG API 조사 후 결정)
-- worker별 독립 `CuvsBuildState` + leader merge (memcpy 연접, 정렬 불필요)
-- `max_parallel_maintenance_workers` GUC 읽기 (0이면 기존 단일 프로세스)
-
-완료 기준: workers=4 기준 build ≤ 35s (현재 55s)
-
-스펙: [design/PLAN.md — Phase 4A](design/PLAN.md) | ADR-034 §4A-2
+> **3A Pending Delta는 완료**(완료 표 참조). streaming write(INSERT/UPDATE/DELETE) 후 REINDEX 없이 GPU+delta 병합으로 정합한 top-k를 반환한다. 3L `CuvsBfIndex`를 3A-2 GPU delta cache가 재사용. 상세 스펙·검증은 [design/PLAN.md — Phase 3A](design/PLAN.md), 결정은 ADR-047. **4A(빌드 오버헤드)도 완료**(완료 표 참조, ADR-057/058/059) — 순차 경로는 3R부터다.
 
 #### 3R — CAGRA 빌드 파라미터 reloption
-**왜**: 4A-2 완료 후. `graph_degree`, `intermediate_graph_degree`, `build_algo`를 reloption으로 노출. recall↔speed·VRAM 트레이드오프를 사용자가 직접 제어. 난이도 낮음.
+**왜**: 4A 완료 후(다음 순차). `graph_degree`, `intermediate_graph_degree`, `build_algo`를 reloption으로 노출. recall↔speed·VRAM 트레이드오프를 사용자가 직접 제어. 난이도 낮음.
 
 구현 항목:
 - `cuvs_relopts`에 `graph_degree`(int), `intermediate_graph_degree`(int), `build_algo`(enum) 추가
@@ -100,7 +65,7 @@
 스펙: [design/PLAN.md — Phase 3R](design/PLAN.md) | ADR-052
 
 #### 3O — Pre-filter ANN (필터 검색)
-**왜**: 4A-2 완료 후. WHERE 조건을 cuVS bitvector mask로 daemon에 전달해 GPU가 조건을 만족하는 벡터만 탐색. 고선택성 필터에서 IPC·recheck 낭비 제거.
+**왜**: 4A 완료 후. WHERE 조건을 cuVS bitvector mask로 daemon에 전달해 GPU가 조건을 만족하는 벡터만 탐색. 고선택성 필터에서 IPC·recheck 낭비 제거.
 
 구현 항목:
 - `CuvsCmdFrame`에 `filter_shm_key[64]` 추가
