@@ -52,10 +52,21 @@ SET cuvs.cpu_hnsw_fallback = off;
 
 -- Force planner to use CAGRA index (20 rows -> seqscan is cheaper by default).
 SET enable_seqscan = off;
+-- Ask the daemon for >=2 candidates so LIMIT 2 has two DISTINCT neighbors. With
+-- the default k the CPU HNSW path returns only the nearest, and LIMIT 2 repeats
+-- it (the old golden's CPU block was a {20,20} duplicate that did NOT match the
+-- GPU {20,9}). cuvs.k=4 lets both paths return a real top-2 so the test actually
+-- validates GPU CAGRA == CPU HNSW.
+SET cuvs.k = 4;
 
 -- GPU baseline: verify CAGRA is used and returns results.
+-- Query [0.7,0.1,0,0] has an UNAMBIGUOUS, untied top-2: id 20 [0.9,0.1,0,0]
+-- (0.04) then id 1 [1,0,0,0] (0.10), with the 3rd nearest (id 9) far behind
+-- (0.20). The earlier [1,0.5,0,0] sat ON the id1==id9 tie-line (both 0.25), so
+-- CAGRA's approximate tie-break flapped the 2nd id across builds (flaky golden).
+-- Untied + off the tie-line + not near-exact -> stable, and GPU == CPU HNSW.
 SELECT id FROM hnsw_test
-ORDER BY embedding <-> '[1,0.5,0,0]'::vector
+ORDER BY embedding <-> '[0.7,0.1,0,0]'::vector
 LIMIT 2;
 
 -- Enable CPU HNSW mode.
@@ -63,7 +74,7 @@ SET cuvs.cpu_hnsw_fallback = on;
 
 -- CPU HNSW search: same top-2 expected.
 SELECT id FROM hnsw_test
-ORDER BY embedding <-> '[1,0.5,0,0]'::vector
+ORDER BY embedding <-> '[0.7,0.1,0,0]'::vector
 LIMIT 2;
 
 -- search_mode must be 'cpu_hnsw' after a cpu_hnsw_fallback query.

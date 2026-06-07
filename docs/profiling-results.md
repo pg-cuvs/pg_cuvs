@@ -183,3 +183,87 @@ journalctl -u pg-cuvs-server | grep -E 'handle_build|built index'
 
 # export WAL: pg_stat_wal 델타 (CREATE INDEX USING pg_cuvs_hnsw 전후)
 ```
+
+---
+
+## 7. 빌드 corpus 핸드오프: memfd 하이브리드 (ADR-057, 2026-06-07)
+
+빌드 corpus를 익명 memfd에 모아 `SCM_RIGHTS`로 데몬에 fd를 넘기는 무복사·누수-안전 핸드오프. 측정 환경
+동일(A100/PG16). **north-star = raw cuVS 대비 backend 오버헤드 제거율**로 프레이밍한다.
+
+### 빌드 오버헤드 분해 (N=500k dim=1024, memfd tier)
+
+| 구성요소 | 시간 | 비고 |
+|----------|------|------|
+| **GPU build** (데몬: H2D + 그래프 구축) | **~33 s** | cuVS-native와 공유(천장). journal `corpus via memfd`→`built index` |
+| **backend 오버헤드** (scan + detoast + memfd fill + 무복사 IPC) | **~6 s** | pg_cuvs가 cuVS 위에 얹는 PG 오버헤드 |
+| **빌드 wall-clock (합계)** | **39.2 s** | `\timing` |
+
+### old(heap+이중복사) vs new(memfd) A/B — N=500k dim=1024
+
+| 지표 | old (heap+shm 복사) | new (memfd) | 차이 |
+|------|--------------------|-------------|------|
+| 빌드 wall-clock | 40.3 s | 39.2 s | −1.1s (GPU 지배라 marginal) |
+| backend peak RSS | 6146 MB | 4189 MB | **−1957 MB (−32%)** = corpus 크기(이중버퍼 1개 제거) |
+| **copy 오버헤드** | heap→shm memcpy(corpus 전체) | **0 (데몬이 corpus 직접 mmap)** | 무복사 |
+
+### 핵심 결론 (ADR-034 §4A-1 대체)
+
+- **copy 오버헤드를 ~0으로**: 데몬이 backend가 채운 corpus를 그대로 mmap → heap→shm 복사 소멸. memfd라
+  **/dev/shm 이름 없음 → 크래시 고아 누수 구조적 불가**(SIGKILL/SIGSEGV/OOM-killer 매트릭스 + soak 실증).
+- **남은 backend 오버헤드 ~6s = detoast + heap scan**. north-star(오버헤드→0)를 위해선 PLAIN storage(§4,
+  detoast 제거)·4A-2 parallel maintenance workers(heap scan 분산)가 다음 레버. memfd는 그 둘의 enabler
+  (worker buffer도 corpus 위에 직접).
+- **peak RSS −32%**(= corpus 크기)는 대규모/동시-빌드/메모리-제약 환경에서 fit-vs-OOM을 가름.
+
+---
+
+## 8. 빌드 병렬화: parallel maintenance workers (ADR-058, 2026-06-07)
+
+`table_index_build_scan`을 PostgreSQL parallel index build로 병렬화(워커별 named-shm partial → 리더가 memfd로
+merge). north-star = backend 오버헤드(=total − GPU floor) 제거율.
+
+### bench_500000 (dim1024) — workers=0 vs 4
+
+| workers | total | GPU floor | backend 오버헤드 |
+|---------|-------|-----------|------------------|
+| 0 (단일) | 39.2 s | ~33 s | **~6.2 s** |
+| 4 (병렬) | 36.5 s | ~32 s | **~4.5 s (−27%)** |
+
+- **정합**: 고유-벡터 데이터에서 self-NN 단일=병렬 5/5(merge가 (vec,tid) pairing 보존). installcheck 15/15 무회귀.
+- **한계(merge가 병목)**: 단일 경로는 corpus를 1회만 씀(memfd 직접). 병렬은 worker가 partial에 1회 쓰고
+  **리더가 모든 partial을 최종 memfd로 다시 복사(merge)** = corpus 2-pass. backend(병렬) ≈ 분산스캔(~1.2s) +
+  **merge 복사(~3s)** ≈ 4.5s. 즉 스캔은 ~5배 빨라졌으나 **merge가 절감분을 대부분 먹어** 순이득 −27%에 그침.
+  merge 복사가 4A-2 이득의 상한(ADR-057이 없앤 복사를 부분 재도입).
+- **wall-clock은 GPU floor(~33s) 지배라 marginal**(39→36s). 가치는 backend 오버헤드 제거(north-star).
+- **다음 레버**: (a) **merge 복사 제거** — 데몬이 worker별 다중 partial을 직접 mmap(프로토콜 변경)하면 2-pass→
+  1-pass, 분산스캔 이득이 그대로 살아남. (b) **PLAIN storage(§4)** — detoast 자체 제거(직교).
+
+> 주의: 이 문서의 1M 벤치 테이블(bench1m/bench_500000)은 uncorrelated subquery 생성이라 **모든 행이 동일
+> 벡터**(InitPlan 1회 평가) — 빌드 시간/오버헤드 측정엔 유효하나 **recall 측정엔 무효**. recall은 고유-벡터
+> 테이블(예: `array_agg(random() ...) GROUP BY id`)로 별도 검증.
+
+---
+
+## 9. 빌드 merge 복사 제거: 데몬 multi-partial direct H2D (ADR-059, 2026-06-07)
+
+ADR-058의 상한이던 **리더 merge 복사**를 제거 — 리더가 worker partial을 최종 corpus로 연접하는 대신 N개
+descriptor를 데몬에 넘기고, 데몬이 각 partial을 mmap해 **device 행렬 1개에 offset별 직접 H2D**
+(`cuvs_cagra_build_multi`). host corpus 복사 0.
+
+### bench_500000 (dim1024) — backend 오버헤드 (total − GPU floor)
+
+| 구성 | total wall | GPU floor(데몬 저널) | backend 오버헤드 |
+|------|-----------|---------------------|------------------|
+| 단일(w0, memfd) | 39.35 s | ~33 s | **~6.3 s** |
+| 병렬(w4, ADR-059 multi-partial) | 36.67 s | ~33 s | **~3.7 s** |
+
+- **merge 복사 소멸 실증**: 데몬 로그 `[handle_build_multi] 2 partial(s) ... (direct multi-H2D)` — 연접 단계
+  없음. ADR-058 병렬 backend ~4.5s(merge 포함) 대비 감소(저널 1s 해상도 내 노이즈 존재).
+- **wall-clock은 여전히 GPU floor(~33s/37s ≈ 89%) 지배** → 빌드 시간 자체는 marginal. 가치는 north-star
+  (backend 오버헤드 제거).
+- **구조적 이득**: 리더가 더 이상 2번째 full corpus(merge 버퍼)를 들지 않음 → backend peak RSS −corpus(~2GB,
+  500k×1024). single-shard 직접 경로; multi-shard(대형)는 host 조립 + `build_sharded` 폴백.
+- **정합**: 고유-벡터 self-NN 단일==병렬 5/5(§ADR-059), installcheck 15/15 + iso 2/2, sidecar byte-identity
+  단위. /dev/shm 고아 0.
+- **남은 레버**: PLAIN storage(§4, detoast 제거) — 단일/병렬 양쪽 직교 적용.

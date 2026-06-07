@@ -4,7 +4,7 @@
 
 ## 1. 벡터 컬럼 storage: 고차원은 PLAIN 권장 (ADR-043)
 
-pgvector `vector` 타입의 기본 storage는 **EXTERNAL**이다. 차원이 커서 행이 TOAST 임계(~2KB, 약 dim≥500)를 넘으면 값이 out-of-line으로 저장되고, CAGRA 빌드의 heap scan마다 **detoast 비용**(빌드 heap scan의 ~25-35%)을 낸다.
+pgvector `vector` 타입의 기본 storage는 **EXTERNAL**이다. 차원이 커서 행이 TOAST 임계(~2KB, 약 dim≥500)를 넘으면 값이 out-of-line으로 저장되고, CAGRA 빌드의 heap scan마다 **detoast 비용**을 낸다. VM 실측(ADR-044, 1M×1024): detoast는 빌드 backend ~15.5s 중 ~6.8s로 **빌드 시간의 ~8%**다(이전의 "~25-35%" 추정은 프로파일링으로 하향 보정됨). PLAIN은 추가로 **INSERT ~10%·총 디스크**에서도 유리하다.
 
 벡터 전용 테이블(다른 큰 컬럼 없음)이라면 **PLAIN storage**를 권장한다:
 
@@ -19,7 +19,8 @@ CREATE INDEX ON items USING cagra (embedding vector_l2_ops);
 
 - 빌드 시 컬럼이 TOAST-able이고 해당 차원에서 toast되면 NOTICE가 출력된다.
 - 작은 차원(행이 inline 유지)은 detoast 비용이 없어 NOTICE를 내지 않는다.
-- 측정 근거: `docs/profiling-results.md`(4-preflight), ADR-043. EXTENDED/EXTERNAL vs PLAIN 빌드 차이 실측.
+- **트레이드오프**: PLAIN은 벡터를 main heap에 inline 저장하므로 **main heap이 크게 팽창**한다(1M×1024 실측: 58MB→7.8GB, 약 134×). 같은 테이블에서 벡터 외 컬럼을 자주 조회하면 heap scan이 느려진다 — 그래서 **벡터 전용 테이블에서만** 권장한다. 총 디스크는 오히려 줄어든다(TOAST 13GB가 사라짐).
+- 측정 근거: `docs/profiling-results.md`(4-preflight §4), ADR-043/ADR-044. EXTENDED/EXTERNAL vs PLAIN 빌드·INSERT·디스크 차이 실측.
 
 주의: 행이 페이지(8KB)에 안 들어갈 만큼 크면 PLAIN이 불가하다. 매우 고차원(예: dim>2000 float4)은 TOAST가 불가피할 수 있다.
 

@@ -30,9 +30,18 @@
 |-------|------|------|
 | 4A-1 | CAGRA 빌드 double memcpy 제거 (**quick win**: ~2-5s, 난이도 낮음, 4A-2 enabler) | 릴리스 후 기능 |
 | 4A-2 | parallel maintenance workers — heap scan/detoast 병렬화 (~8-12s/~10-14%, 난이도 중간) | 릴리스 후 기능 |
+| 3R | CAGRA 빌드 파라미터 reloption — `graph_degree`, `intermediate_graph_degree`, `build_algo` 사용자 제어 (recall↔speed 튜닝) | 릴리스 후 기능 |
+| 3O | Pre-filter ANN — WHERE 조건을 cuVS bitvector mask로 daemon에 전달, 고선택성 필터 GPU 품질 향상 | 릴리스 후 기능 |
+| 3S | statement_timeout / 취소 전파 — UDS recv timeout + CHECK_FOR_INTERRUPTS + CUVS_OP_CANCEL, 연결 고갈 방지 | 릴리스 후 기능 |
+| 3P | IVF-PQ — 새 AM `USING ivfpq` (product quantization, VRAM 10–100× 절감, 100M+ 대용량) | 릴리스 후 기능 |
+| 3Q | CAGRA Streaming Updates — `cuvsCagraExtend`(INSERT) + `cuvsCagraMerge`+cuvsFilter(DELETE/컴팩션) 실시간 인덱스 업데이트, .delta 경로 대체 | 릴리스 후 기능 |
+| 4C | Background Compaction + CONCURRENTLY 정합성 — PG bgworker auto-REINDEX + DELETE 정합 검증 | 릴리스 후 기능 |
 | 3C / 3D | GCS artifact snapshot 본체 / Replica async warmup | 트리거 (multi-node 수요) |
 | fallback 관측성 · circuit breaker 전역화 · SQL latency split | 운영 하드닝 잔여 | 트리거 |
 | 3N | OFFSET-aware K 자동 조정 (ORM pagination 호환) | 트리거 (ORM 요구) |
+| fp16 입력 | float16 벡터 입력으로 VRAM ~50% 절감 — `WITH (precision=fp16)` reloption, cuVS C API 지원 확인 필요 | 트리거 (cuVS fp16 지원 확인) |
+| EXPLAIN GPU 타이밍 | `EXPLAIN ANALYZE`에 GPU kernel time / IPC latency 노출, 쿼리별 병목 진단 | 트리거 (명시 진단 수요) |
+| VACUUM tombstone 연동 | autovacuum 시 `CUVS_OP_COMPACT` 자동 트리거 — 별도 bgworker 없이 PG 스케줄 재활용 (3Q 의존) | 트리거 (3Q 완료) |
 
 ---
 
@@ -79,6 +88,85 @@
 
 스펙: [design/PLAN.md — Phase 4A](design/PLAN.md) | ADR-034 §4A-2
 
+#### 3R — CAGRA 빌드 파라미터 reloption
+**왜**: 4A-2 완료 후. `graph_degree`, `intermediate_graph_degree`, `build_algo`를 reloption으로 노출. recall↔speed·VRAM 트레이드오프를 사용자가 직접 제어. 난이도 낮음.
+
+구현 항목:
+- `cuvs_relopts`에 `graph_degree`(int), `intermediate_graph_degree`(int), `build_algo`(enum) 추가
+- `CuvsCmdFrame` build params에 포함, daemon의 `cuvsCagraIndexParams` 직접 설정
+- reloption 미지정 시 cuVS 기본값 통과
+
+완료 기준: `WITH (graph_degree=32)` 빌드 시 cuVS params 반영 확인, 기존 test suite PASS
+
+스펙: [design/PLAN.md — Phase 3R](design/PLAN.md) | ADR-052
+
+#### 3O — Pre-filter ANN (필터 검색)
+**왜**: 4A-2 완료 후. WHERE 조건을 cuVS bitvector mask로 daemon에 전달해 GPU가 조건을 만족하는 벡터만 탐색. 고선택성 필터에서 IPC·recheck 낭비 제거.
+
+구현 항목:
+- `CuvsCmdFrame`에 `filter_shm_key[64]` 추가
+- backend: filter 조건 → TID 비트맵 → shm 전달
+- daemon: cuVS filtered search API 호출
+- fallback: 비트맵 shm 실패 시 기존 post-filter 경로 + WARNING
+- GUC `cuvs.prefilter_threshold` (밀도 기반 pre/post 자동 전환)
+
+완료 기준: 고선택성 WHERE 쿼리에서 pre-filter 경로 동작 확인, recall@10 동일성, 기존 test suite PASS
+
+스펙: [design/PLAN.md — Phase 3O](design/PLAN.md) | ADR-048
+
+#### 3S — statement_timeout / 취소 전파
+**왜**: 3O 완료 후. PG cancel이 daemon IPC로 전파되지 않아 GPU 검색이 걸리면 statement_timeout 이후에도 backend가 대기. 연결 고갈 방지 필수.
+
+구현 항목:
+- UDS recv에 `poll(fd, ipc_timeout_ms)` 루프 + `CHECK_FOR_INTERRUPTS()` 감지
+- 취소 시 daemon에 `CUVS_OP_CANCEL` 전송 후 오류 반환
+- GUC `cuvs.ipc_timeout_ms` (기본 5000ms)
+- daemon: cancel op 수신 시 진행 중 검색 중단 후 연결 상태 초기화
+
+완료 기준: `statement_timeout = '1s'` 설정 후 느린 GPU 검색에서 timeout 확인, 연결 정상 반환 확인, 기존 test suite PASS
+
+스펙: [design/PLAN.md — Phase 3S](design/PLAN.md) | ADR-053
+
+#### 3P — IVF-PQ (추가 cuVS 알고리즘)
+**왜**: 3O 완료 후. CAGRA는 VRAM에 float32 전체 보유 필요 — 대용량(100M+) 환경에서 비실용적. IVF-PQ로 VRAM 10–100× 절감.
+
+구현 항목:
+- 새 AM handler `pg_cuvs_ivfpq_handler` 등록 (`CREATE INDEX USING ivfpq`)
+- reloption: `n_lists`, `pq_bits`, `pq_dim`
+- GUC: `cuvs.ivfpq_n_probes`
+- daemon: `CUVS_OP_BUILD_IVFPQ`, `CUVS_OP_SEARCH_IVFPQ` op 추가
+
+완료 기준: N=1M build 성공, recall@10 ≥ 0.90, VRAM CAGRA 대비 10× 절감 실측, 기존 test suite PASS
+
+스펙: [design/PLAN.md — Phase 3P](design/PLAN.md) | ADR-049
+
+#### 3Q — CAGRA Streaming Updates
+**왜**: 3P 완료 후. cuVS 26.04 C API(`cuvsCagraExtend`, `cuvsCagraMerge`, `cuvsFilter`)로 INSERT/DELETE를 .delta 파일 없이 VRAM 내에서 직접 처리. delta 누적에 따른 search-time 병합 비용을 제거하고 recall 유지.
+
+구현 항목:
+- `CUVS_OP_EXTEND`: IPC op + daemon `cuvsCagraExtend` + disk serialize(내구성)
+- `CUVS_OP_COMPACT`: `cuvsCagraMerge(filter=tombstone bitvector)` → new index atomic swap → old VRAM 해제
+- GUC `cuvs.extend_chunk_size` (`max_chunk_size` 제어, 0=auto)
+- VRAM 예산 갱신 (extend grow 반영)
+- `aminsert` → `CUVS_OP_EXTEND` 전환, 3A .delta 경로 deprecated
+
+완료 기준: INSERT/DELETE/UPDATE e2e 검증(recall@10 동일성), .delta 미생성 확인, 기존 test suite PASS
+
+스펙: [design/PLAN.md — Phase 3Q](design/PLAN.md) | ADR-051
+
+#### 4C — Background Compaction + CREATE INDEX CONCURRENTLY 정합성
+**왜**: 3P 완료 후. delta 수동 REINDEX 운용 부담 제거. CONCURRENTLY DELETE 정합성 검증은 4C 착수 전 선행 필수.
+
+구현 항목:
+- 4C-0 선행: REINDEX CONCURRENTLY 동작 검증 + DELETE concurrent build isolation 테스트
+- `cuvs_compaction_worker` bgworker 등록
+- GUC: `cuvs.auto_compact`, `cuvs.auto_compact_check_interval`, `cuvs.auto_compact_threshold`
+- `pg_stat_gpu_search`에 `last_compact_at`, `compact_count` 컬럼 추가
+
+완료 기준: auto_compact=on에서 delta 초과 인덱스 자동 REINDEX e2e 검증, CONCURRENTLY DELETE isolation GREEN, 기존 test suite PASS
+
+스펙: [design/PLAN.md — Phase 4C](design/PLAN.md) | ADR-050
+
 ---
 
 ## 트리거 기반 백로그 (번호 없음 — 조건 충족 시 승격)
@@ -113,6 +201,26 @@
 **상태**: 보류 (low-value). 자체 분석상 임팩트 낮음 — PG executor의 `LIMIT/OFFSET`이 이미 동작하고, pg_cuvs는 K를 `offset + limit`으로 조정하면 됨(별도 API 불필요). top-K 사용 패턴(K=10~100)에서 offset pagination 수요가 드묾. ORM 호환이 명확한 요구로 올라오는 시점에 재검토. 구현 자체는 자명(저난이도)이라 필요 시 즉시 착수 가능.
 
 스펙: [design/PLAN.md — Phase 3N](design/PLAN.md) | ADR-042
+
+#### fp16 입력 벡터 (트리거: cuVS C API fp16 지원 확인)
+**효과**: float16 입력으로 VRAM ~50% 절감. `WITH (precision=fp16)` reloption.
+**전제**: VM에서 `cuvsCagraBuild`에 `CUDA_R_16F` dtype 전달 가능 여부 확인 필요.
+**트리거**: cuVS C API fp16 지원 확인 + recall 저하 < 0.5% 실측.
+
+스펙: [design/PLAN.md — fp16 입력 벡터](design/PLAN.md) | ADR-054
+
+#### EXPLAIN ANALYZE GPU 타이밍 (트리거: 명시 진단 수요)
+**효과**: `EXPLAIN ANALYZE`에 GPU kernel time / IPC latency 노출. 쿼리별 병목 진단 가능.
+**구현**: daemon 응답 프레임에 `gpu_kernel_us`/`ipc_roundtrip_us` 추가, custom scan `ExplainCustomScan` 콜백에서 주입.
+**트리거**: 프로덕션 배포 후 쿼리별 GPU latency 분해 수요 명시.
+
+스펙: [design/PLAN.md — EXPLAIN GPU 타이밍](design/PLAN.md) | ADR-055
+
+#### VACUUM 연동 tombstone 정리 (트리거: 3Q 완료)
+**효과**: autovacuum 시 `CUVS_OP_COMPACT` 자동 트리거 — 별도 bgworker 없이 PG 스케줄 재활용. 4C와 동일 COMPACT op 공유.
+**트리거**: 3Q 완료 + autovacuum 중 tombstone 지연 정리가 실측 문제로 확인.
+
+스펙: [design/PLAN.md — VACUUM tombstone 연동](design/PLAN.md) | ADR-056
 
 ---
 

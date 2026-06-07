@@ -983,6 +983,43 @@ Phase 3N 완료 기준:
 - Django QuerySet slicing(`qs[100:110]`), SQLAlchemy `.offset(100).limit(10)` 패턴으로 GPU 인덱스가 사용됨을 `EXPLAIN`으로 확인한다.
 - large offset(>1000) 시 NOTICE 경고가 발생한다.
 
+#### fp16 입력 벡터 (트리거: cuVS C API fp16 지원 확인)
+
+`CREATE INDEX ... WITH (precision=fp16)` reloption 추가. float32 대비 VRAM ~50% 절감. 동일 예산에서 인덱스 크기 2× 향상.
+
+전제: `cuvsCagraBuild` dataset 인자에 `CUDA_R_16F` dtype 전달 가능 여부 VM 헤더 검증 필요.
+
+완료 기준:
+- cuVS C API fp16 지원 확인 + recall 저하 < 0.5% 실측.
+- N=1M dim=1024 기준 VRAM 사용량 float32 대비 ≥45% 절감 확인.
+- 기존 test suite PASS.
+
+스펙: ADR-054
+
+---
+
+#### EXPLAIN ANALYZE GPU 타이밍 (트리거: 명시 진단 수요)
+
+PG custom scan node의 `ExplainCustomScan` 콜백에서 GPU kernel time / IPC latency를 `EXPLAIN ANALYZE` output에 주입. daemon 응답 프레임에 `gpu_kernel_us`, `ipc_roundtrip_us` 추가.
+
+완료 기준:
+- `EXPLAIN (ANALYZE)` output에 `GPU kernel: Xms, IPC: Yms` 행 표시 확인.
+- 기존 test suite PASS.
+
+스펙: ADR-055
+
+---
+
+#### VACUUM 연동 tombstone 정리 (트리거: 3Q 완료)
+
+`ambulkdelete` hook에서 tombstone 비율이 `cuvs.compact_on_delete_ratio`를 초과하면 `CUVS_OP_COMPACT` 호출. PG autovacuum 스케줄을 재활용해 별도 bgworker 불필요.
+
+4C(full REINDEX bgworker)와 동일 `CUVS_OP_COMPACT` 공유 — 병행 가능. `ambulkdelete`가 동기 호출이므로 threshold 설계 또는 비동기 dispatch 검토 필요.
+
+완료 기준: autovacuum 실행 후 tombstone 자동 정리 e2e 확인. 기존 test suite PASS.
+
+스펙: ADR-056
+
 ---
 
 Phase 3 전체 완료 기준:
@@ -1083,7 +1120,7 @@ heap scan + varlena decode ~15-20s는 PG 오버헤드 45s 중 가장 큰 단일 
 
 현실적 대응:
 - parallel workers(4A-2)가 wall-clock 분산으로 유일한 단기 가속 수단이다.
-- PLAIN storage(`ALTER TABLE ... SET STORAGE PLAIN`)는 사용자 선택이며, 빌드 성능 ~25-35% 개선이 가능하나 일반 쿼리 성능 저하 트레이드오프가 있다. OPS_GPU_PLAYBOOK에 "빌드 성능 최적화 팁"으로 안내한다.
+- PLAIN storage(`ALTER TABLE ... SET STORAGE PLAIN`)는 사용자 선택이며, 빌드 성능 개선이 가능하나 일반 쿼리 성능 저하 트레이드오프가 있다. OPS_GPU_PLAYBOOK에 "빌드 성능 최적화 팁"으로 안내한다. *(이 단락의 "~45s PG 오버헤드"·"~25-35% 개선"은 ADR-044 프로파일링 이전 추정 — 실측은 backend ~15.5s, PLAIN 빌드 절감 ~8%. `docs/best-practices.md` §1 참조.)*
 - 장기 모니터링 대상: pgvector fixed-length storage 지원 여부, PG 코어 TOAST prefetch/streaming API.
 
 ### 4B — import_hnsw 페이지 write 병목 감소
@@ -1124,6 +1161,243 @@ REINDEX INDEX t_hnsw;  -- pgvector 재빌드, LOGGED
 | 4A-2 완료 | CAGRA build ≤ 35s (현재 55s, workers=4 기준) | 동일 + workers=0 동작 동일 확인 + parallel build integration test |
 | 4B 현상 유지 | UNLOGGED import ~28s (변동 없음) | `EXPLAIN (ANALYZE)` import time, 기존 test suite regression 없음 |
 | 종합 (4A-2 + 4B, UNLOGGED) | 전체 ≤ 65s (현재 96s, native 285s 대비 4.4×) | end-to-end: CAGRA build + pg_cuvs_build_hnsw(nsw) + UNLOGGED import |
+
+---
+
+## Phase 3R — CAGRA 빌드 파라미터 reloption
+
+목표: `graph_degree`, `intermediate_graph_degree`, `build_algo`를 `CREATE INDEX ... WITH (...)` reloption으로 노출해 사용자가 recall↔build-time·VRAM 트레이드오프를 직접 제어할 수 있도록 한다. (ADR-052)
+
+### 구현 항목
+
+#### 1. reloption 추가
+
+| reloption | 타입 | cuVS 기본값 | 범위 |
+|-----------|------|-------------|------|
+| `graph_degree` | int | 64 | 8–512 |
+| `intermediate_graph_degree` | int | 128 | 8–1024 |
+| `build_algo` | enum str | `IVF_PQ` | `IVF_PQ`, `NN_DESCENT` |
+
+`relopt_kind` 등록 + `cuvs_relopts` 파싱에 추가.
+
+#### 2. IPC 전달
+
+`CuvsCmdFrame` 또는 별도 `CuvsIndexParams` struct에 3개 필드 추가. daemon의 `cuvsCagraIndexParams` 직접 설정 후 `cuvsCagraBuild` 호출.
+
+#### 3. 기본값 처리
+
+reloption 미지정(0/NULL) → cuVS 기본값 통과. 값 지정 시만 override.
+
+### 완료 기준
+
+- `WITH (graph_degree=32)` 빌드 시 cuVS params 반영 확인 (daemon 로그 또는 인덱스 메타 검증)
+- `WITH (build_algo='NN_DESCENT')` 빌드 성공
+- 기존 test suite(`make gpu-test-all`) 전수 PASS
+
+스펙: ADR-052
+
+---
+
+## Phase 3O — Pre-filter ANN (필터 검색)
+
+목표: WHERE 조건을 cuVS bitvector mask로 daemon에 전달해, GPU가 조건을 만족하는 벡터만 탐색한다. 고선택성 필터에서 GPU 후보 품질을 높이고 IPC·recheck 낭비를 줄인다. (ADR-048)
+
+### 구현 항목
+
+**3O-1 — IPC 프레임 확장**:
+- `CuvsCmdFrame`에 `filter_shm_key[64]` 추가 (비트맵 shm 이름; 빈 문자열 = unfiltered).
+- `CuvsBuildShm` 패턴과 동일하게 backend가 비트맵 shm 세그먼트를 생성·전달·소멸.
+
+**3O-2 — backend 비트맵 생성**:
+- `cuvs_beginscan` / `cuvs_rescan`에서 `scan->xs_recheck_itup` filter 조건을 heap TID 비트맵으로 평가.
+- 비트맵 밀도가 `cuvs.prefilter_threshold` 이하이면 pre-filter 경로, 초과이면 기존 post-filter 경로.
+
+**3O-3 — daemon filtered search**:
+- `CUVS_OP_SEARCH`에서 `filter_shm_key`가 있으면 cuVS CAGRA filtered_search API 호출.
+- cuVS bitvector mask 포맷으로 변환 후 `SearchParams::sample_filter` 전달.
+
+**3O-4 — fallback 및 테스트**:
+- 비트맵 shm 생성 실패 시 기존 unfiltered + post-filter 경로로 graceful degradation + WARNING.
+- isolation test: concurrent filter + ANN 정합 확인. recall 비교(pre-filter vs post-filter, 동일 결과 보장).
+
+### 완료 기준
+
+- `SELECT ... WHERE category = $1 ORDER BY embedding <-> $2 LIMIT 10` 쿼리에서 pre-filter 경로 동작 확인 (`EXPLAIN` + `pg_stat_gpu_search.search_mode` 확인).
+- recall@10 동일성: pre-filter와 post-filter가 동일한 top-k 반환 (deterministic 데이터셋 기준).
+- 기존 test suite(`make gpu-test-all`) 전수 PASS.
+- fallback 경로 integration 시나리오 1건 추가.
+
+스펙: ADR-048
+
+---
+
+## Phase 3S — statement_timeout / 취소 전파
+
+목표: PG의 `statement_timeout` 및 `pg_cancel_backend()`가 daemon IPC로 전파되도록 한다. GPU 검색이 걸려도 backend가 timeout 이후 무기한 대기하지 않아 연결 고갈을 방지한다. (ADR-053)
+
+### 구현 항목
+
+#### 1. backend 측
+
+- `cuvs_ipc_search()` 내부 recv를 `poll(fd, cuvs.ipc_timeout_ms)` 루프로 교체.
+- 루프 내 `CHECK_FOR_INTERRUPTS()` 호출 — PG cancel signal 즉시 감지.
+- 취소 감지 또는 poll timeout 시:
+  1. daemon에 `CUVS_OP_CANCEL` 전송 (best-effort, 실패 무시).
+  2. `ereport(ERROR, ...)` 반환 — PG 트랜잭션 rollback.
+
+#### 2. daemon 측
+
+- `CUVS_OP_CANCEL` 수신 시 해당 연결의 진행 중 검색 중단.
+- cuVS 검색 자체가 non-cancellable이면: worker thread join + 짧은 timeout 후 결과 폐기, 연결 상태 초기화.
+- cancel 처리 후 `CUVS_STATUS_CANCELLED` 응답.
+
+#### 3. GUC
+
+| GUC | 기본값 | 설명 |
+|-----|--------|------|
+| `cuvs.ipc_timeout_ms` | 5000 | poll 상한 (ms). 0=무기한 대기(이전 동작). |
+
+### 완료 기준
+
+- `SET statement_timeout = '1s'` 후 인위적으로 느린 GPU 검색에서 1초 이내 오류 반환 확인
+- 취소 후 연결 정상 재사용 확인 (연결 고갈 없음)
+- `cuvs.ipc_timeout_ms=0` 시 이전 동작 유지 (regression 없음)
+- 기존 test suite(`make gpu-test-all`) 전수 PASS
+
+스펙: ADR-053
+
+---
+
+## Phase 3P — IVF-PQ 및 추가 cuVS 알고리즘
+
+목표: `CREATE INDEX USING ivfpq`로 product quantization 기반 GPU 인덱스를 지원한다. CAGRA 대비 VRAM 10–100× 절감, 대용량(100M+) 데이터셋 대응. (ADR-049)
+
+### 구현 항목
+
+**3P-1 — 새 AM handler 등록**:
+- `pg_cuvs_ivfpq_handler` 등록 (`CREATE ACCESS METHOD ivfpq TYPE INDEX HANDLER ...`).
+- reloption: `n_lists`(IVF 클러스터 수, 기본 1024), `pq_bits`(코드워드 비트, 기본 8), `pq_dim`(서브공간 수, 기본 dim/2).
+- GUC: `cuvs.ivfpq_n_probes`(탐색 클러스터 수, 기본 64 — recall/speed 트레이드오프).
+
+**3P-2 — IPC op 추가**:
+- `CUVS_OP_BUILD_IVFPQ`, `CUVS_OP_SEARCH_IVFPQ` 추가.
+- build 경로: 동일 shm 코퍼스 전달 → daemon이 cuVS `IvfPq::build()` → serialize.
+- search 경로: 동일 shm query 전달 → daemon이 cuVS `IvfPq::search()`.
+
+**3P-3 — daemon IVF-PQ 경로**:
+- `IndexEntry`에 `ivfpq` 타입 추가 (CAGRA handle과 별개).
+- persist/load: cuVS IVF-PQ serialize/deserialize.
+- VRAM budget 계산: PQ 압축 코드 크기 기준 (float32의 `pq_bits/32` 비율).
+
+**3P-4 — 테스트 및 문서**:
+- smoke: `CREATE INDEX USING ivfpq` + search recall@10 ≥ 0.90 (n_probes=64 기준).
+- 기존 CAGRA 경로 회귀 없음.
+- `docs/algorithm-selection-guide.md`: CAGRA vs IVF-PQ 선택 기준 문서화.
+
+### 완료 기준
+
+- N=1M, dim=1024 데이터셋에서 `CREATE INDEX USING ivfpq` build 성공.
+- recall@10 ≥ 0.90 (CAGRA 대비 트레이드오프 허용).
+- VRAM 사용량이 동일 데이터셋 CAGRA 대비 10× 이상 절감 실측.
+- 기존 test suite(`make gpu-test-all`) 전수 PASS.
+
+스펙: ADR-049
+
+---
+
+## Phase 3Q — CAGRA Streaming Updates
+
+목표: cuVS 26.04 C API(`cuvsCagraExtend`, `cuvsCagraMerge`, `cuvsFilter`)를 활용해 INSERT/DELETE/UPDATE를 .delta 파일 없이 VRAM 내에서 직접 처리한다. delta 누적에 따른 search-time CPU/GPU 병합 비용을 제거하고, recall을 유지한 채 실시간 인덱스 업데이트를 지원한다. (ADR-051)
+
+**전제 조건**: cuVS 26.04 이상 (VM 헤더 검증 완료, 2026-06-06).
+
+### 구현 항목
+
+#### 1. IPC 확장
+
+| Op | 방향 | 설명 |
+|----|------|------|
+| `CUVS_OP_EXTEND` | backend → daemon | shm에 새 벡터+TID 기록, daemon이 `cuvsCagraExtend` 후 disk serialize |
+| `CUVS_OP_COMPACT` | backend → daemon | `cuvsCagraMerge(filter=tombstone bitvector)` → 새 인덱스 atomic swap |
+
+`CuvsCmdFrame`에 `extend_shm_key[64]`(EXTEND용) 추가.
+
+#### 2. EXTEND 경로 (INSERT/UPDATE)
+
+- `aminsert`: shm에 새 벡터 + TID 기록 → `CUVS_OP_EXTEND` IPC
+- daemon: `cuvsCagraExtend(res, &params, new_dataset, index)` 호출
+  - `params.max_chunk_size = cuvs.extend_chunk_size` (0=auto)
+- daemon: 성공 후 disk serialize (`.cagra` + `.tids` 갱신) — 내구성 보장
+- VRAM 예산 카운터 갱신 (extend로 인덱스 grow 반영)
+- EXTEND 실패 시: 3A tombstone + delta append fallback + WARNING (graceful degradation)
+
+#### 3. COMPACT 경로 (DELETE/tombstone 제거)
+
+- `CUVS_OP_COMPACT` IPC: backend가 tombstone bitvector를 shm에 기록
+- daemon: `cuvsCagraMerge(res, params, [index], 1, filter, output_index)` 호출
+  - `filter` = tombstone bitvector (`cuvsFilter` wrapping)
+- 새 인덱스 atomic swap → old VRAM 해제
+- disk serialize (갱신된 `.cagra` + `.tids`)
+
+#### 4. GUC
+
+| GUC | 기본값 | 설명 |
+|-----|--------|------|
+| `cuvs.extend_chunk_size` | `0` (auto) | `cuvsCagraExtendParams.max_chunk_size` 직접 매핑 |
+| `cuvs.compact_on_delete_ratio` | `0.1` | tombstone 비율이 이 값 초과 시 COMPACT 자동 트리거 권장 |
+
+#### 5. 3A .delta 경로 deprecated
+
+- 3Q 완료 후 `aminsert`의 delta file append 경로 제거
+- tombstone 메커니즘은 유지 (COMPACT op의 filter 소스로 재활용)
+- 3A `cuvs.delta_search` GUC: deprecated 표기 (EXTEND 경로에서 불필요)
+
+### 완료 기준
+
+- INSERT/DELETE/UPDATE e2e 검증: recall@10 동일성, .delta 파일 미생성 확인
+- VRAM 예산 갱신 정확성: extend 후 `pg_stat_gpu_cache.vram_bytes` 반영 확인
+- COMPACT 후 tombstone 비율 0 확인
+- 기존 test suite(`make gpu-test-all`) 전수 PASS
+- `cuvs.extend_chunk_size=0`(auto) 기준 N=100K INSERT p99 레이턴시 측정
+
+스펙: ADR-051
+
+---
+
+## Phase 4C — Background Compaction + CREATE INDEX CONCURRENTLY 정합성
+
+목표: delta 수동 REINDEX 운용 부담을 제거하고, CREATE INDEX CONCURRENTLY의 DELETE 정합성을 검증·보장한다. (ADR-050)
+
+### 구현 항목
+
+**4C-0 — REINDEX CONCURRENTLY 선행 검증** (착수 전 필수):
+- `REINDEX INDEX CONCURRENTLY`가 pg_cuvs AM에서 올바르게 동작하는지 검증.
+- DELETE가 섞인 concurrent build isolation 시나리오 추가 (`pg_isolation_regress`).
+- 필요 시 `cuvs_ambuild` 시작 시점에 기존 delta/tombstone 명시적 무효화 경로 추가.
+
+**4C-1 — background worker 등록**:
+- `_PG_init`에서 `cuvs_compaction_worker` bgworker 등록.
+- `cuvs.auto_compact = on|off` GUC (기본 off).
+- `cuvs.auto_compact_check_interval` GUC (기본 60s, 폴링 주기).
+- `cuvs.auto_compact_threshold` GUC (delta_rows 절대값 또는 base 대비 %, 기본 10%).
+
+**4C-2 — compaction 실행 로직**:
+- `pg_stat_gpu_search`에서 `delta_rows > threshold` 인덱스 식별.
+- SPI 또는 별도 libpq connection으로 `REINDEX INDEX CONCURRENTLY <oid>` 실행.
+- 실행 중 daemon restart / 인덱스 DROP 등 경쟁 조건 안전 처리.
+
+**4C-3 — 관측성**:
+- `pg_stat_gpu_search`에 `last_compact_at`(마지막 compaction epoch), `compact_count`(총 횟수) 컬럼 추가.
+- compaction 실행·완료·실패를 PG log에 기록.
+
+### 완료 기준
+
+- `cuvs.auto_compact = on`에서 delta_rows > threshold인 인덱스가 자동 REINDEX됨 (e2e 검증).
+- REINDEX 후 delta_rows = 0, search recall 유지.
+- CREATE INDEX CONCURRENTLY + concurrent DELETE isolation 시나리오 GREEN.
+- 기존 test suite(`make gpu-test-all`) 전수 PASS.
+
+스펙: ADR-050
 
 ---
 
