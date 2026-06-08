@@ -160,7 +160,7 @@ typedef struct IndexEntry {
 
     /* Phase 3I-1: CPU HNSW fallback. Loaded lazily when use_cpu_hnsw=1. */
     CuvsHnswIndex   hnsw_idx;        /* NULL until first cpu_hnsw search request */
-    uint32_t        last_search_mode; /* 0=gpu_cagra, 1=cpu_hnsw, 2=cpu_fallback, 3=gpu_bf (Phase 3L) */
+    uint32_t        last_search_mode; /* 0=gpu_cagra, 1=cpu_hnsw, 2=cpu_fallback, 3=gpu_bf, 4=cagra_prefilter */
 } IndexEntry;
 
 /* Zero just the stat counters of a (re)initialized entry. The slot may carry
@@ -2173,7 +2173,7 @@ handle_search(int client_fd, const CuvsCmdFrame *cmd)
             uint32_t *bitset     = NULL;
             CuvsSearchResult *praw     = NULL;
             CuvsResult       *presults = NULL;
-            int pn = 0, did_prefilter = 0;
+            int pn = 0, did_prefilter = 0, used_cagra = 0;
 
             if (cmd->filter_shm_key[0] != '\0')
             {
@@ -2213,9 +2213,18 @@ handle_search(int client_fd, const CuvsCmdFrame *cmd)
                         }
                     }
 
-                    int pret = cuvs_bf_search_filtered(
-                        e->main_bf_idx, query, (int)cmd->dim, k,
-                        bitset, nv, praw, delta_gpu_of(e));
+                    /* CAGRA prefilter first (approx, faster); fall back to BF. */
+                    int pret = 1;
+                    if (e->handle != NULL) {
+                        pret = cuvs_cagra_search_filtered(
+                            e->handle, query, (int)cmd->dim, k,
+                            bitset, nv, praw, e->gpu_device_id);
+                        if (pret == 0) used_cagra = 1;
+                    }
+                    if (pret != 0 && e->main_bf_idx != NULL)
+                        pret = cuvs_bf_search_filtered(
+                            e->main_bf_idx, query, (int)cmd->dim, k,
+                            bitset, nv, praw, delta_gpu_of(e));
                     if (pret == 0) {
                         did_prefilter = 1;
                         munmap(query, vec_bytes);  /* unmap before D-wedge path runs */
@@ -2242,7 +2251,7 @@ handle_search(int client_fd, const CuvsCmdFrame *cmd)
                 record_search_stat(e, CUVS_STATUS_OK, lat3o, NULL);
                 e->last_requested_k = cmd->k;
                 e->last_returned_k  = (uint32_t) pn;
-                e->last_search_mode = 3; /* gpu_bf */
+                e->last_search_mode = used_cagra ? 4 : 3; /* 4=cagra_prefilter, 3=gpu_bf_prefilter */
                 pthread_mutex_unlock(&g_index_mutex);
                 CuvsReplyHeader hdr3o = {0};
                 hdr3o.status     = CUVS_STATUS_OK;

@@ -534,6 +534,86 @@ cuvs_bf_search_filtered(
 }
 
 /* ----------------------------------------------------------------
+ * 3O: GPU CAGRA search with BITSET prefilter
+ * ---------------------------------------------------------------- */
+extern "C" int
+cuvs_cagra_search_filtered(
+    CuvsCagraIndex    index,
+    const float      *query_vec,
+    int               dim,
+    int               top_k,
+    const uint32_t   *bitset_words,
+    int64_t           bitset_bits,
+    CuvsSearchResult *results,
+    int               device_id)
+{
+    if (!index)
+        return 1;
+
+    CuvsCagraIndexImpl *impl = static_cast<CuvsCagraIndexImpl *>(index);
+    if ((int64_t)dim != impl->idx.dim())
+        return 2;
+
+    int64_t n = (int64_t)impl->idx.dataset().extent(0);
+    if ((int64_t)top_k > n)
+        top_k = (int)n;
+    if (top_k <= 0)
+        return 0;
+
+    PooledRes _pr(device_id);
+    try {
+        raft::device_resources &res = _pr.get();
+
+        auto d_queries   = raft::make_device_matrix<float,    int64_t>(res, (int64_t)1, (int64_t)dim);
+        auto d_indices   = raft::make_device_matrix<uint32_t, int64_t>(res, 1, top_k);
+        auto d_distances = raft::make_device_matrix<float,    int64_t>(res, 1, top_k);
+        raft::copy(d_queries.data_handle(), query_vec, dim, res.get_stream());
+
+        int64_t n_words = (bitset_bits + 31) / 32;
+        auto d_bs_data = raft::make_device_vector<uint32_t, int64_t>(res, n_words);
+        raft::copy(d_bs_data.data_handle(), bitset_words, (size_t)n_words, res.get_stream());
+
+        auto bv        = cuvs::core::bitset_view<uint32_t, int64_t>(
+                             d_bs_data.data_handle(), bitset_bits);
+        auto prefilter = cuvs::neighbors::filtering::bitset_filter<uint32_t, int64_t>(bv);
+
+        cuvs::neighbors::cagra::search_params sparams;
+        int itopk = ((top_k + 31) / 32) * 32;
+        if (itopk < 64) itopk = 64;
+        sparams.itopk_size = itopk;
+
+        cuvs::neighbors::cagra::search(
+            res, sparams, impl->idx,
+            raft::make_const_mdspan(d_queries.view()),
+            d_indices.view(),
+            d_distances.view(),
+            prefilter);
+
+        res.sync_stream();
+
+        std::vector<uint32_t> h_indices(top_k);
+        std::vector<float>    h_distances(top_k);
+        raft::copy(h_indices.data(),   d_indices.data_handle(),   top_k, res.get_stream());
+        raft::copy(h_distances.data(), d_distances.data_handle(), top_k, res.get_stream());
+        res.sync_stream();
+
+        for (int i = 0; i < top_k; i++) {
+            results[i].item_id  = (int64_t)h_indices[i];
+            results[i].distance = h_distances[i];
+        }
+        return 0;
+    } catch (const std::exception &e) {
+        fprintf(stderr, "[cuvs_cagra_search_filtered] exception: %s\n", e.what());
+        _pr.poison();
+        return 1;
+    } catch (...) {
+        fprintf(stderr, "[cuvs_cagra_search_filtered] unknown exception\n");
+        _pr.poison();
+        return 1;
+    }
+}
+
+/* ----------------------------------------------------------------
  * CAGRA index build
  * ---------------------------------------------------------------- */
 /* Map a CUVS_METRIC_* code to the cuVS DistanceType baked into the graph. */

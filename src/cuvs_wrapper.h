@@ -163,6 +163,27 @@ int cuvs_cagra_search(
     int              device_id
 );
 
+/*
+ * cuvs_cagra_search_filtered — GPU CAGRA search with BITSET prefilter (3O).
+ *
+ * bitset_words : host uint32_t[] following cuVS convention: bit[item_id]=1 means
+ *               EXCLUDE that item from search; bit=0 means include.
+ * bitset_bits  : total bit count = n_vecs.
+ *
+ * Returns 0 on success, 2 on dim mismatch, 1 on failure.
+ * Approximate (graph-based); faster than BF prefilter at large N.
+ */
+int cuvs_cagra_search_filtered(
+    CuvsCagraIndex    index,
+    const float      *query_vec,
+    int               dim,
+    int               top_k,
+    const uint32_t   *bitset_words,
+    int64_t           bitset_bits,
+    CuvsSearchResult *results,
+    int               device_id
+);
+
 void cuvs_cagra_free(CuvsCagraIndex index, int device_id);
 
 /*
