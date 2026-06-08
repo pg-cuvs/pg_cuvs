@@ -34,6 +34,7 @@ OBJS           = src/pg_cuvs.o src/cuvs_ipc.o src/cuvs_util.o src/cuvs_wrapper.o
 NVCC          ?= nvcc
 CUDA_ARCH     ?= sm_80
 NVCC_FLAGS    ?= -O3 --compiler-options '-fPIC' -arch=$(CUDA_ARCH) -std=c++17 \
+                 --extended-lambda \
                  -DRAFT_SYSTEM_LITTLE_ENDIAN=1 \
                  -DCUVS_BUILD_CAGRA_HNSWLIB
 
