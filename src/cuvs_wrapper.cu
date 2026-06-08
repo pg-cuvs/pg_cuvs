@@ -16,6 +16,7 @@
 #include <cuvs/neighbors/brute_force.hpp>
 #include <cuvs/neighbors/cagra.hpp>  /* serialize/deserialize merged here in cuVS 25.x+ */
 #include <cuvs/neighbors/hnsw.hpp>   /* Phase 3I-1: CPU HNSW fallback */
+#include <cuvs/neighbors/ivf_pq.hpp> /* 3P: IVF-PQ index */
 #include <cuvs/core/bitset.hpp>      /* 3O: cuvs::core::bitset_view */
 #include <raft/core/device_resources.hpp>
 #include <raft/core/device_mdarray.hpp>
@@ -1021,6 +1022,179 @@ cuvs_cagra_free(CuvsCagraIndex index, int device_id)
         if (cudaSetDevice(device_id) != cudaSuccess)
             fprintf(stderr, "[cuvs_cagra_free] cudaSetDevice(%d) failed\n", device_id);
         delete static_cast<CuvsCagraIndexImpl *>(index);
+    }
+}
+
+/* ----------------------------------------------------------------
+ * 3P: IVF-PQ index
+ *
+ * Stores PQ-compressed codes internally; no retained dataset member needed
+ * (unlike CAGRA which holds an mdspan view into d_corpus). IdxT = int64_t
+ * maps directly to CuvsSearchResult.item_id.
+ * ---------------------------------------------------------------- */
+struct CuvsIvfPqIndexImpl {
+    cuvs::neighbors::ivf_pq::index<int64_t> idx;
+    int64_t  n;    /* corpus size; used for top_k clamping */
+    int      dim;
+
+    CuvsIvfPqIndexImpl(cuvs::neighbors::ivf_pq::index<int64_t> &&i,
+                       int64_t nn, int dm)
+        : idx(std::move(i)), n(nn), dim(dm) {}
+};
+
+extern "C" int
+cuvs_ivfpq_build(
+    const float *vecs, int64_t n_vecs, int dim,
+    uint32_t metric, uint32_t n_lists, uint32_t pq_bits, uint32_t pq_dim,
+    int device_id, CuvsIvfPqIndex *out)
+{
+    if (!vecs || !out || n_vecs <= 0 || dim <= 0)
+        return 1;
+
+    PooledRes _pr(device_id);
+    try {
+        raft::device_resources &res = _pr.get();
+
+        auto d_corpus = raft::make_device_matrix<float, int64_t>(res, n_vecs, (int64_t)dim);
+        raft::copy(d_corpus.data_handle(), vecs, (size_t)n_vecs * dim, res.get_stream());
+        res.sync_stream();
+
+        cuvs::neighbors::ivf_pq::index_params params;
+        params.metric  = cuvs_distance_type(metric);
+        params.n_lists = n_lists ? n_lists : 1024;
+        params.pq_bits = pq_bits ? pq_bits : 8;
+        params.pq_dim  = pq_dim  ? pq_dim  : (uint32_t)((dim + 1) / 2);
+
+        auto idx = cuvs::neighbors::ivf_pq::build(
+            res, params,
+            raft::make_const_mdspan(d_corpus.view()));
+        res.sync_stream();
+
+        *out = new CuvsIvfPqIndexImpl(std::move(idx), n_vecs, dim);
+        return 0;
+    } catch (const std::exception &e) {
+        fprintf(stderr, "[cuvs_ivfpq_build] exception: %s\n", e.what());
+        _pr.poison();
+        return 1;
+    } catch (...) {
+        fprintf(stderr, "[cuvs_ivfpq_build] unknown exception\n");
+        _pr.poison();
+        return 1;
+    }
+}
+
+extern "C" int
+cuvs_ivfpq_search(
+    CuvsIvfPqIndex    index,
+    const float      *query_vec,
+    int               dim,
+    int               top_k,
+    uint32_t          n_probes,
+    CuvsSearchResult *results,
+    int               device_id)
+{
+    if (!index)
+        return 1;
+
+    CuvsIvfPqIndexImpl *impl = static_cast<CuvsIvfPqIndexImpl *>(index);
+    if (dim != impl->dim)
+        return 2;
+    if ((int64_t)top_k > impl->n)
+        top_k = (int)impl->n;
+    if (top_k <= 0)
+        return 0;
+
+    PooledRes _pr(device_id);
+    try {
+        raft::device_resources &res = _pr.get();
+
+        auto d_queries   = raft::make_device_matrix<float,   int64_t>(res, (int64_t)1, (int64_t)dim);
+        auto d_indices   = raft::make_device_matrix<int64_t, int64_t>(res, 1, top_k);
+        auto d_distances = raft::make_device_matrix<float,   int64_t>(res, 1, top_k);
+        raft::copy(d_queries.data_handle(), query_vec, dim, res.get_stream());
+
+        cuvs::neighbors::ivf_pq::search_params sparams;
+        sparams.n_probes = n_probes ? n_probes : 64;
+
+        cuvs::neighbors::ivf_pq::search(
+            res, sparams, impl->idx,
+            raft::make_const_mdspan(d_queries.view()),
+            d_indices.view(),
+            d_distances.view());
+
+        res.sync_stream();
+
+        std::vector<int64_t> h_indices(top_k);
+        std::vector<float>   h_distances(top_k);
+        raft::copy(h_indices.data(),   d_indices.data_handle(),   top_k, res.get_stream());
+        raft::copy(h_distances.data(), d_distances.data_handle(), top_k, res.get_stream());
+        res.sync_stream();
+
+        for (int i = 0; i < top_k; i++) {
+            results[i].item_id  = h_indices[i];
+            results[i].distance = h_distances[i];
+        }
+        return 0;
+    } catch (const std::exception &e) {
+        fprintf(stderr, "[cuvs_ivfpq_search] exception: %s\n", e.what());
+        _pr.poison();
+        return 1;
+    } catch (...) {
+        fprintf(stderr, "[cuvs_ivfpq_search] unknown exception\n");
+        _pr.poison();
+        return 1;
+    }
+}
+
+extern "C" int
+cuvs_ivfpq_serialize(CuvsIvfPqIndex index, const char *path, int device_id)
+{
+    if (!index || !path)
+        return 1;
+    try {
+        CuvsIvfPqIndexImpl *impl = static_cast<CuvsIvfPqIndexImpl *>(index);
+        PooledRes _pr(device_id); raft::device_resources &res = _pr.get();
+        cuvs::neighbors::ivf_pq::serialize(res, std::string(path), impl->idx);
+        res.sync_stream();
+        return 0;
+    } catch (const std::exception &e) {
+        fprintf(stderr, "[cuvs_ivfpq_serialize] exception: %s\n", e.what());
+        return 1;
+    } catch (...) {
+        fprintf(stderr, "[cuvs_ivfpq_serialize] unknown exception\n");
+        return 1;
+    }
+}
+
+extern "C" CuvsIvfPqIndex
+cuvs_ivfpq_deserialize(const char *path, int device_id)
+{
+    if (!path)
+        return nullptr;
+    try {
+        PooledRes _pr(device_id); raft::device_resources &res = _pr.get();
+        cuvs::neighbors::ivf_pq::index<int64_t> idx(res);
+        cuvs::neighbors::ivf_pq::deserialize(res, std::string(path), &idx);
+        res.sync_stream();
+        int64_t n   = (int64_t)idx.size();
+        int     dim = (int)idx.dim();
+        return new CuvsIvfPqIndexImpl(std::move(idx), n, dim);
+    } catch (const std::exception &e) {
+        fprintf(stderr, "[cuvs_ivfpq_deserialize] exception: %s\n", e.what());
+        return nullptr;
+    } catch (...) {
+        fprintf(stderr, "[cuvs_ivfpq_deserialize] unknown exception\n");
+        return nullptr;
+    }
+}
+
+extern "C" void
+cuvs_ivfpq_free(CuvsIvfPqIndex index, int device_id)
+{
+    if (index) {
+        if (cudaSetDevice(device_id) != cudaSuccess)
+            fprintf(stderr, "[cuvs_ivfpq_free] cudaSetDevice(%d) failed\n", device_id);
+        delete static_cast<CuvsIvfPqIndexImpl *>(index);
     }
 }
 

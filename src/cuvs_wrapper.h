@@ -187,6 +187,25 @@ int cuvs_cagra_search_filtered(
 void cuvs_cagra_free(CuvsCagraIndex index, int device_id);
 
 /*
+ * 3P: GPU IVF-PQ index — product quantization, 10-100× less VRAM than CAGRA.
+ * IdxT = int64_t; results map directly to CuvsSearchResult.item_id.
+ * n_lists/pq_bits/pq_dim: 0 = auto (1024 / 8 / ceil(dim/2)).
+ */
+typedef void *CuvsIvfPqIndex;
+
+int            cuvs_ivfpq_build(const float *vecs, int64_t n_vecs, int dim,
+                                 uint32_t metric, uint32_t n_lists,
+                                 uint32_t pq_bits, uint32_t pq_dim,
+                                 int device_id, CuvsIvfPqIndex *out);
+int            cuvs_ivfpq_search(CuvsIvfPqIndex index, const float *query_vec,
+                                  int dim, int top_k, uint32_t n_probes,
+                                  CuvsSearchResult *results, int device_id);
+int            cuvs_ivfpq_serialize(CuvsIvfPqIndex index, const char *path,
+                                     int device_id);
+CuvsIvfPqIndex cuvs_ivfpq_deserialize(const char *path, int device_id);
+void           cuvs_ivfpq_free(CuvsIvfPqIndex index, int device_id);
+
+/*
  * Phase 3M: batched search — n_queries queries in one GPU dispatch.
  * queries is [n_queries][dim] row-major; results is [n_queries][top_k] row-major
  * (results[q*top_k + j] = j-th neighbor of query q). cuVS cagra/brute_force
