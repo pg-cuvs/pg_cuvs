@@ -234,7 +234,8 @@ int cuvs_ipc_search_filtered(
     uint64_t     *tids_out,
     float        *dist_out,
     int          *n_out,
-    uint32_t     *latency_us_out
+    uint32_t     *latency_us_out,
+    int          *delta_merged_out  /* OUT: 1 if daemon merged .delta; may be NULL */
 );
 
 int cuvs_ipc_search(
