@@ -1026,6 +1026,121 @@ cuvs_cagra_free(CuvsCagraIndex index, int device_id)
 }
 
 /* ----------------------------------------------------------------
+ * 3Q: cuvs_cagra_extend — in-place extend a CAGRA index with n_new vectors.
+ *
+ * After cagra::extend (with nullopt buffer views), cuVS internally reallocates
+ * the dataset to hold old + new vectors. impl->dataset is the OLD allocation and
+ * is no longer referenced by idx after extend; we replace it with an empty matrix
+ * to release the VRAM rather than holding both old and new in parallel.
+ * ---------------------------------------------------------------- */
+extern "C" int
+cuvs_cagra_extend(CuvsCagraIndex index,
+                  const float   *new_vecs,
+                  int64_t        n_new,
+                  int            dim,
+                  uint32_t       max_chunk_size,
+                  int            device_id)
+{
+    if (!index || !new_vecs || n_new <= 0)
+        return 1;
+
+    CuvsCagraIndexImpl *impl = static_cast<CuvsCagraIndexImpl *>(index);
+    if ((int64_t)dim != impl->idx.dim())
+        return 2;
+
+    PooledRes _pr(device_id);
+    try {
+        raft::device_resources &res = _pr.get();
+
+        /* Upload new vectors to device */
+        auto d_new = raft::make_device_matrix<float, int64_t>(res, n_new, (int64_t)dim);
+        raft::copy(d_new.data_handle(), new_vecs, (size_t)(n_new * (int64_t)dim),
+                   res.get_stream());
+        res.sync_stream();
+
+        cuvs::neighbors::cagra::extend_params params;
+        params.max_chunk_size = max_chunk_size;   /* 0 = auto */
+
+        /* Extend in-place; cuVS reallocates the dataset buffer internally. */
+        cuvs::neighbors::cagra::extend(
+            res, params,
+            raft::make_const_mdspan(d_new.view()),
+            impl->idx);
+        res.sync_stream();
+
+        /* Release the old impl->dataset (no longer referenced by idx). */
+        impl->dataset = raft::make_device_matrix<float, int64_t>(res, (int64_t)0, (int64_t)0);
+        res.sync_stream();
+
+        return 0;
+    } catch (const std::exception &e) {
+        fprintf(stderr, "[cuvs_cagra_extend] exception: %s\n", e.what());
+        _pr.poison();
+        return 1;
+    } catch (...) {
+        fprintf(stderr, "[cuvs_cagra_extend] unknown exception\n");
+        _pr.poison();
+        return 1;
+    }
+}
+
+/* ----------------------------------------------------------------
+ * 3Q: cuvs_cagra_compact — merge-compact a CAGRA index removing dead vectors.
+ *
+ * keep_bits_words: host uint32_t bitset where bit[i]=1 means "keep vector i"
+ * (greenlight semantics — opposite to search prefilter's "bit=1 = exclude").
+ * cagra::merge creates a NEW index; the old handle must be freed by the caller.
+ * The new index manages its own dataset internally (same as deserialize path).
+ * ---------------------------------------------------------------- */
+extern "C" CuvsCagraIndex
+cuvs_cagra_compact(CuvsCagraIndex  index,
+                   const uint32_t *keep_bits_words,
+                   int64_t         n_total,
+                   uint32_t        metric,
+                   int             device_id)
+{
+    if (!index || !keep_bits_words || n_total <= 0)
+        return nullptr;
+
+    CuvsCagraIndexImpl *impl = static_cast<CuvsCagraIndexImpl *>(index);
+
+    PooledRes _pr(device_id);
+    try {
+        raft::device_resources &res = _pr.get();
+
+        /* Upload keep-bitset to device (bit[i]=1 → include vector i). */
+        int64_t n_words = (n_total + 31) / 32;
+        auto d_bs_data = raft::make_device_vector<uint32_t, int64_t>(res, n_words);
+        raft::copy(d_bs_data.data_handle(), keep_bits_words, (size_t)n_words,
+                   res.get_stream());
+
+        auto bv = cuvs::core::bitset_view<uint32_t, int64_t>(
+                      d_bs_data.data_handle(), n_total);
+        auto filter = cuvs::neighbors::filtering::bitset_filter<uint32_t, int64_t>(bv);
+
+        cuvs::neighbors::cagra::index_params params;
+        params.metric = cuvs_distance_type(metric);
+
+        std::vector<cuvs::neighbors::cagra::index<float, uint32_t>*> indices = {&impl->idx};
+        auto new_idx = cuvs::neighbors::cagra::merge(res, params, indices, filter);
+        res.sync_stream();
+
+        /* Wrap in new impl with empty placeholder dataset (same as deserialize). */
+        auto empty = raft::make_device_matrix<float, int64_t>(res, (int64_t)0, (int64_t)0);
+        res.sync_stream();
+        return new CuvsCagraIndexImpl(std::move(empty), std::move(new_idx));
+    } catch (const std::exception &e) {
+        fprintf(stderr, "[cuvs_cagra_compact] exception: %s\n", e.what());
+        _pr.poison();
+        return nullptr;
+    } catch (...) {
+        fprintf(stderr, "[cuvs_cagra_compact] unknown exception\n");
+        _pr.poison();
+        return nullptr;
+    }
+}
+
+/* ----------------------------------------------------------------
  * 3P: IVF-PQ index
  *
  * Stores PQ-compressed codes internally; no retained dataset member needed

@@ -186,6 +186,29 @@ int cuvs_cagra_search_filtered(
 
 void cuvs_cagra_free(CuvsCagraIndex index, int device_id);
 
+/* 3Q: Extend a CAGRA index in-place with n_new additional vectors.
+ * new_vecs: row-major float32 [n_new × dim] on host.
+ * max_chunk_size: 0 = auto (cagra::extend_params.max_chunk_size).
+ * Returns 0 on success, 2 on dim mismatch, 1 on other failure. */
+int cuvs_cagra_extend(CuvsCagraIndex index,
+                      const float   *new_vecs,
+                      int64_t        n_new,
+                      int            dim,
+                      uint32_t       max_chunk_size,
+                      int            device_id);
+
+/* 3Q: Compact a CAGRA index by removing tombstoned vectors.
+ * keep_bits_words: host uint32_t bitset (bit[i]=1 → keep vector i).
+ * n_total: total vector count (= bitset width = current index size).
+ * metric: CUVS_METRIC_* — preserved in the rebuilt graph.
+ * Returns a NEW CuvsCagraIndex; caller must cuvs_cagra_free the old one.
+ * Returns NULL on failure. */
+CuvsCagraIndex cuvs_cagra_compact(CuvsCagraIndex  index,
+                                   const uint32_t *keep_bits_words,
+                                   int64_t         n_total,
+                                   uint32_t        metric,
+                                   int             device_id);
+
 /*
  * 3P: GPU IVF-PQ index — product quantization, 10-100× less VRAM than CAGRA.
  * IdxT = int64_t; results map directly to CuvsSearchResult.item_id.
