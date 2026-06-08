@@ -3133,7 +3133,21 @@ cuvs_ambulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 static IndexBulkDeleteResult *
 cuvs_amvacuumcleanup(IndexVacuumInfo *info, IndexBulkDeleteResult *stats)
 {
-    (void) info;
+    Relation indexRel  = info->index;
+    Oid      index_oid = RelationGetRelid(indexRel);
+    char     tpath[MAXPGPATH];
+    struct   stat st;
+
+    if (cuvs_socket_path && cuvs_socket_path[0] != '\0' &&
+        !cuvs_index_is_stale(index_oid))
+    {
+        cuvs_tombstone_path(index_oid, tpath, sizeof(tpath));
+        if (stat(tpath, &st) == 0)
+            (void) cuvs_ipc_compact(cuvs_socket_path,
+                                    (uint32_t) MyDatabaseId,
+                                    (uint32_t) index_oid,
+                                    cuvs_resolve_index_dir_rel(indexRel));
+    }
     return stats;
 }
 
