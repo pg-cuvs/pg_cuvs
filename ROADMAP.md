@@ -28,6 +28,7 @@
 | 3S | statement_timeout / 취소 전파 — backend reply 대기를 `recv_all_interruptible`(poll + wait 콜백)로 인터럽트 가능하게: `statement_timeout`/cancel이 걸린 GPU 검색을 ~544ms에 끊음(이전 무기한). 데몬 `SIGPIPE` 무시로 client mid-reply disconnect에서 생존(기존 잠재 크래시 버그도 해소). `CUVS_OP_CANCEL` 미도입(소켓 close로 충분). integration sc24 + installcheck 17/17 GREEN (ADR-053) |
 | D | Exact filtered BF (D-wedge) — **전체 완료** (ADR-063). Option B(`cuvs_filtered_knn` SRF bigint[]+tid[] 오버로드, 4x overfetch, NULL→unfiltered fallback) + Option A(Custom Scan hook `cuvs.filtered_knn_hook`). IPC `CuvsCmdFrame` filter_shm_key 확장, daemon binary-search post-filter. 잔여 4항목 완료: (1) `tid[]` 타입-안전 wrapper SQL 오버로드, (2) `ExplainCustomScan` 콜백으로 EXPLAIN ANALYZE GPU IPC latency 노출, (3) `.delta` + tombstone 통합(`cuvs_merge_delta_filtered` / `cuvs_apply_tombstones_filtered`), (4) selectivity×correlation 2D 실험으로 `cuvs.filter_auto_threshold=0.05` 근거 실측(`docs/filter-threshold-experiment.md`). installcheck 19/19 + isolation 2/2 GREEN |
 | 3O | Pre-filter ANN — CAGRA-first BITSET prefilter (ADR-048). daemon 빌드 타임에 `rev_tids[]`(sorted)+`rev_item_ids[]` 역방향 맵 구성. 쿼리 타임에 필터 TID → item_id 이진탐색 → GPU BITSET. `handle_search` 3O 경로: CAGRA prefilter 우선(`cuvs_cagra_search_filtered`, approx/graph-based), 실패 시 BF prefilter fallback(`cuvs_bf_search_filtered`, exact). `use_prefilter` IPC 플래그. `cuvs.filter_auto_threshold` GUC(기본 0.05). `last_search_mode=4`(cagra_prefilter)/3(bf_prefilter). PR #36(BF prefilter), #37(CAGRA-first). installcheck 19/19 + isolation 2/2 GREEN |
+| 3P | IVF-PQ AM — `CREATE INDEX USING ivfpq`, reloptions(`n_lists`/`pq_bits`/`pq_dim`), `cuvs.ivfpq_n_probes` GUC(default 64). PQ codes 내부 저장으로 VRAM 10–100× 절감. `.tids`+`.ivfpq` 사이드카. `default_version` 0.2.0으로 상향. installcheck 20/20 + isolation 2/2 GREEN (ADR-049) |
 
 ### 미완료
 
@@ -35,7 +36,6 @@
 
 | Phase | 내용 | 트랙 |
 |-------|------|------|
-| 3P | IVF-PQ — 새 AM `USING ivfpq` (product quantization, VRAM 10–100× 절감, 100M+ 대용량). **격하(ADR-061)**: "규모"가 아니라 "VRAM working-set 천장 올리기"; 압축 품질은 RaBitQ에 짐 | 릴리스 후 기능 |
 | 3Q | CAGRA Streaming Updates — `cuvsCagraExtend`(INSERT) + `cuvsCagraMerge`+cuvsFilter(DELETE/컴팩션) 실시간 인덱스 업데이트, .delta 경로 대체 | 릴리스 후 기능 |
 | 4C | Background Compaction + CONCURRENTLY 정합성 — PG bgworker auto-REINDEX + DELETE 정합 검증 | 릴리스 후 기능 |
 | 3C / 3D | GCS artifact snapshot 본체 / Replica async warmup | 트리거 (multi-node 수요) |
@@ -53,20 +53,7 @@
 
 ### 릴리스 후 기능 (순차)
 
-> **3A Pending Delta는 완료**(완료 표 참조). streaming write(INSERT/UPDATE/DELETE) 후 REINDEX 없이 GPU+delta 병합으로 정합한 top-k를 반환한다. 3L `CuvsBfIndex`를 3A-2 GPU delta cache가 재사용. 상세 스펙·검증은 [design/PLAN.md — Phase 3A](design/PLAN.md), 결정은 ADR-047. **4A(빌드 오버헤드)·3R(빌드 파라미터 reloption)도 완료**(완료 표 참조; 4A=ADR-057/058/059, 3R=ADR-052), **3S(취소 전파)도 완료**(ADR-053), **D(exact filtered BF)도 완료**(ADR-063, 잔여 4항목 포함), **3O(CAGRA-first BITSET prefilter)도 완료**(ADR-048, PR #36/#37) — 순차 경로는 3P 순이다.
-
-#### 3P — IVF-PQ (추가 cuVS 알고리즘)
-**왜**: 3O 완료 후. CAGRA는 VRAM에 float32 전체 보유 필요 — 대용량(100M+) 환경에서 비실용적. IVF-PQ로 VRAM 10–100× 절감.
-
-구현 항목:
-- 새 AM handler `pg_cuvs_ivfpq_handler` 등록 (`CREATE INDEX USING ivfpq`)
-- reloption: `n_lists`, `pq_bits`, `pq_dim`
-- GUC: `cuvs.ivfpq_n_probes`
-- daemon: `CUVS_OP_BUILD_IVFPQ`, `CUVS_OP_SEARCH_IVFPQ` op 추가
-
-완료 기준: N=1M build 성공, recall@10 ≥ 0.90, VRAM CAGRA 대비 10× 절감 실측, 기존 test suite PASS
-
-스펙: [design/PLAN.md — Phase 3P](design/PLAN.md) | ADR-049
+> **3A Pending Delta는 완료**(완료 표 참조). streaming write(INSERT/UPDATE/DELETE) 후 REINDEX 없이 GPU+delta 병합으로 정합한 top-k를 반환한다. 3L `CuvsBfIndex`를 3A-2 GPU delta cache가 재사용. 상세 스펙·검증은 [design/PLAN.md — Phase 3A](design/PLAN.md), 결정은 ADR-047. **4A(빌드 오버헤드)·3R(빌드 파라미터 reloption)도 완료**(완료 표 참조; 4A=ADR-057/058/059, 3R=ADR-052), **3S(취소 전파)도 완료**(ADR-053), **D(exact filtered BF)도 완료**(ADR-063, 잔여 4항목 포함), **3O(CAGRA-first BITSET prefilter)도 완료**(ADR-048, PR #36/#37) — 순차 경로는 3Q 순이다.
 
 #### 3Q — CAGRA Streaming Updates
 **왜**: 3P 완료 후. cuVS 26.04 C API(`cuvsCagraExtend`, `cuvsCagraMerge`, `cuvsFilter`)로 INSERT/DELETE를 .delta 파일 없이 VRAM 내에서 직접 처리. delta 누적에 따른 search-time 병합 비용을 제거하고 recall 유지.
