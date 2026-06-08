@@ -3772,57 +3772,90 @@ cuvs_filtered_knn(PG_FUNCTION_ARGS)
     }
 
     /* --- IPC call. --- */
-    uint64_t *tids_out   = palloc((size_t)k * sizeof(uint64_t));
-    float    *dists_out  = palloc((size_t)k * sizeof(float));
-    int       n_results  = 0;
-    uint32_t  latency_us = 0;
-
-    int rc = cuvs_ipc_search_filtered(
-        cuvs_socket_path,
-        (uint32_t) MyDatabaseId,
-        (uint32_t) index_oid,
-        qvec->x,
-        dim, k, metric,
-        1,   /* search_mode = brute_force; filter only applies to BF path */
-        (uint32_t) cuvs_bf_precision,
-        filter_arr, n_filter,
-        tids_out, dists_out, &n_results, &latency_us);
-
-    if (rc == CUVS_STATUS_CANCELED)
+    /*
+     * use_filter: caller provided a non-empty TID whitelist.
+     * k_fetch:    overfetch 4x so post-filter has enough candidates to fill k.
+     */
     {
-        CHECK_FOR_INTERRUPTS();
-        return (Datum) 0;
-    }
-    if (rc != CUVS_STATUS_OK)
-        ereport(ERROR,
-                (errcode(ERRCODE_INTERNAL_ERROR),
-                 errmsg("cuvs_filtered_knn: search failed (status %d)", rc)));
+        bool      use_filter = (filter_arr != NULL && n_filter > 0);
+        int       k_fetch    = use_filter ? Min(k * 4, 4000) : k;
+        int       emit_limit;
+        int       rc;
+        int       n_results  = 0;
+        uint32_t  latency_us = 0;
+        uint64_t *tids_out   = palloc((size_t)k_fetch * sizeof(uint64_t));
+        float    *dists_out  = palloc((size_t)k_fetch * sizeof(float));
 
-    /* --- Materialize (ctid, distance) rows. --- */
-    per_query_ctx = rsinfo->econtext->ecxt_per_query_memory;
-    oldcontext = MemoryContextSwitchTo(per_query_ctx);
-    tupstore = tuplestore_begin_heap(true, false, work_mem);
-    rsinfo->returnMode = SFRM_Materialize;
-    rsinfo->setResult  = tupstore;
-    rsinfo->setDesc    = tupdesc;
-    MemoryContextSwitchTo(oldcontext);
+        if (use_filter)
+        {
+            rc = cuvs_ipc_search_filtered(
+                cuvs_socket_path,
+                (uint32_t) MyDatabaseId,
+                (uint32_t) index_oid,
+                qvec->x,
+                dim, k_fetch, metric,
+                1,   /* search_mode = brute_force */
+                (uint32_t) cuvs_bf_precision,
+                filter_arr, n_filter,
+                tids_out, dists_out, &n_results, &latency_us);
+        }
+        else
+        {
+            /* NULL or empty filter_tids → unfiltered BF */
+            int delta_merged = 0;
+            rc = cuvs_ipc_search(
+                cuvs_socket_path,
+                (uint32_t) MyDatabaseId,
+                (uint32_t) index_oid,
+                qvec->x,
+                dim, k, metric,
+                1,   /* shard_overfetch */
+                0,   /* parallel_fanout */
+                0,   /* use_cpu_hnsw */
+                1,   /* search_mode = brute_force */
+                (uint32_t) cuvs_bf_precision,
+                0,   /* bf_batch_wait_us */
+                tids_out, dists_out, &n_results,
+                &latency_us, &delta_merged);
+        }
 
-    for (int i = 0; i < n_results; i++)
-    {
-        uint32_t        blk;
-        uint16_t        off;
-        ItemPointerData iptr;
-        Datum           values[2];
-        bool            isnull[2] = {false, false};
+        if (rc == CUVS_STATUS_CANCELED)
+        {
+            CHECK_FOR_INTERRUPTS();
+            return (Datum) 0;
+        }
+        if (rc != CUVS_STATUS_OK)
+            ereport(ERROR,
+                    (errcode(ERRCODE_INTERNAL_ERROR),
+                     errmsg("cuvs_filtered_knn: search failed (status %d)", rc)));
 
-        if (tids_out[i] == 0)
-            continue;
+        /* --- Materialize (ctid, distance) rows. --- */
+        per_query_ctx = rsinfo->econtext->ecxt_per_query_memory;
+        oldcontext = MemoryContextSwitchTo(per_query_ctx);
+        tupstore = tuplestore_begin_heap(true, false, work_mem);
+        rsinfo->returnMode = SFRM_Materialize;
+        rsinfo->setResult  = tupstore;
+        rsinfo->setDesc    = tupdesc;
+        MemoryContextSwitchTo(oldcontext);
 
-        cuvs_tid_decode(tids_out[i], &blk, &off);
-        ItemPointerSet(&iptr, blk, off);
-        values[0] = PointerGetDatum(&iptr);
-        values[1] = Float4GetDatum(dists_out[i]);
-        tuplestore_putvalues(tupstore, tupdesc, values, isnull);
+        emit_limit = Min(n_results, k);
+        for (int i = 0; i < emit_limit; i++)
+        {
+            uint32_t        blk;
+            uint16_t        off;
+            ItemPointerData iptr;
+            Datum           values[2];
+            bool            isnull[2] = {false, false};
+
+            if (tids_out[i] == 0)
+                continue;
+
+            cuvs_tid_decode(tids_out[i], &blk, &off);
+            ItemPointerSet(&iptr, blk, off);
+            values[0] = PointerGetDatum(&iptr);
+            values[1] = Float4GetDatum(dists_out[i]);
+            tuplestore_putvalues(tupstore, tupdesc, values, isnull);
+        }
     }
 
     return (Datum) 0;
