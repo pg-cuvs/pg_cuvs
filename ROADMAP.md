@@ -33,7 +33,7 @@
 
 | Phase | 내용 | 트랙 |
 |-------|------|------|
-| **D** | **exact filtered brute-force (신규 1순위 후보, ADR-061)** — 고선택성 WHERE를 PG가 평가→bitset→`cuvsBruteForceSearch` exact top-k. killer app=멀티테넌트 SaaS RAG. 3O의 GPU-네이티브 정답 버전. PG plumbing(custom scan/bitmap)·저선택성 분기 임계값 미해결 | 전략 wedge |
+| **D** | **exact filtered brute-force — 스파이크 완료, PR #35 (ADR-063)** — Option B(`cuvs_filtered_knn` SRF, 4x overfetch, NULL→unfiltered fallback) + Option A(Custom Scan hook, `cuvs.filtered_knn_hook` GUC) 구현·테스트 통과. IPC `CuvsCmdFrame` filter_shm_key 확장, 데몬 binary-search post-filter, 전체 19+2 테스트 GREEN. **잔여**: 타입-안전 wrapper, 선택성 임계값 GUC, delta 통합, `EXPLAIN ANALYZE` GPU 타이밍 | 전략 wedge |
 | 3O | Pre-filter ANN — WHERE 조건을 cuVS bitvector mask로 daemon에 전달, 고선택성 필터 GPU 품질 향상. **D로 흡수(2026-06-07, ADR-061)**; 기존 분석 ADR-048(보류) | D로 대체 |
 | 3P | IVF-PQ — 새 AM `USING ivfpq` (product quantization, VRAM 10–100× 절감, 100M+ 대용량). **격하(ADR-061)**: "규모"가 아니라 "VRAM working-set 천장 올리기"; 압축 품질은 RaBitQ에 짐 | 릴리스 후 기능 |
 | 3Q | CAGRA Streaming Updates — `cuvsCagraExtend`(INSERT) + `cuvsCagraMerge`+cuvsFilter(DELETE/컴팩션) 실시간 인덱스 업데이트, .delta 경로 대체 | 릴리스 후 기능 |

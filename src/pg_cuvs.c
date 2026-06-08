@@ -55,6 +55,11 @@
 #include "utils/syscache.h"         /* SearchSysCache1(RELOID) */
 #include "commands/dbcommands.h"    /* get_database_name (ADR-046 orphan GC) */
 #include "catalog/pg_opfamily.h"    /* OPFAMILYOID, Form_pg_opfamily */
+#include "nodes/extensible.h"       /* CustomPath, CustomScan (Option A D-wedge) */
+#include "optimizer/paths.h"        /* set_rel_pathlist_hook */
+#include "optimizer/pathnode.h"     /* add_path */
+#include "optimizer/tlist.h"        /* get_sortgroupclause_tle */
+#include "executor/executor.h"      /* ExecInitQual, ExecQual */
 
 #include <sys/stat.h>
 #include <sys/file.h>   /* flock */
@@ -111,6 +116,7 @@ int   cuvs_search_mode             = 0;    /* 0=cagra (default), 1=brute_force (
 int   cuvs_bf_precision            = 0;    /* 0=float32 (default), 1=float16 (Phase 3L) */
 int   cuvs_bf_batch_wait_us        = 0;    /* daemon BF micro-batch window μs; 0=off (Phase 3L) */
 int   cuvs_max_batch_queries       = 1024; /* pg_cuvs_batch_search Q cap (Phase 3M) */
+bool  cuvs_filtered_knn_hook_enabled = false; /* ADR-063 Option A custom scan hook */
 
 /* Enum option tables for the Phase 3L GUCs (string in SQL, mapped to int in C). */
 static const struct config_enum_entry cuvs_search_mode_options[] = {
@@ -164,6 +170,12 @@ void _PG_init(void);
  * intact — matching PostgreSQL's own transactional outcome (i survives).
  * ---------------------------------------------------------------- */
 static object_access_hook_type prev_object_access_hook = NULL;
+static set_rel_pathlist_hook_type prev_set_rel_pathlist_hook = NULL; /* ADR-063 */
+
+/* Forward declarations for ADR-063 Option A custom scan (defined at file end). */
+static void cuvs_filtered_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel,
+                                            Index rti, RangeTblEntry *rte);
+void cuvs_register_custom_scan(void);
 
 /* A pending DROP and the subtransaction that observed it (ADR-060). */
 typedef struct CuvsPendingDrop
@@ -615,6 +627,22 @@ _PG_init(void)
         &cuvs_warmup_threads,
         2, 1, 8,
         PGC_SUSET,
+        0, NULL, NULL, NULL);
+
+    /* D-wedge spike (ADR-063): Option A custom scan. */
+    cuvs_register_custom_scan();
+    prev_set_rel_pathlist_hook = set_rel_pathlist_hook;
+    set_rel_pathlist_hook = cuvs_filtered_set_rel_pathlist;
+
+    DefineCustomBoolVariable(
+        "cuvs.filtered_knn_hook",
+        "Enable D-wedge Custom Scan hook (ADR-063 spike, default off).",
+        "Intercepts planner path generation for CAGRA-indexed relations with a "
+        "WHERE filter, injecting a GPU BF post-filter path for comparison with "
+        "the cuvs_filtered_knn() Function API (Option B).",
+        &cuvs_filtered_knn_hook_enabled,
+        false,
+        PGC_USERSET,
         0, NULL, NULL, NULL);
 
     /* Phase 3G.1: observe DROP INDEX of cagra indexes and notify the daemon to
@@ -3653,4 +3681,586 @@ pg_cuvs_gc_orphans(PG_FUNCTION_ARGS)
     }
 
     return (Datum) 0;
+}
+
+/* ----------------------------------------------------------------
+ * cuvs_filtered_knn — D-wedge spike: Option B Function API
+ *
+ * cuvs_filtered_knn(index_rel regclass,
+ *                   query     vector,
+ *                   filter_tids bigint[],   -- sorted encoded TIDs; NULL = no filter
+ *                   k         int)
+ * RETURNS TABLE (ctid tid, distance float4)
+ *
+ * Bypasses the AM scan path so non-index quals (e.g. tenant_id = $1) can
+ * be passed as an explicit TID set.  The daemon post-filters BF results to
+ * only the provided TIDs.  Degrades to unfiltered BF when filter_tids is
+ * NULL or empty.
+ * ---------------------------------------------------------------- */
+PG_FUNCTION_INFO_V1(cuvs_filtered_knn);
+Datum
+cuvs_filtered_knn(PG_FUNCTION_ARGS)
+{
+    ReturnSetInfo   *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+    TupleDesc        tupdesc;
+    Tuplestorestate *tupstore;
+    MemoryContext    per_query_ctx, oldcontext;
+
+    Oid        index_oid   = PG_GETARG_OID(0);
+    Datum      query_datum = PG_GETARG_DATUM(1);
+    /* arg 2: filter_tids bigint[] — may be NULL */
+    int        k = PG_GETARG_INT32(3);
+
+    if (rsinfo == NULL || !IsA(rsinfo, ReturnSetInfo))
+        ereport(ERROR,
+                (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                 errmsg("set-valued function called in context that cannot accept a set")));
+    if (!(rsinfo->allowedModes & SFRM_Materialize))
+        ereport(ERROR,
+                (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                 errmsg("materialize mode required, but it is not allowed in this context")));
+    if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+        ereport(ERROR,
+                (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                 errmsg("return type must be a row type")));
+
+    if (k < 1 || k > 2000)
+        ereport(ERROR,
+                (errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
+                 errmsg("cuvs_filtered_knn: k must be between 1 and 2000")));
+
+    /* --- Open index to validate and get metric. --- */
+    Relation  indexRel = index_open(index_oid, AccessShareLock);
+    Oid       cagra_am = get_am_oid("cagra", true);
+    if (!OidIsValid(cagra_am) || indexRel->rd_rel->relam != cagra_am)
+    {
+        index_close(indexRel, AccessShareLock);
+        ereport(ERROR,
+                (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+                 errmsg("cuvs_filtered_knn: relation is not a \"USING cagra\" index")));
+    }
+    uint32_t metric = cuvs_index_metric(indexRel);
+    index_close(indexRel, AccessShareLock);
+
+    /* --- Query vector. --- */
+    PgVector *qvec = DatumGetPgVector(query_datum);
+    int       dim  = qvec->dim;
+
+    /* --- Deconstruct filter_tids bigint[] if provided. --- */
+    uint64_t *filter_arr = NULL;
+    uint32_t  n_filter   = 0;
+    if (!PG_ARGISNULL(2))
+    {
+        ArrayType *farr = PG_GETARG_ARRAYTYPE_P(2);
+        int16  elmlen;
+        bool   elmbyval;
+        char   elmalign;
+        Datum *elems;
+        bool  *elnulls;
+        int    nelems;
+
+        get_typlenbyvalalign(INT8OID, &elmlen, &elmbyval, &elmalign);
+        deconstruct_array(farr, INT8OID, elmlen, elmbyval, elmalign,
+                          &elems, &elnulls, &nelems);
+        if (nelems > 0)
+        {
+            filter_arr = palloc((size_t)nelems * sizeof(uint64_t));
+            for (int i = 0; i < nelems; i++)
+                filter_arr[i] = elnulls[i] ? 0 : (uint64_t) DatumGetInt64(elems[i]);
+            n_filter = (uint32_t) nelems;
+        }
+    }
+
+    /* --- IPC call. --- */
+    /*
+     * use_filter: caller provided a non-empty TID whitelist.
+     * k_fetch:    overfetch 4x so post-filter has enough candidates to fill k.
+     */
+    {
+        bool      use_filter = (filter_arr != NULL && n_filter > 0);
+        int       k_fetch    = use_filter ? Min(k * 4, 4000) : k;
+        int       emit_limit;
+        int       rc;
+        int       n_results  = 0;
+        uint32_t  latency_us = 0;
+        uint64_t *tids_out   = palloc((size_t)k_fetch * sizeof(uint64_t));
+        float    *dists_out  = palloc((size_t)k_fetch * sizeof(float));
+
+        if (use_filter)
+        {
+            rc = cuvs_ipc_search_filtered(
+                cuvs_socket_path,
+                (uint32_t) MyDatabaseId,
+                (uint32_t) index_oid,
+                qvec->x,
+                dim, k_fetch, metric,
+                1,   /* search_mode = brute_force */
+                (uint32_t) cuvs_bf_precision,
+                filter_arr, n_filter,
+                tids_out, dists_out, &n_results, &latency_us);
+        }
+        else
+        {
+            /* NULL or empty filter_tids → unfiltered BF */
+            int delta_merged = 0;
+            rc = cuvs_ipc_search(
+                cuvs_socket_path,
+                (uint32_t) MyDatabaseId,
+                (uint32_t) index_oid,
+                qvec->x,
+                dim, k, metric,
+                1,   /* shard_overfetch */
+                0,   /* parallel_fanout */
+                0,   /* use_cpu_hnsw */
+                1,   /* search_mode = brute_force */
+                (uint32_t) cuvs_bf_precision,
+                0,   /* bf_batch_wait_us */
+                tids_out, dists_out, &n_results,
+                &latency_us, &delta_merged);
+        }
+
+        if (rc == CUVS_STATUS_CANCELED)
+        {
+            CHECK_FOR_INTERRUPTS();
+            return (Datum) 0;
+        }
+        if (rc != CUVS_STATUS_OK)
+            ereport(ERROR,
+                    (errcode(ERRCODE_INTERNAL_ERROR),
+                     errmsg("cuvs_filtered_knn: search failed (status %d)", rc)));
+
+        /* --- Materialize (ctid, distance) rows. --- */
+        per_query_ctx = rsinfo->econtext->ecxt_per_query_memory;
+        oldcontext = MemoryContextSwitchTo(per_query_ctx);
+        tupstore = tuplestore_begin_heap(true, false, work_mem);
+        rsinfo->returnMode = SFRM_Materialize;
+        rsinfo->setResult  = tupstore;
+        rsinfo->setDesc    = tupdesc;
+        MemoryContextSwitchTo(oldcontext);
+
+        emit_limit = Min(n_results, k);
+        for (int i = 0; i < emit_limit; i++)
+        {
+            uint32_t        blk;
+            uint16_t        off;
+            ItemPointerData iptr;
+            Datum           values[2];
+            bool            isnull[2] = {false, false};
+
+            if (tids_out[i] == 0)
+                continue;
+
+            cuvs_tid_decode(tids_out[i], &blk, &off);
+            ItemPointerSet(&iptr, blk, off);
+            values[0] = PointerGetDatum(&iptr);
+            values[1] = Float4GetDatum(dists_out[i]);
+            tuplestore_putvalues(tupstore, tupdesc, values, isnull);
+        }
+    }
+
+    return (Datum) 0;
+}
+
+/* ================================================================
+ * D-wedge spike: Option A — Custom Scan Node (ADR-063)
+ *
+ * GUC: cuvs.filtered_knn_hook = on  (default off)
+ *
+ * When on, set_rel_pathlist_hook fires for base relations that have:
+ *   (1) a CAGRA index, (2) non-index quals, (3) an ORDER BY with a
+ *   Const query vector.
+ *
+ * Execution:
+ *   a. SeqScan heap with filter quals → sorted TID set
+ *   b. cuvs_ipc_search_filtered (GPU BF post-filter)
+ *   c. Return full heap tuples matched by result TIDs
+ *
+ * pgvector compatibility: transparent to standard SQL —
+ *   SELECT ... WHERE tenant_id=5 ORDER BY emb <-> $q LIMIT k
+ * ================================================================ */
+
+/* ---- per-scan state ---- */
+typedef struct CuvsFilteredScanState {
+    CustomScanState css;
+    Oid         index_oid;
+    uint32_t    metric;
+    Datum       query_datum;
+    List       *filter_rinfos;  /* RestrictInfo* list from plan time */
+    Oid         heap_oid;
+    /* populated on first ExecCustomScan call */
+    bool        built;
+    uint64_t   *result_tids;
+    float      *result_dists;
+    int         n_results;
+    int         cursor;
+    Relation    heap_rel;
+    /* heap-AM compatible slot for table_tuple_fetch_row_version */
+    TupleTableSlot *heap_fetch_slot;
+} CuvsFilteredScanState;
+
+/* ---- forward declarations ---- */
+static Plan *cuvs_cs_create_plan(PlannerInfo *root, RelOptInfo *rel,
+                                  CustomPath *best_path, List *tlist,
+                                  List *clauses, List *custom_plans);
+static Node *cuvs_cs_create_state(CustomScan *cscan);
+static void  cuvs_cs_begin(CustomScanState *node, EState *estate, int eflags);
+static TupleTableSlot *cuvs_cs_exec(CustomScanState *node);
+static void  cuvs_cs_end(CustomScanState *node);
+static void  cuvs_cs_rescan(CustomScanState *node);
+
+static CustomPathMethods cuvs_filtered_path_methods = {
+    .CustomName    = "CuvsFilteredScan",
+    .PlanCustomPath = cuvs_cs_create_plan,
+};
+static CustomScanMethods cuvs_filtered_scan_methods = {
+    .CustomName          = "CuvsFilteredScan",
+    .CreateCustomScanState = cuvs_cs_create_state,
+};
+static CustomExecMethods cuvs_filtered_exec_methods = {
+    .CustomName      = "CuvsFilteredScan",
+    .BeginCustomScan = cuvs_cs_begin,
+    .ExecCustomScan  = cuvs_cs_exec,
+    .EndCustomScan   = cuvs_cs_end,
+    .ReScanCustomScan = cuvs_cs_rescan,
+};
+
+/* ---- planner path → plan ---- */
+static Plan *
+cuvs_cs_create_plan(PlannerInfo *root, RelOptInfo *rel,
+                    CustomPath *best_path, List *tlist,
+                    List *clauses, List *custom_plans)
+{
+    CustomScan *cscan = makeNode(CustomScan);
+    cscan->scan.plan.targetlist = tlist;
+    cscan->scan.scanrelid       = best_path->path.parent->relid;
+    cscan->custom_scan_tlist    = NIL;
+    cscan->methods              = &cuvs_filtered_scan_methods;
+    cscan->custom_private       = best_path->custom_private;
+    return (Plan *) cscan;
+}
+
+/* ---- plan → exec state ---- */
+static Node *
+cuvs_cs_create_state(CustomScan *cscan)
+{
+    CuvsFilteredScanState *state = palloc0(sizeof(CuvsFilteredScanState));
+    NodeSetTag(state, T_CustomScanState);
+    state->css.methods = &cuvs_filtered_exec_methods;
+    return (Node *) state;
+}
+
+/* ---- BeginCustomScan ---- */
+static void
+cuvs_cs_begin(CustomScanState *node, EState *estate, int eflags)
+{
+    CuvsFilteredScanState *state = (CuvsFilteredScanState *) node;
+    CustomScan *cscan = (CustomScan *) node->ss.ps.plan;
+
+    List *priv = cscan->custom_private;
+
+    /* custom_private: {index_oid_int, query_const, rinfos_list, heap_oid_int} */
+    state->index_oid    = (Oid) intVal(linitial(priv));
+    state->query_datum  = ((Const *) lsecond(priv))->constvalue;
+    state->filter_rinfos = (List *) lthird(priv);
+    state->heap_oid     = (Oid) intVal(lfourth(priv));
+    state->built        = false;
+    state->result_tids  = NULL;
+    state->result_dists = NULL;
+    state->n_results    = 0;
+    state->cursor       = 0;
+
+    state->heap_rel = table_open(state->heap_oid, AccessShareLock);
+
+    /* Dedicated heap-AM slot for table_tuple_fetch_row_version.
+     * We keep it separate from ss_ScanTupleSlot (virtual) to avoid
+     * the PG type-check that fires when ExecInitScanTupleSlot replaces
+     * the planner-derived virtual slot with the physical heap descriptor. */
+    state->heap_fetch_slot = table_slot_create(state->heap_rel, NULL);
+
+    /* Get metric from the CAGRA index. */
+    {
+        Relation indexRel = index_open(state->index_oid, AccessShareLock);
+        state->metric = cuvs_index_metric(indexRel);
+        index_close(indexRel, AccessShareLock);
+    }
+}
+
+/* TID comparator for qsort */
+static int
+compare_tid_enc(const void *a, const void *b)
+{
+    uint64_t ua = *(const uint64_t *)a;
+    uint64_t ub = *(const uint64_t *)b;
+    return (ua > ub) - (ua < ub);
+}
+
+/* ---- Build TID set + GPU search (called on first ExecCustomScan) ---- */
+static void
+cuvs_cs_build(CuvsFilteredScanState *state, EState *estate)
+{
+    /* --- Step 1: seqscan heap, evaluate filter quals, collect TIDs. --- */
+    List           *qual_exprs = NIL;
+    ListCell       *lc;
+    ExprState      *qual_state;
+    ExprContext    *filter_ctx;
+    TupleTableSlot *slot;
+    int             cap   = 1024;
+    int             ntids = 0;
+    uint64_t       *tids;
+    TableScanDesc   scan;
+
+    foreach(lc, state->filter_rinfos)
+    {
+        RestrictInfo *rinfo = lfirst_node(RestrictInfo, lc);
+        qual_exprs = lappend(qual_exprs, rinfo->clause);
+    }
+
+    /*
+     * Use NULL parent so ExecInitQual does NOT embed the parent's virtual
+     * ss_ScanTupleSlot pointer into EEOP_SCAN_FETCHSOME.  With a parent, the
+     * slot-type optimization bakes the empty virtual slot into the ExprState;
+     * every SCAN_VAR read then gets 0 from that slot (wrong).  With NULL,
+     * the ExprState reads ecxt_scantuple dynamically at eval time, which is
+     * exactly the heap-AM scan slot we supply below.
+     */
+    qual_state = ExecInitQual(qual_exprs, NULL);
+
+    /* Standalone context to avoid polluting ps_ExprContext. */
+    filter_ctx = CreateStandaloneExprContext();
+
+    slot  = table_slot_create(state->heap_rel, NULL);
+    tids  = palloc((size_t)cap * sizeof(uint64_t));
+
+    scan = table_beginscan(state->heap_rel, GetTransactionSnapshot(), 0, NULL);
+    while (table_scan_getnextslot(scan, ForwardScanDirection, slot))
+    {
+        ItemPointer iptr;
+        uint64_t    enc;
+
+        filter_ctx->ecxt_scantuple = slot;
+        if (!ExecQual(qual_state, filter_ctx))
+            continue;
+
+        iptr = &slot->tts_tid;
+        enc  = ((uint64_t) ItemPointerGetBlockNumber(iptr) << 16)
+             | (uint64_t) ItemPointerGetOffsetNumber(iptr);
+        if (ntids >= cap)
+        {
+            cap *= 2;
+            tids = repalloc(tids, (size_t)cap * sizeof(uint64_t));
+        }
+        tids[ntids++] = enc;
+    }
+    table_endscan(scan);
+    ExecDropSingleTupleTableSlot(slot);
+    FreeExprContext(filter_ctx, true);
+
+    if (ntids > 1)
+        qsort(tids, (size_t)ntids, sizeof(uint64_t), compare_tid_enc);
+
+    /* --- Step 2: GPU BF search with post-filter. --- */
+    PgVector *qvec = DatumGetPgVector(state->query_datum);
+    int       dim  = qvec->dim;
+    int       k    = (int) cuvs_k;
+
+    state->result_tids  = palloc((size_t)k * sizeof(uint64_t));
+    state->result_dists = palloc((size_t)k * sizeof(float));
+    uint32_t latency_us = 0;
+
+    int rc = cuvs_ipc_search_filtered(
+        cuvs_socket_path,
+        (uint32_t) MyDatabaseId,
+        (uint32_t) state->index_oid,
+        qvec->x, dim, k, state->metric,
+        1,   /* brute_force */
+        (uint32_t) cuvs_bf_precision,
+        tids, (uint32_t) ntids,
+        state->result_tids, state->result_dists, &state->n_results,
+        &latency_us);
+
+    pfree(tids);
+
+    if (rc == CUVS_STATUS_CANCELED)
+        CHECK_FOR_INTERRUPTS();
+    else if (rc != CUVS_STATUS_OK)
+        ereport(ERROR,
+                (errcode(ERRCODE_INTERNAL_ERROR),
+                 errmsg("cuvs filtered scan: search failed (status %d)", rc)));
+    state->built  = true;
+    state->cursor = 0;
+}
+
+/* ---- ExecCustomScan ---- */
+static TupleTableSlot *
+cuvs_cs_exec(CustomScanState *node)
+{
+    CuvsFilteredScanState *state = (CuvsFilteredScanState *) node;
+    TupleTableSlot        *fetch = state->heap_fetch_slot;
+    /* ps_ProjInfo was compiled against the virtual scan slot; use it as
+     * the ecxt_scantuple so expression evaluation reads the right ops. */
+    TupleTableSlot        *scan  = node->ss.ss_ScanTupleSlot;
+
+    if (!state->built)
+        cuvs_cs_build(state, node->ss.ps.state);
+
+    while (state->cursor < state->n_results)
+    {
+        uint64_t        tid_enc = state->result_tids[state->cursor++];
+        uint32_t        blk;
+        uint16_t        off;
+        ItemPointerData iptr;
+        int             i;
+        int             natts;
+
+        if (tid_enc == 0)
+            continue;
+
+        cuvs_tid_decode(tid_enc, &blk, &off);
+        ItemPointerSet(&iptr, blk, off);
+
+        ExecClearTuple(fetch);
+        if (!table_tuple_fetch_row_version(state->heap_rel, &iptr,
+                                           GetTransactionSnapshot(), fetch))
+            continue;   /* dead / invisible tuple */
+
+        /*
+         * Deform the heap tuple and copy attribute values into the virtual
+         * scan slot that ps_ProjInfo was compiled against.  ExecProject
+         * crashes if given a heap-AM slot when the ExprState expects a virtual
+         * slot (different tts_ops → wrong slot-type fast path).
+         */
+        slot_getallattrs(fetch);
+        natts = scan->tts_tupleDescriptor->natts;
+        ExecClearTuple(scan);
+        for (i = 0; i < natts; i++)
+        {
+            scan->tts_values[i] = fetch->tts_values[i];
+            scan->tts_isnull[i] = fetch->tts_isnull[i];
+        }
+        ExecStoreVirtualTuple(scan);
+
+        node->ss.ps.ps_ExprContext->ecxt_scantuple = scan;
+        return ExecProject(node->ss.ps.ps_ProjInfo);
+    }
+
+    return ExecClearTuple(node->ss.ps.ps_ResultTupleSlot);
+}
+
+/* ---- EndCustomScan ---- */
+static void
+cuvs_cs_end(CustomScanState *node)
+{
+    CuvsFilteredScanState *state = (CuvsFilteredScanState *) node;
+    if (state->heap_fetch_slot)
+    {
+        ExecDropSingleTupleTableSlot(state->heap_fetch_slot);
+        state->heap_fetch_slot = NULL;
+    }
+    if (state->heap_rel)
+    {
+        table_close(state->heap_rel, AccessShareLock);
+        state->heap_rel = NULL;
+    }
+    if (state->result_tids)  { pfree(state->result_tids);  state->result_tids  = NULL; }
+    if (state->result_dists) { pfree(state->result_dists); state->result_dists = NULL; }
+}
+
+/* ---- ReScanCustomScan ---- */
+static void
+cuvs_cs_rescan(CustomScanState *node)
+{
+    CuvsFilteredScanState *state = (CuvsFilteredScanState *) node;
+    /* Re-run the build on next ExecCustomScan call. */
+    state->built    = false;
+    state->cursor   = 0;
+    state->n_results = 0;
+    if (state->result_tids)  { pfree(state->result_tids);  state->result_tids  = NULL; }
+    if (state->result_dists) { pfree(state->result_dists); state->result_dists = NULL; }
+}
+
+/* ---- set_rel_pathlist_hook ---- */
+static void
+cuvs_filtered_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel,
+                                Index rti, RangeTblEntry *rte)
+{
+    Oid             cagra_am;
+    Oid             index_oid = InvalidOid;
+    ListCell       *lc;
+    SortGroupClause *sgc;
+    TargetEntry    *tle;
+    OpExpr         *op;
+    Expr           *arg1;
+    Expr           *arg2;
+    Const          *query_const = NULL;
+    CustomPath     *cpath;
+
+    if (prev_set_rel_pathlist_hook)
+        prev_set_rel_pathlist_hook(root, rel, rti, rte);
+
+    if (!cuvs_filtered_knn_hook_enabled)
+        return;
+    if (rte->rtekind != RTE_RELATION || rel->reloptkind != RELOPT_BASEREL)
+        return;
+    if (rel->baserestrictinfo == NIL)
+        return;
+
+    /* Require a CAGRA index on the relation. */
+    cagra_am = get_am_oid("cagra", true);
+    if (!OidIsValid(cagra_am))
+        return;
+    foreach(lc, rel->indexlist)
+    {
+        IndexOptInfo *ioi = lfirst_node(IndexOptInfo, lc);
+        if (ioi->relam == cagra_am) { index_oid = ioi->indexoid; break; }
+    }
+    if (!OidIsValid(index_oid))
+        return;
+
+    /* Extract query vector from first ORDER BY (must be a Const). */
+    if (root->parse->sortClause == NIL)
+        return;
+    sgc = linitial_node(SortGroupClause, root->parse->sortClause);
+    tle = get_sortgroupclause_tle(sgc, root->parse->targetList);
+    if (tle == NULL || !IsA(tle->expr, OpExpr))
+        return;
+    op = (OpExpr *) tle->expr;
+    if (list_length(op->args) != 2)
+        return;
+    arg1 = linitial(op->args);
+    arg2 = lsecond(op->args);
+    if (IsA(arg1, Const))       query_const = (Const *) arg1;
+    else if (IsA(arg2, Const))  query_const = (Const *) arg2;
+    if (query_const == NULL)
+        return;   /* parametrized query — skip for spike */
+
+    /* Build the CustomPath. */
+    cpath = makeNode(CustomPath);
+    cpath->path.pathtype      = T_CustomScan;
+    cpath->path.parent        = rel;
+    cpath->path.pathtarget    = rel->reltarget;
+    cpath->path.param_info    = NULL;
+    cpath->path.parallel_aware  = false;
+    cpath->path.parallel_safe   = rel->consider_parallel;
+    cpath->path.parallel_workers = 0;
+    cpath->path.rows          = rel->rows;
+    /* Cost: competitive with index scan for high-selectivity filters. */
+    cpath->path.startup_cost  = 0;
+    cpath->path.total_cost    = rel->rows * cpu_tuple_cost + 200.0;
+    cpath->flags              = 0;
+    cpath->methods            = &cuvs_filtered_path_methods;
+    /* custom_private: {index_oid, query_const, rinfos, heap_oid} */
+    cpath->custom_private = list_make4(
+        makeInteger((long) index_oid),
+        query_const,
+        rel->baserestrictinfo,
+        makeInteger((long) rte->relid));
+
+    add_path(rel, (Path *) cpath);
+}
+
+/* Register the Custom Scan methods so the executor can deserialize the node. */
+void
+cuvs_register_custom_scan(void)
+{
+    RegisterCustomScanMethods(&cuvs_filtered_scan_methods);
 }
