@@ -119,6 +119,9 @@ int   cuvs_max_batch_queries       = 1024; /* pg_cuvs_batch_search Q cap (Phase 
 bool  cuvs_filtered_knn_hook_enabled = false; /* ADR-063 Option A custom scan hook */
 double cuvs_filter_auto_threshold = 0.05;    /* 3O: selectivity below which pre-filter is used */
 int   cuvs_ivfpq_n_probes          = 64;     /* 3P: IVF clusters probed per search (ivfpq AM) */
+int   cuvs_extend_chunk_size       = 0;      /* 3Q: CAGRA extend max_chunk_size; 0 = auto */
+double cuvs_compact_delete_ratio   = 0.10;   /* 3Q: auto-compact when dead/total >= this */
+bool  cuvs_extend_sync             = false;  /* 3Q: reserved — passed to daemon in future */
 
 /* Enum option tables for the Phase 3L GUCs (string in SQL, mapped to int in C). */
 static const struct config_enum_entry cuvs_search_mode_options[] = {
@@ -694,6 +697,24 @@ _PG_init(void)
         "Must be <= n_lists used at build time.",
         &cuvs_ivfpq_n_probes,
         64, 1, 4096,
+        PGC_USERSET,
+        0, NULL, NULL, NULL);
+
+    DefineCustomIntVariable(
+        "cuvs.extend_chunk_size",
+        "CAGRA extend max_chunk_size (3Q); 0 = auto.",
+        NULL,
+        &cuvs_extend_chunk_size,
+        0, 0, 65536,
+        PGC_USERSET,
+        0, NULL, NULL, NULL);
+
+    DefineCustomRealVariable(
+        "cuvs.compact_delete_ratio",
+        "Fraction of deleted vectors that triggers auto-compact after VACUUM (3Q).",
+        "Set to 0 to disable auto-compact.",
+        &cuvs_compact_delete_ratio,
+        0.10, 0.0, 1.0,
         PGC_USERSET,
         0, NULL, NULL, NULL);
 
@@ -2938,6 +2959,20 @@ cuvs_aminsert(Relation indexRel, Datum *values, bool *isnull,
                              ItemPointerGetOffsetNumber(heap_tid));
     metric = cuvs_index_metric(indexRel);
 
+    /* 3Q: EXTEND path — update VRAM CAGRA graph in-place via IPC. */
+    if (cuvs_socket_path && cuvs_socket_path[0] != '\0')
+    {
+        int rc = cuvs_ipc_extend(cuvs_socket_path,
+                                 (uint32_t) MyDatabaseId,
+                                 (uint32_t) RelationGetRelid(indexRel),
+                                 vec->x, &tid, 1, (int) vec->dim,
+                                 (uint32_t) cuvs_extend_chunk_size,
+                                 cuvs_resolve_index_dir_rel(indexRel));
+        if (rc == CUVS_STATUS_OK)
+            return false;
+        /* NOT_FOUND / BUILD_FAILED / daemon down → fall through to delta. */
+    }
+
     if (!cuvs_delta_append(indexRel, tid, vec->x, (int) vec->dim, metric))
         cuvs_mark_index_stale(indexRel);
 
@@ -3032,6 +3067,7 @@ cuvs_ambulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
         FILE           *f;
         CuvsTidsHeader  thdr;
         uint64_t       *base_tids = NULL;
+        int64_t         n_total_vecs = 0;
 
         snprintf(tids_path, sizeof(tids_path), "%s/%u_%u.tids",
                  cuvs_resolve_index_dir_rel(indexRel),
@@ -3041,6 +3077,7 @@ cuvs_ambulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
         if (f && cuvs_tids_read(f, &thdr, &base_tids) == 0)
         {
             TransactionId delete_xid = GetCurrentTransactionId();
+            n_total_vecs = thdr.n_vecs;
             for (int64_t i = 0; i < thdr.n_vecs; i++)
             {
                 uint32_t blk;
@@ -3062,6 +3099,18 @@ cuvs_ambulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
                 }
             }
             free(base_tids);
+
+            /* 3Q: advisory auto-compact when dead ratio >= threshold. */
+            if (all_ok && cuvs_compact_delete_ratio > 0 &&
+                n_total_vecs > 0 && cuvs_socket_path && cuvs_socket_path[0] != '\0' &&
+                (double) stats->tuples_removed / (double) n_total_vecs
+                    >= cuvs_compact_delete_ratio)
+            {
+                (void) cuvs_ipc_compact(cuvs_socket_path,
+                                        (uint32_t) MyDatabaseId,
+                                        (uint32_t) index_oid,
+                                        cuvs_resolve_index_dir_rel(indexRel));
+            }
         }
         else
         {
@@ -4064,6 +4113,36 @@ gc_unlink_family(const char *idir, uint32_t db_oid, uint32_t index_oid)
     }
     closedir(dir);
     return removed;
+}
+
+/* 3Q: manual COMPACT trigger — pg_cuvs_compact(index_rel regclass) */
+PG_FUNCTION_INFO_V1(pg_cuvs_compact);
+Datum
+pg_cuvs_compact(PG_FUNCTION_ARGS)
+{
+    Oid      index_oid = PG_GETARG_OID(0);
+    Relation indexRel;
+    int      rc;
+
+    indexRel = try_index_open(index_oid, AccessShareLock);
+    if (!indexRel)
+        ereport(ERROR,
+                (errcode(ERRCODE_UNDEFINED_OBJECT),
+                 errmsg("index %u does not exist", index_oid)));
+
+    rc = cuvs_ipc_compact(cuvs_socket_path,
+                          (uint32_t) MyDatabaseId,
+                          (uint32_t) index_oid,
+                          cuvs_resolve_index_dir_rel(indexRel));
+
+    index_close(indexRel, AccessShareLock);
+
+    if (rc != CUVS_STATUS_OK && rc != CUVS_STATUS_NOT_FOUND)
+        ereport(ERROR,
+                (errcode(ERRCODE_INTERNAL_ERROR),
+                 errmsg("pg_cuvs_compact: daemon returned status %d", rc)));
+
+    PG_RETURN_VOID();
 }
 
 PG_FUNCTION_INFO_V1(pg_cuvs_gc_orphans);
