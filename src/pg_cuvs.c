@@ -56,7 +56,8 @@
 #include "commands/dbcommands.h"    /* get_database_name (ADR-046 orphan GC) */
 #include "catalog/pg_opfamily.h"    /* OPFAMILYOID, Form_pg_opfamily */
 #include "nodes/extensible.h"       /* CustomPath, CustomScan (Option A D-wedge) */
-#include "optimizer/paths.h"        /* set_rel_pathlist_hook, add_path */
+#include "optimizer/paths.h"        /* set_rel_pathlist_hook */
+#include "optimizer/pathnode.h"     /* add_path */
 #include "optimizer/tlist.h"        /* get_sortgroupclause_tle */
 #include "executor/executor.h"      /* ExecInitQual, ExecQual */
 
@@ -3860,6 +3861,8 @@ typedef struct CuvsFilteredScanState {
     int         n_results;
     int         cursor;
     Relation    heap_rel;
+    /* heap-AM compatible slot for table_tuple_fetch_row_version */
+    TupleTableSlot *heap_fetch_slot;
 } CuvsFilteredScanState;
 
 /* ---- forward declarations ---- */
@@ -3919,6 +3922,7 @@ cuvs_cs_begin(CustomScanState *node, EState *estate, int eflags)
 {
     CuvsFilteredScanState *state = (CuvsFilteredScanState *) node;
     CustomScan *cscan = (CustomScan *) node->ss.ps.plan;
+
     List *priv = cscan->custom_private;
 
     /* custom_private: {index_oid_int, query_const, rinfos_list, heap_oid_int} */
@@ -3934,10 +3938,18 @@ cuvs_cs_begin(CustomScanState *node, EState *estate, int eflags)
 
     state->heap_rel = table_open(state->heap_oid, AccessShareLock);
 
+    /* Dedicated heap-AM slot for table_tuple_fetch_row_version.
+     * We keep it separate from ss_ScanTupleSlot (virtual) to avoid
+     * the PG type-check that fires when ExecInitScanTupleSlot replaces
+     * the planner-derived virtual slot with the physical heap descriptor. */
+    state->heap_fetch_slot = table_slot_create(state->heap_rel, NULL);
+
     /* Get metric from the CAGRA index. */
-    Relation indexRel = index_open(state->index_oid, AccessShareLock);
-    state->metric = cuvs_index_metric(indexRel);
-    index_close(indexRel, AccessShareLock);
+    {
+        Relation indexRel = index_open(state->index_oid, AccessShareLock);
+        state->metric = cuvs_index_metric(indexRel);
+        index_close(indexRel, AccessShareLock);
+    }
 }
 
 /* TID comparator for qsort */
@@ -3954,34 +3966,51 @@ static void
 cuvs_cs_build(CuvsFilteredScanState *state, EState *estate)
 {
     /* --- Step 1: seqscan heap, evaluate filter quals, collect TIDs. --- */
-    List *qual_exprs = NIL;
-    ListCell *lc;
+    List           *qual_exprs = NIL;
+    ListCell       *lc;
+    ExprState      *qual_state;
+    ExprContext    *filter_ctx;
+    TupleTableSlot *slot;
+    int             cap   = 1024;
+    int             ntids = 0;
+    uint64_t       *tids;
+    TableScanDesc   scan;
+
     foreach(lc, state->filter_rinfos)
     {
         RestrictInfo *rinfo = lfirst_node(RestrictInfo, lc);
         qual_exprs = lappend(qual_exprs, rinfo->clause);
     }
-    ExprState   *qual_state = ExecInitQual(qual_exprs, &state->css.ss.ps);
-    ExprContext *econtext   = state->css.ss.ps.ps_ExprContext;
 
-    TupleTableSlot *slot = table_slot_create(state->heap_rel, NULL);
+    /*
+     * Use NULL parent so ExecInitQual does NOT embed the parent's virtual
+     * ss_ScanTupleSlot pointer into EEOP_SCAN_FETCHSOME.  With a parent, the
+     * slot-type optimization bakes the empty virtual slot into the ExprState;
+     * every SCAN_VAR read then gets 0 from that slot (wrong).  With NULL,
+     * the ExprState reads ecxt_scantuple dynamically at eval time, which is
+     * exactly the heap-AM scan slot we supply below.
+     */
+    qual_state = ExecInitQual(qual_exprs, NULL);
 
-    int       cap   = 1024;
-    int       ntids = 0;
-    uint64_t *tids  = palloc((size_t)cap * sizeof(uint64_t));
+    /* Standalone context to avoid polluting ps_ExprContext. */
+    filter_ctx = CreateStandaloneExprContext();
 
-    TableScanDesc scan = table_beginscan(state->heap_rel,
-                                         GetTransactionSnapshot(), 0, NULL);
+    slot  = table_slot_create(state->heap_rel, NULL);
+    tids  = palloc((size_t)cap * sizeof(uint64_t));
+
+    scan = table_beginscan(state->heap_rel, GetTransactionSnapshot(), 0, NULL);
     while (table_scan_getnextslot(scan, ForwardScanDirection, slot))
     {
-        ResetExprContext(econtext);
-        econtext->ecxt_scantuple = slot;
-        if (!ExecQual(qual_state, econtext))
+        ItemPointer iptr;
+        uint64_t    enc;
+
+        filter_ctx->ecxt_scantuple = slot;
+        if (!ExecQual(qual_state, filter_ctx))
             continue;
 
-        ItemPointer iptr = &slot->tts_tid;
-        uint64_t enc = ((uint64_t) ItemPointerGetBlockNumber(iptr) << 16)
-                     | (uint64_t) ItemPointerGetOffsetNumber(iptr);
+        iptr = &slot->tts_tid;
+        enc  = ((uint64_t) ItemPointerGetBlockNumber(iptr) << 16)
+             | (uint64_t) ItemPointerGetOffsetNumber(iptr);
         if (ntids >= cap)
         {
             cap *= 2;
@@ -3991,6 +4020,7 @@ cuvs_cs_build(CuvsFilteredScanState *state, EState *estate)
     }
     table_endscan(scan);
     ExecDropSingleTupleTableSlot(slot);
+    FreeExprContext(filter_ctx, true);
 
     if (ntids > 1)
         qsort(tids, (size_t)ntids, sizeof(uint64_t), compare_tid_enc);
@@ -4032,31 +4062,55 @@ static TupleTableSlot *
 cuvs_cs_exec(CustomScanState *node)
 {
     CuvsFilteredScanState *state = (CuvsFilteredScanState *) node;
-    TupleTableSlot *slot = node->ss.ss_ScanTupleSlot;
+    TupleTableSlot        *fetch = state->heap_fetch_slot;
+    /* ps_ProjInfo was compiled against the virtual scan slot; use it as
+     * the ecxt_scantuple so expression evaluation reads the right ops. */
+    TupleTableSlot        *scan  = node->ss.ss_ScanTupleSlot;
 
     if (!state->built)
         cuvs_cs_build(state, node->ss.ps.state);
 
     while (state->cursor < state->n_results)
     {
-        uint64_t tid_enc = state->result_tids[state->cursor++];
+        uint64_t        tid_enc = state->result_tids[state->cursor++];
+        uint32_t        blk;
+        uint16_t        off;
+        ItemPointerData iptr;
+        int             i;
+        int             natts;
+
         if (tid_enc == 0)
             continue;
 
-        uint32_t blk; uint16_t off;
         cuvs_tid_decode(tid_enc, &blk, &off);
-        ItemPointerData iptr;
         ItemPointerSet(&iptr, blk, off);
 
-        ExecClearTuple(slot);
+        ExecClearTuple(fetch);
         if (!table_tuple_fetch_row_version(state->heap_rel, &iptr,
-                                           GetTransactionSnapshot(), slot))
+                                           GetTransactionSnapshot(), fetch))
             continue;   /* dead / invisible tuple */
 
-        return ExecFilterJunk(node->ss.ps.ps_ProjInfo, slot);
+        /*
+         * Deform the heap tuple and copy attribute values into the virtual
+         * scan slot that ps_ProjInfo was compiled against.  ExecProject
+         * crashes if given a heap-AM slot when the ExprState expects a virtual
+         * slot (different tts_ops → wrong slot-type fast path).
+         */
+        slot_getallattrs(fetch);
+        natts = scan->tts_tupleDescriptor->natts;
+        ExecClearTuple(scan);
+        for (i = 0; i < natts; i++)
+        {
+            scan->tts_values[i] = fetch->tts_values[i];
+            scan->tts_isnull[i] = fetch->tts_isnull[i];
+        }
+        ExecStoreVirtualTuple(scan);
+
+        node->ss.ps.ps_ExprContext->ecxt_scantuple = scan;
+        return ExecProject(node->ss.ps.ps_ProjInfo);
     }
 
-    return ExecClearTuple(slot);   /* done */
+    return ExecClearTuple(node->ss.ps.ps_ResultTupleSlot);
 }
 
 /* ---- EndCustomScan ---- */
@@ -4064,6 +4118,11 @@ static void
 cuvs_cs_end(CustomScanState *node)
 {
     CuvsFilteredScanState *state = (CuvsFilteredScanState *) node;
+    if (state->heap_fetch_slot)
+    {
+        ExecDropSingleTupleTableSlot(state->heap_fetch_slot);
+        state->heap_fetch_slot = NULL;
+    }
     if (state->heap_rel)
     {
         table_close(state->heap_rel, AccessShareLock);
@@ -4091,6 +4150,17 @@ static void
 cuvs_filtered_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel,
                                 Index rti, RangeTblEntry *rte)
 {
+    Oid             cagra_am;
+    Oid             index_oid = InvalidOid;
+    ListCell       *lc;
+    SortGroupClause *sgc;
+    TargetEntry    *tle;
+    OpExpr         *op;
+    Expr           *arg1;
+    Expr           *arg2;
+    Const          *query_const = NULL;
+    CustomPath     *cpath;
+
     if (prev_set_rel_pathlist_hook)
         prev_set_rel_pathlist_hook(root, rel, rti, rte);
 
@@ -4102,11 +4172,9 @@ cuvs_filtered_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel,
         return;
 
     /* Require a CAGRA index on the relation. */
-    Oid cagra_am = get_am_oid("cagra", true);
+    cagra_am = get_am_oid("cagra", true);
     if (!OidIsValid(cagra_am))
         return;
-    Oid index_oid = InvalidOid;
-    ListCell *lc;
     foreach(lc, rel->indexlist)
     {
         IndexOptInfo *ioi = lfirst_node(IndexOptInfo, lc);
@@ -4118,23 +4186,22 @@ cuvs_filtered_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel,
     /* Extract query vector from first ORDER BY (must be a Const). */
     if (root->parse->sortClause == NIL)
         return;
-    SortGroupClause *sgc = linitial_node(SortGroupClause, root->parse->sortClause);
-    TargetEntry *tle = get_sortgroupclause_tle(sgc, root->parse->targetList);
+    sgc = linitial_node(SortGroupClause, root->parse->sortClause);
+    tle = get_sortgroupclause_tle(sgc, root->parse->targetList);
     if (tle == NULL || !IsA(tle->expr, OpExpr))
         return;
-    OpExpr *op = (OpExpr *) tle->expr;
+    op = (OpExpr *) tle->expr;
     if (list_length(op->args) != 2)
         return;
-    Expr *arg1 = linitial(op->args);
-    Expr *arg2 = lsecond(op->args);
-    Const *query_const = NULL;
+    arg1 = linitial(op->args);
+    arg2 = lsecond(op->args);
     if (IsA(arg1, Const))       query_const = (Const *) arg1;
     else if (IsA(arg2, Const))  query_const = (Const *) arg2;
     if (query_const == NULL)
         return;   /* parametrized query — skip for spike */
 
     /* Build the CustomPath. */
-    CustomPath *cpath = makeNode(CustomPath);
+    cpath = makeNode(CustomPath);
     cpath->path.pathtype      = T_CustomScan;
     cpath->path.parent        = rel;
     cpath->path.pathtarget    = rel->reltarget;
