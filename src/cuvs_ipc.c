@@ -1469,3 +1469,125 @@ cleanup:
     shm_unlink(shm_key);
     return rc;
 }
+
+/* ----------------------------------------------------------------
+ * 3Q: cuvs_ipc_extend
+ *
+ * Writes n_new vectors + their TIDs to a named shm segment (same layout as
+ * BUILD: [float32 vecs][uint64_t tids]) then sends CUVS_OP_EXTEND. The daemon
+ * calls cagra::extend in-place on the loaded CAGRA index. Fast path: timeout
+ * is 30 s (extend is GPU-bound, not O(index_size) on disk).
+ * ---------------------------------------------------------------- */
+int
+cuvs_ipc_extend(
+    const char     *socket_path,
+    uint32_t        db_oid,
+    uint32_t        index_oid,
+    const float    *new_vecs,
+    const uint64_t *new_tids,
+    int64_t         n_new,
+    int             dim,
+    uint32_t        max_chunk_size,
+    const char     *index_dir)
+{
+    char shm_key[64] = "";
+    int  shm_fd  = -1;
+    int  sock    = -1;
+    int  rc      = CUVS_STATUS_ERROR;
+    CuvsCmdFrame    cmd;
+    char            dir_buf[256] = {0};
+    CuvsReplyHeader hdr;
+
+    make_shm_key(shm_key, sizeof(shm_key));
+    shm_fd = shm_write_build_payload(shm_key, new_vecs, new_tids, n_new, dim);
+    if (shm_fd < 0) {
+        LOG_ERROR("[cuvs_ipc_extend] shm_write FAILED errno=%d (%s)\n",
+                  errno, strerror(errno));
+        goto cleanup;
+    }
+
+    sock = uds_connect_ex(socket_path, 30);
+    if (sock < 0) {
+        LOG_ERROR("[cuvs_ipc_extend] uds_connect FAILED errno=%d (%s)\n",
+                  errno, strerror(errno));
+        rc = CUVS_STATUS_UNAVAILABLE;
+        goto cleanup;
+    }
+
+    memset(&cmd, 0, sizeof(cmd));
+    cmd.op             = CUVS_OP_EXTEND;
+    cmd.db_oid         = db_oid;
+    cmd.index_oid      = index_oid;
+    cmd.dim            = (uint32_t)dim;
+    cmd.n_vecs         = n_new;
+    cmd.max_chunk_size = max_chunk_size;
+    strncpy(cmd.shm_key, shm_key, sizeof(cmd.shm_key) - 1);
+
+    if (send_all(sock, &cmd, sizeof(cmd)) < 0)
+        goto cleanup;
+
+    if (index_dir)
+        strncpy(dir_buf, index_dir, sizeof(dir_buf) - 1);
+    if (cuvs_fd_send(sock, -1, dir_buf, sizeof(dir_buf)) < 0)
+        goto cleanup;
+
+    if (recv_all(sock, &hdr, sizeof(hdr)) < 0)
+        goto cleanup;
+
+    rc = (int)hdr.status;
+
+cleanup:
+    if (sock >= 0)   close(sock);
+    if (shm_fd >= 0) {
+        close(shm_fd);
+        shm_unlink(shm_key);
+    }
+    return rc;
+}
+
+/* ----------------------------------------------------------------
+ * 3Q: cuvs_ipc_compact
+ *
+ * Sends CUVS_OP_COMPACT with no extra payload — the daemon reads the
+ * .tombstone sidecar directly from index_dir. Timeout is 120 s because
+ * cagra::merge rebuilds the graph (O(new_n * graph_degree)).
+ * ---------------------------------------------------------------- */
+int
+cuvs_ipc_compact(
+    const char *socket_path,
+    uint32_t    db_oid,
+    uint32_t    index_oid,
+    const char *index_dir)
+{
+    int  sock = -1;
+    int  rc   = CUVS_STATUS_ERROR;
+    CuvsCmdFrame    cmd;
+    char            dir_buf[256] = {0};
+    CuvsReplyHeader hdr;
+
+    sock = uds_connect_ex(socket_path, 120);
+    if (sock < 0)
+        return CUVS_STATUS_UNAVAILABLE;
+
+    memset(&cmd, 0, sizeof(cmd));
+    cmd.op        = CUVS_OP_COMPACT;
+    cmd.db_oid    = db_oid;
+    cmd.index_oid = index_oid;
+
+    if (send_all(sock, &cmd, sizeof(cmd)) < 0)
+        goto cleanup;
+
+    if (index_dir)
+        strncpy(dir_buf, index_dir, sizeof(dir_buf) - 1);
+    if (cuvs_fd_send(sock, -1, dir_buf, sizeof(dir_buf)) < 0)
+        goto cleanup;
+
+    if (recv_all(sock, &hdr, sizeof(hdr)) < 0)
+        goto cleanup;
+
+    rc = (int)hdr.status;
+
+cleanup:
+    if (sock >= 0) close(sock);
+    return rc;
+}

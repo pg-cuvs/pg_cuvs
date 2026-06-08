@@ -31,6 +31,8 @@
 #define CUVS_OP_SEARCH_BATCH    10 /* Phase 3M: Q queries in one request, Q×K reply via shm */
 #define CUVS_OP_BUILD_IVFPQ    11 /* 3P: build an IVF-PQ index */
 #define CUVS_OP_SEARCH_IVFPQ   12 /* 3P: search an IVF-PQ index */
+#define CUVS_OP_EXTEND         13 /* 3Q: cagra::extend CAGRA index in-place */
+#define CUVS_OP_COMPACT        14 /* 3Q: cagra::merge with tombstone filter */
 
 /* ----------------------------------------------------------------
  * Distance metrics (mirror pgvector operator names)
@@ -100,6 +102,10 @@ typedef struct CuvsCmdFrame {
     uint32_t pq_bits;   /* BUILD_IVFPQ: bits per PQ code (0 = auto -> 8) */
     uint32_t pq_dim;    /* BUILD_IVFPQ: PQ subspace count (0 = auto -> ceil(dim/2)) */
     uint32_t n_probes;  /* SEARCH_IVFPQ: IVF clusters to probe at query time */
+    /* 3Q: EXTEND params */
+    uint32_t max_chunk_size; /* EXTEND: 0 = auto (cagra::extend_params.max_chunk_size) */
+    /* shm_key reused: EXTEND payload = [float32 vecs: n_vecs×dim][uint64_t tids: n_vecs]
+     * COMPACT has no extra payload — daemon reads .tombstone directly. */
 } CuvsCmdFrame;
 
 /*
@@ -524,6 +530,34 @@ int cuvs_ipc_search_ivfpq(
     float        *dist_out,
     int          *n_out,
     uint32_t     *latency_us_out
+);
+
+/* 3Q: EXTEND — write n_new vectors (+ their TIDs) to shm and ask the daemon
+ * to call cagra::extend in-place on the loaded CAGRA index.
+ * max_chunk_size: 0 = auto. index_dir: where the daemon finds the index on disk.
+ * Returns CUVS_STATUS_OK on success, CUVS_STATUS_NOT_FOUND if the index is not
+ * loaded, CUVS_STATUS_UNAVAILABLE if the daemon is unreachable. */
+int cuvs_ipc_extend(
+    const char     *socket_path,
+    uint32_t        db_oid,
+    uint32_t        index_oid,
+    const float    *new_vecs,     /* host float32 [n_new × dim] */
+    const uint64_t *new_tids,     /* host uint64_t [n_new] */
+    int64_t         n_new,
+    int             dim,
+    uint32_t        max_chunk_size,
+    const char     *index_dir
+);
+
+/* 3Q: COMPACT — ask the daemon to compact a loaded CAGRA index by removing
+ * tombstoned vectors via cagra::merge. No payload: the daemon reads the
+ * .tombstone sidecar directly from index_dir. Returns CUVS_STATUS_OK on
+ * success or if there is nothing to compact (no .tombstone file). */
+int cuvs_ipc_compact(
+    const char *socket_path,
+    uint32_t    db_oid,
+    uint32_t    index_oid,
+    const char *index_dir
 );
 
 /* Circuit breaker state machine moved to cuvs_util.h (structural commit). */
