@@ -77,6 +77,33 @@ FROM cuvs_filtered_knn(
 ) f;
 
 -- ----------------------------------------------------------------
+-- Test 1b: Option B — tid[] type-safe overload
+--
+-- Same correctness check using the tid[] overload; no manual encoding.
+-- ----------------------------------------------------------------
+
+SELECT count(*) AS n, count(*) FILTER (WHERE tenant_id <> 1) AS wrong_tenant
+FROM (
+    SELECT fc.tenant_id
+    FROM cuvs_filtered_knn(
+        'fc_cagra'::regclass,
+        '[0.5,0.3,0.7,0.2,0.8,0.4,0.6,0.1]'::vector(8),
+        ARRAY(SELECT ctid FROM fc WHERE tenant_id = 1),
+        10
+    ) f
+    JOIN fc ON fc.ctid = f.ctid
+) s;
+
+-- NULL tid[] → unfiltered, expect 10 rows.
+SELECT count(*) AS n_unfiltered
+FROM cuvs_filtered_knn(
+    'fc_cagra'::regclass,
+    '[0.5,0.3,0.7,0.2,0.8,0.4,0.6,0.1]'::vector(8),
+    NULL::tid[],
+    10
+) f;
+
+-- ----------------------------------------------------------------
 -- Test 2: Option A — Custom Scan hook
 --
 -- Transparent SQL: WHERE tenant_id=1 ORDER BY v <-> q LIMIT 10.

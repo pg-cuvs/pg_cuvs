@@ -386,3 +386,37 @@ COMMENT ON FUNCTION cuvs_filtered_knn(regclass, vector, bigint[], integer) IS
   'ADR-063 D-wedge spike (Option B): GPU BF kNN restricted to filter_tids. '
   'filter_tids is a sorted bigint[] of heap TIDs encoded as block<<16|off; '
   'NULL degrades to unfiltered BF.  Returns (ctid, distance) pairs.';
+
+-- Type-safe tid[] overload: accepts ctid values directly, encodes internally.
+-- Usage example:
+--   SELECT t.*
+--   FROM cuvs_filtered_knn(
+--         'items_embedding_idx'::regclass,
+--         '[0.1, 0.2, ...]'::vector,
+--         ARRAY(SELECT ctid FROM items WHERE tenant_id = 5),
+--         10
+--       ) f
+--   JOIN items t ON t.ctid = f.ctid
+--   ORDER BY f.distance;
+CREATE FUNCTION cuvs_filtered_knn(
+    index_rel   regclass,
+    query       vector,
+    filter_tids tid[],
+    k           integer
+)
+RETURNS TABLE (ctid tid, distance float4)
+LANGUAGE sql STABLE AS $$
+    SELECT * FROM cuvs_filtered_knn(
+        index_rel,
+        query,
+        (SELECT array_agg(
+                    (((t::text::point)[0])::bigint << 16) |
+                     ((t::text::point)[1])::bigint
+                ) FROM unnest(filter_tids) t),
+        k
+    );
+$$;
+
+COMMENT ON FUNCTION cuvs_filtered_knn(regclass, vector, tid[], integer) IS
+  'Type-safe tid[] overload of cuvs_filtered_knn. Accepts ctid values directly; '
+  'encodes as block<<16|off internally. NULL filter_tids degrades to unfiltered BF.';
