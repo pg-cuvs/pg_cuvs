@@ -166,6 +166,8 @@ typedef struct IndexEntry {
     CuvsIvfPqIndex  ivfpq_handle;       /* NULL if not loaded */
     int64_t         ivfpq_n_vecs;       /* corpus size (mirrors n_vecs) */
     size_t          ivfpq_vram_bytes;   /* estimated VRAM for IVF-PQ PQ codes */
+    /* 3Q: streaming update counters */
+    int64_t         n_extended;         /* vectors added via EXTEND since last build/compact */
 } IndexEntry;
 
 /* Zero just the stat counters of a (re)initialized entry. The slot may carry
@@ -5495,6 +5497,315 @@ handle_search_ivfpq(int client_fd, const CuvsCmdFrame *cmd)
 }
 
 /* ----------------------------------------------------------------
+ * 3Q: handle_extend — extend a loaded CAGRA index in-place with new vectors.
+ *
+ * shm layout: same as BUILD — [float32 vecs: n_vecs×dim][uint64_t tids: n_vecs].
+ * After cuvs_cagra_extend, VRAM graph includes the new vectors; no disk write
+ * (extend_sync=false default). Rev_tids rebuilt so 3O prefilter stays correct.
+ * ---------------------------------------------------------------- */
+static void
+handle_extend(int client_fd, const CuvsCmdFrame *cmd)
+{
+    char index_dir[256] = {0};
+    int  passed_fd = -1;
+
+    if (cuvs_fd_recv(client_fd, index_dir, sizeof(index_dir), &passed_fd) < 0)
+    {
+        send_error(client_fd, "recv index_dir failed");
+        return;
+    }
+    if (passed_fd >= 0) close(passed_fd);
+
+    if (cmd->n_vecs < 1 || cmd->dim == 0)
+    {
+        send_error(client_fd, "EXTEND needs at least 1 vector");
+        return;
+    }
+
+    size_t vec_bytes = (size_t)cmd->n_vecs * cmd->dim * sizeof(float);
+    size_t tid_bytes = (size_t)cmd->n_vecs * sizeof(uint64_t);
+    size_t total     = vec_bytes + tid_bytes;
+
+    int shm_fd = shm_open(cmd->shm_key, O_RDONLY, 0);
+    if (shm_fd < 0)
+    {
+        send_error(client_fd, "shm_open failed");
+        return;
+    }
+    void *mem = mmap(NULL, total, PROT_READ, MAP_SHARED, shm_fd, 0);
+    close(shm_fd);
+    if (mem == MAP_FAILED)
+    {
+        send_error(client_fd, "mmap failed");
+        return;
+    }
+
+    const float    *new_vecs = (const float *)mem;
+    const uint64_t *new_tids_src = (const uint64_t *)((const char *)mem + vec_bytes);
+
+    pthread_mutex_lock(&g_index_mutex);
+
+    IndexEntry *e = find_index(cmd->db_oid, cmd->index_oid);
+    if (!e || !e->handle)
+    {
+        pthread_mutex_unlock(&g_index_mutex);
+        munmap(mem, total);
+        CuvsReplyHeader hdr = {0};
+        hdr.status = CUVS_STATUS_NOT_FOUND;
+        snprintf(hdr.error, sizeof(hdr.error), "CAGRA index %u/%u not loaded",
+                 cmd->db_oid, cmd->index_oid);
+        send_all(client_fd, &hdr, sizeof(hdr));
+        return;
+    }
+
+    int64_t  old_n = e->n_vecs;
+    int64_t  n_new = cmd->n_vecs;
+
+    /* Grow TIDs array before the GPU call; failure here is cheap to handle. */
+    uint64_t *grown = realloc(e->tids, (size_t)(old_n + n_new) * sizeof(uint64_t));
+    if (!grown)
+    {
+        pthread_mutex_unlock(&g_index_mutex);
+        munmap(mem, total);
+        send_error_code(client_fd, CUVS_STATUS_ERROR, "realloc tids failed");
+        return;
+    }
+    e->tids = grown;
+    memcpy(e->tids + old_n, new_tids_src, (size_t)n_new * sizeof(uint64_t));
+
+    int rc = cuvs_cagra_extend(e->handle, new_vecs, n_new, (int)cmd->dim,
+                               cmd->max_chunk_size, (int)e->gpu_device_id);
+    if (rc != 0)
+    {
+        /* GPU failed: tids buffer is oversized by n_new but n_vecs is unchanged. */
+        pthread_mutex_unlock(&g_index_mutex);
+        munmap(mem, total);
+        send_error_code(client_fd, CUVS_STATUS_BUILD_FAILED, "cuvs_cagra_extend failed");
+        return;
+    }
+
+    e->n_vecs     += n_new;
+    e->n_extended += n_new;
+    e->vram_bytes  = estimate_vram_bytes(e->n_vecs, (int)e->dim);
+
+    /* Rebuild rev_tids to include new item_ids (needed for 3O prefilter). */
+    free(e->rev_tids);     e->rev_tids     = NULL;
+    free(e->rev_item_ids); e->rev_item_ids = NULL;
+    build_rev_tid_map(e);
+
+    pthread_mutex_unlock(&g_index_mutex);
+    munmap(mem, total);
+
+    LOG_INFO("[handle_extend] %u/%u: added %lld vecs (total %lld, n_extended %lld)\n",
+             cmd->db_oid, cmd->index_oid,
+             (long long)n_new, (long long)e->n_vecs, (long long)e->n_extended);
+
+    CuvsReplyHeader ok = {0};
+    ok.status = CUVS_STATUS_OK;
+    send_all(client_fd, &ok, sizeof(ok));
+}
+
+/* Comparator for qsort/bsearch on raw uint64_t arrays. */
+static int
+cmp_u64(const void *a, const void *b)
+{
+    uint64_t x = *(const uint64_t *)a;
+    uint64_t y = *(const uint64_t *)b;
+    return (x > y) - (x < y);
+}
+
+/* ----------------------------------------------------------------
+ * 3Q: handle_compact — remove tombstoned vectors via cagra::merge.
+ *
+ * No extra shm payload; daemon reads .tombstone sidecar from save_dir.
+ * After merge: new handle + compacted tids + rebuilt rev_tids + save_index.
+ * ---------------------------------------------------------------- */
+static void
+handle_compact(int client_fd, const CuvsCmdFrame *cmd)
+{
+    char index_dir[256] = {0};
+    int  passed_fd = -1;
+
+    if (cuvs_fd_recv(client_fd, index_dir, sizeof(index_dir), &passed_fd) < 0)
+    {
+        send_error(client_fd, "recv index_dir failed");
+        return;
+    }
+    if (passed_fd >= 0) close(passed_fd);
+
+    const char *save_dir = (index_dir[0] != '\0') ? index_dir : g_index_dir;
+
+    /* Read tombstone file before taking the mutex (disk I/O only). */
+    char tombstone_path[512];
+    snprintf(tombstone_path, sizeof(tombstone_path), "%s/%u_%u.tombstone",
+             save_dir, cmd->db_oid, cmd->index_oid);
+
+    FILE *tf = fopen(tombstone_path, "rb");
+    if (!tf)
+    {
+        /* No tombstone: nothing to compact. Reply OK. */
+        CuvsReplyHeader ok = {0};
+        ok.status = CUVS_STATUS_OK;
+        send_all(client_fd, &ok, sizeof(ok));
+        return;
+    }
+
+    CuvsTombstoneHeader thdr;
+    if (fread(&thdr, sizeof(thdr), 1, tf) != 1 ||
+        thdr.magic != CUVS_TOMBSTONE_MAGIC || thdr.n_entries <= 0)
+    {
+        fclose(tf);
+        send_error_code(client_fd, CUVS_STATUS_ERROR, "invalid tombstone file");
+        return;
+    }
+
+    int64_t  n_dead   = thdr.n_entries;
+    uint64_t *dead_tids = malloc((size_t)n_dead * sizeof(uint64_t));
+    if (!dead_tids)
+    {
+        fclose(tf);
+        send_error_code(client_fd, CUVS_STATUS_ERROR, "malloc dead_tids failed");
+        return;
+    }
+
+    for (int64_t i = 0; i < n_dead; i++)
+    {
+        CuvsTombstoneRecord rec;
+        if (fread(&rec, sizeof(rec), 1, tf) != 1)
+        {
+            fclose(tf);
+            free(dead_tids);
+            send_error_code(client_fd, CUVS_STATUS_ERROR, "tombstone read failed");
+            return;
+        }
+        dead_tids[i] = rec.tid;
+    }
+    fclose(tf);
+    qsort(dead_tids, (size_t)n_dead, sizeof(uint64_t), cmp_u64);
+
+    pthread_mutex_lock(&g_index_mutex);
+
+    IndexEntry *e = find_index(cmd->db_oid, cmd->index_oid);
+    if (!e || !e->handle)
+    {
+        pthread_mutex_unlock(&g_index_mutex);
+        free(dead_tids);
+        send_error_code(client_fd, CUVS_STATUS_NOT_FOUND,
+                        "CAGRA index not loaded for compact");
+        return;
+    }
+
+    /* Build keep_bits: bit[i]=1 → keep vector i (not tombstoned). */
+    int64_t   n_vecs   = e->n_vecs;
+    int64_t   n_words  = (n_vecs + 31) / 32;
+    uint32_t *keep_bits = calloc((size_t)n_words, sizeof(uint32_t));
+    if (!keep_bits)
+    {
+        pthread_mutex_unlock(&g_index_mutex);
+        free(dead_tids);
+        send_error_code(client_fd, CUVS_STATUS_ERROR, "calloc keep_bits failed");
+        return;
+    }
+
+    int64_t dead_count = 0;
+    for (int64_t i = 0; i < n_vecs; i++)
+    {
+        if (!bsearch(&e->tids[i], dead_tids, (size_t)n_dead,
+                     sizeof(uint64_t), cmp_u64))
+        {
+            keep_bits[i / 32] |= (1u << (i % 32));
+        }
+        else
+        {
+            dead_count++;
+        }
+    }
+    free(dead_tids);
+
+    if (dead_count == 0)
+    {
+        pthread_mutex_unlock(&g_index_mutex);
+        free(keep_bits);
+        unlink(tombstone_path);
+        CuvsReplyHeader ok = {0};
+        ok.status = CUVS_STATUS_OK;
+        send_all(client_fd, &ok, sizeof(ok));
+        return;
+    }
+
+    LOG_INFO("[handle_compact] %u/%u: removing %lld of %lld vectors\n",
+             cmd->db_oid, cmd->index_oid, (long long)dead_count, (long long)n_vecs);
+
+    int64_t   new_n    = n_vecs - dead_count;
+
+    /* Build compacted TIDs BEFORE the GPU call — both operations need keep_bits.
+     * Free keep_bits only after both consumers are done. */
+    uint64_t *new_tids = malloc((size_t)new_n * sizeof(uint64_t));
+    if (!new_tids)
+    {
+        pthread_mutex_unlock(&g_index_mutex);
+        free(keep_bits);
+        send_error_code(client_fd, CUVS_STATUS_ERROR, "malloc new_tids failed");
+        return;
+    }
+    {
+        int64_t j = 0;
+        for (int64_t i = 0; i < n_vecs; i++)
+            if (keep_bits[i / 32] & (1u << (i % 32)))
+                new_tids[j++] = e->tids[i];
+    }
+
+    CuvsCagraIndex new_handle = cuvs_cagra_compact(
+        e->handle, keep_bits, n_vecs, e->metric, (int)e->gpu_device_id);
+    free(keep_bits);
+
+    if (!new_handle)
+    {
+        pthread_mutex_unlock(&g_index_mutex);
+        free(new_tids);
+        send_error_code(client_fd, CUVS_STATUS_BUILD_FAILED,
+                        "cuvs_cagra_compact failed");
+        return;
+    }
+
+    /* Swap handle + tids. */
+    CuvsCagraIndex old_handle = e->handle;
+    e->handle = new_handle;
+    free(e->tids);
+    e->tids = new_tids;
+    e->n_vecs      = new_n;
+    e->n_extended  = 0;
+    e->vram_bytes  = estimate_vram_bytes(new_n, (int)e->dim);
+
+    cuvs_cagra_free(old_handle, (int)e->gpu_device_id);
+
+    /* Rebuild rev_tids from scratch. */
+    free(e->rev_tids);     e->rev_tids     = NULL;
+    free(e->rev_item_ids); e->rev_item_ids = NULL;
+    build_rev_tid_map(e);
+
+    /* Persist to disk. */
+    if (save_index(e) != 0)
+    {
+        pthread_mutex_unlock(&g_index_mutex);
+        send_error_code(client_fd, CUVS_STATUS_PERSIST_FAILED,
+                        "save_index failed after compact");
+        return;
+    }
+
+    unlink(tombstone_path);
+
+    pthread_mutex_unlock(&g_index_mutex);
+
+    LOG_INFO("[handle_compact] %u/%u: compact OK, %lld vecs remaining\n",
+             cmd->db_oid, cmd->index_oid, (long long)new_n);
+
+    CuvsReplyHeader ok = {0};
+    ok.status = CUVS_STATUS_OK;
+    send_all(client_fd, &ok, sizeof(ok));
+}
+
+/* ----------------------------------------------------------------
  * Per-connection thread
  * ---------------------------------------------------------------- */
 static void *
@@ -5556,6 +5867,12 @@ connection_thread(void *arg)
             break;
         case CUVS_OP_SEARCH_IVFPQ:
             handle_search_ivfpq(client_fd, &cmd);
+            break;
+        case CUVS_OP_EXTEND:
+            handle_extend(client_fd, &cmd);
+            break;
+        case CUVS_OP_COMPACT:
+            handle_compact(client_fd, &cmd);
             break;
         default:
             send_error(client_fd, "unknown op");
