@@ -4194,6 +4194,8 @@ finish_build_commit(int client_fd, const CuvsCmdFrame *cmd, const char *save_dir
         else
             cuvs_cagra_free(existing->handle, existing->gpu_device_id);
         free(existing->tids);
+        free(existing->rev_tids);     existing->rev_tids     = NULL;
+        free(existing->rev_item_ids); existing->rev_item_ids = NULL;
         existing->shard_count = 0;
         existing->shards      = NULL;
         existing->gpu_device_id = (uint32_t)target_gpu;
@@ -4216,6 +4218,8 @@ finish_build_commit(int client_fd, const CuvsCmdFrame *cmd, const char *save_dir
         if (existing->ivfpq_handle) { cuvs_ivfpq_free(existing->ivfpq_handle, existing->gpu_device_id); existing->ivfpq_handle = NULL; }
         existing->last_search_mode = 0;
         reset_entry_stats(existing);   /* fresh index instance */
+        existing->n_extended = 0;      /* REINDEX resets the extend counter */
+        build_rev_tid_map(existing);   /* rebuild map for new tids/n_vecs */
     } else {
         if (g_n_indexes >= MAX_INDEXES)
             evict_lru(target_gpu);
@@ -4258,6 +4262,9 @@ finish_build_commit(int client_fd, const CuvsCmdFrame *cmd, const char *save_dir
         e->ivfpq_n_vecs = 0;
         e->ivfpq_vram_bytes = 0;
         e->last_search_mode = 0;
+        e->n_extended = 0;   /* slot may be reused; must not carry stale counter */
+        e->rev_tids = NULL;  /* evicted slot may have stale freed ptr; NULL it */
+        e->rev_item_ids = NULL;
         reset_entry_stats(e);
     }
 
@@ -4769,6 +4776,8 @@ handle_drop(int client_fd, const CuvsCmdFrame *cmd)
         if (e->shard_count >= 2) free_index_shards(e);
         else if (e->handle)      cuvs_cagra_free(e->handle, e->gpu_device_id);
         free(e->tids);
+        free(e->rev_tids);     e->rev_tids     = NULL;
+        free(e->rev_item_ids); e->rev_item_ids = NULL;
 
         int slot = (int)(e - g_indexes);
         for (int i = slot; i < g_n_indexes - 1; i++)
@@ -5290,6 +5299,9 @@ handle_build_ivfpq(int client_fd, const CuvsCmdFrame *cmd)
             existing->stale_since    = 0;
             existing->last_search_mode = 5; /* ivfpq */
             reset_entry_stats(existing);
+            existing->n_extended = 0;
+            free(existing->rev_tids);     existing->rev_tids     = NULL;
+            free(existing->rev_item_ids); existing->rev_item_ids = NULL;
             build_rev_tid_map(existing);
         }
         else
