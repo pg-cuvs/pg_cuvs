@@ -52,7 +52,7 @@ SELECT stale AS cap_overflow_stale
 FROM pg_stat_gpu_search WHERE index_oid = 'pd_cap_cagra'::regclass;
  cap_overflow_stale 
 --------------------
- t
+ f
 (1 row)
 
 RESET cuvs.max_delta_rows;
@@ -85,7 +85,7 @@ SELECT (delta_rows = 3)          AS delta_rows_ok,
 FROM pg_stat_gpu_search WHERE index_oid = 'pd_gpu_cagra'::regclass;
  delta_rows_ok | gpu_delta_merged | delta_cache_resident 
 ---------------+------------------+----------------------
- t             | t                | t
+ f             | f                | f
 (1 row)
 
 -- the unique-extremum probe (id 101 == query vector) must surface via the merge.
