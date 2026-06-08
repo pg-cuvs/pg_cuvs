@@ -55,6 +55,16 @@ FROM cs ORDER BY embedding <-> '[10,0,0,0]'::vector LIMIT 1;
 -- ----------------------------------------------------------------
 SELECT pg_cuvs_compact('cs_cagra'::regclass);
 
+-- ----------------------------------------------------------------
+-- Test 5: VACUUM alone triggers compact (amvacuumcleanup path)
+-- ----------------------------------------------------------------
+INSERT INTO cs VALUES (2001, '[20,0,0,0]');
+DELETE FROM cs WHERE id = 2001;
+VACUUM cs;
+-- After amvacuumcleanup fires COMPACT: top-1 near [20,0,0,0] must be from base cluster
+SELECT id <= 100 AS from_base_cluster
+FROM cs ORDER BY embedding <-> '[20,0,0,0]'::vector LIMIT 1;
+
 RESET enable_seqscan;
 
 DROP TABLE cs;
