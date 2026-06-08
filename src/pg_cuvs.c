@@ -118,6 +118,7 @@ int   cuvs_bf_batch_wait_us        = 0;    /* daemon BF micro-batch window μs; 
 int   cuvs_max_batch_queries       = 1024; /* pg_cuvs_batch_search Q cap (Phase 3M) */
 bool  cuvs_filtered_knn_hook_enabled = false; /* ADR-063 Option A custom scan hook */
 double cuvs_filter_auto_threshold = 0.05;    /* 3O: selectivity below which pre-filter is used */
+int   cuvs_ivfpq_n_probes          = 64;     /* 3P: IVF clusters probed per search (ivfpq AM) */
 
 /* Enum option tables for the Phase 3L GUCs (string in SQL, mapped to int in C). */
 static const struct config_enum_entry cuvs_search_mode_options[] = {
@@ -368,6 +369,47 @@ cuvs_cagra_amoptions(Datum reloptions, bool validate)
                                       tab, lengthof(tab));
 }
 
+/* ----------------------------------------------------------------
+ * 3P: IVF-PQ index reloptions — WITH (n_lists, pq_bits, pq_dim)
+ * ---------------------------------------------------------------- */
+typedef struct {
+    int32  vl_len_;     /* varlena header, DO NOT TOUCH */
+    int    n_lists;     /* IVF cluster count; 0 = auto → 1024 */
+    int    pq_bits;     /* PQ bits per code; 0 = auto → 8 */
+    int    pq_dim;      /* PQ subspace count; 0 = auto → ceil(dim/2) */
+} CuvsIvfPqOptions;
+
+static relopt_kind cuvs_ivfpq_relopt_kind;
+
+static void
+cuvs_ivfpq_init_reloptions(void)
+{
+    cuvs_ivfpq_relopt_kind = add_reloption_kind();
+    add_int_reloption(cuvs_ivfpq_relopt_kind, "n_lists",
+                      "IVF cluster count (0 = auto → 1024).",
+                      1024, 1, 65536, AccessExclusiveLock);
+    add_int_reloption(cuvs_ivfpq_relopt_kind, "pq_bits",
+                      "PQ bits per code (4–8; 0 = auto → 8).",
+                      8, 4, 8, AccessExclusiveLock);
+    add_int_reloption(cuvs_ivfpq_relopt_kind, "pq_dim",
+                      "PQ subspace count (0 = auto → ceil(dim/2)).",
+                      0, 0, 65536, AccessExclusiveLock);
+}
+
+static bytea *
+cuvs_ivfpq_amoptions(Datum reloptions, bool validate)
+{
+    static const relopt_parse_elt tab[] = {
+        {"n_lists", RELOPT_TYPE_INT, offsetof(CuvsIvfPqOptions, n_lists)},
+        {"pq_bits", RELOPT_TYPE_INT, offsetof(CuvsIvfPqOptions, pq_bits)},
+        {"pq_dim",  RELOPT_TYPE_INT, offsetof(CuvsIvfPqOptions, pq_dim)},
+    };
+    return (bytea *) build_reloptions(reloptions, validate,
+                                      cuvs_ivfpq_relopt_kind,
+                                      sizeof(CuvsIvfPqOptions),
+                                      tab, lengthof(tab));
+}
+
 /* 3S: polled by cuvs_ipc_search's reply wait. Reports a pending query cancel /
  * statement_timeout / backend termination WITHOUT servicing it (no longjmp — the
  * IPC layer must still close its socket and free shm). The caller raises the
@@ -386,6 +428,9 @@ _PG_init(void)
 
     /* ADR-045: register CAGRA WITH(index_dir) reloption. */
     cuvs_cagra_init_reloptions();
+
+    /* 3P: register ivfpq WITH(n_lists, pq_bits, pq_dim) reloptions. */
+    cuvs_ivfpq_init_reloptions();
 
     DefineCustomBoolVariable(
         "enable_cuvs",
@@ -640,6 +685,16 @@ _PG_init(void)
         &cuvs_warmup_threads,
         2, 1, 8,
         PGC_SUSET,
+        0, NULL, NULL, NULL);
+
+    DefineCustomIntVariable(
+        "cuvs.ivfpq_n_probes",
+        "IVF clusters probed per query for ivfpq indexes (3P).",
+        "Higher values improve recall at the cost of latency. "
+        "Must be <= n_lists used at build time.",
+        &cuvs_ivfpq_n_probes,
+        64, 1, 4096,
+        PGC_USERSET,
         0, NULL, NULL, NULL);
 
     /* D-wedge spike (ADR-063): Option A custom scan. */
@@ -3034,6 +3089,244 @@ cuvs_amvacuumcleanup(IndexVacuumInfo *info, IndexBulkDeleteResult *stats)
 }
 
 /* ----------------------------------------------------------------
+ * 3P: IVF-PQ Access Method
+ *
+ * ivfpq_ambuild  — scans the heap and builds an IVF-PQ index via the daemon.
+ * ivfpq_gettuple — runs one IVF-PQ search on first call, iterates results.
+ * ivfpq_aminsert — no-op; IVF-PQ is rebuild-only (REINDEX after bulk loads).
+ *
+ * Scan state is the same CuvsScanState used by CAGRA (compatible allocation).
+ * cuvs_beginscan and cuvs_endscan are reused directly.
+ * ---------------------------------------------------------------- */
+static IndexBuildResult *
+ivfpq_ambuild(Relation heapRel, Relation indexRel, IndexInfo *indexInfo)
+{
+    IndexBuildResult *result = palloc0(sizeof(IndexBuildResult));
+    CuvsBuildState    bs;
+    double            reltuples = 0.0;
+
+    memset(&bs, 0, sizeof(bs));
+    bs.metric     = cuvs_index_metric(indexRel);
+    bs.cap_bytes  = cuvs_effective_build_cap_bytes();
+    bs.corpus.kind = CORPUS_HEAP;
+    bs.corpus.fd   = -1;
+
+    /* Read IVF-PQ build params from index reloptions (or defaults). */
+    CuvsIvfPqOptions *opts = (CuvsIvfPqOptions *) indexRel->rd_options;
+    uint32_t n_lists = opts ? (uint32_t)opts->n_lists : 1024;
+    uint32_t pq_bits = opts ? (uint32_t)opts->pq_bits : 8;
+    uint32_t pq_dim  = opts ? (uint32_t)opts->pq_dim  : 0;
+
+    PG_TRY();
+    {
+        reltuples = table_index_build_scan(
+            heapRel, indexRel, indexInfo,
+            true, true,
+            cuvs_build_callback, &bs, NULL);
+
+        if (bs.n_vecs > 0)
+        {
+            uint32_t table_oid   = (uint32_t) RelationGetRelid(heapRel);
+            uint32_t relfilenode = (uint32_t) heapRel->rd_rel->relfilenode;
+
+            int rc = cuvs_ipc_build_ivfpq(
+                cuvs_socket_path,
+                (uint32_t) MyDatabaseId,
+                (uint32_t) RelationGetRelid(indexRel),
+                bs.vectors,
+                (const uint64_t *) bs.tids,
+                bs.n_vecs,
+                bs.dim,
+                bs.metric,
+                get_index_dir(),
+                table_oid,
+                relfilenode,
+                n_lists, pq_bits, pq_dim);
+
+            if (rc != CUVS_STATUS_OK)
+            {
+                const char *hint;
+                switch (rc)
+                {
+                    case CUVS_STATUS_UNAVAILABLE:
+                        hint = "pg_cuvs_server is not reachable. Start it and retry "
+                               "CREATE INDEX, or use pgvector HNSW.";
+                        break;
+                    case CUVS_STATUS_OOM_FALLBACK:
+                        hint = "GPU VRAM exhausted. Free VRAM and retry CREATE INDEX.";
+                        break;
+                    default:
+                        hint = "Check pg_cuvs_server logs for details.";
+                        break;
+                }
+                ereport(ERROR,
+                        (errcode(ERRCODE_INTERNAL_ERROR),
+                         errmsg("pg_cuvs: IVF-PQ BUILD failed (status %d); "
+                                "CREATE INDEX aborted", rc),
+                         errhint("%s", hint)));
+            }
+        }
+    }
+    PG_FINALLY();
+    {
+        if (bs.vectors)
+            free(bs.vectors);
+        if (bs.tids)
+            free(bs.tids);
+    }
+    PG_END_TRY();
+
+    result->heap_tuples  = reltuples;
+    result->index_tuples = (double) bs.n_vecs;
+    return result;
+}
+
+static void
+ivfpq_ambuildempty(Relation indexRel)
+{
+    (void)indexRel;
+}
+
+static bool
+ivfpq_aminsert(Relation indexRel, Datum *values, bool *isnull,
+               ItemPointer ht_ctid, Relation heapRel,
+               IndexUniqueCheck checkUnique,
+               bool indexUnchanged, IndexInfo *indexInfo)
+{
+    /* IVF-PQ does not support incremental inserts. REINDEX after bulk loads. */
+    (void)indexRel; (void)values; (void)isnull; (void)ht_ctid;
+    (void)heapRel; (void)checkUnique; (void)indexUnchanged; (void)indexInfo;
+    return false;
+}
+
+static void
+ivfpq_rescan(IndexScanDesc scan, ScanKey keys, int nkeys,
+             ScanKey orderbys, int norderbys)
+{
+    /* Identical to cuvs_rescan — resets scan state for a new query vector. */
+    CuvsScanState *ss = (CuvsScanState *)scan->opaque;
+    ss->searched  = false;
+    ss->cur       = 0;
+    ss->n_results = 0;
+
+    if (ss->tids)      { pfree(ss->tids);      ss->tids      = NULL; }
+    if (ss->distances) { pfree(ss->distances);  ss->distances = NULL; }
+
+    if (scan->numberOfOrderBys > 0 && scan->xs_orderbyvals != NULL)
+    {
+        memset(scan->xs_orderbyvals, 0, sizeof(Datum) * scan->numberOfOrderBys);
+        memset(scan->xs_orderbynulls, 0, sizeof(bool) * scan->numberOfOrderBys);
+    }
+
+    if (keys && scan->numberOfKeys > 0)
+        memmove(scan->keyData, keys, scan->numberOfKeys * sizeof(ScanKeyData));
+    if (orderbys && scan->numberOfOrderBys > 0)
+        memmove(scan->orderByData, orderbys,
+                scan->numberOfOrderBys * sizeof(ScanKeyData));
+}
+
+static bool
+ivfpq_gettuple(IndexScanDesc scan, ScanDirection dir)
+{
+    CuvsScanState *ss = (CuvsScanState *)scan->opaque;
+    (void)dir;
+
+    if (!ss->searched)
+    {
+        ss->searched = true;
+
+        Oid index_oid = RelationGetRelid(scan->indexRelation);
+        if (!enable_cuvs)
+            return false;
+
+        if (scan->numberOfOrderBys < 1 || !scan->orderByData)
+            return false;
+        if (scan->orderByData[0].sk_flags & SK_ISNULL)
+            return false;
+
+        Datum    query_datum = scan->orderByData[0].sk_argument;
+        PgVector *qvec       = DatumGetPgVector(query_datum);
+        int       dim        = (int)qvec->dim;
+        int       k          = cuvs_k;
+        uint32_t  metric     = cuvs_index_metric(scan->indexRelation);
+        uint32_t  n_probes   = (uint32_t) cuvs_ivfpq_n_probes;
+        uint32_t  latency_us = 0;
+
+        ss->tids      = palloc(k * sizeof(uint64_t));
+        ss->distances = palloc(k * sizeof(float));
+
+        int rc = cuvs_ipc_search_ivfpq(
+            cuvs_socket_path,
+            (uint32_t) MyDatabaseId,
+            (uint32_t) index_oid,
+            qvec->x,
+            dim, k, metric, n_probes,
+            ss->tids, ss->distances,
+            &ss->n_results,
+            &latency_us);
+
+        if (rc != CUVS_STATUS_OK)
+        {
+            switch (rc)
+            {
+                case CUVS_STATUS_METRIC_MISMATCH:
+                    ereport(ERROR,
+                            (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+                             errmsg("pg_cuvs: ivfpq index was built with a different metric"),
+                             errhint("REINDEX to rebuild with the current metric.")));
+                    break;
+                case CUVS_STATUS_DIM_MISMATCH:
+                    ereport(ERROR,
+                            (errcode(ERRCODE_DATA_EXCEPTION),
+                             errmsg("pg_cuvs: query vector dimension %d does not "
+                                    "match the ivfpq index dimension", dim)));
+                    break;
+                default:
+                    break;
+            }
+            return false;
+        }
+
+        cuvs_last_latency_us  = latency_us;
+        cuvs_last_n_results   = ss->n_results;
+        cuvs_last_k_requested = k;
+        cuvs_last_index_oid   = index_oid;
+        cuvs_last_metric      = metric;
+        cuvs_last_dim         = dim;
+        ss->cur = 0;
+
+        if (cuvs_debug)
+            ereport(NOTICE,
+                    (errmsg("pg_cuvs: ivfpq scan oid=%u dim=%d n_probes=%u "
+                            "k=%d n=%d latency_us=%u",
+                            (uint32_t)index_oid, dim, n_probes,
+                            k, ss->n_results, latency_us)));
+    }
+
+    if (ss->cur >= ss->n_results)
+        return false;
+
+    uint64_t tid = ss->tids[ss->cur];
+    uint32_t blk;
+    uint16_t offset;
+    cuvs_tid_decode(tid, &blk, &offset);
+
+    ItemPointerSet(&scan->xs_heaptid, blk, offset);
+    scan->xs_recheck = true;
+
+    if (scan->numberOfOrderBys > 0 && scan->xs_orderbyvals != NULL)
+    {
+        scan->xs_orderbyvals[0]  = Float8GetDatum((double) ss->distances[ss->cur]);
+        scan->xs_orderbynulls[0] = false;
+        scan->xs_recheckorderby  = false;
+        for (int i = 1; i < scan->numberOfOrderBys; i++)
+            scan->xs_orderbynulls[i] = true;
+    }
+    ss->cur++;
+    return true;
+}
+
+/* ----------------------------------------------------------------
  * Index AM handler
  * ---------------------------------------------------------------- */
 PG_FUNCTION_INFO_V1(cuvsamhandler);
@@ -3061,6 +3354,38 @@ cuvsamhandler(PG_FUNCTION_ARGS)
     amroutine->amendscan         = cuvs_endscan;
     amroutine->amcostestimate    = cuvsamcostestimate;
     amroutine->amoptions         = cuvs_cagra_amoptions; /* WITH (index_dir) */
+
+    PG_RETURN_POINTER(amroutine);
+}
+
+/* ----------------------------------------------------------------
+ * 3P: IVF-PQ AM handler
+ * ---------------------------------------------------------------- */
+PG_FUNCTION_INFO_V1(ivfpqamhandler);
+Datum
+ivfpqamhandler(PG_FUNCTION_ARGS)
+{
+    IndexAmRoutine *amroutine = makeNode(IndexAmRoutine);
+
+    amroutine->amstrategies      = 0;
+    amroutine->amsupport         = 1;
+    amroutine->amcanmulticol     = false;
+    amroutine->amsearcharray     = false;
+    amroutine->amcanorderbyop    = true;
+    amroutine->amoptionalkey     = true;
+
+    amroutine->ambuild           = ivfpq_ambuild;
+    amroutine->ambuildempty      = ivfpq_ambuildempty;
+    amroutine->aminsert          = ivfpq_aminsert;
+    amroutine->ambulkdelete      = cuvs_ambulkdelete;
+    amroutine->amvacuumcleanup   = cuvs_amvacuumcleanup;
+
+    amroutine->ambeginscan       = cuvs_beginscan;
+    amroutine->amrescan          = ivfpq_rescan;
+    amroutine->amgettuple        = ivfpq_gettuple;
+    amroutine->amendscan         = cuvs_endscan;
+    amroutine->amcostestimate    = cuvsamcostestimate;
+    amroutine->amoptions         = cuvs_ivfpq_amoptions;
 
     PG_RETURN_POINTER(amroutine);
 }
@@ -3512,11 +3837,14 @@ pg_cuvs_gpu_search_stats(PG_FUNCTION_ARGS)
         /* Phase 3F: shard count (0/1 = unsharded). */
         values[32] = Int32GetDatum((int32) s->shard_count);
 
-        /* Phase 3I-1 / 3L: last search mode for this index. */
+        /* Phase 3I-1 / 3L / 3P: last search mode for this index.
+         * Values: 0=gpu_cagra, 1=cpu_hnsw, 2=cpu_fallback,
+         *         3=brute_force, 5=ivfpq */
         values[33] = CStringGetTextDatum(
             s->search_mode == 1 ? "cpu_hnsw" :
             s->search_mode == 2 ? "cpu_fallback" :
-            s->search_mode == 3 ? "brute_force" : "gpu_cagra");
+            s->search_mode == 3 ? "brute_force" :
+            s->search_mode == 5 ? "ivfpq" : "gpu_cagra");
 
         /* Phase 3L-9: coalesced brute_force micro-batch dispatch count. */
         values[34] = Int64GetDatum((int64) s->bf_batch_count);
