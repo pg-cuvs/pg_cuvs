@@ -2299,3 +2299,80 @@ PostgreSQL 수준에서 실제 활용하는 유일한 사례가 된다 — cuVS 
 기술 기여(코드, 벤치마크)가 마케팅보다 효과적. 홍보는 링크 등재 이후 자연스럽게.
 
 상세 계획: [docs/ecosystem-strategy.md](../docs/ecosystem-strategy.md)
+
+---
+
+## ADR-063 — D-wedge 필터 스파이크: Option B + Option A 구현 결과
+
+**날짜**: 2026-06-08
+**상태**: 스파이크 완료 — PR #35 검토 대기. 프로덕션 전환은 임계값 로직·타입 안전성 강화 후.
+
+### 배경
+
+ADR-061에서 exact filtered brute-force(D wedge)를 1순위 전략으로 지정. 핵심 미결 사항은 PG 인덱스 AM이 비-인덱스-컬럼 qual을 AM에 넘기지 않는다는 제약 — 이를 우회해 GPU BF 검색에 필터를 end-to-end로 전달하는 경로 설계가 스파이크 목표였다.
+
+### IPC 프로토콜 확장
+
+`CuvsCmdFrame`에 두 필드 추가:
+
+```c
+uint32_t n_filter_tids;      /* 0 = no filter */
+char     filter_shm_key[64]; /* POSIX shm name for sorted uint64_t TID array */
+```
+
+필터 TID 배열은 POSIX shm으로 전달(메모리 매핑, zero-copy). 데몬은 BF top-bk 결과에 binary search로 TID whitelist 교차 — `found ? keep : skip`. `n_filter_tids=0`이면 무필터 BF 경로로 fall-through.
+
+데몬 내부 overfetch: `n_filter_tids > 0`이면 `bk_target = k * 4` (post-filter 생존자를 k개 채우기 위한 candidate 확보).
+
+### Option B — Function API (`cuvs_filtered_knn`)
+
+```sql
+cuvs_filtered_knn(index_rel regclass, query vector,
+                  filter_tids bigint[], k integer)
+RETURNS TABLE (ctid tid, distance float4)
+```
+
+caller가 TID whitelist를 `bigint[]`(block<<16|off 인코딩)로 직접 전달. AM 제약 완전 우회.
+
+**구현 과정에서 발견된 버그 2개**:
+
+1. **`STRICT` 문제**: SQL 함수 선언이 `LANGUAGE C STABLE STRICT`였다. PostgreSQL의 `STRICT`는 임의의 인자가 NULL이면 C body를 실행하지 않고 즉시 NULL(SRF에서는 empty set) 반환. `NULL::bigint[]` 필터를 넘기면 C 코드가 아예 호출되지 않아 항상 0 rows. **수정**: `STRICT` 제거 → `CALLED ON NULL INPUT`(기본값). C body에서 `PG_ARGISNULL(2)` 검사 후 unfiltered BF 경로 분기.
+
+2. **overfetch 부족**: 필터 TID가 200개(200/800 = 25%)일 때 `k=10`만 요청하면 daemon이 10개 후보를 반환하고 그 중 평균 2~3개만 whitelist를 통과 → recall 저하. **수정**: PG 측에서도 `k_fetch = min(k*4, 4000)` 요청, emit loop에서 `min(n_results, k)`만 방출. 데몬 내부 4x와 합산해 실효 candidate pool ≈ 16x.
+
+**결과**: `n=10, wrong_tenant=0` (수정 전 n=8), `n_unfiltered=10` (수정 전 0).
+
+### Option A — Custom Scan Hook
+
+`set_rel_pathlist_hook`에서 CAGRA 인덱스 + 비-인덱스-컬럼 qual + ORDER BY vector `<->` const + LIMIT이 모두 있는 RelOptInfo를 감지해 `CustomPath → CustomScan`으로 교체. SQL 변경 없이 투명하게 동작.
+
+실행 경로:
+1. `cuvs_cs_build`: heap seqscan + qual 평가 → TID set 구축 → `cuvs_ipc_search_filtered`
+2. `cuvs_cs_exec`: TID별 heap fetch → virtual slot 복사 → `ExecProject`
+
+**핵심 구현 이슈 2개**:
+
+1. **`ExecInitQual` 슬롯 포인터 최적화**: `ExecInitQual(exprs, parent)`는 parent의 `ss_ScanTupleSlot` 포인터를 `EEOP_SCAN_FETCHSOME` 옵코드에 직접 bake한다. parent의 virtual slot이 비어있는 상태에서 qual 평가 시 항상 0을 읽어 모든 행이 필터에서 탈락(800행 중 799개 통과해야 할 qual이 0개 통과). **수정**: `ExecInitQual(exprs, NULL)` + `CreateStandaloneExprContext()` — eval 시점에 `filter_ctx->ecxt_scantuple`을 동적으로 지정.
+
+2. **`ExecProject` slot ops 불일치**: `ps_ProjInfo`는 virtual `ss_ScanTupleSlot`을 기준으로 컴파일됨. heap-AM slot을 직접 넘기면 `tts_ops` 불일치로 SIGSEGV. **수정**: `slot_getallattrs(heap_fetch_slot)` 후 `tts_values/tts_isnull`을 virtual scan slot에 수동 복사 → `ExecStoreVirtualTuple` → `ExecProject`. `ExecAssignScanProjectionInfo` + `ExecInitScanTupleSlot` 패턴으로 단순화 가능하나, CustomScan hook에서 `ExecInitCustomScan` 이후 slot 교체는 PG 버전별 내부 구현 차이 가능성이 있어 현 방식 유지.
+
+**결과**: `EXPLAIN`에 `Custom Scan (CuvsFilteredScan)` 노출, `n=10, wrong_tenant=0`, hook off 시 기존 Index Scan 복원 확인.
+
+### 교훈 (향후 C 함수 작성 시 체크리스트)
+
+| 항목 | 설명 |
+|------|------|
+| `STRICT` vs `CALLED ON NULL INPUT` | NULL 인자를 함수 내에서 처리할 의도라면 `STRICT` 금지. NULL이 들어오면 C body 자체가 실행되지 않는다. |
+| `ExecInitQual` parent 인자 | CustomScan에서 qual을 별도 ExprContext로 평가할 때는 `NULL` 전달. parent 전달 시 해당 parent의 slot 포인터가 ExprState에 bake된다. |
+| `tts_ops` 불일치 | heap-AM slot과 virtual slot은 `tts_ops`가 다르다. `ExecProject` 호출 전 slot 타입을 맞추거나 값을 복사해야 한다. |
+| IPC + 4x overfetch | post-filter는 후보 소진 위험이 있다. PG 측과 데몬 측 모두 overfetch를 적용해야 k개를 안정적으로 반환한다. |
+
+### 현재 상태 및 다음 단계
+
+스파이크로서 Option B, A 모두 동작 확인. 프로덕션 전환 전 필요한 작업:
+
+- **Option B**: 타입 안전성 (`bigint[]` 인코딩을 wrapper 함수로 추상화), 저선택성↔고선택성 분기 임계값 GUC
+- **Option A**: GUC `cuvs.filtered_knn_hook`(현재 off 기본값 유지), 선택성 추정으로 BF/CAGRA 자동 선택
+- **공통**: delta 통합 (`.delta` 벡터를 BF 필터 경로에도 포함), `EXPLAIN ANALYZE` GPU 타이밍 노출
+
+**대안 기각**: Option C (GUC 세션 변수 `cuvs.prefilter_col/val`) — 타입 안전성 없음, 병렬 쿼리 위험, 프로덕션 부적합.
