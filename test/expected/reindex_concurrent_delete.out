@@ -1,0 +1,37 @@
+Parsed test spec with 2 sessions
+
+starting permutation: s1_del s1_vac s1_compact s1_reindex s3_read
+step s1_del: DELETE FROM iso3 WHERE id = 99;
+step s1_vac: VACUUM iso3;
+step s1_compact: SELECT pg_cuvs_compact('iso3_cagra'::regclass);
+pg_cuvs_compact
+---------------
+               
+(1 row)
+
+step s1_reindex: REINDEX INDEX CONCURRENTLY iso3_cagra;
+step s3_read: SELECT id <> 99 AS no_ghost
+               FROM iso3 ORDER BY embedding <-> '[99,0,0,0]'::vector LIMIT 1;
+no_ghost
+--------
+t       
+(1 row)
+
+
+starting permutation: s1_reindex s1_del s1_vac s1_compact s3_read
+step s1_reindex: REINDEX INDEX CONCURRENTLY iso3_cagra;
+step s1_del: DELETE FROM iso3 WHERE id = 99;
+step s1_vac: VACUUM iso3;
+step s1_compact: SELECT pg_cuvs_compact('iso3_cagra'::regclass);
+pg_cuvs_compact
+---------------
+               
+(1 row)
+
+step s3_read: SELECT id <> 99 AS no_ghost
+               FROM iso3 ORDER BY embedding <-> '[99,0,0,0]'::vector LIMIT 1;
+no_ghost
+--------
+t       
+(1 row)
+
