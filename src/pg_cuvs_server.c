@@ -5583,10 +5583,16 @@ handle_extend(int client_fd, const CuvsCmdFrame *cmd)
     int64_t  old_n = e->n_vecs;
     int64_t  n_new = cmd->n_vecs;
 
-    /* Pre-flight VRAM budget check: evict LRU entries if the delta won't fit. */
+    /* Pre-flight VRAM budget check.
+     * Cannot call ensure_vram here: evict_lru shifts g_indexes[], invalidating
+     * this IndexEntry *e pointer.  A budget-only check is sufficient — the
+     * backend falls through to delta on BUILD_FAILED (pg_cuvs.c:3029). */
     size_t new_vram   = estimate_vram_bytes(old_n + n_new, (int)e->dim);
     size_t delta_vram = (new_vram > e->vram_bytes) ? new_vram - e->vram_bytes : 0;
-    if (delta_vram > 0 && ensure_vram(delta_vram, (int)e->gpu_device_id) < 0)
+    int    dev        = (int)e->gpu_device_id;
+    if (delta_vram > 0 &&
+        g_max_vram_per_gpu[dev] > 0 &&
+        total_vram_used(dev) + delta_vram > g_max_vram_per_gpu[dev])
     {
         pthread_mutex_unlock(&g_index_mutex);
         munmap(mem, total);
@@ -5851,6 +5857,30 @@ handle_compact(int client_fd, const CuvsCmdFrame *cmd)
 }
 
 /* ----------------------------------------------------------------
+ * handle_set_vram_budget — runtime VRAM budget override (test/admin).
+ *
+ * cmd->n_vecs = new budget in bytes; 0 = unlimited.
+ * No extra payload — just update g_max_vram_per_gpu for all GPUs.
+ * ---------------------------------------------------------------- */
+static void
+handle_set_vram_budget(int client_fd, const CuvsCmdFrame *cmd)
+{
+    size_t new_budget = (size_t)(uint64_t)cmd->n_vecs;  /* 0 = unlimited */
+
+    pthread_mutex_lock(&g_index_mutex);
+    g_max_vram_bytes = new_budget;
+    for (int d = 0; d < CUVS_MAX_GPUS; d++)
+        g_max_vram_per_gpu[d] = new_budget;
+    pthread_mutex_unlock(&g_index_mutex);
+
+    LOG_INFO("[set_vram_budget] budget set to %zu bytes\n", new_budget);
+
+    CuvsReplyHeader ok = {0};
+    ok.status = CUVS_STATUS_OK;
+    send_all(client_fd, &ok, sizeof(ok));
+}
+
+/* ----------------------------------------------------------------
  * Per-connection thread
  * ---------------------------------------------------------------- */
 static void *
@@ -5918,6 +5948,9 @@ connection_thread(void *arg)
             break;
         case CUVS_OP_COMPACT:
             handle_compact(client_fd, &cmd);
+            break;
+        case CUVS_OP_SET_VRAM_BUDGET:
+            handle_set_vram_budget(client_fd, &cmd);
             break;
         default:
             send_error(client_fd, "unknown op");

@@ -33,6 +33,7 @@
 #define CUVS_OP_SEARCH_IVFPQ   12 /* 3P: search an IVF-PQ index */
 #define CUVS_OP_EXTEND         13 /* 3Q: cagra::extend CAGRA index in-place */
 #define CUVS_OP_COMPACT        14 /* 3Q: cagra::merge with tombstone filter */
+#define CUVS_OP_SET_VRAM_BUDGET 15 /* admin/test: set per-GPU VRAM budget (bytes); 0=unlimited */
 
 /* ----------------------------------------------------------------
  * Distance metrics (mirror pgvector operator names)
@@ -562,6 +563,11 @@ int cuvs_ipc_compact(
     uint32_t    db_oid,
     uint32_t    index_oid,
     const char *index_dir
+);
+
+int cuvs_ipc_set_vram_budget(
+    const char *socket_path,
+    int64_t     budget_bytes    /* bytes; 0 = unlimited */
 );
 
 /* Circuit breaker state machine moved to cuvs_util.h (structural commit). */

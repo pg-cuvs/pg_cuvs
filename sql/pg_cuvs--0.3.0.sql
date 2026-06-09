@@ -475,3 +475,13 @@ COMMENT ON FUNCTION pg_cuvs_compact(regclass) IS
   'Compact a CAGRA index: remove tombstoned vectors via cuvsCagraMerge, '
   'rebuild the on-disk .cagra + .tids, and delete the .tombstone sidecar. '
   'Auto-triggered during VACUUM when cuvs.compact_delete_ratio is exceeded.';
+
+CREATE FUNCTION pg_cuvs_set_vram_budget(budget_bytes bigint)
+RETURNS void
+AS '$libdir/pg_cuvs', 'pg_cuvs_set_vram_budget'
+LANGUAGE C VOLATILE STRICT;
+
+COMMENT ON FUNCTION pg_cuvs_set_vram_budget(bigint) IS
+  'Override the per-GPU VRAM budget (bytes) for the running daemon. '
+  '0 = unlimited. Intended for testing and capacity management; '
+  'does not persist across daemon restarts.';

@@ -1591,3 +1591,33 @@ cleanup:
     if (sock >= 0) close(sock);
     return rc;
 }
+
+/* ----------------------------------------------------------------
+ * cuvs_ipc_set_vram_budget — override per-GPU VRAM budget at runtime.
+ *
+ * budget_bytes == 0 restores the unlimited default. No payload beyond
+ * the cmd frame (n_vecs carries the value). Used by tests and admin.
+ * ---------------------------------------------------------------- */
+int
+cuvs_ipc_set_vram_budget(const char *socket_path, int64_t budget_bytes)
+{
+    int  sock = -1;
+    int  rc   = CUVS_STATUS_ERROR;
+    CuvsCmdFrame    cmd;
+    CuvsReplyHeader hdr;
+
+    sock = uds_connect_ex(socket_path, 10);
+    if (sock < 0)
+        return CUVS_STATUS_UNAVAILABLE;
+
+    memset(&cmd, 0, sizeof(cmd));
+    cmd.op     = CUVS_OP_SET_VRAM_BUDGET;
+    cmd.n_vecs = budget_bytes;
+
+    if (send_all(sock, &cmd, sizeof(cmd)) >= 0 &&
+        recv_all(sock, &hdr, sizeof(hdr)) >= 0)
+        rc = (int)hdr.status;
+
+    close(sock);
+    return rc;
+}

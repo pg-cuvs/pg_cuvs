@@ -4224,6 +4224,23 @@ pg_cuvs_compact(PG_FUNCTION_ARGS)
     PG_RETURN_VOID();
 }
 
+/* pg_cuvs_set_vram_budget(budget_bytes bigint) — runtime VRAM cap override.
+ * 0 = unlimited. Intended for testing and capacity management. */
+PG_FUNCTION_INFO_V1(pg_cuvs_set_vram_budget);
+Datum
+pg_cuvs_set_vram_budget(PG_FUNCTION_ARGS)
+{
+    int64 budget_bytes = PG_GETARG_INT64(0);
+    int   rc;
+
+    rc = cuvs_ipc_set_vram_budget(cuvs_socket_path, (int64_t)budget_bytes);
+    if (rc != CUVS_STATUS_OK && rc != CUVS_STATUS_UNAVAILABLE)
+        ereport(ERROR,
+                (errcode(ERRCODE_INTERNAL_ERROR),
+                 errmsg("pg_cuvs_set_vram_budget: daemon returned status %d", rc)));
+    PG_RETURN_VOID();
+}
+
 PG_FUNCTION_INFO_V1(pg_cuvs_gc_orphans);
 Datum
 pg_cuvs_gc_orphans(PG_FUNCTION_ARGS)
