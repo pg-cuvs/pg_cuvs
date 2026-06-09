@@ -5583,6 +5583,17 @@ handle_extend(int client_fd, const CuvsCmdFrame *cmd)
     int64_t  old_n = e->n_vecs;
     int64_t  n_new = cmd->n_vecs;
 
+    /* Pre-flight VRAM budget check: evict LRU entries if the delta won't fit. */
+    size_t new_vram   = estimate_vram_bytes(old_n + n_new, (int)e->dim);
+    size_t delta_vram = (new_vram > e->vram_bytes) ? new_vram - e->vram_bytes : 0;
+    if (delta_vram > 0 && ensure_vram(delta_vram, (int)e->gpu_device_id) < 0)
+    {
+        pthread_mutex_unlock(&g_index_mutex);
+        munmap(mem, total);
+        send_error_code(client_fd, CUVS_STATUS_BUILD_FAILED, "not enough VRAM for extend");
+        return;
+    }
+
     /* Grow TIDs array before the GPU call; failure here is cheap to handle. */
     uint64_t *grown = realloc(e->tids, (size_t)(old_n + n_new) * sizeof(uint64_t));
     if (!grown)
@@ -5599,7 +5610,17 @@ handle_extend(int client_fd, const CuvsCmdFrame *cmd)
                                cmd->max_chunk_size, (int)e->gpu_device_id);
     if (rc != 0)
     {
-        /* GPU failed: tids buffer is oversized by n_new but n_vecs is unchanged. */
+        /* Rollback TIDs to old_n: shrink the buffer so the invariant
+         * e->tids[0..n_vecs-1] == valid holds again. realloc to a smaller
+         * size is guaranteed to succeed on all POSIX malloc implementations;
+         * on failure (defensive) the oversized buffer is still safe because
+         * n_vecs was not updated. */
+        if (old_n > 0)
+        {
+            uint64_t *shrunk = realloc(e->tids, (size_t)old_n * sizeof(uint64_t));
+            if (shrunk)
+                e->tids = shrunk;
+        }
         pthread_mutex_unlock(&g_index_mutex);
         munmap(mem, total);
         send_error_code(client_fd, CUVS_STATUS_BUILD_FAILED, "cuvs_cagra_extend failed");
