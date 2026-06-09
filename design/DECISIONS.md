@@ -2459,6 +2459,7 @@ selectivity × Q 조합에 따라 streaming BF / D-wedge post-filter / CAGRA 중
 - IPC: 기존 `filter_shm_key` 필드 재활용, `use_stream_bf` 플래그 추가
 - GUC: `cuvs.stream_bf_selectivity_threshold` (자동 전환 임계값)
 - running top-k 머지: 청크별 GPU BF 결과를 host에서 누적 정렬
+- **청크 크기 결정은 RMM pool API 기반으로 해야 함** — raw `cudaMemGetInfo` 사용 금지. cuVS BF workspace는 RMM pool에서 조달되므로 raw CUDA 잔여 메모리 체크는 실제 가용량을 반영하지 못한다 (ADR-065 참조)
 
 ### 대안 기각
 
