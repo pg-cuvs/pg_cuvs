@@ -2396,3 +2396,72 @@ caller가 TID whitelist를 `bigint[]`(block<<16|off 인코딩)로 직접 전달.
 - **공통**: delta 통합 (`.delta` 벡터를 BF 필터 경로에도 포함), `EXPLAIN ANALYZE` GPU 타이밍 노출
 
 **대안 기각**: Option C (GUC 세션 변수 `cuvs.prefilter_col/val`) — 타입 안전성 없음, 병렬 쿼리 위험, 프로덕션 부적합.
+
+## ADR-064 — Streaming / Out-of-Core BF: sidecar-gather 경로 (DEFERRED)
+
+**날짜**: 2026-06-09
+**상태**: DEFERRED — 착수 조건: 3O 완료(역방향 맵 구현 후). 분석 출처: STRATEGY_NOTES §H.
+
+### 배경
+
+VRAM을 초과하는 벡터 데이터셋(예: 벡터 400GB, VRAM 40GB)에서 고선택성 필터 쿼리를 GPU로 처리하는 경로가 없다. 현재 GPU 검색은 인덱스 전체(CAGRA graph + `.vectors` sidecar)가 VRAM에 상주해야 동작한다. VRAM 초과 시 OOM 또는 multi-GPU sharding으로만 대응 가능하다.
+
+D-wedge(ADR-063)의 post-filter 방식도 동일 제약 — GPU가 VRAM 내 전체 벡터에 BF를 수행한 뒤 CPU에서 솎는다. 선택성이 아무리 높아도 GPU는 전체 corpus를 봐야 한다.
+
+### 핵심 병목 분석
+
+streaming BF의 naive 구현(`WHERE` 통과 행 → heap fetch → 행렬 구성 → H2D → GPU BF)에서 gather 단계가 지배 비용이 된다:
+
+```
+filter 통과 heapTID 집합
+  → heap page random fetch (buffer pool 경합, scattered I/O)
+  → vector detoast (TOAST면 청크 fetch + LZ 해제)
+  → contiguous 버퍼 복사
+  → H2D transfer → GPU BF
+```
+
+이는 [Filter-Agnostic Vector Search on PostgreSQL (Lu et al., 2026)](https://arxiv.org/abs/2603.23710)이 CPU HNSW에서 발견한 것과 동형 — page access가 distance computation을 압도한다.
+
+### 결정: sidecar-gather 경로
+
+heap 대신 `.vectors` sidecar를 gather 소스로 사용한다.
+
+`.vectors` sidecar는 item_id 순서로 벡터를 연속 저장하며 detoast가 필요 없다. 3O(ADR-048)가 빌드하는 역방향 맵 `heapTID → item_id`를 재활용하면 gather 경로가 다음과 같이 바뀐다:
+
+```
+filter 통과 heapTID 집합
+  → 역방향 맵으로 item_id 집합 변환  O(n_filter), 메모리 내
+  → .vectors sidecar에서 item_id별 read  heap random I/O 및 TOAST 비용 없음
+  → contiguous 버퍼 구성 → H2D → GPU BF (필터 통과분만)
+```
+
+### 적소와 한계
+
+**적합한 워크로드**:
+- 고선택성 필터 + VRAM 초과 데이터 (online 쿼리 포함)
+- exact 대규모 배치 스코어링 / ground-truth 검증
+
+**부적합한 워크로드**:
+- 저선택성 (필터 통과 벡터 >> VRAM) — gather 비용이 이득을 상쇄
+- Q=1 저선택성 온라인 쿼리 — corpus 전체 스윕 부담. throughput 플레이로 Q가 커야 amortize됨 (A100 기준 compute-bound 임계 Q ≳ 5,000)
+
+selectivity × Q 조합에 따라 streaming BF / D-wedge post-filter / CAGRA 중 최적이 갈린다. 전환 임계값은 3O 완료 후 실험으로 확정한다.
+
+### 착수 조건 (DEFERRED 해제 기준)
+
+1. **3O 완료** — `heapTID → item_id` 역방향 맵이 daemon 메모리에 상주하는 시점 (재구현 없이 재활용)
+2. **고선택성 online 쿼리 수요 확인** — 단일 GPU VRAM 초과 + 필터 선택성 < 10% 워크로드가 실측 문제로 보고되는 시점
+
+### 구현 골자 (착수 시)
+
+- daemon: `CUVS_OP_SEARCH_STREAM_BF` op 추가
+- `handle_search_stream_bf()`: filter TID → item_id 변환(역방향 맵) → sidecar read → GPU BF dispatch
+- IPC: 기존 `filter_shm_key` 필드 재활용, `use_stream_bf` 플래그 추가
+- GUC: `cuvs.stream_bf_selectivity_threshold` (자동 전환 임계값)
+- running top-k 머지: 청크별 GPU BF 결과를 host에서 누적 정렬
+
+### 대안 기각
+
+- **heap-based gather**: random page I/O + TOAST 비용이 GPU 이득을 상쇄 — sidecar 경로 대비 열위
+- **IVF-PQ (ADR-049)**: VRAM 절감 접근이지 VRAM 초과 exact search 해법이 아님
+- **multi-GPU sharding (3E/3F/3G)**: GPU 대수 선형 증가 요구 — 비용 문제를 하드웨어로 해결
