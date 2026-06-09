@@ -4222,6 +4222,8 @@ finish_build_commit(int client_fd, const CuvsCmdFrame *cmd, const char *save_dir
         existing->last_search_mode = 0;
         reset_entry_stats(existing);   /* fresh index instance */
         existing->n_extended = 0;      /* REINDEX resets the extend counter */
+        existing->compact_count++;     /* every rebuild counts as a compaction */
+        existing->last_compact_at = time(NULL);
         build_rev_tid_map(existing);   /* rebuild map for new tids/n_vecs */
     } else {
         if (g_n_indexes >= MAX_INDEXES)
@@ -4265,7 +4267,9 @@ finish_build_commit(int client_fd, const CuvsCmdFrame *cmd, const char *save_dir
         e->ivfpq_n_vecs = 0;
         e->ivfpq_vram_bytes = 0;
         e->last_search_mode = 0;
-        e->n_extended = 0;   /* slot may be reused; must not carry stale counter */
+        e->n_extended        = 0;   /* slot may be reused; must not carry stale counter */
+        e->compact_count     = 0;
+        e->last_compact_at   = 0;
         e->rev_tids = NULL;  /* evicted slot may have stale freed ptr; NULL it */
         e->rev_item_ids = NULL;
         reset_entry_stats(e);
