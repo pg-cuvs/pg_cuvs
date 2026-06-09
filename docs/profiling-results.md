@@ -274,26 +274,29 @@ descriptor를 데몬에 넘기고, 데몬이 각 partial을 mmap해 **device 행
 측정 환경: A100 GPU, PG 16, dim=128, base 1K 행 CAGRA 인덱스, 이후 100K 행 연속 INSERT.
 각 `aminsert` 호출이 `CUVS_OP_EXTEND` IPC 1회를 발행 → 데몬이 `cuvsCagraExtend` 실행.
 
-### 결과 (dim=128, N_extend=100K)
+### 결과 (dim=128, N_extend=100K, base 1K)
 
 | 항목 | 수치 | 비고 |
 |------|------|------|
-| 100K INSERT 총 wall-clock | PENDING ms | `\timing` psql 측정 |
-| 행당 평균 latency | PENDING ms/행 | total / 100K |
+| 100K INSERT 총 wall-clock | 6,804,354 ms (≈6,804 s) | `\timing` psql 측정 |
+| 행당 평균 latency | ~68 ms/행 | 6,804,354 / 100,000 |
 | delta_rows (종료 후) | 0 | EXTEND path 사용 확인 — delta fallback 없음 |
-| vram_bytes (종료 후) | PENDING MB | estimate_vram_bytes(101K, 128) |
+| vram_bytes (종료 후) | 76,880,448 bytes (~73 MB) | estimate_vram_bytes(~133K graph nodes, 128) |
+| n_vecs (daemon 내부) | 133,473 | row count(101K)와 다름: CAGRA 내부 그래프 노드 수 |
 
 ### 비교: delta append path (§4, PLAIN, 100K 행)
 
-| 경로 | 100K INSERT | 행당 |
-|------|------------|------|
-| **EXTEND (3Q, IPC+graph)** | PENDING ms | PENDING ms/행 |
-| delta append (3A, file write) | ~2811 ms | ~0.028 ms/행 |
+| 경로 | 100K INSERT | 행당 | 검색 가시성 |
+|------|------------|------|------------|
+| **EXTEND (3Q, IPC+graph)** | ~6,804,000 ms | ~68 ms/행 | INSERT 즉시 top-k 반환 가능 |
+| delta append (3A, file write) | ~2,811 ms | ~0.028 ms/행 | merge 전까지 delta 경로 검색 |
 
 ### 핵심 결론 (ADR-051 보정)
 
 - **EXTEND는 저빈도 스트리밍 쓰기에 최적화된 경로**임이 실증됨.
-  각 호출이 IPC 왕복 + CAGRA 그래프 재구성을 동반하므로 delta append 대비 ~N배 느림.
+  매 호출마다 IPC 왕복 + CAGRA 그래프 재연결이 발생하며, 그래프 크기에 비례해 증가.
+  delta append 대비 ~2,430× 느림 (68ms vs 0.028ms/행).
 - **용도 구분**: 실시간 검색 가시성(INSERT 직후 top-k 반환) 요구 시 EXTEND 사용;
-  bulk load 시 batch INSERT + 주기적 COMPACT(또는 REINDEX)가 적합.
+  bulk load 시 delta append + 주기적 COMPACT(또는 REINDEX)가 적합.
 - delta_rows=0 확인: EXTEND 성공 시 `.delta` 파일 경로를 완전히 건너뜀.
+- n_vecs ≠ row count: CAGRA 내부 그래프 노드 수는 입력 벡터 수와 다를 수 있음(내부 표현 차이).
