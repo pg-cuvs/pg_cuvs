@@ -3542,7 +3542,7 @@ pg_cuvs_last_search_metric(PG_FUNCTION_ARGS)
  * the view must stay queryable while the daemon restarts. (See plan: a
  * future liveness column can distinguish "down" from "idle".)
  * ---------------------------------------------------------------- */
-#define GPU_STATS_NCOLS 35
+#define GPU_STATS_NCOLS 38
 
 static const char *
 cuvs_metric_name(uint32_t metric)
@@ -3911,6 +3911,15 @@ pg_cuvs_gpu_search_stats(PG_FUNCTION_ARGS)
 
         /* Phase 3L-9: coalesced brute_force micro-batch dispatch count. */
         values[34] = Int64GetDatum((int64) s->bf_batch_count);
+
+        /* Phase 4C: streaming update and compaction observability. */
+        values[35] = Int64GetDatum(s->n_extended);
+        values[36] = Int64GetDatum((int64) s->compact_count);
+        if (s->last_compact_at != 0)
+            values[37] = TimestampTzGetDatum(
+                time_t_to_timestamptz((pg_time_t) s->last_compact_at));
+        else
+            nulls[37] = true;
 
         tuplestore_putvalues(tupstore, tupdesc, values, nulls);
     }

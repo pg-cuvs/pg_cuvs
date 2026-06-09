@@ -174,7 +174,10 @@ CREATE FUNCTION pg_cuvs_gpu_search_stats(
     OUT gpu_device_id      integer,
     OUT shard_count        integer,
     OUT search_mode        text,
-    OUT bf_batch_count     bigint
+    OUT bf_batch_count     bigint,
+    OUT extend_count       bigint,
+    OUT compact_count      bigint,
+    OUT last_compact_at    timestamptz
 )
 RETURNS SETOF record
 AS '$libdir/pg_cuvs', 'pg_cuvs_gpu_search_stats'

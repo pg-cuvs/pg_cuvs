@@ -194,6 +194,10 @@ typedef struct CuvsIndexStats {
     uint32_t search_mode;
     /* Phase 3L-9: coalesced brute_force micro-batch dispatches for this index */
     uint64_t bf_batch_count;
+    /* Phase 4C: streaming update and compaction counters */
+    int64_t  n_extended;        /* vectors added via EXTEND since last build/compact */
+    uint64_t compact_count;     /* cuvsCagraMerge compact ops since last build */
+    int64_t  last_compact_at;   /* epoch seconds of last compact; 0 if never */
 } CuvsIndexStats;
 
 /* ----------------------------------------------------------------

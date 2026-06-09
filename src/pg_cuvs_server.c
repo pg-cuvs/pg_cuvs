@@ -168,6 +168,9 @@ typedef struct IndexEntry {
     size_t          ivfpq_vram_bytes;   /* estimated VRAM for IVF-PQ PQ codes */
     /* 3Q: streaming update counters */
     int64_t         n_extended;         /* vectors added via EXTEND since last build/compact */
+    /* 4C: compaction observability */
+    uint64_t        compact_count;      /* cuvsCagraMerge compact ops since last build */
+    time_t          last_compact_at;    /* epoch seconds of last compact; 0 if never */
 } IndexEntry;
 
 /* Zero just the stat counters of a (re)initialized entry. The slot may carry
@@ -4673,6 +4676,9 @@ handle_stats(int client_fd, const CuvsCmdFrame *cmd)
         s->shard_count        = (uint32_t)e->shard_count;
         s->search_mode        = e->last_search_mode; /* Phase 3I-1 */
         s->bf_batch_count     = e->bf_batch_count;   /* Phase 3L-9 */
+        s->n_extended         = e->n_extended;
+        s->compact_count      = e->compact_count;
+        s->last_compact_at    = (int64_t)e->last_compact_at;
     }
 
     /* Phase 3D: also emit cold (not-yet-resident) entries so operators can
@@ -5786,7 +5792,9 @@ handle_compact(int client_fd, const CuvsCmdFrame *cmd)
     free(e->tids);
     e->tids = new_tids;
     e->n_vecs      = new_n;
-    e->n_extended  = 0;
+    e->n_extended       = 0;
+    e->compact_count++;
+    e->last_compact_at  = time(NULL);
     e->vram_bytes  = estimate_vram_bytes(new_n, (int)e->dim);
 
     cuvs_cagra_free(old_handle, (int)e->gpu_device_id);
