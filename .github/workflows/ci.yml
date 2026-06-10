@@ -85,17 +85,23 @@ jobs:
 
       - name: Configure PostgreSQL + start shim daemon
         run: |
+          # Free port 5432 + the default socket dir from any preinstalled cluster,
+          # then create a clean PG16 cluster (runners don't auto-create 16/main).
+          sudo systemctl stop postgresql 2>/dev/null || true
+          sudo pg_dropcluster 16 main --stop 2>/dev/null || true
+          sudo pg_createcluster 16 main -p 5432 -- --auth-local=trust --auth-host=trust
           PGCONF=/etc/postgresql/16/main/postgresql.conf
           echo "shared_preload_libraries = 'pg_cuvs'" | sudo tee -a "$PGCONF"
           echo "cuvs.index_dir = '/tmp/cuvs_indexes'" | sudo tee -a "$PGCONF"
           sudo mkdir -p /tmp/cuvs_indexes && sudo chmod 0777 /tmp/cuvs_indexes
-          sudo -u postgres createuser -s "$USER" 2>/dev/null || true
-          sudo pg_ctlcluster 16 main restart
+          sudo pg_ctlcluster 16 main start
+          sudo -u postgres createuser -s "$USER" || true
           /usr/lib/postgresql/16/bin/pg_cuvs_server \
             --socket /tmp/.s.pg_cuvs --index-dir /tmp/cuvs_indexes \
             --max-vram-mb 38000 >/tmp/shim_daemon.log 2>&1 &
           for _ in $(seq 1 30); do [ -S /tmp/.s.pg_cuvs ] && break; sleep 1; done
           chmod 666 /tmp/.s.pg_cuvs
+          cat /tmp/shim_daemon.log || true
 
       - name: Regression suite (installcheck + isolation)
         run: |
