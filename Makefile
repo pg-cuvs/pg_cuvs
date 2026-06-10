@@ -226,7 +226,7 @@ unexport VM_IP VM_HOST
 
 .PHONY: vm-start vm-stop sync gpu-build gpu-test gpu-bench gpu-bench-1m gpu-shell \
 	gpu-test-unit gpu-test-regress gpu-test-isolation gpu-test-daemon gpu-test-e2e \
-	gpu-test-delta-restart gpu-test-all gpu-test-objstore
+	gpu-test-delta-restart gpu-test-all gpu-test-objstore gpu-test-vram
 
 vm-start:
 	@test -n "$(GCP_INSTANCE)" || (echo "ERROR: set GCP_INSTANCE in .env.gpu"; exit 1)
@@ -328,6 +328,13 @@ gpu-test-objstore:
 	ssh $(VM_HOST) "source ~/miniforge3/bin/activate $(CONDA_ENV) && \
 		PATH=\$$PATH:/snap/bin bash -s" \
 		< infra/scripts/objstore-roundtrip-e2e.sh
+
+# ADR-065: a daemon started without --max-vram-mb must default to a bounded VRAM
+# budget (a fraction of total), not unlimited. Runs a dedicated daemon on a test
+# socket and asserts pg_stat_gpu_cache + the startup log. Piped over stdin.
+gpu-test-vram:
+	ssh $(VM_HOST) "source ~/miniforge3/bin/activate $(CONDA_ENV) && bash -s" \
+		< infra/scripts/vram-budget-default.sh
 
 # End-to-end durability smoke (alias of gpu-e2e for naming symmetry).
 gpu-test-e2e:
