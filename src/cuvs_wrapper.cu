@@ -249,6 +249,21 @@ cuvs_vram_free_bytes_on(int device_id)
     if (cudaSetDevice(device_id) != cudaSuccess)
         return 0;
     cudaMemGetInfo(&free_bytes, &total_bytes);
+
+    /* ADR-065: cuVS allocates through a CUDA async mempool that caches freed
+     * blocks; cudaMemGetInfo counts that cache as "used", understating the
+     * memory a new allocation can actually reuse. Add back the pool's
+     * reclaimable bytes (reserved but not currently in use) so the headroom
+     * estimate reflects real availability. Best-effort: any error leaves the
+     * raw free figure untouched. */
+    cudaMemPool_t pool;
+    if (cudaDeviceGetDefaultMemPool(&pool, device_id) == cudaSuccess) {
+        cuuint64_t reserved = 0, used = 0;
+        if (cudaMemPoolGetAttribute(pool, cudaMemPoolAttrReservedMemCurrent, &reserved) == cudaSuccess &&
+            cudaMemPoolGetAttribute(pool, cudaMemPoolAttrUsedMemCurrent,     &used)     == cudaSuccess &&
+            reserved > used)
+            free_bytes += (size_t)(reserved - used);
+    }
     return free_bytes;
 }
 

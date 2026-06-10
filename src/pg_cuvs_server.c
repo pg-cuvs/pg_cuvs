@@ -269,7 +269,12 @@ static size_t   g_max_vram_per_gpu[CUVS_MAX_GPUS];
  * ---------------------------------------------------------------- */
 static char   g_socket_path[256]  = "/tmp/.s.pg_cuvs.server";
 static char   g_index_dir[256]    = "/tmp/pg_cuvs_indexes";
-static size_t g_max_vram_bytes    = 0;   /* 0 = unlimited; applied per-device */
+static size_t g_max_vram_bytes    = 0;   /* 0 = use default fraction; >0 = explicit --max-vram-mb */
+
+/* ADR-065: default per-device budget when --max-vram-mb is omitted — a fraction
+ * of total VRAM, leaving headroom for the untracked cuVS workspace + CUDA
+ * context so an unset budget cannot OOM the device. */
+#define CUVS_DEFAULT_VRAM_FRACTION 0.90
 static int    g_server_fd         = -1;
 static volatile int g_shutdown    = 0;
 static char   g_snapshot_uri[512] = ""; /* "gs://bucket[/prefix]"; empty = disabled */
@@ -6678,17 +6683,33 @@ main(int argc, char **argv)
             }
         }
     }
-    /* Initialize per-device VRAM budgets */
+    /* Initialize per-device VRAM budgets.
+     *
+     * ADR-065: when --max-vram-mb is omitted, default to a conservative fraction
+     * of each device's total VRAM rather than "unlimited" — an external operator
+     * who doesn't set a budget should NOT be able to OOM the device. The budget
+     * is enforced against the daemon's own per-index accounting (total_vram_used),
+     * which is reliable (it knows what it allocated); the headroom fraction
+     * reserves room for the untracked cuVS workspace + CUDA context. (We do NOT
+     * trust raw cudaMemGetInfo for the budget — cuVS's async mempool caches freed
+     * memory so the "free" figure understates real availability.) Explicit
+     * runtime-unlimited is still available via pg_cuvs_set_vram_budget(0). */
     {
         int n = n_usable_gpus();
         for (int i = 0; i < n; i++)
         {
             int dev = usable_gpu(i);
-            g_max_vram_per_gpu[dev] = g_max_vram_bytes;
-            LOG_INFO("GPU %d (%s): %.0f MB total, budget %s\n",
+            if (g_max_vram_bytes > 0)
+                g_max_vram_per_gpu[dev] = g_max_vram_bytes;          /* explicit --max-vram-mb */
+            else
+                g_max_vram_per_gpu[dev] =
+                    (size_t)(g_gpus[dev].total_vram_bytes * CUVS_DEFAULT_VRAM_FRACTION);
+            LOG_INFO("GPU %d (%s): %.0f MB total, budget %.0f MB (%s)\n",
                      dev, g_gpus[dev].name,
                      g_gpus[dev].total_vram_bytes / (1024.0 * 1024),
-                     g_max_vram_bytes ? "limited" : "unlimited");
+                     g_max_vram_per_gpu[dev] / (1024.0 * 1024),
+                     g_max_vram_bytes ? "explicit --max-vram-mb"
+                                      : "default fraction of total");
         }
     }
 
