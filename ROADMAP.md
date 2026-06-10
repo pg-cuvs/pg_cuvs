@@ -83,6 +83,7 @@
 | **circuit breaker 전역화** | 감사 #5. breaker가 백엔드 프로세스-로컬(shared 아님) — 동시 연결에서 GPU 장애 시 전역 보호 안 됨(백엔드당 상한은 있음). | 코드(shared-memory breaker 상태) | 3C/3D 완료(프로덕션 배포 시점) |
 | **SQL latency split** | 감사 #1. `pg_stat_gpu_search`에 GPU/IPC/recheck 분해 미노출. | 코드(데몬 계측 + IPC + SQL 컬럼) | 명시 요청 시(ADR-044가 외부 측정 완료, SQL 노출 한계가치 낮음) |
 | **delta 누적 성능 저하 관측성** | brute-force 머지가 O(n_delta)라 delta 누적 시 검색 성능 저하. 현재 SQL로 "지금 REINDEX 해야 하나" 판단 기준 없음 — `pg_stat_gpu_search`에 delta 누적 경보 signal 미노출. | 코드(`pg_stat_gpu_search`에 `delta_ratio` 또는 `delta_warn` 컬럼 추가) | delta 누적 운영 문제 실측 시 |
+| **자동 티어링 없음** | VRAM 압박 시 CAGRA → IVF-PQ / HNSW 자동 강등 없음. LRU 축출(3E/3F/3G)은 인덱스를 디스크로 내리지만 포맷 변환은 수동 — 운영자가 직접 `CREATE INDEX USING ivfpq` 또는 `pg_cuvs_build_hnsw()` 재실행 필요. VRAM 초과 시 `안전하게 실패`는 보장하나 `자동 품질 강등`은 미구현. | 코드(VRAM 임계값 도달 시 daemon이 대상 인덱스를 IVF-PQ로 자동 변환 또는 HNSW export 트리거) | VRAM 관리 자동화 명시 수요 시 (3P + 3I 완료가 선결) |
 
 스펙: `docs/spec-audit-2026-06-05.md` | ADR-011 / ADR-017 | `design/OPS_GPU_PLAYBOOK.md`
 
