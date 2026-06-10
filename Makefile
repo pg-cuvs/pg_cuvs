@@ -31,7 +31,7 @@ ISOLATION_OPTS = --inputdir=test --outputdir=test
 # C source files + the CUDA-compiled wrapper (built below by nvcc).
 # PGXS only knows how to build .c → .o; the .cu → .o rule is custom,
 # but the resulting object MUST be listed in OBJS to be linked into the .so.
-OBJS           = src/pg_cuvs.o src/cuvs_ipc.o src/cuvs_util.o src/cuvs_wrapper.o src/hnsw_export.o src/cuvs_build_corpus.o src/pg_cuvs_compaction.o
+OBJS           = src/pg_cuvs.o src/cuvs_ipc.o src/cuvs_util.o $(WRAPPER_OBJ) src/hnsw_export.o src/cuvs_build_corpus.o src/pg_cuvs_compaction.o
 
 # nvcc settings (Phase 1: brute-force only; CAGRA added later)
 NVCC          ?= nvcc
@@ -48,12 +48,26 @@ CUVS_INCLUDE  ?= $(CUVS_PREFIX)/include
 CUVS_RAPIDS_INCLUDE ?= $(CUVS_PREFIX)/include/rapids
 CUVS_LIB      ?= $(CUVS_PREFIX)/lib
 
+# ---- CI Tier 1: CPU-reference shim (no CUDA/cuVS) -------------------------
+# `make PGCUVS_CPU_SHIM=1` swaps the nvcc-built cuVS wrapper for a pure-C CPU
+# shim (src/cuvs_wrapper_shim_cpu.c) so the extension + daemon build and run on
+# a GPU-less hosted CI runner — zero CUDA toolkit. See design/CI_STRATEGY.md
+# (ADR-067). cuvs_wrapper.h is the single GPU boundary, so nothing else changes.
+ifdef PGCUVS_CPU_SHIM
+WRAPPER_OBJ      = src/cuvs_wrapper_shim_cpu.o
+CUVS_SO_LINK     = -lm
+CUVS_SERVER_LINK = -lm
+else
+WRAPPER_OBJ      = src/cuvs_wrapper.o
+CUVS_SO_LINK     = -L$(CUVS_LIB) -lcuvs -lcudart -Wl,-rpath,$(CUVS_LIB)
+CUVS_SERVER_LINK = -L$(CUVS_LIB) -lcuvs -lrmm -lcudart -Wl,-rpath,$(CUVS_LIB)
+endif
+
 PG_CPPFLAGS    = -I$(CUVS_INCLUDE) -I$(CUVS_RAPIDS_INCLUDE) -I./src
 # -Wl,-rpath embeds the cuVS lib path so postmaster finds libcuvs.so
 # without LD_LIBRARY_PATH being set (ADR-007).
-SHLIB_LINK     = -L$(CUVS_LIB) -lcuvs -lcudart \
-                 -Wl,-Bstatic -lstdc++ -Wl,-Bdynamic \
-                 -Wl,-rpath,$(CUVS_LIB) -lrt
+SHLIB_LINK     = $(CUVS_SO_LINK) \
+                 -Wl,-Bstatic -lstdc++ -Wl,-Bdynamic -lrt
 
 PG_CONFIG     ?= pg_config
 PGXS         := $(shell $(PG_CONFIG) --pgxs)
@@ -90,8 +104,7 @@ CC             ?= gcc
 SERVER_CFLAGS  = -O2 -g -Wall -Wextra -I./src \
                  -I$(CUVS_INCLUDE) -I$(CUVS_RAPIDS_INCLUDE) -std=gnu11 \
                  -D_POSIX_C_SOURCE=200809L
-SERVER_LDFLAGS = -L$(CUVS_LIB) -lcuvs -lrmm -lcudart -lstdc++ \
-                 -Wl,-rpath,$(CUVS_LIB) \
+SERVER_LDFLAGS = $(CUVS_SERVER_LINK) -lstdc++ \
                  -lpthread -lrt \
                  -lcurl -lssl -lcrypto
 
@@ -117,7 +130,12 @@ src/cuvs_util_server.o: src/cuvs_util.c src/cuvs_util.h src/cuvs_ipc.h
 src/cuvs_build_corpus_server.o: src/cuvs_build_corpus.c src/cuvs_build_corpus.h
 	$(CC) $(SERVER_CFLAGS) -c $< -o $@
 
-$(SERVER_BIN): src/pg_cuvs_server.o src/cuvs_ipc_server.o src/cuvs_util_server.o src/cuvs_objstore_server.o src/cuvs_build_corpus_server.o src/cuvs_wrapper.o
+# CI Tier 1: pure-C CPU shim object (no CUDA). Shared by the .so and the daemon
+# (same object both link cuvs_wrapper.o today). Built with gcc, -fPIC for the .so.
+src/cuvs_wrapper_shim_cpu.o: src/cuvs_wrapper_shim_cpu.c src/cuvs_wrapper.h src/cuvs_ipc.h
+	$(CC) -O2 -g -fPIC -I./src -std=gnu11 -c $< -o $@
+
+$(SERVER_BIN): src/pg_cuvs_server.o src/cuvs_ipc_server.o src/cuvs_util_server.o src/cuvs_objstore_server.o src/cuvs_build_corpus_server.o $(WRAPPER_OBJ)
 	$(CXX) -o $@ $^ $(SERVER_LDFLAGS)
 
 server: $(SERVER_BIN)
@@ -150,7 +168,7 @@ src/cuvs_objstore_server_test.o: src/cuvs_objstore.c src/cuvs_objstore.h src/cuv
 src/cuvs_build_corpus_server_test.o: src/cuvs_build_corpus.c src/cuvs_build_corpus.h
 	$(CC) $(SERVER_TEST_CFLAGS) -c $< -o $@
 
-$(SERVER_TEST_BIN): src/pg_cuvs_server_test.o src/cuvs_ipc_server_test.o src/cuvs_util_server_test.o src/cuvs_objstore_server_test.o src/cuvs_build_corpus_server_test.o src/cuvs_wrapper.o
+$(SERVER_TEST_BIN): src/pg_cuvs_server_test.o src/cuvs_ipc_server_test.o src/cuvs_util_server_test.o src/cuvs_objstore_server_test.o src/cuvs_build_corpus_server_test.o $(WRAPPER_OBJ)
 	$(CXX) -o $@ $^ $(SERVER_LDFLAGS)
 
 server-test: $(SERVER_TEST_BIN)
