@@ -66,6 +66,23 @@ ORDER BY v <-> array_fill(1.5::real, ARRAY[128])::vector
 LIMIT 1;
 
 -- ----------------------------------------------------------------
+-- Post-OOM CAGRA 그래프 무결성 (repo 공개 전 안전성):
+-- poisoned extend가 VRAM 상주 그래프를 손상시키거나 데몬을 강등시키면 안 된다.
+-- delta가 아닌 ORIGINAL 값([0.5,...], CAGRA에만 존재)에 대한 NN이 정확해야 하고
+-- GPU로 서빙돼야 한다. 벡터는 id별 상수 (id%100)/100이라 [0.5]의 NN은 id%100=50인
+-- 임의의 id — 동률(50개)과 무관한 잔여류(residue class)로 assert (tie-robust).
+SELECT (id % 100) = 50 AS cagra_intact_post_oom
+FROM co
+ORDER BY v <-> array_fill(0.5::real, ARRAY[128])::vector
+LIMIT 1;
+
+-- 데몬은 이 쿼리를 여전히 GPU로 서빙해야 한다(조용한 CPU 강등 금지).
+SELECT search_mode <> 'cpu_fallback' AND search_mode <> 'cpu_hnsw'
+         AS gpu_served_post_oom
+FROM pg_stat_gpu_search
+WHERE index_oid = 'co_cagra'::regclass;
+
+-- ----------------------------------------------------------------
 -- REINDEX: delta 흡수
 -- ----------------------------------------------------------------
 REINDEX INDEX CONCURRENTLY co_cagra;
