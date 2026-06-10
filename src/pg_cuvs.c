@@ -124,6 +124,8 @@ int    cuvs_auto_compact_check_interval = 60;
 double cuvs_auto_compact_threshold      = 0.10;
 char  *cuvs_auto_compact_database       = NULL;
 double cuvs_filter_auto_threshold = 0.05;    /* 3O: selectivity below which pre-filter is used */
+double cuvs_stream_bf_selectivity_threshold = 0.0;  /* ADR-064: selectivity below which out-of-core stream BF is used; 0=off */
+int    cuvs_stream_bf_chunk_vectors = 262144;       /* ADR-064: max vectors per GPU chunk (footprint knob) */
 int   cuvs_ivfpq_n_probes          = 64;     /* 3P: IVF clusters probed per search (ivfpq AM) */
 int   cuvs_extend_chunk_size       = 0;      /* 3Q: CAGRA extend max_chunk_size; 0 = auto */
 double cuvs_compact_delete_ratio   = 0.10;   /* 3Q: auto-compact when dead/total >= this */
@@ -538,6 +540,31 @@ _PG_init(void)
         "0.0 = always D-wedge, 1.0 = always 3O. Default 0.05 (confirmed by benchmark).",
         &cuvs_filter_auto_threshold,
         0.05, 0.0, 1.0,
+        PGC_USERSET,
+        0, NULL, NULL, NULL);
+
+    DefineCustomRealVariable(
+        "cuvs.stream_bf_selectivity_threshold",
+        "Selectivity below which filtered BF streams from the .vectors sidecar (out-of-core, ADR-064).",
+        "Selectivity = |filter| / N. Below this value the daemon gathers ONLY the "
+        "filter-passing vectors from the on-disk .vectors sidecar (never resident "
+        "whole in VRAM) and runs chunked GPU brute force — exact, for datasets that "
+        "exceed VRAM. Takes precedence over cuvs.filter_auto_threshold (3O) when both "
+        "would fire and the sidecar is present. 0.0 = off (default).",
+        &cuvs_stream_bf_selectivity_threshold,
+        0.0, 0.0, 1.0,
+        PGC_USERSET,
+        0, NULL, NULL, NULL);
+
+    DefineCustomIntVariable(
+        "cuvs.stream_bf_chunk_vectors",
+        "Max vectors gathered to the GPU per chunk in streaming BF (ADR-064).",
+        "Footprint knob only: chunk size bounds the per-dispatch GPU buffer but does "
+        "NOT affect the result — the running top-k merge is exact for any chunking. "
+        "Lower it to cap VRAM use on huge filter sets; raise it to reduce dispatch "
+        "count. (RMM/mempool-aware auto-sizing is a tracked ADR-065 follow-up.)",
+        &cuvs_stream_bf_chunk_vectors,
+        262144, 1, INT_MAX,
         PGC_USERSET,
         0, NULL, NULL, NULL);
 
@@ -3956,14 +3983,15 @@ pg_cuvs_gpu_search_stats(PG_FUNCTION_ARGS)
         /* Phase 3F: shard count (0/1 = unsharded). */
         values[32] = Int32GetDatum((int32) s->shard_count);
 
-        /* Phase 3I-1 / 3L / 3P: last search mode for this index.
+        /* Phase 3I-1 / 3L / 3P / ADR-064: last search mode for this index.
          * Values: 0=gpu_cagra, 1=cpu_hnsw, 2=cpu_fallback,
-         *         3=brute_force, 5=ivfpq */
+         *         3=brute_force, 5=ivfpq, 6=stream_bf */
         values[33] = CStringGetTextDatum(
             s->search_mode == 1 ? "cpu_hnsw" :
             s->search_mode == 2 ? "cpu_fallback" :
             s->search_mode == 3 ? "brute_force" :
-            s->search_mode == 5 ? "ivfpq" : "gpu_cagra");
+            s->search_mode == 5 ? "ivfpq" :
+            s->search_mode == 6 ? "stream_bf" : "gpu_cagra");
 
         /* Phase 3L-9: coalesced brute_force micro-batch dispatch count. */
         values[34] = Int64GetDatum((int64) s->bf_batch_count);
@@ -4527,8 +4555,11 @@ cuvs_filtered_knn(PG_FUNCTION_ARGS)
     {
         bool      use_filter    = (filter_arr != NULL && n_filter > 0);
         bool      use_prefilter = false;
+        bool      use_stream_bf = false;
 
-        if (use_filter && cuvs_filter_auto_threshold > 0.0)
+        if (use_filter &&
+            (cuvs_filter_auto_threshold > 0.0 ||
+             cuvs_stream_bf_selectivity_threshold > 0.0))
         {
             Oid heap_oid = IndexGetRelation((Oid) index_oid, true);
             if (OidIsValid(heap_oid))
@@ -4537,14 +4568,25 @@ cuvs_filtered_knn(PG_FUNCTION_ARGS)
                 if (hr)
                 {
                     double N = (double) hr->rd_rel->reltuples;
-                    if (N > 0.0 && (double) n_filter / N < cuvs_filter_auto_threshold)
-                        use_prefilter = true;
+                    if (N > 0.0)
+                    {
+                        double sel = (double) n_filter / N;
+                        /* ADR-064 streaming BF (out-of-core) takes precedence over
+                         * the in-VRAM 3O prefilter when both thresholds fire. */
+                        if (cuvs_stream_bf_selectivity_threshold > 0.0 &&
+                            sel < cuvs_stream_bf_selectivity_threshold)
+                            use_stream_bf = true;
+                        else if (cuvs_filter_auto_threshold > 0.0 &&
+                                 sel < cuvs_filter_auto_threshold)
+                            use_prefilter = true;
+                    }
                     relation_close(hr, AccessShareLock);
                 }
             }
         }
 
-        int       k_fetch    = (use_filter && !use_prefilter) ? Min(k * 4, 4000) : k;
+        int       k_fetch    = (use_filter && !use_prefilter && !use_stream_bf)
+                               ? Min(k * 4, 4000) : k;
         int       emit_limit;
         int       rc;
         int       n_results  = 0;
@@ -4555,17 +4597,39 @@ cuvs_filtered_knn(PG_FUNCTION_ARGS)
         if (use_filter)
         {
             int delta_merged = 0;
-            rc = cuvs_ipc_search_filtered(
-                cuvs_socket_path,
-                (uint32_t) MyDatabaseId,
-                (uint32_t) index_oid,
-                qvec->x,
-                dim, k_fetch, metric,
-                1,   /* search_mode = brute_force */
-                (uint32_t) cuvs_bf_precision,
-                filter_arr, n_filter,
-                tids_out, dists_out, &n_results, &latency_us, &delta_merged,
-                (int) use_prefilter);
+
+            if (use_stream_bf)
+            {
+                rc = cuvs_ipc_search_stream_bf(
+                    cuvs_socket_path,
+                    (uint32_t) MyDatabaseId,
+                    (uint32_t) index_oid,
+                    qvec->x,
+                    dim, k_fetch, metric,
+                    filter_arr, n_filter,
+                    cuvs_stream_bf_chunk_vectors,
+                    tids_out, dists_out, &n_results, &latency_us);
+                /* Sidecar / reverse map absent -> fall back to exact 3O prefilter
+                 * (same k_fetch=k, no overfetch). */
+                if (rc == CUVS_STATUS_NO_VECTORS)
+                {
+                    use_stream_bf = false;
+                    use_prefilter = true;
+                }
+            }
+
+            if (!use_stream_bf)
+                rc = cuvs_ipc_search_filtered(
+                    cuvs_socket_path,
+                    (uint32_t) MyDatabaseId,
+                    (uint32_t) index_oid,
+                    qvec->x,
+                    dim, k_fetch, metric,
+                    1,   /* search_mode = brute_force */
+                    (uint32_t) cuvs_bf_precision,
+                    filter_arr, n_filter,
+                    tids_out, dists_out, &n_results, &latency_us, &delta_merged,
+                    (int) use_prefilter);
 
             /* Merge .delta pending-insert rows (filtered) and apply tombstones. */
             if (rc == CUVS_STATUS_OK && cuvs_max_delta_rows > 0)
@@ -4850,11 +4914,19 @@ cuvs_cs_build(CuvsFilteredScanState *state, EState *estate)
     int       k    = (int) cuvs_k;
 
     bool use_prefilter = false;
-    if (ntids > 0 && cuvs_filter_auto_threshold > 0.0
-        && state->heap_rel->rd_rel->reltuples > 0.0)
+    bool use_stream_bf = false;
+    if (ntids > 0 && state->heap_rel->rd_rel->reltuples > 0.0
+        && (cuvs_filter_auto_threshold > 0.0 ||
+            cuvs_stream_bf_selectivity_threshold > 0.0))
     {
-        double N = (double) state->heap_rel->rd_rel->reltuples;
-        if ((double) ntids / N < cuvs_filter_auto_threshold)
+        double N   = (double) state->heap_rel->rd_rel->reltuples;
+        double sel = (double) ntids / N;
+        /* ADR-064 streaming BF takes precedence over 3O prefilter. */
+        if (cuvs_stream_bf_selectivity_threshold > 0.0 &&
+            sel < cuvs_stream_bf_selectivity_threshold)
+            use_stream_bf = true;
+        else if (cuvs_filter_auto_threshold > 0.0 &&
+                 sel < cuvs_filter_auto_threshold)
             use_prefilter = true;
     }
     /* Always send k to daemon: daemon handles 4x D-wedge overfetch internally.
@@ -4865,16 +4937,35 @@ cuvs_cs_build(CuvsFilteredScanState *state, EState *estate)
     uint32_t latency_us = 0;
 
     int delta_merged = 0;
-    int rc = cuvs_ipc_search_filtered(
-        cuvs_socket_path,
-        (uint32_t) MyDatabaseId,
-        (uint32_t) state->index_oid,
-        qvec->x, dim, k, state->metric,
-        1,   /* brute_force */
-        (uint32_t) cuvs_bf_precision,
-        tids, (uint32_t) ntids,
-        state->result_tids, state->result_dists, &state->n_results,
-        &latency_us, &delta_merged, (int) use_prefilter);
+    int rc;
+    if (use_stream_bf)
+    {
+        rc = cuvs_ipc_search_stream_bf(
+            cuvs_socket_path,
+            (uint32_t) MyDatabaseId,
+            (uint32_t) state->index_oid,
+            qvec->x, dim, k, state->metric,
+            tids, (uint32_t) ntids,
+            cuvs_stream_bf_chunk_vectors,
+            state->result_tids, state->result_dists, &state->n_results,
+            &latency_us);
+        if (rc == CUVS_STATUS_NO_VECTORS)   /* sidecar absent -> exact 3O prefilter */
+        {
+            use_stream_bf = false;
+            use_prefilter = true;
+        }
+    }
+    if (!use_stream_bf)
+        rc = cuvs_ipc_search_filtered(
+            cuvs_socket_path,
+            (uint32_t) MyDatabaseId,
+            (uint32_t) state->index_oid,
+            qvec->x, dim, k, state->metric,
+            1,   /* brute_force */
+            (uint32_t) cuvs_bf_precision,
+            tids, (uint32_t) ntids,
+            state->result_tids, state->result_dists, &state->n_results,
+            &latency_us, &delta_merged, (int) use_prefilter);
 
     state->last_latency_us = latency_us;
 

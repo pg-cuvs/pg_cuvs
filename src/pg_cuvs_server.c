@@ -1936,6 +1936,281 @@ shard_search_worker(void *p)
 }
 
 /* ----------------------------------------------------------------
+ * ADR-064: Streaming / out-of-core filtered brute force.
+ *
+ * Reuses the 3O reverse map (heapTID -> item_id) to gather ONLY the
+ * filter-passing vectors from the `.vectors` sidecar via pread (item_id order,
+ * random access: offset = sizeof(header) + item_id*dim*4), runs GPU brute force
+ * in chunks of `cmd->n_vecs` vectors, and merges a running exact top-k. The
+ * whole sidecar is never resident — only one chunk at a time. Chunk size is a
+ * footprint knob only; the merged result is identical for any chunking.
+ * ---------------------------------------------------------------- */
+
+/* pread `chunk_n` rows (item_ids[0..chunk_n)) from the sidecar body into the
+ * contiguous host buffer `out` (row j = item_ids[j]). 0 on success, -1 on any
+ * short read / pread error. */
+static int
+gather_chunk_pread(int fd, uint32_t dim, const int32_t *item_ids,
+                   int chunk_n, float *out)
+{
+    const size_t row_bytes = (size_t)dim * sizeof(float);
+    for (int j = 0; j < chunk_n; j++)
+    {
+        off_t  off = (off_t)sizeof(CuvsVectorsHeader)
+                   + (off_t)item_ids[j] * (off_t)row_bytes;
+        char  *dst = (char *)(out + (size_t)j * dim);
+        size_t got = 0;
+        while (got < row_bytes)
+        {
+            ssize_t r = pread(fd, dst + got, row_bytes - got, off + (off_t)got);
+            if (r <= 0)
+                return -1;
+            got += (size_t)r;
+        }
+    }
+    return 0;
+}
+
+/* Insert (tid, dist) into a running top-k kept ascending by distance (smaller =
+ * better, matching cuVS L2/IP-as-distance). `*pn` is the current fill (<= k). */
+static void
+topk_insert(CuvsResult *top, int *pn, int k, uint64_t tid, float dist)
+{
+    if (*pn >= k && dist >= top[k - 1].distance)
+        return;                                /* not better than current worst */
+    int pos = (*pn < k) ? (*pn)++ : k - 1;     /* append, or evict worst if full */
+    while (pos > 0 && top[pos - 1].distance > dist)
+    {
+        top[pos] = top[pos - 1];
+        pos--;
+    }
+    top[pos].tid      = tid;
+    top[pos].distance = dist;
+}
+
+static void
+handle_search_stream_bf(int client_fd, const CuvsCmdFrame *cmd)
+{
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+
+    pthread_mutex_lock(&g_index_mutex);
+
+    IndexEntry *e = find_index(cmd->db_oid, cmd->index_oid);
+    if (!e && load_index(cmd->db_oid, cmd->index_oid) == 0)
+        e = find_index(cmd->db_oid, cmd->index_oid);
+    if (!e)
+    {
+        pthread_mutex_unlock(&g_index_mutex);
+        CuvsReplyHeader hdr = {0};
+        hdr.status = CUVS_STATUS_NOT_FOUND;
+        send_all(client_fd, &hdr, sizeof(hdr));
+        return;
+    }
+    e->last_search = time(NULL);
+
+    /* Stale (heap writes since build): defer to the backend CPU path, same as
+     * the in-VRAM filtered path does. */
+    if (e->stale)
+    {
+        record_search_stat(e, CUVS_STATUS_STALE, 0, "index stale (writes since build)");
+        pthread_mutex_unlock(&g_index_mutex);
+        CuvsReplyHeader hdr = {0};
+        hdr.status = CUVS_STATUS_STALE;
+        strncpy(hdr.error, "index stale (writes since build)", sizeof(hdr.error) - 1);
+        send_all(client_fd, &hdr, sizeof(hdr));
+        return;
+    }
+
+    /* Need the 3O reverse map (heapTID -> item_id). It is built on index LOAD,
+     * but not by handle_build, so a freshly-built-and-still-resident index has
+     * none yet — build it lazily here (we hold g_index_mutex; e->tids is stable). */
+    if (e->rev_tids == NULL && e->tids != NULL && e->n_vecs > 0)
+        build_rev_tid_map(e);
+    if (e->rev_tids == NULL || e->rev_item_ids == NULL || e->n_vecs <= 0)
+    {
+        pthread_mutex_unlock(&g_index_mutex);
+        CuvsReplyHeader hdr = {0};
+        hdr.status = CUVS_STATUS_NO_VECTORS;
+        send_all(client_fd, &hdr, sizeof(hdr));
+        return;
+    }
+    if (cmd->metric != e->metric || cmd->dim != e->dim)
+    {
+        pthread_mutex_unlock(&g_index_mutex);
+        CuvsReplyHeader hdr = {0};
+        hdr.status = (cmd->metric != e->metric) ? CUVS_STATUS_METRIC_MISMATCH
+                                                : CUVS_STATUS_DIM_MISMATCH;
+        send_all(client_fd, &hdr, sizeof(hdr));
+        return;
+    }
+
+    /* Map shm query vector. */
+    size_t vec_bytes = (size_t)cmd->dim * sizeof(float);
+    int qfd = shm_open(cmd->shm_key, O_RDONLY, 0);
+    if (qfd < 0)
+    {
+        pthread_mutex_unlock(&g_index_mutex);
+        send_error(client_fd, "shm_open failed");
+        return;
+    }
+    float *query = mmap(NULL, vec_bytes, PROT_READ, MAP_SHARED, qfd, 0);
+    close(qfd);
+    if (query == MAP_FAILED)
+    {
+        pthread_mutex_unlock(&g_index_mutex);
+        send_error(client_fd, "mmap failed");
+        return;
+    }
+
+    /* Map filter TIDs. */
+    uint64_t *flt_tids = NULL;
+    void     *flt_mem  = MAP_FAILED;
+    size_t    flt_bytes = (size_t)cmd->n_filter_tids * sizeof(uint64_t);
+    if (cmd->n_filter_tids > 0 && cmd->filter_shm_key[0] != '\0')
+    {
+        int ffd = shm_open(cmd->filter_shm_key, O_RDONLY, 0);
+        if (ffd >= 0)
+        {
+            flt_mem = mmap(NULL, flt_bytes, PROT_READ, MAP_SHARED, ffd, 0);
+            close(ffd);
+            if (flt_mem != MAP_FAILED)
+                flt_tids = (uint64_t *) flt_mem;
+        }
+    }
+    if (!flt_tids)
+    {
+        munmap(query, vec_bytes);
+        pthread_mutex_unlock(&g_index_mutex);
+        CuvsReplyHeader hdr = {0};
+        hdr.status = CUVS_STATUS_NO_VECTORS;   /* nothing to gather */
+        send_all(client_fd, &hdr, sizeof(hdr));
+        return;
+    }
+
+    /* TID -> item_id via 3O reverse map (binary search); collect, drop misses. */
+    int64_t  nv       = e->n_vecs;
+    int32_t *item_ids = malloc((size_t)cmd->n_filter_tids * sizeof(int32_t));
+    int      n_items  = 0;
+    if (item_ids)
+    {
+        for (uint32_t fi = 0; fi < cmd->n_filter_tids; fi++)
+        {
+            uint64_t want = flt_tids[fi];
+            int64_t  lo = 0, hi = nv - 1;
+            while (lo <= hi)
+            {
+                int64_t mid = lo + (hi - lo) / 2;
+                if (e->rev_tids[mid] == want)
+                {
+                    int32_t iid = e->rev_item_ids[mid];
+                    if (iid >= 0 && (int64_t)iid < nv)
+                        item_ids[n_items++] = iid;
+                    break;
+                }
+                if (e->rev_tids[mid] < want) lo = mid + 1;
+                else                          hi = mid - 1;
+            }
+        }
+    }
+    if (flt_mem != MAP_FAILED)
+        munmap(flt_mem, flt_bytes);
+
+    int k = (int)cmd->k;
+    if (k < 1) k = 1;
+    int chunk_cap = (cmd->n_vecs > 0) ? (int)cmd->n_vecs : 1;
+    int dev       = delta_gpu_of(e);
+
+    /* Open + validate the .vectors sidecar (item_id-ordered float32 body). */
+    char vpath[512];
+    vectors_file_path(vpath, sizeof(vpath), g_index_dir, e->db_oid, e->index_oid);
+    int vfd = open(vpath, O_RDONLY);
+    CuvsVectorsHeader vh;
+    int ok = (vfd >= 0);
+    if (ok)
+    {
+        ssize_t hr = pread(vfd, &vh, sizeof(vh), 0);
+        ok = (hr == (ssize_t)sizeof(vh)
+              && vh.magic == CUVS_VECTORS_MAGIC
+              && vh.dim == e->dim && vh.metric == e->metric
+              && vh.n_vecs == e->n_vecs);
+    }
+    if (!ok || !item_ids)
+    {
+        if (vfd >= 0) close(vfd);
+        free(item_ids);
+        munmap(query, vec_bytes);
+        pthread_mutex_unlock(&g_index_mutex);
+        CuvsReplyHeader hdr = {0};
+        hdr.status = ok ? CUVS_STATUS_ERROR : CUVS_STATUS_NO_VECTORS;
+        send_all(client_fd, &hdr, sizeof(hdr));
+        return;
+    }
+
+    /* Chunk buffers (sized to the cap, reused across chunks). */
+    int cap = (chunk_cap < n_items) ? chunk_cap : (n_items > 0 ? n_items : 1);
+    float            *chunkbuf  = malloc((size_t)cap * (size_t)e->dim * sizeof(float));
+    CuvsSearchResult *chunk_res = malloc((size_t)k * sizeof(CuvsSearchResult));
+    CuvsResult       *top       = malloc((size_t)k * sizeof(CuvsResult));
+    int pn = 0;
+    int failed = (!chunkbuf || !chunk_res || !top);
+
+    for (int base = 0; !failed && base < n_items; base += chunk_cap)
+    {
+        int chunk_n = (n_items - base < chunk_cap) ? (n_items - base) : chunk_cap;
+        if (gather_chunk_pread(vfd, e->dim, item_ids + base, chunk_n, chunkbuf) != 0)
+        { failed = 1; break; }
+
+        int sk = (k < chunk_n) ? k : chunk_n;
+        if (cuvs_brute_force_search(chunkbuf, query, chunk_n, (int)e->dim,
+                                    sk, e->metric, chunk_res, dev) != 0)
+        { failed = 1; break; }
+
+        for (int j = 0; j < sk; j++)
+        {
+            int64_t row = chunk_res[j].item_id;
+            if (row < 0 || row >= chunk_n) continue;
+            int32_t gid = item_ids[base + row];
+            if (gid < 0 || (int64_t)gid >= e->n_vecs) continue;
+            topk_insert(top, &pn, k, e->tids[gid], chunk_res[j].distance);
+        }
+    }
+
+    close(vfd);
+    munmap(query, vec_bytes);
+    free(item_ids);
+    free(chunkbuf);
+    free(chunk_res);
+
+    if (failed)
+    {
+        free(top);
+        record_search_stat(e, CUVS_STATUS_ERROR, 0, "stream_bf failed");
+        pthread_mutex_unlock(&g_index_mutex);
+        send_error(client_fd, "stream_bf failed");
+        return;
+    }
+
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    uint32_t lat = (uint32_t)((t1.tv_sec - t0.tv_sec) * 1000000 +
+                              (t1.tv_nsec - t0.tv_nsec) / 1000);
+    record_search_stat(e, CUVS_STATUS_OK, lat, NULL);
+    e->last_requested_k = cmd->k;
+    e->last_returned_k  = (uint32_t)pn;
+    e->last_search_mode = 6;   /* stream_bf */
+    pthread_mutex_unlock(&g_index_mutex);
+
+    CuvsReplyHeader hdr = {0};
+    hdr.status     = CUVS_STATUS_OK;
+    hdr.n_results  = (uint32_t)pn;
+    hdr.latency_us = lat;
+    send_all(client_fd, &hdr, sizeof(hdr));
+    if (pn > 0)
+        send_all(client_fd, top, (size_t)pn * sizeof(CuvsResult));
+    free(top);
+}
+
+/* ----------------------------------------------------------------
  * Handle SEARCH command
  * ---------------------------------------------------------------- */
 static void
@@ -6005,6 +6280,9 @@ connection_thread(void *arg)
             break;
         case CUVS_OP_INJECT_EXTEND_OOM:
             handle_inject_extend_oom(client_fd, &cmd);
+            break;
+        case CUVS_OP_SEARCH_STREAM_BF:
+            handle_search_stream_bf(client_fd, &cmd);
             break;
         default:
             send_error(client_fd, "unknown op");

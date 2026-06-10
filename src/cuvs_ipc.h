@@ -37,6 +37,9 @@
 #define CUVS_OP_EAT_VRAM        16 /* test: cudaMalloc to leave only n_vecs bytes free on GPU dim */
 #define CUVS_OP_FREE_VRAM       17 /* test: release the g_vram_eaten allocation on GPU dim */
 #define CUVS_OP_INJECT_EXTEND_OOM 18 /* test: make next cuvs_cagra_extend throw bad_alloc (0=off,1=on) */
+#define CUVS_OP_SEARCH_STREAM_BF 19 /* ADR-064: out-of-core filtered BF — gather filter-passing
+                                     * vectors from the .vectors sidecar (pread), chunked GPU BF,
+                                     * running top-k merge. cmd.n_vecs carries the per-chunk cap. */
 
 /* ----------------------------------------------------------------
  * Distance metrics (mirror pgvector operator names)
@@ -259,6 +262,37 @@ int cuvs_ipc_search_filtered(
     uint32_t     *latency_us_out,
     int          *delta_merged_out, /* OUT: 1 if daemon merged .delta; may be NULL */
     int           use_prefilter     /* 3O: 1=GPU BITSET prefilter, 0=D-wedge post-filter */
+);
+
+/*
+ * cuvs_ipc_search_stream_bf — ADR-064: out-of-core filtered brute force.
+ *
+ * Like cuvs_ipc_search_filtered but the daemon does NOT require the whole
+ * `.vectors` sidecar resident in VRAM: it converts filter TIDs to item_ids via
+ * the 3O reverse map, gathers ONLY the filter-passing vectors from the sidecar
+ * with pread, and runs chunked GPU brute force (chunk_cap vectors per GPU
+ * dispatch) merging a running exact top-k. chunk_cap is a footprint knob only —
+ * the result is identical for any chunk size. Exact (float32); no overfetch.
+ *
+ * Returns CUVS_STATUS_OK on success; CUVS_STATUS_NO_VECTORS if the sidecar or
+ * reverse map is unavailable (caller should fall back); CUVS_STATUS_UNAVAILABLE
+ * if the daemon is unreachable.
+ */
+int cuvs_ipc_search_stream_bf(
+    const char     *socket_path,
+    uint32_t        db_oid,
+    uint32_t        index_oid,
+    const float    *query_vec,
+    int             dim,
+    int             k,
+    uint32_t        metric,
+    const uint64_t *filter_tids,   /* daemon converts to item_ids and sorts */
+    uint32_t        n_filter,
+    int             chunk_cap,     /* max vectors per GPU chunk (cuvs.stream_bf_chunk_vectors) */
+    uint64_t       *tids_out,
+    float          *dist_out,
+    int            *n_out,
+    uint32_t       *latency_us_out
 );
 
 int cuvs_ipc_search(
