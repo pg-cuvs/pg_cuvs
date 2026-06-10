@@ -78,7 +78,7 @@
 | 항목 | 근거 | 성격 | 트리거 |
 |------|------|------|--------|
 | **fallback 관측성** | 감사 #2. `pg_stat_gpu_search`에 fallback/success 카운터 부재 — 쿼리가 조용히 CPU로 새는지 SQL로 알 수 없음(fallback은 backend plan-time 결정이라 데몬 미도달). | 코드(backend per-index fallback 카운터 → view 노출) | **repo 공개 전** — 외부 사용자의 첫 번째 디버깅 장벽 |
-| **VRAM budget 강제** | `set_vram_budget(0)` 기본값 무제한 + raw `cudaMemGetInfo` 신뢰 불가 — RMM pool이 해제된 CUDA 메모리를 내부 캐시로 보유하므로 raw 잔여 체크가 실제 cuVS workspace 가용량을 반영하지 못함. 실효 budget 강제는 RMM pool API 경유 필요. | 코드(RMM pool 기반 budget 체크 + GUC 기본값 재검토, ADR-065) | **repo 공개 전** — 기본값 무제한이 외부 사용자 OOM 유발 |
+| **VRAM budget 강제** | `set_vram_budget(0)` 기본값 무제한 + raw `cudaMemGetInfo` 신뢰 불가 — driver GPU mempool(VM 검증상 RMM pool 아닌 **CUDA async mempool** 추정)이 해제 메모리를 캐시 보유해 raw 잔여 체크가 실제 cuVS workspace 가용량을 반영하지 못함. 실효 budget 강제는 CUDA mempool attribute(`cudaMemPoolGetAttribute`) 경유 — active device resource 확정이 선결. | 코드(CUDA mempool attribute 기반 budget 체크 + GUC 기본값 재검토, ADR-065) | **repo 공개 전** — 기본값 무제한이 외부 사용자 OOM 유발 |
 | **OOM 후 인덱스 재사용 미검증** | CAGRA extend OOM 시 `_pr.poison()`으로 PooledRes 반환을 막지만, poison 이후 재빌드 없이 동일 인덱스에 쿼리했을 때 동작 불명. | 테스트(OOM 복구 → 재빌드 없이 쿼리 e2e) | **repo 공개 전** — 안전성 미검증 상태로 공개 부적합 |
 | **circuit breaker 전역화** | 감사 #5. breaker가 백엔드 프로세스-로컬(shared 아님) — 동시 연결에서 GPU 장애 시 전역 보호 안 됨(백엔드당 상한은 있음). | 코드(shared-memory breaker 상태) | 3C/3D 완료(프로덕션 배포 시점) |
 | **SQL latency split** | 감사 #1. `pg_stat_gpu_search`에 GPU/IPC/recheck 분해 미노출. | 코드(데몬 계측 + IPC + SQL 컬럼) | 명시 요청 시(ADR-044가 외부 측정 완료, SQL 노출 한계가치 낮음) |
@@ -93,7 +93,7 @@
 **왜**: VRAM을 초과하는 데이터셋에서 고선택성 필터 쿼리를 GPU로 처리하는 경로. 현재 GPU 검색은 인덱스 전체가 VRAM에 상주해야 동작 — VRAM 초과 시 OOM 또는 multi-GPU sharding만 가능.
 **접근**: 역방향 맵(`heapTID → item_id`, 3O 구현)을 재활용해 필터 통과 벡터만 `.vectors` sidecar에서 gather → H2D → GPU BF. heap random I/O 및 TOAST 비용 없음.
 **적소**: 고선택성 필터(필터 통과 비율 낮음) + VRAM 초과 데이터. 저선택성은 gather 비용이 이득을 상쇄.
-**제약**: 청크 크기 결정은 RMM pool API 기반 필요 — raw `cudaMemGetInfo` 신뢰 불가 (ADR-065).
+**제약**: 청크 크기는 보수적 고정 cap GUC(`cuvs.stream_bf_chunk_vectors`)로 결정 — raw `cudaMemGetInfo` 금지 (ADR-065). 스트리밍은 청크 크기와 정확도 무관하므로 GPU 메모리 잔여 조회 불필요. mempool attribute 자동 sizing은 ADR-065 follow-up.
 **착수 조건**: 3O 완료(역방향 맵 구현) + VRAM 초과 고선택성 쿼리 실측 수요.
 
 스펙: ADR-064
