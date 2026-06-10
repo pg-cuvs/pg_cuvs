@@ -89,12 +89,12 @@
 
 ### 기타
 
-#### Streaming BF — sidecar-gather 경로 (트리거: 3O 완료 + VRAM 초과 고선택성 쿼리 실측 수요)
+#### Streaming BF — sidecar-gather 경로 — **1차 구현 완료** (ADR-064)
 **왜**: VRAM을 초과하는 데이터셋에서 고선택성 필터 쿼리를 GPU로 처리하는 경로. 현재 GPU 검색은 인덱스 전체가 VRAM에 상주해야 동작 — VRAM 초과 시 OOM 또는 multi-GPU sharding만 가능.
-**접근**: 역방향 맵(`heapTID → item_id`, 3O 구현)을 재활용해 필터 통과 벡터만 `.vectors` sidecar에서 gather → H2D → GPU BF. heap random I/O 및 TOAST 비용 없음.
+**구현**: `CUVS_OP_SEARCH_STREAM_BF` + `handle_search_stream_bf()`. 3O 역방향 맵(`heapTID → item_id`) 재활용 → 필터 통과 벡터만 `.vectors` sidecar에서 `pread`로 gather(전체 상주 없음) → `cuvs.stream_bf_chunk_vectors` 단위 청크 GPU BF → host running top-k 머지. `last_search_mode=6`(stream_bf). 자동 전환 GUC `cuvs.stream_bf_selectivity_threshold`(기본 0.0=off; 미만이면 stream, 3O보다 우선, 사이드카 부재 시 3O 폴백). 검증: `stream_bf_recall.sql`(강제 경로 + CPU exact 일치 + parity). installcheck 25/25 + isolation 3/3 GREEN.
 **적소**: 고선택성 필터(필터 통과 비율 낮음) + VRAM 초과 데이터. 저선택성은 gather 비용이 이득을 상쇄.
-**제약**: 청크 크기는 보수적 고정 cap GUC(`cuvs.stream_bf_chunk_vectors`)로 결정 — raw `cudaMemGetInfo` 금지 (ADR-065). 스트리밍은 청크 크기와 정확도 무관하므로 GPU 메모리 잔여 조회 불필요. mempool attribute 자동 sizing은 ADR-065 follow-up.
-**착수 조건**: 3O 완료(역방향 맵 구현) + VRAM 초과 고선택성 쿼리 실측 수요.
+**제약**: 청크 크기 = 정확도 무관(running 머지는 임의 청킹에 exact) → GPU 잔여 조회 불필요, `cudaMemGetInfo` 미사용(ADR-065 준수). 고정 cap GUC.
+**후속(트리거)**: (1) mempool-aware 청크 auto-sizing(ADR-065 follow-up), (2) selectivity×Q 자동 라우팅(현재 수동 GUC), (3) VRAM 초과 대규모 스케일 실측(회귀 CI 밖).
 
 스펙: ADR-064
 
