@@ -38,7 +38,7 @@
 
 | Phase | 내용 | 트랙 |
 |-------|------|------|
-| 3C / 3D | GCS artifact snapshot 본체 / Replica async warmup | 트리거 (multi-node 수요) |
+| 3C / 3D | GCS artifact snapshot 본체 / Replica async warmup | **repo 공개 전 필수** (순차 경로로 승격) |
 | fallback 관측성 · circuit breaker 전역화 · SQL latency split | 운영 하드닝 잔여 | 트리거 |
 | MAX_INDEXES 상향/동적화 + 런타임-축출 auto-reload | 다중 테넌트 파티션 온라인-스케일 선결 — 현 `MAX_INDEXES=64`가 하드월(>64 파티션 축출 시 ERROR+REINDEX, auto-reload 미배선). 측정·근거 ADR-061 / STRATEGY_NOTES §G | 트리거 (수백+ 테넌트 수요) |
 | 3N | OFFSET-aware K 자동 조정 (ORM pagination 호환) | 트리거 (ORM 요구) |
@@ -52,7 +52,7 @@
 
 ### 릴리스 후 기능 (순차)
 
-> **3A Pending Delta는 완료**(완료 표 참조). streaming write(INSERT/UPDATE/DELETE) 후 REINDEX 없이 GPU+delta 병합으로 정합한 top-k를 반환한다. 3L `CuvsBfIndex`를 3A-2 GPU delta cache가 재사용. 상세 스펙·검증은 [design/PLAN.md — Phase 3A](design/PLAN.md), 결정은 ADR-047. **4A(빌드 오버헤드)·3R(빌드 파라미터 reloption)도 완료**(완료 표 참조; 4A=ADR-057/058/059, 3R=ADR-052), **3S(취소 전파)도 완료**(ADR-053), **D(exact filtered BF)도 완료**(ADR-063, 잔여 4항목 포함), **3O(CAGRA-first BITSET prefilter)도 완료**(ADR-048, PR #36/#37), **3Q(CAGRA Streaming Updates)도 완료**(ADR-051, installcheck 21/21), **4C(Background Compaction)도 완료**(ADR-050, installcheck 22/22 + isolation 3/3) — 릴리스 후 기능 순차 경로 완료. 다음 순차 작업은 트리거 기반 백로그 참조.
+> **3A Pending Delta는 완료**(완료 표 참조). streaming write(INSERT/UPDATE/DELETE) 후 REINDEX 없이 GPU+delta 병합으로 정합한 top-k를 반환한다. 3L `CuvsBfIndex`를 3A-2 GPU delta cache가 재사용. 상세 스펙·검증은 [design/PLAN.md — Phase 3A](design/PLAN.md), 결정은 ADR-047. **4A(빌드 오버헤드)·3R(빌드 파라미터 reloption)도 완료**(완료 표 참조; 4A=ADR-057/058/059, 3R=ADR-052), **3S(취소 전파)도 완료**(ADR-053), **D(exact filtered BF)도 완료**(ADR-063, 잔여 4항목 포함), **3O(CAGRA-first BITSET prefilter)도 완료**(ADR-048, PR #36/#37), **3Q(CAGRA Streaming Updates)도 완료**(ADR-051, installcheck 21/21), **4C(Background Compaction)도 완료**(ADR-050, installcheck 22/22 + isolation 3/3) — 기능 순차 경로 완료. **다음 순차 작업: 3C → 3D (repo 공개 전 필수)**.
 
 ---
 
@@ -60,10 +60,10 @@
 
 순차 경로(릴리스 후 기능)와 섞지 않는다. 각 항목은 트리거가 충족될 때 순차 트랙으로 승격한다.
 
-### 분산 운영 — 3C/3D (트리거: multi-node 수요)
+### 분산 운영 — 3C/3D (repo 공개 전 필수 — 순차 경로로 승격)
 
 #### 3C → 3D — GCS Snapshot + Replica Async Warmup
-**왜 나중에**: 단일 노드 워크로드가 충분히 커버되고 multi-node 수요가 생기는 시점에 진입.
+**왜 repo 공개 전에**: read replica는 production PostgreSQL 운용의 기본 패턴. 3C/3D 없이 공개하면 외부 사용자가 replica 설정에서 첫 번째 벽에 부딪힌다 — GCS snapshot 없이 각 replica가 REINDEX를 독립 실행해야 하고(GPU 빌드 비용 × 노드 수), 3D 없이 cold-start QPS가 무너진다.
 
 - **3C**: manifest/checksum/version 기반 GCS upload/download 전체 경로 (3G.2 sharded snapshot과 통합)
 - **3D**: background warmup thread pool, cold entry 등록, cache miss CPU fallback
@@ -136,6 +136,7 @@
 
 | 항목 | 필요 작업 |
 |------|-----------|
+| **3C/3D 완료** | GCS artifact snapshot + replica async warmup — replica 운용 없이는 production 부적합 |
 | GitHub repo 공개 | public release + 라이선스 확인 |
 | 재현 가능한 벤치마크 공개 | `BENCHMARK.md` (pgvector vs pg_cuvs 핵심 수치). **논문화 시 수준 상향**: selectivity × correlation 2축 체계적 sweep(논문 수준 = 복수 dataset × 다단계 selectivity × correlation 유형별) — filter_comparison.sql 확장 형태로 구축, D 잔여 또는 3O 완료 기준에 포함 |
 | 외부 사용자용 설치 가이드 | README 정비 (설치, quick start) |
