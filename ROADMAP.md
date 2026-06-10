@@ -137,10 +137,10 @@
 | 항목 | 필요 작업 |
 |------|-----------|
 | **3C/3D 완료** | GCS artifact snapshot + replica async warmup — replica 운용 없이는 production 부적합 |
-| GitHub repo 공개 | public release + 라이선스 확인 |
-| 재현 가능한 벤치마크 공개 | `BENCHMARK.md` (pgvector vs pg_cuvs 핵심 수치). **논문화 시 수준 상향**: selectivity × correlation 2축 체계적 sweep(논문 수준 = 복수 dataset × 다단계 selectivity × correlation 유형별) — filter_comparison.sql 확장 형태로 구축, D 잔여 또는 3O 완료 기준에 포함 |
-| 외부 사용자용 설치 가이드 | README 정비 (설치, quick start) |
-| 기본 CI | GitHub Actions 최소 구성 |
+| GitHub repo 공개 | public release. 라이선스: **Apache 2.0** (확정) |
+| 재현 가능한 벤치마크 공개 | `BENCHMARK.md` — 핵심은 **overhead characterization**: GPU가 distance computation을 제거하면 IPC / PG heap fetch가 새 병목이 된다는 것을 latency 분해로 실증. pgvector(CPU HNSW) 대비 QPS/latency 비교는 부수. selectivity sweep은 멀티테넌트 filtered search 효과 지지 실험으로 포함(논문 중심 아님) |
+| 외부 사용자용 설치 가이드 | README 정비 (설치, quick start, CUDA/cuVS 버전 매트릭스) |
+| CI — GPU 테스트 전략 | GitHub Actions + GPU 러너 전략 확정 필요. 옵션: (a) self-hosted GPU runner, (b) NVIDIA cloud CI, (c) GPU 없는 mock 경로로 unit test만. 외부 contributor PR 리뷰 가능 여부가 여기에 달림 |
 
 ### 진입 단계
 
