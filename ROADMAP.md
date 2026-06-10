@@ -40,7 +40,7 @@
 |-------|------|------|
 | 3C / 3D | GCS artifact snapshot 본체 / Replica async warmup | **repo 공개 전 필수** (순차 경로로 승격) |
 | fallback 관측성 · circuit breaker 전역화 · SQL latency split | 운영 하드닝 잔여 | 트리거 |
-| MAX_INDEXES 상향/동적화 + 런타임-축출 auto-reload | 다중 테넌트 파티션 온라인-스케일 선결 — 현 `MAX_INDEXES=64`가 하드월(>64 파티션 축출 시 ERROR+REINDEX, auto-reload 미배선). 측정·근거 ADR-061 / STRATEGY_NOTES §G | 트리거 (수백+ 테넌트 수요) |
+| MAX_INDEXES 상향/동적화 + 런타임-축출 auto-reload | 다중 테넌트 파티션 온라인-스케일 선결 — 현 `MAX_INDEXES=64`가 하드월(>64 파티션 축출 시 ERROR+REINDEX, auto-reload 미배선). 측정·근거 ADR-061 / STRATEGY_NOTES §G | **repo 공개 전 또는 멀티테넌트 첫 외부 수요** — 타깃이 멀티테넌트인데 65번째 테넌트에서 ERROR는 첫 외부 사용자 이탈 사유 |
 | 3N | OFFSET-aware K 자동 조정 (ORM pagination 호환) | 트리거 (ORM 요구) |
 | fp16 입력 | float16 벡터 입력으로 VRAM ~50% 절감 — `WITH (precision=fp16)` reloption, cuVS C API 지원 확인 필요 | 트리거 (cuVS fp16 지원 확인) |
 
@@ -77,11 +77,11 @@
 
 | 항목 | 근거 | 성격 | 트리거 |
 |------|------|------|--------|
-| **fallback 관측성** | 감사 #2. `pg_stat_gpu_search`에 fallback/success 카운터 부재 — 쿼리가 조용히 CPU로 새는지 SQL로 알 수 없음(fallback은 backend plan-time 결정이라 데몬 미도달). | 코드(backend per-index fallback 카운터 → view 노출) | 관측성/Phase 2 작업 시 동반 |
-| **circuit breaker 전역화** | 감사 #5. breaker가 백엔드 프로세스-로컬(shared 아님) — 동시 연결에서 GPU 장애 시 전역 보호 안 됨(백엔드당 상한은 있음). | 코드(shared-memory breaker 상태) | 동시연결 GPU 장애 복원력 요구 시(프로덕션화) |
+| **fallback 관측성** | 감사 #2. `pg_stat_gpu_search`에 fallback/success 카운터 부재 — 쿼리가 조용히 CPU로 새는지 SQL로 알 수 없음(fallback은 backend plan-time 결정이라 데몬 미도달). | 코드(backend per-index fallback 카운터 → view 노출) | **repo 공개 전** — 외부 사용자의 첫 번째 디버깅 장벽 |
+| **VRAM budget 강제** | `set_vram_budget(0)` 기본값 무제한 + raw `cudaMemGetInfo` 신뢰 불가 — RMM pool이 해제된 CUDA 메모리를 내부 캐시로 보유하므로 raw 잔여 체크가 실제 cuVS workspace 가용량을 반영하지 못함. 실효 budget 강제는 RMM pool API 경유 필요. | 코드(RMM pool 기반 budget 체크 + GUC 기본값 재검토, ADR-065) | **repo 공개 전** — 기본값 무제한이 외부 사용자 OOM 유발 |
+| **OOM 후 인덱스 재사용 미검증** | CAGRA extend OOM 시 `_pr.poison()`으로 PooledRes 반환을 막지만, poison 이후 재빌드 없이 동일 인덱스에 쿼리했을 때 동작 불명. | 테스트(OOM 복구 → 재빌드 없이 쿼리 e2e) | **repo 공개 전** — 안전성 미검증 상태로 공개 부적합 |
+| **circuit breaker 전역화** | 감사 #5. breaker가 백엔드 프로세스-로컬(shared 아님) — 동시 연결에서 GPU 장애 시 전역 보호 안 됨(백엔드당 상한은 있음). | 코드(shared-memory breaker 상태) | 3C/3D 완료(프로덕션 배포 시점) |
 | **SQL latency split** | 감사 #1. `pg_stat_gpu_search`에 GPU/IPC/recheck 분해 미노출. | 코드(데몬 계측 + IPC + SQL 컬럼) | 명시 요청 시(ADR-044가 외부 측정 완료, SQL 노출 한계가치 낮음) |
-| **VRAM budget 강제** | `set_vram_budget(0)` 기본값 무제한 + raw `cudaMemGetInfo` 신뢰 불가 — RMM pool이 해제된 CUDA 메모리를 내부 캐시로 보유하므로 raw 잔여 체크가 실제 cuVS workspace 가용량을 반영하지 못함. 실효 budget 강제는 RMM pool API 경유 필요. | 코드(RMM pool 기반 budget 체크 + GUC 기본값 재검토, ADR-065) | 프로덕션 VRAM 관리 수요 시 |
-| **OOM 후 인덱스 재사용 미검증** | CAGRA extend OOM 시 `_pr.poison()`으로 PooledRes 반환을 막지만, poison 이후 재빌드 없이 동일 인덱스에 쿼리했을 때 동작 불명. | 테스트(OOM 복구 → 재빌드 없이 쿼리 e2e) | OOM 복구 e2e 요구 시 |
 | **delta 누적 성능 저하 관측성** | brute-force 머지가 O(n_delta)라 delta 누적 시 검색 성능 저하. 현재 SQL로 "지금 REINDEX 해야 하나" 판단 기준 없음 — `pg_stat_gpu_search`에 delta 누적 경보 signal 미노출. | 코드(`pg_stat_gpu_search`에 `delta_ratio` 또는 `delta_warn` 컬럼 추가) | delta 누적 운영 문제 실측 시 |
 
 스펙: `docs/spec-audit-2026-06-05.md` | ADR-011 / ADR-017 | `design/OPS_GPU_PLAYBOOK.md`
