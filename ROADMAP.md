@@ -144,7 +144,7 @@
 | GitHub repo 공개 | public release. 라이선스: **Apache 2.0** (확정) |
 | 재현 가능한 벤치마크 공개 | `BENCHMARK.md` — 핵심은 **overhead characterization**: GPU가 distance computation을 제거하면 IPC / PG heap fetch가 새 병목이 된다는 것을 latency 분해로 실증. pgvector(CPU HNSW) 대비 QPS/latency 비교는 부수. selectivity sweep은 멀티테넌트 filtered search 효과 지지 실험으로 포함(논문 중심 아님) |
 | 외부 사용자용 설치 가이드 | README 정비 (설치, quick start, CUDA/cuVS 버전 매트릭스) |
-| CI — GPU 테스트 전략 | GitHub Actions + GPU 러너 전략 확정 필요. 옵션: (a) self-hosted GPU runner, (b) NVIDIA cloud CI, (c) GPU 없는 mock 경로로 unit test만. 외부 contributor PR 리뷰 가능 여부가 여기에 달림 |
+| CI — GPU 테스트 전략 | **전략 확정** (ADR-067, 스펙 [design/CI_STRATEGY.md](design/CI_STRATEGY.md)): 2-tier — Tier 1 CPU-reference shim(`cuvs_wrapper.h` 경계 대체, hosted ubuntu, 매 PR 자동, 무료, plumbing·계약·mode·recall 검증) + Tier 2 실 A100 installcheck(self-hosted, 사용자 on-demand `/gpu-test`). 구현 미착수(shim TU + workflow 2종). |
 
 ### 진입 단계
 

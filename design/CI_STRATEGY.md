@@ -55,7 +55,7 @@ shim 빌드가 CUDA 툴킷 설치를 요구하면 hosted 러너 무료 이점이
 - `cuvs_eat_vram`/`cuvs_free_vram` → 그 카운터를 가감 → **evict_lru·VRAM budget 강제·OOM을 실 GPU 없이 결정적으로 재현**.
 - `cuvs_warmup`/`_device` → no-op.
 
-> E 덕분에 지금 진행 중인 **VRAM budget 강제·OOM 후 재사용** 테스트를 Tier 1에서 결정적으로 돌릴 수 있다. 단 ADR-065 경고 유지: shim의 fake 카운터는 *테스트 결정성*용이고, 실 mempool 거동(active device resource 확정)은 Tier 2에서만 검증된다 — shim이 GREEN이어도 실 budget enforcement는 on-demand GPU 런으로 확증해야 한다.
+> E 덕분에 **VRAM budget 강제·OOM 후 재사용**을 Tier 1에서 결정적으로 돌릴 수 있다. budget 강제는 ADR-065 해소대로 **데몬 자기-회계**(`total_vram_used` = Σ per-index `vram_bytes`, 기본 총량 90% cap)라 device 조회가 아예 불필요 — shim은 `cuvs_detect_gpus`로 **fake 총량만** 주면 cap 산술이 CPU에서 진짜 돈다. 단 ADR-065 경고 유지: 실 mempool headroom(explicit-unlimited 경로의 `cudaMemPoolGetAttribute` 보정)은 Tier 2에서만 검증된다.
 
 ## 4. 잡는 것 / 못 잡는 것 (정직)
 

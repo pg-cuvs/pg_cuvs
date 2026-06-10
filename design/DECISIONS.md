@@ -2589,3 +2589,41 @@ selectivity × Q 조합에 따라 streaming BF / D-wedge post-filter / CAGRA 중
 **결정 4 — 3D 보조 동작 마감** (warmup 관측성 + graceful fallback): 후속 점검에서 3D 보조 2항목을 닫았다. (a) **warmup 관측 통계 보존**: `last_warmup_at`/`warmup_duration_ms`/`download_count`/`cache_miss_count`가 cold→hot 전환 시 0으로 리셋되던(사실상 미구현 — 컬럼은 있으나 항상 0) 결함 수정 — `IndexEntry`에 4필드 추가, `reset_entry_stats`에서 0 초기화, warmup 워커 hot 전환부에서 측정값 propagate, hot-entry stat fill이 실제 값 노출. (b) **graceful CPU fallback**: 인덱스 하이드레이션 불가(아티팩트 거부)면 로컬 `.tids` 부재 → backend plan-time artifact gate가 쿼리를 CPU seqscan으로 라우팅 → 정상 top-k 반환(에러/빈 결과 아님). 데몬-측 cache-miss 카운터(`.tids` local-but-not-hot 좁은 창)는 기존 integration scenario 12(eviction/reload)가 이미 커버.
 
 **검증 증거 (2026-06-10, A100-40GB, cuVS 26.04.00)**: `make gpu-test-objstore` 전 항목 PASS — 업로드, 매니페스트 계약 필드, warmup 하이드레이션 recall@10 일치, **warmup 관측성 보존(download_count=1·last_warmup_at set)**, **하이드레이션 불가 시 graceful CPU fallback top-10 정확**, 3종 fail-closed reject, 버킷 생성·파괴 클린. 회귀 무영향: installcheck **25/25** + isolation **3/3** GREEN. 관련: [[ADR-013]], ADR-024(sharded snapshot), ADR-065(cudaMemGetInfo 금지 — 본 작업과 직교).
+
+## ADR-067 — CI 전략: 2-tier (CPU-reference shim + on-demand GPU)
+
+**날짜**: 2026-06-10
+**상태**: 확정 (스펙: [design/CI_STRATEGY.md](CI_STRATEGY.md)) — repo 공개 전 필수. 구현 미착수.
+
+### 배경
+
+GPU CI는 무료 옵션이 없다 — GitHub hosted 러너에 GPU가 없어 self-hosted(사용자 유료 VM)밖에 길이 없다. 그러나 이번 세션의 false-done 버그(3O rev map 미빌드 PR#39, manifest version 스탬프·base_generation=0 ADR-066)는 **하나도 GPU 커널 버그가 아니라 glue**(IPC 직렬화, 데몬 라우팅, fail-closed, `search_mode` 라벨링, manifest 계약)에서 났다. cuVS 커널 자체는 upstream에서 검증된다. → 실제로 무는 버그 클래스는 GPU 없이 잡을 수 있다.
+
+### 결정: 2-tier
+
+- **Tier 1 (CPU-reference shim, GitHub hosted `ubuntu-latest`, 매 PR 자동, 무료)**: `src/cuvs_wrapper.h`(GPU/CUDA 호출의 단일 경계) 전 심볼을 CPU exact-kNN 구현으로 대체하는 TU(`cuvs_wrapper_shim_cpu.c`, `make PGCUVS_CPU_SHIM=1`). 데몬·백엔드 나머지는 불변. plumbing·IPC 계약·fail-closed·mode 라벨링·정확성(shim이 exact라 ground truth)·VRAM 회계 로직을 검증.
+- **Tier 2 (실 A100 installcheck, self-hosted GPU VM, 사용자 on-demand)**: `workflow_dispatch` + `/gpu-test` 코멘트 / `gpu-ci` 라벨. GPU 커널 correctness·approximate recall 회귀·실 mempool VRAM 거동·latency. release가 아니라 **사용자가 원할 때** 트리거(비용 통제권 사용자). release는 트리거 아닌 머지 정책("최근 Tier 2 GREEN 확인")으로 얹음.
+
+### 무료 성립 조건
+
+(1) public repo = hosted 러너 무제한 무료(공개가 전제). (2) shim 빌드가 CUDA 툴킷 의존 0 — shim 미니 헤더가 `cudaStream_t` 등을 `typedef void*`로 stub, opaque 핸들을 host 구조체로 실체화. → 순수 CPU 빌드.
+
+### Tier 1이 잡는다 / 못 잡는다 (정직)
+
+- **잡는다**: IPC struct padding(CI Linux oracle 클래스), `search_mode` 라벨링(3O false-done을 잡았을 것), fail-closed(SHA/relfilenode/version/base_generation reject), rev map 빌드(build·load 양 경로), manifest 계약, recall(exact ground truth), VRAM 회계 제어흐름. **데몬 자기-회계 budget(ADR-065 해소: 총량 90% cap)은 shim이 fake 총량만 주면 cap 산술이 CPU에서 진짜 돈다** → VRAM budget·OOM·evict_lru 결정적 테스트.
+- **못 잡는다(→ Tier 2 전속)**: 실 cuVS/CUDA 통합(API 오용/dtype/stream sync), **approximate recall 회귀**(shim은 exact라 그래프 품질 저하 안 보임), 실 mempool 거동(ADR-065), latency·멀티GPU 실배치.
+
+### 정직성 라벨 (필수)
+
+green CI badge가 "GPU 검증됨"으로 읽히면 그 자체가 CI의 false-done이다. README/badge에 "Tier 1=CPU reference로 plumbing·계약·정확성, GPU 커널·approximate recall·실 VRAM은 on-demand A100(Tier 2)" 명시.
+
+### 대안 기각
+
+- **GPU CI를 매 PR 자동(self-hosted 상시)**: 비용 — 사용자 무예산. 기각, on-demand로 대체.
+- **release-only GPU 트리거**: GPU 경로 건드린 비-release PR을 못 막음. 기각, on-demand가 상위호환.
+- **mock 없이 unit test만**: glue·IPC·fail-closed·mode·recall 전부 미검증 — 실제 버그 클래스를 놓침. 기각.
+- **CPU fallback 경로만 CI**: 데몬/GPU 경로(false-done이 살던 곳) 미검증. 기각, shim이 데몬 경로를 실제로 태움.
+
+### 후속
+
+ADR-066 비고의 emulator 기반 GCS 회귀(`STORAGE_EMULATOR_HOST` + fake-gcs-server)를 Tier 1에 편입 가능. 관련: [[ADR-065]](VRAM 자기-회계), [[ADR-066]](objstore 인증), 3O PR#39(false-done 교훈).
