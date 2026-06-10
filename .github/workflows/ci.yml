@@ -70,7 +70,8 @@ jobs:
           sudo apt-get install -y postgresql-common
           sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y
           sudo apt-get install -y postgresql-16 postgresql-server-dev-16 \
-              postgresql-16-pgvector gcc make
+              postgresql-16-pgvector gcc make \
+              libcurl4-openssl-dev libssl-dev   # daemon objstore client (curl/ssl)
 
       - name: Build + install (CPU shim, no CUDA)
         run: |
