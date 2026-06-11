@@ -2665,3 +2665,67 @@ realloc 무한 성장 — pointer-stability 위험, startup-fixed로 충분(`--m
 **ERROR 0** + 전 테넌트 쿼리 정확 + `pg_stat_gpu_cache` evictions=16/**reloads=10**(축출분이 GPU로
 재하이드레이션 = B 증명). 프로덕션 기본 1024 로그 확인. 회귀 무영향: installcheck 26/26 +
 isolation 3/3 GREEN. 관련: [[ADR-061]](전략), STRATEGY_NOTES §G.
+
+---
+
+## ADR-069 — 자원 거버넌스 원칙(어떤 레버가 무엇을 통제하나) + 확정 버그 3개
+
+**날짜**: 2026-06-11
+**상태**: ACCEPTED / 원칙 채택 + 버그 3개 수정 진행 (repo 공개 전 하드닝)
+
+### 배경
+
+"pg_cuvs가 `maintenance_work_mem`을 준수하나?"라는 질문에서 출발해 표준 PostgreSQL 레버
+전반의 준수 여부를 감사하고, 적대적 리뷰 2라운드(PG-시맨틱·운영-SRE·GPU-시스템 렌즈)로 정책 초안을
+검증했다. 두 라운드가 초기 가설("문제되는 host 자원을 표준 PG 레버로 천장 씌우자")을 상당 부분
+반증했고, 그 과정에서 **정책과 무관하게 코드로 확정된 버그 3개**가 드러났다.
+
+### 결정: 자원이 *실제 사는 곳*으로 강제 계층을 고른다
+
+표준 PG 레버는 **PG 자신의 enforcement 기계(fd.c temp 파일, MemoryContext palloc, executor 취소)를
+통과하는 자원만** 강제할 수 있다. pg_cuvs의 핵심 자원(memfd/shm 코퍼스, 데몬 host RAM, GPU VRAM,
+외부 아티팩트)은 전부 그 밖이다. 따라서:
+
+| 자원 | 진짜 enforcement 레버 | cuvs 자체 레버의 역할 |
+|------|----------------------|----------------------|
+| PG 기계 내부 (취소·병렬 grant·플래너·VACUUM) | 표준 PG 레버 — **이미 준수** | 없음, 유지 |
+| host RAM (코퍼스·데몬 배열) | **OS/cgroup** (`MemoryMax=`, `RLIMIT_AS`) | `cuvs.max_build_mem_mb`는 cgroup 벽 닿기 전 깨끗한 ERROR를 내는 soft fail-fast일 뿐(보증 아님). 대안: 코퍼스를 PG `BufFile`로 옮기면 `temp_file_limit`이 *진짜로* 적용 |
+| VRAM (빌드 scratch) | **reactive evict-and-retry** + RMM pool release-threshold cap | `cuvs.max_vram_per_gpu`는 soft admission floor, 예측 천장 아님 |
+| 정확성/복제 (아티팩트) | **백엔드가** `.tids` 헤더에 system_identifier+timeline 스탬프 + plan-time 검증(데몬은 백엔드 판정을 신뢰만) | timeline 불일치→ERROR(fail-closed); 부재→degrade+SQL-level WARNING |
+
+**철회(category error로 확정)**:
+- `maintenance_work_mem`-as-build-ceiling — 의미 불일치(scratch≠full materialization), 기본 64MB면
+  정상 빌드도 ERROR, per-backend라 system-wide 아님, 병렬 워커당 N배.
+- `temp_file_limit`-on-memfd/shm — PG의 `fd.c`가 이 fd들을 절대 못 봄. 노브가 거짓말을 함.
+
+### 확정 버그 3개 (코드 검증 완료, 이번에 수정)
+
+1. **VRAM 회계 누락** — `total_vram_used`(`pg_cuvs_server.c:560-582`)가 unsharded `main_bf_vram_bytes`,
+   sharded `shards[].bf_vram_bytes`를 합산 안 함 → eviction 과약정 → 빌드/검색 OOM. (IVF-PQ는
+   `vram_bytes`와 `ivfpq_vram_bytes`를 둘 다 set하므로 후자를 더하면 이중계상 — 주의.)
+2. **빌드 락 starvation** — `handle_build`/`build_sharded`가 `g_index_mutex`를 GPU 빌드(`cuvs_cagra_build`,
+   수 분)·디스크 I/O 내내 보유 → 그동안 모든 검색/통계/드롭 블록. 뮤텍스가 진짜 필요한 건 VRAM 회계와
+   registry swap뿐. → reservation-counter로 GPU 빌드 구간 언락.
+3. **빌드 OOM evict-retry 부재** — `cuvs_cagra_build` NULL(OOM 구분 불가) 시 즉시 BUILD_FAILED.
+   `estimate_vram_bytes`가 빌드 scratch를 빼므로 사전 `ensure_vram` 통과 후에도 OOM 가능. → OOM 신호
+   추가 + evict 후 1회 재시도(데몬 내부 한정).
+
+### 대안 기각
+
+- **데몬을 거버넌스 권위자로(admission control)**: 데몬은 PG 내부(pg_control/timeline)를 못 읽고, 코퍼스는
+  백엔드가 접촉 전 이미 할당하며, system_identifier는 standby에서 primary와 동일(클론). 새 IPC 왕복+lease+
+  TOCTOU 처리가 필요한 무거운 신규 설계 → 이번 미채택, 백로그.
+- **빌드 scratch를 정적 배수(3-10x)로 예측**: intermediate/graph degree·IVF-PQ vs NN-descent·AUTO 불투명,
+  cuVS에 peak 질의 API 없음 → 과거부+과소부 동시. reactive evict-retry가 정답(버그 #3).
+
+### 검증
+
+Tier-1 CPU shim(`make test-unit`, GPU 불필요)으로 VRAM 회계 산술·OOM evict-retry·빌드 락 보유시간을
+결정적으로 검증. 신규 `inject_build_oom` seam(`inject_extend_oom` 미러링). 회귀: 기존 installcheck/isolation
+무영향. 대형 항목(cgroup 가이드, scratch-aware admission, 백엔드 스탬프, corpus→BufFile, daemon host-bytes cap)은
+ROADMAP 트리거 백로그로 분리.
+
+### 후속
+
+관련: [[ADR-068]](MAX_INDEXES 소프트 LRU — 같은 eviction/회계 경로), [[ADR-065]](VRAM 자기-회계),
+[[ADR-057]](corpus 핸드오프). 보고서: `docs/reports/2026-06-11-resource-governance-audit.md`.
