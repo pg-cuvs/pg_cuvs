@@ -1,0 +1,122 @@
+# 세션 보고서 — 자원 거버넌스 감사 + 확정 버그 3개 수정
+
+| 항목 | 값 |
+|------|-----|
+| 날짜 | 2026-06-11 |
+| 범위 | 표준 PostgreSQL 레버 준수 감사 · 적대적 리뷰 2라운드 · 자원 거버넌스 정책(v3) · 확정 버그 3개 수정 |
+| 결과 | ADR-069 채택 + ROADMAP 등재 + 버그 3개 패치(PR #54) |
+| 검증 | Tier-1 `make test-unit` GREEN + 신규 SQL 회귀 3종(`vram_accounting`/`build_oom`/`build_lock`); 동시성·sharded는 Tier-2 후속 |
+
+---
+
+## 1. 요약 (TL;DR)
+
+"pg_cuvs가 `maintenance_work_mem`을 준수하나?"라는 질문에서 출발해 표준 PostgreSQL 레버 전반의
+준수 여부를 감사하고, 적대적 리뷰 2라운드로 정책 초안을 검증했다.
+
+- **핵심 결론**: 표준 PG 레버는 **PG 자신의 enforcement 기계(fd.c · MemoryContext · executor)를 통과하는
+  자원만** 강제할 수 있다. pg_cuvs의 핵심 자원(memfd/shm 코퍼스 · 데몬 host RAM · GPU VRAM · 외부 아티팩트)은
+  전부 그 밖이라, `maintenance_work_mem`/`temp_file_limit`로 통제하려는 시도는 **category error**다.
+  진짜 레버는 host RAM=**OS/cgroup**, VRAM=**reactive evict-retry**, 정확성=**백엔드 스탬프**다.
+- **부수 성과**: 정책과 무관하게 **코드로 확정된 버그 3개**(VRAM 회계 누락 · 빌드 락 starvation ·
+  빌드 OOM retry 부재)를 발견·수정했다. 데이터 안전/성능 등급.
+
+## 2. 배경 / 목표
+
+repo 공개 전 하드닝 맥락에서, 외부 운영자가 익숙한 PG 노브로 pg_cuvs의 자원을 통제할 수 있는지 물었다.
+감사는 "준수/미준수"의 단순 분류를 넘어, **어떤 레버가 무엇을 통제해야 하는가**라는 설계 원칙으로 확장됐다.
+
+## 3. 표준 레버 준수 현황 (감사)
+
+| 표준 레버 | 준수 | 근거 |
+|-----------|------|------|
+| `statement_timeout` / query cancel / `lock_timeout` | 준수 | 3S: IPC wait가 cancel 콜백으로 GPU 검색 중단 → `CHECK_FOR_INTERRUPTS` |
+| `max_parallel_maintenance_workers` | 준수 | ADR-034 §4A-2 병렬 CAGRA 빌드(자체 `CreateParallelContext`) |
+| 플래너 비용 (`enable_*`) | 준수 | `cuvsamcostestimate` (GPU-vs-CPU plan-time 라우팅 포함) |
+| VACUUM (`ambulkdelete`/`amvacuumcleanup`) | 준수 | 톰스톤 경로 + `.stale` 게이트 |
+| `maintenance_work_mem` | **미준수** | 자체 `cuvs.max_build_mem_mb` 사용 (의미 불일치) |
+| `temp_file_limit` | **미준수** | memfd/shm은 `fd.c` 밖 — PG가 강제 불가 |
+| `pg_stat_progress_create_index` | 미구현 | 장시간 CAGRA 빌드 진행률 미노출 |
+| `shared_buffers` (CAGRA 경로) | 미적용(의도) | 외부파일+GPU, 버퍼매니저 우회 |
+| `tablespace` (CAGRA 아티팩트) | 미준수 | `index_dir` GUC/reloption 사용 |
+
+`SnapshotAny` 병렬 스캔 "false negative" 주장은 **기각**(검증): `table_index_build_scan`이 튜플별 가시성을
+처리하는 표준 btree 패턴.
+
+## 4. 적대적 리뷰 2라운드 — 무엇이 철회/재정의됐나
+
+3개 렌즈(PG-시맨틱 · 운영-SRE · GPU-시스템)로 정책 초안을 공격하고, 비판자 주장도 코드로 적대적 검증했다.
+
+**철회(category error로 확정)**:
+- `maintenance_work_mem`-as-build-ceiling — scratch≠full materialization, 기본 64MB면 정상 빌드도 ERROR,
+  per-backend라 system-wide 아님, 병렬 워커당 N배.
+- `temp_file_limit`-on-memfd/shm — `fd.c`가 이 fd들을 절대 못 봄.
+
+**재정의**:
+- "데몬을 거버넌스 권위자로" → 데몬은 PG 내부(pg_control/timeline)를 못 읽고, system_identifier는 standby에서
+  primary와 동일(클론). admission은 새 IPC 왕복+lease+TOCTOU가 필요한 무거운 신규 설계 → 미채택, 백로그.
+- "빌드 scratch를 정적 배수(3-10x)로 예측" → cuVS에 peak 질의 API 없음 → reactive evict-retry가 정답.
+
+**비판자 과대주장 기각(코드 검증)**: `SnapshotAny` false-negative(표준 패턴), `amcanparallel` 미선언
+(pg_cuvs는 자체 `CreateParallelContext` 구동이라 무관).
+
+## 5. 최종 정책 v3 — 자원이 *사는 곳*으로 강제 계층 선택
+
+| 자원 | 진짜 enforcement 레버 | cuvs 자체 레버의 역할 |
+|------|----------------------|----------------------|
+| PG 기계 내부 (취소·병렬 grant·플래너·VACUUM) | 표준 PG 레버 — **이미 준수** | 없음, 유지 |
+| host RAM (코퍼스·데몬 배열) | **OS/cgroup** (`MemoryMax=`, `RLIMIT_AS`) | `cuvs.max_build_mem_mb`는 cgroup 벽 전 clean ERROR soft-layer. 대안: corpus→PG `BufFile`이면 `temp_file_limit` 진짜 적용 |
+| VRAM (빌드 scratch) | **reactive evict-and-retry** + RMM pool cap | `cuvs.max_vram_per_gpu`는 soft floor, 예측 천장 아님 |
+| 정확성/복제 (아티팩트) | **백엔드** `.tids` 스탬프(system_identifier+timeline) + plan-time 검증 | 불일치→ERROR(fail-closed); 부재→degrade+SQL WARNING |
+
+전문은 ADR-069. 대형 항목(cgroup 가이드·scratch-aware admission·백엔드 스탬프·corpus→BufFile·daemon
+host-bytes cap)은 ROADMAP 트리거 백로그.
+
+## 6. 확정 버그 3개 + 수정 (PR #54)
+
+### 6.1 VRAM 회계 누락 — `fix(vram)`
+- **증상**: `total_vram_used`(`pg_cuvs_server.c`)가 unsharded `main_bf_vram_bytes`, sharded
+  `shards[].bf_vram_bytes` 미합산 → eviction/admission 과약정 → 빌드/검색 OOM.
+- **수정**: 두 필드 합산. IVF-PQ `ivfpq_vram_bytes`는 `vram_bytes`와 중복 set이라 **제외**(이중계상 방지).
+- **검증**: `vram_accounting.sql` — CREATE INDEX 후(CAGRA only) vs brute_force 검색 후(CAGRA+BF) 스냅샷,
+  총량이 BF만큼 증가하는지.
+
+### 6.2 빌드 OOM evict-retry 부재 — `fix(build)`
+- **증상**: `cuvs_cagra_build` NULL(모든 실패 동일) 시 즉시 BUILD_FAILED. `estimate_vram_bytes`가 빌드
+  scratch를 빼므로 사전 `ensure_vram` 통과 후에도 OOM 가능.
+- **수정**: wrapper가 `std::bad_alloc`(RMM OOM 포함)을 `cuvs_last_build_was_oom()`로 신호 → 데몬이 evict 후
+  1회 재시도(eviction이 실제로 VRAM을 비운 경우만). `inject_build_oom` seam(opcode 20) 추가.
+- **검증**: `build_oom.sql` — victim 인덱스 상주 상태에서 OOM 1회 주입 → evict+retry 성공 + 인덱스 정상.
+
+### 6.3 빌드 락 starvation — `fix(build)`
+- **증상**: `handle_build`/`build_sharded`가 `g_index_mutex`를 GPU 빌드(수 분)+디스크 I/O 내내 보유 →
+  모든 검색/통계/드롭 블록.
+- **수정**: reservation-counter(`g_pending_build_vram`, `total_vram_used`가 합산)로 VRAM 예약 후 GPU 빌드
+  구간만 언락, 디스크 커밋은 락 유지(`finish_build_commit` 에러 경로 보존). 양 경로 적용.
+- **검증**: `build_lock.sql` — 빌드 정상 완료 + reservation no-leak(drop 후 VRAM 베이스라인 복귀).
+- **한계(정직)**: 동시성(starvation 부재)은 멀티클라이언트 부하 필요 → Tier-2. `build_sharded`는 single-GPU
+  shim으로 미검증 → Tier-2 멀티GPU 검증 권장.
+
+## 7. 교훈
+
+- **"표준 레버 준수"는 enforcement 경계로 판단한다.** 노브가 자원을 강제하지 못하면 "준수"는 무의미하고
+  오히려 거짓 안전감을 준다(`temp_file_limit`이 memfd/shm에 무력한 것처럼).
+- **적대적 검증은 양방향.** 비판자도 코드로 검증해야 한다 — `SnapshotAny`/`amcanparallel` 과대주장을 그대로
+  수용했으면 멀쩡한 코드를 "고칠" 뻔했다.
+- **예측보다 반응.** 예측 불가능한 자원(빌드 VRAM scratch)은 정적 추정 대신 reactive(evict-retry)가 옳다.
+
+## 8. 산출물 / 남은 것
+
+### 이번 세션
+- `design/DECISIONS.md` ADR-069 (정책 + 버그 3개)
+- `ROADMAP.md` — 버그 3개(순차) + 대형 거버넌스 항목(트리거 백로그)
+- PR #54 — 버그 3개 패치 + Tier-1 회귀 3종
+- 본 보고서
+
+### 남은 것 (트리거 백로그)
+- cgroup/systemd `MemoryMax=` 운영 가이드
+- scratch-aware VRAM admission (intermediate/graph degree 기반 또는 RMM pool cap)
+- 백엔드 아티팩트 스탬프(timeline/system_identifier) — standby/PITR fail-closed
+- corpus → PG `BufFile` 옵션 (`temp_file_limit` 적용)
+- daemon host-bytes cap + evict-on-host-pressure
+- 빌드 락 동시성 Tier-2 검증 + `build_sharded` 멀티GPU 검증
