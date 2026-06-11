@@ -4307,6 +4307,23 @@ handle_build(int client_fd, const CuvsCmdFrame *cmd)
                                                  (int)cmd->graph_degree,
                                                  (int)cmd->intermediate_graph_degree,
                                                  cmd->build_algo, target_gpu);
+    if (!new_handle && cuvs_last_build_was_oom())
+    {
+        /* ADR-069 Bug #3: the build hit a VRAM OOM. estimate_vram_bytes (used by
+         * the pre-build ensure_vram) does not cover CAGRA's build-time scratch,
+         * so admission can pass yet the build still OOM. Evict an LRU index to
+         * free room and retry once before failing. g_index_mutex is held, so
+         * evict_lru is safe here; only retry if eviction actually freed VRAM. */
+        if (evict_lru(target_gpu) > 0)
+        {
+            LOG_WARN("[handle_build] build OOM on GPU %d; evicted LRU, retrying once\n",
+                     target_gpu);
+            new_handle = cuvs_cagra_build(vecs, cmd->n_vecs, (int)cmd->dim, cmd->metric,
+                                          (int)cmd->graph_degree,
+                                          (int)cmd->intermediate_graph_degree,
+                                          cmd->build_algo, target_gpu);
+        }
+    }
     if (!new_handle)
     {
         LOG_ERROR("[handle_build] cuvs_cagra_build returned NULL\n");
@@ -6278,6 +6295,19 @@ handle_inject_extend_oom(int client_fd, const CuvsCmdFrame *cmd)
     send_all(client_fd, &ok, sizeof(ok));
 }
 
+/* handle_inject_build_oom — test helper (ADR-069 Bug #3): arm synthetic OOM for
+ * the next cmd->dim cuvs_cagra_build calls, so a test can exercise the daemon's
+ * evict-and-retry path deterministically. cmd->dim == 0 disarms. */
+static void
+handle_inject_build_oom(int client_fd, const CuvsCmdFrame *cmd)
+{
+    cuvs_set_inject_build_oom((int)cmd->dim);
+
+    CuvsReplyHeader ok = {0};
+    ok.status = CUVS_STATUS_OK;
+    send_all(client_fd, &ok, sizeof(ok));
+}
+
 /* ----------------------------------------------------------------
  * Per-connection thread
  * ---------------------------------------------------------------- */
@@ -6358,6 +6388,9 @@ connection_thread(void *arg)
             break;
         case CUVS_OP_INJECT_EXTEND_OOM:
             handle_inject_extend_oom(client_fd, &cmd);
+            break;
+        case CUVS_OP_INJECT_BUILD_OOM:
+            handle_inject_build_oom(client_fd, &cmd);
             break;
         case CUVS_OP_SEARCH_STREAM_BF:
             handle_search_stream_bf(client_fd, &cmd);
