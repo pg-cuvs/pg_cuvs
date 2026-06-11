@@ -12,7 +12,9 @@
 -- (CPU shim): cuvs_set_inject_build_oom is implemented in the shim too.
 \set ON_ERROR_STOP on
 CREATE EXTENSION IF NOT EXISTS vector;
+NOTICE:  extension "vector" already exists, skipping
 CREATE EXTENSION IF NOT EXISTS pg_cuvs;
+NOTICE:  extension "pg_cuvs" already exists, skipping
 SET cuvs.index_dir = '/tmp/cuvs_indexes';
 -- Victim index: resident LRU candidate for the retry to evict.
 CREATE TABLE boom_a (id int, embedding vector(8));
@@ -25,9 +27,9 @@ SELECT evictions AS e0 FROM pg_stat_gpu_cache WHERE gpu_device_id = 0 \gset
 -- Arm one build OOM: the next CREATE INDEX's first build fails, the daemon
 -- evicts the LRU (boom_a) and retries.
 SELECT pg_cuvs_inject_build_oom(1);
- pg_cuvs_inject_build_oom
+ pg_cuvs_inject_build_oom 
 --------------------------
-
+ 
 (1 row)
 
 CREATE TABLE boom_b (id int, embedding vector(8));
@@ -36,9 +38,9 @@ SELECT g, format('[0,%s,0,0,0,0,0,0]', (g * 0.1)::numeric(8,3))::vector
 FROM generate_series(1, 200) g;
 CREATE INDEX boom_b_idx ON boom_b USING cagra (embedding vector_l2_ops);
 SELECT pg_cuvs_inject_build_oom(0);
- pg_cuvs_inject_build_oom
+ pg_cuvs_inject_build_oom 
 --------------------------
-
+ 
 (1 row)
 
 -- The retried build is a working index: an exact (brute_force) self-query
@@ -47,7 +49,7 @@ SET cuvs.search_mode = 'brute_force';
 SELECT id FROM boom_b
 ORDER BY embedding <-> (SELECT embedding FROM boom_b WHERE id = 7)
 LIMIT 1;
- id
+ id 
 ----
   7
 (1 row)
@@ -55,7 +57,7 @@ LIMIT 1;
 -- The retry path evicted the LRU index at least once.
 SELECT evictions > :e0 AS bug3_evicted_and_retried
 FROM pg_stat_gpu_cache WHERE gpu_device_id = 0;
- bug3_evicted_and_retried
+ bug3_evicted_and_retried 
 --------------------------
  t
 (1 row)
