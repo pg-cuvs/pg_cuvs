@@ -4963,11 +4963,43 @@ handle_build_multi(int client_fd, const CuvsCmdFrame *cmd, const char *index_dir
             goto fail;
         }
 
+        /* ADR-069 Bug #2: reserve VRAM, then release the lock for the multi-H2D
+         * GPU build so concurrent searches/stats/drops aren't blocked. Partials
+         * (part_vecs/maps) are per-request, so reading them unlocked is safe;
+         * total_vram_used() counts g_pending_build_vram during the window. */
+        g_pending_build_vram[target_gpu] += needed;
+        pthread_mutex_unlock(&g_index_mutex);
+
         new_handle = cuvs_cagra_build_multi(part_vecs, n_each, nmapped, total,
                                             (int)cmd->dim, cmd->metric,
                                             (int)cmd->graph_degree,
                                             (int)cmd->intermediate_graph_degree,
                                             cmd->build_algo, target_gpu);
+        if (!new_handle && cuvs_last_build_was_oom())
+        {
+            /* ADR-069 Bug #3: VRAM OOM (scratch not covered by ensure_vram) —
+             * briefly retake the lock to evict an LRU index, then retry once. */
+            pthread_mutex_lock(&g_index_mutex);
+            int evicted = (evict_lru(target_gpu) > 0);
+            pthread_mutex_unlock(&g_index_mutex);
+            if (evicted)
+            {
+                LOG_WARN("[handle_build_multi] build OOM on GPU %d; evicted LRU, retrying once\n",
+                         target_gpu);
+                new_handle = cuvs_cagra_build_multi(part_vecs, n_each, nmapped, total,
+                                                    (int)cmd->dim, cmd->metric,
+                                                    (int)cmd->graph_degree,
+                                                    (int)cmd->intermediate_graph_degree,
+                                                    cmd->build_algo, target_gpu);
+            }
+        }
+
+        /* Reacquire for the durable-commit + registry tail (finish_build_commit
+         * expects the lock held). Release the reservation: on success the registry
+         * entry carries vram_bytes; on failure the VRAM is freed. */
+        pthread_mutex_lock(&g_index_mutex);
+        g_pending_build_vram[target_gpu] -= needed;
+
         if (!new_handle)
         {
             pthread_mutex_unlock(&g_index_mutex);
