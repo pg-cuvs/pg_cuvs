@@ -265,6 +265,12 @@ static uint64_t g_cache_evictions[CUVS_MAX_GPUS];
 static uint64_t g_cache_reloads[CUVS_MAX_GPUS];
 static uint64_t g_cache_persist_fail[CUVS_MAX_GPUS];
 
+/* ADR-069 Bug #2: VRAM reserved by in-flight builds that have released
+ * g_index_mutex for the (multi-minute) GPU build. The built index is not yet in
+ * g_indexes, so total_vram_used() adds this so concurrent admission/eviction
+ * still accounts for the build's VRAM. Mutated under g_index_mutex. */
+static size_t   g_pending_build_vram[CUVS_MAX_GPUS];
+
 /* Phase 3E: per-device GPU state. */
 static CuvsGpuDeviceInfo g_gpus[CUVS_MAX_GPUS];
 static int      g_n_gpus          = 0;
@@ -585,6 +591,10 @@ total_vram_used(int device_id)
             total += e->vram_bytes + e->delta_vram_bytes + e->main_bf_vram_bytes;
         }
     }
+    /* ADR-069 Bug #2: include VRAM reserved by in-flight builds on this device
+     * (released the mutex for the GPU build; not yet in g_indexes). */
+    if (device_id >= 0 && device_id < CUVS_MAX_GPUS)
+        total += g_pending_build_vram[device_id];
     return total;
 }
 
@@ -3764,6 +3774,7 @@ build_sharded(int client_fd, const CuvsCmdFrame *cmd, const char *index_dir,
     int     n_gpus = n_usable_gpus();
     int     ok     = 1;
     int     i      = 0;
+    int     n_reserved = 0;   /* ADR-069 Bug #2: shards with an active VRAM reservation */
     for (i = 0; i < sc; i++)
     {
         int64_t shard_n = base + (i < rem ? 1 : 0);
@@ -3832,6 +3843,16 @@ build_sharded(int client_fd, const CuvsCmdFrame *cmd, const char *index_dir,
 
         off += shard_n;
     }
+
+    /* ADR-069 Bug #2: builds done (or aborted) — release every shard reservation.
+     * The lock is held continuously from here through the registry insert below,
+     * so the shards' VRAM is accounted by the registry entry (success) or freed
+     * (error paths) at the next unlock; no reservation must outlive this point.
+     * shards[r].gpu_device_id/vram_bytes were set before each build, so this also
+     * covers a shard whose build failed. */
+    for (int r = 0; r < n_reserved; r++)
+        g_pending_build_vram[shards[r].gpu_device_id] -= shards[r].vram_bytes;
+    n_reserved = 0;
 
     /* Phase 3L: persist one global `.vectors` sidecar (same build-order layout
      * as the global `.tids`) while `vecs` is still mapped. Per-shard BF indexes
@@ -4301,6 +4322,14 @@ handle_build(int client_fd, const CuvsCmdFrame *cmd)
         return;
     }
 
+    /* ADR-069 Bug #2: reserve the VRAM, then release g_index_mutex for the
+     * multi-minute GPU build so concurrent searches/stats/drops are not blocked.
+     * total_vram_used() counts g_pending_build_vram, so concurrent admission and
+     * eviction stay correct while we build unlocked. vecs/mem are per-request
+     * (not shared state), so reading them unlocked is safe. */
+    g_pending_build_vram[target_gpu] += needed;
+    pthread_mutex_unlock(&g_index_mutex);
+
     LOG_DEBUG("[handle_build] calling cuvs_cagra_build n_vecs=%lld dim=%u gpu=%d...\n",
             (long long)cmd->n_vecs, cmd->dim, target_gpu);
     CuvsCagraIndex new_handle = cuvs_cagra_build(vecs, cmd->n_vecs, (int)cmd->dim, cmd->metric,
@@ -4309,12 +4338,13 @@ handle_build(int client_fd, const CuvsCmdFrame *cmd)
                                                  cmd->build_algo, target_gpu);
     if (!new_handle && cuvs_last_build_was_oom())
     {
-        /* ADR-069 Bug #3: the build hit a VRAM OOM. estimate_vram_bytes (used by
-         * the pre-build ensure_vram) does not cover CAGRA's build-time scratch,
-         * so admission can pass yet the build still OOM. Evict an LRU index to
-         * free room and retry once before failing. g_index_mutex is held, so
-         * evict_lru is safe here; only retry if eviction actually freed VRAM. */
-        if (evict_lru(target_gpu) > 0)
+        /* ADR-069 Bug #3: build hit a VRAM OOM (estimate excludes build scratch).
+         * Briefly retake the lock to evict an LRU index, then retry once unlocked.
+         * Only retry if eviction actually freed VRAM. */
+        pthread_mutex_lock(&g_index_mutex);
+        int evicted = (evict_lru(target_gpu) > 0);
+        pthread_mutex_unlock(&g_index_mutex);
+        if (evicted)
         {
             LOG_WARN("[handle_build] build OOM on GPU %d; evicted LRU, retrying once\n",
                      target_gpu);
@@ -4324,6 +4354,13 @@ handle_build(int client_fd, const CuvsCmdFrame *cmd)
                                           cmd->build_algo, target_gpu);
         }
     }
+
+    /* Reacquire for the durable-commit + registry tail (finish_build_commit
+     * expects the lock held). Release the build reservation now: on success the
+     * registry entry below carries vram_bytes; on failure the VRAM is freed. */
+    pthread_mutex_lock(&g_index_mutex);
+    g_pending_build_vram[target_gpu] -= needed;
+
     if (!new_handle)
     {
         LOG_ERROR("[handle_build] cuvs_cagra_build returned NULL\n");
