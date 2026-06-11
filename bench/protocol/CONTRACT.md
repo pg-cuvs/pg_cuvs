@@ -143,3 +143,33 @@ est_total, est_rows, chosen, measured_ref`.
 4. `concurrency: { group: gpu-singleton, cancel-in-progress: false }`.
 5. 워크플로우 파일은 **default 브랜치(main)에 존재**해야 웹이 API로 dispatch 가능.
 6. conda 활성화 + `CUVS_INDEX_DIR` 등 runner 환경은 step에서 세팅 후 `run.sh` 호출.
+
+---
+
+## 9. VM 환경 (engines) — `_common.sh` 기본값
+
+`engines/<config>.sh`는 conda 활성화 후 `runner.py`를 exec한다. VM 사실(issue #56)을
+기본값으로 두고 bench.yml env로 override 가능:
+
+| env | 기본값 (pg-cuvs-dev) | 용도 |
+|-----|----------------------|------|
+| `PGCUVS_CONDA` / `PGCUVS_ENV` | `~/miniforge3` / `cuvs_py` | numpy+psycopg+pgvector(+GPU) |
+| `PGCUVS_CORPUS` | `~/anbench/data/corpus.fbin` | 적재 corpus |
+| `PGCUVS_QUERIES` | `~/anbench/data/queries_10k.fbin` | 쿼리셋 |
+| `PGCUVS_GT_DIR` | `~/anbench/data` | `gt_<N>.npy` 조회 |
+| `CUVS_INDEX_DIR` | `/tmp/cuvs_indexes` | **데몬 `--index-dir`와 일치 필수** (§아래) |
+| `PGDATABASE` | `bench` | 작업 DB |
+| `PGCUVS_INSTANCE_TYPE` / `PGCUVS_PRICE_USD_HR` | (없음) | CSV 경제 컬럼 |
+
+데몬 pid는 `systemctl show -p MainPID --value pg-cuvs-server`로 발견 → `ResourceSampler(daemon_pid=)`에
+주입(host RSS 합산).
+
+### cuvs 플랜 가드 (issue #56 — 치명적)
+`forced-cuvs`/`auto`는 세션마다 `SET cuvs.index_dir='<daemon --index-dir>'` **필수**. 불일치 시
+backend가 `$PGDATA/cuvs_indexes`를 보고 아티팩트를 못 찾아 **조용히 Seq Scan 폴백**(GPU 없음·에러
+없음) → pg_cuvs를 처참히 느린 것으로 오측정. `runner.py`는 빌드 후 **EXPLAIN으로 cagra 인덱스
+사용(≠Seq Scan)을 단언**하고, 실패 시 셀을 fail(잘못된 행을 쓰지 않음).
+
+### GT 가용성
+`runner.py`는 `gt_<N>.npy`를 요구한다. 현재 준비됨: N∈{20000,100000,1000000}. **N∈{1k,10k}는
+`infra/anbench/build_gt.py`로 선빌드 필요**(거친 격자의 교차구간 10k 포함).
