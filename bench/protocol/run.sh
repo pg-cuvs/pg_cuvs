@@ -2,12 +2,14 @@
 # run.sh — single entry point for the benchmark protocol harness.
 #
 # Contract: bench/protocol/CONTRACT.md. Config comes from env (CONTRACT §2).
-# This script writes ONLY under results/protocol/ — git push is the workflow's job.
-#
-# STATE: dispatch skeleton. The actual measurement (resource sampling + engine
-# build/query + CONTRACT §6 CSV row) is delegated to observe.py + engines/<config>.sh
-# at the SEAM marked below. Until observe.py lands, PGCUVS_CPU_SHIM=1 exercises the
-# plumbing end-to-end (enumeration, resume, dry-run, terminal marker, CSV shape).
+# Boundary (reconciled with observe.py, issue #56):
+#   * observe.py (infra/anbench)  → resource sampling + protocol-CSV writer
+#     (PROTOCOL_FIELDS is the CSV source of truth; header written once).
+#   * the per-engine python runner → imports observe, wraps build/query in
+#     `with ResourceSampler(...)`, then write_protocol_row(...). CSV write
+#     happens INSIDE the runner, never here.
+#   * run.sh (this file)          → cell expansion, dispatch, resume, dry-run,
+#     engines/<config>.sh calls, PGCUVS_RESULT marker. It does NOT write the CSV.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -30,15 +32,12 @@ CPU_SHIM="${PGCUVS_CPU_SHIM:-0}"
 COST_MODEL_VERSION="${PGCUVS_COST_MODEL_VERSION:-unset}"
 RUNTIME_ROUTING_VERSION="${PGCUVS_RUNTIME_ROUTING_VERSION:-unset}"
 
-OUTDIR="$RESULTS_ROOT/$STAGE"
-CSV="$OUTDIR/$RUN_ID.csv"
-PROGRESS="$OUTDIR/$RUN_ID.progress"
-MANIFEST="$OUTDIR/$RUN_ID.manifest.json"
-mkdir -p "$OUTDIR"
-
-# CONTRACT §6 schema — SINGLE SOURCE here. MUST stay identical to observe.py's
-# writer when it lands (reconcile to one definition then).
-CSV_HEADER="run_id,date,stage,phase,cell_id,config,system,system_version,system_commit,index_type,N,dim,k,recall_target,dataset,query_set_id,seed,clients,warm_state,build_s,qps,p50_us,p95_us,p99_us,p999_us,avg_latency_us,recall_at_k,peak_vram_mb,peak_rss_mb,cpu_core_s,gpu_s,energy_j,disk_bytes_written,wal_bytes,index_bytes_vram,index_bytes_host,index_bytes_disk,instance_type,price_usd_hr,usd_per_1m_queries,reps,agg_method,dispersion,gt_method,cost_model_version,runtime_routing_version,selectivity,correlation,filter_mode,stream_op,ops_done,delta_rows,params_json,notes"
+# observe.protocol_path convention: <base>/<stage>.csv (append-only, run_id col).
+# progress/manifest are per-run-id siblings (resume tracks ONE run's measurements).
+CSV="$RESULTS_ROOT/$STAGE.csv"
+PROGRESS="$RESULTS_ROOT/$STAGE.$RUN_ID.progress"
+MANIFEST="$RESULTS_ROOT/$STAGE.$RUN_ID.manifest.json"
+mkdir -p "$RESULTS_ROOT"
 
 log(){ echo "[run.sh] $*" >&2; }
 
@@ -59,8 +58,7 @@ if [ "$DRY_RUN" = "1" ]; then
   exit 0
 fi
 
-# ── init outputs + resume ────────────────────────────────────────────────────
-[ -f "$CSV" ] || echo "$CSV_HEADER" > "$CSV"
+# ── resume ledger ────────────────────────────────────────────────────────────
 touch "$PROGRESS"
 declare -A DONE=()
 if [ "$RESUME" = "1" ]; then
@@ -69,9 +67,8 @@ if [ "$RESUME" = "1" ]; then
 fi
 
 write_manifest(){
-  # SEAM: observe.py owns the rich manifest (pg_settings non-default dump, pg_cuvs
-  # sha / cuVS / CUDA / driver versions, gt_method, terminal status — CONTRACT §3).
-  # Placeholder until observe.py lands: env snapshot only.
+  # Dispatch-level metadata (env snapshot). The richer pg_settings/version dump
+  # is folded in by the runner/observe path when measurements run.
   cat > "$MANIFEST" <<EOF
 {
   "run_id": "$RUN_ID", "stage": "$STAGE", "module": "$MODULE",
@@ -79,8 +76,7 @@ write_manifest(){
   "cpu_shim": $CPU_SHIM,
   "cost_model_version": "$COST_MODEL_VERSION",
   "runtime_routing_version": "$RUNTIME_ROUTING_VERSION",
-  "started": "$(date -u +%Y-%m-%dT%H:%M:%SZ)", "total": $TOTAL,
-  "_note": "placeholder manifest — observe.py replaces with full env/version dump"
+  "csv": "$CSV", "started": "$(date -u +%Y-%m-%dT%H:%M:%SZ)", "total": $TOTAL
 }
 EOF
 }
@@ -88,29 +84,29 @@ write_manifest
 
 measure(){
   local cell_id="$1" config="$2"
-  # ══════════════════════════ SEAM ══════════════════════════
-  # Real path (observe.py landed):
-  #   observe.py samples nvidia-smi (device-delta VRAM) + /usr/bin/time + power.draw,
-  #   invokes engines/<config>.sh to build+query under iso-recall, and appends a
-  #   CONTRACT §6 row to $CSV. run.sh stays the dispatcher; observe.py owns CSV+sampling.
-  # Until then, CPU_SHIM emits a syntactically valid placeholder row so the plumbing
-  # is end-to-end testable without GPU/PG.
-  # ═══════════════════════════════════════════════════════════
+  # CPU-shim: a tiny python runner exercises observe.write_protocol_row so the
+  # plumbing (dispatch → observe CSV writer) is testable without GPU/PG.
   if [ "$CPU_SHIM" = "1" ]; then
-    local n d k r
-    n="${cell_id#N}"; n="${n%%_*}"
-    d="$(sed -n 's/.*_d\([0-9]*\)_.*/\1/p' <<<"$cell_id")"
-    k="$(sed -n 's/.*_k\([0-9]*\)_.*/\1/p' <<<"$cell_id")"
-    r="${cell_id##*_r}"
-    # one row per CONTRACT §6 column order; zeros/empties for unmeasured fields
-    printf '%s,%s,%s,query,%s,%s,shim,0,0,shim,%s,%s,%s,%s,%s,q,0,1,warm,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,shim,0,0,%s,shim,0,shim,%s,%s,,,,,,,{},cpu-shim-placeholder\n' \
-      "$RUN_ID" "$(date -u +%F)" "$STAGE" "$cell_id" "$config" \
-      "$n" "$d" "$k" "$r" "$DATASET" "$REPS" \
-      "$COST_MODEL_VERSION" "$RUNTIME_ROUTING_VERSION" >> "$CSV"
-    return 0
+    python3 "$LIB/shim_runner.py" \
+      --csv "$CSV" --stage "$STAGE" --cell "$cell_id" --config "$config" \
+      --dataset "$DATASET" --run-id "$RUN_ID" \
+      --cost-model-version "$COST_MODEL_VERSION" \
+      --runtime-routing-version "$RUNTIME_ROUTING_VERSION"
+    return $?
   fi
-  log "ERROR: real measurement path not wired yet (observe.py pending). cell=$cell_id config=$config"
-  return 3
+  # ══════════════════════════ SEAM (real) ══════════════════════════
+  # engines/<config>.sh activates the right conda env and calls the adapted
+  # python runner (imports observe → ResourceSampler + write_protocol_row).
+  local eng="$HERE/engines/${config}.sh"
+  if [ ! -x "$eng" ]; then
+    log "ERROR: engine '$config' not wired ($eng missing). observe.py vendored; engines pending."
+    return 3
+  fi
+  CSV="$CSV" RUN_ID="$RUN_ID" CELL_ID="$cell_id" STAGE="$STAGE" \
+  DATASET="$DATASET" REPS="$REPS" BASELINE="$BASELINE" \
+  COST_MODEL_VERSION="$COST_MODEL_VERSION" \
+  RUNTIME_ROUTING_VERSION="$RUNTIME_ROUTING_VERSION" \
+    "$eng" "$cell_id"
 }
 
 # ── main loop: per-cell-per-config atomic unit (CONTRACT §3) ──────────────────

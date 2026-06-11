@@ -9,22 +9,32 @@
 ## 1. 디렉터리 / 진입점
 
 ```
+infra/anbench/observe.py          # 자원 샘플러 + protocol-CSV 라이터 (import 모듈)
 bench/protocol/
-  run.sh                  # 단일 진입점. 워크플로우는 이것만 호출
+  run.sh                  # 단일 진입점. 워크플로우는 이것만 호출 (CSV 안 씀)
   lib/
     resolve_cells.sh      # env → cell 목록 전개
-    collect.sh            # phase별 자원 수집(VRAM/RSS/core-s/GPU-s/J) 래퍼
+    shim_runner.py        # CPU-shim 자리표시 측정(observe 경유 1행 기록)
     setup_tables.sh       # per-engine 테이블 생성/적재 (§4)
-    engines/{hnsw,cuvs,seqscan,bf}.sh
+  engines/{forced-hnsw,forced-cuvs,auto,forced-seqscan,forced-bf}.sh
 results/protocol/
-  <stage>/<run_id>.csv            # §6 스키마, append-only, 행 완결
-  <stage>/<run_id>.manifest.json  # env·pg_settings·버전·gt_method·터미널 상태
-  <stage>/<run_id>.progress       # 완료 cell_id 목록 (resume용)
+  <stage>.csv                     # §6 스키마, append-only, run_id 컬럼 (observe.protocol_path)
+  <stage>.<run_id>.progress       # 완료 cell|config 목록 (resume용)
+  <stage>.<run_id>.manifest.json  # env 스냅샷 + 버전/gt_method
   planner_est/<run_id>.csv        # Stage B 전용 (BENCHMARK_PROTOCOL §6.2)
 ```
 
-`run.sh`는 **`results/protocol/` 밑 파일만 쓴다. git은 절대 안 건드림** → push는 워크플로우(로컬)가.
-자격증명이 스크립트로 새지 않는다.
+**경계 (observe.py 정합, issue #56):**
+- **`observe.py`**(infra/anbench) = 자원 샘플링(`ResourceSampler`) + protocol-CSV 라이터
+  (`write_protocol_row`). `PROTOCOL_FIELDS`가 **CSV 단일 진실**. 별도 `collect.sh` 없음.
+- **per-engine 러너**(적응된 `run_pg.py`, `engines/<config>.sh`가 호출) = observe를 import,
+  `with ResourceSampler(...)`로 실제 build/query를 감싸고 `write_protocol_row(...)` 호출.
+  **CSV 쓰기는 러너 안**, run.sh가 아니다.
+- **`run.sh`** = cell 전개 · 디스패치 · resume(`.progress`) · dry-run · `engines/<config>.sh` 호출 ·
+  `PGCUVS_RESULT` 마커. **CSV를 직접 쓰지 않는다.**
+
+산출물은 **`results/protocol/` 밑만** 생성. git push는 워크플로우(로컬)가 — 자격증명이 스크립트로
+새지 않는다.
 
 ---
 
@@ -53,11 +63,12 @@ results/protocol/
 
 ## 3. 출력 계약
 
-- **셀 1개 = 원자 단위**. 셀 완료 시: CSV 행 append → `.progress`에 cell_id append → **fsync**.
-  중간에 죽으면 `PGCUVS_RESUME=1` 재dispatch로 이어감(멱등).
+- **셀×config 1개 = 원자 단위**. 완료 시: 러너가 `observe.write_protocol_row`로 CSV 행 append →
+  run.sh가 `.progress`에 `cell|config` append → **fsync**. 중간에 죽으면 `PGCUVS_RESUME=1`
+  재dispatch로 이어감(멱등). 러너 비호출(shim 제외) 시 run.sh는 CSV를 만지지 않는다.
 - **종료 마커**를 stdout 마지막 줄에:
   `PGCUVS_RESULT: status=OK|FAIL|OOM cells_done=N/M` → 웹의 로그읽기+웹훅 진단용.
-- **manifest** (`<run_id>.manifest.json`): env 스냅샷 + `SELECT name,setting FROM pg_settings
+- **manifest** (`<stage>.<run_id>.manifest.json`): env 스냅샷 + `SELECT name,setting FROM pg_settings
   WHERE source<>'default'` 덤프 + 버전(pg_cuvs sha·cuVS·CUDA·드라이버) + dataset + `gt_method` +
   start/end + 터미널 상태. → BENCHMARK_PROTOCOL §12 재현성 자동 충족.
 
@@ -84,15 +95,17 @@ results/protocol/
 
 ## 5. iso-recall 등화 (config별 노브 sweep)
 
-`run.sh`는 각 (N, recall) 셀에서 엔진 노브를 sweep해 target 만족 **최소값**을 채택한다
-(`ef_search`/`probes`/`cuvs.k`). 상한 미달이면 달성 recall 병기 + 미달 표기.
+엔진 러너(`engines/<config>.sh`→python)가 각 (N, recall) 셀에서 노브를 sweep해 target 만족
+**최소값**을 채택한다(`ef_search`/`probes`/`cuvs.k`). 상한 미달이면 달성 recall 병기 + 미달 표기.
 BF 모드는 recall=1.0 — 등화 없이 별도 행. 상세 BENCHMARK_PROTOCOL §3.3.
 
 ---
 
 ## 6. 결과 CSV 스키마
 
-BENCHMARK_PROTOCOL §4 스키마를 그대로 따른다(행 완결, append-only):
+**단일 진실 = `infra/anbench/observe.py`의 `PROTOCOL_FIELDS`** (BENCHMARK_PROTOCOL §4와 동일).
+헤더/순서는 그 리스트가 결정하며 `observe.write_protocol_row`가 RFC-4180(CRLF)로 기록한다.
+아래는 참조용 복제:
 
 ```
 run_id, date, stage, phase, cell_id, config,
