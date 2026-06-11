@@ -34,11 +34,15 @@ CREATE INDEX vram_acct_idx ON vram_acct USING cagra (embedding vector_l2_ops);
 -- Snapshot 1: CAGRA resident, no BF index yet.
 SELECT vram_used_mb AS v1 FROM pg_stat_gpu_cache WHERE gpu_device_id = 0 \gset
 
+-- Capture a query vector as a literal so the index (GPU path) is used; a
+-- subquery operand would prevent the index scan and skip the BF build.
+SELECT embedding::text AS qv FROM vram_acct WHERE id = 1 \gset
+
 -- Force a brute-force search -> daemon (re)builds the resident main BF index.
 SET cuvs.search_mode = 'brute_force';
 SELECT count(*) FROM (
     SELECT id FROM vram_acct
-    ORDER BY embedding <-> (SELECT embedding FROM vram_acct WHERE id = 1)
+    ORDER BY embedding <-> :'qv'::vector
     LIMIT 5
 ) s;
 

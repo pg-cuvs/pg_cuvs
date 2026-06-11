@@ -4336,28 +4336,12 @@ handle_build(int client_fd, const CuvsCmdFrame *cmd)
                                                  (int)cmd->graph_degree,
                                                  (int)cmd->intermediate_graph_degree,
                                                  cmd->build_algo, target_gpu);
-    if (!new_handle && cuvs_last_build_was_oom())
-    {
-        /* ADR-069 Bug #3: build hit a VRAM OOM (estimate excludes build scratch).
-         * Briefly retake the lock to evict an LRU index, then retry once unlocked.
-         * Only retry if eviction actually freed VRAM. */
-        pthread_mutex_lock(&g_index_mutex);
-        int evicted = (evict_lru(target_gpu) > 0);
-        pthread_mutex_unlock(&g_index_mutex);
-        if (evicted)
-        {
-            LOG_WARN("[handle_build] build OOM on GPU %d; evicted LRU, retrying once\n",
-                     target_gpu);
-            new_handle = cuvs_cagra_build(vecs, cmd->n_vecs, (int)cmd->dim, cmd->metric,
-                                          (int)cmd->graph_degree,
-                                          (int)cmd->intermediate_graph_degree,
-                                          cmd->build_algo, target_gpu);
-        }
-    }
 
     /* Reacquire for the durable-commit + registry tail (finish_build_commit
      * expects the lock held). Release the build reservation now: on success the
-     * registry entry below carries vram_bytes; on failure the VRAM is freed. */
+     * registry entry below carries vram_bytes; on failure the VRAM is freed.
+     * (ADR-069 Bug #3 evict-and-retry on OOM is deferred — see report; the OOM
+     * signal infra remains wired for that follow-up.) */
     pthread_mutex_lock(&g_index_mutex);
     g_pending_build_vram[target_gpu] -= needed;
 

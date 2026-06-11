@@ -18,6 +18,9 @@ CREATE EXTENSION IF NOT EXISTS vector;
 CREATE EXTENSION IF NOT EXISTS pg_cuvs;
 
 SET cuvs.index_dir = '/tmp/cuvs_indexes';
+-- Exercise the single-process build path (handle_build), where the Bug #2
+-- reservation/unlock lives.
+SET max_parallel_maintenance_workers = 0;
 
 -- VRAM baseline (counters are cumulative across the regression DB).
 SELECT vram_used_mb AS base FROM pg_stat_gpu_cache WHERE gpu_device_id = 0 \gset
