@@ -39,10 +39,10 @@
 
 | Phase | 내용 | 트랙 |
 |-------|------|------|
-| fallback 관측성 · circuit breaker 전역화 · SQL latency split | 운영 하드닝 잔여 | 트리거 |
+| circuit breaker 전역화 · SQL latency split | 운영 하드닝 잔여 (fallback 관측성은 PR #43 완료) | 트리거 |
 | ~~MAX_INDEXES 상향/동적화 + 런타임-축출 auto-reload~~ [OK] | 다중 테넌트 파티션 온라인-스케일 선결. 측정·근거 ADR-061 / STRATEGY_NOTES §G | **완료** (ADR-068): 레지스트리를 *하드월*→*소프트 LRU 캡*으로 전환 — `--max-indexes`(기본 1024, was 64, calloc) + `load_index` 슬롯-확보 eviction(auto-reload 배선) + build 경로 graceful defer. `gpu-test-maxidx`: cap 4에 10테넌트 빌드 ERROR 0 + 전 테넌트 쿼리 GPU reload(evict=16/reload=10). installcheck 26/26 |
 | 3N | OFFSET-aware K 자동 조정 (ORM pagination 호환) | 트리거 (ORM 요구) |
-| fp16 입력 | float16 벡터 입력으로 VRAM ~50% 절감 — `WITH (precision=fp16)` reloption, cuVS C API 지원 확인 필요 | 트리거 (cuVS fp16 지원 확인) |
+| fp16 CAGRA reloption | BF용 fp16은 **3L `cuvs.bf_precision` 완료·출고**(`cuvs_wrapper.cu` device fp16 사본, BF VRAM 절반). 잔여 = CAGRA `WITH (precision=fp16)` reloption 표면만. cuVS C API fp16은 BF에서 실증돼 **트리거 충족** | 트리거 (수요 시 즉시 착수) |
 
 ---
 
@@ -52,7 +52,31 @@
 
 ### 릴리스 후 기능 (순차)
 
-> **3A Pending Delta는 완료**(완료 표 참조). streaming write(INSERT/UPDATE/DELETE) 후 REINDEX 없이 GPU+delta 병합으로 정합한 top-k를 반환한다. 3L `CuvsBfIndex`를 3A-2 GPU delta cache가 재사용. 상세 스펙·검증은 [design/PLAN.md — Phase 3A](design/PLAN.md), 결정은 ADR-047. **4A(빌드 오버헤드)·3R(빌드 파라미터 reloption)도 완료**(완료 표 참조; 4A=ADR-057/058/059, 3R=ADR-052), **3S(취소 전파)도 완료**(ADR-053), **D(exact filtered BF)도 완료**(ADR-063, 잔여 4항목 포함), **3O(CAGRA-first BITSET prefilter)도 완료**(ADR-048, PR #36/#37), **3Q(CAGRA Streaming Updates)도 완료**(ADR-051, installcheck 21/21), **4C(Background Compaction)도 완료**(ADR-050, installcheck 22/22 + isolation 3/3), **3C/3D(GCS snapshot + replica async warmup)도 완료·인증**(ADR-013/ADR-066, 실 GCS round-trip `make gpu-test-objstore`, installcheck 25/25 + isolation 3/3) — 기능 순차 경로 완료. **repo 공개 전 운영 하드닝 3종(fallback 관측성=PR #43 · VRAM budget 강제=ADR-065 해소 · OOM 후 재사용=PR #42)도 완료**. **MAX_INDEXES 하드월도 해소**(ADR-068, PR — 소프트 LRU 캡 `--max-indexes` 기본 1024 + 슬롯-확보 auto-reload). **다음 순차 작업: 릴리스 준비**(README 정비 · `BENCHMARK.md` 공개 · CI GPU 전략 확정=ADR-067 — "에코시스템 진입 계획" 전제조건 참조). **릴리스 후 순차: 엄밀 벤치마크 + 코스트모델 보정**(ADR-069, [design/BENCHMARK_PROTOCOL.md](design/BENCHMARK_PROTOCOL.md) — Stage A 물리 실측 → Stage B regret 보정 루프 → 동결 → 필터/증분/Pareto 스위트. 논문 트랙 R1–R5는 별도 일정).
+> **3A Pending Delta는 완료**(완료 표 참조). streaming write(INSERT/UPDATE/DELETE) 후 REINDEX 없이 GPU+delta 병합으로 정합한 top-k를 반환한다. 3L `CuvsBfIndex`를 3A-2 GPU delta cache가 재사용. 상세 스펙·검증은 [design/PLAN.md — Phase 3A](design/PLAN.md), 결정은 ADR-047. **4A(빌드 오버헤드)·3R(빌드 파라미터 reloption)도 완료**(완료 표 참조; 4A=ADR-057/058/059, 3R=ADR-052), **3S(취소 전파)도 완료**(ADR-053), **D(exact filtered BF)도 완료**(ADR-063, 잔여 4항목 포함), **3O(CAGRA-first BITSET prefilter)도 완료**(ADR-048, PR #36/#37), **3Q(CAGRA Streaming Updates)도 완료**(ADR-051, installcheck 21/21), **4C(Background Compaction)도 완료**(ADR-050, installcheck 22/22 + isolation 3/3), **3C/3D(GCS snapshot + replica async warmup)도 완료·인증**(ADR-013/ADR-066, 실 GCS round-trip `make gpu-test-objstore`, installcheck 25/25 + isolation 3/3) — 기능 순차 경로 완료. **repo 공개 전 운영 하드닝 3종(fallback 관측성=PR #43 · VRAM budget 강제=ADR-065 해소 · OOM 후 재사용=PR #42)도 완료**. **MAX_INDEXES 하드월도 해소**(ADR-068, PR #45 — 소프트 LRU 캡 `--max-indexes` 기본 1024 + 슬롯-확보 auto-reload; PR #50 Tier-1 evict/reload 가드). **CI 2-tier도 구현·검증 완료**(ADR-067, PR #46–48/#50 — Tier 1 매 PR 자동 + Tier 2 UI 버튼 실 A100 26/26). README도 현재화 완료(Install/Requirements/Compatibility/Quickstart/Usage). 라이선스는 **PostgreSQL License**로 확정. **다음 순차 작업: 릴리스 준비 — `BENCHMARK.md` 공개 · 문서 정합성/현행화 · 운영 플레이북 완성**(아래 "릴리스 준비 — 문서·운영 정비" 절; "에코시스템 진입 계획" 전제조건 참조). **릴리스 준비 후 순차: 엄밀 벤치마크 + 코스트모델 보정**(ADR-069, [design/BENCHMARK_PROTOCOL.md](design/BENCHMARK_PROTOCOL.md) — Stage A 물리 실측 → Stage B regret 보정 루프 → 동결 → 필터/증분/Pareto 스위트. 논문 트랙 R1–R5는 별도 일정).
+
+### 릴리스 준비 — 문서·운영 정비 (순차)
+
+> repo가 PUBLIC이 된 지금, 외부 사용자·기여자·운영자가 **현행 제품을 ADR 발굴 없이** 이해·운용할 수 있어야 한다. 현 문서는 ADR 69개(`DECISIONS.md` 214KB) + `PLAN.md`(1523줄) + 분산 design/docs로 **역사적 근거·작업메모 누적**에 가까워, 현재 제품의 기능·아키텍처·적용 기법·고려사항을 일목요연하게 볼 단일 reference가 없다(README가 유일 개요).
+
+- **문서 정합성/현행화 (current-state reference 정비)**
+  - `ARCHITECTURE.md`(신규): 현행 컴포넌트(확장 `.so` / sidecar 데몬 / shmem IPC), 데이터·제어 흐름, 인덱스 생애주기(build→serialize→load→evict→reload), VRAM 자기-회계, 멀티-GPU 샤딩, GCS 스냅샷.
+  - 기능/능력 reference: 현존 검색 모드·인덱스 AM(cagra/ivfpq/hnsw/BF)·GUC·reloption 일람 통합(현재 PLAN/ADR/README 분산).
+  - 적용 기법·고려사항 요약: 비자명 엔지니어링 — BITSET 극성 규약, rev-map prefilter(3O), fail-closed 계약, VRAM 자기-회계(ADR-065), delta/tombstone 병합, CPU-reference shim CI, false-done 방지 원칙.
+  - 문서 맵: ADR/PLAN = "역사적 근거", reference = "현행 SSOT"로 명확히 구분. drift(`SPEC.md` 등) reconcile.
+  - **완료 기준**: 외부 기여자/사용자가 reference 문서군만으로 "무엇을·어떻게·왜"를 ADR 발굴 없이 파악. 문서 맵이 현행 vs 역사를 구분.
+
+- **운영 플레이북 완성 (`design/OPS_GPU_PLAYBOOK.md` 단일화)**
+  - 현황: OPS_GPU_PLAYBOOK(331줄)은 GPU 튜닝 + MIG만 다룸. `docs/playbooks/`에 3종(replica-bootstrap·capacity-planning·benchmark-runbook); **release-upgrade 런북 부재**.
+  - 작업: 운영 생애주기 전반 단일화 — 기동·모니터링(어느 `pg_stat_gpu_*` 뷰·임계값), 장애모드·복구(데몬 다운·VRAM OOM·fallback 급증·eviction 폭주), 업그레이드/롤백, 백업/복구(GCS 스냅샷), 스케일링·캐파, 인시던트 대응. 흩어진 런북을 OPS_GPU_PLAYBOOK로 연결.
+  - **완료 기준**: 신규 운영자가 플레이북만으로 배포→모니터→장애대응→업그레이드 수행 가능; 각 절차에 실 명령·뷰·임계값 포함.
+
+- **가이드 사이트 발행 (GitHub Pages, MkDocs)**
+  - 레퍼런스: [PG-Strom 문서](https://heterodb.github.io/pg-strom/)(MkDocs + RTD 테마, GitHub Pages, **동일 PostgreSQL License·같은 PG-GPU 카테고리** → IA 모델: Home/Install/Tutorial/Advanced Features/References/Release Notes) + [cuVS integrations](https://docs.rapids.ai/api/cuvs/stable/integrations/)(Faiss/Milvus/Lucene/Kinetica 등재; **PostgreSQL/DB 확장 전무 → pg_cuvs 첫 등재 기회**, 등재엔 dedicated 페이지+링크 필요).
+  - 작업: MkDocs(Material 또는 RTD 테마) + GitHub Actions로 Pages 발행(`ysys143.github.io/pg_cuvs`). IA는 PG-Strom 미러 — Home(개요) / Install(설치·버전매트릭스) / Tutorial(quickstart·필터검색·멀티테넌트) / Features(검색 모드·인덱스 AM·GUC·reloption) / References(SQL 함수·뷰·기법 요약) / Operations(플레이북) / Release Notes.
+  - **위 두 항목(문서 현행화·플레이북)의 단일 렌더 표면** — ARCHITECTURE·기능 reference·기법 요약·플레이북을 사이트가 렌더(중복 산출물 안 만듦, single source). cuVS integrations 등재용 dedicated 페이지(pg_cuvs ← cuVS) 준비 → **에코시스템 진입 단계 3**(cuVS 문서/README 링크 요청) 산출물.
+  - **완료 기준**: Pages URL 라이브 + PG-Strom 수준 IA + cuVS integrations PR에 링크할 dedicated 페이지 존재.
+
+대상: `design/OPS_GPU_PLAYBOOK.md` · `docs/playbooks/` · (신규) `ARCHITECTURE.md` + 문서 맵 · (신규) `mkdocs.yml` + Pages 배포 워크플로
 
 ---
 
@@ -141,18 +165,18 @@
 | 항목 | 필요 작업 |
 |------|-----------|
 | ~~**3C/3D 완료**~~ [OK] | GCS artifact snapshot + replica async warmup — **완료·인증** (ADR-013/ADR-066, `make gpu-test-objstore`). 잔여: emulator CI 회귀(트리거) |
-| GitHub repo 공개 | public release. 라이선스: **Apache 2.0** (확정) |
+| ~~GitHub repo 공개~~ [OK] | **PUBLIC 공개됨**. 라이선스: **PostgreSQL License** (확정 — `LICENSE`·README 일치; 이전 표의 "Apache 2.0" 표기는 실제 파일과 불일치였어 정정) |
 | 재현 가능한 벤치마크 공개 | `BENCHMARK.md` — 핵심은 **overhead characterization**: GPU가 distance computation을 제거하면 IPC / PG heap fetch가 새 병목이 된다는 것을 latency 분해로 실증. pgvector(CPU HNSW) 대비 QPS/latency 비교는 부수. selectivity sweep은 멀티테넌트 filtered search 효과 지지 실험으로 포함(논문 중심 아님) |
-| 외부 사용자용 설치 가이드 | README 정비 (설치, quick start, CUDA/cuVS 버전 매트릭스) |
-| CI — GPU 테스트 전략 | **전략 확정** (ADR-067, 스펙 [design/CI_STRATEGY.md](design/CI_STRATEGY.md)): 2-tier — Tier 1 CPU-reference shim(`cuvs_wrapper.h` 경계 대체, hosted ubuntu, 매 PR 자동, 무료, plumbing·계약·mode·recall 검증) + Tier 2 실 A100 installcheck(self-hosted, 사용자 on-demand `/gpu-test`). 구현 미착수(shim TU + workflow 2종). |
+| 외부 사용자용 가이드 | README 현재화 완료. **가이드 사이트 발행**으로 격상(GitHub Pages/MkDocs, PG-Strom IA 미러) — "릴리스 준비 — 문서·운영 정비" 절 |
+| ~~CI — GPU 테스트 전략~~ [OK] | **구현·검증 완료** (ADR-067, [design/CI_STRATEGY.md](design/CI_STRATEGY.md)): 2-tier — **Tier 1** `ci.yml`(CPU-reference shim `cuvs_wrapper.h` 경계 대체, hosted ubuntu, 매 PR 자동·무료; plumbing·계약·mode·recall + filter_comparison·MAX_INDEXES evict/reload 가드) + **Tier 2** `gpu.yml`(UI 버튼 `workflow_dispatch`, WIF 키리스 GCP 인증, self-hosted A100, 실 installcheck 26/26 검증). PR #46–48, #50. 잔여: emulator CI 회귀(트리거). |
 
 ### 진입 단계
 
 | 단계 | 목표 | 전제 조건 | 타이밍 |
 |------|------|-----------|--------|
-| 1 | repo 공개 + 벤치마크 공개 | 없음 | 즉시 가능 |
+| 1 | repo 공개 [OK] + 벤치마크 공개 | 없음 | repo 공개됨 · `BENCHMARK.md`만 잔여 |
 | 2 | cuvs-bench backend PR | 3Q 완료 [OK] | 즉시 착수 가능 |
-| 3 | cuVS 문서/README 링크 요청 | 2단계 merge | 2단계 후 |
+| 3 | [cuVS integrations](https://docs.rapids.ai/api/cuvs/stable/integrations/) 등재 + cuVS README 링크 (현재 Faiss/Milvus/Lucene/Kinetica — PG 확장 전무 → 선점) | 2단계 merge + 가이드 사이트 dedicated 페이지 | 2단계 후 |
 | 4 | NVIDIA 채널 노출 | 3단계 등재 | 3단계 후 |
 
 **현황**: PostgreSQL 관련 언급이 cuVS 생태계에 전무 — 선점 기회. 현재 공식 통합: Milvus, Faiss, Elasticsearch(진행 중), Kinetica.
