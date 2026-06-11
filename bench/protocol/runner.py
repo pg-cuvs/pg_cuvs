@@ -231,10 +231,13 @@ def main():
     if table is None:
         raise NotImplementedError(f"config {a.config} not implemented")
 
-    gt_path = os.path.join(a.gt_dir, f"gt_{n}.npy")
+    # Build a RUNNER-OWNED GT keyed to (corpus, queries, N) rather than trusting the
+    # pre-built gt_<N>.npy of uncertain provenance — those gave random recall (=k/N)
+    # at N=100k because their neighbor ids did not match the first-N corpus id space
+    # this runner loads (issue #56). build_gt.py is the same GPU brute force that
+    # produced the proven §16 GT, so a runner-built GT is exact by construction.
+    gt_path = os.path.join(a.gt_dir, f"gt_runner_{n}.npy")
     if not os.path.exists(gt_path):
-        # auto-build exact GT (GPU brute force, cupy) — self-sufficient live path.
-        # quick at small N; required because gt_{1k,10k} aren't pre-built (issue #56).
         log(f"GT {gt_path} missing — building via build_gt.py (N={n}, k=100)")
         import subprocess
         r = subprocess.run([sys.executable, os.path.join(ANBENCH, "build_gt.py"),

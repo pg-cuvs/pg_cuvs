@@ -49,3 +49,4 @@ design/anbench/
 
 # Local tool cache (project-path → UUID map; machine-specific)
 cache/
+/results/

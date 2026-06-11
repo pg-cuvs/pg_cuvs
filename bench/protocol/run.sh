@@ -15,7 +15,8 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LIB="$HERE/lib"
 REPO_ROOT="$(cd "$HERE/../.." && pwd)"
-RESULTS_ROOT="${PGCUVS_RESULTS_ROOT:-$REPO_ROOT/bench/results/protocol}"
+# repo-root results/protocol — MUST match bench.yml's publish path (`results/protocol`).
+RESULTS_ROOT="${PGCUVS_RESULTS_ROOT:-$REPO_ROOT/results/protocol}"
 
 # ── env (CONTRACT §2) ────────────────────────────────────────────────────────
 STAGE="${PGCUVS_STAGE:?PGCUVS_STAGE required (A|B|C|D)}"
