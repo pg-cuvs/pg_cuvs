@@ -54,15 +54,15 @@
 
 > **3A Pending Delta는 완료**(완료 표 참조). streaming write(INSERT/UPDATE/DELETE) 후 REINDEX 없이 GPU+delta 병합으로 정합한 top-k를 반환한다. 3L `CuvsBfIndex`를 3A-2 GPU delta cache가 재사용. 상세 스펙·검증은 [design/PLAN.md — Phase 3A](design/PLAN.md), 결정은 ADR-047. **4A(빌드 오버헤드)·3R(빌드 파라미터 reloption)도 완료**(완료 표 참조; 4A=ADR-057/058/059, 3R=ADR-052), **3S(취소 전파)도 완료**(ADR-053), **D(exact filtered BF)도 완료**(ADR-063, 잔여 4항목 포함), **3O(CAGRA-first BITSET prefilter)도 완료**(ADR-048, PR #36/#37), **3Q(CAGRA Streaming Updates)도 완료**(ADR-051, installcheck 21/21), **4C(Background Compaction)도 완료**(ADR-050, installcheck 22/22 + isolation 3/3), **3C/3D(GCS snapshot + replica async warmup)도 완료·인증**(ADR-013/ADR-066, 실 GCS round-trip `make gpu-test-objstore`, installcheck 25/25 + isolation 3/3) — 기능 순차 경로 완료. **repo 공개 전 운영 하드닝 3종(fallback 관측성=PR #43 · VRAM budget 강제=ADR-065 해소 · OOM 후 재사용=PR #42)도 완료**. **MAX_INDEXES 하드월도 해소**(ADR-068, PR #45 — 소프트 LRU 캡 `--max-indexes` 기본 1024 + 슬롯-확보 auto-reload; PR #50 Tier-1 evict/reload 가드). **CI 2-tier도 구현·검증 완료**(ADR-067, PR #46–48/#50 — Tier 1 매 PR 자동 + Tier 2 UI 버튼 실 A100 26/26). README도 현재화 완료(Install/Requirements/Compatibility/Quickstart/Usage). 라이선스는 **PostgreSQL License**로 확정. **다음 순차 작업: 릴리스 준비 — `BENCHMARK.md` 공개 · 문서 정합성/현행화 · 운영 플레이북 완성**(아래 "릴리스 준비 — 문서·운영 정비" 절; "에코시스템 진입 계획" 전제조건 참조).
 
-### 자원 거버넌스 하드닝 — 확정 버그 3개 (순차, 문서화에 선행)
+### 자원 거버넌스 하드닝 — 확정 버그 3개 (ADR-069, PR #54)
 
-> 자원 거버넌스 감사(ADR-069) + 적대적 리뷰 2라운드에서 **정책과 무관하게 코드로 확정된 버그 3개**. 데이터 안전/성능 등급이라 위 "문서·운영 정비"보다 **먼저** 해소한다. 큰 거버넌스 항목(cgroup 가이드·scratch-aware admission·백엔드 스탬프 등)은 트리거 백로그로 분리.
+> 자원 거버넌스 감사 + 적대적 리뷰 2라운드에서 **정책과 무관하게 코드로 확정된 버그 3개**. PR #54에서 #1·#2 출고(Tier-1 GREEN 25/25), #3은 보류(아래). 큰 거버넌스 항목은 트리거 백로그로 분리.
 
-- **VRAM 회계 누락** — `total_vram_used`(`pg_cuvs_server.c`)가 unsharded `main_bf_vram_bytes` / sharded `shards[].bf_vram_bytes` 미합산 → eviction 과약정 → 빌드/검색 OOM. (IVF-PQ `ivfpq_vram_bytes`는 `vram_bytes`와 중복 set이라 더하면 이중계상.) 완료 기준: Tier-1 단위테스트로 보조 캐시 포함·IVF-PQ 비-이중계상 검증.
-- **빌드 OOM evict-retry** — `cuvs_cagra_build` NULL(OOM 구분 불가) 시 즉시 BUILD_FAILED; scratch 미추정으로 사전 `ensure_vram` 통과 후에도 OOM. 완료 기준: OOM 신호 추가 + `inject_build_oom` seam + evict 후 1회 재시도, Tier-1 검증.
-- **빌드 락 starvation** — `handle_build`/`build_sharded`가 `g_index_mutex`를 GPU 빌드·디스크 I/O 내내 보유 → 검색/통계/드롭 블록. 완료 기준: reservation-counter로 GPU 빌드 구간 언락(양 경로), 동일 OID 가드, Tier-1 동시성 회귀.
+- **[OK] VRAM 회계 누락** — `total_vram_used`가 unsharded `main_bf_vram_bytes` / sharded `shards[].bf_vram_bytes` 미합산 → eviction 과약정 → OOM. (IVF-PQ `ivfpq_vram_bytes`는 `vram_bytes`와 중복이라 비-합산.) **완료**: `vram_accounting.sql` Tier-1 GREEN.
+- **[OK] 빌드 락 starvation** — `handle_build`/`build_sharded`가 `g_index_mutex`를 GPU 빌드 내내 보유 → 검색/통계/드롭 블록. **완료**: reservation-counter(`g_pending_build_vram`)로 GPU 빌드 구간 언락(양 경로); `build_lock.sql` Tier-1 GREEN(빌드 정상+reservation no-leak). 동시성(starvation 부재)·`build_sharded` 멀티GPU는 Tier-2.
+- **[보류] 빌드 OOM evict-retry** — OOM 신호 인프라(`cuvs_last_build_was_oom`+`inject_build_oom`)는 배선했으나 retry 본체에서 **shim 데몬 크래시**(로컬 무재현) → 즉시-BUILD_FAILED(기존)로 되돌림. Tier-2 재현 후 후속(트리거 백로그).
 
-대상: `src/pg_cuvs_server.c` · `src/cuvs_wrapper.{cu,h}` · `src/cuvs_wrapper_shim_cpu.c` · `src/pg_cuvs.c` · `test/unit/` | ADR-069
+대상: `src/pg_cuvs_server.c` · `src/cuvs_wrapper.{cu,h}` · `src/cuvs_wrapper_shim_cpu.c` · `src/pg_cuvs.c` · `test/sql/{vram_accounting,build_lock}.sql` | ADR-069
 
 ### 릴리스 준비 — 문서·운영 정비 (순차)
 
@@ -125,6 +125,8 @@
 | **백엔드 아티팩트 스탬프(timeline/system_identifier)** | ADR-069. 외부 아티팩트가 WAL/복제 밖 → standby/PITR에서 timeline 발산 시 stale 결과 위험. 데몬은 pg_control/timeline 못 읽음 → 백엔드가 `.tids` 헤더 스탬프 + plan-time 검증해야 fail-closed 가능. | 코드(사이드카 포맷 + 백엔드 검증) | replica/PITR 정합성 요구 시 |
 | **corpus → BufFile 옵션** | ADR-069. 코퍼스를 PG `BufFile` temp 파일로 옮기면 `temp_file_limit`이 *진짜로* 적용(디스크 백킹 트레이드오프). 메모리 제약 환경 대안. | 코드(corpus tier에 BufFile 추가) | host RAM 제약 환경 수요 시 |
 | **daemon host-bytes cap + evict-on-host-pressure** | ADR-069. resident host 배열(`rev_tids`/`rev_item_ids`/`tids` ~20B/vec)이 개수 LRU(`g_max_indexes`)로만 제한 → host RAM은 인덱스 크기 비례 누적. | 코드(host-bytes 카운터 + host 압박 시 eviction) | 데몬 host RSS 누적 실측 시 |
+| **빌드 OOM evict-retry (버그#3 본체)** | ADR-069/PR#54. OOM 신호 인프라는 배선됐으나 retry의 `evict_lru` 호출이 shim 데몬 크래시(로컬 무재현). | 코드(크래시 진단·수정 + retry) | Tier-2(A100)에서 재현·진단 |
+| **#2/#3 병렬빌드(handle_build_multi) 미적용** | ADR-069. reservation-unlock(#2)·OOM-retry(#3)는 단일 `handle_build`/`build_sharded`에만 적용; ADR-058 병렬빌드 경로(대형·OOM 빈발)는 미적용. | 코드(handle_build_multi에 동일 패턴) | 대형 병렬빌드에서 starvation/OOM 실측 시 |
 
 스펙: `docs/spec-audit-2026-06-05.md` | ADR-011 / ADR-017 / ADR-069 | `design/OPS_GPU_PLAYBOOK.md`
 

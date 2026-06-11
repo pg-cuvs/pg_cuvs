@@ -2707,8 +2707,11 @@ isolation 3/3 GREEN. 관련: [[ADR-061]](전략), STRATEGY_NOTES §G.
    수 분)·디스크 I/O 내내 보유 → 그동안 모든 검색/통계/드롭 블록. 뮤텍스가 진짜 필요한 건 VRAM 회계와
    registry swap뿐. → reservation-counter로 GPU 빌드 구간 언락.
 3. **빌드 OOM evict-retry 부재** — `cuvs_cagra_build` NULL(OOM 구분 불가) 시 즉시 BUILD_FAILED.
-   `estimate_vram_bytes`가 빌드 scratch를 빼므로 사전 `ensure_vram` 통과 후에도 OOM 가능. → OOM 신호
-   추가 + evict 후 1회 재시도(데몬 내부 한정).
+   `estimate_vram_bytes`가 빌드 scratch를 빼므로 사전 `ensure_vram` 통과 후에도 OOM 가능. OOM 신호
+   인프라(`cuvs_last_build_was_oom` + `inject_build_oom` seam, IPC opcode 20)는 배선했으나, evict-retry
+   본체는 **이번에 보류**: Tier-1 CPU shim에서 `handle_build`가 retry 경로의 `evict_lru`를 호출할 때
+   **데몬이 크래시**했고(로컬 macOS 무재현 — 데몬 미컴파일, PG14≠PG16), 크래시 코드를 출고할 수 없어
+   즉시-BUILD_FAILED(기존 동작)로 되돌렸다. 실제 retry는 Tier-2(A100)에서 재현·진단 후 후속.
 
 ### 대안 기각
 
@@ -2720,10 +2723,12 @@ isolation 3/3 GREEN. 관련: [[ADR-061]](전략), STRATEGY_NOTES §G.
 
 ### 검증
 
-Tier-1 CPU shim(`make test-unit`, GPU 불필요)으로 VRAM 회계 산술·OOM evict-retry·빌드 락 보유시간을
-결정적으로 검증. 신규 `inject_build_oom` seam(`inject_extend_oom` 미러링). 회귀: 기존 installcheck/isolation
-무영향. 대형 항목(cgroup 가이드, scratch-aware admission, 백엔드 스탬프, corpus→BufFile, daemon host-bytes cap)은
-ROADMAP 트리거 백로그로 분리.
+Tier-1 CPU shim 회귀(installcheck, PR #54 GREEN 25/25): `vram_accounting`(버그#1 — BF 검색 후
+total_vram_used가 BF VRAM 포함), `build_lock`(버그#2 — 빌드가 정상 완료 + reservation no-leak). 빌드 락
+**동시성**(starvation 부재)과 `build_sharded` 멀티GPU는 Tier-1(단일 클라이언트·단일 GPU shim)로 검증 불가 →
+Tier-2. 버그#3 evict-retry는 위 사유로 보류. 대형 항목(cgroup 가이드, scratch-aware admission, 백엔드 스탬프,
+corpus→BufFile, daemon host-bytes cap, **버그#3 evict-retry**, **handle_build_multi 병렬빌드에 #2/#3 미적용**)은
+ROADMAP 트리거 백로그.
 
 ### 후속
 
