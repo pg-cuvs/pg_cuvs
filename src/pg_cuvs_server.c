@@ -1235,6 +1235,16 @@ save_index(IndexEntry *e)
         return -1;
     }
 #endif
+    /* Defensive (ADR-069): save_index serializes a CAGRA handle. An IVF-PQ or
+     * sharded entry has e->handle == NULL; serializing it would deref NULL.
+     * Callers must route those to their own (save-free) eviction paths; fail
+     * closed here rather than crash if one ever reaches us. */
+    if (e->handle == NULL) {
+        LOG_ERROR("save_index: %u/%u has no CAGRA handle (ivfpq/sharded?); refusing\n",
+                  e->db_oid, e->index_oid);
+        return -1;
+    }
+
     char idx_final[512],  idx_tmp[576];
     char tids_final[512], tids_tmp[576];
     index_file_path(idx_final,  sizeof(idx_final),  g_index_dir, e->db_oid, e->index_oid);
@@ -1808,6 +1818,21 @@ evict_lru(int device_id)
         free(e->tids);
         free(e->rev_tids);     e->rev_tids     = NULL;
         free(e->rev_item_ids); e->rev_item_ids = NULL;
+    }
+    else if (e->ivfpq_handle)
+    {
+        /* 3P IVF-PQ: its `.ivfpq`/`.tids` sidecars are durable on disk, so
+         * eviction needs no save — a later query reloads via load_index (like
+         * the sharded path). save_index() assumes a CAGRA handle, but an IVF-PQ
+         * entry's `e->handle` is NULL — calling cuvs_cagra_serialize(NULL) here
+         * SEGV'd the daemon (ADR-069 — pre-existing; IVF-PQ was never evictable).
+         * The ivfpq_handle itself is freed by the shared cleanup below. */
+        free_delta_cache(e);
+        free_main_bf_cache(e);
+        free(e->tids);
+        free(e->rev_tids);     e->rev_tids     = NULL;
+        free(e->rev_item_ids); e->rev_item_ids = NULL;
+        freed = e->vram_bytes;   /* IVF-PQ sets vram_bytes == ivfpq_vram_bytes */
     }
     else
     {
@@ -4338,8 +4363,10 @@ handle_build(int client_fd, const CuvsCmdFrame *cmd)
                                                  cmd->build_algo, target_gpu);
     if (!new_handle && cuvs_last_build_was_oom())
     {
-        /* ADR-069 Bug #3 [DEBUG: under ASAN to capture the crash backtrace].
-         * Build hit a VRAM OOM; evict an LRU index and retry once. */
+        /* ADR-069 Bug #3: the build hit a VRAM OOM (estimate_vram_bytes excludes
+         * CAGRA build-time scratch, so admission can pass yet the build OOM).
+         * Briefly retake the lock to evict an LRU index, then retry once (only if
+         * eviction freed VRAM). evict_lru now safely handles IVF-PQ/sharded LRUs. */
         pthread_mutex_lock(&g_index_mutex);
         int evicted = (evict_lru(target_gpu) > 0);
         pthread_mutex_unlock(&g_index_mutex);
