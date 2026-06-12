@@ -139,7 +139,6 @@ def vec_literal(v):
 def run_queries(conn, table, queries, kmax, set_sql, index_dir, config,
                 warmup=200, lat_cap=2000):
     import numpy as np
-    from anbench_common import percentiles_ms
     with conn.cursor() as cur:
         # plan-forcing GUCs are session-level (set once in main); here we only
         # apply the per-sweep knob.
@@ -165,7 +164,31 @@ def run_queries(conn, table, queries, kmax, set_sql, index_dir, config,
             for j, r in enumerate(rows):
                 ids[i, j] = r[0]
         total = time.perf_counter() - t0
-    return ids, nq / total, percentiles_ms(lat)
+    return ids, nq / total, lat   # lat = per-query latencies (seconds)
+
+
+def _pctls_us(lat):
+    """(p50, p95, p99, p999) in microseconds from a latency list (seconds)."""
+    import numpy as np
+    a = np.asarray(lat, dtype=np.float64) * 1e6
+    if a.size == 0:
+        return (float("nan"),) * 4
+    return tuple(float(np.percentile(a, p)) for p in (50, 95, 99, 99.9))
+
+
+def _agg_reps(per_rep_us, per_rep_qps):
+    """Median across reps for each percentile + qps; dispersion = per-metric
+    [min,max] across reps (JSON). per_rep_us: list of (p50,p95,p99,p999) µs."""
+    import json
+    import numpy as np
+    arr = np.asarray(per_rep_us, dtype=np.float64)        # (reps, 4)
+    med = [float(np.median(arr[:, i])) for i in range(4)]
+    qps = float(np.median(per_rep_qps))
+    disp = {"reps": len(per_rep_qps),
+            "p50_us": [round(float(arr[:, 0].min()), 1), round(float(arr[:, 0].max()), 1)],
+            "p99_us": [round(float(arr[:, 2].min()), 1), round(float(arr[:, 2].max()), 1)],
+            "qps": [round(min(per_rep_qps), 1), round(max(per_rep_qps), 1)]}
+    return med, qps, json.dumps(disp, separators=(",", ":"))
 
 
 def knob_sweep(config):
@@ -209,7 +232,7 @@ def main():
     ap.add_argument("--gt-dir", required=True)
     ap.add_argument("--index-dir", default="/tmp/cuvs_indexes")
     ap.add_argument("--baseline", default="same-box")
-    ap.add_argument("--reps", type=int, default=5)
+    ap.add_argument("--reps", type=int, default=3)
     ap.add_argument("--daemon-pid", type=int, default=None)
     ap.add_argument("--instance-type", default=None)
     ap.add_argument("--price-usd-hr", default=None)
@@ -306,26 +329,36 @@ def main():
                      f"(seq-scan fallback — check cuvs.index_dir / daemon). plan:\n{plan}")
         log("plan guard OK — cagra index in use")
 
-    # ── iso-recall selection + measured query point ──────────────────────────
-    qcap = min(2000, len(queries))
-    qset, gtset = queries[:qcap], gt[:qcap]
-    set_sql, knob, rec, met = choose_iso_recall(conn, table, qset, gtset, k,
-                                                 target, a.config, a.index_dir)
+    # ── iso-recall knob selection (cheap: recall-only sweep on a 2k subset) ───
+    qcap_sweep = min(2000, len(queries))
+    set_sql, knob, _, met = choose_iso_recall(conn, table, queries[:qcap_sweep],
+                                              gt[:qcap_sweep], k, target,
+                                              a.config, a.index_dir)
+    # ── measured query point: reps × full query set → median + dispersion ────
+    qcap = min(10000, len(queries))
+    qfin, gtfin = queries[:qcap], gt[:qcap]
+    per_rep, per_qps, last_ids = [], [], None
     with observe.ResourceSampler(gpu_index=a.gpu_index, daemon_pid=dpid) as s:
-        ids, qps, (p50, p95, p99) = run_queries(conn, table, qset, k, set_sql,
-                                                 a.index_dir, a.config)
-    rec = recall_at_k(ids[:, :k], gtset[:, :k], k)
+        for _ in range(max(1, a.reps)):
+            ids, qps, lat = run_queries(conn, table, qfin, k, set_sql,
+                                        a.index_dir, a.config, lat_cap=qcap)
+            per_rep.append(_pctls_us(lat))
+            per_qps.append(qps)
+            last_ids = ids
+    (p50, p95, p99, p999), qps, disp = _agg_reps(per_rep, per_qps)
+    rec = recall_at_k(last_ids[:, :k], gtfin[:, :k], k)
     observe.write_protocol_row(
         a.csv, **common_row(
             phase="query", index_type=index_type,
-            qps=round(qps, 1), p50_us=round(p50 * 1000, 1),
-            p95_us=round(p95 * 1000, 1), p99_us=round(p99 * 1000, 1),
-            recall_at_k=round(rec, 4),
-            params_json={"knob": knob, "iso_recall_met": met},
+            qps=round(qps, 1), p50_us=round(p50, 1), p95_us=round(p95, 1),
+            p99_us=round(p99, 1), p999_us=round(p999, 1),
+            recall_at_k=round(rec, 4), dispersion=disp,
+            params_json={"knob": knob, "iso_recall_met": met, "n_queries": qcap},
             notes="" if met else "recall target NOT met at sweep ceiling",
             **s.as_dict()))
     conn.close()
-    log(f"done {a.cell} {a.config}: recall={rec:.4f} qps={qps:.0f} p50={p50*1000:.0f}us")
+    log(f"done {a.cell} {a.config}: recall={rec:.4f} qps={qps:.0f} "
+        f"p50={p50:.0f}us p99={p99:.0f}us reps={a.reps}")
 
 
 def _selfcheck():
