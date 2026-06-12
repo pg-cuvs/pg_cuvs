@@ -25,9 +25,12 @@ run_engine(){
 
   # shellcheck disable=SC1091
   source "$conda/bin/activate" "$env"
-  # PGCUVS_MODULE selects the runner: physics → runner.py, concurrency → load probe
+  # PGCUVS_MODULE selects the runner.
   local pyrunner="runner.py"
-  [ "${PGCUVS_MODULE:-physics}" = "concurrency" ] && pyrunner="runner_concurrency.py"
+  case "${PGCUVS_MODULE:-physics}" in
+    concurrency) pyrunner="runner_concurrency.py" ;;
+    explain)     pyrunner="runner_explain.py" ;;
+  esac
   exec python3 "$PROTO/$pyrunner" \
     --config "$config" --cell "$cell_id" \
     --csv "$CSV" --run-id "$RUN_ID" --stage "$STAGE" \
