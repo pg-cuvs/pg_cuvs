@@ -1,5 +1,12 @@
 # pg_cuvs 개발 계획
 
+> **[동결 · 역사 문서]** 메인 구현(Phase 1~4C)이 완료되어 이 문서의 *계획* 역할은 종료됐다.
+> 이 문서는 **각 Phase를 어떻게 만들고 무엇으로 증명했는지의 역사 기록**(구현 항목·완료 기준·검증 증거)으로
+> 보존하며, 더 이상 현행 상태를 반영하도록 갱신하지 않는다(예: 아래 "현재 구현 기준"은 2026-05-26 시점 스냅샷).
+> **현행 제품의 SSOT는 [ARCHITECTURE.md](../ARCHITECTURE.md)(아키텍처)와 [docs/reference.md](../docs/reference.md)(기능·GUC·인덱스 일람)다.**
+> 새 계획은 PLAN.md가 아니라 해당 트랙 문서로 간다(벤치마크=[design/BENCHMARK_PROTOCOL.md](BENCHMARK_PROTOCOL.md), 순차/트리거=[ROADMAP.md](../ROADMAP.md)).
+> 설계 결정의 근거(왜)는 [design/DECISIONS.md](DECISIONS.md). 문서 맵: [docs/doc-map.md](../docs/doc-map.md).
+
 ## 프로젝트 정체성
 
 pg_cuvs는 단순한 PostgreSQL용 GPU ANN 확장이 아니다. PostgreSQL을 제어 평면으로 유지하면서, 비용이 크고 병렬화 효과가 큰 벡터 후보 생성만 GPU sidecar로 오프로딩하는 미들웨어 프로젝트다.

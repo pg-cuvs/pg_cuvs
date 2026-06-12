@@ -2836,3 +2836,29 @@ load-dependent `bf_batch_wait` 라우팅과 `CUVS_STARTUP_COST` 재보정은 이
 
 관련: ADR-039(BF 자동선택), ADR-064(스트림/OOC BF), ADR-069(벤치 프로토콜),
 [operational-guide.md](../docs/operational-guide.md)(측정 근거 — gpu-bf vs cpu-seq/cagra), 이슈 #56·#58.
+
+---
+
+## ADR-072 — Disk DiskANN tier 재개 시 구현 방향: cuVS 업스트림 기여(advocate/PR), 포크 회피
+
+**날짜**: 2026-06-12
+**상태**: ACCEPTED / 방향 기록 (실행은 ADR-026 트리거 충족 시). 근거: PHASE_3B_SPIKE.md, ADR-025/026, ADR-061
+
+**문제**: 3B(larger-than-RAM disk DiskANN cold tier)는 ADR-026에서 보류됐으나, 향후 트리거(1B+ 수요 / cuVS PQFlash stable / 128GB+ VRAM) 충족 시 "어떻게 구현하나"가 미기록 상태였다. 스파이크(PHASE_3B_SPIKE.md) 결과 cuVS 26.04는 Vamana **그래프 빌드는 정상**(in-memory recall 0.999)이나 **disk/PQFlash 직렬화가 PQFlash 비호환**(`sector_aligned` 출력이 1001 섹터 vs DiskANN 417 섹터 → PQFlash가 rerank 벡터를 잘못된 오프셋에서 읽어 recall 0.405로 붕괴). 또한 `cuvsVamanaSearch` 부재(Vamana는 build+serialize 전용, 검색은 MS DiskANN CPU에 의존). 이 갭을 닫는 길은 세 갈래이고, 그 선택과 기각을 고정한다.
+
+**결정**: 재개 시 다음 방향만 취한다 — **우리는 어답터/기여자, 포크는 최후 수단**.
+
+1. **방향 1 (advocate) — GPU Vamana disk 검색기**: cuVS disk index를 GPU에서 직접 검색(= cuVS #2197). 셋 중 유일하게 검색까지 GPU. **그러나 우리가 구현하지 않는다 — NVIDIA/cuVS 영역**. 이유: (a) GPUDirect Storage 기반 disk graph traversal은 연구급 시스템 프로젝트로 Postgres 확장 범위 밖, (b) PQFlash는 I/O 바운드(쿼리당 SSD 읽기가 지배)라 GPU 이득이 본질적으로 불확실 — 대량 배치(throughput)+GDS라야 의미, 단일 쿼리 latency엔 CPU 대비 이점 미미. → cuVS #2197을 업스트림에 advocate하고 어답터로 남는다.
+
+2. **방향 3 (선택 — 할 거면 이것) — PQFlash 호환 cuVS serializer**: cuVS `vamana::serialize(sector_aligned)`가 MS DiskANN PQFlash 섹터 포맷을 정확히 쓰게 한다(= cuVS #1501, #905=OPQ codebooks에 의존). GPU 가치는 **빌드에 한정**(검색은 stock MS DiskANN CPU PQFlash) — 3I "GPU 빌드 → CPU HNSW 서빙"의 larger-than-RAM 버전으로 일관. **포크가 아니라 업스트림 PR**로 추진(유지보수 ~0, 굿윌). 우리 스파이크의 섹터-패킹 데이터(파일을 다 조립해도 1001 vs 417로 붕괴 — #1501이 현재 보는 "빠진 파일" 차원을 넘는 레이아웃 결함)를 #1501에 기여.
+
+**대안 기각**:
+- **방향 2 (PQFlash 포크/어댑터)**: MS DiskANN 리더를 포크해 cuVS 레이아웃을 읽게 함. 기각 — 얻는 건 CPU 검색(GPU 가치 0 = pgvectorscale 영역)인데 **MS DiskANN 포크 + cuVS·DiskANN 두 moving target을 동시 유지**해야 함(둘 중 하나만 포맷 바꿔도 깨짐). 최악의 유지보수 위치.
+- **자체(in-tree) 포크로 방향 3 수행**: 업스트림 PR 거부 시에만 고려. 기본은 업스트림.
+- **즉시 착수**: 기각 — ADR-026 트리거 미충족(세그먼트 비표적·CPU+NVMe 경제성 우위). VRAM 천장 밀기는 IVF-PQ(3P/ADR-049)·streaming BF(ADR-064)로 이미 처리됨.
+
+**cuVS 업스트림 이슈 매핑** (스파이크 발견 = 이미 트래킹, 전부 OPEN, milestone 없음): #2197 Vamana/DiskANN search on GPU(방향 1) · #1501 Vamana SSD index ↔ diskannpy 호환(방향 3, #905 의존) · #1380 host-dataset build `cudaErrorIllegalAddress` · #905 OPQ codebooks/rotation. (+ #1753/#1943 fp16, #1423 cuvs-bench, #906 disk 포맷 문서). 비고: cuVS가 26.08에서 Vamana 활발(#2214 device permute, 예제 DRAFT #2064) → 우선순위 상향 advocate 적기.
+
+**순위**: 방향 3(업스트림 기여) > 방향 1(advocate) > 방향 2(회피).
+
+관련: ADR-025(50M 벤치·포지셔닝), ADR-026(3B go/no-go·트리거), ADR-061(전략·표적 세그먼트), ADR-049(IVF-PQ), ADR-064(streaming BF), PHASE_3B_SPIKE.md / PHASE_3B_DECISION.md.

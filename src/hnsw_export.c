@@ -87,9 +87,6 @@ extern char *cuvs_socket_path;
 /* Maximum heaptids stored inline in an element tuple */
 #define PGV_HNSW_MAX_HEAPTIDS   10
 
-/* HnswGetLayerM: layer 0 uses 2*M connections, upper layers use M */
-#define PGV_HNSW_LAYER_M(m, layer) ((layer) == 0 ? 2*(m) : (m))
-
 /*
  * ItemPointerData: (BlockIdData blkhi:blklo, OffsetNumber).
  * BlockIdData is { uint16 bi_hi, uint16 bi_lo }.
@@ -317,7 +314,6 @@ write_elem_page(Relation rel,
                 size_t n_elems,
                 bool skip_wal)
 {
-    GenericXLogState   *xlog_state;
     Buffer              buf;
     Page                page;
     PgvHnswPageOpaque  *opaque;
@@ -417,7 +413,6 @@ write_elem_page(Relation rel,
     /* Write the page — always extend with P_NEW; caller loops in blkno order
      * so each call appends the next block in sequence. */
     (void)blkno;        /* layout reference only */
-    (void)xlog_state;   /* unused after switching to direct write */
     buf  = ReadBuffer(rel, P_NEW);
     LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
     page = BufferGetPage(buf);
@@ -527,7 +522,7 @@ fill_hnsw_from_hnswlib(Oid cagra_oid, Oid hnsw_oid, bool use_shm)
         if (!OidIsValid(vec_oid))
             ereport(ERROR,
                     (errmsg("pg_cuvs: pgvector extension is not installed; "
-                            "pg_cuvs_import_hnsw requires pgvector 0.5.0+"),
+                            "pg_cuvs_build_hnsw requires pgvector 0.5.0+"),
                      errhint("Run: CREATE EXTENSION vector;")));
         cuvs_warn_pgvector_version();   /* Wave 1: version-range guard */
     }
@@ -583,7 +578,7 @@ fill_hnsw_from_hnswlib(Oid cagra_oid, Oid hnsw_oid, bool use_shm)
                 ReleaseSysCache(tup);
                 ereport(ERROR,
                         (errmsg("pg_cuvs: index \"%s\" is not a pgvector HNSW index; "
-                                "pg_cuvs_import_hnsw requires USING hnsw",
+                                "pg_cuvs_build_hnsw requires USING hnsw",
                                 name)));
             }
         }

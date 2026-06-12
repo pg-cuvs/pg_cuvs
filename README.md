@@ -2,7 +2,7 @@
 
 GPU-accelerated vector search for PostgreSQL via NVIDIA cuVS — a heterogeneous acceleration path that keeps Postgres as the control plane.
 
-**Built on**: [pgvector](https://github.com/pgvector/pgvector) · [RAPIDS cuVS](https://github.com/rapidsai/cuvs) · [PG-Strom](https://github.com/heterodb/pg-strom) (architectural inspiration) · [pgvectorscale](https://github.com/timescale/pgvectorscale) (DiskANN reference)
+**Built on** [pgvector](https://github.com/pgvector/pgvector) and [RAPIDS cuVS](https://github.com/rapidsai/cuvs).
 
 ## What it is
 
@@ -40,6 +40,10 @@ Two tiers (`design/CI_STRATEGY.md`, ADR-067):
 > GPU kernels or approximate recall were verified. Those are the on-demand Tier 2 run.
 
 ## Architecture
+
+> Full current-state architecture: [ARCHITECTURE.md](ARCHITECTURE.md). User-facing surface
+> (GUCs, reloptions, functions, views): [docs/reference.md](docs/reference.md). How all the docs
+> fit together (current vs historical): [docs/doc-map.md](docs/doc-map.md).
 
 pg_cuvs uses a **tightly coupled sidecar model** (PG-Strom style), not an in-process CUDA context per backend:
 
@@ -136,7 +140,8 @@ See [`BENCHMARK.md`](BENCHMARK.md) for the latency decomposition, the Cohere 1M�
 
 ## Roadmap
 
-See [design/PLAN.md](design/PLAN.md) for the full product-roadmap plan. Some committed test-hardening work used its own "Phase 2/3/4/5" task labels; the table below refers only to the product roadmap.
+See [ROADMAP.md](ROADMAP.md) for remaining work and the trigger-based backlog. The full per-phase
+build history (now frozen) is in [design/PLAN.md](design/PLAN.md). Some committed test-hardening work used its own "Phase 2/3/4/5" task labels; the table below refers only to the product roadmap.
 
 | Phase | Goal | Status |
 |-------|------|--------|
@@ -277,6 +282,6 @@ PostgreSQL License. Copyright (c) 2026, JAESOL SHIN. See [LICENSE](LICENSE) for 
 ## Related Work
 
 - [pgvector](https://github.com/pgvector/pgvector) — PostgreSQL vector type and CPU indexes (HNSW, IVFFlat)
-- [pgvectorscale](https://github.com/timescale/pgvectorscale) — DiskANN for PostgreSQL (the CPU/SSD reference we build on)
+- [pgvectorscale](https://github.com/timescale/pgvectorscale) — DiskANN for PostgreSQL (CPU/SSD; benchmark comparison baseline)
 - [RAPIDS cuVS](https://github.com/rapidsai/cuvs) — GPU ANN library (CAGRA, IVF-Flat, IVF-PQ, brute force)
 - [PG-Strom](https://github.com/heterodb/pg-strom) — GPU-accelerated SQL for PostgreSQL (architectural inspiration)
