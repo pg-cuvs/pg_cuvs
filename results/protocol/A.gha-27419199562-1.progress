@@ -1,0 +1,4 @@
+N200k_d1024_k10_r0.95|forced-hnsw
+N200k_d1024_k10_r0.95|forced-cuvs
+N500k_d1024_k10_r0.95|forced-hnsw
+N500k_d1024_k10_r0.95|forced-cuvs
