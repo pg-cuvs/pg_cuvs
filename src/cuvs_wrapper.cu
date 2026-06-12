@@ -64,7 +64,7 @@ static DevicePool g_device_pools[CUVS_MAX_GPUS];
 /* test-only: armed by cuvs_set_inject_extend_oom(); self-clears in cuvs_cagra_extend */
 static std::atomic<int> g_inject_extend_oom{0};
 
-/* ADR-069 Bug #3: set when a cuvs_cagra_build[_multi] failure was an OOM
+/* ADR-070 Bug #3: set when a cuvs_cagra_build[_multi] failure was an OOM
  * (std::bad_alloc, incl. RMM out_of_memory which derives from it). Queried+cleared
  * by the daemon via cuvs_last_build_was_oom() to decide whether to evict+retry. */
 static std::atomic<int> g_last_build_oom{0};
@@ -683,7 +683,7 @@ cuvs_cagra_build_multi(const float **vecs, const int64_t *n_each, int n_parts,
                        int graph_degree, int intermediate_graph_degree,
                        uint32_t build_algo, int device_id)
 {
-    g_last_build_oom.store(0);   /* ADR-069: fresh per build attempt */
+    g_last_build_oom.store(0);   /* ADR-070: fresh per build attempt */
     PooledRes _pr(device_id);
     try {
         /* test-only: simulate a VRAM OOM to exercise the daemon evict+retry path. */
@@ -740,7 +740,7 @@ cuvs_cagra_build_multi(const float **vecs, const int64_t *n_each, int n_parts,
 
         return new CuvsCagraIndexImpl(std::move(d_corpus), std::move(idx));
     } catch (const std::bad_alloc &) {
-        /* ADR-069 Bug #3: OOM (incl. RMM out_of_memory). Flag it so the daemon
+        /* ADR-070 Bug #3: OOM (incl. RMM out_of_memory). Flag it so the daemon
          * evicts an LRU index and retries before failing the build. */
         fprintf(stderr, "[cuvs_cagra_build_multi] out of memory\n");
         g_last_build_oom.store(1);

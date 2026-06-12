@@ -185,7 +185,7 @@ cuvs_bf_build(const float *vecs, int64_t n, int dim, uint32_t metric,
 void cuvs_bf_free(CuvsBfIndex index, int device_id)
 { (void)device_id; shim_free((ShimIndex *)index); }
 
-/* ADR-069 Bug #3: synthetic build-OOM seam, mirrors the GPU wrapper. */
+/* ADR-070 Bug #3: synthetic build-OOM seam, mirrors the GPU wrapper. */
 static int g_last_build_oom  = 0;
 static int g_inject_build_oom = 0;
 int  cuvs_last_build_was_oom(void) { int v = g_last_build_oom; g_last_build_oom = 0; return v; }

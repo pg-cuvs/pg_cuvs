@@ -4558,7 +4558,7 @@ pg_cuvs_inject_extend_oom(PG_FUNCTION_ARGS)
     PG_RETURN_VOID();
 }
 
-/* pg_cuvs_inject_build_oom(n_fail int) — ADR-069 Bug #3: arm synthetic OOM for
+/* pg_cuvs_inject_build_oom(n_fail int) — ADR-070 Bug #3: arm synthetic OOM for
  * the next n_fail cuvs_cagra_build calls in the daemon (0 = disarm), so a test
  * can deterministically exercise the build evict-and-retry path. Test-only;
  * no-op if the daemon is unavailable. */

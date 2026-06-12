@@ -265,7 +265,7 @@ static uint64_t g_cache_evictions[CUVS_MAX_GPUS];
 static uint64_t g_cache_reloads[CUVS_MAX_GPUS];
 static uint64_t g_cache_persist_fail[CUVS_MAX_GPUS];
 
-/* ADR-069 Bug #2: VRAM reserved by in-flight builds that have released
+/* ADR-070 Bug #2: VRAM reserved by in-flight builds that have released
  * g_index_mutex for the (multi-minute) GPU build. The built index is not yet in
  * g_indexes, so total_vram_used() adds this so concurrent admission/eviction
  * still accounts for the build's VRAM. Mutated under g_index_mutex. */
@@ -591,7 +591,7 @@ total_vram_used(int device_id)
             total += e->vram_bytes + e->delta_vram_bytes + e->main_bf_vram_bytes;
         }
     }
-    /* ADR-069 Bug #2: include VRAM reserved by in-flight builds on this device
+    /* ADR-070 Bug #2: include VRAM reserved by in-flight builds on this device
      * (released the mutex for the GPU build; not yet in g_indexes). */
     if (device_id >= 0 && device_id < CUVS_MAX_GPUS)
         total += g_pending_build_vram[device_id];
@@ -1235,7 +1235,7 @@ save_index(IndexEntry *e)
         return -1;
     }
 #endif
-    /* Defensive (ADR-069): save_index serializes a CAGRA handle. An IVF-PQ or
+    /* Defensive (ADR-070): save_index serializes a CAGRA handle. An IVF-PQ or
      * sharded entry has e->handle == NULL; serializing it would deref NULL.
      * Callers must route those to their own (save-free) eviction paths; fail
      * closed here rather than crash if one ever reaches us. */
@@ -1825,7 +1825,7 @@ evict_lru(int device_id)
          * eviction needs no save — a later query reloads via load_index (like
          * the sharded path). save_index() assumes a CAGRA handle, but an IVF-PQ
          * entry's `e->handle` is NULL — calling cuvs_cagra_serialize(NULL) here
-         * SEGV'd the daemon (ADR-069 — pre-existing; IVF-PQ was never evictable).
+         * SEGV'd the daemon (ADR-070 — pre-existing; IVF-PQ was never evictable).
          * The ivfpq_handle itself is freed by the shared cleanup below. */
         free_delta_cache(e);
         free_main_bf_cache(e);
@@ -3799,7 +3799,7 @@ build_sharded(int client_fd, const CuvsCmdFrame *cmd, const char *index_dir,
     int     n_gpus = n_usable_gpus();
     int     ok     = 1;
     int     i      = 0;
-    int     n_reserved = 0;   /* ADR-069 Bug #2: shards with an active VRAM reservation */
+    int     n_reserved = 0;   /* ADR-070 Bug #2: shards with an active VRAM reservation */
     for (i = 0; i < sc; i++)
     {
         int64_t shard_n = base + (i < rem ? 1 : 0);
@@ -3869,7 +3869,7 @@ build_sharded(int client_fd, const CuvsCmdFrame *cmd, const char *index_dir,
         off += shard_n;
     }
 
-    /* ADR-069 Bug #2: builds done (or aborted) — release every shard reservation.
+    /* ADR-070 Bug #2: builds done (or aborted) — release every shard reservation.
      * The lock is held continuously from here through the registry insert below,
      * so the shards' VRAM is accounted by the registry entry (success) or freed
      * (error paths) at the next unlock; no reservation must outlive this point.
@@ -4347,7 +4347,7 @@ handle_build(int client_fd, const CuvsCmdFrame *cmd)
         return;
     }
 
-    /* ADR-069 Bug #2: reserve the VRAM, then release g_index_mutex for the
+    /* ADR-070 Bug #2: reserve the VRAM, then release g_index_mutex for the
      * multi-minute GPU build so concurrent searches/stats/drops are not blocked.
      * total_vram_used() counts g_pending_build_vram, so concurrent admission and
      * eviction stay correct while we build unlocked. vecs/mem are per-request
@@ -4363,7 +4363,7 @@ handle_build(int client_fd, const CuvsCmdFrame *cmd)
                                                  cmd->build_algo, target_gpu);
     if (!new_handle && cuvs_last_build_was_oom())
     {
-        /* ADR-069 Bug #3: the build hit a VRAM OOM (estimate_vram_bytes excludes
+        /* ADR-070 Bug #3: the build hit a VRAM OOM (estimate_vram_bytes excludes
          * CAGRA build-time scratch, so admission can pass yet the build OOM).
          * Briefly retake the lock to evict an LRU index, then retry once (only if
          * eviction freed VRAM). evict_lru now safely handles IVF-PQ/sharded LRUs. */
@@ -4963,7 +4963,7 @@ handle_build_multi(int client_fd, const CuvsCmdFrame *cmd, const char *index_dir
             goto fail;
         }
 
-        /* ADR-069 Bug #2: reserve VRAM, then release the lock for the multi-H2D
+        /* ADR-070 Bug #2: reserve VRAM, then release the lock for the multi-H2D
          * GPU build so concurrent searches/stats/drops aren't blocked. Partials
          * (part_vecs/maps) are per-request, so reading them unlocked is safe;
          * total_vram_used() counts g_pending_build_vram during the window. */
@@ -4977,7 +4977,7 @@ handle_build_multi(int client_fd, const CuvsCmdFrame *cmd, const char *index_dir
                                             cmd->build_algo, target_gpu);
         if (!new_handle && cuvs_last_build_was_oom())
         {
-            /* ADR-069 Bug #3: VRAM OOM (scratch not covered by ensure_vram) —
+            /* ADR-070 Bug #3: VRAM OOM (scratch not covered by ensure_vram) —
              * briefly retake the lock to evict an LRU index, then retry once. */
             pthread_mutex_lock(&g_index_mutex);
             int evicted = (evict_lru(target_gpu) > 0);
@@ -6390,7 +6390,7 @@ handle_inject_extend_oom(int client_fd, const CuvsCmdFrame *cmd)
     send_all(client_fd, &ok, sizeof(ok));
 }
 
-/* handle_inject_build_oom — test helper (ADR-069 Bug #3): arm synthetic OOM for
+/* handle_inject_build_oom — test helper (ADR-070 Bug #3): arm synthetic OOM for
  * the next cmd->dim cuvs_cagra_build calls, so a test can exercise the daemon's
  * evict-and-retry path deterministically. cmd->dim == 0 disarms. */
 static void

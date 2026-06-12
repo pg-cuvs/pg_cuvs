@@ -78,7 +78,7 @@ jobs:
           export PATH=/usr/lib/postgresql/16/bin:$PATH
           make PGCUVS_CPU_SHIM=1
           sudo env "PATH=$PATH" make PGCUVS_CPU_SHIM=1 install
-          # Daemon built with AddressSanitizer (ADR-069: capture the Bug #3 OOM
+          # Daemon built with AddressSanitizer (ADR-070: capture the Bug #3 OOM
           # evict-retry crash backtrace; permanent UAF/overflow coverage). The .so
           # stays non-ASAN (built above) so PostgreSQL loads it normally.
           make PGCUVS_CPU_SHIM=1 server \

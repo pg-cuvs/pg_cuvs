@@ -330,7 +330,7 @@ int cuvs_free_vram(int device_id);
  * When armed, the next extend call throws bad_alloc and self-clears the flag. */
 void cuvs_set_inject_extend_oom(int enable);
 
-/* ADR-069 Bug #3: was the most recent cuvs_cagra_build[_multi] failure (NULL
+/* ADR-070 Bug #3: was the most recent cuvs_cagra_build[_multi] failure (NULL
  * return) caused by an out-of-memory condition? Returns 1 and clears the flag,
  * so the daemon can distinguish a VRAM OOM (retry after eviction is worthwhile)
  * from a non-OOM build failure. */

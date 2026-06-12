@@ -3,7 +3,7 @@
 > **목적**: ROADMAP "릴리스 준비 — 문서·운영 정비"가 바로 소비할 입력. 흩어진 레버/거버넌스 지식을
 > 한곳에 모은 **작업용 reference**다. 문서 정리 시 §1·§2·§3은 운영자 reference/플레이북으로 승격하고,
 > §5(감사 TODO)는 그 작업의 체크리스트로 쓴다.
-> **정확성**: 레버 목록은 소스에서 추출(2026-06-11). 근거: ADR-069(design/DECISIONS.md), 세션 보고서
+> **정확성**: 레버 목록은 소스에서 추출(2026-06-11). 근거: ADR-070(design/DECISIONS.md), 세션 보고서
 > docs/reports/2026-06-11-resource-governance-audit.md, PR #54.
 > **상태 표기**: 이 문서 자체가 "현행 SSOT 후보"다. 운영자 문서로 승격되기 전까지는 작업 문서로 본다.
 
@@ -85,7 +85,7 @@ GUC 34개(`cuvs.*` 33 + `enable_cuvs`) · 인덱스 reloption 11개 · 데몬 CL
 
 ---
 
-## §2. 표준 PostgreSQL 레버 상호작용 (운영자 관점, ADR-069)
+## §2. 표준 PostgreSQL 레버 상호작용 (운영자 관점, ADR-070)
 
 > **원칙**: 표준 PG 레버는 **PG 자신의 enforcement 기계(fd.c temp 파일, MemoryContext palloc, executor 취소)를
 > 통과하는 자원만** 강제할 수 있다. pg_cuvs의 핵심 자원(memfd/shm 코퍼스 · 데몬 host RAM · GPU VRAM ·
@@ -172,15 +172,15 @@ docs/best-practices.md / docs/playbooks/*.
   GUC 12개만 + 스테일 + `design/`(내부).
 - §1을 `docs/reference-guc.md`(또는 가이드사이트 References) 운영자 reference로 승격.
 
-### 5.3 [높음] ADR-069 거버넌스가 운영자 문서에 0건
+### 5.3 [높음] ADR-070 거버넌스가 운영자 문서에 0건
 - `maintenance_work_mem`/`temp_file_limit`/`cgroup`/`MemoryMax` 언급이 README/OPS/best-practices/playbooks에
-  **전무**(코드로 확인). ADR-069 + 세션 보고서에만 존재.
+  **전무**(코드로 확인). ADR-070 + 세션 보고서에만 존재.
 - 운영자가 `maintenance_work_mem`로 빌드 메모리 제한 시도 → 조용히 무효(경고 없음).
 - **조치**: §2를 OPS 플레이북 "표준 PG 레버" 절로 승격.
 
 ### 5.4 [중간] 신규 산출물이 런북에 미반영(backport 필요)
 - `pg_stat_gpu_fallback` 뷰(PR#43) — 모든 playbook에 **0건**(fallback 급증의 핵심 관측 지표인데).
-- ADR-069 수정(IVF-PQ eviction 크래시, 빌드 OOM evict-retry) — 세션 보고서에만; `vram-oom-fallback.md`/
+- ADR-070 수정(IVF-PQ eviction 크래시, 빌드 OOM evict-retry) — 세션 보고서에만; `vram-oom-fallback.md`/
   `create-index-failure-diagnosis.md`에 미반영.
 - 모니터링 임계값이 4개 문서에 산재 → 단일 알림 기준 없음.
 
