@@ -11,8 +11,8 @@
 
 # ---- PGXS configuration -------------------------------------------------
 EXTENSION      = pg_cuvs
-EXTVERSION     = 0.1.0
-DATA           = sql/pg_cuvs--$(EXTVERSION).sql \
+EXTVERSION     = 0.3.0
+DATA           = sql/pg_cuvs--0.1.0.sql \
                  sql/pg_cuvs--0.1.0--0.2.0.sql \
                  sql/pg_cuvs--0.2.0.sql \
                  sql/pg_cuvs--0.2.0--0.3.0.sql \

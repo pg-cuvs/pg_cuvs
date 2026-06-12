@@ -17,7 +17,7 @@
 | 3L | GPU brute force 검색 모드 (`.vectors` sidecar, `search_mode`/`bf_precision` GUC, micro-batching, sharded BF). installcheck GREEN, recall@10=1.0 (ADR-039) |
 | 3M | 배치 검색 API (`CUVS_OP_SEARCH_BATCH`, `pg_cuvs_batch_search` SRF, CAGRA/BF/sharded 지원). installcheck GREEN, Q×K top-k 일치 (ADR-040) |
 | 3H-full | 운영 runbook 4종 추가 (capacity-planning, replica-bootstrap, release-upgrade, benchmark-runbook) + 기존 3H-light. TBD: streaming 물리복제 / cross-version upgrade 검증 |
-| 3B | DiskANN/NVMe cold tier — **NO-GO** (cuVS 26.04 PQFlash 미완성, 재검토 조건: 1B+ 수요 또는 cuVS stable) |
+| 3B | DiskANN/NVMe cold tier — **NO-GO** (cuVS 26.04 PQFlash 미완성, 재검토 조건: 1B+ 수요 또는 cuVS stable; 재개 시 구현 방향 ADR-072) |
 | 하드닝 | `index_dir` reloption — cross-session seqscan 폴백 근절. 인덱스가 빌드 디렉터리를 `pg_class.reloptions`에 self-describe (reloption > 세션 GUC > `$PGDATA` 3단계). installcheck GREEN, no-GUC 연결에서 Index Scan 실증 (ADR-045) |
 | 하드닝 | orphan artifact GC (`pg_cuvs_gc_orphans(do_delete)`) — 데몬-down DROP / DROP DATABASE / 재시작 좀비 재로드로 인한 VRAM+디스크 누수 근절. backend가 `index_dir`을 `pg_index`/`pg_database`와 대조(daemon은 sidecar라 카탈로그 불가). dry-run 기본. installcheck GREEN(gc_orphans) + 데몬-down e2e 검증. ADR-009 정정 반영 (ADR-046) |
 | 4-preflight | 연산 지역성 프로파일링 완료 (A100/PG16, N=1M dim=1024). 검색 GPU:IPC≈2:1(GPU-bound), 빌드 GPU 82%/backend 18%, export buffer-mgr 39%, TOAST vs PLAIN 8%. 측정 근거로 4A 하향. `docs/profiling-results.md` (ADR-044) |
@@ -84,6 +84,16 @@
   - 작업: 운영 생애주기 전반 단일화 — 기동·모니터링(어느 `pg_stat_gpu_*` 뷰·임계값), 장애모드·복구(데몬 다운·VRAM OOM·fallback 급증·eviction 폭주), 업그레이드/롤백, 백업/복구(GCS 스냅샷), 스케일링·캐파, 인시던트 대응. 흩어진 런북을 OPS_GPU_PLAYBOOK로 연결.
   - **완료 기준**: 신규 운영자가 플레이북만으로 배포→모니터→장애대응→업그레이드 수행 가능; 각 절차에 실 명령·뷰·임계값 포함.
 
+- **GitHub org 이전 (가이드 사이트보다 *선행* — Pages URL이 여기 종속)**
+  - 결정: `ysys143/pg_cuvs` → **`pg-cuvs/pg_cuvs`** (org `pg-cuvs` 가용 확인 2026-06-13). GitHub org명은 underscore 불가라 org는 하이픈(`pg-cuvs`), repo는 확장명 그대로 `pg_cuvs` 유지(= `CREATE EXTENSION pg_cuvs`/`.so`와 일치). 대안 `pgcuvs/pg_cuvs`.
+  - 왜: 신뢰도(pgvector/timescale/tensorchord 전부 org) + 개인 핸들과 분리 + **cuVS 등재·가이드 사이트가 링크 걸기 전에 최종 주소 확정**(리다이렉트보다 처음부터 옳은 주소).
+  - transfer는 GitHub 내장(stars/issues/PR/history 보존 + 옛 URL 자동 리다이렉트, issue #56·브랜치 동반; 계정 작업이라 사람이 UI에서 실행). **이전 후 재배선 필수**:
+    - **self-hosted runner 재등록** — `config.sh remove` 후 새 repo URL로 재등록 (현재 `ysys143-pg_cuvs.pg-cuvs-a100`; `docs/ci-gpu-setup.md`). 안 하면 Tier-2 GPU CI 죽음.
+    - **WIF attribute-condition** `assertion.repository=='ysys143/pg_cuvs'` 갱신 — 안 하면 키리스 인증 거부.
+    - **가이드 사이트 URL** `ysys143.github.io/pg_cuvs` → `pg-cuvs.github.io/pg_cuvs` (또는 커스텀 도메인으로 완전 디커플링 — org 재변경에도 docs URL 불변).
+    - 하드코딩 repo 참조 일괄 갱신: `ROADMAP.md`(아래 가이드 사이트 항목)·`docs/ci-gpu-setup.md`·`docs/reports/*`.
+  - **완료 기준**: `pg-cuvs/pg_cuvs` 라이브 + Tier-2 GPU CI가 새 repo에서 GREEN + Pages 최종 URL 확정.
+
 - **가이드 사이트 발행 (GitHub Pages, MkDocs)**
   - 레퍼런스: [PG-Strom 문서](https://heterodb.github.io/pg-strom/)(MkDocs + RTD 테마, GitHub Pages, **동일 PostgreSQL License·같은 PG-GPU 카테고리** → IA 모델: Home/Install/Tutorial/Advanced Features/References/Release Notes) + [cuVS integrations](https://docs.rapids.ai/api/cuvs/stable/integrations/)(Faiss/Milvus/Lucene/Kinetica 등재; **PostgreSQL/DB 확장 전무 → pg_cuvs 첫 등재 기회**, 등재엔 dedicated 페이지+링크 필요).
   - 작업: MkDocs(Material 또는 RTD 테마) + GitHub Actions로 Pages 발행(`ysys143.github.io/pg_cuvs`). IA는 PG-Strom 미러 — Home(개요) / Install(설치·버전매트릭스) / Tutorial(quickstart·필터검색·멀티테넌트) / Features(검색 모드·인덱스 AM·GUC·reloption) / References(SQL 함수·뷰·기법 요약) / Operations(플레이북) / Release Notes.
@@ -135,6 +145,9 @@
 스펙: `docs/spec-audit-2026-06-05.md` | ADR-011 / ADR-017 / ADR-070 | `design/OPS_GPU_PLAYBOOK.md`
 
 ### 기타
+
+#### 코드 헬스 / 리팩토링 (트리거: 해당 파일 손볼 때 또는 릴리스 후)
+복잡도/고아코드 정리 — 순서·결정·게이트는 [design/REFACTOR_PLAN.md](design/REFACTOR_PLAN.md) (2026-06-12 3-에이전트 감사 기반). 핵심: `handle_search`(934줄) 비-mutex 모드 추출 + preamble 단일화(`resolve_index_for_search`)는 안전→우선, **mutex dance는 영구 보류(주석만)**. Tier-1(dead symbols·EXTVERSION 0.1.0→0.3.0·고아 스크립트/문서·doc-map 보강)은 저위험 즉시.
 
 #### Streaming BF — sidecar-gather 경로 — **1차 구현 완료** (ADR-064)
 **왜**: VRAM을 초과하는 데이터셋에서 고선택성 필터 쿼리를 GPU로 처리하는 경로. 현재 GPU 검색은 인덱스 전체가 VRAM에 상주해야 동작 — VRAM 초과 시 OOM 또는 multi-GPU sharding만 가능.

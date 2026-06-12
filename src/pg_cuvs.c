@@ -167,7 +167,6 @@ static int32    cuvs_last_n_results = -1;        /* -1 = no scan yet */
 static int32    cuvs_last_k_requested = 0;
 static Oid      cuvs_last_index_oid = InvalidOid;
 static uint32_t cuvs_last_metric    = 0;
-static int32    cuvs_last_dim       = 0;
 
 void _PG_init(void);
 
@@ -3006,7 +3005,6 @@ cuvs_gettuple(IndexScanDesc scan, ScanDirection dir)
         cuvs_last_k_requested  = k;
         cuvs_last_index_oid    = index_oid;
         cuvs_last_metric       = metric;
-        cuvs_last_dim          = dim;
 
         if (cuvs_debug)
         {
@@ -3607,7 +3605,6 @@ ivfpq_gettuple(IndexScanDesc scan, ScanDirection dir)
         cuvs_last_k_requested = k;
         cuvs_last_index_oid   = index_oid;
         cuvs_last_metric      = metric;
-        cuvs_last_dim         = dim;
         ss->cur = 0;
 
         if (cuvs_debug)
