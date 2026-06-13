@@ -28,7 +28,7 @@
 | Need | Write pattern | Recommended path |
 |------|--------------|-----------------|
 | Exact (recall=1.0), read-heavy, stable corpus | Infrequent inserts/updates | **`USING flat`** — resident exact BF, recall=1.0, O(N) scan, VRAM warm. First-class AM (ADR-073) |
-| Exact (recall=1.0), write-heavy or always-fresh | Frequent inserts, ad-hoc filters | **transient BF** (`cuvs.gpu_bruteforce`, planned/future) — no index, every query scans live heap |
+| Exact (recall=1.0), write-heavy or always-fresh | Frequent inserts, ad-hoc filters | **transient BF** (`cuvs.gpu_bruteforce=on`, ADR-073) — no index, every query scans live heap |
 | Approximate OK, any N | Any | **`USING cagra`** — ~1.5 ms flat, ~1200 QPS, SLA-robust. GPU workhorse |
 | VRAM too small for cagra graph | Any | **`USING ivfpq`** — 10–100x VRAM savings via PQ, approximate |
 | No GPU at query time | Any | **`USING pg_cuvs_hnsw`** — GPU build, CPU serve |
@@ -37,6 +37,14 @@
 GPU AMs: O(N) copy, no graph or PQ); periodic compaction merges delta into `.vectors`. Read cost
 = O(N) per query (full `.vectors` scan). For approximate search or very large N where O(N) scan
 exceeds your latency budget, use `cagra`/`ivfpq` instead.
+
+**transient BF cost characteristics (`cuvs.gpu_bruteforce=on`):** write cost = zero (no index to
+maintain). Read cost = per-query heap scan + detoast + H2D transfer — paid fresh every call.
+Host corpus is capped by `cuvs.gpu_bruteforce_max_mb` (default 2048 MiB); exceeding it fails
+closed with an ERROR. VRAM admission is non-evicting: a transient corpus never displaces a
+resident `flat` or `cagra` index. Use when write velocity or always-fresh semantics make
+maintaining a `flat` index impractical. For stable, read-heavy corpora `USING flat` is more
+efficient (corpus loaded once, served from resident VRAM).
 
 **`flat` VRAM sizing:** N·dim·4 bytes for float32 resident BF (e.g. 1M×1024 ≈ 4 GB). Use
 `WITH (precision='float16')` to halve it. If the corpus exceeds free VRAM at build time the

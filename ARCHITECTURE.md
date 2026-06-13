@@ -33,7 +33,7 @@ Invariants that shape everything below:
 
 | Component | Process | Source | Owns |
 |-----------|---------|--------|------|
-| Extension `.so` | each PostgreSQL backend | `src/pg_cuvs.c` | Index AM handlers (`cagra`, `flat`, `ivfpq`, `pg_cuvs_hnsw`), planner cost hook, GUCs, reloptions, SQL functions, object-access (DROP) hook |
+| Extension `.so` | each PostgreSQL backend | `src/pg_cuvs.c` | Index AM handlers (`cagra`, `flat`, `ivfpq`, `pg_cuvs_hnsw`), planner cost hook, `set_rel_pathlist_hook` (D-wedge + transient BF `CuvsTransientBF`), GUCs, reloptions, SQL functions, object-access (DROP) hook |
 | Sidecar daemon | standalone `pg_cuvs_server` | `src/pg_cuvs_server.c` | The CUDA context, VRAM-resident index registry, build/search/evict/reload, warmup pool, GCS upload |
 | Compaction bgworker | PostgreSQL background worker | `src/pg_cuvs_compaction.c` | Phase 4C auto-`REINDEX CONCURRENTLY` when delta growth crosses a threshold |
 | IPC client | linked into the backend | `src/cuvs_ipc.c` / `.h` | UDS framing, shm/memfd payload handoff, interruptible waits |
@@ -114,6 +114,57 @@ Key differences from cagra:
 - DROP: `cuvs_object_access` matches the flat index OID and calls `free_main_bf_cache` to release
   the resident BF VRAM before removing artifacts.
 
+### 3.1b Transient no-index brute force (`cuvs.gpu_bruteforce`)
+
+When `cuvs.gpu_bruteforce = on`, the extension's `set_rel_pathlist_hook` fires for every base
+relation scan. The hook runs two independent sub-hooks:
+
+- **`cuvs_dwedge_add_path`** (ADR-063) — adds the D-wedge filtered CustomScan path for indexed
+  relations.
+- **`cuvs_transient_bf_add_path`** — adds the `CuvsTransientBF` CustomScan path for the
+  no-index transient corpus case.
+
+`cuvs_transient_bf_add_path` inspects the query shape and only adds the path when all of the
+following hold: single base relation (no join), no OFFSET, no GROUP BY / DISTINCT / HAVING /
+window, a plan-time Const LIMIT in the range 1..100000, and exactly one distance ORDER BY key.
+Any shape violation causes it to return without adding a path; the planner then picks seqscan
+as usual. No pathkeys are claimed — the planner keeps `Limit → Sort → CustomScan`.
+
+Execution flow:
+
+```
+executor (CuvsTransientBF ExecCustomScan)          daemon (handle_search_bf_transient)
+  scan live heap under estate->es_snapshot
+  apply WHERE quals (filter-first)
+  detoast vectors into per-query corpus
+  bind query vector at execution time
+  ($1 parametrized queries: NOT downgraded)
+  IPC SEARCH_BF_TRANSIENT (op 22) ────────────▶  non-evicting VRAM admission:
+                                                    never evicts a resident flat/cagra index
+                                                    corpus too large → OOM_FALLBACK → backend ERROR
+                                                  cuvs_brute_force_search (exact, recall=1.0)
+                                                  no IndexEntry created
+  reply: top-k (tid, dist) ◀──────────────────   reply
+  heap recheck (MVCC, ACL)
+  return ≤ k visible rows
+```
+
+Key differences from the `flat` AM (3.1a):
+- **No on-disk artifacts and no IndexEntry.** The corpus is materialized per-query from the heap;
+  nothing is written to `index_dir` and no daemon registry entry is created.
+- **Non-evicting admission.** The daemon checks the VRAM budget before accepting the corpus, but
+  will never evict a resident index to make room. On `OOM_FALLBACK` the backend raises an ERROR
+  (fail-closed); no silent CPU fallback.
+- **Host cap.** The backend enforces `cuvs.gpu_bruteforce_max_mb` before the IPC handoff: if the
+  materialized corpus exceeds the limit the query fails with an ERROR before touching the daemon.
+- **Write cost zero.** There is no index structure to update on INSERT/UPDATE/DELETE.
+- **Read cost per query.** Every query pays heap scan + detoast + H2D transfer regardless of how
+  recently the same query ran. For stable, read-heavy corpora `USING flat` (3.1a) amortizes this
+  cost across queries.
+
+Verified Tier-2 on A100/PG16 (2026-06-14): `make installcheck` 32/32 GREEN + isolation 3/3 GREEN
+(new `transient_bf` test + regression fence).
+
 ### 3.2 Search
 
 ```
@@ -154,7 +205,9 @@ it is visible in `pg_stat_gpu_fallback`, never in the daemon-sourced `pg_stat_gp
 - **Operations** (`CUVS_OP_*`): SEARCH, BUILD, STATUS, MARK_STALE, CACHE_STATS, SHARD_STATS,
   DROP_INDEX, EXPORT_ADJACENCY, EXPORT_HNSW_SHM, SEARCH_BATCH, BUILD_IVFPQ, SEARCH_IVFPQ,
   EXTEND, COMPACT, SEARCH_STREAM_BF, **BUILD_FLAT** (op 21, vectors-only build for the `flat`
-  AM — no graph), plus test-only VRAM-injection ops.
+  AM — no graph), **SEARCH_BF_TRANSIENT** (op 22, transient no-index corpus BF — no IndexEntry,
+  non-evicting VRAM admission, handler `handle_search_bf_transient`), plus test-only
+  VRAM-injection ops.
 - **Reply status** (`CUVS_STATUS_*`): OK, ERROR, OOM_FALLBACK, NOT_FOUND, UNAVAILABLE,
   BUILD_FAILED, PERSIST_FAILED, DIM_MISMATCH, METRIC_MISMATCH, STALE, NO_VECTORS, CANCELED.
   Each maps to a specific backend reaction (error vs. CPU fallback vs. reload-and-retry).

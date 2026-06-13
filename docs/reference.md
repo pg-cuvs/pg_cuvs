@@ -37,6 +37,46 @@ corpora where recall=1.0 is required; use `cagra`/`ivfpq` for approximate search
 > path couples an exact-BF workload to an unnecessary graph build and cannot be independently cost-
 > calibrated by the planner.
 
+### Transient no-index GPU brute-force (`cuvs.gpu_bruteforce`)
+
+When `cuvs.gpu_bruteforce = on`, the planner routes a no-index single-table
+`ORDER BY veccol <-> q LIMIT k` query to a transient GPU exact brute-force Custom Scan node named
+`CuvsTransientBF` — no index required. This is the W1 counterpart to `USING flat` (W2 resident
+index): use it when write velocity or always-fresh semantics make maintaining a flat index
+impractical.
+
+Key properties:
+- **Exact** (recall@k = 1.0) and **always fresh** — scans the live heap under the query snapshot
+  every call; no delta or tombstone logic needed.
+- **Filter-first**: WHERE clauses are applied before the GPU handoff, not post-filtered.
+- **Exec-time parameter binding**: `ORDER BY col <-> $1 LIMIT k` parametrized queries are NOT
+  downgraded to approximate search.
+- **Fires only for the bounded shape**: single base relation (no join), no OFFSET, no GROUP
+  BY/DISTINCT/HAVING/window, a plan-time Const LIMIT in 1..100000, single distance ORDER BY key.
+  Any other shape falls back to seqscan. The planner keeps `Limit → Sort → CustomScan` (no
+  pathkeys claimed).
+- **Host cap** (`cuvs.gpu_bruteforce_max_mb`, default 2048): if the per-query corpus materialized
+  on the host exceeds this limit, the query fails closed with a clear ERROR rather than silently
+  falling back.
+- **Non-evicting VRAM admission**: the daemon never evicts a resident `flat` or `cagra` index to
+  make room for a transient corpus. If the corpus exceeds the VRAM budget the daemon returns
+  `OOM_FALLBACK` and the backend raises an ERROR; no crash.
+- **Write cost zero** (no index to maintain). Read cost is paid per query: heap scan + detoast +
+  H2D transfer every call. For read-heavy stable corpora, `USING flat` (W2) is more efficient.
+
+Mental model: "flat index present → use it (A1/W2); no index + `gpu_bruteforce=on` → B (W1)."
+
+Verified Tier-2 on A100/PG16 (2026-06-14): `make installcheck` 32/32 GREEN + isolation 3/3 GREEN.
+
+```sql
+SET cuvs.gpu_bruteforce = on;
+-- No index needed; a plain ORDER BY query uses CuvsTransientBF:
+SELECT ctid, embedding <-> '[1,2,3]' AS dist
+FROM items
+ORDER BY embedding <-> '[1,2,3]'
+LIMIT 10;
+```
+
 `ivfpq` trades recall for 10–100× lower VRAM via product quantization. `pg_cuvs_hnsw` is the GPU
 *build accelerator*: it builds a pgvector HNSW from a CAGRA graph without pgvector's CPU build,
 then serves entirely through pgvector (its query path is pgvector's). See also
@@ -100,6 +140,8 @@ Defaults and ranges are from source. "Set by" is the minimum role/scope: `USERSE
 | GUC | Type | Default | Range | Set by | Purpose |
 |-----|------|---------|-------|--------|---------|
 | `cuvs.search_mode` | enum | `cagra` | `cagra`, `brute_force` | USERSET | CAGRA ANN vs GPU exact BF on a `cagra` index. `brute_force` value is **deprecated** — use `USING flat` AM instead. A `flat` index always forces exact BF regardless of this GUC |
+| `cuvs.gpu_bruteforce` | enum | `off` | `off`, `auto`, `on` | USERSET | Route a no-index single-table vector top-k query to the transient GPU BF CustomScan (`CuvsTransientBF`). `auto` behaves as `off` in v1 until cost calibration is complete. `on` enables the path unconditionally for qualifying query shapes (ADR-073) |
+| `cuvs.gpu_bruteforce_max_mb` | int | `2048` | 1–INT_MAX | USERSET | Host-side hard cap (MiB) on the per-query corpus materialized before the GPU handoff. Queries whose corpus exceeds this limit fail closed with an ERROR |
 | `cuvs.bf_precision` | enum | `float32` | `float32`, `float16` | USERSET | Resident BF index precision; float16 halves VRAM |
 | `cuvs.bf_batch_wait_us` | int | `0` (off) | 0–10000 | USERSET | Daemon BF micro-batch coalescing window (µs) |
 | `cuvs.cpu_hnsw_fallback` | bool | `off` | — | USERSET | Serve from the `.hnsw` sidecar instead of GPU CAGRA |

@@ -2871,13 +2871,13 @@ load-dependent `bf_batch_wait` 라우팅과 `CUVS_STARTUP_COST` 재보정은 이
 ## ADR-073 — GPU exact brute-force 1급화: 상주 `flat` AM (A1) + transient 무인덱스 (B, 후속) + 플래너 라우팅
 
 **날짜**: 2026-06-14
-**상태**: ACCEPTED. **A1(`flat` 상주 AM) 구현·VM 검증 완료**(2026-06-14, A100). B(transient)·라우팅 캘리브레이션은 후속 단계(미착수). ADR-071을 **흡수/supersede**한다.
+**상태**: ACCEPTED. **A1(`flat` 상주 AM) + B(transient 무인덱스 CustomScan) 구현·VM 검증 완료**(2026-06-14, A100). 라우팅 cost 캘리브레이션(`cuvs.gpu_bruteforce` off→auto 승격)은 후속 단계. ADR-071을 **흡수/supersede**한다.
 
 **문제**: GPU exact brute-force는 cuVS를 가장 잘 드러내는 핵심 기둥(filtered exact BF = CPU 대응물 없는 cuVS-네이티브 차별점)인데, 두 가지로 *2급 시민*에 머물러 있었다. (1) BF가 cagra 인덱스의 `cuvs.search_mode='brute_force'` **옵션**으로만 접근 가능 → 비싼 그래프 빌드를 강제당하고 플래너가 BF를 독립 비용화 못함. (2) ADR-071의 `bruteforce` AM 안은 `CREATE INDEX`로 "무빌드"를 선언하는 **형용모순**.
 
 **결정**: GPU exact BF를 1급으로 승격. 능력은 하나(matmul→L2→topK, exact, recall=1.0)이고 **워크로드가 물질화 방식을 가른다** — 두 체제로 구현한다.
 - **A1 = 상주 `flat` AM (W2: 읽기 多·쓰기 간헐·안정 코퍼스).** `CREATE INDEX … USING flat (… vector_l2_ops) WITH (precision='float16')`. *진짜 평면 벡터 저장소(.vectors)를 지으므로* `flat` 명명이 정직(FAISS IndexFlat식; `bruteforce` 형용모순 회피). 빌드 1회 분할상환·VRAM warm. 신선도는 기존 cagra delta/tombstone 재사용(INSERT→`.delta`, 검색 시 CPU-exact 머지).
-- **B = transient 무인덱스 (W1: 쓰기 폭주·항상최신·ad-hoc 필터).** `SET cuvs.gpu_bruteforce=on`(working name; 기본 off→Tier-2 검증 후 auto). 인덱스 없이 플래너가 vector ORDER BY를 transient GPU-BF CustomScan으로 라우팅. **후속 별도 세션**(설계+적대검증; round-2 FATAL = Sort 수용 + 실행시 파라미터 바인딩으로 회피).
+- **B = transient 무인덱스 (W1: 쓰기 폭주·항상최신·ad-hoc 필터).** `SET cuvs.gpu_bruteforce=on`(기본 off→Tier-2 캘리브레이션 후 auto). 인덱스 없이 플래너가 vector ORDER BY를 transient GPU-BF CustomScan(`CuvsTransientBF`)으로 라우팅. **구현·검증 완료**(round-2 FATAL = Sort 수용(pathkey 미주장) + 실행시 파라미터 바인딩으로 회피).
 - **멘탈 모델**: "flat 인덱스 생성 여부 = 유일한 W2/W1 스위치." 사용자는 A1/B를 몰라도 됨.
 
 **라우팅 매트릭스** (플래너 cost 자동, 사용자 개입 0): exact+읽기→**A1** / exact+쓰기→**B** / 근사+대규모 N→**cagra·ivfpq**. A1은 exact지만 O(N) 전수 스캔 → 근사 허용+대규모면 cagra가 *읽기 속도*로 이김. read/write 트레이드오프: **A1은 쓰기에 지불·읽기를 산다**(인덱스 中 최경량: O(N) 복사, 그래프/PQ 없음), **B는 읽기에 지불·쓰기를 산다**(쓰기 비용 0).
@@ -2905,6 +2905,17 @@ load-dependent `bf_batch_wait` 라우팅과 `CUVS_STARTUP_COST` 재보정은 이
 
 **검증 증거 (Tier-2, A100 `pg-cuvs-dev`/PG16, 2026-06-14)**: `make installcheck` **31/31 GREEN**(flat_smoke + 회귀 펜스 6 전부) + isolation **3/3 GREEN**. flat_smoke 5 assertion 전부 통과: recall@10=1.0 vs seqscan **with `search_mode`=DEFAULT('cagra')**(GUC 무관 증명), `Index Scan using flat_l2` + Sort 노드 없음, INSERT(`id=1001`) delta 머지 가시, `<-> $1` 파라미터 exact, DROP 무크래시. **재시작 내구성** 별도 검증: flat 빌드→데몬 재시작→동일 exact 결과(`5,6,31,4,30` = seqscan GT, `.vectors`에서 재로드). **업그레이드 경로** 0.3.0→0.4.0 `ALTER EXTENSION UPDATE` 동작.
 
-**후속(carry-forward)**: B(transient CustomScan) 설계+적대검증 세션 / 라우팅 cost 캘리브레이션(Tier-2 측정, `cuvs.gpu_bruteforce` off→auto 승격, ADR-069 루프) / B GUC 최종명 + release-prep(모든 flat/B 작업 뒤).
+---
+
+**B 구현 (검증 완료, 2026-06-14)** — transient 무인덱스 GPU exact BF CustomScan:
+- **`pg_cuvs.c`**: `set_rel_pathlist_hook`을 `cuvs_dwedge_add_path`(ADR-063, **동작 보존**) + `cuvs_transient_bf_add_path`(B)로 분리 — D-wedge의 "CAGRA 인덱스 필요 + WHERE 필요" early-return이 B(무인덱스·WHERE 선택적)를 막던 모순 해소. B는 **무인덱스 단일테이블 top-k에서만 발화**(FATAL-k 가드: 단일 base rel·조인/OFFSET/GROUP·DISTINCT·WINDOW·HAVING 없음·Const LIMIT 1..100000·단일 거리 ORDER BY 키 — LIMIT k가 rel을 증명적으로 bound하는 유일 shape). **pathkey 미주장(Sort 수용)**. 쿼리벡터 Expr은 `custom_exprs`에 저장→실행시 `ExecInitExpr`/`ExecEvalExpr` 바인딩(`$1` 근사 cagra 강등 회피). CustomScan은 `estate->es_snapshot`으로 힙 스캔(filter-first·NULL 벡터 skip)→leak-safe huge 코퍼스 컨텍스트(host 하드캡)→transient verb→top-k TID 페치. `parallel_safe=false`. metric은 `pg_amop`(amoppurpose='o') 스캔으로 거리연산자→opfamily→이름 매핑(`<->`는 btree 정렬연산자가 아니라 `get_ordering_op_properties` 부적합 — 구현 중 발견·수정). 신규 GUC `cuvs.gpu_bruteforce`(off/auto/on, 기본 off; auto는 v1에서 off로 동작) + `cuvs.gpu_bruteforce_max_mb`(host 코퍼스 하드캡, 기본 2GiB).
+- **`cuvs_ipc.{h,c}`**: `CUVS_OP_SEARCH_BF_TRANSIENT`(22) + `cuvs_ipc_search_bf_transient` — 코퍼스 `[vecs][tids]`를 memfd(SCM_RIGHTS)/shm로 핸드오프(빌드 핸드오프 `CuvsBuildCorpus` 재사용), 쿼리는 별도 shm, 응답=header+`CuvsResult[]`. 비-OK는 fatal(B는 CPU fallback 없음); 데몬 에러메시지 반환. 코퍼스는 응답 후 close(shm 티어 데몬이 이름으로 open하는 레이스 회피).
+- **`pg_cuvs_server.c`**: `handle_search_bf_transient` — 코퍼스+쿼리 mmap, **비축출(non-evicting) VRAM admission**(`g_index_mutex` 하 `total_vram_used()+needed > budget` OR `needed > free` → `OOM_FALLBACK`; **resident flat/cagra 인덱스 절대 축출 안 함** — `ensure_vram`/`evict_lru` 미사용), `cuvs_brute_force_search`, row→tid 매핑, **IndexEntry 무접촉**(find_index/load_index/record_search_stat 미호출).
+
+**B 적대검증이 코드 전에 잡은 FATAL** (architect+critic 2-reviewer): (1) **FATAL-k** — `root->parse->limitCount`는 조인 inner-side/OFFSET/agg에서 해당 rel을 bound하지 않음(silent under-return) → 단일테이블 shape로 제한. (2) **FATAL-Expr** — 쿼리 Expr을 `custom_private`에 두면 setrefs/copyObject/parallel에서 깨짐 → `custom_exprs`로. (3) **C1 비축출** — `ensure_vram`(evict_lru) 재사용 시 one-shot 코퍼스가 resident 인덱스 축출(회귀) → 전용 비축출 체크. (4) **C2 훅 분리** — D-wedge early-return이 B 차단. (5) `parallel_safe=false`·`es_snapshot` 일관성(D-wedge의 이중 `GetTransactionSnapshot()` skew 회피)·호스트 OOM 하드캡·NULL 벡터 skip·결과버퍼 k-사이징.
+
+**B 검증 증거 (Tier-2, A100/PG16, 2026-06-14)**: `make installcheck` **32/32 GREEN**(transient_bf + 회귀 펜스 7) + isolation **3/3 GREEN**. transient_bf 5 assertion: `gpu_bruteforce=off`→`Seq Scan`(플랜 무변경), `on`→`Custom Scan (CuvsTransientBF)` under Sort + recall@10=1.0 vs seqscan, `<-> $1` prepared→CuvsTransientBF·exact(근사 강등 없음), WHERE 필터 exact(filter-first), 1-byte budget→`ERROR ... (status 2) ... fail-closed`·데몬 생존.
+
+**후속(carry-forward)**: 라우팅 cost 캘리브레이션(Tier-2 측정, `cuvs.gpu_bruteforce` off→auto 승격, ADR-069 루프) / release-prep(모든 flat/B 작업 뒤: BENCHMARK·doc-coherence·ops-playbook·GitHub Pages·org 이전).
 
 관련: ADR-071(흡수), ADR-039(BF GUC deprecation), ADR-049(AM-per-algo), ADR-061(filtered wedge), ADR-064(streaming BF), ADR-047(delta/tombstone freshness), 플랜 SSOT `snappy-strolling-brook.md`.
