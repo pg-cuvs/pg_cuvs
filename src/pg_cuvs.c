@@ -215,9 +215,14 @@ cuvs_object_access(ObjectAccessType access, Oid classId, Oid objectId,
         if (HeapTupleIsValid(tup))
         {
             Form_pg_class cf = (Form_pg_class) GETSTRUCT(tup);
+            /* ADR-073: a flat index also persists daemon artifacts (.tids/.vectors)
+             * and a resident BF cache, so its DROP must notify the daemon too —
+             * otherwise the artifacts orphan and a restart reloads them as zombies. */
+            Oid cagra_am = get_am_oid("cagra", true);
+            Oid flat_am  = get_am_oid("flat", true);
             if (cf->relkind == RELKIND_INDEX &&
-                cf->relam == get_am_oid("cagra", true) &&
-                OidIsValid(cf->relam))
+                OidIsValid(cf->relam) &&
+                (cf->relam == cagra_am || cf->relam == flat_am))
             {
                 MemoryContext old = MemoryContextSwitchTo(TopMemoryContext);
                 CuvsPendingDrop *pd = (CuvsPendingDrop *) palloc(sizeof(CuvsPendingDrop));
@@ -424,6 +429,88 @@ cuvs_ivfpq_amoptions(Datum reloptions, bool validate)
                                       tab, lengthof(tab));
 }
 
+/* ----------------------------------------------------------------
+ * ADR-073: flat AM reloptions — WITH (index_dir, precision)
+ *
+ * The flat AM is a standalone GPU exact brute-force index. It accepts the same
+ * index_dir override as cagra, plus a `precision` (float32|float16) selecting the
+ * resident BF index's precision. index_dir_offset MUST stay the first field after
+ * vl_len_ so this struct is layout-compatible with CuvsCagraOptions and the shared
+ * cuvs_reloption_index_dir / cuvs_resolve_index_dir_rel (which cast rd_options to
+ * CuvsCagraOptions) read a flat index's index_dir correctly.
+ * ---------------------------------------------------------------- */
+typedef struct CuvsFlatOptions
+{
+    int32 vl_len_;          /* varlena header — do not access directly */
+    int   index_dir_offset; /* relopt string offset; 0 = absent (LAYOUT-COMPATIBLE
+                             * with CuvsCagraOptions: must stay first) */
+    int   precision_offset; /* relopt string offset ('float32'|'float16');
+                             * 0 = absent -> fall back to cuvs.bf_precision GUC */
+} CuvsFlatOptions;
+
+static relopt_kind cuvs_flat_relopt_kind;
+
+/* Validate the precision string reloption at DDL time (fail-closed on typo). */
+static void
+cuvs_validate_precision(const char *value)
+{
+    if (value == NULL || value[0] == '\0')
+        return;   /* absent -> GUC fallback */
+    if (strcmp(value, "float32") != 0 && strcmp(value, "float16") != 0)
+        ereport(ERROR,
+                (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+                 errmsg("pg_cuvs: invalid precision \"%s\" for flat index", value),
+                 errhint("Valid values: float32, float16.")));
+}
+
+/* One-time relopt registration; called from _PG_init. */
+static void
+cuvs_flat_init_reloptions(void)
+{
+    cuvs_flat_relopt_kind = add_reloption_kind();
+    add_string_reloption(cuvs_flat_relopt_kind, "index_dir",
+                         "Directory holding this flat index's artifacts "
+                         "(overrides cuvs.index_dir for this index).",
+                         "", NULL, AccessExclusiveLock);
+    add_string_reloption(cuvs_flat_relopt_kind, "precision",
+                         "Resident brute-force precision: float32 | float16.",
+                         "float32", cuvs_validate_precision, AccessExclusiveLock);
+}
+
+static bytea *
+cuvs_flat_amoptions(Datum reloptions, bool validate)
+{
+    static const relopt_parse_elt tab[] = {
+        {"index_dir", RELOPT_TYPE_STRING,
+         offsetof(CuvsFlatOptions, index_dir_offset)},
+        {"precision", RELOPT_TYPE_STRING,
+         offsetof(CuvsFlatOptions, precision_offset)},
+    };
+    return (bytea *) build_reloptions(reloptions, validate,
+                                      cuvs_flat_relopt_kind,
+                                      sizeof(CuvsFlatOptions),
+                                      tab, lengthof(tab));
+}
+
+/* ADR-073: resolve a flat index's BF precision. A `precision` reloption wins;
+ * absent, it falls back to the cuvs.bf_precision GUC (handoff: "reuse bf_precision").
+ * Only called from the flat scan path (indexRel is a flat index). */
+static uint32_t
+cuvs_resolve_flat_precision(Relation indexRel)
+{
+    CuvsFlatOptions *opts = (CuvsFlatOptions *) indexRel->rd_options;
+
+    if (opts != NULL && opts->precision_offset != 0)
+    {
+        const char *s = (const char *) opts + opts->precision_offset;
+        if (strcmp(s, "float16") == 0)
+            return 1;
+        if (strcmp(s, "float32") == 0)
+            return 0;
+    }
+    return (uint32_t) cuvs_bf_precision;   /* GUC fallback */
+}
+
 /* 3S: polled by cuvs_ipc_search's reply wait. Reports a pending query cancel /
  * statement_timeout / backend termination WITHOUT servicing it (no longjmp — the
  * IPC layer must still close its socket and free shm). The caller raises the
@@ -582,6 +669,9 @@ _PG_init(void)
 
     /* 3P: register ivfpq WITH(n_lists, pq_bits, pq_dim) reloptions. */
     cuvs_ivfpq_init_reloptions();
+
+    /* ADR-073: register flat WITH(index_dir, precision) reloptions. */
+    cuvs_flat_init_reloptions();
 
     DefineCustomBoolVariable(
         "enable_cuvs",
@@ -1450,6 +1540,14 @@ cuvs_pread_all(int fd, off_t off, void *buf, size_t len)
 /* Tiny N-term: CAGRA is ~N-independent but must not beat seqscan at N->0. */
 #define CUVS_ROWS_COST         0.00001
 
+/* ADR-073: flat AM startup cost. The shared CUVS_STARTUP_COST (1000) was
+ * calibrated for CAGRA and leaves an exact flat scan losing to seqscan up to
+ * ~23k rows (operational-guide self-admitted miscalibration). A dedicated, ~20x
+ * lower constant fixes flat's calibration WITHOUT touching cagra's cost (the
+ * plan's inviolable "cagra path unchanged" regression-fence principle): flat has
+ * its own duplicated flat_amcostestimate, so this only moves the flat candidate. */
+#define CUVS_FLAT_STARTUP_COST 50.0
+
 /* PG16 amcostestimate is a direct C function pointer, not a SQL function.
  *
  * IMPORTANT: This runs in the planner on every query — once per candidate
@@ -1542,6 +1640,79 @@ cuvsamcostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
                 (errmsg("pg_cuvs: costest oid=%u rows=%.0f k=%d gpu_off=%d total=%.1f",
                         (uint32_t) index_oid, rows, cuvs_k, (int) gpu_off,
                         *indexTotalCost)));
+
+    *indexSelectivity = 1.0;
+    *indexCorrelation = 0.0;
+    *indexPages       = 0.0;
+}
+
+/* ----------------------------------------------------------------
+ * ADR-073: flat AM cost estimate.
+ *
+ * A DUPLICATE of cuvsamcostestimate (the plan mandates duplicate-not-refactor —
+ * cagra's version is GUC-gated on cuvs_search_mode and would mis-cost flat). It
+ * keeps ALL EIGHT plan-time gates verbatim (no IPC / no CUDA), but then ALWAYS
+ * takes the exact brute-force N-cost branch regardless of cuvs.search_mode: a
+ * flat index IS brute-force by construction. Uses the recalibrated
+ * CUVS_FLAT_STARTUP_COST so a small-N flat scan is chosen over seqscan.
+ * ---------------------------------------------------------------- */
+static void
+flat_amcostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
+                    Cost *indexStartupCost, Cost *indexTotalCost,
+                    Selectivity *indexSelectivity, double *indexCorrelation,
+                    double *indexPages)
+{
+    Oid    index_oid = path->indexinfo->indexoid;
+    bool   gpu_off;
+
+    (void) root;
+    (void) loop_count;
+
+    /* Same eight gates as cuvsamcostestimate, same priority order. */
+    {
+        int fb_reason = CUVS_FB_NONE;
+        if (!enable_cuvs)
+            fb_reason = CUVS_FB_DISABLED;
+        else if (cuvs_circuit_is_open((uint32_t) index_oid))
+            fb_reason = CUVS_FB_BREAKER;
+        else if (cuvs_index_is_stale(index_oid))
+            fb_reason = CUVS_FB_STALE;
+        else if (cuvs_index_delete_drift_stale(index_oid, path->indexinfo->rel->tuples))
+            fb_reason = CUVS_FB_DRIFT;
+        else if (!cuvs_daemon_socket_ready())
+            fb_reason = CUVS_FB_DAEMON_DOWN;
+        else if (!cuvs_index_has_artifact(index_oid))
+            fb_reason = CUVS_FB_NO_ARTIFACT;
+        else if (cuvs_index_delta_unusable(index_oid))
+            fb_reason = CUVS_FB_DELTA;
+        else if (cuvs_index_tombstone_unusable(index_oid))
+            fb_reason = CUVS_FB_TOMBSTONE;
+
+        gpu_off = (fb_reason != CUVS_FB_NONE);
+        if (gpu_off)
+            cuvs_fb_record(index_oid, fb_reason);
+    }
+
+    if (gpu_off)
+    {
+        *indexStartupCost = 1e15;
+        *indexTotalCost   = 1e15;
+    }
+    else
+    {
+        /* ALWAYS exact brute-force (GUC-independent): bandwidth-bound in the
+         * corpus size N, no per-k term. The recalibrated startup cost keeps a
+         * small-N flat scan ahead of seqscan. */
+        double n = path->indexinfo->rel->tuples;
+        if (n < 1) n = 1;
+        *indexStartupCost = CUVS_FLAT_STARTUP_COST;
+        *indexTotalCost   = CUVS_FLAT_STARTUP_COST + CUVS_ROWS_COST * n;
+    }
+
+    if (cuvs_debug)
+        ereport(DEBUG1,
+                (errmsg("pg_cuvs: flat costest oid=%u gpu_off=%d total=%.1f",
+                        (uint32_t) index_oid, (int) gpu_off, *indexTotalCost)));
 
     *indexSelectivity = 1.0;
     *indexCorrelation = 0.0;
@@ -2313,6 +2484,249 @@ cuvs_ambuild(Relation heapRel, Relation indexRel, IndexInfo *indexInfo)
     return result;
 }
 
+/* ----------------------------------------------------------------
+ * ADR-073: scan the heap and build a flat (vectors-only) index on the daemon.
+ *
+ * A DUPLICATE of cuvs_build_cagra_from_heap minus the CAGRA-specific parts: no
+ * parallel-maintenance-worker build (cuvs_build_parallel builds a CAGRA graph)
+ * and no graph-degree/build-algo params. The corpus accumulation
+ * (cuvs_corpus_open + cuvs_build_callback + table_index_build_scan) is
+ * metric/graph-agnostic and reused as-is; the finalized [vectors][tids] payload
+ * is handed to cuvs_ipc_build_flat, which persists .tids + .vectors only.
+ * ---------------------------------------------------------------- */
+static void
+cuvs_build_flat_from_heap(Relation heapRel, Relation indexRel, IndexInfo *indexInfo,
+                          uint32_t build_index_oid,
+                          int64_t *out_n_vecs, double *out_reltuples)
+{
+    CuvsBuildState bs;
+    AttrNumber heap_attno;
+    int32  typmod;
+    double reltuples_est;
+    int    rc = CUVS_STATUS_OK;
+
+    memset(&bs, 0, sizeof(bs));
+    bs.metric = cuvs_index_metric(indexRel);  /* baked into the .vectors sidecar */
+    bs.cap_bytes = cuvs_effective_build_cap_bytes();
+    bs.corpus.kind = CORPUS_HEAP;             /* until cuvs_corpus_open succeeds */
+    bs.corpus.fd = -1;
+
+    heap_attno = indexInfo->ii_IndexAttrNumbers[0];
+    typmod = (heap_attno >= 1)
+        ? TupleDescAttr(RelationGetDescr(heapRel), heap_attno - 1)->atttypmod
+        : -1;
+    reltuples_est = heapRel->rd_rel->reltuples;
+
+    if (bs.cap_bytes > 0 && typmod > 0 && reltuples_est > 0)
+    {
+        size_t est = (size_t) reltuples_est * (size_t) typmod * sizeof(float)
+                   + (size_t) reltuples_est * sizeof(uint64_t);
+        if (est > bs.cap_bytes)
+            ereport(ERROR,
+                    (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+                     errmsg("pg_cuvs: estimated build corpus %zu MB exceeds the "
+                            "build memory limit (%zu MB)",
+                            est / (1024 * 1024), bs.cap_bytes / (1024 * 1024)),
+                     errdetail("%s",
+                               cuvs_max_build_mem_mb > 0
+                               ? "Limit is the cuvs.max_build_mem_mb hard cap."
+                               : "Limit is auto (MemAvailable * cuvs.build_mem_safety_ratio)."),
+                     errhint("Raise cuvs.max_build_mem_mb (hard cap) or "
+                             "cuvs.build_mem_safety_ratio, shard the table, or see "
+                             "docs/playbooks/large-dataset-benchmark.md.")));
+    }
+
+    if (typmod > 0)
+    {
+        int64_t init_rows = (reltuples_est > 0) ? (int64_t) reltuples_est : 64;
+        if (init_rows < 64)
+            init_rows = 64;
+        if (cuvs_corpus_open(&bs.corpus,
+                             (size_t) init_rows * (size_t) typmod * sizeof(float)) == 0
+            && bs.corpus.kind != CORPUS_HEAP)
+        {
+            bs.tids = (uint64_t *) malloc((size_t) init_rows * sizeof(uint64_t));
+            if (bs.tids == NULL)
+            {
+                cuvs_corpus_close(&bs.corpus);
+                ereport(ERROR,
+                        (errcode(ERRCODE_OUT_OF_MEMORY),
+                         errmsg("pg_cuvs: out of memory allocating build TID buffer")));
+            }
+            bs.dim         = typmod;            /* declared dim; callback rechecks per row */
+            bs.vectors     = (float *) bs.corpus.base;
+            bs.n_allocated = init_rows;
+        }
+    }
+
+    PG_TRY();
+    {
+        bs.reltuples = table_index_build_scan(
+            heapRel, indexRel, indexInfo,
+            true, true,
+            cuvs_build_callback, &bs, NULL);
+
+        if (out_reltuples) *out_reltuples = bs.reltuples;
+        *out_n_vecs = bs.n_vecs;
+
+        if (bs.n_vecs > 0)
+        {
+            uint32_t heap_table_oid   = (uint32_t) RelationGetRelid(heapRel);
+            uint32_t heap_relfilenode = (uint32_t) heapRel->rd_rel->relfilenode;
+
+            if (bs.corpus.kind != CORPUS_HEAP)
+            {
+                size_t vec_bytes = (size_t) bs.n_vecs * bs.dim * sizeof(float);
+                size_t tid_bytes = (size_t) bs.n_vecs * sizeof(uint64_t);
+                if (cuvs_corpus_resize(&bs.corpus, vec_bytes + tid_bytes) != 0)
+                    ereport(ERROR,
+                            (errcode(ERRCODE_OUT_OF_MEMORY),
+                             errmsg("pg_cuvs: failed to finalize build corpus: %m")));
+                memcpy((char *) bs.corpus.base + vec_bytes, bs.tids, tid_bytes);
+            }
+
+            rc = cuvs_ipc_build_flat(
+                cuvs_socket_path,
+                (uint32_t) MyDatabaseId,
+                build_index_oid,
+                &bs.corpus,
+                bs.corpus.kind == CORPUS_HEAP ? bs.vectors : NULL,
+                bs.corpus.kind == CORPUS_HEAP ? (const uint64_t *) bs.tids : NULL,
+                bs.n_vecs,
+                bs.dim,
+                bs.metric,
+                cuvs_resolve_index_dir_rel(indexRel),
+                heap_table_oid,
+                heap_relfilenode);
+
+            if (rc != CUVS_STATUS_OK)
+            {
+                const char *hint;
+                switch (rc)
+                {
+                    case CUVS_STATUS_UNAVAILABLE:
+                        hint = "pg_cuvs_server is not reachable. Start it and retry "
+                               "CREATE INDEX, or use SET enable_cuvs = off + pgvector "
+                               "HNSW if GPU acceleration is not required.";
+                        break;
+                    case CUVS_STATUS_OOM_FALLBACK:
+                        hint = "GPU VRAM cannot hold the flat corpus (N*dim*4 bytes). "
+                               "Free VRAM, use WITH (precision='float16'), shard the "
+                               "table, or use a cagra/ivfpq index instead.";
+                        break;
+                    default:
+                        hint = "Check pg_cuvs_server journal (journalctl -u "
+                               "pg-cuvs-server) for the underlying error. "
+                               "Common causes: disk full or permission denied on "
+                               "cuvs.index_dir.";
+                        break;
+                }
+                ereport(ERROR,
+                        (errcode(ERRCODE_INTERNAL_ERROR),
+                         errmsg("pg_cuvs: flat BUILD failed (status %d); CREATE INDEX "
+                                "aborted to preserve catalog durability", rc),
+                         errhint("%s", hint)));
+            }
+        }
+    }
+    PG_FINALLY();
+    {
+        if (bs.corpus.kind == CORPUS_HEAP && bs.vectors)
+            free(bs.vectors);
+        cuvs_corpus_close(&bs.corpus);
+        if (bs.tids)
+            free(bs.tids);
+    }
+    PG_END_TRY();
+}
+
+/* ----------------------------------------------------------------
+ * ADR-073: Index AM ambuild — handles CREATE INDEX USING flat.
+ *
+ * A DUPLICATE of cuvs_ambuild: same TOAST / index_dir build advisories and the
+ * same .relfilenode sidecar + delta/tombstone reset, but it builds a vectors-only
+ * flat store (cuvs_build_flat_from_heap) instead of a CAGRA graph and does not
+ * resolve CAGRA graph reloptions.
+ * ---------------------------------------------------------------- */
+static IndexBuildResult *
+flat_ambuild(Relation heapRel, Relation indexRel, IndexInfo *indexInfo)
+{
+    IndexBuildResult *result = palloc0(sizeof(IndexBuildResult));
+    int64_t n_vecs    = 0;
+    double  reltuples = 0.0;
+
+    /* Build-time advisories (shared with cagra; reuse verbatim). */
+    {
+        AttrNumber heap_attno = indexInfo->ii_IndexAttrNumbers[0];
+        if (heap_attno >= 1)
+        {
+            Form_pg_attribute att =
+                TupleDescAttr(RelationGetDescr(heapRel), heap_attno - 1);
+            if (att->attstorage != 'p'
+                && att->atttypmod > 0
+                && (int64) att->atttypmod * (int64) sizeof(float) >= 2000)
+                ereport(NOTICE,
+                        (errmsg("pg_cuvs: indexed column \"%s\" uses TOAST-able storage and "
+                                "toasts at this dimension; PLAIN storage avoids detoast "
+                                "overhead during build", NameStr(att->attname)),
+                         errhint("For vector-only tables: ALTER TABLE %s ALTER COLUMN %s "
+                                 "SET STORAGE PLAIN; VACUUM FULL; then rebuild. "
+                                 "See docs/best-practices.md.",
+                                 RelationGetRelationName(heapRel), NameStr(att->attname))));
+        }
+
+        {
+            const char *idir = cuvs_resolve_index_dir_rel(indexRel);
+            size_t dlen = (DataDir != NULL) ? strlen(DataDir) : 0;
+            if (idir != NULL && dlen > 0
+                && strncmp(idir, DataDir, dlen) == 0
+                && (idir[dlen] == '/' || idir[dlen] == '\0'))
+                ereport(WARNING,
+                        (errmsg("pg_cuvs: index_dir \"%s\" is inside the data directory; "
+                                "its artifacts will be included in pg_basebackup", idir),
+                         errhint("flat artifacts (.vectors) are rebuildable and can be "
+                                 "multi-GB. Place index_dir in a sibling directory on the "
+                                 "same local volume but OUTSIDE $PGDATA (preserves "
+                                 "locality, excludes from base backups). "
+                                 "See docs/best-practices.md and OPS_GPU_PLAYBOOK section 6.")));
+        }
+    }
+
+    /* Scan the heap and build the flat (vectors-only) store on the daemon. */
+    cuvs_build_flat_from_heap(heapRel, indexRel, indexInfo,
+                              (uint32_t) RelationGetRelid(indexRel),
+                              &n_vecs, &reltuples);
+
+    result->heap_tuples  = reltuples;
+    result->index_tuples = (double) n_vecs;
+
+    if (n_vecs == 0)
+        return result;  /* empty table — nothing built */
+
+    /* Phase 3C: .relfilenode sidecar (heap compat verification). */
+    {
+        uint32_t heap_table_oid   = (uint32_t) RelationGetRelid(heapRel);
+        uint32_t heap_relfilenode = (uint32_t) heapRel->rd_rel->relfilenode;
+        char sidecar[MAXPGPATH];
+        snprintf(sidecar, sizeof(sidecar), "%s/%u_%u.relfilenode",
+                 cuvs_resolve_index_dir_rel(indexRel),
+                 (uint32_t) MyDatabaseId,
+                 (uint32_t) RelationGetRelid(indexRel));
+        FILE *f = fopen(sidecar, "w");
+        if (f)
+        {
+            fprintf(f, "%u %u\n", heap_relfilenode, heap_table_oid);
+            fclose(f);
+        }
+    }
+
+    /* A fresh base absorbs all current rows — drop obsolete delta/tombstones. */
+    cuvs_delta_unlink(RelationGetRelid(indexRel));
+    cuvs_tombstone_unlink(RelationGetRelid(indexRel));
+
+    return result;
+}
+
 static void
 cuvs_ambuildempty(Relation indexRel)
 {
@@ -3061,6 +3475,208 @@ cuvs_gettuple(IndexScanDesc scan, ScanDirection dir)
     return true;
 }
 
+/* ----------------------------------------------------------------
+ * ADR-073: flat AM amgettuple — exact GPU brute-force scan.
+ *
+ * A DUPLICATE of cuvs_gettuple. cagra's version passes the cuvs.search_mode GUC
+ * to the daemon; flat MUST force brute_force (search_mode = 1) regardless of the
+ * GUC — a flat index has no CAGRA graph, so a cagra-mode request would deref a
+ * NULL handle on the daemon. Precision comes from the flat index's `precision`
+ * reloption (falling back to cuvs.bf_precision). Delta-merge / tombstone freshness
+ * is inherited unchanged (verified SOUND in the plan).
+ * ---------------------------------------------------------------- */
+static bool
+flat_gettuple(IndexScanDesc scan, ScanDirection dir)
+{
+    CuvsScanState *ss = (CuvsScanState *)scan->opaque;
+    (void)dir;
+
+    if (!ss->searched)
+    {
+        ss->searched = true;
+
+        Oid index_oid = RelationGetRelid(scan->indexRelation);
+        if (!enable_cuvs || cuvs_circuit_is_open((uint32_t)index_oid))
+            return false;
+
+        if (scan->numberOfOrderBys < 1 || !scan->orderByData)
+            return false;
+
+        if (scan->orderByData[0].sk_flags & SK_ISNULL)
+            return false;
+
+        Datum query_datum = scan->orderByData[0].sk_argument;
+        PgVector *qvec    = DatumGetPgVector(query_datum);
+        int       dim     = (int)qvec->dim;
+        int       k       = cuvs_k;  /* GPU top-k; SQL LIMIT applied by executor */
+
+        /* Over-fetch by the pending dead-TID count so tombstone filtering cannot
+         * drop the live result below cuvs_k. No-op without tombstones. */
+        if (cuvs_max_delta_rows > 0)
+        {
+            int64_t n_tomb = cuvs_tombstone_count(index_oid);
+            if (n_tomb > 0)
+                k += (int) Min(n_tomb, (int64_t) cuvs_k);
+        }
+
+        ss->tids      = palloc(k * sizeof(uint64_t));
+        ss->distances = palloc(k * sizeof(float));
+
+        uint32_t metric = cuvs_index_metric(scan->indexRelation);
+
+        uint32_t latency_us = 0;
+        int      delta_merged = 0;
+        int rc = cuvs_ipc_search(
+            cuvs_socket_path,
+            (uint32_t)MyDatabaseId,
+            (uint32_t)index_oid,
+            qvec->x,
+            dim, k, metric,
+            (uint32_t)cuvs_shard_overfetch,
+            cuvs_parallel_fanout ? 1 : 0,
+            cuvs_cpu_hnsw_fallback ? 1 : 0,
+            1u,                                          /* ADR-073: FORCE brute_force */
+            cuvs_resolve_flat_precision(scan->indexRelation), /* reloption / GUC */
+            (uint32_t)cuvs_bf_batch_wait_us,
+            ss->tids,
+            ss->distances,
+            &ss->n_results,
+            &latency_us,
+            &delta_merged);
+
+        if (rc == CUVS_STATUS_CANCELED)
+        {
+            CHECK_FOR_INTERRUPTS();
+            return false;
+        }
+
+        if (rc != CUVS_STATUS_OK)
+        {
+            if (rc != CUVS_STATUS_DIM_MISMATCH
+                && rc != CUVS_STATUS_METRIC_MISMATCH && rc != CUVS_STATUS_STALE
+                && rc != CUVS_STATUS_NO_VECTORS)
+                cuvs_circuit_record_error((uint32_t)index_oid,
+                                          cuvs_circuit_breaker_threshold);
+
+            switch (rc)
+            {
+                case CUVS_STATUS_STALE:
+                    ereport(WARNING,
+                            (errmsg("pg_cuvs: flat index went stale mid-scan; "
+                                    "returning no rows (retry replans to CPU)"),
+                             errhint("REINDEX the index to re-enable GPU search.")));
+                    break;
+                case CUVS_STATUS_METRIC_MISMATCH:
+                    ereport(ERROR,
+                            (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+                             errmsg("pg_cuvs: flat index was built with a different "
+                                    "distance metric than this query's operator class"),
+                             errhint("REINDEX the index to rebuild it with the current metric.")));
+                    break;
+                case CUVS_STATUS_DIM_MISMATCH:
+                    ereport(ERROR,
+                            (errcode(ERRCODE_DATA_EXCEPTION),
+                             errmsg("pg_cuvs: query vector dimension %d does not "
+                                    "match the flat index dimension", dim)));
+                    break;
+                case CUVS_STATUS_UNAVAILABLE:
+                    ereport(ERROR,
+                            (errcode(ERRCODE_CONNECTION_FAILURE),
+                             errmsg("pg_cuvs: GPU daemon unavailable after planning; "
+                                    "retry will use CPU while breaker is open"),
+                             errhint("The daemon crashed or restarted between plan and "
+                                     "execute time. Subsequent queries replan to CPU "
+                                     "automatically once the breaker opens.")));
+                    break;
+                case CUVS_STATUS_OOM_FALLBACK:
+                    ereport(ERROR,
+                            (errcode(ERRCODE_OUT_OF_MEMORY),
+                             errmsg("pg_cuvs: GPU VRAM exhausted; "
+                                    "retry will use CPU while breaker is open"),
+                             errhint("Use WITH (precision='float16'), shard the table, "
+                                     "or free VRAM, then REINDEX.")));
+                    break;
+                case CUVS_STATUS_NOT_FOUND:
+                    ereport(ERROR,
+                            (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+                             errmsg("pg_cuvs: flat index not loaded on GPU daemon; "
+                                    "retry will use CPU while breaker is open"),
+                             errhint("REINDEX the index to reload it on the daemon.")));
+                    break;
+                case CUVS_STATUS_NO_VECTORS:
+                    ereport(ERROR,
+                            (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+                             errmsg("pg_cuvs: flat index .vectors sidecar is missing "
+                                    "or stale for this index"),
+                             errhint("REINDEX the index to (re)build the flat vector "
+                                     "store.")));
+                    break;
+                default:
+                    ereport(ERROR,
+                            (errcode(ERRCODE_INTERNAL_ERROR),
+                             errmsg("pg_cuvs: GPU search failed (status %d); "
+                                    "retry will use CPU while breaker is open", rc)));
+                    break;
+            }
+            return false;
+        }
+
+        cuvs_circuit_record_success((uint32_t)index_oid);
+        ss->cur = 0;
+
+        if (cuvs_max_delta_rows > 0)
+        {
+            int do_cpu = (cuvs_delta_search_mode == 1)
+                      || (cuvs_delta_search_mode == 0 && !delta_merged);
+            if (do_cpu)
+                cuvs_merge_delta(ss, index_oid, qvec->x, dim, k, metric);
+        }
+
+        if (cuvs_max_delta_rows > 0)
+            cuvs_apply_tombstones(ss, index_oid);
+
+        cuvs_last_latency_us   = latency_us;
+        cuvs_last_n_results    = ss->n_results;
+        cuvs_last_k_requested  = k;
+        cuvs_last_index_oid    = index_oid;
+        cuvs_last_metric       = metric;
+
+        if (cuvs_debug)
+        {
+            static const char * const metric_names[] = {"l2", "cosine", "ip"};
+            const char *mname = (metric < 3) ? metric_names[metric] : "?";
+            ereport(NOTICE,
+                    (errmsg("pg_cuvs: flat scan oid=%u dim=%d metric=%s "
+                            "k=%d n=%d latency_us=%u",
+                            (uint32_t)index_oid, dim, mname,
+                            k, ss->n_results, latency_us)));
+        }
+    }
+
+    if (ss->cur >= ss->n_results)
+        return false;
+
+    uint64_t tid     = ss->tids[ss->cur];
+    uint32_t blk;
+    uint16_t offset;
+    cuvs_tid_decode(tid, &blk, &offset);
+
+    ItemPointerSet(&scan->xs_heaptid, blk, offset);
+    scan->xs_recheck = true;
+
+    if (scan->numberOfOrderBys > 0 && scan->xs_orderbyvals != NULL)
+    {
+        scan->xs_orderbyvals[0]  = Float8GetDatum((double) ss->distances[ss->cur]);
+        scan->xs_orderbynulls[0] = false;
+        scan->xs_recheckorderby  = false;
+        for (int i = 1; i < scan->numberOfOrderBys; i++)
+            scan->xs_orderbynulls[i] = true;
+    }
+    ss->cur++;
+
+    return true;
+}
+
 static void
 cuvs_endscan(IndexScanDesc scan)
 {
@@ -3698,6 +4314,43 @@ ivfpqamhandler(PG_FUNCTION_ARGS)
     amroutine->amendscan         = cuvs_endscan;
     amroutine->amcostestimate    = cuvsamcostestimate;
     amroutine->amoptions         = cuvs_ivfpq_amoptions;
+
+    PG_RETURN_POINTER(amroutine);
+}
+
+/* ----------------------------------------------------------------
+ * ADR-073: flat AM handler — standalone GPU exact brute-force index.
+ *
+ * Reuses cagra's read-only scan/insert/delete callbacks verbatim (regression
+ * safety; freshness inherited). Only the build, gettuple, cost, and options are
+ * flat-specific: flat_ambuild (vectors-only), flat_gettuple (forces brute_force),
+ * flat_amcostestimate (always exact N-cost), cuvs_flat_amoptions (precision).
+ * ---------------------------------------------------------------- */
+PG_FUNCTION_INFO_V1(flatamhandler);
+Datum
+flatamhandler(PG_FUNCTION_ARGS)
+{
+    IndexAmRoutine *amroutine = makeNode(IndexAmRoutine);
+
+    amroutine->amstrategies      = 0;
+    amroutine->amsupport         = 1;
+    amroutine->amcanmulticol     = false;
+    amroutine->amsearcharray     = false;
+    amroutine->amcanorderbyop    = true;
+    amroutine->amoptionalkey     = true;
+
+    amroutine->ambuild           = flat_ambuild;      /* vectors-only, no graph */
+    amroutine->ambuildempty      = cuvs_ambuildempty;
+    amroutine->aminsert          = cuvs_aminsert;     /* appends pending delta */
+    amroutine->ambulkdelete      = cuvs_ambulkdelete; /* tombstone or stale fallback */
+    amroutine->amvacuumcleanup   = cuvs_amvacuumcleanup;
+
+    amroutine->ambeginscan       = cuvs_beginscan;
+    amroutine->amrescan          = cuvs_rescan;
+    amroutine->amgettuple        = flat_gettuple;     /* forces brute_force */
+    amroutine->amendscan         = cuvs_endscan;
+    amroutine->amcostestimate    = flat_amcostestimate; /* always exact N-cost */
+    amroutine->amoptions         = cuvs_flat_amoptions;  /* WITH (index_dir, precision) */
 
     PG_RETURN_POINTER(amroutine);
 }
