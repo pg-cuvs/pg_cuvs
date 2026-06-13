@@ -45,6 +45,11 @@
 #define CUVS_OP_BUILD_FLAT       21 /* ADR-073: build a standalone `flat` GPU exact brute-force
                                      * index — persists .tids + .vectors only (no .cagra graph).
                                      * Same [vectors][tids] corpus payload as CUVS_OP_BUILD. */
+#define CUVS_OP_SEARCH_BF_TRANSIENT 22 /* ADR-073 (B): one-shot GPU exact BF over a per-query corpus
+                                     * supplied by the backend (no resident IndexEntry). Corpus
+                                     * [vectors][tids] handed off via SCM_RIGHTS memfd (filter_shm_key
+                                     * names the SHM-tier fallback); query in shm_key. Non-evicting
+                                     * VRAM admission; returns top-k (tid,distance). */
 
 /* ----------------------------------------------------------------
  * Distance metrics (mirror pgvector operator names)
@@ -298,6 +303,37 @@ int cuvs_ipc_search_stream_bf(
     float          *dist_out,
     int            *n_out,
     uint32_t       *latency_us_out
+);
+
+/*
+ * cuvs_ipc_search_bf_transient — ADR-073 (B): one-shot GPU exact brute force over
+ * a per-query corpus the backend supplies (no resident index). The corpus
+ * [float32 vecs n×dim][uint64_t tids n] is staged into a memfd (SCM_RIGHTS) — or
+ * a named shm fallback — and handed to the daemon, which runs cuvs_brute_force_search
+ * once and returns top-k (tid, distance). The daemon admits VRAM non-evictingly:
+ * it NEVER evicts a resident flat/cagra index for a transient corpus.
+ *
+ * Returns CUVS_STATUS_OK on success; CUVS_STATUS_OOM_FALLBACK if the corpus does
+ * not fit the VRAM budget (err_out carries an actionable message); CUVS_STATUS_*
+ * (DIM_MISMATCH, ERROR) otherwise; CUVS_STATUS_UNAVAILABLE if the daemon is down.
+ * The caller treats any non-OK status as a hard error (B has no CPU fallback).
+ */
+int cuvs_ipc_search_bf_transient(
+    const char     *socket_path,
+    uint32_t        db_oid,
+    const float    *corpus_vecs,   /* row-major n×dim float32 */
+    const uint64_t *corpus_tids,   /* n encoded TIDs (block<<16|offset) */
+    int64_t         n,
+    const float    *query_vec,
+    int             dim,
+    int             k,
+    uint32_t        metric,
+    uint64_t       *tids_out,       /* caller-allocated [k] */
+    float          *dist_out,       /* caller-allocated [k] */
+    int            *n_out,
+    uint32_t       *latency_us_out,
+    char           *err_out,        /* daemon error message on failure (may be NULL) */
+    size_t          err_len
 );
 
 int cuvs_ipc_search(

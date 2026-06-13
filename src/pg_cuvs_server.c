@@ -2411,6 +2411,154 @@ handle_search_stream_bf(int client_fd, const CuvsCmdFrame *cmd)
 }
 
 /* ----------------------------------------------------------------
+ * Handle SEARCH_BF_TRANSIENT command (CUVS_OP_SEARCH_BF_TRANSIENT, ADR-073 B)
+ *
+ * One-shot exact GPU brute force over a per-query corpus the backend supplies —
+ * NO resident IndexEntry. The corpus [float32 vecs n×dim][uint64_t tids n] arrives
+ * as an SCM_RIGHTS memfd (or a named shm in filter_shm_key); the query is in
+ * shm_key. VRAM admission is NON-EVICTING: a transient corpus must NEVER evict a
+ * resident flat/cagra index. The short search runs under g_index_mutex so
+ * total_vram_used() is consistent without a reservation counter. Touches no
+ * IndexEntry (no find_index/load_index/record_search_stat).
+ * ---------------------------------------------------------------- */
+static void
+handle_search_bf_transient(int client_fd, const CuvsCmdFrame *cmd)
+{
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+
+    /* Second frame: corpus memfd via SCM_RIGHTS (passed_fd), else shm by name. */
+    char dir_buf[256] = {0};
+    int  passed_fd = -1;
+    if (cuvs_fd_recv(client_fd, dir_buf, sizeof(dir_buf), &passed_fd) < 0)
+    {
+        send_error(client_fd, "recv corpus frame failed");
+        return;
+    }
+
+    if (cmd->n_vecs < 1 || cmd->dim == 0)
+    {
+        if (passed_fd >= 0) close(passed_fd);
+        send_error_code(client_fd, CUVS_STATUS_ERROR, "transient BF needs >= 1 vector");
+        return;
+    }
+    {
+        size_t per_vec = (size_t)cmd->dim * sizeof(float) + sizeof(uint64_t);
+        if ((size_t)cmd->n_vecs > SIZE_MAX / per_vec)
+        {
+            if (passed_fd >= 0) close(passed_fd);
+            send_error_code(client_fd, CUVS_STATUS_ERROR, "transient BF payload overflow");
+            return;
+        }
+    }
+
+    size_t vec_bytes = (size_t)cmd->n_vecs * cmd->dim * sizeof(float);
+    size_t tid_bytes = (size_t)cmd->n_vecs * sizeof(uint64_t);
+    size_t total     = vec_bytes + tid_bytes;
+
+    /* Map the corpus (memfd tier via SCM_RIGHTS; else named shm). */
+    void *mem;
+    if (passed_fd >= 0)
+    {
+        mem = mmap(NULL, total, PROT_READ, MAP_SHARED, passed_fd, 0);
+        close(passed_fd);
+    }
+    else
+    {
+        int cfd = shm_open(cmd->filter_shm_key, O_RDONLY, 0);
+        if (cfd < 0) { send_error(client_fd, "corpus shm_open failed"); return; }
+        mem = mmap(NULL, total, PROT_READ, MAP_SHARED, cfd, 0);
+        close(cfd);
+    }
+    if (mem == MAP_FAILED) { send_error(client_fd, "corpus mmap failed"); return; }
+
+    const float    *vecs = (const float *)mem;
+    const uint64_t *tids = (const uint64_t *)((const char *)mem + vec_bytes);
+
+    /* Map the query shm. */
+    size_t q_bytes = (size_t)cmd->dim * sizeof(float);
+    int qfd = shm_open(cmd->shm_key, O_RDONLY, 0);
+    if (qfd < 0) { munmap(mem, total); send_error(client_fd, "query shm_open failed"); return; }
+    float *query = mmap(NULL, q_bytes, PROT_READ, MAP_SHARED, qfd, 0);
+    close(qfd);
+    if (query == MAP_FAILED) { munmap(mem, total); send_error(client_fd, "query mmap failed"); return; }
+
+    int k  = (int)cmd->k; if (k < 1) k = 1;
+    int sk = (k < (int)cmd->n_vecs) ? k : (int)cmd->n_vecs;
+
+    /* --- VRAM admission (NON-EVICTING). Hold g_index_mutex across the short
+     * search so total_vram_used() stays consistent (no reservation counter). --- */
+    pthread_mutex_lock(&g_index_mutex);
+
+    size_t needed = vec_bytes;   /* corpus uploaded to the GPU as float32 */
+    int    dev    = pick_gpu_for_index(needed);
+    if (dev < 0
+        || (g_max_vram_per_gpu[dev] > 0
+            && total_vram_used(dev) + needed > g_max_vram_per_gpu[dev])
+        || needed > gpu_free_vram_bytes(dev))
+    {
+        pthread_mutex_unlock(&g_index_mutex);
+        munmap(query, q_bytes);
+        munmap(mem, total);
+        CuvsReplyHeader hdr = {0};
+        hdr.status = CUVS_STATUS_OOM_FALLBACK;
+        snprintf(hdr.error, sizeof(hdr.error),
+                 "transient BF corpus %zu MB exceeds free GPU VRAM; reduce the WHERE "
+                 "selectivity, build a flat index, or use a cagra/ivfpq index",
+                 needed / (1024 * 1024));
+        LOG_WARN("[handle_search_bf_transient] db=%u %s\n", cmd->db_oid, hdr.error);
+        send_all(client_fd, &hdr, sizeof(hdr));
+        return;
+    }
+
+    CuvsSearchResult *res = malloc((size_t)sk * sizeof(CuvsSearchResult));
+    CuvsResult       *out = malloc((size_t)sk * sizeof(CuvsResult));
+    int rc = (!res || !out)
+           ? -1
+           : cuvs_brute_force_search(vecs, query, cmd->n_vecs, (int)cmd->dim,
+                                     sk, cmd->metric, res, dev);
+
+    pthread_mutex_unlock(&g_index_mutex);
+
+    munmap(query, q_bytes);
+
+    if (rc != 0)
+    {
+        free(res); free(out);
+        munmap(mem, total);
+        send_error(client_fd, "transient BF search failed");
+        return;
+    }
+
+    /* Map corpus rows -> TIDs (tids still mapped). */
+    int pn = 0;
+    for (int j = 0; j < sk; j++)
+    {
+        int64_t row = res[j].item_id;
+        if (row < 0 || row >= cmd->n_vecs)
+            continue;
+        out[pn].tid      = tids[row];
+        out[pn].distance = res[j].distance;
+        pn++;
+    }
+    munmap(mem, total);
+    free(res);
+
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    uint32_t lat = (uint32_t)((t1.tv_sec - t0.tv_sec) * 1000000 +
+                              (t1.tv_nsec - t0.tv_nsec) / 1000);
+
+    CuvsReplyHeader hdr = {0};
+    hdr.status     = CUVS_STATUS_OK;
+    hdr.n_results  = (uint32_t)pn;
+    hdr.latency_us = lat;
+    send_all(client_fd, &hdr, sizeof(hdr));
+    if (pn > 0)
+        send_all(client_fd, out, (size_t)pn * sizeof(CuvsResult));
+    free(out);
+}
+
+/* ----------------------------------------------------------------
  * Handle SEARCH command
  * ---------------------------------------------------------------- */
 static void
@@ -6952,6 +7100,9 @@ connection_thread(void *arg)
             break;
         case CUVS_OP_SEARCH_STREAM_BF:
             handle_search_stream_bf(client_fd, &cmd);
+            break;
+        case CUVS_OP_SEARCH_BF_TRANSIENT:
+            handle_search_bf_transient(client_fd, &cmd);
             break;
         default:
             send_error(client_fd, "unknown op");

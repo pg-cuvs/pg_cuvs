@@ -1533,6 +1533,161 @@ cleanup:
 }
 
 /* ----------------------------------------------------------------
+ * Public API: cuvs_ipc_search_bf_transient (ADR-073 B)
+ *
+ * One-shot GPU exact BF over a backend-supplied per-query corpus (no resident
+ * index). Stages [vecs][tids] into a memfd (SCM_RIGHTS) or named-shm fallback
+ * (the same CuvsBuildCorpus handoff the build path uses), puts the query in a
+ * separate shm, and sends CUVS_OP_SEARCH_BF_TRANSIENT. The corpus name (shm
+ * tier) rides in filter_shm_key; the memfd fd rides on the second frame's
+ * SCM_RIGHTS, exactly like cuvs_ipc_build's index_dir+fd. Reply = header +
+ * n_results × CuvsResult (same as search). No CPU fallback — any non-OK is fatal.
+ * ---------------------------------------------------------------- */
+int
+cuvs_ipc_search_bf_transient(
+    const char     *socket_path,
+    uint32_t        db_oid,
+    const float    *corpus_vecs,
+    const uint64_t *corpus_tids,
+    int64_t         n,
+    const float    *query_vec,
+    int             dim,
+    int             k,
+    uint32_t        metric,
+    uint64_t       *tids_out,
+    float          *dist_out,
+    int            *n_out,
+    uint32_t       *latency_us_out,
+    char           *err_out,
+    size_t          err_len)
+{
+    char shm_key[64] = "";
+    int  shm_fd      = -1;
+    int  sock        = -1;
+    int  rc          = CUVS_STATUS_ERROR;
+    int  pass_fd     = -1;
+    CuvsBuildCorpus corpus = {0};
+    char dir_buf[256] = {0};   /* unused payload; carries the SCM_RIGHTS fd only */
+
+    if (latency_us_out) *latency_us_out = 0;
+    if (n_out)          *n_out          = 0;
+    if (err_out && err_len) err_out[0]  = '\0';
+
+    if (n < 1 || dim <= 0 || k < 1)
+        return CUVS_STATUS_ERROR;
+
+    /* Overflow guard mirrors the daemon build path. */
+    {
+        size_t per_vec = (size_t)dim * sizeof(float) + sizeof(uint64_t);
+        if ((size_t)n > SIZE_MAX / per_vec)
+            return CUVS_STATUS_ERROR;
+    }
+
+    size_t vec_bytes = (size_t)n * (size_t)dim * sizeof(float);
+    size_t tid_bytes = (size_t)n * sizeof(uint64_t);
+    size_t total     = vec_bytes + tid_bytes;
+
+    /* --- Stage the corpus (memfd default, shm fallback). --- */
+    if (cuvs_corpus_open(&corpus, total) != 0 || corpus.base == NULL)
+    {
+        /* CORPUS_HEAP (no working shared memory) cannot hand a corpus to the
+         * daemon — transient BF is unavailable in that degenerate environment. */
+        if (err_out && err_len)
+            snprintf(err_out, err_len, "no shared-memory tier for transient BF corpus");
+        cuvs_corpus_close(&corpus);
+        return CUVS_STATUS_ERROR;
+    }
+    memcpy(corpus.base, corpus_vecs, vec_bytes);
+    memcpy((char *)corpus.base + vec_bytes, corpus_tids, tid_bytes);
+    if (corpus.kind == CORPUS_MEMFD)
+        pass_fd = corpus.fd;   /* anonymous; daemon mmaps via SCM_RIGHTS */
+
+    /* --- Query shm. --- */
+    make_shm_key(shm_key, sizeof(shm_key));
+    shm_fd = shm_write_query(shm_key, query_vec, dim);
+    if (shm_fd < 0)
+        goto cleanup;
+
+    sock = uds_connect(socket_path);
+    if (sock < 0)
+    {
+        rc = CUVS_STATUS_UNAVAILABLE;
+        goto cleanup;
+    }
+
+    CuvsCmdFrame cmd;
+    memset(&cmd, 0, sizeof(cmd));
+    cmd.op       = CUVS_OP_SEARCH_BF_TRANSIENT;
+    cmd.db_oid   = db_oid;
+    cmd.k        = (uint32_t)k;
+    cmd.metric   = metric;
+    cmd.dim      = (uint32_t)dim;
+    cmd.n_vecs   = n;
+    strncpy(cmd.shm_key, shm_key, sizeof(cmd.shm_key) - 1);  /* query */
+    if (corpus.kind == CORPUS_SHM)                            /* corpus (shm tier) */
+        strncpy(cmd.filter_shm_key, corpus.shm_name, sizeof(cmd.filter_shm_key) - 1);
+
+    if (send_all(sock, &cmd, sizeof(cmd)) < 0)
+        goto cleanup;
+
+    /* Second frame carries the corpus memfd via SCM_RIGHTS (pass_fd=-1 for the
+     * shm tier — the daemon recvmsg's it either way, exactly like handle_build). */
+    if (cuvs_fd_send(sock, pass_fd, dir_buf, sizeof(dir_buf)) < 0)
+        goto cleanup;
+
+    CuvsReplyHeader hdr;
+    {
+        int wr = recv_all_interruptible(sock, &hdr, sizeof(hdr), 30);
+        if (wr == 1) { rc = CUVS_STATUS_CANCELED; goto cleanup; }
+        if (wr < 0)  goto cleanup;
+    }
+
+    rc = (int)hdr.status;
+    if (latency_us_out) *latency_us_out = hdr.latency_us;
+    if (rc != CUVS_STATUS_OK && err_out && err_len)
+    {
+        strncpy(err_out, hdr.error, err_len - 1);
+        err_out[err_len - 1] = '\0';
+    }
+
+    if (hdr.status == CUVS_STATUS_OK && hdr.n_results > 0)
+    {
+        int n_res   = (int)hdr.n_results;
+        int n_write = (n_res > k) ? k : n_res;
+        CuvsResult *results = malloc((size_t)n_res * sizeof(CuvsResult));
+        if (!results)
+        {
+            rc = CUVS_STATUS_ERROR;
+            goto cleanup;
+        }
+        if (recv_all(sock, results, (size_t)n_res * sizeof(CuvsResult)) < 0)
+        {
+            free(results);
+            rc = CUVS_STATUS_ERROR;
+            goto cleanup;
+        }
+        for (int i = 0; i < n_write; i++)
+        {
+            tids_out[i] = results[i].tid;
+            dist_out[i] = results[i].distance;
+        }
+        if (n_out) *n_out = n_write;
+        free(results);
+    }
+
+cleanup:
+    if (sock >= 0)   close(sock);
+    if (shm_fd >= 0) close(shm_fd);
+    shm_unlink(shm_key);
+    /* Close AFTER the reply: the shm-tier daemon opens the corpus by name during
+     * handling, so unlinking earlier would race it. cuvs_corpus_close munmaps +
+     * closes (+ shm_unlinks for the shm tier); the memfd's daemon-side mapping
+     * survives our close. */
+    cuvs_corpus_close(&corpus);
+    return rc;
+}
+
+/* ----------------------------------------------------------------
  * Public API: cuvs_ipc_build_ivfpq (3P)
  *
  * Sends a BUILD_IVFPQ request. Corpus is written to a named shm segment
