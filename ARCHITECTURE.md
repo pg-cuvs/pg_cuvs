@@ -171,7 +171,9 @@ Verified Tier-2 on A100/PG16 (2026-06-14): `make installcheck` 32/32 GREEN + iso
 planner (cuvsamcostestimate)
   stat() the .stale sidecar — no CUDA, no IPC
   stale OR delete-drift > cuvs.max_stale_fraction → high cost → CPU path
-  else → GPU cost (k-dominant model)
+  else → GPU cost: ADR-075 physical κ-model when the hw profile is probed
+         (loads <index_dir>/cuvs_hw_profile sidecar — no CUDA/IPC), else legacy
+         k-dominant constants (cuvs.enable_phys_cost gate / probe_status bits)
 
 executor (cuvs_amgettuple)            daemon (handle_search)
   query vector → shm                  find index (load on miss; cache hit/miss/reload counters)

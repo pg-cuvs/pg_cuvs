@@ -51,10 +51,41 @@ efficient (corpus loaded once, served from resident VRAM).
 daemon emits a dedicated error; options: use `precision='float16'`, shard, or switch to
 `cagra`/`ivfpq`.
 
-> **Note on cost routing:** earlier versions noted that `CUVS_STARTUP_COST=1000` caused the
-> planner to prefer seqscan up to ~23k rows (miscalibrated). The `flat` AM ships its own
-> `CUVS_FLAT_STARTUP_COST=50`, so the planner selects `flat` correctly at small N without
-> touching the shared `cagra` cost constant.
+### Cost routing & the hardware profile (ADR-075)
+
+The planner chooses GPU index vs CPU seqscan by **cost**. Since v0.5.0 there are two regimes:
+
+- **Physical (default).** The daemon measures this deployment's hardware at boot (`link_bw`,
+  `hbm_bw`, GPU BF throughput, IPC RTT, CPU distance throughput, CAGRA per-query latency) and writes
+  a CRC'd profile to `<index_dir>/cuvs_hw_profile`. The planner reads it cheaply (no CUDA/IPC) and
+  costs `cagra`/`flat` in real units, so the GPU-vs-seqscan crossover tracks your actual hardware
+  and the query's vector dimension — not a baked constant. The earlier miscalibration
+  (`CUVS_STARTUP_COST=1000` preferring seqscan up to ~23k rows) only applies to the legacy fallback.
+- **Legacy fallback.** When `cuvs.enable_phys_cost=off`, the profile is missing/partial, or the
+  build is the CPU shim, the planner uses the legacy constants (`CUVS_FLAT_STARTUP_COST=50` vs
+  `CUVS_STARTUP_COST=1000`) — `flat`'s lower startup keeps small-N tables on `flat`. Routing is
+  identical to pre-0.5.0.
+
+**Diagnose with `pg_cuvs_hw_profile()`:**
+
+```sql
+SELECT gpu_name, source, probe_status, matches_running_daemon,
+       link_bw_bytes_per_us, hbm_bw_bytes_per_us, gpu_cagra_lat_us, ipc_rtt_us
+FROM pg_cuvs_hw_profile();
+```
+
+- `source = measured` → physical regime active; `source = default` → no usable sidecar (legacy).
+- `matches_running_daemon = false` → the profile is **stale vs the running daemon** (GPU swapped,
+  index_dir restored from another host, or daemon not yet rebooted after a GPU change). Fix:
+  restart `pg-cuvs-server` so it re-probes and rewrites the sidecar. Until then the planner safely
+  uses whatever the sidecar/DEFAULT says — never crashes, only mis-prices.
+- `probe_status` is a bitmask of which coefficients were actually measured; a partial value means
+  some coefficients fell back to DEFAULT and the affected path uses the legacy cost.
+- To force legacy routing everywhere (e.g. to A/B a routing regression): `SET cuvs.enable_phys_cost
+  = off`.
+
+Note: `cuvs.gpu_bruteforce = auto` is **not** cost-driven yet — it stays off-behavior until
+unified-memory hardware makes transient BF a win (ADR-075 Phase 3).
 
 ### Within gpu-bf: single-query latency guide
 
