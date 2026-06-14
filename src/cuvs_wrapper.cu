@@ -254,7 +254,8 @@ cuvs_gpu_available(void)
  * ---------------------------------------------------------------- */
 extern "C" int
 cuvs_probe_hw(int device_id, double *link_bw_bpus, double *hbm_bw_bpus,
-              double *gpu_bf_tput, unsigned int *probe_status)
+              double *gpu_bf_tput, double *gpu_cagra_lat_us,
+              unsigned int *probe_status)
 {
     if (cudaSetDevice(device_id) != cudaSuccess)
         return 0;
@@ -340,6 +341,37 @@ cuvs_probe_hw(int device_id, double *link_bw_bpus, double *hbm_bw_bpus,
                 *gpu_bf_tput = ((double)n * (double)dim) / us;   /* (vec*dim)/us */
                 *probe_status |= CUVS_HWPROBE_BF_TPUT;
             }
+        }
+    }
+
+    /* --- gpu_cagra_lat_us: build a small CAGRA index, time a single-query search
+     * (the per-query graph-search latency floor; ~N-independent). Warm once so the
+     * timed runs do not pay first-query kernel load. Best-effort. --- */
+    {
+        const int64_t n = 10000; const int dim = 128; const int k = 10;
+        std::vector<float> corpus((size_t)n * dim), query(dim, 0.1f);
+        for (size_t i = 0; i < corpus.size(); i++)
+            corpus[i] = (float)((i * 2654435761u) % 1000) / 1000.0f;
+        std::vector<CuvsSearchResult> res(k);
+        CuvsCagraIndex idx = cuvs_cagra_build(corpus.data(), n, dim, CUVS_METRIC_L2,
+                                              0, 0, CUVS_CAGRA_BUILD_AUTO, device_id);
+        if (idx) {
+            (void) cuvs_cagra_search(idx, query.data(), dim, k, res.data(), device_id); /* warm */
+            double best_us = 1e30;
+            for (int i = 0; i < 5; i++) {
+                auto c0 = std::chrono::steady_clock::now();
+                int rc = cuvs_cagra_search(idx, query.data(), dim, k, res.data(), device_id);
+                auto c1 = std::chrono::steady_clock::now();
+                if (rc == 0) {
+                    double us = std::chrono::duration<double, std::micro>(c1 - c0).count();
+                    if (us > 0.0 && us < best_us) best_us = us;
+                }
+            }
+            if (best_us < 1e29) {
+                *gpu_cagra_lat_us = best_us;
+                *probe_status |= CUVS_HWPROBE_CAGRA_LAT;
+            }
+            cuvs_cagra_free(idx, device_id);
         }
     }
     return 0;

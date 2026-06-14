@@ -7386,6 +7386,81 @@ graceful_shutdown(void)
  * planner reads these cheaply; failure is non-fatal (planner falls back to
  * compiled DEFAULTs). NOT consumed by any cost decision yet (Phase 2).
  * ---------------------------------------------------------------- */
+/* ADR-075 Phase 2: host-side coefficient probes (no CUDA). Both best-effort and
+ * return -1 on failure so the caller leaves the field at DEFAULT with its bit
+ * clear (→ planner falls back to the legacy cost path for that coefficient). */
+
+/* Local AF_UNIX round-trip latency floor (microseconds) — the IPC cost a
+ * backend<->daemon request pays before any work. */
+static double
+probe_ipc_rtt_us(void)
+{
+    int    sv[2];
+    char   b = 0;
+    double best = 1e30;
+    int    i;
+
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0)
+        return -1.0;
+    /* warm */
+    if (write(sv[0], &b, 1) == 1 && read(sv[1], &b, 1) == 1 &&
+        write(sv[1], &b, 1) == 1 && read(sv[0], &b, 1) == 1) { /* ok */ }
+    for (i = 0; i < 50; i++)
+    {
+        struct timespec t0, t1;
+        double us;
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        if (write(sv[0], &b, 1) != 1 || read(sv[1], &b, 1) != 1 ||
+            write(sv[1], &b, 1) != 1 || read(sv[0], &b, 1) != 1) { best = 1e30; break; }
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        us = (t1.tv_sec - t0.tv_sec) * 1e6 + (t1.tv_nsec - t0.tv_nsec) / 1e3;
+        if (us > 0.0 && us < best) best = us;
+    }
+    close(sv[0]); close(sv[1]);
+    return (best < 1e29) ? best : -1.0;
+}
+
+/* CPU L2-distance throughput, (vectors*dim) per microsecond — the anchor that
+ * converts GPU microseconds into PG cost units. Clamped to a plausible band;
+ * outside it returns -1 (probe distrusted → DEFAULT/legacy). */
+static double
+probe_cpu_dist_tput(void)
+{
+    const int64_t   n = 100000; const int dim = 128;
+    float          *corpus = (float *) malloc((size_t) n * dim * sizeof(float));
+    float           q[128];
+    struct timespec t0, t1;
+    volatile double sink = 0.0;
+    double          us, tput;
+    int64_t         i; int j;
+
+    if (!corpus)
+        return -1.0;
+    for (i = 0; i < n * dim; i++)
+        corpus[i] = (float) ((uint64_t) i * 2654435761u % 1000) / 1000.0f;
+    for (j = 0; j < dim; j++) q[j] = 0.1f;
+
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    for (i = 0; i < n; i++)
+    {
+        const float *v = corpus + i * dim;
+        double s = 0.0;
+        for (j = 0; j < dim; j++) { double d = (double) v[j] - q[j]; s += d * d; }
+        sink += s;
+    }
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    (void) sink;
+    free(corpus);
+
+    us = (t1.tv_sec - t0.tv_sec) * 1e6 + (t1.tv_nsec - t0.tv_nsec) / 1e3;
+    if (us <= 0.0)
+        return -1.0;
+    tput = (double) n * dim / us;            /* (vec*dim)/us */
+    if (tput < 1.0 || tput > 1.0e6)          /* implausible → distrust */
+        return -1.0;
+    return tput;
+}
+
 static void
 write_hw_profile(void)
 {
@@ -7413,7 +7488,16 @@ write_hw_profile(void)
     p.gpu_cagra_lat_us = CUVS_HWP_DEFAULT_CAGRA_LAT; /* v2; probed in Stage 3 */
     p.probe_status    = 0;
 
-    cuvs_probe_hw(dev, &p.link_bw_bpus, &p.hbm_bw_bpus, &p.gpu_bf_tput, &p.probe_status);
+    cuvs_probe_hw(dev, &p.link_bw_bpus, &p.hbm_bw_bpus, &p.gpu_bf_tput,
+                  &p.gpu_cagra_lat_us, &p.probe_status);
+
+    /* Host-side coefficients (no CUDA): IPC RTT floor + CPU distance throughput. */
+    {
+        double rtt  = probe_ipc_rtt_us();
+        double cput = probe_cpu_dist_tput();
+        if (rtt  > 0.0) { p.ipc_rtt_us    = rtt;  p.probe_status |= CUVS_HWPROBE_IPC_RTT; }
+        if (cput > 0.0) { p.cpu_dist_tput = cput; p.probe_status |= CUVS_HWPROBE_CPU_DIST; }
+    }
 
     /* atomic profile write */
     snprintf(final, sizeof(final), "%s/cuvs_hw_profile", g_index_dir);
@@ -7451,8 +7535,10 @@ write_hw_profile(void)
         if (dir_fd >= 0) { fsync(dir_fd); close(dir_fd); }
     }
 
-    LOG_INFO("pg_cuvs_server: hw_profile gpu='%s' link_bw=%.0f hbm_bw=%.0f bf_tput=%.0f probe_status=0x%x\n",
-             p.gpu_name, p.link_bw_bpus, p.hbm_bw_bpus, p.gpu_bf_tput, p.probe_status);
+    LOG_INFO("pg_cuvs_server: hw_profile gpu='%s' link_bw=%.0f hbm_bw=%.0f bf_tput=%.0f "
+             "cpu_dist=%.0f cagra_lat=%.1f ipc_rtt=%.1f probe_status=0x%x\n",
+             p.gpu_name, p.link_bw_bpus, p.hbm_bw_bpus, p.gpu_bf_tput,
+             p.cpu_dist_tput, p.gpu_cagra_lat_us, p.ipc_rtt_us, p.probe_status);
 }
 
 /* ----------------------------------------------------------------
