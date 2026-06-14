@@ -117,6 +117,16 @@
 
 순차 경로(릴리스 후 기능)와 섞지 않는다. 각 항목은 트리거가 충족될 때 순차 트랙으로 승격한다.
 
+### 코스트 모델 v2 — Phase 3 (transient B 물리화 + `auto`) — 장비 블록
+
+> **블록(2026-06-15)**: Phase 1+2는 구현·VM 검증 완료(`feat/hw-profile`, ADR-075 Phase 2 구현절 — cagra/flat 물리 비용 + κ 앵커 + probe-bit 게이트). Phase 3는 **하드웨어 부재로 보류**. PCIe-attached A100에서는 transient B가 잉여(ADR-074: 매쿼리 H2D로 pgvector-무인덱스와 중복)라 `auto` 승격이 regret-positive — 진짜 이득은 **통합메모리(GH200 NVLink-C2C ~900GB/s / MI300A APU)**에서만 발생(매쿼리 H2D 페널티 붕괴).
+
+- **트리거**: 통합메모리급 GPU 확보.
+- **작업**: (1) `cuvs_transient_bf_add_path`의 `on` 강제 1.0를 유지하되 `auto`(1) 경로에 물리 공식 배선 — `κ·(ipc_rtt + bytes(N)/link_bw + N·dim/gpu_bf_tput) + cpu_operator_cost·N`(detoast는 PG 단위, probe 불필요). (2) `link_bw` 밴드로 `auto` 게이트(통합메모리에서만 B 승격). (3) `bf_tput` probe를 검색-전용(업로드 제외)으로 정밀화 — 현재 end-to-end라 transient용으로 과대. (4) filtered wedge 교차점 + 런타임 적응 신호(아래 행과 연계).
+- **검증**: 통합메모리 HW에서 B-vs-CPU-seqscan 교차점 실측 → `routing_golden_measured`에 B-flip 케이스 추가, regret-averse 확인.
+
+스펙: ADR-075(Phase 2 구현절·Phase 3 설계), ADR-074(B 거취), ADR-073(transient B).
+
 ### 분산 운영 — 3C/3D (완료·인증 — 완료 표 참조)
 
 > **완료 (2026-06-10, ADR-013/ADR-066)**: 아래 스펙은 모두 구현·인증됐다. 실 GCS round-trip + fail-closed가 A100에서 `make gpu-test-objstore`로 검증됐고(installcheck 25/25 + isolation 3/3), SSOT는 완료 표로 이전됐다. 이 절은 원 스펙 기록으로 보존한다. 잔여 후속(트리거): emulator 기반 CI 회귀(`STORAGE_EMULATOR_HOST` + fake-gcs-server), S3 provider.
