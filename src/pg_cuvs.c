@@ -1766,10 +1766,29 @@ cuvsamcostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
     }
     else
     {
-        *indexStartupCost = CUVS_STARTUP_COST;
-        *indexTotalCost   = CUVS_STARTUP_COST
-                          + CUVS_K_COST    * (double) cuvs_k
-                          + CUVS_ROWS_COST * rows;
+        int           dim = cuvs_index_vector_dim(root, path->indexinfo);
+        CuvsHwProfile prof;
+        double        kappa;
+
+        if (cuvs_phys_cost_ready(CUVS_HWPROBE_IPC_RTT | CUVS_HWPROBE_CAGRA_LAT |
+                                 CUVS_HWPROBE_CPU_DIST, dim, &prof, &kappa))
+        {
+            /* Physical: CAGRA graph search is ~N-independent — a fixed GPU latency
+             * floor + IPC roundtrip, in PG cost units via κ. The legacy tiny-N term
+             * is dropped: at N->0 the CPU seqscan is ~free and wins automatically,
+             * so the crossover where cagra beats seqscan is now hardware/dim-located
+             * (κ ∝ 1/dim → cagra wins at lower N as dim grows). */
+            double startup = kappa * (prof.ipc_rtt_us + prof.gpu_cagra_lat_us);
+            *indexStartupCost = startup;
+            *indexTotalCost   = startup * (1.0 + (double) cuvs_k / 100.0);
+        }
+        else
+        {
+            *indexStartupCost = CUVS_STARTUP_COST;
+            *indexTotalCost   = CUVS_STARTUP_COST
+                              + CUVS_K_COST    * (double) cuvs_k
+                              + CUVS_ROWS_COST * rows;
+        }
     }
 
     if (cuvs_debug)
