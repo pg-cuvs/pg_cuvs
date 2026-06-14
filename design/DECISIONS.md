@@ -2921,3 +2921,36 @@ load-dependent `bf_batch_wait` 라우팅과 `CUVS_STARTUP_COST` 재보정은 이
 **후속(carry-forward)**: filtered-path 교차점 측정(B의 filter-first가 CPU exact-filtered 대비 우위 구간) + 런타임 적응 라우팅(동시성/offload 신호) = live `auto`의 전제 / release-prep(모든 flat/B 작업 뒤: BENCHMARK·doc-coherence·ops-playbook·GitHub Pages·org 이전).
 
 관련: ADR-071(흡수), ADR-039(BF GUC deprecation), ADR-049(AM-per-algo), ADR-061(filtered wedge), ADR-064(streaming BF), ADR-047(delta/tombstone freshness), 플랜 SSOT `snappy-strolling-brook.md`.
+
+---
+
+## ADR-074 (잠정, 번호 머지 시 확정) — GPU exact BF 실측 특성화 + 두-체제 포지셔닝 수정: A1=GPU 값, B(transient)=잉여, 쓰기-heavy=pgvector-무인덱스
+
+**날짜**: 2026-06-14
+**상태**: ACCEPTED (측정 기반). ADR-073의 **W1/W2 가치 전제를 실측으로 수정**한다. B(transient)의 최종 거취(제거 vs experimental)는 보류 — 단 신규 투자 중단. ADR-073의 A1·MVCC·라우팅 결정은 유효.
+
+**문제**: ADR-073은 두 체제(A1 상주 + B transient)를 설계하며 "B가 W1(쓰기-heavy)에서 GPU 속도 이득을 준다"를 가정했으나, **빌드 전에 그 가치 가설을 측정하지 않았다**(적대검증은 정확성/FATAL에만 집중). 라우팅 캘리브레이션 중 실측으로 가설을 검증.
+
+**측정 (A100/PG16, 100k×768, top-10; 분해는 단일스레드)**:
+- **A1 상주 read = 1.09ms** (CPU seqscan 559ms 대비 ~500x). W2 검증.
+- **분해**: 힙 스캔만 10ms / detoast(계산 X, `vector_dims`) 544ms / detoast+L2거리 540ms → **거리계산 ≈ 0ms.** L2는 ~0.75 flop/byte로 **memory-bound**(CPU·GPU 공통). 비용은 전부 **데이터 이동**이고, **TOAST detoast ~535ms가 지배**(CPU·transient-B 공통 바닥).
+- **transient B read = 1103ms** = 백엔드 1014(detoast ~570 + **회피가능 복사 ~434**: per-row 코퍼스 memcpy + `repalloc_huge` 성장 + 코퍼스→memfd 이중복사) + 데몬 89(**pageable H2D ~3.5GB/s** = PCIe peak의 ~1/7, mmap'd memfd가 미-pin + RMM-pool 부재 per-query cudaMalloc). 즉 **B ≈ CPU(읽기 GPU 이득 0)**; 최적화해도 detoast가 양쪽을 지배 + GPU는 H2D를 더 내므로 **잘해야 무승부**(선형 비용 → 비율 N-무관, 큰 N도 미교차).
+- **A1 write = 1.77ms/row vs no-index 0.13ms = ~13x** (행당 데몬 IPC `cuvs_ipc_extend` + delta append; cagra 3Q extend 경로 상속). 동반: HOT 비활성(벡터 컬럼 UPDATE)·compaction 재빌드(전체 N 재detoast+H2D)·delta cap 초과→CPU 리라우트·VRAM 천장. (초기 "1.1x"는 빈 테이블 빌드로 aminsert가 단락된 오측정이었음 — 비-empty 빌드로 정정.)
+
+**결정 (포지셔닝 수정)**:
+- **읽기 多 → A1 (GPU 상주)**: 1ms. 데이터 이동을 빌드 1회로 분할상환 → GPU가 이기는 **유일한 길**. ✓
+- **쓰기 多 → pgvector 무인덱스 (CPU)**: 쓰기 0비용, 읽기 detoast-bound. A1의 13x 쓰기 비용이 실재하므로(ADR-073 "쓰기에 지불" 직관 확인) 쓰기-heavy엔 A1 부적합.
+- **B (transient GPU) = 잉여**: A1(읽기)과 pgvector-무인덱스(쓰기) 사이에서, 읽기는 GPU 이득 0(memory-bound + 매쿼리 H2D = 구조적), 쓰기는 pgvector도 0 → **pgvector-무인덱스와 완전 중복**. 신규 투자 중단; 최종 거취 보류.
+- **근본 원인**: GPU 속도 = 데이터 이동 분할상환 = 상주(빌드). "no-build인데 GPU 빠름"은 형용모순. PG-Strom이 빠른 건 컬럼나/Arrow로 row-by-row TOAST를 회피하기 때문.
+
+**MVCC 안전성 (A1)**: gettuple은 **TID만 반환 + `scan->xs_recheck=true`**(pg_cuvs.c:3489) → executor가 쿼리 스냅샷으로 힙 visibility recheck(`index_getnext_slot`→`table_index_fetch_tuple`). GPU 코퍼스/delta/tombstone은 **후보 생성기**일 뿐 — 미커밋 INSERT 누출·DELETE 가시성·snapshot 경계 전부 recheck에서 차단 → **visibility 위반 없음**. tombstone은 ambulkdelete=**VACUUM**(전역 xmin horizon 아래=모두에게 dead)만 찍어 안전. recall(가시 행 누락)은 stale/drift 게이트(max_delta_rows·max_stale_fraction·delete-drift)가 CPU-exact 리라우트로 보호. **검증 틈**: cagra 기계장치 재사용으로 안전이 상속되나, isolation 3 스펙(delta_tombstone_snapshot/delta_interleaving/reindex_concurrent_delete)은 **`USING cagra`만 — flat 직접 검증 안 됨** → 후속으로 flat 변종 스펙 추가.
+
+**완화 레버(미측정)**: `ALTER TABLE … SET STORAGE PLAIN`(dim≤~768은 8KB 페이지 인라인) → TOAST 회피로 detoast 바닥 제거 가능 → CPU/transient 절대시간 급감. A1 상주가 정공법.
+
+**기각/수정**: ADR-073의 "B = W1 GPU 가치" 전제 기각(실측 잉여). A1·플래너 라우팅·MVCC 설계는 유지. B 코드는 보존하되 `auto` off, `on` 전용(ADR-073 캘리브레이션 결정과 일관).
+
+**후속(carry-forward)**: flat isolation 스펙 3종 추가 / B 최종 거취(제거 vs experimental) 결정 / (선택) STORAGE PLAIN 실측 / (B 유지 시) daemon pinned-H2D + RMM-pool + 백엔드 마샬링 복사 제거 / filtered 교차점 + 런타임 적응 라우팅 + **하드웨어-포터블 cost**(VM 스펙 고정 금지, 배포 장비별 계수) = live `auto`의 전제.
+
+**교훈**: 정확성(FATAL)은 빌드 전 적대검증했으나 **"빠른가"라는 가치 가설은 빌드 후에야 측정**했다. 작은 spike(재스캔+GPU vs CPU)를 빌드 전에 했으면 B의 잉여성을 일찍 잡았다. → 성능 가치 가설도 빌드 전 측정을 절차로.
+
+관련: ADR-073(수정 대상), ADR-069(cost-correction loop), ADR-047(delta/tombstone MVCC), ADR-061(filtered wedge), ADR-044(프로파일링).
