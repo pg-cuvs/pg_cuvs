@@ -2944,13 +2944,13 @@ load-dependent `bf_batch_wait` 라우팅과 `CUVS_STARTUP_COST` 재보정은 이
 - **B (transient GPU) = 잉여**: A1(읽기)과 pgvector-무인덱스(쓰기) 사이에서, 읽기는 GPU 이득 0(memory-bound + 매쿼리 H2D = 구조적), 쓰기는 pgvector도 0 → **pgvector-무인덱스와 완전 중복**. 신규 투자 중단; 최종 거취 보류.
 - **근본 원인**: GPU 속도 = 데이터 이동 분할상환 = 상주(빌드). "no-build인데 GPU 빠름"은 형용모순. PG-Strom이 빠른 건 컬럼나/Arrow로 row-by-row TOAST를 회피하기 때문.
 
-**MVCC 안전성 (A1)**: gettuple은 **TID만 반환 + `scan->xs_recheck=true`**(pg_cuvs.c:3489) → executor가 쿼리 스냅샷으로 힙 visibility recheck(`index_getnext_slot`→`table_index_fetch_tuple`). GPU 코퍼스/delta/tombstone은 **후보 생성기**일 뿐 — 미커밋 INSERT 누출·DELETE 가시성·snapshot 경계 전부 recheck에서 차단 → **visibility 위반 없음**. tombstone은 ambulkdelete=**VACUUM**(전역 xmin horizon 아래=모두에게 dead)만 찍어 안전. recall(가시 행 누락)은 stale/drift 게이트(max_delta_rows·max_stale_fraction·delete-drift)가 CPU-exact 리라우트로 보호. **검증 틈**: cagra 기계장치 재사용으로 안전이 상속되나, isolation 3 스펙(delta_tombstone_snapshot/delta_interleaving/reindex_concurrent_delete)은 **`USING cagra`만 — flat 직접 검증 안 됨** → 후속으로 flat 변종 스펙 추가.
+**MVCC 안전성 (A1)**: gettuple은 **TID만 반환 + `scan->xs_recheck=true`**(pg_cuvs.c:3489) → executor가 쿼리 스냅샷으로 힙 visibility recheck(`index_getnext_slot`→`table_index_fetch_tuple`). GPU 코퍼스/delta/tombstone은 **후보 생성기**일 뿐 — 미커밋 INSERT 누출·DELETE 가시성·snapshot 경계 전부 recheck에서 차단 → **visibility 위반 없음**. tombstone은 ambulkdelete=**VACUUM**(전역 xmin horizon 아래=모두에게 dead)만 찍어 안전. recall(가시 행 누락)은 stale/drift 게이트(max_delta_rows·max_stale_fraction·delete-drift)가 CPU-exact 리라우트로 보호. **검증 틈 — 닫힘(2026-06-14)**: isolation 3 스펙이 `USING cagra`만이었으나, flat 변종 3종(`flat_tombstone_snapshot`/`flat_delta_interleaving`/`flat_reindex_concurrent_delete`)을 추가해 A100에서 직접 검증 — **installcheck-isolation 6/6 GREEN**, flat이 cagra와 동일하게 MVCC-correct(오래된 RR 스냅샷은 삭제행 유지·새 스냅샷은 필터, 미커밋 insert 불가시→커밋 후 가시, REINDEX 후 ghost 없음). **부수 발견**: `pg_cuvs_compact`는 cagra 전용(`handle_compact`가 `e->handle` 요구, flat은 NULL) — flat은 in-place compact 없이 **REINDEX로 재빌드 compaction**(flat 변종 스펙은 compact 단계 생략).
 
 **완화 레버(미측정)**: `ALTER TABLE … SET STORAGE PLAIN`(dim≤~768은 8KB 페이지 인라인) → TOAST 회피로 detoast 바닥 제거 가능 → CPU/transient 절대시간 급감. A1 상주가 정공법.
 
 **기각/수정**: ADR-073의 "B = W1 GPU 가치" 전제 기각(실측 잉여). A1·플래너 라우팅·MVCC 설계는 유지. B 코드는 보존하되 `auto` off, `on` 전용(ADR-073 캘리브레이션 결정과 일관).
 
-**후속(carry-forward)**: flat isolation 스펙 3종 추가 / B 최종 거취(제거 vs experimental) 결정 / (선택) STORAGE PLAIN 실측 / (B 유지 시) daemon pinned-H2D + RMM-pool + 백엔드 마샬링 복사 제거 / filtered 교차점 + 런타임 적응 라우팅 + **하드웨어-포터블 cost**(VM 스펙 고정 금지, 배포 장비별 계수) = live `auto`의 전제.
+**후속(carry-forward)**: ~~flat isolation 스펙 3종 추가~~(완료 2026-06-14, 6/6 GREEN) / B 최종 거취(제거 vs experimental) 결정 / (선택) STORAGE PLAIN 실측(detoast 벽 제거로 CPU kNN 3.7x; 단 GPU 승리는 여전히 상주) / (B 유지 시) daemon pinned-H2D + RMM-pool + 백엔드 마샬링 복사 제거 / filtered 교차점 + 런타임 적응 라우팅 + **하드웨어-포터블 cost**(VM 스펙 고정 금지, 배포 장비별 계수) = live `auto`의 전제 / (참고) `pg_cuvs_compact` flat 미지원 — 깨끗한 no-op vs REINDEX 안내 문서화.
 
 **교훈**: 정확성(FATAL)은 빌드 전 적대검증했으나 **"빠른가"라는 가치 가설은 빌드 후에야 측정**했다. 작은 spike(재스캔+GPU vs CPU)를 빌드 전에 했으면 B의 잉여성을 일찍 잡았다. → 성능 가치 가설도 빌드 전 측정을 절차로.
 
