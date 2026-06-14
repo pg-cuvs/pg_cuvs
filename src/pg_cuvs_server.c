@@ -7381,6 +7381,79 @@ graceful_shutdown(void)
 }
 
 /* ----------------------------------------------------------------
+ * ADR-075 Phase 1: probe hardware constants once at boot and write the GLOBAL
+ * cuvs_hw_profile (CRC) + cuvs_daemon_identity (text) sidecars atomically. The
+ * planner reads these cheaply; failure is non-fatal (planner falls back to
+ * compiled DEFAULTs). NOT consumed by any cost decision yet (Phase 2).
+ * ---------------------------------------------------------------- */
+static void
+write_hw_profile(void)
+{
+    int           dev = (g_n_allowed_gpus > 0) ? g_allowed_gpus[0] : 0;
+    CuvsHwProfile p;
+    char          final[512], tmp[576];
+    FILE         *f;
+
+    mkdir(g_index_dir, 0700);   /* may not exist yet if no index built */
+
+    memset(&p, 0, sizeof(p));
+    if (dev >= 0 && dev < g_n_gpus)
+    {
+        strncpy(p.gpu_name, g_gpus[dev].name, sizeof(p.gpu_name) - 1);
+        p.total_vram_bytes = (int64_t) g_gpus[dev].total_vram_bytes;
+    }
+    p.n_gpus      = (uint32_t) g_n_gpus;
+    p.measured_at = (int64_t) time(NULL);
+    /* Conservative DEFAULTs (shared with the planner fallback); probes overwrite. */
+    p.link_bw_bpus = CUVS_HWP_DEFAULT_LINK_BW;
+    p.hbm_bw_bpus  = CUVS_HWP_DEFAULT_HBM_BW;
+    p.gpu_bf_tput  = CUVS_HWP_DEFAULT_BF_TPUT;
+    p.ipc_rtt_us   = CUVS_HWP_DEFAULT_IPC_RTT;   /* not probed in v1 */
+    p.probe_status = 0;
+
+    cuvs_probe_hw(dev, &p.link_bw_bpus, &p.hbm_bw_bpus, &p.gpu_bf_tput, &p.probe_status);
+
+    /* atomic profile write */
+    snprintf(final, sizeof(final), "%s/cuvs_hw_profile", g_index_dir);
+    snprintf(tmp,   sizeof(tmp),   "%s.tmp", final);
+    f = fopen(tmp, "wb");
+    if (f)
+    {
+        int ok = (cuvs_hw_profile_write(f, &p) == 0);
+        if (ok && fflush(f) != 0) ok = 0;
+        if (ok && fsync(fileno(f)) != 0) ok = 0;
+        if (fclose(f) != 0) ok = 0;
+        if (ok && rename(tmp, final) != 0) ok = 0;
+        if (!ok) { unlink(tmp); LOG_WARN("pg_cuvs_server: hw_profile write failed errno=%d\n", errno); }
+    }
+    else
+        LOG_WARN("pg_cuvs_server: hw_profile fopen(%s) failed errno=%d\n", tmp, errno);
+
+    /* atomic daemon-identity write (text: gpu_name / pid / boot epoch) */
+    snprintf(final, sizeof(final), "%s/cuvs_daemon_identity", g_index_dir);
+    snprintf(tmp,   sizeof(tmp),   "%s.tmp", final);
+    f = fopen(tmp, "w");
+    if (f)
+    {
+        int ok = (fprintf(f, "%s\n%d\n%lld\n", p.gpu_name, (int) getpid(),
+                          (long long) p.measured_at) > 0);
+        if (ok && fflush(f) != 0) ok = 0;
+        if (ok && fsync(fileno(f)) != 0) ok = 0;
+        if (fclose(f) != 0) ok = 0;
+        if (ok && rename(tmp, final) != 0) ok = 0;
+        if (!ok) unlink(tmp);
+    }
+
+    {
+        int dir_fd = open(g_index_dir, O_RDONLY);
+        if (dir_fd >= 0) { fsync(dir_fd); close(dir_fd); }
+    }
+
+    LOG_INFO("pg_cuvs_server: hw_profile gpu='%s' link_bw=%.0f hbm_bw=%.0f bf_tput=%.0f probe_status=0x%x\n",
+             p.gpu_name, p.link_bw_bpus, p.hbm_bw_bpus, p.gpu_bf_tput, p.probe_status);
+}
+
+/* ----------------------------------------------------------------
  * main
  * ---------------------------------------------------------------- */
 int
@@ -7493,6 +7566,9 @@ main(int argc, char **argv)
         return 1;
     }
     LOG_INFO("index registry capacity: %d (--max-indexes)\n", g_max_indexes);
+
+    /* ADR-075 Phase 1: probe hardware + write the global cost-model profile. */
+    write_hw_profile();
 
     /* Initialize per-device VRAM budgets.
      *

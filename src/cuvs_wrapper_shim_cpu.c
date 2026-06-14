@@ -469,6 +469,17 @@ int cuvs_detect_gpus(CuvsGpuDeviceInfo *out, int max_devices)
 }
 
 int    cuvs_gpu_available(void) { return 1; }
+
+/* ADR-075: no real hardware to probe under the CPU shim — leave every output
+ * untouched and probe_status clear so the caller keeps its compiled DEFAULTs. */
+int cuvs_probe_hw(int device_id, double *link_bw_bpus, double *hbm_bw_bpus,
+                  double *gpu_bf_tput, unsigned int *probe_status)
+{
+    (void)device_id; (void)link_bw_bpus; (void)hbm_bw_bpus;
+    (void)gpu_bf_tput; (void)probe_status;
+    return 0;
+}
+
 size_t cuvs_vram_free_bytes_on(int device_id) { (void)device_id; return shim_vram_free_get(); }
 size_t cuvs_vram_free_bytes(void) { return shim_vram_free_get(); }
 void   cuvs_warmup_device(int device_id) { (void)device_id; }

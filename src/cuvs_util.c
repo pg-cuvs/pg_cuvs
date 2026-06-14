@@ -11,6 +11,7 @@
 
 #include <string.h>
 #include <stdlib.h>
+#include <stddef.h>   /* offsetof (cuvs_hw_profile crc range) */
 
 /* ----------------------------------------------------------------
  * Index filename parsing: "<db_oid>_<index_oid>.cagra"
@@ -369,6 +370,47 @@ cuvs_vectors_read(FILE *f, CuvsVectorsHeader *hdr_out, float **vecs_out)
     if (hdr_out)
         *hdr_out = hdr;
     *vecs_out = vecs;
+    return 0;
+}
+
+/* ----------------------------------------------------------------
+ * Hardware profile (ADR-075) write/read. Self-contained struct; body_crc32
+ * covers all bytes after it (offsetof(probe_status)..end).
+ * ---------------------------------------------------------------- */
+int
+cuvs_hw_profile_write(FILE *f, CuvsHwProfile *p)
+{
+    size_t off = offsetof(CuvsHwProfile, probe_status);
+
+    p->magic      = CUVS_HWPROFILE_MAGIC;
+    p->version    = CUVS_HWPROFILE_VERSION;
+    p->reserved   = 0;
+    p->body_crc32 = cuvs_crc32((const char *)p + off, sizeof(*p) - off);
+
+    if (fwrite(p, sizeof(*p), 1, f) != 1)
+        return -1;
+    return 0;
+}
+
+int
+cuvs_hw_profile_read(FILE *f, CuvsHwProfile *out)
+{
+    CuvsHwProfile p;
+    size_t        off = offsetof(CuvsHwProfile, probe_status);
+
+    if (fread(&p, sizeof(p), 1, f) != 1)
+        return -1;
+    if (p.magic != CUVS_HWPROFILE_MAGIC)
+        return -1;
+    if (p.version != CUVS_HWPROFILE_VERSION)
+        return -1;
+    if (p.reserved != 0)
+        return -1;
+    if (cuvs_crc32((const char *)&p + off, sizeof(p) - off) != p.body_crc32)
+        return -1;
+
+    if (out)
+        *out = p;
     return 0;
 }
 

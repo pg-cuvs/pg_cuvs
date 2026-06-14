@@ -1292,6 +1292,27 @@ cuvs_index_delete_drift_stale(Oid index_oid, double live_rows)
            > cuvs_max_stale_fraction;
 }
 
+/* ADR-075 Phase 1: read the GLOBAL hardware profile written by the daemon at boot
+ * (<index_dir>/cuvs_hw_profile). Cheap plan-time read — NO IPC, NO CUDA — modeled
+ * on the .tids header gate above. Returns true + fills *out on a valid profile;
+ * false on absent/corrupt (caller uses compiled DEFAULT coefficients). Not yet
+ * consumed by any cost decision (Phase 2). */
+static bool
+cuvs_hw_profile_load(CuvsHwProfile *out)
+{
+    char  path[MAXPGPATH];
+    FILE *f;
+    int   rc;
+
+    snprintf(path, sizeof(path), "%s/cuvs_hw_profile", get_index_dir());
+    f = AllocateFile(path, PG_BINARY_R);
+    if (f == NULL)
+        return false;
+    rc = cuvs_hw_profile_read(f, out);
+    FreeFile(f);
+    return rc == 0;
+}
+
 /* Plan-time daemon availability gate. The daemon creates its UDS socket only
  * after full startup (warmup + index loading). A missing socket means the
  * daemon is not yet ready or was cleanly shut down; silently raise cost so the
@@ -4719,6 +4740,99 @@ pg_cuvs_batch_search(PG_FUNCTION_ARGS)
         }
     }
 
+    return (Datum) 0;
+}
+
+/* ----------------------------------------------------------------
+ * ADR-075 Phase 1: pg_cuvs_hw_profile() — expose the measured (or DEFAULT)
+ * hardware profile written by the daemon. Read-only, no IPC/CUDA. One row.
+ * source = 'measured' (valid sidecar) | 'default' (absent/corrupt → compiled
+ * defaults). matches_running_daemon compares the profile's gpu_name to the
+ * daemon-identity sidecar's, so a stale profile after a GPU swap is visible.
+ * NOT consumed by any cost decision yet (Phase 2).
+ * ---------------------------------------------------------------- */
+#define HWPROFILE_NCOLS 11
+
+PG_FUNCTION_INFO_V1(pg_cuvs_hw_profile);
+Datum
+pg_cuvs_hw_profile(PG_FUNCTION_ARGS)
+{
+    ReturnSetInfo   *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+    TupleDesc        tupdesc;
+    Tuplestorestate *tupstore;
+    MemoryContext    per_query_ctx, oldcontext;
+    CuvsHwProfile    p;
+    bool             measured;
+    bool             matches = false;
+    Datum            values[HWPROFILE_NCOLS];
+    bool             nulls[HWPROFILE_NCOLS];
+
+    if (rsinfo == NULL || !IsA(rsinfo, ReturnSetInfo))
+        ereport(ERROR,
+                (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                 errmsg("set-valued function called in context that cannot accept a set")));
+    if (!(rsinfo->allowedModes & SFRM_Materialize))
+        ereport(ERROR,
+                (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                 errmsg("materialize mode required, but it is not allowed in this context")));
+    if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+        ereport(ERROR,
+                (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                 errmsg("return type must be a row type")));
+
+    per_query_ctx = rsinfo->econtext->ecxt_per_query_memory;
+    oldcontext = MemoryContextSwitchTo(per_query_ctx);
+    tupstore = tuplestore_begin_heap(true, false, work_mem);
+    rsinfo->returnMode = SFRM_Materialize;
+    rsinfo->setResult  = tupstore;
+    rsinfo->setDesc    = tupdesc;
+    MemoryContextSwitchTo(oldcontext);
+
+    measured = cuvs_hw_profile_load(&p);
+    if (!measured)
+    {
+        memset(&p, 0, sizeof(p));
+        p.link_bw_bpus = CUVS_HWP_DEFAULT_LINK_BW;
+        p.hbm_bw_bpus  = CUVS_HWP_DEFAULT_HBM_BW;
+        p.gpu_bf_tput  = CUVS_HWP_DEFAULT_BF_TPUT;
+        p.ipc_rtt_us   = CUVS_HWP_DEFAULT_IPC_RTT;
+    }
+    else
+    {
+        /* compare profile gpu_name vs the running daemon's identity sidecar */
+        char  idpath[MAXPGPATH], line[80];
+        FILE *idf;
+        snprintf(idpath, sizeof(idpath), "%s/cuvs_daemon_identity", get_index_dir());
+        idf = AllocateFile(idpath, PG_BINARY_R);
+        if (idf)
+        {
+            if (fgets(line, sizeof(line), idf))
+            {
+                size_t n = strlen(line);
+                if (n > 0 && line[n - 1] == '\n') line[n - 1] = '\0';
+                matches = (strncmp(line, p.gpu_name, sizeof(p.gpu_name)) == 0);
+            }
+            FreeFile(idf);
+        }
+    }
+
+    memset(nulls, 0, sizeof(nulls));
+    if (p.gpu_name[0] != '\0')
+        values[0] = CStringGetTextDatum(p.gpu_name);
+    else
+        nulls[0] = true;
+    values[1]  = Int32GetDatum((int32) p.n_gpus);
+    values[2]  = Int64GetDatum(p.total_vram_bytes);
+    values[3]  = Float8GetDatum(p.link_bw_bpus);
+    values[4]  = Float8GetDatum(p.hbm_bw_bpus);
+    values[5]  = Float8GetDatum(p.gpu_bf_tput);
+    values[6]  = Float8GetDatum(p.ipc_rtt_us);
+    values[7]  = Int64GetDatum(p.measured_at);
+    values[8]  = Int32GetDatum((int32) p.probe_status);
+    values[9]  = CStringGetTextDatum(measured ? "measured" : "default");
+    values[10] = BoolGetDatum(matches);
+
+    tuplestore_putvalues(tupstore, tupdesc, values, nulls);
     return (Datum) 0;
 }
 
