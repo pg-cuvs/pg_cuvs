@@ -102,6 +102,9 @@ typedef struct {
  * ---------------------------------------------------------------- */
 bool  enable_cuvs                 = true;
 bool  cuvs_debug                  = false;
+/* ADR-075 Phase 2: use the measured physical cost formula when the hardware
+ * profile is fully probed. Off → legacy heuristic constants (byte-identical). */
+bool  enable_cuvs_phys_cost       = true;
 char *cuvs_socket_path            = NULL;
 char *cuvs_index_dir              = NULL;
 int   cuvs_circuit_breaker_threshold = 3;
@@ -709,6 +712,17 @@ _PG_init(void)
         "scriptable access without log spam.",
         &cuvs_debug,
         false,
+        PGC_USERSET,
+        0, NULL, NULL, NULL);
+
+    DefineCustomBoolVariable(
+        "cuvs.enable_phys_cost",
+        "Use the measured physical cost model when the hardware profile is fully probed.",
+        "On (default): the cagra/flat cost is derived from the deployment's measured "
+        "coefficients (ADR-075 Phase 2). Off, or when the profile is missing/partial: "
+        "the legacy heuristic constants are used (byte-identical routing).",
+        &enable_cuvs_phys_cost,
+        true,
         PGC_USERSET,
         0, NULL, NULL, NULL);
 
@@ -1616,6 +1630,61 @@ cuvs_pread_all(int fd, off_t off, void *buf, size_t len)
  * its own duplicated flat_amcostestimate, so this only moves the flat candidate. */
 #define CUVS_FLAT_STARTUP_COST 50.0
 
+/* ----------------------------------------------------------------
+ * ADR-075 Phase 2: physical, hardware-anchored cost.
+ *
+ * κ = cpu_operator_cost * cpu_dist_tput / dim converts a GPU latency in
+ * microseconds into the SAME PG cost-unit basis core uses for the competing CPU
+ * seqscan+Sort (core charges the distance operator a flat, dim-blind per-call
+ * cost; κ ∝ 1/dim correctly bends the crossover toward the GPU as dim grows).
+ * The physical branch runs ONLY when the profile is fully probed for the actor's
+ * required coefficients AND cuvs.enable_phys_cost is on; otherwise the caller
+ * keeps the legacy constants — byte-identical routing for un-probed deployments
+ * (Tier-1 shim writes probe_status=0; a missing/partial/corrupt profile → load
+ * fails or bits unset). No CUDA/IPC: cuvs_hw_profile_load is a cheap file read,
+ * dim is a syscache typmod lookup (no table_open). */
+static int
+cuvs_index_vector_dim(PlannerInfo *root, IndexOptInfo *index)
+{
+    AttrNumber attno;
+    Oid        heaprelid;
+
+    if (index == NULL || index->ncolumns < 1 || index->rel == NULL)
+        return -1;
+    if (index->rel->relid == 0 ||
+        (int) index->rel->relid >= root->simple_rel_array_size)
+        return -1;
+    attno = index->indexkeys[0];
+    if (attno <= 0)                       /* expression index — no plain column */
+        return -1;
+    heaprelid = root->simple_rte_array[index->rel->relid]->relid;
+    if (!OidIsValid(heaprelid))
+        return -1;
+    {
+        Oid   typid; int32 typmod; Oid collid;
+        get_atttypetypmodcoll(heaprelid, attno, &typid, &typmod, &collid);
+        return (int) typmod;              /* pgvector vector(d) typmod == d */
+    }
+}
+
+static bool
+cuvs_phys_cost_ready(uint32_t req_bits, int dim, CuvsHwProfile *prof, double *kappa)
+{
+    double k;
+
+    if (!enable_cuvs_phys_cost || dim < 1)
+        return false;
+    if (!cuvs_hw_profile_load(prof))
+        return false;
+    if ((prof->probe_status & req_bits) != req_bits)
+        return false;
+    k = cpu_operator_cost * prof->cpu_dist_tput / (double) dim;
+    if (!(k > 0.0) || isinf(k))           /* NaN / Inf / non-positive → distrust */
+        return false;
+    *kappa = k;
+    return true;
+}
+
 /* PG16 amcostestimate is a direct C function pointer, not a SQL function.
  *
  * IMPORTANT: This runs in the planner on every query — once per candidate
@@ -1769,12 +1838,29 @@ flat_amcostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
     else
     {
         /* ALWAYS exact brute-force (GUC-independent): bandwidth-bound in the
-         * corpus size N, no per-k term. The recalibrated startup cost keeps a
-         * small-N flat scan ahead of seqscan. */
-        double n = path->indexinfo->rel->tuples;
+         * corpus size N, no per-k term. */
+        double        n = path->indexinfo->rel->tuples;
+        int           dim = cuvs_index_vector_dim(root, path->indexinfo);
+        CuvsHwProfile prof;
+        double        kappa;
         if (n < 1) n = 1;
-        *indexStartupCost = CUVS_FLAT_STARTUP_COST;
-        *indexTotalCost   = CUVS_FLAT_STARTUP_COST + CUVS_ROWS_COST * n;
+
+        if (cuvs_phys_cost_ready(CUVS_HWPROBE_IPC_RTT | CUVS_HWPROBE_HBM_BW |
+                                 CUVS_HWPROBE_CPU_DIST, dim, &prof, &kappa))
+        {
+            /* Physical: resident corpus streamed once from HBM per query.
+             * startup = κ·ipc_rtt (fixed roundtrip), total += κ·(N·dim·4 / hbm_bw). */
+            double startup = kappa * prof.ipc_rtt_us;
+            double hbm_us  = ((double) n * (double) dim * 4.0) / prof.hbm_bw_bpus;
+            *indexStartupCost = startup;
+            *indexTotalCost   = startup + kappa * hbm_us;
+        }
+        else
+        {
+            /* Legacy: recalibrated startup keeps a small-N flat scan ahead of seqscan. */
+            *indexStartupCost = CUVS_FLAT_STARTUP_COST;
+            *indexTotalCost   = CUVS_FLAT_STARTUP_COST + CUVS_ROWS_COST * n;
+        }
     }
 
     if (cuvs_debug)
