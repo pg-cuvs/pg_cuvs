@@ -385,8 +385,11 @@ def main():
                      f"plan:\n{plan}")
         log(f"plan guard OK — {substr} in use")
 
-    # ── iso-recall knob selection (cheap: recall-only sweep on a 2k subset) ───
-    qcap_sweep = min(2000, len(queries))
+    # ── iso-recall knob selection (recall-only sweep) ────────────────────────
+    # Slow EXACT paths have a single knob point and trivially recall=1.0, so a
+    # 2000-query recall sweep is pure waste (~0.1-1s/q → 30+ min at 100k). Cap it.
+    SLOW = ("forced-seqscan", "forced-transient-bf")
+    qcap_sweep = min(100 if a.config in SLOW else 2000, len(queries))
     set_sql, knob, _, met = choose_iso_recall(conn, table, queries[:qcap_sweep],
                                               gt[:qcap_sweep], k, target,
                                               a.config, a.index_dir)
