@@ -213,6 +213,7 @@ static void cuvs_dwedge_add_path(PlannerInfo *root, RelOptInfo *rel,
                                  Index rti, RangeTblEntry *rte);          /* ADR-063 */
 static void cuvs_transient_bf_add_path(PlannerInfo *root, RelOptInfo *rel,
                                        Index rti, RangeTblEntry *rte);    /* ADR-073 B */
+static int  cuvs_metric_from_order_op(Oid opno);   /* defined below; used by both hooks */
 void cuvs_register_custom_scan(void);
 
 /* A pending DROP and the subtransaction that observed it (ADR-060). */
@@ -6324,6 +6325,7 @@ cuvs_dwedge_add_path(PlannerInfo *root, RelOptInfo *rel,
     Expr           *arg1;
     Expr           *arg2;
     Const          *query_const = NULL;
+    Var            *vcol = NULL;
     CustomPath     *cpath;
 
     if (!cuvs_filtered_knn_hook_enabled)
@@ -6333,19 +6335,12 @@ cuvs_dwedge_add_path(PlannerInfo *root, RelOptInfo *rel,
     if (rel->baserestrictinfo == NIL)
         return;
 
-    /* Require a CAGRA index on the relation. */
     cagra_am = get_am_oid("cagra", true);
     if (!OidIsValid(cagra_am))
         return;
-    foreach(lc, rel->indexlist)
-    {
-        IndexOptInfo *ioi = lfirst_node(IndexOptInfo, lc);
-        if (ioi->relam == cagra_am) { index_oid = ioi->indexoid; break; }
-    }
-    if (!OidIsValid(index_oid))
-        return;
 
-    /* Extract query vector from first ORDER BY (must be a Const). */
+    /* Extract the query Const AND the vector column Var from the first ORDER BY:
+     * one arg is this rel's vector Var, the other the query Const. */
     if (root->parse->sortClause == NIL)
         return;
     sgc = linitial_node(SortGroupClause, root->parse->sortClause);
@@ -6355,12 +6350,29 @@ cuvs_dwedge_add_path(PlannerInfo *root, RelOptInfo *rel,
     op = (OpExpr *) tle->expr;
     if (list_length(op->args) != 2)
         return;
+    if (cuvs_metric_from_order_op(op->opno) < 0)
+        return;   /* not a cuVS vector-distance ORDER BY — same guard as transient BF */
     arg1 = linitial(op->args);
     arg2 = lsecond(op->args);
-    if (IsA(arg1, Const))       query_const = (Const *) arg1;
-    else if (IsA(arg2, Const))  query_const = (Const *) arg2;
-    if (query_const == NULL)
-        return;   /* parametrized query — skip for spike */
+    if (IsA(arg1, Var) && ((Var *) arg1)->varno == (int) rti)
+    { vcol = (Var *) arg1; if (IsA(arg2, Const)) query_const = (Const *) arg2; }
+    else if (IsA(arg2, Var) && ((Var *) arg2)->varno == (int) rti)
+    { vcol = (Var *) arg2; if (IsA(arg1, Const)) query_const = (Const *) arg1; }
+    if (vcol == NULL || query_const == NULL)
+        return;   /* not "<col> <-> <const>" on this rel (e.g. parametrized) — skip */
+
+    /* Require a CAGRA index ON THIS COLUMN — not merely the first CAGRA index on
+     * the table. With multiple vector columns, picking the first CAGRA index would
+     * route the filtered KNN to the wrong column's graph. */
+    foreach(lc, rel->indexlist)
+    {
+        IndexOptInfo *ioi = lfirst_node(IndexOptInfo, lc);
+        if (ioi->relam == cagra_am && ioi->nkeycolumns >= 1 &&
+            ioi->indexkeys[0] == vcol->varattno)
+        { index_oid = ioi->indexoid; break; }
+    }
+    if (!OidIsValid(index_oid))
+        return;
 
     /* Build the CustomPath. */
     cpath = makeNode(CustomPath);

@@ -1,0 +1,89 @@
+-- multi_vector.sql — multiple vector columns on one table, each with its own GPU
+-- index. pg_cuvs index AMs are single-column (amcanmulticol=false → no composite
+-- index), but a table may carry several vector columns, one index per column;
+-- artifacts/daemon registry are keyed by index OID so they coexist. This test
+-- proves: (1) two GPU indexes on two different vector columns build and coexist,
+-- (2) routing is per-column (each ORDER BY uses its own column's index),
+-- (3) per-column search is correct, (4) the D-wedge filtered-KNN hook selects the
+-- CAGRA index ON THE ORDER BY COLUMN, not merely the first CAGRA index on the
+-- table (regression for the column-match fix — with two CAGRA indexes of
+-- different dim, picking the wrong one would dim-mismatch / return wrong rows).
+--
+-- REQUIRES: pg_cuvs_server running; cuvs.index_dir writable.
+\set ON_ERROR_STOP on
+
+CREATE EXTENSION IF NOT EXISTS vector;
+CREATE EXTENSION IF NOT EXISTS pg_cuvs;
+SET cuvs.index_dir = '/tmp/cuvs_indexes';
+
+-- Two vector columns of DIFFERENT dimension. Row g is linear+unique so the query
+-- = row g's own vector has an unambiguous nearest neighbour (id = g).
+CREATE TABLE mv (id int, tenant int, va vector(4), vb vector(8));
+INSERT INTO mv
+SELECT g, g % 3,
+       format('[%s,%s,%s,%s]',
+              (g*0.10)::numeric(12,4), (g*0.20)::numeric(12,4),
+              (g*0.30)::numeric(12,4), (g*0.40)::numeric(12,4))::vector,
+       format('[%s,%s,%s,%s,%s,%s,%s,%s]',
+              (g*0.01)::numeric(12,4), (g*0.02)::numeric(12,4),
+              (g*0.03)::numeric(12,4), (g*0.04)::numeric(12,4),
+              (g*0.05)::numeric(12,4), (g*0.06)::numeric(12,4),
+              (g*0.07)::numeric(12,4), (g*0.08)::numeric(12,4))::vector
+FROM generate_series(1, 500) g;
+
+-- which scan node won, by index name (mv_va = on va, mv_vb = on vb)
+CREATE FUNCTION pscan(q text) RETURNS text AS $$
+DECLARE line text;
+BEGIN
+  FOR line IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
+    IF line LIKE '%Index Scan using mv_va%' THEN RETURN 'idx_va'; END IF;
+    IF line LIKE '%Index Scan using mv_vb%' THEN RETURN 'idx_vb'; END IF;
+    IF line LIKE '%Seq Scan%'               THEN RETURN 'seqscan'; END IF;
+  END LOOP;
+  RETURN 'other';
+END$$ LANGUAGE plpgsql;
+
+-- ============================================================ (1) coexistence
+-- Two GPU indexes on two different vector columns of ONE table build cleanly.
+CREATE INDEX mv_va ON mv USING cagra (va vector_l2_ops);   -- column va (dim 4)
+CREATE INDEX mv_vb ON mv USING flat  (vb vector_l2_ops);   -- column vb (dim 8)
+ANALYZE mv;
+SELECT count(*) AS n_cuvs_indexes
+FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid
+WHERE i.indrelid = 'mv'::regclass AND c.relname IN ('mv_va','mv_vb');
+
+-- ============================================================ (2) per-column routing
+SET enable_seqscan = off;
+SELECT
+  pscan('SELECT id FROM mv ORDER BY va <-> ''[10,20,30,40]'' LIMIT 5')               AS route_va,
+  pscan('SELECT id FROM mv ORDER BY vb <-> ''[1,2,3,4,5,6,7,8]'' LIMIT 5')           AS route_vb;
+RESET enable_seqscan;
+
+-- ============================================================ (3) per-column correctness
+-- query = row 100's own vector on each column → nearest neighbour is id=100.
+SELECT (SELECT id FROM mv ORDER BY va <-> '[10,20,30,40]'    LIMIT 1) AS top_va,
+       (SELECT id FROM mv ORDER BY vb <-> '[1,2,3,4,5,6,7,8]' LIMIT 1) AS top_vb;
+
+-- ============================================================ (4) D-wedge column match
+-- Two CAGRA indexes on different-dim columns. A filtered (WHERE) top-k on vb must
+-- use vb's CAGRA index — selecting the first CAGRA index (va, dim 4) for a dim-8
+-- query would error or return wrong rows. Assert results match the CPU ground truth.
+DROP INDEX mv_vb;
+CREATE INDEX mv_vb ON mv USING cagra (vb vector_l2_ops);   -- now BOTH columns are CAGRA
+ANALYZE mv;
+
+CREATE TEMP TABLE gt AS
+  SELECT id FROM mv WHERE tenant = 1
+  ORDER BY vb <-> '[1,2,3,4,5,6,7,8]' LIMIT 5;            -- CPU ground truth (filtered)
+
+SET cuvs.filtered_knn_hook = on;
+CREATE TEMP TABLE dw AS
+  SELECT id FROM mv WHERE tenant = 1
+  ORDER BY vb <-> '[1,2,3,4,5,6,7,8]' LIMIT 5;            -- D-wedge path on vb
+RESET cuvs.filtered_knn_hook;
+
+SELECT (SELECT array_agg(id ORDER BY id) FROM gt)
+     = (SELECT array_agg(id ORDER BY id) FROM dw) AS dwedge_picks_vb_column;
+
+DROP FUNCTION pscan(text);
+DROP TABLE mv;
