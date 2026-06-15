@@ -15,7 +15,7 @@
 
 구현과 실측이 v2의 전제 세 개를 바꿨다.
 
-1. **엔진 인벤토리가 달라졌다.** v2의 `forced-bf`(cagra `search_mode` 옵션)는 1급 **`flat` AM(A1, 상주 exact GPU BF)** + **transient BF(B, 무인덱스)**로 승격·분리됐다(ADR-073). "HNSW vs CAGRA는 플래너 옵션이 아니다" — 한 컬럼은 한 인덱스만 가지므로 HNSW는 경쟁자(Ring A)일 뿐 플래너 결정면이 아니다. **플래너 결정면 = {cpu-seqscan, flat(GPU exact 상주), cagra(GPU approx), ivfpq, transient-B}**.
+1. **엔진 인벤토리가 달라졌다.** v2의 `forced-bf`(cagra `search_mode` 옵션)는 1급 **`flat` AM(A1, 상주 exact GPU BF)** + **transient BF(B, 무인덱스)**로 승격·분리됐다(ADR-073). 단 **flat·cagra·ivfpq는 서로 다른 AM이라 컬럼당 하나만 빌드하는 *배포 선택*이지 per-query 플래너 옵션이 아니다**(HNSW vs CAGRA와 같은 이유). 정확히: **빌드 메뉴 = {flat | cagra | ivfpq} 택1**(recall·쓰기패턴 기준), **per-query 플래너 결정면 = `seqscan ↔ 빌드한 그 인덱스 하나`** (+ `transient-B`는 무인덱스라 항상 병존 가능). flat↔cagra가 한 쿼리에서 겨뤄지는 일은 정상 배포엔 없다. HNSW는 경쟁자(Ring A)일 뿐.
 2. **코스트모델이 상수 휴리스틱에서 데이터-이동 물리 분해로 바뀌었다**(ADR-075, 구현됨). 그래서 Stage B는 더 이상 "`CUVS_STARTUP_COST` 상수를 내린다"가 아니라 **"물리 공식 + 하드웨어 probe가 옳게 라우팅하는지 검증한다"**가 된다.
 3. **실측이 포지셔닝을 수정했다**(ADR-074). 벡터 kNN은 **데이터-이동 바운드**이고 **TOAST detoast가 벽**이다. **GPU는 상주(A1)일 때만 이긴다**(HBM에서 연산). transient-B는 PCIe에선 잉여(≈CPU), 쓰기-heavy는 pgvector 무인덱스가 정답. → 벤치마크의 헤드라인 질문이 "GPU vs CPU QPS 슛아웃"에서 **"상주-GPU가 detoast-바운드 CPU를 어디서·왜 이기고, 코스트모델이 거기로 옳게 라우팅하는가"**로 이동한다.
 
@@ -71,6 +71,7 @@ main 0.5.0 기준 실제 경로. **한 cagra/flat 인덱스 + heap이 여러 실
 | **transient-B** `SET cuvs.gpu_bruteforce=on` | GPU exact 무인덱스 | 1.0 | **없음** | 항상 최신 | **매쿼리 detoast+H2D** (PCIe에선 ≈CPU) |
 
 **라우팅 규칙 (ADR-075, 구현됨)**:
+- **per-query 결정면은 배포별 2지선다**(빌드한 인덱스 하나 + seqscan): 인덱스 없음 → `seqscan ↔ transient-B(on일 때)` / cagra 빌드 → `seqscan ↔ cagra` / flat 빌드 → `seqscan ↔ flat`. **flat↔cagra는 플래너가 per-query로 고르지 않는다**(둘 다 빌드해야 `add_path` 비용비교가 일어나는데, 둘 다 VRAM 상주 = 비현실적 배포). 그래서 Stage B는 배포별로 따로 측정한다.
 - 코스트 = `scan(N) + detoast(m,storage) + move(m,link) + compute(m,engine) + topk(m,k) + fetch(k)` (행 수 휴리스틱 아님).
 - **exact-우선 단방향**: exact(cpu-seq/flat/B)가 cagra보다 **싸거나 같으면 exact**; 더 비싸면 cagra 유지(사용자가 DDL로 속도-위해-recall 선택). recall을 비용으로 거래하지 않는다.
 - 멘탈 모델: **"flat 인덱스 생성 여부 = read-heavy(W2)/write-heavy(W1) 스위치."** transient-B는 `on` 전용(experimental, ADR-074).
