@@ -62,22 +62,38 @@ def parse_cell(cell_id):
 
 # ── table setup (per-engine table; idempotent reuse if N rows already loaded) ─
 
-def setup_table(conn, table, corpus, n, dim, batch=50000):
+def storage_of(conn, table):
+    """attstorage of the embedding column: 'plain' or 'toast' (x/e/m)."""
+    with conn.cursor() as cur:
+        cur.execute("SELECT attstorage FROM pg_attribute WHERE attrelid = "
+                    "%s::regclass AND attname = 'embedding'", (table,))
+        r = cur.fetchone()
+    return "plain" if (r and r[0] == "p") else "toast"
+
+
+def setup_table(conn, table, corpus, n, dim, batch=50000, storage=None):
+    # ADR-074: TOAST detoast dominates kNN cost; STORAGE PLAIN (dim<=~768 inline)
+    # removes the wall. PGCUVS_STORAGE=plain forces it. Storage is part of the
+    # reuse key so a plain cell never reuses a toasted table (and vice-versa).
     import numpy as np
     from anbench_common import read_fbin
     import pgvector.psycopg
     pgvector.psycopg.register_vector(conn)
+    storage = (storage or os.environ.get("PGCUVS_STORAGE", "")).lower() or "toast"
     with conn.cursor() as cur:
         cur.execute("SELECT to_regclass(%s)", (f"public.{table}",))
         if cur.fetchone()[0] is not None:
             cur.execute(f"SELECT count(*) FROM {table}")
-            if cur.fetchone()[0] == n:
-                log(f"{table} already has {n} rows; reuse")
+            if cur.fetchone()[0] == n and storage_of(conn, table) == storage:
+                log(f"{table} already has {n} rows (storage={storage}); reuse")
                 return
             cur.execute(f"DROP TABLE {table}")
         cur.execute(f"CREATE TABLE {table} (id bigint, embedding vector({dim}))")
+        if storage == "plain":
+            cur.execute(f"ALTER TABLE {table} ALTER COLUMN embedding "
+                        f"SET STORAGE PLAIN")
     conn.commit()
-    log(f"COPY {n} rows into {table}")
+    log(f"COPY {n} rows into {table} (storage={storage})")
     from pgvector import Vector
     with conn.cursor().copy(
             f"COPY {table} (id, embedding) FROM STDIN WITH (FORMAT BINARY)") as cp:
@@ -341,11 +357,18 @@ def main():
     wal_b = observe.wal_delta(conn, before_lsn)
     sizes = observe.index_sizes(conn, name) if name else {
         "index_bytes_host": 0, "index_bytes_disk": 0, "index_bytes_vram": None}
+    tbl_storage = storage_of(conn, table)
     observe.write_protocol_row(
         a.csv, **common_row(phase="build", index_type=index_type,
                             build_s=round(bt, 3), wal_bytes=wal_b,
                             params_json={"build": "m16_ef64" if index_type == "hnsw"
-                                         else index_type},
+                                         else index_type,
+                                         "storage": tbl_storage,
+                                         "build_kind": ("none" if index_type in
+                                                        ("none", "transient_bf")
+                                                        else "graph" if index_type
+                                                        in ("hnsw", "cagra")
+                                                        else "vectors_only")},
                             **sizes, **s.as_dict()))
 
     # ── plan guard: GPU path must NOT silently seq-scan (issue #56) ───────────
@@ -396,7 +419,8 @@ def main():
             qps=round(qps, 1), p50_us=round(p50, 1), p95_us=round(p95, 1),
             p99_us=round(p99, 1), p999_us=round(p999, 1),
             recall_at_k=round(rec, 4), dispersion=disp,
-            params_json={"knob": knob, "iso_recall_met": met, "n_queries": qcap},
+            params_json={"knob": knob, "iso_recall_met": met, "n_queries": qcap,
+                          "storage": tbl_storage},
             notes="" if met else "recall target NOT met at sweep ceiling",
             **s.as_dict()))
     conn.close()
