@@ -158,7 +158,7 @@ stage=D module=concurrency ref=main build=false \
 > **NOTE — 50M IVF-PQ is NOT out of scope** (was missed in the first draft). ADR-049's `ivfpq` AM landed *after* the ADR-025 50M run, so the large-scale CAGRA-OOM verdict never had an IVF-PQ counterpoint. IVF-PQ compresses 50M×384 to ≈9.6 GB → **fits a single A100-40GB**, so it is genuinely runnable and is the *intended* answer for that scale (ADR-049 guide: IVF-PQ ⟶ 100M+). Once `forced-ivfpq` exists (Tier 0), this becomes a real Tier-2/3 benchmark cell, not an escalation: 50M IVF-PQ recall@n_probes vs vchordrq (0.9991) vs CPU HNSW. Recall is medium and `n_probes`-sensitive — that tradeoff IS the result.
 - **Ring C** (Milvus/Qdrant/LanceDB) — separate system-level doc, deprioritized.
 
-### Research track — native RaBitQ quantizer (spike GREEN, ADR candidate)
+### Research track — native RaBitQ quantizer (spike GREEN on cohere, ADR candidate)
 
 > Why: ivfpq needs **1024 B/vec** to reach iso-recall 0.95 on cohere-1024 (run #31).
 > vchordrq hits 0.9991 at 50M because **RaBitQ** (Gao & Long, SIGMOD'24) reranks
@@ -168,7 +168,7 @@ stage=D module=concurrency ref=main build=false \
 > the *full* RaBitQ win needs the quantizer itself.
 
 - **numpy feasibility spike — ✅ GREEN** (`tools/rabitq_spike.py`, `268b05b`). On synthetic clustered dim=1024 (N=20k/50k, 2 seeds): unbiased (standardized std=**1.001** — theoretical variance form matches), error-bound coverage **0.9901**, recall@10 **0.966 @ 5% rerank** / 0.994 @ 10%, storage **136 B/vec = 30× vs raw, 3.8× smaller than ivfpq**. The math checks (unbiased + bound) are data-agnostic → estimator is correct.
-- **cohere VM validation — in flight** (`engines/spike-rabitq.sh`, dispatched via `configs=spike-rabitq`): re-runs the spike on real `~/anbench/data/corpus.fbin` 100k. **Gate**: recall@10 ≥ 0.95 at rerank budget ≤ 5% on cohere (synthetic is optimistic). [UPDATE THIS WITH THE RUN RESULT.]
+- **cohere VM validation — ✅ GREEN** (run #32, `engines/spike-rabitq.sh`, real `corpus.fbin` 100k×1024): math identical to synthetic (unbiased std=**1.000**, coverage **0.9901**) — the data-agnostic checks hold on cohere. recall@10 = **1.0000 at every budget (1/2/5/10%)** → gate (≥0.95 @ ≤5%) passed decisively. **Caveat**: this is the *probe-all-lists* upper bound (no IVF miss) and the perfect 1.0 is suspiciously clean — a cheap follow-up should push rerank budget down to 0.1–0.5% to find the recall knee and use realistic `n_probes` for a production number. But feasibility is confirmed.
 - **If cohere holds** → write an ADR (like ADR-049 for ivfpq) + port to a CUDA kernel + `rabitq` AM. Effort: spike S (done) → CUDA encoder/estimator/bound M–L (first self-authored ANN numerics, correctness-sensitive) → AM integration M (flat/ivfpq template) → validation harness M (non-negotiable). Tractable *because the blocker is our own bounded numerics, not an unstable upstream API* (unlike DiskANN, ADR-026) — and it extends the hot-tier value prop (more vectors/GPU at high recall), which is in-segment.
 - **Deferred**: option B (real cuVS `refine()` for ivfpq) — plumbing path known (`refine_ratio` via the `ivfpq_n_probes` GUC→IPC→wrapper chain), revisit after the RaBitQ gate.
 
