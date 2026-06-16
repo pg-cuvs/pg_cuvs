@@ -122,7 +122,7 @@ def explain_uses_index(conn, table, qvec, index_substr):
 
 # ── build phase ──────────────────────────────────────────────────────────────
 
-def build_index(conn, config, table, n, index_dir):
+def build_index(conn, config, table, n, index_dir, build_params=None):
     with conn.cursor() as cur:
         cur.execute("SET maintenance_work_mem='16GB'")
         cur.execute("SET max_parallel_maintenance_workers=7")
@@ -147,11 +147,15 @@ def build_index(conn, config, table, n, index_dir):
             cur.execute(f"SET cuvs.index_dir = '{index_dir}'")  # CRITICAL
             name = f"{table}_ivfpq"
             # n_lists scaled to N so small cells don't get near-empty clusters
-            # (cuVS trains each list from the corpus); pq_bits/pq_dim keep the AM
-            # defaults (8 bits, dim/2 subspaces). n_probes is the query-time knob.
+            # (cuVS trains each list from the corpus). pq_dim/pq_bits come from
+            # the build-knob sweep (recall lever); default to the AM's dim/2, 8.
             nlists = max(16, min(2048, int(n ** 0.5)))
+            bp = build_params or {}
+            opts = [f"n_lists={nlists}", f"pq_bits={bp.get('pq_bits', 8)}"]
+            if bp.get("pq_dim"):
+                opts.append(f"pq_dim={bp['pq_dim']}")
             sql = (f"CREATE INDEX {name} ON {table} USING ivfpq "
-                   f"(embedding vector_l2_ops) WITH (n_lists={nlists})")
+                   f"(embedding vector_l2_ops) WITH ({', '.join(opts)})")
             index_type = "ivfpq"
         elif config == "forced-seqscan":
             return None, "none", 0.0, 0
@@ -248,6 +252,25 @@ def knob_sweep(config):
     if config in ("forced-seqscan", "forced-flat", "forced-transient-bf"):
         return [(None, None)]  # exact, single point (recall=1.0, no recall knob)
     raise NotImplementedError(config)
+
+
+def build_knob_sweep(config, dim):
+    """Build-param ladder. Only ivfpq needs one: its recall is governed by PQ
+    fidelity (pq_dim, a BUILD reloption), so reaching an iso-recall target means
+    rebuilding at higher pq_dim — not just raising the query-time n_probes knob
+    (pq_bits is already at the cuVS max of 8). Ascending pq_dim = ascending
+    VRAM/recall; the caller stops at the first (most-compressed) rung that meets
+    target = the min-VRAM iso-recall point. Non-ivfpq builds once ([None])."""
+    if config != "forced-ivfpq":
+        return [None]
+    ladder, seen = [], set()
+    for f in (4, 2, 1):                       # pq_dim = dim/4, dim/2, dim
+        if dim % f == 0:
+            pqd = dim // f
+            if pqd >= 1 and pqd not in seen:
+                seen.add(pqd)
+                ladder.append({"pq_dim": pqd, "pq_bits": 8})
+    return ladder or [{"pq_dim": dim, "pq_bits": 8}]
 
 
 def choose_iso_recall(conn, table, queries, gt, k, target, config, index_dir):
@@ -364,52 +387,63 @@ def main():
         base.update(extra)
         return base
 
-    # ── build phase (resource-sampled) ───────────────────────────────────────
-    before_lsn = observe.wal_lsn(conn)
-    with observe.ResourceSampler(gpu_index=a.gpu_index, daemon_pid=dpid) as s:
-        name, index_type, bt, idx_host = build_index(conn, a.config, table, n,
-                                                      a.index_dir)
-    wal_b = observe.wal_delta(conn, before_lsn)
-    sizes = observe.index_sizes(conn, name) if name else {
-        "index_bytes_host": 0, "index_bytes_disk": 0, "index_bytes_vram": None}
+    # ── build + iso-recall selection (ivfpq adds a build-knob sweep) ──────────
+    # Non-ivfpq: build_knob_sweep → [None], one build (identical to before).
+    # ivfpq: recall is set by PQ fidelity (pq_dim, a BUILD reloption), not by the
+    # query-time n_probes knob — so rebuild per pq_dim rung (ascending
+    # compression→recall) and stop at the most-compressed build whose n_probes
+    # sweep meets the iso-recall target (= the min-VRAM iso-recall point).
+    # forced-cuvs→cagra Index Scan, forced-flat→flat, forced-ivfpq→ivfpq,
+    # forced-transient-bf→CuvsTransientBF CustomScan (issue #56 plan guard).
+    GUARD = {"forced-cuvs": "cagra", "forced-flat": "flat",
+             "forced-ivfpq": "ivfpq", "forced-transient-bf": "CuvsTransientBF"}
     tbl_storage = storage_of(conn, table)
+    SLOW = ("forced-seqscan", "forced-transient-bf")
+    qcap_sweep = min(100 if a.config in SLOW else 2000, len(queries))
+    ladder = build_knob_sweep(a.config, dim)
+    nlists = max(16, min(2048, int(n ** 0.5)))
+    chosen = None
+    for bi, bp in enumerate(ladder):
+        before_lsn = observe.wal_lsn(conn)
+        with observe.ResourceSampler(gpu_index=a.gpu_index, daemon_pid=dpid) as s:
+            name, index_type, bt, idx_host = build_index(conn, a.config, table, n,
+                                                         a.index_dir, bp)
+        wal_b = observe.wal_delta(conn, before_lsn)
+        sizes = observe.index_sizes(conn, name) if name else {
+            "index_bytes_host": 0, "index_bytes_disk": 0, "index_bytes_vram": None}
+        if a.config in GUARD:
+            ok, plan = explain_uses_index(conn, table, queries[0], GUARD[a.config])
+            if not ok:
+                sys.exit(f"[runner] FAIL: {a.config} plan not using "
+                         f"{GUARD[a.config]} (fallback — check cuvs.index_dir / "
+                         f"daemon / gpu_bruteforce). plan:\n{plan}")
+            log(f"plan guard OK — {GUARD[a.config]} in use")
+        set_sql, knob, rec_sweep, met = choose_iso_recall(
+            conn, table, queries[:qcap_sweep], gt[:qcap_sweep], k, target,
+            a.config, a.index_dir)
+        chosen = (bp, name, index_type, bt, idx_host, wal_b, sizes, s.as_dict(),
+                  set_sql, knob, met)
+        if bp:
+            log(f"  build rung {bi} pq_dim={bp['pq_dim']}: iso_recall_met={met} "
+                f"sweep_recall={rec_sweep:.4f}")
+        if met or bi == len(ladder) - 1:
+            break
+
+    (bp, name, index_type, bt, idx_host, wal_b, sizes, sdict,
+     set_sql, knob, met) = chosen
+    build_pj = {"build": "m16_ef64" if index_type == "hnsw" else index_type,
+                "storage": tbl_storage,
+                "build_kind": ("none" if index_type in ("none", "transient_bf")
+                               else "graph" if index_type in ("hnsw", "cagra")
+                               else "pq" if index_type == "ivfpq"
+                               else "vectors_only")}
+    if bp:
+        build_pj.update(pq_dim=bp["pq_dim"], pq_bits=bp["pq_bits"], n_lists=nlists,
+                        builds_tried=ladder.index(bp) + 1)
     observe.write_protocol_row(
         a.csv, **common_row(phase="build", index_type=index_type,
                             build_s=round(bt, 3), wal_bytes=wal_b,
-                            params_json={"build": "m16_ef64" if index_type == "hnsw"
-                                         else index_type,
-                                         "storage": tbl_storage,
-                                         "build_kind": ("none" if index_type in
-                                                        ("none", "transient_bf")
-                                                        else "graph" if index_type
-                                                        in ("hnsw", "cagra")
-                                                        else "pq" if index_type
-                                                        == "ivfpq"
-                                                        else "vectors_only")},
-                            **sizes, **s.as_dict()))
-
-    # ── plan guard: GPU path must NOT silently seq-scan (issue #56) ───────────
-    # forced-cuvs→cagra Index Scan, forced-flat→flat Index Scan,
-    # forced-transient-bf→CuvsTransientBF CustomScan (ADR-073).
-    GUARD = {"forced-cuvs": "cagra", "forced-flat": "flat",
-             "forced-ivfpq": "ivfpq", "forced-transient-bf": "CuvsTransientBF"}
-    if a.config in GUARD:
-        substr = GUARD[a.config]
-        ok, plan = explain_uses_index(conn, table, queries[0], substr)
-        if not ok:
-            sys.exit(f"[runner] FAIL: {a.config} plan not using {substr} "
-                     f"(fallback — check cuvs.index_dir / daemon / gpu_bruteforce). "
-                     f"plan:\n{plan}")
-        log(f"plan guard OK — {substr} in use")
-
-    # ── iso-recall knob selection (recall-only sweep) ────────────────────────
-    # Slow EXACT paths have a single knob point and trivially recall=1.0, so a
-    # 2000-query recall sweep is pure waste (~0.1-1s/q → 30+ min at 100k). Cap it.
-    SLOW = ("forced-seqscan", "forced-transient-bf")
-    qcap_sweep = min(100 if a.config in SLOW else 2000, len(queries))
-    set_sql, knob, _, met = choose_iso_recall(conn, table, queries[:qcap_sweep],
-                                              gt[:qcap_sweep], k, target,
-                                              a.config, a.index_dir)
+                            params_json=build_pj, **sizes, **sdict))
     # ── measured query point: reps × query set → median + dispersion ─────────
     # Slow EXACT paths (cpu seqscan ~0.1-1s/q, transient-BF ~0.1-1s/q) would take
     # hours over 10k queries × reps; cap them (PGCUVS_SLOW_QCAP, default 300) and
@@ -456,6 +490,12 @@ def _selfcheck():
     assert [kn for _, kn in knob_sweep("forced-ivfpq")] == IVFPQ_NPROBES
     assert knob_sweep("forced-ivfpq")[0][0] == "SET cuvs.ivfpq_n_probes=16"
     assert knob_sweep("forced-seqscan") == [(None, None)]
+    assert build_knob_sweep("forced-hnsw", 1024) == [None]
+    assert build_knob_sweep("forced-cuvs", 1024) == [None]
+    lad = build_knob_sweep("forced-ivfpq", 1024)
+    assert [b["pq_dim"] for b in lad] == [256, 512, 1024]
+    assert all(b["pq_bits"] == 8 for b in lad)
+    assert build_knob_sweep("forced-ivfpq", 8)[0]["pq_dim"] == 2  # tiny dim ok
     print("SELFCHECK OK")
 
 
