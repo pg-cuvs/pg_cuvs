@@ -106,7 +106,7 @@ stage=D module=concurrency ref=main build=false \
 |--------|--------|---------------------------|----------------------|
 | **D8 storage** | ✅ near-done | `docs/profiling-results.md §4`: TOAST vs PLAIN measured (PLAIN build +8%, search storage-independent); `runner.py setup_table` honors `PGCUVS_STORAGE=plain` | `bench.yml` `storage` input (~2 lines) + republish; *optional* one PLAIN run at dim≤768 |
 | **D4 concurrency** | 🟡 ~80% | `runner_concurrency.py` + `docs/data/concurrency_consolidated.csv` (150 rows: cagra/hnsw/bf/bf-batch/seqscan, N 1k–1M); `observe.sla_bounded_qps` column exists | add `forced-flat`/`forced-transient-bf` configs (~5 lines) + emit `sla_bounded_qps` as headline + rerun |
-| **D1 Pareto $** | 🟡 partial | cost/energy fields populated (`observe.price_usd_hr`, `usd_per_1m_queries`, `energy_j`); `aggregate.py` already plots Pareto; Stage A data | small aggregator over the protocol CSV (reuse `aggregate.py` logic) + **one** `baseline=iso-$` CPU dispatch |
+| **D1 Pareto $** | 🟡 partial | cost/energy fields populated (`observe.price_usd_hr`, `usd_per_1m_queries`, `energy_j`); `aggregate.py` already plots Pareto; Stage A data | small aggregator over the protocol CSV (reuse `aggregate.py` logic) + **one** `baseline=iso-$` CPU dispatch + **VRAM-budget cell** (ivfpq vs cagra at fixed VRAM — the protocol's 1급 D1/D6 axis, §70/§84; ivfpq is the only engine that bends the resource-Pareto) |
 | **D2 filter** | 🟡 partial | `tools/bench_filter_sweep.py` + `docs/filter-threshold-experiment.md`: pg_cuvs D-wedge sel×corr measured → `auto_threshold=0.05` | add **pgvector `iterative_scan` competitor + explicit p99 tail**; the pg_cuvs side is done |
 | **Ring A competitors** | 🟡 partial | `infra/anbench/run_pg.py` (pgvector hnsw/ivfflat/exact) | add `run_pgvectorscale.py`/`run_vectorchord.py` on the `run_pg.py` skeleton; pgvector `iterative_scan` mode |
 | **Ring B anchors** | ✅ exists | `run_cuvs.py` (raw CAGRA), `run_faiss.py` (gpu/cpu), `run_cagra_hnsw.py`, `aggregate.py`, `run_all.sh` | none new — just run + consolidate into `docs/data/` |
@@ -114,6 +114,16 @@ stage=D module=concurrency ref=main build=false \
 | **D6 ceiling — CAGRA 50M** | 🔴 cite-only | **50M×384 already measured (ADR-025, 2026-05-30): CAGRA shard=2 & shard=4 both OOM on A100-40GB×2** (73.24 GiB raw f32 > 80 GB VRAM); competitor numbers (HNSW p50=13ms/QPS=546, vchordrq recall=0.9991) recorded there | **50M CAGRA = cite ADR-025, do NOT re-run** (same OOM, A100-80GB×2 needed) |
 | **D6 ceiling — IVF-PQ 50M** | 🟡 **runnable, UNMEASURED** | **`ivfpq` AM implemented (ADR-049, 20/20 PASS 2026-06-08) — but landed AFTER the 50M run, so ADR-025 never tested it.** Compressed codes ≈ pq_dim·pq_bits/8 per vec: 50M×(192 B) ≈ **9.6 GB → fits a single A100-40GB** | **the real large-scale arm.** Add `forced-ivfpq` to `runner.py` (gap — see below), then 50M head-to-head: IVF-PQ recall@n_probes vs vchordrq 0.9991 vs HNSW. Compression ANN race, not exact |
 | **D6 multi-GPU** | 🔴 out / escalate | terraform `gpu_count>1` path ready | **multi-GPU sharding NOT implemented in the product** (no daemon shard routing) → engineering, not a benchmark; 10M CAGRA = high $ |
+| **IVF-PQ engine (axis-wide)** | 🔴 dropped | `ivfpq` AM done (ADR-049); **protocol v3 lists it first-class** in the config axis (`BENCHMARK_PROTOCOL.md` §155) + self-tuning knobs `n_lists/pq_bits/n_probes` (§163) + a VRAM-budget cell as a 1급 D1/D6 axis (§84) | **the harness has no ivfpq path** (`runner.py` = hnsw/cuvs/flat only) and this handoff dropped it everywhere except the 50M cell. `forced-ivfpq` (Tier 0) unblocks **all** ivfpq cells, not just 50M |
+
+> **⚠ Engine-axis gap (added 2026-06-16)**: IVF-PQ was under-counted in the first
+> re-audit — fixed only at 50M, then realised it's missing axis-wide. The protocol
+> SPEC already treats ivfpq as a first-class engine, but neither the **harness**
+> (`runner.py`) nor this handoff carried it. The headline ivfpq deliverable is **not**
+> 50M — it's the **VRAM-budget cell in D1/D6**: at a fixed VRAM, ivfpq trades recall
+> for 10–100× capacity, so it is the only engine that changes the *shape* of the
+> resource/$ Pareto. Everything ivfpq is blocked on one Tier-0 item: `forced-ivfpq`
+> in `runner.py` (build reloptions `n_lists/pq_bits/pq_dim` + `cuvs.ivfpq_n_probes` sweep).
 
 > **Schema note**: `observe.PROTOCOL_FIELDS` already has first-class `selectivity`,
 > `correlation`, `filter_mode`, `stream_op`, `ops_done`, `delta_rows`,
