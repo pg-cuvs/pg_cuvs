@@ -90,19 +90,43 @@ def main():
         ok, plan = runner.explain_uses_index(conn, table, corpus[0], "flat")
         if not ok:
             sys.exit(f"[incremental] FAIL: flat not used. plan:\n{plan}")
-    runner.log(f"base {n_base} rows loaded ({a.config}); appending {n_app} rows")
+    scenario = os.environ.get("PGCUVS_INC_SCENARIO", "append")
+    runner.log(f"base {n_base} rows loaded ({a.config}); scenario={scenario} ops={n_app}")
 
-    # ── append phase: one INSERT per row, timed ──────────────────────────────
-    lat = []
+    # ── streaming phase: one op per step, timed ──────────────────────────────
+    # append : INSERT new row
+    # fifo   : INSERT new (head) + DELETE oldest (tail)  → window stays n_base
+    # upsert : alternate INSERT new / UPDATE a random existing row
+    import random as _rnd
+    _rnd.seed(0)
+    lat, ops = [], 0
     with observe.ResourceSampler(gpu_index=a.gpu_index, daemon_pid=a.daemon_pid) as s:
         t0 = time.perf_counter()
-        for i in range(n_base, n_base + n_app):
-            v = Vector(corpus[i])
+        for j in range(n_app):
+            newid = n_base + j
+            v = Vector(corpus[newid % n])
             t = time.perf_counter()
-            cur.execute(f"INSERT INTO {table} (id, embedding) VALUES (%s, %s)", (i, v))
+            if scenario == "append":
+                cur.execute(f"INSERT INTO {table} (id, embedding) VALUES (%s, %s)",
+                            (newid, v))
+            elif scenario == "fifo":
+                cur.execute(f"INSERT INTO {table} (id, embedding) VALUES (%s, %s)",
+                            (newid, v))
+                cur.execute(f"DELETE FROM {table} WHERE id = %s", (j,))   # tail
+            elif scenario == "upsert":
+                if j % 2 == 0:
+                    cur.execute(f"INSERT INTO {table} (id, embedding) VALUES (%s, %s)",
+                                (newid, v))
+                else:
+                    cur.execute(f"UPDATE {table} SET embedding = %s WHERE id = %s",
+                                (v, _rnd.randrange(n_base)))
+            else:
+                sys.exit(f"[incremental] unknown scenario {scenario}")
             lat.append((time.perf_counter() - t) * 1e6)     # µs
+            ops += 1
         total = time.perf_counter() - t0
-    rows_per_s = n_app / total if total > 0 else float("nan")
+    n_app = ops                                              # ops actually done
+    rows_per_s = ops / total if total > 0 else float("nan")
     a_us = np.asarray(lat)
     p50, p95, p99, p999 = (float(np.percentile(a_us, p)) for p in (50, 95, 99, 99.9))
     disp = {"reps": 1, "per_row_us": [round(float(a_us.min()), 1),
@@ -117,14 +141,15 @@ def main():
         query_set_id=os.path.basename(a.queries), clients=1, warm_state="warm",
         qps=round(rows_per_s, 1), p50_us=round(p50, 1), p95_us=round(p95, 1),
         p99_us=round(p99, 1), p999_us=round(p999, 1),
-        reps=1, agg_method="per-row-insert", dispersion=disp, gt_method="n/a",
-        stream_op="append", ops_done=n_app, delta_rows=n_app,
+        reps=1, agg_method="per-op", dispersion=disp, gt_method="n/a",
+        stream_op=scenario, ops_done=ops, delta_rows=ops,
         instance_type=a.instance_type, price_usd_hr=a.price_usd_hr,
         cost_model_version=a.cost_model_version,
         runtime_routing_version=a.runtime_routing_version,
-        params_json={"n_base": n_base, "regime": "W2-read-heavy" if is_flat
-                     else "W1-write-heavy", "rows_per_s": round(rows_per_s, 1)},
-        notes=f"append {n_app} rows: {rows_per_s:.0f} rows/s, p99={p99/1000:.2f}ms/row",
+        params_json={"n_base": n_base, "scenario": scenario,
+                     "regime": "W2-read-heavy" if is_flat else "W1-write-heavy",
+                     "ops_per_s": round(rows_per_s, 1)},
+        notes=f"{scenario} {ops} ops: {rows_per_s:.0f} ops/s, p99={p99/1000:.2f}ms/op",
         **s.as_dict())
     cur.execute(f"DROP TABLE {table} CASCADE")
     conn.close()
