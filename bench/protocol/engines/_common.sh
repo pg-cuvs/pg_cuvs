@@ -31,6 +31,7 @@ run_engine(){
   case "${PGCUVS_MODULE:-physics}" in
     concurrency) pyrunner="runner_concurrency.py" ;;
     explain)     pyrunner="runner_explain.py" ;;
+    incremental) pyrunner="runner_incremental.py" ;;
   esac
   exec python3 "$PROTO/$pyrunner" \
     --config "$config" --cell "$cell_id" \

@@ -1,0 +1,137 @@
+#!/usr/bin/env python3
+"""runner_incremental.py — D3 incremental ingest (PGCUVS_MODULE=incremental).
+
+Scope v1: the headline ADR-074 write claim, measured — append ingest throughput
++ per-row INSERT latency for the two write regimes:
+  - forced-flat     (W2, read-heavy): each INSERT triggers the GPU index path
+                    (cuvsCagraExtend), ADR-074 ~1.77ms/row, HOT-disabled.
+  - forced-noindex  (W1, write-heavy = pgvector no-index): plain heap insert.
+Frame: write-heavy → no-index, read-heavy → flat. The crossover is the result.
+
+Emits one `phase=maint` row per config: qps = rows/s, p50/p95/p99 = per-row
+INSERT latency (µs), dispersion = per-rep spread, params_json.ops_done = rows
+appended. VRAM growth from the ResourceSampler. FIFO/upsert/recall-drift/
+concurrent-query-during-ingest are follow-ups (noted in HANDOFF).
+"""
+import argparse
+import os
+import sys
+import time
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+ANBENCH = os.path.abspath(os.path.join(HERE, "..", "..", "infra", "anbench"))
+sys.path.insert(0, ANBENCH)
+import observe  # noqa: E402
+import runner   # noqa: E402
+
+TABLES = {"forced-flat": "t_inc_flat", "forced-noindex": "t_inc_noidx"}
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--config", required=True)
+    ap.add_argument("--cell", required=True)
+    ap.add_argument("--csv", required=True)
+    ap.add_argument("--run-id", required=True)
+    ap.add_argument("--stage", required=True)
+    ap.add_argument("--dataset", default="cohere-1m")
+    ap.add_argument("--corpus", required=True)
+    ap.add_argument("--queries", required=True)
+    ap.add_argument("--gt-dir", required=True)
+    ap.add_argument("--index-dir", default="/tmp/cuvs_indexes")
+    ap.add_argument("--baseline", default="same-box")
+    ap.add_argument("--reps", type=int, default=1)
+    ap.add_argument("--daemon-pid", type=int, default=None)
+    ap.add_argument("--instance-type", default=None)
+    ap.add_argument("--price-usd-hr", default=None)
+    ap.add_argument("--cost-model-version", default="unset")
+    ap.add_argument("--runtime-routing-version", default="unset")
+    ap.add_argument("--dbname", default="bench")
+    ap.add_argument("--gpu-index", type=int, default=0)
+    a = ap.parse_args()
+
+    import numpy as np
+    from anbench_common import read_fbin
+    cell = runner.parse_cell(a.cell)
+    n, dim, k, target = cell["N"], cell["dim"], cell["k"], cell["recall_target"]
+    table = TABLES.get(a.config)
+    if table is None:
+        raise NotImplementedError(f"incremental config {a.config} not supported")
+    is_flat = a.config == "forced-flat"
+
+    # base = first n_base rows; append the next n_app rows one at a time.
+    n_app = min(int(os.environ.get("PGCUVS_INC_APPEND", "2000")), n // 2)
+    n_base = n - n_app
+    corpus = np.ascontiguousarray(read_fbin(a.corpus, count=n))
+
+    import psycopg
+    from pgvector.psycopg import register_vector
+    from pgvector import Vector
+    conn = psycopg.connect(dbname=a.dbname, autocommit=True)
+    conn.execute("CREATE EXTENSION IF NOT EXISTS vector")
+    register_vector(conn)
+    if is_flat:
+        conn.execute("CREATE EXTENSION IF NOT EXISTS pg_cuvs")
+        conn.execute("ALTER EXTENSION pg_cuvs UPDATE")
+        conn.execute(f"SET cuvs.index_dir = '{a.index_dir}'")
+
+    cur = conn.cursor()
+    cur.execute(f"DROP TABLE IF EXISTS {table} CASCADE")
+    cur.execute(f"CREATE TABLE {table} (id bigint, embedding vector({dim}))")
+    # load base via COPY
+    with conn.cursor().copy(
+            f"COPY {table} (id, embedding) FROM STDIN WITH (FORMAT BINARY)") as cp:
+        cp.set_types(["int8", "vector"])
+        for i in range(n_base):
+            cp.write_row((i, Vector(corpus[i])))
+    if is_flat:                                   # W2: resident exact GPU index
+        cur.execute(f"CREATE INDEX {table}_flat ON {table} USING flat "
+                    f"(embedding vector_l2_ops)")
+        ok, plan = runner.explain_uses_index(conn, table, corpus[0], "flat")
+        if not ok:
+            sys.exit(f"[incremental] FAIL: flat not used. plan:\n{plan}")
+    runner.log(f"base {n_base} rows loaded ({a.config}); appending {n_app} rows")
+
+    # ── append phase: one INSERT per row, timed ──────────────────────────────
+    lat = []
+    with observe.ResourceSampler(gpu_index=a.gpu_index, daemon_pid=a.daemon_pid) as s:
+        t0 = time.perf_counter()
+        for i in range(n_base, n_base + n_app):
+            v = Vector(corpus[i])
+            t = time.perf_counter()
+            cur.execute(f"INSERT INTO {table} (id, embedding) VALUES (%s, %s)", (i, v))
+            lat.append((time.perf_counter() - t) * 1e6)     # µs
+        total = time.perf_counter() - t0
+    rows_per_s = n_app / total if total > 0 else float("nan")
+    a_us = np.asarray(lat)
+    p50, p95, p99, p999 = (float(np.percentile(a_us, p)) for p in (50, 95, 99, 99.9))
+    disp = {"reps": 1, "per_row_us": [round(float(a_us.min()), 1),
+                                      round(float(a_us.max()), 1)],
+            "total_s": round(total, 2)}
+
+    observe.write_protocol_row(
+        a.csv, run_id=a.run_id, date=time.strftime("%Y-%m-%d"), stage=a.stage,
+        phase="maint", cell_id=a.cell, config=a.config, system=a.config,
+        index_type=("flat" if is_flat else "none"), N=n, dim=dim, k=k,
+        recall_target=target, dataset=a.dataset,
+        query_set_id=os.path.basename(a.queries), clients=1, warm_state="warm",
+        qps=round(rows_per_s, 1), p50_us=round(p50, 1), p95_us=round(p95, 1),
+        p99_us=round(p99, 1), p999_us=round(p999, 1),
+        reps=1, agg_method="per-row-insert", dispersion=disp, gt_method="n/a",
+        stream_op="append", ops_done=n_app, delta_rows=n_app,
+        instance_type=a.instance_type, price_usd_hr=a.price_usd_hr,
+        cost_model_version=a.cost_model_version,
+        runtime_routing_version=a.runtime_routing_version,
+        params_json={"n_base": n_base, "regime": "W2-read-heavy" if is_flat
+                     else "W1-write-heavy", "rows_per_s": round(rows_per_s, 1)},
+        notes=f"append {n_app} rows: {rows_per_s:.0f} rows/s, p99={p99/1000:.2f}ms/row",
+        **s.as_dict())
+    cur.execute(f"DROP TABLE {table} CASCADE")
+    conn.close()
+    runner.log(f"incremental {a.config} N={n}: {rows_per_s:.0f} rows/s "
+               f"p50={p50:.0f}us p99={p99:.0f}us")
+    return 0
+
+
+if __name__ == "__main__":
+    main()
