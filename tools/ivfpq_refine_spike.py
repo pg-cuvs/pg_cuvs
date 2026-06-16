@@ -90,8 +90,9 @@ def main():
         t = time.perf_counter()
         _, I = ivf_pq.search(sp, idx, d_queries, k2)
         if ratio > 1:
-            # cuVS refine: recompute exact distances on the candidates, re-rank
-            _, I = refine.refine(d_corpus, d_queries, I, a.k, metric="sqeuclidean")
+            # cuVS refine: recompute exact distances on the candidates, re-rank.
+            # `refine` is imported as the callable itself (cython function).
+            _, I = refine(d_corpus, d_queries, I, k=a.k, metric="sqeuclidean")
         cp.cuda.runtime.deviceSynchronize()
         ms = (time.perf_counter() - t) / nq * 1000.0
         neigh = cp.asnumpy(I)[:, :a.k]
