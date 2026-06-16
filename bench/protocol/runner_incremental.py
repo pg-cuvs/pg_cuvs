@@ -77,7 +77,10 @@ def main():
 
     cur = conn.cursor()
     cur.execute(f"DROP TABLE IF EXISTS {table} CASCADE")
-    cur.execute(f"CREATE TABLE {table} (id bigint, embedding vector({dim}))")
+    # PK on id so fifo/upsert DELETE/UPDATE WHERE id=... use the btree, not a
+    # seqscan (a scalar PK is normal for any table; it is NOT a vector index, so
+    # the W1 'no vector index' regime still holds).
+    cur.execute(f"CREATE TABLE {table} (id bigint PRIMARY KEY, embedding vector({dim}))")
     # load base via COPY
     with conn.cursor().copy(
             f"COPY {table} (id, embedding) FROM STDIN WITH (FORMAT BINARY)") as cp:
