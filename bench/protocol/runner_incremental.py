@@ -112,10 +112,7 @@ def main():
                 cur.fetchall(); c += 1
             return c / seconds
 
-        base_qps = measure_qps(dur)                       # no ingest
-        stop = threading.Event()
-
-        def ingest():
+        def ingest(stop):
             try:
                 ic = psycopg.connect(dbname=a.dbname, autocommit=True)
                 from pgvector.psycopg import register_vector as _rv
@@ -133,29 +130,37 @@ def main():
             except Exception as e:
                 runner.log(f"ingest thread error: {e!r}")
 
-        th = threading.Thread(target=ingest, daemon=True); th.start()
-        with observe.ResourceSampler(gpu_index=a.gpu_index, daemon_pid=a.daemon_pid) as s:
-            conc_qps = measure_qps(dur)                    # queries under ingest
-        stop.set(); th.join(timeout=10)                   # never block on the thread
-        degr = 100.0 * (1 - conc_qps / base_qps) if base_qps else float("nan")
-        runner.log(f"concurrent {a.config}: base={base_qps:.0f} qps, "
-                   f"under-ingest={conc_qps:.0f} qps, degradation={degr:.0f}%")
-        observe.write_protocol_row(
-            a.csv, run_id=a.run_id, date=time.strftime("%Y-%m-%d"), stage=a.stage,
-            phase="query", cell_id=a.cell, config=a.config, system=a.config,
-            index_type=("flat" if is_flat else "none"), N=n, dim=dim, k=k,
-            recall_target=target, dataset=a.dataset,
-            query_set_id=os.path.basename(a.queries), clients=1, warm_state="warm",
-            qps=round(conc_qps, 1), reps=1, agg_method="qps-under-ingest",
-            gt_method="n/a", stream_op="concurrent",
-            instance_type=a.instance_type, price_usd_hr=a.price_usd_hr,
-            cost_model_version=a.cost_model_version,
-            runtime_routing_version=a.runtime_routing_version,
-            params_json={"baseline_qps": round(base_qps, 1),
-                         "under_ingest_qps": round(conc_qps, 1),
-                         "degradation_pct": round(degr, 1)},
-            notes=f"query QPS {base_qps:.0f}→{conc_qps:.0f} under ingest "
-                  f"({degr:.0f}% degradation)", **s.as_dict())
+        try:                                              # best-effort: never fail run
+            base_qps = measure_qps(dur)                   # no ingest
+            stop = threading.Event()
+            th = threading.Thread(target=ingest, args=(stop,), daemon=True)
+            th.start()
+            with observe.ResourceSampler(gpu_index=a.gpu_index,
+                                         daemon_pid=a.daemon_pid) as s:
+                conc_qps = measure_qps(dur)               # queries under ingest
+            stop.set(); th.join(timeout=10)               # never block on the thread
+            degr = 100.0 * (1 - conc_qps / base_qps) if base_qps else float("nan")
+            runner.log(f"concurrent {a.config}: base={base_qps:.0f} qps, "
+                       f"under-ingest={conc_qps:.0f} qps, degradation={degr:.0f}%")
+            observe.write_protocol_row(
+                a.csv, run_id=a.run_id, date=time.strftime("%Y-%m-%d"),
+                stage=a.stage, phase="query", cell_id=a.cell, config=a.config,
+                system=a.config, index_type=("flat" if is_flat else "none"),
+                N=n, dim=dim, k=k, recall_target=target, dataset=a.dataset,
+                query_set_id=os.path.basename(a.queries), clients=1,
+                warm_state="warm", qps=round(conc_qps, 1), reps=1,
+                agg_method="qps-under-ingest", gt_method="n/a",
+                stream_op="concurrent", instance_type=a.instance_type,
+                price_usd_hr=a.price_usd_hr,
+                cost_model_version=a.cost_model_version,
+                runtime_routing_version=a.runtime_routing_version,
+                params_json={"baseline_qps": round(base_qps, 1),
+                             "under_ingest_qps": round(conc_qps, 1),
+                             "degradation_pct": round(degr, 1)},
+                notes=f"query QPS {base_qps:.0f}→{conc_qps:.0f} under ingest "
+                      f"({degr:.0f}% degradation)", **s.as_dict())
+        except Exception as e:
+            runner.log(f"concurrent {a.config} FAILED: {e!r}")
         try:
             cur.execute(f"DROP TABLE {table} CASCADE")     # next run drops anyway
         except Exception as e:
