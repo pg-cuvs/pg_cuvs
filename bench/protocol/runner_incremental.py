@@ -97,6 +97,66 @@ def main():
     scenario = os.environ.get("PGCUVS_INC_SCENARIO", "append")
     runner.log(f"base {n_base} rows loaded ({a.config}); scenario={scenario} ops={n_app}")
 
+    # ── concurrent: query QPS baseline vs under a background ingest thread ────
+    if scenario == "concurrent":
+        import threading
+        nq = len(queries)
+        dur = int(os.environ.get("PGCUVS_INC_CONC_SECONDS", "8"))
+
+        def measure_qps(seconds):
+            t_end = time.perf_counter() + seconds
+            c = 0
+            while time.perf_counter() < t_end:
+                cur.execute(f"SELECT id FROM {table} ORDER BY embedding <-> %s "
+                            f"LIMIT {k}", (Vector(queries[c % nq]),))
+                cur.fetchall(); c += 1
+            return c / seconds
+
+        base_qps = measure_qps(dur)                       # no ingest
+        stop = threading.Event()
+
+        def ingest():
+            ic = psycopg.connect(dbname=a.dbname, autocommit=True)
+            from pgvector.psycopg import register_vector as _rv
+            _rv(ic)
+            if is_flat:
+                ic.execute("CREATE EXTENSION IF NOT EXISTS pg_cuvs")
+                ic.execute(f"SET cuvs.index_dir = '{a.index_dir}'")
+            icur = ic.cursor(); jj = 0
+            while not stop.is_set():
+                icur.execute(f"INSERT INTO {table} (id, embedding) VALUES (%s, %s)",
+                             (n_base + jj, Vector(corpus[(n_base + jj) % n])))
+                jj += 1
+            ic.close()
+            return jj
+
+        th = threading.Thread(target=ingest); th.start()
+        with observe.ResourceSampler(gpu_index=a.gpu_index, daemon_pid=a.daemon_pid) as s:
+            conc_qps = measure_qps(dur)                    # queries under ingest
+        stop.set(); th.join()
+        degr = 100.0 * (1 - conc_qps / base_qps) if base_qps else float("nan")
+        runner.log(f"concurrent {a.config}: base={base_qps:.0f} qps, "
+                   f"under-ingest={conc_qps:.0f} qps, degradation={degr:.0f}%")
+        observe.write_protocol_row(
+            a.csv, run_id=a.run_id, date=time.strftime("%Y-%m-%d"), stage=a.stage,
+            phase="query", cell_id=a.cell, config=a.config, system=a.config,
+            index_type=("flat" if is_flat else "none"), N=n, dim=dim, k=k,
+            recall_target=target, dataset=a.dataset,
+            query_set_id=os.path.basename(a.queries), clients=1, warm_state="warm",
+            qps=round(conc_qps, 1), reps=1, agg_method="qps-under-ingest",
+            gt_method="n/a", stream_op="concurrent",
+            instance_type=a.instance_type, price_usd_hr=a.price_usd_hr,
+            cost_model_version=a.cost_model_version,
+            runtime_routing_version=a.runtime_routing_version,
+            params_json={"baseline_qps": round(base_qps, 1),
+                         "under_ingest_qps": round(conc_qps, 1),
+                         "degradation_pct": round(degr, 1)},
+            notes=f"query QPS {base_qps:.0f}→{conc_qps:.0f} under ingest "
+                  f"({degr:.0f}% degradation)", **s.as_dict())
+        cur.execute(f"DROP TABLE {table} CASCADE")
+        conn.close()
+        return 0
+
     # ── streaming phase: one op per step, timed ──────────────────────────────
     # append : INSERT new row
     # fifo   : INSERT new (head) + DELETE oldest (tail)  → window stays n_base
