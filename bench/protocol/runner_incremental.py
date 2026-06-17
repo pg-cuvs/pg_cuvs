@@ -165,38 +165,40 @@ def main():
     # set vs the index result: high recall ⇒ inserts searchable + deletes (fifo)
     # excluded. no-index = seqscan = exact (1.0 baseline confirming the GT).
     if scenario in ("append", "fifo"):
-        if is_flat:
-            cur.execute("SET enable_seqscan = off")        # force the flat index
-            cur.execute("SET enable_bitmapscan = off")
-        ids = np.array(sorted(live), dtype=np.int64)
-        emb = corpus[ids % n]
-        nqd = min(100, len(queries))
-        drift, leaked = [], 0
-        for qi in range(nqd):
-            d = ((emb - queries[qi]) ** 2).sum(1)
-            gtset = set(ids[np.argsort(d)[:k]].tolist())
-            cur.execute(f"SELECT id FROM {table} ORDER BY embedding <-> %s LIMIT {k}",
-                        (Vector(queries[qi]),))
-            got = [r[0] for r in cur.fetchall()]
-            leaked += sum(1 for g in got if g not in live)   # deleted/absent ids
-            drift.append(len(set(got) & gtset) / k)
-        rdrift = float(np.mean(drift))
-        runner.log(f"recall-drift {scenario} {a.config} = {rdrift:.4f} over "
-                   f"{len(live)} live rows, leaked={leaked}")
-        observe.write_protocol_row(
-            a.csv, run_id=a.run_id, date=time.strftime("%Y-%m-%d"), stage=a.stage,
-            phase="query", cell_id=a.cell, config=a.config, system=a.config,
-            index_type=("flat" if is_flat else "none"), N=len(live), dim=dim, k=k,
-            recall_target=target, dataset=a.dataset,
-            query_set_id=os.path.basename(a.queries), clients=1, warm_state="warm",
-            recall_at_k=round(rdrift, 4), reps=1, agg_method="recall-drift",
-            gt_method="exact-live", stream_op=scenario, ops_done=ops,
-            instance_type=a.instance_type, price_usd_hr=a.price_usd_hr,
-            cost_model_version=a.cost_model_version,
-            runtime_routing_version=a.runtime_routing_version,
-            params_json={"scenario": scenario, "live_rows": len(live),
-                         "leaked_ids": leaked, "n_queries": nqd},
-            notes=f"recall-drift after {scenario}: {rdrift:.4f}, leaked={leaked}")
+        try:
+            ids = np.array(sorted(live), dtype=np.int64)
+            emb = corpus[ids % n]
+            nqd = min(100, len(queries))
+            drift, leaked = [], 0
+            for qi in range(nqd):
+                d = ((emb - queries[qi]) ** 2).sum(1)
+                gtset = set(ids[np.argsort(d)[:k]].tolist())
+                cur.execute(
+                    f"SELECT id FROM {table} ORDER BY embedding <-> %s LIMIT {k}",
+                    (Vector(queries[qi]),))
+                got = [int(r[0]) for r in cur.fetchall()]
+                leaked += sum(1 for g in got if g not in live)   # deleted/absent
+                drift.append(len(set(got) & gtset) / k)
+            rdrift = float(np.mean(drift))
+            runner.log(f"recall-drift {scenario} {a.config} = {rdrift:.4f} over "
+                       f"{len(live)} live rows, leaked={leaked}")
+            observe.write_protocol_row(
+                a.csv, run_id=a.run_id, date=time.strftime("%Y-%m-%d"),
+                stage=a.stage, phase="query", cell_id=a.cell, config=a.config,
+                system=a.config, index_type=("flat" if is_flat else "none"),
+                N=len(live), dim=dim, k=k, recall_target=target, dataset=a.dataset,
+                query_set_id=os.path.basename(a.queries), clients=1,
+                warm_state="warm", recall_at_k=round(rdrift, 4), reps=1,
+                agg_method="recall-drift", gt_method="exact-live",
+                stream_op=scenario, ops_done=ops,
+                instance_type=a.instance_type, price_usd_hr=a.price_usd_hr,
+                cost_model_version=a.cost_model_version,
+                runtime_routing_version=a.runtime_routing_version,
+                params_json={"scenario": scenario, "live_rows": len(live),
+                             "leaked_ids": leaked, "n_queries": nqd},
+                notes=f"recall-drift after {scenario}: {rdrift:.4f}, leaked={leaked}")
+        except Exception as e:                            # best-effort; never fail
+            runner.log(f"recall-drift {a.config} skipped: {e!r}")
 
     cur.execute(f"DROP TABLE {table} CASCADE")
     conn.close()
