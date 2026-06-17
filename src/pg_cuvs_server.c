@@ -6659,7 +6659,11 @@ handle_extend(int client_fd, const CuvsCmdFrame *cmd)
         munmap(mem, total);
         CuvsReplyHeader hdr = {0};
         hdr.status = CUVS_STATUS_NOT_FOUND;
-        snprintf(hdr.error, sizeof(hdr.error), "CAGRA index %u/%u not loaded",
+        /* EXTEND is cagra-only (needs the graph handle). flat/ivfpq have
+         * handle==NULL; the backend skips extend for them (pg_cuvs.c aminsert),
+         * so reaching here means a not-loaded or non-extendable index. */
+        snprintf(hdr.error, sizeof(hdr.error),
+                 "index %u/%u not loaded or not extendable (extend is cagra-only)",
                  cmd->db_oid, cmd->index_oid);
         send_all(client_fd, &hdr, sizeof(hdr));
         return;

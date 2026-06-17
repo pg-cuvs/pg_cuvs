@@ -3988,6 +3988,7 @@ cuvs_aminsert(Relation indexRel, Datum *values, bool *isnull,
     PgVector *vec;
     uint64_t  tid;
     uint32_t  metric;
+    Oid       cagra_am;
 
     (void) heapRel; (void) checkUnique; (void) indexUnchanged; (void) indexInfo;
 
@@ -4018,8 +4019,14 @@ cuvs_aminsert(Relation indexRel, Datum *values, bool *isnull,
                              ItemPointerGetOffsetNumber(heap_tid));
     metric = cuvs_index_metric(indexRel);
 
-    /* 3Q: EXTEND path — update VRAM CAGRA graph in-place via IPC. */
-    if (cuvs_socket_path && cuvs_socket_path[0] != '\0')
+    /* 3Q: EXTEND path — update the VRAM CAGRA graph in-place via IPC. Only the
+     * cagra AM supports extend; flat/ivfpq have no GPU streaming write (the
+     * daemon's handle_extend rejects a NULL handle), so they skip the wasted
+     * round-trip + misleading "CAGRA index not loaded" rejection and append
+     * straight to the delta below. */
+    cagra_am = get_am_oid("cagra", true);
+    if (cuvs_socket_path && cuvs_socket_path[0] != '\0'
+        && OidIsValid(cagra_am) && indexRel->rd_rel->relam == cagra_am)
     {
         int rc = cuvs_ipc_extend(cuvs_socket_path,
                                  (uint32_t) MyDatabaseId,
@@ -4029,7 +4036,7 @@ cuvs_aminsert(Relation indexRel, Datum *values, bool *isnull,
                                  cuvs_resolve_index_dir_rel(indexRel));
         if (rc == CUVS_STATUS_OK)
             return false;
-        /* NOT_FOUND / BUILD_FAILED / daemon down → fall through to delta. */
+        /* BUILD_FAILED / daemon down → fall through to delta. */
     }
 
     if (!cuvs_delta_append(indexRel, tid, vec->x, (int) vec->dim, metric))
