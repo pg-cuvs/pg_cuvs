@@ -6,7 +6,7 @@
 > [`design/BENCHMARK_PROTOCOL.md`](../../design/BENCHMARK_PROTOCOL.md) (v3, the design)
 > and [`docs/cost-model-calibration.md`](../../docs/cost-model-calibration.md) (frozen result).
 
-Last updated: 2026-06-15 (after #68 v3 protocol/calibration + #69 harness merged to main).
+Last updated: 2026-06-17 (Stage D measured incl. D3 concurrent; merged main #71 handoff — its earlier "Stage D NOT started" snapshot is superseded by §1/§5 here).
 
 ---
 
