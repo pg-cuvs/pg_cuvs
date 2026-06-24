@@ -2862,7 +2862,9 @@ load-dependent `bf_batch_wait` 라우팅과 `CUVS_STARTUP_COST` 재보정은 이
 
 **순위**: 방향 3(업스트림 기여) > 방향 1(advocate) > 방향 2(회피).
 
-관련: ADR-025(50M 벤치·포지셔닝), ADR-026(3B go/no-go·트리거), ADR-061(전략·표적 세그먼트), ADR-049(IVF-PQ), ADR-064(streaming BF), PHASE_3B_SPIKE.md / PHASE_3B_DECISION.md.
+**대안 cold-tier 경로 — RaBitQ + GDS (graph 아닌 IVF, 2026-06-16 추가)**: 위 셋은 전부 graph(Vamana/PQFlash) 계열이다. 별도로, **ADR-076 RaBitQ(`rabitq` AM)가 자라면** GPU cold tier의 다른 길이 열린다: RaBitQ 코드(136 B/vec, 압축)만 VRAM 상주 + 원본 rerank 벡터는 **NVMe→VRAM 직접 DMA(GPUDirect Storage/cuFile)**로 끌어와 ADR-064 streaming-BF sidecar-gather(현재 `pread`→host→H2D)를 직접-DMA로 진화. 측정 근거(bench run #35, `tools/ivfpq_refine_spike.py`): cuVS refine가 rerank로 recall을 0.91→0.97로 올리는 건 확인됐고, 유일한 미해결은 "원본을 VRAM에 안 두고 싸게 가져오기" = GDS. **전제(트리거)**: NVMe Local SSD + `nvidia-fs` + `cuFile` 검증 장비(현재 `pg-cuvs-dev`에 부재 → 개발/적용 불가). 주의: GDS per-query I/O는 GPU 저지연 강점과 상충하므로 throughput 워크로드에 한정. **RaBitQ는 이 cold tier 필요 시점을 먼저 밀어낸다**(VRAM 천장 7.5×↑ → 50M이 단일 A100에 상주, ADR-076) — GDS cold tier는 그 이후의 escalation.
+
+관련: ADR-025(50M 벤치·포지셔닝), ADR-026(3B go/no-go·트리거), ADR-061(전략·표적 세그먼트), ADR-049(IVF-PQ), ADR-064(streaming BF), ADR-076(RaBitQ·GDS cold-tier 경로), PHASE_3B_SPIKE.md / PHASE_3B_DECISION.md.
 
 **업계 선례 — EDB pgpu / VectorChord** (2026-06-14 비교): pgpu(EnterpriseDB, Rust/pgrx, AGPL-3.0, v2.0.0)는 cuVS **k-means centroid만** GPU로 계산해 vchord external-build에 넘기는 "GPU 빌드 가속기"다 — 검색은 vchord(CPU). 즉 우리 3I/방향 3과 같은 "GPU 빌드 → CPU 서빙" 철학의 상용 선례이나 **인덱스 계열이 IVF로 다르고 Vamana/PQFlash와 무관**하므로 DiskANN 구현 참조 가치는 없고(난관=cuVS #1501 PQFlash serializer), 전략 패턴 검증 의미만 있다. EDB의 다른 GPU 자료(spark-rapids-tutorial)는 OLAP를 외부 Spark+RAPIDS로 오프로드하는 튜토리얼로 벡터 검색과 무관. 요지: **EDB 노선 = GPU build/analytics 오프로드, in-Postgres GPU search 부재** → pg_cuvs의 GPU filtered exact hot tier 자리는 미개척으로 남아 있고, cold tier 소유(본 ADR)는 그와 별개의 통합·라이선스 판단이다.
 
@@ -3035,3 +3037,74 @@ cost = scan(N) + detoast(m, storage) + move(m, link) + compute(m, engine) + topk
 - **레거시 복귀(안전 증명, 3경로 동일)**: `cuvs.enable_phys_cost=off` / 사이드카 부재 / Tier-1(GPU 비트 미충족) → 모두 레거시 = N=10000에서 seqscan으로 복귀. installcheck 35/35 + isolation 6/6 GREEN, un-probed 바이트 동일.
 
 **남은 것**: transient B 물리 공식 활성화 + `auto`(Phase 3, GH200/MI300A급 통합메모리 필요); cpu_dist 클램프 밴드 재조정; bf_tput probe가 end-to-end(업로드 포함)라 transient용으론 후속 정밀화 필요.
+
+---
+
+## ADR-076 — Native RaBitQ 양자화기(`rabitq` AM): 저VRAM + 고recall 동시 달성
+
+**날짜**: 2026-06-16
+**상태**: PROPOSED — numpy 스파이크 GREEN(cohere 실측). **CUDA 구현은 별도 go 필요**(수 주 규모, 첫 자작 ANN 수치).
+
+**문제/배경**:
+- ivfpq(ADR-049)는 압축으로 VRAM을 줄이지만 **recall이 PQ 양자화 오차에 천장**이 있다. cohere-1024 100k 실측(벤치 run #30/#31): 기본 pq_dim=dim/2는 recall@10=0.937(<0.95), iso-recall 0.95에 도달하려면 **pq_dim=1024(=1024 B/vec)까지 재빌드**해야 했다. 즉 "압축으로 VRAM 절감"이라는 본래 이점을 recall을 위해 상당 부분 반납한다.
+- vchordrq는 50M×384에서 recall **0.9991**(ADR-025)을 낸다. 그 핵심은 **RaBitQ**(Gao & Long, SIGMOD'24): 1비트 압축 + **무편향 추정 + 이론적 오차 상한**으로, 압축 표현만으로 "버려도 되는 후보"를 판별하고 소수만 정밀 보정(rerank)한다 → 원본 f32 상주 없이 저VRAM·고recall 동시 달성.
+- pg_cuvs 포지셔닝(GPU hot tier, **VRAM working-set 천장 밀기** — ADR-049/3P)에 정확히 부합. cuVS는 RaBitQ를 제공하지 않는다(26.04 기준).
+
+**결정**: RaBitQ 양자화기를 **자작**해 새 PG access method `rabitq`로 등록한다(`CREATE INDEX USING rabitq`). IVF coarse(ivfpq에서 재사용) + RaBitQ 코드 + 쿼리타임 rerank. cagra/ivfpq와 독립 경로, 동일 UDS+shm IPC·index_dir 영속화·사이드카 직렬화 인프라 재사용.
+
+**증거(numpy 스파이크 `tools/rabitq_spike.py`, 합성 + cohere VM 실측 run #32→#33)**:
+- **수학 정확**(데이터 무관): 추정 무편향(표준화 std=**1.000** — 이론 분산식이 경험분포와 일치), 오차 상한 coverage **0.9901**.
+- **양자화기 품질**(probe-all, cohere): recall@10 = **0.9995 @ 0.1% rerank** → 랭킹이 거의 완벽.
+- **현실 IVF 설정**: n_probes=64(316 lists의 20%)에서 recall@10 = **0.9675 ≥ 0.95**, 그것도 0.5% rerank에서 천장 도달. 각 n_probes의 천장은 IVF miss(양자화기 무관)이며 n_probes를 키우면 상승 — 136 B 코드라 probe 증설이 싸다.
+- **저장**: **136 B/vec**(D비트 코드 + 스칼라 2개) = raw f32의 **30×**, **같은 recall에 ivfpq가 필요로 한 1024 B의 ~7.5× 작다**.
+
+**구현 방향**:
+- 인코더(GPU): IVF centroid residual → 랜덤 직교 회전(고차원은 Hadamard/FJLT로 O(D²) 회피) → 1비트 부호 코드 + 스칼라(`‖r‖`, `dot_xo=⟨x̄,ō⟩`) 저장.
+- 추정기/bound 커널(GPU): bit dot-product(popcount) 기반 무편향 `⟨q̄,ō⟩` 추정 + 분산식 기반 오차 상한 → 거리 하한으로 rerank 후보 가지치기.
+- rerank: 후보를 원본/고비트 residual로 정밀 거리 재계산 후 top-k. GUC `cuvs.rabitq_n_probes`, `cuvs.rabitq_rerank`(budget).
+- AM: `pg_cuvs_rabitq_handler`, `CUVS_OP_BUILD_RABITQ`/`CUVS_OP_SEARCH_RABITQ`. reloption(`n_lists`, 회전 seed 등).
+- 검증 하네스(비협상): 무편향·bound coverage·recall@(n_probes×budget) 그리드를 GT 대조로 게이트(스파이크 기준 재사용).
+
+**대안 기각**:
+- **(B) cuVS `refine()`로 ivfpq에 rerank 부착** — recall은 복구하나 refine이 원본 f32를 요구 → VRAM 상주(압축 이점 상쇄) 또는 host→device per-query 전송(detoast/PCIe 지연, ADR-074의 535ms 벽 재등장). RaBitQ가 푸는 트레이드오프를 그대로 떠안음. **측정으로 확정·기각**(cuVS 26.04 python 스파이크 `tools/ivfpq_refine_spike.py`, cohere 100k, bench run #35): refine는 **잘 동작** — recall@10 0.9095→**0.9685**(ratio≥2, sub-ms). 단 dataset device-상주(variant A)라 VRAM = f32 전량(~419MB/100k) → 같은 VRAM의 **flat이 exact(recall 1.0)라 variant A를 완전 지배**. 같은 0.968 recall을 RaBitQ는 **136 B/vec(30× 작음)**으로 냄. → variant A는 제품 가치 없음(dominated), 자작 통합 안 함. **가치 있는 B = host/GDS dataset refine**(PQ 코드만 VRAM + 원본은 NVMe→VRAM 직접 DMA)이나 **GDS 장비(NVMe+nvidia-fs+cuFile) 부재로 개발 불가** → ADR-072 cold-tier 트랙으로 이관. 경로는 기록: `refine_ratio`를 `ivfpq_n_probes`와 같은 GUC→IPC→wrapper 체인에 추가.
+- **ivfpq pq_dim 상향만** — run #31처럼 0.95 도달하나 1024 B/vec(7.5× 더 큼) + 재빌드 비용. 압축 축에서 RaBitQ에 열위.
+- **cuVS 업스트림 대기** — bit/scalar quantization이 로드맵에 있으나 시점·형태 불확실. DiskANN(ADR-026/072)과 달리 본 건의 블로커는 **우리가 통제하는 유한한 수치 작업**이지 불안정한 외부 API가 아니라, 자작이 tractable(아래 리스크 참조).
+
+**트레이드오프/리스크**:
+- **첫 자작 ANN 수치**: 지금까지는 cuVS 프리미티브 래핑 + PG 배관이었고, 본 건은 처음으로 알고리즘을 직접 저술. 무편향·bound 상수가 틀리면 **recall이 조용히 손상**(issue #56류 최악 모드) → 검증 하네스가 게이트.
+- **업스트림 중복 가능성**: cuVS가 RaBitQ류를 추가하면 자작이 tech debt. → AM 경계를 깨끗이 두어 추후 교체 가능하게.
+- **고차원 회전 비용**: dim=1024 회전을 hot path에서 빠른 변환으로 처리해야(FJLT/Hadamard) — 구현 까다로움.
+- **효용 근거**: 시스템 통합은 ~40% 기성(IVF·AM·데몬·직렬화 재사용), 위험은 60%(GPU 수치+검증)에 집중. numpy 스파이크로 그 60%의 핵심(수치)을 선소각 완료.
+
+**구현 비용(스파이크 할인 반영)**: numpy 스파이크 S(완료) → CUDA 인코더/추정기/bound M–L → `rabitq` AM 통합 M(flat/ivfpq 템플릿) → 검증 하네스 M.
+
+**관련**: ADR-049(ivfpq·VRAM 절감, 본 건의 recall-천장 동기), ADR-025(50M·vchordrq 0.9991), ADR-026/072(DiskANN no-go — 대조: 블로커가 외부 API였음), ADR-073(AM-per-algo 하우스 스타일), ADR-010(VRAM OOM 정책). 스파이크: `tools/rabitq_spike.py`, 벤치 핸드오프 `bench/protocol/HANDOFF.md §5 RaBitQ 트랙`(run #30–#33).
+
+---
+
+## ADR-077 — flat 동시-쓰기 정합성: `.delta` reader 공유 락 (torn-read 제거)
+
+**날짜**: 2026-06-17
+**상태**: ACCEPTED (설계, 측정 기반). 구현은 후속(소규모, 트리거 없음 — 착수 가능). D3 concurrent 벤치(run #57, `gha-27665874191`)가 노출한 국소 동시성 버그를 수정한다. ADR-047(delta/tombstone MVCC) 위에 선다 — **delta 아키텍처는 유지**하고 reader 락 비대칭만 고친다.
+
+**문제**: Stage D3 concurrent 셀(query QPS under background ingest, A100 real cuVS)에서 `forced-flat`이 동시 insert+query 시 **`pg_cuvs: delta sidecar unusable mid-scan; retry will replan to CPU`** 로 FAILED. 같은 워크로드에서 cagra는 757.8→9.8 qps(98.7% 저하)지만 **생존**, no-index는 0% 저하. 즉 flat만 "느려짐"이 아니라 "끊김"으로 떨어진다.
+
+**근본원인 (torn read, 락 비대칭)**:
+- **Writer** `cuvs_delta_append`(`pg_cuvs.c:3918`)는 `flock(fd, LOCK_EX)`로 다른 backend의 append와 직렬화하며, 레코드 바디를 먼저 쓰고(① 파일 확장) → 헤더 `n_rows`를 나중에 갱신한다(②).
+- **Reader** scan-time delta 머지(`pg_cuvs.c:3101`)는 `OpenTransientFile(O_RDONLY)` 후 **flock 없이** `fsize`와 `hdr.n_rows`를 읽어 `cuvs_delta_validate`로 크기↔카운트 정합을 검사한다.
+- writer의 ①과 ② 사이(바디는 썼으나 헤더 카운트 미갱신)에 reader가 끼면 `fsize=(n+1)*rec` vs `hdr.n_rows=n` 불일치 → `ereport(ERROR, OBJECT_NOT_IN_PREREQUISITE_STATE)`. **reader가 writer의 배타 락에 참여하지 않아** append 중간 상태를 관측한다.
+- **cagra가 미발현인 이유**(`pg_cuvs.c:4022`): cagra aminsert는 `cuvs_ipc_extend`(GPU `cuvsCagraExtend`) 경로라 `.delta`가 churn하지 않는다(저하는 `g_index_mutex`의 extend↔search 직렬화). flat/ivfpq는 extend가 없어 매 INSERT가 `.delta` append → 동시 스캔과 torn-read 충돌.
+
+**결정**: scan-time delta reader에 **공유 락(`flock(fd, LOCK_SH)`)** 을 추가한다. reader는 writer의 `LOCK_EX`가 끝날 때까지 대기 → append 중간 상태를 절대 관측하지 않음 → **에러 대신 잠깐 대기 후 정합한 delta를 읽는다**("락 걸려 느려도 증분은 굴러간다"). delta MVCC 설계(ADR-047: 후보 TID + 힙 recheck 가시성)는 그대로 유지. cap 초과(`cuvs_max_delta_rows`)·base 세대 변경(REINDEX) 분기는 의도된 fail-closed로 보존(동시쓰기 race와 무관).
+
+**대안 기각**:
+- **resident 코퍼스 직접 append (delta 폐기)** — flat은 그래프가 없어 append가 싸 보이나, (1) `aminsert`는 커밋 전 발화 → 미커밋 행이 공유 GPU 인덱스에 즉시 박혀 **abort/rollback 오염**(CAGRA 그래프/flat 코퍼스에서 점 제거 불가), (2) 매 쓰기를 `g_index_mutex`에 올려 **cagra의 98.7% 직렬화 프로필을 flat에도 도입**, (3) fsync `.delta`의 **재시작 내구성 상실**(ADR-047 e2e). ADR-047이 delta로 피한 문제 3종을 모두 재발 → 거의 모든 축에서 열위.
+- **`cuvs_max_delta_rows` 하향으로 회피** — race는 카운트와 무관(낮춰도 torn read 발생), stale 빈도만 증가 → 미해결.
+- **reader의 validate 실패를 무에러 재시도로만** — 락 없이 재시도하면 부하 시 라이브락 위험. 정공법은 reader 락(짧고 결정적 대기).
+
+**검증 (설계 단계 근거 + 구현 후 게이트)**:
+- 측정 근거: run #57 `gha-27665874191`(A100, real cuVS) — cagra 757.8→9.8(생존), **flat FAILED(delta unusable mid-scan)**, no-index 0%. 보고서 `docs/reports/2026-06-17-stage-d3-concurrent.md`.
+- delta 머지 **정확성은 이미 입증**(이번 버그는 가용성/race이지 정확성 아님): ADR-047 isolation 2/2 GREEN + D3 recall-drift `recall@10=1.0, 0 leaked`(순차 2000 ins+del).
+- 구현 후 게이트(비협상): pg_isolation_regress에 **동시 INSERT+scan에서 에러 없이 정합 top-k** 케이스 추가(flat), flat 회귀펜스 GREEN 유지. D3 concurrent 재측정에서 flat이 "slow-but-OK"로 전환(FAILED→degradation%)됨을 확인.
+
+**관련**: ADR-047(delta/tombstone MVCC freshness — 본 결정의 토대), ADR-073(flat AM A1), ADR-074(포지셔닝: 쓰기多→pgvector-무인덱스; 본 수정은 동시-읽기-중-간헐쓰기 정합을 보장하되 write-heavy 라우팅은 불변), ADR-051(3Q cagra streaming extend — cagra가 delta를 우회하는 경로). 측정: `bench/protocol/HANDOFF.md §D3`, 보고서 `docs/reports/2026-06-17-stage-d3-concurrent.md`. 코드: writer `pg_cuvs.c:3918`(flock), reader `pg_cuvs.c:3101`(락 누락 지점).
