@@ -1,5 +1,6 @@
 .cwf
 .omc
+.claude-profile
 .venv
 .env
 .env.gpu
