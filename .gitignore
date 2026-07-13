@@ -6,12 +6,10 @@
 .env.gpu
 .env.local
 
-# Local-only access/runbook notes (connection info; never commit)
-VM_ACCESS.local.md
-*.local.md
-
-# Local-only meeting-prep materials (private strategy/notes; never commit)
-*.local/
+# Local-only sensitive context — never commit. Durable private copies live in
+# the private repo ysys143/pg_cuvs_docs. CLAUDE.local.md = local Claude context.
+CLAUDE.local.md
+*.local*
 node_modules/
 __pycache__/
 *.pyc
