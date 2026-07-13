@@ -220,6 +220,13 @@
 
 스펙: [design/PLAN.md — fp16 입력 벡터](design/PLAN.md) | ADR-054
 
+#### GPUDirect Storage / cuFile 빌드 ingest (트리거: 대규모 빌드 ingest 병목 실측)
+**왜**: Corey 강연(ADR-078)이 GPU 인덱싱의 새 병목으로 disk/network ingest를 지목하고 대응책으로 RAPIDS Quick I/O(cuFile/GPUDirect Storage)·PCIe CPU-bypass를 제시. pg_cuvs 빌드 ingest 경로는 PG heap scan → memfd(ADR-057) → H2D.
+**상태**: 후보(저순위). 4A(ADR-057/058/059)로 double-copy 제거·copy≈0 달성 + wall-clock이 GPU build floor(~33s) 지배라 이득 marginal 예상. 소스가 PG heap이라 GDS 적용이 Lucene 세그먼트 파일만큼 자연스럽지 않음(파일 직접→GPU가 아니라 heap tuple 경유).
+**트리거**: 대규모 빌드에서 ingest가 GPU floor를 넘는 병목으로 실측될 때.
+
+스펙: ADR-078 | ADR-034(빌드 오버헤드) | ADR-057(memfd 무복사)
+
 #### EXPLAIN ANALYZE GPU 타이밍 (D 잔여로 승격)
 **상태**: D 잔여로 이동. 스펙: [design/PLAN.md — EXPLAIN GPU 타이밍](design/PLAN.md) | ADR-055
 
@@ -243,6 +250,8 @@
 ## cuVS 에코시스템 진입 계획
 
 상세: [docs/ecosystem-strategy.md](docs/ecosystem-strategy.md) | ADR-062
+
+> **1차 사료 보강 (2026-07-13, ADR-078)**: Corey Nolet(NVIDIA cuVS)+Vivek Narang의 cuVS+Lucene 강연이 **merge·batch 미결을 Lucene 커넥터의 공개 과제로 확증**했다. pg_cuvs는 이 둘을 이미 닫음 — merge=3Q(ADR-051 `cuvsCagraExtend`+`cuvsCagraMerge`), batch=3M(ADR-040 `pg_cuvs_batch_search`). → **Stage 2 cuvs-bench PR 피치의 핵심 근거**: "pg_cuvs = cuVS streaming-update API를 DB 레벨에서 실사용하는 유일 사례." 강연 Q&A 통합 목록(Milvus/FAISS/OpenSearch/Qdrant/Oracle)에 Postgres 부재 = 아래 "선점 기회" 전제 재확인.
 
 ### 전제 조건 (진입 전 필수)
 
