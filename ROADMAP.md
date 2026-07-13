@@ -93,19 +93,21 @@
   - 작업: 운영 생애주기 전반 단일화 — 기동·모니터링(어느 `pg_stat_gpu_*` 뷰·임계값), 장애모드·복구(데몬 다운·VRAM OOM·fallback 급증·eviction 폭주), 업그레이드/롤백, 백업/복구(GCS 스냅샷), 스케일링·캐파, 인시던트 대응. 흩어진 런북을 OPS_GPU_PLAYBOOK로 연결.
   - **완료 기준**: 신규 운영자가 플레이북만으로 배포→모니터→장애대응→업그레이드 수행 가능; 각 절차에 실 명령·뷰·임계값 포함.
 
-- **GitHub org 이전 (가이드 사이트보다 *선행* — Pages URL이 여기 종속)**
-  - 결정: `ysys143/pg_cuvs` → **`pg-cuvs/pg_cuvs`** (org `pg-cuvs` 가용 확인 2026-06-13). GitHub org명은 underscore 불가라 org는 하이픈(`pg-cuvs`), repo는 확장명 그대로 `pg_cuvs` 유지(= `CREATE EXTENSION pg_cuvs`/`.so`와 일치). 대안 `pgcuvs/pg_cuvs`.
-  - 왜: 신뢰도(pgvector/timescale/tensorchord 전부 org) + 개인 핸들과 분리 + **cuVS 등재·가이드 사이트가 링크 걸기 전에 최종 주소 확정**(리다이렉트보다 처음부터 옳은 주소).
-  - transfer는 GitHub 내장(stars/issues/PR/history 보존 + 옛 URL 자동 리다이렉트, issue #56·브랜치 동반; 계정 작업이라 사람이 UI에서 실행). **이전 후 재배선 필수**:
-    - **self-hosted runner 재등록** — `config.sh remove` 후 새 repo URL로 재등록 (현재 `ysys143-pg_cuvs.pg-cuvs-a100`; `docs/ci-gpu-setup.md`). 안 하면 Tier-2 GPU CI 죽음.
-    - **WIF attribute-condition** `assertion.repository=='ysys143/pg_cuvs'` 갱신 — 안 하면 키리스 인증 거부.
-    - **가이드 사이트 URL** `ysys143.github.io/pg_cuvs` → `pg-cuvs.github.io/pg_cuvs` (또는 커스텀 도메인으로 완전 디커플링 — org 재변경에도 docs URL 불변).
-    - 하드코딩 repo 참조 일괄 갱신: `ROADMAP.md`(아래 가이드 사이트 항목)·`docs/ci-gpu-setup.md`·`docs/reports/*`.
-  - **완료 기준**: `pg-cuvs/pg_cuvs` 라이브 + Tier-2 GPU CI가 새 repo에서 GREEN + Pages 최종 URL 확정.
+- **GitHub org 이전 → `pg-cuvs/pg_cuvs` — repo transfer 완료 (2026-07-14)**
+  - 결정: `ysys143/pg_cuvs` → **`pg-cuvs/pg_cuvs`** (org `pg-cuvs`, **My personal account 소유** — 법적 통제 주체는 개인, "business/institution" 아님. `team-pgcuvs`/`pgcuvs` 후보 검토 후 확정). org명 underscore 불가라 하이픈, repo는 `pg_cuvs` 유지(= `CREATE EXTENSION pg_cuvs`/`.so` 일치).
+  - 왜: 신뢰도(pgvector/timescale/tensorchord 전부 org) + 개인 핸들과 분리 + **cuVS 등재·가이드 사이트 링크 전 최종 주소 확정**. 브랜딩은 "Team pg-cuvs"(README/CONTRIBUTING), GitHub 소유는 개인.
+  - **완료**: GitHub 내장 transfer 실행(stars/issues/PR/history 보존 + 옛 URL 자동 리다이렉트). 로컬 `origin` remote → `pg-cuvs/pg_cuvs` 갱신. in-repo: `docs/ci-gpu-setup.md`를 `pg-cuvs/pg_cuvs`로 갱신(커밋 `f46d761`). 워크플로 YAML은 `${GITHUB_REPOSITORY}`+repo vars 간접참조라 자동 정합.
+  - **잔여 재배선 — Brev/새 GCP 컴퓨트 셋업과 통합** (GCP 크레딧 만료·차단, `reference_gpu_vms` 참조):
+    - self-hosted runner 재등록(`config.sh remove` → 새 repo URL; Brev 이전 시 거기서 신규 등록). 안 하면 Tier-2 GPU CI 죽음.
+    - WIF attribute-condition → `assertion.repository=='pg-cuvs/pg_cuvs'`(새 프로젝트 셋업에 포함).
+    - GitHub Actions repo vars(`GCP_WIF_PROVIDER`/`GCP_CI_SA`/`GPU_CI_INSTANCE`/`GPU_CI_ZONE`) 재입력 — transfer 시 미이동.
+    - 가이드 사이트 URL `ysys143.github.io/pg_cuvs` → `pg-cuvs.github.io/pg_cuvs`(가이드 사이트 발행 시).
+  - 역사 보존: 본 절의 from→to 서술과 `docs/reports/*`의 옛 핸들은 기록으로 유지.
+  - **완료 기준(잔여)**: 새 컴퓨트 환경에서 Tier-2 GPU CI GREEN + Pages 최종 URL 확정.
 
 - **가이드 사이트 발행 (GitHub Pages, MkDocs)**
   - 레퍼런스: [PG-Strom 문서](https://heterodb.github.io/pg-strom/)(MkDocs + RTD 테마, GitHub Pages, **동일 PostgreSQL License·같은 PG-GPU 카테고리** → IA 모델: Home/Install/Tutorial/Advanced Features/References/Release Notes) + [cuVS integrations](https://docs.rapids.ai/api/cuvs/stable/integrations/)(Faiss/Milvus/Lucene/Kinetica 등재; **PostgreSQL/DB 확장 전무 → pg_cuvs 첫 등재 기회**, 등재엔 dedicated 페이지+링크 필요).
-  - 작업: MkDocs(Material 또는 RTD 테마) + GitHub Actions로 Pages 발행(`ysys143.github.io/pg_cuvs`). IA는 PG-Strom 미러 — Home(개요) / Install(설치·버전매트릭스) / Tutorial(quickstart·필터검색·멀티테넌트) / Features(검색 모드·인덱스 AM·GUC·reloption) / References(SQL 함수·뷰·기법 요약) / Operations(플레이북) / Release Notes.
+  - 작업: MkDocs(Material 또는 RTD 테마) + GitHub Actions로 Pages 발행(`pg-cuvs.github.io/pg_cuvs`). IA는 PG-Strom 미러 — Home(개요) / Install(설치·버전매트릭스) / Tutorial(quickstart·필터검색·멀티테넌트) / Features(검색 모드·인덱스 AM·GUC·reloption) / References(SQL 함수·뷰·기법 요약) / Operations(플레이북) / Release Notes.
   - **위 두 항목(문서 현행화·플레이북)의 단일 렌더 표면** — ARCHITECTURE·기능 reference·기법 요약·플레이북을 사이트가 렌더(중복 산출물 안 만듦, single source). cuVS integrations 등재용 dedicated 페이지(pg_cuvs ← cuVS) 준비 → **에코시스템 진입 단계 3**(cuVS 문서/README 링크 요청) 산출물.
   - **완료 기준**: Pages URL 라이브 + PG-Strom 수준 IA + cuVS integrations PR에 링크할 dedicated 페이지 존재.
 
