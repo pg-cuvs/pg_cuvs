@@ -227,6 +227,15 @@
 
 스펙: ADR-078 | ADR-034(빌드 오버헤드) | ADR-057(memfd 무복사)
 
+#### 필터검색 외부 검증 후속 — 3O recall-ceiling 리스크 + 라우팅 임계 + 벤치 방법론 (ADR-079)
+**왜**: GPU 필터검색 3-논문 분석(ADR-079). VecFlow(SIGMOD'26, cuVS 저자 Karsin/Chirkin)가 **글로벌 CAGRA 그래프 + prefilter(=우리 3O/ADR-048)가 recall ~80% 천장 + 매우 selective 필터서 ~0% 붕괴**함을 실측(작은 교집합이 그래프 연결성 파괴). D-wedge(exact GPU BF)는 cuVS(VecFlow IVF-BFS 26M QPS)·CPU(Fudan 벤치) 양쪽서 최적 확증.
+- **[최우선] 3O 리스크 벤치 arm**: "3O recall vs selectivity(교집합 축소 시 붕괴 여부)" 측정 → 확인 시 "매우 selective → D-wedge BF, 3O 아님" 라우팅 규칙 명문화. 저비용·고가치.
+- **라우팅 임계 재검토**: ADR-063 selectivity fraction(0.05) vs VecFlow 절대 candidate count(~1-2K points) 실측 비교.
+- **벤치 방법론 채택**: matched-recall interpolation(recall 0.8/0.9/0.95 고정→QPS) + 3-family taxonomy(pre/post/hybrid) + 데이터셋 YFCC(192d, NeurIPS BigANN filtered 표준)/arXiv; correlation×selectivity + GPU + range를 우리 novelty로 명시(Fudan named gap 3종).
+**트리거**: 없음(D-wedge/3O·벤치 재개 시 순차 승격; 3O arm은 저비용). 홈 = `bench/protocol/HANDOFF.md §5`.
+
+스펙: ADR-079 | ADR-048(3O) | ADR-063(D-wedge/threshold) | ADR-069(벤치)
+
 #### EXPLAIN ANALYZE GPU 타이밍 (D 잔여로 승격)
 **상태**: D 잔여로 이동. 스펙: [design/PLAN.md — EXPLAIN GPU 타이밍](design/PLAN.md) | ADR-055
 

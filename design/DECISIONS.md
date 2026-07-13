@@ -3038,6 +3038,9 @@ cost = scan(N) + detoast(m, storage) + move(m, link) + compute(m, engine) + topk
 
 **남은 것**: transient B 물리 공식 활성화 + `auto`(Phase 3, GH200/MI300A급 통합메모리 필요); cpu_dist 클램프 밴드 재조정; bf_tput probe가 end-to-end(업로드 포함)라 transient용으론 후속 정밀화 필요.
 
+### 통합메모리 가설 외부 근거 (2026-07-13, ADR-079)
+SVFusion(VLDB'26, PCIe A100)이 CAGRA/GGNN가 **UVM(demand paging)에서 크게 저하**함을 보이며 "이득은 명시적 배치이지 HW 코히런스가 아니다"라고 결론. 함의: (1) transient B의 PCIe 열위(ADR-074 2-8×)를 독립 재확인 — insert의 45.4%가 H2D 전송. (2) **UVM ≠ NVLink-C2C**: SVFusion의 UVM 저하는 demand-paging 산물이지 GH200/MI300A의 코히런트 통합메모리(~900GB/s)를 반증하지 않음 → 우리 Ph3 가설(`link_bw` 자동 판정)은 **여전히 유효·미검증**. 단 경고로 흡수: 통합메모리에서도 **명시적 배치가 naive paging을 이길 수 있음** → Ph3 활성화 시 `auto`는 순수 대역폭 게이트만이 아니라 배치/캐싱(예: SVFusion의 in-degree 기반 λ 예측)도 고려. 스펙: ADR-079.
+
 ---
 
 ## ADR-076 — Native RaBitQ 양자화기(`rabitq` AM): 저VRAM + 고recall 동시 달성
@@ -3143,3 +3146,36 @@ cost = scan(N) + detoast(m, storage) + move(m, link) + compute(m, engine) + topk
 3. **고차원 CAGRA-as-HNSW 벤치 arm**: 강연의 "고차원(2048+)서 HNSW 계층 성능 저해, CAGRA-graph-as-HNSW가 native HNSW보다 우수" 정성 주장을 우리 실측으로 재현/반박. 현 벤치 sweep dim∈{8,384,768}에 2048+ arm 추가, pg_cuvs HNSW export vs pgvector native HNSW 검색 recall/latency 비교. 홈 = `bench/protocol/HANDOFF.md §5`(bench SSOT); 벤치 재개 시 반영.
 
 **관련**: ADR-062(에코시스템 진입), ADR-051(3Q merge), ADR-040(3M batch), ADR-029(3I HNSW export), ADR-034(빌드 I/O 오버헤드), ADR-057(memfd 무복사). 메모리: `reference_corey_cuvs_lucene_talk`, `project_nvidia_cuvs_outreach`.
+
+---
+
+## ADR-079 — GPU 필터검색 3-논문 외부 검증: D-wedge 확증 + 3O recall-ceiling 리스크 + 벤치 방법론
+
+**날짜**: 2026-07-13
+**상태**: 검증 기록 — 액션 도출(3O 리스크 벤치·ADR화 최우선, 나머지 백로그/방법론)
+
+**배경**: pg_cuvs 필터검색·CPU-GPU·벤치 설계에 직결되는 3편 분석(메모리 `reference_gpu_filtered_ann_papers`; ADR-078 강연 분석과 병행):
+- **VecFlow** (arXiv 2506.00812, SIGMOD'26; UIUC + NVIDIA cuVS 저자 Karsin/Chirkin) — GPU filtered-ANNS. 사실상 cuVS 팀의 필터검색 설계.
+- **SVFusion** (arXiv 2601.08528, VLDB'26; ZJU+Huawei) — GPU-CPU-disk 3-tier streaming ANNS, **PCIe A100(우리 체제)**.
+- **Filtered-ANN Unified Benchmark** (arXiv 2509.07789, PVLDB EA&B; Fudan) — CPU-only FANNS 통합 벤치, GPU 방법 없음.
+
+**판정 매핑**:
+| 논문 발견 | 대응 | 판정 |
+|---|---|---|
+| VecFlow IVF-BFS(=cuVS `ivfflat_interleaved_scan`) 26M QPS, graph보다 **1.32×@90%recall + recall 상한 없음** + Fudan low-sel pre-filter BF 최적 | ADR-061/063 D-wedge | **강력 지지**(cuVS팀·GPU + Fudan·CPU 양쪽) |
+| **CAGRA-Post/Inline이 단일 글로벌 그래프서 recall ~80% 정체, 매우 selective 필터엔 ~0% 붕괴**(작은 교집합이 그래프 연결성 파괴; WIKI-1M multi-label AND recall ~0) | **ADR-048 (3O)** | **리스크** — 측정·ADR화 필요 |
+| VecFlow 빌드타임 라우팅 임계 T≈1000-2000 candidate points | ADR-063 `filter_auto_threshold=0.05`(fraction) | 재검토(절대 candidate count 후보) |
+| SVFusion WAVP `gain=λ·(T_CPU−T_GPU)−T_transfer`; insert의 H2D 45.4%/거리계산 33.6% | ADR-075 물리분해 코스트 | **독립 재발명 = 지지**; λ에 in-degree 신호 추가 후보 |
+| CAGRA/GGNN가 UVM서 저하("이득은 명시적 배치, HW 코히런스 아님"); GH200/C2C 미테스트 | ADR-074/075 Ph3 | 가설 유효 + UVM≠C2C 뉘앙스(ADR-075 addendum) |
+| Fudan: correlation·GPU·range 미다룸(named gap) + matched-recall/taxonomy 방법론 | ADR-069 벤치 | 방법론 채택 + 우리 novelty 확정 |
+
+**핵심 리스크(3O)**: 우리 3O(ADR-048)는 글로벌 CAGRA 그래프 + BITSET prefilter다. VecFlow는 바로 이 구조(CAGRA-Post/Inline)가 (a) recall ~80% 천장, (b) 매우 selective 필터(작은 교집합)에서 ~0% 붕괴함을 실측했다. VecFlow 해법(per-label 그래프)은 저카디널리티 known 범주형 컬럼에만 통하므로, 임의 predicate에는 D-wedge BF가 정답. **우리는 이 실패 모드를 아직 명시 측정하지 않았다** — 벤치·ADR화 필요.
+
+**도출 액션**:
+1. **[최우선] 3O recall-ceiling 리스크 검증** — 벤치에 "3O recall vs selectivity(교집합 축소 시 붕괴 여부)" arm 추가. 확인 시 라우팅 규칙 "매우 selective → D-wedge BF, 3O 아님" 명문화. 홈 = `bench/protocol/HANDOFF.md §5` + ROADMAP 트리거 백로그.
+2. **라우팅 임계 재검토** — ADR-063 selectivity fraction(0.05) vs VecFlow 절대 candidate count(~1-2K). 무엇이 robust한지 실측.
+3. **벤치 방법론 채택** — matched-recall interpolation(recall 0.8/0.9/0.95 고정→QPS 비교) + 3-family taxonomy(pre/post/hybrid) 보고 + 데이터셋 YFCC(192d, NeurIPS BigANN filtered 표준)/arXiv. correlation×selectivity + GPU + range를 우리 차별점으로 명시(Fudan named gap).
+4. **ADR-075 Ph3 UVM≠C2C 뉘앙스** — 별도 addendum(SVFusion 근거).
+5. **NVIDIA 정렬 카드** — VecFlow=cuVS 저자 → outreach(ADR-062): "pg_cuvs = VecFlow IVF-BFS를 임의 Postgres predicate로 일반화."
+
+**관련**: ADR-048(3O), ADR-063(D-wedge 필터/threshold), ADR-061(전략), ADR-075(코스트/통합메모리), ADR-069(벤치), ADR-062(에코시스템), ADR-078(강연 검증·병행). 메모리: `reference_gpu_filtered_ann_papers`.
