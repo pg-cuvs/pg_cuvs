@@ -296,4 +296,8 @@ PostgreSQL License. Copyright (c) 2026, JAESOL SHIN. See [LICENSE](LICENSE) for 
 - [pgvector](https://github.com/pgvector/pgvector) — PostgreSQL vector type and CPU indexes (HNSW, IVFFlat)
 - [pgvectorscale](https://github.com/timescale/pgvectorscale) — DiskANN for PostgreSQL (CPU/SSD; benchmark comparison baseline)
 - [RAPIDS cuVS](https://github.com/rapidsai/cuvs) — GPU ANN library (CAGRA, IVF-Flat, IVF-PQ, brute force)
+
+## Acknowledgments
+
+Thanks to the NVIDIA cuVS team for their feedback and encouragement.
 - [PG-Strom](https://github.com/heterodb/pg-strom) — GPU-accelerated SQL for PostgreSQL (architectural inspiration)
