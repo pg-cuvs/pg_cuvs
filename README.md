@@ -283,6 +283,10 @@ FROM pg_stat_gpu_search;
 
 See `design/OPS_GPU_PLAYBOOK.md` for parameter tuning and MIG operations.
 
+## Contributing
+
+pg_cuvs is built by **Team pg-cuvs**, an independent open-source project. Contributions and collaboration inquiries are welcome — open an issue or pull request, or reach out at <ysys143@gmail.com>. See [CONTRIBUTING.md](CONTRIBUTING.md) to get started.
+
 ## License
 
 PostgreSQL License. Copyright (c) 2026, JAESOL SHIN. See [LICENSE](LICENSE) for details.

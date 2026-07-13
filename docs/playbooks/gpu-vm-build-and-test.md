@@ -30,7 +30,7 @@ cat > .env.gpu << 'EOF'
 GCP_VM=ubuntu@<외부IP>          # VM 외부 IP (stop/start 시 바뀜 — gpu-vm-lifecycle.md 참조)
 GCP_INSTANCE=pg-cuvs-dev        # gcloud 인스턴스 이름
 GCP_ZONE=us-central1-b          # 인스턴스가 있는 zone
-GCP_PROJECT=gpu-experiment-wdl-2026
+GCP_PROJECT=your-gcp-project
 CONDA_ENV=rapids                 # VM의 conda 환경 이름
 CUDA_ARCH=sm_80                  # A100 = sm_80, A10 = sm_86
 EOF

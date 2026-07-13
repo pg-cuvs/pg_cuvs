@@ -8,17 +8,17 @@ No long-lived secret is stored in GitHub: GCP trusts short-lived GitHub OIDC
 tokens scoped to **this repo only**, and the VM runs PR code only while a
 maintainer-triggered run has it booted.
 
-Concrete values below assume: repo `ysys143/pg_cuvs`, project
-`gpu-experiment-wdl-2026`, instance `pg-cuvs-dev`, zone `us-central1-b`. Adjust.
+Concrete values below assume: repo `pg-cuvs/pg_cuvs`, project
+`your-gcp-project`, instance `pg-cuvs-dev`, zone `us-central1-b`. Adjust.
 
 ---
 
 ## 1. Workload Identity Federation (keyless GCP auth) — run with project-admin gcloud
 
 ```bash
-PROJECT=gpu-experiment-wdl-2026
+PROJECT=your-gcp-project
 PROJECT_NUM=$(gcloud projects describe "$PROJECT" --format='value(projectNumber)')
-REPO=ysys143/pg_cuvs
+REPO=pg-cuvs/pg_cuvs
 
 # Pool + provider that trusts GitHub's OIDC issuer, RESTRICTED to this repo.
 gcloud iam workload-identity-pools create gh-pool \
@@ -63,7 +63,7 @@ mkdir -p ~/actions-runner && cd ~/actions-runner
 curl -o runner.tar.gz -L https://github.com/actions/runner/releases/latest/download/actions-runner-linux-x64.tar.gz
 tar xzf runner.tar.gz
 # Get a registration token: GitHub repo → Settings → Actions → Runners → New self-hosted runner.
-./config.sh --url https://github.com/ysys143/pg_cuvs --token <RUNNER_TOKEN> \
+./config.sh --url https://github.com/pg-cuvs/pg_cuvs --token <RUNNER_TOKEN> \
   --labels gpu,a100 --name pg-cuvs-a100 --unattended
 sudo ./svc.sh install ubuntu     # run as ubuntu (has the cuvs_dev conda env)
 sudo ./svc.sh start
@@ -82,7 +82,7 @@ identifiers, not secrets):
 | Variable | Value |
 |----------|-------|
 | `GCP_WIF_PROVIDER` | the provider resource name printed in step 1 |
-| `GCP_CI_SA` | `gpu-ci@gpu-experiment-wdl-2026.iam.gserviceaccount.com` |
+| `GCP_CI_SA` | `gpu-ci@your-gcp-project.iam.gserviceaccount.com` |
 | `GPU_CI_INSTANCE` | `pg-cuvs-dev` |
 | `GPU_CI_ZONE` | `us-central1-b` |
 
