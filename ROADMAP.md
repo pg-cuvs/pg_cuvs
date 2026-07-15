@@ -264,6 +264,8 @@
 
 > **1차 사료 보강 (2026-07-13, ADR-078)**: Corey Nolet(NVIDIA cuVS)+Vivek Narang의 cuVS+Lucene 강연이 **merge·batch 미결을 Lucene 커넥터의 공개 과제로 확증**했다. pg_cuvs는 이 둘을 이미 닫음 — merge=3Q(ADR-051 `cuvsCagraExtend`+`cuvsCagraMerge`), batch=3M(ADR-040 `pg_cuvs_batch_search`). → **Stage 2 cuvs-bench PR 피치의 핵심 근거**: "pg_cuvs = cuVS streaming-update API를 DB 레벨에서 실사용하는 유일 사례." 강연 Q&A 통합 목록(Milvus/FAISS/OpenSearch/Qdrant/Oracle)에 Postgres 부재 = 아래 "선점 기회" 전제 재확인.
 
+> **Stage 2 백엔드 구현·검증 완료 (2026-07-16, ADR-080)**: cuvs-bench pluggable backend(`PgBackend`+`PgConfigLoader`, `bench/cuvs_bench_backend/`)를 구현해 pg_cuvs·pgvector를 **NVIDIA 자체 도구**(`BenchmarkOrchestrator(backend_type="pg")`) 안에서 Cohere 1M×1024로 재측정했다. 보고는 **end-to-end**(psql 왕복 전체; raw 라이브러리 수치는 미보고) — matched recall@10≈0.99에서 **CAGRA 검색 ~5×**(p50·QPS) · **3I 빌드 ~2×** vs pgvector native. 19-pt Pareto = `bench/results/pg_cuvsbench_1m.csv`. 잔여 = `rapidsai/cuvs` upstream PR. (정정: 기존 "빌드 13×"는 synthetic random 최악조건, "24×"는 raw 라이브러리 경계 — 헤드라인에서 강등, canonical=real-embedding end-to-end.)
+
 ### 전제 조건 (진입 전 필수)
 
 | 항목 | 필요 작업 |
@@ -279,7 +281,7 @@
 | 단계 | 목표 | 전제 조건 | 타이밍 |
 |------|------|-----------|--------|
 | 1 | repo 공개 [OK] + 벤치마크 공개 | 없음 | repo 공개됨 · `BENCHMARK.md`만 잔여 |
-| 2 | cuvs-bench backend PR | 3Q 완료 [OK] | 즉시 착수 가능 |
+| 2 | cuvs-bench backend PR | 3Q 완료 [OK] | **백엔드 구현·검증 완료** (2026-07-16, ADR-080; 1M×1024 3-algo end-to-end 통과). 잔여 = `rapidsai/cuvs` upstream PR |
 | 3 | [cuVS integrations](https://docs.rapids.ai/api/cuvs/stable/integrations/) 등재 + cuVS README 링크 (현재 Faiss/Milvus/Lucene/Kinetica — PG 확장 전무 → 선점) | 2단계 merge + 가이드 사이트 dedicated 페이지 | 2단계 후 |
 | 4 | NVIDIA 채널 노출 | 3단계 등재 | 3단계 후 |
 

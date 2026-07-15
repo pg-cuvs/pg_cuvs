@@ -3179,3 +3179,34 @@ SVFusion(VLDB'26, PCIe A100)이 CAGRA/GGNN가 **UVM(demand paging)에서 크게 
 5. **NVIDIA 정렬 카드** — VecFlow=cuVS 저자 → outreach(ADR-062): "pg_cuvs = VecFlow IVF-BFS를 임의 Postgres predicate로 일반화."
 
 **관련**: ADR-048(3O), ADR-063(D-wedge 필터/threshold), ADR-061(전략), ADR-075(코스트/통합메모리), ADR-069(벤치), ADR-062(에코시스템), ADR-078(강연 검증·병행). 메모리: `reference_gpu_filtered_ann_papers`.
+
+## ADR-080 — cuvs-bench Postgres 백엔드(pg_cuvs + pgvector): NVIDIA 도구 안에서 end-to-end apples-to-apples
+
+**날짜**: 2026-07-16
+**상태**: 구현·검증 완료 (Cohere 1M×1024, 3-algo, cuvs-bench 오케스트레이터 end-to-end 통과; 적대적 코드리뷰 7개 이슈 반영)
+
+**배경**: NVIDIA가 2026-06-24 미팅에서 명시 초대한 에코시스템 진입 Stage 2(ADR-062)를 구현했다. cuvs-bench(RAPIDS 26.06)는 pluggable backend(`ConfigLoader` + `BenchmarkBackend`)를 지원하나 PostgreSQL/pgvector 백엔드가 없다 → **우리가 첫 구현**. 목적은 (a) pg_cuvs·pgvector를 **NVIDIA 자체 도구·방법론**(recall 버킷, Pareto, matched-recall) 안에서 같은 데이터·GT로 재고 (b) 우리 자체 하네스의 방법론 시비·`recall==0` id-space 버그·측정 경계 논란을 원천 차단하는 것.
+
+**결정**:
+1. **One Postgres backend, several algos** — `PgBackend(BenchmarkBackend)` + `PgConfigLoader(ConfigLoader)`를 `"pg"`로 등록하고 **모던 진입점 `BenchmarkOrchestrator(backend_type="pg").run_benchmark()`** 로 구동(모듈 레벨 `cuvs_bench.run.run()`은 upstream deprecated). algo = `pgvector_hnsw`/`pgvector_ivfflat`(CPU) · `pgcuvs_cagra`(GPU 상주) · `pgcuvs_hnsw_import`(3I). 위치 `bench/cuvs_bench_backend/`(향후 `rapidsai/cuvs` upstream PR 원본).
+2. **측정 경계 = end-to-end psql 왕복** (parse/plan + shm IPC + GPU 커널 + 힙 회수 + 클라이언트). in-process C++ 커널 시간이 **아니다**. **오직 이 end-to-end 숫자만 보고한다** — Postgres를 제외한 raw 라이브러리 타이밍은 pg_cuvs 수치가 아니므로 사용하지 않는다. 전 algo가 동일 statement shape(inline literal, 한 문장씩)라 상호·대 pgvector 비교가 공정.
+3. **실제 이웃 id 반환 → 오케스트레이터 `compute_recall`이 계산** (백엔드가 recall을 자체 계산하지 않음). `t.id == corpus row index` 불변식이 반환 id를 GT id 공간에 정렬시켜 `recall==0` 버그를 구조적으로 차단. GT는 `.npy`→big-ann `.ibin` 변환.
+4. **빌드 재사용 + seqscan 가드** — (algo,param)당 `BenchmarkConfig` 1개 + 상태 sidecar로 algo당 1회 빌드 후 파라미터 스윕. `search()`는 `EXPLAIN`으로 **Seq Scan 폴백을 거부**(인덱스 미사용 시 exact seqscan이 recall≈1.0을 "성공"으로 보고하는 조용히-틀린-숫자를 하드 실패로 전환).
+
+**검증 증거** (A100-40GB, ext 0.5.0, k=10, 2000 queries, via cuvs-bench; `bench/results/pg_cuvsbench_1m.csv`):
+
+| index | 서빙 | recall@10 (best) | p50 | QPS | build |
+|------|---|---:|---:|---:|---:|
+| pg_cuvs CAGRA | GPU | 0.9992 (cuvs.k=400) | 2.9 ms | 344 | 62 s |
+| pgvector HNSW (native) | CPU | 0.9884 (ef=400) | 13.2 ms | 72 | 237 s |
+| CAGRA→pgvector HNSW 변환 (`pgcuvs_hnsw_import`, `build_hnsw` nsw) | CPU | 0.9993 (ef=512) | 30.5 ms | 31 | 120 s |
+
+- **matched recall@10 ≈ 0.99, 검색 ~5×** (CAGRA 2.9 ms/344 QPS vs pgvector 13.2 ms/72 QPS, p50·QPS). **빌드는 용도별 두 값**: (a) GPU 서빙용 **CAGRA 인덱스 빌드 ~3.8×**(62 s vs 237 s), (b) CPU 서빙용 **CAGRA→pgvector HNSW 변환 ~2×**(120 s vs 237 s — GPU가 pgvector HNSW를 만들어줌; CAGRA 빌드 + pgvector 페이지 변환이라 순수 CAGRA보다 느림). 과거 real-embedding run(BENCHMARK.md §2.1: 4.4 ms vs 22 ms, 285 s)과 자릿수 일치.
+
+**데이터 정합성 정정(중요)**: 기존 문서의 **"빌드 13-14×"는 synthetic random 데이터**(1M×384; pgvector HNSW native가 918 s로 최악조건)에서 나온 값이며 real 임베딩에선 **~2×** 다. **"24× / 12 s"는 raw cuVS 라이브러리**(Postgres COPY·WAL·페이지 물성화 제외) 경계다. 둘 다 실사용자 end-to-end가 아니므로 **헤드라인에서 강등/제거**하고, canonical은 **real-embedding end-to-end(검색 ~5×, 빌드 ~2×)** 로 재정박한다.
+
+**한계(정직)**: 단일쿼리 serial 측정이라 QPS는 latency-bound — 배치/동시성(GPU throughput 강점)은 미측정. pgvector 절대치는 실행 환경에 따라 변동하나, 두 엔진을 **같은 환경·같은 도구**로 재므로 내부 비교는 공정.
+
+**도출 액션**: 1. `rapidsai/cuvs` upstream PR(백엔드 기여). 2. 7/23 NVIDIA 체크인 지참(19-point Pareto + 방법론). 3.(백로그) throughput/동시성 arm — GPU throughput 실측. 4.(백로그) 3O recall-ceiling arm(ADR-079).
+
+**관련**: ADR-062(에코시스템 진입 Stage 2), ADR-069(벤치 방법론), ADR-037(`pg_cuvs_build_hnsw` 통합 API), ADR-078/079(NVIDIA 정렬·외부검증). 산출물: `bench/cuvs_bench_backend/{backend.py,run_pg_cuvsbench.py,pg_engine.py,README.md}`, `bench/results/pg_cuvsbench_1m*.csv`.

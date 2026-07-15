@@ -76,7 +76,7 @@ If the GPU service dies, PostgreSQL **gracefully degrades** to CPU-based pgvecto
 | `USING cagra` | GPU VRAM | Approximate NN, low latency (~1.5 ms), hot data, fits in GPU VRAM |
 | `USING flat` | GPU VRAM (`.vectors` only, no graph) | Exact GPU brute-force (recall=1.0), read-heavy/stable corpora; first-class BF AM (v0.4.0, ADR-073) |
 | `USING ivfpq` | GPU VRAM (compressed) | Approximate NN, 10–100x VRAM savings vs cagra via product quantization |
-| `USING pg_cuvs_hnsw` (built from heap, or reuses a `USING cagra` source) | GPU build / CPU serve | Fast GPU build (13x vs pgvector), then served by pgvector HNSW on CPU |
+| `USING pg_cuvs_hnsw` (built from heap, or reuses a `USING cagra` source) | GPU build / CPU serve | Faster GPU-accelerated build (~2× vs pgvector on real embeddings, higher on synthetic), then served by pgvector HNSW on CPU |
 
 > **DiskANN/NVMe cold tier** (Phase 3B): spike completed, no-go for now — cuVS PQFlash
 > API is unstable in cuVS 26.04 and DiskANN at 50M×384 timed out at 2 GB cache.
@@ -96,7 +96,7 @@ Small tables route to CPU; large tables route to GPU automatically.
 |----------|-----------------|-------|
 | N < 10K, any dim | pgvector HNSW | IPC + daemon round-trip overhead exceeds GPU search benefit |
 | N 100K–10M, VRAM fits index | pg_cuvs CAGRA (GPU search) | Hot tier, low latency; crossover vs pgvector appears around N≈50K (synthetic clustered data; verify with your embedding distribution) |
-| Fast build/rebuild needed, CPU serving preferred | CAGRA build + `USING pg_cuvs_hnsw` | 14x faster than pgvector native build at 1M×384; serves as standard pgvector HNSW afterward |
+| Fast build/rebuild needed, CPU serving preferred | CAGRA build + `USING pg_cuvs_hnsw` | ~2× faster than pgvector native build on real embeddings (1M×1024, end-to-end); much higher on synthetic random data (1M×384, pgvector's HNSW worst case). Serves as standard pgvector HNSW afterward |
 | On-prem RAG, embedding GPU pool already available | Reuse GPU for batch index build via 3I | GPU pool not idle; online search stays on pgvector HNSW CPU path |
 | Larger-than-VRAM / billion-scale / NVMe cold tier | pgvectorscale DiskANN or VectorChord | pg_cuvs 3B DiskANN path is a no-go in cuVS 26.04; revisit when demand is confirmed |
 | Multi-GPU horizontal scale | pg_cuvs CAGRA with `shard_count` | Recall improves with sharding; latency increases due to merge overhead |
@@ -152,7 +152,7 @@ build history (now frozen) is in [design/PLAN.md](design/PLAN.md). Some committe
 | 1.5 — Test & Ops Hardening | DDL durability, large-data benchmarks, GPU e2e, playbooks | Done |
 | 2 — Production Ready | `pg_stat_gpu_search`, LIMIT-k/metric, write/staleness, large-build memory, tiered cache | Done |
 | 3A~3G — Scale Out | pending-delta, snapshots, replicas, multi-GPU sharding, query optimization | Done (3G complete; 3B DiskANN → **no-go**, see PHASE_3B_DECISION.md) |
-| 3I — GPU Build Accelerator | CAGRA build → pgvector HNSW export (13x faster build, recall=1.0 @ 1M×384) | Done (VM E2E verified, MIG tested) |
+| 3I — GPU Build Accelerator | CAGRA build → pgvector HNSW export (~2× faster build on real embeddings 1M×1024; 13× on synthetic 1M×384) | Done (VM E2E verified, MIG tested) |
 | 3K — HNSW DDL | `CREATE INDEX ... USING pg_cuvs_hnsw`: standard DDL for the build accelerator; `source` optional (ephemeral CAGRA from heap) + metric pre-check | Done (VM E2E, installcheck 8/8) |
 | 3H — Ops Playbooks | sizing guide, when-to-use, runbooks | In progress |
 | Release Hardening | compat matrix, known limitations, README, upgrade path | Planned |
