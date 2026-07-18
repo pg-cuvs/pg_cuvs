@@ -3197,13 +3197,15 @@ SVFusion(VLDB'26, PCIe A100)이 CAGRA/GGNN가 **UVM(demand paging)에서 크게 
 
 | index | 서빙 | recall@10 (best) | p50 | QPS | build |
 |------|---|---:|---:|---:|---:|
-| pg_cuvs CAGRA | GPU | 0.9992 (cuvs.k=400) | 2.9 ms | 344 | 62 s |
-| pgvector HNSW (native) | CPU | 0.9884 (ef=400) | 13.2 ms | 72 | 237 s |
-| CAGRA→pgvector HNSW 변환 (`pgcuvs_hnsw_import`, `build_hnsw` nsw) | CPU | 0.9993 (ef=512) | 30.5 ms | 31 | 120 s |
+| pg_cuvs CAGRA | GPU | 0.999 (cuvs.k=400) | 2.9 ms | 340 | 62 s |
+| pgvector HNSW (native) | CPU | 0.988 (ef=400) | 12.8 ms | 74 | 237 s |
+| CAGRA→pgvector HNSW 변환 (`pgcuvs_hnsw_import`, `build_hnsw` nsw) | CPU | 0.9994 (ef=512) | 31.2 ms | 31 | 120 s |
 
-- **matched recall@10 ≈ 0.99, 검색 ~5×** (CAGRA 2.9 ms/344 QPS vs pgvector 13.2 ms/72 QPS, p50·QPS). **빌드는 용도별 두 값**: (a) GPU 서빙용 **CAGRA 인덱스 빌드 ~3.8×**(62 s vs 237 s), (b) CPU 서빙용 **CAGRA→pgvector HNSW 변환 ~2×**(120 s vs 237 s — GPU가 pgvector HNSW를 만들어줌; CAGRA 빌드 + pgvector 페이지 변환이라 순수 CAGRA보다 느림). 과거 real-embedding run(BENCHMARK.md §2.1: 4.4 ms vs 22 ms, 285 s)과 자릿수 일치.
+(모든 수치는 `bench/results/pg_cuvsbench_1m.csv` 원본과 일치.)
 
-**데이터 정합성 정정(중요)**: 기존 문서의 **"빌드 13-14×"는 synthetic random 데이터**(1M×384; pgvector HNSW native가 918 s로 최악조건)에서 나온 값이며 real 임베딩에선 **~2×** 다. **"24× / 12 s"는 raw cuVS 라이브러리**(Postgres COPY·WAL·페이지 물성화 제외) 경계다. 둘 다 실사용자 end-to-end가 아니므로 **헤드라인에서 강등/제거**하고, canonical은 **real-embedding end-to-end(검색 ~5×, 빌드 ~2×)** 로 재정박한다.
+- **matched recall@10 ≈ 0.99, 검색 ~4.5×** (CAGRA 2.9 ms/340 QPS vs pgvector 12.8 ms/74 QPS — p50 4.4×, QPS 4.6×). **공정한 빌드 비교(같은 산출물 = pgvector HNSW)** = **CAGRA 빌드 + 변환 120 s vs pgvector native 237 s → ~2×** (120 s는 이미 CAGRA 빌드 62 s + 변환 58 s의 합이다). 순수 CAGRA 인덱스는 62 s에 빌드되나 *GPU 인덱스*라 pgvector HNSW와 동일 산출물이 아니므로 **빌드 스피드업으로 내세우지 않는다**(GPU 검색 경로의 셋업 비용일 뿐). 과거 real-embedding run(BENCHMARK.md §2.1: 4.4 ms vs 22 ms, 285 s)과 자릿수 일치.
+
+**데이터 정합성 정정(중요)**: 기존 문서의 **"빌드 13-14×"는 synthetic random 데이터**(1M×384; pgvector HNSW native가 918 s로 최악조건)에서 나온 값이며 real 임베딩에선 **~2×** 다. **"24× / 12 s"는 raw cuVS 라이브러리**(Postgres COPY·WAL·페이지 물성화 제외) 경계다. 둘 다 실사용자 end-to-end가 아니므로 **헤드라인에서 강등/제거**하고, canonical은 **real-embedding end-to-end(검색 ~4.5×, 빌드 ~2×)** 로 재정박한다.
 
 **한계(정직)**: 단일쿼리 serial 측정이라 QPS는 latency-bound — 배치/동시성(GPU throughput 강점)은 미측정. pgvector 절대치는 실행 환경에 따라 변동하나, 두 엔진을 **같은 환경·같은 도구**로 재므로 내부 비교는 공정.
 

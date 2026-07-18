@@ -26,9 +26,14 @@
 - **clustered synthetic에서 IVF 계열(VectorChord vchordrq) recall이 과도하게 높게 나온다.**
   실제 RAG 임베딩셋은 k-means로 설명되는 구조가 약해서 probes가 훨씬 높아야 동일 recall 달성.
 - **recall=1.0000(§13)은 synthetic random의 특성.** 실 데이터에서는 distance concentration으로
-  recall이 낮아지며, build speedup 수치와 달리 recall 수치는 재측정이 필요하다.
-- **build speedup(§13: 2.6x–15.8x)은 데이터 독립적.** CAGRA build/HNSW import 시간은
-  벡터 내용이 아닌 N·dim·M에 의존하므로 실 데이터에서도 유사한 speedup이 예상된다.
+  recall이 낮아지며, recall 수치는 재측정이 필요하다.
+- **build speedup(§13: 2.6x–15.8x)은 실 데이터로 전이되지 않는다.** CAGRA build/HNSW import의
+  *wall time* 자체는 벡터 내용이 아닌 N·dim·M에 의존해 데이터 독립적이지만, speedup *비율*은
+  분모인 pgvector HNSW build 시간이 데이터·설정에 따라 달라지므로 데이터 독립적이지 않다.
+  §16.2/§16.3 실측(Cohere 1024d, apples-to-apples: CAGRA build+import_hnsw로 pgvector HNSW를
+  만드는 경로 vs pgvector native build)에서 실제 speedup은 **~2.0×**다. synthetic
+  2.6x–15.8x는 dim=384·`maintenance_work_mem=2GB` pgvector baseline이 유난히 느린 조건에서
+  나온 수치이며 실사용 수치로 읽어서는 안 된다.
 - **latency crossover(N≈50K)는 synthetic clustered 기준.** 실 데이터의 클러스터 구조·dim
   분포에 따라 crossover 좌표가 달라질 수 있다.
 
@@ -205,10 +210,14 @@ concurrency=8, iso-recall target=0.95(미달 시 sweep 최대값 채택), `maint
 - **CAGRA latency floor가 N에 거의 불변.** dim=384에서 871→1,146→1,228→1,196 us (1k→1M).
   dim=1536에서도 1,605→**1,702 us** (100k→1M). HNSW는 dim 384: 224→13,700 us,
   dim 1536: 14,230→**14,969 us** → **latency crossover ≈ N 10k–100k** (**H1·H3 확인**).
-- **Build 우위가 N·dim 둘 다에서 계속 확대.** 9×(100k×384) → 13×(1M×384) → 20×(100k×1536)
-  → **36×(1M×1536)**. HNSW build은 1M×1536에서 **2,721s(45분)** — `maintenance_work_mem=2GB`
+- **Build 시간이 N·dim 둘 다에서 계속 벌어진다.** 9×(100k×384) → 13×(1M×384) → 20×(100k×1536)
+  → 36×(1M×1536). HNSW build은 1M×1536에서 **2,721s(45분)** — `maintenance_work_mem=2GB`
   한계로 디스크 spill 모드, dim 1536에서 내부 구조가 RAM을 초과. CAGRA는 A100 40GB에 전체를
-  올려 75s 완료 — **H2 확인, 스케일에서 격차 심화**.
+  올려 75s 완료 — **H2 확인, 스케일에서 격차 심화**. 단, 이 비율은 **bare CAGRA GPU 인덱스
+  build 시간 vs pgvector HNSW build 시간**을 비교한 것으로, 서로 다른 산출물(GPU 검색 경로 vs
+  CPU 검색 경로)이다 — GPU 검색 경로로 전환할 때의 setup 비용 이점이지 "pgvector HNSW를 더
+  빨리 만든다"는 apples-to-apples 수치가 아니다. 동일 산출물(pgvector HNSW) 기준 build 가속은
+  **~2×**(§16.2, CAGRA build+import_hnsw vs pgvector native, Cohere 1024d 실측)다.
 - **Recall도 1M×1536에서 CAGRA 압승.** CAGRA 0.995 vs HNSW 0.910 (둘 다 sweep 상한). HNSW는
   1M×1536에서 0.95 target 미달 — 빌드 품질 저하(spill) + 거리 집중 이중 영향. 100k×1536의
   근소 역전(HNSW 0.975 vs CAGRA 0.956)은 1M에서 완전히 뒤집힌다.
@@ -224,8 +233,10 @@ concurrency=8, iso-recall target=0.95(미달 시 sweep 최대값 채택), `maint
 N <~ 10k                            -> pgvector HNSW (CPU)
                                        단일 쿼리 latency + QPS 모두 압도적
 N >~ 100k  또는  dim >= 1536         -> pg_cuvs CAGRA (GPU)
-                                       latency 8–12×, build 9–36×, recall도 우위
-                                       N·dim이 클수록 격차 확대 (1M×1536: build 36×, latency 8.8×)
+                                       latency 8–12×, recall도 우위
+                                       build: bare-CAGRA 기준 9–36×(다른 산출물 비교 — 캐비어트는
+                                       위 §11 발견 참조) / pgvector HNSW 산출물 기준 ~2×(§16.2)
+                                       N·dim이 클수록 latency 격차 확대 (1M×1536: latency 8.8×)
 동시 QPS 목표 (소~중 N)              -> 단일 GPU daemon 천장(~1k QPS) 주의 → 멀티-GPU 필요
 동시 QPS 목표 (대규모 N)             -> HNSW 자체가 병목, CAGRA가 QPS도 우위
 ```
@@ -355,7 +366,11 @@ pilot crossover(§11)의 clustered 합성 데이터와 **다른 생성기**다. 
   distance concentration 현상으로 recall이 낮아지며, pgvector HNSW native 대비 import HNSW의
   recall 동등성은 별도 검증이 필요하다 (구조상 동일 index이므로 동등해야 하지만 실측 미완료).
 
-**build speedup은 데이터 독립적**: CAGRA build / HNSW import 시간은 벡터 내용이 아닌 N·dim·M에 의존하므로 speedup 수치(2.6x~15.8x)는 real data에서도 유사하게 유지될 것으로 예상.
+**build speedup 비율은 데이터 독립적이지 않다**: CAGRA build / HNSW import의 *wall time* 자체는
+벡터 내용이 아닌 N·dim·M에 의존하지만, speedup 수치(2.6x~15.8x)는 여기서 쓰인 dim=384 ·
+`maintenance_work_mem=2GB` pgvector baseline이 유난히 느려서 나온 값이다. real data(Cohere
+1024d) 실측은 §16.2/§16.3 참조 — 동일 방식(apples-to-apples, CAGRA build+import_hnsw vs
+pgvector native)으로 측정한 실제 speedup은 **~2.0×**다.
 
 모든 수치는 VM 실측값 (`bench/results/hnsw_import_bench.csv`, 2026-06-01)
 
@@ -504,9 +519,13 @@ max_vram_mb (daemon 시작 플래그):
 | pgvector HNSW | 0.9392 | 130 | 7.6ms | ef=80 |
 | pgvector IVFFlat | 0.9766 | 8.6 | 115ms | probes=128 |
 | pg_cuvs_import_hnsw (3I) | **0.9993** | 16.9 | 61ms | ef=512 |
-| cagra-hnsw-cpu (cuVS lib) | 0.9975 | 611¹ | 12ms | ef=512 |
 
-¹ cagra-hnsw-cpu는 12-core 배치 QPS; 단일 쿼리 latency는 p50=12ms.
+> **참고 (raw cuVS-library reference — NOT pg_cuvs end-to-end)**: cagra-hnsw-cpu(cuVS lib
+> 직접 호출, CPU search)는 recall@10=0.9975, QPS 611¹, p50=12ms. PostgreSQL COPY/IPC/WAL
+> 비용이 전부 제외된 라이브러리 단독 수치이므로 위 pg_cuvs/pgvector 행과 직접 비교(비율
+> 계산)하지 않는다.
+>
+> ¹ cagra-hnsw-cpu는 12-core 배치 QPS; 단일 쿼리 latency는 p50=12ms.
 
 ### 16.2 빌드 시간 비교 (1M×1024)
 
@@ -514,9 +533,18 @@ max_vram_mb (daemon 시작 플래그):
 |-----------|-----------|------|
 | pgvector HNSW native | 285s | m=16, ef=64, 16GB mem, 7 parallel workers |
 | **3I: CAGRA build + import_hnsw** | **142s** | CAGRA 85s + import_hnsw 57s |
-| cagra-hnsw (cuVS lib, CPU search) | **12s** | GPU build only; no PostgreSQL COPY overhead |
 
-**3I speedup: 2.0× vs pgvector native (1M×1024)**
+> **참고 (raw cuVS-library reference — NOT pg_cuvs end-to-end)**: cagra-hnsw(cuVS lib 직접
+> 호출, CPU search)는 GPU build only 12s — PostgreSQL COPY/IPC/WAL 비용이 전부 제외된
+> 수치이므로 위 pg_cuvs/pgvector 행과 직접 비교(비율 계산)하지 않는다.
+>
+> **주의 (baseline 정합)**: 위 285s는 이 섹션(anbench 하네스)의 개별 실측이다. 이후
+> `bench/results/pg_cuvsbench_1m.csv`(cuvs-bench 하네스, 종단 SQL, Cohere 1M×1024, ext 0.5.0)
+> 기준 pgvector native build는 **237s**로 별도 측정됐다 — 두 실측을 섞어서 비율 계산하지 말 것.
+> 그 하네스에서 apples-to-apples(동일 산출물=pgvector HNSW) build 가속은 CAGRA build+변환
+> 120s vs native 237s = **~2×**다.
+
+**3I speedup: 2.0× vs pgvector native (1M×1024, 이 섹션 285s 기준)**
 
 ### 16.3 synthetic vs real 비교
 
@@ -539,7 +567,8 @@ max_vram_mb (daemon 시작 플래그):
 
 - **pg_cuvs CAGRA GPU search**: 실 데이터 recall@10=0.991, p50=4.4ms — synthetic(0.978)보다 높음
 - **3I import**: recall@10=0.992 (ef=128), 2.0× build speedup — synthetic 결과를 실 데이터로 검증
-- **cagra-hnsw-cpu (cuVS lib)**: GPU 12s 빌드 후 CPU search, recall@10=0.985, 611 QPS (배치) — 가장 빠른 빌드
+- **cagra-hnsw-cpu (cuVS lib, raw library reference)**: GPU 12s 빌드 후 CPU search, recall@10=0.985,
+  611 QPS(배치) — PostgreSQL COPY/IPC/WAL 제외 수치, pg_cuvs 값과 직접 비교 금지
 - 실 데이터에서 IVFFlat(vchordrq)는 synthetic에서의 유리했던 clustered 구조 이점이 줄어들 것으로 예상
 
 ### 16.5 하네스

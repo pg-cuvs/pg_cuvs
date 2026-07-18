@@ -70,8 +70,9 @@ NOT re-scaled to a raw-kernel ratio by subtracting the shared floor. Two honest
 caveats when reading it: (1) searches are single-query and **serial**, so QPS is
 latency-bound; batch/concurrent clients would raise throughput (the GPU's
 strength, not measured here). (2) The build advantage is **data-dependent**: on
-real embeddings (Cohere 1M×1024) it is ~2× (pgvector native ~285 s vs 3I
-~120 s); much larger build ratios seen elsewhere in this repo come from
+real embeddings (Cohere 1M×1024) it is ~2× (pgvector native ~237 s vs the
+GPU-accelerated CAGRA-build+conversion ~120 s, both from
+`bench/results/pg_cuvsbench_1m.csv`); much larger build ratios seen elsewhere come from
 **synthetic random data**, where pgvector's HNSW build hits its worst case, and
 are not representative. This backend reports **only end-to-end Postgres numbers**
 — raw library-level timings that exclude the Postgres path are not a pg_cuvs

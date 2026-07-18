@@ -1191,10 +1191,9 @@ REINDEX INDEX t_hnsw;  -- pgvector 재빌드, LOGGED
 
 | 목표 | 수치 | 검증 방법 |
 |------|------|-----------|
-| 4A-1 완료 | CAGRA build ≤ 50s (현재 55s) | `EXPLAIN (ANALYZE)` build time + shm fallback integration test |
-| 4A-2 완료 | CAGRA build ≤ 35s (현재 55s, workers=4 기준) | 동일 + workers=0 동작 동일 확인 + parallel build integration test |
+| 4A 완료 (ADR-057/058/059) | backend 오버헤드 ~6.3s(단일) → ~3.7s(병렬). 원안 wall-clock 목표(4A-1 ≤50s / 4A-2 ≤35s)는 ADR-044 실측(GPU floor ~33–68s 지배)으로 도달 불가가 확인돼 폐기 — north-star는 backend 오버헤드 제거율 | `docs/profiling-results.md` §7/8/9 + self-NN 단일==병렬 5/5 + installcheck 15/15 + iso 2/2 |
 | 4B 현상 유지 | UNLOGGED import ~28s (변동 없음) | `EXPLAIN (ANALYZE)` import time, 기존 test suite regression 없음 |
-| 종합 (4A-2 + 4B, UNLOGGED) | 전체 ≤ 65s (현재 96s, native 285s 대비 4.4×) | end-to-end: CAGRA build + pg_cuvs_build_hnsw(nsw) + UNLOGGED import |
+| 종합 (apples-to-apples, 동일 산출물=pgvector HNSW, LOGGED) | CAGRA build+변환 ≈ 120s vs pgvector native build 237s → **~2×** (`bench/results/pg_cuvsbench_1m.csv`, Cohere 1M×1024 실측). 이전 "96s / native 285s 대비 4.4×"는 4A-2+4B **UNLOGGED**(crash-unsafe) 조합을 LOGGED native build와 잘못 대응시킨 값이므로 폐기 | end-to-end: CAGRA build + import_hnsw/import_cagra(LOGGED) vs pgvector native `CREATE INDEX` |
 
 ---
 

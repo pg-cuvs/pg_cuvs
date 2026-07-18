@@ -179,29 +179,35 @@ this project does not report raw cuVS-library timings that exclude the Postgres 
 
 #### 2.1a Re-measured via cuvs-bench (NVIDIA's tool, ext 0.5.0, 2026-07-16)
 
-Same dataset, re-run inside NVIDIA's own
-[cuvs-bench](https://docs.nvidia.com/cuvs/) through a first-of-its-kind Postgres
-backend (`BenchmarkOrchestrator(backend_type="pg")` — see
+Same dataset as §2.1, but §2.1 above is the earlier anbench `run_cohere.sh` run
+while this is a fresh run inside NVIDIA's own
+[cuvs-bench](https://docs.nvidia.com/cuvs/) on ext 0.5.0 (different harness/date,
+hence slightly different absolute numbers — same ~2× build / ~4.5× search story),
+through a first-of-its-kind Postgres backend (`BenchmarkOrchestrator(backend_type="pg")` — see
 [ADR-080](design/DECISIONS.md) and [`bench/cuvs_bench_backend/`](bench/cuvs_bench_backend/)).
 19-point Pareto in [`bench/results/pg_cuvsbench_1m.csv`](bench/results/pg_cuvsbench_1m.csv):
 
 | index | serves on | recall@10 (best) | p50 | QPS | build |
 |-------|-----------|----------:|----:|----:|------:|
-| pg_cuvs CAGRA | GPU | 0.9992 (cuvs.k=400) | 2.9 ms | 344 | **62 s** |
-| pgvector HNSW (native) | CPU | 0.9884 (ef=400) | 13.2 ms | 72 | 237 s |
-| CAGRA build → pgvector HNSW conversion | CPU | 0.9993 (ef=512) | 30.5 ms | 31 | **120 s** |
+| pg_cuvs CAGRA | GPU | 0.999 (cuvs.k=400) | 2.9 ms | 340 | **62 s** |
+| pgvector HNSW (native) | CPU | 0.988 (ef=400) | 12.8 ms | 74 | 237 s |
+| CAGRA build → pgvector HNSW conversion | CPU | 0.9994 (ef=512) | 31.2 ms | 31 | **120 s** |
 
-Two honest comparisons, by use case (all **end-to-end SQL** — parse/plan + shm IPC +
-GPU kernel + heap fetch — the number a PostgreSQL application actually sees):
+Two honest results (all **end-to-end SQL** — parse/plan + shm IPC + GPU kernel +
+heap fetch — the number a PostgreSQL application actually sees):
 
-- **Want GPU search** → build a CAGRA index: **~3.8× faster build** (62 s vs 237 s)
-  **and ~5× faster search** (2.9 ms vs 13.2 ms p50, 344 vs 72 QPS) at matched
-  recall ≈ 0.99.
-- **Want CPU serving** → have the GPU build a pgvector HNSW index for you (CAGRA
-  build, then convert the graph into pgvector HNSW pages): **~2× faster build**
-  (120 s vs 237 s), after which queries run on ordinary pgvector HNSW. This is
-  slower to build than a bare CAGRA index because it also materializes the
-  CPU-servable pgvector index.
+- **Search (GPU path)** → CAGRA index: at matched recall ≈ 0.99, **~4.5× faster**
+  than pgvector HNSW (2.9 ms / 340 QPS vs 12.8 ms / 74 QPS — p50 4.4×, QPS 4.6×,
+  from `pg_cuvsbench_1m.csv`). The CAGRA index itself builds in 62 s, but that is a
+  *GPU* index — not a like-for-like
+  substitute for a pgvector HNSW — so it is **not** a build-vs-pgvector comparison,
+  just the setup cost for the GPU-search path.
+- **Build the SAME index, faster (CPU path)** → have the GPU build a pgvector HNSW
+  for you: **CAGRA build + conversion = 120 s vs pgvector native 237 s → ~2×**,
+  after which queries run on ordinary pgvector HNSW. This is the apples-to-apples
+  build comparison — identical output artifact (a pgvector HNSW index). It is
+  slower than a bare CAGRA build because it also materializes that CPU-servable
+  index. (The 120 s already includes the CAGRA build; it is not conversion-only.)
 
 ### 2.2 Synthetic crossover pilot — where the line is
 

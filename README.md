@@ -73,7 +73,7 @@ If the GPU service dies, PostgreSQL **gracefully degrades** to CPU-based pgvecto
 
 | Index | Storage | Use Case |
 |-------|---------|----------|
-| `USING cagra` | GPU VRAM | Approximate NN, low latency (~1.5 ms), hot data, fits in GPU VRAM |
+| `USING cagra` | GPU VRAM | Approximate NN, low latency (~2.9 ms p50 end-to-end at 1M×1024 real; ~1.5 ms at 384-dim), hot data, fits in GPU VRAM |
 | `USING flat` | GPU VRAM (`.vectors` only, no graph) | Exact GPU brute-force (recall=1.0), read-heavy/stable corpora; first-class BF AM (v0.4.0, ADR-073) |
 | `USING ivfpq` | GPU VRAM (compressed) | Approximate NN, 10–100x VRAM savings vs cagra via product quantization |
 | `USING pg_cuvs_hnsw` (built from heap, or reuses a `USING cagra` source) | GPU build / CPU serve | Faster GPU-accelerated build (~2× vs pgvector on real embeddings, higher on synthetic), then served by pgvector HNSW on CPU |
@@ -129,17 +129,30 @@ Implemented on GCP (NVIDIA A100-40GB × 2, PostgreSQL 16), VM E2E verified:
 - [x] Multi-GPU sharding (`shard_count`), GCS snapshot restore (Phase 3G)
 - [x] MIG verified (no code changes needed)
 
-Benchmark results (A100-40GB, 1M×384, VM E2E, **synthetic random data**):
+Benchmark results — **real embeddings, Cohere Wikipedia 1M×1024, end-to-end SQL, measured inside NVIDIA's cuvs-bench** (A100-40GB, ext 0.5.0; raw: [`bench/results/pg_cuvsbench_1m.csv`](bench/results/pg_cuvsbench_1m.csv)):
+
+| Path | Build | p50 @ recall≈0.99 | QPS | vs pgvector |
+|------|------:|------------------:|----:|-------------|
+| pgvector HNSW (CPU, native) | 237s | 12.8ms | 74 | baseline |
+| pg_cuvs CAGRA (GPU search) | 62s† | 2.9ms | 340 | **search ~4.5×** |
+| CAGRA build → pgvector HNSW (GPU build, CPU serve) | 120s | served as pgvector HNSW | — | **build ~2×** |
+
+† The 62s CAGRA build produces a *GPU* index (a different artifact from a pgvector HNSW), so it is the setup cost of the GPU-search path — **not** a build-vs-pgvector claim. The apples-to-apples build win is the ~2× row: CAGRA build + conversion = 120s vs pgvector native 237s, both producing a pgvector HNSW index.
+
+<details><summary>Synthetic worst-case (1M×384 random) — pgvector's HNSW build stresses here; NOT representative of real embeddings</summary>
 
 | Method | Build time | p50 latency | Recall@10 |
 |--------|-----------|-------------|-----------|
 | pgvector HNSW (native) | 918s | — | baseline |
-| CAGRA build + HNSW import | **66s** | 1.65ms | 1.0000* |
+| CAGRA build + HNSW conversion | 66s | 1.65ms | 1.0000* |
 | pg_cuvs CAGRA search | 27s build | 1.65ms | 0.978** |
 
-\* recall=1.0000 on synthetic random data (uniform distribution); expect lower on real embeddings.  
-\*\* 0.978 on synthetic clustered data (20 clusters, sigma=0.05). Real embedding datasets pending.  
-See [`BENCHMARK.md`](BENCHMARK.md) for the latency decomposition, the Cohere 1M×1024 real-embedding comparison, and the filtered-search selectivity sweep; `design/BENCHMARK_CROSSOVER.md` for full crossover methodology.
+\* recall=1.0000 on synthetic random data (uniform distribution).  
+\*\* 0.978 on synthetic clustered data (20 clusters, sigma=0.05).  
+On synthetic **random** data pgvector's native HNSW build is pathologically slow (918s), which inflates the build ratio to ~13.9× — that is pgvector's worst case, not the real-embedding figure (~2×). GPU CAGRA build is content-independent, so its advantage balloons on random data.
+</details>
+
+See [`BENCHMARK.md`](BENCHMARK.md) for the latency decomposition, the full Cohere 1M×1024 Pareto, and the filtered-search selectivity sweep; `design/BENCHMARK_CROSSOVER.md` for crossover methodology.
 
 ## Roadmap
 
