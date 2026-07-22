@@ -96,6 +96,26 @@ def _write_ibin(path, arr):
         f.write(a.tobytes())
 
 
+def _read_ibin(path):
+    """Read a big-ann .ibin (uint32 n, uint32 dim, int32 data) as an (n, dim) array."""
+    with open(path, "rb") as f:
+        n, d = struct.unpack("<II", f.read(8))
+        return np.frombuffer(f.read(n * d * 4), dtype=np.int32).reshape(n, d)
+
+
+def _recall_at_k(neighbors, gt, k):
+    """recall@k: mean over queries of |returned_topk ∩ gt_topk| / k. neighbors and
+    gt are in the same id space (corpus row index). gt may carry >k columns; only
+    its first k are the true top-k."""
+    nq = min(len(neighbors), len(gt))
+    if nq == 0 or k == 0:
+        return 0.0
+    hits = 0
+    for i in range(nq):
+        hits += len(set(neighbors[i, :k].tolist()) & set(gt[i, :k].tolist()))
+    return hits / float(nq * k)
+
+
 # ── config loader ────────────────────────────────────────────────────────────
 class PgConfigLoader(ConfigLoader):
     """Produce a DatasetConfig + one BenchmarkConfig per (algo, sweep-param).
@@ -293,13 +313,18 @@ class PgBackend(BenchmarkBackend):
                                 metadata={}, success=False, error_message=repr(e))
         total_s = float(sum(lat))
         p50, p95, p99 = percentiles_ms(lat)
-        # neighbors carry real ids -> orchestrator computes recall vs gt.
+        # neighbors carry real ids (corpus row index == gt id space). This
+        # cuvs-bench version has the orchestrator report result.recall as-is
+        # (Python-native backends compute their own recall from the ground
+        # truth), so compute recall@k here rather than leaving a 0.0 placeholder.
+        nbr = np.asarray(ids[:, :k], dtype=np.int64)
+        recall = _recall_at_k(nbr, _read_ibin(dataset.groundtruth_neighbors_file), k)
         return SearchResult(
-            neighbors=np.asarray(ids[:, :k], dtype=np.int64),
+            neighbors=nbr,
             distances=np.full((nq, k), -1.0, dtype=np.float32),
             search_time_ms=total_s * 1000.0,
             queries_per_second=(nq / total_s if total_s > 0 else 0.0),
-            recall=0.0, algorithm=algo,
+            recall=recall, algorithm=algo,
             search_params=[{"param": param, "k": k}],
             latency_percentiles={"p50_ms": p50, "p95_ms": p95, "p99_ms": p99},
             metadata={"n_queries": nq, "algo": algo, "param": param},
