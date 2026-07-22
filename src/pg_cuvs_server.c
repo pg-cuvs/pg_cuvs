@@ -102,6 +102,9 @@ typedef struct IndexEntry {
     uint32_t        dim;
     uint32_t        metric;
     int64_t         n_vecs;
+    int             graph_degree;  /* CAGRA graph_degree for VRAM estimation; set at
+                                    * build (cmd->graph_degree, 0 => default 64). Not
+                                    * persisted: cold reload falls back to 64. */
     CuvsCagraIndex  handle;       /* cuVS opaque index (unsharded only; NULL if sharded) */
     uint64_t       *tids;         /* global TID array [n_vecs] (shared by all shards) */
 
@@ -217,6 +220,10 @@ reset_entry_stats(IndexEntry *e)
      * through reset_entry_stats, so this clears a reused slot's stale is_flat;
      * the flat build/load paths set is_flat = 1 AFTER calling reset_entry_stats. */
     e->is_flat            = 0;
+    /* Default graph_degree to 0 (=> estimate_vram_bytes treats as cuVS default
+     * 64), clearing a reused slot's stale value. CAGRA build paths set the real
+     * cmd->graph_degree AFTER this call; flat/ivfpq/reload leave it 0. */
+    e->graph_degree       = 0;
 }
 
 /* Record a completed search on an entry. Caller MUST hold g_index_mutex. */
@@ -568,10 +575,16 @@ warmup_worker_thread(void *arg)
  * VRAM helpers
  * ---------------------------------------------------------------- */
 static size_t
-estimate_vram_bytes(int64_t n_vecs, int dim)
+estimate_vram_bytes(int64_t n_vecs, int dim, int graph_degree)
 {
-    /* CAGRA graph: ~16 edges × 4 bytes per node, plus float vectors */
-    return (size_t)n_vecs * ((size_t)dim * sizeof(float) + 16 * 4);
+    /* CAGRA graph: graph_degree edges × 4 bytes (uint32 adjacency) per node,
+     * plus float vectors. graph_degree <= 0 means "cuVS default" (64) — mirrors
+     * the >0 ? : 64 mapping in cuvs_wrapper.cu and the reloption default in
+     * pg_cuvs.c. Reload/extend/compact paths that lack the per-index degree pass
+     * 64 (the default); a non-default-degree index reloaded after a daemon
+     * restart is estimated at 64 (graph_degree is not persisted in .tids/.shards). */
+    int gd = graph_degree > 0 ? graph_degree : 64;
+    return (size_t)n_vecs * ((size_t)dim * sizeof(float) + (size_t)gd * 4);
 }
 
 static size_t
@@ -1363,7 +1376,8 @@ load_index_sharded(uint32_t db_oid, uint32_t index_oid,
     int i;
     for (i = 0; i < sc; i++)
     {
-        size_t needed = estimate_vram_bytes(recs[i].n_vecs, (int)recs[i].dim);
+        /* cold reload: graph_degree not persisted in .shards -> default 64 */
+        size_t needed = estimate_vram_bytes(recs[i].n_vecs, (int)recs[i].dim, 64);
         int    dev    = usable_gpu(i % n_gpus);   /* re-place on reload */
         if (ensure_vram(needed, dev) != 0)
         {
@@ -1634,7 +1648,8 @@ load_index(uint32_t db_oid, uint32_t index_oid)
      * path as build, so a search miss on a non-resident index reloads it by
      * evicting the least-recently-used one. If it still won't fit after full
      * eviction, skip (caller falls back to CPU). */
-    size_t needed = estimate_vram_bytes(n_vecs, (int)dim);
+    /* cold reload: graph_degree not persisted in .tids -> default 64 */
+    size_t needed = estimate_vram_bytes(n_vecs, (int)dim, 64);
     int target_gpu = pick_gpu_for_index(needed);
     if (target_gpu < 0)
     {
@@ -4103,7 +4118,7 @@ build_sharded(int client_fd, const CuvsCmdFrame *cmd, const char *index_dir,
     for (i = 0; i < sc; i++)
     {
         int64_t shard_n = base + (i < rem ? 1 : 0);
-        size_t  needed  = estimate_vram_bytes(shard_n, (int)dim);
+        size_t  needed  = estimate_vram_bytes(shard_n, (int)dim, (int)cmd->graph_degree);
         int     dev     = usable_gpu(i % n_gpus);   /* round-robin spread */
 
         shard_cagra_path(shard_final[i], 512, save_dir,
@@ -4615,7 +4630,7 @@ handle_build(int client_fd, const CuvsCmdFrame *cmd)
     /* VRAM accounting: cuvs_cagra_build allocates BEFORE we free the old
      * index, so peak VRAM = existing + new. Ask for full 'needed' from
      * ensure_vram regardless of same-OID replacement. */
-    size_t needed = estimate_vram_bytes(cmd->n_vecs, (int)cmd->dim);
+    size_t needed = estimate_vram_bytes(cmd->n_vecs, (int)cmd->dim, (int)cmd->graph_degree);
     int target_gpu = pick_gpu_for_index(needed);
     if (target_gpu < 0)
     {
@@ -4930,6 +4945,7 @@ finish_build_commit(int client_fd, const CuvsCmdFrame *cmd, const char *save_dir
         if (existing->ivfpq_handle) { cuvs_ivfpq_free(existing->ivfpq_handle, existing->gpu_device_id); existing->ivfpq_handle = NULL; }
         existing->last_search_mode = 0;
         reset_entry_stats(existing);   /* fresh index instance */
+        existing->graph_degree = (int)cmd->graph_degree;  /* for extend/compact VRAM est */
         existing->n_extended = 0;      /* REINDEX resets the extend counter */
         existing->compact_count++;     /* every rebuild counts as a compaction */
         existing->last_compact_at = time(NULL);
@@ -4994,6 +5010,7 @@ finish_build_commit(int client_fd, const CuvsCmdFrame *cmd, const char *save_dir
          * handle_build and handle_build_multi (both finalize through here). */
         build_rev_tid_map(e);
         reset_entry_stats(e);
+        e->graph_degree = (int)cmd->graph_degree;  /* for extend/compact VRAM est */
     }
 
     pthread_mutex_unlock(&g_index_mutex);
@@ -5248,7 +5265,7 @@ handle_build_multi(int client_fd, const CuvsCmdFrame *cmd, const char *index_dir
     /* Single shard: direct multi-H2D — the ADR-059 win (no host corpus copy). */
     pthread_mutex_lock(&g_index_mutex);
     {
-        size_t needed = estimate_vram_bytes(total, (int)cmd->dim);
+        size_t needed = estimate_vram_bytes(total, (int)cmd->dim, (int)cmd->graph_degree);
         int    target_gpu = pick_gpu_for_index(needed);
         CuvsCagraIndex new_handle;
         uint32_t tids_gen;
@@ -6676,7 +6693,7 @@ handle_extend(int client_fd, const CuvsCmdFrame *cmd)
      * Cannot call ensure_vram here: evict_lru shifts g_indexes[], invalidating
      * this IndexEntry *e pointer.  A budget-only check is sufficient — the
      * backend falls through to delta on BUILD_FAILED (pg_cuvs.c:3029). */
-    size_t new_vram   = estimate_vram_bytes(old_n + n_new, (int)e->dim);
+    size_t new_vram   = estimate_vram_bytes(old_n + n_new, (int)e->dim, e->graph_degree);
     size_t delta_vram = (new_vram > e->vram_bytes) ? new_vram - e->vram_bytes : 0;
     int    dev        = (int)e->gpu_device_id;
     if (delta_vram > 0 &&
@@ -6724,7 +6741,7 @@ handle_extend(int client_fd, const CuvsCmdFrame *cmd)
 
     e->n_vecs     += n_new;
     e->n_extended += n_new;
-    e->vram_bytes  = estimate_vram_bytes(e->n_vecs, (int)e->dim);
+    e->vram_bytes  = estimate_vram_bytes(e->n_vecs, (int)e->dim, e->graph_degree);
 
     /* Rebuild rev_tids to include new item_ids (needed for 3O prefilter). */
     free(e->rev_tids);     e->rev_tids     = NULL;
@@ -6915,7 +6932,7 @@ handle_compact(int client_fd, const CuvsCmdFrame *cmd)
     e->n_extended       = 0;
     e->compact_count++;
     e->last_compact_at  = time(NULL);
-    e->vram_bytes  = estimate_vram_bytes(new_n, (int)e->dim);
+    e->vram_bytes  = estimate_vram_bytes(new_n, (int)e->dim, e->graph_degree);
 
     cuvs_cagra_free(old_handle, (int)e->gpu_device_id);
 

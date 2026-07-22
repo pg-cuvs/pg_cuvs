@@ -3102,6 +3102,14 @@ cuvs_merge_delta(CuvsScanState *ss, Oid index_oid, const float *query,
     if (fd < 0)
         return;     /* no delta -> base-only (matches the plan gate) */
 
+    /* ADR-077: shared lock so a concurrent writer's LOCK_EX (cuvs_delta_append,
+     * body-then-header ordering) completes before we read fsize/header. Without
+     * it a torn append is observed as fsize > hdr.n_rows and errors "delta
+     * sidecar unusable mid-scan". flock releases when fd is closed on every exit
+     * path below (no explicit LOCK_UN needed). */
+    while (flock(fd, LOCK_SH) != 0 && errno == EINTR)
+        ;
+
     fsize = lseek(fd, 0, SEEK_END);
     if (cuvs_pread_all(fd, 0, &hdr, sizeof(hdr)) != 0
         || hdr.magic != CUVS_DELTA_MAGIC || hdr.version != CUVS_DELTA_VERSION
@@ -3207,6 +3215,11 @@ cuvs_merge_delta_filtered(Oid index_oid, const float *query,
     fd = OpenTransientFile(path, O_RDONLY | PG_BINARY);
     if (fd < 0)
         return;
+
+    /* ADR-077: shared lock (see cuvs_merge_delta) — wait out a concurrent
+     * writer's LOCK_EX so we never read a torn append. Released on fd close. */
+    while (flock(fd, LOCK_SH) != 0 && errno == EINTR)
+        ;
 
     fsize = lseek(fd, 0, SEEK_END);
     if (cuvs_pread_all(fd, 0, &hdr, sizeof(hdr)) != 0
