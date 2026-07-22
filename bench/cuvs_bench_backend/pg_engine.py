@@ -159,6 +159,22 @@ class PgEngine:
             cur.execute(f"SELECT pg_relation_size('{name}')")
             return cur.fetchone()[0]
 
+    def _vram_bytes(self, name):
+        """Daemon-resident VRAM footprint (bytes) for a GPU-resident index.
+
+        A CAGRA/flat graph lives in the sidecar daemon's VRAM, not a Postgres
+        relation, so pg_relation_size() returns 0 for it. pg_stat_gpu_search
+        exposes the daemon's self-accounted vram_bytes, populated at build time
+        (no search required). Returns None if the daemon is down or the index is
+        not resident (empty result set)."""
+        with self.conn.cursor() as cur:
+            cur.execute(
+                "SELECT vram_bytes FROM pg_stat_gpu_search "
+                "WHERE index_oid = %s::regclass",
+                (name,))
+            row = cur.fetchone()
+        return int(row[0]) if row and row[0] is not None else None
+
     # -- build -----------------------------------------------------------------
     def build(self, algo, n, sample_query=None):
         """Build the index for `algo`. Returns (build_time_s, index_bytes).
@@ -189,7 +205,16 @@ class PgEngine:
             c.execute("SET maintenance_work_mem = '8GB'")
             t0 = time.perf_counter()
             c.execute("CREATE INDEX t_cagra ON t USING cagra (embedding vector_l2_ops)")
-            return time.perf_counter() - t0, self._relsize("t_cagra")
+            bt = time.perf_counter() - t0
+            # CAGRA graph is VRAM-resident (pg_relation_size == 0); report the
+            # daemon's self-accounted VRAM footprint instead (issue #75).
+            vram = self._vram_bytes("t_cagra")
+            if vram is None:
+                print("[engine] WARN: no pg_stat_gpu_search row for t_cagra "
+                      "(daemon down / not resident); index_bytes falls back to 0",
+                      flush=True)
+                vram = self._relsize("t_cagra")
+            return bt, vram
 
         # pgcuvs_hnsw_import (3I): GPU CAGRA build -> pg_cuvs_build_hnsw(cagra, mode).
         # The unified 0.5.0 API (ADR-037) creates the pgvector HNSW index directly
