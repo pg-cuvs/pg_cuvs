@@ -7057,9 +7057,42 @@ connection_thread(void *arg)
     fflush(stderr);
 
     CuvsCmdFrame cmd;
-    if (recv_all(client_fd, &cmd, sizeof(cmd)) < 0)
+
+    /* #77: read the protocol prologue (magic + version) first, then the rest.
+     * An extension built from an older header sends a SHORTER frame, so reading
+     * sizeof(cmd) in one call would block forever on bytes that never arrive.
+     * Validating the prologue turns a wire-protocol skew into an immediate,
+     * named error instead of a silent struct misinterpretation. */
+    const size_t prologue = offsetof(CuvsCmdFrame, op);
+
+    if (recv_all(client_fd, &cmd, prologue) < 0)
     {
-        LOG_ERROR("pg_cuvs_server: recv_all CMD failed (errno=%d)\n", errno);
+        LOG_ERROR("pg_cuvs_server: recv_all CMD prologue failed (errno=%d)\n", errno);
+        fflush(stderr);
+        close(client_fd);
+        return NULL;
+    }
+
+    if (cmd.proto_magic != CUVS_PROTO_MAGIC
+        || cmd.proto_version != CUVS_PROTO_VERSION)
+    {
+        char msg[128];
+        snprintf(msg, sizeof(msg),
+                 "IPC protocol mismatch: daemon speaks magic 0x%08x v%u, "
+                 "client sent 0x%08x v%u; co-deploy extension and daemon",
+                 CUVS_PROTO_MAGIC, CUVS_PROTO_VERSION,
+                 cmd.proto_magic, cmd.proto_version);
+        LOG_ERROR("pg_cuvs_server: %s\n", msg);
+        fflush(stderr);
+        send_error_code(client_fd, CUVS_STATUS_PROTO_MISMATCH, msg);
+        close(client_fd);
+        return NULL;
+    }
+
+    if (recv_all(client_fd, (char *)&cmd + prologue,
+                 sizeof(cmd) - prologue) < 0)
+    {
+        LOG_ERROR("pg_cuvs_server: recv_all CMD body failed (errno=%d)\n", errno);
         fflush(stderr);
         close(client_fd);
         return NULL;

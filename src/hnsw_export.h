@@ -41,6 +41,7 @@ Datum pg_cuvs_build_hnsw(PG_FUNCTION_ARGS);
  */
 void  cuvs_hnsw_init_reloptions(void);
 Datum pg_cuvs_hnsw_handler(PG_FUNCTION_ARGS);
+void  cuvs_report_proto_mismatch(int rc);
 
 /*
  * Phase 3K: shared heap-scan + CAGRA build (defined in pg_cuvs.c). Used by

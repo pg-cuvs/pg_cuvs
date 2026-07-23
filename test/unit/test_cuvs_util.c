@@ -100,9 +100,33 @@ test_parse_index_filename(void)
            "reject shard artifact .s015.cagra");
 }
 
+/*
+ * #77: the daemon reads offsetof(CuvsCmdFrame, op) bytes, validates the magic
+ * and version, and only then reads the rest. That two-stage read is what turns
+ * a daemon/extension skew into a named error instead of a silently
+ * misinterpreted struct — so the layout it depends on is pinned here.
+ */
+static void
+test_proto_frame_layout(void)
+{
+    ASSERT(offsetof(CuvsCmdFrame, proto_magic) == 0,
+           "proto_magic must be the first frame field");
+    ASSERT(offsetof(CuvsCmdFrame, proto_version) == sizeof(uint32_t),
+           "proto_version must directly follow proto_magic");
+    ASSERT(offsetof(CuvsCmdFrame, op) == 2 * sizeof(uint32_t),
+           "op must follow the 8-byte protocol prologue");
+
+    /* Reverse-direction detection: an old daemon reads our magic as `op`, so
+     * the magic must not collide with any op code it might dispatch on. */
+    ASSERT(CUVS_PROTO_MAGIC > 1000u, "magic must not collide with an op code");
+    ASSERT(CUVS_PROTO_VERSION >= 1u, "protocol version starts at 1");
+}
+
 static void
 test_status_str(void)
 {
+    ASSERT(strcmp(cuvs_status_str(CUVS_STATUS_PROTO_MISMATCH), "proto_mismatch") == 0,
+           "status proto_mismatch");
     ASSERT(strcmp(cuvs_status_str(CUVS_STATUS_OK), "ok") == 0, "status ok");
     ASSERT(strcmp(cuvs_status_str(CUVS_STATUS_ERROR), "error") == 0, "status error");
     ASSERT(strcmp(cuvs_status_str(CUVS_STATUS_OOM_FALLBACK), "oom_fallback") == 0,
@@ -165,6 +189,36 @@ test_circuit_breaker(void)
     cuvs_circuit_reset_all();
     ASSERT(cuvs_circuit_is_open(1) == 0, "reset_all clears oid 1");
     ASSERT(cuvs_n_circuit_breakers == 0, "reset_all count back to zero");
+}
+
+static void
+test_circuit_breaker_status_classification(void)
+{
+    const uint32_t oid = 8;
+    const int threshold = 2;
+
+    /* Given a fresh breaker, user/config and cancellation statuses are neutral. */
+    cuvs_circuit_reset_all();
+
+    /* When each neutral status is recorded. */
+    cuvs_circuit_record_status(oid, threshold, CUVS_STATUS_OK);
+    cuvs_circuit_record_status(oid, threshold, CUVS_STATUS_CANCELED);
+    cuvs_circuit_record_status(oid, threshold, CUVS_STATUS_DIM_MISMATCH);
+    cuvs_circuit_record_status(oid, threshold, CUVS_STATUS_METRIC_MISMATCH);
+    cuvs_circuit_record_status(oid, threshold, CUVS_STATUS_STALE);
+    cuvs_circuit_record_status(oid, threshold, CUVS_STATUS_NO_VECTORS);
+
+    /* Then they do not consume the error budget. */
+    ASSERT(cuvs_n_circuit_breakers == 0, "neutral statuses do not create breaker state");
+
+    /* Given repeatable daemon failures. */
+    cuvs_circuit_record_status(oid, threshold, CUVS_STATUS_PROTO_MISMATCH);
+
+    /* When the threshold is reached by another repeatable failure. */
+    cuvs_circuit_record_status(oid, threshold, CUVS_STATUS_UNAVAILABLE);
+
+    /* Then the breaker opens for the affected index. */
+    ASSERT(cuvs_circuit_is_open(oid) == 1, "repeatable search statuses trip breaker");
 }
 
 static void
@@ -1019,8 +1073,10 @@ main(void)
 {
     test_tid_roundtrip();
     test_parse_index_filename();
+    test_proto_frame_layout();
     test_status_str();
     test_circuit_breaker();
+    test_circuit_breaker_status_classification();
     test_crc32();
     test_tids_roundtrip();
     test_tids_rejections();

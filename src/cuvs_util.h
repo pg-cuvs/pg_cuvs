@@ -424,6 +424,7 @@ extern CuvsCircuitBreaker cuvs_circuit_breakers[CUVS_MAX_TRACKED_INDEXES];
 extern int                cuvs_n_circuit_breakers;
 
 void cuvs_circuit_record_error(uint32_t index_oid, int threshold);
+void cuvs_circuit_record_status(uint32_t index_oid, int threshold, int status);
 void cuvs_circuit_record_success(uint32_t index_oid); /* reset consecutive_errors */
 void cuvs_circuit_reset(uint32_t index_oid);          /* also clears open flag */
 int  cuvs_circuit_is_open(uint32_t index_oid);

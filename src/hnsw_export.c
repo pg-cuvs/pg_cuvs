@@ -637,9 +637,12 @@ fill_hnsw_from_hnswlib(Oid cagra_oid, Oid hnsw_oid, bool use_shm)
         int shm_rc = cuvs_ipc_export_hnsw_shm(
             cuvs_socket_path, db_oid, index_oid, hnsw_path, sizeof(hnsw_path));
         if (shm_rc != CUVS_STATUS_OK)
+        {
+            cuvs_report_proto_mismatch(shm_rc);
             ereport(ERROR,
                     (errmsg("pg_cuvs: export_hnsw_shm failed (status=%d); "
                             "ensure cagra index %u is loaded in daemon", shm_rc, cagra_oid)));
+        }
         /* .tids comes from the regular index_dir sidecar */
         snprintf(tids_path, sizeof(tids_path), "%s/%u_%u.tids", idir, db_oid, index_oid);
     }
@@ -1390,6 +1393,7 @@ fill_hnsw_from_cagra_ipc(Oid cagra_oid, Oid hnsw_oid, const char *mode)
 
     if (rc != CUVS_STATUS_OK)
     {
+        cuvs_report_proto_mismatch(rc);
         ereport(ERROR,
                 (errmsg("pg_cuvs: IPC export_adjacency failed (status=%d); "
                         "ensure index %u is loaded in daemon", rc, cagra_oid)));

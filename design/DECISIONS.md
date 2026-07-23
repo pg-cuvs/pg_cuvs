@@ -3212,3 +3212,23 @@ SVFusion(VLDB'26, PCIe A100)이 CAGRA/GGNN가 **UVM(demand paging)에서 크게 
 **도출 액션**: 1. `rapidsai/cuvs` upstream PR(백엔드 기여). 2. 7/23 NVIDIA 체크인 지참(19-point Pareto + 방법론). 3.(백로그) throughput/동시성 arm — GPU throughput 실측. 4.(백로그) 3O recall-ceiling arm(ADR-079).
 
 **관련**: ADR-062(에코시스템 진입 Stage 2), ADR-069(벤치 방법론), ADR-037(`pg_cuvs_build_hnsw` 통합 API), ADR-078/079(NVIDIA 정렬·외부검증). 산출물: `bench/cuvs_bench_backend/{backend.py,run_pg_cuvsbench.py,pg_engine.py,README.md}`, `bench/results/pg_cuvsbench_1m*.csv`.
+
+---
+
+## ADR-081 — IPC 프로토콜 버전 핸드셰이크: 데몬/확장 skew를 조용한 오해석에서 즉시 거부로
+
+**날짜**: 2026-07-23
+**상태**: 구현 완료 (#77)
+
+**배경**: `CuvsCmdFrame`은 **꼬리에 필드를 덧붙이는** 방식으로 확장돼 왔다(`cuvs_ipc.h:117` "appended at end to preserve ABI", `:194,200` "co-deploy daemon+extension"). 따라서 `.so`와 `pg_cuvs_server`가 서로 다른 리비전의 헤더로 빌드되면 **프레임 레이아웃과 `sizeof(CuvsCmdFrame)`이 동시에 어긋난다**. 그런데 와이어에 버전 필드도 핸드셰이크도 없어서, skew가 나면 데몬이 받은 바이트를 그냥 재해석한다 — 깨끗한 실패가 아니라 **조용히 틀린 답**이다. `make install`만 하고 `make install-server`를 빠뜨리는 부분 배포가 이 상태를 만든다(관례가 강제되지 않음).
+
+**결정**:
+1. **매직·버전을 프레임의 첫 두 필드로 둔다** (`proto_magic`=0x50435556, `proto_version`). 꼬리가 아니라 **머리**에 두는 것이 핵심 — 양방향 검출이 공짜로 따라온다. 구버전 확장 → 신버전 데몬: 매직 자리에 구프레임의 `op`(1~22)가 들어와 불일치로 거부. 신버전 확장 → 구버전 데몬: 구데몬이 매직을 `op`로 읽어 기존 `default: "unknown op"` 경로로 거부.
+2. **데몬은 2단으로 읽는다** — 먼저 `offsetof(CuvsCmdFrame, op)`(8바이트) 프롤로그만 읽어 검증하고, 통과한 경우에만 나머지를 읽는다. 한 번에 `sizeof(cmd)`를 읽으면 **더 짧은 프레임을 보내는 구버전 클라이언트를 기다리며 영원히 블록**된다. 즉 2단 읽기가 "조용한 오해석"을 "즉시 거부"로 바꾸는 실제 장치다.
+3. **송신은 단일 관문 `send_cmd()`** 를 통과한다(24개 송신 지점 전부 교체). 새 op을 추가할 때 매직/버전 스탬핑을 빠뜨릴 수 없다.
+4. **`CUVS_STATUS_PROTO_MISMATCH`(12)** 신설. 데몬은 사람이 읽을 수 있는 메시지와 함께 이 상태로 응답하고, 확장은 기존 관례대로 `ereport(ERROR)` + 서킷 브레이커 오픈 → 다음 쿼리는 CPU로 재계획된다(가용성 유지). 힌트는 조치를 직접 지시한다: `make install && make install-server` 후 데몬 재기동.
+5. **레이아웃 변경 시 `CUVS_PROTO_VERSION`을 올린다.** 이 불변식(매직·버전이 맨 앞, 프롤로그 = 8바이트)은 `test/unit/test_cuvs_util.c`의 `test_proto_frame_layout()`이 `offsetof`로 고정한다.
+
+**한계(정직)**: 구버전 데몬이 신버전 확장을 거부하는 경로는 **기존 `unknown op` 처리에 의존**한다 — 즉 이번 버전 이전에 배포된 데몬이 그 경로에서 깨끗이 실패한다는 보장은 우리 코드가 아니라 그 데몬의 동작에 달려 있다. 이번 버전 이후로는 양쪽 모두 명시적 검증을 한다. 또한 `CuvsReplyHeader`에는 버전 필드를 넣지 않았다 — 응답은 항상 방금 검증된 연결 위에서만 오가므로 중복이다.
+
+**관련**: `src/cuvs_ipc.h`(프로토콜 정의), `src/cuvs_ipc.c`(`send_cmd`), `src/pg_cuvs_server.c`(`connection_thread` 2단 읽기), `src/cuvs_util.c`(상태 문자열), `src/pg_cuvs.c`(오류 매핑 2곳), `test/unit/test_cuvs_util.c`(레이아웃 고정).

@@ -53,6 +53,7 @@ cuvs_status_str(int status)
         case CUVS_STATUS_DIM_MISMATCH:   return "dim_mismatch";
         case CUVS_STATUS_METRIC_MISMATCH: return "metric_mismatch";
         case CUVS_STATUS_STALE:          return "stale";
+        case CUVS_STATUS_PROTO_MISMATCH: return "proto_mismatch";
         default:                       return "unknown";
     }
 }
@@ -729,6 +730,20 @@ cuvs_circuit_record_error(uint32_t index_oid, int threshold)
     b->consecutive_errors++;
     if (b->consecutive_errors >= threshold)
         b->open = 1;
+}
+
+void
+cuvs_circuit_record_status(uint32_t index_oid, int threshold, int status)
+{
+    if (status == CUVS_STATUS_OK
+        || status == CUVS_STATUS_CANCELED
+        || status == CUVS_STATUS_DIM_MISMATCH
+        || status == CUVS_STATUS_METRIC_MISMATCH
+        || status == CUVS_STATUS_STALE
+        || status == CUVS_STATUS_NO_VECTORS)
+        return;
+
+    cuvs_circuit_record_error(index_oid, threshold);
 }
 
 void

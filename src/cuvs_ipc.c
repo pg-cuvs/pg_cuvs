@@ -90,6 +90,19 @@ send_all(int fd, const void *buf, size_t len)
     return 0;
 }
 
+/*
+ * #77: stamp the protocol identity, then send the command frame. Every
+ * CuvsCmdFrame leaves the backend through here, so a newly added op cannot
+ * forget the magic/version the daemon validates.
+ */
+static int
+send_cmd(int fd, CuvsCmdFrame *cmd)
+{
+    cmd->proto_magic = CUVS_PROTO_MAGIC;
+    cmd->proto_version = CUVS_PROTO_VERSION;
+    return send_all(fd, cmd, sizeof(*cmd));
+}
+
 static int
 recv_all(int fd, void *buf, size_t len)
 {
@@ -359,7 +372,7 @@ cuvs_ipc_search(
     };
     strncpy(cmd.shm_key, shm_key, sizeof(cmd.shm_key) - 1);
 
-    if (send_all(sock, &cmd, sizeof(cmd)) < 0)
+    if (send_cmd(sock, &cmd) < 0)
         goto cleanup;
 
     /* 3S: wait for the reply header interruptibly so a query cancel /
@@ -491,7 +504,7 @@ cuvs_ipc_search_batch(
         .bf_precision    = bf_precision,
     };
     strncpy(cmd.shm_key, req_key, sizeof(cmd.shm_key) - 1);
-    if (send_all(sock, &cmd, sizeof(cmd)) < 0)
+    if (send_cmd(sock, &cmd) < 0)
         goto cleanup;
 
     CuvsReplyHeader hdr;
@@ -574,7 +587,7 @@ cuvs_ipc_stats(
         .index_oid = index_oid,
     };
 
-    if (send_all(sock, &cmd, sizeof(cmd)) < 0)
+    if (send_cmd(sock, &cmd) < 0)
         goto cleanup;
 
     CuvsReplyHeader hdr;
@@ -630,7 +643,7 @@ cuvs_ipc_cache_stats(const char *socket_path, CuvsCacheStats *out,
     cmd.op = CUVS_OP_CACHE_STATS;
 
     rc = CUVS_STATUS_ERROR;
-    if (send_all(sock, &cmd, sizeof(cmd)) == 0
+    if (send_cmd(sock, &cmd) == 0
         && recv_all(sock, &hdr, sizeof(hdr)) == 0)
     {
         rc = (int) hdr.status;
@@ -678,7 +691,7 @@ cuvs_ipc_shard_stats(const char *socket_path, uint32_t db_oid,
         .index_oid = index_oid,
     };
 
-    if (send_all(sock, &cmd, sizeof(cmd)) < 0)
+    if (send_cmd(sock, &cmd) < 0)
         goto cleanup;
 
     CuvsReplyHeader hdr;
@@ -731,7 +744,7 @@ cuvs_ipc_mark_stale(const char *socket_path, uint32_t db_oid, uint32_t index_oid
     cmd.index_oid = index_oid;
 
     rc = CUVS_STATUS_ERROR;
-    if (send_all(sock, &cmd, sizeof(cmd)) == 0
+    if (send_cmd(sock, &cmd) == 0
         && recv_all(sock, &hdr, sizeof(hdr)) == 0)
         rc = (int) hdr.status;
 
@@ -759,7 +772,7 @@ cuvs_ipc_drop(const char *socket_path, uint32_t db_oid, uint32_t index_oid)
     cmd.index_oid = index_oid;
 
     rc = CUVS_STATUS_ERROR;
-    if (send_all(sock, &cmd, sizeof(cmd)) == 0
+    if (send_cmd(sock, &cmd) == 0
         && recv_all(sock, &hdr, sizeof(hdr)) == 0)
         rc = (int) hdr.status;
 
@@ -845,7 +858,7 @@ cuvs_ipc_build(
     cmd.build_algo                = build_algo;                /* 3R; 0 = AUTO */
     strncpy(cmd.shm_key, shm_key, sizeof(cmd.shm_key) - 1);  /* "" for memfd tier */
 
-    if (send_all(sock, &cmd, sizeof(cmd)) < 0)
+    if (send_cmd(sock, &cmd) < 0)
         goto cleanup;
 
     /* index_dir (fixed 256B) carries the SCM_RIGHTS fd for the memfd tier; for
@@ -948,7 +961,7 @@ cuvs_ipc_build_flat(
     cmd.shard_count  = 1;   /* flat is always unsharded; daemon ignores this */
     strncpy(cmd.shm_key, shm_key, sizeof(cmd.shm_key) - 1);  /* "" for memfd tier */
 
-    if (send_all(sock, &cmd, sizeof(cmd)) < 0)
+    if (send_cmd(sock, &cmd) < 0)
         goto cleanup;
 
     /* index_dir (fixed 256B) carries the SCM_RIGHTS fd for the memfd tier; for
@@ -1041,7 +1054,7 @@ cuvs_ipc_build_multi(
     LOG_DEBUG("[cuvs_ipc_build_multi] n_partials=%u total=%lld dim=%d socket=%s\n",
         n_partials, (long long)total, dim, socket_path);
 
-    if (send_all(sock, &cmd, sizeof(cmd)) < 0)
+    if (send_cmd(sock, &cmd) < 0)
         goto cleanup;
 
     /* index_dir frame: no SCM_RIGHTS fd for the multi-partial path. */
@@ -1099,7 +1112,7 @@ cuvs_ipc_export_adjacency(
         .db_oid    = db_oid,
         .index_oid = index_oid,
     };
-    if (send_all(sock, &cmd, sizeof(cmd)) < 0)
+    if (send_cmd(sock, &cmd) < 0)
         goto cleanup;
 
     CuvsReplyHeader hdr;
@@ -1207,7 +1220,7 @@ cuvs_ipc_export_hnsw_shm(
         .db_oid    = db_oid,
         .index_oid = index_oid,
     };
-    if (send_all(sock, &cmd, sizeof(cmd)) < 0)
+    if (send_cmd(sock, &cmd) < 0)
         goto cleanup;
 
     CuvsReplyHeader hdr;
@@ -1336,7 +1349,7 @@ cuvs_ipc_search_filtered(
         strncpy(cmd.filter_shm_key, filter_shm_key,
                 sizeof(cmd.filter_shm_key) - 1);
 
-    if (send_all(sock, &cmd, sizeof(cmd)) < 0)
+    if (send_cmd(sock, &cmd) < 0)
         goto cleanup;
 
     CuvsReplyHeader hdr;
@@ -1480,7 +1493,7 @@ cuvs_ipc_search_stream_bf(
     strncpy(cmd.shm_key, shm_key, sizeof(cmd.shm_key) - 1);
     strncpy(cmd.filter_shm_key, filter_shm_key, sizeof(cmd.filter_shm_key) - 1);
 
-    if (send_all(sock, &cmd, sizeof(cmd)) < 0)
+    if (send_cmd(sock, &cmd) < 0)
         goto cleanup;
 
     CuvsReplyHeader hdr;
@@ -1627,7 +1640,7 @@ cuvs_ipc_search_bf_transient(
     if (corpus.kind == CORPUS_SHM)                            /* corpus (shm tier) */
         strncpy(cmd.filter_shm_key, corpus.shm_name, sizeof(cmd.filter_shm_key) - 1);
 
-    if (send_all(sock, &cmd, sizeof(cmd)) < 0)
+    if (send_cmd(sock, &cmd) < 0)
         goto cleanup;
 
     /* Second frame carries the corpus memfd via SCM_RIGHTS (pass_fd=-1 for the
@@ -1749,7 +1762,7 @@ cuvs_ipc_build_ivfpq(
     cmd.pq_dim      = pq_dim;
     strncpy(cmd.shm_key, shm_key, sizeof(cmd.shm_key) - 1);
 
-    if (send_all(sock, &cmd, sizeof(cmd)) < 0)
+    if (send_cmd(sock, &cmd) < 0)
         goto cleanup;
 
     if (index_dir)
@@ -1822,7 +1835,7 @@ cuvs_ipc_search_ivfpq(
     };
     strncpy(cmd.shm_key, shm_key, sizeof(cmd.shm_key) - 1);
 
-    if (send_all(sock, &cmd, sizeof(cmd)) < 0)
+    if (send_cmd(sock, &cmd) < 0)
         goto cleanup;
 
     CuvsReplyHeader hdr;
@@ -1922,7 +1935,7 @@ cuvs_ipc_extend(
     cmd.max_chunk_size = max_chunk_size;
     strncpy(cmd.shm_key, shm_key, sizeof(cmd.shm_key) - 1);
 
-    if (send_all(sock, &cmd, sizeof(cmd)) < 0)
+    if (send_cmd(sock, &cmd) < 0)
         goto cleanup;
 
     if (index_dir)
@@ -1973,7 +1986,7 @@ cuvs_ipc_compact(
     cmd.db_oid    = db_oid;
     cmd.index_oid = index_oid;
 
-    if (send_all(sock, &cmd, sizeof(cmd)) < 0)
+    if (send_cmd(sock, &cmd) < 0)
         goto cleanup;
 
     if (index_dir)
@@ -2013,7 +2026,7 @@ cuvs_ipc_set_vram_budget(const char *socket_path, int64_t budget_bytes)
     cmd.op     = CUVS_OP_SET_VRAM_BUDGET;
     cmd.n_vecs = budget_bytes;
 
-    if (send_all(sock, &cmd, sizeof(cmd)) >= 0 &&
+    if (send_cmd(sock, &cmd) >= 0 &&
         recv_all(sock, &hdr, sizeof(hdr)) >= 0)
         rc = (int)hdr.status;
 
@@ -2048,7 +2061,7 @@ cuvs_ipc_eat_vram(const char *socket_path, int64_t leave_bytes, int device_id)
     cmd.n_vecs = leave_bytes;
     cmd.dim    = (uint32_t)device_id;
 
-    if (send_all(sock, &cmd, sizeof(cmd)) >= 0 &&
+    if (send_cmd(sock, &cmd) >= 0 &&
         recv_all(sock, &hdr, sizeof(hdr)) >= 0)
         rc = (int)hdr.status;
 
@@ -2072,7 +2085,7 @@ cuvs_ipc_free_vram(const char *socket_path, int device_id)
     cmd.op  = CUVS_OP_FREE_VRAM;
     cmd.dim = (uint32_t)device_id;
 
-    if (send_all(sock, &cmd, sizeof(cmd)) >= 0 &&
+    if (send_cmd(sock, &cmd) >= 0 &&
         recv_all(sock, &hdr, sizeof(hdr)) >= 0)
         rc = (int)hdr.status;
 
@@ -2096,7 +2109,7 @@ cuvs_ipc_inject_extend_oom(const char *socket_path, int enable)
     cmd.op  = CUVS_OP_INJECT_EXTEND_OOM;
     cmd.dim = (uint32_t)(enable ? 1 : 0);
 
-    if (send_all(sock, &cmd, sizeof(cmd)) >= 0 &&
+    if (send_cmd(sock, &cmd) >= 0 &&
         recv_all(sock, &hdr, sizeof(hdr)) >= 0)
         rc = (int)hdr.status;
 
@@ -2120,7 +2133,7 @@ cuvs_ipc_inject_build_oom(const char *socket_path, int n_fail)
     cmd.op  = CUVS_OP_INJECT_BUILD_OOM;
     cmd.dim = (uint32_t)(n_fail < 0 ? 0 : n_fail);
 
-    if (send_all(sock, &cmd, sizeof(cmd)) >= 0 &&
+    if (send_cmd(sock, &cmd) >= 0 &&
         recv_all(sock, &hdr, sizeof(hdr)) >= 0)
         rc = (int)hdr.status;
 
