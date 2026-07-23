@@ -733,6 +733,20 @@ cuvs_circuit_record_error(uint32_t index_oid, int threshold)
 }
 
 void
+cuvs_circuit_record_status(uint32_t index_oid, int threshold, int status)
+{
+    if (status == CUVS_STATUS_OK
+        || status == CUVS_STATUS_CANCELED
+        || status == CUVS_STATUS_DIM_MISMATCH
+        || status == CUVS_STATUS_METRIC_MISMATCH
+        || status == CUVS_STATUS_STALE
+        || status == CUVS_STATUS_NO_VECTORS)
+        return;
+
+    cuvs_circuit_record_error(index_oid, threshold);
+}
+
+void
 cuvs_circuit_record_success(uint32_t index_oid)
 {
     for (int i = 0; i < cuvs_n_circuit_breakers; i++)

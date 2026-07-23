@@ -192,6 +192,36 @@ test_circuit_breaker(void)
 }
 
 static void
+test_circuit_breaker_status_classification(void)
+{
+    const uint32_t oid = 8;
+    const int threshold = 2;
+
+    /* Given a fresh breaker, user/config and cancellation statuses are neutral. */
+    cuvs_circuit_reset_all();
+
+    /* When each neutral status is recorded. */
+    cuvs_circuit_record_status(oid, threshold, CUVS_STATUS_OK);
+    cuvs_circuit_record_status(oid, threshold, CUVS_STATUS_CANCELED);
+    cuvs_circuit_record_status(oid, threshold, CUVS_STATUS_DIM_MISMATCH);
+    cuvs_circuit_record_status(oid, threshold, CUVS_STATUS_METRIC_MISMATCH);
+    cuvs_circuit_record_status(oid, threshold, CUVS_STATUS_STALE);
+    cuvs_circuit_record_status(oid, threshold, CUVS_STATUS_NO_VECTORS);
+
+    /* Then they do not consume the error budget. */
+    ASSERT(cuvs_n_circuit_breakers == 0, "neutral statuses do not create breaker state");
+
+    /* Given repeatable daemon failures. */
+    cuvs_circuit_record_status(oid, threshold, CUVS_STATUS_PROTO_MISMATCH);
+
+    /* When the threshold is reached by another repeatable failure. */
+    cuvs_circuit_record_status(oid, threshold, CUVS_STATUS_UNAVAILABLE);
+
+    /* Then the breaker opens for the affected index. */
+    ASSERT(cuvs_circuit_is_open(oid) == 1, "repeatable search statuses trip breaker");
+}
+
+static void
 test_crc32(void)
 {
     /* Standard CRC-32 (IEEE 802.3) check vectors. */
@@ -1046,6 +1076,7 @@ main(void)
     test_proto_frame_layout();
     test_status_str();
     test_circuit_breaker();
+    test_circuit_breaker_status_classification();
     test_crc32();
     test_tids_roundtrip();
     test_tids_rejections();

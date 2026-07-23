@@ -213,7 +213,7 @@ void _PG_init(void);
  * through here first, so the operator gets the fix instead of "status 12".
  * No-op for any other status.
  */
-static void
+void
 cuvs_report_proto_mismatch(int rc)
 {
     if (rc != CUVS_STATUS_PROTO_MISMATCH)
@@ -3541,11 +3541,9 @@ cuvs_gettuple(IndexScanDesc scan, ScanDirection dir)
              * already gated at plan time. Everything else — including UNAVAILABLE
              * (daemon crash after planning) — counts so the breaker opens and
              * subsequent queries replan to CPU via the socket-existence gate. */
-            if (rc != CUVS_STATUS_DIM_MISMATCH
-                && rc != CUVS_STATUS_METRIC_MISMATCH && rc != CUVS_STATUS_STALE
-                && rc != CUVS_STATUS_NO_VECTORS)
-                cuvs_circuit_record_error((uint32_t)index_oid,
-                                          cuvs_circuit_breaker_threshold);
+            cuvs_circuit_record_status((uint32_t)index_oid,
+                                       cuvs_circuit_breaker_threshold,
+                                       rc);
 
             switch (rc)
             {
@@ -3791,11 +3789,9 @@ flat_gettuple(IndexScanDesc scan, ScanDirection dir)
 
         if (rc != CUVS_STATUS_OK)
         {
-            if (rc != CUVS_STATUS_DIM_MISMATCH
-                && rc != CUVS_STATUS_METRIC_MISMATCH && rc != CUVS_STATUS_STALE
-                && rc != CUVS_STATUS_NO_VECTORS)
-                cuvs_circuit_record_error((uint32_t)index_oid,
-                                          cuvs_circuit_breaker_threshold);
+            cuvs_circuit_record_status((uint32_t)index_oid,
+                                       cuvs_circuit_breaker_threshold,
+                                       rc);
 
             switch (rc)
             {
@@ -4416,7 +4412,7 @@ ivfpq_gettuple(IndexScanDesc scan, ScanDirection dir)
         ss->searched = true;
 
         Oid index_oid = RelationGetRelid(scan->indexRelation);
-        if (!enable_cuvs)
+        if (!enable_cuvs || cuvs_circuit_is_open((uint32_t)index_oid))
             return false;
 
         if (scan->numberOfOrderBys < 1 || !scan->orderByData)
@@ -4447,6 +4443,10 @@ ivfpq_gettuple(IndexScanDesc scan, ScanDirection dir)
 
         if (rc != CUVS_STATUS_OK)
         {
+            cuvs_circuit_record_status((uint32_t)index_oid,
+                                       cuvs_circuit_breaker_threshold,
+                                       rc);
+
             switch (rc)
             {
                 case CUVS_STATUS_METRIC_MISMATCH:
@@ -4485,6 +4485,7 @@ ivfpq_gettuple(IndexScanDesc scan, ScanDirection dir)
             return false;
         }
 
+        cuvs_circuit_record_success((uint32_t)index_oid);
         cuvs_last_latency_us  = latency_us;
         cuvs_last_n_results   = ss->n_results;
         cuvs_last_k_requested = k;
