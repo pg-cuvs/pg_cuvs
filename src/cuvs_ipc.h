@@ -17,6 +17,28 @@
 #include <sys/types.h>
 
 /* ----------------------------------------------------------------
+ * Protocol identity (#77)
+ *
+ * CuvsCmdFrame grows by appending fields, so a daemon and an extension built
+ * from different revisions of this header disagree on the frame layout AND on
+ * sizeof(CuvsCmdFrame). Without a marker the daemon would simply reinterpret
+ * the bytes it got — a silent wrong-answer failure. The magic and version are
+ * therefore the FIRST two fields of the frame, and the daemon validates them
+ * before reading the rest (see connection_thread), which detects skew in both
+ * directions:
+ *   old extension -> new daemon: the magic slot holds the old frame's `op`
+ *                                (a small integer) -> magic mismatch -> refused.
+ *   new extension -> old daemon: the old daemon reads the magic as `op`
+ *                                -> no such op -> "unknown op" error.
+ *
+ * Bump CUVS_PROTO_VERSION whenever CuvsCmdFrame or CuvsReplyHeader layout
+ * changes. Deploy the extension and daemon together:
+ *   make install && make install-server
+ * ---------------------------------------------------------------- */
+#define CUVS_PROTO_MAGIC   0x50435556u  /* 'VUCP' LE — "PG CUVS" tag */
+#define CUVS_PROTO_VERSION 1u
+
+/* ----------------------------------------------------------------
  * Op codes
  * ---------------------------------------------------------------- */
 #define CUVS_OP_SEARCH    1
@@ -79,11 +101,16 @@
 #define CUVS_STATUS_STALE          9   /* index stale (writes since build) → CPU fallback */
 #define CUVS_STATUS_NO_VECTORS    10   /* Phase 3L: brute_force requested but .vectors sidecar missing → REINDEX */
 #define CUVS_STATUS_CANCELED      11   /* 3S: backend aborted the wait (statement_timeout / query cancel) */
+#define CUVS_STATUS_PROTO_MISMATCH 12  /* #77: daemon/extension wire-protocol skew (co-deploy both) */
 
 /* ----------------------------------------------------------------
  * Command frame (sent over UDS, fixed size)
  * ---------------------------------------------------------------- */
 typedef struct CuvsCmdFrame {
+    /* #77: must stay the first two fields — the daemon reads and validates them
+     * before reading the rest of the frame. Stamped by send_cmd(). */
+    uint32_t proto_magic;   /* CUVS_PROTO_MAGIC */
+    uint32_t proto_version; /* CUVS_PROTO_VERSION */
     uint32_t op;            /* CUVS_OP_* */
     uint32_t db_oid;        /* PostgreSQL database OID */
     uint32_t index_oid;     /* PostgreSQL index OID */

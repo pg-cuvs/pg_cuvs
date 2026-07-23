@@ -3553,6 +3553,20 @@ cuvs_gettuple(IndexScanDesc scan, ScanDirection dir)
                              errmsg("pg_cuvs: query vector dimension %d does not "
                                     "match the cagra index dimension", dim)));
                     break;
+                case CUVS_STATUS_PROTO_MISMATCH:
+                    /* #77: the daemon refused the frame because it was built
+                     * from a different cuvs_ipc.h than this extension. Before
+                     * the handshake this skew silently misread the struct. */
+                    ereport(ERROR,
+                            (errcode(ERRCODE_PROTOCOL_VIOLATION),
+                             errmsg("pg_cuvs: IPC protocol mismatch between the "
+                                    "extension and the GPU daemon; "
+                                    "retry will use CPU while breaker is open"),
+                             errhint("The .so and pg_cuvs_server were built from "
+                                     "different revisions. Reinstall both together: "
+                                     "make install && make install-server, then restart "
+                                     "the daemon.")));
+                    break;
                 case CUVS_STATUS_UNAVAILABLE:
                     /* Daemon was reachable at plan time (socket existed) but
                      * unreachable now — crash or restart between plan and execute.
@@ -3784,6 +3798,17 @@ flat_gettuple(IndexScanDesc scan, ScanDirection dir)
                             (errcode(ERRCODE_DATA_EXCEPTION),
                              errmsg("pg_cuvs: query vector dimension %d does not "
                                     "match the flat index dimension", dim)));
+                    break;
+                case CUVS_STATUS_PROTO_MISMATCH:
+                    ereport(ERROR,
+                            (errcode(ERRCODE_PROTOCOL_VIOLATION),
+                             errmsg("pg_cuvs: IPC protocol mismatch between the "
+                                    "extension and the GPU daemon; "
+                                    "retry will use CPU while breaker is open"),
+                             errhint("The .so and pg_cuvs_server were built from "
+                                     "different revisions. Reinstall both together: "
+                                     "make install && make install-server, then restart "
+                                     "the daemon.")));
                     break;
                 case CUVS_STATUS_UNAVAILABLE:
                     ereport(ERROR,

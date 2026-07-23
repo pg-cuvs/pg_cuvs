@@ -100,9 +100,33 @@ test_parse_index_filename(void)
            "reject shard artifact .s015.cagra");
 }
 
+/*
+ * #77: the daemon reads offsetof(CuvsCmdFrame, op) bytes, validates the magic
+ * and version, and only then reads the rest. That two-stage read is what turns
+ * a daemon/extension skew into a named error instead of a silently
+ * misinterpreted struct — so the layout it depends on is pinned here.
+ */
+static void
+test_proto_frame_layout(void)
+{
+    ASSERT(offsetof(CuvsCmdFrame, proto_magic) == 0,
+           "proto_magic must be the first frame field");
+    ASSERT(offsetof(CuvsCmdFrame, proto_version) == sizeof(uint32_t),
+           "proto_version must directly follow proto_magic");
+    ASSERT(offsetof(CuvsCmdFrame, op) == 2 * sizeof(uint32_t),
+           "op must follow the 8-byte protocol prologue");
+
+    /* Reverse-direction detection: an old daemon reads our magic as `op`, so
+     * the magic must not collide with any op code it might dispatch on. */
+    ASSERT(CUVS_PROTO_MAGIC > 1000u, "magic must not collide with an op code");
+    ASSERT(CUVS_PROTO_VERSION >= 1u, "protocol version starts at 1");
+}
+
 static void
 test_status_str(void)
 {
+    ASSERT(strcmp(cuvs_status_str(CUVS_STATUS_PROTO_MISMATCH), "proto_mismatch") == 0,
+           "status proto_mismatch");
     ASSERT(strcmp(cuvs_status_str(CUVS_STATUS_OK), "ok") == 0, "status ok");
     ASSERT(strcmp(cuvs_status_str(CUVS_STATUS_ERROR), "error") == 0, "status error");
     ASSERT(strcmp(cuvs_status_str(CUVS_STATUS_OOM_FALLBACK), "oom_fallback") == 0,
@@ -1019,6 +1043,7 @@ main(void)
 {
     test_tid_roundtrip();
     test_parse_index_filename();
+    test_proto_frame_layout();
     test_status_str();
     test_circuit_breaker();
     test_crc32();

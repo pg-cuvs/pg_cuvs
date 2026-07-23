@@ -53,6 +53,7 @@ cuvs_status_str(int status)
         case CUVS_STATUS_DIM_MISMATCH:   return "dim_mismatch";
         case CUVS_STATUS_METRIC_MISMATCH: return "metric_mismatch";
         case CUVS_STATUS_STALE:          return "stale";
+        case CUVS_STATUS_PROTO_MISMATCH: return "proto_mismatch";
         default:                       return "unknown";
     }
 }
