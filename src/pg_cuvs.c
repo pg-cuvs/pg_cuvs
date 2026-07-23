@@ -4461,6 +4461,13 @@ ivfpq_gettuple(IndexScanDesc scan, ScanDirection dir)
                              errmsg("pg_cuvs: query vector dimension %d does not "
                                     "match the ivfpq index dimension", dim)));
                     break;
+                case CUVS_STATUS_CANCELED:
+                    /* 3S: the backend aborted the wait for a pending cancel or
+                     * statement_timeout. That is not an engine failure — let the
+                     * interrupt be raised and end the scan, exactly as before
+                     * this switch gained a default arm. */
+                    CHECK_FOR_INTERRUPTS();
+                    break;
                 default:
                     /* Everything else used to fall through to `return false`,
                      * which ends the scan as "no more rows" — a daemon crash, a
