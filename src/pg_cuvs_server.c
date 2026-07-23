@@ -2993,10 +2993,10 @@ handle_search(int client_fd, const CuvsCmdFrame *cmd)
         int ret = (bk > 0)
             ? cuvs_bf_search(e->main_bf_idx, query, (int) cmd->dim, bk, raw, delta_gpu_of(e))
             : 0;
-        munmap(query, vec_bytes);
         if (ret != 0)
         {
             free(raw); free(results);
+            munmap(query, vec_bytes);
             CuvsReplyHeader hdr = {0};
             hdr.status = (ret == 2) ? CUVS_STATUS_DIM_MISMATCH : CUVS_STATUS_OOM_FALLBACK;
             strncpy(hdr.error,
@@ -3048,30 +3048,96 @@ handle_search(int client_fd, const CuvsCmdFrame *cmd)
             return;
         }
 
-        int n_valid = 0;
-        for (int i = 0; i < bk && n_valid < k; i++)
+        /* Fail closed, keyed on the REQUEST (n_filter_tids) rather than on the
+         * shm key. This path exists to confine results to the caller's TID
+         * whitelist (tenant isolation, ADR-063); returning the unfiltered top-k
+         * with CUVS_STATUS_OK silently hands back rows the caller excluded.
+         * Note an empty filter_shm_key with n_filter_tids > 0 must land here
+         * too: an earlier version tested only the mmap result *inside* the
+         * "key is non-empty" branch, so a frame with no key skipped the check
+         * entirely and still produced unfiltered rows. The streaming-BF path
+         * already refuses in the same situation — match it. */
+        if (cmd->n_filter_tids > 0 && !filter_tids)
         {
-            int64_t id = raw[i].item_id;
-            if (id < 0 || id >= e->n_vecs) continue;
-            uint64_t tid = e->tids[id];
-            if (filter_tids)
+            free(raw); free(results);
+            if (filter_mem != MAP_FAILED) munmap(filter_mem, filter_bytes);
+            munmap(query, vec_bytes);
+            CuvsReplyHeader hdr = {0};
+            hdr.status = CUVS_STATUS_ERROR;
+            strncpy(hdr.error,
+                    "filter TID set unavailable; refusing to return unfiltered rows",
+                    sizeof(hdr.error) - 1);
+            record_search_stat(e, hdr.status, 0, hdr.error);
+            pthread_mutex_unlock(&g_index_mutex);
+            send_all(client_fd, &hdr, sizeof(hdr));
+            return;
+        }
+
+        /*
+         * Post-filter, then guarantee exactness.
+         *
+         * The depth heuristic above (max(4k, 2k/sel)) assumes filter membership
+         * is independent of distance: then the j-th filtered neighbour sits at
+         * unfiltered rank ~ j/sel and 2k/sel is generous. That assumption is not
+         * safe in general — an ANTI-correlated filter (one that admits only rows
+         * far from the query) can place every valid neighbour past the prefix,
+         * and the scan would return short or empty while claiming success. The
+         * earlier "D-wedge is exact by construction" wording was wrong for that
+         * case, and the 2026-06 correlation experiment does not cover it: its
+         * "spatial" level is POSITIVE correlation, which only makes the prefix
+         * easier.
+         *
+         * So: if the prefix did not yield k survivors and it did not already
+         * cover the corpus, redo the search at full depth. That is definitive —
+         * either k rows come back, or fewer than k filter rows exist at all.
+         * The deep pass only runs when the cheap one came up short.
+         */
+        int n_valid = 0;
+        for (int attempt = 0; attempt < 2; attempt++)
+        {
+            n_valid = 0;
+            for (int i = 0; i < bk && n_valid < k; i++)
             {
-                uint32_t lo = 0, hi = cmd->n_filter_tids;
-                int found = 0;
-                while (lo < hi)
+                int64_t id = raw[i].item_id;
+                if (id < 0 || id >= e->n_vecs) continue;
+                uint64_t tid = e->tids[id];
+                if (filter_tids)
                 {
-                    uint32_t mid = lo + (hi - lo) / 2;
-                    if (filter_tids[mid] == tid) { found = 1; break; }
-                    if (filter_tids[mid] < tid)  lo = mid + 1;
-                    else                          hi = mid;
+                    uint32_t lo = 0, hi = cmd->n_filter_tids;
+                    int found = 0;
+                    while (lo < hi)
+                    {
+                        uint32_t mid = lo + (hi - lo) / 2;
+                        if (filter_tids[mid] == tid) { found = 1; break; }
+                        if (filter_tids[mid] < tid)  lo = mid + 1;
+                        else                          hi = mid;
+                    }
+                    if (!found) continue;
                 }
-                if (!found) continue;
+                results[n_valid].tid      = tid;
+                results[n_valid].distance = raw[i].distance;
+                n_valid++;
             }
-            results[n_valid].tid      = tid;
-            results[n_valid].distance = raw[i].distance;
-            n_valid++;
+
+            if (attempt > 0 || n_valid >= k || !filter_tids
+                || (int64_t) bk >= e->main_bf_n)
+                break;   /* satisfied, unfiltered, or the prefix was the corpus */
+
+            int deep = (int) e->main_bf_n;
+            CuvsSearchResult *rd = realloc(raw, (size_t) deep * sizeof(CuvsSearchResult));
+            if (!rd)
+                break;   /* cannot deepen — return what the prefix found */
+            raw = rd;
+            LOG_DEBUG("[handle_search] D-wedge short (%d < %d) at depth %d; "
+                      "rescanning full corpus %lld\n",
+                      n_valid, k, bk, (long long) e->main_bf_n);
+            if (cuvs_bf_search(e->main_bf_idx, query, (int) cmd->dim, deep, raw,
+                               delta_gpu_of(e)) != 0)
+                break;   /* deep pass failed — keep the prefix result */
+            bk = deep;
         }
         free(raw);
+        munmap(query, vec_bytes);
         if (filter_mem != MAP_FAILED)
             munmap(filter_mem, filter_bytes);
 
