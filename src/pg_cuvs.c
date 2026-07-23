@@ -132,8 +132,8 @@ bool   cuvs_auto_compact                = false;
 int    cuvs_auto_compact_check_interval = 60;
 double cuvs_auto_compact_threshold      = 0.10;
 char  *cuvs_auto_compact_database       = NULL;
-double cuvs_filter_auto_threshold = 0.05;    /* 3O: selectivity below which pre-filter is used */
-double cuvs_stream_bf_selectivity_threshold = 0.0;  /* ADR-064: selectivity below which out-of-core stream BF is used; 0=off */
+double cuvs_filter_auto_threshold = 0.0;     /* 3O: selectivity below which the approximate BITSET prefilter is used; 0 = always exact (ADR-082) */
+double cuvs_stream_bf_selectivity_threshold = 0.004;  /* ADR-064: selectivity below which out-of-core stream BF is used; crossover vs D-wedge measured at ~0.004 (ADR-082); 0=off */
 int    cuvs_stream_bf_chunk_vectors = 262144;       /* ADR-064: max vectors per GPU chunk (footprint knob) */
 int   cuvs_ivfpq_n_probes          = 64;     /* 3P: IVF clusters probed per search (ivfpq AM) */
 int   cuvs_extend_chunk_size       = 0;      /* 3Q: CAGRA extend max_chunk_size; 0 = auto */
@@ -798,12 +798,16 @@ _PG_init(void)
     DefineCustomRealVariable(
         "cuvs.filter_auto_threshold",
         "Selectivity below which filtered BF uses GPU BITSET prefilter (3O) instead of D-wedge.",
-        "Selectivity = |filter| / N. Below this value, the daemon searches only within the "
-        "filter set via a GPU BITSET mask (3O), giving recall=1.00 at any selectivity. "
-        "Above this value, the D-wedge post-filter (k*4 overfetch) is used. "
-        "0.0 = always D-wedge, 1.0 = always 3O. Default 0.05 (confirmed by benchmark).",
+        "Selectivity = |filter| / N. Below this value, the daemon searches the CAGRA "
+        "graph under a GPU BITSET mask (3O) instead of the exact D-wedge post-filter. "
+        "3O is APPROXIMATE and its recall collapses on selective filters: measured "
+        "0.99 at sel>=1e-3 but 0.86 / 0.48 / 0.28 at 5e-4 / 2e-4 / 1e-4, where it also "
+        "stops returning a full k (ADR-082). The exact paths cover the whole range "
+        "faster, so this defaults to 0.0 = always exact; raise it only to trade "
+        "correctness for 3O's flat ~2ms latency. 1.0 = always 3O. 3O also remains the "
+        "automatic fallback when the .vectors sidecar is missing.",
         &cuvs_filter_auto_threshold,
-        0.05, 0.0, 1.0,
+        0.0, 0.0, 1.0,
         PGC_USERSET,
         0, NULL, NULL, NULL);
 
@@ -814,9 +818,13 @@ _PG_init(void)
         "filter-passing vectors from the on-disk .vectors sidecar (never resident "
         "whole in VRAM) and runs chunked GPU brute force — exact, for datasets that "
         "exceed VRAM. Takes precedence over cuvs.filter_auto_threshold (3O) when both "
-        "would fire and the sidecar is present. 0.0 = off (default).",
+        "would fire and the sidecar is present; falls back to 3O when it is not. "
+        "Its cost scales with |filter| while D-wedge's scales with 1/selectivity, so "
+        "the two exact paths cross near 0.004 (measured D-wedge/stream_bf p50: "
+        "3.6/12.9 ms at 5e-3 ... 4.3/3.1 ms at 3e-3 ... 35.4/0.45 ms at 1e-4, "
+        "ADR-082) — hence the default. 0.0 = off.",
         &cuvs_stream_bf_selectivity_threshold,
-        0.0, 0.0, 1.0,
+        0.004, 0.0, 1.0,
         PGC_USERSET,
         0, NULL, NULL, NULL);
 
