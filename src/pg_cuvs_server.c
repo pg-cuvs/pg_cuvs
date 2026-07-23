@@ -2946,10 +2946,31 @@ handle_search(int client_fd, const CuvsCmdFrame *cmd)
             /* 3O failed (search error or malloc); fall through to D-wedge. */
         }
 
-        /* D-wedge: overfetch 4x when post-filtering so top-k survive. */
-        int64_t bk_target = (cmd->n_filter_tids > 0)
-            ? (int64_t)k * 4
-            : (int64_t)k;
+        /* D-wedge: exact BF over the whole corpus, then post-filter down to the
+         * whitelist -- so the fetch depth must be deep enough that ~k filtered
+         * rows survive. For a filter uncorrelated with distance the j-th
+         * filtered neighbour sits at unfiltered rank ~ j/sel, so the depth has
+         * to scale with 1/sel. A fixed 4x ignores selectivity and collapses:
+         * ADR-082 measured recall 0.011 with 0.11 rows returned at sel=0.001.
+         * The 2x factor covers the variance of Binomial(bk, sel) so ~k rows
+         * survive rather than exactly k in expectation. bk is clamped to the
+         * corpus below, which makes very selective filters degrade into a full
+         * top-k -- exact, and nearly free, since brute force computes every
+         * distance regardless and only the selection depth grows. */
+        int64_t bk_target = (int64_t) k;
+        if (cmd->n_filter_tids > 0)
+        {
+            double sel = (e->main_bf_n > 0)
+                ? (double) cmd->n_filter_tids / (double) e->main_bf_n
+                : 0.0;
+            bk_target = (int64_t) k * 4;
+            if (sel > 0.0)
+            {
+                double want = (double) k / sel * 2.0;
+                if (want > (double) bk_target)
+                    bk_target = (int64_t) want;
+            }
+        }
         int bk = (int)(bk_target < e->main_bf_n ? bk_target : e->main_bf_n);
         CuvsSearchResult *raw     = malloc((size_t)(bk > 0 ? bk : 1) * sizeof(CuvsSearchResult));
         CuvsResult       *results = malloc((size_t)(k  > 0 ? k  : 1) * sizeof(CuvsResult));
