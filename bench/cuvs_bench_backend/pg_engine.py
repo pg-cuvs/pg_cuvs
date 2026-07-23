@@ -132,8 +132,31 @@ class PgEngine:
         with self.conn.cursor() as cur:
             cur.execute("SELECT to_regclass('public.t')")
             if cur.fetchone()[0] is not None:
-                cur.execute("SELECT count(*) FROM t")
-                if cur.fetchone()[0] == n:
+                cur.execute("SELECT count(*) FROM public.t")
+                got = cur.fetchone()[0]
+                if got != n:
+                    # #78: at 1M scale this intermittently reports 0 between
+                    # configs. Measured facts so far: the heap really is empty
+                    # (parallel seq scan returns rows=0 in ~17 ms), relfilenode is
+                    # unchanged, n_tup_del is 0, the orchestrator loop is strictly
+                    # sequential, an autocommit COPY is visible to other
+                    # connections immediately, and neither pg_cuvs_build_hnsw nor
+                    # a cagra CREATE INDEX empties the heap at 50k. So re-loading
+                    # is the correct response -- what is unknown is what empties
+                    # the table. Dump the state here so the next occurrence
+                    # carries its own evidence instead of just a lost 2 minutes.
+                    cur.execute(
+                        "SELECT pg_relation_filenode('public.t'), "
+                        "       pg_relation_size('public.t'), "
+                        "       (SELECT n_tup_ins FROM pg_stat_all_tables "
+                        "         WHERE relid = 'public.t'::regclass), "
+                        "       (SELECT n_tup_del FROM pg_stat_all_tables "
+                        "         WHERE relid = 'public.t'::regclass)")
+                    fnode, relsize, ins, dele = cur.fetchone()
+                    print(f"[engine] #78 corpus reload: count={got} want={n} "
+                          f"filenode={fnode} relsize={relsize} "
+                          f"n_tup_ins={ins} n_tup_del={dele}", flush=True)
+                if got == n:
                     print(f"[engine] table t already has {n} rows; reuse", flush=True)
                     return
                 cur.execute("DROP TABLE t CASCADE")
