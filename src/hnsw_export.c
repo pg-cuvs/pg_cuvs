@@ -58,6 +58,8 @@
 #include "access/stratnum.h"     /* BTEqualStrategyNumber */
 #include "catalog/pg_extension.h"/* ExtensionRelationId, Anum_pg_extension_* */
 #include "utils/fmgroids.h"      /* F_OIDEQ */
+#include "utils/acl.h"
+#include "utils/lsyscache.h"     /* get_rel_name */
 
 #include <math.h>
 #include <stdio.h>
@@ -1703,6 +1705,10 @@ create_empty_hnsw(Oid cagra_oid)
         ereport(ERROR, (errmsg("pg_cuvs: CAGRA index %u not found", cagra_oid)));
     Oid heap_oid = ((Form_pg_index) GETSTRUCT(ix_tup))->indrelid;
     ReleaseSysCache(ix_tup);
+
+    if (!object_ownercheck(RelationRelationId, heap_oid, GetUserId()))
+        aclcheck_error(ACLCHECK_NOT_OWNER, OBJECT_TABLE,
+                       get_rel_name(heap_oid));
 
     uint32_t metric       = cagra_index_metric(cagra_oid);
     Oid      hnsw_opclass = find_hnsw_opclass_oid(metric);

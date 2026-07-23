@@ -68,6 +68,8 @@ const char *cuvs_status_str(int status);
 
 /* Opclass name -> CUVS_METRIC_* (cuvs_ipc.h); -1 if unrecognized. */
 int cuvs_metric_from_opclass_name(const char *name);
+void cuvs_u64_sort(uint64_t *values, size_t n);
+int  cuvs_u64_contains(const uint64_t *sorted_values, size_t n, uint64_t target);
 
 /* ----------------------------------------------------------------
  * Latency histogram (per-index, daemon-side). Log2-spaced fixed buckets:

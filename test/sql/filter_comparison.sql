@@ -103,6 +103,99 @@ FROM cuvs_filtered_knn(
     10
 ) f;
 
+SELECT count(*) AS empty_bigint
+FROM cuvs_filtered_knn(
+    'fc_cagra'::regclass,
+    '[0.5,0.3,0.7,0.2,0.8,0.4,0.6,0.1]'::vector(8),
+    ARRAY[]::bigint[],
+    10
+) f;
+
+SELECT count(*) AS empty_tid
+FROM cuvs_filtered_knn(
+    'fc_cagra'::regclass,
+    '[0.5,0.3,0.7,0.2,0.8,0.4,0.6,0.1]'::vector(8),
+    ARRAY[]::tid[],
+    10
+) f;
+
+WITH asc_results AS MATERIALIZED (
+    SELECT ctid
+    FROM cuvs_filtered_knn(
+        'fc_cagra'::regclass,
+        '[0.5,0.3,0.7,0.2,0.8,0.4,0.6,0.1]'::vector(8),
+        ARRAY(
+            SELECT (((ctid::text::point)[0])::bigint << 16)
+                 | (((ctid::text::point)[1])::bigint)
+            FROM fc WHERE tenant_id = 1
+            ORDER BY 1
+        ),
+        10
+    )
+), desc_results AS MATERIALIZED (
+    SELECT ctid
+    FROM cuvs_filtered_knn(
+        'fc_cagra'::regclass,
+        '[0.5,0.3,0.7,0.2,0.8,0.4,0.6,0.1]'::vector(8),
+        ARRAY(
+            SELECT (((ctid::text::point)[0])::bigint << 16)
+                 | (((ctid::text::point)[1])::bigint)
+            FROM fc WHERE tenant_id = 1
+            ORDER BY 1 DESC
+        ),
+        10
+    )
+)
+SELECT (SELECT array_agg(ctid::text ORDER BY ctid::text) FROM asc_results)
+     = (SELECT array_agg(ctid::text ORDER BY ctid::text) FROM desc_results)
+       AS same_results;
+
+DROP TABLE IF EXISTS fc_anti CASCADE;
+CREATE TABLE fc_anti (row_id int NOT NULL, v vector(2));
+INSERT INTO fc_anti
+SELECT g, ARRAY[g::real, 0::real]::vector(2)
+FROM generate_series(1, 256) g;
+CREATE INDEX fc_anti_cagra ON fc_anti USING cagra (v vector_l2_ops);
+SET cuvs.stream_bf_chunk_vectors = 32;
+
+CREATE TEMP TABLE fc_anti_filter (encoded_tid bigint);
+INSERT INTO fc_anti_filter
+SELECT (((ctid::text::point)[0])::bigint << 16)
+     | (((ctid::text::point)[1])::bigint)
+FROM fc_anti
+WHERE row_id > 128
+ORDER BY 1 DESC;
+
+SELECT count(*) AS n, min(row_id) AS min_id, max(row_id) AS max_id
+FROM cuvs_filtered_knn(
+    'fc_anti_cagra'::regclass,
+    '[0,0]'::vector(2),
+    ARRAY(SELECT encoded_tid FROM fc_anti_filter),
+    10
+) f
+JOIN fc_anti ON fc_anti.ctid = f.ctid;
+
+SELECT search_mode AS anti_mode
+FROM pg_stat_gpu_search
+WHERE index_oid = 'fc_anti_cagra'::regclass;
+
+DELETE FROM fc_anti WHERE row_id BETWEEN 129 AND 143;
+SET cuvs.socket_path = '';
+VACUUM fc_anti;
+RESET cuvs.socket_path;
+
+SELECT count(*) AS n, min(row_id) AS min_id, max(row_id) AS max_id
+FROM cuvs_filtered_knn(
+    'fc_anti_cagra'::regclass,
+    '[0,0]'::vector(2),
+    ARRAY(SELECT encoded_tid FROM fc_anti_filter),
+    10
+) f
+JOIN fc_anti ON fc_anti.ctid = f.ctid;
+
+RESET cuvs.stream_bf_chunk_vectors;
+DROP TABLE fc_anti CASCADE;
+
 -- ----------------------------------------------------------------
 -- Test 2: Option A — Custom Scan hook
 --

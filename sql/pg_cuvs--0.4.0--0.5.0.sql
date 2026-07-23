@@ -28,6 +28,32 @@ COMMENT ON FUNCTION pg_cuvs_hw_profile() IS
   'bytes per microsecond; gpu_bf_tput is (vectors*dim) per microsecond. Read-only; '
   'not yet consumed by the cost model.';
 
+CREATE OR REPLACE FUNCTION cuvs_filtered_knn(
+    index_rel   regclass,
+    query       vector,
+    filter_tids tid[],
+    k           integer
+)
+RETURNS TABLE (ctid tid, distance float4)
+LANGUAGE sql STABLE AS $$
+    SELECT * FROM cuvs_filtered_knn(
+        index_rel,
+        query,
+        CASE
+            WHEN filter_tids IS NULL THEN NULL::bigint[]
+            ELSE COALESCE(
+                (SELECT array_agg(encoded ORDER BY encoded)
+                 FROM (
+                     SELECT (((t::text::point)[0])::bigint << 16) |
+                             ((t::text::point)[1])::bigint AS encoded
+                     FROM unnest(filter_tids) t
+                 ) encoded_tids),
+                ARRAY[]::bigint[])
+        END,
+        k
+    );
+$$;
+
 -- These five reach into daemon-global state (VRAM budget, a VRAM balloon, and the
 -- fault-injection counters). PostgreSQL grants EXECUTE to PUBLIC by default, which
 -- would let any role arm a build failure or pin VRAM and break *other* sessions'
@@ -37,3 +63,6 @@ REVOKE ALL ON FUNCTION pg_cuvs_eat_vram(bigint)            FROM PUBLIC;
 REVOKE ALL ON FUNCTION pg_cuvs_free_vram()                 FROM PUBLIC;
 REVOKE ALL ON FUNCTION pg_cuvs_inject_extend_oom(integer)  FROM PUBLIC;
 REVOKE ALL ON FUNCTION pg_cuvs_inject_build_oom(integer)   FROM PUBLIC;
+REVOKE ALL ON FUNCTION pg_cuvs_gc_orphans(boolean)         FROM PUBLIC;
+REVOKE ALL ON FUNCTION pg_cuvs_compact(regclass)           FROM PUBLIC;
+REVOKE ALL ON FUNCTION pg_cuvs_build_hnsw(regclass, text)  FROM PUBLIC;

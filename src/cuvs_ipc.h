@@ -274,7 +274,8 @@ int cuvs_ipc_search_filtered(
     int          *n_out,
     uint32_t     *latency_us_out,
     int          *delta_merged_out, /* OUT: 1 if daemon merged .delta; may be NULL */
-    int           use_prefilter     /* 3O: 1=GPU BITSET prefilter, 0=D-wedge post-filter */
+    int           use_prefilter,    /* 3O: 1=GPU BITSET prefilter, 0=D-wedge post-filter */
+    int           exact_chunk_cap
 );
 
 /*

@@ -76,6 +76,43 @@ cuvs_metric_from_opclass_name(const char *name)
     return -1;
 }
 
+static int
+compare_u64(const void *left, const void *right)
+{
+    uint64_t a = *(const uint64_t *) left;
+    uint64_t b = *(const uint64_t *) right;
+
+    return (a > b) - (a < b);
+}
+
+void
+cuvs_u64_sort(uint64_t *values, size_t n)
+{
+    if (values && n > 1)
+        qsort(values, n, sizeof(*values), compare_u64);
+}
+
+int
+cuvs_u64_contains(const uint64_t *sorted_values, size_t n, uint64_t target)
+{
+    size_t lo = 0;
+    size_t hi = n;
+
+    while (lo < hi)
+    {
+        size_t mid = lo + (hi - lo) / 2;
+        uint64_t value = sorted_values[mid];
+
+        if (value == target)
+            return 1;
+        if (value < target)
+            lo = mid + 1;
+        else
+            hi = mid;
+    }
+    return 0;
+}
+
 /* ----------------------------------------------------------------
  * Latency histogram: log2-spaced buckets + approximate percentiles.
  * ---------------------------------------------------------------- */

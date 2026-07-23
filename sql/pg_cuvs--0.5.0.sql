@@ -443,10 +443,17 @@ LANGUAGE sql STABLE AS $$
     SELECT * FROM cuvs_filtered_knn(
         index_rel,
         query,
-        (SELECT array_agg(
-                    (((t::text::point)[0])::bigint << 16) |
-                     ((t::text::point)[1])::bigint
-                ) FROM unnest(filter_tids) t),
+        CASE
+            WHEN filter_tids IS NULL THEN NULL::bigint[]
+            ELSE COALESCE(
+                (SELECT array_agg(encoded ORDER BY encoded)
+                 FROM (
+                     SELECT (((t::text::point)[0])::bigint << 16) |
+                             ((t::text::point)[1])::bigint AS encoded
+                     FROM unnest(filter_tids) t
+                 ) encoded_tids),
+                ARRAY[]::bigint[])
+        END,
         k
     );
 $$;
@@ -565,6 +572,9 @@ REVOKE ALL ON FUNCTION pg_cuvs_eat_vram(bigint)            FROM PUBLIC;
 REVOKE ALL ON FUNCTION pg_cuvs_free_vram()                 FROM PUBLIC;
 REVOKE ALL ON FUNCTION pg_cuvs_inject_extend_oom(integer)  FROM PUBLIC;
 REVOKE ALL ON FUNCTION pg_cuvs_inject_build_oom(integer)   FROM PUBLIC;
+REVOKE ALL ON FUNCTION pg_cuvs_gc_orphans(boolean)         FROM PUBLIC;
+REVOKE ALL ON FUNCTION pg_cuvs_compact(regclass)           FROM PUBLIC;
+REVOKE ALL ON FUNCTION pg_cuvs_build_hnsw(regclass, text)  FROM PUBLIC;
 
 
 -- ----------------------------------------------------------------
