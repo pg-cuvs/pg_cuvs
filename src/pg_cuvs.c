@@ -5745,6 +5745,7 @@ cuvs_filtered_knn(PG_FUNCTION_ARGS)
     /* --- Deconstruct filter_tids bigint[] if provided. --- */
     uint64_t *filter_arr = NULL;
     uint32_t  n_filter   = 0;
+    bool      empty_filter = false;   /* non-NULL array with zero elements */
     if (!PG_ARGISNULL(2))
     {
         ArrayType *farr = PG_GETARG_ARRAYTYPE_P(2);
@@ -5765,6 +5766,29 @@ cuvs_filtered_knn(PG_FUNCTION_ARGS)
                 filter_arr[i] = elnulls[i] ? 0 : (uint64_t) DatumGetInt64(elems[i]);
             n_filter = (uint32_t) nelems;
         }
+        else
+            empty_filter = true;
+    }
+
+    /*
+     * An EMPTY whitelist is not the same as NULL. NULL means "no filter" and
+     * degrades to unfiltered BF, which is the documented contract. An empty
+     * array means "nothing passes" and must return zero rows — collapsing it to
+     * n_filter == 0 handed back the unfiltered top-k instead, so a predicate
+     * that legitimately matches nothing returned the whole corpus. Answer here;
+     * there is nothing to ask the daemon.
+     */
+    if (empty_filter)
+    {
+        ReturnSetInfo *rsi = (ReturnSetInfo *) fcinfo->resultinfo;
+        TupleDesc      td;
+
+        if (get_call_result_type(fcinfo, NULL, &td) != TYPEFUNC_COMPOSITE)
+            elog(ERROR, "cuvs_filtered_knn: return type must be a row type");
+        rsi->returnMode = SFRM_Materialize;
+        rsi->setResult  = tuplestore_begin_heap(true, false, work_mem);
+        rsi->setDesc    = td;
+        PG_RETURN_NULL();
     }
 
     /* --- IPC call. --- */
@@ -6128,6 +6152,20 @@ cuvs_cs_build(CuvsFilteredScanState *state, EState *estate)
 
     if (ntids > 1)
         qsort(tids, (size_t)ntids, sizeof(uint64_t), compare_tid_enc);
+
+    /*
+     * The qual matched nothing. Passing n_filter_tids = 0 to the daemon means
+     * "no filter", so the scan would answer with the UNFILTERED top-k — rows the
+     * predicate explicitly excluded. An empty match set must produce an empty
+     * scan.
+     */
+    if (ntids == 0)
+    {
+        state->n_results = 0;
+        state->built     = true;
+        state->cursor    = 0;
+        return;
+    }
 
     /* --- Step 2: GPU BF search — 3O pre-filter or D-wedge based on selectivity. --- */
     PgVector *qvec = DatumGetPgVector(state->query_datum);

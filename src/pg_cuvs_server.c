@@ -3023,25 +3023,29 @@ handle_search(int client_fd, const CuvsCmdFrame *cmd)
                 if (filter_mem != MAP_FAILED)
                     filter_tids = (uint64_t *)filter_mem;
             }
-            /* Fail closed. This path exists to confine results to the caller's
-             * TID whitelist (tenant isolation, ADR-063); answering with the
-             * unfiltered top-k on an shm failure silently returns rows the
-             * caller excluded, with CUVS_STATUS_OK. The streaming-BF path
-             * already refuses in the same situation — match it. */
-            if (!filter_tids)
-            {
-                free(raw); free(results);
-                CuvsReplyHeader hdr = {0};
-                hdr.status = CUVS_STATUS_ERROR;
-                strncpy(hdr.error,
-                        "filter TID set could not be mapped; refusing to return "
-                        "unfiltered rows",
-                        sizeof(hdr.error) - 1);
-                record_search_stat(e, hdr.status, 0, hdr.error);
-                pthread_mutex_unlock(&g_index_mutex);
-                send_all(client_fd, &hdr, sizeof(hdr));
-                return;
-            }
+        }
+
+        /* Fail closed, keyed on the REQUEST (n_filter_tids) rather than on the
+         * shm key. This path confines results to the caller's TID whitelist
+         * (tenant isolation, ADR-063); returning the unfiltered top-k with
+         * CUVS_STATUS_OK silently hands back rows the caller excluded. An empty
+         * filter_shm_key with n_filter_tids > 0 must land here too: testing only
+         * the mmap result *inside* the "key is non-empty" branch let such a
+         * frame skip the check entirely. The streaming-BF path already refuses
+         * here — match it. */
+        if (cmd->n_filter_tids > 0 && !filter_tids)
+        {
+            free(raw); free(results);
+            if (filter_mem != MAP_FAILED) munmap(filter_mem, filter_bytes);
+            CuvsReplyHeader hdr = {0};
+            hdr.status = CUVS_STATUS_ERROR;
+            strncpy(hdr.error,
+                    "filter TID set unavailable; refusing to return unfiltered rows",
+                    sizeof(hdr.error) - 1);
+            record_search_stat(e, hdr.status, 0, hdr.error);
+            pthread_mutex_unlock(&g_index_mutex);
+            send_all(client_fd, &hdr, sizeof(hdr));
+            return;
         }
 
         int n_valid = 0;

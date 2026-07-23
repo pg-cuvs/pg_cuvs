@@ -27,3 +27,13 @@ COMMENT ON FUNCTION pg_cuvs_hw_profile() IS
   'stale profile vs the running daemon (GPU swap / migration). Bandwidths are '
   'bytes per microsecond; gpu_bf_tput is (vectors*dim) per microsecond. Read-only; '
   'not yet consumed by the cost model.';
+
+-- These five reach into daemon-global state (VRAM budget, a VRAM balloon, and the
+-- fault-injection counters). PostgreSQL grants EXECUTE to PUBLIC by default, which
+-- would let any role arm a build failure or pin VRAM and break *other* sessions'
+-- index builds. Applied on upgrade as well as fresh install.
+REVOKE ALL ON FUNCTION pg_cuvs_set_vram_budget(bigint)     FROM PUBLIC;
+REVOKE ALL ON FUNCTION pg_cuvs_eat_vram(bigint)            FROM PUBLIC;
+REVOKE ALL ON FUNCTION pg_cuvs_free_vram()                 FROM PUBLIC;
+REVOKE ALL ON FUNCTION pg_cuvs_inject_extend_oom(integer)  FROM PUBLIC;
+REVOKE ALL ON FUNCTION pg_cuvs_inject_build_oom(integer)   FROM PUBLIC;
