@@ -2205,6 +2205,143 @@ topk_insert(CuvsResult *top, int *pn, int k, uint64_t tid, float dist)
     top[pos].distance = dist;
 }
 
+static void *
+map_shm_readonly(const char *key, size_t bytes)
+{
+    int fd;
+    struct stat st;
+    void *mem;
+
+    if (!key || key[0] == '\0' || bytes == 0)
+        return MAP_FAILED;
+    fd = shm_open(key, O_RDONLY, 0);
+    if (fd < 0)
+        return MAP_FAILED;
+    if (fstat(fd, &st) != 0 || st.st_size < 0
+        || (uint64_t)st.st_size < (uint64_t)bytes)
+    {
+        close(fd);
+        return MAP_FAILED;
+    }
+    mem = mmap(NULL, bytes, PROT_READ, MAP_SHARED, fd, 0);
+    close(fd);
+    return mem;
+}
+
+static int
+search_filter_exact(IndexEntry *e, const float *query,
+                    const uint64_t *filter_tids, uint32_t n_filter,
+                    int k, int chunk_cap, CuvsResult *top, int *pn)
+{
+    int32_t *item_ids = NULL;
+    int n_items = 0;
+    int vfd = -1;
+    float *chunkbuf = NULL;
+    CuvsSearchResult *chunk_res = NULL;
+    int status = CUVS_STATUS_ERROR;
+
+    *pn = 0;
+    if (!e->rev_tids || !e->rev_item_ids || e->n_vecs <= 0)
+        return CUVS_STATUS_NO_VECTORS;
+
+    item_ids = malloc((size_t)n_filter * sizeof(*item_ids));
+    if (!item_ids)
+        goto cleanup;
+
+    for (uint32_t fi = 0; fi < n_filter; fi++)
+    {
+        uint64_t want = filter_tids[fi];
+        int64_t lo = 0;
+        int64_t hi = e->n_vecs - 1;
+
+        if (fi > 0 && want == filter_tids[fi - 1])
+            continue;
+        while (lo <= hi)
+        {
+            int64_t mid = lo + (hi - lo) / 2;
+
+            if (e->rev_tids[mid] == want)
+            {
+                int32_t item_id = e->rev_item_ids[mid];
+
+                if (item_id >= 0 && (int64_t)item_id < e->n_vecs)
+                    item_ids[n_items++] = item_id;
+                break;
+            }
+            if (e->rev_tids[mid] < want)
+                lo = mid + 1;
+            else
+                hi = mid - 1;
+        }
+    }
+
+    if (n_items == 0)
+    {
+        status = CUVS_STATUS_OK;
+        goto cleanup;
+    }
+
+    char vpath[512];
+    CuvsVectorsHeader vh;
+    vectors_file_path(vpath, sizeof(vpath), g_index_dir, e->db_oid, e->index_oid);
+    vfd = open(vpath, O_RDONLY);
+    if (vfd < 0
+        || pread(vfd, &vh, sizeof(vh), 0) != (ssize_t)sizeof(vh)
+        || vh.magic != CUVS_VECTORS_MAGIC
+        || vh.dim != e->dim
+        || vh.metric != e->metric
+        || vh.n_vecs != e->n_vecs)
+    {
+        status = CUVS_STATUS_NO_VECTORS;
+        goto cleanup;
+    }
+
+    if (chunk_cap < 1)
+        chunk_cap = 1;
+    int cap = chunk_cap < n_items ? chunk_cap : n_items;
+    int result_cap = k < cap ? k : cap;
+    chunkbuf = malloc((size_t)cap * (size_t)e->dim * sizeof(*chunkbuf));
+    chunk_res = malloc((size_t)result_cap * sizeof(*chunk_res));
+    if (!chunkbuf || !chunk_res)
+        goto cleanup;
+
+    for (int base = 0; base < n_items; base += cap)
+    {
+        int chunk_n = n_items - base < cap ? n_items - base : cap;
+        int search_k = k < chunk_n ? k : chunk_n;
+
+        if (gather_chunk_pread(vfd, e->dim, item_ids + base,
+                               chunk_n, chunkbuf) != 0
+            || cuvs_brute_force_search(chunkbuf, query, chunk_n, (int)e->dim,
+                                       search_k, e->metric, chunk_res,
+                                       delta_gpu_of(e)) != 0)
+            goto cleanup;
+
+        for (int j = 0; j < search_k; j++)
+        {
+            int64_t row = chunk_res[j].item_id;
+
+            if (row >= 0 && row < chunk_n)
+            {
+                int32_t item_id = item_ids[base + row];
+
+                if (item_id >= 0 && (int64_t)item_id < e->n_vecs)
+                    topk_insert(top, pn, k, e->tids[item_id],
+                                chunk_res[j].distance);
+            }
+        }
+    }
+    status = CUVS_STATUS_OK;
+
+cleanup:
+    if (vfd >= 0)
+        close(vfd);
+    free(item_ids);
+    free(chunkbuf);
+    free(chunk_res);
+    return status;
+}
+
 static void
 handle_search_stream_bf(int client_fd, const CuvsCmdFrame *cmd)
 {
@@ -2282,17 +2419,10 @@ handle_search_stream_bf(int client_fd, const CuvsCmdFrame *cmd)
     uint64_t *flt_tids = NULL;
     void     *flt_mem  = MAP_FAILED;
     size_t    flt_bytes = (size_t)cmd->n_filter_tids * sizeof(uint64_t);
-    if (cmd->n_filter_tids > 0 && cmd->filter_shm_key[0] != '\0')
-    {
-        int ffd = shm_open(cmd->filter_shm_key, O_RDONLY, 0);
-        if (ffd >= 0)
-        {
-            flt_mem = mmap(NULL, flt_bytes, PROT_READ, MAP_SHARED, ffd, 0);
-            close(ffd);
-            if (flt_mem != MAP_FAILED)
-                flt_tids = (uint64_t *) flt_mem;
-        }
-    }
+    if (cmd->n_filter_tids > 0)
+        flt_mem = map_shm_readonly(cmd->filter_shm_key, flt_bytes);
+    if (flt_mem != MAP_FAILED)
+        flt_tids = (uint64_t *)flt_mem;
     if (!flt_tids)
     {
         munmap(query, vec_bytes);
@@ -2303,106 +2433,38 @@ handle_search_stream_bf(int client_fd, const CuvsCmdFrame *cmd)
         return;
     }
 
-    /* TID -> item_id via 3O reverse map (binary search); collect, drop misses. */
-    int64_t  nv       = e->n_vecs;
-    int32_t *item_ids = malloc((size_t)cmd->n_filter_tids * sizeof(int32_t));
-    int      n_items  = 0;
-    if (item_ids)
+    int k = (int)cmd->k;
+    if (k < 1)
+        k = 1;
+    int chunk_cap = (cmd->n_vecs > 0) ? (int)cmd->n_vecs : 1;
+    uint64_t *sorted_tids = malloc(flt_bytes);
+    CuvsResult *top = malloc((size_t)k * sizeof(*top));
+    int pn = 0;
+    int status = CUVS_STATUS_ERROR;
+    if (sorted_tids && top)
     {
-        for (uint32_t fi = 0; fi < cmd->n_filter_tids; fi++)
-        {
-            uint64_t want = flt_tids[fi];
-            int64_t  lo = 0, hi = nv - 1;
-            while (lo <= hi)
-            {
-                int64_t mid = lo + (hi - lo) / 2;
-                if (e->rev_tids[mid] == want)
-                {
-                    int32_t iid = e->rev_item_ids[mid];
-                    if (iid >= 0 && (int64_t)iid < nv)
-                        item_ids[n_items++] = iid;
-                    break;
-                }
-                if (e->rev_tids[mid] < want) lo = mid + 1;
-                else                          hi = mid - 1;
-            }
-        }
+        memcpy(sorted_tids, flt_tids, flt_bytes);
+        cuvs_u64_sort(sorted_tids, cmd->n_filter_tids);
+        status = search_filter_exact(e, query, sorted_tids,
+                                     cmd->n_filter_tids, k, chunk_cap,
+                                     top, &pn);
     }
     if (flt_mem != MAP_FAILED)
         munmap(flt_mem, flt_bytes);
-
-    int k = (int)cmd->k;
-    if (k < 1) k = 1;
-    int chunk_cap = (cmd->n_vecs > 0) ? (int)cmd->n_vecs : 1;
-    int dev       = delta_gpu_of(e);
-
-    /* Open + validate the .vectors sidecar (item_id-ordered float32 body). */
-    char vpath[512];
-    vectors_file_path(vpath, sizeof(vpath), g_index_dir, e->db_oid, e->index_oid);
-    int vfd = open(vpath, O_RDONLY);
-    CuvsVectorsHeader vh;
-    int ok = (vfd >= 0);
-    if (ok)
-    {
-        ssize_t hr = pread(vfd, &vh, sizeof(vh), 0);
-        ok = (hr == (ssize_t)sizeof(vh)
-              && vh.magic == CUVS_VECTORS_MAGIC
-              && vh.dim == e->dim && vh.metric == e->metric
-              && vh.n_vecs == e->n_vecs);
-    }
-    if (!ok || !item_ids)
-    {
-        if (vfd >= 0) close(vfd);
-        free(item_ids);
-        munmap(query, vec_bytes);
-        pthread_mutex_unlock(&g_index_mutex);
-        CuvsReplyHeader hdr = {0};
-        hdr.status = ok ? CUVS_STATUS_ERROR : CUVS_STATUS_NO_VECTORS;
-        send_all(client_fd, &hdr, sizeof(hdr));
-        return;
-    }
-
-    /* Chunk buffers (sized to the cap, reused across chunks). */
-    int cap = (chunk_cap < n_items) ? chunk_cap : (n_items > 0 ? n_items : 1);
-    float            *chunkbuf  = malloc((size_t)cap * (size_t)e->dim * sizeof(float));
-    CuvsSearchResult *chunk_res = malloc((size_t)k * sizeof(CuvsSearchResult));
-    CuvsResult       *top       = malloc((size_t)k * sizeof(CuvsResult));
-    int pn = 0;
-    int failed = (!chunkbuf || !chunk_res || !top);
-
-    for (int base = 0; !failed && base < n_items; base += chunk_cap)
-    {
-        int chunk_n = (n_items - base < chunk_cap) ? (n_items - base) : chunk_cap;
-        if (gather_chunk_pread(vfd, e->dim, item_ids + base, chunk_n, chunkbuf) != 0)
-        { failed = 1; break; }
-
-        int sk = (k < chunk_n) ? k : chunk_n;
-        if (cuvs_brute_force_search(chunkbuf, query, chunk_n, (int)e->dim,
-                                    sk, e->metric, chunk_res, dev) != 0)
-        { failed = 1; break; }
-
-        for (int j = 0; j < sk; j++)
-        {
-            int64_t row = chunk_res[j].item_id;
-            if (row < 0 || row >= chunk_n) continue;
-            int32_t gid = item_ids[base + row];
-            if (gid < 0 || (int64_t)gid >= e->n_vecs) continue;
-            topk_insert(top, &pn, k, e->tids[gid], chunk_res[j].distance);
-        }
-    }
-
-    close(vfd);
     munmap(query, vec_bytes);
-    free(item_ids);
-    free(chunkbuf);
-    free(chunk_res);
+    free(sorted_tids);
 
-    if (failed)
+    if (status != CUVS_STATUS_OK)
     {
         free(top);
-        record_search_stat(e, CUVS_STATUS_ERROR, 0, "stream_bf failed");
+        if (status == CUVS_STATUS_ERROR)
+            record_search_stat(e, status, 0, "stream_bf failed");
         pthread_mutex_unlock(&g_index_mutex);
-        send_error(client_fd, "stream_bf failed");
+        CuvsReplyHeader hdr = {0};
+        hdr.status = (uint32_t)status;
+        if (status == CUVS_STATUS_ERROR)
+            strncpy(hdr.error, "stream_bf failed", sizeof(hdr.error) - 1);
+        send_all(client_fd, &hdr, sizeof(hdr));
         return;
     }
 
@@ -2754,7 +2816,10 @@ handle_search(int client_fd, const CuvsCmdFrame *cmd)
          * and block until the worker fills our result. The query shm stays mapped
          * (req.query points at it) until we reply. On a full queue we degrade to
          * the immediate path below by re-acquiring the lock and re-finding e. */
-        if (cmd->bf_batch_wait_us > 0 && g_bf_worker_started)
+        if (cmd->bf_batch_wait_us > 0 && g_bf_worker_started
+            && !(cmd->use_prefilter && cmd->n_filter_tids > 0
+                 && e->handle != NULL && e->rev_tids != NULL
+                 && e->rev_item_ids != NULL))
         {
             CuvsBfKey     key  = { cmd->db_oid, cmd->index_oid, cmd->bf_precision, cmd->dim };
             CuvsResult   *rout = malloc((size_t) k * sizeof(CuvsResult));
@@ -2825,7 +2890,10 @@ handle_search(int client_fd, const CuvsCmdFrame *cmd)
         }
 
         refresh_main_bf_cache(e, cmd->bf_precision);
-        if (!e->main_bf_idx)
+        if (!e->main_bf_idx
+            && !(cmd->use_prefilter && cmd->n_filter_tids > 0
+                 && e->handle != NULL && e->rev_tids != NULL
+                 && e->rev_item_ids != NULL))
         {
             munmap(query, vec_bytes);
             CuvsReplyHeader hdr = {0};
@@ -2843,7 +2911,8 @@ handle_search(int client_fd, const CuvsCmdFrame *cmd)
         /* 3O: GPU BITSET prefilter path.
          * Converts filter TIDs → bitset via rev map, then calls cuVS filtered BF.
          * Falls through to D-wedge below on any allocation or search failure. */
-        if (cmd->use_prefilter && cmd->n_filter_tids > 0 && e->rev_tids != NULL)
+        if (cmd->use_prefilter && cmd->n_filter_tids > 0
+            && e->rev_tids != NULL && e->rev_item_ids != NULL)
         {
             size_t    flt_bytes  = (size_t)cmd->n_filter_tids * sizeof(uint64_t);
             void     *flt_mem    = MAP_FAILED;
@@ -2853,19 +2922,12 @@ handle_search(int client_fd, const CuvsCmdFrame *cmd)
             CuvsResult       *presults = NULL;
             int pn = 0, did_prefilter = 0, used_cagra = 0;
 
-            if (cmd->filter_shm_key[0] != '\0')
-            {
-                int ffd = shm_open(cmd->filter_shm_key, O_RDONLY, 0);
-                if (ffd >= 0) {
-                    flt_mem = mmap(NULL, flt_bytes, PROT_READ, MAP_SHARED, ffd, 0);
-                    close(ffd);
-                    if (flt_mem != MAP_FAILED)
-                        flt_tids = (uint64_t *) flt_mem;
-                }
-            }
+            flt_mem = map_shm_readonly(cmd->filter_shm_key, flt_bytes);
+            if (flt_mem != MAP_FAILED)
+                flt_tids = (uint64_t *)flt_mem;
 
             if (flt_tids) {
-                int64_t  nv      = e->main_bf_n;
+                int64_t  nv      = e->n_vecs;
                 uint32_t nwords  = (uint32_t)((nv + 31) / 32);
                 bitset   = malloc((size_t)nwords * sizeof(uint32_t));
                 praw     = malloc((size_t)(k > 0 ? k : 1) * sizeof(CuvsSearchResult));
@@ -2946,11 +3008,59 @@ handle_search(int client_fd, const CuvsCmdFrame *cmd)
             /* 3O failed (search error or malloc); fall through to D-wedge. */
         }
 
-        /* D-wedge: overfetch 4x when post-filtering so top-k survive. */
-        int64_t bk_target = (cmd->n_filter_tids > 0)
-            ? (int64_t)k * 4
-            : (int64_t)k;
-        int bk = (int)(bk_target < e->main_bf_n ? bk_target : e->main_bf_n);
+        if (!e->main_bf_idx)
+        {
+            munmap(query, vec_bytes);
+            CuvsReplyHeader hdr = {0};
+            hdr.status = CUVS_STATUS_NO_VECTORS;
+            strncpy(hdr.error,
+                    "prefilter failed and no brute-force vectors are available",
+                    sizeof(hdr.error) - 1);
+            record_search_stat(e, hdr.status, 0, hdr.error);
+            pthread_mutex_unlock(&g_index_mutex);
+            send_all(client_fd, &hdr, sizeof(hdr));
+            return;
+        }
+
+        /* D-wedge: exact BF over the whole corpus, then post-filter down to the
+         * whitelist -- so the fetch depth must be deep enough that ~k filtered
+         * rows survive. For a filter uncorrelated with distance the j-th
+         * filtered neighbour sits at unfiltered rank ~ j/sel, so the depth has
+         * to scale with 1/sel. A fixed 4x ignores selectivity and collapses:
+         * ADR-082 measured recall 0.011 with 0.11 rows returned at sel=0.001.
+         * The 2x factor covers the variance of Binomial(bk, sel) so ~k rows
+         * survive rather than exactly k in expectation. bk is clamped to the
+         * corpus and to the exact-fallback chunk cap below. If that prefix
+         * comes up short, the sidecar path scans only whitelist vectors in
+         * bounded chunks. */
+        int64_t bk_target = (int64_t) k;
+        if (cmd->n_filter_tids > 0)
+        {
+            double sel = (e->main_bf_n > 0)
+                ? (double) cmd->n_filter_tids / (double) e->main_bf_n
+                : 0.0;
+            bk_target = (int64_t) k * 4;
+            if (sel > 0.0)
+            {
+                /* Clamp in double space before converting: a pathologically
+                 * small selectivity (a stale reltuples, say) would otherwise
+                 * overflow the int64_t conversion, which is undefined. The
+                 * corpus is the only meaningful ceiling anyway. */
+                double want = (double) k / sel * 2.0;
+                double cap  = (double) e->main_bf_n;
+                if (want > cap)
+                    want = cap;
+                if (want > (double) bk_target)
+                    bk_target = (int64_t) want;
+            }
+        }
+        int exact_chunk_cap = (cmd->n_vecs > 0 && cmd->n_vecs <= INT32_MAX)
+            ? (int)cmd->n_vecs : 1;
+        int64_t bk_limit = exact_chunk_cap > k ? exact_chunk_cap : k;
+        int64_t bk_value = bk_target < e->main_bf_n ? bk_target : e->main_bf_n;
+        if (bk_value > bk_limit)
+            bk_value = bk_limit;
+        int bk = (int)bk_value;
         CuvsSearchResult *raw     = malloc((size_t)(bk > 0 ? bk : 1) * sizeof(CuvsSearchResult));
         CuvsResult       *results = malloc((size_t)(k  > 0 ? k  : 1) * sizeof(CuvsResult));
         if (!raw || !results)
@@ -2965,10 +3075,10 @@ handle_search(int client_fd, const CuvsCmdFrame *cmd)
         int ret = (bk > 0)
             ? cuvs_bf_search(e->main_bf_idx, query, (int) cmd->dim, bk, raw, delta_gpu_of(e))
             : 0;
-        munmap(query, vec_bytes);
         if (ret != 0)
         {
             free(raw); free(results);
+            munmap(query, vec_bytes);
             CuvsReplyHeader hdr = {0};
             hdr.status = (ret == 2) ? CUVS_STATUS_DIM_MISMATCH : CUVS_STATUS_OOM_FALLBACK;
             strncpy(hdr.error,
@@ -2984,46 +3094,92 @@ handle_search(int client_fd, const CuvsCmdFrame *cmd)
         uint64_t *filter_tids = NULL;
         void     *filter_mem  = MAP_FAILED;
         size_t    filter_bytes = 0;
-        if (cmd->n_filter_tids > 0 && cmd->filter_shm_key[0] != '\0')
+        if (cmd->n_filter_tids > 0)
         {
             filter_bytes = (size_t)cmd->n_filter_tids * sizeof(uint64_t);
-            int ffd = shm_open(cmd->filter_shm_key, O_RDONLY, 0);
-            if (ffd >= 0)
+            filter_mem = map_shm_readonly(cmd->filter_shm_key, filter_bytes);
+            if (filter_mem != MAP_FAILED)
             {
-                filter_mem = mmap(NULL, filter_bytes, PROT_READ, MAP_SHARED, ffd, 0);
-                close(ffd);
-                if (filter_mem != MAP_FAILED)
-                    filter_tids = (uint64_t *)filter_mem;
+                filter_tids = malloc(filter_bytes);
+                if (filter_tids)
+                {
+                    memcpy(filter_tids, filter_mem, filter_bytes);
+                    cuvs_u64_sort(filter_tids, cmd->n_filter_tids);
+                }
             }
-            /* On shm failure: fall through to unfiltered (spike graceful degrade). */
+        }
+        if (filter_mem != MAP_FAILED)
+        {
+            munmap(filter_mem, filter_bytes);
+            filter_mem = MAP_FAILED;
+        }
+
+        /* Fail closed, keyed on the REQUEST (n_filter_tids) rather than on the
+         * shm key. This path exists to confine results to the caller's TID
+         * whitelist (tenant isolation, ADR-063); returning the unfiltered top-k
+         * with CUVS_STATUS_OK silently hands back rows the caller excluded.
+         * Note an empty filter_shm_key with n_filter_tids > 0 must land here
+         * too: an earlier version tested only the mmap result *inside* the
+         * "key is non-empty" branch, so a frame with no key skipped the check
+         * entirely and still produced unfiltered rows. The streaming-BF path
+         * already refuses in the same situation — match it. */
+        if (cmd->n_filter_tids > 0 && !filter_tids)
+        {
+            free(raw); free(results);
+            free(filter_tids);
+            munmap(query, vec_bytes);
+            CuvsReplyHeader hdr = {0};
+            hdr.status = CUVS_STATUS_ERROR;
+            strncpy(hdr.error,
+                    "filter TID set unavailable; refusing to return unfiltered rows",
+                    sizeof(hdr.error) - 1);
+            record_search_stat(e, hdr.status, 0, hdr.error);
+            pthread_mutex_unlock(&g_index_mutex);
+            send_all(client_fd, &hdr, sizeof(hdr));
+            return;
         }
 
         int n_valid = 0;
         for (int i = 0; i < bk && n_valid < k; i++)
         {
             int64_t id = raw[i].item_id;
-            if (id < 0 || id >= e->n_vecs) continue;
+            if (id < 0 || id >= e->n_vecs)
+                continue;
             uint64_t tid = e->tids[id];
-            if (filter_tids)
-            {
-                uint32_t lo = 0, hi = cmd->n_filter_tids;
-                int found = 0;
-                while (lo < hi)
-                {
-                    uint32_t mid = lo + (hi - lo) / 2;
-                    if (filter_tids[mid] == tid) { found = 1; break; }
-                    if (filter_tids[mid] < tid)  lo = mid + 1;
-                    else                          hi = mid;
-                }
-                if (!found) continue;
-            }
-            results[n_valid].tid      = tid;
+            if (filter_tids
+                && !cuvs_u64_contains(filter_tids, cmd->n_filter_tids, tid))
+                continue;
+            results[n_valid].tid = tid;
             results[n_valid].distance = raw[i].distance;
             n_valid++;
         }
         free(raw);
-        if (filter_mem != MAP_FAILED)
-            munmap(filter_mem, filter_bytes);
+
+        int exact_status = CUVS_STATUS_OK;
+        int used_exact = 0;
+        if (filter_tids && n_valid < k && (int64_t)bk < e->main_bf_n)
+        {
+            used_exact = 1;
+            exact_status = search_filter_exact(
+                e, query, filter_tids, cmd->n_filter_tids,
+                k, exact_chunk_cap, results, &n_valid);
+        }
+        free(filter_tids);
+        munmap(query, vec_bytes);
+
+        if (exact_status != CUVS_STATUS_OK)
+        {
+            free(results);
+            CuvsReplyHeader hdr = {0};
+            hdr.status = (uint32_t)exact_status;
+            strncpy(hdr.error,
+                    "filtered search could not complete exact fallback",
+                    sizeof(hdr.error) - 1);
+            record_search_stat(e, hdr.status, 0, hdr.error);
+            pthread_mutex_unlock(&g_index_mutex);
+            send_all(client_fd, &hdr, sizeof(hdr));
+            return;
+        }
 
         clock_gettime(CLOCK_MONOTONIC, &t1);
         uint32_t latency_us = (uint32_t)(
@@ -3033,7 +3189,7 @@ handle_search(int client_fd, const CuvsCmdFrame *cmd)
         record_search_stat(e, CUVS_STATUS_OK, latency_us, NULL);
         e->last_requested_k = cmd->k;
         e->last_returned_k  = (uint32_t) n_valid;
-        e->last_search_mode = 3; /* gpu_bf */
+        e->last_search_mode = used_exact ? 6 : 3;
 
         pthread_mutex_unlock(&g_index_mutex);
 
@@ -3069,6 +3225,25 @@ handle_search(int client_fd, const CuvsCmdFrame *cmd)
         int use_bf    = (cmd->search_mode == 1);   /* Phase 3L: brute_force over shards */
         uint32_t snap_db  = e->db_oid;
         uint32_t snap_idx = e->index_oid;
+
+        /* The sharded fanout below never consumes cmd->filter_shm_key, and the
+         * merge does not re-apply the whitelist, so a filtered request answered
+         * here would silently return rows the caller excluded. cuvs_ipc.h used
+         * to promise a per-shard post-filter that was never implemented; until
+         * it is, refuse rather than widen the result set. */
+        if (cmd->n_filter_tids > 0)
+        {
+            munmap(query, vec_bytes);
+            CuvsReplyHeader hdr = {0};
+            hdr.status = CUVS_STATUS_ERROR;
+            strncpy(hdr.error,
+                    "filtered search is not implemented for sharded indexes",
+                    sizeof(hdr.error) - 1);
+            record_search_stat(e, hdr.status, 0, hdr.error);
+            pthread_mutex_unlock(&g_index_mutex);
+            send_all(client_fd, &hdr, sizeof(hdr));
+            return;
+        }
 
         /* Phase 3L: brute_force over a sharded index — ensure every shard has a
          * resident BF index over its range. Fail closed (NO_VECTORS) if the
@@ -4234,6 +4409,7 @@ build_sharded(int client_fd, const CuvsCmdFrame *cmd, const char *index_dir,
         }
         pthread_mutex_unlock(&g_index_mutex);
         free(new_tids); free(shards); free(recs); free(shard_tmp); free(shard_final);
+        cuvs_set_inject_build_oom(0);   /* #82: see handle_build */
         send_error_code(client_fd, CUVS_STATUS_BUILD_FAILED, "sharded build failed");
         return;
     }
@@ -4712,6 +4888,14 @@ handle_build(int client_fd, const CuvsCmdFrame *cmd)
     if (!new_handle)
     {
         LOG_ERROR("[handle_build] cuvs_cagra_build returned NULL\n");
+        /* #82: the build-OOM injection is daemon-global and outlives the test
+         * that armed it — a test that arms N failures then aborts under
+         * ON_ERROR_STOP never reaches its disarm call, and the leftover arm
+         * kills the next cagra build in an unrelated test. Clear it where a
+         * cagra build gives up for good. Deliberately NOT in send_error_code():
+         * EXTEND and COMPACT also report BUILD_FAILED, and a generic serializer
+         * must not disarm a scenario that belongs to a different operation. */
+        cuvs_set_inject_build_oom(0);
         pthread_mutex_unlock(&g_index_mutex);
         munmap(mem, total);
         send_error_code(client_fd, CUVS_STATUS_BUILD_FAILED, "cuvs_cagra_build failed");
@@ -5331,6 +5515,7 @@ handle_build_multi(int client_fd, const CuvsCmdFrame *cmd, const char *index_dir
 
         if (!new_handle)
         {
+            cuvs_set_inject_build_oom(0);   /* #82: see handle_build */
             pthread_mutex_unlock(&g_index_mutex);
             status = CUVS_STATUS_BUILD_FAILED;
             err = "cuvs_cagra_build_multi failed";

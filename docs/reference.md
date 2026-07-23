@@ -179,8 +179,8 @@ Defaults and ranges are from source. "Set by" is the minimum role/scope: `USERSE
 
 | GUC | Type | Default | Range | Set by | Purpose |
 |-----|------|---------|-------|--------|---------|
-| `cuvs.filter_auto_threshold` | real | `0.05` | 0.0–1.0 | USERSET | Selectivity below which filtered BF uses the GPU BITSET prefilter instead of D-wedge post-filter |
-| `cuvs.stream_bf_selectivity_threshold` | real | `0.0` (off) | 0.0–1.0 | USERSET | Selectivity below which filtered BF streams out-of-core from `.vectors` (ADR-064) |
+| `cuvs.filter_auto_threshold` | real | `0.0` | 0.0–1.0 | USERSET | Selectivity below which filtered BF uses the **approximate** GPU BITSET prefilter (3O) instead of the exact D-wedge post-filter. Defaults to off: 3O recall collapses on selective filters (0.28 at 1e-4, ADR-082) and the exact paths are faster there |
+| `cuvs.stream_bf_selectivity_threshold` | real | `0.004` | 0.0–1.0 | USERSET | Selectivity below which filtered BF streams out-of-core from `.vectors`; the default is the measured D-wedge/stream crossover (ADR-064/082) |
 | `cuvs.stream_bf_chunk_vectors` | int | `262144` | 1–INT_MAX | USERSET | Vectors per GPU chunk in streaming BF (footprint only; result is exact for any chunking) |
 | `cuvs.filtered_knn_hook` | bool | `off` | — | USERSET | Enable the D-wedge Custom Scan hook (ADR-063 spike) |
 | `cuvs.max_batch_queries` | int | `1024` | 1–4096 | USERSET | Max query vectors per `pg_cuvs_batch_search` call |

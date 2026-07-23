@@ -146,6 +146,23 @@ test_status_str(void)
 }
 
 static void
+test_u64_sorted_set(void)
+{
+    uint64_t values[] = {9, 1, 7, 1, 3};
+
+    /* Given an unordered whitelist with a duplicate, when it is normalized. */
+    cuvs_u64_sort(values, sizeof(values) / sizeof(values[0]));
+
+    /* Then membership is independent of caller order and absent values stay absent. */
+    ASSERT(values[0] == 1 && values[1] == 1 && values[2] == 3
+           && values[3] == 7 && values[4] == 9,
+           "u64 set sorts ascending");
+    ASSERT(cuvs_u64_contains(values, 5, 1) == 1, "u64 set finds first duplicate");
+    ASSERT(cuvs_u64_contains(values, 5, 7) == 1, "u64 set finds interior value");
+    ASSERT(cuvs_u64_contains(values, 5, 8) == 0, "u64 set rejects absent value");
+}
+
+static void
 test_circuit_breaker(void)
 {
     const uint32_t oid = 7;
@@ -1075,6 +1092,7 @@ main(void)
     test_parse_index_filename();
     test_proto_frame_layout();
     test_status_str();
+    test_u64_sorted_set();
     test_circuit_breaker();
     test_circuit_breaker_status_classification();
     test_crc32();

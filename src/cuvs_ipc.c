@@ -1274,7 +1274,8 @@ cuvs_ipc_search_filtered(
     int           *n_out,
     uint32_t      *latency_us_out,
     int           *delta_merged_out,
-    int            use_prefilter)
+    int            use_prefilter,
+    int            exact_chunk_cap)
 {
     char shm_key[64];
     char filter_shm_key[64];
@@ -1317,6 +1318,7 @@ cuvs_ipc_search_filtered(
             goto cleanup;
         }
         memcpy(fmem, filter_tids, filter_bytes);
+        cuvs_u64_sort((uint64_t *) fmem, n_filter);
         munmap(fmem, filter_bytes);
     }
     else
@@ -1338,7 +1340,7 @@ cuvs_ipc_search_filtered(
         .k             = (uint32_t)k,
         .metric        = metric,
         .dim           = (uint32_t)dim,
-        .n_vecs        = 0,
+        .n_vecs        = (int64_t)(exact_chunk_cap > 0 ? exact_chunk_cap : 1),
         .search_mode   = search_mode,
         .bf_precision  = bf_precision,
         .n_filter_tids = has_filter ? n_filter : 0,
@@ -1469,6 +1471,7 @@ cuvs_ipc_search_stream_bf(
             goto cleanup;
         }
         memcpy(fmem, filter_tids, filter_bytes);
+        cuvs_u64_sort((uint64_t *) fmem, n_filter);
         munmap(fmem, filter_bytes);
     }
 

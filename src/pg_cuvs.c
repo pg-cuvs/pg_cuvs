@@ -61,6 +61,7 @@
 #include "catalog/pg_opfamily.h"    /* OPFAMILYOID, Form_pg_opfamily */
 #include "catalog/pg_amop.h"        /* AMOPOPID, Form_pg_amop, AMOP_ORDER (ADR-073 B metric) */
 #include "utils/catcache.h"         /* CatCList (SearchSysCacheList1) */
+#include "utils/acl.h"
 #include "nodes/extensible.h"       /* CustomPath, CustomScan (Option A D-wedge) */
 #include "optimizer/paths.h"        /* set_rel_pathlist_hook */
 #include "optimizer/pathnode.h"     /* add_path */
@@ -132,8 +133,8 @@ bool   cuvs_auto_compact                = false;
 int    cuvs_auto_compact_check_interval = 60;
 double cuvs_auto_compact_threshold      = 0.10;
 char  *cuvs_auto_compact_database       = NULL;
-double cuvs_filter_auto_threshold = 0.05;    /* 3O: selectivity below which pre-filter is used */
-double cuvs_stream_bf_selectivity_threshold = 0.0;  /* ADR-064: selectivity below which out-of-core stream BF is used; 0=off */
+double cuvs_filter_auto_threshold = 0.0;     /* 3O: selectivity below which the approximate BITSET prefilter is used; 0 = always exact (ADR-082) */
+double cuvs_stream_bf_selectivity_threshold = 0.004;  /* ADR-064: selectivity below which out-of-core stream BF is used; crossover vs D-wedge measured at ~0.004 (ADR-082); 0=off */
 int    cuvs_stream_bf_chunk_vectors = 262144;       /* ADR-064: max vectors per GPU chunk (footprint knob) */
 int   cuvs_ivfpq_n_probes          = 64;     /* 3P: IVF clusters probed per search (ivfpq AM) */
 int   cuvs_extend_chunk_size       = 0;      /* 3Q: CAGRA extend max_chunk_size; 0 = auto */
@@ -822,12 +823,16 @@ _PG_init(void)
     DefineCustomRealVariable(
         "cuvs.filter_auto_threshold",
         "Selectivity below which filtered BF uses GPU BITSET prefilter (3O) instead of D-wedge.",
-        "Selectivity = |filter| / N. Below this value, the daemon searches only within the "
-        "filter set via a GPU BITSET mask (3O), giving recall=1.00 at any selectivity. "
-        "Above this value, the D-wedge post-filter (k*4 overfetch) is used. "
-        "0.0 = always D-wedge, 1.0 = always 3O. Default 0.05 (confirmed by benchmark).",
+        "Selectivity = |filter| / N. Below this value, the daemon searches the CAGRA "
+        "graph under a GPU BITSET mask (3O) instead of the exact D-wedge post-filter. "
+        "3O is APPROXIMATE and its recall collapses on selective filters: measured "
+        "0.99 at sel>=1e-3 but 0.86 / 0.48 / 0.28 at 5e-4 / 2e-4 / 1e-4, where it also "
+        "stops returning a full k (ADR-082). The exact paths cover the whole range "
+        "faster, so this defaults to 0.0 = always exact; raise it only to trade "
+        "correctness for 3O's flat ~2ms latency. 1.0 = always 3O. 3O also remains the "
+        "automatic fallback when the .vectors sidecar is missing.",
         &cuvs_filter_auto_threshold,
-        0.05, 0.0, 1.0,
+        0.0, 0.0, 1.0,
         PGC_USERSET,
         0, NULL, NULL, NULL);
 
@@ -838,9 +843,13 @@ _PG_init(void)
         "filter-passing vectors from the on-disk .vectors sidecar (never resident "
         "whole in VRAM) and runs chunked GPU brute force — exact, for datasets that "
         "exceed VRAM. Takes precedence over cuvs.filter_auto_threshold (3O) when both "
-        "would fire and the sidecar is present. 0.0 = off (default).",
+        "would fire and the sidecar is present; falls back to 3O when it is not. "
+        "Its cost scales with |filter| while D-wedge's scales with 1/selectivity, so "
+        "the two exact paths cross near 0.004 (measured D-wedge/stream_bf p50: "
+        "3.6/12.9 ms at 5e-3 ... 4.3/3.1 ms at 3e-3 ... 35.4/0.45 ms at 1e-4, "
+        "ADR-082) — hence the default. 0.0 = off.",
         &cuvs_stream_bf_selectivity_threshold,
-        0.0, 0.0, 1.0,
+        0.004, 0.0, 1.0,
         PGC_USERSET,
         0, NULL, NULL, NULL);
 
@@ -1565,6 +1574,23 @@ cuvs_tombstone_count(Oid index_oid)
         || base_crc != hdr.base_tids_crc32)
         return 0;       /* belongs to a previous base build */
     return hdr.n_entries;
+}
+
+static int
+cuvs_k_with_tombstone_slack(Oid index_oid, int k)
+{
+    int64_t n_tombstones;
+
+    if (cuvs_max_delta_rows <= 0)
+        return k;
+    n_tombstones = cuvs_tombstone_count(index_oid);
+    if (n_tombstones <= 0)
+        return k;
+    if (n_tombstones > (int64_t) INT_MAX - k)
+        ereport(ERROR,
+                (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+                 errmsg("tombstone slack exceeds the supported result limit")));
+    return k + (int) n_tombstones;
 }
 
 /* pread/pwrite full-length wrappers (retry partials and EINTR). 0 on success. */
@@ -4728,6 +4754,24 @@ cuvs_metric_name(uint32_t metric)
     }
 }
 
+static void
+cuvs_require_table_select(Oid table_oid)
+{
+    AclResult acl_result = pg_class_aclcheck(
+        table_oid, GetUserId(), ACL_SELECT);
+
+    if (acl_result != ACLCHECK_OK)
+        aclcheck_error(acl_result, OBJECT_TABLE, get_rel_name(table_oid));
+}
+
+static void
+cuvs_require_index_owner(Oid index_oid)
+{
+    if (!object_ownercheck(RelationRelationId, index_oid, GetUserId()))
+        aclcheck_error(ACLCHECK_NOT_OWNER, OBJECT_INDEX,
+                       get_rel_name(index_oid));
+}
+
 /* ----------------------------------------------------------------
  * Phase 3M: pg_cuvs_batch_search(rel regclass, queries vector[], k int)
  *   RETURNS TABLE(query_idx int, ctid tid, distance float4)
@@ -4769,6 +4813,8 @@ pg_cuvs_batch_search(PG_FUNCTION_ARGS)
         ereport(ERROR,
                 (errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
                  errmsg("pg_cuvs_batch_search: k must be between 1 and 2000")));
+
+    cuvs_require_table_select(table_oid);
 
     /* --- Resolve the USING cagra index on the table. --- */
     Relation  heapRel = table_open(table_oid, AccessShareLock);
@@ -5497,6 +5543,8 @@ pg_cuvs_compact(PG_FUNCTION_ARGS)
                 (errcode(ERRCODE_UNDEFINED_OBJECT),
                  errmsg("index %u does not exist", index_oid)));
 
+    cuvs_require_index_owner(index_oid);
+
     rc = cuvs_ipc_compact(cuvs_socket_path,
                           (uint32_t) MyDatabaseId,
                           (uint32_t) index_oid,
@@ -5627,6 +5675,11 @@ pg_cuvs_gc_orphans(PG_FUNCTION_ARGS)
     struct dirent   *ent;
     GcId            *ids = NULL;
     int              n_ids = 0, cap = 0;
+
+    if (do_delete && !superuser())
+        ereport(ERROR,
+                (errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+                 errmsg("must be superuser to delete orphan pg_cuvs artifacts")));
 
     if (rsinfo == NULL || !IsA(rsinfo, ReturnSetInfo))
         ereport(ERROR,
@@ -5763,8 +5816,8 @@ pg_cuvs_gc_orphans(PG_FUNCTION_ARGS)
  *
  * Bypasses the AM scan path so non-index quals (e.g. tenant_id = $1) can
  * be passed as an explicit TID set.  The daemon post-filters BF results to
- * only the provided TIDs.  Degrades to unfiltered BF when filter_tids is
- * NULL or empty.
+ * only the provided TIDs.  Degrades to unfiltered BF only when filter_tids is
+ * NULL; an empty array returns no rows.
  * ---------------------------------------------------------------- */
 PG_FUNCTION_INFO_V1(cuvs_filtered_knn);
 Datum
@@ -5809,6 +5862,8 @@ cuvs_filtered_knn(PG_FUNCTION_ARGS)
                  errmsg("cuvs_filtered_knn: relation is not a \"USING cagra\" index")));
     }
     uint32_t metric = cuvs_index_metric(indexRel);
+    Oid heap_oid = IndexGetRelation(index_oid, false);
+    cuvs_require_table_select(heap_oid);
     index_close(indexRel, AccessShareLock);
 
     /* --- Query vector. --- */
@@ -5818,6 +5873,7 @@ cuvs_filtered_knn(PG_FUNCTION_ARGS)
     /* --- Deconstruct filter_tids bigint[] if provided. --- */
     uint64_t *filter_arr = NULL;
     uint32_t  n_filter   = 0;
+    bool      empty_filter = false;   /* non-NULL array with zero elements */
     if (!PG_ARGISNULL(2))
     {
         ArrayType *farr = PG_GETARG_ARRAYTYPE_P(2);
@@ -5838,13 +5894,33 @@ cuvs_filtered_knn(PG_FUNCTION_ARGS)
                 filter_arr[i] = elnulls[i] ? 0 : (uint64_t) DatumGetInt64(elems[i]);
             n_filter = (uint32_t) nelems;
         }
+        else
+            empty_filter = true;
+    }
+
+    /*
+     * An EMPTY whitelist is not the same as NULL. NULL means "no filter" and
+     * degrades to unfiltered BF, which is the documented contract. An empty
+     * array means "nothing passes" and must return zero rows — collapsing it to
+     * n_filter == 0 handed back the unfiltered top-k instead, so a predicate
+     * that legitimately matches nothing returned the whole corpus. Answer here;
+     * there is nothing to ask the daemon.
+     */
+    if (empty_filter)
+    {
+        oldcontext = MemoryContextSwitchTo(
+            rsinfo->econtext->ecxt_per_query_memory);
+        rsinfo->returnMode = SFRM_Materialize;
+        rsinfo->setResult  = tuplestore_begin_heap(true, false, work_mem);
+        rsinfo->setDesc    = tupdesc;
+        MemoryContextSwitchTo(oldcontext);
+        PG_RETURN_NULL();
     }
 
     /* --- IPC call. --- */
     /*
      * use_filter:    caller provided a non-empty TID whitelist.
      * use_prefilter: 3O GPU BITSET path when selectivity < filter_auto_threshold.
-     * k_fetch:       D-wedge overfetches 4x; 3O pre-filter fetches exactly k.
      */
     {
         bool      use_filter    = (filter_arr != NULL && n_filter > 0);
@@ -5855,10 +5931,10 @@ cuvs_filtered_knn(PG_FUNCTION_ARGS)
             (cuvs_filter_auto_threshold > 0.0 ||
              cuvs_stream_bf_selectivity_threshold > 0.0))
         {
-            Oid heap_oid = IndexGetRelation((Oid) index_oid, true);
-            if (OidIsValid(heap_oid))
+            Oid routing_heap_oid = IndexGetRelation((Oid) index_oid, true);
+            if (OidIsValid(routing_heap_oid))
             {
-                Relation hr = try_relation_open(heap_oid, AccessShareLock);
+                Relation hr = try_relation_open(routing_heap_oid, AccessShareLock);
                 if (hr)
                 {
                     double N = (double) hr->rd_rel->reltuples;
@@ -5879,8 +5955,9 @@ cuvs_filtered_knn(PG_FUNCTION_ARGS)
             }
         }
 
-        int       k_fetch    = (use_filter && !use_prefilter && !use_stream_bf)
-                               ? Min(k * 4, 4000) : k;
+        int       k_fetch    = use_filter
+                               ? cuvs_k_with_tombstone_slack((Oid)index_oid, k)
+                               : k;
         int       emit_limit;
         int       rc;
         int       n_results  = 0;
@@ -5903,8 +5980,6 @@ cuvs_filtered_knn(PG_FUNCTION_ARGS)
                     filter_arr, n_filter,
                     cuvs_stream_bf_chunk_vectors,
                     tids_out, dists_out, &n_results, &latency_us);
-                /* Sidecar / reverse map absent -> fall back to exact 3O prefilter
-                 * (same k_fetch=k, no overfetch). */
                 if (rc == CUVS_STATUS_NO_VECTORS)
                 {
                     use_stream_bf = false;
@@ -5923,7 +5998,7 @@ cuvs_filtered_knn(PG_FUNCTION_ARGS)
                     (uint32_t) cuvs_bf_precision,
                     filter_arr, n_filter,
                     tids_out, dists_out, &n_results, &latency_us, &delta_merged,
-                    (int) use_prefilter);
+                    (int) use_prefilter, cuvs_stream_bf_chunk_vectors);
 
             /* Merge .delta pending-insert rows (filtered) and apply tombstones. */
             if (rc == CUVS_STATUS_OK && cuvs_max_delta_rows > 0)
@@ -5932,7 +6007,7 @@ cuvs_filtered_knn(PG_FUNCTION_ARGS)
                           || (cuvs_delta_search_mode == 0 && !delta_merged);
                 if (do_cpu)
                     cuvs_merge_delta_filtered(
-                        (Oid) index_oid, qvec->x, dim, k, metric,
+                        (Oid) index_oid, qvec->x, dim, k_fetch, metric,
                         filter_arr, n_filter,
                         tids_out, dists_out, &n_results);
                 cuvs_apply_tombstones_filtered(
@@ -5941,7 +6016,6 @@ cuvs_filtered_knn(PG_FUNCTION_ARGS)
         }
         else
         {
-            /* NULL or empty filter_tids → unfiltered BF */
             int delta_merged = 0;
             rc = cuvs_ipc_search(
                 cuvs_socket_path,
@@ -6205,6 +6279,20 @@ cuvs_cs_build(CuvsFilteredScanState *state, EState *estate)
     if (ntids > 1)
         qsort(tids, (size_t)ntids, sizeof(uint64_t), compare_tid_enc);
 
+    /*
+     * The qual matched nothing. Passing n_filter_tids = 0 to the daemon means
+     * "no filter", so the scan would answer with the UNFILTERED top-k — rows the
+     * predicate explicitly excluded. An empty match set must produce an empty
+     * scan.
+     */
+    if (ntids == 0)
+    {
+        state->n_results = 0;
+        state->built     = true;
+        state->cursor    = 0;
+        return;
+    }
+
     /* --- Step 2: GPU BF search — 3O pre-filter or D-wedge based on selectivity. --- */
     PgVector *qvec = DatumGetPgVector(state->query_datum);
     int       dim  = qvec->dim;
@@ -6226,11 +6314,9 @@ cuvs_cs_build(CuvsFilteredScanState *state, EState *estate)
                  sel < cuvs_filter_auto_threshold)
             use_prefilter = true;
     }
-    /* Always send k to daemon: daemon handles 4x D-wedge overfetch internally.
-     * Result buffers are sized k; sending k*4 would overflow them. */
-
-    state->result_tids  = palloc((size_t)k * sizeof(uint64_t));
-    state->result_dists = palloc((size_t)k * sizeof(float));
+    int search_k = cuvs_k_with_tombstone_slack(state->index_oid, k);
+    state->result_tids  = palloc((size_t)search_k * sizeof(uint64_t));
+    state->result_dists = palloc((size_t)search_k * sizeof(float));
     uint32_t latency_us = 0;
 
     int delta_merged = 0;
@@ -6241,12 +6327,12 @@ cuvs_cs_build(CuvsFilteredScanState *state, EState *estate)
             cuvs_socket_path,
             (uint32_t) MyDatabaseId,
             (uint32_t) state->index_oid,
-            qvec->x, dim, k, state->metric,
+            qvec->x, dim, search_k, state->metric,
             tids, (uint32_t) ntids,
             cuvs_stream_bf_chunk_vectors,
             state->result_tids, state->result_dists, &state->n_results,
             &latency_us);
-        if (rc == CUVS_STATUS_NO_VECTORS)   /* sidecar absent -> exact 3O prefilter */
+        if (rc == CUVS_STATUS_NO_VECTORS)
         {
             use_stream_bf = false;
             use_prefilter = true;
@@ -6257,12 +6343,13 @@ cuvs_cs_build(CuvsFilteredScanState *state, EState *estate)
             cuvs_socket_path,
             (uint32_t) MyDatabaseId,
             (uint32_t) state->index_oid,
-            qvec->x, dim, k, state->metric,
+            qvec->x, dim, search_k, state->metric,
             1,   /* brute_force */
             (uint32_t) cuvs_bf_precision,
             tids, (uint32_t) ntids,
             state->result_tids, state->result_dists, &state->n_results,
-            &latency_us, &delta_merged, (int) use_prefilter);
+            &latency_us, &delta_merged, (int) use_prefilter,
+            cuvs_stream_bf_chunk_vectors);
 
     state->last_latency_us = latency_us;
 
@@ -6272,13 +6359,15 @@ cuvs_cs_build(CuvsFilteredScanState *state, EState *estate)
                   || (cuvs_delta_search_mode == 0 && !delta_merged);
         if (do_cpu)
             cuvs_merge_delta_filtered(
-                state->index_oid, qvec->x, dim, k, state->metric,
+                state->index_oid, qvec->x, dim, search_k, state->metric,
                 tids, (uint32_t) ntids,
                 state->result_tids, state->result_dists, &state->n_results);
         cuvs_apply_tombstones_filtered(
             state->index_oid,
             state->result_tids, state->result_dists, &state->n_results);
     }
+    if (state->n_results > k)
+        state->n_results = k;
 
     pfree(tids);
 

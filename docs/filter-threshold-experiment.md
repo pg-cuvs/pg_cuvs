@@ -116,3 +116,47 @@ python3 tools/bench_filter_sweep.py > /tmp/sweep_results.tsv 2>/tmp/sweep_progre
 Re-runs from scratch (generates data, builds index, sweeps, drops table).
 To skip data regeneration if table exists, the script detects `_bench_sweep` in pg_class
 and rebuilds the index only.
+
+---
+
+## Addendum (2026-07-23): the condition this threshold worked around has been removed
+
+This experiment measured D-wedge with the **fixed 4× overfetch** of the day
+(`overfetch: 4 (k_fetch = 40)`), and its central finding — recall 0.20 at 1% random
+correlation — is a property of that fixed overfetch, not of D-wedge as an approach. The
+`0.05` default existed to route selective queries away from it, to 3O.
+
+Two things changed since:
+
+1. **The overfetch now scales with selectivity** (#80). Depth is `max(4k, 2k/sel)`, clamped
+   to the corpus, because for a filter uncorrelated with distance the j-th filtered neighbour
+   sits at unfiltered rank ~ j/sel. Re-measured on wiki_all_1M (1M × 768, k=10), D-wedge
+   returns **recall 1.000 with a full k at every selectivity from 0.5 down to 1e-4** — the
+   collapse this document recorded no longer occurs.
+
+2. **3O was measured for the first time** (#76, ADR-082) and is the path that now collapses:
+   0.99 at sel ≥ 1e-3, but 0.86 / 0.48 / 0.28 at 5e-4 / 2e-4 / 1e-4, where it also stops
+   returning a full k. Routing selective queries *to* 3O — the reason for the 0.05 default —
+   is therefore the wrong direction once D-wedge is fixed.
+
+Adding the third path (ADR-064 streaming BF, which gathers only the filter-passing vectors)
+closes the range: its cost grows with |filter| while D-wedge's grows with 1/selectivity, so
+they cross at **~0.004** (measured D-wedge/stream_bf p50: 3.6/12.9 ms at 5e-3, 4.3/3.1 ms at
+3e-3, 35.4/0.45 ms at 1e-4). Both are exact.
+
+Defaults were changed accordingly (#81):
+
+```
+cuvs.filter_auto_threshold           = 0.0     (was 0.05 — 3O is now opt-in)
+cuvs.stream_bf_selectivity_threshold = 0.004   (was 0.0  — the measured crossover)
+```
+
+**What still stands from this experiment**: spatial/mixed positive correlation helps a
+post-filtering approach because eligible rows sit near the query. The pure-random column is
+therefore worse than the positive-correlation fixtures measured here, but it is not the
+general worst case: an anti-correlated whitelist can put every eligible row beyond a bounded
+prefix. The newer uncorrelated 1M sweep is conservative only relative to the positive-
+correlation fixtures, not relative to anti-correlation. The correlation axis has **not** been
+re-run against 3O, whose failure mechanism is graph connectivity rather than overfetch depth.
+
+Raw data: `bench/results/adr079_3o_recall*.csv`, harness `bench/adr079_3o_recall.py`.

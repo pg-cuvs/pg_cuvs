@@ -27,8 +27,8 @@ GUC 34개(`cuvs.*` 33 + `enable_cuvs`) · 인덱스 reloption 11개 · 데몬 CL
 | `cuvs.max_build_mem_mb` | int | 0(auto) | 0–INT_MAX | **빌드 host 메모리 하드캡** | △ (design만) |
 | `cuvs.build_mem_safety_ratio` | real | 0.5 | 0.01–0.95 | auto cap = MemAvailable×ratio | △ (capacity 공식에만) |
 | `cuvs.max_stale_fraction` | real | 0.10 | 0–1 | stale 허용 비율 | X |
-| `cuvs.filter_auto_threshold` | real | 0.05 | 0–1 | 필터 선택도 라우팅 임계 | O (filter 실험문서) |
-| `cuvs.stream_bf_selectivity_threshold` | real | 0.0(off) | 0–1 | out-of-core stream BF 트리거 | X (ADR-064만) |
+| `cuvs.filter_auto_threshold` | real | 0.0(off) | 0–1 | 근사 3O 필터 라우팅 임계 | O (filter 실험문서) |
+| `cuvs.stream_bf_selectivity_threshold` | real | 0.004 | 0–1 | out-of-core stream BF 트리거(실측 교차점) | X (ADR-064만) |
 | `cuvs.stream_bf_chunk_vectors` | int | 262144 | 1–INT_MAX | stream BF 청크 VRAM cap | X (ADR-064만) |
 | `cuvs.max_delta_rows` | int | 10000 | 0–INT_MAX | delta cap(초과 시 REINDEX 권고) | △ (write-path playbook) |
 | `cuvs.delta_search` | enum | auto | auto/cpu/gpu | delta 병합 검색 모드 | O (write-path) |

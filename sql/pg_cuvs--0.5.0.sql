@@ -443,10 +443,17 @@ LANGUAGE sql STABLE AS $$
     SELECT * FROM cuvs_filtered_knn(
         index_rel,
         query,
-        (SELECT array_agg(
-                    (((t::text::point)[0])::bigint << 16) |
-                     ((t::text::point)[1])::bigint
-                ) FROM unnest(filter_tids) t),
+        CASE
+            WHEN filter_tids IS NULL THEN NULL::bigint[]
+            ELSE COALESCE(
+                (SELECT array_agg(encoded ORDER BY encoded)
+                 FROM (
+                     SELECT (((t::text::point)[0])::bigint << 16) |
+                             ((t::text::point)[1])::bigint AS encoded
+                     FROM unnest(filter_tids) t
+                 ) encoded_tids),
+                ARRAY[]::bigint[])
+        END,
         k
     );
 $$;
@@ -554,6 +561,21 @@ COMMENT ON FUNCTION pg_cuvs_inject_build_oom(integer) IS
   'Test-only (ADR-070 Bug #3): arm synthetic OOM for the next n_fail '
   'cuvs_cagra_build calls in the daemon (0 = disarm), to exercise the build '
   'evict-and-retry path. Each failing build decrements the counter.';
+
+-- These five reach into daemon-global state (VRAM budget, a VRAM balloon, and the
+-- fault-injection counters used by the OOM regression tests). PostgreSQL grants
+-- EXECUTE to PUBLIC by default, which would let any role arm a build failure or
+-- pin VRAM and break *other* sessions' index builds. Mirrored in the 0.4.0--0.5.0
+-- upgrade script so existing installs are covered too.
+REVOKE ALL ON FUNCTION pg_cuvs_set_vram_budget(bigint)     FROM PUBLIC;
+REVOKE ALL ON FUNCTION pg_cuvs_eat_vram(bigint)            FROM PUBLIC;
+REVOKE ALL ON FUNCTION pg_cuvs_free_vram()                 FROM PUBLIC;
+REVOKE ALL ON FUNCTION pg_cuvs_inject_extend_oom(integer)  FROM PUBLIC;
+REVOKE ALL ON FUNCTION pg_cuvs_inject_build_oom(integer)   FROM PUBLIC;
+REVOKE ALL ON FUNCTION pg_cuvs_gc_orphans(boolean)         FROM PUBLIC;
+REVOKE ALL ON FUNCTION pg_cuvs_compact(regclass)           FROM PUBLIC;
+REVOKE ALL ON FUNCTION pg_cuvs_build_hnsw(regclass, text)  FROM PUBLIC;
+
 
 -- ----------------------------------------------------------------
 -- flat Access Method handler
