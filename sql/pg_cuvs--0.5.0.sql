@@ -555,6 +555,18 @@ COMMENT ON FUNCTION pg_cuvs_inject_build_oom(integer) IS
   'cuvs_cagra_build calls in the daemon (0 = disarm), to exercise the build '
   'evict-and-retry path. Each failing build decrements the counter.';
 
+-- These five reach into daemon-global state (VRAM budget, a VRAM balloon, and the
+-- fault-injection counters used by the OOM regression tests). PostgreSQL grants
+-- EXECUTE to PUBLIC by default, which would let any role arm a build failure or
+-- pin VRAM and break *other* sessions' index builds. Mirrored in the 0.4.0--0.5.0
+-- upgrade script so existing installs are covered too.
+REVOKE ALL ON FUNCTION pg_cuvs_set_vram_budget(bigint)     FROM PUBLIC;
+REVOKE ALL ON FUNCTION pg_cuvs_eat_vram(bigint)            FROM PUBLIC;
+REVOKE ALL ON FUNCTION pg_cuvs_free_vram()                 FROM PUBLIC;
+REVOKE ALL ON FUNCTION pg_cuvs_inject_extend_oom(integer)  FROM PUBLIC;
+REVOKE ALL ON FUNCTION pg_cuvs_inject_build_oom(integer)   FROM PUBLIC;
+
+
 -- ----------------------------------------------------------------
 -- flat Access Method handler
 -- ----------------------------------------------------------------
