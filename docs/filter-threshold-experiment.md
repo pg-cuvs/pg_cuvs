@@ -151,11 +151,12 @@ cuvs.filter_auto_threshold           = 0.0     (was 0.05 — 3O is now opt-in)
 cuvs.stream_bf_selectivity_threshold = 0.004   (was 0.0  — the measured crossover)
 ```
 
-**What still stands from this experiment**: the correlation axis. Spatial/mixed correlation
-*helps* a post-filtering approach (filter rows sit near the query and survive the overfetch),
-so the pure-random column remains the worst case, and the newer 1M sweep — which uses an
-uncorrelated hash filter — is conservative for D-wedge for the same reason. The correlation
-axis has **not** been re-run against 3O, whose failure mechanism is graph connectivity rather
-than overfetch depth.
+**What still stands from this experiment**: spatial/mixed positive correlation helps a
+post-filtering approach because eligible rows sit near the query. The pure-random column is
+therefore worse than the positive-correlation fixtures measured here, but it is not the
+general worst case: an anti-correlated whitelist can put every eligible row beyond a bounded
+prefix. The newer uncorrelated 1M sweep is conservative only relative to the positive-
+correlation fixtures, not relative to anti-correlation. The correlation axis has **not** been
+re-run against 3O, whose failure mechanism is graph connectivity rather than overfetch depth.
 
 Raw data: `bench/results/adr079_3o_recall*.csv`, harness `bench/adr079_3o_recall.py`.
