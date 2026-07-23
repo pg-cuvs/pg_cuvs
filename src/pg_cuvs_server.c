@@ -2106,19 +2106,6 @@ static void
 send_error_code(int client_fd, int status, const char *msg)
 {
     CuvsReplyHeader hdr = {0};
-
-    /* #82: the build-OOM injection is daemon-global and outlives the test that
-     * armed it. A test script that arms N failures and then aborts under
-     * ON_ERROR_STOP never reaches its disarm call, so the leftover arm kills the
-     * next cagra build in an unrelated test (observed: build_oom_evict_to_fit
-     * arms 2, spends 1, aborts -> routing_golden's first CREATE INDEX fails).
-     * Once a build has definitively failed the armed scenario is over, so clear
-     * it here — one place that covers every build-failure path, present and
-     * future. Injections consumed *within* a still-retrying build are untouched:
-     * the evict-and-retry loop never reaches this function. */
-    if (status == CUVS_STATUS_BUILD_FAILED)
-        cuvs_set_inject_build_oom(0);
-
     hdr.status = status;
     hdr.n_results = 0;
     strncpy(hdr.error, msg, sizeof(hdr.error) - 1);
@@ -2979,7 +2966,14 @@ handle_search(int client_fd, const CuvsCmdFrame *cmd)
             bk_target = (int64_t) k * 4;
             if (sel > 0.0)
             {
+                /* Clamp in double space before converting: a pathologically
+                 * small selectivity (a stale reltuples, say) would otherwise
+                 * overflow the int64_t conversion, which is undefined. The
+                 * corpus is the only meaningful ceiling anyway. */
                 double want = (double) k / sel * 2.0;
+                double cap  = (double) e->main_bf_n;
+                if (want > cap)
+                    want = cap;
                 if (want > (double) bk_target)
                     bk_target = (int64_t) want;
             }
@@ -3029,7 +3023,25 @@ handle_search(int client_fd, const CuvsCmdFrame *cmd)
                 if (filter_mem != MAP_FAILED)
                     filter_tids = (uint64_t *)filter_mem;
             }
-            /* On shm failure: fall through to unfiltered (spike graceful degrade). */
+            /* Fail closed. This path exists to confine results to the caller's
+             * TID whitelist (tenant isolation, ADR-063); answering with the
+             * unfiltered top-k on an shm failure silently returns rows the
+             * caller excluded, with CUVS_STATUS_OK. The streaming-BF path
+             * already refuses in the same situation — match it. */
+            if (!filter_tids)
+            {
+                free(raw); free(results);
+                CuvsReplyHeader hdr = {0};
+                hdr.status = CUVS_STATUS_ERROR;
+                strncpy(hdr.error,
+                        "filter TID set could not be mapped; refusing to return "
+                        "unfiltered rows",
+                        sizeof(hdr.error) - 1);
+                record_search_stat(e, hdr.status, 0, hdr.error);
+                pthread_mutex_unlock(&g_index_mutex);
+                send_all(client_fd, &hdr, sizeof(hdr));
+                return;
+            }
         }
 
         int n_valid = 0;
@@ -3103,6 +3115,25 @@ handle_search(int client_fd, const CuvsCmdFrame *cmd)
         int use_bf    = (cmd->search_mode == 1);   /* Phase 3L: brute_force over shards */
         uint32_t snap_db  = e->db_oid;
         uint32_t snap_idx = e->index_oid;
+
+        /* The sharded fanout below never consumes cmd->filter_shm_key, and the
+         * merge does not re-apply the whitelist, so a filtered request answered
+         * here would silently return rows the caller excluded. cuvs_ipc.h used
+         * to promise a per-shard post-filter that was never implemented; until
+         * it is, refuse rather than widen the result set. */
+        if (cmd->n_filter_tids > 0)
+        {
+            munmap(query, vec_bytes);
+            CuvsReplyHeader hdr = {0};
+            hdr.status = CUVS_STATUS_ERROR;
+            strncpy(hdr.error,
+                    "filtered search is not implemented for sharded indexes",
+                    sizeof(hdr.error) - 1);
+            record_search_stat(e, hdr.status, 0, hdr.error);
+            pthread_mutex_unlock(&g_index_mutex);
+            send_all(client_fd, &hdr, sizeof(hdr));
+            return;
+        }
 
         /* Phase 3L: brute_force over a sharded index — ensure every shard has a
          * resident BF index over its range. Fail closed (NO_VECTORS) if the
@@ -4268,6 +4299,7 @@ build_sharded(int client_fd, const CuvsCmdFrame *cmd, const char *index_dir,
         }
         pthread_mutex_unlock(&g_index_mutex);
         free(new_tids); free(shards); free(recs); free(shard_tmp); free(shard_final);
+        cuvs_set_inject_build_oom(0);   /* #82: see handle_build */
         send_error_code(client_fd, CUVS_STATUS_BUILD_FAILED, "sharded build failed");
         return;
     }
@@ -4746,6 +4778,14 @@ handle_build(int client_fd, const CuvsCmdFrame *cmd)
     if (!new_handle)
     {
         LOG_ERROR("[handle_build] cuvs_cagra_build returned NULL\n");
+        /* #82: the build-OOM injection is daemon-global and outlives the test
+         * that armed it — a test that arms N failures then aborts under
+         * ON_ERROR_STOP never reaches its disarm call, and the leftover arm
+         * kills the next cagra build in an unrelated test. Clear it where a
+         * cagra build gives up for good. Deliberately NOT in send_error_code():
+         * EXTEND and COMPACT also report BUILD_FAILED, and a generic serializer
+         * must not disarm a scenario that belongs to a different operation. */
+        cuvs_set_inject_build_oom(0);
         pthread_mutex_unlock(&g_index_mutex);
         munmap(mem, total);
         send_error_code(client_fd, CUVS_STATUS_BUILD_FAILED, "cuvs_cagra_build failed");
@@ -5365,6 +5405,7 @@ handle_build_multi(int client_fd, const CuvsCmdFrame *cmd, const char *index_dir
 
         if (!new_handle)
         {
+            cuvs_set_inject_build_oom(0);   /* #82: see handle_build */
             pthread_mutex_unlock(&g_index_mutex);
             status = CUVS_STATUS_BUILD_FAILED;
             err = "cuvs_cagra_build_multi failed";

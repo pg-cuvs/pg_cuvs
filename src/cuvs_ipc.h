@@ -251,7 +251,10 @@ void cuvs_ipc_set_wait_callback(int (*cb)(void));
  * n_filter:    length of filter_tids (0 = no filter, ignored if filter_tids NULL).
  *
  * The daemon post-filters BF results to only the provided TID set.
- * Works for both unsharded and sharded (per-shard post-filter).
+ * UNSHARDED ONLY: the sharded fanout does not consume the whitelist, so a
+ * filtered request against a sharded index is refused rather than answered
+ * with unfiltered rows. (The per-shard post-filter this once promised was
+ * never implemented.)
  * Returns same status codes as cuvs_ipc_search.
  */
 int cuvs_ipc_search_filtered(
