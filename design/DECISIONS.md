@@ -3234,7 +3234,7 @@ SVFusion(VLDB'26, PCIe A100)이 CAGRA/GGNN가 **UVM(demand paging)에서 크게 
 **관련**: `src/cuvs_ipc.h`(프로토콜 정의), `src/cuvs_ipc.c`(`send_cmd`), `src/pg_cuvs_server.c`(`connection_thread` 2단 읽기), `src/cuvs_util.c`(상태 문자열), `src/pg_cuvs.c`(오류 매핑 2곳), `test/unit/test_cuvs_util.c`(레이아웃 고정).
 ---
 
-## ADR-082 — 3O recall 상한 실측(#76): 상한은 3O가 아니라 **D-wedge**에 있었다
+## ADR-082 — 3O recall 상한 실측(#76): 두 경로 모두 붕괴하며, 무릎 위치가 다르다
 
 **날짜**: 2026-07-23
 **상태**: 측정 완료 (Brev A100-SXM4-80GB, wiki_all_1M 1M×768, k=10, 100 queries/point; `bench/results/adr079_3o_recall.csv`)
@@ -3265,7 +3265,9 @@ SVFusion(VLDB'26, PCIe A100)이 CAGRA/GGNN가 **UVM(demand paging)에서 크게 
 
    전 지점 `cagra_prefilter`(mode 4)다. 0.001 아래에서 recall이 무너지고 k조차 못 채운다(1e-4에서 10개 중 3.29개). **ADR-079의 리스크는 확증**된다.
 
-   **기존 기록과의 화해**: 이는 과거 실측을 뒤집는 것이 아니다. ADR-048은 이미 표로 `CAGRA prefilter = ~0.95+ (approx)`, `BF prefilter = 1.00 (exact)`, `D-wedge = <1.0 @ 저 sel`를 적어두었고, CAGRA recall=1.00 관측은 **"소규모 테스트 데이터셋에서"**(800행 `filter_comparison`, sel 0.25)라고 명시했다. ADR-079는 이 실패 모드를 "아직 명시 측정하지 않았다"고 썼다. 본 측정의 0.986~0.996(sel ≥ 0.001)은 ADR-048의 "~0.95+"와 일치하고, 붕괴는 아무도 밟지 않은 구간에서만 나타난다.
+   **기존 기록과의 화해**: 이는 과거 실측을 뒤집는 것이 아니다. ADR-048은 이미 표로 `CAGRA prefilter = ~0.95+ (approx)`, `BF prefilter = 1.00 (exact)`, `D-wedge = <1.0 @ 저 sel`를 적어두었고, CAGRA recall=1.00 관측은 **"소규모 테스트 데이터셋에서"**(800행 `filter_comparison`, sel 0.25)라고 명시했다. ADR-079는 3O의 이 실패 모드를 "아직 명시 측정하지 않았다"고 썼다. 본 측정의 0.986~0.996(sel ≥ 0.001)은 ADR-048의 "~0.95+"와 일치하고, 3O 붕괴는 아무도 밟지 않은 구간에서만 나타난다.
+
+   **임계값 0.05의 출처(중요)**: `docs/filter-threshold-experiment.md`(2026-06-08, N=200k·dim=128, selectivity × correlation 2D, 셀당 5회 median)가 실측으로 정한 값이다. 그 실험은 **고정 4× 오버페치 시절의 D-wedge**를 쟀고 `1% random에서 recall 0.20`, `5% random에서 0.80`을 이미 기록했다 — 본 ADR이 재현한 바로 그 붕괴다. 즉 0.05는 검증되지 않은 값이 아니라, **#80이 제거한 결함을 우회하려고 정확히 그 결함에 맞춰 놓은 값**이다. 따라서 #80 이후 임계를 내리는 근거는 "0.05에 근거가 없다"가 아니라 "0.05를 필요하게 만든 조건이 사라졌다"이다.
 
    **따라서 `cuvs.filter_auto_threshold`의 GUC 설명문 "giving recall=1.00 at any selectivity"는 틀렸다.** recall=1.00은 임계가 선택하는 CAGRA prefilter(mode 4)가 아니라 **BF prefilter(mode 3)**의 성질이며, "any selectivity"도 성립한 적이 없다.
 2. **D-wedge도 붕괴했고, 원인은 코드에 그대로 있었다 — 그리고 고쳤다(#80).** 수정 전 선택도 0.05 이하에서 recall이 0.78 → 0.16 → 0.08 → 0.01로 무너지고 반환 행 수가 0.11개까지 떨어졌다. 원인은 데몬의 `bk_target = k*4` — **선택도와 무관한 고정 오버페치** 후 후처리 필터다. 거리와 무상관인 필터에서 j번째 필터 이웃은 미필터 랭크 ~j/sel에 있으므로 깊이는 1/sel로 스케일해야 한다. `bk_target = max(k*4, k/sel·2)`로 고친 뒤 재측정:
@@ -3295,6 +3297,10 @@ SVFusion(VLDB'26, PCIe A100)이 CAGRA/GGNN가 **UVM(demand paging)에서 크게 
 4. **극저선택도의 제3 경로 측정** — sel < 1e-3에서 3O는 붕괴하고 D-wedge는 1/sel로 느려진다. 이 구간의 올바른 답은 ADR-064 스트리밍 BF(필터 통과 벡터만 gather → exact)일 가능성이 높으나 `cuvs.stream_bf_selectivity_threshold` 기본값이 0(꺼짐)이고 **본 측정에 포함하지 않았다.**
 5. 다른 데이터셋·차원에서 3O 곡선 재확인 — 본 측정은 wiki_all_1M(768d) 단일 데이터셋이다.
 
-**한계(정직)**: 단일 데이터셋·단일 GPU·k=10·지점당 100 쿼리. 필터 멤버십은 `(id·2654435761) mod 10^6 < s·10^6`의 결정론적 해시로 **코퍼스 위치와 무상관**하게 뽑았다 — 상관된 필터(예: 클러스터 하나만 통과)는 더 가혹할 수 있고 측정하지 않았다. VecFlow가 보고한 붕괴가 그런 상관 필터 조건에서 나타날 가능성은 배제되지 않는다.
+**한계(정직)**: 단일 데이터셋·단일 GPU·k=10·지점당 100 쿼리. 필터 멤버십은 `(id·2654435761) mod 10^6 < s·10^6`의 결정론적 해시로 **코퍼스 위치와 무상관**하게 뽑았다.
+
+이전 판에서 "상관된 필터는 더 가혹할 수 있다"고 적었으나 **방향이 반대였다.** `docs/filter-threshold-experiment.md`의 correlation 축 실측은 D-wedge 기준 1% 선택도에서 random 0.20 / mixed 1.00 / spatial 1.00으로, **상관이 있으면 오히려 쉬워진다** — 필터 통과 행이 쿼리 근처에 몰려 오버페치 풀 안에 살아남기 때문이다. 따라서 무상관 해시 필터는 D-wedge에 대해 **최악 조건**이고 본 측정은 보수적이다.
+
+다만 3O에 대해서는 상관 축을 재지 않았다. 그래프 연결성이 끊기는 방식은 오버페치와 기전이 다르므로, VecFlow가 보고한 붕괴가 상관 조건에서 어떻게 달라지는지는 여전히 미측정이다.
 
 **관련**: ADR-079(리스크 제기 — 확증됨), ADR-048(3O; CAGRA prefilter를 이미 `~0.95+ approx`로 기록), ADR-063(D-wedge 라우팅), 이슈 #76·#80·#81. 산출물: `bench/adr079_3o_recall.py`, `bench/results/adr079_3o_recall.csv`(#80 이전), `bench/results/adr079_3o_recall_after80.csv`(#80 이후), `bench/results/adr079_3o_recall_tail.csv`(저선택도 꼬리).

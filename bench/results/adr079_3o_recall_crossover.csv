@@ -1,0 +1,13 @@
+path,selectivity,n_filter,k,recall,mean_returned,p50_ms,daemon_search_mode,n_queries
+3O,0.008,8000,10,0.994,10.0,2.343,cagra_prefilter,100
+D-wedge,0.008,8000,10,1.0,10.0,3.631,brute_force,100
+stream_bf,0.008,8000,10,1.0,10.0,12.902,stream_bf,100
+3O,0.005,5000,10,0.997,10.0,1.944,cagra_prefilter,100
+D-wedge,0.005,5000,10,1.0,10.0,3.853,brute_force,100
+stream_bf,0.005,5000,10,1.0,10.0,6.453,stream_bf,100
+3O,0.003,3000,10,0.993,10.0,1.871,cagra_prefilter,100
+D-wedge,0.003,3000,10,1.0,10.0,4.27,brute_force,100
+stream_bf,0.003,3000,10,1.0,10.0,3.131,stream_bf,100
+3O,0.002,2000,10,0.993,10.0,2.035,cagra_prefilter,100
+D-wedge,0.002,2000,10,1.0,10.0,5.172,brute_force,100
+stream_bf,0.002,2000,10,1.0,10.0,2.57,stream_bf,100

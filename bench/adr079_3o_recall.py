@@ -89,6 +89,9 @@ def main():
     ap.add_argument("--dbname", default="postgres")
     ap.add_argument("--index-dir", default="/tmp/cuvs_indexes")
     ap.add_argument("--out", required=True)
+    ap.add_argument("--selectivities", default=None,
+                    help="comma-separated selectivity grid; default "
+                         + ",".join(str(x) for x in SELECTIVITIES))
     ap.add_argument("--reuse-table", action="store_true",
                     help="skip COPY/CREATE INDEX if f3o is already loaded")
     args = ap.parse_args()
@@ -109,9 +112,46 @@ def main():
     pgvector.psycopg.register_vector(conn)
     conn.execute(f"SET cuvs.index_dir = '{args.index_dir}'")
 
-    loaded = conn.execute(
-        "SELECT count(*) FROM pg_class WHERE relname='f3o'").fetchone()[0]
-    if not (args.reuse_table and loaded):
+    def _reusable():
+        """Is the existing f3o the corpus this run is about to measure?
+
+        A bare "does a relation named f3o exist" check will happily benchmark a
+        leftover table from a different --n, dimension or dataset while ground
+        truth still comes from the requested files -- producing results that look
+        valid and are not. Verify shape, size, the index, and the actual vectors."""
+        row = conn.execute(
+            "SELECT (SELECT count(*) FROM pg_class WHERE relname='f3o'),"
+            "       (SELECT a.atttypmod FROM pg_attribute a"
+            "          WHERE a.attrelid = to_regclass('public.f3o')"
+            "            AND a.attname = 'embedding'),"
+            "       (SELECT count(*) FROM pg_class WHERE relname='f3o_cagra')"
+        ).fetchone()
+        if not row[0]:
+            return False, "no table f3o"
+        if row[1] != dim:
+            return False, f"dim {row[1]} != corpus dim {dim}"
+        if not row[2]:
+            return False, "index f3o_cagra missing"
+        n_rows = conn.execute("SELECT count(*) FROM public.f3o").fetchone()[0]
+        if n_rows != args.n:
+            return False, f"{n_rows} rows != --n {args.n}"
+        # Corpus identity: sample rows and compare against the .fbin itself.
+        for rid in (0, args.n // 2, args.n - 1):
+            got = conn.execute(
+                "SELECT embedding FROM public.f3o WHERE id = %s", (rid,)).fetchone()
+            if got is None:
+                return False, f"row id={rid} missing"
+            if not np.allclose(np.asarray(got[0], dtype=np.float32),
+                               np.asarray(base[rid]), rtol=0, atol=1e-6):
+                return False, f"row id={rid} does not match {corpus}"
+        return True, "verified"
+
+    reuse = False
+    if args.reuse_table:
+        reuse, why = _reusable()
+        print(f"[setup] --reuse-table: {'reusing' if reuse else 'rebuilding'} ({why})",
+              flush=True)
+    if not reuse:
         conn.execute("DROP TABLE IF EXISTS f3o CASCADE")
         conn.execute(f"CREATE TABLE f3o (id bigint, cat int, embedding vector({dim}))")
         t0 = time.perf_counter()
@@ -144,8 +184,10 @@ def main():
     conn.execute("DROP TABLE IF EXISTS filterset")
     conn.execute("CREATE TABLE filterset (sel float8 PRIMARY KEY, tids bigint[])")
 
+    grid = ([float(x) for x in args.selectivities.split(",")]
+            if args.selectivities else list(SELECTIVITIES))
     rows = []
-    for sel in SELECTIVITIES:
+    for sel in grid:
         cut = int(sel * HASH_MOD)
         subset_idx = np.nonzero(cat < cut)[0]
         actual_sel = len(subset_idx) / args.n
@@ -167,7 +209,7 @@ def main():
                                  ("stream_bf", 0.0, 1.0)):
             conn.execute(f"SET cuvs.stream_bf_selectivity_threshold = {sthr}")
             conn.execute(f"SET cuvs.filter_auto_threshold = {fthr}")
-            got, lat = [], []
+            got, lat, modes = [], [], []
             for qi in range(args.queries):
                 q0 = time.perf_counter()
                 res = conn.execute(
@@ -177,9 +219,22 @@ def main():
                     (Vector(queries[qi]), sel, args.k)).fetchall()
                 lat.append((time.perf_counter() - q0) * 1000.0)
                 got.append([ctid_of_id.get(encode_ctid(r[0]), -1) for r in res])
-            mode = conn.execute(
-                "SELECT search_mode FROM pg_stat_gpu_search "
-                "WHERE index_oid = 'f3o_cagra'::regclass").fetchone()
+                # Per query: the daemon silently falls back (3O -> exact BF
+                # prefilter -> D-wedge; stream_bf -> 3O when the sidecar is
+                # absent). Reading the mode once at the end lets one final
+                # successful query hide every earlier fallback, which would make
+                # a point-level "this measured 3O" claim unsupportable.
+                m = conn.execute(
+                    "SELECT search_mode FROM pg_stat_gpu_search "
+                    "WHERE index_oid = 'f3o_cagra'::regclass").fetchone()
+                modes.append(m[0] if m else None)
+            seen = sorted(set(modes), key=lambda x: (x is None, x))
+            mode = (seen[0],) if len(seen) == 1 else ("MIXED:" + ",".join(
+                f"{x}x{modes.count(x)}" for x in seen),)
+            if len(seen) > 1:
+                print(f"  [warn] {path} sel={actual_sel:.4f} mixed daemon routes: "
+                      f"{mode[0]} -- point-level attribution is not uniform",
+                      flush=True)
             r = recall_at_k(got, gt, args.k)
             returned = np.mean([len(g) for g in got])
             rows.append(dict(path=path, selectivity=round(actual_sel, 6),
