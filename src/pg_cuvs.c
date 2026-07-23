@@ -203,6 +203,30 @@ void _PG_init(void);
  * `SAVEPOINT s; DROP INDEX i; ROLLBACK TO s; COMMIT;` leaves i's artifacts
  * intact — matching PostgreSQL's own transactional outcome (i survives).
  * ---------------------------------------------------------------- */
+
+/*
+ * #77: surface a wire-protocol mismatch as an actionable error.
+ *
+ * The daemon refuses a frame whose magic/version does not match its own, which
+ * means the .so and pg_cuvs_server were built from different revisions of
+ * cuvs_ipc.h. Every path that would otherwise print a bare status number routes
+ * through here first, so the operator gets the fix instead of "status 12".
+ * No-op for any other status.
+ */
+static void
+cuvs_report_proto_mismatch(int rc)
+{
+    if (rc != CUVS_STATUS_PROTO_MISMATCH)
+        return;
+    ereport(ERROR,
+            (errcode(ERRCODE_PROTOCOL_VIOLATION),
+             errmsg("pg_cuvs: IPC protocol mismatch between the extension and "
+                    "the GPU daemon; retry will use CPU while breaker is open"),
+             errhint("The .so and pg_cuvs_server were built from different "
+                     "revisions. Reinstall both together: make install && "
+                     "make install-server, then restart the daemon.")));
+}
+
 static object_access_hook_type prev_object_access_hook = NULL;
 static set_rel_pathlist_hook_type prev_set_rel_pathlist_hook = NULL; /* ADR-063 */
 
@@ -2347,12 +2371,15 @@ cuvs_build_parallel(Relation heapRel, Relation indexRel, IndexInfo *indexInfo,
                 (uint32_t) graph_degree, (uint32_t) intermediate_graph_degree, build_algo);
 
             if (rc != CUVS_STATUS_OK)
+            {
+                cuvs_report_proto_mismatch(rc);
                 ereport(ERROR,
                         (errcode(ERRCODE_INTERNAL_ERROR),
                          errmsg("pg_cuvs: BUILD failed (status %d); CREATE INDEX "
                                 "aborted to preserve catalog durability", rc),
                          errhint("Check pg_cuvs_server journal (journalctl -u "
                                  "pg-cuvs-server).")));
+            }
         }
         PG_FINALLY();
         {
@@ -2549,6 +2576,7 @@ cuvs_build_cagra_from_heap(Relation heapRel, Relation indexRel, IndexInfo *index
                                "cuvs.index_dir.";
                         break;
                 }
+                cuvs_report_proto_mismatch(rc);
                 ereport(ERROR,
                         (errcode(ERRCODE_INTERNAL_ERROR),
                          errmsg("pg_cuvs: BUILD failed (status %d); CREATE INDEX "
@@ -2814,6 +2842,7 @@ cuvs_build_flat_from_heap(Relation heapRel, Relation indexRel, IndexInfo *indexI
                                "cuvs.index_dir.";
                         break;
                 }
+                cuvs_report_proto_mismatch(rc);
                 ereport(ERROR,
                         (errcode(ERRCODE_INTERNAL_ERROR),
                          errmsg("pg_cuvs: flat BUILD failed (status %d); CREATE INDEX "
@@ -3554,18 +3583,7 @@ cuvs_gettuple(IndexScanDesc scan, ScanDirection dir)
                                     "match the cagra index dimension", dim)));
                     break;
                 case CUVS_STATUS_PROTO_MISMATCH:
-                    /* #77: the daemon refused the frame because it was built
-                     * from a different cuvs_ipc.h than this extension. Before
-                     * the handshake this skew silently misread the struct. */
-                    ereport(ERROR,
-                            (errcode(ERRCODE_PROTOCOL_VIOLATION),
-                             errmsg("pg_cuvs: IPC protocol mismatch between the "
-                                    "extension and the GPU daemon; "
-                                    "retry will use CPU while breaker is open"),
-                             errhint("The .so and pg_cuvs_server were built from "
-                                     "different revisions. Reinstall both together: "
-                                     "make install && make install-server, then restart "
-                                     "the daemon.")));
+                    cuvs_report_proto_mismatch(rc);
                     break;
                 case CUVS_STATUS_UNAVAILABLE:
                     /* Daemon was reachable at plan time (socket existed) but
@@ -3606,6 +3624,7 @@ cuvs_gettuple(IndexScanDesc scan, ScanDirection dir)
                                      "vector sidecar, or SET cuvs.search_mode='cagra'.")));
                     break;
                 default:
+                    cuvs_report_proto_mismatch(rc);
                     ereport(ERROR,
                             (errcode(ERRCODE_INTERNAL_ERROR),
                              errmsg("pg_cuvs: GPU search failed (status %d); "
@@ -3800,15 +3819,7 @@ flat_gettuple(IndexScanDesc scan, ScanDirection dir)
                                     "match the flat index dimension", dim)));
                     break;
                 case CUVS_STATUS_PROTO_MISMATCH:
-                    ereport(ERROR,
-                            (errcode(ERRCODE_PROTOCOL_VIOLATION),
-                             errmsg("pg_cuvs: IPC protocol mismatch between the "
-                                    "extension and the GPU daemon; "
-                                    "retry will use CPU while breaker is open"),
-                             errhint("The .so and pg_cuvs_server were built from "
-                                     "different revisions. Reinstall both together: "
-                                     "make install && make install-server, then restart "
-                                     "the daemon.")));
+                    cuvs_report_proto_mismatch(rc);
                     break;
                 case CUVS_STATUS_UNAVAILABLE:
                     ereport(ERROR,
@@ -3843,6 +3854,7 @@ flat_gettuple(IndexScanDesc scan, ScanDirection dir)
                                      "store.")));
                     break;
                 default:
+                    cuvs_report_proto_mismatch(rc);
                     ereport(ERROR,
                             (errcode(ERRCODE_INTERNAL_ERROR),
                              errmsg("pg_cuvs: GPU search failed (status %d); "
@@ -4326,6 +4338,7 @@ ivfpq_ambuild(Relation heapRel, Relation indexRel, IndexInfo *indexInfo)
                         hint = "Check pg_cuvs_server logs for details.";
                         break;
                 }
+                cuvs_report_proto_mismatch(rc);
                 ereport(ERROR,
                         (errcode(ERRCODE_INTERNAL_ERROR),
                          errmsg("pg_cuvs: IVF-PQ BUILD failed (status %d); "
@@ -4869,6 +4882,7 @@ pg_cuvs_batch_search(PG_FUNCTION_ARGS)
                                  errhint("REINDEX the index to reload it on the daemon.")));
                         break;
                     default:
+                        cuvs_report_proto_mismatch(rc);
                         ereport(ERROR,
                                 (errcode(ERRCODE_INTERNAL_ERROR),
                                  errmsg("pg_cuvs_batch_search: batch search failed (status %d)", rc)));
@@ -5917,9 +5931,12 @@ cuvs_filtered_knn(PG_FUNCTION_ARGS)
             return (Datum) 0;
         }
         if (rc != CUVS_STATUS_OK)
+        {
+            cuvs_report_proto_mismatch(rc);
             ereport(ERROR,
                     (errcode(ERRCODE_INTERNAL_ERROR),
                      errmsg("cuvs_filtered_knn: search failed (status %d)", rc)));
+        }
 
         /* --- Materialize (ctid, distance) rows. --- */
         per_query_ctx = rsinfo->econtext->ecxt_per_query_memory;
@@ -6234,9 +6251,12 @@ cuvs_cs_build(CuvsFilteredScanState *state, EState *estate)
     if (rc == CUVS_STATUS_CANCELED)
         CHECK_FOR_INTERRUPTS();
     else if (rc != CUVS_STATUS_OK)
+    {
+        cuvs_report_proto_mismatch(rc);
         ereport(ERROR,
                 (errcode(ERRCODE_INTERNAL_ERROR),
                  errmsg("cuvs filtered scan: search failed (status %d)", rc)));
+    }
     state->built  = true;
     state->cursor = 0;
 }
@@ -6883,10 +6903,13 @@ cuvs_tbf_build(CuvsTransientBFScanState *state, EState *estate)
     if (rc == CUVS_STATUS_CANCELED)
         CHECK_FOR_INTERRUPTS();
     if (rc != CUVS_STATUS_OK)
+    {
+        cuvs_report_proto_mismatch(rc);
         ereport(ERROR,
                 (errcode(ERRCODE_INTERNAL_ERROR),
                  errmsg("cuvs transient BF: search failed (status %d)%s%s", rc,
                         errbuf[0] ? ": " : "", errbuf)));
+    }
 
     state->built  = true;
     state->cursor = 0;
