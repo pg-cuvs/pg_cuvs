@@ -2106,6 +2106,19 @@ static void
 send_error_code(int client_fd, int status, const char *msg)
 {
     CuvsReplyHeader hdr = {0};
+
+    /* #82: the build-OOM injection is daemon-global and outlives the test that
+     * armed it. A test script that arms N failures and then aborts under
+     * ON_ERROR_STOP never reaches its disarm call, so the leftover arm kills the
+     * next cagra build in an unrelated test (observed: build_oom_evict_to_fit
+     * arms 2, spends 1, aborts -> routing_golden's first CREATE INDEX fails).
+     * Once a build has definitively failed the armed scenario is over, so clear
+     * it here — one place that covers every build-failure path, present and
+     * future. Injections consumed *within* a still-retrying build are untouched:
+     * the evict-and-retry loop never reaches this function. */
+    if (status == CUVS_STATUS_BUILD_FAILED)
+        cuvs_set_inject_build_oom(0);
+
     hdr.status = status;
     hdr.n_results = 0;
     strncpy(hdr.error, msg, sizeof(hdr.error) - 1);
