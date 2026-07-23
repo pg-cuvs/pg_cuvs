@@ -7,20 +7,22 @@ SIGMOD 2026, by cuVS engineers) reports that this architecture plateaus near
 80% recall and collapses under highly selective filters. pg_cuvs ships 3O but
 had never measured that failure mode on its own implementation.
 
-This sweeps filter selectivity and records recall@k for both filtered paths:
+This sweeps filter selectivity and records recall@k for three filtered paths:
 
   3O       cuvs.filter_auto_threshold = 1.0  -> GPU BITSET prefilter over the
            CAGRA graph (daemon search_mode 4 = cagra_prefilter)
-  D-wedge  cuvs.filter_auto_threshold = 0    -> exact BF over the whole corpus
-           with 4x overfetch, then post-filter (ADR-063)
+  D-wedge  cuvs.filter_auto_threshold = 0    -> BF candidate prefix followed by
+           whitelist post-filtering (ADR-063)
+  stream   cuvs.stream_bf_selectivity_threshold = 1.0 -> exact BF over only
+           whitelist members (ADR-064)
 
 MEASUREMENT HONESTY
   Ground truth is computed here in numpy -- exact top-k over the *filtered*
   subset -- not taken from pg_cuvs. A systematic engine error therefore cannot
   hide inside the reference. The daemon's own search_mode is read back from
   pg_stat_gpu_search and reported, so a run that silently fell back to the
-  exact BF prefilter (mode 3) or to D-wedge is visible as such rather than
-  being reported as a 3O result.
+  BF prefilter (mode 3), D-wedge, or stream BF is visible rather than being
+  reported as a different route.
 
 Usage (GPU VM, cuvs_bench env, daemon up):
     python bench/adr079_3o_recall.py --data-dir ~/data --n 1000000 \
@@ -33,10 +35,11 @@ import sys
 import time
 
 import numpy as np
+from numpy.typing import NDArray
+
+from adr079_reuse import HASH_MOD, KNUTH, corpus_fingerprint
 
 SELECTIVITIES = (0.5, 0.1, 0.05, 0.01, 0.005, 0.001)
-HASH_MOD = 1_000_000          # cat = (id * KNUTH) % HASH_MOD -> filter is cat < s*HASH_MOD
-KNUTH = 2654435761
 
 
 def read_fbin(path, count=None, offset=0):
@@ -48,7 +51,12 @@ def read_fbin(path, count=None, offset=0):
                      offset=8 + offset * dim * 4, shape=(count, dim))
 
 
-def exact_topk_in_subset(base, subset_idx, queries, k, chunk=64):
+def exact_topk_in_subset(
+        base: NDArray[np.float32],
+        subset_idx: NDArray[np.int64],
+        queries: NDArray[np.float32],
+        k: int,
+        chunk: int = 64) -> NDArray[np.int64]:
     """Exact top-k row indices (into the full corpus) restricted to subset_idx.
 
     L2 ranking only needs ||b||^2 - 2 q.b; the ||q||^2 term is constant per
@@ -56,11 +64,14 @@ def exact_topk_in_subset(base, subset_idx, queries, k, chunk=64):
     """
     sub = np.ascontiguousarray(base[subset_idx])
     bn = (sub * sub).sum(1)
-    out = np.empty((len(queries), k), dtype=np.int64)
+    top = min(k, len(subset_idx))
+    out = np.empty((len(queries), top), dtype=np.int64)
+    if top == 0:
+        return out
     for s in range(0, len(queries), chunk):
         e = min(s + chunk, len(queries))
         d = bn[None, :] - 2.0 * (queries[s:e] @ sub.T)
-        part = np.argpartition(d, k, axis=1)[:, :k]
+        part = np.argpartition(d, top - 1, axis=1)[:, :top]
         order = np.argsort(np.take_along_axis(d, part, axis=1), axis=1)
         out[s:e] = subset_idx[np.take_along_axis(part, order, axis=1)]
     return out
@@ -120,30 +131,49 @@ def main():
         truth still comes from the requested files -- producing results that look
         valid and are not. Verify shape, size, the index, and the actual vectors."""
         row = conn.execute(
-            "SELECT (SELECT count(*) FROM pg_class WHERE relname='f3o'),"
+            "SELECT to_regclass('public.f3o') IS NOT NULL,"
             "       (SELECT a.atttypmod FROM pg_attribute a"
             "          WHERE a.attrelid = to_regclass('public.f3o')"
             "            AND a.attname = 'embedding'),"
-            "       (SELECT count(*) FROM pg_class WHERE relname='f3o_cagra')"
+            "       EXISTS ("
+            "         SELECT 1"
+            "         FROM pg_index i"
+            "         JOIN pg_class idx ON idx.oid = i.indexrelid"
+            "         JOIN pg_namespace idx_ns ON idx_ns.oid = idx.relnamespace"
+            "         JOIN pg_class tbl ON tbl.oid = i.indrelid"
+            "         JOIN pg_namespace tbl_ns ON tbl_ns.oid = tbl.relnamespace"
+            "         JOIN pg_am am ON am.oid = idx.relam"
+            "         JOIN pg_attribute a"
+            "           ON a.attrelid = tbl.oid AND a.attnum = i.indkey[0]"
+            "         JOIN pg_opclass opc ON opc.oid = i.indclass[0]"
+            "         WHERE tbl_ns.nspname = 'public' AND tbl.relname = 'f3o'"
+            "           AND idx_ns.nspname = 'public' AND idx.relname = 'f3o_cagra'"
+            "           AND i.indrelid = to_regclass('public.f3o')"
+            "           AND i.indexrelid = to_regclass('public.f3o_cagra')"
+            "           AND am.amname = 'cagra'"
+            "           AND i.indnatts = 1"
+            "           AND a.attname = 'embedding'"
+            "           AND opc.opcname = 'vector_l2_ops'"
+            "           AND i.indisvalid AND i.indisready)"
         ).fetchone()
         if not row[0]:
-            return False, "no table f3o"
+            return False, "table public.f3o missing"
         if row[1] != dim:
             return False, f"dim {row[1]} != corpus dim {dim}"
         if not row[2]:
-            return False, "index f3o_cagra missing"
-        n_rows = conn.execute("SELECT count(*) FROM public.f3o").fetchone()[0]
+            return False, "public.f3o_cagra contract mismatch"
+        n_rows, stored_fingerprint = conn.execute(
+            "SELECT count(*),"
+            "       md5(string_agg("
+            "         md5(int8send(id) || int4send(cat) || vector_send(embedding)),"
+            "         '' ORDER BY id))"
+            " FROM public.f3o"
+        ).fetchone()
         if n_rows != args.n:
             return False, f"{n_rows} rows != --n {args.n}"
-        # Corpus identity: sample rows and compare against the .fbin itself.
-        for rid in (0, args.n // 2, args.n - 1):
-            got = conn.execute(
-                "SELECT embedding FROM public.f3o WHERE id = %s", (rid,)).fetchone()
-            if got is None:
-                return False, f"row id={rid} missing"
-            if not np.allclose(np.asarray(got[0], dtype=np.float32),
-                               np.asarray(base[rid]), rtol=0, atol=1e-6):
-                return False, f"row id={rid} does not match {corpus}"
+        expected_fingerprint = corpus_fingerprint(base, args.n)
+        if stored_fingerprint != expected_fingerprint:
+            return False, f"corpus/id/cat fingerprint does not match {corpus}"
         return True, "verified"
 
     reuse = False
