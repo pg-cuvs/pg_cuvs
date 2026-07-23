@@ -3093,6 +3093,7 @@ handle_search(int client_fd, const CuvsCmdFrame *cmd)
          * The deep pass only runs when the cheap one came up short.
          */
         int n_valid = 0;
+        int deep_failed = 0;
         for (int attempt = 0; attempt < 2; attempt++)
         {
             n_valid = 0;
@@ -3126,20 +3127,44 @@ handle_search(int client_fd, const CuvsCmdFrame *cmd)
             int deep = (int) e->main_bf_n;
             CuvsSearchResult *rd = realloc(raw, (size_t) deep * sizeof(CuvsSearchResult));
             if (!rd)
-                break;   /* cannot deepen — return what the prefix found */
+            {
+                deep_failed = 1;   /* cannot deepen — must not pass this off as OK */
+                break;
+            }
             raw = rd;
             LOG_DEBUG("[handle_search] D-wedge short (%d < %d) at depth %d; "
                       "rescanning full corpus %lld\n",
                       n_valid, k, bk, (long long) e->main_bf_n);
             if (cuvs_bf_search(e->main_bf_idx, query, (int) cmd->dim, deep, raw,
                                delta_gpu_of(e)) != 0)
-                break;   /* deep pass failed — keep the prefix result */
+            {
+                deep_failed = 1;
+                break;
+            }
             bk = deep;
         }
         free(raw);
         munmap(query, vec_bytes);
         if (filter_mem != MAP_FAILED)
             munmap(filter_mem, filter_bytes);
+
+        /* The prefix came up short and the definitive full-corpus pass could not
+         * run. The rows collected so far are a prefix of an unknown answer, so
+         * reporting them as CUVS_STATUS_OK would present a truncated result as a
+         * complete one. Fail instead. */
+        if (deep_failed)
+        {
+            CuvsReplyHeader hdr = {0};
+            hdr.status = CUVS_STATUS_ERROR;
+            strncpy(hdr.error,
+                    "filtered search could not complete the full-corpus pass; "
+                    "refusing to return a partial result",
+                    sizeof(hdr.error) - 1);
+            record_search_stat(e, hdr.status, 0, hdr.error);
+            pthread_mutex_unlock(&g_index_mutex);
+            send_all(client_fd, &hdr, sizeof(hdr));
+            return;
+        }
 
         clock_gettime(CLOCK_MONOTONIC, &t1);
         uint32_t latency_us = (uint32_t)(
