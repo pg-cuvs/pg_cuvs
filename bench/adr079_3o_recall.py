@@ -160,9 +160,13 @@ def main():
         print(f"[gt] sel={actual_sel:.4f} |S|={len(subset_idx)} "
               f"exact top-{args.k} in {time.perf_counter()-t0:.1f}s", flush=True)
 
-        for path, threshold in (("3O", 1.0), ("D-wedge", 0.0)):
-            conn.execute("SET cuvs.stream_bf_selectivity_threshold = 0")
-            conn.execute(f"SET cuvs.filter_auto_threshold = {threshold}")
+        # (label, cuvs.filter_auto_threshold, cuvs.stream_bf_selectivity_threshold).
+        # stream_bf takes precedence over the 3O prefilter when both would fire.
+        for path, fthr, sthr in (("3O", 1.0, 0.0),
+                                 ("D-wedge", 0.0, 0.0),
+                                 ("stream_bf", 0.0, 1.0)):
+            conn.execute(f"SET cuvs.stream_bf_selectivity_threshold = {sthr}")
+            conn.execute(f"SET cuvs.filter_auto_threshold = {fthr}")
             got, lat = [], []
             for qi in range(args.queries):
                 q0 = time.perf_counter()
