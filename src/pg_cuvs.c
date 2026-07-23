@@ -4462,6 +4462,17 @@ ivfpq_gettuple(IndexScanDesc scan, ScanDirection dir)
                                     "match the ivfpq index dimension", dim)));
                     break;
                 default:
+                    /* Everything else used to fall through to `return false`,
+                     * which ends the scan as "no more rows" — a daemon crash, a
+                     * protocol mismatch or an OOM all became a silently empty
+                     * result set that looks like a successful query. Report it
+                     * like the cagra and flat paths do. */
+                    cuvs_report_proto_mismatch(rc);
+                    ereport(ERROR,
+                            (errcode(ERRCODE_INTERNAL_ERROR),
+                             errmsg("pg_cuvs: IVF-PQ search failed (status %d: %s); "
+                                    "retry will use CPU while breaker is open",
+                                    rc, cuvs_status_str(rc))));
                     break;
             }
             return false;
@@ -5486,9 +5497,12 @@ pg_cuvs_compact(PG_FUNCTION_ARGS)
     index_close(indexRel, AccessShareLock);
 
     if (rc != CUVS_STATUS_OK && rc != CUVS_STATUS_NOT_FOUND)
+    {
+        cuvs_report_proto_mismatch(rc);
         ereport(ERROR,
                 (errcode(ERRCODE_INTERNAL_ERROR),
                  errmsg("pg_cuvs_compact: daemon returned status %d", rc)));
+    }
 
     PG_RETURN_VOID();
 }
@@ -5504,9 +5518,12 @@ pg_cuvs_set_vram_budget(PG_FUNCTION_ARGS)
 
     rc = cuvs_ipc_set_vram_budget(cuvs_socket_path, (int64_t)budget_bytes);
     if (rc != CUVS_STATUS_OK && rc != CUVS_STATUS_UNAVAILABLE)
+    {
+        cuvs_report_proto_mismatch(rc);
         ereport(ERROR,
                 (errcode(ERRCODE_INTERNAL_ERROR),
                  errmsg("pg_cuvs_set_vram_budget: daemon returned status %d", rc)));
+    }
     PG_RETURN_VOID();
 }
 
@@ -5522,9 +5539,12 @@ pg_cuvs_eat_vram(PG_FUNCTION_ARGS)
 
     rc = cuvs_ipc_eat_vram(cuvs_socket_path, (int64_t)leave_bytes, 0);
     if (rc != CUVS_STATUS_OK && rc != CUVS_STATUS_UNAVAILABLE)
+    {
+        cuvs_report_proto_mismatch(rc);
         ereport(ERROR,
                 (errcode(ERRCODE_INTERNAL_ERROR),
                  errmsg("pg_cuvs_eat_vram: daemon returned status %d", rc)));
+    }
     PG_RETURN_VOID();
 }
 
@@ -5551,9 +5571,12 @@ pg_cuvs_inject_extend_oom(PG_FUNCTION_ARGS)
 
     rc = cuvs_ipc_inject_extend_oom(cuvs_socket_path, (int)enable);
     if (rc != CUVS_STATUS_OK && rc != CUVS_STATUS_UNAVAILABLE)
+    {
+        cuvs_report_proto_mismatch(rc);
         ereport(ERROR,
                 (errcode(ERRCODE_INTERNAL_ERROR),
                  errmsg("pg_cuvs_inject_extend_oom: daemon returned status %d", rc)));
+    }
     PG_RETURN_VOID();
 }
 
@@ -5570,9 +5593,12 @@ pg_cuvs_inject_build_oom(PG_FUNCTION_ARGS)
 
     rc = cuvs_ipc_inject_build_oom(cuvs_socket_path, (int)n_fail);
     if (rc != CUVS_STATUS_OK && rc != CUVS_STATUS_UNAVAILABLE)
+    {
+        cuvs_report_proto_mismatch(rc);
         ereport(ERROR,
                 (errcode(ERRCODE_INTERNAL_ERROR),
                  errmsg("pg_cuvs_inject_build_oom: daemon returned status %d", rc)));
+    }
     PG_RETURN_VOID();
 }
 
