@@ -14,7 +14,9 @@ pg_cuvs development has run on three GPU providers. **Brev is the main provider 
 | **RunPod** | historical | Used earlier; no committed provisioning (pods were created ad hoc via `runpodctl`). Superseded by Brev. |
 
 Brev cannot `stop` and has no persistent volume, so "restart" means a fast rebuild from
-the bootstrap — see the private repo's `brev-bootstrap/README.md`.
+the bootstrap — see the private repo's `brev-bootstrap/README.md`. Operational lifecycle
+notes (and how the GCP stop/start model differs) are in
+[`docs/playbooks/gpu-vm-lifecycle.md`](../docs/playbooks/gpu-vm-lifecycle.md).
 
 ## Layout
 
