@@ -591,7 +591,7 @@ echo "$OUT" | grep -q "it_big_cagra" \
 # results, not the empty result a stale cagra scan gives.
 # Delete a large fraction (> id 50000, keeping id 5): VACUUM bypasses index
 # vacuuming when dead tuples touch < ~2% of pages, so a tiny delete on a big
-# table would not call ambulkdelete at all (see PLAN Phase 2 staleness note).
+# table would not call ambulkdelete at all (see phase-record Phase 2 staleness note).
 run_sql "DELETE FROM it_big WHERE id > 50000; VACUUM it_big;" >/dev/null
 run_sql "EXPLAIN (COSTS OFF) SELECT id FROM it_big ORDER BY embedding <-> '[5,35,65,145]'::vector LIMIT 1;"
 echo "$OUT" | grep -q "Seq Scan" \

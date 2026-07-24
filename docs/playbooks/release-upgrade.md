@@ -248,7 +248,7 @@ SELECT index_name, resident, search_count, last_status
 - [ ] `pg_stat_gpu_search.resident = t`
 
 > 검증 근거: `daemon-restart-recovery.md` (재시작 후 reload 검증, 소켓/index_dir
-> 경로 동기화 확인); BENCHMARK_CROSSOVER.md §16.5 주의사항 (`make install-server`
+> 경로 동기화 확인); crossover-methodology.md §16.5 주의사항 (`make install-server`
 > 별도 필요 — `make install`만으로는 `.so`만 갱신).
 
 ---

@@ -8,7 +8,7 @@
 > Evidence: this session's Stage A/B runs on the A100 dev VM via `bench.yml`
 > (`ref=bench/protocol-v3`). Raw rows: [`docs/data/stageA_exact_v3.csv`](data/stageA_exact_v3.csv).
 > Design: ADR-075 (cost model) · ADR-074 (characterization) · ADR-073 (engines) ·
-> ADR-069 (protocol) · [`design/BENCHMARK_PROTOCOL.md`](../design/BENCHMARK_PROTOCOL.md) v3.
+> ADR-069 (protocol) · [`design/benchmarks/protocol.md`](../design/benchmarks/protocol.md) v3.
 
 ---
 

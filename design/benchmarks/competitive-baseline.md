@@ -2,7 +2,7 @@
 
 > 목적: **"pgvectorscale / VectorChord와 비교해도 pg_cuvs가 의미 있는 구간이 남는가"**를
 > Pareto frontier로 숫자화한다.
-> 상위 컨텍스트: [[BENCHMARK_CROSSOVER.md]] §11 (HNSW vs CAGRA 1차 crossover 완료).
+> 상위 컨텍스트: [[crossover-methodology.md]] §11 (HNSW vs CAGRA 1차 crossover 완료).
 
 ## 1. 비교 대상
 

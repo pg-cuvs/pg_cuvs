@@ -3,7 +3,7 @@
 > **Purpose**: hand off the pg_cuvs benchmark campaign to the next session/operator.
 > Validation (cost model) is **done & merged**; this is the map for the remaining
 > Stage D suite + the harness gaps each module needs. Read this, then
-> [`design/BENCHMARK_PROTOCOL.md`](../../design/BENCHMARK_PROTOCOL.md) (v3, the design)
+> [`design/benchmarks/protocol.md`](../../design/benchmarks/protocol.md) (v3, the design)
 > and [`docs/cost-model-calibration.md`](../../docs/cost-model-calibration.md) (frozen result).
 
 Last updated: 2026-06-17 (Stage D measured incl. D3 concurrent; merged main #71 handoff — its earlier "Stage D NOT started" snapshot is superseded by §1/§5 here).
@@ -14,7 +14,7 @@ Last updated: 2026-06-17 (Stage D measured incl. D3 concurrent; merged main #71 
 
 | Item | State |
 |------|-------|
-| **v3 protocol** (`design/BENCHMARK_PROTOCOL.md`) | merged (#68) — engines, axes, stages, P1/P2/P3 |
+| **v3 protocol** (`design/benchmarks/protocol.md`) | merged (#68) — engines, axes, stages, P1/P2/P3 |
 | **Cost-model validation** (Stage B + Stage A cross-check) | **DONE** — `docs/cost-model-calibration.md` (#68). `cost_model_version=v3-phys`, `hw_profile_version=v2` |
 | **Harness** (`bench/protocol/`, `infra/anbench/observe.py`) | merged (#69). Engines: cagra, **flat**, **transient-bf**, seqscan, hnsw, bf+batch |
 | **Operational guide** (`docs/operational-guide.md`) | v1, has the concurrency + single-client tables |
@@ -196,7 +196,7 @@ stage=D module=concurrency ref=main build=false \
 
 ## 7. References & coordination
 
-- **Design**: `design/BENCHMARK_PROTOCOL.md` (v3) · ADR-069 (protocol) · ADR-073 (engines) · ADR-074 (characterization) · ADR-075 (cost model) · ADR-061 (strategy/segment).
+- **Design**: `design/benchmarks/protocol.md` (v3) · ADR-069 (protocol) · ADR-073 (engines) · ADR-074 (characterization) · ADR-075 (cost model) · ADR-061 (strategy/segment).
 - **Results**: `docs/cost-model-calibration.md` · `docs/operational-guide.md` · `docs/data/*.csv`.
 - **Harness**: `bench/protocol/` (CONTRACT.md = interface SSOT, README.md = ownership) · `infra/anbench/observe.py`.
 - **Coordination**: GitHub **issue #56** (web↔local benchmark channel). Diagnostic on the box: `SELECT * FROM pg_cuvs_hw_profile();`.

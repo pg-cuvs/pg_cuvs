@@ -199,9 +199,9 @@ make gpu-build          # 빌드
 
 | 문서 | 내용 |
 |------|------|
-| `design/DECISIONS.md` ADR-004 | GCP VM 선택 이유 |
-| `design/DECISIONS.md` ADR-001 | C/.cu 분리, float4 충돌 |
-| `design/DECISIONS.md` ADR-007 | -Wl,-rpath 이슈 |
-| `design/SPEC.md` | GEARS 요구사항 전체 |
+| `design/decisions.md` ADR-004 | GCP VM 선택 이유 |
+| `design/decisions.md` ADR-001 | C/.cu 분리, float4 충돌 |
+| `design/decisions.md` ADR-007 | -Wl,-rpath 이슈 |
+| `design/specs/requirements.md` | GEARS 요구사항 전체 |
 | `infra/terraform/` | Terraform 설정 |
 | `infra/terraform/scripts/install_gpu_env.sh` | VM 스타트업 스크립트 |

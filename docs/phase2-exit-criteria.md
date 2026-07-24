@@ -1,6 +1,6 @@
 # Phase 2 — Exit Criteria Audit
 
-Status of the 10 PLAN.md Phase 2 exit criteria. Legend: **MET** / **MET (deviation)**.
+Status of the 10 phase-record.md Phase 2 exit criteria. Legend: **MET** / **MET (deviation)**.
 Evidence points to the implementing step and its test(s). See `docs/phase2-test-matrix.md`
 for the full feature->test matrix.
 

@@ -172,6 +172,6 @@ A100-40GB 기준 예상 성능 (N=1M×384):
 ## 4. 참고 자료
 
 - `cuvs-silicon/docs/apple_silicon_gpu_vector_search_report.md` — Apple Silicon 하드웨어 한계 분석
-- `design/DECISIONS.md` ADR-039 — Phase 3L 설계 결정
-- `design/PLAN.md` Phase 3L — GPU BF 검색 모드 사용자 노출 계획
+- `design/decisions.md` ADR-039 — Phase 3L 설계 결정
+- `design/specs/phase-record.md` Phase 3L — GPU BF 검색 모드 사용자 노출 계획
 - RAPIDS cuVS `cuvs::neighbors::brute_force` API 문서

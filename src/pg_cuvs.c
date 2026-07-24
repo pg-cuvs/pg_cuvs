@@ -305,7 +305,7 @@ cuvs_xact_callback(XactEvent event, void *arg)
                          errhint("GPU VRAM/artifacts for the dropped index may persist; "
                                  "a daemon restart will NOT clean them (it reloads them as "
                                  "zombies). Run SELECT pg_cuvs_gc_orphans(true); to reclaim "
-                                 "them, or follow the manual cleanup in OPS_GPU_PLAYBOOK.")));
+                                 "them, or follow the manual cleanup in ops-gpu-playbook.")));
         }
     }
 
@@ -2679,7 +2679,7 @@ cuvs_ambuild(Relation heapRel, Relation indexRel, IndexInfo *indexInfo)
                          errhint("CAGRA artifacts are rebuildable and multi-GB. Place index_dir "
                                  "in a sibling directory on the same local volume but OUTSIDE "
                                  "$PGDATA (preserves locality, excludes from base backups). "
-                                 "See docs/best-practices.md and OPS_GPU_PLAYBOOK section 6.")));
+                                 "See docs/best-practices.md and ops-gpu-playbook section 6.")));
         }
     }
 
@@ -2936,7 +2936,7 @@ flat_ambuild(Relation heapRel, Relation indexRel, IndexInfo *indexInfo)
                                  "multi-GB. Place index_dir in a sibling directory on the "
                                  "same local volume but OUTSIDE $PGDATA (preserves "
                                  "locality, excludes from base backups). "
-                                 "See docs/best-practices.md and OPS_GPU_PLAYBOOK section 6.")));
+                                 "See docs/best-practices.md and ops-gpu-playbook section 6.")));
         }
     }
 
@@ -4653,7 +4653,7 @@ flatamhandler(PG_FUNCTION_ARGS)
 
 /* ----------------------------------------------------------------
  * pg_cuvs_reset_circuit(index_name text) — re-enable GPU routing
- * after circuit breaker tripped (FALLBACK-04 in SPEC.md).
+ * after circuit breaker tripped (FALLBACK-04 in requirements.md).
  * ---------------------------------------------------------------- */
 PG_FUNCTION_INFO_V1(pg_cuvs_reset_circuit);
 Datum

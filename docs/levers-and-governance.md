@@ -3,7 +3,7 @@
 > **목적**: ROADMAP "릴리스 준비 — 문서·운영 정비"가 바로 소비할 입력. 흩어진 레버/거버넌스 지식을
 > 한곳에 모은 **작업용 reference**다. 문서 정리 시 §1·§2·§3은 운영자 reference/플레이북으로 승격하고,
 > §5(감사 TODO)는 그 작업의 체크리스트로 쓴다.
-> **정확성**: 레버 목록은 소스에서 추출(2026-06-11). 근거: ADR-070(design/DECISIONS.md), 세션 보고서
+> **정확성**: 레버 목록은 소스에서 추출(2026-06-11). 근거: ADR-070(design/decisions.md), 세션 보고서
 > docs/reports/2026-06-11-resource-governance-audit.md, PR #54.
 > **상태 표기**: 이 문서 자체가 "현행 SSOT 후보"다. 운영자 문서로 승격되기 전까지는 작업 문서로 본다.
 
@@ -156,19 +156,19 @@ Tier-2 A100 installcheck 30/30 + isolation 3/3 + no-starvation 실측.**
 
 ## §5. 문서화 감사 결과 (문서 정리 작업의 체크리스트)
 
-2026-06-11 감사(Explore 3종 + 코드 검증). 운영자 문서 = README / design/OPS_GPU_PLAYBOOK.md /
+2026-06-11 감사(Explore 3종 + 코드 검증). 운영자 문서 = README / design/ops-gpu-playbook.md /
 docs/best-practices.md / docs/playbooks/*.
 
 ### 5.1 [높음] 드리프트 — 문서가 존재하지 않는 GUC를 안내 (코드로 확정: 소스 정의 0개)
-- `design/SPEC.md §13`(line 664/666/667): `cuvs.max_vram_mb`·`cuvs.rebuild_threshold`·`cuvs.export_hnsw` — **셋 다 소스에 없음**.
+- `design/specs/requirements.md §13`(line 664/666/667): `cuvs.max_vram_mb`·`cuvs.rebuild_threshold`·`cuvs.export_hnsw` — **셋 다 소스에 없음**.
   실제: VRAM 상한은 데몬 플래그 `--max-vram-mb`(GUC 아님); delta 트리거는 `cuvs.compact_delete_ratio`/`max_delta_rows`;
   export_hnsw는 deferred(미구현).
-- `design/SPEC.md` line 154/265/294 본문도 위 가짜 GUC 참조.
+- `design/specs/requirements.md` line 154/265/294 본문도 위 가짜 GUC 참조.
 - `README.md:179`: `cuvs.gcs_bucket` GUC 설정 안내 — **없음**. 실제는 `cuvs.snapshot_uri`/`cluster_id`/`gcs_key_file`.
 - **조치**: 위 정정(저비용·즉시).
 
 ### 5.2 [높음] 단일 레버 reference 부재
-- GUC/reloption/플래그 통합 reference 문서 없음(이 문서 §1이 그 시드). `design/SPEC.md §13`이 가장 근접하나
+- GUC/reloption/플래그 통합 reference 문서 없음(이 문서 §1이 그 시드). `design/specs/requirements.md §13`이 가장 근접하나
   GUC 12개만 + 스테일 + `design/`(내부).
 - §1을 `docs/reference-guc.md`(또는 가이드사이트 References) 운영자 reference로 승격.
 
@@ -194,13 +194,13 @@ docs/best-practices.md / docs/playbooks/*.
 ### 5.6 [낮음] TBD/스테일
 - `release-upgrade.md`: cross-version 업그레이드 = TBD(템플릿만, migration script 없음).
 - `replica-bootstrap.md`: 스트리밍 물리복제 standby warmup = 미검증(TBD).
-- `OPS_GPU_PLAYBOOK §1.4`: `--max-vram-mb` 기본값 "40000" 표기 오류(실제 0→90%).
+- `ops-gpu-playbook §1.4`: `--max-vram-mb` 기본값 "40000" 표기 오류(실제 0→90%).
 - `rollback-and-cleanup.md:47` `extversion = 1.0` vs `release-upgrade.md` `0.1.0` 불일치.
 - `large-dataset-benchmark.md`: backend peak RSS 컬럼 빈칸.
 
 ### 5.7 구조: 운영 문서가 흩어져 있음
-- 운영 표면이 5곳 분산(OPS_GPU_PLAYBOOK / playbooks 16종 / best-practices / README / reports).
-- ROADMAP "릴리스 준비 — 문서·운영 정비"가 이미 자가진단: "흩어진 런북을 OPS_GPU_PLAYBOOK로 연결",
+- 운영 표면이 5곳 분산(ops-gpu-playbook / playbooks 16종 / best-practices / README / reports).
+- ROADMAP "릴리스 준비 — 문서·운영 정비"가 이미 자가진단: "흩어진 런북을 ops-gpu-playbook로 연결",
   "단일 reference 부재", "host RAM cgroup 가이드". → *잊은* 게 아니라 *아직 안 한* 상태.
 
 ### 정상 (잘 돼 있음 — 유지)

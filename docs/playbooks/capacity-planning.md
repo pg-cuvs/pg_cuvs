@@ -4,7 +4,7 @@ CAGRA 인덱스 하나가 GPU에 차지하는 VRAM, 디스크 artifact 크기, d
 사전에 계산해 `--max-vram-mb`와 `shard_count`를 결정하는 절차.
 수치는 `src/pg_cuvs_server.c:447 estimate_vram_bytes`,
 `src/cuvs_util.c cuvs_auto_shard_count`, 실측 결과
-(`design/BENCHMARK_CROSSOVER.md §11·§12·§13·§16`, `bench/results/`)에 근거한다.
+(`design/benchmarks/crossover-methodology.md §11·§12·§13·§16`, `bench/results/`)에 근거한다.
 
 ---
 
@@ -254,7 +254,7 @@ ls -lh /tmp/cuvs_indexes/ | grep -E "\.cagra|\.tids|\.delta"
 - [ ] 빌드 완료 후 `resident = t`
 
 > 검증 근거: `estimate_vram_bytes`(src/pg_cuvs_server.c:447) + `cuvs_auto_shard_count`
-> (src/cuvs_util.c) 코드 로직; pilot 실측(BENCHMARK_CROSSOVER.md §11: 1M×384 CAGRA build
+> (src/cuvs_util.c) 코드 로직; pilot 실측(crossover-methodology.md §11: 1M×384 CAGRA build
 > 28s, §16: 1M×1024 CAGRA build 85s); 50M×384 한계 확인(§12: 2×A100-40GB 교착 → 단일 노드
 > 한계).
 

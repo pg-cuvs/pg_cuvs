@@ -9,11 +9,11 @@ The <주체> shall <행동>
 ```
 
 이 문서는 `/ouroboros:interview` 세션에서 확정된 설계 결정을 GEARS 형식으로 정교화한 것이다.
-ADR은 `design/DECISIONS.md` 참조. 이 문서는 ADR을 검증 가능한 요구사항으로 변환한다.
+ADR은 `design/decisions.md` 참조. 이 문서는 ADR을 검증 가능한 요구사항으로 변환한다.
 
 Scope note:
 - 이 파일은 Phase 2 전용 완료 기준이 아니라 pg_cuvs의 전체 제품/장기 요구사항이다.
-- Phase별 완료 판정은 `design/PLAN.md`와 해당 phase audit 문서를 따른다.
+- Phase별 완료 판정은 `design/specs/phase-record.md`와 해당 phase audit 문서를 따른다.
 - Product Phase 2 single-node core 완료 판정은 `docs/phase2-exit-criteria.md`가 canonical이다.
 - 이 파일의 요구사항 중 일부는 Phase 3 또는 deferred enhancement로 남을 수 있으며,
   그런 경우 각 항목에 phase note를 둔다.
@@ -399,8 +399,8 @@ replication mechanisms.
 > backup membership (inside the `$PGDATA` tree or not) are **orthogonal**: placing
 > `index_dir` in a sibling directory on the SAME local NVMe but OUTSIDE the
 > `$PGDATA` tree preserves locality while excluding the artifacts. The default
-> `$PGDATA/cuvs_indexes` does NOT satisfy this requirement (see DECISIONS.md
-> ADR-013 + OPS_GPU_PLAYBOOK §6).
+> `$PGDATA/cuvs_indexes` does NOT satisfy this requirement (see decisions.md
+> ADR-013 + ops-gpu-playbook §6).
 
 **OBJSTORE-04**
 ```

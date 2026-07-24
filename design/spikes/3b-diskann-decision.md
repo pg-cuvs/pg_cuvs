@@ -100,6 +100,6 @@ N > RAM 한계 (1B+)            → DiskANN / sharding 재검토 시점
 ## 영향 범위
 
 - `src/`: 변경 없음 (Phase 3B 코드 없음)
-- `design/DECISIONS.md`: ADR-026 참조
-- `design/BENCHMARK_CROSSOVER.md`: §12 DiskANN 결과 참조
+- `design/decisions.md`: ADR-026 참조
+- `design/benchmarks/crossover-methodology.md`: §12 DiskANN 결과 참조
 - 향후 README의 "When to use" 섹션에 위 포지셔닝 반영 필요

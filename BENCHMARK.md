@@ -12,7 +12,7 @@ All numbers here are VM-measured and traceable to a source artifact:
 | Source | What it holds |
 |--------|---------------|
 | [`docs/profiling-results.md`](docs/profiling-results.md) | Search / build / export latency decomposition (Nsight Systems + perf) |
-| [`design/BENCHMARK_CROSSOVER.md`](design/BENCHMARK_CROSSOVER.md) | Full crossover methodology + synthetic pilot + 50M competitive + Cohere real-embedding run |
+| [`design/benchmarks/crossover-methodology.md`](design/benchmarks/crossover-methodology.md) | Full crossover methodology + synthetic pilot + 50M competitive + Cohere real-embedding run |
 | [`bench/results/*.csv`](bench/results/) | Raw per-engine result rows |
 | [`docs/filter-threshold-experiment.md`](docs/filter-threshold-experiment.md) | Selectivity × correlation sweep for filtered BF |
 
@@ -174,7 +174,7 @@ The full legacy table is preserved with these defects annotated in
 
 A fresh run inside NVIDIA's own [cuvs-bench](https://docs.nvidia.com/cuvs/) on ext
 0.5.0, through a first-of-its-kind Postgres backend
-(`BenchmarkOrchestrator(backend_type="pg")` — see [ADR-080](design/DECISIONS.md) and
+(`BenchmarkOrchestrator(backend_type="pg")` — see [ADR-080](design/decisions.md) and
 [`bench/cuvs_bench_backend/`](bench/cuvs_bench_backend/)). This **supersedes §2.1**:
 the k is wired to the GPU top-k and recall is computed against exact ground truth.
 19-point Pareto in
@@ -256,7 +256,7 @@ builds a denser graph.
 ### 2.2 Synthetic crossover pilot — where the line is
 
 Single A100, k=10, clustered synthetic, iso-recall target 0.95, concurrency=8.
-Full table in [`BENCHMARK_CROSSOVER.md` §11](design/BENCHMARK_CROSSOVER.md).
+Full table in [`crossover-methodology.md` §11](design/benchmarks/crossover-methodology.md).
 
 | N | dim | engine | build (s) | p50 (µs) | QPS (c=8) | recall@10 |
 |--:|----:|--------|----------:|---------:|----------:|----------:|
@@ -274,7 +274,7 @@ wins on every axis — the IPC round-trip (§1.1) is not worth paying for a tiny
 
 ### 2.3 50M × 384 competitive (4-way) — the honest ceiling
 
-2×A100-40GB, clustered synthetic. Full writeup: [§12](design/BENCHMARK_CROSSOVER.md).
+2×A100-40GB, clustered synthetic. Full writeup: [§12](design/benchmarks/crossover-methodology.md).
 
 | engine | build | QPS | p50 | recall@10 | note |
 |--------|------:|----:|----:|----------:|------|
@@ -380,7 +380,7 @@ Other harnesses:
 | GPU resource / MIG params | `bench/legacy/test_gpu_resources.py`, `bench/legacy/test_mig.sh` |
 
 See [`bench/README.md`](bench/README.md) for the full harness contract and
-[`design/BENCHMARK_CROSSOVER.md`](design/BENCHMARK_CROSSOVER.md) for methodology and the
+[`design/benchmarks/crossover-methodology.md`](design/benchmarks/crossover-methodology.md) for methodology and the
 complete result set.
 
 ---

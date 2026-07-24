@@ -62,7 +62,7 @@ CUVS_LIB      ?= $(CUVS_PREFIX)/lib
 # ---- CI Tier 1: CPU-reference shim (no CUDA/cuVS) -------------------------
 # `make PGCUVS_CPU_SHIM=1` swaps the nvcc-built cuVS wrapper for a pure-C CPU
 # shim (src/cuvs_wrapper_shim_cpu.c) so the extension + daemon build and run on
-# a GPU-less hosted CI runner — zero CUDA toolkit. See design/CI_STRATEGY.md
+# a GPU-less hosted CI runner — zero CUDA toolkit. See design/ci-strategy.md
 # (ADR-067). cuvs_wrapper.h is the single GPU boundary, so nothing else changes.
 ifdef PGCUVS_CPU_SHIM
 WRAPPER_OBJ      = src/cuvs_wrapper_shim_cpu.o
@@ -243,7 +243,7 @@ installcheck-tier1:
 # Parameterized large-dataset benchmark. Runs the bash harness; N/DIM/K/M
 # are passed through ONLY when set on the make command line, so the script's
 # own small sanity defaults apply otherwise. Invoked on the VM by `gpu-bench`
-# (and `gpu-bench-1m` for the PLAN 1M/1536 completion gate).
+# (and `gpu-bench-1m` for the phase-record 1M/1536 completion gate).
 benchmark:
 	$(if $(N),N=$(N)) $(if $(DIM),DIM=$(DIM)) $(if $(K),K=$(K)) $(if $(M),M=$(M)) \
 		bash infra/scripts/benchmark.sh
@@ -412,7 +412,7 @@ gpu-bench:
 		make benchmark $(if $(N),N=$(N)) $(if $(DIM),DIM=$(DIM)) $(if $(K),K=$(K)) $(if $(M),M=$(M)) 2>&1" \
 		| tee design/bench_$(shell date +%Y%m%d_%H%M).log
 
-# PLAN completion-gate run: 1M rows x 1536 dim (large VRAM-stress case).
+# phase-record completion-gate run: 1M rows x 1536 dim (large VRAM-stress case).
 # Explicit target so the heavy run is never the default. Reuses gpu-bench.
 gpu-bench-1m:
 	$(MAKE) gpu-bench N=1000000 DIM=1536

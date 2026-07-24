@@ -4,7 +4,7 @@
 # this runs as a manual/e2e harness on the GPU VM:
 #   make gpu-test-delta-restart   (or via gpu-test-all)
 #
-# Two properties (PLAN.md 3A: "daemon restart 후 delta 유실/손상 시 incomplete GPU
+# Two properties (phase-record.md 3A: "daemon restart 후 delta 유실/손상 시 incomplete GPU
 # 결과를 서빙하지 않는다"):
 #   (1) DURABILITY — a VALID pending .delta survives a daemon restart: the daemon
 #       reloads the base index and rebuilds the resident GPU delta cache from the

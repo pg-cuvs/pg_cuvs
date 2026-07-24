@@ -2,7 +2,7 @@
 
 > 워크플로우 스켈레톤(로컬)과 하네스 스크립트(웹)가 **독립적으로 작업해도 맞물리도록** 고정한 계약.
 > 실행 아키텍처는 [`README.md`](README.md), 실험 설계는
-> [`design/BENCHMARK_PROTOCOL.md`](../../design/BENCHMARK_PROTOCOL.md)(ADR-069).
+> [`design/benchmarks/protocol.md`](../../design/benchmarks/protocol.md)(ADR-069).
 
 ---
 
@@ -21,7 +21,7 @@ results/protocol/
   <stage>.csv                     # §6 스키마, append-only, run_id 컬럼 (observe.protocol_path)
   <stage>.<run_id>.progress       # 완료 cell|config 목록 (resume용)
   <stage>.<run_id>.manifest.json  # env 스냅샷 + 버전/gt_method
-  planner_est/<run_id>.csv        # Stage B 전용 (BENCHMARK_PROTOCOL §6.2)
+  planner_est/<run_id>.csv        # Stage B 전용 (protocol §6.2)
 ```
 
 **경계 (observe.py 정합, issue #56):**
@@ -48,13 +48,13 @@ results/protocol/
 | `PGCUVS_MODULE` | A: `physics` / D: `filter`\|`incremental`\|`pareto`\|`concurrency`\|`coldstart`\|`ceiling` | |
 | `PGCUVS_CELLS` | `N=1k,10k,100k,1m;dim=1024;k=10;recall=0.95,0.99` | `resolve_cells.sh`가 전개 |
 | `PGCUVS_CONFIGS` | `forced-hnsw,forced-cuvs,auto`(+`forced-seqscan,forced-bf`) | |
-| `PGCUVS_BASELINE` | `same-box`\|`iso-$` | §BENCHMARK_PROTOCOL 2 |
+| `PGCUVS_BASELINE` | `same-box`\|`iso-$` | §protocol 2 |
 | `PGCUVS_DATASET` | `cohere-1m`\|`cohere-10m`\|`synth-clustered`\|`synth-random` | |
 | `PGCUVS_REPS` | 기본 `5` | latency 셀 반복 |
 | `PGCUVS_RUN_ID` | 워크플로우 주입 (GHA run id + ts) | 출력 경로·CSV 행에 박힘 |
 | `PGCUVS_DRY_RUN` | `1`=cell 전개만 출력, 실행·기록 없음, exit 0 | GPU 쓰기 전 검증 |
 | `PGCUVS_RESUME` | `1`=`.progress`의 완료 cell 스킵 | 멱등 재실행 |
-| `PGCUVS_COST_MODEL_VERSION` | 문자열 | 모든 행에 스탬프 (§BENCHMARK_PROTOCOL 6.4) |
+| `PGCUVS_COST_MODEL_VERSION` | 문자열 | 모든 행에 스탬프 (§protocol 6.4) |
 | `PGCUVS_RUNTIME_ROUTING_VERSION` | 문자열 | 동일 |
 | `PGHOST/PGPORT/PGDATABASE/PGUSER` | 접속 | conda 활성화·`CUVS_INDEX_DIR`은 runner가 |
 | `PGCUVS_CPU_SHIM` | `1`=GPU 없이 plumbing 검증 | §7 |
@@ -70,7 +70,7 @@ results/protocol/
   `PGCUVS_RESULT: status=OK|FAIL|OOM cells_done=N/M` → 웹의 로그읽기+웹훅 진단용.
 - **manifest** (`<stage>.<run_id>.manifest.json`): env 스냅샷 + `SELECT name,setting FROM pg_settings
   WHERE source<>'default'` 덤프 + 버전(pg_cuvs sha·cuVS·CUDA·드라이버) + dataset + `gt_method` +
-  start/end + 터미널 상태. → BENCHMARK_PROTOCOL §12 재현성 자동 충족.
+  start/end + 터미널 상태. → protocol §12 재현성 자동 충족.
 
 ---
 
@@ -97,13 +97,13 @@ results/protocol/
 
 엔진 러너(`engines/<config>.sh`→python)가 각 (N, recall) 셀에서 노브를 sweep해 target 만족
 **최소값**을 채택한다(`ef_search`/`probes`/`cuvs.k`). 상한 미달이면 달성 recall 병기 + 미달 표기.
-BF 모드는 recall=1.0 — 등화 없이 별도 행. 상세 BENCHMARK_PROTOCOL §3.3.
+BF 모드는 recall=1.0 — 등화 없이 별도 행. 상세 protocol §3.3.
 
 ---
 
 ## 6. 결과 CSV 스키마
 
-**단일 진실 = `infra/anbench/observe.py`의 `PROTOCOL_FIELDS`** (BENCHMARK_PROTOCOL §4와 동일).
+**단일 진실 = `infra/anbench/observe.py`의 `PROTOCOL_FIELDS`** (protocol §4와 동일).
 헤더/순서는 그 리스트가 결정하며 `observe.write_protocol_row`가 RFC-4180(CRLF)로 기록한다.
 아래는 참조용 복제:
 

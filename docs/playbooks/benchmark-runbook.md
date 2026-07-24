@@ -14,7 +14,7 @@ pg_cuvs 벤치마크 하네스 사용법, 결과 위치, 해석 기준.
 - 코드 변경 또는 GUC 조정 후 latency/recall/QPS 회귀 여부를 확인할 때.
 - capacity-planning.md의 VRAM 추정과 실측 빌드 시간을 대조할 때.
 - 경쟁 엔진(pgvector HNSW, VectorChord 등) 대비 crossover 좌표를 측정할 때.
-- `design/BENCHMARK_CROSSOVER.md`의 미완료 셀(실제 임베딩 데이터, N 10M+,
+- `design/benchmarks/crossover-methodology.md`의 미완료 셀(실제 임베딩 데이터, N 10M+,
   멀티 GPU sharded QPS)을 채울 때.
 
 ---
@@ -57,7 +57,7 @@ SELECT index_name, n_vecs, dim, search_count, avg_latency_us,
 | `fallbacks: 0` | VRAM 충분 | 정상 |
 | `fallbacks > 0` | VRAM 부족 | `--max-vram-mb` 조정 또는 `vram-oom-fallback.md` |
 | nvidia-smi에 PG 백엔드가 CUDA context 소유 | ADR-002 위반 | 즉시 에스컬레이션 |
-| recall이 기대보다 낮음 | `cuvs.k` 부족 또는 shard_count 과다 | `cuvs.k=200` 시도 또는 `OPS_GPU_PLAYBOOK.md §1` 참조 |
+| recall이 기대보다 낮음 | `cuvs.k` 부족 또는 shard_count 과다 | `cuvs.k=200` 시도 또는 `ops-gpu-playbook.md §1` 참조 |
 
 ### B. 합성 데이터 vs 실제 임베딩 데이터 해석 주의사항
 
@@ -264,7 +264,7 @@ ls -lh design/bench_*.log 2>/dev/null
 - [ ] 결과 CSV/JSONL 파일 생성됨
 
 > 검증 근거: `large-dataset-benchmark.md`(benchmark.sh 래퍼, SUMMARY 형식, ADR-002
-> compute-apps 검증); `BENCHMARK_CROSSOVER.md §11·§12·§13·§16`(참조값 + GT 버그 이력).
+> compute-apps 검증); `crossover-methodology.md §11·§12·§13·§16`(참조값 + GT 버그 이력).
 
 ---
 
@@ -285,5 +285,5 @@ ls -lh design/bench_*.log 2>/dev/null
 
 관련: `large-dataset-benchmark.md`(기존 벤치 절차), `capacity-planning.md`(VRAM 계획),
 `jit-threshold-sweep.md`(JIT spike 시), `vram-oom-fallback.md`(fallback 시).  
-설계 근거: `design/BENCHMARK_CROSSOVER.md`(crossover 가설 H1–H4, harness 설계 §6,
-결과 스키마), `design/OPS_GPU_PLAYBOOK.md §3.2`(빌드 시간 참조).
+설계 근거: `design/benchmarks/crossover-methodology.md`(crossover 가설 H1–H4, harness 설계 §6,
+결과 스키마), `design/ops-gpu-playbook.md §3.2`(빌드 시간 참조).

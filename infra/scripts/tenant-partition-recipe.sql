@@ -13,8 +13,8 @@
 -- partitions). Hash-on-id cannot prune a similarity query; use a query-aligned key here.
 --
 -- Best fit: multi-tenant SaaS RAG (per-tenant data small, every query filters tenant,
--- high QPS, low latency = query-cost-dominated). See design/STRATEGY_NOTES.md §G,
--- design/DECISIONS.md ADR-061.
+-- high QPS, low latency = query-cost-dominated). See design/strategy/workload-notes.md §G,
+-- design/decisions.md ADR-061.
 --
 -- Usage:
 --   psql -d <db> -f tenant-partition-recipe.sql

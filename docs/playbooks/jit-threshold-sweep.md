@@ -3,7 +3,7 @@
 > [!WARNING]
 > large-dataset-benchmark.md 결과에서 `JIT:` 섹션 + p95 스파이크가 확인된 경우에만 실행.
 > 측정 없이 `jit = off`를 전역 적용하거나 임의의 `jit_above_cost`를 설정하지 않는다.
-> 이는 프로젝트 정책이다 (PLAN.md L163-168, ADR-018).
+> 이는 프로젝트 정책이다 (phase-record.md L163-168, ADR-018).
 
 ---
 

@@ -3,7 +3,7 @@
 > 목적: **"언제 pg_cuvs를 써야 하는가"를 숫자로 증명한다.**
 > pgvector / pgvectorscale / VectorChord 대비 pg_cuvs(CAGRA, GPU)가 이기는
 > (N, dim, QPS, p95/p99, cost) 구간(**crossover**)을 찾고, 지는 구간도 정직하게 기록한다.
-> 본 문서는 [[PROJECT_POSITIONING.md]]의 차별성 주장을 숫자로 뒷받침하기 위한 설계다.
+> 본 문서는 [[positioning.md]]의 차별성 주장을 숫자로 뒷받침하기 위한 설계다.
 
 ---
 
@@ -53,7 +53,7 @@
 ## 0. 배경 / 동기
 
 - Phase 3(3A~3G)는 기능적으로 완료. 남은 핵심은 **가치 입증 + 제품화**.
-- [[PHASE_3B_SPIKE.md]] 결과: cuVS Vamana disk/PQFlash 경로 **NO-GO** (cuVS 26.04).
+- [[3b-diskann-spike.md]] 결과: cuVS Vamana disk/PQFlash 경로 **NO-GO** (cuVS 26.04).
   따라서 현 시점 비교 대상은 **CAGRA(GPU, VRAM-resident)** 가 중심이고, NVMe cold
   tier는 benchmark/baseline 이후에 go/no-go를 다시 본다.
 - positioning 문서는 "고QPS·대규모 빌드·multi-GPU"를 차별점으로 주장하지만 **숫자가
@@ -149,7 +149,7 @@ avg_latency_us, recall_at_k, cost_per_1M, hw, params_json`.
 
 ## 7. 산출물
 
-- 본 문서(`design/BENCHMARK_CROSSOVER.md`).
+- 본 문서(`design/benchmarks/crossover-methodology.md`).
 - `bench/results/*.csv` + crossover 표 + 플롯.
 - README용 **"when to use pg_cuvs"** 표 — positioning 문서 보강(어느 N·QPS·dim에서
   pg_cuvs를 쓰고, 어디서 pgvector/pgvectorscale를 쓰라고 정직하게 명시).

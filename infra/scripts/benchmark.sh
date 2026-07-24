@@ -7,7 +7,7 @@
 # All metrics are emitted as parseable "metric: value" lines and collected
 # into a final "[bench] SUMMARY" block. Run on the GPU VM:
 #   make benchmark            (default sanity size 10000 x 384)
-#   N=1000000 DIM=1536 make benchmark   (PLAN completion gate case)
+#   N=1000000 DIM=1536 make benchmark   (phase-record completion gate case)
 #
 # Requires: pg_cuvs installed, pg-cuvs-server systemd unit active, index dir
 # matching the daemon --index-dir. The daemon is left running on exit.

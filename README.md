@@ -24,7 +24,7 @@ For on-prem or private RAG systems, this is useful even when search serving stay
 
 ## CI / testing
 
-Two tiers (`design/CI_STRATEGY.md`, ADR-067):
+Two tiers (`design/ci-strategy.md`, ADR-067):
 
 - **Tier 1 — CPU reference (every PR, hosted, free).** The single GPU boundary
   (`src/cuvs_wrapper.h`) is replaced by an exact-kNN **CPU shim** (`make
@@ -80,7 +80,7 @@ If the GPU service dies, PostgreSQL **gracefully degrades** to CPU-based pgvecto
 
 > **DiskANN/NVMe cold tier** (Phase 3B): spike completed, no-go for now — cuVS PQFlash
 > API is unstable in cuVS 26.04 and DiskANN at 50M×384 timed out at 2 GB cache.
-> Revisit when demand for billion-scale is confirmed. See `design/PHASE_3B_DECISION.md`.
+> Revisit when demand for billion-scale is confirmed. See `design/spikes/3b-diskann-decision.md`.
 
 Both use the same `vector <->` / `<=>` / `<#>` operator interface from pgvector. The planner selects the cheaper path based on a cost model that accounts for IPC overhead, GPU kernel cost, and data transfer:
 
@@ -112,7 +112,7 @@ Small tables route to CPU; large tables route to GPU automatically.
 | MIG (Multi-Instance GPU) | Verified | No code change; `CUDA_VISIBLE_DEVICES=MIG-uuid` |
 | GCS snapshot restore | Production-tested | Phase 3G |
 | CPU HNSW fallback (`cuvs.cpu_hnsw_fallback`) | Production-tested | Phase 3I-1 |
-| DiskANN / NVMe cold tier | Deferred (no-go) | cuVS 26.04 PQFlash API unstable; see `design/PHASE_3B_DECISION.md` |
+| DiskANN / NVMe cold tier | Deferred (no-go) | cuVS 26.04 PQFlash API unstable; see `design/spikes/3b-diskann-decision.md` |
 
 ## Current Status
 
@@ -152,19 +152,19 @@ Benchmark results — **real embeddings, Cohere Wikipedia 1M×1024, end-to-end S
 On synthetic **random** data pgvector's native HNSW build is pathologically slow (918s), which inflates the build ratio to ~13.9× — that is pgvector's worst case, not the real-embedding figure (~2×). GPU CAGRA build is content-independent, so its advantage balloons on random data.
 </details>
 
-See [`BENCHMARK.md`](BENCHMARK.md) for the latency decomposition, the full Cohere 1M×1024 Pareto, and the filtered-search selectivity sweep; `design/BENCHMARK_CROSSOVER.md` for crossover methodology.
+See [`BENCHMARK.md`](BENCHMARK.md) for the latency decomposition, the full Cohere 1M×1024 Pareto, and the filtered-search selectivity sweep; `design/benchmarks/crossover-methodology.md` for crossover methodology.
 
 ## Roadmap
 
 See [ROADMAP.md](ROADMAP.md) for remaining work and the trigger-based backlog. The full per-phase
-build history (now frozen) is in [design/PLAN.md](design/PLAN.md). Some committed test-hardening work used its own "Phase 2/3/4/5" task labels; the table below refers only to the product roadmap.
+build history (now frozen) is in [design/specs/phase-record.md](design/specs/phase-record.md). Some committed test-hardening work used its own "Phase 2/3/4/5" task labels; the table below refers only to the product roadmap.
 
 | Phase | Goal | Status |
 |-------|------|--------|
 | 1 — Proof of Mechanism | PostgreSQL pipeline + sidecar CAGRA search | Done |
 | 1.5 — Test & Ops Hardening | DDL durability, large-data benchmarks, GPU e2e, playbooks | Done |
 | 2 — Production Ready | `pg_stat_gpu_search`, LIMIT-k/metric, write/staleness, large-build memory, tiered cache | Done |
-| 3A~3G — Scale Out | pending-delta, snapshots, replicas, multi-GPU sharding, query optimization | Done (3G complete; 3B DiskANN → **no-go**, see PHASE_3B_DECISION.md) |
+| 3A~3G — Scale Out | pending-delta, snapshots, replicas, multi-GPU sharding, query optimization | Done (3G complete; 3B DiskANN → **no-go**, see 3b-diskann-decision.md) |
 | 3I — GPU Build Accelerator | CAGRA build → pgvector HNSW export (~2× faster build on real embeddings 1M×1024; 13× on synthetic 1M×384) | Done (VM E2E verified, MIG tested) |
 | 3K — HNSW DDL | `CREATE INDEX ... USING pg_cuvs_hnsw`: standard DDL for the build accelerator; `source` optional (ephemeral CAGRA from heap) + metric pre-check | Done (VM E2E, installcheck 8/8) |
 | 3H — Ops Playbooks | sizing guide, when-to-use, runbooks | In progress |
@@ -195,7 +195,7 @@ format or opclass procs would require a matching update to `src/hnsw_export.c` a
 |------------|--------|
 | `USING pg_cuvs_hnsw` build is offline | A `CREATE INDEX` build takes normal index-build locks; there is no `CONCURRENTLY` support for the GPU import path |
 | pgvector layout dependency | `hnsw_export.c` hardcodes pgvector 0.5.0+ page format; pgvector major version upgrade requires validation |
-| DiskANN / NVMe cold tier not supported | Phase 3B was spiked and abandoned; cuVS 26.04 PQFlash API is unstable. See `design/PHASE_3B_DECISION.md` |
+| DiskANN / NVMe cold tier not supported | Phase 3B was spiked and abandoned; cuVS 26.04 PQFlash API is unstable. See `design/spikes/3b-diskann-decision.md` |
 | MIG requires VM reboot on GCP | `nvidia-smi -mig 1` only sets pending mode; reboot required to activate or deactivate |
 | GCS snapshot restore requires bucket setup | Phase 3G restore path needs `cuvs.gcs_bucket` GUC set and credentials available |
 | `parallel_fanout` at N > 5M unverified | Parallel dispatch may help at large scale; current measurement only covers N ≤ 100K |
@@ -294,7 +294,7 @@ SELECT index_name, search_count, avg_latency_us, p50_us, p95_us, search_mode
 FROM pg_stat_gpu_search;
 ```
 
-See `design/OPS_GPU_PLAYBOOK.md` for parameter tuning and MIG operations.
+See `design/ops-gpu-playbook.md` for parameter tuning and MIG operations.
 
 ## Contributing
 

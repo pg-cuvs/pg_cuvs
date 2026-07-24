@@ -43,7 +43,7 @@ SELECT pg_reload_conf();
 
 - 데몬(`pg-cuvs-server`)의 `--index-dir`도 동일 경로로 맞춘다.
 - `index_dir`이 `$PGDATA` 하위로 해석되면 빌드 시 WARNING이 출력된다.
-- 복원/운영 절차: `design/OPS_GPU_PLAYBOOK.md` §6. orphan 정리는 `pg_cuvs_gc_orphans(true)`(ADR-046).
+- 복원/운영 절차: `design/ops-gpu-playbook.md` §6. orphan 정리는 `pg_cuvs_gc_orphans(true)`(ADR-046).
 
 ## 3. pgvector 버전: 0.5.x–0.8.x (HNSW export)
 
