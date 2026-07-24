@@ -27,9 +27,9 @@ Preserved for provenance. **Not** kept in sync with the current product; read as
 | [design/specs/phase-record.md](../design/specs/phase-record.md) | **Frozen.** Per-phase as-built spec + completion criteria + verification evidence. Its planning role ended when implementation completed |
 | [design/specs/requirements.md](../design/specs/requirements.md), [design/strategy/positioning.md](../design/strategy/positioning.md) | Earlier requirements / positioning; the SSOT docs above supersede them for current state |
 | [design/strategy/workload-notes.md](../design/strategy/workload-notes.md) | The analysis behind ADR-061 (workload-target repositioning); **cited by decisions.md §G/§H as the "why."** Not superseded — it is the record of that reasoning |
-| [design/benchmarks/crossover-methodology.md](../design/benchmarks/crossover-methodology.md), [docs/profiling-results.md](profiling-results.md) | Measurement methodology + raw profiling that BENCHMARK.md cites |
-| [design/spikes/](../design/spikes/), [docs/spec-audit-*.md](.) | Spike/decision records for specific phases (3B DiskANN go/no-go) |
-| [docs/filter-threshold-experiment.md](filter-threshold-experiment.md), [docs/bruteforce-acceleration-lessons.md](bruteforce-acceleration-lessons.md), [docs/phase2-exit-criteria.md](phase2-exit-criteria.md), [docs/phase2-test-matrix.md](phase2-test-matrix.md), [docs/ecosystem-strategy.md](ecosystem-strategy.md), [docs/reports/](reports/) | Experiment results, lessons, phase-completion criteria, ecosystem strategy (ADR-062), prerelease reports |
+| [design/benchmarks/crossover-methodology.md](../design/benchmarks/crossover-methodology.md), [docs/experiments/profiling-results.md](experiments/profiling-results.md) | Measurement methodology + raw profiling that BENCHMARK.md cites |
+| [design/spikes/](../design/spikes/), [docs/history/](history/) | Spike/decision records for specific phases (3B DiskANN go/no-go) + phase-2 audits |
+| [docs/experiments/filter-threshold-experiment.md](experiments/filter-threshold-experiment.md), [docs/experiments/bruteforce-acceleration-lessons.md](experiments/bruteforce-acceleration-lessons.md), [docs/history/phase2-exit-criteria.md](history/phase2-exit-criteria.md), [docs/history/phase2-test-matrix.md](history/phase2-test-matrix.md), [docs/strategy/ecosystem-strategy.md](strategy/ecosystem-strategy.md), [docs/reports/](reports/) | Experiment results, lessons, phase-completion criteria, ecosystem strategy (ADR-062), prerelease reports |
 
 ## Active planning — "what's next"
 

@@ -9,7 +9,7 @@ Measures GPU-side latency and result-count for cuvs_filtered_knn() across:
                 0.5 = half spatial   (mixed)
                 1.0 = spatially closest rows (best case for recall)
 
-Output: TSV to stdout, captured into docs/filter-threshold-experiment.md.
+Output: TSV to stdout, captured into docs/experiments/filter-threshold-experiment.md.
 
 Usage (on VM, inside cuvs_dev conda env):
   psql -U postgres -d contrib_regression -c "CREATE EXTENSION IF NOT EXISTS pg_cuvs"

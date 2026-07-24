@@ -11,10 +11,10 @@ All numbers here are VM-measured and traceable to a source artifact:
 
 | Source | What it holds |
 |--------|---------------|
-| [`docs/profiling-results.md`](docs/profiling-results.md) | Search / build / export latency decomposition (Nsight Systems + perf) |
+| [`docs/experiments/profiling-results.md`](docs/experiments/profiling-results.md) | Search / build / export latency decomposition (Nsight Systems + perf) |
 | [`design/benchmarks/crossover-methodology.md`](design/benchmarks/crossover-methodology.md) | Full crossover methodology + synthetic pilot + 50M competitive + Cohere real-embedding run |
 | [`bench/results/*.csv`](bench/results/) | Raw per-engine result rows |
-| [`docs/filter-threshold-experiment.md`](docs/filter-threshold-experiment.md) | Selectivity × correlation sweep for filtered BF |
+| [`docs/experiments/filter-threshold-experiment.md`](docs/experiments/filter-threshold-experiment.md) | Selectivity × correlation sweep for filtered BF |
 
 Reproduction harness: [`bench/`](bench/) (see [§5](#5-reproduce-it-yourself)).
 
@@ -296,7 +296,7 @@ segment (online RAG, multi-tenant), not raw scale.
 Supports the filtered brute-force path (D-wedge post-filter + 3O BITSET pre-filter), the
 multi-tenant primitive: each tenant queries with a TID filter over its own rows.
 N=200K × 128, uniform random, k=10, overfetch=4, 5 reps/cell.
-Full table: [`docs/filter-threshold-experiment.md`](docs/filter-threshold-experiment.md).
+Full table: [`docs/experiments/filter-threshold-experiment.md`](docs/experiments/filter-threshold-experiment.md).
 
 | selectivity | random recall | mixed recall | spatial recall | med latency |
 |------------:|:-------------:|:------------:|:--------------:|------------:|
@@ -340,7 +340,7 @@ Full table: [`docs/filter-threshold-experiment.md`](docs/filter-threshold-experi
   (recall +13%, latency +70% at shard_count=2 on 100K).
 - **pg_cuvs is not a WAL-logged mutable native index** — comparisons assume a
   static/batch-built index. Streaming writes go through `cuvsCagraExtend` (3Q) or the
-  `.delta` path, characterized separately ([profiling §10](docs/profiling-results.md)).
+  `.delta` path, characterized separately ([profiling §10](docs/experiments/profiling-results.md)).
 - **`pg_stat_gpu_search.p50` is a log2 bucket** — for engine-to-engine latency we use
   client-side `\timing` / `avg_latency_us`, not the bucketed percentile.
 - **Profiling hardware is a GCP VM without PMU counters** — see §0.

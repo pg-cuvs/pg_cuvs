@@ -21,13 +21,13 @@
 | 3B | DiskANN/NVMe cold tier — **NO-GO**. 재검토 조건: 1B+ 수요, **AiSAQ 레이아웃 포팅 착수 판단**, 또는 128GB+ VRAM. 재개 시 구현 방향 ADR-072(2026-07-24 개정) — cold tier는 vchord 공존이 아니라 자체 소유이며, 남의 구현을 링크하지 않고 **AiSAQ 인라인 PQ 레이아웃을 자체 직렬화 계층으로 포팅**한다. **"cuVS PQFlash stable"은 트리거에서 제거됨** — 대상(MS DiskANN C++)이 `cpp_main`으로 동결되었고, 더 근본적으로 남의 릴리스 일정에 재개 시점을 묶는 형태였다 |
 | 하드닝 | `index_dir` reloption — cross-session seqscan 폴백 근절. 인덱스가 빌드 디렉터리를 `pg_class.reloptions`에 self-describe (reloption > 세션 GUC > `$PGDATA` 3단계). installcheck GREEN, no-GUC 연결에서 Index Scan 실증 (ADR-045) |
 | 하드닝 | orphan artifact GC (`pg_cuvs_gc_orphans(do_delete)`) — 데몬-down DROP / DROP DATABASE / 재시작 좀비 재로드로 인한 VRAM+디스크 누수 근절. backend가 `index_dir`을 `pg_index`/`pg_database`와 대조(daemon은 sidecar라 카탈로그 불가). dry-run 기본. installcheck GREEN(gc_orphans) + 데몬-down e2e 검증. ADR-009 정정 반영 (ADR-046) |
-| 4-preflight | 연산 지역성 프로파일링 완료 (A100/PG16, N=1M dim=1024). 검색 GPU:IPC≈2:1(GPU-bound), 빌드 GPU 82%/backend 18%, export buffer-mgr 39%, TOAST vs PLAIN 8%. 측정 근거로 4A 하향. `docs/profiling-results.md` (ADR-044) |
+| 4-preflight | 연산 지역성 프로파일링 완료 (A100/PG16, N=1M dim=1024). 검색 GPU:IPC≈2:1(GPU-bound), 빌드 GPU 82%/backend 18%, export buffer-mgr 39%, TOAST vs PLAIN 8%. 측정 근거로 4A 하향. `docs/experiments/profiling-results.md` (ADR-044) |
 | Release-hardening | 빌드-time 권고 emit 3종 — TOAST NOTICE(고차원 toastable→PLAIN 권고), index_dir이 $PGDATA 하위면 WARNING(basebackup 비대), pgvector 0.5–0.8 밖이면 WARNING(HNSW 포맷 drift). `docs/best-practices.md`. installcheck GREEN(release_hardening) + 수동 e2e (ADR-043/ADR-013/ADR-038) |
 | 3A | Pending delta / delta exact search — INSERT/UPDATE `.delta` append(false stale 없음) + CPU/GPU 병합, snapshot-aware `.tombstone`, tri-mode `cuvs.delta_search`(enum auto|cpu|gpu), delta cap fail-closed, tombstone-aware over-fetch로 delete-drift recall 보존. installcheck 15/15 + isolation 2/2 GREEN + restart e2e PASS (ADR-047). **비고**: 메커니즘은 3F/3G·phase3a WIP(2026-05)로 구현됐으나 완료 기준(회귀/격리 검증) 미충족으로 미완 표기됐던 것을 본 세션에서 검증·certify(false-done 역방향 해소) |
-| 4A | 빌드 오버헤드(raw cuVS 대비) 최소화 — **ADR-057** memfd+SCM_RIGHTS corpus(누수-안전·무복사, peak RSS −32%), **ADR-058** parallel maintenance workers(분산스캔), **ADR-059** 데몬 multi-partial direct H2D(리더 merge 복사 제거). backend 오버헤드 ~6.3s(단일)→~3.7s(병렬); wall-clock은 GPU floor(~33s) 지배라 marginal — 가치는 north-star(backend 제거율). PLAIN 권고도 ADR-044 실측 ~8%로 보정. self-NN 단일==병렬(multi-partial) 5/5 + installcheck 15/15 + iso 2/2 GREEN, /dev/shm 고아 0. `docs/profiling-results.md` §7/8/9 (#20, ADR-057/058/059) |
+| 4A | 빌드 오버헤드(raw cuVS 대비) 최소화 — **ADR-057** memfd+SCM_RIGHTS corpus(누수-안전·무복사, peak RSS −32%), **ADR-058** parallel maintenance workers(분산스캔), **ADR-059** 데몬 multi-partial direct H2D(리더 merge 복사 제거). backend 오버헤드 ~6.3s(단일)→~3.7s(병렬); wall-clock은 GPU floor(~33s) 지배라 marginal — 가치는 north-star(backend 제거율). PLAIN 권고도 ADR-044 실측 ~8%로 보정. self-NN 단일==병렬(multi-partial) 5/5 + installcheck 15/15 + iso 2/2 GREEN, /dev/shm 고아 0. `docs/experiments/profiling-results.md` §7/8/9 (#20, ADR-057/058/059) |
 | 3R | CAGRA 빌드 파라미터 reloption — `graph_degree`/`intermediate_graph_degree`/`build_algo`(auto\|ivf_pq\|nn_descent) per-index reloption으로 노출, recall↔speed↔VRAM 튜닝. cuVS 26.04 `graph_build_params` variant 매핑. DDL validator + `intermediate >= graph_degree` fail-closed. 파라미터 실적용 실증(`.cagra` adjacency Δ = n×Δgd×4 정확) + installcheck 16/16(`build_params`) + iso 2/2 GREEN (ADR-052) |
 | 3S | statement_timeout / 취소 전파 — backend reply 대기를 `recv_all_interruptible`(poll + wait 콜백)로 인터럽트 가능하게: `statement_timeout`/cancel이 걸린 GPU 검색을 ~544ms에 끊음(이전 무기한). 데몬 `SIGPIPE` 무시로 client mid-reply disconnect에서 생존(기존 잠재 크래시 버그도 해소). `CUVS_OP_CANCEL` 미도입(소켓 close로 충분). integration sc24 + installcheck 17/17 GREEN (ADR-053) |
-| D | Exact filtered BF (D-wedge) — **전체 완료** (ADR-063). Option B(`cuvs_filtered_knn` SRF bigint[]+tid[] 오버로드, 4x overfetch, NULL→unfiltered fallback) + Option A(Custom Scan hook `cuvs.filtered_knn_hook`). IPC `CuvsCmdFrame` filter_shm_key 확장, daemon binary-search post-filter. 잔여 4항목 완료: (1) `tid[]` 타입-안전 wrapper SQL 오버로드, (2) `ExplainCustomScan` 콜백으로 EXPLAIN ANALYZE GPU IPC latency 노출, (3) `.delta` + tombstone 통합(`cuvs_merge_delta_filtered` / `cuvs_apply_tombstones_filtered`), (4) selectivity×correlation 2D 실험으로 `cuvs.filter_auto_threshold=0.05` 근거 실측(`docs/filter-threshold-experiment.md`). installcheck 19/19 + isolation 2/2 GREEN |
+| D | Exact filtered BF (D-wedge) — **전체 완료** (ADR-063). Option B(`cuvs_filtered_knn` SRF bigint[]+tid[] 오버로드, 4x overfetch, NULL→unfiltered fallback) + Option A(Custom Scan hook `cuvs.filtered_knn_hook`). IPC `CuvsCmdFrame` filter_shm_key 확장, daemon binary-search post-filter. 잔여 4항목 완료: (1) `tid[]` 타입-안전 wrapper SQL 오버로드, (2) `ExplainCustomScan` 콜백으로 EXPLAIN ANALYZE GPU IPC latency 노출, (3) `.delta` + tombstone 통합(`cuvs_merge_delta_filtered` / `cuvs_apply_tombstones_filtered`), (4) selectivity×correlation 2D 실험으로 `cuvs.filter_auto_threshold=0.05` 근거 실측(`docs/experiments/filter-threshold-experiment.md`). installcheck 19/19 + isolation 2/2 GREEN |
 | 3O | Pre-filter ANN — CAGRA-first BITSET prefilter (ADR-048). daemon 빌드 타임에 `rev_tids[]`(sorted)+`rev_item_ids[]` 역방향 맵 구성. 쿼리 타임에 필터 TID → item_id 이진탐색 → GPU BITSET. `handle_search` 3O 경로: CAGRA prefilter 우선(`cuvs_cagra_search_filtered`, approx/graph-based), 실패 시 BF prefilter fallback(`cuvs_bf_search_filtered`, exact). `use_prefilter` IPC 플래그. `cuvs.filter_auto_threshold` GUC(기본 0.05). `last_search_mode=4`(cagra_prefilter)/3(bf_prefilter). PR #36(BF prefilter), #37(CAGRA-first). installcheck 19/19 + isolation 2/2 GREEN. **비고**: 역방향 맵이 `finish_build_commit` fresh-build 분기에서 미빌드돼, 갓 빌드된 인덱스(첫 CREATE INDEX/eviction 후 재빌드)에서 prefilter가 데몬 재시작/in-place REINDEX 전까지 조용히 D-wedge로 강등되던 false-done을 PR #39에서 근본 수정(공유 헬퍼 1줄로 양 빌드 경로 커버). 원인: 완료 증거(`mode=4`)가 비대표적 상태(재시작 후 load 경로)에서만 수집됨 + `filter_comparison`이 mode를 assert 안 함. mode assertion 추가로 재발 방지(ADR-064 stream BF 작업 중 발견) |
 | 3P | IVF-PQ AM — `CREATE INDEX USING ivfpq`, reloptions(`n_lists`/`pq_bits`/`pq_dim`), `cuvs.ivfpq_n_probes` GUC(default 64). PQ codes 내부 저장으로 VRAM 10–100× 절감. `.tids`+`.ivfpq` 사이드카. `default_version` 0.2.0으로 상향. installcheck 20/20 + isolation 2/2 GREEN (ADR-049) |
 | 3Q | CAGRA Streaming Updates — `cuvsCagraExtend`(INSERT) + `cuvsCagraMerge`+cuvsFilter(DELETE/컴팩션) 실시간 인덱스 업데이트, .delta 경로 대체. VACUUM tombstone 연동(`cuvs_amvacuumcleanup`) 포함. INSERT/DELETE/UPDATE e2e · .delta 미생성 · vram_bytes 갱신 Scenario 6-8 PASS. installcheck 21/21 + isolation 2/2 GREEN (ADR-051) |
@@ -79,7 +79,7 @@
 
 > repo가 PUBLIC이 된 지금, 외부 사용자·기여자·운영자가 **현행 제품을 ADR 발굴 없이** 이해·운용할 수 있어야 한다. 현 문서는 ADR 69개(`decisions.md` 214KB) + `phase-record.md`(1523줄) + 분산 design/docs로 **역사적 근거·작업메모 누적**에 가까워, 현재 제품의 기능·아키텍처·적용 기법·고려사항을 일목요연하게 볼 단일 reference가 없다(README가 유일 개요).
 
-> **입력 자료**: [`docs/levers-and-governance.md`](docs/levers-and-governance.md) — 레버 카탈로그(GUC 34/reloption 11/데몬플래그 9, 소스 추출) + 표준 PG 레버 거버넌스(ADR-070 운영자 버전) + 세션 학습(PR#54) + **문서화 감사 결과(§5: 드리프트·미설명 레버·backport TODO 체크리스트)**. 아래 "문서 정합성/현행화"·"운영 플레이북"·"References"가 이 문서를 승격·소비한다.
+> **입력 자료**: [`docs/strategy/levers-and-governance.md`](docs/strategy/levers-and-governance.md) — 레버 카탈로그(GUC 34/reloption 11/데몬플래그 9, 소스 추출) + 표준 PG 레버 거버넌스(ADR-070 운영자 버전) + 세션 학습(PR#54) + **문서화 감사 결과(§5: 드리프트·미설명 레버·backport TODO 체크리스트)**. 아래 "문서 정합성/현행화"·"운영 플레이북"·"References"가 이 문서를 승격·소비한다.
 
 - **문서 정합성/현행화 (current-state reference 정비)**
   - `ARCHITECTURE.md`(신규): 현행 컴포넌트(확장 `.so` / sidecar 데몬 / shmem IPC), 데이터·제어 흐름, 인덱스 생애주기(build→serialize→load→evict→reload), VRAM 자기-회계, 멀티-GPU 샤딩, GCS 스냅샷.
@@ -168,7 +168,7 @@
 
 ### 운영 하드닝 잔여 (트리거별)
 
-2026-06-05 스펙 무결성 감사(`docs/spec-audit-2026-06-05.md`) + AI council 논의에서 누적. **운영자 대면 절차의 단일 산출물은 `design/ops-gpu-playbook.md`**. release급 emit(TOAST NOTICE / index_dir WARNING / pgvector 가드)은 Release-hardening으로 **완료됨**(완료 표 참조). 아래는 트리거 대기분.
+2026-06-05 스펙 무결성 감사(`docs/history/spec-audit-2026-06-05.md`) + AI council 논의에서 누적. **운영자 대면 절차의 단일 산출물은 `design/ops-gpu-playbook.md`**. release급 emit(TOAST NOTICE / index_dir WARNING / pgvector 가드)은 Release-hardening으로 **완료됨**(완료 표 참조). 아래는 트리거 대기분.
 
 | 항목 | 근거 | 성격 | 트리거 |
 |------|------|------|--------|
@@ -187,7 +187,7 @@
 | ~~**빌드 락 동시성 Tier-2 검증**~~ [OK] | ADR-070. #2 unlock의 starvation-부재(동시 검색 비차단) 검증. | **완료** (A100, 2026-06-11): 6.97s GPU 빌드 중 동시 검색 25회 각 50–110ms(블록 없음). installcheck 30/30 + isolation 3/3. |
 | **`build_sharded` 멀티GPU 검증** | ADR-070. 샤드 빌드의 reservation/eviction은 2+ GPU 필요(dev VM은 단일 A100). | Tier-2 멀티GPU VM | 멀티GPU 배포/회귀 의심 시 |
 
-스펙: `docs/spec-audit-2026-06-05.md` | ADR-011 / ADR-017 / ADR-070 | `design/ops-gpu-playbook.md`
+스펙: `docs/history/spec-audit-2026-06-05.md` | ADR-011 / ADR-017 / ADR-070 | `design/ops-gpu-playbook.md`
 
 ### 기타
 
@@ -260,7 +260,7 @@
 
 ## cuVS 에코시스템 진입 계획
 
-상세: [docs/ecosystem-strategy.md](docs/ecosystem-strategy.md) | ADR-062
+상세: [docs/strategy/ecosystem-strategy.md](docs/strategy/ecosystem-strategy.md) | ADR-062
 
 > **1차 사료 보강 (2026-07-13, ADR-078)**: Corey Nolet(NVIDIA cuVS)+Vivek Narang의 cuVS+Lucene 강연이 **merge·batch 미결을 Lucene 커넥터의 공개 과제로 확증**했다. pg_cuvs는 이 둘을 이미 닫음 — merge=3Q(ADR-051 `cuvsCagraExtend`+`cuvsCagraMerge`), batch=3M(ADR-040 `pg_cuvs_batch_search`). → **Stage 2 cuvs-bench PR 피치의 핵심 근거**: "pg_cuvs = cuVS streaming-update API를 DB 레벨에서 실사용하는 유일 사례." 강연 Q&A 통합 목록(Milvus/FAISS/OpenSearch/Qdrant/Oracle)에 Postgres 부재 = 아래 "선점 기회" 전제 재확인.
 

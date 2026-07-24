@@ -117,5 +117,5 @@ DB급 셋(Milvus·OpenSearch·Kinetica)이 수렴:
 ---
 
 **관련**: ADR-077(flat reader 락 — 본 대조가 fix를 정당화), ADR-047(delta/tombstone = 우리의
-tail), ADR-073(flat AM), ADR-074(detoast 병목·포지셔닝). 자매 문서 `docs/pgstrom-comparison.md`
+tail), ADR-073(flat AM), ADR-074(detoast 병목·포지셔닝). 자매 문서 `docs/experiments/pgstrom-comparison.md`
 (PG-Strom OLAP 대조 — transient vs warm 상주). 측정: `docs/reports/2026-06-17-stage-d3-concurrent.md`.
