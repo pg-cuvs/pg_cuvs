@@ -1,5 +1,14 @@
 # Playbook: GPU VM 생애주기 및 복구 (provisioning / stop-start / recovery)
 
+> **프로바이더 주의.** pg_cuvs 는 여러 GPU 프로바이더에서 개발돼 왔다 — 전체 목록·상태는
+> [`infra/README.md`](../../infra/README.md). **현 메인은 Brev 다.** 이 플레이북은 **GCP
+> 전용**(start/stop/ephemeral IP/service account/TERMINATED)이다. Brev 는 모델이 다르다:
+> `brev stop` 을 지원하지 않고 영속 볼륨도 없어 **start/stop 이 없다** — "재시작"은 곧
+> **재빌드**다. Brev 절차·부트스트랩은 사설 문서 레포
+> `pg_cuvs_docs/vm-access/brev-bootstrap/`(`bootstrap.sh` + README) 참조 — zero→ready
+> ~10분, 빌드 함정이 모두 박혀 있다. (부트스트랩은 운영 액세스 툴이라 공개 레포에
+> 커밋하지 않는다.) 아래 GCP 절차는 GCP 인스턴스에만 적용한다.
+
 pg_cuvs의 GPU VM(개발용 `pg-cuvs-dev` 1×A100, 멀티 GPU 수용 `pg-cuvs-dev-mgpu`
 2×A100)을 start/stop/reset 할 때 발생하는 운영 함정과 복구 절차. **둘 다 GCP
 project `your-gcp-project`에 있다** — gcloud 명령에 항상
