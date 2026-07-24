@@ -25,7 +25,7 @@ MEASUREMENT HONESTY
   reported as a different route.
 
 Usage (GPU VM, cuvs_bench env, daemon up):
-    python bench/adr079_3o_recall.py --data-dir ~/data --n 1000000 \
+    python bench/filter_recall/adr079_3o_recall.py --data-dir ~/data --n 1000000 \
         --queries 200 --k 10 --out bench/results/adr079_3o_recall.csv
 """
 import argparse

@@ -7,7 +7,7 @@ Mixing their numbers is the most common way to get a wrong answer.
 | Generation | Location | Status | What it is |
 |---|---|---|---|
 | **Current** | `cuvs_bench_backend/` | **canonical** | NVIDIA's own [cuvs-bench](https://docs.nvidia.com/cuvs/) driven through a Postgres backend (ADR-080). Recall computed by the harness against exact GT; `index_bytes` reports real daemon VRAM. Use this for any new search/build comparison. |
-| **Current** | `adr079_3o_recall.py` + `adr079_reuse.py` | **canonical** | Filtered-search measurement (3O / D-wedge / stream_bf) behind ADR-082. Independent numpy ground truth, per-query route attribution, corpus-identity checks on `--reuse-table`. |
+| **Current** | `filter_recall/` | **canonical** | Filtered-search measurement (3O / D-wedge / stream_bf) behind ADR-082 — `adr079_3o_recall.py` (driver), `adr079_reuse.py` (corpus fingerprint / reuse gate), `test_adr079_reuse.py`. Independent numpy ground truth, per-query route attribution, corpus-identity checks on `--reuse-table`. |
 | **Protocol** | `protocol/` | active | Benchmark protocol/contract + runners (concurrency, explain, incremental). Tool-agnostic; see `protocol/CONTRACT.md`. |
 | **Legacy** | `legacy/` | **superseded — do not cite** | The 2026-06 anbench-era harnesses and helpers. Preserved for provenance and because some numbers in the design docs came from them. |
 

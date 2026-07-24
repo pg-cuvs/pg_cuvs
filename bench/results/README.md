@@ -19,7 +19,7 @@ file exists so a link that lands directly on a CSV does not lose the context.
 |---|---|---|---|---|---|
 | `pg_cuvsbench_wiki1m.csv` | 2026-07-23 | cuvs-bench (pg backend) | wiki_all_1M, 1M×768 | RunPod A100-40GB | **canonical** (search+build, post-#73/#74/#75) |
 | `pg_cuvsbench_wiki1m_brev.csv` | 2026-07-23 | cuvs-bench (pg backend) | wiki_all_1M, 1M×768 | Brev A100-SXM4-80GB | **canonical** — cross-machine reproduction of the row above |
-| `adr079_3o_recall.csv` | 2026-07-23 | `bench/adr079_3o_recall.py` | wiki_all_1M | Brev A100-SXM4-80GB | superseded by `_after80` (pre-#80 D-wedge) |
+| `adr079_3o_recall.csv` | 2026-07-23 | `bench/filter_recall/adr079_3o_recall.py` | wiki_all_1M | Brev A100-SXM4-80GB | superseded by `_after80` (pre-#80 D-wedge) |
 | `adr079_3o_recall_after80.csv` | 2026-07-23 | same | wiki_all_1M | Brev A100 | **canonical** — D-wedge after #80 |
 | `adr079_3o_recall_tail.csv` | 2026-07-24 | same | wiki_all_1M | Brev A100 | **canonical** — low-selectivity tail (3O collapse) |
 | `adr079_3o_recall_crossover.csv` | 2026-07-24 | same | wiki_all_1M | Brev A100 | **canonical** — D-wedge/stream_bf crossover (~0.004) |

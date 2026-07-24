@@ -159,4 +159,4 @@ prefix. The newer uncorrelated 1M sweep is conservative only relative to the pos
 correlation fixtures, not relative to anti-correlation. The correlation axis has **not** been
 re-run against 3O, whose failure mechanism is graph connectivity rather than overfetch depth.
 
-Raw data: `bench/results/adr079_3o_recall*.csv`, harness `bench/adr079_3o_recall.py`.
+Raw data: `bench/results/adr079_3o_recall*.csv`, harness `bench/filter_recall/adr079_3o_recall.py`.
