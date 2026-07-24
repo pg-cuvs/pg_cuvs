@@ -5,7 +5,7 @@
 # survives a PostgreSQL restart and returns correct results.
 #
 # Run on pg-cuvs-dev-mgpu with:
-#   sudo bash bench/test_3i_restart.sh
+#   sudo bash bench/legacy/test_3i_restart.sh
 set -e
 
 DB=contrib_regression

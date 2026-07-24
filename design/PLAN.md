@@ -1192,7 +1192,7 @@ REINDEX INDEX t_hnsw;  -- pgvector 재빌드, LOGGED
 
 ### 4 — 완료 기준
 
-검증 환경: N=1M, dim=1024, Cohere Wikipedia, A100-40GB. `bench/run_cohere.sh` 또는 동등한 harness로 실행하고 `bench/results/`에 결과를 기록한다.
+검증 환경: N=1M, dim=1024, Cohere Wikipedia, A100-40GB. `bench/legacy/run_cohere.sh` 또는 동등한 harness로 실행하고 `bench/results/`에 결과를 기록한다.
 
 | 목표 | 수치 | 검증 방법 |
 |------|------|-----------|

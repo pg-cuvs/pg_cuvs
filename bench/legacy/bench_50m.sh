@@ -4,7 +4,7 @@
 # DiskANN is constrained to maintenance_work_mem=2GB (pgvectorscale ref conditions).
 #
 # Usage (run locally, SSHes into mgpu):
-#   bash bench/bench_50m.sh
+#   bash bench/legacy/bench_50m.sh
 #
 # Result appended to bench/results/competitive.csv (same schema).
 set -euo pipefail
@@ -29,9 +29,9 @@ SCP_TO() { gcloud compute scp "$1" "$VM:$2" --zone=$ZONE --project=$PROJ 2>&1 | 
 
 # ── 0. SCP latest harness ─────────────────────────────────────────────────
 echo "[50m] step0: SCP harness to mgpu VM"
-for f in bench/run_pilot.sh bench/run_pgvectorscale.sh bench/run_vectorchord.sh \
-          bench/load_binary.py bench/gt_faiss.py bench/recall.py bench/pctl.py \
-          bench/common.py; do
+for f in bench/legacy/run_pilot.sh bench/legacy/run_pgvectorscale.sh bench/legacy/run_vectorchord.sh \
+          bench/legacy/load_binary.py bench/legacy/gt_faiss.py bench/legacy/recall.py bench/legacy/pctl.py \
+          bench/legacy/common.py; do
   SCP_TO "$f" "/home/jaesolshin/bench/$(basename $f)"
 done
 

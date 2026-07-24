@@ -1,4 +1,45 @@
-# bench/ — pg_cuvs Crossover Benchmark harness (pilot)
+# bench/ — pg_cuvs benchmark harnesses
+
+This directory holds **three generations** of harness. They are not interchangeable:
+they differ in tool, recall method, and the extension revision they were run against.
+Mixing their numbers is the most common way to get a wrong answer.
+
+| Generation | Location | Status | What it is |
+|---|---|---|---|
+| **Current** | `cuvs_bench_backend/` | **canonical** | NVIDIA's own [cuvs-bench](https://docs.nvidia.com/cuvs/) driven through a Postgres backend (ADR-080). Recall computed by the harness against exact GT; `index_bytes` reports real daemon VRAM. Use this for any new search/build comparison. |
+| **Current** | `adr079_3o_recall.py` + `adr079_reuse.py` | **canonical** | Filtered-search measurement (3O / D-wedge / stream_bf) behind ADR-082. Independent numpy ground truth, per-query route attribution, corpus-identity checks on `--reuse-table`. |
+| **Protocol** | `protocol/` | active | Benchmark protocol/contract + runners (concurrency, explain, incremental). Tool-agnostic; see `protocol/CONTRACT.md`. |
+| **Legacy** | `legacy/` | **superseded — do not cite** | The 2026-06 anbench-era harnesses and helpers. Preserved for provenance and because some numbers in the design docs came from them. |
+
+Result artifacts and their provenance: [`results/README.md`](results/README.md).
+Narrative: [`../BENCHMARK.md`](../BENCHMARK.md).
+
+## Why `legacy/` is quarantined, not deleted
+
+Its output is still cited in `design/` documents, so deleting it would strand those
+citations. But two defects of that era are baked into its results, and they are the
+reason its numbers were demoted (see `BENCHMARK.md` Appendix A):
+
+- **k was not wired to the GPU top-k** — the `pg_cuvs` rows searched k=100 regardless of
+  the requested k, so their recall@10 came off a top-100 result while pgvector ran true
+  k sweeps. Not iso-k.
+- **`index_bytes` reported 0** for GPU-resident indexes (fixed in #73/#75).
+
+The recall *method* in `legacy/common.py` is sound (exact brute-force GT, `table id ==
+corpus row index`, set-intersection recall@k). The defects were in the extension of that
+era, not the harness — which is why the files are kept and readable rather than removed.
+
+## Known duplication (tracked, not yet fixed)
+
+`read_fbin` exists in 9 copies across `bench/`, `infra/anbench/` and `tools/`; recall in
+5; ground-truth generation in 4. That duplication is how a recall bug survived in one
+copy while another was fixed. Consolidating onto `legacy/common.py` (or a new shared
+module) needs a GPU to re-verify each harness, so it is deferred rather than done
+half-way.
+
+---
+
+## Legacy harness detail (2026-06 generation)
 
 설계 근거: [`design/BENCHMARK_CROSSOVER.md`](../design/BENCHMARK_CROSSOVER.md).
 목적: **동일 데이터 + iso-recall** 조건에서 pgvector HNSW vs pg_cuvs CAGRA의
@@ -33,13 +74,13 @@ latency / QPS / build time / recall 을 측정해 crossover 구간을 찾는다.
 
 ```bash
 # 0) (로컬 또는 VM) 데이터 + GT 생성 — diskannpy venv 등 numpy 환경에서
-python3 bench/gen_dataset.py --n 100000 --dim 384 --queries 1000 --dist random --out bench/data
-python3 bench/gt.py --data bench/data --k 100
+python3 bench/legacy/gen_dataset.py --n 100000 --dim 384 --queries 1000 --dist random --out bench/data
+python3 bench/legacy/gt.py --data bench/data --k 100
 
 # 1) (VM) pgvector HNSW
-ENGINE=hnsw  N=100000 DIM=384 K=10 RECALL_TARGET=0.95 bash bench/run_pilot.sh
+ENGINE=hnsw  N=100000 DIM=384 K=10 RECALL_TARGET=0.95 bash bench/legacy/run_pilot.sh
 # 2) (VM) pg_cuvs CAGRA  (daemon 필요)
-ENGINE=cagra N=100000 DIM=384 K=10 RECALL_TARGET=0.95 IDX_DIR=/tmp/cuvs_indexes bash bench/run_pilot.sh
+ENGINE=cagra N=100000 DIM=384 K=10 RECALL_TARGET=0.95 IDX_DIR=/tmp/cuvs_indexes bash bench/legacy/run_pilot.sh
 
 # 결과
 cat bench/results/pilot.csv

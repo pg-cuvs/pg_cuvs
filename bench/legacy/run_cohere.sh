@@ -3,7 +3,7 @@
 #
 # VM에서 실행. nohup 비동기 패턴 권장:
 #
-#   nohup bash bench/run_cohere.sh --n 1000000 > /tmp/cohere_bench.log 2>&1 &
+#   nohup bash bench/legacy/run_cohere.sh --n 1000000 > /tmp/cohere_bench.log 2>&1 &
 #   tail -f /tmp/cohere_bench.log
 #   grep -E 'STEP|DONE|FAIL|result' /tmp/cohere_bench.log
 #

@@ -5,7 +5,7 @@ Generates synthetic clustered data on-the-fly and streams into PG without
 writing a 500GB base.copy file. Supports --smoke for quick validation.
 
 Usage:
-  python3 bench/load_binary.py --n 50000000 --dim 384 --queries 1000 \\
+  python3 bench/legacy/load_binary.py --n 50000000 --dim 384 --queries 1000 \\
     --db bench --host /var/run/postgresql --seed 1234
 
 Requires: numpy, psycopg2

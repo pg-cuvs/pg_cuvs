@@ -7,7 +7,7 @@ Queries : ~/anbench/data/queries_10k.fbin (first N_QUERIES used)
 GT      : ~/anbench/data/gt_1000000.npy  (shape [10000, 100], 0-indexed)
 
 Usage (async):
-  nohup python3 bench/ef_recall_sweep.py > /tmp/ef_recall.log 2>&1 &
+  nohup python3 bench/legacy/ef_recall_sweep.py > /tmp/ef_recall.log 2>&1 &
   tail -f /tmp/ef_recall.log
 
 Results → bench/results/ef_recall_sweep.csv

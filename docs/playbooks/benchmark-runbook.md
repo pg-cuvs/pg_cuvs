@@ -1,7 +1,7 @@
 # Playbook: 벤치마크 실행 (benchmark-runbook)
 
 pg_cuvs 벤치마크 하네스 사용법, 결과 위치, 해석 기준.
-`infra/scripts/benchmark.sh`(`make gpu-bench`), `bench/run_cohere.sh`(`make gpu-cohere`),
+`infra/scripts/benchmark.sh`(`make gpu-bench`), `bench/legacy/run_cohere.sh`(`make gpu-cohere`),
 `infra/anbench/run_all.sh`(`make gpu-anbench`) 세 하네스를 다룬다.
 장애 대응이 아닌 측정 절차이므로 각 섹션은 "결과 해석 → 다음 단계"로 구성된다.
 
@@ -122,7 +122,7 @@ jit_section: no
 
 ---
 
-### 하네스 B — `make gpu-cohere` (bench/run_cohere.sh, 실제 임베딩 벤치)
+### 하네스 B — `make gpu-cohere` (bench/legacy/run_cohere.sh, 실제 임베딩 벤치)
 
 **용도**: Cohere Wikipedia 1024d 실제 임베딩으로 recall/latency/QPS 측정.
 현재까지 유일한 실제 임베딩 결과가 이 하네스로 생성됐다(§16, N=1M×1024).
@@ -131,7 +131,7 @@ jit_section: no
 # 기본 (N=1M, GPU 0)
 make gpu-cohere
 # 내부적으로:
-# nohup bash bench/run_cohere.sh --n 1000000 --gpu 0 > /tmp/cohere_bench.log 2>&1 &
+# nohup bash bench/legacy/run_cohere.sh --n 1000000 --gpu 0 > /tmp/cohere_bench.log 2>&1 &
 ```
 
 데이터셋 사전 준비가 필요하다(`infra/anbench/fetch_dataset.py`로 Cohere Wikipedia

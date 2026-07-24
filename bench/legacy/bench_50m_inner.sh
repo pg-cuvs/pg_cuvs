@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Runs INSIDE the mgpu VM via nohup. No SSH needed after launch.
-# Start with: nohup bash ~/bench/bench_50m_inner.sh > ~/bench/bench_50m_full.log 2>&1 &
+# Start with: nohup bash ~/bench/legacy/bench_50m_inner.sh > ~/bench/bench_50m_full.log 2>&1 &
 set -euo pipefail
 
 PY=/home/ubuntu/miniforge3/envs/cuvs_dev/bin/python

@@ -8,7 +8,7 @@ batching edge; this is the load-bearing differentiation experiment.
 
 Forcing + knob are pushed to every pgbench connection via PGOPTIONS (startup GUCs),
 so the planner uses the engine's index at the same iso-recall operating point as the
-single-client runner. Templated on bench/bf_microbatch_concurrency.sh.
+single-client runner. Templated on bench/legacy/bf_microbatch_concurrency.sh.
 """
 import argparse
 import glob

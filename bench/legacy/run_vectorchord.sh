@@ -2,7 +2,7 @@
 # VectorChord vchordrq benchmark: build index then sweep vchordrq.probes for recall Pareto.
 # SKIP_LOAD=1 to reuse existing items/queries table (same DB used across engine comparisons).
 #
-#   N=100000 DIM=384 K=10 LISTS=1000 RECALL_TARGET=0.95 bash bench/run_vectorchord.sh
+#   N=100000 DIM=384 K=10 LISTS=1000 RECALL_TARGET=0.95 bash bench/legacy/run_vectorchord.sh
 set -euo pipefail
 
 ENGINE=vchordrq; AM=vchordrq; EXT=vchord

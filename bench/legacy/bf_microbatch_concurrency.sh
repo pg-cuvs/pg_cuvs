@@ -20,7 +20,7 @@
 # bf_batch_wait_us window, bf_batch_count < total_queries demonstrates that
 # multiple queries were coalesced into single GPU dispatches.
 #
-# Run on the GPU VM with the daemon up:  bash bench/bf_microbatch_concurrency.sh
+# Run on the GPU VM with the daemon up:  bash bench/legacy/bf_microbatch_concurrency.sh
 set -u
 
 DB=${PGDATABASE:-contrib_regression}

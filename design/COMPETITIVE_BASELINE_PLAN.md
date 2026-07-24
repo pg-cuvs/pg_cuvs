@@ -183,8 +183,8 @@ Cell A는 pgvectorscale/VectorChord가 가장 유리한 구간 → 여기서 지
 
 | 파일 | 역할 |
 |---|---|
-| `bench/run_pgvectorscale.sh` | diskann 인덱스 빌드 + `diskann.query_search_list_size` sweep |
-| `bench/run_vectorchord.sh` | vchordrq 인덱스 빌드 + recall sweep (GUC 또는 multi-index) |
+| `bench/legacy/run_pgvectorscale.sh` | diskann 인덱스 빌드 + `diskann.query_search_list_size` sweep |
+| `bench/legacy/run_vectorchord.sh` | vchordrq 인덱스 빌드 + recall sweep (GUC 또는 multi-index) |
 | `bench/pareto.py` | recall-latency Pareto 추출 + CSV → frontier 표 출력 |
 
 ### 결과 CSV 스키마 확장 (기존 호환)
@@ -194,13 +194,13 @@ Cell A는 pgvectorscale/VectorChord가 가장 유리한 구간 → 여기서 지
 system,index,N,dim,k,recall_target,build_s,qps,p50_us,p95_us,p99_us,avg_us,recall_at_k,params,index_bytes
 ```
 
-`bench/run_pilot.sh`의 CSV append 부분에 `pg_relation_size('bench_idx')` 추가 예정.
+`bench/legacy/run_pilot.sh`의 CSV append 부분에 `pg_relation_size('bench_idx')` 추가 예정.
 
 ### 기존 재사용
 
-- `bench/common.py`, `bench/gt.py`, `bench/recall.py`, `bench/pctl.py` — 변경 없이 재사용.
+- `bench/legacy/common.py`, `bench/legacy/gt.py`, `bench/legacy/recall.py`, `bench/legacy/pctl.py` — 변경 없이 재사용.
 - 동일 `data.fbin`/`gt.ibin` → 공정성 보장 (같은 GT로 모든 엔진 채점).
-- `bench/bench_1m1536.sh` 패턴(스트림 로드) → VectorChord/pgvectorscale도 동일 방식.
+- `bench/legacy/bench_1m1536.sh` 패턴(스트림 로드) → VectorChord/pgvectorscale도 동일 방식.
 
 ## 7. 실행 순서 (VM 비용 최소화)
 

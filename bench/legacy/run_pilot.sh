@@ -2,13 +2,13 @@
 # Pilot crossover benchmark: pgvector HNSW vs pg_cuvs CAGRA on IDENTICAL data,
 # iso-recall comparison. Run ON the GPU VM (see design/BENCHMARK_CROSSOVER.md).
 #
-#   ENGINE=hnsw  N=100000 DIM=384 K=10 RECALL_TARGET=0.95 bash bench/run_pilot.sh
-#   ENGINE=cagra N=100000 DIM=384 K=10 RECALL_TARGET=0.95 bash bench/run_pilot.sh
+#   ENGINE=hnsw  N=100000 DIM=384 K=10 RECALL_TARGET=0.95 bash bench/legacy/run_pilot.sh
+#   ENGINE=cagra N=100000 DIM=384 K=10 RECALL_TARGET=0.95 bash bench/legacy/run_pilot.sh
 #
 # Requires (hnsw):  pgvector installed.
 # Requires (cagra): pg_cuvs installed + pg-cuvs-server daemon active, IDX_DIR
 #                   matching the daemon --index-dir.
-# Pre-req once: python3 bench/gen_dataset.py ... && python3 bench/gt.py ...
+# Pre-req once: python3 bench/legacy/gen_dataset.py ... && python3 bench/legacy/gt.py ...
 set -euo pipefail
 
 ENGINE=${ENGINE:-hnsw}                 # hnsw | cagra
