@@ -782,6 +782,9 @@ cuvs_ipc_drop(const char *socket_path, uint32_t db_oid, uint32_t index_oid)
 
 /* ----------------------------------------------------------------
  * Public API: cuvs_ipc_build
+ *
+ * DUP-SIBLING(build): cuvs_ipc_build_flat is a duplicate (ADR-073). Change both
+ * together; see the duplicate-pair inventory in ADR-073.
  * ---------------------------------------------------------------- */
 int
 cuvs_ipc_build(
@@ -889,8 +892,8 @@ cleanup:
 /* ----------------------------------------------------------------
  * Public API: cuvs_ipc_build_flat (ADR-073)
  *
- * Duplicate of cuvs_ipc_build (regression safety — the plan mandates
- * duplicate-not-refactor for flat) that sends CUVS_OP_BUILD_FLAT. The corpus
+ * DUP-SIBLING(build). Duplicate of cuvs_ipc_build (regression safety — the plan
+ * mandates duplicate-not-refactor for flat) that sends CUVS_OP_BUILD_FLAT. The corpus
  * staging by tier is identical; only the op code and the (absent) graph params
  * differ. The daemon's handle_build_flat persists .tids + .vectors and registers
  * a brute-force-only entry — it never calls cuvs_cagra_build.
