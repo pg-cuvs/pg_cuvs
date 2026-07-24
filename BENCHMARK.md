@@ -268,17 +268,29 @@ QPS did not. Recall itself is mostly stable (cagra Δ ≤ 0.0016), except
 HNSW graph structure depends on the parallel worker count, and the beefier node
 builds a denser graph.
 
-**The wiki_all_1M ratio itself, stated honestly.** Unlike §2.1a's Cohere sweep, this
-dataset has no matched-recall pair for CAGRA vs pgvector: pgvector's ceiling
-(ef=400) tops out at recall **0.9737** (69 QPS, 14.4 ms p50), while CAGRA's *floor*
-(search_width=16) is already **0.9788** — the two curves don't overlap, so there is
-no shared recall value to compare at. The honest citation is **"CAGRA's cheapest
-point already exceeds pgvector's best recall, at 8.3× the QPS and 8.3× lower p50"**
-(600 QPS / 1.66 ms vs 69 QPS / 14.4 ms — Brev file), not a same-recall ratio. Always
-report the recall pair alongside the multiplier; a 4.5×-style headline without it
-would silently overstate the comparison in the other direction (implying same-recall
-when the baseline never reached it) and understate it in this one (pgvector cannot
-reach CAGRA's floor at any tested parameter).
+**The wiki_all_1M ratio itself, via the standard ann-benchmarks convention.**
+Fix a target recall, take the highest-QPS point on each algorithm's curve that still
+clears it (the way `ann-benchmarks.com` and the DiskANN paper itself report
+"recall@k" — no same-recall-value interpolation, no curve-overlap caveat needed):
+
+| recall@ | CAGRA (best ≥ target) | pgvector (best ≥ target) | QPS ratio | p50 ratio |
+|---|---|---|---|---|
+| ≥0.90 | sp=32, 0.9789, 671.8 QPS, 1.46 ms | ef=80, 0.9207, 245.0 QPS, 4.01 ms | 2.74× | 2.75× |
+| **≥0.95** | sp=32, 0.9789, 671.8 QPS, 1.46 ms | ef=200, 0.9585, 124.2 QPS, 8.02 ms | **5.41×** | **5.49×** |
+| ≥0.99 | sp=200, 0.998, 607.5 QPS, 1.62 ms | *no point clears 0.99* | — | — |
+
+**recall@0.95 → ~5.4×** is the citation to lead with: it needs no caveat because it
+compares both algorithms against the same external bar, not against each other's own
+extremes — exactly how the field already reports these numbers.
+
+The recall@0.99 row is not a gap in the table — it's the finding. pgvector's ceiling
+on this dataset is 0.9737 and it never reaches 0.99 at any tested `ef`, so there is no
+"CAGRA vs pgvector at recall 0.99" to report on this dataset; CAGRA's cheapest point
+(600 QPS / 1.66 ms, recall 0.9788) already exceeds that ceiling. Stated as a
+multiplier — **8.3× QPS, 8.3× lower p50** (600 vs 69, 1.66 ms vs 14.4 ms, Brev file)
+— that is what "push the target past where pgvector can go at all" looks like, not a
+different or larger version of the recall@0.95 number. Always report the recall pair
+(or, for this row, that pgvector has none) alongside any multiplier taken from it.
 
 **Same-file comparison: CAGRA vs `pgcuvs_hnsw_import` (3I, the CPU-export path from
 §1.4/§2.1a).** At matched recall ≈0.98 (cagra 0.9798, 3I 0.9808), CAGRA is **5.0×**
