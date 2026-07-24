@@ -153,39 +153,32 @@ exceeds the (small) search it replaces.
 
 ### 2.1 Real embeddings — Cohere Wikipedia 1M × 1024 (cosine)
 
-Single A100-40GB, k=10, iso-data, exact brute-force ground truth.
-Raw: [`bench/results/cohere_N1000000_summary.csv`](bench/results/cohere_N1000000_summary.csv).
+The **canonical** real-embedding comparison is §2.1a below (cuvs-bench, ext 0.5.0).
+The original run here was the earlier **anbench `run_cohere.sh`** harness, and it
+carries two code-era defects that make its pg_cuvs rows not directly comparable to
+pgvector's:
 
-| System | recall@10 | QPS | p50 | Params |
-|--------|----------:|----:|----:|--------|
-| **pg_cuvs CAGRA** (GPU search) | **0.9912** | 227 | **4.4 ms** | k=100 |
-| pgvector HNSW | 0.9891 | 45 | 22 ms | ef_search=400 |
-| pgvector HNSW | 0.9392 | 130 | 7.6 ms | ef_search=80 |
-| pgvector IVFFlat | 0.9766 | 8.6 | 115 ms | probes=128 |
-| pg_cuvs `build_hnsw` (3I) | **0.9993** | 16.9 | 61 ms | ef=512 |
+- **pg_cuvs searched k=100 regardless of the requested k** (`LIMIT` was not yet
+  wired to the GPU top-k), so its recall@10 was read from a top-100 result while
+  pgvector ran true k=10 sweeps — not iso-k. (CSV note: *"k hardcoded 100
+  internally"*.)
+- **`index_bytes` reported 0** for the GPU-resident CAGRA index (the VRAM-accounting
+  gap later fixed in #73/#75).
 
-At equivalent recall (~0.99), pg_cuvs CAGRA delivers **5 ms p50 vs pgvector HNSW's
-22 ms** — and the gap is the §1.1 story: CAGRA's search is a fixed GPU kernel, while
-HNSW must walk more of the graph (higher `ef_search`) to reach 0.99 on 1024-dim real
-embeddings. All rows are **end-to-end SQL latency** (what a Postgres app experiences);
-this project does not report raw cuVS-library timings that exclude the Postgres path.
+The full legacy table is preserved with these defects annotated in
+[Appendix A](#appendix-a--legacy-anbench-cohere-run-2026-06-superseded); raw:
+[`cohere_N1000000_summary.csv`](bench/results/cohere_N1000000_summary.csv). Use
+§2.1a/§2.1b for any headline claim.
 
-**Build (1M × 1024):**
+#### 2.1a Re-measured via cuvs-bench (NVIDIA's tool, ext 0.5.0, 2026-07-16) — canonical
 
-| Path | Build time | Note |
-|------|-----------:|------|
-| pgvector HNSW native | 285 s | m=16, ef=64, 16 GB mem, 7 workers |
-| CAGRA build + `build_hnsw` (3I) | **142 s** | **2.0× faster**, then served by pgvector HNSW |
-
-#### 2.1a Re-measured via cuvs-bench (NVIDIA's tool, ext 0.5.0, 2026-07-16)
-
-Same dataset as §2.1, but §2.1 above is the earlier anbench `run_cohere.sh` run
-while this is a fresh run inside NVIDIA's own
-[cuvs-bench](https://docs.nvidia.com/cuvs/) on ext 0.5.0 (different harness/date,
-hence slightly different absolute numbers — same ~2× build / ~4.5× search story),
-through a first-of-its-kind Postgres backend (`BenchmarkOrchestrator(backend_type="pg")` — see
-[ADR-080](design/DECISIONS.md) and [`bench/cuvs_bench_backend/`](bench/cuvs_bench_backend/)).
-19-point Pareto in [`bench/results/pg_cuvsbench_1m.csv`](bench/results/pg_cuvsbench_1m.csv):
+A fresh run inside NVIDIA's own [cuvs-bench](https://docs.nvidia.com/cuvs/) on ext
+0.5.0, through a first-of-its-kind Postgres backend
+(`BenchmarkOrchestrator(backend_type="pg")` — see [ADR-080](design/DECISIONS.md) and
+[`bench/cuvs_bench_backend/`](bench/cuvs_bench_backend/)). This **supersedes §2.1**:
+the k is wired to the GPU top-k, `index_bytes` is measured, and recall is computed by
+the orchestrator against exact ground truth. 19-point Pareto in
+[`bench/results/pg_cuvsbench_1m.csv`](bench/results/pg_cuvsbench_1m.csv):
 
 | index | serves on | recall@10 (best) | p50 | QPS | build |
 |-------|-----------|----------:|----:|----:|------:|
@@ -321,7 +314,7 @@ Full table: [`docs/filter-threshold-experiment.md`](docs/filter-threshold-experi
 
 - **Most pilot/crossover data is synthetic.** Clustered synthetic flatters IVF
   (VectorChord) and gives optimistic recall; uniform-random gives recall=1.0 that real
-  high-dim embeddings won't match (distance concentration). The §2.1 Cohere run is the
+  high-dim embeddings won't match (distance concentration). The §2.1a Cohere run is the
   one real-embedding anchor; treat synthetic crossover *coordinates* as
   distribution-dependent.
 - **Absolute QPS is host-specific; only within-machine ratios are portable.** The
@@ -369,7 +362,8 @@ Other harnesses:
 
 | Goal | Script |
 |------|--------|
-| Real Cohere 1M×1024 (§2.1) | `bench/run_cohere.sh --n 1000000 --gpu 0` |
+| Real Cohere 1M×1024 (§2.1a canonical) | `run_pg_cuvsbench.py … --dataset cohere` |
+| Real Cohere 1M×1024 (§2.1 legacy anbench) | `bench/run_cohere.sh --n 1000000 --gpu 0` |
 | 50M competitive (§2.3) | `bench/bench_50m.sh` |
 | Filter selectivity sweep (§3) | `tools/bench_filter_sweep.py` |
 | GPU resource / MIG params | `bench/test_gpu_resources.py`, `bench/test_mig.sh` |
@@ -377,3 +371,36 @@ Other harnesses:
 See [`bench/README.md`](bench/README.md) for the full harness contract and
 [`design/BENCHMARK_CROSSOVER.md`](design/BENCHMARK_CROSSOVER.md) for methodology and the
 complete result set.
+
+---
+
+## Appendix A — Legacy anbench Cohere run (2026-06, superseded)
+
+> **Superseded by §2.1a.** Preserved for provenance, not for headline claims. This
+> is the original `bench/run_cohere.sh` (anbench) output on Cohere 1M × 1024,
+> A100-SXM4-40GB. The recall *method* is sound — exact brute-force ground truth,
+> `table id == corpus row index`, standard set-intersection recall@k
+> (`infra/anbench/anbench_common.py:53`) — but two **code-era defects** are baked
+> into the pg_cuvs rows, so do not read them as iso-k vs pgvector:
+>
+> 1. **k=100 fixed** — the GPU path returned top-100 regardless of the requested k
+>    (`LIMIT` not wired to GPU top-k), so pg_cuvs recall@10 comes from a top-100
+>    result while pgvector ran true k=10/k=100 sweeps. The comparison is not iso-k.
+> 2. **`index_bytes = 0`** for the CAGRA index — VRAM accounting gap, fixed in
+>    #73/#75.
+>
+> Raw: [`cohere_N1000000_summary.csv`](bench/results/cohere_N1000000_summary.csv),
+> [`cohere_N1000000.jsonl`](bench/results/cohere_N1000000.jsonl).
+
+| System | recall@10 | QPS | p50 | Params | defect |
+|--------|----------:|----:|----:|--------|--------|
+| pg_cuvs CAGRA (GPU search) | 0.9912 | 227 | 4.4 ms | k=100 | recall from top-100, not k=10 |
+| pgvector HNSW | 0.9891 | 45 | 22 ms | ef_search=400 | — |
+| pgvector HNSW | 0.9392 | 130 | 7.6 ms | ef_search=80 | — |
+| pgvector IVFFlat | 0.9766 | 8.6 | 115 ms | probes=128 | — |
+| pg_cuvs `build_hnsw` (3I) | 0.9993 | 16.9 | 61 ms | ef=512 | — |
+
+Build (1M × 1024): pgvector HNSW native **285 s** vs CAGRA build + `build_hnsw` (3I)
+**142 s** (cagra_build 84.8 s + import 57.1 s). The build figures do not depend on the
+k-wiring defect, but the canonical build comparison is §2.1a (identical output
+artifact, measured end-to-end).
