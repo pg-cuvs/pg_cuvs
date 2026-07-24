@@ -18,7 +18,7 @@
 | §13 Phase 3I HNSW import | synthetic random — `random.Random(42)`, pilot과 **다른** 생성기 | recall=1.0000은 이 분포의 특성 |
 | §14 GPU resource/MIG | synthetic random, N=100K | 동작 검증 목적, 대표성 낮음 |
 
-**실제 임베딩 데이터 (Cohere Wikipedia 1024d)** 하네스는 `infra/anbench/fetch_dataset.py`에
+**실제 임베딩 데이터 (Cohere Wikipedia 1024d)** 하네스는 `bench/legacy/anbench/fetch_dataset.py`에
 준비되어 있지만 아직 핵심 결과에 미반영이다.
 
 ### 합성 데이터 해석 시 주의
@@ -45,7 +45,7 @@
 | N | 1M, 10M |
 | 비교 엔진 | pgvector HNSW, pg_cuvs CAGRA, VectorChord, pgvectorscale |
 | 검증 목표 | crossover N, latency/QPS, §13 build speedup 재확인, recall on real dist |
-| 하네스 | `infra/anbench/fetch_dataset.py` + `bench/legacy/bench_50m.sh` 확장 |
+| 하네스 | `bench/legacy/anbench/fetch_dataset.py` + `bench/legacy/bench_50m.sh` 확장 |
 | 상태 | **미실행** — 우선순위 대기 중 |
 
 ---

@@ -31,7 +31,7 @@ era, not the harness — which is why the files are kept and readable rather tha
 
 ## Known duplication (tracked, not yet fixed)
 
-`read_fbin` exists in 9 copies across `bench/`, `infra/anbench/` and `tools/`; recall in
+`read_fbin` exists in 9 copies across `bench/`, `bench/legacy/anbench/` and `tools/`; recall in
 5; ground-truth generation in 4. That duplication is how a recall bug survived in one
 copy while another was fixed. Consolidating onto `legacy/common.py` (or a new shared
 module) needs a GPU to re-verify each harness, so it is deferred rather than done

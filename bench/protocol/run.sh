@@ -3,7 +3,7 @@
 #
 # Contract: bench/protocol/CONTRACT.md. Config comes from env (CONTRACT §2).
 # Boundary (reconciled with observe.py, issue #56):
-#   * observe.py (infra/anbench)  → resource sampling + protocol-CSV writer
+#   * observe.py (bench/legacy/anbench)  → resource sampling + protocol-CSV writer
 #     (PROTOCOL_FIELDS is the CSV source of truth; header written once).
 #   * the per-engine python runner → imports observe, wraps build/query in
 #     `with ResourceSampler(...)`, then write_protocol_row(...). CSV write

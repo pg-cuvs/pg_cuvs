@@ -472,6 +472,6 @@ def main():
 
 
 if __name__ == "__main__":
-    # make `python3 infra/anbench/observe.py` runnable standalone
+    # make `python3 bench/legacy/anbench/observe.py` runnable standalone
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     main()

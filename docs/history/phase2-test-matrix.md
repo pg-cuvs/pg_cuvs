@@ -5,7 +5,7 @@ Maps each Product Phase 2 feature to the tests that cover it. Layers:
 - **Regress** — `test/sql/edge_cases.sql` + `test/expected/edge_cases.out` (`make gpu-test-regress`).
 - **Integ** — `infra/scripts/integration-test.sh` scenarios (`make gpu-test-daemon`).
 - **E2E** — `infra/scripts/e2e-smoke.sh` (`make gpu-test-e2e`).
-- **Bench** — `infra/anbench` / `make gpu-bench*` (Phase 1.5 infra).
+- **Bench** — `bench/legacy/anbench` / `make gpu-bench*` (Phase 1.5 infra).
 
 | Feature (Step) | Unit | Regress | Integ | E2E | Bench |
 |---|---|---|---|---|---|

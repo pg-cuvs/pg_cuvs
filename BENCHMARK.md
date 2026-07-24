@@ -391,7 +391,7 @@ complete result set.
 > is the original `bench/legacy/run_cohere.sh` (anbench) output on Cohere 1M × 1024,
 > A100-SXM4-40GB. The recall *method* is sound — exact brute-force ground truth,
 > `table id == corpus row index`, standard set-intersection recall@k
-> (`infra/anbench/anbench_common.py:53`) — but two **code-era defects** are baked
+> (`bench/legacy/anbench/anbench_common.py:53`) — but two **code-era defects** are baked
 > into the pg_cuvs rows, so do not read them as iso-k vs pgvector:
 >
 > 1. **k=100 fixed** — the GPU path returned top-100 regardless of the requested k

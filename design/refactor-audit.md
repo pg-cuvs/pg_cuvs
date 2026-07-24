@@ -15,7 +15,7 @@
 - 클린: `PG_FUNCTION_INFO_V1` 22개 전부 SQL 매칭 · orphan SQL 바인딩 0 · `#if 0` 0.
 
 ### 1.2 고아모듈 / 아티팩트
-- **정정(에이전트 오류)**: `src/*.o`는 git-추적 안 됨(이미 gitignore) -> 조치 불요. `infra/anbench/observe.py`는 고아 아님 -> issue #56 bench-protocol 하네스로 통합 중인 WIP.
+- **정정(에이전트 오류)**: `src/*.o`는 git-추적 안 됨(이미 gitignore) -> 조치 불요. `bench/legacy/anbench/observe.py`는 고아 아님 -> issue #56 bench-protocol 하네스로 통합 중인 WIP.
 - **EXTVERSION 불일치**(확인됨): Makefile `EXTVERSION=0.1.0` vs `pg_cuvs.control default_version='0.3.0'` -> Makefile 0.3.0으로.
 - 추적된 bench 산출물 4종(`bench/results/cohere_N1000000.jsonl`/`_summary.csv` · `gpu_resources_bench.csv` · `hnsw_import_bench.csv`) — BENCHMARK.md 증거 인용. 의도면 유지, 아니면 untrack.
 - **정정 — 벤치 스크립트/문서는 고아 아님**: `bench/legacy/ef_recall_sweep.py` · `infra/scripts/pgbench-multigpu.sql` · `design/benchmarks/competitive-baseline.md`는 **진행 중인 엄밀 벤치마크 작업(ADR-069 / issue #56 web<->local)의 일부**. observe.py와 동일한 false-positive 클래스(감사 에이전트가 멀티-에이전트 벤치 맥락 부재). **삭제 금지.**

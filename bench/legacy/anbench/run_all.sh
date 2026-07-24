@@ -2,7 +2,7 @@
 # run_all.sh - run the full ANN benchmark for one corpus size N across all
 # systems, each in its own conda env. Run ON THE VM from ~/pg_cuvs.
 #
-#   N=1000000 KS=10,100 bash infra/anbench/run_all.sh
+#   N=1000000 KS=10,100 bash bench/legacy/anbench/run_all.sh
 #
 # Tiers:  Tier A (SQL): pg_cuvs, pgvector hnsw, pgvector ivfflat
 #         Tier B (lib): raw cuvs CAGRA, faiss-gpu, faiss-cpu
@@ -34,19 +34,19 @@ step() { echo; echo "===== $* ====="; }
 act cuvs_py
 if [ ! -f "$GT" ]; then
     step "build GT N=$N"
-    python infra/anbench/build_gt.py --corpus "$CORPUS" --queries "$Q" --n "$N" --k 100 --out "$GT" || exit 1
+    python bench/legacy/anbench/build_gt.py --corpus "$CORPUS" --queries "$Q" --n "$N" --k 100 --out "$GT" || exit 1
 fi
 
 # --- Tier A: pgvector (CPU, in-PG) ---
 for sys in hnsw ivfflat; do
     step "pgvector $sys N=$N"
-    python infra/anbench/run_pg.py --corpus "$CORPUS" --queries "$Q" --gt "$GT" \
+    python bench/legacy/anbench/run_pg.py --corpus "$CORPUS" --queries "$Q" --gt "$GT" \
         --n "$N" --system "$sys" --out "$RUN" --ks "$KS" || echo "[run_all] WARN $sys failed"
 done
 
 # --- Tier A: pgvector exact (seqscan, no index) = in-PG brute-force baseline ---
 step "pgvector exact (seqscan) N=$N"
-python infra/anbench/run_pg.py --corpus "$CORPUS" --queries "$Q" --gt "$GT" \
+python bench/legacy/anbench/run_pg.py --corpus "$CORPUS" --queries "$Q" --gt "$GT" \
     --n "$N" --system exact --out "$RUN" --ks "$KS" || echo "[run_all] WARN exact failed"
 
 # --- Tier A: pg_cuvs (GPU via sidecar) ---
@@ -56,7 +56,7 @@ if [ "$GPU_FITS" = "1" ]; then
         /etc/systemd/system/pg-cuvs-server.service 2>/dev/null || true
     sudo systemctl daemon-reload 2>/dev/null || true
     sudo systemctl restart pg-cuvs-server; sleep 3
-    python infra/anbench/run_pg.py --corpus "$CORPUS" --queries "$Q" --gt "$GT" \
+    python bench/legacy/anbench/run_pg.py --corpus "$CORPUS" --queries "$Q" --gt "$GT" \
         --n "$N" --system pg_cuvs --out "$RUN" --ks "$KS" || echo "[run_all] WARN pg_cuvs failed (VRAM?)"
 else
     echo "[run_all] SKIP pg_cuvs: N=$N dim=$DIM exceeds GPU VRAM budget (OOM finding)"
@@ -65,11 +65,11 @@ fi
 # --- Tier B: raw cuvs CAGRA (cuvs_py) ---
 if [ "$GPU_FITS" = "1" ]; then
     step "raw cuvs CAGRA N=$N"
-    python infra/anbench/run_cuvs.py --corpus "$CORPUS" --queries "$Q" --gt "$GT" \
+    python bench/legacy/anbench/run_cuvs.py --corpus "$CORPUS" --queries "$Q" --gt "$GT" \
         --n "$N" --out "$RUN" --ks "$KS" || echo "[run_all] WARN cuvs failed"
     # Hybrid: GPU CAGRA build -> CPU HNSW search (no GPU/daemon at query time)
     step "cagra->hnsw (GPU build, CPU search) N=$N"
-    python infra/anbench/run_cagra_hnsw.py --corpus "$CORPUS" --queries "$Q" --gt "$GT" \
+    python bench/legacy/anbench/run_cagra_hnsw.py --corpus "$CORPUS" --queries "$Q" --gt "$GT" \
         --n "$N" --out "$RUN" --ks "$KS" || echo "[run_all] WARN cagra-hnsw failed"
 else
     echo "[run_all] SKIP cuvs + cagra-hnsw: exceeds GPU VRAM budget (OOM finding)"
@@ -79,7 +79,7 @@ fi
 if [ "$GPU_FITS" = "1" ]; then
     step "faiss-gpu N=$N"
     act faiss_gpu
-    python infra/anbench/run_faiss.py --corpus "$CORPUS" --queries "$Q" --gt "$GT" \
+    python bench/legacy/anbench/run_faiss.py --corpus "$CORPUS" --queries "$Q" --gt "$GT" \
         --n "$N" --out "$RUN" --mode gpu --ks "$KS" || echo "[run_all] WARN faiss-gpu failed"
 else
     echo "[run_all] SKIP faiss-gpu: exceeds GPU VRAM budget (OOM finding)"
@@ -88,7 +88,7 @@ fi
 # --- Tier B: faiss-cpu ---
 step "faiss-cpu N=$N"
 act faiss_cpu
-python infra/anbench/run_faiss.py --corpus "$CORPUS" --queries "$Q" --gt "$GT" \
+python bench/legacy/anbench/run_faiss.py --corpus "$CORPUS" --queries "$Q" --gt "$GT" \
     --n "$N" --out "$RUN" --mode cpu --ks "$KS" || echo "[run_all] WARN faiss-cpu failed"
 
 step "DONE N=$N -> $RUN"

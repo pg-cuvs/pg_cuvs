@@ -458,7 +458,7 @@ gpu-sql:
 		psql -d $(if $(DB),$(DB),postgres) -P pager=off -A -F '|'"
 .PHONY: gpu-sql
 
-# ---- Comparative ANN benchmark (infra/anbench) -------------------------
+# ---- Comparative ANN benchmark (bench/legacy/anbench) -------------------------
 # pg_cuvs vs pgvector(hnsw/ivfflat) vs raw cuvs vs faiss-gpu/cpu on the same
 # real dataset (Cohere wiki en, 1024d, cosine). Runs entirely on the VM.
 .PHONY: gpu-anbench gpu-anbench-5m gpu-anbench-agg
@@ -467,7 +467,7 @@ gpu-sql:
 gpu-anbench:
 	@mkdir -p design/anbench
 	ssh $(VM_HOST) "cd ~/pg_cuvs && N=$(if $(N),$(N),1000000) KS=$(if $(KS),$(KS),10,100) \
-		bash infra/anbench/run_all.sh 2>&1" \
+		bash bench/legacy/anbench/run_all.sh 2>&1" \
 		| tee design/anbench/run_N$(if $(N),$(N),1000000)_$(shell date +%Y%m%d_%H%M).log
 
 # Large tier (GPU-feasible max at 1024d).
@@ -478,7 +478,7 @@ gpu-anbench-5m:
 gpu-anbench-agg:
 	@mkdir -p design/anbench
 	ssh $(VM_HOST) "cd ~/pg_cuvs && source ~/miniforge3/bin/activate cuvs_py && \
-		pip install -q matplotlib 2>/dev/null; python infra/anbench/aggregate.py"
+		pip install -q matplotlib 2>/dev/null; python bench/legacy/anbench/aggregate.py"
 	rsync -avz $(VM_HOST):~/pg_cuvs/design/anbench/ design/anbench/
 
 # Convenience: full cycle on the VM (sync → build → install → test).
