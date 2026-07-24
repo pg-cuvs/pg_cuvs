@@ -209,6 +209,46 @@ heap fetch — the number a PostgreSQL application actually sees):
   slower than a bare CAGRA build because it also materializes that CPU-servable
   index. (The 120 s already includes the CAGRA build; it is not conversion-only.)
 
+#### 2.1b Cross-machine reproduction (wiki_all_1M, RunPod vs Brev) — why only *ratios* are portable
+
+The §2.1a sweep was re-run through the same cuvs-bench Postgres backend on
+**wiki_all_1M (1M × 768)**, on two different A100 hosts: a RunPod A100-40GB pod
+(containerized, shared host) and a Brev A100-SXM4-80GB node (Massed Compute).
+19-point Pareto each; raw in
+[`bench/results/pg_cuvsbench_wiki1m.csv`](bench/results/pg_cuvsbench_wiki1m.csv)
+(RunPod) and
+[`bench/results/pg_cuvsbench_wiki1m_brev.csv`](bench/results/pg_cuvsbench_wiki1m_brev.csv)
+(Brev). The two runs split cleanly into three kinds of number:
+
+| axis | RunPod → Brev | portable? |
+|------|---------------|-----------|
+| `index_bytes` (all 3 algos) | **byte-identical** (`3328000000` cagra, `4093870080` pgvector, `8192008192` 3I) | **yes — deterministic** |
+| best-recall QPS | cagra 169 → 672 (**3.98×**), pgvector 199 → 700 (**3.52×**), 3I 105 → 281 (2.67×) | **no — host-specific** |
+| build time (min) | cagra 61 → 32 s, pgvector 268 → 94 s, 3I 109 → 54 s (~2×) | **no — host-specific** |
+
+**The decisive tell: `pgvector_hnsw` uses no GPU at all**, yet its QPS moved by
+the *same* ~3× as the GPU CAGRA path (p50 3.21× for pgvector vs 3.56× for cagra).
+If the A100 were the bottleneck, only the GPU path would have sped up. Because the
+CPU-only baseline scaled in lockstep, **the driver is the host, not the GPU.**
+
+Why "the same A100" gives 3× different QPS: the measurement is a **serial,
+per-query end-to-end SQL round-trip** (`QPS ≈ 1000 / p50`). At k=10 the CAGRA
+kernel is a few hundred µs (§1.1); the wall-clock is dominated by CPU/memory-bound
+work — query planning, `vector(768)` heap detoast (~3 KB/row), the IPC round-trip,
+and result marshalling. A RunPod pod gets an over-subscribed slice of vCPUs; the
+SXM4 node has far more CPU and memory bandwidth, which is also why builds (parallel
+`CREATE INDEX`) roughly halve. The SXM4-vs-PCIe GPU difference barely contributes
+here — a serial k=10 query transfers one 3 KB query vector — and would only show up
+in **batch/concurrent** throughput, which this serial harness does not measure.
+
+**Consequence for reading every table in this document:** the headline numbers are
+**iso-recall *ratios* measured within one machine** (e.g. "CAGRA ~4.5× pgvector at
+recall 0.99"), never absolute QPS. Those ratios held across both hosts; the absolute
+QPS did not. Recall itself is mostly stable (cagra Δ ≤ 0.0016), except
+`pgvector_hnsw` reads **+0.004 to +0.019 higher on Brev** — not noise but direction:
+HNSW graph structure depends on the parallel worker count, and the beefier node
+builds a denser graph.
+
 ### 2.2 Synthetic crossover pilot — where the line is
 
 Single A100, k=10, clustered synthetic, iso-recall target 0.95, concurrency=8.
@@ -284,6 +324,13 @@ Full table: [`docs/filter-threshold-experiment.md`](docs/filter-threshold-experi
   high-dim embeddings won't match (distance concentration). The §2.1 Cohere run is the
   one real-embedding anchor; treat synthetic crossover *coordinates* as
   distribution-dependent.
+- **Absolute QPS is host-specific; only within-machine ratios are portable.** The
+  same code on two A100 hosts differs ~3× in absolute QPS — and the CPU-only pgvector
+  baseline moves by the same factor, so the driver is host CPU/memory, not the GPU
+  (§2.1b). Serial end-to-end latency is CPU/memory-bound (planning + heap detoast +
+  IPC), so a container pod and a bare node diverge. Read the headline as an iso-recall
+  *ratio* measured within one machine, never as an absolute QPS. `index_bytes` is the
+  only cross-machine-stable metric (deterministic).
 - **Single-GPU QPS ceiling ≈ 1K (small/medium N).** A single daemon's per-query IPC
   (§1.1) caps single-GPU throughput; multi-GPU sharding raises it but adds merge latency
   (recall +13%, latency +70% at shard_count=2 on 100K).
