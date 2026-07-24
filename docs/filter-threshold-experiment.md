@@ -105,12 +105,12 @@ coverage to lower selectivities at the cost of extra GPU memory bandwidth.
 
 ## Benchmark script
 
-`tools/bench_filter_sweep.py` — runs on VM with `cuvs_dev` conda env.
+`bench/filter_recall/bench_filter_sweep.py` — runs on VM with `cuvs_dev` conda env.
 
 ```bash
 cd ~/pg_cuvs
 source ~/miniforge3/bin/activate cuvs_dev
-python3 tools/bench_filter_sweep.py > /tmp/sweep_results.tsv 2>/tmp/sweep_progress.log
+python3 bench/filter_recall/bench_filter_sweep.py > /tmp/sweep_results.tsv 2>/tmp/sweep_progress.log
 ```
 
 Re-runs from scratch (generates data, builds index, sweeps, drops table).

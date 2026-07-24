@@ -15,5 +15,5 @@ queries="${PGCUVS_QUERIES:-$HOME/anbench/data/queries_10k.fbin}"
 
 # shellcheck disable=SC1091
 source "$conda/bin/activate" "$env"
-exec python3 "$REPO/tools/ivfpq_refine_spike.py" \
+exec python3 "$REPO/bench/protocol/spikes/ivfpq_refine_spike.py" \
   --corpus "$corpus" --queries "$queries" --n 100000 --nq 200 --n-probes 64

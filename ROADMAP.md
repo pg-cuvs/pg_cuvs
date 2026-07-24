@@ -205,7 +205,7 @@
 
 #### RaBitQ 자작 양자화기 — `rabitq` AM (트리거: CUDA 포팅 go) — **스파이크 GREEN**
 **왜**: ivfpq는 iso-recall 0.95에 pq_dim=1024(=1024 B/vec) 재빌드가 필요(벤치 run #31). RaBitQ(SIGMOD'24, vchord의 핵심)는 무편향 추정+오차 상한+소량 rerank로 저VRAM·고recall 동시 달성 — pg_cuvs의 VRAM 천장 밀기 포지셔닝에 정확히 부합. cuVS 미제공 → 자작.
-**증거**: numpy 스파이크(`tools/rabitq_spike.py`) cohere 100k 실측(run #32→#33): 수학 정확(무편향 std=1.000, bound coverage 0.9901), 양자화기 recall@10=0.9995@0.1%rerank, 현실 n_probes=64에서 0.9675≥0.95, **136 B/vec(ivfpq 대비 7.5× 작음)**.
+**증거**: numpy 스파이크(`bench/protocol/spikes/rabitq_spike.py`) cohere 100k 실측(run #32→#33): 수학 정확(무편향 std=1.000, bound coverage 0.9901), 양자화기 recall@10=0.9995@0.1%rerank, 현실 n_probes=64에서 0.9675≥0.95, **136 B/vec(ivfpq 대비 7.5× 작음)**.
 **남음**: CUDA 인코더/추정기/bound 커널 → `rabitq` AM 통합(flat/ivfpq 템플릿) → 검증 하네스. **트리거 = CUDA 포팅 go**(수 주, 첫 자작 ANN 수치). B안(cuVS refine)은 메모리 트레이드오프로 기각·보류.
 
 스펙: ADR-076 | `bench/protocol/HANDOFF.md §5 RaBitQ 트랙`
