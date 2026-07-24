@@ -25,9 +25,11 @@ Preserved for provenance. **Not** kept in sync with the current product; read as
 |-----|------|
 | [design/DECISIONS.md](../design/DECISIONS.md) | ADRs — every design decision, alternatives, rejection reasons. The "why" of record. Key recent: **ADR-073** (`flat` AM, supersedes ADR-071), ADR-072 (DiskANN direction), ADR-070 (resource governance) |
 | [design/PLAN.md](../design/PLAN.md) | **Frozen.** Per-phase as-built spec + completion criteria + verification evidence. Its planning role ended when implementation completed |
-| [design/SPEC.md](../design/SPEC.md), [design/STRATEGY_NOTES.md](../design/STRATEGY_NOTES.md), [design/PROJECT_POSITIONING.md](../design/PROJECT_POSITIONING.md) | Earlier requirements / strategy / positioning; superseded by the SSOT docs for current state |
+| [design/SPEC.md](../design/SPEC.md), [design/PROJECT_POSITIONING.md](../design/PROJECT_POSITIONING.md) | Earlier requirements / positioning; the SSOT docs above supersede them for current state |
+| [design/STRATEGY_NOTES.md](../design/STRATEGY_NOTES.md) | The analysis behind ADR-061 (workload-target repositioning); **cited by DECISIONS.md §G/§H as the "why."** Not superseded — it is the record of that reasoning |
 | [design/BENCHMARK_CROSSOVER.md](../design/BENCHMARK_CROSSOVER.md), [docs/profiling-results.md](profiling-results.md) | Measurement methodology + raw profiling that BENCHMARK.md cites |
-| [design/PHASE_3B_*.md](../design/), [docs/spec-audit-*.md](.) | Spike/decision records for specific phases |
+| [design/PHASE_3B_*.md](../design/), [docs/spec-audit-*.md](.) | Spike/decision records for specific phases (3B DiskANN go/no-go) |
+| [design/REVIEW_timescaledb_2.27.md](../design/REVIEW_timescaledb_2.27.md) | Evaluation note on an external design (TimescaleDB 2.27); self-declared "not an ADR" |
 | [docs/filter-threshold-experiment.md](filter-threshold-experiment.md), [docs/bruteforce-acceleration-lessons.md](bruteforce-acceleration-lessons.md), [docs/phase2-exit-criteria.md](phase2-exit-criteria.md), [docs/phase2-test-matrix.md](phase2-test-matrix.md), [docs/ecosystem-strategy.md](ecosystem-strategy.md), [docs/reports/](reports/) | Experiment results, lessons, phase-completion criteria, ecosystem strategy (ADR-062), prerelease reports |
 
 ## Active planning — "what's next"
@@ -36,6 +38,7 @@ Preserved for provenance. **Not** kept in sync with the current product; read as
 |-----|------|
 | [ROADMAP.md](../ROADMAP.md) | Sequence of remaining work + trigger-based backlog. New sequencing goes here, not PLAN.md |
 | [design/BENCHMARK_PROTOCOL.md](../design/BENCHMARK_PROTOCOL.md) | The rigorous benchmark + cost-model calibration protocol (ADR-069). New benchmark planning goes here |
+| [design/COMPETITIVE_BASELINE_PLAN.md](../design/COMPETITIVE_BASELINE_PLAN.md) | Active competitive-baseline plan (pgvectorscale / VectorChord vs pg_cuvs Pareto), part of the rigorous benchmark track (#56) |
 | [design/CI_STRATEGY.md](../design/CI_STRATEGY.md) | 2-tier CI design (ADR-067) |
 | [design/REFACTOR_PLAN.md](../design/REFACTOR_PLAN.md) | Complexity / orphan-code audit + ordered refactor plan (2026-06-12 3-agent audit) |
 
