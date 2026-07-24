@@ -3,7 +3,7 @@ name: GPU regression (Tier 2)
 # Tier 2 — real A100 regression, run ON DEMAND from the GitHub UI.
 # Actions tab -> "GPU regression (Tier 2)" -> "Run workflow" (write access only).
 #
-# Model (design/CI_STRATEGY.md §5, ADR-067): a hosted runner starts the GPU VM
+# Model (design/ci-strategy.md §5, ADR-067): a hosted runner starts the GPU VM
 # (keyless GCP auth via Workload Identity Federation), a self-hosted runner that
 # lives on the VM (as the build user, with the cuVS conda env) runs the real
 # installcheck, then a hosted runner stops the VM. Cost is incurred only when a
