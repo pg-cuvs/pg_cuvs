@@ -3,7 +3,7 @@
 > **Current-state reference (SSOT)** for the user-facing surface: index access methods, search
 > modes, GUCs, reloptions, SQL functions, and observability views. How the pieces fit together is
 > in [ARCHITECTURE.md](../ARCHITECTURE.md); the rationale behind each is in
-> [design/DECISIONS.md](../design/DECISIONS.md). Verified against `src/pg_cuvs.c` and
+> [design/decisions.md](../design/decisions.md). Verified against `src/pg_cuvs.c` and
 > `sql/pg_cuvs--0.5.0.sql` (extension version 0.5.0).
 
 ---

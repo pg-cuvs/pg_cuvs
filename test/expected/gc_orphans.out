@@ -9,8 +9,8 @@
 --
 -- NOT covered here (inherently non-deterministic for pg_regress — needs the daemon
 -- stopped mid-test): the daemon-DOWN DROP -> orphan -> GC reclaim -> no-zombie-reload
--- path. That is verified manually on the GPU VM; see docs/spec-audit / OPS_GPU_PLAYBOOK
--- and the manual procedure in DECISIONS.md ADR-046.
+-- path. That is verified manually on the GPU VM; see docs/spec-audit / ops-gpu-playbook
+-- and the manual procedure in decisions.md ADR-046.
 \set ON_ERROR_STOP on
 CREATE EXTENSION IF NOT EXISTS vector;
 NOTICE:  extension "vector" already exists, skipping

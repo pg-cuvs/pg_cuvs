@@ -3,8 +3,8 @@
 > **Purpose**: hand off the pg_cuvs benchmark campaign to the next session/operator.
 > Validation (cost model) is **done & merged**; this is the map for the remaining
 > Stage D suite + the harness gaps each module needs. Read this, then
-> [`design/BENCHMARK_PROTOCOL.md`](../../design/BENCHMARK_PROTOCOL.md) (v3, the design)
-> and [`docs/cost-model-calibration.md`](../../docs/cost-model-calibration.md) (frozen result).
+> [`design/benchmarks/protocol.md`](../../design/benchmarks/protocol.md) (v3, the design)
+> and [`docs/experiments/cost-model-calibration.md`](../../docs/experiments/cost-model-calibration.md) (frozen result).
 
 Last updated: 2026-06-17 (Stage D measured incl. D3 concurrent; merged main #71 handoff — its earlier "Stage D NOT started" snapshot is superseded by §1/§5 here).
 
@@ -14,9 +14,9 @@ Last updated: 2026-06-17 (Stage D measured incl. D3 concurrent; merged main #71 
 
 | Item | State |
 |------|-------|
-| **v3 protocol** (`design/BENCHMARK_PROTOCOL.md`) | merged (#68) — engines, axes, stages, P1/P2/P3 |
-| **Cost-model validation** (Stage B + Stage A cross-check) | **DONE** — `docs/cost-model-calibration.md` (#68). `cost_model_version=v3-phys`, `hw_profile_version=v2` |
-| **Harness** (`bench/protocol/`, `infra/anbench/observe.py`) | merged (#69). Engines: cagra, **flat**, **transient-bf**, seqscan, hnsw, bf+batch |
+| **v3 protocol** (`design/benchmarks/protocol.md`) | merged (#68) — engines, axes, stages, P1/P2/P3 |
+| **Cost-model validation** (Stage B + Stage A cross-check) | **DONE** — `docs/experiments/cost-model-calibration.md` (#68). `cost_model_version=v3-phys`, `hw_profile_version=v2` |
+| **Harness** (`bench/protocol/`, `bench/legacy/anbench/observe.py`) | merged (#69). Engines: cagra, **flat**, **transient-bf**, seqscan, hnsw, bf+batch |
 | **Operational guide** (`docs/operational-guide.md`) | v1, has the concurrency + single-client tables |
 | **Measured data** (`docs/data/`) | `stageA_exact_v3.csv` (exact-tier), `concurrency_consolidated.csv` (150 rows) |
 | **Stage A** (physics curves) | **partial** — exact-tier @10k/100k (TOAST, dim=1024) + concurrency @1k–1M done; full N×dim×storage sweep NOT done |
@@ -83,7 +83,7 @@ stage=D module=concurrency ref=main build=false \
 
 ## 4. Validated results (don't re-derive)
 
-- **Cost model PASS** (`docs/cost-model-calibration.md`): physics routes GPU from ~1k (legacy mis-routed cagra to seqscan until ~23k); `pg_cuvs_hw_profile()` source=measured/probe 6/6/daemon-match; exact-first holds; DEFAULT fallback safe.
+- **Cost model PASS** (`docs/experiments/cost-model-calibration.md`): physics routes GPU from ~1k (legacy mis-routed cagra to seqscan until ~23k); `pg_cuvs_hw_profile()` source=measured/probe 6/6/daemon-match; exact-first holds; DEFAULT fallback safe.
 - **ADR-074 reproduced** (Stage A @10k, TOAST, dim=1024, p50): flat 0.86ms(r=1.0) < cagra 1.26ms(r=0.998) ≪ cpu-seq 46.7ms(r=1.0) ≪ transient-B 129.6ms(r=1.0). flat 54× faster than seqscan; transient-B ≈/worse than cpu-seq on PCIe. cpu-seq@100k 697.8ms.
 - **Concurrency** (`docs/data/concurrency_consolidated.csv`): single-stream cagra/bf ceiling ~900–1200 QPS; **bf+batch coalescing scales** (10k→5146, 100k→4226 QPS exact) but **SLA-dependent** (1M: cagra wins p99<20ms, bf+batch wins <50ms). **peak QPS is misleading → use SLA-bounded QPS.**
 
@@ -92,23 +92,23 @@ stage=D module=concurrency ref=main build=false \
 ## 5. Next work — Stage D suite (RE-AUDITED 2026-06-16)
 
 > **Re-audit correction.** The earlier "Stage D NOT started" framing was wrong. A
-> full sweep of existing assets (`tools/`, `infra/anbench/`, `docs/`, `test/`) shows
+> full sweep of existing assets (`tools/`, `bench/legacy/anbench/`, `docs/`, `test/`) shows
 > **most of Stage D already exists or is a small delta** — only **D3 (incremental
 > perf)** is a genuinely new harness. Two parallel harnesses exist and are **not
 > integrated**: **`bench/protocol/`** (this campaign — physics/concurrency/explain,
-> writes the `observe.py` CSV) and **`infra/anbench/`** (an older competitor suite —
+> writes the `observe.py` CSV) and **`bench/legacy/anbench/`** (an older competitor suite —
 > `run_pg.py`/`run_cuvs.py`/`run_faiss.py`/`run_cagra_hnsw.py`, JSONL, `aggregate.py`
-> Pareto plots, `run_all.sh`). **Reuse `infra/anbench/` for Ring A/B instead of rebuilding.**
+> Pareto plots, `run_all.sh`). **Reuse `bench/legacy/anbench/` for Ring A/B instead of rebuilding.**
 
 ### Status legend (audit evidence)
 
 | Module | Status | Already exists (evidence) | Real remaining delta |
 |--------|--------|---------------------------|----------------------|
-| **D8 storage** | ✅ **DONE** | `docs/profiling-results.md §4`: TOAST vs PLAIN measured (PLAIN build +8%, CPU detoast wall 539→147ms). Run #40 (`engines/forced-flat-plain.sh`, dim=384): **flat is storage-independent — toast==plain** (build 1.2s, p99 1.0ms, qps ~1130 both) ✓, because flat serves from the resident `.vectors` sidecar, not the heap. The PLAIN benefit is the CPU-seq/transient-B detoast path (§4) | done — `storage` bench.yml input still blocked by the main-branch rule (wrapper used instead) |
+| **D8 storage** | ✅ **DONE** | `docs/experiments/profiling-results.md §4`: TOAST vs PLAIN measured (PLAIN build +8%, CPU detoast wall 539→147ms). Run #40 (`engines/forced-flat-plain.sh`, dim=384): **flat is storage-independent — toast==plain** (build 1.2s, p99 1.0ms, qps ~1130 both) ✓, because flat serves from the resident `.vectors` sidecar, not the heap. The PLAIN benefit is the CPU-seq/transient-B detoast path (§4) | done — `storage` bench.yml input still blocked by the main-branch rule (wrapper used instead) |
 | **D4 concurrency** | ✅ **DONE** | `runner_concurrency.py` now has `forced-flat`/`forced-transient-bf` + **`sla_bounded_qps` headline** (p99≤10ms, +5/25ms curve; was missing from `observe` — added). Run #38 @100k: **flat = 1432 sla-QPS** (c=4, p99 5.6ms; single-daemon ceiling), **transient-bf = 0** (reads TOAST heap → p99 1.5–18s, can't meet any SLA) — quantifies ADR-074 "transient-B redundant". Bug fixed: slow-detoast paths capped to 100 sweep queries | (optional) add forced-cuvs/forced-flat to the consolidated CSV for the full matrix |
 | **D1 Pareto $** | ✅ **near-done** | `tools/d1_pareto.py` over a 4-engine cohere-100k cell (run #45, $3.67/hr A100): **flat on the frontier — recall 1.0 @ $1.21/1M**, cagra 0.991@$1.34, ivfpq 0.965@$1.76 (64 MB VRAM = the compression axis), **hnsw(CPU) 0.97@$4.20 (3.5× dearer, dominated)**. VRAM-budget axis covered (ivfpq 54–64MB vs ~410MB raw) | remaining: **iso-$ CPU arm** (a CPU-only instance at matched $/hr — separate infra dispatch) |
 | **D2 filter** | ✅ **DONE** | pg_cuvs side: `filter-threshold-experiment.md` (D-wedge recall=1.0 @ ~1.3–2.8ms flat). **Competitor measured** (`tools/filter_competitor_spike.py`, run #44, pgvector 0.8.0): `off`=recall **cliff** (sel1% 0.093, 200/200 short) / `iterative_scan` recovers recall (0.85–0.98) but **p99 35–105ms** and never 1.0. **Headline: pg_cuvs 1.0@~3ms flat vs pgvector cliff-or-92ms-tail** | done (p99 + iterative_scan modes measured) |
-| **Ring A competitors** | 🟡 partial | `infra/anbench/run_pg.py` (pgvector hnsw/ivfflat/exact) | add `run_pgvectorscale.py`/`run_vectorchord.py` on the `run_pg.py` skeleton; pgvector `iterative_scan` mode |
+| **Ring A competitors** | 🟡 partial | `bench/legacy/anbench/run_pg.py` (pgvector hnsw/ivfflat/exact) | add `run_pgvectorscale.py`/`run_vectorchord.py` on the `run_pg.py` skeleton; pgvector `iterative_scan` mode |
 | **Ring B anchors** | ✅ exists | `run_cuvs.py` (raw CAGRA), `run_faiss.py` (gpu/cpu), `run_cagra_hnsw.py`, `aggregate.py`, `run_all.sh` | none new — just run + consolidate into `docs/data/` |
 | **D3 incremental** | ✅ **DONE** | `runner_incremental.py`, 5 scenarios + PK(id) (runs #43–#54). throughput: append 431/1573, fifo 345/802, upsert 417/1483 ops/s (flat/no-index) → no-index (W1) beats flat (W2) 2.3–3.6× (ADR-074). recall-drift after 2000 fifo ins+del: flat **recall@10=1.0, 0 leaked**. **concurrent diagnosed (root cause)**: flat INSERTs have **no GPU streaming write** — the daemon's EXTEND is cagra-only (`handle_extend` rejects flat's NULL handle, `pg_cuvs_server.c:6656`), so flat INSERT → CPU `.delta`; concurrent insert+search → delta/shape-mismatch/stale → CPU/error, and one `g_index_mutex` serialises extend↔search. **Earlier "flat" write numbers were the delta path, not GPU extend.** Fix landed: aminsert skips extend for non-cagra AMs; `forced-cuvs` (cagra, real `cuvsCagraExtend`) is the streaming engine for the concurrent test | **concurrent measured** (gha-27665874191, A100, real cuVS): cagra **757.8→9.8 qps, 98.7% degradation** under background ingest; no-index 1.5→1.5 qps (0%); flat FAILED (delta sidecar unusable mid-scan → replan-to-CPU, the pre-diagnosed finding). cells_done=3/3 |
 | **D6 ceiling — CAGRA 50M** | 🔴 cite-only | **50M×384 already measured (ADR-025, 2026-05-30): CAGRA shard=2 & shard=4 both OOM on A100-40GB×2** (73.24 GiB raw f32 > 80 GB VRAM); competitor numbers (HNSW p50=13ms/QPS=546, vchordrq recall=0.9991) recorded there | **50M CAGRA = cite ADR-025, do NOT re-run** (same OOM, A100-80GB×2 needed) |
@@ -196,8 +196,8 @@ stage=D module=concurrency ref=main build=false \
 
 ## 7. References & coordination
 
-- **Design**: `design/BENCHMARK_PROTOCOL.md` (v3) · ADR-069 (protocol) · ADR-073 (engines) · ADR-074 (characterization) · ADR-075 (cost model) · ADR-061 (strategy/segment).
-- **Results**: `docs/cost-model-calibration.md` · `docs/operational-guide.md` · `docs/data/*.csv`.
-- **Harness**: `bench/protocol/` (CONTRACT.md = interface SSOT, README.md = ownership) · `infra/anbench/observe.py`.
+- **Design**: `design/benchmarks/protocol.md` (v3) · ADR-069 (protocol) · ADR-073 (engines) · ADR-074 (characterization) · ADR-075 (cost model) · ADR-061 (strategy/segment).
+- **Results**: `docs/experiments/cost-model-calibration.md` · `docs/operational-guide.md` · `docs/data/*.csv`.
+- **Harness**: `bench/protocol/` (CONTRACT.md = interface SSOT, README.md = ownership) · `bench/legacy/anbench/observe.py`.
 - **Coordination**: GitHub **issue #56** (web↔local benchmark channel). Diagnostic on the box: `SELECT * FROM pg_cuvs_hw_profile();`.
 - **VM**: A100 `pg-cuvs-dev` (always up, PCIe). Never `stop_vm`. Shared with the local dev session → expect occasional PG restarts during long ops (§3.5).

@@ -35,7 +35,7 @@ rows=$(( $(wc -l < "$CSV") - 1 ))
 # 3b. header is exactly observe.PROTOCOL_FIELDS (CSV source of truth).
 # observe writes RFC-4180 CRLF line endings — strip the CR for the compare.
 hdr=$(head -1 "$CSV" | tr -d '\r')
-expect=$(python3 -c "import sys; sys.path.insert(0,'$PROTO/../../infra/anbench'); import observe; print(','.join(observe.PROTOCOL_FIELDS))")
+expect=$(python3 -c "import sys; sys.path.insert(0,'$PROTO/../../bench/legacy/anbench'); import observe; print(','.join(observe.PROTOCOL_FIELDS))")
 [ "$hdr" = "$expect" ] || fail "header != observe.PROTOCOL_FIELDS"
 
 # 4. resume idempotency: re-run adds 0 rows

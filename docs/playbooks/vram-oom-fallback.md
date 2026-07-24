@@ -371,7 +371,7 @@ SET enable_cuvs = off;
 
 - `--max-vram-mb`를 물리 VRAM의 50% 이하로 낮춰도 build-time OOM이 반복되면:
   `cuvs_ambuild()`가 backend memory에 전체 corpus를 모으는 과정에서 메모리 압박이
-  커지고 있을 수 있다. PLAN.md Phase 2 §5(streaming handoff)로 에스컬레이션.
+  커지고 있을 수 있다. phase-record.md Phase 2 §5(streaming handoff)로 에스컬레이션.
 - circuit breaker가 threshold=1 설정에서도 매 쿼리 트리거되면:
   GPU search 자체가 반복적으로 실패하는 것. daemon journal의 `OOM_FALLBACK` 이유 확인 후
   에스컬레이션.

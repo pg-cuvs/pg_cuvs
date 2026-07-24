@@ -31,7 +31,7 @@ era, not the harness — which is why the files are kept and readable rather tha
 
 ## Known duplication (tracked, not yet fixed)
 
-`read_fbin` exists in 9 copies across `bench/`, `infra/anbench/` and `tools/`; recall in
+`read_fbin` exists in 9 copies across `bench/`, `bench/legacy/anbench/` and `tools/`; recall in
 5; ground-truth generation in 4. That duplication is how a recall bug survived in one
 copy while another was fixed. Consolidating onto `legacy/common.py` (or a new shared
 module) needs a GPU to re-verify each harness, so it is deferred rather than done
@@ -41,7 +41,7 @@ half-way.
 
 ## Legacy harness detail (2026-06 generation)
 
-설계 근거: [`design/BENCHMARK_CROSSOVER.md`](../design/BENCHMARK_CROSSOVER.md).
+설계 근거: [`design/benchmarks/crossover-methodology.md`](../design/benchmarks/crossover-methodology.md).
 목적: **동일 데이터 + iso-recall** 조건에서 pgvector HNSW vs pg_cuvs CAGRA의
 latency / QPS / build time / recall 을 측정해 crossover 구간을 찾는다.
 
@@ -86,7 +86,7 @@ ENGINE=cagra N=100000 DIM=384 K=10 RECALL_TARGET=0.95 IDX_DIR=/tmp/cuvs_indexes 
 cat bench/results/pilot.csv
 ```
 
-## Pilot 매트릭스 (BENCHMARK_CROSSOVER.md §5)
+## Pilot 매트릭스 (crossover-methodology.md §5)
 
 N ∈ {100K, 1M} × dim ∈ {384, 1536} × k ∈ {10, 100} × recall_target ∈ {0.95, 0.99}.
 concurrency sweep는 `CLIENTS` 환경변수로 (기본 8). 각 셀을 hnsw·cagra 양쪽 실행.

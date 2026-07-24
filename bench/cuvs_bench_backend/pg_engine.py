@@ -2,7 +2,7 @@
 """
 pg_engine.py -- the pg_cuvs / pgvector benchmark engine.
 
-Factored out of infra/anbench/run_pg{,_3i}.py so it can back a cuvs-bench
+Factored out of bench/legacy/anbench/run_pg{,_3i}.py so it can back a cuvs-bench
 pluggable backend (which splits build() and search() into separate calls) AND
 run standalone for validation. cuvs-bench ships no PostgreSQL/pgvector backend,
 so this exposes pg_cuvs and pgvector side by side under one tool, on the same
@@ -93,7 +93,7 @@ def percentiles_ms(lat_s):
 
 def _vec_literal(v):
     # inline literal (not a bind param) so every algo runs an identical
-    # statement shape, exactly as infra/anbench/run_pg.py does.
+    # statement shape, exactly as bench/legacy/anbench/run_pg.py does.
     return "[" + ",".join(repr(float(x)) for x in v.tolist()) + "]"
 
 

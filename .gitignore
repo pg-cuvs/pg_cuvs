@@ -56,3 +56,9 @@ design/anbench/
 
 # Local tool cache (project-path → UUID map; machine-specific)
 cache/
+
+# Terraform init cache / state (any provider dir, any depth) — huge binaries
+**/.terraform/
+*.tfstate
+*.tfstate.backup
+.terraform.lock.hcl

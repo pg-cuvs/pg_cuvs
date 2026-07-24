@@ -34,7 +34,7 @@ done
 ## 2. terraform.tfvars 작성
 
 ```bash
-cd infra/terraform
+cd infra/gcp
 cp terraform.tfvars.example terraform.tfvars
 # 편집:
 #   project_id       = "<your-project>"
@@ -91,7 +91,7 @@ make gpu-server   # 데몬 바이너리 빌드 + 설치
 make gpu-postinstall
 ```
 
-`infra/scripts/postinstall.sh`를 VM에서 idempotent하게 실행한다. 내용:
+`infra/scripts/setup/postinstall.sh`를 VM에서 idempotent하게 실행한다. 내용:
 - PG role/db 생성 (ubuntu superuser)
 - conda env까지 `chmod o+x` traverse 권한 (postgres 유저가 .so rpath 따라가야 함)
 - `libstdc++.so.6` + `libgcc_s.so.1`만 `/usr/local/lib`에 심볼릭 링크 후 ldconfig

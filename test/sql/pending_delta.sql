@@ -5,7 +5,7 @@
 -- completion criteria:
 --   * Scenario A: delta cap overflow fail-closes to `.stale` (CPU reroute).
 --   * Scenario B: the resident GPU brute-force delta cache is actually built and
---     merged on the daemon (PLAN "Integration Sc 15").
+--     merged on the daemon (phase-record "Integration Sc 15").
 --   * Scenario C: cuvs.delta_search tri-mode (auto|cpu|gpu) keeps the merge correct.
 --   * Scenario D: cuvs.max_delta_rows = 0 reverts to Phase 2 (INSERT marks stale).
 --

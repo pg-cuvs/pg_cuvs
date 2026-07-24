@@ -62,7 +62,7 @@ CUVS_LIB      ?= $(CUVS_PREFIX)/lib
 # ---- CI Tier 1: CPU-reference shim (no CUDA/cuVS) -------------------------
 # `make PGCUVS_CPU_SHIM=1` swaps the nvcc-built cuVS wrapper for a pure-C CPU
 # shim (src/cuvs_wrapper_shim_cpu.c) so the extension + daemon build and run on
-# a GPU-less hosted CI runner — zero CUDA toolkit. See design/CI_STRATEGY.md
+# a GPU-less hosted CI runner — zero CUDA toolkit. See design/ci-strategy.md
 # (ADR-067). cuvs_wrapper.h is the single GPU boundary, so nothing else changes.
 ifdef PGCUVS_CPU_SHIM
 WRAPPER_OBJ      = src/cuvs_wrapper_shim_cpu.o
@@ -243,10 +243,10 @@ installcheck-tier1:
 # Parameterized large-dataset benchmark. Runs the bash harness; N/DIM/K/M
 # are passed through ONLY when set on the make command line, so the script's
 # own small sanity defaults apply otherwise. Invoked on the VM by `gpu-bench`
-# (and `gpu-bench-1m` for the PLAN 1M/1536 completion gate).
+# (and `gpu-bench-1m` for the phase-record 1M/1536 completion gate).
 benchmark:
 	$(if $(N),N=$(N)) $(if $(DIM),DIM=$(DIM)) $(if $(K),K=$(K)) $(if $(M),M=$(M)) \
-		bash infra/scripts/benchmark.sh
+		bash infra/scripts/benchmark/benchmark.sh
 
 .PHONY: benchmark
 
@@ -319,12 +319,12 @@ gpu-server:
 # fragile nested quoting; plain ssh (no -tt) since it needs no remote TTY.
 gpu-postinstall:
 	CONDA_ENV=$(CONDA_ENV) ssh $(VM_HOST) "CONDA_ENV=$(CONDA_ENV) bash -s" \
-		< infra/scripts/postinstall.sh
+		< infra/scripts/setup/postinstall.sh
 
 # End-to-end durability smoke: build index, restart daemon, verify reload.
 # Piped over stdin (bash -s); plain ssh, no remote TTY needed.
 gpu-e2e:
-	ssh $(VM_HOST) "bash -s" < infra/scripts/e2e-smoke.sh
+	ssh $(VM_HOST) "bash -s" < infra/scripts/tests/e2e-smoke.sh
 
 # ---- Integration test suite (Phase 1.5 #3) -----------------------------
 # Layered test targets. Unit tests run locally (no toolchain needed);
@@ -359,7 +359,7 @@ gpu-test-isolation:
 gpu-test-daemon:
 	ssh $(VM_HOST) "source ~/miniforge3/bin/activate $(CONDA_ENV) && \
 		CONDA_ENV=$(CONDA_ENV) bash -s" \
-		< infra/scripts/integration-test.sh
+		< infra/scripts/tests/integration-test.sh
 
 # Phase 3C: real GCS snapshot round-trip + fail-closed certification against an
 # EPHEMERAL bucket (created + destroyed by the script). Needs gcloud (/snap/bin)
@@ -368,30 +368,30 @@ gpu-test-daemon:
 gpu-test-objstore:
 	ssh $(VM_HOST) "source ~/miniforge3/bin/activate $(CONDA_ENV) && \
 		PATH=\$$PATH:/snap/bin bash -s" \
-		< infra/scripts/objstore-roundtrip-e2e.sh
+		< infra/scripts/tests/objstore-roundtrip-e2e.sh
 
 # ADR-065: a daemon started without --max-vram-mb must default to a bounded VRAM
 # budget (a fraction of total), not unlimited. Runs a dedicated daemon on a test
 # socket and asserts pg_stat_gpu_cache + the startup log. Piped over stdin.
 gpu-test-vram:
 	ssh $(VM_HOST) "source ~/miniforge3/bin/activate $(CONDA_ENV) && bash -s" \
-		< infra/scripts/vram-budget-default.sh
+		< infra/scripts/setup/vram-budget-default.sh
 
 # MAX_INDEXES soft-cap: more tenants than registry slots must work (build w/o
 # ERROR + queries auto-reload evicted indexes to GPU). Dedicated daemon with a
 # tiny --max-indexes; asserts evictions>0 and reloads>0. Piped over stdin.
 gpu-test-maxidx:
 	ssh $(VM_HOST) "source ~/miniforge3/bin/activate $(CONDA_ENV) && bash -s" \
-		< infra/scripts/max-indexes-scale.sh
+		< infra/scripts/tests/max-indexes-scale.sh
 
 # End-to-end durability smoke (alias of gpu-e2e for naming symmetry).
 gpu-test-e2e:
-	ssh $(VM_HOST) "bash -s" < infra/scripts/e2e-smoke.sh
+	ssh $(VM_HOST) "bash -s" < infra/scripts/tests/e2e-smoke.sh
 
 # Phase 3A pending-delta durability + fail-closed across a daemon restart.
 # Piped over stdin (bash -s); plain ssh, no remote TTY needed.
 gpu-test-delta-restart:
-	ssh $(VM_HOST) "bash -s" < infra/scripts/delta-restart-e2e.sh
+	ssh $(VM_HOST) "bash -s" < infra/scripts/tests/delta-restart-e2e.sh
 
 # Full ladder: unit -> regress -> isolation -> daemon faults -> e2e durability.
 gpu-test-all: gpu-test-unit gpu-test-regress gpu-test-isolation gpu-test-daemon \
@@ -412,7 +412,7 @@ gpu-bench:
 		make benchmark $(if $(N),N=$(N)) $(if $(DIM),DIM=$(DIM)) $(if $(K),K=$(K)) $(if $(M),M=$(M)) 2>&1" \
 		| tee design/bench_$(shell date +%Y%m%d_%H%M).log
 
-# PLAN completion-gate run: 1M rows x 1536 dim (large VRAM-stress case).
+# phase-record completion-gate run: 1M rows x 1536 dim (large VRAM-stress case).
 # Explicit target so the heavy run is never the default. Reuses gpu-bench.
 gpu-bench-1m:
 	$(MAKE) gpu-bench N=1000000 DIM=1536
@@ -458,7 +458,7 @@ gpu-sql:
 		psql -d $(if $(DB),$(DB),postgres) -P pager=off -A -F '|'"
 .PHONY: gpu-sql
 
-# ---- Comparative ANN benchmark (infra/anbench) -------------------------
+# ---- Comparative ANN benchmark (bench/legacy/anbench) -------------------------
 # pg_cuvs vs pgvector(hnsw/ivfflat) vs raw cuvs vs faiss-gpu/cpu on the same
 # real dataset (Cohere wiki en, 1024d, cosine). Runs entirely on the VM.
 .PHONY: gpu-anbench gpu-anbench-5m gpu-anbench-agg
@@ -467,7 +467,7 @@ gpu-sql:
 gpu-anbench:
 	@mkdir -p design/anbench
 	ssh $(VM_HOST) "cd ~/pg_cuvs && N=$(if $(N),$(N),1000000) KS=$(if $(KS),$(KS),10,100) \
-		bash infra/anbench/run_all.sh 2>&1" \
+		bash bench/legacy/anbench/run_all.sh 2>&1" \
 		| tee design/anbench/run_N$(if $(N),$(N),1000000)_$(shell date +%Y%m%d_%H%M).log
 
 # Large tier (GPU-feasible max at 1024d).
@@ -478,7 +478,7 @@ gpu-anbench-5m:
 gpu-anbench-agg:
 	@mkdir -p design/anbench
 	ssh $(VM_HOST) "cd ~/pg_cuvs && source ~/miniforge3/bin/activate cuvs_py && \
-		pip install -q matplotlib 2>/dev/null; python infra/anbench/aggregate.py"
+		pip install -q matplotlib 2>/dev/null; python bench/legacy/anbench/aggregate.py"
 	rsync -avz $(VM_HOST):~/pg_cuvs/design/anbench/ design/anbench/
 
 # Convenience: full cycle on the VM (sync → build → install → test).

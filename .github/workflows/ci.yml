@@ -57,7 +57,7 @@ jobs:
 # Catches the bug class that actually bit us this session (IPC drift, search_mode
 # labeling, fail-closed rejects, rev-map build, manifest contract, VRAM-budget
 # control flow) — all GPU-kernel-independent. Approximate-recall regression and
-# real VRAM behavior are Tier 2 only. See design/CI_STRATEGY.md (ADR-067).
+# real VRAM behavior are Tier 2 only. See design/ci-strategy.md (ADR-067).
   tier1-shim:
     name: Tier 1 — CPU shim (installcheck)
     runs-on: ubuntu-22.04
@@ -126,7 +126,7 @@ jobs:
           # query each, assert no registry-full ERROR + correct rows + evictions>0
           # and reloads>0. Slot-cap eviction is GPU-agnostic, so the shim reproduces
           # #45's soft-LRU churn deterministically. Installed server = shim (no CUDA).
-          bash infra/scripts/max-indexes-scale.sh
+          bash infra/scripts/tests/max-indexes-scale.sh
 
       - name: Upload diffs + daemon log on failure
         if: failure()
@@ -142,7 +142,7 @@ jobs:
 # ── Tier 2 (real A100 regression) lives in .github/workflows/gpu.yml ───────
 # Run on demand from the Actions UI ("Run workflow"); a hosted runner starts the
 # GPU VM (keyless WIF auth), a self-hosted runner on the VM runs the real
-# installcheck, then the VM is stopped. See design/CI_STRATEGY.md + docs/ci-gpu-setup.md.
+# installcheck, then the VM is stopped. See design/ci-strategy.md + docs/ci-gpu-setup.md.
 
 # ── Compatibility matrix (informational) ──────────────────────────────────
 # Component        Tested       Minimum

@@ -2,7 +2,7 @@
 --   CAGRA index. Verifies PG partition pruning routes `WHERE tenant_id = X` to a SINGLE
 --   child cagra index scan (no Append over other partitions) and execution stays confined
 --   to that partition; contrast: an unfiltered query fans out (Merge Append) over all.
--- This is the "online large-scale = partition pruning + LRU" model (STRATEGY_NOTES §G,
+-- This is the "online large-scale = partition pruning + LRU" model (workload-notes §G,
 --   ADR-061). LRU evict/reload capacity needs daemon-budget control and is covered by a
 --   manual spike, not here. REQUIRES: pg_cuvs_server running with GPU; cuvs.index_dir writable.
 \set ON_ERROR_STOP off

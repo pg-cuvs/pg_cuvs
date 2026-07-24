@@ -11,10 +11,10 @@ All numbers here are VM-measured and traceable to a source artifact:
 
 | Source | What it holds |
 |--------|---------------|
-| [`docs/profiling-results.md`](docs/profiling-results.md) | Search / build / export latency decomposition (Nsight Systems + perf) |
-| [`design/BENCHMARK_CROSSOVER.md`](design/BENCHMARK_CROSSOVER.md) | Full crossover methodology + synthetic pilot + 50M competitive + Cohere real-embedding run |
+| [`docs/experiments/profiling-results.md`](docs/experiments/profiling-results.md) | Search / build / export latency decomposition (Nsight Systems + perf) |
+| [`design/benchmarks/crossover-methodology.md`](design/benchmarks/crossover-methodology.md) | Full crossover methodology + synthetic pilot + 50M competitive + Cohere real-embedding run |
 | [`bench/results/*.csv`](bench/results/) | Raw per-engine result rows |
-| [`docs/filter-threshold-experiment.md`](docs/filter-threshold-experiment.md) | Selectivity × correlation sweep for filtered BF |
+| [`docs/experiments/filter-threshold-experiment.md`](docs/experiments/filter-threshold-experiment.md) | Selectivity × correlation sweep for filtered BF |
 
 Reproduction harness: [`bench/`](bench/) (see [§5](#5-reproduce-it-yourself)).
 
@@ -174,7 +174,7 @@ The full legacy table is preserved with these defects annotated in
 
 A fresh run inside NVIDIA's own [cuvs-bench](https://docs.nvidia.com/cuvs/) on ext
 0.5.0, through a first-of-its-kind Postgres backend
-(`BenchmarkOrchestrator(backend_type="pg")` — see [ADR-080](design/DECISIONS.md) and
+(`BenchmarkOrchestrator(backend_type="pg")` — see [ADR-080](design/decisions.md) and
 [`bench/cuvs_bench_backend/`](bench/cuvs_bench_backend/)). This **supersedes §2.1**:
 the k is wired to the GPU top-k and recall is computed against exact ground truth.
 19-point Pareto in
@@ -256,7 +256,7 @@ builds a denser graph.
 ### 2.2 Synthetic crossover pilot — where the line is
 
 Single A100, k=10, clustered synthetic, iso-recall target 0.95, concurrency=8.
-Full table in [`BENCHMARK_CROSSOVER.md` §11](design/BENCHMARK_CROSSOVER.md).
+Full table in [`crossover-methodology.md` §11](design/benchmarks/crossover-methodology.md).
 
 | N | dim | engine | build (s) | p50 (µs) | QPS (c=8) | recall@10 |
 |--:|----:|--------|----------:|---------:|----------:|----------:|
@@ -274,7 +274,7 @@ wins on every axis — the IPC round-trip (§1.1) is not worth paying for a tiny
 
 ### 2.3 50M × 384 competitive (4-way) — the honest ceiling
 
-2×A100-40GB, clustered synthetic. Full writeup: [§12](design/BENCHMARK_CROSSOVER.md).
+2×A100-40GB, clustered synthetic. Full writeup: [§12](design/benchmarks/crossover-methodology.md).
 
 | engine | build | QPS | p50 | recall@10 | note |
 |--------|------:|----:|----:|----------:|------|
@@ -296,7 +296,7 @@ segment (online RAG, multi-tenant), not raw scale.
 Supports the filtered brute-force path (D-wedge post-filter + 3O BITSET pre-filter), the
 multi-tenant primitive: each tenant queries with a TID filter over its own rows.
 N=200K × 128, uniform random, k=10, overfetch=4, 5 reps/cell.
-Full table: [`docs/filter-threshold-experiment.md`](docs/filter-threshold-experiment.md).
+Full table: [`docs/experiments/filter-threshold-experiment.md`](docs/experiments/filter-threshold-experiment.md).
 
 | selectivity | random recall | mixed recall | spatial recall | med latency |
 |------------:|:-------------:|:------------:|:--------------:|------------:|
@@ -340,7 +340,7 @@ Full table: [`docs/filter-threshold-experiment.md`](docs/filter-threshold-experi
   (recall +13%, latency +70% at shard_count=2 on 100K).
 - **pg_cuvs is not a WAL-logged mutable native index** — comparisons assume a
   static/batch-built index. Streaming writes go through `cuvsCagraExtend` (3Q) or the
-  `.delta` path, characterized separately ([profiling §10](docs/profiling-results.md)).
+  `.delta` path, characterized separately ([profiling §10](docs/experiments/profiling-results.md)).
 - **`pg_stat_gpu_search.p50` is a log2 bucket** — for engine-to-engine latency we use
   client-side `\timing` / `avg_latency_us`, not the bucketed percentile.
 - **Profiling hardware is a GCP VM without PMU counters** — see §0.
@@ -380,7 +380,7 @@ Other harnesses:
 | GPU resource / MIG params | `bench/legacy/test_gpu_resources.py`, `bench/legacy/test_mig.sh` |
 
 See [`bench/README.md`](bench/README.md) for the full harness contract and
-[`design/BENCHMARK_CROSSOVER.md`](design/BENCHMARK_CROSSOVER.md) for methodology and the
+[`design/benchmarks/crossover-methodology.md`](design/benchmarks/crossover-methodology.md) for methodology and the
 complete result set.
 
 ---
@@ -391,7 +391,7 @@ complete result set.
 > is the original `bench/legacy/run_cohere.sh` (anbench) output on Cohere 1M × 1024,
 > A100-SXM4-40GB. The recall *method* is sound — exact brute-force ground truth,
 > `table id == corpus row index`, standard set-intersection recall@k
-> (`infra/anbench/anbench_common.py:53`) — but two **code-era defects** are baked
+> (`bench/legacy/anbench/anbench_common.py:53`) — but two **code-era defects** are baked
 > into the pg_cuvs rows, so do not read them as iso-k vs pgvector:
 >
 > 1. **k=100 fixed** — the GPU path returned top-100 regardless of the requested k

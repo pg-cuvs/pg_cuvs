@@ -120,7 +120,7 @@ host-bytes cap)은 ROADMAP 트리거 백로그.
 ## 8. 산출물 / 남은 것
 
 ### 이번 세션
-- `design/DECISIONS.md` ADR-070 (정책 + 버그 3개 + IVF-PQ eviction 수정)
+- `design/decisions.md` ADR-070 (정책 + 버그 3개 + IVF-PQ eviction 수정)
 - `ROADMAP.md` — 버그 #1·#2·#3·IVF-PQ eviction(출고) + 병렬빌드·대형 거버넌스(트리거 백로그)
 - PR #54 — 버그 #1·#2·#3 + IVF-PQ eviction 수정 + #2/#3 병렬경로(handle_build_multi) 적용 + Tier-1 회귀 4종 + 데몬 ASAN 상시. **CI GREEN 27/27**
 - 본 보고서

@@ -3,8 +3,8 @@
 > **Current-state reference (SSOT).** This document describes how pg_cuvs works *as built*.
 > For the user-facing surface (GUCs, reloptions, SQL functions, views) see
 > [docs/reference.md](docs/reference.md). For *why* each decision was made see
-> [design/DECISIONS.md](design/DECISIONS.md) (ADRs). For the *history* of how each phase was
-> built and verified see [design/PLAN.md](design/PLAN.md) (frozen). Document map:
+> [design/decisions.md](design/decisions.md) (ADRs). For the *history* of how each phase was
+> built and verified see [design/specs/phase-record.md](design/specs/phase-record.md) (frozen). Document map:
 > [docs/doc-map.md](docs/doc-map.md).
 
 ---

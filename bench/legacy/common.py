@@ -4,7 +4,7 @@ File formats (DiskANN-compatible, also used by the Phase 3B spike):
   fbin = [int32 n][int32 d][float32 n*d]   -- vectors
   ibin = [int32 n][int32 k][int32  n*k]    -- neighbor-id matrix (ground truth)
 
-See design/BENCHMARK_CROSSOVER.md for how these feed the pilot.
+See design/benchmarks/crossover-methodology.md for how these feed the pilot.
 """
 import numpy as np
 
@@ -39,7 +39,7 @@ def write_ibin(path, a):
 
 def brute_force_l2(base, query, k):
     """Exact L2 top-k ground truth. O(nq * n * d); fine for pilot sizes.
-    For N>=10M consider a GPU/batched variant (noted in BENCHMARK_CROSSOVER.md)."""
+    For N>=10M consider a GPU/batched variant (noted in crossover-methodology.md)."""
     bb = (base * base).sum(1)
     gt = np.empty((query.shape[0], k), np.int32)
     for i in range(query.shape[0]):

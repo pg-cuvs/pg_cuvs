@@ -28,7 +28,7 @@ gcloud compute accelerator-types list --filter="name:nvidia-tesla-a100" \
 - us-east4-c
 - asia-east1-a, asia-east1-b, asia-east1-c
 
-`infra/terraform/terraform.tfvars` 수정:
+`infra/gcp/terraform.tfvars` 수정:
 ```hcl
 # zone = "us-central1-a"  # STOCKOUT
 zone = "us-central1-b"    # 시도

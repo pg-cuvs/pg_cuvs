@@ -58,4 +58,4 @@
 
 > Phase 3H-full 기준(이 색인): 위 16개 중 8개(*Phase 3* 및 *Phase 3H-full* 표시)가
 > 멀티 GPU/GCS/샤딩/DROP/용량계획/업그레이드/bootstrap/벤치마크 운영 표면을 커버한다.
-> 설계 근거: `design/DECISIONS.md` ADR-013, ADR-021..024.
+> 설계 근거: `design/decisions.md` ADR-013, ADR-021..024.

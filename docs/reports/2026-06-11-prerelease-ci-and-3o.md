@@ -47,7 +47,7 @@ TDD로 재현·수정하고, 회귀가드를 Tier-1에 상시 편입했다.
 
 ## 4. Part 2 — 2-tier CI 구축 (#46–#48 + WIF)
 
-### 4.1 전략 (ADR-067, `design/CI_STRATEGY.md`)
+### 4.1 전략 (ADR-067, `design/ci-strategy.md`)
 
 | Tier | 머신 | 트리거 | 검증 대상 |
 |------|------|--------|-----------|

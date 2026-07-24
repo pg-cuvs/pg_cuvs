@@ -20,7 +20,7 @@ CREATE INDEX ON items USING cagra (embedding vector_l2_ops);
 - 빌드 시 컬럼이 TOAST-able이고 해당 차원에서 toast되면 NOTICE가 출력된다.
 - 작은 차원(행이 inline 유지)은 detoast 비용이 없어 NOTICE를 내지 않는다.
 - **트레이드오프**: PLAIN은 벡터를 main heap에 inline 저장하므로 **main heap이 크게 팽창**한다(1M×1024 실측: 58MB→7.8GB, 약 134×). 같은 테이블에서 벡터 외 컬럼을 자주 조회하면 heap scan이 느려진다 — 그래서 **벡터 전용 테이블에서만** 권장한다. 총 디스크는 오히려 줄어든다(TOAST 13GB가 사라짐).
-- 측정 근거: `docs/profiling-results.md`(4-preflight §4), ADR-043/ADR-044. EXTENDED/EXTERNAL vs PLAIN 빌드·INSERT·디스크 차이 실측.
+- 측정 근거: `docs/experiments/profiling-results.md`(4-preflight §4), ADR-043/ADR-044. EXTENDED/EXTERNAL vs PLAIN 빌드·INSERT·디스크 차이 실측.
 
 주의: 행이 페이지(8KB)에 안 들어갈 만큼 크면 PLAIN이 불가하다. 매우 고차원(예: dim>2000 float4)은 TOAST가 불가피할 수 있다.
 
@@ -43,7 +43,7 @@ SELECT pg_reload_conf();
 
 - 데몬(`pg-cuvs-server`)의 `--index-dir`도 동일 경로로 맞춘다.
 - `index_dir`이 `$PGDATA` 하위로 해석되면 빌드 시 WARNING이 출력된다.
-- 복원/운영 절차: `design/OPS_GPU_PLAYBOOK.md` §6. orphan 정리는 `pg_cuvs_gc_orphans(true)`(ADR-046).
+- 복원/운영 절차: `design/ops-gpu-playbook.md` §6. orphan 정리는 `pg_cuvs_gc_orphans(true)`(ADR-046).
 
 ## 3. pgvector 버전: 0.5.x–0.8.x (HNSW export)
 

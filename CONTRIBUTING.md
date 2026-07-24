@@ -7,8 +7,8 @@ Contributions and collaboration inquiries are welcome.
 
 - **Issues** — bug reports, feature requests, benchmark results, or questions.
 - **Pull requests** — for non-trivial changes, skim the design docs first:
-  [ROADMAP.md](ROADMAP.md) (what / in what order), [design/PLAN.md](design/PLAN.md)
-  (specs), and [design/DECISIONS.md](design/DECISIONS.md) (ADRs — the "why").
+  [ROADMAP.md](ROADMAP.md) (what / in what order), [design/specs/phase-record.md](design/specs/phase-record.md)
+  (specs), and [design/decisions.md](design/decisions.md) (ADRs — the "why").
 - **Collaboration** — for research collaboration or larger involvement, reach out
   at <ysys143@gmail.com>.
 

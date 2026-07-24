@@ -2,7 +2,7 @@
 
 Phase 1.5 운영 기준선 고정을 위한 벤치마크 절차.
 JIT threshold 결정, VRAM 예산 설정, fallback 정책 검증의 근거 데이터를 수집한다.
-PLAN.md §5 참조.
+phase-record.md §5 참조.
 
 ---
 
@@ -69,7 +69,7 @@ jit_section: no
 ```
 **→ `jit_section: no`:** Phase 1.5 완료 기준 통과  
 **→ `jit_section: yes`:** p95/p99 확인 → `jit-threshold-sweep.md` 실행 여부 결정  
-**→ backend OOM 중 `cuvs_ambuild()`:** PLAN.md Phase 2 §5 streaming handoff로 에스컬레이션
+**→ backend OOM 중 `cuvs_ambuild()`:** phase-record.md Phase 2 §5 streaming handoff로 에스컬레이션
 
 ---
 
@@ -151,7 +151,7 @@ ssh $GCP_VM "nvidia-smi --query-compute-apps=pid,process_name,used_gpu_memory \
 
 ### 4-1. 데이터 생성
 
-Dataset tiers (PLAN.md §5): Small=10K, Medium=1M, Large=10M.
+Dataset tiers (phase-record.md §5): Small=10K, Medium=1M, Large=10M.
 Dimensions: 384, 768, 1536. Query k: 10, 100, 1000.
 
 ```sql
@@ -296,6 +296,6 @@ LIMIT 1;
 - `nvidia-smi`에서 PG 백엔드 프로세스가 CUDA context를 소유하면: 즉시 에스컬레이션. ADR-002 위반.
 - 1M 벤치마크에서 `cuvs_ambuild()` 중 backend OOM
   (`pg_cuvs: out of memory accumulating index vectors`): `work_mem` 조정은 효과 없다
-  (malloc 사용). PLAN.md Phase 2 §5 streaming handoff로 에스컬레이션.
+  (malloc 사용). phase-record.md Phase 2 §5 streaming handoff로 에스컬레이션.
 - `EXPLAIN (ANALYZE)`에 `JIT:` 섹션이 있고 p95 latency가 p50의 3배 이상이면:
   jit-threshold-sweep.md를 실행한다. 측정 없이 `jit = off`를 적용하지 않는다 (ADR-018).

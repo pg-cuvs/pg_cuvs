@@ -78,7 +78,7 @@ if [[ "$SKIP_DOWNLOAD" -eq 1 ]]; then
 else
     TOTAL=$(( N + 10000 ))
     log "  corpus=${N}, queries=10000 (total=$TOTAL rows)"
-    python infra/anbench/fetch_dataset.py \
+    python bench/legacy/anbench/fetch_dataset.py \
         --out-dir "$DATA_DIR" \
         --n-corpus "$N" \
         --n-queries 10000
@@ -93,7 +93,7 @@ if [[ "$SKIP_GT" -eq 1 ]] && [[ -f "$GT" ]]; then
 else
     # GT build needs cupy (GPU brute-force) — use cuvs_py env
     act cuvs_py
-    python infra/anbench/build_gt.py \
+    python bench/legacy/anbench/build_gt.py \
         --corpus "$CORPUS" --queries "$QUERIES" \
         --n "$N" --k 100 --out "$GT"
     act "$CONDA_ENV"
@@ -122,7 +122,7 @@ stop_daemon() {
 # ── Step 2: pg_cuvs CAGRA search ─────────────────────────────────────────
 step "STEP 2: pg_cuvs CAGRA GPU search"
 restart_daemon
-python infra/anbench/run_pg.py \
+python bench/legacy/anbench/run_pg.py \
     --corpus "$CORPUS" --queries "$QUERIES" --gt "$GT" \
     --n "$N" --system pg_cuvs --out "$RUN" --ks "$K" \
     --dataset "cohere-wiki-en-1024" \
@@ -131,14 +131,14 @@ python infra/anbench/run_pg.py \
 # ── Step 3: pgvector HNSW sweep ──────────────────────────────────────────
 step "STEP 3: pgvector HNSW (ef_search sweep)"
 stop_daemon
-python infra/anbench/run_pg.py \
+python bench/legacy/anbench/run_pg.py \
     --corpus "$CORPUS" --queries "$QUERIES" --gt "$GT" \
     --n "$N" --system hnsw --out "$RUN" --ks "$K" \
     --dataset "cohere-wiki-en-1024" || log "  [WARN] hnsw step failed"
 
 # ── Step 4: pgvector IVFFlat sweep ───────────────────────────────────────
 step "STEP 4: pgvector IVFFlat (probes sweep)"
-python infra/anbench/run_pg.py \
+python bench/legacy/anbench/run_pg.py \
     --corpus "$CORPUS" --queries "$QUERIES" --gt "$GT" \
     --n "$N" --system ivfflat --out "$RUN" --ks "$K" \
     --dataset "cohere-wiki-en-1024" || log "  [WARN] ivfflat step failed"
@@ -146,7 +146,7 @@ python infra/anbench/run_pg.py \
 # ── Step 5: pg_cuvs_import_hnsw (3I SQL path) ────────────────────────────
 step "STEP 5: pg_cuvs_import_hnsw SQL path (CAGRA build → pgvector HNSW)"
 restart_daemon
-python infra/anbench/run_pg_3i.py \
+python bench/legacy/anbench/run_pg_3i.py \
     --corpus "$CORPUS" --queries "$QUERIES" --gt "$GT" \
     --n "$N" --out "$RUN" --ks "$K" \
     --dataset "cohere-wiki-en-1024" \
@@ -155,7 +155,7 @@ stop_daemon
 
 # ── Step 6: cagra-hnsw lib path (comparison baseline for Step 5) ─────────
 step "STEP 6: cagra-hnsw (cuVS lib direct — build-time comparison)"
-python infra/anbench/run_cagra_hnsw.py \
+python bench/legacy/anbench/run_cagra_hnsw.py \
     --corpus "$CORPUS" --queries "$QUERIES" --gt "$GT" \
     --n "$N" --out "$RUN" --ks "$K" \
     --dataset "cohere-wiki-en-1024" || log "  [WARN] cagra-hnsw step failed"
@@ -224,5 +224,5 @@ log "Summary CSV:     $OUT_DIR/cohere_N${N}_summary.csv"
 log ""
 log "다음 단계:"
 log "  1. bench/results/cohere_N${N}_summary.csv 확인"
-log "  2. design/BENCHMARK_CROSSOVER.md §15에 결과 추가"
+log "  2. design/benchmarks/crossover-methodology.md §15에 결과 추가"
 log "  3. README 벤치 표 synthetic -> real 데이터로 교체 (또는 병기)"

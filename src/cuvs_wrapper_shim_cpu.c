@@ -5,7 +5,7 @@
  * implementation so the daemon + extension build and run on a hosted GitHub
  * runner with no GPU. Selected by `make PGCUVS_CPU_SHIM=1` (see Makefile).
  *
- * Design (design/CI_STRATEGY.md, ADR-067):
+ * Design (design/ci-strategy.md, ADR-067):
  *   - opaque handles (CuvsCagraIndex/BfIndex/IvfPqIndex/HnswIndex) = host copy of
  *     the corpus { float *vecs; int64_t n; int dim; uint32_t metric; }.
  *   - every search is EXACT brute-force k-NN → it is the ground truth, so SQL

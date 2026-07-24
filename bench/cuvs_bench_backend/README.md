@@ -30,7 +30,7 @@ prevents the recall==0 id-space bug seen in an earlier 50M run).
 
 - `pg_engine.py` — the engine: fbin load → COPY, per-algo `build()`,
   per-param `search()`, recall/percentiles. Factored from
-  `infra/anbench/run_pg{,_3i}.py`. Runs standalone (see below) or under cuvs-bench.
+  `bench/legacy/anbench/run_pg{,_3i}.py`. Runs standalone (see below) or under cuvs-bench.
 - `backend.py` — the cuvs-bench integration: `PgBackend(BenchmarkBackend)` +
   `PgConfigLoader(ConfigLoader)` + `register()`. `build()`/`search()` delegate to
   `pg_engine` and return cuvs-bench `BuildResult`/`SearchResult` carrying **real
@@ -80,7 +80,7 @@ figure and are not used here.
 
 Queries are issued one statement at a time with the query vector as an **inline
 literal** (not a bind parameter) so every algo runs an identical statement shape
-— matching `infra/anbench/run_pg.py`.
+— matching `bench/legacy/anbench/run_pg.py`.
 
 `index_bytes` for `pgcuvs_cagra` is the PG heap relation size only (≈0) — the
 CAGRA graph lives off-heap in `cuvs.index_dir` / GPU VRAM and isn't counted, so
@@ -139,5 +139,5 @@ searched query count so `compute_recall` gets matching shapes.
 
 Exact k-NN by GPU brute force over the first N corpus rows (unit-norm → dot
 product == L2 ranking), id-space-aligned to `t.id`. Produced by
-`cuvs_bench.generate_groundtruth` or `infra/anbench/build_gt.py` (identical exact
+`cuvs_bench.generate_groundtruth` or `bench/legacy/anbench/build_gt.py` (identical exact
 result). **Always rebuild GT for the exact N tested**; never reuse a different-N GT.

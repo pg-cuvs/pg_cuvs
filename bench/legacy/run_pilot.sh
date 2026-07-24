@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Pilot crossover benchmark: pgvector HNSW vs pg_cuvs CAGRA on IDENTICAL data,
-# iso-recall comparison. Run ON the GPU VM (see design/BENCHMARK_CROSSOVER.md).
+# iso-recall comparison. Run ON the GPU VM (see design/benchmarks/crossover-methodology.md).
 #
 #   ENGINE=hnsw  N=100000 DIM=384 K=10 RECALL_TARGET=0.95 bash bench/legacy/run_pilot.sh
 #   ENGINE=cagra N=100000 DIM=384 K=10 RECALL_TARGET=0.95 bash bench/legacy/run_pilot.sh
