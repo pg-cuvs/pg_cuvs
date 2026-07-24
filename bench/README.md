@@ -7,8 +7,8 @@ Mixing their numbers is the most common way to get a wrong answer.
 | Generation | Location | Status | What it is |
 |---|---|---|---|
 | **Current** | `cuvs_bench_backend/` | **canonical** | NVIDIA's own [cuvs-bench](https://docs.nvidia.com/cuvs/) driven through a Postgres backend (ADR-080). Recall computed by the harness against exact GT; `index_bytes` reports real daemon VRAM. Use this for any new search/build comparison. |
-| **Current** | `filter_recall/` | **canonical** | Filtered-search measurement (3O / D-wedge / stream_bf) behind ADR-082 — `adr079_3o_recall.py` (driver), `adr079_reuse.py` (corpus fingerprint / reuse gate), `test_adr079_reuse.py`. Independent numpy ground truth, per-query route attribution, corpus-identity checks on `--reuse-table`. |
-| **Protocol** | `protocol/` | active | Benchmark protocol/contract + runners (concurrency, explain, incremental). Tool-agnostic; see `protocol/CONTRACT.md`. |
+| **Current** | `filter_recall/` | **canonical** | Filtered-search measurement (3O / D-wedge / stream_bf) behind ADR-082 — `adr079_3o_recall.py` (driver), `adr079_reuse.py` (corpus fingerprint / reuse gate), `test_adr079_reuse.py`. Independent numpy ground truth, per-query route attribution, corpus-identity checks on `--reuse-table`. Also holds `bench_filter_sweep.py`, the earlier-generation selectivity × correlation sweep that produced `docs/filter-threshold-experiment.md`. |
+| **Protocol** | `protocol/` | active | Benchmark protocol/contract + runners (concurrency, explain, incremental) + `spikes/` (competitor/primitive spikes the `engines/spike-*.sh` drive) + `d1_pareto.py` (resource/$ post-hoc). Tool-agnostic; see `protocol/CONTRACT.md`. |
 | **Legacy** | `legacy/` | **superseded — do not cite** | The 2026-06 anbench-era harnesses and helpers. Preserved for provenance and because some numbers in the design docs came from them. |
 
 Result artifacts and their provenance: [`results/README.md`](results/README.md).
@@ -31,7 +31,8 @@ era, not the harness — which is why the files are kept and readable rather tha
 
 ## Known duplication (tracked, not yet fixed)
 
-`read_fbin` exists in 9 copies across `bench/`, `infra/anbench/` and `tools/`; recall in
+`read_fbin` exists in 9 copies across `bench/` (backend, filter_recall, legacy, protocol
+spikes) and `infra/anbench/`; recall in
 5; ground-truth generation in 4. That duplication is how a recall bug survived in one
 copy while another was fixed. Consolidating onto `legacy/common.py` (or a new shared
 module) needs a GPU to re-verify each harness, so it is deferred rather than done

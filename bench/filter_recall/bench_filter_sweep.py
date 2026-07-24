@@ -13,7 +13,7 @@ Output: TSV to stdout, captured into docs/filter-threshold-experiment.md.
 
 Usage (on VM, inside cuvs_dev conda env):
   psql -U postgres -d contrib_regression -c "CREATE EXTENSION IF NOT EXISTS pg_cuvs"
-  python3 tools/bench_filter_sweep.py | tee /tmp/sweep_results.tsv
+  python3 bench/filter_recall/bench_filter_sweep.py | tee /tmp/sweep_results.tsv
 """
 import subprocess, sys, io
 import numpy as np

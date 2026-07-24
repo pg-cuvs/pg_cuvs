@@ -3,7 +3,7 @@
 hnsw.iterative_scan, with the p99 tail.
 
 The pg_cuvs side (D-wedge cuvs_filtered_knn, recall=1.0 @ flat latency for
-sel>=10%) is already measured in tools/bench_filter_sweep.py /
+sel>=10%) is already measured in bench/filter_recall/bench_filter_sweep.py /
 docs/filter-threshold-experiment.md. This measures the COMPETITOR: pgvector
 HNSW + a WHERE filter, swept over hnsw.iterative_scan in {off, strict_order,
 relaxed_order} × selectivity. The differentiation thesis:

@@ -376,7 +376,7 @@ Other harnesses:
 | Real Cohere 1M×1024 (§2.1a canonical) | `run_pg_cuvsbench.py … --dataset cohere` |
 | Real Cohere 1M×1024 (§2.1 legacy anbench) | `bench/legacy/run_cohere.sh --n 1000000 --gpu 0` |
 | 50M competitive (§2.3) | `bench/legacy/bench_50m.sh` |
-| Filter selectivity sweep (§3) | `tools/bench_filter_sweep.py` |
+| Filter selectivity sweep (§3) | `bench/filter_recall/bench_filter_sweep.py` |
 | GPU resource / MIG params | `bench/legacy/test_gpu_resources.py`, `bench/legacy/test_mig.sh` |
 
 See [`bench/README.md`](bench/README.md) for the full harness contract and
