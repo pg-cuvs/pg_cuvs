@@ -253,6 +253,28 @@ QPS did not. Recall itself is mostly stable (cagra Δ ≤ 0.0016), except
 HNSW graph structure depends on the parallel worker count, and the beefier node
 builds a denser graph.
 
+**The wiki_all_1M ratio itself, stated honestly.** Unlike §2.1a's Cohere sweep, this
+dataset has no matched-recall pair for CAGRA vs pgvector: pgvector's ceiling
+(ef=400) tops out at recall **0.9737** (69 QPS, 14.4 ms p50), while CAGRA's *floor*
+(search_width=16) is already **0.9788** — the two curves don't overlap, so there is
+no shared recall value to compare at. The honest citation is **"CAGRA's cheapest
+point already exceeds pgvector's best recall, at 8.3× the QPS and 8.3× lower p50"**
+(600 QPS / 1.66 ms vs 69 QPS / 14.4 ms — Brev file), not a same-recall ratio. Always
+report the recall pair alongside the multiplier; a 4.5×-style headline without it
+would silently overstate the comparison in the other direction (implying same-recall
+when the baseline never reached it) and understate it in this one (pgvector cannot
+reach CAGRA's floor at any tested parameter).
+
+**Same-file comparison: CAGRA vs `pgcuvs_hnsw_import` (3I, the CPU-export path from
+§1.4/§2.1a).** At matched recall ≈0.98 (cagra 0.9798, 3I 0.9808), CAGRA is **5.0×**
+faster (p50 1.64 ms vs 8.29 ms, QPS 601 vs 120) and its index is **0.41×** the size
+(3.33 GB vs 8.19 GB). The gap widens at high recall — at ≈0.999 (cagra 0.9993 vs 3I
+0.9988) p50 is **14.9×** apart (1.72 ms vs 25.6 ms). This does not contradict
+§2.1a's Cohere result, where 3I's build-time win (120 s vs 237 s, a *pgvector*-
+servable artifact) was the point, not its search speed — the two sections answer
+different questions (GPU search latency vs CPU-portable build cost) and should not
+be read as the same axis.
+
 ### 2.2 Synthetic crossover pilot — where the line is
 
 Single A100, k=10, clustered synthetic, iso-recall target 0.95, concurrency=8.
