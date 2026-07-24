@@ -103,7 +103,7 @@
   HNSW `m`/`ef_search`, CAGRA `graph_degree`/`itopk`/`search_width`,
   pgvectorscale `num_neighbors`/`search_list_size`, VectorChord 해당 노브.)
   사용한 파라미터는 전부 결과에 공개한다.
-- **동일 하드웨어 축**: pg_cuvs는 GPU VM(A100, [[reference_gpu_vms]]), CPU baseline은
+- **동일 하드웨어 축**: pg_cuvs는 GPU VM(A100), CPU baseline은
   같은 VM의 CPU 또는 동급 CPU 인스턴스. cost는 각 인스턴스의 실제 시간당 단가로 환산.
 - **warm 상태 통일**: pg_cuvs는 daemon resident, pgvector/경쟁자는
   `shared_buffers` warm 후 측정. cold-start는 별도 항목으로 분리 측정.

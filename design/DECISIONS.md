@@ -2877,9 +2877,9 @@ load-dependent `bf_batch_wait` 라우팅과 `CUVS_STARTUP_COST` 재보정은 이
    브랜치로 이관되어 README가 "not actively developed or maintained"라고 명시한다. 커밋
    활동 대비: `cpp_main` 약 5개월 2건 vs `main` 3일 5건. 즉 #1501을 PQFlash 호환으로
    고쳐도 **호환 대상이 유지보수되지 않는다.**
-2. **NVIDIA가 다른 경로를 직접 권고했다** (2026-06-24 미팅): "오늘 기준 NVMe disk-ANN
-   최선의 오픈소스. **Vamana 직접 구현 말고 AiSAQ를 봐라**", "cuVS 자체의 on-disk 경로는
-   단기 로드맵에 없음". 즉 방향 1(advocate #2197)의 기대값도 함께 내려간다.
+2. **더 나은 경로가 있고 cuVS on-disk는 단기 로드맵에 없다.** 현재 NVMe disk-ANN에서는
+   **AiSAQ**가 유력한 오픈소스이며 Vamana 직접 구현보다 우선한다. cuVS 자체의 on-disk
+   경로는 단기 로드맵에 없다. 즉 방향 1(advocate #2197)의 기대값도 함께 내려간다.
 3. **AiSAQ는 우리가 산출물을 밀어 넣는 대상이 아니다.** cuVS integrations 페이지가
    "AiSAQ can use NVIDIA cuVS to accelerate index build, including Vamana graph
    construction and k-means workflows"라고 서술하듯 **AiSAQ가 cuVS를 호출하는 쪽**이다.
@@ -3220,7 +3220,7 @@ SVFusion(VLDB'26, PCIe A100)이 CAGRA/GGNN가 **UVM(demand paging)에서 크게 
 **날짜**: 2026-07-13
 **상태**: 검증 기록 — 액션 3개 도출(1=에코시스템 보강 즉시 착수 가능, 2·3=백로그)
 
-**배경**: Corey J. Nolet(NVIDIA cuVS 코어)+Vivek Narang(Lucene-cuVS 커넥터)의 공동 강연 "cuVS and Lucene: GPU-based Vector Search" 자료를 NVIDIA 미팅에서 입수(전사/요약: `~/Downloads/Corey_J._Nolet,_Vivek_Narang_–_cuVS_and_Lucene_GPU-based_Vector_Search{,_summary}.txt`, 메모리 `reference_corey_cuvs_lucene_talk`). 이 강연 = cuVS 공식 integrations 목록의 **Lucene 커넥터**의 실체이므로, ADR-062의 "cuVS 생태계에 Postgres 자리 비어있음" 조사를 1차 사료로 확증한다.
+**배경**: Corey J. Nolet(NVIDIA cuVS 코어)+Vivek Narang의 공동 강연 "cuVS and Lucene: GPU-based Vector Search" 자료를 검토했다. 이 강연 = cuVS 공식 integrations 목록의 **Lucene 커넥터**의 실체이므로, ADR-062의 "cuVS 생태계에 Postgres 자리 비어있음" 조사를 1차 사료로 확증한다.
 
 **강연 load-bearing 사실 5개**:
 1. **CAGRA→HNSW 변환**: 고차원(수천 dim)서 HNSW 계층 레이어가 검색 성능을 저해하며, GPU 빌드 CAGRA 그래프를 HNSW 포맷으로 변환해 CPU 검색하면 native HNSW보다 검색 성능이 더 좋다(정성 주장, 그들 벤치 차트 근거).
@@ -3246,7 +3246,7 @@ SVFusion(VLDB'26, PCIe A100)이 CAGRA/GGNN가 **UVM(demand paging)에서 크게 
 2. **GPUDirect Storage/cuFile 빌드 ingest 백로그 (저순위)**: ADR-034 빌드 ingest 경로에 cuFile/GDS 평가 항목 추가 후보. 단 소스가 PG heap이라 Lucene 세그먼트 파일만큼 GDS 적용이 자연스럽지 않고(파일→GPU가 아니라 heap tuple 경유), 4A로 copy≈0 + wall-clock=GPU build floor 지배라 이득 marginal 예상. 트리거: 대규모 빌드 ingest 병목 실측. ROADMAP 트리거 백로그에 반영.
 3. **고차원 CAGRA-as-HNSW 벤치 arm**: 강연의 "고차원(2048+)서 HNSW 계층 성능 저해, CAGRA-graph-as-HNSW가 native HNSW보다 우수" 정성 주장을 우리 실측으로 재현/반박. 현 벤치 sweep dim∈{8,384,768}에 2048+ arm 추가, pg_cuvs HNSW export vs pgvector native HNSW 검색 recall/latency 비교. 홈 = `bench/protocol/HANDOFF.md §5`(bench SSOT); 벤치 재개 시 반영.
 
-**관련**: ADR-062(에코시스템 진입), ADR-051(3Q merge), ADR-040(3M batch), ADR-029(3I HNSW export), ADR-034(빌드 I/O 오버헤드), ADR-057(memfd 무복사). 메모리: `reference_corey_cuvs_lucene_talk`, `project_nvidia_cuvs_outreach`.
+**관련**: ADR-062(에코시스템 진입), ADR-051(3Q merge), ADR-040(3M batch), ADR-029(3I HNSW export), ADR-034(빌드 I/O 오버헤드), ADR-057(memfd 무복사).
 
 ---
 
@@ -3255,7 +3255,7 @@ SVFusion(VLDB'26, PCIe A100)이 CAGRA/GGNN가 **UVM(demand paging)에서 크게 
 **날짜**: 2026-07-13
 **상태**: 검증 기록 — 액션 도출(3O 리스크 벤치·ADR화 최우선, 나머지 백로그/방법론)
 
-**배경**: pg_cuvs 필터검색·CPU-GPU·벤치 설계에 직결되는 3편 분석(메모리 `reference_gpu_filtered_ann_papers`; ADR-078 강연 분석과 병행):
+**배경**: pg_cuvs 필터검색·CPU-GPU·벤치 설계에 직결되는 3편 분석(ADR-078 강연 분석과 병행):
 - **VecFlow** (arXiv 2506.00812, SIGMOD'26; UIUC + NVIDIA cuVS 저자 Karsin/Chirkin) — GPU filtered-ANNS. 사실상 cuVS 팀의 필터검색 설계.
 - **SVFusion** (arXiv 2601.08528, VLDB'26; ZJU+Huawei) — GPU-CPU-disk 3-tier streaming ANNS, **PCIe A100(우리 체제)**.
 - **Filtered-ANN Unified Benchmark** (arXiv 2509.07789, PVLDB EA&B; Fudan) — CPU-only FANNS 통합 벤치, GPU 방법 없음.
@@ -3279,14 +3279,14 @@ SVFusion(VLDB'26, PCIe A100)이 CAGRA/GGNN가 **UVM(demand paging)에서 크게 
 4. **ADR-075 Ph3 UVM≠C2C 뉘앙스** — 별도 addendum(SVFusion 근거).
 5. **NVIDIA 정렬 카드** — VecFlow=cuVS 저자 → outreach(ADR-062): "pg_cuvs = VecFlow IVF-BFS를 임의 Postgres predicate로 일반화."
 
-**관련**: ADR-048(3O), ADR-063(D-wedge 필터/threshold), ADR-061(전략), ADR-075(코스트/통합메모리), ADR-069(벤치), ADR-062(에코시스템), ADR-078(강연 검증·병행). 메모리: `reference_gpu_filtered_ann_papers`.
+**관련**: ADR-048(3O), ADR-063(D-wedge 필터/threshold), ADR-061(전략), ADR-075(코스트/통합메모리), ADR-069(벤치), ADR-062(에코시스템), ADR-078(강연 검증·병행).
 
 ## ADR-080 — cuvs-bench Postgres 백엔드(pg_cuvs + pgvector): NVIDIA 도구 안에서 end-to-end apples-to-apples
 
 **날짜**: 2026-07-16
 **상태**: 구현·검증 완료 (Cohere 1M×1024, 3-algo, cuvs-bench 오케스트레이터 end-to-end 통과; 적대적 코드리뷰 7개 이슈 반영)
 
-**배경**: NVIDIA가 2026-06-24 미팅에서 명시 초대한 에코시스템 진입 Stage 2(ADR-062)를 구현했다. cuvs-bench(RAPIDS 26.06)는 pluggable backend(`ConfigLoader` + `BenchmarkBackend`)를 지원하나 PostgreSQL/pgvector 백엔드가 없다 → **우리가 첫 구현**. 목적은 (a) pg_cuvs·pgvector를 **NVIDIA 자체 도구·방법론**(recall 버킷, Pareto, matched-recall) 안에서 같은 데이터·GT로 재고 (b) 우리 자체 하네스의 방법론 시비·`recall==0` id-space 버그·측정 경계 논란을 원천 차단하는 것.
+**배경**: ADR-062의 에코시스템 진입 Stage 2를 구현했다. cuvs-bench(RAPIDS 26.06)는 pluggable backend(`ConfigLoader` + `BenchmarkBackend`)를 지원하나 PostgreSQL/pgvector 백엔드가 없다 → **우리가 첫 구현**. 목적은 (a) pg_cuvs·pgvector를 **NVIDIA 자체 도구·방법론**(recall 버킷, Pareto, matched-recall) 안에서 같은 데이터·GT로 재고 (b) 우리 자체 하네스의 방법론 시비·`recall==0` id-space 버그·측정 경계 논란을 원천 차단하는 것.
 
 **결정**:
 1. **One Postgres backend, several algos** — `PgBackend(BenchmarkBackend)` + `PgConfigLoader(ConfigLoader)`를 `"pg"`로 등록하고 **모던 진입점 `BenchmarkOrchestrator(backend_type="pg").run_benchmark()`** 로 구동(모듈 레벨 `cuvs_bench.run.run()`은 upstream deprecated). algo = `pgvector_hnsw`/`pgvector_ivfflat`(CPU) · `pgcuvs_cagra`(GPU 상주) · `pgcuvs_hnsw_import`(3I). 위치 `bench/cuvs_bench_backend/`(향후 `rapidsai/cuvs` upstream PR 원본).
