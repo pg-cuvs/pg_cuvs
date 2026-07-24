@@ -35,7 +35,11 @@ src/*.o
 test/results/
 test/regression.diffs
 test/regression.out
-results/
+# Anchored: an unanchored `results/` also swallowed bench/results/, so curated
+# artifacts AND its README needed `git add -f` and were silently dropped from
+# commits. bench/results is governed by bench/.gitignore (generated *.csv
+# ignored, docs tracked); design/anbench/results by the design/anbench/ rule.
+/results/
 regression.diffs
 regression.out
 

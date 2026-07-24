@@ -5,7 +5,7 @@ Reads base vectors from PostgreSQL (avoids storing 72GB fbin on disk)
 and query vectors from query.fbin, writes gt.ibin.
 
 Usage:
-  python3 bench/gt_faiss.py --db bench --data /home/jaesolshin/bench/data \\
+  python3 bench/legacy/gt_faiss.py --db bench --data /home/jaesolshin/bench/data \\
     --k 100 --dim 384 --n 50000000
 
 Requires: numpy, psycopg2, faiss-gpu

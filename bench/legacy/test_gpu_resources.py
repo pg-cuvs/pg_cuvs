@@ -10,7 +10,7 @@ test_gpu_resources.py — GPU 자원 파라미터별 E2E 검증 및 벤치마크
 
 비동기 실행:
   nohup sudo bash -c 'CUDA_VISIBLE_DEVICES=1 PGDSN=dbname=contrib_regression \
-    python3 bench/test_gpu_resources.py' > /tmp/test_gpu_res.log 2>&1 &
+    python3 bench/legacy/test_gpu_resources.py' > /tmp/test_gpu_res.log 2>&1 &
   sudo tail -f /tmp/test_gpu_res.log
 
 결과:

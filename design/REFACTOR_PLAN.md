@@ -18,7 +18,7 @@
 - **정정(에이전트 오류)**: `src/*.o`는 git-추적 안 됨(이미 gitignore) -> 조치 불요. `infra/anbench/observe.py`는 고아 아님 -> issue #56 bench-protocol 하네스로 통합 중인 WIP.
 - **EXTVERSION 불일치**(확인됨): Makefile `EXTVERSION=0.1.0` vs `pg_cuvs.control default_version='0.3.0'` -> Makefile 0.3.0으로.
 - 추적된 bench 산출물 4종(`bench/results/cohere_N1000000.jsonl`/`_summary.csv` · `gpu_resources_bench.csv` · `hnsw_import_bench.csv`) — BENCHMARK.md 증거 인용. 의도면 유지, 아니면 untrack.
-- **정정 — 벤치 스크립트/문서는 고아 아님**: `bench/ef_recall_sweep.py` · `infra/scripts/pgbench-multigpu.sql` · `design/COMPETITIVE_BASELINE_PLAN.md`는 **진행 중인 엄밀 벤치마크 작업(ADR-069 / issue #56 web<->local)의 일부**. observe.py와 동일한 false-positive 클래스(감사 에이전트가 멀티-에이전트 벤치 맥락 부재). **삭제 금지.**
+- **정정 — 벤치 스크립트/문서는 고아 아님**: `bench/legacy/ef_recall_sweep.py` · `infra/scripts/pgbench-multigpu.sql` · `design/COMPETITIVE_BASELINE_PLAN.md`는 **진행 중인 엄밀 벤치마크 작업(ADR-069 / issue #56 web<->local)의 일부**. observe.py와 동일한 false-positive 클래스(감사 에이전트가 멀티-에이전트 벤치 맥락 부재). **삭제 금지.**
 - doc-map 누락 6종(ci-gpu-setup · bruteforce-acceleration-lessons · ecosystem-strategy · filter-threshold-experiment · phase2-* · reports/2026-06-11-prerelease-ci-and-3o) -> doc-map에 historical 항목 추가 **(완료)**.
 
 ### 1.3 스파게티 (복잡도) — `pg_cuvs_server.c`에 집중

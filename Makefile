@@ -421,7 +421,7 @@ gpu-cohere:
 	@echo "[gpu-cohere] Launching Cohere 1M benchmark (nohup, async)"
 	ssh $(VM_HOST) "cd ~/pg_cuvs && \
 		source ~/miniforge3/bin/activate $(CONDA_ENV) && \
-		nohup bash bench/run_cohere.sh \
+		nohup bash bench/legacy/run_cohere.sh \
 			--n $(if $(N),$(N),1000000) \
 			--gpu $(if $(GPU),$(GPU),0) \
 			> /tmp/cohere_bench.log 2>&1 &" && \

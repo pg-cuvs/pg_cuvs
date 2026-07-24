@@ -91,7 +91,7 @@ don't read cagra's `index_bytes` as "storage-free."
 The standalone `pg_engine.py` runner offers `--toggle-daemon`: it restarts the
 `pg-cuvs-server` daemon for `pg_cuvs` algos and stops it for `pgvector` algos,
 so the CPU baselines aren't starved of VRAM by a resident GPU index (mirroring
-`bench/run_cohere.sh`'s `restart_daemon`/`stop_daemon`). The **cuvs-bench
+`bench/legacy/run_cohere.sh`'s `restart_daemon`/`stop_daemon`). The **cuvs-bench
 backend keeps the daemon up throughout** — it does not toggle it — because
 `pgvector` is CPU-only and unaffected by a resident GPU index. The daemon's
 `--index-dir` (e.g. `/tmp/cuvs_indexes`) must match `cuvs.index_dir`, or pg_cuvs
@@ -103,7 +103,7 @@ silently seq-scan-falls-back and mis-measures as slow.
 
 ```bash
 # On the GPU VM, in an env with numpy + psycopg + pgvector (+ pg_cuvs installed,
-# daemon reachable). Data + gt built by bench/run_cohere.sh Steps 0-1 (or cuvs-bench).
+# daemon reachable). Data + gt built by bench/legacy/run_cohere.sh Steps 0-1 (or cuvs-bench).
 python bench/cuvs_bench_backend/pg_engine.py \
   --corpus ~/anbench/data/corpus.fbin \
   --queries ~/anbench/data/queries_10k.fbin \

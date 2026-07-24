@@ -5,7 +5,7 @@ test_3i_bench.py — Phase 3I benchmark:
 
 비동기 실행 패턴 (SSH 연결 불필요):
   # VM에서 nohup으로 실행:
-  nohup python3 bench/test_3i_bench.py --n 1000000 --dim 384 \
+  nohup python3 bench/legacy/test_3i_bench.py --n 1000000 --dim 384 \
       > /tmp/bench_3i_1m.log 2>&1 &
   echo $! > /tmp/bench_3i_1m.pid
 

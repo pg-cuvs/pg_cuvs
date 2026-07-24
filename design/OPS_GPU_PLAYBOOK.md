@@ -105,7 +105,7 @@ MIG 활성화는 pending 상태로 설정된 후 재부팅이 완료되어야 �
 **Step 1: MIG 활성화 + 재부팅**
 
 ```bash
-sudo bash bench/test_mig.sh --setup
+sudo bash bench/legacy/test_mig.sh --setup
 # 내부 동작:
 #   sudo nvidia-smi -i 0 -mig 1   (pending 설정)
 #   sudo reboot
@@ -114,7 +114,7 @@ sudo bash bench/test_mig.sh --setup
 **Step 2: 재부팅 후 인스턴스 생성 + 테스트 (비동기)**
 
 ```bash
-nohup sudo bash bench/test_mig.sh --test > /tmp/test_mig.log 2>&1 &
+nohup sudo bash bench/legacy/test_mig.sh --test > /tmp/test_mig.log 2>&1 &
 sudo tail -f /tmp/test_mig.log
 sudo grep 'PASS\|FAIL\|ERROR' /tmp/test_mig.log
 ```
@@ -122,7 +122,7 @@ sudo grep 'PASS\|FAIL\|ERROR' /tmp/test_mig.log
 **Teardown: MIG 해제 + 재부팅**
 
 ```bash
-sudo bash bench/test_mig.sh --teardown
+sudo bash bench/legacy/test_mig.sh --teardown
 # 내부 동작:
 #   nvidia-smi mig -i 0 -dci / -dgi   (compute/gpu instance 삭제)
 #   nvidia-smi -i 0 -mig 0             (pending 해제)

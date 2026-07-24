@@ -2,7 +2,7 @@
 # pgvectorscale StreamingDiskANN benchmark: build index then sweep diskann.query_search_list_size.
 # SKIP_LOAD=1 to reuse existing items/queries table.
 #
-#   N=100000 DIM=384 K=10 RECALL_TARGET=0.95 bash bench/run_pgvectorscale.sh
+#   N=100000 DIM=384 K=10 RECALL_TARGET=0.95 bash bench/legacy/run_pgvectorscale.sh
 set -euo pipefail
 
 ENGINE=diskann; AM=diskann; EXT=vectorscale

@@ -6,15 +6,15 @@
 # 실행 순서 (2단계):
 #
 #   [Step 1] MIG 활성화 + 재시작 (1회):
-#     sudo bash bench/test_mig.sh --setup
+#     sudo bash bench/legacy/test_mig.sh --setup
 #
 #   [Step 2] 재부팅 후 테스트 (nohup 비동기):
-#     nohup sudo bash bench/test_mig.sh --test > /tmp/test_mig.log 2>&1 &
+#     nohup sudo bash bench/legacy/test_mig.sh --test > /tmp/test_mig.log 2>&1 &
 #     sudo tail -f /tmp/test_mig.log            # 진행 폴링
 #     sudo grep 'PASS\|FAIL\|ERROR' /tmp/test_mig.log  # 결과 확인
 #
 #   [Teardown] 원복 + 재부팅:
-#     sudo bash bench/test_mig.sh --teardown
+#     sudo bash bench/legacy/test_mig.sh --teardown
 #
 # 검증 시나리오:
 #   Test 1: GPU 0 단일 MIG 인스턴스(3g.20gb=20GB)로 정상 빌드/서치
@@ -99,7 +99,7 @@ case "$MODE" in
     log "Enabling MIG on GPU 0 (pending — reboot needed)..."
     sudo nvidia-smi -i 0 -mig 1
     log "After reboot, run:"
-    log "  nohup sudo bash bench/test_mig.sh --test > /tmp/test_mig.log 2>&1 &"
+    log "  nohup sudo bash bench/legacy/test_mig.sh --test > /tmp/test_mig.log 2>&1 &"
     sleep 3
     sudo reboot
     ;;
