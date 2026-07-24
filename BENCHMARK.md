@@ -176,9 +176,20 @@ A fresh run inside NVIDIA's own [cuvs-bench](https://docs.nvidia.com/cuvs/) on e
 0.5.0, through a first-of-its-kind Postgres backend
 (`BenchmarkOrchestrator(backend_type="pg")` — see [ADR-080](design/DECISIONS.md) and
 [`bench/cuvs_bench_backend/`](bench/cuvs_bench_backend/)). This **supersedes §2.1**:
-the k is wired to the GPU top-k, `index_bytes` is measured, and recall is computed by
-the orchestrator against exact ground truth. 19-point Pareto in
-[`bench/results/pg_cuvsbench_1m.csv`](bench/results/pg_cuvsbench_1m.csv):
+the k is wired to the GPU top-k and recall is computed against exact ground truth.
+19-point Pareto in
+[`bench/results/pg_cuvsbench_1m.csv`](bench/results/pg_cuvsbench_1m.csv).
+
+> **Caveat on that CSV — `index_bytes = 0` for every `pgcuvs_cagra` row.** This run
+> predates #73/#75: the CAGRA graph is daemon-resident, not a Postgres relation, so
+> `pg_relation_size()` returned 0 while the pgvector rows report real sizes. Read
+> naively the file says *the GPU index costs nothing* — the opposite of true. The
+> `recall` / `qps` / `p50` / `build_time_s` columns are unaffected. Post-fix evidence:
+> [`pg_cuvsbench_wiki1m.csv`](bench/results/pg_cuvsbench_wiki1m.csv) reports
+> `index_bytes = 3328000000` (= `1M × (768×4 + 64×4)`, the corrected
+> `estimate_vram_bytes`), reproduced byte-identically on a second host (§2.1b).
+> Regenerating this Cohere sweep on post-#75 code is tracked separately.
+> Per-artifact provenance: [`bench/results/README.md`](bench/results/README.md).
 
 | index | serves on | recall@10 (best) | p50 | QPS | build |
 |-------|-----------|----------:|----:|----:|------:|
