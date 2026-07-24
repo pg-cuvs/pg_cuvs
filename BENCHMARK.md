@@ -108,6 +108,21 @@ dominates* — the value is the removed backend overhead, not the clock.
 > This **corrected an earlier code-analysis estimate** (ADR-034) that assumed "GPU build
 > ~10 s vs PG overhead ~45 s." The measurement inverted it: GPU build dominates at 82%.
 
+> **TODO — raw cuVS is not validated against §2's SQL numbers.** §1.1's 715 µs kernel
+> and §1.2's 68 s build floor come from Nsight Systems / `perf` profiling on the §0
+> environment, dated to the ADR-057/058/059 (2026-06-07) / ADR-069 (2026-06-11) window.
+> §2.1a/§2.1b's `pgcuvs_cagra` numbers come from the cuvs-bench harness (ADR-080,
+> 2026-07-16 onward) — a different tool, on code more than 5 weeks later, host not
+> confirmed identical (§0 states `A100-SXM4-40GB`; the bench ledger records
+> `pg_cuvsbench_1m.csv`'s host only as `A100-40GB`). §2.1b's own finding — that a
+> 0%-GPU pgvector baseline still swung ~3.5× in QPS across two "same-model" A100
+> hosts — means these two figures **must not** be subtracted or ratioed against each
+> other; only the pg_cuvs-vs-pgvector comparisons *within* §2's own files are safe to
+> cite (§2.1a, §2.1b). Closing this requires a fourth cuvs-bench algo — raw cuVS
+> called directly, bypassing Postgres — registered in
+> [`bench/cuvs_bench_backend/backend.py`](bench/cuvs_bench_backend/) so all four
+> points come from one run/host/day, the same way the existing three already do.
+
 ### 1.3 Storage: TOAST (EXTENDED) vs PLAIN
 
 Same 1M × 1024 data in both layouts.
