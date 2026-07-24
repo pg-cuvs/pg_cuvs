@@ -4,7 +4,7 @@
 #
 #   make gpu-test-maxidx                          # real GPU daemon (Tier 2)
 #   PG_CUVS_SERVER_BIN=./pg_cuvs_server bash \
-#     infra/scripts/max-indexes-scale.sh          # CPU shim daemon (Tier 1, per-PR)
+#     infra/scripts/tests/max-indexes-scale.sh          # CPU shim daemon (Tier 1, per-PR)
 #
 # Runs a DEDICATED daemon with a TINY cap (--max-indexes 4), builds N=10 tenant
 # indexes (> cap), then queries every tenant. Asserts:

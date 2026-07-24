@@ -1,7 +1,7 @@
 # Playbook: 벤치마크 실행 (benchmark-runbook)
 
 pg_cuvs 벤치마크 하네스 사용법, 결과 위치, 해석 기준.
-`infra/scripts/benchmark.sh`(`make gpu-bench`), `bench/legacy/run_cohere.sh`(`make gpu-cohere`),
+`infra/scripts/benchmark/benchmark.sh`(`make gpu-bench`), `bench/legacy/run_cohere.sh`(`make gpu-cohere`),
 `bench/legacy/anbench/run_all.sh`(`make gpu-anbench`) 세 하네스를 다룬다.
 장애 대응이 아닌 측정 절차이므로 각 섹션은 "결과 해석 → 다음 단계"로 구성된다.
 
@@ -97,7 +97,7 @@ make gpu-bench N=1000000 DIM=384 K=100
 make gpu-bench-1m
 ```
 
-내부적으로 `infra/scripts/benchmark.sh`를 VM SSH로 실행하고 결과를
+내부적으로 `infra/scripts/benchmark/benchmark.sh`를 VM SSH로 실행하고 결과를
 `design/bench_<timestamp>.log`에 tee한다.
 
 **기대 출력 (SUMMARY 블록):**

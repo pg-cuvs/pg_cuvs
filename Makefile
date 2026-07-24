@@ -246,7 +246,7 @@ installcheck-tier1:
 # (and `gpu-bench-1m` for the phase-record 1M/1536 completion gate).
 benchmark:
 	$(if $(N),N=$(N)) $(if $(DIM),DIM=$(DIM)) $(if $(K),K=$(K)) $(if $(M),M=$(M)) \
-		bash infra/scripts/benchmark.sh
+		bash infra/scripts/benchmark/benchmark.sh
 
 .PHONY: benchmark
 
@@ -319,12 +319,12 @@ gpu-server:
 # fragile nested quoting; plain ssh (no -tt) since it needs no remote TTY.
 gpu-postinstall:
 	CONDA_ENV=$(CONDA_ENV) ssh $(VM_HOST) "CONDA_ENV=$(CONDA_ENV) bash -s" \
-		< infra/scripts/postinstall.sh
+		< infra/scripts/setup/postinstall.sh
 
 # End-to-end durability smoke: build index, restart daemon, verify reload.
 # Piped over stdin (bash -s); plain ssh, no remote TTY needed.
 gpu-e2e:
-	ssh $(VM_HOST) "bash -s" < infra/scripts/e2e-smoke.sh
+	ssh $(VM_HOST) "bash -s" < infra/scripts/tests/e2e-smoke.sh
 
 # ---- Integration test suite (Phase 1.5 #3) -----------------------------
 # Layered test targets. Unit tests run locally (no toolchain needed);
@@ -359,7 +359,7 @@ gpu-test-isolation:
 gpu-test-daemon:
 	ssh $(VM_HOST) "source ~/miniforge3/bin/activate $(CONDA_ENV) && \
 		CONDA_ENV=$(CONDA_ENV) bash -s" \
-		< infra/scripts/integration-test.sh
+		< infra/scripts/tests/integration-test.sh
 
 # Phase 3C: real GCS snapshot round-trip + fail-closed certification against an
 # EPHEMERAL bucket (created + destroyed by the script). Needs gcloud (/snap/bin)
@@ -368,30 +368,30 @@ gpu-test-daemon:
 gpu-test-objstore:
 	ssh $(VM_HOST) "source ~/miniforge3/bin/activate $(CONDA_ENV) && \
 		PATH=\$$PATH:/snap/bin bash -s" \
-		< infra/scripts/objstore-roundtrip-e2e.sh
+		< infra/scripts/tests/objstore-roundtrip-e2e.sh
 
 # ADR-065: a daemon started without --max-vram-mb must default to a bounded VRAM
 # budget (a fraction of total), not unlimited. Runs a dedicated daemon on a test
 # socket and asserts pg_stat_gpu_cache + the startup log. Piped over stdin.
 gpu-test-vram:
 	ssh $(VM_HOST) "source ~/miniforge3/bin/activate $(CONDA_ENV) && bash -s" \
-		< infra/scripts/vram-budget-default.sh
+		< infra/scripts/setup/vram-budget-default.sh
 
 # MAX_INDEXES soft-cap: more tenants than registry slots must work (build w/o
 # ERROR + queries auto-reload evicted indexes to GPU). Dedicated daemon with a
 # tiny --max-indexes; asserts evictions>0 and reloads>0. Piped over stdin.
 gpu-test-maxidx:
 	ssh $(VM_HOST) "source ~/miniforge3/bin/activate $(CONDA_ENV) && bash -s" \
-		< infra/scripts/max-indexes-scale.sh
+		< infra/scripts/tests/max-indexes-scale.sh
 
 # End-to-end durability smoke (alias of gpu-e2e for naming symmetry).
 gpu-test-e2e:
-	ssh $(VM_HOST) "bash -s" < infra/scripts/e2e-smoke.sh
+	ssh $(VM_HOST) "bash -s" < infra/scripts/tests/e2e-smoke.sh
 
 # Phase 3A pending-delta durability + fail-closed across a daemon restart.
 # Piped over stdin (bash -s); plain ssh, no remote TTY needed.
 gpu-test-delta-restart:
-	ssh $(VM_HOST) "bash -s" < infra/scripts/delta-restart-e2e.sh
+	ssh $(VM_HOST) "bash -s" < infra/scripts/tests/delta-restart-e2e.sh
 
 # Full ladder: unit -> regress -> isolation -> daemon faults -> e2e durability.
 gpu-test-all: gpu-test-unit gpu-test-regress gpu-test-isolation gpu-test-daemon \

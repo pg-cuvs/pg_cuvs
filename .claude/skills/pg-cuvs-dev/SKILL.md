@@ -40,7 +40,7 @@ gcloud auth application-default login
 
 ### 프로비저닝
 ```bash
-cd infra/terraform
+cd infra/gcp
 cp terraform.tfvars.example terraform.tfvars
 # terraform.tfvars 편집: project_id, zone 등
 
@@ -203,5 +203,5 @@ make gpu-build          # 빌드
 | `design/decisions.md` ADR-001 | C/.cu 분리, float4 충돌 |
 | `design/decisions.md` ADR-007 | -Wl,-rpath 이슈 |
 | `design/specs/requirements.md` | GEARS 요구사항 전체 |
-| `infra/terraform/` | Terraform 설정 |
-| `infra/terraform/scripts/install_gpu_env.sh` | VM 스타트업 스크립트 |
+| `infra/gcp/` | Terraform 설정 |
+| `infra/gcp/scripts/install_gpu_env.sh` | VM 스타트업 스크립트 |

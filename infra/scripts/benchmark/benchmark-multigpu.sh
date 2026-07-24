@@ -7,7 +7,7 @@
 #   3. Build time: single index vs partitioned indexes
 #
 # Usage:
-#   bash infra/scripts/benchmark-multigpu.sh [N_PARTITIONS] [N_ROWS] [DIM] [K]
+#   bash infra/scripts/benchmark/benchmark-multigpu.sh [N_PARTITIONS] [N_ROWS] [DIM] [K]
 #
 # Requires: psql, pg_cuvs + vector installed, daemon running with N GPUs.
 

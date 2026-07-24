@@ -132,9 +132,9 @@
 ## 6. Harness 설계
 
 재사용:
-- `infra/scripts/pgbench-shard.sql` — pg_cuvs KNN 부하 (`<=>`, `cuvs.probe_*`).
-- `infra/scripts/benchmark.sh` — 실행 래퍼.
-- `infra/scripts/integration-test.sh` — recall 검증 scenario 패턴.
+- `infra/scripts/recipes/pgbench-shard.sql` — pg_cuvs KNN 부하 (`<=>`, `cuvs.probe_*`).
+- `infra/scripts/benchmark/benchmark.sh` — 실행 래퍼.
+- `infra/scripts/tests/integration-test.sh` — recall 검증 scenario 패턴.
 
 신규(동일 인터페이스로 시스템별 분리):
 - `bench/legacy/gen_dataset.py` — base/query 생성·로드 (fbin ↔ pgvector COPY).

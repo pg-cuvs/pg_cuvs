@@ -339,7 +339,7 @@ install ... pg_cuvs_server '/usr/local/bin/'
 **VM 안에서 직접:**
 
 ```bash
-bash ~/pg_cuvs/infra/scripts/postinstall.sh
+bash ~/pg_cuvs/infra/scripts/setup/postinstall.sh
 ```
 
 **로컬 래퍼 (동일한 동작 — stdin으로 스크립트를 전송):**
@@ -347,7 +347,7 @@ bash ~/pg_cuvs/infra/scripts/postinstall.sh
 ```bash
 # make gpu-postinstall 가 실제로 하는 것 (Makefile:212):
 CONDA_ENV=$CONDA_ENV ssh $GCP_VM "CONDA_ENV=$CONDA_ENV bash -s" \
-    < infra/scripts/postinstall.sh
+    < infra/scripts/setup/postinstall.sh
 
 # 또는:
 make gpu-postinstall

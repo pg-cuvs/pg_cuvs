@@ -352,7 +352,7 @@ ssh -tt $(GCP_VM) "cd ~/pg_cuvs && source ~/miniforge3/bin/activate $(CONDA_ENV)
 
 ```bash
 # postinstall: shared_preload_libraries 재설정 포함 (Makefile:L212)
-CONDA_ENV=$(CONDA_ENV) ssh $(GCP_VM) "CONDA_ENV=$(CONDA_ENV) bash -s" < infra/scripts/postinstall.sh
+CONDA_ENV=$(CONDA_ENV) ssh $(GCP_VM) "CONDA_ENV=$(CONDA_ENV) bash -s" < infra/scripts/setup/postinstall.sh
 ```
 
 **기대 출력:**

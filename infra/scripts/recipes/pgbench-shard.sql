@@ -8,7 +8,7 @@
 --   SET cuvs.shard_count = 2;
 --   CREATE INDEX mg_cagra ON mg_items USING cagra (v vector_l2_ops);
 -- Run (as the postgres role against the test db):
---   pgbench -n -f infra/scripts/pgbench-shard.sql -j 4 -c 8 -T 10 mg
+--   pgbench -n -f infra/scripts/recipes/pgbench-shard.sql -j 4 -c 8 -T 10 mg
 -- Verify both GPUs were hit:
 --   SELECT shard_id, gpu_device_id, search_count
 --     FROM pg_stat_gpu_shards WHERE index_name = 'mg_cagra' ORDER BY shard_id;

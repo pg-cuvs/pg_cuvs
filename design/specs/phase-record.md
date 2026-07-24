@@ -410,7 +410,7 @@ Phase 3A 완료 기준:
 - delta 손상 또는 cleanup 실패는 CPU fallback으로 닫힌다.
 - over-fetch recall, restart fail-closed, metric-specific merge가 regression/integration/property test로 검증된다.
 
-**완료 (2026-06-06, ADR-047)**: 메커니즘은 2026-05 WIP로 기구현·정확했으나 위 완료 기준이 요구하는 검증이 비어 미완 표기됐던 것을, 본 세션에서 회귀+격리+e2e로 certify(false-done 역방향 해소). 검증 산출물: `test/sql/pending_delta.sql`(cap fail-closed·Sc15 GPU delta cache built·tri-mode·max_delta_rows=0), `test/sql/delta_recall.sql`(delete-drift recall — over-fetch fix red→green), `test/specs/delta_tombstone_snapshot.spec`·`delta_interleaving.spec`(pg_isolation_regress: 동시 DELETE 가시성·미커밋 delta 격리), `infra/scripts/delta-restart-e2e.sh`(valid delta restart 생존 + corrupt delta fail-closed), `test/unit/test_cuvs_util.c::test_tombstone_format`. VM(A100/PG16): installcheck 15/15 + isolation 2/2 GREEN, e2e PASS. 발견·수정: delete-drift 임계 아래 + top-k 집중 삭제에서 recall<LIMIT → `cuvs_gettuple` tombstone-aware over-fetch(`k += min(n_tomb, cuvs_k)`).
+**완료 (2026-06-06, ADR-047)**: 메커니즘은 2026-05 WIP로 기구현·정확했으나 위 완료 기준이 요구하는 검증이 비어 미완 표기됐던 것을, 본 세션에서 회귀+격리+e2e로 certify(false-done 역방향 해소). 검증 산출물: `test/sql/pending_delta.sql`(cap fail-closed·Sc15 GPU delta cache built·tri-mode·max_delta_rows=0), `test/sql/delta_recall.sql`(delete-drift recall — over-fetch fix red→green), `test/specs/delta_tombstone_snapshot.spec`·`delta_interleaving.spec`(pg_isolation_regress: 동시 DELETE 가시성·미커밋 delta 격리), `infra/scripts/tests/delta-restart-e2e.sh`(valid delta restart 생존 + corrupt delta fail-closed), `test/unit/test_cuvs_util.c::test_tombstone_format`. VM(A100/PG16): installcheck 15/15 + isolation 2/2 GREEN, e2e PASS. 발견·수정: delete-drift 임계 아래 + top-k 집중 삭제에서 recall<LIMIT → `cuvs_gettuple` tombstone-aware over-fetch(`k += min(n_tomb, cuvs_k)`).
 
 Phase 3A follow-ups:
 - random INSERT/UPDATE/DELETE/query interleaving property test를 더 넓은 데이터 크기와 transaction snapshot 조합으로 확장한다.
@@ -542,7 +542,7 @@ Scope decision:
 - multi-GPU VM에서는 child partition indexes가 2개 이상 GPU에 분산 resident해야 한다.
 
 3E-3 verified evidence:
-- `infra/scripts/multigpu-partition-recipe.sql` provides the parent-table query recipe and correctness check; `infra/scripts/benchmark-multigpu.sh` provides the benchmark harness.
+- `infra/scripts/recipes/multigpu-partition-recipe.sql` provides the parent-table query recipe and correctness check; `infra/scripts/benchmark/benchmark-multigpu.sh` provides the benchmark harness.
 - multi-GPU VM hash partition distribution was balanced: p0 10023 rows, p1 9977 rows.
 - child CAGRA indexes were distributed across GPUs: `recipe_p0_cagra -> GPU 1`, `recipe_p1_cagra -> GPU 0`.
 - parent-table query planned as `Limit -> Merge Append -> Index Scan using recipe_p0_cagra / recipe_p1_cagra`, with no direct child-partition query required.
