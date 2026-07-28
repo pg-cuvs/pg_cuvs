@@ -655,9 +655,13 @@ cuvs_bf_search_filtered(
      * down every backend's session, not just this query. The caller treats a
      * non-zero return as "prefilter unavailable" and falls back. Teaching the
      * filtered path to search idx_f16 (mirroring cuvs_bf_search's half-query
-     * conversion) is the real fix and needs a GPU to validate. */
+     * conversion) is the real fix and needs a GPU to validate.
+     *
+     * 1, not a new code: cuvs_wrapper.h documents only 0/2/1 for this entry
+     * point, and the CPU shim — which has no precision concept at all — can
+     * never produce anything outside that set. */
     if (!impl->idx_f32)
-        return 3;
+        return 1;
     if ((int64_t)top_k > impl->n)
         top_k = (int)impl->n;
     if (top_k <= 0)
