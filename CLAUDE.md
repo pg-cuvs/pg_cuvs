@@ -11,6 +11,27 @@
 
 ---
 
+## 하네스: pg_cuvs 개발 스킬
+
+**목표:** GPU VM 기반 개발 루프의 재현성 확보와 코드/테스트 품질의 주기적 개선.
+
+**트리거:**
+- VM 신규 생성·재빌드·환경 구성(brev, bootstrap.sh, libcuvs, ldconfig 사고) → `gpu-vm-provision` 스킬
+- 부트스트랩된 VM의 일상 개발 루프(sync, gpu-build, gpu-test, 빌드 함정) → `pg-cuvs-dev` 스킬
+- 코드 전체 훑기, 버그/중복 헌팅, 테스트 속도 점검 → `quality-loop` 스킬
+- 단순 질문은 스킬 없이 직접 응답 가능. 상세 경계는 각 스킬 description 참조.
+
+**변경 이력:**
+| 날짜 | 변경 내용 | 대상 | 사유 |
+|------|----------|------|------|
+| 2026-07-28 | quality-loop 스킬 추가 | skills/quality-loop | 품질 루프 도입 (버그·중복·테스트 속도 감사) |
+| 2026-07-28 | GPU 스킬 2종 트리거 경계 정리, 프로비저닝 중복 섹션을 참조로 대체, disk-recovery.md dead link 수정 | skills/pg-cuvs-dev, skills/gpu-vm-provision | 하네스 진단에서 트리거 중복·이중 관리 발견 |
+| 2026-07-28 | 하네스 포인터 등록 | CLAUDE.md | 변경 추적 진입점 부재 |
+| 2026-07-28 | GPU 스킬 2종 GCP → Brev 전환 (bootstrap 재빌드 모델, shadeform/sm_80, vm-start·stop 무효화 명시, GCP는 레거시 섹션으로) | skills/gpu-vm-provision, skills/pg-cuvs-dev, skills/quality-loop | GCP 크레딧 만료, Brev(Massed Compute A100)가 현 메인 프로바이더 |
+| 2026-07-28 | 트리거 공백 보완("VM 올려줘"→provision, "VM 내려줘/삭제"→dev), 함정 F·H에 bootstrap gotcha SSoT 인용 추가 | skills/gpu-vm-provision, skills/pg-cuvs-dev | 책임 분리 검토에서 트리거 틈·드리프트 위험 발견 |
+
+---
+
 ## Karpathy Coding Guidelines
 
 > Behavioral guidelines to reduce common LLM coding mistakes. These apply to ALL code-writing agents.
