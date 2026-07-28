@@ -48,6 +48,12 @@ pg_cuvs_docs/vm-access/brev-bootstrap/   (로컬: ~/Documents/GitHub/pg_cuvs_doc
 
 ## 재빌드 절차
 
+**사양을 조사하지 마라.** `brev search`로 가용 머신을 훑거나 `brev create --type ...`으로
+타입을 즉석에서 고르는 것은 금지다. 사양은 아래에 이미 고정돼 있고(`massedcompute_A100_sxm4_80G`,
+shadeform 유저, CUDA_ARCH=sm_80), 그 고정이 이 스킬의 존재 이유다 — 벤치마크와 회귀 검증은
+머신이 같아야 결과를 비교할 수 있는데, 매번 즉석에서 고르면 실험이 흔들린다.
+1번은 콘솔 단계이고 과금이 시작되므로 **사용자 몫**이다. 에이전트는 2번부터 이어받는다.
+
 ```bash
 # 1. 인스턴스 준비 (Brev 콘솔에서 massedcompute A100 생성, 또는 기존 이름으로)
 brev start <name>
