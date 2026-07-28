@@ -6752,6 +6752,17 @@ handle_search_ivfpq(int client_fd, const CuvsCmdFrame *cmd)
 
     CuvsSearchResult *raw = malloc((size_t)(k > 0 ? k : 1) * sizeof(CuvsSearchResult));
     CuvsResult       *results = malloc((size_t)(k > 0 ? k : 1) * sizeof(CuvsResult));
+    if (raw)
+    {
+        /* cuvs_ivfpq_search clamps top_k to the corpus size and leaves slots
+         * [n_vecs, k) untouched, so the loop below would read uninitialized
+         * heap. It uses `continue`, not `break`, so every garbage item_id that
+         * lands in [0, n_vecs) is admitted as a real neighbour with a real TID.
+         * Seed the sentinel the loop already rejects. The CPU shim pads its
+         * tail with -1, which is why Tier-1 cannot reproduce this. */
+        for (int i = 0; i < k; i++)
+            raw[i].item_id = -1;
+    }
     if (!raw || !results)
     {
         free(raw); free(results);
