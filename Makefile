@@ -88,7 +88,7 @@ include $(PGXS)
 # a shared header (e.g. a wire struct in cuvs_ipc.h) would otherwise leave stale
 # extension objects linked against the old layout — an ABI mismatch vs the
 # daemon. Force every extension object to rebuild when ANY project header
-# changes. (The server objects already list their header prereqs explicitly.)
+# changes. (The daemon objects get the same blanket rule via SERVER_ALL_OBJS.)
 $(OBJS): $(wildcard src/*.h)
 
 # Build CUDA object before linking the .so. Pattern rule overrides PGXS
@@ -122,6 +122,22 @@ SERVER_LDFLAGS = $(CUVS_SERVER_LINK) -lstdc++ \
                  -lpthread -lrt \
                  -lcurl -lssl -lcrypto
 SERVER_LDFLAGS += $(EXTRA_SERVER_LDFLAGS)
+
+# Every daemon object, including the *_test variants built with the CPU shim.
+# The per-object rules below list header prereqs by hand and have drifted from
+# the actual #include set (cuvs_ipc.c and cuvs_objstore.c both pull in
+# cuvs_util.h, which carries the on-disk/wire structs CuvsDeltaHeader,
+# CuvsTombstoneHeader, CuvsShardRecord, …). A missed prereq links a stale
+# object against an old struct layout — the same ABI drift the extension-side
+# rule below guards against, but inside the daemon binary. Rebuild them all
+# when ANY project header changes.
+SERVER_ALL_OBJS = src/pg_cuvs_server.o src/cuvs_objstore_server.o \
+                  src/cuvs_ipc_server.o src/cuvs_util_server.o \
+                  src/cuvs_build_corpus_server.o \
+                  src/pg_cuvs_server_test.o src/cuvs_objstore_server_test.o \
+                  src/cuvs_ipc_server_test.o src/cuvs_util_server_test.o \
+                  src/cuvs_build_corpus_server_test.o
+$(SERVER_ALL_OBJS): $(wildcard src/*.h)
 
 # server .c → .o (not via PGXS — separate rule with no PG headers)
 src/pg_cuvs_server.o: src/pg_cuvs_server.c src/cuvs_ipc.h src/cuvs_util.h src/cuvs_wrapper.h src/cuvs_objstore.h src/cuvs_build_corpus.h
