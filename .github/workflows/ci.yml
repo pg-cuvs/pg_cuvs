@@ -6,48 +6,27 @@ on:
   pull_request:
     branches: [main]
 
-# ── Job 1: CPU-only build + unit tests ────────────────────────────────────
-# Runs on standard GitHub-hosted runners. No CUDA, no GPU, no daemon.
-# Validates: C compilation (pg headers), unit tests (cuvs_util.c helpers).
-# Does NOT build the CUDA wrapper (nvcc absent); nvcc compilation is gated
-# to the GPU job below.
+# ── Job 1: CPU-only unit tests ────────────────────────────────────────────
+# Runs on standard GitHub-hosted runners. No CUDA, no GPU, no daemon, no PG.
+# Validates: the pure-C unit suites (cuvs_util.c + cuvs_build_corpus.c helpers).
+#
+# This job used to also run `gcc -fsyntax-only` over three sources, which
+# required installing PostgreSQL solely to obtain `pg_config --cflags`. That
+# check was a strict subset of tier1-shim below (which compiles AND links the
+# whole tree), and its file list had gone stale — src/pg_cuvs_compaction.c is in
+# OBJS but was never checked. Both it and the PG install are gone; `make
+# test-unit` uses plain $(CC) and never touches PGXS, so an absent pg_config
+# just makes `include $(PGXS)` a no-op. Coverage is unchanged: this job remains
+# the only place test-unit runs.
 jobs:
   build-check:
-    name: Build check + unit tests (CPU)
+    name: Unit tests (CPU)
     runs-on: ubuntu-22.04
-
-    strategy:
-      matrix:
-        pg: ["16"]
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install PostgreSQL ${{ matrix.pg }}
-        run: |
-          # ubuntu-22.04 runners don't ship PG16 in the default apt repos;
-          # add the official PGDG repo via postgresql-common's helper first.
-          sudo apt-get update -qq
-          sudo apt-get install -y postgresql-common
-          sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y
-          sudo apt-get install -y postgresql-${{ matrix.pg }} \
-              postgresql-server-dev-${{ matrix.pg }} \
-              gcc make
-
-      - name: Compile C sources (no CUDA)
-        run: |
-          PG_CONFIG=/usr/lib/postgresql/${{ matrix.pg }}/bin/pg_config
-          CFLAGS=$(${PG_CONFIG} --cflags)
-          INCLUDEDIR=$(${PG_CONFIG} --includedir-server)
-          # Compile each C source to verify no syntax errors.
-          # hnsw_export.c and pg_cuvs.c include PG headers — compile-check only.
-          for f in src/pg_cuvs.c src/cuvs_ipc.c src/hnsw_export.c; do
-            echo "Checking $f ..."
-            gcc -fsyntax-only ${CFLAGS} -I${INCLUDEDIR} -I./src \
-              -DHAVE_LONG_INT_64 -DHAVE_PG_CONFIG_H \
-              $f || exit 1
-          done
-
+      # gcc + make are preinstalled on ubuntu-22.04 runners; no apt step needed.
       - name: Unit tests (CPU-only, no PG/CUDA required)
         run: make test-unit
 
@@ -64,29 +43,81 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Two compiles happen below with different flag sets (plain -O2 extension,
+      # ASAN -O1 daemon). They get separate CCACHE_DIRs under .ccache/ so their
+      # object namespaces never mix; one actions/cache entry carries both. The
+      # key is per-commit with a rolling restore-key, so every run restores the
+      # previous run's cache and saves a fresh one.
+      - name: Restore ccache
+        uses: actions/cache@v4
+        with:
+          path: .ccache
+          key: ccache-tier1-${{ github.sha }}
+          restore-keys: |
+            ccache-tier1-
+
       - name: Install PostgreSQL 16 + pgvector
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y postgresql-common
           sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y
           sudo apt-get install -y postgresql-16 postgresql-server-dev-16 \
-              postgresql-16-pgvector gcc make \
+              postgresql-16-pgvector gcc make ccache \
               libcurl4-openssl-dev libssl-dev   # daemon objstore client (curl/ssl)
 
       - name: Build + install (CPU shim, no CUDA)
         run: |
           export PATH=/usr/lib/postgresql/16/bin:$PATH
-          make PGCUVS_CPU_SHIM=1
+          # ccache is engaged via an explicit CC override rather than the
+          # /usr/lib/ccache PATH symlinks: the `sudo` install targets below must
+          # NOT run through ccache (root would create root-owned files in
+          # CCACHE_DIR and the cache-save step would then fail), and leaving CC
+          # off those invocations makes that impossible by construction.
+          # A command-line CC= also wins over the CC that PGXS sets.
+
+          export CCACHE_DIR="$GITHUB_WORKSPACE/.ccache/ext"
+          ccache --max-size=400M >/dev/null
+          ccache -z >/dev/null
+          make CC="ccache gcc" PGCUVS_CPU_SHIM=1 2>&1 | tee -a /tmp/build.log
           sudo env "PATH=$PATH" make PGCUVS_CPU_SHIM=1 install
+          echo "--- ccache stats: extension ---"; ccache -s
+
           # Daemon built with AddressSanitizer (ADR-070: capture the Bug #3 OOM
           # evict-retry crash backtrace; permanent UAF/overflow coverage). The .so
           # stays non-ASAN (built above) so PostgreSQL loads it normally.
-          make PGCUVS_CPU_SHIM=1 server \
+          export CCACHE_DIR="$GITHUB_WORKSPACE/.ccache/asan"
+          ccache --max-size=400M >/dev/null
+          ccache -z >/dev/null
+          make CC="ccache gcc" PGCUVS_CPU_SHIM=1 server \
             EXTRA_SERVER_CFLAGS="-fsanitize=address -fno-omit-frame-pointer -O1" \
-            EXTRA_SERVER_LDFLAGS="-fsanitize=address"
+            EXTRA_SERVER_LDFLAGS="-fsanitize=address" 2>&1 | tee -a /tmp/build.log
           sudo env "PATH=$PATH" make install-server
+          echo "--- ccache stats: daemon (ASAN) ---"; ccache -s
+
           # Prove the shim .so has no GPU runtime dependency.
           ! ldd pg_cuvs.so | grep -qiE 'libcuvs|libcudart|librmm'
+
+      # Non-blocking. The daemon already builds with -Wall -Wextra (Makefile:115)
+      # but the diagnostics are buried in the build log, so nobody tracks the
+      # count. This surfaces it as a job summary table. Deliberately NOT -Werror
+      # yet: a gcc 11.4 build of the daemon currently emits ~31 warnings, ~27 of
+      # them -Wstringop-truncation on intentional truncating strncpy() calls.
+      # Promote to -Werror (via EXTRA_SERVER_CFLAGS, no Makefile change needed)
+      # once this table reads zero — see issue #111.
+      - name: Compiler warning summary (non-blocking)
+        if: always()
+        continue-on-error: true
+        run: |
+          n=$(grep -c 'warning:' /tmp/build.log 2>/dev/null || true)
+          {
+            echo "### Compiler warnings: ${n:-0}"
+            echo ""
+            echo '```'
+            grep 'warning:' /tmp/build.log 2>/dev/null \
+              | sed -n 's/.*\[\(-W[^]]*\)\]/\1/p' \
+              | sort | uniq -c | sort -rn || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Configure PostgreSQL + start shim daemon
         run: |
