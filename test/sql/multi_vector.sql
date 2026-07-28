@@ -12,8 +12,10 @@
 -- REQUIRES: pg_cuvs_server running; cuvs.index_dir writable.
 \set ON_ERROR_STOP on
 
+SET client_min_messages = warning;
 CREATE EXTENSION IF NOT EXISTS vector;
 CREATE EXTENSION IF NOT EXISTS pg_cuvs;
+RESET client_min_messages;
 SET cuvs.index_dir = '/tmp/cuvs_indexes';
 
 -- Two vector columns of DIFFERENT dimension. Row g is linear+unique so the query

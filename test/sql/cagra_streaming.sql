@@ -17,8 +17,10 @@
 --
 -- Requires a running pg_cuvs_server with a loaded CAGRA index.
 
+SET client_min_messages = warning;
 CREATE EXTENSION IF NOT EXISTS vector;
 CREATE EXTENSION IF NOT EXISTS pg_cuvs;
+RESET client_min_messages;
 SET cuvs.index_dir = '/tmp/cuvs_indexes';
 
 -- ----------------------------------------------------------------
@@ -107,4 +109,3 @@ DELETE FROM cs WHERE id = 5001;
 RESET enable_seqscan;
 
 DROP TABLE cs;
-DROP EXTENSION pg_cuvs;

@@ -15,10 +15,10 @@
 --   6. pg_cuvs_inject_extend_oom(0) → 플래그 해제 (자동 해제됐지만 명시적 정리)
 --   7. 검색: id=9999이 delta에 있으므로 nearest = 9999
 --   8. REINDEX → delta 흡수, delta_rows = 0
+SET client_min_messages = warning;
 CREATE EXTENSION IF NOT EXISTS vector;
-NOTICE:  extension "vector" already exists, skipping
 CREATE EXTENSION IF NOT EXISTS pg_cuvs;
-NOTICE:  extension "pg_cuvs" already exists, skipping
+RESET client_min_messages;
 SET cuvs.index_dir = '/tmp/cuvs_indexes';
 -- ----------------------------------------------------------------
 -- Setup: dim=128, 5000벡터 빌드

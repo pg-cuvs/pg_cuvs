@@ -10,10 +10,10 @@
 -- REQUIRES: pg_cuvs_server running (cagra index build + routing gates);
 -- cuvs.index_dir = the daemon's --index-dir.
 \set ON_ERROR_STOP on
+SET client_min_messages = warning;
 CREATE EXTENSION IF NOT EXISTS vector;
-NOTICE:  extension "vector" already exists, skipping
 CREATE EXTENSION IF NOT EXISTS pg_cuvs;
-NOTICE:  extension "pg_cuvs" already exists, skipping
+RESET client_min_messages;
 SET cuvs.index_dir = '/tmp/cuvs_indexes';
 -- Canonical label of the chosen scan for a vector top-k query. The cagra index
 -- is named rg_cagra so the plan's "Index Scan using <name>" is matched by AM

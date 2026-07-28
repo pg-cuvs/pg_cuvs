@@ -146,11 +146,25 @@ base64url_encode(const unsigned char *in, size_t in_len,
  * libcurl callbacks
  * ---------------------------------------------------------------- */
 
+/* Upper bound on any HTTP response body buffered in memory.
+ *
+ * The largest such body is latest/manifest.json, and manifest_to_json()
+ * serializes into a 4096-byte buffer — so every manifest this code can produce
+ * is under 4 KiB, which is also what manifest_from_json() is written against.
+ * 64 KiB keeps that assumption intact with room for added fields while bounding
+ * the allocation; the other buffered bodies (OAuth token JSON, GCS
+ * object-metadata replies) are of the same order. Exceeding the cap aborts the
+ * transfer with CURLE_WRITE_ERROR rather than growing the heap without limit. */
+#define OBJSTORE_RESP_MAX (64 * 1024)
+
 static size_t
 write_to_buf(void *ptr, size_t sz, size_t nmemb, void *userp)
 {
     RespBuf *rb  = userp;
     size_t   add = sz * nmemb;
+    /* Returning != add fails the transfer — fail-closed on oversized bodies. */
+    if (add > OBJSTORE_RESP_MAX || rb->size + add > OBJSTORE_RESP_MAX)
+        return 0;
     if (rb->size + add + 1 > rb->cap) {
         size_t  ncap = rb->cap + add + 4096;
         char   *nd   = realloc(rb->data, ncap);
@@ -168,6 +182,17 @@ static size_t
 read_from_file(void *ptr, size_t sz, size_t nmemb, void *userp)
 {
     return fread(ptr, sz, nmemb, (FILE *)userp);
+}
+
+/* Rewind the upload body so libcurl can retry a request it has to resend
+ * (redirect, auth challenge, connection reuse failure). Without this, curl
+ * aborts with CURLE_SEND_FAIL_REWIND instead of retrying. */
+static int
+seek_in_file(void *userp, curl_off_t offset, int origin)
+{
+    if (fseeko((FILE *)userp, (off_t)offset, origin) != 0)
+        return CURL_SEEKFUNC_FAIL;
+    return CURL_SEEKFUNC_OK;
 }
 
 /* ----------------------------------------------------------------
@@ -261,6 +286,9 @@ fetch_metadata_token(char *tok, size_t tok_sz, long *expires_in_out)
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_to_buf);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA,     &rb);
     curl_easy_setopt(curl, CURLOPT_TIMEOUT,       5L);
+    /* Uploads run on detached threads; timeouts without NOSIGNAL are undefined
+     * behaviour off the main thread when libcurl resolves names via alarm(). */
+    curl_easy_setopt(curl, CURLOPT_NOSIGNAL,      1L);
     curl_easy_setopt(curl, CURLOPT_FAILONERROR,   1L);
 
     CURLcode rc = curl_easy_perform(curl);
@@ -321,9 +349,15 @@ fetch_jwt_token(const char *key_file, char *tok, size_t tok_sz,
 
     char *sa_json = malloc((size_t)flen + 1);
     if (!sa_json) { fclose(f); return -1; }
-    fread(sa_json, 1, (size_t)flen, f);
-    sa_json[flen] = '\0';
+    size_t nread = fread(sa_json, 1, (size_t)flen, f);
     fclose(f);
+    if (nread != (size_t)flen) {
+        /* A short read would leave uninitialised heap for the strstr() parsing below. */
+        LOG_WARN("[objstore] short read of gcs_key_file: %s\n", key_file);
+        free(sa_json);
+        return -1;
+    }
+    sa_json[nread] = '\0';
 
     char email[256] = "", pem[8192] = "";
     sa_json_extract(sa_json, "client_email", email, sizeof(email));
@@ -412,6 +446,7 @@ fetch_jwt_token(const char *key_file, char *tok, size_t tok_sz,
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_to_buf);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA,     &rb);
     curl_easy_setopt(curl, CURLOPT_TIMEOUT,       15L);
+    curl_easy_setopt(curl, CURLOPT_NOSIGNAL,      1L);
 
     CURLcode rc = curl_easy_perform(curl);
     curl_easy_cleanup(curl);
@@ -550,9 +585,12 @@ gcs_upload_file(const char *bucket, const char *object_name,
     curl_easy_setopt(curl, CURLOPT_HTTPHEADER,          hdrs);
     curl_easy_setopt(curl, CURLOPT_READFUNCTION,        read_from_file);
     curl_easy_setopt(curl, CURLOPT_READDATA,            f);
+    curl_easy_setopt(curl, CURLOPT_SEEKFUNCTION,        seek_in_file);
+    curl_easy_setopt(curl, CURLOPT_SEEKDATA,            f);
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION,       write_to_buf);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA,           &rb);
     curl_easy_setopt(curl, CURLOPT_TIMEOUT,             7200L); /* 2 h for large files */
+    curl_easy_setopt(curl, CURLOPT_NOSIGNAL,            1L);
     curl_easy_setopt(curl, CURLOPT_FAILONERROR,         1L);
 
     CURLcode rc = curl_easy_perform(curl);
@@ -602,6 +640,7 @@ gcs_upload_string(const char *bucket, const char *object_name,
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_to_buf);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA,     &rb);
     curl_easy_setopt(curl, CURLOPT_TIMEOUT,       30L);
+    curl_easy_setopt(curl, CURLOPT_NOSIGNAL,      1L);
     curl_easy_setopt(curl, CURLOPT_FAILONERROR,   1L);
 
     CURLcode rc = curl_easy_perform(curl);
@@ -650,6 +689,7 @@ gcs_download_file(const char *bucket, const char *object_name,
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, fwrite);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA,     f);
     curl_easy_setopt(curl, CURLOPT_TIMEOUT,       7200L);
+    curl_easy_setopt(curl, CURLOPT_NOSIGNAL,      1L);
     curl_easy_setopt(curl, CURLOPT_FAILONERROR,   1L);
 
     CURLcode rc = curl_easy_perform(curl);
@@ -657,11 +697,22 @@ gcs_download_file(const char *bucket, const char *object_name,
     curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
     curl_slist_free_all(hdrs);
     curl_easy_cleanup(curl);
-    fclose(f);
+    int close_rc = fclose(f);
 
     if (rc != CURLE_OK) {
         LOG_WARN("[objstore] download FAILED: %s (HTTP %ld) object=%s\n",
                  curl_easy_strerror(rc), http_code, object_name);
+        unlink(tmp_path);
+        return -1;
+    }
+
+    /* A failed fclose (ENOSPC, EIO) means buffered bytes never reached disk;
+     * renaming a truncated file into place would publish a corrupt artifact.
+     * Per-shard .cagra files are not SHA-verified by the caller, so this is the
+     * only guard for them. */
+    if (close_rc != 0) {
+        LOG_WARN("[objstore] fclose %s FAILED errno=%d — discarding download\n",
+                 tmp_path, errno);
         unlink(tmp_path);
         return -1;
     }
@@ -702,6 +753,11 @@ gcs_fetch_string(const char *bucket, const char *object_name, const char *token)
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_to_buf);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA,     &rb);
     curl_easy_setopt(curl, CURLOPT_TIMEOUT,       30L);
+    curl_easy_setopt(curl, CURLOPT_NOSIGNAL,      1L);
+    /* Reject an oversized object from its Content-Length before transferring it;
+     * write_to_buf enforces the same cap for chunked replies. */
+    curl_easy_setopt(curl, CURLOPT_MAXFILESIZE_LARGE,
+                     (curl_off_t)OBJSTORE_RESP_MAX);
     curl_easy_setopt(curl, CURLOPT_FAILONERROR,   1L);
 
     CURLcode rc = curl_easy_perform(curl);

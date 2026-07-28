@@ -16,8 +16,10 @@
 --   7. 검색: id=9999이 delta에 있으므로 nearest = 9999
 --   8. REINDEX → delta 흡수, delta_rows = 0
 
+SET client_min_messages = warning;
 CREATE EXTENSION IF NOT EXISTS vector;
 CREATE EXTENSION IF NOT EXISTS pg_cuvs;
+RESET client_min_messages;
 SET cuvs.index_dir = '/tmp/cuvs_indexes';
 
 -- ----------------------------------------------------------------

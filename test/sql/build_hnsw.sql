@@ -12,8 +12,10 @@
 
 \set ON_ERROR_STOP on
 
+SET client_min_messages = warning;
 CREATE EXTENSION IF NOT EXISTS vector;
 CREATE EXTENSION IF NOT EXISTS pg_cuvs;
+RESET client_min_messages;
 
 SELECT proname FROM pg_proc WHERE proname = 'pg_cuvs_build_hnsw';
 
@@ -88,4 +90,3 @@ WHERE tablename = 'bh_test' AND indexname LIKE '%hnsw%';
 
 -- Cleanup.
 DROP TABLE bh_test CASCADE;
-DROP EXTENSION pg_cuvs CASCADE;

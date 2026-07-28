@@ -147,16 +147,44 @@ struct CuvsCagraIndexImpl {
      * idx destroyed first, then dataset. */
     raft::device_matrix<float, int64_t> dataset;
     cuvs::neighbors::cagra::index<float, uint32_t> idx;
+    uint32_t metric;   /* CUVS_METRIC_*; selects the tail padding sentinel */
 
     CuvsCagraIndexImpl(raft::device_matrix<float, int64_t> &&d,
-                       cuvs::neighbors::cagra::index<float, uint32_t> &&i)
-        : dataset(std::move(d)), idx(std::move(i))
+                       cuvs::neighbors::cagra::index<float, uint32_t> &&i,
+                       uint32_t m)
+        : dataset(std::move(d)), idx(std::move(i)), metric(m)
     {}
 };
 
 /* Forward decl: defined below, but cuvs_brute_force_search / cuvs_bf_build (above
  * the definition) need the metric -> cuVS DistanceType mapping. */
 static cuvs::distance::DistanceType cuvs_distance_type(uint32_t metric);
+
+/* Inverse of cuvs_distance_type. A deserialized index carries the cuVS
+ * DistanceType but not the CUVS_METRIC_* code it was built from, and the tail
+ * contract's padding sentinel depends on that code. */
+static uint32_t
+cuvs_metric_code(cuvs::distance::DistanceType dt)
+{
+    switch (dt) {
+        case cuvs::distance::DistanceType::CosineExpanded: return CUVS_METRIC_COSINE;
+        case cuvs::distance::DistanceType::InnerProduct:   return CUVS_METRIC_IP;
+        default:                                           return CUVS_METRIC_L2;
+    }
+}
+
+/* TAIL CONTRACT (cuvs_wrapper.h, #103): fill results[from, to) with the padding
+ * sentinel. Every search entry point that clamps top_k to the corpus size calls
+ * this for the slots the corpus cannot fill, so a successful search always
+ * writes all top_k slots. The CPU shim pads identically in shim_topk. */
+static inline void
+pad_results(CuvsSearchResult *results, int from, int to, uint32_t metric)
+{
+    for (int i = from; i < to; i++) {
+        results[i].item_id  = CUVS_PAD_ITEM_ID;
+        results[i].distance = cuvs_pad_distance(metric);
+    }
+}
 
 /* Phase 3I-1: CPU HNSW index (hnswlib-backed via cuVS).
  * from_cagra() returns unique_ptr; deserialize() returns raw ptr via out-param.
@@ -177,6 +205,7 @@ struct CuvsBfIndexImpl {
     int      dim;
     int64_t  n;
     uint32_t precision;   /* 0 = float32, 1 = float16 */
+    uint32_t metric;      /* CUVS_METRIC_*; selects the tail padding sentinel */
 
     /* cuVS brute_force::index is index<DataT, DistanceT>; distances always
      * accumulate in float, so the half variant is index<half, float> (NOT
@@ -187,8 +216,8 @@ struct CuvsBfIndexImpl {
     raft::device_matrix<half, int64_t>               *ds_f16  = nullptr;
     cuvs::neighbors::brute_force::index<half, float>  *idx_f16 = nullptr;
 
-    CuvsBfIndexImpl(int dm, int64_t nn, uint32_t prec)
-        : dim(dm), n(nn), precision(prec) {}
+    CuvsBfIndexImpl(int dm, int64_t nn, uint32_t prec, uint32_t met)
+        : dim(dm), n(nn), precision(prec), metric(met) {}
     ~CuvsBfIndexImpl() {
         delete idx_f32; delete ds_f32;
         delete idx_f16; delete ds_f16;
@@ -440,6 +469,18 @@ cuvs_brute_force_search(
     CuvsSearchResult *results,
     int               device_id)
 {
+    if (top_k <= 0)
+        return 0;
+    /* Clamp to the corpus and pad the tail (TAIL CONTRACT), as the indexed
+     * entry points do. */
+    int bk = top_k;
+    if ((int64_t)bk > n_corpus)
+        bk = (int)n_corpus;
+    if (bk <= 0) {
+        pad_results(results, 0, top_k, metric);
+        return 0;
+    }
+
     PooledRes _pr(device_id);
     try {
         raft::device_resources &res = _pr.get();
@@ -450,8 +491,8 @@ cuvs_brute_force_search(
         auto d_queries = raft::make_device_matrix<float, int64_t>(res, (int64_t)1, (int64_t)dim);
         raft::copy(d_queries.data_handle(), query_vec, dim, res.get_stream());
 
-        auto d_indices   = raft::make_device_matrix<int64_t, int64_t>(res, 1, top_k);
-        auto d_distances = raft::make_device_matrix<float,   int64_t>(res, 1, top_k);
+        auto d_indices   = raft::make_device_matrix<int64_t, int64_t>(res, 1, bk);
+        auto d_distances = raft::make_device_matrix<float,   int64_t>(res, 1, bk);
 
         auto index = cuvs::neighbors::brute_force::build(
             res,
@@ -466,16 +507,17 @@ cuvs_brute_force_search(
 
         res.sync_stream();
 
-        std::vector<int64_t> h_indices(top_k);
-        std::vector<float>   h_distances(top_k);
-        raft::copy(h_indices.data(),   d_indices.data_handle(),   top_k, res.get_stream());
-        raft::copy(h_distances.data(), d_distances.data_handle(), top_k, res.get_stream());
+        std::vector<int64_t> h_indices(bk);
+        std::vector<float>   h_distances(bk);
+        raft::copy(h_indices.data(),   d_indices.data_handle(),   bk, res.get_stream());
+        raft::copy(h_distances.data(), d_distances.data_handle(), bk, res.get_stream());
         res.sync_stream();
 
-        for (int i = 0; i < top_k; i++) {
+        for (int i = 0; i < bk; i++) {
             results[i].item_id  = h_indices[i];
             results[i].distance = h_distances[i];
         }
+        pad_results(results, bk, top_k, metric);
         return 0;
     } catch (...) {
         _pr.poison();
@@ -498,7 +540,7 @@ cuvs_bf_build(const float *vecs, int64_t n, int dim, uint32_t metric,
         /* Upload corpus once; retained in the impl so the index's view stays
          * valid for the handle's lifetime (mirror of the CAGRA dataset rule).
          * unique_ptr makes a mid-build throw clean up the partial impl. */
-        std::unique_ptr<CuvsBfIndexImpl> impl(new CuvsBfIndexImpl(dim, n, precision));
+        std::unique_ptr<CuvsBfIndexImpl> impl(new CuvsBfIndexImpl(dim, n, precision, metric));
 
         if (precision == 1 /* float16 */) {
             /* Convert host float32 -> host half once, then upload. half search
@@ -558,18 +600,24 @@ cuvs_bf_search(
     CuvsBfIndexImpl *impl = static_cast<CuvsBfIndexImpl *>(index);
     if (dim != impl->dim)
         return 2;
-    /* brute_force cannot return more neighbors than the corpus holds. */
-    if ((int64_t)top_k > impl->n)
-        top_k = (int)impl->n;
     if (top_k <= 0)
         return 0;
+    /* brute_force cannot return more neighbors than the corpus holds; the tail
+     * slots [bk, top_k) carry the padding sentinel (TAIL CONTRACT). */
+    int bk = top_k;
+    if ((int64_t)bk > impl->n)
+        bk = (int)impl->n;
+    if (bk <= 0) {
+        pad_results(results, 0, top_k, impl->metric);
+        return 0;
+    }
 
     PooledRes _pr(device_id);
     try {
         raft::device_resources &res = _pr.get();
 
-        auto d_indices   = raft::make_device_matrix<int64_t, int64_t>(res, 1, top_k);
-        auto d_distances = raft::make_device_matrix<float,   int64_t>(res, 1, top_k);
+        auto d_indices   = raft::make_device_matrix<int64_t, int64_t>(res, 1, bk);
+        auto d_distances = raft::make_device_matrix<float,   int64_t>(res, 1, bk);
 
         if (impl->precision == 1 /* float16 */) {
             auto d_queries = raft::make_device_matrix<half, int64_t>(res, (int64_t)1, (int64_t)dim);
@@ -596,16 +644,17 @@ cuvs_bf_search(
 
         res.sync_stream();
 
-        std::vector<int64_t> h_indices(top_k);
-        std::vector<float>   h_distances(top_k);
-        raft::copy(h_indices.data(),   d_indices.data_handle(),   top_k, res.get_stream());
-        raft::copy(h_distances.data(), d_distances.data_handle(), top_k, res.get_stream());
+        std::vector<int64_t> h_indices(bk);
+        std::vector<float>   h_distances(bk);
+        raft::copy(h_indices.data(),   d_indices.data_handle(),   bk, res.get_stream());
+        raft::copy(h_distances.data(), d_distances.data_handle(), bk, res.get_stream());
         res.sync_stream();
 
-        for (int i = 0; i < top_k; i++) {
+        for (int i = 0; i < bk; i++) {
             results[i].item_id  = h_indices[i];
             results[i].distance = h_distances[i];
         }
+        pad_results(results, bk, top_k, impl->metric);
         return 0;
     } catch (const std::exception &e) {
         fprintf(stderr, "[cuvs_bf_search] exception: %s\n", e.what());
@@ -648,10 +697,33 @@ cuvs_bf_search_filtered(
     CuvsBfIndexImpl *impl = static_cast<CuvsBfIndexImpl *>(index);
     if (dim != impl->dim)
         return 2;
-    if ((int64_t)top_k > impl->n)
-        top_k = (int)impl->n;
+    /* Unlike cuvs_bf_search above, the filtered path below searches idx_f32
+     * unconditionally — but a float16 index (precision == 1) builds only
+     * idx_f16 and leaves idx_f32 null. Refuse the combination instead of
+     * dereferencing null: this runs in the daemon, so a SIGSEGV here takes
+     * down every backend's session, not just this query. The caller treats a
+     * non-zero return as "prefilter unavailable" and falls back. Teaching the
+     * filtered path to search idx_f16 (mirroring cuvs_bf_search's half-query
+     * conversion) is the real fix and needs a GPU to validate.
+     *
+     * 1, not a new code: cuvs_wrapper.h documents only 0/2/1 for this entry
+     * point, and the CPU shim — which has no precision concept at all — can
+     * never produce anything outside that set. */
+    if (!impl->idx_f32)
+        return 1;
+    /* The bitset is dereferenced unconditionally below; the CPU shim refuses
+     * NULL the same way rather than reading it as "no filter" (#110). */
+    if (!bitset_words)
+        return 1;
     if (top_k <= 0)
         return 0;
+    int bk = top_k;
+    if ((int64_t)bk > impl->n)
+        bk = (int)impl->n;
+    if (bk <= 0) {
+        pad_results(results, 0, top_k, impl->metric);
+        return 0;
+    }
 
     PooledRes _pr(device_id);
     try {
@@ -659,8 +731,8 @@ cuvs_bf_search_filtered(
 
         /* Upload query */
         auto d_queries   = raft::make_device_matrix<float,   int64_t>(res, (int64_t)1, (int64_t)dim);
-        auto d_indices   = raft::make_device_matrix<int64_t, int64_t>(res, 1, top_k);
-        auto d_distances = raft::make_device_matrix<float,   int64_t>(res, 1, top_k);
+        auto d_indices   = raft::make_device_matrix<int64_t, int64_t>(res, 1, bk);
+        auto d_distances = raft::make_device_matrix<float,   int64_t>(res, 1, bk);
         raft::copy(d_queries.data_handle(), query_vec, dim, res.get_stream());
 
         /* Upload bitset. pg_cuvs builds bit=1 = EXCLUDE (daemon memsets 0xFF then
@@ -689,16 +761,17 @@ cuvs_bf_search_filtered(
 
         res.sync_stream();
 
-        std::vector<int64_t> h_indices(top_k);
-        std::vector<float>   h_distances(top_k);
-        raft::copy(h_indices.data(),   d_indices.data_handle(),   top_k, res.get_stream());
-        raft::copy(h_distances.data(), d_distances.data_handle(), top_k, res.get_stream());
+        std::vector<int64_t> h_indices(bk);
+        std::vector<float>   h_distances(bk);
+        raft::copy(h_indices.data(),   d_indices.data_handle(),   bk, res.get_stream());
+        raft::copy(h_distances.data(), d_distances.data_handle(), bk, res.get_stream());
         res.sync_stream();
 
-        for (int i = 0; i < top_k; i++) {
+        for (int i = 0; i < bk; i++) {
             results[i].item_id  = h_indices[i];
             results[i].distance = h_distances[i];
         }
+        pad_results(results, bk, top_k, impl->metric);
         return 0;
     } catch (const std::exception &e) {
         fprintf(stderr, "[cuvs_bf_search_filtered] exception: %s\n", e.what());
@@ -731,20 +804,29 @@ cuvs_cagra_search_filtered(
     CuvsCagraIndexImpl *impl = static_cast<CuvsCagraIndexImpl *>(index);
     if ((int64_t)dim != impl->idx.dim())
         return 2;
-
-    int64_t n = (int64_t)impl->idx.dataset().extent(0);
-    if ((int64_t)top_k > n)
-        top_k = (int)n;
+    /* The bitset is dereferenced unconditionally below; the CPU shim refuses
+     * NULL the same way rather than reading it as "no filter" (#110). */
+    if (!bitset_words)
+        return 1;
     if (top_k <= 0)
         return 0;
+
+    int64_t n = (int64_t)impl->idx.dataset().extent(0);
+    int bk = top_k;
+    if ((int64_t)bk > n)
+        bk = (int)n;
+    if (bk <= 0) {
+        pad_results(results, 0, top_k, impl->metric);
+        return 0;
+    }
 
     PooledRes _pr(device_id);
     try {
         raft::device_resources &res = _pr.get();
 
         auto d_queries   = raft::make_device_matrix<float,    int64_t>(res, (int64_t)1, (int64_t)dim);
-        auto d_indices   = raft::make_device_matrix<uint32_t, int64_t>(res, 1, top_k);
-        auto d_distances = raft::make_device_matrix<float,    int64_t>(res, 1, top_k);
+        auto d_indices   = raft::make_device_matrix<uint32_t, int64_t>(res, 1, bk);
+        auto d_distances = raft::make_device_matrix<float,    int64_t>(res, 1, bk);
         raft::copy(d_queries.data_handle(), query_vec, dim, res.get_stream());
 
         /* Upload bitset. pg_cuvs builds bit=1 = EXCLUDE; cuVS bitset_filter keeps
@@ -762,7 +844,7 @@ cuvs_cagra_search_filtered(
         auto prefilter = cuvs::neighbors::filtering::bitset_filter<uint32_t, int64_t>(bv);
 
         cuvs::neighbors::cagra::search_params sparams;
-        int itopk = ((top_k + 31) / 32) * 32;
+        int itopk = ((bk + 31) / 32) * 32;
         if (itopk < 64) itopk = 64;
         sparams.itopk_size = itopk;
 
@@ -775,16 +857,17 @@ cuvs_cagra_search_filtered(
 
         res.sync_stream();
 
-        std::vector<uint32_t> h_indices(top_k);
-        std::vector<float>    h_distances(top_k);
-        raft::copy(h_indices.data(),   d_indices.data_handle(),   top_k, res.get_stream());
-        raft::copy(h_distances.data(), d_distances.data_handle(), top_k, res.get_stream());
+        std::vector<uint32_t> h_indices(bk);
+        std::vector<float>    h_distances(bk);
+        raft::copy(h_indices.data(),   d_indices.data_handle(),   bk, res.get_stream());
+        raft::copy(h_distances.data(), d_distances.data_handle(), bk, res.get_stream());
         res.sync_stream();
 
-        for (int i = 0; i < top_k; i++) {
+        for (int i = 0; i < bk; i++) {
             results[i].item_id  = (int64_t)h_indices[i];
             results[i].distance = h_distances[i];
         }
+        pad_results(results, bk, top_k, impl->metric);
         return 0;
     } catch (const std::exception &e) {
         fprintf(stderr, "[cuvs_cagra_search_filtered] exception: %s\n", e.what());
@@ -883,7 +966,7 @@ cuvs_cagra_build_multi(const float **vecs, const int64_t *n_each, int n_parts,
         idx.update_dataset(res, raft::make_const_mdspan(d_corpus.view()));
         res.sync_stream();
 
-        return new CuvsCagraIndexImpl(std::move(d_corpus), std::move(idx));
+        return new CuvsCagraIndexImpl(std::move(d_corpus), std::move(idx), metric);
     } catch (const std::bad_alloc &) {
         /* ADR-070 Bug #3: OOM (incl. RMM out_of_memory). Flag it so the daemon
          * evicts an LRU index and retries before failing the build. */
@@ -943,6 +1026,19 @@ cuvs_cagra_search(
         return 2;
     }
 
+    if (top_k <= 0)
+        return 0;
+    /* Clamp to the corpus and pad the tail, as every sibling entry point does —
+     * this one had neither guard, so an oversized k reached cagra::search
+     * unclamped (#103). */
+    int bk = top_k;
+    if ((int64_t)bk > (int64_t)impl->idx.size())
+        bk = (int)impl->idx.size();
+    if (bk <= 0) {
+        pad_results(results, 0, top_k, impl->metric);
+        return 0;
+    }
+
     PooledRes _pr(device_id);
     try {
         raft::device_resources &res = _pr.get();
@@ -950,8 +1046,8 @@ cuvs_cagra_search(
         auto d_queries = raft::make_device_matrix<float, int64_t>(res, (int64_t)1, (int64_t)dim);
         raft::copy(d_queries.data_handle(), query_vec, dim, res.get_stream());
 
-        auto d_indices   = raft::make_device_matrix<uint32_t, int64_t>(res, 1, top_k);
-        auto d_distances = raft::make_device_matrix<float,    int64_t>(res, 1, top_k);
+        auto d_indices   = raft::make_device_matrix<uint32_t, int64_t>(res, 1, bk);
+        auto d_distances = raft::make_device_matrix<float,    int64_t>(res, 1, bk);
 
         cuvs::neighbors::cagra::search_params sparams;
         /* CAGRA multi-cta search requires:
@@ -959,7 +1055,7 @@ cuvs_cagra_search(
          * where num_cta_per_query = max(search_width, ceil(itopk_size / 32))
          * Default itopk_size=64, search_width=1 -> num_cta=2 -> max top_k=64.
          * Round itopk_size up to a multiple of 32 that satisfies top_k. */
-        int itopk = ((top_k + 31) / 32) * 32;
+        int itopk = ((bk + 31) / 32) * 32;
         if (itopk < 64) itopk = 64;
         sparams.itopk_size = itopk;
 
@@ -971,16 +1067,17 @@ cuvs_cagra_search(
 
         res.sync_stream();
 
-        std::vector<uint32_t> h_indices(top_k);
-        std::vector<float>    h_distances(top_k);
-        raft::copy(h_indices.data(),   d_indices.data_handle(),   top_k, res.get_stream());
-        raft::copy(h_distances.data(), d_distances.data_handle(), top_k, res.get_stream());
+        std::vector<uint32_t> h_indices(bk);
+        std::vector<float>    h_distances(bk);
+        raft::copy(h_indices.data(),   d_indices.data_handle(),   bk, res.get_stream());
+        raft::copy(h_distances.data(), d_distances.data_handle(), bk, res.get_stream());
         res.sync_stream();
 
-        for (int i = 0; i < top_k; i++) {
+        for (int i = 0; i < bk; i++) {
             results[i].item_id  = (int64_t)h_indices[i];
             results[i].distance = h_distances[i];
         }
+        pad_results(results, bk, top_k, impl->metric);
         return 0;
     } catch (const std::exception &e) {
         fprintf(stderr, "[cuvs_cagra_search] exception: %s\n", e.what());
@@ -1024,20 +1121,31 @@ cuvs_cagra_search_batch(
         return 2;
     }
 
+    /* Clamp to the corpus; the per-query tail slots [bk, top_k) get the padding
+     * sentinel (TAIL CONTRACT), as in cuvs_bf_search_batch. */
+    int bk = top_k;
+    if ((int64_t)bk > (int64_t)impl->idx.size())
+        bk = (int)impl->idx.size();
+    if (bk <= 0) {
+        for (int q = 0; q < n_queries; q++)
+            pad_results(results + (size_t)q * top_k, 0, top_k, impl->metric);
+        return 0;
+    }
+
     PooledRes _pr(device_id);
     try {
         raft::device_resources &res = _pr.get();
         int64_t Q = n_queries;
-        size_t  n = (size_t)Q * (size_t)top_k;
+        size_t  n = (size_t)Q * (size_t)bk;
 
         auto d_queries = raft::make_device_matrix<float, int64_t>(res, Q, (int64_t)dim);
         raft::copy(d_queries.data_handle(), queries, (size_t)Q * dim, res.get_stream());
 
-        auto d_indices   = raft::make_device_matrix<uint32_t, int64_t>(res, Q, top_k);
-        auto d_distances = raft::make_device_matrix<float,    int64_t>(res, Q, top_k);
+        auto d_indices   = raft::make_device_matrix<uint32_t, int64_t>(res, Q, bk);
+        auto d_distances = raft::make_device_matrix<float,    int64_t>(res, Q, bk);
 
         cuvs::neighbors::cagra::search_params sparams;
-        int itopk = ((top_k + 31) / 32) * 32;
+        int itopk = ((bk + 31) / 32) * 32;
         if (itopk < 64) itopk = 64;
         sparams.itopk_size = itopk;
 
@@ -1054,9 +1162,13 @@ cuvs_cagra_search_batch(
         raft::copy(h_distances.data(), d_distances.data_handle(), n, res.get_stream());
         res.sync_stream();
 
-        for (size_t i = 0; i < n; i++) {
-            results[i].item_id  = (int64_t)h_indices[i];
-            results[i].distance = h_distances[i];
+        for (int64_t q = 0; q < Q; q++) {
+            for (int j = 0; j < bk; j++) {
+                CuvsSearchResult *r = &results[(size_t)q * top_k + j];
+                r->item_id  = (int64_t)h_indices[(size_t)q * bk + j];
+                r->distance = h_distances[(size_t)q * bk + j];
+            }
+            pad_results(results + (size_t)q * top_k, bk, top_k, impl->metric);
         }
         return 0;
     } catch (const std::exception &e) {
@@ -1093,6 +1205,11 @@ cuvs_bf_search_batch(
     int bk = top_k;
     if ((int64_t)bk > impl->n)
         bk = (int)impl->n;
+    if (bk <= 0) {
+        for (int q = 0; q < n_queries; q++)
+            pad_results(results + (size_t)q * top_k, 0, top_k, impl->metric);
+        return 0;
+    }
 
     PooledRes _pr(device_id);
     try {
@@ -1134,16 +1251,12 @@ cuvs_bf_search_batch(
         res.sync_stream();
 
         for (int64_t q = 0; q < Q; q++) {
-            for (int j = 0; j < top_k; j++) {
+            for (int j = 0; j < bk; j++) {
                 CuvsSearchResult *r = &results[(size_t)q * top_k + j];
-                if (j < bk) {
-                    r->item_id  = h_indices[(size_t)q * bk + j];
-                    r->distance = h_distances[(size_t)q * bk + j];
-                } else {
-                    r->item_id  = -1;            /* sentinel: no neighbor */
-                    r->distance = 3.402823466e+38f;
-                }
+                r->item_id  = h_indices[(size_t)q * bk + j];
+                r->distance = h_distances[(size_t)q * bk + j];
             }
+            pad_results(results + (size_t)q * top_k, bk, top_k, impl->metric);
         }
         return 0;
     } catch (const std::exception &e) {
@@ -1199,7 +1312,10 @@ cuvs_cagra_deserialize(const char *path, int dim, int device_id)
          * field stays valid; idx's internal dataset is what matters. */
         auto empty = raft::make_device_matrix<float, int64_t>(res, (int64_t)0, (int64_t)0);
         res.sync_stream();
-        return new CuvsCagraIndexImpl(std::move(empty), std::move(idx));
+        /* The metric is baked into the serialized graph; recover our code for
+         * the tail contract's padding sentinel. */
+        uint32_t met = cuvs_metric_code(idx.metric());
+        return new CuvsCagraIndexImpl(std::move(empty), std::move(idx), met);
     } catch (const std::exception &e) {
         fprintf(stderr, "[cuvs_cagra_deserialize] exception: %s\n", e.what());
         return nullptr;
@@ -1329,7 +1445,7 @@ cuvs_cagra_compact(CuvsCagraIndex  index,
         /* Wrap in new impl with empty placeholder dataset (same as deserialize). */
         auto empty = raft::make_device_matrix<float, int64_t>(res, (int64_t)0, (int64_t)0);
         res.sync_stream();
-        return new CuvsCagraIndexImpl(std::move(empty), std::move(new_idx));
+        return new CuvsCagraIndexImpl(std::move(empty), std::move(new_idx), metric);
     } catch (const std::exception &e) {
         fprintf(stderr, "[cuvs_cagra_compact] exception: %s\n", e.what());
         _pr.poison();
@@ -1352,10 +1468,11 @@ struct CuvsIvfPqIndexImpl {
     cuvs::neighbors::ivf_pq::index<int64_t> idx;
     int64_t  n;    /* corpus size; used for top_k clamping */
     int      dim;
+    uint32_t metric;   /* CUVS_METRIC_*; selects the tail padding sentinel */
 
     CuvsIvfPqIndexImpl(cuvs::neighbors::ivf_pq::index<int64_t> &&i,
-                       int64_t nn, int dm)
-        : idx(std::move(i)), n(nn), dim(dm) {}
+                       int64_t nn, int dm, uint32_t met)
+        : idx(std::move(i)), n(nn), dim(dm), metric(met) {}
 };
 
 extern "C" int
@@ -1386,7 +1503,7 @@ cuvs_ivfpq_build(
             raft::make_const_mdspan(d_corpus.view()));
         res.sync_stream();
 
-        *out = new CuvsIvfPqIndexImpl(std::move(idx), n_vecs, dim);
+        *out = new CuvsIvfPqIndexImpl(std::move(idx), n_vecs, dim, metric);
         return 0;
     } catch (const std::exception &e) {
         fprintf(stderr, "[cuvs_ivfpq_build] exception: %s\n", e.what());
@@ -1415,18 +1532,23 @@ cuvs_ivfpq_search(
     CuvsIvfPqIndexImpl *impl = static_cast<CuvsIvfPqIndexImpl *>(index);
     if (dim != impl->dim)
         return 2;
-    if ((int64_t)top_k > impl->n)
-        top_k = (int)impl->n;
     if (top_k <= 0)
         return 0;
+    int bk = top_k;
+    if ((int64_t)bk > impl->n)
+        bk = (int)impl->n;
+    if (bk <= 0) {
+        pad_results(results, 0, top_k, impl->metric);
+        return 0;
+    }
 
     PooledRes _pr(device_id);
     try {
         raft::device_resources &res = _pr.get();
 
         auto d_queries   = raft::make_device_matrix<float,   int64_t>(res, (int64_t)1, (int64_t)dim);
-        auto d_indices   = raft::make_device_matrix<int64_t, int64_t>(res, 1, top_k);
-        auto d_distances = raft::make_device_matrix<float,   int64_t>(res, 1, top_k);
+        auto d_indices   = raft::make_device_matrix<int64_t, int64_t>(res, 1, bk);
+        auto d_distances = raft::make_device_matrix<float,   int64_t>(res, 1, bk);
         raft::copy(d_queries.data_handle(), query_vec, dim, res.get_stream());
 
         cuvs::neighbors::ivf_pq::search_params sparams;
@@ -1440,16 +1562,17 @@ cuvs_ivfpq_search(
 
         res.sync_stream();
 
-        std::vector<int64_t> h_indices(top_k);
-        std::vector<float>   h_distances(top_k);
-        raft::copy(h_indices.data(),   d_indices.data_handle(),   top_k, res.get_stream());
-        raft::copy(h_distances.data(), d_distances.data_handle(), top_k, res.get_stream());
+        std::vector<int64_t> h_indices(bk);
+        std::vector<float>   h_distances(bk);
+        raft::copy(h_indices.data(),   d_indices.data_handle(),   bk, res.get_stream());
+        raft::copy(h_distances.data(), d_distances.data_handle(), bk, res.get_stream());
         res.sync_stream();
 
-        for (int i = 0; i < top_k; i++) {
+        for (int i = 0; i < bk; i++) {
             results[i].item_id  = h_indices[i];
             results[i].distance = h_distances[i];
         }
+        pad_results(results, bk, top_k, impl->metric);
         return 0;
     } catch (const std::exception &e) {
         fprintf(stderr, "[cuvs_ivfpq_search] exception: %s\n", e.what());
@@ -1492,9 +1615,10 @@ cuvs_ivfpq_deserialize(const char *path, int device_id)
         cuvs::neighbors::ivf_pq::index<int64_t> idx(res);
         cuvs::neighbors::ivf_pq::deserialize(res, std::string(path), &idx);
         res.sync_stream();
-        int64_t n   = (int64_t)idx.size();
-        int     dim = (int)idx.dim();
-        return new CuvsIvfPqIndexImpl(std::move(idx), n, dim);
+        int64_t  n   = (int64_t)idx.size();
+        int      dim = (int)idx.dim();
+        uint32_t met = cuvs_metric_code(idx.metric());
+        return new CuvsIvfPqIndexImpl(std::move(idx), n, dim, met);
     } catch (const std::exception &e) {
         fprintf(stderr, "[cuvs_ivfpq_deserialize] exception: %s\n", e.what());
         return nullptr;
@@ -1532,11 +1656,13 @@ cuvs_hnsw_serialize(CuvsCagraIndex cagra_idx, const char *path, int device_id)
     if (!cagra_idx || !path) return -1;
     CuvsCagraIndexImpl *cimpl = static_cast<CuvsCagraIndexImpl *>(cagra_idx);
     /* hnswlib aborts on very small graphs; skip serialization rather than crash.
-     * The CAGRA index remains functional for GPU search. */
-    if (cimpl->idx.size() < 16) {
-        fprintf(stderr, "[cuvs_hnsw_serialize] skip: n_vecs=%zu < 16 (too small for hnswlib)\n",
-                cimpl->idx.size());
-        return 0;
+     * The CAGRA index remains functional for GPU search. SKIPPED, not 0: nothing
+     * was written, and a caller reading 0 as "the sidecar exists" hands out a
+     * path to a file nobody created (#106). */
+    if (cimpl->idx.size() < (size_t)CUVS_HNSW_MIN_ELEMENTS) {
+        fprintf(stderr, "[cuvs_hnsw_serialize] skip: n_vecs=%zu < %d (too small for hnswlib)\n",
+                cimpl->idx.size(), CUVS_HNSW_MIN_ELEMENTS);
+        return CUVS_HNSW_SERIALIZE_SKIPPED;
     }
     PooledRes _pr(device_id);
     try {
@@ -1666,7 +1792,17 @@ cuvs_cagra_extract_adjacency(
         auto graph_view = cimpl->idx.graph();
         size_t N   = (size_t)graph_view.extent(0);
         size_t D   = (size_t)graph_view.extent(1);
-        size_t dim = (size_t)cimpl->dataset.extent(1);
+
+        /* Read the corpus from the index, NOT from cimpl->dataset. After
+         * cuvs_cagra_deserialize (and cuvs_cagra_extend) that member is a
+         * deliberate 0x0 placeholder — the index owns the real dataset. Taking
+         * dim from the placeholder yielded 0, so `vecs` was a 0-byte malloc and
+         * the copy below moved nothing, yet the function still returned 0; the
+         * daemon then copied n_vecs * e->dim * sizeof(float) bytes out of that
+         * empty buffer (a 12.8 KB over-read at 400x8, ~3 GB at 1M x 768). See
+         * issue #101 — measured, not inferred. */
+        auto   ds  = cimpl->idx.dataset();
+        size_t dim = (size_t)ds.extent(1);
 
         uint32_t *adj  = (uint32_t *)malloc(N * D   * sizeof(uint32_t));
         float    *vecs = (float    *)malloc(N * dim  * sizeof(float));
@@ -1678,8 +1814,22 @@ cuvs_cagra_extract_adjacency(
         }
 
         auto stream = raft::resource::get_cuda_stream(res);
-        raft::copy(adj,  graph_view.data_handle(),      N * D,   stream);
-        raft::copy(vecs, cimpl->dataset.data_handle(),  N * dim, stream);
+        raft::copy(adj, graph_view.data_handle(), N * D, stream);
+        /* cagra::index::dataset() is a strided view — cuVS pads rows for
+         * alignment, so a flat N*dim copy is only valid when the row stride
+         * equals dim. Fall back to a row-wise copy otherwise, or every vector
+         * after the first would be read at the wrong offset. */
+        {
+            size_t row_stride = (size_t)ds.stride(0);
+            if (row_stride == dim) {
+                raft::copy(vecs, ds.data_handle(), N * dim, stream);
+            } else {
+                for (size_t i = 0; i < N; i++)
+                    raft::copy(vecs + i * dim,
+                               ds.data_handle() + i * row_stride,
+                               dim, stream);
+            }
+        }
         res.sync_stream();
 
         *adj_out          = adj;

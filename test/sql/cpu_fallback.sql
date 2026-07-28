@@ -4,8 +4,10 @@
 
 \set ON_ERROR_STOP on
 
+SET client_min_messages = warning;
 CREATE EXTENSION IF NOT EXISTS vector;
 CREATE EXTENSION IF NOT EXISTS pg_cuvs;
+RESET client_min_messages;
 
 CREATE TABLE smoke_items (id bigint, embedding vector(4));
 INSERT INTO smoke_items VALUES
@@ -28,4 +30,3 @@ ORDER BY embedding <-> '[1,0.5,0,0]'::vector
 LIMIT 2;
 
 DROP TABLE smoke_items;
-DROP EXTENSION pg_cuvs;

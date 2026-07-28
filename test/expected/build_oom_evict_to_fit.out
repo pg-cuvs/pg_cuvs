@@ -13,10 +13,10 @@
 --
 -- REQUIRES: pg_cuvs_server running; cuvs.index_dir writable. Tier-1 CI (CPU shim).
 \set ON_ERROR_STOP on
+SET client_min_messages = warning;
 CREATE EXTENSION IF NOT EXISTS vector;
-NOTICE:  extension "vector" already exists, skipping
 CREATE EXTENSION IF NOT EXISTS pg_cuvs;
-NOTICE:  extension "pg_cuvs" already exists, skipping
+RESET client_min_messages;
 SET cuvs.index_dir = '/tmp/cuvs_indexes';
 -- ============================================================ single-process path
 -- handle_build (max_parallel_maintenance_workers = 0). Two fresh resident victims.

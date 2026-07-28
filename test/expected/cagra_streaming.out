@@ -16,9 +16,10 @@
 -- CAGRA is approximate but at this distance ratio (1000x) ordering is exact.
 --
 -- Requires a running pg_cuvs_server with a loaded CAGRA index.
+SET client_min_messages = warning;
 CREATE EXTENSION IF NOT EXISTS vector;
-NOTICE:  extension "vector" already exists, skipping
 CREATE EXTENSION IF NOT EXISTS pg_cuvs;
+RESET client_min_messages;
 SET cuvs.index_dir = '/tmp/cuvs_indexes';
 -- ----------------------------------------------------------------
 -- Setup: small base cluster near origin, all within dist 0.05
@@ -144,4 +145,3 @@ FROM cs ORDER BY embedding <-> '[50,1,0,0]'::vector LIMIT 1;
 DELETE FROM cs WHERE id = 5001;
 RESET enable_seqscan;
 DROP TABLE cs;
-DROP EXTENSION pg_cuvs;

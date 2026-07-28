@@ -1,6 +1,6 @@
 -- pg_cuvs--0.2.0.sql
 -- Loaded by CREATE EXTENSION pg_cuvs; (requires pgvector)
-cho Use "CREATE EXTENSION pg_cuvs" to load this file. \quit
+\echo Use "CREATE EXTENSION pg_cuvs" to load this file. \quit
 
 
 -- ----------------------------------------------------------------

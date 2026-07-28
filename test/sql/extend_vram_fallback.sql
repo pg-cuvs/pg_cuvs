@@ -6,8 +6,10 @@
 -- 이 테스트는 handle_extend의 budget 체크와 백엔드 delta fallback의 정합성을
 -- end-to-end로 검증한다.
 
+SET client_min_messages = warning;
 CREATE EXTENSION IF NOT EXISTS vector;
 CREATE EXTENSION IF NOT EXISTS pg_cuvs;
+RESET client_min_messages;
 SET cuvs.index_dir = '/tmp/cuvs_indexes';
 
 -- ----------------------------------------------------------------

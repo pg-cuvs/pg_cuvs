@@ -22,7 +22,7 @@ DATA           = sql/pg_cuvs--0.1.0.sql \
                  sql/pg_cuvs--0.4.0--0.5.0.sql \
                  sql/pg_cuvs--0.5.0.sql
 MODULE_big     = pg_cuvs
-REGRESS        = smoke cpu_fallback edge_cases cpu_hnsw_fallback build_hnsw build_hnsw_edge pg_cuvs_hnsw metrics brute_force pg_cuvs_batch reloption_dir gc_orphans release_hardening pending_delta delta_recall build_params drop_subxact partition_prune filter_comparison ivfpq_smoke cagra_streaming auto_compact extend_vram_fallback extend_cuda_oom stream_bf_recall fallback_stat vram_accounting build_lock build_oom build_multi_oom build_oom_evict_to_fit flat_smoke transient_bf hw_profile routing_golden routing_golden_measured multi_vector
+REGRESS        = smoke upgrade_path cpu_fallback edge_cases cpu_hnsw_fallback build_hnsw build_hnsw_edge pg_cuvs_hnsw metrics brute_force pg_cuvs_batch reloption_dir gc_orphans release_hardening pending_delta delta_recall build_params drop_subxact partition_prune filter_comparison ivfpq_smoke cagra_streaming auto_compact extend_vram_fallback extend_cuda_oom stream_bf_recall fallback_stat vram_accounting build_lock build_oom build_multi_oom build_oom_evict_to_fit flat_smoke transient_bf hw_profile routing_golden routing_golden_measured multi_vector
 REGRESS_OPTS   = --inputdir=test --outputdir=test
 
 # Tier-1 CI (CPU-reference shim, PGCUVS_CPU_SHIM=1) runs a SUBSET of REGRESS.
@@ -88,7 +88,7 @@ include $(PGXS)
 # a shared header (e.g. a wire struct in cuvs_ipc.h) would otherwise leave stale
 # extension objects linked against the old layout — an ABI mismatch vs the
 # daemon. Force every extension object to rebuild when ANY project header
-# changes. (The server objects already list their header prereqs explicitly.)
+# changes. (The daemon objects get the same blanket rule via SERVER_ALL_OBJS.)
 $(OBJS): $(wildcard src/*.h)
 
 # Build CUDA object before linking the .so. Pattern rule overrides PGXS
@@ -122,6 +122,22 @@ SERVER_LDFLAGS = $(CUVS_SERVER_LINK) -lstdc++ \
                  -lpthread -lrt \
                  -lcurl -lssl -lcrypto
 SERVER_LDFLAGS += $(EXTRA_SERVER_LDFLAGS)
+
+# Every daemon object, including the *_test variants built with the CPU shim.
+# The per-object rules below list header prereqs by hand and have drifted from
+# the actual #include set (cuvs_ipc.c and cuvs_objstore.c both pull in
+# cuvs_util.h, which carries the on-disk/wire structs CuvsDeltaHeader,
+# CuvsTombstoneHeader, CuvsShardRecord, …). A missed prereq links a stale
+# object against an old struct layout — the same ABI drift the extension-side
+# rule below guards against, but inside the daemon binary. Rebuild them all
+# when ANY project header changes.
+SERVER_ALL_OBJS = src/pg_cuvs_server.o src/cuvs_objstore_server.o \
+                  src/cuvs_ipc_server.o src/cuvs_util_server.o \
+                  src/cuvs_build_corpus_server.o \
+                  src/pg_cuvs_server_test.o src/cuvs_objstore_server_test.o \
+                  src/cuvs_ipc_server_test.o src/cuvs_util_server_test.o \
+                  src/cuvs_build_corpus_server_test.o
+$(SERVER_ALL_OBJS): $(wildcard src/*.h)
 
 # server .c → .o (not via PGXS — separate rule with no PG headers)
 src/pg_cuvs_server.o: src/pg_cuvs_server.c src/cuvs_ipc.h src/cuvs_util.h src/cuvs_wrapper.h src/cuvs_objstore.h src/cuvs_build_corpus.h
@@ -250,20 +266,38 @@ benchmark:
 
 .PHONY: benchmark
 
-# ---- GCP remote orchestration ------------------------------------------
-# Load .env.gpu (gitignored) for GCP_VM, GCP_INSTANCE, GCP_ZONE, etc.
+# ---- Remote VM orchestration -------------------------------------------
+# Load .env.gpu (gitignored) for GCP_VM (the ssh host, whatever the provider),
+# and — for the legacy GCP path — GCP_INSTANCE, GCP_ZONE, GCP_PROJECT.
 -include .env.gpu
 export
 
-# The VM's external IP is ephemeral (GCP reassigns it on every stop/start), so the
-# GCP_VM value in .env.gpu goes stale. VM_HOST resolves the CURRENT IP from gcloud
-# at expansion time, falling back to .env.gpu's GCP_VM if the lookup fails (gcloud
-# offline/unauthenticated). Recursive '=' + unexport so gcloud runs only when a
-# remote ssh/rsync recipe references $(VM_HOST) -- never on a plain local `make`.
+# On GCP the external IP is ephemeral (reassigned on every stop/start), so
+# .env.gpu's GCP_VM goes stale and the CURRENT IP has to come from gcloud.
+# Brev (the current main provider, see infra/README.md) has no such lookup:
+# GCP_VM *is* the host. So the gcloud probe is opt-in via USE_GCP_IP=1.
+#
+# Leaving it unconditional cost us twice. It forks gcloud once per $(VM_HOST)
+# reference — recursive '=' re-evaluates the shell on every expansion — so a
+# `make -n gpu-test-all` (6 references, nothing executed) took 6.7s vs 0.24s
+# for a target that never mentions the host. Worse, a successful lookup WINS
+# over GCP_VM: with a Brev host in GCP_VM but a stale GCP_INSTANCE still in
+# .env.gpu and live gcloud auth, every gpu-* target would silently retarget
+# the old GCP machine — and `sync` is `rsync --delete`.
 GCP_USER ?= ubuntu
-VM_IP = $(shell gcloud compute instances describe $(GCP_INSTANCE) --zone $(GCP_ZONE) $(if $(GCP_PROJECT),--project $(GCP_PROJECT)) --format='value(networkInterfaces[0].accessConfigs[0].natIP)' 2>/dev/null)
+VM_IP = $(if $(USE_GCP_IP),$(shell gcloud compute instances describe $(GCP_INSTANCE) --zone $(GCP_ZONE) $(if $(GCP_PROJECT),--project $(GCP_PROJECT)) --format='value(networkInterfaces[0].accessConfigs[0].natIP)' 2>/dev/null),)
 VM_HOST = $(if $(VM_IP),$(GCP_USER)@$(VM_IP),$(GCP_VM))
 unexport VM_IP VM_HOST
+
+# Every remote command sources ~/.pg_cuvs_env, the environment file that
+# infra/brev/bootstrap.sh wrote on the VM while it built (CONDA_PREFIX, PATH
+# with the PG bin dir, LD_LIBRARY_PATH, NVCC, PGHOST). It is the single source
+# of truth for the remote toolchain: encoding those paths here is what made the
+# GCP-era targets (~/miniforge3, no pg_config on PATH) fail on Brev, and PGXS
+# degrades SILENTLY when pg_config is missing, so the build "succeeds" without
+# ever compiling. Hence the hard gate — a missing file must stop the target,
+# not fall through to a wrong environment.
+REMOTE_ENV = { test -f ~/.pg_cuvs_env || { echo 'ERROR: ~/.pg_cuvs_env missing on the VM — run infra/brev/bootstrap.sh first' >&2; exit 1; }; . ~/.pg_cuvs_env; }
 
 .PHONY: vm-start vm-stop sync gpu-build gpu-test gpu-bench gpu-bench-1m gpu-shell \
 	gpu-test-unit gpu-test-regress gpu-test-isolation gpu-test-daemon gpu-test-e2e \
@@ -295,22 +329,22 @@ sync:
 
 gpu-build:
 	ssh -tt $(VM_HOST) "cd ~/pg_cuvs && \
-		source ~/miniforge3/bin/activate $(CONDA_ENV) && \
+		$(REMOTE_ENV) && \
 		make 2>&1 | tee /tmp/pg_cuvs_build.log"
 
 gpu-install:
 	ssh -tt $(VM_HOST) "cd ~/pg_cuvs && \
-		source ~/miniforge3/bin/activate $(CONDA_ENV) && \
+		$(REMOTE_ENV) && \
 		sudo -E make install"
 
 gpu-test:
 	ssh -tt $(VM_HOST) "cd ~/pg_cuvs && \
-		source ~/miniforge3/bin/activate $(CONDA_ENV) && \
+		$(REMOTE_ENV) && \
 		make installcheck"
 
 gpu-server:
 	ssh -tt $(VM_HOST) "cd ~/pg_cuvs && \
-		source ~/miniforge3/bin/activate $(CONDA_ENV) && \
+		$(REMOTE_ENV) && \
 		make server && sudo make install-server"
 
 # Idempotent post-install: home traversal perms, libstdc++ symlinks,
@@ -318,13 +352,13 @@ gpu-server:
 # The script is piped over stdin (bash -s) rather than inlined to avoid
 # fragile nested quoting; plain ssh (no -tt) since it needs no remote TTY.
 gpu-postinstall:
-	CONDA_ENV=$(CONDA_ENV) ssh $(VM_HOST) "CONDA_ENV=$(CONDA_ENV) bash -s" \
+	CONDA_ENV=$(CONDA_ENV) ssh $(VM_HOST) "$(REMOTE_ENV) && CONDA_ENV=$(CONDA_ENV) bash -s" \
 		< infra/scripts/setup/postinstall.sh
 
 # End-to-end durability smoke: build index, restart daemon, verify reload.
 # Piped over stdin (bash -s); plain ssh, no remote TTY needed.
 gpu-e2e:
-	ssh $(VM_HOST) "bash -s" < infra/scripts/tests/e2e-smoke.sh
+	ssh $(VM_HOST) "$(REMOTE_ENV) && bash -s" < infra/scripts/tests/e2e-smoke.sh
 
 # ---- Integration test suite (Phase 1.5 #3) -----------------------------
 # Layered test targets. Unit tests run locally (no toolchain needed);
@@ -334,7 +368,7 @@ gpu-e2e:
 # for parity with the build toolchain; identical to local `make test-unit`.
 gpu-test-unit:
 	ssh -tt $(VM_HOST) "cd ~/pg_cuvs && \
-		source ~/miniforge3/bin/activate $(CONDA_ENV) && \
+		$(REMOTE_ENV) && \
 		make test-unit"
 
 # PG regression suite (smoke + cpu_fallback). Requires a daemon up for the
@@ -342,14 +376,14 @@ gpu-test-unit:
 # active and cuvs.index_dir set to its --index-dir.
 gpu-test-regress:
 	ssh -tt $(VM_HOST) "cd ~/pg_cuvs && \
-		source ~/miniforge3/bin/activate $(CONDA_ENV) && \
+		$(REMOTE_ENV) && \
 		make installcheck"
 
 # Isolation suite (snapshot-aware tombstone, write/query interleaving). Same
 # daemon + GPU prerequisites as gpu-test-regress; runs only the isolation specs.
 gpu-test-isolation:
 	ssh -tt $(VM_HOST) "cd ~/pg_cuvs && \
-		source ~/miniforge3/bin/activate $(CONDA_ENV) && \
+		$(REMOTE_ENV) && \
 		make installcheck-isolation"
 
 # Fault-injection daemon integration tests. Builds the CUVS_TEST_HOOKS
@@ -357,7 +391,7 @@ gpu-test-isolation:
 # TEST socket + index dir, then restores the production daemon. Piped over
 # stdin (bash -s); CONDA_ENV is forwarded so the script can compile.
 gpu-test-daemon:
-	ssh $(VM_HOST) "source ~/miniforge3/bin/activate $(CONDA_ENV) && \
+	ssh $(VM_HOST) "$(REMOTE_ENV) && \
 		CONDA_ENV=$(CONDA_ENV) bash -s" \
 		< infra/scripts/tests/integration-test.sh
 
@@ -366,7 +400,7 @@ gpu-test-daemon:
 # and a service account with storage.buckets.create. Piped over stdin (bash -s);
 # /snap/bin is added to PATH so gcloud resolves in the non-login ssh shell.
 gpu-test-objstore:
-	ssh $(VM_HOST) "source ~/miniforge3/bin/activate $(CONDA_ENV) && \
+	ssh $(VM_HOST) "$(REMOTE_ENV) && \
 		PATH=\$$PATH:/snap/bin bash -s" \
 		< infra/scripts/tests/objstore-roundtrip-e2e.sh
 
@@ -374,24 +408,24 @@ gpu-test-objstore:
 # budget (a fraction of total), not unlimited. Runs a dedicated daemon on a test
 # socket and asserts pg_stat_gpu_cache + the startup log. Piped over stdin.
 gpu-test-vram:
-	ssh $(VM_HOST) "source ~/miniforge3/bin/activate $(CONDA_ENV) && bash -s" \
+	ssh $(VM_HOST) "$(REMOTE_ENV) && bash -s" \
 		< infra/scripts/setup/vram-budget-default.sh
 
 # MAX_INDEXES soft-cap: more tenants than registry slots must work (build w/o
 # ERROR + queries auto-reload evicted indexes to GPU). Dedicated daemon with a
 # tiny --max-indexes; asserts evictions>0 and reloads>0. Piped over stdin.
 gpu-test-maxidx:
-	ssh $(VM_HOST) "source ~/miniforge3/bin/activate $(CONDA_ENV) && bash -s" \
+	ssh $(VM_HOST) "$(REMOTE_ENV) && bash -s" \
 		< infra/scripts/tests/max-indexes-scale.sh
 
 # End-to-end durability smoke (alias of gpu-e2e for naming symmetry).
 gpu-test-e2e:
-	ssh $(VM_HOST) "bash -s" < infra/scripts/tests/e2e-smoke.sh
+	ssh $(VM_HOST) "$(REMOTE_ENV) && bash -s" < infra/scripts/tests/e2e-smoke.sh
 
 # Phase 3A pending-delta durability + fail-closed across a daemon restart.
 # Piped over stdin (bash -s); plain ssh, no remote TTY needed.
 gpu-test-delta-restart:
-	ssh $(VM_HOST) "bash -s" < infra/scripts/tests/delta-restart-e2e.sh
+	ssh $(VM_HOST) "$(REMOTE_ENV) && bash -s" < infra/scripts/tests/delta-restart-e2e.sh
 
 # Full ladder: unit -> regress -> isolation -> daemon faults -> e2e durability.
 gpu-test-all: gpu-test-unit gpu-test-regress gpu-test-isolation gpu-test-daemon \
@@ -408,7 +442,7 @@ gpu-server-start:
 gpu-bench:
 	@mkdir -p design
 	ssh $(VM_HOST) "cd ~/pg_cuvs && \
-		source ~/miniforge3/bin/activate $(CONDA_ENV) && \
+		$(REMOTE_ENV) && \
 		make benchmark $(if $(N),N=$(N)) $(if $(DIM),DIM=$(DIM)) $(if $(K),K=$(K)) $(if $(M),M=$(M)) 2>&1" \
 		| tee design/bench_$(shell date +%Y%m%d_%H%M).log
 
@@ -420,7 +454,7 @@ gpu-bench-1m:
 gpu-cohere:
 	@echo "[gpu-cohere] Launching Cohere 1M benchmark (nohup, async)"
 	ssh $(VM_HOST) "cd ~/pg_cuvs && \
-		source ~/miniforge3/bin/activate $(CONDA_ENV) && \
+		$(REMOTE_ENV) && \
 		nohup bash bench/legacy/run_cohere.sh \
 			--n $(if $(N),$(N),1000000) \
 			--gpu $(if $(GPU),$(GPU),0) \
@@ -454,7 +488,7 @@ vm-ip:
 # Phase 3K integration checks. Usage: make gpu-sql < query.sql  (or via heredoc)
 gpu-sql:
 	ssh -o StrictHostKeyChecking=accept-new $(VM_HOST) \
-		"source ~/miniforge3/bin/activate $(CONDA_ENV) && \
+		"$(REMOTE_ENV) && \
 		psql -d $(if $(DB),$(DB),postgres) -P pager=off -A -F '|'"
 .PHONY: gpu-sql
 
@@ -475,10 +509,16 @@ gpu-anbench-5m:
 	$(MAKE) gpu-anbench N=5000000
 
 # Aggregate results into summary.csv/txt + Pareto plots, then pull back locally.
+# aggregate.py needs a python; the env file activates the C/C++ build env, which
+# has none, so the interpreter comes from the sibling bench env (bootstrap.sh's
+# cuvs_bench) resolved off CONDA_PREFIX. matplotlib stays best-effort — plots are
+# optional in aggregate.py and the /opt prefix is root-owned.
 gpu-anbench-agg:
 	@mkdir -p design/anbench
-	ssh $(VM_HOST) "cd ~/pg_cuvs && source ~/miniforge3/bin/activate cuvs_py && \
-		pip install -q matplotlib 2>/dev/null; python bench/legacy/anbench/aggregate.py"
+	ssh $(VM_HOST) "cd ~/pg_cuvs && $(REMOTE_ENV) && \
+		PY=\$$(dirname \$$CONDA_PREFIX)/cuvs_bench/bin/python && \
+		\$$PY -m pip install -q matplotlib 2>/dev/null; \
+		\$$PY bench/legacy/anbench/aggregate.py"
 	rsync -avz $(VM_HOST):~/pg_cuvs/design/anbench/ design/anbench/
 
 # Convenience: full cycle on the VM (sync → build → install → test).

@@ -41,6 +41,7 @@
 #include "storage/bufmgr.h"
 #include "storage/itemptr.h"
 #include "storage/smgr.h"
+#include "catalog/storage.h"       /* RelationTruncate */
 #include "utils/rel.h"
 #include "utils/relcache.h"
 #include "utils/builtins.h"
@@ -300,6 +301,48 @@ free_elem_descs(ElemDesc *elems, size_t n, size_t maxM0)
 }
 
 /* ----------------------------------------------------------------
+ * Raw (non-palloc) resources held by the fill_hnsw_from_* bodies.
+ *
+ * Every PG throw site inside those bodies — write_elem_page's PageAddItem
+ * checks, index_open, RelationTruncate, ReadBuffer, ... — longjmps past
+ * plain malloc/fopen cleanup.  The bodies therefore register each buffer
+ * here as soon as they own it and never free on the error path; the
+ * PG_TRY/PG_FINALLY wrappers below run hnsw_fill_res_free() on both the
+ * success and the error path.
+ * ---------------------------------------------------------------- */
+typedef struct HnswFillRes
+{
+    FILE     *hf;           /* .hnsw sidecar */
+    uint64_t *tids;         /* .tids payload / IPC tids */
+    char     *lv0_block;    /* hnswlib level-0 block */
+    char     *llbuf;        /* hnswlib per-element upper-link block */
+    ElemDesc *elems;
+    size_t    n_elems;      /* elems entries to release (calloc'd, so NULL-safe) */
+    size_t    elems_maxM0;
+    uint32_t *adj;          /* IPC CAGRA adjacency */
+    float    *vecs;         /* IPC corpus vectors */
+    int      *cand_buf;     /* heuristic candidate scratch */
+} HnswFillRes;
+
+static void
+hnsw_fill_res_free(HnswFillRes *r)
+{
+    if (r->hf)        { fclose(r->hf);      r->hf = NULL; }
+    if (r->tids)      { free(r->tids);      r->tids = NULL; }
+    if (r->lv0_block) { free(r->lv0_block); r->lv0_block = NULL; }
+    if (r->llbuf)     { free(r->llbuf);     r->llbuf = NULL; }
+    if (r->cand_buf)  { free(r->cand_buf);  r->cand_buf = NULL; }
+    if (r->adj)       { free(r->adj);       r->adj = NULL; }
+    if (r->vecs)      { free(r->vecs);      r->vecs = NULL; }
+    if (r->elems)
+    {
+        free_elem_descs(r->elems, r->n_elems, r->elems_maxM0);
+        free(r->elems);
+        r->elems = NULL;
+    }
+}
+
+/* ----------------------------------------------------------------
  * Write a single page for element i (elem + neigh tuples).
  *
  * We write one page per element pair.  Both tuples must fit; the
@@ -512,7 +555,8 @@ cuvs_warn_pgvector_version(void)
  * use_shm=true  → daemon runs from_cagra() → /dev/shm (no disk I/O)
  * use_shm=false → reads pre-built .hnsw sidecar from index_dir */
 static void
-fill_hnsw_from_hnswlib(Oid cagra_oid, Oid hnsw_oid, bool use_shm)
+fill_hnsw_from_hnswlib_impl(Oid cagra_oid, Oid hnsw_oid, bool use_shm,
+                            HnswFillRes *res)
 {
 
     /* ---- 0. pgvector compatibility check ---- */
@@ -660,6 +704,7 @@ fill_hnsw_from_hnswlib(Oid cagra_oid, Oid hnsw_oid, bool use_shm)
         ereport(ERROR,
                 (errmsg("pg_cuvs: cannot open .hnsw sidecar \"%s\": %m",
                         hnsw_path)));
+    res->hf = hf;
 
     HnswlibHeader hdr;
     memset(&hdr, 0, sizeof(hdr));
@@ -678,7 +723,6 @@ fill_hnsw_from_hnswlib(Oid cagra_oid, Oid hnsw_oid, bool use_shm)
         fread(&hdr.mult,               sizeof(double), 1, hf) != 1 ||
         fread(&hdr.efConstruction,     sizeof(size_t), 1, hf) != 1)
     {
-        fclose(hf);
         ereport(ERROR,
                 (errmsg("pg_cuvs: short read on .hnsw header \"%s\"",
                         hnsw_path)));
@@ -690,12 +734,10 @@ fill_hnsw_from_hnswlib(Oid cagra_oid, Oid hnsw_oid, bool use_shm)
 
     if (N == 0)
     {
-        fclose(hf);
         ereport(ERROR, (errmsg("pg_cuvs: .hnsw sidecar is empty (N=0)")));
     }
     if (M <= 0 || M0 <= 0)
     {
-        fclose(hf);
         ereport(ERROR, (errmsg("pg_cuvs: invalid M=%d M0=%d in .hnsw header",
                                M, M0)));
     }
@@ -704,7 +746,6 @@ fill_hnsw_from_hnswlib(Oid cagra_oid, Oid hnsw_oid, bool use_shm)
     FILE *tf = fopen(tids_path, "rb");
     if (!tf)
     {
-        fclose(hf);
         ereport(ERROR,
                 (errmsg("pg_cuvs: cannot open .tids sidecar \"%s\": %m",
                         tids_path)));
@@ -715,17 +756,15 @@ fill_hnsw_from_hnswlib(Oid cagra_oid, Oid hnsw_oid, bool use_shm)
     if (cuvs_tids_read(tf, &tids_hdr, &tids) != 0)
     {
         fclose(tf);
-        fclose(hf);
         ereport(ERROR,
                 (errmsg("pg_cuvs: failed to read/validate .tids sidecar \"%s\"",
                         tids_path)));
     }
     fclose(tf);
+    res->tids = tids;
 
     if ((size_t)tids_hdr.n_vecs < N)
     {
-        free(tids);
-        fclose(hf);
         ereport(ERROR,
                 (errmsg("pg_cuvs: .tids has %lld entries but .hnsw has %zu elements",
                         (long long)tids_hdr.n_vecs, N)));
@@ -769,8 +808,6 @@ fill_hnsw_from_hnswlib(Oid cagra_oid, Oid hnsw_oid, bool use_shm)
             static const char *mname[] = { "l2", "cosine", "ip" };
             const char *src_m = (tids_hdr.metric < 3) ? mname[tids_hdr.metric] : "unknown";
             const char *tgt_m = (tgt_metric < 3) ? mname[tgt_metric] : "unknown";
-            free(tids);
-            fclose(hf);
             ereport(ERROR,
                     (errmsg("pg_cuvs: metric mismatch: source CAGRA uses %s "
                             "but target HNSW opclass uses %s",
@@ -793,17 +830,13 @@ fill_hnsw_from_hnswlib(Oid cagra_oid, Oid hnsw_oid, bool use_shm)
     char  *lv0_block = (char *) malloc(lv0_block_bytes);
     if (!lv0_block)
     {
-        free(tids);
-        fclose(hf);
         ereport(ERROR, (errmsg("pg_cuvs: out of memory for level-0 block "
                                "(%zu bytes)", lv0_block_bytes)));
     }
+    res->lv0_block = lv0_block;
 
     if (fread(lv0_block, 1, lv0_block_bytes, hf) != lv0_block_bytes)
     {
-        free(lv0_block);
-        free(tids);
-        fclose(hf);
         ereport(ERROR,
                 (errmsg("pg_cuvs: short read on level-0 block in \"%s\"",
                         hnsw_path)));
@@ -813,11 +846,11 @@ fill_hnsw_from_hnswlib(Oid cagra_oid, Oid hnsw_oid, bool use_shm)
     ElemDesc *elems = (ElemDesc *) calloc(N, sizeof(ElemDesc));
     if (!elems)
     {
-        free(lv0_block);
-        free(tids);
-        fclose(hf);
         ereport(ERROR, (errmsg("pg_cuvs: out of memory for element descriptors")));
     }
+    res->elems       = elems;
+    res->n_elems     = N;
+    res->elems_maxM0 = (size_t)M0;
 
     for (size_t i = 0; i < N; i++)
     {
@@ -834,23 +867,24 @@ fill_hnsw_from_hnswlib(Oid cagra_oid, Oid hnsw_oid, bool use_shm)
         elems[i].lv0_links = (int *) malloc((size_t)M0 * sizeof(int));
         if (!elems[i].lv0_links)
         {
-            /* cleanup and error */
-            free_elem_descs(elems, i, (size_t)M0);
-            free(elems);
-            free(lv0_block);
-            free(tids);
-            fclose(hf);
             ereport(ERROR, (errmsg("pg_cuvs: out of memory for lv0 links")));
         }
         memcpy(elems[i].lv0_links, lv0ptr + sizeof(int),
                (size_t)M0 * sizeof(int));
 
-        /* label (item_id) at labelOffset — used to look up heap TID */
+        /* label (item_id) at labelOffset — used to look up heap TID.
+         * An out-of-range label has no heap TID; falling back to 0 would write
+         * an invalid ItemPointer (posid=0), and pgvector's heaptids loop stops
+         * at the first invalid entry — the element would silently return
+         * nothing and look deletable to vacuum.  Fail loudly instead. */
         size_t label;
         memcpy(&label, base + hdr.labelOffset, sizeof(size_t));
-        elems[i].tid_encoded = (label < (size_t)tids_hdr.n_vecs)
-                               ? tids[label]
-                               : (uint64_t)0;
+        if (label >= (size_t)tids_hdr.n_vecs)
+            ereport(ERROR,
+                    (errmsg("pg_cuvs: .hnsw element %zu has label %zu but "
+                            ".tids has only %lld entries",
+                            i, label, (long long)tids_hdr.n_vecs)));
+        elems[i].tid_encoded = tids[label];
 
         /* level and upper links come from the upper-level block; set defaults */
         elems[i].level        = 0;
@@ -859,6 +893,7 @@ fill_hnsw_from_hnswlib(Oid cagra_oid, Oid hnsw_oid, bool use_shm)
     }
 
     free(lv0_block);
+    res->lv0_block = NULL;
 
     /* ---- 7. Read upper-level link lists ---- */
     /*
@@ -876,10 +911,6 @@ fill_hnsw_from_hnswlib(Oid cagra_oid, Oid hnsw_oid, bool use_shm)
         uint32_t llsize = 0;
         if (fread(&llsize, sizeof(uint32_t), 1, hf) != 1)
         {
-            free_elem_descs(elems, N, (size_t)M0);
-            free(elems);
-            free(tids);
-            fclose(hf);
             ereport(ERROR,
                     (errmsg("pg_cuvs: short read on upper-level size for "
                             "element %zu in \"%s\"", i, hnsw_path)));
@@ -905,21 +936,13 @@ fill_hnsw_from_hnswlib(Oid cagra_oid, Oid hnsw_oid, bool use_shm)
         char *llbuf = (char *) malloc(llsize);
         if (!llbuf)
         {
-            free_elem_descs(elems, N, (size_t)M0);
-            free(elems);
-            free(tids);
-            fclose(hf);
             ereport(ERROR, (errmsg("pg_cuvs: out of memory for upper links "
                                    "element %zu", i)));
         }
+        res->llbuf = llbuf;
 
         if (fread(llbuf, 1, llsize, hf) != llsize)
         {
-            free(llbuf);
-            free_elem_descs(elems, N, (size_t)M0);
-            free(elems);
-            free(tids);
-            fclose(hf);
             ereport(ERROR,
                     (errmsg("pg_cuvs: short read on upper links for element "
                             "%zu in \"%s\"", i, hnsw_path)));
@@ -929,11 +952,6 @@ fill_hnsw_from_hnswlib(Oid cagra_oid, Oid hnsw_oid, bool use_shm)
         elems[i].upper_counts = (int *)  calloc((size_t)elem_level, sizeof(int));
         if (!elems[i].upper_links || !elems[i].upper_counts)
         {
-            free(llbuf);
-            free_elem_descs(elems, N, (size_t)M0);
-            free(elems);
-            free(tids);
-            fclose(hf);
             ereport(ERROR, (errmsg("pg_cuvs: out of memory for upper link arrays")));
         }
 
@@ -951,11 +969,6 @@ fill_hnsw_from_hnswlib(Oid cagra_oid, Oid hnsw_oid, bool use_shm)
             elems[i].upper_links[lv_idx]  = (int *) malloc((size_t)M * sizeof(int));
             if (!elems[i].upper_links[lv_idx])
             {
-                free(llbuf);
-                free_elem_descs(elems, N, (size_t)M0);
-                free(elems);
-                free(tids);
-                fclose(hf);
                 ereport(ERROR,
                         (errmsg("pg_cuvs: out of memory for upper links lv=%d", lv)));
             }
@@ -964,10 +977,13 @@ fill_hnsw_from_hnswlib(Oid cagra_oid, Oid hnsw_oid, bool use_shm)
         }
 
         free(llbuf);
+        res->llbuf = NULL;
     }
 
     fclose(hf);
+    res->hf = NULL;
     free(tids);
+    res->tids = NULL;
 
     /* ---- 8. Layout pass: assign (blkno, offno) to each element ---- */
     /*
@@ -1002,18 +1018,14 @@ fill_hnsw_from_hnswlib(Oid cagra_oid, Oid hnsw_oid, bool use_shm)
     hf = fopen(hnsw_path, "rb");
     if (!hf)
     {
-        free_elem_descs(elems, N, (size_t)M0);
-        free(elems);
         ereport(ERROR,
                 (errmsg("pg_cuvs: cannot re-open .hnsw \"%s\": %m", hnsw_path)));
     }
+    res->hf = hf;
 
     /* Seek to level-0 block, then to the offsetData of element 0 */
     if (fseek(hf, (long)hdr.offsetLevel0, SEEK_SET) != 0)
     {
-        fclose(hf);
-        free_elem_descs(elems, N, (size_t)M0);
-        free(elems);
         ereport(ERROR,
                 (errmsg("pg_cuvs: fseek failed on re-opened \"%s\"", hnsw_path)));
     }
@@ -1036,18 +1048,17 @@ fill_hnsw_from_hnswlib(Oid cagra_oid, Oid hnsw_oid, bool use_shm)
 
     /*
      * Truncate the relation to 0 blocks so we can write fresh pages.
-     * We use smgrtruncate directly since RelationTruncate is not
-     * exposed to extensions.
+     * RelationTruncate (catalog/storage.h) rather than a bare smgrtruncate:
+     * it emits XLOG_SMGR_TRUNCATE, without which a standby keeps the old
+     * file length and retains ghost element pages past the new end.
+     * It skips the WAL record itself when !RelationNeedsWAL, so the UNLOGGED
+     * target needs no separate branch here.
      */
     {
         SMgrRelation smgr = RelationGetSmgr(hnsw_rel);
         BlockNumber  cur  = smgrnblocks(smgr, MAIN_FORKNUM);
         if (cur > 0)
-        {
-            ForkNumber  forks[1]  = { MAIN_FORKNUM };
-            BlockNumber blocks[1] = { 0 };
-            smgrtruncate(smgr, forks, 1, blocks);
-        }
+            RelationTruncate(hnsw_rel, 0);
         /* Invalidate the buffer manager's knowledge of this relation's size. */
         RelationSetTargetBlock(hnsw_rel, InvalidBlockNumber);
     }
@@ -1124,11 +1135,6 @@ fill_hnsw_from_hnswlib(Oid cagra_oid, Oid hnsw_oid, bool use_shm)
                          + (long)hdr.offsetData;
         if (fseek(hf, elem_offset, SEEK_SET) != 0)
         {
-            fclose(hf);
-            pfree(vec_buf);
-            free_elem_descs(elems, N, (size_t)M0);
-            free(elems);
-            index_close(hnsw_rel, AccessExclusiveLock);
             ereport(ERROR,
                     (errmsg("pg_cuvs: fseek to vector for element %zu failed",
                             i)));
@@ -1136,11 +1142,6 @@ fill_hnsw_from_hnswlib(Oid cagra_oid, Oid hnsw_oid, bool use_shm)
 
         if (fread(vec_buf, sizeof(float), (size_t)dim, hf) != (size_t)dim)
         {
-            fclose(hf);
-            pfree(vec_buf);
-            free_elem_descs(elems, N, (size_t)M0);
-            free(elems);
-            index_close(hnsw_rel, AccessExclusiveLock);
             ereport(ERROR,
                     (errmsg("pg_cuvs: short read on vector for element %zu", i)));
         }
@@ -1154,10 +1155,8 @@ fill_hnsw_from_hnswlib(Oid cagra_oid, Oid hnsw_oid, bool use_shm)
                         hnsw_unlogged);
     }
 
-    fclose(hf);
     pfree(vec_buf);
-    free_elem_descs(elems, N, (size_t)M0);
-    free(elems);
+    /* hf / elems are released by the PG_FINALLY in fill_hnsw_from_hnswlib(). */
 
     index_close(hnsw_rel, AccessExclusiveLock);
 
@@ -1169,6 +1168,23 @@ fill_hnsw_from_hnswlib(Oid cagra_oid, Oid hnsw_oid, bool use_shm)
     /* Clean up /dev/shm file after successful import */
     if (use_shm)
         unlink(hnsw_path);
+}
+
+static void
+fill_hnsw_from_hnswlib(Oid cagra_oid, Oid hnsw_oid, bool use_shm)
+{
+    HnswFillRes res;
+
+    memset(&res, 0, sizeof(res));
+    PG_TRY();
+    {
+        fill_hnsw_from_hnswlib_impl(cagra_oid, hnsw_oid, use_shm, &res);
+    }
+    PG_FINALLY();
+    {
+        hnsw_fill_res_free(&res);
+    }
+    PG_END_TRY();
 }
 
 /* ================================================================
@@ -1268,7 +1284,8 @@ cagra_assign_level(int M, unsigned int *seed)
  * mode='nsw'  → flat NSW (no hierarchy, level 0 only)
  * mode='hnsw' → hierarchical with heuristic neighbor selection */
 static void
-fill_hnsw_from_cagra_ipc(Oid cagra_oid, Oid hnsw_oid, const char *mode)
+fill_hnsw_from_cagra_ipc_impl(Oid cagra_oid, Oid hnsw_oid, const char *mode,
+                              HnswFillRes *res)
 {
     bool do_hierarchy = (strcmp(mode, "hnsw") == 0);
 
@@ -1400,6 +1417,9 @@ fill_hnsw_from_cagra_ipc(Oid cagra_oid, Oid hnsw_oid, const char *mode)
                 (errmsg("pg_cuvs: IPC export_adjacency failed (status=%d); "
                         "ensure index %u is loaded in daemon", rc, cagra_oid)));
     }
+    res->adj  = adj;
+    res->vecs = vecs;
+    res->tids = tids;
 
     /* Metric mismatch check */
     if (src_metric != tgt_metric)
@@ -1407,7 +1427,6 @@ fill_hnsw_from_cagra_ipc(Oid cagra_oid, Oid hnsw_oid, const char *mode)
         static const char *mname[] = {"l2", "cosine", "ip"};
         const char *sm = (src_metric < 3) ? mname[src_metric] : "unknown";
         const char *tm = (tgt_metric < 3) ? mname[tgt_metric] : "unknown";
-        free(adj); free(vecs); free(tids);
         ereport(ERROR,
                 (errmsg("pg_cuvs: metric mismatch: source CAGRA uses %s but "
                         "target HNSW uses %s", sm, tm)));
@@ -1424,9 +1443,11 @@ fill_hnsw_from_cagra_ipc(Oid cagra_oid, Oid hnsw_oid, const char *mode)
     ElemDesc *elems = (ElemDesc *)calloc(N, sizeof(ElemDesc));
     if (!elems)
     {
-        free(adj); free(vecs); free(tids);
         ereport(ERROR, (errmsg("pg_cuvs: out of memory for element descriptors")));
     }
+    res->elems       = elems;
+    res->n_elems     = N;
+    res->elems_maxM0 = (size_t)M0;
 
     int    max_level  = 0;
     size_t entry_elem = 0;
@@ -1461,8 +1482,6 @@ fill_hnsw_from_cagra_ipc(Oid cagra_oid, Oid hnsw_oid, const char *mode)
             elems[i].lv0_links = (int *)malloc((size_t)cnt0 * sizeof(int));
             if (!elems[i].lv0_links)
             {
-                free_elem_descs(elems, i, (size_t)M0);
-                free(elems); free(adj); free(vecs); free(tids);
                 ereport(ERROR, (errmsg("pg_cuvs: out of memory for lv0_links")));
             }
             for (int j = 0; j < cnt0; j++)
@@ -1477,47 +1496,71 @@ fill_hnsw_from_cagra_ipc(Oid cagra_oid, Oid hnsw_oid, const char *mode)
             elems[i].upper_counts = (int  *)calloc((size_t)lv, sizeof(int));
             if (!elems[i].upper_links || !elems[i].upper_counts)
             {
-                free_elem_descs(elems, i + 1, (size_t)M0);
-                free(elems); free(adj); free(vecs); free(tids);
                 ereport(ERROR, (errmsg("pg_cuvs: out of memory for upper_links")));
             }
             /* Convert CAGRA uint32_t adjacency to int candidates for heuristic */
             int *cand_buf = (int *)malloc((size_t)graph_degree * sizeof(int));
+            int  n_cand   = 0;
             if (!cand_buf)
             {
-                free_elem_descs(elems, i + 1, (size_t)M0);
-                free(elems); free(adj); free(vecs); free(tids);
                 ereport(ERROR, (errmsg("pg_cuvs: out of memory for heuristic candidates")));
             }
+            res->cand_buf = cand_buf;
             for (int j = 0; j < graph_degree; j++)
-                cand_buf[j] = (int)row[j];
+            {
+                uint32_t c = row[j];
+                if ((size_t)c < N)
+                    cand_buf[n_cand++] = (int)c;
+            }
 
             for (int l = 1; l <= lv; l++)
             {
+                int keep = 0;
+
                 elems[i].upper_links[l - 1]  = (int *)malloc((size_t)M * sizeof(int));
                 if (!elems[i].upper_links[l - 1])
                 {
-                    free(cand_buf);
-                    free_elem_descs(elems, i + 1, (size_t)M0);
-                    free(elems); free(adj); free(vecs); free(tids);
                     ereport(ERROR, (errmsg("pg_cuvs: out of memory for upper_links[%d]", l)));
                 }
+                /*
+                 * pgvector requires that an element linked at level lc has
+                 * level >= lc: HnswGetNeighborArray computes
+                 * start = (level - lc) * m and would read before the neighbor
+                 * array for a level-0 element parked in a level-3 list.
+                 * Levels here come from cagra_assign_level (geometric), so most
+                 * candidates are level 0 and must be dropped.
+                 *
+                 * The filter is monotone in l, so compacting cand_buf in place
+                 * carries over to the next iteration: level l+1 sees a strict
+                 * subset of level l's candidates.  That is also what gives each
+                 * level a distinct neighbor list — heuristic_select_neighbors is
+                 * deterministic, so an unchanged candidate set would hand every
+                 * upper level the exact same links.
+                 */
+                for (int j = 0; j < n_cand; j++)
+                    if (elems[cand_buf[j]].level >= l)
+                        cand_buf[keep++] = cand_buf[j];
+                n_cand = keep;
+
                 /* Heuristic neighbor selection: diverse coverage of directions */
                 int n_sel = heuristic_select_neighbors(
                     vecs + (size_t)i * ipc_dim,
                     vecs,
                     ipc_dim,
                     cand_buf,
-                    graph_degree,
+                    n_cand,
                     M,
                     elems[i].upper_links[l - 1]);
                 elems[i].upper_counts[l - 1] = n_sel;
             }
             free(cand_buf);
+            res->cand_buf = NULL;
         }
     }
     free(adj);
+    res->adj = NULL;
     free(tids);
+    res->tids = NULL;
 
     /* ---- 4. Layout pass ---- */
     for (size_t i = 0; i < N; i++)
@@ -1536,8 +1579,6 @@ fill_hnsw_from_cagra_ipc(Oid cagra_oid, Oid hnsw_oid, const char *mode)
         size_t needed = esize + 2 * PGV_ITEM_OVERHEAD + nsize + 2 * PGV_ITEM_OVERHEAD;
         if (needed > (size_t)PGV_USABLE_BYTES)
         {
-            free_elem_descs(elems, N, (size_t)M0);
-            free(elems); free(vecs);
             ereport(ERROR,
                     (errmsg("pg_cuvs: element+neighbor too large for one page "
                             "(dim=%d M=%d max_level=%d needed=%zu avail=%d)",
@@ -1548,14 +1589,12 @@ fill_hnsw_from_cagra_ipc(Oid cagra_oid, Oid hnsw_oid, const char *mode)
     /* ---- 5. Open target HNSW with AccessExclusiveLock and truncate ---- */
     Relation hnsw_rel = index_open(hnsw_oid, AccessExclusiveLock);
     {
+        /* RelationTruncate, not a bare smgrtruncate — see the matching comment
+         * in fill_hnsw_from_hnswlib_impl for why the WAL record matters. */
         SMgrRelation smgr = RelationGetSmgr(hnsw_rel);
         BlockNumber  cur  = smgrnblocks(smgr, MAIN_FORKNUM);
         if (cur > 0)
-        {
-            ForkNumber  forks[1]  = { MAIN_FORKNUM };
-            BlockNumber blocks[1] = { 0 };
-            smgrtruncate(smgr, forks, 1, blocks);
-        }
+            RelationTruncate(hnsw_rel, 0);
         RelationSetTargetBlock(hnsw_rel, InvalidBlockNumber);
     }
 
@@ -1618,9 +1657,7 @@ fill_hnsw_from_cagra_ipc(Oid cagra_oid, Oid hnsw_oid, const char *mode)
                         hnsw_unlogged);
     }
 
-    free(vecs);
-    free_elem_descs(elems, N, (size_t)M0);
-    free(elems);
+    /* vecs / elems are released by the PG_FINALLY in fill_hnsw_from_cagra_ipc(). */
 
     index_close(hnsw_rel, AccessExclusiveLock);
 
@@ -1630,6 +1667,23 @@ fill_hnsw_from_cagra_ipc(Oid cagra_oid, Oid hnsw_oid, const char *mode)
                     "from cagra index %u into hnsw index %u",
                     N, ipc_dim, M, graph_degree, max_level, mode,
                     cagra_oid, hnsw_oid)));
+}
+
+static void
+fill_hnsw_from_cagra_ipc(Oid cagra_oid, Oid hnsw_oid, const char *mode)
+{
+    HnswFillRes res;
+
+    memset(&res, 0, sizeof(res));
+    PG_TRY();
+    {
+        fill_hnsw_from_cagra_ipc_impl(cagra_oid, hnsw_oid, mode, &res);
+    }
+    PG_FINALLY();
+    {
+        hnsw_fill_res_free(&res);
+    }
+    PG_END_TRY();
 }
 
 /* ================================================================

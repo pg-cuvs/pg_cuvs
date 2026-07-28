@@ -10,10 +10,10 @@
 --     the suite uses /tmp/cuvs_indexes (outside PGDATA), so no warning.
 --   - pgvector version guard: WARNs only when pgvector is outside 0.5.x–0.8.x.
 \set ON_ERROR_STOP on
+SET client_min_messages = warning;
 CREATE EXTENSION IF NOT EXISTS vector;
-NOTICE:  extension "vector" already exists, skipping
 CREATE EXTENSION IF NOT EXISTS pg_cuvs;
-NOTICE:  extension "pg_cuvs" already exists, skipping
+RESET client_min_messages;
 SET cuvs.index_dir = '/tmp/cuvs_indexes';
 -- 1. High-dim, default (EXTERNAL) storage → expect TOAST NOTICE at build.
 CREATE TABLE rh_ext (id bigint, embedding vector(2000));
