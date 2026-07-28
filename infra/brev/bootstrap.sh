@@ -115,15 +115,34 @@ echo "=== [3/5] clone + build (.so + daemon) ================================="
 [ -d "$REPO/.git" ] || git clone https://github.com/pg-cuvs/pg_cuvs.git "$REPO"
 cd "$REPO"
 git pull --ff-only || true
+# The build environment is written to a file FIRST and then sourced, so the
+# environment this script exports is by construction the exact one it built with.
+# The Makefile's gpu-* targets source the same file over ssh; without it they
+# fall back to GCP-era guesses (~/miniforge3, no PG bin on PATH) and all fail.
+#   NVCC: without `conda activate`, conda's nvcc can't find its own cc1plus
+#     (activation sets GCC_EXEC_PREFIX). Pointing it at the system g++ sidesteps
+#     that; the Makefile's `NVCC ?= nvcc` makes the override clean.
+#   PGHOST: conda's libpq defaults to a socket dir the Debian server doesn't use.
+#   \$PATH is left unexpanded on purpose — the sourcing shell keeps its own PATH.
+ENV_FILE="$USER_HOME/.pg_cuvs_env"
+cat > "$ENV_FILE" <<EOF
 export CONDA_PREFIX="$DEV"
-export PATH="$DEV/bin:/usr/lib/postgresql/16/bin:$PATH"
+export PATH="$DEV/bin:/usr/lib/postgresql/16/bin:\$PATH"
 export LD_LIBRARY_PATH="$DEV/lib"
-# nvcc -ccbin /usr/bin/g++: without `conda activate`, conda's nvcc can't find its
-# own cc1plus (activation sets GCC_EXEC_PREFIX). Pointing it at the system g++
-# sidesteps that; the Makefile's `NVCC ?= nvcc` makes the override clean.
-make NVCC="nvcc -ccbin /usr/bin/g++"
+export NVCC="nvcc -ccbin /usr/bin/g++"
+export PGHOST=/var/run/postgresql
+EOF
+# Hard gate: a truncated or unparseable env file would make every remote build
+# fail far from here, with an error that points at the Makefile instead.
+test -f "$ENV_FILE" \
+  || { echo "FATAL: $ENV_FILE was not created" >&2; exit 1; }
+sh -n "$ENV_FILE" \
+  || { echo "FATAL: $ENV_FILE is not valid POSIX sh" >&2; exit 1; }
+# shellcheck source=/dev/null
+. "$ENV_FILE"
+make
 sudo -E env PATH="$PATH" CONDA_PREFIX="$CONDA_PREFIX" make install
-make NVCC="nvcc -ccbin /usr/bin/g++" server
+make server
 sudo -E env PATH="$PATH" CONDA_PREFIX="$CONDA_PREFIX" make install-server
 # Gate on the artifacts, not on make's exit code: when pg_config is missing PGXS
 # silently degrades and `make install` has been observed writing the daemon to /
@@ -177,6 +196,7 @@ fi
 echo "=== BOOTSTRAP DONE ==="
 echo "  build/bench env : $DEV | $BENCH"
 echo "  daemon socket   : /tmp/.s.pg_cuvs   (index dir $IDX)"
+echo "  build env file  : $ENV_FILE  (\`. $ENV_FILE\` — what this build used; make gpu-* sources it)"
 echo "  dataset         : $D/{corpus.fbin,queries_10k.fbin,gt_1000000.npy}"
 echo "  bench:  export PGHOST=/var/run/postgresql PATH=$BENCH/bin:/usr/lib/postgresql/16/bin:\$PATH LD_LIBRARY_PATH=$DEV/lib"
 echo "          python bench/adr079_3o_recall.py --data-dir $D --n 1000000 --queries 100 --k 10 \\"
