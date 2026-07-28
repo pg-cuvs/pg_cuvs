@@ -20,6 +20,9 @@
 - [2026-07-28] **CI 캐시 전무** — `.github/workflows/*.yml`에 `actions/cache` 0건 — PGDG repo 추가 + PG16 설치가 2개 job에서 매 push마다 cold. ccache 도입이 가장 효과 큼(단 ASAN/non-ASAN 캐시 키 분리 필요).
 - [2026-07-28] **정의됐으나 테스트가 건드리지 않는 GUC 18/36개** — `auto_compact*`, `max_stale_fraction` 등 — 테스트가 참조하는 `cuvs.*`를 `src/*.c`의 `DefineCustom*` 정의와 대조. 축소가 아니라 **추가** 대상(커버리지 공백).
 
+- [2026-07-28] **Makefile 재귀 확장 `=` + `$(shell)` = 참조 횟수만큼 프로세스 fork** — `Makefile:280` `VM_IP` — `make -n <타깃>`(아무것도 실행 안 함) 시간을 참조 0회/1회/6회 타깃끼리 비교하면 선형 증가로 즉시 드러난다. 실측 `gpu-test-all` 6.69s vs 로컬 타깃 0.24s. **더 중요한 건 정확성** — 조회 결과가 사용자 지정 호스트보다 우선하면 프로바이더 이전 후 옛 머신을 조용히 향한다(`sync`는 `rsync --delete`).
+- [2026-07-28] **프로바이더 이전이 문서에만 반영되고 빌드 시스템에 미반영** — `infra/README.md`는 "Brev is the main provider now"인데 Makefile에 brev 문자열이 0건 — 이전 시 `grep -c <새프로바이더> Makefile`로 확인. 문서/스킬만 갱신하고 Makefile을 두면 런타임 오작동 경로가 남는다.
+
 ## 오탐 기록 (수정하면 안 되는 것)
 
 의도된 패턴인데 버그처럼 보이는 것들. 재발 방지용.
