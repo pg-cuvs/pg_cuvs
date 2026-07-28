@@ -13,8 +13,10 @@
 -- captured in the expected output while the script continues. Requires a
 -- running pg_cuvs_server and a daemon-writable cuvs.index_dir.
 
+SET client_min_messages = warning;
 CREATE EXTENSION IF NOT EXISTS vector;
 CREATE EXTENSION IF NOT EXISTS pg_cuvs;
+RESET client_min_messages;
 SET cuvs.index_dir = '/tmp/cuvs_indexes';
 
 -- ============================================================================
@@ -360,4 +362,3 @@ RESET enable_seqscan;
 -- ============================================================================
 DROP TABLE ec, ec_big, ec_empty, ec_one, ec_d1, ec_d2000, ec_dup, ec_null,
            ec_cos, ec_ip;
-DROP EXTENSION pg_cuvs;

@@ -16,8 +16,10 @@
 
 \set ON_ERROR_STOP on
 
+SET client_min_messages = warning;
 CREATE EXTENSION IF NOT EXISTS vector;
 CREATE EXTENSION IF NOT EXISTS pg_cuvs;
+RESET client_min_messages;
 
 -- NOTE: there is intentionally NO `SET cuvs.index_dir` anywhere in this file.
 -- That absence is the whole point of the regression.
@@ -48,4 +50,3 @@ RESET enable_seqscan;
 
 -- Cleanup.
 DROP TABLE rd CASCADE;
-DROP EXTENSION pg_cuvs CASCADE;

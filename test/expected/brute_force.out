@@ -18,9 +18,10 @@
 --
 -- REQUIRES: pg_cuvs_server running with a GPU; cuvs.index_dir writable.
 \set ON_ERROR_STOP on
+SET client_min_messages = warning;
 CREATE EXTENSION IF NOT EXISTS vector;
-NOTICE:  extension "vector" already exists, skipping
 CREATE EXTENSION IF NOT EXISTS pg_cuvs;
+RESET client_min_messages;
 SET cuvs.index_dir = '/tmp/cuvs_indexes';
 -- Deterministic 200-vector, 8-dim corpus. Mixed linear/periodic terms keep the
 -- per-query distances distinct (no exact ties) while staying reproducible.
@@ -179,4 +180,3 @@ SELECT (SELECT array_agg(d ORDER BY d) FROM gt_sh)
 
 -- Cleanup.
 DROP TABLE bf_test CASCADE;
-DROP EXTENSION pg_cuvs CASCADE;

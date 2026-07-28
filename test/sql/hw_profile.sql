@@ -8,7 +8,9 @@
 -- REQUIRES: pg_cuvs_server running (writes the profile at boot); cuvs.index_dir =
 -- the daemon's --index-dir so the backend reads the same sidecar.
 \set ON_ERROR_STOP on
+SET client_min_messages = warning;
 CREATE EXTENSION IF NOT EXISTS pg_cuvs;
+RESET client_min_messages;
 SET cuvs.index_dir = '/tmp/cuvs_indexes';
 
 SELECT source = 'measured'            AS profile_present,

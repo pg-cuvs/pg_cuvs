@@ -11,8 +11,10 @@
 
 \set ON_ERROR_STOP on
 
+SET client_min_messages = warning;
 CREATE EXTENSION IF NOT EXISTS vector;
 CREATE EXTENSION IF NOT EXISTS pg_cuvs;
+RESET client_min_messages;
 SET cuvs.index_dir = '/tmp/cuvs_indexes';
 
 -- 16 unit-normalized vectors in 4d.  Query ≈ [0.707, 0.707, 0, 0]:
@@ -78,4 +80,3 @@ RESET enable_cuvs; RESET enable_seqscan;
 
 -- Cleanup.
 DROP TABLE met_test CASCADE;
-DROP EXTENSION pg_cuvs CASCADE;

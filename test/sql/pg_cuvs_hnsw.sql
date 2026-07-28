@@ -14,8 +14,10 @@
 
 \set ON_ERROR_STOP on
 
+SET client_min_messages = warning;
 CREATE EXTENSION IF NOT EXISTS vector;
 CREATE EXTENSION IF NOT EXISTS pg_cuvs;
+RESET client_min_messages;
 
 -- AM + opclasses present (from the 0.1.0->0.2.0 migration).
 SELECT amname FROM pg_am WHERE amname = 'pg_cuvs_hnsw';
@@ -143,4 +145,3 @@ DROP INDEX ph_hnsw_cos;
 
 -- Cleanup.
 DROP TABLE ph_test CASCADE;
-DROP EXTENSION pg_cuvs CASCADE;

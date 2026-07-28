@@ -6,8 +6,10 @@
 -- bgworker는 extend_count/n_vecs 임계값을 보고 REINDEX를 트리거하며,
 -- REINDEX 후 새 OID에서 extend_count=0/compact_count=0을 별도로 검증한다.
 
+SET client_min_messages = warning;
 CREATE EXTENSION IF NOT EXISTS vector;
 CREATE EXTENSION IF NOT EXISTS pg_cuvs;
+RESET client_min_messages;
 SET cuvs.index_dir = '/tmp/cuvs_indexes';
 
 -- ----------------------------------------------------------------

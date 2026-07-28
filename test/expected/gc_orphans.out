@@ -12,9 +12,10 @@
 -- path. That is verified manually on the GPU VM; see docs/spec-audit / ops-gpu-playbook
 -- and the manual procedure in decisions.md ADR-046.
 \set ON_ERROR_STOP on
+SET client_min_messages = warning;
 CREATE EXTENSION IF NOT EXISTS vector;
-NOTICE:  extension "vector" already exists, skipping
 CREATE EXTENSION IF NOT EXISTS pg_cuvs;
+RESET client_min_messages;
 SET cuvs.index_dir = '/tmp/cuvs_indexes';
 -- 1. Callable + well-formed result set.
 SELECT count(*) >= 0 AS gc_callable FROM pg_cuvs_gc_orphans();

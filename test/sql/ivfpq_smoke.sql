@@ -60,4 +60,3 @@ WHERE index_name = 'ivfpq_idx';
 
 -- Cleanup
 DROP TABLE ivfpq_items;
-DROP EXTENSION pg_cuvs;

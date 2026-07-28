@@ -23,8 +23,10 @@
 -- NO \set ON_ERROR_STOP (parity with edge_cases): the cap-overflow path may emit
 -- a WARNING/HINT that must be captured while the script continues.
 
+SET client_min_messages = warning;
 CREATE EXTENSION IF NOT EXISTS vector;
 CREATE EXTENSION IF NOT EXISTS pg_cuvs;
+RESET client_min_messages;
 SET cuvs.index_dir = '/tmp/cuvs_indexes';
 
 -- ============================================================================
@@ -113,4 +115,3 @@ RESET cuvs.max_delta_rows;
 -- Cleanup
 -- ============================================================================
 DROP TABLE pd_cap, pd_gpu, pd_off;
-DROP EXTENSION pg_cuvs;

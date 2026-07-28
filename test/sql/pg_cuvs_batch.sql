@@ -17,8 +17,10 @@
 
 \set ON_ERROR_STOP on
 
+SET client_min_messages = warning;
 CREATE EXTENSION IF NOT EXISTS vector;
 CREATE EXTENSION IF NOT EXISTS pg_cuvs;
+RESET client_min_messages;
 
 SET cuvs.index_dir = '/tmp/cuvs_indexes';
 
@@ -114,4 +116,3 @@ DROP TABLE pcb_noidx;
 
 -- Cleanup.
 DROP TABLE pcb_test CASCADE;
-DROP EXTENSION pg_cuvs CASCADE;

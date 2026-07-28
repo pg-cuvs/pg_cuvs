@@ -20,8 +20,10 @@
 -- Expected (fixed): live_topk = 5. Against the pre-fix code this yields 0
 -- (the red state that motivates the fix). Requires a running pg_cuvs_server.
 
+SET client_min_messages = warning;
 CREATE EXTENSION IF NOT EXISTS vector;
 CREATE EXTENSION IF NOT EXISTS pg_cuvs;
+RESET client_min_messages;
 SET cuvs.index_dir = '/tmp/cuvs_indexes';
 
 CREATE TABLE dr (id bigint, embedding vector(4));
@@ -47,4 +49,3 @@ RESET enable_seqscan;
 RESET cuvs.k;
 
 DROP TABLE dr;
-DROP EXTENSION pg_cuvs;

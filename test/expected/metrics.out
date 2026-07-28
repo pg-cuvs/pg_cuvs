@@ -9,9 +9,10 @@
 -- NOTE: Vectors are unit-normalized so L2 and cosine rankings coincide;
 -- this lets us verify metric plumbing without needing separate expected results.
 \set ON_ERROR_STOP on
+SET client_min_messages = warning;
 CREATE EXTENSION IF NOT EXISTS vector;
-NOTICE:  extension "vector" already exists, skipping
 CREATE EXTENSION IF NOT EXISTS pg_cuvs;
+RESET client_min_messages;
 SET cuvs.index_dir = '/tmp/cuvs_indexes';
 -- 16 unit-normalized vectors in 4d.  Query ≈ [0.707, 0.707, 0, 0]:
 -- nearest = id=9 ([1,0,0,0]→cos=0.707), id=10 ([0,1,0,0]→cos=0.707), etc.
@@ -94,4 +95,3 @@ ORDER BY embedding <#> '[0.707,0.707,0,0]'::vector LIMIT 1;
 RESET enable_cuvs; RESET enable_seqscan;
 -- Cleanup.
 DROP TABLE met_test CASCADE;
-DROP EXTENSION pg_cuvs CASCADE;

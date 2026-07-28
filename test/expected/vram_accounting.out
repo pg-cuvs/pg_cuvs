@@ -14,10 +14,10 @@
 -- REQUIRES: pg_cuvs_server running; cuvs.index_dir writable. Runs in Tier-1 CI
 -- (CPU shim): the shim's VRAM accounting is a deterministic in-process counter.
 \set ON_ERROR_STOP on
+SET client_min_messages = warning;
 CREATE EXTENSION IF NOT EXISTS vector;
-NOTICE:  extension "vector" already exists, skipping
 CREATE EXTENSION IF NOT EXISTS pg_cuvs;
-NOTICE:  extension "pg_cuvs" already exists, skipping
+RESET client_min_messages;
 SET cuvs.index_dir = '/tmp/cuvs_indexes';
 CREATE TABLE vram_acct (id int, embedding vector(64));
 INSERT INTO vram_acct

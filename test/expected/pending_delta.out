@@ -22,10 +22,10 @@
 -- Requires a running pg_cuvs_server and a daemon-writable cuvs.index_dir.
 -- NO \set ON_ERROR_STOP (parity with edge_cases): the cap-overflow path may emit
 -- a WARNING/HINT that must be captured while the script continues.
+SET client_min_messages = warning;
 CREATE EXTENSION IF NOT EXISTS vector;
-NOTICE:  extension "vector" already exists, skipping
 CREATE EXTENSION IF NOT EXISTS pg_cuvs;
-NOTICE:  extension "pg_cuvs" already exists, skipping
+RESET client_min_messages;
 SET cuvs.index_dir = '/tmp/cuvs_indexes';
 -- ============================================================================
 -- Scenario A — delta cap overflow fail-closes to stale.
@@ -161,4 +161,3 @@ RESET cuvs.max_delta_rows;
 -- Cleanup
 -- ============================================================================
 DROP TABLE pd_cap, pd_gpu, pd_off;
-DROP EXTENSION pg_cuvs;

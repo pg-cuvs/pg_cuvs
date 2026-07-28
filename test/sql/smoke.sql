@@ -5,8 +5,10 @@
 
 \set ON_ERROR_STOP on
 
+SET client_min_messages = warning;
 CREATE EXTENSION IF NOT EXISTS vector;
 CREATE EXTENSION IF NOT EXISTS pg_cuvs;
+RESET client_min_messages;
 
 -- Point at the daemon's index dir so build artifacts persist where the
 -- pg_cuvs_server process (running as its own user) can write them.

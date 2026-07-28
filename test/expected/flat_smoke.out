@@ -17,10 +17,10 @@
 --
 -- REQUIRES: pg_cuvs_server running; cuvs.index_dir writable.
 \set ON_ERROR_STOP on
+SET client_min_messages = warning;
 CREATE EXTENSION IF NOT EXISTS vector;
-NOTICE:  extension "vector" already exists, skipping
 CREATE EXTENSION IF NOT EXISTS pg_cuvs;
-NOTICE:  extension "pg_cuvs" already exists, skipping
+RESET client_min_messages;
 SET cuvs.index_dir = '/tmp/cuvs_indexes';
 -- Deterministic 200-vector, 8-dim corpus (same generator as brute_force.sql).
 CREATE TABLE flat_test (id int, embedding vector(8));

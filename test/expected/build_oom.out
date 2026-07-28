@@ -11,10 +11,10 @@
 -- REQUIRES: pg_cuvs_server running; cuvs.index_dir writable. Runs in Tier-1 CI
 -- (CPU shim): cuvs_set_inject_build_oom is implemented in the shim too.
 \set ON_ERROR_STOP on
+SET client_min_messages = warning;
 CREATE EXTENSION IF NOT EXISTS vector;
-NOTICE:  extension "vector" already exists, skipping
 CREATE EXTENSION IF NOT EXISTS pg_cuvs;
-NOTICE:  extension "pg_cuvs" already exists, skipping
+RESET client_min_messages;
 SET cuvs.index_dir = '/tmp/cuvs_indexes';
 -- Victim index: resident LRU candidate for the retry to evict.
 CREATE TABLE boom_a (id int, embedding vector(8));

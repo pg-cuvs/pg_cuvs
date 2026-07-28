@@ -8,9 +8,10 @@
 --   5. Error: calling pg_cuvs_build_hnsw on non-existent CAGRA (NOT_FOUND).
 --
 -- NOTE: No \set ON_ERROR_STOP on for Cases 1b and 5 (expected errors).
+SET client_min_messages = warning;
 CREATE EXTENSION IF NOT EXISTS vector;
-NOTICE:  extension "vector" already exists, skipping
 CREATE EXTENSION IF NOT EXISTS pg_cuvs;
+RESET client_min_messages;
 SET cuvs.index_dir = '/tmp/cuvs_indexes';
 -- ── Case 1: small index (4 vecs, n_vecs < 16) ───────────────────
 -- 'nsw' works for any N (no hnswlib serialization guard).
@@ -130,6 +131,5 @@ LINE 1: SELECT pg_cuvs_build_hnsw('ec_drop_cagra'::regclass);
                                   ^
 ROLLBACK TO SAVEPOINT sp_dropped;
 COMMIT;
-DROP TABLE ec_dropped;
 -- Cleanup.
-DROP EXTENSION pg_cuvs;
+DROP TABLE ec_dropped;
