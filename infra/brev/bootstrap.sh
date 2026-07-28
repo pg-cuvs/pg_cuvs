@@ -172,9 +172,19 @@ sudo -u postgres psql -c "SELECT pg_reload_conf()"
 pkill -9 -f pg_cuvs_server 2>/dev/null || true; sleep 1
 nohup "$REPO/pg_cuvs_server" --socket /tmp/.s.pg_cuvs --index-dir "$IDX" --gpu-devices 0 \
   > "$USER_HOME/daemon.log" 2>&1 &
-sleep 12
+# Poll, don't guess. The socket appears only after the daemon's first CUDA
+# context is built, and that is a property of the machine, not of the build:
+# ~12s on Massed Compute but over 3 minutes on a Paperspace A100. The former
+# fixed `sleep 12` turned the slower machine into a bogus "SOCKET MISSING"
+# failure for a daemon that was still initialising normally.
+set +x
+for _ in $(seq 1 600); do
+  [ -S /tmp/.s.pg_cuvs ] && break
+  sleep 0.5
+done
+set -x
 test -S /tmp/.s.pg_cuvs && sudo chmod 666 /tmp/.s.pg_cuvs && echo "SOCKET OK" \
-  || { echo "SOCKET MISSING"; tail -30 "$USER_HOME/daemon.log"; exit 1; }
+  || { echo "SOCKET MISSING after 5 min"; tail -30 "$USER_HOME/daemon.log"; exit 1; }
 
 echo "=== [5/5] dataset: wiki_all_1M -> corpus.fbin/queries_10k.fbin/gt.npy ==="
 D="$USER_HOME/data"; mkdir -p "$D/raw"

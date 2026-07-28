@@ -1792,7 +1792,17 @@ cuvs_cagra_extract_adjacency(
         auto graph_view = cimpl->idx.graph();
         size_t N   = (size_t)graph_view.extent(0);
         size_t D   = (size_t)graph_view.extent(1);
-        size_t dim = (size_t)cimpl->dataset.extent(1);
+
+        /* Read the corpus from the index, NOT from cimpl->dataset. After
+         * cuvs_cagra_deserialize (and cuvs_cagra_extend) that member is a
+         * deliberate 0x0 placeholder — the index owns the real dataset. Taking
+         * dim from the placeholder yielded 0, so `vecs` was a 0-byte malloc and
+         * the copy below moved nothing, yet the function still returned 0; the
+         * daemon then copied n_vecs * e->dim * sizeof(float) bytes out of that
+         * empty buffer (a 12.8 KB over-read at 400x8, ~3 GB at 1M x 768). See
+         * issue #101 — measured, not inferred. */
+        auto   ds  = cimpl->idx.dataset();
+        size_t dim = (size_t)ds.extent(1);
 
         uint32_t *adj  = (uint32_t *)malloc(N * D   * sizeof(uint32_t));
         float    *vecs = (float    *)malloc(N * dim  * sizeof(float));
@@ -1804,8 +1814,22 @@ cuvs_cagra_extract_adjacency(
         }
 
         auto stream = raft::resource::get_cuda_stream(res);
-        raft::copy(adj,  graph_view.data_handle(),      N * D,   stream);
-        raft::copy(vecs, cimpl->dataset.data_handle(),  N * dim, stream);
+        raft::copy(adj, graph_view.data_handle(), N * D, stream);
+        /* cagra::index::dataset() is a strided view — cuVS pads rows for
+         * alignment, so a flat N*dim copy is only valid when the row stride
+         * equals dim. Fall back to a row-wise copy otherwise, or every vector
+         * after the first would be read at the wrong offset. */
+        {
+            size_t row_stride = (size_t)ds.stride(0);
+            if (row_stride == dim) {
+                raft::copy(vecs, ds.data_handle(), N * dim, stream);
+            } else {
+                for (size_t i = 0; i < N; i++)
+                    raft::copy(vecs + i * dim,
+                               ds.data_handle() + i * row_stride,
+                               dim, stream);
+            }
+        }
         res.sync_stream();
 
         *adj_out          = adj;
