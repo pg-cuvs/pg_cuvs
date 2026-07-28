@@ -17,9 +17,11 @@
  *     self-accounting, so a fake total is all the daemon needs).
  *
  * Metric conventions MATCH cuvs_wrapper.cu (cuvs_distance_type): L2 -> squared L2
- * (L2Expanded), COSINE -> 1 - cosine_sim (CosineExpanded), IP -> -dot (so
- * ascending sort puts the largest inner product first, as InnerProduct nearest).
- * Distances are smaller-is-nearer; ties broken by item_id for determinism.
+ * (L2Expanded), COSINE -> 1 - cosine_sim (CosineExpanded), IP -> raw +dot
+ * (InnerProduct, measured on an A100 in #102 — the GPU hands back the dot
+ * product unnegated). So L2/cosine are smaller-is-nearer and sort ascending
+ * while IP is larger-is-nearer and sorts descending, matching delta_cand_cmp in
+ * the daemon. Ties broken by item_id for determinism.
  */
 
 #include <stdio.h>
@@ -63,14 +65,14 @@ shim_free(ShimIndex *ix)
     free(ix);
 }
 
-/* ---- exact metric distance (smaller = nearer), matches cuvs_distance_type -- */
+/* ---- exact metric distance, matches cuvs_distance_type ------------------- */
 static float
 shim_dist(const float *a, const float *b, int dim, uint32_t metric)
 {
     if (metric == CUVS_METRIC_IP) {
         double dot = 0.0;
         for (int d = 0; d < dim; d++) dot += (double)a[d] * (double)b[d];
-        return (float)(-dot);                      /* largest dot first */
+        return (float)dot;                         /* raw inner product */
     }
     if (metric == CUVS_METRIC_COSINE) {
         double dot = 0.0, na = 0.0, nb = 0.0;
@@ -106,13 +108,27 @@ shim_pair_cmp(const void *pa, const void *pb)
     return 0;
 }
 
+/* IP only: distances are raw inner products, so nearest = LARGEST (#102). */
+static int
+shim_pair_cmp_ip(const void *pa, const void *pb)
+{
+    const ShimPair *a = (const ShimPair *)pa, *b = (const ShimPair *)pb;
+    if (a->dist > b->dist) return -1;
+    if (a->dist < b->dist) return 1;
+    if (a->id   < b->id)   return -1;   /* deterministic tiebreak */
+    if (a->id   > b->id)   return 1;
+    return 0;
+}
+
 /* Exact top-k over ix, optionally excluding items whose bitset bit is set
- * (bit[id]=1 => EXCLUDE, pg_cuvs convention). Pads tail with item_id=-1. */
+ * (bit[id]=1 => EXCLUDE, pg_cuvs convention). Pads the tail per the TAIL
+ * CONTRACT in cuvs_wrapper.h. */
 static void
 shim_topk(const ShimIndex *ix, const float *query, int dim, int top_k,
           const uint32_t *bitset, int64_t bitset_bits,
           CuvsSearchResult *results)
 {
+    uint32_t metric = ix ? ix->metric : CUVS_METRIC_L2;
     int64_t n = (ix && dim == ix->dim) ? ix->n : 0;
     ShimPair *pairs = (n > 0) ? (ShimPair *) malloc((size_t)n * sizeof(ShimPair)) : NULL;
     int64_t m = 0;
@@ -125,11 +141,14 @@ shim_topk(const ShimIndex *ix, const float *query, int dim, int top_k,
         pairs[m].id   = i;
         m++;
     }
-    if (m > 0) qsort(pairs, (size_t)m, sizeof(ShimPair), shim_pair_cmp);
+    if (m > 0)
+        qsort(pairs, (size_t)m, sizeof(ShimPair),
+              (metric == CUVS_METRIC_IP) ? shim_pair_cmp_ip : shim_pair_cmp);
 
     for (int j = 0; j < top_k; j++) {
         if (j < m) { results[j].item_id = pairs[j].id;  results[j].distance = pairs[j].dist; }
-        else       { results[j].item_id = -1;           results[j].distance = INFINITY;      }
+        else       { results[j].item_id = CUVS_PAD_ITEM_ID;
+                     results[j].distance = cuvs_pad_distance(metric); }
     }
     free(pairs);
 }
@@ -191,10 +210,15 @@ static int g_inject_build_oom = 0;
 int  cuvs_last_build_was_oom(void) { int v = g_last_build_oom; g_last_build_oom = 0; return v; }
 void cuvs_set_inject_build_oom(int n_fail) { g_inject_build_oom = n_fail; }
 
-/* Return 1 (and arm g_last_build_oom) when a build should fake an OOM. */
+/* Return 1 (and arm g_last_build_oom) when a build should fake an OOM.
+ * Called at the entry of every cagra build, and clears the flag first — the GPU
+ * wrapper resets it per build attempt (cuvs_wrapper.cu, cuvs_cagra_build_multi),
+ * so without this a non-OOM failure after an injected OOM would still report
+ * OOM=1 here and 0 on GPU, sending the daemon down different retry paths (#110). */
 static int
 shim_build_oom_armed(void)
 {
+    g_last_build_oom = 0;
     if (g_inject_build_oom > 0) {
         g_inject_build_oom--;
         g_last_build_oom = 1;
@@ -223,8 +247,9 @@ cuvs_cagra_build_multi(const float **vecs, const int64_t *n_each, int n_parts,
     if (!ix) return NULL;
     int64_t off = 0;
     for (int p = 0; p < n_parts; p++) {
-        size_t rows = (size_t)n_each[p];
-        if (rows == 0) continue;
+        size_t rows;
+        if (n_each[p] <= 0) continue;   /* empty worker share, as in the GPU path */
+        rows = (size_t)n_each[p];
         memcpy(ix->vecs + (size_t)off * dim, vecs[p], rows * (size_t)dim * sizeof(float));
         off += n_each[p];
     }
@@ -270,6 +295,9 @@ cuvs_bf_search_filtered(CuvsBfIndex index, const float *query_vec, int dim,
     ShimIndex *ix = (ShimIndex *)index;
     if (!ix) return 1;
     if (dim != ix->dim) return 2;
+    /* The GPU wrapper dereferences bitset_words unconditionally; refuse NULL on
+     * both sides rather than treating it as "no filter" here (#110). */
+    if (!bitset_words) return 1;
     shim_topk(ix, query_vec, dim, top_k, bitset_words, bitset_bits, results);
     return 0;
 }
@@ -370,7 +398,9 @@ int cuvs_ivfpq_build(const float *vecs, int64_t n_vecs, int dim, uint32_t metric
                      uint32_t n_lists, uint32_t pq_bits, uint32_t pq_dim,
                      int device_id, CuvsIvfPqIndex *out)
 { (void)n_lists; (void)pq_bits; (void)pq_dim; (void)device_id;
-  if (!out) return 1;
+  /* Same rejection as the GPU path (cuvs_wrapper.cu, cuvs_ivfpq_build): an
+   * empty corpus must not yield a valid handle here and a failure there. */
+  if (!vecs || !out || n_vecs <= 0 || dim <= 0) return 1;
   *out = (CuvsIvfPqIndex) shim_new(vecs, n_vecs, dim, metric);
   return *out ? 0 : 1; }
 
@@ -392,7 +422,13 @@ void cuvs_ivfpq_free(CuvsIvfPqIndex index, int device_id)
 /* CPU HNSW (Phase 3I-1) — exact kNN over the same host copy                 */
 /* ======================================================================== */
 int cuvs_hnsw_serialize(CuvsCagraIndex cagra_idx, const char *path, int device_id)
-{ (void)device_id; return shim_write((ShimIndex *)cagra_idx, path); }
+{ (void)device_id;
+  ShimIndex *ix = (ShimIndex *)cagra_idx;
+  if (!ix || !path) return -1;
+  /* Mirror the GPU wrapper's hnswlib floor so the "no sidecar was written"
+   * outcome is reachable on Tier-1 (#106) instead of only on a real GPU. */
+  if (ix->n < CUVS_HNSW_MIN_ELEMENTS) return CUVS_HNSW_SERIALIZE_SKIPPED;
+  return shim_write(ix, path); }
 
 CuvsHnswIndex cuvs_hnsw_deserialize(const char *path, int dim, uint32_t metric, int device_id)
 { (void)dim; (void)metric; (void)device_id; return (CuvsHnswIndex) shim_read(path); }
