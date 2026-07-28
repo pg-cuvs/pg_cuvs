@@ -9,12 +9,12 @@ pg_cuvs development has run on three GPU providers. **Brev is the main provider 
 
 | Provider | Status | Where |
 |----------|--------|-------|
-| **Brev** (Massed Compute A100) | **main** | Bootstrap kept in the private docs repo (`pg_cuvs_docs/vm-access/brev-bootstrap/`) — it is a zero-to-ready `bootstrap.sh` (apt + conda + libcuvs + PG16 + build). Not committed here because it is operational access tooling, not product infra. |
+| **Brev** (Massed Compute A100) | **main** | [`brev/`](brev/) — `bootstrap.sh` takes a fresh instance to ready (apt + conda + libcuvs + PG16 + build) in ~10 min. Same category as the GCP startup script below; access details (IPs, project ids) stay in the private docs repo, the script does not. |
 | **GCP** (A100 via Terraform) | available | [`gcp/`](gcp/) — `terraform apply` provisions the instance and runs `scripts/install_gpu_env.sh` as the startup script. |
 | **RunPod** | historical | Used earlier; no committed provisioning (pods were created ad hoc via `runpodctl`). Superseded by Brev. |
 
 Brev cannot `stop` and has no persistent volume, so "restart" means a fast rebuild from
-the bootstrap — see the private repo's `brev-bootstrap/README.md`. Operational lifecycle
+the bootstrap — see [`brev/README.md`](brev/README.md). Operational lifecycle
 notes (and how the GCP stop/start model differs) are in
 [`docs/playbooks/gpu-vm-lifecycle.md`](../docs/playbooks/gpu-vm-lifecycle.md).
 
@@ -22,6 +22,9 @@ notes (and how the GCP stop/start model differs) are in
 
 ```
 infra/
+  brev/                   Brev/Massed Compute A100 (current main): zero-to-ready
+                          bootstrap.sh + README with the restart procedure and the
+                          build gotchas it encodes
   gcp/                    Terraform for a GCP A100 dev VM (main.tf, variables, outputs,
                           scripts/install_gpu_env.sh startup script)
   scripts/

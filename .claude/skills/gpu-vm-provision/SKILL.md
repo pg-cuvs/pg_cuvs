@@ -38,10 +38,11 @@ VM 위의 어떤 것도 source of truth가 아니다. 소스는 `main` 브랜치
 
 ## 부트스트랩 위치
 
-부트스트랩은 운영 액세스 툴이라 공개 레포에 커밋하지 않는다. 사설 문서 레포:
+부트스트랩은 리포에 커밋되어 있다. 접속 정보(IP·project id)만 사설 문서 레포
+`pg_cuvs_docs/vm-access/VM_ACCESS.md`에 남는다:
 
 ```
-pg_cuvs_docs/vm-access/brev-bootstrap/   (로컬: ~/Documents/GitHub/pg_cuvs_docs)
+infra/brev/
 ├── bootstrap.sh   # zero-to-ready 스크립트, 모든 함정이 주석과 함께 박혀 있음
 └── README.md      # 재시작 절차 + gotcha 7종 상세
 ```
@@ -60,7 +61,7 @@ brev start <name>
 brev refresh                 # ~/.brev/ssh_config 갱신 → `ssh <name>` 가능해짐
 
 # 2. 부트스트랩 전송 + 실행 (~10분)
-scp ~/Documents/GitHub/pg_cuvs_docs/vm-access/brev-bootstrap/bootstrap.sh <name>:/home/shadeform/
+scp infra/brev/bootstrap.sh <name>:/home/shadeform/
 ssh <name> 'bash /home/shadeform/bootstrap.sh 2>&1 | tee bootstrap.log'
 
 # 3. 완료 후 로컬 .env.gpu의 호스트를 새 인스턴스로 갱신 → pg-cuvs-dev 스킬로 전환
@@ -73,7 +74,7 @@ ssh <name> 'bash /home/shadeform/bootstrap.sh 2>&1 | tee bootstrap.log'
 ## 빌드 함정 (bootstrap.sh에 이미 박혀 있음)
 
 새로 디버깅하지 말 것 — 아래는 색인이고, 상세와 해법 원라이너는
-`brev-bootstrap/README.md`의 gotcha 목록과 bootstrap.sh 주석에 있다:
+`infra/brev/README.md`의 gotcha 목록과 bootstrap.sh 주석에 있다:
 
 1. `ld: cannot find -lstdc++` — gcc=12/g++=11 불일치 → `libstdc++-12-dev` 설치
 2. `nvcc fatal: cannot execute cc1plus` — `make NVCC="nvcc -ccbin /usr/bin/g++"`

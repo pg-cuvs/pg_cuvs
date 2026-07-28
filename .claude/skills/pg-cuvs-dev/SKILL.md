@@ -157,7 +157,7 @@ Brev는 stop이 없다 — 인스턴스가 떠 있는 동안 계속 과금된다
 | 문서 | 내용 |
 |------|------|
 | `infra/README.md` | 프로바이더 현황 (Brev main / GCP legacy / RunPod historical) |
-| `pg_cuvs_docs/vm-access/brev-bootstrap/` | bootstrap.sh + gotcha 상세 (사설 레포) |
+| `infra/brev/` | bootstrap.sh + gotcha 상세 |
 | `design/decisions.md` ADR-004 | 원격 GPU VM 개발 모델 |
 | `design/decisions.md` ADR-001 | C/.cu 분리, float4 충돌 |
 | `design/decisions.md` ADR-007 | -Wl,-rpath 이슈 |
