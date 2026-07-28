@@ -648,6 +648,16 @@ cuvs_bf_search_filtered(
     CuvsBfIndexImpl *impl = static_cast<CuvsBfIndexImpl *>(index);
     if (dim != impl->dim)
         return 2;
+    /* Unlike cuvs_bf_search above, the filtered path below searches idx_f32
+     * unconditionally — but a float16 index (precision == 1) builds only
+     * idx_f16 and leaves idx_f32 null. Refuse the combination instead of
+     * dereferencing null: this runs in the daemon, so a SIGSEGV here takes
+     * down every backend's session, not just this query. The caller treats a
+     * non-zero return as "prefilter unavailable" and falls back. Teaching the
+     * filtered path to search idx_f16 (mirroring cuvs_bf_search's half-query
+     * conversion) is the real fix and needs a GPU to validate. */
+    if (!impl->idx_f32)
+        return 3;
     if ((int64_t)top_k > impl->n)
         top_k = (int)impl->n;
     if (top_k <= 0)
