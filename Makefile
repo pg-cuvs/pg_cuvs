@@ -266,18 +266,26 @@ benchmark:
 
 .PHONY: benchmark
 
-# ---- GCP remote orchestration ------------------------------------------
-# Load .env.gpu (gitignored) for GCP_VM, GCP_INSTANCE, GCP_ZONE, etc.
+# ---- Remote VM orchestration -------------------------------------------
+# Load .env.gpu (gitignored) for GCP_VM (the ssh host, whatever the provider),
+# and — for the legacy GCP path — GCP_INSTANCE, GCP_ZONE, GCP_PROJECT.
 -include .env.gpu
 export
 
-# The VM's external IP is ephemeral (GCP reassigns it on every stop/start), so the
-# GCP_VM value in .env.gpu goes stale. VM_HOST resolves the CURRENT IP from gcloud
-# at expansion time, falling back to .env.gpu's GCP_VM if the lookup fails (gcloud
-# offline/unauthenticated). Recursive '=' + unexport so gcloud runs only when a
-# remote ssh/rsync recipe references $(VM_HOST) -- never on a plain local `make`.
+# On GCP the external IP is ephemeral (reassigned on every stop/start), so
+# .env.gpu's GCP_VM goes stale and the CURRENT IP has to come from gcloud.
+# Brev (the current main provider, see infra/README.md) has no such lookup:
+# GCP_VM *is* the host. So the gcloud probe is opt-in via USE_GCP_IP=1.
+#
+# Leaving it unconditional cost us twice. It forks gcloud once per $(VM_HOST)
+# reference — recursive '=' re-evaluates the shell on every expansion — so a
+# `make -n gpu-test-all` (6 references, nothing executed) took 6.7s vs 0.24s
+# for a target that never mentions the host. Worse, a successful lookup WINS
+# over GCP_VM: with a Brev host in GCP_VM but a stale GCP_INSTANCE still in
+# .env.gpu and live gcloud auth, every gpu-* target would silently retarget
+# the old GCP machine — and `sync` is `rsync --delete`.
 GCP_USER ?= ubuntu
-VM_IP = $(shell gcloud compute instances describe $(GCP_INSTANCE) --zone $(GCP_ZONE) $(if $(GCP_PROJECT),--project $(GCP_PROJECT)) --format='value(networkInterfaces[0].accessConfigs[0].natIP)' 2>/dev/null)
+VM_IP = $(if $(USE_GCP_IP),$(shell gcloud compute instances describe $(GCP_INSTANCE) --zone $(GCP_ZONE) $(if $(GCP_PROJECT),--project $(GCP_PROJECT)) --format='value(networkInterfaces[0].accessConfigs[0].natIP)' 2>/dev/null),)
 VM_HOST = $(if $(VM_IP),$(GCP_USER)@$(VM_IP),$(GCP_VM))
 unexport VM_IP VM_HOST
 
