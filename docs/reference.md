@@ -10,7 +10,7 @@
 
 ## 1. Index access methods
 
-pg_cuvs registers three index AMs. All reuse pgvector's `vector` type and operators
+pg_cuvs registers four index AMs. All reuse pgvector's `vector` type and operators
 (`<->` L2, `<=>` cosine, `<#>` inner product) via opclasses `vector_l2_ops` (default),
 `vector_cosine_ops`, `vector_ip_ops`.
 
