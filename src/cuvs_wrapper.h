@@ -6,6 +6,9 @@ extern "C" {
 
 #include <stdint.h>
 #include <stddef.h>
+#include <math.h>
+
+#include "cuvs_ipc.h"   /* CUVS_METRIC_* (PG-free, CUDA-free defines) */
 
 /* Phase 3E: maximum GPUs the daemon can manage. */
 #define CUVS_MAX_GPUS 16
@@ -41,6 +44,36 @@ typedef struct CuvsSearchResult {
 } CuvsSearchResult;
 
 /*
+ * TAIL CONTRACT (#103) — binding on every search entry point below:
+ *   cuvs_brute_force_search, cuvs_bf_search, cuvs_bf_search_filtered,
+ *   cuvs_cagra_search, cuvs_cagra_search_filtered, cuvs_ivfpq_search,
+ *   cuvs_cagra_search_batch, cuvs_bf_search_batch.
+ *
+ * On a success return (0), EVERY slot of results[0, top_k) is written (per
+ * query for the batch entry points). A slot the corpus cannot fill — because
+ * it holds fewer than top_k vectors, or a prefilter excluded them — carries
+ *     item_id  = CUVS_PAD_ITEM_ID
+ *     distance = cuvs_pad_distance(metric)
+ * Callers may therefore pass a malloc'd (uninitialized) buffer and detect
+ * unfilled slots by item_id alone; padded slots are always the trailing ones.
+ * On a non-zero return nothing about results[] is guaranteed.
+ *
+ * The padding distance is metric-dependent because the daemon re-sorts merged
+ * base+delta candidates by distance and IP orders DESCENDING (distances are
+ * raw inner products, larger = nearer — measured on GPU, see #102) while
+ * L2/cosine order ascending. -INFINITY / +INFINITY respectively keeps a padded
+ * slot last under either order, so a pad that escapes an item_id filter still
+ * cannot displace a real neighbour.
+ */
+#define CUVS_PAD_ITEM_ID ((int64_t) -1)
+
+static inline float
+cuvs_pad_distance(uint32_t metric)
+{
+    return (metric == CUVS_METRIC_IP) ? -INFINITY : INFINITY;
+}
+
+/*
  * cuvs_brute_force_search
  *
  * Runs exact cosine/L2 search on the GPU via cuVS BruteForce API.
@@ -74,7 +107,8 @@ int cuvs_brute_force_search(
  * by the daemon to hold a per-index GPU brute-force index over the pending
  * `.delta` vectors. metric is a CUVS_METRIC_* value (same scale as the CAGRA
  * base index). cuvs_bf_search returns 0 on success, 2 on dim mismatch, 1 on
- * other failure; top_k must be <= the corpus size the index was built with.
+ * other failure; a top_k larger than the corpus is clamped and the tail padded
+ * per the TAIL CONTRACT above.
  *
  * Phase 3L: `precision` selects the resident numeric type — 0 = float32,
  * 1 = float16. float16 halves the dataset VRAM and raises throughput; the
@@ -111,7 +145,10 @@ void cuvs_bf_free(CuvsBfIndex index, int device_id);
  *               EXCLUDE that item from search; bit=0 means include.
  * bitset_bits  : total bit count = n_vecs.
  *
- * Returns 0 on success, 2 on dim mismatch, 1 on failure.
+ * Returns 0 on success, 2 on dim mismatch, 1 on failure. A NULL bitset_words
+ * is a failure (1), not "no filter": the unfiltered entry point exists for
+ * that, and accepting NULL here made the CPU shim silently succeed where the
+ * GPU wrapper dereferenced it (#110).
  */
 int cuvs_bf_search_filtered(
     CuvsBfIndex       index,
@@ -184,7 +221,8 @@ int cuvs_cagra_search(
  *               EXCLUDE that item from search; bit=0 means include.
  * bitset_bits  : total bit count = n_vecs.
  *
- * Returns 0 on success, 2 on dim mismatch, 1 on failure.
+ * Returns 0 on success, 2 on dim mismatch, 1 on failure. NULL bitset_words is
+ * a failure (1), as in cuvs_bf_search_filtered.
  * Approximate (graph-based); faster than BF prefilter at large N.
  */
 int cuvs_cagra_search_filtered(
@@ -247,9 +285,9 @@ void           cuvs_ivfpq_free(CuvsIvfPqIndex index, int device_id);
  * queries is [n_queries][dim] row-major; results is [n_queries][top_k] row-major
  * (results[q*top_k + j] = j-th neighbor of query q). cuVS cagra/brute_force
  * search accept a Q×dim query matrix, so the whole batch is one kernel launch.
- * Caller must pass top_k <= corpus size. cuvs_bf_search_batch pads any tail
- * slots [n, top_k) with item_id = -1 when the BF corpus has fewer than top_k
- * vectors. Both return 0 on success, 2 on dim mismatch, 1 on other failure.
+ * A top_k larger than the corpus is clamped and each query's tail padded per
+ * the TAIL CONTRACT above.
+ * Both return 0 on success, 2 on dim mismatch, 1 on other failure.
  */
 int cuvs_cagra_search_batch(
     CuvsCagraIndex   index,
@@ -277,8 +315,23 @@ int cuvs_bf_search_batch(
  * After CAGRA build, cuvs_hnsw_serialize() converts the GPU graph to a
  * CPU hnswlib index and writes it to `path` (.hnsw sidecar).  The daemon
  * can then load and search it without a GPU when cpu_hnsw_fallback is on.
+ *
+ * #106: hnswlib aborts on graphs smaller than CUVS_HNSW_MIN_ELEMENTS, so those
+ * are skipped rather than written. That is NOT success — a caller that reads
+ * rc == 0 as "the sidecar exists" then hands out a path to a file nobody
+ * created. The three outcomes are distinct:
+ *   CUVS_HNSW_SERIALIZE_OK      (0)  file written at `path`
+ *   CUVS_HNSW_SERIALIZE_SKIPPED (1)  nothing written, corpus too small; the
+ *                                    CAGRA index stays usable for GPU search
+ *   negative                         failure, nothing usable written
+ * Both the GPU wrapper and the CPU shim apply the same threshold so the skip
+ * is reproducible without a GPU.
  */
 typedef void *CuvsHnswIndex;
+
+#define CUVS_HNSW_MIN_ELEMENTS       16
+#define CUVS_HNSW_SERIALIZE_OK        0
+#define CUVS_HNSW_SERIALIZE_SKIPPED   1
 
 int           cuvs_hnsw_serialize(CuvsCagraIndex cagra_idx,
                                    const char *path, int device_id);

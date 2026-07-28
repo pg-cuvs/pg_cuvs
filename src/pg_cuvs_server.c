@@ -2934,14 +2934,10 @@ handle_search(int client_fd, const CuvsCmdFrame *cmd)
                 presults = malloc((size_t)(k > 0 ? k : 1) * sizeof(CuvsResult));
 
                 if (bitset && praw && presults) {
-                    /* The GPU wrappers clamp top_k to the corpus size and leave
-                     * slots [n_vecs, k) untouched, so the result loop below would
-                     * read uninitialized heap; a garbage item_id landing inside
-                     * [0, n_vecs) yields a real TID for a neighbour that was never
-                     * returned. Seed the sentinel the loop already stops on. The
-                     * CPU shim pads its tail with -1, which is why Tier-1 cannot
-                     * reproduce this — see also cuvs_bf_search_batch, whose GPU
-                     * path does pad. */
+                    /* The wrappers now pad slots the corpus cannot fill (TAIL
+                     * CONTRACT in cuvs_wrapper.h, #103). Seeding the same
+                     * sentinel the loop stops on keeps this loop safe against a
+                     * wrapper that returns non-zero after a partial write. */
                     for (int pi = 0; pi < k; pi++)
                         praw[pi].item_id = -1;
                     /* pg_cuvs convention: bit=1 = exclude. Start all excluded;
@@ -5097,7 +5093,14 @@ finish_build_commit(int client_fd, const CuvsCmdFrame *cmd, const char *save_dir
         char hnsw_path[512];
         hnsw_file_path(hnsw_path, sizeof(hnsw_path), save_dir,
                        cmd->db_oid, cmd->index_oid);
-        if (cuvs_hnsw_serialize(new_handle, hnsw_path, target_gpu) != 0)
+        int hrc = cuvs_hnsw_serialize(new_handle, hnsw_path, target_gpu);
+        if (hrc == CUVS_HNSW_SERIALIZE_SKIPPED)
+            /* #106: no file was written — say so, so the log does not claim a
+             * sidecar that a later cpu_hnsw search will fail to open. */
+            LOG_WARN("[handle_build] no HNSW fallback sidecar for %u/%u: "
+                     "fewer than %d vectors; cpu_hnsw searches will use GPU CAGRA\n",
+                     cmd->db_oid, cmd->index_oid, CUVS_HNSW_MIN_ELEMENTS);
+        else if (hrc != CUVS_HNSW_SERIALIZE_OK)
             LOG_WARN("[handle_build] HNSW fallback sidecar not saved for %u/%u\n",
                      cmd->db_oid, cmd->index_oid);
         else
@@ -5975,7 +5978,16 @@ handle_export_hnsw_shm(int client_fd, const CuvsCmdFrame *cmd)
              __atomic_fetch_add(&hnsw_shm_seq, 1, __ATOMIC_RELAXED));
 
     /* Serialize HNSW to /dev/shm (reuses existing cuvs_hnsw_serialize) */
-    if (cuvs_hnsw_serialize(handle, shm_path, gpu) != 0)
+    int hrc = cuvs_hnsw_serialize(handle, shm_path, gpu);
+    if (hrc == CUVS_HNSW_SERIALIZE_SKIPPED)
+    {
+        /* #106: nothing was written, so shm_path does not exist — replying OK
+         * with that path would send the importer at a missing file. */
+        send_error_code(client_fd, CUVS_STATUS_NOT_FOUND,
+                        "index too small for an HNSW sidecar");
+        return;
+    }
+    if (hrc != CUVS_HNSW_SERIALIZE_OK)
     {
         send_error(client_fd, "from_cagra/serialize failed");
         return;
@@ -6754,12 +6766,10 @@ handle_search_ivfpq(int client_fd, const CuvsCmdFrame *cmd)
     CuvsResult       *results = malloc((size_t)(k > 0 ? k : 1) * sizeof(CuvsResult));
     if (raw)
     {
-        /* cuvs_ivfpq_search clamps top_k to the corpus size and leaves slots
-         * [n_vecs, k) untouched, so the loop below would read uninitialized
-         * heap. It uses `continue`, not `break`, so every garbage item_id that
-         * lands in [0, n_vecs) is admitted as a real neighbour with a real TID.
-         * Seed the sentinel the loop already rejects. The CPU shim pads its
-         * tail with -1, which is why Tier-1 cannot reproduce this. */
+        /* cuvs_ivfpq_search now pads slots the corpus cannot fill (TAIL
+         * CONTRACT in cuvs_wrapper.h, #103). The loop below uses `continue`,
+         * not `break`, so seed the same sentinel it rejects: that keeps it safe
+         * against a wrapper that returns non-zero after a partial write. */
         for (int i = 0; i < k; i++)
             raw[i].item_id = -1;
     }
