@@ -2934,6 +2934,16 @@ handle_search(int client_fd, const CuvsCmdFrame *cmd)
                 presults = malloc((size_t)(k > 0 ? k : 1) * sizeof(CuvsResult));
 
                 if (bitset && praw && presults) {
+                    /* The GPU wrappers clamp top_k to the corpus size and leave
+                     * slots [n_vecs, k) untouched, so the result loop below would
+                     * read uninitialized heap; a garbage item_id landing inside
+                     * [0, n_vecs) yields a real TID for a neighbour that was never
+                     * returned. Seed the sentinel the loop already stops on. The
+                     * CPU shim pads its tail with -1, which is why Tier-1 cannot
+                     * reproduce this — see also cuvs_bf_search_batch, whose GPU
+                     * path does pad. */
+                    for (int pi = 0; pi < k; pi++)
+                        praw[pi].item_id = -1;
                     /* pg_cuvs convention: bit=1 = exclude. Start all excluded;
                      * the cuVS wrapper inverts this to cuVS's bit=1 = include. */
                     memset(bitset, 0xFF, (size_t)nwords * sizeof(uint32_t));
