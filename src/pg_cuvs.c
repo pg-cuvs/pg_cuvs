@@ -1752,7 +1752,10 @@ cuvs_phys_cost_ready(uint32_t req_bits, int dim, CuvsHwProfile *prof, double *ka
  * runtime failures), .stale sidecar (heap writes since build), delete-drift
  * (.tids header vs live-row estimate), socket existence (daemon ready),
  * artifact existence (no .tids = empty-table build, no GPU artifact), delta
- * unusable, and tombstone unusable (see the gate chain below). */
+ * unusable, and tombstone unusable (see the gate chain below).
+ *
+ * DUP-SIBLING(cost): flat_amcostestimate is a duplicate (ADR-073). Change both
+ * together; see the duplicate-pair inventory in ADR-073. */
 static void
 cuvsamcostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
                    Cost *indexStartupCost, Cost *indexTotalCost,
@@ -1863,7 +1866,7 @@ cuvsamcostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
 /* ----------------------------------------------------------------
  * ADR-073: flat AM cost estimate.
  *
- * A DUPLICATE of cuvsamcostestimate (the plan mandates duplicate-not-refactor —
+ * DUP-SIBLING(cost). A DUPLICATE of cuvsamcostestimate (the plan mandates duplicate-not-refactor —
  * cagra's version is GUC-gated on cuvs_search_mode and would mis-cost flat). It
  * keeps ALL EIGHT plan-time gates verbatim (no IPC / no CUDA), but then ALWAYS
  * takes the exact brute-force N-cost branch regardless of cuvs.search_mode: a
@@ -2430,6 +2433,9 @@ cuvs_build_parallel(Relation heapRel, Relation indexRel, IndexInfo *indexInfo,
  * build_index_oid). On an empty heap, sets *out_n_vecs = 0 and builds nothing.
  * The corpus is freed internally; a build failure raises ERROR (DDL durability
  * contract).
+ *
+ * DUP-SIBLING(build-heap): cuvs_build_flat_from_heap is a duplicate (ADR-073).
+ * Change both together; see the duplicate-pair inventory in ADR-073.
  * ---------------------------------------------------------------- */
 void
 cuvs_build_cagra_from_heap(Relation heapRel, Relation indexRel, IndexInfo *indexInfo,
@@ -2626,6 +2632,9 @@ cuvs_build_cagra_from_heap(Relation heapRel, Relation indexRel, IndexInfo *index
 
 /* ----------------------------------------------------------------
  * Index AM: ambuild — handles CREATE INDEX USING cagra
+ *
+ * DUP-SIBLING(ambuild): flat_ambuild is a duplicate (ADR-073). Change both
+ * together; see the duplicate-pair inventory in ADR-073.
  * ---------------------------------------------------------------- */
 static IndexBuildResult *
 cuvs_ambuild(Relation heapRel, Relation indexRel, IndexInfo *indexInfo)
@@ -2734,7 +2743,7 @@ cuvs_ambuild(Relation heapRel, Relation indexRel, IndexInfo *indexInfo)
 /* ----------------------------------------------------------------
  * ADR-073: scan the heap and build a flat (vectors-only) index on the daemon.
  *
- * A DUPLICATE of cuvs_build_cagra_from_heap minus the CAGRA-specific parts: no
+ * DUP-SIBLING(build-heap). A DUPLICATE of cuvs_build_cagra_from_heap minus the CAGRA-specific parts: no
  * parallel-maintenance-worker build (cuvs_build_parallel builds a CAGRA graph)
  * and no graph-degree/build-algo params. The corpus accumulation
  * (cuvs_corpus_open + cuvs_build_callback + table_index_build_scan) is
@@ -2891,7 +2900,7 @@ cuvs_build_flat_from_heap(Relation heapRel, Relation indexRel, IndexInfo *indexI
 /* ----------------------------------------------------------------
  * ADR-073: Index AM ambuild — handles CREATE INDEX USING flat.
  *
- * A DUPLICATE of cuvs_ambuild: same TOAST / index_dir build advisories and the
+ * DUP-SIBLING(ambuild). A DUPLICATE of cuvs_ambuild: same TOAST / index_dir build advisories and the
  * same .relfilenode sidecar + delta/tombstone reset, but it builds a vectors-only
  * flat store (cuvs_build_flat_from_heap) instead of a CAGRA graph and does not
  * resolve CAGRA graph reloptions.
@@ -3475,6 +3484,9 @@ cuvs_rescan(IndexScanDesc scan, ScanKey keys, int nkeys,
  *
  * On the first call: extract query vector from orderByData, run IPC
  * search, store result set. Subsequent calls iterate stored results.
+ *
+ * DUP-SIBLING(gettuple): flat_gettuple is a duplicate (ADR-073). Change both
+ * together; see the duplicate-pair inventory in ADR-073.
  * ---------------------------------------------------------------- */
 static bool
 cuvs_gettuple(IndexScanDesc scan, ScanDirection dir)
@@ -3741,7 +3753,7 @@ cuvs_gettuple(IndexScanDesc scan, ScanDirection dir)
 /* ----------------------------------------------------------------
  * ADR-073: flat AM amgettuple — exact GPU brute-force scan.
  *
- * A DUPLICATE of cuvs_gettuple. cagra's version passes the cuvs.search_mode GUC
+ * DUP-SIBLING(gettuple). A DUPLICATE of cuvs_gettuple. cagra's version passes the cuvs.search_mode GUC
  * to the daemon; flat MUST force brute_force (search_mode = 1) regardless of the
  * GUC — a flat index has no CAGRA graph, so a cagra-mode request would deref a
  * NULL handle on the daemon. Precision comes from the flat index's `precision`
