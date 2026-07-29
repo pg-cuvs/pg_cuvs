@@ -14,20 +14,20 @@ GPU VM에서 pg_cuvs를 처음 빌드하거나 재빌드할 때 사용한다.
 
 ---
 
-## 0. 전제 조건 — `.env.gpu` 설정
+## 0. 전제 조건 — `gpu.conf` 설정
 
 모든 `make gpu-*` 래퍼와 직접 명령은 아래 변수들을 사용한다.  
-`make`는 Makefile의 `-include .env.gpu` + `export`로 자동 로드하지만,  
-**직접 명령을 칠 때는 반드시 먼저 `source .env.gpu`를 실행해야 한다.**
+`make`는 Makefile의 `-include gpu.conf` + `export`로 자동 로드하지만,  
+**직접 명령을 칠 때는 반드시 먼저 `source gpu.conf`를 실행해야 한다.**
 
-### `.env.gpu` 파일 만들기 (최초 1회)
+### `gpu.conf` 파일 만들기 (최초 1회)
 
-프로젝트 루트에 `.env.gpu` 파일을 생성한다 (`.gitignore` 대상 — 커밋하지 않는다):
+프로젝트 루트에 `gpu.conf` 파일을 생성한다 (`.gitignore` 대상 — 커밋하지 않는다):
 
 ```bash
 # pg_cuvs 프로젝트 루트에서
-cat > .env.gpu << 'EOF'
-GCP_VM=ubuntu@<외부IP>          # VM 외부 IP (stop/start 시 바뀜 — gpu-vm-lifecycle.md 참조)
+cat > gpu.conf << 'EOF'
+VM_SSH_HOST=ubuntu@<외부IP>          # VM 외부 IP (stop/start 시 바뀜 — gpu-vm-lifecycle.md 참조)
 GCP_INSTANCE=pg-cuvs-dev        # gcloud 인스턴스 이름
 GCP_ZONE=us-central1-b          # 인스턴스가 있는 zone
 GCP_PROJECT=your-gcp-project
@@ -36,12 +36,12 @@ CUDA_ARCH=sm_80                  # A100 = sm_80, A10 = sm_86
 EOF
 ```
 
-> `GCP_VM`의 IP는 VM을 stop/start 할 때마다 바뀐다(ephemeral IP).  
+> `VM_SSH_HOST`의 IP는 VM을 stop/start 할 때마다 바뀐다(ephemeral IP).  
 > IP 확인: `gcloud compute instances describe $GCP_INSTANCE --zone $GCP_ZONE --project $GCP_PROJECT --format='get(networkInterfaces[0].accessConfigs[0].natIP)'`
 
 ### SSH 접속 설정 (최초 1회)
 
-`make gpu-*` 래퍼들은 내부적으로 `ssh $GCP_VM ...` 으로 VM에 접속한다.  
+`make gpu-*` 래퍼들은 내부적으로 `ssh $VM_SSH_HOST ...` 으로 VM에 접속한다.  
 처음 사용하는 경우 SSH 키를 GCP에 등록해야 한다.
 
 ```bash
@@ -50,7 +50,7 @@ gcloud compute ssh $GCP_INSTANCE --zone $GCP_ZONE --project $GCP_PROJECT
 
 # 성공하면 VM 셸이 열린다. exit로 빠져나온다.
 # 이후 일반 ssh도 동작:
-ssh $GCP_VM "echo connected"
+ssh $VM_SSH_HOST "echo connected"
 ```
 
 **기대 출력:**
@@ -65,18 +65,18 @@ connected
 
 ```bash
 cd ~/Documents/GitHub/pg_cuvs
-source .env.gpu
+source gpu.conf
 
 # 설정 확인
-echo "VM=$GCP_VM  INSTANCE=$GCP_INSTANCE  ZONE=$GCP_ZONE  CONDA=$CONDA_ENV"
+echo "VM=$VM_SSH_HOST  INSTANCE=$GCP_INSTANCE  ZONE=$GCP_ZONE  CONDA=$CONDA_ENV"
 ```
 
 **기대 출력:**
 ```
 VM=ubuntu@35.224.x.x  INSTANCE=pg-cuvs-dev  ZONE=us-central1-b  CONDA=rapids
 ```
-**→ 빈 값 있음:** `.env.gpu` 파일이 없거나 경로가 다름 — 위의 파일 생성 단계 수행  
-**→ `GCP_VM`의 IP가 틀림:** VM stop/start 후 IP 변경 → `gpu-vm-lifecycle.md` "IP 변경 후"로
+**→ 빈 값 있음:** `gpu.conf` 파일이 없거나 경로가 다름 — 위의 파일 생성 단계 수행  
+**→ `VM_SSH_HOST`의 IP가 틀림:** VM stop/start 후 IP 변경 → `gpu-vm-lifecycle.md` "IP 변경 후"로
 
 ---
 
@@ -90,8 +90,8 @@ VM이 꺼진 경우 먼저 기동한다.
 # make vm-start 가 실제로 하는 것 (Makefile:166):
 gcloud compute instances start $GCP_INSTANCE --zone $GCP_ZONE
 # SSH가 응답할 때까지 3초 간격으로 폴링
-until ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=no $GCP_VM true 2>/dev/null; do sleep 3; done
-echo "VM ready: $GCP_VM"
+until ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=no $VM_SSH_HOST true 2>/dev/null; do sleep 3; done
+echo "VM ready: $VM_SSH_HOST"
 
 # 또는 래퍼:
 make vm-start
@@ -109,7 +109,7 @@ VM ready: ubuntu@35.224.x.x
 ### conda 환경 확인
 
 ```bash
-ssh $GCP_VM "source ~/miniforge3/bin/activate ${CONDA_ENV} && \
+ssh $VM_SSH_HOST "source ~/miniforge3/bin/activate ${CONDA_ENV} && \
   echo CONDA_PREFIX=\$CONDA_PREFIX && \
   ls \$CONDA_PREFIX/lib/libcuvs.so && \
   echo OK"
@@ -130,7 +130,7 @@ OK
 ### rpath 확인
 
 ```bash
-ssh $GCP_VM "source ~/miniforge3/bin/activate ${CONDA_ENV} && \
+ssh $VM_SSH_HOST "source ~/miniforge3/bin/activate ${CONDA_ENV} && \
   objdump -x \$(pg_config --pkglibdir)/pg_cuvs.so | grep RPATH"
 ```
 
@@ -148,7 +148,7 @@ ssh $GCP_VM "source ~/miniforge3/bin/activate ${CONDA_ENV} && \
 빌드 실패 시 VM의 로그를 확인한다.
 
 ```bash
-ssh $GCP_VM "tail -50 /tmp/pg_cuvs_build.log"
+ssh $VM_SSH_HOST "tail -50 /tmp/pg_cuvs_build.log"
 ```
 
 **기대 출력:**
@@ -198,8 +198,8 @@ VM이 TERMINATED 상태일 때만 실행한다.
 ```bash
 # make vm-start 가 실제로 하는 것 (Makefile:166):
 gcloud compute instances start $GCP_INSTANCE --zone $GCP_ZONE
-until ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=no $GCP_VM true 2>/dev/null; do sleep 3; done
-echo "VM ready: $GCP_VM"
+until ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=no $VM_SSH_HOST true 2>/dev/null; do sleep 3; done
+echo "VM ready: $VM_SSH_HOST"
 
 # 또는 래퍼:
 make vm-start
@@ -211,7 +211,7 @@ VM ready: ubuntu@35.224.x.x
 ```
 **-> 성공:** Step 1로  
 **-> SSH 폴링이 1분 이상 반복:** IP 변경 → `gpu-vm-lifecycle.md` "IP 변경 후"로  
-**-> `ERROR: set GCP_INSTANCE in .env.gpu`:** `.env.gpu` 파일에 `GCP_INSTANCE` 설정 필요
+**-> `ERROR: set GCP_INSTANCE in gpu.conf`:** `gpu.conf` 파일에 `GCP_INSTANCE` 설정 필요
 
 ---
 
@@ -227,8 +227,8 @@ rsync -avz --delete \
     --exclude 'src/*.o' \    # VM에서 nvcc로 컴파일된 오브젝트 — 로컬 것으로 덮으면 GPU 아키텍처 불일치
     --exclude 'src/*.bc' \   # LLVM 비트코드(PG JIT용) — 마찬가지
     --exclude '*.so' \       # 빌드 결과물 — sync 방향이 로컬→VM이므로 제외
-    --exclude '.env.gpu' \   # GCP 자격증명 포함 — VM에 올리면 안 됨
-    ./ $GCP_VM:~/pg_cuvs/
+    --exclude 'gpu.conf' \   # GCP 자격증명 포함 — VM에 올리면 안 됨
+    ./ $VM_SSH_HOST:~/pg_cuvs/
 # --delete: 로컬에서 삭제한 파일은 VM에서도 삭제 (파일명 변경 시 VM에 구버전 좀비 방지)
 
 # 또는 래퍼:
@@ -257,13 +257,13 @@ sent N bytes  received M bytes  ...
 
 ```bash
 # 1. VM에 SSH 접속 (-tt 는 TTY 강제 할당 — make 출력이 실시간으로 보임)
-ssh -tt $GCP_VM "cd ~/pg_cuvs && \
+ssh -tt $VM_SSH_HOST "cd ~/pg_cuvs && \
     source ~/miniforge3/bin/activate $CONDA_ENV && \
     make 2>&1 | tee /tmp/pg_cuvs_build.log"
 ```
 
 각 부분의 의미:
-- `ssh -tt $GCP_VM` — VM에 접속 (`$GCP_VM` = `ubuntu@<IP>`, `.env.gpu`에서 읽음)
+- `ssh -tt $VM_SSH_HOST` — VM에 접속 (`$VM_SSH_HOST` = `ubuntu@<IP>`, `gpu.conf`에서 읽음)
 - `cd ~/pg_cuvs` — sync로 올린 소스 디렉토리로 이동
 - `source ~/miniforge3/bin/activate $CONDA_ENV` — cuVS 헤더/라이브러리가 있는 conda 환경 활성화
 - `make` — PGXS 빌드 (`pg_cuvs.so` + `cuvs_wrapper.o` nvcc 컴파일 포함)
@@ -281,8 +281,8 @@ gcc ... -shared -o pg_cuvs.so ...
 ```
 **→ 성공:** Step 3으로  
 **→ `cagra.hpp: No such file or directory`:** 원인 A — conda 환경 미활성화  
-**→ `-lcuvs: not found`:** 원인 A — `$CONDA_ENV` 이름이 `.env.gpu`와 다름  
-**→ 기타 컴파일 오류:** `ssh $GCP_VM "tail -50 /tmp/pg_cuvs_build.log"` 로 상세 확인
+**→ `-lcuvs: not found`:** 원인 A — `$CONDA_ENV` 이름이 `gpu.conf`와 다름  
+**→ 기타 컴파일 오류:** `ssh $VM_SSH_HOST "tail -50 /tmp/pg_cuvs_build.log"` 로 상세 확인
 
 ---
 
@@ -290,7 +290,7 @@ gcc ... -shared -o pg_cuvs.so ...
 
 ```bash
 # make gpu-install 가 실제로 하는 것 (Makefile:193):
-ssh -tt $GCP_VM "cd ~/pg_cuvs && \
+ssh -tt $VM_SSH_HOST "cd ~/pg_cuvs && \
     source ~/miniforge3/bin/activate $CONDA_ENV && \
     sudo -E make install"
 
@@ -313,7 +313,7 @@ make gpu-install
 
 ```bash
 # make gpu-server 가 실제로 하는 것 (Makefile:203):
-ssh -tt $GCP_VM "cd ~/pg_cuvs && \
+ssh -tt $VM_SSH_HOST "cd ~/pg_cuvs && \
     source ~/miniforge3/bin/activate $CONDA_ENV && \
     make server && sudo make install-server"
 
@@ -346,7 +346,7 @@ bash ~/pg_cuvs/infra/scripts/setup/postinstall.sh
 
 ```bash
 # make gpu-postinstall 가 실제로 하는 것 (Makefile:212):
-CONDA_ENV=$CONDA_ENV ssh $GCP_VM "CONDA_ENV=$CONDA_ENV bash -s" \
+CONDA_ENV=$CONDA_ENV ssh $VM_SSH_HOST "CONDA_ENV=$CONDA_ENV bash -s" \
     < infra/scripts/setup/postinstall.sh
 
 # 또는:
@@ -399,7 +399,7 @@ pg_cuvs_server: listening on /tmp/.s.pg_cuvs
 daemon이 떴으니 실제로 인덱스를 만들고 GPU 검색이 동작하는지 확인한다.
 
 ```bash
-ssh $GCP_VM "psql -d postgres" << 'EOF'
+ssh $VM_SSH_HOST "psql -d postgres" << 'EOF'
 CREATE EXTENSION IF NOT EXISTS vector;
 CREATE EXTENSION IF NOT EXISTS pg_cuvs;
 SELECT amname FROM pg_am WHERE amname = 'cagra';
@@ -456,7 +456,7 @@ cd ~/pg_cuvs
 make installcheck
 
 # 로컬 래퍼 (make gpu-test 가 실제로 하는 것, Makefile:198):
-ssh -tt $GCP_VM "cd ~/pg_cuvs && \
+ssh -tt $VM_SSH_HOST "cd ~/pg_cuvs && \
     source ~/miniforge3/bin/activate $CONDA_ENV && \
     make installcheck"
 
@@ -470,7 +470,7 @@ make gpu-test
 All N tests passed.
 ```
 **-> 성공:** 빌드 완료  
-**-> IPC 관련 오류 (`pg_cuvs_server` 응답 없음):** daemon 상태 확인 → `ssh $GCP_VM "sudo systemctl is-active pg-cuvs-server"` → 비활성이면 `sudo systemctl start pg-cuvs-server`  
+**-> IPC 관련 오류 (`pg_cuvs_server` 응답 없음):** daemon 상태 확인 → `ssh $VM_SSH_HOST "sudo systemctl is-active pg-cuvs-server"` → 비활성이면 `sudo systemctl start pg-cuvs-server`  
 **-> regression diff 존재:** 예상 출력과 실제 출력 비교 — `results/` vs `expected/` 확인
 
 ---
@@ -486,21 +486,21 @@ make gpu-test
 - [ ] 설치된 .so 확인
 
 ```bash
-ssh $GCP_VM "ls -la \$(pg_config --pkglibdir)/pg_cuvs.so"
+ssh $VM_SSH_HOST "ls -la \$(pg_config --pkglibdir)/pg_cuvs.so"
 ```
 **기대 출력:** `-rwxr-xr-x 1 root root ... pg_cuvs.so`
 
 - [ ] shared_preload_libraries 설정 확인
 
 ```bash
-ssh $GCP_VM "psql -d postgres -c 'SHOW shared_preload_libraries;'"
+ssh $VM_SSH_HOST "psql -d postgres -c 'SHOW shared_preload_libraries;'"
 ```
 **기대 출력:** `pg_cuvs` 포함
 
 - [ ] E2E smoke test
 
 ```bash
-ssh $GCP_VM "psql -d postgres" << 'EOF'
+ssh $VM_SSH_HOST "psql -d postgres" << 'EOF'
 CREATE EXTENSION IF NOT EXISTS vector;
 CREATE EXTENSION IF NOT EXISTS pg_cuvs;
 SELECT amname FROM pg_am WHERE amname = 'cagra';
@@ -516,7 +516,7 @@ EOF
 - [ ] daemon 로그 확인
 
 ```bash
-ssh $GCP_VM "sudo journalctl -u pg-cuvs-server -n 20 --no-pager"
+ssh $VM_SSH_HOST "sudo journalctl -u pg-cuvs-server -n 20 --no-pager"
 ```
 **기대 출력:** `built index ... vecs` 메시지 포함
 

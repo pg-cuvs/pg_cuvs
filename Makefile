@@ -267,26 +267,36 @@ benchmark:
 .PHONY: benchmark
 
 # ---- Remote VM orchestration -------------------------------------------
-# Load .env.gpu (gitignored) for GCP_VM (the ssh host, whatever the provider),
-# and — for the legacy GCP path — GCP_INSTANCE, GCP_ZONE, GCP_PROJECT.
+# Local, gitignored config: VM_SSH_HOST (the ssh host, whatever the provider)
+# and — for the legacy GCP path only — GCP_INSTANCE, GCP_ZONE, GCP_PROJECT.
+#
+# The file used to be `.env.gpu`. It holds no secrets (an ssh host alias, a
+# conda env name, CUDA_ARCH), but the `.env` prefix trips tooling that refuses
+# to read dotenv files, so it is now `gpu.conf`. Both are included and the
+# legacy one is read first, so an existing .env.gpu keeps working and gpu.conf
+# wins where both define a key.
 -include .env.gpu
+-include gpu.conf
 export
 
 # On GCP the external IP is ephemeral (reassigned on every stop/start), so
-# .env.gpu's GCP_VM goes stale and the CURRENT IP has to come from gcloud.
+# the configured VM_SSH_HOST goes stale and the CURRENT IP has to come from gcloud.
 # Brev (the current main provider, see infra/README.md) has no such lookup:
-# GCP_VM *is* the host. So the gcloud probe is opt-in via USE_GCP_IP=1.
+# VM_SSH_HOST *is* the host. So the gcloud probe is opt-in via USE_GCP_IP=1.
 #
 # Leaving it unconditional cost us twice. It forks gcloud once per $(VM_HOST)
 # reference — recursive '=' re-evaluates the shell on every expansion — so a
 # `make -n gpu-test-all` (6 references, nothing executed) took 6.7s vs 0.24s
 # for a target that never mentions the host. Worse, a successful lookup WINS
-# over GCP_VM: with a Brev host in GCP_VM but a stale GCP_INSTANCE still in
-# .env.gpu and live gcloud auth, every gpu-* target would silently retarget
+# over VM_SSH_HOST: with a Brev host configured but a stale GCP_INSTANCE still
+# in the config file and live gcloud auth, every gpu-* target would silently retarget
 # the old GCP machine — and `sync` is `rsync --delete`.
+# VM_SSH_HOST is provider-neutral; GCP_VM is the pre-Brev name kept as a
+# fallback so an existing config file still resolves.
+VM_SSH_HOST ?= $(GCP_VM)
 GCP_USER ?= ubuntu
 VM_IP = $(if $(USE_GCP_IP),$(shell gcloud compute instances describe $(GCP_INSTANCE) --zone $(GCP_ZONE) $(if $(GCP_PROJECT),--project $(GCP_PROJECT)) --format='value(networkInterfaces[0].accessConfigs[0].natIP)' 2>/dev/null),)
-VM_HOST = $(if $(VM_IP),$(GCP_USER)@$(VM_IP),$(GCP_VM))
+VM_HOST = $(if $(VM_IP),$(GCP_USER)@$(VM_IP),$(VM_SSH_HOST))
 unexport VM_IP VM_HOST
 
 # Every remote command sources ~/.pg_cuvs_env, the environment file that
@@ -304,8 +314,8 @@ REMOTE_ENV = { test -f ~/.pg_cuvs_env || { echo 'ERROR: ~/.pg_cuvs_env missing o
 	gpu-test-delta-restart gpu-test-all gpu-test-objstore gpu-test-vram gpu-test-maxidx
 
 vm-start:
-	@test -n "$(GCP_INSTANCE)" || (echo "ERROR: set GCP_INSTANCE in .env.gpu"; exit 1)
-	@test -n "$(GCP_PROJECT)" || (echo "ERROR: set GCP_PROJECT in .env.gpu"; exit 1)
+	@test -n "$(GCP_INSTANCE)" || (echo "ERROR: set GCP_INSTANCE in gpu.conf"; exit 1)
+	@test -n "$(GCP_PROJECT)" || (echo "ERROR: set GCP_PROJECT in gpu.conf"; exit 1)
 	gcloud compute instances start $(GCP_INSTANCE) --zone $(GCP_ZONE) --project $(GCP_PROJECT)
 	@echo "Waiting for SSH..."
 	@until ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=no $(VM_HOST) true 2>/dev/null; \
@@ -313,7 +323,7 @@ vm-start:
 	@echo "VM ready: $(VM_HOST)"
 
 vm-stop:
-	@test -n "$(GCP_PROJECT)" || (echo "ERROR: set GCP_PROJECT in .env.gpu"; exit 1)
+	@test -n "$(GCP_PROJECT)" || (echo "ERROR: set GCP_PROJECT in gpu.conf"; exit 1)
 	gcloud compute instances stop $(GCP_INSTANCE) --zone $(GCP_ZONE) --project $(GCP_PROJECT)
 
 # rsync local → VM. Excludes build artifacts to avoid clobbering remote .o files
@@ -325,6 +335,7 @@ sync:
 		--exclude 'src/*.bc' \
 		--exclude '*.so' \
 		--exclude '.env.gpu' \
+		--exclude 'gpu.conf' \
 		./ $(VM_HOST):~/pg_cuvs/
 
 gpu-build:
@@ -477,7 +488,7 @@ gpu-shell:
 	ssh -tt $(VM_HOST)
 
 # Report the VM's current power state and external IP (ephemeral IPs change on
-# stop/start, so .env.gpu's GCP_VM can go stale). Usage: make vm-ip
+# stop/start, so the configured VM_SSH_HOST can go stale). Usage: make vm-ip
 vm-ip:
 	@gcloud compute instances describe $(GCP_INSTANCE) --zone $(GCP_ZONE) \
 		$(if $(GCP_PROJECT),--project $(GCP_PROJECT)) \

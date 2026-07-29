@@ -128,14 +128,14 @@ sudo systemctl is-active sshd          # 'active'
 
 ## 외부 IP 변경 처리
 
-GCE의 ephemeral IP는 정지/시작 시 바뀐다. `.env.gpu`의 `GCP_VM` 갱신:
+GCE의 ephemeral IP는 정지/시작 시 바뀐다. `gpu.conf`의 `VM_SSH_HOST` 갱신:
 
 ```bash
 NEW_IP=$(gcloud compute instances describe <BROKEN_VM> --zone <ZONE> \
   --format="value(networkInterfaces[0].accessConfigs[0].natIP)")
 
-cat > .env.gpu << EOF
-GCP_VM=ubuntu@$NEW_IP
+cat > gpu.conf << EOF
+VM_SSH_HOST=ubuntu@$NEW_IP
 GCP_INSTANCE=<BROKEN_VM>
 GCP_ZONE=<ZONE>
 GCP_PROJECT=<PROJECT>

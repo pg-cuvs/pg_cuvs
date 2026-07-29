@@ -5,6 +5,7 @@
 .venv
 .env
 .env.gpu
+gpu.conf
 .env.local
 
 # Local-only sensitive context — never commit. Durable private copies live in

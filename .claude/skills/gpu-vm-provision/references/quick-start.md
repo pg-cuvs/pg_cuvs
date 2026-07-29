@@ -50,8 +50,8 @@ cp terraform.tfvars.example terraform.tfvars
 terraform init && terraform apply -auto-approve
 # ~30초 안에 VM 생성됨
 
-terraform output env_gpu_snippet > ../../.env.gpu
-# .env.gpu에 GCP_VM, GCP_INSTANCE, CUDA_ARCH 등 자동 채워짐
+terraform output env_gpu_snippet > ../../gpu.conf
+# gpu.conf에 VM_SSH_HOST, GCP_INSTANCE, CUDA_ARCH 등 자동 채워짐
 ```
 
 **STOCKOUT 오류 시**: tfvars의 zone을 b/c/f로 변경 후 재시도.

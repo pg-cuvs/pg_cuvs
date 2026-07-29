@@ -206,7 +206,7 @@ conda create -n cuvs_dev_25 -y \
     libcuvs=25.10 cuda-toolkit=12.* python=3.11
 "
 
-# .env.gpu의 CONDA_ENV를 cuvs_dev_25로 변경 후 재빌드
+# gpu.conf의 CONDA_ENV를 cuvs_dev_25로 변경 후 재빌드
 ```
 
 `-Wl,-rpath`가 conda env path를 박아두므로 .so 재빌드 필요.

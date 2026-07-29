@@ -93,7 +93,7 @@ make gpu-bench N=1000000 DIM=384 K=100
 
 ```bash
 # GPU 메모리 현황
-ssh $GCP_VM "nvidia-smi --query-gpu=memory.total,memory.used,memory.free \
+ssh $VM_SSH_HOST "nvidia-smi --query-gpu=memory.total,memory.used,memory.free \
   --format=csv,noheader,nounits"
 ```
 
@@ -106,7 +106,7 @@ ssh $GCP_VM "nvidia-smi --query-gpu=memory.total,memory.used,memory.free \
 
 ```bash
 # daemon 보유 인덱스 및 VRAM 사용량 (journal 기준)
-ssh $GCP_VM "sudo journalctl -u pg-cuvs-server --no-pager \
+ssh $VM_SSH_HOST "sudo journalctl -u pg-cuvs-server --no-pager \
   | grep -E 'loaded index|built index'"
 ```
 
@@ -117,7 +117,7 @@ ssh $GCP_VM "sudo journalctl -u pg-cuvs-server --no-pager \
 
 ```bash
 # 백엔드별 CUDA context 소유 여부 확인 (pg_cuvs_server 외 프로세스가 GPU를 잡으면 ADR-002 위반)
-ssh $GCP_VM "nvidia-smi --query-compute-apps=pid,process_name,used_gpu_memory \
+ssh $VM_SSH_HOST "nvidia-smi --query-compute-apps=pid,process_name,used_gpu_memory \
   --format=csv,noheader"
 ```
 
@@ -185,11 +185,11 @@ CREATE INDEX cagra_10k_384 ON bench_10k_384 USING cagra (v vector_l2_ops);
 
 ```bash
 # 빌드 직후 daemon journal에서 VRAM 사용량 확인
-ssh $GCP_VM "sudo journalctl -u pg-cuvs-server --no-pager | grep 'built index' | tail -5"
+ssh $VM_SSH_HOST "sudo journalctl -u pg-cuvs-server --no-pager | grep 'built index' | tail -5"
 # 출력 예: built index 16384/16392 (1000000 vecs, 512 MB VRAM)
 
 # .cagra + .tids 아티팩트 크기
-ssh $GCP_VM "ls -lh /tmp/cuvs_indexes/"
+ssh $VM_SSH_HOST "ls -lh /tmp/cuvs_indexes/"
 ```
 
 ### 4-3. 검색 latency 측정 (cold/warm planning, k=10/100/1000)
@@ -219,10 +219,10 @@ SELECT pg_cuvs_last_search_latency_us();
 
 ```bash
 # daemon 재시작 후 reload 시간
-ssh $GCP_VM "time sudo systemctl restart pg-cuvs-server"
+ssh $VM_SSH_HOST "time sudo systemctl restart pg-cuvs-server"
 
 # 각 인덱스의 reload 확인
-ssh $GCP_VM "sudo journalctl -u pg-cuvs-server --no-pager | grep 'loaded index'"
+ssh $VM_SSH_HOST "sudo journalctl -u pg-cuvs-server --no-pager | grep 'loaded index'"
 ```
 
 ### 4-5. fallback count 확인
@@ -231,7 +231,7 @@ Phase 2에서 `pg_stat_gpu_search`가 추가되면 해당 뷰를 사용한다.
 현재는 daemon journal로 확인한다.
 
 ```bash
-ssh $GCP_VM "sudo journalctl -u pg-cuvs-server --no-pager \
+ssh $VM_SSH_HOST "sudo journalctl -u pg-cuvs-server --no-pager \
   | grep -iE 'fallback|OOM|evict|circuit'"
 ```
 
@@ -259,7 +259,7 @@ ssh $GCP_VM "sudo journalctl -u pg-cuvs-server --no-pager \
 
 ```bash
 # daemon이 단독으로 GPU를 점유하는지 확인 (PG 백엔드 0 MB여야 함)
-ssh $GCP_VM "nvidia-smi --query-compute-apps=pid,process_name,used_gpu_memory \
+ssh $VM_SSH_HOST "nvidia-smi --query-compute-apps=pid,process_name,used_gpu_memory \
   --format=csv,noheader"
 ```
 

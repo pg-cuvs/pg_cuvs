@@ -60,7 +60,7 @@ infra/brev/
 
 개발용으로 다른 인스턴스를 쓸 때 확인할 것:
 
-1. **`CUDA_ARCH`를 GPU에 맞춘다** — A100=sm_80, L4=sm_89, H100=sm_90 (`.env.gpu`).
+1. **`CUDA_ARCH`를 GPU에 맞춘다** — A100=sm_80, L4=sm_89, H100=sm_90 (`gpu.conf`).
 2. **이미지 계열** — 부트스트랩은 `shadeform` 유저 + systemd를 전제한다. 다른 계열
    (RunPod: root, systemd 없음)이면 `USER_HOME`과 `systemctl`→`pg_ctlcluster` 교체 필요.
 3. **`routing_golden_measured`는 이식 불가** — 테스트 헤더가 직접 밝히듯 실측 계수로
@@ -87,7 +87,7 @@ brev refresh                 # ~/.brev/ssh_config 갱신 → `ssh <name>` 가능
 scp infra/brev/bootstrap.sh <name>:/home/shadeform/
 ssh <name> 'bash /home/shadeform/bootstrap.sh 2>&1 | tee bootstrap.log'
 
-# 3. 완료 후 로컬 .env.gpu의 호스트를 새 인스턴스로 갱신 → pg-cuvs-dev 스킬로 전환
+# 3. 완료 후 로컬 gpu.conf의 호스트를 새 인스턴스로 갱신 → pg-cuvs-dev 스킬로 전환
 ```
 
 환경 상수 (shadeform 계열 이미지 — massedcompute·paperspace 모두 동일, 2026-07 기준):

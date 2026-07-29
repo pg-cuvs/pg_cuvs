@@ -140,8 +140,8 @@ nohup + log tail로 진행률을 확인한다:
 
 ```bash
 # VM에서 진행 확인
-ssh $GCP_VM 'tail -f /tmp/cohere_bench.log'
-ssh $GCP_VM 'grep -E "recall|QPS|build|p50" /tmp/cohere_bench.log | tail -20'
+ssh $VM_SSH_HOST 'tail -f /tmp/cohere_bench.log'
+ssh $VM_SSH_HOST 'grep -E "recall|QPS|build|p50" /tmp/cohere_bench.log | tail -20'
 ```
 
 **결과 위치:** `bench/results/cohere_N<N>.jsonl` +

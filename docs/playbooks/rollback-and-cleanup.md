@@ -205,8 +205,8 @@ mv /tmp/cuvs_indexes /var/lib/postgresql/16/main/cuvs_indexes
 # 로컬에서 VM으로 소스 동기화 (Makefile:L179)
 rsync -avz --delete \
     --exclude '.git' --exclude 'src/*.o' --exclude 'src/*.bc' \
-    --exclude '*.so' --exclude '.env.gpu' \
-    ./ $(GCP_VM):~/pg_cuvs/
+    --exclude '*.so' --exclude 'gpu.conf' \
+    ./ $(VM_SSH_HOST):~/pg_cuvs/
 ```
 
 **기대 출력:**
@@ -217,11 +217,11 @@ src/pg_cuvs.c
 sent N bytes  received M bytes
 ```
 **-> 성공:** Step 4-2로  
-**-> "Connection refused" / "Host key verification failed":** GCP_VM 환경변수 및 SSH 키 확인
+**-> "Connection refused" / "Host key verification failed":** VM_SSH_HOST 환경변수 및 SSH 키 확인
 
 ```bash
 # Step 4-2: VM에서 재빌드 (Makefile:L188)
-ssh -tt $(GCP_VM) "cd ~/pg_cuvs && source ~/miniforge3/bin/activate $(CONDA_ENV) && make 2>&1 | tee /tmp/pg_cuvs_build.log"
+ssh -tt $(VM_SSH_HOST) "cd ~/pg_cuvs && source ~/miniforge3/bin/activate $(CONDA_ENV) && make 2>&1 | tee /tmp/pg_cuvs_build.log"
 ```
 
 **기대 출력 (마지막 줄):**
@@ -233,7 +233,7 @@ build complete
 
 ```bash
 # Step 4-3: VM에서 설치 (Makefile:L193)
-ssh -tt $(GCP_VM) "cd ~/pg_cuvs && source ~/miniforge3/bin/activate $(CONDA_ENV) && sudo -E make install"
+ssh -tt $(VM_SSH_HOST) "cd ~/pg_cuvs && source ~/miniforge3/bin/activate $(CONDA_ENV) && sudo -E make install"
 ```
 
 **기대 출력:**
@@ -244,7 +244,7 @@ ssh -tt $(GCP_VM) "cd ~/pg_cuvs && source ~/miniforge3/bin/activate $(CONDA_ENV)
 
 ```bash
 # Step 4-4: daemon 바이너리도 교체 (Makefile:L203)
-ssh -tt $(GCP_VM) "cd ~/pg_cuvs && source ~/miniforge3/bin/activate $(CONDA_ENV) && make server && sudo make install-server"
+ssh -tt $(VM_SSH_HOST) "cd ~/pg_cuvs && source ~/miniforge3/bin/activate $(CONDA_ENV) && make server && sudo make install-server"
 ```
 
 **기대 출력:**
@@ -308,8 +308,8 @@ psql -d postgres -c "SHOW shared_preload_libraries;"
 # 로컬에서 VM으로 최신 소스 동기화 (Makefile:L179)
 rsync -avz --delete \
     --exclude '.git' --exclude 'src/*.o' --exclude 'src/*.bc' \
-    --exclude '*.so' --exclude '.env.gpu' \
-    ./ $(GCP_VM):~/pg_cuvs/
+    --exclude '*.so' --exclude 'gpu.conf' \
+    ./ $(VM_SSH_HOST):~/pg_cuvs/
 ```
 
 **기대 출력:**
@@ -321,7 +321,7 @@ sent N bytes  received M bytes
 
 ```bash
 # VM에서 빌드 (Makefile:L188)
-ssh -tt $(GCP_VM) "cd ~/pg_cuvs && source ~/miniforge3/bin/activate $(CONDA_ENV) && make 2>&1 | tee /tmp/pg_cuvs_build.log"
+ssh -tt $(VM_SSH_HOST) "cd ~/pg_cuvs && source ~/miniforge3/bin/activate $(CONDA_ENV) && make 2>&1 | tee /tmp/pg_cuvs_build.log"
 ```
 
 **기대 출력:**
@@ -332,7 +332,7 @@ build complete
 
 ```bash
 # 설치 (Makefile:L193)
-ssh -tt $(GCP_VM) "cd ~/pg_cuvs && source ~/miniforge3/bin/activate $(CONDA_ENV) && sudo -E make install"
+ssh -tt $(VM_SSH_HOST) "cd ~/pg_cuvs && source ~/miniforge3/bin/activate $(CONDA_ENV) && sudo -E make install"
 ```
 
 **기대 출력:**
@@ -342,7 +342,7 @@ ssh -tt $(GCP_VM) "cd ~/pg_cuvs && source ~/miniforge3/bin/activate $(CONDA_ENV)
 
 ```bash
 # daemon 바이너리 교체 + 서비스 등록 (Makefile:L203)
-ssh -tt $(GCP_VM) "cd ~/pg_cuvs && source ~/miniforge3/bin/activate $(CONDA_ENV) && make server && sudo make install-server"
+ssh -tt $(VM_SSH_HOST) "cd ~/pg_cuvs && source ~/miniforge3/bin/activate $(CONDA_ENV) && make server && sudo make install-server"
 ```
 
 **기대 출력:**
@@ -352,7 +352,7 @@ ssh -tt $(GCP_VM) "cd ~/pg_cuvs && source ~/miniforge3/bin/activate $(CONDA_ENV)
 
 ```bash
 # postinstall: shared_preload_libraries 재설정 포함 (Makefile:L212)
-CONDA_ENV=$(CONDA_ENV) ssh $(GCP_VM) "CONDA_ENV=$(CONDA_ENV) bash -s" < infra/scripts/setup/postinstall.sh
+CONDA_ENV=$(CONDA_ENV) ssh $(VM_SSH_HOST) "CONDA_ENV=$(CONDA_ENV) bash -s" < infra/scripts/setup/postinstall.sh
 ```
 
 **기대 출력:**
