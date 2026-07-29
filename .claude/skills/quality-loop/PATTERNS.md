@@ -25,6 +25,7 @@
 
 - [2026-07-28] **같은 결함 클래스를 한 곳만 고치고 형제 호출부를 방치** — `pg_cuvs_server.c:2946`(패스1 수정) vs `:6753` IVF-PQ(패스2에서야 수정) — 결함을 고친 뒤 **반드시 같은 패턴을 리포 전체에서 grep** 하라. tail 미기록 건은 소비 루프가 `break`인지 `continue`인지에 따라 심각도가 다르다(`continue`가 더 나쁨 — 첫 센티넬에서 안 멈추고 전 슬롯을 훑음).
 - [2026-07-28] **수정이 문서화된 계약을 어기는 것** — `cuvs_wrapper.cu:660`에 패스1이 넣은 `return 3` — 헤더(`cuvs_wrapper.h:114`)는 0/1/2만 문서화. **가드를 추가할 때 새 반환값을 발명하지 말고 헤더 계약을 먼저 읽어라.** shim이 그 값을 낼 수 없으면 고치려던 발산을 다른 형태로 재생산하는 셈이다.
+- [2026-07-29] **계약이 두 조건을 약속했는데 구현은 한 조건만 이행** — `cuvs_wrapper.h:52-58` TAIL CONTRACT는 미충족 슬롯의 사유로 (a) 코퍼스가 top_k보다 작음 (b) **프리필터가 배제함** 둘을 들고 양쪽 다 `CUVS_PAD_ITEM_ID`를 약속한다. `cuvs_wrapper.cu`의 `pad_results` 호출 16곳은 전부 (a)뿐 — (b)는 cuVS가 쓴 자체 마커(CAGRA는 uint32 계열)가 그대로 나간다. shim은 `shim_topk`가 두 경우를 구분하지 않아 **양쪽 다 이행**한다. 탐지: 계약 문장의 사유를 절로 쪼개 각각의 이행 코드를 찾아라 — "패딩하는 곳이 있다"로 만족하지 말 것. 헤더가 "callers may detect unfilled slots by item_id alone"이라고 명시 초대까지 하고 있어 다음 호출자가 밟는다. (재발 축: PATTERNS "수정이 문서화된 계약을 어기는 것"의 역방향 — 계약이 구현을 앞서간 경우)
 - [2026-07-28] **`.cu`가 의도적으로 비워둔 필드를 다른 함수가 읽음** — `cuvs_wrapper.cu:1679` `extract_adjacency`가 `dataset.extent(1)`를 읽는데 `deserialize`(1210)/`extend`(1283)가 그 dataset을 0x0 placeholder로 교체 — "의도적으로 비움" 주석이 달린 멤버를 grep해 **읽는 쪽 전부**를 확인하라. 이 건은 은폐가 이중이다: shim이 가릴 뿐 아니라 GPU에서도 **데몬 재시작을 끼우지 않은** 수동 테스트는 통과한다.
 
 ## VM 검증 운영 함정 (2026-07-28 세션에서 실제로 밟은 것)
@@ -56,3 +57,5 @@
 - [2026-07-28] **`cuvs_ipc_export_adjacency`의 응답 헤더 필드 용도 변경** — `cuvs_ipc.c:1139-1141` (`latency_us`→graph_degree, `delta_merged`→dim, `error`→shm key) — 관례 이탈이지만 양측 해석이 일치하고 유효성 검사도 있어 버그 아님. 단, 헤더 변경 시 조용히 깨질 지점이라 주의 대상.
 - [2026-07-28] **`routing_golden` ↔ `routing_golden_measured`는 중복 아님** — 전자는 `enable_*` 토글로 강제된 라우팅(티어 이식 가능), 후자는 토글 없는 비용 크기 기반 결정(측정 계수 의존). 케이스 4도 서로 다름. **통합하지 말 것.**
 - [2026-07-28] **macOS에서 `-D_POSIX_C_SOURCE=200809L`로 `pg_cuvs_server.c` 문법 검사 시 `MAP_ANONYMOUS` undeclared** — 플랫폼 아티팩트이지 코드 결함이 아님(HEAD에서도 동일 재현). 로컬 검사에는 `-D_DARWIN_C_SOURCE`를 쓸 것.
+- [2026-07-29] **`handle_search_batch`의 `tid = 0` 기록은 #110 패턴이 아님** — `pg_cuvs_server.c:3895`가 범위 밖 item_id에 `out[i].tid = 0`을 쓴다(다른 소비 루프는 `continue`/`break`). 배치 API는 Q×K 고정 행렬을 반환해야 해서 **건너뛸 수 없고**, `tid = 0`은 백엔드가 `pg_cuvs.c:4990`에서 `continue`로 거르는 **합의된 센티넬**이다. 소비 루프 가드를 일괄 비교할 때 반환 형태가 고정 행렬인 곳은 분리해서 볼 것.
+- [2026-07-29] **`cuvs_ipc_*` 심볼이 wrapper 대조표에 안 잡히는 것** — `cuvs_wrapper.h` 선언 39개는 shim/`.cu` 양쪽에 100% 존재한다(3회차 확인). 대조 스크립트가 `grep -c "\bname\b"`면 주석 언급까지 세므로 "존재"만 판정하고 **의미 일치는 판정 못 한다** — 발산은 항상 본문 대조로만 잡힌다.
