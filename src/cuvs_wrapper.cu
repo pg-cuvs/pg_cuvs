@@ -720,19 +720,17 @@ cuvs_bf_search_filtered(
     CuvsBfIndexImpl *impl = static_cast<CuvsBfIndexImpl *>(index);
     if (dim != impl->dim)
         return 2;
-    /* Unlike cuvs_bf_search above, the filtered path below searches idx_f32
-     * unconditionally — but a float16 index (precision == 1) builds only
-     * idx_f16 and leaves idx_f32 null. Refuse the combination instead of
-     * dereferencing null: this runs in the daemon, so a SIGSEGV here takes
-     * down every backend's session, not just this query. The caller treats a
-     * non-zero return as "prefilter unavailable" and falls back. Teaching the
-     * filtered path to search idx_f16 (mirroring cuvs_bf_search's half-query
-     * conversion) is the real fix and needs a GPU to validate.
+    /* Both precisions are searchable below (the search call branches on
+     * impl->precision exactly as cuvs_bf_search does). Only a build that left
+     * the active variant null gets refused — that would be corruption, and a
+     * null deref here runs in the daemon, so it takes down every backend's
+     * session rather than just this query.
      *
      * 1, not a new code: cuvs_wrapper.h documents only 0/2/1 for this entry
      * point, and the CPU shim — which has no precision concept at all — can
      * never produce anything outside that set. */
-    if (!impl->idx_f32)
+    if (impl->precision == 1 ? (impl->idx_f16 == nullptr)
+                             : (impl->idx_f32 == nullptr))
         return 1;
     /* The bitset is dereferenced unconditionally below; the CPU shim refuses
      * NULL the same way rather than reading it as "no filter" (#110). */
@@ -752,11 +750,8 @@ cuvs_bf_search_filtered(
     try {
         raft::device_resources &res = _pr.get();
 
-        /* Upload query */
-        auto d_queries   = raft::make_device_matrix<float,   int64_t>(res, (int64_t)1, (int64_t)dim);
         auto d_indices   = raft::make_device_matrix<int64_t, int64_t>(res, 1, bk);
         auto d_distances = raft::make_device_matrix<float,   int64_t>(res, 1, bk);
-        raft::copy(d_queries.data_handle(), query_vec, dim, res.get_stream());
 
         /* Upload bitset. pg_cuvs builds bit=1 = EXCLUDE (daemon memsets 0xFF then
          * clears kept items); cuVS bitset_filter keeps SET bits (bit=1 = INCLUDE),
@@ -773,14 +768,36 @@ cuvs_bf_search_filtered(
                              d_bs_data.data_handle(), bitset_bits);
         auto prefilter = cuvs::neighbors::filtering::bitset_filter<uint32_t, int64_t>(bv);
 
-        /* Filtered search */
+        /* Filtered search. The query is uploaded inside each branch because the
+         * device matrix element type follows the index variant — half for a
+         * float16 index, float otherwise. Same shape as cuvs_bf_search; the
+         * `.vectors` sidecar on disk is always float32, so precision only ever
+         * affects the device-resident copy and the query conversion. */
         cuvs::neighbors::brute_force::search_params params;
-        cuvs::neighbors::brute_force::search(
-            res, params, *impl->idx_f32,
-            raft::make_const_mdspan(d_queries.view()),
-            d_indices.view(),
-            d_distances.view(),
-            prefilter);
+        if (impl->precision == 1 /* float16 */) {
+            auto d_queries = raft::make_device_matrix<half, int64_t>(res, (int64_t)1, (int64_t)dim);
+            {
+                std::vector<half> h_q(dim);
+                for (int i = 0; i < dim; i++)
+                    h_q[i] = __float2half(query_vec[i]);
+                raft::copy(d_queries.data_handle(), h_q.data(), dim, res.get_stream());
+            }
+            cuvs::neighbors::brute_force::search(
+                res, params, *impl->idx_f16,
+                raft::make_const_mdspan(d_queries.view()),
+                d_indices.view(),
+                d_distances.view(),
+                prefilter);
+        } else {
+            auto d_queries = raft::make_device_matrix<float, int64_t>(res, (int64_t)1, (int64_t)dim);
+            raft::copy(d_queries.data_handle(), query_vec, dim, res.get_stream());
+            cuvs::neighbors::brute_force::search(
+                res, params, *impl->idx_f32,
+                raft::make_const_mdspan(d_queries.view()),
+                d_indices.view(),
+                d_distances.view(),
+                prefilter);
+        }
 
         res.sync_stream();
 
