@@ -12,6 +12,6 @@ corpus="${PGCUVS_CORPUS:-$HOME/anbench/data/corpus.fbin}"
 queries="${PGCUVS_QUERIES:-$HOME/anbench/data/queries_10k.fbin}"
 # shellcheck disable=SC1091
 source "$conda/bin/activate" "$env"
-exec python3 "$REPO/tools/filter_competitor_spike.py" \
+exec python3 "$REPO/bench/protocol/spikes/filter_competitor_spike.py" \
   --corpus "$corpus" --queries "$queries" --n 100000 --nq 200 \
   --dbname "${PGDATABASE:-bench}"
