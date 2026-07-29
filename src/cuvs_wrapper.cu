@@ -752,6 +752,23 @@ cuvs_bf_search_filtered(
 
         auto d_indices   = raft::make_device_matrix<int64_t, int64_t>(res, 1, bk);
         auto d_distances = raft::make_device_matrix<float,   int64_t>(res, 1, bk);
+        /* store_result() below trusts an in-range id to mean "cuVS wrote a
+         * real neighbour here". That is false when the filter excludes more
+         * than bk-n_pass candidates: unlike CAGRA, brute_force::search does
+         * not write anything to a slot it has nothing to put there, leaving
+         * whatever raft::make_device_matrix's allocator handed back — device
+         * memory the pool may have reused from an unrelated prior call.
+         * Measured on an A100: reinterpreted distance pairs from a previous
+         * search (e.g. 0x4110000041100000, decoding as float(9.0),float(9.0))
+         * land in-range and are indistinguishable from a genuine hit by value
+         * alone. Seed every slot to CUVS_PAD_ITEM_ID first so an untouched
+         * slot is deterministically caught by store_result()'s id<0 branch
+         * regardless of pool history; a slot cuVS does write overwrites this.
+         * CUVS_PAD_ITEM_ID is int64_t(-1), whose bit pattern is all-0xFF, so a
+         * raw byte memset produces the exact value. Applies to both precision
+         * branches below — same d_indices buffer either way. */
+        cudaMemsetAsync(d_indices.data_handle(), 0xFF,
+                         (size_t)bk * sizeof(int64_t), res.get_stream());
 
         /* Upload bitset. pg_cuvs builds bit=1 = EXCLUDE (daemon memsets 0xFF then
          * clears kept items); cuVS bitset_filter keeps SET bits (bit=1 = INCLUDE),
@@ -866,6 +883,15 @@ cuvs_cagra_search_filtered(
         auto d_queries   = raft::make_device_matrix<float,    int64_t>(res, (int64_t)1, (int64_t)dim);
         auto d_indices   = raft::make_device_matrix<uint32_t, int64_t>(res, 1, bk);
         auto d_distances = raft::make_device_matrix<float,    int64_t>(res, 1, bk);
+        /* cagra::search has, on an A100, been observed to write a deterministic
+         * out-of-range marker (0xFFFFFFFF) to every excluded slot rather than
+         * leaving pool memory untouched (see cuvs_bf_search_filtered above for
+         * the sibling entry point where that assumption is measurably false).
+         * That is this build's empirical behaviour, not a documented cuVS
+         * contract — seed the same way so store_result()'s correctness does
+         * not depend on it. A slot cuVS does write overwrites this. */
+        cudaMemsetAsync(d_indices.data_handle(), 0xFF,
+                         (size_t)bk * sizeof(uint32_t), res.get_stream());
         raft::copy(d_queries.data_handle(), query_vec, dim, res.get_stream());
 
         /* Upload bitset. pg_cuvs builds bit=1 = EXCLUDE; cuVS bitset_filter keeps
