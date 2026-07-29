@@ -65,7 +65,7 @@
 - named volume 함정 → bind mount + 명시적 copy
 - pipe truncation → `ssh -tt` + `tee` 실시간 스트리밍
 - ad-hoc 명령 → 모든 GCP 실행을 make 타깃으로 캡슐화
-- secrets → `.env.gpu` (gitignored)
+- secrets → `gpu.conf` (gitignored)
 
 **대안**: GPU 노트북 구매. 보류 — 클라우드 비용이 더 저렴하고 다양한 GPU 아키텍처 테스트가 가능.
 

@@ -47,7 +47,7 @@ ssh ubuntu@<IP> 'sudo journalctl -u pg-cuvs-server --no-pager -n 20 | grep -i "G
 
 ### A. Ephemeral 외부 IP 변경
 `pg-cuvs-dev`/`pg-cuvs-dev-mgpu`는 정적 IP가 아니다. stop/start 시 외부 IP가
-바뀐다(예: 이번 세션 `35.224.130.40` → `104.197.150.30`). `.env.gpu`의 `GCP_VM`은
+바뀐다(예: 이번 세션 `35.224.130.40` → `104.197.150.30`). `gpu.conf`의 `VM_SSH_HOST`은
 이전 IP를 가리키므로 `make sync`/`gpu-*`가 죽은 호스트로 붙는다.
 
 ### B. NVIDIA driver/library version mismatch (stop/start의 주 함정)
@@ -79,8 +79,8 @@ PROJ=your-gcp-project
 NEWIP=$(gcloud compute instances describe pg-cuvs-dev --zone=us-central1-b --project=$PROJ \
   --format='get(networkInterfaces[0].accessConfigs[0].natIP)')
 echo "new IP = $NEWIP"
-# .env.gpu 의 GCP_VM=ubuntu@<old> 를 ubuntu@$NEWIP 로 수정.
-# 일회성으로는 make 에 override: make sync GCP_VM=ubuntu@$NEWIP
+# gpu.conf 의 VM_SSH_HOST=ubuntu@<old> 를 ubuntu@$NEWIP 로 수정.
+# 일회성으로는 make 에 override: make sync VM_SSH_HOST=ubuntu@$NEWIP
 ```
 
 ### Driver/library mismatch 후 (reset)
@@ -98,7 +98,7 @@ PROJ=your-gcp-project
 gcloud compute instances start pg-cuvs-dev-mgpu --zone=us-central1-f --project=$PROJ
 MGIP=$(gcloud compute instances describe pg-cuvs-dev-mgpu --zone=us-central1-f --project=$PROJ \
   --format='get(networkInterfaces[0].accessConfigs[0].natIP)')
-make sync gpu-build gpu-server gpu-install gpu-postinstall GCP_VM=ubuntu@$MGIP
+make sync gpu-build gpu-server gpu-install gpu-postinstall VM_SSH_HOST=ubuntu@$MGIP
 # (systemd unit / shared_preload / extension refresh 는 gpu-snapshot/sharding 플레이북 참조)
 # ... 작업 끝나면 반드시:
 gcloud compute instances stop pg-cuvs-dev-mgpu --zone=us-central1-f --project=$PROJ
@@ -144,7 +144,7 @@ ssh ubuntu@<IP> 'curl -s -H "Metadata-Flavor: Google" \
   업그레이드). `apt list --installed | grep nvidia` 확인 후 드라이버/DKMS 재설치.
 - mgpu VM이 start 후 GPU 0개만 보이면: zone capacity/quota 문제일 수 있음 — 다른
   zone 또는 시간 재시도.
-- `.env.gpu` IP를 고정하고 싶으면: 정적 외부 IP를 예약해 VM에 연결(운영 정책 결정 필요).
+- `gpu.conf` IP를 고정하고 싶으면: 정적 외부 IP를 예약해 VM에 연결(운영 정책 결정 필요).
 - 비용: mgpu VM을 stop 안 하고 방치한 흔적이 보이면 즉시 stop + 사용 시간 보고.
 
 관련: `gpu-vm-build-and-test.md`(빌드/테스트), `gcs-snapshot-ops.md`(SA/GCS),

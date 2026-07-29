@@ -186,6 +186,29 @@ pad_results(CuvsSearchResult *results, int from, int to, uint32_t metric)
     }
 }
 
+/* TAIL CONTRACT (cuvs_wrapper.h, #103), prefilter clause. pad_results above
+ * covers only the first stated reason a slot goes unfilled — the corpus holding
+ * fewer than top_k vectors. The second, "a prefilter excluded them", lands
+ * INSIDE [0, bk): cuVS writes its own no-neighbour marker there, and that marker
+ * is not CUVS_PAD_ITEM_ID (CAGRA indexes with uint32, so it arrives as a large
+ * positive value after the widening cast, never as -1). Callers were told they
+ * may detect unfilled slots by item_id alone, so translate anything outside
+ * [0, n) to the documented sentinel. The CPU shim already behaves this way —
+ * shim_topk does not distinguish the two reasons — which is why Tier-1 cannot
+ * express this divergence. Valid ids pass through untouched. */
+static inline void
+store_result(CuvsSearchResult *slot, int64_t id, float distance,
+             int64_t n, uint32_t metric)
+{
+    if (id < 0 || id >= n) {
+        slot->item_id  = CUVS_PAD_ITEM_ID;
+        slot->distance = cuvs_pad_distance(metric);
+    } else {
+        slot->item_id  = id;
+        slot->distance = distance;
+    }
+}
+
 /* Phase 3I-1: CPU HNSW index (hnswlib-backed via cuVS).
  * from_cagra() returns unique_ptr; deserialize() returns raw ptr via out-param.
  * We store a raw ptr and delete in cuvs_hnsw_free. */
@@ -697,19 +720,17 @@ cuvs_bf_search_filtered(
     CuvsBfIndexImpl *impl = static_cast<CuvsBfIndexImpl *>(index);
     if (dim != impl->dim)
         return 2;
-    /* Unlike cuvs_bf_search above, the filtered path below searches idx_f32
-     * unconditionally — but a float16 index (precision == 1) builds only
-     * idx_f16 and leaves idx_f32 null. Refuse the combination instead of
-     * dereferencing null: this runs in the daemon, so a SIGSEGV here takes
-     * down every backend's session, not just this query. The caller treats a
-     * non-zero return as "prefilter unavailable" and falls back. Teaching the
-     * filtered path to search idx_f16 (mirroring cuvs_bf_search's half-query
-     * conversion) is the real fix and needs a GPU to validate.
+    /* Both precisions are searchable below (the search call branches on
+     * impl->precision exactly as cuvs_bf_search does). Only a build that left
+     * the active variant null gets refused — that would be corruption, and a
+     * null deref here runs in the daemon, so it takes down every backend's
+     * session rather than just this query.
      *
      * 1, not a new code: cuvs_wrapper.h documents only 0/2/1 for this entry
      * point, and the CPU shim — which has no precision concept at all — can
      * never produce anything outside that set. */
-    if (!impl->idx_f32)
+    if (impl->precision == 1 ? (impl->idx_f16 == nullptr)
+                             : (impl->idx_f32 == nullptr))
         return 1;
     /* The bitset is dereferenced unconditionally below; the CPU shim refuses
      * NULL the same way rather than reading it as "no filter" (#110). */
@@ -729,11 +750,25 @@ cuvs_bf_search_filtered(
     try {
         raft::device_resources &res = _pr.get();
 
-        /* Upload query */
-        auto d_queries   = raft::make_device_matrix<float,   int64_t>(res, (int64_t)1, (int64_t)dim);
         auto d_indices   = raft::make_device_matrix<int64_t, int64_t>(res, 1, bk);
         auto d_distances = raft::make_device_matrix<float,   int64_t>(res, 1, bk);
-        raft::copy(d_queries.data_handle(), query_vec, dim, res.get_stream());
+        /* store_result() below trusts an in-range id to mean "cuVS wrote a
+         * real neighbour here". That is false when the filter excludes more
+         * than bk-n_pass candidates: unlike CAGRA, brute_force::search does
+         * not write anything to a slot it has nothing to put there, leaving
+         * whatever raft::make_device_matrix's allocator handed back — device
+         * memory the pool may have reused from an unrelated prior call.
+         * Measured on an A100: reinterpreted distance pairs from a previous
+         * search (e.g. 0x4110000041100000, decoding as float(9.0),float(9.0))
+         * land in-range and are indistinguishable from a genuine hit by value
+         * alone. Seed every slot to CUVS_PAD_ITEM_ID first so an untouched
+         * slot is deterministically caught by store_result()'s id<0 branch
+         * regardless of pool history; a slot cuVS does write overwrites this.
+         * CUVS_PAD_ITEM_ID is int64_t(-1), whose bit pattern is all-0xFF, so a
+         * raw byte memset produces the exact value. Applies to both precision
+         * branches below — same d_indices buffer either way. */
+        cudaMemsetAsync(d_indices.data_handle(), 0xFF,
+                         (size_t)bk * sizeof(int64_t), res.get_stream());
 
         /* Upload bitset. pg_cuvs builds bit=1 = EXCLUDE (daemon memsets 0xFF then
          * clears kept items); cuVS bitset_filter keeps SET bits (bit=1 = INCLUDE),
@@ -750,14 +785,36 @@ cuvs_bf_search_filtered(
                              d_bs_data.data_handle(), bitset_bits);
         auto prefilter = cuvs::neighbors::filtering::bitset_filter<uint32_t, int64_t>(bv);
 
-        /* Filtered search */
+        /* Filtered search. The query is uploaded inside each branch because the
+         * device matrix element type follows the index variant — half for a
+         * float16 index, float otherwise. Same shape as cuvs_bf_search; the
+         * `.vectors` sidecar on disk is always float32, so precision only ever
+         * affects the device-resident copy and the query conversion. */
         cuvs::neighbors::brute_force::search_params params;
-        cuvs::neighbors::brute_force::search(
-            res, params, *impl->idx_f32,
-            raft::make_const_mdspan(d_queries.view()),
-            d_indices.view(),
-            d_distances.view(),
-            prefilter);
+        if (impl->precision == 1 /* float16 */) {
+            auto d_queries = raft::make_device_matrix<half, int64_t>(res, (int64_t)1, (int64_t)dim);
+            {
+                std::vector<half> h_q(dim);
+                for (int i = 0; i < dim; i++)
+                    h_q[i] = __float2half(query_vec[i]);
+                raft::copy(d_queries.data_handle(), h_q.data(), dim, res.get_stream());
+            }
+            cuvs::neighbors::brute_force::search(
+                res, params, *impl->idx_f16,
+                raft::make_const_mdspan(d_queries.view()),
+                d_indices.view(),
+                d_distances.view(),
+                prefilter);
+        } else {
+            auto d_queries = raft::make_device_matrix<float, int64_t>(res, (int64_t)1, (int64_t)dim);
+            raft::copy(d_queries.data_handle(), query_vec, dim, res.get_stream());
+            cuvs::neighbors::brute_force::search(
+                res, params, *impl->idx_f32,
+                raft::make_const_mdspan(d_queries.view()),
+                d_indices.view(),
+                d_distances.view(),
+                prefilter);
+        }
 
         res.sync_stream();
 
@@ -767,10 +824,9 @@ cuvs_bf_search_filtered(
         raft::copy(h_distances.data(), d_distances.data_handle(), bk, res.get_stream());
         res.sync_stream();
 
-        for (int i = 0; i < bk; i++) {
-            results[i].item_id  = h_indices[i];
-            results[i].distance = h_distances[i];
-        }
+        for (int i = 0; i < bk; i++)
+            store_result(&results[i], h_indices[i], h_distances[i],
+                         impl->n, impl->metric);
         pad_results(results, bk, top_k, impl->metric);
         return 0;
     } catch (const std::exception &e) {
@@ -827,6 +883,15 @@ cuvs_cagra_search_filtered(
         auto d_queries   = raft::make_device_matrix<float,    int64_t>(res, (int64_t)1, (int64_t)dim);
         auto d_indices   = raft::make_device_matrix<uint32_t, int64_t>(res, 1, bk);
         auto d_distances = raft::make_device_matrix<float,    int64_t>(res, 1, bk);
+        /* cagra::search has, on an A100, been observed to write a deterministic
+         * out-of-range marker (0xFFFFFFFF) to every excluded slot rather than
+         * leaving pool memory untouched (see cuvs_bf_search_filtered above for
+         * the sibling entry point where that assumption is measurably false).
+         * That is this build's empirical behaviour, not a documented cuVS
+         * contract — seed the same way so store_result()'s correctness does
+         * not depend on it. A slot cuVS does write overwrites this. */
+        cudaMemsetAsync(d_indices.data_handle(), 0xFF,
+                         (size_t)bk * sizeof(uint32_t), res.get_stream());
         raft::copy(d_queries.data_handle(), query_vec, dim, res.get_stream());
 
         /* Upload bitset. pg_cuvs builds bit=1 = EXCLUDE; cuVS bitset_filter keeps
@@ -863,10 +928,9 @@ cuvs_cagra_search_filtered(
         raft::copy(h_distances.data(), d_distances.data_handle(), bk, res.get_stream());
         res.sync_stream();
 
-        for (int i = 0; i < bk; i++) {
-            results[i].item_id  = (int64_t)h_indices[i];
-            results[i].distance = h_distances[i];
-        }
+        for (int i = 0; i < bk; i++)
+            store_result(&results[i], (int64_t)h_indices[i], h_distances[i],
+                         n, impl->metric);
         pad_results(results, bk, top_k, impl->metric);
         return 0;
     } catch (const std::exception &e) {

@@ -2,9 +2,9 @@
 name: pg-cuvs-dev
 description: >
   pg_cuvs 일상 GPU 개발 워크플로우 전문 스킬. Brev A100 VM에서의
-  Makefile gpu-* 루프(sync → gpu-build → gpu-install → gpu-test), .env.gpu 설정,
+  Makefile gpu-* 루프(sync → gpu-build → gpu-install → gpu-test), gpu.conf 설정,
   빌드/테스트 중 CUDA/cuVS/PG16 함정 대응을 다룬다.
-  "gpu-build 안 돼", "conda 환경 활성화", "nvcc 에러", "make gpu-", ".env.gpu",
+  "gpu-build 안 돼", "conda 환경 활성화", "nvcc 에러", "make gpu-", "gpu.conf",
   "installcheck 실패", "CUDA 경로", "sync 안 됨", "VM 접속",
   "VM 내려줘", "VM 삭제", "인스턴스 정리"(세션 종료 = brev delete) 키워드가
   나오면 이 스킬을 사용하라.
@@ -47,21 +47,41 @@ brev refresh            # ~/.brev/ssh_config 갱신 → `ssh <name>` 동작
 ssh <name>              # 예: ssh slimy-indigo-bison (유저 shadeform)
 ```
 
-### .env.gpu 설정
+### gpu.conf 설정
 
-Makefile의 `gpu-*` 타깃은 `.env.gpu`(gitignored)를 읽는다. Makefile의 VM_HOST는
-gcloud 조회 실패 시 `GCP_VM` 값으로 폴백하므로, Brev에서는 이 폴백 경로를 쓴다:
+Makefile의 `gpu-*` 타깃은 `gpu.conf`(gitignored)를 읽는다. Brev에는 gcloud IP
+조회가 없으므로 `VM_SSH_HOST`가 그대로 접속 호스트가 된다:
 
 ```bash
-# .env.gpu (gitignored)
-GCP_VM=shadeform@<brev-host-or-ip>   # 변수명은 GCP 시절 잔재; VM_HOST 폴백으로 사용됨
+# gpu.conf (gitignored, 비밀 없음)
+VM_SSH_HOST=<brev-host-alias>   # 예: pg-cuvs-verify (brev refresh 가 ssh_config 에 등록)
 CONDA_ENV=cuvs_dev
-CUDA_ARCH=sm_80                      # A100=sm_80 (L4=sm_89, H100=sm_90)
+CUDA_ARCH=sm_80                 # A100=sm_80 (L4=sm_89, H100=sm_90)
 ```
 
+파일명이 예전엔 `.env.gpu` 였다. 비밀이 없는데도 `.env` 접두사 때문에 dotenv 읽기를
+거부하는 도구에 걸려서 `gpu.conf` 로 바꿨다. 레거시 이름도 계속 읽히고
+`VM_SSH_HOST` 는 옛 `GCP_VM` 으로 폴백하므로, 기존 설정을 안 고쳐도 동작한다.
+
 주의: `make vm-start` / `make vm-stop` / `make vm-ip`는 gcloud 전용 타깃이라
-Brev에서는 동작하지 않는다 (Makefile 재배선은 ROADMAP "잔여 재배선" 항목).
-Brev에서 과금을 멈추려면 `brev delete`뿐이다 — gpu-vm-provision 스킬 참조.
+Brev에서는 동작하지 않는다. Brev에서 과금을 멈추려면 `brev delete`뿐이다 —
+gpu-vm-provision 스킬 참조.
+
+### 데몬 제어
+
+부트스트랩이 `pg-cuvs-server` systemd 유닛을 설치하므로 데몬은 systemd로 다룬다
+(예전엔 `nohup`이라 이 명령들이 존재하지 않았고, 세션이 끊기면 데몬도 죽었다):
+
+```bash
+ssh <name> "sudo systemctl restart pg-cuvs-server"     # 재기동
+ssh <name> "systemctl is-active pg-cuvs-server"        # 상태
+ssh <name> "sudo journalctl -u pg-cuvs-server -n 50 --no-pager"   # 로그
+```
+
+`restart` 후 소켓은 **즉시 생기지 않는다** — 첫 CUDA 컨텍스트가 필요해서 머신에
+따라 12초~3분 걸린다. 유닛의 `TimeoutStartSec=600`이 이걸 감안한 값이고, 그동안
+`activating` 상태로 머무는 것이 정상이다. 소켓 권한(0660 → 0666) 확장은
+`ExecStartPost`가 자동으로 하므로 손으로 `chmod` 할 필요가 없다.
 
 ---
 
@@ -69,7 +89,7 @@ Brev에서 과금을 멈추려면 `brev delete`뿐이다 — gpu-vm-provision �
 
 | 명령 | 용도 |
 |------|------|
-| `make sync` | 로컬 → VM rsync (.o/.so/.env.gpu 제외) |
+| `make sync` | 로컬 → VM rsync (.o/.so/gpu.conf 제외) |
 | `make gpu-build` | VM에서 make (nvcc + PGXS) |
 | `make gpu-install` | VM에서 sudo make install |
 | `make gpu-test` | VM에서 make installcheck |

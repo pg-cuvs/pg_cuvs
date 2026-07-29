@@ -77,7 +77,7 @@ JIT:
 ---
 
 ```bash
-ssh $GCP_VM "grep -E '^jit' \$(psql -t -c 'SHOW config_file' | tr -d ' ') 2>/dev/null || echo 'no jit settings'"
+ssh $VM_SSH_HOST "grep -E '^jit' \$(psql -t -c 'SHOW config_file' | tr -d ' ') 2>/dev/null || echo 'no jit settings'"
 ```
 
 **기대 출력:**
@@ -241,7 +241,7 @@ Planning/Execution time과 JIT: 섹션 유무를 기록한다.
 threshold 값이 결정된 경우에만 적용한다. 예: 1e7로 결정된 경우:
 
 ```bash
-ssh $GCP_VM "sudo -u postgres psql -c \
+ssh $VM_SSH_HOST "sudo -u postgres psql -c \
   \"ALTER SYSTEM SET jit_above_cost = 10000000;\""
 ```
 
@@ -251,7 +251,7 @@ ALTER SYSTEM
 ```
 
 ```bash
-ssh $GCP_VM "sudo -u postgres psql -c \"SELECT pg_reload_conf();\""
+ssh $VM_SSH_HOST "sudo -u postgres psql -c \"SELECT pg_reload_conf();\""
 ```
 
 **기대 출력:**
@@ -265,7 +265,7 @@ ssh $GCP_VM "sudo -u postgres psql -c \"SELECT pg_reload_conf();\""
 적용 확인:
 
 ```bash
-ssh $GCP_VM "psql -d postgres -c 'SHOW jit_above_cost;'"
+ssh $VM_SSH_HOST "psql -d postgres -c 'SHOW jit_above_cost;'"
 ```
 
 **기대 출력:**
@@ -292,8 +292,8 @@ ssh $GCP_VM "psql -d postgres -c 'SHOW jit_above_cost;'"
 - [ ] `SHOW jit_above_cost;` → 기대 출력: 결정된 threshold 값 (예: `10000000`)
 - [ ] 재시작 후 설정 유지 확인:
   ```bash
-  ssh $GCP_VM "sudo systemctl restart postgresql"
-  ssh $GCP_VM "psql -d postgres -c 'SHOW jit_above_cost;'"
+  ssh $VM_SSH_HOST "sudo systemctl restart postgresql"
+  ssh $VM_SSH_HOST "psql -d postgres -c 'SHOW jit_above_cost;'"
   ```
   → 기대 출력: 설정한 값 그대로 유지
 

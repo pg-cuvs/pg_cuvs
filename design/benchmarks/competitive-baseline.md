@@ -228,7 +228,7 @@ system,index,N,dim,k,recall_target,build_s,qps,p50_us,p95_us,p99_us,avg_us,recal
 ## 9. 운영 기준
 
 - VM은 실행 직전 명시적으로 start, 결과 확인 직후 stop/TERMINATED 확인.
-- ephemeral IP 변경 시 `.env.gpu` 및 gcloud 명령 IP 업데이트.
+- ephemeral IP 변경 시 `gpu.conf` 및 gcloud 명령 IP 업데이트.
 - 단일 cell build가 **2시간** 초과 → 중단, 원인(OOM? CPU 병목?) 문서화.
 - 설치 실패 또는 crash → VM 정지, 원인 기록 후 별도 issue.
 - 모든 실측 결과는 `bench/results/competitive.csv`에 append (pilot.csv와 분리).

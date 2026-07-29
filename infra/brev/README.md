@@ -1,8 +1,7 @@
 # Brev pg_cuvs GPU VM — fast rebuild
 
-**There is no "resume".** The Brev A100 (`massedcompute_A100_sxm4_80G`) does not
-support `brev stop`, has no persistent volume, and Brev has no snapshot/image
-feature. `brev delete` is the only way to stop paying, and it loses everything.
+**There is no "resume".** A Brev A100 does not support `brev stop`, has no
+persistent volume, and Brev has no snapshot/image feature. `brev delete` is the only way to stop paying, and it loses everything.
 So the plan is not to preserve the VM — it is to rebuild it fast.
 
 `bootstrap.sh` does that: a fresh instance → ready (built extension + daemon +
@@ -19,6 +18,34 @@ ssh <name> 'bash /home/shadeform/bootstrap.sh 2>&1 | tee bootstrap.log'
 ```
 
 Wall clock: setup ~80s, dataset ~75s, build ~2–3 min, verify ~30s.
+
+Which instance type: benchmarking is pinned to `massedcompute_A100_sxm4_80G`
+because the canonical numbers came from it; development and regression work only
+needs an A100-class GPU. See the `gpu-vm-provision` skill for the rule and the
+verified alternatives.
+
+## The daemon
+
+`bootstrap.sh` installs a `pg-cuvs-server` systemd unit, so the daemon outlives
+the ssh session and the `systemctl`/`journalctl` commands used throughout the
+playbooks actually work:
+
+```bash
+sudo systemctl restart pg-cuvs-server
+systemctl is-active pg-cuvs-server
+sudo journalctl -u pg-cuvs-server -n 50 --no-pager
+```
+
+The socket appears only after the daemon's first CUDA context — 12s on one A100,
+over 3 minutes on another — so the unit carries `TimeoutStartSec=600` and sitting
+in `activating` for minutes is normal, not a hang. `ExecStartPost` polls for the
+socket and widens it to 0666; the daemon creates it 0660, which the `postgres` OS
+user cannot open, and doing that chmod by hand is the step that gets forgotten.
+
+Indexes live in `/tmp/cuvs_indexes`, matching what the 35 regression SQL files
+hardcode — the suite passes straight off a fresh bootstrap with no manual daemon
+restart. `/tmp` being volatile is fine here since nothing on the VM is a source
+of truth; on a long-lived host, watch for `systemd-tmpfiles` reaping it.
 
 ## What survives a delete (and what doesn't)
 
@@ -60,6 +87,9 @@ These cost the most time on 2026-07-23; each is now a one-liner in `bootstrap.sh
 
 ## If the provider/user differs
 
-The script targets Brev/Massed Compute (`shadeform` user, systemd). On a
-container without systemd (e.g. RunPod, user `root`): change `USER_HOME`, and
-swap `systemctl restart postgresql@16-main` for `pg_ctlcluster 16 main restart`.
+The script targets a shadeform-family image (`shadeform` user, systemd) — both
+massedcompute and paperspace qualify. On a container without systemd (e.g.
+RunPod, user `root`): change `USER_HOME`, swap `systemctl restart
+postgresql@16-main` for `pg_ctlcluster 16 main restart`, and replace the
+`pg-cuvs-server` unit with a supervised launch of your own — the daemon is a unit
+now, so there is no nohup fallback left in the script to fall back to.

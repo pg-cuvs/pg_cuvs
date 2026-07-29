@@ -9,12 +9,15 @@
 # Result appended to bench/results/competitive.csv (same schema).
 set -euo pipefail
 
-# GCP project comes from the local gitignored .env.gpu (or the environment);
-# no project ID is hardcoded in the repo.
+# GCP project comes from the local gitignored gpu.conf (or the environment);
+# no project ID is hardcoded in the repo. .env.gpu is the file's old name
+# (Makefile:273-279) — read first, same as there, so it keeps working and
+# gpu.conf wins if a box somehow has both.
 [ -f .env.gpu ] && { set -a; . ./.env.gpu; set +a; }
+[ -f gpu.conf ] && { set -a; . ./gpu.conf; set +a; }
 
 ZONE=us-central1-f
-PROJ=${GCP_PROJECT:?set GCP_PROJECT in .env.gpu or the environment}
+PROJ=${GCP_PROJECT:?set GCP_PROJECT in gpu.conf or the environment}
 VM=pg-cuvs-dev-mgpu
 DB=bench_50m
 N=${N:-50000000}; DIM=${DIM:-384}; K=${K:-10}; QUERIES=${QUERIES:-1000}

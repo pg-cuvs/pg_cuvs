@@ -258,8 +258,8 @@ CREATE INDEX hnsw_idx ON items USING hnsw (embedding vector_l2_ops);
 # 로컬에서 VM으로 소스 동기화 (Makefile:L179)
 rsync -avz --delete \
     --exclude '.git' --exclude 'src/*.o' --exclude 'src/*.bc' \
-    --exclude '*.so' --exclude '.env.gpu' \
-    ./ $(GCP_VM):~/pg_cuvs/
+    --exclude '*.so' --exclude 'gpu.conf' --exclude '.env.gpu' \
+    ./ $(VM_SSH_HOST):~/pg_cuvs/
 ```
 
 **기대 출력:**
@@ -271,7 +271,7 @@ sent N bytes  received M bytes
 
 ```bash
 # VM에서 재빌드 (Makefile:L188)
-ssh -tt $(GCP_VM) "cd ~/pg_cuvs && source ~/miniforge3/bin/activate $(CONDA_ENV) && make 2>&1 | tee /tmp/pg_cuvs_build.log"
+ssh -tt $(VM_SSH_HOST) "cd ~/pg_cuvs && source ~/miniforge3/bin/activate $(CONDA_ENV) && make 2>&1 | tee /tmp/pg_cuvs_build.log"
 ```
 
 **기대 출력 (마지막 줄):**
@@ -283,7 +283,7 @@ build complete
 
 ```bash
 # Step 3-2: VM에서 설치 (Makefile:L193)
-ssh -tt $(GCP_VM) "cd ~/pg_cuvs && source ~/miniforge3/bin/activate $(CONDA_ENV) && sudo -E make install"
+ssh -tt $(VM_SSH_HOST) "cd ~/pg_cuvs && source ~/miniforge3/bin/activate $(CONDA_ENV) && sudo -E make install"
 ```
 
 **기대 출력:**
