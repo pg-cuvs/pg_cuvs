@@ -98,6 +98,32 @@ Strong success criteria let you loop independently. Weak criteria ("make it work
 - Cut at the point where "I'd want to be able to revert to here."
 - If modifying multiple files or working on a feature unit, create a branch.
 
+**The same rule applies to the PR, not just the commit.** This repo squash-merges
+by default (`viewerDefaultMergeMethod: SQUASH`), so **the PR is the unit that
+lands on `main`** — a PR carrying four intentions becomes one four-intention
+commit no matter how cleanly its branch was committed. That is how #113 became a
+single 88-file commit and #115 fused a CUDA wrapper fix with the systemd unit,
+the `GCP_VM` → `VM_SSH_HOST` rename, and 19 documents. Neither wrapper fix can
+now be reverted without taking the infrastructure with it, and `git bisect` lands
+on the whole bundle.
+
+Split a PR when any of these is true:
+
+| Signal | Example from #115 |
+|---|---|
+| Structural + behavioral together (Tidy First) | Makefile rename (structural) + wrapper sentinel fix (behavioral) |
+| Two changes revertible independently | the systemd unit vs. the TAIL CONTRACT fix |
+| Different subsystems with no shared cause | `src/*.cu` vs. `infra/brev/` |
+| Docs that don't describe this change | playbook edits riding along with a bug fix |
+
+Docs and tests that exist *because of* the change belong **with** it — the test
+proving a fix, the comment explaining it. Split by cause, not by file type.
+
+When a PR already bundles intentions and re-splitting is not worth it, merge it
+with `gh pr merge --rebase` (allowed here) so the branch's separated commits
+survive on `main`. Prefer splitting; rebase is the fallback, and it only works if
+the commits were clean to begin with.
+
 > Follow the git plugin skills for branch names, commit messages, and PR format:
 > `git:branch-name-convention`, `git:commit-message-convention`, `git:pr-convention`
 
@@ -145,6 +171,9 @@ Strong success criteria let you loop independently. Weak criteria ("make it work
 - Commit only after all tests pass and linter warnings are resolved
 - One commit = one logical unit of change
 - State in the commit message whether it is a structural or behavioral change
+- One PR = one logical unit too — under squash merge the PR is what lands on
+  `main`, so clean commits under a bundled PR still collapse. See "Commit Often"
+  in the Karpathy section for the split criteria.
 
 > Follow the git plugin skills for branch names, commit messages, and PR format:
 > `git:branch-name-convention`, `git:commit-message-convention`, `git:pr-convention`
