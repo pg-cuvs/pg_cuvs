@@ -221,6 +221,26 @@ sudo chmod 755 /usr/local/bin/pg-cuvs-wait-socket
 # gate above used, so the unit points at the binary that was actually installed.
 # TimeoutStartSec covers the CUDA-context wait described above; the unit sitting
 # in `activating` for minutes on a slow machine is normal, not a hang.
+#
+# ExecStartPre removes the socket path before ExecStart runs. Without it, a
+# restart racing a stale file gives a false "ready": on SIGKILL (this script's
+# earlier pkill -9, or systemd falling back to SIGKILL after TimeoutStopSec)
+# the old process cannot run its own unlink(), so the special file from the
+# PREVIOUS instance is still on disk when the new one starts. The daemon binds
+# the real socket only after startup_load_indexes() + per-GPU warm-up (the same
+# CUDA-context wait TimeoutStartSec covers — up to minutes on a slow machine),
+# so pg-cuvs-wait-socket's `[ -S ... ]` poll below would match that leftover
+# file immediately and report the daemon ready long before it is listening.
+# Deleting it first makes a later `[ -S ... ]` unambiguous: the path can only
+# exist again once the new process has actually bound it. `-` prefix: a
+# missing file (first-ever start) must not fail the unit.
+#
+# TimeoutStopSec: on `systemctl restart`, systemd stops the running instance
+# before this ExecStartPre even runs. Shutdown serializes every resident index
+# to disk one at a time (graceful_shutdown() in pg_cuvs_server.c) before it
+# unlinks the socket — with several/large indexes this can outrun systemd's
+# default stop timeout (90s), and the ensuing SIGKILL both loses whatever
+# indexes had not yet been saved and reintroduces the stale-socket race above.
 sudo tee /etc/systemd/system/pg-cuvs-server.service > /dev/null <<UNIT
 [Unit]
 Description=pg_cuvs GPU sidecar daemon
@@ -231,9 +251,11 @@ Type=simple
 User=$(id -un)
 Group=$(id -gn)
 ExecStartPre=/bin/mkdir -p $IDX
+ExecStartPre=-/bin/rm -f /tmp/.s.pg_cuvs
 ExecStart=$(pg_config --bindir)/pg_cuvs_server --socket /tmp/.s.pg_cuvs --index-dir $IDX --gpu-devices 0
 ExecStartPost=/usr/local/bin/pg-cuvs-wait-socket
 TimeoutStartSec=600
+TimeoutStopSec=300
 Restart=on-failure
 
 [Install]
