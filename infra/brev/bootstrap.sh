@@ -31,7 +31,15 @@ export DEBIAN_FRONTEND=noninteractive
 
 USER_HOME=/home/shadeform
 REPO="$USER_HOME/pg_cuvs"
-IDX=/var/lib/pg_cuvs_indexes
+# /tmp, matching what the regression suite hardcodes: 35 test/sql files do
+# `SET cuvs.index_dir = '/tmp/cuvs_indexes'`. Pointing the daemon elsewhere used
+# to mean the suite could not pass straight off a fresh bootstrap — it needed a
+# manual daemon restart first. Volatility is fine here: a Brev VM is disposable
+# (restart == rebuild), and nothing on it is a source of truth. On a long-lived
+# host, note that systemd-tmpfiles can reap /tmp — the symptom is indexes
+# silently vanishing; production deployments should use the path in
+# docs/best-practices.md instead.
+IDX=/tmp/cuvs_indexes
 CONDA=/opt/miniforge3
 DEV=$CONDA/envs/cuvs_dev            # C/C++ build toolchain (nvcc, libcuvs)
 BENCH=$CONDA/envs/cuvs_bench        # python bench stack (separate: python 3.12)
@@ -167,24 +175,93 @@ sudo systemctl restart postgresql@16-main; sleep 3
 sudo -u postgres psql -c "ALTER SYSTEM SET cuvs.socket_path='/tmp/.s.pg_cuvs'"
 sudo -u postgres psql -c "ALTER SYSTEM SET cuvs.index_dir='$IDX'"
 sudo -u postgres psql -c "SELECT pg_reload_conf()"
+# Run the daemon under systemd, not nohup. 34 playbooks and scripts in this repo
+# already say `systemctl restart pg-cuvs-server` / `journalctl -u pg-cuvs-server`
+# (delta-restart-e2e.sh among them); with a bare nohup none of that was true, and
+# a daemon started over ssh died with the session. This unit is the SSOT for the
+# definition — references/quick-start.md carries the GCP-era copy for history.
+#
 # `|| true`: pkill exits 1 when nothing matched, which is the normal case on a
-# fresh box and would abort the script under `set -e`.
-pkill -9 -f pg_cuvs_server 2>/dev/null || true; sleep 1
-nohup "$REPO/pg_cuvs_server" --socket /tmp/.s.pg_cuvs --index-dir "$IDX" --gpu-devices 0 \
-  > "$USER_HOME/daemon.log" 2>&1 &
-# Poll, don't guess. The socket appears only after the daemon's first CUDA
-# context is built, and that is a property of the machine, not of the build:
-# ~12s on Massed Compute but over 3 minutes on a Paperspace A100. The former
-# fixed `sleep 12` turned the slower machine into a bogus "SOCKET MISSING"
-# failure for a daemon that was still initialising normally.
+# fresh box and would abort the script under `set -e`. `-x` not `-f`: `-f`
+# matches this script's own command line (PATTERNS.md — that trap cost real time).
+pkill -9 -x pg_cuvs_server 2>/dev/null || true; sleep 1
+
+# The socket only appears after the daemon's first CUDA context, and how long
+# that takes is a property of the machine, not the build: ~12s on Massed Compute
+# but over 3 minutes on a Paperspace A100. So every wait here polls; nothing
+# sleeps a fixed amount. The chmod is what this buys us — the daemon creates the
+# socket 0660 and the `postgres` OS user cannot reach it until it is widened.
+# Doing that by hand is the step that gets forgotten, and forgetting it fails the
+# whole regression run with an opaque `BUILD failed (status 4)`.
+#
+# It lives in a file rather than inline in the unit because systemd does its own
+# `$`-expansion on Exec lines, so an inline `$(seq ...)` depends on systemd
+# declining to touch a `$` that is not a variable name. Not worth the bet.
+#
+# Always exits 0. ExecStartPost failure would mark the unit failed, and with
+# Restart=on-failure and each attempt taking the full 5 minutes, a genuinely
+# broken GPU would sit in a permanent restart loop (the default 10s
+# StartLimitIntervalSec never sees two failures close enough together to trip).
+# Verifying the socket is the bootstrap's job, below, where failing is useful.
+sudo tee /usr/local/bin/pg-cuvs-wait-socket > /dev/null <<'WAIT'
+#!/bin/sh
+n=0
+while [ ! -S /tmp/.s.pg_cuvs ] && [ "$n" -lt 600 ]; do
+  n=$((n + 1))
+  sleep 0.5
+done
+[ -S /tmp/.s.pg_cuvs ] && chmod 666 /tmp/.s.pg_cuvs
+exit 0
+WAIT
+sudo chmod 755 /usr/local/bin/pg-cuvs-wait-socket
+
+# $(pg_config --bindir) is expanded here, at write time, on purpose: systemd has
+# none of the conda PATH this script is running under, so the unit needs the
+# absolute path — and it is the same pg_config that `make install-server` and the
+# gate above used, so the unit points at the binary that was actually installed.
+# TimeoutStartSec covers the CUDA-context wait described above; the unit sitting
+# in `activating` for minutes on a slow machine is normal, not a hang.
+sudo tee /etc/systemd/system/pg-cuvs-server.service > /dev/null <<UNIT
+[Unit]
+Description=pg_cuvs GPU sidecar daemon
+After=network.target
+
+[Service]
+Type=simple
+User=$(id -un)
+Group=$(id -gn)
+ExecStartPre=/bin/mkdir -p $IDX
+ExecStart=$(pg_config --bindir)/pg_cuvs_server --socket /tmp/.s.pg_cuvs --index-dir $IDX --gpu-devices 0
+ExecStartPost=/usr/local/bin/pg-cuvs-wait-socket
+TimeoutStartSec=600
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+# Idempotent: re-running the bootstrap overwrites the unit and re-enables it.
+sudo systemctl daemon-reload
+sudo systemctl enable pg-cuvs-server
+# `|| true` under `set -e`: this blocks until ExecStartPost returns, so a machine
+# slower than TimeoutStartSec makes systemctl exit non-zero. Aborting here would
+# skip the diagnostic block below, which is the only thing that says why.
+sudo systemctl restart pg-cuvs-server || true
+# Type=simple returns as soon as the process is spawned, so still gate on the
+# socket here rather than trusting `systemctl start` to mean "ready".
 set +x
 for _ in $(seq 1 600); do
   [ -S /tmp/.s.pg_cuvs ] && break
   sleep 0.5
 done
 set -x
+# The unit's ExecStartPost already chmods; this is the hard gate, and the chmod
+# is repeated only so a partially-started unit still leaves a usable socket.
+# Diagnostics come from the journal now that the daemon is a unit, not a nohup.
 test -S /tmp/.s.pg_cuvs && sudo chmod 666 /tmp/.s.pg_cuvs && echo "SOCKET OK" \
-  || { echo "SOCKET MISSING after 5 min"; tail -30 "$USER_HOME/daemon.log"; exit 1; }
+  || { echo "SOCKET MISSING after 5 min"
+       systemctl is-active pg-cuvs-server || true
+       sudo journalctl -u pg-cuvs-server --no-pager -n 30 || true
+       exit 1; }
 
 echo "=== [5/5] dataset: wiki_all_1M -> corpus.fbin/queries_10k.fbin/gt.npy ==="
 D="$USER_HOME/data"; mkdir -p "$D/raw"
