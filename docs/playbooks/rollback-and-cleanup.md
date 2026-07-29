@@ -205,7 +205,7 @@ mv /tmp/cuvs_indexes /var/lib/postgresql/16/main/cuvs_indexes
 # 로컬에서 VM으로 소스 동기화 (Makefile:L179)
 rsync -avz --delete \
     --exclude '.git' --exclude 'src/*.o' --exclude 'src/*.bc' \
-    --exclude '*.so' --exclude 'gpu.conf' \
+    --exclude '*.so' --exclude 'gpu.conf' --exclude '.env.gpu' \
     ./ $(VM_SSH_HOST):~/pg_cuvs/
 ```
 
@@ -308,7 +308,7 @@ psql -d postgres -c "SHOW shared_preload_libraries;"
 # 로컬에서 VM으로 최신 소스 동기화 (Makefile:L179)
 rsync -avz --delete \
     --exclude '.git' --exclude 'src/*.o' --exclude 'src/*.bc' \
-    --exclude '*.so' --exclude 'gpu.conf' \
+    --exclude '*.so' --exclude 'gpu.conf' --exclude '.env.gpu' \
     ./ $(VM_SSH_HOST):~/pg_cuvs/
 ```
 

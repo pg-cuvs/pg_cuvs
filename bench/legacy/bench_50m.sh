@@ -10,7 +10,10 @@
 set -euo pipefail
 
 # GCP project comes from the local gitignored gpu.conf (or the environment);
-# no project ID is hardcoded in the repo.
+# no project ID is hardcoded in the repo. .env.gpu is the file's old name
+# (Makefile:273-279) — read first, same as there, so it keeps working and
+# gpu.conf wins if a box somehow has both.
+[ -f .env.gpu ] && { set -a; . ./.env.gpu; set +a; }
 [ -f gpu.conf ] && { set -a; . ./gpu.conf; set +a; }
 
 ZONE=us-central1-f

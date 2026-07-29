@@ -228,6 +228,7 @@ rsync -avz --delete \
     --exclude 'src/*.bc' \   # LLVM 비트코드(PG JIT용) — 마찬가지
     --exclude '*.so' \       # 빌드 결과물 — sync 방향이 로컬→VM이므로 제외
     --exclude 'gpu.conf' \   # GCP 자격증명 포함 — VM에 올리면 안 됨
+    --exclude '.env.gpu' \   # gpu.conf 의 옛 이름 — 남아 있는 박스가 있으면 동일하게 제외
     ./ $VM_SSH_HOST:~/pg_cuvs/
 # --delete: 로컬에서 삭제한 파일은 VM에서도 삭제 (파일명 변경 시 VM에 구버전 좀비 방지)
 

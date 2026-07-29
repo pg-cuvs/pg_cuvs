@@ -258,7 +258,7 @@ CREATE INDEX hnsw_idx ON items USING hnsw (embedding vector_l2_ops);
 # 로컬에서 VM으로 소스 동기화 (Makefile:L179)
 rsync -avz --delete \
     --exclude '.git' --exclude 'src/*.o' --exclude 'src/*.bc' \
-    --exclude '*.so' --exclude 'gpu.conf' \
+    --exclude '*.so' --exclude 'gpu.conf' --exclude '.env.gpu' \
     ./ $(VM_SSH_HOST):~/pg_cuvs/
 ```
 
