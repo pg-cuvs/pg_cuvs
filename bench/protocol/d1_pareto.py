@@ -9,7 +9,7 @@ measured qps/p99/VRAM rows. Emits, per (config, cell):
   resident VRAM (peak_vram_mb)              (the D1/D6 VRAM-budget axis)
 and flags the recall-vs-$ Pareto frontier (no other point is both cheaper and
 higher-recall). Usage:
-  python3 tools/d1_pareto.py results/protocol/A.csv [--price 3.67]
+  python3 bench/protocol/d1_pareto.py results/protocol/A.csv [--price 3.67]
 Default price = GCP a2-highgpu-1g (1x A100-40GB) on-demand, us-central1.
 """
 import argparse

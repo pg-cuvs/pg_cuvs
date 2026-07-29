@@ -2963,7 +2963,7 @@ Fresh-DiskANN 기반 실시간 갱신과 속성 필터 훅을 표방한다 — �
 **근거 문서**: `pg_cuvs_docs/docs/ANN-SYSTEMS.md`(6.1 DiskANN 메모리 배치, 6.2 DiskANN3,
 7장 AiSAQ, 7.6.1 코드 소재, 7.6.2 결정), `pg_cuvs_docs/docs/INTERNALS.md` 29장·37.3.
 
-**대안 cold-tier 경로 — RaBitQ + GDS (graph 아닌 IVF, 2026-06-16 추가)**: 위 셋은 전부 graph(Vamana/PQFlash) 계열이다. 별도로, **ADR-076 RaBitQ(`rabitq` AM)가 자라면** GPU cold tier의 다른 길이 열린다: RaBitQ 코드(136 B/vec, 압축)만 VRAM 상주 + 원본 rerank 벡터는 **NVMe→VRAM 직접 DMA(GPUDirect Storage/cuFile)**로 끌어와 ADR-064 streaming-BF sidecar-gather(현재 `pread`→host→H2D)를 직접-DMA로 진화. 측정 근거(bench run #35, `tools/ivfpq_refine_spike.py`): cuVS refine가 rerank로 recall을 0.91→0.97로 올리는 건 확인됐고, 유일한 미해결은 "원본을 VRAM에 안 두고 싸게 가져오기" = GDS. **전제(트리거)**: NVMe Local SSD + `nvidia-fs` + `cuFile` 검증 장비(현재 `pg-cuvs-dev`에 부재 → 개발/적용 불가). 주의: GDS per-query I/O는 GPU 저지연 강점과 상충하므로 throughput 워크로드에 한정. **RaBitQ는 이 cold tier 필요 시점을 먼저 밀어낸다**(VRAM 천장 7.5×↑ → 50M이 단일 A100에 상주, ADR-076) — GDS cold tier는 그 이후의 escalation.
+**대안 cold-tier 경로 — RaBitQ + GDS (graph 아닌 IVF, 2026-06-16 추가)**: 위 셋은 전부 graph(Vamana/PQFlash) 계열이다. 별도로, **ADR-076 RaBitQ(`rabitq` AM)가 자라면** GPU cold tier의 다른 길이 열린다: RaBitQ 코드(136 B/vec, 압축)만 VRAM 상주 + 원본 rerank 벡터는 **NVMe→VRAM 직접 DMA(GPUDirect Storage/cuFile)**로 끌어와 ADR-064 streaming-BF sidecar-gather(현재 `pread`→host→H2D)를 직접-DMA로 진화. 측정 근거(bench run #35, `bench/protocol/spikes/ivfpq_refine_spike.py`): cuVS refine가 rerank로 recall을 0.91→0.97로 올리는 건 확인됐고, 유일한 미해결은 "원본을 VRAM에 안 두고 싸게 가져오기" = GDS. **전제(트리거)**: NVMe Local SSD + `nvidia-fs` + `cuFile` 검증 장비(현재 `pg-cuvs-dev`에 부재 → 개발/적용 불가). 주의: GDS per-query I/O는 GPU 저지연 강점과 상충하므로 throughput 워크로드에 한정. **RaBitQ는 이 cold tier 필요 시점을 먼저 밀어낸다**(VRAM 천장 7.5×↑ → 50M이 단일 A100에 상주, ADR-076) — GDS cold tier는 그 이후의 escalation.
 
 관련: ADR-025(50M 벤치·포지셔닝), ADR-026(3B go/no-go·트리거), ADR-061(전략·표적 세그먼트), ADR-049(IVF-PQ), ADR-064(streaming BF), ADR-076(RaBitQ·GDS cold-tier 경로), 3b-diskann-spike.md / 3b-diskann-decision.md.
 
@@ -3168,7 +3168,7 @@ SVFusion(VLDB'26, PCIe A100)이 CAGRA/GGNN가 **UVM(demand paging)에서 크게 
 
 **결정**: RaBitQ 양자화기를 **자작**해 새 PG access method `rabitq`로 등록한다(`CREATE INDEX USING rabitq`). IVF coarse(ivfpq에서 재사용) + RaBitQ 코드 + 쿼리타임 rerank. cagra/ivfpq와 독립 경로, 동일 UDS+shm IPC·index_dir 영속화·사이드카 직렬화 인프라 재사용.
 
-**증거(numpy 스파이크 `tools/rabitq_spike.py`, 합성 + cohere VM 실측 run #32→#33)**:
+**증거(numpy 스파이크 `bench/protocol/spikes/rabitq_spike.py`, 합성 + cohere VM 실측 run #32→#33)**:
 - **수학 정확**(데이터 무관): 추정 무편향(표준화 std=**1.000** — 이론 분산식이 경험분포와 일치), 오차 상한 coverage **0.9901**.
 - **양자화기 품질**(probe-all, cohere): recall@10 = **0.9995 @ 0.1% rerank** → 랭킹이 거의 완벽.
 - **현실 IVF 설정**: n_probes=64(316 lists의 20%)에서 recall@10 = **0.9675 ≥ 0.95**, 그것도 0.5% rerank에서 천장 도달. 각 n_probes의 천장은 IVF miss(양자화기 무관)이며 n_probes를 키우면 상승 — 136 B 코드라 probe 증설이 싸다.
@@ -3182,7 +3182,7 @@ SVFusion(VLDB'26, PCIe A100)이 CAGRA/GGNN가 **UVM(demand paging)에서 크게 
 - 검증 하네스(비협상): 무편향·bound coverage·recall@(n_probes×budget) 그리드를 GT 대조로 게이트(스파이크 기준 재사용).
 
 **대안 기각**:
-- **(B) cuVS `refine()`로 ivfpq에 rerank 부착** — recall은 복구하나 refine이 원본 f32를 요구 → VRAM 상주(압축 이점 상쇄) 또는 host→device per-query 전송(detoast/PCIe 지연, ADR-074의 535ms 벽 재등장). RaBitQ가 푸는 트레이드오프를 그대로 떠안음. **측정으로 확정·기각**(cuVS 26.04 python 스파이크 `tools/ivfpq_refine_spike.py`, cohere 100k, bench run #35): refine는 **잘 동작** — recall@10 0.9095→**0.9685**(ratio≥2, sub-ms). 단 dataset device-상주(variant A)라 VRAM = f32 전량(~419MB/100k) → 같은 VRAM의 **flat이 exact(recall 1.0)라 variant A를 완전 지배**. 같은 0.968 recall을 RaBitQ는 **136 B/vec(30× 작음)**으로 냄. → variant A는 제품 가치 없음(dominated), 자작 통합 안 함. **가치 있는 B = host/GDS dataset refine**(PQ 코드만 VRAM + 원본은 NVMe→VRAM 직접 DMA)이나 **GDS 장비(NVMe+nvidia-fs+cuFile) 부재로 개발 불가** → ADR-072 cold-tier 트랙으로 이관. 경로는 기록: `refine_ratio`를 `ivfpq_n_probes`와 같은 GUC→IPC→wrapper 체인에 추가.
+- **(B) cuVS `refine()`로 ivfpq에 rerank 부착** — recall은 복구하나 refine이 원본 f32를 요구 → VRAM 상주(압축 이점 상쇄) 또는 host→device per-query 전송(detoast/PCIe 지연, ADR-074의 535ms 벽 재등장). RaBitQ가 푸는 트레이드오프를 그대로 떠안음. **측정으로 확정·기각**(cuVS 26.04 python 스파이크 `bench/protocol/spikes/ivfpq_refine_spike.py`, cohere 100k, bench run #35): refine는 **잘 동작** — recall@10 0.9095→**0.9685**(ratio≥2, sub-ms). 단 dataset device-상주(variant A)라 VRAM = f32 전량(~419MB/100k) → 같은 VRAM의 **flat이 exact(recall 1.0)라 variant A를 완전 지배**. 같은 0.968 recall을 RaBitQ는 **136 B/vec(30× 작음)**으로 냄. → variant A는 제품 가치 없음(dominated), 자작 통합 안 함. **가치 있는 B = host/GDS dataset refine**(PQ 코드만 VRAM + 원본은 NVMe→VRAM 직접 DMA)이나 **GDS 장비(NVMe+nvidia-fs+cuFile) 부재로 개발 불가** → ADR-072 cold-tier 트랙으로 이관. 경로는 기록: `refine_ratio`를 `ivfpq_n_probes`와 같은 GUC→IPC→wrapper 체인에 추가.
 - **ivfpq pq_dim 상향만** — run #31처럼 0.95 도달하나 1024 B/vec(7.5× 더 큼) + 재빌드 비용. 압축 축에서 RaBitQ에 열위.
 - **cuVS 업스트림 대기** — bit/scalar quantization이 로드맵에 있으나 시점·형태 불확실. DiskANN(ADR-026/072)과 달리 본 건의 블로커는 **우리가 통제하는 유한한 수치 작업**이지 불안정한 외부 API가 아니라, 자작이 tractable(아래 리스크 참조).
 
@@ -3194,7 +3194,7 @@ SVFusion(VLDB'26, PCIe A100)이 CAGRA/GGNN가 **UVM(demand paging)에서 크게 
 
 **구현 비용(스파이크 할인 반영)**: numpy 스파이크 S(완료) → CUDA 인코더/추정기/bound M–L → `rabitq` AM 통합 M(flat/ivfpq 템플릿) → 검증 하네스 M.
 
-**관련**: ADR-049(ivfpq·VRAM 절감, 본 건의 recall-천장 동기), ADR-025(50M·vchordrq 0.9991), ADR-026/072(DiskANN no-go — 대조: 블로커가 외부 API였음), ADR-073(AM-per-algo 하우스 스타일), ADR-010(VRAM OOM 정책). 스파이크: `tools/rabitq_spike.py`, 벤치 핸드오프 `bench/protocol/HANDOFF.md §5 RaBitQ 트랙`(run #30–#33).
+**관련**: ADR-049(ivfpq·VRAM 절감, 본 건의 recall-천장 동기), ADR-025(50M·vchordrq 0.9991), ADR-026/072(DiskANN no-go — 대조: 블로커가 외부 API였음), ADR-073(AM-per-algo 하우스 스타일), ADR-010(VRAM OOM 정책). 스파이크: `bench/protocol/spikes/rabitq_spike.py`, 벤치 핸드오프 `bench/protocol/HANDOFF.md §5 RaBitQ 트랙`(run #30–#33).
 
 ---
 
