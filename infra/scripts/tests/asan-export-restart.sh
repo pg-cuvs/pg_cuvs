@@ -37,6 +37,19 @@ set -e
 # pipeline report make's status instead.
 set -o pipefail
 
+# This script is executed as `bash -s < asan-export-restart.sh` (Makefile),
+# so its own stdin is the script file, and any child command below that does
+# not redirect its own stdin inherits that fd. A command that reads from it
+# would consume bytes meant for the script, corrupting later parsing in a way
+# that would not look like a script error -- it would look like some
+# unrelated downstream command misbehaving. This was the leading suspect for
+# the flaky ASAN-verification failure documented below, but adding these
+# redirects alone did not fix it (still reproduced with them in place; see
+# the retry loop's comment for what the evidence actually pointed to). Kept
+# anyway as cheap, independently-justified defensive practice for a script
+# invoked this way -- every command here that doesn't need its own input is
+# redirected from /dev/null.
+
 TESTIDX=/tmp/cuvs_indexes_asan_test
 SOCK=/tmp/.s.pg_cuvs
 DB=postgres
@@ -101,9 +114,10 @@ cleanup() {
     # on the *next* run's own "DROP TABLE IF EXISTS" instead of a clean no-op
     # here. Best-effort either way: if the ASAN daemon already crashed, the
     # `|| true` also silently swallows that connection failure.
-    psql -qd "$DB" -c "SET cuvs.index_dir='$TESTIDX'; DROP TABLE IF EXISTS asan_export_t;" 2>/dev/null || true
+    psql -qd "$DB" -c "SET cuvs.index_dir='$TESTIDX'; DROP TABLE IF EXISTS asan_export_t;" \
+        < /dev/null 2>/dev/null || true
     kill_test_daemon
-    sudo rm -rf "$TESTIDX"
+    sudo rm -rf "$TESTIDX" < /dev/null
     # Same mtime trap as the ASAN build above, in reverse: the objects on disk
     # are now the ASAN ones, so a plain `make server` sees them as up to date
     # and does nothing -- install-server would silently reinstall the ASAN
@@ -116,21 +130,25 @@ cleanup() {
     rm -f src/pg_cuvs_server.o src/cuvs_ipc_server.o src/cuvs_util_server.o \
           src/cuvs_objstore_server.o src/cuvs_build_corpus_server.o \
           src/cuvs_wrapper.o pg_cuvs_server
-    make server 2>&1 | tail -n 5
-    nm -D pg_cuvs_server 2>/dev/null | grep -q '__asan_init' \
+    make server < /dev/null 2>&1 | tail -n 5
+    # See the matching comment on the ASAN-build check above: decouple this
+    # from nm's own (sometimes spuriously nonzero) exit status by capturing
+    # its output first.
+    nm_out=$(nm -D pg_cuvs_server 2>/dev/null || true)
+    echo "$nm_out" | grep -q '__asan_init' \
         && { echo "[asan-export] FAIL: cleanup rebuild is still ASAN-linked, refusing to install"; return 1; }
-    sudo make install-server
-    sudo systemctl start pg-cuvs-server
+    sudo make install-server < /dev/null
+    sudo systemctl start pg-cuvs-server < /dev/null
     for _ in $(seq 1 600); do
-        systemctl is-active --quiet pg-cuvs-server && break
+        systemctl is-active --quiet pg-cuvs-server < /dev/null && break
         sleep 1
     done
-    systemctl is-active pg-cuvs-server
+    systemctl is-active pg-cuvs-server < /dev/null
 }
 trap cleanup EXIT
 
 echo "[asan-export] stopping production daemon (this test runs its own)"
-sudo systemctl stop pg-cuvs-server
+sudo systemctl stop pg-cuvs-server < /dev/null
 
 echo "[asan-export] building ASAN daemon"
 # make's staleness check is mtime-only -- it has no notion of "compiler flags
@@ -139,20 +157,58 @@ echo "[asan-export] building ASAN daemon"
 # run against already-built objects logged "Nothing to be done for 'server'"
 # and launched a daemon with no sanitizer at all). Force every object feeding
 # the binary, matching $(SERVER_BIN)'s prerequisite list (Makefile:169).
-rm -f src/pg_cuvs_server.o src/cuvs_ipc_server.o src/cuvs_util_server.o \
-      src/cuvs_objstore_server.o src/cuvs_build_corpus_server.o \
-      src/cuvs_wrapper.o pg_cuvs_server
-make server \
-    EXTRA_SERVER_CFLAGS="-fsanitize=address -fno-omit-frame-pointer -O1" \
-    EXTRA_SERVER_LDFLAGS="-fsanitize=address" 2>&1 | tail -n 10
+#
+# The build+verify below retries up to 3 times. This is not working around
+# the mtime trap above (that one is deterministic and always reproduces) --
+# it is a separate, genuinely flaky failure: the identical rm -f + make server
+# + nm -D sequence, run repeatedly on the same VM with no code changes between
+# runs, produced a binary nm reports as ASAN-free in roughly half of ~5 trials
+# and correctly ASAN-linked in the other half (`-fsanitize=address` visibly
+# present on the g++ link line every time; `ldd`/`nm -D`/md5sum immediately
+# after a successful build all agreed, and a second nm -D 3s later after an
+# explicit `sync` changed nothing within a single run -- so this is not a
+# file-flush race, and it did not correlate with stopping the production
+# daemon first, the only script step that differs from a bare rebuild). No
+# root cause was found in the toolchain; retrying a full clean rebuild is the
+# pragmatic mitigation, matching how CI systems generally handle a flaky
+# compiler/linker rather than blocking on an unreproduced toolchain bug. All
+# three attempts failing still fails the guard -- this bounds the flake, it
+# does not launder it.
+asan_build_ok=0
+for attempt in 1 2 3; do
+    rm -f src/pg_cuvs_server.o src/cuvs_ipc_server.o src/cuvs_util_server.o \
+          src/cuvs_objstore_server.o src/cuvs_build_corpus_server.o \
+          src/cuvs_wrapper.o pg_cuvs_server
+    make server \
+        EXTRA_SERVER_CFLAGS="-fsanitize=address -fno-omit-frame-pointer -O1" \
+        EXTRA_SERVER_LDFLAGS="-fsanitize=address" \
+        < /dev/null 2>&1 | tail -n 10
+    # Root cause of the "flaky" failure this loop was originally added to
+    # paper over: `nm -D ... | grep -q ...` is a pipeline, and under
+    # pipefail (set above) its exit status is nm's whenever nm itself exits
+    # nonzero -- which it intermittently did on this VM even while printing
+    # a complete, correct symbol table that grep would have matched (proven
+    # by diffing two nm -D invocations 1s apart on the same unmodified
+    # binary: identical output, but only one of the two pipelines reported
+    # success). Capture nm's stdout first, discarding its own exit status
+    # with `|| true`, so the check reflects only "is the symbol in the
+    # output" and not "did nm also exit 0" -- the two turned out not to be
+    # the same question on this toolchain.
+    nm_out=$(nm -D pg_cuvs_server 2>/dev/null || true)
+    if echo "$nm_out" | grep -q '__asan_init'; then
+        asan_build_ok=1
+        break
+    fi
+    echo "[asan-export] attempt $attempt: pg_cuvs_server was not built with ASAN, retrying"
+done
 # Verify the sanitizer is actually linked in before trusting the rest of the
 # run -- silently testing a plain build would report a false PASS.
-nm -D pg_cuvs_server 2>/dev/null | grep -q '__asan_init' \
-    || { echo "[asan-export] FAIL: pg_cuvs_server was not built with ASAN"; exit 1; }
-sudo make install-server
+[ "$asan_build_ok" -eq 1 ] \
+    || { echo "[asan-export] FAIL: pg_cuvs_server was not built with ASAN after 3 attempts"; exit 1; }
+sudo make install-server < /dev/null
 
-sudo mkdir -p "$TESTIDX"
-sudo chmod 777 "$TESTIDX"
+sudo mkdir -p "$TESTIDX" < /dev/null
+sudo chmod 777 "$TESTIDX" < /dev/null
 
 echo "[asan-export] launch 1: build the CAGRA index"
 launch_asan_daemon
@@ -181,7 +237,8 @@ echo "[asan-export] export: pg_cuvs_build_hnsw() must not ASAN-fault"
 # ASAN's abort_on_error crashes rather than hangs, but a bound is cheap
 # insurance against an unattended run never returning.
 set +e
-timeout 120 psql -d "$DB" -c "SET cuvs.index_dir='$TESTIDX'; SELECT pg_cuvs_build_hnsw('asan_export_cagra'::regclass);"
+timeout 120 psql -d "$DB" -c "SET cuvs.index_dir='$TESTIDX'; SELECT pg_cuvs_build_hnsw('asan_export_cagra'::regclass);" \
+    < /dev/null
 PSQL_RC=$?
 set -e
 if [ "$PSQL_RC" -eq 124 ]; then
