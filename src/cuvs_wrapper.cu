@@ -186,6 +186,29 @@ pad_results(CuvsSearchResult *results, int from, int to, uint32_t metric)
     }
 }
 
+/* TAIL CONTRACT (cuvs_wrapper.h, #103), prefilter clause. pad_results above
+ * covers only the first stated reason a slot goes unfilled — the corpus holding
+ * fewer than top_k vectors. The second, "a prefilter excluded them", lands
+ * INSIDE [0, bk): cuVS writes its own no-neighbour marker there, and that marker
+ * is not CUVS_PAD_ITEM_ID (CAGRA indexes with uint32, so it arrives as a large
+ * positive value after the widening cast, never as -1). Callers were told they
+ * may detect unfilled slots by item_id alone, so translate anything outside
+ * [0, n) to the documented sentinel. The CPU shim already behaves this way —
+ * shim_topk does not distinguish the two reasons — which is why Tier-1 cannot
+ * express this divergence. Valid ids pass through untouched. */
+static inline void
+store_result(CuvsSearchResult *slot, int64_t id, float distance,
+             int64_t n, uint32_t metric)
+{
+    if (id < 0 || id >= n) {
+        slot->item_id  = CUVS_PAD_ITEM_ID;
+        slot->distance = cuvs_pad_distance(metric);
+    } else {
+        slot->item_id  = id;
+        slot->distance = distance;
+    }
+}
+
 /* Phase 3I-1: CPU HNSW index (hnswlib-backed via cuVS).
  * from_cagra() returns unique_ptr; deserialize() returns raw ptr via out-param.
  * We store a raw ptr and delete in cuvs_hnsw_free. */
@@ -767,10 +790,9 @@ cuvs_bf_search_filtered(
         raft::copy(h_distances.data(), d_distances.data_handle(), bk, res.get_stream());
         res.sync_stream();
 
-        for (int i = 0; i < bk; i++) {
-            results[i].item_id  = h_indices[i];
-            results[i].distance = h_distances[i];
-        }
+        for (int i = 0; i < bk; i++)
+            store_result(&results[i], h_indices[i], h_distances[i],
+                         impl->n, impl->metric);
         pad_results(results, bk, top_k, impl->metric);
         return 0;
     } catch (const std::exception &e) {
@@ -863,10 +885,9 @@ cuvs_cagra_search_filtered(
         raft::copy(h_distances.data(), d_distances.data_handle(), bk, res.get_stream());
         res.sync_stream();
 
-        for (int i = 0; i < bk; i++) {
-            results[i].item_id  = (int64_t)h_indices[i];
-            results[i].distance = h_distances[i];
-        }
+        for (int i = 0; i < bk; i++)
+            store_result(&results[i], (int64_t)h_indices[i], h_distances[i],
+                         n, impl->metric);
         pad_results(results, bk, top_k, impl->metric);
         return 0;
     } catch (const std::exception &e) {
