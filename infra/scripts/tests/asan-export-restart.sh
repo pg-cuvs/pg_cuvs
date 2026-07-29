@@ -32,6 +32,10 @@
 # and restarted by this script), /tmp writable for a dedicated test index dir.
 
 set -e
+# make server | tail masks a real build failure behind tail's own (near-always
+# 0) exit code, so set -e alone would not catch it -- pipefail makes the
+# pipeline report make's status instead.
+set -o pipefail
 
 TESTIDX=/tmp/cuvs_indexes_asan_test
 SOCK=/tmp/.s.pg_cuvs
@@ -90,7 +94,14 @@ launch_asan_daemon() {
 # sanitizer's overhead and could mask or misattribute unrelated failures.
 cleanup() {
     echo "[asan-export] cleanup: restoring production (non-ASAN, systemd) daemon"
-    psql -qd "$DB" -c "DROP TABLE IF EXISTS asan_export_t;" 2>/dev/null || true
+    # Drop before killing the daemon and deleting $TESTIDX, with the same
+    # index_dir the table was built under -- otherwise this reads the default
+    # cuvs.index_dir (a different path), the AM drop hook can't find what it
+    # expects, and the leftover catalog entry surfaces as a confusing failure
+    # on the *next* run's own "DROP TABLE IF EXISTS" instead of a clean no-op
+    # here. Best-effort either way: if the ASAN daemon already crashed, the
+    # `|| true` also silently swallows that connection failure.
+    psql -qd "$DB" -c "SET cuvs.index_dir='$TESTIDX'; DROP TABLE IF EXISTS asan_export_t;" 2>/dev/null || true
     kill_test_daemon
     sudo rm -rf "$TESTIDX"
     # Same mtime trap as the ASAN build above, in reverse: the objects on disk
@@ -165,10 +176,17 @@ kill_test_daemon
 launch_asan_daemon
 
 echo "[asan-export] export: pg_cuvs_build_hnsw() must not ASAN-fault"
+# A crash (the bug this test targets) is caught below via the ASAN log. A
+# HANG is a distinct failure mode this test has not otherwise exercised --
+# ASAN's abort_on_error crashes rather than hangs, but a bound is cheap
+# insurance against an unattended run never returning.
 set +e
-psql -d "$DB" -c "SET cuvs.index_dir='$TESTIDX'; SELECT pg_cuvs_build_hnsw('asan_export_cagra'::regclass);"
+timeout 120 psql -d "$DB" -c "SET cuvs.index_dir='$TESTIDX'; SELECT pg_cuvs_build_hnsw('asan_export_cagra'::regclass);"
 PSQL_RC=$?
 set -e
+if [ "$PSQL_RC" -eq 124 ]; then
+    echo "[asan-export] FAIL: export query timed out after 120s (daemon hang, not a crash)"
+fi
 
 echo "[asan-export] daemon log tail:"
 tail -n 40 "$ASAN_LOG"
@@ -183,3 +201,11 @@ if [ "$PSQL_RC" -ne 0 ]; then
 fi
 
 echo "[asan-export] PASS: no AddressSanitizer report, export succeeded"
+# Deliberately no `exit 0` here. Bash preserves an *explicit* exit code
+# (the `exit 1`s above) through an EXIT trap no matter what the trap itself
+# does, but an *implicit* fall-through exit does not -- it is overridden by
+# the trap handler's own last command (verified: `set -e; trap 'false' EXIT`
+# with no exit call yields a nonzero script status). That asymmetry means a
+# PASS whose cleanup() then fails to restore the daemon still surfaces here
+# as a failing `make gpu-test-asan-export`, which is the outcome we want. An
+# explicit `exit 0` added "for clarity" would silently remove that guarantee.
