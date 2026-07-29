@@ -67,6 +67,22 @@ CUDA_ARCH=sm_80                 # A100=sm_80 (L4=sm_89, H100=sm_90)
 Brev에서는 동작하지 않는다. Brev에서 과금을 멈추려면 `brev delete`뿐이다 —
 gpu-vm-provision 스킬 참조.
 
+### 데몬 제어
+
+부트스트랩이 `pg-cuvs-server` systemd 유닛을 설치하므로 데몬은 systemd로 다룬다
+(예전엔 `nohup`이라 이 명령들이 존재하지 않았고, 세션이 끊기면 데몬도 죽었다):
+
+```bash
+ssh <name> "sudo systemctl restart pg-cuvs-server"     # 재기동
+ssh <name> "systemctl is-active pg-cuvs-server"        # 상태
+ssh <name> "sudo journalctl -u pg-cuvs-server -n 50 --no-pager"   # 로그
+```
+
+`restart` 후 소켓은 **즉시 생기지 않는다** — 첫 CUDA 컨텍스트가 필요해서 머신에
+따라 12초~3분 걸린다. 유닛의 `TimeoutStartSec=600`이 이걸 감안한 값이고, 그동안
+`activating` 상태로 머무는 것이 정상이다. 소켓 권한(0660 → 0666) 확장은
+`ExecStartPost`가 자동으로 하므로 손으로 `chmod` 할 필요가 없다.
+
 ---
 
 ## 2. 일상 워크플로우

@@ -116,6 +116,13 @@ ssh ubuntu@$IP "psql -d postgres -c 'CREATE EXTENSION IF NOT EXISTS vector; CREA
 
 ## 8. pg_cuvs_server systemd 서비스
 
+> **이건 GCP 레거시 정의다.** Brev 의 유닛 SSOT 는 `infra/brev/bootstrap.sh` 이며,
+> 부트스트랩이 알아서 설치한다 — 손으로 만들 일이 없다. 아래와 다른 점:
+> `User=shadeform`, `--max-vram-mb` 없음(그 20480 은 40GB GCP A100 기준값이라
+> 80GB 에서는 데몬 기본값이 맞다), 그리고 `ExecStartPost` 가 `sleep 1` 이 아니라
+> 소켓을 폴링한다 — 첫 CUDA 컨텍스트가 뜨는 데 머신에 따라 3분이 넘게 걸려서
+> `sleep 1` 로는 chmod 대상이 아직 없다. 같은 이유로 `TimeoutStartSec=600` 이 필요하다.
+
 ```bash
 ssh ubuntu@$IP "sudo tee /etc/systemd/system/pg-cuvs-server.service > /dev/null" << 'EOF'
 [Unit]
