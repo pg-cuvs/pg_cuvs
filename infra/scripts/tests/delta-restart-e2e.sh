@@ -6,6 +6,9 @@
 #
 # Two properties (phase-record.md 3A: "daemon restart 후 delta 유실/손상 시 incomplete GPU
 # 결과를 서빙하지 않는다"):
+# The delta sidecar is a fallback path since 3Q added EXTEND (see the SET below),
+# so the setup has to induce its condition; a plain INSERT no longer reaches it.
+#
 #   (1) DURABILITY — a VALID pending .delta survives a daemon restart: the daemon
 #       reloads the base index and rebuilds the resident GPU delta cache from the
 #       persisted .delta, so the merged top-k is unchanged.
@@ -61,6 +64,18 @@ CREATE EXTENSION IF NOT EXISTS pg_cuvs;
 CREATE TABLE de_items (id bigint, embedding vector(4));
 INSERT INTO de_items SELECT g, ('['||g||',0,0,0]')::vector FROM generate_series(1,16) g;
 CREATE INDEX de_cagra ON de_items USING cagra (embedding vector_l2_ops);
+-- Empty socket_path forces the delta sidecar, which is what this test is about.
+-- Since 3Q, an INSERT into a cagra index with the daemon reachable takes the
+-- EXTEND path instead (cuvs_ipc_extend updates the VRAM graph in place and
+-- returns), and .delta is only the fallback for "extend failed / daemon down" —
+-- so the unmodified INSERT produced no .delta at all and step (2) below failed
+-- with "no .delta artifact found". aminsert gates that branch on a non-empty
+-- cuvs_socket_path (pg_cuvs.c), so clearing it reaches the fallback by its own
+-- documented condition rather than by faking an artifact. PGC_SUSET and
+-- session-local: the probes below run in new sessions with the real socket.
+-- No backticks in this comment: the heredoc is unquoted (it interpolates
+-- IDX_DIR), so bash would run the contents as a command substitution.
+SET cuvs.socket_path='';
 -- pending delta extremum: reachable only via the delta merge.
 INSERT INTO de_items VALUES (999, '[500,0,0,0]');
 SQL
