@@ -311,7 +311,8 @@ REMOTE_ENV = { test -f ~/.pg_cuvs_env || { echo 'ERROR: ~/.pg_cuvs_env missing o
 
 .PHONY: vm-start vm-stop sync gpu-build gpu-test gpu-bench gpu-bench-1m gpu-shell \
 	gpu-test-unit gpu-test-regress gpu-test-isolation gpu-test-daemon gpu-test-e2e \
-	gpu-test-delta-restart gpu-test-all gpu-test-objstore gpu-test-vram gpu-test-maxidx
+	gpu-test-delta-restart gpu-test-all gpu-test-objstore gpu-test-vram gpu-test-maxidx \
+	gpu-test-asan-export
 
 vm-start:
 	@test -n "$(GCP_INSTANCE)" || (echo "ERROR: set GCP_INSTANCE in gpu.conf"; exit 1)
@@ -437,6 +438,15 @@ gpu-test-e2e:
 # Piped over stdin (bash -s); plain ssh, no remote TTY needed.
 gpu-test-delta-restart:
 	ssh $(VM_HOST) "$(REMOTE_ENV) && bash -s" < infra/scripts/tests/delta-restart-e2e.sh
+
+# #101/#114 regression guard: ASAN heap-buffer-overflow in handle_export_adjacency
+# on export after a daemon restart. Deliberately NOT in gpu-test-all (5-10 min:
+# ASAN daemon build + two restarts + a slow first CUDA context) -- run on demand
+# or after touching cuvs_cagra_extract_adjacency / the deserialize/extend
+# placeholder path. `cd` is required here (unlike the other piped scripts, which
+# never call `make`) because the script builds+installs the ASAN daemon itself.
+gpu-test-asan-export:
+	ssh $(VM_HOST) "cd ~/pg_cuvs && $(REMOTE_ENV) && bash -s" < infra/scripts/tests/asan-export-restart.sh
 
 # Full ladder: unit -> regress -> isolation -> daemon faults -> e2e durability.
 gpu-test-all: gpu-test-unit gpu-test-regress gpu-test-isolation gpu-test-daemon \
