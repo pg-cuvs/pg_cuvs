@@ -9,6 +9,16 @@
  * to a CPU fallback without crashing the backend.
  */
 
+/* This file is compiled twice: once via PGXS into the extension .so (PG
+ * backend context) and once standalone into pg_cuvs_server (Makefile's
+ * SERVER_CFLAGS adds -D_POSIX_C_SOURCE=200809L, which hides glibc's
+ * __USE_MISC extensions — including getrandom(), used below for shm key
+ * hardening, #87). Re-enable them; additive alongside _POSIX_C_SOURCE. Must
+ * precede any system header. Mirrors the guard in pg_cuvs_server.c. */
+#ifndef _DEFAULT_SOURCE
+#define _DEFAULT_SOURCE 1
+#endif
+
 #include "cuvs_ipc.h"
 #include "cuvs_util.h"   /* leveled logging macros (LOG_ERROR/WARN/INFO/DEBUG) */
 #include "cuvs_build_corpus.h"   /* ADR-057: tiered corpus handoff + SCM_RIGHTS */
@@ -26,6 +36,7 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/time.h>
+#include <sys/random.h>   /* getrandom(2): CSPRNG suffix for shm key names, #87 */
 #include <fcntl.h>
 #include <time.h>
 #include <poll.h>   /* 3S: interruptible reply wait */
@@ -194,12 +205,35 @@ recv_all_interruptible(int fd, void *buf, size_t len, int timeout_sec)
  * shm helpers
  * ---------------------------------------------------------------- */
 
-/* Build a unique shm key from pid + sequence counter. */
+/* CSPRNG fill for shm key suffixes (#87). getrandom(2) is Linux-only; this
+ * file also builds via PGXS on whatever host runs `make` (macOS in local
+ * dev), so fall back to arc4random_buf() there (BSD/macOS libc, never fails). */
+static void
+shm_key_random(unsigned char *buf, size_t len)
+{
+#ifdef __linux__
+    if (getrandom(buf, len, 0) != (ssize_t)len)
+        memset(buf, 0, len);
+#else
+    arc4random_buf(buf, len);
+#endif
+}
+
+/* Build a unique, unguessable shm key from pid + sequence counter + a CSPRNG
+ * suffix. The pid/seq prefix stays for debug ordering; the random suffix
+ * (#87) is what makes the name unguessable to another user on a shared host. */
 static void
 make_shm_key(char *key, size_t keylen)
 {
     static int seq = 0;
-    snprintf(key, keylen, "/pg_cuvs_%d_%d", (int)getpid(), seq++);
+    unsigned char rnd[8];
+    char hex[17];
+
+    shm_key_random(rnd, sizeof(rnd));
+    for (size_t i = 0; i < sizeof(rnd); i++)
+        snprintf(hex + i * 2, 3, "%02x", rnd[i]);
+
+    snprintf(key, keylen, "/pg_cuvs_%d_%d_%s", (int)getpid(), seq++, hex);
 }
 
 /* Write vectors + TIDs into a new shm segment. Returns shm fd or -1. */
@@ -214,12 +248,9 @@ shm_write_build_payload(const char   *shm_key,
     size_t tid_bytes = (size_t)n_vecs * sizeof(uint64_t);
     size_t total     = vec_bytes + tid_bytes;
 
-    int fd = shm_open(shm_key, O_CREAT | O_RDWR, 0666);
+    int fd = shm_open(shm_key, O_CREAT | O_EXCL | O_RDWR, 0600);
     if (fd < 0)
         return -1;
-
-    /* Override umask: ensure other users (daemon) can read the shm segment */
-    fchmod(fd, 0666);
 
     if (ftruncate(fd, (off_t)total) < 0)
     {
@@ -253,10 +284,9 @@ shm_write_query_batch(const char *shm_key, const float *queries,
     size_t vec_bytes = (size_t)n_queries * (size_t)dim * sizeof(float);
     size_t total     = hdr_bytes + vec_bytes;
 
-    int fd = shm_open(shm_key, O_CREAT | O_RDWR, 0666);
+    int fd = shm_open(shm_key, O_CREAT | O_EXCL | O_RDWR, 0600);
     if (fd < 0)
         return -1;
-    fchmod(fd, 0666);
     if (ftruncate(fd, (off_t)total) < 0)
     {
         shm_unlink(shm_key);
@@ -283,12 +313,9 @@ shm_write_query(const char *shm_key, const float *query_vec, int dim)
 {
     size_t vec_bytes = (size_t)dim * sizeof(float);
 
-    int fd = shm_open(shm_key, O_CREAT | O_RDWR, 0666);
+    int fd = shm_open(shm_key, O_CREAT | O_EXCL | O_RDWR, 0600);
     if (fd < 0)
         return -1;
-
-    /* Override umask: ensure other users (daemon) can read the shm segment */
-    fchmod(fd, 0666);
 
     if (ftruncate(fd, (off_t)vec_bytes) < 0)
     {
@@ -1304,10 +1331,9 @@ cuvs_ipc_search_filtered(
         make_shm_key(filter_shm_key, sizeof(filter_shm_key));
         size_t filter_bytes = (size_t)n_filter * sizeof(uint64_t);
 
-        filter_shm_fd = shm_open(filter_shm_key, O_CREAT | O_RDWR, 0666);
+        filter_shm_fd = shm_open(filter_shm_key, O_CREAT | O_EXCL | O_RDWR, 0600);
         if (filter_shm_fd < 0)
             goto cleanup;
-        fchmod(filter_shm_fd, 0666);
         if (ftruncate(filter_shm_fd, (off_t)filter_bytes) < 0)
         {
             shm_unlink(filter_shm_key);
@@ -1457,10 +1483,9 @@ cuvs_ipc_search_stream_bf(
         make_shm_key(filter_shm_key, sizeof(filter_shm_key));
         size_t filter_bytes = (size_t)n_filter * sizeof(uint64_t);
 
-        filter_shm_fd = shm_open(filter_shm_key, O_CREAT | O_RDWR, 0666);
+        filter_shm_fd = shm_open(filter_shm_key, O_CREAT | O_EXCL | O_RDWR, 0600);
         if (filter_shm_fd < 0)
             goto cleanup;
-        fchmod(filter_shm_fd, 0666);
         if (ftruncate(filter_shm_fd, (off_t)filter_bytes) < 0)
         {
             shm_unlink(filter_shm_key);

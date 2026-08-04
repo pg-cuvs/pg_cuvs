@@ -18,6 +18,7 @@
 #include <sys/stat.h>
 #include <sys/file.h>     /* flock */
 #include <sys/socket.h>
+#include <sys/random.h>   /* getrandom(2): CSPRNG suffix for shm segment names, #87 */
 
 #define BLD_PREFIX     "pg_cuvs_bld_"
 #define BLD_PREFIX_LEN (sizeof(BLD_PREFIX) - 1)
@@ -38,12 +39,38 @@ cuvs_corpus_force_kind(const char *kind)
     else                             g_forced = CORPUS_NONE;
 }
 
-/* Unique per-process T2 name (mirrors cuvs_ipc.c:make_shm_key, distinct prefix). */
+/* CSPRNG fill for shm key suffixes (#87). getrandom(2) is Linux-only; this
+ * file also builds on macOS via `make test-unit` (test/unit/test_build_corpus.c),
+ * so fall back to arc4random_buf() there (BSD/macOS libc, never fails). */
+static void
+shm_key_random(unsigned char *buf, size_t len)
+{
+#ifdef __linux__
+    if (getrandom(buf, len, 0) != (ssize_t) len)
+        memset(buf, 0, len);
+#else
+    arc4random_buf(buf, len);
+#endif
+}
+
+/* Unique, unguessable per-process T2 name (mirrors cuvs_ipc.c:make_shm_key,
+ * distinct prefix; #87 CSPRNG suffix hardening applies here too). Only 4
+ * random bytes (not 8, like cuvs_ipc.c) — macOS enforces a hard 31-char
+ * POSIX shm name limit (PSHMNAMLEN) and this path is exercised locally by
+ * `make test-unit`; Linux has no such limit, so the extra margin isn't lost
+ * there, just unused. */
 static void
 build_shm_name(char *name, size_t namelen)
 {
     static int seq = 0;
-    snprintf(name, namelen, "/" BLD_PREFIX "%d_%d", (int) getpid(), seq++);
+    unsigned char rnd[4];
+    char hex[9];
+
+    shm_key_random(rnd, sizeof(rnd));
+    for (size_t i = 0; i < sizeof(rnd); i++)
+        snprintf(hex + i * 2, 3, "%02x", rnd[i]);
+
+    snprintf(name, namelen, "/" BLD_PREFIX "%d_%d_%s", (int) getpid(), seq++, hex);
 }
 
 /* ---- tier: memfd (T1) -------------------------------------------------- */
@@ -85,10 +112,9 @@ open_shm(CuvsBuildCorpus *c, size_t bytes)
 
     build_shm_name(name, sizeof(name));
 
-    fd = shm_open(name, O_CREAT | O_RDWR, 0666);
+    fd = shm_open(name, O_CREAT | O_EXCL | O_RDWR, 0600);
     if (fd < 0)
         return -1;
-    fchmod(fd, 0666);                 /* daemon (other uid) must be able to open */
     /* Hold an exclusive advisory lock for the segment's life. The kernel
      * auto-releases it on ANY process death (incl. SIGKILL), which is how the
      * reaper distinguishes a dead owner from a live build. Best-effort: on

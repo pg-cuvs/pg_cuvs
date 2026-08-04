@@ -91,11 +91,12 @@ test_golden_no_grow(int64_t n, int dim)
     memcpy((char *) c.base + vec_bytes, tids, tid_bytes);
     ASSERT(memcmp(c.base, golden, total) == 0, "golden byte-identity (shm)");
 
-    /* 0666 perms so the daemon (other uid) can open it. */
+    /* #87: 0600 + O_EXCL now, not 0666 — same uid (daemon reads by name
+     * passed over the UDS control channel, not via world-readable perms). */
     {
         struct stat st;
         ASSERT(fstat(c.fd, &st) == 0, "fstat");
-        ASSERT((st.st_mode & 0777) == 0666, "shm mode 0666");
+        ASSERT((st.st_mode & 0777) == 0600, "shm mode 0600");
     }
     strncpy(name, c.shm_name, sizeof(name) - 1);
     name[sizeof(name) - 1] = '\0';

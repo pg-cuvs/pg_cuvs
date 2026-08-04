@@ -47,9 +47,24 @@
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <sys/mman.h>
+#include <sys/random.h>   /* getrandom(2): CSPRNG suffix for reply shm key names, #87 */
 #include <fcntl.h>
 #include <time.h>
 #include <stdint.h>
+
+/* CSPRNG fill for reply-shm key suffixes (#87). getrandom(2) is Linux-only;
+ * fall back to arc4random_buf() on macOS/BSD (never fails) so this file still
+ * builds wherever `make` runs locally. */
+static void
+shm_key_random(unsigned char *buf, size_t len)
+{
+#ifdef __linux__
+    if (getrandom(buf, len, 0) != (ssize_t) len)
+        memset(buf, 0, len);
+#else
+    arc4random_buf(buf, len);
+#endif
+}
 
 /* ----------------------------------------------------------------
  * Index registry
@@ -3984,14 +3999,21 @@ handle_search_batch(int client_fd, const CuvsCmdFrame *cmd)
     /* --- Allocate the reply shm: [Q][K][tids Q*K][dists Q*K]. --- */
     static int bsr_seq = 0;
     char rkey[64];
-    snprintf(rkey, sizeof(rkey), "/pg_cuvs_bsr_%d_%d",
-             (int) getpid(), __atomic_fetch_add(&bsr_seq, 1, __ATOMIC_RELAXED));
+    {
+        unsigned char rnd[8];
+        char hex[17];
+        shm_key_random(rnd, sizeof(rnd));
+        for (size_t i = 0; i < sizeof(rnd); i++)
+            snprintf(hex + i * 2, 3, "%02x", rnd[i]);
+        snprintf(rkey, sizeof(rkey), "/pg_cuvs_bsr_%d_%d_%s",
+                 (int) getpid(), __atomic_fetch_add(&bsr_seq, 1, __ATOMIC_RELAXED), hex);
+    }
     size_t rhdr   = 2 * sizeof(uint32_t);
     size_t rtids  = (size_t) Q * (size_t) K * sizeof(uint64_t);
     size_t rdists = (size_t) Q * (size_t) K * sizeof(float);
     size_t rtotal = rhdr + rtids + rdists;
 
-    int rfd = shm_open(rkey, O_CREAT | O_RDWR, 0666);
+    int rfd = shm_open(rkey, O_CREAT | O_EXCL | O_RDWR, 0600);
     if (rfd < 0)
     {
         free(out);
@@ -3999,7 +4021,6 @@ handle_search_batch(int client_fd, const CuvsCmdFrame *cmd)
         send_error(client_fd, "shm_open failed for batch reply");
         return;
     }
-    fchmod(rfd, 0666);
     if (ftruncate(rfd, (off_t) rtotal) != 0)
     {
         close(rfd); shm_unlink(rkey); free(out);
@@ -5885,13 +5906,20 @@ handle_export_adjacency(int client_fd, const CuvsCmdFrame *cmd)
     size_t hdr_bytes  = 4 * sizeof(uint32_t);
     size_t total      = hdr_bytes + adj_bytes + vecs_bytes + tids_bytes;
 
-    /* Generate a unique shm key for this reply. */
+    /* Generate a unique, unguessable shm key for this reply (#87). */
     static int adj_seq = 0;
     char shm_key[64];
-    snprintf(shm_key, sizeof(shm_key), "/pg_cuvs_adj_%d_%d",
-             (int)getpid(), __atomic_fetch_add(&adj_seq, 1, __ATOMIC_RELAXED));
+    {
+        unsigned char rnd[8];
+        char hex[17];
+        shm_key_random(rnd, sizeof(rnd));
+        for (size_t i = 0; i < sizeof(rnd); i++)
+            snprintf(hex + i * 2, 3, "%02x", rnd[i]);
+        snprintf(shm_key, sizeof(shm_key), "/pg_cuvs_adj_%d_%d_%s",
+                 (int)getpid(), __atomic_fetch_add(&adj_seq, 1, __ATOMIC_RELAXED), hex);
+    }
 
-    int shm_fd = shm_open(shm_key, O_CREAT | O_RDWR, 0666);
+    int shm_fd = shm_open(shm_key, O_CREAT | O_EXCL | O_RDWR, 0600);
     if (shm_fd < 0)
     {
         free(adj); free(vecs);
