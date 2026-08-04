@@ -1,0 +1,7 @@
+path,correlation,selectivity,n_filter,k,recall,mean_returned,p50_ms,daemon_search_mode,n_queries
+3O,anti,0.05,50000,10,0.998,10.0,76.139,brute_force,200
+D-wedge,anti,0.05,50000,10,0.9955,10.0,198.492,stream_bf,200
+stream_bf,anti,0.05,50000,10,0.9945,10.0,202.085,stream_bf,200
+3O,anti,0.005,5000,10,0.999,10.0,9.352,brute_force,200
+D-wedge,anti,0.005,5000,10,0.999,10.0,21.817,stream_bf,200
+stream_bf,anti,0.005,5000,10,0.999,10.0,18.083,stream_bf,200

@@ -170,6 +170,12 @@ def main():
                     help="RNG seed for the random-fill portion of mixed filters")
     ap.add_argument("--reuse-table", action="store_true",
                     help="skip COPY/CREATE INDEX if f3o is already loaded")
+    ap.add_argument("--dump-per-query", default=None,
+                    help="optional path: write one row per (path, correlation, "
+                         "selectivity, query_idx, returned) -- mean_returned in "
+                         "--out is an aggregate that hides a bimodal distribution "
+                         "(e.g. some queries filling k while others return 0); "
+                         "this is the underlying per-query counts (#133 review F7)")
     args = ap.parse_args()
 
     correlations = [c.strip() for c in args.correlations.split(",")]
@@ -305,6 +311,7 @@ def main():
     grid = ([float(x) for x in args.selectivities.split(",")]
             if args.selectivities else list(SELECTIVITIES))
     rows = []
+    per_query_rows = []
     for corr in correlations:
         for sel in grid:
             if corr == "random":
@@ -378,6 +385,12 @@ def main():
                           "is not uniform", flush=True)
                 r = recall_at_k(got, gt, args.k)
                 returned = np.mean([len(g) for g in got])
+                if args.dump_per_query:
+                    per_query_rows.extend(
+                        dict(path=path, correlation=corr,
+                             selectivity=round(actual_sel, 6),
+                             query_idx=qi, returned=len(g))
+                        for qi, g in enumerate(got))
                 rows.append(dict(path=path, correlation=corr,
                                  selectivity=round(actual_sel, 6),
                                  n_filter=n_filter, k=args.k,
@@ -395,6 +408,13 @@ def main():
         w.writeheader()
         w.writerows(rows)
     print(f"[done] wrote {args.out} ({len(rows)} rows)")
+
+    if args.dump_per_query:
+        with open(args.dump_per_query, "w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=list(per_query_rows[0].keys()))
+            w.writeheader()
+            w.writerows(per_query_rows)
+        print(f"[done] wrote {args.dump_per_query} ({len(per_query_rows)} rows)")
     return 0
 
 

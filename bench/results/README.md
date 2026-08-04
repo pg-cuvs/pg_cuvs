@@ -29,7 +29,9 @@ file exists so a link that lands directly on a CSV does not lose the context.
 | `cohere_N1000000_summary.csv`, `.jsonl` | 2026-06-01 | anbench `run_cohere.sh` | Cohere wiki-en, 1M×1024 | A100-SXM4-40GB | **superseded + known defect** — see below |
 | `gpu_resources_bench.csv` | 2026-06-01 | `bench/legacy/test_gpu_resources.py` | synthetic 100K×384 | A100 | VRAM budget / shard / fanout matrix — not re-audited |
 | `hnsw_import_bench.csv` | 2026-06-01 | 3I import harness | synthetic | A100 | CAGRA→HNSW import speedup — not re-audited |
-| `adr083_133_anti_after_fix.csv` | 2026-08-04 | `bench/filter_recall/adr079_3o_recall.py --correlations anti` | wiki_all_1M | Brev A100-SXM4-80GB | **canonical** — #133/ADR-083 fix verification: 3O recall on anti-correlated filter after the short-fill fallback, vs `adr079_3o_correlation.csv`/`_hisel.csv` (0.0 before, same harness/host) |
+| `adr083_133_anti_after_fix.csv` | 2026-08-04 | `bench/filter_recall/adr079_3o_recall.py --correlations anti` | wiki_all_1M | Brev A100-SXM4-80GB | superseded by `_after_review_fixes` (pre-F1/F2/F3/F5 review round) |
+| `adr083_133_anti_after_review_fixes.csv` | 2026-08-04 | `bench/filter_recall/adr079_3o_recall.py --correlations anti` | wiki_all_1M | Brev A100-SXM4-80GB | **canonical** — #133/ADR-083 fix verification at the final commit (after the F1/F2/F3/F5 adversarial-review fixes): 3O recall 0.998/0.999 vs 0.0 before (`adr079_3o_correlation.csv`/`_hisel.csv`, same harness/host) |
+| `adr083_133_anti_per_query.csv` | 2026-08-04 | `bench/filter_recall/adr079_3o_recall.py --correlations anti --dump-per-query` | wiki_all_1M | Brev A100-SXM4-80GB | **canonical** — #133 review F7: per-query `returned` for every query behind `adr083_133_anti_after_review_fixes.csv`'s 3O rows. All 400 queries (200 x 2 selectivities) returned exactly k=10 -- not a bimodal mix that would indicate the guard under-triggers on some queries |
 
 ## Known defects
 
