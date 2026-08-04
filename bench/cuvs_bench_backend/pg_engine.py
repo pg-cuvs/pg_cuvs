@@ -30,11 +30,18 @@ MEASUREMENT BOUNDARY (important; also in README.md):
 """
 import argparse
 import csv
+import os
 import struct
 import sys
 import time
 
 import numpy as np
+
+# adr079_reuse.corpus_fingerprint lives beside bench/filter_recall/*.py -- reuse
+# its md5-of-ordered-row-md5 gate machinery (#78) rather than reimplementing it.
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                 "..", "filter_recall"))
+from adr079_reuse import corpus_fingerprint  # noqa: E402
 
 INDEX_DIR_DEFAULT = "/tmp/cuvs_indexes"
 
@@ -113,6 +120,7 @@ class PgEngine:
     cuvs-bench backend and the standalone main() below."""
 
     ANN_INDEXES = ("t_hnsw", "t_ivf", "t_cagra")
+    CORPUS_MARKER = "public._bench_corpus"
 
     def __init__(self, dbname="postgres", index_dir=INDEX_DIR_DEFAULT):
         import psycopg
@@ -127,40 +135,88 @@ class PgEngine:
         self.index_dir = index_dir
 
     # -- data ------------------------------------------------------------------
-    def load_corpus(self, corpus_path, n, dim, batch=50_000):
+    def _dump_78_evidence(self, cur, got, n):
+        """#78: at 1M scale count(*) has intermittently reported 0 between
+        configs. Measured facts so far: the heap really is empty (parallel seq
+        scan returns rows=0 in ~17 ms), relfilenode is unchanged, n_tup_del is
+        0, the orchestrator loop is strictly sequential, an autocommit COPY is
+        visible to other connections immediately, and neither
+        pg_cuvs_build_hnsw nor a cagra CREATE INDEX empties the heap at 50k. So
+        re-loading is the correct response -- what is unknown is what empties
+        the table. Dump the state here so the next occurrence carries its own
+        evidence instead of just a lost 2 minutes."""
+        cur.execute(
+            "SELECT pg_relation_filenode('public.t'), "
+            "       pg_relation_size('public.t'), "
+            "       (SELECT n_tup_ins FROM pg_stat_all_tables "
+            "         WHERE relid = 'public.t'::regclass), "
+            "       (SELECT n_tup_del FROM pg_stat_all_tables "
+            "         WHERE relid = 'public.t'::regclass)")
+        fnode, relsize, ins, dele = cur.fetchone()
+        print(f"[engine] #78 corpus reload: marker/count mismatch count={got} "
+              f"want={n} filenode={fnode} relsize={relsize} "
+              f"n_tup_ins={ins} n_tup_del={dele}", flush=True)
+
+    def _corpus_reusable(self, cur, dataset, n, dim):
+        """Cheap per-config gate (#78): a durable marker table records the
+        fingerprint of the last corpus this dataset/n/dim loaded into `t`. If
+        the marker matches AND `t` still has exactly n rows, reuse it -- no
+        full fingerprint recompute here, just an indexed marker lookup + a
+        count(*) (a parallel seq scan of a static-size heap costs ~17ms even at
+        1M rows, per the #78 investigation). The expensive full fingerprint
+        verify only happens once, right after an actual load."""
+        cur.execute(
+            f"SELECT fingerprint FROM {self.CORPUS_MARKER} "
+            "WHERE dataset = %s AND n = %s AND dim = %s",
+            (dataset, n, dim))
+        marker = cur.fetchone()
+        if marker is None:
+            return False
+        cur.execute("SELECT to_regclass('public.t')")
+        if cur.fetchone()[0] is None:
+            return False
+        cur.execute("SELECT count(*) FROM public.t")
+        got = cur.fetchone()[0]
+        if got == n:
+            print(f"[engine] table t reused via #78 marker gate "
+                  f"(dataset={dataset} n={n} fingerprint={marker[0][:12]}...)",
+                  flush=True)
+            return True
+        self._dump_78_evidence(cur, got, n)
+        return False
+
+    def load_corpus(self, corpus_path, n, dim, dataset="default", batch=50_000,
+                     force_reload=False):
+        """Load `t` with the first n rows of corpus_path, reusing an existing
+        load when possible (#78). Reuse is gated by a durable marker table
+        (CORPUS_MARKER) keyed on (dataset, n, dim) + a corpus fingerprint, so
+        it survives the fresh PgEngine/PgBackend instance the cuvs-bench
+        orchestrator constructs per BenchmarkConfig -- the effect is "load
+        once per run" without needing a hook into the orchestrator itself.
+
+        On an actual (re)load this uses TRUNCATE + COPY, NOT `DROP TABLE ...
+        CASCADE` (the pre-#78 behaviour), so any ANN index on `t` survives --
+        DROP...CASCADE was destroying it and forcing a spurious rebuild on the
+        next config (see issue #78 comment 2026-07-22).
+
+        force_reload=True bypasses the marker gate unconditionally (test hook:
+        deterministically exercise the reload path without waiting for a
+        genuine #78 recurrence)."""
         from pgvector import Vector
         with self.conn.cursor() as cur:
+            cur.execute(
+                f"CREATE TABLE IF NOT EXISTS {self.CORPUS_MARKER} "
+                "(dataset text PRIMARY KEY, n bigint NOT NULL, dim int NOT NULL, "
+                " fingerprint text NOT NULL, "
+                " loaded_at timestamptz NOT NULL DEFAULT now())")
+            if not force_reload and self._corpus_reusable(cur, dataset, n, dim):
+                return
             cur.execute("SELECT to_regclass('public.t')")
             if cur.fetchone()[0] is not None:
-                cur.execute("SELECT count(*) FROM public.t")
-                got = cur.fetchone()[0]
-                if got != n:
-                    # #78: at 1M scale this intermittently reports 0 between
-                    # configs. Measured facts so far: the heap really is empty
-                    # (parallel seq scan returns rows=0 in ~17 ms), relfilenode is
-                    # unchanged, n_tup_del is 0, the orchestrator loop is strictly
-                    # sequential, an autocommit COPY is visible to other
-                    # connections immediately, and neither pg_cuvs_build_hnsw nor
-                    # a cagra CREATE INDEX empties the heap at 50k. So re-loading
-                    # is the correct response -- what is unknown is what empties
-                    # the table. Dump the state here so the next occurrence
-                    # carries its own evidence instead of just a lost 2 minutes.
-                    cur.execute(
-                        "SELECT pg_relation_filenode('public.t'), "
-                        "       pg_relation_size('public.t'), "
-                        "       (SELECT n_tup_ins FROM pg_stat_all_tables "
-                        "         WHERE relid = 'public.t'::regclass), "
-                        "       (SELECT n_tup_del FROM pg_stat_all_tables "
-                        "         WHERE relid = 'public.t'::regclass)")
-                    fnode, relsize, ins, dele = cur.fetchone()
-                    print(f"[engine] #78 corpus reload: count={got} want={n} "
-                          f"filenode={fnode} relsize={relsize} "
-                          f"n_tup_ins={ins} n_tup_del={dele}", flush=True)
-                if got == n:
-                    print(f"[engine] table t already has {n} rows; reuse", flush=True)
-                    return
-                cur.execute("DROP TABLE t CASCADE")
-            cur.execute(f"CREATE TABLE t (id bigint, embedding vector({dim}))")
+                cur.execute("TRUNCATE t")
+            else:
+                cur.execute(f"CREATE TABLE t (id bigint, embedding vector({dim}))")
+
         t0 = time.perf_counter()
         with self.conn.cursor().copy(
                 "COPY t (id, embedding) FROM STDIN WITH (FORMAT BINARY)") as cp:
@@ -171,6 +227,37 @@ class PgEngine:
                 for i in range(e - s):
                     cp.write_row((s + i, Vector(chunk[i])))
         print(f"[engine] COPY {n} rows in {time.perf_counter()-t0:.1f}s", flush=True)
+
+        # Verify the full fingerprint now, once, right after the load (not per
+        # config): compare the SQL-side aggregate of what actually landed
+        # against the Python-side hash of the source file. A mismatch means
+        # the COPY silently produced the wrong contents.
+        with self.conn.cursor() as cur:
+            cur.execute(
+                "SELECT count(*), md5(string_agg("
+                "  md5(int8send(id) || vector_send(embedding)), '' ORDER BY id))"
+                " FROM public.t")
+            got_n, sql_fp = cur.fetchone()
+        if got_n != n:
+            raise RuntimeError(f"load_corpus: post-COPY count {got_n} != {n}")
+        py_fp = corpus_fingerprint(
+            np.ascontiguousarray(read_fbin(corpus_path, count=n)), n,
+            has_category=False)
+        if sql_fp != py_fp:
+            raise RuntimeError(
+                f"load_corpus: fingerprint mismatch after COPY "
+                f"(sql={sql_fp} py={py_fp}) -- corpus corrupted in transit")
+        with self.conn.cursor() as cur:
+            cur.execute(
+                f"INSERT INTO {self.CORPUS_MARKER} "
+                "(dataset, n, dim, fingerprint, loaded_at) "
+                "VALUES (%s, %s, %s, %s, now()) "
+                "ON CONFLICT (dataset) DO UPDATE SET "
+                "  n = EXCLUDED.n, dim = EXCLUDED.dim, "
+                "  fingerprint = EXCLUDED.fingerprint, loaded_at = EXCLUDED.loaded_at",
+                (dataset, n, dim, sql_fp))
+        print(f"[engine] corpus fingerprint {sql_fp[:12]}... verified + stored "
+              f"(dataset={dataset})", flush=True)
 
     def _drop_ann_indexes(self):
         with self.conn.cursor() as cur:
@@ -382,7 +469,7 @@ def main():
         if args.toggle_daemon:
             _daemon("restart" if is_gpu else "stop")
         eng = PgEngine(dbname=args.dbname, index_dir=args.index_dir)
-        eng.load_corpus(args.corpus, args.n, dim)
+        eng.load_corpus(args.corpus, args.n, dim, dataset=args.dataset)
         print(f"[engine] build {algo} ...", flush=True)
         bt, ibytes = eng.build(algo, args.n, sample_query=qset[0])
         print(f"[engine] {algo} build {bt:.1f}s size {ibytes/1e6:.0f}MB", flush=True)

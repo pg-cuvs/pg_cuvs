@@ -178,7 +178,7 @@ class PgConfigLoader(ConfigLoader):
                 backend_config = {
                     "name": f"{algo}.{param}", "algo": algo, "param": param,
                     "dbname": dbname, "index_dir": index_dir,
-                    "n": n, "dim": dim, "nq": nq,
+                    "n": n, "dim": dim, "nq": nq, "dataset": dataset,
                 }
                 configs.append(BenchmarkConfig(indexes=[idx],
                                                backend_config=backend_config))
@@ -256,7 +256,8 @@ class PgBackend(BenchmarkBackend):
                                build_params={}, metadata={"dry_run": True},
                                success=True)
         eng = self._eng()
-        eng.load_corpus(dataset.base_file, n, dim)
+        eng.load_corpus(dataset.base_file, n, dim,
+                        dataset=self.config.get("dataset", "default"))
 
         side = self._read_sidecar()
         if (not force and side.get("algo") == algo
