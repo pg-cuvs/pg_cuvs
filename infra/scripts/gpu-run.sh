@@ -109,7 +109,12 @@ json.dump({"name": os.environ["NAME"], "owner": os.environ["OWNER"],
 PY
 cd "$HOME/pg_cuvs" || exit 70
 export PGHOST=/var/run/postgresql
-export PATH=/opt/miniforge3/envs/cuvs_bench/bin:/usr/lib/postgresql/16/bin:$PATH
+# PG16 bindir first: the cuvs_bench env ships its own pg_config, and PGXS asks
+# pg_config where the binaries live. With conda first, `make installcheck` was
+# sent to conda's bindir — which has no psql — and died as "psql not found".
+# python3 still resolves to cuvs_bench (PG's bindir has none), so bench scripts
+# keep the env they need.
+export PATH=/usr/lib/postgresql/16/bin:/opt/miniforge3/envs/cuvs_bench/bin:$PATH
 export LD_LIBRARY_PATH=/opt/miniforge3/envs/cuvs_dev/lib
 bash -c "$CMD" >"$LOG" 2>&1
 rc=$?
