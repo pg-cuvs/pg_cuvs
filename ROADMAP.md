@@ -253,6 +253,12 @@
 
 스펙: ADR-076 | `bench/protocol/HANDOFF.md §5 RaBitQ 트랙`
 
+#### IVF-Flat AM 미보유 (트리거: CAGRA 빌드 지연이 병목으로 실측 + 압축 불요)
+**상태**: 미구현·비착수. `grep ivf_flat src/` = 0건이며 `cuvs_wrapper.cu`는 `ivf_pq.hpp`만 include한다. 결정면의 축을 기존 AM이 이미 점유 — 고recall=CAGRA, 저VRAM=IVF-PQ(ADR-049), exact=flat A1(ADR-073)/brute_force. IVF-Flat은 IVF-PQ보다 열등한 게 아니라 다른 트레이드오프 점(무손실 거리 · `n_probes=n_lists`에서 recall 1.0 도달 가능 · 원본 float 유지라 VRAM 절감 없음)이지만, 그 두 이점은 여기선 이미 A1/brute_force가 담당한다. **잔존 고유 이점은 빌드 저비용 하나** — balanced k-means만 돌리면 되고 PQ 코드북 학습이 없어 CAGRA 그래프 빌드(~33s floor, ADR-034)나 IVF-PQ 대비 싸다. 따라서 트리거는 "IVF-Flat이 필요해지면"이 아니라 **관측 가능한 사건**으로 잡는다: 잦은 재색인·단명 테이블 워크로드에서 빌드 지연이 실측 병목이고 동시에 VRAM 압축이 불요한 경우. 착수 시 벤치 arm(`forced-ivfflat`) 동반.
+**부수**: cuVS JIT LTO(Advanced Topics)는 현재 **IVF-Flat search API에서만** 발동한다 — 즉 현행 pg_cuvs는 JIT 컴파일 경로를 타지 않아 `CUDA_CACHE_PATH`/`CUDA_CACHE_MAX_SIZE` 튜닝이 불요하다. 도입 시엔 첫 검색의 JIT 지연을 흡수할 warmup이 벤치 프로토콜과 데몬 기동 절차에 추가되어야 하고, on-disk 캐시는 드라이버 업그레이드로 무효화되므로 데몬 uid가 쓸 수 있는 영속 경로가 필요하다.
+
+스펙: ADR-049(IVF-PQ 채택·알고리즘 선택표) | ADR-073(flat A1/B) | https://docs.rapids.ai/api/cuvs/stable/advanced_topics/
+
 #### 3N — OFFSET-aware K 자동 조정 (트리거: ORM pagination 요구)
 **상태**: 보류 (low-value). 자체 분석상 임팩트 낮음 — PG executor의 `LIMIT/OFFSET`이 이미 동작하고, pg_cuvs는 K를 `offset + limit`으로 조정하면 됨(별도 API 불필요). top-K 사용 패턴(K=10~100)에서 offset pagination 수요가 드묾. ORM 호환이 명확한 요구로 올라오는 시점에 재검토. 구현 자체는 자명(저난이도)이라 필요 시 즉시 착수 가능.
 
