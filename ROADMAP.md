@@ -54,8 +54,8 @@
 | [#124](https://github.com/pg-cuvs/pg_cuvs/issues/124) unguarded OOM injection dispatch | **BLOCKER** | [dispatch](src/pg_cuvs_server.c#L7541-L7546)이 release binary에도 노출되지 않는지 `CUVS_TEST_HOOKS` 경계와 cross-uid UDS 접근을 검증하기 전까지 차단 |
 | [#92](https://github.com/pg-cuvs/pg_cuvs/issues/92) 벤치 데이터셋 위계 정정 (Cohere→wiki_all_1M) | **RESOLVED (docs)** | 2026-08-04 재정의: 원 acceptance("Cohere CSV 재생성")는 철회 — 결함은 코드로 이미 해소(#75/#79), wiki_all_1M canonical 산출물이 증거. `BENCHMARK.md` primary/canonical을 wiki_all_1M(§2.1b)로 정정, `pg_cuvsbench_1m.csv`→[`_legacy`](bench/results/pg_cuvsbench_1m_legacy.csv) 강등, [ledger](bench/results/README.md) 갱신 |
 | [#88](https://github.com/pg-cuvs/pg_cuvs/issues/88) 3O correlation axis | **OPEN / UNVERIFIED** | [filter experiment](docs/experiments/filter-threshold-experiment.md)의 selectivity 결과를 spatial/anti-correlated 입력으로 일반화하지 않음 |
-| [#98](https://github.com/pg-cuvs/pg_cuvs/issues/98) four-way benchmark | **OPEN** | raw cuVS / pg_cuvs / HNSW / pgvector 동일 조건 비교 미완료 |
-| [#78](https://github.com/pg-cuvs/pg_cuvs/issues/78) benchmark corpus reload | **OPEN** | `load_corpus` 재복사 원인과 실행시간 영향 조사 중 |
+| [#98](https://github.com/pg-cuvs/pg_cuvs/issues/98) four-way benchmark | **RESOLVED** | 2026-08-05 완료: 지연 4 algo + 처리량 4 arm, 빌드그리드 스윕, 같은 프로세스·인덱스·CSV — [`pg_cuvsbench_98.csv`](bench/results/pg_cuvsbench_98.csv)(#145), Nsight 분해(#146, 빌드 캡처 최초 성공), [BENCHMARK §2.1c](BENCHMARK.md) |
+| [#78](https://github.com/pg-cuvs/pg_cuvs/issues/78) benchmark corpus reload | **RESOLVED** | 근본 원인 규명(2026-08-04): 테이블은 비워진 적 없음 — CAGRA 인덱스가 `count(*)`에 0을 답한 것([#141](https://github.com/pg-cuvs/pg_cuvs/issues/141) 제품 버그). 하네스 게이트는 플랜 독립으로 수정(#142) |
 | [#74](https://github.com/pg-cuvs/pg_cuvs/issues/74) delta reader shared lock | **CODE RESOLVED / TEST GAP** | [reader](src/pg_cuvs.c#L3193-L3199)에 `LOCK_SH` 반영; 실제 byte-level overlap 회귀 증거는 별도 보강 필요 |
 
 ### 미완료

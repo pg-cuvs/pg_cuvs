@@ -193,11 +193,14 @@ Three levers, all measured on N=500K × 1024:
 memfd also makes crash-orphan leak **structurally impossible** (anonymous fd, no
 `/dev/shm` name to leak) — validated across a SIGKILL/SIGSEGV/OOM-killer matrix.
 
-**Net:** combining PLAIN + memfd + parallel workers shrinks the backend from ~15.5 s to
-**~2–4 s**, i.e. build wall-clock 83.5 s → ~70–72 s = **GPU floor + minimal dispatch ≈
-~95% of a raw cuVS call**, while keeping PostgreSQL MVCC, durability, and DDL
-integration. The build wall-clock improvement is marginal *because the GPU floor
-dominates* — the value is the removed backend overhead, not the clock.
+**Net** (2026-06 cell: 1M×1024, `build_algo` unpinned): combining PLAIN + memfd +
+parallel workers shrinks the backend from ~15.5 s to **~2–4 s**, i.e. build wall-clock
+83.5 s → ~70–72 s = **GPU floor + minimal dispatch ≈ ~95% of a raw cuVS call**, while
+keeping PostgreSQL MVCC, durability, and DDL integration. The build wall-clock
+improvement is marginal *because the GPU floor dominates in that cell* — the value is
+the removed backend overhead, not the clock. In the 2026-08 cell (1M×768, `ivf_pq`
+pinned; §1.2 current table) the ratio inverts — backend+IPC is 77.6% of the wall — so
+the same backend work is worth *more* there, not less.
 
 > This **corrected an earlier code-analysis estimate** (ADR-034) that assumed "GPU build
 > ~10 s vs PG overhead ~45 s." The measurement inverted it: GPU build dominates at 82%.
