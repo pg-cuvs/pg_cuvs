@@ -70,11 +70,16 @@ uds_connect_ex(const char *socket_path, int recv_timeout_sec)
     if (fd < 0)
         return -1;
 
-    /* #119: verify socket_path owner before connect(). SO_PEERCRED
-     * (shm_check_daemon_owner, unchanged) verifies the peer after a
-     * connection is made — it can't stop an attacker who unlinks the real
-     * socket and squats the path before the daemon rebinds it. lstat (not
-     * stat) so a symlink swap to a different socket can't bypass this. */
+    /* #119: verify socket_path owner before connect(). This is a fast-path
+     * pre-check only — the actual security boundary is the post-connect
+     * SO_PEERCRED check below (F1: this lstat is TOCTOU-racy on its own; a
+     * kernel-verified peer credential after connect() is not). Checking
+     * here first still buys two things: a cheaper failure (no connect()
+     * syscall for an obviously-wrong path) and a clearer error message
+     * (owner mismatch vs. generic peer-uid mismatch). lstat (not stat) so a
+     * symlink swap to a different socket can't bypass this pre-check —
+     * though connect() itself follows the symlink regardless, so the
+     * post-connect check below is what actually catches that case. */
     if (g_expected_daemon_uid >= 0 && socket_path[0] != '\0')
     {
         struct stat st;
@@ -123,6 +128,39 @@ uds_connect_ex(const char *socket_path, int recv_timeout_sec)
         close(fd);
         return -1;
     }
+
+    /* #119 (adversarial review F1): post-connect SO_PEERCRED check. The
+     * lstat above is a TOCTOU race — the daemon could be unlinked and
+     * resquatted between the lstat and this connect(). SO_PEERCRED is
+     * kernel-verified at connect() time and race-free: the peer credential
+     * is latched to whoever accepted this specific connection, and can't be
+     * swapped out afterward. This is the actual security boundary; the
+     * lstat check above stays only for a fast failure and a clearer error
+     * message before paying for a connect(). Linux-only, like the shm-side
+     * SO_PEERCRED check (shm_check_daemon_owner) this mirrors. */
+#ifdef __linux__
+    if (g_expected_daemon_uid >= 0)
+    {
+        struct ucred cred;
+        socklen_t    cred_len = sizeof(cred);
+        if (getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &cred, &cred_len) != 0)
+        {
+            LOG_ERROR("[cuvs_ipc] SO_PEERCRED failed: %s — refusing to connect\n",
+                      strerror(errno));
+            close(fd);
+            return -1;
+        }
+        if (cred.uid != (uid_t) g_expected_daemon_uid)
+        {
+            LOG_ERROR("[cuvs_ipc] socket peer uid=%u, expected=%d "
+                      "— refusing to connect (possible hijack)\n",
+                      (unsigned) cred.uid, g_expected_daemon_uid);
+            close(fd);
+            return -1;
+        }
+    }
+#endif
+
     return fd;
 }
 
