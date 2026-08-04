@@ -52,7 +52,7 @@
 | Item | Status | Evidence / action |
 |------|--------|------------------|
 | [#124](https://github.com/pg-cuvs/pg_cuvs/issues/124) unguarded OOM injection dispatch | **BLOCKER** | [dispatch](src/pg_cuvs_server.c#L7541-L7546)이 release binary에도 노출되지 않는지 `CUVS_TEST_HOOKS` 경계와 cross-uid UDS 접근을 검증하기 전까지 차단 |
-| [#92](https://github.com/pg-cuvs/pg_cuvs/issues/92) Cohere benchmark artifact | **OPEN** | [`pg_cuvsbench_1m.csv`](bench/results/pg_cuvsbench_1m.csv)의 CAGRA `index_bytes=0`; [ledger caveat](bench/results/README.md#known-defects) 유지 또는 Cohere 재생성 |
+| [#92](https://github.com/pg-cuvs/pg_cuvs/issues/92) 벤치 데이터셋 위계 정정 (Cohere→wiki_all_1M) | **RESOLVED (docs)** | 2026-08-04 재정의: 원 acceptance("Cohere CSV 재생성")는 철회 — 결함은 코드로 이미 해소(#75/#79), wiki_all_1M canonical 산출물이 증거. `BENCHMARK.md` primary/canonical을 wiki_all_1M(§2.1b)로 정정, `pg_cuvsbench_1m.csv`→[`_legacy`](bench/results/pg_cuvsbench_1m_legacy.csv) 강등, [ledger](bench/results/README.md) 갱신 |
 | [#88](https://github.com/pg-cuvs/pg_cuvs/issues/88) 3O correlation axis | **OPEN / UNVERIFIED** | [filter experiment](docs/experiments/filter-threshold-experiment.md)의 selectivity 결과를 spatial/anti-correlated 입력으로 일반화하지 않음 |
 | [#98](https://github.com/pg-cuvs/pg_cuvs/issues/98) four-way benchmark | **OPEN** | raw cuVS / pg_cuvs / HNSW / pgvector 동일 조건 비교 미완료 |
 | [#78](https://github.com/pg-cuvs/pg_cuvs/issues/78) benchmark corpus reload | **OPEN** | `load_corpus` 재복사 원인과 실행시간 영향 조사 중 |
@@ -310,7 +310,7 @@
 
 > **1차 사료 보강 (2026-07-13, ADR-078)**: Corey Nolet(NVIDIA cuVS)+Vivek Narang의 cuVS+Lucene 강연이 **merge·batch 미결을 Lucene 커넥터의 공개 과제로 확증**했다. pg_cuvs는 이 둘을 이미 닫음 — merge=3Q(ADR-051 `cuvsCagraExtend`+`cuvsCagraMerge`), batch=3M(ADR-040 `pg_cuvs_batch_search`). → **Stage 2 cuvs-bench PR 피치의 핵심 근거**: "pg_cuvs = cuVS streaming-update API를 DB 레벨에서 실사용하는 유일 사례." 강연 Q&A 통합 목록(Milvus/FAISS/OpenSearch/Qdrant/Oracle)에 Postgres 부재 = 아래 "선점 기회" 전제 재확인.
 
-> **Stage 2 백엔드 구현·검증 완료 (2026-07-16, ADR-080)**: cuvs-bench pluggable backend(`PgBackend`+`PgConfigLoader`, `bench/cuvs_bench_backend/`)를 구현해 pg_cuvs·pgvector를 **NVIDIA 자체 도구**(`BenchmarkOrchestrator(backend_type="pg")`) 안에서 Cohere 1M×1024로 재측정했다. 보고는 **end-to-end**(psql 왕복 전체; raw 라이브러리 수치는 미보고) — matched recall@10≈0.99에서 **CAGRA 검색 ~5×**(p50·QPS) · **3I 빌드 ~2×** vs pgvector native. 19-pt Pareto = `bench/results/pg_cuvsbench_1m.csv`. 잔여 = `rapidsai/cuvs` upstream PR. (정정: 기존 "빌드 13×"는 synthetic random 최악조건, "24×"는 raw 라이브러리 경계 — 헤드라인에서 강등, canonical=real-embedding end-to-end.)
+> **Stage 2 백엔드 구현·검증 완료 (2026-07-16, ADR-080)**: cuvs-bench pluggable backend(`PgBackend`+`PgConfigLoader`, `bench/cuvs_bench_backend/`)를 구현해 pg_cuvs·pgvector를 **NVIDIA 자체 도구**(`BenchmarkOrchestrator(backend_type="pg")`) 안에서 Cohere 1M×1024로 재측정했다. 보고는 **end-to-end**(psql 왕복 전체; raw 라이브러리 수치는 미보고) — matched recall@10≈0.99에서 **CAGRA 검색 ~5×**(p50·QPS) · **3I 빌드 ~2×** vs pgvector native. 19-pt Pareto = `bench/results/pg_cuvsbench_1m_legacy.csv` (2026-08-04 #92 재정의로 canonical→legacy 강등, 파일명 변경; 현 canonical=wiki_all_1M, `BENCHMARK.md` §2.1b). 잔여 = `rapidsai/cuvs` upstream PR. (정정: 기존 "빌드 13×"는 synthetic random 최악조건, "24×"는 raw 라이브러리 경계 — 헤드라인에서 강등, canonical=real-embedding end-to-end.)
 
 ### 전제 조건 (진입 전 필수)
 

@@ -16,7 +16,7 @@ Usage (on the GPU VM, cuvs_bench env; daemon up; data in --data-dir):
     python bench/cuvs_bench_backend/run_pg_cuvsbench.py \
         --data-dir /home/ubuntu/anbench/data --n 1000000 \
         --algos pgcuvs_cagra,pgvector_hnsw --k 10 --max-queries 2000 \
-        --out bench/results/pg_cuvsbench_1m.csv
+        --out bench/results/pg_cuvsbench_1m_legacy.csv
 
 Ground truth: gt_<n>.npy must exist in --data-dir (built by build_gt.py or
 cuvs_bench.generate_groundtruth); the loader slices it to <max-queries> rows and

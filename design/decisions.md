@@ -3326,6 +3326,8 @@ SVFusion(VLDB'26, PCIe A100)이 CAGRA/GGNN가 **UVM(demand paging)에서 크게 
 
 **관련**: ADR-062(에코시스템 진입 Stage 2), ADR-069(벤치 방법론), ADR-037(`pg_cuvs_build_hnsw` 통합 API), ADR-078/079(NVIDIA 정렬·외부검증). 산출물: `bench/cuvs_bench_backend/{backend.py,run_pg_cuvsbench.py,pg_engine.py,README.md}`, `bench/results/pg_cuvsbench_1m*.csv`.
 
+**데이터셋 위계 정정 (2026-08-04, #92)**: 위 Cohere 1M×1024 실측(`pg_cuvsbench_1m.csv`)은 `pg_cuvsbench_1m_legacy.csv`로 개명됐다 — 프로젝트의 canonical 데이터셋이 wiki_all_1M(cuvs-bench 표준, `data.rapids.ai`)로 이동했기 때문이다(`BENCHMARK.md` §2.1b, `pg_cuvsbench_wiki1m.csv`/`_brev.csv`). 본 ADR의 비율 주장(검색 ~4.5×, 빌드 ~2×)은 Cohere run 내부에서 유효하며 철회되지 않는다; 위계상 지위만 legacy/secondary로 조정됐다.
+
 ---
 
 ## ADR-081 — IPC 프로토콜 버전 핸드셰이크: 데몬/확장 skew를 조용한 오해석에서 즉시 거부로
