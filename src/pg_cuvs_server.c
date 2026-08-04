@@ -3057,10 +3057,12 @@ handle_search(int client_fd, const CuvsCmdFrame *cmd)
                              * exactly min(k, |filter|); every measured collapsed
                              * cell returned <=2.02 out of k=10. TAIL CONTRACT
                              * (cuvs_wrapper.h, #103) pads unfilled slots with
-                             * CUVS_PAD_ITEM_ID and guarantees padding is
-                             * trailing-only, so a forward scan to the first pad
-                             * gives the fill count without needing to know which
-                             * candidates the corpus could actually supply.
+                             * CUVS_PAD_ITEM_ID; the documented contract says
+                             * padding is trailing-only, but cuvs_wrapper.cu's own
+                             * comment on store_result() only guarantees the
+                             * sentinel lands somewhere in [0, bk) -- so count every
+                             * slot rather than stop at the first pad, which stays
+                             * correct even if that ever isn't strictly trailing.
                              *
                              * `expect` is what a correct answer could return: k,
                              * or the whole filter set if it is smaller than k (a
@@ -3071,8 +3073,9 @@ handle_search(int client_fd, const CuvsCmdFrame *cmd)
                              * 10 here), so it will not misfire on a legitimately
                              * short answer nor miss the measured failure mode. */
                             int filled = 0;
-                            while (filled < k && praw[filled].item_id != CUVS_PAD_ITEM_ID)
-                                filled++;
+                            for (int fi = 0; fi < k; fi++)
+                                if (praw[fi].item_id != CUVS_PAD_ITEM_ID)
+                                    filled++;
                             int expect = k;
                             if ((int64_t)cmd->n_filter_tids < (int64_t)expect)
                                 expect = (int)cmd->n_filter_tids;
