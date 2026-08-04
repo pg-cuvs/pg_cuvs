@@ -264,6 +264,26 @@ def test_pareto_ignores_throughput_rows_when_recomputed_from_the_csv():
 
 
 # ── consistency gates ────────────────────────────────────────────────────────
+def test_plan_index_reads_the_relation_that_served():
+    plan = ("Limit  (cost=1365.82..1386.17 rows=10 width=16)\n"
+            "  ->  Index Scan using t_hnsw_pgv on t  (cost=1365.82..204800.00)\n"
+            "        Order By: (embedding <-> '[...]'::vector)")
+    assert conc_runner.plan_index(plan) == "t_hnsw_pgv"
+
+
+def test_plan_index_reports_a_seqscan_as_such():
+    assert conc_runner.plan_index("Limit\n  ->  Seq Scan on t") == "SEQSCAN"
+
+
+def test_index_used_gate_is_hard_when_another_algos_index_served():
+    # two ANN indexes on one column: a plan can be fully index-driven and still
+    # be scanning the wrong one, which mislabels the row rather than adding noise.
+    assert runner.gate_index_used("a", ["t_hnsw_pgv"], "t_hnsw_pgv").startswith("gate-ok")
+    assert not runner.GATE_VIOLATIONS
+    assert runner.gate_index_used("a", ["t_cagra"], "t_hnsw_pgv").startswith("GATE-VIOL")
+    assert runner.GATE_VIOLATIONS
+
+
 def test_fallback_gate_does_not_fire_on_a_cpu_by_design_arm():
     # pgvector arms set enable_cuvs=off; with a CAGRA index co-resident (Phase 2
     # keeps t_cagra while measuring pgvector) the extension records one

@@ -42,6 +42,7 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from pg_engine import _vec_literal, percentiles_ms  # noqa: E402
+from sidecar import RELATION_OF  # noqa: E402
 
 #: Default concurrency ladder (plan rev.4). N=1 doubles as the consistency check
 #: against the latency axis.
@@ -102,6 +103,7 @@ def _worker(wid, algo, param, index_dir, dbname, qidx, qvecs, top_k, window,
                     f"<-> '{_vec_literal(qvecs[0])}'::vector LIMIT {top_k}")
         plan = "\n".join(r[0] for r in cur.fetchall())
         seqscan = "Seq Scan" in plan
+        index_used = plan_index(plan)
 
         for j in range(min(WARMUP_QUERIES, nq)):
             one(j)
@@ -122,7 +124,7 @@ def _worker(wid, algo, param, index_dir, dbname, qidx, qvecs, top_k, window,
         wall = time.perf_counter() - t0
         conn.close()
         out.put({"wid": wid, "n": n, "wall": wall, "lat": lat, "ids": ids,
-                 "seqscan": seqscan, "slice": nq,
+                 "seqscan": seqscan, "slice": nq, "index_used": index_used,
                  "passes": i / max(1, nq), "error": None})
     except Exception as e:  # noqa: BLE001 -- a dead worker must not hang the parent
         try:
@@ -130,7 +132,28 @@ def _worker(wid, algo, param, index_dir, dbname, qidx, qvecs, top_k, window,
         except Exception:  # noqa: BLE001
             pass
         out.put({"wid": wid, "error": repr(e), "n": 0, "wall": 0.0, "lat": [],
-                 "ids": {}, "seqscan": False, "slice": 0, "passes": 0.0})
+                 "ids": {}, "seqscan": False, "slice": 0, "passes": 0.0,
+                 "index_used": None})
+
+
+def plan_index(plan):
+    """The relation an EXPLAIN plan actually scans, or None.
+
+    Checking only for "Seq Scan" is not enough: with two ANN indexes on one
+    column, a plan can be perfectly index-driven and still be scanning the OTHER
+    algo's index -- and the row would carry this algo's label over the other
+    one's numbers. This is what makes a conc row self-evidencing about which
+    index served it (see the arm's notes).
+    """
+    for line in plan.splitlines():
+        line = line.strip()
+        if line.startswith("->"):
+            line = line[2:].strip()
+        if line.startswith("Index Scan using ") or line.startswith("Index Only Scan using "):
+            return line.split(" using ", 1)[1].split(" on ", 1)[0].strip()
+        if line.startswith("Seq Scan"):
+            return "SEQSCAN"
+    return None
 
 
 def slices_for(n_queries, n_workers):
@@ -194,11 +217,13 @@ def run_arm(algo, n_workers, queries, gt, param, index_dir, dbname="postgres",
                      "(cache-hot to that degree)")
     if any(r["seqscan"] for r in res):
         notes.append("WARN seqscan detected in worker plan")
+    used = sorted({r["index_used"] for r in res if r["index_used"]})
     return {"algo": algo, "n_workers": n_workers, "qps": total / wall,
             "queries": total, "wall": wall, "recall": recall,
             "p50_ms": p50, "p95_ms": p95, "p99_ms": p99,
             "recall_queries": len(covered), "passes": passes,
-            "seqscan": any(r["seqscan"] for r in res), "notes": notes}
+            "seqscan": any(r["seqscan"] for r in res), "notes": notes,
+            "index_used": used, "expected_index": RELATION_OF.get(algo)}
 
 
 def _recall(got, gt, k):

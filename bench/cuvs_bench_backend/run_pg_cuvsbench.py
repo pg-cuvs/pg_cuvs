@@ -512,6 +512,7 @@ def emit_conc(args, eng, emit, done, algo, p, n_workers, queries_all, gt, bt,
     notes = [env_note, f"param={p['param']}",
              f"recall over {r['recall_queries']} gt-covered queries"]
     notes += r["notes"]
+    notes.append(gate_index_used(name, r["index_used"], r["expected_index"]))
     notes.append(gate_fallback(name, fb_delta,
                                gpu_served=algo.startswith("pgcuvs")))
     if n_workers == 1:
@@ -632,20 +633,46 @@ def gate_fallback(name, delta, gpu_served=True):
     a GPU-served arm: the row would be describing a CPU exact search under a GPU
     arm's label.
 
-    `gpu_served=False` for the pgvector arms, and that is not a loophole. Those
-    arms set `enable_cuvs=off` deliberately, so with a CAGRA index co-resident
-    (Phase 2 keeps t_cagra while measuring pgvector) the extension records one
-    `reason=disabled` fallback PER QUERY -- measured: delta 6673 over ~6667
-    queries. That delta is the arm working as designed, not contamination, and
-    gating on it would fail every pgvector row for doing what it was told. The
-    number is still recorded in the row's notes.
+    `gpu_served=False` for the pgvector arms, and that is not a loophole. The
+    counter is incremented by cuvsamcostestimate at PLAN time, not at execution:
+    with `enable_cuvs=off` it records `reason=disabled` and sets the CAGRA
+    index's cost to 1e15 so the planner DROPS it (src/pg_cuvs.c:1820-1839). The
+    increment is therefore the GPU index being rejected, not serving anything.
+    Measured directly: 100 executed queries -> delta exactly 100, while the
+    daemon's search_count for t_cagra moved 0; and 20 bare EXPLAINs (nothing
+    executed, no rows fetched) -> delta exactly 20. The plan under those GUCs is
+    `Index Scan using t_hnsw_pgv`, which gate_index_used now records on every
+    row. Gating on this would fail every pgvector row for doing what it was
+    told; the number is still recorded.
     """
     if not gpu_served:
-        return (f"fallback-delta={delta} (not gated: this arm runs "
-                "enable_cuvs=off by design, so a co-resident GPU index records "
-                "one reason=disabled fallback per query -- the CPU path IS this "
-                "arm's measurement)")
+        return (f"fallback-delta={delta} (not gated: enable_cuvs=off makes the "
+                "planner's cost hook record one reason=disabled fallback per "
+                "PLANNING call for the co-resident GPU index and then drop it "
+                "-- plan-time bookkeeping, not a served query; see index_used)")
     return _gate(name, delta == 0, f"fallback-delta={delta} (want 0)", hard=True)
+
+
+def gate_index_used(name, used, expected):
+    """The arm's workers must have scanned the index the arm is named after.
+
+    HARD: with two ANN indexes on one column, a plan can be fully index-driven
+    and still be scanning the other algo's index -- the row would then carry
+    this algo's label over the other one's numbers, which is a mislabelled
+    published measurement rather than a noisy one.
+
+    This also makes each conc row self-evidencing about a question that
+    otherwise needs a separate investigation: pgvector arms run with
+    `enable_cuvs=off`, which makes cuvsamcostestimate record one
+    `reason=disabled` fallback per PLANNING call for the co-resident CAGRA index
+    (src/pg_cuvs.c:1820 sets cost 1e15 so the planner drops it). That counter
+    moving is the GPU index being REJECTED, not serving anything -- and the
+    index recorded here is the proof of what did serve.
+    """
+    txt = f"index_used={used or 'unknown'} expected={expected}"
+    if not used:
+        return "index-used: no plan captured " + txt
+    return _gate(name, used == [expected], txt, hard=True)
 
 
 def gate_conc1_ratio(name, conc_qps, latency_qps, lo=0.8, hi=1.0):
