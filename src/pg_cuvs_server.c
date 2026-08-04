@@ -4013,7 +4013,7 @@ handle_search_batch(int client_fd, const CuvsCmdFrame *cmd)
     size_t rdists = (size_t) Q * (size_t) K * sizeof(float);
     size_t rtotal = rhdr + rtids + rdists;
 
-    int rfd = shm_open(rkey, O_CREAT | O_EXCL | O_RDWR, 0600);
+    int rfd = shm_open(rkey, O_CREAT | O_EXCL | O_RDWR, 0644);
     if (rfd < 0)
     {
         free(out);
@@ -4021,6 +4021,9 @@ handle_search_batch(int client_fd, const CuvsCmdFrame *cmd)
         send_error(client_fd, "shm_open failed for batch reply");
         return;
     }
+    /* umask may be stricter than 0644; the PG backend (other uid) must read
+     * this reply, so guarantee the mode explicitly (#87). */
+    fchmod(rfd, 0644);
     if (ftruncate(rfd, (off_t) rtotal) != 0)
     {
         close(rfd); shm_unlink(rkey); free(out);
@@ -5919,13 +5922,16 @@ handle_export_adjacency(int client_fd, const CuvsCmdFrame *cmd)
                  (int)getpid(), __atomic_fetch_add(&adj_seq, 1, __ATOMIC_RELAXED), hex);
     }
 
-    int shm_fd = shm_open(shm_key, O_CREAT | O_EXCL | O_RDWR, 0600);
+    int shm_fd = shm_open(shm_key, O_CREAT | O_EXCL | O_RDWR, 0644);
     if (shm_fd < 0)
     {
         free(adj); free(vecs);
         send_error(client_fd, "shm_open failed for export");
         return;
     }
+    /* umask may be stricter than 0644; the PG backend (other uid) must read
+     * this reply, so guarantee the mode explicitly (#87). */
+    fchmod(shm_fd, 0644);
     if (ftruncate(shm_fd, (off_t)total) != 0)
     {
         close(shm_fd); shm_unlink(shm_key); free(adj); free(vecs);

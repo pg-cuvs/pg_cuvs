@@ -248,9 +248,14 @@ shm_write_build_payload(const char   *shm_key,
     size_t tid_bytes = (size_t)n_vecs * sizeof(uint64_t);
     size_t total     = vec_bytes + tid_bytes;
 
-    int fd = shm_open(shm_key, O_CREAT | O_EXCL | O_RDWR, 0600);
+    int fd = shm_open(shm_key, O_CREAT | O_EXCL | O_RDWR, 0644);
     if (fd < 0)
         return -1;
+
+    /* umask may be stricter than 0644 (e.g. 077); the daemon runs as a
+     * different uid and must retain read access, so guarantee the mode
+     * explicitly rather than rely on shm_open's mode argument (#87). */
+    fchmod(fd, 0644);
 
     if (ftruncate(fd, (off_t)total) < 0)
     {
@@ -284,9 +289,10 @@ shm_write_query_batch(const char *shm_key, const float *queries,
     size_t vec_bytes = (size_t)n_queries * (size_t)dim * sizeof(float);
     size_t total     = hdr_bytes + vec_bytes;
 
-    int fd = shm_open(shm_key, O_CREAT | O_EXCL | O_RDWR, 0600);
+    int fd = shm_open(shm_key, O_CREAT | O_EXCL | O_RDWR, 0644);
     if (fd < 0)
         return -1;
+    fchmod(fd, 0644);   /* guarantee daemon (other uid) read access; see above (#87) */
     if (ftruncate(fd, (off_t)total) < 0)
     {
         shm_unlink(shm_key);
@@ -313,9 +319,11 @@ shm_write_query(const char *shm_key, const float *query_vec, int dim)
 {
     size_t vec_bytes = (size_t)dim * sizeof(float);
 
-    int fd = shm_open(shm_key, O_CREAT | O_EXCL | O_RDWR, 0600);
+    int fd = shm_open(shm_key, O_CREAT | O_EXCL | O_RDWR, 0644);
     if (fd < 0)
         return -1;
+
+    fchmod(fd, 0644);   /* guarantee daemon (other uid) read access; see above (#87) */
 
     if (ftruncate(fd, (off_t)vec_bytes) < 0)
     {
@@ -1331,9 +1339,10 @@ cuvs_ipc_search_filtered(
         make_shm_key(filter_shm_key, sizeof(filter_shm_key));
         size_t filter_bytes = (size_t)n_filter * sizeof(uint64_t);
 
-        filter_shm_fd = shm_open(filter_shm_key, O_CREAT | O_EXCL | O_RDWR, 0600);
+        filter_shm_fd = shm_open(filter_shm_key, O_CREAT | O_EXCL | O_RDWR, 0644);
         if (filter_shm_fd < 0)
             goto cleanup;
+        fchmod(filter_shm_fd, 0644);   /* guarantee daemon (other uid) read access; see above (#87) */
         if (ftruncate(filter_shm_fd, (off_t)filter_bytes) < 0)
         {
             shm_unlink(filter_shm_key);
@@ -1483,9 +1492,10 @@ cuvs_ipc_search_stream_bf(
         make_shm_key(filter_shm_key, sizeof(filter_shm_key));
         size_t filter_bytes = (size_t)n_filter * sizeof(uint64_t);
 
-        filter_shm_fd = shm_open(filter_shm_key, O_CREAT | O_EXCL | O_RDWR, 0600);
+        filter_shm_fd = shm_open(filter_shm_key, O_CREAT | O_EXCL | O_RDWR, 0644);
         if (filter_shm_fd < 0)
             goto cleanup;
+        fchmod(filter_shm_fd, 0644);   /* guarantee daemon (other uid) read access; see above (#87) */
         if (ftruncate(filter_shm_fd, (off_t)filter_bytes) < 0)
         {
             shm_unlink(filter_shm_key);

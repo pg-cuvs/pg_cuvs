@@ -112,9 +112,13 @@ open_shm(CuvsBuildCorpus *c, size_t bytes)
 
     build_shm_name(name, sizeof(name));
 
-    fd = shm_open(name, O_CREAT | O_EXCL | O_RDWR, 0600);
+    fd = shm_open(name, O_CREAT | O_EXCL | O_RDWR, 0644);
     if (fd < 0)
         return -1;
+    /* umask may be stricter than 0644; the daemon (other uid) must read this
+     * segment, so guarantee the mode explicitly rather than rely on
+     * shm_open's mode argument (#87). */
+    fchmod(fd, 0644);
     /* Hold an exclusive advisory lock for the segment's life. The kernel
      * auto-releases it on ANY process death (incl. SIGKILL), which is how the
      * reaper distinguishes a dead owner from a live build. Best-effort: on
