@@ -12,11 +12,14 @@
 /* This file is compiled twice: once via PGXS into the extension .so (PG
  * backend context) and once standalone into pg_cuvs_server (Makefile's
  * SERVER_CFLAGS adds -D_POSIX_C_SOURCE=200809L, which hides glibc's
- * __USE_MISC extensions — including getrandom(), used below for shm key
- * hardening, #87). Re-enable them; additive alongside _POSIX_C_SOURCE. Must
- * precede any system header. Mirrors the guard in pg_cuvs_server.c. */
-#ifndef _DEFAULT_SOURCE
-#define _DEFAULT_SOURCE 1
+ * __USE_MISC extensions — including getrandom() and, on this glibc,
+ * `struct ucred`/SO_PEERCRED (#87 finding 1) — used below for shm key
+ * hardening. __USE_MISC alone (_DEFAULT_SOURCE) wasn't enough to expose
+ * struct ucred in CI; _GNU_SOURCE is the strict superset that reliably does.
+ * Re-enable them; additive alongside _POSIX_C_SOURCE. Must precede any
+ * system header. Mirrors the guard in pg_cuvs_server.c. */
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE 1
 #endif
 
 #include "cuvs_ipc.h"

@@ -18,10 +18,12 @@
 
 /* The Makefile builds with -D_POSIX_C_SOURCE=200809L, which hides glibc's
  * __USE_MISC extensions (e.g. MAP_ANONYMOUS, used by the ADR-059 multi-shard
- * fallback). Re-enable them; additive alongside _POSIX_C_SOURCE. Must precede
- * any system header. */
-#ifndef _DEFAULT_SOURCE
-#define _DEFAULT_SOURCE 1
+ * fallback) and, on this glibc, also `struct ucred`/SO_PEERCRED (#87 finding
+ * 1) — __USE_MISC alone (_DEFAULT_SOURCE) wasn't enough to expose those in
+ * CI; _GNU_SOURCE is the strict superset that reliably does. Re-enable them;
+ * additive alongside _POSIX_C_SOURCE. Must precede any system header. */
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE 1
 #endif
 
 #include "cuvs_ipc.h"
