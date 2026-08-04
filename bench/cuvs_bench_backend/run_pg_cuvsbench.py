@@ -515,16 +515,18 @@ def emit_conc(args, eng, emit, done, algo, p, n_workers, queries_all, gt, bt,
 
 
 def emit_raw_batch(args, emit, done, pareto, queries, gt, env_note):
-    """raw cuVS `cagra.search` over the whole block -- PR-B's cuvs_engine.
+    """raw cuVS `cagra.search` over the whole block (PR-B's cuvs_engine).
 
-    PR-B owns that module and lands separately, so this degrades to a logged
-    skip rather than failing the run when it is not importable yet.
+    The raw index lives in this process's GPU memory, so Phase 2 reuses the
+    engine singleton Phase 1 left behind when it already holds the Pareto cell,
+    and rebuilds with the SAME BUILD PARAMETERS otherwise. "Same parameters" is
+    the honest label rather than "same index": a CAGRA build is not guaranteed
+    bit-identical run to run, so a rebuilt graph is not the graph Phase 1 swept.
     """
     try:
-        import cuvs_engine  # noqa: F401
-    except Exception as e:  # noqa: BLE001
-        log("P2", "skip", "cuvs_batch", f"cuvs_engine unavailable ({e!r})",
-            "-- PR-B lands it; reconciled at merge")
+        import cuvs_engine
+    except Exception as e:  # noqa: BLE001 -- cupy/cuvs absent (CPU box)
+        log("P2", "skip", "cuvs_batch", f"cuvs_engine unavailable ({e!r})")
         return
     src = pareto.get("cuvs") or pareto.get("pgcuvs_cagra")
     if src is None:
@@ -535,41 +537,45 @@ def emit_raw_batch(args, emit, done, pareto, queries, gt, env_note):
     if (name, src["build_params"], param) in done:
         log("P2", "skip", name, param, "(already recorded)")
         return
+    cfg = json.loads(src["build_params"] or "{}")
+    notes = [env_note, f"K={K} (Pareto point), recall@{args.k}"]
     try:
-        eng = cuvs_engine.CuvsEngine(index_dir=args.index_dir)
-        cfg = json.loads(src["build_params"] or "{}")
-        # Same build PARAMETERS, not the same graph object: a CAGRA build is not
-        # bit-identical run to run, so the label is what it is.
-        bt, ibytes = eng.build(args.n, build_cfg=cfg)
-        ids, per_repeat = eng.batch_search(queries, K, top_k=args.k,
-                                           warmup=args.batch_warmup,
-                                           repeats=args.batch_repeats)
-    except Exception as e:  # noqa: BLE001
-        log("P2", "WARN", "raw-batch-failed", repr(e), "-- reconciled at merge")
+        from pg_engine import fbin_meta
+
+        corpus = os.path.join(args.data_dir, "corpus.fbin")
+        _, dim = fbin_meta(corpus)
+        eng = cuvs_engine.get_raw_engine()
+        with Heartbeat("raw batch"):
+            eng.load_corpus(corpus, args.n, dim, dataset=args.dataset)
+            reused = eng.has_index(cfg)
+            if reused:
+                log("P2", "index", "cuvs", canonical_json(cfg),
+                    "resident in this process (no rebuild)")
+                bt = getattr(eng, "_build_time", "")
+            else:
+                log("P2", "rebuild", "cuvs", canonical_json(cfg),
+                    "reason=not the Pareto cell")
+                bt, _ibytes, _meta = eng.build("cuvs", args.n, build_cfg=cfg)
+                notes.append("raw index rebuilt at the Pareto cell's build "
+                             "PARAMETERS (a CAGRA build is not bit-identical, "
+                             "so this is not the Phase-1 graph)")
+            ids, med = eng.search_batch(queries, args.k, K,
+                                        warmup=args.batch_warmup,
+                                        repeats=args.batch_repeats)
+    except Exception as e:  # noqa: BLE001 -- a raw failure must not lose the
+        log("P2", "WARN", "raw-batch-failed", repr(e))   # Postgres arms' rows
         return
-    med = float(sorted(per_repeat)[len(per_repeat) // 2])
     recall = _recall_at_k(ids, gt[:len(ids)], args.k)
-    emit(throughput_row(name, param, args.k, recall, len(queries) / med,
-                        med * 1000.0, src["build_params"], len(queries),
-                        build_time_s=bt, index_bytes=ibytes, reused=False,
-                        notes=[env_note, "raw arm: same build PARAMETERS as the "
-                               "Pareto cell, rebuilt (CAGRA builds are not "
-                               "bit-identical)", nvidia_smi_note()]))
-    log("P2", "batch", name, param, f"recall={recall:.4f}",
-        f"qps={len(queries)/med:.0f}")
-
-
-def nvidia_smi_note():
-    """VRAM at the moment a second GPU tenant measured -- the raw arm shares the
-    device with the resident daemon, so the row carries the occupancy it saw."""
-    import subprocess
-    try:
-        out = subprocess.run(
-            ["nvidia-smi", "--query-gpu=memory.used", "--format=csv,noheader"],
-            capture_output=True, text=True, timeout=20, check=True).stdout
-        return "nvidia-smi memory.used=" + ",".join(out.split())
-    except Exception as e:  # noqa: BLE001
-        return f"nvidia-smi unavailable ({e!r})"
+    qps = len(queries) / med
+    # The raw arm is a SECOND GPU tenant beside the resident daemon, so the row
+    # carries the occupancy it actually saw rather than an assumption of one.
+    notes.append(eng.row_note())
+    notes.append(f"repeats={args.batch_repeats} median={med*1000:.1f}ms")
+    emit(throughput_row(name, param, args.k, recall, qps, med * 1000.0,
+                        src["build_params"], len(queries), build_time_s=bt,
+                        index_bytes=0, reused=reused, notes=notes))
+    log("P2", "batch", name, param, f"recall={recall:.4f}", f"qps={qps:.0f}",
+        f"median={med*1000:.1f}ms")
 
 
 # ── Phase-2 consistency gates ────────────────────────────────────────────────
@@ -701,9 +707,13 @@ def main():
     ap.add_argument("--batch-repeats", type=int, default=10)
     ap.add_argument("--batch-warmup", type=int, default=2)
     ap.add_argument("--batch-recall-tol", type=float, default=None,
-                    help="batch-vs-single recall gate; set from the rehearsal's "
-                         "measured delta x2. Omitted -> observe-and-record "
-                         "(both recalls recorded, nothing gated)")
+                    help="batch-vs-single recall gate = measured delta x2. "
+                         "Deltas so far (N=100k): raw arm +0.0002 / +0.0003 "
+                         "(gd=64, K=100), SQL batch arm 0.0012 (gd=32, K=64) -- "
+                         "they move, so this stays a config value and gets "
+                         "recalibrated at the Stage-1 rehearsal rather than "
+                         "being frozen here. Omitted -> observe-and-record "
+                         "(both recalls in the CSV, nothing gated)")
     ap.add_argument("--skip-raw-batch", action="store_true",
                     help="skip the raw cuVS batch arm (PR-B's cuvs_engine)")
     args = ap.parse_args()

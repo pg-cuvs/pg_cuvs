@@ -18,7 +18,7 @@ import conc_runner  # noqa: E402
 import report_recall_tables as report  # noqa: E402
 import run_pg_cuvsbench as runner  # noqa: E402
 from pg_engine import truncate_topk  # noqa: E402
-from sidecar import canonical_json  # noqa: E402
+from sidecar import CAGRA_BUILD_ALGO, canonical_json  # noqa: E402
 
 
 class Args:
@@ -134,7 +134,11 @@ class FakeEngine:
 
     def build(self, algo, n, build_cfg=None, keep=()):
         self.built.append((algo, canonical_json(build_cfg), tuple(keep)))
-        self._relopts["t_cagra"] = {k: str(v) for k, v in build_cfg.items()}
+        # what the real DDL leaves in pg_class.reloptions: the cell, plus the
+        # build_algo pin PgEngine._cagra_with() always writes.
+        opts = {k: str(v) for k, v in build_cfg.items()}
+        opts["build_algo"] = CAGRA_BUILD_ALGO
+        self._relopts["t_cagra"] = opts
         return 33.0, 4242, {}
 
 
@@ -152,7 +156,8 @@ def test_no_rebuild_when_the_pareto_cell_is_already_resident(tmp_path, monkeypat
              {"t_cagra": {"algo": "pgcuvs_cagra", "build_cfg": canonical_json(cfg),
                           "build_time_seconds": 35.0, "index_size_bytes": 99}})
     eng = FakeEngine({"t_cagra": {"graph_degree": "64",
-                                  "intermediate_graph_degree": "128"}})
+                                  "intermediate_graph_degree": "128",
+                                  "build_algo": CAGRA_BUILD_ALGO}})
     bt, ibytes, rebuilt = runner.ensure_pareto_index(eng, "pgcuvs_cagra", cfg, 100)
     assert (bt, ibytes, rebuilt) == (35.0, 99, False)
     assert eng.built == []
@@ -171,6 +176,26 @@ def test_rebuild_when_phase1_left_a_different_cell_resident(tmp_path, monkeypatc
     bt, ibytes, rebuilt = runner.ensure_pareto_index(eng, "pgcuvs_cagra", want, 100)
     assert rebuilt is True and bt == 33.0 and ibytes == 4242
     assert eng.built == [("pgcuvs_cagra", canonical_json(want), ())]
+
+
+def test_pinned_build_algo_forces_one_rebuild_and_then_settles(tmp_path,
+                                                               monkeypatch):
+    # PR-B pinned build_algo='ivf_pq' in both the DDL and expected_reloptions.
+    # An index built before the pin (reloptions carry no build_algo) must fail
+    # the gate once -- and the rebuild must then satisfy it, or Phase 2 would
+    # rebuild the same cell on every arm.
+    cfg = {"graph_degree": 64, "intermediate_graph_degree": 128}
+    _sidecar(tmp_path, monkeypatch,
+             {"t_cagra": {"algo": "pgcuvs_cagra", "build_cfg": canonical_json(cfg),
+                          "build_time_seconds": 35.0, "index_size_bytes": 99}})
+    eng = FakeEngine({"t_cagra": {"graph_degree": "64",
+                                  "intermediate_graph_degree": "128"}})
+    _bt, _b, rebuilt = runner.ensure_pareto_index(eng, "pgcuvs_cagra", cfg, 100)
+    assert rebuilt is True
+    # FakeEngine.build() writes back what the real DDL writes, build_algo pin
+    # included -- so the second call must be a no-op.
+    _bt, _b, again = runner.ensure_pareto_index(eng, "pgcuvs_cagra", cfg, 100)
+    assert again is False, "Pareto rebuild did not settle -- every arm rebuilds"
 
 
 def test_rebuild_when_the_sidecar_agrees_but_the_catalog_does_not(tmp_path,
