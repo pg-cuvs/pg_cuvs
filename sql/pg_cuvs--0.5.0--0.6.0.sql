@@ -1,8 +1,9 @@
 -- pg_cuvs upgrade: 0.5.0 -> 0.6.0
 -- #133 / ADR-083: 3O (CAGRA BITSET prefilter) recall collapses on
 -- anti-correlated filters regardless of selectivity. The daemon now detects a
--- materially short fill (mean_returned << k) and retries on D-wedge; this
--- adds an observability counter for that retry.
+-- materially short fill (mean_returned << k) and retries on the GPU exact BF
+-- prefilter (`gpu_bf_prefilter`); this adds an observability counter for
+-- that retry.
 --
 -- Usage:
 --   ALTER EXTENSION pg_cuvs UPDATE TO '0.6.0';
@@ -75,6 +76,6 @@ COMMENT ON VIEW pg_stat_gpu_search IS
   'GPU CAGRA per-index search stats: counts, fallbacks/errors, and '
   'approximate p50/p95/p99 latency. Counters reset on index rebuild or '
   'daemon restart; empty while the daemon is down. prefilter_fallback_count '
-  '(#133/ADR-083) counts 3O->D-wedge retries triggered by a short-fill '
+  '(#133/ADR-083) counts 3O->gpu_bf_prefilter retries triggered by a short-fill '
   'collapse detection (anti-correlated filter) -- watch it against '
   'search_count to see an index "quietly went slow" on a hostile filter shape.';

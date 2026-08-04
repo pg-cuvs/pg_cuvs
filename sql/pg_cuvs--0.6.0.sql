@@ -196,7 +196,7 @@ COMMENT ON VIEW pg_stat_gpu_search IS
   'GPU CAGRA per-index search stats: counts, fallbacks/errors, and '
   'approximate p50/p95/p99 latency. Counters reset on index rebuild or '
   'daemon restart; empty while the daemon is down. prefilter_fallback_count '
-  '(#133/ADR-083) counts 3O->D-wedge retries triggered by a short-fill '
+  '(#133/ADR-083) counts 3O->gpu_bf_prefilter retries triggered by a short-fill '
   'collapse detection (anti-correlated filter) -- watch it against '
   'search_count to see an index "quietly went slow" on a hostile filter shape.';
 

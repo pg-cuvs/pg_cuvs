@@ -180,7 +180,7 @@ Defaults and ranges are from source. "Set by" is the minimum role/scope: `USERSE
 
 | GUC | Type | Default | Range | Set by | Purpose |
 |-----|------|---------|-------|--------|---------|
-| `cuvs.filter_auto_threshold` | real | `0.0` | 0.0–1.0 | USERSET | Selectivity below which filtered BF uses the **approximate** GPU BITSET prefilter (3O) instead of the exact D-wedge post-filter. Defaults to off: 3O recall collapses on selective filters (0.28 at 1e-4, ADR-082) and the exact paths are faster there. **Selectivity does not predict the worst case (ADR-083, #133): the collapse point depends on filter *shape* (query correlation), not selectivity.** An anti-correlated filter measured recall 0.0 across the entire 0.0001–0.5 selectivity range — no threshold value here filters it out. The daemon mitigates by detecting a materially short fill and retrying on D-wedge (`pg_stat_gpu_search.prefilter_fallback_count`); this is a mitigation, not a guarantee for every filter shape |
+| `cuvs.filter_auto_threshold` | real | `0.0` | 0.0–1.0 | USERSET | Selectivity below which filtered BF uses the **approximate** GPU BITSET prefilter (3O) instead of the exact D-wedge post-filter. Defaults to off: 3O recall collapses on selective filters (0.28 at 1e-4, ADR-082) and the exact paths are faster there. **Selectivity does not predict the worst case (ADR-083, #133): the collapse point depends on filter *shape* (query correlation), not selectivity.** An anti-correlated filter measured recall 0.0 across the entire 0.0001–0.5 selectivity range — no threshold value here filters it out. The daemon mitigates by detecting a materially short fill and retrying on the GPU exact BF prefilter (`gpu_bf_prefilter`; **not** the D-wedge post-filter above — different cost model, see `pg_stat_gpu_search.prefilter_fallback_count`); this is a mitigation, not a guarantee for every filter shape |
 | `cuvs.stream_bf_selectivity_threshold` | real | `0.004` | 0.0–1.0 | USERSET | Selectivity below which filtered BF streams out-of-core from `.vectors`; `0.004` is the canonical-host operational baseline, not a portable crossover. A second host measured the crossover below `0.002`; recalibrate for the deployment ([report](reports/2026-08-04-item2b-second-host-replication.md), ADR-064/082) |
 | `cuvs.stream_bf_chunk_vectors` | int | `262144` | 1–INT_MAX | USERSET | Vectors per GPU chunk in streaming BF (footprint only; result is exact for any chunking) |
 | `cuvs.filtered_knn_hook` | bool | `off` | — | USERSET | Enable the D-wedge Custom Scan hook (ADR-063 spike) |
@@ -328,9 +328,12 @@ GPU?), `error_count`, p50/p95/p99 latency, `stale`, `delta_rows`.
 
 `prefilter_fallback_count` (ADR-083, #133) counts searches where the 3O CAGRA prefilter
 (`cagra_prefilter`) returned a materially short fill — a signal the traversal collapsed on an
-anti-correlated filter — and were retried on D-wedge within the same query. Watch it against
-`search_count`: a nonzero, growing value means an index is quietly paying D-wedge latency on some
-filter shapes even though `cuvs.filter_auto_threshold` routes it to 3O.
+anti-correlated filter — and were retried on the GPU exact BF prefilter (`gpu_bf_prefilter`,
+mode 3) within the same query. This is a different code path from the D-wedge Custom Scan hook
+above — its cost scales with corpus size (N), not with `1/selectivity` like D-wedge. Watch
+`prefilter_fallback_count` against `search_count`: a nonzero, growing value means an index is
+quietly paying `gpu_bf_prefilter` latency on some filter shapes even though
+`cuvs.filter_auto_threshold` routes it to 3O.
 
 ### `pg_stat_gpu_cache` — per-GPU VRAM cache counters (daemon-sourced)
 
