@@ -37,15 +37,17 @@ def _write_fbin(path, arr):
 
 @pytest.fixture
 def eng(tmp_path):
-    import psycopg
-    import pgvector.psycopg
+    # psycopg/pgvector are absent on a CPU-only CI runner; that is a skip, not
+    # an error -- the job must still collect and run the rest of this directory.
+    psycopg = pytest.importorskip("psycopg")
+    pgvector_psycopg = pytest.importorskip("pgvector.psycopg")
 
     try:
         conn = psycopg.connect(dbname=TEST_DBNAME, autocommit=True)
     except Exception as e:  # noqa: BLE001
         pytest.skip(f"no local PostgreSQL reachable (dbname={TEST_DBNAME}): {e!r}")
     conn.execute("CREATE EXTENSION IF NOT EXISTS vector")
-    pgvector.psycopg.register_vector(conn)
+    pgvector_psycopg.register_vector(conn)
     conn.execute("DROP TABLE IF EXISTS t CASCADE")
     conn.execute("DROP TABLE IF EXISTS public._bench_corpus")
 

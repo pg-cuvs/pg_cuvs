@@ -133,7 +133,7 @@ def main():
                 sample_query = np.ascontiguousarray(read_fbin(queries_path, count=1)[0])
             params = build_params_label(algo, args.n)
             bts = []
-            for i, (bt, ibytes) in enumerate(
+            for i, (bt, ibytes, _meta) in enumerate(
                     run_build_reps(eng, algo, args.n, args.build_reps,
                                    sample_query=sample_query)):
                 w.writerow(dict(algo=algo, build_params=params, rep=i,
