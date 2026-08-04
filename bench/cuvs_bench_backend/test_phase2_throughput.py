@@ -31,9 +31,11 @@ class Args:
 
 @pytest.fixture(autouse=True)
 def _clear_gate_state():
-    runner.GATE_VIOLATIONS.clear()
+    for bucket in (runner.GATE_VIOLATIONS, runner.GATE_OBSERVATIONS):
+        bucket.clear()
     yield
-    runner.GATE_VIOLATIONS.clear()
+    for bucket in (runner.GATE_VIOLATIONS, runner.GATE_OBSERVATIONS):
+        bucket.clear()
 
 
 # ── client-side top-k truncation ─────────────────────────────────────────────
@@ -252,39 +254,29 @@ def test_pareto_ignores_throughput_rows_when_recomputed_from_the_csv():
 
 
 # ── consistency gates ────────────────────────────────────────────────────────
-def test_fallback_gate_passes_only_on_a_zero_delta():
+def test_fallback_gate_is_hard_and_passes_only_on_a_zero_delta():
     assert runner.gate_fallback("a", 0).startswith("gate-ok")
     assert not runner.GATE_VIOLATIONS
+    # HARD: a nonzero delta means the arm may have measured a CPU exact search
+    # under a GPU arm's label, so the run must not exit clean.
     assert runner.gate_fallback("a", 3).startswith("GATE-VIOLATION")
     assert runner.GATE_VIOLATIONS
 
 
 def test_conc1_ratio_gate_accepts_the_expected_band():
     assert runner.gate_conc1_ratio("a", 90.0, 100.0).startswith("gate-ok")
-    assert not runner.GATE_VIOLATIONS
+    assert not runner.GATE_VIOLATIONS and not runner.GATE_OBSERVATIONS
 
 
-def test_conc1_ratio_gate_flags_a_conc_arm_faster_than_the_latency_axis():
+def test_conc1_ratio_violation_is_observational_not_fatal():
     # conc N=1 is wall-clock and must be the LOWER number; above 1.0 one of the
-    # two is not measuring what its label says.
-    assert runner.gate_conc1_ratio("a", 130.0, 100.0).startswith("GATE-VIOLATION")
-    assert runner.GATE_VIOLATIONS
-
-
-def test_conc1_ratio_note_carries_the_measured_formatting_asymmetry():
-    # measured at 100k: latency axis 617 QPS (1.621 ms/query, literal formatting
-    # included), conc N=1 840 QPS (1.190 ms, literals precomputed). Correcting
-    # the latency axis by the arm's own measured 0.442 ms/query lands the ratio
-    # in band, which is what identifies the asymmetry as the whole story.
-    txt = runner.gate_conc1_ratio("a", 840.0, 617.0, fmt_ms=0.442)
-    assert txt.startswith("GATE-VIOLATION")          # raw ratio still gated
-    assert "ratio=1.361" in txt
-    corrected = float(txt.split("corrected ratio=")[1].split()[0])
-    assert 0.8 <= corrected <= 1.0
-
-
-def test_conc1_ratio_note_omits_the_correction_when_it_is_not_measured():
-    assert "corrected" not in runner.gate_conc1_ratio("a", 90.0, 100.0)
+    # two stopped describing the same query. Worth recording -- but the rows are
+    # still measurements, and the plan says this check never aborts. A non-zero
+    # exit here would make gpu-run.sh record a completed run as state=failed.
+    txt = runner.gate_conc1_ratio("a", 130.0, 100.0)
+    assert txt.startswith("GATE-OBSERVATION")
+    assert runner.GATE_OBSERVATIONS
+    assert not runner.GATE_VIOLATIONS, "observational gate must not set exit code"
 
 
 def test_batch_recall_gate_is_observe_and_record_without_a_tolerance():
@@ -297,7 +289,10 @@ def test_batch_recall_gate_is_observe_and_record_without_a_tolerance():
 def test_batch_recall_gate_uses_the_measured_tolerance_when_given():
     args = Args(batch_recall_tol=0.02)
     assert runner.gate_batch_recall(args, "a", 0.97, 0.98).startswith("gate-ok")
+    # HARD: past the tolerance the batch arm is not returning the neighbours of
+    # the point it is labelled with.
     assert runner.gate_batch_recall(args, "a", 0.90, 0.99).startswith("GATE-VIOL")
+    assert runner.GATE_VIOLATIONS
 
 
 # ── concurrency runner (pure parts) ──────────────────────────────────────────
@@ -310,6 +305,21 @@ def test_slices_are_disjoint_and_cover_the_full_query_pool():
 
 def test_slices_never_hand_a_worker_an_empty_range():
     assert all(len(s) for s in conc_runner.slices_for(5, 8))
+
+
+def test_conc_worker_formats_its_literal_inside_the_timed_loop():
+    # The measurement boundary for BOTH axes is the full round trip the
+    # application experiences, and formatting the inline vector literal
+    # (~0.45 ms/query at dim=768) is part of what it pays. Precomputing it made
+    # conc N=1 come out 1.33x the latency axis for a reason unrelated to
+    # concurrency. The batch arm's bind parameter is the only sanctioned
+    # exception to the same-statement-shape rule.
+    import inspect
+    src = inspect.getsource(conc_runner._worker)
+    body = src.split("def one(j):")[1].split("# Plan guard")[0]
+    assert "_vec_literal(qvecs[j])" in body, \
+        "the timed statement must build its own literal, as the latency axis does"
+    assert "lits = [" not in src, "no precomputed literal list may come back"
 
 
 def test_worker_gucs_replicate_the_operating_point_per_algo():

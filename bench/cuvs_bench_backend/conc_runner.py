@@ -80,40 +80,39 @@ def _worker(wid, algo, param, index_dir, dbname, qidx, qvecs, top_k, window,
         cur = conn.cursor()
         for g in worker_gucs(algo, param, index_dir):
             cur.execute(g)
-        # Literals are built ONCE, before the window. The latency axis builds
-        # them inside its timed region (pg_engine.search), which is ~0.44 ms per
-        # query at dim=768 -- real client-side CPU that the throughput axis must
-        # not spend inside the measurement, or at N=64 the arm would report how
-        # fast the client can format floats. The cost is measured here so the
-        # N=1 consistency check can state the asymmetry instead of just failing.
-        t_fmt = time.perf_counter()
-        lits = [_vec_literal(q) for q in qvecs]
-        fmt_ms = (time.perf_counter() - t_fmt) / max(1, len(lits)) * 1000.0
+        nq = len(qvecs)
 
-        def one(lit):
-            # Same statement shape as the latency axis: an inline literal, not a
-            # bind parameter (the batch arm is the only documented exception).
+        def one(j):
+            # The literal is formatted INSIDE the timed region, exactly as the
+            # latency axis does it (pg_engine.search). It costs ~0.45 ms/query
+            # at dim=768, and it is a cost the application genuinely pays -- the
+            # measurement boundary for both axes is the full round trip a
+            # PostgreSQL client experiences. Precomputing it here would make
+            # conc N=1 faster than the latency axis for a reason that has
+            # nothing to do with concurrency (measured: ratio 1.33). The one
+            # sanctioned departure from the same-statement-shape rule is the
+            # batch arm's bind parameter, and that exception is pre-registered.
             cur.execute("SELECT id FROM t ORDER BY embedding <-> "
-                        f"'{lit}'::vector LIMIT {top_k}")
+                        f"'{_vec_literal(qvecs[j])}'::vector LIMIT {top_k}")
             return [r[0] for r in cur.fetchall()]
 
         # Plan guard, per worker: the parent's EXPLAIN says nothing about a
         # connection that has its own GUCs.
         cur.execute("EXPLAIN (FORMAT TEXT) SELECT id FROM t ORDER BY embedding "
-                    f"<-> '{lits[0]}'::vector LIMIT {top_k}")
+                    f"<-> '{_vec_literal(qvecs[0])}'::vector LIMIT {top_k}")
         plan = "\n".join(r[0] for r in cur.fetchall())
         seqscan = "Seq Scan" in plan
 
-        for lit in lits[:WARMUP_QUERIES]:
-            one(lit)
+        for j in range(min(WARMUP_QUERIES, nq)):
+            one(j)
 
         barrier.wait()
         t0 = time.perf_counter()
         lat, ids, n, i = [], {}, 0, 0
         while time.perf_counter() - t0 < window:
-            j = i % len(lits)
+            j = i % nq
             t1 = time.perf_counter()
-            got = one(lits[j])
+            got = one(j)
             lat.append(time.perf_counter() - t1)
             # Keep the FIRST result per query only: a repeated query must not
             # weight recall more heavily than one measured once.
@@ -123,16 +122,15 @@ def _worker(wid, algo, param, index_dir, dbname, qidx, qvecs, top_k, window,
         wall = time.perf_counter() - t0
         conn.close()
         out.put({"wid": wid, "n": n, "wall": wall, "lat": lat, "ids": ids,
-                 "seqscan": seqscan, "slice": len(lits), "fmt_ms": fmt_ms,
-                 "passes": i / max(1, len(lits)), "error": None})
+                 "seqscan": seqscan, "slice": nq,
+                 "passes": i / max(1, nq), "error": None})
     except Exception as e:  # noqa: BLE001 -- a dead worker must not hang the parent
         try:
             barrier.abort()
         except Exception:  # noqa: BLE001
             pass
         out.put({"wid": wid, "error": repr(e), "n": 0, "wall": 0.0, "lat": [],
-                 "ids": {}, "seqscan": False, "slice": 0, "passes": 0.0,
-                 "fmt_ms": float("nan")})
+                 "ids": {}, "seqscan": False, "slice": 0, "passes": 0.0})
 
 
 def slices_for(n_queries, n_workers):
@@ -200,7 +198,6 @@ def run_arm(algo, n_workers, queries, gt, param, index_dir, dbname="postgres",
             "queries": total, "wall": wall, "recall": recall,
             "p50_ms": p50, "p95_ms": p95, "p99_ms": p99,
             "recall_queries": len(covered), "passes": passes,
-            "literal_format_ms": float(np.mean([r["fmt_ms"] for r in res])),
             "seqscan": any(r["seqscan"] for r in res), "notes": notes}
 
 

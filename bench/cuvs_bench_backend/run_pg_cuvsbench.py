@@ -422,6 +422,18 @@ def run_phase2(args, writer, fout, latency_rows):
         emit_raw_batch(args, emit, done, pareto, q_lat, gt, env_note)
 
     eng.close()
+    # cuvs_engine keeps the raw index in a module-level singleton, so nothing
+    # else will release it; left to interpreter shutdown, its teardown runs
+    # against a CUDA context that may already be gone (the empty
+    # "Error in sys.excepthook" that closed the pg98c8 log). Releasing it here
+    # is the contract cuvs_engine.close_raw_engine() documents.
+    try:
+        import sys as _sys
+        if "cuvs_engine" in _sys.modules:
+            _sys.modules["cuvs_engine"].close_raw_engine()
+            log("P2", "raw-engine", "released")
+    except Exception as e:  # noqa: BLE001 -- teardown must not lose the rows
+        log("P2", "WARN", "raw-engine-release-failed", repr(e))
     log("P2", "done", f"throughput rows={len(rows)}")
     return rows
 
@@ -501,8 +513,7 @@ def emit_conc(args, eng, emit, done, algo, p, n_workers, queries_all, gt, bt,
     notes += r["notes"]
     notes.append(gate_fallback(name, fb_delta))
     if n_workers == 1:
-        notes.append(gate_conc1_ratio(name, r["qps"], p["qps"],
-                                      fmt_ms=r.get("literal_format_ms")))
+        notes.append(gate_conc1_ratio(name, r["qps"], p["qps"]))
 
     emit(throughput_row(name, param, args.k, r["recall"], r["qps"],
                         r["wall"] * 1000.0, p["build_params"], r["queries"],
@@ -579,14 +590,30 @@ def emit_raw_batch(args, emit, done, pareto, queries, gt, env_note):
 
 
 # ── Phase-2 consistency gates ────────────────────────────────────────────────
-GATE_VIOLATIONS = []
+#
+# Two kinds, and the difference is what the process exit code says:
+#
+#   HARD          the row may be describing something other than its label, so
+#                 the run must not end looking clean -> recorded AND non-zero
+#                 exit. (fallback delta; batch-vs-single recall once a measured
+#                 tolerance is configured.)
+#   OBSERVATIONAL a cross-check whose violation is information, not corruption.
+#                 Recorded in the row's notes and the log, exit code untouched.
+#                 The plan says so explicitly for the conc N=1 ratio ("이탈 시
+#                 중단 아님, notes 기록+원인 메모"), and it matters operationally:
+#                 gpu-run.sh reads a non-zero exit as state=failed, which would
+#                 turn an observation into a Stage-2 segment retry loop.
+GATE_VIOLATIONS = []        # hard only -- what the exit code is derived from
+GATE_OBSERVATIONS = []      # observational violations, reported never fatal
 
 
-def _gate(name, ok, text):
+def _gate(name, ok, text, hard=True):
     if not ok:
-        GATE_VIOLATIONS.append(f"{name}: {text}")
-        log("P2", "WARN", "gate-violation", name, text)
-    return ("gate-ok " if ok else "GATE-VIOLATION ") + text
+        (GATE_VIOLATIONS if hard else GATE_OBSERVATIONS).append(f"{name}: {text}")
+        log("P2", "WARN", "gate-violation" if hard else "gate-observation",
+            name, text)
+    return ("gate-ok " if ok else
+            ("GATE-VIOLATION " if hard else "GATE-OBSERVATION ")) + text
 
 
 def gate_fallback(name, delta):
@@ -594,39 +621,33 @@ def gate_fallback(name, delta):
 
     A fallback returns recall~=1.0 at high latency, so a contaminated arm looks
     *better* on recall while measuring something else entirely -- which is why
-    this is checked per arm rather than once for the run.
+    this is checked per arm rather than once for the run, and why it is HARD:
+    the row would be describing a CPU exact search under a GPU arm's label.
     """
-    return _gate(name, delta == 0, f"fallback-delta={delta} (want 0)")
+    return _gate(name, delta == 0, f"fallback-delta={delta} (want 0)", hard=True)
 
 
-def gate_conc1_ratio(name, conc_qps, latency_qps, fmt_ms=None, lo=0.8, hi=1.0):
+def gate_conc1_ratio(name, conc_qps, latency_qps, lo=0.8, hi=1.0):
     """conc N=1 vs the latency axis: the two must describe the same query.
 
-    The band assumes conc N=1 is the lower number (wall-clock, including loop
-    overhead the latency axis's nq/sum(latency) excludes). Measured at 100k it
-    came out HIGHER, and the cause is a real asymmetry rather than noise: the
-    latency axis formats each query's inline vector literal INSIDE its timed
-    region (pg_engine.search), while the throughput arm precomputes literals
-    before the window on purpose -- at N=64 a timed format would make the arm
-    report the client's float formatting speed, not the server's throughput.
+    Both now do identical per-query work -- the conc worker formats its inline
+    literal inside the timed region exactly as pg_engine.search does -- so the
+    only remaining difference is the intended one: conc N=1 is wall-clock and
+    the latency axis is nq/sum(latency), which excludes the loop overhead
+    between queries. conc N=1 is therefore the slightly LOWER number, hence the
+    band. (An earlier revision precomputed the literals, which bought the conc
+    arm ~0.45 ms/query it never paid and pushed the ratio to 1.33 -- a
+    measurement-boundary bug this check is exactly what caught.)
 
-    So the raw ratio is what is gated (it is the honest cross-check, and it did
-    catch this), and when the arm measured its own formatting cost the note also
-    carries the parity-corrected ratio: the latency axis's per-query time minus
-    that measured cost. Recorded, never fatal."""
+    OBSERVATIONAL: a violation says the two axes stopped describing the same
+    query, which is worth knowing and writing down, but the rows themselves are
+    still measurements of what they say they are."""
     if not latency_qps:
         return "conc1-ratio: no latency QPS to compare"
     ratio = conc_qps / latency_qps
-    extra = ""
-    if fmt_ms:
-        parity_s = 1.0 / latency_qps - fmt_ms / 1000.0
-        if parity_s > 0:
-            extra = (f"; literal-format-corrected ratio="
-                     f"{conc_qps * parity_s:.3f} (latency axis includes "
-                     f"{fmt_ms:.3f}ms/query client-side literal formatting that "
-                     f"the conc arm precomputes)")
     return _gate(name, lo <= ratio <= hi,
-                 f"conc1/latency QPS ratio={ratio:.3f} (want [{lo},{hi}])" + extra)
+                 f"conc1/latency QPS ratio={ratio:.3f} (want [{lo},{hi}])",
+                 hard=False)
 
 
 def gate_batch_recall(args, name, batch_recall, single_recall):
@@ -642,8 +663,10 @@ def gate_batch_recall(args, name, batch_recall, single_recall):
            f"delta={delta:.4f}")
     if args.batch_recall_tol is None:
         return "observe-and-record " + txt
+    # HARD once a tolerance exists: past it, the batch arm is not returning the
+    # same neighbours as the point it is labelled with.
     return _gate(name, delta <= args.batch_recall_tol,
-                 txt + f" (tol={args.batch_recall_tol})")
+                 txt + f" (tol={args.batch_recall_tol})", hard=True)
 
 
 def _recall_at_k(ids, gt, k):
@@ -796,13 +819,20 @@ def main():
 
     log("S1", "done", f"points={done_pts}", f"throughput-rows={len(tp_rows)}",
         f"-> {args.out}")
+    for o in GATE_OBSERVATIONS:
+        log("P2", "gate-observation", o)
     if GATE_VIOLATIONS:
-        # Non-fatal by design (an arm's number is still a measurement), but the
-        # run must not end looking clean when a gate did not hold.
-        log("P2", "gate-summary", f"violations={len(GATE_VIOLATIONS)}")
+        # Hard only. Observational violations above are recorded in the rows'
+        # notes and in this log and deliberately do NOT change the exit code:
+        # gpu-run.sh turns a non-zero exit into state=failed, and a cross-check
+        # that flags information must not make a completed run look failed.
+        log("P2", "gate-summary", f"hard-violations={len(GATE_VIOLATIONS)}",
+            f"observations={len(GATE_OBSERVATIONS)}")
         for v in GATE_VIOLATIONS:
             log("P2", "gate-violation", v)
         return 3
+    log("P2", "gate-summary", "hard-violations=0",
+        f"observations={len(GATE_OBSERVATIONS)}")
     return 0
 
 
