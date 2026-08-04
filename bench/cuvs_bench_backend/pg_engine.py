@@ -596,6 +596,10 @@ class PgEngine:
         sample_query is accepted for call compatibility and unused: the unified
         0.5.0 export needs no dummy search.
         """
+        return self._build_once(algo, n, sample_query, build_cfg, keep)
+
+    def _build_once(self, algo, n, sample_query=None, build_cfg=None, keep=()):
+        """One build attempt. See build() for the contract."""
         assert algo in ALGOS, f"unknown algo {algo}"
         cfg = dict(build_cfg) if build_cfg else self.default_build_cfg(algo, n)
         c = self.conn
