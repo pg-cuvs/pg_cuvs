@@ -228,8 +228,10 @@ typedef struct IndexEntry {
     uint32_t        last_returned_k;   /* rows last OK search returned */
     uint64_t        delta_merged_count; /* searches where daemon merged delta on GPU */
     uint64_t        bf_batch_count;     /* Phase 3L-9: coalesced BF batch dispatches */
-    uint64_t        prefilter_fallback_count; /* #133/ADR-083: 3O->D-wedge retries after
-                                                * a short-fill (mean_returned<<k) detection */
+    uint64_t        prefilter_fallback_count; /* #133/ADR-083: 3O->gpu_bf_prefilter retries
+                                                * after a short-fill (mean_returned<<k)
+                                                * detection actually falls back (not merely
+                                                * detects; see the handle_search comment) */
     char            last_error[128];
     WarmupState      warmup_state;     /* Phase 3D: WARMUP_HOT for resident indexes */
     /* Phase 3D: warmup observability — populated when an index is hydrated from
@@ -3023,7 +3025,14 @@ handle_search(int client_fd, const CuvsCmdFrame *cmd)
                     /* pg_cuvs convention: bit=1 = exclude. Start all excluded;
                      * the cuVS wrapper inverts this to cuVS's bit=1 = include. */
                     memset(bitset, 0xFF, (size_t)nwords * sizeof(uint32_t));
-                    /* clear bits for filter items (include them) */
+                    /* clear bits for filter items (include them). n_included
+                     * counts bits actually cleared -- cmd->n_filter_tids is
+                     * the backend's filter TID count, but the binary search
+                     * above silently skips a TID this index's rev map can't
+                     * find (e.g. a post-build delta row, a tombstoned row),
+                     * so n_included <= cmd->n_filter_tids in general (#133
+                     * review F2). Used below to size the short-fill guard. */
+                    int64_t n_included = 0;
                     for (uint32_t fi = 0; fi < cmd->n_filter_tids; fi++) {
                         uint64_t want = flt_tids[fi];
                         int64_t lo = 0, hi = nv - 1;
@@ -3031,8 +3040,10 @@ handle_search(int client_fd, const CuvsCmdFrame *cmd)
                             int64_t mid = lo + (hi - lo) / 2;
                             if (e->rev_tids[mid] == want) {
                                 int32_t iid = e->rev_item_ids[mid];
-                                if (iid >= 0 && (int64_t)iid < nv)
+                                if (iid >= 0 && (int64_t)iid < nv) {
                                     bitset[iid >> 5] &= ~(1u << (iid & 31));
+                                    n_included++;
+                                }
                                 break;
                             }
                             if (e->rev_tids[mid] < want) lo = mid + 1;
@@ -3042,6 +3053,7 @@ handle_search(int client_fd, const CuvsCmdFrame *cmd)
 
                     /* CAGRA prefilter first (approx, faster); fall back to BF. */
                     int pret = 1;
+                    int short_fill_detected = 0;
                     if (e->handle != NULL) {
                         pret = cuvs_cagra_search_filtered(
                             e->handle, query, (int)cmd->dim, k,
@@ -3054,10 +3066,10 @@ handle_search(int client_fd, const CuvsCmdFrame *cmd)
                              * 0.0001-0.5 selectivity), but the traversal never
                              * reaching the passing rows does: it comes back with
                              * far fewer than k filled slots. Healthy cells returned
-                             * exactly min(k, |filter|); every measured collapsed
-                             * cell returned <=2.02 out of k=10. TAIL CONTRACT
-                             * (cuvs_wrapper.h, #103) pads unfilled slots with
-                             * CUVS_PAD_ITEM_ID; the documented contract says
+                             * exactly min(k, |included filter|); every measured
+                             * collapsed cell returned <=2.02 out of k=10. TAIL
+                             * CONTRACT (cuvs_wrapper.h, #103) pads unfilled slots
+                             * with CUVS_PAD_ITEM_ID; the documented contract says
                              * padding is trailing-only, but cuvs_wrapper.cu's own
                              * comment on store_result() only guarantees the
                              * sentinel lands somewhere in [0, bk) -- so count every
@@ -3065,31 +3077,51 @@ handle_search(int client_fd, const CuvsCmdFrame *cmd)
                              * correct even if that ever isn't strictly trailing.
                              *
                              * `expect` is what a correct answer could return: k,
-                             * or the whole filter set if it is smaller than k (a
-                             * short-but-correct answer must not be mistaken for a
-                             * collapse). Retrying below half of `expect` sits far
-                             * under the healthy floor (=expect) and far over the
-                             * observed collapse ceiling (2.02 out of an expect of
-                             * 10 here), so it will not misfire on a legitimately
-                             * short answer nor miss the measured failure mode. */
+                             * or the whole INCLUDED filter set if that is smaller
+                             * than k (n_included, not cmd->n_filter_tids -- see
+                             * above; a short-but-correct answer must not be
+                             * mistaken for a collapse). Strict `filled < expect`
+                             * (#133 review F1): every measured healthy cell
+                             * returned exactly `expect`, with no observed
+                             * in-between case, and the measured collapse ceiling
+                             * (2.02/10) is far below even a `expect - 1` floor, so
+                             * tightening from the original half-of-expect margin
+                             * does not risk misfiring on a real partial fill.
+                             *
+                             * Gated on e->main_bf_idx != NULL (#133 review F3):
+                             * detecting a collapse is only actionable if a BF
+                             * fallback target exists. Without this gate, an index
+                             * with no `.vectors` sidecar would have pret forced
+                             * back to 1 with nothing to retry into, and the
+                             * request would fail with CUVS_STATUS_NO_VECTORS
+                             * instead of returning 3O's (possibly degraded but
+                             * still approximate) results -- turning a recall
+                             * problem into an availability regression. */
                             int filled = 0;
                             for (int fi = 0; fi < k; fi++)
                                 if (praw[fi].item_id != CUVS_PAD_ITEM_ID)
                                     filled++;
                             int expect = k;
-                            if ((int64_t)cmd->n_filter_tids < (int64_t)expect)
-                                expect = (int)cmd->n_filter_tids;
-                            if (filled * 2 < expect) {
+                            if (n_included < (int64_t)expect)
+                                expect = (int)n_included;
+                            if (filled < expect && e->main_bf_idx != NULL) {
                                 pret = 1;
                                 used_cagra = 0;
-                                e->prefilter_fallback_count++;
+                                short_fill_detected = 1;
                             }
                         }
                     }
-                    if (pret != 0 && e->main_bf_idx != NULL)
+                    if (pret != 0 && e->main_bf_idx != NULL) {
                         pret = cuvs_bf_search_filtered(
                             e->main_bf_idx, query, (int)cmd->dim, k,
                             bitset, nv, praw, delta_gpu_of(e));
+                        /* Count the retry only once it actually ran (#133
+                         * review F3), not merely detected -- a search error
+                         * unrelated to the short-fill collapse (e.g. a
+                         * concurrent OOM) must not be attributed to it. */
+                        if (short_fill_detected)
+                            e->prefilter_fallback_count++;
+                    }
                     if (pret == 0) {
                         did_prefilter = 1;
                         munmap(query, vec_bytes);  /* unmap before D-wedge path runs */
