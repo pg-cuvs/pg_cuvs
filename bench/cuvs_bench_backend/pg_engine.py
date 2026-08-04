@@ -47,6 +47,7 @@ from adr079_reuse import corpus_fingerprint  # noqa: E402
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from sidecar import (  # noqa: E402
     ALL_RELATIONS,
+    CAGRA_BUILD_ALGO,
     INTERMEDIATE_GRAPH_DEGREE,
     RELATION_OF,
     SIBLING_OF,
@@ -588,16 +589,24 @@ class PgEngine:
 
     @staticmethod
     def _cagra_with(cfg):
-        """WITH(...) clause for a CAGRA build, or '' when cfg pins nothing.
+        """WITH(...) clause for a CAGRA build.
 
         intermediate_graph_degree must be >= graph_degree (src/pg_cuvs.c:1265),
         so both travel together or neither does.
+
+        build_algo is ALWAYS pinned, even when the cell names no degrees. The
+        reloption default is `auto` -- a corpus-size heuristic that chooses
+        ivf_pq or nn_descent -- while the raw arm (cuvs_engine) names its
+        algorithm outright. Left on `auto`, the two arms could be built by
+        different algorithms, and "same parameters except the integration"
+        would be an unverified claim rather than a fact of the DDL.
         """
         gd = cfg.get("graph_degree")
         if gd is None:
-            return ""
+            return f"WITH (build_algo='{CAGRA_BUILD_ALGO}')"
         igd = int(cfg.get("intermediate_graph_degree", INTERMEDIATE_GRAPH_DEGREE))
-        return f"WITH (graph_degree={int(gd)}, intermediate_graph_degree={igd})"
+        return (f"WITH (graph_degree={int(gd)}, intermediate_graph_degree={igd}, "
+                f"build_algo='{CAGRA_BUILD_ALGO}')")
 
     # -- search ----------------------------------------------------------------
     def search(self, algo, queries, kmax, param, warmup=200):

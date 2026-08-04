@@ -121,9 +121,11 @@ def test_3i_identity_splits_across_two_relations():
     # the exported index knows its source and mode ...
     assert expected_reloptions("pgcuvs_hnsw_import", cfg) == {
         "source": "t_cagra", "mode": "hnswlib"}
-    # ... but not the source graph's degree, which is checked on t_cagra
+    # ... but not the source graph's degree or build algorithm, which are
+    # checked on t_cagra (build_algo is pinned, not swept -- see #98/ADR-084)
     assert expected_source_reloptions(cfg) == {
-        "graph_degree": "32", "intermediate_graph_degree": "128"}
+        "graph_degree": "32", "intermediate_graph_degree": "128",
+        "build_algo": "ivf_pq"}
 
 
 # ── NOTICE parser (two formats) ──────────────────────────────────────────────

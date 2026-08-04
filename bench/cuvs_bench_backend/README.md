@@ -27,9 +27,12 @@ the harness process's own VRAM (a second GPU tenant beside the daemon — every
 row logs `nvidia-smi memory.used`), and is measured as **host wall-clock per
 query, python dispatch included**. It exists so the integration tax can be read
 off two rows of one CSV instead of two runs. It shares `pgcuvs_cagra`'s build
-grid and sweep values exactly, and derives `itopk_size` by the extension's own
-rule (`src/cuvs_wrapper.cu:1122-1124`), because the comparison is only about the
-integration if everything else matches. It is **not** the same quantity as a
+grid and sweep values exactly, derives `itopk_size` by the extension's own rule
+(`src/cuvs_wrapper.cu:1122-1124`), and both arms pin `build_algo='ivf_pq'`
+(the reloption default is `auto`, a size heuristic that may pick nn_descent —
+so leaving it unset would let the two arms build their graphs with different
+algorithms). The comparison is only about the integration if everything else
+matches. It is **not** the same quantity as a
 kernel-time profile (`BENCHMARK.md` §1.1) and does not replace one. See ADR-084
 for what may and may not be said with these rows.
 

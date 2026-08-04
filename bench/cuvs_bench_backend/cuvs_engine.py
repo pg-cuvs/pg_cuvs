@@ -54,7 +54,7 @@ import time
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from sidecar import INTERMEDIATE_GRAPH_DEGREE  # noqa: E402
+from sidecar import CAGRA_BUILD_ALGO, INTERMEDIATE_GRAPH_DEGREE  # noqa: E402
 
 # The raw arm's algo name, and the sidecar key its ownership record lives under.
 # It is NOT a SQL relation (there is no pg_class row to cross-check), hence the
@@ -65,7 +65,11 @@ RAW_SIDECAR_KEY = "raw:cuvs"
 # Matches bench/legacy/anbench/run_cuvs.py: L2 on unit-norm vectors == cosine
 # ranking, which is what every SQL algo here uses (vector_l2_ops).
 METRIC = "sqeuclidean"
-BUILD_ALGO = "ivf_pq"
+
+# Imported, not restated: the SQL arm's DDL pins the same constant
+# (pg_engine._cagra_with). Two spellings of "the build algorithm both arms use"
+# is exactly the drift that would silently break the comparison.
+BUILD_ALGO = CAGRA_BUILD_ALGO
 
 
 # ── build config ─────────────────────────────────────────────────────────────

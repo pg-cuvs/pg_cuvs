@@ -27,8 +27,21 @@ from cuvs_engine import (  # noqa: E402
     itopk_for,
     validate_build_cfg,
 )
-from pg_engine import ALGOS, DEFAULT_SWEEPS, LATENCY_ALGOS, RAW_ALGOS  # noqa: E402
-from sidecar import BUILD_GRIDS, INTERMEDIATE_GRAPH_DEGREE  # noqa: E402
+from pg_engine import (  # noqa: E402
+    ALGOS,
+    DEFAULT_SWEEPS,
+    LATENCY_ALGOS,
+    RAW_ALGOS,
+    PgEngine,
+)
+from sidecar import (  # noqa: E402
+    BUILD_GRIDS,
+    CAGRA_BUILD_ALGO,
+    INTERMEDIATE_GRAPH_DEGREE,
+    expected_reloptions,
+    expected_source_reloptions,
+    reloptions_match,
+)
 
 
 # ── build config validation ──────────────────────────────────────────────────
@@ -124,7 +137,41 @@ def test_metric_matches_the_sql_arms():
     # vector_l2_ops on unit-norm vectors == cosine ranking; the raw arm must
     # rank the same way or its recall is not comparable.
     assert METRIC == "sqeuclidean"
-    assert BUILD_ALGO == "ivf_pq"
+
+
+def test_both_arms_pin_the_same_build_algo():
+    # The extension's reloption default is `auto` -- a size heuristic that may
+    # pick nn_descent -- so an unpinned SQL build could be a different graph
+    # than the raw one. The raw arm must not carry its own spelling of the
+    # pinned value either, or the two can drift apart silently.
+    assert BUILD_ALGO is CAGRA_BUILD_ALGO
+    assert CAGRA_BUILD_ALGO == "ivf_pq"
+
+
+def test_cagra_ddl_pins_build_algo():
+    # The pin has to reach the catalog, not just the config dict.
+    ddl = PgEngine._cagra_with({"graph_degree": 64,
+                                "intermediate_graph_degree": 128})
+    assert "build_algo='ivf_pq'" in ddl
+    assert "graph_degree=64" in ddl and "intermediate_graph_degree=128" in ddl
+    # ... including for a cell that names no degrees at all.
+    assert "build_algo='ivf_pq'" in PgEngine._cagra_with({})
+
+
+def test_reuse_gate_requires_the_pinned_build_algo():
+    # An index left on `auto` is not the index this harness asked for: the gate
+    # must reject it (-> rebuild) rather than reuse it under the wrong label.
+    cfg = {"graph_degree": 64, "intermediate_graph_degree": 128}
+    exp = expected_reloptions("pgcuvs_cagra", cfg)
+    assert exp["build_algo"] == "ivf_pq"
+    assert reloptions_match({"graph_degree": "64", "intermediate_graph_degree": "128",
+                             "build_algo": "ivf_pq"}, exp)
+    assert not reloptions_match({"graph_degree": "64",
+                                 "intermediate_graph_degree": "128"}, exp)
+    assert not reloptions_match({"graph_degree": "64", "intermediate_graph_degree": "128",
+                                 "build_algo": "nn_descent"}, exp)
+    # the 3I cell's source graph carries the same requirement
+    assert expected_source_reloptions(cfg)["build_algo"] == "ivf_pq"
 
 
 # ── row notes ────────────────────────────────────────────────────────────────
