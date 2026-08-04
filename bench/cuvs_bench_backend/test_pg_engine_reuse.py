@@ -11,7 +11,8 @@ reason if unreachable, per the constraint against faking evidence.
 
 The root cause of #78 is now known: nothing emptied `t`. `count(*)` needs no
 columns, so the planner answered it from the resident pg_cuvs index, whose
-unqualified scan returns zero rows -- see pg_engine._dump_78_evidence. The gate
+unqualified scan returns zero rows (product bug #141, not fixed here -- see
+pg_engine._dump_78_evidence for the measured evidence). The gate
 now counts with the index scan methods disabled;
 test_heap_row_count_is_not_answered_by_an_index below is that regression.
 
@@ -252,7 +253,7 @@ def test_load_corpus_verify_matches_when_chunked(eng, tmp_path, monkeypatch, cap
 class _IndexAnsweredCursor:
     """A cursor where a bare count(*) is answered by an index that returns no
     rows -- exactly what a resident pg_cuvs index does to `SELECT count(*)
-    FROM t` (src/pg_cuvs.c:3540-3542 returns false for an unqualified scan).
+    FROM t` (#141; src/pg_cuvs.c:3540-3542 returns false for an unqualified scan).
 
     Faked rather than built for real because reproducing it needs the pg_cuvs
     extension and a GPU daemon; the behaviour under test is the harness's, not

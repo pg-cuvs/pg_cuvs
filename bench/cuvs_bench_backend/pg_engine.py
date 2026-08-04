@@ -224,7 +224,7 @@ class PgEngine:
     # -- data ------------------------------------------------------------------
     def _dump_78_evidence(self, cur, got, n):
         """#78: count(*) intermittently reported 0 between configs. RESOLVED --
-        nothing was emptying the table.
+        nothing was emptying the table. Product-side cause tracked as #141.
 
         `SELECT count(*) FROM t` needs no columns, so the planner may answer it
         from ANY index on t, and it costed a pg_cuvs index at the table's full
@@ -248,7 +248,7 @@ class PgEngine:
         It stays because a genuinely short table is still possible, and then the
         state it prints is the evidence. NOTE: the underlying AM behaviour is a
         product bug -- `SELECT count(*)` silently returns 0 for any table
-        carrying a pg_cuvs index -- and is NOT fixed here."""
+        carrying a pg_cuvs index -- and is NOT fixed here. Tracked as #141."""
         cur.execute(
             "SELECT pg_relation_filenode('public.t'), "
             "       pg_relation_size('public.t'), "
@@ -271,7 +271,7 @@ class PgEngine:
 
         A bare `SELECT count(*) FROM t` is not a fact about the data: it needs
         no columns, so the planner may answer it from any index on t, and a
-        pg_cuvs index answers an unqualified scan with zero rows (see
+        pg_cuvs index answers an unqualified scan with zero rows (#141; see
         _dump_78_evidence). That made a corpus-integrity gate return "the table
         is empty" for a full table whenever a CAGRA index was resident, and the
         spurious reload that followed dropped the ANN indexes mid-sweep -- one
