@@ -341,6 +341,19 @@ class PgEngine:
                     "WHERE a.attrelid = 'public.t'::regclass AND a.attname = 'embedding'")
                 same_dim = cur.fetchone()[0] == dim
             if exists and same_dim:
+                # An ANN index left on `t` across a real reload is worse than
+                # useless. TRUNCATE + COPY keeps it correct by maintaining it
+                # one row at a time, which (a) ran past 15 minutes for 100k rows
+                # with a resident HNSW + CAGRA index (measured on the VM; every
+                # CAGRA insert is an IPC round trip to the daemon) and (b)
+                # leaves an index assembled by insertion while the sidecar still
+                # claims the bulk CREATE INDEX time of the previous one -- a
+                # build_time attached to an index it does not describe. Drop
+                # them and let the ownership gate rebuild. #78's TRUNCATE (over
+                # DROP TABLE CASCADE) still does its job: it preserves the index
+                # on the path that does NOT reload, which is the early return
+                # above and the only place preserving one was ever the point.
+                self._drop_ann_indexes()
                 cur.execute("TRUNCATE t")
             else:
                 if exists:

@@ -69,7 +69,7 @@ def _copy_count(captured_out):
     return captured_out.count("[engine] COPY ")
 
 
-def test_load_corpus_reuses_across_configs_and_preserves_index_on_forced_reload(
+def test_load_corpus_reuses_across_configs_and_drops_the_index_on_reload(
     eng, tmp_path, capsys,
 ):
     n, dim = 200, 8
@@ -89,7 +89,7 @@ def test_load_corpus_reuses_across_configs_and_preserves_index_on_forced_reload(
     # And an ANN index built on it, as a real sweep would before the next config
     # runs (backend.py's _index_present gate checks for this).
     eng.conn.execute(
-        "CREATE INDEX t_hnsw ON t USING hnsw (embedding vector_l2_ops) "
+        "CREATE INDEX t_hnsw_pgv ON t USING hnsw (embedding vector_l2_ops) "
         "WITH (m=16, ef_construction=64)")
 
     # When the next config's load_corpus call reuses the marker gate (no #78
@@ -99,7 +99,8 @@ def test_load_corpus_reuses_across_configs_and_preserves_index_on_forced_reload(
     # Then no COPY happened (reused) and the index is untouched.
     assert _copy_count(capsys.readouterr().out) == 0
     assert eng.conn.execute("SELECT count(*) FROM t").fetchone()[0] == n
-    assert eng.conn.execute("SELECT to_regclass('public.t_hnsw')").fetchone()[0] is not None
+    assert eng.conn.execute(
+        "SELECT to_regclass('public.t_hnsw_pgv')").fetchone()[0] is not None
 
     # Given #78 recurs: something empties `t` between configs (root cause still
     # open -- injected here directly, exactly what the marker gate must detect).
@@ -109,18 +110,26 @@ def test_load_corpus_reuses_across_configs_and_preserves_index_on_forced_reload(
     # When load_corpus runs for the next config.
     eng.load_corpus(corpus_path, n, dim, dataset="unit-test")
 
-    # Then it reloaded in place (TRUNCATE + COPY, not DROP TABLE ... CASCADE):
-    # exactly one real COPY happened, row count is restored, AND -- the actual
-    # #78 regression this fix targets -- t_hnsw is STILL PRESENT. The pre-fix
-    # code used `DROP TABLE t CASCADE` here, which would have destroyed t_hnsw
-    # and forced every remaining config in the sweep to rebuild it from scratch.
+    # Then it reloaded in place (TRUNCATE + COPY, not DROP TABLE ... CASCADE)
+    # and DROPPED the ANN index first.
+    #
+    # #78 originally asserted the opposite -- that t_hnsw survives this path --
+    # to avoid a "spurious rebuild". #98 measured what surviving actually costs:
+    # TRUNCATE empties the index too, so COPY refills it one row at a time, and
+    # at 100k rows with a resident HNSW + CAGRA index that COPY ran past 15
+    # minutes on the A100 VM (every CAGRA insert is an IPC round trip to the
+    # daemon) versus ~7 s with no index. Worse, the surviving index was
+    # assembled by insertion while the ownership sidecar still claimed the bulk
+    # CREATE INDEX time of the one before it -- a build_time describing an index
+    # that no longer exists. Dropping is both cheaper and honest.
+    #
+    # The preservation #78 wanted is still there, and is the case that mattered:
+    # the marker-gate hit above returns before any of this and leaves the index
+    # untouched.
     assert _copy_count(capsys.readouterr().out) == 1
     assert eng.conn.execute("SELECT count(*) FROM t").fetchone()[0] == n
-    assert eng.conn.execute("SELECT to_regclass('public.t_hnsw')").fetchone()[0] is not None
-    valid = eng.conn.execute(
-        "SELECT indisvalid FROM pg_index WHERE indexrelid = 'public.t_hnsw'::regclass"
-    ).fetchone()[0]
-    assert valid is True
+    assert eng.conn.execute(
+        "SELECT to_regclass('public.t_hnsw_pgv')").fetchone()[0] is None
 
 
 def test_load_corpus_force_reload_bypasses_marker_gate(eng, tmp_path, capsys):

@@ -216,10 +216,20 @@ def validate_segment(rows, expected_n, algo, build_params, recall_range=RECALL_S
     if keys != {build_params}:
         raise SegmentError(
             f"{algo}: rows carry build_params {sorted(keys)}, expected {build_params}")
-    reused = {str(r["reused"]) for r in rows}
-    if len(reused) != 1:
-        raise SegmentError(f"{algo} {build_params}: mixed reused flags {sorted(reused)}")
-    return (f"rows={len(rows)} reused={reused.pop()} "
+    # A healthy segment builds once and reuses that index for the rest of the
+    # sweep, so the reuse flags must read False?True* -- at most one build, and
+    # it first. (On --resume with the index already resident, every row is True.)
+    # A True followed by a False means the index was replaced mid-sweep, so the
+    # rows do not describe one index and the segment's build_time means nothing.
+    flags = [str(r["reused"]) == "True" for r in rows]
+    if flags != sorted(flags):
+        raise SegmentError(
+            f"{algo} {build_params}: index rebuilt mid-sweep (reused={flags})")
+    n_built = flags.count(False)
+    if n_built > 1:
+        raise SegmentError(
+            f"{algo} {build_params}: {n_built} builds in one segment")
+    return (f"rows={len(rows)} builds={n_built} "
             f"recall=[{min(float(r['recall']) for r in rows):.4f},"
             f"{max(float(r['recall']) for r in rows):.4f}]")
 

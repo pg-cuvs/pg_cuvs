@@ -25,10 +25,16 @@ def _row(param, recall=0.96, success=True, reused=False, build_params="{}"):
 
 
 # ── segment gate ─────────────────────────────────────────────────────────────
-def test_segment_ok_returns_a_summary():
-    rows = [_row(16), _row(32), _row(64)]
+def test_segment_ok_builds_once_then_reuses():
+    # the healthy shape: the first point builds the index, the rest sweep it
+    rows = [_row(16, reused=False), _row(32, reused=True), _row(64, reused=True)]
     s = runner.validate_segment(rows, 3, "pgcuvs_cagra", "{}")
-    assert "rows=3" in s and "reused=False" in s
+    assert "rows=3" in s and "builds=1" in s
+
+
+def test_segment_ok_when_resume_reuses_a_resident_index():
+    rows = [_row(16, reused=True), _row(32, reused=True)]
+    assert "builds=0" in runner.validate_segment(rows, 2, "pgcuvs_cagra", "{}")
 
 
 def test_segment_aborts_on_missing_rows():
@@ -54,11 +60,11 @@ def test_segment_aborts_when_rows_name_another_build():
         runner.validate_segment(rows, 1, "pgcuvs_cagra", '{"graph_degree":64}')
 
 
-def test_segment_aborts_when_the_index_changed_mid_sweep():
-    # half the sweep reused the index and half rebuilt it -> the rows do not
-    # describe one index, so the segment's build_time means nothing.
+def test_segment_aborts_when_the_index_was_replaced_mid_sweep():
+    # a reuse followed by a rebuild -> the rows do not describe one index, so
+    # the segment's build_time means nothing.
     rows = [_row(16, reused=True), _row(32, reused=False)]
-    with pytest.raises(runner.SegmentError, match="mixed reused"):
+    with pytest.raises(runner.SegmentError, match="rebuilt mid-sweep"):
         runner.validate_segment(rows, 2, "pgcuvs_cagra", "{}")
 
 
