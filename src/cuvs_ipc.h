@@ -238,6 +238,11 @@ typedef struct CuvsIndexStats {
     uint32_t search_mode;
     /* Phase 3L-9: coalesced brute_force micro-batch dispatches for this index */
     uint64_t bf_batch_count;
+    /* #133/ADR-083: searches where the 3O CAGRA prefilter returned a
+     * materially short fill (mean_returned<<k, a signal of anti-correlated
+     * filter collapse) and were retried on D-wedge (wire ABI extension —
+     * co-deploy daemon+extension) */
+    uint64_t prefilter_fallback_count;
     /* Phase 4C: streaming update and compaction counters */
     int64_t  n_extended;        /* vectors added via EXTEND since last build/compact */
     uint64_t compact_count;     /* cuvsCagraMerge compact ops since last build */

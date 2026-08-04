@@ -5810,6 +5810,7 @@ handle_stats(int client_fd, const CuvsCmdFrame *cmd)
         s->shard_count        = (uint32_t)e->shard_count;
         s->search_mode        = e->last_search_mode; /* Phase 3I-1 */
         s->bf_batch_count     = e->bf_batch_count;   /* Phase 3L-9 */
+        s->prefilter_fallback_count = e->prefilter_fallback_count; /* #133 */
         s->n_extended         = e->n_extended;
         s->compact_count      = e->compact_count;
         s->last_compact_at    = (int64_t)e->last_compact_at;
