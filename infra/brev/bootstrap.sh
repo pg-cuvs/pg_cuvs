@@ -174,6 +174,13 @@ sudo -u postgres psql -c "ALTER SYSTEM SET shared_preload_libraries='pg_cuvs'"
 sudo systemctl restart postgresql@16-main; sleep 3
 sudo -u postgres psql -c "ALTER SYSTEM SET cuvs.socket_path='/tmp/.s.pg_cuvs'"
 sudo -u postgres psql -c "ALTER SYSTEM SET cuvs.index_dir='$IDX'"
+# #119: the daemon runs as this script's own user (systemd unit's User=$(id -un)
+# below), so its uid is known here — set cuvs.daemon_uid so the backend verifies
+# the socket owner before connecting on every VM this bootstrap produces, not
+# only ones someone remembers to configure by hand. Default is -1 (off), so this
+# is additive: it does not change behavior on any existing deployment that
+# doesn't run this bootstrap.
+sudo -u postgres psql -c "ALTER SYSTEM SET cuvs.daemon_uid=$(id -u)"
 sudo -u postgres psql -c "SELECT pg_reload_conf()"
 # Run the daemon under systemd, not nohup. 34 playbooks and scripts in this repo
 # already say `systemctl restart pg-cuvs-server` / `journalctl -u pg-cuvs-server`
