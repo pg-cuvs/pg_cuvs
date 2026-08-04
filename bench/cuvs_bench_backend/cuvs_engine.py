@@ -283,7 +283,12 @@ class CuvsEngine:
             _, nbrs = cagra.search(sp, self._index, d_q[i:i + 1], k_search)
             cp.cuda.runtime.deviceSynchronize()
             lat.append(time.perf_counter() - t1)
-            ids[i] = cp.asnumpy(nbrs)[0, :kmax]
+            # copy_to_host() is a plain D2H memcpy on cuvs's returned
+            # device_ndarray. cupy.asnumpy() would instead compile a cast
+            # kernel at runtime, which needs the CUDA *headers*; the VM's
+            # cuvs_bench env ships the runtime without them, so that path
+            # failed every search while the build succeeded.
+            ids[i] = nbrs.copy_to_host()[0, :kmax]
         return ids, lat
 
     def search_batch(self, queries, kmax, param, warmup=2, repeats=1):
@@ -318,7 +323,7 @@ class CuvsEngine:
             _, nbrs = cagra.search(sp, self._index, d_q, k_search)
             cp.cuda.runtime.deviceSynchronize()
             times.append(time.perf_counter() - t0)
-        ids = np.asarray(cp.asnumpy(nbrs)[:, :kmax], dtype=np.int64)
+        ids = np.asarray(nbrs.copy_to_host()[:, :kmax], dtype=np.int64)
         return ids, float(np.median(times))
 
     # -- lifecycle ------------------------------------------------------------
