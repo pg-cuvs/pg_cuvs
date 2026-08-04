@@ -1,12 +1,22 @@
 # pg_cuvs 구현 로드맵
 
-상세 스펙은 [design/specs/phase-record.md](design/specs/phase-record.md), 설계 결정은 [design/decisions.md](design/decisions.md) 참조.
+현행 제품 계약은 [docs/doc-map.md](docs/doc-map.md), [docs/reference.md](docs/reference.md),
+[ARCHITECTURE.md](ARCHITECTURE.md)를 따른다. Phase 기록과 설계 결정은 역사·근거 문서다.
 
 ---
 
 ## 현재 상태
 
 ### 완료
+
+> 아래 표는 완료 시점의 역사적 증거를 보존한다. 현재 기본값, 지원 범위, release
+> readiness는 표의 문구가 아니라 아래 active sections와 current-state SSOT를 따른다.
+
+> **Current contract (2026-08-04):** extension version `0.5.0`,
+> `cuvs.filter_auto_threshold=0.0` (3O opt-in), and
+> `cuvs.stream_bf_selectivity_threshold=0.004` as the canonical-host operational
+> default. The historical completion rows below retain earlier values for provenance;
+> they are not current defaults or release evidence.
 
 | Phase | 내용 |
 |-------|------|
@@ -17,7 +27,7 @@
 | 3L | GPU brute force 검색 모드 (`.vectors` sidecar, `search_mode`/`bf_precision` GUC, micro-batching, sharded BF). installcheck GREEN, recall@10=1.0 (ADR-039). **deprecated path**: `cuvs.search_mode='brute_force'`는 `USING flat` AM으로 대체됨 (ADR-073) |
 | **flat AM (A1)** | **GPU exact brute-force 1급 AM** — `CREATE INDEX … USING flat (… vector_l2_ops) WITH (precision='float16')`. `.tids`+`.vectors`만 빌드(그래프 없음), recall=1.0, GUC 무관, 재시작 내구성. extension 0.4.0. installcheck **31/31 GREEN** + isolation **3/3 GREEN** + 재시작 내구성 검증(A100, 2026-06-14). `CUVS_FLAT_STARTUP_COST=50` 전용 비용. ADR-073; **ADR-071 흡수/supersede** |
 | 3M | 배치 검색 API (`CUVS_OP_SEARCH_BATCH`, `pg_cuvs_batch_search` SRF, CAGRA/BF/sharded 지원). installcheck GREEN, Q×K top-k 일치 (ADR-040) |
-| 3H-full | 운영 runbook 4종 추가 (capacity-planning, replica-bootstrap, release-upgrade, benchmark-runbook) + 기존 3H-light. TBD: streaming 물리복제 / cross-version upgrade 검증 |
+| 3H-full | 운영 runbook 4종 추가 (capacity-planning, replica-bootstrap, release-upgrade, benchmark-runbook) + 기존 3H-light. 완료 시점 후속: streaming 물리복제 검증. cross-version upgrade는 현재 `0.1.0→0.5.0` chain과 `test/sql/upgrade_path.sql`로 검증 |
 | 3B | DiskANN/NVMe cold tier — **NO-GO**. 재검토 조건: 1B+ 수요, **AiSAQ 레이아웃 포팅 착수 판단**, 또는 128GB+ VRAM. 재개 시 구현 방향 ADR-072(2026-07-24 개정) — cold tier는 vchord 공존이 아니라 자체 소유이며, 남의 구현을 링크하지 않고 **AiSAQ 인라인 PQ 레이아웃을 자체 직렬화 계층으로 포팅**한다. **"cuVS PQFlash stable"은 트리거에서 제거됨** — 대상(MS DiskANN C++)이 `cpp_main`으로 동결되었고, 더 근본적으로 남의 릴리스 일정에 재개 시점을 묶는 형태였다 |
 | 하드닝 | `index_dir` reloption — cross-session seqscan 폴백 근절. 인덱스가 빌드 디렉터리를 `pg_class.reloptions`에 self-describe (reloption > 세션 GUC > `$PGDATA` 3단계). installcheck GREEN, no-GUC 연결에서 Index Scan 실증 (ADR-045) |
 | 하드닝 | orphan artifact GC (`pg_cuvs_gc_orphans(do_delete)`) — 데몬-down DROP / DROP DATABASE / 재시작 좀비 재로드로 인한 VRAM+디스크 누수 근절. backend가 `index_dir`을 `pg_index`/`pg_database`와 대조(daemon은 sidecar라 카탈로그 불가). dry-run 기본. installcheck GREEN(gc_orphans) + 데몬-down e2e 검증. ADR-009 정정 반영 (ADR-046) |
@@ -33,6 +43,20 @@
 | 3Q | CAGRA Streaming Updates — `cuvsCagraExtend`(INSERT) + `cuvsCagraMerge`+cuvsFilter(DELETE/컴팩션) 실시간 인덱스 업데이트, .delta 경로 대체. VACUUM tombstone 연동(`cuvs_amvacuumcleanup`) 포함. INSERT/DELETE/UPDATE e2e · .delta 미생성 · vram_bytes 갱신 Scenario 6-8 PASS. installcheck 21/21 + isolation 2/2 GREEN (ADR-051) |
 | 4C | Background Compaction + CONCURRENTLY 정합성 — PG bgworker auto-REINDEX + 4 GUC(`cuvs.auto_compact` 외 3종) + `pg_stat_gpu_search`에 `extend_count`/`compact_count`/`last_compact_at` 관측성 컬럼 추가. REINDEX CONCURRENTLY+DELETE isolation 테스트(3/3 GREEN). extend_count→compact_count 갱신 e2e(auto_compact.sql). installcheck 22/22 + isolation 3/3 GREEN (ADR-050) |
 | 3C / 3D | GCS artifact snapshot + replica async warmup — manifest/checksum/version 기반 GCS upload(빌드 후 detached)/download(warmup cold-miss). unsharded + sharded(3G.2) 양쪽. fail-closed: corrupt(SHA256)/heap-incompat(relfilenode hard-reject)/cuVS-version(매니페스트 버전 게이트). 3D warmup 풀·cold 등록·cache-miss requeue·`pg_stat_gpu_search` warmup 컬럼. **인증**: A100에서 실 ephemeral GCS 버킷 round-trip(`make gpu-test-objstore`) — 업로드·warmup 하이드레이션 recall 일치·3종 fail-closed reject·버킷 생성/파괴 클린. installcheck 25/25 + isolation 3/3 GREEN (ADR-013/ADR-066). **비고**: 본체는 3F/3G 작업 중 배선됐으나 SSOT가 "미완료"로 뒤처진 reverse false-done이었음 — 실 GCS 검증 부재 + 매니페스트 빈틈(version 스탬프·base_generation) 보강 후 인증. emulator 기반 CI 회귀는 후속(트리거) |
+
+### Release readiness
+
+이 표는 구현 완료표가 아니라 현재 release 판단용 active 상태다. 이슈가 닫혔다는
+사실만으로 runtime evidence가 충족됐다고 간주하지 않는다.
+
+| Item | Status | Evidence / action |
+|------|--------|------------------|
+| [#124](https://github.com/pg-cuvs/pg_cuvs/issues/124) unguarded OOM injection dispatch | **BLOCKER** | [dispatch](src/pg_cuvs_server.c#L7541-L7546)이 release binary에도 노출되지 않는지 `CUVS_TEST_HOOKS` 경계와 cross-uid UDS 접근을 검증하기 전까지 차단 |
+| [#92](https://github.com/pg-cuvs/pg_cuvs/issues/92) Cohere benchmark artifact | **OPEN** | [`pg_cuvsbench_1m.csv`](bench/results/pg_cuvsbench_1m.csv)의 CAGRA `index_bytes=0`; [ledger caveat](bench/results/README.md#known-defects) 유지 또는 Cohere 재생성 |
+| [#88](https://github.com/pg-cuvs/pg_cuvs/issues/88) 3O correlation axis | **OPEN / UNVERIFIED** | [filter experiment](docs/experiments/filter-threshold-experiment.md)의 selectivity 결과를 spatial/anti-correlated 입력으로 일반화하지 않음 |
+| [#98](https://github.com/pg-cuvs/pg_cuvs/issues/98) four-way benchmark | **OPEN** | raw cuVS / pg_cuvs / HNSW / pgvector 동일 조건 비교 미완료 |
+| [#78](https://github.com/pg-cuvs/pg_cuvs/issues/78) benchmark corpus reload | **OPEN** | `load_corpus` 재복사 원인과 실행시간 영향 조사 중 |
+| [#74](https://github.com/pg-cuvs/pg_cuvs/issues/74) delta reader shared lock | **CODE RESOLVED / TEST GAP** | [reader](src/pg_cuvs.c#L3193-L3199)에 `LOCK_SH` 반영; 실제 byte-level overlap 회귀 증거는 별도 보강 필요 |
 
 ### 미완료
 
@@ -57,11 +81,11 @@
 
 ## 구현 순서
 
-> **원칙(2026-06-06)**: '완료' 표가 완료의 단일 진실이고, Phase 코드(`3A`/`3K` 등)가 안정적 식별자다. 살아있는 시퀀스에는 **미완 순차 작업만 트랙 이름으로** 둔다(번호 `Wave N`을 붙이지 않는다 — 완료할 때마다 renumber하면 같은 번호가 다른 걸 가리켜 꼬이므로). 완료 Phase는 시퀀스에서 제외(상세는 완료 표 + `design/specs/phase-record.md`). **분산·운영 하드닝 등 조건/트리거 항목은 '트리거 기반 백로그'로 분리**해 순차 경로와 섞지 않는다.
+> **원칙(2026-06-06)**: '완료' 표가 완료의 단일 진실이고, Phase 코드(`3A`/`3K` 등)가 안정적 식별자다. 살아있는 시퀀스에는 **미완 순차 작업만 트랙 이름으로** 둔다(번호 `Wave N`을 붙이지 않는다 — 완료할 때마다 renumber하면 같은 번호가 다른 걸 가리켜 꼬이므로). 완료 Phase는 시퀀스에서 제외(현행 상세는 current-state SSOT, `phase-record.md`는 역사 증거). **분산·운영 하드닝 등 조건/트리거 항목은 '트리거 기반 백로그'로 분리**해 순차 경로와 섞지 않는다.
 
 ### 릴리스 후 기능 (순차)
 
-> **3A Pending Delta는 완료**(완료 표 참조). streaming write(INSERT/UPDATE/DELETE) 후 REINDEX 없이 GPU+delta 병합으로 정합한 top-k를 반환한다. 3L `CuvsBfIndex`를 3A-2 GPU delta cache가 재사용. 상세 스펙·검증은 [design/specs/phase-record.md — Phase 3A](design/specs/phase-record.md), 결정은 ADR-047. **4A(빌드 오버헤드)·3R(빌드 파라미터 reloption)도 완료**(완료 표 참조; 4A=ADR-057/058/059, 3R=ADR-052), **3S(취소 전파)도 완료**(ADR-053), **D(exact filtered BF)도 완료**(ADR-063, 잔여 4항목 포함), **3O(CAGRA-first BITSET prefilter)도 완료**(ADR-048, PR #36/#37), **3Q(CAGRA Streaming Updates)도 완료**(ADR-051, installcheck 21/21), **4C(Background Compaction)도 완료**(ADR-050, installcheck 22/22 + isolation 3/3), **3C/3D(GCS snapshot + replica async warmup)도 완료·인증**(ADR-013/ADR-066, 실 GCS round-trip `make gpu-test-objstore`, installcheck 25/25 + isolation 3/3) — 기능 순차 경로 완료. **repo 공개 전 운영 하드닝 3종(fallback 관측성=PR #43 · VRAM budget 강제=ADR-065 해소 · OOM 후 재사용=PR #42)도 완료**. **MAX_INDEXES 하드월도 해소**(ADR-068, PR #45 — 소프트 LRU 캡 `--max-indexes` 기본 1024 + 슬롯-확보 auto-reload; PR #50 Tier-1 evict/reload 가드). **CI 2-tier도 구현·검증 완료**(ADR-067, PR #46–48/#50 — Tier 1 매 PR 자동 + Tier 2 UI 버튼 실 A100 26/26). README도 현재화 완료(Install/Requirements/Compatibility/Quickstart/Usage). 라이선스는 **PostgreSQL License**로 확정. **flat A1(`USING flat`)은 VM 검증 완료**(installcheck 31/31 + isolation 3/3 + 재시작 내구성, ADR-073, 2026-06-14). **flat B(transient)도 VM 검증 완료**(installcheck 32/32 + isolation 3/3, ADR-073, 2026-06-14; GUC `cuvs.gpu_bruteforce`(off/auto/on), CustomScan `CuvsTransientBF`, op 22). **B 라우팅 캘리브레이션도 측정 완료**(A100, ADR-069 루프): unfiltered top-k에서 B는 병렬 CPU seqscan 대비 교차점 없음(2–8× 느림) → `auto` plan-time 승격 안 함(regret-averse), B는 명시적 `on` 전용. **flat 성능 특성화·포지셔닝 수정도 완료**(ADR-074): A1 상주 read 1.09ms(CPU 559ms 대비 ~500x), 병목은 TOAST detoast(~535ms, 거리계산≈0=memory-bound), **transient B는 pgvector-무인덱스와 중복(잉여)**, A1 쓰기 ~13x. 포지셔닝 = 읽기多→A1·쓰기多→pgvector-무인덱스·B 보류. MVCC visibility 안전(**flat isolation 6/6 GREEN 검증 완료** — flat 변종 3종 스펙 추가, ADR-074). **flat A1/B + 특성화 + 코스트모델(ADR-075 물리분해+hw probe) 전부 완료. 다음 순차 = 엄밀 벤치마크 v3(진행 중) + 릴리스 준비(병행)**. **릴리스 준비 — `BENCHMARK.md` 공개 · 문서 정합성/현행화 · 운영 플레이북 완성**(아래 "릴리스 준비 — 문서·운영 정비" 절; "에코시스템 진입 계획" 전제조건 참조). **엄밀 벤치마크 v3**([design/benchmarks/protocol.md](design/benchmarks/protocol.md) **v3**, ADR-073/074/075 반영)는 **이미 착수·진행 중**이며, 살아있는 상태·다음-할-일의 SSOT는 **[bench/protocol/HANDOFF.md](bench/protocol/HANDOFF.md) §5**다(ROADMAP은 거시 순서만 보유). 현황: Stage A 물리 **partial**(exact-tier @10k/100k + 동시성 @1k–1M) · Stage C **동결 done**(캘리브레이션 freeze) · **Stage D 측정 완료**(2026-06-16, runs #30–#45: D1 Pareto·D2 필터·D3 증분 v1·D4 동시성·D8 storage·dim/auto·D6 cite — HANDOFF §5; 잔여=D1 iso-$ CPU arm·D3 v2 FIFO/upsert). 코스트모델은 데이터-이동 물리분해+하드웨어 probe로 **이미 구현**(ADR-075)이라 Stage B는 regret 보정 루프가 아니라 **물리-코스트 검증**(판별 플립·DEFAULT 폴백·exact-우선·`pg_cuvs_hw_profile()`). 결정면 = {cpu-seq/flat/cagra/ivfpq/transient-B}, HNSW=Ring A 경쟁자. **Stage D 순서(HANDOFF §5 재감사, value/effort Tier)**: Tier0 enabler — ✅`forced-ivfpq`+`pq_dim` build-knob 스윕(run #30/#31, A100; ivfpq iso-recall 0.9651) · `PGCUVS_STORAGE`→`bench.yml` 입력 · D4 `forced-flat`/`forced-transient-bf`+`sla_bounded_qps` · `auto` 엔진 · dim∈{8,384,768} → Tier1 재게시 — D8 TOAST/PLAIN · D1 $-Pareto + **VRAM-예산 셀(ivfpq vs cagra)** → Tier2 차별화 — D2 필터(pgvector `iterative_scan`+p99 · B filter-first) · Ring A(pgvectorscale/vchord) → Tier3 신규 하네스 — D3 증분(A1 13× 쓰기·W1/W2). 50M IVF-PQ는 forced-ivfpq 완료로 이제 runnable arm(vs vchordrq 0.9991/HNSW). RaBitQ 자작 양자화기는 별개 트랙(트리거 백로그, ADR-076). 논문 트랙 R1–R5 별도. 하네스 교훈: one-ahead 디스패치(gpu-singleton)·publish 덮어쓰기→`docs/data/` 통합.
+> **3A Pending Delta는 완료**(완료 표 참조). streaming write(INSERT/UPDATE/DELETE) 후 REINDEX 없이 GPU+delta 병합으로 정합한 top-k를 반환한다. 3L `CuvsBfIndex`를 3A-2 GPU delta cache가 재사용. 현행 상세 동작·검증은 [docs/reference.md](docs/reference.md)와 [ARCHITECTURE.md](ARCHITECTURE.md)를 따른다. 결정 근거는 ADR-047이며, `phase-record.md`는 역사 증거다. **4A(빌드 오버헤드)·3R(빌드 파라미터 reloption)도 완료**(완료 표 참조; 4A=ADR-057/058/059, 3R=ADR-052), **3S(취소 전파)도 완료**(ADR-053), **D(exact filtered BF)도 완료**(ADR-063, 잔여 4항목 포함), **3O(CAGRA-first BITSET prefilter)도 완료**(ADR-048, PR #36/#37), **3Q(CAGRA Streaming Updates)도 완료**(ADR-051, installcheck 21/21), **4C(Background Compaction)도 완료**(ADR-050, installcheck 22/22 + isolation 3/3), **3C/3D(GCS snapshot + replica async warmup)도 완료·인증**(ADR-013/ADR-066, 실 GCS round-trip `make gpu-test-objstore`, installcheck 25/25 + isolation 3/3) — 기능 순차 경로 완료. **repo 공개 전 운영 하드닝 3종(fallback 관측성=PR #43 · VRAM budget 강제=ADR-065 해소 · OOM 후 재사용=PR #42)도 완료**. **MAX_INDEXES 하드월도 해소**(ADR-068, PR #45 — 소프트 LRU 캡 `--max-indexes` 기본 1024 + 슬롯-확보 auto-reload; PR #50 Tier-1 evict/reload 가드). **CI 2-tier도 구현·검증 완료**(ADR-067, PR #46–48/#50 — Tier 1 매 PR 자동 + Tier 2 UI 버튼 실 A100 26/26). README도 현재화 완료(Install/Requirements/Compatibility/Quickstart/Usage). 라이선스는 **PostgreSQL License**로 확정. **flat A1(`USING flat`)은 VM 검증 완료**(installcheck 31/31 + isolation 3/3 + 재시작 내구성, ADR-073, 2026-06-14). **flat B(transient)도 VM 검증 완료**(installcheck 32/32 + isolation 3/3, ADR-073, 2026-06-14; GUC `cuvs.gpu_bruteforce`(off/auto/on), CustomScan `CuvsTransientBF`, op 22). **B 라우팅 캘리브레이션도 측정 완료**(A100, ADR-069 루프): unfiltered top-k에서 B는 병렬 CPU seqscan 대비 교차점 없음(2–8× 느림) → `auto` plan-time 승격 안 함(regret-averse), B는 명시적 `on` 전용. **flat 성능 특성화·포지셔닝 수정도 완료**(ADR-074): A1 상주 read 1.09ms(CPU 559ms 대비 ~500x), 병목은 TOAST detoast(~535ms, 거리계산≈0=memory-bound), **transient B는 pgvector-무인덱스와 중복(잉여)**, A1 쓰기 ~13x. 포지셔닝 = 읽기多→A1·쓰기多→pgvector-무인덱스·B 보류. MVCC visibility 안전(**flat isolation 6/6 GREEN 검증 완료** — flat 변종 3종 스펙 추가, ADR-074). **flat A1/B + 특성화 + 코스트모델(ADR-075 물리분해+hw probe) 전부 완료. 다음 순차 = 엄밀 벤치마크 v3(진행 중) + 릴리스 준비(병행)**. **릴리스 준비 — `BENCHMARK.md` 공개 · 문서 정합성/현행화 · 운영 플레이북 완성**(아래 "릴리스 준비 — 문서·운영 정비" 절; "에코시스템 진입 계획" 전제조건 참조). **엄밀 벤치마크 v3**([design/benchmarks/protocol.md](design/benchmarks/protocol.md) **v3**, ADR-073/074/075 반영)는 **이미 착수·진행 중**이며, 살아있는 상태·다음-할-일의 SSOT는 **[bench/protocol/HANDOFF.md](bench/protocol/HANDOFF.md) §5**다(ROADMAP은 거시 순서만 보유). 현황: Stage A 물리 **partial**(exact-tier @10k/100k + 동시성 @1k–1M) · Stage C **동결 done**(캘리브레이션 freeze) · **Stage D 측정 완료**(2026-06-16, runs #30–#45: D1 Pareto·D2 필터·D3 증분 v1·D4 동시성·D8 storage·dim/auto·D6 cite — HANDOFF §5; 잔여=D1 iso-$ CPU arm·D3 v2 FIFO/upsert). 코스트모델은 데이터-이동 물리분해+하드웨어 probe로 **이미 구현**(ADR-075)이라 Stage B는 regret 보정 루프가 아니라 **물리-코스트 검증**(판별 플립·DEFAULT 폴백·exact-우선·`pg_cuvs_hw_profile()`). 결정면 = {cpu-seq/flat/cagra/ivfpq/transient-B}, HNSW=Ring A 경쟁자. **Stage D 순서(HANDOFF §5 재감사, value/effort Tier)**: Tier0 enabler — ✅`forced-ivfpq`+`pq_dim` build-knob 스윕(run #30/#31, A100; ivfpq iso-recall 0.9651) · `PGCUVS_STORAGE`→`bench.yml` 입력 · D4 `forced-flat`/`forced-transient-bf`+`sla_bounded_qps` · `auto` 엔진 · dim∈{8,384,768} → Tier1 재게시 — D8 TOAST/PLAIN · D1 $-Pareto + **VRAM-예산 셀(ivfpq vs cagra)** → Tier2 차별화 — D2 필터(pgvector `iterative_scan`+p99 · B filter-first) · Ring A(pgvectorscale/vchord) → Tier3 신규 하네스 — D3 증분(A1 13× 쓰기·W1/W2). 50M IVF-PQ는 forced-ivfpq 완료로 이제 runnable arm(vs vchordrq 0.9991/HNSW). RaBitQ 자작 양자화기는 별개 트랙(트리거 백로그, ADR-076). 논문 트랙 R1–R5 별도. 하네스 교훈: one-ahead 디스패치(gpu-singleton)·publish 덮어쓰기→`docs/data/` 통합.
 
 ### 자원 거버넌스 하드닝 — 확정 버그 3개 (ADR-070, PR #54)
 
@@ -75,23 +99,34 @@
 
 대상: `src/pg_cuvs_server.c` · `src/cuvs_wrapper.{cu,h}` · `src/cuvs_wrapper_shim_cpu.c` · `src/pg_cuvs.c` · `.github/workflows/ci.yml`(ASAN) · `test/sql/{vram_accounting,build_lock,build_oom,build_multi_oom}.sql` | ADR-070
 
-### 릴리스 준비 — 문서·운영 정비 (순차)
+### 릴리스 준비 — 문서·운영 정비 (문서 계약 구현 완료; 증거·Pages 잔여)
 
-> repo가 PUBLIC이 된 지금, 외부 사용자·기여자·운영자가 **현행 제품을 ADR 발굴 없이** 이해·운용할 수 있어야 한다. 현 문서는 ADR 69개(`decisions.md` 214KB) + `phase-record.md`(1523줄) + 분산 design/docs로 **역사적 근거·작업메모 누적**에 가까워, 현재 제품의 기능·아키텍처·적용 기법·고려사항을 일목요연하게 볼 단일 reference가 없다(README가 유일 개요).
+> **상태 (2026-08-04):** `docs/doc-map.md`를 권한·갱신 규칙의 단일 계약으로 만들고,
+> current reference/architecture, README·벤치마크 caveat, 운영 playbook의 버전 드리프트를
+> 정리했다. `make docs-contract-check`가 이 표면의 CPU-only drift gate다. 남은 릴리스 작업은
+> #124 차단, 미완 benchmark/runtime evidence, 그리고 Pages 공개다.
 
-> **입력 자료**: [`docs/strategy/levers-and-governance.md`](docs/strategy/levers-and-governance.md) — 레버 카탈로그(GUC 34/reloption 11/데몬플래그 9, 소스 추출) + 표준 PG 레버 거버넌스(ADR-070 운영자 버전) + 세션 학습(PR#54) + **문서화 감사 결과(§5: 드리프트·미설명 레버·backport TODO 체크리스트)**. 아래 "문서 정합성/현행화"·"운영 플레이북"·"References"가 이 문서를 승격·소비한다.
+> **입력·근거 자료**: [`docs/strategy/levers-and-governance.md`](docs/strategy/levers-and-governance.md)는
+> 2026-06-11 감사 스냅샷이다. 현재 판단은 `docs/reference.md`, `ARCHITECTURE.md`,
+> `design/ops-gpu-playbook.md`, `docs/playbooks/`, GitHub issues, 그리고 아래 readiness 표를 따른다.
 
-- **문서 정합성/현행화 (current-state reference 정비)**
-  - `ARCHITECTURE.md`(신규): 현행 컴포넌트(확장 `.so` / sidecar 데몬 / shmem IPC), 데이터·제어 흐름, 인덱스 생애주기(build→serialize→load→evict→reload), VRAM 자기-회계, 멀티-GPU 샤딩, GCS 스냅샷.
-  - 기능/능력 reference: 현존 검색 모드·인덱스 AM(cagra/ivfpq/hnsw/BF)·GUC·reloption 일람 통합(현재 PLAN/ADR/README 분산).
-  - 적용 기법·고려사항 요약: 비자명 엔지니어링 — BITSET 극성 규약, rev-map prefilter(3O), fail-closed 계약, VRAM 자기-회계(ADR-065), delta/tombstone 병합, CPU-reference shim CI, false-done 방지 원칙.
-  - 문서 맵: ADR/PLAN = "역사적 근거", reference = "현행 SSOT"로 명확히 구분. drift(`requirements.md` 등) reconcile.
-  - **완료 기준**: 외부 기여자/사용자가 reference 문서군만으로 "무엇을·어떻게·왜"를 ADR 발굴 없이 파악. 문서 맵이 현행 vs 역사를 구분.
+- **문서 정합성/현행화 (current-state reference 정비) — 완료 (2026-08-04)**
+  - `docs/doc-map.md`와 `CLAUDE.md`가 현행 SSOT와 역사 문서의 경계를 정의한다.
+  - `docs/reference.md`와 `ARCHITECTURE.md`가 현재 표면·구조를 담당하고, README는 개요,
+    BENCHMARK와 결과 ledger는 측정·결함 상태를 담당한다.
+  - `requirements.md`, phase-record, 오래된 실험·감사 문서는 historical/superseded 상태를
+    표시하고 현재 문서·코드·이슈로 라우팅한다.
+  - **완료 기준 충족:** 외부 사용자는 reference 문서군과 doc-map으로 현재 계약을 찾고,
+    historical 문서의 과거 값을 shipping contract로 오인하지 않는다.
 
-- **운영 플레이북 완성 (`design/ops-gpu-playbook.md` 단일화)**
-  - 현황: ops-gpu-playbook(331줄)은 GPU 튜닝 + MIG만 다룸. `docs/playbooks/`에 3종(replica-bootstrap·capacity-planning·benchmark-runbook); **release-upgrade 런북 부재**.
-  - 작업: 운영 생애주기 전반 단일화 — 기동·모니터링(어느 `pg_stat_gpu_*` 뷰·임계값), 장애모드·복구(데몬 다운·VRAM OOM·fallback 급증·eviction 폭주), 업그레이드/롤백, 백업/복구(GCS 스냅샷), 스케일링·캐파, 인시던트 대응. 흩어진 런북을 ops-gpu-playbook로 연결.
-  - **완료 기준**: 신규 운영자가 플레이북만으로 배포→모니터→장애대응→업그레이드 수행 가능; 각 절차에 실 명령·뷰·임계값 포함.
+- **운영 플레이북 정합성 — 핵심 절차 완료; 환경별 검증 잔여**
+  - `design/ops-gpu-playbook.md`와 `docs/playbooks/`가 배포·모니터링·장애복구·업그레이드·
+    롤백·GCS·용량계획·벤치마크 절차를 나눈다. `release-upgrade.md`는 현재 0.5.0과
+    0.1.0→0.5.0 migration chain을 반영한다.
+  - `--max-vram-mb` 기본 90%, extension version, artifact caveat 같은 운영 계약은
+    source-backed 문구와 `make docs-contract-check`로 고정한다.
+  - 남은 환경별 검증(예: streaming physical replication, real GPU/host별 benchmark)은
+    해당 issue/runbook의 Unverified/Open 상태로 유지한다.
 
 - **GitHub org 이전 → `pg-cuvs/pg_cuvs` — repo transfer 완료 (2026-07-14)**
   - 결정: `ysys143/pg_cuvs` → **`pg-cuvs/pg_cuvs`** (org `pg-cuvs`, **My personal account 소유** — 법적 통제 주체는 개인, "business/institution" 아님. `team-pgcuvs`/`pgcuvs` 후보 검토 후 확정). org명 underscore 불가라 하이픈, repo는 `pg_cuvs` 유지(= `CREATE EXTENSION pg_cuvs`/`.so` 일치).
@@ -119,6 +154,10 @@
 
 순차 경로(릴리스 후 기능)와 섞지 않는다. 각 항목은 트리거가 충족될 때 순차 트랙으로 승격한다.
 
+> 이 백로그의 `phase-record.md` 스펙 링크는 감사·설계 provenance다. 현재 요구사항,
+> 기본값, 완료·release 판단은 `docs/doc-map.md`, current-state docs, 코드/테스트,
+> GitHub issue evidence를 따른다.
+
 ### 코스트 모델 v2 — Phase 3 (transient B 물리화 + `auto`) — 장비 블록
 
 > **블록(2026-06-15)**: Phase 1+2는 구현·VM 검증 완료(`feat/hw-profile`, ADR-075 Phase 2 구현절 — cagra/flat 물리 비용 + κ 앵커 + probe-bit 게이트). Phase 3는 **하드웨어 부재로 보류**. PCIe-attached A100에서는 transient B가 잉여(ADR-074: 매쿼리 H2D로 pgvector-무인덱스와 중복)라 `auto` 승격이 regret-positive — 진짜 이득은 **통합메모리(GH200 NVLink-C2C ~900GB/s / MI300A APU)**에서만 발생(매쿼리 H2D 페널티 붕괴).
@@ -129,13 +168,17 @@
 
 스펙: ADR-075(Phase 2 구현절·Phase 3 설계), ADR-074(B 거취), ADR-073(transient B).
 
-### flat 동시-쓰기 정합성 — `.delta` reader 공유 락 (트리거 없음 — 착수 가능)
+### flat 동시-쓰기 정합성 — `.delta` reader 공유 락 (코드 해결, 회귀 증거 보강 필요)
 
-> **D3 concurrent 노출(2026-06-17, run #57 `gha-27665874191`)**: `forced-flat`이 동시 insert+query에서 `delta sidecar unusable mid-scan`으로 FAILED(cagra는 98.7% 저하지만 생존, no-index 0%). 근본원인 = writer(`cuvs_delta_append`)는 `flock LOCK_EX`인데 scan-time delta reader가 **무락**이라 append 중간 상태를 torn-read. delta 머지 정확성은 이미 입증(ADR-047 isolation 2/2 + D3 recall-drift 1.0) — **가용성/race 버그**다.
+> [#74](https://github.com/pg-cuvs/pg_cuvs/issues/74)는 닫혔고, `src/pg_cuvs.c`의
+> scan-time reader에는 `LOCK_SH`가 반영됐다(커밋 `8034d32`). 따라서 락 추가는
+> active 구현 작업이 아니다. 다만 기존 `flat_delta_interleaving.spec`은 MVCC
+> visibility 순서만 검증하며, append 중간의 byte-level overlap을 의도적으로 만들지는
+> 않는다. 코드 해결과 회귀 증거를 구분해 기록한다.
 
-- **트리거**: 없음(릴리스 후 순차로 승격 가능, 소규모).
-- **작업**: (1) scan-time delta reader(`pg_cuvs.c:3101`)에 `flock(fd, LOCK_SH)` 추가 → 에러 대신 짧은 대기 후 정합 read("느려도 증분 굴러감"). delta 아키텍처·cap/세대 fail-closed 분기 불변. (2) pg_isolation_regress에 동시 INSERT+scan 정합 top-k 케이스(flat) 추가, flat 회귀펜스 GREEN 유지.
-- **검증**: D3 concurrent 재측정에서 flat이 FAILED→degradation%(slow-but-OK)로 전환. **resident-corpus 직접 append는 기각**(MVCC/rollback 오염 + `g_index_mutex` 직렬화 재도입 + 내구성 상실 — ADR-077 대안 기각).
+- **남은 증거 작업**: 실제 concurrent INSERT+scan에서 torn-read ERROR가 재발하지 않는
+  isolation/runtime 회귀를 추가한다.
+- **범위 밖**: resident corpus 직접 append, delta 아키텍처 변경, write-heavy 라우팅 변경.
 
 스펙: ADR-077(결정), ADR-047(delta/tombstone MVCC 토대), ADR-073(flat AM), ADR-074(write-heavy 라우팅 불변). 보고서: `docs/reports/2026-06-17-stage-d3-concurrent.md`.
 
@@ -192,11 +235,11 @@
 ### 기타
 
 #### 코드 헬스 / 리팩토링 (트리거: 해당 파일 손볼 때 또는 릴리스 후)
-복잡도/고아코드 정리 — 순서·결정·게이트는 [design/refactor-audit.md](design/refactor-audit.md) (2026-06-12 3-에이전트 감사 기반). 핵심: `handle_search`(934줄) 비-mutex 모드 추출 + preamble 단일화(`resolve_index_for_search`)는 안전→우선, **mutex dance는 영구 보류(주석만)**. Tier-1(dead symbols·EXTVERSION 0.1.0→0.3.0·고아 스크립트/문서·doc-map 보강)은 저위험 즉시.
+복잡도/고아코드 정리 — 순서·결정·게이트는 [design/refactor-audit.md](design/refactor-audit.md) (2026-06-12 3-에이전트 감사 기반). 핵심: `handle_search`(934줄) 비-mutex 모드 추출 + preamble 단일화(`resolve_index_for_search`)는 안전→우선, **mutex dance는 영구 보류(주석만)**. Tier-1(dead symbols·당시 EXTVERSION 0.1.0→0.3.0 불일치·고아 스크립트/문서·doc-map 보강)은 역사 감사 항목이며, 현재 버전 정합성은 `make docs-contract-check`가 검사한다.
 
 #### Streaming BF — sidecar-gather 경로 — **1차 구현 완료** (ADR-064)
 **왜**: VRAM을 초과하는 데이터셋에서 고선택성 필터 쿼리를 GPU로 처리하는 경로. 현재 GPU 검색은 인덱스 전체가 VRAM에 상주해야 동작 — VRAM 초과 시 OOM 또는 multi-GPU sharding만 가능.
-**구현**: `CUVS_OP_SEARCH_STREAM_BF` + `handle_search_stream_bf()`. 3O 역방향 맵(`heapTID → item_id`) 재활용 → 필터 통과 벡터만 `.vectors` sidecar에서 `pread`로 gather(전체 상주 없음) → `cuvs.stream_bf_chunk_vectors` 단위 청크 GPU BF → host running top-k 머지. `last_search_mode=6`(stream_bf). 자동 전환 GUC `cuvs.stream_bf_selectivity_threshold`(기본 0.0=off; 미만이면 stream, 3O보다 우선, 사이드카 부재 시 3O 폴백). 검증: `stream_bf_recall.sql`(강제 경로 + CPU exact 일치 + parity). installcheck 25/25 + isolation 3/3 GREEN.
+**구현**: `CUVS_OP_SEARCH_STREAM_BF` + `handle_search_stream_bf()`. 3O 역방향 맵(`heapTID → item_id`) 재활용 → 필터 통과 벡터만 `.vectors` sidecar에서 `pread`로 gather(전체 상주 없음) → `cuvs.stream_bf_chunk_vectors` 단위 청크 GPU BF → host running top-k 머지. `last_search_mode=6`(stream_bf). 자동 전환 GUC `cuvs.stream_bf_selectivity_threshold`(현재 기본 0.004; stream이 3O보다 우선, 사이드카 부재 시 3O 폴백). 단일 canonical host의 측정값이며, 2026-08-04 second-host 결과에서 crossover가 `<0.002`로 이동했으므로 보편 상수가 아니다. 호스트별 재보정 전까지는 명시적 운영값으로 취급한다. 검증: `stream_bf_recall.sql`(강제 경로 + CPU exact 일치 + parity). installcheck 25/25 + isolation 3/3 GREEN.
 **적소**: 고선택성 필터(필터 통과 비율 낮음) + VRAM 초과 데이터. 저선택성은 gather 비용이 이득을 상쇄.
 **제약**: 청크 크기 = 정확도 무관(running 머지는 임의 청킹에 exact) → GPU 잔여 조회 불필요, `cudaMemGetInfo` 미사용(ADR-065 준수). 고정 cap GUC.
 **후속(트리거)**: (1) mempool-aware 청크 auto-sizing(ADR-065 follow-up), (2) selectivity×Q 자동 라우팅(현재 수동 GUC), (3) VRAM 초과 대규모 스케일 실측(회귀 CI 밖).
@@ -232,9 +275,12 @@
 #### 필터검색 외부 검증 후속 — 3O recall-ceiling 리스크 + 라우팅 임계 + 벤치 방법론 (ADR-079)
 **왜**: GPU 필터검색 3-논문 분석(ADR-079). VecFlow(SIGMOD'26, cuVS 저자 Karsin/Chirkin)가 **글로벌 CAGRA 그래프 + prefilter(=우리 3O/ADR-048)가 recall ~80% 천장 + 매우 selective 필터서 ~0% 붕괴**함을 실측(작은 교집합이 그래프 연결성 파괴). D-wedge(exact GPU BF)는 cuVS(VecFlow IVF-BFS 26M QPS)·CPU(Fudan 벤치) 양쪽서 최적 확증.
 - **[최우선] 3O 리스크 벤치 arm**: "3O recall vs selectivity(교집합 축소 시 붕괴 여부)" 측정 → 확인 시 "매우 selective → D-wedge BF, 3O 아님" 라우팅 규칙 명문화. 저비용·고가치.
-- **라우팅 임계 재검토**: ADR-063 selectivity fraction(0.05) vs VecFlow 절대 candidate count(~1-2K points) 실측 비교.
+- **라우팅 임계 재검토**: 현재 `cuvs.filter_auto_threshold=0.0`은 3O opt-in이고
+  stream BF `0.004`는 canonical-host operational baseline이다. #88의 correlation axis와
+  host별 crossover 증거를 확보한 뒤 VecFlow의 절대 candidate count(~1–2K points)와 비교한다.
 - **벤치 방법론 채택**: matched-recall interpolation(recall 0.8/0.9/0.95 고정→QPS) + 3-family taxonomy(pre/post/hybrid) + 데이터셋 YFCC(192d, NeurIPS BigANN filtered 표준)/arXiv; correlation×selectivity + GPU + range를 우리 novelty로 명시(Fudan named gap 3종).
-**트리거**: 없음(D-wedge/3O·벤치 재개 시 순차 승격; 3O arm은 저비용). 홈 = `bench/protocol/HANDOFF.md §5`.
+**트리거**: #88 correlation-axis evidence와 D-wedge/3O 재검증이 남아 있다. 벤치 재개 시
+순차 승격하며, 현재 상태는 `ROADMAP.md` release-readiness 표와 `bench/protocol/HANDOFF.md §5`를 따른다.
 
 스펙: ADR-079 | ADR-048(3O) | ADR-063(D-wedge/threshold) | ADR-069(벤치)
 

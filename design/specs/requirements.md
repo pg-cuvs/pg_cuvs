@@ -18,6 +18,13 @@ Scope note:
 - 이 파일의 요구사항 중 일부는 Phase 3 또는 deferred enhancement로 남을 수 있으며,
   그런 경우 각 항목에 phase note를 둔다.
 
+> **Historical requirements, not the shipping contract.** For current behavior,
+> use [`docs/doc-map.md`](../../docs/doc-map.md), [`docs/reference.md`](../../docs/reference.md),
+> and [`ARCHITECTURE.md`](../../ARCHITECTURE.md). Several normative statements below
+> describe superseded or deferred designs, including JSON IPC, the postmaster-PID
+> socket path, daemon-side catalog access, fixed-only cost constants, and DiskANN.
+> Do not close an implementation or release decision from this file alone.
+
 ---
 
 ## 1. IPC 레이어 (ADR-002)
