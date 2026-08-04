@@ -141,7 +141,17 @@ def test_load_corpus_force_reload_bypasses_marker_gate(eng, tmp_path, capsys):
 def test_load_corpus_rejects_a_second_dataset_with_a_stale_marker(eng, tmp_path, capsys):
     """A marker keyed on a DIFFERENT dataset must not let a stale/foreign `t`
     be reused -- closes the gap in the pre-#78 code, which reused on a bare
-    `count(*) == n` with no dataset check at all."""
+    `count(*) == n` with no dataset check at all.
+
+    A -> B -> A is the actual #78 review F1 regression: the ORIGINAL fix kept
+    one marker row PER DATASET (PRIMARY KEY on `dataset`), so after A then B
+    (same n/dim) the marker table held BOTH rows even though `t` -- a single
+    table -- can only ever hold one of them. A third call for dataset-a would
+    then match its own still-present marker row and reuse `t`, which actually
+    holds dataset-b's vectors: a silent mis-attribution of B's data as A's
+    results. The fix makes the marker a singleton describing exactly what `t`
+    currently holds (delete-then-insert, not upsert-by-dataset), so step 3
+    below must reload, not reuse."""
     n, dim = 30, 4
     rng = np.random.default_rng(2)
     corpus_a = str(tmp_path / "a.fbin")
@@ -156,3 +166,67 @@ def test_load_corpus_rejects_a_second_dataset_with_a_stale_marker(eng, tmp_path,
     # right shape (dataset-a's data) -- must reload, not silently reuse.
     eng.load_corpus(corpus_b, n, dim, dataset="dataset-b")
     assert _copy_count(capsys.readouterr().out) == 1
+    assert eng.conn.execute(
+        "SELECT count(*) FROM public._bench_corpus"
+    ).fetchone()[0] == 1, "marker must hold at most one row -- t is one table"
+
+    # dataset-a again: the pre-fix code would find its OLD marker row still
+    # present (never deleted when dataset-b loaded) and wrongly reuse `t`,
+    # which actually holds dataset-b's vectors.
+    eng.load_corpus(corpus_a, n, dim, dataset="dataset-a")
+    assert _copy_count(capsys.readouterr().out) == 1, (
+        "must reload for dataset-a: t currently holds dataset-b's vectors")
+    assert eng.conn.execute(
+        "SELECT count(*) FROM public._bench_corpus"
+    ).fetchone()[0] == 1
+
+
+def test_load_corpus_reload_on_dim_change_does_not_truncate_wrong_typmod(
+    eng, tmp_path, capsys,
+):
+    """#78 review F4: TRUNCATE preserves the table's column type. If `t`
+    exists as vector(dim_old) and the new load needs a different dim, TRUNCATE
+    would leave a table COPY can't load into (typmod mismatch) -- must fall
+    back to DROP + CREATE, exactly like the pre-#78 DROP...CASCADE path did
+    for this case (there's no index worth preserving across a dim change: an
+    index built for the old dim doesn't apply to the new one)."""
+    rng = np.random.default_rng(3)
+    corpus_4d = str(tmp_path / "a4.fbin")
+    corpus_8d = str(tmp_path / "a8.fbin")
+    _write_fbin(corpus_4d, rng.standard_normal((20, 4)))
+    _write_fbin(corpus_8d, rng.standard_normal((20, 8)))
+
+    eng.load_corpus(corpus_4d, 20, 4, dataset="dim-test")
+    capsys.readouterr()
+
+    eng.load_corpus(corpus_8d, 20, 8, dataset="dim-test")
+    assert _copy_count(capsys.readouterr().out) == 1
+    typmod = eng.conn.execute(
+        "SELECT a.atttypmod FROM pg_attribute a "
+        "WHERE a.attrelid = 'public.t'::regclass AND a.attname = 'embedding'"
+    ).fetchone()[0]
+    assert typmod == 8
+    assert eng.conn.execute("SELECT count(*) FROM t").fetchone()[0] == 20
+
+
+def test_load_corpus_verify_matches_when_chunked(eng, tmp_path, monkeypatch, capsys):
+    """#78 review F3: above VERIFY_CHUNK rows, the post-COPY verify folds into
+    per-chunk digests on both the SQL and Python side instead of one
+    string_agg() over the whole table (which hits PostgreSQL's 1GB varlena
+    limit well before 50M rows). Force a tiny chunk size so this test actually
+    exercises the chunked path (and its id_offset bookkeeping) without a
+    multi-million-row corpus, and confirm it still verifies cleanly -- a
+    load_corpus() call that raises here means the chunked SQL and Python
+    fingerprints disagree."""
+    from pg_engine import PgEngine
+
+    monkeypatch.setattr(PgEngine, "VERIFY_CHUNK", 5)
+    n, dim = 23, 4  # deliberately not a multiple of the chunk size
+    rng = np.random.default_rng(4)
+    corpus_path = str(tmp_path / "corpus.fbin")
+    _write_fbin(corpus_path, rng.standard_normal((n, dim)))
+
+    eng.load_corpus(corpus_path, n, dim, dataset="chunk-test")
+
+    assert eng.conn.execute("SELECT count(*) FROM t").fetchone()[0] == n
+    assert "verified + stored" in capsys.readouterr().out
