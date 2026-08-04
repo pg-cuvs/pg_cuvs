@@ -9,11 +9,16 @@ touches. Needs a local PostgreSQL with pgvector reachable via psycopg defaults
 (PGDATABASE / PGHOST / etc, or edit TEST_DBNAME below); skips with a clear
 reason if unreachable, per the constraint against faking evidence.
 
-The root cause of #78 (what empties `t` at 1M scale) is still open (see
-pg_engine.py's #78 evidence dump). These tests inject the emptying directly
-(a manual TRUNCATE between load_corpus calls) to exercise the gate
-deterministically without waiting for a real recurrence -- mirroring the
-`force_reload` test hook load_corpus() also exposes.
+The root cause of #78 is now known: nothing emptied `t`. `count(*)` needs no
+columns, so the planner answered it from the resident pg_cuvs index, whose
+unqualified scan returns zero rows -- see pg_engine._dump_78_evidence. The gate
+now counts with the index scan methods disabled;
+test_heap_row_count_is_not_answered_by_an_index below is that regression.
+
+The tests that need a real reload still inject the emptying directly (a manual
+TRUNCATE between load_corpus calls) to exercise the gate deterministically
+without waiting for a genuine short table -- mirroring the `force_reload` test
+hook load_corpus() also exposes.
 """
 import os
 import struct
@@ -102,8 +107,9 @@ def test_load_corpus_reuses_across_configs_and_drops_the_index_on_reload(
     assert eng.conn.execute(
         "SELECT to_regclass('public.t_hnsw_pgv')").fetchone()[0] is not None
 
-    # Given #78 recurs: something empties `t` between configs (root cause still
-    # open -- injected here directly, exactly what the marker gate must detect).
+    # Given `t` really is short between configs -- injected directly here,
+    # exactly what the marker gate must detect. (The #78 field reports of this
+    # were not a short table at all; see the module docstring.)
     eng.conn.execute("TRUNCATE t")
     assert eng.conn.execute("SELECT count(*) FROM t").fetchone()[0] == 0
 
@@ -241,3 +247,72 @@ def test_load_corpus_verify_matches_when_chunked(eng, tmp_path, monkeypatch, cap
 
     assert eng.conn.execute("SELECT count(*) FROM t").fetchone()[0] == n
     assert "verified + stored" in capsys.readouterr().out
+
+
+class _IndexAnsweredCursor:
+    """A cursor where a bare count(*) is answered by an index that returns no
+    rows -- exactly what a resident pg_cuvs index does to `SELECT count(*)
+    FROM t` (src/pg_cuvs.c:3540-3542 returns false for an unqualified scan).
+
+    Faked rather than built for real because reproducing it needs the pg_cuvs
+    extension and a GPU daemon; the behaviour under test is the harness's, not
+    the AM's."""
+
+    TRUE_ROWS = 100000
+
+    def __init__(self):
+        self.gucs = {"enable_indexscan": "on", "enable_indexonlyscan": "on",
+                     "enable_bitmapscan": "on"}
+        self.log = []
+        self._result = None
+
+    def execute(self, sql, *_args):
+        self.log.append(sql)
+        if sql.startswith("SHOW "):
+            self._result = (self.gucs[sql.split()[1]],)
+        elif sql.startswith("SET "):
+            name, val = sql[4:].split(" = ")
+            self.gucs[name] = val
+            self._result = None
+        elif "count(*)" in sql:
+            # An index can serve a zero-column aggregate whenever any index
+            # scan method is enabled; here that index yields nothing.
+            served_by_index = any(v == "on" for v in self.gucs.values())
+            self._result = (0 if served_by_index else self.TRUE_ROWS,)
+        else:
+            self._result = None
+
+    def fetchone(self):
+        return self._result
+
+
+def test_heap_row_count_is_not_answered_by_an_index():
+    """The corpus gate asks a question about the heap, so its answer must not
+    depend on which scan method the planner picks.
+
+    Regression for the #98 Stage-1 rehearsal abort: with a CAGRA index resident,
+    the bare count(*) returned 0 for a full 100k-row table, the gate concluded
+    the corpus was gone and reloaded it, the reload dropped the ANN indexes
+    mid-sweep, and the segment recorded two builds for one build_cfg."""
+    eng = PgEngine.__new__(PgEngine)
+    cur = _IndexAnsweredCursor()
+
+    got = eng._heap_row_count(cur)
+
+    assert got == _IndexAnsweredCursor.TRUE_ROWS
+    # and the caller's planner settings are left exactly as they were found
+    assert cur.gucs == {"enable_indexscan": "on", "enable_indexonlyscan": "on",
+                        "enable_bitmapscan": "on"}
+
+
+def test_heap_row_count_restores_gucs_the_caller_had_turned_off():
+    """Restore, not RESET: a caller that deliberately disabled a scan method
+    must still have it disabled afterwards, or this helper silently changes how
+    a later measurement is planned."""
+    eng = PgEngine.__new__(PgEngine)
+    cur = _IndexAnsweredCursor()
+    cur.gucs["enable_indexscan"] = "off"
+
+    eng._heap_row_count(cur)
+
+    assert cur.gucs["enable_indexscan"] == "off"
