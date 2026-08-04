@@ -300,3 +300,188 @@ descriptor를 데몬에 넘기고, 데몬이 각 partial을 mmap해 **device 행
   bulk load 시 delta append + 주기적 COMPACT(또는 REINDEX)가 적합.
 - delta_rows=0 확인: EXTEND 성공 시 `.delta` 파일 경로를 완전히 건너뜀.
 - n_vecs ≠ row count: CAGRA 내부 그래프 노드 수는 입력 벡터 수와 다를 수 있음(내부 표현 차이).
+
+---
+
+## 11. Nsight 재측정 — 검색·빌드 경로 (#98 PR-E, 2026-08-04)
+
+§2/§6의 2026-06 수치는 **보존**한다. 이 절은 대체가 아니라 **다른 환경·다른 빌드
+파라미터에서의 새 측정**이며, 2026-06이 하지 못한 두 가지를 추가한다:
+(a) 빌드 경로의 nsys 캡처 성공, (b) 프로파일 오버헤드를 제거한 residual 산출.
+
+### 11.0 환경과 2026-06 대비 차이
+
+| 항목 | 2026-06 (§1) | 2026-08 (이 절) |
+|------|--------------|-----------------|
+| GPU | A100-SXM4-**40**GB (GCP) | A100-SXM4-**80**GB (Brev/massedcompute DGX, `pg-cuvs-item2b`) |
+| 데이터셋 | 1M × **1024** (Cohere 계열) | wiki_all_1M, 1M × **768** |
+| 빌드 파라미터 | 미고정(reloption 기본 `auto`) | **`graph_degree=32, intermediate_graph_degree=128, build_algo='ivf_pq'`** (#98이 고정) |
+| 검색 파라미터 | Q=1, k 미기록 | Q=1, **`cuvs.k=200`** (#98 1M run의 Pareto 점) |
+| nsys | 2023.4.4 | **2026.1.3.425-261338342291v0** |
+| 빌드 캡처 | **실패** (다중 스트림 qdstrm→nsys-rep "Wrong event order") | **성공 (1차 시도)** |
+
+**두 측정은 직접 비교 대상이 아니다.** dim(1024→768)과 `build_algo`가 모두 다르므로
+아래 수치는 2026-06 수치의 정정이 아니라 **다른 셀의 값**이다.
+
+**설치 경위 (재현용).** conda 경로는 두 이름 모두 실패했다 —
+`mamba create -n nsys_env -c nvidia nsight-systems` 및
+`... -c nvidia -c conda-forge nsight-systems-cli` 모두
+`does not exist (perhaps a typo or a missing channel)`. 폴백으로 **이미 등록돼 있던 NVIDIA
+CUDA apt 저장소**(`/etc/apt/sources.list.d/cuda-ubuntu2204-x86_64.list`)의
+`nsight-systems-2026.1.3`을 설치했다. 설치 위치는 `/opt/nvidia/nsight-systems/2026.1.3`,
+`/usr/local/bin/nsys` 심링크. `cuvs_dev` 환경은 건드리지 않았고 **ldconfig 등록도 없다**
+(gotcha #7 준수).
+
+**수동 기동 환경.** 유닛(`systemctl cat pg-cuvs-server`)에는 `Environment=` 라인이 **없고**,
+실행 중 데몬의 `/proc/<pid>/environ`에도 `LD_LIBRARY_PATH`가 없다. 바이너리에
+`RUNPATH=/opt/miniforge3/envs/cuvs_dev/lib`가 박혀 있어(`readelf -d`) 라이브러리가 해결되므로,
+**nsys 하 수동 기동에도 `LD_LIBRARY_PATH`를 주지 않았다** — 유닛과 동일 argv:
+
+```
+nsys profile --trace=cuda --output=/tmp/<label> \
+  /usr/lib/postgresql/16/bin/pg_cuvs_server \
+    --socket /tmp/.s.pg_cuvs --index-dir /tmp/cuvs_indexes --gpu-devices 0
+```
+
+소켓 생성 후 `chmod 666`(유닛의 ExecStartPost가 하는 일을 수동 대체), 워크로드 후
+**SIGTERM**으로 in-process finalize. 2026-06과 동일하게 `--duration`/SIGINT는 쓰지 않았다.
+
+### 11.1 프로파일 오버헤드 — residual 계산의 전제
+
+nsys의 CUDA 트레이싱은 **CPU측 wall-clock을 부풀린다.** 동일 워크로드를 프로파일 하/미하로
+각각 측정한 결과:
+
+| 측정 | 데몬 wall (`avg_latency_us`, 단건) | 비고 |
+|------|-----:|------|
+| nsys 하 | **4278.6 µs** | CUDA API 호출마다 트레이싱 비용 |
+| 미프로파일 (systemd 정상 기동) | **882.1 µs** | 305회 중 warmup 5회 제외 보정값 |
+
+**≈4.9× 부풀림.** 따라서 `residual = wall − kernel − memcpy`의 wall은 **미프로파일 값**을
+쓴다. GPU 커널/memcpy 시간은 CUPTI의 GPU측 타임스탬프라 트레이싱 영향이 없으므로 nsys 값을
+그대로 사용한다. **프로파일 하 wall로 residual을 내면 과대평가된다** — 이후 세션 주의.
+
+배치 경로는 반대로 거의 영향이 없다(디스패치당 CUDA 호출 수가 적어서):
+프로파일 하 928.1 QPS vs 미프로파일 885.8 QPS.
+
+### 11.2 검색 경로 분해 (단건, Q=1, `cuvs.k=200`)
+
+기저 차감법: 데몬은 기동 시 상주 인덱스를 H2D 로드하고 warm-up 빌드를 돌린다(3.2 GB memcpy +
+nn_descent 커널). 이를 검색 비용으로 오인하지 않도록 **워크로드 없는 baseline 캡처**를 따로 떠
+차감했다(`pg98_none` vs `pg98_singles`).
+
+| 구성요소 | 시간 (Q=1) | 비율 | 출처 |
+|----------|-----------:|------:|------|
+| **GPU 커널** | **459.4 µs** | **52.1%** | `cuda_gpu_kern_sum` 차분 / 305회 |
+| └ `multi_cta_search::search_kernel` | 446.0 µs | 50.6% | 312−7 = 305 instances |
+| └ `kern_topk_cta_11<8,2,256,64>` | 13.3 µs | 1.5% | 305 instances (k=200용 top-k) |
+| └ `set_value_batch_kernel` | 2.0 µs | 0.2% | 312−7 instances |
+| **memcpy** | **1.44 µs** | **0.16%** | `cuda_gpu_mem_time_sum` 차분 (915회, 1.36 MiB) |
+| **IPC + 오버헤드** | **421.3 µs** | **47.8%** | wall − kernel − memcpy |
+| **데몬 wall-clock** | **882.1 µs** | 100% | 미프로파일 `avg_latency_us` |
+
+**읽는 법:**
+- **memcpy는 여전히 무시 가능**(0.16%). 2026-06의 0.4% 결론이 다른 차원·다른 GPU에서도 유지된다.
+- **IPC 비중이 33%(2026-06) → 47.8%로 커졌다.** 커널이 빨라질수록(1024→768 차원) *GPU에 도달하는
+  비용*이 상대적으로 커진다는 §6-3의 방향을 강화한다. 커널:IPC ≈ 1.09:1.
+
+### 11.3 배치 경로 (`pg_cuvs_batch_search`, Q=2000, k=200)
+
+| 구성요소 | 디스패치당 | 쿼리당 | 비고 |
+|----------|-----------:|-------:|------|
+| GPU 커널 (`single_cta_search`) | **31.03 ms** | **15.5 µs** | 6회 디스패치 차분 |
+| memcpy | 0.264 ms | 0.13 µs | 30.0 MiB (질의 in + 결과 out) |
+| 데몬 wall | 40.19 ms | 20.1 µs | 미프로파일 `avg_latency_us` |
+| **클라이언트 왕복 wall** | **2257.8 ms** | 1128.9 µs | psycopg median, R=5 |
+
+- **쿼리당 GPU 커널이 단건 459.4 µs → 배치 15.5 µs로 29.6× 줄어든다.** AUTO 커널 분기가
+  실제로 갈린다: 단건은 `multi_cta_search`, 배치는 `single_cta_search`
+  (`cuvs_wrapper.cu:1116-1130` vs `:1211-1220`). 2026-06 §2의 "배치가 상각한다"를 정량 확인.
+- **그러나 배치 왕복의 98.2%는 GPU 밖에 있다.** 데몬은 2000쿼리를 40.19 ms에 끝내는데
+  클라이언트 왕복은 2257.8 ms다. 차이는 하네스 배치 SQL의
+  `JOIN t ON t.ctid = b.ctid` + `ORDER BY b.query_idx, b.distance` + **40만 행 마샬링**이다.
+  즉 #98이 보고한 배치 ~885 QPS는 **GPU가 아니라 PG측 행 구체화가 상한**이며, 결과 반환을
+  경량화하면 상당한 여유가 있다. (이 SQL 형태는 recall 검증을 위해 하네스가 선택한 것으로,
+  배치 커널 자체의 한계가 아니다.)
+
+### 11.4 빌드 경로 — **nsys 캡처 성공** (2026-06 미해결 항목)
+
+2026-06은 nsys 2023.4.4의 다중 스트림 변환 버그로 빌드를 캡처하지 못해 **journal 타임스탬프**로
+대체했다. nsys **2026.1.3에서는 1차 시도에 변환까지 성공**했으며, 에스컬레이션
+(`--sample=none`, N 축소, `nsys export`, 스트림 축소)은 **한 단계도 필요하지 않았다.**
+
+측정 대상: `CREATE INDEX t_cagra_nsys ON t USING cagra (embedding vector_l2_ops)
+WITH (graph_degree=32, intermediate_graph_degree=128, build_algo='ivf_pq')`, 1M × 768.
+`CREATE INDEX` 구간은 셸이 찍은 epoch 마커와 nsys의 `TARGET_INFO_SESSION_START_TIME.utcEpochNs`로
+**정확히 정렬**했다(폴링 횟수 추정 아님).
+
+| 구성요소 | 시간 | 비율 | 출처 |
+|----------|-----:|------:|------|
+| **PG backend + IPC** (heap scan + detoast + memfd fill) | **19.45 s** | **77.6%** | wall − GPU span |
+| **GPU 구간** (첫 커널 → 마지막 커널) | **5.62 s** | **22.4%** | nsys |
+| └ 커널 | 3.178 s | 12.7% | 53,017 instances |
+| └ memcpy | 2.192 s | 8.7% | H2D 3784 MiB(코퍼스) + D2H 4284 MiB(인덱스 직렬화) |
+| └ GPU idle(구간 내) | 0.235 s | 0.9% | host측 cuVS 오케스트레이션 |
+| **빌드 wall-clock** | **25.07 s** | 100% | `\timing` |
+
+상위 커널: `ivf_pq::compute_similarity_kernel` 1345 ms(8회),
+`cagra::graph::kern_prune` 971 ms(4회), `warpsort::block_kernel` 301 ms(31회).
+
+코퍼스 H2D가 **정확히 3개 파티션**(963.4 + 954.3 + 1012.0 MiB = 3072 MB = 1M×768×4B)으로
+관측돼 ADR-059의 `handle_build_multi` "3 partial(s), direct multi-H2D" 로그와 일치한다.
+
+**재현성**: 동일 캡처를 2회 떴고 커널 시간이 **3.182 s / 3.178 s**로 0.1% 내 일치했다
+(wall 25.34 s / 25.07 s).
+
+### 11.5 raw cuVS 교차검증 — 빌드 82% 명제는 **셀 의존적**
+
+같은 파라미터로 raw cuVS 빌드를 별도 프로세스에서 nsys 하에 측정했다:
+
+| 측정 | 값 |
+|------|----:|
+| raw cuVS `cagra.build` wall (python) | **5.94 s** |
+| pg_cuvs `CREATE INDEX` 내부 GPU 구간 (nsys) | **5.62 s** |
+| pg_cuvs `CREATE INDEX` wall | **25.07 s** |
+
+**raw 빌드 wall(5.94 s)과 pg_cuvs의 GPU 구간(5.62 s)이 독립 측정으로 일치한다.** 따라서 이 셀의
+GPU floor는 ~5.6–5.9 s이고, **나머지 ~19.1 s(76%)는 제거 대상인 PG backend 오버헤드**다.
+
+이는 §6-1/BENCHMARK §1.2의 "GPU build가 82%, backend가 18%"를 **뒤집는 것처럼 보이지만
+정정이 아니다.** 그 82%는 1M×**1024**에 `build_algo` 미고정(기본 `auto`) 셀의 값이고, 여기는
+1M×**768**에 **`ivf_pq` 고정** 셀이다. `ivf_pq`는 `nn_descent` 대비 GPU 비용이 훨씬 낮다
+(baseline 캡처의 warm-up 빌드가 `nn_descent` 커널을 쓰는 것과 대조된다). 결론은:
+
+> **"GPU floor가 빌드를 지배한다"는 명제는 `build_algo`·차원에 의존한다.** #98이 고정한
+> `build_algo='ivf_pq'` 셀에서는 **PG backend가 지배적(77.6%)**이며, ADR-057/058/059가 겨냥한
+> backend 최적화의 가치가 이 셀에서 **더 크다**.
+
+### 11.6 raw vs pg_cuvs 단건 — 커널은 거의 같다 (ADR-084 앵커 보강)
+
+| 구성요소 | raw cuVS | pg_cuvs AM |
+|----------|---------:|-----------:|
+| GPU 커널 | **429.5 µs** | **459.4 µs** |
+| └ `multi_cta_search` | 413.2 µs | 446.0 µs |
+| memcpy | 4.21 µs | 1.44 µs |
+| wall | 1412 µs (python, 미프로파일 CSV 환산) | 882.1 µs (데몬 내부) |
+
+**두 경로의 GPU 커널 시간은 7% 이내로 같다** — 같은 알고리즘·같은 파라미터이므로 기대대로다
+(인덱스 인스턴스가 달라 CAGRA 빌드가 비트동일하지 않은 데서 오는 차이). 여기서 wall 두 값은
+**측정 범위가 다르므로 직접 비교 금지**다: raw는 python 디스패치를 포함한 호스트 wall이고,
+pg_cuvs 값은 데몬 내부 wall(플래너·파서·힙 페치 제외)이다. 축을 맞춘 end-to-end 비교는
+BENCHMARK §2.1c(같은 CSV, 708.3 vs 580.5 QPS)에 있다.
+
+### 11.7 산출물과 재현
+
+프로파일 산출물은 VM `/tmp`에만 둔다(레포에 커밋하지 않음):
+`pg98_none` / `pg98_singles` / `pg98_batch` / `pg98_build` / `pg98_build2` / `pg98_raw`
+(`.nsys-rep` + `nsys stats`가 생성한 `.sqlite`).
+
+```bash
+# 기저 + 워크로드 캡처 (각각 별도 데몬 세션, SIGTERM finalize)
+bash pg98_nsys_search.sh pg98_none    none
+bash pg98_nsys_search.sh pg98_singles singles
+bash pg98_nsys_search.sh pg98_batch   batch
+# 빌드 (epoch 마커로 CREATE INDEX 구간 정렬)
+bash pg98_nsys_build.sh pg98_build2 ""
+# 집계
+nsys stats --report cuda_gpu_kern_sum,cuda_gpu_mem_time_sum /tmp/pg98_singles.nsys-rep
+```
