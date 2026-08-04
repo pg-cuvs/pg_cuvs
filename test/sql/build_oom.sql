@@ -25,7 +25,10 @@ CREATE EXTENSION IF NOT EXISTS vector;
 CREATE EXTENSION IF NOT EXISTS pg_cuvs;
 RESET client_min_messages;
 
-SET cuvs.index_dir = '/tmp/cuvs_indexes';
+-- #124: points at the CUVS_TEST_HOOKS test daemon (make installcheck-fault),
+-- not the production socket/index dir.
+SET cuvs.socket_path = '/tmp/.s.pg_cuvs_test';
+SET cuvs.index_dir = '/tmp/cuvs_indexes_test';
 
 -- Victim index: resident LRU candidate for the retry to evict.
 CREATE TABLE boom_a (id int, embedding vector(8));

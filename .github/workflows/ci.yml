@@ -153,6 +153,26 @@ jobs:
           make installcheck-tier1 || { echo "===== regression.diffs ====="; cat test/regression.diffs; false; }
           make installcheck-isolation || { echo "===== isolation diffs ====="; cat test/output_iso/regression.diffs 2>/dev/null; cat test/regression.diffs 2>/dev/null; false; }
 
+      # #124: build_oom/build_multi_oom/build_oom_evict_to_fit/extend_cuda_oom
+      # (REGRESS_FAULT, excluded from REGRESS_TIER1 above) call
+      # pg_cuvs_inject_{build,extend}_oom(), which reach the daemon's
+      # CUVS_OP_INJECT_* opcodes — compiled in only under -DCUVS_TEST_HOOKS
+      # (pg_cuvs_server.c), so the production shim daemon started above now
+      # rejects them ("unknown op"). `installcheck-fault` builds a separate
+      # $(SERVER_TEST_BIN) and runs these 4 against it on its own socket +
+      # index dir (see Makefile), so this is a second pass, not a substitute
+      # for the one above — both must be green.
+      - name: Fault-injection installcheck (CUVS_TEST_HOOKS daemon)
+        run: |
+          export PATH=/usr/lib/postgresql/16/bin:$PATH
+          export CCACHE_DIR="$GITHUB_WORKSPACE/.ccache/fault"
+          ccache --max-size=400M >/dev/null
+          ccache -z >/dev/null
+          make CC="ccache gcc" PGCUVS_CPU_SHIM=1 installcheck-fault \
+            || { echo "===== fault regression.diffs ====="; cat test/regression.diffs; \
+                 echo "===== fault daemon log ====="; cat /tmp/pg_cuvs_fault_daemon.log 2>/dev/null; false; }
+          echo "--- ccache stats: fault daemon ---"; ccache -s
+
       - name: MAX_INDEXES soft-LRU evict/reload (tiny-cap shim daemon)
         run: |
           export PATH=/usr/lib/postgresql/16/bin:$PATH
@@ -171,6 +191,7 @@ jobs:
             test/regression.diffs
             test/*.diffs
             /tmp/shim_daemon.log
+            /tmp/pg_cuvs_fault_daemon.log
           retention-days: 7
 
 # ── Tier 2 (real A100 regression) lives in .github/workflows/gpu.yml ───────

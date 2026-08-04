@@ -276,7 +276,48 @@ installcheck-isolation:
 installcheck-tier1:
 	$(pg_regress_installcheck) $(REGRESS_OPTS) $(REGRESS_TIER1)
 
-.PHONY: installcheck-isolation installcheck-tier1
+# ---- Fault-injection installcheck (CUVS_TEST_HOOKS daemon) ----------------
+# #124: REGRESS_FAULT needs the CUVS_OP_INJECT_* opcodes, which only exist in
+# a -DCUVS_TEST_HOOKS build (pg_cuvs_server.c) — the production daemon
+# rejects them ("unknown op"). Run REGRESS_FAULT against a dedicated
+# $(SERVER_TEST_BIN) on its own socket + index dir instead, mirroring the
+# test-daemon pattern `gpu-test-daemon` already uses
+# (infra/scripts/tests/integration-test.sh): the production pg-cuvs-server
+# daemon and its socket/index dir are never touched.
+#
+# Unlike installcheck-tier1, this does NOT try to point cuvs.socket_path/
+# cuvs.index_dir at the test daemon from here (e.g. via ALTER DATABASE) —
+# pg_regress drops and recreates its target database at the start of every
+# run (see pg_regress.c drop_database_if_exists/create_database), which would
+# silently wipe a pre-set ALTER DATABASE default before the tests ever ran.
+# Instead, each REGRESS_FAULT .sql file SETs cuvs.socket_path/cuvs.index_dir
+# to FAULT_SOCK/FAULT_IDX itself (session-level, first thing after CREATE
+# EXTENSION) — safe because these 4 files are reachable ONLY through this
+# target now (removed from REGRESS/REGRESS_TIER1 above).
+FAULT_SOCK = /tmp/.s.pg_cuvs_test
+FAULT_IDX  = /tmp/cuvs_indexes_test
+
+installcheck-fault: server-test
+	set -e; \
+	echo "[fault] starting CUVS_TEST_HOOKS daemon ($(SERVER_TEST_BIN)) on $(FAULT_SOCK)"; \
+	rm -f $(FAULT_SOCK); rm -rf $(FAULT_IDX); mkdir -p $(FAULT_IDX); chmod 0777 $(FAULT_IDX); \
+	./$(SERVER_TEST_BIN) --socket $(FAULT_SOCK) --index-dir $(FAULT_IDX) --max-vram-mb 20480 \
+		>/tmp/pg_cuvs_fault_daemon.log 2>&1 & \
+	DAEMON_PID=$$!; \
+	trap 'echo "[fault] cleanup"; \
+	      kill $$DAEMON_PID 2>/dev/null || true; wait $$DAEMON_PID 2>/dev/null || true; \
+	      rm -f $(FAULT_SOCK); rm -rf $(FAULT_IDX)' EXIT; \
+	for i in $$(seq 1 60); do \
+		[ -S $(FAULT_SOCK) ] && break; \
+		if ! kill -0 $$DAEMON_PID 2>/dev/null; then \
+			echo "[fault] test daemon died during startup"; cat /tmp/pg_cuvs_fault_daemon.log; exit 1; \
+		fi; \
+		sleep 0.5; \
+	done; \
+	test -S $(FAULT_SOCK) || { echo "[fault] test daemon socket never appeared"; cat /tmp/pg_cuvs_fault_daemon.log; exit 1; }; \
+	$(pg_regress_installcheck) $(REGRESS_OPTS) $(REGRESS_FAULT)
+
+.PHONY: installcheck-isolation installcheck-tier1 installcheck-fault
 
 .PHONY: installcheck-isolation
 
