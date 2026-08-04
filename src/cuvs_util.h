@@ -12,6 +12,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stddef.h>
+#include <stdbool.h>
 
 /* ----------------------------------------------------------------
  * Leveled logging macros (PG-free; stderr only).
@@ -54,6 +55,16 @@ cuvs_tid_decode(uint64_t tid, uint32_t *block, uint16_t *offset)
     *block  = (uint32_t)(tid >> 16);
     *offset = (uint16_t)(tid & 0xFFFF);
 }
+
+/* ----------------------------------------------------------------
+ * Fail-closed filter-frame gate (ADR-063 tenant isolation): a search
+ * request that names a TID whitelist (n_filter_tids > 0) but for which the
+ * whitelist itself is unavailable (bad/empty shm key, failed mmap, ...)
+ * must be refused rather than silently answered with unfiltered rows.
+ * Pure decision, no I/O -- callers keep their own status code for the
+ * refusal.
+ * ---------------------------------------------------------------- */
+bool cuvs_filter_frame_refuses(uint32_t n_filter_tids, bool filter_available);
 
 /* ----------------------------------------------------------------
  * Index filename parsing: "<db_oid>_<index_oid>.cagra"

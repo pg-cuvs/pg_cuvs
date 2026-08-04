@@ -964,6 +964,23 @@ test_lat_histogram(void)
     ASSERT(cuvs_lat_percentile(hist, CUVS_LAT_BUCKETS, 0.99) == 1024u, "skewed p99 -> 1024 (tail)");
 }
 
+/* #89 item 1: frame-level regression guard for the fail-closed filter
+ * refusal (ADR-063). A request naming a TID whitelist (n_filter_tids > 0)
+ * whose whitelist is unavailable must refuse, never fall through to
+ * unfiltered rows. */
+static void
+test_filter_refusal(void)
+{
+    ASSERT(cuvs_filter_frame_refuses(0, false) == false,
+           "no filter requested, unavailable -> no refusal");
+    ASSERT(cuvs_filter_frame_refuses(0, true) == false,
+           "no filter requested, available -> no refusal");
+    ASSERT(cuvs_filter_frame_refuses(5, false) == true,
+           "filter requested but unavailable -> fail closed");
+    ASSERT(cuvs_filter_frame_refuses(5, true) == false,
+           "filter requested and available -> no refusal");
+}
+
 static void
 test_metric_from_opclass(void)
 {
@@ -1109,6 +1126,7 @@ main(void)
     test_tombstone_format();
     test_lat_histogram();
     test_metric_from_opclass();
+    test_filter_refusal();
 #ifdef CUVS_TEST_HOOKS
     test_fault_hook();
 #endif

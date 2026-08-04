@@ -14,6 +14,15 @@
 #include <stddef.h>   /* offsetof (cuvs_hw_profile crc range) */
 
 /* ----------------------------------------------------------------
+ * Fail-closed filter-frame gate (ADR-063 tenant isolation).
+ * ---------------------------------------------------------------- */
+bool
+cuvs_filter_frame_refuses(uint32_t n_filter_tids, bool filter_available)
+{
+    return n_filter_tids > 0 && !filter_available;
+}
+
+/* ----------------------------------------------------------------
  * Index filename parsing: "<db_oid>_<index_oid>.cagra"
  * ---------------------------------------------------------------- */
 int
