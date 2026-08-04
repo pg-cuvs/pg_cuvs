@@ -11,7 +11,10 @@
 -- old evict-once path would still be OOM-armed on its single retry → hard fail.
 -- Each scenario creates its OWN >=2 resident victims so it holds standalone.
 --
--- REQUIRES: pg_cuvs_server running; cuvs.index_dir writable. Tier-1 CI (CPU shim).
+-- REQUIRES: a CUVS_TEST_HOOKS pg_cuvs_server_test daemon on the test socket +
+-- index dir below (`make installcheck-fault`, not `make installcheck` — #124:
+-- CUVS_OP_INJECT_BUILD_OOM only exists in a CUVS_TEST_HOOKS build; the
+-- production daemon rejects it). Tier-1 CI (CPU shim).
 --
 -- ENVIRONMENT-DEPENDENT (#89 item 2): on the CPU shim (Tier-1 CI) the OOM
 -- injection is deterministic, so this test is a stable pass. On real GPU —

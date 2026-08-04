@@ -8,8 +8,11 @@
 -- CREATE INDEX raises an error and ON_ERROR_STOP aborts the test. With the fix,
 -- the daemon evicts boom_a and the retry succeeds, so CREATE INDEX completes.
 --
--- REQUIRES: pg_cuvs_server running; cuvs.index_dir writable. Runs in Tier-1 CI
--- (CPU shim): cuvs_set_inject_build_oom is implemented in the shim too.
+-- REQUIRES: a CUVS_TEST_HOOKS pg_cuvs_server_test daemon on the test socket +
+-- index dir below (`make installcheck-fault`, not `make installcheck` — #124:
+-- CUVS_OP_INJECT_BUILD_OOM only exists in a CUVS_TEST_HOOKS build; the
+-- production daemon rejects it). Runs in Tier-1 CI (CPU shim):
+-- cuvs_set_inject_build_oom is implemented in the shim too.
 --
 -- ENVIRONMENT-DEPENDENT (#89 item 2): on the CPU shim (Tier-1 CI) the OOM
 -- injection is deterministic, so this test is a stable pass. On real GPU —

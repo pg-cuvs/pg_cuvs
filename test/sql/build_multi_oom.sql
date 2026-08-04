@@ -8,8 +8,11 @@
 -- + zero parallel costs make plan_create_index_workers grant a worker even for a
 -- tiny table, so cuvs_build_parallel -> CUVS_OP_BUILD_MULTI -> handle_build_multi.
 --
--- REQUIRES: pg_cuvs_server running; cuvs.index_dir writable. Tier-1 CI (CPU shim,
--- ASAN daemon — also guards the new reservation/retry against UAF/overflow).
+-- REQUIRES: a CUVS_TEST_HOOKS pg_cuvs_server_test daemon on the test socket +
+-- index dir below (`make installcheck-fault`, not `make installcheck` — #124:
+-- CUVS_OP_INJECT_BUILD_OOM only exists in a CUVS_TEST_HOOKS build; the
+-- production daemon rejects it). Tier-1 CI (CPU shim, ASAN daemon — also
+-- guards the new reservation/retry against UAF/overflow).
 --
 -- ENVIRONMENT-DEPENDENT (#89 item 2): on the CPU shim (Tier-1 CI) the OOM
 -- injection is deterministic, so this test is a stable pass. On real GPU —

@@ -550,7 +550,10 @@ LANGUAGE C VOLATILE STRICT;
 COMMENT ON FUNCTION pg_cuvs_inject_extend_oom(integer) IS
   'Test-only: arm (1) or disarm (0) synthetic OOM injection in cuvs_cagra_extend. '
   'When armed, the next extend throws bad_alloc, exercising _pr.poison() → '
-  'BUILD_FAILED → delta fallback. The flag self-clears on fire.';
+  'BUILD_FAILED → delta fallback. The flag self-clears on fire. '
+  '#124: the production daemon rejects this call (CUVS_OP_INJECT_EXTEND_OOM '
+  'is compiled in only under CUVS_TEST_HOOKS) — point cuvs.socket_path at a '
+  'pg_cuvs_server_test daemon (make installcheck-fault) to use it.';
 
 CREATE FUNCTION pg_cuvs_inject_build_oom(n_fail integer)
 RETURNS void
@@ -560,7 +563,10 @@ LANGUAGE C VOLATILE STRICT;
 COMMENT ON FUNCTION pg_cuvs_inject_build_oom(integer) IS
   'Test-only (ADR-070 Bug #3): arm synthetic OOM for the next n_fail '
   'cuvs_cagra_build calls in the daemon (0 = disarm), to exercise the build '
-  'evict-and-retry path. Each failing build decrements the counter.';
+  'evict-and-retry path. Each failing build decrements the counter. '
+  '#124: the production daemon rejects this call (CUVS_OP_INJECT_BUILD_OOM '
+  'is compiled in only under CUVS_TEST_HOOKS) — point cuvs.socket_path at a '
+  'pg_cuvs_server_test daemon (make installcheck-fault) to use it.';
 
 -- These five reach into daemon-global state (VRAM budget, a VRAM balloon, and the
 -- fault-injection counters used by the OOM regression tests). PostgreSQL grants
