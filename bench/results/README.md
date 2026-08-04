@@ -29,6 +29,7 @@ file exists so a link that lands directly on a CSV does not lose the context.
 | `cohere_N1000000_summary.csv`, `.jsonl` | 2026-06-01 | anbench `run_cohere.sh` | Cohere wiki-en, 1M×1024 | A100-SXM4-40GB | **superseded + known defect** — see below |
 | `gpu_resources_bench.csv` | 2026-06-01 | `bench/legacy/test_gpu_resources.py` | synthetic 100K×384 | A100 | VRAM budget / shard / fanout matrix — not re-audited |
 | `hnsw_import_bench.csv` | 2026-06-01 | 3I import harness | synthetic | A100 | CAGRA→HNSW import speedup — not re-audited |
+| `adr083_133_anti_after_fix.csv` | 2026-08-04 | `bench/filter_recall/adr079_3o_recall.py --correlations anti` | wiki_all_1M | Brev A100-SXM4-80GB | **canonical** — #133/ADR-083 fix verification: 3O recall on anti-correlated filter after the short-fill fallback, vs `adr079_3o_correlation.csv`/`_hisel.csv` (0.0 before, same harness/host) |
 
 ## Known defects
 
