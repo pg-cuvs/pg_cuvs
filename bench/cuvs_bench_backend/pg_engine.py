@@ -128,6 +128,14 @@ class PgEngine:
     # post-COPY verify folds into per-chunk digests + a rehash on both the SQL
     # and Python side instead of one aggregate over the whole table.
     VERIFY_CHUNK = 1_000_000
+    # pgvector build params (build() and build_time_arm.py's label both derive
+    # from these -- #78 review F8: a second hardcoded copy would drift silently).
+    HNSW_M = 16
+    HNSW_EF_CONSTRUCTION = 64
+
+    @staticmethod
+    def ivfflat_lists(n):
+        return max(1, int(4 * (n ** 0.5)))
 
     def __init__(self, dbname="postgres", index_dir=INDEX_DIR_DEFAULT):
         import psycopg
@@ -387,12 +395,12 @@ class PgEngine:
 
         if algo == "pgvector_hnsw":
             t0 = time.perf_counter()
-            c.execute("CREATE INDEX t_hnsw ON t USING hnsw (embedding vector_l2_ops) "
-                      "WITH (m=16, ef_construction=64)")
+            c.execute(f"CREATE INDEX t_hnsw ON t USING hnsw (embedding vector_l2_ops) "
+                      f"WITH (m={self.HNSW_M}, ef_construction={self.HNSW_EF_CONSTRUCTION})")
             return time.perf_counter() - t0, self._relsize("t_hnsw")
 
         if algo == "pgvector_ivfflat":
-            lists = max(1, int(4 * (n ** 0.5)))
+            lists = self.ivfflat_lists(n)
             t0 = time.perf_counter()
             c.execute(f"CREATE INDEX t_ivf ON t USING ivfflat (embedding vector_l2_ops) "
                       f"WITH (lists={lists})")
