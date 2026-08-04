@@ -132,6 +132,31 @@ def _vec_literal(v):
     return "[" + ",".join(repr(float(x)) for x in v.tolist()) + "]"
 
 
+def truncate_topk(rows, nq, top_k=10):
+    """(query_idx, id, distance) rows -> an (nq, top_k) id array.
+
+    The batch arm asks the daemon for K neighbours per query (K = the Pareto
+    point's cuvs.k, up to 400) and scores recall@10, so the top-10 cut happens
+    here, client-side. The SQL is ORDER BY query_idx, distance, so "the first
+    top_k rows of each query_idx" IS that query's top-10 -- this function must
+    not re-sort, or it would paper over a statement that lost its ordering.
+
+    Missing slots stay -1 (a query that returned fewer than top_k rows scores
+    those slots as misses rather than as some other query's neighbour).
+    """
+    ids = np.full((nq, top_k), -1, dtype=np.int64)
+    seen = [0] * nq
+    for qi, rid, _dist in rows:
+        qi = int(qi)
+        if not (0 <= qi < nq):
+            continue
+        s = seen[qi]
+        if s < top_k:
+            ids[qi, s] = rid
+            seen[qi] = s + 1
+    return ids
+
+
 # ── the engine ───────────────────────────────────────────────────────────────
 class PgEngine:
     """One connection, one table t; build() an index, then search() sweeps.
@@ -661,6 +686,109 @@ class PgEngine:
                 for j, r in enumerate(rows):
                     ids[i, j] = r[0]
         return ids, lat
+
+    # -- batch search (3M, throughput axis) ------------------------------------
+    #: GUC ceiling on one batch dispatch (src/pg_cuvs.c:994). Q must not exceed
+    #: it; the harness sets the GUC to the ceiling so Q=2000 has 2x headroom.
+    MAX_BATCH_QUERIES = 4096
+
+    BATCH_SQL = (
+        "SELECT b.query_idx, t.id, b.distance "
+        "FROM pg_cuvs_batch_search('t'::regclass, %s::vector[], %s) b "
+        "JOIN t ON t.ctid = b.ctid "
+        "ORDER BY b.query_idx, b.distance")
+
+    def _batch_gucs(self, cur):
+        cur.execute("SET enable_seqscan = off")
+        # The ctid join must be a Tid Scan; a hash join over the whole heap
+        # would still be correct but would time the heap, not the search.
+        cur.execute("SET enable_hashjoin = off")
+        cur.execute(f"SET cuvs.index_dir = '{self.index_dir}'")
+        cur.execute("SET cuvs.shard_count = 1")
+        cur.execute(f"SET cuvs.max_batch_queries = {self.MAX_BATCH_QUERIES}")
+
+    def batch_plan_guard(self, queries, k):
+        """EXPLAIN the batch statement. Returns (plan_text, seqscan: bool).
+
+        A Seq Scan here is a WARNING, not a failure (plan rev.4): the ctid join
+        returns the same rows either way, so only the timing's interpretation is
+        polluted -- unlike the latency axis, where a Seq Scan means the ANN index
+        was never consulted and the recall is a different quantity entirely.
+        """
+        with self.conn.cursor() as cur:
+            self._batch_gucs(cur)
+            cur.execute("EXPLAIN (FORMAT TEXT) " + self.BATCH_SQL,
+                        (self._vector_array(queries), int(k)))
+            plan = "\n".join(r[0] for r in cur.fetchall())
+        return plan, ("Seq Scan" in plan)
+
+    @staticmethod
+    def _vector_array(queries):
+        """The query block as a psycopg BIND PARAMETER (list of pgvector Vector).
+
+        Deliberate exception to this suite's same-statement-shape rule, and the
+        report says so in a footnote: 2000 x 1024 floats spelled as an inline
+        literal is a ~29 MB statement, so the parser -- not the search -- would
+        be what the batch arm measures.
+        """
+        from pgvector import Vector
+        return [Vector(q) for q in queries]
+
+    def batch_search(self, queries, k, top_k=10, warmup=2, repeats=10, chunks=1):
+        """One `pg_cuvs_batch_search` round trip per repeat over `queries`.
+
+        Returns (ids (nq, top_k), per_repeat_seconds, notes). `chunks` splits Q
+        into that many dispatches per repeat (the documented fallback when the
+        reply shm -- 8 + Q*K*12 bytes, no hard cap in the daemon -- cannot be
+        sized at the selected K); the split is merged back before truncation, so
+        the returned ids are the same shape either way and the note records that
+        the repeat was not a single round trip.
+        """
+        nq = len(queries)
+        notes = []
+        if chunks > 1:
+            notes.append(f"batch split into {chunks} dispatches (shm sizing)")
+        bounds = [(s, min(s + (nq + chunks - 1) // chunks, nq))
+                  for s in range(0, nq, (nq + chunks - 1) // chunks)]
+        params = [(self._vector_array(queries[a:b]), int(k)) for a, b in bounds]
+
+        with self.conn.cursor() as cur:
+            self._batch_gucs(cur)
+
+            def one_pass():
+                rows = []
+                for (a, _b), p in zip(bounds, params):
+                    cur.execute(self.BATCH_SQL, p)
+                    # query_idx is per dispatch; shift it back into the block's
+                    # own index space so a split repeat is indistinguishable
+                    # from an unsplit one downstream.
+                    rows.extend((qi + a, rid, d) for qi, rid, d in cur.fetchall())
+                return rows
+
+            for _ in range(warmup):
+                one_pass()
+            # repeats=0 is the shm pre-check: dispatch once (the warmup) to
+            # prove the reply buffer sizes at this K, and time nothing.
+            per_repeat, rows = [], []
+            for _ in range(repeats):
+                t0 = time.perf_counter()
+                rows = one_pass()
+                per_repeat.append(time.perf_counter() - t0)
+        return truncate_topk(rows, nq, top_k), per_repeat, notes
+
+    def fallback_count(self):
+        """Total CPU-fallback events the daemon has recorded so far.
+
+        The throughput arms gate on the DELTA of this being 0: the daemon's
+        listen() backlog is 32 while every request opens its own UDS connection,
+        so at N=64 an overflow could be absorbed as a silent CPU exact search --
+        which returns recall~=1.0 at high latency and would contaminate the row
+        rather than fail it.
+        """
+        with self.conn.cursor() as cur:
+            cur.execute("SELECT coalesce(sum(fallback_count), 0) "
+                        "FROM pg_stat_gpu_fallback")
+            return int(cur.fetchone()[0])
 
     def close(self):
         try:
