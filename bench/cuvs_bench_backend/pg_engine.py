@@ -47,6 +47,7 @@ from adr079_reuse import corpus_fingerprint  # noqa: E402
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from sidecar import (  # noqa: E402
     ALL_RELATIONS,
+    CAGRA_BUILD_ALGO,
     INTERMEDIATE_GRAPH_DEGREE,
     RELATION_OF,
     SIBLING_OF,
@@ -59,6 +60,16 @@ INDEX_DIR_DEFAULT = "/tmp/cuvs_indexes"
 
 ALGOS = ("pgvector_hnsw", "pgvector_ivfflat", "pgcuvs_cagra", "pgcuvs_hnsw_import")
 
+# The #98 latency axis also carries a non-Postgres algo, `cuvs` (raw cuVS CAGRA,
+# cuvs_engine.CuvsEngine). It is deliberately NOT in ALGOS: ALGOS is what
+# PgEngine.build() asserts against and what the standalone runners offer, and
+# PgEngine cannot build or search a raw index. It IS in DEFAULT_SWEEPS, which is
+# the harness-wide sweep table that both backend.py's loader and
+# run_pg_cuvsbench.py index by algo name (a missing entry there is a KeyError,
+# not a graceful skip).
+RAW_ALGOS = ("cuvs",)
+LATENCY_ALGOS = ALGOS + RAW_ALGOS
+
 # Default per-algo parameter sweeps (the recall/latency knob). Each value is one
 # point on that algo's recall-vs-latency curve; pg_cuvs CAGRA sweeps cuvs.k so
 # it gets a real curve rather than a single point.
@@ -67,6 +78,11 @@ DEFAULT_SWEEPS = {
     "pgvector_ivfflat":   [1, 4, 8, 16, 32, 64, 128],        # ivfflat.probes
     "pgcuvs_cagra":       [16, 32, 64, 100, 200, 400],       # cuvs.k
     "pgcuvs_hnsw_import": [16, 32, 64, 128, 256, 512],       # hnsw.ef_search
+    # Identical to pgcuvs_cagra's, and that identity is load-bearing: the raw
+    # arm exists to be compared with pgcuvs_cagra point for point within the
+    # latency axis, which only holds if both sweep the same knob over the same
+    # values. Change one and you must change the other.
+    "cuvs":               [16, 32, 64, 100, 200, 400],       # GPU candidate count
 }
 
 
@@ -573,16 +589,24 @@ class PgEngine:
 
     @staticmethod
     def _cagra_with(cfg):
-        """WITH(...) clause for a CAGRA build, or '' when cfg pins nothing.
+        """WITH(...) clause for a CAGRA build.
 
         intermediate_graph_degree must be >= graph_degree (src/pg_cuvs.c:1265),
         so both travel together or neither does.
+
+        build_algo is ALWAYS pinned, even when the cell names no degrees. The
+        reloption default is `auto` -- a corpus-size heuristic that chooses
+        ivf_pq or nn_descent -- while the raw arm (cuvs_engine) names its
+        algorithm outright. Left on `auto`, the two arms could be built by
+        different algorithms, and "same parameters except the integration"
+        would be an unverified claim rather than a fact of the DDL.
         """
         gd = cfg.get("graph_degree")
         if gd is None:
-            return ""
+            return f"WITH (build_algo='{CAGRA_BUILD_ALGO}')"
         igd = int(cfg.get("intermediate_graph_degree", INTERMEDIATE_GRAPH_DEGREE))
-        return f"WITH (graph_degree={int(gd)}, intermediate_graph_degree={igd})"
+        return (f"WITH (graph_degree={int(gd)}, intermediate_graph_degree={igd}, "
+                f"build_algo='{CAGRA_BUILD_ALGO}')")
 
     # -- search ----------------------------------------------------------------
     def search(self, algo, queries, kmax, param, warmup=200):

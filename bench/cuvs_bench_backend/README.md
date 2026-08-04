@@ -20,6 +20,21 @@ This backend exposes:
 | `pgvector_ivfflat` | pgvector CPU IVFFlat | `CREATE INDEX … USING ivfflat` (lists=4√N) | `ivfflat.probes` |
 | `pgcuvs_cagra` | pg_cuvs GPU CAGRA (resident) | `CREATE INDEX … USING cagra` | `cuvs.k` (GPU candidate list) |
 | `pgcuvs_hnsw_import` | pg_cuvs 3I: GPU CAGRA build → pgvector HNSW export | CAGRA build + `pg_cuvs_build_hnsw(cagra,'nsw')` | `hnsw.ef_search` (CPU search) |
+| `cuvs` | **raw cuVS CAGRA — no PostgreSQL** (`cuvs_engine.py`) | `cagra.build()` in-process, on the GPU | GPU candidate count (same values as `cuvs.k`) |
+
+`cuvs` is the odd one out and is meant to be: it runs no SQL, holds its index in
+the harness process's own VRAM (a second GPU tenant beside the daemon — every
+row logs `nvidia-smi memory.used`), and is measured as **host wall-clock per
+query, python dispatch included**. It exists so the integration tax can be read
+off two rows of one CSV instead of two runs. It shares `pgcuvs_cagra`'s build
+grid and sweep values exactly, derives `itopk_size` by the extension's own rule
+(`src/cuvs_wrapper.cu:1122-1124`), and both arms pin `build_algo='ivf_pq'`
+(the reloption default is `auto`, a size heuristic that may pick nn_descent —
+so leaving it unset would let the two arms build their graphs with different
+algorithms). The comparison is only about the integration if everything else
+matches. It is **not** the same quantity as a
+kernel-time profile (`BENCHMARK.md` §1.1) and does not replace one. See ADR-084
+for what may and may not be said with these rows.
 
 All use `vector_l2_ops` on L2-normalized vectors (L2-NN == cosine ranking). The
 table is `t(id bigint, embedding vector(dim))` with **id == corpus row index**,
@@ -31,6 +46,12 @@ prevents the recall==0 id-space bug seen in an earlier 50M run).
 - `pg_engine.py` — the engine: fbin load → COPY, per-algo `build()`,
   per-param `search()`, recall/percentiles. Factored from
   `bench/legacy/anbench/run_pg{,_3i}.py`. Runs standalone (see below) or under cuvs-bench.
+- `cuvs_engine.py` — the raw arm (`cuvs`): the same `load_corpus`/`build`/
+  `search`/`close` surface as `pg_engine`, backed by `cuvs.neighbors.cagra` on
+  device arrays instead of SQL. `cupy`/`cuvs` are imported lazily inside the
+  methods, so the module (and its tests) import on a CPU-only box. Also exposes
+  `search_batch()` — one dispatch over the whole query set — for the throughput
+  axis; nothing in the latency path calls it.
 - `backend.py` — the cuvs-bench integration: `PgBackend(BenchmarkBackend)` +
   `PgConfigLoader(ConfigLoader)` + `register()`. `build()`/`search()` delegate to
   `pg_engine` and return cuvs-bench `BuildResult`/`SearchResult` carrying **real
@@ -82,9 +103,20 @@ real embeddings (Cohere 1M×1024, legacy dataset — see `BENCHMARK.md` §2.1a) 
 (pgvector native ~237 s vs the GPU-accelerated CAGRA-build+conversion ~120 s, both from
 `bench/results/pg_cuvsbench_1m_legacy.csv`); much larger build ratios seen elsewhere come from
 **synthetic random data**, where pgvector's HNSW build hits its worst case, and
-are not representative. This backend reports **only end-to-end Postgres numbers**
-— raw library-level timings that exclude the Postgres path are not a pg_cuvs
-figure and are not used here.
+are not representative. **Headline numbers are end-to-end Postgres numbers** —
+a raw library timing is never the pg_cuvs figure and is never re-framed as one.
+
+Raw library timings ARE reported, under four conditions (ADR-084, which
+conditionally supersedes ADR-080 decision 2's blanket prohibition): they come
+from the **same process, same build parameters, and same CSV** as the SQL rows
+(the `cuvs` algo below); every row carries an `axis` label; they are cited
+**only** as an integration-tax anchor within the latency axis, or as the library
+mechanism within the throughput axis; and **no ratio crosses the two axes**. The
+prohibition existed because the raw number in circulation came from a different
+run, day and host than the SQL numbers — on this hardware even a 0%-GPU pgvector
+shows ~3.5× QPS spread between two same-model A100 hosts — so it could be
+neither subtracted nor divided. Producing both in one run is what removes that
+defect, not an exception to it.
 
 Queries are issued one statement at a time with the query vector as an **inline
 literal** (not a bind parameter) so every algo runs an identical statement shape

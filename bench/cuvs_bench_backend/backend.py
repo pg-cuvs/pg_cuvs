@@ -24,7 +24,12 @@ Design notes that matter:
 
 * One backend, several algos. cuvs-bench models a "backend" (how it runs) with
   one or more algos. Algos: pgvector_hnsw / pgvector_ivfflat / pgcuvs_cagra /
-  pgcuvs_hnsw_import (3I). See pg_engine.ALGOS.
+  pgcuvs_hnsw_import (3I) -- see pg_engine.ALGOS -- plus `cuvs`, the raw cuVS
+  CAGRA arm (#98), which runs no SQL at all. `cuvs` shares this backend so its
+  rows come from the same process, corpus, ground truth and CSV as the SQL rows;
+  it bypasses every relation-shaped check (there is no index in the database to
+  find) and is served by cuvs_engine.CuvsEngine. Read those rows only as a
+  latency-axis integration-tax anchor -- ADR-084.
 
 * Build reuse. The orchestrator creates a fresh backend per BenchmarkConfig and
   calls build() then search() for each. With one config per (algo, param) that
@@ -64,6 +69,12 @@ from pg_engine import (  # noqa: E402
     fbin_meta,
     percentiles_ms,
     read_fbin,
+)
+
+from cuvs_engine import (  # noqa: E402 -- lazy cupy/cuvs imports, safe on CPU
+    RAW_ALGO,
+    RAW_SIDECAR_KEY,
+    get_raw_engine,
 )
 
 from sidecar import (  # noqa: E402
@@ -132,7 +143,7 @@ class PgConfigLoader(ConfigLoader):
     flags. We accept:
         dataset       dataset name (label)
         dataset_path  dir holding corpus.fbin, queries_10k.fbin, gt_<n>.npy
-        algorithms    comma list from pg_engine.ALGOS
+        algorithms    comma list from pg_engine.LATENCY_ALGOS
         n             corpus rows to benchmark (table is built to this N)
         dim           vector dim
         dbname        Postgres db (default "postgres")
@@ -245,10 +256,35 @@ class PgBackend(BenchmarkBackend):
         """Algorithm name -- BenchmarkBackend requires this as a property."""
         return self.config["algo"]
 
-    def _eng(self):
+    @property
+    def is_raw(self):
+        """True for the non-Postgres arm (`cuvs`). See _engine_for()."""
+        return self.algo == RAW_ALGO
+
+    def _engine_for(self, algo):
+        """The engine that owns `algo`'s index.
+
+        `cuvs` is raw cuVS: no connection, no relation, and -- crucially -- an
+        index that lives in THIS PROCESS's memory, so it comes from a module
+        singleton rather than a per-config instance (cuvs_engine.get_raw_engine).
+        Every other algo is a Postgres algo and gets a PgEngine.
+        """
+        if algo == RAW_ALGO:
+            return get_raw_engine()
         if self._engine is None:
             self._engine = PgEngine(dbname=self.dbname, index_dir=self.index_dir)
         return self._engine
+
+    def _eng(self):
+        return self._engine_for(self.algo)
+
+    def _relation_key(self):
+        """The sidecar key this config's index is recorded under.
+
+        For the raw arm there is no relation, so a "raw:" sentinel key is used;
+        it is never passed to to_regclass or reloptions.
+        """
+        return RAW_SIDECAR_KEY if self.is_raw else RELATION_OF[self.algo]
 
     def _sidecar_path(self):
         # NOT index_dir -- that's the daemon's dir (not writable by us). Use a
@@ -293,6 +329,17 @@ class PgBackend(BenchmarkBackend):
         Returns (ok, reason) so a rejected reuse says why in the run log rather
         than silently costing a rebuild nobody can explain.
         """
+        if self.is_raw:
+            # The raw index is an in-process object, so the SQL half of this
+            # gate does not exist -- there is no relation and no reloptions to
+            # cross-check. The engine itself is the only truthful witness, and
+            # it must be the ONLY one consulted: a sidecar record survives a
+            # process restart that the GPU index does not, so honouring the
+            # record alone would attribute a stale build_time to an index that
+            # is gone.
+            if eng.has_index(self.build_cfg):
+                return True, "ok"
+            return False, "raw index not resident in this process"
         if not self._index_present(eng, algo):
             return False, "relation absent"
         if not sidecar_matches(side, algo, self.build_cfg):
@@ -325,7 +372,7 @@ class PgBackend(BenchmarkBackend):
                         dataset=self.config.get("dataset", "default"))
 
         side = self._read_sidecar()
-        entry = side.get(RELATION_OF[algo], {})
+        entry = side.get(self._relation_key(), {})
         if not force:
             ok, why = self._owns_index(eng, algo, side)
             if ok:
@@ -349,10 +396,16 @@ class PgBackend(BenchmarkBackend):
                                build_params=dict(cfg), metadata={}, success=False,
                                error_message=repr(e))
         # The build replaced/dropped other relations; record only what it owns
-        # now, and drop records for relations the build removed.
-        side = {k: v for k, v in side.items()
-                if eng.reloptions(k) is not None and k != RELATION_OF[algo]}
-        side[RELATION_OF[algo]] = ownership_record(algo, cfg, bt, ibytes, notice_meta)
+        # now, and drop records for relations the build removed. The raw entry
+        # is exempt from that pruning (it names no relation, so reloptions()
+        # would always report it absent) and a raw build prunes nothing: it
+        # touches no relation at all.
+        key = self._relation_key()
+        if not self.is_raw:
+            side = {k: v for k, v in side.items()
+                    if k.startswith("raw:")
+                    or (eng.reloptions(k) is not None and k != key)}
+        side[key] = ownership_record(algo, cfg, bt, ibytes, notice_meta)
         self._write_sidecar(side)
         return BuildResult(index_path=idx.file, build_time_seconds=bt,
                            index_size_bytes=ibytes, algorithm=algo,
@@ -377,8 +430,9 @@ class PgBackend(BenchmarkBackend):
                                 search_params=[{"param": param}],
                                 metadata={"dry_run": True}, success=True)
         queries = np.ascontiguousarray(read_fbin(dataset.query_file))[:nq]
+        eng = self._eng()
         try:
-            ids, lat = self._eng().search(algo, queries, k, param)
+            ids, lat = eng.search(algo, queries, k, param)
         except Exception as e:  # noqa: BLE001
             return SearchResult(neighbors=np.empty((0, 0), np.int64),
                                 distances=np.empty((0, 0), np.float32),
@@ -407,10 +461,18 @@ class PgBackend(BenchmarkBackend):
             # joins on (algo, build_params).
             metadata={"n_queries": nq, "algo": algo, "param": param,
                       "build_params": canonical_json(self.build_cfg),
-                      "axis": "latency"},
+                      "axis": "latency",
+                      # The raw arm is a second GPU tenant beside the daemon;
+                      # record what the device was holding when this point was
+                      # measured instead of leaving it to be reconstructed.
+                      "notes": eng.row_note() if self.is_raw else ""},
             success=True)
 
     def cleanup(self):
+        # Deliberately does NOT close the raw engine: the orchestrator calls
+        # cleanup() after every config, and the raw index lives in this
+        # process's GPU memory -- freeing it here would rebuild it once per
+        # sweep point. cuvs_engine.close_raw_engine() releases it at process end.
         if self._engine is not None:
             self._engine.close()
             self._engine = None

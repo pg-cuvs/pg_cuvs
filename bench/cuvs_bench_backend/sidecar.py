@@ -62,6 +62,14 @@ SOURCE_RELATION = "t_cagra"
 # which destroys the "M only" label the confounder split depends on.
 INTERMEDIATE_GRAPH_DEGREE = 128
 
+# CAGRA's build algorithm is pinned across every cell and both arms. It is NOT a
+# sweep dimension -- it is a variable being *removed*: the extension's reloption
+# default is `auto` (docs/reference.md:262), a size heuristic that picks ivf_pq
+# or nn_descent, while the raw arm names an algorithm outright. Leaving the SQL
+# side on `auto` would mean the two arms could be comparing different graphs, and
+# the raw arm's whole claim is that everything except the integration matches.
+CAGRA_BUILD_ALGO = "ivf_pq"
+
 BUILD_GRIDS = {
     "pgvector_hnsw": [{"m": m, "ef_construction": efc}
                       for m in (16, 32) for efc in (64, 128)],
@@ -71,6 +79,12 @@ BUILD_GRIDS = {
     "pgcuvs_hnsw_import": [{"mode": mode, "graph_degree": gd,
                             "intermediate_graph_degree": INTERMEDIATE_GRAPH_DEGREE}
                            for mode in ("nsw", "hnswlib") for gd in (32, 64)],
+    # Raw cuVS CAGRA (no Postgres). Same cells as pgcuvs_cagra by construction:
+    # the raw arm is only interpretable as an integration-tax anchor if its
+    # index is built with the parameters the SQL arm's index was built with.
+    "cuvs": [{"graph_degree": gd,
+              "intermediate_graph_degree": INTERMEDIATE_GRAPH_DEGREE}
+             for gd in (32, 64, 128)],
     # ivfflat is explicitly out of #98's 4-algo scope (pgvector's representative
     # curve is HNSW); kept buildable with a single cell so nothing crashes if a
     # caller asks for it.
@@ -149,8 +163,12 @@ def expected_reloptions(algo, build_cfg):
     if algo == "pgvector_hnsw":
         return {k: str(cfg[k]) for k in ("m", "ef_construction") if k in cfg}
     if algo == "pgcuvs_cagra":
-        return {k: str(cfg[k])
-                for k in ("graph_degree", "intermediate_graph_degree") if k in cfg}
+        exp = {k: str(cfg[k])
+               for k in ("graph_degree", "intermediate_graph_degree") if k in cfg}
+        # Pinned, not swept: an index left on the `auto` default is not the
+        # index this harness asked for, so it must fail the reuse gate.
+        exp["build_algo"] = CAGRA_BUILD_ALGO
+        return exp
     if algo == "pgcuvs_hnsw_import":
         exp = {"source": SOURCE_RELATION}
         if "mode" in cfg:
@@ -160,10 +178,17 @@ def expected_reloptions(algo, build_cfg):
 
 
 def expected_source_reloptions(build_cfg):
-    """reloptions the 3I cell's source t_cagra must carry (graph_degree etc.)."""
+    """reloptions the 3I cell's source t_cagra must carry (graph_degree etc.).
+
+    build_algo is pinned here too: the 3I export's quality is a property of the
+    source graph, so a source built by a different algorithm is a different
+    experiment.
+    """
     cfg = build_cfg or {}
-    return {k: str(cfg[k])
-            for k in ("graph_degree", "intermediate_graph_degree") if k in cfg}
+    exp = {k: str(cfg[k])
+           for k in ("graph_degree", "intermediate_graph_degree") if k in cfg}
+    exp["build_algo"] = CAGRA_BUILD_ALGO
+    return exp
 
 
 def reloptions_match(actual, expected):
