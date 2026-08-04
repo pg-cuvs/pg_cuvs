@@ -539,7 +539,9 @@ max_vram_mb (daemon 시작 플래그):
 > 수치이므로 위 pg_cuvs/pgvector 행과 직접 비교(비율 계산)하지 않는다.
 >
 > **주의 (baseline 정합)**: 위 285s는 이 섹션(anbench 하네스)의 개별 실측이다. 이후
-> `bench/results/pg_cuvsbench_1m.csv`(cuvs-bench 하네스, 종단 SQL, Cohere 1M×1024, ext 0.5.0)
+> `bench/results/pg_cuvsbench_1m_legacy.csv`(cuvs-bench 하네스, 종단 SQL, Cohere 1M×1024, ext
+> 0.5.0; 2026-08-04 #92 재정의로 `pg_cuvsbench_1m.csv`에서 개명 — 현 canonical은 wiki_all_1M,
+> `BENCHMARK.md` §2.1b)
 > 기준 pgvector native build는 **237s**로 별도 측정됐다 — 두 실측을 섞어서 비율 계산하지 말 것.
 > 그 하네스에서 apples-to-apples(동일 산출물=pgvector HNSW) build 가속은 CAGRA build+변환
 > 120s vs native 237s = **~2×**다.

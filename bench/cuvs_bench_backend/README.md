@@ -70,9 +70,9 @@ NOT re-scaled to a raw-kernel ratio by subtracting the shared floor. Two honest
 caveats when reading it: (1) searches are single-query and **serial**, so QPS is
 latency-bound; batch/concurrent clients would raise throughput (the GPU's
 strength, not measured here). (2) The build advantage is **data-dependent**: on
-real embeddings (Cohere 1M×1024) it is ~2× (pgvector native ~237 s vs the
-GPU-accelerated CAGRA-build+conversion ~120 s, both from
-`bench/results/pg_cuvsbench_1m.csv`); much larger build ratios seen elsewhere come from
+real embeddings (Cohere 1M×1024, legacy dataset — see `BENCHMARK.md` §2.1a) it is ~2×
+(pgvector native ~237 s vs the GPU-accelerated CAGRA-build+conversion ~120 s, both from
+`bench/results/pg_cuvsbench_1m_legacy.csv`); much larger build ratios seen elsewhere come from
 **synthetic random data**, where pgvector's HNSW build hits its worst case, and
 are not representative. This backend reports **only end-to-end Postgres numbers**
 — raw library-level timings that exclude the Postgres path are not a pg_cuvs
@@ -125,7 +125,7 @@ orchestrator, `Dataset`, `IndexConfig`, `BuildResult`/`SearchResult`, and
 python bench/cuvs_bench_backend/run_pg_cuvsbench.py \
   --data-dir ~/anbench/data --n 1000000 \
   --algos pgcuvs_cagra,pgvector_hnsw,pgcuvs_hnsw_import \
-  --k 10 --max-queries 2000 --out bench/results/pg_cuvsbench_1m.csv
+  --k 10 --max-queries 2000 --out bench/results/pg_cuvsbench_1m_legacy.csv
 ```
 
 Requires the pg_cuvs extension at **0.5.0** (a fresh `CREATE EXTENSION pg_cuvs`,
