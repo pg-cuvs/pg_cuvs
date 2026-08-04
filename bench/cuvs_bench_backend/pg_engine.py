@@ -595,7 +595,42 @@ class PgEngine:
 
         sample_query is accepted for call compatibility and unused: the unified
         0.5.0 export needs no dummy search.
+
+        Retries ONCE on a relation-name collision. `_build_once` already issues
+        DROP INDEX IF EXISTS immediately before CREATE INDEX, but that is a
+        check against what is *visible*, and an index being built by another
+        backend is not visible until it commits. #98's Stage-1 resume proof hit
+        exactly that: a run was SIGKILLed mid-CREATE INDEX, the killed client's
+        backend kept building and committed afterwards, and the resuming run
+        read `to_regclass -> NULL` ("relation absent"), dropped nothing, and
+        then collided:
+
+            UniqueViolation: duplicate key value violates unique constraint
+            "pg_class_relname_nsp_index"
+            Key (relname, relnamespace)=(t_hnsw_pgv, 2200) already exists
+
+        A UniqueViolation rather than a block is itself the evidence that the
+        other transaction had committed. On the retry the relation IS visible,
+        so the DROP does its job and the build proceeds -- turning a lost
+        resume cycle into a self-heal.
+
+        Only the name collision is retried. Every other build failure is a
+        real one and must surface, not be re-attempted.
+
+        The obvious alternative -- take a conflicting lock on `t` so the drop
+        waits out the in-flight build -- is not available here: locks need an
+        explicit transaction, and this connection is autocommit BECAUSE a cagra
+        build inside a transaction block corrupts the backend (see __init__).
         """
+        import psycopg
+        try:
+            return self._build_once(algo, n, sample_query, build_cfg, keep)
+        except (psycopg.errors.UniqueViolation,
+                psycopg.errors.DuplicateTable) as e:
+            print(f"[engine] WARN: {algo} build hit a relation-name collision "
+                  f"({e.__class__.__name__}); an index left by another backend "
+                  f"became visible after the pre-build drop. Re-dropping and "
+                  f"retrying once.", flush=True)
         return self._build_once(algo, n, sample_query, build_cfg, keep)
 
     def _build_once(self, algo, n, sample_query=None, build_cfg=None, keep=()):

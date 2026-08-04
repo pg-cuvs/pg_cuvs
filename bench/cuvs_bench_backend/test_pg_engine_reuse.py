@@ -317,3 +317,46 @@ def test_heap_row_count_restores_gucs_the_caller_had_turned_off():
     eng._heap_row_count(cur)
 
     assert cur.gucs["enable_indexscan"] == "off"
+
+
+def test_build_retries_once_on_a_relation_name_collision(monkeypatch):
+    """A build that collides on pg_class_relname_nsp_index retries once.
+
+    #98 Stage-1 resume proof: a run SIGKILLed mid-CREATE INDEX left a backend
+    that kept building and committed afterwards. The resuming run saw
+    `to_regclass -> NULL`, so its pre-build DROP was a no-op, and CREATE INDEX
+    then collided. Retrying re-runs the drop against a now-visible relation."""
+    psycopg = pytest.importorskip("psycopg")
+
+    eng = PgEngine.__new__(PgEngine)
+    calls = []
+
+    def fake_build_once(algo, n, sample_query=None, build_cfg=None, keep=()):
+        calls.append(algo)
+        if len(calls) == 1:
+            raise psycopg.errors.UniqueViolation(
+                'duplicate key value violates unique constraint '
+                '"pg_class_relname_nsp_index"')
+        return (12.5, 4096, {})
+
+    monkeypatch.setattr(eng, "_build_once", fake_build_once)
+
+    assert eng.build("pgvector_hnsw", 100) == (12.5, 4096, {})
+    assert len(calls) == 2, "expected exactly one retry"
+
+
+def test_build_does_not_retry_other_failures(monkeypatch):
+    """Only the name collision is retried -- any other build failure is real
+    and must surface on the first attempt rather than being re-run."""
+    eng = PgEngine.__new__(PgEngine)
+    calls = []
+
+    def fake_build_once(algo, n, sample_query=None, build_cfg=None, keep=()):
+        calls.append(algo)
+        raise RuntimeError("GPU out of memory")
+
+    monkeypatch.setattr(eng, "_build_once", fake_build_once)
+
+    with pytest.raises(RuntimeError, match="GPU out of memory"):
+        eng.build("pgcuvs_cagra", 100)
+    assert len(calls) == 1, "a genuine failure must not be retried"
