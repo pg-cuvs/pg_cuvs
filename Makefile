@@ -294,6 +294,11 @@ installcheck-tier1:
 # to FAULT_SOCK/FAULT_IDX itself (session-level, first thing after CREATE
 # EXTENSION) — safe because these 4 files are reachable ONLY through this
 # target now (removed from REGRESS/REGRESS_TIER1 above).
+#
+# The daemon binds the socket 0660 (pg_cuvs_server.c); this target runs the
+# daemon as the calling (non-postgres) OS user, so it needs the same chmod
+# 666 widening the production systemd unit and the Tier-1 CI shim daemon do
+# — otherwise the postgres-owned backend gets EACCES on connect().
 FAULT_SOCK = /tmp/.s.pg_cuvs_test
 FAULT_IDX  = /tmp/cuvs_indexes_test
 
@@ -315,6 +320,7 @@ installcheck-fault: server-test
 		sleep 0.5; \
 	done; \
 	test -S $(FAULT_SOCK) || { echo "[fault] test daemon socket never appeared"; cat /tmp/pg_cuvs_fault_daemon.log; exit 1; }; \
+	chmod 666 $(FAULT_SOCK); \
 	$(pg_regress_installcheck) $(REGRESS_OPTS) $(REGRESS_FAULT)
 
 .PHONY: installcheck-isolation installcheck-tier1 installcheck-fault
