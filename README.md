@@ -129,7 +129,19 @@ Implemented on GCP (NVIDIA A100-40GB × 2, PostgreSQL 16), VM E2E verified:
 - [x] Multi-GPU sharding (`shard_count`), GCS snapshot restore (Phase 3G)
 - [x] MIG verified (no code changes needed)
 
-Benchmark results — **real embeddings, Cohere Wikipedia 1M×1024, end-to-end SQL, measured inside NVIDIA's cuvs-bench** (A100-40GB, ext 0.5.0; raw: [`bench/results/pg_cuvsbench_1m.csv`](bench/results/pg_cuvsbench_1m.csv)). **Known artifact caveat:** this Cohere CSV predates #73/#75 and reports `index_bytes=0` for CAGRA; recall/QPS/latency/build-time fields are unaffected, and the result must be read with the [benchmark caveat](BENCHMARK.md) and [provenance ledger](bench/results/README.md).
+Benchmark results — canonical dataset is **wiki_all_1M (1M×768, the cuvs-bench standard
+dataset)**, end-to-end SQL, measured inside NVIDIA's cuvs-bench: at matched recall≈0.95,
+CAGRA is **~5.4× faster** than pgvector HNSW (see [`BENCHMARK.md` §2.1b](BENCHMARK.md);
+raw: [`bench/results/pg_cuvsbench_wiki1m_brev.csv`](bench/results/pg_cuvsbench_wiki1m_brev.csv)).
+
+The table below is the **legacy** real-embedding run — **Cohere Wikipedia 1M×1024**
+(A100-40GB, ext 0.5.0; raw:
+[`bench/results/pg_cuvsbench_1m_legacy.csv`](bench/results/pg_cuvsbench_1m_legacy.csv)).
+Its ratios (search ~4.5×, build ~2×) remain valid as a same-run comparison; it is kept
+for provenance, not as the primary citation. **Known artifact caveat:** this CSV predates
+#73/#75 and reports `index_bytes=0` for CAGRA; recall/QPS/latency/build-time fields are
+unaffected, and the result must be read with the [benchmark caveat](BENCHMARK.md) and
+[provenance ledger](bench/results/README.md).
 
 | Path | Build | p50 @ recall≈0.99 | QPS | vs pgvector |
 |------|------:|------------------:|----:|-------------|
