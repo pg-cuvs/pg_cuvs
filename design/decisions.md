@@ -2969,6 +2969,45 @@ Fresh-DiskANN 기반 실시간 갱신과 속성 필터 훅을 표방한다 — �
 
 **업계 선례 — EDB pgpu / VectorChord** (2026-06-14 비교): pgpu(EnterpriseDB, Rust/pgrx, AGPL-3.0, v2.0.0)는 cuVS **k-means centroid만** GPU로 계산해 vchord external-build에 넘기는 "GPU 빌드 가속기"다 — 검색은 vchord(CPU). 즉 우리 3I/방향 3과 같은 "GPU 빌드 → CPU 서빙" 철학의 상용 선례이나 **인덱스 계열이 IVF로 다르고 Vamana/PQFlash와 무관**하므로 DiskANN 구현 참조 가치는 없고(난관=cuVS #1501 PQFlash serializer), 전략 패턴 검증 의미만 있다. EDB의 다른 GPU 자료(spark-rapids-tutorial)는 OLAP를 외부 Spark+RAPIDS로 오프로드하는 튜토리얼로 벡터 검색과 무관. 요지: **EDB 노선 = GPU build/analytics 오프로드, in-Postgres GPU search 부재** → pg_cuvs의 GPU filtered exact hot tier 자리는 미개척으로 남아 있고, cold tier 소유(본 ADR)는 그와 별개의 통합·라이선스 판단이다.
 
+**추가 (2026-08-04) — 산술 판정: 그래프 경로는 경제성으로 사망. 트리거에 K1 선행 조건 추가.**
+
+방향 4 채택으로 외부 블로커(PQFlash 비호환·대상 브랜치 동결)는 우회 가능해졌으나, 남은 질문
+"그래서 GPU가 거기서 무엇을 하는가"를 산술로 답한 결과 **방향 4는 자기가 표적하는 세그먼트에서
+조차 GPU 우위가 없다**. 분석 전문: `docs/reports/2026-08-04-aisaq-gds-viability.md`.
+
+- **결정적 불변식**: AiSAQ의 정의상 섹터 1회 읽기 = 노드 1개 = 이웃 R개의 PQ 코드이므로
+  `초당 PQ 평가 수 = IOPS × R`. hop 수·beamwidth·visited nodes가 **전부 상쇄**되고 드라이브가
+  GPU 수요의 천장을 잠근다. NVMe 1.0M IOPS × R=64 = 6.4×10⁷ evals/s = **A100의 0.13 %**이며,
+  같은 부하를 **AVX-512 CPU 0.32코어**(비관적으로도 1.3코어)가 감당한다. R=128 + Gen5로 밀어도
+  0.7 %, PQ 처리량 가정이 ±5배 틀려도 격차가 700배라 강건하다.
+- **지연**: 의존 hop ≈ 38 × 100 µs = 하한 3.8 ms, 포화 시 p50 8–15 ms. 자사 VRAM 상주 경로의
+  실측 0.8–1.1 ms보다 4~15배 느리다 — GPU의 저지연 논거가 디스크에 붙는 순간 소멸한다
+  (ADR-061 렌즈 B "GPU는 VRAM→PCIe 절벽으로 우아한 spill이 없다"의 정량화).
+- **GDS 부적합(그래프 한정)**: 총 대역폭이 4 GB/s라 CPU 바운스가 0.4코어에 불과해 제거 가치가
+  없고, 더 근본적으로 **제어 경로가 CPU에 남아** 쿼리당 38회의 왕복이 CPU를 경유한다. 이 접근
+  패턴에 맞는 원시연산은 커널 내부에서 NVMe 읽기를 발행하는 계열(BaM)이며 cuVS 미제품화.
+- **[신규] "추가 I/O 없음"은 차원 의존적**: 레코드 `d×4 + R×4` 대비 4096 B 섹터 슬랙이 128d
+  (SIFT)는 이웃 64개 전부를 수용하나 **768d는 24개분, 1024d는 음수**다. 표적 차원에서 논문
+  헤드라인 조건이 얇아지거나 깨진다 — 위 "동등성 미보장"의 **구체적 기전**이며 순수 산수로
+  검증 가능하다.
+- **[신규] 누락 비용**: 본 ADR은 비용을 "포맷 하나를 우리 직렬화 계층으로 포팅"으로 잡았으나,
+  필요 동시성 B ≈ 25–64는 데몬 배치 코얼레싱에서 나올 수 없고(디스크 경로 상한 6.7k QPS라
+  1,000 µs 창당 ~7개) **in-flight 쿼리 수**에서 나와야 한다. 즉 **쿼리당 38회 의존 라운드를
+  가진 비동기 I/O 상태 기계로 데몬을 재작성**하는 비용이 동반된다(현 연결-스레드당 동기
+  `handle_search`와 구조가 다르다). 부수로 TB급 리플리카 부트스트랩, O_DIRECT/정렬 요구와
+  `$PGDATA` 하위 배치의 충돌, 불변 온디스크 그래프의 TB 재작성 컴팩션.
+
+**트리거 보강**: 재개 트리거 "AiSAQ 레이아웃 포팅 착수 판단"에 **경제성 반증(K1) 통과를 선행
+조건으로 추가**한다. K1 = `fio` 4KB 랜덤 IOPS + AVX PQ-ADC 마이크로벤치로 `IOPS × R`을 CPU
+1코어와 비교하는 반나절 실험이며 **GPU도 GDS 장비도 필요 없다**. 현 트리거는 "우리가 결정할 수
+있는 것"이라는 원칙은 만족하지만 **경제성 반증을 요구하지 않았고**, 그것이 이 안의 실제 사망
+원인이다.
+
+**cold-tier 트랙의 잔존 경로**: 위 "대안 cold-tier 경로 — RaBitQ + GDS(graph 아닌 IVF)"만
+남는다. 그 결합은 산술상 옳다 — rerank gather는 후보 1,000개의 원본(768d f32 ≈ 3 MB)을 한 번에
+끌어오는 **배치형 대용량**이라 GDS의 적소다. 단 하드웨어(NVMe + `nvidia-fs` + `cuFile`)
+미확보로 여전히 착수 불가이며, **RaBitQ 본체는 이 블로커와 무관하다**(ADR-076 2026-08-04 추가).
+
 ---
 
 ## ADR-073 — GPU exact brute-force 1급화: 상주 `flat` AM (A1) + transient 무인덱스 (B, 후속) + 플래너 라우팅
@@ -3195,6 +3234,27 @@ SVFusion(VLDB'26, PCIe A100)이 CAGRA/GGNN가 **UVM(demand paging)에서 크게 
 **구현 비용(스파이크 할인 반영)**: numpy 스파이크 S(완료) → CUDA 인코더/추정기/bound M–L → `rabitq` AM 통합 M(flat/ivfpq 템플릿) → 검증 하네스 M.
 
 **관련**: ADR-049(ivfpq·VRAM 절감, 본 건의 recall-천장 동기), ADR-025(50M·vchordrq 0.9991), ADR-026/072(DiskANN no-go — 대조: 블로커가 외부 API였음), ADR-073(AM-per-algo 하우스 스타일), ADR-010(VRAM OOM 정책). 스파이크: `bench/protocol/spikes/rabitq_spike.py`, 벤치 핸드오프 `bench/protocol/HANDOFF.md §5 RaBitQ 트랙`(run #30–#33).
+
+**추가 (2026-08-04) — variant B(GDS rerank)가 옳은 GDS 결합임을 산술로 확인. 단 상태는 불변.**
+
+`docs/reports/2026-08-04-aisaq-gds-viability.md`의 산술은 GDS가 **그래프 순회**(의존적 소량 랜덤
+읽기 + 제어 경로 CPU)에는 구조적으로 부적합하고 **rerank gather**(후보 1,000개의 원본 ≈ 3 MB,
+독립·배치 가능)에는 적소임을 보인다. 즉 `AiSAQ + GDS`가 틀린 결합이고 **`RaBitQ + GDS`(본 ADR
+variant B)가 옳은 결합**이다. GDS가 결정적이 되는 교차점은 전송 단위 ≥128 KB–1 MB, 총 대역폭
+≳10 GB/s이며 rerank는 그 위, 그래프 순회는 그 아래에 있다.
+
+**그러나 상태는 변하지 않는다**: variant B는 하드웨어(NVMe + `nvidia-fs` + `cuFile`) 미확보로
+착수·검증 모두 불가하고, kill criteria K3(`cuFileDriverGetProperties`로 DMA 경로 증명)/K4
+(`gdsio` cuFile vs POSIX)도 실행할 수 없다. 주의: cuFile은 조건 미충족 시 에러가 아니라
+**compatibility mode(내부 CPU 바운스)로 조용히 강등**되므로, DMA 경로를 증명하지 않은 측정은
+바운스 수치를 GDS 수치로 오인하게 한다.
+
+**본체는 이 블로커와 무관하다**: RaBitQ의 핵심 가치 — 136 B/vec를 VRAM에 상주시켜 천장을 올리는
+것 — 은 디스크 경로 없이 온전히 실현된다. GDS rerank는 풀정밀 rerank를 디스크에서 가져오고 싶을
+때의 **선택적 확장**일 뿐이다. 따라서 **RaBitQ 진행에는 하드웨어 블로킹이 없다**. 8×A100-80GB
+기준 640 GB / 136 B ≈ **47억 벡터**가 VRAM에 상주하므로, 표적 세그먼트(ADR-061 쿼리당-비용)가
+요구할 어떤 규모에서도 디스크 티어가 불필요해진다 — RaBitQ는 cold tier 시점을 *미루는* 것이
+아니라 표적 세그먼트 내에서 *제거한다*.
 
 ---
 
