@@ -271,6 +271,13 @@ typedef struct CuvsIndexStats {
  * checking (blocking wait, legacy behavior). */
 void cuvs_ipc_set_wait_callback(int (*cb)(void));
 
+/* #119: register the expected owner uid of cuvs.socket_path. Backend refuses
+ * to connect() if the socket is owned by a different uid (pre-bind squat —
+ * SO_PEERCRED alone can't catch this, since it only verifies the peer after
+ * a connection is already made to whoever holds the path). -1 (default) =
+ * no check. Set from cuvs.daemon_uid via _PG_init. */
+void cuvs_ipc_set_daemon_uid(int uid);
+
 /*
  * cuvs_ipc_search_filtered — D-wedge spike: filtered BF search.
  *

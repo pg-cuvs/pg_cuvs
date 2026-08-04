@@ -50,6 +50,16 @@
  * Socket helpers
  * ---------------------------------------------------------------- */
 
+/* #119: expected owner uid of cuvs.socket_path (-1 = no check). Set via
+ * cuvs_ipc_set_daemon_uid, mirroring the g_wait_cb setter pattern below. */
+static int g_expected_daemon_uid = -1;
+
+void
+cuvs_ipc_set_daemon_uid(int uid)
+{
+    g_expected_daemon_uid = uid;
+}
+
 /* Open a UDS connection. Returns fd on success, -1 on failure.
  * connect_timeout_ms: short for fail-fast on missing daemon
  * recv_timeout_sec: longer for receiving daemon response (build can be slow) */
@@ -59,6 +69,44 @@ uds_connect_ex(const char *socket_path, int recv_timeout_sec)
     int fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (fd < 0)
         return -1;
+
+    /* #119: verify socket_path owner before connect(). SO_PEERCRED
+     * (shm_check_daemon_owner, unchanged) verifies the peer after a
+     * connection is made — it can't stop an attacker who unlinks the real
+     * socket and squats the path before the daemon rebinds it. lstat (not
+     * stat) so a symlink swap to a different socket can't bypass this. */
+    if (g_expected_daemon_uid >= 0 && socket_path[0] != '\0')
+    {
+        struct stat st;
+        if (lstat(socket_path, &st) != 0)
+        {
+            LOG_ERROR("[cuvs_ipc] cannot stat socket_path %s: %s\n",
+                      socket_path, strerror(errno));
+            close(fd);
+            return -1;
+        }
+        if (!S_ISSOCK(st.st_mode))
+        {
+            LOG_ERROR("[cuvs_ipc] socket_path %s is not a socket\n", socket_path);
+            close(fd);
+            return -1;
+        }
+        if (st.st_uid != (uid_t) g_expected_daemon_uid)
+        {
+            LOG_ERROR("[cuvs_ipc] socket_path %s owned by uid=%u, expected=%d "
+                      "— refusing to connect (possible hijack)\n",
+                      socket_path, (unsigned) st.st_uid, g_expected_daemon_uid);
+            close(fd);
+            return -1;
+        }
+        if (st.st_mode & S_IWOTH)
+        {
+            LOG_ERROR("[cuvs_ipc] socket_path %s is world-writable — refusing to connect\n",
+                      socket_path);
+            close(fd);
+            return -1;
+        }
+    }
 
     struct sockaddr_un addr;
     memset(&addr, 0, sizeof(addr));
