@@ -130,9 +130,15 @@ Implemented on GCP (NVIDIA A100-40GB × 2, PostgreSQL 16), VM E2E verified:
 - [x] MIG verified (no code changes needed)
 
 Benchmark results — canonical dataset is **wiki_all_1M (1M×768, the cuvs-bench standard
-dataset)**, end-to-end SQL, measured inside NVIDIA's cuvs-bench: at matched recall≈0.95,
-CAGRA is **~5.4× faster** than pgvector HNSW (see [`BENCHMARK.md` §2.1b](BENCHMARK.md);
-raw: [`bench/results/pg_cuvsbench_wiki1m_brev.csv`](bench/results/pg_cuvsbench_wiki1m_brev.csv)).
+dataset)**, end-to-end SQL, measured inside NVIDIA's cuvs-bench. In the four-algorithm
+build-parameter sweep (one process, one index set, one file), at matched recall≥0.95
+CAGRA is **~5.7× faster** than pgvector HNSW (580.5 vs 102.1 QPS) and builds its index
+**~4.9× faster**; pgvector clears no point at recall 0.99 at any `m`×`ef_construction`
+tested (see [`BENCHMARK.md` §2.1c](BENCHMARK.md); raw:
+[`bench/results/pg_cuvsbench_98.csv`](bench/results/pg_cuvsbench_98.csv)). The earlier
+~5.4× figure is a different run on a different host
+([`pg_cuvsbench_wiki1m_brev.csv`](bench/results/pg_cuvsbench_wiki1m_brev.csv), §2.1b);
+absolute QPS is host-specific, so the two are not a before/after of one measurement.
 
 The table below is the **legacy** real-embedding run — **Cohere Wikipedia 1M×1024**
 (A100-40GB, ext 0.5.0; raw:

@@ -225,6 +225,14 @@ system,index,N,dim,k,recall_target,build_s,qps,p50_us,p95_us,p99_us,avg_us,recal
 | CPU baseline이 모든 셀에서 pg_cuvs를 recall@latency로 이김 | **NO-GO** (현재 단일 GPU 기준) | 멀티-GPU CAGRA(Phase 3F)로 재검증 또는 포지션 재정의 |
 | pgvectorscale/VectorChord 설치 smoke 실패 | **ABORT** | 원인 기록 후 설치 방법 변경 검토 |
 
+> **2026-08-05 — 이 표의 판정에 쓸 수 있는 부분과 쓸 수 없는 부분.** #98 4-algo 스윕
+> ([`bench/results/pg_cuvsbench_98.csv`](../../bench/results/pg_cuvsbench_98.csv),
+> [`BENCHMARK.md` §2.1c](../../BENCHMARK.md))은 wiki_all_1M 1M×768에서 recall≥0.95 기준
+> pg_cuvs CAGRA가 **pgvector HNSW 대비 p50 5.71× 우위**(1.71 ms vs 9.78 ms)임을 같은 run
+> 안에서 보인다. 다만 **이 표의 CPU baseline은 pgvectorscale/VectorChord이고 #98은 그 둘을
+> 재지 않았다** — 위 GO 행의 "CPU 대비"는 아직 미충족이며, #98 수치를 그 자리에 대입하지
+> 말 것. 셀 구성(N×dim)도 다르다.
+
 ## 9. 운영 기준
 
 - VM은 실행 직전 명시적으로 start, 결과 확인 직후 stop/TERMINATED 확인.
