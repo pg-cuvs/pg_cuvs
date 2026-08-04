@@ -120,3 +120,72 @@ FROM pg_stat_gpu_search WHERE index_oid = 'psf_novectors_cagra'::regclass;
 
 RESET cuvs.filter_auto_threshold;
 DROP TABLE psf_novectors CASCADE;
+
+-- ----------------------------------------------------------------
+-- #133 review F2: `expect` must be sized from n_included (bits the bitset-
+-- building loop actually set), not cmd->n_filter_tids (what the backend
+-- sent). A TID the loop's rev_tids binary search can't find -- a post-build
+-- delta row, a tombstoned row, or (as constructed determinstically here)
+-- an encoded TID that was never a real ctid of this table -- is silently
+-- skipped, so the bitset can legitimately include fewer positions than the
+-- filter array's length. cuvs_filtered_knn's bigint[] overload takes
+-- encoded TIDs directly from the client, so this gap is constructible
+-- without relying on delta/tombstone timing (which the #133 review noted
+-- is nondeterministic and not worth chasing -- see the PR discussion).
+--
+-- This is deliberately real == 3 (< k) so the query only reaches the F2
+-- codepath if F3's k-vs-|filter| guard has already let it through: a
+-- pre-F2 (cmd->n_filter_tids based) `expect` of min(10,23)=10 exceeds what
+-- 3 real matches can ever fill (filled=3 < 10), so it would retry on
+-- gpu_bf_prefilter -- misjudging a CORRECT 3-row answer as a collapse.
+-- Post-F2, n_included=3 (only the 3 real TIDs resolve), so expect=3 and
+-- filled(3) < expect(3) is false: no retry.
+--
+-- Verified manually that this test FAILS without the F2 fix: reverting
+-- `expect = (int)n_included` back to `expect = (int)cmd->n_filter_tids`
+-- (i.e. sizing `expect` from the filter array length instead of the
+-- bitset-loop's actual hit count) flips mode_f2_gap from cagra_prefilter to
+-- brute_force and fallback_count_after_f2_gap from 0 to 1 -- confirmed by
+-- temporarily reverting expect's source, rebuilding the daemon, and
+-- re-running this file on pg-cuvs-item2b before restoring the fix.
+-- ----------------------------------------------------------------
+
+DROP TABLE IF EXISTS psf_f2 CASCADE;
+CREATE TABLE psf_f2 (row_id int NOT NULL, v vector(4));
+INSERT INTO psf_f2
+SELECT g, array_agg(round((random() * 0.9 + 0.05)::numeric, 4) ORDER BY d)::real[]::vector(4)
+FROM generate_series(1, 200) g, generate_series(1, 4) d
+GROUP BY g;
+
+-- Give this index a resident BF index (main_bf_idx != NULL) so the F3 gate
+-- alone can't explain a lack of retry -- this test isolates F1+F2's expect
+-- computation specifically.
+SET cuvs.search_mode = brute_force;
+CREATE INDEX psf_f2_cagra ON psf_f2 USING cagra (v vector_l2_ops);
+SET cuvs.filter_auto_threshold = 1.0;
+
+SELECT prefilter_fallback_count AS fallback_count_before_f2_gap
+FROM pg_stat_gpu_search WHERE index_oid = 'psf_f2_cagra'::regclass;
+
+-- 3 real encoded ctids + 20 encoded TIDs that were never real ctids of this
+-- table (block 999999, offsets 1..20 -- this table has nowhere near that
+-- many heap blocks). n_filter_tids=23, n_included=3.
+SELECT count(*) AS n_f2_gap
+FROM cuvs_filtered_knn(
+    'psf_f2_cagra'::regclass,
+    '[0.5,0.3,0.7,0.2]'::vector(4),
+    (SELECT array_agg((((ctid::text::point)[0])::bigint << 16)
+                     | (((ctid::text::point)[1])::bigint))
+       FROM psf_f2 WHERE row_id IN (10, 50, 90))
+    || ARRAY(SELECT (999999::bigint << 16) | g::bigint
+              FROM generate_series(1, 20) g),
+    10
+) f;
+
+SELECT search_mode AS mode_f2_gap,
+       prefilter_fallback_count AS fallback_count_after_f2_gap
+FROM pg_stat_gpu_search WHERE index_oid = 'psf_f2_cagra'::regclass;
+
+RESET cuvs.filter_auto_threshold;
+RESET cuvs.search_mode;
+DROP TABLE psf_f2 CASCADE;
