@@ -87,6 +87,18 @@ DEFAULT_SWEEPS = {
 
 
 # ── fbin / recall helpers (vendored so the backend is self-contained) ────────
+def _is_relation_name_collision(exc):
+    """True when `exc` is PostgreSQL refusing a name another relation holds.
+
+    Identified by SQLSTATE, not by exception class: psycopg is not installed on
+    the CPU-only CI runner, so importing it here to name the classes would make
+    an ordinary build failure raise ModuleNotFoundError instead. psycopg3
+    exposes `.sqlstate`; `.pgcode` is psycopg2's spelling of the same field.
+    """
+    code = getattr(exc, "sqlstate", None) or getattr(exc, "pgcode", None)
+    return code in PgEngine._NAME_COLLISION_SQLSTATES
+
+
 def read_fbin(path, count=None, offset=0):
     """big-ann .fbin: int32 n, int32 dim, then n*dim float32 row-major.
     Returns an (count, dim) float32 memmap view."""
@@ -579,6 +591,15 @@ class PgEngine:
                     "intermediate_graph_degree": INTERMEDIATE_GRAPH_DEGREE}
         return {}
 
+    # PostgreSQL SQLSTATEs for "that relation name is already taken":
+    #   23505 unique_violation  -- the pg_class_relname_nsp_index collision the
+    #                              #98 resume proof actually hit
+    #   42P07 duplicate_table   -- the same conflict seen at name-lookup time
+    # Matched by code rather than by psycopg exception class so this module
+    # keeps working where psycopg is absent (the CPU-only CI runner imports it
+    # for collection but cannot install the driver).
+    _NAME_COLLISION_SQLSTATES = ("23505", "42P07")
+
     def build(self, algo, n, sample_query=None, build_cfg=None, keep=()):
         """Build `algo`'s index under `build_cfg`.
 
@@ -595,7 +616,46 @@ class PgEngine:
 
         sample_query is accepted for call compatibility and unused: the unified
         0.5.0 export needs no dummy search.
+
+        Retries ONCE on a relation-name collision. `_build_once` already issues
+        DROP INDEX IF EXISTS immediately before CREATE INDEX, but that is a
+        check against what is *visible*, and an index being built by another
+        backend is not visible until it commits. #98's Stage-1 resume proof hit
+        exactly that: a run was SIGKILLed mid-CREATE INDEX, the killed client's
+        backend kept building and committed afterwards, and the resuming run
+        read `to_regclass -> NULL` ("relation absent"), dropped nothing, and
+        then collided:
+
+            UniqueViolation: duplicate key value violates unique constraint
+            "pg_class_relname_nsp_index"
+            Key (relname, relnamespace)=(t_hnsw_pgv, 2200) already exists
+
+        A UniqueViolation rather than a block is itself the evidence that the
+        other transaction had committed. On the retry the relation IS visible,
+        so the DROP does its job and the build proceeds -- turning a lost
+        resume cycle into a self-heal.
+
+        Only the name collision is retried. Every other build failure is a
+        real one and must surface, not be re-attempted.
+
+        The obvious alternative -- take a conflicting lock on `t` so the drop
+        waits out the in-flight build -- is not available here: locks need an
+        explicit transaction, and this connection is autocommit BECAUSE a cagra
+        build inside a transaction block corrupts the backend (see __init__).
         """
+        try:
+            return self._build_once(algo, n, sample_query, build_cfg, keep)
+        except Exception as e:  # noqa: BLE001 -- re-raised unless it is 23505/42P07
+            if not _is_relation_name_collision(e):
+                raise
+            print(f"[engine] WARN: {algo} build hit a relation-name collision "
+                  f"({e.__class__.__name__}); an index left by another backend "
+                  f"became visible after the pre-build drop. Re-dropping and "
+                  f"retrying once.", flush=True)
+        return self._build_once(algo, n, sample_query, build_cfg, keep)
+
+    def _build_once(self, algo, n, sample_query=None, build_cfg=None, keep=()):
+        """One build attempt. See build() for the contract."""
         assert algo in ALGOS, f"unknown algo {algo}"
         cfg = dict(build_cfg) if build_cfg else self.default_build_cfg(algo, n)
         c = self.conn
