@@ -99,13 +99,14 @@ uds_connect_ex(const char *socket_path, int recv_timeout_sec)
             close(fd);
             return -1;
         }
-        if (st.st_mode & S_IWOTH)
-        {
-            LOG_ERROR("[cuvs_ipc] socket_path %s is world-writable — refusing to connect\n",
-                      socket_path);
-            close(fd);
-            return -1;
-        }
+        /* No S_IWOTH check: different-uid deployments require the socket to
+         * be world-writable for connect() to succeed at all (AF_UNIX
+         * connect() needs write access to the socket inode) — the daemon's
+         * own systemd unit chmod's it 666 (daemon-restart-recovery.md).
+         * That permission bit carries no attacker advantage the uid check
+         * above doesn't already close: a resquatted socket is owned by the
+         * attacker's uid, not g_expected_daemon_uid, so it's refused above
+         * regardless of its mode. */
     }
 
     struct sockaddr_un addr;

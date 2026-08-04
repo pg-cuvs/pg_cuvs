@@ -45,9 +45,9 @@ SELECT uid AS real_daemon_uid FROM daemon_uid_probe \gset
 SET cuvs.daemon_uid = :real_daemon_uid;
 CREATE TABLE daemon_uid_owner_t (id int, v vector(8));
 SELECT setseed(0.87);
- setseed
+ setseed 
 ---------
-
+ 
 (1 row)
 
 INSERT INTO daemon_uid_owner_t
@@ -65,15 +65,15 @@ SELECT count(*) FROM (
     ORDER BY v <-> '[0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5]'::vector(8)
     LIMIT 5
 ) s;
- count
+ count 
 -------
      5
 (1 row)
 
 SELECT count(*) >= 1 AS matching_uid_reaches_daemon
 FROM pg_stat_gpu_search WHERE index_oid = 'daemon_uid_owner_idx'::regclass;
- matching_uid_reaches_daemon
-------------------------------
+ matching_uid_reaches_daemon 
+-----------------------------
  t
 (1 row)
 
@@ -84,8 +84,8 @@ FROM pg_stat_gpu_search WHERE index_oid = 'daemon_uid_owner_idx'::regclass;
 SET cuvs.daemon_uid = 999999;
 SELECT count(*) = 0 AS mismatched_uid_fails_closed
 FROM pg_stat_gpu_search WHERE index_oid = 'daemon_uid_owner_idx'::regclass;
- mismatched_uid_fails_closed
-------------------------------
+ mismatched_uid_fails_closed 
+-----------------------------
  t
 (1 row)
 

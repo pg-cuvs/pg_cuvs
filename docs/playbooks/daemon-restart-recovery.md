@@ -273,9 +273,14 @@ connect 이후에나 검증하므로 이 앞선 공격을 막지 못한다.
    끄며(하위 호환), 소켓 owner가 기대와 다르면 backend는 connect를
    거부하고 `CUVS_STATUS_UNAVAILABLE`로 CPU fallback한다(fail-closed).
    § 3. GUC reference의 `cuvs.daemon_uid` 참고.
-4. **소켓을 world-writable하지 않은 디렉터리에 둔다.** 기본
-   `cuvs.socket_path`(`/tmp/.s.pg_cuvs`)의 부모 디렉터리가 sticky bit이
-   없는 world-writable이면 다른 로컬 사용자가 소켓 파일을 미리 만들어
-   둘 수 있다. `cuvs.daemon_uid` 검사는 소켓 자체가 world-writable
-   (`S_IWOTH`)인 경우도 거부하지만, 상위 디렉터리 권한은 배포 시
-   별도로 확인해야 한다.
+4. **소켓의 부모 디렉터리는 world-writable + non-sticky로 두지 않는다.**
+   소켓 파일 자체는 world-writable(0666)이어야 한다 — AF_UNIX
+   `connect()`는 소켓 inode에 대한 write 권한을 요구하므로, daemon과
+   backend가 다른 uid인 배포에서는 systemd unit이 `chmod 666`으로
+   이를 보장한다(daemon-restart-recovery.md 위 "소켓 권한 문제" 참고).
+   `cuvs.daemon_uid`는 이 world-writable 비트를 거부하지 않는다 —
+   소켓을 unlink 후 재squat한 공격자는 자기 uid로 새 소켓을 만들 수밖에
+   없으므로 owner-uid 검사(위 3번)가 이미 이를 막는다. 대신 부모
+   디렉터리(기본 `/tmp`)가 sticky bit(`+t`) 없이 world-writable이면
+   다른 로컬 사용자가 소켓 파일을 미리 만들어 선점할 수 있으므로,
+   부모 디렉터리의 sticky bit은 배포 시 별도로 확인한다.
