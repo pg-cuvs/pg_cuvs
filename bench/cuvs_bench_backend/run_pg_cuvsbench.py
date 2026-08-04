@@ -412,10 +412,11 @@ def run_phase2(args, writer, fout, latency_rows):
         # co-residency this repo has already validated); the CAGRA arm keeps its
         # index so a later resume does not rebuild it.
         keep = ("t_cagra",) if algo.startswith("pgvector") else ()
-        bt, ibytes, _ = ensure_pareto_index(eng, algo, cfg, args.n, keep=keep)
+        bt, ibytes, rebuilt = ensure_pareto_index(eng, algo, cfg, args.n,
+                                                  keep=keep)
         for n_workers in conc_ns:
             emit_conc(args, eng, emit, done, algo, p, n_workers, queries_all, gt,
-                      bt, ibytes, env_note, latency_rows)
+                      bt, ibytes, env_note, rebuilt)
 
     # -- raw cuVS batch (PR-B's engine; absent until that PR lands) ------------
     if not args.skip_raw_batch:
@@ -493,7 +494,7 @@ def emit_batch(args, eng, emit, done, algo, p, cfg, queries, gt, bt, ibytes,
 
 
 def emit_conc(args, eng, emit, done, algo, p, n_workers, queries_all, gt, bt,
-              ibytes, env_note, latency_rows):
+              ibytes, env_note, rebuilt):
     """N concurrent connections, single-query scans, fixed wall-clock window."""
     import conc_runner
 
@@ -511,13 +512,19 @@ def emit_conc(args, eng, emit, done, algo, p, n_workers, queries_all, gt, bt,
     notes = [env_note, f"param={p['param']}",
              f"recall over {r['recall_queries']} gt-covered queries"]
     notes += r["notes"]
-    notes.append(gate_fallback(name, fb_delta))
+    notes.append(gate_fallback(name, fb_delta,
+                               gpu_served=algo.startswith("pgcuvs")))
     if n_workers == 1:
         notes.append(gate_conc1_ratio(name, r["qps"], p["qps"]))
 
     emit(throughput_row(name, param, args.k, r["recall"], r["qps"],
                         r["wall"] * 1000.0, p["build_params"], r["queries"],
-                        build_time_s=bt, index_bytes=ibytes, reused=True,
+                        # Whether the index this arm measured was already
+                        # resident, or Phase 2 had to build it. pgvector_hnsw is
+                        # first ensured inside this very loop, so hardcoding
+                        # True here claimed a reuse that had not happened and
+                        # attached it to a build_time_s from a fresh build.
+                        build_time_s=bt, index_bytes=ibytes, reused=not rebuilt,
                         p50=r["p50_ms"], p95=r["p95_ms"], p99=r["p99_ms"],
                         notes=notes))
     log("P2", "conc", name, f"N={n_workers}", f"window={r['wall']:.0f}s",
@@ -616,14 +623,28 @@ def _gate(name, ok, text, hard=True):
             ("GATE-VIOLATION " if hard else "GATE-OBSERVATION ")) + text
 
 
-def gate_fallback(name, delta):
-    """The daemon must not have absorbed any request as a CPU exact search.
+def gate_fallback(name, delta, gpu_served=True):
+    """The daemon must not have absorbed a GPU request as a CPU exact search.
 
     A fallback returns recall~=1.0 at high latency, so a contaminated arm looks
     *better* on recall while measuring something else entirely -- which is why
-    this is checked per arm rather than once for the run, and why it is HARD:
-    the row would be describing a CPU exact search under a GPU arm's label.
+    this is checked per arm rather than once for the run, and why it is HARD for
+    a GPU-served arm: the row would be describing a CPU exact search under a GPU
+    arm's label.
+
+    `gpu_served=False` for the pgvector arms, and that is not a loophole. Those
+    arms set `enable_cuvs=off` deliberately, so with a CAGRA index co-resident
+    (Phase 2 keeps t_cagra while measuring pgvector) the extension records one
+    `reason=disabled` fallback PER QUERY -- measured: delta 6673 over ~6667
+    queries. That delta is the arm working as designed, not contamination, and
+    gating on it would fail every pgvector row for doing what it was told. The
+    number is still recorded in the row's notes.
     """
+    if not gpu_served:
+        return (f"fallback-delta={delta} (not gated: this arm runs "
+                "enable_cuvs=off by design, so a co-resident GPU index records "
+                "one reason=disabled fallback per query -- the CPU path IS this "
+                "arm's measurement)")
     return _gate(name, delta == 0, f"fallback-delta={delta} (want 0)", hard=True)
 
 

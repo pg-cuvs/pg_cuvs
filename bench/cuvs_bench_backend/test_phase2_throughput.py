@@ -213,6 +213,16 @@ def test_rebuild_when_the_sidecar_agrees_but_the_catalog_does_not(tmp_path,
     assert rebuilt is True
 
 
+def test_conc_rows_report_the_reuse_that_actually_happened():
+    # pgvector_hnsw's index is first ensured INSIDE the conc loop, so a hardcoded
+    # reused=True would claim a reuse that never happened -- and attach it to a
+    # build_time_s that came from a fresh build.
+    import inspect
+    src = inspect.getsource(runner.emit_conc)
+    assert "reused=not rebuilt" in src
+    assert "reused=True" not in src
+
+
 # ── Phase-2 resume ───────────────────────────────────────────────────────────
 def _tp_csv_row(algo, param, build_params="{}", success="True"):
     return {"algo": algo, "param": param, "build_params": build_params,
@@ -254,6 +264,16 @@ def test_pareto_ignores_throughput_rows_when_recomputed_from_the_csv():
 
 
 # ── consistency gates ────────────────────────────────────────────────────────
+def test_fallback_gate_does_not_fire_on_a_cpu_by_design_arm():
+    # pgvector arms set enable_cuvs=off; with a CAGRA index co-resident (Phase 2
+    # keeps t_cagra while measuring pgvector) the extension records one
+    # reason=disabled fallback per query -- measured 6673 over ~6667 queries.
+    # That is the arm doing what it was told, so it must be recorded, not gated.
+    txt = runner.gate_fallback("pgvector_hnsw_conc1", 6673, gpu_served=False)
+    assert "6673" in txt and "not gated" in txt
+    assert not runner.GATE_VIOLATIONS and not runner.GATE_OBSERVATIONS
+
+
 def test_fallback_gate_is_hard_and_passes_only_on_a_zero_delta():
     assert runner.gate_fallback("a", 0).startswith("gate-ok")
     assert not runner.GATE_VIOLATIONS
