@@ -3535,3 +3535,93 @@ correlation에 대한 서술을 두 번 고쳤고, 최종 형태는 다음과 �
 다만 3O에 대해서는 상관 축을 재지 않았다. 그래프 연결성이 끊기는 방식은 오버페치와 기전이 다르므로, VecFlow가 보고한 붕괴가 상관 조건에서 어떻게 달라지는지는 여전히 미측정이다.
 
 **관련**: ADR-079(리스크 제기 — 확증됨), ADR-048(3O; CAGRA prefilter를 이미 `~0.95+ approx`로 기록), ADR-063(D-wedge 라우팅), 이슈 #76·#80·#81. 산출물: `bench/filter_recall/adr079_3o_recall.py`, `bench/results/adr079_3o_recall.csv`(#80 이전), `bench/results/adr079_3o_recall_after80.csv`(#80 이후), `bench/results/adr079_3o_recall_tail.csv`(저선택도 꼬리), `bench/results/adr079_3paths_verified.csv`(three-path 재실행), `bench/results/adr079_3o_recall_crossover.csv`(교차 구간).
+
+---
+
+## ADR-083 — 3O 라우팅: selectivity는 붕괴의 예측 변수가 아니다 (상관 지배) → 런타임 탐지 + 폴백
+
+**날짜**: 2026-08-04
+**상태**: ACCEPTED (측정 기반). 구현은 후속 이슈.
+**관련**: ADR-048(3O), ADR-063(`filter_auto_threshold=0.05`), ADR-079(VecFlow 리스크 제기),
+ADR-082(상관 축 공백 명시), 이슈 #88. 측정: `docs/reports/2026-08-04-3o-correlation-axis.md`,
+`bench/results/adr079_3o_correlation{_anchor,,_hisel}.csv`.
+
+### 문제
+
+`cuvs.filter_auto_threshold`(ADR-063, 기본 0.05)는 **selectivity 단일 변수**로 3O(CAGRA BITSET
+prefilter)와 D-wedge를 라우팅한다. 그런데 wiki_all_1M 1M×768 측정에서 3O의 recall은 selectivity가
+아니라 **필터–쿼리 상관 방향**에 지배된다:
+
+| sel | anti | random | spatial |
+|---|---|---|---|
+| 0.5 | **0.0** | 0.989 | 0.995 |
+| 0.05 | **0.0** | 0.997 | 1.0 |
+| 0.0001 | 0.0005 | 0.282 | 1.0 |
+
+anti-correlated 필터에서는 **0.0001~0.5 전 구간 recall 0.0**이다. 통과 집합의 크기를 고정해도
+(sel=0.5, 통과 50만 행) 방향만으로 0.0 ↔ 0.989로 갈린다. 전 셀의 `daemon_search_mode`는
+`cagra_prefilter`로, 조용한 폴백이 아니라 3O가 실제 실행된 상태의 수치다.
+
+**기본 설정의 주 경로에 있는 결함이다** — 임계 0.05 *위*는 반드시 3O로 라우팅되는데, 그 구간에서
+anti는 recall 0이다.
+
+### 선행 연구와의 관계
+
+붕괴 현상 자체는 새롭지 않다.
+
+- **VecFlow**(arXiv 2506.00812, cuVS 저자)가 CAGRA 글로벌 그래프 + 필터의 ~0% 붕괴를 이미 실측
+  했고(ADR-079에 기록), 원인을 **작은 교집합이 그래프 연결성을 파괴**하는 것으로 귀인했다.
+- **RACORN-1**(arXiv 2607.00768)은 동일한 3레벨 상관 설계로 ACORN-1이 음의 상관에서 0.161(SIFT)
+  ~0.080(Text2Image 40M)까지 붕괴함을 보이고, "correlation is a determining variable **on par
+  with** selectivity"라고 서술한다. CPU HNSW 계열이며 CAGRA는 명시적으로 범위 제외.
+
+**본 ADR이 더하는 것은 귀인의 분리다**: selectivity를 고정한 채 상관만 움직여, CAGRA prefilter에서는
+**상관이 지배하고 selectivity는 거의 무관**함을 보인다(sel=0.5에서도 anti 0.0). VecFlow의 multi-label
+AND는 두 요인이 섞여 분리가 불가능했고, RACORN-1의 "on par"보다 우리 체제에서는 상관 쪽으로 더
+기운다.
+
+### 결정
+
+1. **selectivity 단일 변수 라우팅은 안전하지 않음을 확정하고 문서화한다.** `filter_auto_threshold`의
+   도움말·레퍼런스에 "붕괴점은 selectivity가 아니라 필터 형상(상관)에 의존한다"를 명시한다.
+   임계값을 조정하는 것으로는 해결되지 않는다 — 어떤 임계도 anti를 걸러내지 못한다.
+2. **그래프 densification(ACORN 계열)을 채택하지 않는다.** RACORN-1이 측정한 대상이 바로 ACORN-1
+   자신의 붕괴이므로, CAGRA에 과밀 그래프(`graph_degree` 상향)를 적용해도 음의 상관을 고치지 못할
+   가능성이 높다. VRAM 선형 증가(우리의 최희소 자원)를 치르고도 효과가 불확실하다.
+3. **런타임 탐지 + 폴백을 채택한다.** anti 실패는 "잘못된 이웃 반환"이 아니라 **"k를 채우지 못함"**
+   으로 나타난다: anti 전 구간 `mean_returned` 0.03~2.02 vs 건강한 전 셀 정확히 10.00. 분리가
+   넓고 예외가 없다. 3O가 k보다 현저히 적게 반환하면 **D-wedge로 폴백**한다. 필터 형상을 미리 알
+   필요가 없다.
+   - RACORN-1의 ASF도 같은 계열(런타임 신호 → 전환)이나, 그 신호는 순회 *내부*(방문 노드의 술어
+     통과 비율)라 커널 수정을 전제한다. `mean_returned`는 **커널 밖에서** 관측되므로 cuVS를
+     수정하지 않는 우리 위치에 적용 가능하다.
+4. **exact 경로의 지표는 tie-robust(거리 기준)로 보고한다.** anti 대형 후보집합에서 D-wedge/
+   stream_bf가 0.9885~0.9995를 보인 것은 **float32 마지막 비트 수준의 동률 교체**임을 확증했다
+   (50/50 쿼리 거리 동등, 최대 차 9.54e-07 = 2⁻²⁰). exact 경로의 정확성에는 결함이 없다.
+
+### 대안과 기각 사유
+
+| 대안 | 기각 사유 |
+|---|---|
+| 임계값 재조정(절대 candidate count 등, ADR-079 액션 2) | 어떤 selectivity 임계도 anti를 못 걸러낸다 — 변수가 틀렸다 |
+| CAGRA `graph_degree` 상향(ACORN-γ 근사) | RACORN-1이 ACORN-1의 붕괴를 측정. VRAM 선형 증가 대비 효과 불확실 |
+| 자체 필터 순회 커널(ACORN-1/ASF 이식) | 연구급 작업. cuVS 저자들이 같은 공간(VecFlow)에 있어 중복 위험. 폴백으로 같은 정합성을 훨씬 싸게 얻는다 |
+| per-label 그래프(VecFlow 방식) | 저카디널리티 known 범주형에만 통함. 임의 SQL 술어를 표적하는 우리 포지션과 불일치 |
+
+### 유예된 대안과 재개 트리거
+
+3번(자체 커널)은 **가치 창구가 확인되면** 재검토한다. 창구 = "exact BF가 비싸질 만큼 크면서 동시에
+필터 형상이 3O에 적대적인" 구간. 현 측정 전 구간에서 D-wedge가 recall 1.0을 내므로 그 창구의
+존재가 아직 확인되지 않았다. 재개 전 선행 조건:
+
+- 클러스터 기반 anti 픽스처로 문헌과 강도를 정렬(현 `anti`는 "가장 먼 N개"로 RACORN-1·VecFlow보다
+  극단적이며, 우리 0.0과 ACORN-1 0.08~0.22의 차이가 *구조 차이*인지 *픽스처 강도 차이*인지
+  분리되지 않았다)
+- 그 창구에서 D-wedge 폴백의 실측 비용이 수용 불가함을 보일 것
+
+### 남는 위험
+
+- 픽스처 강도 미분리(위)
+- 데이터셋 1종·k 고정. 차원·k 축 미측정
+- `mean_returned` 임계값 자체는 미정 — 구현 시 결정하며, 관측된 분리(≤2.02 vs =10.00)가 넓어 여유가
+  크다
