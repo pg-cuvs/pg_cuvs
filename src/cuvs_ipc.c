@@ -113,14 +113,18 @@ uds_connect_ex(const char *socket_path, int recv_timeout_sec)
             close(fd);
             return -1;
         }
-        /* No S_IWOTH check: different-uid deployments require the socket to
-         * be world-writable for connect() to succeed at all (AF_UNIX
-         * connect() needs write access to the socket inode) — the daemon's
-         * own systemd unit chmod's it 666 (daemon-restart-recovery.md).
-         * That permission bit carries no attacker advantage the uid check
-         * above doesn't already close: a resquatted socket is owned by the
-         * attacker's uid, not g_expected_daemon_uid, so it's refused above
-         * regardless of its mode. */
+        /* No S_IWOTH check: connect() needs write access to the socket
+         * inode (AF_UNIX requirement), but that's not the same as
+         * world-write. The daemon itself creates the socket 0660
+         * (pg_cuvs_server.c) — the correct different-uid deployment adds
+         * the backend's OS user to the daemon's group, not a wider mode.
+         * (The Brev dev bootstrap widens it to 0666 as a convenience
+         * because it doesn't set up that group membership; don't carry
+         * that into production.) Either way, S_IWOTH carries no attacker
+         * advantage the uid check above doesn't already close: a
+         * resquatted socket is owned by the attacker's uid, not
+         * g_expected_daemon_uid, so it's refused above regardless of its
+         * mode. */
     }
 
     struct sockaddr_un addr;
