@@ -244,3 +244,38 @@ NOTICE:  pg_cuvs: cagra scan index_oid=XXXXX gpu
 - 재시작 10회 이상 자동 재시작(`Restart=on-failure`)이 반복되면:
   systemd restart loop를 `sudo systemctl stop pg-cuvs-server`로 멈추고
   원인을 journal에서 분석한 뒤 수동으로 재시작한다.
+
+---
+
+## 7. Security / hardening
+
+#87/#119 finding — shm handoff는 daemon과 PG backend가 다른 uid로 돌아가는
+전제하에 SO_PEERCRED(`shm_check_peer_owner`, 소켓 접속 시점의 owner 검증)와
+CSPRNG 세그먼트 이름 + `O_EXCL`(#87)로 unlink-and-resquat 공격을 막는다.
+같은 방식으로 `cuvs.daemon_uid`(#119)는 backend가 `cuvs.socket_path`에
+connect하기 *전* 소켓 파일 자체의 owner를 검증해, daemon 소켓을 unlink하고
+자기 소유 리스너로 미리 squat하는 pre-bind 공격을 막는다 — SO_PEERCRED만으로는
+connect 이후에나 검증하므로 이 앞선 공격을 막지 못한다.
+
+배포 시 다음을 지킨다:
+
+1. **daemon을 전용/postgres uid로 실행한다.** daemon과 backend가 같은 uid로
+   돌면 SO_PEERCRED 검증이 무의미해지므로(모든 로컬 프로세스가 같은 uid),
+   다른 uid를 쓰는 배포에서만 #87/#119 방어가 실질적 의미를 가진다.
+2. **`/dev/shm`을 sticky(모드 1777)로 유지한다.** 코드가 시작 시
+   확인해 sticky가 아니면 `LOG_WARN`을 남긴다(`pg_cuvs_server.c` 데몬 시작
+   경로, `startup, /dev/shm sticky check` 참고). SO_PEERCRED가 이미
+   resquat된 세그먼트를 걸러내지만, sticky는 애초에 다른 로컬 사용자가
+   같은 이름의 파일을 건드리지 못하게 막는 defense-in-depth다.
+3. **다른-uid 또는 공유 호스트 배포에서는 `cuvs.daemon_uid`를 daemon의
+   uid로 설정한다.** 예: `SET cuvs.daemon_uid = 999;` 또는
+   `postgresql.conf`에 `cuvs.daemon_uid = 999`. 기본값 `-1`은 검사를
+   끄며(하위 호환), 소켓 owner가 기대와 다르면 backend는 connect를
+   거부하고 `CUVS_STATUS_UNAVAILABLE`로 CPU fallback한다(fail-closed).
+   § 3. GUC reference의 `cuvs.daemon_uid` 참고.
+4. **소켓을 world-writable하지 않은 디렉터리에 둔다.** 기본
+   `cuvs.socket_path`(`/tmp/.s.pg_cuvs`)의 부모 디렉터리가 sticky bit이
+   없는 world-writable이면 다른 로컬 사용자가 소켓 파일을 미리 만들어
+   둘 수 있다. `cuvs.daemon_uid` 검사는 소켓 자체가 world-writable
+   (`S_IWOTH`)인 경우도 거부하지만, 상위 디렉터리 권한은 배포 시
+   별도로 확인해야 한다.
