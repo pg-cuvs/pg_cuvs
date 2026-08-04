@@ -10,6 +10,13 @@
 --
 -- REQUIRES: pg_cuvs_server running; cuvs.index_dir writable. Runs in Tier-1 CI
 -- (CPU shim): cuvs_set_inject_build_oom is implemented in the shim too.
+--
+-- ENVIRONMENT-DEPENDENT (#89 item 2): on the CPU shim (Tier-1 CI) the OOM
+-- injection is deterministic, so this test is a stable pass. On real GPU —
+-- especially a single-GPU dev VM — the evict-retry outcome is residency-
+-- state-dependent: it depends on what is resident and evictable at run
+-- time, so a full-suite GPU run may show this test flaking between runs.
+-- A flake here on GPU is environment-dependent, NOT a code regression.
 
 \set ON_ERROR_STOP on
 
