@@ -18,6 +18,7 @@
 #include <sys/stat.h>
 #include <sys/file.h>     /* flock */
 #include <sys/socket.h>
+#include <sys/random.h>   /* getrandom(2): CSPRNG suffix for shm segment names, #87 */
 
 #define BLD_PREFIX     "pg_cuvs_bld_"
 #define BLD_PREFIX_LEN (sizeof(BLD_PREFIX) - 1)
@@ -38,12 +39,47 @@ cuvs_corpus_force_kind(const char *kind)
     else                             g_forced = CORPUS_NONE;
 }
 
-/* Unique per-process T2 name (mirrors cuvs_ipc.c:make_shm_key, distinct prefix). */
-static void
+/* CSPRNG fill for shm key suffixes (#87). getrandom(2) is Linux-only; this
+ * file also builds on macOS via `make test-unit` (test/unit/test_build_corpus.c),
+ * so fall back to arc4random_buf() there (BSD/macOS libc, never fails).
+ * Returns 0 on success, -1 if the CSPRNG source itself failed (Linux only).
+ * #87 finding 2: the caller must fail closed on -1, not degrade to a
+ * predictable (all-zero) suffix. */
+static int
+shm_key_random(unsigned char *buf, size_t len)
+{
+#ifdef __linux__
+    if (getrandom(buf, len, 0) != (ssize_t) len)
+        return -1;
+#else
+    arc4random_buf(buf, len);
+#endif
+    return 0;
+}
+
+/* Unique, unguessable per-process T2 name (mirrors cuvs_ipc.c:make_shm_key,
+ * distinct prefix; #87 CSPRNG suffix hardening applies here too). Only 4
+ * random bytes (not 8, like cuvs_ipc.c) — macOS enforces a hard 31-char
+ * POSIX shm name limit (PSHMNAMLEN) and this path is exercised locally by
+ * `make test-unit`; Linux has no such limit, so the extra margin isn't lost
+ * there, just unused. Returns 0 on success, -1 if the CSPRNG source failed —
+ * the caller must not proceed to shm_open with an unrandomized name (#87
+ * finding 2); open_shm() failing just drops the T2 tier, cuvs_corpus_open()
+ * falls through to the heap tier same as any other open_shm() failure. */
+static int
 build_shm_name(char *name, size_t namelen)
 {
     static int seq = 0;
-    snprintf(name, namelen, "/" BLD_PREFIX "%d_%d", (int) getpid(), seq++);
+    unsigned char rnd[4];
+    char hex[9];
+
+    if (shm_key_random(rnd, sizeof(rnd)) != 0)
+        return -1;
+    for (size_t i = 0; i < sizeof(rnd); i++)
+        snprintf(hex + i * 2, 3, "%02x", rnd[i]);
+
+    snprintf(name, namelen, "/" BLD_PREFIX "%d_%d_%s", (int) getpid(), seq++, hex);
+    return 0;
 }
 
 /* ---- tier: memfd (T1) -------------------------------------------------- */
@@ -83,12 +119,16 @@ open_shm(CuvsBuildCorpus *c, size_t bytes)
     int   fd;
     void *mem;
 
-    build_shm_name(name, sizeof(name));
+    if (build_shm_name(name, sizeof(name)) != 0)   /* #87 finding 2: fail closed */
+        return -1;
 
-    fd = shm_open(name, O_CREAT | O_RDWR, 0666);
+    fd = shm_open(name, O_CREAT | O_EXCL | O_RDWR, 0644);
     if (fd < 0)
         return -1;
-    fchmod(fd, 0666);                 /* daemon (other uid) must be able to open */
+    /* umask may be stricter than 0644; the daemon (other uid) must read this
+     * segment, so guarantee the mode explicitly rather than rely on
+     * shm_open's mode argument (#87). */
+    fchmod(fd, 0644);
     /* Hold an exclusive advisory lock for the segment's life. The kernel
      * auto-releases it on ANY process death (incl. SIGKILL), which is how the
      * reaper distinguishes a dead owner from a live build. Best-effort: on
