@@ -9,8 +9,10 @@
 -- design/ci-strategy.md), so it always fills every slot the filter set can
 -- supply and can never reproduce the collapse. This file therefore covers
 -- only the guard's other half — a filter set smaller than k is a legitimate
--- short answer, not a failure, and must NOT be retried on D-wedge. The
--- collapse-detection half is exercised on real GPU via
+-- short answer, not a failure, and must NOT be retried on the GPU exact BF
+-- prefilter (gpu_bf_prefilter -- not the D-wedge post-filter; different code
+-- path, different cost model). The collapse-detection half is exercised on
+-- real GPU via
 -- bench/filter_recall/adr079_3o_recall.py --correlations anti (ADR-083 VM
 -- verification).
 
@@ -28,7 +30,9 @@ SELECT g, array_agg(round((random() * 0.9 + 0.05)::numeric, 4) ORDER BY d)::real
 FROM generate_series(1, 200) g, generate_series(1, 4) d
 GROUP BY g;
 
-SET cuvs.search_mode = brute_force;   -- build the .vectors sidecar (needed by D-wedge)
+SET cuvs.search_mode = brute_force;   -- build the .vectors sidecar (main_bf_idx, needed
+                                       -- both by D-wedge and by the gpu_bf_prefilter
+                                       -- fallback this test exercises)
 CREATE INDEX psf_cagra ON psf USING cagra (v vector_l2_ops);
 
 -- Force every filtered call onto the 3O CAGRA-prefilter path.
@@ -75,3 +79,44 @@ FROM pg_stat_gpu_search WHERE index_oid = 'psf_cagra'::regclass;
 RESET cuvs.filter_auto_threshold;
 RESET cuvs.search_mode;
 DROP TABLE psf CASCADE;
+
+-- ----------------------------------------------------------------
+-- #133 review F3: the short-fill guard is gated on e->main_bf_idx != NULL.
+-- Without a resident BF index (no `.vectors` sidecar -- this table is never
+-- built with cuvs.search_mode=brute_force), there is nothing to retry into.
+-- Before this gate, a detected short fill would force pret=1 with no BF
+-- fallback available, and the daemon's existing NO_VECTORS guard (above the
+-- 3O block) would turn what used to be a degraded-but-approximate 3O answer
+-- into a hard ERROR -- an availability regression, not just a recall one.
+-- This asserts the query still returns OK (not an error) and stays on
+-- cagra_prefilter, matching pre-#133 behavior for this configuration.
+-- ----------------------------------------------------------------
+
+DROP TABLE IF EXISTS psf_novectors CASCADE;
+CREATE TABLE psf_novectors (row_id int NOT NULL, v vector(4));
+INSERT INTO psf_novectors
+SELECT g, array_agg(round((random() * 0.9 + 0.05)::numeric, 4) ORDER BY d)::real[]::vector(4)
+FROM generate_series(1, 200) g, generate_series(1, 4) d
+GROUP BY g;
+
+-- cuvs.search_mode stays at its default ('cagra') -- no .vectors sidecar,
+-- so main_bf_idx never gets built for this index.
+CREATE INDEX psf_novectors_cagra ON psf_novectors USING cagra (v vector_l2_ops);
+
+SET cuvs.filter_auto_threshold = 1.0;
+
+SELECT count(*) AS n
+FROM cuvs_filtered_knn(
+    'psf_novectors_cagra'::regclass,
+    '[0.5,0.3,0.7,0.2]'::vector(4),
+    ARRAY(SELECT ctid FROM psf_novectors WHERE row_id IN (10, 50, 90)),
+    10
+) f;
+
+-- Must be cagra_prefilter, not an error and not a fallback mode (there is
+-- no BF index to fall back to).
+SELECT search_mode AS mode_no_vectors, last_status AS status_no_vectors
+FROM pg_stat_gpu_search WHERE index_oid = 'psf_novectors_cagra'::regclass;
+
+RESET cuvs.filter_auto_threshold;
+DROP TABLE psf_novectors CASCADE;
