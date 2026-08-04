@@ -30,6 +30,7 @@ MEASUREMENT BOUNDARY (important; also in README.md):
 """
 import argparse
 import csv
+import hashlib
 import os
 import struct
 import sys
@@ -121,6 +122,12 @@ class PgEngine:
 
     ANN_INDEXES = ("t_hnsw", "t_ivf", "t_cagra")
     CORPUS_MARKER = "public._bench_corpus"
+    # #78 review F3: string_agg() of one 32-byte md5 hex digest per row hits
+    # PostgreSQL's 1GB varlena limit at 1_073_741_824 // 32 ~= 33.5M rows --
+    # this repo has already published a 50M arm. Above this many rows, the
+    # post-COPY verify folds into per-chunk digests + a rehash on both the SQL
+    # and Python side instead of one aggregate over the whole table.
+    VERIFY_CHUNK = 1_000_000
 
     def __init__(self, dbname="postgres", index_dir=INDEX_DIR_DEFAULT):
         import psycopg
@@ -157,18 +164,36 @@ class PgEngine:
               f"want={n} filenode={fnode} relsize={relsize} "
               f"n_tup_ins={ins} n_tup_del={dele}", flush=True)
 
-    def _corpus_reusable(self, cur, dataset, n, dim):
-        """Cheap per-config gate (#78): a durable marker table records the
-        fingerprint of the last corpus this dataset/n/dim loaded into `t`. If
-        the marker matches AND `t` still has exactly n rows, reuse it -- no
-        full fingerprint recompute here, just an indexed marker lookup + a
-        count(*) (a parallel seq scan of a static-size heap costs ~17ms even at
-        1M rows, per the #78 investigation). The expensive full fingerprint
-        verify only happens once, right after an actual load."""
+    def _corpus_reusable(self, cur, dataset, corpus_path, n, dim):
+        """Cheap per-config gate (#78): a durable marker table describes what
+        `t` currently holds. If the marker matches this call's
+        (dataset, corpus_path, size, mtime, n, dim) AND `t` still has exactly n
+        rows, reuse it -- no full fingerprint recompute here, just a marker
+        lookup + a count(*) (a parallel seq scan of a static-size heap costs
+        ~17ms at 1M rows when the heap is EMPTY, per the #78 investigation;
+        a full 1M-row heap's count(*) is a real scan and costs more, but is
+        still one cheap query, not a reload).
+
+        Since `t` is a single table, the marker holds AT MOST ONE row (#78
+        review F1): a prior design keyed the marker on `dataset` alone, so it
+        accumulated one row per dataset ever seen while `t` itself can only
+        ever hold one dataset's data -- a later re-run of an EARLIER dataset
+        could then match its own stale marker row and silently reuse `t`
+        while it actually held a DIFFERENT dataset's vectors (mis-attributed
+        recall/latency in the published CSV). Comparing corpus_path + size +
+        mtime (not just the free-text `dataset` label, which callers can set
+        to anything) closes the same hole for two different corpus files
+        sharing one label."""
+        try:
+            size = os.path.getsize(corpus_path)
+            mtime = os.path.getmtime(corpus_path)
+        except OSError:
+            return False
         cur.execute(
             f"SELECT fingerprint FROM {self.CORPUS_MARKER} "
-            "WHERE dataset = %s AND n = %s AND dim = %s",
-            (dataset, n, dim))
+            "WHERE dataset = %s AND corpus_path = %s AND corpus_size = %s "
+            "  AND corpus_mtime = %s AND n = %s AND dim = %s",
+            (dataset, corpus_path, size, mtime, n, dim))
         marker = cur.fetchone()
         if marker is None:
             return False
@@ -185,19 +210,75 @@ class PgEngine:
         self._dump_78_evidence(cur, got, n)
         return False
 
+    def _sql_fingerprint(self, n):
+        """The SQL-side fingerprint of what `t` actually holds, matching
+        corpus_fingerprint's has_category=False contract. Above VERIFY_CHUNK
+        rows, folds into per-chunk digests + a rehash instead of one
+        string_agg() over the whole table (#78 review F3: a single aggregate
+        would exceed PostgreSQL's 1GB varlena limit well before 50M rows)."""
+        with self.conn.cursor() as cur:
+            if n <= self.VERIFY_CHUNK:
+                cur.execute(
+                    "SELECT count(*), md5(string_agg("
+                    "  md5(int8send(id) || vector_send(embedding)), '' ORDER BY id))"
+                    " FROM public.t")
+                return cur.fetchone()
+            got_n, chunk_hashes = 0, []
+            for s in range(0, n, self.VERIFY_CHUNK):
+                e = min(s + self.VERIFY_CHUNK, n)
+                cur.execute(
+                    "SELECT count(*), md5(string_agg("
+                    "  md5(int8send(id) || vector_send(embedding)), '' ORDER BY id))"
+                    " FROM public.t WHERE id >= %s AND id < %s",
+                    (s, e))
+                cnt, fp = cur.fetchone()
+                got_n += cnt
+                chunk_hashes.append(fp)
+            fp = hashlib.md5("".join(chunk_hashes).encode("ascii"),
+                             usedforsecurity=False).hexdigest()
+            return got_n, fp
+
+    @classmethod
+    def _py_fingerprint(cls, corpus_path, n):
+        """The Python-side fingerprint of the source file, chunked the same
+        way as _sql_fingerprint above VERIFY_CHUNK rows (#78 review F3) so the
+        two sides stay directly comparable at any n, including the 50M scale
+        this repo has already published."""
+        if n <= cls.VERIFY_CHUNK:
+            return corpus_fingerprint(
+                np.ascontiguousarray(read_fbin(corpus_path, count=n)), n,
+                has_category=False)
+        chunk_hashes = []
+        for s in range(0, n, cls.VERIFY_CHUNK):
+            e = min(s + cls.VERIFY_CHUNK, n)
+            chunk = np.ascontiguousarray(read_fbin(corpus_path, count=e - s, offset=s))
+            chunk_hashes.append(corpus_fingerprint(
+                chunk, e - s, has_category=False, id_offset=s))
+        return hashlib.md5("".join(chunk_hashes).encode("ascii"),
+                           usedforsecurity=False).hexdigest()
+
     def load_corpus(self, corpus_path, n, dim, dataset="default", batch=50_000,
                      force_reload=False):
         """Load `t` with the first n rows of corpus_path, reusing an existing
         load when possible (#78). Reuse is gated by a durable marker table
-        (CORPUS_MARKER) keyed on (dataset, n, dim) + a corpus fingerprint, so
-        it survives the fresh PgEngine/PgBackend instance the cuvs-bench
-        orchestrator constructs per BenchmarkConfig -- the effect is "load
-        once per run" without needing a hook into the orchestrator itself.
+        (CORPUS_MARKER) describing what `t` currently holds -- dataset label,
+        source corpus_path (+size/mtime), n, dim, and a fingerprint -- so it
+        survives the fresh PgEngine/PgBackend instance the cuvs-bench
+        orchestrator constructs per BenchmarkConfig. The effect is "load once
+        per run" without needing a hook into the orchestrator itself. The
+        marker holds at most one row: `t` is a single table, so the marker
+        must describe exactly what it holds right now, not accumulate history
+        (#78 review F1).
 
-        On an actual (re)load this uses TRUNCATE + COPY, NOT `DROP TABLE ...
-        CASCADE` (the pre-#78 behaviour), so any ANN index on `t` survives --
+        On an actual (re)load, TRUNCATE + COPY replaces `DROP TABLE ...
+        CASCADE` (the pre-#78 behaviour) so any ANN index on `t` survives --
         DROP...CASCADE was destroying it and forcing a spurious rebuild on the
-        next config (see issue #78 comment 2026-07-22).
+        next config (see issue #78 comment 2026-07-22) -- UNLESS `t` already
+        exists with a different `dim`: TRUNCATE cannot repair a typmod
+        mismatch (the next COPY would fail), so that case still falls back to
+        DROP + CREATE (#78 review F4; there is no index to preserve across a
+        dim change anyway, since an index built for the old dim is meaningless
+        for the new one).
 
         force_reload=True bypasses the marker gate unconditionally (test hook:
         deterministically exercise the reload path without waiting for a
@@ -206,15 +287,25 @@ class PgEngine:
         with self.conn.cursor() as cur:
             cur.execute(
                 f"CREATE TABLE IF NOT EXISTS {self.CORPUS_MARKER} "
-                "(dataset text PRIMARY KEY, n bigint NOT NULL, dim int NOT NULL, "
-                " fingerprint text NOT NULL, "
+                "(dataset text NOT NULL, corpus_path text NOT NULL, "
+                " corpus_size bigint NOT NULL, corpus_mtime double precision NOT NULL, "
+                " n bigint NOT NULL, dim int NOT NULL, fingerprint text NOT NULL, "
                 " loaded_at timestamptz NOT NULL DEFAULT now())")
-            if not force_reload and self._corpus_reusable(cur, dataset, n, dim):
+            if not force_reload and self._corpus_reusable(cur, dataset, corpus_path, n, dim):
                 return
             cur.execute("SELECT to_regclass('public.t')")
-            if cur.fetchone()[0] is not None:
+            exists = cur.fetchone()[0] is not None
+            same_dim = False
+            if exists:
+                cur.execute(
+                    "SELECT a.atttypmod FROM pg_attribute a "
+                    "WHERE a.attrelid = 'public.t'::regclass AND a.attname = 'embedding'")
+                same_dim = cur.fetchone()[0] == dim
+            if exists and same_dim:
                 cur.execute("TRUNCATE t")
             else:
+                if exists:
+                    cur.execute("DROP TABLE t CASCADE")
                 cur.execute(f"CREATE TABLE t (id bigint, embedding vector({dim}))")
 
         t0 = time.perf_counter()
@@ -232,30 +323,27 @@ class PgEngine:
         # config): compare the SQL-side aggregate of what actually landed
         # against the Python-side hash of the source file. A mismatch means
         # the COPY silently produced the wrong contents.
-        with self.conn.cursor() as cur:
-            cur.execute(
-                "SELECT count(*), md5(string_agg("
-                "  md5(int8send(id) || vector_send(embedding)), '' ORDER BY id))"
-                " FROM public.t")
-            got_n, sql_fp = cur.fetchone()
+        got_n, sql_fp = self._sql_fingerprint(n)
         if got_n != n:
             raise RuntimeError(f"load_corpus: post-COPY count {got_n} != {n}")
-        py_fp = corpus_fingerprint(
-            np.ascontiguousarray(read_fbin(corpus_path, count=n)), n,
-            has_category=False)
+        py_fp = self._py_fingerprint(corpus_path, n)
         if sql_fp != py_fp:
             raise RuntimeError(
                 f"load_corpus: fingerprint mismatch after COPY "
                 f"(sql={sql_fp} py={py_fp}) -- corpus corrupted in transit")
         with self.conn.cursor() as cur:
+            # The marker describes exactly what `t` holds right now -- delete
+            # then insert, not upsert-by-dataset, so a stale row from an
+            # earlier dataset can never remain alongside the current one
+            # (#78 review F1).
+            cur.execute(f"DELETE FROM {self.CORPUS_MARKER}")
             cur.execute(
                 f"INSERT INTO {self.CORPUS_MARKER} "
-                "(dataset, n, dim, fingerprint, loaded_at) "
-                "VALUES (%s, %s, %s, %s, now()) "
-                "ON CONFLICT (dataset) DO UPDATE SET "
-                "  n = EXCLUDED.n, dim = EXCLUDED.dim, "
-                "  fingerprint = EXCLUDED.fingerprint, loaded_at = EXCLUDED.loaded_at",
-                (dataset, n, dim, sql_fp))
+                "(dataset, corpus_path, corpus_size, corpus_mtime, n, dim, "
+                " fingerprint, loaded_at) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, now())",
+                (dataset, corpus_path, os.path.getsize(corpus_path),
+                 os.path.getmtime(corpus_path), n, dim, sql_fp))
         print(f"[engine] corpus fingerprint {sql_fp[:12]}... verified + stored "
               f"(dataset={dataset})", flush=True)
 
