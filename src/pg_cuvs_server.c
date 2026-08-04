@@ -228,6 +228,8 @@ typedef struct IndexEntry {
     uint32_t        last_returned_k;   /* rows last OK search returned */
     uint64_t        delta_merged_count; /* searches where daemon merged delta on GPU */
     uint64_t        bf_batch_count;     /* Phase 3L-9: coalesced BF batch dispatches */
+    uint64_t        prefilter_fallback_count; /* #133/ADR-083: 3O->D-wedge retries after
+                                                * a short-fill (mean_returned<<k) detection */
     char            last_error[128];
     WarmupState      warmup_state;     /* Phase 3D: WARMUP_HOT for resident indexes */
     /* Phase 3D: warmup observability — populated when an index is hydrated from
@@ -267,6 +269,7 @@ reset_entry_stats(IndexEntry *e)
     e->last_returned_k    = 0;
     e->delta_merged_count = 0;
     e->bf_batch_count     = 0;
+    e->prefilter_fallback_count = 0;
     e->last_error[0]      = '\0';
     e->last_warmup_at     = 0;   /* Phase 3D warmup observability */
     e->warmup_duration_ms = 0;
@@ -3043,7 +3046,42 @@ handle_search(int client_fd, const CuvsCmdFrame *cmd)
                         pret = cuvs_cagra_search_filtered(
                             e->handle, query, (int)cmd->dim, k,
                             bitset, nv, praw, e->gpu_device_id);
-                        if (pret == 0) used_cagra = 1;
+                        if (pret == 0) {
+                            used_cagra = 1;
+                            /* #133 / ADR-083: 3O's BITSET-masked CAGRA traversal
+                             * can collapse on anti-correlated filters -- selectivity
+                             * does not predict it (measured recall 0.0 across
+                             * 0.0001-0.5 selectivity), but the traversal never
+                             * reaching the passing rows does: it comes back with
+                             * far fewer than k filled slots. Healthy cells returned
+                             * exactly min(k, |filter|); every measured collapsed
+                             * cell returned <=2.02 out of k=10. TAIL CONTRACT
+                             * (cuvs_wrapper.h, #103) pads unfilled slots with
+                             * CUVS_PAD_ITEM_ID and guarantees padding is
+                             * trailing-only, so a forward scan to the first pad
+                             * gives the fill count without needing to know which
+                             * candidates the corpus could actually supply.
+                             *
+                             * `expect` is what a correct answer could return: k,
+                             * or the whole filter set if it is smaller than k (a
+                             * short-but-correct answer must not be mistaken for a
+                             * collapse). Retrying below half of `expect` sits far
+                             * under the healthy floor (=expect) and far over the
+                             * observed collapse ceiling (2.02 out of an expect of
+                             * 10 here), so it will not misfire on a legitimately
+                             * short answer nor miss the measured failure mode. */
+                            int filled = 0;
+                            while (filled < k && praw[filled].item_id != CUVS_PAD_ITEM_ID)
+                                filled++;
+                            int expect = k;
+                            if ((int64_t)cmd->n_filter_tids < (int64_t)expect)
+                                expect = (int)cmd->n_filter_tids;
+                            if (filled * 2 < expect) {
+                                pret = 1;
+                                used_cagra = 0;
+                                e->prefilter_fallback_count++;
+                            }
+                        }
                     }
                     if (pret != 0 && e->main_bf_idx != NULL)
                         pret = cuvs_bf_search_filtered(
