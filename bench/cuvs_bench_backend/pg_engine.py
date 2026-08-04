@@ -87,6 +87,18 @@ DEFAULT_SWEEPS = {
 
 
 # ── fbin / recall helpers (vendored so the backend is self-contained) ────────
+def _is_relation_name_collision(exc):
+    """True when `exc` is PostgreSQL refusing a name another relation holds.
+
+    Identified by SQLSTATE, not by exception class: psycopg is not installed on
+    the CPU-only CI runner, so importing it here to name the classes would make
+    an ordinary build failure raise ModuleNotFoundError instead. psycopg3
+    exposes `.sqlstate`; `.pgcode` is psycopg2's spelling of the same field.
+    """
+    code = getattr(exc, "sqlstate", None) or getattr(exc, "pgcode", None)
+    return code in PgEngine._NAME_COLLISION_SQLSTATES
+
+
 def read_fbin(path, count=None, offset=0):
     """big-ann .fbin: int32 n, int32 dim, then n*dim float32 row-major.
     Returns an (count, dim) float32 memmap view."""
@@ -579,6 +591,15 @@ class PgEngine:
                     "intermediate_graph_degree": INTERMEDIATE_GRAPH_DEGREE}
         return {}
 
+    # PostgreSQL SQLSTATEs for "that relation name is already taken":
+    #   23505 unique_violation  -- the pg_class_relname_nsp_index collision the
+    #                              #98 resume proof actually hit
+    #   42P07 duplicate_table   -- the same conflict seen at name-lookup time
+    # Matched by code rather than by psycopg exception class so this module
+    # keeps working where psycopg is absent (the CPU-only CI runner imports it
+    # for collection but cannot install the driver).
+    _NAME_COLLISION_SQLSTATES = ("23505", "42P07")
+
     def build(self, algo, n, sample_query=None, build_cfg=None, keep=()):
         """Build `algo`'s index under `build_cfg`.
 
@@ -622,11 +643,11 @@ class PgEngine:
         explicit transaction, and this connection is autocommit BECAUSE a cagra
         build inside a transaction block corrupts the backend (see __init__).
         """
-        import psycopg
         try:
             return self._build_once(algo, n, sample_query, build_cfg, keep)
-        except (psycopg.errors.UniqueViolation,
-                psycopg.errors.DuplicateTable) as e:
+        except Exception as e:  # noqa: BLE001 -- re-raised unless it is 23505/42P07
+            if not _is_relation_name_collision(e):
+                raise
             print(f"[engine] WARN: {algo} build hit a relation-name collision "
                   f"({e.__class__.__name__}); an index left by another backend "
                   f"became visible after the pre-build drop. Re-dropping and "
