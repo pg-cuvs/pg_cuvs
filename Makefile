@@ -32,6 +32,13 @@ REGRESS_OPTS   = --inputdir=test --outputdir=test
 REGRESS_TIER2_ONLY = build_hnsw build_hnsw_edge pg_cuvs_hnsw routing_golden_measured
 REGRESS_TIER1      = $(filter-out $(REGRESS_TIER2_ONLY),$(REGRESS))
 
+# GPU-residency-dependent (#89 item 2): build_oom, build_multi_oom, and
+# build_oom_evict_to_fit inject synthetic build OOMs and assert an
+# evict-and-retry outcome. Deterministic on the CPU shim (Tier-1 CI). On
+# real GPU (esp. single-GPU dev VM) the evict-retry outcome depends on what
+# is resident/evictable at run time, so a full-suite GPU run may flake on
+# these — that is environment-dependent, not a code regression.
+
 # Isolation tests (pg_isolation_regress) for concurrent-session correctness that
 # pg_regress cannot express: snapshot-aware tombstone filtering and write/query
 # interleaving. Specs live in test/specs/*.spec, expected in test/expected/*.out.

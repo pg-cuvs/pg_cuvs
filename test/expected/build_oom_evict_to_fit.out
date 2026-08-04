@@ -12,6 +12,13 @@
 -- Each scenario creates its OWN >=2 resident victims so it holds standalone.
 --
 -- REQUIRES: pg_cuvs_server running; cuvs.index_dir writable. Tier-1 CI (CPU shim).
+--
+-- ENVIRONMENT-DEPENDENT (#89 item 2): on the CPU shim (Tier-1 CI) the OOM
+-- injection is deterministic, so this test is a stable pass. On real GPU —
+-- especially a single-GPU dev VM — the evict-retry outcome is residency-
+-- state-dependent: it depends on what is resident and evictable at run
+-- time, so a full-suite GPU run may show this test flaking between runs.
+-- A flake here on GPU is environment-dependent, NOT a code regression.
 \set ON_ERROR_STOP on
 SET client_min_messages = warning;
 CREATE EXTENSION IF NOT EXISTS vector;
