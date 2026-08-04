@@ -44,6 +44,17 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                  "..", "filter_recall"))
 from adr079_reuse import corpus_fingerprint  # noqa: E402
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from sidecar import (  # noqa: E402
+    ALL_RELATIONS,
+    INTERMEDIATE_GRAPH_DEGREE,
+    RELATION_OF,
+    SIBLING_OF,
+    SOURCE_RELATION,
+    parse_build_notices,
+    parse_reloptions,
+)
+
 INDEX_DIR_DEFAULT = "/tmp/cuvs_indexes"
 
 ALGOS = ("pgvector_hnsw", "pgvector_ivfflat", "pgcuvs_cagra", "pgcuvs_hnsw_import")
@@ -120,7 +131,10 @@ class PgEngine:
     engine's -- see run_cohere.sh restart_daemon/stop_daemon, mirrored by the
     cuvs-bench backend and the standalone main() below."""
 
-    ANN_INDEXES = ("t_hnsw", "t_ivf", "t_cagra")
+    # #98: one relation per algo (sidecar.RELATION_OF). The pre-#98 list mapped
+    # both pgvector_hnsw and 3I onto a single "t_hnsw", so a reuse gate could
+    # not tell whose index was resident.
+    ANN_INDEXES = ALL_RELATIONS
     CORPUS_MARKER = "public._bench_corpus"
     # #78 review F3: string_agg() of one 32-byte md5 hex digest per row hits
     # PostgreSQL's 1GB varlena limit at 1_073_741_824 // 32 ~= 33.5M rows --
@@ -157,6 +171,14 @@ class PgEngine:
         import pgvector.psycopg
         pgvector.psycopg.register_vector(self.conn)
         self.index_dir = index_dir
+        # #98: the 3I build's only self-describing evidence (M, graph_degree,
+        # max_level, mode) is a server NOTICE -- psycopg drops those unless a
+        # handler is attached, so attach one for the connection's whole life and
+        # let build() snapshot it. Diagnostic objects are not retained (they are
+        # only valid inside the callback); the message text is.
+        self._notices = []
+        self.conn.add_notice_handler(
+            lambda diag: self._notices.append(str(diag.message_primary)))
 
     # -- data ------------------------------------------------------------------
     def _dump_78_evidence(self, cur, got, n):
@@ -319,6 +341,19 @@ class PgEngine:
                     "WHERE a.attrelid = 'public.t'::regclass AND a.attname = 'embedding'")
                 same_dim = cur.fetchone()[0] == dim
             if exists and same_dim:
+                # An ANN index left on `t` across a real reload is worse than
+                # useless. TRUNCATE + COPY keeps it correct by maintaining it
+                # one row at a time, which (a) ran past 15 minutes for 100k rows
+                # with a resident HNSW + CAGRA index (measured on the VM; every
+                # CAGRA insert is an IPC round trip to the daemon) and (b)
+                # leaves an index assembled by insertion while the sidecar still
+                # claims the bulk CREATE INDEX time of the previous one -- a
+                # build_time attached to an index it does not describe. Drop
+                # them and let the ownership gate rebuild. #78's TRUNCATE (over
+                # DROP TABLE CASCADE) still does its job: it preserves the index
+                # on the path that does NOT reload, which is the early return
+                # above and the only place preserving one was ever the point.
+                self._drop_ann_indexes()
                 cur.execute("TRUNCATE t")
             else:
                 if exists:
@@ -364,10 +399,52 @@ class PgEngine:
         print(f"[engine] corpus fingerprint {sql_fp[:12]}... verified + stored "
               f"(dataset={dataset})", flush=True)
 
-    def _drop_ann_indexes(self):
+    def _drop_ann_indexes(self, keep=()):
+        """Drop every ANN index except those named in `keep`.
+
+        The default (keep=()) is the pre-#98 behaviour -- drop everything -- and
+        it is the safe default on purpose: two candidate index paths on the same
+        column let the planner choose, so a leftover index turns "what does this
+        row measure" into a guess. `keep` is the deliberate opt-in for the
+        already-verified co-resident configurations (t_cagra + t_hnsw_pgv).
+
+        One exception is not negotiable: the two hnsw-shaped relations are never
+        both resident, so a sibling in `keep` is still dropped (with a warning).
+        """
+        keep = set(keep)
         with self.conn.cursor() as cur:
             for nm in self.ANN_INDEXES:
+                if nm in keep:
+                    continue
                 cur.execute("DROP INDEX IF EXISTS " + nm)
+
+    def _drop_for(self, algo, keep=()):
+        """Drop what must go before building `algo`: its own relation (a rebuild
+        replaces it), its hnsw sibling if any, and anything not in `keep`."""
+        keep = set(keep)
+        target = RELATION_OF[algo]
+        keep.discard(target)
+        sibling = SIBLING_OF.get(target)
+        if sibling and sibling in keep:
+            print(f"[engine] WARN: keep={sorted(keep)} asked to retain {sibling} "
+                  f"alongside {target}; dropping it anyway (two hnsw indexes on "
+                  f"one column make the planner's choice ambiguous)", flush=True)
+            keep.discard(sibling)
+        if algo == "pgcuvs_hnsw_import":
+            # 3I builds its own source graph, so t_cagra is rebuilt too.
+            keep.discard(SOURCE_RELATION)
+        self._drop_ann_indexes(keep=keep)
+
+    def reloptions(self, name):
+        """pg_class.reloptions of `name` as a dict, or None when absent."""
+        with self.conn.cursor() as cur:
+            cur.execute(
+                "SELECT c.reloptions FROM pg_class c "
+                "WHERE c.oid = to_regclass(%s)", (f"public.{name}",))
+            row = cur.fetchone()
+        if row is None:
+            return None
+        return parse_reloptions(row[0])
 
     def _relsize(self, name):
         with self.conn.cursor() as cur:
@@ -391,35 +468,72 @@ class PgEngine:
         return int(row[0]) if row and row[0] is not None else None
 
     # -- build -----------------------------------------------------------------
-    def build(self, algo, n, sample_query=None):
-        """Build the index for `algo`. Returns (build_time_s, index_bytes).
-        sample_query (1-D float array) is REQUIRED for pgcuvs_hnsw_import: a
-        dummy search triggers the lazy .hnsw sidecar serialization needed by
-        pg_cuvs_import_hnsw."""
+    def default_build_cfg(self, algo, n):
+        """The build config used when a caller passes none.
+
+        pgvector's cell derives from HNSW_M / HNSW_EF_CONSTRUCTION rather than
+        repeating the numbers, because build_time_arm.py labels its rows from
+        those same constants (#78 review F8) -- a second copy would drift and
+        the published CSV would then describe the wrong build.
+        """
+        if algo == "pgvector_hnsw":
+            return {"m": self.HNSW_M, "ef_construction": self.HNSW_EF_CONSTRUCTION}
+        if algo == "pgvector_ivfflat":
+            return {"lists": self.ivfflat_lists(n)}
+        if algo == "pgcuvs_cagra":
+            return {"graph_degree": 64,
+                    "intermediate_graph_degree": INTERMEDIATE_GRAPH_DEGREE}
+        if algo == "pgcuvs_hnsw_import":
+            return {"mode": "nsw", "graph_degree": 64,
+                    "intermediate_graph_degree": INTERMEDIATE_GRAPH_DEGREE}
+        return {}
+
+    def build(self, algo, n, sample_query=None, build_cfg=None, keep=()):
+        """Build `algo`'s index under `build_cfg`.
+
+        Returns (build_time_s, index_bytes, notice_meta) -- notice_meta carries
+        whatever the server's build NOTICE reported (3I only; {} elsewhere).
+
+        build_cfg is the #98 first-class build dimension: pgvector takes
+        {m, ef_construction}, cagra {graph_degree, intermediate_graph_degree},
+        3I {mode, graph_degree, intermediate_graph_degree}. None -> the algo's
+        default cell (default_build_cfg).
+
+        `keep` names relations that must survive the pre-build drop; see
+        _drop_ann_indexes for why the default drops everything.
+
+        sample_query is accepted for call compatibility and unused: the unified
+        0.5.0 export needs no dummy search.
+        """
         assert algo in ALGOS, f"unknown algo {algo}"
+        cfg = dict(build_cfg) if build_cfg else self.default_build_cfg(algo, n)
         c = self.conn
-        self._drop_ann_indexes()
+        self._drop_for(algo, keep=keep)
+        self._notices = []
         c.execute("SET maintenance_work_mem = '16GB'")
         c.execute("SET max_parallel_maintenance_workers = 7")
 
         if algo == "pgvector_hnsw":
+            m = int(cfg.get("m", self.HNSW_M))
+            efc = int(cfg.get("ef_construction", self.HNSW_EF_CONSTRUCTION))
             t0 = time.perf_counter()
-            c.execute(f"CREATE INDEX t_hnsw ON t USING hnsw (embedding vector_l2_ops) "
-                      f"WITH (m={self.HNSW_M}, ef_construction={self.HNSW_EF_CONSTRUCTION})")
-            return time.perf_counter() - t0, self._relsize("t_hnsw")
+            c.execute("CREATE INDEX t_hnsw_pgv ON t USING hnsw (embedding vector_l2_ops) "
+                      f"WITH (m={m}, ef_construction={efc})")
+            return time.perf_counter() - t0, self._relsize("t_hnsw_pgv"), {}
 
         if algo == "pgvector_ivfflat":
-            lists = self.ivfflat_lists(n)
+            lists = int(cfg.get("lists", self.ivfflat_lists(n)))
             t0 = time.perf_counter()
-            c.execute(f"CREATE INDEX t_ivf ON t USING ivfflat (embedding vector_l2_ops) "
+            c.execute("CREATE INDEX t_ivf ON t USING ivfflat (embedding vector_l2_ops) "
                       f"WITH (lists={lists})")
-            return time.perf_counter() - t0, self._relsize("t_ivf")
+            return time.perf_counter() - t0, self._relsize("t_ivf"), {}
 
         if algo == "pgcuvs_cagra":
             c.execute(f"SET cuvs.index_dir = '{self.index_dir}'")
             c.execute("SET maintenance_work_mem = '8GB'")
             t0 = time.perf_counter()
-            c.execute("CREATE INDEX t_cagra ON t USING cagra (embedding vector_l2_ops)")
+            c.execute("CREATE INDEX t_cagra ON t USING cagra (embedding vector_l2_ops) "
+                      + self._cagra_with(cfg))
             bt = time.perf_counter() - t0
             # CAGRA graph is VRAM-resident (pg_relation_size == 0); report the
             # daemon's self-accounted VRAM footprint instead (issue #75).
@@ -429,31 +543,46 @@ class PgEngine:
                       "(daemon down / not resident); index_bytes falls back to 0",
                       flush=True)
                 vram = self._relsize("t_cagra")
-            return bt, vram
+            return bt, vram, {}
 
-        # pgcuvs_hnsw_import (3I): GPU CAGRA build -> pg_cuvs_build_hnsw(cagra, mode).
-        # The unified 0.5.0 API (ADR-037) creates the pgvector HNSW index directly
-        # from the CAGRA graph via INDEX_CREATE_SKIP_BUILD (no 285s CPU build) and
-        # RETURNS the new index's regclass. It replaces the removed two-step
-        # pg_cuvs_import_hnsw(cagra, hnsw). mode 'nsw' = flat level-0 NSW (recommended
-        # default). build_time = CAGRA build + HNSW export (the GPU-build-accelerator
-        # figure). sample_query is unused now (no dummy fallback search needed).
+        # pgcuvs_hnsw_import (3I): GPU CAGRA build -> pgvector HNSW export.
+        #
+        # The export runs as a DDL CREATE INDEX on the pg_cuvs_hnsw AM, NOT via
+        # pg_cuvs_build_hnsw(): that function is deprecated (it says so in a
+        # NOTICE, src/hnsw_export.c:1837-1842) and creates the index with
+        # reloptions NULL, which leaves the resulting relation unable to say
+        # what built it. The DDL form stores source/mode/m/ef_construction as
+        # reloptions (:1889-1905) and names the index directly, so the reuse
+        # gate has a catalog fact to check and no RENAME is needed. A benchmark
+        # meant for publication does not measure an API the repo tells callers
+        # not to use.
+        mode = str(cfg.get("mode", "nsw"))
         c.execute(f"SET cuvs.index_dir = '{self.index_dir}'")
         c.execute("SET maintenance_work_mem = '8GB'")
         t0 = time.perf_counter()
-        c.execute("CREATE INDEX t_cagra ON t USING cagra (embedding vector_l2_ops)")
+        c.execute("CREATE INDEX t_cagra ON t USING cagra (embedding vector_l2_ops) "
+                  + self._cagra_with(cfg))
         t_cagra = time.perf_counter() - t0
         t1 = time.perf_counter()
-        with c.cursor() as cur:
-            cur.execute("SELECT pg_cuvs_build_hnsw('t_cagra'::regclass, 'nsw')::regclass::text")
-            gen = cur.fetchone()[0]
-            assert gen is not None, "pg_cuvs_build_hnsw returned NULL"
-        t_build = time.perf_counter() - t1
-        # normalize the generated index name to t_hnsw so _drop_ann_indexes and the
-        # planner-driven search path stay uniform across algos.
-        if str(gen).split(".")[-1] != "t_hnsw":
-            c.execute(f"ALTER INDEX {gen} RENAME TO t_hnsw")
-        return t_cagra + t_build, self._relsize("t_hnsw")
+        c.execute("CREATE INDEX t_hnsw_3i ON t USING pg_cuvs_hnsw "
+                  "(embedding vector_l2_ops) "
+                  f"WITH (source='{SOURCE_RELATION}', mode='{mode}')")
+        t_export = time.perf_counter() - t1
+        meta = parse_build_notices(self._notices)
+        return t_cagra + t_export, self._relsize("t_hnsw_3i"), meta
+
+    @staticmethod
+    def _cagra_with(cfg):
+        """WITH(...) clause for a CAGRA build, or '' when cfg pins nothing.
+
+        intermediate_graph_degree must be >= graph_degree (src/pg_cuvs.c:1265),
+        so both travel together or neither does.
+        """
+        gd = cfg.get("graph_degree")
+        if gd is None:
+            return ""
+        igd = int(cfg.get("intermediate_graph_degree", INTERMEDIATE_GRAPH_DEGREE))
+        return f"WITH (graph_degree={int(gd)}, intermediate_graph_degree={igd})"
 
     # -- search ----------------------------------------------------------------
     def search(self, algo, queries, kmax, param, warmup=200):
@@ -576,7 +705,7 @@ def main():
         eng = PgEngine(dbname=args.dbname, index_dir=args.index_dir)
         eng.load_corpus(args.corpus, args.n, dim, dataset=args.dataset)
         print(f"[engine] build {algo} ...", flush=True)
-        bt, ibytes = eng.build(algo, args.n, sample_query=qset[0])
+        bt, ibytes, _meta = eng.build(algo, args.n, sample_query=qset[0])
         print(f"[engine] {algo} build {bt:.1f}s size {ibytes/1e6:.0f}MB", flush=True)
         for param in DEFAULT_SWEEPS[algo]:
             if algo in ("pgvector_hnsw", "pgcuvs_hnsw_import") and param < kmax:

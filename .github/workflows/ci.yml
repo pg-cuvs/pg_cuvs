@@ -182,6 +182,18 @@ jobs:
           # #45's soft-LRU churn deterministically. Installed server = shim (no CUDA).
           bash infra/scripts/tests/max-indexes-scale.sh
 
+      # The benchmark harness decides which index a published number describes
+      # (ownership keys, reloptions checks, the 3I build-NOTICE parser, --resume
+      # row skipping). Until now this job ran no Python at all, so those rules
+      # were only ever exercised by hand on the GPU VM. They are pure logic and
+      # need neither a database nor cuvs_bench -- bench/cuvs_bench_backend/
+      # tests skip themselves when a live PostgreSQL is absent.
+      - name: Benchmark harness unit tests (CPU, no DB)
+        run: |
+          python3 -m pip install --quiet --upgrade pip
+          python3 -m pip install --quiet pytest numpy
+          python3 -m pytest bench/cuvs_bench_backend/ -q
+
       - name: Upload diffs + daemon log on failure
         if: failure()
         uses: actions/upload-artifact@v4
