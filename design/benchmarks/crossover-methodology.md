@@ -548,6 +548,24 @@ max_vram_mb (daemon 시작 플래그):
 
 **3I speedup: 2.0× vs pgvector native (1M×1024, 이 섹션 285s 기준)**
 
+> **2026-08-05 신규 엔트리 (#98, wiki_all_1M 1M×768, `massedcompute_A100_sxm4_80G_DGX`).**
+> 위 두 raw-cuVS 가드(§16.1·§16.2)는 그대로 유효하다 — 저 수치들은 여전히 라이브러리 단독
+> 값이고 이 항목이 대체하지 않는다. 아래는 **다른 하네스·다른 호스트·다른 데이터셋의 별개
+> 측정**이며 위 표와 비율로 엮지 않는다
+> ([`pg_cuvsbench_98.csv`](../../bench/results/pg_cuvsbench_98.csv),
+> [`BENCHMARK.md` §2.1c](../../BENCHMARK.md)):
+>
+> | 항목 | 값 (recall≥0.95, 같은 run) |
+> |---|---|
+> | 3I 빌드 (gd=64/hnswlib) vs pgvector native (m=16/efc=64) | 59.6s vs 118.7s = **1.99×** |
+> | CAGRA 빌드 vs pgvector native | 24.3s vs 118.7s = **4.88×** |
+> | 3I 검색 vs pgvector 검색 | 177.1 vs 102.1 QPS = **1.73×** |
+>
+> 빌드 speedup 1.99×가 이 섹션의 2.0×와 근접한 것은 **다른 데이터셋·호스트에서 나온 별개
+> 관측의 일치**이지, 같은 측정의 재현이 아니다. 검색 축 1.73×는 이 섹션에 대응 수치가 없는
+> **신규** 비교쌍이다(§16.1은 3I를 pgvector보다 느리게 기록했는데, 그것은 iso-recall이 아닌
+> 최고-recall 점 비교였다).
+
 ### 16.3 synthetic vs real 비교
 
 | 항목 | synthetic (§13, 1M×384) | real Cohere (§16, 1M×1024) |

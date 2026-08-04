@@ -484,7 +484,18 @@ def emit_batch(args, eng, emit, done, algo, p, cfg, queries, gt, bt, ibytes,
     notes.append(f"repeats={len(per_repeat)} median={med*1000:.1f}ms "
                  f"min={min(per_repeat)*1000:.1f}ms max={max(per_repeat)*1000:.1f}ms")
     notes.append(gate_fallback(name, fb_delta))
-    notes.append(gate_batch_recall(args, name, recall, p["recall"]))
+
+    # Single-query recall on the graph that is resident RIGHT NOW, under the
+    # same cuvs.k the batch call used. p["recall"] would be cheaper, but Phase 2
+    # has usually rebuilt to the Pareto cell by this point, so comparing against
+    # it charges build nondeterminism to the kernel split. ~2000 serial queries,
+    # a few seconds, and it is what makes the recorded delta same-graph.
+    s_ids, _ = eng.search(algo, queries, args.k, K)
+    single_recall = _recall_at_k(s_ids, gt[:len(s_ids)], args.k)
+    notes.append(f"same-graph single recall={single_recall:.6f} at K={K} "
+                 f"(measured on the resident index, not the Phase-1 row "
+                 f"{p['recall']} which predates the Pareto rebuild)")
+    notes.append(gate_batch_recall(name, recall, single_recall))
 
     emit(throughput_row(name, param, args.k, recall, qps, med * 1000.0,
                         p["build_params"], len(queries), build_time_s=bt,
@@ -698,23 +709,53 @@ def gate_conc1_ratio(name, conc_qps, latency_qps, lo=0.8, hi=1.0):
                  hard=False)
 
 
-def gate_batch_recall(args, name, batch_recall, single_recall):
-    """Batch and single-query recall need not be identical: the AM path picks
-    the CAGRA kernel by batch size (single-CTA vs multi-CTA), so a delta is
-    expected rather than a bug. The tolerance is therefore a measured input
-    (--batch-recall-tol, set from the rehearsal's observed delta x2), and with
-    no tolerance given the arm runs in observe-and-record mode: both recalls go
-    into the CSV and the report compares them. Hardcoding 0.001 here would
-    manufacture a failure out of a known kernel difference."""
+# A total-error detector, NOT a recalibration of the tolerance below. The
+# calibrated gate was falsified at 1M (see gate_batch_recall) and no replacement
+# tolerance is derived from that measurement -- deriving one from the datum it
+# is meant to judge is what the falsification forbids. This number is
+# deliberately uncalibrated and an order of magnitude above every delta ever
+# observed (100k: 0.00065/0.0010; 1M: 0.00225/0.00240/0.00250): it fires only
+# for gross faults -- ground-truth misalignment, a wrong K, shm corruption --
+# where the batch arm is not searching what it claims to be searching at all.
+BATCH_RECALL_TRIPWIRE = 0.01
+
+
+def gate_batch_recall(name, batch_recall, single_recall):
+    """Batch-vs-single recall: OBSERVE-AND-RECORD, plus a coarse tripwire.
+
+    Batch and single-query recall need not be identical -- the AM path picks the
+    CAGRA kernel by batch size (single-CTA `cuvs_wrapper.cu:1116-1130` vs
+    multi-CTA `:1211-1220`), so a delta is a property of the kernel split rather
+    than a bug. #98 therefore required the tolerance to be measured rather than
+    hardcoded, and Stage 1 measured 0.002 from 100k same-graph deltas.
+
+    That gate was then falsified by its own measurement. At 1M the same-graph
+    delta is 0.00225 / 0.00240 / 0.00250 over three samples on one resident
+    graph -- reproducibly past 0.002, with the batch side bit-identical every
+    time (0.990700) and the sign stable (batch lower), where at 100k it had been
+    under 0.001 and had flipped sign between builds. The divergence tracks scale
+    AND/OR K (100k was calibrated at K=64, 1M measured at K=200 -- both moved,
+    so neither can be named the cause), and raw `cuvs_batch` shows the same
+    direction at 0.9892 without any pg_cuvs code in the path, which places the
+    divergence in the cuVS kernels rather than this extension's plumbing.
+
+    A tolerance recalibrated on that data would be measuring the divergence
+    against itself. So the batch arm records both recalls and their delta and
+    gates nothing; interpretation belongs in the report, next to the numbers.
+    The divergence itself is tracked as a product observation in #144 -- this
+    function's job is to record the inputs that issue reasons about, not to
+    decide whether the batch path's lower recall is acceptable.
+    The caller measures `single_recall` on the RESIDENT graph, not on the
+    Phase-1 latency row -- Phase 2 usually rebuilds to the Pareto cell first, so
+    the Phase-1 row's recall belongs to a different graph and any delta against
+    it mixes kernel divergence with build nondeterminism."""
     delta = abs(batch_recall - single_recall)
-    txt = (f"batch recall={batch_recall:.4f} vs single={single_recall:.4f} "
-           f"delta={delta:.4f}")
-    if args.batch_recall_tol is None:
-        return "observe-and-record " + txt
-    # HARD once a tolerance exists: past it, the batch arm is not returning the
-    # same neighbours as the point it is labelled with.
-    return _gate(name, delta <= args.batch_recall_tol,
-                 txt + f" (tol={args.batch_recall_tol})", hard=True)
+    txt = (f"batch recall={batch_recall:.4f} vs same-graph single="
+           f"{single_recall:.4f} delta={delta:.4f}")
+    return ("observe-and-record " + txt + "; "
+            + _gate(f"{name} tripwire", delta <= BATCH_RECALL_TRIPWIRE,
+                    f"|delta|={delta:.4f} vs uncalibrated tripwire "
+                    f"{BATCH_RECALL_TRIPWIRE}", hard=True))
 
 
 def _recall_at_k(ids, gt, k):
@@ -777,14 +818,9 @@ def main():
                     help="seconds of sustained load per conc arm")
     ap.add_argument("--batch-repeats", type=int, default=10)
     ap.add_argument("--batch-warmup", type=int, default=2)
-    ap.add_argument("--batch-recall-tol", type=float, default=None,
-                    help="batch-vs-single recall gate = measured delta x2. "
-                         "Deltas so far (N=100k): raw arm +0.0002 / +0.0003 "
-                         "(gd=64, K=100), SQL batch arm 0.0012 (gd=32, K=64) -- "
-                         "they move, so this stays a config value and gets "
-                         "recalibrated at the Stage-1 rehearsal rather than "
-                         "being frozen here. Omitted -> observe-and-record "
-                         "(both recalls in the CSV, nothing gated)")
+    # --batch-recall-tol is gone: the calibrated gate it fed was falsified at 1M
+    # (gate_batch_recall) and demoted to observe-and-record. Keeping the flag
+    # would invite recalibrating the bar from the measurement it judges.
     ap.add_argument("--skip-raw-batch", action="store_true",
                     help="skip the raw cuVS batch arm (PR-B's cuvs_engine)")
     args = ap.parse_args()

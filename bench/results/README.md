@@ -31,7 +31,60 @@ file exists so a link that lands directly on a CSV does not lose the context.
 | `hnsw_import_bench.csv` | 2026-06-01 | 3I import harness | synthetic | A100 | CAGRA→HNSW import speedup — not re-audited |
 | `adr083_133_anti_after_fix.csv` | 2026-08-04 | `bench/filter_recall/adr079_3o_recall.py --correlations anti` | wiki_all_1M | Brev A100-SXM4-80GB | superseded by `_after_review_fixes` (pre-F1/F2/F3/F5 review round) |
 | `adr083_133_anti_after_review_fixes.csv` | 2026-08-04 | `bench/filter_recall/adr079_3o_recall.py --correlations anti` | wiki_all_1M | Brev A100-SXM4-80GB | **canonical** — #133/ADR-083 fix verification at the final commit (after the F1/F2/F3/F5 adversarial-review fixes): 3O recall 0.998/0.999 vs 0.0 before (`adr079_3o_correlation.csv`/`_hisel.csv`, same harness/host) |
+| `pg_cuvsbench_98.csv` | 2026-08-05 | cuvs-bench (pg backend), 2-phase #98 harness | wiki_all_1M, 1M×768 | **massedcompute_A100_sxm4_80G_DGX** (Brev `pg-cuvs-item2b`) | **canonical** — the two-axis build-parameter sweep (#98). See below |
 | `adr083_133_anti_per_query.csv` | 2026-08-04 | `bench/filter_recall/adr079_3o_recall.py --correlations anti --dump-per-query` | wiki_all_1M | Brev A100-SXM4-80GB | **canonical** — #133 review F7: per-query `returned` for every query behind `adr083_133_anti_after_review_fixes.csv`'s 3O rows. All 400 queries (200 x 2 selectivities) returned exactly k=10 -- not a bimodal mix that would indicate the guard under-triggers on some queries |
+
+## `pg_cuvsbench_98.csv` — the #98 two-axis run
+
+100 rows from **one process, one set of indexes, one file**: 88 `axis=latency` +
+12 `axis=throughput`. Every row carries `axis` and `build_params`, and every row has
+`success=True`.
+
+**Relationship to `pg_cuvsbench_wiki1m_brev.csv` — neither supersedes the other.**
+They answer different questions on the same dataset. The Brev file is a *fixed-config
+cross-machine reproduction*: one build config per algo, run to show that the RunPod
+numbers reproduce on a second host. This file is a *sweep*: four algos over a build
+grid (pgvector `m`×`ef_construction`, CAGRA/raw `graph_degree`, 3I `mode`×`graph_degree`),
+plus a throughput axis the older file has no rows for at all. Neither file's rows can
+replace the other's, and they were taken on different hosts.
+
+**Host caveat — this is the DGX variant.** `massedcompute_A100_sxm4_80G_DGX` is not the
+same node type as the `A100-SXM4-80GB` behind the Brev canonical rows, and §2.1b of
+`BENCHMARK.md` already documents ~3.5× QPS swings between nominally identical A100
+hosts *including for the 0%-GPU pgvector baseline*. **Cite ratios measured within this
+file only.** Absolute QPS, p50 and `build_time_s` here are not comparable to any other
+artifact in this ledger.
+
+Conditions recorded in every row's `notes`:
+
+- **Daemon up for the entire run**, including the pgvector arms. pgvector search is pure
+  CPU (`enable_cuvs=off`), so a resident GPU daemon does not compete with it, but its
+  absolute QPS is nonetheless a "measured with the daemon resident" number.
+- `max_connections=100` — above the top concurrency rung (N=64) with headroom.
+- `cuvs.shard_count=1`, set explicitly rather than left at `0=auto`.
+- **conc arms**: 30 s sustained window per rung, N ∈ {1, 8, 16, 32, 64}, workers drawing
+  disjoint slices of the full 10k query pool; recall computed only over GT-covered
+  queries. `index_used` and a fallback-counter delta are recorded per arm — **the delta
+  is 0 on all ten conc rows**, so no arm was silently absorbed as a CPU exact search.
+- **batch arms**: warmup 2 + 10 timed repeats, median reported, percentiles `n/a` by
+  construction (one dispatch has no per-query distribution). Vectors are passed as
+  psycopg bind parameters, not inline literals — the documented exception to the
+  same-statement-shape rule, since 2000×768 inline would make parser time dominate.
+- **raw `cuvs` / `cuvs_batch` rows**: a second GPU tenant alongside the daemon.
+  `nvidia-smi` memory is logged at each raw build (deltas 120–486 MB); `index_bytes=0`
+  for these rows because the index is process-resident, not a PostgreSQL relation —
+  this is a not-applicable, not the `index_bytes=0` defect described below.
+
+**One row carries a `GATE-VIOLATION` note that the current harness would no longer
+emit.** `pgcuvs_cagra_batch` records `batch recall=0.9907 vs single=0.9928
+delta=0.0021 (tol=0.002)`. That calibrated gate was falsified by follow-up measurement
+on the resident graph (same-graph delta 0.00225 / 0.00240 / 0.00250 over three samples)
+and has since been demoted to observe-and-record with an uncalibrated `|delta| > 0.01`
+tripwire. The run was **not** repeated: all 100 rows are valid measurements, and the
+batch row's recall of 0.9907 is reproducible to four decimals. The note is left as the
+run emitted it rather than rewritten after the fact. The underlying kernel divergence is
+tracked as [#144](https://github.com/pg-cuvs/pg_cuvs/issues/144); read the batch row's
+recall as the batch path's own, never as the single-query path's.
 
 ## Known defects
 

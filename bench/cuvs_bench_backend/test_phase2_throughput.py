@@ -25,7 +25,6 @@ class Args:
     """Minimal stand-in for the runner's parsed argv."""
     def __init__(self, **kw):
         self.k = 10
-        self.batch_recall_tol = None
         self.__dict__.update(kw)
 
 
@@ -319,19 +318,24 @@ def test_conc1_ratio_violation_is_observational_not_fatal():
     assert not runner.GATE_VIOLATIONS, "observational gate must not set exit code"
 
 
-def test_batch_recall_gate_is_observe_and_record_without_a_tolerance():
-    txt = runner.gate_batch_recall(Args(), "a", 0.90, 0.99)
+def test_batch_recall_records_both_recalls_and_gates_nothing():
+    # The calibrated 0.002 gate was falsified at 1M (same-graph delta 0.00225 /
+    # 0.00240 / 0.00250) and demoted: the arm records, it does not judge. 0.0090
+    # is nearly 4x every delta ever measured and still must not fail.
+    txt = runner.gate_batch_recall("a", 0.9810, 0.9900)
     assert txt.startswith("observe-and-record")
-    assert "0.9000" in txt and "0.9900" in txt   # both recalls recorded
-    assert not runner.GATE_VIOLATIONS            # nothing is gated
+    assert "0.9810" in txt and "0.9900" in txt and "0.0090" in txt
+    assert "same-graph single" in txt
+    assert not runner.GATE_VIOLATIONS
 
 
-def test_batch_recall_gate_uses_the_measured_tolerance_when_given():
-    args = Args(batch_recall_tol=0.02)
-    assert runner.gate_batch_recall(args, "a", 0.97, 0.98).startswith("gate-ok")
-    # HARD: past the tolerance the batch arm is not returning the neighbours of
-    # the point it is labelled with.
-    assert runner.gate_batch_recall(args, "a", 0.90, 0.99).startswith("GATE-VIOL")
+def test_batch_recall_tripwire_fires_only_on_gross_divergence():
+    # Uncalibrated total-error detector, not a replacement tolerance: it exists
+    # for GT misalignment / wrong K / shm corruption, where the arm is not
+    # searching what its label says at all.
+    assert runner.gate_batch_recall("a", 0.90, 0.99).startswith(
+        "observe-and-record")           # the observation is still recorded
+    assert "GATE-VIOLATION" in runner.gate_batch_recall("a", 0.90, 0.99)
     assert runner.GATE_VIOLATIONS
 
 

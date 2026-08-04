@@ -70,6 +70,20 @@ GPU breakdown from Nsight Systems `cuda_gpu_kern_sum` / `cuda_gpu_mem_time_sum`.
   Q=1 kernel for 100× the queries. Throughput scales far better than single-query
   latency suggests.
 
+> **Alongside this table — the same-run wall-clock anchor (#98, 2026-08-05).** The
+> breakdown above is a *kernel-time* decomposition from an nsys profile on the §0
+> environment, dated 2026-06. §2.1c adds a separate, independently valid measurement of
+> a *different quantity*: raw cuVS and `pgcuvs_cagra` measured end-to-end, in one
+> process on one host on one day, at 708.3 vs 580.5 QPS at recall ≥0.95 — **1.22×**, or
+> **0.31 ms/query** for the whole SQL round trip, with the SQL path retaining 82% of raw
+> wall-clock throughput.
+>
+> **The two numbers are not comparable and neither corrects the other.** This table's
+> 715 µs is a sum of GPU kernel time; §2.1c's figures are wall-clock including Python
+> dispatch on the raw side and the full planner/detoast/IPC path on the SQL side, on a
+> different host (`_DGX`) at a different dimensionality (768 vs 1024). Refreshing the
+> kernel-time column belongs to the Nsight session, not to §2.1c's run.
+
 ### 1.2 Build path — the GPU floor and the removable PG overhead
 
 `CREATE INDEX USING cagra`, 1M × 1024, EXTENDED storage. GPU build segment from daemon
@@ -109,20 +123,19 @@ dominates* — the value is the removed backend overhead, not the clock.
 > This **corrected an earlier code-analysis estimate** (ADR-034) that assumed "GPU build
 > ~10 s vs PG overhead ~45 s." The measurement inverted it: GPU build dominates at 82%.
 
-> **TODO — raw cuVS is not validated against §2's SQL numbers.** §1.1's 715 µs kernel
-> and §1.2's 68 s build floor come from Nsight Systems / `perf` profiling on the §0
-> environment, dated to the ADR-057/058/059 (2026-06-07) / ADR-069 (2026-06-11) window.
-> §2.1a/§2.1b's `pgcuvs_cagra` numbers come from the cuvs-bench harness (ADR-080,
-> 2026-07-16 onward) — a different tool, on code more than 5 weeks later, host not
-> confirmed identical (§0 states `A100-SXM4-40GB`; the bench ledger records
-> `pg_cuvsbench_1m_legacy.csv`'s host only as `A100-40GB`). §2.1b's own finding — that a
-> 0%-GPU pgvector baseline still swung ~3.5× in QPS across two "same-model" A100
-> hosts — means these two figures **must not** be subtracted or ratioed against each
-> other; only the pg_cuvs-vs-pgvector comparisons *within* §2's own files are safe to
-> cite (§2.1a, §2.1b). Closing this requires a fourth cuvs-bench algo — raw cuVS
-> called directly, bypassing Postgres — registered in
-> [`bench/cuvs_bench_backend/backend.py`](bench/cuvs_bench_backend/) so all four
-> points come from one run/host/day, the same way the existing three already do.
+> **Raw cuVS is now anchored against the SQL numbers — in a separate, same-run
+> measurement (#98, 2026-08-05).** The gap this TODO described was that §1.1's 715 µs
+> kernel figure and §2's SQL numbers came from different tools, different code weeks
+> apart, and unconfirmed-identical hosts, so they could not be subtracted or ratioed.
+> That is closed by registering raw cuVS as a fourth algo in the cuvs-bench harness, so
+> raw and SQL points come from **one process, one index set, one CSV**
+> ([`pg_cuvsbench_98.csv`](bench/results/pg_cuvsbench_98.csv), §2.1c below).
+>
+> **The raw latency rows do not replace the 715 µs number, and are not a corrected
+> version of it.** They are a different quantity: wall-clock per query including Python
+> dispatch, versus a sum of GPU kernel time from an nsys profile. Both stand, measuring
+> different things. Updating §1.1's kernel time is the Nsight session's job, not this
+> run's.
 
 ### 1.3 Storage: TOAST (EXTENDED) vs PLAIN
 
@@ -248,6 +261,18 @@ The §2.1a sweep was re-run through the same cuvs-bench Postgres backend on
 | axis | RunPod → Brev | portable? |
 |------|---------------|-----------|
 | `index_bytes` (all 3 algos) | **byte-identical** (`3328000000` cagra, `4093870080` pgvector, `8192008192` 3I) | **yes — deterministic** |
+<!-- The cagra constant above is the gd=64 cell, which is the only one these two
+     fixed-config files built. #98 swept graph_degree and confirms the quantity is
+     deterministic but not a single constant: 3200000000 (gd=32) / 3328000000 (gd=64) /
+     3584000000 (gd=128), i.e. 1M × (768×4 + gd×4) exactly. 3I is 8192008192 at every
+     cell of its grid — mode and graph_degree do not move it. -->
+
+> **Reading the `index_bytes` row:** the value is deterministic *given the build
+> parameters*, not a single constant per algorithm. The three numbers above are the
+> `graph_degree=64` CAGRA cell and pgvector's `m=16` cells, because those are the only
+> configs these two files built. #98's sweep gives the full picture: CAGRA is
+> `1M × (768×4 + graph_degree×4)` — **3.20 GB / 3.33 GB / 3.58 GB** at gd 32/64/128 —
+> while 3I stays at `8192008192` across its entire `mode`×`graph_degree` grid.
 | best-recall QPS | cagra 169 → 672 (**3.98×**), pgvector 199 → 700 (**3.52×**), 3I 105 → 281 (2.67×) | **no — host-specific** |
 | build time (min) | cagra 61 → 32 s, pgvector 268 → 94 s, 3I 109 → 54 s (~2×) | **no — host-specific** |
 
@@ -274,39 +299,190 @@ QPS did not. Recall itself is mostly stable (cagra Δ ≤ 0.0016), except
 HNSW graph structure depends on the parallel worker count, and the beefier node
 builds a denser graph.
 
-**The wiki_all_1M ratio itself, via the standard ann-benchmarks convention.**
-Fix a target recall, take the highest-QPS point on each algorithm's curve that still
-clears it (the way `ann-benchmarks.com` and the DiskANN paper itself report
-"recall@k" — no same-recall-value interpolation, no curve-overlap caveat needed):
+### 2.1c wiki_all_1M, four algorithms, one run — the build-parameter sweep (#98)
 
-| recall@ | CAGRA (best ≥ target) | pgvector (best ≥ target) | QPS ratio | p50 ratio |
+Everything in this subsection comes from a **single file, single process, single set of
+indexes**: [`bench/results/pg_cuvsbench_98.csv`](bench/results/pg_cuvsbench_98.csv),
+2026-08-05, host `massedcompute_A100_sxm4_80G_DGX`. It supersedes the earlier
+stitched-together ratios in this section for every comparison it covers.
+
+Two rules govern how it is read, and both are structural rather than stylistic:
+
+1. **Two axes, never divided into each other.** `axis=latency` is one query at a time,
+   serial, `QPS = nq / Σ latency`. `axis=throughput` is each system's real dispatch
+   mechanism under sustained load. A latency-axis QPS and a throughput-axis QPS are
+   different quantities; no ratio in this document crosses them.
+2. **Build config is part of the point.** Each algorithm was swept over a build grid,
+   so "CAGRA at recall 0.95" names a `graph_degree`, not just a search parameter.
+   `intermediate_graph_degree=128` is pinned in every CAGRA/3I cell so that sweeping
+   `graph_degree` changes the degree alone and not the source-graph quality with it.
+
+#### Latency axis — best QPS clearing each recall bar, per build config
+
+Standard ann-benchmarks convention: fix a target recall, take the highest-QPS point on
+each curve that still clears it. Per algorithm, the best cell of its grid:
+
+| recall@ | raw `cuvs` | `pgcuvs_cagra` | `pgcuvs_hnsw_import` (3I) | `pgvector_hnsw` |
 |---|---|---|---|---|
-| ≥0.90 | sp=32, 0.9789, 671.8 QPS, 1.46 ms | ef=80, 0.9207, 245.0 QPS, 4.01 ms | 2.74× | 2.75× |
-| **≥0.95** | sp=32, 0.9789, 671.8 QPS, 1.46 ms | ef=200, 0.9585, 124.2 QPS, 8.02 ms | **5.41×** | **5.49×** |
-| ≥0.99 | sp=200, 0.998, 607.5 QPS, 1.62 ms | *no point clears 0.99* | — | — |
+| ≥0.90 | gd=32, k=64, 0.9400, **731.8** QPS, 1.36 ms | gd=32, k=32, 0.9473, **585.6**, 1.69 ms | gd=32/nsw, ef=32, 0.9037, **263.6**, 3.70 ms | m=32/efc=64, ef=40, 0.9149, **196.0**, 5.08 ms |
+| **≥0.95** | gd=32, k=200, 0.9913, **708.3**, 1.41 ms | gd=32, k=200, 0.9928, **580.5**, 1.71 ms | gd=64/hnswlib, ef=32, 0.9537, **177.1**, 5.56 ms | m=16/efc=64, ef=200, 0.9594, **102.1**, 9.78 ms |
+| ≥0.99 | gd=32, k=200, 0.9913, **708.3**, 1.41 ms | gd=32, k=200, 0.9928, **580.5**, 1.71 ms | gd=64/hnswlib, ef=128, 0.9910, **71.9**, 13.89 ms | *no point clears 0.99 at any m×efc* |
 
-**recall@0.95 → ~5.4×** is the citation to lead with: it needs no caveat because it
-compares both algorithms against the same external bar, not against each other's own
-extremes — exactly how the field already reports these numbers.
+The resulting within-file ratios, each with the recall pair it was taken at:
 
-The recall@0.99 row is not a gap in the table — it's the finding. pgvector's ceiling
-on this dataset is 0.9737 and it never reaches 0.99 at any tested `ef`, so there is no
-"CAGRA vs pgvector at recall 0.99" to report on this dataset; CAGRA's cheapest point
-(600 QPS / 1.66 ms, recall 0.9788) already exceeds that ceiling. Stated as a
-multiplier — **8.3× QPS, 8.3× lower p50** (600 vs 69, 1.66 ms vs 14.4 ms, Brev file)
-— that is what "push the target past where pgvector can go at all" looks like, not a
-different or larger version of the recall@0.95 number. Always report the recall pair
-(or, for this row, that pgvector has none) alongside any multiplier taken from it.
+| comparison | at recall ≥0.95 | at recall ≥0.99 |
+|---|---|---|
+| **CAGRA vs pgvector** | **5.69× QPS** (580.5 vs 102.1), 5.71× lower p50 | pgvector has no point — see below |
+| **CAGRA vs 3I** | **3.28×** (580.5 vs 177.1), 3.24× p50 | **8.07×** (580.5 vs 71.9), 8.11× p50 |
+| **3I vs pgvector** | **1.73×** (177.1 vs 102.1), 1.76× p50 | pgvector has no point |
+| **raw cuVS vs `pgcuvs_cagra`** | **1.22×** (708.3 vs 580.5), 1.22× p50 | 1.22× |
 
-**Same-file comparison: CAGRA vs `pgcuvs_hnsw_import` (3I, the CPU-export path from
-§1.4/§2.1a).** At matched recall ≈0.98 (cagra 0.9798, 3I 0.9808), CAGRA is **5.0×**
-faster (p50 1.64 ms vs 8.29 ms, QPS 601 vs 120) and its index is **0.41×** the size
-(3.33 GB vs 8.19 GB). The gap widens at high recall — at ≈0.999 (cagra 0.9993 vs 3I
-0.9988) p50 is **14.9×** apart (1.72 ms vs 25.6 ms). This does not contradict
-§2.1a's Cohere result, where 3I's build-time win (120 s vs 237 s, a *pgvector*-
-servable artifact) was the point, not its search speed — the two sections answer
-different questions (GPU search latency vs CPU-portable build cost) and should not
-be read as the same axis.
+**recall@0.95 → ~5.7× CAGRA over pgvector** is the citation to lead with; it replaces
+the ~5.41× figure this section previously carried, which came from a different host and
+a fixed-config file. The two are not a before/after of the same measurement — the older
+number is not wrong, it is a different run, and §2.1b's own 3.5× cross-host swing is
+exactly why they must not be differenced.
+
+The recall@0.99 column is not a gap in the table — it is the finding, and it reproduces.
+pgvector never clears 0.99 at **any** of the four `m`×`ef_construction` cells, so there
+is no "CAGRA vs pgvector at recall 0.99" to state on this dataset. Any multiplier quoted
+past pgvector's ceiling must be reported with the recall pair, or with the fact that
+pgvector has no such point.
+
+**The `raw cuVS vs pgcuvs_cagra` row is what closes §1.1's TODO — and it is a
+wall-clock anchor, not a kernel-time figure.** Both arms here are wall-clock per query;
+the raw arm still pays Python dispatch. Read the 1.22× as: taking the same CAGRA graph
+from a direct library call into a full SQL round trip — planner, heap detoast, IPC to
+the daemon, result marshalling — costs **0.31 ms/query** and retains **82%** of raw
+throughput. It does not replace, correct, or update §1.1's 715 µs kernel sum, which is
+a different quantity measured by a different tool; that number is the Nsight session's
+to revise.
+
+#### Build cost, same run
+
+| algo | best cell at recall ≥0.95 | build s | index bytes |
+|---|---|---|---|
+| raw `cuvs` | gd=32 | **5.7** | n/a (process-resident) |
+| `pgcuvs_cagra` | gd=32 | **24.3** | 3,200,000,000 |
+| `pgcuvs_hnsw_import` | gd=64/hnswlib | **59.6** | 8,192,008,192 |
+| `pgvector_hnsw` | m=16/efc=64 | **118.7** | 4,093,870,080 |
+
+CAGRA builds its recall-0.95 index **4.9× faster** than pgvector builds its own
+(24.3 s vs 118.7 s) and the index is **0.78×** the size. Against 3I the ordering is the
+one §2.1a already described from the other direction: 3I costs 2.5× the CAGRA build and
+2.6× the bytes, and buys a *pgvector-servable artifact* for it.
+
+#### Confound separation: 3I vs pgvector, and the pre-registered verdict
+
+This comparison pair had **no published headline before this run**. (The 5.0×/14.9×
+figures this section previously carried were CAGRA-vs-3I, not 3I-vs-pgvector — an
+attribution error corrected in the #98 scope comment.) Three confounds were named in
+advance, with falsification criteria fixed before the run:
+
+**(a) "M is dominant" — FALSIFIED.** 3I at `gd=32` derives `M=16`
+(`src/hnsw_export.c:1435-1441`), matching pgvector `m=16` by construction. The criterion
+was that moving pgvector to `m=32` would close at least half the gap. It closed none of
+it: pgvector's best ≥0.95 point *fell* from 102.1 QPS (m=16) to 96.4 (m=32), widening
+the gap from 75.0 to 80.7 QPS. Within 3I, the same M step (gd 32→64) moves ≥0.95 QPS by
+−4.7% (nsw) and +0.3% (hnswlib). M does not explain this pair.
+
+**(b) "Hierarchy is dominant" — FALSIFIED.** The hierarchy cell is `hnswlib`
+(RECOMMENDED grade); `'hnsw'` is excluded from this judgment because the code classifies
+it HIDDEN/research with incomplete level assignment (`hnsw_export.c:1855-1862`). nsw →
+hnswlib moves 3I's ≥0.95 QPS by +1.8% (gd=32) and +7.1% (gd=64), and its ≥0.99 QPS by
+−5.6% and +3.5% — small, and inconsistent in sign. Not the meaningful shift the
+criterion required.
+
+**Construction knob — bounded at ≈0, not merely unmeasured.** 3I's export
+`efConstruction` is auto-filled `M0*2` and informational (`hnsw_export.c:1620`), so it
+has no matching knob; the plan therefore used pgvector's own `ef_construction` sweep as
+an *upper bound* on how much this confound could contribute. Doubling it made pgvector
+**worse** at both M (m=16: 102.1 → 90.1 QPS; m=32: 96.4 → 92.4) while costing 60–64%
+more build time. The upper bound on this confound's contribution is therefore
+approximately zero at this grid.
+
+**(c) The residual — and the pre-registered wording for it was wrong.** Criterion (c)
+said that if neither M nor hierarchy explained the gap, the main explanation would be
+"the serving path (code) difference". The code rules that out: `pg_cuvs_hnsw_handler`
+**borrows pgvector's `IndexAmRoutine` wholesale for the entire read path**, overriding
+only `ambuild` and `amoptions` (`src/hnsw_export.c:2094-2108`, design note at `:1882`).
+3I and `pgvector_hnsw` are scanned by *the same code*. With the serving path identical,
+M matched by construction, hierarchy near-neutral and the construction knob bounded at
+zero, the residual is **graph quality at equal M** — the GPU-built CAGRA graph, converted
+to pgvector's on-disk format, is searched 1.73× faster at recall ≥0.95 than the graph
+pgvector's own CPU insertion procedure builds.
+
+Reported as measured, including that it contradicts the pre-registration's own (c): the
+gap is real, it is not in the serving path, and its direction is the opposite of what
+the earlier fixed-config files suggested for this pair.
+
+#### Throughput axis — each system's real dispatch mechanism
+
+Same file, same indexes, **separate axis**. Each arm runs at its algorithm's Pareto
+build config from the latency axis. No number here may be divided by a latency-axis
+number.
+
+| arm | mechanism | QPS | **its own recall@10** | p50 |
+|---|---|---:|---:|---|
+| `cuvs_batch` | raw `cagra.search` over all 2000 queries, 1 dispatch | **70,990** | 0.9892 | n/a |
+| `pgcuvs_cagra_conc8` | 8 connections × single-query AM scan | **1,547** | 0.9928 | 5.14 ms |
+| `pgcuvs_cagra_conc64` | 64 connections | 1,474 | 0.9927 | 43.28 ms |
+| `pgcuvs_cagra_batch` | `pg_cuvs_batch_search`, 1 SQL round trip | **840** | **0.9907** | n/a |
+| `pgvector_hnsw_conc16` | 16 connections (CPU multicore) | **657** | 0.9116 | 24.27 ms |
+| `pgvector_hnsw_conc64` | 64 connections | 585 | 0.9116 | 108.06 ms |
+
+**Every QPS above is quoted with the recall that arm itself measured.** In particular
+the batch arm's 840 QPS goes with **0.9907**, its own recall — not with the 0.9928 the
+single-query path reaches on the same graph. The two differ (see below), so borrowing
+the single-query recall to dress the batch number would be reporting a throughput this
+run never measured at that recall.
+
+**The pgvector conc rows are not iso-recall with the pg_cuvs conc rows** (0.9116 vs
+0.9927): pgvector's Pareto point was selected on the latency axis and its curve does not
+reach 0.95 under the conc arm's parameters. The ~2.4× peak-to-peak QPS gap is therefore
+*not* an iso-recall claim and must not be quoted as one.
+
+**Percentiles are `n/a` for both batch arms by construction** — one dispatch returns one
+timing, so there is no per-query distribution to take percentiles of. Batch vectors are
+passed as psycopg bind parameters rather than inline literals; 2000×768 inline would be
+a ~29 MB statement and parser time would dominate the measurement. This is the
+documented exception to the same-statement-shape rule.
+
+**The pg_cuvs conc arms measure the daemon's global-mutex serialization curve**, not an
+algorithmic scaling property. Non-sharded single-query search holds `g_index_mutex`
+through GPU dispatch (`pg_cuvs_server.c:2736` → `:3757`); the lock-free window is
+sharded-fanout only. The pre-registered hypothesis was that QPS would be **flat** in N.
+It is not: N=1 → N=8 gains **2.75×** (562 → 1547 QPS), and only then does it saturate
+(1510 / 1469 / 1474 at N=16/32/64) while p50 grows linearly (1.77 → 43.28 ms) — the
+signature of a queue in front of a fixed-rate server, not of a fully serialized one.
+Reported as measured; the flat-curve prediction was too strong. The operational reading
+is unchanged: **batch (3M) is pg_cuvs's throughput mechanism**, and these rows are the
+evidence for why. This is a statement about the current implementation, not about CAGRA.
+
+Fallback-counter deltas are **0 on all ten conc rows**, so no arm was quietly absorbed
+as a CPU exact search — which would have shown up as suspiciously high recall at high
+latency. Worker query slices are disjoint across the full 10k pool rather than a
+repeated 2000-query block, so no arm is measured cache-hot in a way that would favour
+the CPU baseline.
+
+**Batch-vs-single recall divergence (`pgcuvs_cagra_batch`) — tracked as
+[#144](https://github.com/pg-cuvs/pg_cuvs/issues/144).** On the same resident graph
+at K=200, batch returns 0.9907 and single-query returns 0.9930–0.9932: a
+**same-graph delta of 0.00225 / 0.00240 / 0.00250** across three samples, with the batch
+side bit-identical every time and the sign stable (batch lower). At N=100k the same
+measurement gave 0.00065 and 0.0010 with the sign flipping between builds. **Both scale
+and K changed between those two measurements** (100k was calibrated at K=64, 1M measured
+at K=200), so neither can be named as the cause — the divergence is scale- and/or
+K-dependent, and this run does not separate them. The mechanism is consistent with the
+AM path's AUTO kernel selection splitting on batch size (single-CTA
+`cuvs_wrapper.cu:1116-1130` vs multi-CTA `:1211-1220`). Raw `cuvs_batch` shows the same
+direction at 0.9892 with no pg_cuvs code in the path, which places the divergence in the
+cuVS kernels rather than this extension's plumbing. The harness records both recalls and
+gates neither; only an uncalibrated `|delta| > 0.01` tripwire remains, to catch gross
+faults rather than to re-judge this one. The open question — whether the driver is scale,
+K, or both, and whether the batch path's lower recall is worth correcting — is tracked in
+[#144](https://github.com/pg-cuvs/pg_cuvs/issues/144), which carries the three same-graph
+samples, the raw-arm corroboration, and the K/scale confound.
 
 ### 2.2 Synthetic crossover pilot — where the line is
 
