@@ -13,27 +13,27 @@
 -- collapse-detection half is exercised on real GPU via
 -- bench/filter_recall/adr079_3o_recall.py --correlations anti (ADR-083 VM
 -- verification).
-
 \set ON_ERROR_STOP off
 SET client_min_messages = warning;
 CREATE EXTENSION IF NOT EXISTS vector;
 CREATE EXTENSION IF NOT EXISTS pg_cuvs;
 SET cuvs.index_dir = '/tmp/cuvs_indexes';
-
 DROP TABLE IF EXISTS psf CASCADE;
 CREATE TABLE psf (row_id int NOT NULL, v vector(4));
 SELECT setseed(0.13);
+ setseed 
+---------
+ 
+(1 row)
+
 INSERT INTO psf
 SELECT g, array_agg(round((random() * 0.9 + 0.05)::numeric, 4) ORDER BY d)::real[]::vector(4)
 FROM generate_series(1, 200) g, generate_series(1, 4) d
 GROUP BY g;
-
 SET cuvs.search_mode = brute_force;   -- build the .vectors sidecar (needed by D-wedge)
 CREATE INDEX psf_cagra ON psf USING cagra (v vector_l2_ops);
-
 -- Force every filtered call onto the 3O CAGRA-prefilter path.
 SET cuvs.filter_auto_threshold = 1.0;
-
 -- Filter set (3 rows) smaller than k (10): a correct 3O answer returns
 -- exactly those 3 rows, not 10 — that must NOT be treated as a collapse.
 SELECT count(*) AS n, min(row_id) AS min_id, max(row_id) AS max_id
@@ -44,16 +44,28 @@ FROM cuvs_filtered_knn(
     10
 ) f
 JOIN psf ON psf.ctid = f.ctid;
+ n | min_id | max_id 
+---+--------+--------
+ 3 |     10 |     90
+(1 row)
 
 -- Must still show cagra_prefilter (mode 4), not a fallback to brute_force
 -- (mode 3) or stream_bf.
 SELECT search_mode AS mode_short_filter
 FROM pg_stat_gpu_search WHERE index_oid = 'psf_cagra'::regclass;
+ mode_short_filter 
+-------------------
+ cagra_prefilter
+(1 row)
 
 -- The short-fill guard must not have fired: this is a correct short answer,
 -- not a detected collapse.
 SELECT prefilter_fallback_count AS fallback_count_after_short_filter
 FROM pg_stat_gpu_search WHERE index_oid = 'psf_cagra'::regclass;
+ fallback_count_after_short_filter 
+-----------------------------------
+                                 0
+(1 row)
 
 -- Sanity: a large-but-not-whole-corpus filter (190/200 rows, sel=0.95 < the
 -- forced threshold of 1.0) still routes to 3O, fills all k, and does not
@@ -67,10 +79,18 @@ FROM cuvs_filtered_knn(
     ARRAY(SELECT ctid FROM psf WHERE row_id <= 190),
     10
 ) f;
+ n_full 
+--------
+     10
+(1 row)
 
 SELECT search_mode AS mode_full_filter,
        prefilter_fallback_count AS fallback_count_after_full_filter
 FROM pg_stat_gpu_search WHERE index_oid = 'psf_cagra'::regclass;
+ mode_full_filter | fallback_count_after_full_filter 
+------------------+----------------------------------
+ cagra_prefilter  |                                0
+(1 row)
 
 RESET cuvs.filter_auto_threshold;
 RESET cuvs.search_mode;
