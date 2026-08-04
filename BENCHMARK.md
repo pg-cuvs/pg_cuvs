@@ -340,10 +340,11 @@ segment (online RAG, multi-tenant), not raw scale.
 
 ---
 
-## 3. Multi-tenant filtered search — selectivity sweep
+## 3. Historical multi-tenant filtered search sweep — pre-#80
 
-Supports the filtered brute-force path (D-wedge post-filter + 3O BITSET pre-filter), the
-multi-tenant primitive: each tenant queries with a TID filter over its own rows.
+This is the original filtered brute-force sweep (D-wedge post-filter + 3O BITSET
+pre-filter), recorded before #80 changed the D-wedge overfetch behavior. It is retained
+as historical evidence; it is not a current default or release gate.
 N=200K × 128, uniform random, k=10, overfetch=4, 5 reps/cell.
 Full table: [`docs/experiments/filter-threshold-experiment.md`](docs/experiments/filter-threshold-experiment.md).
 
@@ -356,7 +357,7 @@ Full table: [`docs/experiments/filter-threshold-experiment.md`](docs/experiments
 | 25% (n=50k) | 1.00 | 1.00 | 1.00 | 2.10 ms |
 | 50% (n=100k)| 1.00 | 1.00 | 1.00 | 2.82 ms |
 
-**Two findings:**
+**Historical findings:**
 
 1. **Filtered search at low selectivity is *faster* than unfiltered** (~33% at sel=1%) —
    the daemon searches a smaller candidate space. The crossover (filtered = unfiltered
@@ -365,8 +366,19 @@ Full table: [`docs/experiments/filter-threshold-experiment.md`](docs/experiments
    on the worst-case *random* column below 5% (0.80 at 5%, 0.20 at 1%) — because the
    k×4 overfetch pool runs out of in-filter rows. Real multi-tenant workloads have
    spatial correlation (tenants query near their own data), where recall stays 1.00 even
-   at 1%. This is exactly why `cuvs.filter_auto_threshold = 0.05` switches to the 3O
-   BITSET pre-filter below 5% selectivity.
+   at 1%. This was the rationale for the pre-#80 `cuvs.filter_auto_threshold = 0.05`
+   routing claim; it is not the current default.
+
+### Current routing contract (source/reference verified)
+
+- #80's selectivity-scaled overfetch makes the D-wedge exact on the measured
+  uncorrelated sweep; the pre-#80 recall table above must not be used as current behavior.
+- The current `cuvs.filter_auto_threshold=0.0` keeps 3O opt-in. The current stream default
+  is `cuvs.stream_bf_selectivity_threshold=0.004` on the canonical host, not a universal
+  hardware-independent crossover; the second-host measurement moved it below `0.002`
+  ([replication report](docs/reports/2026-08-04-item2b-second-host-replication.md)).
+- The correlation axis remains unverified for #88. Do not generalize 3O routing beyond the
+  measured fixtures until that issue is closed with evidence.
 
 ---
 

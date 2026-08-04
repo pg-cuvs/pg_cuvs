@@ -7,6 +7,11 @@
 **k**: 10 · **overfetch**: 4 (k_fetch = 40)  
 **Reps**: 5 per cell, median latency reported
 
+> **Status: Historical experiment.** The original `0.05` recommendation below is
+> superseded by the 2026-07-23 addendum: #80 changed D-wedge overfetch, the current
+> `cuvs.filter_auto_threshold` is `0.0`, and `0.004` is only a canonical-host
+> operational baseline for stream BF. Current routing follows [`docs/reference.md`](../reference.md).
+
 ## Motivation
 
 D-wedge (ADR-063 Option B) fetches k×4=40 BF results from the GPU and filters client-side

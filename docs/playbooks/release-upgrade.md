@@ -1,12 +1,13 @@
 # Playbook: 릴리스 및 업그레이드 (release-upgrade)
 
 pg_cuvs 설치/재설치, 데몬 재시작 순서, artifact magic 호환성 확인 절차.
-현재 default_version은 **0.1.0** (단일 버전, 미릴리스).
-향후 버전 bump 시 `ALTER EXTENSION pg_cuvs UPDATE` 경로를 포함한다.
+현재 저장소의 `default_version`은 **0.5.0**이다.
+`0.1.0`부터 `0.5.0`까지의 SQL migration chain이 저장소에 있고,
+`test/sql/upgrade_path.sql`이 설치·업데이트 경로를 회귀 검증한다.
 
-**현재 상태 한정**: 0.1.0 단일 버전이므로 실제 cross-version upgrade 경로는
-**TBD: 첫 릴리스 후 cross-version upgrade 검증 필요**. 이 playbook은
-신규 설치/재설치 및 코드 변경 후 재배포 절차를 주로 다룬다.
+이 playbook은 현재 버전의 신규 설치/재설치, cross-version UPDATE,
+코드 변경 후 재배포 절차를 다룬다. 실제 운영 전환에서는 설치된 구버전과
+대상 버전에 맞는 migration script 및 백업/롤백 절차를 함께 확인한다.
 
 ---
 
@@ -31,13 +32,13 @@ psql -d postgres -c "SELECT name, default_version, installed_version
 
 **기대 출력:**
 ```
-  name   | default_version | installed_version
+ name   | default_version | installed_version
 ---------+-----------------+-------------------
- pg_cuvs | 0.1.0           | 0.1.0
+ pg_cuvs | 0.5.0           | 0.5.0
 ```
 **→ `installed_version IS NULL`:** `CREATE EXTENSION pg_cuvs`가 아직 실행되지 않음  
 **→ `installed_version != default_version`:** `ALTER EXTENSION pg_cuvs UPDATE` 필요
-  (향후 버전 bump 시 — 현재는 둘 다 0.1.0이라 발생하지 않음)
+  (설치된 버전에서 현재 버전까지의 migration chain을 먼저 확인)
 
 ```bash
 # 설치된 바이너리/라이브러리 타임스탬프 (재설치가 실제로 적용됐는지 확인)
@@ -83,15 +84,16 @@ PostgreSQL을 재시작(`pg_ctl restart`)해야 한다. 데몬은 별도 프로�
 인덱스를 건너뛴다(journal에 magic 불일치 메시지). 이 경우 REINDEX로 현재 버전
 artifact를 새로 만들어야 한다.
 
-> 현재(0.1.0)는 단일 버전이므로 소스 변경 없이 같은 코드베이스로 재빌드하면
-> magic은 동일하다. magic이 바뀌는 경우는 format-breaking 변경이 있는 새 버전에서
-> 발생하므로 **첫 릴리스 후 cross-version 시나리오 검증 필요(TBD)**.
+> 현재 대상 버전은 0.5.0이다. 소스 변경 없이 같은 코드베이스로 재빌드하면
+> magic은 동일하지만, format-breaking 변경이 있는 버전 전환은 해당 migration
+> script와 REINDEX 필요성을 별도로 확인한다. 저장소의 전체 버전 전환 경로는
+> `test/sql/upgrade_path.sql`에서 다룬다.
 → 복구 Step 3 (REINDEX로 artifact 재생성).
 
-### D. 향후: `ALTER EXTENSION pg_cuvs UPDATE` (버전 bump 시)
-`pg_cuvs--0.1.0--0.2.0.sql` 같은 migration script가 있을 때 아래 명령으로 카탈로그를
-업데이트한다. 현재(0.1.0 단일 버전)에서는 적용할 migration이 없다.
-→ TBD: 첫 릴리스 후 migration script 작성 및 검증 필요.
+### D. `ALTER EXTENSION pg_cuvs UPDATE` (cross-version)
+`pg_cuvs--<old>--<new>.sql` migration script가 있을 때 아래 명령으로 카탈로그를
+업데이트한다. 현재 저장소에는 `pg_cuvs--0.4.0--0.5.0.sql`을 포함한
+0.1.0→0.5.0 chain이 있다.
 
 ---
 
@@ -182,13 +184,10 @@ ls -lh /tmp/cuvs_indexes/ | grep -E "\.cagra|\.tids"
 
 ---
 
-### Step 4 — 향후 버전 bump 시 (TBD)
-
-> **TBD: 첫 릴리스(0.1.0 → 0.2.0 등) 후 검증 필요.**
-> 아래는 절차 템플릿이며 실제 migration script 없이는 실행하지 않는다.
+### Step 4 — cross-version extension update
 
 ```bash
-# 1. 소스에 pg_cuvs--0.1.0--0.2.0.sql migration script가 있는지 확인
+# 1. 설치된 버전에서 현재 버전까지의 migration script가 있는지 확인
 ls sql/pg_cuvs--*.sql
 
 # 2. .control 파일의 default_version이 새 버전인지 확인
@@ -207,6 +206,10 @@ psql -d <dbname> -c "ALTER EXTENSION pg_cuvs UPDATE;"
 sudo systemctl restart postgresql
 ```
 
+저장소의 전체 설치·업데이트 경로를 CPU shim에서 재현하려면
+`test/sql/upgrade_path.sql`을 실행한다. 운영 환경에서는 먼저 staging에서
+동일한 `ALTER EXTENSION` 경로와 artifact reload를 검증한다.
+
 ---
 
 ## 5. 검증 명령 (Verification commands)
@@ -215,7 +218,7 @@ sudo systemctl restart postgresql
 # 확장 버전 일치
 psql -d postgres -c "SELECT installed_version FROM pg_available_extensions
                      WHERE name='pg_cuvs';"
-# 기대: 0.1.0
+# 기대: 0.5.0
 ```
 
 ```bash
@@ -241,7 +244,7 @@ SELECT index_name, resident, search_count, last_status
 -- 기대: resident=t, last_status='ok'
 ```
 
-- [ ] `installed_version = default_version = 0.1.0`
+- [ ] `installed_version = default_version = 0.5.0`
 - [ ] `sudo systemctl is-active pg-cuvs-server` → `active`
 - [ ] journalctl에 `loaded index` 1줄 이상
 - [ ] `EXPLAIN` 결과에 GPU scan path 확인
@@ -260,10 +263,11 @@ SELECT index_name, resident, search_count, last_status
   PATH 앞에 있을 수 있음.
 - magic 불일치로 REINDEX를 해도 즉시 재발: 빌드한 `.so`와 `pg_cuvs_server`의
   소스 커밋이 다를 가능성(각각 별도 빌드됨) → 같은 소스 상태에서 `make` 전체 재빌드.
-- cross-version 업그레이드 후 `ALTER EXTENSION` 실패(`could not open file pg_cuvs--0.1.0--N.sql`):
-  migration script 미포함 → **TBD: migration script 작성 및 검증 필요**.
+- cross-version 업그레이드 후 `ALTER EXTENSION` 실패(`could not open file pg_cuvs--<old>--<new>.sql`):
+  설치된 버전에서 대상 버전까지의 migration script 누락 여부를 확인하고 release blocker로 기록한다.
 - PostgreSQL 재시작 후 `shared_preload_libraries`에서 pg_cuvs.so 로드 실패:
   `pg_config --pkglibdir` 경로가 설치 경로와 맞는지 확인.
 
 관련: `daemon-restart-recovery.md`, `persistence-corruption-recovery.md`.  
-설계 근거: pg_cuvs.control(default_version=0.1.0), Makefile install / install-server 타겟.
+설계 근거: `pg_cuvs.control(default_version=0.5.0)`,
+`test/sql/upgrade_path.sql`, Makefile `install` / `install-server` 타겟.

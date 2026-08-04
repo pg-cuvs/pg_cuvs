@@ -129,7 +129,7 @@ Implemented on GCP (NVIDIA A100-40GB × 2, PostgreSQL 16), VM E2E verified:
 - [x] Multi-GPU sharding (`shard_count`), GCS snapshot restore (Phase 3G)
 - [x] MIG verified (no code changes needed)
 
-Benchmark results — **real embeddings, Cohere Wikipedia 1M×1024, end-to-end SQL, measured inside NVIDIA's cuvs-bench** (A100-40GB, ext 0.5.0; raw: [`bench/results/pg_cuvsbench_1m.csv`](bench/results/pg_cuvsbench_1m.csv)):
+Benchmark results — **real embeddings, Cohere Wikipedia 1M×1024, end-to-end SQL, measured inside NVIDIA's cuvs-bench** (A100-40GB, ext 0.5.0; raw: [`bench/results/pg_cuvsbench_1m.csv`](bench/results/pg_cuvsbench_1m.csv)). **Known artifact caveat:** this Cohere CSV predates #73/#75 and reports `index_bytes=0` for CAGRA; recall/QPS/latency/build-time fields are unaffected, and the result must be read with the [benchmark caveat](BENCHMARK.md) and [provenance ledger](bench/results/README.md).
 
 | Path | Build | p50 @ recall≈0.99 | QPS | vs pgvector |
 |------|------:|------------------:|----:|-------------|

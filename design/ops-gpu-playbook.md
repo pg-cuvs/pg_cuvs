@@ -71,7 +71,8 @@ sudo systemctl restart pg-cuvs-server
 
 | max_vram_mb | 동작 |
 |-------------|------|
-| 40000 (기본) | 물리 GPU 전체 사용 |
+| 0 또는 생략 (기본) | GPU별 물리 VRAM의 90%를 budget으로 사용 |
+| 40000 (명시) | GPU별 budget을 40000 MiB로 제한 |
 | 2048 | N=100K×384 (≈750MB) 이내면 성능 무관 |
 | < corpus_size×4 | 인덱스 적재 실패 → 에러 |
 

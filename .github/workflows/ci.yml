@@ -27,6 +27,9 @@ jobs:
       - uses: actions/checkout@v4
 
       # gcc + make are preinstalled on ubuntu-22.04 runners; no apt step needed.
+      - name: Documentation contract checks
+        run: make docs-contract-check
+
       - name: Unit tests (CPU-only, no PG/CUDA required)
         run: make test-unit
 

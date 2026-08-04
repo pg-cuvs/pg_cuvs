@@ -1,13 +1,20 @@
 
 ## 프로젝트 문서 구조
 
-| 파일 | 역할 | 언제 읽는가 |
-|------|------|-------------|
-| `ROADMAP.md` | 구현 순서 및 미완료 이슈 목록. Wave별 우선순위와 각 항목의 완료 기준. | 세션 시작 시, "다음에 뭘 해야 하나" 파악할 때 |
-| `design/specs/phase-record.md` | 각 Phase의 상세 스펙, 구현 항목, 완료 기준, 검증 증거. ADR 참조 포함. | 특정 Phase 구현 전 설계 확인 시 |
-| `design/decisions.md` | ADR(Architecture Decision Record) 목록. 결정 배경, 대안, 기각 이유. | 설계 결정의 근거가 궁금할 때, 새 ADR 추가 시 |
+문서의 권한과 갱신 규칙은 [`docs/doc-map.md`](docs/doc-map.md)가 단일 기준이다.
+현행 동작을 확인할 때는 코드/SQL과 `docs/reference.md` 및 `ARCHITECTURE.md`를
+우선한다. `README.md`는 개요·quickstart, `BENCHMARK.md`는 측정 결과만 담당한다.
 
-**관계**: ROADMAP.md는 "무엇을 어떤 순서로" 결정한다. phase-record.md는 "어떻게"의 스펙이다. decisions.md는 "왜"의 기록이다. 새 설계 결정은 decisions.md에 ADR로 먼저 기록하고, 해당 Phase 스펙은 phase-record.md에, 구현 순서 변경은 ROADMAP.md에 반영한다.
+| 파일 | 역할 | 상태 |
+|------|------|------|
+| `docs/reference.md` | 현행 AM, GUC, SQL 함수, view, search mode 표면 | Current / Verified |
+| `ARCHITECTURE.md` | 현재 프로세스·IPC·수명주기·실패 경계 | Current / Verified |
+| `ROADMAP.md` | GitHub 이슈와 연결된 미완료 작업·release readiness | Active planning |
+| `design/decisions.md` | 결정의 배경과 대안의 역사 | Historical / append-only |
+| `design/specs/phase-record.md` | Phase별 as-built 기록과 검증 증거 | Frozen history |
+
+새 설계 결정은 ADR로 기록하되 `supersedes`와 현행 SSOT 링크를 남긴다. 구현이
+끝난 항목은 ROADMAP의 active backlog에서 제거하고 코드·테스트 증거를 링크한다.
 
 ---
 

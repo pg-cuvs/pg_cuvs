@@ -5,7 +5,9 @@
 > §5(감사 TODO)는 그 작업의 체크리스트로 쓴다.
 > **정확성**: 레버 목록은 소스에서 추출(2026-06-11). 근거: ADR-070(design/decisions.md), 세션 보고서
 > docs/reports/2026-06-11-resource-governance-audit.md, PR #54.
-> **상태 표기**: 이 문서 자체가 "현행 SSOT 후보"다. 운영자 문서로 승격되기 전까지는 작업 문서로 본다.
+> **상태 표기**: 이 문서는 2026-06-11 소스 추출에 기반한 작업용 감사 스냅샷이다.
+> 현행 SSOT가 아니며, 현재 기본값·운영 절차는 `docs/doc-map.md`, `docs/reference.md`,
+> `design/ops-gpu-playbook.md`, `docs/playbooks/`에서 확인한다.
 
 ---
 
@@ -191,11 +193,11 @@ docs/best-practices.md / docs/playbooks/*.
   hnsw `m`/`ef_construction`.
 - 미설명 플래그: `--max-indexes`, `--gpu-devices`.
 
-### 5.6 [낮음] TBD/스테일
-- `release-upgrade.md`: cross-version 업그레이드 = TBD(템플릿만, migration script 없음).
+### 5.6 [낮음] TBD/스테일 (2026-06-11 audit snapshot)
+- `release-upgrade.md`: 당시 cross-version 업그레이드 = TBD였으나, 현재는 0.1.0→0.5.0 migration chain과 `test/sql/upgrade_path.sql`로 갱신됨.
 - `replica-bootstrap.md`: 스트리밍 물리복제 standby warmup = 미검증(TBD).
-- `ops-gpu-playbook §1.4`: `--max-vram-mb` 기본값 "40000" 표기 오류(실제 0→90%).
-- `rollback-and-cleanup.md:47` `extversion = 1.0` vs `release-upgrade.md` `0.1.0` 불일치.
+- `ops-gpu-playbook §1.4`: `--max-vram-mb` 기본값 "40000" 표기 오류는 현재 0→90% 정책으로 수정됨.
+- `rollback-and-cleanup.md:47`의 `extversion = 1.0` 표기는 현재 0.5.0으로 수정됨.
 - `large-dataset-benchmark.md`: backend peak RSS 컬럼 빈칸.
 
 ### 5.7 구조: 운영 문서가 흩어져 있음

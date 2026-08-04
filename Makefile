@@ -230,6 +230,14 @@ test-unit: test/unit/test_cuvs_util.c src/cuvs_util.c src/cuvs_util.h src/cuvs_i
 
 .PHONY: test-unit
 
+# ---- Documentation contract check ---------------------------------------
+# CPU-only drift detector for the current version/defaults and release-facing
+# caveats. It intentionally does not replace PostgreSQL, GPU, or benchmark QA.
+docs-contract-check:
+	bash scripts/docs-contract-check.sh
+
+.PHONY: docs-contract-check
+
 # ---- No-GPU regression target -------------------------------------------
 # Runs the subset of tests that do NOT require a live GPU daemon.
 # Currently this is just the C-level unit tests (test-unit).
