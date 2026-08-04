@@ -16,6 +16,22 @@ This sweeps filter selectivity and records recall@k for three filtered paths:
   stream   cuvs.stream_bf_selectivity_threshold = 1.0 -> exact BF over only
            whitelist members (ADR-064)
 
+It also sweeps a correlation axis (#88): how filter membership relates to each
+query's position in the corpus.
+
+  random   deterministic hash on id, independent of corpus position (ADR-082's
+           original fixture -- the regression anchor for this script)
+  spatial  the sel-fraction of rows nearest the query (best case for a
+           post-filter prefix)
+  anti     the sel-fraction of rows farthest from the query (new; the obvious
+           adversarial case a fixed/proportional overfetch prefix can miss)
+  mixed    half spatial, half random
+
+`random` filter membership is shared across all queries and delivered via the
+existing filterset table + scalar subquery. The other three are per-query --
+each query has its own nearest/farthest ordering -- so they are delivered as
+an explicit bigint[] parameter per query instead.
+
 MEASUREMENT HONESTY
   Ground truth is computed here in numpy -- exact top-k over the *filtered*
   subset -- not taken from pg_cuvs. A systematic engine error therefore cannot
@@ -40,6 +56,8 @@ from numpy.typing import NDArray
 from adr079_reuse import HASH_MOD, KNUTH, corpus_fingerprint
 
 SELECTIVITIES = (0.5, 0.1, 0.05, 0.01, 0.005, 0.001)
+CORRELATIONS = ("anti", "random", "mixed", "spatial")
+MIXED_FRACTION = 0.5  # "mixed" = this fraction spatial + remainder random
 
 
 def read_fbin(path, count=None, offset=0):
@@ -85,6 +103,47 @@ def recall_at_k(got, gt, k):
     return tot / len(gt)
 
 
+def compute_spatial_orders(
+        base: NDArray[np.float32],
+        queries: NDArray[np.float32]) -> list[NDArray[np.int32]]:
+    """Per-query ascending-L2-distance row order into the full corpus.
+
+    Computed once and cached: spatial/anti/mixed filter construction all
+    reduce to slicing this array, so the selectivity sweep never recomputes
+    a query's distances. int32 is enough for a 1e6-row corpus and halves the
+    cache footprint versus argsort's default int64.
+    """
+    base_sqnorm = np.einsum("ij,ij->i", base, base)
+    orders = []
+    for qi in range(len(queries)):
+        d = base_sqnorm - 2.0 * (base @ queries[qi])
+        orders.append(np.argsort(d).astype(np.int32))
+    return orders
+
+
+def correlated_filter_idx(order, sel, corr, k, rng):
+    """Row indices (into the full corpus) admitted by the filter for one
+    query, at the given selectivity and correlation level.
+
+    `order` is that query's full ascending-distance ordering (see
+    compute_spatial_orders). Nearest-first order makes prefixes/suffixes
+    nested across selectivities, so no additional sorting is needed here.
+    """
+    n = len(order)
+    n_f = min(n, max(k, int(round(n * sel))))
+    if corr == "spatial":
+        return order[:n_f]
+    if corr == "anti":
+        return order[-n_f:]
+    if corr == "mixed":
+        n_sp = int(round(n_f * MIXED_FRACTION))
+        n_rnd = n_f - n_sp
+        remainder = order[n_sp:]
+        rnd = rng.choice(remainder, size=n_rnd, replace=False)
+        return np.concatenate([order[:n_sp], rnd])
+    raise ValueError(f"unknown correlation level: {corr}")
+
+
 def encode_ctid(ctid):
     """'(block,off)' -> block<<16 | off, pg_cuvs's TID encoding."""
     block, off = ctid.strip("()").split(",")
@@ -103,9 +162,21 @@ def main():
     ap.add_argument("--selectivities", default=None,
                     help="comma-separated selectivity grid; default "
                          + ",".join(str(x) for x in SELECTIVITIES))
+    ap.add_argument("--correlations", default="random",
+                    help="comma-separated correlation levels from "
+                         + ",".join(CORRELATIONS) + "; default random "
+                         "(the ADR-082 regression anchor)")
+    ap.add_argument("--seed", type=int, default=42,
+                    help="RNG seed for the random-fill portion of mixed filters")
     ap.add_argument("--reuse-table", action="store_true",
                     help="skip COPY/CREATE INDEX if f3o is already loaded")
     args = ap.parse_args()
+
+    correlations = [c.strip() for c in args.correlations.split(",")]
+    for c in correlations:
+        if c not in CORRELATIONS:
+            ap.error(f"unknown --correlations level: {c!r} (choices: "
+                      + ",".join(CORRELATIONS) + ")")
 
     import psycopg
     import pgvector.psycopg
@@ -205,78 +276,119 @@ def main():
 
     cat = (np.arange(args.n, dtype=np.int64) * KNUTH) % HASH_MOD
     ctid_of_id = {}
+    id_to_ctid = {}
     for rid, ct in conn.execute("SELECT id, ctid::text FROM f3o").fetchall():
-        ctid_of_id[encode_ctid(ct)] = rid
+        enc = encode_ctid(ct)
+        ctid_of_id[enc] = rid
+        id_to_ctid[rid] = enc
 
     # The TID whitelist is up to n*0.5 bigints. Re-serialising it from the client
-    # on every query would swamp the latency being measured, so it is materialised
-    # server-side once per selectivity and referenced by a scalar subquery.
-    conn.execute("DROP TABLE IF EXISTS filterset")
-    conn.execute("CREATE TABLE filterset (sel float8 PRIMARY KEY, tids bigint[])")
+    # on every query would swamp the latency being measured, so for the shared
+    # (non-per-query) `random` filter it is materialised server-side once per
+    # selectivity and referenced by a scalar subquery. The per-query
+    # correlated filters (spatial/anti/mixed) have no shared table to
+    # reference -- each query's admitted rows differ -- so those are passed
+    # directly as a bigint[] parameter instead.
+    if "random" in correlations:
+        conn.execute("DROP TABLE IF EXISTS filterset")
+        conn.execute("CREATE TABLE filterset (sel float8 PRIMARY KEY, tids bigint[])")
+
+    need_order = any(c != "random" for c in correlations)
+    orders = None
+    if need_order:
+        t0 = time.perf_counter()
+        orders = compute_spatial_orders(base, queries)
+        print(f"[setup] per-query spatial order for {args.queries} queries "
+              f"in {time.perf_counter()-t0:.1f}s", flush=True)
+    rng = np.random.default_rng(args.seed)
 
     grid = ([float(x) for x in args.selectivities.split(",")]
             if args.selectivities else list(SELECTIVITIES))
     rows = []
-    for sel in grid:
-        cut = int(sel * HASH_MOD)
-        subset_idx = np.nonzero(cat < cut)[0]
-        actual_sel = len(subset_idx) / args.n
-        conn.execute(
-            "INSERT INTO filterset "
-            "SELECT %s, array_agg(t ORDER BY t) FROM ("
-            "  SELECT (((ctid::text::point)[0])::bigint << 16)"
-            "       | ((ctid::text::point)[1])::bigint AS t"
-            "  FROM f3o WHERE cat < %s) s", (sel, cut))
-        t0 = time.perf_counter()
-        gt = exact_topk_in_subset(base, subset_idx, queries, args.k)
-        print(f"[gt] sel={actual_sel:.4f} |S|={len(subset_idx)} "
-              f"exact top-{args.k} in {time.perf_counter()-t0:.1f}s", flush=True)
+    for corr in correlations:
+        for sel in grid:
+            if corr == "random":
+                cut = int(sel * HASH_MOD)
+                subset_idx = np.nonzero(cat < cut)[0]
+                actual_sel = len(subset_idx) / args.n
+                conn.execute(
+                    "INSERT INTO filterset "
+                    "SELECT %s, array_agg(t ORDER BY t) FROM ("
+                    "  SELECT (((ctid::text::point)[0])::bigint << 16)"
+                    "       | ((ctid::text::point)[1])::bigint AS t"
+                    "  FROM f3o WHERE cat < %s) s", (sel, cut))
+                t0 = time.perf_counter()
+                gt = exact_topk_in_subset(base, subset_idx, queries, args.k)
+                n_filter = len(subset_idx)
+            else:
+                subset_per_query = [
+                    correlated_filter_idx(orders[qi], sel, corr, args.k, rng)
+                    for qi in range(args.queries)]
+                actual_sel = float(np.mean(
+                    [len(s) for s in subset_per_query])) / args.n
+                n_filter = int(round(np.mean([len(s) for s in subset_per_query])))
+                t0 = time.perf_counter()
+                gt = np.stack([
+                    exact_topk_in_subset(
+                        base, subset_per_query[qi], queries[qi:qi + 1], args.k)[0]
+                    for qi in range(args.queries)])
+            print(f"[gt] corr={corr} sel={actual_sel:.4f} |S|~={n_filter} "
+                  f"exact top-{args.k} in {time.perf_counter()-t0:.1f}s", flush=True)
 
-        # (label, cuvs.filter_auto_threshold, cuvs.stream_bf_selectivity_threshold).
-        # stream_bf takes precedence over the 3O prefilter when both would fire.
-        for path, fthr, sthr in (("3O", 1.0, 0.0),
-                                 ("D-wedge", 0.0, 0.0),
-                                 ("stream_bf", 0.0, 1.0)):
-            conn.execute(f"SET cuvs.stream_bf_selectivity_threshold = {sthr}")
-            conn.execute(f"SET cuvs.filter_auto_threshold = {fthr}")
-            got, lat, modes = [], [], []
-            for qi in range(args.queries):
-                q0 = time.perf_counter()
-                res = conn.execute(
-                    "SELECT ctid::text FROM cuvs_filtered_knn("
-                    "  'f3o_cagra'::regclass, %s::vector,"
-                    "  (SELECT tids FROM filterset WHERE sel = %s), %s)",
-                    (Vector(queries[qi]), sel, args.k)).fetchall()
-                lat.append((time.perf_counter() - q0) * 1000.0)
-                got.append([ctid_of_id.get(encode_ctid(r[0]), -1) for r in res])
-                # Per query: the daemon silently falls back (3O -> exact BF
-                # prefilter -> D-wedge; stream_bf -> 3O when the sidecar is
-                # absent). Reading the mode once at the end lets one final
-                # successful query hide every earlier fallback, which would make
-                # a point-level "this measured 3O" claim unsupportable.
-                m = conn.execute(
-                    "SELECT search_mode FROM pg_stat_gpu_search "
-                    "WHERE index_oid = 'f3o_cagra'::regclass").fetchone()
-                modes.append(m[0] if m else None)
-            seen = sorted(set(modes), key=lambda x: (x is None, x))
-            mode = (seen[0],) if len(seen) == 1 else ("MIXED:" + ",".join(
-                f"{x}x{modes.count(x)}" for x in seen),)
-            if len(seen) > 1:
-                print(f"  [warn] {path} sel={actual_sel:.4f} mixed daemon routes: "
-                      f"{mode[0]} -- point-level attribution is not uniform",
-                      flush=True)
-            r = recall_at_k(got, gt, args.k)
-            returned = np.mean([len(g) for g in got])
-            rows.append(dict(path=path, selectivity=round(actual_sel, 6),
-                             n_filter=len(subset_idx), k=args.k,
-                             recall=round(r, 4),
-                             mean_returned=round(float(returned), 2),
-                             p50_ms=round(float(np.percentile(lat, 50)), 3),
-                             daemon_search_mode=(mode[0] if mode else None),
-                             n_queries=args.queries))
-            print(f"  {path:8s} sel={actual_sel:.4f} recall@{args.k}={r:.4f} "
-                  f"returned={returned:.2f} mode={rows[-1]['daemon_search_mode']}",
-                  flush=True)
+            # (label, cuvs.filter_auto_threshold, cuvs.stream_bf_selectivity_threshold).
+            # stream_bf takes precedence over the 3O prefilter when both would fire.
+            for path, fthr, sthr in (("3O", 1.0, 0.0),
+                                     ("D-wedge", 0.0, 0.0),
+                                     ("stream_bf", 0.0, 1.0)):
+                conn.execute(f"SET cuvs.stream_bf_selectivity_threshold = {sthr}")
+                conn.execute(f"SET cuvs.filter_auto_threshold = {fthr}")
+                got, lat, modes = [], [], []
+                for qi in range(args.queries):
+                    if corr == "random":
+                        sql = ("SELECT ctid::text FROM cuvs_filtered_knn("
+                               "  'f3o_cagra'::regclass, %s::vector,"
+                               "  (SELECT tids FROM filterset WHERE sel = %s), %s)")
+                        params = (Vector(queries[qi]), sel, args.k)
+                    else:
+                        tids = [int(id_to_ctid[rid])
+                                for rid in subset_per_query[qi]]
+                        sql = ("SELECT ctid::text FROM cuvs_filtered_knn("
+                               "  'f3o_cagra'::regclass, %s::vector,"
+                               "  %s::bigint[], %s)")
+                        params = (Vector(queries[qi]), tids, args.k)
+                    q0 = time.perf_counter()
+                    res = conn.execute(sql, params).fetchall()
+                    lat.append((time.perf_counter() - q0) * 1000.0)
+                    got.append([ctid_of_id.get(encode_ctid(r[0]), -1) for r in res])
+                    # Per query: the daemon silently falls back (3O -> exact BF
+                    # prefilter -> D-wedge; stream_bf -> 3O when the sidecar is
+                    # absent). Reading the mode once at the end lets one final
+                    # successful query hide every earlier fallback, which would make
+                    # a point-level "this measured 3O" claim unsupportable.
+                    m = conn.execute(
+                        "SELECT search_mode FROM pg_stat_gpu_search "
+                        "WHERE index_oid = 'f3o_cagra'::regclass").fetchone()
+                    modes.append(m[0] if m else None)
+                seen = sorted(set(modes), key=lambda x: (x is None, x))
+                mode = (seen[0],) if len(seen) == 1 else ("MIXED:" + ",".join(
+                    f"{x}x{modes.count(x)}" for x in seen),)
+                if len(seen) > 1:
+                    print(f"  [warn] {path} corr={corr} sel={actual_sel:.4f} mixed "
+                          f"daemon routes: {mode[0]} -- point-level attribution "
+                          "is not uniform", flush=True)
+                r = recall_at_k(got, gt, args.k)
+                returned = np.mean([len(g) for g in got])
+                rows.append(dict(path=path, correlation=corr,
+                                 selectivity=round(actual_sel, 6),
+                                 n_filter=n_filter, k=args.k,
+                                 recall=round(r, 4),
+                                 mean_returned=round(float(returned), 2),
+                                 p50_ms=round(float(np.percentile(lat, 50)), 3),
+                                 daemon_search_mode=(mode[0] if mode else None),
+                                 n_queries=args.queries))
+                print(f"  {path:8s} corr={corr} sel={actual_sel:.4f} "
+                      f"recall@{args.k}={r:.4f} returned={returned:.2f} "
+                      f"mode={rows[-1]['daemon_search_mode']}", flush=True)
 
     with open(args.out, "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
