@@ -15,12 +15,20 @@
 --   6. pg_cuvs_inject_extend_oom(0) → 플래그 해제 (자동 해제됐지만 명시적 정리)
 --   7. 검색: id=9999이 delta에 있으므로 nearest = 9999
 --   8. REINDEX → delta 흡수, delta_rows = 0
+--
+-- REQUIRES: a CUVS_TEST_HOOKS pg_cuvs_server_test daemon on the test socket +
+-- index dir below (`make installcheck-fault`, not `make installcheck` — #124:
+-- CUVS_OP_INJECT_EXTEND_OOM only exists in a CUVS_TEST_HOOKS build; the
+-- production daemon rejects it).
 
 SET client_min_messages = warning;
 CREATE EXTENSION IF NOT EXISTS vector;
 CREATE EXTENSION IF NOT EXISTS pg_cuvs;
 RESET client_min_messages;
-SET cuvs.index_dir = '/tmp/cuvs_indexes';
+-- #124: points at the CUVS_TEST_HOOKS test daemon (make installcheck-fault),
+-- not the production socket/index dir.
+SET cuvs.socket_path = '/tmp/.s.pg_cuvs_test';
+SET cuvs.index_dir = '/tmp/cuvs_indexes_test';
 
 -- ----------------------------------------------------------------
 -- Setup: dim=128, 5000벡터 빌드

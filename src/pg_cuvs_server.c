@@ -7382,6 +7382,15 @@ handle_free_vram(int client_fd, const CuvsCmdFrame *cmd)
     send_all(client_fd, &ok, sizeof(ok));
 }
 
+/* #124: handle_inject_extend_oom/handle_inject_build_oom (and their dispatch
+ * cases below) are test-only fault-injection hooks — a client that can reach
+ * the daemon's socket could otherwise arm a synthetic OOM against ANY
+ * resident index in a production deployment. Unlike the CUVS_FAULT_* hooks
+ * elsewhere in this file (gated by CUVS_TEST_HOOKS at each call site, e.g.
+ * around line 5089), these two were dispatched unconditionally. Guarding the
+ * handler bodies too (not just the dispatch, below) avoids an unused-function
+ * warning in a production (non-CUVS_TEST_HOOKS) build. */
+#ifdef CUVS_TEST_HOOKS
 /* handle_inject_extend_oom — test helper: arm/disarm synthetic OOM in cuvs_cagra_extend.
  * cmd->dim == 1 arms; == 0 disarms. */
 static void
@@ -7406,6 +7415,7 @@ handle_inject_build_oom(int client_fd, const CuvsCmdFrame *cmd)
     ok.status = CUVS_STATUS_OK;
     send_all(client_fd, &ok, sizeof(ok));
 }
+#endif /* CUVS_TEST_HOOKS */
 
 /* ----------------------------------------------------------------
  * Per-connection thread
@@ -7538,12 +7548,14 @@ connection_thread(void *arg)
         case CUVS_OP_FREE_VRAM:
             handle_free_vram(client_fd, &cmd);
             break;
+#ifdef CUVS_TEST_HOOKS
         case CUVS_OP_INJECT_EXTEND_OOM:
             handle_inject_extend_oom(client_fd, &cmd);
             break;
         case CUVS_OP_INJECT_BUILD_OOM:
             handle_inject_build_oom(client_fd, &cmd);
             break;
+#endif /* CUVS_TEST_HOOKS */
         case CUVS_OP_SEARCH_STREAM_BF:
             handle_search_stream_bf(client_fd, &cmd);
             break;

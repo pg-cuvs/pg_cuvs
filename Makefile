@@ -22,7 +22,7 @@ DATA           = sql/pg_cuvs--0.1.0.sql \
                  sql/pg_cuvs--0.4.0--0.5.0.sql \
                  sql/pg_cuvs--0.5.0.sql
 MODULE_big     = pg_cuvs
-REGRESS        = smoke upgrade_path cpu_fallback edge_cases cpu_hnsw_fallback build_hnsw build_hnsw_edge pg_cuvs_hnsw metrics brute_force pg_cuvs_batch reloption_dir gc_orphans release_hardening pending_delta delta_recall build_params drop_subxact partition_prune filter_comparison ivfpq_smoke cagra_streaming auto_compact extend_vram_fallback extend_cuda_oom stream_bf_recall fallback_stat vram_accounting build_lock build_oom build_multi_oom build_oom_evict_to_fit flat_smoke transient_bf hw_profile routing_golden routing_golden_measured multi_vector daemon_uid_owner
+REGRESS        = smoke upgrade_path cpu_fallback edge_cases cpu_hnsw_fallback build_hnsw build_hnsw_edge pg_cuvs_hnsw metrics brute_force pg_cuvs_batch reloption_dir gc_orphans release_hardening pending_delta delta_recall build_params drop_subxact partition_prune filter_comparison ivfpq_smoke cagra_streaming auto_compact extend_vram_fallback stream_bf_recall fallback_stat vram_accounting build_lock flat_smoke transient_bf hw_profile routing_golden routing_golden_measured multi_vector daemon_uid_owner
 REGRESS_OPTS   = --inputdir=test --outputdir=test
 
 # Tier-1 CI (CPU-reference shim, PGCUVS_CPU_SHIM=1) runs a SUBSET of REGRESS.
@@ -32,12 +32,22 @@ REGRESS_OPTS   = --inputdir=test --outputdir=test
 REGRESS_TIER2_ONLY = build_hnsw build_hnsw_edge pg_cuvs_hnsw routing_golden_measured
 REGRESS_TIER1      = $(filter-out $(REGRESS_TIER2_ONLY),$(REGRESS))
 
-# GPU-residency-dependent (#89 item 2): build_oom, build_multi_oom, and
-# build_oom_evict_to_fit inject synthetic build OOMs and assert an
-# evict-and-retry outcome. Deterministic on the CPU shim (Tier-1 CI). On
-# real GPU (esp. single-GPU dev VM) the evict-retry outcome depends on what
-# is resident/evictable at run time, so a full-suite GPU run may flake on
-# these — that is environment-dependent, not a code regression.
+# #124: build_oom, build_multi_oom, build_oom_evict_to_fit, and extend_cuda_oom
+# call pg_cuvs_inject_{build,extend}_oom(), which reaches the daemon's
+# CUVS_OP_INJECT_* opcodes. Those opcodes are compiled in ONLY under
+# -DCUVS_TEST_HOOKS (pg_cuvs_server.c) — a production daemon now rejects them
+# outright ("unknown op") rather than dispatching unconditionally, so these 4
+# tests cannot run against the production daemon $(REGRESS)/$(REGRESS_TIER1)
+# exercise. They run instead via `make installcheck-fault`, below, against a
+# dedicated $(SERVER_TEST_BIN) (built with CUVS_TEST_HOOKS) on its own socket
+# + index dir, so the production daemon and its REGRESS run are never touched.
+#
+# GPU-residency-dependent (#89 item 2): on the CPU shim (Tier-1 CI) the OOM
+# injection is deterministic. On real GPU (esp. single-GPU dev VM) the
+# evict-retry outcome depends on what is resident/evictable at run time, so a
+# full-suite GPU run may flake on these — that is environment-dependent, not
+# a code regression.
+REGRESS_FAULT  = build_oom build_multi_oom build_oom_evict_to_fit extend_cuda_oom
 
 # Isolation tests (pg_isolation_regress) for concurrent-session correctness that
 # pg_regress cannot express: snapshot-aware tombstone filtering and write/query
@@ -266,7 +276,54 @@ installcheck-isolation:
 installcheck-tier1:
 	$(pg_regress_installcheck) $(REGRESS_OPTS) $(REGRESS_TIER1)
 
-.PHONY: installcheck-isolation installcheck-tier1
+# ---- Fault-injection installcheck (CUVS_TEST_HOOKS daemon) ----------------
+# #124: REGRESS_FAULT needs the CUVS_OP_INJECT_* opcodes, which only exist in
+# a -DCUVS_TEST_HOOKS build (pg_cuvs_server.c) — the production daemon
+# rejects them ("unknown op"). Run REGRESS_FAULT against a dedicated
+# $(SERVER_TEST_BIN) on its own socket + index dir instead, mirroring the
+# test-daemon pattern `gpu-test-daemon` already uses
+# (infra/scripts/tests/integration-test.sh): the production pg-cuvs-server
+# daemon and its socket/index dir are never touched.
+#
+# Unlike installcheck-tier1, this does NOT try to point cuvs.socket_path/
+# cuvs.index_dir at the test daemon from here (e.g. via ALTER DATABASE) —
+# pg_regress drops and recreates its target database at the start of every
+# run (see pg_regress.c drop_database_if_exists/create_database), which would
+# silently wipe a pre-set ALTER DATABASE default before the tests ever ran.
+# Instead, each REGRESS_FAULT .sql file SETs cuvs.socket_path/cuvs.index_dir
+# to FAULT_SOCK/FAULT_IDX itself (session-level, first thing after CREATE
+# EXTENSION) — safe because these 4 files are reachable ONLY through this
+# target now (removed from REGRESS/REGRESS_TIER1 above).
+#
+# The daemon binds the socket 0660 (pg_cuvs_server.c); this target runs the
+# daemon as the calling (non-postgres) OS user, so it needs the same chmod
+# 666 widening the production systemd unit and the Tier-1 CI shim daemon do
+# — otherwise the postgres-owned backend gets EACCES on connect().
+FAULT_SOCK = /tmp/.s.pg_cuvs_test
+FAULT_IDX  = /tmp/cuvs_indexes_test
+
+installcheck-fault: server-test
+	set -e; \
+	echo "[fault] starting CUVS_TEST_HOOKS daemon ($(SERVER_TEST_BIN)) on $(FAULT_SOCK)"; \
+	rm -f $(FAULT_SOCK); rm -rf $(FAULT_IDX); mkdir -p $(FAULT_IDX); chmod 0777 $(FAULT_IDX); \
+	./$(SERVER_TEST_BIN) --socket $(FAULT_SOCK) --index-dir $(FAULT_IDX) --max-vram-mb 20480 \
+		>/tmp/pg_cuvs_fault_daemon.log 2>&1 & \
+	DAEMON_PID=$$!; \
+	trap 'echo "[fault] cleanup"; \
+	      kill $$DAEMON_PID 2>/dev/null || true; wait $$DAEMON_PID 2>/dev/null || true; \
+	      rm -f $(FAULT_SOCK); rm -rf $(FAULT_IDX)' EXIT; \
+	for i in $$(seq 1 60); do \
+		[ -S $(FAULT_SOCK) ] && break; \
+		if ! kill -0 $$DAEMON_PID 2>/dev/null; then \
+			echo "[fault] test daemon died during startup"; cat /tmp/pg_cuvs_fault_daemon.log; exit 1; \
+		fi; \
+		sleep 0.5; \
+	done; \
+	test -S $(FAULT_SOCK) || { echo "[fault] test daemon socket never appeared"; cat /tmp/pg_cuvs_fault_daemon.log; exit 1; }; \
+	chmod 666 $(FAULT_SOCK); \
+	$(pg_regress_installcheck) $(REGRESS_OPTS) $(REGRESS_FAULT)
+
+.PHONY: installcheck-isolation installcheck-tier1 installcheck-fault
 
 .PHONY: installcheck-isolation
 
