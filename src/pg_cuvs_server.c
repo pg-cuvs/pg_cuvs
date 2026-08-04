@@ -54,15 +54,53 @@
 
 /* CSPRNG fill for reply-shm key suffixes (#87). getrandom(2) is Linux-only;
  * fall back to arc4random_buf() on macOS/BSD (never fails) so this file still
- * builds wherever `make` runs locally. */
-static void
+ * builds wherever `make` runs locally. Returns 0 on success, -1 if the CSPRNG
+ * source itself failed (Linux only). #87 finding 2: callers must fail closed
+ * on -1 (refuse to create the reply segment), not degrade to an all-zero,
+ * predictable suffix. */
+static int
 shm_key_random(unsigned char *buf, size_t len)
 {
 #ifdef __linux__
     if (getrandom(buf, len, 0) != (ssize_t) len)
-        memset(buf, 0, len);
+        return -1;
 #else
     arc4random_buf(buf, len);
+#endif
+    return 0;
+}
+
+/* #87 finding 1: SO_PEERCRED owner verification.
+ *
+ * The daemon and the PG backend run as different uids, so the shm handoff
+ * has to be 0644 (world-readable) for the daemon to read backend-created
+ * segments at all (see the 0600->0644 fix above). On a non-sticky /dev/shm
+ * host that reopens the CSPRNG-name/O_EXCL vuln from a different angle: an
+ * attacker can readdir() /dev/shm, discover the (unguessable but not
+ * secret-once-listed) segment name, unlink it, and recreate one under their
+ * own uid with the same name — the daemon would then read attacker-chosen
+ * bytes back as if they were the real backend's query/corpus/filter data.
+ *
+ * SO_PEERCRED gives the kernel-verified uid of whoever connect()ed this UDS
+ * socket. Every PG backend and background worker is a postmaster fork, so
+ * they all share postgres's uid — a segment the real backend created has
+ * st_uid == g_peer_uid; an attacker-recreated one does not (different uid),
+ * so the read is refused. Linux-only (SO_PEERCRED + struct ucred); this file
+ * is daemon-only and Linux-only in production, so other platforms just skip
+ * the check rather than fail closed. */
+static __thread uid_t g_peer_uid = (uid_t) -1;
+
+static int
+shm_check_peer_owner(int fd)
+{
+#ifdef __linux__
+    struct stat st;
+    if (fstat(fd, &st) != 0)
+        return 0;
+    return st.st_uid == g_peer_uid;
+#else
+    (void) fd;
+    return 1;
 #endif
 }
 
@@ -2232,6 +2270,11 @@ map_shm_readonly(const char *key, size_t bytes)
     fd = shm_open(key, O_RDONLY, 0);
     if (fd < 0)
         return MAP_FAILED;
+    if (!shm_check_peer_owner(fd))   /* #87 finding 1 */
+    {
+        close(fd);
+        return MAP_FAILED;
+    }
     if (fstat(fd, &st) != 0 || st.st_size < 0
         || (uint64_t)st.st_size < (uint64_t)bytes)
     {
@@ -2421,6 +2464,13 @@ handle_search_stream_bf(int client_fd, const CuvsCmdFrame *cmd)
         send_error(client_fd, "shm_open failed");
         return;
     }
+    if (!shm_check_peer_owner(qfd))   /* #87 finding 1 */
+    {
+        close(qfd);
+        pthread_mutex_unlock(&g_index_mutex);
+        send_error(client_fd, "shm owner mismatch");
+        return;
+    }
     float *query = mmap(NULL, vec_bytes, PROT_READ, MAP_SHARED, qfd, 0);
     close(qfd);
     if (query == MAP_FAILED)
@@ -2559,6 +2609,7 @@ handle_search_bf_transient(int client_fd, const CuvsCmdFrame *cmd)
     {
         int cfd = shm_open(cmd->filter_shm_key, O_RDONLY, 0);
         if (cfd < 0) { send_error(client_fd, "corpus shm_open failed"); return; }
+        if (!shm_check_peer_owner(cfd)) { close(cfd); send_error(client_fd, "corpus shm owner mismatch"); return; }   /* #87 finding 1 */
         mem = mmap(NULL, total, PROT_READ, MAP_SHARED, cfd, 0);
         close(cfd);
     }
@@ -2571,6 +2622,7 @@ handle_search_bf_transient(int client_fd, const CuvsCmdFrame *cmd)
     size_t q_bytes = (size_t)cmd->dim * sizeof(float);
     int qfd = shm_open(cmd->shm_key, O_RDONLY, 0);
     if (qfd < 0) { munmap(mem, total); send_error(client_fd, "query shm_open failed"); return; }
+    if (!shm_check_peer_owner(qfd)) { close(qfd); munmap(mem, total); send_error(client_fd, "query shm owner mismatch"); return; }   /* #87 finding 1 */
     float *query = mmap(NULL, q_bytes, PROT_READ, MAP_SHARED, qfd, 0);
     close(qfd);
     if (query == MAP_FAILED) { munmap(mem, total); send_error(client_fd, "query mmap failed"); return; }
@@ -2779,6 +2831,13 @@ handle_search(int client_fd, const CuvsCmdFrame *cmd)
     {
         pthread_mutex_unlock(&g_index_mutex);
         send_error(client_fd, "shm_open failed");
+        return;
+    }
+    if (!shm_check_peer_owner(shm_fd))   /* #87 finding 1 */
+    {
+        close(shm_fd);
+        pthread_mutex_unlock(&g_index_mutex);
+        send_error(client_fd, "shm owner mismatch");
         return;
     }
 
@@ -3840,6 +3899,13 @@ handle_search_batch(int client_fd, const CuvsCmdFrame *cmd)
         send_error(client_fd, "shm_open failed for batch queries");
         return;
     }
+    if (!shm_check_peer_owner(qfd))   /* #87 finding 1 */
+    {
+        close(qfd);
+        pthread_mutex_unlock(&g_index_mutex);
+        send_error(client_fd, "shm owner mismatch for batch queries");
+        return;
+    }
     void *qmem = mmap(NULL, qtotal, PROT_READ, MAP_SHARED, qfd, 0);
     close(qfd);
     if (qmem == MAP_FAILED)
@@ -4002,7 +4068,13 @@ handle_search_batch(int client_fd, const CuvsCmdFrame *cmd)
     {
         unsigned char rnd[8];
         char hex[17];
-        shm_key_random(rnd, sizeof(rnd));
+        if (shm_key_random(rnd, sizeof(rnd)) != 0)   /* #87 finding 2: fail closed */
+        {
+            free(out);
+            pthread_mutex_unlock(&g_index_mutex);
+            send_error_code(client_fd, CUVS_STATUS_ERROR, "csprng failed");
+            return;
+        }
         for (size_t i = 0; i < sizeof(rnd); i++)
             snprintf(hex + i * 2, 3, "%02x", rnd[i]);
         snprintf(rkey, sizeof(rkey), "/pg_cuvs_bsr_%d_%d_%s",
@@ -4772,6 +4844,13 @@ handle_build(int client_fd, const CuvsCmdFrame *cmd)
             send_error(client_fd, "shm_open failed");
             return;
         }
+        if (!shm_check_peer_owner(shm_fd))   /* #87 finding 1 */
+        {
+            LOG_ERROR("[handle_build] shm owner mismatch for %s\n", cmd->shm_key);
+            close(shm_fd);
+            send_error(client_fd, "shm owner mismatch");
+            return;
+        }
         LOG_DEBUG("[handle_build] shm_open OK fd=%d\n", shm_fd);
         mem = mmap(NULL, total, PROT_READ, MAP_SHARED, shm_fd, 0);
         close(shm_fd);
@@ -5391,6 +5470,7 @@ handle_build_multi(int client_fd, const CuvsCmdFrame *cmd, const char *index_dir
 
         pfd = shm_open(descs[i].shm_name, O_RDONLY, 0);
         if (pfd < 0)              { err = "shm_open partial failed"; goto fail; }
+        if (!shm_check_peer_owner(pfd)) { close(pfd); err = "shm owner mismatch (partial)"; goto fail; }   /* #87 finding 1 */
         if (fstat(pfd, &st) != 0) { close(pfd); err = "fstat partial failed"; goto fail; }
         if ((size_t)st.st_size != plen)
         {
@@ -5915,7 +5995,12 @@ handle_export_adjacency(int client_fd, const CuvsCmdFrame *cmd)
     {
         unsigned char rnd[8];
         char hex[17];
-        shm_key_random(rnd, sizeof(rnd));
+        if (shm_key_random(rnd, sizeof(rnd)) != 0)   /* #87 finding 2: fail closed */
+        {
+            free(adj); free(vecs);
+            send_error_code(client_fd, CUVS_STATUS_ERROR, "csprng failed");
+            return;
+        }
         for (size_t i = 0; i < sizeof(rnd); i++)
             snprintf(hex + i * 2, 3, "%02x", rnd[i]);
         snprintf(shm_key, sizeof(shm_key), "/pg_cuvs_adj_%d_%d_%s",
@@ -6233,6 +6318,12 @@ handle_build_flat(int client_fd, const CuvsCmdFrame *cmd)
             send_error(client_fd, "shm_open failed");
             return;
         }
+        if (!shm_check_peer_owner(shm_fd))   /* #87 finding 1 */
+        {
+            close(shm_fd);
+            send_error(client_fd, "shm owner mismatch");
+            return;
+        }
         mem = mmap(NULL, total, PROT_READ, MAP_SHARED, shm_fd, 0);
         close(shm_fd);
     }
@@ -6509,6 +6600,12 @@ handle_build_ivfpq(int client_fd, const CuvsCmdFrame *cmd)
         send_error(client_fd, "shm_open failed");
         return;
     }
+    if (!shm_check_peer_owner(shm_fd))   /* #87 finding 1 */
+    {
+        close(shm_fd);
+        send_error(client_fd, "shm owner mismatch");
+        return;
+    }
     void *mem = mmap(NULL, total, PROT_READ, MAP_SHARED, shm_fd, 0);
     close(shm_fd);
     if (mem == MAP_FAILED)
@@ -6772,6 +6869,13 @@ handle_search_ivfpq(int client_fd, const CuvsCmdFrame *cmd)
         send_error(client_fd, "shm_open failed");
         return;
     }
+    if (!shm_check_peer_owner(shm_fd))   /* #87 finding 1 */
+    {
+        close(shm_fd);
+        pthread_mutex_unlock(&g_index_mutex);
+        send_error(client_fd, "shm owner mismatch");
+        return;
+    }
     float *query = mmap(NULL, vec_bytes, PROT_READ, MAP_SHARED, shm_fd, 0);
     close(shm_fd);
     if (query == MAP_FAILED)
@@ -6904,6 +7008,12 @@ handle_extend(int client_fd, const CuvsCmdFrame *cmd)
     if (shm_fd < 0)
     {
         send_error(client_fd, "shm_open failed");
+        return;
+    }
+    if (!shm_check_peer_owner(shm_fd))   /* #87 finding 1 */
+    {
+        close(shm_fd);
+        send_error(client_fd, "shm owner mismatch");
         return;
     }
     void *mem = mmap(NULL, total, PROT_READ, MAP_SHARED, shm_fd, 0);
@@ -7302,6 +7412,23 @@ connection_thread(void *arg)
 {
     int client_fd = *(int *)arg;
     free(arg);
+
+#ifdef __linux__
+    /* #87 finding 1: latch the kernel-verified peer uid for this connection's
+     * lifetime before touching any shm the peer named. Fail closed — a
+     * connection whose credentials we can't read gets no service. */
+    {
+        struct ucred cred;
+        socklen_t    cred_len = sizeof(cred);
+        if (getsockopt(client_fd, SOL_SOCKET, SO_PEERCRED, &cred, &cred_len) != 0)
+        {
+            LOG_ERROR("pg_cuvs_server: SO_PEERCRED failed (errno=%d); refusing connection (#87)\n", errno);
+            close(client_fd);
+            return NULL;
+        }
+        g_peer_uid = cred.uid;
+    }
+#endif
 
     LOG_DEBUG("pg_cuvs_server: client connected (fd=%d)\n", client_fd);
     fflush(stderr);
@@ -7907,6 +8034,26 @@ main(int argc, char **argv)
     LOG_INFO("pg_cuvs_server: starting (socket=%s index-dir=%s snapshot=%s)\n",
             g_socket_path, g_index_dir,
             g_snapshot_uri[0] ? g_snapshot_uri : "disabled");
+
+#ifdef __linux__
+    /* #87 (DiD): SO_PEERCRED owner verification (finding 1) closes the
+     * unlink-and-resquat attack, but only because every real segment's name
+     * is CSPRNG-random and every fake one has the wrong uid. Neither defense
+     * needs /dev/shm to be sticky (mode 1777) — but sticky is the standard
+     * hardening for a shared tmpfs and worth a loud warning if it's missing,
+     * since it also stops other unrelated tenants from touching each
+     * other's files by name. */
+    {
+        struct stat st;
+        if (stat("/dev/shm", &st) == 0 && !(st.st_mode & S_ISVTX))
+            LOG_WARN("pg_cuvs_server: /dev/shm is not sticky (mode %o) — "
+                      "any local user can unlink/replace another user's shm "
+                      "segments; SO_PEERCRED owner checks (#87) still block "
+                      "the daemon from trusting a resquatted segment, but "
+                      "sticky /dev/shm (chmod +t) is recommended defense in depth\n",
+                      (unsigned)(st.st_mode & 07777));
+    }
+#endif
 
     /* Install SIGTERM/SIGINT via sigaction WITHOUT SA_RESTART so a signal
      * interrupts a blocked accept() (returns -1/EINTR) and we can break out

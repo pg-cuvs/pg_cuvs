@@ -207,33 +207,68 @@ recv_all_interruptible(int fd, void *buf, size_t len, int timeout_sec)
 
 /* CSPRNG fill for shm key suffixes (#87). getrandom(2) is Linux-only; this
  * file also builds via PGXS on whatever host runs `make` (macOS in local
- * dev), so fall back to arc4random_buf() there (BSD/macOS libc, never fails). */
-static void
+ * dev), so fall back to arc4random_buf() there (BSD/macOS libc, never fails).
+ * Returns 0 on success, -1 if the CSPRNG source itself failed (Linux only —
+ * arc4random_buf() has no failure mode). #87 finding 2: the caller must fail
+ * closed on -1, not degrade to a predictable (all-zero) suffix. */
+static int
 shm_key_random(unsigned char *buf, size_t len)
 {
 #ifdef __linux__
     if (getrandom(buf, len, 0) != (ssize_t)len)
-        memset(buf, 0, len);
+        return -1;
 #else
     arc4random_buf(buf, len);
 #endif
+    return 0;
 }
 
 /* Build a unique, unguessable shm key from pid + sequence counter + a CSPRNG
  * suffix. The pid/seq prefix stays for debug ordering; the random suffix
- * (#87) is what makes the name unguessable to another user on a shared host. */
-static void
+ * (#87) is what makes the name unguessable to another user on a shared host.
+ * Returns 0 on success, -1 if the CSPRNG source failed — callers must treat
+ * that as a hard failure (goto cleanup / CUVS_STATUS_ERROR), not proceed with
+ * an unrandomized key (#87 finding 2). */
+static int
 make_shm_key(char *key, size_t keylen)
 {
     static int seq = 0;
     unsigned char rnd[8];
     char hex[17];
 
-    shm_key_random(rnd, sizeof(rnd));
+    if (shm_key_random(rnd, sizeof(rnd)) != 0)
+        return -1;
     for (size_t i = 0; i < sizeof(rnd); i++)
         snprintf(hex + i * 2, 3, "%02x", rnd[i]);
 
     snprintf(key, keylen, "/pg_cuvs_%d_%d_%s", (int)getpid(), seq++, hex);
+    return 0;
+}
+
+/* #87 finding 1: verify a reply shm segment was created by the daemon we are
+ * actually talking to on `sock`, not by an attacker who unlinked and
+ * re-squatted the segment name on a non-sticky /dev/shm host (the name is
+ * CSPRNG-random but not secret once an attacker can readdir() /dev/shm).
+ * SO_PEERCRED on `sock` gives the kernel-verified uid of the daemon process
+ * that accepted this connection; a segment the real daemon created has
+ * st_uid == that uid. Linux-only (SO_PEERCRED + struct ucred). */
+static int
+shm_check_daemon_owner(int sock, int fd)
+{
+#ifdef __linux__
+    struct ucred cred;
+    socklen_t    cred_len = sizeof(cred);
+    struct stat  st;
+
+    if (getsockopt(sock, SOL_SOCKET, SO_PEERCRED, &cred, &cred_len) != 0)
+        return 0;
+    if (fstat(fd, &st) != 0)
+        return 0;
+    return st.st_uid == cred.uid;
+#else
+    (void)sock; (void)fd;
+    return 1;
+#endif
 }
 
 /* Write vectors + TIDs into a new shm segment. Returns shm fd or -1. */
@@ -378,7 +413,8 @@ cuvs_ipc_search(
     if (n_out)            *n_out = 0;
     if (delta_merged_out) *delta_merged_out = 0;
 
-    make_shm_key(shm_key, sizeof(shm_key));
+    if (make_shm_key(shm_key, sizeof(shm_key)) != 0)   /* #87 finding 2 */
+        goto cleanup;
 
     shm_fd = shm_write_query(shm_key, query_vec, dim);
     if (shm_fd < 0)
@@ -511,7 +547,8 @@ cuvs_ipc_search_batch(
     if (k_out)          *k_out = 0;
     if (latency_us_out) *latency_us_out = 0;
 
-    make_shm_key(req_key, sizeof(req_key));
+    if (make_shm_key(req_key, sizeof(req_key)) != 0)   /* #87 finding 2 */
+        goto cleanup;
     shm_fd = shm_write_query_batch(req_key, queries, n_queries, dim);
     if (shm_fd < 0)
         goto cleanup;       /* our-side error -> CUVS_STATUS_ERROR */
@@ -569,8 +606,10 @@ cuvs_ipc_search_batch(
     size_t dist_bytes = (size_t)Q * (size_t)K * sizeof(float);
     rtotal = hdr_bytes + tids_bytes + dist_bytes;
 
-    reply_fd = shm_open(reply_key, O_RDONLY, 0666);
+    reply_fd = shm_open(reply_key, O_RDONLY, 0);
     if (reply_fd < 0)
+        goto cleanup;
+    if (!shm_check_daemon_owner(sock, reply_fd))   /* #87 finding 1 */
         goto cleanup;
     rmem = mmap(NULL, rtotal, PROT_READ, MAP_SHARED, reply_fd, 0);
     if (rmem == MAP_FAILED)
@@ -861,7 +900,8 @@ cuvs_ipc_build(
     }
     else  /* CORPUS_HEAP: copy into a fresh named shm, unlinked at cleanup */
     {
-        make_shm_key(shm_key, sizeof(shm_key));
+        if (make_shm_key(shm_key, sizeof(shm_key)) != 0)   /* #87 finding 2 */
+            goto cleanup;
         legacy_shm_fd = shm_write_build_payload(shm_key, heap_vecs, heap_tids, n_vecs, dim);
         if (legacy_shm_fd < 0) {
             LOG_ERROR("[cuvs_ipc_build] shm_write FAILED errno=%d (%s)\n",
@@ -968,7 +1008,8 @@ cuvs_ipc_build_flat(
     }
     else  /* CORPUS_HEAP: copy into a fresh named shm, unlinked at cleanup */
     {
-        make_shm_key(shm_key, sizeof(shm_key));
+        if (make_shm_key(shm_key, sizeof(shm_key)) != 0)   /* #87 finding 2 */
+            goto cleanup;
         legacy_shm_fd = shm_write_build_payload(shm_key, heap_vecs, heap_tids, n_vecs, dim);
         if (legacy_shm_fd < 0) {
             LOG_ERROR("[cuvs_ipc_build_flat] shm_write FAILED errno=%d (%s)\n",
@@ -1185,10 +1226,14 @@ cuvs_ipc_export_adjacency(
     size_t hdr_bytes  = 4 * sizeof(uint32_t);  /* n_vecs, gd, dim, pad */
     size_t total      = hdr_bytes + adj_bytes + vecs_bytes + tids_bytes;
 
-    shm_fd = shm_open(reply_shm_key, O_RDONLY, 0666);
+    shm_fd = shm_open(reply_shm_key, O_RDONLY, 0);
     if (shm_fd < 0) {
         LOG_ERROR("[export_adjacency] shm_open(%s) failed errno=%d\n",
                   reply_shm_key, errno);
+        goto cleanup;
+    }
+    if (!shm_check_daemon_owner(sock, shm_fd)) {   /* #87 finding 1 */
+        LOG_ERROR("[export_adjacency] shm owner mismatch for %s\n", reply_shm_key);
         goto cleanup;
     }
 
@@ -1328,7 +1373,8 @@ cuvs_ipc_search_filtered(
     if (delta_merged_out) *delta_merged_out = 0;
 
     /* --- query shm --- */
-    make_shm_key(shm_key, sizeof(shm_key));
+    if (make_shm_key(shm_key, sizeof(shm_key)) != 0)   /* #87 finding 2 */
+        goto cleanup;
     shm_fd = shm_write_query(shm_key, query_vec, dim);
     if (shm_fd < 0)
         goto cleanup;
@@ -1336,7 +1382,8 @@ cuvs_ipc_search_filtered(
     /* --- filter shm (flat uint64_t[n_filter]) --- */
     if (has_filter)
     {
-        make_shm_key(filter_shm_key, sizeof(filter_shm_key));
+        if (make_shm_key(filter_shm_key, sizeof(filter_shm_key)) != 0)   /* #87 finding 2 */
+            goto cleanup;
         size_t filter_bytes = (size_t)n_filter * sizeof(uint64_t);
 
         filter_shm_fd = shm_open(filter_shm_key, O_CREAT | O_EXCL | O_RDWR, 0644);
@@ -1482,14 +1529,16 @@ cuvs_ipc_search_stream_bf(
         return CUVS_STATUS_NO_VECTORS;   /* nothing to gather */
 
     /* --- query shm --- */
-    make_shm_key(shm_key, sizeof(shm_key));
+    if (make_shm_key(shm_key, sizeof(shm_key)) != 0)   /* #87 finding 2 */
+        goto cleanup;
     shm_fd = shm_write_query(shm_key, query_vec, dim);
     if (shm_fd < 0)
         goto cleanup;
 
     /* --- filter shm (flat uint64_t[n_filter]) --- */
     {
-        make_shm_key(filter_shm_key, sizeof(filter_shm_key));
+        if (make_shm_key(filter_shm_key, sizeof(filter_shm_key)) != 0)   /* #87 finding 2 */
+            goto cleanup;
         size_t filter_bytes = (size_t)n_filter * sizeof(uint64_t);
 
         filter_shm_fd = shm_open(filter_shm_key, O_CREAT | O_EXCL | O_RDWR, 0644);
@@ -1657,7 +1706,8 @@ cuvs_ipc_search_bf_transient(
         pass_fd = corpus.fd;   /* anonymous; daemon mmaps via SCM_RIGHTS */
 
     /* --- Query shm. --- */
-    make_shm_key(shm_key, sizeof(shm_key));
+    if (make_shm_key(shm_key, sizeof(shm_key)) != 0)   /* #87 finding 2 */
+        goto cleanup;
     shm_fd = shm_write_query(shm_key, query_vec, dim);
     if (shm_fd < 0)
         goto cleanup;
@@ -1773,7 +1823,8 @@ cuvs_ipc_build_ivfpq(
     char            dir_buf[256] = {0};
     CuvsReplyHeader hdr;
 
-    make_shm_key(shm_key, sizeof(shm_key));
+    if (make_shm_key(shm_key, sizeof(shm_key)) != 0)   /* #87 finding 2 */
+        goto cleanup;
     shm_fd = shm_write_build_payload(shm_key, vecs, tids, n_vecs, dim);
     if (shm_fd < 0) {
         LOG_ERROR("[cuvs_ipc_build_ivfpq] shm_write FAILED errno=%d (%s)\n",
@@ -1854,7 +1905,8 @@ cuvs_ipc_search_ivfpq(
     if (latency_us_out) *latency_us_out = 0;
     if (n_out)          *n_out = 0;
 
-    make_shm_key(shm_key, sizeof(shm_key));
+    if (make_shm_key(shm_key, sizeof(shm_key)) != 0)   /* #87 finding 2 */
+        goto cleanup;
     shm_fd = shm_write_query(shm_key, query_vec, dim);
     if (shm_fd < 0)
         goto cleanup;
@@ -1951,7 +2003,8 @@ cuvs_ipc_extend(
     char            dir_buf[256] = {0};
     CuvsReplyHeader hdr;
 
-    make_shm_key(shm_key, sizeof(shm_key));
+    if (make_shm_key(shm_key, sizeof(shm_key)) != 0)   /* #87 finding 2 */
+        goto cleanup;
     shm_fd = shm_write_build_payload(shm_key, new_vecs, new_tids, n_new, dim);
     if (shm_fd < 0) {
         LOG_ERROR("[cuvs_ipc_extend] shm_write FAILED errno=%d (%s)\n",
