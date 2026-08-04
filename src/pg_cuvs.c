@@ -850,7 +850,15 @@ _PG_init(void)
         "graph under a GPU BITSET mask (3O) instead of the exact D-wedge post-filter. "
         "3O is APPROXIMATE and its recall collapses on selective filters: measured "
         "0.99 at sel>=1e-3 but 0.86 / 0.48 / 0.28 at 5e-4 / 2e-4 / 1e-4, where it also "
-        "stops returning a full k (ADR-082). The exact paths cover the whole range "
+        "stops returning a full k (ADR-082). WARNING (ADR-083, #133): selectivity is "
+        "NOT the predictive variable for this collapse -- filter *shape* (its "
+        "correlation with the query) is. An anti-correlated filter measured recall "
+        "0.0 across the ENTIRE 0.0001-0.5 selectivity range, including sel=0.5 "
+        "(500k passing rows), so no threshold here filters the failure out. The "
+        "daemon detects a materially short fill and retries on the GPU exact BF "
+        "prefilter (gpu_bf_prefilter, NOT the D-wedge post-filter above -- different "
+        "cost model; see pg_stat_gpu_search.prefilter_fallback_count) as a "
+        "mitigation, not a guarantee for every filter shape. The exact paths cover the whole range "
         "faster, so this defaults to 0.0 = always exact; raise it only to trade "
         "correctness for 3O's flat ~2ms latency. 1.0 = always 3O. 3O also remains the "
         "automatic fallback when the .vectors sidecar is missing.",
@@ -4776,7 +4784,7 @@ pg_cuvs_last_search_metric(PG_FUNCTION_ARGS)
  * the view must stay queryable while the daemon restarts. (See plan: a
  * future liveness column can distinguish "down" from "idle".)
  * ---------------------------------------------------------------- */
-#define GPU_STATS_NCOLS 38
+#define GPU_STATS_NCOLS 39
 
 static const char *
 cuvs_metric_name(uint32_t metric)
@@ -5274,6 +5282,12 @@ pg_cuvs_gpu_search_stats(PG_FUNCTION_ARGS)
                 time_t_to_timestamptz((pg_time_t) s->last_compact_at));
         else
             nulls[37] = true;
+
+        /* #133/ADR-083: 3O->gpu_bf_prefilter retries triggered by a short-fill
+         * collapse detection (anti-correlated filter). Lets an operator see
+         * this index "quietly went slow" without the query itself signaling
+         * anything. */
+        values[38] = Int64GetDatum((int64) s->prefilter_fallback_count);
 
         tuplestore_putvalues(tupstore, tupdesc, values, nulls);
     }

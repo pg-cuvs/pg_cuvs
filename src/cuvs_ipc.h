@@ -196,6 +196,18 @@ typedef struct CuvsResult {
  * index entries) followed by n_results × CuvsIndexStats. The daemon owns
  * the per-index latency histogram and sends pre-computed percentiles, so
  * the bucket count is not part of the wire ABI.
+ *
+ * CuvsIndexStats is NOT covered by CUVS_PROTO_VERSION above (that guards
+ * CuvsCmdFrame/CuvsReplyHeader only) -- it has its own convention, marked
+ * inline at each addition as "wire ABI extension — co-deploy daemon+
+ * extension": new fields are appended at the STRUCT TAIL ONLY, never
+ * inserted mid-struct. A mid-struct insert shifts every field after it,
+ * so an old extension reading a new daemon's reply (or vice versa) would
+ * silently misread every trailing field as garbage rather than failing
+ * loudly; a tail append at worst leaves an old reader ignorant of the new
+ * field (harmless) or a new reader zero-filled for it (memset'd before
+ * populating, see handle_stats). Still requires co-deployment for the new
+ * field itself to be meaningful, but does not corrupt the fields around it.
  * ---------------------------------------------------------------- */
 typedef struct CuvsIndexStats {
     uint32_t db_oid;
@@ -242,6 +254,14 @@ typedef struct CuvsIndexStats {
     int64_t  n_extended;        /* vectors added via EXTEND since last build/compact */
     uint64_t compact_count;     /* cuvsCagraMerge compact ops since last build */
     int64_t  last_compact_at;   /* epoch seconds of last compact; 0 if never */
+    /* #133/ADR-083: searches where the 3O CAGRA prefilter returned a
+     * materially short fill (mean_returned<<k, a signal of anti-correlated
+     * filter collapse) and were retried on the GPU exact BF prefilter
+     * (`gpu_bf_prefilter`, mode 3 -- see cuvs_bf_search_filtered) instead of
+     * the approximate CAGRA path. Appended at the struct TAIL, not inserted
+     * mid-struct (wire ABI extension — co-deploy daemon+extension; see the
+     * struct-level comment above on why tail-only matters here). */
+    uint64_t prefilter_fallback_count;
 } CuvsIndexStats;
 
 /* ----------------------------------------------------------------

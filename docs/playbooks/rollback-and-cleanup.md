@@ -43,7 +43,7 @@ psql -d postgres -c "SELECT extversion FROM pg_extension WHERE extname = 'pg_cuv
 ```
  extversion
 ------------
- 0.5.0
+ 0.6.0
 ```
 **-> 버전 확인:** Step 1-3으로  
 **-> 0 rows:** extension이 catalog에 없음 (artifact만 남아 있을 수 있음)
