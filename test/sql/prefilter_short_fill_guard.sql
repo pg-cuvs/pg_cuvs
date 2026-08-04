@@ -189,3 +189,104 @@ FROM pg_stat_gpu_search WHERE index_oid = 'psf_f2_cagra'::regclass;
 RESET cuvs.filter_auto_threshold;
 RESET cuvs.search_mode;
 DROP TABLE psf_f2 CASCADE;
+
+-- ----------------------------------------------------------------
+-- #133 review, round 3: the psf_f2 case above proves F2 is correct against
+-- a FABRICATED gap (encoded TIDs that were never real ctids). It does not
+-- prove the causal claim in the code comment and ADR-083 -- that a
+-- post-build DELTA ROW produces this same gap. This section reproduces
+-- that specific cause.
+--
+-- Mechanism (found by reading cuvs_aminsert, src/pg_cuvs.c): a `cagra`-AM
+-- INSERT does NOT go straight to the async .delta file. When the daemon
+-- socket is reachable, aminsert synchronously calls cuvs_ipc_extend() per
+-- row, which grows the resident CAGRA graph (and rebuilds rev_tids) in
+-- place immediately -- so in normal operation a delta row is usually
+-- absorbed into the base graph before any query ever sees it pending,
+-- which is exactly why chasing this race non-deterministically failed
+-- twice before. Only when the EXTEND call cannot reach the daemon does
+-- aminsert fall through to cuvs_delta_append() (a direct file write, not
+-- an RPC) -- and THAT path is what leaves rev_tids permanently unaware of
+-- the new row until a REINDEX. `cuvs.socket_path=''` (already used by the
+-- fc_anti case in filter_comparison.sql for VACUUM) makes aminsert take
+-- that fallback deterministically, without racing anything.
+--
+-- Confirmed the gap is real, not merely inferred: with 5 rows inserted
+-- this way, n_vecs stayed unchanged (checked via pg_stat_gpu_search) and
+-- the daemon log showed "delta cache ... built (5 rows...)" but no
+-- "extend" activity -- the base graph never saw them. A direct probe
+-- (filter = ONLY those 5 pending-delta TIDs) returned all 5 rows from
+-- cuvs_filtered_knn's SQL-visible output, which looked at first like the
+-- gap does NOT exist -- but that visible row count comes from a SEPARATE
+-- backend-side step (cuvs_merge_delta_filtered in src/pg_cuvs.c, called
+-- after the daemon replies) that CPU-merges matching .delta rows into
+-- filtered results independent of the daemon's own search. It runs after
+-- the guard's decision, not as part of it. The daemon-side observation
+-- point -- search_mode / prefilter_fallback_count, exactly what this
+-- guard controls -- showed cagra_prefilter / unchanged throughout,
+-- confirming the daemon's own n_included correctly excluded the pending
+-- rows and did not misfire.
+-- ----------------------------------------------------------------
+
+DROP TABLE IF EXISTS psf_delta CASCADE;
+CREATE TABLE psf_delta (row_id int NOT NULL, v vector(4));
+INSERT INTO psf_delta
+SELECT g, array_agg(round((random() * 0.9 + 0.05)::numeric, 4) ORDER BY d)::real[]::vector(4)
+FROM generate_series(1, 200) g, generate_series(1, 4) d
+GROUP BY g;
+
+SET cuvs.search_mode = brute_force;   -- main_bf_idx present (isolates F1+F2)
+CREATE INDEX psf_delta_cagra ON psf_delta USING cagra (v vector_l2_ops);
+RESET cuvs.search_mode;               -- back to 'cagra' -- brute_force mode
+                                       -- skips refresh_delta_cache() below
+
+-- Force aminsert to skip the synchronous EXTEND RPC so these 5 rows go
+-- through cuvs_delta_append() (a direct file write) instead of growing the
+-- resident CAGRA graph -- see the mechanism note above.
+SET cuvs.socket_path = '';
+INSERT INTO psf_delta
+SELECT g, array_agg(round((random() * 0.9 + 0.05)::numeric, 4) ORDER BY d)::real[]::vector(4)
+FROM generate_series(201, 205) g, generate_series(1, 4) d
+GROUP BY g;
+RESET cuvs.socket_path;
+
+-- Step 1 (review instruction): confirm the rows are genuinely pending
+-- BEFORE checking the gap. A plain (non-prefiltered) CAGRA search is the
+-- path that calls refresh_delta_cache() and picks up the .delta file.
+SET enable_seqscan = off;
+SELECT count(*) FROM (
+    SELECT ctid FROM psf_delta
+    ORDER BY v <-> '[0.5,0.3,0.7,0.2]'::vector(4) LIMIT 5
+) s;
+RESET enable_seqscan;
+
+SELECT delta_rows AS pending_delta_confirmed
+FROM pg_stat_gpu_search WHERE index_oid = 'psf_delta_cagra'::regclass;
+
+-- Step 2: filter on 3 real base rows + all 5 pending-delta rows, force 3O.
+-- n_filter_tids=8; n_included should be 3 (rev_tids never absorbed the
+-- delta rows). k=5 so a pre-F2 expect=min(5,8)=5 would exceed what the
+-- daemon can ever find (3), misjudging a correct answer as a collapse.
+SET cuvs.filter_auto_threshold = 1.0;
+
+SELECT prefilter_fallback_count AS fallback_before_real_delta_gap
+FROM pg_stat_gpu_search WHERE index_oid = 'psf_delta_cagra'::regclass;
+
+SELECT count(*) AS n_real_delta_gap  -- SQL-visible count; see note above on
+                                      -- why this isn't the assertion point
+FROM cuvs_filtered_knn(
+    'psf_delta_cagra'::regclass,
+    '[0.5,0.3,0.7,0.2]'::vector(4),
+    (SELECT array_agg(ctid) FROM psf_delta WHERE row_id IN (10, 50, 90))
+    || (SELECT array_agg(ctid) FROM psf_delta WHERE row_id > 200),
+    5
+) f;
+
+-- The actual assertion: the daemon's own decision, unaffected by the
+-- backend's separate delta merge above.
+SELECT search_mode AS mode_real_delta_gap,
+       prefilter_fallback_count AS fallback_after_real_delta_gap
+FROM pg_stat_gpu_search WHERE index_oid = 'psf_delta_cagra'::regclass;
+
+RESET cuvs.filter_auto_threshold;
+DROP TABLE psf_delta CASCADE;
