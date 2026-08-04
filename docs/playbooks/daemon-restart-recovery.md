@@ -253,9 +253,15 @@ NOTICE:  pg_cuvs: cagra scan index_oid=XXXXX gpu
 전제하에 SO_PEERCRED(`shm_check_peer_owner`, 소켓 접속 시점의 owner 검증)와
 CSPRNG 세그먼트 이름 + `O_EXCL`(#87)로 unlink-and-resquat 공격을 막는다.
 같은 방식으로 `cuvs.daemon_uid`(#119)는 backend가 `cuvs.socket_path`에
-connect하기 *전* 소켓 파일 자체의 owner를 검증해, daemon 소켓을 unlink하고
-자기 소유 리스너로 미리 squat하는 pre-bind 공격을 막는다 — SO_PEERCRED만으로는
-connect 이후에나 검증하므로 이 앞선 공격을 막지 못한다.
+connect하는 경로를 두 단계로 방어한다: (1) connect *전* lstat으로 소켓 파일
+owner를 미리 확인해 빠른 실패 + 명확한 에러 메시지를 주고, (2) connect
+*직후* SO_PEERCRED로 커널이 검증한 peer uid를 다시 확인한다. 실제 보안
+경계는 (2)다 — (1)은 lstat과 connect() 사이에 소켓이 unlink·재squat될 수
+있는 TOCTOU race이고, (2)는 이 특정 connection을 accept한 프로세스의
+uid가 커널에 의해 확정되므로 이후 바꿔치기가 불가능하다. 기존
+`shm_check_daemon_owner`(cuvs_ipc.c)는 이 (2)와 다른 검사다 —
+"reply shm 소유자 == 이 소켓의 peer" 자기일관성만 보고 `cuvs.daemon_uid`와는
+대조하지 않으므로, 공격자가 peer 본인이면(즉 소켓 자체를 장악했으면) 통과한다.
 
 배포 시 다음을 지킨다:
 
@@ -273,14 +279,34 @@ connect 이후에나 검증하므로 이 앞선 공격을 막지 못한다.
    끄며(하위 호환), 소켓 owner가 기대와 다르면 backend는 connect를
    거부하고 `CUVS_STATUS_UNAVAILABLE`로 CPU fallback한다(fail-closed).
    § 3. GUC reference의 `cuvs.daemon_uid` 참고.
-4. **소켓의 부모 디렉터리는 world-writable + non-sticky로 두지 않는다.**
-   소켓 파일 자체는 world-writable(0666)이어야 한다 — AF_UNIX
+4. **소켓을 non-world-writable 디렉터리에 둔다 — 이것이 1차 완화책이다.**
+   기본 경로 `/tmp/.s.pg_cuvs`는 `/tmp`가 sticky(`+t`) + world-writable인
+   표준 배포에서도 안전하지 않다: **sticky bit는 남의 파일을
+   unlink/rename하는 것만 막고, 새 이름으로 파일을 만드는 것은 막지
+   않는다.** 즉 daemon이 재시작·크래시·부팅 순서 등으로 잠시 죽어 있는
+   동안, 같은 호스트의 아무 로컬 사용자나 `/tmp/.s.pg_cuvs` 경로를 먼저
+   bind해 선점할 수 있고, 그러면 실제 daemon의 bind()가 `EADDRINUSE`로
+   실패해 공격자가 그 경로를 계속 점유하게 된다 — `cuvs.daemon_uid`가
+   막으려는 hijack이 **stock `/tmp` 설정에서 실제로 도달 가능**하다.
+   uid 검사 유무와 무관하게 이 공격 자체를 없애려면 소켓을
+   non-world-writable 디렉터리(예: `/run/pg_cuvs/`, daemon이 만들고
+   0755 root 소유 또는 0750 `daemon:postgres`)에 두고 `cuvs.socket_path`를
+   그 경로로 설정해야 한다.
+
+   소켓 파일 자체의 world-writable(0666) 비트는 다른 얘기다 — AF_UNIX
    `connect()`는 소켓 inode에 대한 write 권한을 요구하므로, daemon과
-   backend가 다른 uid인 배포에서는 systemd unit이 `chmod 666`으로
-   이를 보장한다(daemon-restart-recovery.md 위 "소켓 권한 문제" 참고).
-   `cuvs.daemon_uid`는 이 world-writable 비트를 거부하지 않는다 —
-   소켓을 unlink 후 재squat한 공격자는 자기 uid로 새 소켓을 만들 수밖에
-   없으므로 owner-uid 검사(위 3번)가 이미 이를 막는다. 대신 부모
-   디렉터리(기본 `/tmp`)가 sticky bit(`+t`) 없이 world-writable이면
-   다른 로컬 사용자가 소켓 파일을 미리 만들어 선점할 수 있으므로,
-   부모 디렉터리의 sticky bit은 배포 시 별도로 확인한다.
+   backend가 다른 uid이고 같은 그룹을 공유하지 않는 배포에서는
+   필요하다(systemd unit의 `chmod 666`, 위 "소켓 권한 문제" 참고).
+   `cuvs.daemon_uid`는 이 비트를 거부하지 않는다 — 소켓을 unlink 후
+   재squat한 공격자는 자기 uid로 새 소켓을 만들 수밖에 없으므로
+   owner-uid + SO_PEERCRED 검사(위 3번)가 이미 이를 막는다. 다만 group을
+   공유할 수 있는 배포(예: postgres를 daemon 그룹에 추가)라면 0666보다
+   **0660 + 공유 그룹**이 한 단계 더 나은 하드닝이다 — world 권한 자체를
+   없애기 때문이다.
+
+   함정: `cuvs.socket_path`가 실제 소켓을 가리키는 **심링크**인 배포는
+   `cuvs.daemon_uid` 설정 시 깨진다 — pre-check는 `lstat`으로 심링크
+   자체(다른 owner일 수 있음)를 보고 거부할 수 있다. `connect()`는
+   심링크를 따라가므로 실제 보안 경계인 post-connect SO_PEERCRED는
+   영향받지 않지만, `cuvs.socket_path`는 심링크가 아닌 소켓 파일을
+   직접 가리키게 하는 편이 안전하다.

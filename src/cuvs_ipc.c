@@ -85,8 +85,17 @@ uds_connect_ex(const char *socket_path, int recv_timeout_sec)
         struct stat st;
         if (lstat(socket_path, &st) != 0)
         {
-            LOG_ERROR("[cuvs_ipc] cannot stat socket_path %s: %s\n",
-                      socket_path, strerror(errno));
+            /* ENOENT is the normal "daemon is down" shape (restart window,
+             * crash, not yet started) — happens on every query while the
+             * daemon is out; don't drown a real hijack signal in restart
+             * noise. Anything else (EACCES, ELOOP, ...) is unusual enough
+             * to warrant the louder level. */
+            if (errno == ENOENT)
+                LOG_WARN("[cuvs_ipc] cannot stat socket_path %s: %s\n",
+                          socket_path, strerror(errno));
+            else
+                LOG_ERROR("[cuvs_ipc] cannot stat socket_path %s: %s\n",
+                          socket_path, strerror(errno));
             close(fd);
             return -1;
         }
