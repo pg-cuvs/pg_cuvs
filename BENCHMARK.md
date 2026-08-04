@@ -467,7 +467,7 @@ the CPU baseline.
 
 **Batch-vs-single recall divergence (`pgcuvs_cagra_batch`) — tracked as
 [#144](https://github.com/pg-cuvs/pg_cuvs/issues/144).** On the same resident graph
-at K=200, batch returns 0.9907 and single-query returns 0.9928–0.9932: a
+at K=200, batch returns 0.9907 and single-query returns 0.9930–0.9932: a
 **same-graph delta of 0.00225 / 0.00240 / 0.00250** across three samples, with the batch
 side bit-identical every time and the sign stable (batch lower). At N=100k the same
 measurement gave 0.00065 and 0.0010 with the sign flipping between builds. **Both scale
