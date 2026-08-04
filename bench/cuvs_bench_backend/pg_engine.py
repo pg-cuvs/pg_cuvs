@@ -59,6 +59,16 @@ INDEX_DIR_DEFAULT = "/tmp/cuvs_indexes"
 
 ALGOS = ("pgvector_hnsw", "pgvector_ivfflat", "pgcuvs_cagra", "pgcuvs_hnsw_import")
 
+# The #98 latency axis also carries a non-Postgres algo, `cuvs` (raw cuVS CAGRA,
+# cuvs_engine.CuvsEngine). It is deliberately NOT in ALGOS: ALGOS is what
+# PgEngine.build() asserts against and what the standalone runners offer, and
+# PgEngine cannot build or search a raw index. It IS in DEFAULT_SWEEPS, which is
+# the harness-wide sweep table that both backend.py's loader and
+# run_pg_cuvsbench.py index by algo name (a missing entry there is a KeyError,
+# not a graceful skip).
+RAW_ALGOS = ("cuvs",)
+LATENCY_ALGOS = ALGOS + RAW_ALGOS
+
 # Default per-algo parameter sweeps (the recall/latency knob). Each value is one
 # point on that algo's recall-vs-latency curve; pg_cuvs CAGRA sweeps cuvs.k so
 # it gets a real curve rather than a single point.
@@ -67,6 +77,11 @@ DEFAULT_SWEEPS = {
     "pgvector_ivfflat":   [1, 4, 8, 16, 32, 64, 128],        # ivfflat.probes
     "pgcuvs_cagra":       [16, 32, 64, 100, 200, 400],       # cuvs.k
     "pgcuvs_hnsw_import": [16, 32, 64, 128, 256, 512],       # hnsw.ef_search
+    # Identical to pgcuvs_cagra's, and that identity is load-bearing: the raw
+    # arm exists to be compared with pgcuvs_cagra point for point within the
+    # latency axis, which only holds if both sweep the same knob over the same
+    # values. Change one and you must change the other.
+    "cuvs":               [16, 32, 64, 100, 200, 400],       # GPU candidate count
 }
 
 

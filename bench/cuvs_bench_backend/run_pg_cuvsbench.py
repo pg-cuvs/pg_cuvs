@@ -178,7 +178,10 @@ def _rows(results, axis="latency"):
                 "reused": (b.metadata or {}).get("reused") if b else "",
                 "success": r.success,
                 "error": r.error_message or "",
-                "notes": "",
+                # Backends that have something to say about the conditions a
+                # point was measured under (the raw arm's GPU tenancy) put it
+                # here; "" for everything else.
+                "notes": md.get("notes", ""),
             })
     return rows
 

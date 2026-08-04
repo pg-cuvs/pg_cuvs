@@ -71,6 +71,12 @@ BUILD_GRIDS = {
     "pgcuvs_hnsw_import": [{"mode": mode, "graph_degree": gd,
                             "intermediate_graph_degree": INTERMEDIATE_GRAPH_DEGREE}
                            for mode in ("nsw", "hnswlib") for gd in (32, 64)],
+    # Raw cuVS CAGRA (no Postgres). Same cells as pgcuvs_cagra by construction:
+    # the raw arm is only interpretable as an integration-tax anchor if its
+    # index is built with the parameters the SQL arm's index was built with.
+    "cuvs": [{"graph_degree": gd,
+              "intermediate_graph_degree": INTERMEDIATE_GRAPH_DEGREE}
+             for gd in (32, 64, 128)],
     # ivfflat is explicitly out of #98's 4-algo scope (pgvector's representative
     # curve is HNSW); kept buildable with a single cell so nothing crashes if a
     # caller asks for it.
