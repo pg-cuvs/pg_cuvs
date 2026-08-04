@@ -18,6 +18,7 @@
 #   gpu-run.sh status                     # what is running / how the last run ended
 #   gpu-run.sh run <name> -- <command…>   # preflight, take the lock, run detached
 #   gpu-run.sh log  [n]                   # tail the current/last run's log
+#   gpu-run.sh log  -f                    # follow it live (Ctrl-C to detach)
 #
 # The command runs on the VM under the bench env (PGHOST/PATH/LD_LIBRARY_PATH),
 # cwd = ~/pg_cuvs.
@@ -57,8 +58,15 @@ print("          cmd %s" % g("cmd"))
 '
     ;;
 log)
-    n="${2:-40}"
-    vm "l=\$(python3 -c \"import json;print(json.load(open('$STATE'))['log'])\" 2>/dev/null); [ -n \"\$l\" ] && tail -n $n \"\$l\" || echo '(no log)'"
+    # `log -f` follows the run's log live (ssh + tail -F, Ctrl-C to detach) so a
+    # run's progress can be watched as it happens; `log [n]` keeps its old
+    # meaning (print the last n lines and return).
+    if [ "${2:-}" = "-f" ]; then
+        vm -t "l=\$(python3 -c \"import json;print(json.load(open('$STATE'))['log'])\" 2>/dev/null); [ -n \"\$l\" ] && tail -n 40 -F \"\$l\" || echo '(no log)'"
+    else
+        n="${2:-40}"
+        vm "l=\$(python3 -c \"import json;print(json.load(open('$STATE'))['log'])\" 2>/dev/null); [ -n \"\$l\" ] && tail -n $n \"\$l\" || echo '(no log)'"
+    fi
     ;;
 run)
     shift
