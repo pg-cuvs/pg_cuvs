@@ -2490,7 +2490,7 @@ handle_search_stream_bf(int client_fd, const CuvsCmdFrame *cmd)
         flt_mem = map_shm_readonly(cmd->filter_shm_key, flt_bytes);
     if (flt_mem != MAP_FAILED)
         flt_tids = (uint64_t *)flt_mem;
-    if (!flt_tids)
+    if (cuvs_filter_frame_refuses(cmd->n_filter_tids, flt_tids != NULL))
     {
         munmap(query, vec_bytes);
         pthread_mutex_unlock(&g_index_mutex);
@@ -3205,7 +3205,7 @@ handle_search(int client_fd, const CuvsCmdFrame *cmd)
          * "key is non-empty" branch, so a frame with no key skipped the check
          * entirely and still produced unfiltered rows. The streaming-BF path
          * already refuses in the same situation — match it. */
-        if (cmd->n_filter_tids > 0 && !filter_tids)
+        if (cuvs_filter_frame_refuses(cmd->n_filter_tids, filter_tids != NULL))
         {
             free(raw); free(results);
             free(filter_tids);
