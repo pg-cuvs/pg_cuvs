@@ -223,15 +223,32 @@ class PgEngine:
 
     # -- data ------------------------------------------------------------------
     def _dump_78_evidence(self, cur, got, n):
-        """#78: at 1M scale count(*) has intermittently reported 0 between
-        configs. Measured facts so far: the heap really is empty (parallel seq
-        scan returns rows=0 in ~17 ms), relfilenode is unchanged, n_tup_del is
-        0, the orchestrator loop is strictly sequential, an autocommit COPY is
-        visible to other connections immediately, and neither
-        pg_cuvs_build_hnsw nor a cagra CREATE INDEX empties the heap at 50k. So
-        re-loading is the correct response -- what is unknown is what empties
-        the table. Dump the state here so the next occurrence carries its own
-        evidence instead of just a lost 2 minutes."""
+        """#78: count(*) intermittently reported 0 between configs. RESOLVED --
+        nothing was emptying the table. Product-side cause tracked as #141.
+
+        `SELECT count(*) FROM t` needs no columns, so the planner may answer it
+        from ANY index on t, and it costed a pg_cuvs index at the table's full
+        row count. But that AM returns zero tuples for an unqualified scan
+        (src/pg_cuvs.c:3540-3542 returns false when numberOfOrderBys < 1), so
+        the aggregate counted nothing:
+
+            Aggregate  (cost=… rows=1)
+              ->  Index Only Scan using t_cagra on t  (rows=100000 est) (actual rows=0)
+
+        Measured on the VM during the Stage-1 rehearsal: count(*) = 0 while the
+        same count with enable_indexscan/indexonlyscan/bitmapscan off returned
+        100000, n_tup_del was 0, and pg_relation_size(t) was consistent with a
+        full table (vector(768) rows are TOASTed, so the heap holds pointers).
+        The intermittency was simply whether a pg_cuvs index happened to be
+        resident -- which is why it only ever appeared between configs and never
+        reproduced in the 50k isolated test, where none was.
+
+        The gate now counts with those scan methods disabled (see
+        _corpus_reusable), so this dump should no longer fire for that reason.
+        It stays because a genuinely short table is still possible, and then the
+        state it prints is the evidence. NOTE: the underlying AM behaviour is a
+        product bug -- `SELECT count(*)` silently returns 0 for any table
+        carrying a pg_cuvs index -- and is NOT fixed here. Tracked as #141."""
         cur.execute(
             "SELECT pg_relation_filenode('public.t'), "
             "       pg_relation_size('public.t'), "
@@ -243,6 +260,40 @@ class PgEngine:
         print(f"[engine] #78 corpus reload: marker/count mismatch count={got} "
               f"want={n} filenode={fnode} relsize={relsize} "
               f"n_tup_ins={ins} n_tup_del={dele}", flush=True)
+
+    #: Scan methods that let an index answer a zero-column aggregate. The corpus
+    #: gate must not depend on which of them the planner picks.
+    _COUNT_SCAN_GUCS = ("enable_indexscan", "enable_indexonlyscan",
+                        "enable_bitmapscan")
+
+    def _heap_row_count(self, cur):
+        """How many rows `t` actually holds, independent of plan shape.
+
+        A bare `SELECT count(*) FROM t` is not a fact about the data: it needs
+        no columns, so the planner may answer it from any index on t, and a
+        pg_cuvs index answers an unqualified scan with zero rows (#141; see
+        _dump_78_evidence). That made a corpus-integrity gate return "the table
+        is empty" for a full table whenever a CAGRA index was resident, and the
+        spurious reload that followed dropped the ANN indexes mid-sweep -- one
+        build_cfg then recorded two builds and the segment gate aborted the run.
+
+        Counting with the index scan methods disabled forces the seq scan that
+        reads the heap itself, which is the only thing the gate is actually
+        asking about."""
+        saved = {}
+        for g in self._COUNT_SCAN_GUCS:
+            cur.execute(f"SHOW {g}")
+            saved[g] = cur.fetchone()[0]
+            cur.execute(f"SET {g} = off")
+        try:
+            cur.execute("SELECT count(*) FROM public.t")
+            return cur.fetchone()[0]
+        finally:
+            # Restore rather than RESET: the caller's session may legitimately
+            # have set these, and this helper must not be the thing that
+            # changes how a later measurement is planned.
+            for g, v in saved.items():
+                cur.execute(f"SET {g} = {v}")
 
     def _corpus_reusable(self, cur, dataset, corpus_path, n, dim):
         """Cheap per-config gate (#78): a durable marker table describes what
@@ -280,8 +331,7 @@ class PgEngine:
         cur.execute("SELECT to_regclass('public.t')")
         if cur.fetchone()[0] is None:
             return False
-        cur.execute("SELECT count(*) FROM public.t")
-        got = cur.fetchone()[0]
+        got = self._heap_row_count(cur)
         if got == n:
             print(f"[engine] table t reused via #78 marker gate "
                   f"(dataset={dataset} n={n} fingerprint={marker[0][:12]}...)",
