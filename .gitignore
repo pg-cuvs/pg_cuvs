@@ -63,3 +63,6 @@ cache/
 *.tfstate
 *.tfstate.backup
 .terraform.lock.hcl
+
+# gpu-guard bypass / local hook state (see .claude/hooks/gpu-guard.sh)
+.claude/state/
