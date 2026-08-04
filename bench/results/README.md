@@ -25,30 +25,22 @@ file exists so a link that lands directly on a CSV does not lose the context.
 | `adr079_3o_recall_crossover.csv` | 2026-07-24 | same | wiki_all_1M | Brev A100 | **canonical** — D-wedge/stream_bf crossover (~0.004) |
 | `adr079_3paths.csv` | 2026-07-24 | same | wiki_all_1M | Brev A100 | superseded by `_verified` |
 | `adr079_3paths_verified.csv` | 2026-07-24 | same | wiki_all_1M | Brev A100 | **canonical** — per-query route attribution |
-| `pg_cuvsbench_1m.csv` | 2026-07-16 | cuvs-bench (pg backend), ext 0.5.0 | Cohere wiki-en, 1M×1024 | A100-40GB | **known defect** — see below |
+| `pg_cuvsbench_1m_legacy.csv` | 2026-07-16 | cuvs-bench (pg backend), ext 0.5.0 | Cohere wiki-en, 1M×1024 | A100-40GB | **legacy** (superseded by wiki_all_1M canonical rows above; `index_bytes=0` defect, fixed in code by #75/#79 — see below) |
 | `cohere_N1000000_summary.csv`, `.jsonl` | 2026-06-01 | anbench `run_cohere.sh` | Cohere wiki-en, 1M×1024 | A100-SXM4-40GB | **superseded + known defect** — see below |
 | `gpu_resources_bench.csv` | 2026-06-01 | `bench/legacy/test_gpu_resources.py` | synthetic 100K×384 | A100 | VRAM budget / shard / fanout matrix — not re-audited |
 | `hnsw_import_bench.csv` | 2026-06-01 | 3I import harness | synthetic | A100 | CAGRA→HNSW import speedup — not re-audited |
 
 ## Known defects
 
-### `pg_cuvsbench_1m.csv` — `index_bytes = 0` on every `pgcuvs_cagra` row
+### `pg_cuvsbench_1m_legacy.csv` — `index_bytes = 0` on every `pgcuvs_cagra` row (legacy, not re-run)
 
-Produced **before** #73/#75 fixed VRAM accounting. The CAGRA graph is daemon-resident,
-not a Postgres relation, so the backend's `pg_relation_size()` returned 0 — while the
-pgvector rows in the same file report real sizes (7.62 GiB). Read naively, the file says
-*"the GPU index costs nothing"*, which is the opposite of true on the axis that matters
-most for GPU deployment.
-
-`recall`, `qps`, `p50/p95/p99` and `build_time_s` in this file are **not** affected.
-
-Corrected evidence for the same measurement, on post-fix code:
-`pg_cuvsbench_wiki1m.csv` reports `index_bytes = 3328000000` for CAGRA
-(= `1M × (768×4 + 64×4)`, exactly the fixed `estimate_vram_bytes` formula), and
-`pg_cuvsbench_wiki1m_brev.csv` reproduces it byte-identically on a second host.
-It is a different dataset (wiki_all_1M 768d vs Cohere 1024d), so it is a replacement for
-the *defect*, not a drop-in replacement for the row. Regenerating the Cohere sweep on
-post-#75 code is tracked separately.
+Produced **before** #73/#75 fixed VRAM accounting; `pg_relation_size()` returned 0 for
+the daemon-resident CAGRA graph. `recall`, `qps`, `p50/p95/p99` and `build_time_s` are
+**not** affected. **#92 (2026-08-04) withdrew the regenerate-this-CSV plan**: the defect
+is already fixed in code (#75/#79), and `pg_cuvsbench_wiki1m.csv` /
+`pg_cuvsbench_wiki1m_brev.csv` above are the canonical post-fix evidence
+(`index_bytes = 3328000000`, byte-identical across hosts) — this file is retained as a
+legacy artifact, not a regeneration target.
 
 ### `cohere_N1000000_summary.csv` / `.jsonl` — k not wired to GPU top-k
 
