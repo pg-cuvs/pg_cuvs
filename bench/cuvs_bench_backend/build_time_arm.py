@@ -15,13 +15,22 @@ that bug (pg_engine.PgEngine.load_corpus) removes even that accidental sample.
 This script fixes the corpus + build params and repeats DROP INDEX; CREATE
 INDEX `--build-reps` times per algo, to get a real build-time distribution. It
 writes its OWN csv (BUILD_CSV_FIELDS below) -- run_pg_cuvsbench.py's search CSV
-schema (CSV_FIELDS there) is untouched.
+schema (CSV_FIELDS there) is untouched. Rows are appended and flushed after
+EACH rep, not buffered to the end, so a mid-run failure in a multi-hour sweep
+doesn't lose the reps that already completed (#78 review F5c).
 
-Usage (CPU-only, no pg_cuvs/daemon needed for pgvector_hnsw/pgvector_ivfflat):
+Usage (CPU-only, no daemon needed for pgvector_hnsw/pgvector_ivfflat; pg_cuvs
+itself is now optional at connect time -- see PgEngine.__init__ -- so this
+script's pgvector-only path genuinely runs without CUDA/libcuvs installed):
     python bench/cuvs_bench_backend/build_time_arm.py \
         --data-dir /home/ubuntu/anbench/data --n 1000000 \
         --algos pgvector_hnsw --build-reps 5 \
         --out bench/results/build_time_1m.csv
+
+Caveat: rep 0 of each algo runs against a cold page cache (a fresh COPY just
+landed); later reps may be warmer, understating the true variance an operator
+would see on an isolated build. Not excluded from the CSV -- it's real data --
+but treat it as a caveat when reading the distribution (#78 review F6).
 """
 import argparse
 import csv
@@ -55,21 +64,24 @@ def gpu_name():
 
 
 def build_params_label(algo, n):
-    """Label the fixed build configuration used for every rep. Mirrors the
-    hardcoded params in PgEngine.build() -- this script does not sweep them,
-    it only repeats the same build to sample its time distribution."""
+    """Label the fixed build configuration used for every rep. Derives from
+    PgEngine's own constants (not a second hardcoded copy -- #78 review F8: a
+    duplicate would drift silently and the published CSV would then describe
+    the wrong build)."""
     if algo == "pgvector_hnsw":
-        return "m=16,ef_construction=64"
+        return f"m={PgEngine.HNSW_M},ef_construction={PgEngine.HNSW_EF_CONSTRUCTION}"
     if algo == "pgvector_ivfflat":
-        return f"lists={max(1, int(4 * (n ** 0.5)))}"
+        return f"lists={PgEngine.ivfflat_lists(n)}"
     return "default"
 
 
 def run_build_reps(eng, algo, n, reps, sample_query=None):
-    """DROP INDEX; CREATE INDEX `reps` times. eng.build() already drops all ANN
-    indexes before building (PgEngine._drop_ann_indexes), so no new SQL is
-    needed here -- just call it in a loop. Returns [(build_time_s, index_bytes), ...]."""
-    return [eng.build(algo, n, sample_query=sample_query) for _ in range(reps)]
+    """DROP INDEX; CREATE INDEX, one rep at a time. eng.build() already drops
+    all ANN indexes before building (PgEngine._drop_ann_indexes), so no new
+    SQL is needed here. A generator (not a list) so the caller can write +
+    flush each rep's CSV row as it lands (#78 review F5c)."""
+    for _ in range(reps):
+        yield eng.build(algo, n, sample_query=sample_query)
 
 
 def main():
@@ -90,36 +102,53 @@ def main():
     _, dim = fbin_meta(corpus)
     algos = [a.strip() for a in args.algos.split(",") if a.strip()]
 
+    # #78 review F5b: PgEngine's own class docstring says pg_cuvs algos need
+    # the daemon UP and pgvector algos need it DOWN for a VRAM-fair CPU
+    # baseline -- this script (unlike pg_engine.main()'s --toggle-daemon)
+    # never touches the daemon, so a mixed algo list can silently violate
+    # that protocol.
+    has_pgvector = any(a.startswith("pgvector_") for a in algos)
+    has_pgcuvs = any(a.startswith("pgcuvs_") for a in algos)
+    if has_pgvector and has_pgcuvs:
+        print("[build-arm] WARN: mixing pgvector_* and pgcuvs_* algos in one "
+              "run -- this script does not toggle the pg-cuvs-server daemon, "
+              "so pgvector's build_time_s may not be a VRAM-fair CPU baseline "
+              "if the daemon is up. See PgEngine's class docstring.", flush=True)
+
     host = socket.gethostname()
     gpu = gpu_name()
 
     eng = PgEngine(dbname=args.dbname, index_dir=args.index_dir)
     eng.load_corpus(corpus, args.n, dim, dataset=args.dataset)
 
-    rows = []
-    for algo in algos:
-        sample_query = None
-        if algo == "pgcuvs_hnsw_import":
-            sample_query = np.ascontiguousarray(read_fbin(queries_path, count=1)[0])
-        params = build_params_label(algo, args.n)
-        reps = run_build_reps(eng, algo, args.n, args.build_reps,
-                              sample_query=sample_query)
-        for i, (bt, ibytes) in enumerate(reps):
-            rows.append(dict(algo=algo, build_params=params, rep=i,
-                             build_time_s=round(bt, 3), index_bytes=ibytes,
-                             host=host, gpu=gpu, n=args.n, dim=dim,
-                             dataset=args.dataset))
-        bts = [bt for bt, _ in reps]
-        print(f"[build-arm] {algo}: median={float(np.median(bts)):.2f}s "
-              f"min={min(bts):.2f}s max={max(bts):.2f}s reps={len(bts)}", flush=True)
-    eng.close()
-
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
+    n_rows = 0
     with open(args.out, "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=BUILD_CSV_FIELDS)
         w.writeheader()
-        w.writerows(rows)
-    print(f"[build-arm] {len(rows)} rows -> {args.out}", flush=True)
+        f.flush()
+        for algo in algos:
+            sample_query = None
+            if algo == "pgcuvs_hnsw_import":
+                sample_query = np.ascontiguousarray(read_fbin(queries_path, count=1)[0])
+            params = build_params_label(algo, args.n)
+            bts = []
+            for i, (bt, ibytes) in enumerate(
+                    run_build_reps(eng, algo, args.n, args.build_reps,
+                                   sample_query=sample_query)):
+                w.writerow(dict(algo=algo, build_params=params, rep=i,
+                                build_time_s=round(bt, 3), index_bytes=ibytes,
+                                host=host, gpu=gpu, n=args.n, dim=dim,
+                                dataset=args.dataset))
+                f.flush()
+                n_rows += 1
+                bts.append(bt)
+                print(f"[build-arm] {algo} rep={i} build_time_s={bt:.2f} "
+                      f"index_bytes={ibytes}", flush=True)
+            print(f"[build-arm] {algo}: median={float(np.median(bts)):.2f}s "
+                  f"min={min(bts):.2f}s max={max(bts):.2f}s reps={len(bts)}", flush=True)
+    eng.close()
+    print(f"[build-arm] {n_rows} rows -> {args.out}", flush=True)
     return 0
 
 

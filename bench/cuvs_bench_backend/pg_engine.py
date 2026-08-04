@@ -144,7 +144,16 @@ class PgEngine:
         # the connection (run_pg.py). Autocommit is the working + realistic path.
         self.conn = psycopg.connect(dbname=dbname, autocommit=True)
         self.conn.execute("CREATE EXTENSION IF NOT EXISTS vector")
-        self.conn.execute("CREATE EXTENSION IF NOT EXISTS pg_cuvs")
+        try:
+            self.conn.execute("CREATE EXTENSION IF NOT EXISTS pg_cuvs")
+        except Exception as e:  # noqa: BLE001
+            # pg_cuvs is a GPU extension; a CPU-only PostgreSQL (no CUDA/libcuvs
+            # installed) won't have it. Only pgcuvs_* algos touch it -- defer the
+            # failure to whichever pgcuvs_* call actually needs it, so
+            # pgvector-only usage (e.g. build_time_arm.py's CPU-only path) works
+            # on a box without pg_cuvs (#78 review F5).
+            print(f"[engine] WARN: CREATE EXTENSION pg_cuvs failed ({e!r}); "
+                  f"pgcuvs_* algos will fail later if used", flush=True)
         import pgvector.psycopg
         pgvector.psycopg.register_vector(self.conn)
         self.index_dir = index_dir
