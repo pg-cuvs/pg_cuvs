@@ -465,7 +465,8 @@ latency. Worker query slices are disjoint across the full 10k pool rather than a
 repeated 2000-query block, so no arm is measured cache-hot in a way that would favour
 the CPU baseline.
 
-**Batch-vs-single recall divergence (`pgcuvs_cagra_batch`).** On the same resident graph
+**Batch-vs-single recall divergence (`pgcuvs_cagra_batch`) — tracked as
+[#144](https://github.com/pg-cuvs/pg_cuvs/issues/144).** On the same resident graph
 at K=200, batch returns 0.9907 and single-query returns 0.9928–0.9932: a
 **same-graph delta of 0.00225 / 0.00240 / 0.00250** across three samples, with the batch
 side bit-identical every time and the sign stable (batch lower). At N=100k the same
@@ -478,7 +479,10 @@ AM path's AUTO kernel selection splitting on batch size (single-CTA
 direction at 0.9892 with no pg_cuvs code in the path, which places the divergence in the
 cuVS kernels rather than this extension's plumbing. The harness records both recalls and
 gates neither; only an uncalibrated `|delta| > 0.01` tripwire remains, to catch gross
-faults rather than to re-judge this one.
+faults rather than to re-judge this one. The open question — whether the driver is scale,
+K, or both, and whether the batch path's lower recall is worth correcting — is tracked in
+[#144](https://github.com/pg-cuvs/pg_cuvs/issues/144), which carries the three same-graph
+samples, the raw-arm corroboration, and the K/scale confound.
 
 ### 2.2 Synthetic crossover pilot — where the line is
 

@@ -742,6 +742,9 @@ def gate_batch_recall(name, batch_recall, single_recall):
     A tolerance recalibrated on that data would be measuring the divergence
     against itself. So the batch arm records both recalls and their delta and
     gates nothing; interpretation belongs in the report, next to the numbers.
+    The divergence itself is tracked as a product observation in #144 -- this
+    function's job is to record the inputs that issue reasons about, not to
+    decide whether the batch path's lower recall is acceptable.
     The caller measures `single_recall` on the RESIDENT graph, not on the
     Phase-1 latency row -- Phase 2 usually rebuilds to the Pareto cell first, so
     the Phase-1 row's recall belongs to a different graph and any delta against

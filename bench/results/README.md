@@ -82,7 +82,9 @@ on the resident graph (same-graph delta 0.00225 / 0.00240 / 0.00250 over three s
 and has since been demoted to observe-and-record with an uncalibrated `|delta| > 0.01`
 tripwire. The run was **not** repeated: all 100 rows are valid measurements, and the
 batch row's recall of 0.9907 is reproducible to four decimals. The note is left as the
-run emitted it rather than rewritten after the fact.
+run emitted it rather than rewritten after the fact. The underlying kernel divergence is
+tracked as [#144](https://github.com/pg-cuvs/pg_cuvs/issues/144); read the batch row's
+recall as the batch path's own, never as the single-query path's.
 
 ## Known defects
 
