@@ -41,6 +41,14 @@ prevents the recall==0 id-space bug seen in an earlier 50M run).
 - `run_pg_cuvsbench.py` — the driver: registers the backend and runs
   `BenchmarkOrchestrator(backend_type="pg").run_benchmark(...)`, then writes a
   native (Google-Benchmark-shaped) CSV.
+- `report_recall_tables.py` — the #98 reporter: reads one two-axis run CSV
+  (`CSV_FIELDS` + `build_params` + `axis`) and renders per axis × algo ×
+  build_params the highest-QPS point clearing recall 0.95 (plus 0.90/0.99
+  secondaries, with explicit "no point clears" rows) as markdown. Groups are
+  axis-homogeneous by construction, so the tool cannot express a latency ÷
+  throughput ratio; caveats (batch bind parameters, undefined batch
+  percentiles, daemon-mutex serialisation on `pgcuvs_*_conc{N}`) are emitted
+  from the rows themselves and tagged per row.
 
 ## MEASUREMENT BOUNDARY (read this before comparing to cuVS's own rows)
 
