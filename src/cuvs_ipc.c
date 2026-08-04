@@ -50,6 +50,16 @@
  * Socket helpers
  * ---------------------------------------------------------------- */
 
+/* #119: expected owner uid of cuvs.socket_path (-1 = no check). Set via
+ * cuvs_ipc_set_daemon_uid, mirroring the g_wait_cb setter pattern below. */
+static int g_expected_daemon_uid = -1;
+
+void
+cuvs_ipc_set_daemon_uid(int uid)
+{
+    g_expected_daemon_uid = uid;
+}
+
 /* Open a UDS connection. Returns fd on success, -1 on failure.
  * connect_timeout_ms: short for fail-fast on missing daemon
  * recv_timeout_sec: longer for receiving daemon response (build can be slow) */
@@ -59,6 +69,63 @@ uds_connect_ex(const char *socket_path, int recv_timeout_sec)
     int fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (fd < 0)
         return -1;
+
+    /* #119: verify socket_path owner before connect(). This is a fast-path
+     * pre-check only — the actual security boundary is the post-connect
+     * SO_PEERCRED check below (F1: this lstat is TOCTOU-racy on its own; a
+     * kernel-verified peer credential after connect() is not). Checking
+     * here first still buys two things: a cheaper failure (no connect()
+     * syscall for an obviously-wrong path) and a clearer error message
+     * (owner mismatch vs. generic peer-uid mismatch). lstat (not stat) so a
+     * symlink swap to a different socket can't bypass this pre-check —
+     * though connect() itself follows the symlink regardless, so the
+     * post-connect check below is what actually catches that case. */
+    if (g_expected_daemon_uid >= 0 && socket_path[0] != '\0')
+    {
+        struct stat st;
+        if (lstat(socket_path, &st) != 0)
+        {
+            /* ENOENT is the normal "daemon is down" shape (restart window,
+             * crash, not yet started) — happens on every query while the
+             * daemon is out; don't drown a real hijack signal in restart
+             * noise. Anything else (EACCES, ELOOP, ...) is unusual enough
+             * to warrant the louder level. */
+            if (errno == ENOENT)
+                LOG_WARN("[cuvs_ipc] cannot stat socket_path %s: %s\n",
+                          socket_path, strerror(errno));
+            else
+                LOG_ERROR("[cuvs_ipc] cannot stat socket_path %s: %s\n",
+                          socket_path, strerror(errno));
+            close(fd);
+            return -1;
+        }
+        if (!S_ISSOCK(st.st_mode))
+        {
+            LOG_ERROR("[cuvs_ipc] socket_path %s is not a socket\n", socket_path);
+            close(fd);
+            return -1;
+        }
+        if (st.st_uid != (uid_t) g_expected_daemon_uid)
+        {
+            LOG_ERROR("[cuvs_ipc] socket_path %s owned by uid=%u, expected=%d "
+                      "— refusing to connect (possible hijack)\n",
+                      socket_path, (unsigned) st.st_uid, g_expected_daemon_uid);
+            close(fd);
+            return -1;
+        }
+        /* No S_IWOTH check: connect() needs write access to the socket
+         * inode (AF_UNIX requirement), but that's not the same as
+         * world-write. The daemon itself creates the socket 0660
+         * (pg_cuvs_server.c) — the correct different-uid deployment adds
+         * the backend's OS user to the daemon's group, not a wider mode.
+         * (The Brev dev bootstrap widens it to 0666 as a convenience
+         * because it doesn't set up that group membership; don't carry
+         * that into production.) Either way, S_IWOTH carries no attacker
+         * advantage the uid check above doesn't already close: a
+         * resquatted socket is owned by the attacker's uid, not
+         * g_expected_daemon_uid, so it's refused above regardless of its
+         * mode. */
+    }
 
     struct sockaddr_un addr;
     memset(&addr, 0, sizeof(addr));
@@ -74,6 +141,39 @@ uds_connect_ex(const char *socket_path, int recv_timeout_sec)
         close(fd);
         return -1;
     }
+
+    /* #119 (adversarial review F1): post-connect SO_PEERCRED check. The
+     * lstat above is a TOCTOU race — the daemon could be unlinked and
+     * resquatted between the lstat and this connect(). SO_PEERCRED is
+     * kernel-verified at connect() time and race-free: the peer credential
+     * is latched to whoever accepted this specific connection, and can't be
+     * swapped out afterward. This is the actual security boundary; the
+     * lstat check above stays only for a fast failure and a clearer error
+     * message before paying for a connect(). Linux-only, like the shm-side
+     * SO_PEERCRED check (shm_check_daemon_owner) this mirrors. */
+#ifdef __linux__
+    if (g_expected_daemon_uid >= 0)
+    {
+        struct ucred cred;
+        socklen_t    cred_len = sizeof(cred);
+        if (getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &cred, &cred_len) != 0)
+        {
+            LOG_ERROR("[cuvs_ipc] SO_PEERCRED failed: %s — refusing to connect\n",
+                      strerror(errno));
+            close(fd);
+            return -1;
+        }
+        if (cred.uid != (uid_t) g_expected_daemon_uid)
+        {
+            LOG_ERROR("[cuvs_ipc] socket peer uid=%u, expected=%d "
+                      "— refusing to connect (possible hijack)\n",
+                      (unsigned) cred.uid, g_expected_daemon_uid);
+            close(fd);
+            return -1;
+        }
+    }
+#endif
+
     return fd;
 }
 

@@ -108,6 +108,7 @@ bool  cuvs_debug                  = false;
 bool  enable_cuvs_phys_cost       = true;
 char *cuvs_socket_path            = NULL;
 char *cuvs_index_dir              = NULL;
+int   cuvs_daemon_uid             = -1;    /* #119: expected owner uid of cuvs.socket_path; -1 = no check */
 int   cuvs_circuit_breaker_threshold = 3;
 int   cuvs_k                      = 100;   /* GPU top-k (pgvector ef_search analog) */
 int   cuvs_max_build_mem_mb       = 0;     /* 0 = auto (MemAvailable * safety_ratio); >0 = hard cap MB */
@@ -706,6 +707,16 @@ cuvs_fb_record(Oid index_oid, int reason)
     SpinLockRelease(&g_fb->mutex);
 }
 
+/* #119: GUC assign hook — propagate cuvs.daemon_uid into cuvs_ipc.c's
+ * g_expected_daemon_uid via the g_wait_cb-style setter (avoids threading a
+ * new extern/param through ~30 cuvs_ipc_* call sites). */
+static void
+cuvs_daemon_uid_assign(int newval, void *extra)
+{
+    (void) extra;
+    cuvs_ipc_set_daemon_uid(newval);
+}
+
 void
 _PG_init(void)
 {
@@ -760,6 +771,18 @@ _PG_init(void)
         "/tmp/.s.pg_cuvs",
         PGC_SUSET,
         0, NULL, NULL, NULL);
+
+    DefineCustomIntVariable(
+        "cuvs.daemon_uid",
+        "Expected owner uid of cuvs.socket_path; backend refuses to connect "
+        "if the socket is owned by a different uid.",
+        "-1 (default) disables the check. Set to the daemon's uid in "
+        "different-uid or shared-host deployments to close the pre-bind "
+        "socket-squat gap that SO_PEERCRED alone can't catch.",
+        &cuvs_daemon_uid,
+        -1, -1, INT_MAX,
+        PGC_SUSET,
+        0, NULL, cuvs_daemon_uid_assign, NULL);
 
     DefineCustomStringVariable(
         "cuvs.index_dir",
@@ -1099,6 +1122,7 @@ _PG_init(void)
     RegisterXactCallback(cuvs_xact_callback, NULL);
     RegisterSubXactCallback(cuvs_subxact_callback, NULL);  /* ADR-060 */
     cuvs_ipc_set_wait_callback(cuvs_search_wait_should_abort);  /* 3S: cancelable search */
+    cuvs_ipc_set_daemon_uid(cuvs_daemon_uid);  /* #119: seed from GUC default at load time */
 
     /* ADR-057: test seam — CUVS_FORCE_CORPUS=memfd|shm|heap pins the build tier
      * for every backend (inherited from the postmaster env). Unset => auto. Used

@@ -150,6 +150,7 @@ Defaults and ranges are from source. "Set by" is the minimum role/scope: `USERSE
 | `cuvs.enable_phys_cost` | bool | `on` | — | USERSET | Use the ADR-075 physical (hardware-anchored) cost model for `cagra`/`flat` when the profile is fully probed. Off (or unprobed/Tier-1) → legacy heuristic constants, byte-identical routing. See § Cost model & hardware profile |
 | `cuvs.debug` | bool | `off` | — | USERSET | Emit a per-search NOTICE with daemon latency + metric (for EXPLAIN VERBOSE) |
 | `cuvs.socket_path` | string | `/tmp/.s.pg_cuvs` | — | SUSET | UDS path to the daemon |
+| `cuvs.daemon_uid` | int | `-1` | -1– | SUSET | Expected owner uid of `cuvs.socket_path`; backend refuses to connect if the socket is owned by a different uid. `-1` disables the check. See playbooks/daemon-restart-recovery.md § Security / hardening |
 | `cuvs.index_dir` | string | `$PGDATA/cuvs_indexes` | — | SUSET | Artifact directory (empty = resolved at runtime) |
 | `cuvs.k` | int | `100` | 1–2000 | USERSET | GPU top-k candidates fetched per scan (cf. `hnsw.ef_search`) |
 | `cuvs.circuit_breaker_threshold` | int | `3` | 1–100 | USERSET | Consecutive GPU errors before the (per-backend) breaker trips |

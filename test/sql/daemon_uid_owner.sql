@@ -1,0 +1,167 @@
+-- daemon_uid_owner.sql — #119 (#87 follow-up): cuvs.daemon_uid socket-owner
+-- check.
+--
+-- shm_check_daemon_owner (cuvs_ipc.c) is NOT a backstop for this: it only
+-- checks that a reply shm segment's owner matches the peer of the socket it
+-- arrived on (self-consistency), and never compares against
+-- cuvs.daemon_uid. If an attacker controls the socket (is the peer), that
+-- check passes. cuvs.daemon_uid closes the actual gap in two layers, both
+-- exercised below:
+--   - a pre-connect lstat() of the socket path (fast fail, clear error;
+--     TOCTOU-racy on its own — Test 3/4 pin its S_ISSOCK/lstat behavior),
+--   - a post-connect SO_PEERCRED check (kernel-verified, race-free — the
+--     actual security boundary; Test 2 exercises this).
+--
+-- Discriminator: pg_stat_gpu_search reaches the daemon via cuvs_ipc_stats,
+-- which goes through the same uds_connect_ex gate as every other cuvs_ipc_*
+-- call. A daemon-down/UNAVAILABLE result is documented (cuvs_ipc.c) to leave
+-- the view empty rather than erroring — so a wrong cuvs.daemon_uid is
+-- observable as "0 rows" (fail-closed), not a crash and not attacker data.
+--
+--   1. discover the real daemon uid from cuvs.socket_path's owner,
+--   2. SET cuvs.daemon_uid to that value -> build + search + stats all work
+--      normally (backward-compat: matches the real owner; this also
+--      exercises the post-connect SO_PEERCRED check's pass branch, since
+--      connect() only succeeds if both the pre-connect lstat AND the
+--      post-connect SO_PEERCRED agree the peer is g_expected_daemon_uid),
+--   3. SET cuvs.daemon_uid to a uid that cannot own the real socket -> the
+--      pre-connect lstat refuses before connect() is even attempted (this
+--      does NOT exercise the post-connect SO_PEERCRED failure branch —
+--      that only fires on the TOCTOU race the lstat can't see, which isn't
+--      practically reproducible without racing the actual daemon process;
+--      not covered here, see PR discussion),
+--   4. cuvs.socket_path pointed at a same-uid regular file -> refused
+--      (S_ISSOCK, independent of the uid check),
+--   5. cuvs.socket_path pointed at a same-uid symlink to the real socket ->
+--      refused (lstat sees the symlink itself, S_ISLNK not S_ISSOCK; a
+--      stat()-based rewrite of the pre-check would follow the link and
+--      wrongly pass this — pins the lstat choice as a regression guard).
+--
+-- REQUIRES: pg_cuvs_server running; cuvs.index_dir writable; the connecting
+-- role can COPY FROM PROGRAM (superuser in the regression harness). Runs in
+-- Tier-1 CI too — the CPU-shim daemon owns its socket the same way.
+
+\set ON_ERROR_STOP on
+
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS vector;
+CREATE EXTENSION IF NOT EXISTS pg_cuvs;
+RESET client_min_messages;
+
+SET cuvs.index_dir = '/tmp/cuvs_indexes';
+
+-- ----------------------------------------------------------------
+-- Discover the real daemon uid (owner of cuvs.socket_path) so setup below
+-- can run with the check enabled and matching, rather than disabled.
+-- ----------------------------------------------------------------
+CREATE TEMP TABLE daemon_uid_probe (uid int);
+DO $$
+DECLARE
+    sock text := current_setting('cuvs.socket_path');
+BEGIN
+    EXECUTE format('COPY daemon_uid_probe FROM PROGRAM %L', 'stat -c %u ' || sock);
+END $$;
+SELECT uid AS real_daemon_uid FROM daemon_uid_probe \gset
+
+SET cuvs.daemon_uid = :real_daemon_uid;
+
+CREATE TABLE daemon_uid_owner_t (id int, v vector(8));
+SELECT setseed(0.87);
+INSERT INTO daemon_uid_owner_t
+SELECT g, array_agg(round((random())::numeric, 5) ORDER BY d)::real[]::vector(8)
+FROM generate_series(1, 200) g, generate_series(1, 8) d
+GROUP BY g;
+
+SET cuvs.search_mode = cagra;
+SET max_parallel_workers_per_gather = 0;
+CREATE INDEX daemon_uid_owner_idx ON daemon_uid_owner_t USING cagra (v vector_l2_ops);
+
+-- ----------------------------------------------------------------
+-- Test 1: matching daemon uid — search works, stats RPC reaches the daemon.
+-- ----------------------------------------------------------------
+SELECT count(*) FROM (
+    SELECT id FROM daemon_uid_owner_t
+    ORDER BY v <-> '[0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5]'::vector(8)
+    LIMIT 5
+) s;
+
+SELECT count(*) >= 1 AS matching_uid_reaches_daemon
+FROM pg_stat_gpu_search WHERE index_oid = 'daemon_uid_owner_idx'::regclass;
+
+-- ----------------------------------------------------------------
+-- Test 2: a uid that cannot own the socket -> uds_connect_ex refuses to
+-- connect -> stats RPC comes back UNAVAILABLE -> empty view (fail-closed).
+-- ----------------------------------------------------------------
+SET cuvs.daemon_uid = 999999;
+
+SELECT count(*) = 0 AS mismatched_uid_fails_closed
+FROM pg_stat_gpu_search WHERE index_oid = 'daemon_uid_owner_idx'::regclass;
+
+RESET cuvs.daemon_uid;
+
+-- ----------------------------------------------------------------
+-- Test 3 (adversarial review F5.1): cuvs.socket_path pointed at a plain
+-- regular file, same-uid as the real daemon (so this isolates the
+-- S_ISSOCK check from the uid check — a same-uid non-socket must still be
+-- refused).
+-- ----------------------------------------------------------------
+CREATE TEMP TABLE daemon_uid_regfile_setup (out text);
+DO $$
+BEGIN
+    EXECUTE format('COPY daemon_uid_regfile_setup FROM PROGRAM %L',
+                    'rm -f /tmp/daemon_uid_owner_regfile.tmp; '
+                    'touch /tmp/daemon_uid_owner_regfile.tmp; '
+                    'echo done');
+END $$;
+
+SET cuvs.socket_path = '/tmp/daemon_uid_owner_regfile.tmp';
+SET cuvs.daemon_uid = :real_daemon_uid;
+
+SELECT count(*) = 0 AS regular_file_refused
+FROM pg_stat_gpu_search WHERE index_oid = 'daemon_uid_owner_idx'::regclass;
+
+RESET cuvs.socket_path;
+RESET cuvs.daemon_uid;
+
+CREATE TEMP TABLE daemon_uid_regfile_cleanup (out text);
+DO $$
+BEGIN
+    EXECUTE format('COPY daemon_uid_regfile_cleanup FROM PROGRAM %L',
+                    'rm -f /tmp/daemon_uid_owner_regfile.tmp; echo done');
+END $$;
+
+-- ----------------------------------------------------------------
+-- Test 4 (adversarial review F5.1): cuvs.socket_path pointed at a symlink
+-- to the real socket, same-uid. lstat() sees the symlink itself (S_ISLNK,
+-- not S_ISSOCK) and refuses -- pinning that choice: a stat()-based rewrite
+-- of the pre-check would follow the link, see the real socket, and wrongly
+-- let this through.
+-- ----------------------------------------------------------------
+CREATE TEMP TABLE daemon_uid_symlink_setup (out text);
+DO $$
+DECLARE
+    sock text := current_setting('cuvs.socket_path');
+BEGIN
+    EXECUTE format('COPY daemon_uid_symlink_setup FROM PROGRAM %L',
+                    'rm -f /tmp/daemon_uid_owner_symlink.tmp; '
+                    'ln -s ' || sock || ' /tmp/daemon_uid_owner_symlink.tmp; '
+                    'echo done');
+END $$;
+
+SET cuvs.socket_path = '/tmp/daemon_uid_owner_symlink.tmp';
+SET cuvs.daemon_uid = :real_daemon_uid;
+
+SELECT count(*) = 0 AS symlink_to_real_socket_refused
+FROM pg_stat_gpu_search WHERE index_oid = 'daemon_uid_owner_idx'::regclass;
+
+RESET cuvs.socket_path;
+RESET cuvs.daemon_uid;
+
+CREATE TEMP TABLE daemon_uid_symlink_cleanup (out text);
+DO $$
+BEGIN
+    EXECUTE format('COPY daemon_uid_symlink_cleanup FROM PROGRAM %L',
+                    'rm -f /tmp/daemon_uid_owner_symlink.tmp; echo done');
+END $$;
+
+DROP TABLE daemon_uid_owner_t CASCADE;

@@ -93,15 +93,16 @@ shm_key_random(unsigned char *buf, size_t len)
 static __thread uid_t g_peer_uid = (uid_t) -1;
 
 static int
-shm_check_peer_owner(int fd)
+shm_check_peer_owner(int fd, uid_t expected_uid)
 {
 #ifdef __linux__
     struct stat st;
     if (fstat(fd, &st) != 0)
         return 0;
-    return st.st_uid == g_peer_uid;
+    return st.st_uid == expected_uid;
 #else
     (void) fd;
+    (void) expected_uid;
     return 1;
 #endif
 }
@@ -2261,7 +2262,7 @@ topk_insert(CuvsResult *top, int *pn, int k, uint64_t tid, float dist)
 }
 
 static void *
-map_shm_readonly(const char *key, size_t bytes)
+map_shm_readonly(const char *key, size_t bytes, uid_t expected_uid)
 {
     int fd;
     struct stat st;
@@ -2272,7 +2273,7 @@ map_shm_readonly(const char *key, size_t bytes)
     fd = shm_open(key, O_RDONLY, 0);
     if (fd < 0)
         return MAP_FAILED;
-    if (!shm_check_peer_owner(fd))   /* #87 finding 1 */
+    if (!shm_check_peer_owner(fd, expected_uid))   /* #87 finding 1 */
     {
         close(fd);
         return MAP_FAILED;
@@ -2466,7 +2467,7 @@ handle_search_stream_bf(int client_fd, const CuvsCmdFrame *cmd)
         send_error(client_fd, "shm_open failed");
         return;
     }
-    if (!shm_check_peer_owner(qfd))   /* #87 finding 1 */
+    if (!shm_check_peer_owner(qfd, g_peer_uid))   /* #87 finding 1 */
     {
         close(qfd);
         pthread_mutex_unlock(&g_index_mutex);
@@ -2487,7 +2488,7 @@ handle_search_stream_bf(int client_fd, const CuvsCmdFrame *cmd)
     void     *flt_mem  = MAP_FAILED;
     size_t    flt_bytes = (size_t)cmd->n_filter_tids * sizeof(uint64_t);
     if (cmd->n_filter_tids > 0)
-        flt_mem = map_shm_readonly(cmd->filter_shm_key, flt_bytes);
+        flt_mem = map_shm_readonly(cmd->filter_shm_key, flt_bytes, g_peer_uid);
     if (flt_mem != MAP_FAILED)
         flt_tids = (uint64_t *)flt_mem;
     if (cuvs_filter_frame_refuses(cmd->n_filter_tids, flt_tids != NULL))
@@ -2611,7 +2612,7 @@ handle_search_bf_transient(int client_fd, const CuvsCmdFrame *cmd)
     {
         int cfd = shm_open(cmd->filter_shm_key, O_RDONLY, 0);
         if (cfd < 0) { send_error(client_fd, "corpus shm_open failed"); return; }
-        if (!shm_check_peer_owner(cfd)) { close(cfd); send_error(client_fd, "corpus shm owner mismatch"); return; }   /* #87 finding 1 */
+        if (!shm_check_peer_owner(cfd, g_peer_uid)) { close(cfd); send_error(client_fd, "corpus shm owner mismatch"); return; }   /* #87 finding 1 */
         mem = mmap(NULL, total, PROT_READ, MAP_SHARED, cfd, 0);
         close(cfd);
     }
@@ -2624,7 +2625,7 @@ handle_search_bf_transient(int client_fd, const CuvsCmdFrame *cmd)
     size_t q_bytes = (size_t)cmd->dim * sizeof(float);
     int qfd = shm_open(cmd->shm_key, O_RDONLY, 0);
     if (qfd < 0) { munmap(mem, total); send_error(client_fd, "query shm_open failed"); return; }
-    if (!shm_check_peer_owner(qfd)) { close(qfd); munmap(mem, total); send_error(client_fd, "query shm owner mismatch"); return; }   /* #87 finding 1 */
+    if (!shm_check_peer_owner(qfd, g_peer_uid)) { close(qfd); munmap(mem, total); send_error(client_fd, "query shm owner mismatch"); return; }   /* #87 finding 1 */
     float *query = mmap(NULL, q_bytes, PROT_READ, MAP_SHARED, qfd, 0);
     close(qfd);
     if (query == MAP_FAILED) { munmap(mem, total); send_error(client_fd, "query mmap failed"); return; }
@@ -2835,7 +2836,7 @@ handle_search(int client_fd, const CuvsCmdFrame *cmd)
         send_error(client_fd, "shm_open failed");
         return;
     }
-    if (!shm_check_peer_owner(shm_fd))   /* #87 finding 1 */
+    if (!shm_check_peer_owner(shm_fd, g_peer_uid))   /* #87 finding 1 */
     {
         close(shm_fd);
         pthread_mutex_unlock(&g_index_mutex);
@@ -2998,7 +2999,7 @@ handle_search(int client_fd, const CuvsCmdFrame *cmd)
             CuvsResult       *presults = NULL;
             int pn = 0, did_prefilter = 0, used_cagra = 0;
 
-            flt_mem = map_shm_readonly(cmd->filter_shm_key, flt_bytes);
+            flt_mem = map_shm_readonly(cmd->filter_shm_key, flt_bytes, g_peer_uid);
             if (flt_mem != MAP_FAILED)
                 flt_tids = (uint64_t *)flt_mem;
 
@@ -3179,7 +3180,7 @@ handle_search(int client_fd, const CuvsCmdFrame *cmd)
         if (cmd->n_filter_tids > 0)
         {
             filter_bytes = (size_t)cmd->n_filter_tids * sizeof(uint64_t);
-            filter_mem = map_shm_readonly(cmd->filter_shm_key, filter_bytes);
+            filter_mem = map_shm_readonly(cmd->filter_shm_key, filter_bytes, g_peer_uid);
             if (filter_mem != MAP_FAILED)
             {
                 filter_tids = malloc(filter_bytes);
@@ -3901,7 +3902,7 @@ handle_search_batch(int client_fd, const CuvsCmdFrame *cmd)
         send_error(client_fd, "shm_open failed for batch queries");
         return;
     }
-    if (!shm_check_peer_owner(qfd))   /* #87 finding 1 */
+    if (!shm_check_peer_owner(qfd, g_peer_uid))   /* #87 finding 1 */
     {
         close(qfd);
         pthread_mutex_unlock(&g_index_mutex);
@@ -4846,7 +4847,7 @@ handle_build(int client_fd, const CuvsCmdFrame *cmd)
             send_error(client_fd, "shm_open failed");
             return;
         }
-        if (!shm_check_peer_owner(shm_fd))   /* #87 finding 1 */
+        if (!shm_check_peer_owner(shm_fd, g_peer_uid))   /* #87 finding 1 */
         {
             LOG_ERROR("[handle_build] shm owner mismatch for %s\n", cmd->shm_key);
             close(shm_fd);
@@ -5472,7 +5473,7 @@ handle_build_multi(int client_fd, const CuvsCmdFrame *cmd, const char *index_dir
 
         pfd = shm_open(descs[i].shm_name, O_RDONLY, 0);
         if (pfd < 0)              { err = "shm_open partial failed"; goto fail; }
-        if (!shm_check_peer_owner(pfd)) { close(pfd); err = "shm owner mismatch (partial)"; goto fail; }   /* #87 finding 1 */
+        if (!shm_check_peer_owner(pfd, g_peer_uid)) { close(pfd); err = "shm owner mismatch (partial)"; goto fail; }   /* #87 finding 1 */
         if (fstat(pfd, &st) != 0) { close(pfd); err = "fstat partial failed"; goto fail; }
         if ((size_t)st.st_size != plen)
         {
@@ -6320,7 +6321,7 @@ handle_build_flat(int client_fd, const CuvsCmdFrame *cmd)
             send_error(client_fd, "shm_open failed");
             return;
         }
-        if (!shm_check_peer_owner(shm_fd))   /* #87 finding 1 */
+        if (!shm_check_peer_owner(shm_fd, g_peer_uid))   /* #87 finding 1 */
         {
             close(shm_fd);
             send_error(client_fd, "shm owner mismatch");
@@ -6602,7 +6603,7 @@ handle_build_ivfpq(int client_fd, const CuvsCmdFrame *cmd)
         send_error(client_fd, "shm_open failed");
         return;
     }
-    if (!shm_check_peer_owner(shm_fd))   /* #87 finding 1 */
+    if (!shm_check_peer_owner(shm_fd, g_peer_uid))   /* #87 finding 1 */
     {
         close(shm_fd);
         send_error(client_fd, "shm owner mismatch");
@@ -6871,7 +6872,7 @@ handle_search_ivfpq(int client_fd, const CuvsCmdFrame *cmd)
         send_error(client_fd, "shm_open failed");
         return;
     }
-    if (!shm_check_peer_owner(shm_fd))   /* #87 finding 1 */
+    if (!shm_check_peer_owner(shm_fd, g_peer_uid))   /* #87 finding 1 */
     {
         close(shm_fd);
         pthread_mutex_unlock(&g_index_mutex);
@@ -7012,7 +7013,7 @@ handle_extend(int client_fd, const CuvsCmdFrame *cmd)
         send_error(client_fd, "shm_open failed");
         return;
     }
-    if (!shm_check_peer_owner(shm_fd))   /* #87 finding 1 */
+    if (!shm_check_peer_owner(shm_fd, g_peer_uid))   /* #87 finding 1 */
     {
         close(shm_fd);
         send_error(client_fd, "shm owner mismatch");
