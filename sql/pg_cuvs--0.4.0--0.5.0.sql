@@ -63,6 +63,25 @@ REVOKE ALL ON FUNCTION pg_cuvs_eat_vram(bigint)            FROM PUBLIC;
 REVOKE ALL ON FUNCTION pg_cuvs_free_vram()                 FROM PUBLIC;
 REVOKE ALL ON FUNCTION pg_cuvs_inject_extend_oom(integer)  FROM PUBLIC;
 REVOKE ALL ON FUNCTION pg_cuvs_inject_build_oom(integer)   FROM PUBLIC;
+
+-- #124: the production daemon rejects INJECT_* opcodes (CUVS_TEST_HOOKS-only);
+-- mirror the base script's COMMENT text so an upgraded install matches a fresh
+-- 0.5.0 install (see upgrade_path.sql, which diffs the two).
+COMMENT ON FUNCTION pg_cuvs_inject_extend_oom(integer) IS
+  'Test-only: arm (1) or disarm (0) synthetic OOM injection in cuvs_cagra_extend. '
+  'When armed, the next extend throws bad_alloc, exercising _pr.poison() → '
+  'BUILD_FAILED → delta fallback. The flag self-clears on fire. '
+  '#124: the production daemon rejects this call (CUVS_OP_INJECT_EXTEND_OOM '
+  'is compiled in only under CUVS_TEST_HOOKS) — point cuvs.socket_path at a '
+  'pg_cuvs_server_test daemon (make installcheck-fault) to use it.';
+
+COMMENT ON FUNCTION pg_cuvs_inject_build_oom(integer) IS
+  'Test-only (ADR-070 Bug #3): arm synthetic OOM for the next n_fail '
+  'cuvs_cagra_build calls in the daemon (0 = disarm), to exercise the build '
+  'evict-and-retry path. Each failing build decrements the counter. '
+  '#124: the production daemon rejects this call (CUVS_OP_INJECT_BUILD_OOM '
+  'is compiled in only under CUVS_TEST_HOOKS) — point cuvs.socket_path at a '
+  'pg_cuvs_server_test daemon (make installcheck-fault) to use it.';
 REVOKE ALL ON FUNCTION pg_cuvs_gc_orphans(boolean)         FROM PUBLIC;
 REVOKE ALL ON FUNCTION pg_cuvs_compact(regclass)           FROM PUBLIC;
 REVOKE ALL ON FUNCTION pg_cuvs_build_hnsw(regclass, text)  FROM PUBLIC;
