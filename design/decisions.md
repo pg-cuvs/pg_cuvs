@@ -3256,6 +3256,45 @@ variant B)가 옳은 결합**이다. GDS가 결정적이 되는 교차점은 전
 요구할 어떤 규모에서도 디스크 티어가 불필요해진다 — RaBitQ는 cold tier 시점을 *미루는* 것이
 아니라 표적 세그먼트 내에서 *제거한다*.
 
+**추가 (2026-08-04) — cuVS 양자화 API 표면 실측: 자작 전제는 유효, 단 범위 축소 + 중복 위험 구체화.**
+
+설치된 cuVS(A100 VM, `cuvs_dev` env)의 헤더와 `libcuvs.so` 심볼을 직접 확인했다. 지금까지
+"cuVS 미제공"은 문헌 기반 추정이었고, 이번에 실측으로 경계선을 그었다.
+
+**cuVS가 실제로 제공하는 것** (전부 C API 포함 — 우리는 C 확장이라 이 점이 중요):
+
+| 경로 | 내용 |
+|---|---|
+| `cuvs/preprocessing/quantize/binary.{h,hpp}` | `cuvsBinaryQuantizer` — 1비트 이진 양자화 |
+| `cuvs/preprocessing/quantize/scalar.{h,hpp}` | `cuvsScalarQuantizer` |
+| `cuvs/preprocessing/quantize/pq.{h,hpp}` | `cuvsProductQuantizer` |
+| `cuvs/cluster/kmeans.{h,hpp}` | k-means (`libcuvs.so`에 `cuvs::cluster::kmeans::detail::…` 심볼 확인) |
+
+부수 확인: **cuML은 설치·링크되지 않으며 필요하지도 않다.** k-means가 cuML 소관이라는 인식이
+있으나(RAFT 계보를 공유하므로 양쪽에 존재), 우리가 쓸 것은 cuVS 쪽이고 C API로 노출돼 있다 —
+ADR-072 분해표의 "PQ 코드북(k-means) = cuVS 제공" 서술이 **실측으로 확인**됐다.
+
+**binary 양자화기 vs RaBitQ — 겹치는 부분은 쉬운 쪽이다.** cuVS binary는 차원별 임계
+(`mean`/`sampling_median`) 벡터를 학습해 "원소가 임계보다 크면 비트를 세우는" 방식이다. 즉
+**비트 패킹과 차원별 임계까지**가 제공 범위이고, RaBitQ의 실제 기여인 **랜덤 회전 · 무편향 거리
+추정기 · 후보별 오차 상한은 전부 없다**(거리도 Hamming). 따라서 본 ADR의 "cuVS 미제공 → 자작"
+전제는 **유효하다**.
+
+- **범위 축소(소)**: 인코더의 패킹·레이아웃·transform 배관은 cuVS 관례를 따르거나 참고할 수
+  있어 "CUDA 인코더" 항목의 부담이 다소 준다. 핵심 위험(수치 — 무편향·bound 상수)은 불변이며
+  검증 하네스가 여전히 게이트다.
+- **중복 위험의 구체화(대)**: 본 ADR이 적어둔 "업스트림 중복 가능성"이 추상적 우려가 아니게
+  됐다. `preprocessing/quantize`에 세 양자화기가 **C API까지 갖춰 나란히** 있고 저작권이
+  2024–2026이다 — RaBitQ가 들어갈 자리가 이미 마련돼 있고 수요도 명확하다(vchord의 핵심 기법).
+  기존 완화책("AM 경계를 깨끗이 두어 추후 교체 가능하게")을 유지한다.
+- **신규 선택지(전략 판단 필요, 본 ADR 범위 밖)**: 자작을 tech debt 위험으로 안고 가는 대신
+  **cuVS `quantize` 네임스페이스에 RaBitQ를 업스트림 기여**하는 길이 있다. 에코시스템 전략
+  (ADR-062 Stage 2/3) 관점에서는 cuvs-bench 백엔드 PR보다 강한 카드이나, 커밋 규모가 크고
+  NVIDIA 자체 계획과 겹칠 수 있어 별도 판단이 필요하다.
+
+검증 방법: `ls`/`grep` on `$CONDA_PREFIX/include/cuvs/**`, `nm -D --defined-only libcuvs.so`.
+재확인이 필요하면 같은 방법으로 즉시 반복 가능하다.
+
 ---
 
 ## ADR-077 — flat 동시-쓰기 정합성: `.delta` reader 공유 락 (torn-read 제거)
