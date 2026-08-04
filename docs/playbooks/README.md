@@ -38,8 +38,8 @@
 - [capacity-planning.md](capacity-planning.md) — VRAM 추정 공식(`estimate_vram_bytes`,
   `cuvs_auto_shard_count`), N×dim별 단일/멀티 GPU 표, `--max-vram-mb` 권장값(물리
   70–80%), artifact 디스크 크기, 50M×384 단일 노드 한계.
-- [release-upgrade.md](release-upgrade.md) — 0.5.0 설치/재설치(`make install` +
-  `make install-server`), 0.1.0→0.5.0 migration chain, 데몬·PostgreSQL 재시작
+- [release-upgrade.md](release-upgrade.md) — 0.6.0 설치/재설치(`make install` +
+  `make install-server`), 0.1.0→0.6.0 migration chain, 데몬·PostgreSQL 재시작
   순서, artifact magic 호환성, `ALTER EXTENSION pg_cuvs UPDATE` 절차.
 
 ## 노드 부트스트랩 *(Phase 3H-full)*

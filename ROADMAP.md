@@ -12,7 +12,7 @@
 > 아래 표는 완료 시점의 역사적 증거를 보존한다. 현재 기본값, 지원 범위, release
 > readiness는 표의 문구가 아니라 아래 active sections와 current-state SSOT를 따른다.
 
-> **Current contract (2026-08-04):** extension version `0.5.0`,
+> **Current contract (2026-08-04):** extension version `0.6.0`,
 > `cuvs.filter_auto_threshold=0.0` (3O opt-in), and
 > `cuvs.stream_bf_selectivity_threshold=0.004` as the canonical-host operational
 > default. The historical completion rows below retain earlier values for provenance;

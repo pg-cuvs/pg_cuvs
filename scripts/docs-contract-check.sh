@@ -41,7 +41,7 @@ header_version="$(sed -n 's/^#define PG_CUVS_VERSION "\([^"]*\)".*/\1/p' src/cuv
 if [[ -z "$control_version" || -z "$make_version" || -z "$header_version" ]]; then
     fail "could not read all extension version declarations"
 else
-    [[ "$control_version" == "0.5.0" ]] || fail "pg_cuvs.control version is $control_version, expected 0.5.0"
+    [[ "$control_version" == "0.6.0" ]] || fail "pg_cuvs.control version is $control_version, expected 0.6.0"
     [[ "$make_version" == "$control_version" ]] || fail "Makefile EXTVERSION ($make_version) differs from control ($control_version)"
     [[ "$header_version" == "$control_version" ]] || fail "PG_CUVS_VERSION ($header_version) differs from control ($control_version)"
 fi
@@ -67,7 +67,7 @@ require_text "README.md" 'bench/results/README.md'
 require_text "bench/results/README.md" '**known defect**'
 require_text "design/ops-gpu-playbook.md" '| 0 또는 생략 (기본) | GPU별 물리 VRAM의 90%를 budget으로 사용 |'
 reject_text "design/ops-gpu-playbook.md" '40000 (기본)'
-require_text "docs/playbooks/rollback-and-cleanup.md" ' 0.5.0'
+require_text "docs/playbooks/rollback-and-cleanup.md" ' 0.6.0'
 
 reject_text "docs/playbooks/README.md" '0.1.0 설치/재설치'
 reject_text "docs/playbooks/release-upgrade.md" '현재 default_version은 **0.1.0**'
