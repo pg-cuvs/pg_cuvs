@@ -56,6 +56,13 @@ PASS=0; FAIL=0
 ok(){  PASS=$((PASS+1)); echo "  [PASS] $1"; }
 bad(){ FAIL=$((FAIL+1)); echo "  [FAIL] $1"; }
 
+# psql writes NOTICEs to the same stream, and DROP INDEX IF EXISTS emits one
+# before the statement that actually fails — so `head -1` reported
+#   NOTICE: index "umask_t_hnsw" does not exist, skipping
+# as the cause. Surface the ERROR line instead, which is what a negative
+# control needs to be readable at all.
+why(){ grep -m1 '^ERROR' "$1" 2>/dev/null || head -1 "$1" 2>/dev/null; }
+
 # Waits for the process to be gone, not a fixed sleep: graceful shutdown
 # serializes resident indexes first (asan-export-restart.sh learned this).
 kill_test_daemon() {
@@ -127,7 +134,7 @@ SQL
 then
   ok "fixture built under normal umask"
 else
-  bad "fixture build: $(head -1 /tmp/umask_setup.txt)"; exit 1
+  bad "fixture build: $(why /tmp/umask_setup.txt)"; exit 1
 fi
 
 # ---- phase 2: same index_dir, hardened daemon ------------------------------
@@ -148,7 +155,7 @@ for mode in hnswlib nsw; do
                       WITH (source='umask_t_cagra', mode='${mode}');" >/dev/null 2>/tmp/umask_err.txt; then
     ok "export mode=${mode} under umask 077"
   else
-    bad "export mode=${mode} under umask 077: $(head -1 /tmp/umask_err.txt)"
+    bad "export mode=${mode} under umask 077: $(why /tmp/umask_err.txt)"
   fi
 done
 
