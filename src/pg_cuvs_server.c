@@ -4161,6 +4161,13 @@ handle_search_batch(int client_fd, const CuvsCmdFrame *cmd)
     size_t rdists = (size_t) Q * (size_t) K * sizeof(float);
     size_t rtotal = rhdr + rtids + rdists;
 
+    /*
+     * #165: handed over as an SCM_RIGHTS fd with the name unlinked before the
+     * reply, so nothing survives this call. The backend cannot unlink a
+     * daemon-owned name (sticky /dev/shm, different uid) — and this is the
+     * per-query path, so the old scheme leaked on every batch search.
+     * Second RDONLY descriptor keeps the consumer read-only, as before.
+     */
     int rfd = shm_open(rkey, O_CREAT | O_EXCL | O_RDWR, 0644);
     if (rfd < 0)
     {
@@ -4169,9 +4176,6 @@ handle_search_batch(int client_fd, const CuvsCmdFrame *cmd)
         send_error(client_fd, "shm_open failed for batch reply");
         return;
     }
-    /* umask may be stricter than 0644; the PG backend (other uid) must read
-     * this reply, so guarantee the mode explicitly (#87). */
-    fchmod(rfd, 0644);
     if (ftruncate(rfd, (off_t) rtotal) != 0)
     {
         close(rfd); shm_unlink(rkey); free(out);
@@ -4179,11 +4183,20 @@ handle_search_batch(int client_fd, const CuvsCmdFrame *cmd)
         send_error(client_fd, "ftruncate failed for batch reply");
         return;
     }
+    int rpass_fd = shm_open(rkey, O_RDONLY, 0);
+    if (rpass_fd < 0)
+    {
+        close(rfd); shm_unlink(rkey); free(out);
+        pthread_mutex_unlock(&g_index_mutex);
+        send_error(client_fd, "shm_open(RDONLY) failed for batch reply");
+        return;
+    }
+    shm_unlink(rkey);          /* name gone; both fds remain valid */
     void *rmem = mmap(NULL, rtotal, PROT_WRITE, MAP_SHARED, rfd, 0);
     close(rfd);
     if (rmem == MAP_FAILED)
     {
-        shm_unlink(rkey); free(out);
+        close(rpass_fd); free(out);
         pthread_mutex_unlock(&g_index_mutex);
         send_error(client_fd, "mmap failed for batch reply");
         return;
@@ -4209,8 +4222,11 @@ handle_search_batch(int client_fd, const CuvsCmdFrame *cmd)
     hdr.n_results    = Q;
     hdr.latency_us   = latency_us;
     hdr.delta_merged = (uint32_t) K;   /* per-query result stride */
+    /* error[] carries the former name for log correlation only (#165). */
     strncpy(hdr.error, rkey, sizeof(hdr.error) - 1);
-    send_all(client_fd, &hdr, sizeof(hdr));
+    if (cuvs_fd_send(client_fd, rpass_fd, &hdr, sizeof(hdr)) != 0)
+        LOG_ERROR("[batch_search] reply fd handoff failed\n");
+    close(rpass_fd);
 }
 
 /* ----------------------------------------------------------------
