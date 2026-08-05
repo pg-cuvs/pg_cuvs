@@ -6354,26 +6354,52 @@ handle_export_hnsw_shm(int client_fd, const CuvsCmdFrame *cmd)
     int            gpu    = (int)e->gpu_device_id;
     pthread_mutex_unlock(&g_index_mutex);
 
-    /* Generate unique /dev/shm path */
-    static int hnsw_shm_seq = 0;
-    char shm_path[256];
-    snprintf(shm_path, sizeof(shm_path), "/dev/shm/pg_cuvs_hnsw_%d_%d",
-             (int)getpid(),
-             __atomic_fetch_add(&hnsw_shm_seq, 1, __ATOMIC_RELAXED));
+    /*
+     * #166 review 3: the sidecar is an anonymous memfd, never a name in
+     * /dev/shm.
+     *
+     * The previous scheme ("/dev/shm/pg_cuvs_hnsw_<pid>_<seq>") was fully
+     * predictable, and /dev/shm is world-writable (sticky only stops *deletion*
+     * of another uid's entry, not creation of a new name). The serializers open
+     * that path themselves and follow symlinks with no O_EXCL — the CPU shim
+     * through fopen(path, "wb") (cuvs_wrapper_shim_cpu.c), the GPU wrapper
+     * through cuVS's own stream — so a local attacker could pre-create the name
+     * and have the daemon write through it. Unlinking afterwards also could not
+     * close the crash window: a daemon killed mid-serialize left the inode
+     * behind, contradicting #165's "no residue" contract.
+     *
+     * memfd has no name to squat and no residue to reclaim — the inode dies
+     * with the last descriptor, including on SIGKILL. The serializers still
+     * take a path, so they get /proc/self/fd/N. That is safe *here* and unsafe
+     * on the consumer side (which review 2 fixed) for the same reason: opening
+     * the procfs link re-checks inode permissions, which succeeds only for the
+     * process and uid that owns the file — which is exactly this one.
+     *
+     * No fallback to the old path scheme: it is the vulnerability. memfd_create
+     * is Linux 3.17+ and already required by the ADR-057 build corpus.
+     */
+    int mfd = memfd_create("pg_cuvs_hnsw", MFD_CLOEXEC);
+    if (mfd < 0)
+    {
+        LOG_ERROR("[handle_export_hnsw_shm] memfd_create failed errno=%d\n", errno);
+        send_error(client_fd, "memfd_create failed for hnsw sidecar");
+        return;
+    }
 
-    /* Serialize HNSW to /dev/shm (reuses existing cuvs_hnsw_serialize) */
+    char shm_path[64];
+    snprintf(shm_path, sizeof(shm_path), "/proc/self/fd/%d", mfd);
+
+    /* Serialize HNSW into the memfd (reuses existing cuvs_hnsw_serialize) */
     int hrc = cuvs_hnsw_serialize(handle, shm_path, gpu);
     if (hrc != CUVS_HNSW_SERIALIZE_OK)
     {
         /*
-         * #166 review: a failed serialize can still have created (and partially
-         * written) the file — the CPU shim opens before it can fail on write or
-         * close, and the GPU wrapper catches serialization exceptions after the
-         * stream exists. Nothing else will ever remove it: the name is
-         * daemon-owned in sticky /dev/shm and only the success path hands out an
-         * fd. Unlink unconditionally; ENOENT is fine.
+         * A failed serialize may have written into the memfd — the CPU shim
+         * opens before it can fail on write or close, and the GPU wrapper
+         * catches serialization exceptions after the stream exists. There is
+         * nothing to unlink: closing the descriptor frees the inode.
          */
-        unlink(shm_path);
+        close(mfd);
         if (hrc == CUVS_HNSW_SERIALIZE_SKIPPED)
             send_error_code(client_fd, CUVS_STATUS_NOT_FOUND,
                             "index too small for an HNSW sidecar");
@@ -6382,31 +6408,23 @@ handle_export_hnsw_shm(int client_fd, const CuvsCmdFrame *cmd)
         return;
     }
 
-    LOG_INFO("[handle_export_hnsw_shm] %u/%u → %s (fd-passed)\n", db, idx, shm_path);
+    LOG_INFO("[handle_export_hnsw_shm] %u/%u → memfd (fd-passed)\n", db, idx);
 
     /*
-     * #165: hand the serialized sidecar over as an SCM_RIGHTS fd and unlink the
-     * path here. Unlike the adjacency/batch-reply segments this is a plain file
-     * in tmpfs (cuvs_hnsw_serialize writes by path), but the leak is identical:
-     * the PG backend runs as a different uid and cannot unlink a daemon-owned
-     * file from sticky /dev/shm. The consumer reads it through /proc/self/fd/N.
+     * #165: hand the serialized sidecar over as an SCM_RIGHTS fd. There is no
+     * path to unlink and no reopen to fail — the memfd created above *is* what
+     * gets passed. The serializer wrote through its own file description, so
+     * this descriptor's offset is untouched; the consumer dup()s it and
+     * rewind()s the dup anyway (hnsw_open_stream).
      */
-    int pass_fd = open(shm_path, O_RDONLY);
-    if (pass_fd < 0)
-    {
-        unlink(shm_path);
-        send_error(client_fd, "cannot reopen serialized hnsw sidecar");
-        return;
-    }
-    unlink(shm_path);          /* name gone; the passed fd keeps the inode alive */
-
     CuvsReplyHeader reply = {0};
     reply.status = CUVS_STATUS_OK;
-    /* error[] carries the former path for log correlation only (#165). */
-    strncpy(reply.error, shm_path, sizeof(reply.error) - 1);
-    if (cuvs_fd_send(client_fd, pass_fd, &reply, sizeof(reply)) != 0)
+    /* error[] carries a label for log correlation only (#165); there is no
+     * longer a filesystem path to report. */
+    snprintf(reply.error, sizeof(reply.error), "memfd:pg_cuvs_hnsw %u/%u", db, idx);
+    if (cuvs_fd_send(client_fd, mfd, &reply, sizeof(reply)) != 0)
         LOG_ERROR("[handle_export_hnsw_shm] fd handoff failed for %u/%u\n", db, idx);
-    close(pass_fd);
+    close(mfd);
 }
 
 /* ----------------------------------------------------------------
