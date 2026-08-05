@@ -574,8 +574,11 @@ int cuvs_ipc_build_multi(
  * #165: the sidecar is handed over as an SCM_RIGHTS fd with its /dev/shm name
  * already unlinked daemon-side — there is nothing for the caller to unlink, and
  * the caller could not have done so anyway (different uid, sticky /dev/shm).
- * shm_path_out receives a "/proc/self/fd/N" path that stays openable as long as
- * *fd_out is held; the caller MUST close(*fd_out) when done reading.
+ * The caller reads through *fd_out and MUST close() it when done. shm_path_out
+ * receives the daemon's former path for diagnostics only — it no longer exists,
+ * and a "/proc/self/fd/N" substitute would not work either: reopening that
+ * symlink re-checks inode permissions and fails EACCES cross-uid whenever the
+ * daemon's umask leaves the segment 0600 (#166 review).
  * Returns CUVS_STATUS_OK on success, NOT_FOUND if index not loaded.
  */
 int cuvs_ipc_export_hnsw_shm(

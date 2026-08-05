@@ -6358,17 +6358,22 @@ handle_export_hnsw_shm(int client_fd, const CuvsCmdFrame *cmd)
 
     /* Serialize HNSW to /dev/shm (reuses existing cuvs_hnsw_serialize) */
     int hrc = cuvs_hnsw_serialize(handle, shm_path, gpu);
-    if (hrc == CUVS_HNSW_SERIALIZE_SKIPPED)
-    {
-        /* #106: nothing was written, so shm_path does not exist — replying OK
-         * with that path would send the importer at a missing file. */
-        send_error_code(client_fd, CUVS_STATUS_NOT_FOUND,
-                        "index too small for an HNSW sidecar");
-        return;
-    }
     if (hrc != CUVS_HNSW_SERIALIZE_OK)
     {
-        send_error(client_fd, "from_cagra/serialize failed");
+        /*
+         * #166 review: a failed serialize can still have created (and partially
+         * written) the file — the CPU shim opens before it can fail on write or
+         * close, and the GPU wrapper catches serialization exceptions after the
+         * stream exists. Nothing else will ever remove it: the name is
+         * daemon-owned in sticky /dev/shm and only the success path hands out an
+         * fd. Unlink unconditionally; ENOENT is fine.
+         */
+        unlink(shm_path);
+        if (hrc == CUVS_HNSW_SERIALIZE_SKIPPED)
+            send_error_code(client_fd, CUVS_STATUS_NOT_FOUND,
+                            "index too small for an HNSW sidecar");
+        else
+            send_error(client_fd, "from_cagra/serialize failed");
         return;
     }
 

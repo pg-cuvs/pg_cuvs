@@ -493,6 +493,13 @@ gpu-test-shm-residue:
 	ssh $(VM_HOST) "$(REMOTE_ENV) && bash -s" \
 		< infra/scripts/tests/shm-residue.sh
 
+# #166 review: the SCM_RIGHTS sidecar handoff must not depend on the daemon's
+# umask. Installs a temporary UMask=077 drop-in, exercises both export modes,
+# and always removes it again. Piped over stdin (bash -s).
+gpu-test-umask:
+	ssh $(VM_HOST) "$(REMOTE_ENV) && bash -s" \
+		< infra/scripts/tests/umask-hardened-export.sh
+
 gpu-test-objstore:
 	ssh $(VM_HOST) "$(REMOTE_ENV) && \
 		PATH=\$$PATH:/snap/bin bash -s" \
