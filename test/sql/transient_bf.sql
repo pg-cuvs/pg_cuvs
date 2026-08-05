@@ -13,7 +13,7 @@
 --   C. Metrics: L2 / cosine / inner-product all fire B and stay exact (recall=1.0).
 --   D. Param binding: <-> $1 prepared routes to B, exact (no approx downgrade).
 --   E. Filter-first: WHERE consumed natively, exact.
---   F. Edge cases: NULL vector rows skipped; <-> NULL query → empty; k > N.
+--   F. Edge cases: NULL vector rows skipped; <-> NULL query → ERROR 0A000; k > N.
 --   G. Fail-closed: corpus over the VRAM budget → clean ERROR, daemon survives.
 --
 -- REQUIRES: pg_cuvs_server running; cuvs.index_dir writable.
@@ -161,14 +161,19 @@ SELECT count(*) = 5 AS null_row_skipped FROM (
   SELECT id FROM tbf_test ORDER BY embedding <-> '[0.5,0.3,0.1,0.7,0.2,0.4,0.6,0.15]' LIMIT 5) s;
 DELETE FROM tbf_test WHERE id = 9001;
 
--- (F2) a NULL query vector has no neighbors → empty result, no crash. A literal
+-- (F2) a NULL query vector reaching B raises ERROR 0A000 (feature_not_supported)
+-- instead of the silent empty result it used to return (#156). A literal
 -- `<-> NULL` is const-folded to seqscan by the planner (B never sees it), so we
--- force a generic plan and bind a NULL param: B fires and its qisnull branch
--- returns empty. The non-NULL param exercises the same generic plan normally.
+-- force a generic plan and bind a NULL param: B fires and its qisnull branch now
+-- fails loudly. The assertion is not vacuous — had B not fired, the heap would
+-- answer n=5 for an all-NULL sort key, so the ERROR is reachable only through B.
 SET plan_cache_mode = force_generic_plan;
 PREPARE nq(vector) AS SELECT count(*)::int AS n FROM (
   SELECT id FROM tbf_test ORDER BY embedding <-> $1 LIMIT 5) s;
+\set ON_ERROR_STOP off
 EXECUTE nq(NULL);
+\set ON_ERROR_STOP on
+-- The same generic plan with a non-NULL bind is unaffected.
 EXECUTE nq('[0.5,0.3,0.1,0.7,0.2,0.4,0.6,0.15]');
 DEALLOCATE nq;
 RESET plan_cache_mode;
