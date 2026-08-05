@@ -158,14 +158,17 @@ SELECT NOT us_uses_index('SELECT count(*) FROM us_ivfpq_tbl', 'us_ivfpq_idx')
  t
 (1 row)
 
-SELECT us_uses_index('SELECT id FROM us_ivfpq_tbl ORDER BY embedding <-> ''[1,0,0,0]'' LIMIT 1', 'us_ivfpq_idx')
+RESET enable_seqscan;
+-- Routing check in ivfpq_smoke.sql's exact shape: explicit ::vector cast, no
+-- enable_seqscan forcing. That is the form proven to reach the ivfpq AM under
+-- the Tier-1 shim.
+SELECT us_uses_index('SELECT id FROM us_ivfpq_tbl ORDER BY embedding <-> ''[1,0,0,0]''::vector LIMIT 1', 'us_ivfpq_idx')
     AS ivfpq_orderby_uses_index;
  ivfpq_orderby_uses_index 
 --------------------------
  t
 (1 row)
 
-RESET enable_seqscan;
 -- Cleanup
 DROP TABLE us_cagra_tbl;
 DROP TABLE us_flat_tbl;
