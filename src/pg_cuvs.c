@@ -7028,13 +7028,21 @@ cuvs_tbf_build(CuvsTransientBFScanState *state, EState *estate)
 
     /* Bind the query vector at EXEC time (params now resolved). */
     qdatum = ExecEvalExpr(state->query_exprstate, econtext, &qisnull);
-    if (qisnull)   /* `<-> NULL` has no neighbors */
-    {
-        state->n_results = 0;
-        state->built = true;
-        state->cursor = 0;
-        return;
-    }
+    /* #156: a NULL query vector reaching this scan. A LITERAL `<-> NULL` never
+     * gets here (the operator is strict, so it const-folds and the planner
+     * routes to the heap); a PARAMETERIZED NULL under a generic plan does. The
+     * old empty-result return made that a silent zero-row answer — and B stands
+     * in for a seqscan, so the user reads it as "every row was scanned and none
+     * matched". There is no vector to search with, so fail loudly instead.
+     *
+     * Same call as the AM gettuple guards (#150) and the dim-mismatch ereport
+     * below: a bad query vector is a user error, not an empty neighborhood. */
+    if (qisnull)
+        ereport(ERROR,
+                (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                 errmsg("transient brute-force scan does not support a NULL query vector"),
+                 errhint("Bind a non-NULL vector, or guard the query with "
+                         "IS NOT NULL. See issue #156.")));
     qvec = DatumGetPgVector(qdatum);
 
     foreach(lc, state->filter_rinfos)
