@@ -59,7 +59,10 @@ Key properties:
   every call; no delta or tombstone logic needed.
 - **Filter-first**: WHERE clauses are applied before the GPU handoff, not post-filtered.
 - **Exec-time parameter binding**: `ORDER BY col <-> $1 LIMIT k` parametrized queries are NOT
-  downgraded to approximate search.
+  downgraded to approximate search. A NULL bound to that parameter raises
+  `ERROR 0A000 (feature_not_supported)` rather than returning zero rows — there is no vector to
+  search with, and B stands in for a seqscan, so a silent empty result would read as "every row
+  was scanned and none matched" (#156). Same contract as the index scans above (#150).
 - **Fires only for the bounded shape**: single base relation (no join), no OFFSET, no GROUP
   BY/DISTINCT/HAVING/window, a plan-time Const LIMIT in 1..100000, single distance ORDER BY key.
   Any other shape falls back to seqscan. The planner keeps `Limit → Sort → CustomScan` (no
