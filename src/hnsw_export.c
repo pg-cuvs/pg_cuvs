@@ -1206,17 +1206,24 @@ fill_hnsw_from_hnswlib_impl(Oid cagra_oid, Oid hnsw_oid, bool use_shm,
 static void
 fill_hnsw_from_hnswlib(Oid cagra_oid, Oid hnsw_oid, bool use_shm)
 {
-    HnswFillRes res;
+    /*
+     * #166 review 3: `res` is written inside PG_TRY (through the pointer the
+     * impl receives) and read in PG_FINALLY, i.e. across a possible longjmp.
+     * PostgreSQL requires such locals to be volatile; the cast back is the
+     * usual idiom, safe because the value is only consumed after the jump.
+     */
+    volatile HnswFillRes res;
 
-    memset(&res, 0, sizeof(res));
+    memset((void *) &res, 0, sizeof(res));
     res.shm_fd = -1;            /* #165: 0 is stdin — never a valid sentinel */
     PG_TRY();
     {
-        fill_hnsw_from_hnswlib_impl(cagra_oid, hnsw_oid, use_shm, &res);
+        fill_hnsw_from_hnswlib_impl(cagra_oid, hnsw_oid, use_shm,
+                                    (HnswFillRes *) &res);
     }
     PG_FINALLY();
     {
-        hnsw_fill_res_free(&res);
+        hnsw_fill_res_free((HnswFillRes *) &res);
     }
     PG_END_TRY();
 }
@@ -1706,17 +1713,19 @@ fill_hnsw_from_cagra_ipc_impl(Oid cagra_oid, Oid hnsw_oid, const char *mode,
 static void
 fill_hnsw_from_cagra_ipc(Oid cagra_oid, Oid hnsw_oid, const char *mode)
 {
-    HnswFillRes res;
+    /* #166 review 3: volatile across the longjmp — see fill_hnsw_from_hnswlib. */
+    volatile HnswFillRes res;
 
-    memset(&res, 0, sizeof(res));
+    memset((void *) &res, 0, sizeof(res));
     res.shm_fd = -1;            /* #165: 0 is stdin — never a valid sentinel */
     PG_TRY();
     {
-        fill_hnsw_from_cagra_ipc_impl(cagra_oid, hnsw_oid, mode, &res);
+        fill_hnsw_from_cagra_ipc_impl(cagra_oid, hnsw_oid, mode,
+                                      (HnswFillRes *) &res);
     }
     PG_FINALLY();
     {
-        hnsw_fill_res_free(&res);
+        hnsw_fill_res_free((HnswFillRes *) &res);
     }
     PG_END_TRY();
 }
