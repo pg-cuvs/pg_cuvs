@@ -407,15 +407,15 @@ static pthread_t       g_warmup_tids[8];
  * into a single cuvs_bf_search_batch GPU dispatch, then wakes each producer.
  *
  * Lock order (no thread ever holds both): a producer takes g_index_mutex for
- * the cheap stale/metric/dim preamble, RELEASES it, then takes g_bf_mtx to
- * enqueue; the worker moves the queue out under g_bf_mtx, RELEASES it, then
+ * the cheap stale/metric/dim preamble, RELEASES it, then takes g_batch_mtx to
+ * enqueue; the worker moves the queue out under g_batch_mtx, RELEASES it, then
  * takes g_index_mutex for the GPU work. Gated entirely by bf_batch_wait_us>0 —
  * with the default 0 nothing is ever enqueued and this subsystem is inert.
  * ---------------------------------------------------------------- */
-#define CUVS_BF_BATCH_MAX 256          /* cap on concurrently queued BF requests */
+#define CUVS_BATCH_MAX 256          /* cap on concurrently queued requests */
 
-typedef struct CuvsBfRequest {
-    CuvsBfKey    key;          /* db_oid, index_oid, precision, dim */
+typedef struct CuvsBatchRequest {
+    CuvsBatchKey key;          /* db_oid, index_oid, precision, dim */
     const float *query;        /* producer-owned, dim floats, valid until done */
     int          k;            /* requested top-k */
     uint32_t     wait_us;      /* this request's batch window hint */
@@ -423,15 +423,15 @@ typedef struct CuvsBfRequest {
     int          n_out;        /* results written by the worker */
     int          status;       /* CUVS_STATUS_* set by the worker */
     int          done;         /* 0 = pending, 1 = worker finished this request */
-} CuvsBfRequest;
+} CuvsBatchRequest;
 
-static pthread_mutex_t g_bf_mtx       = PTHREAD_MUTEX_INITIALIZER;
-static pthread_cond_t  g_bf_cond      = PTHREAD_COND_INITIALIZER; /* signaled on enqueue */
-static pthread_cond_t  g_bf_done_cond = PTHREAD_COND_INITIALIZER; /* signaled on completion */
-static CuvsBfRequest  *g_bf_queue[CUVS_BF_BATCH_MAX];
-static int             g_bf_queue_n   = 0;
-static pthread_t       g_bf_worker_tid;
-static int             g_bf_worker_started = 0;
+static pthread_mutex_t   g_batch_mtx       = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t    g_batch_cond      = PTHREAD_COND_INITIALIZER; /* signaled on enqueue */
+static pthread_cond_t    g_batch_done_cond = PTHREAD_COND_INITIALIZER; /* signaled on completion */
+static CuvsBatchRequest *g_batch_queue[CUVS_BATCH_MAX];
+static int               g_batch_queue_n   = 0;
+static pthread_t         g_batch_worker_tid;
+static int               g_batch_worker_started = 0;
 
 static int
 warmup_enqueue(uint32_t db_oid, uint32_t index_oid,
@@ -2898,17 +2898,17 @@ handle_search(int client_fd, const CuvsCmdFrame *cmd)
          * and block until the worker fills our result. The query shm stays mapped
          * (req.query points at it) until we reply. On a full queue we degrade to
          * the immediate path below by re-acquiring the lock and re-finding e. */
-        if (cmd->bf_batch_wait_us > 0 && g_bf_worker_started
+        if (cmd->bf_batch_wait_us > 0 && g_batch_worker_started
             && !(cmd->use_prefilter && cmd->n_filter_tids > 0
                  && e->handle != NULL && e->rev_tids != NULL
                  && e->rev_item_ids != NULL))
         {
-            CuvsBfKey     key  = { cmd->db_oid, cmd->index_oid, cmd->bf_precision, cmd->dim };
+            CuvsBatchKey     key  = { cmd->db_oid, cmd->index_oid, cmd->bf_precision, cmd->dim };
             CuvsResult   *rout = malloc((size_t) k * sizeof(CuvsResult));
             int           enqueued = 0;
-            CuvsBfRequest req;
+            CuvsBatchRequest req;
 
-            pthread_mutex_unlock(&g_index_mutex);   /* release BEFORE taking g_bf_mtx */
+            pthread_mutex_unlock(&g_index_mutex);   /* release BEFORE taking g_batch_mtx */
 
             if (rout)
             {
@@ -2917,16 +2917,16 @@ handle_search(int client_fd, const CuvsCmdFrame *cmd)
                 req.out     = rout;  req.n_out  = 0;
                 req.status  = CUVS_STATUS_ERROR; req.done = 0;
 
-                pthread_mutex_lock(&g_bf_mtx);
-                if (g_bf_queue_n < CUVS_BF_BATCH_MAX)
+                pthread_mutex_lock(&g_batch_mtx);
+                if (g_batch_queue_n < CUVS_BATCH_MAX)
                 {
-                    g_bf_queue[g_bf_queue_n++] = &req;
+                    g_batch_queue[g_batch_queue_n++] = &req;
                     enqueued = 1;
-                    pthread_cond_signal(&g_bf_cond);
+                    pthread_cond_signal(&g_batch_cond);
                     while (!req.done)                       /* spurious-wakeup safe */
-                        pthread_cond_wait(&g_bf_done_cond, &g_bf_mtx);
+                        pthread_cond_wait(&g_batch_done_cond, &g_batch_mtx);
                 }
-                pthread_mutex_unlock(&g_bf_mtx);
+                pthread_mutex_unlock(&g_batch_mtx);
             }
 
             if (enqueued)
@@ -7656,35 +7656,35 @@ connection_thread(void *arg)
  * behavior from non-async-signal-safe calls.
  * ---------------------------------------------------------------- */
 /* Phase 3L-9: mark every queued BF request done with `status` and wake its
- * producer. Caller holds g_bf_mtx. */
+ * producer. Caller holds g_batch_mtx. */
 static void
-bf_batch_fail_all_locked(int status)
+batch_fail_all_locked(int status)
 {
-    for (int i = 0; i < g_bf_queue_n; i++)
+    for (int i = 0; i < g_batch_queue_n; i++)
     {
-        g_bf_queue[i]->status = status;
-        g_bf_queue[i]->done   = 1;
+        g_batch_queue[i]->status = status;
+        g_batch_queue[i]->done   = 1;
     }
-    g_bf_queue_n = 0;
-    pthread_cond_broadcast(&g_bf_done_cond);
+    g_batch_queue_n = 0;
+    pthread_cond_broadcast(&g_batch_done_cond);
 }
 
 /* Phase 3L-9: run one coalesced group (requests in `batch` with gid[i]==g, all
  * sharing a (db,index,precision,dim) key) as a single cuvs_bf_search_batch
  * dispatch. Acquires g_index_mutex for the GPU work (eviction-safe, mirrors the
- * immediate path); the caller must NOT hold g_bf_mtx here. Writes each member's
+ * immediate path); the caller must NOT hold g_batch_mtx here. Writes each member's
  * out/n_out/status (but not `done` — the caller sets that after all groups). */
 static void
-bf_batch_run_group(CuvsBfRequest **batch, const int *gid, int n, int g)
+bf_batch_run_group(CuvsBatchRequest **batch, const int *gid, int n, int g)
 {
-    int idx[CUVS_BF_BATCH_MAX], Q = 0;
+    int idx[CUVS_BATCH_MAX], Q = 0;
     for (int i = 0; i < n; i++)
         if (gid[i] == g)
             idx[Q++] = i;
     if (Q == 0)
         return;
 
-    CuvsBfRequest *r0   = batch[idx[0]];
+    CuvsBatchRequest *r0   = batch[idx[0]];
     int            dim  = (int) r0->key.dim;
     int            maxk = 0;
     for (int i = 0; i < Q; i++)
@@ -7747,7 +7747,7 @@ bf_batch_run_group(CuvsBfRequest **batch, const int *gid, int n, int g)
 
     for (int i = 0; i < Q; i++)
     {
-        CuvsBfRequest *r  = batch[idx[i]];
+        CuvsBatchRequest *r  = batch[idx[i]];
         int            ki = (r->k < K) ? r->k : K;
         int            nv = 0;
         for (int j = 0; j < ki; j++)
@@ -7771,37 +7771,37 @@ bf_batch_run_group(CuvsBfRequest **batch, const int *gid, int n, int g)
     free(raw);
 }
 
-/* Phase 3L-9: process the currently queued BF requests. Caller holds g_bf_mtx;
+/* Phase 3L-9: process the currently queued BF requests. Caller holds g_batch_mtx;
  * returns holding it. Snapshots + clears the queue (so producers can fill the
- * next batch), releases g_bf_mtx, groups by key, runs one cuvs_bf_search_batch
+ * next batch), releases g_batch_mtx, groups by key, runs one cuvs_bf_search_batch
  * per group, then re-locks and wakes every producer in this batch. */
 static void
-bf_batch_process_locked(void)
+batch_process_locked(void)
 {
-    int n = g_bf_queue_n;
+    int n = g_batch_queue_n;
     if (n == 0)
         return;
 
-    CuvsBfRequest *batch[CUVS_BF_BATCH_MAX];
+    CuvsBatchRequest *batch[CUVS_BATCH_MAX];
     for (int i = 0; i < n; i++)
-        batch[i] = g_bf_queue[i];
-    g_bf_queue_n = 0;
-    pthread_mutex_unlock(&g_bf_mtx);
+        batch[i] = g_batch_queue[i];
+    g_batch_queue_n = 0;
+    pthread_mutex_unlock(&g_batch_mtx);
 
-    CuvsBfKey keys[CUVS_BF_BATCH_MAX];
-    int       gid[CUVS_BF_BATCH_MAX];
+    CuvsBatchKey keys[CUVS_BATCH_MAX];
+    int       gid[CUVS_BATCH_MAX];
     int       ng = 0;
     for (int i = 0; i < n; i++)
         keys[i] = batch[i]->key;
-    cuvs_bf_batch_group(keys, n, gid, &ng);
+    cuvs_batch_group(keys, n, gid, &ng);
 
     for (int g = 0; g < ng; g++)
         bf_batch_run_group(batch, gid, n, g);
 
-    pthread_mutex_lock(&g_bf_mtx);
+    pthread_mutex_lock(&g_batch_mtx);
     for (int i = 0; i < n; i++)
         batch[i]->done = 1;
-    pthread_cond_broadcast(&g_bf_done_cond);
+    pthread_cond_broadcast(&g_batch_done_cond);
 }
 
 /* Phase 3L-9: the single BF micro-batch consumer thread. Idle (1s poll) until a
@@ -7809,40 +7809,40 @@ bf_batch_process_locked(void)
  * request's bf_batch_wait_us window (lock released, so more accumulate) then
  * coalesces everything queued into one batch. */
 static void *
-bf_batch_worker_thread(void *arg)
+batch_worker_thread(void *arg)
 {
     (void) arg;
-    pthread_mutex_lock(&g_bf_mtx);
+    pthread_mutex_lock(&g_batch_mtx);
     while (!g_shutdown)
     {
         struct timespec ts;
         clock_gettime(CLOCK_REALTIME, &ts);
         ts.tv_sec += 1;                 /* 1s poll so shutdown stays responsive */
-        while (g_bf_queue_n == 0 && !g_shutdown)
-            if (pthread_cond_timedwait(&g_bf_cond, &g_bf_mtx, &ts) == ETIMEDOUT)
+        while (g_batch_queue_n == 0 && !g_shutdown)
+            if (pthread_cond_timedwait(&g_batch_cond, &g_batch_mtx, &ts) == ETIMEDOUT)
                 break;
         if (g_shutdown)
             break;
-        if (g_bf_queue_n == 0)
+        if (g_batch_queue_n == 0)
             continue;
 
         /* Accumulation window: let concurrent requests pile up before the GPU
          * dispatch. Released lock during the sleep so producers can enqueue. */
-        uint32_t window = g_bf_queue[0]->wait_us;
+        uint32_t window = g_batch_queue[0]->wait_us;
         if (window > 10000) window = 10000;   /* GUC max; defensive */
         if (window > 0)
         {
             /* window us -> ns; window<=10000 keeps tv_nsec well under 1e9. */
             struct timespec ws = { 0, (long) window * 1000 };
-            pthread_mutex_unlock(&g_bf_mtx);
+            pthread_mutex_unlock(&g_batch_mtx);
             nanosleep(&ws, NULL);
-            pthread_mutex_lock(&g_bf_mtx);
+            pthread_mutex_lock(&g_batch_mtx);
         }
-        bf_batch_process_locked();
+        batch_process_locked();
     }
     /* Shutdown: fail any still-queued requests so producers never hang. */
-    bf_batch_fail_all_locked(CUVS_STATUS_UNAVAILABLE);
-    pthread_mutex_unlock(&g_bf_mtx);
+    batch_fail_all_locked(CUVS_STATUS_UNAVAILABLE);
+    pthread_mutex_unlock(&g_batch_mtx);
     return NULL;
 }
 
@@ -7864,12 +7864,12 @@ graceful_shutdown(void)
 
     /* Phase 3L-9: wake the BF batch worker (g_shutdown is already set) so it
      * fails any queued requests and exits, then join it. Always spawned. */
-    if (g_bf_worker_started)
+    if (g_batch_worker_started)
     {
-        pthread_mutex_lock(&g_bf_mtx);
-        pthread_cond_broadcast(&g_bf_cond);
-        pthread_mutex_unlock(&g_bf_mtx);
-        pthread_join(g_bf_worker_tid, NULL);
+        pthread_mutex_lock(&g_batch_mtx);
+        pthread_cond_broadcast(&g_batch_cond);
+        pthread_mutex_unlock(&g_batch_mtx);
+        pthread_join(g_batch_worker_tid, NULL);
         LOG_INFO("bf_batch: worker thread joined\n");
     }
 
@@ -8304,8 +8304,8 @@ main(int argc, char **argv)
 
     /* Phase 3L-9: spawn the single BF micro-batch consumer. Always running but
      * inert until a request with bf_batch_wait_us>0 is enqueued. */
-    if (pthread_create(&g_bf_worker_tid, NULL, bf_batch_worker_thread, NULL) == 0)
-        g_bf_worker_started = 1;
+    if (pthread_create(&g_batch_worker_tid, NULL, batch_worker_thread, NULL) == 0)
+        g_batch_worker_started = 1;
     else
         LOG_ERROR("pg_cuvs_server: failed to spawn BF batch worker; "
                   "brute_force micro-batching disabled (immediate dispatch only)\n");

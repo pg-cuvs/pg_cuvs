@@ -837,7 +837,7 @@ cuvs_circuit_reset_all(void)
  * Phase 3L-9: brute-force micro-batch grouping (pure).
  * ---------------------------------------------------------------- */
 void
-cuvs_bf_batch_group(const CuvsBfKey *keys, int n,
+cuvs_batch_group(const CuvsBatchKey *keys, int n,
                     int *group_id_out, int *n_groups_out)
 {
     int ng = 0;
