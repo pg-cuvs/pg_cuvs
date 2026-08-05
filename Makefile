@@ -485,6 +485,12 @@ gpu-test-daemon:
 # EPHEMERAL bucket (created + destroyed by the script). Needs gcloud (/snap/bin)
 # and a service account with storage.buckets.create. Piped over stdin (bash -s);
 # /snap/bin is added to PATH so gcloud resolves in the non-login ssh shell.
+# #165: daemon-created /dev/shm segments must not outlive their request. Needs a
+# table `t` with a CAGRA index `t_cagra` on the VM. Piped over stdin (bash -s).
+gpu-test-shm-residue:
+	ssh $(VM_HOST) "$(REMOTE_ENV) && bash -s" \
+		< infra/scripts/tests/shm-residue.sh
+
 gpu-test-objstore:
 	ssh $(VM_HOST) "$(REMOTE_ENV) && \
 		PATH=\$$PATH:/snap/bin bash -s" \
