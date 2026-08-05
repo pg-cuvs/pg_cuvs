@@ -1,6 +1,6 @@
 -- ivfpq_smoke.sql — Phase 3P IVF-PQ access method smoke test.
 -- Verifies: AM/opcls registration, GUC, CREATE INDEX (daemon required),
--- a deterministic nearest-neighbor search, and pg_stat_gpu_search mode.
+-- a real IVF-PQ search reaching the daemon, and pg_stat_gpu_search mode.
 
 \set ON_ERROR_STOP on
 SET client_min_messages = WARNING;
@@ -47,12 +47,39 @@ SELECT indexrelid::regclass FROM pg_index
 WHERE indrelid = 'ivfpq_items'::regclass
   AND indexrelid::regclass::text = 'ivfpq_idx';
 
--- Probe all 4 clusters → recall = 1.00 for this tiny dataset.
--- [1,0,0,0] is the exact match for id=1 (distance = 0).
+-- Probe all 4 clusters, so no candidate is missed by the IVF stage.
+--
+-- What this file must NOT assert is which neighbor comes back. The old
+-- "recall = 1.00 → id = 1 is the exact match" claim held only while the query
+-- was silently running as a CPU Seq Scan + Sort (#151); the first run of a real
+-- GPU IVF-PQ search returned id = 9 ([2,0,0,0], true distance 1.0). That is not
+-- a bug: this corpus is deliberately degenerate — pq_bits = 8 trains 256 PQ
+-- centroids from 20 samples at dim 4 — so quantization error reorders near ties,
+-- and which id wins depends on kmeans initialization. The CPU shim answers
+-- exactly, real GPU PQ does not, so the assertion below locks only the minimum
+-- contract both tiers owe: one row, and a valid id. The fence that a real search
+-- happened at all is the search_count bracket, not this result.
 SET cuvs.ivfpq_n_probes = 4;
 SET cuvs.k = 4;
-SELECT id FROM ivfpq_items
-ORDER BY embedding <-> '[1,0,0,0]'::vector LIMIT 1;
+
+-- #151: bracket the query with the daemon's search_count. The pg_stat_gpu_search
+-- row is registered at CREATE INDEX time with search_count = 0, so asserting
+-- search_mode alone proves only that the BUILD reached the daemon — it stayed
+-- green all the while the query silently ran as a CPU Seq Scan + Sort and
+-- returned the right answer anyway. Only the counter going 0 → ≥1 proves a real
+-- ivfpq search happened.
+SELECT search_count = 0 AS ivfpq_not_searched_before FROM pg_stat_gpu_search
+WHERE index_oid = 'ivfpq_idx'::regclass;
+
+SET enable_seqscan = off;
+SELECT count(*) = 1                     AS one_row,
+       bool_and(id BETWEEN 1 AND 20)    AS valid_id
+FROM (SELECT id FROM ivfpq_items
+      ORDER BY embedding <-> '[1,0,0,0]'::vector LIMIT 1) s;
+RESET enable_seqscan;
+
+SELECT search_count >= 1 AS ivfpq_searched_after FROM pg_stat_gpu_search
+WHERE index_oid = 'ivfpq_idx'::regclass;
 
 -- Daemon stats should report search_mode = 'ivfpq' for this index.
 SELECT search_mode FROM pg_stat_gpu_search

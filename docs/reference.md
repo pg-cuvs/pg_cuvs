@@ -18,7 +18,7 @@ pg_cuvs registers four index AMs. All reuse pgvector's `vector` type and operato
 |----|--------|---------------------|-----------|---------------|
 | `cagra` | `CREATE INDEX i ON t USING cagra (col vector_l2_ops)` | `graph_degree`, `intermediate_graph_degree`, `build_algo`, `index_dir` | GPU daemon | `.cagra`, `.tids`, (`.vectors`, `.delta`, `.tombstone`, `.stale`, `.shards`, `.sNNN.cagra`, `.relfilenode`) |
 | `flat` | `CREATE INDEX i ON t USING flat (col vector_l2_ops) WITH (precision='float16')` | `precision`, `index_dir` | GPU daemon | `.tids`, `.vectors` (no `.cagra` graph) |
-| `ivfpq` | `CREATE INDEX i ON t USING ivfpq (col vector_l2_ops)` | `n_lists`, `pq_bits`, `pq_dim` | GPU daemon | `.ivfpq`, `.tids` |
+| `ivfpq` | `CREATE INDEX i ON t USING ivfpq (col vector_l2_ops)` | `n_lists`, `pq_bits`, `pq_dim`, `index_dir` | GPU daemon | `.ivfpq`, `.tids` |
 | `pg_cuvs_hnsw` | `CREATE INDEX i ON t USING pg_cuvs_hnsw (col vector_l2_ops) WITH (source='my_cagra', mode='nsw')` | `source`, `mode`, `m`, `ef_construction` | **pgvector** (CPU) | `.hnsw` (pgvector page format) |
 
 `flat` is the first-class exact GPU brute-force AM (ADR-073, extension v0.4.0). It builds only a
@@ -279,6 +279,7 @@ cagra/ivfpq") rather than silently failing.
 | `n_lists` | int | `1024` | 1–65536 | IVF cluster count |
 | `pq_bits` | int | `8` | 4–8 | Bits per PQ code |
 | `pq_dim` | int | `0` (auto → ~dim/2) | 0–65536 | PQ subspace count |
+| `index_dir` | string | (uses `cuvs.index_dir`) | path | Per-index artifact directory; same semantics as `cagra` (ADR-045) |
 
 ### `pg_cuvs_hnsw`
 
