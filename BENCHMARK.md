@@ -551,6 +551,8 @@ signature of a queue in front of a fixed-rate server, not of a fully serialized 
 Reported as measured; the flat-curve prediction was too strong. The operational reading
 is unchanged: **batch search is pg_cuvs's throughput mechanism**, and these rows are the
 evidence for why. This is a statement about the current implementation, not about CAGRA.
+This serialization ceiling is what v0.7.0's dynamic batching addresses — the same
+concurrent single-query traffic, measured with the coalescing window open, is §2.1d.
 
 Fallback-counter deltas are **0 on all ten conc rows**, so no arm was quietly absorbed
 as a CPU exact search — which would have shown up as suspiciously high recall at high
@@ -576,6 +578,89 @@ faults rather than to re-judge this one. The open question — whether the drive
 K, or both, and whether the batch path's lower recall is worth correcting — is tracked in
 [#144](https://github.com/pg-cuvs/pg_cuvs/issues/144), which carries the three same-graph
 samples, the raw-arm corroboration, and the K/scale confound.
+
+### 2.1d Dynamic batching for concurrent single-query traffic (2026-08-05)
+
+§2.1c's conc arms measured a daemon that serializes concurrent single-query CAGRA
+searches behind one global mutex. v0.7.0 adds a coalescing window
+(`cuvs.cagra_batch_wait_us`, default `0` = off) that merges those concurrent requests
+into one multi-CTA dispatch. This subsection is the measurement of what the window buys.
+
+Data: [`bench/results/cagra_dynbatch_160.csv`](bench/results/cagra_dynbatch_160.csv),
+driver [`bench/cuvs_bench_backend/cagra_dynbatch_sweep.py`](bench/cuvs_bench_backend/cagra_dynbatch_sweep.py).
+Host `massedcompute_A100_sxm4_80G` (Brev `pg-cuvs-verify-3fix-b`), extension 0.7.0.
+Workload: a freshly built `t_cagra` over wiki_all_1M (1M × 768, `graph_degree=32`,
+`intermediate_graph_degree=128`, `build_algo=ivf_pq`), closed loop of N workers over a
+15 s window, inline vector literal + `LIMIT 10` — the same query shape as §2.1c's conc
+arms — at `cuvs.k=200`, the §2.1c Pareto operating point. recall@10 is computed over
+2000 queries against exact ground truth.
+
+> **This is a feature-validation sweep, not a canonical two-axis run, and its absolute
+> numbers do not line up against §2.1c's.** §2.1c was taken on
+> `massedcompute_A100_sxm4_80G_DGX` — the same A100 class but a different platform
+> variant — and §2.1b documents ~3.5× QPS swings between nominally identical A100 hosts.
+> Every ratio below is measured **within this one file**.
+
+| N | `cagra_batch_wait_us` | QPS | p50 ms | p95 ms | recall@10 | avg batch width |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 0 | 972 | 1.02 | 1.22 | 0.9911 | — |
+| 1 | 200 | 738 | 1.33 | 1.51 | 0.9912 | 1.0 |
+| 1 | 1000 | 449 | 2.21 | 2.41 | 0.9913 | 1.0 |
+| 8 | 0 | 1,671 | 4.76 | 5.62 | 0.9912 | — |
+| 8 | 200 | **4,538** | **1.74** | 1.93 | 0.9922 | 4.0 |
+| 8 | 1000 | 3,351 | 2.36 | 2.63 | 0.9925 | 8.0 |
+| 32 | 0 | 1,682 | 18.89 | 22.56 | 0.9913 | — |
+| 32 | 200 | **8,398** | **3.70** | 5.58 | 0.9925 | 10.0 |
+| 32 | 1000 | 7,914 | 3.98 | 5.88 | 0.9919 | 16.0 |
+
+*`avg batch width` is derived from the CSV as `total_queries / cagra_batch_delta`; the
+CSV carries the two raw columns.*
+
+**The `wait_us=0` rows are the control arm, and they are flat.** 972 / 1,671 / 1,682 QPS
+at N = 1 / 8 / 32: past N=8 the added concurrency buys nothing and p50 grows linearly
+(1.02 → 18.89 ms). That is the same serialization ceiling §2.1c's conc arms measured, on
+this host at ~1,680 QPS.
+
+**Against that control, N=32 with a 200 µs window gives 8,398 QPS — 5.0× — while p50
+falls 18.89 → 3.70 ms, 5.1×.** Both ratios are within-file, N=32 wait=200 µs against
+N=32 wait=0, on this host and this build config. Throughput and latency improve together
+rather than trading off, because once the daemon is saturated the mutex queueing wait a
+request pays is far larger than the batching window it waits instead. At N=8 the same
+comparison is 2.7× (4,538 vs 1,671).
+
+**recall does not regress.** The merged cells sit at 0.9922–0.9925 against 0.9911–0.9913
+for the wait=0 controls — a change of about +0.001, i.e. no loss. At the batch widths
+this sweep reaches (4–16) the multi-CTA recall deficit tracked in
+[#144](https://github.com/pg-cuvs/pg_cuvs/issues/144) does not appear; that divergence
+was measured at a 2000-query dispatch, and its sign has been observed to depend on width
+and scale. This sweep does not extend to widths where it would be expected to show.
+
+**Merging is verified by counter, not inferred from the QPS.** Each cell records the
+delta of `pg_stat_gpu_search.cagra_batch_count` over the cell. It is **exactly 0** on all
+three `wait_us=0` rows, so the control arm demonstrably did no coalescing, and it is
+nonzero on every window-open row with `total_queries / delta` landing at the widths in
+the table. A throughput gain without a matching counter delta would have meant something
+other than batching moved.
+
+**N=1 is a pure loss (972 → 738 → 449 QPS), which is why the default is off.** With no
+second request to merge with, the window is dead time added to every query. The GUC ships
+at `0`; it is a knob for concurrent serving, not a global speedup.
+
+**CAGRA prefers the 200 µs window; the brute-force path prefers 1000 µs.** In this sweep
+200 µs beats 1000 µs at both N=8 and N=32, which is the measured justification for
+`cuvs.cagra_batch_wait_us` being a separate GUC from `cuvs.bf_batch_wait_us` rather than
+one shared window.
+
+**The brute-force path, where dynamic batching shipped first, shows the same mechanism
+more strongly.** A sweep of the same shape on `t_flat` (wiki_all_1M, GPU exact search)
+run the same day went from 250 QPS at N=32 / wait=0 to 2,512 QPS at N=32 / wait=1000 µs
+— 10.0× — with p50 falling 124.27 → 13.58 ms, and no recall question at all since the
+path is exact. That sweep was taken on a since-deleted instance
+(`pg-cuvs-verify-3fix`) and **its raw log was not preserved**; the numbers are quoted
+from the 2026-08-05 comment on
+[#160](https://github.com/pg-cuvs/pg_cuvs/issues/160), which is their only source. They
+are not in this repository's results ledger and should be cited as issue-comment
+evidence, not as a committed artifact.
 
 ### 2.2 Synthetic crossover pilot — where the line is
 
