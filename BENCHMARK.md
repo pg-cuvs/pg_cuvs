@@ -657,9 +657,10 @@ Full table: [`docs/experiments/filter-threshold-experiment.md`](docs/experiments
   BITSET pre-filter collapse is the **filter/query correlation direction**, not selectivity.
   On wiki_all_1M the pre-filter held recall at or near 0.0 across the entire sel 0.0001–0.5
   range for anti-correlated filters, while an uncorrelated filter at the *same* sel=0.5
-  gave 0.989 and spatial/mixed filters stayed at 1.0 down to sel=1e-4. ADR-083 therefore
+  gave 0.989 and spatial/mixed filters held 1.0 even at sel=1e-4. ADR-083 therefore
   rules out single-variable selectivity routing and adopts runtime detection (`mean_returned` ≪ k)
-  with a D-wedge fallback; that fix landed via
+  that retries the query on the GPU exact brute-force prefilter (`gpu_bf_prefilter` — **not**
+  the D-wedge post-filter above; a different cost model); that fix landed via
   [#133](https://github.com/pg-cuvs/pg_cuvs/issues/133) and restores pre-filter recall to
   0.998 / 0.999 on the same anti-correlated fixtures
   ([`adr083_133_anti_after_review_fixes.csv`](bench/results/adr083_133_anti_after_review_fixes.csv)).
