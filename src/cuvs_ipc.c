@@ -1297,8 +1297,11 @@ cuvs_ipc_export_adjacency(
     if (send_cmd(sock, &cmd) < 0)
         goto cleanup;
 
+    /* #165: the segment arrives as an SCM_RIGHTS fd. The daemon unlinks the
+     * name before replying, so there is nothing to open by name and nothing
+     * left behind to leak. */
     CuvsReplyHeader hdr;
-    if (recv_all(sock, &hdr, sizeof(hdr)) < 0)
+    if (cuvs_fd_recv(sock, &hdr, sizeof(hdr), &shm_fd) < 0)
         goto cleanup;
 
     if (hdr.status != CUVS_STATUS_OK) {
@@ -1306,18 +1309,21 @@ cuvs_ipc_export_adjacency(
         goto cleanup;
     }
 
-    /* Daemon packs: n_vecs=n_results, graph_degree=latency_us, dim=delta_merged,
-     * shm_key in the error[] field (null-terminated, ≤64 chars). */
+    /* Daemon packs: n_vecs=n_results, graph_degree=latency_us, dim=delta_merged.
+     * error[] holds the former shm name for log correlation only. */
     size_t  n_vecs       = (size_t)hdr.n_results;
     int     graph_degree = (int)hdr.latency_us;
     int     dim          = (int)hdr.delta_merged;
-    char    reply_shm_key[128];
-    strncpy(reply_shm_key, hdr.error, sizeof(reply_shm_key) - 1);
-    reply_shm_key[sizeof(reply_shm_key) - 1] = '\0';
 
-    if (n_vecs == 0 || graph_degree <= 0 || dim <= 0 || reply_shm_key[0] == '\0') {
-        LOG_ERROR("[export_adjacency] bad reply n=%zu gd=%d dim=%d key='%s'\n",
-                  n_vecs, graph_degree, dim, reply_shm_key);
+    if (n_vecs == 0 || graph_degree <= 0 || dim <= 0) {
+        LOG_ERROR("[export_adjacency] bad reply n=%zu gd=%d dim=%d\n",
+                  n_vecs, graph_degree, dim);
+        goto cleanup;
+    }
+    if (shm_fd < 0) {
+        LOG_ERROR("[export_adjacency] no SCM_RIGHTS fd in reply — daemon and "
+                  "extension versions are out of step (#165); restart the "
+                  "pg_cuvs daemon after installing the extension\n");
         goto cleanup;
     }
 
@@ -1329,14 +1335,8 @@ cuvs_ipc_export_adjacency(
     size_t hdr_bytes  = 4 * sizeof(uint32_t);  /* n_vecs, gd, dim, pad */
     size_t total      = hdr_bytes + adj_bytes + vecs_bytes + tids_bytes;
 
-    shm_fd = shm_open(reply_shm_key, O_RDONLY, 0);
-    if (shm_fd < 0) {
-        LOG_ERROR("[export_adjacency] shm_open(%s) failed errno=%d\n",
-                  reply_shm_key, errno);
-        goto cleanup;
-    }
     if (!shm_check_daemon_owner(sock, shm_fd)) {   /* #87 finding 1 */
-        LOG_ERROR("[export_adjacency] shm owner mismatch for %s\n", reply_shm_key);
+        LOG_ERROR("[export_adjacency] shm owner mismatch on passed fd\n");
         goto cleanup;
     }
 
@@ -1373,9 +1373,11 @@ cuvs_ipc_export_adjacency(
     rc = CUVS_STATUS_OK;
 
 cleanup:
+    /* #165: no shm_unlink here — the daemon already unlinked the name, and this
+     * process (a different uid) could not have removed it anyway. Closing the
+     * passed fd releases the last reference. */
     if (mem != MAP_FAILED)  munmap(mem, total);
     if (shm_fd >= 0)        close(shm_fd);
-    if (reply_shm_key[0])   shm_unlink(reply_shm_key);
     if (sock >= 0)          close(sock);
     return rc;
 }
