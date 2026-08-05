@@ -31,6 +31,7 @@
 **변경 이력:**
 | 날짜 | 변경 내용 | 대상 | 사유 |
 |------|----------|------|------|
+| 2026-08-05 | 배포 신선도 게이트 도입 — 스킬 워크플로우 표에 `gpu-deploy`/`gpu-server`/`gpu-reload`/`gpu-verify-deployed` 및 "무엇을 고치면 무엇을 다시 돌려야 하나" 매트릭스 추가 | skills/pg-cuvs-dev, Makefile, infra/scripts/gpu-preflight.sh | #169 — 하네스가 구 코드를 조용히 테스트하는 3갈래. `gpu-preflight.sh`는 있었으나 `gpu.conf` 파싱 버그로 실행 불가였고 호출자도 `gpu-run.sh` 하나뿐이었다 |
 | 2026-07-28 | quality-loop 스킬 추가 | skills/quality-loop | 품질 루프 도입 (버그·중복·테스트 속도 감사) |
 | 2026-07-28 | GPU 스킬 2종 트리거 경계 정리, 프로비저닝 중복 섹션을 참조로 대체, disk-recovery.md dead link 수정 | skills/pg-cuvs-dev, skills/gpu-vm-provision | 하네스 진단에서 트리거 중복·이중 관리 발견 |
 | 2026-07-28 | 하네스 포인터 등록 | CLAUDE.md | 변경 추적 진입점 부재 |
