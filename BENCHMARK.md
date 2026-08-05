@@ -343,11 +343,11 @@ The §2.1a sweep was re-run through the same cuvs-bench Postgres backend on
 
 | axis | RunPod → Brev | portable? |
 |------|---------------|-----------|
-| `index_bytes` (all 3 algos) | **byte-identical** (`3328000000` cagra, `4093870080` pgvector, `8192008192` 3I) | **yes — deterministic** |
+| `index_bytes` (all 3 algos) | **byte-identical** (`3328000000` cagra, `4093870080` pgvector, `8192008192` `pgcuvs_hnsw_import`) | **yes — deterministic** |
 <!-- The cagra constant above is the gd=64 cell, which is the only one these two
      fixed-config files built. #98 swept graph_degree and confirms the quantity is
      deterministic but not a single constant: 3200000000 (gd=32) / 3328000000 (gd=64) /
-     3584000000 (gd=128), i.e. 1M × (768×4 + gd×4) exactly. 3I is 8192008192 at every
+     3584000000 (gd=128), i.e. 1M × (768×4 + gd×4) exactly. pgcuvs_hnsw_import is 8192008192 at every
      cell of its grid — mode and graph_degree do not move it. -->
 
 > **Reading the `index_bytes` row:** the value is deterministic *given the build
@@ -355,9 +355,10 @@ The §2.1a sweep was re-run through the same cuvs-bench Postgres backend on
 > `graph_degree=64` CAGRA cell and pgvector's `m=16` cells, because those are the only
 > configs these two files built. #98's sweep gives the full picture: CAGRA is
 > `1M × (768×4 + graph_degree×4)` — **3.20 GB / 3.33 GB / 3.58 GB** at gd 32/64/128 —
-> while 3I stays at `8192008192` across its entire `mode`×`graph_degree` grid.
-| best-recall QPS | cagra 169 → 672 (**3.98×**), pgvector 199 → 700 (**3.52×**), 3I 105 → 281 (2.67×) | **no — host-specific** |
-| build time (min) | cagra 61 → 32 s, pgvector 268 → 94 s, 3I 109 → 54 s (~2×) | **no — host-specific** |
+> while `pgcuvs_hnsw_import` — the HNSW export path (GPU CAGRA build → pgvector-servable
+> HNSW) — stays at `8192008192` across its entire `mode`×`graph_degree` grid.
+| best-recall QPS | cagra 169 → 672 (**3.98×**), pgvector 199 → 700 (**3.52×**), `pgcuvs_hnsw_import` 105 → 281 (2.67×) | **no — host-specific** |
+| build time (min) | cagra 61 → 32 s, pgvector 268 → 94 s, `pgcuvs_hnsw_import` 109 → 54 s (~2×) | **no — host-specific** |
 
 **The decisive tell: `pgvector_hnsw` uses no GPU at all**, yet its QPS moved by
 the *same* ~3× as the GPU CAGRA path (p50 3.21× for pgvector vs 3.56× for cagra).
@@ -397,7 +398,7 @@ Two rules govern how it is read, and both are structural rather than stylistic:
    different quantities; no ratio in this document crosses them.
 2. **Build config is part of the point.** Each algorithm was swept over a build grid,
    so "CAGRA at recall 0.95" names a `graph_degree`, not just a search parameter.
-   `intermediate_graph_degree=128` is pinned in every CAGRA/3I cell so that sweeping
+   `intermediate_graph_degree=128` is pinned in every CAGRA/`pgcuvs_hnsw_import` cell so that sweeping
    `graph_degree` changes the degree alone and not the source-graph quality with it.
 
 #### Latency axis — best QPS clearing each recall bar, per build config
@@ -405,7 +406,7 @@ Two rules govern how it is read, and both are structural rather than stylistic:
 Standard ann-benchmarks convention: fix a target recall, take the highest-QPS point on
 each curve that still clears it. Per algorithm, the best cell of its grid:
 
-| recall@ | raw `cuvs` | `pgcuvs_cagra` | `pgcuvs_hnsw_import` (3I) | `pgvector_hnsw` |
+| recall@ | raw `cuvs` | `pgcuvs_cagra` | `pgcuvs_hnsw_import` | `pgvector_hnsw` |
 |---|---|---|---|---|
 | ≥0.90 | gd=32, k=64, 0.9400, **731.8** QPS, 1.36 ms | gd=32, k=32, 0.9473, **585.6**, 1.69 ms | gd=32/nsw, ef=32, 0.9037, **263.6**, 3.70 ms | m=32/efc=64, ef=40, 0.9149, **196.0**, 5.08 ms |
 | **≥0.95** | gd=32, k=200, 0.9913, **708.3**, 1.41 ms | gd=32, k=200, 0.9928, **580.5**, 1.71 ms | gd=64/hnswlib, ef=32, 0.9537, **177.1**, 5.56 ms | m=16/efc=64, ef=200, 0.9594, **102.1**, 9.78 ms |
@@ -416,8 +417,8 @@ The resulting within-file ratios, each with the recall pair it was taken at:
 | comparison | at recall ≥0.95 | at recall ≥0.99 |
 |---|---|---|
 | **CAGRA vs pgvector** | **5.69× QPS** (580.5 vs 102.1), 5.71× lower p50 | pgvector has no point — see below |
-| **CAGRA vs 3I** | **3.28×** (580.5 vs 177.1), 3.24× p50 | **8.07×** (580.5 vs 71.9), 8.11× p50 |
-| **3I vs pgvector** | **1.73×** (177.1 vs 102.1), 1.76× p50 | pgvector has no point |
+| **CAGRA vs `pgcuvs_hnsw_import`** | **3.28×** (580.5 vs 177.1), 3.24× p50 | **8.07×** (580.5 vs 71.9), 8.11× p50 |
+| **`pgcuvs_hnsw_import` vs pgvector** | **1.73×** (177.1 vs 102.1), 1.76× p50 | pgvector has no point |
 | **raw cuVS vs `pgcuvs_cagra`** | **1.22×** (708.3 vs 580.5), 1.22× p50 | 1.22× |
 
 **recall@0.95 → ~5.7× CAGRA over pgvector** is the citation to lead with; it replaces
@@ -458,32 +459,34 @@ quantity measured by a different tool.
 | `pgvector_hnsw` | m=16/efc=64 | **118.7** | 4,093,870,080 |
 
 CAGRA builds its recall-0.95 index **4.9× faster** than pgvector builds its own
-(24.3 s vs 118.7 s) and the index is **0.78×** the size. Against 3I the ordering is the
-one §2.1a already described from the other direction: 3I costs 2.5× the CAGRA build and
+(24.3 s vs 118.7 s) and the index is **0.78×** the size. Against `pgcuvs_hnsw_import` the
+ordering is the one §2.1a already described from the other direction: `pgcuvs_hnsw_import`
+costs 2.5× the CAGRA build and
 2.6× the bytes, and buys a *pgvector-servable artifact* for it.
 
-#### Confound separation: 3I vs pgvector, and the pre-registered verdict
+#### Confound separation: `pgcuvs_hnsw_import` vs pgvector, and the pre-registered verdict
 
 This comparison pair had **no published headline before this run**. (The 5.0×/14.9×
-figures this section previously carried were CAGRA-vs-3I, not 3I-vs-pgvector — an
+figures this section previously carried were CAGRA-vs-`pgcuvs_hnsw_import`, not
+`pgcuvs_hnsw_import`-vs-pgvector — an
 attribution error corrected in the #98 scope comment.) Three confounds were named in
 advance, with falsification criteria fixed before the run:
 
-**(a) "M is dominant" — FALSIFIED.** 3I at `gd=32` derives `M=16`
+**(a) "M is dominant" — FALSIFIED.** `pgcuvs_hnsw_import` at `gd=32` derives `M=16`
 (`src/hnsw_export.c:1435-1441`), matching pgvector `m=16` by construction. The criterion
 was that moving pgvector to `m=32` would close at least half the gap. It closed none of
 it: pgvector's best ≥0.95 point *fell* from 102.1 QPS (m=16) to 96.4 (m=32), widening
-the gap from 75.0 to 80.7 QPS. Within 3I, the same M step (gd 32→64) moves ≥0.95 QPS by
+the gap from 75.0 to 80.7 QPS. Within `pgcuvs_hnsw_import`, the same M step (gd 32→64) moves ≥0.95 QPS by
 −4.7% (nsw) and +0.3% (hnswlib). M does not explain this pair.
 
 **(b) "Hierarchy is dominant" — FALSIFIED.** The hierarchy cell is `hnswlib`
 (RECOMMENDED grade); `'hnsw'` is excluded from this judgment because the code classifies
 it HIDDEN/research with incomplete level assignment (`hnsw_export.c:1855-1862`). nsw →
-hnswlib moves 3I's ≥0.95 QPS by +1.8% (gd=32) and +7.1% (gd=64), and its ≥0.99 QPS by
+hnswlib moves `pgcuvs_hnsw_import`'s ≥0.95 QPS by +1.8% (gd=32) and +7.1% (gd=64), and its ≥0.99 QPS by
 −5.6% and +3.5% — small, and inconsistent in sign. Not the meaningful shift the
 criterion required.
 
-**Construction knob — bounded at ≈0, not merely unmeasured.** 3I's export
+**Construction knob — bounded at ≈0, not merely unmeasured.** `pgcuvs_hnsw_import`'s export
 `efConstruction` is auto-filled `M0*2` and informational (`hnsw_export.c:1620`), so it
 has no matching knob; the plan therefore used pgvector's own `ef_construction` sweep as
 an *upper bound* on how much this confound could contribute. Doubling it made pgvector
@@ -496,7 +499,7 @@ said that if neither M nor hierarchy explained the gap, the main explanation wou
 "the serving path (code) difference". The code rules that out: `pg_cuvs_hnsw_handler`
 **borrows pgvector's `IndexAmRoutine` wholesale for the entire read path**, overriding
 only `ambuild` and `amoptions` (`src/hnsw_export.c:2094-2108`, design note at `:1882`).
-3I and `pgvector_hnsw` are scanned by *the same code*. With the serving path identical,
+`pgcuvs_hnsw_import` and `pgvector_hnsw` are scanned by *the same code*. With the serving path identical,
 M matched by construction, hierarchy near-neutral and the construction knob bounded at
 zero, the residual is **graph quality at equal M** — the GPU-built CAGRA graph, converted
 to pgvector's on-disk format, is searched 1.73× faster at recall ≥0.95 than the graph
@@ -546,7 +549,7 @@ It is not: N=1 → N=8 gains **2.75×** (562 → 1547 QPS), and only then does i
 (1510 / 1469 / 1474 at N=16/32/64) while p50 grows linearly (1.77 → 43.28 ms) — the
 signature of a queue in front of a fixed-rate server, not of a fully serialized one.
 Reported as measured; the flat-curve prediction was too strong. The operational reading
-is unchanged: **batch (3M) is pg_cuvs's throughput mechanism**, and these rows are the
+is unchanged: **batch search is pg_cuvs's throughput mechanism**, and these rows are the
 evidence for why. This is a statement about the current implementation, not about CAGRA.
 
 Fallback-counter deltas are **0 on all ten conc rows**, so no arm was quietly absorbed
@@ -614,8 +617,8 @@ segment (online RAG, multi-tenant), not raw scale.
 
 ## 3. Historical multi-tenant filtered search sweep — pre-#80
 
-This is the original filtered brute-force sweep (D-wedge post-filter + 3O BITSET
-pre-filter), recorded before #80 changed the D-wedge overfetch behavior. It is retained
+This is the original filtered brute-force sweep (D-wedge post-filter + GPU BITSET
+pre-filter, ADR-048), recorded before #80 changed the D-wedge overfetch behavior. It is retained
 as historical evidence; it is not a current default or release gate.
 N=200K × 128, uniform random, k=10, overfetch=4, 5 reps/cell.
 Full table: [`docs/experiments/filter-threshold-experiment.md`](docs/experiments/filter-threshold-experiment.md).
@@ -645,11 +648,11 @@ Full table: [`docs/experiments/filter-threshold-experiment.md`](docs/experiments
 
 - #80's selectivity-scaled overfetch makes the D-wedge exact on the measured
   uncorrelated sweep; the pre-#80 recall table above must not be used as current behavior.
-- The current `cuvs.filter_auto_threshold=0.0` keeps 3O opt-in. The current stream default
+- The current `cuvs.filter_auto_threshold=0.0` keeps the BITSET pre-filter opt-in. The current stream default
   is `cuvs.stream_bf_selectivity_threshold=0.004` on the canonical host, not a universal
   hardware-independent crossover; the second-host measurement moved it below `0.002`
   ([replication report](docs/reports/2026-08-04-item2b-second-host-replication.md)).
-- The correlation axis remains unverified for #88. Do not generalize 3O routing beyond the
+- The correlation axis remains unverified for #88. Do not generalize pre-filter routing beyond the
   measured fixtures until that issue is closed with evidence.
 
 ---
@@ -672,7 +675,7 @@ Full table: [`docs/experiments/filter-threshold-experiment.md`](docs/experiments
   (§1.1) caps single-GPU throughput; multi-GPU sharding raises it but adds merge latency
   (recall +13%, latency +70% at shard_count=2 on 100K).
 - **pg_cuvs is not a WAL-logged mutable native index** — comparisons assume a
-  static/batch-built index. Streaming writes go through `cuvsCagraExtend` (3Q) or the
+  static/batch-built index. Streaming writes go through `cuvsCagraExtend` or the
   `.delta` path, characterized separately ([profiling §10](docs/experiments/profiling-results.md)).
 - **`pg_stat_gpu_search.p50` is a log2 bucket** — for engine-to-engine latency we use
   client-side `\timing` / `avg_latency_us`, not the bucketed percentile.
@@ -743,9 +746,9 @@ complete result set.
 | pgvector HNSW | 0.9891 | 45 | 22 ms | ef_search=400 | — |
 | pgvector HNSW | 0.9392 | 130 | 7.6 ms | ef_search=80 | — |
 | pgvector IVFFlat | 0.9766 | 8.6 | 115 ms | probes=128 | — |
-| pg_cuvs `build_hnsw` (3I) | 0.9993 | 16.9 | 61 ms | ef=512 | — |
+| pg_cuvs `build_hnsw` (HNSW export path) | 0.9993 | 16.9 | 61 ms | ef=512 | — |
 
-Build (1M × 1024): pgvector HNSW native **285 s** vs CAGRA build + `build_hnsw` (3I)
+Build (1M × 1024): pgvector HNSW native **285 s** vs CAGRA build + `build_hnsw`
 **142 s** (cagra_build 84.8 s + import 57.1 s). The build figures do not depend on the
 k-wiring defect, but the canonical build comparison is §2.1a (identical output
 artifact, measured end-to-end).
