@@ -48,6 +48,7 @@
 #include "catalog/index.h"       /* index_create, INDEX_CREATE_SKIP_BUILD, BuildIndexInfo */
 #include "catalog/pg_am.h"        /* AMOID, Form_pg_am */
 #include "commands/defrem.h"     /* get_am_oid */
+#include "portability/instr_time.h" /* #161 §0a export phase timing */
 #include "commands/extension.h"  /* get_extension_oid */
 #include "access/amapi.h"        /* IndexAmRoutine, makeNode(T_IndexAmRoutine) */
 #include "access/reloptions.h"   /* relopt_kind, add_*_reloption, build_reloptions */
@@ -161,6 +162,34 @@ typedef struct {
 
 /* MAXALIGN to 8 bytes (standard on x86-64 LP64) */
 #define MAXALIGN8(n)  (((n) + 7) & ~7)
+
+/* ----------------------------------------------------------------
+ * #161 §0a — export phase timing (temporary instrumentation)
+ *
+ * Splits the export segment into prep / layout / write so the 25.6s (nsw) and
+ * 36.9s (hnswlib) measured in #98 can be attributed. File-scope storage keeps
+ * the boundary marks out of the function preambles (-Wdeclaration-after-statement).
+ * The write loop of the hnswlib path streams vectors from the shm file, so its
+ * per-element read time is accumulated separately and subtracted.
+ *
+ * Self-check: (write - read_acc) must agree between the two modes -- both run
+ * the same write_elem_page loop. A mismatch means the instrumentation or the
+ * attribution is wrong.
+ * ---------------------------------------------------------------- */
+static instr_time hx_t_start;
+static instr_time hx_t_prep;
+static instr_time hx_t_layout;
+static instr_time hx_t_write;
+static double     hx_read_ms;      /* accumulated vector-read ms (hnswlib only) */
+
+static double
+hx_elapsed_ms(instr_time start, instr_time end)
+{
+    instr_time diff = end;
+
+    INSTR_TIME_SUBTRACT(diff, start);
+    return INSTR_TIME_GET_MILLISEC(diff);
+}
 
 /* Vector varlena header: 4 bytes vl_len_ + 2 bytes dim + 2 bytes unused */
 #define PGV_VEC_HEADER_SIZE     8
@@ -558,6 +587,8 @@ static void
 fill_hnsw_from_hnswlib_impl(Oid cagra_oid, Oid hnsw_oid, bool use_shm,
                             HnswFillRes *res)
 {
+    INSTR_TIME_SET_CURRENT(hx_t_start);     /* #161 §0a */
+    hx_read_ms = 0.0;
 
     /* ---- 0. pgvector compatibility check ---- */
     /* pg_cuvs_import_hnsw is pinned to pgvector HNSW_VERSION=1 (stable since
@@ -985,6 +1016,8 @@ fill_hnsw_from_hnswlib_impl(Oid cagra_oid, Oid hnsw_oid, bool use_shm,
     free(tids);
     res->tids = NULL;
 
+    INSTR_TIME_SET_CURRENT(hx_t_prep);      /* #161 §0a: shm serialize + parse done */
+
     /* ---- 8. Layout pass: assign (blkno, offno) to each element ---- */
     /*
      * One page per element (elem tuple at offno=1, neigh tuple at offno=2).
@@ -1013,6 +1046,8 @@ fill_hnsw_from_hnswlib_impl(Oid cagra_oid, Oid hnsw_oid, bool use_shm,
                             "(dim=%d, maxlevel=%d, M=%d)",
                             needed, PGV_USABLE_BYTES, dim, max_level_seen, M)));
     }
+
+    INSTR_TIME_SET_CURRENT(hx_t_layout);    /* #161 §0a: layout pass done */
 
     /* ---- 9. Re-open .hnsw to read vectors sequentially ---- */
     hf = fopen(hnsw_path, "rb");
@@ -1133,6 +1168,10 @@ fill_hnsw_from_hnswlib_impl(Oid cagra_oid, Oid hnsw_oid, bool use_shm,
                          + (long)hdr.offsetLevel0
                          + (long)(i * hdr.sizeDataPerElement)
                          + (long)hdr.offsetData;
+        instr_time rd_start;                /* #161 §0a */
+        instr_time rd_end;
+
+        INSTR_TIME_SET_CURRENT(rd_start);
         if (fseek(hf, elem_offset, SEEK_SET) != 0)
         {
             ereport(ERROR,
@@ -1145,6 +1184,8 @@ fill_hnsw_from_hnswlib_impl(Oid cagra_oid, Oid hnsw_oid, bool use_shm,
             ereport(ERROR,
                     (errmsg("pg_cuvs: short read on vector for element %zu", i)));
         }
+        INSTR_TIME_SET_CURRENT(rd_end);
+        hx_read_ms += hx_elapsed_ms(rd_start, rd_end);
 
         write_elem_page(hnsw_rel,
                         elems[i].elem_blkno,
@@ -1157,6 +1198,19 @@ fill_hnsw_from_hnswlib_impl(Oid cagra_oid, Oid hnsw_oid, bool use_shm,
 
     pfree(vec_buf);
     /* hf / elems are released by the PG_FINALLY in fill_hnsw_from_hnswlib(). */
+
+    INSTR_TIME_SET_CURRENT(hx_t_write);     /* #161 §0a */
+    ereport(LOG,
+            (errmsg("pg_cuvs: [#161-0a] mode=%s N=%zu dim=%d M=%d "
+                    "prep=%.0fms layout=%.0fms write=%.0fms "
+                    "(read=%.0fms write_only=%.0fms) total=%.0fms",
+                    use_shm ? "hnswlib" : "hnswlib_file", N, dim, M,
+                    hx_elapsed_ms(hx_t_start,  hx_t_prep),
+                    hx_elapsed_ms(hx_t_prep,   hx_t_layout),
+                    hx_elapsed_ms(hx_t_layout, hx_t_write),
+                    hx_read_ms,
+                    hx_elapsed_ms(hx_t_layout, hx_t_write) - hx_read_ms,
+                    hx_elapsed_ms(hx_t_start,  hx_t_write))));
 
     index_close(hnsw_rel, AccessExclusiveLock);
 
@@ -1288,6 +1342,9 @@ fill_hnsw_from_cagra_ipc_impl(Oid cagra_oid, Oid hnsw_oid, const char *mode,
                               HnswFillRes *res)
 {
     bool do_hierarchy = (strcmp(mode, "hnsw") == 0);
+
+    INSTR_TIME_SET_CURRENT(hx_t_start);     /* #161 §0a */
+    hx_read_ms = 0.0;                       /* no intermediate file on this path */
 
     /* ---- 0. pgvector compatibility check ---- */
     {
@@ -1562,6 +1619,8 @@ fill_hnsw_from_cagra_ipc_impl(Oid cagra_oid, Oid hnsw_oid, const char *mode,
     free(tids);
     res->tids = NULL;
 
+    INSTR_TIME_SET_CURRENT(hx_t_prep);      /* #161 §0a: IPC recv + level assign done */
+
     /* ---- 4. Layout pass ---- */
     for (size_t i = 0; i < N; i++)
     {
@@ -1585,6 +1644,8 @@ fill_hnsw_from_cagra_ipc_impl(Oid cagra_oid, Oid hnsw_oid, const char *mode,
                             ipc_dim, M, max_level, needed, PGV_USABLE_BYTES)));
         }
     }
+
+    INSTR_TIME_SET_CURRENT(hx_t_layout);    /* #161 §0a: layout pass done */
 
     /* ---- 5. Open target HNSW with AccessExclusiveLock and truncate ---- */
     Relation hnsw_rel = index_open(hnsw_oid, AccessExclusiveLock);
@@ -1658,6 +1719,19 @@ fill_hnsw_from_cagra_ipc_impl(Oid cagra_oid, Oid hnsw_oid, const char *mode,
     }
 
     /* vecs / elems are released by the PG_FINALLY in fill_hnsw_from_cagra_ipc(). */
+
+    INSTR_TIME_SET_CURRENT(hx_t_write);     /* #161 §0a */
+    ereport(LOG,
+            (errmsg("pg_cuvs: [#161-0a] mode=%s N=%zu dim=%d M=%d "
+                    "prep=%.0fms layout=%.0fms write=%.0fms "
+                    "(read=%.0fms write_only=%.0fms) total=%.0fms",
+                    mode, N, ipc_dim, M,
+                    hx_elapsed_ms(hx_t_start,  hx_t_prep),
+                    hx_elapsed_ms(hx_t_prep,   hx_t_layout),
+                    hx_elapsed_ms(hx_t_layout, hx_t_write),
+                    hx_read_ms,
+                    hx_elapsed_ms(hx_t_layout, hx_t_write) - hx_read_ms,
+                    hx_elapsed_ms(hx_t_start,  hx_t_write))));
 
     index_close(hnsw_rel, AccessExclusiveLock);
 
