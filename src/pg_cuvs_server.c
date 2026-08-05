@@ -6378,7 +6378,7 @@ handle_export_hnsw_shm(int client_fd, const CuvsCmdFrame *cmd)
      * No fallback to the old path scheme: it is the vulnerability. memfd_create
      * is Linux 3.17+ and already required by the ADR-057 build corpus.
      */
-    int mfd = memfd_create("pg_cuvs_hnsw", MFD_CLOEXEC);
+    int mfd = memfd_create("pg_cuvs_hnsw", MFD_CLOEXEC | MFD_ALLOW_SEALING);
     if (mfd < 0)
     {
         LOG_ERROR("[handle_export_hnsw_shm] memfd_create failed errno=%d\n", errno);
@@ -6408,7 +6408,31 @@ handle_export_hnsw_shm(int client_fd, const CuvsCmdFrame *cmd)
         return;
     }
 
-    LOG_INFO("[handle_export_hnsw_shm] %u/%u → memfd (fd-passed)\n", db, idx);
+    /*
+     * Seal the sidecar read-only before it leaves this process.
+     *
+     * memfd_create returns an O_RDWR description, and SCM_RIGHTS hands the
+     * receiver that same description — so without this the PG backend (a
+     * different uid) would gain write access the previous scheme never gave
+     * it: the old code passed a descriptor from open(path, O_RDONLY). Sealing
+     * is stronger than restoring O_RDONLY, because it makes the bytes
+     * immutable for *every* holder rather than for one descriptor, so neither
+     * side can mutate the buffer between the importer's two read passes.
+     *
+     * F_SEAL_WRITE can only fail with EBUSY if a writable mapping exists; the
+     * serializers write through stdio/ofstream, never mmap. Treat a failure as
+     * fatal rather than shipping a writable descriptor.
+     */
+    if (fcntl(mfd, F_ADD_SEALS,
+              F_SEAL_WRITE | F_SEAL_GROW | F_SEAL_SHRINK | F_SEAL_SEAL) != 0)
+    {
+        LOG_ERROR("[handle_export_hnsw_shm] F_ADD_SEALS failed errno=%d\n", errno);
+        close(mfd);
+        send_error(client_fd, "cannot seal hnsw sidecar");
+        return;
+    }
+
+    LOG_INFO("[handle_export_hnsw_shm] %u/%u → memfd (sealed, fd-passed)\n", db, idx);
 
     /*
      * #165: hand the serialized sidecar over as an SCM_RIGHTS fd. There is no
