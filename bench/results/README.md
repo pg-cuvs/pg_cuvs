@@ -28,7 +28,7 @@ file exists so a link that lands directly on a CSV does not lose the context.
 | `pg_cuvsbench_1m_legacy.csv` | 2026-07-16 | cuvs-bench (pg backend), ext 0.5.0 | Cohere wiki-en, 1M×1024 | A100-40GB | **legacy** (superseded by wiki_all_1M canonical rows above; `index_bytes=0` defect, fixed in code by #75/#79 — see below) |
 | `cohere_N1000000_summary.csv`, `.jsonl` | 2026-06-01 | anbench `run_cohere.sh` | Cohere wiki-en, 1M×1024 | A100-SXM4-40GB | **superseded + known defect** — see below |
 | `gpu_resources_bench.csv` | 2026-06-01 | `bench/legacy/test_gpu_resources.py` | synthetic 100K×384 | A100 | VRAM budget / shard / fanout matrix — not re-audited |
-| `hnsw_import_bench.csv` | 2026-06-01 | 3I import harness | synthetic | A100 | CAGRA→HNSW import speedup — not re-audited |
+| `hnsw_import_bench.csv` | 2026-06-01 | HNSW export/import harness | synthetic | A100 | CAGRA→HNSW import speedup — not re-audited |
 | `adr083_133_anti_after_fix.csv` | 2026-08-04 | `bench/filter_recall/adr079_3o_recall.py --correlations anti` | wiki_all_1M | Brev A100-SXM4-80GB | superseded by `_after_review_fixes` (pre-F1/F2/F3/F5 review round) |
 | `adr083_133_anti_after_review_fixes.csv` | 2026-08-04 | `bench/filter_recall/adr079_3o_recall.py --correlations anti` | wiki_all_1M | Brev A100-SXM4-80GB | **canonical** — #133/ADR-083 fix verification at the final commit (after the F1/F2/F3/F5 adversarial-review fixes): 3O recall 0.998/0.999 vs 0.0 before (`adr079_3o_correlation.csv`/`_hisel.csv`, same harness/host) |
 | `pg_cuvsbench_98.csv` | 2026-08-05 | cuvs-bench (pg backend), 2-phase #98 harness | wiki_all_1M, 1M×768 | **massedcompute_A100_sxm4_80G_DGX** (Brev `pg-cuvs-item2b`) | **canonical** — the two-axis build-parameter sweep (#98). See below |
@@ -44,7 +44,8 @@ file exists so a link that lands directly on a CSV does not lose the context.
 They answer different questions on the same dataset. The Brev file is a *fixed-config
 cross-machine reproduction*: one build config per algo, run to show that the RunPod
 numbers reproduce on a second host. This file is a *sweep*: four algos over a build
-grid (pgvector `m`×`ef_construction`, CAGRA/raw `graph_degree`, 3I `mode`×`graph_degree`),
+grid (pgvector `m`×`ef_construction`, CAGRA/raw `graph_degree`,
+`pgcuvs_hnsw_import` `mode`×`graph_degree`),
 plus a throughput axis the older file has no rows for at all. Neither file's rows can
 replace the other's, and they were taken on different hosts.
 

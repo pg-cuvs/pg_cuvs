@@ -19,7 +19,7 @@ This backend exposes:
 | `pgvector_hnsw` | pgvector CPU HNSW | `CREATE INDEX … USING hnsw` (m=16, ef_construction=64) | `hnsw.ef_search` |
 | `pgvector_ivfflat` | pgvector CPU IVFFlat | `CREATE INDEX … USING ivfflat` (lists=4√N) | `ivfflat.probes` |
 | `pgcuvs_cagra` | pg_cuvs GPU CAGRA (resident) | `CREATE INDEX … USING cagra` | `cuvs.k` (GPU candidate list) |
-| `pgcuvs_hnsw_import` | pg_cuvs 3I: GPU CAGRA build → pgvector HNSW export | CAGRA build + `pg_cuvs_build_hnsw(cagra,'nsw')` | `hnsw.ef_search` (CPU search) |
+| `pgcuvs_hnsw_import` | pg_cuvs HNSW export path: GPU CAGRA build → pgvector HNSW export | CAGRA build + `pg_cuvs_build_hnsw(cagra,'nsw')` | `hnsw.ef_search` (CPU search) |
 | `cuvs` | **raw cuVS CAGRA — no PostgreSQL** (`cuvs_engine.py`) | `cagra.build()` in-process, on the GPU | GPU candidate count (same values as `cuvs.k`) |
 
 `cuvs` is the odd one out and is meant to be: it runs no SQL, holds its index in
@@ -169,7 +169,8 @@ python bench/cuvs_bench_backend/run_pg_cuvsbench.py \
 ```
 
 Requires the pg_cuvs extension at **0.5.0** (a fresh `CREATE EXTENSION pg_cuvs`,
-or `ALTER EXTENSION pg_cuvs UPDATE TO '0.5.0'` on an older database): the 3I algo
+or `ALTER EXTENSION pg_cuvs UPDATE TO '0.5.0'` on an older database): the
+`pgcuvs_hnsw_import` algo
 calls the unified `pg_cuvs_build_hnsw(cagra, 'nsw')` (the older two-step
 `pg_cuvs_import_hnsw(cagra, hnsw)` was removed). The gt is read as a big-ann
 `.ibin`; the loader converts `gt_<n>.npy` → `gt_<n>_q<nq>.ibin` sliced to the
