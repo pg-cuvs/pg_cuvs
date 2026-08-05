@@ -6229,6 +6229,18 @@ handle_export_adjacency(int client_fd, const CuvsCmdFrame *cmd)
                  (int)getpid(), __atomic_fetch_add(&adj_seq, 1, __ATOMIC_RELAXED), hex);
     }
 
+    /*
+     * #165: the segment is handed over as an SCM_RIGHTS fd, and its name is
+     * unlinked before the reply is sent — so no /dev/shm entry outlives this
+     * call. The previous design left the name for the backend to shm_unlink(),
+     * which cannot work: /dev/shm is sticky (drwxrwxrwt) and the daemon (its
+     * owner) and the PG backend run as different uids, so that unlink failed
+     * with EPERM and the segments accumulated until tmpfs was exhausted and
+     * the next mmap write took down the cluster with SIGBUS.
+     *
+     * Two descriptors: RDWR to fill the segment here, RDONLY to hand out, so
+     * the consumer keeps the read-only access it had under the named scheme.
+     */
     int shm_fd = shm_open(shm_key, O_CREAT | O_EXCL | O_RDWR, 0644);
     if (shm_fd < 0)
     {
@@ -6236,20 +6248,26 @@ handle_export_adjacency(int client_fd, const CuvsCmdFrame *cmd)
         send_error(client_fd, "shm_open failed for export");
         return;
     }
-    /* umask may be stricter than 0644; the PG backend (other uid) must read
-     * this reply, so guarantee the mode explicitly (#87). */
-    fchmod(shm_fd, 0644);
     if (ftruncate(shm_fd, (off_t)total) != 0)
     {
         close(shm_fd); shm_unlink(shm_key); free(adj); free(vecs);
         send_error(client_fd, "ftruncate failed for export");
         return;
     }
+    int pass_fd = shm_open(shm_key, O_RDONLY, 0);
+    if (pass_fd < 0)
+    {
+        close(shm_fd); shm_unlink(shm_key); free(adj); free(vecs);
+        send_error(client_fd, "shm_open(RDONLY) failed for export");
+        return;
+    }
+    /* Name is no longer needed by anyone: both fds stay valid without it. */
+    shm_unlink(shm_key);
     void *mem = mmap(NULL, total, PROT_WRITE, MAP_SHARED, shm_fd, 0);
     close(shm_fd);
     if (mem == MAP_FAILED)
     {
-        shm_unlink(shm_key); free(adj); free(vecs);
+        close(pass_fd); free(adj); free(vecs);
         send_error(client_fd, "mmap failed for export");
         return;
     }
@@ -6270,17 +6288,21 @@ handle_export_adjacency(int client_fd, const CuvsCmdFrame *cmd)
     free(adj);
     free(vecs);
 
-    LOG_INFO("[handle_export_adjacency] %u/%u N=%zu D=%d dim=%u shm=%s\n",
+    LOG_INFO("[handle_export_adjacency] %u/%u N=%zu D=%d dim=%u fd-passed (was %s)\n",
              db, idx, n_vecs, graph_degree, dim, shm_key);
 
-    /* Reply: encode n_vecs/graph_degree/dim in header fields; shm_key in error[] */
+    /* Reply: n_vecs/graph_degree/dim in header fields; the segment itself rides
+     * along as an SCM_RIGHTS fd (#165). error[] carries the former name for log
+     * correlation only — the backend must not open by name (it is unlinked). */
     CuvsReplyHeader reply = {0};
     reply.status       = CUVS_STATUS_OK;
     reply.n_results    = (uint32_t)n_vecs;
     reply.latency_us   = (uint32_t)graph_degree;
     reply.delta_merged = (uint32_t)dim;
     strncpy(reply.error, shm_key, sizeof(reply.error) - 1);
-    send_all(client_fd, &reply, sizeof(reply));
+    if (cuvs_fd_send(client_fd, pass_fd, &reply, sizeof(reply)) != 0)
+        LOG_ERROR("[handle_export_adjacency] fd handoff failed for %u/%u\n", db, idx);
+    close(pass_fd);
     (void)n_vecs_i;
 }
 
