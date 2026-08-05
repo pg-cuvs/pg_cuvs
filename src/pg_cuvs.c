@@ -369,6 +369,12 @@ cuvs_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
  * regardless of its session GUC. Mirrors the pg_cuvs_hnsw reloptions machinery
  * (hnsw_export.c). The option is build-time-immutable -> AccessExclusiveLock.
  * ---------------------------------------------------------------- */
+/* LAYOUT CONTRACT: index_dir_offset MUST be the first field after vl_len_ in
+ * EVERY AM options struct that cuvs_reloption_index_dir() can be handed —
+ * cagra, flat, ivfpq — because that reader casts any AM's rd_options to
+ * CuvsCagraOptions. #151: CuvsIvfPqOptions once put n_lists there, so an
+ * `n_lists` value was read as a string offset and every WITH-clause ivfpq index
+ * resolved a garbage artifact directory. */
 typedef struct CuvsCagraOptions
 {
     int32 vl_len_;          /* varlena header — do not access directly */
@@ -438,10 +444,12 @@ cuvs_cagra_amoptions(Datum reloptions, bool validate)
 }
 
 /* ----------------------------------------------------------------
- * 3P: IVF-PQ index reloptions — WITH (n_lists, pq_bits, pq_dim)
+ * 3P: IVF-PQ index reloptions — WITH (index_dir, n_lists, pq_bits, pq_dim)
  * ---------------------------------------------------------------- */
 typedef struct {
     int32  vl_len_;     /* varlena header, DO NOT TOUCH */
+    int    index_dir_offset; /* relopt string offset; 0 = absent (LAYOUT-COMPATIBLE
+                              * with CuvsCagraOptions: must stay first) */
     int    n_lists;     /* IVF cluster count; 0 = auto → 1024 */
     int    pq_bits;     /* PQ bits per code; 0 = auto → 8 */
     int    pq_dim;      /* PQ subspace count; 0 = auto → ceil(dim/2) */
@@ -453,6 +461,10 @@ static void
 cuvs_ivfpq_init_reloptions(void)
 {
     cuvs_ivfpq_relopt_kind = add_reloption_kind();
+    add_string_reloption(cuvs_ivfpq_relopt_kind, "index_dir",
+                         "Directory holding this IVF-PQ index's artifacts "
+                         "(overrides cuvs.index_dir for this index).",
+                         "", NULL, AccessExclusiveLock);
     add_int_reloption(cuvs_ivfpq_relopt_kind, "n_lists",
                       "IVF cluster count (0 = auto → 1024).",
                       1024, 1, 65536, AccessExclusiveLock);
@@ -468,6 +480,8 @@ static bytea *
 cuvs_ivfpq_amoptions(Datum reloptions, bool validate)
 {
     static const relopt_parse_elt tab[] = {
+        {"index_dir", RELOPT_TYPE_STRING,
+         offsetof(CuvsIvfPqOptions, index_dir_offset)},
         {"n_lists", RELOPT_TYPE_INT, offsetof(CuvsIvfPqOptions, n_lists)},
         {"pq_bits", RELOPT_TYPE_INT, offsetof(CuvsIvfPqOptions, pq_bits)},
         {"pq_dim",  RELOPT_TYPE_INT, offsetof(CuvsIvfPqOptions, pq_dim)},
@@ -726,7 +740,7 @@ _PG_init(void)
     /* ADR-045: register CAGRA WITH(index_dir) reloption. */
     cuvs_cagra_init_reloptions();
 
-    /* 3P: register ivfpq WITH(n_lists, pq_bits, pq_dim) reloptions. */
+    /* 3P: register ivfpq WITH(index_dir, n_lists, pq_bits, pq_dim) reloptions. */
     cuvs_ivfpq_init_reloptions();
 
     /* ADR-073: register flat WITH(index_dir, precision) reloptions. */
@@ -1226,7 +1240,9 @@ get_index_dir(void)
 
 /* Read the index_dir reloption from an open index relation's parsed rd_options.
  * Returns the stored directory, or NULL when the option is absent. The pointer
- * is valid only while indexRel is open. */
+ * is valid only while indexRel is open. indexRel may belong to ANY of the AMs
+ * that register an index_dir reloption — see the LAYOUT CONTRACT above
+ * CuvsCagraOptions, which is what makes this unconditional cast sound. */
 static const char *
 cuvs_reloption_index_dir(Relation indexRel)
 {
@@ -4444,7 +4460,7 @@ ivfpq_ambuild(Relation heapRel, Relation indexRel, IndexInfo *indexInfo)
                 bs.n_vecs,
                 bs.dim,
                 bs.metric,
-                get_index_dir(),
+                cuvs_resolve_index_dir_rel(indexRel),
                 table_oid,
                 relfilenode,
                 n_lists, pq_bits, pq_dim);
