@@ -551,7 +551,11 @@ int cuvs_ipc_build_multi(
 /*
  * cuvs_ipc_export_hnsw_shm — Phase 3J: run from_cagra() on the loaded CAGRA
  * index and serialize the resulting multi-level HNSW to /dev/shm (no disk I/O).
- * The path is returned in shm_path_out (caller must unlink after reading).
+ * #165: the sidecar is handed over as an SCM_RIGHTS fd with its /dev/shm name
+ * already unlinked daemon-side — there is nothing for the caller to unlink, and
+ * the caller could not have done so anyway (different uid, sticky /dev/shm).
+ * shm_path_out receives a "/proc/self/fd/N" path that stays openable as long as
+ * *fd_out is held; the caller MUST close(*fd_out) when done reading.
  * Returns CUVS_STATUS_OK on success, NOT_FOUND if index not loaded.
  */
 int cuvs_ipc_export_hnsw_shm(
@@ -559,7 +563,8 @@ int cuvs_ipc_export_hnsw_shm(
     uint32_t    db_oid,
     uint32_t    index_oid,
     char       *shm_path_out,  /* caller-allocated, at least 128 chars */
-    size_t      shm_path_len
+    size_t      shm_path_len,
+    int        *fd_out         /* receives the passed fd; caller closes */
 );
 
 int cuvs_ipc_export_adjacency(

@@ -6227,12 +6227,31 @@ handle_export_hnsw_shm(int client_fd, const CuvsCmdFrame *cmd)
         return;
     }
 
-    LOG_INFO("[handle_export_hnsw_shm] %u/%u → %s\n", db, idx, shm_path);
+    LOG_INFO("[handle_export_hnsw_shm] %u/%u → %s (fd-passed)\n", db, idx, shm_path);
+
+    /*
+     * #165: hand the serialized sidecar over as an SCM_RIGHTS fd and unlink the
+     * path here. Unlike the adjacency/batch-reply segments this is a plain file
+     * in tmpfs (cuvs_hnsw_serialize writes by path), but the leak is identical:
+     * the PG backend runs as a different uid and cannot unlink a daemon-owned
+     * file from sticky /dev/shm. The consumer reads it through /proc/self/fd/N.
+     */
+    int pass_fd = open(shm_path, O_RDONLY);
+    if (pass_fd < 0)
+    {
+        unlink(shm_path);
+        send_error(client_fd, "cannot reopen serialized hnsw sidecar");
+        return;
+    }
+    unlink(shm_path);          /* name gone; the passed fd keeps the inode alive */
 
     CuvsReplyHeader reply = {0};
     reply.status = CUVS_STATUS_OK;
+    /* error[] carries the former path for log correlation only (#165). */
     strncpy(reply.error, shm_path, sizeof(reply.error) - 1);
-    send_all(client_fd, &reply, sizeof(reply));
+    if (cuvs_fd_send(client_fd, pass_fd, &reply, sizeof(reply)) != 0)
+        LOG_ERROR("[handle_export_hnsw_shm] fd handoff failed for %u/%u\n", db, idx);
+    close(pass_fd);
 }
 
 /* ----------------------------------------------------------------
