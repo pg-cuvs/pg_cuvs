@@ -343,7 +343,7 @@ The §2.1a sweep was re-run through the same cuvs-bench Postgres backend on
 
 | axis | RunPod → Brev | portable? |
 |------|---------------|-----------|
-| `index_bytes` (all 3 algos) | **byte-identical** (`3328000000` cagra, `4093870080` pgvector, `8192008192` `pgcuvs_hnsw_import` — internal phase 3I) | **yes — deterministic** |
+| `index_bytes` (all 3 algos) | **byte-identical** (`3328000000` cagra, `4093870080` pgvector, `8192008192` `pgcuvs_hnsw_import`) | **yes — deterministic** |
 <!-- The cagra constant above is the gd=64 cell, which is the only one these two
      fixed-config files built. #98 swept graph_degree and confirms the quantity is
      deterministic but not a single constant: 3200000000 (gd=32) / 3328000000 (gd=64) /
@@ -549,7 +549,7 @@ It is not: N=1 → N=8 gains **2.75×** (562 → 1547 QPS), and only then does i
 (1510 / 1469 / 1474 at N=16/32/64) while p50 grows linearly (1.77 → 43.28 ms) — the
 signature of a queue in front of a fixed-rate server, not of a fully serialized one.
 Reported as measured; the flat-curve prediction was too strong. The operational reading
-is unchanged: **batch (3M) is pg_cuvs's throughput mechanism**, and these rows are the
+is unchanged: **batch search is pg_cuvs's throughput mechanism**, and these rows are the
 evidence for why. This is a statement about the current implementation, not about CAGRA.
 
 Fallback-counter deltas are **0 on all ten conc rows**, so no arm was quietly absorbed
@@ -617,8 +617,8 @@ segment (online RAG, multi-tenant), not raw scale.
 
 ## 3. Historical multi-tenant filtered search sweep — pre-#80
 
-This is the original filtered brute-force sweep (D-wedge post-filter + 3O BITSET
-pre-filter), recorded before #80 changed the D-wedge overfetch behavior. It is retained
+This is the original filtered brute-force sweep (D-wedge post-filter + GPU BITSET
+pre-filter, ADR-048), recorded before #80 changed the D-wedge overfetch behavior. It is retained
 as historical evidence; it is not a current default or release gate.
 N=200K × 128, uniform random, k=10, overfetch=4, 5 reps/cell.
 Full table: [`docs/experiments/filter-threshold-experiment.md`](docs/experiments/filter-threshold-experiment.md).
@@ -648,11 +648,11 @@ Full table: [`docs/experiments/filter-threshold-experiment.md`](docs/experiments
 
 - #80's selectivity-scaled overfetch makes the D-wedge exact on the measured
   uncorrelated sweep; the pre-#80 recall table above must not be used as current behavior.
-- The current `cuvs.filter_auto_threshold=0.0` keeps 3O opt-in. The current stream default
+- The current `cuvs.filter_auto_threshold=0.0` keeps the BITSET pre-filter opt-in. The current stream default
   is `cuvs.stream_bf_selectivity_threshold=0.004` on the canonical host, not a universal
   hardware-independent crossover; the second-host measurement moved it below `0.002`
   ([replication report](docs/reports/2026-08-04-item2b-second-host-replication.md)).
-- The correlation axis remains unverified for #88. Do not generalize 3O routing beyond the
+- The correlation axis remains unverified for #88. Do not generalize pre-filter routing beyond the
   measured fixtures until that issue is closed with evidence.
 
 ---
@@ -675,7 +675,7 @@ Full table: [`docs/experiments/filter-threshold-experiment.md`](docs/experiments
   (§1.1) caps single-GPU throughput; multi-GPU sharding raises it but adds merge latency
   (recall +13%, latency +70% at shard_count=2 on 100K).
 - **pg_cuvs is not a WAL-logged mutable native index** — comparisons assume a
-  static/batch-built index. Streaming writes go through `cuvsCagraExtend` (3Q) or the
+  static/batch-built index. Streaming writes go through `cuvsCagraExtend` or the
   `.delta` path, characterized separately ([profiling §10](docs/experiments/profiling-results.md)).
 - **`pg_stat_gpu_search.p50` is a log2 bucket** — for engine-to-engine latency we use
   client-side `\timing` / `avg_latency_us`, not the bucketed percentile.

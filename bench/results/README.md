@@ -21,7 +21,7 @@ file exists so a link that lands directly on a CSV does not lose the context.
 | `pg_cuvsbench_wiki1m_brev.csv` | 2026-07-23 | cuvs-bench (pg backend) | wiki_all_1M, 1M×768 | Brev A100-SXM4-80GB | **canonical** — cross-machine reproduction of the row above |
 | `adr079_3o_recall.csv` | 2026-07-23 | `bench/filter_recall/adr079_3o_recall.py` | wiki_all_1M | Brev A100-SXM4-80GB | superseded by `_after80` (pre-#80 D-wedge) |
 | `adr079_3o_recall_after80.csv` | 2026-07-23 | same | wiki_all_1M | Brev A100 | **canonical** — D-wedge after #80 |
-| `adr079_3o_recall_tail.csv` | 2026-07-24 | same | wiki_all_1M | Brev A100 | **canonical** — low-selectivity tail (3O collapse) |
+| `adr079_3o_recall_tail.csv` | 2026-07-24 | same | wiki_all_1M | Brev A100 | **canonical** — low-selectivity tail (pre-filter recall collapse) |
 | `adr079_3o_recall_crossover.csv` | 2026-07-24 | same | wiki_all_1M | Brev A100 | **canonical** — D-wedge/stream_bf crossover (~0.004) |
 | `adr079_3paths.csv` | 2026-07-24 | same | wiki_all_1M | Brev A100 | superseded by `_verified` |
 | `adr079_3paths_verified.csv` | 2026-07-24 | same | wiki_all_1M | Brev A100 | **canonical** — per-query route attribution |
@@ -30,9 +30,9 @@ file exists so a link that lands directly on a CSV does not lose the context.
 | `gpu_resources_bench.csv` | 2026-06-01 | `bench/legacy/test_gpu_resources.py` | synthetic 100K×384 | A100 | VRAM budget / shard / fanout matrix — not re-audited |
 | `hnsw_import_bench.csv` | 2026-06-01 | HNSW export/import harness | synthetic | A100 | CAGRA→HNSW import speedup — not re-audited |
 | `adr083_133_anti_after_fix.csv` | 2026-08-04 | `bench/filter_recall/adr079_3o_recall.py --correlations anti` | wiki_all_1M | Brev A100-SXM4-80GB | superseded by `_after_review_fixes` (pre-F1/F2/F3/F5 review round) |
-| `adr083_133_anti_after_review_fixes.csv` | 2026-08-04 | `bench/filter_recall/adr079_3o_recall.py --correlations anti` | wiki_all_1M | Brev A100-SXM4-80GB | **canonical** — #133/ADR-083 fix verification at the final commit (after the F1/F2/F3/F5 adversarial-review fixes): 3O recall 0.998/0.999 vs 0.0 before (`adr079_3o_correlation.csv`/`_hisel.csv`, same harness/host) |
+| `adr083_133_anti_after_review_fixes.csv` | 2026-08-04 | `bench/filter_recall/adr079_3o_recall.py --correlations anti` | wiki_all_1M | Brev A100-SXM4-80GB | **canonical** — #133/ADR-083 fix verification at the final commit (after the F1/F2/F3/F5 adversarial-review fixes): pre-filter recall 0.998/0.999 vs 0.0 before (`adr079_3o_correlation.csv`/`_hisel.csv`, same harness/host) |
 | `pg_cuvsbench_98.csv` | 2026-08-05 | cuvs-bench (pg backend), 2-phase #98 harness | wiki_all_1M, 1M×768 | **massedcompute_A100_sxm4_80G_DGX** (Brev `pg-cuvs-item2b`) | **canonical** — the two-axis build-parameter sweep (#98). See below |
-| `adr083_133_anti_per_query.csv` | 2026-08-04 | `bench/filter_recall/adr079_3o_recall.py --correlations anti --dump-per-query` | wiki_all_1M | Brev A100-SXM4-80GB | **canonical** — #133 review F7: per-query `returned` for every query behind `adr083_133_anti_after_review_fixes.csv`'s 3O rows. All 400 queries (200 x 2 selectivities) returned exactly k=10 -- not a bimodal mix that would indicate the guard under-triggers on some queries |
+| `adr083_133_anti_per_query.csv` | 2026-08-04 | `bench/filter_recall/adr079_3o_recall.py --correlations anti --dump-per-query` | wiki_all_1M | Brev A100-SXM4-80GB | **canonical** — #133 review F7: per-query `returned` for every query behind `adr083_133_anti_after_review_fixes.csv`'s pre-filter rows. All 400 queries (200 x 2 selectivities) returned exactly k=10 -- not a bimodal mix that would indicate the guard under-triggers on some queries |
 
 ## `pg_cuvsbench_98.csv` — the #98 two-axis run
 

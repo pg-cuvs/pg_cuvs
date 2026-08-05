@@ -78,7 +78,7 @@ If the GPU service dies, PostgreSQL **gracefully degrades** to CPU-based pgvecto
 | `USING ivfpq` | GPU VRAM (compressed) | Approximate NN, 10–100x VRAM savings vs cagra via product quantization |
 | `USING pg_cuvs_hnsw` (built from heap, or reuses a `USING cagra` source) | GPU build / CPU serve | Faster GPU-accelerated build (~2× vs pgvector on real embeddings, higher on synthetic), then served by pgvector HNSW on CPU |
 
-> **DiskANN/NVMe cold tier** (internal phase 3B): spike completed, no-go for now — cuVS PQFlash
+> **DiskANN/NVMe cold tier**: spike completed, no-go for now — cuVS PQFlash
 > API is unstable in cuVS 26.04 and DiskANN at 50M×384 timed out at 2 GB cache.
 > Revisit when demand for billion-scale is confirmed. See `design/spikes/3b-diskann-decision.md`.
 
@@ -97,8 +97,8 @@ Small tables route to CPU; large tables route to GPU automatically.
 | N < 10K, any dim | pgvector HNSW | IPC + daemon round-trip overhead exceeds GPU search benefit |
 | N 100K–10M, VRAM fits index | pg_cuvs CAGRA (GPU search) | Hot tier, low latency; crossover vs pgvector appears around N≈50K (synthetic clustered data; verify with your embedding distribution) |
 | Fast build/rebuild needed, CPU serving preferred | CAGRA build + `USING pg_cuvs_hnsw` | ~2× faster than pgvector native build on real embeddings (1M×1024, end-to-end); much higher on synthetic random data (1M×384, pgvector's HNSW worst case). Serves as standard pgvector HNSW afterward |
-| On-prem RAG, embedding GPU pool already available | Reuse GPU for batch index build via the GPU Build Accelerator — the HNSW export path (GPU CAGRA build → pgvector-servable HNSW), internal phase 3I | GPU pool not idle; online search stays on pgvector HNSW CPU path |
-| Larger-than-VRAM / billion-scale / NVMe cold tier | pgvectorscale DiskANN or VectorChord | the pg_cuvs DiskANN path (internal phase 3B) is a no-go in cuVS 26.04; revisit when demand is confirmed |
+| On-prem RAG, embedding GPU pool already available | Reuse GPU for batch index build via the GPU Build Accelerator — the HNSW export path (GPU CAGRA build → pgvector-servable HNSW) | GPU pool not idle; online search stays on pgvector HNSW CPU path |
+| Larger-than-VRAM / billion-scale / NVMe cold tier | pgvectorscale DiskANN or VectorChord | the pg_cuvs DiskANN path is a no-go in cuVS 26.04; revisit when demand is confirmed |
 | Multi-GPU horizontal scale | pg_cuvs CAGRA with `shard_count` | Recall improves with sharding; latency increases due to merge overhead |
 
 ## Feature Support
@@ -110,8 +110,8 @@ Small tables route to CPU; large tables route to GPU automatically.
 | GPU Build Accelerator (`USING pg_cuvs_hnsw`) | Production-tested | VM E2E, 1M×384, recall=1.0 |
 | Multi-GPU sharding (`shard_count`) | Production-tested | 2×A100, shard_count=1/2 |
 | MIG (Multi-Instance GPU) | Verified | No code change; `CUDA_VISIBLE_DEVICES=MIG-uuid` |
-| GCS snapshot restore | Production-tested | Snapshot/restore rollout (internal phase 3G) |
-| CPU HNSW fallback (`cuvs.cpu_hnsw_fallback`) | Production-tested | GPU Build Accelerator rollout (internal phase 3I-1) |
+| GCS snapshot restore | Production-tested | Snapshot/restore rollout |
+| CPU HNSW fallback (`cuvs.cpu_hnsw_fallback`) | Production-tested | GPU Build Accelerator rollout |
 | DiskANN / NVMe cold tier | Deferred (no-go) | cuVS 26.04 PQFlash API unstable; see `design/spikes/3b-diskann-decision.md` |
 
 ## Current Status
@@ -125,8 +125,8 @@ Implemented on GCP (NVIDIA A100-40GB × 2, PostgreSQL 16), VM E2E verified:
 - [x] Hardware-anchored cost model (ADR-075): the daemon probes the deployment's GPU/CPU/IPC at boot and the planner costs GPU vs seqscan in real units (`κ = cpu_operator_cost·cpu_dist_tput/dim`); falls back to the legacy `startup_cost=1000` constants when unprobed or `cuvs.enable_phys_cost=off`
 - [x] `enable_cuvs`, `cuvs.cpu_hnsw_fallback` GUCs for runtime GPU toggle and CPU fallback
 - [x] `pg_stat_gpu_search` view: per-index GPU stats (build time, search count, p50/p95 latency, recall)
-- [x] `CREATE INDEX ... USING pg_cuvs_hnsw`: GPU CAGRA → pgvector HNSW DDL (internal phase 3K). `source` optional — built from the heap (ephemeral CAGRA, auto-dropped) or reused from a `USING cagra` index; served by pgvector
-- [x] Multi-GPU sharding (`shard_count`), GCS snapshot restore (internal phase 3G)
+- [x] `CREATE INDEX ... USING pg_cuvs_hnsw`: GPU CAGRA → pgvector HNSW DDL. `source` optional — built from the heap (ephemeral CAGRA, auto-dropped) or reused from a `USING cagra` index; served by pgvector
+- [x] Multi-GPU sharding (`shard_count`), GCS snapshot restore
 - [x] MIG verified (no code changes needed)
 
 Benchmark results — canonical dataset is **wiki_all_1M (1M×768, the cuvs-bench standard
@@ -177,15 +177,15 @@ See [`BENCHMARK.md`](BENCHMARK.md) for the latency decomposition, the full Coher
 See [ROADMAP.md](ROADMAP.md) for remaining work and the trigger-based backlog. The full per-phase
 build history (now frozen) is in [design/specs/phase-record.md](design/specs/phase-record.md). Some committed test-hardening work used its own "Phase 2/3/4/5" task labels; the table below refers only to the product roadmap.
 
-| Phase | Goal | Status |
-|-------|------|--------|
-| Proof of Mechanism (internal phase 1) | PostgreSQL pipeline + sidecar CAGRA search | Done |
-| Test & Ops Hardening (internal phase 1.5) | DDL durability, large-data benchmarks, GPU e2e, playbooks | Done |
-| Production Ready (internal phase 2) | `pg_stat_gpu_search`, LIMIT-k/metric, write/staleness, large-build memory, tiered cache | Done |
-| Scale Out (internal phases 3A~3G) | pending-delta, snapshots, replicas, multi-GPU sharding, query optimization | Done (complete through phase 3G; the DiskANN path, internal phase 3B, is a **no-go** — see 3b-diskann-decision.md) |
-| GPU Build Accelerator — HNSW export (internal phase 3I) | CAGRA build → pgvector HNSW export (~2× faster build on real embeddings 1M×1024; 13× on synthetic 1M×384) | Done (VM E2E verified, MIG tested) |
-| HNSW DDL export (internal phase 3K) | `CREATE INDEX ... USING pg_cuvs_hnsw`: standard DDL for the build accelerator; `source` optional (ephemeral CAGRA from heap) + metric pre-check | Done (VM E2E, installcheck 8/8) |
-| Ops Playbooks (internal phase 3H) | sizing guide, when-to-use, runbooks | In progress |
+| Milestone | Goal | Status |
+|-----------|------|--------|
+| Proof of Mechanism | PostgreSQL pipeline + sidecar CAGRA search | Done |
+| Test & Ops Hardening | DDL durability, large-data benchmarks, GPU e2e, playbooks | Done |
+| Production Ready | `pg_stat_gpu_search`, LIMIT-k/metric, write/staleness, large-build memory, tiered cache | Done |
+| Scale Out | pending-delta, snapshots, replicas, multi-GPU sharding, query optimization | Done (the DiskANN path is a **no-go** — see 3b-diskann-decision.md) |
+| GPU Build Accelerator — HNSW export | CAGRA build → pgvector HNSW export (~2× faster build on real embeddings 1M×1024; 13× on synthetic 1M×384) | Done (VM E2E verified, MIG tested) |
+| HNSW DDL export | `CREATE INDEX ... USING pg_cuvs_hnsw`: standard DDL for the build accelerator; `source` optional (ephemeral CAGRA from heap) + metric pre-check | Done (VM E2E, installcheck 8/8) |
+| Ops Playbooks | sizing guide, when-to-use, runbooks | In progress |
 | Release Hardening | compat matrix, known limitations, README, upgrade path | Planned |
 
 ## Compatibility
@@ -213,9 +213,9 @@ format or opclass procs would require a matching update to `src/hnsw_export.c` a
 |------------|--------|
 | `USING pg_cuvs_hnsw` build is offline | A `CREATE INDEX` build takes normal index-build locks; there is no `CONCURRENTLY` support for the GPU import path |
 | pgvector layout dependency | `hnsw_export.c` hardcodes pgvector 0.5.0+ page format; pgvector major version upgrade requires validation |
-| DiskANN / NVMe cold tier not supported | The DiskANN spike (internal phase 3B) was abandoned; cuVS 26.04 PQFlash API is unstable. See `design/spikes/3b-diskann-decision.md` |
+| DiskANN / NVMe cold tier not supported | The DiskANN spike was abandoned; cuVS 26.04 PQFlash API is unstable. See `design/spikes/3b-diskann-decision.md` |
 | MIG requires VM reboot on GCP | `nvidia-smi -mig 1` only sets pending mode; reboot required to activate or deactivate |
-| GCS snapshot restore requires bucket setup | The snapshot restore path (internal phase 3G) needs `cuvs.gcs_bucket` GUC set and credentials available |
+| GCS snapshot restore requires bucket setup | The snapshot restore path needs `cuvs.gcs_bucket` GUC set and credentials available |
 | `parallel_fanout` at N > 5M unverified | Parallel dispatch may help at large scale; current measurement only covers N ≤ 100K |
 | Crash during build rolls back | A crash during the `USING pg_cuvs_hnsw` build rolls back the `CREATE INDEX` (no partial index left behind); re-run required |
 | No online index swap | No built-in equivalent of `CREATE INDEX CONCURRENTLY` for import; use table rename pattern for minimal downtime |
@@ -291,7 +291,7 @@ SELECT id FROM items ORDER BY embedding <-> '[...]'::vector LIMIT 10;
 -- SET cuvs.bf_precision = 'float16';
 -- SELECT id FROM items ORDER BY embedding <-> '[...]'::vector LIMIT 10;
 
--- Batch search (internal phase 3M) — Q queries in one GPU dispatch
+-- Batch search — Q queries in one GPU dispatch
 SELECT query_idx, id, distance
 FROM pg_cuvs_batch_search(
     'items'::regclass,
