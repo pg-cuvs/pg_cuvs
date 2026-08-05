@@ -1399,10 +1399,14 @@ cuvs_ipc_export_hnsw_shm(
     uint32_t    db_oid,
     uint32_t    index_oid,
     char       *shm_path_out,
-    size_t      shm_path_len)
+    size_t      shm_path_len,
+    int        *fd_out)
 {
-    int sock = -1;
-    int rc   = CUVS_STATUS_ERROR;
+    int sock    = -1;
+    int rc      = CUVS_STATUS_ERROR;
+    int pass_fd = -1;
+
+    if (fd_out) *fd_out = -1;
 
     /* from_cagra() can take 30s+ for large indexes */
     sock = uds_connect_ex(socket_path, 120);
@@ -1417,8 +1421,9 @@ cuvs_ipc_export_hnsw_shm(
     if (send_cmd(sock, &cmd) < 0)
         goto cleanup;
 
+    /* #165: the sidecar arrives as an SCM_RIGHTS fd, already unlinked daemon-side. */
     CuvsReplyHeader hdr;
-    if (recv_all(sock, &hdr, sizeof(hdr)) < 0)
+    if (cuvs_fd_recv(sock, &hdr, sizeof(hdr), &pass_fd) < 0)
         goto cleanup;
 
     if (hdr.status != CUVS_STATUS_OK) {
@@ -1426,17 +1431,27 @@ cuvs_ipc_export_hnsw_shm(
         goto cleanup;
     }
 
-    /* Daemon puts the /dev/shm path in hdr.error[] */
-    if (hdr.error[0] == '\0') {
-        LOG_ERROR("[export_hnsw_shm] empty path in reply\n");
+    if (pass_fd < 0) {
+        LOG_ERROR("[export_hnsw_shm] no SCM_RIGHTS fd in reply -- daemon and "
+                  "extension versions are out of step (#165); restart the "
+                  "pg_cuvs daemon after installing the extension\n");
         goto cleanup;
     }
-    strncpy(shm_path_out, hdr.error, shm_path_len - 1);
-    shm_path_out[shm_path_len - 1] = '\0';
+    if (!shm_check_daemon_owner(sock, pass_fd)) {   /* #87 finding 1 */
+        LOG_ERROR("[export_hnsw_shm] sidecar owner mismatch on passed fd\n");
+        goto cleanup;
+    }
+
+    /* The inode has no name any more; reach it through the descriptor. Two
+     * fopen()s in the importer each get their own file description on it. */
+    snprintf(shm_path_out, shm_path_len, "/proc/self/fd/%d", pass_fd);
+    if (fd_out) *fd_out = pass_fd;
+    pass_fd = -1;                  /* ownership transferred to the caller */
     rc = CUVS_STATUS_OK;
 
 cleanup:
-    if (sock >= 0) close(sock);
+    if (pass_fd >= 0) close(pass_fd);
+    if (sock >= 0)    close(sock);
     return rc;
 }
 

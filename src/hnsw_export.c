@@ -322,12 +322,14 @@ typedef struct HnswFillRes
     uint32_t *adj;          /* IPC CAGRA adjacency */
     float    *vecs;         /* IPC corpus vectors */
     int      *cand_buf;     /* heuristic candidate scratch */
+    int       shm_fd;       /* #165: SCM_RIGHTS sidecar fd (-1 = none) */
 } HnswFillRes;
 
 static void
 hnsw_fill_res_free(HnswFillRes *r)
 {
     if (r->hf)        { fclose(r->hf);      r->hf = NULL; }
+    if (r->shm_fd >= 0) { close(r->shm_fd); r->shm_fd = -1; }
     if (r->tids)      { free(r->tids);      r->tids = NULL; }
     if (r->lv0_block) { free(r->lv0_block); r->lv0_block = NULL; }
     if (r->llbuf)     { free(r->llbuf);     r->llbuf = NULL; }
@@ -681,7 +683,8 @@ fill_hnsw_from_hnswlib_impl(Oid cagra_oid, Oid hnsw_oid, bool use_shm,
         if (!cuvs_socket_path || cuvs_socket_path[0] == '\0')
             ereport(ERROR, (errmsg("pg_cuvs: daemon socket not set")));
         int shm_rc = cuvs_ipc_export_hnsw_shm(
-            cuvs_socket_path, db_oid, index_oid, hnsw_path, sizeof(hnsw_path));
+            cuvs_socket_path, db_oid, index_oid, hnsw_path, sizeof(hnsw_path),
+            &res->shm_fd);
         if (shm_rc != CUVS_STATUS_OK)
         {
             cuvs_report_proto_mismatch(shm_rc);
@@ -1165,9 +1168,9 @@ fill_hnsw_from_hnswlib_impl(Oid cagra_oid, Oid hnsw_oid, bool use_shm,
                     "\"%s\" (use_shm=%d) into hnsw index %u",
                     N, dim, M, hnsw_path, (int)use_shm, hnsw_oid)));
 
-    /* Clean up /dev/shm file after successful import */
-    if (use_shm)
-        unlink(hnsw_path);
+    /* #165: nothing to unlink — the daemon removed the name before handing the
+     * fd over, and this process (a different uid) could not have removed it.
+     * hnsw_fill_res_free() closes the fd, which releases the inode. */
 }
 
 static void
@@ -1176,6 +1179,7 @@ fill_hnsw_from_hnswlib(Oid cagra_oid, Oid hnsw_oid, bool use_shm)
     HnswFillRes res;
 
     memset(&res, 0, sizeof(res));
+    res.shm_fd = -1;            /* #165: 0 is stdin — never a valid sentinel */
     PG_TRY();
     {
         fill_hnsw_from_hnswlib_impl(cagra_oid, hnsw_oid, use_shm, &res);
@@ -1675,6 +1679,7 @@ fill_hnsw_from_cagra_ipc(Oid cagra_oid, Oid hnsw_oid, const char *mode)
     HnswFillRes res;
 
     memset(&res, 0, sizeof(res));
+    res.shm_fd = -1;            /* #165: 0 is stdin — never a valid sentinel */
     PG_TRY();
     {
         fill_hnsw_from_cagra_ipc_impl(cagra_oid, hnsw_oid, mode, &res);
