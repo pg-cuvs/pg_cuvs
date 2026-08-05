@@ -646,9 +646,7 @@ cuvs_ipc_search_batch(
     void  *rmem     = MAP_FAILED;
     size_t rtotal   = 0;
     int    rc       = CUVS_STATUS_ERROR;
-    char   reply_key[128];
 
-    reply_key[0] = '\0';
     if (k_out)          *k_out = 0;
     if (latency_us_out) *latency_us_out = 0;
 
@@ -684,8 +682,10 @@ cuvs_ipc_search_batch(
     if (send_cmd(sock, &cmd) < 0)
         goto cleanup;
 
+    /* #165: the reply segment arrives as an SCM_RIGHTS fd; its name is already
+     * unlinked daemon-side, so there is nothing to open or reap here. */
     CuvsReplyHeader hdr;
-    if (recv_all(sock, &hdr, sizeof(hdr)) < 0)
+    if (cuvs_fd_recv(sock, &hdr, sizeof(hdr), &reply_fd) < 0)
         goto cleanup;
     rc = (int)hdr.status;
     if (latency_us_out)
@@ -693,14 +693,20 @@ cuvs_ipc_search_batch(
     if (hdr.status != CUVS_STATUS_OK)
         goto cleanup;
 
-    /* Daemon packs: n_results=Q, delta_merged=K (per-query result count),
-     * reply shm key in error[]. */
+    /* Daemon packs: n_results=Q, delta_merged=K (per-query result count).
+     * error[] holds the former shm name for log correlation only. */
     uint32_t Q = hdr.n_results;
     uint32_t K = hdr.delta_merged;
-    strncpy(reply_key, hdr.error, sizeof(reply_key) - 1);
-    reply_key[sizeof(reply_key) - 1] = '\0';
-    if (Q != n_queries || K == 0 || (int)K > k || reply_key[0] == '\0')
+    if (Q != n_queries || K == 0 || (int)K > k)
     {
+        rc = CUVS_STATUS_ERROR;
+        goto cleanup;
+    }
+    if (reply_fd < 0)
+    {
+        LOG_ERROR("[batch_search] no SCM_RIGHTS fd in reply — daemon and "
+                  "extension versions are out of step (#165); restart the "
+                  "pg_cuvs daemon after installing the extension\n");
         rc = CUVS_STATUS_ERROR;
         goto cleanup;
     }
@@ -711,9 +717,6 @@ cuvs_ipc_search_batch(
     size_t dist_bytes = (size_t)Q * (size_t)K * sizeof(float);
     rtotal = hdr_bytes + tids_bytes + dist_bytes;
 
-    reply_fd = shm_open(reply_key, O_RDONLY, 0);
-    if (reply_fd < 0)
-        goto cleanup;
     if (!shm_check_daemon_owner(sock, reply_fd))   /* #87 finding 1 */
         goto cleanup;
     rmem = mmap(NULL, rtotal, PROT_READ, MAP_SHARED, reply_fd, 0);
@@ -730,9 +733,10 @@ cuvs_ipc_search_batch(
     rc = CUVS_STATUS_OK;
 
 cleanup:
+    /* #165: no shm_unlink for the reply — the daemon unlinked its name before
+     * replying. req_key is ours (same uid), so that one still unlinks here. */
     if (rmem != MAP_FAILED) munmap(rmem, rtotal);
     if (reply_fd >= 0)      close(reply_fd);
-    if (reply_key[0])       shm_unlink(reply_key);
     if (shm_fd >= 0)        close(shm_fd);
     shm_unlink(req_key);
     if (sock >= 0)          close(sock);
