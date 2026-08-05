@@ -34,7 +34,14 @@ CREATE INDEX ec_cagra ON ec USING cagra (embedding vector_l2_ops);
 SET enable_seqscan = off;
 SET enable_bitmapscan = off;
 
--- ---- NULL query vector: must NOT crash. gettuple returns false -> 0 rows. ----
+-- ---- NULL query vector: must NOT crash. ----
+-- `embedding <-> NULL::vector` const-folds to a plain NULL (the operator is
+-- strict), so there is no orderable index key left. Before #141 the planner
+-- still picked the cagra index as an UNORDERED path and gettuple returned
+-- false -> 0 rows; that silent zero was the #141 bug, not a specification.
+-- The unordered path is now cost-rejected, so this falls to the heap and
+-- returns LIMIT 5 rows with NULL distances -- the same answer pgvector gives
+-- without an index. The assertion here is "no crash", which still holds.
 SELECT count(*) AS null_query_rows
 FROM (SELECT id FROM ec ORDER BY embedding <-> NULL::vector LIMIT 5) s;
 
