@@ -1,0 +1,97 @@
+-- unordered_scan.sql — #141: an ANN index must never answer an unordered scan.
+--
+-- count(*) needs ZERO columns, so the planner may legally satisfy it with an
+-- Index Only Scan over a cagra / flat / ivfpq index. Those AMs produce tuples
+-- only for an ORDER BY <-> scan, so such a plan delivered zero rows while the
+-- cost estimate promised rows=N — `SELECT count(*) FROM t` silently returned 0
+-- on any table carrying one of these indexes (issue #141).
+--
+-- Coverage, for each of the three AMs:
+--   1. count(*) returns the true rowcount under default planner settings.
+--   2. count(*) still returns the true rowcount under enable_seqscan = off —
+--      the shape that reproduces #141, since a disabled seqscan (cost + 1e10)
+--      loses to a normally-costed index path. amcostestimate now costs the
+--      no-ORDER-BY path at 1e15, so the heap path wins even here.
+--   3. The plan for count(*) does NOT reference the ANN index.
+--   4. An ORDER BY <-> query still routes to the ANN index — the fix rejects
+--      unordered paths only, it does not disable the index.
+--
+-- REQUIRES: pg_cuvs_server running; cuvs.index_dir writable.
+\set ON_ERROR_STOP on
+-- Kept at warning for the whole file: CREATE INDEX notices differ per AM and
+-- carry no signal for this test.
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS vector;
+CREATE EXTENSION IF NOT EXISTS pg_cuvs;
+SET cuvs.index_dir = '/tmp/cuvs_indexes';
+-- True when the chosen plan references the named index. Matching on the index
+-- NAME (not the AM) is unambiguous: the plan shows the index name.
+CREATE FUNCTION us_uses_index(q text, idx text) RETURNS boolean AS $$
+DECLARE line text;
+BEGIN
+  FOR line IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
+    IF line LIKE '%' || idx || '%' THEN RETURN true; END IF;
+  END LOOP;
+  RETURN false;
+END$$ LANGUAGE plpgsql;
+-- Deterministic 200-vector, 8-dim corpus (same generator as brute_force.sql),
+-- copied into one table per AM so each index is the only ANN path on its table.
+CREATE TABLE us_base (id int, embedding vector(8));
+INSERT INTO us_base
+SELECT g,
+       format('[%s,%s,%s,%s,%s,%s,%s,%s]',
+              (g * 0.013)::numeric(12,6),
+              (g * g * 0.0007)::numeric(12,6),
+              sin(g * 0.10)::numeric(12,6),
+              cos(g * 0.17)::numeric(12,6),
+              ((g % 13) * 0.05)::numeric(12,6),
+              ((g % 7) * 0.08)::numeric(12,6),
+              sin(g * 0.30)::numeric(12,6),
+              cos(g * 0.23)::numeric(12,6))::vector
+FROM generate_series(1, 200) g;
+CREATE TABLE us_cagra_tbl (LIKE us_base);
+INSERT INTO us_cagra_tbl SELECT * FROM us_base;
+CREATE TABLE us_flat_tbl (LIKE us_base);
+INSERT INTO us_flat_tbl SELECT * FROM us_base;
+CREATE TABLE us_ivfpq_tbl (LIKE us_base);
+INSERT INTO us_ivfpq_tbl SELECT * FROM us_base;
+DROP TABLE us_base;
+CREATE INDEX us_cagra_idx ON us_cagra_tbl USING cagra (embedding vector_l2_ops);
+CREATE INDEX us_flat_idx ON us_flat_tbl USING flat (embedding vector_l2_ops);
+CREATE INDEX us_ivfpq_idx ON us_ivfpq_tbl USING ivfpq (embedding vector_l2_ops)
+    WITH (n_lists = 4, pq_bits = 8, pq_dim = 4);
+ANALYZE us_cagra_tbl;
+ANALYZE us_flat_tbl;
+ANALYZE us_ivfpq_tbl;
+-- ============================================================ cagra
+SELECT count(*) = 200 AS cagra_count_default_ok FROM us_cagra_tbl;
+SET enable_seqscan = off;
+SELECT count(*) = 200 AS cagra_count_noseqscan_ok FROM us_cagra_tbl;
+SELECT NOT us_uses_index('SELECT count(*) FROM us_cagra_tbl', 'us_cagra_idx')
+    AS cagra_count_avoids_index;
+SELECT us_uses_index('SELECT id FROM us_cagra_tbl ORDER BY embedding <-> ''[0.5,0.3,0.1,0.7,0.2,0.4,0.6,0.15]'' LIMIT 5', 'us_cagra_idx')
+    AS cagra_orderby_uses_index;
+RESET enable_seqscan;
+-- ============================================================ flat
+SELECT count(*) = 200 AS flat_count_default_ok FROM us_flat_tbl;
+SET enable_seqscan = off;
+SELECT count(*) = 200 AS flat_count_noseqscan_ok FROM us_flat_tbl;
+SELECT NOT us_uses_index('SELECT count(*) FROM us_flat_tbl', 'us_flat_idx')
+    AS flat_count_avoids_index;
+SELECT us_uses_index('SELECT id FROM us_flat_tbl ORDER BY embedding <-> ''[0.5,0.3,0.1,0.7,0.2,0.4,0.6,0.15]'' LIMIT 5', 'us_flat_idx')
+    AS flat_orderby_uses_index;
+RESET enable_seqscan;
+-- ============================================================ ivfpq
+SELECT count(*) = 200 AS ivfpq_count_default_ok FROM us_ivfpq_tbl;
+SET enable_seqscan = off;
+SELECT count(*) = 200 AS ivfpq_count_noseqscan_ok FROM us_ivfpq_tbl;
+SELECT NOT us_uses_index('SELECT count(*) FROM us_ivfpq_tbl', 'us_ivfpq_idx')
+    AS ivfpq_count_avoids_index;
+SELECT us_uses_index('SELECT id FROM us_ivfpq_tbl ORDER BY embedding <-> ''[0.5,0.3,0.1,0.7,0.2,0.4,0.6,0.15]'' LIMIT 5', 'us_ivfpq_idx')
+    AS ivfpq_orderby_uses_index;
+RESET enable_seqscan;
+-- Cleanup
+DROP TABLE us_cagra_tbl;
+DROP TABLE us_flat_tbl;
+DROP TABLE us_ivfpq_tbl;
+DROP FUNCTION us_uses_index(text, text);
