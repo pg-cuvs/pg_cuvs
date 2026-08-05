@@ -6277,8 +6277,13 @@ handle_export_adjacency(int client_fd, const CuvsCmdFrame *cmd)
         send_error(client_fd, "shm_open(RDONLY) failed for export");
         return;
     }
-    /* Name is no longer needed by anyone: both fds stay valid without it. */
-    shm_unlink(shm_key);
+    /* Name is no longer needed by anyone: both fds stay valid without it.
+     * #166 review 3: if the unlink fails the name survives as daemon-owned
+     * residue that nothing else reclaims — exactly the condition #165 exists
+     * to make observable, so it must not fail silently. */
+    if (shm_unlink(shm_key) != 0)
+        LOG_WARN("export_adjacency: shm_unlink(%s) failed errno=%d — "
+                 "segment name leaked\n", shm_key, errno);
     void *mem = mmap(NULL, total, PROT_WRITE, MAP_SHARED, shm_fd, 0);
     close(shm_fd);
     if (mem == MAP_FAILED)
