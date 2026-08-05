@@ -28,10 +28,24 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 STATE=/tmp/pgcuvs-run.json
 LOCK=/tmp/pgcuvs-run.lock
 
-for f in "$REPO_ROOT/gpu.conf" "$REPO_ROOT/.env.gpu"; do
-    [ -f "$f" ] && . "$f"
-done
-VM_SSH_HOST="${VM_SSH_HOST:-${GCP_VM:-}}"
+# #169: parse, do not source. gpu.conf is `-include`d by the Makefile, so
+# `VM_SSH_HOST = host` (spaces around `=`) is legal there and fatal here —
+# `.` runs the key as a command, 127, and `set -e` kills this script before it
+# can launch anything. Same fix as gpu-preflight.sh.
+conf_get() {
+    local key="$1" f v
+    for f in "$REPO_ROOT/gpu.conf" "$REPO_ROOT/.env.gpu"; do
+        [ -f "$f" ] || continue
+        v=$(sed -n "s/^[[:space:]]*$key[[:space:]]*=[[:space:]]*//p" "$f" | tail -1)
+        v=${v%%#*}
+        v="$(printf '%s' "$v" | tr -d '"'\''' | xargs 2>/dev/null || true)"
+        [ -n "$v" ] && { printf '%s' "$v"; return 0; }
+    done
+    return 0
+}
+
+VM_SSH_HOST="${VM_SSH_HOST:-$(conf_get VM_SSH_HOST)}"
+[ -n "$VM_SSH_HOST" ] || VM_SSH_HOST="$(conf_get GCP_VM)"
 [ -n "$VM_SSH_HOST" ] || { echo "gpu-run: VM_SSH_HOST unset (gpu.conf)" >&2; exit 1; }
 
 OWNER="${PGCUVS_RUN_OWNER:-${USER:-unknown}}"

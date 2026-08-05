@@ -20,11 +20,30 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 DB="${1:-shadeform}"
 
-# Same config resolution the Makefile uses (gpu.conf first, legacy .env.gpu second).
-for f in "$REPO_ROOT/gpu.conf" "$REPO_ROOT/.env.gpu"; do
-    [ -f "$f" ] && . "$f"
-done
-VM_SSH_HOST="${VM_SSH_HOST:-${GCP_VM:-}}"
+# Same config resolution the Makefile uses (gpu.conf first, legacy .env.gpu
+# second) — but PARSED, not sourced.
+#
+# #169: sourcing was wrong and made this whole guard unreachable. gpu.conf is
+# read by the Makefile via `-include`, so `VM_SSH_HOST = host` (spaces around
+# `=`, Makefile style) is a legal and natural thing to write there. `.` on that
+# line runs `VM_SSH_HOST` as a command, returns 127, and `set -e` kills the
+# script before a single check runs. gpu-run.sh — the runner the PreToolUse hook
+# tells everyone to use — inherited the same failure, so its preflight never
+# ran either.
+conf_get() {
+    local key="$1" f v
+    for f in "$REPO_ROOT/gpu.conf" "$REPO_ROOT/.env.gpu"; do
+        [ -f "$f" ] || continue
+        v=$(sed -n "s/^[[:space:]]*$key[[:space:]]*=[[:space:]]*//p" "$f" | tail -1)
+        v=${v%%#*}                                  # trailing comment
+        v="$(printf '%s' "$v" | tr -d '"'\''' | xargs 2>/dev/null || true)"
+        [ -n "$v" ] && { printf '%s' "$v"; return 0; }
+    done
+    return 0
+}
+
+VM_SSH_HOST="${VM_SSH_HOST:-$(conf_get VM_SSH_HOST)}"
+[ -n "$VM_SSH_HOST" ] || VM_SSH_HOST="$(conf_get GCP_VM)"
 if [ -z "$VM_SSH_HOST" ]; then
     echo "[preflight] FAIL: VM_SSH_HOST unset (set it in gpu.conf)" >&2
     exit 1
