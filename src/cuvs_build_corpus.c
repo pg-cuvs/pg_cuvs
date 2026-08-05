@@ -400,13 +400,44 @@ cuvs_fd_recv(int sock, void *payload, size_t len, int *out_fd)
     do { n = recvmsg(sock, &msg, 0); } while (n < 0 && errno == EINTR);
     if (n <= 0)
         return -1;
-    if (msg.msg_flags & MSG_CTRUNC)
-        return -1;                   /* ancillary truncated — refuse */
 
-    for (cm = CMSG_FIRSTHDR(&msg); cm != NULL; cm = CMSG_NXTHDR(&msg, cm))
+    /*
+     * Account for EVERY descriptor the kernel installed: keep the first, close
+     * the rest. The old loop copied one int per SCM_RIGHTS header and let any
+     * additional descriptor sit unreferenced in this process's fd table, and it
+     * refused MSG_CTRUNC *before* reclaiming the ones that did fit — so a sender
+     * attaching more than one fd could exhaust the receiver's fd table one call
+     * at a time. This matters more now that the daemon replies carry fds
+     * (#165/#166 review P1), not just the backend's corpus handoff.
+     */
     {
-        if (cm->cmsg_level == SOL_SOCKET && cm->cmsg_type == SCM_RIGHTS)
-            memcpy(out_fd, CMSG_DATA(cm), sizeof(int));
+        int keep = -1;
+
+        for (cm = CMSG_FIRSTHDR(&msg); cm != NULL; cm = CMSG_NXTHDR(&msg, cm))
+        {
+            int *fds;
+            int  nfd, i;
+
+            if (cm->cmsg_level != SOL_SOCKET || cm->cmsg_type != SCM_RIGHTS)
+                continue;
+            fds = (int *) CMSG_DATA(cm);
+            nfd = (int) ((cm->cmsg_len - CMSG_LEN(0)) / sizeof(int));
+            for (i = 0; i < nfd; i++)
+            {
+                if (keep < 0)
+                    keep = fds[i];
+                else
+                    close(fds[i]);   /* unexpected extra — never leak it */
+            }
+        }
+
+        if (msg.msg_flags & MSG_CTRUNC)
+        {
+            if (keep >= 0)
+                close(keep);
+            return -1;               /* ancillary truncated — refuse */
+        }
+        *out_fd = keep;
     }
 
     /* The fd arrives with the first byte; read any remaining payload plainly. */
@@ -417,7 +448,16 @@ cuvs_fd_recv(int sock, void *payload, size_t len, int *out_fd)
         if (r < 0 && errno == EINTR)
             continue;
         if (r <= 0)
+        {
+            /* Payload incomplete: the caller gets -1 and never learns about the
+             * descriptor, so reclaim it here rather than leak it. */
+            if (*out_fd >= 0)
+            {
+                close(*out_fd);
+                *out_fd = -1;
+            }
             return -1;
+        }
         got += (size_t) r;
     }
     return 0;

@@ -24,6 +24,7 @@
 #include <stdint.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <sys/resource.h>
 #include <unistd.h>
 #include <signal.h>
 #include <sys/mman.h>
@@ -162,6 +163,88 @@ test_fd_pass(void)
 }
 
 #ifdef __linux__
+/*
+ * #166 review P1: a sender that attaches more descriptors than the receiver's
+ * control buffer holds must not leave any of them in the receiver's fd table.
+ * The receiver refuses the message (MSG_CTRUNC); the descriptors that the kernel
+ * did install have to be reclaimed, or a hostile peer exhausts the fd table one
+ * call at a time. Detected by counting open descriptors across the call.
+ */
+static int
+count_open_fds(void)
+{
+    int n = 0, fd;
+    struct rlimit rl;
+
+    if (getrlimit(RLIMIT_NOFILE, &rl) != 0)
+        rl.rlim_cur = 1024;
+    if (rl.rlim_cur > 4096)
+        rl.rlim_cur = 4096;
+    for (fd = 0; fd < (int) rl.rlim_cur; fd++)
+        if (fcntl(fd, F_GETFD) != -1)
+            n++;
+    return n;
+}
+
+static void
+test_fd_recv_extra_fds_not_leaked(void)
+{
+    int   sv[2];
+    char  tmpl[] = "/tmp/pgcuvs_fdx_XXXXXX";
+    int   srcfd, rfd = -1;
+    char  payload[256], rbuf[256];
+    int   before, after, i;
+
+    ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0, "socketpair (extra-fd)");
+    srcfd = mkstemp(tmpl);
+    ASSERT(srcfd >= 0, "mkstemp (extra-fd)");
+    unlink(tmpl);
+    memset(payload, 0, sizeof(payload));
+
+    before = count_open_fds();
+
+    /* Send three descriptors in one SCM_RIGHTS header; cuvs_fd_recv's control
+     * buffer has room for one, so the kernel truncates. */
+    for (i = 0; i < 4; i++)
+    {
+        struct msghdr  msg;
+        struct iovec   iov;
+        char           cbuf[CMSG_SPACE(3 * sizeof(int))];
+        struct cmsghdr *cm;
+        int            fds[3];
+
+        fds[0] = srcfd; fds[1] = srcfd; fds[2] = srcfd;
+        memset(&msg, 0, sizeof(msg));
+        memset(cbuf, 0, sizeof(cbuf));
+        iov.iov_base = payload;
+        iov.iov_len  = sizeof(payload);
+        msg.msg_iov        = &iov;
+        msg.msg_iovlen     = 1;
+        msg.msg_control    = cbuf;
+        msg.msg_controllen = sizeof(cbuf);
+        cm = CMSG_FIRSTHDR(&msg);
+        cm->cmsg_level = SOL_SOCKET;
+        cm->cmsg_type  = SCM_RIGHTS;
+        cm->cmsg_len   = CMSG_LEN(3 * sizeof(int));
+        memcpy(CMSG_DATA(cm), fds, sizeof(fds));
+        ASSERT(sendmsg(sv[0], &msg, 0) == (ssize_t) sizeof(payload),
+               "sendmsg 3 fds");
+
+        rfd = 999;
+        ASSERT(cuvs_fd_recv(sv[1], rbuf, sizeof(rbuf), &rfd) == -1,
+               "truncated ancillary refused");
+        ASSERT(rfd == -1, "refused call reports no fd");
+    }
+
+    after = count_open_fds();
+    ASSERT(after == before, "no descriptors leaked by refused SCM_RIGHTS");
+
+    close(srcfd); close(sv[0]); close(sv[1]);
+}
+#endif /* __linux__ — Darwin does not reclaim over-count SCM_RIGHTS fds the same
+        * way, and the daemon/backend pair this guards only ever runs on Linux. */
+
+#ifdef __linux__
 /* memfd tier: real grow path + golden byte-identity, plus refcount across a
  * passed fd (sender close keeps it alive while a child holds it). */
 static void
@@ -258,6 +341,9 @@ main(void)
     test_golden_no_grow(/*n=*/64,   /*dim=*/4);
     test_golden_no_grow(/*n=*/1000, /*dim=*/16);
     test_fd_pass();
+#ifdef __linux__
+    test_fd_recv_extra_fds_not_leaked();
+#endif
 #ifdef __linux__
     test_memfd_grow_golden(/*n=*/1000, /*dim=*/16, /*init_rows=*/64);
     test_memfd_grow_golden(/*n=*/333,  /*dim=*/3,  /*init_rows=*/333);
