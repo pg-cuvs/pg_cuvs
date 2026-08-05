@@ -51,8 +51,23 @@ WHERE indrelid = 'ivfpq_items'::regclass
 -- [1,0,0,0] is the exact match for id=1 (distance = 0).
 SET cuvs.ivfpq_n_probes = 4;
 SET cuvs.k = 4;
+
+-- #151: bracket the query with the daemon's search_count. The pg_stat_gpu_search
+-- row is registered at CREATE INDEX time with search_count = 0, so asserting
+-- search_mode alone proves only that the BUILD reached the daemon — it stayed
+-- green all the while the query silently ran as a CPU Seq Scan + Sort and
+-- returned the right answer anyway. Only the counter going 0 → ≥1 proves a real
+-- ivfpq search happened.
+SELECT search_count = 0 AS ivfpq_not_searched_before FROM pg_stat_gpu_search
+WHERE index_oid = 'ivfpq_idx'::regclass;
+
+SET enable_seqscan = off;
 SELECT id FROM ivfpq_items
 ORDER BY embedding <-> '[1,0,0,0]'::vector LIMIT 1;
+RESET enable_seqscan;
+
+SELECT search_count >= 1 AS ivfpq_searched_after FROM pg_stat_gpu_search
+WHERE index_oid = 'ivfpq_idx'::regclass;
 
 -- Daemon stats should report search_mode = 'ivfpq' for this index.
 SELECT search_mode FROM pg_stat_gpu_search
