@@ -1801,6 +1801,23 @@ cuvsamcostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
     (void) root;
     (void) loop_count;
 
+    /* #141: reject index paths with no ORDER BY. count(*) needs zero columns, so
+     * the planner may satisfy it with an Index Only Scan over this index; the
+     * scan then reaches cuvs_gettuple with no query vector and yields zero
+     * tuples — a silent wrong answer. Cost it out of reach exactly as the gates
+     * below do (1e15 > PG disable_cost 1e10), so the unordered path loses even
+     * under enable_seqscan = off. NOT recorded via cuvs_fb_record: this is not a
+     * GPU fallback and must not move the pg_stat_gpu_fallback counters. */
+    if (path->indexorderbys == NIL)
+    {
+        *indexStartupCost = 1e15;
+        *indexTotalCost   = 1e15;
+        *indexSelectivity = 1.0;
+        *indexCorrelation = 0.0;
+        *indexPages       = 0.0;
+        return;
+    }
+
     /* Eight gates turn the GPU path off — all local file/state reads, no IPC.
      * Cost is set to 1e15 (> PG disable_cost 1e10) so the gated index loses
      * even when enable_seqscan = off, preventing empty-result or ERROR paths.
@@ -1916,6 +1933,18 @@ flat_amcostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
 
     (void) root;
     (void) loop_count;
+
+    /* #141: same no-ORDER-BY rejection as cuvsamcostestimate, same 1e15 and same
+     * deliberate absence of a cuvs_fb_record call. */
+    if (path->indexorderbys == NIL)
+    {
+        *indexStartupCost = 1e15;
+        *indexTotalCost   = 1e15;
+        *indexSelectivity = 1.0;
+        *indexCorrelation = 0.0;
+        *indexPages       = 0.0;
+        return;
+    }
 
     /* Same eight gates as cuvsamcostestimate, same priority order. */
     {
@@ -3538,9 +3567,18 @@ cuvs_gettuple(IndexScanDesc scan, ScanDirection dir)
         if (!enable_cuvs || cuvs_circuit_is_open((uint32_t)index_oid))
             return false;
 
-        /* Extract query vector from ORDER BY operator argument */
+        /* Extract query vector from ORDER BY operator argument.
+         *
+         * #141 backstop: unreachable once cuvsamcostestimate costs the
+         * no-ORDER-BY path at 1e15. If a path still gets here there is no query
+         * vector, and the old `return false` produced a silent zero-row answer
+         * (count(*) returning 0). Fail loudly instead. */
         if (scan->numberOfOrderBys < 1 || !scan->orderByData)
-            return false;
+            ereport(ERROR,
+                    (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                     errmsg("cagra index does not support unordered scans"),
+                     errhint("Use ORDER BY <vector column> <-> <query vector>, "
+                             "or drop the index for unordered scans. See issue #141.")));
 
         /* A NULL query vector (e.g. `embedding <-> NULL`) has no neighbors.
          * Return an empty scan instead of dereferencing a NULL Datum in
@@ -3806,8 +3844,13 @@ flat_gettuple(IndexScanDesc scan, ScanDirection dir)
         if (!enable_cuvs || cuvs_circuit_is_open((uint32_t)index_oid))
             return false;
 
+        /* #141 backstop — see cuvs_gettuple. */
         if (scan->numberOfOrderBys < 1 || !scan->orderByData)
-            return false;
+            ereport(ERROR,
+                    (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                     errmsg("flat index does not support unordered scans"),
+                     errhint("Use ORDER BY <vector column> <-> <query vector>, "
+                             "or drop the index for unordered scans. See issue #141.")));
 
         if (scan->orderByData[0].sk_flags & SK_ISNULL)
             return false;
@@ -4485,8 +4528,13 @@ ivfpq_gettuple(IndexScanDesc scan, ScanDirection dir)
         if (!enable_cuvs || cuvs_circuit_is_open((uint32_t)index_oid))
             return false;
 
+        /* #141 backstop — see cuvs_gettuple. */
         if (scan->numberOfOrderBys < 1 || !scan->orderByData)
-            return false;
+            ereport(ERROR,
+                    (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                     errmsg("ivfpq index does not support unordered scans"),
+                     errhint("Use ORDER BY <vector column> <-> <query vector>, "
+                             "or drop the index for unordered scans. See issue #141.")));
         if (scan->orderByData[0].sk_flags & SK_ISNULL)
             return false;
 

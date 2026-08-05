@@ -53,16 +53,32 @@ CREATE TABLE us_cagra_tbl (LIKE us_base);
 INSERT INTO us_cagra_tbl SELECT * FROM us_base;
 CREATE TABLE us_flat_tbl (LIKE us_base);
 INSERT INTO us_flat_tbl SELECT * FROM us_base;
-CREATE TABLE us_ivfpq_tbl (LIKE us_base);
-INSERT INTO us_ivfpq_tbl SELECT * FROM us_base;
 DROP TABLE us_base;
 CREATE INDEX us_cagra_idx ON us_cagra_tbl USING cagra (embedding vector_l2_ops);
 CREATE INDEX us_flat_idx ON us_flat_tbl USING flat (embedding vector_l2_ops);
-CREATE INDEX us_ivfpq_idx ON us_ivfpq_tbl USING ivfpq (embedding vector_l2_ops)
-    WITH (n_lists = 4, pq_bits = 8, pq_dim = 4);
 ANALYZE us_cagra_tbl;
 ANALYZE us_flat_tbl;
-ANALYZE us_ivfpq_tbl;
+-- ivfpq gets ivfpq_smoke.sql's exact corpus shape (20 rows, dim 4, n_lists = 4,
+-- pq_dim = 2) rather than the 200-row dim-8 corpus above: that is the shape
+-- proven to route to the ivfpq AM under the Tier-1 CPU shim. A 200-row / dim-8 /
+-- pq_dim-4 ivfpq index was not chosen by the planner even with
+-- enable_seqscan = off, which would have made these assertions vacuous.
+CREATE TABLE us_ivfpq_tbl (id int, embedding vector(4));
+INSERT INTO us_ivfpq_tbl VALUES
+    (1,  '[1,0,0,0]'), (2,  '[0,1,0,0]'),
+    (3,  '[0,0,1,0]'), (4,  '[0,0,0,1]'),
+    (5,  '[1,1,0,0]'), (6,  '[0,1,1,0]'),
+    (7,  '[0,0,1,1]'), (8,  '[1,0,0,1]'),
+    (9,  '[2,0,0,0]'), (10, '[0,2,0,0]'),
+    (11, '[0,0,2,0]'), (12, '[0,0,0,2]'),
+    (13, '[3,0,0,0]'), (14, '[0,3,0,0]'),
+    (15, '[0,0,3,0]'), (16, '[0,0,0,3]'),
+    (17, '[1,1,1,0]'), (18, '[0,1,1,1]'),
+    (19, '[1,0,1,1]'), (20, '[1,1,0,1]');
+CREATE INDEX us_ivfpq_idx ON us_ivfpq_tbl USING ivfpq (embedding vector_l2_ops)
+    WITH (n_lists = 4, pq_bits = 8, pq_dim = 2);
+SET cuvs.ivfpq_n_probes = 4;
+SET cuvs.k = 4;
 -- ============================================================ cagra
 SELECT count(*) = 200 AS cagra_count_default_ok FROM us_cagra_tbl;
 SET enable_seqscan = off;
@@ -82,12 +98,12 @@ SELECT us_uses_index('SELECT id FROM us_flat_tbl ORDER BY embedding <-> ''[0.5,0
     AS flat_orderby_uses_index;
 RESET enable_seqscan;
 -- ============================================================ ivfpq
-SELECT count(*) = 200 AS ivfpq_count_default_ok FROM us_ivfpq_tbl;
+SELECT count(*) = 20 AS ivfpq_count_default_ok FROM us_ivfpq_tbl;
 SET enable_seqscan = off;
-SELECT count(*) = 200 AS ivfpq_count_noseqscan_ok FROM us_ivfpq_tbl;
+SELECT count(*) = 20 AS ivfpq_count_noseqscan_ok FROM us_ivfpq_tbl;
 SELECT NOT us_uses_index('SELECT count(*) FROM us_ivfpq_tbl', 'us_ivfpq_idx')
     AS ivfpq_count_avoids_index;
-SELECT us_uses_index('SELECT id FROM us_ivfpq_tbl ORDER BY embedding <-> ''[0.5,0.3,0.1,0.7,0.2,0.4,0.6,0.15]'' LIMIT 5', 'us_ivfpq_idx')
+SELECT us_uses_index('SELECT id FROM us_ivfpq_tbl ORDER BY embedding <-> ''[1,0,0,0]'' LIMIT 1', 'us_ivfpq_idx')
     AS ivfpq_orderby_uses_index;
 RESET enable_seqscan;
 -- Cleanup
