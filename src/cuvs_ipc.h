@@ -36,7 +36,14 @@
  *   make install && make install-server
  * ---------------------------------------------------------------- */
 #define CUVS_PROTO_MAGIC   0x50435556u  /* 'VUCP' LE — "PG CUVS" tag */
-#define CUVS_PROTO_VERSION 2u   /* 2: + cagra_batch_wait_us (#160) */
+#define CUVS_PROTO_VERSION 3u   /* 3: daemon replies for EXPORT_ADJACENCY /
+                                 * EXPORT_HNSW_SHM / SEARCH_BATCH now carry the
+                                 * payload as an SCM_RIGHTS fd instead of a
+                                 * /dev/shm name (#165). The frame layout is
+                                 * unchanged, but a mixed pair would clear the
+                                 * handshake and then fail mid-request, so the
+                                 * version carries the reply contract too.
+                                 * 2: + cagra_batch_wait_us (#160) */
 
 /* ----------------------------------------------------------------
  * Op codes
