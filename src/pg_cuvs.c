@@ -3580,11 +3580,24 @@ cuvs_gettuple(IndexScanDesc scan, ScanDirection dir)
                      errhint("Use ORDER BY <vector column> <-> <query vector>, "
                              "or drop the index for unordered scans. See issue #141.")));
 
-        /* A NULL query vector (e.g. `embedding <-> NULL`) has no neighbors.
-         * Return an empty scan instead of dereferencing a NULL Datum in
-         * DatumGetPgVector below (crash). */
+        /* #150 backstop: a NULL query vector reaching this scan. A LITERAL
+         * `embedding <-> NULL::vector` const-folds away (the operator is
+         * strict), so #141's planner exclusion sends it to the heap; but a
+         * PARAMETERIZED NULL (prepared statement / generic plan) does not fold
+         * and lands here. The old `return false` made that another silent
+         * zero-row answer. There is no vector to search with, so fail loudly —
+         * which also keeps DatumGetPgVector below from dereferencing NULL.
+         *
+         * Deliberate divergence from the heap path, which returns LIMIT n rows
+         * in arbitrary order for an all-NULL sort key. An ERROR is never a
+         * wrong answer, and a NULL query vector is in practice an unbound
+         * parameter. Same call as DIM_MISMATCH below. */
         if (scan->orderByData[0].sk_flags & SK_ISNULL)
-            return false;
+            ereport(ERROR,
+                    (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                     errmsg("cagra index scan does not support a NULL query vector"),
+                     errhint("Bind a non-NULL vector, or guard the query with "
+                             "IS NOT NULL. See issue #150.")));
 
         Datum query_datum = scan->orderByData[0].sk_argument;
         PgVector *qvec    = DatumGetPgVector(query_datum);
@@ -3852,8 +3865,13 @@ flat_gettuple(IndexScanDesc scan, ScanDirection dir)
                      errhint("Use ORDER BY <vector column> <-> <query vector>, "
                              "or drop the index for unordered scans. See issue #141.")));
 
+        /* #150 backstop — see cuvs_gettuple. */
         if (scan->orderByData[0].sk_flags & SK_ISNULL)
-            return false;
+            ereport(ERROR,
+                    (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                     errmsg("flat index scan does not support a NULL query vector"),
+                     errhint("Bind a non-NULL vector, or guard the query with "
+                             "IS NOT NULL. See issue #150.")));
 
         Datum query_datum = scan->orderByData[0].sk_argument;
         PgVector *qvec    = DatumGetPgVector(query_datum);
@@ -4535,8 +4553,13 @@ ivfpq_gettuple(IndexScanDesc scan, ScanDirection dir)
                      errmsg("ivfpq index does not support unordered scans"),
                      errhint("Use ORDER BY <vector column> <-> <query vector>, "
                              "or drop the index for unordered scans. See issue #141.")));
+        /* #150 backstop — see cuvs_gettuple. */
         if (scan->orderByData[0].sk_flags & SK_ISNULL)
-            return false;
+            ereport(ERROR,
+                    (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                     errmsg("ivfpq index scan does not support a NULL query vector"),
+                     errhint("Bind a non-NULL vector, or guard the query with "
+                             "IS NOT NULL. See issue #150.")));
 
         Datum    query_datum = scan->orderByData[0].sk_argument;
         PgVector *qvec       = DatumGetPgVector(query_datum);
