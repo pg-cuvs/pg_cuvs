@@ -89,12 +89,32 @@ ssh <name> "sudo journalctl -u pg-cuvs-server -n 50 --no-pager"   # 로그
 
 | 명령 | 용도 |
 |------|------|
+| **`make gpu-deploy`** | **기본 배포 경로** — sync → build → install → **server** → reload → verify |
+| `make gpu-cycle` | `gpu-deploy` + installcheck |
 | `make sync` | 로컬 → VM rsync (.o/.so/gpu.conf 제외) |
-| `make gpu-build` | VM에서 make (nvcc + PGXS) |
-| `make gpu-install` | VM에서 sudo make install |
-| `make gpu-test` | VM에서 make installcheck |
+| `make gpu-build` | VM에서 make — **확장 `.so`만.** 데몬은 안 만든다 |
+| `make gpu-install` | VM에서 sudo make install (확장) |
+| `make gpu-server` | **데몬** 빌드 + 설치 (`make server && install-server`) |
+| `make gpu-reload` | PG + 데몬 재기동, 데몬 `active` 까지 대기 |
+| `make gpu-verify-deployed` | 신선도 preflight (실행 중인 것 == 방금 빌드한 것) |
+| `make gpu-test` | installcheck (신선도 게이트 뒤) |
 | `make gpu-shell` | VM SSH 대화형 세션 |
-| `make gpu-e2e` | sync → build → install → test 전체 |
+| `make gpu-e2e` | e2e-smoke.sh (내구성 스모크. 배포는 안 함) |
+
+### 무엇을 고치면 무엇을 다시 돌려야 하나 (#169)
+
+`gpu-deploy`를 쓰면 아래를 외울 필요가 없다. 개별 타깃을 직접 부를 때만 해당한다.
+
+| 고친 것 | 필요한 것 | 빠뜨리면 |
+|---|---|---|
+| 확장 코드 (`pg_cuvs.c`, `hnsw_export.c` …) | `gpu-build` + `gpu-install` + **PG 재시작** | `shared_preload_libraries` 라 백엔드가 **구 `.so` 를 계속 적재** |
+| 데몬 코드 (`pg_cuvs_server.c`, `cuvs_ipc.c` …) | **`gpu-server`** + **데몬 재시작** | `gpu-build` 는 데몬을 안 만든다 → 구 바이너리가 계속 돈다 |
+| `cuvs_wrapper.cu` (양쪽 링크) | 둘 다 | 위 둘 다 |
+| `sql/*.sql` (확장 버전 변경) | `gpu-install` + `ALTER EXTENSION pg_cuvs UPDATE` | `.so` 와 SQL 선언이 어긋나 ABI 불일치 |
+
+셋 다 **실패 신호가 없다** — 빌드 성공, 설치 성공, 테스트 GREEN. 실제로 한 세션에서
+세 갈래가 모두 발현했고, 그중 하나는 잘못된 결론을 PR 코멘트로 나가게 했다.
+`gpu-verify-deployed`(= `infra/scripts/gpu-preflight.sh`)가 이를 소리나게 만든다.
 
 세션 종료 시: 커밋/푸시 확인 후 `brev delete` (VM 위 자산은 모두 재빌드 가능해야 함 —
 소스는 main에, 측정 CSV는 `bench/results/`에 커밋).
