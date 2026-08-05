@@ -181,6 +181,7 @@ Defaults and ranges are from source. "Set by" is the minimum role/scope: `USERSE
 | `cuvs.gpu_bruteforce_max_mb` | int | `2048` | 1–INT_MAX | USERSET | Host-side hard cap (MiB) on the per-query corpus materialized before the GPU handoff. Queries whose corpus exceeds this limit fail closed with an ERROR |
 | `cuvs.bf_precision` | enum | `float32` | `float32`, `float16` | USERSET | Resident BF index precision; float16 halves VRAM |
 | `cuvs.bf_batch_wait_us` | int | `0` (off) | 0–10000 | USERSET | Daemon BF micro-batch coalescing window (µs) |
+| `cuvs.cagra_batch_wait_us` | int | `0` (off) | 0–10000 | USERSET | Daemon CAGRA micro-batch coalescing window (µs) |
 | `cuvs.cpu_hnsw_fallback` | bool | `off` | — | USERSET | Serve from the `.hnsw` sidecar instead of GPU CAGRA |
 | `cuvs.max_stale_fraction` | real | `0.10` | 0.0–1.0 | USERSET | Delete-drift fraction above which a CAGRA index reroutes to CPU; 1.0 disables |
 | `cuvs.max_delta_rows` | int | `10000` | 0–INT_MAX | USERSET | Pending-insert rows merged before CPU reroute; 0 disables delta |
@@ -332,7 +333,8 @@ error_count, avg_latency_us, p50_latency_us, p95_latency_us, p99_latency_us, las
 last_search_at, requested_k, returned_k, stale, stale_since, delta_rows, delta_generation,
 delta_vram_bytes, delta_merged_count, delta_search_mode, warmup_state, last_warmup_at,
 warmup_duration_ms, download_count, cache_miss_count, gpu_device_id, shard_count, search_mode,
-bf_batch_count, extend_count, compact_count, last_compact_at, prefilter_fallback_count`
+bf_batch_count, extend_count, compact_count, last_compact_at, prefilter_fallback_count,
+cagra_batch_count`
 
 The single most useful row for "is this index healthy": `resident`, `search_mode` (did it stay on
 GPU?), `error_count`, p50/p95/p99 latency, `stale`, `delta_rows`.
@@ -345,6 +347,15 @@ above — its cost scales with corpus size (N), not with `1/selectivity` like D-
 `prefilter_fallback_count` against `search_count`: a nonzero, growing value means an index is
 quietly paying `gpu_bf_prefilter` latency on some filter shapes even though
 `cuvs.filter_auto_threshold` routes it to 3O.
+
+`cagra_batch_count` (#160) counts coalesced CAGRA micro-batch dispatches — the cagra twin of
+`bf_batch_count`. It stays 0 unless `cuvs.cagra_batch_wait_us > 0`, and is the only SQL-visible
+confirmation that the window is actually routing single-query cagra scans through the daemon's
+batch worker. One dispatch can serve many concurrent requests, so `search_count /
+cagra_batch_count` is the average coalesced batch width. Coalesced requests run the multi-CTA
+batch kernel rather than the single-query kernel; measured recall between the two differs by
+around 0.003 in either direction depending on the graph (#144), the same order as a one-step
+`ef_search` change or graph-build nondeterminism.
 
 ### `pg_stat_gpu_cache` — per-GPU VRAM cache counters (daemon-sourced)
 

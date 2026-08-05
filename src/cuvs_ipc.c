@@ -501,6 +501,7 @@ cuvs_ipc_search(
     uint32_t      search_mode,
     uint32_t      bf_precision,
     uint32_t      bf_batch_wait_us,
+    uint32_t      cagra_batch_wait_us,
     uint64_t     *tids_out,
     float        *dist_out,
     int          *n_out,
@@ -543,6 +544,7 @@ cuvs_ipc_search(
         .search_mode     = search_mode,
         .bf_precision    = bf_precision,
         .bf_batch_wait_us = bf_batch_wait_us,
+        .cagra_batch_wait_us = cagra_batch_wait_us,
     };
     strncpy(cmd.shm_key, shm_key, sizeof(cmd.shm_key) - 1);
 

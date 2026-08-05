@@ -1,8 +1,8 @@
 # Playbook: 릴리스 및 업그레이드 (release-upgrade)
 
 pg_cuvs 설치/재설치, 데몬 재시작 순서, artifact magic 호환성 확인 절차.
-현재 저장소의 `default_version`은 **0.6.0**이다.
-`0.1.0`부터 `0.6.0`까지의 SQL migration chain이 저장소에 있고,
+현재 저장소의 `default_version`은 **0.7.0**이다.
+`0.1.0`부터 `0.7.0`까지의 SQL migration chain이 저장소에 있고,
 `test/sql/upgrade_path.sql`이 설치·업데이트 경로를 회귀 검증한다.
 
 이 playbook은 현재 버전의 신규 설치/재설치, cross-version UPDATE,
@@ -34,7 +34,7 @@ psql -d postgres -c "SELECT name, default_version, installed_version
 ```
  name   | default_version | installed_version
 ---------+-----------------+-------------------
- pg_cuvs | 0.6.0           | 0.6.0
+ pg_cuvs | 0.7.0           | 0.7.0
 ```
 **→ `installed_version IS NULL`:** `CREATE EXTENSION pg_cuvs`가 아직 실행되지 않음  
 **→ `installed_version != default_version`:** `ALTER EXTENSION pg_cuvs UPDATE` 필요
@@ -84,7 +84,7 @@ PostgreSQL을 재시작(`pg_ctl restart`)해야 한다. 데몬은 별도 프로�
 인덱스를 건너뛴다(journal에 magic 불일치 메시지). 이 경우 REINDEX로 현재 버전
 artifact를 새로 만들어야 한다.
 
-> 현재 대상 버전은 0.6.0이다. 소스 변경 없이 같은 코드베이스로 재빌드하면
+> 현재 대상 버전은 0.7.0이다. 소스 변경 없이 같은 코드베이스로 재빌드하면
 > magic은 동일하지만, format-breaking 변경이 있는 버전 전환은 해당 migration
 > script와 REINDEX 필요성을 별도로 확인한다. 저장소의 전체 버전 전환 경로는
 > `test/sql/upgrade_path.sql`에서 다룬다.
@@ -92,8 +92,8 @@ artifact를 새로 만들어야 한다.
 
 ### D. `ALTER EXTENSION pg_cuvs UPDATE` (cross-version)
 `pg_cuvs--<old>--<new>.sql` migration script가 있을 때 아래 명령으로 카탈로그를
-업데이트한다. 현재 저장소에는 `pg_cuvs--0.5.0--0.6.0.sql`을 포함한
-0.1.0→0.6.0 chain이 있다.
+업데이트한다. 현재 저장소에는 `pg_cuvs--0.6.0--0.7.0.sql`을 포함한
+0.1.0→0.7.0 chain이 있다.
 
 ---
 
@@ -218,7 +218,7 @@ sudo systemctl restart postgresql
 # 확장 버전 일치
 psql -d postgres -c "SELECT installed_version FROM pg_available_extensions
                      WHERE name='pg_cuvs';"
-# 기대: 0.6.0
+# 기대: 0.7.0
 ```
 
 ```bash
@@ -244,7 +244,7 @@ SELECT index_name, resident, search_count, last_status
 -- 기대: resident=t, last_status='ok'
 ```
 
-- [ ] `installed_version = default_version = 0.6.0`
+- [ ] `installed_version = default_version = 0.7.0`
 - [ ] `sudo systemctl is-active pg-cuvs-server` → `active`
 - [ ] journalctl에 `loaded index` 1줄 이상
 - [ ] `EXPLAIN` 결과에 GPU scan path 확인
@@ -269,5 +269,5 @@ SELECT index_name, resident, search_count, last_status
   `pg_config --pkglibdir` 경로가 설치 경로와 맞는지 확인.
 
 관련: `daemon-restart-recovery.md`, `persistence-corruption-recovery.md`.  
-설계 근거: `pg_cuvs.control(default_version=0.6.0)`,
+설계 근거: `pg_cuvs.control(default_version=0.7.0)`,
 `test/sql/upgrade_path.sql`, Makefile `install` / `install-server` 타겟.

@@ -530,7 +530,7 @@ static void
 test_bf_batch_group(void)
 {
     /* 5 requests, 2 distinct keys (A and B) interleaved: A B A A B. */
-    CuvsBfKey keys[5] = {
+    CuvsBatchKey keys[5] = {
         {1, 10, 0, 8},   /* A */
         {1, 20, 0, 8},   /* B */
         {1, 10, 0, 8},   /* A */
@@ -539,7 +539,7 @@ test_bf_batch_group(void)
     };
     int gid[5];
     int ng = -1;
-    cuvs_bf_batch_group(keys, 5, gid, &ng);
+    cuvs_batch_group(keys, 5, gid, &ng);
     ASSERT(ng == 2, "two distinct keys -> 2 groups");
     ASSERT(gid[0] == 0, "req0 (A) -> first-seen group 0");
     ASSERT(gid[1] == 1, "req1 (B) -> first-seen group 1");
@@ -549,37 +549,52 @@ test_bf_batch_group(void)
 
     /* precision distinguishes groups (same db/index/dim, different precision). */
     {
-        CuvsBfKey kp[2] = { {1, 10, 0, 8}, {1, 10, 1, 8} };
+        CuvsBatchKey kp[2] = { {1, 10, 0, 8}, {1, 10, 1, 8} };
         int g[2], n = -1;
-        cuvs_bf_batch_group(kp, 2, g, &n);
+        cuvs_batch_group(kp, 2, g, &n);
         ASSERT(n == 2 && g[0] != g[1], "precision distinguishes groups");
     }
     /* dim distinguishes groups. */
     {
-        CuvsBfKey kd[2] = { {1, 10, 0, 8}, {1, 10, 0, 16} };
+        CuvsBatchKey kd[2] = { {1, 10, 0, 8}, {1, 10, 0, 16} };
         int g[2], n = -1;
-        cuvs_bf_batch_group(kd, 2, g, &n);
+        cuvs_batch_group(kd, 2, g, &n);
         ASSERT(n == 2 && g[0] != g[1], "dim distinguishes groups");
     }
     /* index_oid distinguishes groups. */
     {
-        CuvsBfKey ki[2] = { {1, 10, 0, 8}, {1, 11, 0, 8} };
+        CuvsBatchKey ki[2] = { {1, 10, 0, 8}, {1, 11, 0, 8} };
         int g[2], n = -1;
-        cuvs_bf_batch_group(ki, 2, g, &n);
+        cuvs_batch_group(ki, 2, g, &n);
         ASSERT(n == 2 && g[0] != g[1], "index_oid distinguishes groups");
+    }
+    /* #160: mode distinguishes groups — the same index queried as cagra and as
+     * brute_force needs two different kernels, so they must never coalesce. */
+    {
+        CuvsBatchKey km[2] = { {1, 10, 0, 8, 0}, {1, 10, 0, 8, 1} };
+        int g[2], n = -1;
+        cuvs_batch_group(km, 2, g, &n);
+        ASSERT(n == 2 && g[0] != g[1], "mode distinguishes groups");
+    }
+    /* A 4-field positional key means mode=0 (cagra); two of them still group. */
+    {
+        CuvsBatchKey kz[2] = { {1, 10, 0, 8}, {1, 10, 0, 8, 0} };
+        int g[2], n = -1;
+        cuvs_batch_group(kz, 2, g, &n);
+        ASSERT(n == 1, "omitted mode defaults to 0 and still groups");
     }
     /* single request -> one group. */
     {
-        CuvsBfKey k1[1] = { {1, 10, 0, 8} };
+        CuvsBatchKey k1[1] = { {1, 10, 0, 8} };
         int g[1], n = -1;
-        cuvs_bf_batch_group(k1, 1, g, &n);
+        cuvs_batch_group(k1, 1, g, &n);
         ASSERT(n == 1 && g[0] == 0, "single request -> one group");
     }
     /* all identical -> one group, every id 0. */
     {
-        CuvsBfKey ks[4] = { {2,5,1,16}, {2,5,1,16}, {2,5,1,16}, {2,5,1,16} };
+        CuvsBatchKey ks[4] = { {2,5,1,16}, {2,5,1,16}, {2,5,1,16}, {2,5,1,16} };
         int g[4], n = -1;
-        cuvs_bf_batch_group(ks, 4, g, &n);
+        cuvs_batch_group(ks, 4, g, &n);
         ASSERT(n == 1 && g[0]==0 && g[1]==0 && g[2]==0 && g[3]==0,
                "all identical -> single group");
     }

@@ -36,7 +36,7 @@
  *   make install && make install-server
  * ---------------------------------------------------------------- */
 #define CUVS_PROTO_MAGIC   0x50435556u  /* 'VUCP' LE — "PG CUVS" tag */
-#define CUVS_PROTO_VERSION 1u
+#define CUVS_PROTO_VERSION 2u   /* 2: + cagra_batch_wait_us (#160) */
 
 /* ----------------------------------------------------------------
  * Op codes
@@ -148,6 +148,13 @@ typedef struct CuvsCmdFrame {
     uint32_t n_probes;  /* SEARCH_IVFPQ: IVF clusters to probe at query time */
     /* 3Q: EXTEND params */
     uint32_t max_chunk_size; /* EXTEND: 0 = auto (cagra::extend_params.max_chunk_size) */
+    /* #160: CAGRA micro-batch window, the cagra-path twin of bf_batch_wait_us.
+     * A separate field rather than a reinterpretation of bf_batch_wait_us: the
+     * daemon can route one request onto the brute-force path regardless of what
+     * the backend asked for (ADR-073 forces is_flat indexes there), so a single
+     * overloaded field would silently apply the cagra tuning to a BF dispatch.
+     * Two fields keep the two gates independently observable and tunable. */
+    uint32_t cagra_batch_wait_us; /* SEARCH: daemon CAGRA micro-batch window (0=off) */
     /* shm_key reused: EXTEND payload = [float32 vecs: n_vecs×dim][uint64_t tids: n_vecs]
      * COMPACT has no extra payload — daemon reads .tombstone directly. */
 } CuvsCmdFrame;
@@ -262,6 +269,11 @@ typedef struct CuvsIndexStats {
      * mid-struct (wire ABI extension — co-deploy daemon+extension; see the
      * struct-level comment above on why tail-only matters here). */
     uint64_t prefilter_fallback_count;
+    /* #160: coalesced CAGRA micro-batch dispatches for this index -- the
+     * cagra-path twin of bf_batch_count above, advanced once per
+     * cuvs_cagra_search_batch the batch worker issues (a dispatch may serve
+     * many requests). Appended at the struct TAIL per the convention above. */
+    uint64_t cagra_batch_count;
 } CuvsIndexStats;
 
 /* ----------------------------------------------------------------
@@ -408,6 +420,7 @@ int cuvs_ipc_search(
     uint32_t      search_mode,     /* Phase 3L: 0=cagra (default), 1=brute_force */
     uint32_t      bf_precision,    /* Phase 3L: 0=float32, 1=float16 (BF only) */
     uint32_t      bf_batch_wait_us,/* Phase 3L: daemon BF micro-batch window μs (0=off) */
+    uint32_t      cagra_batch_wait_us,/* #160: daemon CAGRA micro-batch window μs (0=off) */
     uint64_t     *tids_out,
     float        *dist_out,
     int          *n_out,
