@@ -97,7 +97,7 @@ Small tables route to CPU; large tables route to GPU automatically.
 | N < 10K, any dim | pgvector HNSW | IPC + daemon round-trip overhead exceeds GPU search benefit |
 | N 100K–10M, VRAM fits index | pg_cuvs CAGRA (GPU search) | Hot tier, low latency; crossover vs pgvector appears around N≈50K (synthetic clustered data; verify with your embedding distribution) |
 | Fast build/rebuild needed, CPU serving preferred | CAGRA build + `USING pg_cuvs_hnsw` | ~2× faster than pgvector native build on real embeddings (1M×1024, end-to-end); much higher on synthetic random data (1M×384, pgvector's HNSW worst case). Serves as standard pgvector HNSW afterward |
-| On-prem RAG, embedding GPU pool already available | Reuse GPU for batch index build via 3I | GPU pool not idle; online search stays on pgvector HNSW CPU path |
+| On-prem RAG, embedding GPU pool already available | Reuse GPU for batch index build via the GPU Build Accelerator — the HNSW export path (GPU CAGRA build → pgvector-servable HNSW), internal phase 3I | GPU pool not idle; online search stays on pgvector HNSW CPU path |
 | Larger-than-VRAM / billion-scale / NVMe cold tier | pgvectorscale DiskANN or VectorChord | pg_cuvs 3B DiskANN path is a no-go in cuVS 26.04; revisit when demand is confirmed |
 | Multi-GPU horizontal scale | pg_cuvs CAGRA with `shard_count` | Recall improves with sharding; latency increases due to merge overhead |
 
