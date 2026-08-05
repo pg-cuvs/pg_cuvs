@@ -425,7 +425,8 @@ gpu-install:
 		$(REMOTE_ENV) && \
 		sudo -E make install"
 
-gpu-test:
+# #169: gated on freshness — a stale deployment must not yield a green run.
+gpu-test: gpu-verify-deployed
 	ssh -tt $(VM_HOST) "cd ~/pg_cuvs && \
 		$(REMOTE_ENV) && \
 		make installcheck"
@@ -434,6 +435,28 @@ gpu-server:
 	ssh -tt $(VM_HOST) "cd ~/pg_cuvs && \
 		$(REMOTE_ENV) && \
 		make server && sudo make install-server"
+
+# ---- #169: deploy = install BOTH artifacts, then reload BOTH processes ------
+# gpu-build makes only pg_cuvs.so; the daemon binary needs gpu-server. And an
+# installed artifact is not a running one: the .so is loaded at postmaster start
+# (shared_preload_libraries) and the daemon is long-lived. Skipping either half
+# leaves the harness testing old code with no failure signal — see #169 for the
+# three incidents. Prefer this over calling gpu-build/gpu-install by hand.
+gpu-deploy: sync gpu-build gpu-install gpu-server gpu-reload gpu-verify-deployed
+
+# Restart PostgreSQL and the daemon, then wait for the daemon to reach `active`
+# (first CUDA context takes 12s-3min). Piped over stdin like gpu-postinstall.
+gpu-reload:
+	ssh $(VM_HOST) "$(REMOTE_ENV) && bash -s" \
+		< infra/scripts/setup/reload-deployed.sh
+
+# The staleness guard already existed — gpu-preflight.sh — but gpu-run.sh was
+# its only caller, so every `make gpu-test*` ran outside it. Wiring it in here
+# is most of what #169 needed; the script itself only gained the
+# artifact-vs-source check (its checks 1-4 compare installed against running,
+# which cannot see an install that never happened).
+gpu-verify-deployed:
+	infra/scripts/gpu-preflight.sh
 
 # Idempotent post-install: home traversal perms, libstdc++ symlinks,
 # PG role, and shared_preload_libraries setup. Run once after gpu-install.
@@ -538,7 +561,7 @@ gpu-test-asan-export:
 	ssh $(VM_HOST) "cd ~/pg_cuvs && $(REMOTE_ENV) && bash -s" < infra/scripts/tests/asan-export-restart.sh
 
 # Full ladder: unit -> regress -> isolation -> daemon faults -> e2e durability.
-gpu-test-all: gpu-test-unit gpu-test-regress gpu-test-isolation gpu-test-daemon \
+gpu-test-all: gpu-verify-deployed gpu-test-unit gpu-test-regress gpu-test-isolation gpu-test-daemon \
 	gpu-test-e2e gpu-test-delta-restart
 
 gpu-server-start:
@@ -631,5 +654,7 @@ gpu-anbench-agg:
 		\$$PY bench/legacy/anbench/aggregate.py"
 	rsync -avz $(VM_HOST):~/pg_cuvs/design/anbench/ design/anbench/
 
-# Convenience: full cycle on the VM (sync → build → install → test).
-gpu-cycle: sync gpu-build gpu-install gpu-test
+# Convenience: full cycle on the VM. Routed through gpu-deploy (#169): the old
+# form (sync build install test) rebuilt only the extension and restarted
+# nothing, so it could test code that was never deployed.
+gpu-cycle: gpu-deploy gpu-test
