@@ -228,6 +228,7 @@ typedef struct IndexEntry {
     uint32_t        last_returned_k;   /* rows last OK search returned */
     uint64_t        delta_merged_count; /* searches where daemon merged delta on GPU */
     uint64_t        bf_batch_count;     /* Phase 3L-9: coalesced BF batch dispatches */
+    uint64_t        cagra_batch_count;  /* #160: coalesced CAGRA batch dispatches */
     uint64_t        prefilter_fallback_count; /* #133/ADR-083: 3O->gpu_bf_prefilter retries
                                                 * after a short-fill (mean_returned<<k)
                                                 * detection actually falls back (not merely
@@ -271,6 +272,7 @@ reset_entry_stats(IndexEntry *e)
     e->last_returned_k    = 0;
     e->delta_merged_count = 0;
     e->bf_batch_count     = 0;
+    e->cagra_batch_count  = 0;
     e->prefilter_fallback_count = 0;
     e->last_error[0]      = '\0';
     e->last_warmup_at     = 0;   /* Phase 3D warmup observability */
@@ -398,30 +400,36 @@ static int             g_warmup_nthreads = 2;
 static pthread_t       g_warmup_tids[8];
 
 /* ----------------------------------------------------------------
- * Phase 3L-9: brute-force micro-batch worker (single consumer).
+ * Phase 3L-9 / #160: single-query micro-batch worker (single consumer).
  *
- * When a connection thread runs an unsharded brute_force search with
- * cmd->bf_batch_wait_us > 0, it enqueues a request here (instead of dispatching
- * immediately) and blocks on the request's `done` flag. One dedicated worker
- * thread coalesces queued requests that share a (db,index,precision,dim) key
- * into a single cuvs_bf_search_batch GPU dispatch, then wakes each producer.
+ * When a connection thread runs an unsharded search with a batch window set for
+ * its path — cmd->bf_batch_wait_us for brute_force (3L-9), cmd->
+ * cagra_batch_wait_us for cagra (#160) — it enqueues a request here (instead of
+ * dispatching immediately) and blocks on the request's `done` flag. One
+ * dedicated worker thread coalesces queued requests that share a
+ * (db,index,precision,dim,mode) key into a single batched GPU dispatch —
+ * cuvs_bf_search_batch or cuvs_cagra_search_batch — then wakes each producer.
+ * The `mode` component of the key is what keeps the two algorithms in separate
+ * dispatches while sharing one queue and one worker.
  *
  * Lock order (no thread ever holds both): a producer takes g_index_mutex for
  * the cheap stale/metric/dim preamble, RELEASES it, then takes g_batch_mtx to
  * enqueue; the worker moves the queue out under g_batch_mtx, RELEASES it, then
- * takes g_index_mutex for the GPU work. Gated entirely by bf_batch_wait_us>0 —
- * with the default 0 nothing is ever enqueued and this subsystem is inert.
+ * takes g_index_mutex for the GPU work. Gated entirely by a window > 0 — with
+ * both defaults at 0 nothing is ever enqueued and this subsystem is inert.
  * ---------------------------------------------------------------- */
 #define CUVS_BATCH_MAX 256          /* cap on concurrently queued requests */
 
 typedef struct CuvsBatchRequest {
-    CuvsBatchKey key;          /* db_oid, index_oid, precision, dim */
+    CuvsBatchKey key;          /* db_oid, index_oid, precision, dim, mode */
     const float *query;        /* producer-owned, dim floats, valid until done */
     int          k;            /* requested top-k */
     uint32_t     wait_us;      /* this request's batch window hint */
     CuvsResult  *out;          /* producer-owned [k]; worker writes n_out results */
     int          n_out;        /* results written by the worker */
     int          status;       /* CUVS_STATUS_* set by the worker */
+    int          delta_merged; /* #160: 1 if the worker folded the .delta in */
+    uint32_t     latency_us;   /* #160: dispatch wall-clock, for the reply header */
     int          done;         /* 0 = pending, 1 = worker finished this request */
 } CuvsBatchRequest;
 
@@ -2711,6 +2719,85 @@ handle_search_bf_transient(int client_fd, const CuvsCmdFrame *cmd)
 }
 
 /* ----------------------------------------------------------------
+ * #160: finish ONE unsharded CAGRA single-query search.
+ *
+ * Maps the graph's item_ids to heap TIDs and, when the resident GPU delta cache
+ * produced candidates, merges them into the same metric-aware distance order —
+ * the post-processing the immediate path has always done. Extracted so the
+ * inline dispatch in handle_search and the batch worker share one implementation
+ * and cannot drift on delta semantics, id-range filtering, or the merge order.
+ *
+ * The id-range test (`id < 0 || id >= n`) is also what discards the TAIL
+ * CONTRACT padding (CUVS_PAD_ITEM_ID == -1) that both the single-query and the
+ * batch kernel write into slots the corpus could not fill.
+ *
+ *   base / k  — the k candidates from cuvs_cagra_search[_batch] for THIS request
+ *   draw / n_dc — delta-cache candidates for this request, or NULL/0 if there is
+ *                 no usable delta (absent, or its search failed — caller decides)
+ *   out       — caller-owned [k]
+ *
+ * Returns the number of results written; sets *delta_merged_out. Caller holds
+ * g_index_mutex (g_merge_metric and the entry's counters are read/written here).
+ * ---------------------------------------------------------------- */
+static int
+cagra_finish_one(IndexEntry *e, const CuvsSearchResult *base, int k,
+                 const CuvsSearchResult *draw, int n_dc,
+                 CuvsResult *out, int *delta_merged_out)
+{
+    int n_valid = 0;
+    int merged  = 0;
+
+    if (draw && n_dc > 0)
+    {
+        CuvsResult *cand = malloc((size_t) (k + n_dc) * sizeof(CuvsResult));
+        if (cand)
+        {
+            int n_total = 0;
+            for (int i = 0; i < k; i++)              /* base candidates */
+            {
+                int64_t id = base[i].item_id;
+                if (id < 0 || id >= e->n_vecs) continue;
+                cand[n_total].tid      = e->tids[id];
+                cand[n_total].distance = base[i].distance;
+                n_total++;
+            }
+            for (int i = 0; i < n_dc; i++)           /* delta candidates */
+            {
+                int64_t id = draw[i].item_id;
+                if (id < 0 || id >= e->n_delta) continue;
+                cand[n_total].tid      = e->delta_tids[id];
+                cand[n_total].distance = draw[i].distance;
+                n_total++;
+            }
+            g_merge_metric = e->metric;   /* read by delta_cand_cmp under the mutex */
+            qsort(cand, (size_t) n_total, sizeof(CuvsResult), delta_cand_cmp);
+            n_valid = (n_total < k) ? n_total : k;
+            memcpy(out, cand, (size_t) n_valid * sizeof(CuvsResult));
+            merged = 1;
+            e->delta_merged_count++;
+            free(cand);
+        }
+    }
+
+    if (!merged)
+    {
+        /* Base-only: no usable delta cache — map item_ids to TIDs. */
+        for (int i = 0; i < k; i++)
+        {
+            int64_t id = base[i].item_id;
+            if (id < 0 || id >= e->n_vecs) continue;
+            out[n_valid].tid      = e->tids[id];
+            out[n_valid].distance = base[i].distance;
+            n_valid++;
+        }
+    }
+
+    if (delta_merged_out)
+        *delta_merged_out = merged;
+    return n_valid;
+}
+
+/* ----------------------------------------------------------------
  * Handle SEARCH command
  * ---------------------------------------------------------------- */
 static void
@@ -2903,7 +2990,8 @@ handle_search(int client_fd, const CuvsCmdFrame *cmd)
                  && e->handle != NULL && e->rev_tids != NULL
                  && e->rev_item_ids != NULL))
         {
-            CuvsBatchKey     key  = { cmd->db_oid, cmd->index_oid, cmd->bf_precision, cmd->dim };
+            CuvsBatchKey     key  = { cmd->db_oid, cmd->index_oid, cmd->bf_precision,
+                                      cmd->dim, 1 /* mode: brute_force */ };
             CuvsResult   *rout = malloc((size_t) k * sizeof(CuvsResult));
             int           enqueued = 0;
             CuvsBatchRequest req;
@@ -3724,6 +3812,93 @@ handle_search(int client_fd, const CuvsCmdFrame *cmd)
         }
     }
 
+    /* #160: micro-batched cagra path, the twin of the 3L-9 block above. Every
+     * other unsharded shape has already returned by here (brute_force/flat,
+     * sharded fanout, a successful CPU HNSW), so this is exactly the single
+     * cagra dispatch point. Filtered requests are excluded: the cagra path's
+     * filtering lives in the 3O/D-wedge blocks above, and a coalesced dispatch
+     * has no per-request bitset — batching one here would silently drop the
+     * whitelist. handle==NULL is left to the ADR-073 guard just below, which
+     * fails closed with a clearer status than the worker could.
+     *
+     * Mechanically identical to the BF enqueue: release g_index_mutex (lock
+     * order is index-then-batch), enqueue, block until the worker fills our
+     * result. The query shm stays mapped (req.query points at it) until we
+     * reply. On a full queue we degrade to the immediate path below by
+     * re-acquiring the lock and re-finding e. */
+    if (cmd->cagra_batch_wait_us > 0 && g_batch_worker_started
+        && cmd->n_filter_tids == 0 && e->handle != NULL)
+    {
+        CuvsBatchKey     key = { cmd->db_oid, cmd->index_oid, 0 /* n/a */,
+                                 cmd->dim, 0 /* mode: cagra */ };
+        CuvsResult      *rout = malloc((size_t) k * sizeof(CuvsResult));
+        int              enqueued = 0;
+        CuvsBatchRequest req;
+
+        pthread_mutex_unlock(&g_index_mutex);   /* release BEFORE taking g_batch_mtx */
+
+        if (rout)
+        {
+            req.key     = key;   req.query  = query;  req.k = k;
+            req.wait_us = cmd->cagra_batch_wait_us;
+            req.out     = rout;  req.n_out  = 0;
+            req.status  = CUVS_STATUS_ERROR;
+            req.delta_merged = 0; req.latency_us = 0; req.done = 0;
+
+            pthread_mutex_lock(&g_batch_mtx);
+            if (g_batch_queue_n < CUVS_BATCH_MAX)
+            {
+                g_batch_queue[g_batch_queue_n++] = &req;
+                enqueued = 1;
+                pthread_cond_signal(&g_batch_cond);
+                while (!req.done)                       /* spurious-wakeup safe */
+                    pthread_cond_wait(&g_batch_done_cond, &g_batch_mtx);
+            }
+            pthread_mutex_unlock(&g_batch_mtx);
+        }
+
+        if (enqueued)
+        {
+            munmap(query, vec_bytes);
+            CuvsReplyHeader hdr = {0};
+            hdr.status = (uint32_t) req.status;
+            if (req.status == CUVS_STATUS_OK)
+            {
+                hdr.n_results    = (uint32_t) req.n_out;
+                hdr.latency_us   = req.latency_us;
+                hdr.delta_merged = (uint32_t) req.delta_merged;
+                send_all(client_fd, &hdr, sizeof(hdr));
+                if (req.n_out > 0)
+                    send_all(client_fd, rout, (size_t) req.n_out * sizeof(CuvsResult));
+            }
+            else
+            {
+                if (req.status == CUVS_STATUS_STALE)
+                    strncpy(hdr.error, "index stale (writes since build)",
+                            sizeof(hdr.error) - 1);
+                send_all(client_fd, &hdr, sizeof(hdr));
+            }
+            free(rout);
+            return;
+        }
+
+        /* Could not enqueue (queue full / malloc fail): degrade to the
+         * immediate path. Re-acquire the lock and re-find the entry. */
+        free(rout);
+        pthread_mutex_lock(&g_index_mutex);
+        e = find_index(cmd->db_oid, cmd->index_oid);
+        if (!e)
+        {
+            munmap(query, vec_bytes);
+            pthread_mutex_unlock(&g_index_mutex);
+            CuvsReplyHeader hdr = {0};
+            hdr.status = CUVS_STATUS_NOT_FOUND;
+            send_all(client_fd, &hdr, sizeof(hdr));
+            return;
+        }
+        /* fall through to the immediate path with e + the still-mapped query */
+    }
+
     CuvsSearchResult *raw = malloc(k * sizeof(CuvsSearchResult));
     if (!raw)
     {
@@ -3786,62 +3961,31 @@ handle_search(int client_fd, const CuvsCmdFrame *cmd)
     }
 
     /* Phase 3B: refresh the resident GPU delta cache from the current .delta;
-     * if present, brute-force it on the GPU and merge with the base candidates
-     * by distance (same cuVS scale, metric-aware order). The query stays mmap'd
-     * until after the delta search. */
+     * if present, brute-force it on the GPU so cagra_finish_one can merge it
+     * with the base candidates by distance (same cuVS scale, metric-aware
+     * order). The query stays mmap'd until after the delta search. */
     int delta_merged = 0;
     int n_valid      = 0;
+    CuvsSearchResult *draw = NULL;
+    int               n_dc = 0;
     refresh_delta_cache(e);
     if (e->delta_idx && e->n_delta > 0)
     {
-        int eff_k = (int) ((int64_t) k < e->n_delta ? (int64_t) k : e->n_delta);
-        CuvsSearchResult *draw = malloc((size_t) eff_k * sizeof(CuvsSearchResult));
-        CuvsResult       *cand = malloc((size_t) (k + eff_k) * sizeof(CuvsResult));
-        if (draw && cand
-            && cuvs_bf_search(e->delta_idx, query, (int) cmd->dim, eff_k, draw, e->gpu_device_id) == 0)
+        n_dc = (int) ((int64_t) k < e->n_delta ? (int64_t) k : e->n_delta);
+        draw = malloc((size_t) n_dc * sizeof(CuvsSearchResult));
+        if (!draw
+            || cuvs_bf_search(e->delta_idx, query, (int) cmd->dim, n_dc, draw,
+                              e->gpu_device_id) != 0)
         {
-            int n_total = 0;
-            for (int i = 0; i < k; i++)            /* base candidates */
-            {
-                int64_t id = raw[i].item_id;
-                if (id < 0 || id >= e->n_vecs) continue;
-                cand[n_total].tid      = e->tids[id];
-                cand[n_total].distance = raw[i].distance;
-                n_total++;
-            }
-            for (int i = 0; i < eff_k; i++)        /* delta candidates */
-            {
-                int64_t id = draw[i].item_id;
-                if (id < 0 || id >= e->n_delta) continue;
-                cand[n_total].tid      = e->delta_tids[id];
-                cand[n_total].distance = draw[i].distance;
-                n_total++;
-            }
-            g_merge_metric = e->metric;            /* read by delta_cand_cmp under the mutex */
-            qsort(cand, (size_t) n_total, sizeof(CuvsResult), delta_cand_cmp);
-            n_valid = (n_total < k) ? n_total : k;
-            memcpy(results, cand, (size_t) n_valid * sizeof(CuvsResult));
-            delta_merged = 1;
-            e->delta_merged_count++;
+            free(draw);             /* no usable delta -> base-only, as before */
+            draw = NULL;
+            n_dc = 0;
         }
-        free(draw);
-        free(cand);
     }
     munmap(query, vec_bytes);
 
-    if (!delta_merged)
-    {
-        /* Base-only: no usable delta cache — map item_ids to TIDs. */
-        for (int i = 0; i < k; i++)
-        {
-            int64_t item_id = raw[i].item_id;
-            if (item_id < 0 || item_id >= e->n_vecs)
-                continue;
-            results[n_valid].tid      = e->tids[item_id];
-            results[n_valid].distance = raw[i].distance;
-            n_valid++;
-        }
-    }
+    n_valid = cagra_finish_one(e, raw, k, draw, n_dc, results, &delta_merged);
+    free(draw);
     free(raw);
 
     clock_gettime(CLOCK_MONOTONIC, &t1);
@@ -5845,6 +5989,7 @@ handle_stats(int client_fd, const CuvsCmdFrame *cmd)
         s->shard_count        = (uint32_t)e->shard_count;
         s->search_mode        = e->last_search_mode; /* Phase 3I-1 */
         s->bf_batch_count     = e->bf_batch_count;   /* Phase 3L-9 */
+        s->cagra_batch_count  = e->cagra_batch_count; /* #160 */
         s->prefilter_fallback_count = e->prefilter_fallback_count; /* #133 */
         s->n_extended         = e->n_extended;
         s->compact_count      = e->compact_count;
@@ -7655,7 +7800,7 @@ connection_thread(void *arg)
  * fire while a connection thread holds g_index_mutex) and undefined
  * behavior from non-async-signal-safe calls.
  * ---------------------------------------------------------------- */
-/* Phase 3L-9: mark every queued BF request done with `status` and wake its
+/* Phase 3L-9: mark every queued request done with `status` and wake its
  * producer. Caller holds g_batch_mtx. */
 static void
 batch_fail_all_locked(int status)
@@ -7771,10 +7916,142 @@ bf_batch_run_group(CuvsBatchRequest **batch, const int *gid, int n, int g)
     free(raw);
 }
 
-/* Phase 3L-9: process the currently queued BF requests. Caller holds g_batch_mtx;
- * returns holding it. Snapshots + clears the queue (so producers can fill the
- * next batch), releases g_batch_mtx, groups by key, runs one cuvs_bf_search_batch
- * per group, then re-locks and wakes every producer in this batch. */
+/* #160: run one coalesced CAGRA group (requests in `batch` with gid[i]==g, all
+ * sharing a (db,index,dim,mode=cagra) key) as a single cuvs_cagra_search_batch
+ * dispatch. Mirrors bf_batch_run_group: acquires g_index_mutex for the GPU work
+ * (the caller must NOT hold g_batch_mtx), writes each member's
+ * out/n_out/status/delta_merged/latency_us but not `done`.
+ *
+ * Requests may ask for different k, so the dispatch uses max(k) and each
+ * request reads back only its own prefix — the batch kernel writes results
+ * row-major [q*maxk + j] with TAIL CONTRACT padding beyond what the corpus
+ * could fill, and cagra_finish_one drops the padding by id range.
+ *
+ * The .delta is folded in exactly as the immediate path does, via one extra
+ * batched brute-force dispatch over the resident delta cache shared by the
+ * whole group (not one per request), then cagra_finish_one merges per request.
+ * All per-request post-processing — delta merge, id-range filtering, metric-
+ * aware ordering, per-request stat recording — goes through the same helper the
+ * immediate path uses, so the batched answer is the immediate answer. */
+static void
+cagra_batch_run_group(CuvsBatchRequest **batch, const int *gid, int n, int g)
+{
+    int idx[CUVS_BATCH_MAX], Q = 0;
+    for (int i = 0; i < n; i++)
+        if (gid[i] == g)
+            idx[Q++] = i;
+    if (Q == 0)
+        return;
+
+    CuvsBatchRequest *r0   = batch[idx[0]];
+    int               dim  = (int) r0->key.dim;
+    int               maxk = 0;
+    for (int i = 0; i < Q; i++)
+        if (batch[idx[i]]->k > maxk)
+            maxk = batch[idx[i]]->k;
+
+    pthread_mutex_lock(&g_index_mutex);
+    IndexEntry *e = find_index(r0->key.db_oid, r0->key.index_oid);
+    if (!e && load_index(r0->key.db_oid, r0->key.index_oid) == 0)
+        e = find_index(r0->key.db_oid, r0->key.index_oid);
+
+    int status = CUVS_STATUS_OK;
+    if (!e)
+        status = CUVS_STATUS_NOT_FOUND;
+    else if (e->stale)
+        status = CUVS_STATUS_STALE;
+    else if (e->handle == NULL)
+        status = CUVS_STATUS_NO_VECTORS;   /* ADR-073: flat/BF-only index */
+    if (status != CUVS_STATUS_OK)
+    {
+        if (e)
+            record_search_stat(e, status, 0, NULL);
+        pthread_mutex_unlock(&g_index_mutex);
+        for (int i = 0; i < Q; i++) { batch[idx[i]]->status = status; batch[idx[i]]->n_out = 0; }
+        return;
+    }
+
+    float            *queries = malloc((size_t) Q * (size_t) dim * sizeof(float));
+    CuvsSearchResult *raw     = malloc((size_t) Q * (size_t) maxk * sizeof(CuvsSearchResult));
+    if (!queries || !raw)
+    {
+        free(queries); free(raw);
+        pthread_mutex_unlock(&g_index_mutex);
+        for (int i = 0; i < Q; i++) { batch[idx[i]]->status = CUVS_STATUS_OOM_FALLBACK; batch[idx[i]]->n_out = 0; }
+        return;
+    }
+    for (int i = 0; i < Q; i++)
+        memcpy(queries + (size_t) i * dim, batch[idx[i]]->query, (size_t) dim * sizeof(float));
+
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    int ret = cuvs_cagra_search_batch(e->handle, queries, Q, dim, maxk, raw,
+                                      e->gpu_device_id);
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    uint32_t latency_us = (uint32_t) ((t1.tv_sec - t0.tv_sec) * 1000000 +
+                                      (t1.tv_nsec - t0.tv_nsec) / 1000);
+
+    if (ret != 0)
+    {
+        record_search_stat(e, CUVS_STATUS_OOM_FALLBACK, 0, NULL);
+        pthread_mutex_unlock(&g_index_mutex);
+        free(queries); free(raw);
+        for (int i = 0; i < Q; i++) { batch[idx[i]]->status = CUVS_STATUS_OOM_FALLBACK; batch[idx[i]]->n_out = 0; }
+        return;
+    }
+
+    /* Phase 3B delta, batched: one dispatch for the group instead of one per
+     * request. A failure here is not fatal — the group falls back to base-only
+     * results with delta_merged=0, the same fail-open the immediate path has. */
+    CuvsSearchResult *draw = NULL;
+    int               n_dc = 0;
+    refresh_delta_cache(e);
+    if (e->delta_idx && e->n_delta > 0)
+    {
+        n_dc = (int) ((int64_t) maxk < e->n_delta ? (int64_t) maxk : e->n_delta);
+        draw = malloc((size_t) Q * (size_t) n_dc * sizeof(CuvsSearchResult));
+        if (!draw
+            || cuvs_bf_search_batch(e->delta_idx, queries, Q, dim, n_dc, draw,
+                                    e->gpu_device_id) != 0)
+        {
+            free(draw);
+            draw = NULL;
+            n_dc = 0;
+        }
+    }
+
+    for (int i = 0; i < Q; i++)
+    {
+        CuvsBatchRequest *r = batch[idx[i]];
+        /* This request's delta depth is min(its k, n_delta) — what the
+         * immediate path would have used for the same k. */
+        int di = (n_dc < r->k) ? n_dc : r->k;
+        int dm = 0;
+
+        r->n_out = cagra_finish_one(e, raw + (size_t) i * maxk, r->k,
+                                    draw ? draw + (size_t) i * n_dc : NULL, di,
+                                    r->out, &dm);
+        r->delta_merged = dm;
+        r->latency_us   = latency_us;
+        r->status       = CUVS_STATUS_OK;
+        record_search_stat(e, CUVS_STATUS_OK, latency_us, NULL);   /* per request */
+    }
+    e->cagra_batch_count++;         /* one coalesced GPU dispatch served Q requests */
+    e->last_search_mode = 0;        /* gpu_cagra */
+    e->last_requested_k = (uint32_t) r0->k;
+    e->last_returned_k  = (uint32_t) batch[idx[0]]->n_out;
+    pthread_mutex_unlock(&g_index_mutex);
+    free(queries);
+    free(raw);
+    free(draw);
+}
+
+/* Phase 3L-9 / #160: process the currently queued requests. Caller holds
+ * g_batch_mtx; returns holding it. Snapshots + clears the queue (so producers
+ * can fill the next batch), releases g_batch_mtx, groups by key, runs one
+ * batched dispatch per group — cuvs_bf_search_batch or cuvs_cagra_search_batch
+ * depending on the group's mode, which the key already separated — then
+ * re-locks and wakes every producer in this batch. */
 static void
 batch_process_locked(void)
 {
@@ -7796,7 +8073,17 @@ batch_process_locked(void)
     cuvs_batch_group(keys, n, gid, &ng);
 
     for (int g = 0; g < ng; g++)
-        bf_batch_run_group(batch, gid, n, g);
+    {
+        /* Every member of a group shares the key, so the first member's mode
+         * decides the kernel for the whole group. */
+        int gm = 1;
+        for (int i = 0; i < n; i++)
+            if (gid[i] == g) { gm = (int) batch[i]->key.mode; break; }
+        if (gm == 0)
+            cagra_batch_run_group(batch, gid, n, g);
+        else
+            bf_batch_run_group(batch, gid, n, g);
+    }
 
     pthread_mutex_lock(&g_batch_mtx);
     for (int i = 0; i < n; i++)
@@ -7804,10 +8091,10 @@ batch_process_locked(void)
     pthread_cond_broadcast(&g_batch_done_cond);
 }
 
-/* Phase 3L-9: the single BF micro-batch consumer thread. Idle (1s poll) until a
- * request is enqueued or shutdown. On the first queued request it waits that
- * request's bf_batch_wait_us window (lock released, so more accumulate) then
- * coalesces everything queued into one batch. */
+/* Phase 3L-9 / #160: the single micro-batch consumer thread, shared by both
+ * algorithms. Idle (1s poll) until a request is enqueued or shutdown. On the
+ * first queued request it waits that request's window (lock released, so more
+ * accumulate) then coalesces everything queued into one batch. */
 static void *
 batch_worker_thread(void *arg)
 {
@@ -7862,7 +8149,7 @@ graceful_shutdown(void)
 {
     LOG_INFO("pg_cuvs_server: SIGTERM received, serializing indexes...\n");
 
-    /* Phase 3L-9: wake the BF batch worker (g_shutdown is already set) so it
+    /* Phase 3L-9: wake the batch worker (g_shutdown is already set) so it
      * fails any queued requests and exits, then join it. Always spawned. */
     if (g_batch_worker_started)
     {
@@ -7870,7 +8157,7 @@ graceful_shutdown(void)
         pthread_cond_broadcast(&g_batch_cond);
         pthread_mutex_unlock(&g_batch_mtx);
         pthread_join(g_batch_worker_tid, NULL);
-        LOG_INFO("bf_batch: worker thread joined\n");
+        LOG_INFO("batch: worker thread joined\n");
     }
 
     /* Phase 3D: signal warmup workers to exit and wait for them. */
@@ -8303,7 +8590,7 @@ main(int argc, char **argv)
     }
 
     /* Phase 3L-9: spawn the single BF micro-batch consumer. Always running but
-     * inert until a request with bf_batch_wait_us>0 is enqueued. */
+     * inert until a request with a non-zero batch window is enqueued. */
     if (pthread_create(&g_batch_worker_tid, NULL, batch_worker_thread, NULL) == 0)
         g_batch_worker_started = 1;
     else

@@ -568,6 +568,21 @@ test_bf_batch_group(void)
         cuvs_batch_group(ki, 2, g, &n);
         ASSERT(n == 2 && g[0] != g[1], "index_oid distinguishes groups");
     }
+    /* #160: mode distinguishes groups — the same index queried as cagra and as
+     * brute_force needs two different kernels, so they must never coalesce. */
+    {
+        CuvsBatchKey km[2] = { {1, 10, 0, 8, 0}, {1, 10, 0, 8, 1} };
+        int g[2], n = -1;
+        cuvs_batch_group(km, 2, g, &n);
+        ASSERT(n == 2 && g[0] != g[1], "mode distinguishes groups");
+    }
+    /* A 4-field positional key means mode=0 (cagra); two of them still group. */
+    {
+        CuvsBatchKey kz[2] = { {1, 10, 0, 8}, {1, 10, 0, 8, 0} };
+        int g[2], n = -1;
+        cuvs_batch_group(kz, 2, g, &n);
+        ASSERT(n == 1, "omitted mode defaults to 0 and still groups");
+    }
     /* single request -> one group. */
     {
         CuvsBatchKey k1[1] = { {1, 10, 0, 8} };

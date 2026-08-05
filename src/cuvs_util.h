@@ -444,20 +444,26 @@ int  cuvs_circuit_is_open(uint32_t index_oid);
 void cuvs_circuit_reset_all(void);                    /* zeroes all breaker state */
 
 /* ----------------------------------------------------------------
- * Phase 3L-9: brute-force micro-batch grouping (pure, daemon + test).
+ * Phase 3L-9 / #160: micro-batch grouping (pure, daemon + test).
  *
- * The daemon's BF batch worker collects concurrent brute_force requests and
- * coalesces those targeting the SAME (db_oid, index_oid, precision, dim) into a
- * single cuvs_bf_search_batch dispatch. cuvs_batch_group is the pure
- * indexing core (no threads, no CUDA): it assigns each request a group id so
- * requests with an identical key share a group. Group ids are dense and
- * assigned in first-seen order. O(n^2) but n is bounded by the batch cap.
+ * The daemon's batch worker collects concurrent single-query searches and
+ * coalesces those targeting the SAME (db_oid, index_oid, precision, dim, mode)
+ * into a single batched dispatch — cuvs_bf_search_batch for mode=1
+ * (brute_force, Phase 3L-9), cuvs_cagra_search_batch for mode=0 (cagra, #160).
+ * cuvs_batch_group is the pure indexing core (no threads, no CUDA): it assigns
+ * each request a group id so requests with an identical key share a group.
+ * Group ids are dense and assigned in first-seen order. O(n^2) but n is bounded
+ * by the batch cap.
  * ---------------------------------------------------------------- */
 typedef struct CuvsBatchKey {
     uint32_t db_oid;
     uint32_t index_oid;
-    uint32_t precision;   /* 0=float32, 1=float16 */
+    uint32_t precision;   /* 0=float32, 1=float16 (brute_force only) */
     uint32_t dim;
+    /* #160: same values as CuvsCmdFrame.search_mode, so cagra and brute_force
+     * requests for one index never land in the same dispatch. Appended last so
+     * a 4-field positional initializer still means mode=0 (cagra). */
+    uint32_t mode;        /* 0=cagra, 1=brute_force */
 } CuvsBatchKey;
 
 /* group_id_out[i] = group of request i (requests with equal keys share it);

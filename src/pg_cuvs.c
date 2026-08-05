@@ -127,6 +127,7 @@ int   cuvs_warmup_threads          = 2;    /* background download/load threads i
 int   cuvs_search_mode             = 0;    /* 0=cagra (default), 1=brute_force (Phase 3L) */
 int   cuvs_bf_precision            = 0;    /* 0=float32 (default), 1=float16 (Phase 3L) */
 int   cuvs_bf_batch_wait_us        = 0;    /* daemon BF micro-batch window μs; 0=off (Phase 3L) */
+int   cuvs_cagra_batch_wait_us     = 0;    /* daemon CAGRA micro-batch window μs; 0=off (#160) */
 int   cuvs_max_batch_queries       = 1024; /* pg_cuvs_batch_search Q cap (Phase 3M) */
 bool  cuvs_filtered_knn_hook_enabled = false; /* ADR-063 Option A custom scan hook */
 /* Phase 4C: background auto-compaction */
@@ -995,6 +996,21 @@ _PG_init(void)
         "requests arriving within this window into a single GPU dispatch, raising "
         "throughput for bandwidth-bound BF search. 0 dispatches each request immediately.",
         &cuvs_bf_batch_wait_us,
+        0, 0, 10000,
+        PGC_USERSET,
+        0, NULL, NULL, NULL);
+
+    DefineCustomIntVariable(
+        "cuvs.cagra_batch_wait_us",
+        "Daemon CAGRA micro-batch window in microseconds (0 = disabled).",
+        "#160. The cagra-path twin of cuvs.bf_batch_wait_us: when > 0, the daemon "
+        "coalesces concurrent single-query cagra searches arriving within this window "
+        "into one batched GPU dispatch. Under concurrency this improves throughput AND "
+        "p50 together, because queuing on the daemon's index mutex costs more than the "
+        "window; with a single client it is pure added latency, which is why the default "
+        "is 0. Coalesced requests run the multi-CTA batch kernel, whose recall can differ "
+        "from the single-query kernel by around 0.003 depending on the graph (issue #144).",
+        &cuvs_cagra_batch_wait_us,
         0, 0, 10000,
         PGC_USERSET,
         0, NULL, NULL, NULL);
@@ -3656,6 +3672,7 @@ cuvs_gettuple(IndexScanDesc scan, ScanDirection dir)
             (uint32_t)cuvs_search_mode,      /* Phase 3L: 0=cagra, 1=brute_force */
             (uint32_t)cuvs_bf_precision,     /* Phase 3L: 0=float32, 1=float16 */
             (uint32_t)cuvs_bf_batch_wait_us, /* Phase 3L: BF micro-batch window μs */
+            (uint32_t)cuvs_cagra_batch_wait_us, /* #160: CAGRA micro-batch window μs */
             ss->tids,
             ss->distances,
             &ss->n_results,
@@ -3922,6 +3939,7 @@ flat_gettuple(IndexScanDesc scan, ScanDirection dir)
             1u,                                          /* ADR-073: FORCE brute_force */
             cuvs_resolve_flat_precision(scan->indexRelation), /* reloption / GUC */
             (uint32_t)cuvs_bf_batch_wait_us,
+            0,   /* cagra_batch_wait_us: this path forces brute_force (ADR-073) */
             ss->tids,
             ss->distances,
             &ss->n_results,
@@ -4871,7 +4889,7 @@ pg_cuvs_last_search_metric(PG_FUNCTION_ARGS)
  * the view must stay queryable while the daemon restarts. (See plan: a
  * future liveness column can distinguish "down" from "idle".)
  * ---------------------------------------------------------------- */
-#define GPU_STATS_NCOLS 39
+#define GPU_STATS_NCOLS 40
 
 static const char *
 cuvs_metric_name(uint32_t metric)
@@ -5375,6 +5393,11 @@ pg_cuvs_gpu_search_stats(PG_FUNCTION_ARGS)
          * this index "quietly went slow" without the query itself signaling
          * anything. */
         values[38] = Int64GetDatum((int64) s->prefilter_fallback_count);
+
+        /* #160: coalesced CAGRA micro-batch dispatch count — the cagra twin of
+         * bf_batch_count, and the only SQL-visible signal that
+         * cuvs.cagra_batch_wait_us is actually routing through the worker. */
+        values[39] = Int64GetDatum((int64) s->cagra_batch_count);
 
         tuplestore_putvalues(tupstore, tupdesc, values, nulls);
     }
@@ -6166,6 +6189,7 @@ cuvs_filtered_knn(PG_FUNCTION_ARGS)
                 1,   /* search_mode = brute_force */
                 (uint32_t) cuvs_bf_precision,
                 0,   /* bf_batch_wait_us */
+                0,   /* cagra_batch_wait_us */
                 tids_out, dists_out, &n_results,
                 &latency_us, &delta_merged);
         }
