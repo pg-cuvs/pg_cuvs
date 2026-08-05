@@ -39,6 +39,13 @@ corpora where recall=1.0 is required; use `cagra`/`ivfpq` for approximate search
 > path couples an exact-BF workload to an unnecessary graph build and cannot be independently cost-
 > calibrated by the planner.
 
+**NULL query vector.** A `cagra` / `flat` / `ivfpq` index scan cannot answer
+`ORDER BY col <-> NULL` — there is no vector to search with — so it raises
+`ERROR 0A000 (feature_not_supported)` rather than returning zero rows. A literal
+`<-> NULL::vector` never reaches the scan (the operator is strict, so it const-folds
+and the query is answered by the heap); a NULL bound to a parameter under a generic
+plan does, and is where the error surfaces (#150).
+
 ### Transient no-index GPU brute-force (`cuvs.gpu_bruteforce`)
 
 When `cuvs.gpu_bruteforce = on`, the planner routes a no-index single-table
