@@ -1442,9 +1442,16 @@ cuvs_ipc_export_hnsw_shm(
         goto cleanup;
     }
 
-    /* The inode has no name any more; reach it through the descriptor. Two
-     * fopen()s in the importer each get their own file description on it. */
-    snprintf(shm_path_out, shm_path_len, "/proc/self/fd/%d", pass_fd);
+    /*
+     * #166 review: do NOT hand back a "/proc/self/fd/N" path. Opening that
+     * symlink re-checks inode permissions, so a daemon running with a hardened
+     * umask (the segment lands 0600, daemon-owned) makes the cross-uid reopen
+     * fail EACCES even though reads through the passed descriptor itself are
+     * fine. The importer consumes the descriptor directly; the path is only
+     * carried for diagnostics.
+     */
+    strncpy(shm_path_out, hdr.error, shm_path_len - 1);
+    shm_path_out[shm_path_len - 1] = '\0';
     if (fd_out) *fd_out = pass_fd;
     pass_fd = -1;                  /* ownership transferred to the caller */
     rc = CUVS_STATUS_OK;

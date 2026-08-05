@@ -325,6 +325,36 @@ typedef struct HnswFillRes
     int       shm_fd;       /* #165: SCM_RIGHTS sidecar fd (-1 = none) */
 } HnswFillRes;
 
+/*
+ * #166 review: read the hnswlib sidecar through the descriptor the daemon
+ * passed, never by re-opening a path. The segment's name is already unlinked,
+ * and a "/proc/self/fd/N" stand-in re-checks inode permissions — which fails
+ * EACCES cross-uid as soon as the daemon's umask leaves the file 0600. Each
+ * caller gets its own dup so the two read passes hold independent offsets and
+ * fclose() stays symmetric; the original fd is owned by HnswFillRes.
+ */
+static FILE *
+hnsw_open_stream(const char *path, int passed_fd)
+{
+    int   dupfd;
+    FILE *f;
+
+    if (passed_fd < 0)
+        return fopen(path, "rb");      /* index_dir sidecar (use_shm = false) */
+
+    dupfd = dup(passed_fd);
+    if (dupfd < 0)
+        return NULL;
+    f = fdopen(dupfd, "rb");
+    if (!f)
+    {
+        close(dupfd);
+        return NULL;
+    }
+    rewind(f);
+    return f;
+}
+
 static void
 hnsw_fill_res_free(HnswFillRes *r)
 {
@@ -702,7 +732,7 @@ fill_hnsw_from_hnswlib_impl(Oid cagra_oid, Oid hnsw_oid, bool use_shm,
     }
 
     /* ---- 3. Parse hnswlib binary header ---- */
-    FILE *hf = fopen(hnsw_path, "rb");
+    FILE *hf = hnsw_open_stream(hnsw_path, res->shm_fd);
     if (!hf)
         ereport(ERROR,
                 (errmsg("pg_cuvs: cannot open .hnsw sidecar \"%s\": %m",
@@ -1018,7 +1048,7 @@ fill_hnsw_from_hnswlib_impl(Oid cagra_oid, Oid hnsw_oid, bool use_shm,
     }
 
     /* ---- 9. Re-open .hnsw to read vectors sequentially ---- */
-    hf = fopen(hnsw_path, "rb");
+    hf = hnsw_open_stream(hnsw_path, res->shm_fd);
     if (!hf)
     {
         ereport(ERROR,
