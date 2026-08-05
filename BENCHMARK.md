@@ -652,8 +652,21 @@ Full table: [`docs/experiments/filter-threshold-experiment.md`](docs/experiments
   is `cuvs.stream_bf_selectivity_threshold=0.004` on the canonical host, not a universal
   hardware-independent crossover; the second-host measurement moved it below `0.002`
   ([replication report](docs/reports/2026-08-04-item2b-second-host-replication.md)).
-- The correlation axis remains unverified for #88. Do not generalize pre-filter routing beyond the
-  measured fixtures until that issue is closed with evidence.
+- The correlation axis has since been measured
+  ([#88](https://github.com/pg-cuvs/pg_cuvs/issues/88), closed 2026-08-04): what drives
+  BITSET pre-filter collapse is the **filter/query correlation direction**, not selectivity.
+  On wiki_all_1M the pre-filter held recall at or near 0.0 across the entire sel 0.0001–0.5
+  range for anti-correlated filters, while an uncorrelated filter at the *same* sel=0.5
+  gave 0.989 and spatial/mixed filters stayed at 1.0 down to sel=1e-4
+  ([report](docs/reports/2026-08-04-3o-correlation-axis.md)). ADR-083 therefore rules out
+  single-variable selectivity routing and adopts runtime detection (`mean_returned` ≪ k)
+  with a D-wedge fallback; that fix landed via
+  [#133](https://github.com/pg-cuvs/pg_cuvs/issues/133) and restores pre-filter recall to
+  0.998 / 0.999 on the same anti-correlated fixtures
+  ([`adr083_133_anti_after_review_fixes.csv`](bench/results/adr083_133_anti_after_review_fixes.csv)).
+  Still do not read the 0.0 figure as a calibrated worst case: our anti-correlated fixture
+  is literally "the farthest N rows", more extreme than the published ones, so index-structure
+  difference and fixture severity are not yet separated.
 
 ---
 
