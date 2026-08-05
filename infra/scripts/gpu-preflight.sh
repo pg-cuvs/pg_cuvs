@@ -12,6 +12,15 @@
 #   2. installed extension .so newer than the postmaster that loaded it
 #   3. DB extension version != pg_cuvs.control default_version
 #   4. daemon socket present
+#   5. installed artifact older than the synced sources (#169)
+#
+# Check 5 closes the one gap the first four leave. They all compare *installed*
+# against *running*, which says nothing about whether the install happened at
+# all: `make` (gpu-build) builds only pg_cuvs.so — the daemon binary comes from
+# `make server`. Edit src/pg_cuvs_server.c, run gpu-build + gpu-install, and the
+# old daemon binary is still installed and still running, so checks 1-4 all pass.
+# That is manifestation (1) in #169; it cost a full test cycle before a manual
+# `strings` comparison caught it.
 #
 # Usage: infra/scripts/gpu-preflight.sh [dbname]
 #        VM host comes from gpu.conf / .env.gpu (VM_SSH_HOST, falls back to GCP_VM).
@@ -107,6 +116,41 @@ fi
 
 # 4. socket ------------------------------------------------------------------
 [ -S /tmp/.s.pg_cuvs ] || bad "daemon socket /tmp/.s.pg_cuvs missing"
+
+# 5. installed artifacts vs synced sources (#169) -----------------------------
+# Checks 1-2 compare installed against running; neither notices an install that
+# never happened. Compare both artifacts against the newest source instead.
+# Deliberately conservative — every source feeds one artifact or the other, and
+# modelling which would only turn a wrong "fresh" into a wrong "stale". The
+# remedy for a false alarm is `make gpu-deploy`, which is right either way.
+SRCDIR=$HOME/pg_cuvs/src
+if [ -d "$SRCDIR" ]; then
+    newest=$(find "$SRCDIR" -maxdepth 1 -type f \
+                \( -name '*.c' -o -name '*.cu' -o -name '*.h' \) \
+                -printf '%T@\n' 2>/dev/null | sort -n | tail -1 | cut -d. -f1)
+    : "${newest:=0}"
+    if [ "$newest" -gt 0 ]; then
+        so_m=$(stat -c %Y "$so" 2>/dev/null || echo 0)
+        bin_m=$(stat -c %Y "$PGBIN/pg_cuvs_server" 2>/dev/null || echo 0)
+        if [ "$newest" -gt "$so_m" ]; then
+            bad "pg_cuvs.so is OLDER than src/ — it was never rebuilt/installed
+             so      $(date -d @"$so_m" '+%F %T')
+             src     $(date -d @"$newest" '+%F %T')
+             → make gpu-deploy"
+        else
+            say "extension .so built from current src"
+        fi
+        if [ "$newest" -gt "$bin_m" ]; then
+            bad "pg_cuvs_server is OLDER than src/ — note that gpu-build does NOT
+             build the daemon; only 'make server' (gpu-server) does
+             binary  $(date -d @"$bin_m" '+%F %T')
+             src     $(date -d @"$newest" '+%F %T')
+             → make gpu-deploy"
+        else
+            say "daemon binary built from current src"
+        fi
+    fi
+fi
 
 exit $fail
 REMOTE
