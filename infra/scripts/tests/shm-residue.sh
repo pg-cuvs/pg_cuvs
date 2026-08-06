@@ -21,7 +21,15 @@
 # (#166 review P1). The batch arm below therefore calls the SRF and proves it
 # actually ran by requiring rows back.
 #
-# Run on the GPU VM. Needs a table `t` with a CAGRA index `t_cagra`.
+# #176: this used to assume `t`/`t_cagra` already existed — an implicit shared
+# fixture nothing else in the repo referenced (grep confirms this script was
+# the only consumer). On a freshly provisioned VM that ambient state was never
+# there, and the script failed with "relation \"t\" does not exist", a
+# misleading error unrelated to the /dev/shm invariant it exists to check. It
+# now builds its own small fixture below, same pattern as
+# umask-hardened-export.sh's private table.
+#
+# Run on the GPU VM.
 set -u
 IDIR="${CUVS_INDEX_DIR:-/tmp/cuvs_indexes}"
 PSQL="psql -d ${PGDATABASE:-shadeform} -qtA -v ON_ERROR_STOP=1"
@@ -37,6 +45,29 @@ pre=$(ls /dev/shm 2>/dev/null | grep -c '^pg_cuvs_')
 if [ "$pre" != "0" ]; then
   echo "  [SKIP-GUARD] $pre pre-existing pg_cuvs_* segment(s); clear them first" >&2
   ls /dev/shm | grep '^pg_cuvs_' | head -5 >&2
+  exit 1
+fi
+
+# 100 rows clears the batch loop's id range (up to 80, below) with margin;
+# dim=16 keeps CAGRA build fast. Dropped and rebuilt fresh every run so the
+# fixture never drifts from what this script expects.
+if ! $PSQL <<SQL >/dev/null 2>/tmp/shm_residue_setup.txt
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS vector;
+CREATE EXTENSION IF NOT EXISTS pg_cuvs;
+RESET client_min_messages;
+SET cuvs.index_dir='${IDIR}';
+DROP TABLE IF EXISTS t CASCADE;
+CREATE TABLE t (id bigint, embedding vector(16));
+INSERT INTO t
+    SELECT g, ('[' || array_to_string(ARRAY(
+        SELECT (random())::numeric(6,4) FROM generate_series(1,16)), ',') || ']')::vector
+    FROM generate_series(1, 100) g;
+CREATE INDEX t_cagra ON t USING cagra (embedding vector_l2_ops);
+SQL
+then
+  bad "fixture setup: $(grep -m1 '^ERROR' /tmp/shm_residue_setup.txt 2>/dev/null || head -1 /tmp/shm_residue_setup.txt)"
+  echo "== $PASS passed, $FAIL failed =="
   exit 1
 fi
 
