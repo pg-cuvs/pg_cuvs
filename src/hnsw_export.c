@@ -77,6 +77,10 @@
 /* GUC declared in pg_cuvs.c — socket path for daemon IPC */
 extern char *cuvs_socket_path;
 
+/* #162: read-only accessor into pg_cuvs.c's local CuvsCagraOptions —
+ * used by the pre-GPU dim-ceiling check below. */
+extern int cuvs_cagra_reloption_graph_degree(Relation cagra_rel);
+
 /* ----------------------------------------------------------------
  * pgvector HNSW on-disk constants (must match pgvector source)
  * ---------------------------------------------------------------- */
@@ -2079,6 +2083,21 @@ pg_cuvs_build_hnsw(PG_FUNCTION_ARGS)
              errhint("The DDL form integrates with pg_indexes, DROP INDEX, "
                      "REINDEX, and pg_dump.")));
 
+    /* #162: dim-ceiling pre-check, before any GPU work. This deprecated
+     * function form only ever creates a vector (fp32) target — see
+     * find_hnsw_opclass_oid()/create_empty_hnsw() below, which hardcode
+     * vector_*_ops opclasses — so bytes_per_dim is always 4 here; a halfvec
+     * target requires the CREATE INDEX ... USING pg_cuvs_hnsw DDL form
+     * instead (cuvs_hnsw_ambuild(), which carries its own pre-check). */
+    {
+        Relation cagra_rel_pc = index_open(cagra_oid, AccessShareLock);
+        int precheck_dim = (int) TupleDescAttr(RelationGetDescr(cagra_rel_pc), 0)->atttypmod;
+        int graph_degree  = cuvs_cagra_reloption_graph_degree(cagra_rel_pc);
+        index_close(cagra_rel_pc, AccessShareLock);
+        int m0 = (graph_degree < 64) ? graph_degree : 64;
+        check_hnsw_page_fit(precheck_dim, 4, m0 / 2, 5);
+    }
+
     /* Create empty HNSW on parent table — INDEX_CREATE_SKIP_BUILD, no CPU build */
     Oid hnsw_oid = create_empty_hnsw(cagra_oid);
 
@@ -2209,11 +2228,28 @@ cuvs_hnsw_ambuild(Relation heapRel, Relation indexRel, IndexInfo *indexInfo)
     Oid self_oid = RelationGetRelid(indexRel);
     IndexBuildResult *result = palloc0(sizeof(IndexBuildResult));
 
+    /* #162: dim-ceiling pre-check, before any GPU work. The real ceiling is
+     * maxlevel-dependent (narrower at higher levels); safe_maxlevel=5 is a
+     * fixed conservative bound chosen to always reject before paying for a
+     * CAGRA build or IPC round-trip, per the issue's "다소 보수적으로
+     * 거부하더라도 항상 GPU 작업 전에" policy. check_hnsw_page_fit() below
+     * (after the real M/maxlevel are known) remains as a backstop for the
+     * rare case where this pre-check's M assumption undershoots the actual
+     * build. */
+    Form_pg_attribute precheck_att = TupleDescAttr(RelationGetDescr(indexRel), 0);
+    int precheck_dim           = (int) precheck_att->atttypmod;
+    int precheck_bytes_per_dim = bytes_per_dim_for_typid(precheck_att->atttypid);
+    const int safe_maxlevel = 5;
+
     /* ── Source-less: ephemeral CAGRA built from the heap, then dropped. ── */
     if (source_name[0] == '\0')
     {
         int64_t n_vecs    = 0;
         double  reltuples = 0.0;
+
+        /* No user reloptions on an ephemeral build (cuVS defaults: 3R
+         * comment below) -> graph_degree=64, M=32. */
+        check_hnsw_page_fit(precheck_dim, precheck_bytes_per_dim, 32, safe_maxlevel);
 
         /* Build an ephemeral CAGRA under THIS index's OID. shard_count=1
          * (a sharded CAGRA cannot export its adjacency); no .hnsw sidecar. */
@@ -2279,6 +2315,17 @@ cuvs_hnsw_ambuild(Relation heapRel, Relation indexRel, IndexInfo *indexInfo)
                     (errmsg("pg_cuvs_hnsw: source \"%s\" must be a cagra index",
                             source_name),
                      errhint("Build it first: CREATE INDEX ... USING cagra (col opclass).")));
+
+        /* #162: dim-ceiling pre-check using the source CAGRA's own
+         * graph_degree reloption, before paying the IPC round-trip. */
+        {
+            Relation cagra_rel_gd = index_open(cagra_oid, AccessShareLock);
+            int graph_degree = cuvs_cagra_reloption_graph_degree(cagra_rel_gd);
+            index_close(cagra_rel_gd, AccessShareLock);
+            int m0 = (graph_degree < 64) ? graph_degree : 64;
+            check_hnsw_page_fit(precheck_dim, precheck_bytes_per_dim,
+                                 m0 / 2, safe_maxlevel);
+        }
 
         /* Fail fast: the source CAGRA's metric must match this index's opclass
          * BEFORE paying an IPC round-trip. cagra_index_metric() is opclass-name

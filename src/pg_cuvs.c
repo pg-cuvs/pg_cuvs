@@ -1322,6 +1322,21 @@ cuvs_resolve_build_params_rel(Relation indexRel, int *graph_degree,
                         *intermediate_graph_degree, *graph_degree)));
 }
 
+/* #162: minimal read-only accessor so hnsw_export.c's pre-GPU dim-ceiling
+ * check can read an existing cagra index's graph_degree without depending
+ * on the CuvsCagraOptions layout, which stays local to this file (unlike
+ * cuvs_resolve_build_params_rel() above, this has no side-effect validation
+ * — it is meant to inspect a *source* cagra index, not the one being built).
+ * Returns the cuVS default (64) when the index has no reloptions set,
+ * matching add_int_reloption's own default. */
+int
+cuvs_cagra_reloption_graph_degree(Relation cagra_rel)
+{
+    CuvsCagraOptions *opts = (CuvsCagraOptions *) cagra_rel->rd_options;
+
+    return (opts != NULL) ? opts->graph_degree : 64;
+}
+
 /* Resolver for the plan-time gates and shared path builders, which hold only an
  * Oid. Opens the index relcache entry WITHOUT a lock: by cost-estimation time
  * the planner already holds the lock transitively (get_relation_info opened the
