@@ -101,10 +101,12 @@ start_test_daemon() {
     # Phase 3A: the PG backend (postgres user) writes the .delta sidecar into
     # TEST_IDX, but this test daemon runs as the test-runner user (ubuntu). Make
     # TEST_IDX writable by both so backend delta-append succeeds. (Production
-    # runs the daemon as the postgres user with a 0700 dir; this 0777 is a
+    # runs the daemon as the postgres user with a 0700 dir; this 1777 is a
     # test-fixture concession — the prod permission model is exercised by the
-    # regression suite against the postgres-owned production daemon.)
-    chmod 0777 "$TEST_IDX" 2>/dev/null || true
+    # regression suite against the postgres-owned production daemon.) Sticky bit
+    # matches production (#173): both uids can write, neither can unlink/replace
+    # the other's sidecar files.
+    chmod 1777 "$TEST_IDX" 2>/dev/null || true
 }
 
 stop_test_daemon() {

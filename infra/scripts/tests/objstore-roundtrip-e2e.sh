@@ -69,7 +69,7 @@ start_daemon() {
     done
     [ -S "$SOCK" ] || { echo "[obj] socket never appeared:"; cat "$LOG"; return 1; }
     chmod 666 "$SOCK" 2>/dev/null || true
-    chmod 0777 "$IDX" 2>/dev/null || true
+    chmod 1777 "$IDX" 2>/dev/null || true
 }
 stop_daemon() {
     [ -n "$DAEMON_PID" ] && kill "$DAEMON_PID" 2>/dev/null || true
@@ -117,7 +117,7 @@ gcloud storage buckets create "$BUCKET" --location=US >/dev/null 2>&1 \
 
 echo "[obj] stop production daemon for the duration (frees GPU; distinct socket anyway)"
 sudo systemctl stop pg-cuvs-server 2>/dev/null || true
-rm -rf "$IDX"; mkdir -p "$IDX"; chmod 0777 "$IDX"
+rm -rf "$IDX"; mkdir -p "$IDX"; chmod 1777 "$IDX"
 
 # ---- Phase 1: build -> upload --------------------------------------------
 start_daemon

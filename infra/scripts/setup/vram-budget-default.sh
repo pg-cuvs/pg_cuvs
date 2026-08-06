@@ -44,7 +44,7 @@ SQL
 
 echo "[vram] stop production daemon for the duration"
 sudo systemctl stop pg-cuvs-server 2>/dev/null || true
-rm -rf "$IDX"; mkdir -p "$IDX"; chmod 0777 "$IDX"
+rm -rf "$IDX"; mkdir -p "$IDX"; chmod 1777 "$IDX"
 
 echo "[vram] start daemon WITHOUT --max-vram-mb (default-budget path)"
 "$BIN" --socket "$SOCK" --index-dir "$IDX" >"$LOG" 2>&1 &
@@ -56,7 +56,7 @@ for _ in $(seq 1 60); do
 done
 [ -S "$SOCK" ] || { echo "[vram] socket never appeared:"; cat "$LOG"; exit 1; }
 chmod 666 "$SOCK" 2>/dev/null || true
-chmod 0777 "$IDX" 2>/dev/null || true
+chmod 1777 "$IDX" 2>/dev/null || true
 
 # Build a tiny index so pg_stat_gpu_cache reports a row for the active GPU.
 run_sql "

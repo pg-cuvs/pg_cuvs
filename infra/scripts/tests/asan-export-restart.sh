@@ -208,7 +208,7 @@ done
 sudo make install-server < /dev/null
 
 sudo mkdir -p "$TESTIDX" < /dev/null
-sudo chmod 777 "$TESTIDX" < /dev/null
+sudo chmod 1777 "$TESTIDX" < /dev/null
 
 echo "[asan-export] launch 1: build the CAGRA index"
 launch_asan_daemon
