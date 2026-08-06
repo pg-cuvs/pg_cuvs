@@ -1312,6 +1312,8 @@ static int write_tids_atomic(const char *tids_tmp,
                              int64_t n_vecs, uint32_t dim, uint32_t metric,
                              const uint64_t *tids);
 static int fsync_path(const char *path);
+static void fchmod_sidecar(FILE *f, const char *path);
+static void chmod_sidecar(const char *path);
 static int ensure_vram(size_t needed, int device_id);   /* defined after the LRU section */
 static size_t evict_lru(int device_id);                 /* soft-cap slot eviction (load_index) */
 
@@ -1355,6 +1357,7 @@ save_index(IndexEntry *e)
         unlink(tids_tmp);
         return -1;
     }
+    chmod_sidecar(idx_tmp);
     if (fsync_path(idx_tmp) != 0)
         LOG_WARN("save_index: fsync %s failed errno=%d\n", idx_tmp, errno);
 
@@ -4389,6 +4392,7 @@ write_tids_atomic(const char *tids_tmp,
                 tids_tmp, errno, strerror(errno));
         return -1;
     }
+    fchmod_sidecar(f, tids_tmp);
     int ok = (cuvs_tids_write(f, n_vecs, dim, metric, tids) == 0);
     if (ok && fflush(f) != 0) {
         LOG_ERROR("write_tids_atomic: fflush %s FAILED errno=%d\n",
@@ -4421,6 +4425,43 @@ fsync_path(const char *path)
     int rc = fsync(fd);
     close(fd);
     return rc;
+}
+
+/*
+ * #167: force persistent index_dir sidecars (.tids/.vectors/.shards/.cagra/
+ * .hnsw) to 0644 regardless of the daemon's umask.
+ *
+ * fopen(path, "wb") and the cuVS serialize calls both leave the mode at
+ * 0666 & ~umask. Under the default umask (022) that is already 0644, so this
+ * is a no-op there. Under a hardened daemon (systemd UMask=077, a restrictive
+ * launcher, some container defaults) it is 0600 owned by the daemon uid, and
+ * the PG backend — a different uid, reading these files by path
+ * (hnsw_export.c, pg_cuvs.c) — gets EACCES. #166 closed the equivalent gap
+ * for the transient SCM_RIGHTS handoff; these are the persistent files that
+ * fd-passing cannot help with, because they must still exist as files after
+ * a restart.
+ *
+ * 0644 matches the existing shm_open(..., 0644) precedent (cuvs_ipc.c) for
+ * the transient path, and the current index_dir deployment shape (bootstrap.sh
+ * chmod 777s the directory itself — see #167's follow-up on directory
+ * permissions, which is what actually gates read/replace access here).
+ *
+ * Best-effort: a chmod failure is logged, not fatal. The write already
+ * succeeded and fsynced; refusing to persist over a chmod problem would
+ * trade a mode bug for a durability regression.
+ */
+static void
+fchmod_sidecar(FILE *f, const char *path)
+{
+    if (fchmod(fileno(f), 0644) != 0)
+        LOG_WARN("fchmod_sidecar: fchmod(%s, 0644) failed errno=%d\n", path, errno);
+}
+
+static void
+chmod_sidecar(const char *path)
+{
+    if (chmod(path, 0644) != 0)
+        LOG_WARN("chmod_sidecar: chmod(%s, 0644) failed errno=%d\n", path, errno);
 }
 
 /* Phase 3F: streaming CRC-32 of a whole file (chunked; never loads the entire
@@ -4671,8 +4712,10 @@ build_sharded(int client_fd, const CuvsCmdFrame *cmd, const char *index_dir,
         shards[i].vram_bytes    = needed;
         shards[i].valid         = 1;
 
-        if (cuvs_cagra_serialize(h, shard_tmp[i], dev) != 0
-            || fsync_path(shard_tmp[i]) != 0)
+        int shard_serialized = (cuvs_cagra_serialize(h, shard_tmp[i], dev) == 0);
+        if (shard_serialized)
+            chmod_sidecar(shard_tmp[i]);
+        if (!shard_serialized || fsync_path(shard_tmp[i]) != 0)
         {
             LOG_ERROR("[build_sharded] serialize/fsync failed for shard %d\n", i);
             ok = 0;
@@ -4720,6 +4763,7 @@ build_sharded(int client_fd, const CuvsCmdFrame *cmd, const char *index_dir,
     {
         FILE *vf = fopen(vecs_tmp, "wb");
         int vok = (vf != NULL);
+        if (vok) fchmod_sidecar(vf, vecs_tmp);
         if (vok && cuvs_vectors_write(vf, n_vecs, dim, metric, base_gen, vecs) != 0) vok = 0;
         if (vok && fflush(vf) != 0) vok = 0;
         if (vok && fsync(fileno(vf)) != 0) vok = 0;
@@ -4768,6 +4812,7 @@ build_sharded(int client_fd, const CuvsCmdFrame *cmd, const char *index_dir,
         FILE *mf = fopen(shards_tmp, "wb");
         if (mf)
         {
+            fchmod_sidecar(mf, shards_tmp);
             int wok = (cuvs_shards_write(mf, (uint32_t)sc, n_vecs, dim, metric,
                                          base_crc, recs) == 0);
             if (wok && fflush(mf) != 0) wok = 0;
@@ -5277,6 +5322,7 @@ handle_build(int client_fd, const CuvsCmdFrame *cmd)
     {
         FILE *vf = fopen(vecs_tmp, "wb");
         int vok = (vf != NULL);
+        if (vok) fchmod_sidecar(vf, vecs_tmp);
         if (vok && cuvs_vectors_write(vf, cmd->n_vecs, cmd->dim, cmd->metric, tids_gen, vecs) != 0)
             vok = 0;
         if (vok && fflush(vf) != 0) vok = 0;
@@ -5340,6 +5386,7 @@ finish_build_commit(int client_fd, const CuvsCmdFrame *cmd, const char *save_dir
         LOG_ERROR("[handle_build] cuvs_cagra_serialize FAILED (path=%s)\n", idx_tmp);
         goto persist_fail;
     }
+    chmod_sidecar(idx_tmp);
     if (fsync_path(idx_tmp) != 0) {
         LOG_ERROR("[handle_build] fsync %s failed errno=%d; aborting commit\n", idx_tmp, errno);
         goto persist_fail;
@@ -5443,8 +5490,11 @@ finish_build_commit(int client_fd, const CuvsCmdFrame *cmd, const char *save_dir
             LOG_WARN("[handle_build] HNSW fallback sidecar not saved for %u/%u\n",
                      cmd->db_oid, cmd->index_oid);
         else
+        {
+            chmod_sidecar(hnsw_path);
             LOG_INFO("pg_cuvs_server: saved HNSW fallback %u/%u\n",
                      cmd->db_oid, cmd->index_oid);
+        }
     }
 
     /* --- Swap into registry --- */
@@ -5882,6 +5932,7 @@ handle_build_multi(int client_fd, const CuvsCmdFrame *cmd, const char *index_dir
         {
             FILE *vf = fopen(vecs_tmp, "wb");
             int vok = (vf != NULL);
+            if (vok) fchmod_sidecar(vf, vecs_tmp);
             if (vok && cuvs_vectors_write_multi(vf, n_each, nmapped, cmd->dim,
                                                 cmd->metric, tids_gen, part_vecs) != 0)
                 vok = 0;
@@ -6735,6 +6786,7 @@ handle_build_flat(int client_fd, const CuvsCmdFrame *cmd)
     {
         FILE *vf = fopen(vecs_tmp, "wb");
         int vok = (vf != NULL);
+        if (vok) fchmod_sidecar(vf, vecs_tmp);
         if (vok && cuvs_vectors_write(vf, cmd->n_vecs, cmd->dim, cmd->metric, tids_gen, vecs) != 0)
             vok = 0;
         if (vok && fflush(vf) != 0) vok = 0;
