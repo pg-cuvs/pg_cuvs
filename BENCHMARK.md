@@ -15,7 +15,7 @@ All numbers here are VM-measured and traceable to a source artifact:
 | [`design/benchmarks/crossover-methodology.md`](design/benchmarks/crossover-methodology.md) | Full crossover methodology + synthetic pilot + 50M competitive + Cohere real-embedding run |
 | [`bench/results/*.csv`](bench/results/) | Raw per-engine result rows |
 | [`docs/experiments/filter-threshold-experiment.md`](docs/experiments/filter-threshold-experiment.md) | Selectivity × correlation sweep for filtered BF |
-| [`docs/experiments/benchmark-archive.md`](docs/experiments/benchmark-archive.md) | Superseded/historical sections moved out of this file (Cohere lineage §2.1/§2.1a, synthetic pilot §2.2, pre-#80 filtered sweep §3, Appendix A) |
+| [`docs/experiments/benchmark-archive.md`](docs/experiments/benchmark-archive.md) | Superseded/historical sections moved out of this file (synthetic pilot §2.2, pre-#80 filtered sweep §3) |
 
 Reproduction harness: [`bench/`](bench/) (see [§5](#5-reproduce-it-yourself)).
 
