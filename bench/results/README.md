@@ -109,7 +109,7 @@ read off a top-100 result while the pgvector rows ran true k sweeps — **not is
 
 The recall *method* is sound (exact brute-force ground truth, `table id == corpus row
 index`, standard set-intersection recall@k). The defects are in the extension of that
-era, not the harness. Full annotation: [`BENCHMARK.md` Appendix A](../../BENCHMARK.md).
+era, not the harness. Full annotation: [benchmark archive, Appendix A](../../docs/experiments/benchmark-archive.md).
 
 ## Reading any of these
 

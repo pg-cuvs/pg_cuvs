@@ -146,7 +146,8 @@ The table below is the **legacy** real-embedding run — **Cohere Wikipedia 1M×
 Its ratios (search ~4.5×, build ~2×) remain valid as a same-run comparison; it is kept
 for provenance, not as the primary citation. **Known artifact caveat:** this CSV predates
 #73/#75 and reports `index_bytes=0` for CAGRA; recall/QPS/latency/build-time fields are
-unaffected, and the result must be read with the [benchmark caveat](BENCHMARK.md) and
+unaffected, and the result must be read with the
+[benchmark caveat](docs/experiments/benchmark-archive.md) and
 [provenance ledger](bench/results/README.md).
 
 | Path | Build | p50 @ recall≈0.99 | QPS | vs pgvector |
@@ -170,7 +171,7 @@ unaffected, and the result must be read with the [benchmark caveat](BENCHMARK.md
 On synthetic **random** data pgvector's native HNSW build is pathologically slow (918s), which inflates the build ratio to ~13.9× — that is pgvector's worst case, not the real-embedding figure (~2×). GPU CAGRA build is content-independent, so its advantage balloons on random data.
 </details>
 
-See [`BENCHMARK.md`](BENCHMARK.md) for the latency decomposition, the full Cohere 1M×1024 Pareto, and the filtered-search selectivity sweep; `design/benchmarks/crossover-methodology.md` for crossover methodology.
+See [`BENCHMARK.md`](BENCHMARK.md) for the latency decomposition and the current wiki_all_1M results, [`docs/experiments/benchmark-archive.md`](docs/experiments/benchmark-archive.md) for the full Cohere 1M×1024 Pareto and the pre-#80 filtered-search selectivity sweep, and `design/benchmarks/crossover-methodology.md` for crossover methodology.
 
 ## Roadmap
 

@@ -3415,7 +3415,7 @@ ADR-072 분해표의 "PQ 코드북(k-means) = cuVS 제공" 서술이 **실측으
 
 (모든 수치는 `bench/results/pg_cuvsbench_1m.csv` 원본과 일치.)
 
-- **matched recall@10 ≈ 0.99, 검색 ~4.5×** (CAGRA 2.9 ms/340 QPS vs pgvector 12.8 ms/74 QPS — p50 4.4×, QPS 4.6×). **공정한 빌드 비교(같은 산출물 = pgvector HNSW)** = **CAGRA 빌드 + 변환 120 s vs pgvector native 237 s → ~2×** (120 s는 이미 CAGRA 빌드 62 s + 변환 58 s의 합이다). 순수 CAGRA 인덱스는 62 s에 빌드되나 *GPU 인덱스*라 pgvector HNSW와 동일 산출물이 아니므로 **빌드 스피드업으로 내세우지 않는다**(GPU 검색 경로의 셋업 비용일 뿐). 과거 real-embedding run(BENCHMARK.md §2.1: 4.4 ms vs 22 ms, 285 s)과 자릿수 일치.
+- **matched recall@10 ≈ 0.99, 검색 ~4.5×** (CAGRA 2.9 ms/340 QPS vs pgvector 12.8 ms/74 QPS — p50 4.4×, QPS 4.6×). **공정한 빌드 비교(같은 산출물 = pgvector HNSW)** = **CAGRA 빌드 + 변환 120 s vs pgvector native 237 s → ~2×** (120 s는 이미 CAGRA 빌드 62 s + 변환 58 s의 합이다). 순수 CAGRA 인덱스는 62 s에 빌드되나 *GPU 인덱스*라 pgvector HNSW와 동일 산출물이 아니므로 **빌드 스피드업으로 내세우지 않는다**(GPU 검색 경로의 셋업 비용일 뿐). 과거 real-embedding run(`docs/experiments/benchmark-archive.md` §2.1: 4.4 ms vs 22 ms, 285 s)과 자릿수 일치.
 
 **데이터 정합성 정정(중요)**: 기존 문서의 **"빌드 13-14×"는 synthetic random 데이터**(1M×384; pgvector HNSW native가 918 s로 최악조건)에서 나온 값이며 real 임베딩에선 **~2×** 다. **"24× / 12 s"는 raw cuVS 라이브러리**(Postgres COPY·WAL·페이지 물성화 제외) 경계다. 둘 다 실사용자 end-to-end가 아니므로 **헤드라인에서 강등/제거**하고, canonical은 **real-embedding end-to-end(검색 ~4.5×, 빌드 ~2×)** 로 재정박한다.
 
@@ -3645,7 +3645,8 @@ COPY·WAL·페이지 물성화를 제외한 다른 경계의 수치였고, end-t
 raw 수치 자체가 무의미해서가 아니었다.
 
 그런데 #98이 닫으려는 Gap A가 정확히 그 금지의 부작용이다. `BENCHMARK.md` §1.1의 raw 커널
-시간(715 µs, 2026-06 nsys)과 §2.1의 SQL 수치(5주 뒤 cuvs-bench 하네스)는 호스트 동일성이
+시간(715 µs, 2026-06 nsys)과 §2.1의 SQL 수치(5주 뒤 cuvs-bench 하네스; 현재
+`docs/experiments/benchmark-archive.md`)는 호스트 동일성이
 미확인이고, §2.1b 스스로 "동모델 A100 두 호스트 간 QPS ~3.5× 편차"를 기록한다. **통합 비용
 (integration tax)을 말하려면 raw와 SQL이 같은 run 안에 있어야 하는데, 금지가 그것을 만들지
 못하게 막고 있었다.**
