@@ -18,7 +18,7 @@ Narrative: [`../BENCHMARK.md`](../BENCHMARK.md).
 
 Its output is still cited in `design/` documents, so deleting it would strand those
 citations. But two defects of that era are baked into its results, and they are the
-reason its numbers were demoted (see `BENCHMARK.md` Appendix A):
+reason its numbers were demoted (see [`docs/experiments/benchmark-archive.md`](../docs/experiments/benchmark-archive.md) Appendix A):
 
 - **k was not wired to the GPU top-k** — the `pg_cuvs` rows searched k=100 regardless of
   the requested k, so their recall@10 came off a top-100 result while pgvector ran true

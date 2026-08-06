@@ -56,7 +56,7 @@ require_text "ROADMAP.md" 'Current contract (2026-08-04)'
 require_text "ROADMAP.md" '#124'
 require_text "ROADMAP.md" '**BLOCKER**'
 
-require_text "BENCHMARK.md" 'Historical multi-tenant filtered search sweep — pre-#80'
+require_text "docs/experiments/benchmark-archive.md" 'Historical multi-tenant filtered search sweep — pre-#80'
 require_text "BENCHMARK.md" 'Current routing contract (source/reference verified)'
 require_text "BENCHMARK.md" '`cuvs.filter_auto_threshold=0.0`'
 require_text "BENCHMARK.md" '`cuvs.stream_bf_selectivity_threshold=0.004`'

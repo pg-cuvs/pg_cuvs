@@ -12,8 +12,8 @@ Current-generation harnesses live one level up:
 
 ## Why the numbers here are demoted
 
-Two defects of that era are baked into the pg_cuvs rows (see `../../BENCHMARK.md`
-Appendix A):
+Two defects of that era are baked into the pg_cuvs rows (see
+[`docs/experiments/benchmark-archive.md`](../../docs/experiments/benchmark-archive.md) Appendix A):
 
 - **k was not wired to the GPU top-k** — pg_cuvs searched k=100 regardless of the
   requested k, so recall@10 came off a top-100 result while pgvector ran true k sweeps.
