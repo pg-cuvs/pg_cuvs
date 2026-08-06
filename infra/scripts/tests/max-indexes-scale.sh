@@ -63,7 +63,7 @@ SQL
 
 echo "[maxidx] stop production daemon for the duration"
 sudo systemctl stop pg-cuvs-server 2>/dev/null || true
-rm -rf "$IDX"; mkdir -p "$IDX"; chmod 0777 "$IDX"
+rm -rf "$IDX"; mkdir -p "$IDX"; chmod 1777 "$IDX"
 
 echo "[maxidx] start daemon --max-indexes $CAP (tiny cap)"
 "$BIN" --socket "$SOCK" --index-dir "$IDX" --max-vram-mb 38000 --max-indexes "$CAP" \
@@ -76,7 +76,7 @@ for _ in $(seq 1 60); do
 done
 [ -S "$SOCK" ] || { echo "[maxidx] socket never appeared:"; cat "$LOG"; exit 1; }
 chmod 666 "$SOCK" 2>/dev/null || true
-chmod 0777 "$IDX" 2>/dev/null || true
+chmod 1777 "$IDX" 2>/dev/null || true
 
 # Confirm the daemon honored --max-indexes (not the 1024 default).
 grep -q "index registry capacity: $CAP" "$LOG" \

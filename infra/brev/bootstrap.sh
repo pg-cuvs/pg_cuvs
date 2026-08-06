@@ -162,7 +162,7 @@ test -x "$(pg_config --bindir)/pg_cuvs_server" \
   || { echo "FATAL: pg_cuvs_server not installed under $(pg_config --bindir)" >&2; exit 1; }
 
 echo "=== [4/5] runtime: preload, GUCs, environment, daemon =================="
-sudo mkdir -p "$IDX"; sudo chmod 777 "$IDX"
+sudo mkdir -p "$IDX"; sudo chmod 1777 "$IDX"
 # Debian's /etc/postgresql/16/main/environment is parsed by pg_ctlcluster (perl)
 # and REQUIRES quotes around the value — bare LD_LIBRARY_PATH=... is rejected and
 # PG fails to restart. (RunPod used pg_ctl directly and never hit this.)
