@@ -132,6 +132,27 @@ git pull --ff-only || true
 #     that; the Makefile's `NVCC ?= nvcc` makes the override clean.
 #   PGHOST: conda's libpq defaults to a socket dir the Debian server doesn't use.
 #   \$PATH is left unexpanded on purpose — the sourcing shell keeps its own PATH.
+# #175: detect the GPU's compute capability so the Makefile's `CUDA_ARCH ?=
+# sm_80` default cannot silently apply on a non-A100 box. Local gpu.conf never
+# reaches this remote build (REMOTE_ENV only sources this file, never gpu.conf),
+# and this script never referenced CUDA_ARCH at all — so every `make gpu-build`
+# on an L40/L40S/H100/etc. instance built sm_80 SASS that fails to load at
+# runtime ("no kernel image available for execution on the device"), far from
+# the actual cause. `nvidia-smi --query-gpu=compute_cap` reports e.g. "8.9" for
+# an L40S; strip the dot and prefix "sm_". CUDA_ARCH set in this script's own
+# environment (e.g. `CUDA_ARCH=sm_90 bash bootstrap.sh` for a GPU model this
+# detection doesn't handle correctly) wins over detection.
+if [ -z "${CUDA_ARCH:-}" ]; then
+    cap=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -1 | tr -d '[:space:]')
+    if [ -n "$cap" ]; then
+        CUDA_ARCH="sm_$(printf '%s' "$cap" | tr -d '.')"
+    else
+        echo "WARNING: nvidia-smi compute_cap detection failed; defaulting CUDA_ARCH=sm_80" >&2
+        CUDA_ARCH="sm_80"
+    fi
+fi
+echo "  CUDA_ARCH        : $CUDA_ARCH"
+
 ENV_FILE="$USER_HOME/.pg_cuvs_env"
 cat > "$ENV_FILE" <<EOF
 export CONDA_PREFIX="$DEV"
@@ -139,6 +160,7 @@ export PATH="$DEV/bin:/usr/lib/postgresql/16/bin:\$PATH"
 export LD_LIBRARY_PATH="$DEV/lib"
 export NVCC="nvcc -ccbin /usr/bin/g++"
 export PGHOST=/var/run/postgresql
+export CUDA_ARCH="$CUDA_ARCH"
 EOF
 # Hard gate: a truncated or unparseable env file would make every remote build
 # fail far from here, with an error that points at the Makefile instead.

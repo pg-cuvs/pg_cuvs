@@ -152,5 +152,31 @@ if [ -d "$SRCDIR" ]; then
     fi
 fi
 
+# 6. build CUDA_ARCH vs the GPU actually present (#175) -----------------------
+# gpu.conf's CUDA_ARCH never reaches this remote build (REMOTE_ENV sources only
+# ~/.pg_cuvs_env, never gpu.conf), and until #175 bootstrap.sh never set
+# CUDA_ARCH in that file at all — so a non-A100 box silently built sm_80 SASS,
+# which fails to LOAD at runtime rather than at build time ("no kernel image
+# available for execution on the device"), far from the real cause. There is no
+# cuobjdump in this conda env to introspect the built .so/binary directly, so
+# compare the env file's CUDA_ARCH against the GPU's actual compute capability
+# instead — an indirect but much earlier signal than a runtime kernel-launch
+# failure three commands later.
+env_arch=$(sed -n 's/^export CUDA_ARCH="\?\([^"[:space:]]*\)"\?/\1/p' "$HOME/.pg_cuvs_env" 2>/dev/null | tail -1)
+gpu_cap=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -1 | tr -d '[:space:]')
+if [ -n "$gpu_cap" ]; then
+    gpu_arch="sm_$(printf '%s' "$gpu_cap" | tr -d '.')"
+    if [ -z "$env_arch" ]; then
+        bad "CUDA_ARCH not set in ~/.pg_cuvs_env (GPU reports $gpu_arch) — re-run bootstrap.sh"
+    elif [ "$env_arch" != "$gpu_arch" ]; then
+        bad "CUDA_ARCH mismatch: built for $env_arch, GPU is $gpu_arch
+             → built kernels will not load on this device; fix ~/.pg_cuvs_env and rebuild"
+    else
+        say "CUDA_ARCH matches GPU ($env_arch)"
+    fi
+else
+    say "nvidia-smi unavailable — skipping CUDA_ARCH check"
+fi
+
 exit $fail
 REMOTE
