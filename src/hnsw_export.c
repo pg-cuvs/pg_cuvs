@@ -166,14 +166,15 @@ typedef struct {
 #define PGV_VEC_HEADER_SIZE     8
 
 /*
- * Size of an element tuple for a vector of `dim` floats.
- * = MAXALIGN(sizeof(PgvHnswElemHdr) + PGV_VEC_HEADER_SIZE + dim*4)
+ * Size of an element tuple for a vector of `dim` elements, each
+ * `bytes_per_dim` wide (4 for pgvector `vector`/fp32, 2 for `halfvec`/fp16).
+ * = MAXALIGN(sizeof(PgvHnswElemHdr) + PGV_VEC_HEADER_SIZE + dim*bytes_per_dim)
  */
 static size_t
-elem_tuple_size(int dim)
+elem_tuple_size(int dim, int bytes_per_dim)
 {
     return MAXALIGN8(sizeof(PgvHnswElemHdr) + PGV_VEC_HEADER_SIZE
-                     + (size_t)dim * sizeof(float));
+                     + (size_t)dim * (size_t)bytes_per_dim);
 }
 
 /*
@@ -187,6 +188,29 @@ neigh_tuple_size(int level, int m)
     int count = (level + 2) * m;
     return MAXALIGN8(sizeof(PgvHnswNeighHdr)
                      + (size_t)count * sizeof(PgvItemPointer));
+}
+
+/*
+ * Shared page-fit check, extracted from two structurally identical
+ * post-parse blocks (#162). Errors if an element tuple at the worst-case
+ * level plus its neighbor tuple cannot both fit on one page — this layout
+ * assumes exactly one element per page (#161 established that packing
+ * multiple elements per page is a separate, unimplemented lever), so a
+ * failure here means the index cannot be built at all with this dim/type/M.
+ */
+static void
+check_hnsw_page_fit(int dim, int bytes_per_dim, int m, int maxlevel)
+{
+    size_t esize  = elem_tuple_size(dim, bytes_per_dim);
+    size_t nsize  = neigh_tuple_size(maxlevel, m);
+    size_t needed = esize + 2 * PGV_ITEM_OVERHEAD + nsize + 2 * PGV_ITEM_OVERHEAD;
+    if (needed > (size_t)PGV_USABLE_BYTES)
+        ereport(ERROR,
+                (errmsg("pg_cuvs: element+neighbor tuple pair too large for "
+                        "one page: needed=%zu, available=%d "
+                        "(dim=%d, bytes_per_dim=%d, maxlevel=%d, M=%d)",
+                        needed, PGV_USABLE_BYTES, dim, bytes_per_dim,
+                        maxlevel, m)));
 }
 
 /* ----------------------------------------------------------------
@@ -386,6 +410,7 @@ write_elem_page(Relation rel,
                 ElemDesc *e,
                 const float *vec,
                 int dim,
+                int bytes_per_dim,
                 int m,
                 ElemDesc *all_elems,
                 size_t n_elems,
@@ -396,7 +421,7 @@ write_elem_page(Relation rel,
     PgvHnswPageOpaque  *opaque;
 
     /* elem tuple */
-    size_t esize = elem_tuple_size(dim);
+    size_t esize = elem_tuple_size(dim, bytes_per_dim);
     size_t nsize = neigh_tuple_size(e->level, m);
 
     PgvHnswElemHdr *etup = (PgvHnswElemHdr *) palloc0(esize);
@@ -415,9 +440,13 @@ write_elem_page(Relation rel,
     etup->unused = 0;
 
     /* write the vector varlena immediately after the element header.
-     * pgvector uses SET_VARSIZE (standard 4-byte varlena): vl_len_ = size << 2. */
+     * pgvector uses SET_VARSIZE (standard 4-byte varlena): vl_len_ = size << 2.
+     * bytes_per_dim==4 (vector/fp32): raw memcpy, unchanged from before this
+     * parameter existed. bytes_per_dim==2 (halfvec/fp16) narrow-casts here —
+     * added in the commit that wires up halfvec; this commit only threads the
+     * size through, `vec` is always fp32 and the copy is still unconditional. */
     char *vdata = (char *)etup + sizeof(PgvHnswElemHdr);
-    int32_t vl_len = (int32_t)(PGV_VEC_HEADER_SIZE + (size_t)dim * sizeof(float));
+    int32_t vl_len = (int32_t)(PGV_VEC_HEADER_SIZE + (size_t)dim * (size_t)bytes_per_dim);
     int32_t vl_len_field = vl_len << 2;
     memcpy(vdata, &vl_len_field, 4);
     int16_t vdim   = (int16_t)dim;
@@ -1033,19 +1062,10 @@ fill_hnsw_from_hnswlib_impl(Oid cagra_oid, Oid hnsw_oid, bool use_shm,
     }
 
     /* Verify that elem+neigh fit on one page for the worst-case element level.
-     * We check against the largest possible level. */
-    {
-        int max_level_seen = hdr.maxlevel;
-        size_t esize = elem_tuple_size(dim);
-        size_t nsize = neigh_tuple_size(max_level_seen, M);
-        size_t needed = esize + 2 * PGV_ITEM_OVERHEAD + nsize + 2 * PGV_ITEM_OVERHEAD;
-        if (needed > (size_t)PGV_USABLE_BYTES)
-            ereport(ERROR,
-                    (errmsg("pg_cuvs: element+neighbor tuple pair too large for "
-                            "one page: needed=%zu, available=%d "
-                            "(dim=%d, maxlevel=%d, M=%d)",
-                            needed, PGV_USABLE_BYTES, dim, max_level_seen, M)));
-    }
+     * We check against the largest possible level. bytes_per_dim is literal 4
+     * here (structural commit, #162): this pipeline stays fp32-only until the
+     * follow-up commit threads a real bytes_per_dim through. */
+    check_hnsw_page_fit(dim, 4, M, hdr.maxlevel);
 
     /* ---- 9. Re-open .hnsw to read vectors sequentially ---- */
     hf = hnsw_open_stream(hnsw_path, res->shm_fd);
@@ -1183,7 +1203,7 @@ fill_hnsw_from_hnswlib_impl(Oid cagra_oid, Oid hnsw_oid, bool use_shm,
                         elems[i].elem_blkno,
                         &elems[i],
                         vec_buf,
-                        dim, M,
+                        dim, 4, M,
                         elems, N,
                         hnsw_unlogged);
     }
@@ -1613,19 +1633,10 @@ fill_hnsw_from_cagra_ipc_impl(Oid cagra_oid, Oid hnsw_oid, const char *mode,
         elems[i].neigh_offno = 2;
     }
 
-    /* Verify elem+neigh fit on one page (worst-case: max_level, M neighbors). */
-    {
-        size_t esize  = elem_tuple_size((int)ipc_dim);
-        size_t nsize  = neigh_tuple_size(max_level, M);
-        size_t needed = esize + 2 * PGV_ITEM_OVERHEAD + nsize + 2 * PGV_ITEM_OVERHEAD;
-        if (needed > (size_t)PGV_USABLE_BYTES)
-        {
-            ereport(ERROR,
-                    (errmsg("pg_cuvs: element+neighbor too large for one page "
-                            "(dim=%d M=%d max_level=%d needed=%zu avail=%d)",
-                            ipc_dim, M, max_level, needed, PGV_USABLE_BYTES)));
-        }
-    }
+    /* Verify elem+neigh fit on one page (worst-case: max_level, M neighbors).
+     * bytes_per_dim literal 4 here (structural commit, #162) — see the
+     * matching comment at the fill_hnsw_from_hnswlib_impl call site. */
+    check_hnsw_page_fit((int)ipc_dim, 4, M, max_level);
 
     /* ---- 5. Open target HNSW with AccessExclusiveLock and truncate ---- */
     Relation hnsw_rel = index_open(hnsw_oid, AccessExclusiveLock);
@@ -1693,7 +1704,7 @@ fill_hnsw_from_cagra_ipc_impl(Oid cagra_oid, Oid hnsw_oid, const char *mode,
                         elems[i].elem_blkno,
                         &elems[i],
                         vec,
-                        ipc_dim, M,
+                        ipc_dim, 4, M,
                         elems, N,
                         hnsw_unlogged);
     }
