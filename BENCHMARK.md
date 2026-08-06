@@ -3,7 +3,7 @@
 > **The headline is not "GPU is faster."** It is *where the time goes once the GPU
 > removes distance computation.* When CAGRA collapses the per-query distance work to
 > a ~0.7 ms GPU kernel, the bottleneck moves to **IPC round-trip and PostgreSQL heap
-> access** — not the math. This document characterizes that shift with a latency
+> access**, not the math. This document characterizes that shift with a latency
 > decomposition, then backs it with a pgvector comparison on real embeddings and a
 > multi-tenant filtered-search selectivity sweep.
 
@@ -86,7 +86,7 @@ retained for provenance; **not** superseded arithmetic, a different cell (dimens
   1024 dimensions — the conclusion holds across both cells.)
 - **IPC has grown from 33% to 47.8% of the wall.** As the kernel gets cheaper (768 vs
   1024 dimensions), the cost of *reaching* the GPU (shm handshake + socket wakeup +
-  result marshalling) is an ever-larger share — and it is what is left to optimize.
+  result marshalling) is an ever-larger share, and it is what is left to optimize.
 - **Batching amortizes the kernel 29.6×.** Per query the GPU kernel falls from 459.4 µs
   (Q=1) to 15.5 µs inside a Q=2000 `pg_cuvs_batch_search` dispatch, because the AUTO
   path switches kernels: `multi_cta_search` for singles, `single_cta_search` for the
@@ -174,11 +174,11 @@ the remaining **~19.1 s (76%) is PG backend overhead** — the removable part.
 > `ivf_pq::compute_similarity_kernel`. **Which side dominates depends on `build_algo` and
 > dimension.**
 
-The GPU segment is a **floor** — it is cuVS-internal and shared with a raw cuVS call; no
+The GPU segment is a **floor**: it is cuVS-internal and shared with a raw cuVS call; no
 amount of PostgreSQL-side work can push below it. The backend is the **only removable
 part**, and it is *entirely* PG-integration overhead. The north-star metric is therefore
-**"how much of the PG overhead over raw cuVS do we remove,"** not the wall-clock ratio —
-and under the pinned `ivf_pq` cell that removable part is now the **dominant** cost,
+**"how much of the PG overhead over raw cuVS do we remove,"** not the wall-clock ratio.
+Under the pinned `ivf_pq` cell that removable part is now the **dominant** cost,
 which raises the value of ADR-057/058/059 rather than lowering it.
 
 Three levers, all measured on N=500K × 1024:
@@ -192,7 +192,7 @@ Three levers, all measured on N=500K × 1024:
 | **PLAIN storage** (ADR-043) — removes detoast | backend 15.5 s → 8.7 s | profiling §4 |
 
 memfd also makes crash-orphan leak **structurally impossible** (anonymous fd, no
-`/dev/shm` name to leak) — validated across a SIGKILL/SIGSEGV/OOM-killer matrix.
+`/dev/shm` name to leak), validated across a SIGKILL/SIGSEGV/OOM-killer matrix.
 
 **Net** (2026-06 cell: 1M×1024, `build_algo` unpinned): combining PLAIN + memfd +
 parallel workers shrinks the backend from ~15.5 s to **~2–4 s**, i.e. build wall-clock
@@ -200,7 +200,7 @@ parallel workers shrinks the backend from ~15.5 s to **~2–4 s**, i.e. build wa
 keeping PostgreSQL MVCC, durability, and DDL integration. The build wall-clock
 improvement is marginal *because the GPU floor dominates in that cell* — the value is
 the removed backend overhead, not the clock. In the 2026-08 cell (1M×768, `ivf_pq`
-pinned; §1.2 current table) the ratio inverts — backend+IPC is 77.6% of the wall — so
+pinned; §1.2 current table) the ratio inverts (backend+IPC is 77.6% of the wall), so
 the same backend work is worth *more* there, not less.
 
 > This **corrected an earlier code-analysis estimate** (ADR-034) that assumed "GPU build
@@ -252,7 +252,7 @@ Converting CAGRA → pgvector HNSW writes 1M pages. Backend CPU breakdown (perf)
 WAL delta: 1,000,238 records, 4441 MB, 1,000,026 full-page images.
 
 Sequential `ReadBuffer(P_NEW)` serializes on the relation-extension lock, which is why
-parallel page-write is blocked — this **quantitatively confirmed** the decision to defer
+parallel page-write is blocked. This **quantitatively confirmed** the decision to defer
 parallel export (ADR-035). `UNLOGGED` removes the ~14% WAL slice as a practical
 mitigation.
 
@@ -568,8 +568,8 @@ this host at ~1,680 QPS.
 **Against that control, N=32 with a 200 µs window gives 8,398 QPS — 5.0× — while p50
 falls 18.89 → 3.70 ms, 5.1×.** Both ratios are within-file, N=32 wait=200 µs against
 N=32 wait=0, on this host and this build config. Throughput and latency improve together
-rather than trading off, because once the daemon is saturated the mutex queueing wait a
-request pays is far larger than the batching window it waits instead. At N=8 the same
+rather than trading off, because once the daemon is saturated, waiting behind the mutex
+costs a request far more than waiting out the batching window. At N=8 the same
 comparison is 2.7× (4,538 vs 1,671).
 
 **recall does not regress.** The merged cells sit at 0.9922–0.9925 against 0.9911–0.9913
