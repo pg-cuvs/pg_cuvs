@@ -27,12 +27,15 @@ SELECT opcname
 FROM pg_opclass oc JOIN pg_am am ON am.oid = oc.opcmethod
 WHERE am.amname = 'pg_cuvs_hnsw'
 ORDER BY opcname;
-      opcname      
--------------------
+      opcname       
+--------------------
+ halfvec_cosine_ops
+ halfvec_ip_ops
+ halfvec_l2_ops
  vector_cosine_ops
  vector_ip_ops
  vector_l2_ops
-(3 rows)
+(6 rows)
 
 SET cuvs.index_dir = '/tmp/cuvs_indexes';
 -- Setup: 20-vector 4-dim table. Query [1,0.5,0,0] -> unambiguous top-1 = id=20.

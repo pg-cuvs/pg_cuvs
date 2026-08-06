@@ -61,6 +61,7 @@
 #include "utils/fmgroids.h"      /* F_OIDEQ */
 #include "utils/acl.h"
 #include "utils/lsyscache.h"     /* get_rel_name */
+#include "catalog/namespace.h"   /* TypenameGetTypid (#162: vector/halfvec type detection) */
 
 #include <math.h>
 #include <stdio.h>
@@ -211,6 +212,117 @@ check_hnsw_page_fit(int dim, int bytes_per_dim, int m, int maxlevel)
                         "(dim=%d, bytes_per_dim=%d, maxlevel=%d, M=%d)",
                         needed, PGV_USABLE_BYTES, dim, bytes_per_dim,
                         maxlevel, m)));
+}
+
+/*
+ * IEEE-754 round-to-nearest-even float32 -> float16 (#162). Matches
+ * pgvector halfvec's `half` representation: 1 sign + 5 exponent + 10
+ * mantissa bits. Hand-rolled because this is plain-C PGXS backend code (no
+ * CUDA __float2half available here — that intrinsic backs the *other* fp16
+ * feature in this codebase, cuvs_wrapper.cu's brute-force precision='float16',
+ * which is a .cu translation unit; this file is deliberately not one, see
+ * ADR-001) and pgvector's own internal conversion routine is not an exported
+ * stable C ABI this file may depend on (file header: "We do NOT include
+ * pgvector's hnsw.h... All structs are defined locally").
+ *
+ * Verified bit-exact against a live pgvector 0.8.6 install's own
+ * `vector::halfvec` cast across 335 finite in-range values, including an
+ * exact round-to-even tie (-1.5229491687270953 -> both this function and
+ * pgvector agree on 0xbe18, not the nearer-looking-but-wrong 0xbe17 a naive
+ * reference — numpy's float32->float16 cast — produces for that same tie).
+ */
+static uint16_t
+float_to_half(float f)
+{
+    uint32_t x;
+    memcpy(&x, &f, 4);
+    uint32_t sign = (x >> 16) & 0x8000u;
+    int32_t  exp  = (int32_t)((x >> 23) & 0xFF) - 127 + 15;
+    uint32_t mant = x & 0x7FFFFFu;
+
+    if (((x >> 23) & 0xFF) == 0xFF)              /* Inf/NaN */
+        return (uint16_t)(sign | 0x7C00u | (mant ? 0x0200u : 0));
+    if (exp >= 0x1F)                              /* overflow -> Inf */
+        return (uint16_t)(sign | 0x7C00u);
+    if (exp <= 0)                                 /* underflow -> subnormal/zero */
+    {
+        if (exp < -10) return (uint16_t)sign;     /* too small, flush to zero */
+        mant |= 0x800000u;                        /* implicit leading 1 */
+        uint32_t shift = (uint32_t)(14 - exp);
+        uint32_t half_mant = mant >> shift;
+        /* round to nearest even */
+        if ((mant >> (shift - 1)) & 1)
+            if (((mant & ((1u << (shift - 1)) - 1)) != 0) || (half_mant & 1))
+                half_mant++;
+        return (uint16_t)(sign | half_mant);
+    }
+    /* normal range: round mantissa from 23 to 10 bits, RNE */
+    uint32_t half_mant = mant >> 13;
+    if (mant & 0x1000u)
+        if ((mant & 0xFFFu) || (half_mant & 1))
+            half_mant++;
+    if (half_mant & 0x400u)
+    {
+        half_mant = 0;
+        exp++;
+        if (exp >= 0x1F) return (uint16_t)(sign | 0x7C00u);
+    }
+    return (uint16_t)(sign | ((uint32_t)exp << 10) | half_mant);
+}
+
+/*
+ * Cached vector/halfvec type OIDs (#162). InvalidOid until first resolved;
+ * a lookup miss (halfvec absent) is a legitimate state for pgvector <0.7.0,
+ * not a bug — handled by callers via cuvs_warn_pgvector_version()'s
+ * halfvec-aware ERROR path, not by failing here.
+ */
+static Oid  cached_halfvec_typoid = InvalidOid;
+static bool halfvec_typoid_resolved = false;
+static Oid  cached_vector_typoid = InvalidOid;
+static bool vector_typoid_resolved = false;
+
+static Oid
+get_halfvec_typoid(void)
+{
+    if (!halfvec_typoid_resolved)
+    {
+        cached_halfvec_typoid = TypenameGetTypid("halfvec");
+        halfvec_typoid_resolved = true;
+    }
+    return cached_halfvec_typoid;
+}
+
+static Oid
+get_vector_typoid(void)
+{
+    if (!vector_typoid_resolved)
+    {
+        cached_vector_typoid = TypenameGetTypid("vector");
+        vector_typoid_resolved = true;
+    }
+    return cached_vector_typoid;
+}
+
+/*
+ * Resolve a target column's element width in bytes from its actual PG type
+ * OID (#162): 4 for vector (fp32), 2 for halfvec (fp16). ERRORs on anything
+ * else — this file only ever writes pgvector-compatible vector/halfvec page
+ * bytes, so a third type reaching here is a caller bug, not a runtime
+ * condition to degrade gracefully from.
+ */
+static int
+bytes_per_dim_for_typid(Oid typid)
+{
+    Oid hv = get_halfvec_typoid();
+    if (OidIsValid(hv) && typid == hv)
+        return 2;
+    Oid vc = get_vector_typoid();
+    if (OidIsValid(vc) && typid == vc)
+        return 4;
+    ereport(ERROR,
+            (errmsg("pg_cuvs: target index column type (typoid=%u) is neither "
+                    "vector nor halfvec", typid)));
+    return 4; /* unreached */
 }
 
 /* ----------------------------------------------------------------
@@ -441,10 +553,10 @@ write_elem_page(Relation rel,
 
     /* write the vector varlena immediately after the element header.
      * pgvector uses SET_VARSIZE (standard 4-byte varlena): vl_len_ = size << 2.
-     * bytes_per_dim==4 (vector/fp32): raw memcpy, unchanged from before this
-     * parameter existed. bytes_per_dim==2 (halfvec/fp16) narrow-casts here —
-     * added in the commit that wires up halfvec; this commit only threads the
-     * size through, `vec` is always fp32 and the copy is still unconditional. */
+     * `vec` is always the fp32 buffer read from the .hnsw sidecar / IPC
+     * adjacency (#162: GPU CAGRA build stays fp32 throughout — cuVS has no
+     * fp16 CAGRA path, ADR-054). The narrow-cast to halfvec happens ONLY
+     * here, at the final page-write boundary, never upstream. */
     char *vdata = (char *)etup + sizeof(PgvHnswElemHdr);
     int32_t vl_len = (int32_t)(PGV_VEC_HEADER_SIZE + (size_t)dim * (size_t)bytes_per_dim);
     int32_t vl_len_field = vl_len << 2;
@@ -453,7 +565,16 @@ write_elem_page(Relation rel,
     int16_t vunused = 0;
     memcpy(vdata + 4, &vdim,    2);
     memcpy(vdata + 6, &vunused, 2);
-    memcpy(vdata + 8, vec, (size_t)dim * sizeof(float));
+    if (bytes_per_dim == 4)
+    {
+        memcpy(vdata + 8, vec, (size_t)dim * sizeof(float));
+    }
+    else /* bytes_per_dim == 2: halfvec */
+    {
+        uint16_t *hbuf = (uint16_t *) (vdata + 8);
+        for (int i = 0; i < dim; i++)
+            hbuf[i] = float_to_half(vec[i]);
+    }
 
     /* neighbor tuple */
     int count = (e->level + 2) * m;
@@ -608,6 +729,59 @@ cuvs_warn_pgvector_version(void)
     table_close(rel, AccessShareLock);
 }
 
+/*
+ * #162: halfvec was added in pgvector 0.7.0. pg_cuvs.control's `requires`
+ * field cannot express a version-qualified dependency (PostgreSQL's .control
+ * format is a bare extension-name list, no version syntax) — this is the
+ * substitute enforcement point, called only when a build actually targets a
+ * halfvec index, right after that target's type is known. ERROR, not
+ * WARNING: cuvs_warn_pgvector_version() above warns-and-continues for a
+ * general format-compatibility concern, but writing halfvec bytes against a
+ * pgvector build that has no halfvec type/opclasses at all is not a "might
+ * be incompatible" risk, it is certain to fail (CREATE OPERATOR CLASS ...
+ * FOR TYPE halfvec would not even have installed) or produce garbage.
+ */
+static void
+require_halfvec_capable_pgvector(void)
+{
+    Oid          ext_oid = get_extension_oid("vector", true);
+    Relation     rel;
+    SysScanDesc  scan;
+    ScanKeyData  key;
+    HeapTuple    tup;
+
+    if (!OidIsValid(ext_oid))
+        return;   /* absence is handled (ERROR) elsewhere */
+
+    rel = table_open(ExtensionRelationId, AccessShareLock);
+    ScanKeyInit(&key, Anum_pg_extension_oid, BTEqualStrategyNumber,
+                F_OIDEQ, ObjectIdGetDatum(ext_oid));
+    scan = systable_beginscan(rel, ExtensionOidIndexId, true, NULL, 1, &key);
+    tup = systable_getnext(scan);
+    if (HeapTupleIsValid(tup))
+    {
+        bool  isnull;
+        Datum d = heap_getattr(tup, Anum_pg_extension_extversion,
+                               RelationGetDescr(rel), &isnull);
+        if (!isnull)
+        {
+            char *ver = text_to_cstring(DatumGetTextPP(d));
+            int   major = -1, minor = -1;
+            if (sscanf(ver, "%d.%d", &major, &minor) == 2
+                && major == 0 && minor < 7)
+                ereport(ERROR,
+                        (errmsg("pg_cuvs: halfvec target requires pgvector "
+                                ">= 0.7.0, found %s", ver),
+                         errhint("halfvec was added in pgvector 0.7.0; "
+                                 "upgrade pgvector or target a vector "
+                                 "(fp32) index instead.")));
+            pfree(ver);
+        }
+    }
+    systable_endscan(scan);
+    table_close(rel, AccessShareLock);
+}
+
 /* ================================================================
  * Main SQL function
  * ================================================================ */
@@ -655,6 +829,7 @@ fill_hnsw_from_hnswlib_impl(Oid cagra_oid, Oid hnsw_oid, bool use_shm,
     /* ---- 1b. Validate target index before opening it ---- */
     /* Look up via syscache to avoid opening a non-HNSW index first. */
     bool hnsw_unlogged = false;  /* set below; true = skip WAL on page writes */
+    int  bytes_per_dim = 4;      /* #162: set from the target's actual type below */
     {
         HeapTuple tup = SearchSysCache1(RELOID, ObjectIdGetDatum(hnsw_oid));
         if (!HeapTupleIsValid(tup))
@@ -703,7 +878,12 @@ fill_hnsw_from_hnswlib_impl(Oid cagra_oid, Oid hnsw_oid, bool use_shm,
                 {
                     Form_pg_attribute att = (Form_pg_attribute) GETSTRUCT(attup);
                     tgt_dim = (int)att->atttypmod;
+                    /* #162: must read atttypid before ReleaseSysCache — the
+                     * tuple (and att, which points into it) is invalid after. */
+                    bytes_per_dim = bytes_per_dim_for_typid(att->atttypid);
                     ReleaseSysCache(attup);
+                    if (bytes_per_dim == 2)
+                        require_halfvec_capable_pgvector();
                 }
             }
             if (tgt_dim > 0 && tgt_dim != dim)
@@ -1062,10 +1242,8 @@ fill_hnsw_from_hnswlib_impl(Oid cagra_oid, Oid hnsw_oid, bool use_shm,
     }
 
     /* Verify that elem+neigh fit on one page for the worst-case element level.
-     * We check against the largest possible level. bytes_per_dim is literal 4
-     * here (structural commit, #162): this pipeline stays fp32-only until the
-     * follow-up commit threads a real bytes_per_dim through. */
-    check_hnsw_page_fit(dim, 4, M, hdr.maxlevel);
+     * We check against the largest possible level. */
+    check_hnsw_page_fit(dim, bytes_per_dim, M, hdr.maxlevel);
 
     /* ---- 9. Re-open .hnsw to read vectors sequentially ---- */
     hf = hnsw_open_stream(hnsw_path, res->shm_fd);
@@ -1203,7 +1381,7 @@ fill_hnsw_from_hnswlib_impl(Oid cagra_oid, Oid hnsw_oid, bool use_shm,
                         elems[i].elem_blkno,
                         &elems[i],
                         vec_buf,
-                        dim, 4, M,
+                        dim, bytes_per_dim, M,
                         elems, N,
                         hnsw_unlogged);
     }
@@ -1375,6 +1553,7 @@ fill_hnsw_from_cagra_ipc_impl(Oid cagra_oid, Oid hnsw_oid, const char *mode,
     /* ---- 1b. Validate target index (AM, dim, metric) ---- */
     bool hnsw_unlogged = false;
     uint32_t tgt_metric = CUVS_METRIC_L2;
+    int  bytes_per_dim = 4;  /* #162: set from the target's actual type below */
     {
         HeapTuple tup = SearchSysCache1(RELOID, ObjectIdGetDatum(hnsw_oid));
         if (!HeapTupleIsValid(tup))
@@ -1405,8 +1584,14 @@ fill_hnsw_from_cagra_ipc_impl(Oid cagra_oid, Oid hnsw_oid, const char *mode,
                                                Int16GetDatum(1));
             if (HeapTupleIsValid(attup))
             {
-                tgt_dim = (int)((Form_pg_attribute)GETSTRUCT(attup))->atttypmod;
+                Form_pg_attribute att = (Form_pg_attribute) GETSTRUCT(attup);
+                tgt_dim = (int)att->atttypmod;
+                /* #162: read atttypid before ReleaseSysCache — att points
+                 * into the tuple, invalid after release. */
+                bytes_per_dim = bytes_per_dim_for_typid(att->atttypid);
                 ReleaseSysCache(attup);
+                if (bytes_per_dim == 2)
+                    require_halfvec_capable_pgvector();
             }
             if (tgt_dim > 0 && tgt_dim != dim)
             {
@@ -1633,10 +1818,8 @@ fill_hnsw_from_cagra_ipc_impl(Oid cagra_oid, Oid hnsw_oid, const char *mode,
         elems[i].neigh_offno = 2;
     }
 
-    /* Verify elem+neigh fit on one page (worst-case: max_level, M neighbors).
-     * bytes_per_dim literal 4 here (structural commit, #162) — see the
-     * matching comment at the fill_hnsw_from_hnswlib_impl call site. */
-    check_hnsw_page_fit((int)ipc_dim, 4, M, max_level);
+    /* Verify elem+neigh fit on one page (worst-case: max_level, M neighbors). */
+    check_hnsw_page_fit((int)ipc_dim, bytes_per_dim, M, max_level);
 
     /* ---- 5. Open target HNSW with AccessExclusiveLock and truncate ---- */
     Relation hnsw_rel = index_open(hnsw_oid, AccessExclusiveLock);
@@ -1704,7 +1887,7 @@ fill_hnsw_from_cagra_ipc_impl(Oid cagra_oid, Oid hnsw_oid, const char *mode,
                         elems[i].elem_blkno,
                         &elems[i],
                         vec,
-                        ipc_dim, 4, M,
+                        ipc_dim, bytes_per_dim, M,
                         elems, N,
                         hnsw_unlogged);
     }
