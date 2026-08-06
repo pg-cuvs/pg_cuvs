@@ -11,7 +11,9 @@ superseded it.
 
 **Reading the section numbers:** they are the numbers these sections carried in
 `BENCHMARK.md`. A bare `§x` cross-reference inside a moved section still points at
-[`BENCHMARK.md`](../../BENCHMARK.md), not at this file.
+[`BENCHMARK.md`](../../BENCHMARK.md) — **unless that section itself was moved here**,
+in which case it points within this file. So `§2.1` and `§2.1a` below resolve here,
+while `§2.1b` resolves in `BENCHMARK.md`.
 
 ---
 
