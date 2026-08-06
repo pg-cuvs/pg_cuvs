@@ -252,8 +252,29 @@ WAL delta: 1,000,238 records, 4441 MB, 1,000,026 full-page images.
 
 Sequential `ReadBuffer(P_NEW)` serializes on the relation-extension lock, which is why
 parallel page-write is blocked. This **quantitatively confirmed** the decision to defer
-parallel export (ADR-035). `UNLOGGED` removes the ~14% WAL slice as a practical
-mitigation.
+parallel export (ADR-035).
+
+**Independent corroboration (#161, 2026-08-05, wiki_all_1M dim=768, wall-clock
+instrumentation rather than `perf` CPU-share):** the same WAL slice dominates by a
+different method too — with WAL logging removed from `write_elem_page`'s loop, wall-clock
+dropped from 20.26s to 7.7s (write-loop-only), i.e. WAL was **~62%** of that portion on
+this dataset/dim. The two measurements disagree in magnitude (14% vs 62%) because they
+measure different things (CPU-time share at dim=1024 vs wall-clock share at dim=768,
+different datasets, different tools) — but agree that WAL is the largest single
+addressable slice, not buffer-manager round-trips or page-fill.
+
+**`UNLOGGED` is not just a smaller-slice mitigation — it is the largest lever already
+available, with zero code change.** [`design/ops-gpu-playbook.md` §3.0/3.1](design/ops-gpu-playbook.md)
+documents the build-time-then-`REINDEX` pattern: build the target index `UNLOGGED`,
+`REINDEX` to `LOGGED` in a maintenance window. Measured there (`pg_cuvs_import_cagra`,
+1M×1024): **~96s vs pgvector native 285s (3.0×)**, vs this doc's own LOGGED-vs-LOGGED
+headline ratios in §2.1c. The two numbers are not interchangeable — §2.1c's ratios are a
+fair same-durability-tier comparison against pgvector's own LOGGED default; the
+UNLOGGED+REINDEX path trades a maintenance window for a faster wall-clock and is the
+right answer for anyone who can accept that trade today, ahead of any further
+`write_elem_page` optimization (#161 evaluated and declined a buffer-manager-bypass
+lever aimed at the same WAL cost — see #161 for why the marginal code-level gain there
+is smaller than what `UNLOGGED` already delivers).
 
 ---
 
