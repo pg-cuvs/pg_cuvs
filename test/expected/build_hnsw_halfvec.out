@@ -1,0 +1,126 @@
+-- build_hnsw_halfvec.sql — #162: halfvec (fp16) target coverage.
+--
+-- CAGRA GPU build stays fp32 throughout (cuVS has no fp16 CAGRA path,
+-- ADR-054); only the final HNSW page-write narrow-casts to halfvec. This
+-- covers the write path end-to-end via the pg_cuvs_hnsw AM (the primary
+-- surface from #162; pg_cuvs_hnsw.sql covers the same AM path at dim=4).
+--
+-- Coverage:
+--   1. Small end-to-end build (dim=8, 18 vecs — above the daemon's n>=16
+--      hnswlib serialization floor) via mode='nsw' and mode='hnswlib'.
+--   2. index_bytes determinism: rebuilding from the same source CAGRA
+--      twice yields identical sizes.
+--   3. Search correctness: nearest neighbor unaffected by the fp16
+--      narrow-cast for an exact-match query.
+--   4. dim=3072 (the #162 issue's headline case — unreachable via plain
+--      `vector` HNSW, upper bound 2000): build + search sanity, not recall.
+\set ON_ERROR_STOP on
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS vector;
+CREATE EXTENSION IF NOT EXISTS pg_cuvs;
+RESET client_min_messages;
+SET cuvs.index_dir = '/tmp/cuvs_indexes';
+-- ── dim=8, 18 vectors: nsw mode, determinism, search correctness ────
+CREATE TABLE hv_small (id bigint, embedding vector(8));
+INSERT INTO hv_small VALUES
+    (1, '[1,0,0,0,0,0,0,0]'),
+    (2, '[0,1,0,0,0,0,0,0]'),
+    (3, '[0.9,0.1,0,0,0,0,0,0]'),
+    (4, '[0,0,1,0,0,0,0,0]'),
+    (5, '[0,0,0,1,0,0,0,0]'),
+    (6, '[0,0,0,0,1,0,0,0]'),
+    (7, '[0,0,0,0,0,1,0,0]'),
+    (8, '[0,0,0,0,0,0,1,0]'),
+    (9, '[0,0,0,0,0,0,0,1]'),
+    (10,'[0.5,0.5,0,0,0,0,0,0]'),
+    (11,'[0.3,0.3,0.3,0,0,0,0,0]'),
+    (12,'[0,0.3,0.3,0.3,0,0,0,0]'),
+    (13,'[0,0,0.3,0.3,0.3,0,0,0]'),
+    (14,'[0,0,0,0.3,0.3,0.3,0,0]'),
+    (15,'[0,0,0,0,0.3,0.3,0.3,0]'),
+    (16,'[0,0,0,0,0,0.3,0.3,0.3]'),
+    (17,'[0.25,0.25,0.25,0.25,0,0,0,0]'),
+    (18,'[0,0.25,0.25,0.25,0.25,0,0,0]');
+CREATE INDEX hv_small_cagra ON hv_small USING cagra (embedding vector_l2_ops);
+-- client_min_messages=warning around each build: the import NOTICE embeds
+-- the source/target index OIDs, which are catalog-order-dependent and not
+-- stable across runs (same suppression pattern as pg_cuvs_hnsw.sql).
+SET client_min_messages = 'warning';
+CREATE INDEX hv_small_hnsw ON hv_small USING pg_cuvs_hnsw
+    ((embedding::halfvec(8)) halfvec_l2_ops)
+    WITH (source = 'hv_small_cagra', mode = 'nsw');
+SET client_min_messages = 'notice';
+SET enable_seqscan = off;
+SELECT id FROM hv_small
+ORDER BY embedding::halfvec(8) <-> '[1,0,0,0,0,0,0,0]'::halfvec(8) LIMIT 1;
+ id 
+----
+  1
+(1 row)
+
+RESET enable_seqscan;
+-- Determinism: same source CAGRA, rebuilt from scratch -> identical size.
+SELECT pg_relation_size('hv_small_hnsw') AS nsw_bytes \gset
+DROP INDEX hv_small_hnsw;
+SET client_min_messages = 'warning';
+CREATE INDEX hv_small_hnsw ON hv_small USING pg_cuvs_hnsw
+    ((embedding::halfvec(8)) halfvec_l2_ops)
+    WITH (source = 'hv_small_cagra', mode = 'nsw');
+SET client_min_messages = 'notice';
+SELECT pg_relation_size('hv_small_hnsw') = :'nsw_bytes' AS nsw_rebuild_same_size;
+ nsw_rebuild_same_size 
+-----------------------
+ t
+(1 row)
+
+DROP INDEX hv_small_hnsw;
+-- mode='hnswlib': second write_elem_page call site, same source.
+SET client_min_messages = 'warning';
+CREATE INDEX hv_small_hnsw ON hv_small USING pg_cuvs_hnsw
+    ((embedding::halfvec(8)) halfvec_l2_ops)
+    WITH (source = 'hv_small_cagra', mode = 'hnswlib');
+SET client_min_messages = 'notice';
+SET enable_seqscan = off;
+SELECT id FROM hv_small
+ORDER BY embedding::halfvec(8) <-> '[1,0,0,0,0,0,0,0]'::halfvec(8) LIMIT 1;
+ id 
+----
+  1
+(1 row)
+
+RESET enable_seqscan;
+DROP TABLE hv_small CASCADE;
+-- ── dim=3072: the issue's headline case — vector HNSW cannot reach this
+-- dim at all (pgvector upper bound 2000); halfvec (upper bound 4000) is the
+-- only path. Not a recall measurement, just build+search plumbing sanity. ──
+CREATE TABLE hv_wide (id bigint, embedding vector(3072));
+INSERT INTO hv_wide
+    SELECT i, (SELECT ('[' || string_agg(
+                   CASE WHEN j = i THEN '1' ELSE '0' END, ',') || ']')::vector
+               FROM generate_series(1, 3072) j)
+    FROM generate_series(1, 20) i;
+-- Each row's embedding is a distinct one-hot vector (row i is 1 at position
+-- i). The query below is the exact one-hot at position 1, an exact match
+-- for row 1 only and orthogonal to every other row — the nearest neighbor
+-- is unambiguous regardless of the fp16 narrow-cast.
+CREATE INDEX hv_wide_cagra ON hv_wide USING cagra (embedding vector_l2_ops);
+NOTICE:  pg_cuvs: indexed column "embedding" uses TOAST-able storage and toasts at this dimension; PLAIN storage avoids detoast overhead during build
+HINT:  For vector-only tables: ALTER TABLE hv_wide ALTER COLUMN embedding SET STORAGE PLAIN; VACUUM FULL; then rebuild. See docs/best-practices.md.
+SET client_min_messages = 'warning';
+CREATE INDEX hv_wide_hnsw ON hv_wide USING pg_cuvs_hnsw
+    ((embedding::halfvec(3072)) halfvec_l2_ops)
+    WITH (source = 'hv_wide_cagra', mode = 'nsw');
+SET client_min_messages = 'notice';
+SET enable_seqscan = off;
+SELECT id FROM hv_wide
+ORDER BY embedding::halfvec(3072) <->
+    (SELECT ('[' || string_agg(CASE WHEN j = 1 THEN '1' ELSE '0' END, ',') || ']')::halfvec(3072)
+     FROM generate_series(1, 3072) j)
+LIMIT 1;
+ id 
+----
+  1
+(1 row)
+
+RESET enable_seqscan;
+DROP TABLE hv_wide CASCADE;

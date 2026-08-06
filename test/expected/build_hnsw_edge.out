@@ -6,8 +6,10 @@
 --   3. VACUUM after build: index remains searchable.
 --   4. REINDEX after build: pgvector CPU path rebuilds; index remains searchable.
 --   5. Error: calling pg_cuvs_build_hnsw on non-existent CAGRA (NOT_FOUND).
+--   6. #162: dim-ceiling pre-check rejects BEFORE the GPU/IPC conversion
+--      round-trip, for both vector (fp32) and halfvec (fp16) targets.
 --
--- NOTE: No \set ON_ERROR_STOP on for Cases 1b and 5 (expected errors).
+-- NOTE: No \set ON_ERROR_STOP on for Cases 1b, 5, and 6 (expected errors).
 SET client_min_messages = warning;
 CREATE EXTENSION IF NOT EXISTS vector;
 CREATE EXTENSION IF NOT EXISTS pg_cuvs;
@@ -133,3 +135,38 @@ ROLLBACK TO SAVEPOINT sp_dropped;
 COMMIT;
 -- Cleanup.
 DROP TABLE ec_dropped;
+-- ── Case 6: #162 dim-ceiling pre-check (safe_maxlevel=5) ─────────
+-- fp32, M=32 (graph_degree=64): ceiling is 1678 per the issue's table.
+-- dim=1900 must be rejected — and rejected BEFORE the HNSW-conversion
+-- IPC round-trip (only the source CAGRA build itself pays GPU time).
+\set ON_ERROR_STOP off
+CREATE TABLE ec_ceiling_f32 (id bigint, embedding vector(1900));
+INSERT INTO ec_ceiling_f32
+    SELECT i, (SELECT ('[' || string_agg(random()::text, ',') || ']')::vector
+               FROM generate_series(1,1900))
+    FROM generate_series(1,5) i;
+SET client_min_messages = 'warning';
+CREATE INDEX ec_ceiling_f32_cagra ON ec_ceiling_f32 USING cagra
+    (embedding vector_l2_ops) WITH (graph_degree = 64);
+SET client_min_messages = 'notice';
+CREATE INDEX ec_ceiling_f32_hnsw ON ec_ceiling_f32 USING pg_cuvs_hnsw
+    (embedding vector_l2_ops) WITH (source = 'ec_ceiling_f32_cagra', mode = 'nsw');
+ERROR:  pg_cuvs: element+neighbor tuple pair too large for one page: needed=9048, available=8160 (dim=1900, bytes_per_dim=4, maxlevel=5, M=32)
+DROP TABLE ec_ceiling_f32;
+-- halfvec, M=32 (graph_degree=64): ceiling is 3356 per the issue's table.
+-- dim=3600 must be rejected the same way.
+CREATE TABLE ec_ceiling_hv (id bigint, embedding vector(3600));
+INSERT INTO ec_ceiling_hv
+    SELECT i, (SELECT ('[' || string_agg(random()::text, ',') || ']')::vector
+               FROM generate_series(1,3600))
+    FROM generate_series(1,5) i;
+SET client_min_messages = 'warning';
+CREATE INDEX ec_ceiling_hv_cagra ON ec_ceiling_hv USING cagra
+    (embedding vector_l2_ops) WITH (graph_degree = 64);
+SET client_min_messages = 'notice';
+CREATE INDEX ec_ceiling_hv_hnsw ON ec_ceiling_hv USING pg_cuvs_hnsw
+    ((embedding::halfvec(3600)) halfvec_l2_ops)
+    WITH (source = 'ec_ceiling_hv_cagra', mode = 'nsw');
+ERROR:  pg_cuvs: element+neighbor tuple pair too large for one page: needed=8648, available=8160 (dim=3600, bytes_per_dim=2, maxlevel=5, M=32)
+DROP TABLE ec_ceiling_hv;
+\set ON_ERROR_STOP on
