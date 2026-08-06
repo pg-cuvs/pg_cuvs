@@ -35,14 +35,23 @@
 # --index-dir with the umask set on the process itself, and restores the unit
 # on exit. Same pattern as asan-export-restart.sh.
 #
-# SCOPE — the TRANSIENT handoff only.
+# SCOPE — transient handoff (#166) and persistent sidecars (#167).
 #
-# Persistent sidecars also inherit the daemon's umask, and the backend reads
-# .tids by path, so a daemon hardened for its whole lifetime breaks that too.
-# That is #167, a separate open bug. This guard neither masks it nor trips over
-# it: the fixture is built by a normal-umask daemon, and only the export runs
-# against the hardened one. When #167 is fixed, the fixture phase below is what
-# should be flipped to umask 077.
+# Persistent sidecars inherit the daemon's umask too, and the backend reads
+# .tids by path (hnsw_export.c) — a name, not an fd, so #166's fix cannot help
+# it. That was #167: a daemon hardened for its whole lifetime wrote .tids/.cagra
+# at 0600, and the phase-2 export below (which reads .tids by path to build the
+# pgvector HNSW) failed with EACCES even though the transient .hnsw handoff
+# itself was fine.
+#
+# Fixed by chmod'ing every index_dir sidecar to 0644 right after it is written
+# (pg_cuvs_server.c fchmod_sidecar/chmod_sidecar), independent of the writing
+# process's umask — same reasoning as #166, applied to the files fd-passing
+# cannot reach because they must still exist after a restart.
+#
+# Phase 1 now builds the fixture under the SAME hardened umask as phase 2, so
+# .tids/.cagra are also written hardened — this is what proves #167, since
+# phase 2's export reads .tids by path regardless of #166's fix.
 #
 # Run on the GPU VM; needs sudo (systemctl only) and a built pg_cuvs_server.
 set -u
@@ -107,14 +116,14 @@ cleanup(){
 }
 trap cleanup EXIT
 
-echo "== #166 hardened-umask export =="
+echo "== #166/#167 hardened-umask export =="
 
 sudo systemctl stop pg-cuvs-server || true
 kill_test_daemon
 rm -rf "$TESTIDX"; mkdir -p "$TESTIDX"; chmod 755 "$TESTIDX"
 
-# ---- phase 1: fixture, normal umask -> persistent sidecars stay readable ----
-launch_daemon 022 || { bad "daemon launch (umask 022)"; exit 1; }
+# ---- phase 1: fixture, HARDENED umask -> .tids/.cagra written 0600 (#167) --
+launch_daemon 077 || { bad "daemon launch (umask 077, fixture)"; exit 1; }
 
 # 2000 rows clears CUVS_HNSW_MIN_ELEMENTS (16) with room for the CAGRA graph.
 if $PSQL <<SQL >/dev/null 2>/tmp/umask_setup.txt
@@ -132,7 +141,7 @@ INSERT INTO umask_t
 CREATE INDEX umask_t_cagra ON umask_t USING cagra (embedding vector_l2_ops);
 SQL
 then
-  ok "fixture built under normal umask"
+  ok "fixture built under hardened umask (.tids/.cagra at 077)"
 else
   bad "fixture build: $(why /tmp/umask_setup.txt)"; exit 1
 fi
