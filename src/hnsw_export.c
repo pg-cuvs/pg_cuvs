@@ -1400,7 +1400,15 @@ fill_hnsw_from_hnswlib_impl(Oid cagra_oid, Oid hnsw_oid, bool use_shm,
      * hnsw_fill_res_free() closes the fd, which releases the inode. */
 }
 
-static void
+/* #161: returns the actual element count written, so ambuild() can report
+ * accurate index_tuples/heap_tuples without inferring it from the relation's
+ * block count — an inference that assumed exactly one element per page and
+ * breaks once packing (fill_hnsw_from_cagra_ipc()'s nsw path) makes that
+ * assumption false. res.n_elems is set by the _impl on the success path
+ * (before PG_FINALLY frees the pointer fields, which never touches this
+ * scalar) and is unreachable on the error path, where PG_TRY's longjmp
+ * skips the return entirely — no stale-value case to guard against. */
+static size_t
 fill_hnsw_from_hnswlib(Oid cagra_oid, Oid hnsw_oid, bool use_shm)
 {
     /*
@@ -1423,6 +1431,7 @@ fill_hnsw_from_hnswlib(Oid cagra_oid, Oid hnsw_oid, bool use_shm)
         hnsw_fill_res_free((HnswFillRes *) &res);
     }
     PG_END_TRY();
+    return res.n_elems;
 }
 
 /* ================================================================
@@ -1901,7 +1910,9 @@ fill_hnsw_from_cagra_ipc_impl(Oid cagra_oid, Oid hnsw_oid, const char *mode,
                     cagra_oid, hnsw_oid)));
 }
 
-static void
+/* #161: returns the actual element count — see the matching comment on
+ * fill_hnsw_from_hnswlib(). */
+static size_t
 fill_hnsw_from_cagra_ipc(Oid cagra_oid, Oid hnsw_oid, const char *mode)
 {
     /* #166 review 3: volatile across the longjmp — see fill_hnsw_from_hnswlib. */
@@ -1919,6 +1930,7 @@ fill_hnsw_from_cagra_ipc(Oid cagra_oid, Oid hnsw_oid, const char *mode)
         hnsw_fill_res_free((HnswFillRes *) &res);
     }
     PG_END_TRY();
+    return res.n_elems;
 }
 
 /* ================================================================
@@ -2375,17 +2387,22 @@ cuvs_hnsw_ambuild(Relation heapRel, Relation indexRel, IndexInfo *indexInfo)
      * object this backend already holds (the index under construction) is a
      * no-op re-grant, and the freshly created relation has 0 blocks so no
      * truncate happens. */
+    size_t n_elems_written;
     if (strcmp(mode, "nsw") == 0 || strcmp(mode, "hnsw") == 0)
-        fill_hnsw_from_cagra_ipc(cagra_oid, self_oid, mode);
+        n_elems_written = fill_hnsw_from_cagra_ipc(cagra_oid, self_oid, mode);
     else if (strcmp(mode, "hnswlib") == 0)
-        fill_hnsw_from_hnswlib(cagra_oid, self_oid, true);
+        n_elems_written = fill_hnsw_from_hnswlib(cagra_oid, self_oid, true);
     else  /* hnswlib_file */
-        fill_hnsw_from_hnswlib(cagra_oid, self_oid, false);
+        n_elems_written = fill_hnsw_from_hnswlib(cagra_oid, self_oid, false);
 
-    /* Element pages are one-per-vector after the metapage (block 0). */
+    /* #161: element count from fill_*'s own return, not inferred from block
+     * count. nblocks-1 == N only holds while every page carries exactly one
+     * element — true today, but a later commit packs multiple elements per
+     * page on the nsw path, at which point that inference goes silently
+     * wrong. Switching to the exact count now removes the assumption before
+     * it can be violated. */
     {
-        BlockNumber nblocks = RelationGetNumberOfBlocks(indexRel);
-        double ntuples = (nblocks > 0) ? (double) (nblocks - 1) : 0.0;
+        double ntuples = (double) n_elems_written;
         result->heap_tuples  = ntuples;
         result->index_tuples = ntuples;
     }
