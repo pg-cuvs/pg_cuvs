@@ -162,4 +162,23 @@ WHERE t.id <> (
 (1 row)
 
 RESET enable_cuvs; RESET enable_seqscan;
+-- The full-last-page case is the tightest-margin combination for a post-build
+-- INSERT: the last page has ~240 bytes free (8192 - 24 header - 8 opaque -
+-- 9*(480+392) tuples), too little for another pair's combinedSize, forcing
+-- pgvector's own aminsert down its page-extend path (HnswInsertAppendPage)
+-- rather than the fast in-page path Case 5's N=500 (partial last page,
+-- ~3.7KB free) takes. metap->insertPage still has to point somewhere sane
+-- for this to work at all.
+INSERT INTO hp_test2
+    SELECT 505, (SELECT ('[' || string_agg(random()::text, ',') || ']')::vector
+                 FROM generate_series(1, 100));
+SET enable_cuvs = off; SET enable_seqscan = off;
+SELECT id FROM hp_test2
+ORDER BY embedding <-> (SELECT embedding FROM hp_test2 WHERE id = 505) LIMIT 1;
+ id  
+-----
+ 505
+(1 row)
+
+RESET enable_cuvs; RESET enable_seqscan;
 DROP TABLE hp_test2 CASCADE;

@@ -704,19 +704,25 @@ reference.
 | | build time | index_bytes | B/vector |
 |---|---:|---:|---:|
 | `pgcuvs_hnsw_import` (mode='nsw'), **before** (computed, 1 pair/page) | — | 819,208,192 | 8,192.1 |
-| `pgcuvs_hnsw_import` (mode='nsw'), **after** (packed, measured) | 1.6s | 409,608,192 | 4,096.1 |
-| `pgvector_hnsw` (native, same corpus) | 43.7s | 409,042,944 | 4,090.4 |
+| `pgcuvs_hnsw_import` (mode='nsw'), **after** (packed, measured) | 1.7s | 409,608,192 | 4,096.1 |
+| `pgvector_hnsw` (native, same corpus) | 42.8s | 409,042,944 | 4,090.4 |
 
-**Exactly 2.00× smaller** (819,208,192 / 409,608,192), and now **within 0.14% of
-pgvector's own native index size** (4,096.1 vs 4,090.4 B/vector, ratio 1.0014 —
-the committed JSON is the source of record for this number). The residual gap's
-cause is not established: `check_hnsw_page_fit()`'s existing overhead accounting
-was checked and ruled out as the explanation (at dim=768/M=32 the exact and
-conservative accounting both floor to the identical `k=2` pairs/page, so it cannot
-be what's producing this gap) — the more likely source is a difference in
-pgvector's own page-filling strategy (its `hnswinsert.c` greedy-packs by
-`PageGetFreeSpace()`, not a fixed k), but that has not been confirmed. The
-"our export is ~2× larger than pgvector itself" finding that opened `#161` is
+**2.00× smaller** (819,208,192 / 409,608,192 = 1.99998 — not exactly 2× because
+of the one fixed metapage block), and now **within 0.14% of pgvector's own native
+index size** (4,096.1 vs 4,090.4 B/vector, ratio 1.0014 — the committed JSON is
+the source of record for this number). The residual gap: at dim=768/M=32, both
+the exact and `check_hnsw_page_fit()`'s conservative overhead accounting floor to
+the identical `pack_k=2` pairs/page (888×2=1,776 &lt; 8,160 &lt; 888×3), so that
+accounting is ruled out as the cause. The actual source is confirmed by direct
+arithmetic: `pack_k=2` fills 7,136 of 8,192 bytes/page and leaves the remaining
+1,056 bytes permanently unused (fixed k, not filled further) — 1 + 100,000/2 =
+50,001 blocks × 8,192 = 409,608,192, exactly the measured value. pgvector's own
+native build greedy-packs by `PageGetFreeSpace()` instead of a fixed k
+(`hnswbuild.c:192`, `WriteTuplesInOrder()` — this is the `CREATE INDEX` build
+path; `hnswinsert.c` is only the single-row `INSERT` path and not what built the
+reference index above), so it can use some of that slack pg_cuvs's fixed-k
+policy leaves on the table. The "our export is ~2× larger than pgvector itself"
+finding that opened `#161` is
 closed for the default/recommended mode regardless of this small residual.
 
 **Correctness, not just size**: this is a pure page-layout change — tuple format,
