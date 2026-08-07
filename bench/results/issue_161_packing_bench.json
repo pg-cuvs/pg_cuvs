@@ -1,0 +1,12 @@
+{
+  "n": 100000,
+  "dim": 768,
+  "build_s_cagra": 3.3,
+  "build_s_hnsw_packed": 1.68,
+  "build_s_pgvector_native": 42.84,
+  "index_bytes_old_computed": 819208192,
+  "index_bytes_packed_measured": 409608192,
+  "index_bytes_pgvector_native": 409042944,
+  "ratio_old_over_packed": 2.0,
+  "ratio_packed_over_pgvector_native": 1.0014
+}

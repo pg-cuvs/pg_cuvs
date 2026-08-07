@@ -196,37 +196,52 @@ neigh_tuple_size(int level, int m)
 }
 
 /*
- * Shared page-fit check, extracted from two structurally identical
- * post-parse blocks (#162). Errors if an element tuple at the worst-case
- * level plus its neighbor tuple cannot both fit on one page — this layout
- * assumes exactly one element per page (#161 established that packing
- * multiple elements per page is a separate, unimplemented lever), so a
- * failure here means the index cannot be built at all with this dim/type/M.
+ * How many element+neighbor pairs at (dim, bytes_per_dim, m, level) fit on
+ * one page (#161). 0 means not even one pair fits. Shared by
+ * check_hnsw_page_fit() (below) and the #161 packed-layout pass, which
+ * needs the same arithmetic to pick a fixed pairs-per-page count.
+ *
+ * A negative dim (no typmod, e.g. an unconstrained `vector` column or an
+ * expression index whose typmod didn't resolve) would make the size_t
+ * arithmetic below wrap around instead of erroring — silently claiming
+ * pairs fit that don't. Downstream code (pgvector's own "column does not
+ * have dimensions" check) still catches this, but not before this pre-check
+ * would have claimed the build is safe.
  */
-static void
-check_hnsw_page_fit(int dim, int bytes_per_dim, int m, int maxlevel)
+static int
+elems_per_page(int dim, int bytes_per_dim, int m, int level)
 {
-    /* A negative dim (no typmod, e.g. an unconstrained `vector` column or an
-     * expression index whose typmod didn't resolve) would make the size_t
-     * arithmetic below wrap around instead of erroring — silently passing a
-     * check that should have refused to guess. Downstream code (pgvector's
-     * own "column does not have dimensions" check) still catches this, but
-     * not before this pre-check claims the build is safe. */
     if (dim <= 0)
         ereport(ERROR,
                 (errmsg("pg_cuvs: target index column has no fixed dimension "
                         "(dim=%d) — cannot size-check the HNSW page layout",
                         dim)));
     size_t esize  = elem_tuple_size(dim, bytes_per_dim);
-    size_t nsize  = neigh_tuple_size(maxlevel, m);
+    size_t nsize  = neigh_tuple_size(level, m);
     size_t needed = esize + 2 * PGV_ITEM_OVERHEAD + nsize + 2 * PGV_ITEM_OVERHEAD;
-    if (needed > (size_t)PGV_USABLE_BYTES)
+    return (int)((size_t)PGV_USABLE_BYTES / needed);
+}
+
+/*
+ * Errors if not even one element+neighbor pair at the worst-case level
+ * fits on a page (#162/#161) — a failure here means the index cannot be
+ * built at all with this dim/type/M, regardless of packing.
+ */
+static void
+check_hnsw_page_fit(int dim, int bytes_per_dim, int m, int maxlevel)
+{
+    if (elems_per_page(dim, bytes_per_dim, m, maxlevel) < 1)
+    {
+        size_t esize  = elem_tuple_size(dim, bytes_per_dim);
+        size_t nsize  = neigh_tuple_size(maxlevel, m);
+        size_t needed = esize + 2 * PGV_ITEM_OVERHEAD + nsize + 2 * PGV_ITEM_OVERHEAD;
         ereport(ERROR,
                 (errmsg("pg_cuvs: element+neighbor tuple pair too large for "
                         "one page: needed=%zu, available=%d "
                         "(dim=%d, bytes_per_dim=%d, maxlevel=%d, M=%d)",
                         needed, PGV_USABLE_BYTES, dim, bytes_per_dim,
                         maxlevel, m)));
+    }
 }
 
 /*
@@ -516,27 +531,24 @@ hnsw_fill_res_free(HnswFillRes *r)
 }
 
 /* ----------------------------------------------------------------
- * Write a single page for element i (elem + neigh tuples).
- *
- * We write one page per element pair.  Both tuples must fit; the
- * layout pass guarantees this.
+ * Write one element+neighbor tuple pair onto an ALREADY-OPEN page (#161:
+ * extracted from write_elem_page() so a caller can pack multiple pairs
+ * onto one page — buffer lifecycle (ReadBuffer/PageInit/dirty/WAL/release)
+ * is the caller's responsibility, not this function's). e->elem_offno /
+ * e->neigh_offno (set by the layout pass) determine where on THIS page
+ * the tuples land; this function does not choose or validate offsets
+ * itself, it only asserts PageAddItem returns them.
  * ---------------------------------------------------------------- */
 static void
-write_elem_page(Relation rel,
-                uint32_t blkno,
+write_elem_pair(Page page,
                 ElemDesc *e,
                 const float *vec,
                 int dim,
                 int bytes_per_dim,
                 int m,
                 ElemDesc *all_elems,
-                size_t n_elems,
-                bool skip_wal)
+                size_t n_elems)
 {
-    Buffer              buf;
-    Page                page;
-    PgvHnswPageOpaque  *opaque;
-
     /* elem tuple */
     size_t esize = elem_tuple_size(dim, bytes_per_dim);
     size_t nsize = neigh_tuple_size(e->level, m);
@@ -552,7 +564,10 @@ write_elem_page(Relation rel,
     for (int t = 1; t < PGV_HNSW_MAX_HEAPTIDS; t++)
         set_invalid_item_ptr(&etup->heaptids[t]);
 
-    /* neighbortid points to the neighbor tuple on the same page, offno 2 */
+    /* neighbortid points to the neighbor tuple on the same page, at
+     * whatever offno the layout pass assigned (e->neigh_offno — always 2
+     * for one-pair-per-page, but a packed page's Nth pair lands at a
+     * higher offno; see the layout pass in fill_hnsw_from_cagra_ipc_impl). */
     set_item_ptr(&etup->neighbortid, e->neigh_blkno, e->neigh_offno);
     etup->unused = 0;
 
@@ -642,8 +657,67 @@ write_elem_page(Relation rel,
             set_invalid_item_ptr(&slots[slot]);
     }
 
-    /* Write the page — always extend with P_NEW; caller loops in blkno order
-     * so each call appends the next block in sequence. */
+    /* Add element tuple. InvalidOffsetNumber lets PG choose the next free
+     * slot on THIS page — for a single-pair page that is always offno 1,
+     * for a packed page it is whatever slot this pair falls into. Assert
+     * it matches what the layout pass already assigned to e->elem_offno
+     * (set_item_ptr()-encoded neighbor references elsewhere depend on that
+     * assignment being correct, not on what PageAddItem happens to return). */
+    OffsetNumber eoff = PageAddItem(page, (Item)etup, esize, InvalidOffsetNumber,
+                                    false, false);
+    if (eoff == InvalidOffsetNumber)
+        ereport(ERROR,
+                (errmsg("pg_cuvs: hnsw_export: element tuple does not fit on page "
+                        "(esize=%zu, free=%zu)", esize,
+                        (size_t)PageGetFreeSpace(page))));
+    if (eoff != (OffsetNumber) e->elem_offno)
+        ereport(ERROR,
+                (errmsg("pg_cuvs: hnsw_export: internal error — element landed at "
+                        "offno %u, layout pass assigned %u",
+                        eoff, e->elem_offno)));
+
+    /* Add neighbor tuple, same assertion. */
+    OffsetNumber noff = PageAddItem(page, (Item)ntup, nsize, InvalidOffsetNumber,
+                                    false, false);
+    if (noff == InvalidOffsetNumber)
+        ereport(ERROR,
+                (errmsg("pg_cuvs: hnsw_export: neighbor tuple does not fit on page "
+                        "(nsize=%zu, free=%zu)", nsize,
+                        (size_t)PageGetFreeSpace(page))));
+    if (noff != (OffsetNumber) e->neigh_offno)
+        ereport(ERROR,
+                (errmsg("pg_cuvs: hnsw_export: internal error — neighbor tuple "
+                        "landed at offno %u, layout pass assigned %u",
+                        noff, e->neigh_offno)));
+
+    pfree(etup);
+    pfree(ntup);
+}
+
+/* ----------------------------------------------------------------
+ * Write a single page holding exactly one element+neighbor pair — the
+ * layout used by every caller except #161's packed nsw write loop
+ * (write_elem_pages_packed() below). Thin wrapper: owns the buffer
+ * lifecycle, delegates the tuple construction to write_elem_pair().
+ * ---------------------------------------------------------------- */
+static void
+write_elem_page(Relation rel,
+                uint32_t blkno,
+                ElemDesc *e,
+                const float *vec,
+                int dim,
+                int bytes_per_dim,
+                int m,
+                ElemDesc *all_elems,
+                size_t n_elems,
+                bool skip_wal)
+{
+    Buffer              buf;
+    Page                page;
+    PgvHnswPageOpaque  *opaque;
+
+    /* always extend with P_NEW; caller loops in blkno order so each call
+     * appends the next block in sequence. */
     (void)blkno;        /* layout reference only */
     buf  = ReadBuffer(rel, P_NEW);
     LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
@@ -655,34 +729,67 @@ write_elem_page(Relation rel,
     opaque->unused    = 0;
     opaque->page_id   = PGV_HNSW_PAGE_ID;
 
-    /* Add element tuple at offno 1 */
-    OffsetNumber eoff = PageAddItem(page, (Item)etup, esize, InvalidOffsetNumber,
-                                    false, false);
-    if (eoff == InvalidOffsetNumber)
-        ereport(ERROR,
-                (errmsg("pg_cuvs: hnsw_export: element tuple does not fit on page "
-                        "(esize=%zu, free=%zu)", esize,
-                        (size_t)PageGetFreeSpace(page))));
-
-    /* Add neighbor tuple at offno 2 */
-    OffsetNumber noff = PageAddItem(page, (Item)ntup, nsize, InvalidOffsetNumber,
-                                    false, false);
-    if (noff == InvalidOffsetNumber)
-        ereport(ERROR,
-                (errmsg("pg_cuvs: hnsw_export: neighbor tuple does not fit on page "
-                        "(nsize=%zu, free=%zu)", nsize,
-                        (size_t)PageGetFreeSpace(page))));
-
-    (void)eoff;
-    (void)noff;
+    write_elem_pair(page, e, vec, dim, bytes_per_dim, m, all_elems, n_elems);
 
     MarkBufferDirty(buf);
     if (!skip_wal)
         log_newpage_buffer(buf, true); /* WAL full-page image for crash safety */
     UnlockReleaseBuffer(buf);
+}
 
-    pfree(etup);
-    pfree(ntup);
+/* #161: writes N element+neighbor pairs packed k-per-page (fixed k, not
+ * greedy — same k for every page, chosen once from (dim, bytes_per_dim, m,
+ * level) so index_bytes stays a pure function of the build parameters, not
+ * of runtime packing choices). elems[i].elem_blkno/elem_offno/neigh_blkno/
+ * neigh_offno must already encode this k (the layout pass's job, not this
+ * function's) — this function only opens/fills/closes each page in that
+ * pre-assigned order and asserts (via write_elem_pair()) that what it
+ * writes lands where the layout pass said it would.
+ *
+ * Only valid for a uniform-size element sequence, i.e. every elems[i] at
+ * the SAME level (today: the nsw path, where every element is level 0).
+ * A hierarchical sequence has per-element neighbor-tuple sizes that vary
+ * with level, which a single fixed k cannot pack losslessly — callers with
+ * varying levels must keep using write_elem_page() in a per-element loop. */
+static void
+write_elem_pages_packed(Relation rel,
+                        ElemDesc *elems,
+                        const float *vecs,
+                        int dim,
+                        int bytes_per_dim,
+                        int m,
+                        size_t n_elems,
+                        int k,
+                        bool skip_wal)
+{
+    for (size_t page_start = 0; page_start < n_elems; page_start += (size_t) k)
+    {
+        size_t page_end = page_start + (size_t) k;
+        if (page_end > n_elems)
+            page_end = n_elems;
+
+        Buffer buf  = ReadBuffer(rel, P_NEW);
+        LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
+        Page   page = BufferGetPage(buf);
+        PageInit(page, BLCKSZ, sizeof(PgvHnswPageOpaque));
+
+        PgvHnswPageOpaque *opaque = (PgvHnswPageOpaque *) PageGetSpecialPointer(page);
+        opaque->nextblkno = InvalidBlockNumber;
+        opaque->unused    = 0;
+        opaque->page_id   = PGV_HNSW_PAGE_ID;
+
+        for (size_t i = page_start; i < page_end; i++)
+        {
+            const float *vec = vecs + i * (size_t) dim;
+            write_elem_pair(page, &elems[i], vec, dim, bytes_per_dim, m,
+                            elems, n_elems);
+        }
+
+        MarkBufferDirty(buf);
+        if (!skip_wal)
+            log_newpage_buffer(buf, true);
+        UnlockReleaseBuffer(buf);
+    }
 }
 
 /* Wave 1 release-hardening (ADR-038 3K 잔여): pg_cuvs writes pgvector on-disk
@@ -1351,7 +1458,15 @@ fill_hnsw_from_hnswlib_impl(Oid cagra_oid, Oid hnsw_oid, bool use_shm,
      * hnsw_fill_res_free() closes the fd, which releases the inode. */
 }
 
-static void
+/* #161: returns the actual element count written, so ambuild() can report
+ * accurate index_tuples/heap_tuples without inferring it from the relation's
+ * block count — an inference that assumed exactly one element per page and
+ * breaks once packing (fill_hnsw_from_cagra_ipc()'s nsw path) makes that
+ * assumption false. res.n_elems is set by the _impl on the success path
+ * (before PG_FINALLY frees the pointer fields, which never touches this
+ * scalar) and is unreachable on the error path, where PG_TRY's longjmp
+ * skips the return entirely — no stale-value case to guard against. */
+static size_t
 fill_hnsw_from_hnswlib(Oid cagra_oid, Oid hnsw_oid, bool use_shm)
 {
     /*
@@ -1374,6 +1489,7 @@ fill_hnsw_from_hnswlib(Oid cagra_oid, Oid hnsw_oid, bool use_shm)
         hnsw_fill_res_free((HnswFillRes *) &res);
     }
     PG_END_TRY();
+    return res.n_elems;
 }
 
 /* ================================================================
@@ -1757,17 +1873,41 @@ fill_hnsw_from_cagra_ipc_impl(Oid cagra_oid, Oid hnsw_oid, const char *mode,
     res->tids = NULL;
 
     /* ---- 4. Layout pass ---- */
+    /* Verify elem+neigh fit on one page (worst-case: max_level, M neighbors)
+     * BEFORE computing pack_k below — pack_k divides the loop that follows,
+     * and elems_per_page() (which both this check and pack_k are built on)
+     * returns 0 when a pair doesn't fit at all. This call is what turns
+     * that 0 into a clean ERROR instead of a SIGFPE two lines down; it must
+     * run first, not after. (It used to run after the old one-element/page
+     * loop too, harmlessly, since that loop never divided by anything —
+     * this ordering only became load-bearing when the loop below started
+     * dividing by pack_k.) */
+    check_hnsw_page_fit((int)ipc_dim, bytes_per_dim, M, max_level);
+
+    /* #161: pack k elements/page on the nsw path (do_hierarchy=false), where
+     * every element is level 0 and neighbor-tuple size is therefore uniform
+     * — the one case a single fixed k packs losslessly (see
+     * write_elem_pages_packed()'s header comment). The hierarchical path
+     * keeps one element per page: per-element level varies there, so no
+     * single k fits every element without wasting space on the low-level
+     * majority — out of scope for #161 (mode='nsw' is the recommended
+     * default per #161's own lever-2b measurement; 'hnsw' is not). */
+    int pack_k = do_hierarchy ? 1 : elems_per_page((int)ipc_dim, bytes_per_dim, M, 0);
+    if (pack_k < 1)
+        ereport(ERROR,
+                (errmsg("pg_cuvs: internal error — pack_k=%d after "
+                        "check_hnsw_page_fit() passed (dim=%d, bytes_per_dim=%d, M=%d)",
+                        pack_k, (int)ipc_dim, bytes_per_dim, M)));
     for (size_t i = 0; i < N; i++)
     {
-        uint32_t blkno = (uint32_t)(i + 1);
+        size_t   page_idx = i / (size_t) pack_k;
+        size_t   slot      = i % (size_t) pack_k;
+        uint32_t blkno = (uint32_t)(page_idx + 1);   /* block 0 = meta */
         elems[i].elem_blkno  = blkno;
-        elems[i].elem_offno  = 1;
+        elems[i].elem_offno  = (uint16_t)(2 * slot + 1);
         elems[i].neigh_blkno = blkno;
-        elems[i].neigh_offno = 2;
+        elems[i].neigh_offno = (uint16_t)(2 * slot + 2);
     }
-
-    /* Verify elem+neigh fit on one page (worst-case: max_level, M neighbors). */
-    check_hnsw_page_fit((int)ipc_dim, bytes_per_dim, M, max_level);
 
     /* ---- 5. Open target HNSW with AccessExclusiveLock and truncate ---- */
     Relation hnsw_rel = index_open(hnsw_oid, AccessExclusiveLock);
@@ -1803,9 +1943,12 @@ fill_hnsw_from_cagra_ipc_impl(Oid cagra_oid, Oid hnsw_oid, const char *mode,
         metap->efConstruction = (uint16_t)(M0 * 2);  /* reasonable default */
         if (N > 0)
         {
-            /* entry_elem is the node with highest level (0 for flat NSW) */
+            /* entry_elem is the node with highest level (0 for flat NSW).
+             * #161: entryOffno used to be hard-coded 1, correct only while
+             * every element had the whole page to itself; under packing an
+             * entry element can land at any slot on its page. */
             metap->entryBlkno = elems[entry_elem].elem_blkno;
-            metap->entryOffno = 1;
+            metap->entryOffno = elems[entry_elem].elem_offno;
             metap->entryLevel = (int16_t)max_level;
         }
         else
@@ -1814,7 +1957,14 @@ fill_hnsw_from_cagra_ipc_impl(Oid cagra_oid, Oid hnsw_oid, const char *mode,
             metap->entryOffno = 0;
             metap->entryLevel = -1;
         }
-        metap->insertPage = (uint32_t)N;
+        /* #161: insertPage tells pgvector's own future single-row INSERT
+         * which page to try appending to. It used to be N (block N = the
+         * last element's own block, since block == i+1). Under packing the
+         * last element's actual block is elems[N-1].elem_blkno
+         * (= 1 + (N-1)/pack_k) — pointing INSERT at the true last page,
+         * not one past it, preserves the "append into free space" property
+         * pgvector's own writer already relies on (hnswinsert.c). */
+        metap->insertPage = (N > 0) ? elems[N - 1].elem_blkno : (uint32_t) N;
 
         ((PageHeader)page)->pd_lower =
             (uint16_t)(((char *)metap + sizeof(PgvHnswMeta)) - (char *)page);
@@ -1826,18 +1976,30 @@ fill_hnsw_from_cagra_ipc_impl(Oid cagra_oid, Oid hnsw_oid, const char *mode,
     }
 
     /* ---- 7. Write element+neighbor pages ---- */
-    for (size_t i = 0; i < N; i++)
+    /* #161: pack_k>1 only when !do_hierarchy (nsw); the packed writer with
+     * pack_k==1 would behave identically to the per-element loop below (one
+     * ReadBuffer(P_NEW) per element) but takes the dedicated path anyway to
+     * keep this branch a direct, obviously-correct mirror of the layout
+     * pass's pack_k choice above. */
+    if (pack_k > 1)
     {
-        /* Extract vector for this element */
-        const float *vec = vecs + i * (size_t)ipc_dim;
+        write_elem_pages_packed(hnsw_rel, elems, vecs, ipc_dim, bytes_per_dim,
+                                M, N, pack_k, hnsw_unlogged);
+    }
+    else
+    {
+        for (size_t i = 0; i < N; i++)
+        {
+            const float *vec = vecs + i * (size_t)ipc_dim;
 
-        write_elem_page(hnsw_rel,
-                        elems[i].elem_blkno,
-                        &elems[i],
-                        vec,
-                        ipc_dim, bytes_per_dim, M,
-                        elems, N,
-                        hnsw_unlogged);
+            write_elem_page(hnsw_rel,
+                            elems[i].elem_blkno,
+                            &elems[i],
+                            vec,
+                            ipc_dim, bytes_per_dim, M,
+                            elems, N,
+                            hnsw_unlogged);
+        }
     }
 
     /* vecs / elems are released by the PG_FINALLY in fill_hnsw_from_cagra_ipc(). */
@@ -1852,7 +2014,9 @@ fill_hnsw_from_cagra_ipc_impl(Oid cagra_oid, Oid hnsw_oid, const char *mode,
                     cagra_oid, hnsw_oid)));
 }
 
-static void
+/* #161: returns the actual element count — see the matching comment on
+ * fill_hnsw_from_hnswlib(). */
+static size_t
 fill_hnsw_from_cagra_ipc(Oid cagra_oid, Oid hnsw_oid, const char *mode)
 {
     /* #166 review 3: volatile across the longjmp — see fill_hnsw_from_hnswlib. */
@@ -1870,6 +2034,7 @@ fill_hnsw_from_cagra_ipc(Oid cagra_oid, Oid hnsw_oid, const char *mode)
         hnsw_fill_res_free((HnswFillRes *) &res);
     }
     PG_END_TRY();
+    return res.n_elems;
 }
 
 /* ================================================================
@@ -2326,17 +2491,22 @@ cuvs_hnsw_ambuild(Relation heapRel, Relation indexRel, IndexInfo *indexInfo)
      * object this backend already holds (the index under construction) is a
      * no-op re-grant, and the freshly created relation has 0 blocks so no
      * truncate happens. */
+    size_t n_elems_written;
     if (strcmp(mode, "nsw") == 0 || strcmp(mode, "hnsw") == 0)
-        fill_hnsw_from_cagra_ipc(cagra_oid, self_oid, mode);
+        n_elems_written = fill_hnsw_from_cagra_ipc(cagra_oid, self_oid, mode);
     else if (strcmp(mode, "hnswlib") == 0)
-        fill_hnsw_from_hnswlib(cagra_oid, self_oid, true);
+        n_elems_written = fill_hnsw_from_hnswlib(cagra_oid, self_oid, true);
     else  /* hnswlib_file */
-        fill_hnsw_from_hnswlib(cagra_oid, self_oid, false);
+        n_elems_written = fill_hnsw_from_hnswlib(cagra_oid, self_oid, false);
 
-    /* Element pages are one-per-vector after the metapage (block 0). */
+    /* #161: element count from fill_*'s own return, not inferred from block
+     * count. nblocks-1 == N only holds while every page carries exactly one
+     * element — true today, but a later commit packs multiple elements per
+     * page on the nsw path, at which point that inference goes silently
+     * wrong. Switching to the exact count now removes the assumption before
+     * it can be violated. */
     {
-        BlockNumber nblocks = RelationGetNumberOfBlocks(indexRel);
-        double ntuples = (nblocks > 0) ? (double) (nblocks - 1) : 0.0;
+        double ntuples = (double) n_elems_written;
         result->heap_tuples  = ntuples;
         result->index_tuples = ntuples;
     }
