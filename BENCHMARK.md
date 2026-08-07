@@ -703,7 +703,7 @@ reference.
 
 | | build time | index_bytes | B/vector |
 |---|---:|---:|---:|
-| `pgcuvs_hnsw_import` (mode='nsw'), **before** (computed, 1 pair/page) | — | 819,208,192 | 8,192.1 |
+| `pgcuvs_hnsw_import` (mode='nsw'), **before** (measured, see build-time note below) | 1.6s | 819,208,192 | 8,192.1 |
 | `pgcuvs_hnsw_import` (mode='nsw'), **after** (packed, measured) | 1.7s | 409,608,192 | 4,096.1 |
 | `pgvector_hnsw` (native, same corpus) | 42.8s | 409,042,944 | 4,090.4 |
 
@@ -724,6 +724,18 @@ reference index above), so it can use some of that slack pg_cuvs's fixed-k
 policy leaves on the table. The "our export is ~2× larger than pgvector itself"
 finding that opened `#161` is
 closed for the default/recommended mode regardless of this small residual.
+
+**Build time did not improve — checked directly, not assumed.** The commit that
+introduced packing speculated fewer `ReadBuffer(P_NEW)`/WAL calls would shave some
+build time as a side effect; that speculation does not hold up. A same-host A/B (one
+`massedcompute_L40S` instance, `pg-cuvs-161-buildtime`, built once from the commit
+immediately before `#161`'s merge and once from the merge itself, two repeats each)
+gives **before: 1.6s, 1.6s — after: 1.8s, 1.5s**. The "after" spread fully overlaps
+"before"'s stable value; whatever buffer-manager saving exists at N=100,000 is
+smaller than run-to-run noise, if it is there at all. Raw data:
+[`bench/results/issue_161_buildtime_ab.json`](bench/results/issue_161_buildtime_ab.json).
+**The packing change is a size win, not a build-time win** — do not cite it as the
+latter.
 
 **Correctness, not just size**: this is a pure page-layout change — tuple format,
 graph structure, and neighbor relationships are unchanged, so search results must be
