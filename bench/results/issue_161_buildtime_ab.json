@@ -1,0 +1,20 @@
+{
+  "host": "pg-cuvs-161-buildtime (massedcompute_L40S)",
+  "n": 100000,
+  "dim": 768,
+  "graph_degree": 64,
+  "before_commit": "c9be59c (pre-#161, one element+neighbor pair per page)",
+  "after_commit": "de74119 (#161 merged, packed mode='nsw')",
+  "runs": {
+    "before_hnsw_build_s": [1.6, 1.6],
+    "after_hnsw_build_s": [1.8, 1.5],
+    "before_cagra_build_s": [3.0, 2.9],
+    "after_cagra_build_s": [3.1, 2.88]
+  },
+  "index_bytes": {
+    "before": 819208192,
+    "after": 409608192,
+    "ratio": 2.0
+  },
+  "conclusion": "No measurable build-time difference -- after's spread (1.5-1.8s) fully overlaps before's stable 1.6s. The 2x index_bytes reduction is real and repeated; any build-time benefit from fewer ReadBuffer(P_NEW)/WAL calls is smaller than run-to-run noise at this N, if it exists at all."
+}
