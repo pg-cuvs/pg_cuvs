@@ -266,8 +266,9 @@ addressable slice, not buffer-manager round-trips or page-fill.
 **`UNLOGGED` is not just a smaller-slice mitigation — it is the largest lever already
 available, with zero code change.** [`design/ops-gpu-playbook.md` §3.0/3.1](design/ops-gpu-playbook.md)
 documents the build-time-then-`REINDEX` pattern: build the target index `UNLOGGED`,
-`REINDEX` to `LOGGED` in a maintenance window. Measured there (`pg_cuvs_import_cagra`,
-1M×1024): **~96s vs pgvector native 285s (3.0×)**, vs this doc's own LOGGED-vs-LOGGED
+`REINDEX` to `LOGGED` in a maintenance window. Measured there (`mode='nsw'` via
+`CREATE INDEX ... USING pg_cuvs_hnsw`, 1M×1024): **~96s vs pgvector native 285s
+(3.0×)**, vs this doc's own LOGGED-vs-LOGGED
 headline ratios in §2.1c. The two numbers are not interchangeable — §2.1c's ratios are a
 fair same-durability-tier comparison against pgvector's own LOGGED default; the
 UNLOGGED+REINDEX path trades a maintenance window for a faster wall-clock and is the
