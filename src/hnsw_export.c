@@ -196,37 +196,52 @@ neigh_tuple_size(int level, int m)
 }
 
 /*
- * Shared page-fit check, extracted from two structurally identical
- * post-parse blocks (#162). Errors if an element tuple at the worst-case
- * level plus its neighbor tuple cannot both fit on one page — this layout
- * assumes exactly one element per page (#161 established that packing
- * multiple elements per page is a separate, unimplemented lever), so a
- * failure here means the index cannot be built at all with this dim/type/M.
+ * How many element+neighbor pairs at (dim, bytes_per_dim, m, level) fit on
+ * one page (#161). 0 means not even one pair fits. Shared by
+ * check_hnsw_page_fit() (below) and the #161 packed-layout pass, which
+ * needs the same arithmetic to pick a fixed pairs-per-page count.
+ *
+ * A negative dim (no typmod, e.g. an unconstrained `vector` column or an
+ * expression index whose typmod didn't resolve) would make the size_t
+ * arithmetic below wrap around instead of erroring — silently claiming
+ * pairs fit that don't. Downstream code (pgvector's own "column does not
+ * have dimensions" check) still catches this, but not before this pre-check
+ * would have claimed the build is safe.
  */
-static void
-check_hnsw_page_fit(int dim, int bytes_per_dim, int m, int maxlevel)
+static int
+elems_per_page(int dim, int bytes_per_dim, int m, int level)
 {
-    /* A negative dim (no typmod, e.g. an unconstrained `vector` column or an
-     * expression index whose typmod didn't resolve) would make the size_t
-     * arithmetic below wrap around instead of erroring — silently passing a
-     * check that should have refused to guess. Downstream code (pgvector's
-     * own "column does not have dimensions" check) still catches this, but
-     * not before this pre-check claims the build is safe. */
     if (dim <= 0)
         ereport(ERROR,
                 (errmsg("pg_cuvs: target index column has no fixed dimension "
                         "(dim=%d) — cannot size-check the HNSW page layout",
                         dim)));
     size_t esize  = elem_tuple_size(dim, bytes_per_dim);
-    size_t nsize  = neigh_tuple_size(maxlevel, m);
+    size_t nsize  = neigh_tuple_size(level, m);
     size_t needed = esize + 2 * PGV_ITEM_OVERHEAD + nsize + 2 * PGV_ITEM_OVERHEAD;
-    if (needed > (size_t)PGV_USABLE_BYTES)
+    return (int)((size_t)PGV_USABLE_BYTES / needed);
+}
+
+/*
+ * Errors if not even one element+neighbor pair at the worst-case level
+ * fits on a page (#162/#161) — a failure here means the index cannot be
+ * built at all with this dim/type/M, regardless of packing.
+ */
+static void
+check_hnsw_page_fit(int dim, int bytes_per_dim, int m, int maxlevel)
+{
+    if (elems_per_page(dim, bytes_per_dim, m, maxlevel) < 1)
+    {
+        size_t esize  = elem_tuple_size(dim, bytes_per_dim);
+        size_t nsize  = neigh_tuple_size(maxlevel, m);
+        size_t needed = esize + 2 * PGV_ITEM_OVERHEAD + nsize + 2 * PGV_ITEM_OVERHEAD;
         ereport(ERROR,
                 (errmsg("pg_cuvs: element+neighbor tuple pair too large for "
                         "one page: needed=%zu, available=%d "
                         "(dim=%d, bytes_per_dim=%d, maxlevel=%d, M=%d)",
                         needed, PGV_USABLE_BYTES, dim, bytes_per_dim,
                         maxlevel, m)));
+    }
 }
 
 /*
