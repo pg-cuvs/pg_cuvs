@@ -615,6 +615,59 @@ from the 2026-08-05 comment on
 are not in this repository's results ledger and should be cited as issue-comment
 evidence, not as a committed artifact.
 
+### 2.1e halfvec (fp16) export — paired recall delta vs fp32 (#162, 2026-08-06)
+
+`#162` added a `halfvec` (fp16) target to `pg_cuvs_hnsw`'s export path: the GPU CAGRA
+build stays fp32 throughout (cuVS has no fp16 CAGRA path, ADR-054); only the final
+HNSW page-write narrow-casts each coordinate to fp16. This subsection measures what
+that narrow-cast costs, and separately, what it enables.
+
+Data: [`bench/results/issue_162_halfvec_recall.json`](bench/results/issue_162_halfvec_recall.json),
+driver [`bench/issue_162_halfvec_recall.py`](bench/issue_162_halfvec_recall.py). Host
+L40S (`pg-cuvs-167-sidecar`), extension 0.8.0. wiki_all 768d, first N=100,000 rows,
+1,000 queries, k=10. **Paired design**: one CAGRA source index per dim
+(`graph_degree=64`, `intermediate_graph_degree=128`, `build_algo=ivf_pq`), then BOTH
+the fp32 and halfvec HNSW indexes are exported from that SAME graph — so the only
+variable between the two arms is the fp16 cast, not graph quality or build variance.
+Search runs end-to-end through Postgres (`enable_cuvs=off`, `enable_seqscan=off`); the
+script aborts if the plan is a Seq Scan or does not name the expected index.
+
+| dim | ef_search | recall@10 fp32 | recall@10 halfvec | delta (fp32 − fp16) |
+|---:|---:|---:|---:|---:|
+| 1536 | 40  | 0.9875 | 0.9873 | +0.0002 |
+| 1536 | 100 | 0.9981 | 0.9979 | +0.0002 |
+| 3072 | 40  | *unbuildable* | 0.9872 | n/a |
+| 3072 | 100 | *unbuildable* | 0.9970 | n/a |
+
+The +0.0002 delta at dim=1536 was identical at both ef_search values.
+
+**At dim=3072 the fp32 arm does not exist — it is refused outright, not a scope
+reduction.** `check_hnsw_page_fit()` (`src/hnsw_export.c`) rejects the fp32 export
+before any GPU work: `needed=12776, available=8160 (dim=3072, bytes_per_dim=4,
+maxlevel=0, M=32)`. `mode='nsw'` (used throughout this measurement) always builds
+every element at level 0, so maxlevel=0 here is exact, not a bound — at these
+parameters (N=100K, M=32) the fp32 export ceiling is a deterministic dim≈1918 and
+the halfvec ceiling dim≈3836 (both scale with M and, for hierarchical modes, with
+maxlevel — this measurement's numbers hold specifically for `mode='nsw'`).
+**At dim=3072 the comparison is not "fp16 costs a little
+recall" — it is "fp16 or no index at all."** That is the stronger of the two results
+here and is the reason `#162` exists.
+
+> **Honesty caveat — read before citing these numbers.** The 1536d/3072d corpora are
+> **constructed**, not real embeddings: each 768d wiki_all vector is concatenated with
+> itself m times and divided by √m (m=2 → 1536d, m=4 → 3072d). That transform preserves
+> L2 norm and scales every pairwise distance by the same constant, so the exact top-K
+> neighbor ids are identical to the 768d subset's — which is why ground truth was
+> brute-forced once in 768d and reused for both dims (zero new API cost, zero new
+> ground-truth computation). It also means these vectors carry **no more discriminating
+> information than 768d ones do**: the absolute recall figures above are NOT a claim
+> about real 1536d/3072d embedding recall, and must not be cited as one. Only the
+> paired fp32−fp16 delta, and the dim=3072 buildability fact, are the measurement. Real
+> high-dimensional embeddings with a different coordinate-magnitude distribution could
+> show a larger fp16 penalty than the +0.0002 measured here — this measurement does not
+> bound that case. This differs from the synthetic-buildonly recall-multiple claims
+> §2.2/§2.3 warn against: it is a same-graph paired delta, not an absolute recall claim.
+
 ### 2.2 Synthetic crossover pilot — moved
 
 The synthetic crossover pilot (1K/100K/1M, clustered synthetic, latency crossover

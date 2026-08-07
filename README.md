@@ -194,7 +194,7 @@ build history (now frozen) is in [design/specs/phase-record.md](design/specs/pha
 | Component | Tested version | Minimum |
 |-----------|---------------|---------|
 | PostgreSQL | 16.3 | 16 |
-| pgvector | 0.8.x | 0.5.0 |
+| pgvector | 0.8.x | 0.7.0 |
 | NVIDIA CUDA | 12.4 | 12.0 |
 | cuVS / RAPIDS | 26.04 | 24.12 |
 | NVIDIA driver | 550.x | 525 |
@@ -226,7 +226,12 @@ format or opclass procs would require a matching update to `src/hnsw_export.c` a
 - PostgreSQL 16
 - NVIDIA GPU with CUDA 12+ (A100, L4, H100, or similar; MIG supported)
 - RAPIDS cuVS 26.04+ (`libcuvs`) — installed via Conda/Mamba
-- pgvector 0.5.0+
+- pgvector 0.7.0+ (0.8.0's `sql/pg_cuvs--0.8.0.sql` unconditionally installs the
+  `halfvec_*_ops` opclasses, which require pgvector's `halfvec` type — added in
+  0.7.0 — so `CREATE EXTENSION`/`ALTER EXTENSION ... UPDATE` fails outright on
+  older pgvector even for callers who only ever target `vector`. The fp32-only
+  HNSW page format itself is compatible back to 0.5.0, but that no longer
+  matters once install-time SQL requires 0.7.0's type)
 - GCC 11.4+, CMake 3.26+
 
 ## Install

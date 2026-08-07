@@ -1,0 +1,62 @@
+[
+  {
+    "dim": 1536,
+    "n": 100000,
+    "nq": 1000,
+    "k": 10,
+    "ef_search": 40,
+    "build_s_cagra": 6.35,
+    "build_s_hnsw_fp32": 3.76,
+    "build_s_hnsw_halfvec": 3.9,
+    "fp32_build_error": null,
+    "recall_f32": 0.9875,
+    "qps_f32": 197.2,
+    "recall_halfvec": 0.9873,
+    "qps_halfvec": 200.1,
+    "delta": 0.000200000000000089
+  },
+  {
+    "dim": 1536,
+    "n": 100000,
+    "nq": 1000,
+    "k": 10,
+    "ef_search": 100,
+    "build_s_cagra": 6.35,
+    "build_s_hnsw_fp32": 3.76,
+    "build_s_hnsw_halfvec": 3.9,
+    "fp32_build_error": null,
+    "recall_f32": 0.9981,
+    "qps_f32": 109.3,
+    "recall_halfvec": 0.9979,
+    "qps_halfvec": 113.6,
+    "delta": 0.00019999999999997797
+  },
+  {
+    "dim": 3072,
+    "n": 100000,
+    "nq": 1000,
+    "k": 10,
+    "ef_search": 40,
+    "build_s_cagra": 11.26,
+    "build_s_hnsw_fp32": null,
+    "build_s_hnsw_halfvec": 4.97,
+    "fp32_build_error": "pg_cuvs: element+neighbor tuple pair too large for one page: needed=12776, available=8160 (dim=3072, bytes_per_dim=4, maxlevel=0, M=32)",
+    "recall_halfvec": 0.9872,
+    "qps_halfvec": 153.7,
+    "delta": null
+  },
+  {
+    "dim": 3072,
+    "n": 100000,
+    "nq": 1000,
+    "k": 10,
+    "ef_search": 100,
+    "build_s_cagra": 11.26,
+    "build_s_hnsw_fp32": null,
+    "build_s_hnsw_halfvec": 4.97,
+    "fp32_build_error": "pg_cuvs: element+neighbor tuple pair too large for one page: needed=12776, available=8160 (dim=3072, bytes_per_dim=4, maxlevel=0, M=32)",
+    "recall_halfvec": 0.997,
+    "qps_halfvec": 96.5,
+    "delta": null
+  }
+]

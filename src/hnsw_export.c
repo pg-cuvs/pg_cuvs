@@ -61,6 +61,7 @@
 #include "utils/fmgroids.h"      /* F_OIDEQ */
 #include "utils/acl.h"
 #include "utils/lsyscache.h"     /* get_rel_name */
+#include "catalog/pg_type.h"     /* Form_pg_type (#162: vector/halfvec type detection) */
 
 #include <math.h>
 #include <stdio.h>
@@ -75,6 +76,10 @@
 
 /* GUC declared in pg_cuvs.c — socket path for daemon IPC */
 extern char *cuvs_socket_path;
+
+/* #162: read-only accessor into pg_cuvs.c's local CuvsCagraOptions —
+ * used by the pre-GPU dim-ceiling check below. */
+extern int cuvs_cagra_reloption_graph_degree(Relation cagra_rel);
 
 /* ----------------------------------------------------------------
  * pgvector HNSW on-disk constants (must match pgvector source)
@@ -166,14 +171,15 @@ typedef struct {
 #define PGV_VEC_HEADER_SIZE     8
 
 /*
- * Size of an element tuple for a vector of `dim` floats.
- * = MAXALIGN(sizeof(PgvHnswElemHdr) + PGV_VEC_HEADER_SIZE + dim*4)
+ * Size of an element tuple for a vector of `dim` elements, each
+ * `bytes_per_dim` wide (4 for pgvector `vector`/fp32, 2 for `halfvec`/fp16).
+ * = MAXALIGN(sizeof(PgvHnswElemHdr) + PGV_VEC_HEADER_SIZE + dim*bytes_per_dim)
  */
 static size_t
-elem_tuple_size(int dim)
+elem_tuple_size(int dim, int bytes_per_dim)
 {
     return MAXALIGN8(sizeof(PgvHnswElemHdr) + PGV_VEC_HEADER_SIZE
-                     + (size_t)dim * sizeof(float));
+                     + (size_t)dim * (size_t)bytes_per_dim);
 }
 
 /*
@@ -187,6 +193,141 @@ neigh_tuple_size(int level, int m)
     int count = (level + 2) * m;
     return MAXALIGN8(sizeof(PgvHnswNeighHdr)
                      + (size_t)count * sizeof(PgvItemPointer));
+}
+
+/*
+ * Shared page-fit check, extracted from two structurally identical
+ * post-parse blocks (#162). Errors if an element tuple at the worst-case
+ * level plus its neighbor tuple cannot both fit on one page — this layout
+ * assumes exactly one element per page (#161 established that packing
+ * multiple elements per page is a separate, unimplemented lever), so a
+ * failure here means the index cannot be built at all with this dim/type/M.
+ */
+static void
+check_hnsw_page_fit(int dim, int bytes_per_dim, int m, int maxlevel)
+{
+    /* A negative dim (no typmod, e.g. an unconstrained `vector` column or an
+     * expression index whose typmod didn't resolve) would make the size_t
+     * arithmetic below wrap around instead of erroring — silently passing a
+     * check that should have refused to guess. Downstream code (pgvector's
+     * own "column does not have dimensions" check) still catches this, but
+     * not before this pre-check claims the build is safe. */
+    if (dim <= 0)
+        ereport(ERROR,
+                (errmsg("pg_cuvs: target index column has no fixed dimension "
+                        "(dim=%d) — cannot size-check the HNSW page layout",
+                        dim)));
+    size_t esize  = elem_tuple_size(dim, bytes_per_dim);
+    size_t nsize  = neigh_tuple_size(maxlevel, m);
+    size_t needed = esize + 2 * PGV_ITEM_OVERHEAD + nsize + 2 * PGV_ITEM_OVERHEAD;
+    if (needed > (size_t)PGV_USABLE_BYTES)
+        ereport(ERROR,
+                (errmsg("pg_cuvs: element+neighbor tuple pair too large for "
+                        "one page: needed=%zu, available=%d "
+                        "(dim=%d, bytes_per_dim=%d, maxlevel=%d, M=%d)",
+                        needed, PGV_USABLE_BYTES, dim, bytes_per_dim,
+                        maxlevel, m)));
+}
+
+/*
+ * IEEE-754 round-to-nearest-even float32 -> float16 (#162). Matches
+ * pgvector halfvec's `half` representation: 1 sign + 5 exponent + 10
+ * mantissa bits. Hand-rolled because this is plain-C PGXS backend code (no
+ * CUDA __float2half available here — that intrinsic backs the *other* fp16
+ * feature in this codebase, cuvs_wrapper.cu's brute-force precision='float16',
+ * which is a .cu translation unit; this file is deliberately not one, see
+ * ADR-001) and pgvector's own internal conversion routine is not an exported
+ * stable C ABI this file may depend on (file header: "We do NOT include
+ * pgvector's hnsw.h... All structs are defined locally").
+ *
+ * Verified bit-exact against a live pgvector 0.8.6 install's own
+ * `vector::halfvec` cast across 335 finite in-range values, including an
+ * exact round-to-even tie (-1.5229491687270953 -> both this function and
+ * pgvector agree on 0xbe18, not the nearer-looking-but-wrong 0xbe17 a naive
+ * reference — numpy's float32->float16 cast — produces for that same tie).
+ */
+static uint16_t
+float_to_half(float f)
+{
+    uint32_t x;
+    memcpy(&x, &f, 4);
+    uint32_t sign = (x >> 16) & 0x8000u;
+    int32_t  exp  = (int32_t)((x >> 23) & 0xFF) - 127 + 15;
+    uint32_t mant = x & 0x7FFFFFu;
+
+    if (((x >> 23) & 0xFF) == 0xFF)              /* Inf/NaN */
+        return (uint16_t)(sign | 0x7C00u | (mant ? 0x0200u : 0));
+    if (exp >= 0x1F)                              /* overflow -> Inf */
+        return (uint16_t)(sign | 0x7C00u);
+    if (exp <= 0)                                 /* underflow -> subnormal/zero */
+    {
+        if (exp < -10) return (uint16_t)sign;     /* too small, flush to zero */
+        mant |= 0x800000u;                        /* implicit leading 1 */
+        uint32_t shift = (uint32_t)(14 - exp);
+        uint32_t half_mant = mant >> shift;
+        /* round to nearest even */
+        if ((mant >> (shift - 1)) & 1)
+            if (((mant & ((1u << (shift - 1)) - 1)) != 0) || (half_mant & 1))
+                half_mant++;
+        return (uint16_t)(sign | half_mant);
+    }
+    /* normal range: round mantissa from 23 to 10 bits, RNE */
+    uint32_t half_mant = mant >> 13;
+    if (mant & 0x1000u)
+        if ((mant & 0xFFFu) || (half_mant & 1))
+            half_mant++;
+    if (half_mant & 0x400u)
+    {
+        half_mant = 0;
+        exp++;
+        if (exp >= 0x1F) return (uint16_t)(sign | 0x7C00u);
+    }
+    return (uint16_t)(sign | ((uint32_t)exp << 10) | half_mant);
+}
+
+/*
+ * Resolve a target column's element width in bytes from its actual PG type
+ * OID (#162): 4 for vector (fp32), 2 for halfvec (fp16). ERRORs on anything
+ * else — this file only ever writes pgvector-compatible vector/halfvec page
+ * bytes, so a third type reaching here is a caller bug, not a runtime
+ * condition to degrade gracefully from.
+ *
+ * Looks up the type NAME from the OID via a direct syscache hit, rather
+ * than resolving vector/halfvec's OID from their names via
+ * TypenameGetTypid() (an earlier version of this function did that, cached
+ * process-lifetime). TypenameGetTypid() resolves an UNQUALIFIED name
+ * through the CALLER'S search_path (namespace.c) — under a restricted
+ * search_path (SECURITY DEFINER, a schema-qualified extension install,
+ * `SET search_path = ''`) it can return InvalidOid even though pgvector's
+ * vector/halfvec types are perfectly well-defined by the OID this function
+ * was actually given, turning an ordinary fp32 build into a spurious ERROR.
+ * An OID->name lookup has no such dependency.
+ */
+static int
+bytes_per_dim_for_typid(Oid typid)
+{
+    HeapTuple   tup = SearchSysCache1(TYPEOID, ObjectIdGetDatum(typid));
+    const char *name;
+
+    if (!HeapTupleIsValid(tup))
+        ereport(ERROR,
+                (errmsg("pg_cuvs: target index column type (typoid=%u) not found",
+                        typid)));
+    name = NameStr(((Form_pg_type) GETSTRUCT(tup))->typname);
+    if (strcmp(name, "halfvec") == 0)
+    {
+        ReleaseSysCache(tup);
+        return 2;
+    }
+    if (strcmp(name, "vector") == 0)
+    {
+        ReleaseSysCache(tup);
+        return 4;
+    }
+    ereport(ERROR,
+            (errmsg("pg_cuvs: target index column type (typoid=%u, typname=\"%s\") "
+                    "is neither vector nor halfvec", typid, name)));
+    return 4; /* unreached */
 }
 
 /* ----------------------------------------------------------------
@@ -386,6 +527,7 @@ write_elem_page(Relation rel,
                 ElemDesc *e,
                 const float *vec,
                 int dim,
+                int bytes_per_dim,
                 int m,
                 ElemDesc *all_elems,
                 size_t n_elems,
@@ -396,7 +538,7 @@ write_elem_page(Relation rel,
     PgvHnswPageOpaque  *opaque;
 
     /* elem tuple */
-    size_t esize = elem_tuple_size(dim);
+    size_t esize = elem_tuple_size(dim, bytes_per_dim);
     size_t nsize = neigh_tuple_size(e->level, m);
 
     PgvHnswElemHdr *etup = (PgvHnswElemHdr *) palloc0(esize);
@@ -415,16 +557,29 @@ write_elem_page(Relation rel,
     etup->unused = 0;
 
     /* write the vector varlena immediately after the element header.
-     * pgvector uses SET_VARSIZE (standard 4-byte varlena): vl_len_ = size << 2. */
+     * pgvector uses SET_VARSIZE (standard 4-byte varlena): vl_len_ = size << 2.
+     * `vec` is always the fp32 buffer read from the .hnsw sidecar / IPC
+     * adjacency (#162: GPU CAGRA build stays fp32 throughout — cuVS has no
+     * fp16 CAGRA path, ADR-054). The narrow-cast to halfvec happens ONLY
+     * here, at the final page-write boundary, never upstream. */
     char *vdata = (char *)etup + sizeof(PgvHnswElemHdr);
-    int32_t vl_len = (int32_t)(PGV_VEC_HEADER_SIZE + (size_t)dim * sizeof(float));
+    int32_t vl_len = (int32_t)(PGV_VEC_HEADER_SIZE + (size_t)dim * (size_t)bytes_per_dim);
     int32_t vl_len_field = vl_len << 2;
     memcpy(vdata, &vl_len_field, 4);
     int16_t vdim   = (int16_t)dim;
     int16_t vunused = 0;
     memcpy(vdata + 4, &vdim,    2);
     memcpy(vdata + 6, &vunused, 2);
-    memcpy(vdata + 8, vec, (size_t)dim * sizeof(float));
+    if (bytes_per_dim == 4)
+    {
+        memcpy(vdata + 8, vec, (size_t)dim * sizeof(float));
+    }
+    else /* bytes_per_dim == 2: halfvec */
+    {
+        uint16_t *hbuf = (uint16_t *) (vdata + 8);
+        for (int i = 0; i < dim; i++)
+            hbuf[i] = float_to_half(vec[i]);
+    }
 
     /* neighbor tuple */
     int count = (e->level + 2) * m;
@@ -626,6 +781,7 @@ fill_hnsw_from_hnswlib_impl(Oid cagra_oid, Oid hnsw_oid, bool use_shm,
     /* ---- 1b. Validate target index before opening it ---- */
     /* Look up via syscache to avoid opening a non-HNSW index first. */
     bool hnsw_unlogged = false;  /* set below; true = skip WAL on page writes */
+    int  bytes_per_dim = 4;      /* #162: set from the target's actual type below */
     {
         HeapTuple tup = SearchSysCache1(RELOID, ObjectIdGetDatum(hnsw_oid));
         if (!HeapTupleIsValid(tup))
@@ -674,6 +830,9 @@ fill_hnsw_from_hnswlib_impl(Oid cagra_oid, Oid hnsw_oid, bool use_shm,
                 {
                     Form_pg_attribute att = (Form_pg_attribute) GETSTRUCT(attup);
                     tgt_dim = (int)att->atttypmod;
+                    /* #162: must read atttypid before ReleaseSysCache — the
+                     * tuple (and att, which points into it) is invalid after. */
+                    bytes_per_dim = bytes_per_dim_for_typid(att->atttypid);
                     ReleaseSysCache(attup);
                 }
             }
@@ -1034,18 +1193,7 @@ fill_hnsw_from_hnswlib_impl(Oid cagra_oid, Oid hnsw_oid, bool use_shm,
 
     /* Verify that elem+neigh fit on one page for the worst-case element level.
      * We check against the largest possible level. */
-    {
-        int max_level_seen = hdr.maxlevel;
-        size_t esize = elem_tuple_size(dim);
-        size_t nsize = neigh_tuple_size(max_level_seen, M);
-        size_t needed = esize + 2 * PGV_ITEM_OVERHEAD + nsize + 2 * PGV_ITEM_OVERHEAD;
-        if (needed > (size_t)PGV_USABLE_BYTES)
-            ereport(ERROR,
-                    (errmsg("pg_cuvs: element+neighbor tuple pair too large for "
-                            "one page: needed=%zu, available=%d "
-                            "(dim=%d, maxlevel=%d, M=%d)",
-                            needed, PGV_USABLE_BYTES, dim, max_level_seen, M)));
-    }
+    check_hnsw_page_fit(dim, bytes_per_dim, M, hdr.maxlevel);
 
     /* ---- 9. Re-open .hnsw to read vectors sequentially ---- */
     hf = hnsw_open_stream(hnsw_path, res->shm_fd);
@@ -1183,7 +1331,7 @@ fill_hnsw_from_hnswlib_impl(Oid cagra_oid, Oid hnsw_oid, bool use_shm,
                         elems[i].elem_blkno,
                         &elems[i],
                         vec_buf,
-                        dim, M,
+                        dim, bytes_per_dim, M,
                         elems, N,
                         hnsw_unlogged);
     }
@@ -1355,6 +1503,7 @@ fill_hnsw_from_cagra_ipc_impl(Oid cagra_oid, Oid hnsw_oid, const char *mode,
     /* ---- 1b. Validate target index (AM, dim, metric) ---- */
     bool hnsw_unlogged = false;
     uint32_t tgt_metric = CUVS_METRIC_L2;
+    int  bytes_per_dim = 4;  /* #162: set from the target's actual type below */
     {
         HeapTuple tup = SearchSysCache1(RELOID, ObjectIdGetDatum(hnsw_oid));
         if (!HeapTupleIsValid(tup))
@@ -1385,7 +1534,11 @@ fill_hnsw_from_cagra_ipc_impl(Oid cagra_oid, Oid hnsw_oid, const char *mode,
                                                Int16GetDatum(1));
             if (HeapTupleIsValid(attup))
             {
-                tgt_dim = (int)((Form_pg_attribute)GETSTRUCT(attup))->atttypmod;
+                Form_pg_attribute att = (Form_pg_attribute) GETSTRUCT(attup);
+                tgt_dim = (int)att->atttypmod;
+                /* #162: read atttypid before ReleaseSysCache — att points
+                 * into the tuple, invalid after release. */
+                bytes_per_dim = bytes_per_dim_for_typid(att->atttypid);
                 ReleaseSysCache(attup);
             }
             if (tgt_dim > 0 && tgt_dim != dim)
@@ -1614,18 +1767,7 @@ fill_hnsw_from_cagra_ipc_impl(Oid cagra_oid, Oid hnsw_oid, const char *mode,
     }
 
     /* Verify elem+neigh fit on one page (worst-case: max_level, M neighbors). */
-    {
-        size_t esize  = elem_tuple_size((int)ipc_dim);
-        size_t nsize  = neigh_tuple_size(max_level, M);
-        size_t needed = esize + 2 * PGV_ITEM_OVERHEAD + nsize + 2 * PGV_ITEM_OVERHEAD;
-        if (needed > (size_t)PGV_USABLE_BYTES)
-        {
-            ereport(ERROR,
-                    (errmsg("pg_cuvs: element+neighbor too large for one page "
-                            "(dim=%d M=%d max_level=%d needed=%zu avail=%d)",
-                            ipc_dim, M, max_level, needed, PGV_USABLE_BYTES)));
-        }
-    }
+    check_hnsw_page_fit((int)ipc_dim, bytes_per_dim, M, max_level);
 
     /* ---- 5. Open target HNSW with AccessExclusiveLock and truncate ---- */
     Relation hnsw_rel = index_open(hnsw_oid, AccessExclusiveLock);
@@ -1693,7 +1835,7 @@ fill_hnsw_from_cagra_ipc_impl(Oid cagra_oid, Oid hnsw_oid, const char *mode,
                         elems[i].elem_blkno,
                         &elems[i],
                         vec,
-                        ipc_dim, M,
+                        ipc_dim, bytes_per_dim, M,
                         elems, N,
                         hnsw_unlogged);
     }
@@ -1885,6 +2027,38 @@ pg_cuvs_build_hnsw(PG_FUNCTION_ARGS)
              errhint("The DDL form integrates with pg_indexes, DROP INDEX, "
                      "REINDEX, and pg_dump.")));
 
+    /* #162: dim-ceiling pre-check, before any GPU work. This deprecated
+     * function form only ever creates a vector (fp32) target — see
+     * find_hnsw_opclass_oid()/create_empty_hnsw() below, which hardcode
+     * vector_*_ops opclasses — so bytes_per_dim is always 4 here; a halfvec
+     * target requires the CREATE INDEX ... USING pg_cuvs_hnsw DDL form
+     * instead (cuvs_hnsw_ambuild(), which carries its own pre-check).
+     *
+     * Validate cagra_oid IS a cagra index before reading its reloptions as
+     * CuvsCagraOptions: this runs before create_empty_hnsw()'s own AM check
+     * further down, and cuvs_cagra_reloption_graph_degree() blindly casts
+     * rd_options to CuvsCagraOptions, so a non-cagra argument here would
+     * read that AM's option struct at CuvsCagraOptions's field offsets
+     * instead of failing with a clear "not a cagra index" error. */
+    {
+        Relation cagra_rel_pc = index_open(cagra_oid, AccessShareLock);
+        if (cagra_rel_pc->rd_rel->relam != get_am_oid("cagra", false))
+        {
+            index_close(cagra_rel_pc, AccessShareLock);
+            ereport(ERROR,
+                    (errmsg("pg_cuvs_build_hnsw: \"%s\" is not a cagra index",
+                            get_rel_name(cagra_oid))));
+        }
+        int precheck_dim = (int) TupleDescAttr(RelationGetDescr(cagra_rel_pc), 0)->atttypmod;
+        int graph_degree  = cuvs_cagra_reloption_graph_degree(cagra_rel_pc);
+        index_close(cagra_rel_pc, AccessShareLock);
+        int m0 = (graph_degree < 64) ? graph_degree : 64;
+        /* mode='nsw' always builds level 0 only (see cuvs_hnsw_ambuild()'s
+         * matching comment) -- the exact bound, not a guess, there. */
+        int precheck_maxlevel = (strcmp(mode, "nsw") == 0) ? 0 : 5;
+        check_hnsw_page_fit(precheck_dim, 4, m0 / 2, precheck_maxlevel);
+    }
+
     /* Create empty HNSW on parent table — INDEX_CREATE_SKIP_BUILD, no CPU build */
     Oid hnsw_oid = create_empty_hnsw(cagra_oid);
 
@@ -2015,11 +2189,38 @@ cuvs_hnsw_ambuild(Relation heapRel, Relation indexRel, IndexInfo *indexInfo)
     Oid self_oid = RelationGetRelid(indexRel);
     IndexBuildResult *result = palloc0(sizeof(IndexBuildResult));
 
+    /* #162: dim-ceiling pre-check, before any GPU work. The real ceiling is
+     * maxlevel-dependent (narrower at higher levels); safe_maxlevel=5 is a
+     * fixed conservative bound chosen to always reject before paying for a
+     * CAGRA build or IPC round-trip, per the issue's "다소 보수적으로
+     * 거부하더라도 항상 GPU 작업 전에" policy. check_hnsw_page_fit() below
+     * (after the real M/maxlevel are known) remains as a backstop for the
+     * rare case where this pre-check's M assumption undershoots the actual
+     * build.
+     *
+     * mode='nsw' is the one case where maxlevel is not a guess: do_hierarchy
+     * in fill_hnsw_from_cagra_ipc_impl() is only true for mode='hnsw', so
+     * 'nsw' always builds every element at level 0 (elems[i].level stays
+     * calloc'd 0, max_level=0). Using the conservative 5 there anyway
+     * rejects fp32 builds in the dim≈1679–1918 band that built fine before
+     * this pre-check existed — a real regression on the default mode, not a
+     * conservative-but-safe over-reject. Every other mode ('hnsw',
+     * 'hnswlib', 'hnswlib_file') genuinely can reach a nonzero level, so
+     * they keep the conservative bound. */
+    Form_pg_attribute precheck_att = TupleDescAttr(RelationGetDescr(indexRel), 0);
+    int precheck_dim           = (int) precheck_att->atttypmod;
+    int precheck_bytes_per_dim = bytes_per_dim_for_typid(precheck_att->atttypid);
+    const int safe_maxlevel = (strcmp(mode, "nsw") == 0) ? 0 : 5;
+
     /* ── Source-less: ephemeral CAGRA built from the heap, then dropped. ── */
     if (source_name[0] == '\0')
     {
         int64_t n_vecs    = 0;
         double  reltuples = 0.0;
+
+        /* No user reloptions on an ephemeral build (cuVS defaults: 3R
+         * comment below) -> graph_degree=64, M=32. */
+        check_hnsw_page_fit(precheck_dim, precheck_bytes_per_dim, 32, safe_maxlevel);
 
         /* Build an ephemeral CAGRA under THIS index's OID. shard_count=1
          * (a sharded CAGRA cannot export its adjacency); no .hnsw sidecar. */
@@ -2085,6 +2286,17 @@ cuvs_hnsw_ambuild(Relation heapRel, Relation indexRel, IndexInfo *indexInfo)
                     (errmsg("pg_cuvs_hnsw: source \"%s\" must be a cagra index",
                             source_name),
                      errhint("Build it first: CREATE INDEX ... USING cagra (col opclass).")));
+
+        /* #162: dim-ceiling pre-check using the source CAGRA's own
+         * graph_degree reloption, before paying the IPC round-trip. */
+        {
+            Relation cagra_rel_gd = index_open(cagra_oid, AccessShareLock);
+            int graph_degree = cuvs_cagra_reloption_graph_degree(cagra_rel_gd);
+            index_close(cagra_rel_gd, AccessShareLock);
+            int m0 = (graph_degree < 64) ? graph_degree : 64;
+            check_hnsw_page_fit(precheck_dim, precheck_bytes_per_dim,
+                                 m0 / 2, safe_maxlevel);
+        }
 
         /* Fail fast: the source CAGRA's metric must match this index's opclass
          * BEFORE paying an IPC round-trip. cagra_index_metric() is opclass-name

@@ -143,5 +143,45 @@ FROM pg_class c JOIN pg_am a ON a.oid = c.relam
 WHERE c.relname = 'ph_hnsw_cos';
 DROP INDEX ph_hnsw_cos;
 
+-- ── #162: halfvec target via the pg_cuvs_hnsw AM path ────────────
+-- Expression index on an ::halfvec(4) cast, using halfvec_l2_ops. This is
+-- the primary new surface from #162 (build_hnsw_halfvec.sql covers the same
+-- AM path at larger dims/vector counts). The deprecated pg_cuvs_build_hnsw()
+-- function form has no halfvec coverage — it only ever creates a vector
+-- (fp32) target (find_hnsw_opclass_oid()/create_empty_hnsw() hardcode
+-- vector_*_ops), so there is nothing halfvec-shaped to test there.
+SET client_min_messages = 'warning';
+CREATE INDEX ph_hnsw_hv ON ph_test USING pg_cuvs_hnsw
+    ((embedding::halfvec(4)) halfvec_l2_ops)
+    WITH (source = 'ph_cagra');
+SET client_min_messages = 'notice';
+
+SELECT i.indexname, a.amname
+FROM pg_indexes i
+JOIN pg_class c ON c.relname = i.indexname
+JOIN pg_am a ON a.oid = c.relam
+WHERE i.tablename = 'ph_test' AND i.indexname = 'ph_hnsw_hv';
+
+-- Served by pgvector HNSW path with GPU off. Top-1 must still be id=20.
+SET enable_cuvs = off; SET enable_seqscan = off;
+SELECT id FROM ph_test
+ORDER BY embedding::halfvec(4) <-> '[1,0.5,0,0]'::halfvec(4) LIMIT 1;
+RESET enable_cuvs; RESET enable_seqscan;
+
+-- REINDEX on a halfvec EXPRESSION index specifically: ambuild() re-reads
+-- attnum=1's atttypid from the index relation's own catalog entry (which
+-- for an expression index is the expression's RESULT type, halfvec, fixed
+-- at CREATE INDEX time and unchanged by REINDEX) -- untested before this
+-- case, unlike the vector-target REINDEX coverage above.
+SET client_min_messages = 'warning';
+REINDEX INDEX ph_hnsw_hv;
+SET client_min_messages = 'notice';
+SET enable_cuvs = off; SET enable_seqscan = off;
+SELECT id FROM ph_test
+ORDER BY embedding::halfvec(4) <-> '[1,0.5,0,0]'::halfvec(4) LIMIT 1;
+RESET enable_cuvs; RESET enable_seqscan;
+
+DROP INDEX ph_hnsw_hv;
+
 -- Cleanup.
 DROP TABLE ph_test CASCADE;
