@@ -175,11 +175,17 @@ sudo systemctl start pg-cuvs-server
 
 ## 3. GPU Build Accelerator (3I/3J) 운영
 
-### 3.0 import 함수 선택 가이드
+### 3.0 mode 선택 가이드
 
-두 함수는 동등한 옵션입니다. 트레이드오프를 보고 선택합니다.
+> **#181 갱신**: 이 절이 예전에 이름 붙이던 `pg_cuvs_import_cagra`/`pg_cuvs_import_hnsw`는
+> 별도 SQL 함수가 아니라 지금은 `CREATE INDEX ... USING pg_cuvs_hnsw ... WITH (mode = ...)`
+> 의 `mode` 값이다(각각 `mode='nsw'`/`mode='hnswlib'`에 대응). 그 유일한 함수 형태
+> `pg_cuvs_build_hnsw()`도 deprecated — 아래 §3.1의 DDL을 쓴다. 표의 수치 자체는
+> 2026-06-01 실측 그대로(빌드 경로 코드는 이 이름 변경과 무관하게 그대로다).
 
-| | `pg_cuvs_import_cagra` (Phase 3J) | `pg_cuvs_import_hnsw` (Phase 3I) |
+두 mode는 동등한 옵션입니다. 트레이드오프를 보고 선택합니다.
+
+| | `mode='nsw'` (Phase 3J 계보) | `mode='hnswlib'` (Phase 3I 계보) |
 |--|--|--|
 | 그래프 구조 | NSW (flat, level 0만) | HNSW (계층적, multi-level) |
 | Level 0 neighbor | graph_degree 64~128 (CAGRA 최적) | 2M 기본 32 (heuristic) |
@@ -192,9 +198,9 @@ sudo systemctl start pg-cuvs-server
 | UNLOGGED 지원 | [O] | [O] |
 
 **권장 기준**:
-- N <= 5M, 빠른 빌드 우선 -> `pg_cuvs_import_cagra`
-- N > 10M, HNSW 표준 보장 필요 -> `pg_cuvs_import_hnsw`
-- 가장 빠른 경로 -> `pg_cuvs_import_cagra` + UNLOGGED (~96s vs native 285s, 3.0x)
+- N <= 5M, 빠른 빌드 우선 -> `mode='nsw'`
+- N > 10M, HNSW 표준 보장 필요 -> `mode='hnswlib'`
+- 가장 빠른 경로 -> `mode='nsw'` + UNLOGGED (~96s vs native 285s, 3.0x)
 
 ---
 
@@ -204,16 +210,19 @@ sudo systemctl start pg-cuvs-server
 -- 0. CAGRA 인덱스 생성 (GPU 빌드 + .hnsw 사이드카 자동 저장)
 CREATE INDEX my_cagra ON items USING cagra (embedding vector_l2_ops);
 
--- 1. pgvector HNSW 타겟 인덱스 준비 (빈 껍데기)
-CREATE INDEX my_hnsw ON items USING hnsw (embedding vector_l2_ops);
+-- 1. pg_cuvs_hnsw DDL 로 export (AccessExclusiveLock 획득 → 완료까지
+--    해당 인덱스 쿼리 불가; 대상 컬럼이 vector 면 mode='nsw' 형태, dim>2000
+--    이면 halfvec_l2_ops + ::halfvec(N) 캐스트로 halfvec 타겟도 가능 — #162)
+CREATE INDEX my_hnsw ON items USING pg_cuvs_hnsw (embedding vector_l2_ops)
+    WITH (source = 'my_cagra', mode = 'nsw');
 
--- 2. import (AccessExclusiveLock 획득 → 완료까지 해당 HNSW index 쿼리 불가)
-SELECT pg_cuvs_import_hnsw('my_cagra'::regclass, 'my_hnsw'::regclass);
-
--- 3. 이후 pgvector HNSW로 서치 (GPU 불필요)
+-- 2. 이후 pgvector HNSW로 서치 (GPU 불필요)
 SET enable_cuvs = off;
 SELECT * FROM items ORDER BY embedding <-> $1 LIMIT 10;
 ```
+
+`pg_cuvs_build_hnsw()` 함수 형태는 deprecated다(런타임 NOTICE도 그렇게 안내한다) —
+`pg_indexes`/`DROP INDEX`/`REINDEX`/`pg_dump`와 통합되는 위 DDL 형태를 쓴다.
 
 ### 3.2 빌드 시간 참조 (VM 실측, 2026-06-01)
 
@@ -228,14 +237,14 @@ build/import speedup은 벡터 내용 무관, 실 데이터에서도 유사 예�
 
 ### 3.3 offline-only 제약 설명
 
-`pg_cuvs_import_hnsw`는 target HNSW index에 `AccessExclusiveLock`을 획득한다.
-이는 REINDEX 와 동일한 수준의 잠금으로, import 트랜잭션이 커밋될 때까지
-해당 인덱스를 사용하는 모든 SELECT가 블록된다.
+`CREATE INDEX ... USING pg_cuvs_hnsw`(ambuild)는 대상 인덱스 자신에
+`AccessExclusiveLock`을 획득한다. 이는 REINDEX 와 동일한 수준의 잠금으로,
+빌드 트랜잭션이 커밋될 때까지 해당 인덱스를 사용하는 모든 SELECT가 블록된다.
 
 권장 운영 패턴:
-- 별도 테이블에 새 인덱스를 만들어 import 후 view/rename으로 교체 (minimal downtime)
-- maintenance window 중에 import 실행
-- `pg_cuvs_import_hnsw` 전에 `SET lock_timeout = '5min'` 으로 타임아웃 설정
+- 별도 테이블에 새 인덱스를 만들어 빌드 후 view/rename으로 교체 (minimal downtime)
+- maintenance window 중에 빌드 실행
+- `CREATE INDEX` 전에 `SET lock_timeout = '5min'` 으로 타임아웃 설정
 
 ### 3.4 crash recovery
 
