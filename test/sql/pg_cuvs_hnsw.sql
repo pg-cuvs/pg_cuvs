@@ -168,6 +168,19 @@ SELECT id FROM ph_test
 ORDER BY embedding::halfvec(4) <-> '[1,0.5,0,0]'::halfvec(4) LIMIT 1;
 RESET enable_cuvs; RESET enable_seqscan;
 
+-- REINDEX on a halfvec EXPRESSION index specifically: ambuild() re-reads
+-- attnum=1's atttypid from the index relation's own catalog entry (which
+-- for an expression index is the expression's RESULT type, halfvec, fixed
+-- at CREATE INDEX time and unchanged by REINDEX) -- untested before this
+-- case, unlike the vector-target REINDEX coverage above.
+SET client_min_messages = 'warning';
+REINDEX INDEX ph_hnsw_hv;
+SET client_min_messages = 'notice';
+SET enable_cuvs = off; SET enable_seqscan = off;
+SELECT id FROM ph_test
+ORDER BY embedding::halfvec(4) <-> '[1,0.5,0,0]'::halfvec(4) LIMIT 1;
+RESET enable_cuvs; RESET enable_seqscan;
+
 DROP INDEX ph_hnsw_hv;
 
 -- Cleanup.
