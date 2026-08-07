@@ -669,6 +669,60 @@ here and is the reason `#162` exists.
 > bound that case. This differs from the synthetic-buildonly recall-multiple claims
 > §2.2/§2.3 warn against: it is a same-graph paired delta, not an absolute recall claim.
 
+### 2.1f Page packing closes the 2× index-size gap (#161 lever 1, 2026-08-07)
+
+`#161` found `pgcuvs_hnsw_import`'s `index_bytes` fixed at 8,192,008,192 for 1M
+vectors (8,192 B/vector) **regardless of `graph_degree`/`M`** — one element+neighbor
+pair per page, the whole page, no matter how little of it the pair actually used.
+pgvector's own native HNSW index for the same corpus is 4,093,870,080 (4,093.87
+B/vector, §2.1b/§2.1c above) — pg_cuvs's export was **~2× larger** than the format
+it exports into. §2.1c's `pgcuvs_hnsw_import` figures above (and the `mode`×
+`graph_degree` grid the "Reading the `index_bytes` row" callout describes) predate
+this fix and describe the OLD one-pair-per-page layout, still accurate for
+`mode='hnsw'`/`'hnswlib'`/`'hnswlib_file'` (unchanged — see below), but now stale
+for `mode='nsw'` (the default and recommended mode, per §2.1c's own `nsw`-vs-`hnswlib`
+lever-2b resolution documented in `#161`).
+
+`mode='nsw'` now packs a fixed number of element+neighbor pairs onto each page
+instead of one — safe specifically because every `nsw` element is level 0 (flat,
+non-hierarchical), so every pair is the same size and a single page-capacity
+computation (`elems_per_page()`, `src/hnsw_export.c`) applies uniformly across the
+whole build. `mode='hnsw'`/`'hnswlib'`/`'hnswlib_file'` keep the original
+one-pair-per-page layout — their elements have per-node hierarchical levels, so no
+single fixed pack count fits every element without wasting space on the (majority)
+low-level nodes; out of scope for this fix, and low-priority given `#161`'s own
+finding that `nsw` already matches or beats `hnswlib` on recall.
+
+Data: [`bench/results/issue_161_packing_bench.json`](bench/results/issue_161_packing_bench.json)
+(raw log), driver [`bench/issue_161_packing_bench.py`](bench/issue_161_packing_bench.py).
+Host L40S (`pg-cuvs-167-sidecar`), extension 0.8.0 (this change is a pure C-level
+write-path optimization — no new SQL surface, no version bump per
+`CONTRIBUTING.md`'s versioning policy). wiki_all 768d, N=100,000,
+`graph_degree=64` (M=32), `mode='nsw'`, same-run `pgvector_hnsw` (defaults) for
+reference.
+
+| | build time | index_bytes | B/vector |
+|---|---:|---:|---:|
+| `pgcuvs_hnsw_import` (mode='nsw'), **before** (computed, 1 pair/page) | — | 819,208,192 | 8,192.1 |
+| `pgcuvs_hnsw_import` (mode='nsw'), **after** (packed, measured) | 1.6s | 409,608,192 | 4,096.1 |
+| `pgvector_hnsw` (native, same corpus) | 43.7s | 409,042,944 | 4,090.4 |
+
+**Exactly 2.00× smaller** (819,208,192 / 409,608,192), and now **matches pgvector's
+own native index size to within 0.01%** (4,096.1 vs 4,090.4 B/vector — the residual
+gap is `check_hnsw_page_fit()`'s existing conservative per-item overhead accounting,
+unrelated to this change). The "our export is ~2× larger than pgvector itself"
+finding that opened `#161` is closed for the default/recommended mode.
+
+**Correctness, not just size**: this is a pure page-layout change — tuple format,
+graph structure, and neighbor relationships are unchanged, so search results must be
+byte-for-byte identical to the pre-packing layout. Verified directly (not just
+inferred): `test/sql/build_hnsw_packing.sql` builds a 500-vector, multi-page (56
+pages) packed index and confirms full-sweep correctness (every vector finds itself
+as its own exact-match nearest neighbor, 0/500 mismatches, including pairs whose
+neighbor pointers cross a page boundary), rebuild determinism, `REINDEX` on a packed
+index, and a post-build regular `INSERT` (pgvector's own `aminsert` path) landing
+correctly against the corrected `insertPage` metapage field.
+
 ### 2.2 Synthetic crossover pilot — moved
 
 The synthetic crossover pilot (1K/100K/1M, clustered synthetic, latency crossover
