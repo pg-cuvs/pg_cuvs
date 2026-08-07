@@ -734,6 +734,61 @@ write_elem_page(Relation rel,
     UnlockReleaseBuffer(buf);
 }
 
+/* #161: writes N element+neighbor pairs packed k-per-page (fixed k, not
+ * greedy — same k for every page, chosen once from (dim, bytes_per_dim, m,
+ * level) so index_bytes stays a pure function of the build parameters, not
+ * of runtime packing choices). elems[i].elem_blkno/elem_offno/neigh_blkno/
+ * neigh_offno must already encode this k (the layout pass's job, not this
+ * function's) — this function only opens/fills/closes each page in that
+ * pre-assigned order and asserts (via write_elem_pair()) that what it
+ * writes lands where the layout pass said it would.
+ *
+ * Only valid for a uniform-size element sequence, i.e. every elems[i] at
+ * the SAME level (today: the nsw path, where every element is level 0).
+ * A hierarchical sequence has per-element neighbor-tuple sizes that vary
+ * with level, which a single fixed k cannot pack losslessly — callers with
+ * varying levels must keep using write_elem_page() in a per-element loop. */
+static void
+write_elem_pages_packed(Relation rel,
+                        ElemDesc *elems,
+                        const float *vecs,
+                        int dim,
+                        int bytes_per_dim,
+                        int m,
+                        size_t n_elems,
+                        int k,
+                        bool skip_wal)
+{
+    for (size_t page_start = 0; page_start < n_elems; page_start += (size_t) k)
+    {
+        size_t page_end = page_start + (size_t) k;
+        if (page_end > n_elems)
+            page_end = n_elems;
+
+        Buffer buf  = ReadBuffer(rel, P_NEW);
+        LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
+        Page   page = BufferGetPage(buf);
+        PageInit(page, BLCKSZ, sizeof(PgvHnswPageOpaque));
+
+        PgvHnswPageOpaque *opaque = (PgvHnswPageOpaque *) PageGetSpecialPointer(page);
+        opaque->nextblkno = InvalidBlockNumber;
+        opaque->unused    = 0;
+        opaque->page_id   = PGV_HNSW_PAGE_ID;
+
+        for (size_t i = page_start; i < page_end; i++)
+        {
+            const float *vec = vecs + i * (size_t) dim;
+            write_elem_pair(page, &elems[i], vec, dim, bytes_per_dim, m,
+                            elems, n_elems);
+        }
+
+        MarkBufferDirty(buf);
+        if (!skip_wal)
+            log_newpage_buffer(buf, true);
+        UnlockReleaseBuffer(buf);
+    }
+}
+
 /* Wave 1 release-hardening (ADR-038 3K 잔여): pg_cuvs writes pgvector on-disk
  * HNSW pages pinned to HNSW_VERSION=1 (stable across pgvector 0.5.0–0.8.x). Warn
  * if the installed pgvector is outside that tested range — a future on-disk
@@ -1815,16 +1870,30 @@ fill_hnsw_from_cagra_ipc_impl(Oid cagra_oid, Oid hnsw_oid, const char *mode,
     res->tids = NULL;
 
     /* ---- 4. Layout pass ---- */
+    /* #161: pack k elements/page on the nsw path (do_hierarchy=false), where
+     * every element is level 0 and neighbor-tuple size is therefore uniform
+     * — the one case a single fixed k packs losslessly (see
+     * write_elem_pages_packed()'s header comment). The hierarchical path
+     * keeps one element per page: per-element level varies there, so no
+     * single k fits every element without wasting space on the low-level
+     * majority — out of scope for #161 (mode='nsw' is the recommended
+     * default per #161's own lever-2b measurement; 'hnsw' is not). */
+    int pack_k = do_hierarchy ? 1 : elems_per_page((int)ipc_dim, bytes_per_dim, M, 0);
     for (size_t i = 0; i < N; i++)
     {
-        uint32_t blkno = (uint32_t)(i + 1);
+        size_t   page_idx = i / (size_t) pack_k;
+        size_t   slot      = i % (size_t) pack_k;
+        uint32_t blkno = (uint32_t)(page_idx + 1);   /* block 0 = meta */
         elems[i].elem_blkno  = blkno;
-        elems[i].elem_offno  = 1;
+        elems[i].elem_offno  = (uint16_t)(2 * slot + 1);
         elems[i].neigh_blkno = blkno;
-        elems[i].neigh_offno = 2;
+        elems[i].neigh_offno = (uint16_t)(2 * slot + 2);
     }
 
-    /* Verify elem+neigh fit on one page (worst-case: max_level, M neighbors). */
+    /* Verify elem+neigh fit on one page (worst-case: max_level, M neighbors).
+     * Still meaningful under packing: pack_k comes from the same
+     * elems_per_page() this check is now built on, so pack_k >= 1 here is
+     * exactly what this call already guarantees. */
     check_hnsw_page_fit((int)ipc_dim, bytes_per_dim, M, max_level);
 
     /* ---- 5. Open target HNSW with AccessExclusiveLock and truncate ---- */
@@ -1861,9 +1930,12 @@ fill_hnsw_from_cagra_ipc_impl(Oid cagra_oid, Oid hnsw_oid, const char *mode,
         metap->efConstruction = (uint16_t)(M0 * 2);  /* reasonable default */
         if (N > 0)
         {
-            /* entry_elem is the node with highest level (0 for flat NSW) */
+            /* entry_elem is the node with highest level (0 for flat NSW).
+             * #161: entryOffno used to be hard-coded 1, correct only while
+             * every element had the whole page to itself; under packing an
+             * entry element can land at any slot on its page. */
             metap->entryBlkno = elems[entry_elem].elem_blkno;
-            metap->entryOffno = 1;
+            metap->entryOffno = elems[entry_elem].elem_offno;
             metap->entryLevel = (int16_t)max_level;
         }
         else
@@ -1872,7 +1944,14 @@ fill_hnsw_from_cagra_ipc_impl(Oid cagra_oid, Oid hnsw_oid, const char *mode,
             metap->entryOffno = 0;
             metap->entryLevel = -1;
         }
-        metap->insertPage = (uint32_t)N;
+        /* #161: insertPage tells pgvector's own future single-row INSERT
+         * which page to try appending to. It used to be N (block N = the
+         * last element's own block, since block == i+1). Under packing the
+         * last element's actual block is elems[N-1].elem_blkno
+         * (= 1 + (N-1)/pack_k) — pointing INSERT at the true last page,
+         * not one past it, preserves the "append into free space" property
+         * pgvector's own writer already relies on (hnswinsert.c). */
+        metap->insertPage = (N > 0) ? elems[N - 1].elem_blkno : (uint32_t) N;
 
         ((PageHeader)page)->pd_lower =
             (uint16_t)(((char *)metap + sizeof(PgvHnswMeta)) - (char *)page);
@@ -1884,18 +1963,30 @@ fill_hnsw_from_cagra_ipc_impl(Oid cagra_oid, Oid hnsw_oid, const char *mode,
     }
 
     /* ---- 7. Write element+neighbor pages ---- */
-    for (size_t i = 0; i < N; i++)
+    /* #161: pack_k>1 only when !do_hierarchy (nsw); the packed writer with
+     * pack_k==1 would behave identically to the per-element loop below (one
+     * ReadBuffer(P_NEW) per element) but takes the dedicated path anyway to
+     * keep this branch a direct, obviously-correct mirror of the layout
+     * pass's pack_k choice above. */
+    if (pack_k > 1)
     {
-        /* Extract vector for this element */
-        const float *vec = vecs + i * (size_t)ipc_dim;
+        write_elem_pages_packed(hnsw_rel, elems, vecs, ipc_dim, bytes_per_dim,
+                                M, N, pack_k, hnsw_unlogged);
+    }
+    else
+    {
+        for (size_t i = 0; i < N; i++)
+        {
+            const float *vec = vecs + i * (size_t)ipc_dim;
 
-        write_elem_page(hnsw_rel,
-                        elems[i].elem_blkno,
-                        &elems[i],
-                        vec,
-                        ipc_dim, bytes_per_dim, M,
-                        elems, N,
-                        hnsw_unlogged);
+            write_elem_page(hnsw_rel,
+                            elems[i].elem_blkno,
+                            &elems[i],
+                            vec,
+                            ipc_dim, bytes_per_dim, M,
+                            elems, N,
+                            hnsw_unlogged);
+        }
     }
 
     /* vecs / elems are released by the PG_FINALLY in fill_hnsw_from_cagra_ipc(). */
