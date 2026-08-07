@@ -145,8 +145,11 @@ DROP INDEX ph_hnsw_cos;
 
 -- ── #162: halfvec target via the pg_cuvs_hnsw AM path ────────────
 -- Expression index on an ::halfvec(4) cast, using halfvec_l2_ops. This is
--- the primary new surface from #162 (as opposed to the deprecated
--- pg_cuvs_build_hnsw() function form, covered in build_hnsw_halfvec.sql).
+-- the primary new surface from #162 (build_hnsw_halfvec.sql covers the same
+-- AM path at larger dims/vector counts). The deprecated pg_cuvs_build_hnsw()
+-- function form has no halfvec coverage — it only ever creates a vector
+-- (fp32) target (find_hnsw_opclass_oid()/create_empty_hnsw() hardcode
+-- vector_*_ops), so there is nothing halfvec-shaped to test there.
 SET client_min_messages = 'warning';
 CREATE INDEX ph_hnsw_hv ON ph_test USING pg_cuvs_hnsw
     ((embedding::halfvec(4)) halfvec_l2_ops)

@@ -634,20 +634,21 @@ script aborts if the plan is a Seq Scan or does not name the expected index.
 
 | dim | ef_search | recall@10 fp32 | recall@10 halfvec | delta (fp32 − fp16) |
 |---:|---:|---:|---:|---:|
-| 1536 | 40  | 0.9882 | 0.9880 | +0.0002 |
-| 1536 | 100 | 0.9978 | 0.9976 | +0.0002 |
+| 1536 | 40  | 0.9875 | 0.9873 | +0.0002 |
+| 1536 | 100 | 0.9981 | 0.9979 | +0.0002 |
 | 3072 | 40  | *unbuildable* | 0.9872 | n/a |
-| 3072 | 100 | *unbuildable* | 0.9981 | n/a |
+| 3072 | 100 | *unbuildable* | 0.9970 | n/a |
 
-The +0.0002 delta at dim=1536 reproduced identically at both ef_search values and
-across two independent runs.
+The +0.0002 delta at dim=1536 was identical at both ef_search values.
 
 **At dim=3072 the fp32 arm does not exist — it is refused outright, not a scope
 reduction.** `check_hnsw_page_fit()` (`src/hnsw_export.c`) rejects the fp32 export
-before any GPU work: `needed=13736, available=8160 (dim=3072, bytes_per_dim=4,
-maxlevel=5, M=32)`. At these parameters (N=100K, M=32) the fp32 export ceiling sits
-near dim≈1678 and the halfvec ceiling near dim≈3356 — both maxlevel-dependent (i.e.
-N-dependent), so treat these as observed at this N/M, not as a general formula.
+before any GPU work: `needed=12776, available=8160 (dim=3072, bytes_per_dim=4,
+maxlevel=0, M=32)`. `mode='nsw'` (used throughout this measurement) always builds
+every element at level 0, so maxlevel=0 here is exact, not a bound — at these
+parameters (N=100K, M=32) the fp32 export ceiling is a deterministic dim≈1918 and
+the halfvec ceiling dim≈3836 (both scale with M and, for hierarchical modes, with
+maxlevel — this measurement's numbers hold specifically for `mode='nsw'`).
 **At dim=3072 the comparison is not "fp16 costs a little
 recall" — it is "fp16 or no index at all."** That is the stronger of the two results
 here and is the reason `#162` exists.

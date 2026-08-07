@@ -61,7 +61,7 @@
 #include "utils/fmgroids.h"      /* F_OIDEQ */
 #include "utils/acl.h"
 #include "utils/lsyscache.h"     /* get_rel_name */
-#include "catalog/namespace.h"   /* TypenameGetTypid (#162: vector/halfvec type detection) */
+#include "catalog/pg_type.h"     /* Form_pg_type (#162: vector/halfvec type detection) */
 
 #include <math.h>
 #include <stdio.h>
@@ -206,6 +206,17 @@ neigh_tuple_size(int level, int m)
 static void
 check_hnsw_page_fit(int dim, int bytes_per_dim, int m, int maxlevel)
 {
+    /* A negative dim (no typmod, e.g. an unconstrained `vector` column or an
+     * expression index whose typmod didn't resolve) would make the size_t
+     * arithmetic below wrap around instead of erroring — silently passing a
+     * check that should have refused to guess. Downstream code (pgvector's
+     * own "column does not have dimensions" check) still catches this, but
+     * not before this pre-check claims the build is safe. */
+    if (dim <= 0)
+        ereport(ERROR,
+                (errmsg("pg_cuvs: target index column has no fixed dimension "
+                        "(dim=%d) — cannot size-check the HNSW page layout",
+                        dim)));
     size_t esize  = elem_tuple_size(dim, bytes_per_dim);
     size_t nsize  = neigh_tuple_size(maxlevel, m);
     size_t needed = esize + 2 * PGV_ITEM_OVERHEAD + nsize + 2 * PGV_ITEM_OVERHEAD;
@@ -275,57 +286,47 @@ float_to_half(float f)
 }
 
 /*
- * Cached vector/halfvec type OIDs (#162). InvalidOid until first resolved;
- * a lookup miss (halfvec absent) is a legitimate state for pgvector <0.7.0,
- * not a bug — handled by callers via cuvs_warn_pgvector_version()'s
- * halfvec-aware ERROR path, not by failing here.
- */
-static Oid  cached_halfvec_typoid = InvalidOid;
-static bool halfvec_typoid_resolved = false;
-static Oid  cached_vector_typoid = InvalidOid;
-static bool vector_typoid_resolved = false;
-
-static Oid
-get_halfvec_typoid(void)
-{
-    if (!halfvec_typoid_resolved)
-    {
-        cached_halfvec_typoid = TypenameGetTypid("halfvec");
-        halfvec_typoid_resolved = true;
-    }
-    return cached_halfvec_typoid;
-}
-
-static Oid
-get_vector_typoid(void)
-{
-    if (!vector_typoid_resolved)
-    {
-        cached_vector_typoid = TypenameGetTypid("vector");
-        vector_typoid_resolved = true;
-    }
-    return cached_vector_typoid;
-}
-
-/*
  * Resolve a target column's element width in bytes from its actual PG type
  * OID (#162): 4 for vector (fp32), 2 for halfvec (fp16). ERRORs on anything
  * else — this file only ever writes pgvector-compatible vector/halfvec page
  * bytes, so a third type reaching here is a caller bug, not a runtime
  * condition to degrade gracefully from.
+ *
+ * Looks up the type NAME from the OID via a direct syscache hit, rather
+ * than resolving vector/halfvec's OID from their names via
+ * TypenameGetTypid() (an earlier version of this function did that, cached
+ * process-lifetime). TypenameGetTypid() resolves an UNQUALIFIED name
+ * through the CALLER'S search_path (namespace.c) — under a restricted
+ * search_path (SECURITY DEFINER, a schema-qualified extension install,
+ * `SET search_path = ''`) it can return InvalidOid even though pgvector's
+ * vector/halfvec types are perfectly well-defined by the OID this function
+ * was actually given, turning an ordinary fp32 build into a spurious ERROR.
+ * An OID->name lookup has no such dependency.
  */
 static int
 bytes_per_dim_for_typid(Oid typid)
 {
-    Oid hv = get_halfvec_typoid();
-    if (OidIsValid(hv) && typid == hv)
+    HeapTuple   tup = SearchSysCache1(TYPEOID, ObjectIdGetDatum(typid));
+    const char *name;
+
+    if (!HeapTupleIsValid(tup))
+        ereport(ERROR,
+                (errmsg("pg_cuvs: target index column type (typoid=%u) not found",
+                        typid)));
+    name = NameStr(((Form_pg_type) GETSTRUCT(tup))->typname);
+    if (strcmp(name, "halfvec") == 0)
+    {
+        ReleaseSysCache(tup);
         return 2;
-    Oid vc = get_vector_typoid();
-    if (OidIsValid(vc) && typid == vc)
+    }
+    if (strcmp(name, "vector") == 0)
+    {
+        ReleaseSysCache(tup);
         return 4;
+    }
     ereport(ERROR,
-            (errmsg("pg_cuvs: target index column type (typoid=%u) is neither "
-                    "vector nor halfvec", typid)));
+            (errmsg("pg_cuvs: target index column type (typoid=%u, typname=\"%s\") "
+                    "is neither vector nor halfvec", typid, name)));
     return 4; /* unreached */
 }
 
@@ -733,59 +734,6 @@ cuvs_warn_pgvector_version(void)
     table_close(rel, AccessShareLock);
 }
 
-/*
- * #162: halfvec was added in pgvector 0.7.0. pg_cuvs.control's `requires`
- * field cannot express a version-qualified dependency (PostgreSQL's .control
- * format is a bare extension-name list, no version syntax) — this is the
- * substitute enforcement point, called only when a build actually targets a
- * halfvec index, right after that target's type is known. ERROR, not
- * WARNING: cuvs_warn_pgvector_version() above warns-and-continues for a
- * general format-compatibility concern, but writing halfvec bytes against a
- * pgvector build that has no halfvec type/opclasses at all is not a "might
- * be incompatible" risk, it is certain to fail (CREATE OPERATOR CLASS ...
- * FOR TYPE halfvec would not even have installed) or produce garbage.
- */
-static void
-require_halfvec_capable_pgvector(void)
-{
-    Oid          ext_oid = get_extension_oid("vector", true);
-    Relation     rel;
-    SysScanDesc  scan;
-    ScanKeyData  key;
-    HeapTuple    tup;
-
-    if (!OidIsValid(ext_oid))
-        return;   /* absence is handled (ERROR) elsewhere */
-
-    rel = table_open(ExtensionRelationId, AccessShareLock);
-    ScanKeyInit(&key, Anum_pg_extension_oid, BTEqualStrategyNumber,
-                F_OIDEQ, ObjectIdGetDatum(ext_oid));
-    scan = systable_beginscan(rel, ExtensionOidIndexId, true, NULL, 1, &key);
-    tup = systable_getnext(scan);
-    if (HeapTupleIsValid(tup))
-    {
-        bool  isnull;
-        Datum d = heap_getattr(tup, Anum_pg_extension_extversion,
-                               RelationGetDescr(rel), &isnull);
-        if (!isnull)
-        {
-            char *ver = text_to_cstring(DatumGetTextPP(d));
-            int   major = -1, minor = -1;
-            if (sscanf(ver, "%d.%d", &major, &minor) == 2
-                && major == 0 && minor < 7)
-                ereport(ERROR,
-                        (errmsg("pg_cuvs: halfvec target requires pgvector "
-                                ">= 0.7.0, found %s", ver),
-                         errhint("halfvec was added in pgvector 0.7.0; "
-                                 "upgrade pgvector or target a vector "
-                                 "(fp32) index instead.")));
-            pfree(ver);
-        }
-    }
-    systable_endscan(scan);
-    table_close(rel, AccessShareLock);
-}
-
 /* ================================================================
  * Main SQL function
  * ================================================================ */
@@ -886,8 +834,6 @@ fill_hnsw_from_hnswlib_impl(Oid cagra_oid, Oid hnsw_oid, bool use_shm,
                      * tuple (and att, which points into it) is invalid after. */
                     bytes_per_dim = bytes_per_dim_for_typid(att->atttypid);
                     ReleaseSysCache(attup);
-                    if (bytes_per_dim == 2)
-                        require_halfvec_capable_pgvector();
                 }
             }
             if (tgt_dim > 0 && tgt_dim != dim)
@@ -1594,8 +1540,6 @@ fill_hnsw_from_cagra_ipc_impl(Oid cagra_oid, Oid hnsw_oid, const char *mode,
                  * into the tuple, invalid after release. */
                 bytes_per_dim = bytes_per_dim_for_typid(att->atttypid);
                 ReleaseSysCache(attup);
-                if (bytes_per_dim == 2)
-                    require_halfvec_capable_pgvector();
             }
             if (tgt_dim > 0 && tgt_dim != dim)
             {
@@ -2088,14 +2032,31 @@ pg_cuvs_build_hnsw(PG_FUNCTION_ARGS)
      * find_hnsw_opclass_oid()/create_empty_hnsw() below, which hardcode
      * vector_*_ops opclasses — so bytes_per_dim is always 4 here; a halfvec
      * target requires the CREATE INDEX ... USING pg_cuvs_hnsw DDL form
-     * instead (cuvs_hnsw_ambuild(), which carries its own pre-check). */
+     * instead (cuvs_hnsw_ambuild(), which carries its own pre-check).
+     *
+     * Validate cagra_oid IS a cagra index before reading its reloptions as
+     * CuvsCagraOptions: this runs before create_empty_hnsw()'s own AM check
+     * further down, and cuvs_cagra_reloption_graph_degree() blindly casts
+     * rd_options to CuvsCagraOptions, so a non-cagra argument here would
+     * read that AM's option struct at CuvsCagraOptions's field offsets
+     * instead of failing with a clear "not a cagra index" error. */
     {
         Relation cagra_rel_pc = index_open(cagra_oid, AccessShareLock);
+        if (cagra_rel_pc->rd_rel->relam != get_am_oid("cagra", false))
+        {
+            index_close(cagra_rel_pc, AccessShareLock);
+            ereport(ERROR,
+                    (errmsg("pg_cuvs_build_hnsw: \"%s\" is not a cagra index",
+                            get_rel_name(cagra_oid))));
+        }
         int precheck_dim = (int) TupleDescAttr(RelationGetDescr(cagra_rel_pc), 0)->atttypmod;
         int graph_degree  = cuvs_cagra_reloption_graph_degree(cagra_rel_pc);
         index_close(cagra_rel_pc, AccessShareLock);
         int m0 = (graph_degree < 64) ? graph_degree : 64;
-        check_hnsw_page_fit(precheck_dim, 4, m0 / 2, 5);
+        /* mode='nsw' always builds level 0 only (see cuvs_hnsw_ambuild()'s
+         * matching comment) -- the exact bound, not a guess, there. */
+        int precheck_maxlevel = (strcmp(mode, "nsw") == 0) ? 0 : 5;
+        check_hnsw_page_fit(precheck_dim, 4, m0 / 2, precheck_maxlevel);
     }
 
     /* Create empty HNSW on parent table — INDEX_CREATE_SKIP_BUILD, no CPU build */
@@ -2235,11 +2196,21 @@ cuvs_hnsw_ambuild(Relation heapRel, Relation indexRel, IndexInfo *indexInfo)
      * 거부하더라도 항상 GPU 작업 전에" policy. check_hnsw_page_fit() below
      * (after the real M/maxlevel are known) remains as a backstop for the
      * rare case where this pre-check's M assumption undershoots the actual
-     * build. */
+     * build.
+     *
+     * mode='nsw' is the one case where maxlevel is not a guess: do_hierarchy
+     * in fill_hnsw_from_cagra_ipc_impl() is only true for mode='hnsw', so
+     * 'nsw' always builds every element at level 0 (elems[i].level stays
+     * calloc'd 0, max_level=0). Using the conservative 5 there anyway
+     * rejects fp32 builds in the dim≈1679–1918 band that built fine before
+     * this pre-check existed — a real regression on the default mode, not a
+     * conservative-but-safe over-reject. Every other mode ('hnsw',
+     * 'hnswlib', 'hnswlib_file') genuinely can reach a nonzero level, so
+     * they keep the conservative bound. */
     Form_pg_attribute precheck_att = TupleDescAttr(RelationGetDescr(indexRel), 0);
     int precheck_dim           = (int) precheck_att->atttypmod;
     int precheck_bytes_per_dim = bytes_per_dim_for_typid(precheck_att->atttypid);
-    const int safe_maxlevel = 5;
+    const int safe_maxlevel = (strcmp(mode, "nsw") == 0) ? 0 : 5;
 
     /* ── Source-less: ephemeral CAGRA built from the heap, then dropped. ── */
     if (source_name[0] == '\0')
