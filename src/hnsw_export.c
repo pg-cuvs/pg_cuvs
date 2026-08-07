@@ -516,27 +516,24 @@ hnsw_fill_res_free(HnswFillRes *r)
 }
 
 /* ----------------------------------------------------------------
- * Write a single page for element i (elem + neigh tuples).
- *
- * We write one page per element pair.  Both tuples must fit; the
- * layout pass guarantees this.
+ * Write one element+neighbor tuple pair onto an ALREADY-OPEN page (#161:
+ * extracted from write_elem_page() so a caller can pack multiple pairs
+ * onto one page — buffer lifecycle (ReadBuffer/PageInit/dirty/WAL/release)
+ * is the caller's responsibility, not this function's). e->elem_offno /
+ * e->neigh_offno (set by the layout pass) determine where on THIS page
+ * the tuples land; this function does not choose or validate offsets
+ * itself, it only asserts PageAddItem returns them.
  * ---------------------------------------------------------------- */
 static void
-write_elem_page(Relation rel,
-                uint32_t blkno,
+write_elem_pair(Page page,
                 ElemDesc *e,
                 const float *vec,
                 int dim,
                 int bytes_per_dim,
                 int m,
                 ElemDesc *all_elems,
-                size_t n_elems,
-                bool skip_wal)
+                size_t n_elems)
 {
-    Buffer              buf;
-    Page                page;
-    PgvHnswPageOpaque  *opaque;
-
     /* elem tuple */
     size_t esize = elem_tuple_size(dim, bytes_per_dim);
     size_t nsize = neigh_tuple_size(e->level, m);
@@ -642,8 +639,67 @@ write_elem_page(Relation rel,
             set_invalid_item_ptr(&slots[slot]);
     }
 
-    /* Write the page — always extend with P_NEW; caller loops in blkno order
-     * so each call appends the next block in sequence. */
+    /* Add element tuple. InvalidOffsetNumber lets PG choose the next free
+     * slot on THIS page — for a single-pair page that is always offno 1,
+     * for a packed page it is whatever slot this pair falls into. Assert
+     * it matches what the layout pass already assigned to e->elem_offno
+     * (set_item_ptr()-encoded neighbor references elsewhere depend on that
+     * assignment being correct, not on what PageAddItem happens to return). */
+    OffsetNumber eoff = PageAddItem(page, (Item)etup, esize, InvalidOffsetNumber,
+                                    false, false);
+    if (eoff == InvalidOffsetNumber)
+        ereport(ERROR,
+                (errmsg("pg_cuvs: hnsw_export: element tuple does not fit on page "
+                        "(esize=%zu, free=%zu)", esize,
+                        (size_t)PageGetFreeSpace(page))));
+    if (eoff != (OffsetNumber) e->elem_offno)
+        ereport(ERROR,
+                (errmsg("pg_cuvs: hnsw_export: internal error — element landed at "
+                        "offno %u, layout pass assigned %u",
+                        eoff, e->elem_offno)));
+
+    /* Add neighbor tuple, same assertion. */
+    OffsetNumber noff = PageAddItem(page, (Item)ntup, nsize, InvalidOffsetNumber,
+                                    false, false);
+    if (noff == InvalidOffsetNumber)
+        ereport(ERROR,
+                (errmsg("pg_cuvs: hnsw_export: neighbor tuple does not fit on page "
+                        "(nsize=%zu, free=%zu)", nsize,
+                        (size_t)PageGetFreeSpace(page))));
+    if (noff != (OffsetNumber) e->neigh_offno)
+        ereport(ERROR,
+                (errmsg("pg_cuvs: hnsw_export: internal error — neighbor tuple "
+                        "landed at offno %u, layout pass assigned %u",
+                        noff, e->neigh_offno)));
+
+    pfree(etup);
+    pfree(ntup);
+}
+
+/* ----------------------------------------------------------------
+ * Write a single page holding exactly one element+neighbor pair — the
+ * layout used by every caller except #161's packed nsw write loop
+ * (write_elem_pages_packed() below). Thin wrapper: owns the buffer
+ * lifecycle, delegates the tuple construction to write_elem_pair().
+ * ---------------------------------------------------------------- */
+static void
+write_elem_page(Relation rel,
+                uint32_t blkno,
+                ElemDesc *e,
+                const float *vec,
+                int dim,
+                int bytes_per_dim,
+                int m,
+                ElemDesc *all_elems,
+                size_t n_elems,
+                bool skip_wal)
+{
+    Buffer              buf;
+    Page                page;
+    PgvHnswPageOpaque  *opaque;
+
+    /* always extend with P_NEW; caller loops in blkno order so each call
+     * appends the next block in sequence. */
     (void)blkno;        /* layout reference only */
     buf  = ReadBuffer(rel, P_NEW);
     LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
@@ -655,34 +711,12 @@ write_elem_page(Relation rel,
     opaque->unused    = 0;
     opaque->page_id   = PGV_HNSW_PAGE_ID;
 
-    /* Add element tuple at offno 1 */
-    OffsetNumber eoff = PageAddItem(page, (Item)etup, esize, InvalidOffsetNumber,
-                                    false, false);
-    if (eoff == InvalidOffsetNumber)
-        ereport(ERROR,
-                (errmsg("pg_cuvs: hnsw_export: element tuple does not fit on page "
-                        "(esize=%zu, free=%zu)", esize,
-                        (size_t)PageGetFreeSpace(page))));
-
-    /* Add neighbor tuple at offno 2 */
-    OffsetNumber noff = PageAddItem(page, (Item)ntup, nsize, InvalidOffsetNumber,
-                                    false, false);
-    if (noff == InvalidOffsetNumber)
-        ereport(ERROR,
-                (errmsg("pg_cuvs: hnsw_export: neighbor tuple does not fit on page "
-                        "(nsize=%zu, free=%zu)", nsize,
-                        (size_t)PageGetFreeSpace(page))));
-
-    (void)eoff;
-    (void)noff;
+    write_elem_pair(page, e, vec, dim, bytes_per_dim, m, all_elems, n_elems);
 
     MarkBufferDirty(buf);
     if (!skip_wal)
         log_newpage_buffer(buf, true); /* WAL full-page image for crash safety */
     UnlockReleaseBuffer(buf);
-
-    pfree(etup);
-    pfree(ntup);
 }
 
 /* Wave 1 release-hardening (ADR-038 3K 잔여): pg_cuvs writes pgvector on-disk
