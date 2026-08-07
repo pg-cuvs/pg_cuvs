@@ -19,6 +19,9 @@
 --   5. A regular INSERT after the packed build (pgvector's own aminsert
 --      path, not ours) succeeds and the new row is searchable — exercises
 --      metap->insertPage against a packed layout.
+--   6. N an exact multiple of k: the last page is completely full (not the
+--      partial-last-page case Case 1-5 exercise with N=500, k=9), still
+--      correct.
 
 \set ON_ERROR_STOP on
 SET client_min_messages = warning;
@@ -111,3 +114,31 @@ ORDER BY embedding <-> (SELECT embedding FROM hp_test WHERE id = 501) LIMIT 1;
 RESET enable_cuvs; RESET enable_seqscan;
 
 DROP TABLE hp_test CASCADE;
+
+-- ── Case 6: N exactly divisible by k (504 = 9*56) — last page full ──
+CREATE TABLE hp_test2 (id bigint, embedding vector(100));
+INSERT INTO hp_test2
+    SELECT i, (SELECT ('[' || string_agg((random() + i * 0.0 + j * 0.0)::text, ',') || ']')::vector
+               FROM generate_series(1, 100) j)
+    FROM generate_series(1, 504) i;
+CREATE INDEX hp_cagra2 ON hp_test2 USING cagra
+    (embedding vector_l2_ops) WITH (graph_degree = 64);
+
+SET client_min_messages = 'warning';
+CREATE INDEX hp_hnsw2 ON hp_test2 USING pg_cuvs_hnsw
+    (embedding vector_l2_ops) WITH (source = 'hp_cagra2', mode = 'nsw');
+SET client_min_messages = 'notice';
+
+-- 504/9 = 56 exactly: 1 (meta) + 56 pages, no trailing partial/empty page.
+SELECT pg_relation_size('hp_hnsw2') = 57 * 8192 AS exact_multiple_size_matches;
+
+SET enable_cuvs = off; SET enable_seqscan = off;
+SELECT count(*) AS mismatches_exact_multiple
+FROM hp_test2 t
+WHERE t.id <> (
+    SELECT t2.id FROM hp_test2 t2
+    ORDER BY t2.embedding <-> t.embedding LIMIT 1
+);
+RESET enable_cuvs; RESET enable_seqscan;
+
+DROP TABLE hp_test2 CASCADE;

@@ -707,11 +707,17 @@ reference.
 | `pgcuvs_hnsw_import` (mode='nsw'), **after** (packed, measured) | 1.6s | 409,608,192 | 4,096.1 |
 | `pgvector_hnsw` (native, same corpus) | 43.7s | 409,042,944 | 4,090.4 |
 
-**Exactly 2.00× smaller** (819,208,192 / 409,608,192), and now **matches pgvector's
-own native index size to within 0.01%** (4,096.1 vs 4,090.4 B/vector — the residual
-gap is `check_hnsw_page_fit()`'s existing conservative per-item overhead accounting,
-unrelated to this change). The "our export is ~2× larger than pgvector itself"
-finding that opened `#161` is closed for the default/recommended mode.
+**Exactly 2.00× smaller** (819,208,192 / 409,608,192), and now **within 0.14% of
+pgvector's own native index size** (4,096.1 vs 4,090.4 B/vector, ratio 1.0014 —
+the committed JSON is the source of record for this number). The residual gap's
+cause is not established: `check_hnsw_page_fit()`'s existing overhead accounting
+was checked and ruled out as the explanation (at dim=768/M=32 the exact and
+conservative accounting both floor to the identical `k=2` pairs/page, so it cannot
+be what's producing this gap) — the more likely source is a difference in
+pgvector's own page-filling strategy (its `hnswinsert.c` greedy-packs by
+`PageGetFreeSpace()`, not a fixed k), but that has not been confirmed. The
+"our export is ~2× larger than pgvector itself" finding that opened `#161` is
+closed for the default/recommended mode regardless of this small residual.
 
 **Correctness, not just size**: this is a pure page-layout change — tuple format,
 graph structure, and neighbor relationships are unchanged, so search results must be

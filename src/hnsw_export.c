@@ -564,7 +564,10 @@ write_elem_pair(Page page,
     for (int t = 1; t < PGV_HNSW_MAX_HEAPTIDS; t++)
         set_invalid_item_ptr(&etup->heaptids[t]);
 
-    /* neighbortid points to the neighbor tuple on the same page, offno 2 */
+    /* neighbortid points to the neighbor tuple on the same page, at
+     * whatever offno the layout pass assigned (e->neigh_offno — always 2
+     * for one-pair-per-page, but a packed page's Nth pair lands at a
+     * higher offno; see the layout pass in fill_hnsw_from_cagra_ipc_impl). */
     set_item_ptr(&etup->neighbortid, e->neigh_blkno, e->neigh_offno);
     etup->unused = 0;
 
@@ -1870,6 +1873,17 @@ fill_hnsw_from_cagra_ipc_impl(Oid cagra_oid, Oid hnsw_oid, const char *mode,
     res->tids = NULL;
 
     /* ---- 4. Layout pass ---- */
+    /* Verify elem+neigh fit on one page (worst-case: max_level, M neighbors)
+     * BEFORE computing pack_k below — pack_k divides the loop that follows,
+     * and elems_per_page() (which both this check and pack_k are built on)
+     * returns 0 when a pair doesn't fit at all. This call is what turns
+     * that 0 into a clean ERROR instead of a SIGFPE two lines down; it must
+     * run first, not after. (It used to run after the old one-element/page
+     * loop too, harmlessly, since that loop never divided by anything —
+     * this ordering only became load-bearing when the loop below started
+     * dividing by pack_k.) */
+    check_hnsw_page_fit((int)ipc_dim, bytes_per_dim, M, max_level);
+
     /* #161: pack k elements/page on the nsw path (do_hierarchy=false), where
      * every element is level 0 and neighbor-tuple size is therefore uniform
      * — the one case a single fixed k packs losslessly (see
@@ -1879,6 +1893,11 @@ fill_hnsw_from_cagra_ipc_impl(Oid cagra_oid, Oid hnsw_oid, const char *mode,
      * majority — out of scope for #161 (mode='nsw' is the recommended
      * default per #161's own lever-2b measurement; 'hnsw' is not). */
     int pack_k = do_hierarchy ? 1 : elems_per_page((int)ipc_dim, bytes_per_dim, M, 0);
+    if (pack_k < 1)
+        ereport(ERROR,
+                (errmsg("pg_cuvs: internal error — pack_k=%d after "
+                        "check_hnsw_page_fit() passed (dim=%d, bytes_per_dim=%d, M=%d)",
+                        pack_k, (int)ipc_dim, bytes_per_dim, M)));
     for (size_t i = 0; i < N; i++)
     {
         size_t   page_idx = i / (size_t) pack_k;
@@ -1889,12 +1908,6 @@ fill_hnsw_from_cagra_ipc_impl(Oid cagra_oid, Oid hnsw_oid, const char *mode,
         elems[i].neigh_blkno = blkno;
         elems[i].neigh_offno = (uint16_t)(2 * slot + 2);
     }
-
-    /* Verify elem+neigh fit on one page (worst-case: max_level, M neighbors).
-     * Still meaningful under packing: pack_k comes from the same
-     * elems_per_page() this check is now built on, so pack_k >= 1 here is
-     * exactly what this call already guarantees. */
-    check_hnsw_page_fit((int)ipc_dim, bytes_per_dim, M, max_level);
 
     /* ---- 5. Open target HNSW with AccessExclusiveLock and truncate ---- */
     Relation hnsw_rel = index_open(hnsw_oid, AccessExclusiveLock);
