@@ -1,8 +1,14 @@
 # Brev pg_cuvs GPU VM — fast rebuild
 
-**There is no "resume".** A Brev A100 does not support `brev stop`, has no
-persistent volume, and Brev has no snapshot/image feature. `brev delete` is the only way to stop paying, and it loses everything.
-So the plan is not to preserve the VM — it is to rebuild it fast.
+**On the types we pin for benchmarks, there is no "resume".** Stop support is per
+instance type (`brev search gpu --stoppable`; the `S` flag in FEATURES). Every
+Shadeform-backed A100 — including `massedcompute_A100_sxm4_80G`, the type our published
+numbers are pinned to — has no `S`: no `brev stop`, no persistent volume, no
+snapshot/image. There, `brev delete` is the only way to stop paying, and it loses
+everything. So for the benchmark track the plan is not to preserve the VM — it is to
+rebuild it fast. (Development work can instead use a stoppable type such as Crusoe
+`a100-80gb.1x`, where `/home/ubuntu/workspace` survives stop/start; that path is not yet
+validated against this bootstrap, which assumes the `shadeform` user.)
 
 `bootstrap.sh` does that: a fresh instance → ready (built extension + daemon +
 PG16 preloaded + wiki_all_1M dataset) in ~10 minutes, with every gotcha from the

@@ -37,7 +37,8 @@ GPU (NVIDIA A100-SXM4-80GB, sm_80, 80GB VRAM)
 ## 1. VM 준비
 
 **인스턴스 신규 생성·부트스트랩·재빌드는 이 스킬의 범위가 아니다** —
-`gpu-vm-provision` 스킬을 따르라 (Brev는 stop이 없어 "재시작 = 재부트스트랩 ~10분").
+`gpu-vm-provision` 스킬을 따르라 (shadeform 계열은 stop이 없어 "재시작 = 재부트스트랩
+~10분"; stoppable 사양은 `brev stop`/`start`로 상태 보존).
 여기서는 이미 부트스트랩된 인스턴스를 쓰는 일상 루프만 다룬다.
 
 ### SSH 연결
@@ -64,8 +65,9 @@ CUDA_ARCH=sm_80                 # A100=sm_80 (L4=sm_89, H100=sm_90)
 `VM_SSH_HOST` 는 옛 `GCP_VM` 으로 폴백하므로, 기존 설정을 안 고쳐도 동작한다.
 
 주의: `make vm-start` / `make vm-stop` / `make vm-ip`는 gcloud 전용 타깃이라
-Brev에서는 동작하지 않는다. Brev에서 과금을 멈추려면 `brev delete`뿐이다 —
-gpu-vm-provision 스킬 참조.
+Brev에서는 동작하지 않는다. Brev에서 과금을 멈추는 방법은 사양에 달렸다 — shadeform 계열은
+`brev delete`뿐이고, stoppable 사양(crusoe·gcp)은 `brev stop`이 된다. gpu-vm-provision
+스킬 참조.
 
 ### 데몬 제어
 
@@ -116,8 +118,9 @@ ssh <name> "sudo journalctl -u pg-cuvs-server -n 50 --no-pager"   # 로그
 세 갈래가 모두 발현했고, 그중 하나는 잘못된 결론을 PR 코멘트로 나가게 했다.
 `gpu-verify-deployed`(= `infra/scripts/gpu-preflight.sh`)가 이를 소리나게 만든다.
 
-세션 종료 시: 커밋/푸시 확인 후 `brev delete` (VM 위 자산은 모두 재빌드 가능해야 함 —
-소스는 main에, 측정 CSV는 `bench/results/`에 커밋).
+세션 종료 시: 커밋/푸시 확인 후 `brev delete` (stoppable 사양이면 `brev stop`으로 상태를
+남길 수 있다). 어느 쪽이든 VM 위 자산은 모두 재빌드 가능해야 한다 — 소스는 main에,
+측정 CSV는 `bench/results/`에 커밋.
 
 ---
 
@@ -184,11 +187,14 @@ ldconfig 등록 시 sshd/dbus가 ABI 충돌로 죽고 VM 접근 불가가 된다
 
 ## 4. 비용 관리
 
-Brev는 stop이 없다 — 인스턴스가 떠 있는 동안 계속 과금된다.
+**stop 지원은 인스턴스 타입별이다** (`brev search gpu --stoppable`, FEATURES 열의 `S`).
+shadeform 계열(massedcompute·paperspace 등 — 벤치 canonical 포함)은 stop이 없어 떠 있는
+동안 계속 과금되고, crusoe·gcp 계열은 stop으로 과금을 멈추면서 상태를 보존한다.
 
-- 작업을 마치면 커밋/푸시 후 `brev delete`
-- 다음 세션 시작 비용은 재부트스트랩 ~10분 (gpu-vm-provision 스킬)
-- VM에만 존재하는 산출물을 만들지 말 것 — 측정 결과는 즉시 `bench/results/`로 커밋
+- stop 불가 사양: 작업을 마치면 커밋/푸시 후 `brev delete`. 다음 세션 시작 비용은
+  재부트스트랩 ~10분 (gpu-vm-provision 스킬)
+- stoppable 사양: `brev stop <name>` — `/home/ubuntu/workspace`가 보존된다
+- 어느 쪽이든 VM에만 존재하는 산출물을 만들지 말 것 — 측정 결과는 즉시 `bench/results/`로 커밋
 
 ---
 

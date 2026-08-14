@@ -35,6 +35,7 @@
 | 2026-07-28 | quality-loop 스킬 추가 | skills/quality-loop | 품질 루프 도입 (버그·중복·테스트 속도 감사) |
 | 2026-07-28 | GPU 스킬 2종 트리거 경계 정리, 프로비저닝 중복 섹션을 참조로 대체, disk-recovery.md dead link 수정 | skills/pg-cuvs-dev, skills/gpu-vm-provision | 하네스 진단에서 트리거 중복·이중 관리 발견 |
 | 2026-07-28 | 하네스 포인터 등록 | CLAUDE.md | 변경 추적 진입점 부재 |
+| 2026-08-14 | "Brev엔 stop이 없다" 서술을 "stop은 인스턴스 타입별" 로 정정 (`brev search --stoppable` / FEATURES `S`; shadeform 계열 불가, crusoe·gcp 가능), 벤치=ephemeral / 개발=stoppable 2트랙 명시 | skills/gpu-vm-provision, skills/pg-cuvs-dev, infra/README.md, infra/brev/README.md | 우리 사양의 사실을 플랫폼 전체로 일반화한 오류 — Brev 팀 회신(2026-08-07)과 CLI 실측으로 확인 |
 | 2026-07-28 | GPU 스킬 2종 GCP → Brev 전환 (bootstrap 재빌드 모델, shadeform/sm_80, vm-start·stop 무효화 명시, GCP는 레거시 섹션으로) | skills/gpu-vm-provision, skills/pg-cuvs-dev, skills/quality-loop | GCP 크레딧 만료, Brev(Massed Compute A100)가 현 메인 프로바이더 |
 | 2026-07-28 | 트리거 공백 보완("VM 올려줘"→provision, "VM 내려줘/삭제"→dev), 함정 F·H에 bootstrap gotcha SSoT 인용 추가 | skills/gpu-vm-provision, skills/pg-cuvs-dev | 책임 분리 검토에서 트리거 틈·드리프트 위험 발견 |
 

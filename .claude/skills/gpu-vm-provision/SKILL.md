@@ -26,15 +26,38 @@ pg_cuvs 개발용 GPU VM의 프로비저닝/재빌드/검증을 다룬다. 시�
 
 ## Brev 모델 이해 (가장 중요)
 
-Brev 인스턴스에는 사양과 무관하게 **"보존"이라는 개념이 없다**:
-- `brev stop` 미지원, 영속 볼륨 없음, 스냅샷/이미지 기능 없음
-- 과금을 멈추는 유일한 방법은 `brev delete` — 인스턴스의 모든 것이 사라진다
-- 따라서 전략은 보존이 아니라 **빠른 재현 가능한 재빌드**다: bootstrap.sh가
-  fresh instance → ready(확장 빌드 + 데몬 + PG16 preload + wiki_all_1M 데이터셋)를
-  ~10분에 완료한다 (setup ~80s, dataset ~75s, build ~2-3분, verify ~30s)
+**stop 지원은 플랫폼이 아니라 인스턴스 타입의 속성이다.** 2026-08-14에 확인하기 전까지 이
+문서는 "Brev엔 stop이 없다"고 단정했는데, 그건 우리가 고른 사양의 사실을 플랫폼 전체로
+일반화한 오류였다. CLI가 이미 그 정보를 노출한다:
 
-VM 위의 어떤 것도 source of truth가 아니다. 소스는 `main` 브랜치에, 측정 CSV는
-`bench/results/`에 커밋되어 있으므로 delete의 비용은 ~10분 재빌드뿐이다.
+```bash
+brev search gpu --gpu-name A100     # FEATURES 열: S=Stoppable, R=Rebootable, P=Flex Ports
+brev search gpu --stoppable         # stop 되는 사양만
+```
+
+| 계열 | stop | 예 |
+|------|------|-----|
+| `*:shadeform` (massedcompute·paperspace·hyperstack·denvr·verda) | **불가** (FEATURES `-`) | `massedcompute_A100_sxm4_80G` $1.66/hr — 우리 벤치 canonical |
+| crusoe | **가능** (`SP`) | `a100-80gb.1x` $1.98/hr, `a100-80gb.2x` $3.96/hr |
+| gcp | **가능** (`SP`) | `a2-ultragpu-1g:nvidia-a100-80gb:1` $6.03/hr |
+| lambda-labs | reboot만 (`R`) | `gpu_1x_a100_sxm4` |
+
+stop 되는 사양에서는 `/home/ubuntu/workspace`가 stop/start 간 보존된다 (Brev 팀 회신,
+2026-08-07). stop 안 되는 사양에서는 **과금을 멈추는 유일한 방법이 `brev delete`**이고,
+그러면 인스턴스의 모든 것이 사라진다.
+
+**따라서 트랙을 나눈다:**
+- **벤치마크** — `massedcompute_A100_sxm4_80G` 고정(절대값 비교 가능성). stop이 없지만 이
+  트랙은 ephemeral이 오히려 정합하다(깨끗한 상태 재현). 전략은 **빠른 재현 가능한 재빌드**:
+  bootstrap.sh가 fresh instance → ready(확장 빌드 + 데몬 + PG16 preload + wiki_all_1M)를
+  ~10분에 완료한다 (setup ~80s, dataset ~75s, build ~2-3분, verify ~30s).
+- **개발·회귀** — stoppable 사양(crusoe A100 등)을 쓰면 세션 간 상태가 보존된다.
+  **미검증**: crusoe 이미지 계열이 bootstrap.sh의 전제(`shadeform` 유저 + systemd)와 맞는지
+  아직 확인하지 않았다 — Brev 팀 표현("/home/ubuntu/workspace")으로 보아 유저가 `ubuntu`일
+  가능성이 높고, 그러면 `USER_HOME` 조정이 필요하다.
+
+어느 트랙이든 VM 위의 것은 source of truth가 아니다. 소스는 `main` 브랜치에, 측정 CSV는
+`bench/results/`에 커밋한다.
 
 ## 부트스트랩 위치
 
@@ -130,5 +153,8 @@ Brev에는 디스크 레스큐 개념이 없다 — 망가지면 `brev delete` �
 
 ## 비용 원칙
 
-세션 종료 시 반드시 `brev delete` (stop이 없으므로 delete만이 과금 중지).
-다음 세션 시작 비용은 ~10분 재빌드다. 레거시 GCP 인스턴스는 `make vm-stop`.
+stop 안 되는 사양(shadeform 계열 — 벤치 canonical 포함)은 세션 종료 시 반드시
+`brev delete`. delete만이 과금 중지이고, 다음 세션 시작 비용은 ~10분 재빌드다.
+stoppable 사양(crusoe·gcp)은 `brev stop`으로 과금을 멈추면서 상태를 보존할 수 있다 —
+사양별 지원 여부는 `brev search gpu --stoppable`로 확인한다.
+레거시 GCP 인스턴스는 `make vm-stop`.

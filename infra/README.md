@@ -13,9 +13,13 @@ pg_cuvs development has run on three GPU providers. **Brev is the main provider 
 | **GCP** (A100 via Terraform) | available | [`gcp/`](gcp/) — `terraform apply` provisions the instance and runs `scripts/install_gpu_env.sh` as the startup script. |
 | **RunPod** | historical | Used earlier; no committed provisioning (pods were created ad hoc via `runpodctl`). Superseded by Brev. |
 
-Brev cannot `stop` and has no persistent volume, so "restart" means a fast rebuild from
-the bootstrap — see [`brev/README.md`](brev/README.md). Operational lifecycle
-notes (and how the GCP stop/start model differs) are in
+Whether an instance can `stop` is a property of the **instance type**, not of Brev:
+`brev search gpu --stoppable` (or the `S` flag in the FEATURES column) lists the ones that
+can. The Shadeform-backed types we pin for benchmarks — `massedcompute_A100_sxm4_80G` and
+friends — cannot, so for them "restart" means a fast rebuild from the bootstrap; see
+[`brev/README.md`](brev/README.md). Crusoe (`a100-80gb.1x`, `a100-80gb.2x`) and GCP A2
+types can stop, and preserve `/home/ubuntu/workspace` across stop/start. Operational
+lifecycle notes (and how the GCP stop/start model differs) are in
 [`docs/playbooks/gpu-vm-lifecycle.md`](../docs/playbooks/gpu-vm-lifecycle.md).
 
 ## Layout
