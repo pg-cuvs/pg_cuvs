@@ -40,14 +40,17 @@ set -exo pipefail
 export DEBIAN_FRONTEND=noninteractive
 
 # The image's SSH user, read rather than assumed: `shadeform` on Shadeform-brokered
-# instances, `ubuntu` on Crusoe/GCP. SUDO_USER first so `sudo bash bootstrap.sh`
-# still resolves to the human, not root. Everything downstream — home, repo, the
-# PostgreSQL role and database — is named from this.
+# instances, `ubuntu` on Crusoe/GCP. Everything downstream — home, repo, the
+# PostgreSQL role and database — is named from this. SUDO_USER comes first so the
+# naming still resolves to the human under `sudo bash bootstrap.sh`, but that is
+# damage control, not a supported path: run this as the SSH user. Under sudo the
+# systemd unit takes `User=$(id -un)`=root and the repo lands root-owned, which
+# breaks `make gpu-*` afterwards.
 BOOT_USER="${SUDO_USER:-$(id -un)}"
 USER_HOME="$(getent passwd "$BOOT_USER" | cut -d: -f6)"
 : "${USER_HOME:?cannot resolve a home directory for user $BOOT_USER}"
 REPO="$USER_HOME/pg_cuvs"
-# /tmp, matching what the regression suite hardcodes: 36 test/sql files do
+# /tmp, matching what the regression suite hardcodes: 38 test/sql files do
 # `SET cuvs.index_dir = '/tmp/cuvs_indexes'`. Pointing the daemon elsewhere means
 # the suite cannot pass straight off a fresh bootstrap — it needs a manual daemon
 # restart first, so this default stays.

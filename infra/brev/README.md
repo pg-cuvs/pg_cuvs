@@ -26,8 +26,8 @@ PG16 preloaded + wiki_all_1M dataset) in ~10 minutes, with every gotcha from the
 ```bash
 brev start <name>            # or create a new massedcompute A100 in the console
 brev refresh                 # writes ~/.brev/ssh_config so `ssh <name>` works
-scp infra/brev/bootstrap.sh <name>:/home/shadeform/
-ssh <name> 'bash /home/shadeform/bootstrap.sh 2>&1 | tee bootstrap.log'
+scp infra/brev/bootstrap.sh <name>:            # lands in the SSH user's home
+ssh <name> 'bash ~/bootstrap.sh 2>&1 | tee ~/bootstrap.log'
 ```
 
 Wall clock: setup ~80s, dataset ~75s, build ~2–3 min, verify ~30s.
@@ -55,10 +55,14 @@ in `activating` for minutes is normal, not a hang. `ExecStartPost` polls for the
 socket and widens it to 0666; the daemon creates it 0660, which the `postgres` OS
 user cannot open, and doing that chmod by hand is the step that gets forgotten.
 
-Indexes live in `/tmp/cuvs_indexes`, matching what the 35 regression SQL files
+Indexes live in `/tmp/cuvs_indexes`, matching what 38 of the regression SQL files
 hardcode — the suite passes straight off a fresh bootstrap with no manual daemon
-restart. `/tmp` being volatile is fine here since nothing on the VM is a source
-of truth; on a long-lived host, watch for `systemd-tmpfiles` reaping it.
+restart. On a type that cannot stop, that volatility costs nothing: nothing on the VM is
+a source of truth. On a stoppable type it does cost something — `/tmp` is the one thing
+`brev stop`/`start` wipes, so index artifacts vanish while PostgreSQL's catalog still
+lists the index, and queries fall back to a seq scan without erroring. Rebuild with
+REINDEX or give the index its own persistent `index_dir`; see the `IDX` comment in
+`bootstrap.sh`. On a long-lived host, also watch for `systemd-tmpfiles` reaping it.
 
 ## What survives a delete (and what doesn't)
 
