@@ -6,9 +6,16 @@ Shadeform-backed A100 — including `massedcompute_A100_sxm4_80G`, the type our 
 numbers are pinned to — has no `S`: no `brev stop`, no persistent volume, no
 snapshot/image. There, `brev delete` is the only way to stop paying, and it loses
 everything. So for the benchmark track the plan is not to preserve the VM — it is to
-rebuild it fast. (Development work can instead use a stoppable type such as Crusoe
-`a100-80gb.1x`, where `/home/ubuntu/workspace` survives stop/start; that path is not yet
-validated against this bootstrap, which assumes the `shadeform` user.)
+rebuild it fast.
+
+Development work can instead use a stoppable type. Verified on Crusoe `a100-80gb.1x`
+(2026-08-14): `brev stop` takes ~1 min, `start` ~38 s, and **the whole root disk
+survives** — `/opt` (conda), `/home` (sources, datasets), `/ephemeral`. Only `/tmp` is
+wiped, which matters because the daemon keeps index artifacts there by default; see the
+`IDX` comment in `bootstrap.sh` for what that costs and how to opt an index out. The
+image runs as `ubuntu` rather than `shadeform`, which this bootstrap handles by reading
+the SSH user at runtime. Note the type is A100 80GB **PCIe**, not SXM4 — fine for
+development, not for benchmark numbers.
 
 `bootstrap.sh` does that: a fresh instance → ready (built extension + daemon +
 PG16 preloaded + wiki_all_1M dataset) in ~10 minutes, with every gotcha from the
@@ -93,9 +100,15 @@ These cost the most time on 2026-07-23; each is now a one-liner in `bootstrap.sh
 
 ## If the provider/user differs
 
-The script targets a shadeform-family image (`shadeform` user, systemd) — both
-massedcompute and paperspace qualify. On a container without systemd (e.g.
-RunPod, user `root`): change `USER_HOME`, swap `systemctl restart
-postgresql@16-main` for `pg_ctlcluster 16 main restart`, and replace the
-`pg-cuvs-server` unit with a supervised launch of your own — the daemon is a unit
+**The SSH user needs no edit.** The script reads it at runtime
+(`BOOT_USER="${SUDO_USER:-$(id -un)}"`) and derives the home directory, repo path, and
+the PostgreSQL role and database from it. That covers `shadeform` (massedcompute,
+paperspace) and `ubuntu` (Crusoe, GCP) with the same file. The role/database naming is
+the part that bites if you ever hardcode it again: `psql` with no `-U`/`-d` uses the OS
+username for both, so a box whose role is named for a different user looks healthy while
+every `psql` call dies with `FATAL: role "<user>" does not exist`.
+
+What still needs editing is a container without systemd (e.g. RunPod, user `root`): swap
+`systemctl restart postgresql@16-main` for `pg_ctlcluster 16 main restart`, and replace
+the `pg-cuvs-server` unit with a supervised launch of your own — the daemon is a unit
 now, so there is no nohup fallback left in the script to fall back to.

@@ -3,24 +3,34 @@
 # pg_cuvs GPU dev/bench VM — zero-to-ready bootstrap.
 #
 # WHY THIS EXISTS
-#   Brev A100 (massedcompute_A100_sxm4_80G) does NOT support `stop`, and the
-#   instance has no persistent volume — deleting it loses everything, and there
-#   is no snapshot/image feature in Brev. So "fast restart" = fast, reproducible
-#   REBUILD. Every gotcha debugged in the 2026-07-23 session is baked in below
-#   as a one-liner + comment, so a fresh instance goes to ready without redoing
-#   the debugging (that was the slow part, not the downloads/compiles).
+#   The benchmark-canonical type, `massedcompute_A100_sxm4_80G`, does NOT support
+#   `stop` — no Shadeform-brokered type does (`brev search gpu --stoppable`, or the
+#   `S` flag in the FEATURES column, tells you which do). There is no persistent
+#   volume and no snapshot, so `brev delete` is the only way to stop paying and it
+#   loses everything. For that track "fast restart" = fast, reproducible REBUILD.
+#   Every gotcha debugged in the 2026-07-23 session is baked in below as a
+#   one-liner + comment, so a fresh instance goes to ready without redoing the
+#   debugging (that was the slow part, not the downloads/compiles).
+#
+#   On a stoppable type (Crusoe, GCP) you run this once and then `brev stop` /
+#   `brev start` instead — the root disk, including /opt and the home directory,
+#   survives. See the IDX comment below for the one thing that does not.
 #
 # USAGE (from the Mac, once a fresh instance is up and `ssh <name>` works):
-#   scp bootstrap.sh <name>:/home/shadeform/
-#   ssh <name> 'bash /home/shadeform/bootstrap.sh 2>&1 | tee /home/shadeform/bootstrap.log'
+#   scp bootstrap.sh <name>:                     # lands in the SSH user's home
+#   ssh <name> 'bash ~/bootstrap.sh 2>&1 | tee ~/bootstrap.log'
 #   # ~10 min wall clock: setup ~80s, data ~75s (parallel), build ~2-3m, verify ~30s.
 #
-# ASSUMPTIONS (Brev / Massed Compute image, 2026-07):
-#   - Ubuntu 22.04, user `shadeform`, passwordless sudo, systemd present.
+# ASSUMPTIONS (Brev images, 2026-08):
+#   - Ubuntu 22.04, passwordless sudo, systemd present.
 #   - A100 with a working NVIDIA driver (nvidia-smi works out of the box).
 #   - Public repo pg-cuvs/pg_cuvs reachable (no auth needed for clone).
-# If the SSH user differs (RunPod uses root, no systemd), change USER/HOME and
-# swap `systemctl` for `pg_ctlcluster` — see the notes at each such line.
+# The SSH user is NOT assumed: it is read at runtime (see BOOT_USER below), so the
+# same script runs on a Shadeform-brokered image (user `shadeform`) and on a direct
+# provider image such as Crusoe (user `ubuntu`). Verified on both users' layouts;
+# the Crusoe run is the one exercised end-to-end (2026-08-14).
+# A user without systemd (RunPod runs as root) still needs `systemctl` swapped for
+# `pg_ctlcluster` — see the notes at each such line.
 # `-e` is load-bearing: without it a failed apt install walked all the way to
 # "=== BOOTSTRAP DONE ===" and exit 0 with no PostgreSQL on the box at all
 # (2026-07-28). Every line below that is *allowed* to fail carries an explicit
@@ -29,15 +39,32 @@
 set -exo pipefail
 export DEBIAN_FRONTEND=noninteractive
 
-USER_HOME=/home/shadeform
+# The image's SSH user, read rather than assumed: `shadeform` on Shadeform-brokered
+# instances, `ubuntu` on Crusoe/GCP. SUDO_USER first so `sudo bash bootstrap.sh`
+# still resolves to the human, not root. Everything downstream — home, repo, the
+# PostgreSQL role and database — is named from this.
+BOOT_USER="${SUDO_USER:-$(id -un)}"
+USER_HOME="$(getent passwd "$BOOT_USER" | cut -d: -f6)"
+: "${USER_HOME:?cannot resolve a home directory for user $BOOT_USER}"
 REPO="$USER_HOME/pg_cuvs"
-# /tmp, matching what the regression suite hardcodes: 35 test/sql files do
-# `SET cuvs.index_dir = '/tmp/cuvs_indexes'`. Pointing the daemon elsewhere used
-# to mean the suite could not pass straight off a fresh bootstrap — it needed a
-# manual daemon restart first. Volatility is fine here: a Brev VM is disposable
-# (restart == rebuild), and nothing on it is a source of truth. On a long-lived
-# host, note that systemd-tmpfiles can reap /tmp — the symptom is indexes
-# silently vanishing; production deployments should use the path in
+# /tmp, matching what the regression suite hardcodes: 36 test/sql files do
+# `SET cuvs.index_dir = '/tmp/cuvs_indexes'`. Pointing the daemon elsewhere means
+# the suite cannot pass straight off a fresh bootstrap — it needs a manual daemon
+# restart first, so this default stays.
+#
+# What that costs depends on the instance type. On a type that cannot stop
+# (every Shadeform-brokered one, including the benchmark-canonical
+# `massedcompute_A100_sxm4_80G`) the VM is disposable — restart means rebuild —
+# so /tmp volatility costs nothing. On a stoppable type (Crusoe, GCP) the root
+# disk survives `brev stop`/`start` but **/tmp does not**: PostgreSQL's catalog
+# comes back with the index still registered while its GPU artifacts are gone,
+# and the planner's `no_artifact` gate then routes the query to a seq scan —
+# correct answers, no GPU, no error. Rebuild with REINDEX, or keep an index
+# across stop/start by giving it its own persistent directory:
+#   CREATE INDEX ... USING cagra (...) WITH (index_dir='/home/<user>/cuvs_indexes')
+# That directory must be readable by both the daemon uid and the postgres
+# backend uid (a 0700 home defeats it). systemd-tmpfiles can also reap /tmp on a
+# long-lived host; production deployments should use the path in
 # docs/best-practices.md instead.
 IDX=/tmp/cuvs_indexes
 CONDA=/opt/miniforge3
@@ -84,10 +111,14 @@ test -x /usr/lib/postgresql/16/bin/pg_config \
 # systemd path; on a container (RunPod) use: sudo pg_ctlcluster 16 main start
 sudo systemctl enable --now postgresql@16-main 2>/dev/null || sudo pg_ctlcluster 16 main start || true
 sleep 2
-sudo -u postgres psql -tAc "SELECT 1 FROM pg_roles WHERE rolname='shadeform'" | grep -q 1 \
-  || sudo -u postgres psql -c "CREATE ROLE shadeform SUPERUSER LOGIN"
-sudo -u postgres psql -tAc "SELECT 1 FROM pg_database WHERE datname='shadeform'" | grep -q 1 \
-  || sudo -u postgres createdb -O shadeform shadeform
+# Role and database are named after the SSH user, because psql with no -U/-d uses
+# the OS username for both. Get this wrong and the box looks fine while every
+# psql invocation dies with `FATAL: role "<user>" does not exist` (2026-08-14: a
+# patch that renamed the home but not these left exactly that state).
+sudo -u postgres psql -tAc "SELECT 1 FROM pg_roles WHERE rolname='$BOOT_USER'" | grep -q 1 \
+  || sudo -u postgres psql -c "CREATE ROLE \"$BOOT_USER\" SUPERUSER LOGIN"
+sudo -u postgres psql -tAc "SELECT 1 FROM pg_database WHERE datname='$BOOT_USER'" | grep -q 1 \
+  || sudo -u postgres createdb -O "$BOOT_USER" "$BOOT_USER"
 
 echo "=== [2/5] miniforge + cuvs_dev (build) + cuvs_bench (python) ==========="
 # In /opt, NOT ~ : the `postgres` OS user must be able to read libcuvs.so, and a
@@ -338,4 +369,4 @@ echo "  build env file  : $ENV_FILE  (\`. $ENV_FILE\` — what this build used; 
 echo "  dataset         : $D/{corpus.fbin,queries_10k.fbin,gt_1000000.npy}"
 echo "  bench:  export PGHOST=/var/run/postgresql PATH=$BENCH/bin:/usr/lib/postgresql/16/bin:\$PATH LD_LIBRARY_PATH=$DEV/lib"
 echo "          python bench/adr079_3o_recall.py --data-dir $D --n 1000000 --queries 100 --k 10 \\"
-echo "                 --dbname shadeform --index-dir $IDX --selectivities 0.05,0.01,0.001,0.0002 --reuse-table --out /tmp/x.csv"
+echo "                 --dbname $BOOT_USER --index-dir $IDX --selectivities 0.05,0.01,0.001,0.0002 --reuse-table --out /tmp/x.csv"

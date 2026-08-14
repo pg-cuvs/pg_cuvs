@@ -42,19 +42,39 @@ brev search gpu --stoppable         # stop 되는 사양만
 | gcp | **가능** (`SP`) | `a2-ultragpu-1g:nvidia-a100-80gb:1` $6.03/hr |
 | lambda-labs | reboot만 (`R`) | `gpu_1x_a100_sxm4` |
 
-stop 되는 사양에서는 `/home/ubuntu/workspace`가 stop/start 간 보존된다 (Brev 팀 회신,
-2026-08-07). stop 안 되는 사양에서는 **과금을 멈추는 유일한 방법이 `brev delete`**이고,
-그러면 인스턴스의 모든 것이 사라진다.
+Brev 팀은 stop 되는 사양에서 `/home/ubuntu/workspace`가 보존된다고 회신했는데(2026-08-07),
+**실측해보니 그보다 넓다 — 루트 디스크 전체가 보존된다**(아래 검증표). stop 안 되는 사양에서는
+**과금을 멈추는 유일한 방법이 `brev delete`**이고, 그러면 인스턴스의 모든 것이 사라진다.
 
 **따라서 트랙을 나눈다:**
 - **벤치마크** — `massedcompute_A100_sxm4_80G` 고정(절대값 비교 가능성). stop이 없지만 이
   트랙은 ephemeral이 오히려 정합하다(깨끗한 상태 재현). 전략은 **빠른 재현 가능한 재빌드**:
   bootstrap.sh가 fresh instance → ready(확장 빌드 + 데몬 + PG16 preload + wiki_all_1M)를
   ~10분에 완료한다 (setup ~80s, dataset ~75s, build ~2-3분, verify ~30s).
-- **개발·회귀** — stoppable 사양(crusoe A100 등)을 쓰면 세션 간 상태가 보존된다.
-  **미검증**: crusoe 이미지 계열이 bootstrap.sh의 전제(`shadeform` 유저 + systemd)와 맞는지
-  아직 확인하지 않았다 — Brev 팀 표현("/home/ubuntu/workspace")으로 보아 유저가 `ubuntu`일
-  가능성이 높고, 그러면 `USER_HOME` 조정이 필요하다.
+- **개발·회귀** — stoppable 사양을 쓰면 부트스트랩 1회 후 stop/start만으로 세션이 이어진다.
+
+### crusoe 실측 (2026-08-14, `a100-80gb.1x`)
+
+| 항목 | 값 |
+|------|-----|
+| SSH 유저 / 홈 | **`ubuntu`** (shadeform 아님) — bootstrap이 런타임에 감지하므로 수정 불요 |
+| OS / systemd | Ubuntu 22.04.5 / systemd 249, passwordless sudo |
+| GPU | **A100 80GB PCIe** — SXM4가 아니다. **벤치 수치를 여기서 뽑지 말 것** |
+| 디스크 | 124GB (여유 108GB) — massedcompute의 625GB보다 훨씬 작다 |
+| stop / start | ~1분 / ~38초 |
+| **보존되는 것** | 루트 디스크 전체 — `/opt`(conda), `/home`(데이터셋·소스), `/ephemeral` |
+| **소실되는 것** | **`/tmp`만** |
+
+**`/tmp` 소실이 의미하는 것 (개발 박스 운용의 핵심 주의):**
+- 데몬 소켓(`/tmp/.s.pg_cuvs`)은 systemd가 재기동하며 다시 만들므로 무해하다.
+- **인덱스 아티팩트(`/tmp/cuvs_indexes/*.cagra/.tids/.vectors`)는 사라진다.** PG 카탈로그는
+  영속 디스크에 있어 인덱스가 그대로 등록돼 있으므로, 아티팩트만 없는 불일치가 된다 →
+  costestimate의 `no_artifact` 게이트가 걸려 **조용히 seqscan으로 폴백**한다(답은 맞고 GPU는
+  안 쓴다). REINDEX로 재빌드하거나, 살아남아야 하는 인덱스는 전용 디렉터리를 준다:
+  `CREATE INDEX ... USING cagra (...) WITH (index_dir='$HOME/cuvs_indexes')`
+- 데몬 `--index-dir` 기본값은 **`/tmp` 그대로 두어야 한다** — test/sql 36개 파일이
+  `/tmp/cuvs_indexes`를 하드코딩해서, 바꾸면 fresh bootstrap에서 installcheck가 바로 안 돈다.
+- 전용 디렉터리는 데몬 uid와 postgres 백엔드 uid 양쪽이 접근 가능해야 한다(홈이 0700이면 불가).
 
 어느 트랙이든 VM 위의 것은 source of truth가 아니다. 소스는 `main` 브랜치에, 측정 CSV는
 `bench/results/`에 커밋한다.
