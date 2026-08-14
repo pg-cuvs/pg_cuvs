@@ -42,19 +42,40 @@ brev search gpu --stoppable         # stop 되는 사양만
 | gcp | **가능** (`SP`) | `a2-ultragpu-1g:nvidia-a100-80gb:1` $6.03/hr |
 | lambda-labs | reboot만 (`R`) | `gpu_1x_a100_sxm4` |
 
-stop 되는 사양에서는 `/home/ubuntu/workspace`가 stop/start 간 보존된다 (Brev 팀 회신,
-2026-08-07). stop 안 되는 사양에서는 **과금을 멈추는 유일한 방법이 `brev delete`**이고,
-그러면 인스턴스의 모든 것이 사라진다.
+Brev 팀은 stop 되는 사양에서 `/home/ubuntu/workspace`가 보존된다고 회신했는데(2026-08-07),
+**실측해보니 그보다 넓다 — 루트 디스크 전체가 보존된다**(아래 검증표). stop 안 되는 사양에서는
+**과금을 멈추는 유일한 방법이 `brev delete`**이고, 그러면 인스턴스의 모든 것이 사라진다.
 
 **따라서 트랙을 나눈다:**
 - **벤치마크** — `massedcompute_A100_sxm4_80G` 고정(절대값 비교 가능성). stop이 없지만 이
   트랙은 ephemeral이 오히려 정합하다(깨끗한 상태 재현). 전략은 **빠른 재현 가능한 재빌드**:
   bootstrap.sh가 fresh instance → ready(확장 빌드 + 데몬 + PG16 preload + wiki_all_1M)를
   ~10분에 완료한다 (setup ~80s, dataset ~75s, build ~2-3분, verify ~30s).
-- **개발·회귀** — stoppable 사양(crusoe A100 등)을 쓰면 세션 간 상태가 보존된다.
-  **미검증**: crusoe 이미지 계열이 bootstrap.sh의 전제(`shadeform` 유저 + systemd)와 맞는지
-  아직 확인하지 않았다 — Brev 팀 표현("/home/ubuntu/workspace")으로 보아 유저가 `ubuntu`일
-  가능성이 높고, 그러면 `USER_HOME` 조정이 필요하다.
+- **개발·회귀** — stoppable 사양을 쓰면 부트스트랩 1회 후 stop/start만으로 세션이 이어진다.
+
+### crusoe 실측 (2026-08-14, `a100-80gb.1x`)
+
+| 항목 | 값 |
+|------|-----|
+| SSH 유저 / 홈 | **`ubuntu`** (shadeform 아님) — bootstrap이 런타임에 감지하므로 수정 불요 |
+| OS / systemd | Ubuntu 22.04.5 / systemd 249, passwordless sudo |
+| GPU | **A100 80GB PCIe** — SXM4가 아니다. **벤치 수치를 여기서 뽑지 말 것** |
+| 디스크 | 124GB (여유 108GB) — massedcompute의 625GB보다 훨씬 작다 |
+| stop / start | ~1분 / ~38초 |
+| **보존되는 것** | 루트 디스크 전체 — `/opt`(conda), `/home`(데이터셋·소스), `/ephemeral` |
+| **소실되는 것** | **`/tmp`만** |
+
+**`/tmp` 소실이 의미하는 것 (개발 박스 운용의 핵심 주의):**
+- 데몬 소켓(`/tmp/.s.pg_cuvs`)은 systemd가 재기동하며 다시 만들므로 무해하다.
+- **인덱스 아티팩트(`/tmp/cuvs_indexes/*.cagra/.tids/.vectors`)는 사라진다.** PG 카탈로그는
+  영속 디스크에 있어 인덱스가 그대로 등록돼 있으므로, 아티팩트만 없는 불일치가 된다 →
+  costestimate의 `no_artifact` 게이트가 걸려 **조용히 seqscan으로 폴백**한다(답은 맞고 GPU는
+  안 쓴다). REINDEX로 재빌드하거나, 살아남아야 하는 인덱스는 전용 디렉터리를 준다:
+  `CREATE INDEX ... USING cagra (...) WITH (index_dir='/home/<user>/cuvs_indexes')`
+  (SQL 리터럴 안에서 `$HOME`은 확장되지 않는다 — 실제 경로를 적을 것)
+- 데몬 `--index-dir` 기본값은 **`/tmp` 그대로 두어야 한다** — test/sql 38개 파일이
+  `/tmp/cuvs_indexes`를 하드코딩해서, 바꾸면 fresh bootstrap에서 installcheck가 바로 안 돈다.
+- 전용 디렉터리는 데몬 uid와 postgres 백엔드 uid 양쪽이 접근 가능해야 한다(홈이 0700이면 불가).
 
 어느 트랙이든 VM 위의 것은 source of truth가 아니다. 소스는 `main` 브랜치에, 측정 CSV는
 `bench/results/`에 커밋한다.
@@ -84,8 +105,9 @@ infra/brev/
 개발용으로 다른 인스턴스를 쓸 때 확인할 것:
 
 1. **`CUDA_ARCH`를 GPU에 맞춘다** — A100=sm_80, L4=sm_89, H100=sm_90 (`gpu.conf`).
-2. **이미지 계열** — 부트스트랩은 `shadeform` 유저 + systemd를 전제한다. 다른 계열
-   (RunPod: root, systemd 없음)이면 `USER_HOME`과 `systemctl`→`pg_ctlcluster` 교체 필요.
+2. **이미지 계열** — SSH 유저는 부트스트랩이 런타임에 감지하므로(shadeform·ubuntu 모두)
+   손댈 것이 없다. 남는 전제는 **systemd**뿐 — 없는 계열(RunPod: root, systemd 없음)이면
+   `systemctl`→`pg_ctlcluster` 교체와 데몬 유닛 대체가 필요하다.
 3. **`routing_golden_measured`는 이식 불가** — 테스트 헤더가 직접 밝히듯 실측 계수로
    cagra-vs-seqscan 교차점을 판정하므로 GPU 모델이 바뀌면 재기준선이 필요할 수 있다.
    A100 계열끼리는 통과 확인됨(massedcompute ↔ paperspace, 2026-07-29).
@@ -107,17 +129,18 @@ brev start <name>                                        # 기존 인스턴스 �
 brev refresh                 # ~/.brev/ssh_config 갱신 → `ssh <name>` 가능해짐
 
 # 2. 부트스트랩 전송 + 실행 (~10분)
-scp infra/brev/bootstrap.sh <name>:/home/shadeform/
-ssh <name> 'bash /home/shadeform/bootstrap.sh 2>&1 | tee bootstrap.log'
+scp infra/brev/bootstrap.sh <name>:      # SSH 유저 홈으로 — 유저명 몰라도 됨
+ssh <name> 'bash ~/bootstrap.sh 2>&1 | tee ~/bootstrap.log'
 
 # 3. 완료 후 로컬 gpu.conf의 호스트를 새 인스턴스로 갱신 → pg-cuvs-dev 스킬로 전환
 ```
 
-환경 상수 (shadeform 계열 이미지 — massedcompute·paperspace 모두 동일, 2026-07 기준):
-Ubuntu 22.04, 유저 `shadeform`(passwordless sudo, systemd 있음), conda는
-`/opt/miniforge3`(`cuvs_dev` 빌드 env + `cuvs_bench` python env 분리), A100이면
-CUDA_ARCH=sm_80. 부트스트랩은 이 상수들에 의존하므로, 이미지 계열이 다르면
-위 "이미지 계열" 항목대로 수정이 필요하다.
+환경 상수: Ubuntu 22.04 + passwordless sudo + systemd, conda는 `/opt/miniforge3`
+(`cuvs_dev` 빌드 env + `cuvs_bench` python env 분리), A100이면 CUDA_ARCH=sm_80.
+**유저는 상수가 아니다** — shadeform 계열은 `shadeform`, crusoe·gcp는 `ubuntu`이고
+부트스트랩이 런타임에 감지해 홈·repo·**PG role/db**를 파생시킨다. 그래서 PG 접속 기본값도
+박스마다 다르다: crusoe 박스에서 기존 스크립트를 돌릴 땐 `PGDATABASE=ubuntu`가 필요할 수
+있다(`infra/scripts/gpu-preflight.sh` 등 일부가 `shadeform`을 기본값으로 둔다).
 
 ## 빌드 함정 (bootstrap.sh에 이미 박혀 있음)
 
@@ -134,8 +157,9 @@ CUDA_ARCH=sm_80. 부트스트랩은 이 상수들에 의존하므로, 이미지 
    ldconfig에 등록 금지** (sshd의 OpenSSL이 깨져 VM 접근 불가) —
    `libstdc++.so.6`/`libgcc_s.so.1`만 `/usr/local/lib`에 심볼릭 링크
 
-프로바이더가 다르면(예: RunPod — root 유저, systemd 없음): USER_HOME 변경,
-`systemctl` → `pg_ctlcluster 16 main restart`로 교체.
+프로바이더가 다르면(예: RunPod — root 유저, systemd 없음): 유저·홈은 부트스트랩이
+런타임에 감지하므로 그대로 두고, `systemctl` → `pg_ctlcluster 16 main restart` 교체와
+데몬 유닛 대체만 하면 된다.
 
 ## 레거시: GCP Terraform 경로
 
