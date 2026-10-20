@@ -851,7 +851,10 @@ cuvs_batch_group(const CuvsBatchKey *keys, int n,
                 keys[j].index_oid == keys[i].index_oid &&
                 keys[j].precision == keys[i].precision &&
                 keys[j].dim       == keys[i].dim &&
-                keys[j].mode      == keys[i].mode)
+                keys[j].mode      == keys[i].mode &&
+                (keys[i].mode != 0 ||
+                 (keys[j].itopk_size == keys[i].itopk_size &&
+                  keys[j].search_width == keys[i].search_width)))
             {
                 g = group_id_out[j];
                 break;

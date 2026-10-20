@@ -304,16 +304,23 @@ cuvs_bf_search_filtered(CuvsBfIndex index, const float *query_vec, int dim,
 
 int
 cuvs_cagra_search(CuvsCagraIndex index, const float *query_vec, int dim,
-                  int top_k, CuvsSearchResult *results, int device_id)
-{ return cuvs_bf_search((CuvsBfIndex)index, query_vec, dim, top_k, results, device_id); }
+                  int top_k, CuvsSearchResult *results, int device_id,
+                  uint32_t itopk_size, uint32_t search_width)
+{
+    (void)itopk_size; (void)search_width;
+    return cuvs_bf_search((CuvsBfIndex)index, query_vec, dim, top_k, results, device_id);
+}
 
 int
 cuvs_cagra_search_filtered(CuvsCagraIndex index, const float *query_vec, int dim,
                            int top_k, const uint32_t *bitset_words,
                            int64_t bitset_bits, CuvsSearchResult *results,
-                           int device_id)
-{ return cuvs_bf_search_filtered((CuvsBfIndex)index, query_vec, dim, top_k,
-                                 bitset_words, bitset_bits, results, device_id); }
+                           int device_id, uint32_t itopk_size, uint32_t search_width)
+{
+    (void)itopk_size; (void)search_width;
+    return cuvs_bf_search_filtered((CuvsBfIndex)index, query_vec, dim, top_k,
+                                  bitset_words, bitset_bits, results, device_id);
+}
 
 static int
 shim_search_batch(ShimIndex *ix, const float *queries, int n_queries, int dim,
@@ -329,8 +336,12 @@ shim_search_batch(ShimIndex *ix, const float *queries, int n_queries, int dim,
 
 int cuvs_cagra_search_batch(CuvsCagraIndex index, const float *queries,
                             int n_queries, int dim, int top_k,
-                            CuvsSearchResult *results, int device_id)
-{ (void)device_id; return shim_search_batch((ShimIndex *)index, queries, n_queries, dim, top_k, results); }
+                            CuvsSearchResult *results, int device_id,
+                            uint32_t itopk_size, uint32_t search_width)
+{
+    (void)device_id; (void)itopk_size; (void)search_width;
+    return shim_search_batch((ShimIndex *)index, queries, n_queries, dim, top_k, results);
+}
 
 int cuvs_bf_search_batch(CuvsBfIndex index, const float *queries, int n_queries,
                          int dim, int top_k, CuvsSearchResult *results, int device_id)

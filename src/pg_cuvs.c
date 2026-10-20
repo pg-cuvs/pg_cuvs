@@ -111,6 +111,8 @@ char *cuvs_index_dir              = NULL;
 int   cuvs_daemon_uid             = -1;    /* #119: expected owner uid of cuvs.socket_path; -1 = no check */
 int   cuvs_circuit_breaker_threshold = 3;
 int   cuvs_k                      = 100;   /* GPU top-k (pgvector ef_search analog) */
+static int cuvs_itopk_size        = 0;     /* CAGRA intermediate buffer floor; 0=legacy */
+static int cuvs_search_width      = 0;     /* 0=SDK default */
 int   cuvs_max_build_mem_mb       = 0;     /* 0 = auto (MemAvailable * safety_ratio); >0 = hard cap MB */
 double cuvs_build_mem_safety_ratio = 0.5;  /* auto-limit fraction of MemAvailable */
 double cuvs_max_stale_fraction     = 0.10; /* deleted-since-build fraction that reroutes to CPU */
@@ -732,6 +734,33 @@ cuvs_daemon_uid_assign(int newval, void *extra)
     cuvs_ipc_set_daemon_uid(newval);
 }
 
+static bool
+cuvs_itopk_size_check(int *newval, void **extra, GucSource source)
+{
+    (void) extra;
+    (void) source;
+    if (*newval % 32 != 0)
+    {
+        GUC_check_errdetail("cuvs.itopk_size must be 0 or a multiple of 32.");
+        return false;
+    }
+    return true;
+}
+
+static void
+cuvs_itopk_size_assign(int newval, void *extra)
+{
+    (void) extra;
+    cuvs_ipc_set_cagra_search_params((uint32_t) newval, (uint32_t) cuvs_search_width);
+}
+
+static void
+cuvs_search_width_assign(int newval, void *extra)
+{
+    (void) extra;
+    cuvs_ipc_set_cagra_search_params((uint32_t) cuvs_itopk_size, (uint32_t) newval);
+}
+
 void
 _PG_init(void)
 {
@@ -827,6 +856,27 @@ _PG_init(void)
         100, 1, 2000,
         PGC_USERSET,
         0, NULL, NULL, NULL);
+
+    DefineCustomIntVariable(
+        "cuvs.itopk_size",
+        "CAGRA intermediate search buffer size (0 = legacy auto).",
+        "0 derives the size from the actual top-k, rounded up to 32 with a minimum "
+        "of 64. An explicit multiple of 32 is raised if necessary to cover top-k, "
+        "including shard and tombstone overfetch. Does not change returned k.",
+        &cuvs_itopk_size,
+        0, 0, INT_MAX - 31,
+        PGC_USERSET,
+        0, cuvs_itopk_size_check, cuvs_itopk_size_assign, NULL);
+
+    DefineCustomIntVariable(
+        "cuvs.search_width",
+        "CAGRA search width (0 = SDK default).",
+        "Number of graph vertices expanded per search iteration. Applies to "
+        "single, filtered, sharded and batched CAGRA searches; ignored by exact BF.",
+        &cuvs_search_width,
+        0, 0, INT_MAX,
+        PGC_USERSET,
+        0, NULL, cuvs_search_width_assign, NULL);
 
     DefineCustomIntVariable(
         "cuvs.max_build_mem_mb",

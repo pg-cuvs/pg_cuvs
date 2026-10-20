@@ -525,6 +525,37 @@ test_vectors_rejections(void)
     }
 }
 
+/* ---- CAGRA tuning: legacy defaults and the actual dispatch top-k ---- */
+static void
+test_cagra_search_params(void)
+{
+    ASSERT(cuvs_cagra_itopk_size(0, 10) == 64, "auto keeps legacy minimum 64");
+    ASSERT(cuvs_cagra_itopk_size(0, 64) == 64, "auto keeps aligned k");
+    ASSERT(cuvs_cagra_itopk_size(0, 65) == 96, "auto rounds k up to 32");
+    ASSERT(cuvs_cagra_itopk_size(0, 100) == 128, "auto keeps legacy k=100");
+    ASSERT(cuvs_cagra_itopk_size(0, 2000) == 2016, "auto handles maximum GUC k");
+    ASSERT(cuvs_cagra_itopk_size(32, 10) == 32, "explicit tuning can use 32");
+    ASSERT(cuvs_cagra_itopk_size(256, 10) == 256, "explicit tuning widens search");
+    ASSERT(cuvs_cagra_itopk_size(64, 100) == 128,
+           "actual k raises undersized tuning for tombstones or shard overfetch");
+
+    CuvsBatchKey keys[] = {
+        {.db_oid=1, .index_oid=10, .dim=8, .itopk_size=128, .search_width=1},
+        {.db_oid=1, .index_oid=10, .dim=8, .itopk_size=256, .search_width=1},
+        {.db_oid=1, .index_oid=10, .dim=8, .itopk_size=128, .search_width=2},
+        {.db_oid=1, .index_oid=10, .dim=8, .itopk_size=128, .search_width=1},
+        {.db_oid=1, .index_oid=10, .dim=8, .mode=1, .itopk_size=128},
+        {.db_oid=1, .index_oid=10, .dim=8, .mode=1, .itopk_size=256},
+    };
+    int gid[6], ng = -1;
+    cuvs_batch_group(keys, 6, gid, &ng);
+    ASSERT(ng == 4, "CAGRA tuning splits groups, BF ignores CAGRA tuning");
+    ASSERT(gid[0] != gid[1], "different itopk sizes never coalesce");
+    ASSERT(gid[0] != gid[2], "different search widths never coalesce");
+    ASSERT(gid[0] == gid[3], "identical CAGRA tuning coalesces");
+    ASSERT(gid[4] == gid[5], "BF grouping is unchanged");
+}
+
 /* ---- BF micro-batch grouping (Phase 3L-9) ---- */
 static void
 test_bf_batch_group(void)
@@ -1133,6 +1164,7 @@ main(void)
     test_vectors_roundtrip();
     test_vectors_write_multi();
     test_vectors_rejections();
+    test_cagra_search_params();
     test_bf_batch_group();
     test_shards_roundtrip();
     test_shards_rejections();

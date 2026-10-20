@@ -2205,6 +2205,8 @@ typedef struct ShardSearchArg {
     int               sk;          /* per-shard request k (k + overfetch, clamped to n_vecs) */
     uint32_t          gpu_device_id;
     int64_t           tid_offset;  /* snapshot: global TID start of this shard */
+    uint32_t          itopk_size;
+    uint32_t          search_width;
     int64_t           shard_n_vecs;/* snapshot: vectors in this shard */
     CuvsSearchResult *out;         /* caller-allocated [sk]; NULL when sk==0 */
     int               rc;          /* 0 = OK (also for skipped sk==0 shards) */
@@ -2220,7 +2222,7 @@ shard_search_worker(void *p)
                                (int) a->gpu_device_id);
     else
         a->rc = cuvs_cagra_search(a->handle, a->query, a->dim, a->sk, a->out,
-                                  (int) a->gpu_device_id);
+                                  (int) a->gpu_device_id, a->itopk_size, a->search_width);
     return NULL;
 }
 
@@ -3148,7 +3150,8 @@ handle_search(int client_fd, const CuvsCmdFrame *cmd)
                     if (e->handle != NULL) {
                         pret = cuvs_cagra_search_filtered(
                             e->handle, query, (int)cmd->dim, k,
-                            bitset, nv, praw, e->gpu_device_id);
+                            bitset, nv, praw, e->gpu_device_id,
+                            cmd->itopk_size, cmd->search_width);
                         if (pret == 0) {
                             used_cagra = 1;
                             /* #133 / ADR-083: 3O's BITSET-masked CAGRA traversal
@@ -3544,6 +3547,8 @@ handle_search(int client_fd, const CuvsCmdFrame *cmd)
             args[s].dim           = (int) cmd->dim;
             args[s].sk            = sk;
             args[s].gpu_device_id = se->gpu_device_id;
+            args[s].itopk_size    = cmd->itopk_size;
+            args[s].search_width  = cmd->search_width;
             args[s].tid_offset    = se->tid_offset;
             args[s].shard_n_vecs  = se->n_vecs;
             args[s].rc            = 0;       /* skipped (sk==0) shards = OK / no candidates */
@@ -3833,7 +3838,8 @@ handle_search(int client_fd, const CuvsCmdFrame *cmd)
         && cmd->n_filter_tids == 0 && e->handle != NULL)
     {
         CuvsBatchKey     key = { cmd->db_oid, cmd->index_oid, 0 /* n/a */,
-                                 cmd->dim, 0 /* mode: cagra */ };
+                                 cmd->dim, 0 /* mode: cagra */,
+                                 cmd->itopk_size, cmd->search_width };
         CuvsResult      *rout = malloc((size_t) k * sizeof(CuvsResult));
         int              enqueued = 0;
         CuvsBatchRequest req;
@@ -3932,7 +3938,8 @@ handle_search(int client_fd, const CuvsCmdFrame *cmd)
 
     LOG_DEBUG("[handle_search] calling cuvs_cagra_search k=%d dim=%u...\n",
             k, cmd->dim);
-    int ret = cuvs_cagra_search(e->handle, query, (int)cmd->dim, k, raw, e->gpu_device_id);
+    int ret = cuvs_cagra_search(e->handle, query, (int)cmd->dim, k, raw,
+                                e->gpu_device_id, cmd->itopk_size, cmd->search_width);
     LOG_DEBUG("[handle_search] cuvs_cagra_search rc=%d\n", ret);
 
     if (ret != 0)
@@ -4189,7 +4196,8 @@ handle_search_batch(int client_fd, const CuvsCmdFrame *cmd)
         {
             int ret = use_bf
                 ? cuvs_bf_search_batch(e->main_bf_idx, queries, (int) Q, dim, K, raw, delta_gpu_of(e))
-                : cuvs_cagra_search_batch(e->handle, queries, (int) Q, dim, K, raw, e->gpu_device_id);
+                : cuvs_cagra_search_batch(e->handle, queries, (int) Q, dim, K, raw,
+                                           e->gpu_device_id, cmd->itopk_size, cmd->search_width);
             if (ret != 0)
                 ok = 0;
             else
@@ -4228,7 +4236,8 @@ handle_search_batch(int client_fd, const CuvsCmdFrame *cmd)
                     if (sk <= 0) continue;
                     int ret = use_bf
                         ? cuvs_bf_search(sh->bf_idx, query, dim, sk, sraw, sh->gpu_device_id)
-                        : cuvs_cagra_search(sh->handle, query, dim, sk, sraw, sh->gpu_device_id);
+                        : cuvs_cagra_search(sh->handle, query, dim, sk, sraw,
+                                             sh->gpu_device_id, cmd->itopk_size, cmd->search_width);
                     if (ret != 0) { ok = 0; break; }
                     for (int j = 0; j < sk; j++)
                     {
@@ -8147,7 +8156,8 @@ cagra_batch_run_group(CuvsBatchRequest **batch, const int *gid, int n, int g)
     struct timespec t0, t1;
     clock_gettime(CLOCK_MONOTONIC, &t0);
     int ret = cuvs_cagra_search_batch(e->handle, queries, Q, dim, maxk, raw,
-                                      e->gpu_device_id);
+                                      e->gpu_device_id, r0->key.itopk_size,
+                                      r0->key.search_width);
     clock_gettime(CLOCK_MONOTONIC, &t1);
     uint32_t latency_us = (uint32_t) ((t1.tv_sec - t0.tv_sec) * 1000000 +
                                       (t1.tv_nsec - t0.tv_nsec) / 1000);

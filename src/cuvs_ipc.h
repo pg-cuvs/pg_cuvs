@@ -36,7 +36,8 @@
  *   make install && make install-server
  * ---------------------------------------------------------------- */
 #define CUVS_PROTO_MAGIC   0x50435556u  /* 'VUCP' LE — "PG CUVS" tag */
-#define CUVS_PROTO_VERSION 3u   /* 3: daemon replies for EXPORT_ADJACENCY /
+#define CUVS_PROTO_VERSION 4u   /* 4: + CAGRA itopk_size / search_width.
+                                 * 3: daemon replies for EXPORT_ADJACENCY /
                                  * EXPORT_HNSW_SHM / SEARCH_BATCH now carry the
                                  * payload as an SCM_RIGHTS fd instead of a
                                  * /dev/shm name (#165). The frame layout is
@@ -162,6 +163,8 @@ typedef struct CuvsCmdFrame {
      * overloaded field would silently apply the cagra tuning to a BF dispatch.
      * Two fields keep the two gates independently observable and tunable. */
     uint32_t cagra_batch_wait_us; /* SEARCH: daemon CAGRA micro-batch window (0=off) */
+    uint32_t itopk_size;    /* SEARCH/SEARCH_BATCH: CAGRA buffer floor; 0=legacy auto */
+    uint32_t search_width;  /* SEARCH/SEARCH_BATCH: CAGRA width; 0=SDK default */
     /* shm_key reused: EXTEND payload = [float32 vecs: n_vecs×dim][uint64_t tids: n_vecs]
      * COMPACT has no extra payload — daemon reads .tombstone directly. */
 } CuvsCmdFrame;
@@ -316,6 +319,10 @@ void cuvs_ipc_set_wait_callback(int (*cb)(void));
  * a connection is already made to whoever holds the path). -1 (default) =
  * no check. Set from cuvs.daemon_uid via _PG_init. */
 void cuvs_ipc_set_daemon_uid(int uid);
+
+/* Backend-local GUC assign hooks update these values. send_cmd stamps them on
+ * every SEARCH/SEARCH_BATCH, including filtered search; no daemon-global state. */
+void cuvs_ipc_set_cagra_search_params(uint32_t itopk_size, uint32_t search_width);
 
 /*
  * cuvs_ipc_search_filtered — D-wedge spike: filtered BF search.
