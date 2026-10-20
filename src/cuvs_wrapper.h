@@ -211,7 +211,9 @@ int cuvs_cagra_search(
     int              dim,
     int              top_k,
     CuvsSearchResult *results,
-    int              device_id
+    int              device_id,
+    uint32_t         itopk_size,
+    uint32_t         search_width
 );
 
 /*
@@ -233,7 +235,9 @@ int cuvs_cagra_search_filtered(
     const uint32_t   *bitset_words,
     int64_t           bitset_bits,
     CuvsSearchResult *results,
-    int               device_id
+    int               device_id,
+    uint32_t          itopk_size,
+    uint32_t          search_width
 );
 
 void cuvs_cagra_free(CuvsCagraIndex index, int device_id);
@@ -296,7 +300,9 @@ int cuvs_cagra_search_batch(
     int              dim,
     int              top_k,
     CuvsSearchResult *results,
-    int              device_id
+    int              device_id,
+    uint32_t         itopk_size,
+    uint32_t         search_width
 );
 
 int cuvs_bf_search_batch(

@@ -443,6 +443,18 @@ void cuvs_circuit_reset(uint32_t index_oid);          /* also clears open flag *
 int  cuvs_circuit_is_open(uint32_t index_oid);
 void cuvs_circuit_reset_all(void);                    /* zeroes all breaker state */
 
+/* CAGRA's intermediate buffer must cover the actual dispatch k (including
+ * shard/tombstone overfetch). Zero preserves the legacy minimum of 64; an
+ * explicit setting is a floor, rounded to the kernel's 32-entry granularity.
+ * Inputs come from bounded GUCs: configured <= INT_MAX-31, k <= INT_MAX-31. */
+static inline uint32_t
+cuvs_cagra_itopk_size(uint32_t configured, uint32_t k)
+{
+    uint32_t n = configured ? configured : 64;
+    if (n < k) n = k;
+    return ((n + 31) / 32) * 32;
+}
+
 /* ----------------------------------------------------------------
  * Phase 3L-9 / #160: micro-batch grouping (pure, daemon + test).
  *
@@ -464,6 +476,8 @@ typedef struct CuvsBatchKey {
      * requests for one index never land in the same dispatch. Appended last so
      * a 4-field positional initializer still means mode=0 (cagra). */
     uint32_t mode;        /* 0=cagra, 1=brute_force */
+    uint32_t itopk_size;  /* CAGRA only; 0 = derive from dispatch k */
+    uint32_t search_width;/* CAGRA only; 0 = SDK default */
 } CuvsBatchKey;
 
 /* group_id_out[i] = group of request i (requests with equal keys share it);

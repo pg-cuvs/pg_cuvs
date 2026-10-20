@@ -53,6 +53,15 @@
 /* #119: expected owner uid of cuvs.socket_path (-1 = no check). Set via
  * cuvs_ipc_set_daemon_uid, mirroring the g_wait_cb setter pattern below. */
 static int g_expected_daemon_uid = -1;
+static uint32_t g_cagra_itopk_size = 0;
+static uint32_t g_cagra_search_width = 0;
+
+void
+cuvs_ipc_set_cagra_search_params(uint32_t itopk_size, uint32_t search_width)
+{
+    g_cagra_itopk_size = itopk_size;
+    g_cagra_search_width = search_width;
+}
 
 void
 cuvs_ipc_set_daemon_uid(int uid)
@@ -214,6 +223,11 @@ send_cmd(int fd, CuvsCmdFrame *cmd)
 {
     cmd->proto_magic = CUVS_PROTO_MAGIC;
     cmd->proto_version = CUVS_PROTO_VERSION;
+    if (cmd->op == CUVS_OP_SEARCH || cmd->op == CUVS_OP_SEARCH_BATCH)
+    {
+        cmd->itopk_size = g_cagra_itopk_size;
+        cmd->search_width = g_cagra_search_width;
+    }
     return send_all(fd, cmd, sizeof(*cmd));
 }
 

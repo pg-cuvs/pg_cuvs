@@ -416,11 +416,11 @@ cuvs_probe_hw(int device_id, double *link_bw_bpus, double *hbm_bw_bpus,
         CuvsCagraIndex idx = cuvs_cagra_build(corpus.data(), n, dim, CUVS_METRIC_L2,
                                               0, 0, CUVS_CAGRA_BUILD_AUTO, device_id);
         if (idx) {
-            (void) cuvs_cagra_search(idx, query.data(), dim, k, res.data(), device_id); /* warm */
+            (void) cuvs_cagra_search(idx, query.data(), dim, k, res.data(), device_id, 0, 0); /* warm */
             double best_us = 1e30;
             for (int i = 0; i < 5; i++) {
                 auto c0 = std::chrono::steady_clock::now();
-                int rc = cuvs_cagra_search(idx, query.data(), dim, k, res.data(), device_id);
+                int rc = cuvs_cagra_search(idx, query.data(), dim, k, res.data(), device_id, 0, 0);
                 auto c1 = std::chrono::steady_clock::now();
                 if (rc == 0) {
                     double us = std::chrono::duration<double, std::micro>(c1 - c0).count();
@@ -852,7 +852,9 @@ cuvs_cagra_search_filtered(
     const uint32_t   *bitset_words,
     int64_t           bitset_bits,
     CuvsSearchResult *results,
-    int               device_id)
+    int               device_id,
+    uint32_t          itopk_size,
+    uint32_t          search_width)
 {
     if (!index)
         return 1;
@@ -909,9 +911,8 @@ cuvs_cagra_search_filtered(
         auto prefilter = cuvs::neighbors::filtering::bitset_filter<uint32_t, int64_t>(bv);
 
         cuvs::neighbors::cagra::search_params sparams;
-        int itopk = ((bk + 31) / 32) * 32;
-        if (itopk < 64) itopk = 64;
-        sparams.itopk_size = itopk;
+        sparams.itopk_size = cuvs_cagra_itopk_size(itopk_size, (uint32_t) bk);
+        if (search_width) sparams.search_width = search_width;
 
         cuvs::neighbors::cagra::search(
             res, sparams, impl->idx,
@@ -1072,7 +1073,9 @@ cuvs_cagra_search(
     int              dim,
     int              top_k,
     CuvsSearchResult *results,
-    int              device_id)
+    int              device_id,
+    uint32_t         itopk_size,
+    uint32_t         search_width)
 {
     if (!index)
         return 1;
@@ -1114,14 +1117,10 @@ cuvs_cagra_search(
         auto d_distances = raft::make_device_matrix<float,    int64_t>(res, 1, bk);
 
         cuvs::neighbors::cagra::search_params sparams;
-        /* CAGRA multi-cta search requires:
-         *   num_cta_per_query * 32 >= top_k
-         * where num_cta_per_query = max(search_width, ceil(itopk_size / 32))
-         * Default itopk_size=64, search_width=1 -> num_cta=2 -> max top_k=64.
-         * Round itopk_size up to a multiple of 32 that satisfies top_k. */
-        int itopk = ((bk + 31) / 32) * 32;
-        if (itopk < 64) itopk = 64;
-        sparams.itopk_size = itopk;
+        /* Keep the legacy automatic buffer when unset, and always cover the
+         * actual dispatch k (including shard/tombstone overfetch). */
+        sparams.itopk_size = cuvs_cagra_itopk_size(itopk_size, (uint32_t) bk);
+        if (search_width) sparams.search_width = search_width;
 
         cuvs::neighbors::cagra::search(
             res, sparams, impl->idx,
@@ -1170,7 +1169,9 @@ cuvs_cagra_search_batch(
     int              dim,
     int              top_k,
     CuvsSearchResult *results,
-    int              device_id)
+    int              device_id,
+    uint32_t         itopk_size,
+    uint32_t         search_width)
 {
     if (!index)
         return 1;
@@ -1209,9 +1210,8 @@ cuvs_cagra_search_batch(
         auto d_distances = raft::make_device_matrix<float,    int64_t>(res, Q, bk);
 
         cuvs::neighbors::cagra::search_params sparams;
-        int itopk = ((bk + 31) / 32) * 32;
-        if (itopk < 64) itopk = 64;
-        sparams.itopk_size = itopk;
+        sparams.itopk_size = cuvs_cagra_itopk_size(itopk_size, (uint32_t) bk);
+        if (search_width) sparams.search_width = search_width;
 
         cuvs::neighbors::cagra::search(
             res, sparams, impl->idx,
@@ -2053,7 +2053,7 @@ cuvs_warmup_device(int device_id)
         CuvsCagraIndex idx = cuvs_cagra_build(corpus.data(), n, dim, CUVS_METRIC_L2,
                                                0, 0, CUVS_CAGRA_BUILD_AUTO, device_id);
         if (idx) {
-            (void)cuvs_cagra_search(idx, query.data(), dim, k, out, device_id);
+            (void)cuvs_cagra_search(idx, query.data(), dim, k, out, device_id, 0, 0);
             cuvs_cagra_free(idx, device_id);
         }
     } catch (...) {
