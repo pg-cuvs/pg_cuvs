@@ -94,8 +94,8 @@ CUVS_SO_LINK     = -lm
 CUVS_SERVER_LINK = -lm
 else
 WRAPPER_OBJ      = src/cuvs_wrapper.o
-CUVS_SO_LINK     = -L$(CUVS_LIB) -lcuvs -lcudart -Wl,-rpath,$(CUVS_LIB)
-CUVS_SERVER_LINK = -L$(CUVS_LIB) -lcuvs -lrmm -lcudart -Wl,-rpath,$(CUVS_LIB)
+CUVS_SO_LINK     = -L$(CUVS_LIB) -lcuvs -lrmm -lrapids_logger -lcudart -Wl,-rpath,$(CUVS_LIB)
+CUVS_SERVER_LINK = -L$(CUVS_LIB) -lcuvs -lrmm -lrapids_logger -lcudart -Wl,-rpath,$(CUVS_LIB)
 endif
 
 PG_CPPFLAGS    = -I$(CUVS_INCLUDE) -I$(CUVS_RAPIDS_INCLUDE) -I./src
