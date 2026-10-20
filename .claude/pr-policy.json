@@ -1,0 +1,14 @@
+{
+  "version": 1,
+  "generated_by": "hooks/validate_pr_label.js",
+  "fingerprint": "bdc125e6a657dfec519c59e9bea5157d",
+  "observed_prs": 50,
+  "declared_sources": [
+    "CONTRIBUTING.md",
+    "CLAUDE.md"
+  ],
+  "phantom_labels": [],
+  "confidence": 0,
+  "enforced": false,
+  "rules": []
+}
