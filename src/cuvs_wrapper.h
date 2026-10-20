@@ -23,6 +23,11 @@ typedef struct CuvsGpuDeviceInfo {
  * Returns the number of GPUs found (0 if none). */
 int cuvs_detect_gpus(CuvsGpuDeviceInfo *out, int max_devices);
 
+/* Daemon startup only, before any cuVS/RMM allocations or worker threads.
+ * Initial pool reservation in bytes; 0 leaves the default resource untouched.
+ * Pool may grow via its upstream resource. Returns nonzero on init failure. */
+int cuvs_rmm_pool_init(int device_id, size_t initial_pool_bytes);
+
 /* ADR-075 Phase 1: measure physical hardware constants on `device_id`.
  *   link_bw_bpus  -- CPU->GPU H2D bandwidth, bytes per microsecond
  *   hbm_bw_bpus   -- GPU device-memory bandwidth, bytes per microsecond

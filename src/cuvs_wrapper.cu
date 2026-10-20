@@ -23,6 +23,9 @@
 #include <raft/core/device_mdarray.hpp>
 #include <raft/core/host_mdarray.hpp>
 #include <raft/core/bitset.cuh>      /* 3O: raft::core::bitset device ops */
+#include <rmm/mr/pool_memory_resource.hpp>
+#include <rmm/mr/limiting_resource_adaptor.hpp>
+#include <rmm/mr/per_device_resource.hpp>
 
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>   /* Phase 3L: half precision for brute-force (cuvs.bf_precision) */
@@ -34,6 +37,7 @@
 #include <stdexcept>
 #include <mutex>
 #include <atomic>
+#include <limits>
 
 /* ----------------------------------------------------------------
  * Per-device device_resources pool (Phase 3E)
@@ -62,6 +66,45 @@ struct DevicePool {
 };
 
 static DevicePool g_device_pools[CUVS_MAX_GPUS];
+
+/* Unlimited limiting adaptors provide cheap atomic, allocation-aligned byte
+ * counters, without the maps/debug overhead of tracking_resource_adaptor. */
+using RmmUpstream = rmm::mr::limiting_resource_adaptor<rmm::mr::device_memory_resource>;
+using RmmPool = rmm::mr::pool_memory_resource<RmmUpstream>;
+using RmmUsage = rmm::mr::limiting_resource_adaptor<RmmPool>;
+struct RmmPoolRegistry;
+static RmmPoolRegistry *g_rmm_registry = nullptr;  /* null on the legacy path */
+
+/* Created after RMM's default-resource registry on the first opt-in startup
+ * call, so teardown runs while that registry is still alive. Clear retained
+ * RAFT resources before releasing the memory they can reference. */
+struct RmmPoolRegistry {
+    rmm::mr::device_memory_resource *previous[CUVS_MAX_GPUS] = {};
+    std::unique_ptr<RmmUpstream> upstreams[CUVS_MAX_GPUS];
+    std::unique_ptr<RmmPool> pools[CUVS_MAX_GPUS];
+    std::unique_ptr<RmmUsage> usages[CUVS_MAX_GPUS];
+    ~RmmPoolRegistry() {
+        g_rmm_registry = nullptr;
+        for (int dev = 0; dev < CUVS_MAX_GPUS; dev++) {
+            if (!pools[dev]) continue;
+            if (cudaSetDevice(dev) != cudaSuccess) {
+                /* Process exit with a lost CUDA context: let the driver reclaim
+                 * the pool rather than freeing it on the wrong device. */
+                for (auto &res : g_device_pools[dev].pool) (void)res.release();
+                g_device_pools[dev].pool.clear();
+                (void)pools[dev].release();
+                (void)usages[dev].release();
+                (void)upstreams[dev].release();
+                continue;
+            }
+            g_device_pools[dev].pool.clear();
+            rmm::mr::set_current_device_resource(previous[dev]);
+            usages[dev].reset();
+            pools[dev].reset();
+            upstreams[dev].reset();
+        }
+    }
+};
 
 /* test-only: armed by cuvs_set_inject_extend_oom(); self-clears in cuvs_cagra_extend */
 static std::atomic<int> g_inject_extend_oom{0};
@@ -131,6 +174,39 @@ struct PooledRes {
 };
 
 } // namespace
+
+extern "C" int
+cuvs_rmm_pool_init(int device_id, size_t initial_pool_bytes)
+{
+    if (initial_pool_bytes == 0)
+        return 0;   /* default path: no resource lookup or CUDA allocation */
+    if (device_id < 0 || device_id >= CUVS_MAX_GPUS ||
+        cudaSetDevice(device_id) != cudaSuccess)
+        return 1;
+    try {
+        auto *upstream = rmm::mr::get_current_device_resource();
+        static RmmPoolRegistry registry;
+        if (registry.pools[device_id])
+            return 1;   /* startup-only: never replace a live allocator */
+        auto counted_upstream = std::make_unique<RmmUpstream>(
+            upstream, std::numeric_limits<size_t>::max());
+        auto pool = std::make_unique<RmmPool>(counted_upstream.get(), initial_pool_bytes);
+        auto usage = std::make_unique<RmmUsage>(pool.get(), std::numeric_limits<size_t>::max());
+        registry.previous[device_id] = upstream;
+        rmm::mr::set_current_device_resource(usage.get());
+        registry.upstreams[device_id] = std::move(counted_upstream);
+        registry.pools[device_id] = std::move(pool);
+        registry.usages[device_id] = std::move(usage);
+        g_rmm_registry = &registry;
+        return 0;
+    } catch (const std::exception &e) {
+        fprintf(stderr, "[cuvs_rmm_pool_init] GPU %d: %s\n", device_id, e.what());
+        return 1;
+    } catch (...) {
+        fprintf(stderr, "[cuvs_rmm_pool_init] GPU %d: unknown exception\n", device_id);
+        return 1;
+    }
+}
 
 /* Opaque CAGRA index wrapper.
  *
@@ -453,6 +529,17 @@ cuvs_vram_free_bytes_on(int device_id)
     if (cudaSetDevice(device_id) != cudaSuccess)
         return 0;
     cudaMemGetInfo(&free_bytes, &total_bytes);
+
+    /* RMM pool blocks remain allocated in the CUDA upstream even when free for
+     * reuse inside RMM. Count that reusable space as well, or a preallocated
+     * pool would make admission evict/reject indexes despite available memory.
+     * Both counters are atomic; do not read pool_size() concurrently with growth. */
+    if (g_rmm_registry && device_id >= 0 && device_id < CUVS_MAX_GPUS &&
+        g_rmm_registry->pools[device_id]) {
+        size_t reserved = g_rmm_registry->upstreams[device_id]->get_allocated_bytes();
+        size_t used = g_rmm_registry->usages[device_id]->get_allocated_bytes();
+        if (reserved > used) free_bytes += reserved - used;
+    }
 
     /* ADR-065: cuVS allocates through a CUDA async mempool that caches freed
      * blocks; cudaMemGetInfo counts that cache as "used", understating the

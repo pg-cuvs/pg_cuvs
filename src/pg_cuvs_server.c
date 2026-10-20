@@ -366,6 +366,7 @@ static size_t   g_max_vram_per_gpu[CUVS_MAX_GPUS];
 static char   g_socket_path[256]  = "/tmp/.s.pg_cuvs.server";
 static char   g_index_dir[256]    = "/tmp/pg_cuvs_indexes";
 static size_t g_max_vram_bytes    = 0;   /* 0 = use default fraction; >0 = explicit --max-vram-mb */
+static uint32_t g_rmm_pool_mb     = 0;   /* opt-in initial reservation per usable GPU */
 
 /* ADR-065: default per-device budget when --max-vram-mb is omitted — a fraction
  * of total VRAM, leaving headroom for the untracked cuVS workspace + CUDA
@@ -7902,6 +7903,14 @@ connection_thread(void *arg)
         case CUVS_OP_CACHE_STATS:
             handle_cache_stats(client_fd);
             break;
+        case CUVS_OP_SERVER_SETTINGS:
+        {
+            CuvsReplyHeader hdr = {.status = CUVS_STATUS_OK, .n_results = 1};
+            CuvsServerSettings settings = {.rmm_pool_mb = g_rmm_pool_mb};
+            send_all(client_fd, &hdr, sizeof(hdr));
+            send_all(client_fd, &settings, sizeof(settings));
+            break;
+        }
         case CUVS_OP_SHARD_STATS:
             handle_shard_stats(client_fd, &cmd);
             break;
@@ -8547,6 +8556,14 @@ main(int argc, char **argv)
             strncpy(g_index_dir, argv[++i], sizeof(g_index_dir) - 1);
         else if (strcmp(argv[i], "--max-vram-mb") == 0 && i+1 < argc)
             g_max_vram_bytes = (size_t)atol(argv[++i]) * 1024 * 1024;
+        else if (strcmp(argv[i], "--rmm-pool-mb") == 0)
+        {
+            if (i + 1 >= argc || cuvs_parse_rmm_pool_mb(argv[++i], &g_rmm_pool_mb) != 0)
+            {
+                LOG_ERROR("--rmm-pool-mb requires a nonnegative integer MiB value\n");
+                return 1;
+            }
+        }
         else if (strcmp(argv[i], "--max-indexes") == 0 && i+1 < argc)
         {
             int n = atoi(argv[++i]);
@@ -8665,6 +8682,24 @@ main(int argc, char **argv)
         return 1;
     }
     LOG_INFO("index registry capacity: %d (--max-indexes)\n", g_max_indexes);
+
+    /* Install the per-device allocator before probes, persisted-index reloads,
+     * warmup or worker threads can make the first RMM allocation. Zero leaves
+     * the old allocation path untouched. A failed opt-in init aborts startup. */
+    if (g_rmm_pool_mb > 0)
+    {
+        for (int i = 0; i < n_usable_gpus(); i++)
+        {
+            int dev = usable_gpu(i);
+            if (cuvs_rmm_pool_init(dev, (size_t)g_rmm_pool_mb * 1024 * 1024) != 0)
+            {
+                LOG_ERROR("GPU %d: RMM pool initialization failed (%u MiB)\n",
+                          dev, g_rmm_pool_mb);
+                return 1;
+            }
+        }
+    }
+    LOG_INFO("RMM initial pool reservation: %u MiB per GPU (0=disabled)\n", g_rmm_pool_mb);
 
     /* ADR-075 Phase 1: probe hardware + write the global cost-model profile. */
     write_hw_profile();

@@ -64,6 +64,29 @@ lists the index, and queries fall back to a seq scan without erroring. Rebuild w
 REINDEX or give the index its own persistent `index_dir`; see the `IDX` comment in
 `bootstrap.sh`. On a long-lived host, also watch for `systemd-tmpfiles` reaping it.
 
+### Optional RMM pool
+
+The default `--rmm-pool-mb 0` leaves the existing allocator unchanged. To reserve
+an initial pool per allowed GPU during bootstrap, pass `RMM_POOL_MB=1024`:
+
+```bash
+ssh <name> 'RMM_POOL_MB=1024 bash ~/bootstrap.sh'
+```
+
+The generated unit reads `/etc/default/pg-cuvs-server`. To compare pool disabled
+and enabled on an instance assigned to this benchmark, set `RMM_POOL_MB=0` or
+`RMM_POOL_MB=1024` in that file and restart the daemon using `make gpu-reload`
+or `sudo systemctl restart pg-cuvs-server`. A directly launched daemon receives
+the same setting through `make gpu-server-start RMM_POOL_MB=1024`.
+
+Record the **applied** value with `SHOW cuvs.rmm_pool_mb` (or
+`SELECT current_setting('cuvs.rmm_pool_mb')`) in run metadata. This status is
+read-only: SQL SET cannot replace a live allocator. `unavailable` means the
+daemon did not return a compatible status, and must not be recorded as zero.
+The number is the initial reservation in MiB; the pool can grow and the
+existing `--max-vram-mb` admission budget remains separate. Allocator creation
+failure stops daemon startup rather than silently running without the pool.
+
 ## What survives a delete (and what doesn't)
 
 | Asset | Survives delete? | Recovery |

@@ -73,6 +73,10 @@ IDX=/tmp/cuvs_indexes
 CONDA=/opt/miniforge3
 DEV=$CONDA/envs/cuvs_dev            # C/C++ build toolchain (nvcc, libcuvs)
 BENCH=$CONDA/envs/cuvs_bench        # python bench stack (separate: python 3.12)
+RMM_POOL_MB=${RMM_POOL_MB:-0}       # opt-in initial reservation per GPU, MiB
+case "$RMM_POOL_MB" in
+  ''|*[!0-9]*) echo "FATAL: RMM_POOL_MB must be a nonnegative integer" >&2; exit 1 ;;
+esac
 
 # The Brev image runs its own apt on first boot. Racing it dies with "Could not
 # get lock /var/lib/dpkg/lock-frontend", which is exactly how a bootstrap once
@@ -304,6 +308,9 @@ sudo chmod 755 /usr/local/bin/pg-cuvs-wait-socket
 # unlinks the socket — with several/large indexes this can outrun systemd's
 # default stop timeout (90s), and the ensuing SIGKILL both loses whatever
 # indexes had not yet been saved and reintroduces the stale-socket race above.
+# A benchmark can change this file and restart the daemon to compare pool=0
+# against pool=N without rewriting the unit or changing PostgreSQL GUCs.
+printf 'RMM_POOL_MB=%s\n' "$RMM_POOL_MB" | sudo tee /etc/default/pg-cuvs-server > /dev/null
 sudo tee /etc/systemd/system/pg-cuvs-server.service > /dev/null <<UNIT
 [Unit]
 Description=pg_cuvs GPU sidecar daemon
@@ -313,9 +320,11 @@ After=network.target
 Type=simple
 User=$(id -un)
 Group=$(id -gn)
+Environment=RMM_POOL_MB=0
+EnvironmentFile=-/etc/default/pg-cuvs-server
 ExecStartPre=/bin/mkdir -p $IDX
 ExecStartPre=-/bin/rm -f /tmp/.s.pg_cuvs
-ExecStart=$(pg_config --bindir)/pg_cuvs_server --socket /tmp/.s.pg_cuvs --index-dir $IDX --gpu-devices 0
+ExecStart=$(pg_config --bindir)/pg_cuvs_server --socket /tmp/.s.pg_cuvs --index-dir $IDX --gpu-devices 0 --rmm-pool-mb \${RMM_POOL_MB}
 ExecStartPost=/usr/local/bin/pg-cuvs-wait-socket
 TimeoutStartSec=600
 TimeoutStopSec=300

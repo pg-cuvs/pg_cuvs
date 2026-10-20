@@ -11,7 +11,24 @@
 
 #include <string.h>
 #include <stdlib.h>
+#include <errno.h>
+#include <limits.h>
 #include <stddef.h>   /* offsetof (cuvs_hw_profile crc range) */
+
+int
+cuvs_parse_rmm_pool_mb(const char *value, uint32_t *mb_out)
+{
+    char *end;
+    unsigned long long mb;
+    if (!value || !value[0] || strspn(value, "0123456789") != strlen(value))
+        return -1;
+    errno = 0;
+    mb = strtoull(value, &end, 10);
+    if (errno || *end || mb > INT_MAX || mb > SIZE_MAX / (1024u * 1024u))
+        return -1;
+    *mb_out = (uint32_t) mb;
+    return 0;
+}
 
 /* ----------------------------------------------------------------
  * Fail-closed filter-frame gate (ADR-063 tenant isolation).

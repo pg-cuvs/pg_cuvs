@@ -14,6 +14,10 @@
 #include <stddef.h>
 #include <stdbool.h>
 
+/* Strict daemon CLI parser: MiB, 0=disabled, bounded for size_t and the
+ * read-only integer GUC reporting the applied setting. Returns 0 on success. */
+int cuvs_parse_rmm_pool_mb(const char *value, uint32_t *mb_out);
+
 /* ----------------------------------------------------------------
  * Leveled logging macros (PG-free; stderr only).
  *

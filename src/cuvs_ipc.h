@@ -80,6 +80,7 @@
                                      * [vectors][tids] handed off via SCM_RIGHTS memfd (filter_shm_key
                                      * names the SHM-tier fallback); query in shm_key. Non-evicting
                                      * VRAM admission; returns top-k (tid,distance). */
+#define CUVS_OP_SERVER_SETTINGS    23 /* read-only daemon startup settings */
 
 /* ----------------------------------------------------------------
  * Distance metrics (mirror pgvector operator names)
@@ -323,6 +324,12 @@ void cuvs_ipc_set_daemon_uid(int uid);
 /* Backend-local GUC assign hooks update these values. send_cmd stamps them on
  * every SEARCH/SEARCH_BATCH, including filtered search; no daemon-global state. */
 void cuvs_ipc_set_cagra_search_params(uint32_t itopk_size, uint32_t search_width);
+
+typedef struct CuvsServerSettings {
+    uint32_t rmm_pool_mb;  /* applied initial reservation per GPU; 0=disabled */
+} CuvsServerSettings;
+
+int cuvs_ipc_server_settings(const char *socket_path, CuvsServerSettings *out);
 
 /*
  * cuvs_ipc_search_filtered — D-wedge spike: filtered BF search.

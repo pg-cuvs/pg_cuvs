@@ -193,6 +193,14 @@ shim_read(const char *path)
     return ix;
 }
 
+int
+cuvs_rmm_pool_init(int device_id, size_t initial_pool_bytes)
+{
+    (void)device_id;
+    /* A CPU shim must not claim it applied a GPU allocator. */
+    return initial_pool_bytes == 0 ? 0 : 1;
+}
+
 /* ======================================================================== */
 /* build / free                                                             */
 /* ======================================================================== */

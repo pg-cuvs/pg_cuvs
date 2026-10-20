@@ -556,6 +556,21 @@ test_cagra_search_params(void)
     ASSERT(gid[4] == gid[5], "BF grouping is unchanged");
 }
 
+static void
+test_rmm_pool_size(void)
+{
+    uint32_t mb = 123;
+    ASSERT(cuvs_parse_rmm_pool_mb("0", &mb) == 0 && mb == 0, "zero disables RMM pool");
+    ASSERT(cuvs_parse_rmm_pool_mb("1024", &mb) == 0 && mb == 1024, "pool size in MiB");
+    ASSERT(cuvs_parse_rmm_pool_mb("-1", &mb) != 0, "negative pool size rejected");
+    ASSERT(cuvs_parse_rmm_pool_mb("+1", &mb) != 0, "signed pool size rejected");
+    ASSERT(cuvs_parse_rmm_pool_mb("1GiB", &mb) != 0, "suffix rejected");
+    ASSERT(cuvs_parse_rmm_pool_mb("", &mb) != 0, "empty pool size rejected");
+    ASSERT(cuvs_parse_rmm_pool_mb("2147483648", &mb) != 0, "GUC integer overflow rejected");
+    ASSERT(cuvs_parse_rmm_pool_mb("184467440737095516160", &mb) != 0,
+           "conversion overflow rejected");
+}
+
 /* ---- BF micro-batch grouping (Phase 3L-9) ---- */
 static void
 test_bf_batch_group(void)
@@ -1165,6 +1180,8 @@ main(void)
     test_vectors_write_multi();
     test_vectors_rejections();
     test_cagra_search_params();
+
+    test_rmm_pool_size();
     test_bf_batch_group();
     test_shards_roundtrip();
     test_shards_rejections();

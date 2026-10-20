@@ -163,6 +163,7 @@ Defaults and ranges are from source. "Set by" is the minimum role/scope: `USERSE
 | `cuvs.daemon_uid` | int | `-1` | -1– | SUSET | Expected owner uid of `cuvs.socket_path`; backend refuses to connect if the socket is owned by a different uid. `-1` disables the check. See playbooks/daemon-restart-recovery.md § Security / hardening |
 | `cuvs.index_dir` | string | `$PGDATA/cuvs_indexes` | — | SUSET | Artifact directory (empty = resolved at runtime) |
 | `cuvs.k` | int | `100` | 1–2000 | USERSET | GPU top-k candidates fetched per scan (cf. `hnsw.ef_search`) |
+| `cuvs.rmm_pool_mb` | int/status | daemon value | 0–INT_MAX, or `unavailable` | read-only (INTERNAL) | Applied initial RMM pool reservation per GPU, queried from the daemon. `0` = disabled; `unavailable` = no compatible daemon reply. Set using the daemon CLI and restart, not SQL SET. Record with each benchmark run |
 | `cuvs.circuit_breaker_threshold` | int | `3` | 1–100 | USERSET | Consecutive GPU errors before the (per-backend) breaker trips |
 
 ### Build
@@ -248,6 +249,7 @@ daemon-only ones have no session equivalent.
 | `--socket PATH` | `cuvs.socket_path` | `/tmp/.s.pg_cuvs` | UDS path |
 | `--index-dir DIR` | `cuvs.index_dir` | — | Artifact dir the daemon serves from; must match the backend's `index_dir` or searches fall back to seqscan |
 | `--max-vram-mb N` | — (daemon-only) | 90% of total VRAM | VRAM budget, enforced by self-accounting (ADR-065); the supported way to cap VRAM |
+| `--rmm-pool-mb N` | `cuvs.rmm_pool_mb` (read-only status) | `0` (disabled) | Initial RMM pool reservation per allowed GPU in MiB, installed before probes/load/warmup. May grow from the upstream allocator; this is not a VRAM cap. Init failure aborts startup. Reusable pool bytes are included in admission headroom |
 | `--max-indexes N` | — (daemon-only) | `1024` | **Soft** LRU working-set cap (ADR-068), not a hard wall (was 64). At the cap, `load_index` evicts the LRU index to free a slot and auto-reloads on next use; a build over the cap defers gracefully |
 | `--gpu-devices LIST` | — (daemon-only) | all visible | CUDA devices the daemon uses (else honors `CUDA_VISIBLE_DEVICES`) |
 | `--snapshot-uri URI` | `cuvs.snapshot_uri` | `` | GCS snapshot root |

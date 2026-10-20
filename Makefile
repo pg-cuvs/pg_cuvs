@@ -28,7 +28,7 @@ DATA           = sql/pg_cuvs--0.1.0.sql \
                  sql/pg_cuvs--0.7.0--0.8.0.sql \
                  sql/pg_cuvs--0.8.0.sql
 MODULE_big     = pg_cuvs
-REGRESS        = smoke upgrade_path cpu_fallback edge_cases cpu_hnsw_fallback build_hnsw build_hnsw_edge build_hnsw_halfvec build_hnsw_packing pg_cuvs_hnsw metrics brute_force pg_cuvs_batch reloption_dir gc_orphans release_hardening pending_delta delta_recall build_params drop_subxact partition_prune filter_comparison prefilter_short_fill_guard ivfpq_smoke cagra_streaming cagra_dynbatch cagra_search_params auto_compact extend_vram_fallback stream_bf_recall fallback_stat vram_accounting build_lock flat_smoke transient_bf hw_profile routing_golden routing_golden_measured multi_vector daemon_uid_owner unordered_scan null_query_vector
+REGRESS        = smoke rmm_pool upgrade_path cpu_fallback edge_cases cpu_hnsw_fallback build_hnsw build_hnsw_edge build_hnsw_halfvec build_hnsw_packing pg_cuvs_hnsw metrics brute_force pg_cuvs_batch reloption_dir gc_orphans release_hardening pending_delta delta_recall build_params drop_subxact partition_prune filter_comparison prefilter_short_fill_guard ivfpq_smoke cagra_streaming cagra_dynbatch cagra_search_params auto_compact extend_vram_fallback stream_bf_recall fallback_stat vram_accounting build_lock flat_smoke transient_bf hw_profile routing_golden routing_golden_measured multi_vector daemon_uid_owner unordered_scan null_query_vector
 REGRESS_OPTS   = --inputdir=test --outputdir=test
 
 # Tier-1 CI (CPU-reference shim, PGCUVS_CPU_SHIM=1) runs a SUBSET of REGRESS.
@@ -373,6 +373,7 @@ export
 # VM_SSH_HOST is provider-neutral; GCP_VM is the pre-Brev name kept as a
 # fallback so an existing config file still resolves.
 VM_SSH_HOST ?= $(GCP_VM)
+RMM_POOL_MB ?= 0
 GCP_USER ?= ubuntu
 VM_IP = $(if $(USE_GCP_IP),$(shell gcloud compute instances describe $(GCP_INSTANCE) --zone $(GCP_ZONE) $(if $(GCP_PROJECT),--project $(GCP_PROJECT)) --format='value(networkInterfaces[0].accessConfigs[0].natIP)' 2>/dev/null),)
 VM_HOST = $(if $(VM_IP),$(GCP_USER)@$(VM_IP),$(VM_SSH_HOST))
@@ -571,7 +572,7 @@ gpu-server-start:
 	ssh -tt $(VM_HOST) "pg_cuvs_server \
 		--socket /tmp/.s.pg_cuvs \
 		--index-dir \$$(psql -t -c 'SHOW data_directory' | tr -d ' ')/cuvs_indexes \
-		--max-vram-mb 20480 &"
+		--max-vram-mb 20480 --rmm-pool-mb $(RMM_POOL_MB) &"
 
 # Default sanity benchmark on the VM (small size from benchmark.sh defaults).
 # N/DIM/K/M forwarded to the remote `make benchmark` only when set locally.
