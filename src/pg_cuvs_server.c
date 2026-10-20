@@ -2996,7 +2996,8 @@ handle_search(int client_fd, const CuvsCmdFrame *cmd)
                  && e->rev_item_ids != NULL))
         {
             CuvsBatchKey     key  = { cmd->db_oid, cmd->index_oid, cmd->bf_precision,
-                                      cmd->dim, 1 /* mode: brute_force */ };
+                                      cmd->dim, 1 /* mode: brute_force */,
+                                      0, 0 /* CAGRA tuning is unused */ };
             CuvsResult   *rout = malloc((size_t) k * sizeof(CuvsResult));
             int           enqueued = 0;
             CuvsBatchRequest req;
