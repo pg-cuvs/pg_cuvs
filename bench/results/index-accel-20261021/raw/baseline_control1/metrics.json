@@ -1,0 +1,36 @@
+[
+  {
+    "byte_identical_to_baseline": false,
+    "gt_hits_gained": 21,
+    "gt_hits_lost": 15,
+    "gt_outside_involved_queries": 38,
+    "id_changed_queries": 38,
+    "k": 64,
+    "mean_query_jaccard": 0.9991714932126703,
+    "observed_gpu_errors": 0,
+    "observed_gpu_queries": 10000,
+    "observed_search_mode": "gpu_cagra",
+    "p50_ms": 0.9696385002371244,
+    "qps": 1011.5499595754701,
+    "recall_at10": 0.94075,
+    "reorder_only_queries": 0,
+    "within_gt_only_changed_queries": 0
+  },
+  {
+    "byte_identical_to_baseline": false,
+    "gt_hits_gained": 23,
+    "gt_hits_lost": 29,
+    "gt_outside_involved_queries": 52,
+    "id_changed_queries": 56,
+    "k": 128,
+    "mean_query_jaccard": 0.9990060606060611,
+    "observed_gpu_errors": 0,
+    "observed_gpu_queries": 10000,
+    "observed_search_mode": "gpu_cagra",
+    "p50_ms": 0.9966490001716011,
+    "qps": 1001.9476414340911,
+    "recall_at10": 0.97843,
+    "reorder_only_queries": 3,
+    "within_gt_only_changed_queries": 1
+  }
+]

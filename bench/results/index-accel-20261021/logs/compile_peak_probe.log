@@ -1,0 +1,1082 @@
+Cloning into '/home/ubuntu/index-accel-validation/native-peak-source'...
+done.
+Note: switching to 'fded8ce8fb289112349fbce0d36e2e85f47e9eab'.
+
+You are in 'detached HEAD' state. You can look around, make experimental
+changes and commit them, and you can discard any commits you make in this
+state without impacting any branches by switching back to a branch.
+
+If you want to create a new branch to retain commits you create, you may
+do so (now or later) by using -c with the switch command. Example:
+
+  git switch -c <new-branch-name>
+
+Or undo this operation with:
+
+  git switch -
+
+Turn off this advice by setting config variable advice.detachedHead to false
+
+HEAD is now at fded8ce fix(daemon): link RAPIDS logger for RMM pool resources
+nvcc -ccbin /usr/bin/g++ -O3 --compiler-options '-fPIC' -arch=sm_89 -std=c++17 --extended-lambda -DRAFT_SYSTEM_LITTLE_ENDIAN=1 -DCUVS_BUILD_CAGRA_HNSWLIB -I/opt/miniforge3/envs/cuvs_dev/include -I/opt/miniforge3/envs/cuvs_dev/include/rapids -I./src -c src/cuvs_wrapper.cu -o src/cuvs_wrapper.o
+/opt/miniforge3/envs/cuvs_dev/include/raft/core/device_resources.hpp: In constructor ‘raft::device_resources::device_resources(const raft::device_resources&, std::shared_ptr<rmm::mr::device_memory_resource>, std::optional<long unsigned int>)’:
+/opt/miniforge3/envs/cuvs_dev/include/raft/core/device_resources.hpp:60:33: warning: ‘void raft::resource::set_workspace_resource(const raft::resources&, std::shared_ptr<rmm::mr::device_memory_resource>, std::optional<long unsigned int>, std::optional<long unsigned int>)’ is deprecated: use the overload taking raft::mr::device_resource instead [-Wdeprecated-declarations]
+   60 |     resource::set_workspace_resource(*this, workspace_resource, allocation_limit);
+      |     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+/opt/miniforge3/envs/cuvs_dev/include/raft/core/resource/device_memory_resource.hpp:388:1: note: declared here
+  388 | inline void set_workspace_resource(resources const& res,
+      | ^~~~~~~~~~~~~~~~~~~~~~
+/opt/miniforge3/envs/cuvs_dev/include/raft/core/device_resources.hpp: In constructor ‘raft::device_resources::device_resources(rmm::cuda_stream_view, std::shared_ptr<rmm::cuda_stream_pool>, std::shared_ptr<rmm::mr::device_memory_resource>, std::optional<long unsigned int>)’:
+/opt/miniforge3/envs/cuvs_dev/include/raft/core/device_resources.hpp:90:33: warning: ‘void raft::resource::set_workspace_resource(const raft::resources&, std::shared_ptr<rmm::mr::device_memory_resource>, std::optional<long unsigned int>, std::optional<long unsigned int>)’ is deprecated: use the overload taking raft::mr::device_resource instead [-Wdeprecated-declarations]
+   90 |       resource::set_workspace_resource(*this, workspace_resource, allocation_limit);
+      |       ~~~~~~~~~~~~~~~~~~~~~~~~~~^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+/opt/miniforge3/envs/cuvs_dev/include/raft/core/resource/device_memory_resource.hpp:388:1: note: declared here
+  388 | inline void set_workspace_resource(resources const& res,
+      | ^~~~~~~~~~~~~~~~~~~~~~
+/opt/miniforge3/envs/cuvs_dev/include/raft/sparse/convert/detail/csr.cuh: In function ‘void raft::sparse::convert::detail::coo_to_csr(const raft::resources&, const int*, const int*, const value_t*, int, int, int*, int*, value_t*)’:
+/opt/miniforge3/envs/cuvs_dev/include/raft/sparse/convert/detail/csr.cuh:58:71: warning: ‘cusparseStatus_t cusparseCreateIdentityPermutation(cusparseHandle_t, int, int*)’ is deprecated: The routine will be removed in the next major release [-Wdeprecated-declarations]
+   58 |   RAFT_CUSPARSE_TRY(cusparseCreateIdentityPermutation(cusparseHandle, nnz, P.data()));
+      |                                      ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^~~~~~~~~~~~~~~~               
+/opt/miniforge3/envs/cuvs_dev/bin/../targets/x86_64-linux/include/cusparse.h:4070:1: note: declared here
+ 4070 | cusparseCreateIdentityPermutation(cusparseHandle_t handle,
+      | ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+src/cuvs_wrapper.cu: In function ‘int cuvs_brute_force_search(const float*, const float*, int64_t, int, int, uint32_t, CuvsSearchResult*, int)’:
+src/cuvs_wrapper.cu:607:49: warning: ‘cuvs::neighbors::brute_force::index<float> cuvs::neighbors::brute_force::build(const raft::resources&, raft::device_matrix_view<const float, long int>, cuvs::distance::DistanceType, float)’ is deprecated [-Wdeprecated-declarations]
+  607 |         auto index = cuvs::neighbors::brute_force::build(
+      |              ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^~~~~~~~~                                                                  
+/opt/miniforge3/envs/cuvs_dev/include/cuvs/neighbors/brute_force.hpp:210:21: note: declared here
+  210 | [[deprecated]] auto build(
+      |                     ^~~~~
+src/cuvs_wrapper.cu:612:37: warning: ‘void cuvs::neighbors::brute_force::search(const raft::resources&, const cuvs::neighbors::brute_force::index<float>&, raft::device_matrix_view<const float, long int>, raft::device_matrix_view<long int, long int, cuda::std::__4::layout_right>, raft::device_matrix_view<float, long int>, const cuvs::neighbors::filtering::base_filter&)’ is deprecated [-Wdeprecated-declarations]
+  612 |         cuvs::neighbors::brute_force::search(
+      |         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~^~~~~~~~~                                                                                    
+/opt/miniforge3/envs/cuvs_dev/include/cuvs/neighbors/brute_force.hpp:376:21: note: declared here
+  376 | [[deprecated]] void search(raft::resources const& handle,
+      |                     ^~~~~~
+src/cuvs_wrapper.cu: In function ‘void* cuvs_bf_build(const float*, int64_t, int, uint32_t, uint32_t, int)’:
+src/cuvs_wrapper.cu:668:47: warning: ‘cuvs::neighbors::brute_force::index<__half, float> cuvs::neighbors::brute_force::build(const raft::resources&, raft::device_matrix_view<const __half, long int>, cuvs::distance::DistanceType, float)’ is deprecated [-Wdeprecated-declarations]
+  668 |             auto idx = cuvs::neighbors::brute_force::build(
+      |             ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^~~~~~~~~~~~~                                                                     
+/opt/miniforge3/envs/cuvs_dev/include/cuvs/neighbors/brute_force.hpp:251:21: note: declared here
+  251 | [[deprecated]] auto build(
+      |                     ^~~~~
+src/cuvs_wrapper.cu:679:47: warning: ‘cuvs::neighbors::brute_force::index<float> cuvs::neighbors::brute_force::build(const raft::resources&, raft::device_matrix_view<const float, long int>, cuvs::distance::DistanceType, float)’ is deprecated [-Wdeprecated-declarations]
+  679 |             auto idx = cuvs::neighbors::brute_force::build(
+      |             ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^~~~~~~~~~~~~                                                                     
+/opt/miniforge3/envs/cuvs_dev/include/cuvs/neighbors/brute_force.hpp:210:21: note: declared here
+  210 | [[deprecated]] auto build(
+      |                     ^~~~~
+src/cuvs_wrapper.cu: In function ‘int cuvs_bf_search(CuvsBfIndex, const float*, int, int, CuvsSearchResult*, int)’:
+src/cuvs_wrapper.cu:740:37: warning: ‘void cuvs::neighbors::brute_force::search(const raft::resources&, const cuvs::neighbors::brute_force::index<__half, float>&, raft::device_matrix_view<const __half, long int>, raft::device_matrix_view<long int, long int, cuda::std::__4::layout_right>, raft::device_matrix_view<float, long int>, const cuvs::neighbors::filtering::base_filter&)’ is deprecated [-Wdeprecated-declarations]
+  740 |             cuvs::neighbors::brute_force::search(
+      |             ~~~~~~~~~~~~~~~~~~~~~~~~^~~~~~~~~~~~~                                                                                           
+/opt/miniforge3/envs/cuvs_dev/include/cuvs/neighbors/brute_force.hpp:444:21: note: declared here
+  444 | [[deprecated]] void search(raft::resources const& handle,
+      |                     ^~~~~~
+src/cuvs_wrapper.cu:748:37: warning: ‘void cuvs::neighbors::brute_force::search(const raft::resources&, const cuvs::neighbors::brute_force::index<float>&, raft::device_matrix_view<const float, long int>, raft::device_matrix_view<long int, long int, cuda::std::__4::layout_right>, raft::device_matrix_view<float, long int>, const cuvs::neighbors::filtering::base_filter&)’ is deprecated [-Wdeprecated-declarations]
+  748 |             cuvs::neighbors::brute_force::search(
+      |             ~~~~~~~~~~~~~~~~~~~~~~~~^~~~~~~~~~~~~                                                                                           
+/opt/miniforge3/envs/cuvs_dev/include/cuvs/neighbors/brute_force.hpp:376:21: note: declared here
+  376 | [[deprecated]] void search(raft::resources const& handle,
+      |                     ^~~~~~
+src/cuvs_wrapper.cu: In function ‘int cuvs_bf_search_batch(CuvsBfIndex, const float*, int, int, int, CuvsSearchResult*, int)’:
+src/cuvs_wrapper.cu:1383:37: warning: ‘void cuvs::neighbors::brute_force::search(const raft::resources&, const cuvs::neighbors::brute_force::index<__half, float>&, raft::device_matrix_view<const __half, long int>, raft::device_matrix_view<long int, long int, cuda::std::__4::layout_right>, raft::device_matrix_view<float, long int>, const cuvs::neighbors::filtering::base_filter&)’ is deprecated [-Wdeprecated-declarations]
+ 1383 |             cuvs::neighbors::brute_force::search(
+      |             ~~~~~~~~~~~~~~~~~~~~~~~~^~~~~~~~~~~~~                                                                                     
+/opt/miniforge3/envs/cuvs_dev/include/cuvs/neighbors/brute_force.hpp:444:21: note: declared here
+  444 | [[deprecated]] void search(raft::resources const& handle,
+      |                     ^~~~~~
+src/cuvs_wrapper.cu:1391:37: warning: ‘void cuvs::neighbors::brute_force::search(const raft::resources&, const cuvs::neighbors::brute_force::index<float>&, raft::device_matrix_view<const float, long int>, raft::device_matrix_view<long int, long int, cuda::std::__4::layout_right>, raft::device_matrix_view<float, long int>, const cuvs::neighbors::filtering::base_filter&)’ is deprecated [-Wdeprecated-declarations]
+ 1391 |             cuvs::neighbors::brute_force::search(
+      |             ~~~~~~~~~~~~~~~~~~~~~~~~^~~~~~~~~~~~~                                                                                     
+/opt/miniforge3/envs/cuvs_dev/include/cuvs/neighbors/brute_force.hpp:376:21: note: declared here
+  376 | [[deprecated]] void search(raft::resources const& handle,
+      |                     ^~~~~~
+src/cuvs_wrapper.cu: In function ‘int cuvs_hnsw_serialize(CuvsCagraIndex, const char*, int)’:
+src/cuvs_wrapper.cu:1815:17: warning: format ‘%zu’ expects argument of type ‘size_t’, but argument 3 has type ‘unsigned int’ [-Wformat=]
+ 1815 |         fprintf(stderr, "[cuvs_hnsw_serialize] skip: n_vecs=%zu < %d (too small for hnswlib)\n",
+      |                 ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~  ~~~~~~~            
+      |                                                                                                           |
+      |                                                                                                           unsigned int
+In file included from /opt/miniforge3/envs/cuvs_dev/include/rmm/mr/device_memory_resource.hpp:7,
+                 from /opt/miniforge3/envs/cuvs_dev/include/rmm/mr/statistics_resource_adaptor.hpp:8,
+                 from /home/ubuntu/index-accel-validation/peak_probe.cpp:2:
+/opt/miniforge3/envs/cuvs_dev/include/rmm/cuda_stream_view.hpp:48:32: error: expected ‘)’ before ‘stream’
+   48 |   cuda_stream_view(cudaStream_t stream) noexcept;
+      |                   ~            ^~~~~~~
+      |                                )
+/opt/miniforge3/envs/cuvs_dev/include/rmm/cuda_stream_view.hpp:55:20: error: ‘cuda’ has not been declared
+   55 |   cuda_stream_view(cuda::stream_ref stream) noexcept;
+      |                    ^~~~
+/opt/miniforge3/envs/cuvs_dev/include/rmm/cuda_stream_view.hpp:55:36: error: expected ‘)’ before ‘stream’
+   55 |   cuda_stream_view(cuda::stream_ref stream) noexcept;
+      |                   ~                ^~~~~~~
+      |                                    )
+/opt/miniforge3/envs/cuvs_dev/include/rmm/cuda_stream_view.hpp:62:17: error: ‘cudaStream_t’ does not name a type; did you mean ‘cuda_stream_view’?
+   62 |   [[nodiscard]] cudaStream_t value() const noexcept;
+      |                 ^~~~~~~~~~~~
+      |                 cuda_stream_view
+/opt/miniforge3/envs/cuvs_dev/include/rmm/cuda_stream_view.hpp:69:12: error: expected type-specifier before ‘cudaStream_t’
+   69 |   operator cudaStream_t() const noexcept;
+      |            ^~~~~~~~~~~~
+/opt/miniforge3/envs/cuvs_dev/include/rmm/cuda_stream_view.hpp:76:12: error: ‘cuda’ does not name a type
+   76 |   operator cuda::stream_ref() const noexcept;
+      |            ^~~~
+/opt/miniforge3/envs/cuvs_dev/include/rmm/cuda_stream_view.hpp:105:3: error: ‘cudaStream_t’ does not name a type; did you mean ‘cuda_stream_view’?
+  105 |   cudaStream_t stream_{};
+      |   ^~~~~~~~~~~~
+      |   cuda_stream_view
+/opt/miniforge3/envs/cuvs_dev/include/rmm/cuda_stream_view.hpp:117:3: error: ‘cudaStreamLegacy’ was not declared in this scope; did you mean ‘cuda_stream_legacy’?
+  117 |   cudaStreamLegacy  // NOLINT(cppcoreguidelines-pro-type-cstyle-cast)
+      |   ^~~~~~~~~~~~~~~~
+      |   cuda_stream_legacy
+/opt/miniforge3/envs/cuvs_dev/include/rmm/cuda_stream_view.hpp:124:3: error: ‘cudaStreamPerThread’ was not declared in this scope; did you mean ‘cuda_stream_per_thread’?
+  124 |   cudaStreamPerThread  // NOLINT(cppcoreguidelines-pro-type-cstyle-cast)
+      |   ^~~~~~~~~~~~~~~~~~~
+      |   cuda_stream_per_thread
+In file included from /opt/miniforge3/envs/cuvs_dev/include/rmm/mr/statistics_resource_adaptor.hpp:8,
+                 from /home/ubuntu/index-accel-validation/peak_probe.cpp:2:
+/opt/miniforge3/envs/cuvs_dev/include/rmm/mr/device_memory_resource.hpp:229:59: error: ‘cuda’ has not been declared
+  229 |   friend void get_property(device_memory_resource const&, cuda::mr::device_accessible) noexcept {}
+      |                                                           ^~~~
+/opt/miniforge3/envs/cuvs_dev/include/rmm/mr/device_memory_resource.hpp:280:15: error: ‘cuda’ has not been declared
+  280 | static_assert(cuda::mr::synchronous_resource<device_memory_resource>);
+      |               ^~~~
+/opt/miniforge3/envs/cuvs_dev/include/rmm/mr/device_memory_resource.hpp:280:68: error: expected primary-expression before ‘>’ token
+  280 | static_assert(cuda::mr::synchronous_resource<device_memory_resource>);
+      |                                                                    ^
+/opt/miniforge3/envs/cuvs_dev/include/rmm/mr/device_memory_resource.hpp:280:69: error: expected primary-expression before ‘)’ token
+  280 | static_assert(cuda::mr::synchronous_resource<device_memory_resource>);
+      |                                                                     ^
+/opt/miniforge3/envs/cuvs_dev/include/rmm/mr/device_memory_resource.hpp:281:15: error: ‘cuda’ has not been declared
+  281 | static_assert(cuda::mr::resource<device_memory_resource>);
+      |               ^~~~
+/opt/miniforge3/envs/cuvs_dev/include/rmm/mr/device_memory_resource.hpp:281:56: error: expected primary-expression before ‘>’ token
+  281 | static_assert(cuda::mr::resource<device_memory_resource>);
+      |                                                        ^
+/opt/miniforge3/envs/cuvs_dev/include/rmm/mr/device_memory_resource.hpp:281:57: error: expected primary-expression before ‘)’ token
+  281 | static_assert(cuda::mr::resource<device_memory_resource>);
+      |                                                         ^
+/opt/miniforge3/envs/cuvs_dev/include/rmm/mr/device_memory_resource.hpp:283:3: error: ‘cuda’ has not been declared
+  283 |   cuda::mr::synchronous_resource_with<device_memory_resource, cuda::mr::device_accessible>);
+      |   ^~~~
+/opt/miniforge3/envs/cuvs_dev/include/rmm/mr/device_memory_resource.hpp:283:61: error: expected primary-expression before ‘,’ token
+  283 |   cuda::mr::synchronous_resource_with<device_memory_resource, cuda::mr::device_accessible>);
+      |                                                             ^
+/opt/miniforge3/envs/cuvs_dev/include/rmm/mr/device_memory_resource.hpp:283:63: error: expected string-literal before ‘cuda’
+  283 |   cuda::mr::synchronous_resource_with<device_memory_resource, cuda::mr::device_accessible>);
+      |                                                               ^~~~
+/opt/miniforge3/envs/cuvs_dev/include/rmm/mr/device_memory_resource.hpp:283:62: error: expected ‘)’ before ‘cuda’
+  283 |   cuda::mr::synchronous_resource_with<device_memory_resource, cuda::mr::device_accessible>);
+      |                                                              ^~~~~
+      |                                                              )
+/opt/miniforge3/envs/cuvs_dev/include/rmm/mr/device_memory_resource.hpp:282:14: note: to match this ‘(’
+  282 | static_assert(
+      |              ^
+/opt/miniforge3/envs/cuvs_dev/include/rmm/mr/device_memory_resource.hpp:284:15: error: ‘cuda’ has not been declared
+  284 | static_assert(cuda::mr::resource_with<device_memory_resource, cuda::mr::device_accessible>);
+      |               ^~~~
+/opt/miniforge3/envs/cuvs_dev/include/rmm/mr/device_memory_resource.hpp:284:61: error: expected primary-expression before ‘,’ token
+  284 | static_assert(cuda::mr::resource_with<device_memory_resource, cuda::mr::device_accessible>);
+      |                                                             ^
+/opt/miniforge3/envs/cuvs_dev/include/rmm/mr/device_memory_resource.hpp:284:63: error: expected string-literal before ‘cuda’
+  284 | static_assert(cuda::mr::resource_with<device_memory_resource, cuda::mr::device_accessible>);
+      |                                                               ^~~~
+/opt/miniforge3/envs/cuvs_dev/include/rmm/mr/device_memory_resource.hpp:284:62: error: expected ‘)’ before ‘cuda’
+  284 | static_assert(cuda::mr::resource_with<device_memory_resource, cuda::mr::device_accessible>);
+      |              ~                                               ^~~~~
+      |                                                              )
+In file included from /opt/miniforge3/envs/cuvs_dev/include/rmm/mr/device_memory_resource.hpp:9,
+                 from /opt/miniforge3/envs/cuvs_dev/include/rmm/mr/statistics_resource_adaptor.hpp:8,
+                 from /home/ubuntu/index-accel-validation/peak_probe.cpp:2:
+/opt/miniforge3/envs/cuvs_dev/include/rmm/mr/cuda_memory_resource.hpp: In member function ‘virtual void* rmm::mr::cuda_memory_resource::do_allocate(std::size_t, rmm::cuda_stream_view)’:
+/opt/miniforge3/envs/cuvs_dev/include/rmm/detail/error.hpp:141:5: error: ‘cudaError_t’ was not declared in this scope
+  141 |     cudaError_t const error = (_call);                                                  \
+      |     ^~~~~~~~~~~
+/opt/miniforge3/envs/cuvs_dev/include/rmm/detail/error.hpp:137:57: note: in expansion of macro ‘RMM_CUDA_TRY_ALLOC_2’
+  137 | #define GET_RMM_CUDA_TRY_ALLOC_MACRO(_1, _2, NAME, ...) NAME
+      |                                                         ^~~~
+/opt/miniforge3/envs/cuvs_dev/include/rmm/detail/error.hpp:135:3: note: in expansion of macro ‘GET_RMM_CUDA_TRY_ALLOC_MACRO’
+  135 |   GET_RMM_CUDA_TRY_ALLOC_MACRO(__VA_ARGS__, RMM_CUDA_TRY_ALLOC_2, RMM_CUDA_TRY_ALLOC_1) \
+      |   ^~~~~~~~~~~~~~~~~~~~~~~~~~~~
+/opt/miniforge3/envs/cuvs_dev/include/rmm/mr/cuda_memory_resource.hpp:51:5: note: in expansion of macro ‘RMM_CUDA_TRY_ALLOC’
+   51 |     RMM_CUDA_TRY_ALLOC(cudaMalloc(&ptr, bytes), bytes);
+      |     ^~~~~~~~~~~~~~~~~~
+/opt/miniforge3/envs/cuvs_dev/include/rmm/detail/error.hpp:142:9: error: ‘cudaSuccess’ was not declared in this scope
+  142 |     if (cudaSuccess != error) {                                                         \
+      |         ^~~~~~~~~~~
+/opt/miniforge3/envs/cuvs_dev/include/rmm/detail/error.hpp:137:57: note: in expansion of macro ‘RMM_CUDA_TRY_ALLOC_2’
+  137 | #define GET_RMM_CUDA_TRY_ALLOC_MACRO(_1, _2, NAME, ...) NAME
+      |                                                         ^~~~
+/opt/miniforge3/envs/cuvs_dev/include/rmm/detail/error.hpp:135:3: note: in expansion of macro ‘GET_RMM_CUDA_TRY_ALLOC_MACRO’
+  135 |   GET_RMM_CUDA_TRY_ALLOC_MACRO(__VA_ARGS__, RMM_CUDA_TRY_ALLOC_2, RMM_CUDA_TRY_ALLOC_1) \
+      |   ^~~~~~~~~~~~~~~~~~~~~~~~~~~~
+/opt/miniforge3/envs/cuvs_dev/include/rmm/mr/cuda_memory_resource.hpp:51:5: note: in expansion of macro ‘RMM_CUDA_TRY_ALLOC’
+   51 |     RMM_CUDA_TRY_ALLOC(cudaMalloc(&ptr, bytes), bytes);
+      |     ^~~~~~~~~~~~~~~~~~
+/opt/miniforge3/envs/cuvs_dev/include/rmm/detail/error.hpp:142:24: error: ‘error’ was not declared in this scope; did you mean ‘perror’?
+  142 |     if (cudaSuccess != error) {                                                         \
+      |                        ^~~~~
+/opt/miniforge3/envs/cuvs_dev/include/rmm/detail/error.hpp:137:57: note: in expansion of macro ‘RMM_CUDA_TRY_ALLOC_2’
+  137 | #define GET_RMM_CUDA_TRY_ALLOC_MACRO(_1, _2, NAME, ...) NAME
+      |                                                         ^~~~
+/opt/miniforge3/envs/cuvs_dev/include/rmm/detail/error.hpp:135:3: note: in expansion of macro ‘GET_RMM_CUDA_TRY_ALLOC_MACRO’
+  135 |   GET_RMM_CUDA_TRY_ALLOC_MACRO(__VA_ARGS__, RMM_CUDA_TRY_ALLOC_2, RMM_CUDA_TRY_ALLOC_1) \
+      |   ^~~~~~~~~~~~~~~~~~~~~~~~~~~~
+/opt/miniforge3/envs/cuvs_dev/include/rmm/mr/cuda_memory_resource.hpp:51:5: note: in expansion of macro ‘RMM_CUDA_TRY_ALLOC’
+   51 |     RMM_CUDA_TRY_ALLOC(cudaMalloc(&ptr, bytes), bytes);
+      |     ^~~~~~~~~~~~~~~~~~
+/opt/miniforge3/envs/cuvs_dev/include/rmm/detail/error.hpp:143:7: error: ‘cudaGetLastError’ was not declared in this scope
+  143 |       cudaGetLastError();                                                               \
+      |       ^~~~~~~~~~~~~~~~
+/opt/miniforge3/envs/cuvs_dev/include/rmm/detail/error.hpp:137:57: note: in expansion of macro ‘RMM_CUDA_TRY_ALLOC_2’
+  137 | #define GET_RMM_CUDA_TRY_ALLOC_MACRO(_1, _2, NAME, ...) NAME
+      |                                                         ^~~~
+/opt/miniforge3/envs/cuvs_dev/include/rmm/detail/error.hpp:135:3: note: in expansion of macro ‘GET_RMM_CUDA_TRY_ALLOC_MACRO’
+  135 |   GET_RMM_CUDA_TRY_ALLOC_MACRO(__VA_ARGS__, RMM_CUDA_TRY_ALLOC_2, RMM_CUDA_TRY_ALLOC_1) \
+      |   ^~~~~~~~~~~~~~~~~~~~~~~~~~~~
+/opt/miniforge3/envs/cuvs_dev/include/rmm/mr/cuda_memory_resource.hpp:51:5: note: in expansion of macro ‘RMM_CUDA_TRY_ALLOC’
+   51 |     RMM_CUDA_TRY_ALLOC(cudaMalloc(&ptr, bytes), bytes);
+      |     ^~~~~~~~~~~~~~~~~~
+/opt/miniforge3/envs/cuvs_dev/include/rmm/detail/error.hpp:146:57: error: ‘cudaGetErrorName’ was not declared in this scope
+  146 |                        RMM_STRINGIFY(__LINE__) + ": " + cudaGetErrorName(error) + " " + \
+      |                                                         ^~~~~~~~~~~~~~~~
+/opt/miniforge3/envs/cuvs_dev/include/rmm/detail/error.hpp:137:57: note: in expansion of macro ‘RMM_CUDA_TRY_ALLOC_2’
+  137 | #define GET_RMM_CUDA_TRY_ALLOC_MACRO(_1, _2, NAME, ...) NAME
+      |                                                         ^~~~
+/opt/miniforge3/envs/cuvs_dev/include/rmm/detail/error.hpp:135:3: note: in expansion of macro ‘GET_RMM_CUDA_TRY_ALLOC_MACRO’
+  135 |   GET_RMM_CUDA_TRY_ALLOC_MACRO(__VA_ARGS__, RMM_CUDA_TRY_ALLOC_2, RMM_CUDA_TRY_ALLOC_1) \
+      |   ^~~~~~~~~~~~~~~~~~~~~~~~~~~~
+/opt/miniforge3/envs/cuvs_dev/include/rmm/mr/cuda_memory_resource.hpp:51:5: note: in expansion of macro ‘RMM_CUDA_TRY_ALLOC’
+   51 |     RMM_CUDA_TRY_ALLOC(cudaMalloc(&ptr, bytes), bytes);
+      |     ^~~~~~~~~~~~~~~~~~
+/opt/miniforge3/envs/cuvs_dev/include/rmm/detail/error.hpp:147:24: error: ‘cudaGetErrorString’ was not declared in this scope
+  147 |                        cudaGetErrorString(error);                                       \
+      |                        ^~~~~~~~~~~~~~~~~~
+/opt/miniforge3/envs/cuvs_dev/include/rmm/detail/error.hpp:137:57: note: in expansion of macro ‘RMM_CUDA_TRY_ALLOC_2’
+  137 | #define GET_RMM_CUDA_TRY_ALLOC_MACRO(_1, _2, NAME, ...) NAME
+      |                                                         ^~~~
+/opt/miniforge3/envs/cuvs_dev/include/rmm/detail/error.hpp:135:3: note: in expansion of macro ‘GET_RMM_CUDA_TRY_ALLOC_MACRO’
+  135 |   GET_RMM_CUDA_TRY_ALLOC_MACRO(__VA_ARGS__, RMM_CUDA_TRY_ALLOC_2, RMM_CUDA_TRY_ALLOC_1) \
+      |   ^~~~~~~~~~~~~~~~~~~~~~~~~~~~
+/opt/miniforge3/envs/cuvs_dev/include/rmm/mr/cuda_memory_resource.hpp:51:5: note: in expansion of macro ‘RMM_CUDA_TRY_ALLOC’
+   51 |     RMM_CUDA_TRY_ALLOC(cudaMalloc(&ptr, bytes), bytes);
+      |     ^~~~~~~~~~~~~~~~~~
+/opt/miniforge3/envs/cuvs_dev/include/rmm/detail/error.hpp:148:11: error: ‘cudaErrorMemoryAllocation’ was not declared in this scope
+  148 |       if (cudaErrorMemoryAllocation == error) { throw rmm::out_of_memory{msg}; }        \
+      |           ^~~~~~~~~~~~~~~~~~~~~~~~~
+/opt/miniforge3/envs/cuvs_dev/include/rmm/detail/error.hpp:137:57: note: in expansion of macro ‘RMM_CUDA_TRY_ALLOC_2’
+  137 | #define GET_RMM_CUDA_TRY_ALLOC_MACRO(_1, _2, NAME, ...) NAME
+      |                                                         ^~~~
+/opt/miniforge3/envs/cuvs_dev/include/rmm/detail/error.hpp:135:3: note: in expansion of macro ‘GET_RMM_CUDA_TRY_ALLOC_MACRO’
+  135 |   GET_RMM_CUDA_TRY_ALLOC_MACRO(__VA_ARGS__, RMM_CUDA_TRY_ALLOC_2, RMM_CUDA_TRY_ALLOC_1) \
+      |   ^~~~~~~~~~~~~~~~~~~~~~~~~~~~
+/opt/miniforge3/envs/cuvs_dev/include/rmm/mr/cuda_memory_resource.hpp:51:5: note: in expansion of macro ‘RMM_CUDA_TRY_ALLOC’
+   51 |     RMM_CUDA_TRY_ALLOC(cudaMalloc(&ptr, bytes), bytes);
+      |     ^~~~~~~~~~~~~~~~~~
+/opt/miniforge3/envs/cuvs_dev/include/rmm/detail/error.hpp:148:77: error: no matching function for call to ‘rmm::out_of_memory::out_of_memory(<brace-enclosed initializer list>)’
+  148 |       if (cudaErrorMemoryAllocation == error) { throw rmm::out_of_memory{msg}; }        \
+      |                                                                             ^
+/opt/miniforge3/envs/cuvs_dev/include/rmm/detail/error.hpp:137:57: note: in expansion of macro ‘RMM_CUDA_TRY_ALLOC_2’
+  137 | #define GET_RMM_CUDA_TRY_ALLOC_MACRO(_1, _2, NAME, ...) NAME
+      |                                                         ^~~~
+/opt/miniforge3/envs/cuvs_dev/include/rmm/detail/error.hpp:135:3: note: in expansion of macro ‘GET_RMM_CUDA_TRY_ALLOC_MACRO’
+  135 |   GET_RMM_CUDA_TRY_ALLOC_MACRO(__VA_ARGS__, RMM_CUDA_TRY_ALLOC_2, RMM_CUDA_TRY_ALLOC_1) \
+      |   ^~~~~~~~~~~~~~~~~~~~~~~~~~~~
+/opt/miniforge3/envs/cuvs_dev/include/rmm/mr/cuda_memory_resource.hpp:51:5: note: in expansion of macro ‘RMM_CUDA_TRY_ALLOC’
+   51 |     RMM_CUDA_TRY_ALLOC(cudaMalloc(&ptr, bytes), bytes);
+      |     ^~~~~~~~~~~~~~~~~~
+In file included from /opt/miniforge3/envs/cuvs_dev/include/rmm/detail/error.hpp:8,
+                 from /opt/miniforge3/envs/cuvs_dev/include/rmm/mr/device_memory_resource.hpp:9,
+                 from /opt/miniforge3/envs/cuvs_dev/include/rmm/mr/statistics_resource_adaptor.hpp:8,
+                 from /home/ubuntu/index-accel-validation/peak_probe.cpp:2:
+/opt/miniforge3/envs/cuvs_dev/include/rmm/error.hpp:90:3: note: candidate: ‘rmm::out_of_memory::out_of_memory(const string&)’
+   90 |   out_of_memory(std::string const& msg);
+      |   ^~~~~~~~~~~~~
+/opt/miniforge3/envs/cuvs_dev/include/rmm/error.hpp:90:3: note:   conversion of argument 1 would be ill-formed:
+/opt/miniforge3/envs/cuvs_dev/include/rmm/error.hpp:83:3: note: candidate: ‘rmm::out_of_memory::out_of_memory(const char*)’
+   83 |   out_of_memory(const char* msg);
+      |   ^~~~~~~~~~~~~
+/opt/miniforge3/envs/cuvs_dev/include/rmm/error.hpp:83:3: note:   conversion of argument 1 would be ill-formed:
+/opt/miniforge3/envs/cuvs_dev/include/rmm/error.hpp:76:7: note: candidate: ‘rmm::out_of_memory::out_of_memory(const rmm::out_of_memory&)’
+   76 | class out_of_memory : public bad_alloc {
+      |       ^~~~~~~~~~~~~
+/opt/miniforge3/envs/cuvs_dev/include/rmm/error.hpp:76:7: note:   conversion of argument 1 would be ill-formed:
+/opt/miniforge3/envs/cuvs_dev/include/rmm/error.hpp:76:7: note: candidate: ‘rmm::out_of_memory::out_of_memory(rmm::out_of_memory&&)’
+/opt/miniforge3/envs/cuvs_dev/include/rmm/error.hpp:76:7: note:   conversion of argument 1 would be ill-formed:
+In file included from /opt/miniforge3/envs/cuvs_dev/include/rmm/mr/device_memory_resource.hpp:9,
+                 from /opt/miniforge3/envs/cuvs_dev/include/rmm/mr/statistics_resource_adaptor.hpp:8,
+                 from /home/ubuntu/index-accel-validation/peak_probe.cpp:2:
+/opt/miniforge3/envs/cuvs_dev/include/rmm/detail/error.hpp:149:31: error: no matching function for call to ‘rmm::bad_alloc::bad_alloc(<brace-enclosed initializer list>)’
+  149 |       throw rmm::bad_alloc{msg};                                                        \
+      |                               ^
+/opt/miniforge3/envs/cuvs_dev/include/rmm/detail/error.hpp:137:57: note: in expansion of macro ‘RMM_CUDA_TRY_ALLOC_2’
+  137 | #define GET_RMM_CUDA_TRY_ALLOC_MACRO(_1, _2, NAME, ...) NAME
+      |                                                         ^~~~
+/opt/miniforge3/envs/cuvs_dev/include/rmm/detail/error.hpp:135:3: note: in expansion of macro ‘GET_RMM_CUDA_TRY_ALLOC_MACRO’
+  135 |   GET_RMM_CUDA_TRY_ALLOC_MACRO(__VA_ARGS__, RMM_CUDA_TRY_ALLOC_2, RMM_CUDA_TRY_ALLOC_1) \
+      |   ^~~~~~~~~~~~~~~~~~~~~~~~~~~~
+/opt/miniforge3/envs/cuvs_dev/include/rmm/mr/cuda_memory_resource.hpp:51:5: note: in expansion of macro ‘RMM_CUDA_TRY_ALLOC’
+   51 |     RMM_CUDA_TRY_ALLOC(cudaMalloc(&ptr, bytes), bytes);
+      |     ^~~~~~~~~~~~~~~~~~
+In file included from /opt/miniforge3/envs/cuvs_dev/include/rmm/detail/error.hpp:8,
+                 from /opt/miniforge3/envs/cuvs_dev/include/rmm/mr/device_memory_resource.hpp:9,
+                 from /opt/miniforge3/envs/cuvs_dev/include/rmm/mr/statistics_resource_adaptor.hpp:8,
+                 from /home/ubuntu/index-accel-validation/peak_probe.cpp:2:
+/opt/miniforge3/envs/cuvs_dev/include/rmm/error.hpp:58:3: note: candidate: ‘rmm::bad_alloc::bad_alloc(const string&)’
+   58 |   bad_alloc(std::string const& msg);
+      |   ^~~~~~~~~
+/opt/miniforge3/envs/cuvs_dev/include/rmm/error.hpp:58:3: note:   conversion of argument 1 would be ill-formed:
+/opt/miniforge3/envs/cuvs_dev/include/rmm/error.hpp:51:3: note: candidate: ‘rmm::bad_alloc::bad_alloc(const char*)’
+   51 |   bad_alloc(const char* msg);
+      |   ^~~~~~~~~
+/opt/miniforge3/envs/cuvs_dev/include/rmm/error.hpp:51:3: note:   conversion of argument 1 would be ill-formed:
+/opt/miniforge3/envs/cuvs_dev/include/rmm/error.hpp:44:7: note: candidate: ‘rmm::bad_alloc::bad_alloc(const rmm::bad_alloc&)’
+   44 | class bad_alloc : public std::bad_alloc {
+      |       ^~~~~~~~~
+/opt/miniforge3/envs/cuvs_dev/include/rmm/error.hpp:44:7: note:   conversion of argument 1 would be ill-formed:
+/opt/miniforge3/envs/cuvs_dev/include/rmm/error.hpp:44:7: note: candidate: ‘rmm::bad_alloc::bad_alloc(rmm::bad_alloc&&)’
+/opt/miniforge3/envs/cuvs_dev/include/rmm/error.hpp:44:7: note:   conversion of argument 1 would be ill-formed:
+In file included from /opt/miniforge3/envs/cuvs_dev/include/rmm/mr/device_memory_resource.hpp:9,
+                 from /opt/miniforge3/envs/cuvs_dev/include/rmm/mr/statistics_resource_adaptor.hpp:8,
+                 from /home/ubuntu/index-accel-validation/peak_probe.cpp:2:
+/opt/miniforge3/envs/cuvs_dev/include/rmm/mr/cuda_memory_resource.hpp: In member function ‘virtual void rmm::mr::cuda_memory_resource::do_deallocate(void*, std::size_t, rmm::cuda_stream_view)’:
+/opt/miniforge3/envs/cuvs_dev/include/rmm/detail/error.hpp:236:5: error: ‘cudaError_t’ was not declared in this scope
+  236 |     cudaError_t const status__ = (_call);                                       \
+      |     ^~~~~~~~~~~
+/opt/miniforge3/envs/cuvs_dev/include/rmm/mr/cuda_memory_resource.hpp:69:5: note: in expansion of macro ‘RMM_ASSERT_CUDA_SUCCESS_SAFE_SHUTDOWN’
+   69 |     RMM_ASSERT_CUDA_SUCCESS_SAFE_SHUTDOWN(cudaFree(ptr));
+      |     ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+/opt/miniforge3/envs/cuvs_dev/include/rmm/detail/error.hpp:237:9: error: ‘status__’ was not declared in this scope
+  237 |     if (status__ != cudaSuccess && status__ != cudaErrorCudartUnloading) {      \
+      |         ^~~~~~~~
+/opt/miniforge3/envs/cuvs_dev/include/rmm/mr/cuda_memory_resource.hpp:69:5: note: in expansion of macro ‘RMM_ASSERT_CUDA_SUCCESS_SAFE_SHUTDOWN’
+   69 |     RMM_ASSERT_CUDA_SUCCESS_SAFE_SHUTDOWN(cudaFree(ptr));
+      |     ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+/opt/miniforge3/envs/cuvs_dev/include/rmm/detail/error.hpp:237:21: error: ‘cudaSuccess’ was not declared in this scope
+  237 |     if (status__ != cudaSuccess && status__ != cudaErrorCudartUnloading) {      \
+      |                     ^~~~~~~~~~~
+/opt/miniforge3/envs/cuvs_dev/include/rmm/mr/cuda_memory_resource.hpp:69:5: note: in expansion of macro ‘RMM_ASSERT_CUDA_SUCCESS_SAFE_SHUTDOWN’
+   69 |     RMM_ASSERT_CUDA_SUCCESS_SAFE_SHUTDOWN(cudaFree(ptr));
+      |     ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+/opt/miniforge3/envs/cuvs_dev/include/rmm/detail/error.hpp:237:48: error: ‘cudaErrorCudartUnloading’ was not declared in this scope
+  237 |     if (status__ != cudaSuccess && status__ != cudaErrorCudartUnloading) {      \
+      |                                                ^~~~~~~~~~~~~~~~~~~~~~~~
+/opt/miniforge3/envs/cuvs_dev/include/rmm/mr/cuda_memory_resource.hpp:69:5: note: in expansion of macro ‘RMM_ASSERT_CUDA_SUCCESS_SAFE_SHUTDOWN’
+   69 |     RMM_ASSERT_CUDA_SUCCESS_SAFE_SHUTDOWN(cudaFree(ptr));
+      |     ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+/opt/miniforge3/envs/cuvs_dev/include/rmm/detail/error.hpp:238:47: error: ‘cudaGetErrorName’ was not declared in this scope
+  238 |       std::cerr << "CUDA Error detected. " << cudaGetErrorName(status__) << " " \
+      |                                               ^~~~~~~~~~~~~~~~
+/opt/miniforge3/envs/cuvs_dev/include/rmm/mr/cuda_memory_resource.hpp:69:5: note: in expansion of macro ‘RMM_ASSERT_CUDA_SUCCESS_SAFE_SHUTDOWN’
+   69 |     RMM_ASSERT_CUDA_SUCCESS_SAFE_SHUTDOWN(cudaFree(ptr));
+      |     ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+/opt/miniforge3/envs/cuvs_dev/include/rmm/detail/error.hpp:239:20: error: ‘cudaGetErrorString’ was not declared in this scope
+  239 |                 << cudaGetErrorString(status__) << std::endl;                   \
+      |                    ^~~~~~~~~~~~~~~~~~
+/opt/miniforge3/envs/cuvs_dev/include/rmm/mr/cuda_memory_resource.hpp:69:5: note: in expansion of macro ‘RMM_ASSERT_CUDA_SUCCESS_SAFE_SHUTDOWN’
+   69 |     RMM_ASSERT_CUDA_SUCCESS_SAFE_SHUTDOWN(cudaFree(ptr));
+      |     ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+In file included from /usr/include/c++/11/cassert:44,
+                 from /opt/miniforge3/envs/cuvs_dev/include/rmm/detail/error.hpp:12,
+                 from /opt/miniforge3/envs/cuvs_dev/include/rmm/mr/device_memory_resource.hpp:9,
+                 from /opt/miniforge3/envs/cuvs_dev/include/rmm/mr/statistics_resource_adaptor.hpp:8,
+                 from /home/ubuntu/index-accel-validation/peak_probe.cpp:2:
+/opt/miniforge3/envs/cuvs_dev/include/rmm/detail/error.hpp:242:12: error: ‘status__’ was not declared in this scope
+  242 |     assert(status__ == cudaSuccess || status__ == cudaErrorCudartUnloading);    \
+      |            ^~~~~~~~
+/opt/miniforge3/envs/cuvs_dev/include/rmm/mr/cuda_memory_resource.hpp:69:5: note: in expansion of macro ‘RMM_ASSERT_CUDA_SUCCESS_SAFE_SHUTDOWN’
+   69 |     RMM_ASSERT_CUDA_SUCCESS_SAFE_SHUTDOWN(cudaFree(ptr));
+      |     ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+/opt/miniforge3/envs/cuvs_dev/include/rmm/detail/error.hpp:242:24: error: ‘cudaSuccess’ was not declared in this scope
+  242 |     assert(status__ == cudaSuccess || status__ == cudaErrorCudartUnloading);    \
+      |                        ^~~~~~~~~~~
+/opt/miniforge3/envs/cuvs_dev/include/rmm/mr/cuda_memory_resource.hpp:69:5: note: in expansion of macro ‘RMM_ASSERT_CUDA_SUCCESS_SAFE_SHUTDOWN’
+   69 |     RMM_ASSERT_CUDA_SUCCESS_SAFE_SHUTDOWN(cudaFree(ptr));
+      |     ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+/opt/miniforge3/envs/cuvs_dev/include/rmm/detail/error.hpp:242:51: error: ‘cudaErrorCudartUnloading’ was not declared in this scope
+  242 |     assert(status__ == cudaSuccess || status__ == cudaErrorCudartUnloading);    \
+      |                                                   ^~~~~~~~~~~~~~~~~~~~~~~~
+/opt/miniforge3/envs/cuvs_dev/include/rmm/mr/cuda_memory_resource.hpp:69:5: note: in expansion of macro ‘RMM_ASSERT_CUDA_SUCCESS_SAFE_SHUTDOWN’
+   69 |     RMM_ASSERT_CUDA_SUCCESS_SAFE_SHUTDOWN(cudaFree(ptr));
+      |     ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+In file included from /opt/miniforge3/envs/cuvs_dev/include/rmm/detail/cccl_adaptors.hpp:9,
+                 from /opt/miniforge3/envs/cuvs_dev/include/rmm/resource_ref.hpp:7,
+                 from /opt/miniforge3/envs/cuvs_dev/include/rmm/mr/per_device_resource.hpp:12,
+                 from /opt/miniforge3/envs/cuvs_dev/include/rmm/mr/statistics_resource_adaptor.hpp:9,
+                 from /home/ubuntu/index-accel-validation/peak_probe.cpp:2:
+/opt/miniforge3/envs/cuvs_dev/include/rmm/mr/detail/device_memory_resource_view.hpp: At global scope:
+/opt/miniforge3/envs/cuvs_dev/include/rmm/mr/detail/device_memory_resource_view.hpp:147:64: error: ‘cuda’ has not been declared
+  147 |   friend void get_property(device_memory_resource_view const&, cuda::mr::device_accessible) noexcept
+      |                                                                ^~~~
+/opt/miniforge3/envs/cuvs_dev/include/rmm/mr/detail/device_memory_resource_view.hpp:158:64: error: ‘cuda’ has not been declared
+  158 |   friend void get_property(device_memory_resource_view const&, cuda::mr::host_accessible) noexcept
+      |                                                                ^~~~
+/opt/miniforge3/envs/cuvs_dev/include/rmm/mr/detail/device_memory_resource_view.hpp:158:15: error: redefinition of ‘void rmm::mr::detail::get_property(const rmm::mr::detail::device_memory_resource_view&, int)’
+  158 |   friend void get_property(device_memory_resource_view const&, cuda::mr::host_accessible) noexcept
+      |               ^~~~~~~~~~~~
+/opt/miniforge3/envs/cuvs_dev/include/rmm/mr/detail/device_memory_resource_view.hpp:147:15: note: ‘void rmm::mr::detail::get_property(const rmm::mr::detail::device_memory_resource_view&, int)’ previously defined here
+  147 |   friend void get_property(device_memory_resource_view const&, cuda::mr::device_accessible) noexcept
+      |               ^~~~~~~~~~~~
+/opt/miniforge3/envs/cuvs_dev/include/rmm/mr/detail/device_memory_resource_view.hpp:167:15: error: ‘cuda’ has not been declared
+  167 | static_assert(cuda::mr::resource_with<device_memory_resource_view, cuda::mr::device_accessible>,
+      |               ^~~~
+/opt/miniforge3/envs/cuvs_dev/include/rmm/mr/detail/device_memory_resource_view.hpp:167:66: error: expected primary-expression before ‘,’ token
+  167 | static_assert(cuda::mr::resource_with<device_memory_resource_view, cuda::mr::device_accessible>,
+      |                                                                  ^
+/opt/miniforge3/envs/cuvs_dev/include/rmm/mr/detail/device_memory_resource_view.hpp:167:68: error: expected string-literal before ‘cuda’
+  167 | static_assert(cuda::mr::resource_with<device_memory_resource_view, cuda::mr::device_accessible>,
+      |                                                                    ^~~~
+/opt/miniforge3/envs/cuvs_dev/include/rmm/mr/detail/device_memory_resource_view.hpp:167:67: error: expected ‘)’ before ‘cuda’
+  167 | static_assert(cuda::mr::resource_with<device_memory_resource_view, cuda::mr::device_accessible>,
+      |              ~                                                    ^~~~~
+      |                                                                   )
+/opt/miniforge3/envs/cuvs_dev/include/rmm/mr/detail/device_memory_resource_view.hpp:170:3: error: ‘cuda’ has not been declared
+  170 |   cuda::mr::synchronous_resource_with<device_memory_resource_view, cuda::mr::device_accessible>,
+      |   ^~~~
+/opt/miniforge3/envs/cuvs_dev/include/rmm/mr/detail/device_memory_resource_view.hpp:170:66: error: expected primary-expression before ‘,’ token
+  170 |   cuda::mr::synchronous_resource_with<device_memory_resource_view, cuda::mr::device_accessible>,
+      |                                                                  ^
+/opt/miniforge3/envs/cuvs_dev/include/rmm/mr/detail/device_memory_resource_view.hpp:170:68: error: expected string-literal before ‘cuda’
+  170 |   cuda::mr::synchronous_resource_with<device_memory_resource_view, cuda::mr::device_accessible>,
+      |                                                                    ^~~~
+/opt/miniforge3/envs/cuvs_dev/include/rmm/mr/detail/device_memory_resource_view.hpp:170:67: error: expected ‘)’ before ‘cuda’
+  170 |   cuda::mr::synchronous_resource_with<device_memory_resource_view, cuda::mr::device_accessible>,
+      |                                                                   ^~~~~
+      |                                                                   )
+/opt/miniforge3/envs/cuvs_dev/include/rmm/mr/detail/device_memory_resource_view.hpp:169:14: note: to match this ‘(’
+  169 | static_assert(
+      |              ^
+/opt/miniforge3/envs/cuvs_dev/include/rmm/mr/detail/device_memory_resource_view.hpp:174:15: error: ‘cuda’ has not been declared
+  174 | static_assert(cuda::std::copyable<device_memory_resource_view>,
+      |               ^~~~
+/opt/miniforge3/envs/cuvs_dev/include/rmm/mr/detail/device_memory_resource_view.hpp:174:62: error: expected primary-expression before ‘>’ token
+  174 | static_assert(cuda::std::copyable<device_memory_resource_view>,
+      |                                                              ^
+/opt/miniforge3/envs/cuvs_dev/include/rmm/mr/detail/device_memory_resource_view.hpp:174:63: error: expected primary-expression before ‘,’ token
+  174 | static_assert(cuda::std::copyable<device_memory_resource_view>,
+      |                                                               ^
+/opt/miniforge3/envs/cuvs_dev/include/rmm/mr/detail/device_memory_resource_view.hpp:176:15: error: ‘cuda’ has not been declared
+  176 | static_assert(cuda::std::copy_constructible<device_memory_resource_view>,
+      |               ^~~~
+/opt/miniforge3/envs/cuvs_dev/include/rmm/mr/detail/device_memory_resource_view.hpp:176:72: error: expected primary-expression before ‘>’ token
+  176 | static_assert(cuda::std::copy_constructible<device_memory_resource_view>,
+      |                                                                        ^
+/opt/miniforge3/envs/cuvs_dev/include/rmm/mr/detail/device_memory_resource_view.hpp:176:73: error: expected primary-expression before ‘,’ token
+  176 | static_assert(cuda::std::copy_constructible<device_memory_resource_view>,
+      |                                                                         ^
+In file included from /opt/miniforge3/envs/cuvs_dev/include/rmm/resource_ref.hpp:7,
+                 from /opt/miniforge3/envs/cuvs_dev/include/rmm/mr/per_device_resource.hpp:12,
+                 from /opt/miniforge3/envs/cuvs_dev/include/rmm/mr/statistics_resource_adaptor.hpp:9,
+                 from /home/ubuntu/index-accel-validation/peak_probe.cpp:2:
+/opt/miniforge3/envs/cuvs_dev/include/rmm/detail/cccl_adaptors.hpp:90:27: error: ‘cuda::mr’ has not been declared
+   90 |   cccl_resource_ref(cuda::mr::synchronous_resource_ref<Properties...> const& ref)
+      |                           ^~
+/opt/miniforge3/envs/cuvs_dev/include/rmm/detail/cccl_adaptors.hpp:90:55: error: expected ‘)’ before ‘<’ token
+   90 |   cccl_resource_ref(cuda::mr::synchronous_resource_ref<Properties...> const& ref)
+      |                    ~                                  ^
+      |                                                       )
+/opt/miniforge3/envs/cuvs_dev/include/rmm/detail/cccl_adaptors.hpp:91:32: error: expected unqualified-id before ‘,’ token
+   91 |     : view_{cuda::std::nullopt}, ref_{ref}
+      |                                ^
+/opt/miniforge3/envs/cuvs_dev/include/rmm/detail/cccl_adaptors.hpp:92:3: error: expected unqualified-id before ‘{’ token
+   92 |   {
+      |   ^
+/opt/miniforge3/envs/cuvs_dev/include/rmm/detail/cccl_adaptors.hpp:105:27: error: ‘cuda::mr’ has not been declared
+  105 |   cccl_resource_ref(cuda::mr::synchronous_resource_ref<Properties...>&& ref)
+      |                           ^~
+/opt/miniforge3/envs/cuvs_dev/include/rmm/detail/cccl_adaptors.hpp:105:55: error: expected ‘)’ before ‘<’ token
+  105 |   cccl_resource_ref(cuda::mr::synchronous_resource_ref<Properties...>&& ref)
+      |                    ~                                  ^
+      |                                                       )
+/opt/miniforge3/envs/cuvs_dev/include/rmm/detail/cccl_adaptors.hpp:106:32: error: expected unqualified-id before ‘,’ token
+  106 |     : view_{cuda::std::nullopt}, ref_{std::move(ref)}
+      |                                ^
+/opt/miniforge3/envs/cuvs_dev/include/rmm/detail/cccl_adaptors.hpp:107:3: error: expected unqualified-id before ‘{’ token
+  107 |   {
+      |   ^
+/opt/miniforge3/envs/cuvs_dev/include/rmm/detail/cccl_adaptors.hpp:161:63: error: ‘mr’ is not a member of ‘cuda’; did you mean ‘rmm::mr’?
+  161 |                                                         cuda::mr::synchronous_resource_ref> and
+      |                                                               ^~
+In file included from /opt/miniforge3/envs/cuvs_dev/include/rmm/mr/statistics_resource_adaptor.hpp:8,
+                 from /home/ubuntu/index-accel-validation/peak_probe.cpp:2:
+/opt/miniforge3/envs/cuvs_dev/include/rmm/mr/device_memory_resource.hpp:19:11: note: ‘rmm::mr’ declared here
+   19 | namespace mr {
+      |           ^~
+In file included from /opt/miniforge3/envs/cuvs_dev/include/rmm/resource_ref.hpp:7,
+                 from /opt/miniforge3/envs/cuvs_dev/include/rmm/mr/per_device_resource.hpp:12,
+                 from /opt/miniforge3/envs/cuvs_dev/include/rmm/mr/statistics_resource_adaptor.hpp:9,
+                 from /home/ubuntu/index-accel-validation/peak_probe.cpp:2:
+/opt/miniforge3/envs/cuvs_dev/include/rmm/detail/cccl_adaptors.hpp:160:34: error: parse error in template argument list
+  160 |             std::enable_if_t<not is_specialization_of_v<std::remove_cv_t<OtherResourceType>,
+      |                                  ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+  161 |                                                         cuda::mr::synchronous_resource_ref> and
+      |                                                         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+/opt/miniforge3/envs/cuvs_dev/include/rmm/detail/cccl_adaptors.hpp:163:63: error: ‘mr’ is not a member of ‘cuda’; did you mean ‘rmm::mr’?
+  163 |                                                         cuda::mr::resource_ref> and
+      |                                                               ^~
+In file included from /opt/miniforge3/envs/cuvs_dev/include/rmm/mr/statistics_resource_adaptor.hpp:8,
+                 from /home/ubuntu/index-accel-validation/peak_probe.cpp:2:
+/opt/miniforge3/envs/cuvs_dev/include/rmm/mr/device_memory_resource.hpp:19:11: note: ‘rmm::mr’ declared here
+   19 | namespace mr {
+      |           ^~
+In file included from /opt/miniforge3/envs/cuvs_dev/include/rmm/resource_ref.hpp:7,
+                 from /opt/miniforge3/envs/cuvs_dev/include/rmm/mr/per_device_resource.hpp:12,
+                 from /opt/miniforge3/envs/cuvs_dev/include/rmm/mr/statistics_resource_adaptor.hpp:9,
+                 from /home/ubuntu/index-accel-validation/peak_probe.cpp:2:
+/opt/miniforge3/envs/cuvs_dev/include/rmm/detail/cccl_adaptors.hpp:162:34: error: parse error in template argument list
+  162 |                              not is_specialization_of_v<std::remove_cv_t<OtherResourceType>,
+      |                                  ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+  163 |                                                         cuda::mr::resource_ref> and
+      |                                                         ~~~~~~~~~~~~~~~~~~~~~~~
+/opt/miniforge3/envs/cuvs_dev/include/rmm/detail/cccl_adaptors.hpp:170:36: error: ‘mr’ is not a member of ‘cuda’; did you mean ‘rmm::mr’?
+  170 |                              cuda::mr::synchronous_resource<OtherResourceType>>* = nullptr>
+      |                                    ^~
+In file included from /opt/miniforge3/envs/cuvs_dev/include/rmm/mr/statistics_resource_adaptor.hpp:8,
+                 from /home/ubuntu/index-accel-validation/peak_probe.cpp:2:
+/opt/miniforge3/envs/cuvs_dev/include/rmm/mr/device_memory_resource.hpp:19:11: note: ‘rmm::mr’ declared here
+   19 | namespace mr {
+      |           ^~
+In file included from /opt/miniforge3/envs/cuvs_dev/include/rmm/resource_ref.hpp:7,
+                 from /opt/miniforge3/envs/cuvs_dev/include/rmm/mr/per_device_resource.hpp:12,
+                 from /opt/miniforge3/envs/cuvs_dev/include/rmm/mr/statistics_resource_adaptor.hpp:9,
+                 from /home/ubuntu/index-accel-validation/peak_probe.cpp:2:
+/opt/miniforge3/envs/cuvs_dev/include/rmm/detail/cccl_adaptors.hpp:160:18: error: parse error in template argument list
+  160 |             std::enable_if_t<not is_specialization_of_v<std::remove_cv_t<OtherResourceType>,
+      |                  ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+  161 |                                                         cuda::mr::synchronous_resource_ref> and
+      |                                                         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+  162 |                              not is_specialization_of_v<std::remove_cv_t<OtherResourceType>,
+      |                              ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+  163 |                                                         cuda::mr::resource_ref> and
+      |                                                         ~~~~~~~~~~~~~~~~~~~~~~~~~~~
+  164 |                              not is_specialization_of_v<std::remove_cv_t<OtherResourceType>,
+      |                              ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+  165 |                                                         ::rmm::detail::cccl_resource_ref> and
+      |                                                         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+  166 |                              not is_specialization_of_v<std::remove_cv_t<OtherResourceType>,
+      |                              ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+  167 |                                                         ::rmm::detail::cccl_async_resource_ref> and
+      |                                                         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+  168 |                              not std::is_base_of_v<rmm::mr::device_memory_resource,
+      |                              ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+  169 |                                                    std::remove_cv_t<OtherResourceType>> and
+      |                                                    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+  170 |                              cuda::mr::synchronous_resource<OtherResourceType>>* = nullptr>
+      |                              ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+/opt/miniforge3/envs/cuvs_dev/include/rmm/detail/cccl_adaptors.hpp:326:33: error: ‘cuda::mr’ has not been declared
+  326 |   cccl_async_resource_ref(cuda::mr::resource_ref<Properties...> const& ref)
+      |                                 ^~
+/opt/miniforge3/envs/cuvs_dev/include/rmm/detail/cccl_adaptors.hpp:326:49: error: expected ‘)’ before ‘<’ token
+  326 |   cccl_async_resource_ref(cuda::mr::resource_ref<Properties...> const& ref)
+      |                          ~                      ^
+      |                                                 )
+/opt/miniforge3/envs/cuvs_dev/include/rmm/detail/cccl_adaptors.hpp:327:32: error: expected unqualified-id before ‘,’ token
+  327 |     : view_{cuda::std::nullopt}, ref_{ref}
+      |                                ^
+/opt/miniforge3/envs/cuvs_dev/include/rmm/detail/cccl_adaptors.hpp:328:3: error: expected unqualified-id before ‘{’ token
+  328 |   {
+      |   ^
+/opt/miniforge3/envs/cuvs_dev/include/rmm/detail/cccl_adaptors.hpp:341:33: error: ‘cuda::mr’ has not been declared
+  341 |   cccl_async_resource_ref(cuda::mr::resource_ref<Properties...>&& ref)
+      |                                 ^~
+/opt/miniforge3/envs/cuvs_dev/include/rmm/detail/cccl_adaptors.hpp:341:49: error: expected ‘)’ before ‘<’ token
+  341 |   cccl_async_resource_ref(cuda::mr::resource_ref<Properties...>&& ref)
+      |                          ~                      ^
+      |                                                 )
+/opt/miniforge3/envs/cuvs_dev/include/rmm/detail/cccl_adaptors.hpp:342:32: error: expected unqualified-id before ‘,’ token
+  342 |     : view_{cuda::std::nullopt}, ref_{std::move(ref)}
+      |                                ^
+/opt/miniforge3/envs/cuvs_dev/include/rmm/detail/cccl_adaptors.hpp:343:3: error: expected unqualified-id before ‘{’ token
+  343 |   {
+      |   ^
+/opt/miniforge3/envs/cuvs_dev/include/rmm/detail/cccl_adaptors.hpp:355:33: error: ‘cuda::mr’ has not been declared
+  355 |   cccl_async_resource_ref(cuda::mr::any_resource<Properties...>& res)
+      |                                 ^~
+/opt/miniforge3/envs/cuvs_dev/include/rmm/detail/cccl_adaptors.hpp:355:49: error: expected ‘)’ before ‘<’ token
+  355 |   cccl_async_resource_ref(cuda::mr::any_resource<Properties...>& res)
+      |                          ~                      ^
+      |                                                 )
+/opt/miniforge3/envs/cuvs_dev/include/rmm/detail/cccl_adaptors.hpp:356:32: error: expected unqualified-id before ‘,’ token
+  356 |     : view_{cuda::std::nullopt}, ref_{res}
+      |                                ^
+/opt/miniforge3/envs/cuvs_dev/include/rmm/detail/cccl_adaptors.hpp:357:3: error: expected unqualified-id before ‘{’ token
+  357 |   {
+      |   ^
+/opt/miniforge3/envs/cuvs_dev/include/rmm/detail/cccl_adaptors.hpp:418:40: error: ‘mr’ is not a member of ‘cuda’; did you mean ‘rmm::mr’?
+  418 |                                  cuda::mr::synchronous_resource_ref> and
+      |                                        ^~
+In file included from /opt/miniforge3/envs/cuvs_dev/include/rmm/mr/statistics_resource_adaptor.hpp:8,
+                 from /home/ubuntu/index-accel-validation/peak_probe.cpp:2:
+/opt/miniforge3/envs/cuvs_dev/include/rmm/mr/device_memory_resource.hpp:19:11: note: ‘rmm::mr’ declared here
+   19 | namespace mr {
+      |           ^~
+In file included from /opt/miniforge3/envs/cuvs_dev/include/rmm/resource_ref.hpp:7,
+                 from /opt/miniforge3/envs/cuvs_dev/include/rmm/mr/per_device_resource.hpp:12,
+                 from /opt/miniforge3/envs/cuvs_dev/include/rmm/mr/statistics_resource_adaptor.hpp:9,
+                 from /home/ubuntu/index-accel-validation/peak_probe.cpp:2:
+/opt/miniforge3/envs/cuvs_dev/include/rmm/detail/cccl_adaptors.hpp:417:11: error: parse error in template argument list
+  417 |       not is_specialization_of_v<std::remove_cv_t<OtherResourceType>,
+      |           ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+  418 |                                  cuda::mr::synchronous_resource_ref> and
+      |                                  ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+/opt/miniforge3/envs/cuvs_dev/include/rmm/detail/cccl_adaptors.hpp:419:77: error: ‘mr’ is not a member of ‘cuda’; did you mean ‘rmm::mr’?
+  419 |       not is_specialization_of_v<std::remove_cv_t<OtherResourceType>, cuda::mr::resource_ref> and
+      |                                                                             ^~
+In file included from /opt/miniforge3/envs/cuvs_dev/include/rmm/mr/statistics_resource_adaptor.hpp:8,
+                 from /home/ubuntu/index-accel-validation/peak_probe.cpp:2:
+/opt/miniforge3/envs/cuvs_dev/include/rmm/mr/device_memory_resource.hpp:19:11: note: ‘rmm::mr’ declared here
+   19 | namespace mr {
+      |           ^~
+In file included from /opt/miniforge3/envs/cuvs_dev/include/rmm/resource_ref.hpp:7,
+                 from /opt/miniforge3/envs/cuvs_dev/include/rmm/mr/per_device_resource.hpp:12,
+                 from /opt/miniforge3/envs/cuvs_dev/include/rmm/mr/statistics_resource_adaptor.hpp:9,
+                 from /home/ubuntu/index-accel-validation/peak_probe.cpp:2:
+/opt/miniforge3/envs/cuvs_dev/include/rmm/detail/cccl_adaptors.hpp:419:11: error: parse error in template argument list
+  419 |       not is_specialization_of_v<std::remove_cv_t<OtherResourceType>, cuda::mr::resource_ref> and
+      |           ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+/opt/miniforge3/envs/cuvs_dev/include/rmm/detail/cccl_adaptors.hpp:420:77: error: ‘mr’ is not a member of ‘cuda’; did you mean ‘rmm::mr’?
+  420 |       not is_specialization_of_v<std::remove_cv_t<OtherResourceType>, cuda::mr::any_resource> and
+      |                                                                             ^~
+In file included from /opt/miniforge3/envs/cuvs_dev/include/rmm/mr/statistics_resource_adaptor.hpp:8,
+                 from /home/ubuntu/index-accel-validation/peak_probe.cpp:2:
+/opt/miniforge3/envs/cuvs_dev/include/rmm/mr/device_memory_resource.hpp:19:11: note: ‘rmm::mr’ declared here
+   19 | namespace mr {
+      |           ^~
+In file included from /opt/miniforge3/envs/cuvs_dev/include/rmm/resource_ref.hpp:7,
+                 from /opt/miniforge3/envs/cuvs_dev/include/rmm/mr/per_device_resource.hpp:12,
+                 from /opt/miniforge3/envs/cuvs_dev/include/rmm/mr/statistics_resource_adaptor.hpp:9,
+                 from /home/ubuntu/index-accel-validation/peak_probe.cpp:2:
+/opt/miniforge3/envs/cuvs_dev/include/rmm/detail/cccl_adaptors.hpp:420:11: error: parse error in template argument list
+  420 |       not is_specialization_of_v<std::remove_cv_t<OtherResourceType>, cuda::mr::any_resource> and
+      |           ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+/opt/miniforge3/envs/cuvs_dev/include/rmm/detail/cccl_adaptors.hpp:427:13: error: ‘mr’ is not a member of ‘cuda’; did you mean ‘rmm::mr’?
+  427 |       cuda::mr::resource<OtherResourceType>>* = nullptr>
+      |             ^~
+In file included from /opt/miniforge3/envs/cuvs_dev/include/rmm/mr/statistics_resource_adaptor.hpp:8,
+                 from /home/ubuntu/index-accel-validation/peak_probe.cpp:2:
+/opt/miniforge3/envs/cuvs_dev/include/rmm/mr/device_memory_resource.hpp:19:11: note: ‘rmm::mr’ declared here
+   19 | namespace mr {
+      |           ^~
+In file included from /opt/miniforge3/envs/cuvs_dev/include/rmm/resource_ref.hpp:7,
+                 from /opt/miniforge3/envs/cuvs_dev/include/rmm/mr/per_device_resource.hpp:12,
+                 from /opt/miniforge3/envs/cuvs_dev/include/rmm/mr/statistics_resource_adaptor.hpp:9,
+                 from /home/ubuntu/index-accel-validation/peak_probe.cpp:2:
+/opt/miniforge3/envs/cuvs_dev/include/rmm/detail/cccl_adaptors.hpp:416:10: error: parse error in template argument list
+  416 |     std::enable_if_t<
+      |          ^~~~~~~~~~~~
+  417 |       not is_specialization_of_v<std::remove_cv_t<OtherResourceType>,
+      |       ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+  418 |                                  cuda::mr::synchronous_resource_ref> and
+      |                                  ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+  419 |       not is_specialization_of_v<std::remove_cv_t<OtherResourceType>, cuda::mr::resource_ref> and
+      |       ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+  420 |       not is_specialization_of_v<std::remove_cv_t<OtherResourceType>, cuda::mr::any_resource> and
+      |       ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+  421 |       not is_specialization_of_v<std::remove_cv_t<OtherResourceType>,
+      |       ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+  422 |                                  ::rmm::detail::cccl_resource_ref> and
+      |                                  ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+  423 |       not is_specialization_of_v<std::remove_cv_t<OtherResourceType>,
+      |       ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+  424 |                                  ::rmm::detail::cccl_async_resource_ref> and
+      |                                  ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+  425 |       not std::is_base_of_v<rmm::mr::device_memory_resource,
+      |       ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+  426 |                             std::remove_cv_t<OtherResourceType>> and
+      |                             ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+  427 |       cuda::mr::resource<OtherResourceType>>* = nullptr>
+      |       ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+/opt/miniforge3/envs/cuvs_dev/include/rmm/detail/cccl_adaptors.hpp:557:18: error: ‘mr’ in namespace ‘cuda’ does not name a type
+  557 |   operator cuda::mr::any_resource<Properties...>() const
+      |                  ^~
+In file included from /opt/miniforge3/envs/cuvs_dev/include/rmm/mr/per_device_resource.hpp:12,
+                 from /opt/miniforge3/envs/cuvs_dev/include/rmm/mr/statistics_resource_adaptor.hpp:9,
+                 from /home/ubuntu/index-accel-validation/peak_probe.cpp:2:
+/opt/miniforge3/envs/cuvs_dev/include/rmm/resource_ref.hpp:25:35: error: ‘mr’ is not a member of ‘cuda’; did you mean ‘rmm::mr’?
+   25 |   detail::cccl_resource_ref<cuda::mr::synchronous_resource_ref<cuda::mr::device_accessible>>;
+      |                                   ^~
+In file included from /opt/miniforge3/envs/cuvs_dev/include/rmm/mr/statistics_resource_adaptor.hpp:8,
+                 from /home/ubuntu/index-accel-validation/peak_probe.cpp:2:
+/opt/miniforge3/envs/cuvs_dev/include/rmm/mr/device_memory_resource.hpp:19:11: note: ‘rmm::mr’ declared here
+   19 | namespace mr {
+      |           ^~
+In file included from /opt/miniforge3/envs/cuvs_dev/include/rmm/mr/per_device_resource.hpp:12,
+                 from /opt/miniforge3/envs/cuvs_dev/include/rmm/mr/statistics_resource_adaptor.hpp:9,
+                 from /home/ubuntu/index-accel-validation/peak_probe.cpp:2:
+/opt/miniforge3/envs/cuvs_dev/include/rmm/resource_ref.hpp:25:91: error: template argument 1 is invalid
+   25 |   detail::cccl_resource_ref<cuda::mr::synchronous_resource_ref<cuda::mr::device_accessible>>;
+      |                                                                                           ^~
+/opt/miniforge3/envs/cuvs_dev/include/rmm/resource_ref.hpp:32:41: error: ‘mr’ is not a member of ‘cuda’; did you mean ‘rmm::mr’?
+   32 |   detail::cccl_async_resource_ref<cuda::mr::resource_ref<cuda::mr::device_accessible>>;
+      |                                         ^~
+In file included from /opt/miniforge3/envs/cuvs_dev/include/rmm/mr/statistics_resource_adaptor.hpp:8,
+                 from /home/ubuntu/index-accel-validation/peak_probe.cpp:2:
+/opt/miniforge3/envs/cuvs_dev/include/rmm/mr/device_memory_resource.hpp:19:11: note: ‘rmm::mr’ declared here
+   19 | namespace mr {
+      |           ^~
+In file included from /opt/miniforge3/envs/cuvs_dev/include/rmm/mr/per_device_resource.hpp:12,
+                 from /opt/miniforge3/envs/cuvs_dev/include/rmm/mr/statistics_resource_adaptor.hpp:9,
+                 from /home/ubuntu/index-accel-validation/peak_probe.cpp:2:
+/opt/miniforge3/envs/cuvs_dev/include/rmm/resource_ref.hpp:32:85: error: template argument 1 is invalid
+   32 |   detail::cccl_async_resource_ref<cuda::mr::resource_ref<cuda::mr::device_accessible>>;
+      |                                                                                     ^~
+/opt/miniforge3/envs/cuvs_dev/include/rmm/resource_ref.hpp:39:35: error: ‘mr’ is not a member of ‘cuda’; did you mean ‘rmm::mr’?
+   39 |   detail::cccl_resource_ref<cuda::mr::synchronous_resource_ref<cuda::mr::host_accessible>>;
+      |                                   ^~
+In file included from /opt/miniforge3/envs/cuvs_dev/include/rmm/mr/statistics_resource_adaptor.hpp:8,
+                 from /home/ubuntu/index-accel-validation/peak_probe.cpp:2:
+/opt/miniforge3/envs/cuvs_dev/include/rmm/mr/device_memory_resource.hpp:19:11: note: ‘rmm::mr’ declared here
+   19 | namespace mr {
+      |           ^~
+In file included from /opt/miniforge3/envs/cuvs_dev/include/rmm/mr/per_device_resource.hpp:12,
+                 from /opt/miniforge3/envs/cuvs_dev/include/rmm/mr/statistics_resource_adaptor.hpp:9,
+                 from /home/ubuntu/index-accel-validation/peak_probe.cpp:2:
+/opt/miniforge3/envs/cuvs_dev/include/rmm/resource_ref.hpp:39:89: error: template argument 1 is invalid
+   39 |   detail::cccl_resource_ref<cuda::mr::synchronous_resource_ref<cuda::mr::host_accessible>>;
+      |                                                                                         ^~
+/opt/miniforge3/envs/cuvs_dev/include/rmm/resource_ref.hpp:46:41: error: ‘mr’ is not a member of ‘cuda’; did you mean ‘rmm::mr’?
+   46 |   detail::cccl_async_resource_ref<cuda::mr::resource_ref<cuda::mr::host_accessible>>;
+      |                                         ^~
+In file included from /opt/miniforge3/envs/cuvs_dev/include/rmm/mr/statistics_resource_adaptor.hpp:8,
+                 from /home/ubuntu/index-accel-validation/peak_probe.cpp:2:
+/opt/miniforge3/envs/cuvs_dev/include/rmm/mr/device_memory_resource.hpp:19:11: note: ‘rmm::mr’ declared here
+   19 | namespace mr {
+      |           ^~
+In file included from /opt/miniforge3/envs/cuvs_dev/include/rmm/mr/per_device_resource.hpp:12,
+                 from /opt/miniforge3/envs/cuvs_dev/include/rmm/mr/statistics_resource_adaptor.hpp:9,
+                 from /home/ubuntu/index-accel-validation/peak_probe.cpp:2:
+/opt/miniforge3/envs/cuvs_dev/include/rmm/resource_ref.hpp:46:83: error: template argument 1 is invalid
+   46 |   detail::cccl_async_resource_ref<cuda::mr::resource_ref<cuda::mr::host_accessible>>;
+      |                                                                                   ^~
+/opt/miniforge3/envs/cuvs_dev/include/rmm/resource_ref.hpp:53:9: error: ‘mr’ is not a member of ‘cuda’; did you mean ‘rmm::mr’?
+   53 |   cuda::mr::synchronous_resource_ref<cuda::mr::host_accessible, cuda::mr::device_accessible>>;
+      |         ^~
+In file included from /opt/miniforge3/envs/cuvs_dev/include/rmm/mr/statistics_resource_adaptor.hpp:8,
+                 from /home/ubuntu/index-accel-validation/peak_probe.cpp:2:
+/opt/miniforge3/envs/cuvs_dev/include/rmm/mr/device_memory_resource.hpp:19:11: note: ‘rmm::mr’ declared here
+   19 | namespace mr {
+      |           ^~
+In file included from /opt/miniforge3/envs/cuvs_dev/include/rmm/mr/per_device_resource.hpp:12,
+                 from /opt/miniforge3/envs/cuvs_dev/include/rmm/mr/statistics_resource_adaptor.hpp:9,
+                 from /home/ubuntu/index-accel-validation/peak_probe.cpp:2:
+/opt/miniforge3/envs/cuvs_dev/include/rmm/resource_ref.hpp:53:92: error: template argument 1 is invalid
+   53 |   cuda::mr::synchronous_resource_ref<cuda::mr::host_accessible, cuda::mr::device_accessible>>;
+      |                                                                                            ^~
+/opt/miniforge3/envs/cuvs_dev/include/rmm/resource_ref.hpp:60:9: error: ‘mr’ is not a member of ‘cuda’; did you mean ‘rmm::mr’?
+   60 |   cuda::mr::resource_ref<cuda::mr::host_accessible, cuda::mr::device_accessible>>;
+      |         ^~
+In file included from /opt/miniforge3/envs/cuvs_dev/include/rmm/mr/statistics_resource_adaptor.hpp:8,
+                 from /home/ubuntu/index-accel-validation/peak_probe.cpp:2:
+/opt/miniforge3/envs/cuvs_dev/include/rmm/mr/device_memory_resource.hpp:19:11: note: ‘rmm::mr’ declared here
+   19 | namespace mr {
+      |           ^~
+In file included from /opt/miniforge3/envs/cuvs_dev/include/rmm/mr/per_device_resource.hpp:12,
+                 from /opt/miniforge3/envs/cuvs_dev/include/rmm/mr/statistics_resource_adaptor.hpp:9,
+                 from /home/ubuntu/index-accel-validation/peak_probe.cpp:2:
+/opt/miniforge3/envs/cuvs_dev/include/rmm/resource_ref.hpp:60:80: error: template argument 1 is invalid
+   60 |   cuda::mr::resource_ref<cuda::mr::host_accessible, cuda::mr::device_accessible>>;
+      |                                                                                ^~
+/opt/miniforge3/envs/cuvs_dev/include/rmm/resource_ref.hpp:72:1: error: ‘device_async_resource_ref’ does not name a type
+   72 | device_async_resource_ref to_device_async_resource_ref_checked(Resource* res)
+      | ^~~~~~~~~~~~~~~~~~~~~~~~~
+/opt/miniforge3/envs/cuvs_dev/include/rmm/resource_ref.hpp:82:27: error: ‘device_resource_ref’ was not declared in this scope
+   82 |   std::is_constructible_v<device_resource_ref, mr::device_memory_resource*>,
+      |                           ^~~~~~~~~~~~~~~~~~~
+/opt/miniforge3/envs/cuvs_dev/include/rmm/resource_ref.hpp:82:8: error: template argument 1 is invalid
+   82 |   std::is_constructible_v<device_resource_ref, mr::device_memory_resource*>,
+      |        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+/opt/miniforge3/envs/cuvs_dev/include/rmm/resource_ref.hpp:85:27: error: ‘device_async_resource_ref’ was not declared in this scope
+   85 |   std::is_constructible_v<device_async_resource_ref, mr::device_memory_resource*>,
+      |                           ^~~~~~~~~~~~~~~~~~~~~~~~~
+/opt/miniforge3/envs/cuvs_dev/include/rmm/resource_ref.hpp:85:8: error: template argument 1 is invalid
+   85 |   std::is_constructible_v<device_async_resource_ref, mr::device_memory_resource*>,
+      |        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+/opt/miniforge3/envs/cuvs_dev/include/rmm/resource_ref.hpp:88:27: error: ‘device_resource_ref’ was not declared in this scope
+   88 |   std::is_constructible_v<device_resource_ref, mr::device_memory_resource&>,
+      |                           ^~~~~~~~~~~~~~~~~~~
+/opt/miniforge3/envs/cuvs_dev/include/rmm/resource_ref.hpp:88:8: error: template argument 1 is invalid
+   88 |   std::is_constructible_v<device_resource_ref, mr::device_memory_resource&>,
+      |        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+/opt/miniforge3/envs/cuvs_dev/include/rmm/resource_ref.hpp:91:27: error: ‘device_async_resource_ref’ was not declared in this scope
+   91 |   std::is_constructible_v<device_async_resource_ref, mr::device_memory_resource&>,
+      |                           ^~~~~~~~~~~~~~~~~~~~~~~~~
+/opt/miniforge3/envs/cuvs_dev/include/rmm/resource_ref.hpp:91:8: error: template argument 1 is invalid
+   91 |   std::is_constructible_v<device_async_resource_ref, mr::device_memory_resource&>,
+      |        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+/opt/miniforge3/envs/cuvs_dev/include/rmm/resource_ref.hpp:96:27: error: ‘device_resource_ref’ was not declared in this scope
+   96 |   std::is_constructible_v<device_resource_ref,
+      |                           ^~~~~~~~~~~~~~~~~~~
+/opt/miniforge3/envs/cuvs_dev/include/rmm/resource_ref.hpp:97:33: error: ‘mr’ is not a member of ‘cuda’; did you mean ‘rmm::mr’?
+   97 |                           cuda::mr::synchronous_resource_ref<cuda::mr::device_accessible>>,
+      |                                 ^~
+In file included from /opt/miniforge3/envs/cuvs_dev/include/rmm/mr/statistics_resource_adaptor.hpp:8,
+                 from /home/ubuntu/index-accel-validation/peak_probe.cpp:2:
+/opt/miniforge3/envs/cuvs_dev/include/rmm/mr/device_memory_resource.hpp:19:11: note: ‘rmm::mr’ declared here
+   19 | namespace mr {
+      |           ^~
+In file included from /opt/miniforge3/envs/cuvs_dev/include/rmm/mr/per_device_resource.hpp:12,
+                 from /opt/miniforge3/envs/cuvs_dev/include/rmm/mr/statistics_resource_adaptor.hpp:9,
+                 from /home/ubuntu/index-accel-validation/peak_probe.cpp:2:
+/opt/miniforge3/envs/cuvs_dev/include/rmm/resource_ref.hpp:96:8: error: parse error in template argument list
+   96 |   std::is_constructible_v<device_resource_ref,
+      |        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+   97 |                           cuda::mr::synchronous_resource_ref<cuda::mr::device_accessible>>,
+      |                           ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+/opt/miniforge3/envs/cuvs_dev/include/rmm/resource_ref.hpp:96:8: error: template argument 1 is invalid
+/opt/miniforge3/envs/cuvs_dev/include/rmm/resource_ref.hpp:96:8: error: template argument 2 is invalid
+/opt/miniforge3/envs/cuvs_dev/include/rmm/resource_ref.hpp:101:27: error: ‘device_async_resource_ref’ was not declared in this scope
+  101 |   std::is_constructible_v<device_async_resource_ref,
+      |                           ^~~~~~~~~~~~~~~~~~~~~~~~~
+/opt/miniforge3/envs/cuvs_dev/include/rmm/resource_ref.hpp:102:33: error: ‘mr’ is not a member of ‘cuda’; did you mean ‘rmm::mr’?
+  102 |                           cuda::mr::resource_ref<cuda::mr::device_accessible>>,
+      |                                 ^~
+In file included from /opt/miniforge3/envs/cuvs_dev/include/rmm/mr/statistics_resource_adaptor.hpp:8,
+                 from /home/ubuntu/index-accel-validation/peak_probe.cpp:2:
+/opt/miniforge3/envs/cuvs_dev/include/rmm/mr/device_memory_resource.hpp:19:11: note: ‘rmm::mr’ declared here
+   19 | namespace mr {
+      |           ^~
+In file included from /opt/miniforge3/envs/cuvs_dev/include/rmm/mr/per_device_resource.hpp:12,
+                 from /opt/miniforge3/envs/cuvs_dev/include/rmm/mr/statistics_resource_adaptor.hpp:9,
+                 from /home/ubuntu/index-accel-validation/peak_probe.cpp:2:
+/opt/miniforge3/envs/cuvs_dev/include/rmm/resource_ref.hpp:101:8: error: parse error in template argument list
+  101 |   std::is_constructible_v<device_async_resource_ref,
+      |        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+  102 |                           cuda::mr::resource_ref<cuda::mr::device_accessible>>,
+      |                           ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+/opt/miniforge3/envs/cuvs_dev/include/rmm/resource_ref.hpp:101:8: error: template argument 1 is invalid
+/opt/miniforge3/envs/cuvs_dev/include/rmm/resource_ref.hpp:101:8: error: template argument 2 is invalid
+/opt/miniforge3/envs/cuvs_dev/include/rmm/resource_ref.hpp:105:27: error: ‘host_resource_ref’ was not declared in this scope
+  105 |   std::is_constructible_v<host_resource_ref,
+      |                           ^~~~~~~~~~~~~~~~~
+/opt/miniforge3/envs/cuvs_dev/include/rmm/resource_ref.hpp:106:33: error: ‘mr’ is not a member of ‘cuda’; did you mean ‘rmm::mr’?
+  106 |                           cuda::mr::synchronous_resource_ref<cuda::mr::host_accessible>>,
+      |                                 ^~
+In file included from /opt/miniforge3/envs/cuvs_dev/include/rmm/mr/statistics_resource_adaptor.hpp:8,
+                 from /home/ubuntu/index-accel-validation/peak_probe.cpp:2:
+/opt/miniforge3/envs/cuvs_dev/include/rmm/mr/device_memory_resource.hpp:19:11: note: ‘rmm::mr’ declared here
+   19 | namespace mr {
+      |           ^~
+In file included from /opt/miniforge3/envs/cuvs_dev/include/rmm/mr/per_device_resource.hpp:12,
+                 from /opt/miniforge3/envs/cuvs_dev/include/rmm/mr/statistics_resource_adaptor.hpp:9,
+                 from /home/ubuntu/index-accel-validation/peak_probe.cpp:2:
+/opt/miniforge3/envs/cuvs_dev/include/rmm/resource_ref.hpp:105:8: error: parse error in template argument list
+  105 |   std::is_constructible_v<host_resource_ref,
+      |        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+  106 |                           cuda::mr::synchronous_resource_ref<cuda::mr::host_accessible>>,
+      |                           ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+/opt/miniforge3/envs/cuvs_dev/include/rmm/resource_ref.hpp:105:8: error: template argument 1 is invalid
+/opt/miniforge3/envs/cuvs_dev/include/rmm/resource_ref.hpp:105:8: error: template argument 2 is invalid
+/opt/miniforge3/envs/cuvs_dev/include/rmm/resource_ref.hpp:109:27: error: ‘host_async_resource_ref’ was not declared in this scope
+  109 |   std::is_constructible_v<host_async_resource_ref,
+      |                           ^~~~~~~~~~~~~~~~~~~~~~~
+/opt/miniforge3/envs/cuvs_dev/include/rmm/resource_ref.hpp:110:33: error: ‘mr’ is not a member of ‘cuda’; did you mean ‘rmm::mr’?
+  110 |                           cuda::mr::resource_ref<cuda::mr::host_accessible>>,
+      |                                 ^~
+In file included from /opt/miniforge3/envs/cuvs_dev/include/rmm/mr/statistics_resource_adaptor.hpp:8,
+                 from /home/ubuntu/index-accel-validation/peak_probe.cpp:2:
+/opt/miniforge3/envs/cuvs_dev/include/rmm/mr/device_memory_resource.hpp:19:11: note: ‘rmm::mr’ declared here
+   19 | namespace mr {
+      |           ^~
+In file included from /opt/miniforge3/envs/cuvs_dev/include/rmm/mr/per_device_resource.hpp:12,
+                 from /opt/miniforge3/envs/cuvs_dev/include/rmm/mr/statistics_resource_adaptor.hpp:9,
+                 from /home/ubuntu/index-accel-validation/peak_probe.cpp:2:
+/opt/miniforge3/envs/cuvs_dev/include/rmm/resource_ref.hpp:109:8: error: parse error in template argument list
+  109 |   std::is_constructible_v<host_async_resource_ref,
+      |        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+  110 |                           cuda::mr::resource_ref<cuda::mr::host_accessible>>,
+      |                           ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+/opt/miniforge3/envs/cuvs_dev/include/rmm/resource_ref.hpp:109:8: error: template argument 1 is invalid
+/opt/miniforge3/envs/cuvs_dev/include/rmm/resource_ref.hpp:109:8: error: template argument 2 is invalid
+/opt/miniforge3/envs/cuvs_dev/include/rmm/resource_ref.hpp:114:5: error: ‘host_device_resource_ref’ was not declared in this scope
+  114 |     host_device_resource_ref,
+      |     ^~~~~~~~~~~~~~~~~~~~~~~~
+/opt/miniforge3/envs/cuvs_dev/include/rmm/resource_ref.hpp:115:11: error: ‘mr’ is not a member of ‘cuda’; did you mean ‘rmm::mr’?
+  115 |     cuda::mr::synchronous_resource_ref<cuda::mr::host_accessible, cuda::mr::device_accessible>>,
+      |           ^~
+In file included from /opt/miniforge3/envs/cuvs_dev/include/rmm/mr/statistics_resource_adaptor.hpp:8,
+                 from /home/ubuntu/index-accel-validation/peak_probe.cpp:2:
+/opt/miniforge3/envs/cuvs_dev/include/rmm/mr/device_memory_resource.hpp:19:11: note: ‘rmm::mr’ declared here
+   19 | namespace mr {
+      |           ^~
+In file included from /opt/miniforge3/envs/cuvs_dev/include/rmm/mr/per_device_resource.hpp:12,
+                 from /opt/miniforge3/envs/cuvs_dev/include/rmm/mr/statistics_resource_adaptor.hpp:9,
+                 from /home/ubuntu/index-accel-validation/peak_probe.cpp:2:
+/opt/miniforge3/envs/cuvs_dev/include/rmm/resource_ref.hpp:113:8: error: parse error in template argument list
+  113 |   std::is_constructible_v<
+      |        ^~~~~~~~~~~~~~~~~~~
+  114 |     host_device_resource_ref,
+      |     ~~~~~~~~~~~~~~~~~~~~~~~~~
+  115 |     cuda::mr::synchronous_resource_ref<cuda::mr::host_accessible, cuda::mr::device_accessible>>,
+      |     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+/opt/miniforge3/envs/cuvs_dev/include/rmm/resource_ref.hpp:113:8: error: template argument 1 is invalid
+/opt/miniforge3/envs/cuvs_dev/include/rmm/resource_ref.hpp:113:8: error: template argument 2 is invalid
+/opt/miniforge3/envs/cuvs_dev/include/rmm/resource_ref.hpp:120:5: error: ‘host_device_async_resource_ref’ was not declared in this scope
+  120 |     host_device_async_resource_ref,
+      |     ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+/opt/miniforge3/envs/cuvs_dev/include/rmm/resource_ref.hpp:121:11: error: ‘mr’ is not a member of ‘cuda’; did you mean ‘rmm::mr’?
+  121 |     cuda::mr::resource_ref<cuda::mr::host_accessible, cuda::mr::device_accessible>>,
+      |           ^~
+In file included from /opt/miniforge3/envs/cuvs_dev/include/rmm/mr/statistics_resource_adaptor.hpp:8,
+                 from /home/ubuntu/index-accel-validation/peak_probe.cpp:2:
+/opt/miniforge3/envs/cuvs_dev/include/rmm/mr/device_memory_resource.hpp:19:11: note: ‘rmm::mr’ declared here
+   19 | namespace mr {
+      |           ^~
+In file included from /opt/miniforge3/envs/cuvs_dev/include/rmm/mr/per_device_resource.hpp:12,
+                 from /opt/miniforge3/envs/cuvs_dev/include/rmm/mr/statistics_resource_adaptor.hpp:9,
+                 from /home/ubuntu/index-accel-validation/peak_probe.cpp:2:
+/opt/miniforge3/envs/cuvs_dev/include/rmm/resource_ref.hpp:119:8: error: parse error in template argument list
+  119 |   std::is_constructible_v<
+      |        ^~~~~~~~~~~~~~~~~~~
+  120 |     host_device_async_resource_ref,
+      |     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+  121 |     cuda::mr::resource_ref<cuda::mr::host_accessible, cuda::mr::device_accessible>>,
+      |     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+/opt/miniforge3/envs/cuvs_dev/include/rmm/resource_ref.hpp:119:8: error: template argument 1 is invalid
+/opt/miniforge3/envs/cuvs_dev/include/rmm/resource_ref.hpp:119:8: error: template argument 2 is invalid
+/opt/miniforge3/envs/cuvs_dev/include/rmm/resource_ref.hpp:129:27: error: ‘device_async_resource_ref’ was not declared in this scope
+  129 |   std::is_constructible_v<device_async_resource_ref, host_device_async_resource_ref>,
+      |                           ^~~~~~~~~~~~~~~~~~~~~~~~~
+/opt/miniforge3/envs/cuvs_dev/include/rmm/resource_ref.hpp:129:54: error: ‘host_device_async_resource_ref’ was not declared in this scope
+  129 |   std::is_constructible_v<device_async_resource_ref, host_device_async_resource_ref>,
+      |                                                      ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+/opt/miniforge3/envs/cuvs_dev/include/rmm/resource_ref.hpp:129:8: error: template argument 1 is invalid
+  129 |   std::is_constructible_v<device_async_resource_ref, host_device_async_resource_ref>,
+      |        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+/opt/miniforge3/envs/cuvs_dev/include/rmm/resource_ref.hpp:129:8: error: template argument 2 is invalid
+/opt/miniforge3/envs/cuvs_dev/include/rmm/resource_ref.hpp:131:39: error: ‘device_resource_ref’ was not declared in this scope
+  131 | static_assert(std::is_constructible_v<device_resource_ref, host_device_resource_ref>,
+      |                                       ^~~~~~~~~~~~~~~~~~~
+/opt/miniforge3/envs/cuvs_dev/include/rmm/resource_ref.hpp:131:60: error: ‘host_device_resource_ref’ was not declared in this scope
+  131 | static_assert(std::is_constructible_v<device_resource_ref, host_device_resource_ref>,
+      |                                                            ^~~~~~~~~~~~~~~~~~~~~~~~
+/opt/miniforge3/envs/cuvs_dev/include/rmm/resource_ref.hpp:131:20: error: template argument 1 is invalid
+  131 | static_assert(std::is_constructible_v<device_resource_ref, host_device_resource_ref>,
+      |                    ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+/opt/miniforge3/envs/cuvs_dev/include/rmm/resource_ref.hpp:131:20: error: template argument 2 is invalid
+/opt/miniforge3/envs/cuvs_dev/include/rmm/resource_ref.hpp:133:39: error: ‘host_async_resource_ref’ was not declared in this scope
+  133 | static_assert(std::is_constructible_v<host_async_resource_ref, host_device_async_resource_ref>,
+      |                                       ^~~~~~~~~~~~~~~~~~~~~~~
+/opt/miniforge3/envs/cuvs_dev/include/rmm/resource_ref.hpp:133:64: error: ‘host_device_async_resource_ref’ was not declared in this scope
+  133 | static_assert(std::is_constructible_v<host_async_resource_ref, host_device_async_resource_ref>,
+      |                                                                ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+/opt/miniforge3/envs/cuvs_dev/include/rmm/resource_ref.hpp:133:20: error: template argument 1 is invalid
+  133 | static_assert(std::is_constructible_v<host_async_resource_ref, host_device_async_resource_ref>,
+      |                    ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+/opt/miniforge3/envs/cuvs_dev/include/rmm/resource_ref.hpp:133:20: error: template argument 2 is invalid
+/opt/miniforge3/envs/cuvs_dev/include/rmm/resource_ref.hpp:135:39: error: ‘host_resource_ref’ was not declared in this scope
+  135 | static_assert(std::is_constructible_v<host_resource_ref, host_device_resource_ref>,
+      |                                       ^~~~~~~~~~~~~~~~~
+/opt/miniforge3/envs/cuvs_dev/include/rmm/resource_ref.hpp:135:58: error: ‘host_device_resource_ref’ was not declared in this scope
+  135 | static_assert(std::is_constructible_v<host_resource_ref, host_device_resource_ref>,
+      |                                                          ^~~~~~~~~~~~~~~~~~~~~~~~
+/opt/miniforge3/envs/cuvs_dev/include/rmm/resource_ref.hpp:135:20: error: template argument 1 is invalid
+  135 | static_assert(std::is_constructible_v<host_resource_ref, host_device_resource_ref>,
+      |                    ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+/opt/miniforge3/envs/cuvs_dev/include/rmm/resource_ref.hpp:135:20: error: template argument 2 is invalid
+In file included from /opt/miniforge3/envs/cuvs_dev/include/rmm/mr/statistics_resource_adaptor.hpp:9,
+                 from /home/ubuntu/index-accel-validation/peak_probe.cpp:2:
+/opt/miniforge3/envs/cuvs_dev/include/rmm/mr/per_device_resource.hpp: In function ‘auto& rmm::mr::detail::get_ref_map()’:
+/opt/miniforge3/envs/cuvs_dev/include/rmm/mr/per_device_resource.hpp:149:53: error: ‘mr’ is not a member of ‘cuda’; did you mean ‘rmm::mr’?
+  149 |   static std::map<cuda_device_id::value_type, cuda::mr::any_resource<cuda::mr::device_accessible>>
+      |                                                     ^~
+In file included from /opt/miniforge3/envs/cuvs_dev/include/rmm/mr/statistics_resource_adaptor.hpp:8,
+                 from /home/ubuntu/index-accel-validation/peak_probe.cpp:2:
+/opt/miniforge3/envs/cuvs_dev/include/rmm/mr/device_memory_resource.hpp:19:11: note: ‘rmm::mr’ declared here
+   19 | namespace mr {
+      |           ^~
+In file included from /opt/miniforge3/envs/cuvs_dev/include/rmm/mr/statistics_resource_adaptor.hpp:9,
+                 from /home/ubuntu/index-accel-validation/peak_probe.cpp:2:
+/opt/miniforge3/envs/cuvs_dev/include/rmm/mr/per_device_resource.hpp:149:97: error: template argument 2 is invalid
+  149 |   static std::map<cuda_device_id::value_type, cuda::mr::any_resource<cuda::mr::device_accessible>>
+      |                                                                                                 ^~
+/opt/miniforge3/envs/cuvs_dev/include/rmm/mr/per_device_resource.hpp:149:97: error: template argument 4 is invalid
+/opt/miniforge3/envs/cuvs_dev/include/rmm/mr/per_device_resource.hpp: At global scope:
+/opt/miniforge3/envs/cuvs_dev/include/rmm/mr/per_device_resource.hpp:195:8: error: ‘device_async_resource_ref’ does not name a type; did you mean ‘device_memory_resource_view’?
+  195 | inline device_async_resource_ref set_per_device_resource_ref_unsafe(
+      |        ^~~~~~~~~~~~~~~~~~~~~~~~~
+      |        device_memory_resource_view
+/opt/miniforge3/envs/cuvs_dev/include/rmm/mr/per_device_resource.hpp: In function ‘rmm::mr::device_memory_resource* rmm::mr::set_per_device_resource(rmm::cuda_device_id, rmm::mr::device_memory_resource*)’:
+/opt/miniforge3/envs/cuvs_dev/include/rmm/mr/per_device_resource.hpp:250:36: error: ‘set_per_device_resource_ref_unsafe’ is not a member of ‘rmm::mr::detail’
+  250 |   if (new_mr != nullptr) { detail::set_per_device_resource_ref_unsafe(device_id, new_mr); }
+      |                                    ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+/opt/miniforge3/envs/cuvs_dev/include/rmm/mr/per_device_resource.hpp: At global scope:
+/opt/miniforge3/envs/cuvs_dev/include/rmm/mr/per_device_resource.hpp:337:8: error: ‘device_async_resource_ref’ does not name a type
+  337 | inline device_async_resource_ref get_per_device_resource_ref(cuda_device_id device_id)
+      |        ^~~~~~~~~~~~~~~~~~~~~~~~~
+/opt/miniforge3/envs/cuvs_dev/include/rmm/mr/per_device_resource.hpp:377:8: error: ‘device_async_resource_ref’ does not name a type
+  377 | inline device_async_resource_ref set_per_device_resource_ref(
+      |        ^~~~~~~~~~~~~~~~~~~~~~~~~
+/opt/miniforge3/envs/cuvs_dev/include/rmm/mr/per_device_resource.hpp:406:8: error: ‘device_async_resource_ref’ does not name a type
+  406 | inline device_async_resource_ref get_current_device_resource_ref()
+      |        ^~~~~~~~~~~~~~~~~~~~~~~~~
+/opt/miniforge3/envs/cuvs_dev/include/rmm/mr/per_device_resource.hpp:432:8: error: ‘device_async_resource_ref’ does not name a type
+  432 | inline device_async_resource_ref set_current_device_resource_ref(
+      |        ^~~~~~~~~~~~~~~~~~~~~~~~~
+/opt/miniforge3/envs/cuvs_dev/include/rmm/mr/per_device_resource.hpp:454:8: error: ‘device_async_resource_ref’ does not name a type
+  454 | inline device_async_resource_ref reset_per_device_resource_ref(cuda_device_id device_id)
+      |        ^~~~~~~~~~~~~~~~~~~~~~~~~
+/opt/miniforge3/envs/cuvs_dev/include/rmm/mr/per_device_resource.hpp:472:8: error: ‘device_async_resource_ref’ does not name a type
+  472 | inline device_async_resource_ref reset_current_device_resource_ref()
+      |        ^~~~~~~~~~~~~~~~~~~~~~~~~
+In file included from /home/ubuntu/index-accel-validation/peak_probe.cpp:2:
+/opt/miniforge3/envs/cuvs_dev/include/rmm/mr/statistics_resource_adaptor.hpp:113:56: error: expected ‘)’ before ‘upstream’
+  113 |   statistics_resource_adaptor(device_async_resource_ref upstream) : upstream_{upstream} {}
+      |                              ~                         ^~~~~~~~~
+      |                                                        )
+/opt/miniforge3/envs/cuvs_dev/include/rmm/mr/statistics_resource_adaptor.hpp:113:89: error: expected unqualified-id before ‘{’ token
+  113 |   statistics_resource_adaptor(device_async_resource_ref upstream) : upstream_{upstream} {}
+      |                                                                                         ^
+/opt/miniforge3/envs/cuvs_dev/include/rmm/mr/statistics_resource_adaptor.hpp:140:22: error: ‘device_async_resource_ref’ in namespace ‘rmm’ does not name a type
+  140 |   [[nodiscard]] rmm::device_async_resource_ref get_upstream_resource() const noexcept
+      |                      ^~~~~~~~~~~~~~~~~~~~~~~~~
+/opt/miniforge3/envs/cuvs_dev/include/rmm/mr/statistics_resource_adaptor.hpp:276:3: error: ‘device_async_resource_ref’ does not name a type
+  276 |   device_async_resource_ref upstream_;
+      |   ^~~~~~~~~~~~~~~~~~~~~~~~~
+/opt/miniforge3/envs/cuvs_dev/include/rmm/mr/statistics_resource_adaptor.hpp: In constructor ‘rmm::mr::statistics_resource_adaptor<Upstream>::statistics_resource_adaptor(Upstream*)’:
+/opt/miniforge3/envs/cuvs_dev/include/rmm/mr/statistics_resource_adaptor.hpp:124:7: error: class ‘rmm::mr::statistics_resource_adaptor<Upstream>’ does not have any field named ‘upstream_’
+  124 |     : upstream_{to_device_async_resource_ref_checked(upstream)}
+      |       ^~~~~~~~~
+/opt/miniforge3/envs/cuvs_dev/include/rmm/mr/statistics_resource_adaptor.hpp: In member function ‘void* rmm::mr::statistics_resource_adaptor<Upstream>::do_allocate(std::size_t, rmm::cuda_stream_view)’:
+/opt/miniforge3/envs/cuvs_dev/include/rmm/mr/statistics_resource_adaptor.hpp:223:17: error: there are no arguments to ‘get_upstream_resource’ that depend on a template parameter, so a declaration of ‘get_upstream_resource’ must be available [-fpermissive]
+  223 |     void* ptr = get_upstream_resource().allocate(stream, bytes);
+      |                 ^~~~~~~~~~~~~~~~~~~~~
+/opt/miniforge3/envs/cuvs_dev/include/rmm/mr/statistics_resource_adaptor.hpp:223:17: note: (if you use ‘-fpermissive’, G++ will accept your code, but allowing the use of an undeclared name is deprecated)
+/opt/miniforge3/envs/cuvs_dev/include/rmm/mr/statistics_resource_adaptor.hpp: In member function ‘void rmm::mr::statistics_resource_adaptor<Upstream>::do_deallocate(void*, std::size_t, rmm::cuda_stream_view)’:
+/opt/miniforge3/envs/cuvs_dev/include/rmm/mr/statistics_resource_adaptor.hpp:253:5: error: there are no arguments to ‘get_upstream_resource’ that depend on a template parameter, so a declaration of ‘get_upstream_resource’ must be available [-fpermissive]
+  253 |     get_upstream_resource().deallocate(stream, ptr, bytes);
+      |     ^~~~~~~~~~~~~~~~~~~~~
+/opt/miniforge3/envs/cuvs_dev/include/rmm/mr/statistics_resource_adaptor.hpp: In member function ‘bool rmm::mr::statistics_resource_adaptor<Upstream>::do_is_equal(const rmm::mr::device_memory_resource&) const’:
+/opt/miniforge3/envs/cuvs_dev/include/rmm/mr/statistics_resource_adaptor.hpp:268:12: error: there are no arguments to ‘get_upstream_resource’ that depend on a template parameter, so a declaration of ‘get_upstream_resource’ must be available [-fpermissive]
+  268 |     return get_upstream_resource() == cast->get_upstream_resource();
+      |            ^~~~~~~~~~~~~~~~~~~~~
+/home/ubuntu/index-accel-validation/peak_probe.cpp: In destructor ‘Scope::~Scope()’:
+/home/ubuntu/index-accel-validation/peak_probe.cpp:27:11: error: ‘cudaDeviceSynchronize’ was not declared in this scope
+   27 |  ~Scope(){cudaDeviceSynchronize();auto elapsed=std::chrono::duration<double>(std::chrono::steady_clock::now()-start).count();nvtxRangePop();auto c=client->pop_counters();auto u=up->pop_counters();std::printf("{\"phase\":\"%s\",\"client_start_bytes\":%lld,\"peak_client_bytes\":%lld,\"extra_client_peak_bytes\":%lld,\"client_end_bytes\":%lld,\"client_allocation_calls\":%lld,\"pool_growth_calls\":%lld,\"pool_growth_bytes\":%lld,\"seconds\":%.9f}\n",name,(long long)base,(long long)(base+c.first.peak),(long long)c.first.peak,(long long)(base+c.first.value),(long long)c.second.total,(long long)u.second.total,(long long)u.first.total,elapsed);std::fflush(stdout);}
+      |           ^~~~~~~~~~~~~~~~~~~~~
+/home/ubuntu/index-accel-validation/peak_probe.cpp: In function ‘int main(int, char**)’:
+/home/ubuntu/index-accel-validation/peak_probe.cpp:33:58: error: ‘cudaSetDevice’ was not declared in this scope
+   33 |   std::string mode=argv[1];size_t mb=std::stoul(argv[2]);cudaSetDevice(0);
+      |                                                          ^~~~~~~~~~~~~
+/home/ubuntu/index-accel-validation/peak_probe.cpp:50:28: error: ‘cudaDeviceSynchronize’ was not declared in this scope
+   50 |   cuvs_cagra_free(index,0);cudaDeviceSynchronize();rmm::mr::set_current_device_resource(pool_resource);
+      |                            ^~~~~~~~~~~~~~~~~~~~~
+In file included from /home/ubuntu/index-accel-validation/peak_probe.cpp:2:
+/opt/miniforge3/envs/cuvs_dev/include/rmm/mr/statistics_resource_adaptor.hpp: In instantiation of ‘void* rmm::mr::statistics_resource_adaptor<Upstream>::do_allocate(std::size_t, rmm::cuda_stream_view) [with Upstream = rmm::mr::device_memory_resource; std::size_t = long unsigned int]’:
+/opt/miniforge3/envs/cuvs_dev/include/rmm/mr/statistics_resource_adaptor.hpp:221:9:   required from here
+/opt/miniforge3/envs/cuvs_dev/include/rmm/mr/statistics_resource_adaptor.hpp:223:38: error: ‘get_upstream_resource’ was not declared in this scope
+  223 |     void* ptr = get_upstream_resource().allocate(stream, bytes);
+      |                 ~~~~~~~~~~~~~~~~~~~~~^~
+/opt/miniforge3/envs/cuvs_dev/include/rmm/mr/statistics_resource_adaptor.hpp: In instantiation of ‘void rmm::mr::statistics_resource_adaptor<Upstream>::do_deallocate(void*, std::size_t, rmm::cuda_stream_view) [with Upstream = rmm::mr::device_memory_resource; std::size_t = long unsigned int]’:
+/opt/miniforge3/envs/cuvs_dev/include/rmm/mr/statistics_resource_adaptor.hpp:244:8:   required from here
+/opt/miniforge3/envs/cuvs_dev/include/rmm/mr/statistics_resource_adaptor.hpp:253:26: error: ‘get_upstream_resource’ was not declared in this scope
+  253 |     get_upstream_resource().deallocate(stream, ptr, bytes);
+      |     ~~~~~~~~~~~~~~~~~~~~~^~
+/opt/miniforge3/envs/cuvs_dev/include/rmm/mr/statistics_resource_adaptor.hpp: In instantiation of ‘bool rmm::mr::statistics_resource_adaptor<Upstream>::do_is_equal(const rmm::mr::device_memory_resource&) const [with Upstream = rmm::mr::device_memory_resource]’:
+/opt/miniforge3/envs/cuvs_dev/include/rmm/mr/statistics_resource_adaptor.hpp:263:8:   required from here
+/opt/miniforge3/envs/cuvs_dev/include/rmm/mr/statistics_resource_adaptor.hpp:268:33: error: ‘get_upstream_resource’ was not declared in this scope
+  268 |     return get_upstream_resource() == cast->get_upstream_resource();
+      |            ~~~~~~~~~~~~~~~~~~~~~^~
+/opt/miniforge3/envs/cuvs_dev/include/rmm/mr/statistics_resource_adaptor.hpp:268:45: error: ‘const class rmm::mr::statistics_resource_adaptor<rmm::mr::device_memory_resource>’ has no member named ‘get_upstream_resource’
+  268 |     return get_upstream_resource() == cast->get_upstream_resource();
+      |                                       ~~~~~~^~~~~~~~~~~~~~~~~~~~~

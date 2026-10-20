@@ -1,0 +1,66 @@
+{"setup":true,"pool_mb":256,"upstream_type":"N3rmm2mr20cuda_memory_resourceE","initial_allocation_calls":1}
+{"phase":"load_original_graph","client_start_bytes":0,"peak_client_bytes":3200000000,"extra_client_peak_bytes":3200000000,"client_end_bytes":3200000000,"client_allocation_calls":2,"pool_growth_calls":1,"pool_growth_bytes":3072000000,"seconds":1.482333341}
+{"phase":"single100_k64","client_start_bytes":3200000000,"peak_client_bytes":3200040964,"extra_client_peak_bytes":40964,"client_end_bytes":3200000000,"client_allocation_calls":800,"pool_growth_calls":0,"pool_growth_bytes":0,"seconds":0.095786884}
+{"success":true,"final_client_bytes":0,"lifetime_pool_allocations":2,"lifetime_pool_reserved_bytes":3340435456}
+Collecting data...
+Generating '/tmp/nsys-report-e796.qdstrm'
+[1/7] [0%                          ] pool256.nsys-rep[1/7] [0%                          ] pool256.nsys-rep[1/7] [9%                          ] pool256.nsys-rep[1/7] [=17%                        ] pool256.nsys-rep[1/7] [==18%                       ] pool256.nsys-rep[1/7] [=====================88%    ] pool256.nsys-rep[1/7] [========================100%] pool256.nsys-rep[1/7] [========================100%] pool256.nsys-rep
+[2/7] [0%                          ] pool256.sqlite[2/7] [1%                          ] pool256.sqlite[2/7] [2%                          ] pool256.sqlite[2/7] [3%                          ] pool256.sqlite[2/7] [4%                          ] pool256.sqlite[2/7] [5%                          ] pool256.sqlite[2/7] [6%                          ] pool256.sqlite[2/7] [7%                          ] pool256.sqlite[2/7] [8%                          ] pool256.sqlite[2/7] [9%                          ] pool256.sqlite[2/7] [10%                         ] pool256.sqlite[2/7] [11%                         ] pool256.sqlite[2/7] [12%                         ] pool256.sqlite[2/7] [13%                         ] pool256.sqlite[2/7] [14%                         ] pool256.sqlite[2/7] [=15%                        ] pool256.sqlite[2/7] [=16%                        ] pool256.sqlite[2/7] [=17%                        ] pool256.sqlite[2/7] [==18%                       ] pool256.sqlite[2/7] [==19%                       ] pool256.sqlite[2/7] [==20%                       ] pool256.sqlite[2/7] [==21%                       ] pool256.sqlite[2/7] [===22%                      ] pool256.sqlite[2/7] [===23%                      ] pool256.sqlite[2/7] [===24%                      ] pool256.sqlite[2/7] [====25%                     ] pool256.sqlite[2/7] [====26%                     ] pool256.sqlite[2/7] [====27%                     ] pool256.sqlite[2/7] [====28%                     ] pool256.sqlite[2/7] [=====29%                    ] pool256.sqlite[2/7] [=====30%                    ] pool256.sqlite[2/7] [=====31%                    ] pool256.sqlite[2/7] [=====32%                    ] pool256.sqlite[2/7] [======33%                   ] pool256.sqlite[2/7] [======34%                   ] pool256.sqlite[2/7] [======35%                   ] pool256.sqlite[2/7] [=======36%                  ] pool256.sqlite[2/7] [=======37%                  ] pool256.sqlite[2/7] [=======38%                  ] pool256.sqlite[2/7] [=======39%                  ] pool256.sqlite[2/7] [========40%                 ] pool256.sqlite[2/7] [========41%                 ] pool256.sqlite[2/7] [========42%                 ] pool256.sqlite[2/7] [=========43%                ] pool256.sqlite[2/7] [=========44%                ] pool256.sqlite[2/7] [=========45%                ] pool256.sqlite[2/7] [=========46%                ] pool256.sqlite[2/7] [==========47%               ] pool256.sqlite[2/7] [==========48%               ] pool256.sqlite[2/7] [==========49%               ] pool256.sqlite[2/7] [===========50%              ] pool256.sqlite[2/7] [===========51%              ] pool256.sqlite[2/7] [===========52%              ] pool256.sqlite[2/7] [===========53%              ] pool256.sqlite[2/7] [============54%             ] pool256.sqlite[2/7] [============55%             ] pool256.sqlite[2/7] [============56%             ] pool256.sqlite[2/7] [============57%             ] pool256.sqlite[2/7] [=============58%            ] pool256.sqlite[2/7] [=============59%            ] pool256.sqlite[2/7] [=============60%            ] pool256.sqlite[2/7] [==============61%           ] pool256.sqlite[2/7] [==============62%           ] pool256.sqlite[2/7] [==============63%           ] pool256.sqlite[2/7] [==============64%           ] pool256.sqlite[2/7] [===============65%          ] pool256.sqlite[2/7] [===============66%          ] pool256.sqlite[2/7] [===============67%          ] pool256.sqlite[2/7] [================68%         ] pool256.sqlite[2/7] [================69%         ] pool256.sqlite[2/7] [================70%         ] pool256.sqlite[2/7] [================71%         ] pool256.sqlite[2/7] [=================72%        ] pool256.sqlite[2/7] [=================73%        ] pool256.sqlite[2/7] [=================74%        ] pool256.sqlite[2/7] [==================75%       ] pool256.sqlite[2/7] [==================76%       ] pool256.sqlite[2/7] [==================77%       ] pool256.sqlite[2/7] [==================78%       ] pool256.sqlite[2/7] [===================79%      ] pool256.sqlite[2/7] [===================80%      ] pool256.sqlite[2/7] [===================81%      ] pool256.sqlite[2/7] [===================82%      ] pool256.sqlite[2/7] [====================83%     ] pool256.sqlite[2/7] [====================84%     ] pool256.sqlite[2/7] [====================85%     ] pool256.sqlite[2/7] [=====================86%    ] pool256.sqlite[2/7] [=====================87%    ] pool256.sqlite[2/7] [=====================88%    ] pool256.sqlite[2/7] [=====================89%    ] pool256.sqlite[2/7] [======================90%   ] pool256.sqlite[2/7] [======================91%   ] pool256.sqlite[2/7] [======================92%   ] pool256.sqlite[2/7] [=======================93%  ] pool256.sqlite[2/7] [=======================94%  ] pool256.sqlite[2/7] [=======================95%  ] pool256.sqlite[2/7] [=======================96%  ] pool256.sqlite[2/7] [========================97% ] pool256.sqlite[2/7] [========================98% ] pool256.sqlite[2/7] [========================99% ] pool256.sqlite[2/7] [========================100%] pool256.sqlite[2/7] [========================100%] pool256.sqlite
+[3/7] Executing 'nvtx_sum' stats report
+
+ Time (%)  Total Time (ns)  Instances    Avg (ns)      Med (ns)     Min (ns)    Max (ns)   StdDev (ns)   Style          Range        
+ --------  ---------------  ---------  ------------  ------------  ----------  ----------  -----------  -------  --------------------
+     93.9       1482343085          1  1482343085.0  1482343085.0  1482343085  1482343085          0.0  PushPop  :load_original_graph
+      6.1         95791793          1    95791793.0    95791793.0    95791793    95791793          0.0  PushPop  :single100_k64      
+      0.0           178392          1      178392.0      178392.0      178392      178392          0.0  PushPop  :pool_init          
+
+[4/7] Executing 'cuda_api_sum' stats report
+
+ Time (%)  Total Time (ns)  Num Calls   Avg (ns)     Med (ns)    Min (ns)   Max (ns)   StdDev (ns)             Name            
+ --------  ---------------  ---------  -----------  -----------  ---------  ---------  -----------  ---------------------------
+     60.8        125663835          1  125663835.0  125663835.0  125663835  125663835          0.0  cudaMemcpy2DAsync_ptsz     
+     31.0         64005466        301     212642.7       2321.0       2110   60449393    3487228.4  cudaLaunchKernel_ptsz      
+      3.4          7033163        301      23366.0       8100.0       1820    5078543     292364.9  cudaMemcpyAsync            
+      2.7          5548389          1    5548389.0    5548389.0    5548389    5548389          0.0  cudaMallocAsync_ptsz_v11020
+      1.7          3483813          2    1741906.5    1741906.5    1245236    2238577     702398.2  cudaFree                   
+      0.2           503546          2     251773.0     251773.0     143712     359834     152821.3  cudaMalloc                 
+      0.1           302146        802        376.7        340.0        310       4561        164.8  cudaEventRecord            
+      0.0            41971          1      41971.0      41971.0      41971      41971          0.0  cudaMemsetAsync_ptsz       
+      0.0            18031          1      18031.0      18031.0      18031      18031          0.0  cudaMemGetInfo             
+      0.0            14970          3       4990.0       5340.0       2480       7150       2354.6  cudaDeviceSynchronize      
+      0.0             9840          2       4920.0       4920.0       2930       6910       2814.3  cudaStreamWaitEvent        
+      0.0             7710          2       3855.0       3855.0       1840       5870       2849.6  cudaEventCreateWithFlags   
+      0.0             3850          1       3850.0       3850.0       3850       3850          0.0  cudaFreeAsync_ptsz_v11020  
+      0.0             2231          1       2231.0       2231.0       2231       2231          0.0  cudaEventSynchronize       
+      0.0             2060          1       2060.0       2060.0       2060       2060          0.0  cudaStreamGetId_v12000     
+      0.0             1170          1       1170.0       1170.0       1170       1170          0.0  cudaEventDestroy           
+      0.0              510          1        510.0        510.0        510        510          0.0  cuModuleGetLoadingMode     
+
+[5/7] Executing 'cuda_gpu_kern_sum' stats report
+
+ Time (%)  Total Time (ns)  Instances  Avg (ns)  Med (ns)  Min (ns)  Max (ns)  StdDev (ns)                                                  Name                                                
+ --------  ---------------  ---------  --------  --------  --------  --------  -----------  ----------------------------------------------------------------------------------------------------
+     97.5         20896811        100  208968.1  207217.0    187585    273088      10777.5  void cuvs::neighbors::cagra::detail::multi_cta_search::search_kernel<cuvs::neighbors::cagra::detail…
+      2.0           433985        100    4339.9    4352.0      4288      4608         36.4  void cuvs::neighbors::cagra::detail::kern_topk_cta_11<(int)8, (int)2, (int)64, (int)32, unsigned in…
+      0.5            99586        100     995.9     992.0       960      1280         33.8  void cuvs::neighbors::cagra::detail::multi_cta_search::set_value_batch_kernel<unsigned int>(T1 *, u…
+      0.0             1280          1    1280.0    1280.0      1280      1280          0.0  void cuvs::neighbors::cagra::detail::standard_dataset_descriptor_init_kernel<(cuvs::distance::Dista…
+
+[6/7] Executing 'cuda_gpu_mem_time_sum' stats report
+
+ Time (%)  Total Time (ns)  Count  Avg (ns)   Med (ns)   Min (ns)  Max (ns)   StdDev (ns)           Operation          
+ --------  ---------------  -----  ---------  ---------  --------  ---------  -----------  ----------------------------
+     96.5        126352714    102  1238752.1      480.0       479  121259641   12011883.3  [CUDA memcpy Host-to-Device]
+      3.4          4425424      1  4425424.0  4425424.0   4425424    4425424          0.0  [CUDA memset]               
+      0.2           224606    200     1123.0     1120.0      1087       1536         39.7  [CUDA memcpy Device-to-Host]
+
+[7/7] Executing 'cuda_gpu_mem_size_sum' stats report
+
+ Total (MB)  Count  Avg (MB)  Med (MB)  Min (MB)  Max (MB)  StdDev (MB)           Operation          
+ ----------  -----  --------  --------  --------  --------  -----------  ----------------------------
+   3200.307    102    31.376     0.003     0.003  3072.000      304.312  [CUDA memcpy Host-to-Device]
+   3072.000      1  3072.000  3072.000  3072.000  3072.000        0.000  [CUDA memset]               
+      0.051    200     0.000     0.000     0.000     0.000        0.000  [CUDA memcpy Device-to-Host]
+
+Generated:
+    /home/ubuntu/index-accel-validation/serial-profiles/pool256.nsys-rep
+    /home/ubuntu/index-accel-validation/serial-profiles/pool256.sqlite

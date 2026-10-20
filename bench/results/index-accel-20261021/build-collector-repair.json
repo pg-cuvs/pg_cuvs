@@ -1,0 +1,11 @@
+{
+  "failed_job": "build_timing_cohort",
+  "exit_code": 1,
+  "phase": "first CREATE INDEX completed; physical-minus-logical metric expression raised float-Decimal TypeError",
+  "walltime": "unavailable, not reconstructed",
+  "new_job": "build_timing_cohort_r2",
+  "new_label_prefix": "build_r2_",
+  "N_per_arm": 3,
+  "repair": "normalize numeric SUM to int; save timing.json immediately after CREATE INDEX",
+  "new_harness_sha256": "6774e9db51a9721429c05b9e50fbb3acfdfee8e5bb9676ddef1c6a0b2475d14f"
+}

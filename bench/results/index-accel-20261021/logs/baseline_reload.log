@@ -1,0 +1,29 @@
+active
+[
+  {
+    "k": 64,
+    "recall_at10": 0.94074,
+    "qps": 1006.7757771663263,
+    "p50_ms": 0.9755784999470052,
+    "byte_identical_to_baseline": false,
+    "observed_gpu_queries": 10000,
+    "observed_gpu_errors": 0,
+    "observed_search_mode": "gpu_cagra"
+  },
+  {
+    "k": 128,
+    "recall_at10": 0.97852,
+    "qps": 1001.4332139610341,
+    "p50_ms": 0.9941985000523346,
+    "byte_identical_to_baseline": false,
+    "observed_gpu_queries": 10000,
+    "observed_gpu_errors": 0,
+    "observed_search_mode": "gpu_cagra"
+  }
+]
+Traceback (most recent call last):
+  File "/home/ubuntu/index-accel-validation/feature_gpu_check.py", line 257, in <module>
+    run()
+  File "/home/ubuntu/index-accel-validation/feature_gpu_check.py", line 251, in run
+    raise RuntimeError("default behavior differs from the same-graph baseline; evidence saved")
+RuntimeError: default behavior differs from the same-graph baseline; evidence saved

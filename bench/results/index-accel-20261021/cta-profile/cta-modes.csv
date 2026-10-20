@@ -1,0 +1,9 @@
+itopk_size,path,observed_modes,cagra_kernel_count
+64,batch,['single_cta'],1
+64,single,['multi_cta'],4
+128,batch,['single_cta'],1
+128,single,['multi_cta'],3
+256,batch,['single_cta'],1
+256,single,['multi_cta'],3
+512,batch,['single_cta'],1
+512,single,['multi_cta'],3

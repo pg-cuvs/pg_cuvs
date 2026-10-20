@@ -1,0 +1,208 @@
+{
+  "graph": {
+    "db_oid": 16390,
+    "ddl": "CREATE INDEX t_cagra ON public.t USING cagra (embedding) WITH (graph_degree='32', intermediate_graph_degree='128', build_algo=ivf_pq)",
+    "files": {
+      "16390_1016847.cagra": {
+        "bytes": 3200001716,
+        "sha256": "cc2a2aa515089309c1d528e4be321901a11f778458819c873d75326e2642f547"
+      },
+      "16390_1016847.tids": {
+        "bytes": 8000032,
+        "sha256": "ac8047f1ec2f0f63596d433172013323826eb3ea3effab077fbe54d96f9e415e"
+      },
+      "16390_1016847.vectors": {
+        "bytes": 3072000040,
+        "sha256": "16a0220e7bf2863b8aeab18a9404890b25dd63c066b7db96e3b47335db994317"
+      }
+    },
+    "index_oid": 1016847
+  },
+  "query_bytes_sha256": "5e1e0c1184090eb878c2ce8f5785fa059c437a0a5dcc7200e778cd1be1943c10",
+  "truth_bytes_sha256": "6e0c4be84e3cfb6acbe332cdca4bc14cc2202d0d524bd18218fea0085cb05c45",
+  "commit": "8b73d65fb8a3d6f66cdfe69eec4969c1f2fc753c",
+  "warming": "PG restarted per arm/control; buffer prewarm of heap/toast/index, then 100 query warmups per point",
+  "labels": [
+    "baseline_control1",
+    "baseline_control2",
+    "baseline_control3"
+  ],
+  "sample_count": 3,
+  "threshold_rule": "absolute difference to control mean <= observed max-min span; not a confidence interval",
+  "points": {
+    "64": {
+      "recall_at10": {
+        "values": [
+          0.94075,
+          0.94064,
+          0.94065
+        ],
+        "mean": 0.9406800000000001,
+        "min": 0.94064,
+        "max": 0.94075,
+        "std": 6.08276253029609e-05
+      },
+      "p50_ms": {
+        "values": [
+          0.9696385002371244,
+          0.9660680000251887,
+          0.9692880003058235
+        ],
+        "mean": 0.9683315001893789,
+        "min": 0.9660680000251887,
+        "max": 0.9696385002371244,
+        "std": 0.0019680668930265673
+      },
+      "qps": {
+        "values": [
+          1011.5499595754701,
+          1014.9096505884802,
+          1010.8834757778641
+        ],
+        "mean": 1012.4476953139382,
+        "min": 1010.8834757778641,
+        "max": 1014.9096505884802,
+        "std": 2.158000925278293
+      },
+      "pairwise_ids": [
+        {
+          "runs": [
+            "baseline_control1",
+            "baseline_control2"
+          ],
+          "mean_query_jaccard": 0.9994106244632563,
+          "id_changed_queries": 25,
+          "reorder_only_queries": 0,
+          "within_gt_only_changed_queries": 0,
+          "gt_outside_involved_queries": 25,
+          "gt_hits_lost": 22,
+          "gt_hits_gained": 11
+        },
+        {
+          "runs": [
+            "baseline_control1",
+            "baseline_control3"
+          ],
+          "mean_query_jaccard": 0.9993803214329533,
+          "id_changed_queries": 24,
+          "reorder_only_queries": 0,
+          "within_gt_only_changed_queries": 0,
+          "gt_outside_involved_queries": 24,
+          "gt_hits_lost": 19,
+          "gt_hits_gained": 9
+        },
+        {
+          "runs": [
+            "baseline_control2",
+            "baseline_control3"
+          ],
+          "mean_query_jaccard": 0.9995030303030308,
+          "id_changed_queries": 23,
+          "reorder_only_queries": 0,
+          "within_gt_only_changed_queries": 0,
+          "gt_outside_involved_queries": 23,
+          "gt_hits_lost": 10,
+          "gt_hits_gained": 11
+        }
+      ],
+      "mean_pairwise_query_jaccard": 0.9994313253997468
+    },
+    "128": {
+      "recall_at10": {
+        "values": [
+          0.97843,
+          0.9785,
+          0.97841
+        ],
+        "mean": 0.9784466666666667,
+        "min": 0.97841,
+        "max": 0.9785,
+        "std": 4.725815626254202e-05
+      },
+      "p50_ms": {
+        "values": [
+          0.9966490001716011,
+          1.0019285000453237,
+          1.0000639999816485
+        ],
+        "mean": 0.9995471667328578,
+        "min": 0.9966490001716011,
+        "max": 1.0019285000453237,
+        "std": 0.0026774273443832455
+      },
+      "qps": {
+        "values": [
+          1001.9476414340911,
+          981.6500823496193,
+          980.4129681466312
+        ],
+        "mean": 988.0035639767806,
+        "min": 980.4129681466312,
+        "max": 1001.9476414340911,
+        "std": 12.091756902510744
+      },
+      "pairwise_ids": [
+        {
+          "runs": [
+            "baseline_control1",
+            "baseline_control2"
+          ],
+          "mean_query_jaccard": 0.9993000000000004,
+          "id_changed_queries": 37,
+          "reorder_only_queries": 1,
+          "within_gt_only_changed_queries": 0,
+          "gt_outside_involved_queries": 36,
+          "gt_hits_lost": 15,
+          "gt_hits_gained": 22
+        },
+        {
+          "runs": [
+            "baseline_control1",
+            "baseline_control3"
+          ],
+          "mean_query_jaccard": 0.99929393939394,
+          "id_changed_queries": 39,
+          "reorder_only_queries": 1,
+          "within_gt_only_changed_queries": 1,
+          "gt_outside_involved_queries": 37,
+          "gt_hits_lost": 19,
+          "gt_hits_gained": 17
+        },
+        {
+          "runs": [
+            "baseline_control2",
+            "baseline_control3"
+          ],
+          "mean_query_jaccard": 0.9993515151515155,
+          "id_changed_queries": 34,
+          "reorder_only_queries": 0,
+          "within_gt_only_changed_queries": 1,
+          "gt_outside_involved_queries": 33,
+          "gt_hits_lost": 22,
+          "gt_hits_gained": 13
+        }
+      ],
+      "mean_pairwise_query_jaccard": 0.999315151515152
+    }
+  },
+  "original_restart_diagnostic": {
+    "64": {
+      "mean_query_jaccard": 0.9994393939393944,
+      "id_changed_queries": 30,
+      "reorder_only_queries": 0,
+      "within_gt_only_changed_queries": 0,
+      "gt_outside_involved_queries": 30,
+      "gt_hits_lost": 11,
+      "gt_hits_gained": 16
+    },
+    "128": {
+      "mean_query_jaccard": 0.9990666666666673,
+      "id_changed_queries": 50,
+      "reorder_only_queries": 2,
+      "within_gt_only_changed_queries": 0,
+      "gt_outside_involved_queries": 48,
+      "gt_hits_lost": 23,
+      "gt_hits_gained": 26
+    }
+  }
+}

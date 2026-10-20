@@ -1,0 +1,153 @@
+{
+  "commit": "0caa6483df57fa6d53310e5aecdddc8b7d559688",
+  "extensions": [
+    [
+      "pg_cuvs",
+      "0.8.0"
+    ],
+    [
+      "pg_prewarm",
+      "1.2"
+    ],
+    [
+      "plpgsql",
+      "1.0"
+    ],
+    [
+      "vector",
+      "0.8.7"
+    ]
+  ],
+  "graph": {
+    "db_oid": 16390,
+    "ddl": "CREATE INDEX t_cagra ON public.t USING cagra (embedding) WITH (graph_degree='32', intermediate_graph_degree='128', build_algo=ivf_pq)",
+    "files": {
+      "16390_1016847.cagra": {
+        "bytes": 3200001716,
+        "sha256": "cc2a2aa515089309c1d528e4be321901a11f778458819c873d75326e2642f547"
+      },
+      "16390_1016847.tids": {
+        "bytes": 8000032,
+        "sha256": "ac8047f1ec2f0f63596d433172013323826eb3ea3effab077fbe54d96f9e415e"
+      },
+      "16390_1016847.vectors": {
+        "bytes": 3072000040,
+        "sha256": "16a0220e7bf2863b8aeab18a9404890b25dd63c066b7db96e3b47335db994317"
+      }
+    },
+    "index_oid": 1016847
+  },
+  "harness": "private pg_cuvs feature validation; PgEngine loader/batch; serial id+distance SQL",
+  "harness_file_sha256": "9e40aa8e169e1ef738eb7a2e060db26f9ff6152993bbd3dda2b5b943b168d7a8",
+  "mode": "sweep",
+  "n": 1000000,
+  "owner": {
+    "cuda_arch": "sm_89",
+    "gpu_model": "L40S",
+    "hardware": {
+      "block_devices": {
+        "exit_code": 0,
+        "stderr": "",
+        "stdout": "{\n   \"blockdevices\": [\n      {\n         \"name\": \"loop0\",\n         \"type\": \"loop\",\n         \"size\": 67051520,\n         \"model\": null,\n         \"rota\": true,\n         \"tran\": null,\n         \"fstype\": \"squashfs\",\n         \"mountpoints\": [\n             \"/snap/core20/2318\"\n         ]\n      },{\n         \"name\": \"loop1\",\n         \"type\": \"loop\",\n         \"size\": 91267072,\n         \"model\": null,\n         \"rota\": true,\n         \"tran\": null,\n         \"fstype\": \"squashfs\",\n         \"mountpoints\": [\n             \"/snap/lxd/29351\"\n         ]\n      },{\n         \"name\": \"loop2\",\n         \"type\": \"loop\",\n         \"size\": 40714240,\n         \"model\": null,\n         \"rota\": true,\n         \"tran\": null,\n         \"fstype\": \"squashfs\",\n         \"mountpoints\": [\n             \"/snap/snapd/21759\"\n         ]\n      },{\n         \"name\": \"vda\",\n         \"type\": \"disk\",\n         \"size\": 137438953472,\n         \"model\": null,\n         \"rota\": true,\n         \"tran\": null,\n         \"fstype\": null,\n         \"mountpoints\": [\n             null\n         ],\n         \"children\": [\n            {\n               \"name\": \"vda1\",\n               \"type\": \"part\",\n               \"size\": 137322544640,\n               \"model\": null,\n               \"rota\": true,\n               \"tran\": null,\n               \"fstype\": \"ext4\",\n               \"mountpoints\": [\n                   \"/\"\n               ]\n            },{\n               \"name\": \"vda14\",\n               \"type\": \"part\",\n               \"size\": 4194304,\n               \"model\": null,\n               \"rota\": true,\n               \"tran\": null,\n               \"fstype\": null,\n               \"mountpoints\": [\n                   null\n               ]\n            },{\n               \"name\": \"vda15\",\n               \"type\": \"part\",\n               \"size\": 111149056,\n               \"model\": null,\n               \"rota\": true,\n               \"tran\": null,\n               \"fstype\": \"vfat\",\n               \"mountpoints\": [\n                   \"/boot/efi\"\n               ]\n            }\n         ]\n      },{\n         \"name\": \"vdb\",\n         \"type\": \"disk\",\n         \"size\": 128849018880,\n         \"model\": null,\n         \"rota\": true,\n         \"tran\": null,\n         \"fstype\": \"ext4\",\n         \"mountpoints\": [\n             \"/data\"\n         ]\n      }\n   ]\n}"
+      },
+      "ephemeral_mount": {
+        "exit_code": 0,
+        "stderr": "",
+        "stdout": "{\n   \"filesystems\": [\n      {\n         \"target\": \"/\",\n         \"source\": \"/dev/vda1\",\n         \"fstype\": \"ext4\",\n         \"options\": \"rw,relatime,discard,errors=remount-ro\"\n      }\n   ]\n}"
+      },
+      "gpu": {
+        "exit_code": 0,
+        "stderr": "",
+        "stdout": "NVIDIA L40S, GPU-d9e48742-0b9e-1c7d-d1d3-a12ac29e6935, 46068, 565.57.01, 8.9"
+      },
+      "hostname": "brev-v6nc08sjs",
+      "local_nvme_assessment": "No NVMe block device detected",
+      "memory_gib": 144.39885330200195,
+      "nvcc_before_bootstrap": {
+        "error": "[Errno 2] No such file or directory: 'nvcc'"
+      },
+      "nvidia_smi": {
+        "exit_code": 0,
+        "stderr": "",
+        "stdout": "Tue Oct 20 14:57:41 2026       \n+-----------------------------------------------------------------------------------------+\n| NVIDIA-SMI 565.57.01              Driver Version: 565.57.01      CUDA Version: 12.7     |\n|-----------------------------------------+------------------------+----------------------+\n| GPU  Name                 Persistence-M | Bus-Id          Disp.A | Volatile Uncorr. ECC |\n| Fan  Temp   Perf          Pwr:Usage/Cap |           Memory-Usage | GPU-Util  Compute M. |\n|                                         |                        |               MIG M. |\n|=========================================+========================+======================|\n|   0  NVIDIA L40S                    On  |   00000002:00:01.0 Off |                    0 |\n| N/A   31C    P8             24W /  350W |       1MiB /  46068MiB |      0%      Default |\n|                                         |                        |                  N/A |\n+-----------------------------------------+------------------------+----------------------+\n                                                                                         \n+-----------------------------------------------------------------------------------------+\n| Processes:                                                                              |\n|  GPU   GI   CI        PID   Type   Process name                              GPU Memory |\n|        ID   ID                                                               Usage      |\n|=========================================================================================|\n|  No running processes found                                                             |\n+-----------------------------------------------------------------------------------------+"
+      },
+      "nvme_devices": [],
+      "observed_at_utc": "2026-10-20T14:57:41.068876+00:00",
+      "os_release": {
+        "BUG_REPORT_URL": "https://bugs.launchpad.net/ubuntu/",
+        "HOME_URL": "https://www.ubuntu.com/",
+        "ID": "ubuntu",
+        "ID_LIKE": "debian",
+        "NAME": "Ubuntu",
+        "PRETTY_NAME": "Ubuntu 22.04.5 LTS",
+        "PRIVACY_POLICY_URL": "https://www.ubuntu.com/legal/terms-and-policies/privacy-policy",
+        "SUPPORT_URL": "https://help.ubuntu.com/",
+        "UBUNTU_CODENAME": "jammy",
+        "VERSION": "22.04.5 LTS (Jammy Jellyfish)",
+        "VERSION_CODENAME": "jammy",
+        "VERSION_ID": "22.04"
+      },
+      "root_free_bytes": 115572850688,
+      "root_mount": {
+        "exit_code": 0,
+        "stderr": "",
+        "stdout": "{\n   \"filesystems\": [\n      {\n         \"target\": \"/\",\n         \"source\": \"/dev/vda1\",\n         \"fstype\": \"ext4\",\n         \"options\": \"rw,relatime,discard,errors=remount-ro\"\n      }\n   ]\n}"
+      },
+      "systemd": {
+        "exit_code": 0,
+        "stderr": "",
+        "stdout": "systemd 249 (249.11-0ubuntu3.12)\n+PAM +AUDIT +SELINUX +APPARMOR +IMA +SMACK +SECCOMP +GCRYPT +GNUTLS +OPENSSL +ACL +BLKID +CURL +ELFUTILS +FIDO2 +IDN2 -IDN +IPTC +KMOD +LIBCRYPTSETUP +LIBFDISK +PCRE2 -PWQUALITY -P11KIT -QRENCODE +BZIP2 +LZ4 +XZ +ZLIB +ZSTD -XKBCOMMON +UTMP +SYSVINIT default-hierarchy=unified"
+      },
+      "vcpu_count": 8
+    },
+    "price_usd_per_hour": 1.74,
+    "software": {
+      "baseline_commit": "8b73d65fb8a3d6f66cdfe69eec4969c1f2fc753c",
+      "cuda_toolkit": "12.4.131",
+      "extensions": [
+        [
+          "pg_cuvs",
+          "0.8.0"
+        ],
+        [
+          "pg_prewarm",
+          "1.2"
+        ],
+        [
+          "plpgsql",
+          "1.0"
+        ],
+        [
+          "vector",
+          "0.8.7"
+        ]
+      ],
+      "libcuvs": "26.04.00",
+      "librmm": "26.04.00",
+      "postgres": "16.15",
+      "upstream_bootstrap_commit": "77c660110a22beeffc151fc5c5dee37a859e1c10"
+    },
+    "vm_id": "v6nc08sjs",
+    "vm_name": "pg-cuvs-index-accel-20261020"
+  },
+  "postgres": "PostgreSQL 16.15 (Ubuntu 16.15-1.pgdg22.04+2) on x86_64-pc-linux-gnu, compiled by gcc (Ubuntu 11.4.0-1ubuntu1~22.04.3) 11.4.0, 64-bit",
+  "prewarm_buffer_blocks": {
+    "16842": 7360,
+    "16845": 500000,
+    "16846": 5486
+  },
+  "queries": 10000,
+  "query_bytes_sha256": "5e1e0c1184090eb878c2ce8f5785fa059c437a0a5dcc7200e778cd1be1943c10",
+  "rmm_pool_mb": "not_supported",
+  "search_settings": {
+    "cuvs.bf_batch_wait_us": "0",
+    "cuvs.cagra_batch_wait_us": "0",
+    "cuvs.itopk_size": "0",
+    "cuvs.search_mode": "cagra",
+    "cuvs.search_width": "0"
+  },
+  "selection": "AUTO; no kernel trace collected",
+  "shared_buffers": "128MB",
+  "truth_bytes_sha256": "6e0c4be84e3cfb6acbe332cdca4bc14cc2202d0d524bd18218fea0085cb05c45",
+  "warming": "PG restarted per arm/control; buffer prewarm of heap/toast/index, then 100 query warmups per point"
+}

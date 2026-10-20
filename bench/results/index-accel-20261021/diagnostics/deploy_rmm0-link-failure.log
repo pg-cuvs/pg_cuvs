@@ -1,0 +1,824 @@
+Previous HEAD position was 0caa648 fix(search): initialize unused CAGRA fields in BF batch keys
+HEAD is now at 58e0786 feat(daemon): add opt-in RMM pool initialization and applied-setting status
+rm -f pg_cuvs.so   libpg_cuvs.a  libpg_cuvs.pc
+rm -f src/pg_cuvs.o src/cuvs_ipc.o src/cuvs_util.o src/cuvs_wrapper.o src/hnsw_export.o src/cuvs_build_corpus.o src/pg_cuvs_compaction.o src/pg_cuvs.bc src/cuvs_ipc.bc src/cuvs_util.bc src/cuvs_wrapper.bc src/hnsw_export.bc src/cuvs_build_corpus.bc src/pg_cuvs_compaction.bc
+rm -rf results/ regression.diffs regression.out tmp_check/ tmp_check_iso/ log/ output_iso/
+rm -rf output_iso/ tmp_check_iso/
+gcc -Wall -Wmissing-prototypes -Wpointer-arith -Wdeclaration-after-statement -Werror=vla -Wendif-labels -Wmissing-format-attribute -Wimplicit-fallthrough=3 -Wcast-function-type -Wshadow=compatible-local -Wformat-security -fno-strict-aliasing -fwrapv -fexcess-precision=standard -Wno-format-truncation -Wno-stringop-truncation -g -g -O2 -flto=auto -ffat-lto-objects -flto=auto -ffat-lto-objects -fstack-protector-strong -Wformat -Werror=format-security -fno-omit-frame-pointer -fPIC -fvisibility=hidden -I/opt/miniforge3/envs/cuvs_dev/include -I/opt/miniforge3/envs/cuvs_dev/include/rapids -I./src -I. -I./ -I/usr/include/postgresql/16/server -I/usr/include/postgresql/internal -Wdate-time -D_FORTIFY_SOURCE=2 -D_GNU_SOURCE  -I/usr/include/libxml2   -c -o src/pg_cuvs.o src/pg_cuvs.c
+gcc -Wall -Wmissing-prototypes -Wpointer-arith -Wdeclaration-after-statement -Werror=vla -Wendif-labels -Wmissing-format-attribute -Wimplicit-fallthrough=3 -Wcast-function-type -Wshadow=compatible-local -Wformat-security -fno-strict-aliasing -fwrapv -fexcess-precision=standard -Wno-format-truncation -Wno-stringop-truncation -g -g -O2 -flto=auto -ffat-lto-objects -flto=auto -ffat-lto-objects -fstack-protector-strong -Wformat -Werror=format-security -fno-omit-frame-pointer -fPIC -fvisibility=hidden -I/opt/miniforge3/envs/cuvs_dev/include -I/opt/miniforge3/envs/cuvs_dev/include/rapids -I./src -I. -I./ -I/usr/include/postgresql/16/server -I/usr/include/postgresql/internal -Wdate-time -D_FORTIFY_SOURCE=2 -D_GNU_SOURCE  -I/usr/include/libxml2   -c -o src/cuvs_ipc.o src/cuvs_ipc.c
+src/cuvs_ipc.c: In function ‘uds_connect_ex’:
+src/cuvs_ipc.c:130:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+  130 |     struct sockaddr_un addr;
+      |     ^~~~~~
+src/cuvs_ipc.c:135:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+  135 |     struct timeval tv = {.tv_sec = recv_timeout_sec, .tv_usec = 0};
+      |     ^~~~~~
+src/cuvs_ipc.c: In function ‘recv_all_interruptible’:
+src/cuvs_ipc.c:293:9: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+  293 |         ssize_t n = read(fd, p + got, len - got);
+      |         ^~~~~~~
+src/cuvs_ipc.c: In function ‘shm_write_build_payload’:
+src/cuvs_ipc.c:405:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+  405 |     void *mem = mmap(NULL, total, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+      |     ^~~~
+src/cuvs_ipc.c: In function ‘shm_write_query_batch’:
+src/cuvs_ipc.c:440:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+  440 |     void *mem = mmap(NULL, total, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+      |     ^~~~
+src/cuvs_ipc.c: In function ‘shm_write_query’:
+src/cuvs_ipc.c:473:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+  473 |     void *mem = mmap(NULL, vec_bytes, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+      |     ^~~~
+src/cuvs_ipc.c: In function ‘cuvs_ipc_search’:
+src/cuvs_ipc.c:533:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+  533 |     CuvsCmdFrame cmd = {
+      |     ^~~~~~~~~~~~
+src/cuvs_ipc.c:558:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+  558 |     CuvsReplyHeader hdr;
+      |     ^~~~~~~~~~~~~~~
+src/cuvs_ipc.c: In function ‘cuvs_ipc_search_batch’:
+src/cuvs_ipc.c:668:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+  668 |     CuvsCmdFrame cmd = {
+      |     ^~~~~~~~~~~~
+src/cuvs_ipc.c:687:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+  687 |     CuvsReplyHeader hdr;
+      |     ^~~~~~~~~~~~~~~
+src/cuvs_ipc.c:698:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+  698 |     uint32_t Q = hdr.n_results;
+      |     ^~~~~~~~
+src/cuvs_ipc.c:715:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+  715 |     size_t hdr_bytes  = 2 * sizeof(uint32_t);
+      |     ^~~~~~
+src/cuvs_ipc.c: In function ‘cuvs_ipc_stats’:
+src/cuvs_ipc.c:767:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+  767 |     CuvsCmdFrame cmd = {
+      |     ^~~~~~~~~~~~
+src/cuvs_ipc.c:776:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+  776 |     CuvsReplyHeader hdr;
+      |     ^~~~~~~~~~~~~~~
+src/cuvs_ipc.c: In function ‘cuvs_ipc_shard_stats’:
+src/cuvs_ipc.c:891:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+  891 |     CuvsCmdFrame cmd = {
+      |     ^~~~~~~~~~~~
+src/cuvs_ipc.c:900:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+  900 |     CuvsReplyHeader hdr;
+      |     ^~~~~~~~~~~~~~~
+src/cuvs_ipc.c: In function ‘cuvs_ipc_export_adjacency’:
+src/cuvs_ipc.c:1318:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 1318 |     CuvsCmdFrame cmd = {
+      |     ^~~~~~~~~~~~
+src/cuvs_ipc.c:1329:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 1329 |     CuvsReplyHeader hdr;
+      |     ^~~~~~~~~~~~~~~
+src/cuvs_ipc.c:1340:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 1340 |     size_t  n_vecs       = (size_t)hdr.n_results;
+      |     ^~~~~~
+src/cuvs_ipc.c:1358:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 1358 |     size_t adj_bytes  = n_vecs * (size_t)graph_degree * sizeof(uint32_t);
+      |     ^~~~~~
+src/cuvs_ipc.c:1376:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 1376 |     uint32_t src_metric = ((const uint32_t *)mem)[3];
+      |     ^~~~~~~~
+src/cuvs_ipc.c: In function ‘cuvs_ipc_export_hnsw_shm’:
+src/cuvs_ipc.c:1436:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 1436 |     CuvsCmdFrame cmd = {
+      |     ^~~~~~~~~~~~
+src/cuvs_ipc.c:1445:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 1445 |     CuvsReplyHeader hdr;
+      |     ^~~~~~~~~~~~~~~
+src/cuvs_ipc.c: In function ‘cuvs_ipc_search_filtered’:
+src/cuvs_ipc.c:1540:9: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 1540 |         size_t filter_bytes = (size_t)n_filter * sizeof(uint64_t);
+      |         ^~~~~~
+src/cuvs_ipc.c:1551:9: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 1551 |         void *fmem = mmap(NULL, filter_bytes, PROT_READ | PROT_WRITE,
+      |         ^~~~
+src/cuvs_ipc.c:1574:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 1574 |     CuvsCmdFrame cmd = {
+      |     ^~~~~~~~~~~~
+src/cuvs_ipc.c:1595:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 1595 |     CuvsReplyHeader hdr;
+      |     ^~~~~~~~~~~~~~~
+src/cuvs_ipc.c: In function ‘cuvs_ipc_search_stream_bf’:
+src/cuvs_ipc.c:1695:9: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 1695 |         size_t filter_bytes = (size_t)n_filter * sizeof(uint64_t);
+      |         ^~~~~~
+src/cuvs_ipc.c:1706:9: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 1706 |         void *fmem = mmap(NULL, filter_bytes, PROT_READ | PROT_WRITE,
+      |         ^~~~
+src/cuvs_ipc.c:1725:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 1725 |     CuvsCmdFrame cmd = {
+      |     ^~~~~~~~~~~~
+src/cuvs_ipc.c:1742:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 1742 |     CuvsReplyHeader hdr;
+      |     ^~~~~~~~~~~~~~~
+src/cuvs_ipc.c: In function ‘cuvs_ipc_search_bf_transient’:
+src/cuvs_ipc.c:1842:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 1842 |     size_t vec_bytes = (size_t)n * (size_t)dim * sizeof(float);
+      |     ^~~~~~
+src/cuvs_ipc.c:1875:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 1875 |     CuvsCmdFrame cmd;
+      |     ^~~~~~~~~~~~
+src/cuvs_ipc.c:1895:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 1895 |     CuvsReplyHeader hdr;
+      |     ^~~~~~~~~~~~~~~
+src/cuvs_ipc.c: In function ‘cuvs_ipc_search_ivfpq’:
+src/cuvs_ipc.c:2073:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 2073 |     CuvsCmdFrame cmd = {
+      |     ^~~~~~~~~~~~
+src/cuvs_ipc.c:2087:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 2087 |     CuvsReplyHeader hdr;
+      |     ^~~~~~~~~~~~~~~
+src/pg_cuvs.c:1353:1: warning: no previous prototype for ‘cuvs_cagra_reloption_graph_degree’ [-Wmissing-prototypes]
+ 1353 | cuvs_cagra_reloption_graph_degree(Relation cagra_rel)
+      | ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+src/pg_cuvs.c: In function ‘flat_amcostestimate’:
+src/pg_cuvs.c:2056:9: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 2056 |         double startup = 0.0, total = 0.0;
+      |         ^~~~~~
+src/pg_cuvs.c: In function ‘cuvs_effective_build_cap_bytes’:
+src/pg_cuvs.c:2167:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 2167 |     size_t avail = read_mem_available_bytes();
+      |     ^~~~~~
+src/pg_cuvs.c: In function ‘cuvs_build_callback’:
+src/pg_cuvs.c:2257:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 2257 |     PgVector *vec = DatumGetPgVector(values[0]);
+      |     ^~~~~~~~
+src/pg_cuvs.c:2268:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 2268 |     float *dst = bs->vectors + (bs->n_vecs * bs->dim);
+      |     ^~~~~
+src/pg_cuvs.c: In function ‘cuvs_ambuild’:
+src/pg_cuvs.c:2853:9: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 2853 |         FILE *f = fopen(sidecar, "w");
+      |         ^~~~
+src/pg_cuvs.c: In function ‘flat_ambuild’:
+src/pg_cuvs.c:3100:9: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 3100 |         FILE *f = fopen(sidecar, "w");
+      |         ^~~~
+src/pg_cuvs.c: At top level:
+src/pg_cuvs.c:3389:38: warning: "/*" within comment [-Wcomment]
+ 3389 |  * caller-supplied tids_out/dists_out/*n_results arrays (no CuvsScanState). */
+      |                                       
+src/pg_cuvs.c: In function ‘cuvs_gettuple’:
+src/pg_cuvs.c:3633:9: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 3633 |         Oid index_oid = RelationGetRelid(scan->indexRelation);
+      |         ^~~
+src/pg_cuvs.c:3669:9: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 3669 |         Datum query_datum = scan->orderByData[0].sk_argument;
+      |         ^~~~~
+src/pg_cuvs.c:3694:9: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 3694 |         uint32_t metric = cuvs_index_metric(scan->indexRelation);
+      |         ^~~~~~~~
+src/pg_cuvs.c:3865:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 3865 |     uint64_t tid     = ss->tids[ss->cur];
+      |     ^~~~~~~~
+src/pg_cuvs.c: In function ‘flat_gettuple’:
+src/pg_cuvs.c:3924:9: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 3924 |         Oid index_oid = RelationGetRelid(scan->indexRelation);
+      |         ^~~
+src/pg_cuvs.c:3944:9: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 3944 |         Datum query_datum = scan->orderByData[0].sk_argument;
+      |         ^~~~~
+src/pg_cuvs.c:3961:9: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 3961 |         uint32_t metric = cuvs_index_metric(scan->indexRelation);
+      |         ^~~~~~~~
+src/pg_cuvs.c:4098:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 4098 |     uint64_t tid     = ss->tids[ss->cur];
+      |     ^~~~~~~~
+src/pg_cuvs.c: In function ‘ivfpq_ambuild’:
+src/pg_cuvs.c:4490:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 4490 |     CuvsIvfPqOptions *opts = (CuvsIvfPqOptions *) indexRel->rd_options;
+      |     ^~~~~~~~~~~~~~~~
+src/pg_cuvs.c: In function ‘ivfpq_gettuple’:
+src/pg_cuvs.c:4614:9: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 4614 |         Oid index_oid = RelationGetRelid(scan->indexRelation);
+      |         ^~~
+src/pg_cuvs.c:4633:9: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 4633 |         Datum    query_datum = scan->orderByData[0].sk_argument;
+      |         ^~~~~
+src/pg_cuvs.c:4644:9: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 4644 |         int rc = cuvs_ipc_search_ivfpq(
+      |         ^~~
+src/pg_cuvs.c:4717:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 4717 |     uint64_t tid = ss->tids[ss->cur];
+      |     ^~~~~~~~
+src/pg_cuvs.c: In function ‘pg_cuvs_last_search_metric’:
+src/pg_cuvs.c:4906:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 4906 |     const char *name;
+      |     ^~~~~
+src/pg_cuvs.c: In function ‘pg_cuvs_batch_search’:
+src/pg_cuvs.c:5004:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 5004 |     Relation  heapRel = table_open(table_oid, AccessShareLock);
+      |     ^~~~~~~~
+src/pg_cuvs.c:5035:9: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 5035 |         Oid    elemtype = ARR_ELEMTYPE(qarr);
+      |         ^~~
+src/pg_cuvs.c: In function ‘pg_cuvs_gpu_cache_stats’:
+src/pg_cuvs.c:5459:22: warning: unused variable ‘cs’ [-Wunused-variable]
+ 5459 |     CuvsCacheStats   cs;
+      |                      ^~
+src/pg_cuvs.c: In function ‘cuvs_filtered_knn’:
+src/pg_cuvs.c:6050:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 6050 |     Relation  indexRel = index_open(index_oid, AccessShareLock);
+      |     ^~~~~~~~
+src/pg_cuvs.c:6059:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 6059 |     uint32_t metric = cuvs_index_metric(indexRel);
+      |     ^~~~~~~~
+src/pg_cuvs.c:6065:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 6065 |     PgVector *qvec = DatumGetPgVector(query_datum);
+      |     ^~~~~~~~
+src/pg_cuvs.c:6153:9: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 6153 |         int       k_fetch    = use_filter
+      |         ^~~
+src/pg_cuvs.c: In function ‘cuvs_cs_build’:
+src/pg_cuvs.c:6493:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 6493 |     PgVector *qvec = DatumGetPgVector(state->query_datum);
+      |     ^~~~~~~~
+src/pg_cuvs.c:6513:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 6513 |     int search_k = cuvs_k_with_tombstone_slack(state->index_oid, k);
+      |     ^~~
+src/pg_cuvs.c:6516:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 6516 |     uint32_t latency_us = 0;
+      |     ^~~~~~~~
+gcc -Wall -Wmissing-prototypes -Wpointer-arith -Wdeclaration-after-statement -Werror=vla -Wendif-labels -Wmissing-format-attribute -Wimplicit-fallthrough=3 -Wcast-function-type -Wshadow=compatible-local -Wformat-security -fno-strict-aliasing -fwrapv -fexcess-precision=standard -Wno-format-truncation -Wno-stringop-truncation -g -g -O2 -flto=auto -ffat-lto-objects -flto=auto -ffat-lto-objects -fstack-protector-strong -Wformat -Werror=format-security -fno-omit-frame-pointer -fPIC -fvisibility=hidden -I/opt/miniforge3/envs/cuvs_dev/include -I/opt/miniforge3/envs/cuvs_dev/include/rapids -I./src -I. -I./ -I/usr/include/postgresql/16/server -I/usr/include/postgresql/internal -Wdate-time -D_FORTIFY_SOURCE=2 -D_GNU_SOURCE  -I/usr/include/libxml2   -c -o src/cuvs_util.o src/cuvs_util.c
+nvcc -ccbin /usr/bin/g++ -O3 --compiler-options '-fPIC' -arch=sm_89 -std=c++17 --extended-lambda -DRAFT_SYSTEM_LITTLE_ENDIAN=1 -DCUVS_BUILD_CAGRA_HNSWLIB -I/opt/miniforge3/envs/cuvs_dev/include -I/opt/miniforge3/envs/cuvs_dev/include/rapids -I./src -c src/cuvs_wrapper.cu -o src/cuvs_wrapper.o
+gcc -Wall -Wmissing-prototypes -Wpointer-arith -Wdeclaration-after-statement -Werror=vla -Wendif-labels -Wmissing-format-attribute -Wimplicit-fallthrough=3 -Wcast-function-type -Wshadow=compatible-local -Wformat-security -fno-strict-aliasing -fwrapv -fexcess-precision=standard -Wno-format-truncation -Wno-stringop-truncation -g -g -O2 -flto=auto -ffat-lto-objects -flto=auto -ffat-lto-objects -fstack-protector-strong -Wformat -Werror=format-security -fno-omit-frame-pointer -fPIC -fvisibility=hidden -I/opt/miniforge3/envs/cuvs_dev/include -I/opt/miniforge3/envs/cuvs_dev/include/rapids -I./src -I. -I./ -I/usr/include/postgresql/16/server -I/usr/include/postgresql/internal -Wdate-time -D_FORTIFY_SOURCE=2 -D_GNU_SOURCE  -I/usr/include/libxml2   -c -o src/hnsw_export.o src/hnsw_export.c
+src/hnsw_export.c: In function ‘elems_per_page’:
+src/hnsw_export.c:219:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+  219 |     size_t esize  = elem_tuple_size(dim, bytes_per_dim);
+      |     ^~~~~~
+src/hnsw_export.c: In function ‘float_to_half’:
+src/hnsw_export.c:269:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+  269 |     uint32_t sign = (x >> 16) & 0x8000u;
+      |     ^~~~~~~~
+src/hnsw_export.c:281:9: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+  281 |         uint32_t shift = (uint32_t)(14 - exp);
+      |         ^~~~~~~~
+src/hnsw_export.c:290:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+  290 |     uint32_t half_mant = mant >> 13;
+      |     ^~~~~~~~
+src/hnsw_export.c: In function ‘write_elem_pair’:
+src/hnsw_export.c:580:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+  580 |     char *vdata = (char *)etup + sizeof(PgvHnswElemHdr);
+      |     ^~~~
+src/hnsw_export.c:584:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+  584 |     int16_t vdim   = (int16_t)dim;
+      |     ^~~~~~~
+src/hnsw_export.c:600:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+  600 |     int count = (e->level + 2) * m;
+      |     ^~~
+src/hnsw_export.c:606:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+  606 |     PgvItemPointer *slots = (PgvItemPointer *)((char *)ntup + sizeof(PgvHnswNeighHdr));
+      |     ^~~~~~~~~~~~~~
+src/hnsw_export.c:666:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+  666 |     OffsetNumber eoff = PageAddItem(page, (Item)etup, esize, InvalidOffsetNumber,
+      |     ^~~~~~~~~~~~
+src/hnsw_export.c:680:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+  680 |     OffsetNumber noff = PageAddItem(page, (Item)ntup, nsize, InvalidOffsetNumber,
+      |     ^~~~~~~~~~~~
+src/hnsw_export.c: In function ‘write_elem_pages_packed’:
+src/hnsw_export.c:771:9: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+  771 |         Buffer buf  = ReadBuffer(rel, P_NEW);
+      |         ^~~~~~
+src/hnsw_export.c:773:9: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+  773 |         Page   page = BufferGetPage(buf);
+      |         ^~~~
+src/hnsw_export.c:776:9: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+  776 |         PgvHnswPageOpaque *opaque = (PgvHnswPageOpaque *) PageGetSpecialPointer(page);
+      |         ^~~~~~~~~~~~~~~~~
+src/hnsw_export.c: In function ‘fill_hnsw_from_hnswlib_impl’:
+src/hnsw_export.c:871:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+  871 |     Relation cagra_rel = index_open(cagra_oid, AccessShareLock);
+      |     ^~~~~~~~
+src/hnsw_export.c:890:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+  890 |     bool hnsw_unlogged = false;  /* set below; true = skip WAL on page writes */
+      |     ^~~~
+src/hnsw_export.c:899:9: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+  899 |         Form_pg_class cf = (Form_pg_class) GETSTRUCT(tup);
+      |         ^~~~~~~~~~~~~
+src/hnsw_export.c:972:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+  972 |     char hnsw_path[1024];
+      |     ^~~~
+src/hnsw_export.c:981:9: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+  981 |         int shm_rc = cuvs_ipc_export_hnsw_shm(
+      |         ^~~
+src/hnsw_export.c:1001:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 1001 |     FILE *hf = hnsw_open_stream(hnsw_path, res->shm_fd);
+      |     ^~~~
+src/hnsw_export.c:1008:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 1008 |     HnswlibHeader hdr;
+      |     ^~~~~~~~~~~~~
+src/hnsw_export.c:1030:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 1030 |     size_t N  = hdr.curElementCount;
+      |     ^~~~~~
+src/hnsw_export.c:1045:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 1045 |     FILE *tf = fopen(tids_path, "rb");
+      |     ^~~~
+src/hnsw_export.c:1053:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 1053 |     CuvsTidsHeader tids_hdr;
+      |     ^~~~~~~~~~~~~~
+src/hnsw_export.c:1128:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 1128 |     size_t lv0_block_bytes = N * hdr.sizeDataPerElement;
+      |     ^~~~~~
+src/hnsw_export.c:1145:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 1145 |     ElemDesc *elems = (ElemDesc *) calloc(N, sizeof(ElemDesc));
+      |     ^~~~~~~~
+src/hnsw_export.c:1179:9: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 1179 |         size_t label;
+      |         ^~~~~~
+src/hnsw_export.c:1206:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 1206 |     size_t sizeLinksPerElement = ((size_t)M + 1) * sizeof(int);
+      |     ^~~~~~
+src/hnsw_export.c:1224:9: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 1224 |         int elem_level = (int)(llsize / sizeLinksPerElement);
+      |         ^~~
+src/hnsw_export.c:1235:9: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 1235 |         char *llbuf = (char *) malloc(llsize);
+      |         ^~~~
+src/hnsw_export.c:1257:9: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 1257 |         char *p = llbuf;
+      |         ^~~~
+src/hnsw_export.c:1335:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 1335 |     Relation hnsw_rel = index_open(hnsw_oid, AccessExclusiveLock);
+      |     ^~~~~~~~
+src/hnsw_export.c:1360:9: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 1360 |         Page page = BufferGetPage(buf);
+      |         ^~~~
+src/hnsw_export.c:1363:9: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 1363 |         PgvHnswPageOpaque *opaque =
+      |         ^~~~~~~~~~~~~~~~~
+src/hnsw_export.c:1375:9: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 1375 |         PgvHnswMeta *metap = (PgvHnswMeta *) PageGetContents(page);
+      |         ^~~~~~~~~~~
+src/hnsw_export.c:1384:9: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 1384 |         int ep = hdr.enterpointNode;
+      |         ^~~
+src/hnsw_export.c:1412:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 1412 |     float *vec_buf = (float *) palloc((size_t)dim * sizeof(float));
+      |     ^~~~~
+src/hnsw_export.c: In function ‘fill_hnsw_from_cagra_ipc_impl’:
+src/hnsw_export.c:1609:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 1609 |     Relation cagra_rel = index_open(cagra_oid, AccessShareLock);
+      |     ^~~~~~~~
+src/hnsw_export.c:1620:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 1620 |     bool hnsw_unlogged = false;
+      |     ^~~~
+src/hnsw_export.c:1628:9: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 1628 |         Form_pg_class cf = (Form_pg_class) GETSTRUCT(tup);
+      |         ^~~~~~~~~~~~~
+src/hnsw_export.c:1636:9: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 1636 |         Oid hnsw_amoid      = get_am_oid("hnsw", true);
+      |         ^~~
+src/hnsw_export.c:1708:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 1708 |     uint32_t *adj   = NULL;
+      |     ^~~~~~~~
+src/hnsw_export.c:1748:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 1748 |     int M0 = (graph_degree < 64) ? graph_degree : 64;
+      |     ^~~
+src/hnsw_export.c:1751:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 1751 |     int M = M0 / 2;
+      |     ^~~
+src/hnsw_export.c:1762:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 1762 |     int    max_level  = 0;
+      |     ^~~
+src/hnsw_export.c:1785:9: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 1785 |         const uint32_t *row = adj + i * (size_t)graph_degree;
+      |         ^~~~~
+src/hnsw_export.c:1802:9: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 1802 |         int lv = elems[i].level;
+      |         ^~~
+src/hnsw_export.c:1812:13: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 1812 |             int *cand_buf = (int *)malloc((size_t)graph_degree * sizeof(int));
+      |             ^~~
+src/hnsw_export.c:1856:17: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 1856 |                 int n_sel = heuristic_select_neighbors(
+      |                 ^~~
+src/hnsw_export.c:1895:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 1895 |     int pack_k = do_hierarchy ? 1 : elems_per_page((int)ipc_dim, bytes_per_dim, M, 0);
+      |     ^~~
+src/hnsw_export.c:1913:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 1913 |     Relation hnsw_rel = index_open(hnsw_oid, AccessExclusiveLock);
+      |     ^~~~~~~~
+src/hnsw_export.c:1928:9: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 1928 |         Page page = BufferGetPage(buf);
+      |         ^~~~
+src/hnsw_export.c:1931:9: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 1931 |         PgvHnswPageOpaque *opaque =
+      |         ^~~~~~~~~~~~~~~~~
+src/hnsw_export.c:1937:9: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 1937 |         PgvHnswMeta *metap = (PgvHnswMeta *) PageGetContents(page);
+      |         ^~~~~~~~~~~
+src/hnsw_export.c: In function ‘find_hnsw_opclass_oid’:
+src/hnsw_export.c:2060:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 2060 |     Oid hnsw_amoid = get_am_oid("hnsw", true);
+      |     ^~~
+src/hnsw_export.c:2064:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 2064 |     Relation    opcrel = table_open(OperatorClassRelationId, AccessShareLock);
+      |     ^~~~~~~~
+src/hnsw_export.c: In function ‘cagra_index_metric’:
+src/hnsw_export.c:2092:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 2092 |     bool isnull = false;
+      |     ^~~~
+src/hnsw_export.c:2098:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 2098 |     HeapTuple opctup = SearchSysCache1(CLAOID, ObjectIdGetDatum(cagra_opc));
+      |     ^~~~~~~~~
+src/hnsw_export.c:2100:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 2100 |     const char *nm = NameStr(((Form_pg_opclass) GETSTRUCT(opctup))->opcname);
+      |     ^~~~~
+src/hnsw_export.c: In function ‘create_empty_hnsw’:
+src/hnsw_export.c:2115:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 2115 |     Oid heap_oid = ((Form_pg_index) GETSTRUCT(ix_tup))->indrelid;
+      |     ^~~
+src/hnsw_export.c:2122:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 2122 |     uint32_t metric       = cagra_index_metric(cagra_oid);
+      |     ^~~~~~~~
+src/hnsw_export.c:2141:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 2141 |     static int hnsw_build_seq = 0;
+      |     ^~~~~~
+src/hnsw_export.c:2151:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 2151 |     Oid hnsw_oid = index_create(
+      |     ^~~
+src/hnsw_export.c: In function ‘pg_cuvs_build_hnsw’:
+src/hnsw_export.c:2217:9: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 2217 |         int precheck_dim = (int) TupleDescAttr(RelationGetDescr(cagra_rel_pc), 0)->atttypmod;
+      |         ^~~
+src/hnsw_export.c:2220:9: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 2220 |         int m0 = (graph_degree < 64) ? graph_degree : 64;
+      |         ^~~
+src/hnsw_export.c:2228:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 2228 |     Oid hnsw_oid = create_empty_hnsw(cagra_oid);
+      |     ^~~
+src/hnsw_export.c: In function ‘cuvs_hnsw_ambuild’:
+src/hnsw_export.c:2354:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 2354 |     Oid self_oid = RelationGetRelid(indexRel);
+      |     ^~~
+src/hnsw_export.c:2427:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 2427 |     Oid cagra_oid = DatumGetObjectId(
+      |     ^~~
+src/hnsw_export.c:2436:9: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 2436 |         Oid src_heap = ((Form_pg_index) GETSTRUCT(ixtup))->indrelid;
+      |         ^~~
+src/hnsw_export.c:2443:9: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 2443 |         Oid cagra_am = get_am_oid("cagra", true);
+      |         ^~~
+src/hnsw_export.c:2461:13: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 2461 |             int m0 = (graph_degree < 64) ? graph_degree : 64;
+      |             ^~~
+src/hnsw_export.c:2472:9: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 2472 |         uint32_t src_metric = cagra_index_metric(cagra_oid);
+      |         ^~~~~~~~
+src/hnsw_export.c:2494:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 2494 |     size_t n_elems_written;
+      |     ^~~~~~
+src/hnsw_export.c: In function ‘pg_cuvs_hnsw_handler’:
+src/hnsw_export.c:2528:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 2528 |     Oid amhandler = ((Form_pg_am) GETSTRUCT(amtup))->amhandler;
+      |     ^~~
+src/hnsw_export.c:2533:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 2533 |     IndexAmRoutine *amroutine = (IndexAmRoutine *)
+      |     ^~~~~~~~~~~~~~
+gcc -Wall -Wmissing-prototypes -Wpointer-arith -Wdeclaration-after-statement -Werror=vla -Wendif-labels -Wmissing-format-attribute -Wimplicit-fallthrough=3 -Wcast-function-type -Wshadow=compatible-local -Wformat-security -fno-strict-aliasing -fwrapv -fexcess-precision=standard -Wno-format-truncation -Wno-stringop-truncation -g -g -O2 -flto=auto -ffat-lto-objects -flto=auto -ffat-lto-objects -fstack-protector-strong -Wformat -Werror=format-security -fno-omit-frame-pointer -fPIC -fvisibility=hidden -I/opt/miniforge3/envs/cuvs_dev/include -I/opt/miniforge3/envs/cuvs_dev/include/rapids -I./src -I. -I./ -I/usr/include/postgresql/16/server -I/usr/include/postgresql/internal -Wdate-time -D_FORTIFY_SOURCE=2 -D_GNU_SOURCE  -I/usr/include/libxml2   -c -o src/cuvs_build_corpus.o src/cuvs_build_corpus.c
+src/cuvs_build_corpus.c:5: warning: "_GNU_SOURCE" redefined
+    5 | #define _GNU_SOURCE   /* memfd_create, MFD_CLOEXEC */
+      | 
+<command-line>: note: this is the location of the previous definition
+src/cuvs_build_corpus.c: In function ‘open_memfd’:
+src/cuvs_build_corpus.c:97:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+   97 |     void *mem = mmap(NULL, bytes, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+      |     ^~~~
+gcc -Wall -Wmissing-prototypes -Wpointer-arith -Wdeclaration-after-statement -Werror=vla -Wendif-labels -Wmissing-format-attribute -Wimplicit-fallthrough=3 -Wcast-function-type -Wshadow=compatible-local -Wformat-security -fno-strict-aliasing -fwrapv -fexcess-precision=standard -Wno-format-truncation -Wno-stringop-truncation -g -g -O2 -flto=auto -ffat-lto-objects -flto=auto -ffat-lto-objects -fstack-protector-strong -Wformat -Werror=format-security -fno-omit-frame-pointer -fPIC -fvisibility=hidden -I/opt/miniforge3/envs/cuvs_dev/include -I/opt/miniforge3/envs/cuvs_dev/include/rapids -I./src -I. -I./ -I/usr/include/postgresql/16/server -I/usr/include/postgresql/internal -Wdate-time -D_FORTIFY_SOURCE=2 -D_GNU_SOURCE  -I/usr/include/libxml2   -c -o src/pg_cuvs_compaction.o src/pg_cuvs_compaction.c
+/usr/bin/clang-15 -Wno-ignored-attributes -fno-strict-aliasing -fwrapv -Xclang -no-opaque-pointers -Wno-unused-command-line-argument -Wno-compound-token-split-by-macro -O2  -I/opt/miniforge3/envs/cuvs_dev/include -I/opt/miniforge3/envs/cuvs_dev/include/rapids -I./src -I. -I./ -I/usr/include/postgresql/16/server -I/usr/include/postgresql/internal -Wdate-time -D_FORTIFY_SOURCE=2 -D_GNU_SOURCE  -I/usr/include/libxml2  -flto=thin -emit-llvm -c -o src/pg_cuvs.bc src/pg_cuvs.c
+src/pg_cuvs.c:3389:38: warning: '/*' within block comment [-Wcomment]
+ * caller-supplied tids_out/dists_out/*n_results arrays (no CuvsScanState). */
+                                     ^
+1 warning generated.
+/usr/bin/clang-15 -Wno-ignored-attributes -fno-strict-aliasing -fwrapv -Xclang -no-opaque-pointers -Wno-unused-command-line-argument -Wno-compound-token-split-by-macro -O2  -I/opt/miniforge3/envs/cuvs_dev/include -I/opt/miniforge3/envs/cuvs_dev/include/rapids -I./src -I. -I./ -I/usr/include/postgresql/16/server -I/usr/include/postgresql/internal -Wdate-time -D_FORTIFY_SOURCE=2 -D_GNU_SOURCE  -I/usr/include/libxml2  -flto=thin -emit-llvm -c -o src/cuvs_ipc.bc src/cuvs_ipc.c
+/usr/bin/clang-15 -Wno-ignored-attributes -fno-strict-aliasing -fwrapv -Xclang -no-opaque-pointers -Wno-unused-command-line-argument -Wno-compound-token-split-by-macro -O2  -I/opt/miniforge3/envs/cuvs_dev/include -I/opt/miniforge3/envs/cuvs_dev/include/rapids -I./src -I. -I./ -I/usr/include/postgresql/16/server -I/usr/include/postgresql/internal -Wdate-time -D_FORTIFY_SOURCE=2 -D_GNU_SOURCE  -I/usr/include/libxml2  -flto=thin -emit-llvm -c -o src/cuvs_util.bc src/cuvs_util.c
+/usr/bin/clang-15 -Wno-ignored-attributes -fno-strict-aliasing -fwrapv -Xclang -no-opaque-pointers -Wno-unused-command-line-argument -Wno-compound-token-split-by-macro -O2  -I/opt/miniforge3/envs/cuvs_dev/include -I/opt/miniforge3/envs/cuvs_dev/include/rapids -I./src -I. -I./ -I/usr/include/postgresql/16/server -I/usr/include/postgresql/internal -Wdate-time -D_FORTIFY_SOURCE=2 -D_GNU_SOURCE  -I/usr/include/libxml2  -flto=thin -emit-llvm -c -o src/hnsw_export.bc src/hnsw_export.c
+/usr/bin/clang-15 -Wno-ignored-attributes -fno-strict-aliasing -fwrapv -Xclang -no-opaque-pointers -Wno-unused-command-line-argument -Wno-compound-token-split-by-macro -O2  -I/opt/miniforge3/envs/cuvs_dev/include -I/opt/miniforge3/envs/cuvs_dev/include/rapids -I./src -I. -I./ -I/usr/include/postgresql/16/server -I/usr/include/postgresql/internal -Wdate-time -D_FORTIFY_SOURCE=2 -D_GNU_SOURCE  -I/usr/include/libxml2  -flto=thin -emit-llvm -c -o src/cuvs_build_corpus.bc src/cuvs_build_corpus.c
+src/cuvs_build_corpus.c:5:9: warning: '_GNU_SOURCE' macro redefined [-Wmacro-redefined]
+#define _GNU_SOURCE   /* memfd_create, MFD_CLOEXEC */
+        ^
+<command line>:2:9: note: previous definition is here
+#define _GNU_SOURCE 1
+        ^
+1 warning generated.
+/usr/bin/clang-15 -Wno-ignored-attributes -fno-strict-aliasing -fwrapv -Xclang -no-opaque-pointers -Wno-unused-command-line-argument -Wno-compound-token-split-by-macro -O2  -I/opt/miniforge3/envs/cuvs_dev/include -I/opt/miniforge3/envs/cuvs_dev/include/rapids -I./src -I. -I./ -I/usr/include/postgresql/16/server -I/usr/include/postgresql/internal -Wdate-time -D_FORTIFY_SOURCE=2 -D_GNU_SOURCE  -I/usr/include/libxml2  -flto=thin -emit-llvm -c -o src/pg_cuvs_compaction.bc src/pg_cuvs_compaction.c
+/opt/miniforge3/envs/cuvs_dev/include/raft/core/device_resources.hpp: In constructor ‘raft::device_resources::device_resources(const raft::device_resources&, std::shared_ptr<rmm::mr::device_memory_resource>, std::optional<long unsigned int>)’:
+/opt/miniforge3/envs/cuvs_dev/include/raft/core/device_resources.hpp:60:33: warning: ‘void raft::resource::set_workspace_resource(const raft::resources&, std::shared_ptr<rmm::mr::device_memory_resource>, std::optional<long unsigned int>, std::optional<long unsigned int>)’ is deprecated: use the overload taking raft::mr::device_resource instead [-Wdeprecated-declarations]
+   60 |     resource::set_workspace_resource(*this, workspace_resource, allocation_limit);
+      |     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+/opt/miniforge3/envs/cuvs_dev/include/raft/core/resource/device_memory_resource.hpp:388:1: note: declared here
+  388 | inline void set_workspace_resource(resources const& res,
+      | ^~~~~~~~~~~~~~~~~~~~~~
+/opt/miniforge3/envs/cuvs_dev/include/raft/core/device_resources.hpp: In constructor ‘raft::device_resources::device_resources(rmm::cuda_stream_view, std::shared_ptr<rmm::cuda_stream_pool>, std::shared_ptr<rmm::mr::device_memory_resource>, std::optional<long unsigned int>)’:
+/opt/miniforge3/envs/cuvs_dev/include/raft/core/device_resources.hpp:90:33: warning: ‘void raft::resource::set_workspace_resource(const raft::resources&, std::shared_ptr<rmm::mr::device_memory_resource>, std::optional<long unsigned int>, std::optional<long unsigned int>)’ is deprecated: use the overload taking raft::mr::device_resource instead [-Wdeprecated-declarations]
+   90 |       resource::set_workspace_resource(*this, workspace_resource, allocation_limit);
+      |       ~~~~~~~~~~~~~~~~~~~~~~~~~~^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+/opt/miniforge3/envs/cuvs_dev/include/raft/core/resource/device_memory_resource.hpp:388:1: note: declared here
+  388 | inline void set_workspace_resource(resources const& res,
+      | ^~~~~~~~~~~~~~~~~~~~~~
+/opt/miniforge3/envs/cuvs_dev/include/raft/sparse/convert/detail/csr.cuh: In function ‘void raft::sparse::convert::detail::coo_to_csr(const raft::resources&, const int*, const int*, const value_t*, int, int, int*, int*, value_t*)’:
+/opt/miniforge3/envs/cuvs_dev/include/raft/sparse/convert/detail/csr.cuh:58:71: warning: ‘cusparseStatus_t cusparseCreateIdentityPermutation(cusparseHandle_t, int, int*)’ is deprecated: The routine will be removed in the next major release [-Wdeprecated-declarations]
+   58 |   RAFT_CUSPARSE_TRY(cusparseCreateIdentityPermutation(cusparseHandle, nnz, P.data()));
+      |                                      ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^~~~~~~~~~~~~~~~               
+/opt/miniforge3/envs/cuvs_dev/bin/../targets/x86_64-linux/include/cusparse.h:4070:1: note: declared here
+ 4070 | cusparseCreateIdentityPermutation(cusparseHandle_t handle,
+      | ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+src/cuvs_wrapper.cu: In function ‘int cuvs_brute_force_search(const float*, const float*, int64_t, int, int, uint32_t, CuvsSearchResult*, int)’:
+src/cuvs_wrapper.cu:607:49: warning: ‘cuvs::neighbors::brute_force::index<float> cuvs::neighbors::brute_force::build(const raft::resources&, raft::device_matrix_view<const float, long int>, cuvs::distance::DistanceType, float)’ is deprecated [-Wdeprecated-declarations]
+  607 |         auto index = cuvs::neighbors::brute_force::build(
+      |              ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^~~~~~~~~                                                                  
+/opt/miniforge3/envs/cuvs_dev/include/cuvs/neighbors/brute_force.hpp:210:21: note: declared here
+  210 | [[deprecated]] auto build(
+      |                     ^~~~~
+src/cuvs_wrapper.cu:612:37: warning: ‘void cuvs::neighbors::brute_force::search(const raft::resources&, const cuvs::neighbors::brute_force::index<float>&, raft::device_matrix_view<const float, long int>, raft::device_matrix_view<long int, long int, cuda::std::__4::layout_right>, raft::device_matrix_view<float, long int>, const cuvs::neighbors::filtering::base_filter&)’ is deprecated [-Wdeprecated-declarations]
+  612 |         cuvs::neighbors::brute_force::search(
+      |         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~^~~~~~~~~                                                                                    
+/opt/miniforge3/envs/cuvs_dev/include/cuvs/neighbors/brute_force.hpp:376:21: note: declared here
+  376 | [[deprecated]] void search(raft::resources const& handle,
+      |                     ^~~~~~
+src/cuvs_wrapper.cu: In function ‘void* cuvs_bf_build(const float*, int64_t, int, uint32_t, uint32_t, int)’:
+src/cuvs_wrapper.cu:668:47: warning: ‘cuvs::neighbors::brute_force::index<__half, float> cuvs::neighbors::brute_force::build(const raft::resources&, raft::device_matrix_view<const __half, long int>, cuvs::distance::DistanceType, float)’ is deprecated [-Wdeprecated-declarations]
+  668 |             auto idx = cuvs::neighbors::brute_force::build(
+      |             ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^~~~~~~~~~~~~                                                                     
+/opt/miniforge3/envs/cuvs_dev/include/cuvs/neighbors/brute_force.hpp:251:21: note: declared here
+  251 | [[deprecated]] auto build(
+      |                     ^~~~~
+src/cuvs_wrapper.cu:679:47: warning: ‘cuvs::neighbors::brute_force::index<float> cuvs::neighbors::brute_force::build(const raft::resources&, raft::device_matrix_view<const float, long int>, cuvs::distance::DistanceType, float)’ is deprecated [-Wdeprecated-declarations]
+  679 |             auto idx = cuvs::neighbors::brute_force::build(
+      |             ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^~~~~~~~~~~~~                                                                     
+/opt/miniforge3/envs/cuvs_dev/include/cuvs/neighbors/brute_force.hpp:210:21: note: declared here
+  210 | [[deprecated]] auto build(
+      |                     ^~~~~
+src/cuvs_wrapper.cu: In function ‘int cuvs_bf_search(CuvsBfIndex, const float*, int, int, CuvsSearchResult*, int)’:
+src/cuvs_wrapper.cu:740:37: warning: ‘void cuvs::neighbors::brute_force::search(const raft::resources&, const cuvs::neighbors::brute_force::index<__half, float>&, raft::device_matrix_view<const __half, long int>, raft::device_matrix_view<long int, long int, cuda::std::__4::layout_right>, raft::device_matrix_view<float, long int>, const cuvs::neighbors::filtering::base_filter&)’ is deprecated [-Wdeprecated-declarations]
+  740 |             cuvs::neighbors::brute_force::search(
+      |             ~~~~~~~~~~~~~~~~~~~~~~~~^~~~~~~~~~~~~                                                                                           
+/opt/miniforge3/envs/cuvs_dev/include/cuvs/neighbors/brute_force.hpp:444:21: note: declared here
+  444 | [[deprecated]] void search(raft::resources const& handle,
+      |                     ^~~~~~
+src/cuvs_wrapper.cu:748:37: warning: ‘void cuvs::neighbors::brute_force::search(const raft::resources&, const cuvs::neighbors::brute_force::index<float>&, raft::device_matrix_view<const float, long int>, raft::device_matrix_view<long int, long int, cuda::std::__4::layout_right>, raft::device_matrix_view<float, long int>, const cuvs::neighbors::filtering::base_filter&)’ is deprecated [-Wdeprecated-declarations]
+  748 |             cuvs::neighbors::brute_force::search(
+      |             ~~~~~~~~~~~~~~~~~~~~~~~~^~~~~~~~~~~~~                                                                                           
+/opt/miniforge3/envs/cuvs_dev/include/cuvs/neighbors/brute_force.hpp:376:21: note: declared here
+  376 | [[deprecated]] void search(raft::resources const& handle,
+      |                     ^~~~~~
+src/cuvs_wrapper.cu: In function ‘int cuvs_bf_search_batch(CuvsBfIndex, const float*, int, int, int, CuvsSearchResult*, int)’:
+src/cuvs_wrapper.cu:1382:37: warning: ‘void cuvs::neighbors::brute_force::search(const raft::resources&, const cuvs::neighbors::brute_force::index<__half, float>&, raft::device_matrix_view<const __half, long int>, raft::device_matrix_view<long int, long int, cuda::std::__4::layout_right>, raft::device_matrix_view<float, long int>, const cuvs::neighbors::filtering::base_filter&)’ is deprecated [-Wdeprecated-declarations]
+ 1382 |             cuvs::neighbors::brute_force::search(
+      |             ~~~~~~~~~~~~~~~~~~~~~~~~^~~~~~~~~~~~~                                                                                     
+/opt/miniforge3/envs/cuvs_dev/include/cuvs/neighbors/brute_force.hpp:444:21: note: declared here
+  444 | [[deprecated]] void search(raft::resources const& handle,
+      |                     ^~~~~~
+src/cuvs_wrapper.cu:1390:37: warning: ‘void cuvs::neighbors::brute_force::search(const raft::resources&, const cuvs::neighbors::brute_force::index<float>&, raft::device_matrix_view<const float, long int>, raft::device_matrix_view<long int, long int, cuda::std::__4::layout_right>, raft::device_matrix_view<float, long int>, const cuvs::neighbors::filtering::base_filter&)’ is deprecated [-Wdeprecated-declarations]
+ 1390 |             cuvs::neighbors::brute_force::search(
+      |             ~~~~~~~~~~~~~~~~~~~~~~~~^~~~~~~~~~~~~                                                                                     
+/opt/miniforge3/envs/cuvs_dev/include/cuvs/neighbors/brute_force.hpp:376:21: note: declared here
+  376 | [[deprecated]] void search(raft::resources const& handle,
+      |                     ^~~~~~
+src/cuvs_wrapper.cu: In function ‘int cuvs_hnsw_serialize(CuvsCagraIndex, const char*, int)’:
+src/cuvs_wrapper.cu:1814:17: warning: format ‘%zu’ expects argument of type ‘size_t’, but argument 3 has type ‘unsigned int’ [-Wformat=]
+ 1814 |         fprintf(stderr, "[cuvs_hnsw_serialize] skip: n_vecs=%zu < %d (too small for hnswlib)\n",
+      |                 ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~  ~~~~~~~            
+      |                                                                                                           |
+      |                                                                                                           unsigned int
+gcc -Wall -Wmissing-prototypes -Wpointer-arith -Wdeclaration-after-statement -Werror=vla -Wendif-labels -Wmissing-format-attribute -Wimplicit-fallthrough=3 -Wcast-function-type -Wshadow=compatible-local -Wformat-security -fno-strict-aliasing -fwrapv -fexcess-precision=standard -Wno-format-truncation -Wno-stringop-truncation -g -g -O2 -flto=auto -ffat-lto-objects -flto=auto -ffat-lto-objects -fstack-protector-strong -Wformat -Werror=format-security -fno-omit-frame-pointer -fPIC -fvisibility=hidden -shared -o pg_cuvs.so src/pg_cuvs.o src/cuvs_ipc.o src/cuvs_util.o src/cuvs_wrapper.o src/hnsw_export.o src/cuvs_build_corpus.o src/pg_cuvs_compaction.o -L/usr/lib/x86_64-linux-gnu  -Wl,-Bsymbolic-functions -flto=auto -ffat-lto-objects -flto=auto -Wl,-z,relro -Wl,-z,now  -Wl,--as-needed -fvisibility=hidden -L/opt/miniforge3/envs/cuvs_dev/lib -lcuvs -lcudart -Wl,-rpath,/opt/miniforge3/envs/cuvs_dev/lib -Wl,-Bstatic -lstdc++ -Wl,-Bdynamic -lrt 
+gcc -O2 -g -Wall -Wextra -I./src -I/opt/miniforge3/envs/cuvs_dev/include -I/opt/miniforge3/envs/cuvs_dev/include/rapids -std=gnu11 -D_POSIX_C_SOURCE=200809L  -c src/pg_cuvs_server.c -o src/pg_cuvs_server.o
+gcc -O2 -g -Wall -Wextra -I./src -I/opt/miniforge3/envs/cuvs_dev/include -I/opt/miniforge3/envs/cuvs_dev/include/rapids -std=gnu11 -D_POSIX_C_SOURCE=200809L  -c src/cuvs_ipc.c -o src/cuvs_ipc_server.o
+src/pg_cuvs_server.c: In function ‘refresh_delta_cache’:
+src/pg_cuvs_server.c:929:21: warning: unused variable ‘base_crc’ [-Wunused-variable]
+  929 |     uint32_t        base_crc;
+      |                     ^~~~~~~~
+In file included from /usr/include/string.h:535,
+                 from src/cuvs_ipc.c:32:
+In function ‘strncpy’,
+    inlined from ‘cuvs_ipc_search’ at src/cuvs_ipc.c:549:5:
+/usr/include/x86_64-linux-gnu/bits/string_fortified.h:95:10: warning: ‘__builtin_strncpy’ output may be truncated copying 63 bytes from a string of length 63 [-Wstringop-truncation]
+   95 |   return __builtin___strncpy_chk (__dest, __src, __len,
+      |          ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+   96 |                                   __glibc_objsize (__dest));
+      |                                   ~~~~~~~~~~~~~~~~~~~~~~~~~
+At top level:
+src/pg_cuvs_server.c:705:1: warning: ‘is_gpu_allowed’ defined but not used [-Wunused-function]
+  705 | is_gpu_allowed(int device_id)
+      | ^~~~~~~~~~~~~~
+In function ‘strncpy’,
+    inlined from ‘cuvs_ipc_search_batch’ at src/cuvs_ipc.c:681:5:
+/usr/include/x86_64-linux-gnu/bits/string_fortified.h:95:10: warning: ‘__builtin_strncpy’ output may be truncated copying 63 bytes from a string of length 63 [-Wstringop-truncation]
+   95 |   return __builtin___strncpy_chk (__dest, __src, __len,
+      |          ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+   96 |                                   __glibc_objsize (__dest));
+      |                                   ~~~~~~~~~~~~~~~~~~~~~~~~~
+In function ‘strncpy’,
+    inlined from ‘cuvs_ipc_build’ at src/cuvs_ipc.c:1028:9:
+/usr/include/x86_64-linux-gnu/bits/string_fortified.h:95:10: warning: ‘__builtin_strncpy’ output may be truncated copying 63 bytes from a string of length 63 [-Wstringop-truncation]
+   95 |   return __builtin___strncpy_chk (__dest, __src, __len,
+      |          ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+   96 |                                   __glibc_objsize (__dest));
+      |                                   ~~~~~~~~~~~~~~~~~~~~~~~~~
+In function ‘strncpy’,
+    inlined from ‘cuvs_ipc_build’ at src/cuvs_ipc.c:1066:5:
+/usr/include/x86_64-linux-gnu/bits/string_fortified.h:95:10: warning: ‘__builtin_strncpy’ output may be truncated copying 63 bytes from a string of length 63 [-Wstringop-truncation]
+   95 |   return __builtin___strncpy_chk (__dest, __src, __len,
+      |          ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+   96 |                                   __glibc_objsize (__dest));
+      |                                   ~~~~~~~~~~~~~~~~~~~~~~~~~
+In function ‘strncpy’,
+    inlined from ‘cuvs_ipc_build_flat’ at src/cuvs_ipc.c:1136:9:
+/usr/include/x86_64-linux-gnu/bits/string_fortified.h:95:10: warning: ‘__builtin_strncpy’ output may be truncated copying 63 bytes from a string of length 63 [-Wstringop-truncation]
+   95 |   return __builtin___strncpy_chk (__dest, __src, __len,
+      |          ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+   96 |                                   __glibc_objsize (__dest));
+      |                                   ~~~~~~~~~~~~~~~~~~~~~~~~~
+In function ‘strncpy’,
+    inlined from ‘cuvs_ipc_build_flat’ at src/cuvs_ipc.c:1170:5:
+/usr/include/x86_64-linux-gnu/bits/string_fortified.h:95:10: warning: ‘__builtin_strncpy’ output may be truncated copying 63 bytes from a string of length 63 [-Wstringop-truncation]
+   95 |   return __builtin___strncpy_chk (__dest, __src, __len,
+      |          ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+   96 |                                   __glibc_objsize (__dest));
+      |                                   ~~~~~~~~~~~~~~~~~~~~~~~~~
+In function ‘strncpy’,
+    inlined from ‘cuvs_ipc_search_filtered’ at src/cuvs_ipc.c:1587:5:
+/usr/include/x86_64-linux-gnu/bits/string_fortified.h:95:10: warning: ‘__builtin_strncpy’ output may be truncated copying 63 bytes from a string of length 63 [-Wstringop-truncation]
+   95 |   return __builtin___strncpy_chk (__dest, __src, __len,
+      |          ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+   96 |                                   __glibc_objsize (__dest));
+      |                                   ~~~~~~~~~~~~~~~~~~~~~~~~~
+/usr/include/x86_64-linux-gnu/bits/string_fortified.h:95:10: warning: ‘__builtin_strncpy’ output may be truncated copying 63 bytes from a string of length 63 [-Wstringop-truncation]
+In function ‘strncpy’,
+    inlined from ‘cuvs_ipc_search_filtered’ at src/cuvs_ipc.c:1589:9:
+/usr/include/x86_64-linux-gnu/bits/string_fortified.h:95:10: warning: ‘__builtin_strncpy’ output may be truncated copying 63 bytes from a string of length 63 [-Wstringop-truncation]
+   95 |   return __builtin___strncpy_chk (__dest, __src, __len,
+      |          ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+   96 |                                   __glibc_objsize (__dest));
+      |                                   ~~~~~~~~~~~~~~~~~~~~~~~~~
+In function ‘strncpy’,
+    inlined from ‘cuvs_ipc_search_stream_bf’ at src/cuvs_ipc.c:1736:5:
+/usr/include/x86_64-linux-gnu/bits/string_fortified.h:95:10: warning: ‘__builtin_strncpy’ output may be truncated copying 63 bytes from a string of length 63 [-Wstringop-truncation]
+   95 |   return __builtin___strncpy_chk (__dest, __src, __len,
+      |          ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+   96 |                                   __glibc_objsize (__dest));
+      |                                   ~~~~~~~~~~~~~~~~~~~~~~~~~
+In function ‘strncpy’,
+    inlined from ‘cuvs_ipc_search_stream_bf’ at src/cuvs_ipc.c:1737:5:
+/usr/include/x86_64-linux-gnu/bits/string_fortified.h:95:10: warning: ‘__builtin_strncpy’ output may be truncated copying 63 bytes from a string of length 63 [-Wstringop-truncation]
+   95 |   return __builtin___strncpy_chk (__dest, __src, __len,
+      |          ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+   96 |                                   __glibc_objsize (__dest));
+      |                                   ~~~~~~~~~~~~~~~~~~~~~~~~~
+In function ‘strncpy’,
+    inlined from ‘cuvs_ipc_search_bf_transient’ at src/cuvs_ipc.c:1883:5:
+/usr/include/x86_64-linux-gnu/bits/string_fortified.h:95:10: warning: ‘__builtin_strncpy’ output may be truncated copying 63 bytes from a string of length 63 [-Wstringop-truncation]
+   95 |   return __builtin___strncpy_chk (__dest, __src, __len,
+      |          ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+   96 |                                   __glibc_objsize (__dest));
+      |                                   ~~~~~~~~~~~~~~~~~~~~~~~~~
+In function ‘strncpy’,
+    inlined from ‘cuvs_ipc_search_bf_transient’ at src/cuvs_ipc.c:1885:9:
+/usr/include/x86_64-linux-gnu/bits/string_fortified.h:95:10: warning: ‘__builtin_strncpy’ output may be truncated copying 63 bytes from a string of length 63 [-Wstringop-truncation]
+   95 |   return __builtin___strncpy_chk (__dest, __src, __len,
+      |          ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+   96 |                                   __glibc_objsize (__dest));
+      |                                   ~~~~~~~~~~~~~~~~~~~~~~~~~
+In function ‘strncpy’,
+    inlined from ‘cuvs_ipc_build_ivfpq’ at src/cuvs_ipc.c:2008:5:
+/usr/include/x86_64-linux-gnu/bits/string_fortified.h:95:10: warning: ‘__builtin_strncpy’ output may be truncated copying 63 bytes from a string of length 63 [-Wstringop-truncation]
+   95 |   return __builtin___strncpy_chk (__dest, __src, __len,
+      |          ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+   96 |                                   __glibc_objsize (__dest));
+      |                                   ~~~~~~~~~~~~~~~~~~~~~~~~~
+In function ‘strncpy’,
+    inlined from ‘cuvs_ipc_search_ivfpq’ at src/cuvs_ipc.c:2082:5:
+/usr/include/x86_64-linux-gnu/bits/string_fortified.h:95:10: warning: ‘__builtin_strncpy’ output may be truncated copying 63 bytes from a string of length 63 [-Wstringop-truncation]
+   95 |   return __builtin___strncpy_chk (__dest, __src, __len,
+      |          ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+   96 |                                   __glibc_objsize (__dest));
+      |                                   ~~~~~~~~~~~~~~~~~~~~~~~~~
+In function ‘strncpy’,
+    inlined from ‘cuvs_ipc_extend’ at src/cuvs_ipc.c:2183:5:
+/usr/include/x86_64-linux-gnu/bits/string_fortified.h:95:10: warning: ‘__builtin_strncpy’ output may be truncated copying 63 bytes from a string of length 63 [-Wstringop-truncation]
+   95 |   return __builtin___strncpy_chk (__dest, __src, __len,
+      |          ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+   96 |                                   __glibc_objsize (__dest));
+      |                                   ~~~~~~~~~~~~~~~~~~~~~~~~~
+gcc -O2 -g -Wall -Wextra -I./src -I/opt/miniforge3/envs/cuvs_dev/include -I/opt/miniforge3/envs/cuvs_dev/include/rapids -std=gnu11 -D_POSIX_C_SOURCE=200809L  -c src/cuvs_util.c -o src/cuvs_util_server.o
+In file included from /usr/include/string.h:535,
+                 from src/pg_cuvs_server.c:38:
+In function ‘strncpy’,
+    inlined from ‘handle_stats’ at src/pg_cuvs_server.c:6045:9:
+/usr/include/x86_64-linux-gnu/bits/string_fortified.h:95:10: warning: ‘__builtin_strncpy’ output may be truncated copying 127 bytes from a string of length 127 [-Wstringop-truncation]
+   95 |   return __builtin___strncpy_chk (__dest, __src, __len,
+      |          ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+   96 |                                   __glibc_objsize (__dest));
+      |                                   ~~~~~~~~~~~~~~~~~~~~~~~~~
+gcc -O2 -g -Wall -Wextra -I./src -I/opt/miniforge3/envs/cuvs_dev/include -I/opt/miniforge3/envs/cuvs_dev/include/rapids -std=gnu11 -D_POSIX_C_SOURCE=200809L  -c src/cuvs_objstore.c -o src/cuvs_objstore_server.o
+src/pg_cuvs_server.c: In function ‘handle_search_bf_transient’:
+src/pg_cuvs_server.c:2670:18: warning: ‘ MB exceeds free GPU VRAM; r...’ directive output may be truncated writing 103 bytes into a region of size between 94 and 107 [-Wformat-truncation=]
+ 2670 |                  "transient BF corpus %zu MB exceeds free GPU VRAM; reduce the WHERE "
+      |                  ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+src/pg_cuvs_server.c:2670:42: note: format string is defined here
+ 2670 |                  "transient BF corpus %zu MB exceeds free GPU VRAM; reduce the WHERE "
+      |                                          ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+ 2671 |                  "selectivity, build a flat index, or use a cagra/ivfpq index",
+      |                  ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+In file included from /usr/include/stdio.h:894,
+                 from src/cuvs_util.h:13,
+                 from src/pg_cuvs_server.c:30:
+/usr/include/x86_64-linux-gnu/bits/stdio2.h:71:10: note: ‘__builtin___snprintf_chk’ output between 125 and 138 bytes into a destination of size 128
+   71 |   return __builtin___snprintf_chk (__s, __n, __USE_FORTIFY_LEVEL - 1,
+      |          ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+   72 |                                    __glibc_objsize (__s), __fmt,
+      |                                    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+   73 |                                    __va_arg_pack ());
+      |                                    ~~~~~~~~~~~~~~~~~
+In file included from /usr/include/string.h:535,
+                 from src/pg_cuvs_server.c:38:
+In function ‘strncpy’,
+    inlined from ‘finish_build_commit’ at src/pg_cuvs_server.c:5620:13:
+/usr/include/x86_64-linux-gnu/bits/string_fortified.h:95:10: warning: ‘__builtin_strncpy’ output may be truncated copying 511 bytes from a string of length 511 [-Wstringop-truncation]
+   95 |   return __builtin___strncpy_chk (__dest, __src, __len,
+      |          ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+   96 |                                   __glibc_objsize (__dest));
+      |                                   ~~~~~~~~~~~~~~~~~~~~~~~~~
+In function ‘strncpy’,
+    inlined from ‘finish_build_commit’ at src/pg_cuvs_server.c:5621:13:
+/usr/include/x86_64-linux-gnu/bits/string_fortified.h:95:10: warning: ‘__builtin_strncpy’ output may be truncated copying 127 bytes from a string of length 127 [-Wstringop-truncation]
+   95 |   return __builtin___strncpy_chk (__dest, __src, __len,
+      |          ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+   96 |                                   __glibc_objsize (__dest));
+      |                                   ~~~~~~~~~~~~~~~~~~~~~~~~~
+In function ‘strncpy’,
+    inlined from ‘finish_build_commit’ at src/pg_cuvs_server.c:5622:13:
+/usr/include/x86_64-linux-gnu/bits/string_fortified.h:95:10: warning: ‘__builtin_strncpy’ output may be truncated copying 511 bytes from a string of length 511 [-Wstringop-truncation]
+   95 |   return __builtin___strncpy_chk (__dest, __src, __len,
+      |          ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+   96 |                                   __glibc_objsize (__dest));
+      |                                   ~~~~~~~~~~~~~~~~~~~~~~~~~
+In function ‘strncpy’,
+    inlined from ‘finish_build_commit’ at src/pg_cuvs_server.c:5623:13:
+/usr/include/x86_64-linux-gnu/bits/string_fortified.h:95:10: warning: ‘__builtin_strncpy’ output may be truncated copying 511 bytes from a string of length 511 [-Wstringop-truncation]
+   95 |   return __builtin___strncpy_chk (__dest, __src, __len,
+      |          ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+   96 |                                   __glibc_objsize (__dest));
+      |                                   ~~~~~~~~~~~~~~~~~~~~~~~~~
+In function ‘strncpy’,
+    inlined from ‘finish_build_commit’ at src/pg_cuvs_server.c:5624:13:
+/usr/include/x86_64-linux-gnu/bits/string_fortified.h:95:10: warning: ‘__builtin_strncpy’ output may be truncated copying 511 bytes from a string of length 511 [-Wstringop-truncation]
+   95 |   return __builtin___strncpy_chk (__dest, __src, __len,
+      |          ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+   96 |                                   __glibc_objsize (__dest));
+      |                                   ~~~~~~~~~~~~~~~~~~~~~~~~~
+In function ‘strncpy’,
+    inlined from ‘build_sharded’ at src/pg_cuvs_server.c:4985:13:
+/usr/include/x86_64-linux-gnu/bits/string_fortified.h:95:10: warning: ‘__builtin_strncpy’ output may be truncated copying 511 bytes from a string of length 511 [-Wstringop-truncation]
+   95 |   return __builtin___strncpy_chk (__dest, __src, __len,
+      |          ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+   96 |                                   __glibc_objsize (__dest));
+      |                                   ~~~~~~~~~~~~~~~~~~~~~~~~~
+In function ‘strncpy’,
+    inlined from ‘build_sharded’ at src/pg_cuvs_server.c:4986:13:
+/usr/include/x86_64-linux-gnu/bits/string_fortified.h:95:10: warning: ‘__builtin_strncpy’ output may be truncated copying 127 bytes from a string of length 127 [-Wstringop-truncation]
+   95 |   return __builtin___strncpy_chk (__dest, __src, __len,
+      |          ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+   96 |                                   __glibc_objsize (__dest));
+      |                                   ~~~~~~~~~~~~~~~~~~~~~~~~~
+In function ‘strncpy’,
+    inlined from ‘build_sharded’ at src/pg_cuvs_server.c:4987:13:
+/usr/include/x86_64-linux-gnu/bits/string_fortified.h:95:10: warning: ‘__builtin_strncpy’ output may be truncated copying 511 bytes from a string of length 511 [-Wstringop-truncation]
+   95 |   return __builtin___strncpy_chk (__dest, __src, __len,
+      |          ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+   96 |                                   __glibc_objsize (__dest));
+      |                                   ~~~~~~~~~~~~~~~~~~~~~~~~~
+gcc -O2 -g -Wall -Wextra -I./src -I/opt/miniforge3/envs/cuvs_dev/include -I/opt/miniforge3/envs/cuvs_dev/include/rapids -std=gnu11 -D_POSIX_C_SOURCE=200809L  -c src/cuvs_build_corpus.c -o src/cuvs_build_corpus_server.o
+src/pg_cuvs_server.c: In function ‘handle_build_flat’:
+src/pg_cuvs_server.c:6747:22: warning: ‘ MB); shard the table or use...’ directive output may be truncated writing 48 bytes into a region of size between 29 and 66 [-Wformat-truncation=]
+ 6747 |                      "flat corpus %zu MB (float16 %zu MB) exceeds the GPU VRAM budget "
+      |                      ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+src/pg_cuvs_server.c:6748:27: note: format string is defined here
+ 6748 |                      "(%zu MB); shard the table or use a cagra/ivfpq index",
+      |                           ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+In file included from /usr/include/stdio.h:894,
+                 from src/cuvs_util.h:13,
+                 from src/pg_cuvs_server.c:30:
+/usr/include/x86_64-linux-gnu/bits/stdio2.h:71:10: note: ‘__builtin___snprintf_chk’ output between 111 and 148 bytes into a destination of size 128
+   71 |   return __builtin___snprintf_chk (__s, __n, __USE_FORTIFY_LEVEL - 1,
+      |          ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+   72 |                                    __glibc_objsize (__s), __fmt,
+      |                                    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+   73 |                                    __va_arg_pack ());
+      |                                    ~~~~~~~~~~~~~~~~~
+In file included from /usr/include/string.h:535,
+                 from src/pg_cuvs_server.c:38:
+In function ‘strncpy’,
+    inlined from ‘main’ at src/pg_cuvs_server.c:8759:5:
+/usr/include/x86_64-linux-gnu/bits/string_fortified.h:95:10: warning: ‘__builtin_strncpy’ output may be truncated copying 107 bytes from a string of length 255 [-Wstringop-truncation]
+   95 |   return __builtin___strncpy_chk (__dest, __src, __len,
+      |          ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+   96 |                                   __glibc_objsize (__dest));
+      |                                   ~~~~~~~~~~~~~~~~~~~~~~~~~
+g++ -o pg_cuvs_server src/pg_cuvs_server.o src/cuvs_ipc_server.o src/cuvs_util_server.o src/cuvs_objstore_server.o src/cuvs_build_corpus_server.o src/cuvs_wrapper.o -L/opt/miniforge3/envs/cuvs_dev/lib -lcuvs -lrmm -lcudart -Wl,-rpath,/opt/miniforge3/envs/cuvs_dev/lib -lstdc++ -lpthread -lrt -lcurl -lssl -lcrypto 
+/usr/bin/ld: src/cuvs_wrapper.o: undefined reference to symbol '_ZN13rapids_logger6logger3logENS_10level_enumERKNSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEEE'
+/usr/bin/ld: /opt/miniforge3/envs/cuvs_dev/lib/librapids_logger.so: error adding symbols: DSO missing from command line
+collect2: error: ld returned 1 exit status
+make: *** [Makefile:194: pg_cuvs_server] Error 1

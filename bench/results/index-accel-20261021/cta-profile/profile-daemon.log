@@ -1,0 +1,16 @@
+[INFO] pg_cuvs_server: starting (socket=/tmp/.s.pg_cuvs index-dir=/tmp/cuvs_indexes snapshot=disabled)
+[INFO] index registry capacity: 1024 (--max-indexes)
+[INFO] pg_cuvs_server: hw_profile gpu='NVIDIA L40S' link_bw=26901 hbm_bw=709936 bf_tput=86 cpu_dist=1484 cagra_lat=317.8 ipc_rtt=3.6 probe_status=0x3f
+[INFO] GPU 0 (NVIDIA L40S): 45484 MB total, budget 40936 MB (default fraction of total)
+[INFO] pg_cuvs_server: loaded index 16390/1016847 (1000000 vecs, 3173 MB VRAM)
+[INFO] GPU 0 warm-up done in 70 ms
+[INFO] pg_cuvs_server: listening on /tmp/.s.pg_cuvs
+[INFO] pg_cuvs_server: SIGTERM received, serializing indexes...
+[INFO] batch: worker thread joined
+[INFO] pg_cuvs_server: saved index 16390/1016847 (1000000 vecs)
+[INFO] sigterm: 1 indexes saved, 0 failed
+[INFO] pg_cuvs_server: shutdown complete
+CUDA call='cudaEventDestroy(event_)' at file=/tmp/conda-bld-output/bld/rattler-build_libcuvs-headers/host_env_placehold_placehold_placehold_placehold_placehold_placehold_placehold_placehold_placehold_placehold_placehold_placehold_placehold_placehold_placehold_placehold_placehold_placehold_placehold_/include/raft/core/resource/cuda_event.hpp line=23 failed with driver shutting down
+CUDA call='cudaFreeAsync(ptr, stream)' at file=/tmp/conda-bld-output/bld/rattler-build_libcuvs-headers/work/cpp/src/neighbors/detail/cagra/compute_distance.hpp line=248 failed with driver shutting down
+CUDA call='cudaFreeAsync(ptr, stream)' at file=/tmp/conda-bld-output/bld/rattler-build_libcuvs-headers/work/cpp/src/neighbors/detail/cagra/compute_distance.hpp line=248 failed with driver shutting down
+CUDA call='cudaFreeAsync(ptr, stream)' at file=/tmp/conda-bld-output/bld/rattler-build_libcuvs-headers/work/cpp/src/neighbors/detail/cagra/compute_distance.hpp line=248 failed with driver shutting down

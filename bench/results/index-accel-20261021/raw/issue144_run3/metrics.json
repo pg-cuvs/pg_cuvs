@@ -1,0 +1,94 @@
+[
+  {
+    "batch_dispatches": 10,
+    "batch_minus_single": 0.0023299999999999432,
+    "batch_observed_fallbacks": 0,
+    "batch_observed_gpu_dispatches": 50,
+    "batch_observed_gpu_errors": 0,
+    "batch_observed_search_mode": "gpu_cagra",
+    "batch_plan_has_seqscan": false,
+    "batch_qps": 1855.8449328305765,
+    "batch_recall_at10": 0.94304,
+    "cta_mode": "AUTO/unobserved",
+    "itopk_size": 64,
+    "notes": [
+      "batch split into 10 dispatches (shm sizing)"
+    ],
+    "observed_gpu_errors": 0,
+    "observed_gpu_queries": 10000,
+    "observed_search_mode": "gpu_cagra",
+    "returned_k": 64,
+    "search_width": 1,
+    "single_qps": 1018.0716441752231,
+    "single_recall_at10": 0.94071
+  },
+  {
+    "batch_dispatches": 10,
+    "batch_minus_single": -0.0002300000000000635,
+    "batch_observed_fallbacks": 0,
+    "batch_observed_gpu_dispatches": 50,
+    "batch_observed_gpu_errors": 0,
+    "batch_observed_search_mode": "gpu_cagra",
+    "batch_plan_has_seqscan": false,
+    "batch_qps": 1837.4948975040065,
+    "batch_recall_at10": 0.9781,
+    "cta_mode": "AUTO/unobserved",
+    "itopk_size": 128,
+    "notes": [
+      "batch split into 10 dispatches (shm sizing)"
+    ],
+    "observed_gpu_errors": 0,
+    "observed_gpu_queries": 10000,
+    "observed_search_mode": "gpu_cagra",
+    "returned_k": 64,
+    "search_width": 1,
+    "single_qps": 988.1684455536841,
+    "single_recall_at10": 0.97833
+  },
+  {
+    "batch_dispatches": 10,
+    "batch_minus_single": -0.0032400000000000206,
+    "batch_observed_fallbacks": 0,
+    "batch_observed_gpu_dispatches": 50,
+    "batch_observed_gpu_errors": 0,
+    "batch_observed_search_mode": "gpu_cagra",
+    "batch_plan_has_seqscan": false,
+    "batch_qps": 1802.9212869553407,
+    "batch_recall_at10": 0.99007,
+    "cta_mode": "AUTO/unobserved",
+    "itopk_size": 256,
+    "notes": [
+      "batch split into 10 dispatches (shm sizing)"
+    ],
+    "observed_gpu_errors": 0,
+    "observed_gpu_queries": 10000,
+    "observed_search_mode": "gpu_cagra",
+    "returned_k": 64,
+    "search_width": 1,
+    "single_qps": 980.3415401922716,
+    "single_recall_at10": 0.99331
+  },
+  {
+    "batch_dispatches": 10,
+    "batch_minus_single": -0.0018599999999999728,
+    "batch_observed_fallbacks": 0,
+    "batch_observed_gpu_dispatches": 50,
+    "batch_observed_gpu_errors": 0,
+    "batch_observed_search_mode": "gpu_cagra",
+    "batch_plan_has_seqscan": false,
+    "batch_qps": 1731.2880845570605,
+    "batch_recall_at10": 0.996,
+    "cta_mode": "AUTO/unobserved",
+    "itopk_size": 512,
+    "notes": [
+      "batch split into 10 dispatches (shm sizing)"
+    ],
+    "observed_gpu_errors": 0,
+    "observed_gpu_queries": 10000,
+    "observed_search_mode": "gpu_cagra",
+    "returned_k": 64,
+    "search_width": 1,
+    "single_qps": 949.4837450689046,
+    "single_recall_at10": 0.99786
+  }
+]

@@ -1,0 +1,5 @@
+mode,N,pool_mb,phase,client_start_bytes,peak_client_bytes,extra_client_peak_bytes,client_end_bytes,client_allocation_calls,pool_growth_calls,pool_growth_bytes,seconds,cuda_allocation_api_counts,lifetime_pool_reserved_bytes,lifetime_pool_allocations_including_initial,success
+search,1,1024,load_original_graph,0,3200000000,3200000000,3200000000,2,1,3072000000,1.59089879,{'cudaMalloc_v3020': 1},4145741824,2,True
+search,1,1024,search_it512_q10000_k64,3200000000,3235880000,35880000,3200000000,4,0,0,0.543751126,{'cudaMallocAsync_ptsz_v11020': 1},4145741824,2,True
+ivf_pq,1,1024,ivf_pq,0,8797118032,8797118032,3328000000,33052,3,15509225472,8.989595296,"{'cudaMalloc_v3020': 3, 'cudaMallocManaged_v6000': 3, 'cudaFree_v3020': 3}",16582967296,4,True
+nn_descent,1,1024,nn_descent,0,7168000000,7168000000,3328000000,21,2,7217741824,18.150323764,"{'cudaMalloc_v3020': 2, 'cuMemFreeHost': 9}",8291483648,3,True

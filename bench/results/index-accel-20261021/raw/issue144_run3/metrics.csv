@@ -1,0 +1,5 @@
+itopk_size,search_width,returned_k,single_recall_at10,batch_recall_at10,batch_minus_single,single_qps,batch_qps,batch_dispatches,cta_mode,notes,observed_gpu_queries,observed_gpu_errors,observed_search_mode,batch_observed_gpu_dispatches,batch_observed_gpu_errors,batch_observed_fallbacks,batch_observed_search_mode,batch_plan_has_seqscan
+64,1,64,0.94071,0.94304,0.0023299999999999432,1018.0716441752231,1855.8449328305765,10,AUTO/unobserved,['batch split into 10 dispatches (shm sizing)'],10000,0,gpu_cagra,50,0,0,gpu_cagra,False
+128,1,64,0.97833,0.9781,-0.0002300000000000635,988.1684455536841,1837.4948975040065,10,AUTO/unobserved,['batch split into 10 dispatches (shm sizing)'],10000,0,gpu_cagra,50,0,0,gpu_cagra,False
+256,1,64,0.99331,0.99007,-0.0032400000000000206,980.3415401922716,1802.9212869553407,10,AUTO/unobserved,['batch split into 10 dispatches (shm sizing)'],10000,0,gpu_cagra,50,0,0,gpu_cagra,False
+512,1,64,0.99786,0.996,-0.0018599999999999728,949.4837450689046,1731.2880845570605,10,AUTO/unobserved,['batch split into 10 dispatches (shm sizing)'],10000,0,gpu_cagra,50,0,0,gpu_cagra,False

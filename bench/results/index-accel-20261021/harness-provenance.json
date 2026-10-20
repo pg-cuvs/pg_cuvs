@@ -1,0 +1,16 @@
+{
+  "smoke_source": "feature_gpu_check_smoke_frozen.py",
+  "sha256": "dc0bf9647031ccecdacee8dbc6587ec5dcad22bf102f224d80225e77437d09fb",
+  "matching_metadata": {
+    "baseline_control1": "dc0bf9647031ccecdacee8dbc6587ec5dcad22bf102f224d80225e77437d09fb",
+    "baseline_control2": "dc0bf9647031ccecdacee8dbc6587ec5dcad22bf102f224d80225e77437d09fb",
+    "baseline_control3": "dc0bf9647031ccecdacee8dbc6587ec5dcad22bf102f224d80225e77437d09fb",
+    "guc_zero": "dc0bf9647031ccecdacee8dbc6587ec5dcad22bf102f224d80225e77437d09fb",
+    "rmm_zero": "dc0bf9647031ccecdacee8dbc6587ec5dcad22bf102f224d80225e77437d09fb",
+    "rmm_zero2": "dc0bf9647031ccecdacee8dbc6587ec5dcad22bf102f224d80225e77437d09fb",
+    "rmm_zero3": "dc0bf9647031ccecdacee8dbc6587ec5dcad22bf102f224d80225e77437d09fb",
+    "rmm_1024": "dc0bf9647031ccecdacee8dbc6587ec5dcad22bf102f224d80225e77437d09fb"
+  },
+  "sweep_source": "feature_gpu_check.py",
+  "sweep_addition": "batch dispatch/fallback and EXPLAIN guards only"
+}

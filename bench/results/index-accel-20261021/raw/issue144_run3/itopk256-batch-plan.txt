@@ -1,0 +1,6 @@
+Sort  (cost=4082.33..4084.83 rows=1000 width=16)
+  Sort Key: b.query_idx, b.distance
+  ->  Nested Loop  (cost=0.01..4032.50 rows=1000 width=16)
+        ->  Function Scan on pg_cuvs_batch_search b  (cost=0.00..10.00 rows=1000 width=14)
+        ->  Tid Scan on t  (cost=0.00..4.01 rows=1 width=14)
+              TID Cond: (ctid = b.ctid)

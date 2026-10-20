@@ -1,0 +1,85 @@
+[
+  {
+    "mode": "search",
+    "N": 1,
+    "pool_mb": 1024,
+    "phase": "load_original_graph",
+    "client_start_bytes": 0,
+    "peak_client_bytes": 3200000000,
+    "extra_client_peak_bytes": 3200000000,
+    "client_end_bytes": 3200000000,
+    "client_allocation_calls": 2,
+    "pool_growth_calls": 1,
+    "pool_growth_bytes": 3072000000,
+    "seconds": 1.59089879,
+    "cuda_allocation_api_counts": {
+      "cudaMalloc_v3020": 1
+    },
+    "lifetime_pool_reserved_bytes": 4145741824,
+    "lifetime_pool_allocations_including_initial": 2,
+    "success": true
+  },
+  {
+    "mode": "search",
+    "N": 1,
+    "pool_mb": 1024,
+    "phase": "search_it512_q10000_k64",
+    "client_start_bytes": 3200000000,
+    "peak_client_bytes": 3235880000,
+    "extra_client_peak_bytes": 35880000,
+    "client_end_bytes": 3200000000,
+    "client_allocation_calls": 4,
+    "pool_growth_calls": 0,
+    "pool_growth_bytes": 0,
+    "seconds": 0.543751126,
+    "cuda_allocation_api_counts": {
+      "cudaMallocAsync_ptsz_v11020": 1
+    },
+    "lifetime_pool_reserved_bytes": 4145741824,
+    "lifetime_pool_allocations_including_initial": 2,
+    "success": true
+  },
+  {
+    "mode": "ivf_pq",
+    "N": 1,
+    "pool_mb": 1024,
+    "phase": "ivf_pq",
+    "client_start_bytes": 0,
+    "peak_client_bytes": 8797118032,
+    "extra_client_peak_bytes": 8797118032,
+    "client_end_bytes": 3328000000,
+    "client_allocation_calls": 33052,
+    "pool_growth_calls": 3,
+    "pool_growth_bytes": 15509225472,
+    "seconds": 8.989595296,
+    "cuda_allocation_api_counts": {
+      "cudaMalloc_v3020": 3,
+      "cudaMallocManaged_v6000": 3,
+      "cudaFree_v3020": 3
+    },
+    "lifetime_pool_reserved_bytes": 16582967296,
+    "lifetime_pool_allocations_including_initial": 4,
+    "success": true
+  },
+  {
+    "mode": "nn_descent",
+    "N": 1,
+    "pool_mb": 1024,
+    "phase": "nn_descent",
+    "client_start_bytes": 0,
+    "peak_client_bytes": 7168000000,
+    "extra_client_peak_bytes": 7168000000,
+    "client_end_bytes": 3328000000,
+    "client_allocation_calls": 21,
+    "pool_growth_calls": 2,
+    "pool_growth_bytes": 7217741824,
+    "seconds": 18.150323764,
+    "cuda_allocation_api_counts": {
+      "cudaMalloc_v3020": 2,
+      "cuMemFreeHost": 9
+    },
+    "lifetime_pool_reserved_bytes": 8291483648,
+    "lifetime_pool_allocations_including_initial": 3,
+    "success": true
+  }
+]

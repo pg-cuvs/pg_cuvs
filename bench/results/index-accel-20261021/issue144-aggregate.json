@@ -1,0 +1,595 @@
+{
+  "scope": "this L40S/sm89 only",
+  "commit": "0caa6483df57fa6d53310e5aecdddc8b7d559688",
+  "n": 3,
+  "labels": [
+    "issue144_run1",
+    "issue144_run2",
+    "issue144_run3"
+  ],
+  "same_graph": true,
+  "points": [
+    {
+      "itopk_size": 64,
+      "path": "single",
+      "recall_values": [
+        0.94059,
+        0.94061,
+        0.94071
+      ],
+      "recall_mean": 0.9406366666666667,
+      "recall_min": 0.94059,
+      "recall_max": 0.94071,
+      "recall_std": 6.429100507331037e-05,
+      "qps_mean": 1010.7682502552766,
+      "mean_run_pair_jaccard": 0.9994249082874473,
+      "pairwise_ids": [
+        {
+          "runs": [
+            "issue144_run1",
+            "issue144_run2"
+          ],
+          "mean_query_jaccard": 0.9994775538187307,
+          "id_changed_queries": 22,
+          "reorder_only_queries": 0,
+          "within_gt_only_changed_queries": 0,
+          "gt_outside_involved_queries": 22,
+          "gt_hits_lost": 11,
+          "gt_hits_gained": 13
+        },
+        {
+          "runs": [
+            "issue144_run1",
+            "issue144_run3"
+          ],
+          "mean_query_jaccard": 0.9993289708227793,
+          "id_changed_queries": 24,
+          "reorder_only_queries": 0,
+          "within_gt_only_changed_queries": 0,
+          "gt_outside_involved_queries": 24,
+          "gt_hits_lost": 11,
+          "gt_hits_gained": 23
+        },
+        {
+          "runs": [
+            "issue144_run2",
+            "issue144_run3"
+          ],
+          "mean_query_jaccard": 0.9994682002208319,
+          "id_changed_queries": 20,
+          "reorder_only_queries": 0,
+          "within_gt_only_changed_queries": 0,
+          "gt_outside_involved_queries": 20,
+          "gt_hits_lost": 7,
+          "gt_hits_gained": 17
+        }
+      ]
+    },
+    {
+      "itopk_size": 64,
+      "path": "batch",
+      "recall_values": [
+        0.94304,
+        0.94304,
+        0.94304
+      ],
+      "recall_mean": 0.94304,
+      "recall_min": 0.94304,
+      "recall_max": 0.94304,
+      "recall_std": 0.0,
+      "qps_mean": 1856.0998955213759,
+      "mean_run_pair_jaccard": 1.0,
+      "pairwise_ids": [
+        {
+          "runs": [
+            "issue144_run1",
+            "issue144_run2"
+          ],
+          "mean_query_jaccard": 1.0,
+          "id_changed_queries": 0,
+          "reorder_only_queries": 0,
+          "within_gt_only_changed_queries": 0,
+          "gt_outside_involved_queries": 0,
+          "gt_hits_lost": 0,
+          "gt_hits_gained": 0
+        },
+        {
+          "runs": [
+            "issue144_run1",
+            "issue144_run3"
+          ],
+          "mean_query_jaccard": 1.0,
+          "id_changed_queries": 0,
+          "reorder_only_queries": 0,
+          "within_gt_only_changed_queries": 0,
+          "gt_outside_involved_queries": 0,
+          "gt_hits_lost": 0,
+          "gt_hits_gained": 0
+        },
+        {
+          "runs": [
+            "issue144_run2",
+            "issue144_run3"
+          ],
+          "mean_query_jaccard": 1.0,
+          "id_changed_queries": 0,
+          "reorder_only_queries": 0,
+          "within_gt_only_changed_queries": 0,
+          "gt_outside_involved_queries": 0,
+          "gt_hits_lost": 0,
+          "gt_hits_gained": 0
+        }
+      ]
+    },
+    {
+      "itopk_size": 128,
+      "path": "single",
+      "recall_values": [
+        0.97839,
+        0.97842,
+        0.97833
+      ],
+      "recall_mean": 0.97838,
+      "recall_min": 0.97833,
+      "recall_max": 0.97842,
+      "recall_std": 4.582575694951944e-05,
+      "qps_mean": 986.4042122299513,
+      "mean_run_pair_jaccard": 0.9992444444444449,
+      "pairwise_ids": [
+        {
+          "runs": [
+            "issue144_run1",
+            "issue144_run2"
+          ],
+          "mean_query_jaccard": 0.9991212121212127,
+          "id_changed_queries": 51,
+          "reorder_only_queries": 6,
+          "within_gt_only_changed_queries": 0,
+          "gt_outside_involved_queries": 45,
+          "gt_hits_lost": 22,
+          "gt_hits_gained": 25
+        },
+        {
+          "runs": [
+            "issue144_run1",
+            "issue144_run3"
+          ],
+          "mean_query_jaccard": 0.9992242424242428,
+          "id_changed_queries": 47,
+          "reorder_only_queries": 6,
+          "within_gt_only_changed_queries": 0,
+          "gt_outside_involved_queries": 41,
+          "gt_hits_lost": 24,
+          "gt_hits_gained": 18
+        },
+        {
+          "runs": [
+            "issue144_run2",
+            "issue144_run3"
+          ],
+          "mean_query_jaccard": 0.9993878787878792,
+          "id_changed_queries": 38,
+          "reorder_only_queries": 6,
+          "within_gt_only_changed_queries": 0,
+          "gt_outside_involved_queries": 32,
+          "gt_hits_lost": 20,
+          "gt_hits_gained": 11
+        }
+      ]
+    },
+    {
+      "itopk_size": 128,
+      "path": "batch",
+      "recall_values": [
+        0.9781,
+        0.9781,
+        0.9781
+      ],
+      "recall_mean": 0.9781,
+      "recall_min": 0.9781,
+      "recall_max": 0.9781,
+      "recall_std": 0.0,
+      "qps_mean": 1834.2109811889788,
+      "mean_run_pair_jaccard": 1.0,
+      "pairwise_ids": [
+        {
+          "runs": [
+            "issue144_run1",
+            "issue144_run2"
+          ],
+          "mean_query_jaccard": 1.0,
+          "id_changed_queries": 0,
+          "reorder_only_queries": 0,
+          "within_gt_only_changed_queries": 0,
+          "gt_outside_involved_queries": 0,
+          "gt_hits_lost": 0,
+          "gt_hits_gained": 0
+        },
+        {
+          "runs": [
+            "issue144_run1",
+            "issue144_run3"
+          ],
+          "mean_query_jaccard": 1.0,
+          "id_changed_queries": 0,
+          "reorder_only_queries": 0,
+          "within_gt_only_changed_queries": 0,
+          "gt_outside_involved_queries": 0,
+          "gt_hits_lost": 0,
+          "gt_hits_gained": 0
+        },
+        {
+          "runs": [
+            "issue144_run2",
+            "issue144_run3"
+          ],
+          "mean_query_jaccard": 1.0,
+          "id_changed_queries": 0,
+          "reorder_only_queries": 0,
+          "within_gt_only_changed_queries": 0,
+          "gt_outside_involved_queries": 0,
+          "gt_hits_lost": 0,
+          "gt_hits_gained": 0
+        }
+      ]
+    },
+    {
+      "itopk_size": 256,
+      "path": "single",
+      "recall_values": [
+        0.99338,
+        0.99339,
+        0.99331
+      ],
+      "recall_mean": 0.99336,
+      "recall_min": 0.99331,
+      "recall_max": 0.99339,
+      "recall_std": 4.3588989435399386e-05,
+      "qps_mean": 974.9675547032354,
+      "mean_run_pair_jaccard": 0.9992921717171721,
+      "pairwise_ids": [
+        {
+          "runs": [
+            "issue144_run1",
+            "issue144_run2"
+          ],
+          "mean_query_jaccard": 0.9992189393939399,
+          "id_changed_queries": 49,
+          "reorder_only_queries": 10,
+          "within_gt_only_changed_queries": 0,
+          "gt_outside_involved_queries": 39,
+          "gt_hits_lost": 20,
+          "gt_hits_gained": 21
+        },
+        {
+          "runs": [
+            "issue144_run1",
+            "issue144_run3"
+          ],
+          "mean_query_jaccard": 0.9993545454545457,
+          "id_changed_queries": 36,
+          "reorder_only_queries": 5,
+          "within_gt_only_changed_queries": 0,
+          "gt_outside_involved_queries": 31,
+          "gt_hits_lost": 20,
+          "gt_hits_gained": 13
+        },
+        {
+          "runs": [
+            "issue144_run2",
+            "issue144_run3"
+          ],
+          "mean_query_jaccard": 0.9993030303030308,
+          "id_changed_queries": 38,
+          "reorder_only_queries": 5,
+          "within_gt_only_changed_queries": 0,
+          "gt_outside_involved_queries": 33,
+          "gt_hits_lost": 23,
+          "gt_hits_gained": 15
+        }
+      ]
+    },
+    {
+      "itopk_size": 256,
+      "path": "batch",
+      "recall_values": [
+        0.99007,
+        0.99007,
+        0.99007
+      ],
+      "recall_mean": 0.99007,
+      "recall_min": 0.99007,
+      "recall_max": 0.99007,
+      "recall_std": 0.0,
+      "qps_mean": 1802.3187364788337,
+      "mean_run_pair_jaccard": 1.0,
+      "pairwise_ids": [
+        {
+          "runs": [
+            "issue144_run1",
+            "issue144_run2"
+          ],
+          "mean_query_jaccard": 1.0,
+          "id_changed_queries": 0,
+          "reorder_only_queries": 0,
+          "within_gt_only_changed_queries": 0,
+          "gt_outside_involved_queries": 0,
+          "gt_hits_lost": 0,
+          "gt_hits_gained": 0
+        },
+        {
+          "runs": [
+            "issue144_run1",
+            "issue144_run3"
+          ],
+          "mean_query_jaccard": 1.0,
+          "id_changed_queries": 0,
+          "reorder_only_queries": 0,
+          "within_gt_only_changed_queries": 0,
+          "gt_outside_involved_queries": 0,
+          "gt_hits_lost": 0,
+          "gt_hits_gained": 0
+        },
+        {
+          "runs": [
+            "issue144_run2",
+            "issue144_run3"
+          ],
+          "mean_query_jaccard": 1.0,
+          "id_changed_queries": 0,
+          "reorder_only_queries": 0,
+          "within_gt_only_changed_queries": 0,
+          "gt_outside_involved_queries": 0,
+          "gt_hits_lost": 0,
+          "gt_hits_gained": 0
+        }
+      ]
+    },
+    {
+      "itopk_size": 512,
+      "path": "single",
+      "recall_values": [
+        0.99779,
+        0.99784,
+        0.99786
+      ],
+      "recall_mean": 0.99783,
+      "recall_min": 0.99779,
+      "recall_max": 0.99786,
+      "recall_std": 3.605551275464516e-05,
+      "qps_mean": 943.8408258097562,
+      "mean_run_pair_jaccard": 0.9997111111111113,
+      "pairwise_ids": [
+        {
+          "runs": [
+            "issue144_run1",
+            "issue144_run2"
+          ],
+          "mean_query_jaccard": 0.999727272727273,
+          "id_changed_queries": 28,
+          "reorder_only_queries": 13,
+          "within_gt_only_changed_queries": 0,
+          "gt_outside_involved_queries": 15,
+          "gt_hits_lost": 5,
+          "gt_hits_gained": 10
+        },
+        {
+          "runs": [
+            "issue144_run1",
+            "issue144_run3"
+          ],
+          "mean_query_jaccard": 0.9996939393939396,
+          "id_changed_queries": 27,
+          "reorder_only_queries": 11,
+          "within_gt_only_changed_queries": 0,
+          "gt_outside_involved_queries": 16,
+          "gt_hits_lost": 5,
+          "gt_hits_gained": 12
+        },
+        {
+          "runs": [
+            "issue144_run2",
+            "issue144_run3"
+          ],
+          "mean_query_jaccard": 0.9997121212121214,
+          "id_changed_queries": 27,
+          "reorder_only_queries": 12,
+          "within_gt_only_changed_queries": 0,
+          "gt_outside_involved_queries": 15,
+          "gt_hits_lost": 7,
+          "gt_hits_gained": 9
+        }
+      ]
+    },
+    {
+      "itopk_size": 512,
+      "path": "batch",
+      "recall_values": [
+        0.996,
+        0.996,
+        0.996
+      ],
+      "recall_mean": 0.996,
+      "recall_min": 0.996,
+      "recall_max": 0.996,
+      "recall_std": 0.0,
+      "qps_mean": 1727.9589000832561,
+      "mean_run_pair_jaccard": 1.0,
+      "pairwise_ids": [
+        {
+          "runs": [
+            "issue144_run1",
+            "issue144_run2"
+          ],
+          "mean_query_jaccard": 1.0,
+          "id_changed_queries": 0,
+          "reorder_only_queries": 0,
+          "within_gt_only_changed_queries": 0,
+          "gt_outside_involved_queries": 0,
+          "gt_hits_lost": 0,
+          "gt_hits_gained": 0
+        },
+        {
+          "runs": [
+            "issue144_run1",
+            "issue144_run3"
+          ],
+          "mean_query_jaccard": 1.0,
+          "id_changed_queries": 0,
+          "reorder_only_queries": 0,
+          "within_gt_only_changed_queries": 0,
+          "gt_outside_involved_queries": 0,
+          "gt_hits_lost": 0,
+          "gt_hits_gained": 0
+        },
+        {
+          "runs": [
+            "issue144_run2",
+            "issue144_run3"
+          ],
+          "mean_query_jaccard": 1.0,
+          "id_changed_queries": 0,
+          "reorder_only_queries": 0,
+          "within_gt_only_changed_queries": 0,
+          "gt_outside_involved_queries": 0,
+          "gt_hits_lost": 0,
+          "gt_hits_gained": 0
+        }
+      ]
+    }
+  ],
+  "adjacent_drops": {
+    "single": [],
+    "batch": []
+  },
+  "single_vs_batch_ids": {
+    "64": [
+      {
+        "run": "issue144_run1",
+        "mean_query_jaccard": 0.9477059838166791,
+        "id_changed_queries": 1606,
+        "reorder_only_queries": 10,
+        "within_gt_only_changed_queries": 46,
+        "gt_outside_involved_queries": 1550,
+        "gt_hits_lost": 1510,
+        "gt_hits_gained": 1755
+      },
+      {
+        "run": "issue144_run2",
+        "mean_query_jaccard": 0.9477924094395598,
+        "id_changed_queries": 1604,
+        "reorder_only_queries": 10,
+        "within_gt_only_changed_queries": 46,
+        "gt_outside_involved_queries": 1548,
+        "gt_hits_lost": 1509,
+        "gt_hits_gained": 1752
+      },
+      {
+        "run": "issue144_run3",
+        "mean_query_jaccard": 0.947994761911649,
+        "id_changed_queries": 1600,
+        "reorder_only_queries": 10,
+        "within_gt_only_changed_queries": 47,
+        "gt_outside_involved_queries": 1543,
+        "gt_hits_lost": 1509,
+        "gt_hits_gained": 1742
+      }
+    ],
+    "128": [
+      {
+        "run": "issue144_run1",
+        "mean_query_jaccard": 0.9779883423250362,
+        "id_changed_queries": 770,
+        "reorder_only_queries": 13,
+        "within_gt_only_changed_queries": 23,
+        "gt_outside_involved_queries": 734,
+        "gt_hits_lost": 706,
+        "gt_hits_gained": 677
+      },
+      {
+        "run": "issue144_run2",
+        "mean_query_jaccard": 0.9781640999007938,
+        "id_changed_queries": 762,
+        "reorder_only_queries": 13,
+        "within_gt_only_changed_queries": 24,
+        "gt_outside_involved_queries": 725,
+        "gt_hits_lost": 703,
+        "gt_hits_gained": 671
+      },
+      {
+        "run": "issue144_run3",
+        "mean_query_jaccard": 0.9781149157516096,
+        "id_changed_queries": 763,
+        "reorder_only_queries": 12,
+        "within_gt_only_changed_queries": 25,
+        "gt_outside_involved_queries": 726,
+        "gt_hits_lost": 701,
+        "gt_hits_gained": 678
+      }
+    ],
+    "256": [
+      {
+        "run": "issue144_run1",
+        "mean_query_jaccard": 0.990951861820673,
+        "id_changed_queries": 312,
+        "reorder_only_queries": 17,
+        "within_gt_only_changed_queries": 4,
+        "gt_outside_involved_queries": 291,
+        "gt_hits_lost": 477,
+        "gt_hits_gained": 146
+      },
+      {
+        "run": "issue144_run2",
+        "mean_query_jaccard": 0.9908397406085518,
+        "id_changed_queries": 317,
+        "reorder_only_queries": 15,
+        "within_gt_only_changed_queries": 4,
+        "gt_outside_involved_queries": 298,
+        "gt_hits_lost": 483,
+        "gt_hits_gained": 151
+      },
+      {
+        "run": "issue144_run3",
+        "mean_query_jaccard": 0.9909571249785677,
+        "id_changed_queries": 311,
+        "reorder_only_queries": 16,
+        "within_gt_only_changed_queries": 5,
+        "gt_outside_involved_queries": 290,
+        "gt_hits_lost": 472,
+        "gt_hits_gained": 148
+      }
+    ],
+    "512": [
+      {
+        "run": "issue144_run1",
+        "mean_query_jaccard": 0.9960314221725995,
+        "id_changed_queries": 135,
+        "reorder_only_queries": 12,
+        "within_gt_only_changed_queries": 0,
+        "gt_outside_involved_queries": 123,
+        "gt_hits_lost": 230,
+        "gt_hits_gained": 51
+      },
+      {
+        "run": "issue144_run2",
+        "mean_query_jaccard": 0.9960204331616107,
+        "id_changed_queries": 135,
+        "reorder_only_queries": 12,
+        "within_gt_only_changed_queries": 0,
+        "gt_outside_involved_queries": 123,
+        "gt_hits_lost": 233,
+        "gt_hits_gained": 49
+      },
+      {
+        "run": "issue144_run3",
+        "mean_query_jaccard": 0.9960465736877512,
+        "id_changed_queries": 136,
+        "reorder_only_queries": 13,
+        "within_gt_only_changed_queries": 0,
+        "gt_outside_involved_queries": 123,
+        "gt_hits_lost": 233,
+        "gt_hits_gained": 47
+      }
+    ]
+  }
+}

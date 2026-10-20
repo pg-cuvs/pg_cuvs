@@ -1,0 +1,13 @@
+{
+  "label": "build_r2_3-pool0",
+  "pool_mb": 0,
+  "create_index_seconds": 46.80274778399962,
+  "index_oid": 1016852,
+  "n_vecs": 1000000,
+  "index_vram_estimate_bytes": 3328000000,
+  "all_index_vram_estimate_bytes": 3328000000,
+  "nvidia_smi_total_mib": 46068.0,
+  "nvidia_smi_used_mib": 3779.0,
+  "nvidia_smi_free_mib": 41707.0,
+  "physical_minus_logical_bytes": 634568704
+}

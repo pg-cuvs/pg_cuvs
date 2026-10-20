@@ -1,0 +1,17 @@
+{
+  "frozen_at_utc": "2026-10-20T16:33:14.393892+00:00",
+  "reason": "distinguish initial-size effects from repeated cudaMalloc avoidance, following coordinator 3c3ecbb889e54d47 and first 256MiB latency difference",
+  "separate_from_timed_measurements": true,
+  "pool_sizes_mb": [
+    0,
+    256,
+    512,
+    1024
+  ],
+  "single_queries": 100,
+  "k": 64,
+  "itopk": 64,
+  "source": "fded8ce wrapper; batch-only override unused by this serial probe",
+  "N": 1,
+  "counts_not_latency": "statistics MR upstream calls and Nsight runtime cudaMalloc/Async; do not use profiler times as benchmark"
+}

@@ -1,0 +1,145 @@
+{"setup":true,"pool_mb":1024,"upstream_type":"N3rmm2mr20cuda_memory_resourceE","initial_allocation_calls":1}
+{"phase":"ivf_pq","client_start_bytes":0,"peak_client_bytes":8797118032,"extra_client_peak_bytes":8797118032,"client_end_bytes":3328000000,"client_allocation_calls":33052,"pool_growth_calls":3,"pool_growth_bytes":15509225472,"seconds":8.989595296}
+{"success":true,"final_client_bytes":0,"lifetime_pool_allocations":4,"lifetime_pool_reserved_bytes":16582967296}
+Collecting data...
+Generating '/tmp/nsys-report-25ed.qdstrm'
+[1/7] [0%                          ] ivf_pq.nsys-rep[1/7] [0%                          ] ivf_pq.nsys-rep[1/7] [====25%                     ] ivf_pq.nsys-rep[1/7] [==18%                       ] ivf_pq.nsys-rep[1/7] [=15%                        ] ivf_pq.nsys-rep[1/7] [=====31%                    ] ivf_pq.nsys-rep[1/7] [====26%                     ] ivf_pq.nsys-rep[1/7] [===22%                      ] ivf_pq.nsys-rep[1/7] [==19%                       ] ivf_pq.nsys-rep[1/7] [=17%                        ] ivf_pq.nsys-rep[1/7] [=15%                        ] ivf_pq.nsys-rep[1/7] [14%                         ] ivf_pq.nsys-rep[1/7] [13%                         ] ivf_pq.nsys-rep[1/7] [12%                         ] ivf_pq.nsys-rep[1/7] [11%                         ] ivf_pq.nsys-rep[1/7] [=17%                        ] ivf_pq.nsys-rep[1/7] [===24%                      ] ivf_pq.nsys-rep[1/7] [=====30%                    ] ivf_pq.nsys-rep[1/7] [=======36%                  ] ivf_pq.nsys-rep[1/7] [========41%                 ] ivf_pq.nsys-rep[1/7] [==========48%               ] ivf_pq.nsys-rep[1/7] [============54%             ] ivf_pq.nsys-rep[1/7] [=============60%            ] ivf_pq.nsys-rep[1/7] [===============66%          ] ivf_pq.nsys-rep[1/7] [=================72%        ] ivf_pq.nsys-rep[1/7] [==================78%       ] ivf_pq.nsys-rep[1/7] [===================81%      ] ivf_pq.nsys-rep[1/7] [===================82%      ] ivf_pq.nsys-rep[1/7] [========================100%] ivf_pq.nsys-rep[1/7] [========================100%] ivf_pq.nsys-rep
+[2/7] [0%                          ] ivf_pq.sqlite[2/7] [1%                          ] ivf_pq.sqlite[2/7] [2%                          ] ivf_pq.sqlite[2/7] [3%                          ] ivf_pq.sqlite[2/7] [4%                          ] ivf_pq.sqlite[2/7] [5%                          ] ivf_pq.sqlite[2/7] [6%                          ] ivf_pq.sqlite[2/7] [7%                          ] ivf_pq.sqlite[2/7] [8%                          ] ivf_pq.sqlite[2/7] [9%                          ] ivf_pq.sqlite[2/7] [10%                         ] ivf_pq.sqlite[2/7] [11%                         ] ivf_pq.sqlite[2/7] [12%                         ] ivf_pq.sqlite[2/7] [13%                         ] ivf_pq.sqlite[2/7] [14%                         ] ivf_pq.sqlite[2/7] [=15%                        ] ivf_pq.sqlite[2/7] [=16%                        ] ivf_pq.sqlite[2/7] [=17%                        ] ivf_pq.sqlite[2/7] [==18%                       ] ivf_pq.sqlite[2/7] [==19%                       ] ivf_pq.sqlite[2/7] [==20%                       ] ivf_pq.sqlite[2/7] [==21%                       ] ivf_pq.sqlite[2/7] [===22%                      ] ivf_pq.sqlite[2/7] [===23%                      ] ivf_pq.sqlite[2/7] [===24%                      ] ivf_pq.sqlite[2/7] [====25%                     ] ivf_pq.sqlite[2/7] [====26%                     ] ivf_pq.sqlite[2/7] [====27%                     ] ivf_pq.sqlite[2/7] [====28%                     ] ivf_pq.sqlite[2/7] [=====29%                    ] ivf_pq.sqlite[2/7] [=====30%                    ] ivf_pq.sqlite[2/7] [=====31%                    ] ivf_pq.sqlite[2/7] [=====32%                    ] ivf_pq.sqlite[2/7] [======33%                   ] ivf_pq.sqlite[2/7] [======34%                   ] ivf_pq.sqlite[2/7] [======35%                   ] ivf_pq.sqlite[2/7] [=======36%                  ] ivf_pq.sqlite[2/7] [=======37%                  ] ivf_pq.sqlite[2/7] [=======38%                  ] ivf_pq.sqlite[2/7] [=======39%                  ] ivf_pq.sqlite[2/7] [========40%                 ] ivf_pq.sqlite[2/7] [========41%                 ] ivf_pq.sqlite[2/7] [========42%                 ] ivf_pq.sqlite[2/7] [=========43%                ] ivf_pq.sqlite[2/7] [=========44%                ] ivf_pq.sqlite[2/7] [=========45%                ] ivf_pq.sqlite[2/7] [=========46%                ] ivf_pq.sqlite[2/7] [==========47%               ] ivf_pq.sqlite[2/7] [==========48%               ] ivf_pq.sqlite[2/7] [==========49%               ] ivf_pq.sqlite[2/7] [===========50%              ] ivf_pq.sqlite[2/7] [===========51%              ] ivf_pq.sqlite[2/7] [===========52%              ] ivf_pq.sqlite[2/7] [===========53%              ] ivf_pq.sqlite[2/7] [============54%             ] ivf_pq.sqlite[2/7] [============55%             ] ivf_pq.sqlite[2/7] [============56%             ] ivf_pq.sqlite[2/7] [============57%             ] ivf_pq.sqlite[2/7] [=============58%            ] ivf_pq.sqlite[2/7] [=============59%            ] ivf_pq.sqlite[2/7] [=============60%            ] ivf_pq.sqlite[2/7] [==============61%           ] ivf_pq.sqlite[2/7] [==============62%           ] ivf_pq.sqlite[2/7] [==============63%           ] ivf_pq.sqlite[2/7] [==============64%           ] ivf_pq.sqlite[2/7] [===============65%          ] ivf_pq.sqlite[2/7] [===============66%          ] ivf_pq.sqlite[2/7] [===============67%          ] ivf_pq.sqlite[2/7] [================68%         ] ivf_pq.sqlite[2/7] [================69%         ] ivf_pq.sqlite[2/7] [================70%         ] ivf_pq.sqlite[2/7] [================71%         ] ivf_pq.sqlite[2/7] [=================72%        ] ivf_pq.sqlite[2/7] [=================73%        ] ivf_pq.sqlite[2/7] [=================74%        ] ivf_pq.sqlite[2/7] [==================75%       ] ivf_pq.sqlite[2/7] [==================76%       ] ivf_pq.sqlite[2/7] [==================77%       ] ivf_pq.sqlite[2/7] [==================78%       ] ivf_pq.sqlite[2/7] [===================79%      ] ivf_pq.sqlite[2/7] [===================80%      ] ivf_pq.sqlite[2/7] [===================81%      ] ivf_pq.sqlite[2/7] [===================82%      ] ivf_pq.sqlite[2/7] [====================83%     ] ivf_pq.sqlite[2/7] [====================84%     ] ivf_pq.sqlite[2/7] [====================85%     ] ivf_pq.sqlite[2/7] [=====================86%    ] ivf_pq.sqlite[2/7] [=====================87%    ] ivf_pq.sqlite[2/7] [=====================88%    ] ivf_pq.sqlite[2/7] [=====================89%    ] ivf_pq.sqlite[2/7] [======================90%   ] ivf_pq.sqlite[2/7] [======================91%   ] ivf_pq.sqlite[2/7] [======================92%   ] ivf_pq.sqlite[2/7] [=======================93%  ] ivf_pq.sqlite[2/7] [=======================94%  ] ivf_pq.sqlite[2/7] [=======================95%  ] ivf_pq.sqlite[2/7] [=======================96%  ] ivf_pq.sqlite[2/7] [========================97% ] ivf_pq.sqlite[2/7] [========================98% ] ivf_pq.sqlite[2/7] [========================99% ] ivf_pq.sqlite[2/7] [========================100%] ivf_pq.sqlite[2/7] [========================100%] ivf_pq.sqlite
+[3/7] Executing 'nvtx_sum' stats report
+
+ Time (%)  Total Time (ns)  Instances    Avg (ns)      Med (ns)     Min (ns)    Max (ns)   StdDev (ns)   Style                       Range                    
+ --------  ---------------  ---------  ------------  ------------  ----------  ----------  -----------  -------  ---------------------------------------------
+     99.5       8989602502          1  8989602502.0  8989602502.0  8989602502  8989602502          0.0  PushPop  :ivf_pq                                      
+      0.5         41054834       4968        8263.9        7630.0        7280       42481       1847.1  PushPop  CCCL:cub::DeviceHistogram::MultiHistogramEven
+      0.0          1497648         16       93603.0       68325.5       32760      575018     131281.6  PushPop  CCCL:cub::DeviceRadixSort                    
+      0.0           205433          1      205433.0      205433.0      205433      205433          0.0  PushPop  :pool_init                                   
+      0.0           197463          2       98731.5       98731.5       56661      140802      59496.7  PushPop  CCCL:cub::DeviceMergeSort                    
+      0.0           137823         22        6264.7        5195.0        4631       24730       4197.8  PushPop  CCCL:thrust::gather                          
+      0.0            40211          1       40211.0       40211.0       40211       40211          0.0  PushPop  CCCL:cub::DeviceSelect::UniqueByKey          
+
+[4/7] Executing 'cuda_api_sum' stats report
+
+ Time (%)  Total Time (ns)  Num Calls  Avg (ns)   Med (ns)   Min (ns)  Max (ns)   StdDev (ns)               Name             
+ --------  ---------------  ---------  ---------  ---------  --------  ---------  -----------  ------------------------------
+     51.6        958196416       9339   102601.6     2910.0      1560  174035929    2966374.9  cudaMemcpyAsync_ptsz          
+     28.0        520236733       5075   102509.7      120.0       110  269232357    4324137.2  cudaMemcpyAsync               
+     14.2        264037590      53193     4963.8     2270.0      2000   64129431     289617.2  cudaLaunchKernel_ptsz         
+      1.6         29642977         14  2117355.5  1740774.0    739440    4248169    1353354.2  cuLibraryLoadData             
+      1.1         20864397       9641     2164.1     2230.0      1440      16440        722.4  cudaMemsetAsync_ptsz          
+      1.1         20857946          7  2979706.6  2772569.0     41390    8415445    2805698.3  cudaFree                      
+      1.1         20338829          3  6779609.7    24920.0     22320   20291589   11701717.4  cudaMallocManaged             
+      0.7         12749717      33052      385.7      340.0       300      10790        206.5  cudaEventRecord               
+      0.3          5858203       4155     1409.9     1300.0      1190      21570        523.6  cudaStreamSynchronize         
+      0.1          2135459          8   266932.4     2445.0      2260    2118359     748089.3  cuKernelGetFunction           
+      0.1          1270668          4   317667.0   275223.5    167003     553218     171631.3  cudaMalloc                    
+      0.1          1111247        409     2717.0     2420.0      2100      22260       1450.4  cudaLaunchKernel              
+      0.0            75371        405      186.1      170.0        50        780        111.5  cuGetProcAddress_v2           
+      0.0            60470          8     7558.8     5800.0      5370      20550       5256.3  cuLaunchKernel                
+      0.0            53591          1    53591.0    53591.0     53591      53591          0.0  cudaMemGetInfo                
+      0.0            23640          3     7880.0     9540.0      3570      10530       3765.2  cudaMemcpy2DAsync_ptsz        
+      0.0            21370          3     7123.3     7420.0      2950      11000       4033.2  cudaDeviceSynchronize         
+      0.0            17560         15     1170.7      580.0       480       7660       1850.4  cuLibraryGetKernel            
+      0.0            10800          3     3600.0     1650.0       490       8660       4420.3  cudaStreamSynchronize_ptsz    
+      0.0             4460          2     2230.0     2230.0      1810       2650        594.0  cudaEventCreateWithFlags      
+      0.0             3440          2     1720.0     1720.0      1240       2200        678.8  cuInit                        
+      0.0             2380          1     2380.0     2380.0      2380       2380          0.0  cudaEventSynchronize          
+      0.0             2020          1     2020.0     2020.0      2020       2020          0.0  cudaStreamGetId_v12000        
+      0.0             1740          1     1740.0     1740.0      1740       1740          0.0  cudaStreamWaitEvent           
+      0.0             1270          1     1270.0     1270.0      1270       1270          0.0  cudaEventDestroy              
+      0.0              830          2      415.0      415.0       110        720        431.3  cuModuleGetLoadingMode        
+      0.0              640          2      320.0      320.0       180        460        198.0  cudaGetDriverEntryPoint_v11030
+
+[5/7] Executing 'cuda_gpu_kern_sum' stats report
+
+ Time (%)  Total Time (ns)  Instances    Avg (ns)      Med (ns)    Min (ns)    Max (ns)   StdDev (ns)                                                  Name                                                
+ --------  ---------------  ---------  ------------  ------------  ---------  ----------  -----------  ----------------------------------------------------------------------------------------------------
+     73.7       4082340088          4  1020585022.0  1070513235.0  868601053  1072712565  101330739.0  void cuvs::neighbors::cagra::detail::graph::<unnamed>::kern_prune<(int)1024, unsigned int>(const T2…
+     17.6        974731414         15    64982094.3    64304771.0   58298823    87758362    7083688.7  void cuvs::neighbors::ivf_pq::detail::compute_similarity_kernel<__half, __half, (unsigned int)4, (i…
+      2.2        120956734        270      447987.9      217217.0      84353     7143552     983646.2  void cutlass_cuvs_cutlass::Kernel<cuvs::gemm::kernel::FusedDistanceNNPersistent<cutlass_cuvs_cutlas…
+      1.5         84735944        244      347278.5      354737.5     158177      424898      49569.0  void raft::matrix::detail::select::radix::impl::radix_topk_one_block_kernel<__half, unsigned int, (…
+      0.8         43511103       4968        8758.3        2496.0       1536     1323974      70310.4  void raft::linalg::detail::sum_rows_by_key_large_nkeys_kernel_rowmajor<const float *, const unsigne…
+      0.6         31533618       4308        7319.8        7296.0       7136        7936         85.1  void cutlass_cuvs_cutlass::Kernel<cuvs::gemm::kernel::FusedDistanceNNPersistent<cutlass_cuvs_cutlas…
+      0.5         27951137         16     1746946.1     1826728.5     482498     1866793     337626.8  ampere_sgemm_128x128_tn                                                                             
+      0.4         23254761         16     1453422.6     1489015.0     625955     1571463     222850.1  void cuvs::neighbors::ivf_pq::detail::process_and_fill_codes_kernel<(unsigned int)256, (unsigned in…
+      0.4         21665279       4692        4617.5        4576.0       4352        5695        175.3  void cub::detail::histogram::DeviceHistogramSweepKernel<cub::detail::histogram::policy_hub<unsigned…
+      0.2         10998029       8616        1276.5        1280.0       1183        1504         48.9  void raft::linalg::detail::coalescedSumThinKernel<raft::linalg::detail::ReductionThinPolicy<(int)2,…
+      0.2          9173286         16      573330.4      608627.0      34016      616387     143858.7  void raft::linalg::detail::map_kernel<(int)4, (bool)1, float, unsigned long, void cuvs::neighbors::…
+      0.1          8054980          8     1006872.5     1054068.5     672131     1060613     135329.6  ampere_s1688gemm_fp16_128x128_ldg8_stages_32x1_tn                                                   
+      0.1          7803970         16      487748.1      514114.5      87008      517763     106879.6  void raft::linalg::detail::map_kernel<(int)4, (bool)1, float, unsigned long, void cuvs::neighbors::…
+      0.1          7122211         22      323736.9      352130.0     233569      425410      67877.7  void raft::matrix::detail::gather_kernel<raft::matrix::detail::gather_policy<(int)128, (int)8>, thr…
+      0.1          7085276         18      393626.4      272897.0      71520     1497095     386262.7  void raft::linalg::detail::coalescedSumThinKernel<raft::linalg::detail::ReductionThinPolicy<(int)32…
+      0.1          6850078          8      856259.8      899572.0     564290      906980     118175.5  void raft::linalg::detail::map_kernel<(int)8, (bool)1, __half, unsigned int, void cuvs::neighbors::…
+      0.1          6472015       4692        1379.4        1376.0       1343        1440         16.5  void raft::matrix::detail::matrixLinewiseVecColsMainKernel<float, long, (unsigned long)16, (int)256…
+      0.1          5885946         64       91967.9       94784.0      59264      110816      14798.2  void cuvs::neighbors::cagra::detail::graph::<unnamed>::kern_make_rev_graph<unsigned int>(const T1 *…
+      0.1          5851100          8      731387.5      774292.0     528675      787268      88355.5  void cutlass::Kernel2<cutlass_80_tensorop_h16816gemm_256x128_32x3_tn_align2>(T1::Params)            
+      0.1          5116006       4578        1117.5        1088.0       1055        8320        398.2  void raft::linalg::detail::map_kernel<(int)1, (bool)0, unsigned int, long, raft::compose_op<raft::c…
+      0.1          5112680        274       18659.4       16576.0      10400       57504       6536.6  void cub::detail::histogram::DeviceHistogramSweepKernel<cub::detail::histogram::policy_hub<unsigned…
+      0.1          5066884       3924        1291.3        1056.0       1023        5312        513.0  void cuvs::cluster::kmeans::detail::adjust_centers_kernel<(unsigned int)4, float, float, long, unsi…
+      0.1          4939092        384       12862.2       12832.0      12672       23072        524.1  ampere_sgemm_32x32_sliced1x4_tn                                                                     
+      0.1          4908947       4578        1072.3        1056.0       1023        2272         64.4  void cuvs::distance::detail::initBinMutexKernel<long>(cuda::__4::counting_semaphore<(cuda::std::__4…
+      0.1          4866106         15      324407.1      318274.0     315937      407490      23032.8  void cuvs::neighbors::ivf::detail::postprocess_neighbors_kernel<(int)256, long, long>(T2 *, const u…
+      0.1          4646137       4578        1014.9         992.0        928        4128        162.0  void raft::linalg::detail::map_kernel<(int)1, (bool)0, raft::KeyValuePair<long, float>, long, raft:…
+      0.1          4094753       4692         872.7         864.0        831         897         18.5  void cub::detail::histogram::DeviceHistogramInitKernel<cub::detail::histogram::policy_hub<unsigned …
+      0.1          3151214          1     3151214.0     3151214.0    3151214     3151214          0.0  void raft::matrix::detail::gather_kernel<raft::matrix::detail::gather_policy<(int)128, (int)8>, flo…
+      0.1          2943854         31       94963.0       98176.0      47008      112577      14624.9  void raft::matrix::detail::select::warpsort::block_kernel<raft::matrix::detail::select::warpsort::w…
+      0.0           890469        407        2187.9        1248.0       1215      384354      18990.0  void raft::linalg::detail::map_kernel<(int)4, (bool)1, unsigned int, long, raft::compose_op<raft::c…
+      0.0           881796         15       58786.4       56928.0      56001       88416       8212.9  void raft::linalg::detail::map_kernel<(int)4, (bool)0, float, unsigned long, raft::cast_op<float>, …
+      0.0           623299         15       41553.3       41760.0      36545       50560       3076.0  void cuvs::neighbors::ivf::detail::calc_chunk_indices_kernel<(int)32>(unsigned int, const unsigned …
+      0.0           566499         60        9441.6        8560.0       6240       12448       1965.3  void cub::detail::radix_sort::DeviceRadixSortOnesweepKernel<cub::detail::radix_sort::policy_selecto…
+      0.0           515436        384        1342.3        1344.0       1311        1377         11.3  void cuvs::spatial::knn::detail::utils::copy_selected_kernel<float, float, unsigned long, unsigned …
+      0.0           507141        270        1878.3        1728.0       1664        4224        572.4  void raft::linalg::detail::coalescedSumMediumKernel<(int)256, float, float, long, raft::sq_op, raft…
+      0.0           440099        479         918.8         928.0        895        1089         21.2  void raft::linalg::detail::map_kernel<(int)2, (bool)0, long, unsigned int, raft::const_op<long>, >(…
+      0.0           433333        276        1570.0        1568.0       1535        2239         57.0  void raft::matrix::detail::matrixLinewiseVecColsMainKernel<float, long, (unsigned long)16, (int)256…
+      0.0           368653        229        1609.8        1056.0        992        9792       1583.5  void cuvs::cluster::kmeans::detail::adjust_centers_kernel<(unsigned int)4, float, float, long, unsi…
+      0.0           313761          1      313761.0      313761.0     313761      313761          0.0  void raft::linalg::detail::map_kernel<(int)16, (bool)0, unsigned char, long, raft::const_op<unsigne…
+      0.0           278113          3       92704.3        4448.0       2656      271009     154419.0  void raft::linalg::detail::map_kernel<(int)4, (bool)0, unsigned int, long, raft::const_op<unsigned …
+      0.0           242390        276         878.2         864.0        831        1344         89.2  void cub::detail::histogram::DeviceHistogramInitKernel<cub::detail::histogram::policy_hub<unsigned …
+      0.0            85504         16        5344.0        5344.0       5216        5600        115.7  void cub::detail::merge_sort::DeviceMergeSortMergeKernel<cub::detail::merge_sort::policy_hub<long *…
+      0.0            71966         22        3271.2        3344.0       1600        4544        942.0  void cub::detail::transform::transform_kernel<cub::detail::transform::policy_selector_from_types<(b…
+      0.0            63200         15        4213.3        4320.0       3776        4480        279.2  void cub::detail::radix_sort::DeviceRadixSortHistogramKernel<cub::detail::radix_sort::policy_select…
+      0.0            57759         16        3609.9        3664.0       2816        4320        478.4  void cub::detail::merge_sort::DeviceMergeSortPartitionKernel<long *, unsigned long long, raft::less…
+      0.0            43073          2       21536.5       21536.5      21472       21601         91.2  void cub::detail::merge_sort::DeviceMergeSortBlockSortKernel<cub::detail::merge_sort::policy_hub<lo…
+      0.0            27904          1       27904.0       27904.0      27904       27904          0.0  ampere_sgemm_64x32_sliced1x4_tn                                                                     
+      0.0            26945         15        1796.3        1792.0       1536        1952         92.8  void raft::linalg::detail::map_kernel<(int)4, (bool)1, unsigned int, unsigned int, raft::identity_o…
+      0.0            22147         15        1476.5        1504.0       1249        1536         88.6  void cub::detail::radix_sort::DeviceRadixSortExclusiveSumKernel<cub::detail::radix_sort::policy_sel…
+      0.0            21280          2       10640.0       10640.0      10528       10752        158.4  void cub::detail::histogram::DeviceHistogramSweepKernel<cub::detail::histogram::policy_hub<unsigned…
+      0.0            18852         21         897.7         896.0        864         928         15.9  void raft::linalg::detail::map_kernel<(int)1, (bool)0, long, unsigned int, raft::const_op<long>, >(…
+      0.0            11392          1       11392.0       11392.0      11392       11392          0.0  void raft::stats::detail::smemHistKernel<unsigned int, raft::stats::IdentityBinner<unsigned int, lo…
+      0.0            10368          1       10368.0       10368.0      10368       10368          0.0  void cub::detail::radix_sort::DeviceRadixSortSingleTileKernel<cub::detail::radix_sort::policy_selec…
+      0.0             8415          2        4207.5        4207.5       3807        4608        566.4  void raft::linalg::detail::map_kernel<(int)4, (bool)0, __half, unsigned long, raft::cast_op<__half>…
+      0.0             7808          1        7808.0        7808.0       7808        7808          0.0  void cub::detail::unique_by_key::DeviceUniqueByKeySweepKernel<cub::detail::unique_by_key::policy_hu…
+      0.0             4960          1        4960.0        4960.0       4960        4960          0.0  void raft::random::detail::rngKernel<(int)1, long, unsigned long, raft::random::detail::PCGenerator…
+      0.0             3616          1        3616.0        3616.0       3616        3616          0.0  void raft::linalg::detail::map_kernel<(int)2, (bool)0, long, unsigned long, raft::const_op<long>, >…
+      0.0             2688          1        2688.0        2688.0       2688        2688          0.0  void raft::linalg::detail::map_kernel<(int)2, (bool)1, long, long, raft::identity_op, >(T3 *, T4, T…
+      0.0             2144          1        2144.0        2144.0       2144        2144          0.0  void raft::linalg::detail::coalescedSumMediumKernel<(int)256, float, float, unsigned int, raft::sq_…
+      0.0             2144          1        2144.0        2144.0       2144        2144          0.0  void raft::linalg::detail::map_kernel<(int)4, (bool)1, float, unsigned int, cuvs::neighbors::ivf_pq…
+      0.0             1664          1        1664.0        1664.0       1664        1664          0.0  void raft::linalg::detail::map_kernel<(int)4, (bool)1, float, long, void cuvs::neighbors::ivf_pq::d…
+      0.0             1183          1        1183.0        1183.0       1183        1183          0.0  void raft::linalg::detail::map_kernel<(int)1, (bool)0, unsigned long, int, raft::const_op<unsigned …
+      0.0             1024          1        1024.0        1024.0       1024        1024          0.0  void raft::linalg::detail::map_kernel<(int)1, (bool)0, unsigned int, unsigned int, raft::add_op, un…
+      0.0              928          1         928.0         928.0        928         928          0.0  void cub::detail::scan::DeviceCompactInitKernel<cub::ScanTileState<unsigned long long, (bool)1>, lo…
+
+[6/7] Executing 'cuda_gpu_mem_time_sum' stats report
+
+ Time (%)  Total Time (ns)  Count  Avg (ns)  Med (ns)  Min (ns)  Max (ns)   StdDev (ns)               Operation              
+ --------  ---------------  -----  --------  --------  --------  ---------  -----------  ------------------------------------
+     50.8        411142741   4169   98619.0    1120.0      1087  132574933    3041724.9  [CUDA memcpy Device-to-Host]        
+     47.9        387675450   5221   74253.1     992.0       352  269144097    3842720.1  [CUDA memcpy Host-to-Device]        
+      1.1          9144404   9641     948.5     992.0       352       1920        199.3  [CUDA memset]                       
+      0.1           418749    157    2667.2    1344.0      1183      26272       3474.7  [CUDA memcpy Unified Device-to-Host]
+      0.0           384659    134    2870.6    2367.0      1727       6432       1302.8  [CUDA memcpy Unified Host-to-Device]
+      0.0            36352     28    1298.3    1056.0      1024       3744        656.1  [CUDA memcpy Device-to-Device]      
+
+[7/7] Executing 'cuda_gpu_mem_size_sum' stats report
+
+ Total (MB)  Count  Avg (MB)  Med (MB)  Min (MB)  Max (MB)  StdDev (MB)               Operation              
+ ----------  -----  --------  --------  --------  --------  -----------  ------------------------------------
+   4864.041   5221     0.932     0.000     0.000  3072.000       45.091  [CUDA memcpy Host-to-Device]        
+   2572.039   4169     0.617     0.000     0.000   269.484       12.647  [CUDA memcpy Device-to-Host]        
+    135.647   9641     0.014     0.016     0.000     1.552        0.060  [CUDA memset]                       
+      7.281     28     0.260     0.075     0.002     2.667        0.610  [CUDA memcpy Device-to-Device]      
+      6.423    157     0.041     0.004     0.004     0.655        0.092  [CUDA memcpy Unified Device-to-Host]
+      4.456    134     0.033     0.020     0.004     0.127        0.035  [CUDA memcpy Unified Host-to-Device]
+
+Generated:
+    /home/ubuntu/index-accel-validation/peak-profiles/ivf_pq.nsys-rep
+    /home/ubuntu/index-accel-validation/peak-profiles/ivf_pq.sqlite

@@ -1,0 +1,99 @@
+[
+  {
+    "itopk_size": 64,
+    "path": "batch",
+    "observed_modes": [
+      "single_cta"
+    ],
+    "cagra_kernel_count": 1,
+    "kernel_names": [
+      "void cuvs::neighbors::cagra::detail::single_cta_search::search_kernel<(bool)1, (bool)0, cuvs::neighbors::cagra::detail::dataset_descriptor_base_t<float, unsigned int, float>, unsigned int, cuvs::neighbors::filtering::none_sample_filter>(unsigned long, T3::DISTANCE_T *, unsigned int, const T3*, const T3::DATA_T *, const T3::INDEX_T *, unsigned int, const T4 *, unsigned int, unsigned long, const T3::INDEX_T *, unsigned int, T3::INDEX_T *, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int *, unsigned int, unsigned int, unsigned int, T5)"
+    ]
+  },
+  {
+    "itopk_size": 64,
+    "path": "single",
+    "observed_modes": [
+      "multi_cta"
+    ],
+    "cagra_kernel_count": 4,
+    "kernel_names": [
+      "void cuvs::neighbors::cagra::detail::kern_topk_cta_11<(int)8, (int)2, (int)64, (int)32, unsigned int>(unsigned int, unsigned int, unsigned int, const unsigned int *, unsigned int, const T5 *, unsigned int, unsigned int *, unsigned int, T5 *, unsigned int, unsigned char *, unsigned int *, bool)",
+      "void cuvs::neighbors::cagra::detail::multi_cta_search::search_kernel<cuvs::neighbors::cagra::detail::dataset_descriptor_base_t<float, unsigned int, float>, unsigned int, cuvs::neighbors::filtering::none_sample_filter>(T1::INDEX_T *, T1::DISTANCE_T *, const T1*, const T1::DATA_T *, const T1::INDEX_T *, unsigned int, unsigned int, const T2 *, unsigned int, unsigned long, const T1::INDEX_T *, unsigned int, unsigned int, T1::INDEX_T *, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int *, T3)",
+      "void cuvs::neighbors::cagra::detail::multi_cta_search::set_value_batch_kernel<unsigned int>(T1 *, unsigned long, T1, unsigned long, unsigned long)",
+      "void cuvs::neighbors::cagra::detail::standard_dataset_descriptor_init_kernel<(cuvs::distance::DistanceType)0, (unsigned int)32, (unsigned int)512, float, unsigned int, float>(cuvs::neighbors::cagra::detail::dataset_descriptor_base_t<T4, T5, T6> *, const T4 *, T5, unsigned int, unsigned int, const T6 *)"
+    ]
+  },
+  {
+    "itopk_size": 128,
+    "path": "batch",
+    "observed_modes": [
+      "single_cta"
+    ],
+    "cagra_kernel_count": 1,
+    "kernel_names": [
+      "void cuvs::neighbors::cagra::detail::single_cta_search::search_kernel<(bool)1, (bool)0, cuvs::neighbors::cagra::detail::dataset_descriptor_base_t<float, unsigned int, float>, unsigned int, cuvs::neighbors::filtering::none_sample_filter>(unsigned long, T3::DISTANCE_T *, unsigned int, const T3*, const T3::DATA_T *, const T3::INDEX_T *, unsigned int, const T4 *, unsigned int, unsigned long, const T3::INDEX_T *, unsigned int, T3::INDEX_T *, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int *, unsigned int, unsigned int, unsigned int, T5)"
+    ]
+  },
+  {
+    "itopk_size": 128,
+    "path": "single",
+    "observed_modes": [
+      "multi_cta"
+    ],
+    "cagra_kernel_count": 3,
+    "kernel_names": [
+      "void cuvs::neighbors::cagra::detail::kern_topk_cta_11<(int)8, (int)2, (int)64, (int)32, unsigned int>(unsigned int, unsigned int, unsigned int, const unsigned int *, unsigned int, const T5 *, unsigned int, unsigned int *, unsigned int, T5 *, unsigned int, unsigned char *, unsigned int *, bool)",
+      "void cuvs::neighbors::cagra::detail::multi_cta_search::search_kernel<cuvs::neighbors::cagra::detail::dataset_descriptor_base_t<float, unsigned int, float>, unsigned int, cuvs::neighbors::filtering::none_sample_filter>(T1::INDEX_T *, T1::DISTANCE_T *, const T1*, const T1::DATA_T *, const T1::INDEX_T *, unsigned int, unsigned int, const T2 *, unsigned int, unsigned long, const T1::INDEX_T *, unsigned int, unsigned int, T1::INDEX_T *, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int *, T3)",
+      "void cuvs::neighbors::cagra::detail::multi_cta_search::set_value_batch_kernel<unsigned int>(T1 *, unsigned long, T1, unsigned long, unsigned long)"
+    ]
+  },
+  {
+    "itopk_size": 256,
+    "path": "batch",
+    "observed_modes": [
+      "single_cta"
+    ],
+    "cagra_kernel_count": 1,
+    "kernel_names": [
+      "void cuvs::neighbors::cagra::detail::single_cta_search::search_kernel<(bool)1, (bool)0, cuvs::neighbors::cagra::detail::dataset_descriptor_base_t<float, unsigned int, float>, unsigned int, cuvs::neighbors::filtering::none_sample_filter>(unsigned long, T3::DISTANCE_T *, unsigned int, const T3*, const T3::DATA_T *, const T3::INDEX_T *, unsigned int, const T4 *, unsigned int, unsigned long, const T3::INDEX_T *, unsigned int, T3::INDEX_T *, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int *, unsigned int, unsigned int, unsigned int, T5)"
+    ]
+  },
+  {
+    "itopk_size": 256,
+    "path": "single",
+    "observed_modes": [
+      "multi_cta"
+    ],
+    "cagra_kernel_count": 3,
+    "kernel_names": [
+      "void cuvs::neighbors::cagra::detail::kern_topk_cta_11<(int)8, (int)2, (int)64, (int)32, unsigned int>(unsigned int, unsigned int, unsigned int, const unsigned int *, unsigned int, const T5 *, unsigned int, unsigned int *, unsigned int, T5 *, unsigned int, unsigned char *, unsigned int *, bool)",
+      "void cuvs::neighbors::cagra::detail::multi_cta_search::search_kernel<cuvs::neighbors::cagra::detail::dataset_descriptor_base_t<float, unsigned int, float>, unsigned int, cuvs::neighbors::filtering::none_sample_filter>(T1::INDEX_T *, T1::DISTANCE_T *, const T1*, const T1::DATA_T *, const T1::INDEX_T *, unsigned int, unsigned int, const T2 *, unsigned int, unsigned long, const T1::INDEX_T *, unsigned int, unsigned int, T1::INDEX_T *, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int *, T3)",
+      "void cuvs::neighbors::cagra::detail::multi_cta_search::set_value_batch_kernel<unsigned int>(T1 *, unsigned long, T1, unsigned long, unsigned long)"
+    ]
+  },
+  {
+    "itopk_size": 512,
+    "path": "batch",
+    "observed_modes": [
+      "single_cta"
+    ],
+    "cagra_kernel_count": 1,
+    "kernel_names": [
+      "void cuvs::neighbors::cagra::detail::single_cta_search::search_kernel<(bool)1, (bool)1, cuvs::neighbors::cagra::detail::dataset_descriptor_base_t<float, unsigned int, float>, unsigned int, cuvs::neighbors::filtering::none_sample_filter>(unsigned long, T3::DISTANCE_T *, unsigned int, const T3*, const T3::DATA_T *, const T3::INDEX_T *, unsigned int, const T4 *, unsigned int, unsigned long, const T3::INDEX_T *, unsigned int, T3::INDEX_T *, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int *, unsigned int, unsigned int, unsigned int, T5)"
+    ]
+  },
+  {
+    "itopk_size": 512,
+    "path": "single",
+    "observed_modes": [
+      "multi_cta"
+    ],
+    "cagra_kernel_count": 3,
+    "kernel_names": [
+      "void cuvs::neighbors::cagra::detail::kern_topk_cta_11<(int)8, (int)2, (int)64, (int)32, unsigned int>(unsigned int, unsigned int, unsigned int, const unsigned int *, unsigned int, const T5 *, unsigned int, unsigned int *, unsigned int, T5 *, unsigned int, unsigned char *, unsigned int *, bool)",
+      "void cuvs::neighbors::cagra::detail::multi_cta_search::search_kernel<cuvs::neighbors::cagra::detail::dataset_descriptor_base_t<float, unsigned int, float>, unsigned int, cuvs::neighbors::filtering::none_sample_filter>(T1::INDEX_T *, T1::DISTANCE_T *, const T1*, const T1::DATA_T *, const T1::INDEX_T *, unsigned int, unsigned int, const T2 *, unsigned int, unsigned long, const T1::INDEX_T *, unsigned int, unsigned int, T1::INDEX_T *, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int *, T3)",
+      "void cuvs::neighbors::cagra::detail::multi_cta_search::set_value_batch_kernel<unsigned int>(T1 *, unsigned long, T1, unsigned long, unsigned long)"
+    ]
+  }
+]

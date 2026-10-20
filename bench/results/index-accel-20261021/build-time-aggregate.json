@@ -1,0 +1,35 @@
+{
+  "candidate_mb": 512,
+  "unbounded_pool": true,
+  "wallclock_ratio_pool0_over_pool_on": 1.0275046235036716,
+  "rows": [
+    {
+      "pool_mb": 0,
+      "N": 3,
+      "create_index_seconds_mean": 46.44274841266633,
+      "create_index_seconds_std": 0.4713037011643518,
+      "index_vram_estimate_bytes_mean": 3328000000,
+      "index_vram_estimate_bytes_std": 0.0,
+      "all_index_vram_estimate_bytes_mean": 3328000000,
+      "all_index_vram_estimate_bytes_std": 0.0,
+      "nvidia_smi_used_mib_mean": 3779.0,
+      "nvidia_smi_used_mib_std": 0.0,
+      "physical_minus_logical_bytes_mean": 634568704,
+      "physical_minus_logical_bytes_std": 0.0
+    },
+    {
+      "pool_mb": 512,
+      "N": 3,
+      "create_index_seconds_mean": 45.199551759000315,
+      "create_index_seconds_std": 0.8207982403539706,
+      "index_vram_estimate_bytes_mean": 3328000000,
+      "index_vram_estimate_bytes_std": 0.0,
+      "all_index_vram_estimate_bytes_mean": 3328000000,
+      "all_index_vram_estimate_bytes_std": 0.0,
+      "nvidia_smi_used_mib_mean": 14371.0,
+      "nvidia_smi_used_mib_std": 0.0,
+      "physical_minus_logical_bytes_mean": 11741085696,
+      "physical_minus_logical_bytes_std": 0.0
+    }
+  ]
+}
