@@ -14,6 +14,23 @@
 #include <stddef.h>
 #include <stdbool.h>
 
+/* Strict daemon CLI parser: MiB, 0=disabled, bounded for size_t and the
+ * read-only integer GUC reporting the applied setting. Returns 0 on success. */
+#ifdef __cplusplus
+extern "C" {
+#endif
+int cuvs_parse_rmm_pool_mb(const char *value, uint32_t *mb_out);
+int cuvs_parse_rmm_pool_percent(const char *value, uint32_t *percent_out);
+
+/* Pool quota is aligned to RMM's 256-byte allocation boundary. A zero quota
+ * in the headroom helper means the legacy, unpooled path. */
+size_t cuvs_rmm_pool_max_bytes(size_t total_bytes, uint32_t percent);
+size_t cuvs_rmm_pool_headroom(size_t physical_free, size_t async_reclaimable,
+                              size_t quota, size_t reserved, size_t used);
+#ifdef __cplusplus
+}
+#endif
+
 /* ----------------------------------------------------------------
  * Leveled logging macros (PG-free; stderr only).
  *

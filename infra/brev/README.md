@@ -64,6 +64,35 @@ lists the index, and queries fall back to a seq scan without erroring. Rebuild w
 REINDEX or give the index its own persistent `index_dir`; see the `IDX` comment in
 `bootstrap.sh`. On a long-lived host, also watch for `systemd-tmpfiles` reaping it.
 
+### RMM pool and upstream quota
+
+The GPU daemon defaults to an initial 512 MiB pool per allowed GPU, with an
+upstream quota of 50% of total CUDA memory. To override the initial reservation
+and quota during bootstrap:
+
+```bash
+ssh <name> 'RMM_POOL_MB=1024 RMM_POOL_MAX_PERCENT=50 bash ~/bootstrap.sh'
+```
+
+The generated unit reads `/etc/default/pg-cuvs-server`. To compare pool disabled
+and enabled on an instance assigned to this benchmark, set `RMM_POOL_MB=0` or
+`RMM_POOL_MB=512` in that file and restart the daemon using `make gpu-reload`
+or `sudo systemctl restart pg-cuvs-server`. A directly launched daemon receives
+the same settings through `make gpu-server-start RMM_POOL_MB=512 RMM_POOL_MAX_PERCENT=50`.
+Explicit `RMM_POOL_MB=0` keeps the legacy allocator. CPU shim builds default to zero.
+
+Record the **applied** values with `SHOW cuvs.rmm_pool_mb`,
+`SHOW cuvs.rmm_pool_max_percent`, and `SHOW cuvs.rmm_pool_status` in run metadata. Status is
+read-only: SQL SET cannot replace a live allocator. `unavailable` means the
+daemon did not return a compatible status, and must not be recorded as zero.
+The JSON reports each GPU's maximum, reserved and used pool bytes. The pool grows
+through an upstream quota without changing the SDK's doubling policy. Admission
+adds reusable pool bytes and limits new growth by that quota. The existing
+`--max-vram-mb` logical index budget remains separate, and `vram_bytes` excludes
+unused pool reservation. Direct CUDA/managed allocations and context memory can
+bypass RMM; also record `nvidia-smi memory.used`. Allocator creation failure stops
+daemon startup rather than silently running without the pool.
+
 ## What survives a delete (and what doesn't)
 
 | Asset | Survives delete? | Recovery |
