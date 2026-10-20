@@ -1,0 +1,1651 @@
+diff --git a/cpp/src/neighbors/cagra.cpp b/cpp/src/neighbors/cagra.cpp
+index 6aa5737..a58f3db 100644
+--- a/cpp/src/neighbors/cagra.cpp
++++ b/cpp/src/neighbors/cagra.cpp
+@@ -8,6 +8,12 @@
+ 
+ #include <cuvs/neighbors/common.hpp>
+ 
++extern "C" __attribute__((visibility("default"))) const char*
++pgcuvs_hnsw_memory_guard_patch_id()
++{
++  return "pgcuvs-hnsw-memory-guard-v2@60b19a0f62ba0bd716de349382828e43be6e2daa";
++}
++
+ namespace cuvs::neighbors::cagra {
+ 
+ inline auto graph_params_heuristic(raft::matrix_extent<int64_t> dataset,
+@@ -38,6 +44,7 @@ cagra::index_params index_params::from_hnsw_params(raft::matrix_extent<int64_t>
+                                                    cuvs::distance::DistanceType metric)
+ {
+   cagra::index_params params;
++  params.metric = metric;
+   switch (heuristic) {
+     case hnsw_heuristic_type::SAME_GRAPH_FOOTPRINT:
+       params.graph_degree              = M * 2;
+diff --git a/cpp/src/neighbors/detail/cagra/ace_memory_guard.hpp b/cpp/src/neighbors/detail/cagra/ace_memory_guard.hpp
+new file mode 100644
+index 0000000..79062d2
+--- /dev/null
++++ b/cpp/src/neighbors/detail/cagra/ace_memory_guard.hpp
+@@ -0,0 +1,195 @@
++/*
++ * SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION.
++ * SPDX-License-Identifier: Apache-2.0
++ */
++
++#pragma once
++
++#include <algorithm>
++#include <cmath>
++#include <cstddef>
++#include <cstdint>
++#include <initializer_list>
++#include <limits>
++#include <optional>
++#include <utility>
++#include <stdexcept>
++#include <string>
++
++namespace cuvs::neighbors::cagra::detail::memory_guard {
++
++inline size_t checked_add(size_t lhs, size_t rhs)
++{
++  if (rhs > std::numeric_limits<size_t>::max() - lhs) {
++    throw std::overflow_error("memory guard byte-count addition overflow");
++  }
++  return lhs + rhs;
++}
++
++inline size_t checked_mul(size_t lhs, size_t rhs)
++{
++  if (lhs != 0 && rhs > std::numeric_limits<size_t>::max() / lhs) {
++    throw std::overflow_error("memory guard byte-count multiplication overflow");
++  }
++  return lhs * rhs;
++}
++
++inline size_t checked_sum(std::initializer_list<size_t> values)
++{
++  size_t result = 0;
++  for (auto value : values) { result = checked_add(result, value); }
++  return result;
++}
++
++template <typename VectorType>
++inline size_t reorder_metadata_with_ends(size_t vector_metadata_bytes)
++{
++  return checked_sum({vector_metadata_bytes,
++                      checked_mul(size_t{2}, sizeof(size_t)),
++                      checked_mul(size_t{2}, sizeof(VectorType))});
++}
++
++inline size_t matrix_bytes(size_t rows, size_t cols, size_t element_bytes)
++{
++  return checked_mul(checked_mul(rows, cols), element_bytes);
++}
++
++inline size_t checked_scale(size_t value, double factor)
++{
++  if (!std::isfinite(factor) || factor < 0) {
++    throw std::invalid_argument("memory guard scale must be finite and nonnegative");
++  }
++  const long double scaled = static_cast<long double>(value) * factor;
++  const long double address_space_limit =
++    std::ldexp(1.0L, std::numeric_limits<size_t>::digits);
++  if (scaled >= address_space_limit) {
++    throw std::overflow_error("memory guard scaled byte count overflow");
++  }
++  return static_cast<size_t>(scaled);
++}
++
++inline std::optional<size_t> budget_bytes_from_gib(double gib)
++{
++  if (!std::isfinite(gib)) { throw std::invalid_argument("memory budget must be finite"); }
++  if (gib < 0) { throw std::invalid_argument("memory budget must not be negative"); }
++  if (gib == 0) { return std::nullopt; }
++
++  constexpr long double bytes_per_gib = 1024.0L * 1024.0L * 1024.0L;
++  const long double bytes = static_cast<long double>(gib) * bytes_per_gib;
++  const long double address_space_limit =
++    std::ldexp(1.0L, std::numeric_limits<size_t>::digits);
++  if (bytes < 1.0L || bytes >= address_space_limit) {
++    throw std::overflow_error("memory budget GiB value cannot be represented in bytes");
++  }
++  return static_cast<size_t>(bytes);
++}
++
++inline void require_within(const char* stage, size_t required, size_t budget)
++{
++  if (required > budget) {
++    throw std::length_error(std::string("memory guard: ") + stage + " requires " +
++                            std::to_string(required) + " bytes; budget is " +
++                            std::to_string(budget) + " bytes");
++  }
++}
++
++inline void require_within(const char* stage,
++                           size_t required,
++                           const std::optional<size_t>& budget)
++{
++  if (budget) { require_within(stage, required, *budget); }
++}
++
++inline size_t round_up(size_t value, size_t alignment)
++{
++  if (alignment == 0) { throw std::invalid_argument("memory guard alignment must be positive"); }
++  const size_t remainder = value % alignment;
++  return remainder == 0 ? value : checked_add(value, alignment - remainder);
++}
++
++inline size_t nn_descent_extended_degree(size_t degree)
++{
++  if (degree <= 32) { return round_up(degree, 32); }
++  return round_up(checked_mul(degree, size_t{13}) / 10, 32);
++}
++
++inline std::pair<size_t, size_t> nn_descent_workspace_bytes(size_t rows,
++                                                            size_t dim,
++                                                            size_t output_degree)
++{
++  if (rows == 0 || output_degree == 0) { return {0, 0}; }
++  const size_t graph_degree = nn_descent_extended_degree(output_degree);
++  const size_t internal_input = std::min(rows - 1, checked_mul(output_degree, size_t{2}));
++  const size_t internal_degree = nn_descent_extended_degree(internal_input);
++  // cuVS 26.04 NN-descent has seven N x NUM_SAMPLES host arrays (7*32*int),
++  // two N x int2 list-size arrays (2*8), and init_random_graph's N-int rand_seq
++  // in the worst one-segment case, totaling 916 bytes per row.
++  // Its host graph and distance arrays add two extended-degree float rows;
++  // the BloomFilter adds (512 bits / 32) * internal_degree = 2*internal_degree bytes.
++  const size_t per_row_host = checked_sum({
++    checked_mul(graph_degree, size_t{2 * sizeof(float)}),
++    size_t{912 + sizeof(uint32_t)},
++    checked_mul(internal_degree, size_t{2})});
++  // Device graph/distance rows (2*32*4), locks (4), two int2 sizes (16),
++  // and optional L2 norms (4) total 280. The returned device index also holds
++  // output_degree uint32 neighbors per row; float input staging costs at most 4*dim.
++  const size_t per_row_gpu = checked_sum({size_t{280},
++                                          checked_mul(output_degree, sizeof(uint32_t)),
++                                          checked_mul(dim, sizeof(float))});
++  return {checked_mul(rows, per_row_host), checked_mul(rows, per_row_gpu)};
++}
++
++inline bool hnsw_upper_level_uses_nn_descent(size_t rows,
++                                             size_t degree,
++                                             bool has_memory_budget)
++{
++  constexpr size_t nn_descent_neighbor_element_threshold = 10'000'000;
++  return checked_mul(rows, degree) < nn_descent_neighbor_element_threshold || has_memory_budget;
++}
++
++inline size_t hnsw_serializer_host_peak_bytes(size_t fixed_host_arrays_bytes,
++                                             size_t upper_builder_workspace_bytes,
++                                             size_t batch_bytes)
++{
++  return checked_sum(
++    {fixed_host_arrays_bytes, upper_builder_workspace_bytes, batch_bytes});
++}
++
++inline size_t hnsw_serializer_builder_host_budget(size_t host_budget_bytes,
++                                                  size_t fixed_host_arrays_bytes,
++                                                  size_t batch_bytes)
++{
++  const size_t live_bytes = checked_add(fixed_host_arrays_bytes, batch_bytes);
++  if (live_bytes > host_budget_bytes) {
++    throw std::length_error("memory guard: HNSW serializer live arrays exceed the host budget");
++  }
++  return host_budget_bytes - live_bytes;
++}
++
++inline size_t hnsw_order_arrays_bytes(size_t n_rows)
++{
++  constexpr size_t bytes_per_row = 2 * sizeof(size_t) + sizeof(int);
++  return checked_mul(n_rows, bytes_per_row);
++}
++
++inline size_t reorder_rows_per_buffer(size_t n_partitions,
++                                      size_t vector_bytes,
++                                      size_t budget_bytes,
++                                      size_t max_buffer_bytes = 64 * 1024 * 1024,
++                                      size_t minimum_rows      = 64)
++{
++  if (n_partitions == 0 || vector_bytes == 0 || minimum_rows == 0) {
++    throw std::invalid_argument("reorder buffer dimensions must be positive");
++  }
++
++  const size_t bytes_per_row_across_buffers = checked_mul(checked_mul(2, n_partitions), vector_bytes);
++  const size_t allowed_rows                 = budget_bytes / bytes_per_row_across_buffers;
++  if (allowed_rows < minimum_rows) {
++    throw std::length_error("memory guard: reorder buffers cannot fit the minimum row count");
++  }
++
++  const size_t max_rows = std::max(minimum_rows, max_buffer_bytes / vector_bytes);
++  return std::min(allowed_rows, max_rows);
++}
++
++}  // namespace cuvs::neighbors::cagra::detail::memory_guard
+diff --git a/cpp/src/neighbors/detail/cagra/cagra_build.cuh b/cpp/src/neighbors/detail/cagra/cagra_build.cuh
+index f433a45..3e75ebf 100644
+--- a/cpp/src/neighbors/detail/cagra/cagra_build.cuh
++++ b/cpp/src/neighbors/detail/cagra/cagra_build.cuh
+@@ -15,6 +15,7 @@
+ #include <raft/core/host_device_accessor.hpp>
+ #include <raft/core/host_mdarray.hpp>
+ #include <raft/core/host_mdspan.hpp>
++#include <raft/core/kvp.hpp>
+ #include <raft/core/logger.hpp>
+ #include <raft/core/resource/cuda_stream.hpp>
+ #include <raft/util/integer_utils.hpp>
+@@ -30,9 +31,14 @@
+ 
+ // TODO: This shouldn't be calling spatial/knn APIs
+ #include "../ann_utils.cuh"
++#include "ace_memory_guard.hpp"
+ 
+ #include <rmm/resource_ref.hpp>
+ 
++#if defined(_OPENMP)
++#include <omp.h>
++#endif
++
+ #include <chrono>
+ #include <cstdio>
+ #include <filesystem>
+@@ -79,14 +85,23 @@ void ace_get_partition_labels(
+   raft::host_matrix_view<IdxT, int64_t, raft::row_major> partition_labels,
+   raft::host_matrix_view<IdxT, int64_t, raft::row_major> partition_histogram,
+   size_t min_partition_size,
++  const std::optional<size_t>& host_budget = std::nullopt,
++  const std::optional<size_t>& gpu_budget  = std::nullopt,
+   double sampling_rate = 0.01)
+ {
++  using memory_guard::checked_add;
++  using memory_guard::checked_mul;
++  using memory_guard::checked_sum;
++  using memory_guard::matrix_bytes;
++  using memory_guard::require_within;
+   size_t dataset_size = dataset.extent(0);
+   size_t dataset_dim  = dataset.extent(1);
+   size_t labels_size  = partition_labels.extent(0);
+   size_t labels_dim   = partition_labels.extent(1);
+   RAFT_EXPECTS(dataset_size == labels_size, "Dataset size must match partition labels extent");
+   size_t n_partitions = partition_histogram.extent(0);
++  RAFT_EXPECTS(n_partitions <= static_cast<size_t>(std::numeric_limits<uint32_t>::max()),
++               "ACE partition count exceeds balanced k-means label capacity");
+   RAFT_EXPECTS(labels_dim == 2, "Labels must have 2 columns");
+   RAFT_EXPECTS(partition_histogram.extent(1) == 2, "Partition histogram must have 2 columns");
+   cudaStream_t stream = raft::resource::get_cuda_stream(res);
+@@ -95,11 +110,121 @@ void ace_get_partition_labels(
+   // raft::matrix::sample_rows to minimize GPU memory usage.
+   // TODO(julianmi): Switch to sample_rows when https://github.com/rapidsai/cuvs/issues/1461 is
+   // addressed.
+-  size_t n_samples         = dataset_size * sampling_rate;
+-  const size_t min_samples = 100 * n_partitions;
+-  n_samples                = std::max(n_samples, min_samples);
+-  n_samples                = std::min(n_samples, dataset_size);
++  const long double requested_samples = static_cast<long double>(dataset_size) * sampling_rate;
++  RAFT_EXPECTS(std::isfinite(static_cast<double>(requested_samples)) && requested_samples >= 0 &&
++                 requested_samples <= static_cast<long double>(std::numeric_limits<size_t>::max()),
++               "ACE: sample count is not representable");
++  size_t n_samples = static_cast<size_t>(requested_samples);
++  const size_t min_samples = checked_mul(size_t{100}, n_partitions);
++  n_samples = std::min(std::max(n_samples, min_samples), dataset_size);
+   RAFT_LOG_DEBUG("ACE: n_samples: %lu", n_samples);
++  RAFT_EXPECTS(n_samples <= 1 || dataset_size <=
++                 std::numeric_limits<size_t>::max() / (n_samples - 1),
++               "ACE sampling row index multiplication overflows");
++
++  const size_t sample_bytes = matrix_bytes(n_samples, dataset_dim, sizeof(float));
++  const size_t centroid_bytes = matrix_bytes(n_partitions, dataset_dim, sizeof(float));
++  const size_t live_host_bytes = checked_add(
++    matrix_bytes(partition_labels.extent(0), partition_labels.extent(1), sizeof(IdxT)),
++    matrix_bytes(partition_histogram.extent(0), partition_histogram.extent(1), sizeof(IdxT)));
++  cuvs::cluster::kmeans::balanced_params kmeans_params;
++
++  // Source-derived explicit workspace from balanced k-means build_hierarchical(): dataset norms,
++  // coarse labels/sizes/centers, bounded fine-cluster buffers, and final labels/sizes.
++  const size_t n_mesoclusters = std::min<size_t>(
++    n_partitions, static_cast<size_t>(std::sqrt(static_cast<double>(n_partitions)) + 0.5));
++  const size_t max_meso_rows = std::min(
++    n_samples,
++    checked_add(checked_mul(size_t{2}, n_samples), n_mesoclusters - 1) / n_mesoclusters);
++  // The sample and centroid mdspans are explicitly int64_t, so balanced k-means
++  // selects its uint64_t histogram counters independently of the CAGRA index type.
++  const size_t counter_bytes = sizeof(uint64_t);
++  const size_t meso_labels_bytes = matrix_bytes(n_samples, 1, sizeof(uint32_t));
++  const size_t meso_sizes_bytes = matrix_bytes(n_mesoclusters, 1, counter_bytes);
++  const size_t meso_centers_bytes = matrix_bytes(n_mesoclusters, dataset_dim, sizeof(float));
++  const size_t fine_rows_bytes = checked_sum(
++    {matrix_bytes(max_meso_rows, 1, sizeof(int64_t)),
++     matrix_bytes(max_meso_rows, dataset_dim, sizeof(float)),
++     matrix_bytes(max_meso_rows, 1, sizeof(float)),
++     matrix_bytes(max_meso_rows, 1, sizeof(uint32_t)),
++     matrix_bytes(n_partitions, dataset_dim, sizeof(float)),
++     matrix_bytes(n_partitions, 1, counter_bytes)});
++  const size_t final_kmeans_bytes = checked_sum(
++    {matrix_bytes(n_partitions, 1, counter_bytes),
++     matrix_bytes(n_samples, 1, sizeof(uint32_t))});
++  auto predict_workspace_bytes = [&](size_t rows, size_t clusters) {
++    size_t source_bytes_per_row = 0;
++    size_t actual_bytes_per_row = 0;
++    size_t additional_bytes = 0;
++    switch (kmeans_params.metric) {
++      case cuvs::distance::DistanceType::L2Expanded:
++      case cuvs::distance::DistanceType::L2SqrtExpanded:
++        source_bytes_per_row = checked_add(sizeof(int), sizeof(raft::KeyValuePair<int64_t, float>));
++        actual_bytes_per_row = source_bytes_per_row;
++        additional_bytes = matrix_bytes(clusters, 1, sizeof(float));
++        break;
++      case cuvs::distance::DistanceType::CosineExpanded:
++        source_bytes_per_row = matrix_bytes(clusters, 1, sizeof(float));
++        actual_bytes_per_row = checked_add(sizeof(int), sizeof(raft::KeyValuePair<int64_t, float>));
++        additional_bytes = matrix_bytes(clusters, 1, sizeof(float));
++        break;
++      case cuvs::distance::DistanceType::InnerProduct:
++        source_bytes_per_row = matrix_bytes(clusters, 1, sizeof(float));
++        actual_bytes_per_row = source_bytes_per_row;
++        break;
++      default:
++        RAFT_EXPECTS(false, "ACE balanced k-means metric has no bounded prediction workspace");
++    }
++    const size_t quotient = (size_t{1} << 30) / source_bytes_per_row;
++    const size_t max_batch_rows = checked_mul(checked_add(quotient, size_t{63}) / 64, size_t{64});
++    RAFT_EXPECTS(max_batch_rows > 0,
++                 "ACE balanced k-means prediction batch size is unsupported");
++    const size_t batch_rows = std::min(rows, max_batch_rows);
++    return checked_add(matrix_bytes(batch_rows, 1, actual_bytes_per_row), additional_bytes);
++  };
++  const size_t coarse_prediction_bytes = predict_workspace_bytes(n_samples, n_mesoclusters);
++  const size_t fine_prediction_bytes = predict_workspace_bytes(max_meso_rows, n_partitions);
++  const size_t final_prediction_bytes = predict_workspace_bytes(n_samples, n_partitions);
++  const size_t kmeans_gpu_workspace = checked_sum(
++    {matrix_bytes(n_samples, 1, sizeof(float)), meso_labels_bytes, meso_sizes_bytes,
++     std::max({checked_add(meso_centers_bytes, coarse_prediction_bytes),
++               checked_add(fine_rows_bytes, fine_prediction_bytes),
++               checked_add(final_kmeans_bytes, final_prediction_bytes)})});
++  const size_t kmeans_host_workspace = checked_sum(
++    {meso_labels_bytes, meso_sizes_bytes,
++     matrix_bytes(max_meso_rows, 1, sizeof(int64_t)),
++     matrix_bytes(checked_add(checked_mul(size_t{2}, n_mesoclusters), size_t{1}),
++                  1,
++                  sizeof(int64_t))});
++  require_within("ACE balanced k-means host workspace",
++                 checked_add(checked_add(live_host_bytes, sample_bytes), kmeans_host_workspace),
++                 host_budget);
++  require_within("ACE balanced k-means device workspace",
++                 checked_add(checked_add(sample_bytes, centroid_bytes), kmeans_gpu_workspace),
++                 gpu_budget);
++
++  const size_t row_scratch_bytes = checked_mul(checked_add(dataset_dim, n_partitions), sizeof(float));
++  const size_t max_chunk = std::min<size_t>(32 * 1024, dataset_size);
++  size_t chunk_size = max_chunk;
++  if (host_budget) {
++    const size_t host_baseline = checked_add(live_host_bytes, sample_bytes);
++    require_within("ACE training sample host arrays", host_baseline, *host_budget);
++    chunk_size = std::min(chunk_size, (*host_budget - host_baseline) / row_scratch_bytes);
++  }
++  if (gpu_budget) {
++    const size_t gpu_baseline = checked_add(sample_bytes, centroid_bytes);
++    require_within("ACE training sample and centroid device arrays", gpu_baseline, *gpu_budget);
++    chunk_size = std::min(chunk_size, (*gpu_budget - gpu_baseline) / row_scratch_bytes);
++  }
++  RAFT_EXPECTS(chunk_size > 0, "memory guard: ACE assignment scratch cannot fit one row");
++  require_within("ACE training host arrays",
++                 checked_add(checked_add(live_host_bytes, sample_bytes),
++                             matrix_bytes(chunk_size, checked_add(dataset_dim, n_partitions), sizeof(float))),
++                 host_budget);
++  require_within("ACE training device arrays",
++                 checked_add(checked_add(sample_bytes, centroid_bytes),
++                             matrix_bytes(chunk_size, checked_add(dataset_dim, n_partitions), sizeof(float))),
++                 gpu_budget);
+ 
+   auto sample_db = raft::make_host_matrix<float, int64_t>(n_samples, dataset_dim);
+ #pragma omp parallel for
+@@ -112,13 +237,11 @@ void ace_get_partition_labels(
+   auto sample_db_dev = raft::make_device_matrix<float, int64_t>(res, n_samples, dataset_dim);
+   raft::copy(res, sample_db_dev.view(), sample_db.view());
+ 
+-  cuvs::cluster::kmeans::balanced_params kmeans_params;
+   auto centroids_dev = raft::make_device_matrix<float, int64_t>(res, n_partitions, dataset_dim);
+   cuvs::cluster::kmeans::fit(res, kmeans_params, sample_db_dev.view(), centroids_dev.view());
+ 
+   // Compute distances between dataset and centroid vectors
+   // Uses float conversion on host instead of batch_load_iterator to minimize GPU memory usage.
+-  const size_t chunk_size = 32 * 1024;
+   auto _sub_dataset       = raft::make_host_matrix<float, int64_t>(chunk_size, dataset_dim);
+   auto _sub_distances     = raft::make_host_matrix<float, int64_t>(chunk_size, n_partitions);
+   auto _sub_dataset_dev   = raft::make_device_matrix<float, int64_t>(res, chunk_size, dataset_dim);
+@@ -369,7 +492,7 @@ void ace_gather_partition_dataset(
+   raft::host_vector_view<IdxT, int64_t, raft::row_major> augmented_partition_offsets,
+   raft::host_matrix_view<T, int64_t, raft::row_major> sub_dataset)
+ {
+-  const size_t vector_size_bytes = dataset_dim * sizeof(T);
++  const size_t vector_size_bytes = memory_guard::checked_mul(dataset_dim, sizeof(T));
+ 
+   // Copy core partition vectors
+ #pragma omp parallel for
+@@ -474,7 +597,9 @@ void ace_reorder_and_store_dataset(
+   cuvs::util::file_descriptor& mapping_fd,
+   size_t reordered_header_size,
+   size_t augmented_header_size,
+-  size_t mapping_header_size)
++  size_t mapping_header_size,
++  const std::optional<size_t>& host_budget = std::nullopt,
++  size_t reserved_host_bytes = 0)
+ {
+   auto start = std::chrono::high_resolution_clock::now();
+ 
+@@ -494,8 +619,10 @@ void ace_reorder_and_store_dataset(
+   size_t max_core_vectors        = 0;
+   size_t max_augmented_vectors   = 0;
+   for (size_t p = 0; p < n_partitions; p++) {
+-    total_core_vectors += partition_histogram(p, 0);
+-    total_augmented_vectors += partition_histogram(p, 1);
++    total_core_vectors = memory_guard::checked_add(
++      total_core_vectors, static_cast<size_t>(partition_histogram(p, 0)));
++    total_augmented_vectors = memory_guard::checked_add(
++      total_augmented_vectors, static_cast<size_t>(partition_histogram(p, 1)));
+     max_core_vectors      = std::max<size_t>(max_core_vectors, partition_histogram(p, 0));
+     max_augmented_vectors = std::max<size_t>(max_augmented_vectors, partition_histogram(p, 1));
+   }
+@@ -505,9 +632,9 @@ void ace_reorder_and_store_dataset(
+                "Total augmented vectors must be equal to dataset size");
+ 
+   // Pre-allocate file space for better performance
+-  const size_t vector_size   = dataset_dim * sizeof(T);
+-  size_t reordered_file_size = total_core_vectors * vector_size;
+-  size_t augmented_file_size = total_augmented_vectors * vector_size;
++  const size_t vector_size = memory_guard::checked_mul(dataset_dim, sizeof(T));
++  size_t reordered_file_size = memory_guard::checked_mul(total_core_vectors, vector_size);
++  size_t augmented_file_size = memory_guard::checked_mul(total_augmented_vectors, vector_size);
+ 
+   RAFT_LOG_DEBUG("ACE: Reordered dataset: %lu core vectors (%.2f GiB)",
+                  total_core_vectors,
+@@ -516,38 +643,61 @@ void ace_reorder_and_store_dataset(
+                  total_augmented_vectors,
+                  augmented_file_size / (1024.0 * 1024.0 * 1024.0));
+ 
+-  // Calculate partition start offsets for reordered and augmented datasets
++  // Preflight every host-side reorder allocation before creating the first vector.
++  const size_t vector_metadata_bytes = memory_guard::checked_mul(
++    n_partitions, 2 * sizeof(raft::host_matrix<T, int64_t>) + 6 * sizeof(size_t));
++  const size_t vector_metadata_with_ends =
++    memory_guard::reorder_metadata_with_ends<std::vector<raft::host_matrix<T, int64_t>>>(
++      vector_metadata_bytes);
++  const size_t base_with_metadata = memory_guard::checked_add(reserved_host_bytes, vector_metadata_with_ends);
++  memory_guard::require_within("ACE reorder metadata", base_with_metadata, host_budget);
++
++  // Calculate partition start offsets for reordered and augmented datasets.
+   auto core_partition_starts = raft::make_host_vector<size_t, int64_t>(n_partitions + 1);
+-  memset(core_partition_starts.data_handle(), 0, (n_partitions + 1) * sizeof(size_t));
++  memset(core_partition_starts.data_handle(), 0,
++         memory_guard::checked_mul(n_partitions + 1, sizeof(size_t)));
+   auto augmented_partition_starts = raft::make_host_vector<size_t, int64_t>(n_partitions + 1);
+-  memset(augmented_partition_starts.data_handle(), 0, (n_partitions + 1) * sizeof(size_t));
++  memset(augmented_partition_starts.data_handle(), 0,
++         memory_guard::checked_mul(n_partitions + 1, sizeof(size_t)));
+   auto core_partition_current = raft::make_host_vector<size_t, int64_t>(n_partitions);
+-  memset(core_partition_current.data_handle(), 0, n_partitions * sizeof(size_t));
++  memset(core_partition_current.data_handle(), 0,
++         memory_guard::checked_mul(n_partitions, sizeof(size_t)));
+   auto augmented_partition_current = raft::make_host_vector<size_t, int64_t>(n_partitions);
+-  memset(augmented_partition_current.data_handle(), 0, n_partitions * sizeof(size_t));
++  memset(augmented_partition_current.data_handle(), 0,
++         memory_guard::checked_mul(n_partitions, sizeof(size_t)));
+ 
+   for (size_t p = 0; p < n_partitions; p++) {
+-    core_partition_starts(p + 1)      = core_partition_starts(p) + partition_histogram(p, 0);
+-    augmented_partition_starts(p + 1) = augmented_partition_starts(p) + partition_histogram(p, 1);
++    core_partition_starts(p + 1) = memory_guard::checked_add(
++      core_partition_starts(p), static_cast<size_t>(partition_histogram(p, 0)));
++    augmented_partition_starts(p + 1) = memory_guard::checked_add(
++      augmented_partition_starts(p), static_cast<size_t>(partition_histogram(p, 1)));
+   }
+ 
+-  const size_t free_memory = cuvs::util::get_free_host_memory();
+-  // Conservatively allocate 50% of free memory per partition. Accounts for internal buffers and
+-  // overhead.
+-  // TODO: Adjust overhead if needed.
+-  const size_t memory_per_partition = 0.5 * free_memory / (n_partitions * 2);
+-  size_t disk_write_size            = raft::bound_by_power_of_two<size_t>(memory_per_partition);
+-  // 64MB should be enough to saturate typical NVMe SSDs.
+-  disk_write_size           = std::min<size_t>(disk_write_size, 64 * 1024 * 1024);
+-  size_t vectors_per_buffer = std::max<size_t>(64, disk_write_size / vector_size);
++  size_t vectors_per_buffer;
++  if (host_budget) {
++    const size_t buffer_budget = *host_budget - base_with_metadata;
++    vectors_per_buffer = memory_guard::reorder_rows_per_buffer(n_partitions, vector_size, buffer_budget);
++  } else {
++    const size_t free_memory = cuvs::util::get_free_host_memory();
++    const size_t divisor = memory_guard::checked_mul(n_partitions, size_t{2});
++    const size_t memory_per_partition = free_memory / divisor / 2;
++    size_t disk_write_size = raft::bound_by_power_of_two<size_t>(memory_per_partition);
++    disk_write_size = std::min<size_t>(disk_write_size, 64 * 1024 * 1024);
++    vectors_per_buffer = std::max<size_t>(64, disk_write_size / vector_size);
++  }
++  const size_t buffer_bytes = memory_guard::matrix_bytes(
++    memory_guard::checked_mul(n_partitions, 2), vectors_per_buffer, vector_size);
++  memory_guard::require_within("ACE 2P reorder buffers",
++                               memory_guard::checked_add(base_with_metadata, buffer_bytes),
++                               host_budget);
+ 
+   RAFT_LOG_DEBUG("ACE: Reorder buffers: %lu vectors per buffer (%.2f MiB)",
+                  vectors_per_buffer,
+-                 to_mib(vectors_per_buffer * vector_size));
++                 to_mib(memory_guard::checked_mul(vectors_per_buffer, vector_size)));
+ 
+   std::vector<raft::host_matrix<T, int64_t>> core_buffers;
+   std::vector<raft::host_matrix<T, int64_t>> augmented_buffers;
+-  auto core_buffer_counts      = raft::make_host_vector<size_t, int64_t>(n_partitions);
++  auto core_buffer_counts = raft::make_host_vector<size_t, int64_t>(n_partitions);
+   auto augmented_buffer_counts = raft::make_host_vector<size_t, int64_t>(n_partitions);
+ 
+   core_buffers.reserve(n_partitions);
+@@ -557,7 +707,7 @@ void ace_reorder_and_store_dataset(
+     core_buffers.emplace_back(raft::make_host_matrix<T, int64_t>(vectors_per_buffer, dataset_dim));
+     augmented_buffers.emplace_back(
+       raft::make_host_matrix<T, int64_t>(vectors_per_buffer, dataset_dim));
+-    core_buffer_counts(p)      = 0;
++    core_buffer_counts(p) = 0;
+     augmented_buffer_counts(p) = 0;
+   }
+   auto flush_core_buffer = [&](size_t partition_id) {
+@@ -602,7 +752,7 @@ void ace_reorder_and_store_dataset(
+     // Add vector to core partition buffer
+     size_t core_buffer_row = core_buffer_counts(core_partition);
+     memcpy(
+-      &core_buffers[core_partition](core_buffer_row, 0), &dataset(i, 0), dataset_dim * sizeof(T));
++      &core_buffers[core_partition](core_buffer_row, 0), &dataset(i, 0), vector_size);
+     core_buffer_counts(core_partition)++;
+ 
+     // Flush core buffer if full
+@@ -614,7 +764,7 @@ void ace_reorder_and_store_dataset(
+     size_t augmented_buffer_row = augmented_buffer_counts(secondary_partition);
+     memcpy(&augmented_buffers[secondary_partition](augmented_buffer_row, 0),
+            &dataset(i, 0),
+-           dataset_dim * sizeof(T));
++           vector_size);
+     augmented_buffer_counts(secondary_partition)++;
+ 
+     // Flush augmented buffer if full
+@@ -649,7 +799,7 @@ void ace_reorder_and_store_dataset(
+     }
+   }
+ 
+-  const size_t mapping_file_size = dataset_size * sizeof(IdxT);
++  const size_t mapping_file_size = memory_guard::checked_mul(dataset_size, sizeof(IdxT));
+   cuvs::util::write_large_file(
+     mapping_fd, core_backward_mapping.data_handle(), mapping_file_size, mapping_header_size);
+ 
+@@ -706,7 +856,7 @@ void ace_load_partition_dataset_from_disk(
+                sub_dataset.extent(1),
+                dataset_dim);
+ 
+-  const size_t vector_size = dataset_dim * sizeof(T);
++  const size_t vector_size = memory_guard::checked_mul(dataset_dim, sizeof(T));
+ 
+   const std::string reordered_dataset_path = build_dir + "/reordered_dataset.npy";
+   const std::string augmented_dataset_path = build_dir + "/augmented_dataset.npy";
+@@ -812,7 +962,6 @@ struct ace_memory_requirements {
+ // TODO: Adjust overhead factor if needed. Very conservative for now.
+ constexpr double usable_cpu_memory_fraction = 0.8;
+ constexpr double usable_gpu_memory_fraction = 0.8;
+-constexpr double imbalance_factor           = 3.0;
+ 
+ // Calculate CAGRA optimize workspace memory requirements.
+ // This is the working memory on top of the input/output memory usage.
+@@ -822,40 +971,51 @@ inline std::pair<size_t, size_t> optimize_workspace_size(size_t n_rows,
+                                                          size_t index_size,
+                                                          bool mst_optimize = false)
+ {
+-  // MST optimization memory (host only)
+-  size_t mst_host = n_rows * index_size;  // mst_graph_num_edges
++  using memory_guard::checked_add;
++  using memory_guard::checked_mul;
++  using memory_guard::checked_sum;
++
++  // Source-derived peak workspace for CAGRA prune/reverse/merge stages.
++  const size_t row_index_bytes = checked_mul(n_rows, index_size);
++  const size_t final_graph_bytes = checked_mul(checked_mul(n_rows, graph_degree), index_size);
++  size_t mst_host = row_index_bytes;
++  size_t mst_dev  = 0;
+   if (mst_optimize) {
+-    mst_host += n_rows * graph_degree * index_size;  // mst_graph allocated in optimize
+-    mst_host += n_rows * graph_degree * index_size;  // mst_graph allocated in mst_optimize
+-    mst_host += n_rows * index_size * 7;             // vectors with _max_edges suffix
+-    mst_host += (graph_degree - 1) * (graph_degree - 1) * index_size;  // iB_candidates
++    mst_host = checked_sum({mst_host, final_graph_bytes, final_graph_bytes,
++                            checked_mul(row_index_bytes, size_t{7}),
++                            checked_mul(checked_mul(graph_degree - 1, graph_degree - 1), index_size),
++                            size_t{4 * sizeof(uint64_t)}});
++    // graph_core.cuh::mst_optimization allocates the device MST graph, eight per-row
++    // device vectors, and four uint64 statistics while the input/output graphs are live.
++    mst_dev = checked_sum({final_graph_bytes,
++                           checked_mul(row_index_bytes, size_t{8}),
++                           size_t{4 * sizeof(uint64_t)}});
+   }
+ 
+-  // Prune stage memory
+-  // We neglect 8 bytes (both on host and device) for stats
+-  size_t prune_host = n_rows * intermediate_degree * sizeof(uint8_t);  // detour count
+-
+-  size_t prune_dev = n_rows * intermediate_degree * 1;     // detour count (uint8_t)
+-  prune_dev += n_rows * sizeof(uint32_t);                  // d_num_detour_edges
+-  prune_dev += n_rows * intermediate_degree * index_size;  // d_input_graph
+-
+-  // Reverse graph stage memory
+-  size_t rev_host = n_rows * graph_degree * index_size;  // rev_graph
+-  rev_host += n_rows * sizeof(uint32_t);                 // rev_graph_count
+-  rev_host += n_rows * index_size;                       // dest_nodes
+-
+-  size_t rev_dev = n_rows * graph_degree * index_size;  // d_rev_graph
+-  rev_dev += n_rows * sizeof(uint32_t);                 // d_rev_graph_count
+-  rev_dev += n_rows * sizeof(uint32_t);                 // d_dest_nodes
+-
+-  // Memory for merging graphs (host only)
+-  size_t combine_host =
+-    n_rows * sizeof(uint32_t) + graph_degree * sizeof(uint32_t);  // in_edge_count + hist
+-
+-  size_t total_host = mst_host + std::max({prune_host, rev_host, combine_host});
+-  size_t total_dev  = std::max(prune_dev, rev_dev);
+-
+-  return std::make_pair(total_host, total_dev);
++  size_t prune_host = checked_mul(checked_mul(n_rows, intermediate_degree), sizeof(uint8_t));
++  size_t prune_dev = checked_sum({prune_host,
++                                  checked_mul(n_rows, sizeof(uint32_t)),
++                                  checked_mul(checked_mul(n_rows, intermediate_degree), index_size),
++                                  size_t{2 * sizeof(uint64_t)}});
++  prune_host = checked_add(prune_host, size_t{2 * sizeof(uint64_t)});
++
++  size_t rev_host = checked_sum({final_graph_bytes,
++                                 checked_mul(n_rows, sizeof(uint32_t)),
++                                 row_index_bytes});
++  size_t rev_dev = checked_sum({final_graph_bytes,
++                                checked_mul(n_rows, sizeof(uint32_t)),
++                                row_index_bytes});
++  size_t max_host_threads = 1;
++#if defined(_OPENMP)
++  max_host_threads = static_cast<size_t>(std::max(1, omp_get_max_threads()));
++#endif
++  size_t combine_host = checked_sum({final_graph_bytes,
++                                     checked_mul(n_rows, sizeof(uint32_t)),
++                                     checked_mul(checked_mul(graph_degree, index_size),
++                                                 max_host_threads)});
++
++  return {checked_add(mst_host, std::max({prune_host, rev_host, combine_host})),
++          std::max({mst_dev, prune_dev, rev_dev})};
+ }
+ 
+ // Check if disk mode should be used for ACE based on memory constraints
+@@ -873,7 +1033,7 @@ bool ace_check_use_disk_mode(bool use_disk,
+ {
+   // Use overridden memory limits if provided (> 0), otherwise query actual system memory
+   if (max_host_memory_gb.has_value() && max_host_memory_gb.value() > 0) {
+-    mem.available_host_memory = static_cast<size_t>(max_host_memory_gb.value() * (1ULL << 30));
++    mem.available_host_memory = memory_guard::budget_bytes_from_gib(max_host_memory_gb.value()).value();
+     RAFT_LOG_INFO("ACE: Using overridden host memory limit: %.2f GiB", max_host_memory_gb.value());
+   } else {
+     mem.available_host_memory = cuvs::util::get_free_host_memory();
+@@ -888,15 +1048,20 @@ bool ace_check_use_disk_mode(bool use_disk,
+   //   final)
+   //   * sizeof(IdxT)
+   //   - Final assembled graph: dataset_size * graph_degree * sizeof(IdxT)
+-  mem.partition_labels_size = 2 * dataset_size * sizeof(IdxT);
+-  mem.id_mapping_size       = 2 * dataset_size * sizeof(IdxT);
+-  mem.sub_dataset_size =
+-    imbalance_factor * 2 * (dataset_size / n_partitions) * dataset_dim * sizeof(T);
+-  mem.sub_graph_size = imbalance_factor * 2 * (dataset_size / n_partitions) *
+-                       (intermediate_degree + graph_degree) * sizeof(IdxT);
+-  mem.cagra_graph_size = dataset_size * graph_degree * sizeof(IdxT);
+-  mem.total_size       = mem.partition_labels_size + mem.id_mapping_size + mem.sub_dataset_size +
+-                   mem.sub_graph_size + mem.cagra_graph_size;
++  using memory_guard::checked_add;
++  using memory_guard::checked_mul;
++  using memory_guard::checked_sum;
++  RAFT_EXPECTS(n_partitions > 0, "ACE requires a positive partition count");
++  mem.partition_labels_size = checked_mul(checked_mul(2, dataset_size), sizeof(IdxT));
++  mem.id_mapping_size       = checked_mul(checked_mul(2, dataset_size), sizeof(IdxT));
++  mem.sub_dataset_size = checked_mul(checked_mul(checked_mul(size_t{6}, dataset_size / n_partitions),
++                                                 dataset_dim), sizeof(T));
++  mem.sub_graph_size = checked_mul(checked_mul(checked_mul(size_t{6}, dataset_size / n_partitions),
++                                               checked_add(intermediate_degree, graph_degree)),
++                                   sizeof(IdxT));
++  mem.cagra_graph_size = checked_mul(checked_mul(dataset_size, graph_degree), sizeof(IdxT));
++  mem.total_size = checked_sum({mem.partition_labels_size, mem.id_mapping_size, mem.sub_dataset_size,
++                                mem.sub_graph_size, mem.cagra_graph_size});
+ 
+   RAFT_LOG_INFO("ACE: Estimated host memory required: %.2f GiB, available: %.2f GiB",
+                 to_gib(mem.total_size),
+@@ -909,7 +1074,7 @@ bool ace_check_use_disk_mode(bool use_disk,
+   // Check if GPU has enough memory for the final graph or use disk mode instead.
+   // TODO: Extend model or use managed memory if running out of GPU memory.
+   if (max_gpu_memory_gb.has_value() && max_gpu_memory_gb.value() > 0) {
+-    mem.available_gpu_memory = static_cast<size_t>(max_gpu_memory_gb.value() * (1ULL << 30));
++    mem.available_gpu_memory = memory_guard::budget_bytes_from_gib(max_gpu_memory_gb.value()).value();
+     RAFT_LOG_INFO("ACE: Using overridden GPU memory limit: %.2f GiB", max_gpu_memory_gb.value());
+   } else {
+     mem.available_gpu_memory = rmm::available_device_memory().second;
+@@ -980,24 +1145,27 @@ void ace_validate_disk_mode_partitions(size_t& n_partitions,
+   //   - Avg. per-partition graph during build: 2 * (dataset_size / n_partitions) * (intermediate +
+   //   final) * sizeof(IdxT)
+ 
+-  size_t original_n_partitions     = n_partitions;
++  using memory_guard::checked_add;
++  using memory_guard::checked_mul;
++  using memory_guard::checked_sum;
++  RAFT_EXPECTS(n_partitions > 0, "ACE requires a positive partition count");
++  const size_t original_n_partitions = n_partitions;
+   size_t host_suggested_partitions = n_partitions;
+-  size_t gpu_suggested_partitions  = n_partitions;
+-  bool host_memory_insufficient    = false;
+-  bool gpu_memory_insufficient     = false;
++  size_t gpu_suggested_partitions = n_partitions;
++  bool host_memory_insufficient = false;
++  bool gpu_memory_insufficient = false;
+ 
+-  // Compute optimize workspace requirements
+-  size_t sub_partition_size =
+-    static_cast<size_t>(imbalance_factor * 2 * (dataset_size / n_partitions));
++  const size_t sub_partition_size = checked_mul(size_t{6}, dataset_size / n_partitions);
+   auto [host_workspace_size, gpu_workspace_size] = optimize_workspace_size(
+     sub_partition_size, graph_degree, intermediate_degree, sizeof(IdxT), guarantee_connectivity);
+-
+-  // Check host memory requirements
+-  size_t disk_mode_host_required = mem.partition_labels_size + mem.id_mapping_size +
+-                                   mem.sub_dataset_size + mem.sub_graph_size + host_workspace_size;
+-
+-  if (static_cast<size_t>(usable_cpu_memory_fraction * mem.available_host_memory) <
+-      disk_mode_host_required) {
++  const size_t disk_mode_host_required = checked_sum({mem.partition_labels_size,
++                                                       mem.id_mapping_size,
++                                                       mem.sub_dataset_size,
++                                                       mem.sub_graph_size,
++                                                       host_workspace_size});
++  const size_t host_capacity = static_cast<size_t>(
++    static_cast<long double>(usable_cpu_memory_fraction) * mem.available_host_memory);
++  if (host_capacity < disk_mode_host_required) {
+     host_memory_insufficient = true;
+     RAFT_LOG_WARN(
+       "ACE: Host memory insufficient for disk mode. Required: %.2f GiB, available: %.2f GiB. "
+@@ -1008,31 +1176,25 @@ void ace_validate_disk_mode_partitions(size_t& n_partitions,
+       to_gib(mem.sub_graph_size),
+       to_gib(host_workspace_size));
+ 
+-    // Calculate suggested number of partitions for host memory
+-    double available_for_scaling = usable_cpu_memory_fraction * mem.available_host_memory -
+-                                   mem.partition_labels_size - mem.id_mapping_size;
+-    RAFT_EXPECTS(available_for_scaling > 0,
+-                 "ACE: Host memory insufficient even for constant overhead (labels + id_mapping). "
+-                 "Required: %.2f GiB, available: %.2f GiB",
+-                 to_gib(mem.partition_labels_size + mem.id_mapping_size),
+-                 to_gib(usable_cpu_memory_fraction * mem.available_host_memory));
+-    host_suggested_partitions = static_cast<size_t>(
+-      std::ceil((mem.sub_dataset_size + mem.sub_graph_size + host_workspace_size) * n_partitions /
+-                available_for_scaling));
+-    // Ensure we always increase partitions (current count is insufficient by definition)
+-    host_suggested_partitions = std::max(host_suggested_partitions, n_partitions + 1);
++    const size_t constant_host = checked_add(mem.partition_labels_size, mem.id_mapping_size);
++    RAFT_EXPECTS(host_capacity > constant_host,
++                 "ACE: Host memory insufficient even for labels and ID mappings. Required: %.2f GiB, available: %.2f GiB",
++                 to_gib(constant_host),
++                 to_gib(host_capacity));
++    const size_t scalable_host = checked_sum({mem.sub_dataset_size, mem.sub_graph_size, host_workspace_size});
++    const long double suggested = std::ceil(
++      static_cast<long double>(scalable_host) * n_partitions / (host_capacity - constant_host));
++    RAFT_EXPECTS(suggested <= static_cast<long double>(std::numeric_limits<size_t>::max()),
++                 "ACE: suggested host partition count exceeds addressable size");
++    host_suggested_partitions = std::max(
++      static_cast<size_t>(suggested), checked_add(n_partitions, size_t{1}));
+   }
+ 
+-  // Check GPU memory requirements in disk mode
+-  // GPU memory model for disk mode (per-partition processing):
+-  //   - Per-partition dataset on GPU: 4 * (dataset_size / n_partitions) * dataset_dim * sizeof(T)
+-  //   - Per-partition graph on GPU: (dataset_size / n_partitions) * (intermediate + final) *
+-  //   sizeof(IdxT)
+-  //   - CAGRA optimize workspace memory (computed from optimize_workspace_size)
+-  size_t disk_mode_gpu_required = mem.sub_dataset_size + mem.sub_graph_size + gpu_workspace_size;
+-
+-  if (static_cast<size_t>(usable_gpu_memory_fraction * mem.available_gpu_memory) <
+-      disk_mode_gpu_required) {
++  const size_t disk_mode_gpu_required =
++    checked_sum({mem.sub_dataset_size, mem.sub_graph_size, gpu_workspace_size});
++  const size_t gpu_capacity = static_cast<size_t>(
++    static_cast<long double>(usable_gpu_memory_fraction) * mem.available_gpu_memory);
++  if (gpu_capacity < disk_mode_gpu_required) {
+     gpu_memory_insufficient = true;
+     RAFT_LOG_WARN(
+       "ACE: GPU memory insufficient for per-partition processing. Required: %.2f GiB, "
+@@ -1043,17 +1205,18 @@ void ace_validate_disk_mode_partitions(size_t& n_partitions,
+       to_gib(mem.sub_dataset_size),
+       to_gib(mem.sub_graph_size),
+       to_gib(gpu_workspace_size));
+-
+-    gpu_suggested_partitions = static_cast<size_t>(
+-      std::ceil(disk_mode_gpu_required / (usable_gpu_memory_fraction * mem.available_gpu_memory) *
+-                n_partitions));
+-    gpu_suggested_partitions = std::max(gpu_suggested_partitions, n_partitions + 1);
++    RAFT_EXPECTS(gpu_capacity > 0,
++                 "ACE: GPU memory budget is zero; no partition count can satisfy it");
++    const long double suggested = std::ceil(
++      static_cast<long double>(disk_mode_gpu_required) * n_partitions / gpu_capacity);
++    RAFT_EXPECTS(suggested <= static_cast<long double>(std::numeric_limits<size_t>::max()),
++                 "ACE: suggested GPU partition count exceeds addressable size");
++    gpu_suggested_partitions = std::max(
++      static_cast<size_t>(suggested), checked_add(n_partitions, size_t{1}));
+   }
+ 
+-  // Auto-adjust to the maximum of host and GPU requirements
+   if (host_memory_insufficient || gpu_memory_insufficient) {
+-    size_t new_n_partitions = std::max(host_suggested_partitions, gpu_suggested_partitions);
+-
++    const size_t new_n_partitions = std::max(host_suggested_partitions, gpu_suggested_partitions);
+     RAFT_LOG_WARN(
+       "ACE: Automatically increasing number of partitions from %zu to %zu to satisfy memory "
+       "constraints.%s%s",
+@@ -1067,21 +1230,24 @@ void ace_validate_disk_mode_partitions(size_t& n_partitions,
+         : "");
+ 
+     n_partitions = new_n_partitions;
+-    mem.sub_dataset_size =
+-      imbalance_factor * 2 * (dataset_size / n_partitions) * dataset_dim * sizeof(T);
+-    mem.sub_graph_size = imbalance_factor * 2 * (dataset_size / n_partitions) *
+-                         (intermediate_degree + graph_degree) * sizeof(IdxT);
+-    mem.total_size = mem.partition_labels_size + mem.id_mapping_size + mem.sub_dataset_size +
+-                     mem.sub_graph_size + mem.cagra_graph_size;
+-
+-    size_t new_sub_partition_size =
+-      static_cast<size_t>(imbalance_factor * 2 * (dataset_size / n_partitions));
++    mem.sub_dataset_size = checked_mul(
++      checked_mul(checked_mul(size_t{6}, dataset_size / n_partitions), dataset_dim), sizeof(T));
++    mem.sub_graph_size = checked_mul(
++      checked_mul(checked_mul(size_t{6}, dataset_size / n_partitions),
++                  checked_add(intermediate_degree, graph_degree)),
++      sizeof(IdxT));
++    mem.total_size = checked_sum({mem.partition_labels_size,
++                                  mem.id_mapping_size,
++                                  mem.sub_dataset_size,
++                                  mem.sub_graph_size,
++                                  mem.cagra_graph_size});
++
++    const size_t new_sub_partition_size = checked_mul(size_t{6}, dataset_size / n_partitions);
+     auto [new_opt_host_ws, new_opt_dev_ws] = optimize_workspace_size(new_sub_partition_size,
+                                                                      graph_degree,
+                                                                      intermediate_degree,
+                                                                      sizeof(IdxT),
+                                                                      guarantee_connectivity);
+-
+     RAFT_LOG_INFO(
+       "ACE: Updated per-partition memory estimates: dataset %.2f GiB, graph %.2f GiB, "
+       "host workspace %.2f GiB, GPU workspace %.2f GiB",
+@@ -1090,6 +1256,7 @@ void ace_validate_disk_mode_partitions(size_t& n_partitions,
+       to_gib(new_opt_host_ws),
+       to_gib(new_opt_dev_ws));
+   }
++
+ }
+ 
+ // Build CAGRA index using ACE (Augmented Core Extraction) partitioning
+@@ -1111,7 +1278,10 @@ index<T, IdxT> build_ace(raft::resources const& res,
+     std::holds_alternative<cagra::graph_build_params::ace_params>(params.graph_build_params),
+     "ACE build requires graph_build_params to be set to ace_params");
+ 
+-  auto ace_params    = std::get<cagra::graph_build_params::ace_params>(params.graph_build_params);
++  auto ace_params = std::get<cagra::graph_build_params::ace_params>(params.graph_build_params);
++  const auto host_budget = memory_guard::budget_bytes_from_gib(ace_params.max_host_memory_gb);
++  const auto gpu_budget  = memory_guard::budget_bytes_from_gib(ace_params.max_gpu_memory_gb);
++  const bool bounded_partition_builder = host_budget.has_value() || gpu_budget.has_value();
+   size_t npartitions = ace_params.npartitions;
+   size_t ef_construction = ace_params.ef_construction;
+   std::string build_dir  = ace_params.build_dir;
+@@ -1127,6 +1297,8 @@ index<T, IdxT> build_ace(raft::resources const& res,
+   size_t dataset_dim  = dataset.extent(1);
+ 
+   RAFT_EXPECTS(dataset_size > 0, "ACE: Dataset must not be empty");
++  RAFT_EXPECTS(dataset_size <= static_cast<size_t>(std::numeric_limits<IdxT>::max()),
++               "ACE dataset row count is unsupported by the selected index type");
+   if (dataset_size < 1000) {
+     RAFT_LOG_WARN("ACE: Very small dataset size (%zu), consider using regular CAGRA build instead.",
+                   dataset_size);
+@@ -1135,6 +1307,10 @@ index<T, IdxT> build_ace(raft::resources const& res,
+   RAFT_EXPECTS(params.intermediate_graph_degree > 0,
+                "ACE: Intermediate graph degree must be greater than 0");
+   RAFT_EXPECTS(params.graph_degree > 0, "ACE: Graph degree must be greater than 0");
++  RAFT_EXPECTS(
++    params.intermediate_graph_degree <= static_cast<size_t>(std::numeric_limits<IdxT>::max()) &&
++      params.graph_degree <= static_cast<size_t>(std::numeric_limits<IdxT>::max()),
++    "ACE graph degree is unsupported by the selected index type");
+ 
+   size_t n_partitions = npartitions;
+   if (n_partitions == 0) {
+@@ -1142,6 +1318,10 @@ index<T, IdxT> build_ace(raft::resources const& res,
+     n_partitions = 2;
+   }
+ 
++  RAFT_EXPECTS(n_partitions > 0 &&
++                 n_partitions <= static_cast<size_t>(std::numeric_limits<IdxT>::max()) &&
++                 n_partitions <= static_cast<size_t>(std::numeric_limits<uint32_t>::max()),
++               "ACE partition count is unsupported");
+   size_t min_required_per_partition = 1000;
+   if (n_partitions > dataset_size / min_required_per_partition) {
+     n_partitions = dataset_size / min_required_per_partition;
+@@ -1167,6 +1347,8 @@ index<T, IdxT> build_ace(raft::resources const& res,
+ 
+   try {
+     check_graph_degree<T, IdxT>(intermediate_degree, graph_degree, dataset_size);
++    RAFT_EXPECTS(intermediate_degree > 0 && graph_degree > 0,
++                 "ACE graph degrees must remain positive after dataset-size adjustment");
+ 
+     // Check if disk mode should be used based on memory constraints
+     ace_memory_requirements mem;
+@@ -1191,6 +1373,18 @@ index<T, IdxT> build_ace(raft::resources const& res,
+                                                  params.guarantee_connectivity,
+                                                  mem);
+     }
++    RAFT_EXPECTS(n_partitions > 0 &&
++                   n_partitions <= static_cast<size_t>(std::numeric_limits<IdxT>::max()) &&
++                   n_partitions <= static_cast<size_t>(std::numeric_limits<uint32_t>::max()),
++                 "ACE final partition count is unsupported");
++
++    // The final partition count may have changed during automatic adjustment. Bound the
++    // unavoidable labels and histogram before either array is allocated.
++    const size_t label_bytes = memory_guard::matrix_bytes(dataset_size, 2, sizeof(IdxT));
++    const size_t histogram_bytes = memory_guard::matrix_bytes(n_partitions, 2, sizeof(IdxT));
++    memory_guard::require_within("ACE labels and partition histogram",
++                                 memory_guard::checked_add(label_bytes, histogram_bytes),
++                                 host_budget);
+ 
+     // Preallocate space for files for better performance and fail early if not enough space.
+     cuvs::util::file_descriptor reordered_fd;
+@@ -1241,8 +1435,13 @@ index<T, IdxT> build_ace(raft::resources const& res,
+     // Determine minimum partition size for stable KNN graph construction
+     size_t min_partition_size = std::max<size_t>(1000ULL, dataset_size / n_partitions * 0.1);
+ 
+-    ace_get_partition_labels<T, IdxT>(
+-      res, dataset, partition_labels.view(), partition_histogram.view(), min_partition_size);
++    ace_get_partition_labels<T, IdxT>(res,
++                                      dataset,
++                                      partition_labels.view(),
++                                      partition_histogram.view(),
++                                      min_partition_size,
++                                      host_budget,
++                                      gpu_budget);
+ 
+     ace_check_partition_sizes<IdxT>(dataset_size,
+                                     n_partitions,
+@@ -1250,6 +1449,81 @@ index<T, IdxT> build_ace(raft::resources const& res,
+                                     partition_histogram.view(),
+                                     min_partition_size);
+ 
++    // Use the actual histogram, not the partition-count average, to reserve the
++    // largest subpartition plus its optimize workspace before mapping allocations.
++    size_t max_partition_rows = 0;
++    size_t max_partition_core_rows = 0;
++    for (size_t p = 0; p < n_partitions; ++p) {
++      const size_t core_rows = static_cast<size_t>(partition_histogram(p, 0));
++      const size_t augmented_rows = static_cast<size_t>(partition_histogram(p, 1));
++      const size_t rows = memory_guard::checked_add(core_rows, augmented_rows);
++      max_partition_rows = std::max(max_partition_rows, rows);
++      max_partition_core_rows = std::max(max_partition_core_rows, core_rows);
++    }
++    const size_t max_subbuild_intermediate_degree =
++      memory_guard::checked_mul(graph_degree / 2, size_t{3});
++    const size_t max_subbuild_graph_degree =
++      memory_guard::checked_mul(graph_degree / 2, size_t{2});
++    const size_t max_partition_intermediate_degree =
++      std::min(max_subbuild_intermediate_degree, max_partition_rows - 1);
++    const size_t max_partition_graph_degree =
++      std::min(max_subbuild_graph_degree, max_partition_intermediate_degree);
++    const auto [max_host_optimize, max_gpu_optimize] = optimize_workspace_size(
++      max_partition_rows,
++      max_partition_graph_degree,
++      max_partition_intermediate_degree,
++      sizeof(IdxT),
++      params.guarantee_connectivity);
++    const size_t max_partition_dataset_bytes =
++      memory_guard::matrix_bytes(max_partition_rows, dataset_dim, sizeof(T));
++    const size_t max_partition_knn_graph_bytes = memory_guard::matrix_bytes(
++      max_partition_rows, max_partition_intermediate_degree, sizeof(IdxT));
++    const size_t max_partition_build_graph_bytes = memory_guard::matrix_bytes(
++      max_partition_rows,
++      memory_guard::checked_add(max_partition_intermediate_degree, max_partition_graph_degree),
++      sizeof(IdxT));
++    const size_t max_partition_result_graph_bytes =
++      memory_guard::matrix_bytes(max_partition_core_rows, max_partition_graph_degree, sizeof(IdxT));
++    const auto [max_nn_host_workspace, max_nn_gpu_workspace] = bounded_partition_builder
++      ? memory_guard::nn_descent_workspace_bytes(
++          max_partition_rows, dataset_dim, max_partition_intermediate_degree)
++      : std::pair<size_t, size_t>{0, 0};
++    const size_t max_partition_builder_host_peak =
++      memory_guard::checked_add(max_partition_knn_graph_bytes, max_nn_host_workspace);
++    const size_t max_partition_optimize_host_peak =
++      memory_guard::checked_add(max_partition_build_graph_bytes, max_host_optimize);
++    const size_t max_partition_optimizer_host_peak =
++      std::max(max_partition_optimize_host_peak, max_partition_result_graph_bytes);
++    const bool max_partition_builder_host_is_peak =
++      max_partition_builder_host_peak >= max_partition_optimizer_host_peak;
++    const size_t max_partition_host_peak = std::max(
++      max_partition_builder_host_peak, max_partition_optimizer_host_peak);
++    const size_t max_partition_optimize_gpu_peak =
++      memory_guard::checked_add(max_partition_build_graph_bytes, max_gpu_optimize);
++    const bool max_partition_builder_gpu_is_peak =
++      max_nn_gpu_workspace >= max_partition_optimize_gpu_peak;
++    const size_t max_partition_gpu_peak =
++      std::max(max_nn_gpu_workspace, max_partition_optimize_gpu_peak);
++    const size_t offset_bytes = memory_guard::matrix_bytes(
++      memory_guard::checked_add(n_partitions, 1), 2, sizeof(IdxT));
++    const size_t mapping_bytes = memory_guard::matrix_bytes(
++      dataset_size, use_disk_mode ? 3 : 2, sizeof(IdxT));
++    const size_t mapping_phase_host = memory_guard::checked_sum(
++      {label_bytes, histogram_bytes, mapping_bytes, offset_bytes});
++    memory_guard::require_within(
++      max_partition_builder_host_is_peak
++        ? "ACE actual largest partition host NN-descent builder workspace"
++        : "ACE actual largest partition host optimizer/return workspace",
++      memory_guard::checked_sum(
++        {mapping_phase_host, max_partition_dataset_bytes, max_partition_host_peak}),
++      host_budget);
++    memory_guard::require_within(
++      max_partition_builder_gpu_is_peak
++        ? "ACE actual largest partition GPU NN-descent builder workspace"
++        : "ACE actual largest partition GPU optimizer workspace",
++      memory_guard::checked_add(max_partition_dataset_bytes, max_partition_gpu_peak),
++      gpu_budget);
++
+     auto partition_end = std::chrono::high_resolution_clock::now();
+     auto partition_elapsed =
+       std::chrono::duration_cast<std::chrono::milliseconds>(partition_end - partition_start)
+@@ -1301,12 +1575,22 @@ index<T, IdxT> build_ace(raft::resources const& res,
+                                              mapping_fd,
+                                              reordered_header_size,
+                                              augmented_header_size,
+-                                             mapping_header_size);
++                                             mapping_header_size,
++                                             host_budget,
++                                             mapping_phase_host);
+       // core_backward_mapping is not needed anymore.
+       core_backward_mapping = raft::make_host_vector<IdxT, int64_t>(0);
+     }
+ 
+-    // Placeholder search graph for in-memory version
++    // Placeholder search graph for in-memory version. Include the full persistent graph before
++    // its allocation; disk mode keeps only file-backed graph data.
++    const size_t search_graph_bytes = use_disk_mode
++                                        ? 0
++                                        : memory_guard::matrix_bytes(dataset_size, graph_degree, sizeof(IdxT));
++    memory_guard::require_within(
++      "ACE in-memory final search graph",
++      memory_guard::checked_add(mapping_phase_host, search_graph_bytes),
++      host_budget);
+     auto search_graph = use_disk_mode
+                           ? raft::make_host_matrix<IdxT, int64_t>(0, 0)
+                           : raft::make_host_matrix<IdxT, int64_t>(dataset_size, graph_degree);
+@@ -1318,9 +1602,9 @@ index<T, IdxT> build_ace(raft::resources const& res,
+       auto start = std::chrono::high_resolution_clock::now();
+ 
+       // Extract vectors for this partition
+-      size_t core_sub_dataset_size      = partition_histogram(partition_id, 0);
+-      size_t augmented_sub_dataset_size = partition_histogram(partition_id, 1);
+-      size_t sub_dataset_size           = core_sub_dataset_size + augmented_sub_dataset_size;
++      size_t core_sub_dataset_size = static_cast<size_t>(partition_histogram(partition_id, 0));
++      size_t augmented_sub_dataset_size = static_cast<size_t>(partition_histogram(partition_id, 1));
++      size_t sub_dataset_size = memory_guard::checked_add(core_sub_dataset_size, augmented_sub_dataset_size);
+ 
+       if (sub_dataset_size == 0) {
+         RAFT_LOG_WARN("ACE: Skipping empty partition %lu", partition_id);
+@@ -1331,6 +1615,91 @@ index<T, IdxT> build_ace(raft::resources const& res,
+                      core_sub_dataset_size,
+                      augmented_sub_dataset_size);
+ 
++      cuvs::neighbors::cagra::index_params sub_index_params =
++        cuvs::neighbors::cagra::index_params::from_hnsw_params(
++          raft::make_extents<int64_t>(sub_dataset_size, dataset_dim),
++          graph_degree / 2,
++          ef_construction,
++          cuvs::neighbors::cagra::hnsw_heuristic_type::SAME_GRAPH_FOOTPRINT,
++          params.metric);
++      if (bounded_partition_builder &&
++          !std::holds_alternative<cuvs::neighbors::cagra::graph_build_params::nn_descent_params>(
++            sub_index_params.graph_build_params)) {
++        // The positive-budget path uses NN-descent because cuVS 26.04 exposes its source-derived
++        // workspace sizes. IVF-PQ's training and index allocations are data-dependent and are not
++        // covered by this partition ledger.
++        sub_index_params.graph_build_params =
++          cuvs::neighbors::cagra::graph_build_params::nn_descent_params(
++            sub_index_params.intermediate_graph_degree, params.metric);
++      }
++      sub_index_params.attach_dataset_on_build = false;
++      sub_index_params.guarantee_connectivity  = params.guarantee_connectivity;
++
++      const size_t partition_intermediate_degree =
++        std::min(sub_index_params.intermediate_graph_degree, sub_dataset_size - 1);
++      const size_t partition_graph_degree =
++        std::min(sub_index_params.graph_degree, partition_intermediate_degree);
++      const auto [partition_host_optimize, partition_gpu_optimize] = optimize_workspace_size(
++        sub_dataset_size,
++        partition_graph_degree,
++        partition_intermediate_degree,
++        sizeof(IdxT),
++        params.guarantee_connectivity);
++      const size_t partition_dataset_bytes =
++        memory_guard::matrix_bytes(sub_dataset_size, dataset_dim, sizeof(T));
++      const size_t partition_knn_graph_bytes =
++        memory_guard::matrix_bytes(sub_dataset_size, partition_intermediate_degree, sizeof(IdxT));
++      const size_t partition_build_graph_bytes = memory_guard::matrix_bytes(
++        sub_dataset_size,
++        memory_guard::checked_add(partition_intermediate_degree, partition_graph_degree),
++        sizeof(IdxT));
++      const size_t partition_result_graph_bytes =
++        memory_guard::matrix_bytes(core_sub_dataset_size, partition_graph_degree, sizeof(IdxT));
++      const auto [partition_nn_host_workspace, partition_nn_gpu_workspace] = bounded_partition_builder
++        ? memory_guard::nn_descent_workspace_bytes(
++            sub_dataset_size, dataset_dim, partition_intermediate_degree)
++        : std::pair<size_t, size_t>{0, 0};
++      const size_t partition_builder_host_peak =
++        memory_guard::checked_add(partition_knn_graph_bytes, partition_nn_host_workspace);
++      const size_t partition_optimize_host_peak =
++        memory_guard::checked_add(partition_build_graph_bytes, partition_host_optimize);
++      const size_t partition_optimizer_host_peak =
++        std::max(partition_optimize_host_peak, partition_result_graph_bytes);
++      const bool partition_builder_host_is_peak =
++        partition_builder_host_peak >= partition_optimizer_host_peak;
++      const size_t partition_host_peak = std::max(
++        partition_builder_host_peak, partition_optimizer_host_peak);
++      const size_t partition_optimize_gpu_peak =
++        memory_guard::checked_add(partition_build_graph_bytes, partition_gpu_optimize);
++      const bool partition_builder_gpu_is_peak =
++        partition_nn_gpu_workspace >= partition_optimize_gpu_peak;
++      const size_t partition_gpu_peak =
++        std::max(partition_nn_gpu_workspace, partition_optimize_gpu_peak);
++      size_t live_host_bytes = mapping_phase_host;
++      if (use_disk_mode) {
++        // Reordering has completed and its temporary buffers have been released;
++        // core_backward_mapping is also dropped below this point.
++        live_host_bytes = memory_guard::checked_sum(
++          {label_bytes, histogram_bytes,
++           memory_guard::matrix_bytes(dataset_size, 2, sizeof(IdxT)), offset_bytes});
++      } else {
++        live_host_bytes = memory_guard::checked_sum(
++          {mapping_phase_host,
++           memory_guard::matrix_bytes(dataset_size, graph_degree, sizeof(IdxT))});
++      }
++      memory_guard::require_within(
++        partition_builder_host_is_peak
++          ? "ACE actual partition host NN-descent builder workspace"
++          : "ACE actual partition host optimizer/return workspace",
++        memory_guard::checked_sum({live_host_bytes, partition_dataset_bytes, partition_host_peak}),
++        host_budget);
++      memory_guard::require_within(
++        partition_builder_gpu_is_peak
++          ? "ACE actual partition GPU NN-descent builder workspace"
++          : "ACE actual partition GPU optimizer workspace",
++        memory_guard::checked_add(partition_dataset_bytes, partition_gpu_peak),
++        gpu_budget);
++
+       auto sub_dataset = raft::make_host_matrix<T, int64_t>(sub_dataset_size, dataset_dim);
+ 
+       if (use_disk_mode) {
+@@ -1360,17 +1729,7 @@ index<T, IdxT> build_ace(raft::resources const& res,
+       auto read_elapsed =
+         std::chrono::duration_cast<std::chrono::milliseconds>(read_end - start).count();
+ 
+-      // Create index for this partition
+-      cuvs::neighbors::cagra::index_params sub_index_params;
+-      sub_index_params = cuvs::neighbors::cagra::index_params::from_hnsw_params(
+-        raft::make_extents<int64_t>(sub_dataset_size, dataset_dim),
+-        graph_degree / 2,
+-        ef_construction,
+-        cuvs::neighbors::cagra::hnsw_heuristic_type::SAME_GRAPH_FOOTPRINT,
+-        params.metric);
+-      sub_index_params.attach_dataset_on_build = false;
+-      sub_index_params.guarantee_connectivity  = params.guarantee_connectivity;
+-
++      // Create index for this partition after the builder's peak has passed preflight.
+       auto sub_index = cuvs::neighbors::cagra::build(
+         res, sub_index_params, raft::make_const_mdspan(sub_dataset.view()));
+ 
+@@ -1418,10 +1777,12 @@ index<T, IdxT> build_ace(raft::resources const& res,
+         std::chrono::duration_cast<std::chrono::milliseconds>(adjust_end - optimize_end).count();
+ 
+       if (use_disk_mode) {
+-        const size_t graph_offset =
+-          static_cast<size_t>(core_partition_offsets(partition_id)) * graph_degree * sizeof(IdxT) +
+-          graph_header_size;
+-        const size_t graph_bytes = core_sub_dataset_size * graph_degree * sizeof(IdxT);
++        const size_t graph_row_bytes = memory_guard::checked_mul(graph_degree, sizeof(IdxT));
++        const size_t graph_offset = memory_guard::checked_add(
++          graph_header_size,
++          memory_guard::checked_mul(static_cast<size_t>(core_partition_offsets(partition_id)),
++                                    graph_row_bytes));
++        const size_t graph_bytes = memory_guard::checked_mul(core_sub_dataset_size, graph_row_bytes);
+         cuvs::util::write_large_file(
+           graph_fd, sub_search_graph.data_handle(), graph_bytes, graph_offset);
+       }
+@@ -1432,11 +1793,13 @@ index<T, IdxT> build_ace(raft::resources const& res,
+       auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+       double read_throughput =
+         read_elapsed > 0
+-          ? to_mib(sub_dataset_size * dataset_dim * sizeof(T)) / (read_elapsed / 1000.0)
++          ? to_mib(memory_guard::matrix_bytes(sub_dataset_size, dataset_dim, sizeof(T))) /
++              (read_elapsed / 1000.0)
+           : 0.0;
+       double write_throughput =
+         write_elapsed > 0
+-          ? to_mib(core_sub_dataset_size * dataset_dim * sizeof(T)) / (write_elapsed / 1000.0)
++          ? to_mib(memory_guard::matrix_bytes(core_sub_dataset_size, dataset_dim, sizeof(T))) /
++              (write_elapsed / 1000.0)
+           : 0.0;
+       RAFT_LOG_INFO(
+         "ACE: Partition %4lu (%8lu + %8lu) completed in %6ld ms: read %6ld ms (%7.1f MiB/s), "
+diff --git a/cpp/src/neighbors/detail/hnsw.hpp b/cpp/src/neighbors/detail/hnsw.hpp
+index 9ef1d04..305184b 100644
+--- a/cpp/src/neighbors/detail/hnsw.hpp
++++ b/cpp/src/neighbors/detail/hnsw.hpp
+@@ -7,6 +7,7 @@
+ 
+ #include "../../core/nvtx.hpp"
+ #include "../../core/omp_wrapper.hpp"
++#include "cagra/ace_memory_guard.hpp"
+ 
+ #include <cuvs/neighbors/brute_force.hpp>
+ #include <cuvs/neighbors/cagra.hpp>
+@@ -26,14 +27,20 @@
+ #include <filesystem>
+ #include <fstream>
+ #include <memory>
++#include <limits>
++#include <optional>
+ #include <new>
+ #include <random>
++#include <tuple>
++#include <vector>
+ #include <sys/mman.h>
+ #include <thread>
+ #include <unistd.h>
+ 
+ namespace cuvs::neighbors::hnsw::detail {
+ 
++namespace memory_guard = cuvs::neighbors::cagra::detail::memory_guard;
++
+ // This is needed as hnswlib hardcodes the distance type to float
+ // or int32_t in certain places. However, we can solve uint8 or int8
+ // natively with the pacth cuVS applies. We could potentially remove
+@@ -323,20 +330,62 @@ template <typename T>
+ void all_neighbors_graph(raft::resources const& res,
+                          raft::host_matrix_view<const T, int64_t, raft::row_major> dataset,
+                          raft::host_matrix_view<uint32_t, int64_t, raft::row_major> neighbors,
+-                         cuvs::distance::DistanceType metric)
++                         cuvs::distance::DistanceType metric,
++                         const std::optional<size_t>& host_budget = std::nullopt,
++                         const std::optional<size_t>& gpu_budget  = std::nullopt)
+ {
+-  // FIXME: choose better heuristic
+-  bool use_nn_decent = neighbors.size() < 1e7;
+-  if (use_nn_decent) {
++  using memory_guard::checked_add;
++  using memory_guard::checked_mul;
++  using memory_guard::require_within;
++  const size_t rows = dataset.extent(0);
++  const size_t dim = dataset.extent(1);
++  const size_t degree = neighbors.extent(1);
++  // Keep the legacy IVF-PQ heuristic when no guard budget was supplied. The bounded path uses
++  // NN-descent because its source allocations are explicit and can be preflighted as one ledger;
++  // IVF-PQ's training/index build has additional data-dependent device allocations.
++  const bool has_memory_budget = host_budget.has_value() || gpu_budget.has_value();
++  if (memory_guard::hnsw_upper_level_uses_nn_descent(rows, degree, has_memory_budget)) {
++    RAFT_EXPECTS(rows > 0 && rows < static_cast<size_t>(std::numeric_limits<int>::max() - 1),
++                 "memory guard: HNSW upper-level row count is unsupported by NN-descent");
++    const auto [host_workspace, gpu_workspace] =
++      memory_guard::nn_descent_workspace_bytes(rows, dim, degree);
++    require_within("HNSW upper-level NN-descent host workspace", host_workspace, host_budget);
++    require_within("HNSW upper-level NN-descent GPU workspace", gpu_workspace, gpu_budget);
++
+     nn_descent::index_params nn_params;
+-    nn_params.graph_degree              = neighbors.extent(1);
+-    nn_params.intermediate_graph_degree = neighbors.extent(1) * 2;
++    nn_params.graph_degree              = degree;
++    nn_params.intermediate_graph_degree = checked_mul(degree, size_t{2});
+     nn_params.metric                    = metric;
+     nn_params.return_distances          = false;
+     auto nn_index                       = nn_descent::build(res, nn_params, dataset, neighbors);
+   } else {
+-    // TODO: choose parameters to minimize memory consumption
++    // Bound the actual IVF-PQ query batches and their device/host I/O arrays before the builder
++    // allocates them. The large-workspace branch in cagra_build.cuh reserves five batch widths.
+     cagra::graph_build_params::ivf_pq_params ivfpq_params(dataset.extents(), metric);
++    const size_t top_k = checked_add(degree, size_t{1});
++    const size_t gpu_top_k = std::min<size_t>(
++      std::max(memory_guard::checked_scale(degree, ivfpq_params.refinement_rate), top_k), rows);
++    const size_t gpu_row_bytes = checked_add(
++      checked_mul(dim, sizeof(T)), checked_add(checked_mul(gpu_top_k, size_t{sizeof(float) + sizeof(int64_t)}),
++                                                checked_mul(top_k, size_t{sizeof(float) + sizeof(int64_t)})));
++    const size_t host_row_bytes = checked_add(
++      checked_mul(dim, sizeof(T)), checked_add(checked_mul(gpu_top_k, sizeof(int64_t)),
++                                                checked_add(checked_mul(top_k, sizeof(int64_t)),
++                                                            checked_mul(top_k, sizeof(float)))));
++    size_t max_queries = ivfpq_params.search_params.max_internal_batch_size;
++    if (gpu_budget) {
++      const size_t max_by_gpu = *gpu_budget / checked_mul(gpu_row_bytes, size_t{5});
++      max_queries = std::min(max_queries, max_by_gpu);
++    }
++    if (host_budget) {
++      max_queries = std::min(max_queries, *host_budget / host_row_bytes);
++    }
++    RAFT_EXPECTS(max_queries > 0, "memory guard: IVF-PQ upper-level query workspace cannot fit one row");
++    ivfpq_params.search_params.max_internal_batch_size = static_cast<uint32_t>(max_queries);
++    require_within("HNSW upper-level IVF-PQ host workspace",
++                   checked_mul(max_queries, host_row_bytes), host_budget);
++    require_within("HNSW upper-level IVF-PQ GPU workspace",
++                   checked_mul(checked_mul(max_queries, gpu_row_bytes), size_t{5}), gpu_budget);
+     cagra::build_knn_graph(res, dataset, neighbors, ivfpq_params);
+   }
+ }
+@@ -350,8 +399,12 @@ void serialize_to_hnswlib_from_disk(raft::resources const& res,
+   raft::common::nvtx::range<cuvs::common::nvtx::domain::cuvs> fun_scope("cagra::serialize");
+ 
+   auto start_time = std::chrono::system_clock::now();
+-
+-  cuvs::util::buffered_ofstream os(&os_raw, 1 << 20 /*1MB*/);
++  const auto ace_params = std::holds_alternative<graph_build_params::ace_params>(params.graph_build_params)
++                            ? std::get<graph_build_params::ace_params>(params.graph_build_params)
++                            : graph_build_params::ace_params{};
++  const auto host_budget = memory_guard::budget_bytes_from_gib(ace_params.max_host_memory_gb);
++  const auto gpu_budget = memory_guard::budget_bytes_from_gib(ace_params.max_gpu_memory_gb);
++  memory_guard::require_within("HNSW serializer output buffer", size_t{1} << 20, host_budget);
+ 
+   RAFT_EXPECTS(index_.dataset_fd().has_value() && index_.graph_fd().has_value(),
+                "Function only implements serialization from disk.");
+@@ -360,7 +413,34 @@ void serialize_to_hnswlib_from_disk(raft::resources const& res,
+ 
+   auto n_rows           = index_.size();
+   auto dim              = index_.dim();
+-  auto graph_degree_int = static_cast<int>(index_.graph_degree());
++  RAFT_EXPECTS(n_rows > 0 && n_rows <= static_cast<size_t>(std::numeric_limits<int>::max()),
++               "HNSW serializer row count is unsupported");
++  RAFT_EXPECTS(dim > 0 && dim <= static_cast<size_t>(std::numeric_limits<int64_t>::max()),
++               "HNSW serializer dimension is unsupported");
++  const size_t graph_degree = index_.graph_degree();
++  RAFT_EXPECTS(graph_degree > 0 &&
++                 graph_degree <= static_cast<size_t>(std::numeric_limits<int>::max()),
++               "HNSW serializer graph degree is unsupported");
++  if (params.hierarchy != HnswHierarchy::NONE && (host_budget || gpu_budget)) {
++    RAFT_EXPECTS(n_rows < static_cast<size_t>(std::numeric_limits<int>::max() - 1),
++                 "memory guard: bounded HNSW hierarchy exceeds NN-descent row capacity");
++  }
++  auto graph_degree_int = static_cast<int>(graph_degree);
++  const size_t order_arrays_bytes = memory_guard::hnsw_order_arrays_bytes(n_rows);
++  const size_t stream_buffer_bytes = size_t{1} << 20;
++  const size_t hnsw_m = static_cast<size_t>(graph_degree_int / 2 + graph_degree_int % 2);
++  const size_t dummy_index_bytes = memory_guard::checked_sum(
++    {memory_guard::checked_mul(dim, sizeof(T)),
++     memory_guard::checked_mul(memory_guard::checked_mul(hnsw_m, size_t{2}), sizeof(IdxT)),
++     sizeof(int), sizeof(size_t), size_t{4096}});
++  const size_t initial_level_metadata_bytes =
++    params.hierarchy == HnswHierarchy::NONE ? 0 : memory_guard::checked_mul(size_t{129}, sizeof(size_t));
++  memory_guard::require_within("HNSW serializer fixed arrays, stream, and dummy index",
++                               memory_guard::checked_sum(
++                                 {order_arrays_bytes, stream_buffer_bytes, dummy_index_bytes,
++                                  initial_level_metadata_bytes}),
++                               host_budget);
++  cuvs::util::buffered_ofstream os(&os_raw, stream_buffer_bytes);
+   RAFT_LOG_INFO("Saving CAGRA index to hnswlib format, size %zu, dim %zu, graph_degree %zu",
+                 static_cast<size_t>(n_rows),
+                 static_cast<size_t>(dim),
+@@ -472,33 +552,17 @@ void serialize_to_hnswlib_from_disk(raft::resources const& res,
+                dataset_n_cols,
+                static_cast<size_t>(dim));
+ 
+-  const size_t row_size_bytes =
+-    graph_degree_int * sizeof(IdxT) + dim * sizeof(T) + sizeof(uint32_t);
++  const size_t row_size_bytes = memory_guard::checked_sum(
++    {memory_guard::checked_mul(graph_degree, sizeof(IdxT)),
++     memory_guard::checked_mul(dim, sizeof(T)), sizeof(uint32_t)});
+   const size_t target_batch_bytes = 64 * 1024 * 1024;
+-  const size_t batch_size         = std::max<size_t>(1, target_batch_bytes / row_size_bytes);
+-
+-  RAFT_LOG_DEBUG("Using batch size %zu rows (~%.2f MiB/batch)",
+-                 batch_size,
+-                 (batch_size * row_size_bytes) / (1024.0 * 1024.0));
+-
+-  // Allocate buffers for batched reading
+-  auto graph_buffer   = raft::make_host_matrix<IdxT, int64_t>(batch_size, graph_degree_int);
+-  auto dataset_buffer = raft::make_host_matrix<T, int64_t>(batch_size, dim);
+-  auto label_buffer   = raft::make_host_vector<uint32_t, int64_t>(batch_size);
+-
+-  RAFT_LOG_DEBUG("Allocated buffers: graph[%ld,%d], dataset[%ld,%ld], labels[%ld]",
+-                 graph_buffer.extent(0),
+-                 graph_degree_int,
+-                 dataset_buffer.extent(0),
+-                 dataset_buffer.extent(1),
+-                 label_buffer.extent(0));
+ 
+   // initialize dummy HNSW index to retrieve constants
+   auto hnsw_index = std::make_unique<index_impl<T>>(dim, index_.metric(), params.hierarchy);
+ 
+   int odd_graph_degree = graph_degree_int % 2;
+   auto appr_algo       = std::make_unique<hnswlib::HierarchicalNSW<typename hnsw_dist_t<T>::type>>(
+-    hnsw_index->get_space(), 1, (graph_degree_int + 1) / 2, params.ef_construction);
++    hnsw_index->get_space(), 1, hnsw_m, params.ef_construction);
+ 
+   bool create_hierarchy = params.hierarchy != HnswHierarchy::NONE;
+ 
+@@ -512,9 +576,13 @@ void serialize_to_hnswlib_from_disk(raft::resources const& res,
+   std::vector<size_t> offsets;
+ 
+   if (create_hierarchy) {
++    hist.reserve(64);
++    offsets.reserve(65);
+     RAFT_LOG_INFO("Sort points by levels");
+     for (int64_t i = 0; i < n_rows; i++) {
+       auto pt_level = appr_algo->getRandomLevel(appr_algo->mult_);
++      RAFT_EXPECTS(pt_level >= 0 && pt_level < static_cast<int32_t>(hist.capacity()),
++                   "HNSW serializer hierarchy level exceeds supported capacity");
+       while (pt_level >= static_cast<int32_t>(hist.size()))
+         hist.push_back(0);
+       hist[pt_level]++;
+@@ -580,16 +648,121 @@ void serialize_to_hnswlib_from_disk(raft::resources const& res,
+   // 88 ef_construction
+   os.write(reinterpret_cast<char*>(&appr_algo->ef_construction_), sizeof(std::size_t));
+ 
+-  // host queries
+-  auto host_query_set =
+-    raft::make_host_matrix<T, int64_t>(create_hierarchy ? n_rows - hist[0] : 0, dim);
++  // Generate actual upper-level sizes from the random HNSW level histogram and preflight
++  // query, neighbor, and one-at-a-time graph-builder workspaces before allocating any of them.
++  size_t upper_query_rows = create_hierarchy ? n_rows - hist[0] : 0;
++  size_t upper_neighbor_bytes = 0;
++  size_t max_upper_host_workspace = 0;
++  size_t max_upper_gpu_workspace = 0;
++  if (create_hierarchy) {
++    for (size_t pt_level = 1; pt_level < hist.size(); ++pt_level) {
++      const size_t num_pts = n_rows - offsets[pt_level - 1];
++      RAFT_EXPECTS(num_pts > 0, "HNSW serializer upper-level row count is zero");
++      const size_t neighbor_size = num_pts > appr_algo->M_ ? appr_algo->M_ : num_pts - 1;
++      upper_neighbor_bytes = memory_guard::checked_add(
++        upper_neighbor_bytes, memory_guard::matrix_bytes(num_pts, neighbor_size, sizeof(IdxT)));
++      if (neighbor_size == 0) { continue; }
++      size_t host_workspace = 0;
++      size_t gpu_workspace = 0;
++      const bool has_memory_budget = host_budget.has_value() || gpu_budget.has_value();
++      if (memory_guard::hnsw_upper_level_uses_nn_descent(
++            num_pts, neighbor_size, has_memory_budget)) {
++        std::tie(host_workspace, gpu_workspace) =
++          memory_guard::nn_descent_workspace_bytes(num_pts, dim, neighbor_size);
++      } else {
++        cagra::graph_build_params::ivf_pq_params ivfpq_params(
++          raft::make_extents<int64_t>(num_pts, dim), index_.metric());
++        const size_t top_k = memory_guard::checked_add(neighbor_size, size_t{1});
++        const size_t gpu_top_k = std::min<size_t>(
++          std::max(memory_guard::checked_scale(neighbor_size, ivfpq_params.refinement_rate), top_k),
++          num_pts);
++        const size_t gpu_row_bytes = memory_guard::checked_sum(
++          {memory_guard::checked_mul(dim, sizeof(T)),
++           memory_guard::checked_mul(gpu_top_k, sizeof(float) + sizeof(int64_t)),
++           memory_guard::checked_mul(top_k, sizeof(float) + sizeof(int64_t))});
++        const size_t host_row_bytes = memory_guard::checked_sum(
++          {memory_guard::checked_mul(dim, sizeof(T)),
++           memory_guard::checked_mul(gpu_top_k, sizeof(int64_t)),
++           memory_guard::checked_mul(top_k, sizeof(int64_t) + sizeof(float))});
++        size_t max_queries = ivfpq_params.search_params.max_internal_batch_size;
++        if (gpu_budget) {
++          max_queries = std::min(max_queries,
++                                 *gpu_budget / memory_guard::checked_mul(gpu_row_bytes, size_t{5}));
++        }
++        if (host_budget) {
++          max_queries = std::min(max_queries, *host_budget / host_row_bytes);
++        }
++        RAFT_EXPECTS(max_queries > 0,
++                     "memory guard: HNSW upper-level IVF-PQ workspace cannot fit one row");
++        host_workspace = memory_guard::checked_mul(max_queries, host_row_bytes);
++        gpu_workspace = memory_guard::checked_mul(
++          memory_guard::checked_mul(max_queries, gpu_row_bytes), size_t{5});
++      }
++      max_upper_host_workspace = std::max(max_upper_host_workspace, host_workspace);
++      max_upper_gpu_workspace = std::max(max_upper_gpu_workspace, gpu_workspace);
++    }
++  }
++  const size_t upper_query_bytes = memory_guard::matrix_bytes(upper_query_rows, dim, sizeof(T));
++  const size_t level_metadata_bytes = memory_guard::checked_sum(
++    {memory_guard::matrix_bytes(hist.capacity(), 1, sizeof(size_t)),
++     memory_guard::matrix_bytes(offsets.capacity(), 1, sizeof(size_t)),
++     memory_guard::matrix_bytes(hist.size() > 0 ? hist.size() - 1 : 0,
++                                1,
++                                sizeof(raft::host_matrix<IdxT, int64_t>))});
++  const size_t fixed_host_arrays_bytes = memory_guard::checked_sum(
++    {order_arrays_bytes, stream_buffer_bytes, dummy_index_bytes, upper_query_bytes, upper_neighbor_bytes,
++     level_metadata_bytes});
++  const size_t fixed_host_bytes =
++    memory_guard::checked_add(fixed_host_arrays_bytes, max_upper_host_workspace);
++  memory_guard::require_within("HNSW serializer actual upper-level host arrays and workspace",
++                               fixed_host_bytes,
++                               host_budget);
++  memory_guard::require_within("HNSW serializer actual upper-level GPU workspace",
++                               max_upper_gpu_workspace,
++                               gpu_budget);
++  size_t batch_size = std::min<size_t>(
++    static_cast<size_t>(n_rows), std::max<size_t>(1, target_batch_bytes / row_size_bytes));
++  if (host_budget) {
++    const size_t available_batch_bytes = *host_budget - fixed_host_bytes;
++    batch_size = std::min(batch_size, available_batch_bytes / row_size_bytes);
++    RAFT_EXPECTS(batch_size > 0,
++                 "memory guard: HNSW serializer cannot fit one disk-read batch row");
++  }
++  const size_t batch_bytes = memory_guard::checked_mul(batch_size, row_size_bytes);
++  const size_t serializer_host_peak = memory_guard::hnsw_serializer_host_peak_bytes(
++    fixed_host_arrays_bytes, max_upper_host_workspace, batch_bytes);
++  memory_guard::require_within("HNSW serializer disk-read batch buffers and upper-level workspace",
++                               serializer_host_peak,
++                               host_budget);
++  std::optional<size_t> upper_workspace_host_budget = std::nullopt;
++  if (host_budget) {
++    upper_workspace_host_budget = memory_guard::hnsw_serializer_builder_host_budget(
++      *host_budget, fixed_host_arrays_bytes, batch_bytes);
++  }
++  RAFT_LOG_DEBUG("Using batch size %zu rows (~%.2f MiB/batch)",
++                 batch_size,
++                 batch_bytes / (1024.0 * 1024.0));
++
++  auto graph_buffer = raft::make_host_matrix<IdxT, int64_t>(batch_size, graph_degree_int);
++  auto dataset_buffer = raft::make_host_matrix<T, int64_t>(batch_size, dim);
++  auto label_buffer = raft::make_host_vector<uint32_t, int64_t>(batch_size);
++  RAFT_LOG_DEBUG("Allocated buffers: graph[%ld,%d], dataset[%ld,%ld], labels[%ld]",
++                 graph_buffer.extent(0),
++                 graph_degree_int,
++                 dataset_buffer.extent(0),
++                 dataset_buffer.extent(1),
++                 label_buffer.extent(0));
++
++  auto host_query_set = raft::make_host_matrix<T, int64_t>(upper_query_rows, dim);
+ 
+   int64_t d_report_offset    = n_rows / 10;  // Report progress in 10% steps.
+   int64_t next_report_offset = d_report_offset;
+   auto start_clock           = std::chrono::system_clock::now();
+ 
+   RAFT_EXPECTS(appr_algo->size_data_per_element_ ==
+-                 dim * sizeof(T) + appr_algo->maxM0_ * sizeof(IdxT) + sizeof(int) + sizeof(size_t),
++                 memory_guard::checked_sum({memory_guard::checked_mul(dim, sizeof(T)),
++                                            memory_guard::checked_mul(appr_algo->maxM0_, sizeof(IdxT)),
++                                            sizeof(int), sizeof(size_t)}),
+                "Size data per element mismatch");
+ 
+   RAFT_LOG_INFO("Writing base level");
+@@ -597,18 +770,33 @@ void serialize_to_hnswlib_from_disk(raft::resources const& res,
+   float GiB            = 1 << 30;
+   IdxT zero            = 0;
+   RAFT_EXPECTS(appr_algo->size_data_per_element_ ==
+-                 dim * sizeof(T) + appr_algo->maxM0_ * sizeof(IdxT) + sizeof(int) + sizeof(size_t),
++                 memory_guard::checked_sum({memory_guard::checked_mul(dim, sizeof(T)),
++                                            memory_guard::checked_mul(appr_algo->maxM0_, sizeof(IdxT)),
++                                            sizeof(int), sizeof(size_t)}),
+                "Size data per element mismatch");
+ 
+   // Helper lambda for parallel reading of batches
+   auto read_batch = [&](int64_t start_row, int64_t rows_to_read) {
+-    const size_t graph_bytes   = rows_to_read * graph_degree_int * sizeof(IdxT);
+-    const size_t dataset_bytes = rows_to_read * dim * sizeof(T);
+-    const size_t label_bytes   = rows_to_read * sizeof(uint32_t);
+-
+-    const off_t graph_offset   = graph_header_size + start_row * graph_degree_int * sizeof(IdxT);
+-    const off_t dataset_offset = dataset_header_size + start_row * dim * sizeof(T);
+-    const off_t label_offset   = label_header_size + start_row * sizeof(uint32_t);
++    const size_t graph_row_bytes = memory_guard::checked_mul(graph_degree, sizeof(IdxT));
++    const size_t dataset_row_bytes = memory_guard::checked_mul(dim, sizeof(T));
++    const size_t graph_bytes = memory_guard::checked_mul(rows_to_read, graph_row_bytes);
++    const size_t dataset_bytes = memory_guard::checked_mul(rows_to_read, dataset_row_bytes);
++    const size_t label_bytes = memory_guard::checked_mul(rows_to_read, sizeof(uint32_t));
++    const size_t graph_offset_bytes = memory_guard::checked_add(
++      graph_header_size, memory_guard::checked_mul(static_cast<size_t>(start_row), graph_row_bytes));
++    const size_t dataset_offset_bytes = memory_guard::checked_add(
++      dataset_header_size,
++      memory_guard::checked_mul(static_cast<size_t>(start_row), dataset_row_bytes));
++    const size_t label_offset_bytes = memory_guard::checked_add(
++      label_header_size,
++      memory_guard::checked_mul(static_cast<size_t>(start_row), sizeof(uint32_t)));
++    RAFT_EXPECTS(graph_offset_bytes <= static_cast<size_t>(std::numeric_limits<off_t>::max()) &&
++                   dataset_offset_bytes <= static_cast<size_t>(std::numeric_limits<off_t>::max()) &&
++                   label_offset_bytes <= static_cast<size_t>(std::numeric_limits<off_t>::max()),
++                 "HNSW serializer file offset is not representable");
++    const off_t graph_offset = static_cast<off_t>(graph_offset_bytes);
++    const off_t dataset_offset = static_cast<off_t>(dataset_offset_bytes);
++    const off_t label_offset = static_cast<off_t>(label_offset_bytes);
+ 
+     RAFT_LOG_DEBUG("Reading batch: row=%ld, rows=%ld", start_row, rows_to_read);
+     RAFT_LOG_DEBUG(
+@@ -732,8 +920,9 @@ void serialize_to_hnswlib_from_disk(raft::resources const& res,
+   // trigger knn builds for all levels
+   std::vector<raft::host_matrix<IdxT, int64_t>> host_neighbors;
+   if (create_hierarchy) {
++    host_neighbors.reserve(hist.size() - 1);
+     for (size_t pt_level = 1; pt_level < hist.size(); pt_level++) {
+-      auto num_pts       = n_rows - offsets[pt_level - 1];
++      auto num_pts = n_rows - offsets[pt_level - 1];
+       auto neighbor_size = num_pts > appr_algo->M_ ? appr_algo->M_ : num_pts - 1;
+       host_neighbors.emplace_back(raft::make_host_matrix<IdxT, int64_t>(num_pts, neighbor_size));
+     }
+@@ -745,8 +934,13 @@ void serialize_to_hnswlib_from_disk(raft::resources const& res,
+         host_query_set.extent(0) - removed_rows,
+         dim);
+       auto neighbor_view = host_neighbors[pt_level - 1].view();
+-      all_neighbors_graph(
+-        res, raft::make_const_mdspan(sub_query_view), neighbor_view, index_.metric());
++      if (neighbor_view.extent(1) == 0) { continue; }
++      all_neighbors_graph(res,
++                          raft::make_const_mdspan(sub_query_view),
++                          neighbor_view,
++                          index_.metric(),
++                          upper_workspace_host_budget,
++                          gpu_budget);
+     }
+   }
+ 
+@@ -1289,8 +1483,8 @@ std::unique_ptr<index<T>> build(raft::resources const& res,
+   // Create CAGRA index parameters from HNSW parameters
+   cuvs::neighbors::cagra::index_params cagra_params;
+   cagra_params.metric                    = params.metric;
+-  cagra_params.intermediate_graph_degree = params.M * 3;
+-  cagra_params.graph_degree              = params.M * 2;
++  cagra_params.intermediate_graph_degree = memory_guard::checked_mul(params.M, size_t{3});
++  cagra_params.graph_degree              = memory_guard::checked_mul(params.M, size_t{2});
+ 
+   // Configure ACE parameters for CAGRA
+   cuvs::neighbors::cagra::graph_build_params::ace_params cagra_ace_params;

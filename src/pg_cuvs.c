@@ -40,6 +40,8 @@
 #include "catalog/namespace.h"
 #include "catalog/pg_type.h"
 #include "commands/defrem.h"
+#include "commands/tablespace.h"
+#include "common/cryptohash.h"
 #include "nodes/pg_list.h"
 #include "nodes/value.h"
 #include "nodes/pathnodes.h"
@@ -83,6 +85,8 @@
 #include "cuvs_util.h"
 #include "cuvs_build_corpus.h"   /* ADR-057: leak-safe tiered build-corpus handoff */
 #include "hnsw_export.h"
+#include "cuvs_hnsw_build.h"
+#include "cuvs_hnsw_build_common.h"
 
 PG_MODULE_MAGIC;
 
@@ -2147,7 +2151,7 @@ cuvs_index_metric(Relation indexRel)
     {
         const char *opfname =
             NameStr(((Form_pg_opfamily) GETSTRUCT(oftup))->opfname);
-        m = cuvs_metric_from_opclass_name(opfname);
+        m = cuvs_hnsw_metric_from_family(opfname);
         ReleaseSysCache(oftup);
     }
 
@@ -2198,6 +2202,209 @@ cuvs_effective_build_cap_bytes(void)
     if (avail == 0)
         return 0;
     return (size_t) ((double) avail * cuvs_build_mem_safety_ratio);
+}
+
+/* Source-less HNSW input is an ordinary disk spool. Neither this scan nor its
+ * TID mapping grows a corpus-sized allocation in the PostgreSQL backend. */
+typedef struct CuvsHnswSpool {
+    File vectors;
+    File tids;
+    uint64_t n;
+    uint32_t dim;
+    uint32_t metric;
+    uint32_t crc;
+    pg_cryptohash_ctx *input_hash;
+    bool halfvec;
+    float *row;
+} CuvsHnswSpool;
+
+static void
+cuvs_hnsw_spool_write(File file, const void *data, size_t bytes, off_t offset)
+{
+    const char *p = data;
+    while (bytes)
+    {
+        ssize_t n;
+        CHECK_FOR_INTERRUPTS();
+        n = FileWrite(file, (char *)p, bytes, offset, 0);
+        if (n <= 0)
+            ereport(ERROR, (errcode_for_file_access(),
+                           errmsg("pg_cuvs: writing HNSW disk spool failed: %m")));
+        p += n; bytes -= n; offset += n;
+    }
+}
+
+static float
+cuvs_half_to_float(uint16_t h)
+{
+    unsigned e = (h >> 10) & 31, m = h & 1023;
+    float value = e == 0 ? ldexpf((float)m, -24)
+        : e == 31 ? (m ? NAN : INFINITY)
+        : ldexpf((float)(1024 + m), (int)e - 25);
+    return h & 0x8000 ? -value : value;
+}
+
+static void
+cuvs_hnsw_spool_callback(Relation index, ItemPointer tid, Datum *values,
+                          bool *isnull, bool alive, void *state)
+{
+    CuvsHnswSpool *spool = state;
+    PgVector *v;
+    uint64_t encoded;
+    double norm2 = 0;
+    size_t rowbytes;
+    (void)index;
+    if (!alive || isnull[0]) return;
+    CHECK_FOR_INTERRUPTS();
+    v = DatumGetPgVector(values[0]);
+    if ((uint32_t)v->dim != spool->dim)
+        ereport(ERROR, (errcode(ERRCODE_DATA_EXCEPTION),
+                       errmsg("pg_cuvs: HNSW input dimension mismatch")));
+    for (uint32_t j = 0; j < spool->dim; j++)
+    {
+        float f = spool->halfvec ? cuvs_half_to_float(((uint16_t *)v->x)[j]) : v->x[j];
+        if (!isfinite(f))
+            ereport(ERROR, (errcode(ERRCODE_DATA_EXCEPTION),
+                           errmsg("pg_cuvs: HNSW input contains nonfinite values")));
+        spool->row[j] = f;
+        norm2 += (double)f * f;
+    }
+    if ((void *)v != DatumGetPointer(values[0])) pfree(v);
+    /* Match pgvector cosine builds: zero vectors are not index entries. */
+    if (spool->metric == CUVS_METRIC_COSINE)
+    {
+        if (norm2 == 0) return;
+        double norm = sqrt(norm2);
+        for (uint32_t j = 0; j < spool->dim; j++)
+            spool->row[j] = (float)(spool->row[j] / norm);
+    }
+    rowbytes = (size_t)spool->dim * sizeof(float);
+    if (spool->n >= CUVS_TIDS_MAX_VECS
+        || spool->n >= (uint64_t)INT64_MAX / rowbytes)
+        ereport(ERROR, (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+                       errmsg("pg_cuvs: HNSW row count exceeds supported file offsets")));
+    if (spool->vectors < 0)
+    {
+        // Empty/all-NULL/cosine-zero scans create no files or daemon work.
+        spool->vectors = OpenTemporaryFile(false);
+        spool->tids = OpenTemporaryFile(false);
+        if (!cuvs_hnsw_regular_disk(FileGetRawDesc(spool->vectors))
+            || !cuvs_hnsw_regular_disk(FileGetRawDesc(spool->tids)))
+            ereport(ERROR, (errmsg("pg_cuvs: HNSW spool requires a regular disk tablespace; tmpfs is unsupported")));
+    }
+    encoded = cuvs_tid_encode(ItemPointerGetBlockNumber(tid), ItemPointerGetOffsetNumber(tid));
+    cuvs_hnsw_spool_write(spool->vectors, spool->row, rowbytes, (off_t)(spool->n * rowbytes));
+    cuvs_hnsw_spool_write(spool->tids, &encoded, sizeof(encoded),
+        (off_t)(sizeof(CuvsTidsHeader) + spool->n * sizeof(encoded)));
+    spool->crc = cuvs_crc32_stream_update(spool->crc, &encoded, sizeof(encoded));
+    if (pg_cryptohash_update(spool->input_hash, (const uint8 *)spool->row, rowbytes) < 0)
+        ereport(ERROR, (errmsg("pg_cuvs: HNSW input digest failed: %s",
+                              pg_cryptohash_error(spool->input_hash))));
+    spool->n++;
+}
+
+void
+cuvs_build_hnsw_from_heap(Relation heapRel, Relation indexRel, IndexInfo *indexInfo,
+                          const char *mode, CuvsHnswBuildResult *out)
+{
+    CuvsHnswSpool *spool = palloc0(sizeof(*spool));
+    Form_pg_attribute attr = TupleDescAttr(RelationGetDescr(indexRel), 0);
+    HeapTuple type;
+    const char *name;
+    uint64_t cap;
+    memset(out, 0, sizeof(*out));
+    out->hnsw_fd = out->tids_fd = -1;
+    spool->vectors = spool->tids = -1;
+    if (!mode || (strcmp(mode, "nsw") && strcmp(mode, "hnsw")
+                  && strcmp(mode, "hnswlib") && strcmp(mode, "hnswlib_file")))
+        ereport(ERROR, (errmsg("pg_cuvs: unsupported HNSW build mode")));
+    if (attr->atttypmod <= 0 || attr->atttypmod > 65535)
+        ereport(ERROR, (errmsg("pg_cuvs: HNSW disk build requires a declared vector dimension")));
+    type = SearchSysCache1(TYPEOID, ObjectIdGetDatum(attr->atttypid));
+    if (!HeapTupleIsValid(type)) elog(ERROR, "pg_cuvs: input type does not exist");
+    name = NameStr(((Form_pg_type)GETSTRUCT(type))->typname);
+    spool->halfvec = strcmp(name, "halfvec") == 0;
+    if (!spool->halfvec && strcmp(name, "vector"))
+        ereport(ERROR, (errmsg("pg_cuvs: HNSW disk build supports vector and halfvec only")));
+    ReleaseSysCache(type);
+    spool->dim = (uint32_t)attr->atttypmod;
+    spool->metric = cuvs_index_metric(indexRel);
+    spool->crc = cuvs_crc32_stream_begin();
+    spool->row = palloc((Size)spool->dim * sizeof(float));
+    cap = cuvs_effective_build_cap_bytes();
+    PG_TRY();
+    {
+        CuvsTidsHeader header = {0};
+        char error[128] = {0};
+        int rc;
+        spool->input_hash = pg_cryptohash_create(PG_SHA256);
+        if (!spool->input_hash || pg_cryptohash_init(spool->input_hash) < 0)
+            ereport(ERROR, (errmsg("pg_cuvs: cannot initialize HNSW input digest")));
+        PrepareTempTablespaces();
+        out->reltuples = table_index_build_scan(heapRel, indexRel, indexInfo,
+            true, true, cuvs_hnsw_spool_callback, spool, NULL);
+        out->n_vecs = spool->n;
+        out->dim = spool->dim;
+        out->metric = spool->metric;
+        if (spool->n > 0)
+        {
+            if (!cap)
+                ereport(ERROR, (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+                               errmsg("pg_cuvs: HNSW build host capacity is unknown"),
+                               errhint("Set cuvs.max_build_mem_mb to a bounded admission budget.")));
+            header.magic = CUVS_TIDS_MAGIC;
+            header.version = CUVS_TIDS_VERSION;
+            header.n_vecs = (int64_t)spool->n;
+            header.dim = spool->dim;
+            header.metric = spool->metric;
+            header.body_crc32 = cuvs_crc32_stream_end(spool->crc);
+            cuvs_hnsw_spool_write(spool->tids, &header, sizeof(header), 0);
+            {
+                uint8 digest[32];
+                char hex[65];
+                struct stat input;
+                const char digits[] = "0123456789abcdef";
+                if (pg_cryptohash_final(spool->input_hash, digest, sizeof(digest)) < 0)
+                    ereport(ERROR, (errmsg("pg_cuvs: cannot finalize HNSW input digest")));
+                if (fstat(FileGetRawDesc(spool->vectors), &input))
+                    ereport(ERROR, (errcode_for_file_access(), errmsg("pg_cuvs: cannot stat HNSW input: %m")));
+                for (int i = 0; i < 32; i++)
+                { hex[i * 2] = digits[digest[i] >> 4]; hex[i * 2 + 1] = digits[digest[i] & 15]; }
+                hex[64] = '\0';
+                ereport(LOG, (errmsg("pg_cuvs: HNSW input kind=sha256-float32-native-row-scan-order digest=%s rows=%llu dim=%u metric=%u input_dev=%llu input_ino=%llu index_oid=%u",
+                    hex, (unsigned long long)spool->n, spool->dim, spool->metric,
+                    (unsigned long long)input.st_dev, (unsigned long long)input.st_ino,
+                    RelationGetRelid(indexRel))));
+            }
+            rc = cuvs_ipc_build_hnsw_file(cuvs_socket_path,
+                FileGetRawDesc(spool->vectors), spool->n, spool->dim, spool->metric,
+                64, 128, strcmp(mode, "nsw") != 0, cap,
+                &out->hnsw_fd, error, sizeof(error));
+            if (rc == CUVS_STATUS_CANCELED) CHECK_FOR_INTERRUPTS();
+            if (rc != CUVS_STATUS_OK)
+                ereport(ERROR, (errmsg("pg_cuvs: temporary HNSW build failed (status %d): %s", rc, error)));
+            out->tids_fd = dup(FileGetRawDesc(spool->tids));
+            if (out->tids_fd < 0)
+                ereport(ERROR, (errcode_for_file_access(), errmsg("pg_cuvs: cannot hand off TID spool: %m")));
+            (void)fcntl(out->tids_fd, F_SETFD, FD_CLOEXEC);
+        }
+    }
+    PG_CATCH();
+    {
+        if (out->hnsw_fd >= 0) close(out->hnsw_fd);
+        if (out->tids_fd >= 0) close(out->tids_fd);
+        out->hnsw_fd = out->tids_fd = -1;
+        if (spool->vectors >= 0) FileClose(spool->vectors);
+        if (spool->tids >= 0) FileClose(spool->tids);
+        if (spool->input_hash) pg_cryptohash_free(spool->input_hash);
+        PG_RE_THROW();
+    }
+    PG_END_TRY();
+    if (spool->vectors >= 0) FileClose(spool->vectors);
+    if (spool->tids >= 0) FileClose(spool->tids);
+    if (spool->input_hash) pg_cryptohash_free(spool->input_hash);
+    pfree(spool->row);
+    pfree(spool);
 }
 
 /* ----------------------------------------------------------------

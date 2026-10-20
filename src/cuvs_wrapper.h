@@ -335,6 +335,31 @@ int cuvs_bf_search_batch(
  */
 typedef void *CuvsHnswIndex;
 
+/* Private HNSW build; no mutable index handle or permanent registry entry.
+ * owner_fd is a separate lifecycle socket. out_fd is read-only disk storage,
+ * unlinked before return. The caller supplies a request-private workdir. */
+typedef struct CuvsHnswFileBuild {
+    uint64_t n_vecs;
+    uint64_t host_budget;
+    uint64_t gpu_budget;
+    uint32_t dim;
+    uint32_t metric;
+    uint32_t graph_degree;
+    uint32_t intermediate_degree;
+    uint32_t hierarchy;
+    /* Internal safe-boundary observer. Never received from IPC; only a
+     * CUVS_TEST_HOOKS daemon installs it for controlled failure fixtures. */
+    int (*phase_hook)(void *arg, const char *phase);
+    void *phase_arg;
+} CuvsHnswFileBuild;
+
+int cuvs_hnsw_build_file(int vectors_fd, int owner_fd,
+    const CuvsHnswFileBuild *params, const char *workdir, int device_id,
+    int *out_fd, char *error, size_t error_len);
+
+/* Reap only private temporary directories whose daemon lease lock is gone. */
+int cuvs_hnsw_reap_workdirs(const char *root);
+
 #define CUVS_HNSW_MIN_ELEMENTS       16
 #define CUVS_HNSW_SERIALIZE_OK        0
 #define CUVS_HNSW_SERIALIZE_SKIPPED   1

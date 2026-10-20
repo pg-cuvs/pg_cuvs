@@ -64,6 +64,8 @@
 #include "catalog/pg_type.h"     /* Form_pg_type (#162: vector/halfvec type detection) */
 
 #include <math.h>
+#include <errno.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -72,7 +74,9 @@
 
 #include "cuvs_ipc.h"
 #include "cuvs_util.h"
+#include "cuvs_hnsw_build.h"
 #include "hnsw_export.h"
+#include "storage/buffile.h"
 
 /* GUC declared in pg_cuvs.c — socket path for daemon IPC */
 extern char *cuvs_socket_path;
@@ -81,12 +85,16 @@ extern char *cuvs_socket_path;
  * used by the pre-GPU dim-ceiling check below. */
 extern int cuvs_cagra_reloption_graph_degree(Relation cagra_rel);
 
+static uint32_t cagra_index_metric(Oid index_oid);
+
 /* ----------------------------------------------------------------
  * pgvector HNSW on-disk constants (must match pgvector source)
  * ---------------------------------------------------------------- */
 #define PGV_HNSW_MAGIC          0xA953A953u
 #define PGV_HNSW_VERSION        1u
 #define PGV_HNSW_PAGE_ID        0xFF90u
+#define CUVS_HNSW_BUILD_M       32
+#define CUVS_HNSW_BUILD_EF      128
 
 /* Byte size of the 13-field hnswlib binary header (fixed across versions):
  * 10 × size_t(8) + 2 × int(4) + 1 × double(8) = 96 bytes. */
@@ -129,6 +137,87 @@ typedef struct {
     uint16_t    unused;
     uint16_t    page_id;
 } PgvHnswPageOpaque;   /* 8 bytes */
+
+static void
+hnsw_init_disk_page(Page page)
+{
+    PgvHnswPageOpaque *opaque;
+
+    PageInit(page, BLCKSZ, sizeof(PgvHnswPageOpaque));
+    opaque = (PgvHnswPageOpaque *)PageGetSpecialPointer(page);
+    opaque->nextblkno = InvalidBlockNumber;
+    opaque->unused = 0;
+    opaque->page_id = PGV_HNSW_PAGE_ID;
+}
+
+/* pgvector's vacuum walkers start at block 1 and follow nextblkno. */
+static bool
+hnsw_set_disk_page_chain(Page page, uint64_t data_blkno,
+                         uint64_t data_page_count)
+{
+    PgvHnswPageOpaque *opaque;
+
+    if (page == NULL || data_blkno == 0 || data_page_count == 0 ||
+        data_page_count >= (uint64_t)InvalidBlockNumber ||
+        data_blkno > data_page_count)
+        return false;
+
+    opaque = (PgvHnswPageOpaque *)PageGetSpecialPointer(page);
+    if (opaque->page_id != PGV_HNSW_PAGE_ID)
+        return false;
+
+    opaque->nextblkno = data_blkno < data_page_count
+        ? (BlockNumber)(data_blkno + 1)
+        : InvalidBlockNumber;
+    return true;
+}
+
+static bool
+hnsw_init_metapage(Page page, uint32_t dim, uint16_t m, uint16_t ef_construction,
+                   BlockNumber entry_blkno, OffsetNumber entry_offno,
+                   int16_t entry_level, BlockNumber insert_page)
+{
+    PgvHnswMeta *metap;
+
+    if (page == NULL || dim == 0 || dim > INT16_MAX || m == 0 ||
+        ef_construction == 0 || insert_page == InvalidBlockNumber)
+        return false;
+    if (entry_blkno == InvalidBlockNumber)
+    {
+        if (entry_offno != InvalidOffsetNumber || entry_level != -1)
+            return false;
+    }
+    else if (entry_offno == InvalidOffsetNumber || entry_level < 0)
+        return false;
+
+    hnsw_init_disk_page(page);
+    metap = (PgvHnswMeta *)PageGetContents(page);
+    memset(metap, 0, sizeof(*metap));
+    metap->magicNumber = PGV_HNSW_MAGIC;
+    metap->version = PGV_HNSW_VERSION;
+    metap->dimensions = dim;
+    metap->m = m;
+    metap->efConstruction = ef_construction;
+    metap->entryBlkno = entry_blkno;
+    metap->entryOffno = entry_offno;
+    metap->entryLevel = entry_level;
+    metap->insertPage = insert_page;
+    ((PageHeader)page)->pd_lower =
+        (uint16_t)(((char *)metap + sizeof(PgvHnswMeta)) - (char *)page);
+    return true;
+}
+
+static bool
+hnsw_init_empty_pages(Page metapage, Page first_data_page, uint32_t dim,
+                      uint16_t m, uint16_t ef_construction)
+{
+    if (metapage == NULL || first_data_page == NULL ||
+        !hnsw_init_metapage(metapage, dim, m, ef_construction,
+                            InvalidBlockNumber, InvalidOffsetNumber, -1, 1))
+        return false;
+    hnsw_init_disk_page(first_data_page);
+    return true;
+}
 
 /*
  * Element tuple header (type = 1).
@@ -364,6 +453,563 @@ typedef struct {
     size_t  efConstruction;
 } HnswlibHeader;
 
+_Static_assert(sizeof(HnswlibHeader) == HNSWLIB_HEADER_BYTES,
+               "hnswlib binary header layout changed");
+_Static_assert(sizeof(CuvsTidsHeader) == 32,
+               "CuvsTidsHeader layout changed");
+
+/* One fixed-size, disk-backed record per serialized node.  A location is
+ * enough to resolve every neighbor reference; node vectors, links, TIDs and
+ * ElemDesc records remain row-local scratch in the source-less importer. */
+typedef struct HnswNodeLocation
+{
+    uint32_t elem_blkno;
+    uint16_t elem_offno;
+    uint8_t  level;
+    uint8_t  reserved;
+} HnswNodeLocation;
+
+_Static_assert(sizeof(HnswNodeLocation) == 8,
+               "HNSW location records must stay compact");
+
+typedef void (*HnswInterruptCheck)(void);
+typedef bool (*HnswLocationWriter)(void *arg, uint64_t node,
+                                   const HnswNodeLocation *location,
+                                   char *error, size_t error_size);
+
+#define HNSW_FILE_IO_CHUNK (64 * 1024)
+
+static bool
+hnsw_set_file_error(char *error, size_t error_size, const char *message)
+{
+    if (error && error_size > 0)
+        snprintf(error, error_size, "%s", message);
+    return false;
+}
+
+static bool
+hnsw_set_file_errorf(char *error, size_t error_size,
+                     const char *format, uint64_t a, uint64_t b)
+{
+    if (error && error_size > 0)
+        snprintf(error, error_size, format, (unsigned long long)a,
+                 (unsigned long long)b);
+    return false;
+}
+
+static bool
+hnsw_add_u64(uint64_t a, uint64_t b, uint64_t *out)
+{
+    if (a > UINT64_MAX - b)
+        return false;
+    *out = a + b;
+    return true;
+}
+
+static bool
+hnsw_mul_u64(uint64_t a, uint64_t b, uint64_t *out)
+{
+    if (a != 0 && b > UINT64_MAX / a)
+        return false;
+    *out = a * b;
+    return true;
+}
+
+static bool
+hnsw_pread_exact(int fd, void *buffer, size_t length, uint64_t offset)
+{
+    char *p = (char *)buffer;
+    size_t done = 0;
+
+    if (offset > (uint64_t)INT64_MAX ||
+        length > (uint64_t)INT64_MAX - offset)
+        return false;
+    while (done < length)
+    {
+        ssize_t n = pread(fd, p + done, length - done,
+                          (off_t)(offset + (uint64_t)done));
+        if (n < 0 && errno == EINTR)
+            continue;
+        if (n <= 0)
+            return false;
+        done += (size_t)n;
+    }
+    return true;
+}
+
+static bool
+hnsw_tid_is_valid(uint64_t tid)
+{
+    uint32_t block;
+    uint16_t offset;
+
+    cuvs_tid_decode(tid, &block, &offset);
+    return block != InvalidBlockNumber && offset > InvalidOffsetNumber &&
+        offset <= MaxOffsetNumber;
+}
+
+static bool
+hnsw_read_tid_for_label(int tids_fd, uint64_t n_vecs, uint64_t label,
+                        uint64_t *tid_out, char *error, size_t error_size)
+{
+    uint64_t body_offset;
+    uint64_t file_offset;
+    uint64_t tid;
+
+    if (label >= n_vecs)
+        return hnsw_set_file_error(error, error_size,
+                                   "HNSW label is outside the TID row count");
+    if (!hnsw_mul_u64(label, sizeof(uint64_t), &body_offset) ||
+        !hnsw_add_u64(sizeof(CuvsTidsHeader), body_offset, &file_offset) ||
+        !hnsw_pread_exact(tids_fd, &tid, sizeof(tid), file_offset))
+        return hnsw_set_file_error(error, error_size,
+                                   "cannot read TID for HNSW label");
+    if (!hnsw_tid_is_valid(tid))
+        return hnsw_set_file_error(error, error_size,
+                                   "TID file contains an invalid heap TID");
+    *tid_out = tid;
+    return true;
+}
+
+static bool
+hnsw_layout_location(uint64_t node, uint64_t n_nodes, uint8_t level,
+                     bool packed_nsw, uint32_t pairs_per_page,
+                     HnswNodeLocation *location)
+{
+    uint64_t block;
+    uint64_t slot;
+
+    if (node >= n_nodes)
+        return false;
+    if (packed_nsw)
+    {
+        if (pairs_per_page == 0 || level != 0)
+            return false;
+        block = 1 + node / pairs_per_page;
+        slot = node % pairs_per_page;
+        location->elem_offno = (uint16_t)(1 + 2 * slot);
+    }
+    else
+    {
+        block = 1 + node;
+        location->elem_offno = 1;
+    }
+    if (block >= (uint64_t)InvalidBlockNumber ||
+        location->elem_offno == InvalidOffsetNumber ||
+        location->elem_offno + 1 > MaxOffsetNumber)
+        return false;
+    location->elem_blkno = (uint32_t)block;
+    location->level = level;
+    location->reserved = 0;
+    return true;
+}
+
+static bool
+hnsw_compute_pack_k(int dim, int bytes_per_dim, int m, uint32_t *k_out)
+{
+    size_t esize;
+    size_t nsize;
+    size_t needed;
+
+    if (dim <= 0 || (bytes_per_dim != 2 && bytes_per_dim != 4) || m <= 0)
+        return false;
+    esize = elem_tuple_size(dim, bytes_per_dim);
+    nsize = neigh_tuple_size(0, m);
+    needed = esize + nsize + 4 * PGV_ITEM_OVERHEAD;
+    if (needed == 0 || needed > PGV_USABLE_BYTES)
+        return false;
+    *k_out = (uint32_t)(PGV_USABLE_BYTES / needed);
+    return *k_out > 0;
+}
+
+static bool
+hnsw_data_page_count(uint64_t n_nodes, bool packed_nsw, uint32_t pack_k,
+                     uint32_t *page_count_out)
+{
+    uint64_t page_count;
+
+    if (n_nodes == 0 || page_count_out == NULL ||
+        (packed_nsw && pack_k == 0))
+        return false;
+    page_count = packed_nsw ? 1 + (n_nodes - 1) / pack_k : n_nodes;
+    if (page_count == 0 || page_count >= (uint64_t)InvalidBlockNumber)
+        return false;
+    *page_count_out = (uint32_t)page_count;
+    return true;
+}
+
+static bool
+hnsw_page_pair_fits(int dim, int bytes_per_dim, int m, int level)
+{
+    size_t esize;
+    size_t nsize;
+    size_t needed;
+
+    if (dim <= 0 || (bytes_per_dim != 2 && bytes_per_dim != 4) ||
+        m <= 0 || level < 0)
+        return false;
+    esize = elem_tuple_size(dim, bytes_per_dim);
+    nsize = neigh_tuple_size(level, m);
+    needed = esize + nsize + 4 * PGV_ITEM_OVERHEAD;
+    return needed <= PGV_USABLE_BYTES;
+}
+
+static bool
+hnsw_file_preflight(int hnsw_fd, int tids_fd,
+                    uint64_t expected_n_vecs,
+                    uint32_t expected_dim, uint32_t expected_metric,
+                    int bytes_per_dim, bool packed_nsw,
+                    HnswlibHeader *hnsw_out,
+                    CuvsTidsHeader *tids_out,
+                    HnswLocationWriter location_writer,
+                    void *location_writer_arg,
+                    HnswInterruptCheck check_interrupts,
+                    char *error, size_t error_size)
+{
+    struct stat hs;
+    struct stat ts;
+    HnswlibHeader h;
+    CuvsTidsHeader tids_hdr;
+    uint64_t level0_bytes;
+    uint64_t level0_end;
+    uint64_t expected_tids_body;
+    uint64_t expected_tids_size;
+    uint64_t file_cursor;
+    uint64_t observed_max_level = 0;
+    uint64_t entrypoint_level = UINT64_MAX;
+    uint64_t per_level_bytes;
+    uint32_t pairs_per_page = 0;
+    unsigned char crc_buffer[HNSW_FILE_IO_CHUNK];
+    uint32_t crc_state;
+    uint64_t tids_remaining;
+    uint64_t tids_offset;
+    int *links = NULL;
+    bool ok = false;
+
+    if (fstat(hnsw_fd, &hs) != 0 || fstat(tids_fd, &ts) != 0)
+        return hnsw_set_file_error(error, error_size,
+                                   "cannot stat HNSW or TID input file");
+    if (!S_ISREG(hs.st_mode) || !S_ISREG(ts.st_mode) ||
+        hs.st_size < 0 || ts.st_size < 0)
+        return hnsw_set_file_error(error, error_size,
+                                   "HNSW and TID inputs must be regular files");
+    if ((uint64_t)hs.st_size > (uint64_t)INT64_MAX ||
+        (uint64_t)ts.st_size > (uint64_t)INT64_MAX)
+        return hnsw_set_file_error(error, error_size,
+                                   "HNSW or TID input exceeds supported file size");
+    if (expected_n_vecs == 0 || expected_n_vecs > CUVS_TIDS_MAX_VECS ||
+        expected_dim == 0 || expected_dim > INT16_MAX || expected_metric > CUVS_METRIC_IP)
+        return hnsw_set_file_error(error, error_size,
+                                   "invalid expected HNSW build dimensions or count");
+    if (sizeof(size_t) != 8 || sizeof(int) != 4 || sizeof(double) != 8)
+        return hnsw_set_file_error(error, error_size,
+                                   "unsupported hnswlib host ABI");
+    {
+        const uint16_t endian_probe = 1;
+        if (*(const uint8_t *)&endian_probe != 1)
+            return hnsw_set_file_error(error, error_size,
+                                       "hnswlib and TID inputs require little-endian host ABI");
+    }
+    if ((uint64_t)hs.st_size < HNSWLIB_HEADER_BYTES ||
+        !hnsw_pread_exact(hnsw_fd, &h, sizeof(h), 0))
+        return hnsw_set_file_error(error, error_size,
+                                   "short read on hnswlib header");
+    if ((uint64_t)ts.st_size < sizeof(tids_hdr) ||
+        !hnsw_pread_exact(tids_fd, &tids_hdr, sizeof(tids_hdr), 0))
+        return hnsw_set_file_error(error, error_size,
+                                   "short read on TID header");
+    if (tids_hdr.magic != CUVS_TIDS_MAGIC ||
+        tids_hdr.version != CUVS_TIDS_VERSION || tids_hdr.reserved != 0)
+        return hnsw_set_file_error(error, error_size,
+                                   "unsupported or malformed TID file version");
+    if (tids_hdr.n_vecs <= 0 ||
+        (uint64_t)tids_hdr.n_vecs != expected_n_vecs ||
+        tids_hdr.dim != expected_dim || tids_hdr.metric != expected_metric)
+        return hnsw_set_file_error(error, error_size,
+                                   "TID header count, dimension or metric mismatch");
+    if (!hnsw_mul_u64(expected_n_vecs, sizeof(uint64_t), &expected_tids_body) ||
+        !hnsw_add_u64(sizeof(tids_hdr), expected_tids_body, &expected_tids_size) ||
+        expected_tids_size != (uint64_t)ts.st_size)
+        return hnsw_set_file_error(error, error_size,
+                                   "TID file size does not match its row count");
+
+    crc_state = cuvs_crc32_stream_begin();
+    tids_remaining = expected_tids_body;
+    tids_offset = sizeof(tids_hdr);
+    while (tids_remaining > 0)
+    {
+        size_t chunk = tids_remaining > sizeof(crc_buffer)
+            ? sizeof(crc_buffer) : (size_t)tids_remaining;
+        uint64_t *chunk_tids = (uint64_t *)crc_buffer;
+
+        if (check_interrupts)
+            check_interrupts();
+        if (!hnsw_pread_exact(tids_fd, crc_buffer, chunk, tids_offset))
+        {
+            hnsw_set_file_error(error, error_size,
+                                "short read on TID body");
+            goto done;
+        }
+        crc_state = cuvs_crc32_stream_update(crc_state, crc_buffer, chunk);
+        for (size_t off = 0; off < chunk / sizeof(uint64_t); off++)
+        {
+            if (!hnsw_tid_is_valid(chunk_tids[off]))
+            {
+                hnsw_set_file_error(error, error_size,
+                                    "TID file contains an invalid heap TID");
+                goto done;
+            }
+        }
+        tids_remaining -= chunk;
+        tids_offset += chunk;
+    }
+    if (cuvs_crc32_stream_end(crc_state) != tids_hdr.body_crc32)
+    {
+        hnsw_set_file_error(error, error_size, "TID body checksum mismatch");
+        goto done;
+    }
+
+    if (h.curElementCount != expected_n_vecs || h.maxElements < h.curElementCount ||
+        h.sizeDataPerElement == 0 || h.maxlevel < 0 || h.maxlevel > UINT8_MAX ||
+        h.enterpointNode < 0 || (uint64_t)h.enterpointNode >= expected_n_vecs ||
+        h.M == 0 || h.M > INT_MAX || h.maxM != h.M ||
+        h.M > SIZE_MAX / 2 || h.maxM0 != 2 * h.M || h.maxM0 > INT_MAX ||
+        h.efConstruction == 0 || h.efConstruction > UINT16_MAX ||
+        !isfinite(h.mult) || h.mult <= 0.0)
+    {
+        hnsw_set_file_error(error, error_size, "invalid hnswlib header fields");
+        goto done;
+    }
+    int layout_maxlevel = packed_nsw ? 0 : h.maxlevel;
+    if ((uint64_t)(layout_maxlevel + 2) * h.M > UINT16_MAX)
+    {
+        hnsw_set_file_error(error, error_size,
+                            "HNSW neighbor slot count exceeds the page format");
+        goto done;
+    }
+    if (!hnsw_page_pair_fits((int)expected_dim, bytes_per_dim,
+                             (int)h.M, layout_maxlevel))
+    {
+        hnsw_set_file_error(error, error_size,
+                            "HNSW element and neighbor tuples do not fit on a page");
+        goto done;
+    }
+    if (packed_nsw && h.maxlevel > 1)
+    {
+        hnsw_set_file_error(error, error_size,
+                            "NSW header maximum level exceeds the serializer allowance");
+        goto done;
+    }
+    if (packed_nsw && !hnsw_compute_pack_k((int)expected_dim, bytes_per_dim,
+                                          (int)h.M, &pairs_per_page))
+    {
+        hnsw_set_file_error(error, error_size,
+                            "NSW element and neighbor tuples do not fit on a page");
+        goto done;
+    }
+    if (!hnsw_mul_u64(expected_n_vecs, h.sizeDataPerElement, &level0_bytes) ||
+        !hnsw_add_u64(HNSWLIB_HEADER_BYTES, level0_bytes, &level0_end) ||
+        level0_end > (uint64_t)hs.st_size)
+    {
+        hnsw_set_file_error(error, error_size,
+                            "level-0 element count or file offset overflows input size");
+        goto done;
+    }
+
+    {
+        uint64_t links_bytes;
+        uint64_t links_end;
+        uint64_t vector_bytes;
+        uint64_t vector_end;
+        uint64_t label_end;
+
+        if (!hnsw_mul_u64(h.maxM0, sizeof(int), &links_bytes) ||
+            !hnsw_add_u64(links_bytes, sizeof(int), &links_bytes) ||
+            !hnsw_add_u64(h.offsetLevel0, links_bytes, &links_end) ||
+            !hnsw_mul_u64(expected_dim, sizeof(float), &vector_bytes) ||
+            !hnsw_add_u64(h.offsetData, vector_bytes, &vector_end) ||
+            !hnsw_add_u64(h.labelOffset, sizeof(size_t), &label_end) ||
+            links_end > h.sizeDataPerElement || vector_end > h.sizeDataPerElement ||
+            label_end > h.sizeDataPerElement ||
+            (h.offsetLevel0 < vector_end && h.offsetData < links_end) ||
+            (h.offsetLevel0 < label_end && h.labelOffset < links_end) ||
+            (h.offsetData < label_end && h.labelOffset < vector_end))
+        {
+            hnsw_set_file_error(error, error_size,
+                                "hnswlib element offsets overlap or exceed record size");
+            goto done;
+        }
+    }
+
+    links = (int *)malloc((size_t)h.maxM0 * sizeof(int));
+    if (!links)
+    {
+        hnsw_set_file_error(error, error_size,
+                            "cannot allocate bounded HNSW link scratch");
+        goto done;
+    }
+    for (uint64_t node = 0; node < expected_n_vecs; node++)
+    {
+        uint64_t row_offset;
+        uint64_t base;
+        uint64_t label_offset;
+        int count;
+        size_t label;
+
+        if (check_interrupts)
+            check_interrupts();
+        if (!hnsw_mul_u64(node, h.sizeDataPerElement, &row_offset) ||
+            !hnsw_add_u64(HNSWLIB_HEADER_BYTES, row_offset, &base) ||
+            !hnsw_add_u64(base, h.offsetLevel0, &row_offset) ||
+            !hnsw_pread_exact(hnsw_fd, &count, sizeof(count), row_offset) ||
+            count < 0 || (uint64_t)count > h.maxM0)
+        {
+            hnsw_set_file_errorf(error, error_size,
+                                 "invalid level-0 link count at node %llu (capacity %llu)",
+                                 node, h.maxM0);
+            goto done;
+        }
+        if (!hnsw_add_u64(row_offset, sizeof(count), &row_offset) ||
+            !hnsw_pread_exact(hnsw_fd, links, (size_t)count * sizeof(int), row_offset))
+        {
+            hnsw_set_file_error(error, error_size,
+                                "short read on level-0 links");
+            goto done;
+        }
+        for (int link = 0; link < count; link++)
+        {
+            if (links[link] < 0 || (uint64_t)links[link] >= expected_n_vecs)
+            {
+                hnsw_set_file_error(error, error_size,
+                                    "level-0 link is outside the HNSW node count");
+                goto done;
+            }
+        }
+        if (!hnsw_add_u64(base, h.labelOffset, &label_offset) ||
+            !hnsw_pread_exact(hnsw_fd, &label, sizeof(label), label_offset) ||
+            (uint64_t)label >= expected_n_vecs)
+        {
+            hnsw_set_file_error(error, error_size,
+                                "HNSW label is outside the original row count");
+            goto done;
+        }
+    }
+
+    per_level_bytes = (h.M + 1) * sizeof(int);
+    file_cursor = level0_end;
+    for (uint64_t node = 0; node < expected_n_vecs; node++)
+    {
+        uint32_t list_bytes;
+        uint64_t links_start;
+        uint64_t row_end;
+        uint64_t level;
+        uint64_t location_node = node;
+        HnswNodeLocation location;
+
+        if (check_interrupts)
+            check_interrupts();
+        if (file_cursor > (uint64_t)hs.st_size ||
+            (uint64_t)hs.st_size - file_cursor < sizeof(list_bytes) ||
+            !hnsw_pread_exact(hnsw_fd, &list_bytes, sizeof(list_bytes), file_cursor))
+        {
+            hnsw_set_file_error(error, error_size,
+                                "short read on upper-level link size");
+            goto done;
+        }
+        if (!hnsw_add_u64(file_cursor, sizeof(list_bytes), &links_start) ||
+            !hnsw_add_u64(links_start, list_bytes, &row_end) ||
+            row_end > (uint64_t)hs.st_size ||
+            (list_bytes != 0 &&
+             (per_level_bytes == 0 || list_bytes % per_level_bytes != 0)))
+        {
+            hnsw_set_file_error(error, error_size,
+                                "upper-level link length is malformed or out of bounds");
+            goto done;
+        }
+        level = list_bytes == 0 ? 0 : list_bytes / per_level_bytes;
+        if (level > (uint64_t)h.maxlevel || level > UINT8_MAX)
+        {
+            hnsw_set_file_error(error, error_size,
+                                "node level exceeds the HNSW header maximum");
+            goto done;
+        }
+        for (uint64_t lv = 0; lv < level; lv++)
+        {
+            int upper_count;
+            uint64_t level_offset;
+
+            if (!hnsw_mul_u64(lv, per_level_bytes, &level_offset) ||
+                !hnsw_add_u64(links_start, level_offset, &level_offset) ||
+                !hnsw_pread_exact(hnsw_fd, &upper_count, sizeof(upper_count),
+                                  level_offset) ||
+                upper_count < 0 || (uint64_t)upper_count > h.M)
+            {
+                hnsw_set_file_error(error, error_size,
+                                    "invalid upper-level neighbor count");
+                goto done;
+            }
+            if (!hnsw_add_u64(level_offset, sizeof(upper_count), &level_offset) ||
+                !hnsw_pread_exact(hnsw_fd, links,
+                                  (size_t)upper_count * sizeof(int), level_offset))
+            {
+                hnsw_set_file_error(error, error_size,
+                                    "short read on upper-level links");
+                goto done;
+            }
+            for (int link = 0; link < upper_count; link++)
+            {
+                if (links[link] < 0 || (uint64_t)links[link] >= expected_n_vecs)
+                {
+                    hnsw_set_file_error(error, error_size,
+                                        "upper-level link is outside the HNSW node count");
+                    goto done;
+                }
+            }
+        }
+        if (level > observed_max_level)
+            observed_max_level = level;
+        if (node == (uint64_t)h.enterpointNode)
+            entrypoint_level = level;
+        if (!hnsw_layout_location(node, expected_n_vecs, (uint8_t)level,
+                                  packed_nsw, pairs_per_page, &location))
+        {
+            hnsw_set_file_error(error, error_size,
+                                "HNSW node layout exceeds PostgreSQL page limits");
+            goto done;
+        }
+        if (location_writer &&
+            !location_writer(location_writer_arg, location_node, &location,
+                             error, error_size))
+            goto done;
+        file_cursor = row_end;
+    }
+    if (file_cursor != (uint64_t)hs.st_size)
+    {
+        hnsw_set_file_error(error, error_size,
+                            "hnswlib input has trailing bytes after upper-level data");
+        goto done;
+    }
+    if ((packed_nsw &&
+         (observed_max_level != 0 || entrypoint_level != 0)) ||
+        (!packed_nsw &&
+         (observed_max_level != (uint64_t)h.maxlevel ||
+          entrypoint_level != observed_max_level)))
+    {
+        hnsw_set_file_error(error, error_size,
+                            "HNSW row levels and entrypoint metadata disagree");
+        goto done;
+    }
+    if (hnsw_out)
+        *hnsw_out = h;
+    if (tids_out)
+        *tids_out = tids_hdr;
+    ok = true;
+
+done:
+    free(links);
+    return ok;
+}
+
 /* ----------------------------------------------------------------
  * External GUCs declared in pg_cuvs.c
  * ---------------------------------------------------------------- */
@@ -400,6 +1046,21 @@ typedef struct {
     uint32_t        neigh_blkno;
     uint16_t        neigh_offno;
 } ElemDesc;
+
+typedef bool (*HnswNodeLocationLookup)(void *arg, uint32_t node,
+                                       HnswNodeLocation *location);
+
+static bool
+hnsw_lookup_elem_array(void *arg, uint32_t node, HnswNodeLocation *location)
+{
+    const ElemDesc *elems = (const ElemDesc *)arg;
+
+    location->elem_blkno = elems[node].elem_blkno;
+    location->elem_offno = elems[node].elem_offno;
+    location->level = (uint8_t)elems[node].level;
+    location->reserved = 0;
+    return true;
+}
 
 /* ----------------------------------------------------------------
  * Helper: set a PgvItemPointer from block + offset
@@ -546,8 +1207,9 @@ write_elem_pair(Page page,
                 int dim,
                 int bytes_per_dim,
                 int m,
-                ElemDesc *all_elems,
-                size_t n_elems)
+                size_t n_elems,
+                HnswNodeLocationLookup location_lookup,
+                void *location_lookup_arg)
 {
     /* elem tuple */
     size_t esize = elem_tuple_size(dim, bytes_per_dim);
@@ -628,10 +1290,11 @@ write_elem_pair(Page page,
             if (s < lv_count && e->upper_links && e->upper_links[lv_idx])
             {
                 int nb = e->upper_links[lv_idx][s];
-                if (nb >= 0 && (size_t)nb < n_elems)
-                    set_item_ptr(&slots[slot],
-                                 all_elems[nb].elem_blkno,
-                                 all_elems[nb].elem_offno);
+                HnswNodeLocation location;
+                if (nb >= 0 && (size_t)nb < n_elems &&
+                    location_lookup(location_lookup_arg, (uint32_t)nb, &location))
+                    set_item_ptr(&slots[slot], location.elem_blkno,
+                                 location.elem_offno);
                 else
                     set_invalid_item_ptr(&slots[slot]);
             }
@@ -646,10 +1309,11 @@ write_elem_pair(Page page,
         if (s < e->lv0_count && e->lv0_links)
         {
             int nb = e->lv0_links[s];
-            if (nb >= 0 && (size_t)nb < n_elems)
-                set_item_ptr(&slots[slot],
-                             all_elems[nb].elem_blkno,
-                             all_elems[nb].elem_offno);
+            HnswNodeLocation location;
+            if (nb >= 0 && (size_t)nb < n_elems &&
+                location_lookup(location_lookup_arg, (uint32_t)nb, &location))
+                set_item_ptr(&slots[slot], location.elem_blkno,
+                             location.elem_offno);
             else
                 set_invalid_item_ptr(&slots[slot]);
         }
@@ -708,9 +1372,10 @@ write_elem_page(Relation rel,
                 int dim,
                 int bytes_per_dim,
                 int m,
-                ElemDesc *all_elems,
                 size_t n_elems,
-                bool skip_wal)
+                bool skip_wal,
+                HnswNodeLocationLookup location_lookup,
+                void *location_lookup_arg)
 {
     Buffer              buf;
     Page                page;
@@ -718,7 +1383,6 @@ write_elem_page(Relation rel,
 
     /* always extend with P_NEW; caller loops in blkno order so each call
      * appends the next block in sequence. */
-    (void)blkno;        /* layout reference only */
     buf  = ReadBuffer(rel, P_NEW);
     LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
     page = BufferGetPage(buf);
@@ -728,8 +1392,12 @@ write_elem_page(Relation rel,
     opaque->nextblkno = InvalidBlockNumber;
     opaque->unused    = 0;
     opaque->page_id   = PGV_HNSW_PAGE_ID;
+    if (!hnsw_set_disk_page_chain(page, blkno, n_elems))
+        ereport(ERROR,
+                (errmsg("pg_cuvs: invalid HNSW data page chain position")));
 
-    write_elem_pair(page, e, vec, dim, bytes_per_dim, m, all_elems, n_elems);
+    write_elem_pair(page, e, vec, dim, bytes_per_dim, m, n_elems,
+                    location_lookup, location_lookup_arg);
 
     MarkBufferDirty(buf);
     if (!skip_wal)
@@ -760,8 +1428,20 @@ write_elem_pages_packed(Relation rel,
                         int m,
                         size_t n_elems,
                         int k,
-                        bool skip_wal)
+                        bool skip_wal,
+                        HnswNodeLocationLookup location_lookup,
+                        void *location_lookup_arg)
 {
+    uint32_t data_page_count;
+
+    if (n_elems == 0)
+        return;
+    if (k <= 0 ||
+        !hnsw_data_page_count((uint64_t)n_elems, true, (uint32_t)k,
+                              &data_page_count))
+        ereport(ERROR,
+                (errmsg("pg_cuvs: invalid packed HNSW data page count")));
+
     for (size_t page_start = 0; page_start < n_elems; page_start += (size_t) k)
     {
         size_t page_end = page_start + (size_t) k;
@@ -777,12 +1457,17 @@ write_elem_pages_packed(Relation rel,
         opaque->nextblkno = InvalidBlockNumber;
         opaque->unused    = 0;
         opaque->page_id   = PGV_HNSW_PAGE_ID;
+        if (!hnsw_set_disk_page_chain(page,
+                                      (uint64_t)(page_start / (size_t)k) + 1,
+                                      data_page_count))
+            ereport(ERROR,
+                    (errmsg("pg_cuvs: invalid packed HNSW data page chain position")));
 
         for (size_t i = page_start; i < page_end; i++)
         {
             const float *vec = vecs + i * (size_t) dim;
             write_elem_pair(page, &elems[i], vec, dim, bytes_per_dim, m,
-                            elems, n_elems);
+                            n_elems, location_lookup, location_lookup_arg);
         }
 
         MarkBufferDirty(buf);
@@ -792,12 +1477,21 @@ write_elem_pages_packed(Relation rel,
     }
 }
 
-/* Wave 1 release-hardening (ADR-038 3K 잔여): pg_cuvs writes pgvector on-disk
- * HNSW pages pinned to HNSW_VERSION=1 (stable across pgvector 0.5.0–0.8.x). Warn
- * if the installed pgvector is outside that tested range — a future on-disk
- * format bump could make exported indexes unreadable. Existence is enforced as
- * an ERROR by the callers; this only adds the version-range WARNING. */
-static void
+/* pg_cuvs writes pgvector on-disk HNSW_VERSION=1 pages, tested with pgvector
+ * 0.5.x–0.8.x. Existing import callers retain warning-only behavior; the new
+ * source-less converter rejects versions outside that range before touching
+ * target pages. */
+static bool
+hnsw_pgvector_version_supported(const char *version)
+{
+    int major = -1;
+    int minor = -1;
+
+    return version && sscanf(version, "%d.%d", &major, &minor) == 2 &&
+        major == 0 && minor >= 5 && minor <= 8;
+}
+
+static bool
 cuvs_warn_pgvector_version(void)
 {
     Oid          ext_oid = get_extension_oid("vector", true /* missing_ok */);
@@ -806,8 +1500,10 @@ cuvs_warn_pgvector_version(void)
     ScanKeyData  key;
     HeapTuple    tup;
 
+    bool supported = false;
+
     if (!OidIsValid(ext_oid))
-        return;   /* absence is handled (ERROR) by the callers */
+        return false;   /* absence is handled (ERROR) by the callers */
 
     rel = table_open(ExtensionRelationId, AccessShareLock);
     ScanKeyInit(&key, Anum_pg_extension_oid, BTEqualStrategyNumber,
@@ -822,11 +1518,11 @@ cuvs_warn_pgvector_version(void)
         if (!isnull)
         {
             char *ver = text_to_cstring(DatumGetTextPP(d));
-            int   major = -1, minor = -1;
 
             /* known-good: pgvector 0.5.x – 0.8.x (HNSW_VERSION=1). */
-            if (sscanf(ver, "%d.%d", &major, &minor) == 2
-                && !(major == 0 && minor >= 5 && minor <= 8))
+            if (hnsw_pgvector_version_supported(ver))
+                supported = true;
+            else
                 ereport(WARNING,
                         (errmsg("pg_cuvs: pgvector %s is outside the tested range "
                                 "(0.5.x–0.8.x) for HNSW page export", ver),
@@ -839,6 +1535,7 @@ cuvs_warn_pgvector_version(void)
     }
     systable_endscan(scan);
     table_close(rel, AccessShareLock);
+    return supported;
 }
 
 /* ================================================================
@@ -1439,8 +2136,8 @@ fill_hnsw_from_hnswlib_impl(Oid cagra_oid, Oid hnsw_oid, bool use_shm,
                         &elems[i],
                         vec_buf,
                         dim, bytes_per_dim, M,
-                        elems, N,
-                        hnsw_unlogged);
+                        N, hnsw_unlogged,
+                        hnsw_lookup_elem_array, elems);
     }
 
     pfree(vec_buf);
@@ -1490,6 +2187,519 @@ fill_hnsw_from_hnswlib(Oid cagra_oid, Oid hnsw_oid, bool use_shm)
     }
     PG_END_TRY();
     return res.n_elems;
+}
+
+/* ----------------------------------------------------------------
+ * Source-less HNSW conversion.  The serialized graph is validated in a
+ * bounded first pass while node locations are written to a PostgreSQL temp
+ * tablespace BufFile.  A second pass reads one node, its vector, links and
+ * label at a time, then emits staged PostgreSQL pages.  No graph-sized heap
+ * arrays are created on this path.
+ * ---------------------------------------------------------------- */
+#define HNSW_LOCATION_CACHE_PAGES 4
+#define HNSW_LOCATION_ROWS_PER_PAGE (BLCKSZ / sizeof(HnswNodeLocation))
+
+_Static_assert(BLCKSZ % sizeof(HnswNodeLocation) == 0,
+               "location records must tile PostgreSQL temp-file blocks");
+
+typedef struct HnswLocationCachePage
+{
+    bool valid;
+    uint64 page_no;
+    size_t n_rows;
+    HnswNodeLocation rows[HNSW_LOCATION_ROWS_PER_PAGE];
+} HnswLocationCachePage;
+
+typedef struct HnswLocationTable
+{
+    BufFile *file;
+    uint64_t n_nodes;
+    uint64_t n_written;
+    HnswLocationCachePage cache[HNSW_LOCATION_CACHE_PAGES];
+} HnswLocationTable;
+
+typedef struct HnswDiskImportState
+{
+    HnswLocationTable locations;
+    Relation target;
+} HnswDiskImportState;
+
+typedef struct HnswDiskRow
+{
+    ElemDesc elem;
+    float *vector;
+    int **upper_links;
+    int *upper_counts;
+    int *upper_data;
+} HnswDiskRow;
+
+static bool
+hnsw_location_table_append(void *arg, uint64_t node,
+                           const HnswNodeLocation *location,
+                           char *error, size_t error_size)
+{
+    HnswLocationTable *table = (HnswLocationTable *)arg;
+
+    if (!table->file || node != table->n_written || node >= table->n_nodes)
+        return hnsw_set_file_error(error, error_size,
+                                   "internal node-location table write order error");
+    BufFileWrite(table->file, (void *)location, sizeof(*location));
+    table->n_written++;
+    return true;
+}
+
+static bool
+hnsw_location_table_rewind(HnswLocationTable *table, uint64_t expected_rows)
+{
+    HnswNodeLocation rows[HNSW_LOCATION_ROWS_PER_PAGE];
+    uint64_t logical_bytes;
+    uint64_t bytes_remaining;
+
+    if (!table || !table->file || table->n_nodes != expected_rows ||
+        table->n_written != expected_rows ||
+        !hnsw_mul_u64(expected_rows, sizeof(HnswNodeLocation), &logical_bytes) ||
+        (logical_bytes > 0 && (logical_bytes - 1) / BLCKSZ > LONG_MAX))
+        return false;
+
+    /* BufFile is buffered and BufFileSize only supports shared filesets. */
+    if (BufFileSeekBlock(table->file, 0) != 0)
+        return false;
+    bytes_remaining = logical_bytes;
+    while (bytes_remaining > 0)
+    {
+        size_t bytes = bytes_remaining > sizeof(rows)
+            ? sizeof(rows) : (size_t)bytes_remaining;
+
+        CHECK_FOR_INTERRUPTS();
+        if (BufFileRead(table->file, rows, bytes) != bytes)
+            return false;
+        bytes_remaining -= bytes;
+    }
+
+    /* Rewind after readback so the first lookup starts at logical row zero. */
+    return BufFileSeekBlock(table->file, 0) == 0;
+}
+
+static bool
+hnsw_location_table_lookup(void *arg, uint32_t node,
+                           HnswNodeLocation *location)
+{
+    HnswLocationTable *table = (HnswLocationTable *)arg;
+    uint64_t page_no;
+    uint64_t first_node;
+    size_t row_index;
+    HnswLocationCachePage *cache;
+
+    if ((uint64_t)node >= table->n_nodes)
+        ereport(ERROR,
+                (errmsg("pg_cuvs: HNSW node-location lookup is out of range")));
+    page_no = (uint64_t)node / HNSW_LOCATION_ROWS_PER_PAGE;
+    first_node = page_no * HNSW_LOCATION_ROWS_PER_PAGE;
+    row_index = (size_t)((uint64_t)node - first_node);
+    cache = &table->cache[page_no % HNSW_LOCATION_CACHE_PAGES];
+    if (!cache->valid || cache->page_no != page_no)
+    {
+        uint64_t remaining = table->n_nodes - first_node;
+        size_t n_rows = remaining > HNSW_LOCATION_ROWS_PER_PAGE
+            ? HNSW_LOCATION_ROWS_PER_PAGE : (size_t)remaining;
+        size_t n_bytes = n_rows * sizeof(HnswNodeLocation);
+
+        if (page_no > LONG_MAX ||
+            BufFileSeekBlock(table->file, (long)page_no) != 0 ||
+            BufFileRead(table->file, cache->rows, n_bytes) != n_bytes)
+            ereport(ERROR,
+                    (errmsg("pg_cuvs: cannot read disk-backed HNSW node locations")));
+        cache->page_no = page_no;
+        cache->n_rows = n_rows;
+        cache->valid = true;
+    }
+    if (row_index >= cache->n_rows)
+        ereport(ERROR,
+                (errmsg("pg_cuvs: HNSW node-location cache entry is out of range")));
+    *location = cache->rows[row_index];
+    return true;
+}
+
+static void
+hnsw_pg_check_interrupts(void)
+{
+    CHECK_FOR_INTERRUPTS();
+}
+
+static void
+hnsw_disk_row_init(HnswDiskRow *row, const HnswlibHeader *header,
+                   uint32_t dim)
+{
+    size_t upper_values;
+
+    memset(row, 0, sizeof(*row));
+    row->elem.lv0_links = (int *)palloc((size_t)header->maxM0 * sizeof(int));
+    row->vector = (float *)palloc((size_t)dim * sizeof(float));
+    if (header->maxlevel > 0)
+    {
+        upper_values = (size_t)header->maxlevel * (size_t)header->M;
+        row->upper_links = (int **)palloc0((size_t)header->maxlevel * sizeof(int *));
+        row->upper_counts = (int *)palloc0((size_t)header->maxlevel * sizeof(int));
+        row->upper_data = (int *)palloc(upper_values * sizeof(int));
+        for (int level = 0; level < header->maxlevel; level++)
+            row->upper_links[level] = row->upper_data +
+                (size_t)level * (size_t)header->M;
+    }
+}
+
+static void
+hnsw_read_disk_row(int hnsw_fd, int tids_fd,
+                   const HnswlibHeader *header, uint64_t n_nodes,
+                   uint32_t dim, uint64_t node, uint64_t *upper_cursor,
+                   HnswLocationTable *locations, HnswDiskRow *row)
+{
+    uint64_t row_delta;
+    uint64_t row_base;
+    uint64_t field_offset;
+    uint64_t level0_links_offset;
+    uint64_t label;
+    uint64_t tid;
+    uint32_t upper_bytes;
+    uint64_t per_level_bytes = (header->M + 1) * sizeof(int);
+    int link_count;
+    HnswNodeLocation location;
+    char error[256] = {0};
+
+    if (node >= n_nodes ||
+        !hnsw_mul_u64(node, header->sizeDataPerElement, &row_delta) ||
+        !hnsw_add_u64(HNSWLIB_HEADER_BYTES, row_delta, &row_base) ||
+        !hnsw_add_u64(row_base, header->offsetLevel0, &level0_links_offset) ||
+        !hnsw_pread_exact(hnsw_fd, &link_count, sizeof(link_count),
+                          level0_links_offset) ||
+        link_count < 0 || (uint64_t)link_count > header->maxM0 ||
+        !hnsw_add_u64(level0_links_offset, sizeof(link_count), &field_offset) ||
+        !hnsw_pread_exact(hnsw_fd, row->elem.lv0_links,
+                          (size_t)link_count * sizeof(int), field_offset))
+        ereport(ERROR,
+                (errmsg("pg_cuvs: cannot read HNSW level-0 row %llu",
+                        (unsigned long long)node)));
+
+    if (!hnsw_add_u64(row_base, header->offsetData, &field_offset) ||
+        !hnsw_pread_exact(hnsw_fd, row->vector,
+                          (size_t)dim * sizeof(float), field_offset) ||
+        !hnsw_add_u64(row_base, header->labelOffset, &field_offset) ||
+        !hnsw_pread_exact(hnsw_fd, &label, sizeof(size_t), field_offset) ||
+        !hnsw_read_tid_for_label(tids_fd, n_nodes, label, &tid,
+                                 error, sizeof(error)) ||
+        !hnsw_location_table_lookup(locations, (uint32_t)node, &location))
+        ereport(ERROR,
+                (errmsg("pg_cuvs: cannot read HNSW vector, label or location for row %llu: %s",
+                        (unsigned long long)node, error)));
+
+    row->elem.level = location.level;
+    row->elem.tid_encoded = tid;
+    row->elem.lv0_count = link_count;
+    row->elem.upper_links = row->upper_links;
+    row->elem.upper_counts = row->upper_counts;
+    row->elem.elem_blkno = location.elem_blkno;
+    row->elem.elem_offno = location.elem_offno;
+    row->elem.neigh_blkno = location.elem_blkno;
+    row->elem.neigh_offno = location.elem_offno + 1;
+
+    if (!hnsw_pread_exact(hnsw_fd, &upper_bytes, sizeof(upper_bytes),
+                          *upper_cursor))
+        ereport(ERROR,
+                (errmsg("pg_cuvs: cannot read HNSW upper-level size for row %llu",
+                        (unsigned long long)node)));
+    if ((uint64_t)upper_bytes != (uint64_t)location.level * per_level_bytes)
+        ereport(ERROR,
+                (errmsg("pg_cuvs: HNSW row level changed after preflight")));
+    if (!hnsw_add_u64(*upper_cursor, sizeof(upper_bytes), &field_offset))
+        ereport(ERROR, (errmsg("pg_cuvs: HNSW upper-level offset overflow")));
+    for (int level = 0; level < location.level; level++)
+    {
+        uint64_t level_delta;
+        uint64_t links_offset;
+        int count;
+
+        if (!hnsw_mul_u64((uint64_t)level, per_level_bytes, &level_delta) ||
+            !hnsw_add_u64(field_offset, level_delta, &links_offset) ||
+            !hnsw_pread_exact(hnsw_fd, &count, sizeof(count), links_offset) ||
+            count < 0 || (uint64_t)count > header->M ||
+            !hnsw_add_u64(links_offset, sizeof(count), &links_offset) ||
+            !hnsw_pread_exact(hnsw_fd, row->upper_links[level],
+                              (size_t)header->M * sizeof(int), links_offset))
+            ereport(ERROR,
+                    (errmsg("pg_cuvs: cannot read HNSW upper-level links for row %llu",
+                            (unsigned long long)node)));
+        row->upper_counts[level] = count;
+    }
+    row->elem.level = location.level;
+    if (!hnsw_add_u64(*upper_cursor,
+                      sizeof(upper_bytes) + upper_bytes, upper_cursor))
+        ereport(ERROR, (errmsg("pg_cuvs: HNSW upper-level cursor overflow")));
+}
+
+static void
+hnsw_publish_staged_page(Relation rel, Page staged, bool skip_wal)
+{
+    Buffer buf = ReadBuffer(rel, P_NEW);
+
+    LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
+    memcpy(BufferGetPage(buf), staged, BLCKSZ);
+    MarkBufferDirty(buf);
+    if (!skip_wal)
+        log_newpage_buffer(buf, true);
+    UnlockReleaseBuffer(buf);
+}
+
+static void
+hnsw_write_disk_pages(Relation rel, int hnsw_fd, int tids_fd,
+                      const HnswlibHeader *header, uint64_t n_nodes,
+                      uint32_t dim, int bytes_per_dim, bool packed_nsw,
+                      uint32_t pack_k, uint32_t data_page_count,
+                      bool skip_wal,
+                      HnswLocationTable *locations)
+{
+    HnswDiskRow row;
+    Page staged = (Page)palloc(BLCKSZ);
+    uint64_t upper_cursor;
+    uint64_t level0_bytes;
+    uint64_t page_start = 0;
+    int m = (int)header->M;
+
+    if (!hnsw_mul_u64(n_nodes, header->sizeDataPerElement, &level0_bytes) ||
+        !hnsw_add_u64(HNSWLIB_HEADER_BYTES, level0_bytes, &upper_cursor))
+        ereport(ERROR, (errmsg("pg_cuvs: HNSW level-0 offset overflow")));
+    hnsw_disk_row_init(&row, header, dim);
+
+    while (page_start < n_nodes)
+    {
+        uint64_t page_end;
+
+        CHECK_FOR_INTERRUPTS();
+        if (packed_nsw)
+        {
+            page_end = page_start + pack_k;
+            if (page_end > n_nodes)
+                page_end = n_nodes;
+        }
+        else
+            page_end = page_start + 1;
+
+        hnsw_init_disk_page(staged);
+        if (!hnsw_set_disk_page_chain(
+                staged,
+                (packed_nsw ? page_start / pack_k : page_start) + 1,
+                data_page_count))
+            ereport(ERROR,
+                    (errmsg("pg_cuvs: invalid source-less HNSW data page chain position")));
+
+        for (uint64_t node = page_start; node < page_end; node++)
+        {
+            hnsw_read_disk_row(hnsw_fd, tids_fd, header, n_nodes, dim,
+                               node, &upper_cursor, locations, &row);
+            write_elem_pair(staged, &row.elem, row.vector, (int)dim,
+                            bytes_per_dim, m, (size_t)n_nodes,
+                            hnsw_location_table_lookup, locations);
+        }
+        hnsw_publish_staged_page(rel, staged, skip_wal);
+        page_start = page_end;
+    }
+}
+
+static void
+hnsw_write_disk_metapage(Relation rel, const HnswlibHeader *header,
+                         uint32_t dim, uint32_t n_data_pages, bool skip_wal,
+                         HnswLocationTable *locations)
+{
+    Page staged = (Page)palloc(BLCKSZ);
+    HnswNodeLocation entry;
+
+    if (!hnsw_location_table_lookup(locations, (uint32_t)header->enterpointNode,
+                                    &entry))
+        ereport(ERROR, (errmsg("pg_cuvs: cannot resolve HNSW entrypoint")));
+    if (!hnsw_init_metapage(staged, dim, (uint16_t)header->M,
+                            (uint16_t)header->efConstruction,
+                            entry.elem_blkno, entry.elem_offno, entry.level,
+                            n_data_pages))
+        ereport(ERROR, (errmsg("pg_cuvs: invalid HNSW metapage fields")));
+    hnsw_publish_staged_page(rel, staged, skip_wal);
+    pfree(staged);
+}
+
+static void
+hnsw_validate_build_target(Relation indexRel,
+                           const CuvsHnswBuildResult *build)
+{
+    Oid index_oid = RelationGetRelid(indexRel);
+    Oid vector_ext = get_extension_oid("vector", true);
+    Oid hnsw_am = get_am_oid("hnsw", true);
+    Oid cuvs_hnsw_am = get_am_oid("pg_cuvs_hnsw", true);
+    Form_pg_class index_form = RelationGetForm(indexRel);
+    Form_pg_attribute attr = TupleDescAttr(RelationGetDescr(indexRel), 0);
+    int dim = (int)attr->atttypmod;
+
+    if (!OidIsValid(vector_ext))
+        ereport(ERROR,
+                (errmsg("pg_cuvs: pgvector extension is not installed; "
+                        "HNSW conversion requires pgvector 0.5.0+")));
+    if (!cuvs_warn_pgvector_version())
+        ereport(ERROR,
+                (errmsg("pg_cuvs: unsupported pgvector HNSW page format version"),
+                 errhint("Source-less conversion requires pgvector 0.5.x–0.8.x.")));
+    if (index_form->relkind != RELKIND_INDEX ||
+        (index_form->relam != hnsw_am && index_form->relam != cuvs_hnsw_am))
+        ereport(ERROR,
+                (errmsg("pg_cuvs: target relation is not a pgvector HNSW index")));
+    if (dim <= 0 || (uint32_t)dim != build->dim)
+        ereport(ERROR,
+                (errmsg("pg_cuvs: HNSW build dimension %u does not match target dimension %d",
+                        build->dim, dim)));
+    if (cagra_index_metric(index_oid) != build->metric)
+        ereport(ERROR,
+                (errmsg("pg_cuvs: HNSW build metric does not match target opclass")));
+}
+
+static void
+hnsw_import_empty_build_result(Relation indexRel,
+                               const CuvsHnswBuildResult *build)
+{
+    volatile HnswDiskImportState state;
+    bool skip_wal;
+
+    memset((void *)&state, 0, sizeof(state));
+    PG_TRY();
+    {
+        HnswDiskImportState *s = (HnswDiskImportState *)&state;
+        Page metapage = (Page)palloc(BLCKSZ);
+        Page first_data_page = (Page)palloc(BLCKSZ);
+        Oid index_oid = RelationGetRelid(indexRel);
+
+        hnsw_validate_build_target(indexRel, build);
+        if (build->n_vecs != 0 || build->hnsw_fd != -1 || build->tids_fd != -1)
+            ereport(ERROR,
+                    (errmsg("pg_cuvs: empty HNSW build returned files or a nonzero count")));
+        if (!hnsw_init_empty_pages(metapage, first_data_page, build->dim,
+                                   CUVS_HNSW_BUILD_M, CUVS_HNSW_BUILD_EF))
+            ereport(ERROR, (errmsg("pg_cuvs: cannot initialize empty HNSW pages")));
+
+        s->target = index_open(index_oid, AccessExclusiveLock);
+        skip_wal = RelationGetForm(s->target)->relpersistence == RELPERSISTENCE_UNLOGGED;
+        if (skip_wal)
+            ereport(NOTICE,
+                    (errmsg("pg_cuvs: target HNSW index is UNLOGGED — WAL skipped; "
+                            "index must be rebuilt after crash recovery")));
+        {
+            SMgrRelation smgr = RelationGetSmgr(s->target);
+            BlockNumber current = smgrnblocks(smgr, MAIN_FORKNUM);
+            if (current > 0)
+                RelationTruncate(s->target, 0);
+            RelationSetTargetBlock(s->target, InvalidBlockNumber);
+        }
+        hnsw_publish_staged_page(s->target, metapage, skip_wal);
+        hnsw_publish_staged_page(s->target, first_data_page, skip_wal);
+        index_close(s->target, AccessExclusiveLock);
+        s->target = NULL;
+    }
+    PG_FINALLY();
+    {
+        HnswDiskImportState *s = (HnswDiskImportState *)&state;
+        if (s->target)
+        {
+            index_close(s->target, AccessExclusiveLock);
+            s->target = NULL;
+        }
+    }
+    PG_END_TRY();
+}
+
+static void
+hnsw_import_build_result(Relation indexRel,
+                         const CuvsHnswBuildResult *build,
+                         bool packed_nsw)
+{
+    volatile HnswDiskImportState state;
+    HnswlibHeader header;
+    CuvsTidsHeader tids_header;
+    uint32_t pack_k = 1;
+    char error[256] = {0};
+    Oid index_oid = RelationGetRelid(indexRel);
+    Form_pg_attribute attr = TupleDescAttr(RelationGetDescr(indexRel), 0);
+    int dim = (int)attr->atttypmod;
+    int bytes_per_dim = bytes_per_dim_for_typid(attr->atttypid);
+    bool skip_wal;
+    uint32_t data_page_count;
+
+    memset((void *)&state, 0, sizeof(state));
+    PG_TRY();
+    {
+        HnswDiskImportState *s = (HnswDiskImportState *)&state;
+        hnsw_validate_build_target(indexRel, build);
+        if (build->n_vecs == 0 || build->hnsw_fd < 0 || build->tids_fd < 0 ||
+            build->n_vecs > SIZE_MAX)
+            ereport(ERROR,
+                    (errmsg("pg_cuvs: source-less HNSW build returned invalid files or count")));
+
+        s->locations.n_nodes = build->n_vecs;
+        s->locations.file = BufFileCreateTemp(false);
+        if (!s->locations.file)
+            ereport(ERROR,
+                    (errmsg("pg_cuvs: cannot create disk-backed HNSW location table")));
+        if (!hnsw_file_preflight(build->hnsw_fd, build->tids_fd,
+                                 build->n_vecs, build->dim, build->metric,
+                                 bytes_per_dim, packed_nsw,
+                                 &header, &tids_header,
+                                 hnsw_location_table_append, &s->locations,
+                                 hnsw_pg_check_interrupts,
+                                 error, sizeof(error)))
+            ereport(ERROR,
+                    (errmsg("pg_cuvs: invalid source-less HNSW files: %s", error)));
+        if (!hnsw_location_table_rewind(&s->locations, build->n_vecs))
+            ereport(ERROR,
+                    (errmsg("pg_cuvs: incomplete disk-backed HNSW location table")));
+        if (packed_nsw &&
+            !hnsw_compute_pack_k(dim, bytes_per_dim, (int)header.M, &pack_k))
+            ereport(ERROR,
+                    (errmsg("pg_cuvs: NSW element and neighbor tuples do not fit on a page")));
+        if (!hnsw_data_page_count(build->n_vecs, packed_nsw, pack_k,
+                                  &data_page_count))
+            ereport(ERROR,
+                    (errmsg("pg_cuvs: HNSW data page count exceeds block number limits")));
+
+        s->target = index_open(index_oid, AccessExclusiveLock);
+        skip_wal = RelationGetForm(s->target)->relpersistence == RELPERSISTENCE_UNLOGGED;
+        if (skip_wal)
+            ereport(NOTICE,
+                    (errmsg("pg_cuvs: target HNSW index is UNLOGGED — WAL skipped; "
+                            "index must be rebuilt after crash recovery")));
+        {
+            SMgrRelation smgr = RelationGetSmgr(s->target);
+            BlockNumber current = smgrnblocks(smgr, MAIN_FORKNUM);
+            if (current > 0)
+                RelationTruncate(s->target, 0);
+            RelationSetTargetBlock(s->target, InvalidBlockNumber);
+        }
+        hnsw_write_disk_metapage(s->target, &header, build->dim,
+                                 data_page_count, skip_wal, &s->locations);
+        hnsw_write_disk_pages(s->target, build->hnsw_fd, build->tids_fd,
+                              &header, build->n_vecs, build->dim,
+                              bytes_per_dim, packed_nsw, pack_k,
+                              data_page_count, skip_wal,
+                              &s->locations);
+        index_close(s->target, AccessExclusiveLock);
+        s->target = NULL;
+    }
+    PG_FINALLY();
+    {
+        HnswDiskImportState *s = (HnswDiskImportState *)&state;
+        if (s->target)
+        {
+            index_close(s->target, AccessExclusiveLock);
+            s->target = NULL;
+        }
+        if (s->locations.file)
+        {
+            BufFileClose(s->locations.file);
+            s->locations.file = NULL;
+        }
+    }
+    PG_END_TRY();
 }
 
 /* ================================================================
@@ -1984,7 +3194,8 @@ fill_hnsw_from_cagra_ipc_impl(Oid cagra_oid, Oid hnsw_oid, const char *mode,
     if (pack_k > 1)
     {
         write_elem_pages_packed(hnsw_rel, elems, vecs, ipc_dim, bytes_per_dim,
-                                M, N, pack_k, hnsw_unlogged);
+                                M, N, pack_k, hnsw_unlogged,
+                                hnsw_lookup_elem_array, elems);
     }
     else
     {
@@ -1997,8 +3208,8 @@ fill_hnsw_from_cagra_ipc_impl(Oid cagra_oid, Oid hnsw_oid, const char *mode,
                             &elems[i],
                             vec,
                             ipc_dim, bytes_per_dim, M,
-                            elems, N,
-                            hnsw_unlogged);
+                            N, hnsw_unlogged,
+                            hnsw_lookup_elem_array, elems);
         }
     }
 
@@ -2377,45 +3588,41 @@ cuvs_hnsw_ambuild(Relation heapRel, Relation indexRel, IndexInfo *indexInfo)
     int precheck_bytes_per_dim = bytes_per_dim_for_typid(precheck_att->atttypid);
     const int safe_maxlevel = (strcmp(mode, "nsw") == 0) ? 0 : 5;
 
-    /* ── Source-less: ephemeral CAGRA built from the heap, then dropped. ── */
+    /* ── Source-less: build and convert from regular disk files. ── */
     if (source_name[0] == '\0')
     {
-        int64_t n_vecs    = 0;
-        double  reltuples = 0.0;
+        volatile CuvsHnswBuildResult build;
 
-        /* No user reloptions on an ephemeral build (cuVS defaults: 3R
-         * comment below) -> graph_degree=64, M=32. */
-        check_hnsw_page_fit(precheck_dim, precheck_bytes_per_dim, 32, safe_maxlevel);
-
-        /* Build an ephemeral CAGRA under THIS index's OID. shard_count=1
-         * (a sharded CAGRA cannot export its adjacency); no .hnsw sidecar. */
-        cuvs_build_cagra_from_heap(heapRel, indexRel, indexInfo,
-                                   (uint32_t) self_oid, 1, false,
-                                   /* 3R: ephemeral CAGRA uses cuVS defaults (no user reloptions). */
-                                   0, 0, CUVS_CAGRA_BUILD_AUTO,
-                                   &n_vecs, &reltuples);
-        result->heap_tuples  = reltuples;
-        result->index_tuples = (double) n_vecs;
-        if (n_vecs == 0)
-            return result;  /* empty heap — empty index */
-
-        /* Convert, then ALWAYS drop the ephemeral CAGRA (success or error) so
-         * the daemon keeps no orphan. Dropping inside ambuild also avoids the
-         * abort-time zombie that object_access_hook cannot catch for a failed
-         * CREATE INDEX (it only sees explicit DROPs of cagra-AM indexes). */
+        /* The helper uses graph degree 64, which serializes HNSW M=32. */
+        check_hnsw_page_fit(precheck_dim, precheck_bytes_per_dim,
+                            CUVS_HNSW_BUILD_M, safe_maxlevel);
+        memset((void *)&build, 0, sizeof(build));
+        ((CuvsHnswBuildResult *)&build)->hnsw_fd = -1;
+        ((CuvsHnswBuildResult *)&build)->tids_fd = -1;
         PG_TRY();
         {
-            if (strcmp(mode, "nsw") == 0 || strcmp(mode, "hnsw") == 0)
-                fill_hnsw_from_cagra_ipc(self_oid, self_oid, mode);
-            else if (strcmp(mode, "hnswlib") == 0)
-                fill_hnsw_from_hnswlib(self_oid, self_oid, true);
-            else  /* hnswlib_file */
-                fill_hnsw_from_hnswlib(self_oid, self_oid, false);
+            CuvsHnswBuildResult *b = (CuvsHnswBuildResult *)&build;
+            cuvs_build_hnsw_from_heap(heapRel, indexRel, indexInfo, mode, b);
+            result->heap_tuples = b->reltuples;
+            result->index_tuples = (double)b->n_vecs;
+            if (b->n_vecs > 0)
+                hnsw_import_build_result(indexRel, b, strcmp(mode, "nsw") == 0);
+            else
+                hnsw_import_empty_build_result(indexRel, b);
         }
         PG_FINALLY();
         {
-            cuvs_ipc_drop(cuvs_socket_path, (uint32_t) MyDatabaseId,
-                          (uint32_t) self_oid);
+            CuvsHnswBuildResult *b = (CuvsHnswBuildResult *)&build;
+            if (b->hnsw_fd >= 0)
+            {
+                close(b->hnsw_fd);
+                b->hnsw_fd = -1;
+            }
+            if (b->tids_fd >= 0)
+            {
+                close(b->tids_fd);
+                b->tids_fd = -1;
+            }
         }
         PG_END_TRY();
 

@@ -538,3 +538,22 @@ int cuvs_eat_vram(int64_t leave_bytes, int device_id)
 
 int cuvs_free_vram(int device_id)
 { (void)device_id; g_shim_vram_free = (int64_t) shim_vram_total(); return 0; }
+
+/* The CPU reference shim cannot prove graph construction or SDK identity. */
+int
+cuvs_hnsw_build_file(int vectors_fd, int owner_fd,
+    const CuvsHnswFileBuild *params, const char *workdir, int device_id,
+    int *out_fd, char *error, size_t error_len)
+{
+    (void)vectors_fd; (void)owner_fd; (void)params; (void)workdir; (void)device_id;
+    *out_fd = -1;
+    if (error_len) snprintf(error, error_len, "temporary HNSW build requires verified GPU SDK; CPU shim unsupported");
+    return CUVS_STATUS_BUILD_FAILED;
+}
+
+int
+cuvs_hnsw_reap_workdirs(const char *root)
+{
+    (void)root; /* shim never creates GPU build workdirs */
+    return 0;
+}

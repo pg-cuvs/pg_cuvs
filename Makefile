@@ -239,13 +239,51 @@ install-server-test: server-test
 # librt exists on Linux (CI/VM) but not macOS — link it only where present.
 TEST_RT_LIB := $(shell [ "$$(uname -s)" = "Linux" ] && echo -lrt)
 test-unit: test/unit/test_cuvs_util.c src/cuvs_util.c src/cuvs_util.h src/cuvs_ipc.h \
-           test/unit/test_build_corpus.c src/cuvs_build_corpus.c src/cuvs_build_corpus.h
+           test/unit/test_build_corpus.c src/cuvs_build_corpus.c src/cuvs_build_corpus.h \
+           test-hnsw-build test-hnsw-build-ipc test-hnsw-admission
 	$(CC) -I src -DCUVS_TEST_HOOKS -o test-unit test/unit/test_cuvs_util.c src/cuvs_util.c $(TEST_RT_LIB)
 	./test-unit
 	$(CC) -I src -o test-build-corpus test/unit/test_build_corpus.c src/cuvs_build_corpus.c $(TEST_RT_LIB)
 	./test-build-corpus
 
 .PHONY: test-unit
+
+# HNSW admission and op-specific FD/owner lifecycle fixtures. No daemon, PG
+# backend or CUDA is needed. Keep separate targets for bounded worker checks.
+test-hnsw-build: test/unit/test_hnsw_build.c src/cuvs_hnsw_build_common.h
+	$(CC) -std=gnu11 -Wall -Wextra -I src -o $@ test/unit/test_hnsw_build.c
+	./$@
+
+test-hnsw-build-ipc: test/unit/test_hnsw_build_ipc.c src/cuvs_ipc.c \
+                    src/cuvs_util.c src/cuvs_build_corpus.c $(wildcard src/*.h)
+	$(CC) -std=gnu11 -Wall -Wextra -I src -o $@ test/unit/test_hnsw_build_ipc.c \
+		src/cuvs_ipc.c src/cuvs_util.c src/cuvs_build_corpus.c -lpthread -lm $(TEST_RT_LIB)
+	./$@
+
+test-hnsw-admission: test/unit/test_hnsw_admission.c src/cuvs_hnsw_build_common.h
+	$(CC) -std=gnu11 -Wall -Wextra -I src -o $@ test/unit/test_hnsw_admission.c -lpthread
+	./$@
+
+# Converter fixtures include private PG page helpers, with backend stubs and
+# section garbage collection. Requires server headers, but no running backend.
+ifeq ($(shell uname -s),Darwin)
+HNSW_CONVERTER_UNIT_LINK = -Wl,-undefined,dynamic_lookup -Wl,-dead_strip
+else
+HNSW_CONVERTER_UNIT_LINK = -Wl,--gc-sections \
+                          -L$(shell $(PG_CONFIG) --pkglibdir) -lpgcommon -lpgport -lm
+endif
+HNSW_UNIT_CPPFLAGS ?=
+test-hnsw-converter: test/unit/test_hnsw_converter.c src/hnsw_export.c \
+                     src/hnsw_export.h src/cuvs_util.c $(wildcard src/*.h)
+	$(CC) -std=gnu11 -O0 -Wall -Wextra -Wno-unused-parameter \
+		-ffunction-sections -fdata-sections -I src \
+		-I$(shell $(PG_CONFIG) --includedir) -I$(shell $(PG_CONFIG) --includedir-server) \
+		$(HNSW_UNIT_CPPFLAGS) -o $@ test/unit/test_hnsw_converter.c src/cuvs_util.c \
+		$(HNSW_CONVERTER_UNIT_LINK) $(TEST_RT_LIB)
+	./$@
+
+EXTRA_CLEAN += test-hnsw-build test-hnsw-build-ipc test-hnsw-converter test-hnsw-admission
+.PHONY: test-hnsw-build test-hnsw-build-ipc test-hnsw-converter test-hnsw-admission
 
 # ---- Documentation contract check ---------------------------------------
 # CPU-only drift detector for the current version/defaults and release-facing

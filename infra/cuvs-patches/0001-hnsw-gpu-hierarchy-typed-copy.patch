@@ -1,0 +1,20 @@
+diff --git a/cpp/src/neighbors/detail/hnsw.hpp b/cpp/src/neighbors/detail/hnsw.hpp
+--- a/cpp/src/neighbors/detail/hnsw.hpp
++++ b/cpp/src/neighbors/detail/hnsw.hpp
+@@ -693,6 +693,6 @@
+       if (create_hierarchy && levels[i] > 0) {
+         // position in query: order_bw[i]-hist[0]
+         std::copy(data_row,
+                   data_row + dim,
+-                  reinterpret_cast<char*>(&host_query_set(order_bw[i] - hist[0], 0)));
++                  &host_query_set(order_bw[i] - hist[0], 0));
+       }
+@@ -992,7 +992,7 @@
+ #pragma omp parallel for num_threads(num_threads)
+     for (auto i = start_idx; i < end_idx; i++) {
+       auto pt_id = order[i];
+       std::copy(appr_algo->getDataByInternalId(pt_id),
+                 appr_algo->getDataByInternalId(pt_id) + dim,
+-                reinterpret_cast<char*>(&host_query_set(i - start_idx, 0)));
++                &host_query_set(i - start_idx, 0));
+     }
