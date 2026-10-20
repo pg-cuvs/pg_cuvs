@@ -44,10 +44,9 @@ Datum pg_cuvs_hnsw_handler(PG_FUNCTION_ARGS);
 void  cuvs_report_proto_mismatch(int rc);
 
 /*
- * Phase 3K: shared heap-scan + CAGRA build (defined in pg_cuvs.c). Used by
- * cuvs_ambuild (USING cagra) and the source-less pg_cuvs_hnsw path, which
- * builds an ephemeral CAGRA under build_index_oid and drops it after the HNSW
- * conversion. On an empty heap, sets *out_n_vecs = 0 and builds nothing.
+ * Shared heap-scan + CAGRA build (defined in pg_cuvs.c), used by cuvs_ambuild
+ * (USING cagra). The source-less HNSW AM uses the separate disk-backed
+ * cuvs_build_hnsw_from_heap() interface in cuvs_hnsw_build.h.
  */
 void cuvs_build_cagra_from_heap(Relation heapRel, Relation indexRel,
                                 IndexInfo *indexInfo,

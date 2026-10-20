@@ -25,6 +25,7 @@
 #include "cuvs_ipc.h"
 #include "cuvs_util.h"   /* leveled logging macros (LOG_ERROR/WARN/INFO/DEBUG) */
 #include "cuvs_build_corpus.h"   /* ADR-057: tiered corpus handoff + SCM_RIGHTS */
+#include "cuvs_hnsw_build_common.h"
 
 /* Hot-path IPC traces (LOG_DEBUG) are gated by PG_CUVS_DEBUG; enable via
  * -DPG_CUVS_DEBUG=1. Error paths (LOG_ERROR) always log unconditionally. */
@@ -2379,5 +2380,88 @@ cuvs_ipc_inject_build_oom(const char *socket_path, int n_fail)
         rc = (int)hdr.status;
 
     close(sock);
+    return rc;
+}
+
+/* Temporary HNSW jobs use ordinary disk and a separate owner lease. Cancel
+ * never frees GPU state asynchronously: the daemon observes the lease at safe
+ * boundaries and destroys cuVS objects after any in-flight call returns. */
+int
+cuvs_ipc_build_hnsw_file(const char *socket_path, int vectors_fd,
+    uint64_t n_vecs, uint32_t dim, uint32_t metric, uint32_t graph_degree,
+    uint32_t intermediate_degree, uint32_t hierarchy, uint64_t host_budget,
+    int *hnsw_fd, char *error, size_t error_len)
+{
+    int sock = -1, owner[2] = {-1, -1}, result_fd = -1;
+    int rc = CUVS_STATUS_ERROR;
+    CuvsCmdFrame cmd = {0};
+    CuvsHnswFileRequest request = {CUVS_HNSW_FILE_VERSION, hierarchy, host_budget};
+    CuvsReplyHeader reply = {0};
+    char token = 'O';
+    *hnsw_fd = -1;
+    if (error_len) error[0] = '\0';
+    if (!cuvs_hnsw_regular_disk(vectors_fd) || !n_vecs || n_vecs > INT32_MAX
+        || !dim || metric > CUVS_METRIC_IP || hierarchy > 1 || !host_budget)
+        goto done;
+    sock = uds_connect_ex(socket_path, 30);
+    if (sock < 0) { rc = CUVS_STATUS_UNAVAILABLE; goto done; }
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, owner)) goto done;
+    fcntl(owner[0], F_SETFD, FD_CLOEXEC);
+    fcntl(owner[1], F_SETFD, FD_CLOEXEC);
+    cmd.op = CUVS_OP_BUILD_HNSW_FILE;
+    cmd.n_vecs = (int64_t)n_vecs;
+    cmd.dim = dim;
+    cmd.metric = metric;
+    cmd.graph_degree = graph_degree;
+    cmd.intermediate_graph_degree = intermediate_degree;
+    if (send_cmd(sock, &cmd)
+        || cuvs_fd_send(sock, vectors_fd, &request, sizeof(request))
+        || cuvs_fd_send(sock, owner[1], &token, 1)) goto done;
+    close(owner[1]); owner[1] = -1;
+    /* A single readiness byte permits interruptible waiting before recvmsg:
+     * reading that byte cannot accidentally discard the ancillary result FD. */
+    for (unsigned waited = 0; waited < 864000; waited++)
+    {
+        struct pollfd pfd = {.fd = sock, .events = POLLIN};
+        int pr;
+        if (g_wait_cb && g_wait_cb())
+        {
+            struct stat input;
+            memset(&input, 0, sizeof(input));
+            (void)fstat(vectors_fd, &input);
+            LOG_INFO("[hnsw_wait] phase=backend-cancel mono_us=%llu input_dev=%llu input_ino=%llu\n",
+                (unsigned long long)cuvs_hnsw_monotonic_us(),
+                (unsigned long long)input.st_dev, (unsigned long long)input.st_ino);
+            rc = CUVS_STATUS_CANCELED;
+            token = 'C';
+            (void)send(owner[0], &token, 1, MSG_DONTWAIT);
+            goto done;
+        }
+        pr = poll(&pfd, 1, 100);
+        if (pr < 0 && errno == EINTR) continue;
+        if (pr < 0) goto done;
+        if (pr == 0) continue;
+        if (recv_all(sock, &token, 1) || token != 'R'
+            || cuvs_fd_recv(sock, &reply, sizeof(reply), &result_fd)) goto done;
+        rc = (int)reply.status;
+        if (error_len) snprintf(error, error_len, "%.*s", (int)sizeof(reply.error), reply.error);
+        if (rc == CUVS_STATUS_OK)
+        {
+            if (!cuvs_hnsw_regular_disk(result_fd)
+                || (fcntl(result_fd, F_GETFL) & O_ACCMODE) != O_RDONLY)
+            { rc = CUVS_STATUS_ERROR; goto done; }
+            fcntl(result_fd, F_SETFD, FD_CLOEXEC);
+            token = 'A';
+            if (send(owner[0], &token, 1, 0) != 1) { rc = CUVS_STATUS_ERROR; goto done; }
+            *hnsw_fd = result_fd; result_fd = -1;
+        }
+        goto done;
+    }
+    if (error_len) snprintf(error, error_len, "temporary HNSW job timed out");
+ done:
+    if (result_fd >= 0) close(result_fd);
+    if (owner[0] >= 0) close(owner[0]);
+    if (owner[1] >= 0) close(owner[1]);
+    if (sock >= 0) close(sock);
     return rc;
 }
