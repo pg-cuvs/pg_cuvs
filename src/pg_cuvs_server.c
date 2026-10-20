@@ -366,7 +366,13 @@ static size_t   g_max_vram_per_gpu[CUVS_MAX_GPUS];
 static char   g_socket_path[256]  = "/tmp/.s.pg_cuvs.server";
 static char   g_index_dir[256]    = "/tmp/pg_cuvs_indexes";
 static size_t g_max_vram_bytes    = 0;   /* 0 = use default fraction; >0 = explicit --max-vram-mb */
-static uint32_t g_rmm_pool_mb     = 0;   /* opt-in initial reservation per usable GPU */
+#ifdef PGCUVS_CPU_SHIM
+static uint32_t g_rmm_pool_mb     = 0;   /* CPU fixture has no GPU allocator */
+#else
+static uint32_t g_rmm_pool_mb     = 512; /* initial reservation per usable GPU */
+#endif
+static uint32_t g_rmm_pool_max_percent = 50;
+static size_t g_rmm_pool_limits[CUVS_MAX_GPUS];
 
 /* ADR-065: default per-device budget when --max-vram-mb is omitted — a fraction
  * of total VRAM, leaving headroom for the untracked cuVS workspace + CUDA
@@ -738,10 +744,14 @@ pick_gpu_for_index(size_t needed)
     {
         int dev = usable_gpu(i);
         size_t budget = g_max_vram_per_gpu[dev];
+        if (g_rmm_pool_limits[dev] > 0 &&
+            (budget == 0 || g_rmm_pool_limits[dev] < budget))
+            budget = g_rmm_pool_limits[dev];
         if (budget > 0 && needed > budget)
             continue;
         size_t used = total_vram_used(dev);
-        size_t headroom = (budget > 0) ? (budget - used) : gpu_free_vram_bytes(dev);
+        size_t headroom = budget > 0 ? (budget > used ? budget - used : 0)
+                                    : gpu_free_vram_bytes(dev);
         if (best < 0 || headroom > best_headroom) {
             best_headroom = headroom;
             best = dev;
@@ -2082,6 +2092,10 @@ static int
 ensure_vram(size_t needed, int device_id)
 {
     size_t budget = g_max_vram_per_gpu[device_id];
+    /* An index that cannot fit even in an empty pool must not evict healthy
+     * indexes while admission repeatedly waits for impossible growth. */
+    if (g_rmm_pool_limits[device_id] > 0 && needed > g_rmm_pool_limits[device_id])
+        return -1;
     if (budget > 0 && total_vram_used(device_id) + needed > budget)
     {
         while (g_n_indexes > 0 && total_vram_used(device_id) + needed > budget)
@@ -7911,6 +7925,30 @@ connection_thread(void *arg)
             send_all(client_fd, &settings, sizeof(settings));
             break;
         }
+        case CUVS_OP_RMM_POOL_STATUS:
+        {
+            CuvsReplyHeader hdr = {.status = CUVS_STATUS_OK, .n_results = 1};
+            CuvsRmmPoolStatus status = {
+                .version = CUVS_RMM_POOL_STATUS_VERSION,
+                .initial_mb = g_rmm_pool_mb,
+                .maximum_percent = g_rmm_pool_mb > 0 ? g_rmm_pool_max_percent : 0
+            };
+            if (g_rmm_pool_mb > 0)
+                for (int i = 0; i < n_usable_gpus(); i++)
+                {
+                    if (cuvs_rmm_pool_stats(usable_gpu(i), &status.devices[i]) != 0)
+                    {
+                        hdr.status = CUVS_STATUS_UNAVAILABLE;
+                        hdr.n_results = 0;
+                        break;
+                    }
+                    status.n_devices++;
+                }
+            send_all(client_fd, &hdr, sizeof(hdr));
+            if (hdr.status == CUVS_STATUS_OK)
+                send_all(client_fd, &status, sizeof(status));
+            break;
+        }
         case CUVS_OP_SHARD_STATS:
             handle_shard_stats(client_fd, &cmd);
             break;
@@ -8564,6 +8602,15 @@ main(int argc, char **argv)
                 return 1;
             }
         }
+        else if (strcmp(argv[i], "--rmm-pool-max-percent") == 0)
+        {
+            if (i + 1 >= argc ||
+                cuvs_parse_rmm_pool_percent(argv[++i], &g_rmm_pool_max_percent) != 0)
+            {
+                LOG_ERROR("--rmm-pool-max-percent requires an integer from 1 to 100\n");
+                return 1;
+            }
+        }
         else if (strcmp(argv[i], "--max-indexes") == 0 && i+1 < argc)
         {
             int n = atoi(argv[++i]);
@@ -8684,22 +8731,28 @@ main(int argc, char **argv)
     LOG_INFO("index registry capacity: %d (--max-indexes)\n", g_max_indexes);
 
     /* Install the per-device allocator before probes, persisted-index reloads,
-     * warmup or worker threads can make the first RMM allocation. Zero leaves
-     * the old allocation path untouched. A failed opt-in init aborts startup. */
+     * warmup or worker threads can make the first RMM allocation. An explicit
+     * zero keeps the old allocation path. Any failed init aborts startup. */
     if (g_rmm_pool_mb > 0)
     {
         for (int i = 0; i < n_usable_gpus(); i++)
         {
             int dev = usable_gpu(i);
-            if (cuvs_rmm_pool_init(dev, (size_t)g_rmm_pool_mb * 1024 * 1024) != 0)
+            CuvsRmmPoolStats stats;
+            if (cuvs_rmm_pool_init(dev, (size_t)g_rmm_pool_mb * 1024 * 1024,
+                                  g_rmm_pool_max_percent) != 0 ||
+                cuvs_rmm_pool_stats(dev, &stats) != 0)
             {
                 LOG_ERROR("GPU %d: RMM pool initialization failed (%u MiB)\n",
                           dev, g_rmm_pool_mb);
                 return 1;
             }
+            g_rmm_pool_limits[dev] = (size_t)stats.maximum_bytes;
         }
     }
     LOG_INFO("RMM initial pool reservation: %u MiB per GPU (0=disabled)\n", g_rmm_pool_mb);
+    LOG_INFO("RMM maximum pool quota: %u%% of total device memory\n",
+             g_rmm_pool_mb > 0 ? g_rmm_pool_max_percent : 0);
 
     /* ADR-075 Phase 1: probe hardware + write the global cost-model profile. */
     write_hw_profile();

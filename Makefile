@@ -142,6 +142,9 @@ SERVER_CFLAGS  = -O2 -g -Wall -Wextra -I./src \
 # Optional sanitizer/debug hooks for the daemon (e.g. CI ASAN job passes
 # EXTRA_SERVER_CFLAGS="-fsanitize=address -fno-omit-frame-pointer"). Empty by default.
 SERVER_CFLAGS += $(EXTRA_SERVER_CFLAGS)
+ifdef PGCUVS_CPU_SHIM
+SERVER_CFLAGS += -DPGCUVS_CPU_SHIM
+endif
 SERVER_LDFLAGS = $(CUVS_SERVER_LINK) -lstdc++ \
                  -lpthread -lrt \
                  -lcurl -lssl -lcrypto
@@ -373,7 +376,8 @@ export
 # VM_SSH_HOST is provider-neutral; GCP_VM is the pre-Brev name kept as a
 # fallback so an existing config file still resolves.
 VM_SSH_HOST ?= $(GCP_VM)
-RMM_POOL_MB ?= 0
+RMM_POOL_MB ?= 512
+RMM_POOL_MAX_PERCENT ?= 50
 GCP_USER ?= ubuntu
 VM_IP = $(if $(USE_GCP_IP),$(shell gcloud compute instances describe $(GCP_INSTANCE) --zone $(GCP_ZONE) $(if $(GCP_PROJECT),--project $(GCP_PROJECT)) --format='value(networkInterfaces[0].accessConfigs[0].natIP)' 2>/dev/null),)
 VM_HOST = $(if $(VM_IP),$(GCP_USER)@$(VM_IP),$(VM_SSH_HOST))
@@ -572,7 +576,8 @@ gpu-server-start:
 	ssh -tt $(VM_HOST) "pg_cuvs_server \
 		--socket /tmp/.s.pg_cuvs \
 		--index-dir \$$(psql -t -c 'SHOW data_directory' | tr -d ' ')/cuvs_indexes \
-		--max-vram-mb 20480 --rmm-pool-mb $(RMM_POOL_MB) &"
+		--max-vram-mb 20480 --rmm-pool-mb $(RMM_POOL_MB) \
+		--rmm-pool-max-percent $(RMM_POOL_MAX_PERCENT) &"
 
 # Default sanity benchmark on the VM (small size from benchmark.sh defaults).
 # N/DIM/K/M forwarded to the remote `make benchmark` only when set locally.

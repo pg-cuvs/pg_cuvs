@@ -16,6 +16,8 @@
 #include <stddef.h>
 #include <sys/types.h>
 
+#define CUVS_MAX_GPUS 16
+
 /* ----------------------------------------------------------------
  * Protocol identity (#77)
  *
@@ -81,6 +83,7 @@
                                      * names the SHM-tier fallback); query in shm_key. Non-evicting
                                      * VRAM admission; returns top-k (tid,distance). */
 #define CUVS_OP_SERVER_SETTINGS    23 /* read-only daemon startup settings */
+#define CUVS_OP_RMM_POOL_STATUS    24 /* quota and live pool counters */
 
 /* ----------------------------------------------------------------
  * Distance metrics (mirror pgvector operator names)
@@ -330,6 +333,25 @@ typedef struct CuvsServerSettings {
 } CuvsServerSettings;
 
 int cuvs_ipc_server_settings(const char *socket_path, CuvsServerSettings *out);
+
+typedef struct CuvsRmmPoolStats {
+    uint32_t device_id;
+    uint32_t reserved;
+    uint64_t maximum_bytes;
+    uint64_t reserved_bytes;
+    uint64_t used_bytes;
+} CuvsRmmPoolStats;
+
+#define CUVS_RMM_POOL_STATUS_VERSION 1u
+typedef struct CuvsRmmPoolStatus {
+    uint32_t version;
+    uint32_t initial_mb;
+    uint32_t maximum_percent;  /* applied percentage; 0 when disabled */
+    uint32_t n_devices;
+    CuvsRmmPoolStats devices[CUVS_MAX_GPUS];
+} CuvsRmmPoolStatus;
+
+int cuvs_ipc_rmm_pool_status(const char *socket_path, CuvsRmmPoolStatus *out);
 
 /*
  * cuvs_ipc_search_filtered — D-wedge spike: filtered BF search.

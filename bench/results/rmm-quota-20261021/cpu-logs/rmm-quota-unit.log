@@ -1,0 +1,8 @@
+clang -I src -DCUVS_TEST_HOOKS -o test-unit test/unit/test_cuvs_util.c src/cuvs_util.c 
+./test-unit
+[INFO] cuvs_util unit tests: 276 passed, 0 failed
+[OK] all tests passed
+clang -I src -o test-build-corpus test/unit/test_build_corpus.c src/cuvs_build_corpus.c 
+./test-build-corpus
+[INFO] memfd/shm-grow/reaper tests skipped (non-Linux)
+test_build_corpus: 27 passed, 0 failed

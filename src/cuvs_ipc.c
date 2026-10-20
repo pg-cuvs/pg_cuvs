@@ -885,6 +885,29 @@ cuvs_ipc_server_settings(const char *socket_path, CuvsServerSettings *out)
     return rc;
 }
 
+int
+cuvs_ipc_rmm_pool_status(const char *socket_path, CuvsRmmPoolStatus *out)
+{
+    int sock = uds_connect_ex(socket_path, 1);
+    int rc = CUVS_STATUS_ERROR;
+    CuvsCmdFrame cmd = {.op = CUVS_OP_RMM_POOL_STATUS};
+    CuvsReplyHeader hdr;
+    if (sock < 0)
+        return CUVS_STATUS_UNAVAILABLE;
+    memset(out, 0, sizeof(*out));
+    if (send_cmd(sock, &cmd) == 0 && recv_all(sock, &hdr, sizeof(hdr)) == 0)
+    {
+        rc = (int)hdr.status;
+        if (rc == CUVS_STATUS_OK &&
+            (hdr.n_results != 1 || recv_all(sock, out, sizeof(*out)) < 0 ||
+             out->version != CUVS_RMM_POOL_STATUS_VERSION ||
+             out->n_devices > CUVS_MAX_GPUS))
+            rc = CUVS_STATUS_ERROR;
+    }
+    close(sock);
+    return rc;
+}
+
 /* ----------------------------------------------------------------
  * Public API: cuvs_ipc_shard_stats (Phase 3F)
  * ---------------------------------------------------------------- */

@@ -1,0 +1,18 @@
+echo "# +++ regress install-check in  +++" && /usr/local/lib/postgresql/pgxs/src/makefiles/../../src/test/regress/pg_regress --inputdir=./ --bindir='/usr/local/bin'    --inputdir=test --outputdir=test --dbname=contrib_regression rmm_pool smoke
+# +++ regress install-check in  +++
+# using postmaster on /tmp, default port
+ok 1         - rmm_pool                                   37 ms
+ok 2         - smoke                                      27 ms
+1..2
+# All 2 tests passed.
+echo "# +++ isolation install-check in  +++" && /usr/local/lib/postgresql/pgxs/src/makefiles/../../src/test/isolation/pg_isolation_regress --inputdir=./ --outputdir=output_iso --bindir='/usr/local/bin'    --inputdir=test --outputdir=test --dbname=isolation_regression delta_tombstone_snapshot delta_interleaving reindex_concurrent_delete flat_tombstone_snapshot flat_delta_interleaving flat_reindex_concurrent_delete
+# +++ isolation install-check in  +++
+# using postmaster on /tmp, default port
+ok 1         - delta_tombstone_snapshot                   57 ms
+ok 2         - delta_interleaving                         40 ms
+ok 3         - reindex_concurrent_delete                  82 ms
+ok 4         - flat_tombstone_snapshot                    44 ms
+ok 5         - flat_delta_interleaving                    33 ms
+ok 6         - flat_reindex_concurrent_delete             61 ms
+1..6
+# All 6 tests passed.

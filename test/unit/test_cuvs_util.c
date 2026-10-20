@@ -569,6 +569,47 @@ test_rmm_pool_size(void)
     ASSERT(cuvs_parse_rmm_pool_mb("2147483648", &mb) != 0, "GUC integer overflow rejected");
     ASSERT(cuvs_parse_rmm_pool_mb("184467440737095516160", &mb) != 0,
            "conversion overflow rejected");
+
+    ASSERT(cuvs_parse_rmm_pool_percent("50", &mb) == 0 && mb == 50,
+           "pool quota percent");
+    ASSERT(cuvs_parse_rmm_pool_percent("1", &mb) == 0 && mb == 1,
+           "minimum quota percent");
+    ASSERT(cuvs_parse_rmm_pool_percent("100", &mb) == 0 && mb == 100,
+           "maximum quota percent");
+    ASSERT(cuvs_parse_rmm_pool_percent("0", &mb) != 0, "zero quota rejected");
+    ASSERT(cuvs_parse_rmm_pool_percent("101", &mb) != 0, "oversized quota rejected");
+    ASSERT(cuvs_parse_rmm_pool_percent("50%", &mb) != 0, "percent suffix rejected");
+    ASSERT(cuvs_parse_rmm_pool_percent("-1", &mb) != 0, "negative quota rejected");
+
+    ASSERT(cuvs_rmm_pool_max_bytes(8192, 50) == 4096, "half-device quota");
+    ASSERT(cuvs_rmm_pool_max_bytes(1025, 50) == 512, "quota rounds down to 256B");
+    ASSERT(cuvs_rmm_pool_max_bytes(SIZE_MAX, 100) == SIZE_MAX - 255,
+           "quota multiplication does not overflow");
+    ASSERT(cuvs_rmm_pool_max_bytes(SIZE_MAX, 50) == ((SIZE_MAX / 2) & ~(size_t)255),
+           "half-device calculation does not overflow");
+    ASSERT(cuvs_rmm_pool_max_bytes(8192, 0) == 0, "invalid zero percentage");
+    ASSERT(cuvs_rmm_pool_max_bytes(8192, 101) == 0, "invalid large percentage");
+
+    ASSERT(cuvs_rmm_pool_headroom(100, 50, 0, 0, 0) == 150,
+           "disabled pool keeps physical plus async headroom");
+    ASSERT(cuvs_rmm_pool_headroom(SIZE_MAX - 5, 10, 0, 0, 0) == SIZE_MAX,
+           "physical headroom sum saturates");
+    ASSERT(cuvs_rmm_pool_headroom(100, 0, 1000, 800, 500) == 400,
+           "reuse plus physically available growth");
+    ASSERT(cuvs_rmm_pool_headroom(9000, 0, 1000, 800, 500) == 500,
+           "abundant physical memory cannot bypass quota");
+    ASSERT(cuvs_rmm_pool_headroom(0, 100, 1000, 800, 500) == 400,
+           "async cache reclaim contributes to growth");
+    ASSERT(cuvs_rmm_pool_headroom(0, 0, 1000, 1000, 100) == 900,
+           "a full reservation remains reusable");
+    ASSERT(cuvs_rmm_pool_headroom(9000, 0, 1000, 1000, 1000) == 0,
+           "fully used quota has no admission headroom");
+    ASSERT(cuvs_rmm_pool_headroom(9000, 0, 1000, 800, 900) == 0,
+           "inconsistent counters fail closed");
+    ASSERT(cuvs_rmm_pool_headroom(9000, 0, 1000, 1100, 500) == 0,
+           "transient over-quota reservation fails closed");
+    ASSERT(cuvs_rmm_pool_headroom(SIZE_MAX, 100, SIZE_MAX, SIZE_MAX - 128, 0) == SIZE_MAX,
+           "reusable plus growth stays within quota without overflow");
 }
 
 /* ---- BF micro-batch grouping (Phase 3L-9) ---- */

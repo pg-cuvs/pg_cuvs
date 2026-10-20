@@ -30,6 +30,44 @@ cuvs_parse_rmm_pool_mb(const char *value, uint32_t *mb_out)
     return 0;
 }
 
+int
+cuvs_parse_rmm_pool_percent(const char *value, uint32_t *percent_out)
+{
+    uint32_t percent;
+    if (cuvs_parse_rmm_pool_mb(value, &percent) != 0 || percent < 1 || percent > 100)
+        return -1;
+    *percent_out = percent;
+    return 0;
+}
+
+size_t
+cuvs_rmm_pool_max_bytes(size_t total_bytes, uint32_t percent)
+{
+    size_t bytes;
+    if (percent < 1 || percent > 100)
+        return 0;
+    /* Divide first so even SIZE_MAX * 100 cannot overflow. */
+    bytes = (total_bytes / 100) * percent + ((total_bytes % 100) * percent) / 100;
+    return bytes & ~(size_t)255;
+}
+
+size_t
+cuvs_rmm_pool_headroom(size_t physical_free, size_t async_reclaimable,
+                       size_t quota, size_t reserved, size_t used)
+{
+    size_t physical = async_reclaimable > SIZE_MAX - physical_free
+                    ? SIZE_MAX : physical_free + async_reclaimable;
+    size_t growable;
+    if (quota == 0)
+        return physical;
+    if (reserved > quota || used > reserved)
+        return 0;
+    growable = quota - reserved;
+    if (growable > physical)
+        growable = physical;
+    return reserved - used + growable;
+}
+
 /* ----------------------------------------------------------------
  * Fail-closed filter-frame gate (ADR-063 tenant isolation).
  * ---------------------------------------------------------------- */

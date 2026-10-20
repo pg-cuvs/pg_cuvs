@@ -3725,3 +3725,58 @@ raw 수치 자체가 무의미해서가 아니었다.
 
 **관련**: ADR-080(대체 대상 + 나머지 유효), ADR-069(벤치 방법론), ADR-062(에코시스템 Stage 2),
 #98(측정 설계 — 두 축, 축내 비교만).
+
+## ADR-085 — RMM 초기 예약과 upstream quota를 분리하고 admission에 상한 반영
+
+**날짜:** 2026-10-21
+**상태:** 구현 — 단일 L40S 실험을 근거로 한 기본값, 다른 GPU/scale의 성능 보장은 아님
+**Supersedes:** 동일 RMM PR의 초기 기본값 `0` / upstream 무상한 구성. 과거 측정 원 자료는 변경하지 않음
+**현행 SSOT:** [`docs/reference.md`](../docs/reference.md#rmm-quota-and-memory-accounting), `src/cuvs_wrapper.cu`, `src/pg_cuvs_server.c`
+
+**배경:** cuVS가 사용하는 current device resource에 pool을 설치하면 검색 workspace뿐 아니라
+retained dataset, graph 적재와 빌드의 RMM 할당도 포함된다. `initial_pool_size`는 최대 크기가
+아니며, 빌드가 끝나도 pool의 high-water reservation이 남는다. index별 `vram_bytes`는
+retained dataset/graph 추정치이므로 이 선점분과 temporary workspace를 표현하지 않는다.
+
+[`bench/results/index-accel-20261021/rmm-study.md`](../bench/results/index-accel-20261021/rmm-study.md)의
+L40S(sm89), wiki 1M 고정 graph, private SQL harness, 크기별 N=3 비교에서 검색 p50은
+initial 512 MiB부터 평탄했다. 참조 initial 1024 MiB의 IVF-PQ 빌드는 live peak 8.797 GB와
+pool high-water 16.583 GB를 보였다. 별도 upstream-quota prototype(initial 512 MiB,
+maximum 50%)에서는 검색 IT512/Q10000과 gd64/igd256의 IVF-PQ·NN-descent가 모두 성공했다.
+prototype의 최대 pool hold 14.435 GB에 두 번째 gd64 index의 보수적 추정 3.328 GB를 더해도
+23.847 GB quota 안에 6.083 GB가 남았다. 각 peak/prototype은 N=1이며 동시 다중 index나
+다른 scale을 검증한 결과는 아니다. full grid 또는 교차 엔진 배수로 승격하지 않는다.
+
+**결정:**
+
+1. GPU daemon은 initial 512 MiB와 GPU별 total CUDA memory의 50%를 기본값으로 한다.
+   quota는 256-byte 경계로 내린다. `--rmm-pool-mb 0`은 기존 allocator 경로를 유지한다.
+   CPU shim의 기본값은 0이며 실제 GPU pool 적용을 주장하지 않는다.
+2. maximum은 upstream `limiting_resource_adaptor`로 강제한다. pool constructor의
+   maximum은 미설정으로 두어 기존 doubling/backoff 성장 정책을 유지한다. SDK constructor에
+   finite maximum을 전달하면 remaining/2 정책으로 바뀌므로 이 결정과 다른 구성이다.
+3. admission은 `unused_pool + min(physical_free + async_reclaim, quota - reserved)`다.
+   빈 pool에서도 들어가지 않을 index는 기존 index를 eviction하기 전에 거부한다.
+   별도의 logical index-residency budget은 그대로 적용한다.
+4. `SHOW cuvs.rmm_pool_mb`, `SHOW cuvs.rmm_pool_max_percent`,
+   `SHOW cuvs.rmm_pool_status`로 실제 적용값과 GPU별 maximum/reserved/used bytes를 읽는다.
+   SQL SET으로 allocator를 교체하지 않는다. 응답 불가·구버전은 `unavailable`이며 0으로
+   오인하지 않는다. 기존 startup-settings opcode는 유지하고 상세 상태에 새 opcode를 쓴다.
+5. quota는 RMM pool을 제한한다. 직접 CUDA managed/async 할당, context와 다른 process까지
+   포함하는 전체 GPU memory cap은 아니다. memory pressure를 평가할 때 pool 상태,
+   `pg_stat_gpu_search.vram_bytes`, `nvidia-smi memory.used`를 함께 기록한다. index eviction은
+   pool 공간을 재사용 가능하게 하지만 그 선점분을 외부 CUDA 사용자에게 반환하지 않는다.
+
+**대안:**
+
+| 대안 | 선택하지 않은 이유 |
+|---|---|
+| initial 1024 MiB / 무상한 유지 | 512 MiB 이후의 지연 plateau와 빌드 high-water를 설명하지 못하고 quota를 제공하지 않음 |
+| initial만 줄임 | pool 성장의 maximum이 생기지 않음 |
+| pool constructor에 maximum 전달 | SDK의 growth policy가 바뀌므로 검증한 doubling 구성과 다름 |
+| physical free만 admission에 사용 | 재사용 가능한 pool 공간을 놓치거나 quota 밖의 physical free를 성장 가능량으로 잘못 셈 |
+| pool reservation을 모든 index의 vram_bytes에 분배 | pool은 index 수명과 별개인 process 자원이며 workspace까지 공유하므로 중복·오귀속 가능 |
+
+**검증 경계:** quota 정렬·overflow·재사용·남은 quota 계산은 CPU unit, 적용 상태와 readonly 및
+미접속 처리는 SQL regression으로 확인한다. 실제 allocator 동작은 native CUDA build와 별도
+GPU smoke가 필요하다. 과거 FD snapshot 측정과 새 quota/status 구현의 검증 기록을 구분한다.

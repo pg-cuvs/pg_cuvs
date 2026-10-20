@@ -1,0 +1,69 @@
+[INFO] pg_cuvs_server: starting (socket=/tmp/.s.pg_cuvs index-dir=/tmp/cuvs_indexes snapshot=disabled)
+[INFO] index registry capacity: 1024 (--max-indexes)
+[INFO] RMM initial pool reservation: 0 MiB per GPU (0=disabled)
+[INFO] RMM maximum pool quota: 0% of total device memory
+[INFO] pg_cuvs_server: hw_profile gpu='shim-cpu (PGCUVS_CPU_SHIM)' link_bw=12000 hbm_bw=1000000 bf_tput=1000 cpu_dist=1642 cagra_lat=1000.0 ipc_rtt=1.4 probe_status=0x18
+[INFO] GPU 0 (shim-cpu (PGCUVS_CPU_SHIM)): 40960 MB total, budget 36864 MB (default fraction of total)
+[INFO] GPU 0 warm-up done in 0 ms
+[INFO] pg_cuvs_server: listening on /tmp/.s.pg_cuvs
+[INFO] [handle_build] corpus via memfd(SCM_RIGHTS) fd=6 total=96
+[INFO] [handle_build] auto shard count: 16384/16831 4 vecs dim 4 -> 1 shard(s)
+[INFO] pg_cuvs_server: built index 16384/16831 (4 vecs, 0 MB VRAM)
+[INFO] pg_cuvs_server: dropped index 16384/16831 (freed + artifacts unlinked)
+[INFO] [handle_build] corpus via memfd(SCM_RIGHTS) fd=6 total=96
+[INFO] [handle_build] auto shard count: 16837/17284 4 vecs dim 4 -> 1 shard(s)
+[INFO] pg_cuvs_server: built index 16837/17284 (4 vecs, 0 MB VRAM)
+[INFO] pg_cuvs_server: dropped index 16837/17284 (freed + artifacts unlinked)
+[INFO] [handle_build] corpus via memfd(SCM_RIGHTS) fd=6 total=504
+[INFO] [handle_build] auto shard count: 17286/17733 21 vecs dim 4 -> 1 shard(s)
+[INFO] pg_cuvs_server: built index 17286/17733 (21 vecs, 0 MB VRAM)
+[INFO] pg_cuvs_server: dropped index 17286/17733 (freed + artifacts unlinked)
+[INFO] [handle_build] corpus via memfd(SCM_RIGHTS) fd=6 total=480
+[INFO] [handle_build] auto shard count: 17286/17852 20 vecs dim 4 -> 1 shard(s)
+[INFO] pg_cuvs_server: built index 17286/17852 (20 vecs, 0 MB VRAM)
+[INFO] [handle_extend] 17286/17852: added 1 vecs (total 21, n_extended 1)
+[INFO] pg_cuvs_server: dropped index 17286/17852 (freed + artifacts unlinked)
+[INFO] [handle_build] corpus via memfd(SCM_RIGHTS) fd=6 total=504
+[INFO] [handle_build] auto shard count: 17286/17971 21 vecs dim 4 -> 1 shard(s)
+[INFO] pg_cuvs_server: built index 17286/17971 (21 vecs, 0 MB VRAM)
+[INFO] [handle_compact] 17286/17971: removing 1 of 21 vectors
+[INFO] pg_cuvs_server: saved index 17286/17971 (20 vecs)
+[INFO] [handle_compact] 17286/17971: compact OK, 20 vecs remaining
+[INFO] [handle_build] corpus via memfd(SCM_RIGHTS) fd=6 total=480
+[INFO] [handle_build] auto shard count: 17286/17972 20 vecs dim 4 -> 1 shard(s)
+[INFO] pg_cuvs_server: built index 17286/17972 (20 vecs, 0 MB VRAM)
+[INFO] pg_cuvs_server: dropped index 17286/17971 (freed + artifacts unlinked)
+[INFO] pg_cuvs_server: dropped index 17286/17972 (freed + artifacts unlinked)
+[INFO] [handle_build] corpus via memfd(SCM_RIGHTS) fd=6 total=504
+[INFO] [handle_build] auto shard count: 17286/18091 21 vecs dim 4 -> 1 shard(s)
+[INFO] pg_cuvs_server: built index 17286/18091 (21 vecs, 0 MB VRAM)
+[INFO] [handle_build] corpus via memfd(SCM_RIGHTS) fd=6 total=504
+[INFO] [handle_build] auto shard count: 17286/18092 21 vecs dim 4 -> 1 shard(s)
+[INFO] pg_cuvs_server: built index 17286/18092 (21 vecs, 0 MB VRAM)
+[INFO] pg_cuvs_server: dropped index 17286/18091 (freed + artifacts unlinked)
+[INFO] [handle_compact] 17286/18092: removing 1 of 21 vectors
+[INFO] pg_cuvs_server: saved index 17286/18092 (20 vecs)
+[INFO] [handle_compact] 17286/18092: compact OK, 20 vecs remaining
+[INFO] pg_cuvs_server: dropped index 17286/18092 (freed + artifacts unlinked)
+[INFO] [handle_build_flat] corpus via memfd(SCM_RIGHTS) fd=6 total=504
+[INFO] pg_cuvs_server: built flat index 17286/18211 (21 vecs, 0 MB on disk)
+[INFO] pg_cuvs_server: main BF cache 17286/18211 built (21 vecs, float32, 0 MB VRAM)
+[INFO] pg_cuvs_server: dropped index 17286/18211 (freed + artifacts unlinked)
+[INFO] [handle_build_flat] corpus via memfd(SCM_RIGHTS) fd=6 total=480
+[INFO] pg_cuvs_server: built flat index 17286/18330 (20 vecs, 0 MB on disk)
+[INFO] pg_cuvs_server: main BF cache 17286/18330 built (20 vecs, float32, 0 MB VRAM)
+[INFO] pg_cuvs_server: dropped index 17286/18330 (freed + artifacts unlinked)
+[INFO] [handle_build_flat] corpus via memfd(SCM_RIGHTS) fd=6 total=504
+[INFO] pg_cuvs_server: built flat index 17286/18449 (21 vecs, 0 MB on disk)
+[INFO] [handle_build_flat] corpus via memfd(SCM_RIGHTS) fd=6 total=480
+[INFO] pg_cuvs_server: built flat index 17286/18450 (20 vecs, 0 MB on disk)
+[INFO] pg_cuvs_server: dropped index 17286/18449 (freed + artifacts unlinked)
+[INFO] pg_cuvs_server: main BF cache 17286/18450 built (20 vecs, float32, 0 MB VRAM)
+[INFO] pg_cuvs_server: dropped index 17286/18450 (freed + artifacts unlinked)
+[INFO] [handle_build_flat] corpus via memfd(SCM_RIGHTS) fd=6 total=504
+[INFO] pg_cuvs_server: built flat index 17286/18569 (21 vecs, 0 MB on disk)
+[INFO] [handle_build_flat] corpus via memfd(SCM_RIGHTS) fd=6 total=504
+[INFO] pg_cuvs_server: built flat index 17286/18570 (21 vecs, 0 MB on disk)
+[INFO] pg_cuvs_server: dropped index 17286/18569 (freed + artifacts unlinked)
+[INFO] pg_cuvs_server: main BF cache 17286/18570 built (21 vecs, float32, 0 MB VRAM)
+[INFO] pg_cuvs_server: dropped index 17286/18570 (freed + artifacts unlinked)

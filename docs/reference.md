@@ -164,6 +164,8 @@ Defaults and ranges are from source. "Set by" is the minimum role/scope: `USERSE
 | `cuvs.index_dir` | string | `$PGDATA/cuvs_indexes` | — | SUSET | Artifact directory (empty = resolved at runtime) |
 | `cuvs.k` | int | `100` | 1–2000 | USERSET | GPU top-k candidates fetched per scan (cf. `hnsw.ef_search`) |
 | `cuvs.rmm_pool_mb` | int/status | daemon value | 0–INT_MAX, or `unavailable` | read-only (INTERNAL) | Applied initial RMM pool reservation per GPU, queried from the daemon. `0` = disabled; `unavailable` = no compatible daemon reply. Set using the daemon CLI and restart, not SQL SET. Record with each benchmark run |
+| `cuvs.rmm_pool_max_percent` | int/status | daemon value | 0–100, or `unavailable` | read-only (INTERNAL) | Applied upstream pool quota as a percentage of total CUDA memory on each GPU. `0` when the pool is disabled |
+| `cuvs.rmm_pool_status` | string/status | daemon value | JSON, or `unavailable` | read-only (INTERNAL) | Applied initial MiB, quota percentage, and per-device maximum/reserved/used pool bytes. Counters cover RMM pool allocations; they are live snapshots, not process-wide GPU memory |
 | `cuvs.circuit_breaker_threshold` | int | `3` | 1–100 | USERSET | Consecutive GPU errors before the (per-backend) breaker trips |
 
 ### Build
@@ -248,14 +250,48 @@ daemon-only ones have no session equivalent.
 |------|----------------|---------|---------|
 | `--socket PATH` | `cuvs.socket_path` | `/tmp/.s.pg_cuvs` | UDS path |
 | `--index-dir DIR` | `cuvs.index_dir` | — | Artifact dir the daemon serves from; must match the backend's `index_dir` or searches fall back to seqscan |
-| `--max-vram-mb N` | — (daemon-only) | 90% of total VRAM | VRAM budget, enforced by self-accounting (ADR-065); the supported way to cap VRAM |
-| `--rmm-pool-mb N` | `cuvs.rmm_pool_mb` (read-only status) | `0` (disabled) | Initial RMM pool reservation per allowed GPU in MiB, installed before probes/load/warmup. May grow from the upstream allocator; this is not a VRAM cap. Init failure aborts startup. Reusable pool bytes are included in admission headroom |
+| `--max-vram-mb N` | — (daemon-only) | 90% of total VRAM | Logical index-residency budget, enforced by self-accounting (ADR-065). Excludes unused pool reservation and temporary workspace; it is separate from the RMM quota |
+| `--rmm-pool-mb N` | `cuvs.rmm_pool_mb` (read-only status) | `512` MiB | Initial RMM pool reservation per allowed GPU, installed before probes/load/warmup. Explicit `0` disables the pool and keeps the legacy allocator. CPU shim builds default to `0`. Init failure aborts startup |
+| `--rmm-pool-max-percent N` | `cuvs.rmm_pool_max_percent` (read-only status) | `50` | Hard upstream quota: total CUDA memory × N%, rounded down to 256 bytes, on each allowed GPU. Range 1–100; initial reservation must fit. Preserves the pool's doubling/backoff growth policy |
 | `--max-indexes N` | — (daemon-only) | `1024` | **Soft** LRU working-set cap (ADR-068), not a hard wall (was 64). At the cap, `load_index` evicts the LRU index to free a slot and auto-reloads on next use; a build over the cap defers gracefully |
 | `--gpu-devices LIST` | — (daemon-only) | all visible | CUDA devices the daemon uses (else honors `CUDA_VISIBLE_DEVICES`) |
 | `--snapshot-uri URI` | `cuvs.snapshot_uri` | `` | GCS snapshot root |
 | `--cluster-id ID` | `cuvs.cluster_id` | `` | Cluster id in the GCS artifact path |
 | `--gcs-key-file PATH` | `cuvs.gcs_key_file` | `` | Service-account JSON path |
 | `--warmup-threads N` | `cuvs.warmup_threads` | `2` | Background GCS warmup pool size |
+
+### RMM quota and memory accounting
+
+The current device resource is installed before hardware probes, index reload,
+warmup and worker threads, so the pool covers retained index data and builds as
+well as search workspace. The quota is imposed by the upstream limiting resource;
+the pool constructor's maximum is left unset to retain its doubling/backoff policy.
+The initial reservation is not the maximum, and it does not shrink after a build.
+
+Admission uses **unused pool bytes + min(reclaimable physical memory, remaining
+upstream quota)**. An index estimate larger than an empty pool's quota is rejected
+before evicting resident indexes. The logical index budget still applies separately.
+
+`pg_stat_gpu_search.vram_bytes` estimates retained dataset/graph memory; it does
+not include unused pool reservation or transient workspace. Pool-backed frees
+become reusable without returning their physical allocation to other CUDA users.
+cuVS may also allocate outside the current RMM resource (for example managed or
+CUDA async scratch); the pool quota does not bound those allocations, CUDA context
+memory, or total `nvidia-smi memory.used`. Record both pool status and physical GPU
+usage when assessing memory pressure:
+
+```sql
+SHOW cuvs.rmm_pool_mb;
+SHOW cuvs.rmm_pool_max_percent;
+SHOW cuvs.rmm_pool_status;
+```
+
+The JSON has `initial_mb`, `maximum_percent`, and a `devices` array containing
+`device_id`, `maximum_bytes`, `reserved_bytes`, and `used_bytes`. A disabled pool
+reports initial/percentage zero and an empty device array. An absent or incompatible
+daemon reports `unavailable`, not a fabricated zero. These are read-only settings;
+changing them with SQL SET cannot replace a live allocator. See ADR-085 for the
+measured default rule and its single-GPU scope.
 
 ---
 
