@@ -220,12 +220,17 @@ class PgEngine:
                 if self.conn.info.host != host:
                     raise RuntimeError("GPU benchmark connection host differs from PGHOST")
                 preload = self.conn.execute("SHOW shared_preload_libraries").fetchone()[0]
+                # psycopg returns bytes for text from SQL_ASCII databases.
+                if isinstance(preload, bytes):
+                    preload = preload.decode("utf-8", errors="replace")
                 libraries = [p.strip().strip('"').rsplit("/", 1)[-1]
                              for p in preload.split(",")]
                 if not any(p in ("pg_cuvs", "pg_cuvs.so") for p in libraries):
                     raise RuntimeError("GPU benchmark requires pg_cuvs in "
                                        "shared_preload_libraries")
                 schemas = self.conn.execute("SELECT current_schemas(false)").fetchone()[0]
+                schemas = [s.decode("utf-8", errors="replace") if isinstance(s, bytes)
+                           else s for s in schemas]
                 if schemas != ["public"]:
                     raise RuntimeError("GPU benchmark requires search_path resolving "
                                        f"only to public; got {schemas!r}")
