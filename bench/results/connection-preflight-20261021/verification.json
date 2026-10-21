@@ -1,7 +1,7 @@
 {
-  "source_commit": "b9f641b14692586cb3d0cfaee189fc8ff57e6f1c",
+  "source_commit": "962952c4ee94f8022826e44399c299199d2c17e8",
   "source_sha256": {
-    "pg_engine.py": "3e095be3a5bd5d4051bd13816d8f06a85e31831bd71797038094974c84a81b97",
+    "pg_engine.py": "d463d3ba99e73d748588f89263b3c04c5a106216ff1fa364ed59dd40ac2d0e5e",
     "backend.py": "a76328ac466251a2a4f3770e8931ea7f255ed4549853bb5b353624eb29e3b64e",
     "run_pg_cuvsbench.py": "7e212f8cff865f61414207503e9595e5fb7802c9215c71f9b962398f76223071",
     "build_time_arm.py": "70478e6054c43a988545f13bf99f3f07d850b08aa3315c9e45ed95d0bfef0ad1",
@@ -66,14 +66,26 @@
   },
   "GPU_validation": false,
   "native_RMM_gate_reopened": false,
-  "raw_log_sha256": "a818dafb8fedda58e9d1f1dd95a31b6826f018276ca0b14baebf84e484f3d408",
-  "fixture_driver_sha256": "41f35443867b3feb3966414caa80ad6ab3c41d7979c0a2e6ae5db319a091153d",
-  "log_count_method": "final two PostgreSQL startup segments only, including prepared execute lines; original consumer counters used accumulated log and statement-only counts",
+  "raw_log_sha256": "beafca66a2be5449f3bc48e491342d64cb42814291201874d4eb597c9e6a07c8",
+  "fixture_driver_sha256": "8e58d85d4d09148123e0331ed4813686433e95430818876be774847b37bb6a23",
+  "log_count_method": "Separate final-run log; all statement and prepared execute lines. 112 search, 3 preload, 2 schema SQL.",
   "limits": [
     "Positive CLI uses CPU pgvector with the same actual PgEngine connection preflight; no GPU performance or quality claim.",
     "GPU algo automatic opt-in tested through the actual CLI with missing PGHOST; CUDA/native GPU execution not repeated.",
-    "Default SQL_ASCII local fixture failed; repeated with UTF8 matching benchmark setup.",
     "Docker store I/O and PG17 API/Linux-daemon portability failures were retained; production C/CUDA sources unchanged.",
     "Raw SQL log, fixture driver, input arrays and private build tree remain local; metadata preservation is not a raw backup."
-  ]
+  ],
+  "initial_source_commit": "b9f641b14692586cb3d0cfaee189fc8ff57e6f1c",
+  "SQL_ASCII_status_regression": {
+    "pass": true,
+    "encoding": "SQL_ASCII",
+    "actual_preflight": true,
+    "real_SQL": [
+      1,
+      1.0
+    ],
+    "GPU_validation": false,
+    "PG_stop_exit": 0
+  },
+  "corrected_initial_failure": "SQL_ASCII returned bytes for SHOW/schema status. Final source decodes status values; real SQL_ASCII PgEngine preflight+vector SQL and complete UTF8 CLI both pass."
 }
