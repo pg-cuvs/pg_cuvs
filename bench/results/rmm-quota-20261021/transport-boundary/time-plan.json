@@ -1,0 +1,118 @@
+{
+  "source_pin": "0ff9f7c9fac4c20b8256dfc20ea3b0e604f7dd28",
+  "local_only": true,
+  "new_VM_resumes": 0,
+  "last_STOPPED_observation": "2026-10-21T00:49:34.419418+00:00",
+  "observed": {
+    "start_to_valid_hostname_seconds": 80.44695,
+    "stop_request_to_STOPPED_observation_seconds": 383.676388,
+    "resume_to_STOPPED_observation_seconds": 465.656091,
+    "stop_observation_is_not_physical_poweroff_or_billing_measurement": true,
+    "historical_successful_jobs": {
+      "deploy_guc": {
+        "seconds": 38.0,
+        "exit": 0,
+        "evidence": "../../index-accel-20261021/logs/deploy_guc.{started,completed,exit}",
+        "scope": "prior snapshot, same L40S lane; whole job, not isolated compiler/kernel time"
+      },
+      "deploy_rmm0_linkfix": {
+        "seconds": 39.0,
+        "exit": 0,
+        "evidence": "../../index-accel-20261021/logs/deploy_rmm0_linkfix.{started,completed,exit}",
+        "scope": "prior snapshot, same L40S lane; whole job, not isolated compiler/kernel time"
+      },
+      "deploy_rmm_sweep": {
+        "seconds": 37.0,
+        "exit": 0,
+        "evidence": "../../index-accel-20261021/logs/deploy_rmm_sweep.{started,completed,exit}",
+        "scope": "prior snapshot, same L40S lane; whole job, not isolated compiler/kernel time"
+      },
+      "rmm_zero2": {
+        "seconds": 54.0,
+        "exit": 0,
+        "evidence": "../../index-accel-20261021/logs/rmm_zero2.{started,completed,exit}",
+        "scope": "prior snapshot, same L40S lane; whole job, not isolated compiler/kernel time"
+      },
+      "rmm_zero3": {
+        "seconds": 54.0,
+        "exit": 0,
+        "evidence": "../../index-accel-20261021/logs/rmm_zero3.{started,completed,exit}",
+        "scope": "prior snapshot, same L40S lane; whole job, not isolated compiler/kernel time"
+      },
+      "rmm1024_smoke": {
+        "seconds": 50.0,
+        "exit": 0,
+        "evidence": "../../index-accel-20261021/logs/rmm1024_smoke.{started,completed,exit}",
+        "scope": "prior snapshot, same L40S lane; whole job, not isolated compiler/kernel time"
+      },
+      "preserve_graph": {
+        "seconds": 9.0,
+        "exit": 0,
+        "evidence": "../../index-accel-20261021/logs/preserve_graph.{started,completed,exit}",
+        "scope": "prior snapshot, same L40S lane; whole job, not isolated compiler/kernel time"
+      }
+    }
+  },
+  "phases": [
+    {
+      "phase": "resume_and_readiness",
+      "estimate_seconds": 90,
+      "proposed_cap_seconds": 180,
+      "basis": "observed start-to-valid-hostname 80.45s N=1, including SSH refresh retries"
+    },
+    {
+      "phase": "prepare_build_codeploy_and_graph",
+      "estimate_seconds": 90,
+      "proposed_cap_seconds": 260,
+      "basis": "prior successful deploy jobs37-39s; graph copy+hash9s; new pin/binding work unmeasured"
+    },
+    {
+      "phase": "two_smokes_status_and_quota",
+      "estimate_seconds": 210,
+      "proposed_cap_seconds": 635,
+      "basis": "prior two-point smoke jobs50-54s per arm; extra status/preflight/quota estimated; cap=2*(75+25+25+120)+(45+75+25)"
+    },
+    {
+      "phase": "cleanup_and_export",
+      "estimate_seconds": 45,
+      "proposed_cap_seconds": 90,
+      "basis": "new cleanup and graph recheck/export unmeasured; existing requested limits55+35"
+    },
+    {
+      "phase": "stop_request_through_STOPPED_observation",
+      "estimate_seconds": 420,
+      "proposed_cap_seconds": 480,
+      "basis": "observed request-to-STOPPED383.676s N=1, includes request CLI and polling; no second CLI allowance added"
+    }
+  ],
+  "point_estimate_seconds": 855,
+  "proposed_phase_caps_seconds": 1645,
+  "proposed_fresh_unit_seconds": 1800,
+  "fresh_unit_slack_after_caps_seconds": 155,
+  "original_900s_remaining_seconds": 434.343909,
+  "remaining_after_480s_stop_reserve_seconds": -45.656091,
+  "old_900s_deficit_against_phase_caps_seconds": 745,
+  "admission": {
+    "remaining_original_budget": false,
+    "fresh_900_seconds": false,
+    "proposed_1800_arithmetic_fit_only": true
+  },
+  "price_reference_usd_per_hour": 1.74,
+  "proposed_30min_compute_reference_usd": 0.87,
+  "cost_note": "stored catalog rate; scenario estimate, not an invoice or new authorization",
+  "unmeasured": [
+    "CUDA compile/co-deploy on exact0ff9f7c",
+    "new positive per-device status, mapped-binary binding and quota checks",
+    "new cleanup/export duration",
+    "stop-latency distribution and tail bound",
+    "actual billable duration and invoice"
+  ],
+  "executor_changes_required_before_any_new_live_unit": [
+    "Allocate a fresh explicit total budget; current900s remains insufficient.",
+    "Enforce aggregate resume180s and stop-confirmation480s deadlines; do not rely on20 unbounded40s inventories.",
+    "Reserve cleanup90s+STOP480s before starting next work phase; no work after that reservation is consumed.",
+    "Refresh alias after actual readiness within resume phase, preserving transport causes.",
+    "Retain exact source, graph, query count, quality criteria and failure evidence."
+  ],
+  "authorization": "proposal only; current local task excludes resume; no new live run authorized here"
+}

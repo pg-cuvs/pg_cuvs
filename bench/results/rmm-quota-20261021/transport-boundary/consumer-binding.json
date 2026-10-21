@@ -1,0 +1,14 @@
+{
+  "live_runner": ".omc/rmm-cap-implementation/run_native_followup.py",
+  "live_runner_sha256": "3a4118fc2a3f85935829362c4daff2203cb5d9b581a4d24397cdeeb01fd66d1d",
+  "committed_runner_snapshot": "run_native_followup.py",
+  "runner_snapshot_byte_identical": true,
+  "consumer_path": "bench/results/rmm-quota-20261021/transport-boundary/ssh_readiness.py",
+  "consumer_sha256": "db150b8fb49924cb8141ad8f2acaecb312e23c67b3267a6f8af6b9e51da175d5",
+  "actual_runner_consumer_calls": {
+    "probe_hostname": 1,
+    "accept_probe": 1
+  },
+  "local_replay_passed": 3,
+  "remote_calls_this_task": 0
+}
