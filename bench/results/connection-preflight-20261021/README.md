@@ -1,6 +1,6 @@
 # Benchmark connection preflight verification
 
-Source: `b9f641b14692586cb3d0cfaee189fc8ff57e6f1c` (application change). This directory is a separate evidence commit.
+Source: `962952c4ee94f8022826e44399c299199d2c17e8` (application change). This directory is a separate evidence commit.
 
 The actual standalone `pg_engine.py` CLI ran to completion against an isolated
 PostgreSQL 16.4 with the real pg_cuvs CPU-shim extension preloaded. The positive
@@ -40,8 +40,10 @@ entry. It does not verify CUDA, GPU quality/performance, deployment freshness,
 or the RMM native acceptance gate. Raw SQL logs, generated arrays and build
 trees are local only. Metadata preservation does not back up those artifacts.
 
-A default SQL_ASCII fixture returned bytes and failed the new status parsing;
-the successful fixture explicitly used UTF8, matching benchmark provisioning.
+The initial SQL_ASCII fixture exposed bytes returned by psycopg for status
+text. The final source decodes those values. A real SQL_ASCII PgEngine
+connection preflight and vector-distance SQL now pass; the complete UTF8 CLI
+was rerun against the final source bytes and passed all cases again.
 Docker storage I/O prevented the container route. A PG17 API mismatch and
 Linux-only daemon APIs prevented those local alternatives. No production C/CUDA
 code was changed to work around these fixture limits.
