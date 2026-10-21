@@ -1,0 +1,15 @@
+{
+  "status": "proposal; current production default remains0 and has no maximum",
+  "initial_pool_mb": 512,
+  "maximum_rule": "floor256(0.50*cudaMemGetInfo.total), per GPU; enforce in upstream limiting_resource_adaptor to retain pool doubling policy",
+  "total_cuda_bytes": 47693955072,
+  "maximum_pool_bytes": 23846977536,
+  "candidate_native_high_water_bytes": 14435483648,
+  "second_index_resident_estimate_bytes": 3328000000,
+  "conservative_high_water_plus_second_index_bytes": 17763483648,
+  "remaining_cap_margin_bytes": 6083493888,
+  "reference1024_high_water_bytes": 16582967296,
+  "reference1024_plus_second_index_margin_bytes": 3936010240,
+  "validation": "private native searchIT512/Q10000/K64 and gd64/igd256 buildIVF/NN all succeeded, N1 each; independent PG latency/build timing used production unbounded FD snapshot",
+  "implementation_needed": "new public maximum/status wiring and cap-aware admission growable=min(physical_free_plus_async_reclaim,cap-reserved); concurrent multi-index and other scales not verified"
+}

@@ -1,0 +1,56 @@
+{
+  "observed_at_utc": "2026-10-20T16:54:24.616839+00:00",
+  "hostname": "brev-v6nc08sjs",
+  "source_commit": "fded8ce8fb289112349fbce0d36e2e85f47e9eab",
+  "original_graph_after_all_experiments": {
+    "16390_1016847.cagra": {
+      "bytes": 3200001716,
+      "sha256": "cc2a2aa515089309c1d528e4be321901a11f778458819c873d75326e2642f547"
+    },
+    "16390_1016847.tids": {
+      "bytes": 8000032,
+      "sha256": "ac8047f1ec2f0f63596d433172013323826eb3ea3effab077fbe54d96f9e415e"
+    },
+    "16390_1016847.vectors": {
+      "bytes": 3072000040,
+      "sha256": "16a0220e7bf2863b8aeab18a9404890b25dd63c066b7db96e3b47335db994317"
+    }
+  },
+  "graph_snapshot_manifest": {
+    "graph": {
+      "db_oid": 16390,
+      "ddl": "CREATE INDEX t_cagra ON public.t USING cagra (embedding) WITH (graph_degree='32', intermediate_graph_degree='128', build_algo=ivf_pq)",
+      "files": {
+        "16390_1016847.cagra": {
+          "bytes": 3200001716,
+          "sha256": "cc2a2aa515089309c1d528e4be321901a11f778458819c873d75326e2642f547"
+        },
+        "16390_1016847.tids": {
+          "bytes": 8000032,
+          "sha256": "ac8047f1ec2f0f63596d433172013323826eb3ea3effab077fbe54d96f9e415e"
+        },
+        "16390_1016847.vectors": {
+          "bytes": 3072000040,
+          "sha256": "16a0220e7bf2863b8aeab18a9404890b25dd63c066b7db96e3b47335db994317"
+        }
+      },
+      "index_oid": 1016847
+    },
+    "verified_copies": {
+      "16390_1016847.cagra": {
+        "bytes": 3200001716,
+        "sha256": "cc2a2aa515089309c1d528e4be321901a11f778458819c873d75326e2642f547"
+      },
+      "16390_1016847.tids": {
+        "bytes": 8000032,
+        "sha256": "ac8047f1ec2f0f63596d433172013323826eb3ea3effab077fbe54d96f9e415e"
+      },
+      "16390_1016847.vectors": {
+        "bytes": 3072000040,
+        "sha256": "16a0220e7bf2863b8aeab18a9404890b25dd63c066b7db96e3b47335db994317"
+      }
+    }
+  },
+  "services": "Result=success\nExecMainStatus=0\nId=postgresql@16-main.service\nActiveState=inactive\n\nResult=success\nExecMainStatus=0\nId=pg-cuvs-server.service\nActiveState=inactive\n",
+  "remaining_gpu_processes": ""
+}

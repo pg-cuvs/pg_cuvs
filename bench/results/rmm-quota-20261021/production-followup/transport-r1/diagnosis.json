@@ -1,0 +1,7 @@
+{
+  "cause": "SSH warning stderr and hostname stdout were merged before strict identity equality check",
+  "native_compile_calls": 0,
+  "SQL_measurement_calls": 0,
+  "remote_source_deploy_calls": 0,
+  "fix": "keep SSH readiness stderr separate; retain exact stdout identity equality; same VM and cumulative 900s budget"
+}

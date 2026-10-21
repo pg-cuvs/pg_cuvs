@@ -1,0 +1,44 @@
+[
+  {
+    "pool_mb": 0,
+    "N": 1,
+    "single_queries": 100,
+    "upstream_allocation_calls": 800,
+    "cuda_allocation_api_counts": {
+      "cudaMalloc_v3020": 800,
+      "cudaMallocAsync_ptsz_v11020": 1,
+      "cudaFree_v3020": 800
+    },
+    "peak_client_bytes": 3200040964
+  },
+  {
+    "pool_mb": 256,
+    "N": 1,
+    "single_queries": 100,
+    "upstream_allocation_calls": 0,
+    "cuda_allocation_api_counts": {
+      "cudaMallocAsync_ptsz_v11020": 1
+    },
+    "peak_client_bytes": 3200040964
+  },
+  {
+    "pool_mb": 512,
+    "N": 1,
+    "single_queries": 100,
+    "upstream_allocation_calls": 0,
+    "cuda_allocation_api_counts": {
+      "cudaMallocAsync_ptsz_v11020": 1
+    },
+    "peak_client_bytes": 3200040964
+  },
+  {
+    "pool_mb": 1024,
+    "N": 1,
+    "single_queries": 100,
+    "upstream_allocation_calls": 0,
+    "cuda_allocation_api_counts": {
+      "cudaMallocAsync_ptsz_v11020": 1
+    },
+    "peak_client_bytes": 3200040964
+  }
+]

@@ -1,0 +1,46 @@
+{
+  "consumer": "ssh_readiness.probe_hostname",
+  "consumer_sha256": "db150b8fb49924cb8141ad8f2acaecb312e23c67b3267a6f8af6b9e51da175d5",
+  "original_merged_log_sha256": "0925a6fd7edbbec8b85a535756f0cc0ec00936bb590690f39ca48ac23d8c61d7",
+  "original_merged_channels_reconstructed": true,
+  "reconstruction": "known hostname suffix as stdout; preceding SSH warning text as stderr",
+  "ssh_failure_reconstruction": "original rc255 DNS error log as stderr, empty stdout",
+  "subprocesses": "three local Python emitters; no SSH/Brev/GPU calls",
+  "passed": 3,
+  "cases": [
+    {
+      "case": "hostname_with_warning",
+      "status": "ready",
+      "returncode": 0,
+      "stdout": "brev-v6nc08sjs\n",
+      "stderr": "Pseudo-terminal will not be allocated because stdin is not a terminal.\nWarning: Permanently added '204.52.29.244' (ED25519) to the list of known hosts.\n",
+      "error": null,
+      "seconds": 0.03759175003506243,
+      "accepted": true,
+      "stream_bytes_preserved": true
+    },
+    {
+      "case": "different_hostname",
+      "status": "wrong_host",
+      "returncode": 0,
+      "stdout": "brev-other-vm\n",
+      "stderr": "Pseudo-terminal will not be allocated because stdin is not a terminal.\nWarning: Permanently added '204.52.29.244' (ED25519) to the list of known hosts.\n",
+      "error": "Expected 'brev-v6nc08sjs', received stdout 'brev-other-vm\\n'",
+      "seconds": 0.08702312503010035,
+      "consumer_raised": "Expected 'brev-v6nc08sjs', received stdout 'brev-other-vm\\n'",
+      "accepted": false,
+      "stream_bytes_preserved": true
+    },
+    {
+      "case": "ssh_failure",
+      "status": "ssh_failed",
+      "returncode": 255,
+      "stdout": "",
+      "stderr": "ssh: Could not resolve hostname pg-cuvs-index-accel-20261020: nodename nor servname provided, or not known\n",
+      "error": "SSH exited 255: ssh: Could not resolve hostname pg-cuvs-index-accel-20261020: nodename nor servname provided, or not known",
+      "seconds": 0.0469655420165509,
+      "accepted": false,
+      "stream_bytes_preserved": true
+    }
+  ]
+}

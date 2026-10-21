@@ -1,0 +1,3 @@
+[INFO] pg_cuvs_server: starting (socket=/tmp/.s.pg_cuvs.server index-dir=/tmp/pg_cuvs_indexes snapshot=disabled)
+[INFO] index registry capacity: 1024 (--max-indexes)
+[ERROR] GPU 0: RMM pool initialization failed (512 MiB)

@@ -1,0 +1,4 @@
+mode,N,initial_pool_mb,private_maximum_pool_bytes,total_cuda_bytes,phase,client_start_bytes,peak_client_bytes,extra_client_peak_bytes,client_end_bytes,client_allocation_calls,pool_growth_calls,pool_growth_bytes,seconds,pool_reserved_at_end_bytes,lifetime_upstream_calls_including_initial,success
+search,1,512,23846977536,47693955072,search_it512_q10000_k64,3200000000,3235880000,35880000,3200000000,4,0,0,0.530297334,3608870912,2,True
+ivf_pq,1,512,23846977536,47693955072,ivf_pq,0,9365487184,9365487184,3328000000,32863,3,13898612736,8.69036378,14435483648,4,True
+nn_descent,1,512,23846977536,47693955072,nn_descent,0,7168000000,7168000000,3328000000,21,3,13898612736,18.103283691,14435483648,4,True

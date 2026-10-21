@@ -13,6 +13,7 @@
  */
 
 #include "postgres.h"
+#include "lib/stringinfo.h"
 #include "fmgr.h"
 #include "funcapi.h"
 #include "miscadmin.h"
@@ -113,6 +114,10 @@ int   cuvs_circuit_breaker_threshold = 3;
 int   cuvs_k                      = 100;   /* GPU top-k (pgvector ef_search analog) */
 static int cuvs_itopk_size        = 0;     /* CAGRA intermediate buffer floor; 0=legacy */
 static int cuvs_search_width      = 0;     /* 0=SDK default */
+
+static int cuvs_rmm_pool_mb       = 0;     /* show hook reads the daemon's applied value */
+static int cuvs_rmm_pool_max_percent = 0;
+static char *cuvs_rmm_pool_status = NULL;
 int   cuvs_max_build_mem_mb       = 0;     /* 0 = auto (MemAvailable * safety_ratio); >0 = hard cap MB */
 double cuvs_build_mem_safety_ratio = 0.5;  /* auto-limit fraction of MemAvailable */
 double cuvs_max_stale_fraction     = 0.10; /* deleted-since-build fraction that reroutes to CPU */
@@ -761,6 +766,49 @@ cuvs_search_width_assign(int newval, void *extra)
     cuvs_ipc_set_cagra_search_params((uint32_t) cuvs_itopk_size, (uint32_t) newval);
 }
 
+static const char *
+cuvs_rmm_pool_mb_show(void)
+{
+    CuvsServerSettings settings;
+    if (cuvs_ipc_server_settings(cuvs_socket_path, &settings) != CUVS_STATUS_OK)
+        return "unavailable";
+    return psprintf("%u", settings.rmm_pool_mb);
+}
+
+static const char *
+cuvs_rmm_pool_max_percent_show(void)
+{
+    CuvsRmmPoolStatus status;
+    if (cuvs_ipc_rmm_pool_status(cuvs_socket_path, &status) != CUVS_STATUS_OK)
+        return "unavailable";
+    return psprintf("%u", status.maximum_percent);
+}
+
+static const char *
+cuvs_rmm_pool_status_show(void)
+{
+    CuvsRmmPoolStatus status;
+    StringInfoData json;
+    if (cuvs_ipc_rmm_pool_status(cuvs_socket_path, &status) != CUVS_STATUS_OK)
+        return "unavailable";
+    initStringInfo(&json);
+    appendStringInfo(&json, "{\"initial_mb\":%u,\"maximum_percent\":%u,\"devices\":[",
+                     status.initial_mb, status.maximum_percent);
+    for (uint32_t i = 0; i < status.n_devices; i++)
+    {
+        const CuvsRmmPoolStats *dev = &status.devices[i];
+        appendStringInfo(&json,
+                         "%s{\"device_id\":%u,\"maximum_bytes\":%llu,"
+                         "\"reserved_bytes\":%llu,\"used_bytes\":%llu}",
+                         i ? "," : "", dev->device_id,
+                         (unsigned long long)dev->maximum_bytes,
+                         (unsigned long long)dev->reserved_bytes,
+                         (unsigned long long)dev->used_bytes);
+    }
+    appendStringInfoString(&json, "]}");
+    return json.data;
+}
+
 void
 _PG_init(void)
 {
@@ -877,6 +925,34 @@ _PG_init(void)
         0, 0, INT_MAX,
         PGC_USERSET,
         0, NULL, cuvs_search_width_assign, NULL);
+
+    DefineCustomIntVariable(
+        "cuvs.rmm_pool_mb",
+        "Daemon's applied initial RMM pool reservation per GPU (MiB).",
+        "Read-only status from --rmm-pool-mb. 0 means disabled; unavailable means "
+        "the daemon cannot report it. Requires daemon restart to change.",
+        &cuvs_rmm_pool_mb,
+        0, 0, INT_MAX,
+        PGC_INTERNAL,
+        GUC_NOT_IN_SAMPLE, NULL, NULL, cuvs_rmm_pool_mb_show);
+
+    DefineCustomIntVariable(
+        "cuvs.rmm_pool_max_percent",
+        "Daemon's applied RMM pool quota as a percentage of total device memory.",
+        "Read-only status from --rmm-pool-max-percent; 0 when the pool is disabled. "
+        "Unavailable means no compatible daemon reply.",
+        &cuvs_rmm_pool_max_percent,
+        0, 0, 100, PGC_INTERNAL,
+        GUC_NOT_IN_SAMPLE, NULL, NULL, cuvs_rmm_pool_max_percent_show);
+
+    DefineCustomStringVariable(
+        "cuvs.rmm_pool_status",
+        "Applied RMM pool limits and live per-GPU allocation counters as JSON.",
+        "Read-only; maximum/reserved/used bytes cover the RMM pool only. "
+        "Unavailable means no compatible daemon reply.",
+        &cuvs_rmm_pool_status,
+        "unavailable", PGC_INTERNAL,
+        GUC_NOT_IN_SAMPLE, NULL, NULL, cuvs_rmm_pool_status_show);
 
     DefineCustomIntVariable(
         "cuvs.max_build_mem_mb",

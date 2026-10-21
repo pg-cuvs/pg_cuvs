@@ -1,0 +1,16 @@
+--- /home/ubuntu/index-accel-validation/native-peak-source/src/cuvs_wrapper.cu	2026-10-20 16:13:20.539396523 +0000
++++ /home/ubuntu/index-accel-validation/native-peak-source/src/cuvs_wrapper_bounded.cu	2026-10-20 16:51:10.570126714 +0000
+@@ -188,8 +188,11 @@
+         static RmmPoolRegistry registry;
+         if (registry.pools[device_id])
+             return 1;   /* startup-only: never replace a live allocator */
+-        auto counted_upstream = std::make_unique<RmmUpstream>(
+-            upstream, std::numeric_limits<size_t>::max());
++        size_t private_free = 0, private_total = 0;
++        if (cudaMemGetInfo(&private_free, &private_total) != cudaSuccess) return 1;
++        size_t private_maximum = (private_total / 2 / 256) * 256;
++        fprintf(stderr, "{\"private_maximum_pool_bytes\":%zu,\"total_cuda_bytes\":%zu}\n", private_maximum, private_total);
++        auto counted_upstream = std::make_unique<RmmUpstream>(upstream, private_maximum);
+         auto pool = std::make_unique<RmmPool>(counted_upstream.get(), initial_pool_bytes);
+         auto usage = std::make_unique<RmmUsage>(pool.get(), std::numeric_limits<size_t>::max());
+         registry.previous[device_id] = upstream;

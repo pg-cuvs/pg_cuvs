@@ -1,0 +1,14 @@
+{
+  "ddl": "CREATE INDEX t_pool_bench ON t USING cagra (embedding vector_l2_ops) WITH (graph_degree=64,intermediate_graph_degree=256,build_algo='ivf_pq')",
+  "dbname": "index_accel_pool_build",
+  "index_dir": "/home/ubuntu/index-accel-validation/build-artifacts/build_r2_4-pool512",
+  "table_rows": 1000000,
+  "table_origin": "CREATE DATABASE TEMPLATE index_accel_smoke; source table unchanged",
+  "prewarm_blocks": {
+    "16842": 7360,
+    "16845": 500000,
+    "16846": 5486
+  },
+  "postmaster_start": "2026-10-20 16:47:59.079763+00:00",
+  "pool_status": "512"
+}

@@ -1,0 +1,10 @@
+echo "# +++ regress install-check in  +++" && /usr/local/lib/postgresql/pgxs/src/makefiles/../../src/test/regress/pg_regress --inputdir=./ --bindir='/usr/local/bin'    --inputdir=test --outputdir=test --dbname=contrib_regression rmm_pool smoke
+# +++ regress install-check in  +++
+# using postmaster on /tmp, default port
+not ok 1     - rmm_pool                                   38 ms
+# 1 of 2 tests failed.
+# The differences that caused some tests to fail can be viewed in the file "/work/test/regression.diffs".
+# A copy of the test summary that you see above is saved in the file "/work/test/regression.out".
+make: *** [/usr/local/lib/postgresql/pgxs/src/makefiles/pgxs.mk:436: installcheck] Error 1
+ok 2         - smoke                                      29 ms
+1..2

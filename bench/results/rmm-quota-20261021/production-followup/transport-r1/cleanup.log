@@ -1,0 +1,2 @@
+Pseudo-terminal will not be allocated because stdin is not a terminal.
+bash: /home/ubuntu/index-accel-validation/rmm-production-tools/remote_followup.sh: No such file or directory

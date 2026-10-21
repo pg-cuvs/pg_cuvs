@@ -1,0 +1,4 @@
+5297a2261813f0f715895b227ea8dafeb3bedf4580e464ab1b7bea5a22962227  pg_cuvs.so
+ff64c0a1bb9b3d646db4dbb59a087aef6a0ea888ea408cff029a96380e974a9e  pg_cuvs_server
+5297a2261813f0f715895b227ea8dafeb3bedf4580e464ab1b7bea5a22962227  /usr/lib/postgresql/16/lib/pg_cuvs.so
+ff64c0a1bb9b3d646db4dbb59a087aef6a0ea888ea408cff029a96380e974a9e  /usr/lib/postgresql/16/bin/pg_cuvs_server

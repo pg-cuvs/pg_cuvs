@@ -1,0 +1,25 @@
+2026-10-20 17:33:57.120 UTC [281] LOG:  starting PostgreSQL 16.15 on aarch64-unknown-linux-musl, compiled by gcc (Alpine 15.2.0) 15.2.0, 64-bit
+2026-10-20 17:33:57.130 UTC [281] LOG:  could not translate host name "x27x27", service "5432" to address: Name does not resolve
+2026-10-20 17:33:57.130 UTC [281] WARNING:  could not create listen socket for "x27x27"
+2026-10-20 17:33:57.130 UTC [281] FATAL:  could not create any TCP/IP sockets
+2026-10-20 17:33:57.131 UTC [281] LOG:  database system is shut down
+2026-10-20 17:34:34.062 UTC [317] LOG:  starting PostgreSQL 16.15 on aarch64-unknown-linux-musl, compiled by gcc (Alpine 15.2.0) 15.2.0, 64-bit
+2026-10-20 17:34:34.062 UTC [317] LOG:  listening on Unix socket "/tmp/.s.PGSQL.5432"
+2026-10-20 17:34:34.067 UTC [320] LOG:  database system was shut down at 2026-10-20 17:33:56 UTC
+2026-10-20 17:34:34.071 UTC [317] LOG:  database system is ready to accept connections
+2026-10-20 17:34:35.357 UTC [355] ERROR:  parameter "cuvs.rmm_pool_mb" cannot be changed
+2026-10-20 17:34:35.357 UTC [355] STATEMENT:  SET cuvs.rmm_pool_mb = 1024;
+2026-10-20 17:34:35.357 UTC [355] ERROR:  parameter "cuvs.rmm_pool_max_percent" cannot be changed
+2026-10-20 17:34:35.357 UTC [355] STATEMENT:  SET cuvs.rmm_pool_max_percent = 100;
+2026-10-20 17:34:35.357 UTC [355] ERROR:  parameter "cuvs.rmm_pool_status" cannot be changed
+2026-10-20 17:34:35.357 UTC [355] STATEMENT:  SET cuvs.rmm_pool_status = '{}';
+2026-10-20 17:37:53.352 UTC [318] LOG:  checkpoint starting: immediate force wait
+2026-10-20 17:37:53.367 UTC [318] LOG:  checkpoint complete: wrote 50 buffers (0.3%); 0 WAL file(s) added, 0 removed, 0 recycled; write=0.004 s, sync=0.008 s, total=0.015 s; sync files=16, longest=0.002 s, average=0.001 s; distance=5146 kB, estimate=5146 kB; lsn=0/19FD1E8, redo lsn=0/19FD1B0
+2026-10-20 17:37:53.464 UTC [417] ERROR:  parameter "cuvs.rmm_pool_mb" cannot be changed
+2026-10-20 17:37:53.464 UTC [417] STATEMENT:  SET cuvs.rmm_pool_mb = 1024;
+2026-10-20 17:37:53.464 UTC [417] ERROR:  parameter "cuvs.rmm_pool_max_percent" cannot be changed
+2026-10-20 17:37:53.464 UTC [417] STATEMENT:  SET cuvs.rmm_pool_max_percent = 100;
+2026-10-20 17:37:53.464 UTC [417] ERROR:  parameter "cuvs.rmm_pool_status" cannot be changed
+2026-10-20 17:37:53.464 UTC [417] STATEMENT:  SET cuvs.rmm_pool_status = '{}';
+2026-10-20 17:42:53.472 UTC [318] LOG:  checkpoint starting: time
+2026-10-20 17:46:21.267 UTC [318] LOG:  checkpoint complete: wrote 1976 buffers (12.1%); 0 WAL file(s) added, 0 removed, 1 recycled; write=207.646 s, sync=0.141 s, total=207.796 s; sync files=639, longest=0.004 s, average=0.001 s; distance=11435 kB, estimate=11435 kB; lsn=0/25280B0, redo lsn=0/2528078

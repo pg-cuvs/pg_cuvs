@@ -1,0 +1,2775 @@
++ export DEBIAN_FRONTEND=noninteractive
++ DEBIAN_FRONTEND=noninteractive
+++ id -un
++ BOOT_USER=ubuntu
+++ getent passwd ubuntu
+++ cut -d: -f6
++ USER_HOME=/home/ubuntu
++ : /home/ubuntu
++ REPO=/home/ubuntu/pg_cuvs
++ IDX=/tmp/cuvs_indexes
++ CONDA=/opt/miniforge3
++ DEV=/opt/miniforge3/envs/cuvs_dev
++ BENCH=/opt/miniforge3/envs/cuvs_bench
++ echo '=== [1/5] APT + PostgreSQL 16 =========================================='
+=== [1/5] APT + PostgreSQL 16 ==========================================
++ wait_for_apt
++ set +x
++ return 0
++ sudo apt-get update -qq
++ sudo apt-get install -y -qq curl ca-certificates gnupg lsb-release rsync cmake postgresql-common libcurl4-openssl-dev libssl-dev g++ libstdc++-12-dev git
+Preconfiguring packages ...
+(Reading database ... (Reading database ... 5%(Reading database ... 10%(Reading database ... 15%(Reading database ... 20%(Reading database ... 25%(Reading database ... 30%(Reading database ... 35%(Reading database ... 40%(Reading database ... 45%(Reading database ... 50%(Reading database ... 55%(Reading database ... 60%(Reading database ... 65%(Reading database ... 70%(Reading database ... 75%(Reading database ... 80%(Reading database ... 85%(Reading database ... 90%(Reading database ... 95%(Reading database ... 100%(Reading database ... 146798 files and directories currently installed.)
+Preparing to unpack .../libssl3_3.0.2-0ubuntu1.30_amd64.deb ...
+Unpacking libssl3:amd64 (3.0.2-0ubuntu1.30) over (3.0.2-0ubuntu1.18) ...
+Setting up libssl3:amd64 (3.0.2-0ubuntu1.30) ...
+(Reading database ... (Reading database ... 5%(Reading database ... 10%(Reading database ... 15%(Reading database ... 20%(Reading database ... 25%(Reading database ... 30%(Reading database ... 35%(Reading database ... 40%(Reading database ... 45%(Reading database ... 50%(Reading database ... 55%(Reading database ... 60%(Reading database ... 65%(Reading database ... 70%(Reading database ... 75%(Reading database ... 80%(Reading database ... 85%(Reading database ... 90%(Reading database ... 95%(Reading database ... 100%(Reading database ... 146798 files and directories currently installed.)
+Preparing to unpack .../00-rsync_3.2.7-0ubuntu0.22.04.7_amd64.deb ...
+Unpacking rsync (3.2.7-0ubuntu0.22.04.7) over (3.2.7-0ubuntu0.22.04.2) ...
+Preparing to unpack .../01-libcc1-0_12.3.0-1ubuntu1~22.04.3_amd64.deb ...
+Unpacking libcc1-0:amd64 (12.3.0-1ubuntu1~22.04.3) over (12.3.0-1ubuntu1~22.04) ...
+Preparing to unpack .../02-libgomp1_12.3.0-1ubuntu1~22.04.3_amd64.deb ...
+Unpacking libgomp1:amd64 (12.3.0-1ubuntu1~22.04.3) over (12.3.0-1ubuntu1~22.04) ...
+Preparing to unpack .../03-libitm1_12.3.0-1ubuntu1~22.04.3_amd64.deb ...
+Unpacking libitm1:amd64 (12.3.0-1ubuntu1~22.04.3) over (12.3.0-1ubuntu1~22.04) ...
+Preparing to unpack .../04-libatomic1_12.3.0-1ubuntu1~22.04.3_amd64.deb ...
+Unpacking libatomic1:amd64 (12.3.0-1ubuntu1~22.04.3) over (12.3.0-1ubuntu1~22.04) ...
+Preparing to unpack .../05-libasan8_12.3.0-1ubuntu1~22.04.3_amd64.deb ...
+Unpacking libasan8:amd64 (12.3.0-1ubuntu1~22.04.3) over (12.3.0-1ubuntu1~22.04) ...
+Preparing to unpack .../06-liblsan0_12.3.0-1ubuntu1~22.04.3_amd64.deb ...
+Unpacking liblsan0:amd64 (12.3.0-1ubuntu1~22.04.3) over (12.3.0-1ubuntu1~22.04) ...
+Preparing to unpack .../07-libtsan2_12.3.0-1ubuntu1~22.04.3_amd64.deb ...
+Unpacking libtsan2:amd64 (12.3.0-1ubuntu1~22.04.3) over (12.3.0-1ubuntu1~22.04) ...
+Preparing to unpack .../08-libubsan1_12.3.0-1ubuntu1~22.04.3_amd64.deb ...
+Unpacking libubsan1:amd64 (12.3.0-1ubuntu1~22.04.3) over (12.3.0-1ubuntu1~22.04) ...
+Preparing to unpack .../09-libquadmath0_12.3.0-1ubuntu1~22.04.3_amd64.deb ...
+Unpacking libquadmath0:amd64 (12.3.0-1ubuntu1~22.04.3) over (12.3.0-1ubuntu1~22.04) ...
+Preparing to unpack .../10-libgcc-12-dev_12.3.0-1ubuntu1~22.04.3_amd64.deb ...
+Unpacking libgcc-12-dev:amd64 (12.3.0-1ubuntu1~22.04.3) over (12.3.0-1ubuntu1~22.04) ...
+Preparing to unpack .../11-gcc-12_12.3.0-1ubuntu1~22.04.3_amd64.deb ...
+Unpacking gcc-12 (12.3.0-1ubuntu1~22.04.3) over (12.3.0-1ubuntu1~22.04) ...
+Preparing to unpack .../12-cpp-12_12.3.0-1ubuntu1~22.04.3_amd64.deb ...
+Unpacking cpp-12 (12.3.0-1ubuntu1~22.04.3) over (12.3.0-1ubuntu1~22.04) ...
+Preparing to unpack .../13-gcc-12-base_12.3.0-1ubuntu1~22.04.3_amd64.deb ...
+Unpacking gcc-12-base:amd64 (12.3.0-1ubuntu1~22.04.3) over (12.3.0-1ubuntu1~22.04) ...
+Setting up gcc-12-base:amd64 (12.3.0-1ubuntu1~22.04.3) ...
+(Reading database ... (Reading database ... 5%(Reading database ... 10%(Reading database ... 15%(Reading database ... 20%(Reading database ... 25%(Reading database ... 30%(Reading database ... 35%(Reading database ... 40%(Reading database ... 45%(Reading database ... 50%(Reading database ... 55%(Reading database ... 60%(Reading database ... 65%(Reading database ... 70%(Reading database ... 75%(Reading database ... 80%(Reading database ... 85%(Reading database ... 90%(Reading database ... 95%(Reading database ... 100%(Reading database ... 146798 files and directories currently installed.)
+Preparing to unpack .../libstdc++6_12.3.0-1ubuntu1~22.04.3_amd64.deb ...
+Unpacking libstdc++6:amd64 (12.3.0-1ubuntu1~22.04.3) over (12.3.0-1ubuntu1~22.04) ...
+Setting up libstdc++6:amd64 (12.3.0-1ubuntu1~22.04.3) ...
+(Reading database ... (Reading database ... 5%(Reading database ... 10%(Reading database ... 15%(Reading database ... 20%(Reading database ... 25%(Reading database ... 30%(Reading database ... 35%(Reading database ... 40%(Reading database ... 45%(Reading database ... 50%(Reading database ... 55%(Reading database ... 60%(Reading database ... 65%(Reading database ... 70%(Reading database ... 75%(Reading database ... 80%(Reading database ... 85%(Reading database ... 90%(Reading database ... 95%(Reading database ... 100%(Reading database ... 146798 files and directories currently installed.)
+Preparing to unpack .../libgcc-s1_12.3.0-1ubuntu1~22.04.3_amd64.deb ...
+Unpacking libgcc-s1:amd64 (12.3.0-1ubuntu1~22.04.3) over (12.3.0-1ubuntu1~22.04) ...
+Setting up libgcc-s1:amd64 (12.3.0-1ubuntu1~22.04.3) ...
+(Reading database ... (Reading database ... 5%(Reading database ... 10%(Reading database ... 15%(Reading database ... 20%(Reading database ... 25%(Reading database ... 30%(Reading database ... 35%(Reading database ... 40%(Reading database ... 45%(Reading database ... 50%(Reading database ... 55%(Reading database ... 60%(Reading database ... 65%(Reading database ... 70%(Reading database ... 75%(Reading database ... 80%(Reading database ... 85%(Reading database ... 90%(Reading database ... 95%(Reading database ... 100%(Reading database ... 146798 files and directories currently installed.)
+Preparing to unpack .../00-gpg-wks-client_2.2.27-3ubuntu2.5_amd64.deb ...
+Unpacking gpg-wks-client (2.2.27-3ubuntu2.5) over (2.2.27-3ubuntu2.1) ...
+Preparing to unpack .../01-dirmngr_2.2.27-3ubuntu2.5_amd64.deb ...
+Unpacking dirmngr (2.2.27-3ubuntu2.5) over (2.2.27-3ubuntu2.1) ...
+Preparing to unpack .../02-gpg-wks-server_2.2.27-3ubuntu2.5_amd64.deb ...
+Unpacking gpg-wks-server (2.2.27-3ubuntu2.5) over (2.2.27-3ubuntu2.1) ...
+Preparing to unpack .../03-gnupg-utils_2.2.27-3ubuntu2.5_amd64.deb ...
+Unpacking gnupg-utils (2.2.27-3ubuntu2.5) over (2.2.27-3ubuntu2.1) ...
+Preparing to unpack .../04-gpg-agent_2.2.27-3ubuntu2.5_amd64.deb ...
+Unpacking gpg-agent (2.2.27-3ubuntu2.5) over (2.2.27-3ubuntu2.1) ...
+Preparing to unpack .../05-gpg_2.2.27-3ubuntu2.5_amd64.deb ...
+Unpacking gpg (2.2.27-3ubuntu2.5) over (2.2.27-3ubuntu2.1) ...
+Preparing to unpack .../06-gpgconf_2.2.27-3ubuntu2.5_amd64.deb ...
+Unpacking gpgconf (2.2.27-3ubuntu2.5) over (2.2.27-3ubuntu2.1) ...
+Preparing to unpack .../07-gnupg-l10n_2.2.27-3ubuntu2.5_all.deb ...
+Unpacking gnupg-l10n (2.2.27-3ubuntu2.5) over (2.2.27-3ubuntu2.1) ...
+Preparing to unpack .../08-gnupg_2.2.27-3ubuntu2.5_all.deb ...
+Unpacking gnupg (2.2.27-3ubuntu2.5) over (2.2.27-3ubuntu2.1) ...
+Preparing to unpack .../09-gpgsm_2.2.27-3ubuntu2.5_amd64.deb ...
+Unpacking gpgsm (2.2.27-3ubuntu2.5) over (2.2.27-3ubuntu2.1) ...
+Preparing to unpack .../10-gpgv_2.2.27-3ubuntu2.5_amd64.deb ...
+Unpacking gpgv (2.2.27-3ubuntu2.5) over (2.2.27-3ubuntu2.1) ...
+Setting up gpgv (2.2.27-3ubuntu2.5) ...
+(Reading database ... (Reading database ... 5%(Reading database ... 10%(Reading database ... 15%(Reading database ... 20%(Reading database ... 25%(Reading database ... 30%(Reading database ... 35%(Reading database ... 40%(Reading database ... 45%(Reading database ... 50%(Reading database ... 55%(Reading database ... 60%(Reading database ... 65%(Reading database ... 70%(Reading database ... 75%(Reading database ... 80%(Reading database ... 85%(Reading database ... 90%(Reading database ... 95%(Reading database ... 100%(Reading database ... 146798 files and directories currently installed.)
+Preparing to unpack .../00-ca-certificates_20260601~22.04.1_all.deb ...
+Unpacking ca-certificates (20260601~22.04.1) over (20240203~22.04.1) ...
+Preparing to unpack .../01-curl_7.81.0-1ubuntu1.30_amd64.deb ...
+Unpacking curl (7.81.0-1ubuntu1.30) over (7.81.0-1ubuntu1.19) ...
+Preparing to unpack .../02-libcurl4_7.81.0-1ubuntu1.30_amd64.deb ...
+Unpacking libcurl4:amd64 (7.81.0-1ubuntu1.30) over (7.81.0-1ubuntu1.19) ...
+Selecting previously unselected package libjsoncpp25:amd64.
+Preparing to unpack .../03-libjsoncpp25_1.9.5-3_amd64.deb ...
+Unpacking libjsoncpp25:amd64 (1.9.5-3) ...
+Selecting previously unselected package librhash0:amd64.
+Preparing to unpack .../04-librhash0_1.4.2-1ubuntu1_amd64.deb ...
+Unpacking librhash0:amd64 (1.4.2-1ubuntu1) ...
+Selecting previously unselected package dh-elpa-helper.
+Preparing to unpack .../05-dh-elpa-helper_2.0.9ubuntu1_all.deb ...
+Unpacking dh-elpa-helper (2.0.9ubuntu1) ...
+Selecting previously unselected package emacsen-common.
+Preparing to unpack .../06-emacsen-common_3.0.4_all.deb ...
+Unpacking emacsen-common (3.0.4) ...
+Selecting previously unselected package cmake-data.
+Preparing to unpack .../07-cmake-data_3.22.1-1ubuntu1.22.04.2_all.deb ...
+Unpacking cmake-data (3.22.1-1ubuntu1.22.04.2) ...
+Selecting previously unselected package cmake.
+Preparing to unpack .../08-cmake_3.22.1-1ubuntu1.22.04.2_amd64.deb ...
+Unpacking cmake (3.22.1-1ubuntu1.22.04.2) ...
+Preparing to unpack .../09-git_1%3a2.34.1-1ubuntu1.18_amd64.deb ...
+Unpacking git (1:2.34.1-1ubuntu1.18) over (1:2.34.1-1ubuntu1.11) ...
+Selecting previously unselected package libcurl4-openssl-dev:amd64.
+Preparing to unpack .../10-libcurl4-openssl-dev_7.81.0-1ubuntu1.30_amd64.deb ...
+Unpacking libcurl4-openssl-dev:amd64 (7.81.0-1ubuntu1.30) ...
+Selecting previously unselected package libssl-dev:amd64.
+Preparing to unpack .../11-libssl-dev_3.0.2-0ubuntu1.30_amd64.deb ...
+Unpacking libssl-dev:amd64 (3.0.2-0ubuntu1.30) ...
+Selecting previously unselected package libstdc++-12-dev:amd64.
+Preparing to unpack .../12-libstdc++-12-dev_12.3.0-1ubuntu1~22.04.3_amd64.deb ...
+Unpacking libstdc++-12-dev:amd64 (12.3.0-1ubuntu1~22.04.3) ...
+Selecting previously unselected package postgresql-client-common.
+Preparing to unpack .../13-postgresql-client-common_238_all.deb ...
+Unpacking postgresql-client-common (238) ...
+Selecting previously unselected package ssl-cert.
+Preparing to unpack .../14-ssl-cert_1.1.2_all.deb ...
+Unpacking ssl-cert (1.1.2) ...
+Selecting previously unselected package postgresql-common.
+Preparing to unpack .../15-postgresql-common_238_all.deb ...
+Adding 'diversion of /usr/bin/pg_config to /usr/bin/pg_config.libpq-dev by postgresql-common'
+Unpacking postgresql-common (238) ...
+Setting up postgresql-client-common (238) ...
+Setting up cpp-12 (12.3.0-1ubuntu1~22.04.3) ...
+Setting up libgomp1:amd64 (12.3.0-1ubuntu1~22.04.3) ...
+Setting up ca-certificates (20260601~22.04.1) ...
+Updating certificates in /etc/ssl/certs...
+rehash: warning: skipping ca-certificates.crt,it does not contain exactly one certificate or CRL
+14 added, 39 removed; done.
+Setting up emacsen-common (3.0.4) ...
+Setting up gnupg-l10n (2.2.27-3ubuntu2.5) ...
+Setting up ssl-cert (1.1.2) ...
+Setting up dh-elpa-helper (2.0.9ubuntu1) ...
+Setting up libquadmath0:amd64 (12.3.0-1ubuntu1~22.04.3) ...
+Setting up postgresql-common (238) ...
+Adding user postgres to group ssl-cert
+
+Creating config file /etc/postgresql-common/createcluster.conf with new version
+Building PostgreSQL dictionaries from installed myspell/hunspell packages...
+Removing obsolete dictionary files:
+Created symlink /etc/systemd/system/multi-user.target.wants/postgresql.service → /lib/systemd/system/postgresql.service.
+Setting up libssl-dev:amd64 (3.0.2-0ubuntu1.30) ...
+Setting up libatomic1:amd64 (12.3.0-1ubuntu1~22.04.3) ...
+Setting up libjsoncpp25:amd64 (1.9.5-3) ...
+Setting up git (1:2.34.1-1ubuntu1.18) ...
+Setting up libubsan1:amd64 (12.3.0-1ubuntu1~22.04.3) ...
+Setting up librhash0:amd64 (1.4.2-1ubuntu1) ...
+Setting up libasan8:amd64 (12.3.0-1ubuntu1~22.04.3) ...
+Setting up gpgconf (2.2.27-3ubuntu2.5) ...
+Setting up libcurl4:amd64 (7.81.0-1ubuntu1.30) ...
+Setting up cmake-data (3.22.1-1ubuntu1.22.04.2) ...
+Setting up curl (7.81.0-1ubuntu1.30) ...
+Setting up libtsan2:amd64 (12.3.0-1ubuntu1~22.04.3) ...
+Setting up libcc1-0:amd64 (12.3.0-1ubuntu1~22.04.3) ...
+Setting up gpg (2.2.27-3ubuntu2.5) ...
+Setting up liblsan0:amd64 (12.3.0-1ubuntu1~22.04.3) ...
+Setting up libitm1:amd64 (12.3.0-1ubuntu1~22.04.3) ...
+Setting up rsync (3.2.7-0ubuntu0.22.04.7) ...
+rsync.service is a disabled or a static unit not running, not starting it.
+Setting up gnupg-utils (2.2.27-3ubuntu2.5) ...
+Setting up gpg-agent (2.2.27-3ubuntu2.5) ...
+Setting up gpgsm (2.2.27-3ubuntu2.5) ...
+Setting up dirmngr (2.2.27-3ubuntu2.5) ...
+Setting up libcurl4-openssl-dev:amd64 (7.81.0-1ubuntu1.30) ...
+Setting up libgcc-12-dev:amd64 (12.3.0-1ubuntu1~22.04.3) ...
+Setting up gpg-wks-server (2.2.27-3ubuntu2.5) ...
+Setting up cmake (3.22.1-1ubuntu1.22.04.2) ...
+Setting up gpg-wks-client (2.2.27-3ubuntu2.5) ...
+Setting up libstdc++-12-dev:amd64 (12.3.0-1ubuntu1~22.04.3) ...
+Setting up gcc-12 (12.3.0-1ubuntu1~22.04.3) ...
+Setting up gnupg (2.2.27-3ubuntu2.5) ...
+Processing triggers for libc-bin (2.35-0ubuntu3.8) ...
+Processing triggers for man-db (2.10.2-1) ...
+Processing triggers for install-info (6.8-4build1) ...
+Processing triggers for ca-certificates (20260601~22.04.1) ...
+Updating certificates in /etc/ssl/certs...
+0 added, 0 removed; done.
+Running hooks in /etc/ca-certificates/update.d...
+
+done.
+done.
+NEEDRESTART-VER: 3.5
+NEEDRESTART-KCUR: 5.15.0-126-generic
+NEEDRESTART-KEXP: 5.15.0-126-generic
+NEEDRESTART-KSTA: 1
+NEEDRESTART-SVC: multipathd.service
+NEEDRESTART-SVC: nvidia-dcgm.service
+NEEDRESTART-SVC: packagekit.service
+NEEDRESTART-SVC: ssh.service
+NEEDRESTART-SVC: systemd-journald.service
+NEEDRESTART-SVC: systemd-logind.service
+NEEDRESTART-SVC: systemd-manager
+NEEDRESTART-SVC: systemd-networkd.service
+NEEDRESTART-SVC: systemd-resolved.service
+NEEDRESTART-SVC: systemd-timesyncd.service
+NEEDRESTART-SVC: systemd-udevd.service
+NEEDRESTART-SVC: user@1000.service
++ yes
++ sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh
+This script will enable the PostgreSQL APT repository on apt.postgresql.org on
+your system. The distribution codename used will be jammy-pgdg.
+
+Press Enter to continue, or Ctrl-C to abort.
+Writing /etc/apt/sources.list.d/pgdg.list ...
+Importing repository signing key ...
+Warning: apt-key is deprecated. Manage keyring files in trusted.gpg.d instead (see apt-key(8)).
+OK
+
+Running apt-get update ...
+Hit:1 https://apt.grafana.com stable InRelease
+Hit:2 https://download.docker.com/linux/ubuntu jammy InRelease
+Hit:3 https://nvidia.github.io/libnvidia-container/stable/deb/amd64  InRelease
+Get:4 https://nvidia.github.io/libnvidia-container/stable/ubuntu18.04/amd64  InRelease [1484 B]
+Get:5 http://apt.postgresql.org/pub/repos/apt jammy-pgdg InRelease [189 kB]
+Hit:6 https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64  InRelease
+Ign:7 https://apt.fury.io/crusoe * InRelease
+Get:8 https://apt.fury.io/crusoe * Release
+Get:9 https://repos.influxdata.com/debian stable InRelease [6922 B]
+Ign:10 https://apt.fury.io/crusoe * Release.gpg
+Hit:11 http://security.ubuntu.com/ubuntu jammy-security InRelease
+Get:12 http://apt.postgresql.org/pub/repos/apt jammy-pgdg/main amd64 Packages [863 kB]
+Hit:13 http://archive.ubuntu.com/ubuntu jammy InRelease
+Hit:14 http://archive.ubuntu.com/ubuntu jammy-updates InRelease
+Hit:15 http://archive.ubuntu.com/ubuntu jammy-backports InRelease
+Fetched 1070 kB in 3s (357 kB/s)
+Reading package lists...
+
+You can now start installing packages from apt.postgresql.org.
+
+Have a look at https://wiki.postgresql.org/wiki/Apt for more information;
+most notably the FAQ at https://wiki.postgresql.org/wiki/Apt/FAQ
++ true
++ wait_for_apt
++ set +x
++ return 0
++ sudo apt-get update -qq
++ wait_for_apt
++ set +x
++ return 0
++ sudo apt-get install -y -qq postgresql-16 postgresql-server-dev-16 postgresql-16-pgvector
+Preconfiguring packages ...
+(Reading database ... (Reading database ... 5%(Reading database ... 10%(Reading database ... 15%(Reading database ... 20%(Reading database ... 25%(Reading database ... 30%(Reading database ... 35%(Reading database ... 40%(Reading database ... 45%(Reading database ... 50%(Reading database ... 55%(Reading database ... 60%(Reading database ... 65%(Reading database ... 70%(Reading database ... 75%(Reading database ... 80%(Reading database ... 85%(Reading database ... 90%(Reading database ... 95%(Reading database ... 100%(Reading database ... 151084 files and directories currently installed.)
+Preparing to unpack .../postgresql-common_293.pgdg22.04+1_all.deb ...
+Leaving 'diversion of /usr/bin/pg_config to /usr/bin/pg_config.libpq-dev by postgresql-common'
+Unpacking postgresql-common (293.pgdg22.04+1) over (238) ...
+Preparing to unpack .../postgresql-client-common_293.pgdg22.04+1_all.deb ...
+Unpacking postgresql-client-common (293.pgdg22.04+1) over (238) ...
+Preparing to unpack .../libc6-dev_2.35-0ubuntu3.15_amd64.deb ...
+Unpacking libc6-dev:amd64 (2.35-0ubuntu3.15) over (2.35-0ubuntu3.8) ...
+Preparing to unpack .../libc-dev-bin_2.35-0ubuntu3.15_amd64.deb ...
+Unpacking libc-dev-bin (2.35-0ubuntu3.15) over (2.35-0ubuntu3.8) ...
+Preparing to unpack .../libc6_2.35-0ubuntu3.15_amd64.deb ...
+Unpacking libc6:amd64 (2.35-0ubuntu3.15) over (2.35-0ubuntu3.8) ...
+Setting up libc6:amd64 (2.35-0ubuntu3.15) ...
+(Reading database ... (Reading database ... 5%(Reading database ... 10%(Reading database ... 15%(Reading database ... 20%(Reading database ... 25%(Reading database ... 30%(Reading database ... 35%(Reading database ... 40%(Reading database ... 45%(Reading database ... 50%(Reading database ... 55%(Reading database ... 60%(Reading database ... 65%(Reading database ... 70%(Reading database ... 75%(Reading database ... 80%(Reading database ... 85%(Reading database ... 90%(Reading database ... 95%(Reading database ... 100%(Reading database ... 151020 files and directories currently installed.)
+Preparing to unpack .../libncurses6_6.3-2ubuntu0.3_amd64.deb ...
+Unpacking libncurses6:amd64 (6.3-2ubuntu0.3) over (6.3-2ubuntu0.1) ...
+Preparing to unpack .../libncursesw6_6.3-2ubuntu0.3_amd64.deb ...
+Unpacking libncursesw6:amd64 (6.3-2ubuntu0.3) over (6.3-2ubuntu0.1) ...
+Preparing to unpack .../libtinfo6_6.3-2ubuntu0.3_amd64.deb ...
+Unpacking libtinfo6:amd64 (6.3-2ubuntu0.3) over (6.3-2ubuntu0.1) ...
+Setting up libtinfo6:amd64 (6.3-2ubuntu0.3) ...
+(Reading database ... (Reading database ... 5%(Reading database ... 10%(Reading database ... 15%(Reading database ... 20%(Reading database ... 25%(Reading database ... 30%(Reading database ... 35%(Reading database ... 40%(Reading database ... 45%(Reading database ... 50%(Reading database ... 55%(Reading database ... 60%(Reading database ... 65%(Reading database ... 70%(Reading database ... 75%(Reading database ... 80%(Reading database ... 85%(Reading database ... 90%(Reading database ... 95%(Reading database ... 100%(Reading database ... 151020 files and directories currently installed.)
+Preparing to unpack .../00-libxml2_2.9.13+dfsg-1ubuntu0.14_amd64.deb ...
+Unpacking libxml2:amd64 (2.9.13+dfsg-1ubuntu0.14) over (2.9.13+dfsg-1ubuntu0.4) ...
+Selecting previously unselected package libclang-cpp15.
+Preparing to unpack .../01-libclang-cpp15_1%3a15.0.7-0ubuntu0.22.04.3_amd64.deb ...
+Unpacking libclang-cpp15 (1:15.0.7-0ubuntu0.22.04.3) ...
+Preparing to unpack .../02-libasan6_11.4.0-1ubuntu1~22.04.3_amd64.deb ...
+Unpacking libasan6:amd64 (11.4.0-1ubuntu1~22.04.3) over (11.4.0-1ubuntu1~22.04) ...
+Preparing to unpack .../03-g++-11_11.4.0-1ubuntu1~22.04.3_amd64.deb ...
+Unpacking g++-11 (11.4.0-1ubuntu1~22.04.3) over (11.4.0-1ubuntu1~22.04) ...
+Preparing to unpack .../04-gcc-11_11.4.0-1ubuntu1~22.04.3_amd64.deb ...
+Unpacking gcc-11 (11.4.0-1ubuntu1~22.04.3) over (11.4.0-1ubuntu1~22.04) ...
+Preparing to unpack .../05-libstdc++-11-dev_11.4.0-1ubuntu1~22.04.3_amd64.deb ...
+Unpacking libstdc++-11-dev:amd64 (11.4.0-1ubuntu1~22.04.3) over (11.4.0-1ubuntu1~22.04) ...
+Preparing to unpack .../06-libgcc-11-dev_11.4.0-1ubuntu1~22.04.3_amd64.deb ...
+Unpacking libgcc-11-dev:amd64 (11.4.0-1ubuntu1~22.04.3) over (11.4.0-1ubuntu1~22.04) ...
+Preparing to unpack .../07-libtsan0_11.4.0-1ubuntu1~22.04.3_amd64.deb ...
+Unpacking libtsan0:amd64 (11.4.0-1ubuntu1~22.04.3) over (11.4.0-1ubuntu1~22.04) ...
+Preparing to unpack .../08-cpp-11_11.4.0-1ubuntu1~22.04.3_amd64.deb ...
+Unpacking cpp-11 (11.4.0-1ubuntu1~22.04.3) over (11.4.0-1ubuntu1~22.04) ...
+Preparing to unpack .../09-gcc-11-base_11.4.0-1ubuntu1~22.04.3_amd64.deb ...
+Unpacking gcc-11-base:amd64 (11.4.0-1ubuntu1~22.04.3) over (11.4.0-1ubuntu1~22.04) ...
+Selecting previously unselected package libgc1:amd64.
+Preparing to unpack .../10-libgc1_1%3a8.0.6-1.1build1_amd64.deb ...
+Unpacking libgc1:amd64 (1:8.0.6-1.1build1) ...
+Selecting previously unselected package libobjc4:amd64.
+Preparing to unpack .../11-libobjc4_12.3.0-1ubuntu1~22.04.3_amd64.deb ...
+Unpacking libobjc4:amd64 (12.3.0-1ubuntu1~22.04.3) ...
+Selecting previously unselected package libobjc-11-dev:amd64.
+Preparing to unpack .../12-libobjc-11-dev_11.4.0-1ubuntu1~22.04.3_amd64.deb ...
+Unpacking libobjc-11-dev:amd64 (11.4.0-1ubuntu1~22.04.3) ...
+Selecting previously unselected package libc6-i386.
+Preparing to unpack .../13-libc6-i386_2.35-0ubuntu3.15_amd64.deb ...
+Unpacking libc6-i386 (2.35-0ubuntu3.15) ...
+Selecting previously unselected package lib32gcc-s1.
+Preparing to unpack .../14-lib32gcc-s1_12.3.0-1ubuntu1~22.04.3_amd64.deb ...
+Unpacking lib32gcc-s1 (12.3.0-1ubuntu1~22.04.3) ...
+Selecting previously unselected package lib32stdc++6.
+Preparing to unpack .../15-lib32stdc++6_12.3.0-1ubuntu1~22.04.3_amd64.deb ...
+Unpacking lib32stdc++6 (12.3.0-1ubuntu1~22.04.3) ...
+Selecting previously unselected package libclang-common-15-dev.
+Preparing to unpack .../16-libclang-common-15-dev_1%3a15.0.7-0ubuntu0.22.04.3_amd64.deb ...
+Unpacking libclang-common-15-dev (1:15.0.7-0ubuntu0.22.04.3) ...
+Selecting previously unselected package llvm-15-linker-tools.
+Preparing to unpack .../17-llvm-15-linker-tools_1%3a15.0.7-0ubuntu0.22.04.3_amd64.deb ...
+Unpacking llvm-15-linker-tools (1:15.0.7-0ubuntu0.22.04.3) ...
+Selecting previously unselected package libclang1-15.
+Preparing to unpack .../18-libclang1-15_1%3a15.0.7-0ubuntu0.22.04.3_amd64.deb ...
+Unpacking libclang1-15 (1:15.0.7-0ubuntu0.22.04.3) ...
+Selecting previously unselected package clang-15.
+Preparing to unpack .../19-clang-15_1%3a15.0.7-0ubuntu0.22.04.3_amd64.deb ...
+Unpacking clang-15 (1:15.0.7-0ubuntu0.22.04.3) ...
+Selecting previously unselected package icu-devtools.
+Preparing to unpack .../20-icu-devtools_70.1-2_amd64.deb ...
+Unpacking icu-devtools (70.1-2) ...
+Selecting previously unselected package libicu-dev:amd64.
+Preparing to unpack .../21-libicu-dev_70.1-2_amd64.deb ...
+Unpacking libicu-dev:amd64 (70.1-2) ...
+Selecting previously unselected package libncurses-dev:amd64.
+Preparing to unpack .../22-libncurses-dev_6.3-2ubuntu0.3_amd64.deb ...
+Unpacking libncurses-dev:amd64 (6.3-2ubuntu0.3) ...
+Selecting previously unselected package libpq5:amd64.
+Preparing to unpack .../23-libpq5_18.6-1.pgdg22.04+2_amd64.deb ...
+Unpacking libpq5:amd64 (18.6-1.pgdg22.04+2) ...
+Selecting previously unselected package libpq-dev.
+Preparing to unpack .../24-libpq-dev_18.6-1.pgdg22.04+2_amd64.deb ...
+Unpacking libpq-dev (18.6-1.pgdg22.04+2) ...
+Selecting previously unselected package libtinfo-dev:amd64.
+Preparing to unpack .../25-libtinfo-dev_6.3-2ubuntu0.3_amd64.deb ...
+Unpacking libtinfo-dev:amd64 (6.3-2ubuntu0.3) ...
+Selecting previously unselected package libxml2-dev:amd64.
+Preparing to unpack .../26-libxml2-dev_2.9.13+dfsg-1ubuntu0.14_amd64.deb ...
+Unpacking libxml2-dev:amd64 (2.9.13+dfsg-1ubuntu0.14) ...
+Selecting previously unselected package llvm-15-runtime.
+Preparing to unpack .../27-llvm-15-runtime_1%3a15.0.7-0ubuntu0.22.04.3_amd64.deb ...
+Unpacking llvm-15-runtime (1:15.0.7-0ubuntu0.22.04.3) ...
+Selecting previously unselected package libpfm4:amd64.
+Preparing to unpack .../28-libpfm4_4.11.1+git32-gd0b85fb-1ubuntu0.1_amd64.deb ...
+Unpacking libpfm4:amd64 (4.11.1+git32-gd0b85fb-1ubuntu0.1) ...
+Selecting previously unselected package llvm-15.
+Preparing to unpack .../29-llvm-15_1%3a15.0.7-0ubuntu0.22.04.3_amd64.deb ...
+Unpacking llvm-15 (1:15.0.7-0ubuntu0.22.04.3) ...
+Selecting previously unselected package libffi-dev:amd64.
+Preparing to unpack .../30-libffi-dev_3.4.2-4_amd64.deb ...
+Unpacking libffi-dev:amd64 (3.4.2-4) ...
+Selecting previously unselected package python3-pygments.
+Preparing to unpack .../31-python3-pygments_2.11.2+dfsg-2ubuntu0.1_all.deb ...
+Unpacking python3-pygments (2.11.2+dfsg-2ubuntu0.1) ...
+Selecting previously unselected package llvm-15-tools.
+Preparing to unpack .../32-llvm-15-tools_1%3a15.0.7-0ubuntu0.22.04.3_amd64.deb ...
+Unpacking llvm-15-tools (1:15.0.7-0ubuntu0.22.04.3) ...
+Selecting previously unselected package libz3-4:amd64.
+Preparing to unpack .../33-libz3-4_4.8.12-1_amd64.deb ...
+Unpacking libz3-4:amd64 (4.8.12-1) ...
+Selecting previously unselected package libz3-dev:amd64.
+Preparing to unpack .../34-libz3-dev_4.8.12-1_amd64.deb ...
+Unpacking libz3-dev:amd64 (4.8.12-1) ...
+Selecting previously unselected package llvm-15-dev.
+Preparing to unpack .../35-llvm-15-dev_1%3a15.0.7-0ubuntu0.22.04.3_amd64.deb ...
+Unpacking llvm-15-dev (1:15.0.7-0ubuntu0.22.04.3) ...
+Selecting previously unselected package postgresql-client-16.
+Preparing to unpack .../36-postgresql-client-16_16.15-1.pgdg22.04+2_amd64.deb ...
+Unpacking postgresql-client-16 (16.15-1.pgdg22.04+2) ...
+Selecting previously unselected package postgresql-16.
+Preparing to unpack .../37-postgresql-16_16.15-1.pgdg22.04+2_amd64.deb ...
+Unpacking postgresql-16 (16.15-1.pgdg22.04+2) ...
+Selecting previously unselected package postgresql-16-pgvector.
+Preparing to unpack .../38-postgresql-16-pgvector_0.8.7-1.pgdg22.04+1_amd64.deb ...
+Unpacking postgresql-16-pgvector (0.8.7-1.pgdg22.04+1) ...
+Selecting previously unselected package postgresql-server-dev-16.
+Preparing to unpack .../39-postgresql-server-dev-16_16.15-1.pgdg22.04+2_amd64.deb ...
+Unpacking postgresql-server-dev-16 (16.15-1.pgdg22.04+2) ...
+Selecting previously unselected package sysstat.
+Preparing to unpack .../40-sysstat_12.5.2-2ubuntu0.2_amd64.deb ...
+Unpacking sysstat (12.5.2-2ubuntu0.2) ...
+Setting up postgresql-client-common (293.pgdg22.04+1) ...
+Removing obsolete conffile /etc/postgresql-common/supported_versions ...
+Setting up gcc-11-base:amd64 (11.4.0-1ubuntu1~22.04.3) ...
+Setting up llvm-15-linker-tools (1:15.0.7-0ubuntu0.22.04.3) ...
+Setting up libpq5:amd64 (18.6-1.pgdg22.04+2) ...
+Setting up libpq-dev (18.6-1.pgdg22.04+2) ...
+Setting up libclang1-15 (1:15.0.7-0ubuntu0.22.04.3) ...
+Setting up libffi-dev:amd64 (3.4.2-4) ...
+Setting up libasan6:amd64 (11.4.0-1ubuntu1~22.04.3) ...
+Setting up python3-pygments (2.11.2+dfsg-2ubuntu0.1) ...
+Setting up libz3-4:amd64 (4.8.12-1) ...
+Setting up libpfm4:amd64 (4.11.1+git32-gd0b85fb-1ubuntu0.1) ...
+Setting up libncurses6:amd64 (6.3-2ubuntu0.3) ...
+Setting up postgresql-common (293.pgdg22.04+1) ...
+Replacing config file /etc/postgresql-common/createcluster.conf with new version
+Setting up icu-devtools (70.1-2) ...
+Setting up libncursesw6:amd64 (6.3-2ubuntu0.3) ...
+Setting up libgc1:amd64 (1:8.0.6-1.1build1) ...
+Setting up libclang-cpp15 (1:15.0.7-0ubuntu0.22.04.3) ...
+Setting up llvm-15-runtime (1:15.0.7-0ubuntu0.22.04.3) ...
+Setting up libc6-i386 (2.35-0ubuntu3.15) ...
+Setting up libc-dev-bin (2.35-0ubuntu3.15) ...
+Setting up libxml2:amd64 (2.9.13+dfsg-1ubuntu0.14) ...
+Setting up sysstat (12.5.2-2ubuntu0.2) ...
+
+Creating config file /etc/default/sysstat with new version
+update-alternatives: using /usr/bin/sar.sysstat to provide /usr/bin/sar (sar) in auto mode
+Created symlink /etc/systemd/system/sysstat.service.wants/sysstat-collect.timer → /lib/systemd/system/sysstat-collect.timer.
+Created symlink /etc/systemd/system/sysstat.service.wants/sysstat-summary.timer → /lib/systemd/system/sysstat-summary.timer.
+Created symlink /etc/systemd/system/multi-user.target.wants/sysstat.service → /lib/systemd/system/sysstat.service.
+Setting up libtsan0:amd64 (11.4.0-1ubuntu1~22.04.3) ...
+Setting up cpp-11 (11.4.0-1ubuntu1~22.04.3) ...
+Setting up libz3-dev:amd64 (4.8.12-1) ...
+Setting up llvm-15 (1:15.0.7-0ubuntu0.22.04.3) ...
+Setting up postgresql-client-16 (16.15-1.pgdg22.04+2) ...
+update-alternatives: using /usr/share/postgresql/16/man/man1/psql.1.gz to provide /usr/share/man/man1/psql.1.gz (psql.1.gz) in auto mode
+Setting up libobjc4:amd64 (12.3.0-1ubuntu1~22.04.3) ...
+Setting up llvm-15-tools (1:15.0.7-0ubuntu0.22.04.3) ...
+Setting up lib32gcc-s1 (12.3.0-1ubuntu1~22.04.3) ...
+Setting up lib32stdc++6 (12.3.0-1ubuntu1~22.04.3) ...
+Setting up libgcc-11-dev:amd64 (11.4.0-1ubuntu1~22.04.3) ...
+Setting up gcc-11 (11.4.0-1ubuntu1~22.04.3) ...
+Setting up libc6-dev:amd64 (2.35-0ubuntu3.15) ...
+Setting up libicu-dev:amd64 (70.1-2) ...
+Setting up libncurses-dev:amd64 (6.3-2ubuntu0.3) ...
+Setting up libclang-common-15-dev (1:15.0.7-0ubuntu0.22.04.3) ...
+Setting up postgresql-16 (16.15-1.pgdg22.04+2) ...
+Creating new PostgreSQL cluster 16/main ...
+/usr/lib/postgresql/16/bin/initdb -D /var/lib/postgresql/16/main --auth-local peer --auth-host scram-sha-256 --no-instructions
+The files belonging to this database system will be owned by user "postgres".
+This user must also own the server process.
+
+The database cluster will be initialized with locale "C.UTF-8".
+The default database encoding has accordingly been set to "UTF8".
+The default text search configuration will be set to "english".
+
+Data page checksums are disabled.
+
+fixing permissions on existing directory /var/lib/postgresql/16/main ... ok
+creating subdirectories ... ok
+selecting dynamic shared memory implementation ... posix
+selecting default max_connections ... 100
+selecting default shared_buffers ... 128MB
+selecting default time zone ... Etc/UTC
+creating configuration files ... ok
+running bootstrap script ... ok
+performing post-bootstrap initialization ... ok
+syncing data to disk ... ok
+Setting up libobjc-11-dev:amd64 (11.4.0-1ubuntu1~22.04.3) ...
+Setting up libxml2-dev:amd64 (2.9.13+dfsg-1ubuntu0.14) ...
+Setting up postgresql-16-pgvector (0.8.7-1.pgdg22.04+1) ...
+Setting up libstdc++-11-dev:amd64 (11.4.0-1ubuntu1~22.04.3) ...
+Setting up libtinfo-dev:amd64 (6.3-2ubuntu0.3) ...
+Setting up clang-15 (1:15.0.7-0ubuntu0.22.04.3) ...
+Setting up g++-11 (11.4.0-1ubuntu1~22.04.3) ...
+Setting up llvm-15-dev (1:15.0.7-0ubuntu0.22.04.3) ...
+Setting up postgresql-server-dev-16 (16.15-1.pgdg22.04+2) ...
+Processing triggers for libc-bin (2.35-0ubuntu3.8) ...
+Processing triggers for man-db (2.10.2-1) ...
+Processing triggers for install-info (6.8-4build1) ...
+NEEDRESTART-VER: 3.5
+NEEDRESTART-KCUR: 5.15.0-126-generic
+NEEDRESTART-KEXP: 5.15.0-126-generic
+NEEDRESTART-KSTA: 1
+NEEDRESTART-SVC: containerd.service
+NEEDRESTART-SVC: cron.service
+NEEDRESTART-SVC: dbus.service
+NEEDRESTART-SVC: docker.service
+NEEDRESTART-SVC: getty@tty1.service
+NEEDRESTART-SVC: irqbalance.service
+NEEDRESTART-SVC: multipathd.service
+NEEDRESTART-SVC: networkd-dispatcher.service
+NEEDRESTART-SVC: nvidia-dcgm.service
+NEEDRESTART-SVC: nvidia-persistenced.service
+NEEDRESTART-SVC: packagekit.service
+NEEDRESTART-SVC: polkit.service
+NEEDRESTART-SVC: rsyslog.service
+NEEDRESTART-SVC: serial-getty@ttyS0.service
+NEEDRESTART-SVC: snapd.service
+NEEDRESTART-SVC: ssh.service
+NEEDRESTART-SVC: systemd-journald.service
+NEEDRESTART-SVC: systemd-logind.service
+NEEDRESTART-SVC: systemd-networkd.service
+NEEDRESTART-SVC: systemd-resolved.service
+NEEDRESTART-SVC: systemd-timesyncd.service
+NEEDRESTART-SVC: systemd-udevd.service
+NEEDRESTART-SVC: user@1000.service
++ test -x /usr/lib/postgresql/16/bin/pg_config
++ /usr/lib/postgresql/16/bin/pg_config --version
+PostgreSQL 16.15 (Ubuntu 16.15-1.pgdg22.04+2)
++ sudo systemctl enable --now postgresql@16-main
++ sleep 2
++ sudo -u postgres psql -tAc 'SELECT 1 FROM pg_roles WHERE rolname='\''ubuntu'\'''
++ grep -q 1
++ sudo -u postgres psql -c 'CREATE ROLE "ubuntu" SUPERUSER LOGIN'
+CREATE ROLE
++ sudo -u postgres psql -tAc 'SELECT 1 FROM pg_database WHERE datname='\''ubuntu'\'''
++ grep -q 1
++ sudo -u postgres createdb -O ubuntu ubuntu
++ echo '=== [2/5] miniforge + cuvs_dev (build) + cuvs_bench (python) ==========='
+=== [2/5] miniforge + cuvs_dev (build) + cuvs_bench (python) ===========
++ '[' '!' -d /opt/miniforge3 ']'
++ wget -q https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-Linux-x86_64.sh -O /tmp/mf.sh
++ sudo bash /tmp/mf.sh -b -p /opt/miniforge3
+PREFIX=/opt/miniforge3
+Unpacking bootstrapper...
+Unpacking payload...
+Extracting ca-certificates-2026.7.22-hbd8a1cb_0.conda
+Extracting libgomp-16.2.0-he0feb66_4.conda
+Extracting libzlib-1.3.2-h25fd6f3_3.conda
+Extracting nlohmann_json-abi-3.12.0-h0f90c79_2.conda
+Extracting pybind11-abi-11-hc364b38_1.conda
+Extracting python_abi-3.14-9_cp314.conda
+Extracting tzdata-2026c-h151e31d_0.conda
+Extracting _openmp_mutex-4.5-20_gnu.conda
+Extracting zstd-1.5.7-hb78ec9c_7.conda
+Extracting ld_impl_linux-64-2.46.1-default_hbd61a6d_102.conda
+Extracting libgcc-16.2.0-ha9f2e26_4.conda
+Extracting bzip2-1.0.8-hda65f42_10.conda
+Extracting c-ares-1.34.8-hebe6cf0_2.conda
+Extracting keyutils-1.6.3-h7cc23a3_1.conda
+Extracting libev-4.33-h280c20c_3.conda
+Extracting libexpat-2.8.1-hecca717_1.conda
+Extracting libffi-3.7.0-h81df57d_1.conda
+Extracting libiconv-1.18-h0cb94f2_3.conda
+Extracting liblzma-5.8.3-hb03c661_1.conda
+Extracting libmpdec-4.0.0-hb03c661_2.conda
+Extracting libstdcxx-16.2.0-h934c35e_4.conda
+Extracting libuuid-2.42.3-hcfc3c73_0.conda
+Extracting lzo-2.10-hebe6cf0_1003.conda
+Extracting ncurses-6.6-hdb14827_1.conda
+Extracting openssl-3.6.4-h781a0a9_0.conda
+Extracting reproc-14.2.8.post0-hee9eb32_0.conda
+Extracting tk-8.6.13-noxft_h1df4ec4_4.conda
+Extracting cpp-expected-1.3.1-h171cf75_1.conda
+Extracting fmt-12.1.0-h76c4fd7_1.conda
+Extracting icu-78.3-py310h44b86e0_2.conda
+Extracting libedit-3.1.20250104-pl5321h373387f_1.conda
+Extracting libmsgpack-c-6.1.0-h54a6638_7.conda
+Extracting libnghttp2-1.68.1-h74cf4be_1.conda
+Extracting libpython-3.14.7-hdc7f604_106_cp314.conda
+Extracting libsolv-0.7.39-h72ddc62_1.conda
+Extracting libssh2-1.11.1-h6154650_1.conda
+Extracting lz4-c-1.10.0-hee9eb32_2.conda
+Extracting readline-8.3-hd6e31c0_1.conda
+Extracting reproc-cpp-14.2.8.post0-h1c70be6_0.conda
+Extracting simdjson-4.6.11-h4dbf13b_0.conda
+Extracting yaml-cpp-0.8.0-h54a6638_1.conda
+Extracting krb5-1.22.2-hbc21106_2.conda
+Extracting libpsl-0.23.1-hd9e3e90_1.conda
+Extracting libsqlite-3.53.4-h13e7031_1.conda
+Extracting libxml2-16-2.15.4-hf3af7cc_0.conda
+Extracting spdlog-1.17.0-hb6aa676_2.conda
+Extracting libcurl-8.22.0-ha042cf0_0.conda
+Extracting libxml2-2.15.4-h7df9aa5_0.conda
+Extracting python-3.14.7-hcd007b5_106_cp314.conda
+Extracting libarchive-3.8.9-gpl_h3152399_101.conda
+Extracting tomli-w-1.2.0-pyhd8ed1ab_0.conda
+Extracting libmamba-2.9.0-py314h6ba947b_0.conda
+Extracting menuinst-2.5.2-py314h9e666f3_2.conda
+Extracting archspec-0.2.5-pyhd8ed1ab_0.conda
+Extracting backports.zstd-1.7.0-py314h680f03e_1.conda
+Extracting boltons-26.2.0-pyhd8ed1ab_0.conda
+Extracting brotli-python-1.2.0-py314hcd2bdb6_4.conda
+Extracting cached_property-2.0.1-pyhcf101f3_0.conda
+Extracting certifi-2026.7.22-pyhd8ed1ab_0.conda
+Extracting charset-normalizer-3.5.1-pyhd8ed1ab_0.conda
+Extracting colorama-0.4.6-pyhd8ed1ab_1.conda
+Extracting cpython-3.14.7-py314hd8ed1ab_106.conda
+Extracting distro-1.9.0-pyhd8ed1ab_1.conda
+Extracting frozendict-2.4.7-pyh851646a_2.conda
+Extracting hpack-4.2.0-pyhd8ed1ab_0.conda
+Extracting hyperframe-6.1.0-pyhd8ed1ab_0.conda
+Extracting idna-3.19-pyhcf101f3_0.conda
+Extracting libmamba-spdlog-2.9.0-h5efa3ab_0.conda
+Extracting mamba-2.9.0-h9649d4f_0.conda
+Extracting markupsafe-3.0.3-py314h67df5f8_1.conda
+Extracting msgpack-python-1.2.2-py314h5383ef5_2.conda
+Extracting packaging-26.3-pyhc364b38_0.conda
+Extracting pip-26.2.1-pyh145f28c_0.conda
+Extracting platformdirs-4.11.6-pyh5ded981_0.conda
+Extracting pluggy-1.6.0-pyhf9edf01_1.conda
+Extracting pycosat-0.6.6-py314h89acca1_5.conda
+Extracting pysocks-1.7.1-pyha55dd90_7.conda
+Extracting python-installer-1.0.1-pyh332efcf_0.conda
+Extracting ruamel.yaml.clib-0.2.15-py314hfe1a184_5.conda
+Extracting setuptools-84.0.0-pyh332efcf_0.conda
+Extracting sniffio-1.3.1-pyhd8ed1ab_2.conda
+Extracting tomli-2.4.1-pyhcf101f3_0.conda
+Extracting tqdm-4.70.0-pyh8f84b5b_0.conda
+Extracting truststore-0.10.4-pyhcf101f3_0.conda
+Extracting typing_extensions-4.16.0-pyhcf101f3_0.conda
+Extracting zipp-4.1.0-pyhcf101f3_0.conda
+Extracting anyio-4.15.1-pyh5ded981_1.conda
+Extracting cached-property-2.0.1-pyhcf101f3_0.conda
+Extracting conda-package-streaming-0.13.0-pyhd8ed1ab_0.conda
+Extracting h11-0.16.0-pyhcf101f3_1.conda
+Extracting h2-4.4.1-pyhcf101f3_0.conda
+Extracting importlib-metadata-9.0.1-pyhcf101f3_0.conda
+Extracting jinja2-3.1.6-pyhcf101f3_1.conda
+Extracting libmambapy-2.9.0-py314h959206d_0.conda
+Extracting pyproject_hooks-1.2.0-pyhd8ed1ab_1.conda
+Extracting python-gil-3.14.7-h4df99d1_106.conda
+Extracting ruamel.yaml-0.19.1-pyhcf101f3_0.conda
+Extracting typing-extensions-4.16.0-h69aa097_0.conda
+Extracting typing-inspection-0.4.4-pyhcf101f3_0.conda
+Extracting _python_abi3_support-1.0-hd8ed1ab_3.conda
+Extracting annotated-types-0.8.0-pyhd8ed1ab_0.conda
+Extracting conda-libmamba-solver-26.7.0-pyhcf101f3_0.conda
+Extracting httpcore-1.0.9-pyh29332c3_0.conda
+Extracting pydantic-core-2.46.5-py314h7e8cd81_1.conda
+Extracting python-build-1.6.0-pyhc364b38_0.conda
+Extracting urllib3-2.7.0-pyhd8ed1ab_0.conda
+Extracting httpx-0.28.1-pyhd8ed1ab_0.conda
+Extracting py-rattler-0.25.0-py310hefeb9ab_5.conda
+Extracting pydantic-2.13.5-pyhcf101f3_0.conda
+Extracting requests-2.34.2-pyhcf101f3_0.conda
+Extracting conda-package-handling-2.6.0-pyh5ded981_0.conda
+Extracting unearth-0.18.3-pyhd8ed1ab_0.conda
+Extracting conda-index-0.13.0-pyh5ded981_0.conda
+Extracting conda-pypi-0.11.0-pyh5ded981_2.conda
+Extracting conda-lockfiles-0.2.1-pyhd8ed1ab_0.conda
+Extracting conda-rattler-solver-0.1.1-pyhcf101f3_0.conda
+Extracting conda-26.7.2-py314h9e666f3_1.conda
+Extracting conda-self-0.2.1-pyhd8ed1ab_0.conda
+
+Installing base environment...
+
+Transaction
+
+  Prefix: /opt/miniforge3
+
+  Updating specs:
+
+   - ca-certificates==2026.7.22=hbd8a1cb_0
+   - libgomp==16.2.0=he0feb66_4
+   - libzlib==1.3.2=h25fd6f3_3
+   - nlohmann_json-abi==3.12.0=h0f90c79_2
+   - pybind11-abi==11=hc364b38_1
+   - python_abi==3.14=9_cp314
+   - tzdata==2026c=h151e31d_0
+   - _openmp_mutex==4.5=20_gnu
+   - zstd==1.5.7=hb78ec9c_7
+   - ld_impl_linux-64==2.46.1=default_hbd61a6d_102
+   - libgcc==16.2.0=ha9f2e26_4
+   - bzip2==1.0.8=hda65f42_10
+   - c-ares==1.34.8=hebe6cf0_2
+   - keyutils==1.6.3=h7cc23a3_1
+   - libev==4.33=h280c20c_3
+   - libexpat==2.8.1=hecca717_1
+   - libffi==3.7.0=h81df57d_1
+   - libiconv==1.18=h0cb94f2_3
+   - liblzma==5.8.3=hb03c661_1
+   - libmpdec==4.0.0=hb03c661_2
+   - libstdcxx==16.2.0=h934c35e_4
+   - libuuid==2.42.3=hcfc3c73_0
+   - lzo==2.10=hebe6cf0_1003
+   - ncurses==6.6=hdb14827_1
+   - openssl==3.6.4=h781a0a9_0
+   - reproc==14.2.8.post0=hee9eb32_0
+   - tk==8.6.13=noxft_h1df4ec4_4
+   - cpp-expected==1.3.1=h171cf75_1
+   - fmt==12.1.0=h76c4fd7_1
+   - icu==78.3=py310h44b86e0_2
+   - libedit==3.1.20250104=pl5321h373387f_1
+   - libmsgpack-c==6.1.0=h54a6638_7
+   - libnghttp2==1.68.1=h74cf4be_1
+   - libpython==3.14.7=hdc7f604_106_cp314
+   - libsolv==0.7.39=h72ddc62_1
+   - libssh2==1.11.1=h6154650_1
+   - lz4-c==1.10.0=hee9eb32_2
+   - readline==8.3=hd6e31c0_1
+   - reproc-cpp==14.2.8.post0=h1c70be6_0
+   - simdjson==4.6.11=h4dbf13b_0
+   - yaml-cpp==0.8.0=h54a6638_1
+   - krb5==1.22.2=hbc21106_2
+   - libpsl==0.23.1=hd9e3e90_1
+   - libsqlite==3.53.4=h13e7031_1
+   - libxml2-16==2.15.4=hf3af7cc_0
+   - spdlog==1.17.0=hb6aa676_2
+   - libcurl==8.22.0=ha042cf0_0
+   - libxml2==2.15.4=h7df9aa5_0
+   - python==3.14.7=hcd007b5_106_cp314
+   - libarchive==3.8.9=gpl_h3152399_101
+   - tomli-w==1.2.0=pyhd8ed1ab_0
+   - libmamba==2.9.0=py314h6ba947b_0
+   - menuinst==2.5.2=py314h9e666f3_2
+   - archspec==0.2.5=pyhd8ed1ab_0
+   - backports.zstd==1.7.0=py314h680f03e_1
+   - boltons==26.2.0=pyhd8ed1ab_0
+   - brotli-python==1.2.0=py314hcd2bdb6_4
+   - cached_property==2.0.1=pyhcf101f3_0
+   - certifi==2026.7.22=pyhd8ed1ab_0
+   - charset-normalizer==3.5.1=pyhd8ed1ab_0
+   - colorama==0.4.6=pyhd8ed1ab_1
+   - cpython==3.14.7=py314hd8ed1ab_106
+   - distro==1.9.0=pyhd8ed1ab_1
+   - frozendict==2.4.7=pyh851646a_2
+   - hpack==4.2.0=pyhd8ed1ab_0
+   - hyperframe==6.1.0=pyhd8ed1ab_0
+   - idna==3.19=pyhcf101f3_0
+   - libmamba-spdlog==2.9.0=h5efa3ab_0
+   - mamba==2.9.0=h9649d4f_0
+   - markupsafe==3.0.3=py314h67df5f8_1
+   - msgpack-python==1.2.2=py314h5383ef5_2
+   - packaging==26.3=pyhc364b38_0
+   - pip==26.2.1=pyh145f28c_0
+   - platformdirs==4.11.6=pyh5ded981_0
+   - pluggy==1.6.0=pyhf9edf01_1
+   - pycosat==0.6.6=py314h89acca1_5
+   - pysocks==1.7.1=pyha55dd90_7
+   - python-installer==1.0.1=pyh332efcf_0
+   - ruamel.yaml.clib==0.2.15=py314hfe1a184_5
+   - setuptools==84.0.0=pyh332efcf_0
+   - sniffio==1.3.1=pyhd8ed1ab_2
+   - tomli==2.4.1=pyhcf101f3_0
+   - tqdm==4.70.0=pyh8f84b5b_0
+   - truststore==0.10.4=pyhcf101f3_0
+   - typing_extensions==4.16.0=pyhcf101f3_0
+   - zipp==4.1.0=pyhcf101f3_0
+   - anyio==4.15.1=pyh5ded981_1
+   - cached-property==2.0.1=pyhcf101f3_0
+   - conda-package-streaming==0.13.0=pyhd8ed1ab_0
+   - h11==0.16.0=pyhcf101f3_1
+   - h2==4.4.1=pyhcf101f3_0
+   - importlib-metadata==9.0.1=pyhcf101f3_0
+   - jinja2==3.1.6=pyhcf101f3_1
+   - libmambapy==2.9.0=py314h959206d_0
+   - pyproject_hooks==1.2.0=pyhd8ed1ab_1
+   - python-gil==3.14.7=h4df99d1_106
+   - ruamel.yaml==0.19.1=pyhcf101f3_0
+   - typing-extensions==4.16.0=h69aa097_0
+   - typing-inspection==0.4.4=pyhcf101f3_0
+   - _python_abi3_support==1.0=hd8ed1ab_3
+   - annotated-types==0.8.0=pyhd8ed1ab_0
+   - conda-libmamba-solver==26.7.0=pyhcf101f3_0
+   - httpcore==1.0.9=pyh29332c3_0
+   - pydantic-core==2.46.5=py314h7e8cd81_1
+   - python-build==1.6.0=pyhc364b38_0
+   - urllib3==2.7.0=pyhd8ed1ab_0
+   - httpx==0.28.1=pyhd8ed1ab_0
+   - py-rattler==0.25.0=py310hefeb9ab_5
+   - pydantic==2.13.5=pyhcf101f3_0
+   - requests==2.34.2=pyhcf101f3_0
+   - conda-package-handling==2.6.0=pyh5ded981_0
+   - unearth==0.18.3=pyhd8ed1ab_0
+   - conda-index==0.13.0=pyh5ded981_0
+   - conda-pypi==0.11.0=pyh5ded981_2
+   - conda-lockfiles==0.2.1=pyhd8ed1ab_0
+   - conda-rattler-solver==0.1.1=pyhcf101f3_0
+   - conda==26.7.2=py314h9e666f3_1
+   - conda-self==0.2.1=pyhd8ed1ab_0
+
+
+  Package                         Version  Build                 Channel         Size
+───────────────────────────────────────────────────────────────────────────────────────
+  Install:
+───────────────────────────────────────────────────────────────────────────────────────
+
+  + _openmp_mutex                     4.5  20_gnu                conda-forge         
+  + _python_abi3_support              1.0  hd8ed1ab_3            conda-forge         
+  + annotated-types                 0.8.0  pyhd8ed1ab_0          conda-forge         
+  + anyio                          4.15.1  pyh5ded981_1          conda-forge         
+  + archspec                        0.2.5  pyhd8ed1ab_0          conda-forge         
+  + backports.zstd                  1.7.0  py314h680f03e_1       conda-forge         
+  + boltons                        26.2.0  pyhd8ed1ab_0          conda-forge         
+  + brotli-python                   1.2.0  py314hcd2bdb6_4       conda-forge         
+  + bzip2                           1.0.8  hda65f42_10           conda-forge         
+  + c-ares                         1.34.8  hebe6cf0_2            conda-forge         
+  + ca-certificates             2026.7.22  hbd8a1cb_0            conda-forge         
+  + cached-property                 2.0.1  pyhcf101f3_0          conda-forge         
+  + cached_property                 2.0.1  pyhcf101f3_0          conda-forge         
+  + certifi                     2026.7.22  pyhd8ed1ab_0          conda-forge         
+  + charset-normalizer              3.5.1  pyhd8ed1ab_0          conda-forge         
+  + colorama                        0.4.6  pyhd8ed1ab_1          conda-forge         
+  + conda                          26.7.2  py314h9e666f3_1       conda-forge         
+  + conda-index                    0.13.0  pyh5ded981_0          conda-forge         
+  + conda-libmamba-solver          26.7.0  pyhcf101f3_0          conda-forge         
+  + conda-lockfiles                 0.2.1  pyhd8ed1ab_0          conda-forge         
+  + conda-package-handling          2.6.0  pyh5ded981_0          conda-forge         
+  + conda-package-streaming        0.13.0  pyhd8ed1ab_0          conda-forge         
+  + conda-pypi                     0.11.0  pyh5ded981_2          conda-forge         
+  + conda-rattler-solver            0.1.1  pyhcf101f3_0          conda-forge         
+  + conda-self                      0.2.1  pyhd8ed1ab_0          conda-forge         
+  + cpp-expected                    1.3.1  h171cf75_1            conda-forge         
+  + cpython                        3.14.7  py314hd8ed1ab_106     conda-forge         
+  + distro                          1.9.0  pyhd8ed1ab_1          conda-forge         
+  + fmt                            12.1.0  h76c4fd7_1            conda-forge         
+  + frozendict                      2.4.7  pyh851646a_2          conda-forge         
+  + h11                            0.16.0  pyhcf101f3_1          conda-forge         
+  + h2                              4.4.1  pyhcf101f3_0          conda-forge         
+  + hpack                           4.2.0  pyhd8ed1ab_0          conda-forge         
+  + httpcore                        1.0.9  pyh29332c3_0          conda-forge         
+  + httpx                          0.28.1  pyhd8ed1ab_0          conda-forge         
+  + hyperframe                      6.1.0  pyhd8ed1ab_0          conda-forge         
+  + icu                              78.3  py310h44b86e0_2       conda-forge         
+  + idna                             3.19  pyhcf101f3_0          conda-forge         
+  + importlib-metadata              9.0.1  pyhcf101f3_0          conda-forge         
+  + jinja2                          3.1.6  pyhcf101f3_1          conda-forge         
+  + keyutils                        1.6.3  h7cc23a3_1            conda-forge         
+  + krb5                           1.22.2  hbc21106_2            conda-forge         
+  + ld_impl_linux-64               2.46.1  default_hbd61a6d_102  conda-forge         
+  + libarchive                      3.8.9  gpl_h3152399_101      conda-forge         
+  + libcurl                        8.22.0  ha042cf0_0            conda-forge         
+  + libedit                  3.1.20250104  pl5321h373387f_1      conda-forge         
+  + libev                            4.33  h280c20c_3            conda-forge         
+  + libexpat                        2.8.1  hecca717_1            conda-forge         
+  + libffi                          3.7.0  h81df57d_1            conda-forge         
+  + libgcc                         16.2.0  ha9f2e26_4            conda-forge         
+  + libgomp                        16.2.0  he0feb66_4            conda-forge         
+  + libiconv                         1.18  h0cb94f2_3            conda-forge         
+  + liblzma                         5.8.3  hb03c661_1            conda-forge         
+  + libmamba                        2.9.0  py314h6ba947b_0       conda-forge         
+  + libmamba-spdlog                 2.9.0  h5efa3ab_0            conda-forge         
+  + libmambapy                      2.9.0  py314h959206d_0       conda-forge         
+  + libmpdec                        4.0.0  hb03c661_2            conda-forge         
+  + libmsgpack-c                    6.1.0  h54a6638_7            conda-forge         
+  + libnghttp2                     1.68.1  h74cf4be_1            conda-forge         
+  + libpsl                         0.23.1  hd9e3e90_1            conda-forge         
+  + libpython                      3.14.7  hdc7f604_106_cp314    conda-forge         
+  + libsolv                        0.7.39  h72ddc62_1            conda-forge         
+  + libsqlite                      3.53.4  h13e7031_1            conda-forge         
+  + libssh2                        1.11.1  h6154650_1            conda-forge         
+  + libstdcxx                      16.2.0  h934c35e_4            conda-forge         
+  + libuuid                        2.42.3  hcfc3c73_0            conda-forge         
+  + libxml2                        2.15.4  h7df9aa5_0            conda-forge         
+  + libxml2-16                     2.15.4  hf3af7cc_0            conda-forge         
+  + libzlib                         1.3.2  h25fd6f3_3            conda-forge         
+  + lz4-c                          1.10.0  hee9eb32_2            conda-forge         
+  + lzo                              2.10  hebe6cf0_1003         conda-forge         
+  + mamba                           2.9.0  h9649d4f_0            conda-forge         
+  + markupsafe                      3.0.3  py314h67df5f8_1       conda-forge         
+  + menuinst                        2.5.2  py314h9e666f3_2       conda-forge         
+  + msgpack-python                  1.2.2  py314h5383ef5_2       conda-forge         
+  + ncurses                           6.6  hdb14827_1            conda-forge         
+  + nlohmann_json-abi              3.12.0  h0f90c79_2            conda-forge         
+  + openssl                         3.6.4  h781a0a9_0            conda-forge         
+  + packaging                        26.3  pyhc364b38_0          conda-forge         
+  + pip                            26.2.1  pyh145f28c_0          conda-forge         
+  + platformdirs                   4.11.6  pyh5ded981_0          conda-forge         
+  + pluggy                          1.6.0  pyhf9edf01_1          conda-forge         
+  + py-rattler                     0.25.0  py310hefeb9ab_5       conda-forge         
+  + pybind11-abi                       11  hc364b38_1            conda-forge         
+  + pycosat                         0.6.6  py314h89acca1_5       conda-forge         
+  + pydantic                       2.13.5  pyhcf101f3_0          conda-forge         
+  + pydantic-core                  2.46.5  py314h7e8cd81_1       conda-forge         
+  + pyproject_hooks                 1.2.0  pyhd8ed1ab_1          conda-forge         
+  + pysocks                         1.7.1  pyha55dd90_7          conda-forge         
+  + python                         3.14.7  hcd007b5_106_cp314    conda-forge         
+  + python-build                    1.6.0  pyhc364b38_0          conda-forge         
+  + python-gil                     3.14.7  h4df99d1_106          conda-forge         
+  + python-installer                1.0.1  pyh332efcf_0          conda-forge         
+  + python_abi                       3.14  9_cp314               conda-forge         
+  + readline                          8.3  hd6e31c0_1            conda-forge         
+  + reproc                   14.2.8.post0  hee9eb32_0            conda-forge         
+  + reproc-cpp               14.2.8.post0  h1c70be6_0            conda-forge         
+  + requests                       2.34.2  pyhcf101f3_0          conda-forge         
+  + ruamel.yaml                    0.19.1  pyhcf101f3_0          conda-forge         
+  + ruamel.yaml.clib               0.2.15  py314hfe1a184_5       conda-forge         
+  + setuptools                     84.0.0  pyh332efcf_0          conda-forge         
+  + simdjson                       4.6.11  h4dbf13b_0            conda-forge         
+  + sniffio                         1.3.1  pyhd8ed1ab_2          conda-forge         
+  + spdlog                         1.17.0  hb6aa676_2            conda-forge         
+  + tk                             8.6.13  noxft_h1df4ec4_4      conda-forge         
+  + tomli                           2.4.1  pyhcf101f3_0          conda-forge         
+  + tomli-w                         1.2.0  pyhd8ed1ab_0          conda-forge         
+  + tqdm                           4.70.0  pyh8f84b5b_0          conda-forge         
+  + truststore                     0.10.4  pyhcf101f3_0          conda-forge         
+  + typing-extensions              4.16.0  h69aa097_0            conda-forge         
+  + typing-inspection               0.4.4  pyhcf101f3_0          conda-forge         
+  + typing_extensions              4.16.0  pyhcf101f3_0          conda-forge         
+  + tzdata                          2026c  h151e31d_0            conda-forge         
+  + unearth                        0.18.3  pyhd8ed1ab_0          conda-forge         
+  + urllib3                         2.7.0  pyhd8ed1ab_0          conda-forge         
+  + yaml-cpp                        0.8.0  h54a6638_1            conda-forge         
+  + zipp                            4.1.0  pyhcf101f3_0          conda-forge         
+  + zstd                            1.5.7  hb78ec9c_7            conda-forge         
+
+  Summary:
+
+  Install: 118 packages
+
+  Total download: 0 B
+
+───────────────────────────────────────────────────────────────────────────────────────
+
+
+warning  libmamba Security Warning: This transaction includes executing package scripts (pre/post-link/unlink) if present. These scripts can contain arbitrary code. Please ensure you trust the package sources.
+
+Transaction starting
+Linking ca-certificates-2026.7.22-hbd8a1cb_0
+Linking libgomp-16.2.0-he0feb66_4
+Linking libzlib-1.3.2-h25fd6f3_3
+Linking nlohmann_json-abi-3.12.0-h0f90c79_2
+Linking pybind11-abi-11-hc364b38_1
+Linking python_abi-3.14-9_cp314
+Linking tzdata-2026c-h151e31d_0
+Linking _openmp_mutex-4.5-20_gnu
+Linking zstd-1.5.7-hb78ec9c_7
+Linking ld_impl_linux-64-2.46.1-default_hbd61a6d_102
+Linking libgcc-16.2.0-ha9f2e26_4
+Linking bzip2-1.0.8-hda65f42_10
+Linking c-ares-1.34.8-hebe6cf0_2
+Linking keyutils-1.6.3-h7cc23a3_1
+Linking libev-4.33-h280c20c_3
+Linking libexpat-2.8.1-hecca717_1
+Linking libffi-3.7.0-h81df57d_1
+Linking libiconv-1.18-h0cb94f2_3
+Linking liblzma-5.8.3-hb03c661_1
+Linking libmpdec-4.0.0-hb03c661_2
+Linking libstdcxx-16.2.0-h934c35e_4
+Linking libuuid-2.42.3-hcfc3c73_0
+Linking lzo-2.10-hebe6cf0_1003
+Linking ncurses-6.6-hdb14827_1
+Linking openssl-3.6.4-h781a0a9_0
+Linking reproc-14.2.8.post0-hee9eb32_0
+Linking tk-8.6.13-noxft_h1df4ec4_4
+Linking cpp-expected-1.3.1-h171cf75_1
+Linking fmt-12.1.0-h76c4fd7_1
+Linking icu-78.3-py310h44b86e0_2
+Linking libedit-3.1.20250104-pl5321h373387f_1
+Linking libmsgpack-c-6.1.0-h54a6638_7
+Linking libnghttp2-1.68.1-h74cf4be_1
+Linking libpython-3.14.7-hdc7f604_106_cp314
+Linking libsolv-0.7.39-h72ddc62_1
+Linking libssh2-1.11.1-h6154650_1
+Linking lz4-c-1.10.0-hee9eb32_2
+Linking readline-8.3-hd6e31c0_1
+Linking reproc-cpp-14.2.8.post0-h1c70be6_0
+Linking simdjson-4.6.11-h4dbf13b_0
+Linking yaml-cpp-0.8.0-h54a6638_1
+Linking krb5-1.22.2-hbc21106_2
+Linking libpsl-0.23.1-hd9e3e90_1
+Linking libsqlite-3.53.4-h13e7031_1
+Linking libxml2-16-2.15.4-hf3af7cc_0
+Linking spdlog-1.17.0-hb6aa676_2
+Linking libcurl-8.22.0-ha042cf0_0
+Linking libxml2-2.15.4-h7df9aa5_0
+Linking python-3.14.7-hcd007b5_106_cp314
+Linking libarchive-3.8.9-gpl_h3152399_101
+Linking tomli-w-1.2.0-pyhd8ed1ab_0
+Linking libmamba-2.9.0-py314h6ba947b_0
+Linking menuinst-2.5.2-py314h9e666f3_2
+Linking archspec-0.2.5-pyhd8ed1ab_0
+Linking backports.zstd-1.7.0-py314h680f03e_1
+Linking boltons-26.2.0-pyhd8ed1ab_0
+Linking brotli-python-1.2.0-py314hcd2bdb6_4
+Linking cached_property-2.0.1-pyhcf101f3_0
+Linking certifi-2026.7.22-pyhd8ed1ab_0
+Linking charset-normalizer-3.5.1-pyhd8ed1ab_0
+Linking colorama-0.4.6-pyhd8ed1ab_1
+Linking cpython-3.14.7-py314hd8ed1ab_106
+Linking distro-1.9.0-pyhd8ed1ab_1
+Linking frozendict-2.4.7-pyh851646a_2
+Linking hpack-4.2.0-pyhd8ed1ab_0
+Linking hyperframe-6.1.0-pyhd8ed1ab_0
+Linking idna-3.19-pyhcf101f3_0
+Linking libmamba-spdlog-2.9.0-h5efa3ab_0
+Linking mamba-2.9.0-h9649d4f_0
+Linking markupsafe-3.0.3-py314h67df5f8_1
+Linking msgpack-python-1.2.2-py314h5383ef5_2
+Linking packaging-26.3-pyhc364b38_0
+Linking pip-26.2.1-pyh145f28c_0
+Linking platformdirs-4.11.6-pyh5ded981_0
+Linking pluggy-1.6.0-pyhf9edf01_1
+Linking pycosat-0.6.6-py314h89acca1_5
+Linking pysocks-1.7.1-pyha55dd90_7
+Linking python-installer-1.0.1-pyh332efcf_0
+Linking ruamel.yaml.clib-0.2.15-py314hfe1a184_5
+Linking setuptools-84.0.0-pyh332efcf_0
+Linking sniffio-1.3.1-pyhd8ed1ab_2
+Linking tomli-2.4.1-pyhcf101f3_0
+Linking tqdm-4.70.0-pyh8f84b5b_0
+Linking truststore-0.10.4-pyhcf101f3_0
+Linking typing_extensions-4.16.0-pyhcf101f3_0
+Linking zipp-4.1.0-pyhcf101f3_0
+Linking anyio-4.15.1-pyh5ded981_1
+Linking cached-property-2.0.1-pyhcf101f3_0
+Linking conda-package-streaming-0.13.0-pyhd8ed1ab_0
+Linking h11-0.16.0-pyhcf101f3_1
+Linking h2-4.4.1-pyhcf101f3_0
+Linking importlib-metadata-9.0.1-pyhcf101f3_0
+Linking jinja2-3.1.6-pyhcf101f3_1
+Linking libmambapy-2.9.0-py314h959206d_0
+Linking pyproject_hooks-1.2.0-pyhd8ed1ab_1
+Linking python-gil-3.14.7-h4df99d1_106
+Linking ruamel.yaml-0.19.1-pyhcf101f3_0
+Linking typing-extensions-4.16.0-h69aa097_0
+Linking typing-inspection-0.4.4-pyhcf101f3_0
+Linking _python_abi3_support-1.0-hd8ed1ab_3
+Linking annotated-types-0.8.0-pyhd8ed1ab_0
+Linking conda-libmamba-solver-26.7.0-pyhcf101f3_0
+Linking httpcore-1.0.9-pyh29332c3_0
+Linking pydantic-core-2.46.5-py314h7e8cd81_1
+Linking python-build-1.6.0-pyhc364b38_0
+Linking urllib3-2.7.0-pyhd8ed1ab_0
+Linking httpx-0.28.1-pyhd8ed1ab_0
+Linking py-rattler-0.25.0-py310hefeb9ab_5
+Linking pydantic-2.13.5-pyhcf101f3_0
+Linking requests-2.34.2-pyhcf101f3_0
+Linking conda-package-handling-2.6.0-pyh5ded981_0
+Linking unearth-0.18.3-pyhd8ed1ab_0
+Linking conda-index-0.13.0-pyh5ded981_0
+Linking conda-pypi-0.11.0-pyh5ded981_2
+Linking conda-lockfiles-0.2.1-pyhd8ed1ab_0
+Linking conda-rattler-solver-0.1.1-pyhcf101f3_0
+Linking conda-26.7.2-py314h9e666f3_1
+Linking conda-self-0.2.1-pyhd8ed1ab_0
+
+Transaction finished
+
+installation finished.
++ '[' -d /opt/miniforge3/envs/cuvs_dev ']'
++ sudo /opt/miniforge3/bin/mamba create -y -n cuvs_dev -c rapidsai -c conda-forge -c nvidia libcuvs=26.04 librmm cuda-version=12.4 cuda-nvcc cuda-cudart-dev
+Fetch Shard Index for conda-forge/linux-64                                                      ⧖ Starting
+Fetch Shard Index for conda-forge/linux-64                                                ✔ Done (0.1 sec)
+Fetch Shard Index for conda-forge/noarch                                                        ⧖ Starting
+Fetch Shard Index for conda-forge/noarch                                                  ✔ Done (0.1 sec)
+Fetching and Parsing Packages' Shards                                                           ⧖ Starting
+Fetching and Parsing Packages' Shards                                                     ✔ Done (2.8 sec)
+Fetch Shard Index for rapidsai/linux-64                                                         ⧖ Starting
+Fetch Shard Index for rapidsai/linux-64                                                   ✔ Done (0.0 sec)
+Fetch Shard Index for rapidsai/noarch                                                           ⧖ Starting
+Fetch Shard Index for rapidsai/noarch                                                     ✔ Done (0.0 sec)
+Fetching and Parsing Packages' Shards                                                           ⧖ Starting
+Fetching and Parsing Packages' Shards                                                     ✔ Done (0.3 sec)
+Using Cached Shard Index for rapidsai/noarch                                                        ✔ Done
+Using Cached Shard Index for rapidsai/linux-64                                                      ✔ Done
+Fetching and Parsing Packages' Shards                                                           ⧖ Starting
+Fetching and Parsing Packages' Shards                                                     ✔ Done (0.0 sec)
+Using Flat Repodata for rapidsai/noarch                                                         ✔ Starting
+Using Flat Repodata for rapidsai/noarch                                                   ✔ Done (0.0 sec)
+Fetch Shard Index for nvidia/linux-64                                                           ⧖ Starting
+Fetch Shard Index for nvidia/linux-64                                                     ✔ Done (0.1 sec)
+Fetch Shard Index for nvidia/noarch                                                             ⧖ Starting
+Fetch Shard Index for nvidia/noarch                                                       ✔ Done (0.0 sec)
+Fetching and Parsing Packages' Shards                                                           ⧖ Starting
+Fetching and Parsing Packages' Shards                                                     ✔ Done (1.2 sec)
+Using Cached Shard Index for conda-forge/linux-64                                                   ✔ Done
+Using Cached Shard Index for conda-forge/noarch                                                     ✔ Done
+Fetching and Parsing Packages' Shards                                                           ⧖ Starting
+Fetching and Parsing Packages' Shards                                                     ✔ Done (3.8 sec)
+Using Cached Shard Index for rapidsai/linux-64                                                      ✔ Done
+Using Cached Shard Index for rapidsai/noarch                                                        ✔ Done
+Fetching and Parsing Packages' Shards                                                           ⧖ Starting
+Fetching and Parsing Packages' Shards                                                     ✔ Done (0.0 sec)
+Using Cached Shard Index for rapidsai/noarch                                                        ✔ Done
+Using Cached Shard Index for rapidsai/linux-64                                                      ✔ Done
+Fetching and Parsing Packages' Shards                                                           ⧖ Starting
+Fetching and Parsing Packages' Shards                                                     ✔ Done (0.0 sec)
+Using Flat Repodata for rapidsai/noarch                                                         ✔ Starting
+Using Flat Repodata for rapidsai/noarch                                                   ✔ Done (0.0 sec)
+Using Cached Shard Index for nvidia/linux-64                                                        ✔ Done
+Using Cached Shard Index for nvidia/noarch                                                          ✔ Done
+Fetching and Parsing Packages' Shards                                                           ⧖ Starting
+Fetching and Parsing Packages' Shards                                                     ✔ Done (0.2 sec)
+Parsing Packages' Records                                                                 ✔ Done (5.5 sec)
+
+Resolving Environment                                                                           ⧖ Starting
+Resolving Environment                                                                     ✔ Done (0.3 sec)
+
+Transaction
+
+  Prefix: /opt/miniforge3/envs/cuvs_dev
+
+  Updating specs:
+
+   - libcuvs=26.4
+   - librmm
+   - cuda-version=12.4
+   - cuda-nvcc
+   - cuda-cudart-dev
+
+
+  Package                           Version  Build                              Channel           Size
+────────────────────────────────────────────────────────────────────────────────────────────────────────
+  Install:
+────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+  + _openmp_mutex                       4.5  20_gnu                             conda-forge     Cached
+  + _python_abi3_support                1.0  hd8ed1ab_3                         conda-forge     Cached
+  + binutils_impl_linux-64           2.46.1  default_hfdba357_103               conda-forge        4MB
+  + binutils_linux-64                2.46.1  default_h4852527_103               conda-forge       36kB
+  + bzip2                             1.0.8  hda65f42_10                        conda-forge     Cached
+  + ca-certificates              2026.10.19  hbd8a1cb_0                         conda-forge      131kB
+  + cpython                          3.14.8  py314hd8ed1ab_102                  conda-forge       52kB
+  + cuda-bindings                    12.9.9  py314hf3783bd_0                    conda-forge        5MB
+  + cuda-cccl_linux-64             12.4.127  ha770c72_2                         conda-forge        1MB
+  + cuda-core                         1.2.2  cuda12_py314hb354cc7_0             conda-forge        2MB
+  + cuda-crt-dev_linux-64          12.4.131  ha770c72_1                         conda-forge       88kB
+  + cuda-crt-tools                 12.4.131  ha770c72_1                         conda-forge       26kB
+  + cuda-cudart                    12.4.127  he02047a_2                         conda-forge       23kB
+  + cuda-cudart-dev                12.4.127  he02047a_2                         conda-forge       23kB
+  + cuda-cudart-dev_linux-64       12.4.127  h85509e4_2                         conda-forge      358kB
+  + cuda-cudart-static             12.4.127  he02047a_2                         conda-forge       23kB
+  + cuda-cudart-static_linux-64    12.4.127  h85509e4_2                         conda-forge      742kB
+  + cuda-cudart_linux-64           12.4.127  h85509e4_2                         conda-forge      187kB
+  + cuda-driver-dev_linux-64       12.4.127  h85509e4_2                         conda-forge       36kB
+  + cuda-nvcc                      12.4.131  hcdd1206_1                         conda-forge       24kB
+  + cuda-nvcc-dev_linux-64         12.4.131  ha770c72_1                         conda-forge       11MB
+  + cuda-nvcc-impl                 12.4.131  hd3aeb46_1                         conda-forge       25kB
+  + cuda-nvcc-tools                12.4.131  hd3aeb46_1                         conda-forge       24MB
+  + cuda-nvcc_linux-64             12.4.131  h8a487aa_1                         conda-forge       25kB
+  + cuda-nvrtc                     12.4.127  he02047a_2                         conda-forge       19MB
+  + cuda-nvvm-dev_linux-64         12.4.131  ha770c72_1                         conda-forge       24kB
+  + cuda-nvvm-impl                 12.4.131  h59595ed_1                         conda-forge        9MB
+  + cuda-nvvm-tools                12.4.131  h59595ed_1                         conda-forge       12MB
+  + cuda-pathfinder                   1.8.3  pyhc364b38_0                       conda-forge       53kB
+  + cuda-profiler-api              12.4.127  ha770c72_2                         conda-forge       23kB
+  + cuda-python                      12.9.9  py_min_310_0                       conda-forge       21kB
+  + cuda-version                       12.4  h3060b56_3                         conda-forge       21kB
+  + gcc_impl_linux-64                12.4.0  h26ba24d_2                         conda-forge       60MB
+  + gcc_linux-64                     12.4.0  h6b7512a_10                        conda-forge       33kB
+  + gxx_impl_linux-64                12.4.0  h3ff227c_2                         conda-forge       13MB
+  + gxx_linux-64                     12.4.0  h8489865_10                        conda-forge       31kB
+  + kernel-headers_linux-64          5.14.0  he073ed8_3                         conda-forge        1MB
+  + ld_impl_linux-64                 2.46.1  default_hbd61a6d_103               conda-forge      742kB
+  + libblas                          3.11.0  11_h4a7cf45_openblas               conda-forge       18kB
+  + libcap                             2.78  h084b8d7_1                         conda-forge      124kB
+  + libcblas                         3.11.0  11_h0358290_openblas               conda-forge       18kB
+  + libcublas                      12.4.5.8  he02047a_2                         conda-forge      241MB
+  + libcublas-dev                  12.4.5.8  he02047a_2                         conda-forge       90kB
+  + libcufile                       1.9.1.3  he02047a_2                         conda-forge      924kB
+  + libcurand                    10.3.5.147  he02047a_2                         conda-forge       42MB
+  + libcurand-dev                10.3.5.147  he02047a_2                         conda-forge      264kB
+  + libcusolver                    11.6.1.9  he02047a_2                         conda-forge       82MB
+  + libcusolver-dev                11.6.1.9  he02047a_2                         conda-forge       61kB
+  + libcusparse                  12.3.1.170  he02047a_2                         conda-forge      118MB
+  + libcusparse-dev              12.3.1.170  he02047a_2                         conda-forge       52kB
+  + libcuvs                        26.04.00  cuda12_260408_60b19a0f             rapidsai         330MB
+  + libcuvs-headers                26.04.00  cuda12_260408_60b19a0f             rapidsai         102kB
+  + libexpat                          2.8.5  hd2095e1_0                         conda-forge       78kB
+  + libffi                            3.7.0  h81df57d_1                         conda-forge     Cached
+  + libgcc                           16.2.0  ha9f2e26_7                         conda-forge        1MB
+  + libgcc-devel_linux-64            12.4.0  h1762d19_102                       conda-forge        3MB
+  + libgcc-ng                        16.2.0  h69a702a_7                         conda-forge       29kB
+  + libgfortran                      16.2.0  h69a702a_7                         conda-forge       29kB
+  + libgfortran5                     16.2.0  h6b99dfc_7                         conda-forge        3MB
+  + libgomp                          16.2.0  he0feb66_7                         conda-forge      641kB
+  + liblapack                        3.11.0  11_h47877c9_openblas               conda-forge       18kB
+  + liblzma                           5.8.3  hb03c661_1                         conda-forge     Cached
+  + libmpdec                          4.0.0  hb03c661_2                         conda-forge     Cached
+  + libnl                            3.11.0  hb03c661_1                         conda-forge      735kB
+  + libnvjitlink                    12.9.86  hecca717_2                         conda-forge       31MB
+  + libopenblas                      0.3.34  pthreads_hf13c14d_2                conda-forge        7MB
+  + libpython                        3.14.8  hd51c5da_102_cp314                 conda-forge       11MB
+  + libraft-headers                26.04.00  cuda12_260408_b01e3028             rapidsai          18kB
+  + libraft-headers-only           26.04.00  cuda12_260408_b01e3028             rapidsai         424kB
+  + librmm                         26.04.00  cuda12_260408_48b36cc6             rapidsai           2MB
+  + libsanitizer                     12.4.0  ha732cd4_2                         conda-forge        4MB
+  + libsqlite                        3.54.1  h0737f62_100                       conda-forge      980kB
+  + libstdcxx                        16.2.0  h934c35e_7                         conda-forge        7MB
+  + libstdcxx-devel_linux-64         12.4.0  h1762d19_102                       conda-forge       12MB
+  + libstdcxx-ng                     16.2.0  hdf11a46_7                         conda-forge       29kB
+  + libsystemd0                       262.1  h26e0ef7_0                         conda-forge      575kB
+  + libucxx                         0.49.00  cuda12_260408_8d47a9ff             rapidsai         368kB
+  + libudev1                          262.1  h26e0ef7_0                         conda-forge      185kB
+  + libuuid                          2.42.4  hcfc3c73_0                         conda-forge       34kB
+  + libzlib                           1.3.2  h25fd6f3_3                         conda-forge     Cached
+  + nccl                           2.32.3.1  h4d09622_0                         conda-forge      333MB
+  + ncurses                             6.6  hdb14827_1                         conda-forge     Cached
+  + numpy                             2.5.4  py314hd3a7d6b_0                    conda-forge        9MB
+  + nvidia-ml-py                  13.615.71  pyhd8ed1ab_0                       conda-forge       56kB
+  + openssl                           3.6.5  h781a0a9_0                         conda-forge        3MB
+  + python                           3.14.8  hcd007b5_102_cp314                 conda-forge       27MB
+  + python-gil                       3.14.8  h4df99d1_102                       conda-forge       52kB
+  + python_abi                         3.14  9_cp314                            conda-forge     Cached
+  + rapids-logger                     0.2.3  h98325ef_0                         rapidsai         162kB
+  + rdma-core                          65.0  h7b4f2e6_0                         conda-forge        1MB
+  + readline                            8.3  hd6e31c0_1                         conda-forge     Cached
+  + rmm                            26.04.00  cuda12_cp311_abi3_260408_48b36cc6  rapidsai         464kB
+  + sysroot_linux-64                   2.34  h087de78_3                         conda-forge       41MB
+  + tk                               8.6.13  noxft_h1df4ec4_4                   conda-forge     Cached
+  + tzdata                            2026c  h151e31d_0                         conda-forge     Cached
+  + ucx                              1.20.1  hbe80e26_0                         conda-forge        8MB
+  + ucxx                            0.49.00  cuda12_cp311_abi3_260408_8d47a9ff  rapidsai         423kB
+  + zstd                              1.5.7  hb78ec9c_7                         conda-forge     Cached
+
+  Summary:
+
+  Install: 98 packages
+
+  Total download: 1GB
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+
+warning  libmamba Security Warning: This transaction includes executing package scripts (pre/post-link/unlink) if present. These scripts can contain arbitrary code. Please ensure you trust the package sources.
+
+Transaction starting
+Linking cuda-version-12.4-h3060b56_3
+Linking python_abi-3.14-9_cp314
+Linking tzdata-2026c-h151e31d_0
+Linking kernel-headers_linux-64-5.14.0-he073ed8_3
+Linking ca-certificates-2026.10.19-hbd8a1cb_0
+Linking libgcc-devel_linux-64-12.4.0-h1762d19_102
+Linking libstdcxx-devel_linux-64-12.4.0-h1762d19_102
+Linking cuda-driver-dev_linux-64-12.4.127-h85509e4_2
+Linking cuda-cccl_linux-64-12.4.127-ha770c72_2
+Linking cuda-crt-dev_linux-64-12.4.131-ha770c72_1
+Linking cuda-nvvm-dev_linux-64-12.4.131-ha770c72_1
+Linking cuda-cudart_linux-64-12.4.127-h85509e4_2
+Linking cuda-cudart-static_linux-64-12.4.127-h85509e4_2
+Linking sysroot_linux-64-2.34-h087de78_3
+Linking cuda-cudart-dev_linux-64-12.4.127-h85509e4_2
+Linking libgomp-16.2.0-he0feb66_7
+Linking libzlib-1.3.2-h25fd6f3_3
+Linking cuda-crt-tools-12.4.131-ha770c72_1
+Linking _openmp_mutex-4.5-20_gnu
+Linking zstd-1.5.7-hb78ec9c_7
+Linking libgcc-16.2.0-ha9f2e26_7
+Linking ld_impl_linux-64-2.46.1-default_hbd61a6d_103
+Linking libgfortran5-16.2.0-h6b99dfc_7
+Linking libcap-2.78-h084b8d7_1
+Linking libnl-3.11.0-hb03c661_1
+Linking bzip2-1.0.8-hda65f42_10
+Linking openssl-3.6.5-h781a0a9_0
+Linking libffi-3.7.0-h81df57d_1
+Linking libsqlite-3.54.1-h0737f62_100
+Linking libmpdec-4.0.0-hb03c661_2
+Linking liblzma-5.8.3-hb03c661_1
+Linking ncurses-6.6-hdb14827_1
+Linking tk-8.6.13-noxft_h1df4ec4_4
+Linking libexpat-2.8.5-hd2095e1_0
+Linking libuuid-2.42.4-hcfc3c73_0
+Linking libpython-3.14.8-hd51c5da_102_cp314
+Linking libgcc-ng-16.2.0-h69a702a_7
+Linking libstdcxx-16.2.0-h934c35e_7
+Linking binutils_impl_linux-64-2.46.1-default_hfdba357_103
+Linking libgfortran-16.2.0-h69a702a_7
+Linking libudev1-262.1-h26e0ef7_0
+Linking libsystemd0-262.1-h26e0ef7_0
+Linking readline-8.3-hd6e31c0_1
+Linking libsanitizer-12.4.0-ha732cd4_2
+Linking libnvjitlink-12.9.86-hecca717_2
+Linking nccl-2.32.3.1-h4d09622_0
+Linking libstdcxx-ng-16.2.0-hdf11a46_7
+Linking binutils_linux-64-2.46.1-default_h4852527_103
+Linking libopenblas-0.3.34-pthreads_hf13c14d_2
+Linking rdma-core-65.0-h7b4f2e6_0
+Linking python-3.14.8-hcd007b5_102_cp314
+Linking gcc_impl_linux-64-12.4.0-h26ba24d_2
+Linking libcufile-1.9.1.3-he02047a_2
+Linking cuda-nvrtc-12.4.127-he02047a_2
+Linking cuda-nvvm-tools-12.4.131-h59595ed_1
+Linking cuda-nvvm-impl-12.4.131-h59595ed_1
+Linking libcurand-10.3.5.147-he02047a_2
+Linking libcusparse-12.3.1.170-he02047a_2
+Linking cuda-cudart-12.4.127-he02047a_2
+Linking cuda-cudart-static-12.4.127-he02047a_2
+Linking libblas-3.11.0-11_h4a7cf45_openblas
+Linking ucx-1.20.1-hbe80e26_0
+warning  libmamba Executing post-link script for package 'ucx'.
+
+To enable CUDA support, UCX requires the CUDA Runtime library (libcudart).
+The library can be installed with the appropriate command below:
+
+* For CUDA 12, run:    conda install cuda-cudart cuda-version=12
+* For CUDA 13, run:    conda install cuda-cudart cuda-version=13
+
+If any of the packages you requested use CUDA then CUDA should already
+have been installed for you.
+
+
+Linking gxx_impl_linux-64-12.4.0-h3ff227c_2
+Linking gcc_linux-64-12.4.0-h6b7512a_10
+Linking libcublas-12.4.5.8-he02047a_2
+Linking cuda-nvcc-tools-12.4.131-hd3aeb46_1
+Linking libcurand-dev-10.3.5.147-he02047a_2
+Linking libcusparse-dev-12.3.1.170-he02047a_2
+Linking cuda-cudart-dev-12.4.127-he02047a_2
+Linking liblapack-3.11.0-11_h47877c9_openblas
+Linking libcblas-3.11.0-11_h0358290_openblas
+Linking gxx_linux-64-12.4.0-h8489865_10
+Linking libcusolver-11.6.1.9-he02047a_2
+Linking libcublas-dev-12.4.5.8-he02047a_2
+Linking cuda-profiler-api-12.4.127-ha770c72_2
+Linking numpy-2.5.4-py314hd3a7d6b_0
+Linking libcusolver-dev-11.6.1.9-he02047a_2
+Linking cuda-nvcc-dev_linux-64-12.4.131-ha770c72_1
+Linking cuda-pathfinder-1.8.3-pyhc364b38_0
+Linking cpython-3.14.8-py314hd8ed1ab_102
+Linking nvidia-ml-py-13.615.71-pyhd8ed1ab_0
+Linking python-gil-3.14.8-h4df99d1_102
+Linking _python_abi3_support-1.0-hd8ed1ab_3
+Linking rapids-logger-0.2.3-h98325ef_0
+Linking librmm-26.04.00-cuda12_260408_48b36cc6
+Linking libucxx-0.49.00-cuda12_260408_8d47a9ff
+Linking libraft-headers-only-26.04.00-cuda12_260408_b01e3028
+Linking cuda-nvcc-impl-12.4.131-hd3aeb46_1
+Linking cuda-nvcc_linux-64-12.4.131-h8a487aa_1
+Linking cuda-bindings-12.9.9-py314hf3783bd_0
+Linking cuda-nvcc-12.4.131-hcdd1206_1
+Linking cuda-core-1.2.2-cuda12_py314hb354cc7_0
+Linking cuda-python-12.9.9-py_min_310_0
+Linking rmm-26.04.00-cuda12_cp311_abi3_260408_48b36cc6
+Linking ucxx-0.49.00-cuda12_cp311_abi3_260408_8d47a9ff
+Linking libraft-headers-26.04.00-cuda12_260408_b01e3028
+Linking libcuvs-headers-26.04.00-cuda12_260408_60b19a0f
+Linking libcuvs-26.04.00-cuda12_260408_60b19a0f
+
+Transaction finished
+
+
+To activate this environment, use:
+
+    mamba activate cuvs_dev
+
+Or to execute a single command in this environment, use:
+
+    mamba run -n cuvs_dev mycommand
+
++ '[' -d /opt/miniforge3/envs/cuvs_bench ']'
++ sudo /opt/miniforge3/bin/mamba create -y -n cuvs_bench -c rapidsai -c conda-forge -c nvidia python=3.12 cuvs-bench=26.04 psycopg2 numpy pandas
+Using Cached Shard Index for conda-forge/linux-64                                                   ✔ Done
+Using Cached Shard Index for conda-forge/noarch                                                     ✔ Done
+Fetching and Parsing Packages' Shards                                                           ⧖ Starting
+Fetching and Parsing Packages' Shards                                                    ✔ Done (16.0 sec)
+Using Cached Shard Index for rapidsai/linux-64                                                      ✔ Done
+Using Cached Shard Index for rapidsai/noarch                                                        ✔ Done
+Fetching and Parsing Packages' Shards                                                           ⧖ Starting
+Fetching and Parsing Packages' Shards                                                     ✔ Done (0.3 sec)
+Using Cached Shard Index for rapidsai/noarch                                                        ✔ Done
+Using Cached Shard Index for rapidsai/linux-64                                                      ✔ Done
+Fetching and Parsing Packages' Shards                                                           ⧖ Starting
+Fetching and Parsing Packages' Shards                                                     ✔ Done (0.0 sec)
+Using Flat Repodata for rapidsai/noarch                                                         ✔ Starting
+Using Flat Repodata for rapidsai/noarch                                                   ✔ Done (0.0 sec)
+Using Cached Shard Index for nvidia/linux-64                                                        ✔ Done
+Using Cached Shard Index for nvidia/noarch                                                          ✔ Done
+Fetching and Parsing Packages' Shards                                                           ⧖ Starting
+Fetching and Parsing Packages' Shards                                                     ✔ Done (0.2 sec)
+Using Cached Shard Index for conda-forge/linux-64                                                   ✔ Done
+Using Cached Shard Index for conda-forge/noarch                                                     ✔ Done
+Fetching and Parsing Packages' Shards                                                           ⧖ Starting
+Fetching and Parsing Packages' Shards                                                     ✔ Done (0.9 sec)
+Using Cached Shard Index for rapidsai/linux-64                                                      ✔ Done
+Using Cached Shard Index for rapidsai/noarch                                                        ✔ Done
+Fetching and Parsing Packages' Shards                                                           ⧖ Starting
+Fetching and Parsing Packages' Shards                                                     ✔ Done (0.0 sec)
+Using Cached Shard Index for rapidsai/noarch                                                        ✔ Done
+Using Cached Shard Index for rapidsai/linux-64                                                      ✔ Done
+Fetching and Parsing Packages' Shards                                                           ⧖ Starting
+Fetching and Parsing Packages' Shards                                                     ✔ Done (0.0 sec)
+Using Flat Repodata for rapidsai/noarch                                                         ✔ Starting
+Using Flat Repodata for rapidsai/noarch                                                   ✔ Done (0.0 sec)
+Using Cached Shard Index for nvidia/linux-64                                                        ✔ Done
+Using Cached Shard Index for nvidia/noarch                                                          ✔ Done
+Fetching and Parsing Packages' Shards                                                           ⧖ Starting
+Fetching and Parsing Packages' Shards                                                     ✔ Done (0.0 sec)
+Parsing Packages' Records                                                                 ✔ Done (1.8 sec)
+
+Resolving Environment                                                                           ⧖ Starting
+Resolving Environment                                                                     ✔ Done (0.3 sec)
+
+Transaction
+
+  Prefix: /opt/miniforge3/envs/cuvs_bench
+
+  Updating specs:
+
+   - python=3.12
+   - cuvs-bench=26.4
+   - psycopg2
+   - numpy
+   - pandas
+   - pip
+
+
+  Package                               Version  Build                              Channel           Size
+────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  Install:
+────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+  + _openmp_mutex                           4.5  8_kmp_llvm                         conda-forge        8kB
+  + _python_abi3_support                    1.0  hd8ed1ab_3                         conda-forge     Cached
+  + backports.zstd                        1.8.0  py312h3f22e6b_0                    conda-forge      242kB
+  + brotli                                1.2.0  h505cf86_4                         conda-forge       21kB
+  + brotli-bin                            1.2.0  h9908984_4                         conda-forge       22kB
+  + brotli-python                         1.2.0  py312he9c40d5_4                    conda-forge      368kB
+  + bzip2                                 1.0.8  hda65f42_10                        conda-forge     Cached
+  + c-ares                               1.34.8  hebe6cf0_2                         conda-forge     Cached
+  + ca-certificates                  2026.10.19  hbd8a1cb_0                         conda-forge     Cached
+  + cached-property                       2.0.1  pyhcf101f3_0                       conda-forge     Cached
+  + cached_property                       2.0.1  pyhcf101f3_0                       conda-forge     Cached
+  + certifi                          2026.10.19  pyhd8ed1ab_0                       conda-forge      137kB
+  + charset-normalizer                    3.5.2  h1114479_0                         conda-forge      217kB
+  + click                                 8.5.0  pyh5ded981_0                       conda-forge      112kB
+  + cloudpickle                           3.1.2  pyhcf101f3_1                       conda-forge       27kB
+  + contourpy                             1.4.0  py312h9be0db6_1                    conda-forge      329kB
+  + cpython                             3.12.15  py312hd8ed1ab_2                    conda-forge       48kB
+  + cuda-bindings                        12.9.9  py312h3956a73_0                    conda-forge        5MB
+  + cuda-cccl_linux-64                  12.9.27  ha770c72_0                         conda-forge        1MB
+  + cuda-core                             1.2.2  cuda12_py312h7dd41fa_0             conda-forge        2MB
+  + cuda-crt-dev_linux-64               12.9.86  ha770c72_2                         conda-forge       94kB
+  + cuda-crt-tools                      12.9.86  ha770c72_2                         conda-forge       29kB
+  + cuda-cudart                         12.9.79  h5888daf_0                         conda-forge       23kB
+  + cuda-cudart-dev                     12.9.79  h5888daf_0                         conda-forge       24kB
+  + cuda-cudart-dev_linux-64            12.9.79  h3f2d84a_0                         conda-forge      389kB
+  + cuda-cudart-static                  12.9.79  h5888daf_0                         conda-forge       23kB
+  + cuda-cudart-static_linux-64         12.9.79  h3f2d84a_0                         conda-forge        1MB
+  + cuda-cudart_linux-64                12.9.79  h3f2d84a_0                         conda-forge      197kB
+  + cuda-nvcc-dev_linux-64              12.9.86  he91c749_2                         conda-forge       28kB
+  + cuda-nvcc-impl                      12.9.86  h85509e4_2                         conda-forge       27kB
+  + cuda-nvcc-tools                     12.9.86  he02047a_2                         conda-forge       27MB
+  + cuda-nvrtc                          12.9.86  hecca717_1                         conda-forge       67MB
+  + cuda-nvvm-dev_linux-64              12.9.86  ha770c72_2                         conda-forge       27kB
+  + cuda-nvvm-impl                      12.9.86  h4bc722e_2                         conda-forge       21MB
+  + cuda-nvvm-tools                     12.9.86  h4bc722e_2                         conda-forge       24MB
+  + cuda-pathfinder                       1.8.3  pyhc364b38_0                       conda-forge     Cached
+  + cuda-profiler-api                   12.9.79  h7938cbb_1                         conda-forge       24kB
+  + cuda-python                          12.9.9  py_min_310_0                       conda-forge     Cached
+  + cuda-version                           12.9  h4f385c5_3                         conda-forge       22kB
+  + cupy                                 14.2.0  py312h12f1b05_3                    conda-forge      494kB
+  + cupy-core                            14.2.0  py312hb4f918a_3                    conda-forge       70MB
+  + cuvs                               26.04.00  cuda12_cp311_abi3_260408_          rapidsai         791kB
+  + cuvs-bench                         26.04.00  cuda12_cp311_abi3_260408_60b19a0f  rapidsai          76kB
+  + cycler                               0.12.1  pyhcf101f3_2                       conda-forge       15kB
+  + cyrus-sasl                           2.1.28  hd9c7081_0                         conda-forge      210kB
+  + fonttools                            4.67.0  py312hfd18d64_0                    conda-forge        3MB
+  + freetype                             2.14.3  ha770c72_2                         conda-forge      175kB
+  + h2                                    4.4.1  pyhcf101f3_0                       conda-forge     Cached
+  + h5py                                 3.16.0  nompi_py312hfaa9938_105            conda-forge        1MB
+  + hdf5                                 1.14.6  nompi_h19486de_106                 conda-forge        4MB
+  + hpack                                 4.2.0  pyhd8ed1ab_0                       conda-forge     Cached
+  + hyperframe                            6.1.0  pyhd8ed1ab_0                       conda-forge     Cached
+  + icu                                    75.1  he02047a_0                         conda-forge       12MB
+  + idna                                   3.20  pyh5ded981_0                       conda-forge      179kB
+  + joblib                                1.6.0  pyhcf101f3_0                       conda-forge      229kB
+  + keyutils                              1.6.3  h7cc23a3_1                         conda-forge     Cached
+  + kiwisolver                            1.5.1  py312h9be0db6_3                    conda-forge       75kB
+  + krb5                                 1.21.3  h659f571_0                         conda-forge        1MB
+  + lcms2                                2.19.1  h9073bf1_3                         conda-forge      254kB
+  + ld_impl_linux-64                     2.46.1  default_hbd61a6d_103               conda-forge     Cached
+  + lerc                                  4.2.0  hdb68285_0                         conda-forge      271kB
+  + libaec                                1.1.5  h088129d_0                         conda-forge       37kB
+  + libaio                              0.3.113  h166bdaf_0                         conda-forge       19kB
+  + libblas                              3.11.0  11_h4a7cf45_openblas               conda-forge     Cached
+  + libboost                             1.87.0  h6c02f8c_2                         conda-forge        3MB
+  + libbrotlicommon                       1.2.0  h39a168f_4                         conda-forge       81kB
+  + libbrotlidec                          1.2.0  ha411449_4                         conda-forge       35kB
+  + libbrotlienc                          1.2.0  h018ffa1_4                         conda-forge      298kB
+  + libcap                                 2.78  h084b8d7_1                         conda-forge     Cached
+  + libcblas                             3.11.0  11_h0358290_openblas               conda-forge     Cached
+  + libcublas                         12.9.2.10  h676940d_0                         conda-forge      468MB
+  + libcublas-dev                     12.9.2.10  h676940d_0                         conda-forge       94kB
+  + libcufft                           11.4.1.4  hecca717_1                         conda-forge      162MB
+  + libcufile                          1.14.1.1  hbc026e6_1                         conda-forge      970kB
+  + libcurand                        10.3.10.19  h676940d_1                         conda-forge       46MB
+  + libcurand-dev                    10.3.10.19  h676940d_1                         conda-forge      250kB
+  + libcurl                              8.18.0  h4e3cde8_0                         conda-forge      463kB
+  + libcusolver                       11.7.5.82  h676940d_2                         conda-forge      205MB
+  + libcusolver-dev                   11.7.5.82  h676940d_2                         conda-forge       62kB
+  + libcusparse                      12.5.10.65  hecca717_2                         conda-forge      209MB
+  + libcusparse-dev                  12.5.10.65  hecca717_2                         conda-forge       53kB
+  + libcuvs                            26.04.00  cuda12_260408_60b19a0f             rapidsai        Cached
+  + libcuvs-bench-ann                  26.04.00  cuda12_260408_60b19a0f             rapidsai           1GB
+  + libcuvs-headers                    26.04.00  cuda12_260408_60b19a0f             rapidsai        Cached
+  + libdeflate                             1.25  hd45a770_1                         conda-forge       74kB
+  + libedit                        3.1.20260512  pl5321h373387f_0                   conda-forge      136kB
+  + libev                                  4.33  h280c20c_3                         conda-forge     Cached
+  + libexpat                              2.8.5  hd2095e1_0                         conda-forge     Cached
+  + libffi                                3.7.0  h81df57d_1                         conda-forge     Cached
+  + libfreetype                          2.14.3  ha770c72_2                         conda-forge        8kB
+  + libfreetype6                         2.14.3  h5e6c136_2                         conda-forge      388kB
+  + libgcc                               16.2.0  ha9f2e26_7                         conda-forge     Cached
+  + libgcc-ng                            16.2.0  h69a702a_7                         conda-forge     Cached
+  + libgfortran                          16.2.0  h69a702a_7                         conda-forge     Cached
+  + libgfortran5                         16.2.0  h6b99dfc_7                         conda-forge     Cached
+  + libhwloc                             2.13.0  default_he001693_1000              conda-forge        2MB
+  + libiconv                               1.18  h0cb94f2_3                         conda-forge     Cached
+  + libjpeg-turbo                         3.2.0  hb03c661_1                         conda-forge      650kB
+  + liblapack                            3.11.0  11_h47877c9_openblas               conda-forge     Cached
+  + liblzma                               5.8.3  hb03c661_1                         conda-forge     Cached
+  + libnghttp2                           1.68.1  h74cf4be_1                         conda-forge     Cached
+  + libnl                                3.11.0  hb03c661_1                         conda-forge     Cached
+  + libnsl                                2.0.1  hb9d3cd8_1                         conda-forge       34kB
+  + libntlm                                 1.8  hb9d3cd8_0                         conda-forge       33kB
+  + libnvjitlink                        12.9.86  hecca717_2                         conda-forge     Cached
+  + libnvptxcompiler-dev                12.9.86  ha770c72_2                         conda-forge       27kB
+  + libnvptxcompiler-dev_linux-64       12.9.86  ha770c72_2                         conda-forge       14MB
+  + libopenblas                          0.3.34  pthreads_hf13c14d_2                conda-forge     Cached
+  + libpng                               1.6.59  h922cc85_0                         conda-forge      317kB
+  + libpq                                  18.1  h5c52fec_2                         conda-forge        3MB
+  + libpython                           3.12.15  h0c77377_1_cpython                 conda-forge        9MB
+  + libraft                            26.04.00  cuda12_260408_b01e3028             rapidsai           4MB
+  + libraft-headers                    26.04.00  cuda12_260408_b01e3028             rapidsai        Cached
+  + libraft-headers-only               26.04.00  cuda12_260408_b01e3028             rapidsai        Cached
+  + librmm                             26.04.00  cuda12_260408_48b36cc6             rapidsai        Cached
+  + libsqlite                            3.53.4  h0737f62_102                       conda-forge      970kB
+  + libssh2                              1.11.1  h6154650_1                         conda-forge     Cached
+  + libstdcxx                            16.2.0  h934c35e_7                         conda-forge     Cached
+  + libstdcxx-ng                         16.2.0  hdf11a46_7                         conda-forge     Cached
+  + libsystemd0                           262.1  h26e0ef7_0                         conda-forge     Cached
+  + libtiff                               4.7.2  hcc2c06a_1                         conda-forge      460kB
+  + libucxx                             0.49.00  cuda12_260408_8d47a9ff             rapidsai        Cached
+  + libudev1                              262.1  h26e0ef7_0                         conda-forge     Cached
+  + libuuid                              2.42.4  hcfc3c73_0                         conda-forge     Cached
+  + libwebp-base                          1.6.0  hd42ef1d_1                         conda-forge      428kB
+  + libxcb                               1.17.0  hb83e432_2                         conda-forge      395kB
+  + libxcrypt                            4.4.38  h280c20c_0                         conda-forge      102kB
+  + libxml2                              2.15.1  h26afc86_0                         conda-forge       45kB
+  + libxml2-16                           2.15.1  ha9997c6_0                         conda-forge      556kB
+  + libzlib                               1.3.2  h25fd6f3_3                         conda-forge     Cached
+  + llvm-openmp                          23.1.3  h7148c6a_1                         conda-forge        6MB
+  + matplotlib-base                      3.10.9  py312he3d6523_0                    conda-forge        8MB
+  + mkl                                2023.2.0  ha770c72_50498                     conda-forge      164MB
+  + munkres                               1.1.4  pyhd8ed1ab_1                       conda-forge       16kB
+  + narwhals                             2.27.1  pyh5ded981_0                       conda-forge      303kB
+  + nccl                               2.32.3.1  h4d09622_0                         conda-forge     Cached
+  + ncurses                                 6.6  hdb14827_1                         conda-forge     Cached
+  + numpy                                 2.5.4  py312he827f4e_0                    conda-forge        9MB
+  + nvidia-ml-py                      13.615.71  pyhd8ed1ab_0                       conda-forge     Cached
+  + openjpeg                              2.5.4  heb1ab33_2                         conda-forge      391kB
+  + openldap                             2.6.10  he970967_0                         conda-forge      780kB
+  + openssl                               3.6.5  h781a0a9_0                         conda-forge     Cached
+  + packaging                              26.3  pyhc364b38_0                       conda-forge     Cached
+  + pandas                                3.0.6  np2py312h91ec553_0                 conda-forge       15MB
+  + pillow                               13.0.0  py312h38079b3_0                    conda-forge        1MB
+  + pip                                  26.2.1  pyh8b19718_0                       conda-forge        1MB
+  + psycopg2                             2.9.11  py312hf59bad3_0                    conda-forge      189kB
+  + pthread-stubs                           0.4  h7cc23a3_1004                      conda-forge       10kB
+  + pylibraft                          26.04.00  cuda12_cp311_abi3_260408_b01e3028  rapidsai         281kB
+  + pyparsing                             3.3.3  pyh5ded981_0                       conda-forge      114kB
+  + pysocks                               1.7.1  pyha55dd90_7                       conda-forge     Cached
+  + python                              3.12.15  h5f976f7_1_cpython                 conda-forge       23MB
+  + python-dateutil                 2.9.0.post0  pyhe01879c_2                       conda-forge      233kB
+  + python-gil                          3.12.15  hd8ed1ab_2                         conda-forge       48kB
+  + python_abi                             3.12  9_cp312                            conda-forge        7kB
+  + pyyaml                                6.0.3  py312h8a5da7c_1                    conda-forge      198kB
+  + qhull                                2020.2  h434a139_5                         conda-forge      553kB
+  + rapids-logger                         0.2.3  h98325ef_0                         rapidsai        Cached
+  + rdma-core                              65.0  h7b4f2e6_0                         conda-forge     Cached
+  + readline                                8.3  hd6e31c0_1                         conda-forge     Cached
+  + requests                             2.34.2  pyhcf101f3_0                       conda-forge     Cached
+  + rmm                                26.04.00  cuda12_cp311_abi3_260408_48b36cc6  rapidsai        Cached
+  + scikit-learn                          1.9.1  np2py312h91ec553_1                 conda-forge       10MB
+  + scipy                                1.17.1  py312h54fa4ab_1                    conda-forge       17MB
+  + setuptools                           84.2.0  pyhe730653_0                       conda-forge      567kB
+  + six                                  1.17.0  pyhe01879c_1                       conda-forge       18kB
+  + tbb                               2021.13.0  h7148c6a_7                         conda-forge      171kB
+  + threadpoolctl                         3.7.0  pyhc455866_0                       conda-forge       32kB
+  + tk                                   8.6.13  noxft_h1df4ec4_4                   conda-forge     Cached
+  + tzdata                                2026c  h151e31d_0                         conda-forge     Cached
+  + ucx                                  1.20.1  hbe80e26_0                         conda-forge     Cached
+  + ucxx                                0.49.00  cuda12_cp311_abi3_260408_8d47a9ff  rapidsai        Cached
+  + unicodedata2                         18.0.0  py312h5cc1888_0                    conda-forge      420kB
+  + urllib3                               2.8.0  pyhd8ed1ab_0                       conda-forge      107kB
+  + wheel                                0.48.0  pyhd8ed1ab_0                       conda-forge       35kB
+  + xorg-libxau                          1.0.12  h7cc23a3_2                         conda-forge       19kB
+  + xorg-libxdmcp                         1.1.5  h7cc23a3_2                         conda-forge       23kB
+  + yaml                                  0.2.5  hebe6cf0_3                         conda-forge       85kB
+  + zlib-ng                               2.3.3  hce19668_1                         conda-forge      124kB
+  + zstd                                  1.5.7  hb78ec9c_7                         conda-forge     Cached
+
+  Summary:
+
+  Install: 180 packages
+
+  Total download: 3GB
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+
+warning  libmamba Security Warning: This transaction includes executing package scripts (pre/post-link/unlink) if present. These scripts can contain arbitrary code. Please ensure you trust the package sources.
+
+Transaction starting
+Linking cuda-version-12.9-h4f385c5_3
+Linking python_abi-3.12-9_cp312
+Linking tzdata-2026c-h151e31d_0
+Linking ca-certificates-2026.10.19-hbd8a1cb_0
+Linking cuda-cccl_linux-64-12.9.27-ha770c72_0
+Linking cuda-cudart-static_linux-64-12.9.79-h3f2d84a_0
+Linking cuda-nvvm-dev_linux-64-12.9.86-ha770c72_2
+Linking libnvptxcompiler-dev_linux-64-12.9.86-ha770c72_2
+Linking cuda-crt-dev_linux-64-12.9.86-ha770c72_2
+Linking cuda-cudart_linux-64-12.9.79-h3f2d84a_0
+Linking cuda-cudart-dev_linux-64-12.9.79-h3f2d84a_0
+Linking libzlib-1.3.2-h25fd6f3_3
+Linking llvm-openmp-23.1.3-h7148c6a_1
+Linking cuda-crt-tools-12.9.86-ha770c72_2
+Linking libnvptxcompiler-dev-12.9.86-ha770c72_2
+Linking zstd-1.5.7-hb78ec9c_7
+Linking _openmp_mutex-4.5-8_kmp_llvm
+Linking ld_impl_linux-64-2.46.1-default_hbd61a6d_103
+Linking libgcc-16.2.0-ha9f2e26_7
+Linking yaml-0.2.5-hebe6cf0_3
+Linking xorg-libxau-1.0.12-h7cc23a3_2
+Linking xorg-libxdmcp-1.1.5-h7cc23a3_2
+Linking libdeflate-1.25-hd45a770_1
+Linking libiconv-1.18-h0cb94f2_3
+Linking libpng-1.6.59-h922cc85_0
+Linking c-ares-1.34.8-hebe6cf0_2
+Linking libev-4.33-h280c20c_3
+Linking pthread-stubs-0.4-h7cc23a3_1004
+Linking libwebp-base-1.6.0-hd42ef1d_1
+Linking libjpeg-turbo-3.2.0-hb03c661_1
+Linking libbrotlicommon-1.2.0-h39a168f_4
+Linking libntlm-1.8-hb9d3cd8_0
+Linking keyutils-1.6.3-h7cc23a3_1
+Linking libgfortran5-16.2.0-h6b99dfc_7
+Linking libcap-2.78-h084b8d7_1
+Linking libnl-3.11.0-hb03c661_1
+Linking cuda-nvvm-tools-12.9.86-h4bc722e_2
+Linking cuda-nvvm-impl-12.9.86-h4bc722e_2
+Linking bzip2-1.0.8-hda65f42_10
+Linking libnsl-2.0.1-hb9d3cd8_1
+Linking openssl-3.6.5-h781a0a9_0
+Linking libffi-3.7.0-h81df57d_1
+Linking libsqlite-3.53.4-h0737f62_102
+Linking liblzma-5.8.3-hb03c661_1
+Linking ncurses-6.6-hdb14827_1
+Linking tk-8.6.13-noxft_h1df4ec4_4
+Linking libstdcxx-16.2.0-h934c35e_7
+Linking libgcc-ng-16.2.0-h69a702a_7
+Linking libexpat-2.8.5-hd2095e1_0
+Linking libuuid-2.42.4-hcfc3c73_0
+Linking libxcrypt-4.4.38-h280c20c_0
+Linking libfreetype6-2.14.3-h5e6c136_2
+Linking libxcb-1.17.0-hb83e432_2
+Linking libbrotlienc-1.2.0-h018ffa1_4
+Linking libbrotlidec-1.2.0-ha411449_4
+Linking libgfortran-16.2.0-h69a702a_7
+Linking libsystemd0-262.1-h26e0ef7_0
+Linking libudev1-262.1-h26e0ef7_0
+Linking libssh2-1.11.1-h6154650_1
+Linking libedit-3.1.20260512-pl5321h373387f_0
+Linking readline-8.3-hd6e31c0_1
+Linking zlib-ng-2.3.3-hce19668_1
+Linking libcufft-11.4.1.4-hecca717_1
+Linking lerc-4.2.0-hdb68285_0
+Linking libnghttp2-1.68.1-h74cf4be_1
+Linking libaec-1.1.5-h088129d_0
+Linking cuda-cudart-static-12.9.79-h5888daf_0
+Linking cuda-nvrtc-12.9.86-hecca717_1
+Linking cuda-nvcc-tools-12.9.86-he02047a_2
+Linking libnvjitlink-12.9.86-hecca717_2
+Linking nccl-2.32.3.1-h4d09622_0
+Linking libcurand-10.3.10.19-h676940d_1
+Linking cuda-cudart-12.9.79-h5888daf_0
+Linking libstdcxx-ng-16.2.0-hdf11a46_7
+Linking libpython-3.12.15-h0c77377_1_cpython
+Linking libaio-0.3.113-h166bdaf_0
+Linking libfreetype-2.14.3-ha770c72_2
+Linking brotli-bin-1.2.0-h9908984_4
+Linking libopenblas-0.3.34-pthreads_hf13c14d_2
+Linking rdma-core-65.0-h7b4f2e6_0
+Linking libtiff-4.7.2-hcc2c06a_1
+Linking libcublas-12.9.2.10-h676940d_0
+Linking libcusparse-12.5.10.65-hecca717_2
+Linking libcurand-dev-10.3.10.19-h676940d_1
+Linking cuda-cudart-dev-12.9.79-h5888daf_0
+Linking qhull-2020.2-h434a139_5
+Linking krb5-1.21.3-h659f571_0
+Linking icu-75.1-he02047a_0
+Linking python-3.12.15-h5f976f7_1_cpython
+Linking freetype-2.14.3-ha770c72_2
+Linking brotli-1.2.0-h505cf86_4
+Linking libblas-3.11.0-11_h4a7cf45_openblas
+Linking libcufile-1.14.1.1-hbc026e6_1
+Linking ucx-1.20.1-hbe80e26_0
+warning  libmamba Executing post-link script for package 'ucx'.
+
+To enable CUDA support, UCX requires the CUDA Runtime library (libcudart).
+The library can be installed with the appropriate command below:
+
+* For CUDA 12, run:    conda install cuda-cudart cuda-version=12
+* For CUDA 13, run:    conda install cuda-cudart cuda-version=13
+
+If any of the packages you requested use CUDA then CUDA should already
+have been installed for you.
+
+
+Linking openjpeg-2.5.4-heb1ab33_2
+Linking lcms2-2.19.1-h9073bf1_3
+Linking libcublas-dev-12.9.2.10-h676940d_0
+Linking libcusolver-11.7.5.82-h676940d_2
+Linking libcusparse-dev-12.5.10.65-hecca717_2
+Linking cuda-profiler-api-12.9.79-h7938cbb_1
+Linking libcurl-8.18.0-h4e3cde8_0
+Linking cyrus-sasl-2.1.28-hd9c7081_0
+Linking libxml2-16-2.15.1-ha9997c6_0
+Linking libboost-1.87.0-h6c02f8c_2
+Linking backports.zstd-1.8.0-py312h3f22e6b_0
+Linking brotli-python-1.2.0-py312he9c40d5_4
+Linking unicodedata2-18.0.0-py312h5cc1888_0
+Linking kiwisolver-1.5.1-py312h9be0db6_3
+Linking pyyaml-6.0.3-py312h8a5da7c_1
+Linking liblapack-3.11.0-11_h47877c9_openblas
+Linking libcblas-3.11.0-11_h0358290_openblas
+Linking pillow-13.0.0-py312h38079b3_0
+Linking libcusolver-dev-11.7.5.82-h676940d_2
+Linking hdf5-1.14.6-nompi_h19486de_106
+Linking openldap-2.6.10-he970967_0
+Linking libxml2-2.15.1-h26afc86_0
+Linking numpy-2.5.4-py312he827f4e_0
+Linking libpq-18.1-h5c52fec_2
+Linking libhwloc-2.13.0-default_he001693_1000
+Linking contourpy-1.4.0-py312h9be0db6_1
+Linking scipy-1.17.1-py312h54fa4ab_1
+Linking psycopg2-2.9.11-py312hf59bad3_0
+Linking tbb-2021.13.0-h7148c6a_7
+Linking mkl-2023.2.0-ha770c72_50498
+Linking cuda-nvcc-dev_linux-64-12.9.86-he91c749_2
+Linking pysocks-1.7.1-pyha55dd90_7
+Linking hpack-4.2.0-pyhd8ed1ab_0
+Linking hyperframe-6.1.0-pyhd8ed1ab_0
+Linking cloudpickle-3.1.2-pyhcf101f3_1
+Linking munkres-1.1.4-pyhd8ed1ab_1
+Linking cached_property-2.0.1-pyhcf101f3_0
+Linking cycler-0.12.1-pyhcf101f3_2
+Linking pyparsing-3.3.3-pyh5ded981_0
+Linking packaging-26.3-pyhc364b38_0
+Linking narwhals-2.27.1-pyh5ded981_0
+Linking threadpoolctl-3.7.0-pyhc455866_0
+Linking setuptools-84.2.0-pyhe730653_0
+Linking idna-3.20-pyh5ded981_0
+Linking certifi-2026.10.19-pyhd8ed1ab_0
+Linking six-1.17.0-pyhe01879c_1
+Linking click-8.5.0-pyh5ded981_0
+Linking cuda-pathfinder-1.8.3-pyhc364b38_0
+Linking cpython-3.12.15-py312hd8ed1ab_2
+Linking nvidia-ml-py-13.615.71-pyhd8ed1ab_0
+Linking h2-4.4.1-pyhcf101f3_0
+Linking joblib-1.6.0-pyhcf101f3_0
+Linking cached-property-2.0.1-pyhcf101f3_0
+Linking wheel-0.48.0-pyhd8ed1ab_0
+Linking python-dateutil-2.9.0.post0-pyhe01879c_2
+Linking python-gil-3.12.15-hd8ed1ab_2
+Linking urllib3-2.8.0-pyhd8ed1ab_0
+Linking pip-26.2.1-pyh8b19718_0
+Linking _python_abi3_support-1.0-hd8ed1ab_3
+Linking rapids-logger-0.2.3-h98325ef_0
+Linking librmm-26.04.00-cuda12_260408_48b36cc6
+Linking libucxx-0.49.00-cuda12_260408_8d47a9ff
+Linking libraft-headers-only-26.04.00-cuda12_260408_b01e3028
+Linking cuda-nvcc-impl-12.9.86-h85509e4_2
+Linking fonttools-4.67.0-py312hfd18d64_0
+Linking cupy-core-14.2.0-py312hb4f918a_3
+Linking scikit-learn-1.9.1-np2py312h91ec553_1
+Linking h5py-3.16.0-nompi_py312hfaa9938_105
+Linking pandas-3.0.6-np2py312h91ec553_0
+Linking charset-normalizer-3.5.2-h1114479_0
+Linking cuda-bindings-12.9.9-py312h3956a73_0
+Linking matplotlib-base-3.10.9-py312he3d6523_0
+Linking cupy-14.2.0-py312h12f1b05_3
+Linking cuda-core-1.2.2-cuda12_py312h7dd41fa_0
+Linking requests-2.34.2-pyhcf101f3_0
+Linking cuda-python-12.9.9-py_min_310_0
+Linking rmm-26.04.00-cuda12_cp311_abi3_260408_48b36cc6
+Linking ucxx-0.49.00-cuda12_cp311_abi3_260408_8d47a9ff
+Linking libraft-headers-26.04.00-cuda12_260408_b01e3028
+Linking libcuvs-headers-26.04.00-cuda12_260408_60b19a0f
+Linking libraft-26.04.00-cuda12_260408_b01e3028
+Linking libcuvs-26.04.00-cuda12_260408_60b19a0f
+Linking pylibraft-26.04.00-cuda12_cp311_abi3_260408_b01e3028
+Linking libcuvs-bench-ann-26.04.00-cuda12_260408_60b19a0f
+Linking cuvs-26.04.00-cuda12_cp311_abi3_260408_
+Linking cuvs-bench-26.04.00-cuda12_cp311_abi3_260408_60b19a0f
+
+Transaction finished
+
+
+To activate this environment, use:
+
+    mamba activate cuvs_bench
+
+Or to execute a single command in this environment, use:
+
+    mamba run -n cuvs_bench mycommand
+
++ sudo /opt/miniforge3/bin/mamba install -y -n cuvs_bench -c conda-forge psycopg
+Using Cached Shard Index for conda-forge/linux-64                                                   ✔ Done
+Using Cached Shard Index for conda-forge/noarch                                                     ✔ Done
+Fetching and Parsing Packages' Shards                                                           ⧖ Starting
+Fetching and Parsing Packages' Shards                                                     ✔ Done (0.9 sec)
+
+Pinned packages:
+
+  - python=3.12
+
+Resolving Environment                                                                           ⧖ Starting
+Resolving Environment                                                                     ✔ Done (0.3 sec)
+
+Transaction
+
+  Prefix: /opt/miniforge3/envs/cuvs_bench
+
+  Updating specs:
+
+   - psycopg
+
+
+  Package              Version  Build            Channel           Size
+─────────────────────────────────────────────────────────────────────────
+  Install:
+─────────────────────────────────────────────────────────────────────────
+
+  + psycopg              3.3.2  pyh848bd53_0     conda-forge      145kB
+  + psycopg-c            3.3.2  py312hc3ef785_0  conda-forge      687kB
+  + typing-extensions   4.16.0  h69aa097_0       conda-forge     Cached
+  + typing_extensions   4.16.0  pyhcf101f3_0     conda-forge     Cached
+
+  Summary:
+
+  Install: 4 packages
+
+  Total download: 832kB
+
+─────────────────────────────────────────────────────────────────────────
+
+
+warning  libmamba Security Warning: This transaction includes executing package scripts (pre/post-link/unlink) if present. These scripts can contain arbitrary code. Please ensure you trust the package sources.
+
+Transaction starting
+Linking psycopg-c-3.3.2-py312hc3ef785_0
+Linking typing_extensions-4.16.0-pyhcf101f3_0
+Linking typing-extensions-4.16.0-h69aa097_0
+Linking psycopg-3.3.2-pyh848bd53_0
+
+Transaction finished
+
++ sudo /opt/miniforge3/envs/cuvs_bench/bin/pip install -q pgvector
+WARNING: Running pip as the 'root' user can result in broken permissions and conflicting behaviour with the system package manager, possibly rendering your system unusable. It is recommended to use a virtual environment instead: https://pip.pypa.io/warnings/venv. Use the --root-user-action option if you know what you are doing and want to suppress this warning.
++ sudo chmod -R o+rX /opt/miniforge3
++ /opt/miniforge3/envs/cuvs_bench/bin/python -c 'import cuvs_bench,numpy,psycopg,pgvector.psycopg; print('\''BENCH ENV OK'\'')'
+BENCH ENV OK
++ L=/opt/miniforge3/envs/cuvs_dev/lib
++ sudo ln -sf /opt/miniforge3/envs/cuvs_dev/lib/libstdc++.so.6 /usr/local/lib/libstdc++.so.6
++ sudo ln -sf /opt/miniforge3/envs/cuvs_dev/lib/libgcc_s.so.1 /usr/local/lib/libgcc_s.so.1
++ sudo ldconfig
++ echo '=== [3/5] clone + build (.so + daemon) ================================='
+=== [3/5] clone + build (.so + daemon) =================================
++ '[' -d /home/ubuntu/pg_cuvs/.git ']'
++ git clone https://github.com/pg-cuvs/pg_cuvs.git /home/ubuntu/pg_cuvs
+Cloning into '/home/ubuntu/pg_cuvs'...
++ cd /home/ubuntu/pg_cuvs
++ git checkout --detach 8b73d65fb8a3d6f66cdfe69eec4969c1f2fc753c
+HEAD is now at 8b73d65 fix(bootstrap): SSH 유저를 런타임에 감지 — PG role/db 포함 (crusoe 검증) (#190)
++ '[' -z sm_89 ']'
++ echo '  CUDA_ARCH        : sm_89'
+  CUDA_ARCH        : sm_89
++ ENV_FILE=/home/ubuntu/.pg_cuvs_env
++ cat
++ test -f /home/ubuntu/.pg_cuvs_env
++ sh -n /home/ubuntu/.pg_cuvs_env
++ . /home/ubuntu/.pg_cuvs_env
+++ export CONDA_PREFIX=/opt/miniforge3/envs/cuvs_dev
+++ CONDA_PREFIX=/opt/miniforge3/envs/cuvs_dev
+++ export PATH=/opt/miniforge3/envs/cuvs_dev/bin:/usr/lib/postgresql/16/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games:/usr/local/games:/snap/bin
+++ PATH=/opt/miniforge3/envs/cuvs_dev/bin:/usr/lib/postgresql/16/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games:/usr/local/games:/snap/bin
+++ export LD_LIBRARY_PATH=/opt/miniforge3/envs/cuvs_dev/lib
+++ LD_LIBRARY_PATH=/opt/miniforge3/envs/cuvs_dev/lib
+++ export 'NVCC=nvcc -ccbin /usr/bin/g++'
+++ NVCC='nvcc -ccbin /usr/bin/g++'
+++ export PGHOST=/var/run/postgresql
+++ PGHOST=/var/run/postgresql
+++ export CUDA_ARCH=sm_89
+++ CUDA_ARCH=sm_89
++ make
+gcc -Wall -Wmissing-prototypes -Wpointer-arith -Wdeclaration-after-statement -Werror=vla -Wendif-labels -Wmissing-format-attribute -Wimplicit-fallthrough=3 -Wcast-function-type -Wshadow=compatible-local -Wformat-security -fno-strict-aliasing -fwrapv -fexcess-precision=standard -Wno-format-truncation -Wno-stringop-truncation -g -g -O2 -flto=auto -ffat-lto-objects -flto=auto -ffat-lto-objects -fstack-protector-strong -Wformat -Werror=format-security -fno-omit-frame-pointer -fPIC -fvisibility=hidden -I/opt/miniforge3/envs/cuvs_dev/include -I/opt/miniforge3/envs/cuvs_dev/include/rapids -I./src -I. -I./ -I/usr/include/postgresql/16/server -I/usr/include/postgresql/internal -Wdate-time -D_FORTIFY_SOURCE=2 -D_GNU_SOURCE  -I/usr/include/libxml2   -c -o src/pg_cuvs.o src/pg_cuvs.c
+src/pg_cuvs.c:1333:1: warning: no previous prototype for ‘cuvs_cagra_reloption_graph_degree’ [-Wmissing-prototypes]
+ 1333 | cuvs_cagra_reloption_graph_degree(Relation cagra_rel)
+      | ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+src/pg_cuvs.c: In function ‘flat_amcostestimate’:
+src/pg_cuvs.c:2036:9: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 2036 |         double startup = 0.0, total = 0.0;
+      |         ^~~~~~
+src/pg_cuvs.c: In function ‘cuvs_effective_build_cap_bytes’:
+src/pg_cuvs.c:2147:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 2147 |     size_t avail = read_mem_available_bytes();
+      |     ^~~~~~
+src/pg_cuvs.c: In function ‘cuvs_build_callback’:
+src/pg_cuvs.c:2237:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 2237 |     PgVector *vec = DatumGetPgVector(values[0]);
+      |     ^~~~~~~~
+src/pg_cuvs.c:2248:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 2248 |     float *dst = bs->vectors + (bs->n_vecs * bs->dim);
+      |     ^~~~~
+src/pg_cuvs.c: In function ‘cuvs_ambuild’:
+src/pg_cuvs.c:2833:9: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 2833 |         FILE *f = fopen(sidecar, "w");
+      |         ^~~~
+src/pg_cuvs.c: In function ‘flat_ambuild’:
+src/pg_cuvs.c:3080:9: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 3080 |         FILE *f = fopen(sidecar, "w");
+      |         ^~~~
+src/pg_cuvs.c: At top level:
+src/pg_cuvs.c:3369:38: warning: "/*" within comment [-Wcomment]
+ 3369 |  * caller-supplied tids_out/dists_out/*n_results arrays (no CuvsScanState). */
+      |                                       
+src/pg_cuvs.c: In function ‘cuvs_gettuple’:
+src/pg_cuvs.c:3613:9: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 3613 |         Oid index_oid = RelationGetRelid(scan->indexRelation);
+      |         ^~~
+src/pg_cuvs.c:3649:9: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 3649 |         Datum query_datum = scan->orderByData[0].sk_argument;
+      |         ^~~~~
+src/pg_cuvs.c:3674:9: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 3674 |         uint32_t metric = cuvs_index_metric(scan->indexRelation);
+      |         ^~~~~~~~
+src/pg_cuvs.c:3845:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 3845 |     uint64_t tid     = ss->tids[ss->cur];
+      |     ^~~~~~~~
+src/pg_cuvs.c: In function ‘flat_gettuple’:
+src/pg_cuvs.c:3904:9: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 3904 |         Oid index_oid = RelationGetRelid(scan->indexRelation);
+      |         ^~~
+src/pg_cuvs.c:3924:9: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 3924 |         Datum query_datum = scan->orderByData[0].sk_argument;
+      |         ^~~~~
+src/pg_cuvs.c:3941:9: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 3941 |         uint32_t metric = cuvs_index_metric(scan->indexRelation);
+      |         ^~~~~~~~
+src/pg_cuvs.c:4078:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 4078 |     uint64_t tid     = ss->tids[ss->cur];
+      |     ^~~~~~~~
+src/pg_cuvs.c: In function ‘ivfpq_ambuild’:
+src/pg_cuvs.c:4470:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 4470 |     CuvsIvfPqOptions *opts = (CuvsIvfPqOptions *) indexRel->rd_options;
+      |     ^~~~~~~~~~~~~~~~
+src/pg_cuvs.c: In function ‘ivfpq_gettuple’:
+src/pg_cuvs.c:4594:9: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 4594 |         Oid index_oid = RelationGetRelid(scan->indexRelation);
+      |         ^~~
+src/pg_cuvs.c:4613:9: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 4613 |         Datum    query_datum = scan->orderByData[0].sk_argument;
+      |         ^~~~~
+src/pg_cuvs.c:4624:9: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 4624 |         int rc = cuvs_ipc_search_ivfpq(
+      |         ^~~
+src/pg_cuvs.c:4697:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 4697 |     uint64_t tid = ss->tids[ss->cur];
+      |     ^~~~~~~~
+src/pg_cuvs.c: In function ‘pg_cuvs_last_search_metric’:
+src/pg_cuvs.c:4886:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 4886 |     const char *name;
+      |     ^~~~~
+src/pg_cuvs.c: In function ‘pg_cuvs_batch_search’:
+src/pg_cuvs.c:4984:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 4984 |     Relation  heapRel = table_open(table_oid, AccessShareLock);
+      |     ^~~~~~~~
+src/pg_cuvs.c:5015:9: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 5015 |         Oid    elemtype = ARR_ELEMTYPE(qarr);
+      |         ^~~
+src/pg_cuvs.c: In function ‘pg_cuvs_gpu_cache_stats’:
+src/pg_cuvs.c:5439:22: warning: unused variable ‘cs’ [-Wunused-variable]
+ 5439 |     CuvsCacheStats   cs;
+      |                      ^~
+src/pg_cuvs.c: In function ‘cuvs_filtered_knn’:
+src/pg_cuvs.c:6030:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 6030 |     Relation  indexRel = index_open(index_oid, AccessShareLock);
+      |     ^~~~~~~~
+src/pg_cuvs.c:6039:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 6039 |     uint32_t metric = cuvs_index_metric(indexRel);
+      |     ^~~~~~~~
+src/pg_cuvs.c:6045:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 6045 |     PgVector *qvec = DatumGetPgVector(query_datum);
+      |     ^~~~~~~~
+src/pg_cuvs.c:6133:9: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 6133 |         int       k_fetch    = use_filter
+      |         ^~~
+src/pg_cuvs.c: In function ‘cuvs_cs_build’:
+src/pg_cuvs.c:6473:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 6473 |     PgVector *qvec = DatumGetPgVector(state->query_datum);
+      |     ^~~~~~~~
+src/pg_cuvs.c:6493:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 6493 |     int search_k = cuvs_k_with_tombstone_slack(state->index_oid, k);
+      |     ^~~
+src/pg_cuvs.c:6496:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 6496 |     uint32_t latency_us = 0;
+      |     ^~~~~~~~
+gcc -Wall -Wmissing-prototypes -Wpointer-arith -Wdeclaration-after-statement -Werror=vla -Wendif-labels -Wmissing-format-attribute -Wimplicit-fallthrough=3 -Wcast-function-type -Wshadow=compatible-local -Wformat-security -fno-strict-aliasing -fwrapv -fexcess-precision=standard -Wno-format-truncation -Wno-stringop-truncation -g -g -O2 -flto=auto -ffat-lto-objects -flto=auto -ffat-lto-objects -fstack-protector-strong -Wformat -Werror=format-security -fno-omit-frame-pointer -fPIC -fvisibility=hidden -I/opt/miniforge3/envs/cuvs_dev/include -I/opt/miniforge3/envs/cuvs_dev/include/rapids -I./src -I. -I./ -I/usr/include/postgresql/16/server -I/usr/include/postgresql/internal -Wdate-time -D_FORTIFY_SOURCE=2 -D_GNU_SOURCE  -I/usr/include/libxml2   -c -o src/cuvs_ipc.o src/cuvs_ipc.c
+src/cuvs_ipc.c: In function ‘uds_connect_ex’:
+src/cuvs_ipc.c:130:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+  130 |     struct sockaddr_un addr;
+      |     ^~~~~~
+src/cuvs_ipc.c:135:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+  135 |     struct timeval tv = {.tv_sec = recv_timeout_sec, .tv_usec = 0};
+      |     ^~~~~~
+src/cuvs_ipc.c: In function ‘recv_all_interruptible’:
+src/cuvs_ipc.c:293:9: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+  293 |         ssize_t n = read(fd, p + got, len - got);
+      |         ^~~~~~~
+src/cuvs_ipc.c: In function ‘shm_write_build_payload’:
+src/cuvs_ipc.c:405:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+  405 |     void *mem = mmap(NULL, total, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+      |     ^~~~
+src/cuvs_ipc.c: In function ‘shm_write_query_batch’:
+src/cuvs_ipc.c:440:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+  440 |     void *mem = mmap(NULL, total, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+      |     ^~~~
+src/cuvs_ipc.c: In function ‘shm_write_query’:
+src/cuvs_ipc.c:473:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+  473 |     void *mem = mmap(NULL, vec_bytes, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+      |     ^~~~
+src/cuvs_ipc.c: In function ‘cuvs_ipc_search’:
+src/cuvs_ipc.c:533:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+  533 |     CuvsCmdFrame cmd = {
+      |     ^~~~~~~~~~~~
+src/cuvs_ipc.c:558:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+  558 |     CuvsReplyHeader hdr;
+      |     ^~~~~~~~~~~~~~~
+src/cuvs_ipc.c: In function ‘cuvs_ipc_search_batch’:
+src/cuvs_ipc.c:668:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+  668 |     CuvsCmdFrame cmd = {
+      |     ^~~~~~~~~~~~
+src/cuvs_ipc.c:687:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+  687 |     CuvsReplyHeader hdr;
+      |     ^~~~~~~~~~~~~~~
+src/cuvs_ipc.c:698:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+  698 |     uint32_t Q = hdr.n_results;
+      |     ^~~~~~~~
+src/cuvs_ipc.c:715:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+  715 |     size_t hdr_bytes  = 2 * sizeof(uint32_t);
+      |     ^~~~~~
+src/cuvs_ipc.c: In function ‘cuvs_ipc_stats’:
+src/cuvs_ipc.c:767:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+  767 |     CuvsCmdFrame cmd = {
+      |     ^~~~~~~~~~~~
+src/cuvs_ipc.c:776:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+  776 |     CuvsReplyHeader hdr;
+      |     ^~~~~~~~~~~~~~~
+src/cuvs_ipc.c: In function ‘cuvs_ipc_shard_stats’:
+src/cuvs_ipc.c:871:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+  871 |     CuvsCmdFrame cmd = {
+      |     ^~~~~~~~~~~~
+src/cuvs_ipc.c:880:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+  880 |     CuvsReplyHeader hdr;
+      |     ^~~~~~~~~~~~~~~
+src/cuvs_ipc.c: In function ‘cuvs_ipc_export_adjacency’:
+src/cuvs_ipc.c:1298:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 1298 |     CuvsCmdFrame cmd = {
+      |     ^~~~~~~~~~~~
+src/cuvs_ipc.c:1309:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 1309 |     CuvsReplyHeader hdr;
+      |     ^~~~~~~~~~~~~~~
+src/cuvs_ipc.c:1320:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 1320 |     size_t  n_vecs       = (size_t)hdr.n_results;
+      |     ^~~~~~
+src/cuvs_ipc.c:1338:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 1338 |     size_t adj_bytes  = n_vecs * (size_t)graph_degree * sizeof(uint32_t);
+      |     ^~~~~~
+src/cuvs_ipc.c:1356:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 1356 |     uint32_t src_metric = ((const uint32_t *)mem)[3];
+      |     ^~~~~~~~
+src/cuvs_ipc.c: In function ‘cuvs_ipc_export_hnsw_shm’:
+src/cuvs_ipc.c:1416:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 1416 |     CuvsCmdFrame cmd = {
+      |     ^~~~~~~~~~~~
+src/cuvs_ipc.c:1425:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 1425 |     CuvsReplyHeader hdr;
+      |     ^~~~~~~~~~~~~~~
+src/cuvs_ipc.c: In function ‘cuvs_ipc_search_filtered’:
+src/cuvs_ipc.c:1520:9: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 1520 |         size_t filter_bytes = (size_t)n_filter * sizeof(uint64_t);
+      |         ^~~~~~
+src/cuvs_ipc.c:1531:9: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 1531 |         void *fmem = mmap(NULL, filter_bytes, PROT_READ | PROT_WRITE,
+      |         ^~~~
+src/cuvs_ipc.c:1554:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 1554 |     CuvsCmdFrame cmd = {
+      |     ^~~~~~~~~~~~
+src/cuvs_ipc.c:1575:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 1575 |     CuvsReplyHeader hdr;
+      |     ^~~~~~~~~~~~~~~
+src/cuvs_ipc.c: In function ‘cuvs_ipc_search_stream_bf’:
+src/cuvs_ipc.c:1675:9: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 1675 |         size_t filter_bytes = (size_t)n_filter * sizeof(uint64_t);
+      |         ^~~~~~
+src/cuvs_ipc.c:1686:9: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 1686 |         void *fmem = mmap(NULL, filter_bytes, PROT_READ | PROT_WRITE,
+      |         ^~~~
+src/cuvs_ipc.c:1705:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 1705 |     CuvsCmdFrame cmd = {
+      |     ^~~~~~~~~~~~
+src/cuvs_ipc.c:1722:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 1722 |     CuvsReplyHeader hdr;
+      |     ^~~~~~~~~~~~~~~
+src/cuvs_ipc.c: In function ‘cuvs_ipc_search_bf_transient’:
+src/cuvs_ipc.c:1822:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 1822 |     size_t vec_bytes = (size_t)n * (size_t)dim * sizeof(float);
+      |     ^~~~~~
+src/cuvs_ipc.c:1855:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 1855 |     CuvsCmdFrame cmd;
+      |     ^~~~~~~~~~~~
+src/cuvs_ipc.c:1875:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 1875 |     CuvsReplyHeader hdr;
+      |     ^~~~~~~~~~~~~~~
+src/cuvs_ipc.c: In function ‘cuvs_ipc_search_ivfpq’:
+src/cuvs_ipc.c:2053:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 2053 |     CuvsCmdFrame cmd = {
+      |     ^~~~~~~~~~~~
+src/cuvs_ipc.c:2067:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 2067 |     CuvsReplyHeader hdr;
+      |     ^~~~~~~~~~~~~~~
+gcc -Wall -Wmissing-prototypes -Wpointer-arith -Wdeclaration-after-statement -Werror=vla -Wendif-labels -Wmissing-format-attribute -Wimplicit-fallthrough=3 -Wcast-function-type -Wshadow=compatible-local -Wformat-security -fno-strict-aliasing -fwrapv -fexcess-precision=standard -Wno-format-truncation -Wno-stringop-truncation -g -g -O2 -flto=auto -ffat-lto-objects -flto=auto -ffat-lto-objects -fstack-protector-strong -Wformat -Werror=format-security -fno-omit-frame-pointer -fPIC -fvisibility=hidden -I/opt/miniforge3/envs/cuvs_dev/include -I/opt/miniforge3/envs/cuvs_dev/include/rapids -I./src -I. -I./ -I/usr/include/postgresql/16/server -I/usr/include/postgresql/internal -Wdate-time -D_FORTIFY_SOURCE=2 -D_GNU_SOURCE  -I/usr/include/libxml2   -c -o src/cuvs_util.o src/cuvs_util.c
+nvcc -ccbin /usr/bin/g++ -O3 --compiler-options '-fPIC' -arch=sm_89 -std=c++17 --extended-lambda -DRAFT_SYSTEM_LITTLE_ENDIAN=1 -DCUVS_BUILD_CAGRA_HNSWLIB -I/opt/miniforge3/envs/cuvs_dev/include -I/opt/miniforge3/envs/cuvs_dev/include/rapids -I./src -c src/cuvs_wrapper.cu -o src/cuvs_wrapper.o
+/opt/miniforge3/envs/cuvs_dev/include/raft/core/device_resources.hpp: In constructor ‘raft::device_resources::device_resources(const raft::device_resources&, std::shared_ptr<rmm::mr::device_memory_resource>, std::optional<long unsigned int>)’:
+/opt/miniforge3/envs/cuvs_dev/include/raft/core/device_resources.hpp:60:33: warning: ‘void raft::resource::set_workspace_resource(const raft::resources&, std::shared_ptr<rmm::mr::device_memory_resource>, std::optional<long unsigned int>, std::optional<long unsigned int>)’ is deprecated: use the overload taking raft::mr::device_resource instead [-Wdeprecated-declarations]
+   60 |     resource::set_workspace_resource(*this, workspace_resource, allocation_limit);
+      |     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+/opt/miniforge3/envs/cuvs_dev/include/raft/core/resource/device_memory_resource.hpp:388:1: note: declared here
+  388 | inline void set_workspace_resource(resources const& res,
+      | ^~~~~~~~~~~~~~~~~~~~~~
+/opt/miniforge3/envs/cuvs_dev/include/raft/core/device_resources.hpp: In constructor ‘raft::device_resources::device_resources(rmm::cuda_stream_view, std::shared_ptr<rmm::cuda_stream_pool>, std::shared_ptr<rmm::mr::device_memory_resource>, std::optional<long unsigned int>)’:
+/opt/miniforge3/envs/cuvs_dev/include/raft/core/device_resources.hpp:90:33: warning: ‘void raft::resource::set_workspace_resource(const raft::resources&, std::shared_ptr<rmm::mr::device_memory_resource>, std::optional<long unsigned int>, std::optional<long unsigned int>)’ is deprecated: use the overload taking raft::mr::device_resource instead [-Wdeprecated-declarations]
+   90 |       resource::set_workspace_resource(*this, workspace_resource, allocation_limit);
+      |       ~~~~~~~~~~~~~~~~~~~~~~~~~~^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+/opt/miniforge3/envs/cuvs_dev/include/raft/core/resource/device_memory_resource.hpp:388:1: note: declared here
+  388 | inline void set_workspace_resource(resources const& res,
+      | ^~~~~~~~~~~~~~~~~~~~~~
+/opt/miniforge3/envs/cuvs_dev/include/raft/sparse/convert/detail/csr.cuh: In function ‘void raft::sparse::convert::detail::coo_to_csr(const raft::resources&, const int*, const int*, const value_t*, int, int, int*, int*, value_t*)’:
+/opt/miniforge3/envs/cuvs_dev/include/raft/sparse/convert/detail/csr.cuh:58:71: warning: ‘cusparseStatus_t cusparseCreateIdentityPermutation(cusparseHandle_t, int, int*)’ is deprecated: The routine will be removed in the next major release [-Wdeprecated-declarations]
+   58 |   RAFT_CUSPARSE_TRY(cusparseCreateIdentityPermutation(cusparseHandle, nnz, P.data()));
+      |                                      ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^~~~~~~~~~~~~~~~               
+/opt/miniforge3/envs/cuvs_dev/bin/../targets/x86_64-linux/include/cusparse.h:4070:1: note: declared here
+ 4070 | cusparseCreateIdentityPermutation(cusparseHandle_t handle,
+      | ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+src/cuvs_wrapper.cu: In function ‘int cuvs_brute_force_search(const float*, const float*, int64_t, int, int, uint32_t, CuvsSearchResult*, int)’:
+src/cuvs_wrapper.cu:520:49: warning: ‘cuvs::neighbors::brute_force::index<float> cuvs::neighbors::brute_force::build(const raft::resources&, raft::device_matrix_view<const float, long int>, cuvs::distance::DistanceType, float)’ is deprecated [-Wdeprecated-declarations]
+  520 |         auto index = cuvs::neighbors::brute_force::build(
+      |              ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^~~~~~~~~                                                                  
+/opt/miniforge3/envs/cuvs_dev/include/cuvs/neighbors/brute_force.hpp:210:21: note: declared here
+  210 | [[deprecated]] auto build(
+      |                     ^~~~~
+src/cuvs_wrapper.cu:525:37: warning: ‘void cuvs::neighbors::brute_force::search(const raft::resources&, const cuvs::neighbors::brute_force::index<float>&, raft::device_matrix_view<const float, long int>, raft::device_matrix_view<long int, long int, cuda::std::__4::layout_right>, raft::device_matrix_view<float, long int>, const cuvs::neighbors::filtering::base_filter&)’ is deprecated [-Wdeprecated-declarations]
+  525 |         cuvs::neighbors::brute_force::search(
+      |         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~^~~~~~~~~                                                                                    
+/opt/miniforge3/envs/cuvs_dev/include/cuvs/neighbors/brute_force.hpp:376:21: note: declared here
+  376 | [[deprecated]] void search(raft::resources const& handle,
+      |                     ^~~~~~
+src/cuvs_wrapper.cu: In function ‘void* cuvs_bf_build(const float*, int64_t, int, uint32_t, uint32_t, int)’:
+src/cuvs_wrapper.cu:581:47: warning: ‘cuvs::neighbors::brute_force::index<__half, float> cuvs::neighbors::brute_force::build(const raft::resources&, raft::device_matrix_view<const __half, long int>, cuvs::distance::DistanceType, float)’ is deprecated [-Wdeprecated-declarations]
+  581 |             auto idx = cuvs::neighbors::brute_force::build(
+      |             ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^~~~~~~~~~~~~                                                                     
+/opt/miniforge3/envs/cuvs_dev/include/cuvs/neighbors/brute_force.hpp:251:21: note: declared here
+  251 | [[deprecated]] auto build(
+      |                     ^~~~~
+src/cuvs_wrapper.cu:592:47: warning: ‘cuvs::neighbors::brute_force::index<float> cuvs::neighbors::brute_force::build(const raft::resources&, raft::device_matrix_view<const float, long int>, cuvs::distance::DistanceType, float)’ is deprecated [-Wdeprecated-declarations]
+  592 |             auto idx = cuvs::neighbors::brute_force::build(
+      |             ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^~~~~~~~~~~~~                                                                     
+/opt/miniforge3/envs/cuvs_dev/include/cuvs/neighbors/brute_force.hpp:210:21: note: declared here
+  210 | [[deprecated]] auto build(
+      |                     ^~~~~
+src/cuvs_wrapper.cu: In function ‘int cuvs_bf_search(CuvsBfIndex, const float*, int, int, CuvsSearchResult*, int)’:
+src/cuvs_wrapper.cu:653:37: warning: ‘void cuvs::neighbors::brute_force::search(const raft::resources&, const cuvs::neighbors::brute_force::index<__half, float>&, raft::device_matrix_view<const __half, long int>, raft::device_matrix_view<long int, long int, cuda::std::__4::layout_right>, raft::device_matrix_view<float, long int>, const cuvs::neighbors::filtering::base_filter&)’ is deprecated [-Wdeprecated-declarations]
+  653 |             cuvs::neighbors::brute_force::search(
+      |             ~~~~~~~~~~~~~~~~~~~~~~~~^~~~~~~~~~~~~                                                                                           
+/opt/miniforge3/envs/cuvs_dev/include/cuvs/neighbors/brute_force.hpp:444:21: note: declared here
+  444 | [[deprecated]] void search(raft::resources const& handle,
+      |                     ^~~~~~
+src/cuvs_wrapper.cu:661:37: warning: ‘void cuvs::neighbors::brute_force::search(const raft::resources&, const cuvs::neighbors::brute_force::index<float>&, raft::device_matrix_view<const float, long int>, raft::device_matrix_view<long int, long int, cuda::std::__4::layout_right>, raft::device_matrix_view<float, long int>, const cuvs::neighbors::filtering::base_filter&)’ is deprecated [-Wdeprecated-declarations]
+  661 |             cuvs::neighbors::brute_force::search(
+      |             ~~~~~~~~~~~~~~~~~~~~~~~~^~~~~~~~~~~~~                                                                                           
+/opt/miniforge3/envs/cuvs_dev/include/cuvs/neighbors/brute_force.hpp:376:21: note: declared here
+  376 | [[deprecated]] void search(raft::resources const& handle,
+      |                     ^~~~~~
+src/cuvs_wrapper.cu: In function ‘int cuvs_bf_search_batch(CuvsBfIndex, const float*, int, int, int, CuvsSearchResult*, int)’:
+src/cuvs_wrapper.cu:1295:37: warning: ‘void cuvs::neighbors::brute_force::search(const raft::resources&, const cuvs::neighbors::brute_force::index<__half, float>&, raft::device_matrix_view<const __half, long int>, raft::device_matrix_view<long int, long int, cuda::std::__4::layout_right>, raft::device_matrix_view<float, long int>, const cuvs::neighbors::filtering::base_filter&)’ is deprecated [-Wdeprecated-declarations]
+ 1295 |             cuvs::neighbors::brute_force::search(
+      |             ~~~~~~~~~~~~~~~~~~~~~~~~^~~~~~~~~~~~~                                                                                     
+/opt/miniforge3/envs/cuvs_dev/include/cuvs/neighbors/brute_force.hpp:444:21: note: declared here
+  444 | [[deprecated]] void search(raft::resources const& handle,
+      |                     ^~~~~~
+src/cuvs_wrapper.cu:1303:37: warning: ‘void cuvs::neighbors::brute_force::search(const raft::resources&, const cuvs::neighbors::brute_force::index<float>&, raft::device_matrix_view<const float, long int>, raft::device_matrix_view<long int, long int, cuda::std::__4::layout_right>, raft::device_matrix_view<float, long int>, const cuvs::neighbors::filtering::base_filter&)’ is deprecated [-Wdeprecated-declarations]
+ 1303 |             cuvs::neighbors::brute_force::search(
+      |             ~~~~~~~~~~~~~~~~~~~~~~~~^~~~~~~~~~~~~                                                                                     
+/opt/miniforge3/envs/cuvs_dev/include/cuvs/neighbors/brute_force.hpp:376:21: note: declared here
+  376 | [[deprecated]] void search(raft::resources const& handle,
+      |                     ^~~~~~
+src/cuvs_wrapper.cu: In function ‘int cuvs_hnsw_serialize(CuvsCagraIndex, const char*, int)’:
+src/cuvs_wrapper.cu:1727:17: warning: format ‘%zu’ expects argument of type ‘size_t’, but argument 3 has type ‘unsigned int’ [-Wformat=]
+ 1727 |         fprintf(stderr, "[cuvs_hnsw_serialize] skip: n_vecs=%zu < %d (too small for hnswlib)\n",
+      |                 ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~  ~~~~~~~            
+      |                                                                                                           |
+      |                                                                                                           unsigned int
+gcc -Wall -Wmissing-prototypes -Wpointer-arith -Wdeclaration-after-statement -Werror=vla -Wendif-labels -Wmissing-format-attribute -Wimplicit-fallthrough=3 -Wcast-function-type -Wshadow=compatible-local -Wformat-security -fno-strict-aliasing -fwrapv -fexcess-precision=standard -Wno-format-truncation -Wno-stringop-truncation -g -g -O2 -flto=auto -ffat-lto-objects -flto=auto -ffat-lto-objects -fstack-protector-strong -Wformat -Werror=format-security -fno-omit-frame-pointer -fPIC -fvisibility=hidden -I/opt/miniforge3/envs/cuvs_dev/include -I/opt/miniforge3/envs/cuvs_dev/include/rapids -I./src -I. -I./ -I/usr/include/postgresql/16/server -I/usr/include/postgresql/internal -Wdate-time -D_FORTIFY_SOURCE=2 -D_GNU_SOURCE  -I/usr/include/libxml2   -c -o src/hnsw_export.o src/hnsw_export.c
+src/hnsw_export.c: In function ‘elems_per_page’:
+src/hnsw_export.c:219:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+  219 |     size_t esize  = elem_tuple_size(dim, bytes_per_dim);
+      |     ^~~~~~
+src/hnsw_export.c: In function ‘float_to_half’:
+src/hnsw_export.c:269:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+  269 |     uint32_t sign = (x >> 16) & 0x8000u;
+      |     ^~~~~~~~
+src/hnsw_export.c:281:9: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+  281 |         uint32_t shift = (uint32_t)(14 - exp);
+      |         ^~~~~~~~
+src/hnsw_export.c:290:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+  290 |     uint32_t half_mant = mant >> 13;
+      |     ^~~~~~~~
+src/hnsw_export.c: In function ‘write_elem_pair’:
+src/hnsw_export.c:580:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+  580 |     char *vdata = (char *)etup + sizeof(PgvHnswElemHdr);
+      |     ^~~~
+src/hnsw_export.c:584:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+  584 |     int16_t vdim   = (int16_t)dim;
+      |     ^~~~~~~
+src/hnsw_export.c:600:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+  600 |     int count = (e->level + 2) * m;
+      |     ^~~
+src/hnsw_export.c:606:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+  606 |     PgvItemPointer *slots = (PgvItemPointer *)((char *)ntup + sizeof(PgvHnswNeighHdr));
+      |     ^~~~~~~~~~~~~~
+src/hnsw_export.c:666:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+  666 |     OffsetNumber eoff = PageAddItem(page, (Item)etup, esize, InvalidOffsetNumber,
+      |     ^~~~~~~~~~~~
+src/hnsw_export.c:680:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+  680 |     OffsetNumber noff = PageAddItem(page, (Item)ntup, nsize, InvalidOffsetNumber,
+      |     ^~~~~~~~~~~~
+src/hnsw_export.c: In function ‘write_elem_pages_packed’:
+src/hnsw_export.c:771:9: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+  771 |         Buffer buf  = ReadBuffer(rel, P_NEW);
+      |         ^~~~~~
+src/hnsw_export.c:773:9: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+  773 |         Page   page = BufferGetPage(buf);
+      |         ^~~~
+src/hnsw_export.c:776:9: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+  776 |         PgvHnswPageOpaque *opaque = (PgvHnswPageOpaque *) PageGetSpecialPointer(page);
+      |         ^~~~~~~~~~~~~~~~~
+src/hnsw_export.c: In function ‘fill_hnsw_from_hnswlib_impl’:
+src/hnsw_export.c:871:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+  871 |     Relation cagra_rel = index_open(cagra_oid, AccessShareLock);
+      |     ^~~~~~~~
+src/hnsw_export.c:890:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+  890 |     bool hnsw_unlogged = false;  /* set below; true = skip WAL on page writes */
+      |     ^~~~
+src/hnsw_export.c:899:9: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+  899 |         Form_pg_class cf = (Form_pg_class) GETSTRUCT(tup);
+      |         ^~~~~~~~~~~~~
+src/hnsw_export.c:972:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+  972 |     char hnsw_path[1024];
+      |     ^~~~
+src/hnsw_export.c:981:9: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+  981 |         int shm_rc = cuvs_ipc_export_hnsw_shm(
+      |         ^~~
+src/hnsw_export.c:1001:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 1001 |     FILE *hf = hnsw_open_stream(hnsw_path, res->shm_fd);
+      |     ^~~~
+src/hnsw_export.c:1008:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 1008 |     HnswlibHeader hdr;
+      |     ^~~~~~~~~~~~~
+src/hnsw_export.c:1030:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 1030 |     size_t N  = hdr.curElementCount;
+      |     ^~~~~~
+src/hnsw_export.c:1045:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 1045 |     FILE *tf = fopen(tids_path, "rb");
+      |     ^~~~
+src/hnsw_export.c:1053:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 1053 |     CuvsTidsHeader tids_hdr;
+      |     ^~~~~~~~~~~~~~
+src/hnsw_export.c:1128:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 1128 |     size_t lv0_block_bytes = N * hdr.sizeDataPerElement;
+      |     ^~~~~~
+src/hnsw_export.c:1145:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 1145 |     ElemDesc *elems = (ElemDesc *) calloc(N, sizeof(ElemDesc));
+      |     ^~~~~~~~
+src/hnsw_export.c:1179:9: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 1179 |         size_t label;
+      |         ^~~~~~
+src/hnsw_export.c:1206:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 1206 |     size_t sizeLinksPerElement = ((size_t)M + 1) * sizeof(int);
+      |     ^~~~~~
+src/hnsw_export.c:1224:9: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 1224 |         int elem_level = (int)(llsize / sizeLinksPerElement);
+      |         ^~~
+src/hnsw_export.c:1235:9: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 1235 |         char *llbuf = (char *) malloc(llsize);
+      |         ^~~~
+src/hnsw_export.c:1257:9: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 1257 |         char *p = llbuf;
+      |         ^~~~
+src/hnsw_export.c:1335:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 1335 |     Relation hnsw_rel = index_open(hnsw_oid, AccessExclusiveLock);
+      |     ^~~~~~~~
+src/hnsw_export.c:1360:9: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 1360 |         Page page = BufferGetPage(buf);
+      |         ^~~~
+src/hnsw_export.c:1363:9: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 1363 |         PgvHnswPageOpaque *opaque =
+      |         ^~~~~~~~~~~~~~~~~
+src/hnsw_export.c:1375:9: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 1375 |         PgvHnswMeta *metap = (PgvHnswMeta *) PageGetContents(page);
+      |         ^~~~~~~~~~~
+src/hnsw_export.c:1384:9: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 1384 |         int ep = hdr.enterpointNode;
+      |         ^~~
+src/hnsw_export.c:1412:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 1412 |     float *vec_buf = (float *) palloc((size_t)dim * sizeof(float));
+      |     ^~~~~
+src/hnsw_export.c: In function ‘fill_hnsw_from_cagra_ipc_impl’:
+src/hnsw_export.c:1609:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 1609 |     Relation cagra_rel = index_open(cagra_oid, AccessShareLock);
+      |     ^~~~~~~~
+src/hnsw_export.c:1620:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 1620 |     bool hnsw_unlogged = false;
+      |     ^~~~
+src/hnsw_export.c:1628:9: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 1628 |         Form_pg_class cf = (Form_pg_class) GETSTRUCT(tup);
+      |         ^~~~~~~~~~~~~
+src/hnsw_export.c:1636:9: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 1636 |         Oid hnsw_amoid      = get_am_oid("hnsw", true);
+      |         ^~~
+src/hnsw_export.c:1708:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 1708 |     uint32_t *adj   = NULL;
+      |     ^~~~~~~~
+src/hnsw_export.c:1748:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 1748 |     int M0 = (graph_degree < 64) ? graph_degree : 64;
+      |     ^~~
+src/hnsw_export.c:1751:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 1751 |     int M = M0 / 2;
+      |     ^~~
+src/hnsw_export.c:1762:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 1762 |     int    max_level  = 0;
+      |     ^~~
+src/hnsw_export.c:1785:9: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 1785 |         const uint32_t *row = adj + i * (size_t)graph_degree;
+      |         ^~~~~
+src/hnsw_export.c:1802:9: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 1802 |         int lv = elems[i].level;
+      |         ^~~
+src/hnsw_export.c:1812:13: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 1812 |             int *cand_buf = (int *)malloc((size_t)graph_degree * sizeof(int));
+      |             ^~~
+src/hnsw_export.c:1856:17: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 1856 |                 int n_sel = heuristic_select_neighbors(
+      |                 ^~~
+src/hnsw_export.c:1895:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 1895 |     int pack_k = do_hierarchy ? 1 : elems_per_page((int)ipc_dim, bytes_per_dim, M, 0);
+      |     ^~~
+src/hnsw_export.c:1913:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 1913 |     Relation hnsw_rel = index_open(hnsw_oid, AccessExclusiveLock);
+      |     ^~~~~~~~
+src/hnsw_export.c:1928:9: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 1928 |         Page page = BufferGetPage(buf);
+      |         ^~~~
+src/hnsw_export.c:1931:9: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 1931 |         PgvHnswPageOpaque *opaque =
+      |         ^~~~~~~~~~~~~~~~~
+src/hnsw_export.c:1937:9: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 1937 |         PgvHnswMeta *metap = (PgvHnswMeta *) PageGetContents(page);
+      |         ^~~~~~~~~~~
+src/hnsw_export.c: In function ‘find_hnsw_opclass_oid’:
+src/hnsw_export.c:2060:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 2060 |     Oid hnsw_amoid = get_am_oid("hnsw", true);
+      |     ^~~
+src/hnsw_export.c:2064:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 2064 |     Relation    opcrel = table_open(OperatorClassRelationId, AccessShareLock);
+      |     ^~~~~~~~
+src/hnsw_export.c: In function ‘cagra_index_metric’:
+src/hnsw_export.c:2092:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 2092 |     bool isnull = false;
+      |     ^~~~
+src/hnsw_export.c:2098:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 2098 |     HeapTuple opctup = SearchSysCache1(CLAOID, ObjectIdGetDatum(cagra_opc));
+      |     ^~~~~~~~~
+src/hnsw_export.c:2100:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 2100 |     const char *nm = NameStr(((Form_pg_opclass) GETSTRUCT(opctup))->opcname);
+      |     ^~~~~
+src/hnsw_export.c: In function ‘create_empty_hnsw’:
+src/hnsw_export.c:2115:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 2115 |     Oid heap_oid = ((Form_pg_index) GETSTRUCT(ix_tup))->indrelid;
+      |     ^~~
+src/hnsw_export.c:2122:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 2122 |     uint32_t metric       = cagra_index_metric(cagra_oid);
+      |     ^~~~~~~~
+src/hnsw_export.c:2141:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 2141 |     static int hnsw_build_seq = 0;
+      |     ^~~~~~
+src/hnsw_export.c:2151:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 2151 |     Oid hnsw_oid = index_create(
+      |     ^~~
+src/hnsw_export.c: In function ‘pg_cuvs_build_hnsw’:
+src/hnsw_export.c:2217:9: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 2217 |         int precheck_dim = (int) TupleDescAttr(RelationGetDescr(cagra_rel_pc), 0)->atttypmod;
+      |         ^~~
+src/hnsw_export.c:2220:9: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 2220 |         int m0 = (graph_degree < 64) ? graph_degree : 64;
+      |         ^~~
+src/hnsw_export.c:2228:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 2228 |     Oid hnsw_oid = create_empty_hnsw(cagra_oid);
+      |     ^~~
+src/hnsw_export.c: In function ‘cuvs_hnsw_ambuild’:
+src/hnsw_export.c:2354:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 2354 |     Oid self_oid = RelationGetRelid(indexRel);
+      |     ^~~
+src/hnsw_export.c:2427:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 2427 |     Oid cagra_oid = DatumGetObjectId(
+      |     ^~~
+src/hnsw_export.c:2436:9: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 2436 |         Oid src_heap = ((Form_pg_index) GETSTRUCT(ixtup))->indrelid;
+      |         ^~~
+src/hnsw_export.c:2443:9: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 2443 |         Oid cagra_am = get_am_oid("cagra", true);
+      |         ^~~
+src/hnsw_export.c:2461:13: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 2461 |             int m0 = (graph_degree < 64) ? graph_degree : 64;
+      |             ^~~
+src/hnsw_export.c:2472:9: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 2472 |         uint32_t src_metric = cagra_index_metric(cagra_oid);
+      |         ^~~~~~~~
+src/hnsw_export.c:2494:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 2494 |     size_t n_elems_written;
+      |     ^~~~~~
+src/hnsw_export.c: In function ‘pg_cuvs_hnsw_handler’:
+src/hnsw_export.c:2528:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 2528 |     Oid amhandler = ((Form_pg_am) GETSTRUCT(amtup))->amhandler;
+      |     ^~~
+src/hnsw_export.c:2533:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 2533 |     IndexAmRoutine *amroutine = (IndexAmRoutine *)
+      |     ^~~~~~~~~~~~~~
+gcc -Wall -Wmissing-prototypes -Wpointer-arith -Wdeclaration-after-statement -Werror=vla -Wendif-labels -Wmissing-format-attribute -Wimplicit-fallthrough=3 -Wcast-function-type -Wshadow=compatible-local -Wformat-security -fno-strict-aliasing -fwrapv -fexcess-precision=standard -Wno-format-truncation -Wno-stringop-truncation -g -g -O2 -flto=auto -ffat-lto-objects -flto=auto -ffat-lto-objects -fstack-protector-strong -Wformat -Werror=format-security -fno-omit-frame-pointer -fPIC -fvisibility=hidden -I/opt/miniforge3/envs/cuvs_dev/include -I/opt/miniforge3/envs/cuvs_dev/include/rapids -I./src -I. -I./ -I/usr/include/postgresql/16/server -I/usr/include/postgresql/internal -Wdate-time -D_FORTIFY_SOURCE=2 -D_GNU_SOURCE  -I/usr/include/libxml2   -c -o src/cuvs_build_corpus.o src/cuvs_build_corpus.c
+src/cuvs_build_corpus.c:5: warning: "_GNU_SOURCE" redefined
+    5 | #define _GNU_SOURCE   /* memfd_create, MFD_CLOEXEC */
+      | 
+<command-line>: note: this is the location of the previous definition
+src/cuvs_build_corpus.c: In function ‘open_memfd’:
+src/cuvs_build_corpus.c:97:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+   97 |     void *mem = mmap(NULL, bytes, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+      |     ^~~~
+gcc -Wall -Wmissing-prototypes -Wpointer-arith -Wdeclaration-after-statement -Werror=vla -Wendif-labels -Wmissing-format-attribute -Wimplicit-fallthrough=3 -Wcast-function-type -Wshadow=compatible-local -Wformat-security -fno-strict-aliasing -fwrapv -fexcess-precision=standard -Wno-format-truncation -Wno-stringop-truncation -g -g -O2 -flto=auto -ffat-lto-objects -flto=auto -ffat-lto-objects -fstack-protector-strong -Wformat -Werror=format-security -fno-omit-frame-pointer -fPIC -fvisibility=hidden -I/opt/miniforge3/envs/cuvs_dev/include -I/opt/miniforge3/envs/cuvs_dev/include/rapids -I./src -I. -I./ -I/usr/include/postgresql/16/server -I/usr/include/postgresql/internal -Wdate-time -D_FORTIFY_SOURCE=2 -D_GNU_SOURCE  -I/usr/include/libxml2   -c -o src/pg_cuvs_compaction.o src/pg_cuvs_compaction.c
+gcc -Wall -Wmissing-prototypes -Wpointer-arith -Wdeclaration-after-statement -Werror=vla -Wendif-labels -Wmissing-format-attribute -Wimplicit-fallthrough=3 -Wcast-function-type -Wshadow=compatible-local -Wformat-security -fno-strict-aliasing -fwrapv -fexcess-precision=standard -Wno-format-truncation -Wno-stringop-truncation -g -g -O2 -flto=auto -ffat-lto-objects -flto=auto -ffat-lto-objects -fstack-protector-strong -Wformat -Werror=format-security -fno-omit-frame-pointer -fPIC -fvisibility=hidden -shared -o pg_cuvs.so src/pg_cuvs.o src/cuvs_ipc.o src/cuvs_util.o src/cuvs_wrapper.o src/hnsw_export.o src/cuvs_build_corpus.o src/pg_cuvs_compaction.o -L/usr/lib/x86_64-linux-gnu  -Wl,-Bsymbolic-functions -flto=auto -ffat-lto-objects -flto=auto -Wl,-z,relro -Wl,-z,now  -Wl,--as-needed -fvisibility=hidden -L/opt/miniforge3/envs/cuvs_dev/lib -lcuvs -lcudart -Wl,-rpath,/opt/miniforge3/envs/cuvs_dev/lib -Wl,-Bstatic -lstdc++ -Wl,-Bdynamic -lrt 
+/usr/bin/clang-15 -Wno-ignored-attributes -fno-strict-aliasing -fwrapv -Xclang -no-opaque-pointers -Wno-unused-command-line-argument -Wno-compound-token-split-by-macro -O2  -I/opt/miniforge3/envs/cuvs_dev/include -I/opt/miniforge3/envs/cuvs_dev/include/rapids -I./src -I. -I./ -I/usr/include/postgresql/16/server -I/usr/include/postgresql/internal -Wdate-time -D_FORTIFY_SOURCE=2 -D_GNU_SOURCE  -I/usr/include/libxml2  -flto=thin -emit-llvm -c -o src/pg_cuvs.bc src/pg_cuvs.c
+src/pg_cuvs.c:3369:38: warning: '/*' within block comment [-Wcomment]
+ * caller-supplied tids_out/dists_out/*n_results arrays (no CuvsScanState). */
+                                     ^
+1 warning generated.
+/usr/bin/clang-15 -Wno-ignored-attributes -fno-strict-aliasing -fwrapv -Xclang -no-opaque-pointers -Wno-unused-command-line-argument -Wno-compound-token-split-by-macro -O2  -I/opt/miniforge3/envs/cuvs_dev/include -I/opt/miniforge3/envs/cuvs_dev/include/rapids -I./src -I. -I./ -I/usr/include/postgresql/16/server -I/usr/include/postgresql/internal -Wdate-time -D_FORTIFY_SOURCE=2 -D_GNU_SOURCE  -I/usr/include/libxml2  -flto=thin -emit-llvm -c -o src/cuvs_ipc.bc src/cuvs_ipc.c
+/usr/bin/clang-15 -Wno-ignored-attributes -fno-strict-aliasing -fwrapv -Xclang -no-opaque-pointers -Wno-unused-command-line-argument -Wno-compound-token-split-by-macro -O2  -I/opt/miniforge3/envs/cuvs_dev/include -I/opt/miniforge3/envs/cuvs_dev/include/rapids -I./src -I. -I./ -I/usr/include/postgresql/16/server -I/usr/include/postgresql/internal -Wdate-time -D_FORTIFY_SOURCE=2 -D_GNU_SOURCE  -I/usr/include/libxml2  -flto=thin -emit-llvm -c -o src/cuvs_util.bc src/cuvs_util.c
+/usr/bin/clang-15 -Wno-ignored-attributes -fno-strict-aliasing -fwrapv -Xclang -no-opaque-pointers -Wno-unused-command-line-argument -Wno-compound-token-split-by-macro -O2  -I/opt/miniforge3/envs/cuvs_dev/include -I/opt/miniforge3/envs/cuvs_dev/include/rapids -I./src -I. -I./ -I/usr/include/postgresql/16/server -I/usr/include/postgresql/internal -Wdate-time -D_FORTIFY_SOURCE=2 -D_GNU_SOURCE  -I/usr/include/libxml2  -flto=thin -emit-llvm -c -o src/hnsw_export.bc src/hnsw_export.c
+/usr/bin/clang-15 -Wno-ignored-attributes -fno-strict-aliasing -fwrapv -Xclang -no-opaque-pointers -Wno-unused-command-line-argument -Wno-compound-token-split-by-macro -O2  -I/opt/miniforge3/envs/cuvs_dev/include -I/opt/miniforge3/envs/cuvs_dev/include/rapids -I./src -I. -I./ -I/usr/include/postgresql/16/server -I/usr/include/postgresql/internal -Wdate-time -D_FORTIFY_SOURCE=2 -D_GNU_SOURCE  -I/usr/include/libxml2  -flto=thin -emit-llvm -c -o src/cuvs_build_corpus.bc src/cuvs_build_corpus.c
+src/cuvs_build_corpus.c:5:9: warning: '_GNU_SOURCE' macro redefined [-Wmacro-redefined]
+#define _GNU_SOURCE   /* memfd_create, MFD_CLOEXEC */
+        ^
+<command line>:2:9: note: previous definition is here
+#define _GNU_SOURCE 1
+        ^
+1 warning generated.
+/usr/bin/clang-15 -Wno-ignored-attributes -fno-strict-aliasing -fwrapv -Xclang -no-opaque-pointers -Wno-unused-command-line-argument -Wno-compound-token-split-by-macro -O2  -I/opt/miniforge3/envs/cuvs_dev/include -I/opt/miniforge3/envs/cuvs_dev/include/rapids -I./src -I. -I./ -I/usr/include/postgresql/16/server -I/usr/include/postgresql/internal -Wdate-time -D_FORTIFY_SOURCE=2 -D_GNU_SOURCE  -I/usr/include/libxml2  -flto=thin -emit-llvm -c -o src/pg_cuvs_compaction.bc src/pg_cuvs_compaction.c
++ sudo -E env PATH=/opt/miniforge3/envs/cuvs_dev/bin:/usr/lib/postgresql/16/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games:/usr/local/games:/snap/bin CONDA_PREFIX=/opt/miniforge3/envs/cuvs_dev make install
+/bin/mkdir -p '/usr/lib/postgresql/16/lib'
+/bin/mkdir -p '/usr/share/postgresql/16/extension'
+/bin/mkdir -p '/usr/share/postgresql/16/extension'
+/usr/bin/install -c -m 755  pg_cuvs.so '/usr/lib/postgresql/16/lib/pg_cuvs.so'
+/usr/bin/install -c -m 644 .//pg_cuvs.control '/usr/share/postgresql/16/extension/'
+/usr/bin/install -c -m 644 .//sql/pg_cuvs--0.1.0.sql .//sql/pg_cuvs--0.1.0--0.2.0.sql .//sql/pg_cuvs--0.2.0.sql .//sql/pg_cuvs--0.2.0--0.3.0.sql .//sql/pg_cuvs--0.3.0.sql .//sql/pg_cuvs--0.3.0--0.4.0.sql .//sql/pg_cuvs--0.4.0.sql .//sql/pg_cuvs--0.4.0--0.5.0.sql .//sql/pg_cuvs--0.5.0.sql .//sql/pg_cuvs--0.5.0--0.6.0.sql .//sql/pg_cuvs--0.6.0.sql .//sql/pg_cuvs--0.6.0--0.7.0.sql .//sql/pg_cuvs--0.7.0.sql .//sql/pg_cuvs--0.7.0--0.8.0.sql .//sql/pg_cuvs--0.8.0.sql  '/usr/share/postgresql/16/extension/'
+/bin/mkdir -p '/usr/lib/postgresql/16/lib/bitcode/pg_cuvs'
+/bin/mkdir -p '/usr/lib/postgresql/16/lib/bitcode'/pg_cuvs/src/
+/usr/bin/install -c -m 644 src/pg_cuvs.bc '/usr/lib/postgresql/16/lib/bitcode'/pg_cuvs/src/
+/usr/bin/install -c -m 644 src/cuvs_ipc.bc '/usr/lib/postgresql/16/lib/bitcode'/pg_cuvs/src/
+/usr/bin/install -c -m 644 src/cuvs_util.bc '/usr/lib/postgresql/16/lib/bitcode'/pg_cuvs/src/
+/usr/bin/install -c -m 644 src/cuvs_wrapper.bc '/usr/lib/postgresql/16/lib/bitcode'/pg_cuvs/src/
+/usr/bin/install -c -m 644 src/hnsw_export.bc '/usr/lib/postgresql/16/lib/bitcode'/pg_cuvs/src/
+/usr/bin/install -c -m 644 src/cuvs_build_corpus.bc '/usr/lib/postgresql/16/lib/bitcode'/pg_cuvs/src/
+/usr/bin/install -c -m 644 src/pg_cuvs_compaction.bc '/usr/lib/postgresql/16/lib/bitcode'/pg_cuvs/src/
+cd '/usr/lib/postgresql/16/lib/bitcode' && /usr/lib/llvm-15/bin/llvm-lto -thinlto -thinlto-action=thinlink -o pg_cuvs.index.bc pg_cuvs/src/pg_cuvs.bc pg_cuvs/src/cuvs_ipc.bc pg_cuvs/src/cuvs_util.bc pg_cuvs/src/cuvs_wrapper.bc pg_cuvs/src/hnsw_export.bc pg_cuvs/src/cuvs_build_corpus.bc pg_cuvs/src/pg_cuvs_compaction.bc
++ make server
+gcc -O2 -g -Wall -Wextra -I./src -I/opt/miniforge3/envs/cuvs_dev/include -I/opt/miniforge3/envs/cuvs_dev/include/rapids -std=gnu11 -D_POSIX_C_SOURCE=200809L  -c src/pg_cuvs_server.c -o src/pg_cuvs_server.o
+src/pg_cuvs_server.c: In function ‘refresh_delta_cache’:
+src/pg_cuvs_server.c:928:21: warning: unused variable ‘base_crc’ [-Wunused-variable]
+  928 |     uint32_t        base_crc;
+      |                     ^~~~~~~~
+At top level:
+src/pg_cuvs_server.c:704:1: warning: ‘is_gpu_allowed’ defined but not used [-Wunused-function]
+  704 | is_gpu_allowed(int device_id)
+      | ^~~~~~~~~~~~~~
+src/pg_cuvs_server.c: In function ‘handle_search_bf_transient’:
+src/pg_cuvs_server.c:2669:18: warning: ‘ MB exceeds free GPU VRAM; r...’ directive output may be truncated writing 103 bytes into a region of size between 94 and 107 [-Wformat-truncation=]
+ 2669 |                  "transient BF corpus %zu MB exceeds free GPU VRAM; reduce the WHERE "
+      |                  ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+src/pg_cuvs_server.c:2669:42: note: format string is defined here
+ 2669 |                  "transient BF corpus %zu MB exceeds free GPU VRAM; reduce the WHERE "
+      |                                          ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+ 2670 |                  "selectivity, build a flat index, or use a cagra/ivfpq index",
+      |                  ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+In file included from /usr/include/stdio.h:894,
+                 from src/cuvs_util.h:13,
+                 from src/pg_cuvs_server.c:30:
+/usr/include/x86_64-linux-gnu/bits/stdio2.h:71:10: note: ‘__builtin___snprintf_chk’ output between 125 and 138 bytes into a destination of size 128
+   71 |   return __builtin___snprintf_chk (__s, __n, __USE_FORTIFY_LEVEL - 1,
+      |          ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+   72 |                                    __glibc_objsize (__s), __fmt,
+      |                                    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+   73 |                                    __va_arg_pack ());
+      |                                    ~~~~~~~~~~~~~~~~~
+In file included from /usr/include/string.h:535,
+                 from src/pg_cuvs_server.c:38:
+In function ‘strncpy’,
+    inlined from ‘finish_build_commit’ at src/pg_cuvs_server.c:5619:13:
+/usr/include/x86_64-linux-gnu/bits/string_fortified.h:95:10: warning: ‘__builtin_strncpy’ output may be truncated copying 511 bytes from a string of length 511 [-Wstringop-truncation]
+   95 |   return __builtin___strncpy_chk (__dest, __src, __len,
+      |          ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+   96 |                                   __glibc_objsize (__dest));
+      |                                   ~~~~~~~~~~~~~~~~~~~~~~~~~
+In function ‘strncpy’,
+    inlined from ‘finish_build_commit’ at src/pg_cuvs_server.c:5620:13:
+/usr/include/x86_64-linux-gnu/bits/string_fortified.h:95:10: warning: ‘__builtin_strncpy’ output may be truncated copying 127 bytes from a string of length 127 [-Wstringop-truncation]
+   95 |   return __builtin___strncpy_chk (__dest, __src, __len,
+      |          ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+   96 |                                   __glibc_objsize (__dest));
+      |                                   ~~~~~~~~~~~~~~~~~~~~~~~~~
+In function ‘strncpy’,
+    inlined from ‘finish_build_commit’ at src/pg_cuvs_server.c:5621:13:
+/usr/include/x86_64-linux-gnu/bits/string_fortified.h:95:10: warning: ‘__builtin_strncpy’ output may be truncated copying 511 bytes from a string of length 511 [-Wstringop-truncation]
+   95 |   return __builtin___strncpy_chk (__dest, __src, __len,
+      |          ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+   96 |                                   __glibc_objsize (__dest));
+      |                                   ~~~~~~~~~~~~~~~~~~~~~~~~~
+In function ‘strncpy’,
+    inlined from ‘finish_build_commit’ at src/pg_cuvs_server.c:5622:13:
+/usr/include/x86_64-linux-gnu/bits/string_fortified.h:95:10: warning: ‘__builtin_strncpy’ output may be truncated copying 511 bytes from a string of length 511 [-Wstringop-truncation]
+   95 |   return __builtin___strncpy_chk (__dest, __src, __len,
+      |          ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+   96 |                                   __glibc_objsize (__dest));
+      |                                   ~~~~~~~~~~~~~~~~~~~~~~~~~
+In function ‘strncpy’,
+    inlined from ‘finish_build_commit’ at src/pg_cuvs_server.c:5623:13:
+/usr/include/x86_64-linux-gnu/bits/string_fortified.h:95:10: warning: ‘__builtin_strncpy’ output may be truncated copying 511 bytes from a string of length 511 [-Wstringop-truncation]
+   95 |   return __builtin___strncpy_chk (__dest, __src, __len,
+      |          ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+   96 |                                   __glibc_objsize (__dest));
+      |                                   ~~~~~~~~~~~~~~~~~~~~~~~~~
+In function ‘strncpy’,
+    inlined from ‘build_sharded’ at src/pg_cuvs_server.c:4984:13:
+/usr/include/x86_64-linux-gnu/bits/string_fortified.h:95:10: warning: ‘__builtin_strncpy’ output may be truncated copying 511 bytes from a string of length 511 [-Wstringop-truncation]
+   95 |   return __builtin___strncpy_chk (__dest, __src, __len,
+      |          ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+   96 |                                   __glibc_objsize (__dest));
+      |                                   ~~~~~~~~~~~~~~~~~~~~~~~~~
+In function ‘strncpy’,
+    inlined from ‘build_sharded’ at src/pg_cuvs_server.c:4985:13:
+/usr/include/x86_64-linux-gnu/bits/string_fortified.h:95:10: warning: ‘__builtin_strncpy’ output may be truncated copying 127 bytes from a string of length 127 [-Wstringop-truncation]
+   95 |   return __builtin___strncpy_chk (__dest, __src, __len,
+      |          ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+   96 |                                   __glibc_objsize (__dest));
+      |                                   ~~~~~~~~~~~~~~~~~~~~~~~~~
+In function ‘strncpy’,
+    inlined from ‘build_sharded’ at src/pg_cuvs_server.c:4986:13:
+/usr/include/x86_64-linux-gnu/bits/string_fortified.h:95:10: warning: ‘__builtin_strncpy’ output may be truncated copying 511 bytes from a string of length 511 [-Wstringop-truncation]
+   95 |   return __builtin___strncpy_chk (__dest, __src, __len,
+      |          ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+   96 |                                   __glibc_objsize (__dest));
+      |                                   ~~~~~~~~~~~~~~~~~~~~~~~~~
+src/pg_cuvs_server.c: In function ‘handle_build_flat’:
+src/pg_cuvs_server.c:6746:22: warning: ‘ MB); shard the table or use...’ directive output may be truncated writing 48 bytes into a region of size between 29 and 66 [-Wformat-truncation=]
+ 6746 |                      "flat corpus %zu MB (float16 %zu MB) exceeds the GPU VRAM budget "
+      |                      ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+src/pg_cuvs_server.c:6747:27: note: format string is defined here
+ 6747 |                      "(%zu MB); shard the table or use a cagra/ivfpq index",
+      |                           ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+In file included from /usr/include/stdio.h:894,
+                 from src/cuvs_util.h:13,
+                 from src/pg_cuvs_server.c:30:
+/usr/include/x86_64-linux-gnu/bits/stdio2.h:71:10: note: ‘__builtin___snprintf_chk’ output between 111 and 148 bytes into a destination of size 128
+   71 |   return __builtin___snprintf_chk (__s, __n, __USE_FORTIFY_LEVEL - 1,
+      |          ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+   72 |                                    __glibc_objsize (__s), __fmt,
+      |                                    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+   73 |                                    __va_arg_pack ());
+      |                                    ~~~~~~~~~~~~~~~~~
+In file included from /usr/include/string.h:535,
+                 from src/pg_cuvs_server.c:38:
+In function ‘strncpy’,
+    inlined from ‘handle_stats’ at src/pg_cuvs_server.c:6044:9,
+    inlined from ‘connection_thread’ at src/pg_cuvs_server.c:7887:13:
+/usr/include/x86_64-linux-gnu/bits/string_fortified.h:95:10: warning: ‘__builtin_strncpy’ output may be truncated copying 127 bytes from a string of length 127 [-Wstringop-truncation]
+   95 |   return __builtin___strncpy_chk (__dest, __src, __len,
+      |          ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+   96 |                                   __glibc_objsize (__dest));
+      |                                   ~~~~~~~~~~~~~~~~~~~~~~~~~
+In function ‘strncpy’,
+    inlined from ‘main’ at src/pg_cuvs_server.c:8724:5:
+/usr/include/x86_64-linux-gnu/bits/string_fortified.h:95:10: warning: ‘__builtin_strncpy’ output may be truncated copying 107 bytes from a string of length 255 [-Wstringop-truncation]
+   95 |   return __builtin___strncpy_chk (__dest, __src, __len,
+      |          ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+   96 |                                   __glibc_objsize (__dest));
+      |                                   ~~~~~~~~~~~~~~~~~~~~~~~~~
+gcc -O2 -g -Wall -Wextra -I./src -I/opt/miniforge3/envs/cuvs_dev/include -I/opt/miniforge3/envs/cuvs_dev/include/rapids -std=gnu11 -D_POSIX_C_SOURCE=200809L  -c src/cuvs_ipc.c -o src/cuvs_ipc_server.o
+In file included from /usr/include/string.h:535,
+                 from src/cuvs_ipc.c:32:
+In function ‘strncpy’,
+    inlined from ‘cuvs_ipc_search’ at src/cuvs_ipc.c:549:5:
+/usr/include/x86_64-linux-gnu/bits/string_fortified.h:95:10: warning: ‘__builtin_strncpy’ output may be truncated copying 63 bytes from a string of length 63 [-Wstringop-truncation]
+   95 |   return __builtin___strncpy_chk (__dest, __src, __len,
+      |          ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+   96 |                                   __glibc_objsize (__dest));
+      |                                   ~~~~~~~~~~~~~~~~~~~~~~~~~
+In function ‘strncpy’,
+    inlined from ‘cuvs_ipc_search_batch’ at src/cuvs_ipc.c:681:5:
+/usr/include/x86_64-linux-gnu/bits/string_fortified.h:95:10: warning: ‘__builtin_strncpy’ output may be truncated copying 63 bytes from a string of length 63 [-Wstringop-truncation]
+   95 |   return __builtin___strncpy_chk (__dest, __src, __len,
+      |          ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+   96 |                                   __glibc_objsize (__dest));
+      |                                   ~~~~~~~~~~~~~~~~~~~~~~~~~
+In function ‘strncpy’,
+    inlined from ‘cuvs_ipc_build’ at src/cuvs_ipc.c:1008:9:
+/usr/include/x86_64-linux-gnu/bits/string_fortified.h:95:10: warning: ‘__builtin_strncpy’ output may be truncated copying 63 bytes from a string of length 63 [-Wstringop-truncation]
+   95 |   return __builtin___strncpy_chk (__dest, __src, __len,
+      |          ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+   96 |                                   __glibc_objsize (__dest));
+      |                                   ~~~~~~~~~~~~~~~~~~~~~~~~~
+In function ‘strncpy’,
+    inlined from ‘cuvs_ipc_build’ at src/cuvs_ipc.c:1046:5:
+/usr/include/x86_64-linux-gnu/bits/string_fortified.h:95:10: warning: ‘__builtin_strncpy’ output may be truncated copying 63 bytes from a string of length 63 [-Wstringop-truncation]
+   95 |   return __builtin___strncpy_chk (__dest, __src, __len,
+      |          ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+   96 |                                   __glibc_objsize (__dest));
+      |                                   ~~~~~~~~~~~~~~~~~~~~~~~~~
+In function ‘strncpy’,
+    inlined from ‘cuvs_ipc_build_flat’ at src/cuvs_ipc.c:1116:9:
+/usr/include/x86_64-linux-gnu/bits/string_fortified.h:95:10: warning: ‘__builtin_strncpy’ output may be truncated copying 63 bytes from a string of length 63 [-Wstringop-truncation]
+   95 |   return __builtin___strncpy_chk (__dest, __src, __len,
+      |          ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+   96 |                                   __glibc_objsize (__dest));
+      |                                   ~~~~~~~~~~~~~~~~~~~~~~~~~
+In function ‘strncpy’,
+    inlined from ‘cuvs_ipc_build_flat’ at src/cuvs_ipc.c:1150:5:
+/usr/include/x86_64-linux-gnu/bits/string_fortified.h:95:10: warning: ‘__builtin_strncpy’ output may be truncated copying 63 bytes from a string of length 63 [-Wstringop-truncation]
+   95 |   return __builtin___strncpy_chk (__dest, __src, __len,
+      |          ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+   96 |                                   __glibc_objsize (__dest));
+      |                                   ~~~~~~~~~~~~~~~~~~~~~~~~~
+In function ‘strncpy’,
+    inlined from ‘cuvs_ipc_search_filtered’ at src/cuvs_ipc.c:1567:5:
+/usr/include/x86_64-linux-gnu/bits/string_fortified.h:95:10: warning: ‘__builtin_strncpy’ output may be truncated copying 63 bytes from a string of length 63 [-Wstringop-truncation]
+   95 |   return __builtin___strncpy_chk (__dest, __src, __len,
+      |          ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+   96 |                                   __glibc_objsize (__dest));
+      |                                   ~~~~~~~~~~~~~~~~~~~~~~~~~
+/usr/include/x86_64-linux-gnu/bits/string_fortified.h:95:10: warning: ‘__builtin_strncpy’ output may be truncated copying 63 bytes from a string of length 63 [-Wstringop-truncation]
+In function ‘strncpy’,
+    inlined from ‘cuvs_ipc_search_filtered’ at src/cuvs_ipc.c:1569:9:
+/usr/include/x86_64-linux-gnu/bits/string_fortified.h:95:10: warning: ‘__builtin_strncpy’ output may be truncated copying 63 bytes from a string of length 63 [-Wstringop-truncation]
+   95 |   return __builtin___strncpy_chk (__dest, __src, __len,
+      |          ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+   96 |                                   __glibc_objsize (__dest));
+      |                                   ~~~~~~~~~~~~~~~~~~~~~~~~~
+In function ‘strncpy’,
+    inlined from ‘cuvs_ipc_search_stream_bf’ at src/cuvs_ipc.c:1716:5:
+/usr/include/x86_64-linux-gnu/bits/string_fortified.h:95:10: warning: ‘__builtin_strncpy’ output may be truncated copying 63 bytes from a string of length 63 [-Wstringop-truncation]
+   95 |   return __builtin___strncpy_chk (__dest, __src, __len,
+      |          ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+   96 |                                   __glibc_objsize (__dest));
+      |                                   ~~~~~~~~~~~~~~~~~~~~~~~~~
+In function ‘strncpy’,
+    inlined from ‘cuvs_ipc_search_stream_bf’ at src/cuvs_ipc.c:1717:5:
+/usr/include/x86_64-linux-gnu/bits/string_fortified.h:95:10: warning: ‘__builtin_strncpy’ output may be truncated copying 63 bytes from a string of length 63 [-Wstringop-truncation]
+   95 |   return __builtin___strncpy_chk (__dest, __src, __len,
+      |          ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+   96 |                                   __glibc_objsize (__dest));
+      |                                   ~~~~~~~~~~~~~~~~~~~~~~~~~
+In function ‘strncpy’,
+    inlined from ‘cuvs_ipc_search_bf_transient’ at src/cuvs_ipc.c:1863:5:
+/usr/include/x86_64-linux-gnu/bits/string_fortified.h:95:10: warning: ‘__builtin_strncpy’ output may be truncated copying 63 bytes from a string of length 63 [-Wstringop-truncation]
+   95 |   return __builtin___strncpy_chk (__dest, __src, __len,
+      |          ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+   96 |                                   __glibc_objsize (__dest));
+      |                                   ~~~~~~~~~~~~~~~~~~~~~~~~~
+In function ‘strncpy’,
+    inlined from ‘cuvs_ipc_search_bf_transient’ at src/cuvs_ipc.c:1865:9:
+/usr/include/x86_64-linux-gnu/bits/string_fortified.h:95:10: warning: ‘__builtin_strncpy’ output may be truncated copying 63 bytes from a string of length 63 [-Wstringop-truncation]
+   95 |   return __builtin___strncpy_chk (__dest, __src, __len,
+      |          ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+   96 |                                   __glibc_objsize (__dest));
+      |                                   ~~~~~~~~~~~~~~~~~~~~~~~~~
+In function ‘strncpy’,
+    inlined from ‘cuvs_ipc_build_ivfpq’ at src/cuvs_ipc.c:1988:5:
+/usr/include/x86_64-linux-gnu/bits/string_fortified.h:95:10: warning: ‘__builtin_strncpy’ output may be truncated copying 63 bytes from a string of length 63 [-Wstringop-truncation]
+   95 |   return __builtin___strncpy_chk (__dest, __src, __len,
+      |          ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+   96 |                                   __glibc_objsize (__dest));
+      |                                   ~~~~~~~~~~~~~~~~~~~~~~~~~
+In function ‘strncpy’,
+    inlined from ‘cuvs_ipc_search_ivfpq’ at src/cuvs_ipc.c:2062:5:
+/usr/include/x86_64-linux-gnu/bits/string_fortified.h:95:10: warning: ‘__builtin_strncpy’ output may be truncated copying 63 bytes from a string of length 63 [-Wstringop-truncation]
+   95 |   return __builtin___strncpy_chk (__dest, __src, __len,
+      |          ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+   96 |                                   __glibc_objsize (__dest));
+      |                                   ~~~~~~~~~~~~~~~~~~~~~~~~~
+In function ‘strncpy’,
+    inlined from ‘cuvs_ipc_extend’ at src/cuvs_ipc.c:2163:5:
+/usr/include/x86_64-linux-gnu/bits/string_fortified.h:95:10: warning: ‘__builtin_strncpy’ output may be truncated copying 63 bytes from a string of length 63 [-Wstringop-truncation]
+   95 |   return __builtin___strncpy_chk (__dest, __src, __len,
+      |          ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+   96 |                                   __glibc_objsize (__dest));
+      |                                   ~~~~~~~~~~~~~~~~~~~~~~~~~
+gcc -O2 -g -Wall -Wextra -I./src -I/opt/miniforge3/envs/cuvs_dev/include -I/opt/miniforge3/envs/cuvs_dev/include/rapids -std=gnu11 -D_POSIX_C_SOURCE=200809L  -c src/cuvs_util.c -o src/cuvs_util_server.o
+gcc -O2 -g -Wall -Wextra -I./src -I/opt/miniforge3/envs/cuvs_dev/include -I/opt/miniforge3/envs/cuvs_dev/include/rapids -std=gnu11 -D_POSIX_C_SOURCE=200809L  -c src/cuvs_objstore.c -o src/cuvs_objstore_server.o
+gcc -O2 -g -Wall -Wextra -I./src -I/opt/miniforge3/envs/cuvs_dev/include -I/opt/miniforge3/envs/cuvs_dev/include/rapids -std=gnu11 -D_POSIX_C_SOURCE=200809L  -c src/cuvs_build_corpus.c -o src/cuvs_build_corpus_server.o
+g++ -o pg_cuvs_server src/pg_cuvs_server.o src/cuvs_ipc_server.o src/cuvs_util_server.o src/cuvs_objstore_server.o src/cuvs_build_corpus_server.o src/cuvs_wrapper.o -L/opt/miniforge3/envs/cuvs_dev/lib -lcuvs -lrmm -lcudart -Wl,-rpath,/opt/miniforge3/envs/cuvs_dev/lib -lstdc++ -lpthread -lrt -lcurl -lssl -lcrypto 
++ sudo -E env PATH=/opt/miniforge3/envs/cuvs_dev/bin:/usr/lib/postgresql/16/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games:/usr/local/games:/snap/bin CONDA_PREFIX=/opt/miniforge3/envs/cuvs_dev make install-server
+install -m 755 pg_cuvs_server /usr/lib/postgresql/16/bin/
+++ pg_config --pkglibdir
++ PKGLIB=/usr/lib/postgresql/16/lib
++ test -f /usr/lib/postgresql/16/lib/pg_cuvs.so
+++ pg_config --bindir
++ test -x /usr/lib/postgresql/16/bin/pg_cuvs_server
++ echo '=== [4/5] runtime: preload, GUCs, environment, daemon =================='
+=== [4/5] runtime: preload, GUCs, environment, daemon ==================
++ sudo mkdir -p /tmp/cuvs_indexes
++ sudo chmod 1777 /tmp/cuvs_indexes
++ echo 'LD_LIBRARY_PATH='\''/opt/miniforge3/envs/cuvs_dev/lib'\'''
++ sudo tee /etc/postgresql/16/main/environment
+LD_LIBRARY_PATH='/opt/miniforge3/envs/cuvs_dev/lib'
++ sudo -u postgres psql -c 'ALTER SYSTEM SET shared_preload_libraries='\''pg_cuvs'\'''
+ALTER SYSTEM
++ sudo systemctl restart postgresql@16-main
++ sleep 3
++ sudo -u postgres psql -c 'ALTER SYSTEM SET cuvs.socket_path='\''/tmp/.s.pg_cuvs'\'''
+ALTER SYSTEM
++ sudo -u postgres psql -c 'ALTER SYSTEM SET cuvs.index_dir='\''/tmp/cuvs_indexes'\'''
+ALTER SYSTEM
+++ id -u
++ sudo -u postgres psql -c 'ALTER SYSTEM SET cuvs.daemon_uid=1000'
+ALTER SYSTEM
++ sudo -u postgres psql -c 'SELECT pg_reload_conf()'
+ pg_reload_conf 
+----------------
+ t
+(1 row)
+
++ pkill -9 -x pg_cuvs_server
++ true
++ sleep 1
++ sudo tee /usr/local/bin/pg-cuvs-wait-socket
++ sudo chmod 755 /usr/local/bin/pg-cuvs-wait-socket
++ sudo tee /etc/systemd/system/pg-cuvs-server.service
+++ id -un
+++ id -gn
+++ pg_config --bindir
++ sudo systemctl daemon-reload
++ sudo systemctl enable pg-cuvs-server
+Created symlink /etc/systemd/system/multi-user.target.wants/pg-cuvs-server.service → /etc/systemd/system/pg-cuvs-server.service.
++ sudo systemctl restart pg-cuvs-server
++ set +x
++ test -S /tmp/.s.pg_cuvs
++ sudo chmod 666 /tmp/.s.pg_cuvs
++ echo 'SOCKET OK'
+SOCKET OK
++ echo '=== [5/5] dataset: wiki_all_1M -> corpus.fbin/queries_10k.fbin/gt.npy ==='
+=== [5/5] dataset: wiki_all_1M -> corpus.fbin/queries_10k.fbin/gt.npy ===
++ D=/home/ubuntu/data
++ mkdir -p /home/ubuntu/data/raw
++ '[' '!' -f /home/ubuntu/data/corpus.fbin ']'
++ curl -sSL -o /home/ubuntu/data/raw/wiki_all_1M.tar https://data.rapids.ai/raft/datasets/wiki_all_1M/wiki_all_1M.tar
++ tar -xf /home/ubuntu/data/raw/wiki_all_1M.tar -C /home/ubuntu/data/raw
++ ln -f /home/ubuntu/data/raw/base.1M.fbin /home/ubuntu/data/corpus.fbin
++ ln -f /home/ubuntu/data/raw/queries.fbin /home/ubuntu/data/queries_10k.fbin
++ /opt/miniforge3/envs/cuvs_bench/bin/python -
+gt (10000, 100)
++ echo '=== BOOTSTRAP DONE ==='
+=== BOOTSTRAP DONE ===
++ echo '  build/bench env : /opt/miniforge3/envs/cuvs_dev | /opt/miniforge3/envs/cuvs_bench'
+  build/bench env : /opt/miniforge3/envs/cuvs_dev | /opt/miniforge3/envs/cuvs_bench
++ echo '  daemon socket   : /tmp/.s.pg_cuvs   (index dir /tmp/cuvs_indexes)'
+  daemon socket   : /tmp/.s.pg_cuvs   (index dir /tmp/cuvs_indexes)
++ echo '  build env file  : /home/ubuntu/.pg_cuvs_env  (`. /home/ubuntu/.pg_cuvs_env` — what this build used; make gpu-* sources it)'
+  build env file  : /home/ubuntu/.pg_cuvs_env  (`. /home/ubuntu/.pg_cuvs_env` — what this build used; make gpu-* sources it)
++ echo '  dataset         : /home/ubuntu/data/{corpus.fbin,queries_10k.fbin,gt_1000000.npy}'
+  dataset         : /home/ubuntu/data/{corpus.fbin,queries_10k.fbin,gt_1000000.npy}
++ echo '  bench:  export PGHOST=/var/run/postgresql PATH=/opt/miniforge3/envs/cuvs_bench/bin:/usr/lib/postgresql/16/bin:$PATH LD_LIBRARY_PATH=/opt/miniforge3/envs/cuvs_dev/lib'
+  bench:  export PGHOST=/var/run/postgresql PATH=/opt/miniforge3/envs/cuvs_bench/bin:/usr/lib/postgresql/16/bin:$PATH LD_LIBRARY_PATH=/opt/miniforge3/envs/cuvs_dev/lib
++ echo '          python bench/adr079_3o_recall.py --data-dir /home/ubuntu/data --n 1000000 --queries 100 --k 10 \'
+          python bench/adr079_3o_recall.py --data-dir /home/ubuntu/data --n 1000000 --queries 100 --k 10 \
++ echo '                 --dbname ubuntu --index-dir /tmp/cuvs_indexes --selectivities 0.05,0.01,0.001,0.0002 --reuse-table --out /tmp/x.csv'
+                 --dbname ubuntu --index-dir /tmp/cuvs_indexes --selectivities 0.05,0.01,0.001,0.0002 --reuse-table --out /tmp/x.csv

@@ -1,0 +1,16 @@
+Collecting pgvector
+  Downloading pgvector-0.5.1-py3-none-any.whl.metadata (19 kB)
+Collecting psycopg[binary]
+  Downloading psycopg-3.3.6-py3-none-any.whl.metadata (4.4 kB)
+Collecting psycopg-binary==3.3.6 (from psycopg[binary])
+  Downloading psycopg_binary-3.3.6-cp314-cp314-musllinux_1_2_aarch64.whl.metadata (2.7 kB)
+Downloading psycopg-3.3.6-py3-none-any.whl (215 kB)
+Downloading psycopg_binary-3.3.6-cp314-cp314-musllinux_1_2_aarch64.whl (4.6 MB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 4.6/4.6 MB 25.9 MB/s  0:00:00
+Downloading pgvector-0.5.1-py3-none-any.whl (31 kB)
+Installing collected packages: psycopg-binary, psycopg, pgvector
+
+Successfully installed pgvector-0.5.1 psycopg-3.3.6 psycopg-binary-3.3.6
+
+[notice] A new release of pip is available: 26.2.1 -> 26.2.2
+[notice] To update, run: /opt/miniforge3/envs/cuvs_bench/bin/python3 -m pip install --upgrade pip

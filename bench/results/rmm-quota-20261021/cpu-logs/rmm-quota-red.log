@@ -1,0 +1,33 @@
+clang -I src -DCUVS_TEST_HOOKS -o test-unit test/unit/test_cuvs_util.c src/cuvs_util.c 
+Undefined symbols for architecture arm64:
+  "_cuvs_parse_rmm_pool_percent", referenced from:
+      _test_rmm_pool_size in test_cuvs_util-8e5d23.o
+      _test_rmm_pool_size in test_cuvs_util-8e5d23.o
+      _test_rmm_pool_size in test_cuvs_util-8e5d23.o
+      _test_rmm_pool_size in test_cuvs_util-8e5d23.o
+      _test_rmm_pool_size in test_cuvs_util-8e5d23.o
+      _test_rmm_pool_size in test_cuvs_util-8e5d23.o
+      _test_rmm_pool_size in test_cuvs_util-8e5d23.o
+      ...
+  "_cuvs_rmm_pool_headroom", referenced from:
+      _test_rmm_pool_size in test_cuvs_util-8e5d23.o
+      _test_rmm_pool_size in test_cuvs_util-8e5d23.o
+      _test_rmm_pool_size in test_cuvs_util-8e5d23.o
+      _test_rmm_pool_size in test_cuvs_util-8e5d23.o
+      _test_rmm_pool_size in test_cuvs_util-8e5d23.o
+      _test_rmm_pool_size in test_cuvs_util-8e5d23.o
+      _test_rmm_pool_size in test_cuvs_util-8e5d23.o
+      _test_rmm_pool_size in test_cuvs_util-8e5d23.o
+      _test_rmm_pool_size in test_cuvs_util-8e5d23.o
+      _test_rmm_pool_size in test_cuvs_util-8e5d23.o
+      ...
+  "_cuvs_rmm_pool_max_bytes", referenced from:
+      _test_rmm_pool_size in test_cuvs_util-8e5d23.o
+      _test_rmm_pool_size in test_cuvs_util-8e5d23.o
+      _test_rmm_pool_size in test_cuvs_util-8e5d23.o
+      _test_rmm_pool_size in test_cuvs_util-8e5d23.o
+      _test_rmm_pool_size in test_cuvs_util-8e5d23.o
+      _test_rmm_pool_size in test_cuvs_util-8e5d23.o
+ld: symbol(s) not found for architecture arm64
+clang: error: linker command failed with exit code 1 (use -v to see invocation)
+make: *** [test-unit] Error 1

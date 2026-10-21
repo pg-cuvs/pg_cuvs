@@ -1,0 +1,22 @@
+{
+  "observed_at_utc": "2026-10-20T16:56:25.455172+00:00",
+  "workspace": {
+    "name": "pg-cuvs-index-accel-20261020",
+    "id": "v6nc08sjs",
+    "status": "STOPPED",
+    "build_status": "COMPLETED",
+    "shell_status": "NOT READY",
+    "health_status": "HEALTHY",
+    "instance_type": "l40s-48gb.1x",
+    "instance_kind": "gpu",
+    "gpu": "L40S"
+  },
+  "first_successfully_created_observed_at_utc": "2026-10-20T14:51:40+00:00",
+  "observed_running_seconds_upper_bound": 7485.455172,
+  "displayed_usd_per_hour": 1.74,
+  "estimated_compute_usd": 3.6179699997999997,
+  "billing_note": "creation observation to STOPPED observation; approximate compute at displayed rate, not invoice; storage price not verified",
+  "ssh_alias": "pg-cuvs-index-accel-20261020",
+  "ip_during_run": "160.211.47.183",
+  "retained_graph_backup": "/home/ubuntu/index-accel-validation/graph-snapshot"
+}

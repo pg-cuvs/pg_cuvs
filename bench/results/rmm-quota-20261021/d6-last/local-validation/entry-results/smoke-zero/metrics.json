@@ -1,0 +1,22 @@
+[
+  {
+    "byte_identical_to_baseline": null,
+    "k": 64,
+    "observed_gpu_errors": 0,
+    "observed_gpu_queries": 8,
+    "observed_search_mode": "gpu_cagra",
+    "p50_ms": 2.194800414144993,
+    "qps": 451.32204896148573,
+    "recall_at10": 1.0
+  },
+  {
+    "byte_identical_to_baseline": null,
+    "k": 128,
+    "observed_gpu_errors": 0,
+    "observed_gpu_queries": 8,
+    "observed_search_mode": "gpu_cagra",
+    "p50_ms": 2.303803921677172,
+    "qps": 425.0040069301909,
+    "recall_at10": 1.0
+  }
+]

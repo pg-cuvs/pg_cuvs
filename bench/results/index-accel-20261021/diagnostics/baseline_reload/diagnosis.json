@@ -1,0 +1,43 @@
+{
+  "graph_equal": true,
+  "queries_equal": true,
+  "truth_equal": true,
+  "points": [
+    {
+      "k": 64,
+      "id_changed_queries": 30,
+      "id_changed_positions": 143,
+      "distance_changed_queries": 30,
+      "changed_query_sample": [
+        269,
+        491,
+        719,
+        997,
+        1314,
+        1683,
+        1850,
+        2769,
+        2871,
+        3028
+      ]
+    },
+    {
+      "k": 128,
+      "id_changed_queries": 50,
+      "id_changed_positions": 241,
+      "distance_changed_queries": 48,
+      "changed_query_sample": [
+        22,
+        190,
+        403,
+        427,
+        844,
+        1296,
+        1480,
+        1738,
+        1746,
+        1872
+      ]
+    }
+  ]
+}

@@ -1,0 +1,3 @@
+k,recall_at10,qps,p50_ms,byte_identical_to_baseline,observed_gpu_queries,observed_gpu_errors,observed_search_mode
+64,1.0,451.32204896148573,2.194800414144993,,8,0,gpu_cagra
+128,1.0,425.0040069301909,2.303803921677172,,8,0,gpu_cagra

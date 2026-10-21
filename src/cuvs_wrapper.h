@@ -10,8 +10,7 @@ extern "C" {
 
 #include "cuvs_ipc.h"   /* CUVS_METRIC_* (PG-free, CUDA-free defines) */
 
-/* Phase 3E: maximum GPUs the daemon can manage. */
-#define CUVS_MAX_GPUS 16
+/* The shared per-device capacity is CUVS_MAX_GPUS in cuvs_ipc.h. */
 
 typedef struct CuvsGpuDeviceInfo {
     int     device_id;
@@ -22,6 +21,13 @@ typedef struct CuvsGpuDeviceInfo {
 /* Detect available CUDA GPUs. Fills up to max_devices entries in out[].
  * Returns the number of GPUs found (0 if none). */
 int cuvs_detect_gpus(CuvsGpuDeviceInfo *out, int max_devices);
+
+/* Daemon startup only, before any cuVS/RMM allocations or worker threads.
+ * Initial pool reservation in bytes; 0 leaves the default resource untouched.
+ * Pool grows through an upstream quota of total device memory * maximum_percent.
+ * Returns nonzero on init failure. */
+int cuvs_rmm_pool_init(int device_id, size_t initial_pool_bytes, uint32_t maximum_percent);
+int cuvs_rmm_pool_stats(int device_id, CuvsRmmPoolStats *out);
 
 /* ADR-075 Phase 1: measure physical hardware constants on `device_id`.
  *   link_bw_bpus  -- CPU->GPU H2D bandwidth, bytes per microsecond

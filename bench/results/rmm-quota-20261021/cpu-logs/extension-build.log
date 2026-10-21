@@ -1,0 +1,483 @@
+gcc -Wall -Wmissing-prototypes -Wpointer-arith -Wdeclaration-after-statement -Werror=vla -Wendif-labels -Wmissing-format-attribute -Wimplicit-fallthrough=3 -Wcast-function-type -Wshadow=compatible-local -Wformat-security -fno-strict-aliasing -fwrapv -fexcess-precision=standard -Wno-format-truncation -Wno-stringop-truncation -O2 -fPIC -fvisibility=hidden -I/include -I/include/rapids -I./src -I. -I./ -I/usr/local/include/postgresql/server -I/usr/local/include/postgresql/internal -D_GNU_SOURCE  -I/usr/include/libxml2   -c -o src/pg_cuvs.o src/pg_cuvs.c
+gcc -Wall -Wmissing-prototypes -Wpointer-arith -Wdeclaration-after-statement -Werror=vla -Wendif-labels -Wmissing-format-attribute -Wimplicit-fallthrough=3 -Wcast-function-type -Wshadow=compatible-local -Wformat-security -fno-strict-aliasing -fwrapv -fexcess-precision=standard -Wno-format-truncation -Wno-stringop-truncation -O2 -fPIC -fvisibility=hidden -I/include -I/include/rapids -I./src -I. -I./ -I/usr/local/include/postgresql/server -I/usr/local/include/postgresql/internal -D_GNU_SOURCE  -I/usr/include/libxml2   -c -o src/cuvs_ipc.o src/cuvs_ipc.c
+src/cuvs_ipc.c: In function 'uds_connect_ex':
+src/cuvs_ipc.c:130:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+  130 |     struct sockaddr_un addr;
+      |     ^~~~~~
+src/cuvs_ipc.c:135:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+  135 |     struct timeval tv = {.tv_sec = recv_timeout_sec, .tv_usec = 0};
+      |     ^~~~~~
+src/cuvs_ipc.c: In function 'recv_all_interruptible':
+src/cuvs_ipc.c:293:9: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+  293 |         ssize_t n = read(fd, p + got, len - got);
+      |         ^~~~~~~
+src/cuvs_ipc.c: In function 'shm_write_build_payload':
+src/cuvs_ipc.c:405:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+  405 |     void *mem = mmap(NULL, total, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+      |     ^~~~
+src/cuvs_ipc.c: In function 'shm_write_query_batch':
+src/cuvs_ipc.c:440:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+  440 |     void *mem = mmap(NULL, total, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+      |     ^~~~
+src/cuvs_ipc.c: In function 'shm_write_query':
+src/cuvs_ipc.c:473:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+  473 |     void *mem = mmap(NULL, vec_bytes, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+      |     ^~~~
+src/cuvs_ipc.c: In function 'cuvs_ipc_search':
+src/cuvs_ipc.c:533:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+  533 |     CuvsCmdFrame cmd = {
+      |     ^~~~~~~~~~~~
+src/cuvs_ipc.c:558:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+  558 |     CuvsReplyHeader hdr;
+      |     ^~~~~~~~~~~~~~~
+src/cuvs_ipc.c: In function 'cuvs_ipc_search_batch':
+src/cuvs_ipc.c:668:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+  668 |     CuvsCmdFrame cmd = {
+      |     ^~~~~~~~~~~~
+src/cuvs_ipc.c:687:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+  687 |     CuvsReplyHeader hdr;
+      |     ^~~~~~~~~~~~~~~
+src/cuvs_ipc.c:698:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+  698 |     uint32_t Q = hdr.n_results;
+      |     ^~~~~~~~
+src/cuvs_ipc.c:715:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+  715 |     size_t hdr_bytes  = 2 * sizeof(uint32_t);
+      |     ^~~~~~
+src/cuvs_ipc.c: In function 'cuvs_ipc_stats':
+src/cuvs_ipc.c:767:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+  767 |     CuvsCmdFrame cmd = {
+      |     ^~~~~~~~~~~~
+src/cuvs_ipc.c:776:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+  776 |     CuvsReplyHeader hdr;
+      |     ^~~~~~~~~~~~~~~
+src/cuvs_ipc.c: In function 'cuvs_ipc_shard_stats':
+src/cuvs_ipc.c:914:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+  914 |     CuvsCmdFrame cmd = {
+      |     ^~~~~~~~~~~~
+src/cuvs_ipc.c:923:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+  923 |     CuvsReplyHeader hdr;
+      |     ^~~~~~~~~~~~~~~
+src/cuvs_ipc.c: In function 'cuvs_ipc_export_adjacency':
+src/cuvs_ipc.c:1341:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 1341 |     CuvsCmdFrame cmd = {
+      |     ^~~~~~~~~~~~
+src/cuvs_ipc.c:1352:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 1352 |     CuvsReplyHeader hdr;
+      |     ^~~~~~~~~~~~~~~
+src/cuvs_ipc.c:1363:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 1363 |     size_t  n_vecs       = (size_t)hdr.n_results;
+      |     ^~~~~~
+src/cuvs_ipc.c:1381:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 1381 |     size_t adj_bytes  = n_vecs * (size_t)graph_degree * sizeof(uint32_t);
+      |     ^~~~~~
+src/cuvs_ipc.c:1399:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 1399 |     uint32_t src_metric = ((const uint32_t *)mem)[3];
+      |     ^~~~~~~~
+src/cuvs_ipc.c: In function 'cuvs_ipc_export_hnsw_shm':
+src/cuvs_ipc.c:1459:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 1459 |     CuvsCmdFrame cmd = {
+      |     ^~~~~~~~~~~~
+src/cuvs_ipc.c:1468:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 1468 |     CuvsReplyHeader hdr;
+      |     ^~~~~~~~~~~~~~~
+src/cuvs_ipc.c: In function 'cuvs_ipc_search_filtered':
+src/cuvs_ipc.c:1563:9: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 1563 |         size_t filter_bytes = (size_t)n_filter * sizeof(uint64_t);
+      |         ^~~~~~
+src/cuvs_ipc.c:1574:9: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 1574 |         void *fmem = mmap(NULL, filter_bytes, PROT_READ | PROT_WRITE,
+      |         ^~~~
+src/cuvs_ipc.c:1597:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 1597 |     CuvsCmdFrame cmd = {
+      |     ^~~~~~~~~~~~
+src/cuvs_ipc.c:1618:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 1618 |     CuvsReplyHeader hdr;
+      |     ^~~~~~~~~~~~~~~
+src/cuvs_ipc.c: In function 'cuvs_ipc_search_stream_bf':
+src/cuvs_ipc.c:1718:9: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 1718 |         size_t filter_bytes = (size_t)n_filter * sizeof(uint64_t);
+      |         ^~~~~~
+src/cuvs_ipc.c:1729:9: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 1729 |         void *fmem = mmap(NULL, filter_bytes, PROT_READ | PROT_WRITE,
+      |         ^~~~
+src/cuvs_ipc.c:1748:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 1748 |     CuvsCmdFrame cmd = {
+      |     ^~~~~~~~~~~~
+src/cuvs_ipc.c:1765:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 1765 |     CuvsReplyHeader hdr;
+      |     ^~~~~~~~~~~~~~~
+src/cuvs_ipc.c: In function 'cuvs_ipc_search_bf_transient':
+src/cuvs_ipc.c:1865:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 1865 |     size_t vec_bytes = (size_t)n * (size_t)dim * sizeof(float);
+      |     ^~~~~~
+src/cuvs_ipc.c:1898:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 1898 |     CuvsCmdFrame cmd;
+      |     ^~~~~~~~~~~~
+src/cuvs_ipc.c:1918:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 1918 |     CuvsReplyHeader hdr;
+      |     ^~~~~~~~~~~~~~~
+src/cuvs_ipc.c: In function 'cuvs_ipc_search_ivfpq':
+src/cuvs_ipc.c:2096:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 2096 |     CuvsCmdFrame cmd = {
+      |     ^~~~~~~~~~~~
+src/cuvs_ipc.c:2110:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 2110 |     CuvsReplyHeader hdr;
+      |     ^~~~~~~~~~~~~~~
+src/pg_cuvs.c:1408:1: warning: no previous prototype for 'cuvs_cagra_reloption_graph_degree' [-Wmissing-prototypes]
+ 1408 | cuvs_cagra_reloption_graph_degree(Relation cagra_rel)
+      | ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+src/pg_cuvs.c: In function 'flat_amcostestimate':
+src/pg_cuvs.c:2111:9: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 2111 |         double startup = 0.0, total = 0.0;
+      |         ^~~~~~
+src/pg_cuvs.c: In function 'cuvs_effective_build_cap_bytes':
+src/pg_cuvs.c:2222:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 2222 |     size_t avail = read_mem_available_bytes();
+      |     ^~~~~~
+src/pg_cuvs.c: In function 'cuvs_build_callback':
+src/pg_cuvs.c:2312:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 2312 |     PgVector *vec = DatumGetPgVector(values[0]);
+      |     ^~~~~~~~
+src/pg_cuvs.c:2323:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 2323 |     float *dst = bs->vectors + (bs->n_vecs * bs->dim);
+      |     ^~~~~
+src/pg_cuvs.c: In function 'cuvs_ambuild':
+src/pg_cuvs.c:2908:9: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 2908 |         FILE *f = fopen(sidecar, "w");
+      |         ^~~~
+src/pg_cuvs.c: In function 'flat_ambuild':
+src/pg_cuvs.c:3155:9: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 3155 |         FILE *f = fopen(sidecar, "w");
+      |         ^~~~
+src/pg_cuvs.c: At top level:
+src/pg_cuvs.c:3444:38: warning: '/*' within comment [-Wcomment]
+ 3444 |  * caller-supplied tids_out/dists_out/*n_results arrays (no CuvsScanState). */
+src/pg_cuvs.c: In function 'cuvs_gettuple':
+src/pg_cuvs.c:3688:9: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 3688 |         Oid index_oid = RelationGetRelid(scan->indexRelation);
+      |         ^~~
+src/pg_cuvs.c:3724:9: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 3724 |         Datum query_datum = scan->orderByData[0].sk_argument;
+      |         ^~~~~
+src/pg_cuvs.c:3749:9: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 3749 |         uint32_t metric = cuvs_index_metric(scan->indexRelation);
+      |         ^~~~~~~~
+src/pg_cuvs.c:3920:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 3920 |     uint64_t tid     = ss->tids[ss->cur];
+      |     ^~~~~~~~
+src/pg_cuvs.c: In function 'flat_gettuple':
+src/pg_cuvs.c:3979:9: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 3979 |         Oid index_oid = RelationGetRelid(scan->indexRelation);
+      |         ^~~
+src/pg_cuvs.c:3999:9: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 3999 |         Datum query_datum = scan->orderByData[0].sk_argument;
+      |         ^~~~~
+src/pg_cuvs.c:4016:9: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 4016 |         uint32_t metric = cuvs_index_metric(scan->indexRelation);
+      |         ^~~~~~~~
+src/pg_cuvs.c:4153:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 4153 |     uint64_t tid     = ss->tids[ss->cur];
+      |     ^~~~~~~~
+src/pg_cuvs.c: In function 'ivfpq_ambuild':
+src/pg_cuvs.c:4545:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 4545 |     CuvsIvfPqOptions *opts = (CuvsIvfPqOptions *) indexRel->rd_options;
+      |     ^~~~~~~~~~~~~~~~
+src/pg_cuvs.c: In function 'ivfpq_gettuple':
+src/pg_cuvs.c:4669:9: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 4669 |         Oid index_oid = RelationGetRelid(scan->indexRelation);
+      |         ^~~
+src/pg_cuvs.c:4688:9: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 4688 |         Datum    query_datum = scan->orderByData[0].sk_argument;
+      |         ^~~~~
+src/pg_cuvs.c:4699:9: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 4699 |         int rc = cuvs_ipc_search_ivfpq(
+      |         ^~~
+src/pg_cuvs.c:4772:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 4772 |     uint64_t tid = ss->tids[ss->cur];
+      |     ^~~~~~~~
+src/pg_cuvs.c: In function 'pg_cuvs_last_search_metric':
+src/pg_cuvs.c:4961:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 4961 |     const char *name;
+      |     ^~~~~
+src/pg_cuvs.c: In function 'pg_cuvs_batch_search':
+src/pg_cuvs.c:5059:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 5059 |     Relation  heapRel = table_open(table_oid, AccessShareLock);
+      |     ^~~~~~~~
+src/pg_cuvs.c:5090:9: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 5090 |         Oid    elemtype = ARR_ELEMTYPE(qarr);
+      |         ^~~
+src/pg_cuvs.c: In function 'pg_cuvs_gpu_cache_stats':
+src/pg_cuvs.c:5514:22: warning: unused variable 'cs' [-Wunused-variable]
+ 5514 |     CuvsCacheStats   cs;
+      |                      ^~
+src/pg_cuvs.c: In function 'cuvs_filtered_knn':
+src/pg_cuvs.c:6105:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 6105 |     Relation  indexRel = index_open(index_oid, AccessShareLock);
+      |     ^~~~~~~~
+src/pg_cuvs.c:6114:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 6114 |     uint32_t metric = cuvs_index_metric(indexRel);
+      |     ^~~~~~~~
+src/pg_cuvs.c:6120:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 6120 |     PgVector *qvec = DatumGetPgVector(query_datum);
+      |     ^~~~~~~~
+src/pg_cuvs.c:6208:9: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 6208 |         int       k_fetch    = use_filter
+      |         ^~~
+src/pg_cuvs.c: In function 'cuvs_cs_build':
+src/pg_cuvs.c:6548:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 6548 |     PgVector *qvec = DatumGetPgVector(state->query_datum);
+      |     ^~~~~~~~
+src/pg_cuvs.c:6568:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 6568 |     int search_k = cuvs_k_with_tombstone_slack(state->index_oid, k);
+      |     ^~~
+src/pg_cuvs.c:6571:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 6571 |     uint32_t latency_us = 0;
+      |     ^~~~~~~~
+gcc -Wall -Wmissing-prototypes -Wpointer-arith -Wdeclaration-after-statement -Werror=vla -Wendif-labels -Wmissing-format-attribute -Wimplicit-fallthrough=3 -Wcast-function-type -Wshadow=compatible-local -Wformat-security -fno-strict-aliasing -fwrapv -fexcess-precision=standard -Wno-format-truncation -Wno-stringop-truncation -O2 -fPIC -fvisibility=hidden -I/include -I/include/rapids -I./src -I. -I./ -I/usr/local/include/postgresql/server -I/usr/local/include/postgresql/internal -D_GNU_SOURCE  -I/usr/include/libxml2   -c -o src/cuvs_util.o src/cuvs_util.c
+gcc -O2 -g -fPIC -I./src -std=gnu11 -c src/cuvs_wrapper_shim_cpu.c -o src/cuvs_wrapper_shim_cpu.o
+gcc -Wall -Wmissing-prototypes -Wpointer-arith -Wdeclaration-after-statement -Werror=vla -Wendif-labels -Wmissing-format-attribute -Wimplicit-fallthrough=3 -Wcast-function-type -Wshadow=compatible-local -Wformat-security -fno-strict-aliasing -fwrapv -fexcess-precision=standard -Wno-format-truncation -Wno-stringop-truncation -O2 -fPIC -fvisibility=hidden -I/include -I/include/rapids -I./src -I. -I./ -I/usr/local/include/postgresql/server -I/usr/local/include/postgresql/internal -D_GNU_SOURCE  -I/usr/include/libxml2   -c -o src/hnsw_export.o src/hnsw_export.c
+src/hnsw_export.c: In function 'elems_per_page':
+src/hnsw_export.c:219:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+  219 |     size_t esize  = elem_tuple_size(dim, bytes_per_dim);
+      |     ^~~~~~
+src/hnsw_export.c: In function 'float_to_half':
+src/hnsw_export.c:269:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+  269 |     uint32_t sign = (x >> 16) & 0x8000u;
+      |     ^~~~~~~~
+src/hnsw_export.c:281:9: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+  281 |         uint32_t shift = (uint32_t)(14 - exp);
+      |         ^~~~~~~~
+src/hnsw_export.c:290:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+  290 |     uint32_t half_mant = mant >> 13;
+      |     ^~~~~~~~
+src/hnsw_export.c: In function 'write_elem_pair':
+src/hnsw_export.c:580:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+  580 |     char *vdata = (char *)etup + sizeof(PgvHnswElemHdr);
+      |     ^~~~
+src/hnsw_export.c:584:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+  584 |     int16_t vdim   = (int16_t)dim;
+      |     ^~~~~~~
+src/hnsw_export.c:600:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+  600 |     int count = (e->level + 2) * m;
+      |     ^~~
+src/hnsw_export.c:606:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+  606 |     PgvItemPointer *slots = (PgvItemPointer *)((char *)ntup + sizeof(PgvHnswNeighHdr));
+      |     ^~~~~~~~~~~~~~
+src/hnsw_export.c:666:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+  666 |     OffsetNumber eoff = PageAddItem(page, (Item)etup, esize, InvalidOffsetNumber,
+      |     ^~~~~~~~~~~~
+src/hnsw_export.c:680:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+  680 |     OffsetNumber noff = PageAddItem(page, (Item)ntup, nsize, InvalidOffsetNumber,
+      |     ^~~~~~~~~~~~
+src/hnsw_export.c: In function 'write_elem_pages_packed':
+src/hnsw_export.c:771:9: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+  771 |         Buffer buf  = ReadBuffer(rel, P_NEW);
+      |         ^~~~~~
+src/hnsw_export.c:773:9: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+  773 |         Page   page = BufferGetPage(buf);
+      |         ^~~~
+src/hnsw_export.c:776:9: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+  776 |         PgvHnswPageOpaque *opaque = (PgvHnswPageOpaque *) PageGetSpecialPointer(page);
+      |         ^~~~~~~~~~~~~~~~~
+src/hnsw_export.c: In function 'fill_hnsw_from_hnswlib_impl':
+src/hnsw_export.c:871:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+  871 |     Relation cagra_rel = index_open(cagra_oid, AccessShareLock);
+      |     ^~~~~~~~
+src/hnsw_export.c:890:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+  890 |     bool hnsw_unlogged = false;  /* set below; true = skip WAL on page writes */
+      |     ^~~~
+src/hnsw_export.c:899:9: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+  899 |         Form_pg_class cf = (Form_pg_class) GETSTRUCT(tup);
+      |         ^~~~~~~~~~~~~
+src/hnsw_export.c:972:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+  972 |     char hnsw_path[1024];
+      |     ^~~~
+src/hnsw_export.c:981:9: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+  981 |         int shm_rc = cuvs_ipc_export_hnsw_shm(
+      |         ^~~
+src/hnsw_export.c:1001:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 1001 |     FILE *hf = hnsw_open_stream(hnsw_path, res->shm_fd);
+      |     ^~~~
+src/hnsw_export.c:1008:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 1008 |     HnswlibHeader hdr;
+      |     ^~~~~~~~~~~~~
+src/hnsw_export.c:1030:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 1030 |     size_t N  = hdr.curElementCount;
+      |     ^~~~~~
+src/hnsw_export.c:1045:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 1045 |     FILE *tf = fopen(tids_path, "rb");
+      |     ^~~~
+src/hnsw_export.c:1053:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 1053 |     CuvsTidsHeader tids_hdr;
+      |     ^~~~~~~~~~~~~~
+src/hnsw_export.c:1128:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 1128 |     size_t lv0_block_bytes = N * hdr.sizeDataPerElement;
+      |     ^~~~~~
+src/hnsw_export.c:1145:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 1145 |     ElemDesc *elems = (ElemDesc *) calloc(N, sizeof(ElemDesc));
+      |     ^~~~~~~~
+src/hnsw_export.c:1179:9: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 1179 |         size_t label;
+      |         ^~~~~~
+src/hnsw_export.c:1206:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 1206 |     size_t sizeLinksPerElement = ((size_t)M + 1) * sizeof(int);
+      |     ^~~~~~
+src/hnsw_export.c:1224:9: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 1224 |         int elem_level = (int)(llsize / sizeLinksPerElement);
+      |         ^~~
+src/hnsw_export.c:1235:9: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 1235 |         char *llbuf = (char *) malloc(llsize);
+      |         ^~~~
+src/hnsw_export.c:1257:9: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 1257 |         char *p = llbuf;
+      |         ^~~~
+src/hnsw_export.c:1335:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 1335 |     Relation hnsw_rel = index_open(hnsw_oid, AccessExclusiveLock);
+      |     ^~~~~~~~
+src/hnsw_export.c:1360:9: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 1360 |         Page page = BufferGetPage(buf);
+      |         ^~~~
+src/hnsw_export.c:1363:9: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 1363 |         PgvHnswPageOpaque *opaque =
+      |         ^~~~~~~~~~~~~~~~~
+src/hnsw_export.c:1375:9: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 1375 |         PgvHnswMeta *metap = (PgvHnswMeta *) PageGetContents(page);
+      |         ^~~~~~~~~~~
+src/hnsw_export.c:1384:9: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 1384 |         int ep = hdr.enterpointNode;
+      |         ^~~
+src/hnsw_export.c:1412:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 1412 |     float *vec_buf = (float *) palloc((size_t)dim * sizeof(float));
+      |     ^~~~~
+src/hnsw_export.c: In function 'fill_hnsw_from_cagra_ipc_impl':
+src/hnsw_export.c:1609:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 1609 |     Relation cagra_rel = index_open(cagra_oid, AccessShareLock);
+      |     ^~~~~~~~
+src/hnsw_export.c:1620:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 1620 |     bool hnsw_unlogged = false;
+      |     ^~~~
+src/hnsw_export.c:1628:9: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 1628 |         Form_pg_class cf = (Form_pg_class) GETSTRUCT(tup);
+      |         ^~~~~~~~~~~~~
+src/hnsw_export.c:1636:9: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 1636 |         Oid hnsw_amoid      = get_am_oid("hnsw", true);
+      |         ^~~
+src/hnsw_export.c:1708:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 1708 |     uint32_t *adj   = NULL;
+      |     ^~~~~~~~
+src/hnsw_export.c:1748:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 1748 |     int M0 = (graph_degree < 64) ? graph_degree : 64;
+      |     ^~~
+src/hnsw_export.c:1751:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 1751 |     int M = M0 / 2;
+      |     ^~~
+src/hnsw_export.c:1762:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 1762 |     int    max_level  = 0;
+      |     ^~~
+src/hnsw_export.c:1785:9: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 1785 |         const uint32_t *row = adj + i * (size_t)graph_degree;
+      |         ^~~~~
+src/hnsw_export.c:1802:9: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 1802 |         int lv = elems[i].level;
+      |         ^~~
+src/hnsw_export.c:1812:13: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 1812 |             int *cand_buf = (int *)malloc((size_t)graph_degree * sizeof(int));
+      |             ^~~
+src/hnsw_export.c:1856:17: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 1856 |                 int n_sel = heuristic_select_neighbors(
+      |                 ^~~
+src/hnsw_export.c:1895:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 1895 |     int pack_k = do_hierarchy ? 1 : elems_per_page((int)ipc_dim, bytes_per_dim, M, 0);
+      |     ^~~
+src/hnsw_export.c:1913:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 1913 |     Relation hnsw_rel = index_open(hnsw_oid, AccessExclusiveLock);
+      |     ^~~~~~~~
+src/hnsw_export.c:1928:9: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 1928 |         Page page = BufferGetPage(buf);
+      |         ^~~~
+src/hnsw_export.c:1931:9: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 1931 |         PgvHnswPageOpaque *opaque =
+      |         ^~~~~~~~~~~~~~~~~
+src/hnsw_export.c:1937:9: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 1937 |         PgvHnswMeta *metap = (PgvHnswMeta *) PageGetContents(page);
+      |         ^~~~~~~~~~~
+src/hnsw_export.c: In function 'find_hnsw_opclass_oid':
+src/hnsw_export.c:2060:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 2060 |     Oid hnsw_amoid = get_am_oid("hnsw", true);
+      |     ^~~
+src/hnsw_export.c:2064:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 2064 |     Relation    opcrel = table_open(OperatorClassRelationId, AccessShareLock);
+      |     ^~~~~~~~
+src/hnsw_export.c: In function 'cagra_index_metric':
+src/hnsw_export.c:2092:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 2092 |     bool isnull = false;
+      |     ^~~~
+src/hnsw_export.c:2098:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 2098 |     HeapTuple opctup = SearchSysCache1(CLAOID, ObjectIdGetDatum(cagra_opc));
+      |     ^~~~~~~~~
+src/hnsw_export.c:2100:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 2100 |     const char *nm = NameStr(((Form_pg_opclass) GETSTRUCT(opctup))->opcname);
+      |     ^~~~~
+src/hnsw_export.c: In function 'create_empty_hnsw':
+src/hnsw_export.c:2115:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 2115 |     Oid heap_oid = ((Form_pg_index) GETSTRUCT(ix_tup))->indrelid;
+      |     ^~~
+src/hnsw_export.c:2122:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 2122 |     uint32_t metric       = cagra_index_metric(cagra_oid);
+      |     ^~~~~~~~
+src/hnsw_export.c:2141:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 2141 |     static int hnsw_build_seq = 0;
+      |     ^~~~~~
+src/hnsw_export.c:2151:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 2151 |     Oid hnsw_oid = index_create(
+      |     ^~~
+src/hnsw_export.c: In function 'pg_cuvs_build_hnsw':
+src/hnsw_export.c:2217:9: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 2217 |         int precheck_dim = (int) TupleDescAttr(RelationGetDescr(cagra_rel_pc), 0)->atttypmod;
+      |         ^~~
+src/hnsw_export.c:2220:9: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 2220 |         int m0 = (graph_degree < 64) ? graph_degree : 64;
+      |         ^~~
+src/hnsw_export.c:2228:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 2228 |     Oid hnsw_oid = create_empty_hnsw(cagra_oid);
+      |     ^~~
+src/hnsw_export.c: In function 'cuvs_hnsw_ambuild':
+src/hnsw_export.c:2354:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 2354 |     Oid self_oid = RelationGetRelid(indexRel);
+      |     ^~~
+src/hnsw_export.c:2427:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 2427 |     Oid cagra_oid = DatumGetObjectId(
+      |     ^~~
+src/hnsw_export.c:2436:9: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 2436 |         Oid src_heap = ((Form_pg_index) GETSTRUCT(ixtup))->indrelid;
+      |         ^~~
+src/hnsw_export.c:2443:9: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 2443 |         Oid cagra_am = get_am_oid("cagra", true);
+      |         ^~~
+src/hnsw_export.c:2461:13: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 2461 |             int m0 = (graph_degree < 64) ? graph_degree : 64;
+      |             ^~~
+src/hnsw_export.c:2472:9: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 2472 |         uint32_t src_metric = cagra_index_metric(cagra_oid);
+      |         ^~~~~~~~
+src/hnsw_export.c:2494:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 2494 |     size_t n_elems_written;
+      |     ^~~~~~
+src/hnsw_export.c: In function 'pg_cuvs_hnsw_handler':
+src/hnsw_export.c:2528:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 2528 |     Oid amhandler = ((Form_pg_am) GETSTRUCT(amtup))->amhandler;
+      |     ^~~
+src/hnsw_export.c:2533:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+ 2533 |     IndexAmRoutine *amroutine = (IndexAmRoutine *)
+      |     ^~~~~~~~~~~~~~
+gcc -Wall -Wmissing-prototypes -Wpointer-arith -Wdeclaration-after-statement -Werror=vla -Wendif-labels -Wmissing-format-attribute -Wimplicit-fallthrough=3 -Wcast-function-type -Wshadow=compatible-local -Wformat-security -fno-strict-aliasing -fwrapv -fexcess-precision=standard -Wno-format-truncation -Wno-stringop-truncation -O2 -fPIC -fvisibility=hidden -I/include -I/include/rapids -I./src -I. -I./ -I/usr/local/include/postgresql/server -I/usr/local/include/postgresql/internal -D_GNU_SOURCE  -I/usr/include/libxml2   -c -o src/cuvs_build_corpus.o src/cuvs_build_corpus.c
+src/cuvs_build_corpus.c:5:9: warning: '_GNU_SOURCE' redefined
+    5 | #define _GNU_SOURCE   /* memfd_create, MFD_CLOEXEC */
+      |         ^~~~~~~~~~~
+<command-line>: note: this is the location of the previous definition
+src/cuvs_build_corpus.c: In function 'open_memfd':
+src/cuvs_build_corpus.c:97:5: warning: ISO C90 forbids mixed declarations and code [-Wdeclaration-after-statement]
+   97 |     void *mem = mmap(NULL, bytes, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+      |     ^~~~
+gcc -Wall -Wmissing-prototypes -Wpointer-arith -Wdeclaration-after-statement -Werror=vla -Wendif-labels -Wmissing-format-attribute -Wimplicit-fallthrough=3 -Wcast-function-type -Wshadow=compatible-local -Wformat-security -fno-strict-aliasing -fwrapv -fexcess-precision=standard -Wno-format-truncation -Wno-stringop-truncation -O2 -fPIC -fvisibility=hidden -I/include -I/include/rapids -I./src -I. -I./ -I/usr/local/include/postgresql/server -I/usr/local/include/postgresql/internal -D_GNU_SOURCE  -I/usr/include/libxml2   -c -o src/pg_cuvs_compaction.o src/pg_cuvs_compaction.c
+gcc -Wall -Wmissing-prototypes -Wpointer-arith -Wdeclaration-after-statement -Werror=vla -Wendif-labels -Wmissing-format-attribute -Wimplicit-fallthrough=3 -Wcast-function-type -Wshadow=compatible-local -Wformat-security -fno-strict-aliasing -fwrapv -fexcess-precision=standard -Wno-format-truncation -Wno-stringop-truncation -O2 -fPIC -fvisibility=hidden -shared -o pg_cuvs.so src/pg_cuvs.o src/cuvs_ipc.o src/cuvs_util.o src/cuvs_wrapper_shim_cpu.o src/hnsw_export.o src/cuvs_build_corpus.o src/pg_cuvs_compaction.o -L/usr/local/lib    -L/usr/local/lib -Wl,--as-needed -fvisibility=hidden -lm -Wl,-Bstatic -lstdc++ -Wl,-Bdynamic -lrt 

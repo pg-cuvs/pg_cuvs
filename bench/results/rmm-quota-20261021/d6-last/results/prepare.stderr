@@ -1,0 +1,4 @@
+From https://github.com/pg-cuvs/pg_cuvs
+ * branch            ysys143/index-rmm-pool -> FETCH_HEAD
+   1022996..6967772  ysys143/index-rmm-pool -> origin/ysys143/index-rmm-pool
+HEAD is now at 0ff9f7c feat(memory): default RMM pool to 512 MiB with a 50 percent quota

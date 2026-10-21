@@ -1,0 +1,24 @@
+LAUNCH {"argv": ["env", "PGHOST=/var/run/postgresql", "/opt/miniforge3/envs/cuvs_bench/bin/python", "/home/ubuntu/index-accel-validation/rmm-production-tools-last-20261021/measurement_entry.py", "measure", "--repo", "/home/ubuntu/pg_cuvs", "--owner-file", "/home/ubuntu/index-accel-validation/owner.json", "--expected-commit", "0ff9f7c9fac4c20b8256dfc20ea3b0e604f7dd28", "--dbname", "index_accel_smoke", "--data-dir", "/home/ubuntu/data", "--index-dir", "/tmp/cuvs_indexes", "--out", "/home/ubuntu/index-accel-validation/rmm-quota-last-20261021/smoke-zero", "--n", "256", "--queries", "8", "--points", "64,128", "--expect-rmm-mb", "0"], "cwd": "/home/ubuntu", "explicit_env": {"PGHOST": "/var/run/postgresql"}, "fixture": true, "source_pin": "0ff9f7c9fac4c20b8256dfc20ea3b0e604f7dd28", "started_utc": "2026-10-21T02:07:34.372957+00:00", "entry_sha256": "6eff974166148109e87f883f0f39bb1a86cd2868e2f37e65b083df34cfe57704", "launcher_sha256": "dabd2c7ef86f2b1f11d820d539bb32f2df0f4e0589c1d5cdbbadee419358acb5"}
+CONNECTION {"select1": 1, "rmm_pool_mb": "0", "PGHOST": "/var/run/postgresql", "cwd": "/home/ubuntu", "database_user": "postgres", "backend_pid": 363, "entry_sha256": "6eff974166148109e87f883f0f39bb1a86cd2868e2f37e65b083df34cfe57704", "pg_engine_sha256": "7d5b883679913db81a70b9238a675c24bdb28bdaeeade3341a1db8f2a70591f0"}
+[
+  {
+    "k": 64,
+    "recall_at10": 1.0,
+    "qps": 451.32204896148573,
+    "p50_ms": 2.194800414144993,
+    "byte_identical_to_baseline": null,
+    "observed_gpu_queries": 8,
+    "observed_gpu_errors": 0,
+    "observed_search_mode": "gpu_cagra"
+  },
+  {
+    "k": 128,
+    "recall_at10": 1.0,
+    "qps": 425.0040069301909,
+    "p50_ms": 2.303803921677172,
+    "byte_identical_to_baseline": null,
+    "observed_gpu_queries": 8,
+    "observed_gpu_errors": 0,
+    "observed_search_mode": "gpu_cagra"
+  }
+]

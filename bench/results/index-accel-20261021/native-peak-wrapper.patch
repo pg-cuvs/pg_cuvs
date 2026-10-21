@@ -1,0 +1,14 @@
+diff --git a/src/cuvs_wrapper.cu b/src/cuvs_wrapper.cu
+index b25d9ae..883be8a 100644
+--- a/src/cuvs_wrapper.cu
++++ b/src/cuvs_wrapper.cu
+@@ -1298,7 +1298,8 @@ cuvs_cagra_search_batch(
+         cuvs::neighbors::cagra::search_params sparams;
+         int itopk = ((bk + 31) / 32) * 32;
+         if (itopk < 64) itopk = 64;
+-        sparams.itopk_size = itopk;
++        sparams.itopk_size = 512; /* private peak probe only; returned k remains64 */
++        sparams.search_width = 1;
+ 
+         cuvs::neighbors::cagra::search(
+             res, sparams, impl->idx,

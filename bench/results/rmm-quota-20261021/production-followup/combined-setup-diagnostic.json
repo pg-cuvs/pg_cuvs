@@ -1,0 +1,5 @@
+{
+  "setup_exit": 1,
+  "message": "createdb postgres reported database already exists; built-in postgres database reused; build/server startup were already successful",
+  "subsequent_sql_regression": "cagra_search_params,rmm_pool,smoke 3/3 PASS; isolation6/6 PASS"
+}

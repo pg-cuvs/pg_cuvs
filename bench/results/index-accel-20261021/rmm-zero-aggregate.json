@@ -1,0 +1,138 @@
+{
+  "predeclared_n": 3,
+  "labels": [
+    "rmm_zero",
+    "rmm_zero2",
+    "rmm_zero3"
+  ],
+  "baseline_unchanged": true,
+  "criterion": "recall within frozen span; lower latency outside span is an observation, not a failure",
+  "points": {
+    "64": {
+      "recall_at10": {
+        "values": [
+          0.94069,
+          0.94071,
+          0.9406
+        ],
+        "mean": 0.9406666666666667,
+        "min": 0.9406,
+        "max": 0.94071,
+        "std": 5.859465277085017e-05,
+        "baseline_mean": 0.9406800000000001,
+        "delta_to_baseline_mean": -1.3333333333420683e-05,
+        "within_baseline_span": true
+      },
+      "p50_ms": {
+        "values": [
+          0.9616180002467445,
+          0.9797435000109544,
+          0.9664180001891509
+        ],
+        "mean": 0.9692598334822833,
+        "min": 0.9616180002467445,
+        "max": 0.9797435000109544,
+        "std": 0.00939097693400748,
+        "baseline_mean": 0.9683315001893789,
+        "delta_to_baseline_mean": 0.0009283332929044263,
+        "within_baseline_span": true
+      },
+      "qps": {
+        "values": [
+          1034.7966756815163,
+          999.2057019118564,
+          1011.9409663475807
+        ],
+        "mean": 1015.3144479803178,
+        "min": 999.2057019118564,
+        "max": 1034.7966756815163,
+        "std": 18.033708359984225,
+        "baseline_mean": 1012.4476953139382,
+        "delta_to_baseline_mean": 2.8667526663796252,
+        "within_baseline_span": true
+      },
+      "all_individual_flags": [
+        {
+          "label": "rmm_zero",
+          "p50_ms_within_control_span": false,
+          "recall_at10_within_control_span": true
+        },
+        {
+          "label": "rmm_zero2",
+          "p50_ms_within_control_span": false,
+          "recall_at10_within_control_span": true
+        },
+        {
+          "label": "rmm_zero3",
+          "p50_ms_within_control_span": true,
+          "recall_at10_within_control_span": true
+        }
+      ],
+      "recall_pass": true,
+      "latency_pass": true
+    },
+    "128": {
+      "recall_at10": {
+        "values": [
+          0.97849,
+          0.97844,
+          0.97836
+        ],
+        "mean": 0.97843,
+        "min": 0.97836,
+        "max": 0.97849,
+        "std": 6.557438524300093e-05,
+        "baseline_mean": 0.9784466666666667,
+        "delta_to_baseline_mean": -1.666666666666483e-05,
+        "within_baseline_span": true
+      },
+      "p50_ms": {
+        "values": [
+          0.9965785000076721,
+          1.003189000130078,
+          0.9877739998955803
+        ],
+        "mean": 0.9958471666777768,
+        "min": 0.9877739998955803,
+        "max": 1.003189000130078,
+        "std": 0.007733478802385956,
+        "baseline_mean": 0.9995471667328578,
+        "delta_to_baseline_mean": -0.0037000000550809764,
+        "within_baseline_span": true
+      },
+      "qps": {
+        "values": [
+          984.5811910375364,
+          981.2892877029893,
+          993.404333158565
+        ],
+        "mean": 986.4249372996969,
+        "min": 981.2892877029893,
+        "max": 993.404333158565,
+        "std": 6.2644338776212924,
+        "baseline_mean": 988.0035639767806,
+        "delta_to_baseline_mean": -1.5786266770836619,
+        "within_baseline_span": true
+      },
+      "all_individual_flags": [
+        {
+          "label": "rmm_zero",
+          "p50_ms_within_control_span": true,
+          "recall_at10_within_control_span": true
+        },
+        {
+          "label": "rmm_zero2",
+          "p50_ms_within_control_span": true,
+          "recall_at10_within_control_span": true
+        },
+        {
+          "label": "rmm_zero3",
+          "p50_ms_within_control_span": false,
+          "recall_at10_within_control_span": true
+        }
+      ],
+      "recall_pass": true,
+      "latency_pass": true
+    }
+  }
+}

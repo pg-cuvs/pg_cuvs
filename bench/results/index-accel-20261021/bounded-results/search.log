@@ -1,0 +1,5 @@
+{"private_maximum_pool_bytes":23846977536,"total_cuda_bytes":47693955072}
+{"setup":true,"pool_mb":512,"upstream_type":"N3rmm2mr20cuda_memory_resourceE","initial_allocation_calls":1}
+{"phase":"load_original_graph","client_start_bytes":0,"peak_client_bytes":3200000000,"extra_client_peak_bytes":3200000000,"client_end_bytes":3200000000,"client_allocation_calls":2,"pool_growth_calls":1,"pool_growth_bytes":3072000000,"seconds":1.506047878}
+{"phase":"search_it512_q10000_k64","client_start_bytes":3200000000,"peak_client_bytes":3235880000,"extra_client_peak_bytes":35880000,"client_end_bytes":3200000000,"client_allocation_calls":4,"pool_growth_calls":0,"pool_growth_bytes":0,"seconds":0.530297334}
+{"success":true,"final_client_bytes":0,"lifetime_pool_allocations":2,"lifetime_pool_reserved_bytes":3608870912}

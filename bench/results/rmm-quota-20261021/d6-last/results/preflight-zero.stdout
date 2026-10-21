@@ -1,0 +1,6 @@
+[preflight] daemon fresh (started 02:14:04 >= binary 02:14:01)
+[preflight] extension .so fresh
+[preflight] extension 0.8.0 (matches control)
+[preflight] extension .so built from current src
+[preflight] daemon binary built from current src
+[preflight] CUDA_ARCH matches GPU (sm_89)

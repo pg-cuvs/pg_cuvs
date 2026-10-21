@@ -1,0 +1,8 @@
+[Service]
+ExecStart=
+ExecStart=/usr/lib/postgresql/16/bin/pg_cuvs_server --socket /tmp/.s.pg_cuvs --index-dir /tmp/cuvs_indexes --gpu-devices 0 --rmm-pool-mb 0
+{"pool_mb": 0, "k": 64, "recall_at10": 0.94059, "p50_ms": 0.9728510003697011, "first100_p99_ms": 1.1433505501554484, "first100_max_ms": 1.5332670000134385, "gpu_queries": 10200, "gpu_errors": 0}
+[Service]
+ExecStart=
+ExecStart=/usr/lib/postgresql/16/bin/pg_cuvs_server --socket /tmp/.s.pg_cuvs --index-dir /tmp/cuvs_indexes --gpu-devices 0 --rmm-pool-mb 0
+{"pool_mb": 0, "k": 128, "recall_at10": 0.9784, "p50_ms": 0.9736700003486476, "first100_p99_ms": 1.5251573102159461, "first100_max_ms": 1.6480469994348823, "gpu_queries": 10200, "gpu_errors": 0}

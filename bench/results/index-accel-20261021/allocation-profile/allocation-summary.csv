@@ -1,0 +1,5 @@
+pool_mb,N,single_queries,upstream_allocation_calls,cuda_allocation_api_counts,peak_client_bytes
+0,1,100,800,"{'cudaMalloc_v3020': 800, 'cudaMallocAsync_ptsz_v11020': 1, 'cudaFree_v3020': 800}",3200040964
+256,1,100,0,{'cudaMallocAsync_ptsz_v11020': 1},3200040964
+512,1,100,0,{'cudaMallocAsync_ptsz_v11020': 1},3200040964
+1024,1,100,0,{'cudaMallocAsync_ptsz_v11020': 1},3200040964

@@ -1,0 +1,64 @@
+{"setup":true,"pool_mb":1024,"upstream_type":"N3rmm2mr20cuda_memory_resourceE","initial_allocation_calls":1}
+{"phase":"load_original_graph","client_start_bytes":0,"peak_client_bytes":3200000000,"extra_client_peak_bytes":3200000000,"client_end_bytes":3200000000,"client_allocation_calls":2,"pool_growth_calls":1,"pool_growth_bytes":3072000000,"seconds":1.590898790}
+{"phase":"search_it512_q10000_k64","client_start_bytes":3200000000,"peak_client_bytes":3235880000,"extra_client_peak_bytes":35880000,"client_end_bytes":3200000000,"client_allocation_calls":4,"pool_growth_calls":0,"pool_growth_bytes":0,"seconds":0.543751126}
+{"success":true,"final_client_bytes":0,"lifetime_pool_allocations":2,"lifetime_pool_reserved_bytes":4145741824}
+Collecting data...
+Generating '/tmp/nsys-report-df4e.qdstrm'
+[1/7] [0%                          ] search.nsys-rep[1/7] [0%                          ] search.nsys-rep[1/7] [6%                          ] search.nsys-rep[1/7] [11%                         ] search.nsys-rep[1/7] [12%                         ] search.nsys-rep[1/7] [============56%             ] search.nsys-rep[1/7] [========================100%] search.nsys-rep[1/7] [========================100%] search.nsys-rep
+[2/7] [0%                          ] search.sqlite[2/7] [1%                          ] search.sqlite[2/7] [2%                          ] search.sqlite[2/7] [3%                          ] search.sqlite[2/7] [4%                          ] search.sqlite[2/7] [5%                          ] search.sqlite[2/7] [6%                          ] search.sqlite[2/7] [7%                          ] search.sqlite[2/7] [8%                          ] search.sqlite[2/7] [9%                          ] search.sqlite[2/7] [10%                         ] search.sqlite[2/7] [11%                         ] search.sqlite[2/7] [12%                         ] search.sqlite[2/7] [13%                         ] search.sqlite[2/7] [14%                         ] search.sqlite[2/7] [=15%                        ] search.sqlite[2/7] [=16%                        ] search.sqlite[2/7] [=17%                        ] search.sqlite[2/7] [==18%                       ] search.sqlite[2/7] [==19%                       ] search.sqlite[2/7] [==20%                       ] search.sqlite[2/7] [==21%                       ] search.sqlite[2/7] [===22%                      ] search.sqlite[2/7] [===23%                      ] search.sqlite[2/7] [===24%                      ] search.sqlite[2/7] [====25%                     ] search.sqlite[2/7] [====26%                     ] search.sqlite[2/7] [====27%                     ] search.sqlite[2/7] [====28%                     ] search.sqlite[2/7] [=====29%                    ] search.sqlite[2/7] [=====30%                    ] search.sqlite[2/7] [=====31%                    ] search.sqlite[2/7] [=====32%                    ] search.sqlite[2/7] [======33%                   ] search.sqlite[2/7] [======34%                   ] search.sqlite[2/7] [======35%                   ] search.sqlite[2/7] [=======36%                  ] search.sqlite[2/7] [=======37%                  ] search.sqlite[2/7] [=======38%                  ] search.sqlite[2/7] [=======39%                  ] search.sqlite[2/7] [========40%                 ] search.sqlite[2/7] [========41%                 ] search.sqlite[2/7] [========42%                 ] search.sqlite[2/7] [=========43%                ] search.sqlite[2/7] [=========44%                ] search.sqlite[2/7] [=========45%                ] search.sqlite[2/7] [=========46%                ] search.sqlite[2/7] [==========47%               ] search.sqlite[2/7] [==========48%               ] search.sqlite[2/7] [==========49%               ] search.sqlite[2/7] [===========50%              ] search.sqlite[2/7] [===========51%              ] search.sqlite[2/7] [===========52%              ] search.sqlite[2/7] [===========53%              ] search.sqlite[2/7] [============54%             ] search.sqlite[2/7] [============55%             ] search.sqlite[2/7] [============56%             ] search.sqlite[2/7] [============57%             ] search.sqlite[2/7] [=============58%            ] search.sqlite[2/7] [=============59%            ] search.sqlite[2/7] [=============60%            ] search.sqlite[2/7] [==============61%           ] search.sqlite[2/7] [==============62%           ] search.sqlite[2/7] [==============63%           ] search.sqlite[2/7] [==============64%           ] search.sqlite[2/7] [===============65%          ] search.sqlite[2/7] [===============66%          ] search.sqlite[2/7] [===============67%          ] search.sqlite[2/7] [================68%         ] search.sqlite[2/7] [================69%         ] search.sqlite[2/7] [================70%         ] search.sqlite[2/7] [================71%         ] search.sqlite[2/7] [=================72%        ] search.sqlite[2/7] [=================73%        ] search.sqlite[2/7] [=================74%        ] search.sqlite[2/7] [==================75%       ] search.sqlite[2/7] [==================76%       ] search.sqlite[2/7] [==================77%       ] search.sqlite[2/7] [==================78%       ] search.sqlite[2/7] [===================79%      ] search.sqlite[2/7] [===================80%      ] search.sqlite[2/7] [===================81%      ] search.sqlite[2/7] [===================82%      ] search.sqlite[2/7] [====================83%     ] search.sqlite[2/7] [====================84%     ] search.sqlite[2/7] [====================85%     ] search.sqlite[2/7] [=====================86%    ] search.sqlite[2/7] [=====================87%    ] search.sqlite[2/7] [=====================88%    ] search.sqlite[2/7] [=====================89%    ] search.sqlite[2/7] [======================90%   ] search.sqlite[2/7] [======================91%   ] search.sqlite[2/7] [======================92%   ] search.sqlite[2/7] [=======================93%  ] search.sqlite[2/7] [=======================94%  ] search.sqlite[2/7] [=======================95%  ] search.sqlite[2/7] [=======================96%  ] search.sqlite[2/7] [========================97% ] search.sqlite[2/7] [========================98% ] search.sqlite[2/7] [========================99% ] search.sqlite[2/7] [========================100%] search.sqlite[2/7] [========================100%] search.sqlite
+[3/7] Executing 'nvtx_sum' stats report
+
+ Time (%)  Total Time (ns)  Instances    Avg (ns)      Med (ns)     Min (ns)    Max (ns)   StdDev (ns)   Style            Range          
+ --------  ---------------  ---------  ------------  ------------  ----------  ----------  -----------  -------  ------------------------
+     74.5       1590906730          1  1590906730.0  1590906730.0  1590906730  1590906730          0.0  PushPop  :load_original_graph    
+     25.5        543756764          1   543756764.0   543756764.0   543756764   543756764          0.0  PushPop  :search_it512_q10000_k64
+      0.0           197773          1      197773.0      197773.0      197773      197773          0.0  PushPop  :pool_init              
+
+[4/7] Executing 'cuda_api_sum' stats report
+
+ Time (%)  Total Time (ns)  Num Calls   Avg (ns)     Med (ns)    Min (ns)   Max (ns)   StdDev (ns)             Name            
+ --------  ---------------  ---------  -----------  -----------  ---------  ---------  -----------  ---------------------------
+     87.4        125447452          1  125447452.0  125447452.0  125447452  125447452          0.0  cudaMemcpy2DAsync_ptsz     
+      5.7          8120422          4    2030105.5    1461945.0     133982    5062550    2365698.9  cudaMemcpyAsync            
+      3.8          5479815          1    5479815.0    5479815.0    5479815    5479815          0.0  cudaMallocAsync_ptsz_v11020
+      2.7          3835783          2    1917891.5    1917891.5    1280448    2555335     901481.2  cudaFree                   
+      0.3           501916          2     250958.0     250958.0     160872     341044     127400.8  cudaMalloc                 
+      0.1            83021          2      41510.5      41510.5       4650      78371      52128.6  cudaLaunchKernel_ptsz      
+      0.0            38510          1      38510.0      38510.0      38510      38510          0.0  cudaMemsetAsync_ptsz       
+      0.0            18301          1      18301.0      18301.0      18301      18301          0.0  cudaMemGetInfo             
+      0.0            18010          3       6003.3       7020.0       2790       8200       2844.7  cudaDeviceSynchronize      
+      0.0            12841          2       6420.5       6420.5       6190       6651        326.0  cudaEventCreateWithFlags   
+      0.0            12700          1      12700.0      12700.0      12700      12700          0.0  cudaFreeAsync_ptsz_v11020  
+      0.0            10860          6       1810.0       1100.0        340       4090       1719.1  cudaEventRecord            
+      0.0             9560          2       4780.0       4780.0       2400       7160       3365.8  cudaStreamWaitEvent        
+      0.0             2870          1       2870.0       2870.0       2870       2870          0.0  cudaEventSynchronize       
+      0.0             2130          1       2130.0       2130.0       2130       2130          0.0  cudaStreamGetId_v12000     
+      0.0             1270          1       1270.0       1270.0       1270       1270          0.0  cudaEventDestroy           
+      0.0              710          1        710.0        710.0        710        710          0.0  cuModuleGetLoadingMode     
+
+[5/7] Executing 'cuda_gpu_kern_sum' stats report
+
+ Time (%)  Total Time (ns)  Instances   Avg (ns)     Med (ns)    Min (ns)   Max (ns)   StdDev (ns)                                                  Name                                                
+ --------  ---------------  ---------  -----------  -----------  ---------  ---------  -----------  ----------------------------------------------------------------------------------------------------
+    100.0        464954318          1  464954318.0  464954318.0  464954318  464954318          0.0  void cuvs::neighbors::cagra::detail::single_cta_search::search_kernel<(bool)1, (bool)1, cuvs::neigh…
+      0.0             1249          1       1249.0       1249.0       1249       1249          0.0  void cuvs::neighbors::cagra::detail::standard_dataset_descriptor_init_kernel<(cuvs::distance::Dista…
+
+[6/7] Executing 'cuda_gpu_mem_time_sum' stats report
+
+ Time (%)  Total Time (ns)  Count   Avg (ns)   Med (ns)   Min (ns)  Max (ns)   StdDev (ns)           Operation          
+ --------  ---------------  -----  ----------  ---------  --------  ---------  -----------  ----------------------------
+     96.5        128711903      3  42903967.7  5027606.0   2661260  121023037   67663443.9  [CUDA memcpy Host-to-Device]
+      3.3          4445204      1   4445204.0  4445204.0   4445204    4445204          0.0  [CUDA memset]               
+      0.2           203041      2    101520.5   101520.5    100993     102048        746.0  [CUDA memcpy Device-to-Host]
+
+[7/7] Executing 'cuda_gpu_mem_size_sum' stats report
+
+ Total (MB)  Count  Avg (MB)  Med (MB)  Min (MB)  Max (MB)  StdDev (MB)           Operation          
+ ----------  -----  --------  --------  --------  --------  -----------  ----------------------------
+   3230.720      3  1076.907   128.000    30.720  3072.000     1728.486  [CUDA memcpy Host-to-Device]
+   3072.000      1  3072.000  3072.000  3072.000  3072.000        0.000  [CUDA memset]               
+      5.120      2     2.560     2.560     2.560     2.560        0.000  [CUDA memcpy Device-to-Host]
+
+Generated:
+    /home/ubuntu/index-accel-validation/peak-profiles/search.nsys-rep
+    /home/ubuntu/index-accel-validation/peak-profiles/search.sqlite

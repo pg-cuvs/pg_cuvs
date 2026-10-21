@@ -1,0 +1,62 @@
+{
+  "commit": "0ff9f7c9fac4c20b8256dfc20ea3b0e604f7dd28",
+  "create_index_seconds": 0.012911537196487188,
+  "extensions": [
+    [
+      "pg_cuvs",
+      "0.8.0"
+    ],
+    [
+      "pg_prewarm",
+      "1.2"
+    ],
+    [
+      "plpgsql",
+      "1.0"
+    ],
+    [
+      "vector",
+      "0.8.0"
+    ]
+  ],
+  "graph": {
+    "db_oid": 16384,
+    "ddl": "CREATE INDEX t_cagra ON public.t USING cagra (embedding) WITH (graph_degree='32', intermediate_graph_degree='128', build_algo=ivf_pq)",
+    "files": {
+      "16384_17101.cagra": {
+        "bytes": 786452,
+        "sha256": "b498657c55b885105228ed89e88a516b685088eb47892073fa525766a9af4d10"
+      },
+      "16384_17101.tids": {
+        "bytes": 2080,
+        "sha256": "bf001bc75b0cad771199365cb10b500d79788d83588db9534dc2012da814ba9f"
+      },
+      "16384_17101.vectors": {
+        "bytes": 786472,
+        "sha256": "eb5f5d034402cafb6be577d54b7eec7b2a5bdc3285bb9949d67c88bd9f6f42fb"
+      }
+    },
+    "index_oid": 17101
+  },
+  "harness": "private pg_cuvs feature validation; PgEngine loader/batch; serial id+distance SQL",
+  "harness_file_sha256": "6eff974166148109e87f883f0f39bb1a86cd2868e2f37e65b083df34cfe57704",
+  "mode": "prepare",
+  "n": 256,
+  "owner": {
+    "fixture": true,
+    "hardware_GPU": false,
+    "vm_id": "local-cpu-shim-fixture",
+    "vm_name": "pg-cuvs-index-accel-local-fixture"
+  },
+  "postgres": "PostgreSQL 16.15 on aarch64-unknown-linux-musl, compiled by gcc (Alpine 15.2.0) 15.2.0, 64-bit",
+  "queries": 8,
+  "rmm_pool_mb": "0",
+  "search_settings": {
+    "cuvs.bf_batch_wait_us": "0",
+    "cuvs.cagra_batch_wait_us": "0",
+    "cuvs.itopk_size": "0",
+    "cuvs.search_mode": "cagra",
+    "cuvs.search_width": "0"
+  },
+  "selection": "AUTO; no kernel trace collected"
+}

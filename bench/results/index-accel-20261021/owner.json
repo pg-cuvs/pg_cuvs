@@ -1,0 +1,89 @@
+{
+  "vm_name": "pg-cuvs-index-accel-20261020",
+  "vm_id": "v6nc08sjs",
+  "gpu_model": "L40S",
+  "cuda_arch": "sm_89",
+  "price_usd_per_hour": 1.74,
+  "hardware": {
+    "observed_at_utc": "2026-10-20T14:57:41.068876+00:00",
+    "hostname": "brev-v6nc08sjs",
+    "os_release": {
+      "PRETTY_NAME": "Ubuntu 22.04.5 LTS",
+      "NAME": "Ubuntu",
+      "VERSION_ID": "22.04",
+      "VERSION": "22.04.5 LTS (Jammy Jellyfish)",
+      "VERSION_CODENAME": "jammy",
+      "ID": "ubuntu",
+      "ID_LIKE": "debian",
+      "HOME_URL": "https://www.ubuntu.com/",
+      "SUPPORT_URL": "https://help.ubuntu.com/",
+      "BUG_REPORT_URL": "https://bugs.launchpad.net/ubuntu/",
+      "PRIVACY_POLICY_URL": "https://www.ubuntu.com/legal/terms-and-policies/privacy-policy",
+      "UBUNTU_CODENAME": "jammy"
+    },
+    "vcpu_count": 8,
+    "memory_gib": 144.39885330200195,
+    "gpu": {
+      "exit_code": 0,
+      "stdout": "NVIDIA L40S, GPU-d9e48742-0b9e-1c7d-d1d3-a12ac29e6935, 46068, 565.57.01, 8.9",
+      "stderr": ""
+    },
+    "nvidia_smi": {
+      "exit_code": 0,
+      "stdout": "Tue Oct 20 14:57:41 2026       \n+-----------------------------------------------------------------------------------------+\n| NVIDIA-SMI 565.57.01              Driver Version: 565.57.01      CUDA Version: 12.7     |\n|-----------------------------------------+------------------------+----------------------+\n| GPU  Name                 Persistence-M | Bus-Id          Disp.A | Volatile Uncorr. ECC |\n| Fan  Temp   Perf          Pwr:Usage/Cap |           Memory-Usage | GPU-Util  Compute M. |\n|                                         |                        |               MIG M. |\n|=========================================+========================+======================|\n|   0  NVIDIA L40S                    On  |   00000002:00:01.0 Off |                    0 |\n| N/A   31C    P8             24W /  350W |       1MiB /  46068MiB |      0%      Default |\n|                                         |                        |                  N/A |\n+-----------------------------------------+------------------------+----------------------+\n                                                                                         \n+-----------------------------------------------------------------------------------------+\n| Processes:                                                                              |\n|  GPU   GI   CI        PID   Type   Process name                              GPU Memory |\n|        ID   ID                                                               Usage      |\n|=========================================================================================|\n|  No running processes found                                                             |\n+-----------------------------------------------------------------------------------------+",
+      "stderr": ""
+    },
+    "nvcc_before_bootstrap": {
+      "error": "[Errno 2] No such file or directory: 'nvcc'"
+    },
+    "block_devices": {
+      "exit_code": 0,
+      "stdout": "{\n   \"blockdevices\": [\n      {\n         \"name\": \"loop0\",\n         \"type\": \"loop\",\n         \"size\": 67051520,\n         \"model\": null,\n         \"rota\": true,\n         \"tran\": null,\n         \"fstype\": \"squashfs\",\n         \"mountpoints\": [\n             \"/snap/core20/2318\"\n         ]\n      },{\n         \"name\": \"loop1\",\n         \"type\": \"loop\",\n         \"size\": 91267072,\n         \"model\": null,\n         \"rota\": true,\n         \"tran\": null,\n         \"fstype\": \"squashfs\",\n         \"mountpoints\": [\n             \"/snap/lxd/29351\"\n         ]\n      },{\n         \"name\": \"loop2\",\n         \"type\": \"loop\",\n         \"size\": 40714240,\n         \"model\": null,\n         \"rota\": true,\n         \"tran\": null,\n         \"fstype\": \"squashfs\",\n         \"mountpoints\": [\n             \"/snap/snapd/21759\"\n         ]\n      },{\n         \"name\": \"vda\",\n         \"type\": \"disk\",\n         \"size\": 137438953472,\n         \"model\": null,\n         \"rota\": true,\n         \"tran\": null,\n         \"fstype\": null,\n         \"mountpoints\": [\n             null\n         ],\n         \"children\": [\n            {\n               \"name\": \"vda1\",\n               \"type\": \"part\",\n               \"size\": 137322544640,\n               \"model\": null,\n               \"rota\": true,\n               \"tran\": null,\n               \"fstype\": \"ext4\",\n               \"mountpoints\": [\n                   \"/\"\n               ]\n            },{\n               \"name\": \"vda14\",\n               \"type\": \"part\",\n               \"size\": 4194304,\n               \"model\": null,\n               \"rota\": true,\n               \"tran\": null,\n               \"fstype\": null,\n               \"mountpoints\": [\n                   null\n               ]\n            },{\n               \"name\": \"vda15\",\n               \"type\": \"part\",\n               \"size\": 111149056,\n               \"model\": null,\n               \"rota\": true,\n               \"tran\": null,\n               \"fstype\": \"vfat\",\n               \"mountpoints\": [\n                   \"/boot/efi\"\n               ]\n            }\n         ]\n      },{\n         \"name\": \"vdb\",\n         \"type\": \"disk\",\n         \"size\": 128849018880,\n         \"model\": null,\n         \"rota\": true,\n         \"tran\": null,\n         \"fstype\": \"ext4\",\n         \"mountpoints\": [\n             \"/data\"\n         ]\n      }\n   ]\n}",
+      "stderr": ""
+    },
+    "root_mount": {
+      "exit_code": 0,
+      "stdout": "{\n   \"filesystems\": [\n      {\n         \"target\": \"/\",\n         \"source\": \"/dev/vda1\",\n         \"fstype\": \"ext4\",\n         \"options\": \"rw,relatime,discard,errors=remount-ro\"\n      }\n   ]\n}",
+      "stderr": ""
+    },
+    "ephemeral_mount": {
+      "exit_code": 0,
+      "stdout": "{\n   \"filesystems\": [\n      {\n         \"target\": \"/\",\n         \"source\": \"/dev/vda1\",\n         \"fstype\": \"ext4\",\n         \"options\": \"rw,relatime,discard,errors=remount-ro\"\n      }\n   ]\n}",
+      "stderr": ""
+    },
+    "nvme_devices": [],
+    "local_nvme_assessment": "No NVMe block device detected",
+    "systemd": {
+      "exit_code": 0,
+      "stdout": "systemd 249 (249.11-0ubuntu3.12)\n+PAM +AUDIT +SELINUX +APPARMOR +IMA +SMACK +SECCOMP +GCRYPT +GNUTLS +OPENSSL +ACL +BLKID +CURL +ELFUTILS +FIDO2 +IDN2 -IDN +IPTC +KMOD +LIBCRYPTSETUP +LIBFDISK +PCRE2 -PWQUALITY -P11KIT -QRENCODE +BZIP2 +LZ4 +XZ +ZLIB +ZSTD -XKBCOMMON +UTMP +SYSVINIT default-hierarchy=unified",
+      "stderr": ""
+    },
+    "root_free_bytes": 115572850688
+  },
+  "software": {
+    "postgres": "16.15",
+    "cuda_toolkit": "12.4.131",
+    "libcuvs": "26.04.00",
+    "librmm": "26.04.00",
+    "extensions": [
+      [
+        "pg_cuvs",
+        "0.8.0"
+      ],
+      [
+        "pg_prewarm",
+        "1.2"
+      ],
+      [
+        "plpgsql",
+        "1.0"
+      ],
+      [
+        "vector",
+        "0.8.7"
+      ]
+    ],
+    "upstream_bootstrap_commit": "77c660110a22beeffc151fc5c5dee37a859e1c10",
+    "baseline_commit": "8b73d65fb8a3d6f66cdfe69eec4969c1f2fc753c"
+  }
+}

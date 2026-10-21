@@ -1,0 +1,10 @@
+[INFO] pg_cuvs_server: starting (socket=/tmp/.s.pg_cuvs index-dir=/tmp/cuvs_indexes snapshot=disabled)
+[INFO] index registry capacity: 1024 (--max-indexes)
+[INFO] RMM initial pool reservation: 0 MiB per GPU (0=disabled)
+[INFO] RMM maximum pool quota: 0% of total device memory
+[INFO] pg_cuvs_server: hw_profile gpu='shim-cpu (PGCUVS_CPU_SHIM)' link_bw=12000 hbm_bw=1000000 bf_tput=1000 cpu_dist=1774 cagra_lat=1000.0 ipc_rtt=2.0 probe_status=0x18
+[INFO] GPU 0 (shim-cpu (PGCUVS_CPU_SHIM)): 40960 MB total, budget 36864 MB (default fraction of total)
+[INFO] GPU 0 warm-up done in 0 ms
+[INFO] pg_cuvs_server: listening on /tmp/.s.pg_cuvs
+[INFO] [handle_build] corpus via memfd(SCM_RIGHTS) fd=6 total=788480
+[INFO] pg_cuvs_server: built index 16384/17101 (256 vecs, 0 MB VRAM)

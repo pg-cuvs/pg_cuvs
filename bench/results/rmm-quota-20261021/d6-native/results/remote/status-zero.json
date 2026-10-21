@@ -1,0 +1,66 @@
+{
+  "values": {
+    "cuvs.rmm_pool_mb": "0",
+    "cuvs.rmm_pool_max_percent": "0",
+    "cuvs.rmm_pool_status": "{\"initial_mb\":0,\"maximum_percent\":0,\"devices\":[]}",
+    "cuvs.itopk_size": "0",
+    "cuvs.search_width": "0"
+  },
+  "pool": {
+    "initial_mb": 0,
+    "maximum_percent": 0,
+    "devices": []
+  },
+  "readonly_rejections": {
+    "cuvs.rmm_pool_mb": {
+      "sqlstate": "55P02",
+      "message": "parameter \"cuvs.rmm_pool_mb\" cannot be changed"
+    },
+    "cuvs.rmm_pool_max_percent": {
+      "sqlstate": "55P02",
+      "message": "parameter \"cuvs.rmm_pool_max_percent\" cannot be changed"
+    },
+    "cuvs.rmm_pool_status": {
+      "sqlstate": "55P02",
+      "message": "parameter \"cuvs.rmm_pool_status\" cannot be changed"
+    }
+  },
+  "resident_original_index_count": 1,
+  "binding": {
+    "daemon_pid": 4483,
+    "backend_pid": 5022,
+    "running_exe": {
+      "sha256": "b4b75a99a8d64af5d5c22c96d0cb47212fa70d80ef00ed3bd2ccb57d0c903568",
+      "bytes": 1202760,
+      "device": 64513,
+      "inode": 523485
+    },
+    "built_daemon": {
+      "sha256": "b4b75a99a8d64af5d5c22c96d0cb47212fa70d80ef00ed3bd2ccb57d0c903568",
+      "bytes": 1202760,
+      "device": 64513,
+      "inode": 3875975
+    },
+    "installed_extension": {
+      "sha256": "ad3b83838769cbd3188e3ae229efe33561659279c5255b7a208d1038da427372",
+      "bytes": 3161208,
+      "device": 64513,
+      "inode": 523453
+    },
+    "built_extension": {
+      "sha256": "ad3b83838769cbd3188e3ae229efe33561659279c5255b7a208d1038da427372",
+      "bytes": 3161208,
+      "device": 64513,
+      "inode": 3875967
+    },
+    "extension_maps": [
+      "7fb5534b2000-7fb55354f000 r--p 00000000 fc:01 523453                     /usr/lib/postgresql/16/lib/pg_cuvs.so",
+      "7fb55354f000-7fb553641000 r-xp 0009d000 fc:01 523453                     /usr/lib/postgresql/16/lib/pg_cuvs.so",
+      "7fb553641000-7fb553692000 r--p 0018f000 fc:01 523453                     /usr/lib/postgresql/16/lib/pg_cuvs.so",
+      "7fb553692000-7fb553693000 ---p 001e0000 fc:01 523453                     /usr/lib/postgresql/16/lib/pg_cuvs.so",
+      "7fb553693000-7fb55369f000 r--p 001e0000 fc:01 523453                     /usr/lib/postgresql/16/lib/pg_cuvs.so",
+      "7fb55369f000-7fb5536a0000 rw-p 001ec000 fc:01 523453                     /usr/lib/postgresql/16/lib/pg_cuvs.so"
+    ],
+    "source_commit": "0ff9f7c9fac4c20b8256dfc20ea3b0e604f7dd28"
+  }
+}

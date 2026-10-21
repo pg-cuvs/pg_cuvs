@@ -1,0 +1,977 @@
+diff --git a/Makefile b/Makefile
+index 161bb61..a304301 100644
+--- a/Makefile
++++ b/Makefile
+@@ -142,6 +142,9 @@ SERVER_CFLAGS  = -O2 -g -Wall -Wextra -I./src \
+ # Optional sanitizer/debug hooks for the daemon (e.g. CI ASAN job passes
+ # EXTRA_SERVER_CFLAGS="-fsanitize=address -fno-omit-frame-pointer"). Empty by default.
+ SERVER_CFLAGS += $(EXTRA_SERVER_CFLAGS)
++ifdef PGCUVS_CPU_SHIM
++SERVER_CFLAGS += -DPGCUVS_CPU_SHIM
++endif
+ SERVER_LDFLAGS = $(CUVS_SERVER_LINK) -lstdc++ \
+                  -lpthread -lrt \
+                  -lcurl -lssl -lcrypto
+@@ -373,7 +376,8 @@ export
+ # VM_SSH_HOST is provider-neutral; GCP_VM is the pre-Brev name kept as a
+ # fallback so an existing config file still resolves.
+ VM_SSH_HOST ?= $(GCP_VM)
+-RMM_POOL_MB ?= 0
++RMM_POOL_MB ?= 512
++RMM_POOL_MAX_PERCENT ?= 50
+ GCP_USER ?= ubuntu
+ VM_IP = $(if $(USE_GCP_IP),$(shell gcloud compute instances describe $(GCP_INSTANCE) --zone $(GCP_ZONE) $(if $(GCP_PROJECT),--project $(GCP_PROJECT)) --format='value(networkInterfaces[0].accessConfigs[0].natIP)' 2>/dev/null),)
+ VM_HOST = $(if $(VM_IP),$(GCP_USER)@$(VM_IP),$(VM_SSH_HOST))
+@@ -572,7 +576,8 @@ gpu-server-start:
+ 	ssh -tt $(VM_HOST) "pg_cuvs_server \
+ 		--socket /tmp/.s.pg_cuvs \
+ 		--index-dir \$$(psql -t -c 'SHOW data_directory' | tr -d ' ')/cuvs_indexes \
+-		--max-vram-mb 20480 --rmm-pool-mb $(RMM_POOL_MB) &"
++		--max-vram-mb 20480 --rmm-pool-mb $(RMM_POOL_MB) \
++		--rmm-pool-max-percent $(RMM_POOL_MAX_PERCENT) &"
+ 
+ # Default sanity benchmark on the VM (small size from benchmark.sh defaults).
+ # N/DIM/K/M forwarded to the remote `make benchmark` only when set locally.
+diff --git a/design/decisions.md b/design/decisions.md
+index 1e2ab5a..2803b08 100644
+--- a/design/decisions.md
++++ b/design/decisions.md
+@@ -3725,3 +3725,58 @@ raw 수치 자체가 무의미해서가 아니었다.
+ 
+ **관련**: ADR-080(대체 대상 + 나머지 유효), ADR-069(벤치 방법론), ADR-062(에코시스템 Stage 2),
+ #98(측정 설계 — 두 축, 축내 비교만).
++
++## ADR-085 — RMM 초기 예약과 upstream quota를 분리하고 admission에 상한 반영
++
++**날짜:** 2026-10-21
++**상태:** 구현 — 단일 L40S 실험을 근거로 한 기본값, 다른 GPU/scale의 성능 보장은 아님
++**Supersedes:** 동일 RMM PR의 초기 기본값 `0` / upstream 무상한 구성. 과거 측정 원 자료는 변경하지 않음
++**현행 SSOT:** [`docs/reference.md`](../docs/reference.md#rmm-quota-and-memory-accounting), `src/cuvs_wrapper.cu`, `src/pg_cuvs_server.c`
++
++**배경:** cuVS가 사용하는 current device resource에 pool을 설치하면 검색 workspace뿐 아니라
++retained dataset, graph 적재와 빌드의 RMM 할당도 포함된다. `initial_pool_size`는 최대 크기가
++아니며, 빌드가 끝나도 pool의 high-water reservation이 남는다. index별 `vram_bytes`는
++retained dataset/graph 추정치이므로 이 선점분과 temporary workspace를 표현하지 않는다.
++
++[`bench/results/index-accel-20261021/rmm-study.md`](../bench/results/index-accel-20261021/rmm-study.md)의
++L40S(sm89), wiki 1M 고정 graph, private SQL harness, 크기별 N=3 비교에서 검색 p50은
++initial 512 MiB부터 평탄했다. 참조 initial 1024 MiB의 IVF-PQ 빌드는 live peak 8.797 GB와
++pool high-water 16.583 GB를 보였다. 별도 upstream-quota prototype(initial 512 MiB,
++maximum 50%)에서는 검색 IT512/Q10000과 gd64/igd256의 IVF-PQ·NN-descent가 모두 성공했다.
++prototype의 최대 pool hold 14.435 GB에 두 번째 gd64 index의 보수적 추정 3.328 GB를 더해도
++23.847 GB quota 안에 6.083 GB가 남았다. 각 peak/prototype은 N=1이며 동시 다중 index나
++다른 scale을 검증한 결과는 아니다. full grid 또는 교차 엔진 배수로 승격하지 않는다.
++
++**결정:**
++
++1. GPU daemon은 initial 512 MiB와 GPU별 total CUDA memory의 50%를 기본값으로 한다.
++   quota는 256-byte 경계로 내린다. `--rmm-pool-mb 0`은 기존 allocator 경로를 유지한다.
++   CPU shim의 기본값은 0이며 실제 GPU pool 적용을 주장하지 않는다.
++2. maximum은 upstream `limiting_resource_adaptor`로 강제한다. pool constructor의
++   maximum은 미설정으로 두어 기존 doubling/backoff 성장 정책을 유지한다. SDK constructor에
++   finite maximum을 전달하면 remaining/2 정책으로 바뀌므로 이 결정과 다른 구성이다.
++3. admission은 `unused_pool + min(physical_free + async_reclaim, quota - reserved)`다.
++   빈 pool에서도 들어가지 않을 index는 기존 index를 eviction하기 전에 거부한다.
++   별도의 logical index-residency budget은 그대로 적용한다.
++4. `SHOW cuvs.rmm_pool_mb`, `SHOW cuvs.rmm_pool_max_percent`,
++   `SHOW cuvs.rmm_pool_status`로 실제 적용값과 GPU별 maximum/reserved/used bytes를 읽는다.
++   SQL SET으로 allocator를 교체하지 않는다. 응답 불가·구버전은 `unavailable`이며 0으로
++   오인하지 않는다. 기존 startup-settings opcode는 유지하고 상세 상태에 새 opcode를 쓴다.
++5. quota는 RMM pool을 제한한다. 직접 CUDA managed/async 할당, context와 다른 process까지
++   포함하는 전체 GPU memory cap은 아니다. memory pressure를 평가할 때 pool 상태,
++   `pg_stat_gpu_search.vram_bytes`, `nvidia-smi memory.used`를 함께 기록한다. index eviction은
++   pool 공간을 재사용 가능하게 하지만 그 선점분을 외부 CUDA 사용자에게 반환하지 않는다.
++
++**대안:**
++
++| 대안 | 선택하지 않은 이유 |
++|---|---|
++| initial 1024 MiB / 무상한 유지 | 512 MiB 이후의 지연 plateau와 빌드 high-water를 설명하지 못하고 quota를 제공하지 않음 |
++| initial만 줄임 | pool 성장의 maximum이 생기지 않음 |
++| pool constructor에 maximum 전달 | SDK의 growth policy가 바뀌므로 검증한 doubling 구성과 다름 |
++| physical free만 admission에 사용 | 재사용 가능한 pool 공간을 놓치거나 quota 밖의 physical free를 성장 가능량으로 잘못 셈 |
++| pool reservation을 모든 index의 vram_bytes에 분배 | pool은 index 수명과 별개인 process 자원이며 workspace까지 공유하므로 중복·오귀속 가능 |
++
++**검증 경계:** quota 정렬·overflow·재사용·남은 quota 계산은 CPU unit, 적용 상태와 readonly 및
++미접속 처리는 SQL regression으로 확인한다. 실제 allocator 동작은 native CUDA build와 별도
++GPU smoke가 필요하다. 과거 FD snapshot 측정과 새 quota/status 구현의 검증 기록을 구분한다.
+diff --git a/docs/reference.md b/docs/reference.md
+index a82ac4d..47dd8b4 100644
+--- a/docs/reference.md
++++ b/docs/reference.md
+@@ -164,6 +164,8 @@ Defaults and ranges are from source. "Set by" is the minimum role/scope: `USERSE
+ | `cuvs.index_dir` | string | `$PGDATA/cuvs_indexes` | — | SUSET | Artifact directory (empty = resolved at runtime) |
+ | `cuvs.k` | int | `100` | 1–2000 | USERSET | GPU top-k candidates fetched per scan (cf. `hnsw.ef_search`) |
+ | `cuvs.rmm_pool_mb` | int/status | daemon value | 0–INT_MAX, or `unavailable` | read-only (INTERNAL) | Applied initial RMM pool reservation per GPU, queried from the daemon. `0` = disabled; `unavailable` = no compatible daemon reply. Set using the daemon CLI and restart, not SQL SET. Record with each benchmark run |
++| `cuvs.rmm_pool_max_percent` | int/status | daemon value | 0–100, or `unavailable` | read-only (INTERNAL) | Applied upstream pool quota as a percentage of total CUDA memory on each GPU. `0` when the pool is disabled |
++| `cuvs.rmm_pool_status` | string/status | daemon value | JSON, or `unavailable` | read-only (INTERNAL) | Applied initial MiB, quota percentage, and per-device maximum/reserved/used pool bytes. Counters cover RMM pool allocations; they are live snapshots, not process-wide GPU memory |
+ | `cuvs.circuit_breaker_threshold` | int | `3` | 1–100 | USERSET | Consecutive GPU errors before the (per-backend) breaker trips |
+ 
+ ### Build
+@@ -241,8 +243,9 @@ daemon-only ones have no session equivalent.
+ |------|----------------|---------|---------|
+ | `--socket PATH` | `cuvs.socket_path` | `/tmp/.s.pg_cuvs` | UDS path |
+ | `--index-dir DIR` | `cuvs.index_dir` | — | Artifact dir the daemon serves from; must match the backend's `index_dir` or searches fall back to seqscan |
+-| `--max-vram-mb N` | — (daemon-only) | 90% of total VRAM | VRAM budget, enforced by self-accounting (ADR-065); the supported way to cap VRAM |
+-| `--rmm-pool-mb N` | `cuvs.rmm_pool_mb` (read-only status) | `0` (disabled) | Initial RMM pool reservation per allowed GPU in MiB, installed before probes/load/warmup. May grow from the upstream allocator; this is not a VRAM cap. Init failure aborts startup. Reusable pool bytes are included in admission headroom |
++| `--max-vram-mb N` | — (daemon-only) | 90% of total VRAM | Logical index-residency budget, enforced by self-accounting (ADR-065). Excludes unused pool reservation and temporary workspace; it is separate from the RMM quota |
++| `--rmm-pool-mb N` | `cuvs.rmm_pool_mb` (read-only status) | `512` MiB | Initial RMM pool reservation per allowed GPU, installed before probes/load/warmup. Explicit `0` disables the pool and keeps the legacy allocator. CPU shim builds default to `0`. Init failure aborts startup |
++| `--rmm-pool-max-percent N` | `cuvs.rmm_pool_max_percent` (read-only status) | `50` | Hard upstream quota: total CUDA memory × N%, rounded down to 256 bytes, on each allowed GPU. Range 1–100; initial reservation must fit. Preserves the pool's doubling/backoff growth policy |
+ | `--max-indexes N` | — (daemon-only) | `1024` | **Soft** LRU working-set cap (ADR-068), not a hard wall (was 64). At the cap, `load_index` evicts the LRU index to free a slot and auto-reloads on next use; a build over the cap defers gracefully |
+ | `--gpu-devices LIST` | — (daemon-only) | all visible | CUDA devices the daemon uses (else honors `CUDA_VISIBLE_DEVICES`) |
+ | `--snapshot-uri URI` | `cuvs.snapshot_uri` | `` | GCS snapshot root |
+@@ -250,6 +253,39 @@ daemon-only ones have no session equivalent.
+ | `--gcs-key-file PATH` | `cuvs.gcs_key_file` | `` | Service-account JSON path |
+ | `--warmup-threads N` | `cuvs.warmup_threads` | `2` | Background GCS warmup pool size |
+ 
++### RMM quota and memory accounting
++
++The current device resource is installed before hardware probes, index reload,
++warmup and worker threads, so the pool covers retained index data and builds as
++well as search workspace. The quota is imposed by the upstream limiting resource;
++the pool constructor's maximum is left unset to retain its doubling/backoff policy.
++The initial reservation is not the maximum, and it does not shrink after a build.
++
++Admission uses **unused pool bytes + min(reclaimable physical memory, remaining
++upstream quota)**. An index estimate larger than an empty pool's quota is rejected
++before evicting resident indexes. The logical index budget still applies separately.
++
++`pg_stat_gpu_search.vram_bytes` estimates retained dataset/graph memory; it does
++not include unused pool reservation or transient workspace. Pool-backed frees
++become reusable without returning their physical allocation to other CUDA users.
++cuVS may also allocate outside the current RMM resource (for example managed or
++CUDA async scratch); the pool quota does not bound those allocations, CUDA context
++memory, or total `nvidia-smi memory.used`. Record both pool status and physical GPU
++usage when assessing memory pressure:
++
++```sql
++SHOW cuvs.rmm_pool_mb;
++SHOW cuvs.rmm_pool_max_percent;
++SHOW cuvs.rmm_pool_status;
++```
++
++The JSON has `initial_mb`, `maximum_percent`, and a `devices` array containing
++`device_id`, `maximum_bytes`, `reserved_bytes`, and `used_bytes`. A disabled pool
++reports initial/percentage zero and an empty device array. An absent or incompatible
++daemon reports `unavailable`, not a fabricated zero. These are read-only settings;
++changing them with SQL SET cannot replace a live allocator. See ADR-085 for the
++measured default rule and its single-GPU scope.
++
+ ---
+ 
+ ## 4. Reloptions
+diff --git a/infra/brev/README.md b/infra/brev/README.md
+index ee3dc15..c039426 100644
+--- a/infra/brev/README.md
++++ b/infra/brev/README.md
+@@ -64,28 +64,34 @@ lists the index, and queries fall back to a seq scan without erroring. Rebuild w
+ REINDEX or give the index its own persistent `index_dir`; see the `IDX` comment in
+ `bootstrap.sh`. On a long-lived host, also watch for `systemd-tmpfiles` reaping it.
+ 
+-### Optional RMM pool
++### RMM pool and upstream quota
+ 
+-The default `--rmm-pool-mb 0` leaves the existing allocator unchanged. To reserve
+-an initial pool per allowed GPU during bootstrap, pass `RMM_POOL_MB=1024`:
++The GPU daemon defaults to an initial 512 MiB pool per allowed GPU, with an
++upstream quota of 50% of total CUDA memory. To override the initial reservation
++and quota during bootstrap:
+ 
+ ```bash
+-ssh <name> 'RMM_POOL_MB=1024 bash ~/bootstrap.sh'
++ssh <name> 'RMM_POOL_MB=1024 RMM_POOL_MAX_PERCENT=50 bash ~/bootstrap.sh'
+ ```
+ 
+ The generated unit reads `/etc/default/pg-cuvs-server`. To compare pool disabled
+ and enabled on an instance assigned to this benchmark, set `RMM_POOL_MB=0` or
+-`RMM_POOL_MB=1024` in that file and restart the daemon using `make gpu-reload`
++`RMM_POOL_MB=512` in that file and restart the daemon using `make gpu-reload`
+ or `sudo systemctl restart pg-cuvs-server`. A directly launched daemon receives
+-the same setting through `make gpu-server-start RMM_POOL_MB=1024`.
++the same settings through `make gpu-server-start RMM_POOL_MB=512 RMM_POOL_MAX_PERCENT=50`.
++Explicit `RMM_POOL_MB=0` keeps the legacy allocator. CPU shim builds default to zero.
+ 
+-Record the **applied** value with `SHOW cuvs.rmm_pool_mb` (or
+-`SELECT current_setting('cuvs.rmm_pool_mb')`) in run metadata. This status is
++Record the **applied** values with `SHOW cuvs.rmm_pool_mb`,
++`SHOW cuvs.rmm_pool_max_percent`, and `SHOW cuvs.rmm_pool_status` in run metadata. Status is
+ read-only: SQL SET cannot replace a live allocator. `unavailable` means the
+ daemon did not return a compatible status, and must not be recorded as zero.
+-The number is the initial reservation in MiB; the pool can grow and the
+-existing `--max-vram-mb` admission budget remains separate. Allocator creation
+-failure stops daemon startup rather than silently running without the pool.
++The JSON reports each GPU's maximum, reserved and used pool bytes. The pool grows
++through an upstream quota without changing the SDK's doubling policy. Admission
++adds reusable pool bytes and limits new growth by that quota. The existing
++`--max-vram-mb` logical index budget remains separate, and `vram_bytes` excludes
++unused pool reservation. Direct CUDA/managed allocations and context memory can
++bypass RMM; also record `nvidia-smi memory.used`. Allocator creation failure stops
++daemon startup rather than silently running without the pool.
+ 
+ ## What survives a delete (and what doesn't)
+ 
+diff --git a/infra/brev/bootstrap.sh b/infra/brev/bootstrap.sh
+index f6a2fdd..8653606 100755
+--- a/infra/brev/bootstrap.sh
++++ b/infra/brev/bootstrap.sh
+@@ -73,10 +73,18 @@ IDX=/tmp/cuvs_indexes
+ CONDA=/opt/miniforge3
+ DEV=$CONDA/envs/cuvs_dev            # C/C++ build toolchain (nvcc, libcuvs)
+ BENCH=$CONDA/envs/cuvs_bench        # python bench stack (separate: python 3.12)
+-RMM_POOL_MB=${RMM_POOL_MB:-0}       # opt-in initial reservation per GPU, MiB
++RMM_POOL_MB=${RMM_POOL_MB:-512}     # initial reservation per GPU, MiB; 0 disables
++RMM_POOL_MAX_PERCENT=${RMM_POOL_MAX_PERCENT:-50}
+ case "$RMM_POOL_MB" in
+   ''|*[!0-9]*) echo "FATAL: RMM_POOL_MB must be a nonnegative integer" >&2; exit 1 ;;
+ esac
++case "$RMM_POOL_MAX_PERCENT" in
++  ''|*[!0-9]*) echo "FATAL: RMM_POOL_MAX_PERCENT must be an integer from 1 to 100" >&2; exit 1 ;;
++esac
++if ! { [ "$RMM_POOL_MAX_PERCENT" -ge 1 ] && [ "$RMM_POOL_MAX_PERCENT" -le 100 ]; } 2>/dev/null; then
++  echo "FATAL: RMM_POOL_MAX_PERCENT must be an integer from 1 to 100" >&2
++  exit 1
++fi
+ 
+ # The Brev image runs its own apt on first boot. Racing it dies with "Could not
+ # get lock /var/lib/dpkg/lock-frontend", which is exactly how a bootstrap once
+@@ -310,7 +318,8 @@ sudo chmod 755 /usr/local/bin/pg-cuvs-wait-socket
+ # indexes had not yet been saved and reintroduces the stale-socket race above.
+ # A benchmark can change this file and restart the daemon to compare pool=0
+ # against pool=N without rewriting the unit or changing PostgreSQL GUCs.
+-printf 'RMM_POOL_MB=%s\n' "$RMM_POOL_MB" | sudo tee /etc/default/pg-cuvs-server > /dev/null
++printf 'RMM_POOL_MB=%s\nRMM_POOL_MAX_PERCENT=%s\n' "$RMM_POOL_MB" "$RMM_POOL_MAX_PERCENT" \
++  | sudo tee /etc/default/pg-cuvs-server > /dev/null
+ sudo tee /etc/systemd/system/pg-cuvs-server.service > /dev/null <<UNIT
+ [Unit]
+ Description=pg_cuvs GPU sidecar daemon
+@@ -320,11 +329,12 @@ After=network.target
+ Type=simple
+ User=$(id -un)
+ Group=$(id -gn)
+-Environment=RMM_POOL_MB=0
++Environment=RMM_POOL_MB=512
++Environment=RMM_POOL_MAX_PERCENT=50
+ EnvironmentFile=-/etc/default/pg-cuvs-server
+ ExecStartPre=/bin/mkdir -p $IDX
+ ExecStartPre=-/bin/rm -f /tmp/.s.pg_cuvs
+-ExecStart=$(pg_config --bindir)/pg_cuvs_server --socket /tmp/.s.pg_cuvs --index-dir $IDX --gpu-devices 0 --rmm-pool-mb \${RMM_POOL_MB}
++ExecStart=$(pg_config --bindir)/pg_cuvs_server --socket /tmp/.s.pg_cuvs --index-dir $IDX --gpu-devices 0 --rmm-pool-mb \${RMM_POOL_MB} --rmm-pool-max-percent \${RMM_POOL_MAX_PERCENT}
+ ExecStartPost=/usr/local/bin/pg-cuvs-wait-socket
+ TimeoutStartSec=600
+ TimeoutStopSec=300
+diff --git a/src/cuvs_ipc.c b/src/cuvs_ipc.c
+index aee73fd..89a0720 100644
+--- a/src/cuvs_ipc.c
++++ b/src/cuvs_ipc.c
+@@ -871,6 +871,29 @@ cuvs_ipc_server_settings(const char *socket_path, CuvsServerSettings *out)
+     return rc;
+ }
+ 
++int
++cuvs_ipc_rmm_pool_status(const char *socket_path, CuvsRmmPoolStatus *out)
++{
++    int sock = uds_connect_ex(socket_path, 1);
++    int rc = CUVS_STATUS_ERROR;
++    CuvsCmdFrame cmd = {.op = CUVS_OP_RMM_POOL_STATUS};
++    CuvsReplyHeader hdr;
++    if (sock < 0)
++        return CUVS_STATUS_UNAVAILABLE;
++    memset(out, 0, sizeof(*out));
++    if (send_cmd(sock, &cmd) == 0 && recv_all(sock, &hdr, sizeof(hdr)) == 0)
++    {
++        rc = (int)hdr.status;
++        if (rc == CUVS_STATUS_OK &&
++            (hdr.n_results != 1 || recv_all(sock, out, sizeof(*out)) < 0 ||
++             out->version != CUVS_RMM_POOL_STATUS_VERSION ||
++             out->n_devices > CUVS_MAX_GPUS))
++            rc = CUVS_STATUS_ERROR;
++    }
++    close(sock);
++    return rc;
++}
++
+ /* ----------------------------------------------------------------
+  * Public API: cuvs_ipc_shard_stats (Phase 3F)
+  * ---------------------------------------------------------------- */
+diff --git a/src/cuvs_ipc.h b/src/cuvs_ipc.h
+index 5086a15..e935327 100644
+--- a/src/cuvs_ipc.h
++++ b/src/cuvs_ipc.h
+@@ -16,6 +16,8 @@
+ #include <stddef.h>
+ #include <sys/types.h>
+ 
++#define CUVS_MAX_GPUS 16
++
+ /* ----------------------------------------------------------------
+  * Protocol identity (#77)
+  *
+@@ -80,6 +82,7 @@
+                                      * names the SHM-tier fallback); query in shm_key. Non-evicting
+                                      * VRAM admission; returns top-k (tid,distance). */
+ #define CUVS_OP_SERVER_SETTINGS    23 /* read-only daemon startup settings */
++#define CUVS_OP_RMM_POOL_STATUS    24 /* quota and live pool counters */
+ 
+ /* ----------------------------------------------------------------
+  * Distance metrics (mirror pgvector operator names)
+@@ -324,6 +327,25 @@ typedef struct CuvsServerSettings {
+ 
+ int cuvs_ipc_server_settings(const char *socket_path, CuvsServerSettings *out);
+ 
++typedef struct CuvsRmmPoolStats {
++    uint32_t device_id;
++    uint32_t reserved;
++    uint64_t maximum_bytes;
++    uint64_t reserved_bytes;
++    uint64_t used_bytes;
++} CuvsRmmPoolStats;
++
++#define CUVS_RMM_POOL_STATUS_VERSION 1u
++typedef struct CuvsRmmPoolStatus {
++    uint32_t version;
++    uint32_t initial_mb;
++    uint32_t maximum_percent;  /* applied percentage; 0 when disabled */
++    uint32_t n_devices;
++    CuvsRmmPoolStats devices[CUVS_MAX_GPUS];
++} CuvsRmmPoolStatus;
++
++int cuvs_ipc_rmm_pool_status(const char *socket_path, CuvsRmmPoolStatus *out);
++
+ /*
+  * cuvs_ipc_search_filtered — D-wedge spike: filtered BF search.
+  *
+diff --git a/src/cuvs_util.c b/src/cuvs_util.c
+index 7135569..a6b29b5 100644
+--- a/src/cuvs_util.c
++++ b/src/cuvs_util.c
+@@ -30,6 +30,44 @@ cuvs_parse_rmm_pool_mb(const char *value, uint32_t *mb_out)
+     return 0;
+ }
+ 
++int
++cuvs_parse_rmm_pool_percent(const char *value, uint32_t *percent_out)
++{
++    uint32_t percent;
++    if (cuvs_parse_rmm_pool_mb(value, &percent) != 0 || percent < 1 || percent > 100)
++        return -1;
++    *percent_out = percent;
++    return 0;
++}
++
++size_t
++cuvs_rmm_pool_max_bytes(size_t total_bytes, uint32_t percent)
++{
++    size_t bytes;
++    if (percent < 1 || percent > 100)
++        return 0;
++    /* Divide first so even SIZE_MAX * 100 cannot overflow. */
++    bytes = (total_bytes / 100) * percent + ((total_bytes % 100) * percent) / 100;
++    return bytes & ~(size_t)255;
++}
++
++size_t
++cuvs_rmm_pool_headroom(size_t physical_free, size_t async_reclaimable,
++                       size_t quota, size_t reserved, size_t used)
++{
++    size_t physical = async_reclaimable > SIZE_MAX - physical_free
++                    ? SIZE_MAX : physical_free + async_reclaimable;
++    size_t growable;
++    if (quota == 0)
++        return physical;
++    if (reserved > quota || used > reserved)
++        return 0;
++    growable = quota - reserved;
++    if (growable > physical)
++        growable = physical;
++    return reserved - used + growable;
++}
++
+ /* ----------------------------------------------------------------
+  * Fail-closed filter-frame gate (ADR-063 tenant isolation).
+  * ---------------------------------------------------------------- */
+diff --git a/src/cuvs_util.h b/src/cuvs_util.h
+index 5964592..dbc537b 100644
+--- a/src/cuvs_util.h
++++ b/src/cuvs_util.h
+@@ -16,7 +16,20 @@
+ 
+ /* Strict daemon CLI parser: MiB, 0=disabled, bounded for size_t and the
+  * read-only integer GUC reporting the applied setting. Returns 0 on success. */
++#ifdef __cplusplus
++extern "C" {
++#endif
+ int cuvs_parse_rmm_pool_mb(const char *value, uint32_t *mb_out);
++int cuvs_parse_rmm_pool_percent(const char *value, uint32_t *percent_out);
++
++/* Pool quota is aligned to RMM's 256-byte allocation boundary. A zero quota
++ * in the headroom helper means the legacy, unpooled path. */
++size_t cuvs_rmm_pool_max_bytes(size_t total_bytes, uint32_t percent);
++size_t cuvs_rmm_pool_headroom(size_t physical_free, size_t async_reclaimable,
++                              size_t quota, size_t reserved, size_t used);
++#ifdef __cplusplus
++}
++#endif
+ 
+ /* ----------------------------------------------------------------
+  * Leveled logging macros (PG-free; stderr only).
+diff --git a/src/cuvs_wrapper.cu b/src/cuvs_wrapper.cu
+index b25d9ae..51c3ca8 100644
+--- a/src/cuvs_wrapper.cu
++++ b/src/cuvs_wrapper.cu
+@@ -67,15 +67,15 @@ struct DevicePool {
+ 
+ static DevicePool g_device_pools[CUVS_MAX_GPUS];
+ 
+-/* Unlimited limiting adaptors provide cheap atomic, allocation-aligned byte
+- * counters, without the maps/debug overhead of tracking_resource_adaptor. */
++/* Limiting adaptors provide atomic, allocation-aligned byte counters. The
++ * upstream enforces the quota; the usage adaptor only counts live allocations. */
+ using RmmUpstream = rmm::mr::limiting_resource_adaptor<rmm::mr::device_memory_resource>;
+ using RmmPool = rmm::mr::pool_memory_resource<RmmUpstream>;
+ using RmmUsage = rmm::mr::limiting_resource_adaptor<RmmPool>;
+ struct RmmPoolRegistry;
+ static RmmPoolRegistry *g_rmm_registry = nullptr;  /* null on the legacy path */
+ 
+-/* Created after RMM's default-resource registry on the first opt-in startup
++/* Created after RMM's default-resource registry on the first pooled startup
+  * call, so teardown runs while that registry is still alive. Clear retained
+  * RAFT resources before releasing the memory they can reference. */
+ struct RmmPoolRegistry {
+@@ -83,6 +83,7 @@ struct RmmPoolRegistry {
+     std::unique_ptr<RmmUpstream> upstreams[CUVS_MAX_GPUS];
+     std::unique_ptr<RmmPool> pools[CUVS_MAX_GPUS];
+     std::unique_ptr<RmmUsage> usages[CUVS_MAX_GPUS];
++    size_t limits[CUVS_MAX_GPUS] = {};
+     ~RmmPoolRegistry() {
+         g_rmm_registry = nullptr;
+         for (int dev = 0; dev < CUVS_MAX_GPUS; dev++) {
+@@ -176,20 +177,31 @@ struct PooledRes {
+ } // namespace
+ 
+ extern "C" int
+-cuvs_rmm_pool_init(int device_id, size_t initial_pool_bytes)
++cuvs_rmm_pool_init(int device_id, size_t initial_pool_bytes, uint32_t maximum_percent)
+ {
+     if (initial_pool_bytes == 0)
+-        return 0;   /* default path: no resource lookup or CUDA allocation */
++        return 0;   /* disabled path: no resource lookup or CUDA allocation */
+     if (device_id < 0 || device_id >= CUVS_MAX_GPUS ||
+         cudaSetDevice(device_id) != cudaSuccess)
+         return 1;
+     try {
++        size_t free_bytes = 0, total_bytes = 0;
++        if (cudaMemGetInfo(&free_bytes, &total_bytes) != cudaSuccess)
++            return 1;
++        size_t maximum = cuvs_rmm_pool_max_bytes(total_bytes, maximum_percent);
++        if (maximum == 0 || initial_pool_bytes > maximum) {
++            fprintf(stderr, "[cuvs_rmm_pool_init] GPU %d: initial %zu exceeds quota %zu bytes\n",
++                    device_id, initial_pool_bytes, maximum);
++            return 1;
++        }
+         auto *upstream = rmm::mr::get_current_device_resource();
+         static RmmPoolRegistry registry;
+         if (registry.pools[device_id])
+             return 1;   /* startup-only: never replace a live allocator */
+         auto counted_upstream = std::make_unique<RmmUpstream>(
+-            upstream, std::numeric_limits<size_t>::max());
++            upstream, maximum);
++        /* A finite pool constructor maximum changes growth to remaining/2.
++         * Enforce the quota upstream to retain the existing doubling policy. */
+         auto pool = std::make_unique<RmmPool>(counted_upstream.get(), initial_pool_bytes);
+         auto usage = std::make_unique<RmmUsage>(pool.get(), std::numeric_limits<size_t>::max());
+         registry.previous[device_id] = upstream;
+@@ -197,6 +209,7 @@ cuvs_rmm_pool_init(int device_id, size_t initial_pool_bytes)
+         registry.upstreams[device_id] = std::move(counted_upstream);
+         registry.pools[device_id] = std::move(pool);
+         registry.usages[device_id] = std::move(usage);
++        registry.limits[device_id] = maximum;
+         g_rmm_registry = &registry;
+         return 0;
+     } catch (const std::exception &e) {
+@@ -208,6 +221,22 @@ cuvs_rmm_pool_init(int device_id, size_t initial_pool_bytes)
+     }
+ }
+ 
++extern "C" int
++cuvs_rmm_pool_stats(int device_id, CuvsRmmPoolStats *out)
++{
++    if (!g_rmm_registry || device_id < 0 || device_id >= CUVS_MAX_GPUS ||
++        !g_rmm_registry->pools[device_id])
++        return 1;
++    std::memset(out, 0, sizeof(*out));
++    out->device_id = (uint32_t)device_id;
++    out->maximum_bytes = g_rmm_registry->limits[device_id];
++    /* Pools retain upstream blocks until shutdown. Reading usage first avoids
++     * pairing a new usage value with the reservation from before its growth. */
++    out->used_bytes = g_rmm_registry->usages[device_id]->get_allocated_bytes();
++    out->reserved_bytes = g_rmm_registry->upstreams[device_id]->get_allocated_bytes();
++    return 0;
++}
++
+ /* Opaque CAGRA index wrapper.
+  *
+  * The dataset (d_corpus) MUST outlive the index because cagra::index holds an
+@@ -528,18 +557,9 @@ cuvs_vram_free_bytes_on(int device_id)
+     size_t free_bytes = 0, total_bytes = 0;
+     if (cudaSetDevice(device_id) != cudaSuccess)
+         return 0;
+-    cudaMemGetInfo(&free_bytes, &total_bytes);
+-
+-    /* RMM pool blocks remain allocated in the CUDA upstream even when free for
+-     * reuse inside RMM. Count that reusable space as well, or a preallocated
+-     * pool would make admission evict/reject indexes despite available memory.
+-     * Both counters are atomic; do not read pool_size() concurrently with growth. */
+-    if (g_rmm_registry && device_id >= 0 && device_id < CUVS_MAX_GPUS &&
+-        g_rmm_registry->pools[device_id]) {
+-        size_t reserved = g_rmm_registry->upstreams[device_id]->get_allocated_bytes();
+-        size_t used = g_rmm_registry->usages[device_id]->get_allocated_bytes();
+-        if (reserved > used) free_bytes += reserved - used;
+-    }
++    if (cudaMemGetInfo(&free_bytes, &total_bytes) != cudaSuccess)
++        return 0;
++    size_t async_reclaimable = 0;
+ 
+     /* ADR-065: cuVS allocates through a CUDA async mempool that caches freed
+      * blocks; cudaMemGetInfo counts that cache as "used", understating the
+@@ -553,9 +573,15 @@ cuvs_vram_free_bytes_on(int device_id)
+         if (cudaMemPoolGetAttribute(pool, cudaMemPoolAttrReservedMemCurrent, &reserved) == cudaSuccess &&
+             cudaMemPoolGetAttribute(pool, cudaMemPoolAttrUsedMemCurrent,     &used)     == cudaSuccess &&
+             reserved > used)
+-            free_bytes += (size_t)(reserved - used);
++            async_reclaimable = (size_t)(reserved - used);
+     }
+-    return free_bytes;
++    CuvsRmmPoolStats stats;
++    if (cuvs_rmm_pool_stats(device_id, &stats) == 0)
++        return cuvs_rmm_pool_headroom(free_bytes, async_reclaimable,
++                                      (size_t)stats.maximum_bytes,
++                                      (size_t)stats.reserved_bytes,
++                                      (size_t)stats.used_bytes);
++    return cuvs_rmm_pool_headroom(free_bytes, async_reclaimable, 0, 0, 0);
+ }
+ 
+ extern "C" size_t
+diff --git a/src/cuvs_wrapper.h b/src/cuvs_wrapper.h
+index bd98b3c..2f69726 100644
+--- a/src/cuvs_wrapper.h
++++ b/src/cuvs_wrapper.h
+@@ -10,8 +10,7 @@ extern "C" {
+ 
+ #include "cuvs_ipc.h"   /* CUVS_METRIC_* (PG-free, CUDA-free defines) */
+ 
+-/* Phase 3E: maximum GPUs the daemon can manage. */
+-#define CUVS_MAX_GPUS 16
++/* The shared per-device capacity is CUVS_MAX_GPUS in cuvs_ipc.h. */
+ 
+ typedef struct CuvsGpuDeviceInfo {
+     int     device_id;
+@@ -25,8 +24,10 @@ int cuvs_detect_gpus(CuvsGpuDeviceInfo *out, int max_devices);
+ 
+ /* Daemon startup only, before any cuVS/RMM allocations or worker threads.
+  * Initial pool reservation in bytes; 0 leaves the default resource untouched.
+- * Pool may grow via its upstream resource. Returns nonzero on init failure. */
+-int cuvs_rmm_pool_init(int device_id, size_t initial_pool_bytes);
++ * Pool grows through an upstream quota of total device memory * maximum_percent.
++ * Returns nonzero on init failure. */
++int cuvs_rmm_pool_init(int device_id, size_t initial_pool_bytes, uint32_t maximum_percent);
++int cuvs_rmm_pool_stats(int device_id, CuvsRmmPoolStats *out);
+ 
+ /* ADR-075 Phase 1: measure physical hardware constants on `device_id`.
+  *   link_bw_bpus  -- CPU->GPU H2D bandwidth, bytes per microsecond
+diff --git a/src/cuvs_wrapper_shim_cpu.c b/src/cuvs_wrapper_shim_cpu.c
+index 9286941..22eabc0 100644
+--- a/src/cuvs_wrapper_shim_cpu.c
++++ b/src/cuvs_wrapper_shim_cpu.c
+@@ -194,13 +194,22 @@ shim_read(const char *path)
+ }
+ 
+ int
+-cuvs_rmm_pool_init(int device_id, size_t initial_pool_bytes)
++cuvs_rmm_pool_init(int device_id, size_t initial_pool_bytes, uint32_t maximum_percent)
+ {
+     (void)device_id;
++    (void)maximum_percent;
+     /* A CPU shim must not claim it applied a GPU allocator. */
+     return initial_pool_bytes == 0 ? 0 : 1;
+ }
+ 
++int
++cuvs_rmm_pool_stats(int device_id, CuvsRmmPoolStats *out)
++{
++    (void)device_id;
++    (void)out;
++    return 1;  /* no GPU allocator to report */
++}
++
+ /* ======================================================================== */
+ /* build / free                                                             */
+ /* ======================================================================== */
+diff --git a/src/pg_cuvs.c b/src/pg_cuvs.c
+index 4acfef2..07f066f 100644
+--- a/src/pg_cuvs.c
++++ b/src/pg_cuvs.c
+@@ -13,6 +13,7 @@
+  */
+ 
+ #include "postgres.h"
++#include "lib/stringinfo.h"
+ #include "fmgr.h"
+ #include "funcapi.h"
+ #include "miscadmin.h"
+@@ -112,6 +113,8 @@ int   cuvs_daemon_uid             = -1;    /* #119: expected owner uid of cuvs.s
+ int   cuvs_circuit_breaker_threshold = 3;
+ int   cuvs_k                      = 100;   /* GPU top-k (pgvector ef_search analog) */
+ static int cuvs_rmm_pool_mb       = 0;     /* show hook reads the daemon's applied value */
++static int cuvs_rmm_pool_max_percent = 0;
++static char *cuvs_rmm_pool_status = NULL;
+ int   cuvs_max_build_mem_mb       = 0;     /* 0 = auto (MemAvailable * safety_ratio); >0 = hard cap MB */
+ double cuvs_build_mem_safety_ratio = 0.5;  /* auto-limit fraction of MemAvailable */
+ double cuvs_max_stale_fraction     = 0.10; /* deleted-since-build fraction that reroutes to CPU */
+@@ -742,6 +745,40 @@ cuvs_rmm_pool_mb_show(void)
+     return psprintf("%u", settings.rmm_pool_mb);
+ }
+ 
++static const char *
++cuvs_rmm_pool_max_percent_show(void)
++{
++    CuvsRmmPoolStatus status;
++    if (cuvs_ipc_rmm_pool_status(cuvs_socket_path, &status) != CUVS_STATUS_OK)
++        return "unavailable";
++    return psprintf("%u", status.maximum_percent);
++}
++
++static const char *
++cuvs_rmm_pool_status_show(void)
++{
++    CuvsRmmPoolStatus status;
++    StringInfoData json;
++    if (cuvs_ipc_rmm_pool_status(cuvs_socket_path, &status) != CUVS_STATUS_OK)
++        return "unavailable";
++    initStringInfo(&json);
++    appendStringInfo(&json, "{\"initial_mb\":%u,\"maximum_percent\":%u,\"devices\":[",
++                     status.initial_mb, status.maximum_percent);
++    for (uint32_t i = 0; i < status.n_devices; i++)
++    {
++        const CuvsRmmPoolStats *dev = &status.devices[i];
++        appendStringInfo(&json,
++                         "%s{\"device_id\":%u,\"maximum_bytes\":%llu,"
++                         "\"reserved_bytes\":%llu,\"used_bytes\":%llu}",
++                         i ? "," : "", dev->device_id,
++                         (unsigned long long)dev->maximum_bytes,
++                         (unsigned long long)dev->reserved_bytes,
++                         (unsigned long long)dev->used_bytes);
++    }
++    appendStringInfoString(&json, "]}");
++    return json.data;
++}
++
+ void
+ _PG_init(void)
+ {
+@@ -848,6 +885,24 @@ _PG_init(void)
+         PGC_INTERNAL,
+         GUC_NOT_IN_SAMPLE, NULL, NULL, cuvs_rmm_pool_mb_show);
+ 
++    DefineCustomIntVariable(
++        "cuvs.rmm_pool_max_percent",
++        "Daemon's applied RMM pool quota as a percentage of total device memory.",
++        "Read-only status from --rmm-pool-max-percent; 0 when the pool is disabled. "
++        "Unavailable means no compatible daemon reply.",
++        &cuvs_rmm_pool_max_percent,
++        0, 0, 100, PGC_INTERNAL,
++        GUC_NOT_IN_SAMPLE, NULL, NULL, cuvs_rmm_pool_max_percent_show);
++
++    DefineCustomStringVariable(
++        "cuvs.rmm_pool_status",
++        "Applied RMM pool limits and live per-GPU allocation counters as JSON.",
++        "Read-only; maximum/reserved/used bytes cover the RMM pool only. "
++        "Unavailable means no compatible daemon reply.",
++        &cuvs_rmm_pool_status,
++        "unavailable", PGC_INTERNAL,
++        GUC_NOT_IN_SAMPLE, NULL, NULL, cuvs_rmm_pool_status_show);
++
+     DefineCustomIntVariable(
+         "cuvs.max_build_mem_mb",
+         "Backend memory limit (MB) for accumulating a CAGRA build corpus.",
+diff --git a/src/pg_cuvs_server.c b/src/pg_cuvs_server.c
+index a232a53..33f7796 100644
+--- a/src/pg_cuvs_server.c
++++ b/src/pg_cuvs_server.c
+@@ -366,7 +366,13 @@ static size_t   g_max_vram_per_gpu[CUVS_MAX_GPUS];
+ static char   g_socket_path[256]  = "/tmp/.s.pg_cuvs.server";
+ static char   g_index_dir[256]    = "/tmp/pg_cuvs_indexes";
+ static size_t g_max_vram_bytes    = 0;   /* 0 = use default fraction; >0 = explicit --max-vram-mb */
+-static uint32_t g_rmm_pool_mb     = 0;   /* opt-in initial reservation per usable GPU */
++#ifdef PGCUVS_CPU_SHIM
++static uint32_t g_rmm_pool_mb     = 0;   /* CPU fixture has no GPU allocator */
++#else
++static uint32_t g_rmm_pool_mb     = 512; /* initial reservation per usable GPU */
++#endif
++static uint32_t g_rmm_pool_max_percent = 50;
++static size_t g_rmm_pool_limits[CUVS_MAX_GPUS];
+ 
+ /* ADR-065: default per-device budget when --max-vram-mb is omitted — a fraction
+  * of total VRAM, leaving headroom for the untracked cuVS workspace + CUDA
+@@ -738,10 +744,14 @@ pick_gpu_for_index(size_t needed)
+     {
+         int dev = usable_gpu(i);
+         size_t budget = g_max_vram_per_gpu[dev];
++        if (g_rmm_pool_limits[dev] > 0 &&
++            (budget == 0 || g_rmm_pool_limits[dev] < budget))
++            budget = g_rmm_pool_limits[dev];
+         if (budget > 0 && needed > budget)
+             continue;
+         size_t used = total_vram_used(dev);
+-        size_t headroom = (budget > 0) ? (budget - used) : gpu_free_vram_bytes(dev);
++        size_t headroom = budget > 0 ? (budget > used ? budget - used : 0)
++                                    : gpu_free_vram_bytes(dev);
+         if (best < 0 || headroom > best_headroom) {
+             best_headroom = headroom;
+             best = dev;
+@@ -2082,6 +2092,10 @@ static int
+ ensure_vram(size_t needed, int device_id)
+ {
+     size_t budget = g_max_vram_per_gpu[device_id];
++    /* An index that cannot fit even in an empty pool must not evict healthy
++     * indexes while admission repeatedly waits for impossible growth. */
++    if (g_rmm_pool_limits[device_id] > 0 && needed > g_rmm_pool_limits[device_id])
++        return -1;
+     if (budget > 0 && total_vram_used(device_id) + needed > budget)
+     {
+         while (g_n_indexes > 0 && total_vram_used(device_id) + needed > budget)
+@@ -7901,6 +7915,30 @@ connection_thread(void *arg)
+             send_all(client_fd, &settings, sizeof(settings));
+             break;
+         }
++        case CUVS_OP_RMM_POOL_STATUS:
++        {
++            CuvsReplyHeader hdr = {.status = CUVS_STATUS_OK, .n_results = 1};
++            CuvsRmmPoolStatus status = {
++                .version = CUVS_RMM_POOL_STATUS_VERSION,
++                .initial_mb = g_rmm_pool_mb,
++                .maximum_percent = g_rmm_pool_mb > 0 ? g_rmm_pool_max_percent : 0
++            };
++            if (g_rmm_pool_mb > 0)
++                for (int i = 0; i < n_usable_gpus(); i++)
++                {
++                    if (cuvs_rmm_pool_stats(usable_gpu(i), &status.devices[i]) != 0)
++                    {
++                        hdr.status = CUVS_STATUS_UNAVAILABLE;
++                        hdr.n_results = 0;
++                        break;
++                    }
++                    status.n_devices++;
++                }
++            send_all(client_fd, &hdr, sizeof(hdr));
++            if (hdr.status == CUVS_STATUS_OK)
++                send_all(client_fd, &status, sizeof(status));
++            break;
++        }
+         case CUVS_OP_SHARD_STATS:
+             handle_shard_stats(client_fd, &cmd);
+             break;
+@@ -8553,6 +8591,15 @@ main(int argc, char **argv)
+                 return 1;
+             }
+         }
++        else if (strcmp(argv[i], "--rmm-pool-max-percent") == 0)
++        {
++            if (i + 1 >= argc ||
++                cuvs_parse_rmm_pool_percent(argv[++i], &g_rmm_pool_max_percent) != 0)
++            {
++                LOG_ERROR("--rmm-pool-max-percent requires an integer from 1 to 100\n");
++                return 1;
++            }
++        }
+         else if (strcmp(argv[i], "--max-indexes") == 0 && i+1 < argc)
+         {
+             int n = atoi(argv[++i]);
+@@ -8673,22 +8720,28 @@ main(int argc, char **argv)
+     LOG_INFO("index registry capacity: %d (--max-indexes)\n", g_max_indexes);
+ 
+     /* Install the per-device allocator before probes, persisted-index reloads,
+-     * warmup or worker threads can make the first RMM allocation. Zero leaves
+-     * the old allocation path untouched. A failed opt-in init aborts startup. */
++     * warmup or worker threads can make the first RMM allocation. An explicit
++     * zero keeps the old allocation path. Any failed init aborts startup. */
+     if (g_rmm_pool_mb > 0)
+     {
+         for (int i = 0; i < n_usable_gpus(); i++)
+         {
+             int dev = usable_gpu(i);
+-            if (cuvs_rmm_pool_init(dev, (size_t)g_rmm_pool_mb * 1024 * 1024) != 0)
++            CuvsRmmPoolStats stats;
++            if (cuvs_rmm_pool_init(dev, (size_t)g_rmm_pool_mb * 1024 * 1024,
++                                  g_rmm_pool_max_percent) != 0 ||
++                cuvs_rmm_pool_stats(dev, &stats) != 0)
+             {
+                 LOG_ERROR("GPU %d: RMM pool initialization failed (%u MiB)\n",
+                           dev, g_rmm_pool_mb);
+                 return 1;
+             }
++            g_rmm_pool_limits[dev] = (size_t)stats.maximum_bytes;
+         }
+     }
+     LOG_INFO("RMM initial pool reservation: %u MiB per GPU (0=disabled)\n", g_rmm_pool_mb);
++    LOG_INFO("RMM maximum pool quota: %u%% of total device memory\n",
++             g_rmm_pool_mb > 0 ? g_rmm_pool_max_percent : 0);
+ 
+     /* ADR-075 Phase 1: probe hardware + write the global cost-model profile. */
+     write_hw_profile();
+diff --git a/test/expected/rmm_pool.out b/test/expected/rmm_pool.out
+index 089d2ee..9c48ee9 100644
+--- a/test/expected/rmm_pool.out
++++ b/test/expected/rmm_pool.out
+@@ -3,14 +3,29 @@
+ SET client_min_messages = warning;
+ CREATE EXTENSION IF NOT EXISTS vector;
+ CREATE EXTENSION IF NOT EXISTS pg_cuvs;
+-SELECT current_setting('cuvs.rmm_pool_mb') = '0' AS pool_disabled;
+- pool_disabled 
+----------------
++SELECT current_setting('cuvs.rmm_pool_mb') AS applied_mb,
++       current_setting('cuvs.rmm_pool_max_percent') AS applied_percent \gset
++SELECT (current_setting('cuvs.rmm_pool_status')::jsonb->>'initial_mb') = :'applied_mb'
++   AND (current_setting('cuvs.rmm_pool_status')::jsonb->>'maximum_percent') = :'applied_percent'
++   AS applied_status_matches;
++ applied_status_matches 
++------------------------
+  t
+ (1 row)
+ 
+-SELECT context = 'internal' AS read_only FROM pg_settings
+-WHERE name = 'cuvs.rmm_pool_mb';
++SELECT CASE WHEN :'applied_mb' = '0'
++  THEN :'applied_percent' = '0'
++       AND current_setting('cuvs.rmm_pool_status')::jsonb->'devices' = '[]'::jsonb
++  ELSE :'applied_percent'::int BETWEEN 1 AND 100
++       AND jsonb_array_length(current_setting('cuvs.rmm_pool_status')::jsonb->'devices') > 0
++  END AS device_status_matches;
++ device_status_matches 
++-----------------------
++ t
++(1 row)
++
++SELECT count(*) = 3 AND bool_and(context = 'internal') AS read_only FROM pg_settings
++WHERE name IN ('cuvs.rmm_pool_mb', 'cuvs.rmm_pool_max_percent', 'cuvs.rmm_pool_status');
+  read_only 
+ -----------
+  t
+@@ -19,17 +34,24 @@ WHERE name = 'cuvs.rmm_pool_mb';
+ \set ON_ERROR_STOP off
+ SET cuvs.rmm_pool_mb = 1024;
+ ERROR:  parameter "cuvs.rmm_pool_mb" cannot be changed
++SET cuvs.rmm_pool_max_percent = 100;
++ERROR:  parameter "cuvs.rmm_pool_max_percent" cannot be changed
++SET cuvs.rmm_pool_status = '{}';
++ERROR:  parameter "cuvs.rmm_pool_status" cannot be changed
+ \set ON_ERROR_STOP on
+ BEGIN;
+ SET LOCAL cuvs.socket_path = '/tmp/pgcuvs-rmm-test-no-daemon';
+-SELECT current_setting('cuvs.rmm_pool_mb') = 'unavailable' AS not_reported_as_zero;
++SELECT current_setting('cuvs.rmm_pool_mb') = 'unavailable'
++   AND current_setting('cuvs.rmm_pool_max_percent') = 'unavailable'
++   AND current_setting('cuvs.rmm_pool_status') = 'unavailable' AS not_reported_as_zero;
+  not_reported_as_zero 
+ ----------------------
+  t
+ (1 row)
+ 
+ ROLLBACK;
+-SELECT current_setting('cuvs.rmm_pool_mb') = '0' AS applied_setting_restored;
++SELECT current_setting('cuvs.rmm_pool_mb') = :'applied_mb'
++   AND current_setting('cuvs.rmm_pool_max_percent') = :'applied_percent' AS applied_setting_restored;
+  applied_setting_restored 
+ --------------------------
+  t
+diff --git a/test/sql/rmm_pool.sql b/test/sql/rmm_pool.sql
+index 41051b1..bbfdc09 100644
+--- a/test/sql/rmm_pool.sql
++++ b/test/sql/rmm_pool.sql
+@@ -3,14 +3,29 @@
+ SET client_min_messages = warning;
+ CREATE EXTENSION IF NOT EXISTS vector;
+ CREATE EXTENSION IF NOT EXISTS pg_cuvs;
+-SELECT current_setting('cuvs.rmm_pool_mb') = '0' AS pool_disabled;
+-SELECT context = 'internal' AS read_only FROM pg_settings
+-WHERE name = 'cuvs.rmm_pool_mb';
++SELECT current_setting('cuvs.rmm_pool_mb') AS applied_mb,
++       current_setting('cuvs.rmm_pool_max_percent') AS applied_percent \gset
++SELECT (current_setting('cuvs.rmm_pool_status')::jsonb->>'initial_mb') = :'applied_mb'
++   AND (current_setting('cuvs.rmm_pool_status')::jsonb->>'maximum_percent') = :'applied_percent'
++   AS applied_status_matches;
++SELECT CASE WHEN :'applied_mb' = '0'
++  THEN :'applied_percent' = '0'
++       AND current_setting('cuvs.rmm_pool_status')::jsonb->'devices' = '[]'::jsonb
++  ELSE :'applied_percent'::int BETWEEN 1 AND 100
++       AND jsonb_array_length(current_setting('cuvs.rmm_pool_status')::jsonb->'devices') > 0
++  END AS device_status_matches;
++SELECT count(*) = 3 AND bool_and(context = 'internal') AS read_only FROM pg_settings
++WHERE name IN ('cuvs.rmm_pool_mb', 'cuvs.rmm_pool_max_percent', 'cuvs.rmm_pool_status');
+ \set ON_ERROR_STOP off
+ SET cuvs.rmm_pool_mb = 1024;
++SET cuvs.rmm_pool_max_percent = 100;
++SET cuvs.rmm_pool_status = '{}';
+ \set ON_ERROR_STOP on
+ BEGIN;
+ SET LOCAL cuvs.socket_path = '/tmp/pgcuvs-rmm-test-no-daemon';
+-SELECT current_setting('cuvs.rmm_pool_mb') = 'unavailable' AS not_reported_as_zero;
++SELECT current_setting('cuvs.rmm_pool_mb') = 'unavailable'
++   AND current_setting('cuvs.rmm_pool_max_percent') = 'unavailable'
++   AND current_setting('cuvs.rmm_pool_status') = 'unavailable' AS not_reported_as_zero;
+ ROLLBACK;
+-SELECT current_setting('cuvs.rmm_pool_mb') = '0' AS applied_setting_restored;
++SELECT current_setting('cuvs.rmm_pool_mb') = :'applied_mb'
++   AND current_setting('cuvs.rmm_pool_max_percent') = :'applied_percent' AS applied_setting_restored;
+diff --git a/test/unit/test_cuvs_util.c b/test/unit/test_cuvs_util.c
+index 13dbcbc..f5951dd 100644
+--- a/test/unit/test_cuvs_util.c
++++ b/test/unit/test_cuvs_util.c
+@@ -538,6 +538,47 @@ test_rmm_pool_size(void)
+     ASSERT(cuvs_parse_rmm_pool_mb("2147483648", &mb) != 0, "GUC integer overflow rejected");
+     ASSERT(cuvs_parse_rmm_pool_mb("184467440737095516160", &mb) != 0,
+            "conversion overflow rejected");
++
++    ASSERT(cuvs_parse_rmm_pool_percent("50", &mb) == 0 && mb == 50,
++           "pool quota percent");
++    ASSERT(cuvs_parse_rmm_pool_percent("1", &mb) == 0 && mb == 1,
++           "minimum quota percent");
++    ASSERT(cuvs_parse_rmm_pool_percent("100", &mb) == 0 && mb == 100,
++           "maximum quota percent");
++    ASSERT(cuvs_parse_rmm_pool_percent("0", &mb) != 0, "zero quota rejected");
++    ASSERT(cuvs_parse_rmm_pool_percent("101", &mb) != 0, "oversized quota rejected");
++    ASSERT(cuvs_parse_rmm_pool_percent("50%", &mb) != 0, "percent suffix rejected");
++    ASSERT(cuvs_parse_rmm_pool_percent("-1", &mb) != 0, "negative quota rejected");
++
++    ASSERT(cuvs_rmm_pool_max_bytes(8192, 50) == 4096, "half-device quota");
++    ASSERT(cuvs_rmm_pool_max_bytes(1025, 50) == 512, "quota rounds down to 256B");
++    ASSERT(cuvs_rmm_pool_max_bytes(SIZE_MAX, 100) == SIZE_MAX - 255,
++           "quota multiplication does not overflow");
++    ASSERT(cuvs_rmm_pool_max_bytes(SIZE_MAX, 50) == ((SIZE_MAX / 2) & ~(size_t)255),
++           "half-device calculation does not overflow");
++    ASSERT(cuvs_rmm_pool_max_bytes(8192, 0) == 0, "invalid zero percentage");
++    ASSERT(cuvs_rmm_pool_max_bytes(8192, 101) == 0, "invalid large percentage");
++
++    ASSERT(cuvs_rmm_pool_headroom(100, 50, 0, 0, 0) == 150,
++           "disabled pool keeps physical plus async headroom");
++    ASSERT(cuvs_rmm_pool_headroom(SIZE_MAX - 5, 10, 0, 0, 0) == SIZE_MAX,
++           "physical headroom sum saturates");
++    ASSERT(cuvs_rmm_pool_headroom(100, 0, 1000, 800, 500) == 400,
++           "reuse plus physically available growth");
++    ASSERT(cuvs_rmm_pool_headroom(9000, 0, 1000, 800, 500) == 500,
++           "abundant physical memory cannot bypass quota");
++    ASSERT(cuvs_rmm_pool_headroom(0, 100, 1000, 800, 500) == 400,
++           "async cache reclaim contributes to growth");
++    ASSERT(cuvs_rmm_pool_headroom(0, 0, 1000, 1000, 100) == 900,
++           "a full reservation remains reusable");
++    ASSERT(cuvs_rmm_pool_headroom(9000, 0, 1000, 1000, 1000) == 0,
++           "fully used quota has no admission headroom");
++    ASSERT(cuvs_rmm_pool_headroom(9000, 0, 1000, 800, 900) == 0,
++           "inconsistent counters fail closed");
++    ASSERT(cuvs_rmm_pool_headroom(9000, 0, 1000, 1100, 500) == 0,
++           "transient over-quota reservation fails closed");
++    ASSERT(cuvs_rmm_pool_headroom(SIZE_MAX, 100, SIZE_MAX, SIZE_MAX - 128, 0) == SIZE_MAX,
++           "reusable plus growth stays within quota without overflow");
+ }
+ 
+ /* ---- BF micro-batch grouping (Phase 3L-9) ---- */

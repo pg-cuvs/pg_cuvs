@@ -1,0 +1,70 @@
+{
+  "README.md": {
+    "bytes": 2219,
+    "sha256": "4f1afa4886328758ed5a540ef81256c64f036a53e1cb458dbb2a6a77a5d35ba2"
+  },
+  "cpu-logs/daemon-build.log": {
+    "bytes": 3093,
+    "sha256": "a4bd3aa489d2d87f5b25fa8f2e6135e0d9eb5582c4bff9bb329ac3c76c7be35e"
+  },
+  "cpu-logs/daemon.log": {
+    "bytes": 5102,
+    "sha256": "b3a557b27a5434a20b1278ff3abc95530be1464f577a90ff8bd868b3552eb288"
+  },
+  "cpu-logs/extension-build.log": {
+    "bytes": 33478,
+    "sha256": "1cb8b8a379e47584d1ff10ec50da32a9b704d45b18d12b4b4f3e482b3cf95f80"
+  },
+  "cpu-logs/install.log": {
+    "bytes": 869,
+    "sha256": "384abb2cfb414b74ecbe9258f074e365f1b78ae8b46e06f43e8db8adc6ee04b8"
+  },
+  "cpu-logs/invalid-quota.log": {
+    "bytes": 65,
+    "sha256": "d81fdafc2bb058ad7ae8da2324c549653ab040b1244295dec7e35953a4ad247b"
+  },
+  "cpu-logs/packages.log": {
+    "bytes": 1867,
+    "sha256": "6815c181ada765393f6a76b2d0bf47d3f2857986cd1d7f6c7318039fdfe41d17"
+  },
+  "cpu-logs/pgvector-build.log": {
+    "bytes": 14276,
+    "sha256": "210c9db331ba0aedaac7e87309fe1e35695fb03d19a257305ad819bf4cd2b576"
+  },
+  "cpu-logs/postgres.log": {
+    "bytes": 2700,
+    "sha256": "668ca500ff1d2f92721fbdfdbcf585a2e455ab3b87062c088841255201655eca"
+  },
+  "cpu-logs/rmm-quota-linux-unit.log": {
+    "bytes": 324,
+    "sha256": "d2b0e52582a37c013a57210bbae60985bab85f0ec95175e7648afbf13e763246"
+  },
+  "cpu-logs/rmm-quota-red.log": {
+    "bytes": 1670,
+    "sha256": "f1a9da2a074ecbd41019a32fd7c54e53129a1f853350d17bc62b32cd5e724610"
+  },
+  "cpu-logs/rmm-quota-sql-first.log": {
+    "bytes": 772,
+    "sha256": "d7f06feb17f6fc6bec7f66bbc8dc22bb0c1d4296e774eee43d5ff508ed5f0ec0"
+  },
+  "cpu-logs/rmm-quota-sql.log": {
+    "bytes": 1383,
+    "sha256": "d2c56715ef049d658982ed46045900ac4ac66d0876b773167f4c7bee4142d844"
+  },
+  "cpu-logs/rmm-quota-unit.log": {
+    "bytes": 375,
+    "sha256": "5fec89a66a4dd3b6729f642dbc8f38e9622b972e9ee53a99d912c63d7e1cffbf"
+  },
+  "cpu-logs/rmm_pool.out": {
+    "bytes": 2126,
+    "sha256": "fd287d884c3266f35abf42d0c36232cc0d06a60d9dfe9dfb90593dccea3f2956"
+  },
+  "cpu-logs/shim-quota.log": {
+    "bytes": 222,
+    "sha256": "7b45ee9ab11f9a0abf00f4b01650b9291a3fc871e53b33247ec36254f38038e2"
+  },
+  "measured-sources.bundle": {
+    "bytes": 15589,
+    "sha256": "570a55101e401e51a855cf08120b43f006c0f802752fdffad130d6a98ca016f3"
+  }
+}

@@ -1,0 +1,4 @@
+{"private_maximum_pool_bytes":23846977536,"total_cuda_bytes":47693955072}
+{"setup":true,"pool_mb":512,"upstream_type":"N3rmm2mr20cuda_memory_resourceE","initial_allocation_calls":1}
+{"phase":"ivf_pq","client_start_bytes":0,"peak_client_bytes":9365487184,"extra_client_peak_bytes":9365487184,"client_end_bytes":3328000000,"client_allocation_calls":32863,"pool_growth_calls":3,"pool_growth_bytes":13898612736,"seconds":8.690363780}
+{"success":true,"final_client_bytes":0,"lifetime_pool_allocations":4,"lifetime_pool_reserved_bytes":14435483648}

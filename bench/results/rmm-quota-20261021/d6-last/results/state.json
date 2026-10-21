@@ -1,0 +1,300 @@
+{
+  "task": "b40ecef03a934801",
+  "source_pin": "0ff9f7c9fac4c20b8256dfc20ea3b0e604f7dd28",
+  "vm_name": "pg-cuvs-index-accel-20261020",
+  "vm_id": "v6nc08sjs",
+  "total_seconds": 1800,
+  "phase_caps": {
+    "resume": 180,
+    "prepare": 260,
+    "verify": 635,
+    "cleanup": 90,
+    "stop": 480
+  },
+  "future_reservation": {
+    "resume": 570,
+    "prepare": 570,
+    "verify": 570,
+    "cleanup": 480,
+    "stop": 0
+  },
+  "commands": [
+    {
+      "phase": "resume",
+      "label": "before",
+      "started_utc": "2026-10-21T02:11:47.974654+00:00",
+      "timeout": 40,
+      "elapsed_at_admission": 0.0003904169425368309,
+      "exit": 0,
+      "seconds": 7.768571333028376,
+      "finished_utc": "2026-10-21T02:11:55.743448+00:00"
+    },
+    {
+      "phase": "resume",
+      "label": "vm-start",
+      "started_utc": "2026-10-21T02:11:55.744611+00:00",
+      "timeout": 60,
+      "elapsed_at_admission": 7.770134208025411,
+      "exit": 0,
+      "seconds": 8.916551542002708,
+      "finished_utc": "2026-10-21T02:12:04.661440+00:00"
+    },
+    {
+      "phase": "resume",
+      "label": "boot-00",
+      "started_utc": "2026-10-21T02:12:04.662915+00:00",
+      "timeout": 40,
+      "elapsed_at_admission": 16.68819012492895,
+      "exit": 0,
+      "seconds": 5.974049583077431,
+      "finished_utc": "2026-10-21T02:12:10.637177+00:00"
+    },
+    {
+      "phase": "resume",
+      "label": "boot-01",
+      "started_utc": "2026-10-21T02:12:15.643291+00:00",
+      "timeout": 40,
+      "elapsed_at_admission": 27.668253333074972,
+      "exit": 0,
+      "seconds": 14.451780999777839,
+      "finished_utc": "2026-10-21T02:12:30.095485+00:00"
+    },
+    {
+      "phase": "resume",
+      "label": "ssh-refresh",
+      "started_utc": "2026-10-21T02:12:30.096174+00:00",
+      "timeout": 40,
+      "elapsed_at_admission": 42.120752916904166,
+      "exit": 0,
+      "seconds": 14.136731791077182,
+      "finished_utc": "2026-10-21T02:12:44.233408+00:00"
+    },
+    {
+      "phase": "resume",
+      "label": "tools-mkdir",
+      "started_utc": "2026-10-21T02:12:46.299416+00:00",
+      "timeout": 15,
+      "elapsed_at_admission": 58.32354520796798,
+      "exit": 0,
+      "seconds": 0.5011338340118527,
+      "finished_utc": "2026-10-21T02:12:46.800592+00:00"
+    },
+    {
+      "phase": "resume",
+      "label": "tools-copy",
+      "started_utc": "2026-10-21T02:12:46.801242+00:00",
+      "timeout": 25,
+      "elapsed_at_admission": 58.82536229188554,
+      "exit": 0,
+      "seconds": 9.429831790970638,
+      "finished_utc": "2026-10-21T02:12:56.231397+00:00"
+    },
+    {
+      "phase": "resume",
+      "label": "connect-preflight",
+      "started_utc": "2026-10-21T02:12:56.232627+00:00",
+      "timeout": 25,
+      "elapsed_at_admission": 68.25648787501268,
+      "exit": 0,
+      "seconds": 1.2532059168443084,
+      "finished_utc": "2026-10-21T02:12:57.485921+00:00"
+    },
+    {
+      "phase": "prepare",
+      "label": "prepare",
+      "started_utc": "2026-10-21T02:12:57.488257+00:00",
+      "timeout": 259.999529250199,
+      "elapsed_at_admission": 69.5120834580157,
+      "exit": 0,
+      "seconds": 64.28957200003788,
+      "finished_utc": "2026-10-21T02:14:01.779658+00:00"
+    },
+    {
+      "phase": "verify",
+      "label": "zero",
+      "started_utc": "2026-10-21T02:14:01.783410+00:00",
+      "timeout": 75,
+      "elapsed_at_admission": 133.80547049990855,
+      "exit": 0,
+      "seconds": 5.326049542054534,
+      "finished_utc": "2026-10-21T02:14:07.109658+00:00"
+    },
+    {
+      "phase": "verify",
+      "label": "preflight-zero",
+      "started_utc": "2026-10-21T02:14:07.110875+00:00",
+      "timeout": 25,
+      "elapsed_at_admission": 139.1327885829378,
+      "exit": 0,
+      "seconds": 0.9923921669833362,
+      "finished_utc": "2026-10-21T02:14:08.103369+00:00"
+    },
+    {
+      "phase": "verify",
+      "label": "status-zero",
+      "started_utc": "2026-10-21T02:14:08.104145+00:00",
+      "timeout": 25,
+      "elapsed_at_admission": 140.1260319580324,
+      "exit": 0,
+      "seconds": 0.7292652500327677,
+      "finished_utc": "2026-10-21T02:14:08.833488+00:00"
+    },
+    {
+      "phase": "verify",
+      "label": "measure-zero",
+      "started_utc": "2026-10-21T02:14:08.834515+00:00",
+      "timeout": 120,
+      "elapsed_at_admission": 140.8563810000196,
+      "exit": 1,
+      "seconds": 55.12408687500283,
+      "finished_utc": "2026-10-21T02:15:03.960135+00:00"
+    },
+    {
+      "phase": "cleanup",
+      "label": "cleanup",
+      "started_utc": "2026-10-21T02:15:03.962797+00:00",
+      "timeout": 55,
+      "elapsed_at_admission": 195.98315045796335,
+      "exit": 0,
+      "seconds": 22.078337874962017,
+      "finished_utc": "2026-10-21T02:15:26.041756+00:00"
+    },
+    {
+      "phase": "cleanup",
+      "label": "evidence-copy",
+      "started_utc": "2026-10-21T02:15:26.042504+00:00",
+      "timeout": 35,
+      "elapsed_at_admission": 218.06225074990653,
+      "exit": 0,
+      "seconds": 5.104724500095472,
+      "finished_utc": "2026-10-21T02:15:31.147397+00:00"
+    },
+    {
+      "phase": "stop",
+      "label": "vm-stop",
+      "started_utc": "2026-10-21T02:15:31.149567+00:00",
+      "timeout": 45,
+      "elapsed_at_admission": 223.16917470796034,
+      "exit": 0,
+      "seconds": 6.1165700000710785,
+      "finished_utc": "2026-10-21T02:15:37.266371+00:00"
+    },
+    {
+      "phase": "stop",
+      "label": "stop-observation-00",
+      "started_utc": "2026-10-21T02:15:37.267397+00:00",
+      "timeout": 40,
+      "elapsed_at_admission": 229.28683624998666,
+      "exit": 0,
+      "seconds": 5.2055717499461025,
+      "finished_utc": "2026-10-21T02:15:42.473221+00:00"
+    },
+    {
+      "phase": "stop",
+      "label": "stop-observation-01",
+      "started_utc": "2026-10-21T02:15:47.478206+00:00",
+      "timeout": 40,
+      "elapsed_at_admission": 239.49734908295795,
+      "exit": 0,
+      "seconds": 4.214218209031969,
+      "finished_utc": "2026-10-21T02:15:51.692543+00:00"
+    },
+    {
+      "phase": "stop",
+      "label": "stop-observation-02",
+      "started_utc": "2026-10-21T02:15:56.695510+00:00",
+      "timeout": 40,
+      "elapsed_at_admission": 248.7144112919923,
+      "exit": 0,
+      "seconds": 5.145033540902659,
+      "finished_utc": "2026-10-21T02:16:01.840715+00:00"
+    }
+  ],
+  "phases": {
+    "resume": {
+      "started_utc": "2026-10-21T02:11:47.974279+00:00",
+      "started_elapsed": 6.417045369744301e-06,
+      "deadline_elapsed": 180.00000641704537,
+      "seconds": 69.51114175003022,
+      "finished_utc": "2026-10-21T02:12:57.487325+00:00"
+    },
+    "prepare": {
+      "started_utc": "2026-10-21T02:12:57.487805+00:00",
+      "started_elapsed": 69.51161191705614,
+      "deadline_elapsed": 329.51161191705614,
+      "seconds": 64.29298437479883,
+      "finished_utc": "2026-10-21T02:14:01.782542+00:00"
+    },
+    "verify": {
+      "started_utc": "2026-10-21T02:14:01.782995+00:00",
+      "started_elapsed": 133.80504237487912,
+      "deadline_elapsed": 768.8050423748791
+    },
+    "cleanup": {
+      "started_utc": "2026-10-21T02:15:03.962391+00:00",
+      "started_elapsed": 195.9827417919878,
+      "deadline_elapsed": 285.9827417919878,
+      "seconds": 27.1856668330729,
+      "finished_utc": "2026-10-21T02:15:31.148803+00:00"
+    },
+    "stop": {
+      "started_utc": "2026-10-21T02:15:31.149302+00:00",
+      "started_elapsed": 223.16890495806,
+      "deadline_elapsed": 703.16890495806,
+      "seconds": 30.69171804189682,
+      "finished_utc": "2026-10-21T02:16:01.841859+00:00"
+    }
+  },
+  "first_error": {
+    "scope": "native",
+    "type": "RuntimeError",
+    "message": "measure-zero exited 1: Traceback (most recent call last):\n  File \"/home/ubuntu/index-accel-validation/rmm-production-tools-last-20261021/measurement_entry.py\", line 327, in <module>\n    run()\n  File \"/home/ubuntu/index-accel-validation/rmm-production-tools-last-20261021/measurement_entry.py\", line 321, in run\n    raise RuntimeError(\"default smoke differs beyond the observed control span; evidence saved\")\nRuntimeError: default smoke differs beyond the observed control span; evidence saved\n",
+    "at_utc": "2026-10-21T02:15:03.960748+00:00",
+    "traceback": "Traceback (most recent call last):\n  File \"/Users/jaesolshin/orca/workspaces/pg_cuvs/index-rmm-pool/bench/results/rmm-quota-20261021/d6-last/run_last.py\", line 174, in main\n    remote(p, 'measure-'+arm, measurement_launch_argv('measure',arm), 120)\n    ~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/Users/jaesolshin/orca/workspaces/pg_cuvs/index-rmm-pool/bench/results/rmm-quota-20261021/d6-last/run_last.py\", line 110, in remote\n    return run(p, label, argv, allowed)\n  File \"/Users/jaesolshin/orca/workspaces/pg_cuvs/index-rmm-pool/bench/results/rmm-quota-20261021/d6-last/run_last.py\", line 85, in run\n    raise RuntimeError(f'{label} exited {result.returncode}: {tail}')\nRuntimeError: measure-zero exited 1: Traceback (most recent call last):\n  File \"/home/ubuntu/index-accel-validation/rmm-production-tools-last-20261021/measurement_entry.py\", line 327, in <module>\n    run()\n  File \"/home/ubuntu/index-accel-validation/rmm-production-tools-last-20261021/measurement_entry.py\", line 321, in run\n    raise RuntimeError(\"default smoke differs beyond the observed control span; evidence saved\")\nRuntimeError: default smoke differs beyond the observed control span; evidence saved\n\n"
+  },
+  "cleanup_errors": [],
+  "resumes_this_window": 1,
+  "prior_failed_window_resumes": 2,
+  "native_passed": false,
+  "cleanup_passed": true,
+  "export_passed": true,
+  "stop_confirmed": true,
+  "deadline_is_not_provider_or_billing_guarantee": true,
+  "local_precondition_sha256": "82b5d99d0bb114248991210370f2c2852f617a05480af1dfc021a1ae408fead5",
+  "validation_head": "6967772dfd8d7c195f74a751c781fe4e17a088af",
+  "application_tree_equals_pin": true,
+  "runner_sha256": "ffec36a03359ea94fedd5223ed0accf3eb2d345bbde96ef9a90b450d65f0ffaf",
+  "window_started_utc": "2026-10-21T02:11:47.974077+00:00",
+  "last_inventory": {
+    "observed_utc": "2026-10-21T02:16:01.841620+00:00",
+    "workspace": {
+      "name": "pg-cuvs-index-accel-20261020",
+      "id": "v6nc08sjs",
+      "status": "STOPPED",
+      "build_status": "COMPLETED",
+      "shell_status": "NOT READY",
+      "health_status": "HEALTHY",
+      "instance_type": "l40s-48gb.1x",
+      "instance_kind": "gpu",
+      "gpu": "L40S"
+    }
+  },
+  "actual_ssh_probe": {
+    "status": "ready",
+    "returncode": 0,
+    "stdout": "brev-v6nc08sjs\n",
+    "stderr": "Warning: Permanently added '[global.prd.ga.run.brev.nvidia.com]:24187' (ED25519) to the list of known hosts.\n",
+    "error": null,
+    "seconds": 2.0639075830113143
+  },
+  "stop_request_started_utc": "2026-10-21T02:15:31.149557+00:00",
+  "stop_request_accepted": true,
+  "stop_request_completed_utc": "2026-10-21T02:15:37.267380+00:00",
+  "STOPPED_observed_utc": "2026-10-21T02:16:01.841620+00:00",
+  "elapsed_seconds": 253.86082487506792,
+  "within_total": true,
+  "compute_reference_usd": 0.12269939868961616,
+  "cost_note": "window observation at stored rate; not invoice or physical poweroff measurement",
+  "finished_utc": "2026-10-21T02:16:01.842069+00:00",
+  "succeeded": false
+}

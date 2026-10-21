@@ -1,0 +1,16 @@
+CREATE DATABASE
+DROP INDEX
+ANALYZE
+  count  | min |  max   
+---------+-----+--------
+ 1000000 |   0 | 999999
+(1 row)
+
+[Service]
+ExecStart=
+ExecStart=/usr/lib/postgresql/16/bin/pg_cuvs_server --socket /tmp/.s.pg_cuvs --index-dir /home/ubuntu/index-accel-validation/build-artifacts/build1-pool0 --gpu-devices 0 --rmm-pool-mb 0
+Traceback (most recent call last):
+  File "/home/ubuntu/index-accel-validation/build_timing_measure.py", line 22, in <module>
+    metric={'label':a.label,'pool_mb':a.pool,'create_index_seconds':seconds,'index_oid':stat[0],'n_vecs':stat[1],'index_vram_estimate_bytes':stat[2],'all_index_vram_estimate_bytes':int(logical),'nvidia_smi_total_mib':total,'nvidia_smi_used_mib':used,'nvidia_smi_free_mib':free,'physical_minus_logical_bytes':int(used*1024*1024-logical)}
+                                                                                                                                                                                                                                                                                                                        ~~~~~~~~~~~~~~^~~~~~~~
+TypeError: unsupported operand type(s) for -: 'float' and 'decimal.Decimal'

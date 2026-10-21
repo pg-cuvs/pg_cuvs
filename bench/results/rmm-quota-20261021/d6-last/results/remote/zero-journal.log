@@ -1,0 +1,76 @@
+Oct 21 01:34:54 brev-v6nc08sjs systemd[1]: Starting pg_cuvs GPU sidecar daemon...
+Oct 21 01:34:55 brev-v6nc08sjs pg_cuvs_server[783]: [INFO] pg_cuvs_server: starting (socket=/tmp/.s.pg_cuvs index-dir=/tmp/cuvs_indexes snapshot=disabled)
+Oct 21 01:34:56 brev-v6nc08sjs pg_cuvs_server[783]: [INFO] index registry capacity: 1024 (--max-indexes)
+Oct 21 01:34:56 brev-v6nc08sjs pg_cuvs_server[783]: [INFO] RMM initial pool reservation: 0 MiB per GPU (0=disabled)
+Oct 21 01:34:56 brev-v6nc08sjs pg_cuvs_server[783]: [INFO] pg_cuvs_server: hw_profile gpu='NVIDIA L40S' link_bw=26927 hbm_bw=744727 bf_tput=52 cpu_dist=1457 cagra_lat=340.0 ipc_rtt=4.2 probe_status=0x3f
+Oct 21 01:34:56 brev-v6nc08sjs pg_cuvs_server[783]: [INFO] GPU 0 (NVIDIA L40S): 45484 MB total, budget 40936 MB (default fraction of total)
+Oct 21 01:34:57 brev-v6nc08sjs pg_cuvs_server[783]: [INFO] GPU 0 warm-up done in 217 ms
+Oct 21 01:34:57 brev-v6nc08sjs pg_cuvs_server[783]: [INFO] pg_cuvs_server: listening on /tmp/.s.pg_cuvs
+Oct 21 01:34:57 brev-v6nc08sjs systemd[1]: Started pg_cuvs GPU sidecar daemon.
+Oct 21 01:35:50 brev-v6nc08sjs pg_cuvs_server[783]: [INFO] pg_cuvs_server: SIGTERM received, serializing indexes...
+Oct 21 01:35:50 brev-v6nc08sjs pg_cuvs_server[783]: [INFO] batch: worker thread joined
+Oct 21 01:35:50 brev-v6nc08sjs pg_cuvs_server[783]: [INFO] sigterm: 0 indexes saved, 0 failed
+Oct 21 01:35:50 brev-v6nc08sjs pg_cuvs_server[783]: [INFO] pg_cuvs_server: shutdown complete
+Oct 21 01:35:50 brev-v6nc08sjs systemd[1]: Stopping pg_cuvs GPU sidecar daemon...
+Oct 21 01:35:50 brev-v6nc08sjs pg_cuvs_server[783]: CUDA call='cudaEventDestroy(event_)' at file=/tmp/conda-bld-output/bld/rattler-build_libcuvs-headers/host_env_placehold_placehold_placehold_placehold_placehold_placehold_placehold_placehold_placehold_placehold_placehold_placehold_placehold_placehold_placehold_placehold_placehold_placehold_placehold_/include/raft/core/resource/cuda_event.hpp line=23 failed with driver shutting down
+Oct 21 01:35:50 brev-v6nc08sjs pg_cuvs_server[783]: CUDA call='cudaFreeAsync(ptr, stream)' at file=/tmp/conda-bld-output/bld/rattler-build_libcuvs-headers/work/cpp/src/neighbors/detail/cagra/compute_distance.hpp line=248 failed with driver shutting down
+Oct 21 01:35:50 brev-v6nc08sjs pg_cuvs_server[783]: CUDA call='cudaFreeAsync(ptr, stream)' at file=/tmp/conda-bld-output/bld/rattler-build_libcuvs-headers/work/cpp/src/neighbors/detail/cagra/compute_distance.hpp line=248 failed with driver shutting down
+Oct 21 01:35:50 brev-v6nc08sjs systemd[1]: pg-cuvs-server.service: Deactivated successfully.
+Oct 21 01:35:50 brev-v6nc08sjs systemd[1]: Stopped pg_cuvs GPU sidecar daemon.
+Oct 21 01:35:50 brev-v6nc08sjs systemd[1]: pg-cuvs-server.service: Consumed 4.534s CPU time.
+Oct 21 01:36:55 brev-v6nc08sjs systemd[1]: Starting pg_cuvs GPU sidecar daemon...
+Oct 21 01:36:56 brev-v6nc08sjs pg_cuvs_server[4483]: [INFO] pg_cuvs_server: starting (socket=/tmp/.s.pg_cuvs index-dir=/tmp/cuvs_indexes snapshot=disabled)
+Oct 21 01:36:56 brev-v6nc08sjs pg_cuvs_server[4483]: [INFO] index registry capacity: 1024 (--max-indexes)
+Oct 21 01:36:56 brev-v6nc08sjs pg_cuvs_server[4483]: [INFO] RMM initial pool reservation: 0 MiB per GPU (0=disabled)
+Oct 21 01:36:56 brev-v6nc08sjs pg_cuvs_server[4483]: [INFO] RMM maximum pool quota: 0% of total device memory
+Oct 21 01:36:56 brev-v6nc08sjs pg_cuvs_server[4483]: [INFO] pg_cuvs_server: hw_profile gpu='NVIDIA L40S' link_bw=26931 hbm_bw=728178 bf_tput=127 cpu_dist=1507 cagra_lat=294.7 ipc_rtt=3.7 probe_status=0x3f
+Oct 21 01:36:56 brev-v6nc08sjs pg_cuvs_server[4483]: [INFO] GPU 0 (NVIDIA L40S): 45484 MB total, budget 40936 MB (default fraction of total)
+Oct 21 01:36:58 brev-v6nc08sjs pg_cuvs_server[4483]: [INFO] pg_cuvs_server: loaded index 16390/1016847 (1000000 vecs, 3173 MB VRAM)
+Oct 21 01:36:58 brev-v6nc08sjs pg_cuvs_server[4483]: [INFO] GPU 0 warm-up done in 46 ms
+Oct 21 01:36:58 brev-v6nc08sjs pg_cuvs_server[4483]: [INFO] pg_cuvs_server: listening on /tmp/.s.pg_cuvs
+Oct 21 01:36:58 brev-v6nc08sjs systemd[1]: Started pg_cuvs GPU sidecar daemon.
+Oct 21 01:37:03 brev-v6nc08sjs systemd[1]: Stopping pg_cuvs GPU sidecar daemon...
+Oct 21 01:37:03 brev-v6nc08sjs pg_cuvs_server[4483]: [INFO] pg_cuvs_server: SIGTERM received, serializing indexes...
+Oct 21 01:37:03 brev-v6nc08sjs pg_cuvs_server[4483]: [INFO] batch: worker thread joined
+Oct 21 01:37:20 brev-v6nc08sjs pg_cuvs_server[4483]: [INFO] pg_cuvs_server: saved index 16390/1016847 (1000000 vecs)
+Oct 21 01:37:20 brev-v6nc08sjs pg_cuvs_server[4483]: [INFO] sigterm: 1 indexes saved, 0 failed
+Oct 21 01:37:20 brev-v6nc08sjs pg_cuvs_server[4483]: [INFO] pg_cuvs_server: shutdown complete
+Oct 21 01:37:20 brev-v6nc08sjs pg_cuvs_server[4483]: CUDA call='cudaEventDestroy(event_)' at file=/tmp/conda-bld-output/bld/rattler-build_libcuvs-headers/host_env_placehold_placehold_placehold_placehold_placehold_placehold_placehold_placehold_placehold_placehold_placehold_placehold_placehold_placehold_placehold_placehold_placehold_placehold_placehold_/include/raft/core/resource/cuda_event.hpp line=23 failed with driver shutting down
+Oct 21 01:37:20 brev-v6nc08sjs pg_cuvs_server[4483]: CUDA call='cudaFreeAsync(ptr, stream)' at file=/tmp/conda-bld-output/bld/rattler-build_libcuvs-headers/work/cpp/src/neighbors/detail/cagra/compute_distance.hpp line=248 failed with driver shutting down
+Oct 21 01:37:20 brev-v6nc08sjs pg_cuvs_server[4483]: CUDA call='cudaFreeAsync(ptr, stream)' at file=/tmp/conda-bld-output/bld/rattler-build_libcuvs-headers/work/cpp/src/neighbors/detail/cagra/compute_distance.hpp line=248 failed with driver shutting down
+Oct 21 01:37:20 brev-v6nc08sjs systemd[1]: pg-cuvs-server.service: Deactivated successfully.
+Oct 21 01:37:20 brev-v6nc08sjs systemd[1]: Stopped pg_cuvs GPU sidecar daemon.
+Oct 21 01:37:20 brev-v6nc08sjs systemd[1]: pg-cuvs-server.service: Consumed 9.324s CPU time.
+-- Boot 8c6b9ca945ce4688a910a7e783d54993 --
+Oct 21 02:12:18 brev-v6nc08sjs systemd[1]: Starting pg_cuvs GPU sidecar daemon...
+Oct 21 02:12:19 brev-v6nc08sjs pg_cuvs_server[773]: [INFO] pg_cuvs_server: starting (socket=/tmp/.s.pg_cuvs index-dir=/tmp/cuvs_indexes snapshot=disabled)
+Oct 21 02:12:20 brev-v6nc08sjs pg_cuvs_server[773]: [INFO] index registry capacity: 1024 (--max-indexes)
+Oct 21 02:12:20 brev-v6nc08sjs pg_cuvs_server[773]: [INFO] RMM initial pool reservation: 0 MiB per GPU (0=disabled)
+Oct 21 02:12:20 brev-v6nc08sjs pg_cuvs_server[773]: [INFO] RMM maximum pool quota: 0% of total device memory
+Oct 21 02:12:21 brev-v6nc08sjs pg_cuvs_server[773]: [INFO] pg_cuvs_server: hw_profile gpu='NVIDIA L40S' link_bw=26910 hbm_bw=732246 bf_tput=57 cpu_dist=1448 cagra_lat=325.9 ipc_rtt=3.7 probe_status=0x3f
+Oct 21 02:12:21 brev-v6nc08sjs pg_cuvs_server[773]: [INFO] GPU 0 (NVIDIA L40S): 45484 MB total, budget 40936 MB (default fraction of total)
+Oct 21 02:12:21 brev-v6nc08sjs pg_cuvs_server[773]: [INFO] GPU 0 warm-up done in 232 ms
+Oct 21 02:12:21 brev-v6nc08sjs pg_cuvs_server[773]: [INFO] pg_cuvs_server: listening on /tmp/.s.pg_cuvs
+Oct 21 02:12:21 brev-v6nc08sjs systemd[1]: Started pg_cuvs GPU sidecar daemon.
+Oct 21 02:12:57 brev-v6nc08sjs pg_cuvs_server[773]: [INFO] pg_cuvs_server: SIGTERM received, serializing indexes...
+Oct 21 02:12:57 brev-v6nc08sjs systemd[1]: Stopping pg_cuvs GPU sidecar daemon...
+Oct 21 02:12:57 brev-v6nc08sjs pg_cuvs_server[773]: [INFO] batch: worker thread joined
+Oct 21 02:12:57 brev-v6nc08sjs pg_cuvs_server[773]: [INFO] sigterm: 0 indexes saved, 0 failed
+Oct 21 02:12:57 brev-v6nc08sjs pg_cuvs_server[773]: [INFO] pg_cuvs_server: shutdown complete
+Oct 21 02:12:57 brev-v6nc08sjs pg_cuvs_server[773]: CUDA call='cudaEventDestroy(event_)' at file=/tmp/conda-bld-output/bld/rattler-build_libcuvs-headers/host_env_placehold_placehold_placehold_placehold_placehold_placehold_placehold_placehold_placehold_placehold_placehold_placehold_placehold_placehold_placehold_placehold_placehold_placehold_placehold_/include/raft/core/resource/cuda_event.hpp line=23 failed with driver shutting down
+Oct 21 02:12:57 brev-v6nc08sjs pg_cuvs_server[773]: CUDA call='cudaFreeAsync(ptr, stream)' at file=/tmp/conda-bld-output/bld/rattler-build_libcuvs-headers/work/cpp/src/neighbors/detail/cagra/compute_distance.hpp line=248 failed with driver shutting down
+Oct 21 02:12:57 brev-v6nc08sjs pg_cuvs_server[773]: CUDA call='cudaFreeAsync(ptr, stream)' at file=/tmp/conda-bld-output/bld/rattler-build_libcuvs-headers/work/cpp/src/neighbors/detail/cagra/compute_distance.hpp line=248 failed with driver shutting down
+Oct 21 02:12:58 brev-v6nc08sjs systemd[1]: pg-cuvs-server.service: Deactivated successfully.
+Oct 21 02:12:58 brev-v6nc08sjs systemd[1]: Stopped pg_cuvs GPU sidecar daemon.
+Oct 21 02:12:58 brev-v6nc08sjs systemd[1]: pg-cuvs-server.service: Consumed 5.740s CPU time.
+Oct 21 02:14:04 brev-v6nc08sjs systemd[1]: Starting pg_cuvs GPU sidecar daemon...
+Oct 21 02:14:04 brev-v6nc08sjs pg_cuvs_server[4385]: [INFO] pg_cuvs_server: starting (socket=/tmp/.s.pg_cuvs index-dir=/tmp/cuvs_indexes snapshot=disabled)
+Oct 21 02:14:04 brev-v6nc08sjs pg_cuvs_server[4385]: [INFO] index registry capacity: 1024 (--max-indexes)
+Oct 21 02:14:04 brev-v6nc08sjs pg_cuvs_server[4385]: [INFO] RMM initial pool reservation: 0 MiB per GPU (0=disabled)
+Oct 21 02:14:04 brev-v6nc08sjs pg_cuvs_server[4385]: [INFO] RMM maximum pool quota: 0% of total device memory
+Oct 21 02:14:05 brev-v6nc08sjs pg_cuvs_server[4385]: [INFO] pg_cuvs_server: hw_profile gpu='NVIDIA L40S' link_bw=26949 hbm_bw=753287 bf_tput=125 cpu_dist=1483 cagra_lat=302.3 ipc_rtt=3.7 probe_status=0x3f
+Oct 21 02:14:05 brev-v6nc08sjs pg_cuvs_server[4385]: [INFO] GPU 0 (NVIDIA L40S): 45484 MB total, budget 40936 MB (default fraction of total)
+Oct 21 02:14:06 brev-v6nc08sjs pg_cuvs_server[4385]: [INFO] pg_cuvs_server: loaded index 16390/1016847 (1000000 vecs, 3173 MB VRAM)
+Oct 21 02:14:06 brev-v6nc08sjs pg_cuvs_server[4385]: [INFO] GPU 0 warm-up done in 53 ms
+Oct 21 02:14:06 brev-v6nc08sjs pg_cuvs_server[4385]: [INFO] pg_cuvs_server: listening on /tmp/.s.pg_cuvs
+Oct 21 02:14:06 brev-v6nc08sjs systemd[1]: Started pg_cuvs GPU sidecar daemon.

@@ -1,0 +1,47 @@
+{
+  "task": "b40ecef03a934801",
+  "window_seconds": 1800,
+  "phase_caps_seconds": {
+    "resume": 180,
+    "prepare": 260,
+    "verify": 635,
+    "cleanup": 90,
+    "stop": 480
+  },
+  "work_reservation_seconds": 570,
+  "source_pin": "0ff9f7c9fac4c20b8256dfc20ea3b0e604f7dd28",
+  "vm_id": "v6nc08sjs",
+  "new_resume_limit": 1,
+  "cumulative_resume_count_including_first_failed_window": 3,
+  "points": [
+    64,
+    128
+  ],
+  "queries_per_point": 10000,
+  "arms": [
+    {
+      "GUC_itopk_size": 0,
+      "GUC_search_width": 0,
+      "pool_mb": 0,
+      "max_percent_applied": 0
+    },
+    {
+      "GUC_itopk_size": 0,
+      "GUC_search_width": 0,
+      "pool_mb": 512,
+      "max_percent_applied": 50
+    }
+  ],
+  "zero_gate": "frozen observed control span for recall/p50; no widening or retry",
+  "default_gate": "same graph/query/truth, recall frozen span, GPU10000/error0; record latency improvement without equivalence claim",
+  "status": "readonly applied settings, pool counters, built/installed/running byte binding",
+  "quota": "initial512 greater than1% fails startup; initial64/1% cannot admit preserved1M index",
+  "graph": "original 16390_1016847 graph and persistent snapshot SHA unchanged before/after",
+  "cleanup": "own services stopped, old override restored, source/DB/graph retained, no GPU processes",
+  "stop": "normal accepted request and official STOPPED observation distinguished; absolute deadline480 within total1800; no reset/delete",
+  "last_window": true,
+  "no_fourth_resume": true,
+  "strong_local_precondition": "local-validation/precondition.json; real upper argv/launcher/entry/PgEngine/SQL/status, no mock",
+  "first_live_connection_probe": "same launcher/entry in explicit connect mode; SELECT1+SHOW pool; any failure -> normal STOP",
+  "fallback_on_live_failure": "Draft PR, CPU/shim behavior verified only; no native quality PASS/merge-ready claim"
+}

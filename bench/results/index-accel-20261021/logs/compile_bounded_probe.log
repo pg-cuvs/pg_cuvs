@@ -1,0 +1,81 @@
+/opt/miniforge3/envs/cuvs_dev/include/raft/core/device_resources.hpp: In constructor ‘raft::device_resources::device_resources(const raft::device_resources&, std::shared_ptr<rmm::mr::device_memory_resource>, std::optional<long unsigned int>)’:
+/opt/miniforge3/envs/cuvs_dev/include/raft/core/device_resources.hpp:60:33: warning: ‘void raft::resource::set_workspace_resource(const raft::resources&, std::shared_ptr<rmm::mr::device_memory_resource>, std::optional<long unsigned int>, std::optional<long unsigned int>)’ is deprecated: use the overload taking raft::mr::device_resource instead [-Wdeprecated-declarations]
+   60 |     resource::set_workspace_resource(*this, workspace_resource, allocation_limit);
+      |     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+/opt/miniforge3/envs/cuvs_dev/include/raft/core/resource/device_memory_resource.hpp:388:1: note: declared here
+  388 | inline void set_workspace_resource(resources const& res,
+      | ^~~~~~~~~~~~~~~~~~~~~~
+/opt/miniforge3/envs/cuvs_dev/include/raft/core/device_resources.hpp: In constructor ‘raft::device_resources::device_resources(rmm::cuda_stream_view, std::shared_ptr<rmm::cuda_stream_pool>, std::shared_ptr<rmm::mr::device_memory_resource>, std::optional<long unsigned int>)’:
+/opt/miniforge3/envs/cuvs_dev/include/raft/core/device_resources.hpp:90:33: warning: ‘void raft::resource::set_workspace_resource(const raft::resources&, std::shared_ptr<rmm::mr::device_memory_resource>, std::optional<long unsigned int>, std::optional<long unsigned int>)’ is deprecated: use the overload taking raft::mr::device_resource instead [-Wdeprecated-declarations]
+   90 |       resource::set_workspace_resource(*this, workspace_resource, allocation_limit);
+      |       ~~~~~~~~~~~~~~~~~~~~~~~~~~^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+/opt/miniforge3/envs/cuvs_dev/include/raft/core/resource/device_memory_resource.hpp:388:1: note: declared here
+  388 | inline void set_workspace_resource(resources const& res,
+      | ^~~~~~~~~~~~~~~~~~~~~~
+/opt/miniforge3/envs/cuvs_dev/include/raft/sparse/convert/detail/csr.cuh: In function ‘void raft::sparse::convert::detail::coo_to_csr(const raft::resources&, const int*, const int*, const value_t*, int, int, int*, int*, value_t*)’:
+/opt/miniforge3/envs/cuvs_dev/include/raft/sparse/convert/detail/csr.cuh:58:71: warning: ‘cusparseStatus_t cusparseCreateIdentityPermutation(cusparseHandle_t, int, int*)’ is deprecated: The routine will be removed in the next major release [-Wdeprecated-declarations]
+   58 |   RAFT_CUSPARSE_TRY(cusparseCreateIdentityPermutation(cusparseHandle, nnz, P.data()));
+      |                                      ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^~~~~~~~~~~~~~~~               
+/opt/miniforge3/envs/cuvs_dev/bin/../targets/x86_64-linux/include/cusparse.h:4070:1: note: declared here
+ 4070 | cusparseCreateIdentityPermutation(cusparseHandle_t handle,
+      | ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+src/cuvs_wrapper_bounded.cu: In function ‘int cuvs_brute_force_search(const float*, const float*, int64_t, int, int, uint32_t, CuvsSearchResult*, int)’:
+src/cuvs_wrapper_bounded.cu:610:49: warning: ‘cuvs::neighbors::brute_force::index<float> cuvs::neighbors::brute_force::build(const raft::resources&, raft::device_matrix_view<const float, long int>, cuvs::distance::DistanceType, float)’ is deprecated [-Wdeprecated-declarations]
+  610 |         auto index = cuvs::neighbors::brute_force::build(
+      |              ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^~~~~~~~~                                                                  
+/opt/miniforge3/envs/cuvs_dev/include/cuvs/neighbors/brute_force.hpp:210:21: note: declared here
+  210 | [[deprecated]] auto build(
+      |                     ^~~~~
+src/cuvs_wrapper_bounded.cu:615:37: warning: ‘void cuvs::neighbors::brute_force::search(const raft::resources&, const cuvs::neighbors::brute_force::index<float>&, raft::device_matrix_view<const float, long int>, raft::device_matrix_view<long int, long int, cuda::std::__4::layout_right>, raft::device_matrix_view<float, long int>, const cuvs::neighbors::filtering::base_filter&)’ is deprecated [-Wdeprecated-declarations]
+  615 |         cuvs::neighbors::brute_force::search(
+      |         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~^~~~~~~~~                                                                                    
+/opt/miniforge3/envs/cuvs_dev/include/cuvs/neighbors/brute_force.hpp:376:21: note: declared here
+  376 | [[deprecated]] void search(raft::resources const& handle,
+      |                     ^~~~~~
+src/cuvs_wrapper_bounded.cu: In function ‘void* cuvs_bf_build(const float*, int64_t, int, uint32_t, uint32_t, int)’:
+src/cuvs_wrapper_bounded.cu:671:47: warning: ‘cuvs::neighbors::brute_force::index<__half, float> cuvs::neighbors::brute_force::build(const raft::resources&, raft::device_matrix_view<const __half, long int>, cuvs::distance::DistanceType, float)’ is deprecated [-Wdeprecated-declarations]
+  671 |             auto idx = cuvs::neighbors::brute_force::build(
+      |             ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^~~~~~~~~~~~~                                                                     
+/opt/miniforge3/envs/cuvs_dev/include/cuvs/neighbors/brute_force.hpp:251:21: note: declared here
+  251 | [[deprecated]] auto build(
+      |                     ^~~~~
+src/cuvs_wrapper_bounded.cu:682:47: warning: ‘cuvs::neighbors::brute_force::index<float> cuvs::neighbors::brute_force::build(const raft::resources&, raft::device_matrix_view<const float, long int>, cuvs::distance::DistanceType, float)’ is deprecated [-Wdeprecated-declarations]
+  682 |             auto idx = cuvs::neighbors::brute_force::build(
+      |             ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^~~~~~~~~~~~~                                                                     
+/opt/miniforge3/envs/cuvs_dev/include/cuvs/neighbors/brute_force.hpp:210:21: note: declared here
+  210 | [[deprecated]] auto build(
+      |                     ^~~~~
+src/cuvs_wrapper_bounded.cu: In function ‘int cuvs_bf_search(CuvsBfIndex, const float*, int, int, CuvsSearchResult*, int)’:
+src/cuvs_wrapper_bounded.cu:743:37: warning: ‘void cuvs::neighbors::brute_force::search(const raft::resources&, const cuvs::neighbors::brute_force::index<__half, float>&, raft::device_matrix_view<const __half, long int>, raft::device_matrix_view<long int, long int, cuda::std::__4::layout_right>, raft::device_matrix_view<float, long int>, const cuvs::neighbors::filtering::base_filter&)’ is deprecated [-Wdeprecated-declarations]
+  743 |             cuvs::neighbors::brute_force::search(
+      |             ~~~~~~~~~~~~~~~~~~~~~~~~^~~~~~~~~~~~~                                                                                           
+/opt/miniforge3/envs/cuvs_dev/include/cuvs/neighbors/brute_force.hpp:444:21: note: declared here
+  444 | [[deprecated]] void search(raft::resources const& handle,
+      |                     ^~~~~~
+src/cuvs_wrapper_bounded.cu:751:37: warning: ‘void cuvs::neighbors::brute_force::search(const raft::resources&, const cuvs::neighbors::brute_force::index<float>&, raft::device_matrix_view<const float, long int>, raft::device_matrix_view<long int, long int, cuda::std::__4::layout_right>, raft::device_matrix_view<float, long int>, const cuvs::neighbors::filtering::base_filter&)’ is deprecated [-Wdeprecated-declarations]
+  751 |             cuvs::neighbors::brute_force::search(
+      |             ~~~~~~~~~~~~~~~~~~~~~~~~^~~~~~~~~~~~~                                                                                           
+/opt/miniforge3/envs/cuvs_dev/include/cuvs/neighbors/brute_force.hpp:376:21: note: declared here
+  376 | [[deprecated]] void search(raft::resources const& handle,
+      |                     ^~~~~~
+src/cuvs_wrapper_bounded.cu: In function ‘int cuvs_bf_search_batch(CuvsBfIndex, const float*, int, int, int, CuvsSearchResult*, int)’:
+src/cuvs_wrapper_bounded.cu:1386:37: warning: ‘void cuvs::neighbors::brute_force::search(const raft::resources&, const cuvs::neighbors::brute_force::index<__half, float>&, raft::device_matrix_view<const __half, long int>, raft::device_matrix_view<long int, long int, cuda::std::__4::layout_right>, raft::device_matrix_view<float, long int>, const cuvs::neighbors::filtering::base_filter&)’ is deprecated [-Wdeprecated-declarations]
+ 1386 |             cuvs::neighbors::brute_force::search(
+      |             ~~~~~~~~~~~~~~~~~~~~~~~~^~~~~~~~~~~~~                                                                                     
+/opt/miniforge3/envs/cuvs_dev/include/cuvs/neighbors/brute_force.hpp:444:21: note: declared here
+  444 | [[deprecated]] void search(raft::resources const& handle,
+      |                     ^~~~~~
+src/cuvs_wrapper_bounded.cu:1394:37: warning: ‘void cuvs::neighbors::brute_force::search(const raft::resources&, const cuvs::neighbors::brute_force::index<float>&, raft::device_matrix_view<const float, long int>, raft::device_matrix_view<long int, long int, cuda::std::__4::layout_right>, raft::device_matrix_view<float, long int>, const cuvs::neighbors::filtering::base_filter&)’ is deprecated [-Wdeprecated-declarations]
+ 1394 |             cuvs::neighbors::brute_force::search(
+      |             ~~~~~~~~~~~~~~~~~~~~~~~~^~~~~~~~~~~~~                                                                                     
+/opt/miniforge3/envs/cuvs_dev/include/cuvs/neighbors/brute_force.hpp:376:21: note: declared here
+  376 | [[deprecated]] void search(raft::resources const& handle,
+      |                     ^~~~~~
+src/cuvs_wrapper_bounded.cu: In function ‘int cuvs_hnsw_serialize(CuvsCagraIndex, const char*, int)’:
+src/cuvs_wrapper_bounded.cu:1818:17: warning: format ‘%zu’ expects argument of type ‘size_t’, but argument 3 has type ‘unsigned int’ [-Wformat=]
+ 1818 |         fprintf(stderr, "[cuvs_hnsw_serialize] skip: n_vecs=%zu < %d (too small for hnswlib)\n",
+      |                 ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~  ~~~~~~~            
+      |                                                                                                           |
+      |                                                                                                           unsigned int
+29806f7e25ad397d440fca97247150487ed8f3d3b6f516ba9a7659ec7389156e  /home/ubuntu/index-accel-validation/bounded_probe
+7557fd7718818003cfbce3505d9f28df44234e860954ecf6f03837a2095640d9  src/cuvs_wrapper_bounded.cu

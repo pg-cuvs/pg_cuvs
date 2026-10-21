@@ -1,0 +1,2 @@
+[engine] COPY 1000000 rows in 261.6s
+[engine] corpus fingerprint d39b11c52555... verified + stored (dataset=wiki_all_1M)

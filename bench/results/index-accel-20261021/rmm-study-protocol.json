@@ -1,0 +1,40 @@
+{
+  "frozen_at_utc": "2026-10-20T16:13:50.103485+00:00",
+  "task": "91b00c0e2851492a",
+  "revision": "03b678b102944a7a",
+  "source": "fded8ce",
+  "sizes_mb": [
+    0,
+    256,
+    512,
+    1024,
+    2048,
+    4096
+  ],
+  "N_per_size": 3,
+  "interleaved_sequence_mb": [
+    0,
+    1024,
+    256,
+    2048,
+    512,
+    4096,
+    2048,
+    0,
+    512,
+    1024,
+    4096,
+    256,
+    512,
+    4096,
+    1024,
+    256,
+    0,
+    2048
+  ],
+  "each_point": "separate PG+daemon restart, existing graph load; heap/toast/index prewarm, first100, warm100, steady10000; candidates64/128, no microbatch",
+  "candidate_rule": "smallest positive initial MB whose mean p50 is within 5% of best positive size at BOTH k points; report N3 std and all cold p99, do not discard runs",
+  "peak": "pool1024 reference, statistics_resource_adaptor above and below current resource; native wrapper fded8ce with private batch itopk512,width1 override only; k64,Q10000; separate profiler passes",
+  "build_time": "after candidate choice: ivf_pq gd64/igd256, private cloned DB, pool0/candidate alternated 3 pairs, same warming, CREATE INDEX wallclock only",
+  "public_results": "commit local RMM branch at bench/results/index-accel-20261021; defer public numeric push during embargo"
+}

@@ -1,0 +1,14 @@
+{
+  "observed_at_utc": "2026-10-21T00:49:34.419418+00:00",
+  "workspace": {
+    "name": "pg-cuvs-index-accel-20261020",
+    "id": "v6nc08sjs",
+    "status": "STOPPED",
+    "build_status": "COMPLETED",
+    "shell_status": "NOT READY",
+    "health_status": "HEALTHY",
+    "instance_type": "l40s-48gb.1x",
+    "instance_kind": "gpu",
+    "gpu": "L40S"
+  }
+}

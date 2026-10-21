@@ -1,0 +1,9 @@
+{
+  "base_entry_sha256": "dc0bf9647031ccecdacee8dbc6587ec5dcad22bf102f224d80225e77437d09fb",
+  "final_entry_sha256": "6eff974166148109e87f883f0f39bb1a86cd2868e2f37e65b083df34cfe57704",
+  "single_search_loop_AST_unchanged": true,
+  "graph_hash_and_ID_comparison_AST_unchanged": true,
+  "entry_changes": "real connection audit and explicit connect preflight mode; measure loop runs to completion",
+  "production_source_changes": false,
+  "source_pin": "0ff9f7c9fac4c20b8256dfc20ea3b0e604f7dd28"
+}

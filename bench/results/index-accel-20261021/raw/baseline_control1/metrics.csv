@@ -1,0 +1,3 @@
+k,recall_at10,qps,p50_ms,byte_identical_to_baseline,observed_gpu_queries,observed_gpu_errors,observed_search_mode,mean_query_jaccard,id_changed_queries,reorder_only_queries,within_gt_only_changed_queries,gt_outside_involved_queries,gt_hits_lost,gt_hits_gained
+64,0.94075,1011.5499595754701,0.9696385002371244,False,10000,0,gpu_cagra,0.9991714932126703,38,0,0,38,15,21
+128,0.97843,1001.9476414340911,0.9966490001716011,False,10000,0,gpu_cagra,0.9990060606060611,56,3,1,52,29,23

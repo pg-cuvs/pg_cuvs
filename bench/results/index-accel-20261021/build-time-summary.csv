@@ -1,0 +1,3 @@
+pool_mb,N,create_index_seconds_mean,create_index_seconds_std,index_vram_estimate_bytes_mean,index_vram_estimate_bytes_std,all_index_vram_estimate_bytes_mean,all_index_vram_estimate_bytes_std,nvidia_smi_used_mib_mean,nvidia_smi_used_mib_std,physical_minus_logical_bytes_mean,physical_minus_logical_bytes_std
+0,3,46.44274841266633,0.4713037011643518,3328000000,0.0,3328000000,0.0,3779.0,0.0,634568704,0.0
+512,3,45.199551759000315,0.8207982403539706,3328000000,0.0,3328000000,0.0,14371.0,0.0,11741085696,0.0

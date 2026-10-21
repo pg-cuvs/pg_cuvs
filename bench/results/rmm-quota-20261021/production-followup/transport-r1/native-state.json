@@ -1,0 +1,116 @@
+{
+  "source_pin": "0ff9f7c9fac4c20b8256dfc20ea3b0e604f7dd28",
+  "vm": "pg-cuvs-index-accel-20261020",
+  "vm_id": "v6nc08sjs",
+  "budget_seconds": 900,
+  "price_usd_per_hour_reference": 1.74,
+  "cost_is_estimate_not_invoice": true,
+  "phases": {
+    "vm-start": {
+      "exit": 0,
+      "seconds": 6.32622112496756
+    },
+    "ssh-refresh": {
+      "exit": 0,
+      "seconds": 11.286710957996547
+    },
+    "ready-00": {
+      "exit": 255,
+      "seconds": 0.044315166072919965
+    },
+    "ready-01": {
+      "exit": 255,
+      "seconds": 0.026510709198191762
+    },
+    "ready-02": {
+      "exit": 255,
+      "seconds": 0.027569333091378212
+    },
+    "ready-03": {
+      "exit": 255,
+      "seconds": 0.02466537500731647
+    },
+    "ready-04": {
+      "exit": 255,
+      "seconds": 0.026814833050593734
+    },
+    "ready-05": {
+      "exit": 255,
+      "seconds": 0.023754084017127752
+    },
+    "ready-06": {
+      "exit": 255,
+      "seconds": 0.02062345785088837
+    },
+    "ready-07": {
+      "exit": 255,
+      "seconds": 0.026085332967340946
+    },
+    "ready-08": {
+      "exit": 255,
+      "seconds": 0.023065000073984265
+    },
+    "ready-09": {
+      "exit": 255,
+      "seconds": 0.013441875111311674
+    },
+    "ready-10": {
+      "exit": 255,
+      "seconds": 0.022173041943460703
+    },
+    "ready-11": {
+      "exit": 255,
+      "seconds": 0.01908683287911117
+    },
+    "ready-12": {
+      "exit": 0,
+      "seconds": 2.444619500078261
+    },
+    "cleanup": {
+      "exit": 127,
+      "seconds": 0.48725908319465816
+    },
+    "evidence-copy": {
+      "exit": 23,
+      "seconds": 1.0390222910791636
+    },
+    "vm-stop": {
+      "exit": 0,
+      "seconds": 6.394475500099361
+    }
+  },
+  "before": {
+    "name": "pg-cuvs-index-accel-20261020",
+    "id": "v6nc08sjs",
+    "status": "STOPPED",
+    "build_status": "COMPLETED",
+    "shell_status": "NOT READY",
+    "health_status": "HEALTHY",
+    "instance_type": "l40s-48gb.1x",
+    "instance_kind": "gpu",
+    "gpu": "L40S"
+  },
+  "started_at_utc": "2026-10-21T00:41:48.763327+00:00",
+  "native_passed": false,
+  "failure": "",
+  "traceback": "Traceback (most recent call last):\n  File \"/Users/jaesolshin/orca/workspaces/pg_cuvs/index-rmm-pool/.omc/rmm-cap-implementation/run_native_followup.py\", line 70, in <module>\n    assert (LOCAL/('ready-%02d.log'%attempt)).read_text().strip() == 'brev-v6nc08sjs'\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\nAssertionError\n",
+  "cleanup_passed": false,
+  "cleanup_failure": "cleanup failed: 127",
+  "export_failure": "evidence-copy failed: 23",
+  "after": {
+    "name": "pg-cuvs-index-accel-20261020",
+    "id": "v6nc08sjs",
+    "status": "STOPPING",
+    "build_status": "COMPLETED",
+    "shell_status": "NOT READY",
+    "health_status": "HEALTHY",
+    "instance_type": "l40s-48gb.1x",
+    "instance_kind": "gpu",
+    "gpu": "L40S"
+  },
+  "stop_confirmed": false,
+  "finished_at_utc": "2026-10-21T00:44:14.776659+00:00",
+  "observed_running_seconds_upper_bound": 146.01655154209584,
+  "estimated_compute_usd": 0.07057466657867965,
+  "within_900s": true
+}
