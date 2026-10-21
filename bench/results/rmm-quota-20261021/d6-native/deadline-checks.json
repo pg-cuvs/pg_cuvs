@@ -1,0 +1,47 @@
+{
+  "passed": 9,
+  "cases": [
+    {
+      "case": "resume_inventory_or_refresh_clipped",
+      "timeout": 1
+    },
+    {
+      "case": "resume_probe_after_deadline",
+      "denied": true,
+      "cause": "resume: cumulative deadline exhausted; no new command"
+    },
+    {
+      "case": "next_work_preserves_570",
+      "timeout": 1
+    },
+    {
+      "case": "no_work_when_cleanup_stop_reservation_reached",
+      "denied": true,
+      "cause": "verify: cumulative deadline exhausted; no new command"
+    },
+    {
+      "case": "no_new_work_phase_at_reservation",
+      "denied": true,
+      "cause": "prepare: deadline/reservation exhausted before phase start"
+    },
+    {
+      "case": "cleanup_preserves_480_stop_seconds",
+      "timeout": 1
+    },
+    {
+      "case": "cleanup_exhausted",
+      "denied": true,
+      "cause": "cleanup: cumulative deadline exhausted; no new command"
+    },
+    {
+      "case": "STOP_inventory_clipped_to_same_deadline",
+      "timeout": 1
+    },
+    {
+      "case": "no_STOP_inventory_after_total_deadline",
+      "denied": true,
+      "cause": "stop: cumulative deadline exhausted; no new command"
+    }
+  ],
+  "remote_calls": 0
+}
