@@ -183,3 +183,21 @@ Exact k-NN by GPU brute force over the first N corpus rows (unit-norm → dot
 product == L2 ranking), id-space-aligned to `t.id`. Produced by
 `cuvs_bench.generate_groundtruth` or `bench/legacy/anbench/build_gt.py` (identical exact
 result). **Always rebuild GT for the exact N tested**; never reuse a different-N GT.
+## PostgreSQL connection preflight
+
+For `pgcuvs_*` algorithms, the standalone runner, backend, build-time arm,
+throughput phase and same-graph calibration require an explicit `PGHOST`.
+`infra/scripts/gpu-run.sh` supplies it; direct invocations must export their
+target host. The actual `PgEngine` connection also checks that its host matches,
+`shared_preload_libraries` contains `pg_cuvs`, and `current_schemas(false)` is
+exactly `public`. PostgreSQL's default `"$user", public` is accepted when the
+user schema does not exist. Other resolved schemas are rejected before any
+extension setup, corpus load, build or measurement.
+
+Direct Python callers can request the same checks with
+`PgEngine(..., require_gpu_environment=True)`. CPU-only `pgvector_*` runs keep
+their existing libpq connection defaults. The standalone CLI's
+`--require-gpu-environment` also applies the checks to a CPU-only run, for
+connection validation on a local PostgreSQL without a GPU daemon.
+These checks verify the connection
+environment; they do not establish GPU use or deployment freshness.

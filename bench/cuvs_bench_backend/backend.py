@@ -272,7 +272,8 @@ class PgBackend(BenchmarkBackend):
         if algo == RAW_ALGO:
             return get_raw_engine()
         if self._engine is None:
-            self._engine = PgEngine(dbname=self.dbname, index_dir=self.index_dir)
+            self._engine = PgEngine(dbname=self.dbname, index_dir=self.index_dir,
+                                    require_gpu_environment=algo.startswith("pgcuvs_"))
         return self._engine
 
     def _eng(self):

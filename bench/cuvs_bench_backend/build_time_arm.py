@@ -118,7 +118,8 @@ def main():
     host = socket.gethostname()
     gpu = gpu_name()
 
-    eng = PgEngine(dbname=args.dbname, index_dir=args.index_dir)
+    eng = PgEngine(dbname=args.dbname, index_dir=args.index_dir,
+                   require_gpu_environment=has_pgcuvs)
     eng.load_corpus(corpus, args.n, dim, dataset=args.dataset)
 
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)

@@ -80,7 +80,8 @@ def main():
     gt = read_ibin(os.path.join(
         args.data_dir, f"gt_{args.n}_q{args.max_queries}.ibin"))
 
-    eng = PgEngine(dbname=args.dbname, index_dir=args.index_dir)
+    eng = PgEngine(dbname=args.dbname, index_dir=args.index_dir,
+                   require_gpu_environment=True)
     try:
         with eng.conn.cursor() as cur:
             # Name the graph the number was taken on; without it the delta is

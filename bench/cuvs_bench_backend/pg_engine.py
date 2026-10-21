@@ -204,12 +204,36 @@ class PgEngine:
     def ivfflat_lists(n):
         return max(1, int(4 * (n ** 0.5)))
 
-    def __init__(self, dbname="postgres", index_dir=INDEX_DIR_DEFAULT):
+    def __init__(self, dbname="postgres", index_dir=INDEX_DIR_DEFAULT, *,
+                 require_gpu_environment=False):
+        host = os.environ.get("PGHOST", "")
+        if require_gpu_environment and not host.strip():
+            raise RuntimeError("GPU benchmark requires an explicit PGHOST; "
+                               "run through gpu-run.sh or export the target host")
         import psycopg
         # autocommit from the start: building a cagra index inside an explicit
         # transaction block corrupts the backend so later cagra searches crash
         # the connection (run_pg.py). Autocommit is the working + realistic path.
         self.conn = psycopg.connect(dbname=dbname, autocommit=True)
+        if require_gpu_environment:
+            try:
+                if self.conn.info.host != host:
+                    raise RuntimeError("GPU benchmark connection host differs from PGHOST")
+                preload = self.conn.execute("SHOW shared_preload_libraries").fetchone()[0]
+                libraries = [p.strip().strip('"').rsplit("/", 1)[-1]
+                             for p in preload.split(",")]
+                if not any(p in ("pg_cuvs", "pg_cuvs.so") for p in libraries):
+                    raise RuntimeError("GPU benchmark requires pg_cuvs in "
+                                       "shared_preload_libraries")
+                schemas = self.conn.execute("SELECT current_schemas(false)").fetchone()[0]
+                if schemas != ["public"]:
+                    raise RuntimeError("GPU benchmark requires search_path resolving "
+                                       f"only to public; got {schemas!r}")
+                print("[engine] GPU connection preflight passed: explicit PGHOST, "
+                      "pg_cuvs preload, public search_path", flush=True)
+            except Exception:
+                self.conn.close()
+                raise
         self.conn.execute("CREATE EXTENSION IF NOT EXISTS vector")
         try:
             self.conn.execute("CREATE EXTENSION IF NOT EXISTS pg_cuvs")
@@ -940,6 +964,8 @@ def main():
     ap.add_argument("--dbname", default="postgres")
     ap.add_argument("--index-dir", default=INDEX_DIR_DEFAULT)
     ap.add_argument("--max-queries", type=int, default=2000)
+    ap.add_argument("--require-gpu-environment", action="store_true",
+                    help="also require the GPU connection preflight for CPU-only algos")
     ap.add_argument("--toggle-daemon", action="store_true",
                     help="restart daemon for pg_cuvs algos, stop for pgvector (VRAM-fair)")
     args = ap.parse_args()
@@ -964,7 +990,9 @@ def main():
         is_gpu = algo in ("pgcuvs_cagra", "pgcuvs_hnsw_import")
         if args.toggle_daemon:
             _daemon("restart" if is_gpu else "stop")
-        eng = PgEngine(dbname=args.dbname, index_dir=args.index_dir)
+        eng = PgEngine(dbname=args.dbname, index_dir=args.index_dir,
+                       require_gpu_environment=(args.require_gpu_environment
+                                                or algo.startswith("pgcuvs_")))
         eng.load_corpus(args.corpus, args.n, dim, dataset=args.dataset)
         print(f"[engine] build {algo} ...", flush=True)
         bt, ibytes, _meta = eng.build(algo, args.n, sample_query=qset[0])
