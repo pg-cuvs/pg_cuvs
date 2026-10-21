@@ -17,8 +17,8 @@
 #   survives. See the IDX comment below for the one thing that does not.
 #
 # USAGE (from the Mac, once a fresh instance is up and `ssh <name>` works):
-#   scp bootstrap.sh <name>:                     # lands in the SSH user's home
-#   ssh <name> 'bash ~/bootstrap.sh 2>&1 | tee ~/bootstrap.log'
+#   bash infra/scripts/vm-transport.sh scp infra/brev/bootstrap.sh <name>:
+#   bash infra/scripts/vm-transport.sh ssh <name> 'bash ~/bootstrap.sh 2>&1 | tee ~/bootstrap.log'
 #   # ~10 min wall clock: setup ~80s, data ~75s (parallel), build ~2-3m, verify ~30s.
 #
 # ASSUMPTIONS (Brev images, 2026-08):

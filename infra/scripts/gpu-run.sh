@@ -49,7 +49,7 @@ VM_SSH_HOST="${VM_SSH_HOST:-$(conf_get VM_SSH_HOST)}"
 [ -n "$VM_SSH_HOST" ] || { echo "gpu-run: VM_SSH_HOST unset (gpu.conf)" >&2; exit 1; }
 
 OWNER="${PGCUVS_RUN_OWNER:-${USER:-unknown}}"
-vm() { ssh -o BatchMode=yes "$VM_SSH_HOST" "$@"; }
+vm() { "$REPO_ROOT/infra/scripts/vm-transport.sh" ssh -o BatchMode=yes "$VM_SSH_HOST" "$@"; }
 
 case "${1:-status}" in
 status)

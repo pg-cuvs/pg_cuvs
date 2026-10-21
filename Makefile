@@ -378,6 +378,10 @@ VM_IP = $(if $(USE_GCP_IP),$(shell gcloud compute instances describe $(GCP_INSTA
 VM_HOST = $(if $(VM_IP),$(GCP_USER)@$(VM_IP),$(VM_SSH_HOST))
 unexport VM_IP VM_HOST
 
+# Apply the same explicit forwarding options to commands and file transfers.
+VM_TRANSPORT = bash infra/scripts/vm-transport.sh
+VM_SSH = $(VM_TRANSPORT) ssh
+
 # Every remote command sources ~/.pg_cuvs_env, the environment file that
 # infra/brev/bootstrap.sh wrote on the VM while it built (CONDA_PREFIX, PATH
 # with the PG bin dir, LD_LIBRARY_PATH, NVCC, PGHOST). It is the single source
@@ -398,7 +402,7 @@ vm-start:
 	@test -n "$(GCP_PROJECT)" || (echo "ERROR: set GCP_PROJECT in gpu.conf"; exit 1)
 	gcloud compute instances start $(GCP_INSTANCE) --zone $(GCP_ZONE) --project $(GCP_PROJECT)
 	@echo "Waiting for SSH..."
-	@until ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=no $(VM_HOST) true 2>/dev/null; \
+	@until $(VM_SSH) -o ConnectTimeout=5 -o StrictHostKeyChecking=no $(VM_HOST) true 2>/dev/null; \
 		do sleep 3; done
 	@echo "VM ready: $(VM_HOST)"
 
@@ -409,7 +413,7 @@ vm-stop:
 # rsync local → VM. Excludes build artifacts to avoid clobbering remote .o files
 # that were produced on the VM with the correct nvcc toolchain.
 sync:
-	rsync -avz --delete \
+	$(VM_TRANSPORT) rsync -avz --delete \
 		--exclude '.git' \
 		--exclude 'src/*.o' \
 		--exclude 'src/*.bc' \
@@ -419,23 +423,23 @@ sync:
 		./ $(VM_HOST):~/pg_cuvs/
 
 gpu-build:
-	ssh -tt $(VM_HOST) "cd ~/pg_cuvs && \
+	$(VM_SSH) -tt $(VM_HOST) "cd ~/pg_cuvs && \
 		$(REMOTE_ENV) && \
 		make 2>&1 | tee /tmp/pg_cuvs_build.log"
 
 gpu-install:
-	ssh -tt $(VM_HOST) "cd ~/pg_cuvs && \
+	$(VM_SSH) -tt $(VM_HOST) "cd ~/pg_cuvs && \
 		$(REMOTE_ENV) && \
 		sudo -E make install"
 
 # #169: gated on freshness — a stale deployment must not yield a green run.
 gpu-test: gpu-verify-deployed
-	ssh -tt $(VM_HOST) "cd ~/pg_cuvs && \
+	$(VM_SSH) -tt $(VM_HOST) "cd ~/pg_cuvs && \
 		$(REMOTE_ENV) && \
 		make installcheck"
 
 gpu-server:
-	ssh -tt $(VM_HOST) "cd ~/pg_cuvs && \
+	$(VM_SSH) -tt $(VM_HOST) "cd ~/pg_cuvs && \
 		$(REMOTE_ENV) && \
 		make server && sudo make install-server"
 
@@ -450,7 +454,7 @@ gpu-deploy: sync gpu-build gpu-install gpu-server gpu-reload gpu-verify-deployed
 # Restart PostgreSQL and the daemon, then wait for the daemon to reach `active`
 # (first CUDA context takes 12s-3min). Piped over stdin like gpu-postinstall.
 gpu-reload:
-	ssh $(VM_HOST) "$(REMOTE_ENV) && bash -s" \
+	$(VM_SSH) $(VM_HOST) "$(REMOTE_ENV) && bash -s" \
 		< infra/scripts/setup/reload-deployed.sh
 
 # The staleness guard already existed — gpu-preflight.sh — but gpu-run.sh was
@@ -466,13 +470,13 @@ gpu-verify-deployed:
 # The script is piped over stdin (bash -s) rather than inlined to avoid
 # fragile nested quoting; plain ssh (no -tt) since it needs no remote TTY.
 gpu-postinstall:
-	CONDA_ENV=$(CONDA_ENV) ssh $(VM_HOST) "$(REMOTE_ENV) && CONDA_ENV=$(CONDA_ENV) bash -s" \
+	CONDA_ENV=$(CONDA_ENV) $(VM_SSH) $(VM_HOST) "$(REMOTE_ENV) && CONDA_ENV=$(CONDA_ENV) bash -s" \
 		< infra/scripts/setup/postinstall.sh
 
 # End-to-end durability smoke: build index, restart daemon, verify reload.
 # Piped over stdin (bash -s); plain ssh, no remote TTY needed.
 gpu-e2e:
-	ssh $(VM_HOST) "$(REMOTE_ENV) && bash -s" < infra/scripts/tests/e2e-smoke.sh
+	$(VM_SSH) $(VM_HOST) "$(REMOTE_ENV) && bash -s" < infra/scripts/tests/e2e-smoke.sh
 
 # ---- Integration test suite (Phase 1.5 #3) -----------------------------
 # Layered test targets. Unit tests run locally (no toolchain needed);
@@ -481,7 +485,7 @@ gpu-e2e:
 # Unit tests for the dependency-free helpers (cuvs_util). Runs on the VM
 # for parity with the build toolchain; identical to local `make test-unit`.
 gpu-test-unit:
-	ssh -tt $(VM_HOST) "cd ~/pg_cuvs && \
+	$(VM_SSH) -tt $(VM_HOST) "cd ~/pg_cuvs && \
 		$(REMOTE_ENV) && \
 		make test-unit"
 
@@ -489,14 +493,14 @@ gpu-test-unit:
 # CREATE INDEX paths; the production pg-cuvs-server systemd unit must be
 # active and cuvs.index_dir set to its --index-dir.
 gpu-test-regress:
-	ssh -tt $(VM_HOST) "cd ~/pg_cuvs && \
+	$(VM_SSH) -tt $(VM_HOST) "cd ~/pg_cuvs && \
 		$(REMOTE_ENV) && \
 		make installcheck"
 
 # Isolation suite (snapshot-aware tombstone, write/query interleaving). Same
 # daemon + GPU prerequisites as gpu-test-regress; runs only the isolation specs.
 gpu-test-isolation:
-	ssh -tt $(VM_HOST) "cd ~/pg_cuvs && \
+	$(VM_SSH) -tt $(VM_HOST) "cd ~/pg_cuvs && \
 		$(REMOTE_ENV) && \
 		make installcheck-isolation"
 
@@ -505,7 +509,7 @@ gpu-test-isolation:
 # TEST socket + index dir, then restores the production daemon. Piped over
 # stdin (bash -s); CONDA_ENV is forwarded so the script can compile.
 gpu-test-daemon:
-	ssh $(VM_HOST) "$(REMOTE_ENV) && \
+	$(VM_SSH) $(VM_HOST) "$(REMOTE_ENV) && \
 		CONDA_ENV=$(CONDA_ENV) bash -s" \
 		< infra/scripts/tests/integration-test.sh
 
@@ -516,18 +520,18 @@ gpu-test-daemon:
 # #165: daemon-created /dev/shm segments must not outlive their request. Needs a
 # table `t` with a CAGRA index `t_cagra` on the VM. Piped over stdin (bash -s).
 gpu-test-shm-residue:
-	ssh $(VM_HOST) "$(REMOTE_ENV) && bash -s" \
+	$(VM_SSH) $(VM_HOST) "$(REMOTE_ENV) && bash -s" \
 		< infra/scripts/tests/shm-residue.sh
 
 # #166 review: the SCM_RIGHTS sidecar handoff must not depend on the daemon's
 # umask. Installs a temporary UMask=077 drop-in, exercises both export modes,
 # and always removes it again. Piped over stdin (bash -s).
 gpu-test-umask:
-	ssh $(VM_HOST) "$(REMOTE_ENV) && bash -s" \
+	$(VM_SSH) $(VM_HOST) "$(REMOTE_ENV) && bash -s" \
 		< infra/scripts/tests/umask-hardened-export.sh
 
 gpu-test-objstore:
-	ssh $(VM_HOST) "$(REMOTE_ENV) && \
+	$(VM_SSH) $(VM_HOST) "$(REMOTE_ENV) && \
 		PATH=\$$PATH:/snap/bin bash -s" \
 		< infra/scripts/tests/objstore-roundtrip-e2e.sh
 
@@ -535,24 +539,24 @@ gpu-test-objstore:
 # budget (a fraction of total), not unlimited. Runs a dedicated daemon on a test
 # socket and asserts pg_stat_gpu_cache + the startup log. Piped over stdin.
 gpu-test-vram:
-	ssh $(VM_HOST) "$(REMOTE_ENV) && bash -s" \
+	$(VM_SSH) $(VM_HOST) "$(REMOTE_ENV) && bash -s" \
 		< infra/scripts/setup/vram-budget-default.sh
 
 # MAX_INDEXES soft-cap: more tenants than registry slots must work (build w/o
 # ERROR + queries auto-reload evicted indexes to GPU). Dedicated daemon with a
 # tiny --max-indexes; asserts evictions>0 and reloads>0. Piped over stdin.
 gpu-test-maxidx:
-	ssh $(VM_HOST) "$(REMOTE_ENV) && bash -s" \
+	$(VM_SSH) $(VM_HOST) "$(REMOTE_ENV) && bash -s" \
 		< infra/scripts/tests/max-indexes-scale.sh
 
 # End-to-end durability smoke (alias of gpu-e2e for naming symmetry).
 gpu-test-e2e:
-	ssh $(VM_HOST) "$(REMOTE_ENV) && bash -s" < infra/scripts/tests/e2e-smoke.sh
+	$(VM_SSH) $(VM_HOST) "$(REMOTE_ENV) && bash -s" < infra/scripts/tests/e2e-smoke.sh
 
 # Phase 3A pending-delta durability + fail-closed across a daemon restart.
 # Piped over stdin (bash -s); plain ssh, no remote TTY needed.
 gpu-test-delta-restart:
-	ssh $(VM_HOST) "$(REMOTE_ENV) && bash -s" < infra/scripts/tests/delta-restart-e2e.sh
+	$(VM_SSH) $(VM_HOST) "$(REMOTE_ENV) && bash -s" < infra/scripts/tests/delta-restart-e2e.sh
 
 # #101/#114 regression guard: ASAN heap-buffer-overflow in handle_export_adjacency
 # on export after a daemon restart. Deliberately NOT in gpu-test-all (5-10 min:
@@ -561,14 +565,14 @@ gpu-test-delta-restart:
 # placeholder path. `cd` is required here (unlike the other piped scripts, which
 # never call `make`) because the script builds+installs the ASAN daemon itself.
 gpu-test-asan-export:
-	ssh $(VM_HOST) "cd ~/pg_cuvs && $(REMOTE_ENV) && bash -s" < infra/scripts/tests/asan-export-restart.sh
+	$(VM_SSH) $(VM_HOST) "cd ~/pg_cuvs && $(REMOTE_ENV) && bash -s" < infra/scripts/tests/asan-export-restart.sh
 
 # Full ladder: unit -> regress -> isolation -> daemon faults -> e2e durability.
 gpu-test-all: gpu-verify-deployed gpu-test-unit gpu-test-regress gpu-test-isolation gpu-test-daemon \
 	gpu-test-e2e gpu-test-delta-restart
 
 gpu-server-start:
-	ssh -tt $(VM_HOST) "pg_cuvs_server \
+	$(VM_SSH) -tt $(VM_HOST) "pg_cuvs_server \
 		--socket /tmp/.s.pg_cuvs \
 		--index-dir \$$(psql -t -c 'SHOW data_directory' | tr -d ' ')/cuvs_indexes \
 		--max-vram-mb 20480 &"
@@ -577,7 +581,7 @@ gpu-server-start:
 # N/DIM/K/M forwarded to the remote `make benchmark` only when set locally.
 gpu-bench:
 	@mkdir -p design
-	ssh $(VM_HOST) "cd ~/pg_cuvs && \
+	$(VM_SSH) $(VM_HOST) "cd ~/pg_cuvs && \
 		$(REMOTE_ENV) && \
 		make benchmark $(if $(N),N=$(N)) $(if $(DIM),DIM=$(DIM)) $(if $(K),K=$(K)) $(if $(M),M=$(M)) 2>&1" \
 		| tee design/bench_$(shell date +%Y%m%d_%H%M).log
@@ -589,7 +593,7 @@ gpu-bench-1m:
 
 gpu-cohere:
 	@echo "[gpu-cohere] Launching Cohere 1M benchmark (nohup, async)"
-	ssh $(VM_HOST) "cd ~/pg_cuvs && \
+	$(VM_SSH) $(VM_HOST) "cd ~/pg_cuvs && \
 		$(REMOTE_ENV) && \
 		nohup bash bench/legacy/run_cohere.sh \
 			--n $(if $(N),$(N),1000000) \
@@ -600,17 +604,17 @@ gpu-cohere:
 	echo "  make gpu-cohere-result"
 
 gpu-cohere-log:
-	ssh $(VM_HOST) "tail -50 /tmp/cohere_bench.log"
+	$(VM_SSH) $(VM_HOST) "tail -50 /tmp/cohere_bench.log"
 
 gpu-cohere-result:
 	@N=$(if $(N),$(N),1000000); \
-	ssh $(VM_HOST) "cat ~/pg_cuvs/bench/results/cohere_N$${N}_summary.csv 2>/dev/null \
+	$(VM_SSH) $(VM_HOST) "cat ~/pg_cuvs/bench/results/cohere_N$${N}_summary.csv 2>/dev/null \
 		|| echo 'Not ready yet — check: make gpu-cohere-log'"
 
 .PHONY: gpu-cohere gpu-cohere-log gpu-cohere-result
 
 gpu-shell:
-	ssh -tt $(VM_HOST)
+	$(VM_SSH) -tt $(VM_HOST)
 
 # Report the VM's current power state and external IP (ephemeral IPs change on
 # stop/start, so the configured VM_SSH_HOST can go stale). Usage: make vm-ip
@@ -623,7 +627,7 @@ vm-ip:
 # Run ad-hoc SQL on the VM's postgres DB from stdin. For introspection and
 # Phase 3K integration checks. Usage: make gpu-sql < query.sql  (or via heredoc)
 gpu-sql:
-	ssh -o StrictHostKeyChecking=accept-new $(VM_HOST) \
+	$(VM_SSH) -o StrictHostKeyChecking=accept-new $(VM_HOST) \
 		"$(REMOTE_ENV) && \
 		psql -d $(if $(DB),$(DB),postgres) -P pager=off -A -F '|'"
 .PHONY: gpu-sql
@@ -636,7 +640,7 @@ gpu-sql:
 # One corpus size (default 1M). Override: make gpu-anbench N=5000000
 gpu-anbench:
 	@mkdir -p design/anbench
-	ssh $(VM_HOST) "cd ~/pg_cuvs && N=$(if $(N),$(N),1000000) KS=$(if $(KS),$(KS),10,100) \
+	$(VM_SSH) $(VM_HOST) "cd ~/pg_cuvs && N=$(if $(N),$(N),1000000) KS=$(if $(KS),$(KS),10,100) \
 		bash bench/legacy/anbench/run_all.sh 2>&1" \
 		| tee design/anbench/run_N$(if $(N),$(N),1000000)_$(shell date +%Y%m%d_%H%M).log
 
@@ -651,11 +655,11 @@ gpu-anbench-5m:
 # optional in aggregate.py and the /opt prefix is root-owned.
 gpu-anbench-agg:
 	@mkdir -p design/anbench
-	ssh $(VM_HOST) "cd ~/pg_cuvs && $(REMOTE_ENV) && \
+	$(VM_SSH) $(VM_HOST) "cd ~/pg_cuvs && $(REMOTE_ENV) && \
 		PY=\$$(dirname \$$CONDA_PREFIX)/cuvs_bench/bin/python && \
 		\$$PY -m pip install -q matplotlib 2>/dev/null; \
 		\$$PY bench/legacy/anbench/aggregate.py"
-	rsync -avz $(VM_HOST):~/pg_cuvs/design/anbench/ design/anbench/
+	$(VM_TRANSPORT) rsync -avz $(VM_HOST):~/pg_cuvs/design/anbench/ design/anbench/
 
 # Convenience: full cycle on the VM. Routed through gpu-deploy (#169): the old
 # form (sync build install test) rebuilt only the extension and restarted

@@ -58,7 +58,7 @@ if [ -z "$VM_SSH_HOST" ]; then
     exit 1
 fi
 
-ssh -o BatchMode=yes "$VM_SSH_HOST" "DB='$DB' bash -s" <<'REMOTE'
+"$REPO_ROOT/infra/scripts/vm-transport.sh" ssh -o BatchMode=yes "$VM_SSH_HOST" "DB='$DB' bash -s" <<'REMOTE'
 set -uo pipefail
 fail=0
 say()  { printf '[preflight] %s\n' "$*"; }
