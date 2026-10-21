@@ -1,0 +1,2 @@
+name, uuid, driver_version, compute_cap, memory.total [MiB]
+NVIDIA L40S, GPU-dfbe90f7-e400-b1f3-5400-6f9e8ad43f4f, 565.57.01, 8.9, 46068 MiB

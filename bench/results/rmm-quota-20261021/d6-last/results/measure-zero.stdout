@@ -1,0 +1,50 @@
+LAUNCH {"argv": ["env", "PGHOST=/var/run/postgresql", "/opt/miniforge3/envs/cuvs_bench/bin/python", "/home/ubuntu/index-accel-validation/rmm-production-tools-last-20261021/measurement_entry.py", "measure", "--repo", "/home/ubuntu/pg_cuvs", "--owner-file", "/home/ubuntu/index-accel-validation/owner.json", "--expected-commit", "0ff9f7c9fac4c20b8256dfc20ea3b0e604f7dd28", "--dbname", "index_accel_smoke", "--data-dir", "/home/ubuntu/data", "--index-dir", "/tmp/cuvs_indexes", "--out", "/home/ubuntu/index-accel-validation/rmm-quota-last-20261021/smoke-zero", "--n", "1000000", "--queries", "10000", "--points", "64,128", "--expect-rmm-mb", "0", "--baseline", "/home/ubuntu/index-accel-validation/results/baseline_control1", "--noise-reference", "/home/ubuntu/index-accel-validation/results/baseline-noise.json", "--enforce-noise-floor"], "cwd": "/home/ubuntu", "explicit_env": {"PGHOST": "/var/run/postgresql"}, "fixture": false, "source_pin": "0ff9f7c9fac4c20b8256dfc20ea3b0e604f7dd28", "started_utc": "2026-10-21T02:14:09.195153+00:00", "entry_sha256": "6eff974166148109e87f883f0f39bb1a86cd2868e2f37e65b083df34cfe57704", "launcher_sha256": "dabd2c7ef86f2b1f11d820d539bb32f2df0f4e0589c1d5cdbbadee419358acb5"}
+CONNECTION {"select1": 1, "rmm_pool_mb": "0", "PGHOST": "/var/run/postgresql", "cwd": "/home/ubuntu", "database_user": "ubuntu", "backend_pid": 4800, "entry_sha256": "6eff974166148109e87f883f0f39bb1a86cd2868e2f37e65b083df34cfe57704", "pg_engine_sha256": "7d5b883679913db81a70b9238a675c24bdb28bdaeeade3341a1db8f2a70591f0"}
+[
+  {
+    "k": 64,
+    "recall_at10": 0.94068,
+    "qps": 987.7927862196707,
+    "p50_ms": 1.0084285000004911,
+    "byte_identical_to_baseline": false,
+    "observed_gpu_queries": 10000,
+    "observed_gpu_errors": 0,
+    "observed_search_mode": "gpu_cagra",
+    "mean_query_jaccard": 0.9994260386672157,
+    "id_changed_queries": 24,
+    "reorder_only_queries": 0,
+    "within_gt_only_changed_queries": 0,
+    "gt_outside_involved_queries": 24,
+    "gt_hits_lost": 17,
+    "gt_hits_gained": 10,
+    "recall_at10_delta_to_control_mean": -1.1102230246251565e-16,
+    "recall_at10_control_span": 0.00010999999999994348,
+    "recall_at10_within_control_span": true,
+    "p50_ms_delta_to_control_mean": 0.040096999811112255,
+    "p50_ms_control_span": 0.003570500211935723,
+    "p50_ms_within_control_span": false
+  },
+  {
+    "k": 128,
+    "recall_at10": 0.97839,
+    "qps": 937.6545523690628,
+    "p50_ms": 1.0463434999934407,
+    "byte_identical_to_baseline": false,
+    "observed_gpu_queries": 10000,
+    "observed_gpu_errors": 0,
+    "observed_search_mode": "gpu_cagra",
+    "mean_query_jaccard": 0.99929393939394,
+    "id_changed_queries": 39,
+    "reorder_only_queries": 1,
+    "within_gt_only_changed_queries": 1,
+    "gt_outside_involved_queries": 37,
+    "gt_hits_lost": 21,
+    "gt_hits_gained": 17,
+    "recall_at10_delta_to_control_mean": -5.6666666666704835e-05,
+    "recall_at10_control_span": 9.00000000000345e-05,
+    "recall_at10_within_control_span": true,
+    "p50_ms_delta_to_control_mean": 0.046796333260582856,
+    "p50_ms_control_span": 0.005279499873722671,
+    "p50_ms_within_control_span": false
+  }
+]

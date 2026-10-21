@@ -44,3 +44,44 @@ native/fixture argv 차이, 실제 접속과 SQL/status 횟수가 있다. runner
 이번은 세 번째이자 마지막 재개1회다. 네 번째 재개나 새 자원은 없다. 성공하면 원
 native gate와 PR을 연결한다. 마지막 live창이 실패하면 native 검증을 보류로 기록한
 Draft PR을 열며, CPU/shim 동작 검증과 CUDA 부분 증거를 구분한다.
+
+## 마지막 실제 창 결과: native gate failed
+
+실행 입력 커밋 `6967772`, 앱 pin `0ff9f7c`. 실제 VM의 SELECT1+SHOW가 통과했고,
+운영과 로컬의 최종 entry SHA `6eff974166148109e87f883f0f39bb1a86cd2868e2f37e65b083df34cfe57704`가 같다.
+launcher/실제 PgEngine byte도 로컬 선행 검증과 일치한다. CUDA build/co-deploy,
+preflight와 RMM0의 실제 로드 byte 결속이 통과했다.
+
+L40S(sm89), driver565.57.01, wiki1M의 기존 gd32/igd128/ivf_pq graph,
+private serial SQL id+distance, supplied top10 GT, 각점10K/N=1의 결과다.
+기존 고정 restart control N=3과 비교했다.
+
+| k | 현재 recall | recall gate | 현재 p50 ms | control mean ms | 허용 absolute delta ms | p50 gate |
+|---|---:|---|---:|---:|---:|---|
+| 64 | 0.940680 | PASS | 1.008429 | 0.968332 | 0.003571 | FAIL |
+| 128 | 0.978390 | PASS | 1.046343 | 0.999547 | 0.005279 | FAIL |
+
+측정 GPU query는 각10,000, error0, mode gpu_cagra였다. recall은 기준 안이지만
+p50은 모두 범위 밖이어서 원 gate가 실패했다. 원 threshold를 넓히거나 retry하지 않았다.
+이 관측은 source나 환경에 대한 원인 규명이 아니다. 현 GPU UUID 등 실제 inventory는
+`results/remote/gpu.csv`에 있으며 owner metadata의 과거 provisioning inventory와 구분한다.
+
+default512×50과 quota 검사는 실행하지 않았다. **완료된 동작 검증 범위는 CPU/shim**이며,
+이 native 부분 결과를 pool-on/성능/전체 native PASS로 표시하지 않는다. RMM live 검증은
+보류이고 Draft PR로 닫는다. 그리드 fallback은 main 담당의 `fded8ce`, pool512/max미설정이며
+이 pin0ff/quota50 후보를 fallback으로 사용한다고 주장하지 않는다.
+
+### 종료와 보존
+
+재개69.511초, 준비64.293초, 실패까지검증62.178초, 정리27.186초, STOP30.692초였다.
+실패 단계는 다음 cleanup 시작 monotonic 값으로 구간을 산출했다. 전체 **253.861초**로
+모든 상한 안이다. 정상 STOP 접수와 별개로 공식 `STOPPED`를
+**2026-10-21 02:16:01.841620Z**에 확인했다. 원 graph와 지속 snapshot SHA는 전후 같고,
+PG/daemon inactive·Result=success·ExecMainStatus0, GPU process0, old override 복원을 확인했다.
+참조요금으로 계산한 약$0.1227은 실제 청구액이나 provider 종료 보장이 아니다.
+
+이번 재개1회, 이전 두 실패 창과 합계3회이며 네 번째 재개는0회다. 새 VM·보호 Crusoe
+SSH·다른 레인 접근·reset/delete도0회다. `results/`의 첫 오류·실제 metrics/IDs/distances,
+source pin과 binary binding·정리·종료 원문을 보존했다. 타 VM이 들어 있는 inventory는
+대상 row만 공개하고 전체 원문은 private `.omc`에 남겼다. 변환 및 원문 SHA는
+`results/private-export-map.json`, 공개 파일 무결성은 `SHA256SUMS.json`에 기록했다.
