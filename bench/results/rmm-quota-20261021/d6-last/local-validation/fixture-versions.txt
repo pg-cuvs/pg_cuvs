@@ -1,0 +1,4 @@
+0ff9f7c9fac4c20b8256dfc20ea3b0e604f7dd28
+PostgreSQL 16.15 on aarch64-unknown-linux-musl, compiled by gcc (Alpine 15.2.0) 15.2.0, 64-bit
+Python 3.14.8
+aarch64

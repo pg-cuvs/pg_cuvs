@@ -1,0 +1,10 @@
+{
+  "PGHOST": "/var/run/postgresql",
+  "backend_pid": 308,
+  "cwd": "/home/ubuntu",
+  "database_user": "postgres",
+  "entry_sha256": "6eff974166148109e87f883f0f39bb1a86cd2868e2f37e65b083df34cfe57704",
+  "pg_engine_sha256": "7d5b883679913db81a70b9238a675c24bdb28bdaeeade3341a1db8f2a70591f0",
+  "rmm_pool_mb": "0",
+  "select1": 1
+}

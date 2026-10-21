@@ -1,0 +1,14 @@
+gcc -O2 -g -Wall -Wextra -I./src -I/include -I/include/rapids -std=gnu11 -D_POSIX_C_SOURCE=200809L  -DPGCUVS_CPU_SHIM -c src/pg_cuvs_server.c -o src/pg_cuvs_server.o
+gcc -O2 -g -Wall -Wextra -I./src -I/include -I/include/rapids -std=gnu11 -D_POSIX_C_SOURCE=200809L  -DPGCUVS_CPU_SHIM -c src/cuvs_ipc.c -o src/cuvs_ipc_server.o
+src/pg_cuvs_server.c: In function 'refresh_delta_cache':
+src/pg_cuvs_server.c:939:21: warning: unused variable 'base_crc' [-Wunused-variable]
+  939 |     uint32_t        base_crc;
+      |                     ^~~~~~~~
+src/pg_cuvs_server.c: At top level:
+src/pg_cuvs_server.c:711:1: warning: 'is_gpu_allowed' defined but not used [-Wunused-function]
+  711 | is_gpu_allowed(int device_id)
+      | ^~~~~~~~~~~~~~
+gcc -O2 -g -Wall -Wextra -I./src -I/include -I/include/rapids -std=gnu11 -D_POSIX_C_SOURCE=200809L  -DPGCUVS_CPU_SHIM -c src/cuvs_util.c -o src/cuvs_util_server.o
+gcc -O2 -g -Wall -Wextra -I./src -I/include -I/include/rapids -std=gnu11 -D_POSIX_C_SOURCE=200809L  -DPGCUVS_CPU_SHIM -c src/cuvs_objstore.c -o src/cuvs_objstore_server.o
+gcc -O2 -g -Wall -Wextra -I./src -I/include -I/include/rapids -std=gnu11 -D_POSIX_C_SOURCE=200809L  -DPGCUVS_CPU_SHIM -c src/cuvs_build_corpus.c -o src/cuvs_build_corpus_server.o
+g++ -o pg_cuvs_server src/pg_cuvs_server.o src/cuvs_ipc_server.o src/cuvs_util_server.o src/cuvs_objstore_server.o src/cuvs_build_corpus_server.o src/cuvs_wrapper_shim_cpu.o -lm -lstdc++ -lpthread -lrt -lcurl -lssl -lcrypto 
