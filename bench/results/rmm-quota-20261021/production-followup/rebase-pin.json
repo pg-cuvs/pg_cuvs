@@ -1,0 +1,8 @@
+{
+  "old_rmm": "83f11cf",
+  "rebase_base": "d851f5c2d8faeda2c6ae5b56d1d3e67feb03873d",
+  "final_source_pin": "0ff9f7c9fac4c20b8256dfc20ea3b0e604f7dd28",
+  "guc_merge": "d851f5c2d8faeda2c6ae5b56d1d3e67feb03873d",
+  "cpu_combined": "mac289+27; Linux shim build/install; SQL3/isolation6 PASS",
+  "preserved_old_code_ref": "refs/archive/index-rmm-pre-rebase-83f11cf"
+}

@@ -1,0 +1,18 @@
+2026-10-21 00:36:45.718 UTC [286] LOG:  starting PostgreSQL 16.15 on aarch64-unknown-linux-musl, compiled by gcc (Alpine 15.2.0) 15.2.0, 64-bit
+2026-10-21 00:36:45.719 UTC [286] LOG:  listening on Unix socket "/tmp/.s.PGSQL.5432"
+2026-10-21 00:36:45.726 UTC [289] LOG:  database system was shut down at 2026-10-21 00:36:44 UTC
+2026-10-21 00:36:45.729 UTC [286] LOG:  database system is ready to accept connections
+2026-10-21 00:36:46.822 UTC [298] ERROR:  database "postgres" already exists
+2026-10-21 00:36:46.822 UTC [298] STATEMENT:  CREATE DATABASE postgres;
+2026-10-21 00:37:02.585 UTC [323] ERROR:  invalid value for parameter "cuvs.itopk_size": 33
+2026-10-21 00:37:02.585 UTC [323] DETAIL:  cuvs.itopk_size must be 0 or a multiple of 32.
+2026-10-21 00:37:02.585 UTC [323] STATEMENT:  SET cuvs.itopk_size = 33;
+2026-10-21 00:37:02.585 UTC [323] ERROR:  -1 is outside the valid range for parameter "cuvs.search_width" (0 .. 2147483647)
+2026-10-21 00:37:02.585 UTC [323] STATEMENT:  SET cuvs.search_width = -1;
+2026-10-21 00:37:02.610 UTC [332] ERROR:  parameter "cuvs.rmm_pool_mb" cannot be changed
+2026-10-21 00:37:02.610 UTC [332] STATEMENT:  SET cuvs.rmm_pool_mb = 1024;
+2026-10-21 00:37:02.610 UTC [332] ERROR:  parameter "cuvs.rmm_pool_max_percent" cannot be changed
+2026-10-21 00:37:02.610 UTC [332] STATEMENT:  SET cuvs.rmm_pool_max_percent = 100;
+2026-10-21 00:37:02.610 UTC [332] ERROR:  parameter "cuvs.rmm_pool_status" cannot be changed
+2026-10-21 00:37:02.610 UTC [332] STATEMENT:  SET cuvs.rmm_pool_status = '{}';
+2026-10-21 00:41:45.828 UTC [287] LOG:  checkpoint starting: time
