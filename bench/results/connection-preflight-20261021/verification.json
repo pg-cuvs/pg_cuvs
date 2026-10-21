@@ -1,0 +1,79 @@
+{
+  "source_commit": "b9f641b14692586cb3d0cfaee189fc8ff57e6f1c",
+  "source_sha256": {
+    "pg_engine.py": "3e095be3a5bd5d4051bd13816d8f06a85e31831bd71797038094974c84a81b97",
+    "backend.py": "a76328ac466251a2a4f3770e8931ea7f255ed4549853bb5b353624eb29e3b64e",
+    "run_pg_cuvsbench.py": "7e212f8cff865f61414207503e9595e5fb7802c9215c71f9b962398f76223071",
+    "build_time_arm.py": "70478e6054c43a988545f13bf99f3f07d850b08aa3315c9e45ed95d0bfef0ad1",
+    "same_graph_delta.py": "4341f4d12f11316921e9b5991b9974c69162db2e935747ada4ac85846e823cba"
+  },
+  "related_python_tests": {
+    "passed": 73,
+    "failed": 0,
+    "skipped": 0
+  },
+  "real_PG_fixture": {
+    "version": "16.4",
+    "platform": "macOS arm64",
+    "encoding": "UTF8",
+    "extension": "pg_cuvs CPU shim",
+    "search_algorithm": "pgvector_hnsw",
+    "rows": 256,
+    "dim": 16,
+    "queries_per_point": 8,
+    "points": 7,
+    "result_rows": 7,
+    "measured_queries": 56,
+    "warmup_queries": 56,
+    "SQL_search_statements": 112,
+    "SHOW_preload_statements": 3,
+    "SELECT_resolved_schemas_statements": 2,
+    "mocked_SQL": false,
+    "whole_CLI_exit": 0,
+    "connection_preflight_enabled": true
+  },
+  "cases": {
+    "positive": {
+      "exit": 0,
+      "result_rows": 7,
+      "measured_queries": 56
+    },
+    "missing_PGHOST": {
+      "exit": 1,
+      "reason": "explicit PGHOST required"
+    },
+    "implicit_GPU_missing_PGHOST": {
+      "exit": 1,
+      "reason": "GPU algo enables preflight without an opt-in flag"
+    },
+    "bad_search_path": {
+      "exit": 1,
+      "reason": "resolved schemas are not public"
+    },
+    "host_override": {
+      "exit": 1,
+      "reason": "different socket refuses connection or differs from PGHOST"
+    },
+    "missing_preload": {
+      "exit": 1,
+      "reason": "pg_cuvs must be preloaded"
+    }
+  },
+  "cleanup": {
+    "PG_stop_exit": 0,
+    "postmaster_pid_present": false,
+    "GPU_daemon_started": false
+  },
+  "GPU_validation": false,
+  "native_RMM_gate_reopened": false,
+  "raw_log_sha256": "a818dafb8fedda58e9d1f1dd95a31b6826f018276ca0b14baebf84e484f3d408",
+  "fixture_driver_sha256": "41f35443867b3feb3966414caa80ad6ab3c41d7979c0a2e6ae5db319a091153d",
+  "log_count_method": "final two PostgreSQL startup segments only, including prepared execute lines; original consumer counters used accumulated log and statement-only counts",
+  "limits": [
+    "Positive CLI uses CPU pgvector with the same actual PgEngine connection preflight; no GPU performance or quality claim.",
+    "GPU algo automatic opt-in tested through the actual CLI with missing PGHOST; CUDA/native GPU execution not repeated.",
+    "Default SQL_ASCII local fixture failed; repeated with UTF8 matching benchmark setup.",
+    "Docker store I/O and PG17 API/Linux-daemon portability failures were retained; production C/CUDA sources unchanged.",
+    "Raw SQL log, fixture driver, input arrays and private build tree remain local; metadata preservation is not a raw backup."
+  ]
+}
