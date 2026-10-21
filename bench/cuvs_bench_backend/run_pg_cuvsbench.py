@@ -379,7 +379,8 @@ def run_phase2(args, writer, fout, latency_rows):
     q_lat = queries_all[:args.max_queries]
     conc_ns = [int(x) for x in str(args.conc_n).split(",") if x.strip()]
 
-    eng = PgEngine(dbname=args.dbname, index_dir=args.index_dir)
+    eng = PgEngine(dbname=args.dbname, index_dir=args.index_dir,
+                   require_gpu_environment=any(a.startswith("pgcuvs_") for a in pareto))
     with eng.conn.cursor() as cur:
         cur.execute("SHOW max_connections")
         max_conn = cur.fetchone()[0]
