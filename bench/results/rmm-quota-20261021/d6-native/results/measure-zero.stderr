@@ -1,0 +1,13 @@
+Traceback (most recent call last):
+  File "/home/ubuntu/index-accel-validation/rmm-production-tools-d6-20261021/feature_gpu_check_smoke_frozen.py", line 312, in <module>
+    run()
+  File "/home/ubuntu/index-accel-validation/rmm-production-tools-d6-20261021/feature_gpu_check_smoke_frozen.py", line 118, in run
+    eng = PgEngine(dbname=args.dbname, index_dir=args.index_dir)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ubuntu/pg_cuvs/bench/cuvs_bench_backend/pg_engine.py", line 212, in __init__
+    self.conn = psycopg.connect(dbname=dbname, autocommit=True)
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/miniforge3/envs/cuvs_bench/lib/python3.12/site-packages/psycopg/connection.py", line 122, in connect
+    raise last_ex.with_traceback(None)
+psycopg.OperationalError: connection is bad: connection to server on socket "/tmp/.s.PGSQL.5432" failed: No such file or directory
+	Is the server running locally and accepting connections on that socket?

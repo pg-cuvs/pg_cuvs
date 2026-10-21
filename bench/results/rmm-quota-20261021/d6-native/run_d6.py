@@ -157,7 +157,7 @@ def main():
             run(p, 'preflight-'+arm, ['bash',str(REPO/'infra/scripts/gpu-preflight.sh'),'index_accel_smoke'],25,env=env)
             remote(p, 'status-'+arm, ['/opt/miniforge3/envs/cuvs_bench/bin/python',TOOLS+'/status_and_binding.py',
                                      '/home/ubuntu/pg_cuvs',OUT+'/status-'+arm+'.json',str(initial),str(percent)],25)
-            args = ['/opt/miniforge3/envs/cuvs_bench/bin/python',TOOLS+'/feature_gpu_check_smoke_frozen.py',
+            args = ['env','PGHOST=/var/run/postgresql','/opt/miniforge3/envs/cuvs_bench/bin/python',TOOLS+'/feature_gpu_check_smoke_frozen.py',
                     'measure','--repo','/home/ubuntu/pg_cuvs','--owner-file',ROOT+'/owner.json',
                     '--expected-commit',PIN,'--data-dir','/home/ubuntu/data','--out',OUT+'/smoke-'+arm,
                     '--baseline',ROOT+'/results/baseline_control1','--noise-reference',ROOT+'/results/baseline-noise.json',

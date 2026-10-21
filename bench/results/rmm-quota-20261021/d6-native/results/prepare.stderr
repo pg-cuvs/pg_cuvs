@@ -1,0 +1,15 @@
+From https://github.com/pg-cuvs/pg_cuvs
+ * branch            ysys143/index-rmm-pool -> FETCH_HEAD
+ + fded8ce...1022996 ysys143/index-rmm-pool -> origin/ysys143/index-rmm-pool  (forced update)
+Warning: you are leaving 2 commits behind, not connected to
+any of your branches:
+
+  fded8ce fix(daemon): link RAPIDS logger for RMM pool resources
+  58e0786 feat(daemon): add opt-in RMM pool initialization and applied-setting status
+
+If you want to keep them by creating a new branch, this may be a good time
+to do so with:
+
+ git branch <new-branch-name> fded8ce
+
+HEAD is now at 0ff9f7c feat(memory): default RMM pool to 512 MiB with a 50 percent quota

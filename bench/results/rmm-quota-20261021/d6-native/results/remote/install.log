@@ -1,0 +1,17 @@
+/bin/mkdir -p '/usr/lib/postgresql/16/lib'
+/bin/mkdir -p '/usr/share/postgresql/16/extension'
+/bin/mkdir -p '/usr/share/postgresql/16/extension'
+/usr/bin/install -c -m 755  pg_cuvs.so '/usr/lib/postgresql/16/lib/pg_cuvs.so'
+/usr/bin/install -c -m 644 .//pg_cuvs.control '/usr/share/postgresql/16/extension/'
+/usr/bin/install -c -m 644 .//sql/pg_cuvs--0.1.0.sql .//sql/pg_cuvs--0.1.0--0.2.0.sql .//sql/pg_cuvs--0.2.0.sql .//sql/pg_cuvs--0.2.0--0.3.0.sql .//sql/pg_cuvs--0.3.0.sql .//sql/pg_cuvs--0.3.0--0.4.0.sql .//sql/pg_cuvs--0.4.0.sql .//sql/pg_cuvs--0.4.0--0.5.0.sql .//sql/pg_cuvs--0.5.0.sql .//sql/pg_cuvs--0.5.0--0.6.0.sql .//sql/pg_cuvs--0.6.0.sql .//sql/pg_cuvs--0.6.0--0.7.0.sql .//sql/pg_cuvs--0.7.0.sql .//sql/pg_cuvs--0.7.0--0.8.0.sql .//sql/pg_cuvs--0.8.0.sql  '/usr/share/postgresql/16/extension/'
+/bin/mkdir -p '/usr/lib/postgresql/16/lib/bitcode/pg_cuvs'
+/bin/mkdir -p '/usr/lib/postgresql/16/lib/bitcode'/pg_cuvs/src/
+/usr/bin/install -c -m 644 src/pg_cuvs.bc '/usr/lib/postgresql/16/lib/bitcode'/pg_cuvs/src/
+/usr/bin/install -c -m 644 src/cuvs_ipc.bc '/usr/lib/postgresql/16/lib/bitcode'/pg_cuvs/src/
+/usr/bin/install -c -m 644 src/cuvs_util.bc '/usr/lib/postgresql/16/lib/bitcode'/pg_cuvs/src/
+/usr/bin/install -c -m 644 src/cuvs_wrapper.bc '/usr/lib/postgresql/16/lib/bitcode'/pg_cuvs/src/
+/usr/bin/install -c -m 644 src/hnsw_export.bc '/usr/lib/postgresql/16/lib/bitcode'/pg_cuvs/src/
+/usr/bin/install -c -m 644 src/cuvs_build_corpus.bc '/usr/lib/postgresql/16/lib/bitcode'/pg_cuvs/src/
+/usr/bin/install -c -m 644 src/pg_cuvs_compaction.bc '/usr/lib/postgresql/16/lib/bitcode'/pg_cuvs/src/
+cd '/usr/lib/postgresql/16/lib/bitcode' && /usr/lib/llvm-15/bin/llvm-lto -thinlto -thinlto-action=thinlink -o pg_cuvs.index.bc pg_cuvs/src/pg_cuvs.bc pg_cuvs/src/cuvs_ipc.bc pg_cuvs/src/cuvs_util.bc pg_cuvs/src/cuvs_wrapper.bc pg_cuvs/src/hnsw_export.bc pg_cuvs/src/cuvs_build_corpus.bc pg_cuvs/src/pg_cuvs_compaction.bc
+install -m 755 pg_cuvs_server /usr/lib/postgresql/16/bin/

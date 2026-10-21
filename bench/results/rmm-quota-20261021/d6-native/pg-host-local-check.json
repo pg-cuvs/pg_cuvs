@@ -1,0 +1,15 @@
+{
+  "passed": true,
+  "executed_runner_commit": "1022996",
+  "executed_runner_sha256": "668a1d485fa7b4d1a20697770d6d884080a89038983626b7b06686092eeb1c9e",
+  "repaired_runner_sha256": "3fee0123b6a8b0c734a3f91219472e01d0d444d404a86724453610a0ab3b86ca",
+  "actual_runner_env_prefix": [
+    "env",
+    "PGHOST=/var/run/postgresql"
+  ],
+  "overrides_wrong_parent_PGHOST": true,
+  "all_other_runner_AST_including_quality_gates_unchanged": true,
+  "remote_calls": 0,
+  "VM_resumes": 0,
+  "database_connection_after_fix_tested": false
+}

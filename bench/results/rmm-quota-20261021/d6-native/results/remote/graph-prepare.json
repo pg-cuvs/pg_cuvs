@@ -1,0 +1,26 @@
+{
+  "/home/ubuntu/index-accel-validation/graph-snapshot/16390_1016847.cagra": {
+    "bytes": 3200001716,
+    "sha256": "cc2a2aa515089309c1d528e4be321901a11f778458819c873d75326e2642f547"
+  },
+  "/tmp/cuvs_indexes/16390_1016847.cagra": {
+    "bytes": 3200001716,
+    "sha256": "cc2a2aa515089309c1d528e4be321901a11f778458819c873d75326e2642f547"
+  },
+  "/home/ubuntu/index-accel-validation/graph-snapshot/16390_1016847.tids": {
+    "bytes": 8000032,
+    "sha256": "ac8047f1ec2f0f63596d433172013323826eb3ea3effab077fbe54d96f9e415e"
+  },
+  "/tmp/cuvs_indexes/16390_1016847.tids": {
+    "bytes": 8000032,
+    "sha256": "ac8047f1ec2f0f63596d433172013323826eb3ea3effab077fbe54d96f9e415e"
+  },
+  "/home/ubuntu/index-accel-validation/graph-snapshot/16390_1016847.vectors": {
+    "bytes": 3072000040,
+    "sha256": "16a0220e7bf2863b8aeab18a9404890b25dd63c066b7db96e3b47335db994317"
+  },
+  "/tmp/cuvs_indexes/16390_1016847.vectors": {
+    "bytes": 3072000040,
+    "sha256": "16a0220e7bf2863b8aeab18a9404890b25dd63c066b7db96e3b47335db994317"
+  }
+}

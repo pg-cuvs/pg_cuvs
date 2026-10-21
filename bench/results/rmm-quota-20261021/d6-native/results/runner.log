@@ -1,0 +1,312 @@
+2026-10-21T01:34:23.089547+00:00 phase resume
+2026-10-21T01:34:23.089941+00:00 before
+2026-10-21T01:34:29.776187+00:00 vm-start
+2026-10-21T01:34:37.555460+00:00 boot-00
+2026-10-21T01:34:46.754544+00:00 boot-01
+2026-10-21T01:34:59.146045+00:00 boot-02
+2026-10-21T01:35:07.471311+00:00 ssh-refresh
+2026-10-21T01:35:41.533954+00:00 phase prepare
+2026-10-21T01:35:41.534313+00:00 tools-mkdir
+2026-10-21T01:35:42.045204+00:00 tools-copy
+2026-10-21T01:35:49.888740+00:00 prepare
+2026-10-21T01:36:53.095619+00:00 phase verify
+2026-10-21T01:36:53.095826+00:00 zero
+2026-10-21T01:36:58.468173+00:00 preflight-zero
+2026-10-21T01:37:00.157139+00:00 status-zero
+2026-10-21T01:37:02.318131+00:00 measure-zero
+2026-10-21T01:37:03.312402+00:00 phase cleanup
+2026-10-21T01:37:03.313018+00:00 cleanup
+2026-10-21T01:37:27.451177+00:00 evidence-copy
+2026-10-21T01:37:29.704669+00:00 phase stop
+2026-10-21T01:37:29.704863+00:00 vm-stop
+2026-10-21T01:37:36.898593+00:00 stop-observation-00
+2026-10-21T01:37:46.385230+00:00 stop-observation-01
+{
+  "task": "980c948eac3a4d77",
+  "source_pin": "0ff9f7c9fac4c20b8256dfc20ea3b0e604f7dd28",
+  "vm_name": "pg-cuvs-index-accel-20261020",
+  "vm_id": "v6nc08sjs",
+  "total_seconds": 1800,
+  "phase_caps": {
+    "resume": 180,
+    "prepare": 260,
+    "verify": 635,
+    "cleanup": 90,
+    "stop": 480
+  },
+  "future_reservation": {
+    "resume": 570,
+    "prepare": 570,
+    "verify": 570,
+    "cleanup": 480,
+    "stop": 0
+  },
+  "commands": [
+    {
+      "phase": "resume",
+      "label": "before",
+      "started_utc": "2026-10-21T01:34:23.089937+00:00",
+      "timeout": 40,
+      "elapsed_at_admission": 0.00040512485429644585,
+      "exit": 0,
+      "seconds": 6.684311666991562,
+      "finished_utc": "2026-10-21T01:34:29.774112+00:00"
+    },
+    {
+      "phase": "resume",
+      "label": "vm-start",
+      "started_utc": "2026-10-21T01:34:29.776180+00:00",
+      "timeout": 60,
+      "elapsed_at_admission": 6.686811124905944,
+      "exit": 0,
+      "seconds": 7.777728874934837,
+      "finished_utc": "2026-10-21T01:34:37.553753+00:00"
+    },
+    {
+      "phase": "resume",
+      "label": "boot-00",
+      "started_utc": "2026-10-21T01:34:37.555445+00:00",
+      "timeout": 40,
+      "elapsed_at_admission": 14.466264416929334,
+      "exit": 0,
+      "seconds": 4.19251333293505,
+      "finished_utc": "2026-10-21T01:34:41.747951+00:00"
+    },
+    {
+      "phase": "resume",
+      "label": "boot-01",
+      "started_utc": "2026-10-21T01:34:46.754490+00:00",
+      "timeout": 40,
+      "elapsed_at_admission": 23.66550916689448,
+      "exit": 0,
+      "seconds": 7.385544124990702,
+      "finished_utc": "2026-10-21T01:34:54.139867+00:00"
+    },
+    {
+      "phase": "resume",
+      "label": "boot-02",
+      "started_utc": "2026-10-21T01:34:59.145993+00:00",
+      "timeout": 40,
+      "elapsed_at_admission": 36.05732254195027,
+      "exit": 0,
+      "seconds": 8.32283216691576,
+      "finished_utc": "2026-10-21T01:35:07.468687+00:00"
+    },
+    {
+      "phase": "resume",
+      "label": "ssh-refresh",
+      "started_utc": "2026-10-21T01:35:07.471302+00:00",
+      "timeout": 40,
+      "elapsed_at_admission": 44.38285225001164,
+      "exit": 0,
+      "seconds": 31.956065749982372,
+      "finished_utc": "2026-10-21T01:35:39.426707+00:00"
+    },
+    {
+      "phase": "prepare",
+      "label": "tools-mkdir",
+      "started_utc": "2026-10-21T01:35:41.534306+00:00",
+      "timeout": 15,
+      "elapsed_at_admission": 78.4466866669245,
+      "exit": 0,
+      "seconds": 0.5085714580491185,
+      "finished_utc": "2026-10-21T01:35:42.042991+00:00"
+    },
+    {
+      "phase": "prepare",
+      "label": "tools-copy",
+      "started_utc": "2026-10-21T01:35:42.045190+00:00",
+      "timeout": 25,
+      "elapsed_at_admission": 78.9575821668841,
+      "exit": 0,
+      "seconds": 7.841958042001352,
+      "finished_utc": "2026-10-21T01:35:49.887037+00:00"
+    },
+    {
+      "phase": "prepare",
+      "label": "prepare",
+      "started_utc": "2026-10-21T01:35:49.888723+00:00",
+      "timeout": 251.64499845798127,
+      "elapsed_at_admission": 86.80130704189651,
+      "exit": 0,
+      "seconds": 63.20673658302985,
+      "finished_utc": "2026-10-21T01:36:53.094016+00:00"
+    },
+    {
+      "phase": "verify",
+      "label": "zero",
+      "started_utc": "2026-10-21T01:36:53.095823+00:00",
+      "timeout": 75,
+      "elapsed_at_admission": 150.0099489169661,
+      "exit": 0,
+      "seconds": 5.370849374914542,
+      "finished_utc": "2026-10-21T01:36:58.466559+00:00"
+    },
+    {
+      "phase": "verify",
+      "label": "preflight-zero",
+      "started_utc": "2026-10-21T01:36:58.468160+00:00",
+      "timeout": 25,
+      "elapsed_at_admission": 155.38241554191336,
+      "exit": 0,
+      "seconds": 1.6881079580634832,
+      "finished_utc": "2026-10-21T01:37:00.156272+00:00"
+    },
+    {
+      "phase": "verify",
+      "label": "status-zero",
+      "started_utc": "2026-10-21T01:37:00.157131+00:00",
+      "timeout": 25,
+      "elapsed_at_admission": 157.07142849988304,
+      "exit": 0,
+      "seconds": 2.158407875103876,
+      "finished_utc": "2026-10-21T01:37:02.315658+00:00"
+    },
+    {
+      "phase": "verify",
+      "label": "measure-zero",
+      "started_utc": "2026-10-21T01:37:02.318109+00:00",
+      "timeout": 120,
+      "elapsed_at_admission": 159.2324569169432,
+      "exit": 1,
+      "seconds": 0.9900591250043362,
+      "finished_utc": "2026-10-21T01:37:03.308159+00:00"
+    },
+    {
+      "phase": "cleanup",
+      "label": "cleanup",
+      "started_utc": "2026-10-21T01:37:03.313010+00:00",
+      "timeout": 55,
+      "elapsed_at_admission": 160.22738483385183,
+      "exit": 0,
+      "seconds": 24.1329568750225,
+      "finished_utc": "2026-10-21T01:37:27.445461+00:00"
+    },
+    {
+      "phase": "cleanup",
+      "label": "evidence-copy",
+      "started_utc": "2026-10-21T01:37:27.451166+00:00",
+      "timeout": 35,
+      "elapsed_at_admission": 184.3661284998525,
+      "exit": 0,
+      "seconds": 2.252694125054404,
+      "finished_utc": "2026-10-21T01:37:29.703826+00:00"
+    },
+    {
+      "phase": "stop",
+      "label": "vm-stop",
+      "started_utc": "2026-10-21T01:37:29.704861+00:00",
+      "timeout": 45,
+      "elapsed_at_admission": 186.61988070886582,
+      "exit": 0,
+      "seconds": 7.191944000078365,
+      "finished_utc": "2026-10-21T01:37:36.896739+00:00"
+    },
+    {
+      "phase": "stop",
+      "label": "stop-observation-00",
+      "started_utc": "2026-10-21T01:37:36.898585+00:00",
+      "timeout": 40,
+      "elapsed_at_admission": 193.81377904186957,
+      "exit": 0,
+      "seconds": 4.478558500064537,
+      "finished_utc": "2026-10-21T01:37:41.377159+00:00"
+    },
+    {
+      "phase": "stop",
+      "label": "stop-observation-01",
+      "started_utc": "2026-10-21T01:37:46.385208+00:00",
+      "timeout": 40,
+      "elapsed_at_admission": 203.3006262090057,
+      "exit": 0,
+      "seconds": 5.159677540883422,
+      "finished_utc": "2026-10-21T01:37:51.544784+00:00"
+    }
+  ],
+  "phases": {
+    "resume": {
+      "started_utc": "2026-10-21T01:34:23.089542+00:00",
+      "started_elapsed": 5.00003807246685e-06,
+      "deadline_elapsed": 180.00000500003807,
+      "seconds": 78.44588912487961,
+      "finished_utc": "2026-10-21T01:35:41.533526+00:00"
+    },
+    "prepare": {
+      "started_utc": "2026-10-21T01:35:41.533944+00:00",
+      "started_elapsed": 78.44630129192956,
+      "deadline_elapsed": 338.44630129192956,
+      "seconds": 71.56322187487967,
+      "finished_utc": "2026-10-21T01:36:53.095399+00:00"
+    },
+    "verify": {
+      "started_utc": "2026-10-21T01:36:53.095615+00:00",
+      "started_elapsed": 150.0097307919059,
+      "deadline_elapsed": 785.0097307919059
+    },
+    "cleanup": {
+      "started_utc": "2026-10-21T01:37:03.312391+00:00",
+      "started_elapsed": 160.22676091687754,
+      "deadline_elapsed": 250.22676091687754,
+      "seconds": 26.392593583092093,
+      "finished_utc": "2026-10-21T01:37:29.704336+00:00"
+    },
+    "stop": {
+      "started_utc": "2026-10-21T01:37:29.704666+00:00",
+      "started_elapsed": 186.61968108383007,
+      "deadline_elapsed": 666.6196810838301,
+      "seconds": 21.84362387517467,
+      "finished_utc": "2026-10-21T01:37:51.547755+00:00"
+    }
+  },
+  "first_error": {
+    "scope": "native",
+    "type": "RuntimeError",
+    "message": "measure-zero exited 1: Traceback (most recent call last):\n  File \"/home/ubuntu/index-accel-validation/rmm-production-tools-d6-20261021/feature_gpu_check_smoke_frozen.py\", line 312, in <module>\n    run()\n  File \"/home/ubuntu/index-accel-validation/rmm-production-tools-d6-20261021/feature_gpu_check_smoke_frozen.py\", line 118, in run\n    eng = PgEngine(dbname=args.dbname, index_dir=args.index_dir)\n          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/ubuntu/pg_cuvs/bench/cuvs_bench_backend/pg_engine.py\", line 212, in __init__\n    self.conn = psycopg.connect(dbname=dbname, autocommit=True)\n                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/opt/miniforge3/envs/cuvs_bench/lib/python3.12/site-packages/psycopg/connection.py\", line 122, in connect\n    raise last_ex.with_traceback(None)\npsycopg.OperationalError: connection is bad: connection to server on socket \"/tmp/.s.PGSQL.5432\" failed: No such file or directory\n\tIs the server running locally and accepting connections on that socket?\n",
+    "at_utc": "2026-10-21T01:37:03.309052+00:00",
+    "traceback": "Traceback (most recent call last):\n  File \"/Users/jaesolshin/orca/workspaces/pg_cuvs/index-rmm-pool/bench/results/rmm-quota-20261021/d6-native/run_d6.py\", line 167, in main\n    remote(p, 'measure-'+arm, args, 120)\n    ~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/Users/jaesolshin/orca/workspaces/pg_cuvs/index-rmm-pool/bench/results/rmm-quota-20261021/d6-native/run_d6.py\", line 103, in remote\n    return run(p, label, argv, allowed)\n  File \"/Users/jaesolshin/orca/workspaces/pg_cuvs/index-rmm-pool/bench/results/rmm-quota-20261021/d6-native/run_d6.py\", line 78, in run\n    raise RuntimeError(f'{label} exited {result.returncode}: {tail}')\nRuntimeError: measure-zero exited 1: Traceback (most recent call last):\n  File \"/home/ubuntu/index-accel-validation/rmm-production-tools-d6-20261021/feature_gpu_check_smoke_frozen.py\", line 312, in <module>\n    run()\n  File \"/home/ubuntu/index-accel-validation/rmm-production-tools-d6-20261021/feature_gpu_check_smoke_frozen.py\", line 118, in run\n    eng = PgEngine(dbname=args.dbname, index_dir=args.index_dir)\n          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/ubuntu/pg_cuvs/bench/cuvs_bench_backend/pg_engine.py\", line 212, in __init__\n    self.conn = psycopg.connect(dbname=dbname, autocommit=True)\n                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/opt/miniforge3/envs/cuvs_bench/lib/python3.12/site-packages/psycopg/connection.py\", line 122, in connect\n    raise last_ex.with_traceback(None)\npsycopg.OperationalError: connection is bad: connection to server on socket \"/tmp/.s.PGSQL.5432\" failed: No such file or directory\n\tIs the server running locally and accepting connections on that socket?\n\n"
+  },
+  "cleanup_errors": [],
+  "resumes_this_window": 1,
+  "prior_failed_window_resumes": 1,
+  "native_passed": false,
+  "cleanup_passed": true,
+  "export_passed": true,
+  "stop_confirmed": true,
+  "deadline_is_not_provider_or_billing_guarantee": true,
+  "validation_head": "10229963883f1628acffa2e234e7eea8d337a289",
+  "application_tree_equals_pin": true,
+  "runner_sha256": "668a1d485fa7b4d1a20697770d6d884080a89038983626b7b06686092eeb1c9e",
+  "window_started_utc": "2026-10-21T01:34:23.089323+00:00",
+  "last_inventory": {
+    "observed_utc": "2026-10-21T01:37:51.547046+00:00",
+    "workspace": {
+      "name": "pg-cuvs-index-accel-20261020",
+      "id": "v6nc08sjs",
+      "status": "STOPPED",
+      "build_status": "COMPLETED",
+      "shell_status": "NOT READY",
+      "health_status": "HEALTHY",
+      "instance_type": "l40s-48gb.1x",
+      "instance_kind": "gpu",
+      "gpu": "L40S"
+    }
+  },
+  "actual_ssh_probe": {
+    "status": "ready",
+    "returncode": 0,
+    "stdout": "brev-v6nc08sjs\n",
+    "stderr": "Warning: Permanently added '[global.prd.ga.run.brev.nvidia.com]:24187' (ED25519) to the list of known hosts.\n",
+    "error": null,
+    "seconds": 2.1036753749940544
+  },
+  "stop_request_started_utc": "2026-10-21T01:37:29.704853+00:00",
+  "stop_request_accepted": true,
+  "stop_request_completed_utc": "2026-10-21T01:37:36.898532+00:00",
+  "STOPPED_observed_utc": "2026-10-21T01:37:51.547046+00:00",
+  "elapsed_seconds": 208.46392487501726,
+  "within_total": true,
+  "compute_reference_usd": 0.10075756368959167,
+  "cost_note": "window observation at stored rate; not invoice or physical poweroff measurement",
+  "finished_utc": "2026-10-21T01:37:51.548405+00:00",
+  "succeeded": false
+}

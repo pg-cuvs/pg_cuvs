@@ -1,0 +1,213 @@
+{
+  "before.stderr": {
+    "private_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "private_bytes": 0,
+    "public_file": "before.stderr"
+  },
+  "before.stdout": {
+    "private_sha256": "a3184be524ac48a08f4baab96d0e857db7ba703621b81bb2c16c6d5f4133d28b",
+    "private_bytes": 620,
+    "public_file": "before.stdout.own-vm.json",
+    "filter": "only target VM row; full response retained in private .omc"
+  },
+  "boot-00.stderr": {
+    "private_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "private_bytes": 0,
+    "public_file": "boot-00.stderr"
+  },
+  "boot-00.stdout": {
+    "private_sha256": "ed958ff9e94f2960f886455422854631e5d7cf5fb4e23e0b7a49d69f15d3eb39",
+    "private_bytes": 624,
+    "public_file": "boot-00.stdout.own-vm.json",
+    "filter": "only target VM row; full response retained in private .omc"
+  },
+  "boot-01.stderr": {
+    "private_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "private_bytes": 0,
+    "public_file": "boot-01.stderr"
+  },
+  "boot-01.stdout": {
+    "private_sha256": "b6b041847755f2737110513052060bf364f28612d65f9d9aa542f1bbf1231ed2",
+    "private_bytes": 625,
+    "public_file": "boot-01.stdout.own-vm.json",
+    "filter": "only target VM row; full response retained in private .omc"
+  },
+  "boot-02.stderr": {
+    "private_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "private_bytes": 0,
+    "public_file": "boot-02.stderr"
+  },
+  "boot-02.stdout": {
+    "private_sha256": "a73aa688e6d3002856e74b18ea2e3bb8ece4024084cea39352e5deb72453915f",
+    "private_bytes": 616,
+    "public_file": "boot-02.stdout.own-vm.json",
+    "filter": "only target VM row; full response retained in private .omc"
+  },
+  "cleanup.stderr": {
+    "private_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "private_bytes": 0,
+    "public_file": "cleanup.stderr"
+  },
+  "cleanup.stdout": {
+    "private_sha256": "20b5756c8df715d15d6b889b8799c4106b502bd432a48d702c63c08776fcdb65",
+    "private_bytes": 55,
+    "public_file": "cleanup.stdout"
+  },
+  "evidence-copy.stderr": {
+    "private_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "private_bytes": 0,
+    "public_file": "evidence-copy.stderr"
+  },
+  "evidence-copy.stdout": {
+    "private_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "private_bytes": 0,
+    "public_file": "evidence-copy.stdout"
+  },
+  "measure-zero.stderr": {
+    "private_sha256": "bba030dc0992b42d17a16c6d8b4a1b0b53c7bbe682b41fc014287a903a24efc3",
+    "private_bytes": 1016,
+    "public_file": "measure-zero.stderr"
+  },
+  "measure-zero.stdout": {
+    "private_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "private_bytes": 0,
+    "public_file": "measure-zero.stdout"
+  },
+  "preflight-zero.stderr": {
+    "private_sha256": "d0e14941dee288cc8de19e48436cdf3c2e7939d4b98136c44d954b5f8be73d8a",
+    "private_bytes": 72,
+    "public_file": "preflight-zero.stderr"
+  },
+  "preflight-zero.stdout": {
+    "private_sha256": "fb661cbc11fb993aa3d2e2165428be5e03785906ccaa585e3e7b26aa188e8f3f",
+    "private_bytes": 281,
+    "public_file": "preflight-zero.stdout"
+  },
+  "prepare.stderr": {
+    "private_sha256": "aec0643b7cb38d2cb29360f24ea25b8510e0ecc2408cc3ecda347f257311b658",
+    "private_bytes": 646,
+    "public_file": "prepare.stderr"
+  },
+  "prepare.stdout": {
+    "private_sha256": "a2d369b06a348a9d4b78c0b242d2e8025f9b489cc7abec0d1a28b826356c44a5",
+    "private_bytes": 57,
+    "public_file": "prepare.stdout"
+  },
+  "probe.stderr": {
+    "private_sha256": "a75806e837fe2602b442351fa62b75d09eca91fdf9c77a004fd6a6a0375ab16f",
+    "private_bytes": 110,
+    "public_file": "probe.stderr"
+  },
+  "probe.stdout": {
+    "private_sha256": "757f76de03685fb39727da96919877d7f7bc855b7b46f56e6988bd13ea18047e",
+    "private_bytes": 15,
+    "public_file": "probe.stdout"
+  },
+  "resume-issued": {
+    "private_sha256": "224c07e6095f5baef8e7a94f3e8b458d12ef3fd47ee723f5bd3e400772695ba7",
+    "private_bytes": 33,
+    "public_file": "resume-issued"
+  },
+  "runner.log": {
+    "private_sha256": "17d661e7d5e713abd5852fe650597186ec8028e5189dc3a3db091ae9f4c34f4e",
+    "private_bytes": 12872,
+    "public_file": "runner.log"
+  },
+  "ssh-refresh.stderr": {
+    "private_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "private_bytes": 0,
+    "public_file": "ssh-refresh.stderr"
+  },
+  "ssh-refresh.stdout": {
+    "private_sha256": "ee38121064eb8177a424f17c3446932d10d6e542de33512f8df440aa88a914d8",
+    "private_bytes": 43,
+    "public_file": "ssh-refresh.stdout"
+  },
+  "state.json": {
+    "private_sha256": "0e227daa1c0b566707bee35c967bebd51242f10e37bd902cfb0752761333857e",
+    "private_bytes": 11850,
+    "public_file": "state.json"
+  },
+  "status-zero.stderr": {
+    "private_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "private_bytes": 0,
+    "public_file": "status-zero.stderr"
+  },
+  "status-zero.stdout": {
+    "private_sha256": "accfdfca6babd95f9852f6aae5a8de8e042374d1ba3d6dbfbe7a9f0c6f458e16",
+    "private_bytes": 2416,
+    "public_file": "status-zero.stdout"
+  },
+  "stop-observation-00.stderr": {
+    "private_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "private_bytes": 0,
+    "public_file": "stop-observation-00.stderr"
+  },
+  "stop-observation-00.stdout": {
+    "private_sha256": "f0370c1cf1ec789800f3883a6b8c9934477ffc5c3feb2301bee704fede5eafdb",
+    "private_bytes": 621,
+    "public_file": "stop-observation-00.stdout.own-vm.json",
+    "filter": "only target VM row; full response retained in private .omc"
+  },
+  "stop-observation-01.stderr": {
+    "private_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "private_bytes": 0,
+    "public_file": "stop-observation-01.stderr"
+  },
+  "stop-observation-01.stdout": {
+    "private_sha256": "a3184be524ac48a08f4baab96d0e857db7ba703621b81bb2c16c6d5f4133d28b",
+    "private_bytes": 620,
+    "public_file": "stop-observation-01.stdout.own-vm.json",
+    "filter": "only target VM row; full response retained in private .omc"
+  },
+  "tools-copy.stderr": {
+    "private_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "private_bytes": 0,
+    "public_file": "tools-copy.stderr"
+  },
+  "tools-copy.stdout": {
+    "private_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "private_bytes": 0,
+    "public_file": "tools-copy.stdout"
+  },
+  "tools-mkdir.stderr": {
+    "private_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "private_bytes": 0,
+    "public_file": "tools-mkdir.stderr"
+  },
+  "tools-mkdir.stdout": {
+    "private_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "private_bytes": 0,
+    "public_file": "tools-mkdir.stdout"
+  },
+  "vm-start.stderr": {
+    "private_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "private_bytes": 0,
+    "public_file": "vm-start.stderr"
+  },
+  "vm-start.stdout": {
+    "private_sha256": "16ae9acf4676d14fc7dfa0267124a026f254ab9d843b1f0b1979a0daa1baffc9",
+    "private_bytes": 148,
+    "public_file": "vm-start.stdout"
+  },
+  "vm-stop.stderr": {
+    "private_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "private_bytes": 0,
+    "public_file": "vm-stop.stderr"
+  },
+  "vm-stop.stdout": {
+    "private_sha256": "78e31dd33173b4d695b7fc677bc56767dcf55728da7250bf35317e7a800b98fe",
+    "private_bytes": 29,
+    "public_file": "vm-stop.stdout"
+  },
+  "zero.stderr": {
+    "private_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "private_bytes": 0,
+    "public_file": "zero.stderr"
+  },
+  "zero.stdout": {
+    "private_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "private_bytes": 0,
+    "public_file": "zero.stdout"
+  }
+}

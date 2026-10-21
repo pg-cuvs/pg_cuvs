@@ -1,0 +1,9 @@
+Result=success
+ExecMainStatus=0
+Id=postgresql@16-main.service
+ActiveState=inactive
+
+Result=success
+ExecMainStatus=0
+Id=pg-cuvs-server.service
+ActiveState=inactive
