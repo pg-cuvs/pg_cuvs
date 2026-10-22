@@ -3605,7 +3605,7 @@ pg_cuvs_hnsw_build_info(PG_FUNCTION_ARGS)
         "\"requested_algo\":\"%s\",\"requested_ef_construction\":%u,"
         "\"graph_degree\":%u,\"intermediate_degree\":%u,\"hierarchy\":%u,"
         "\"hierarchy_ef_construction\":%u,\"ace_ef_construction\":%u,"
-        "\"ace_partitions\":%u,\"ace_partitions_origin\":\"same_SDK_stable_explicit_plan\",\"internal_builder\":\"%s\","
+        "\"ace_partitions\":%u,\"ace_partitions_origin\":\"%s\",\"internal_builder\":\"%s\","
         "\"n_lists\":%u,\"pq_dim\":%u,\"pq_bits\":%u,\"n_probes\":%u,\"query_batch\":%u,"
         "\"resident_training_requested\":%llu,\"resident_training_actual\":%llu,"
         "\"resident_host_estimate_bytes\":%llu,\"resident_gpu_estimate_bytes\":%llu,"
@@ -3617,6 +3617,7 @@ pg_cuvs_hnsw_build_info(PG_FUNCTION_ARGS)
         policy.requested_algo ? "ivf_pq" : "auto", policy.requested_ef,
         policy.degree, policy.intermediate, policy.hierarchy,
         policy.hierarchy_ef, policy.ace_ef, policy.partitions,
+        policy.route == CUVS_HNSW_ROUTE_ACE ? "same_SDK_stable_explicit_plan" : "not_applicable",
         policy.internal_builder == 1 ? "exact" : policy.internal_builder == 2 ? "ivf_pq" : "nn_descent",
         policy.n_lists, policy.pq_dim, policy.pq_bits, policy.n_probes, policy.query_batch,
         (unsigned long long)policy.training_requested, (unsigned long long)policy.training_actual,
