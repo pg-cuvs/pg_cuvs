@@ -5,6 +5,7 @@
  * the converter, which must close both even if page conversion raises ERROR. */
 #include "utils/relcache.h"
 #include "nodes/execnodes.h"
+#include "cuvs_hnsw_policy.h"
 
 typedef struct CuvsHnswBuildResult {
     int hnsw_fd;
@@ -13,9 +14,11 @@ typedef struct CuvsHnswBuildResult {
     uint32_t dim;
     uint32_t metric;
     double reltuples;
+    CuvsHnswPolicy policy;
 } CuvsHnswBuildResult;
 
 void cuvs_build_hnsw_from_heap(Relation heapRel, Relation indexRel,
-    IndexInfo *indexInfo, const char *mode, CuvsHnswBuildResult *out);
+    IndexInfo *indexInfo, const char *mode, uint32_t build_algo,
+    uint32_t ef_construction, CuvsHnswBuildResult *out);
 
 #endif

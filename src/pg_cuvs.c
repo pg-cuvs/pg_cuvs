@@ -884,8 +884,9 @@ _PG_init(void)
 
     DefineCustomIntVariable(
         "cuvs.max_build_mem_mb",
-        "Backend memory limit (MB) for accumulating a CAGRA build corpus.",
-        "0 = auto (MemAvailable * cuvs.build_mem_safety_ratio). >0 = hard cap in MB. "
+        "CAGRA corpus limit / HNSW host route selection budget (MB).",
+        "For HNSW this is an estimate-based route budget, not an RSS upper bound. "
+        "0 = auto (MemAvailable * cuvs.build_mem_safety_ratio). >0 = corpus cap in MB. "
         "CREATE INDEX fails fast with a clear error instead of OOM-killing the backend.",
         &cuvs_max_build_mem_mb,
         0, 0, INT_MAX,
@@ -2305,7 +2306,8 @@ cuvs_hnsw_spool_callback(Relation index, ItemPointer tid, Datum *values,
 
 void
 cuvs_build_hnsw_from_heap(Relation heapRel, Relation indexRel, IndexInfo *indexInfo,
-                          const char *mode, CuvsHnswBuildResult *out)
+                          const char *mode, uint32_t build_algo,
+                          uint32_t ef_construction, CuvsHnswBuildResult *out)
 {
     CuvsHnswSpool *spool = palloc0(sizeof(*spool));
     Form_pg_attribute attr = TupleDescAttr(RelationGetDescr(indexRel), 0);
@@ -2379,7 +2381,11 @@ cuvs_build_hnsw_from_heap(Relation heapRel, Relation indexRel, IndexInfo *indexI
             rc = cuvs_ipc_build_hnsw_file(cuvs_socket_path,
                 FileGetRawDesc(spool->vectors), spool->n, spool->dim, spool->metric,
                 64, 128, strcmp(mode, "nsw") != 0, cap,
+                build_algo, ef_construction, &out->policy,
                 &out->hnsw_fd, error, sizeof(error));
+            if (rc == CUVS_STATUS_OK && out->policy.route == CUVS_HNSW_ROUTE_ACE)
+                ereport(NOTICE, (errmsg("pg_cuvs: auto selected ACE-disk (%u partitions): resident IVF-PQ estimate exceeds budget", out->policy.partitions),
+                    errdetail("Route selection uses memory estimates, not allocation or RSS upper bounds.")));
             if (rc == CUVS_STATUS_CANCELED) CHECK_FOR_INTERRUPTS();
             if (rc != CUVS_STATUS_OK)
                 ereport(ERROR, (errmsg("pg_cuvs: temporary HNSW build failed (status %d): %s", rc, error)));

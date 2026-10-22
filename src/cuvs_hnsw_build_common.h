@@ -124,6 +124,21 @@ cuvs_hnsw_capacity(uint64_t n, uint32_t dim, uint32_t degree,
     return 0;
 }
 
+/* Reserve the shape consumed by the SDK's integer sampling, rather than the
+ * requested fractional population. Kept shared with direct CPU consumers. */
+static inline int
+cuvs_hnsw_training_reserve(CuvsHnswCapacity *cap, uint64_t actual_rows, uint32_t dim)
+{
+    uint64_t bytes;
+    if (!dim || actual_rows > UINT64_MAX / dim / sizeof(float)) return -1;
+    bytes = actual_rows * dim * sizeof(float);
+    if (bytes > (UINT64_MAX - cap->host_peak) / 2
+        || bytes > (UINT64_MAX - cap->gpu_peak) / 4) return -1;
+    cap->host_peak += bytes * 2;
+    cap->gpu_peak += bytes * 4;
+    return 0;
+}
+
 /* Conservative candidate only. The patched SDK must recheck the ACTUAL
  * histogram, any internal P increase, live reorder buffers and serializer
  * upper-level workspace before allocation. A zero result admits no build. */

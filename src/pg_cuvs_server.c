@@ -7984,6 +7984,7 @@ handle_build_hnsw_file(int client_fd, const CuvsCmdFrame *cmd)
 {
     CuvsHnswFileRequest request = {0};
     CuvsHnswFileBuild params = {0};
+    CuvsHnswFileReply wire = {0};
     CuvsReplyHeader reply = {0};
     struct stat st;
     struct statvfs disk;
@@ -7993,10 +7994,24 @@ handle_build_hnsw_file(int client_fd, const CuvsCmdFrame *cmd)
     char workdir[4096] = {0};
     reply.status = CUVS_STATUS_BUILD_FAILED;
     snprintf(reply.error, sizeof(reply.error), "invalid HNSW file request");
-    if (cuvs_fd_recv(client_fd, &request, sizeof(request), &vectors_fd)
+    /* Read the unchanged v1 prefix first. Waiting for the longer v2 struct
+     * before checking version could consume the old owner's one-byte frame
+     * and leave an old backend/new daemon pair waiting on each other. */
+    if (cuvs_fd_recv(client_fd, &request, offsetof(CuvsHnswFileRequest, build_algo), &vectors_fd))
+        goto done;
+    if (request.version != CUVS_HNSW_FILE_VERSION)
+    {
+        snprintf(reply.error, sizeof(reply.error),
+            "HNSW file payload version mismatch: expected v%u; co-deploy extension and daemon", CUVS_HNSW_FILE_VERSION);
+        goto done;
+    }
+    if (recv_all(client_fd, (char *)&request + offsetof(CuvsHnswFileRequest, build_algo),
+            sizeof(request) - offsetof(CuvsHnswFileRequest, build_algo))
         || cuvs_fd_recv(client_fd, &token, 1, &owner_fd)) goto done;
     if (request.version != CUVS_HNSW_FILE_VERSION || request.hierarchy > 1
-        || !request.host_budget || cmd->n_vecs <= 0 || cmd->n_vecs > CUVS_TIDS_MAX_VECS
+        || !request.host_budget || request.build_algo > CUVS_HNSW_ALGO_IVF_PQ
+        || request.ef_construction < 4 || request.ef_construction > 1000
+        || cmd->n_vecs <= 0 || cmd->n_vecs > CUVS_TIDS_MAX_VECS
         || cmd->dim == 0 || cmd->dim > CUVS_VECTORS_MAX_DIM
         || cmd->metric > CUVS_METRIC_IP || !cuvs_hnsw_regular_disk(vectors_fd)
         || !shm_check_peer_owner(vectors_fd, g_peer_uid)
@@ -8014,6 +8029,9 @@ handle_build_hnsw_file(int client_fd, const CuvsCmdFrame *cmd)
     params.graph_degree = cmd->graph_degree;
     params.intermediate_degree = cmd->intermediate_graph_degree;
     params.hierarchy = request.hierarchy;
+    params.build_algo = request.build_algo;
+    params.ef_construction = request.ef_construction;
+    params.policy = &wire.policy;
     if (cuvs_hnsw_wait_for_idle(&g_index_mutex, owner_fd, hnsw_gpu_work_pending, NULL))
         goto cancelled;
     locked = 1;
@@ -8129,9 +8147,10 @@ handle_build_hnsw_file(int client_fd, const CuvsCmdFrame *cmd)
         reply.status = CUVS_STATUS_CANCELED;
     if (reply.status != CUVS_STATUS_OK && result_fd >= 0)
     { close(result_fd); result_fd = -1; }
+    wire.header = reply;
     token = 'R';
     if (send_all(client_fd, &token, 1) == 0
-        && cuvs_fd_send(client_fd, result_fd, &reply, sizeof(reply)) == 0
+        && cuvs_fd_send(client_fd, result_fd, &wire, sizeof(wire)) == 0
         && reply.status == CUVS_STATUS_OK)
     {
         /* The backend ACKs receipt of its own kernel reference; it then owns

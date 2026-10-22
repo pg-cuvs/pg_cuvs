@@ -2390,18 +2390,22 @@ int
 cuvs_ipc_build_hnsw_file(const char *socket_path, int vectors_fd,
     uint64_t n_vecs, uint32_t dim, uint32_t metric, uint32_t graph_degree,
     uint32_t intermediate_degree, uint32_t hierarchy, uint64_t host_budget,
+    uint32_t build_algo, uint32_t ef_construction, CuvsHnswPolicy *policy,
     int *hnsw_fd, char *error, size_t error_len)
 {
     int sock = -1, owner[2] = {-1, -1}, result_fd = -1;
     int rc = CUVS_STATUS_ERROR;
     CuvsCmdFrame cmd = {0};
-    CuvsHnswFileRequest request = {CUVS_HNSW_FILE_VERSION, hierarchy, host_budget};
+    CuvsHnswFileRequest request = {CUVS_HNSW_FILE_VERSION, hierarchy, host_budget, build_algo, ef_construction};
+    CuvsHnswFileReply wire = {0};
     CuvsReplyHeader reply = {0};
     char token = 'O';
     *hnsw_fd = -1;
+    if (policy) memset(policy, 0, sizeof(*policy));
     if (error_len) error[0] = '\0';
     if (!cuvs_hnsw_regular_disk(vectors_fd) || !n_vecs || n_vecs > INT32_MAX
-        || !dim || metric > CUVS_METRIC_IP || hierarchy > 1 || !host_budget)
+        || !dim || metric > CUVS_METRIC_IP || hierarchy > 1 || !host_budget
+        || build_algo > CUVS_HNSW_ALGO_IVF_PQ || ef_construction < 4 || ef_construction > 1000)
         goto done;
     sock = uds_connect_ex(socket_path, 30);
     if (sock < 0) { rc = CUVS_STATUS_UNAVAILABLE; goto done; }
@@ -2442,17 +2446,22 @@ cuvs_ipc_build_hnsw_file(const char *socket_path, int vectors_fd,
         if (pr < 0) goto done;
         if (pr == 0) continue;
         if (recv_all(sock, &token, 1) || token != 'R'
-            || cuvs_fd_recv(sock, &reply, sizeof(reply), &result_fd)) goto done;
+            || cuvs_fd_recv(sock, &wire, sizeof(wire), &result_fd)) goto done;
+        reply = wire.header;
         rc = (int)reply.status;
         if (error_len) snprintf(error, error_len, "%.*s", (int)sizeof(reply.error), reply.error);
         if (rc == CUVS_STATUS_OK)
         {
-            if (!cuvs_hnsw_regular_disk(result_fd)
+            if (!cuvs_hnsw_policy_valid(&wire.policy)
+                || wire.policy.requested_algo != build_algo
+                || wire.policy.requested_ef != ef_construction
+                || !cuvs_hnsw_regular_disk(result_fd)
                 || (fcntl(result_fd, F_GETFL) & O_ACCMODE) != O_RDONLY)
             { rc = CUVS_STATUS_ERROR; goto done; }
             fcntl(result_fd, F_SETFD, FD_CLOEXEC);
             token = 'A';
             if (send(owner[0], &token, 1, 0) != 1) { rc = CUVS_STATUS_ERROR; goto done; }
+            if (policy) *policy = wire.policy;
             *hnsw_fd = result_fd; result_fd = -1;
         }
         goto done;

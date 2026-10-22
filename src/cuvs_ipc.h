@@ -87,16 +87,20 @@
  * Second frame: one byte + separate owner socket FD. Reply: readiness byte,
  * then CuvsReplyHeader + read-only regular HNSW file FD (success only).
  * Owner channel: C=cancel, EOF=owner lost, A=result handoff acknowledged. */
-#define CUVS_HNSW_FILE_VERSION 1u
+#include "cuvs_hnsw_policy.h"
+#define CUVS_HNSW_FILE_VERSION 2u
 typedef struct CuvsHnswFileRequest {
     uint32_t version;
     uint32_t hierarchy;        /* 0=NONE (nsw), 1=GPU; never CPU */
     uint64_t host_budget;      /* nonzero admission budget, not an RSS guarantee */
+    uint32_t build_algo;
+    uint32_t ef_construction;
 } CuvsHnswFileRequest;
 
 int cuvs_ipc_build_hnsw_file(const char *socket_path, int vectors_fd,
     uint64_t n_vecs, uint32_t dim, uint32_t metric, uint32_t graph_degree,
     uint32_t intermediate_degree, uint32_t hierarchy, uint64_t host_budget,
+    uint32_t build_algo, uint32_t ef_construction, CuvsHnswPolicy *policy,
     int *hnsw_fd, char *error, size_t error_len);
 
 /* ----------------------------------------------------------------
@@ -218,6 +222,12 @@ typedef struct CuvsReplyHeader {
                              * (Phase 3B); backend then skips its CPU merge */
     char     error[128];
 } CuvsReplyHeader;
+
+/* Only BUILD_HNSW_FILE v2 uses this receipt; global v3 stays unchanged. */
+typedef struct CuvsHnswFileReply {
+    CuvsReplyHeader header;
+    CuvsHnswPolicy policy;
+} CuvsHnswFileReply;
 
 typedef struct CuvsResult {
     uint64_t tid;           /* heap TID encoded as block<<16|offset */
