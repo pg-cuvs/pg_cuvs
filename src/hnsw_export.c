@@ -61,6 +61,7 @@
 #include "utils/fmgroids.h"      /* F_OIDEQ */
 #include "utils/acl.h"
 #include "utils/lsyscache.h"     /* get_rel_name */
+#include "utils/jsonb.h"
 #include "catalog/pg_type.h"     /* Form_pg_type (#162: vector/halfvec type detection) */
 
 #include <math.h>
@@ -2506,7 +2507,7 @@ hnsw_write_disk_pages(Relation rel, int hnsw_fd, int tids_fd,
 static void
 hnsw_write_disk_metapage(Relation rel, const HnswlibHeader *header,
                          uint32_t dim, uint32_t n_data_pages, bool skip_wal,
-                         HnswLocationTable *locations)
+                         HnswLocationTable *locations, const CuvsHnswPolicy *policy)
 {
     Page staged = (Page)palloc(BLCKSZ);
     HnswNodeLocation entry;
@@ -2519,6 +2520,10 @@ hnsw_write_disk_metapage(Relation rel, const HnswlibHeader *header,
                             entry.elem_blkno, entry.elem_offno, entry.level,
                             n_data_pages))
         ereport(ERROR, (errmsg("pg_cuvs: invalid HNSW metapage fields")));
+    if (!cuvs_hnsw_policy_valid(policy))
+        ereport(ERROR, (errmsg("pg_cuvs: missing or invalid native HNSW build policy receipt")));
+    memcpy((char *)PageGetContents(staged) + sizeof(PgvHnswMeta), policy, sizeof(*policy));
+    ((PageHeader)staged)->pd_lower += sizeof(*policy);
     hnsw_publish_staged_page(rel, staged, skip_wal);
     pfree(staged);
 }
@@ -2676,7 +2681,7 @@ hnsw_import_build_result(Relation indexRel,
             RelationSetTargetBlock(s->target, InvalidBlockNumber);
         }
         hnsw_write_disk_metapage(s->target, &header, build->dim,
-                                 data_page_count, skip_wal, &s->locations);
+                                 data_page_count, skip_wal, &s->locations, &build->policy);
         hnsw_write_disk_pages(s->target, build->hnsw_fd, build->tids_fd,
                               &header, build->n_vecs, build->dim,
                               bytes_per_dim, packed_nsw, pack_k,
@@ -3488,6 +3493,7 @@ typedef struct CuvsHnswOptions
     int   ef_construction;  /* pgvector HnswOptions-compatible */
     int   source_offset;    /* relopt string offset: source CAGRA index name */
     int   mode_offset;      /* relopt string offset: conversion mode */
+    int   build_algo_offset; /* HNSW policy only */
 } CuvsHnswOptions;
 
 static relopt_kind cuvs_hnsw_relopt_kind;
@@ -3506,6 +3512,20 @@ cuvs_hnsw_validate_mode(const char *value)
                  errhint("Valid modes: nsw (default), hnsw, hnswlib, hnswlib_file.")));
 }
 
+static void
+cuvs_hnsw_validate_build_algo(const char *value)
+{
+    if (!value || !strcmp(value, "auto") || !strcmp(value, "ivf_pq")) return;
+    if (!strcmp(value, "nn_descent"))
+        ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+            errmsg("pg_cuvs_hnsw: build_algo=nn_descent is reserved but unsupported"),
+            errdetail("NN-descent has no supported memory estimate for this build path."),
+            errhint("Use build_algo=auto (bounded resident IVF-PQ or ACE-disk).")));
+    ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+        errmsg("pg_cuvs_hnsw: invalid build_algo \"%s\"", value),
+        errhint("Valid supported values: auto, ivf_pq.")));
+}
+
 /* One-time relopt registration; called from _PG_init. */
 void
 cuvs_hnsw_init_reloptions(void)
@@ -3517,11 +3537,14 @@ cuvs_hnsw_init_reloptions(void)
     add_string_reloption(cuvs_hnsw_relopt_kind, "mode",
                          "Conversion mode: nsw (default), hnsw, hnswlib, hnswlib_file",
                          "nsw", cuvs_hnsw_validate_mode, AccessExclusiveLock);
+    add_string_reloption(cuvs_hnsw_relopt_kind, "build_algo",
+                         "HNSW route: auto or explicit ivf_pq; estimates are not memory upper bounds",
+                         "auto", cuvs_hnsw_validate_build_algo, AccessExclusiveLock);
     add_int_reloption(cuvs_hnsw_relopt_kind, "m",
                       "pgvector HNSW M; informational (graph degree drives layout)",
                       16, 2, 100, AccessExclusiveLock);
     add_int_reloption(cuvs_hnsw_relopt_kind, "ef_construction",
-                      "pgvector HNSW efConstruction; informational",
+                      "Construction effort: default 64 preserves route defaults; changes intermediate degree / ACE effort",
                       64, 4, 1000, AccessExclusiveLock);
 }
 
@@ -3533,11 +3556,74 @@ cuvs_hnsw_amoptions(Datum reloptions, bool validate)
         {"ef_construction", RELOPT_TYPE_INT,    offsetof(CuvsHnswOptions, ef_construction)},
         {"source",          RELOPT_TYPE_STRING, offsetof(CuvsHnswOptions, source_offset)},
         {"mode",            RELOPT_TYPE_STRING, offsetof(CuvsHnswOptions, mode_offset)},
+        {"build_algo",      RELOPT_TYPE_STRING, offsetof(CuvsHnswOptions, build_algo_offset)},
     };
     return (bytea *) build_reloptions(reloptions, validate,
                                       cuvs_hnsw_relopt_kind,
                                       sizeof(CuvsHnswOptions),
                                       tab, lengthof(tab));
+}
+
+/* Read the build-time receipt, never infer history from today's GUCs. The
+ * pgvector-compatible prefix stays unchanged, including for INSERT/VACUUM. */
+PG_FUNCTION_INFO_V1(pg_cuvs_hnsw_build_info);
+Datum
+pg_cuvs_hnsw_build_info(PG_FUNCTION_ARGS)
+{
+    Oid oid = PG_GETARG_OID(0);
+    Relation rel = index_open(oid, AccessShareLock);
+    CuvsHnswPolicy policy = {0};
+    StringInfoData json;
+    Oid heap;
+    if (rel->rd_rel->relam != get_am_oid("pg_cuvs_hnsw", true))
+        ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+            errmsg("pg_cuvs_hnsw_build_info requires a pg_cuvs_hnsw index")));
+    heap = IndexGetRelation(oid, false);
+    if (pg_class_aclcheck(heap, GetUserId(), ACL_SELECT) != ACLCHECK_OK)
+        aclcheck_error(ACLCHECK_NO_PRIV, OBJECT_TABLE, get_rel_name(heap));
+    if (RelationGetNumberOfBlocks(rel) > 0)
+    {
+        Buffer buffer = ReadBuffer(rel, 0);
+        Page page;
+        LockBuffer(buffer, BUFFER_LOCK_SHARE);
+        page = BufferGetPage(buffer);
+        if (((PageHeader)page)->pd_lower >= SizeOfPageHeaderData + sizeof(PgvHnswMeta) + sizeof(policy))
+            memcpy(&policy, (char *)PageGetContents(page) + sizeof(PgvHnswMeta), sizeof(policy));
+        UnlockReleaseBuffer(buffer);
+    }
+    index_close(rel, AccessShareLock);
+    if (policy.magic == CUVS_HNSW_POLICY_MAGIC && !cuvs_hnsw_policy_valid(&policy))
+        ereport(ERROR, (errcode(ERRCODE_INDEX_CORRUPTED),
+            errmsg("pg_cuvs: invalid or unsupported stored HNSW policy receipt")));
+    if (!cuvs_hnsw_policy_valid(&policy))
+        PG_RETURN_DATUM(DirectFunctionCall1(jsonb_in,
+            CStringGetDatum("{\"status\":\"not_recorded\",\"reason\":\"legacy, empty, or reused source graph; rebuild to record a native policy\"}")));
+    initStringInfo(&json);
+    appendStringInfo(&json,
+        "{\"status\":\"recorded\",\"policy_version\":%u,\"route\":\"%s\","
+        "\"rows\":%llu,\"dimensions\":%u,\"metric\":%u,"
+        "\"requested_algo\":\"%s\",\"requested_ef_construction\":%u,"
+        "\"graph_degree\":%u,\"intermediate_degree\":%u,\"hierarchy\":%u,"
+        "\"hierarchy_ef_construction\":%u,\"ace_ef_construction\":%u,"
+        "\"ace_partitions\":%u,\"ace_partitions_origin\":\"same_SDK_stable_explicit_plan\",\"internal_builder\":\"%s\","
+        "\"n_lists\":%u,\"pq_dim\":%u,\"pq_bits\":%u,\"n_probes\":%u,\"query_batch\":%u,"
+        "\"resident_training_requested\":%llu,\"resident_training_actual\":%llu,"
+        "\"resident_host_estimate_bytes\":%llu,\"resident_gpu_estimate_bytes\":%llu,"
+        "\"host_budget_bytes\":%llu,\"gpu_budget_bytes\":%llu,"
+        "\"sdk_host_budget_bytes\":%llu,\"sdk_gpu_budget_bytes\":%llu,"
+        "\"guard\":\"selected_route_returned\",\"memory_upper_bound_guaranteed\":false}",
+        policy.version, cuvs_hnsw_route_name(policy.route),
+        (unsigned long long)policy.n_rows, policy.dim, policy.metric,
+        policy.requested_algo ? "ivf_pq" : "auto", policy.requested_ef,
+        policy.degree, policy.intermediate, policy.hierarchy,
+        policy.hierarchy_ef, policy.ace_ef, policy.partitions,
+        policy.internal_builder == 1 ? "exact" : policy.internal_builder == 2 ? "ivf_pq" : "nn_descent",
+        policy.n_lists, policy.pq_dim, policy.pq_bits, policy.n_probes, policy.query_batch,
+        (unsigned long long)policy.training_requested, (unsigned long long)policy.training_actual,
+        (unsigned long long)policy.host_estimate, (unsigned long long)policy.gpu_estimate,
+        (unsigned long long)policy.host_budget, (unsigned long long)policy.gpu_budget,
+        (unsigned long long)policy.sdk_host_budget, (unsigned long long)policy.sdk_gpu_budget);
+    PG_RETURN_DATUM(DirectFunctionCall1(jsonb_in, CStringGetDatum(json.data)));
 }
 
 /* ambuild: build a pgvector-HNSW index, served by pgvector (Phase 3K).
@@ -3561,6 +3647,15 @@ cuvs_hnsw_ambuild(Relation heapRel, Relation indexRel, IndexInfo *indexInfo)
         ? (const char *) opts + opts->mode_offset : "nsw";
     if (mode[0] == '\0')
         mode = "nsw";
+    const char *algorithm = (opts && opts->build_algo_offset)
+        ? (const char *)opts + opts->build_algo_offset : "auto";
+    uint32_t requested_ef = opts ? opts->ef_construction : 64;
+    cuvs_hnsw_validate_build_algo(algorithm);
+    uint32_t build_algo = !strcmp(algorithm, "ivf_pq") ? CUVS_HNSW_ALGO_IVF_PQ : CUVS_HNSW_ALGO_AUTO;
+    if (source_name[0] && build_algo != CUVS_HNSW_ALGO_AUTO)
+        ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+            errmsg("pg_cuvs_hnsw: build_algo applies to heap builds, not source graph reuse")));
+
 
     Oid self_oid = RelationGetRelid(indexRel);
     IndexBuildResult *result = palloc0(sizeof(IndexBuildResult));
@@ -3602,7 +3697,7 @@ cuvs_hnsw_ambuild(Relation heapRel, Relation indexRel, IndexInfo *indexInfo)
         PG_TRY();
         {
             CuvsHnswBuildResult *b = (CuvsHnswBuildResult *)&build;
-            cuvs_build_hnsw_from_heap(heapRel, indexRel, indexInfo, mode, b);
+            cuvs_build_hnsw_from_heap(heapRel, indexRel, indexInfo, mode, build_algo, requested_ef, b);
             result->heap_tuples = b->reltuples;
             result->index_tuples = (double)b->n_vecs;
             if (b->n_vecs > 0)

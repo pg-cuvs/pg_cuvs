@@ -16,7 +16,8 @@
 #include "cuvs_util.h"  /* ADR-075: CUVS_HWPROBE_* bits (PG-free, CUDA-free) */
 
 #include <cuvs/neighbors/brute_force.hpp>
-#include <cuvs/neighbors/cagra.hpp>  /* serialize/deserialize merged here in cuVS 25.x+ */
+#include <cuvs/neighbors/cagra.hpp>
+#include "cuvs_hnsw_sdk_plan.cuh"  /* serialize/deserialize merged here in cuVS 25.x+ */
 #include <cuvs/neighbors/hnsw.hpp>   /* Phase 3I-1: CPU HNSW fallback */
 #include <cuvs/neighbors/ivf_pq.hpp> /* 3P: IVF-PQ index */
 #include <cuvs/core/bitset.hpp>      /* 3O: cuvs::core::bitset_view */
@@ -2128,9 +2129,20 @@ cuvs_hnsw_build_file(int vectors_fd, int owner_fd,
     if (!params || !workdir || device_id < 0 || device_id >= CUVS_MAX_GPUS)
         return CUVS_STATUS_ERROR;
     HnswBuildFiles files{workdir};
+    try
+    {
     CuvsHnswCapacity cap;
     uint32_t degree = params->graph_degree;
-    uint32_t intermediate = params->intermediate_degree;
+    uint32_t intermediate = cuvs_hnsw_scaled_quality(params->intermediate_degree,
+        params->ef_construction, degree, 4096);
+    CuvsHnswPolicy receipt = {};
+    if (params->policy) memset(params->policy, 0, sizeof(*params->policy));
+    if (params->build_algo > CUVS_HNSW_ALGO_IVF_PQ
+        || params->ef_construction < 4 || params->ef_construction > 1000)
+    {
+        snprintf(error, error_len, "unsupported HNSW builder/ef_construction; use build_algo=auto (NN-descent memory model unsupported)");
+        return CUVS_STATUS_BUILD_FAILED;
+    }
     const bool tiny = params->n_vecs > 0 && params->n_vecs < CUVS_HNSW_MIN_ELEMENTS;
     if (tiny)
     {
@@ -2154,14 +2166,31 @@ cuvs_hnsw_build_file(int vectors_fd, int owner_fd,
         snprintf(error, error_len, "invalid HNSW capacity/dimension/degree/file descriptor");
         return CUVS_STATUS_BUILD_FAILED;
     }
+    if (tiny && params->build_algo == CUVS_HNSW_ALGO_IVF_PQ)
+    {
+        snprintf(error, error_len, "explicit ivf_pq requires at least 16 rows; use build_algo=auto for the tiny exact route");
+        return CUVS_STATUS_BUILD_FAILED;
+    }
     uint64_t sample_rows = std::min<uint64_t>(params->n_vecs,
         std::max<uint64_t>(256, std::min(params->host_budget, params->gpu_budget)
             / 64 / (params->dim * sizeof(float))));
-    uint64_t sample_bytes = sample_rows * params->dim * sizeof(float);
-    // Training/codebook construction can overlap the compressed index and
-    // graphs. Count its host and GPU copies in the route admission estimate.
-    cap.host_peak += sample_bytes * 2;
-    cap.gpu_peak += sample_bytes * 4;
+    auto shape = raft::make_host_matrix_view<const float, int64_t>(
+        static_cast<const float *>(nullptr), (int64_t)params->n_vecs, (int64_t)params->dim);
+    auto pq_params = cagra::graph_build_params::ivf_pq_params(shape.extents(),
+        params->metric == CUVS_METRIC_COSINE ? cuvs::distance::DistanceType::InnerProduct
+                                          : cuvs_distance_type(params->metric));
+    pq_params.build_params.n_lists = std::min<uint32_t>(pq_params.build_params.n_lists,
+        (uint32_t)std::max<uint64_t>(1, sample_rows / 32));
+    if (sample_rows < 256) pq_params.build_params.pq_bits = 4;
+    pq_params.build_params.kmeans_trainset_fraction = (double)sample_rows / params->n_vecs;
+    pq_params.search_params.max_internal_batch_size = 4096;
+    uint64_t actual_training = tiny ? 0 : cuvs_hnsw_training_rows(params->n_vecs,
+        sample_rows, pq_params.build_params.n_lists);
+    if (cuvs_hnsw_training_reserve(&cap, actual_training, params->dim))
+    {
+        snprintf(error, error_len, "HNSW training estimate overflow");
+        return CUVS_STATUS_BUILD_FAILED;
+    }
     if (params->hierarchy && !hnsw_sdk_marker_verified("pgcuvs_hnsw_disk_copy_patch_id",
             "pgcuvs-hnsw-disk-copy-v1@60b19a0f62ba0bd716de349382828e43be6e2daa"))
     {
@@ -2173,6 +2202,16 @@ cuvs_hnsw_build_file(int vectors_fd, int owner_fd,
      * max_* alone is not a verified capacity bound: vanilla ACE can increase
      * P internally and exceed both reorder and upper-hierarchy workspace. */
     bool disk = cap.host_peak > params->host_budget || cap.gpu_peak > params->gpu_budget;
+    if (disk && params->build_algo == CUVS_HNSW_ALGO_IVF_PQ)
+    {
+        snprintf(error, error_len, "explicit ivf_pq estimate exceeds host/GPU budget; no ACE fallback (use build_algo=auto)");
+        return CUVS_STATUS_BUILD_FAILED;
+    }
+    if (disk && tiny)
+    {
+        snprintf(error, error_len, "tiny exact route estimate exceeds host/GPU budget");
+        return CUVS_STATUS_BUILD_FAILED;
+    }
     uint32_t partitions = 0;
     // The SDK ledger excludes caller/runtime/pool allocations. Keep an
     // explicit reserve outside its positive budgets, in addition to the
@@ -2204,6 +2243,38 @@ cuvs_hnsw_build_file(int vectors_fd, int owner_fd,
             return CUVS_STATUS_BUILD_FAILED;
         }
     }
+    receipt.magic = CUVS_HNSW_POLICY_MAGIC;
+    receipt.version = CUVS_HNSW_POLICY_VERSION;
+    receipt.bytes = sizeof(receipt);
+    receipt.route = tiny ? CUVS_HNSW_ROUTE_TINY : disk ? CUVS_HNSW_ROUTE_ACE : CUVS_HNSW_ROUTE_IVF_PQ;
+    receipt.requested_algo = params->build_algo;
+    receipt.requested_ef = params->ef_construction;
+    receipt.degree = degree;
+    receipt.intermediate = intermediate;
+    receipt.hierarchy = params->hierarchy;
+    receipt.n_rows = params->n_vecs;
+    receipt.dim = params->dim;
+    receipt.metric = params->metric;
+    receipt.hierarchy_ef = params->hierarchy
+        ? cuvs_hnsw_scaled_quality(200, params->ef_construction, 4, 65535) : 200;
+    receipt.ace_ef = cuvs_hnsw_scaled_quality(120, params->ef_construction, 4, 65535);
+    receipt.partitions = partitions;
+    receipt.internal_builder = tiny ? 1 : disk ? 3 : 2; /* exact / IVF-PQ / NN-descent */
+    receipt.training_requested = tiny ? 0 : sample_rows;
+    receipt.training_actual = actual_training; /* resident candidate estimate */
+    receipt.host_estimate = cap.host_peak;
+    receipt.gpu_estimate = cap.gpu_peak;
+    receipt.host_budget = params->host_budget;
+    receipt.gpu_budget = params->gpu_budget;
+    receipt.sdk_host_budget = sdk_host_budget;
+    receipt.sdk_gpu_budget = sdk_gpu_budget;
+    if (!tiny && !disk) {
+        receipt.n_lists = pq_params.build_params.n_lists;
+        receipt.pq_dim = pq_params.build_params.pq_dim;
+        receipt.pq_bits = pq_params.build_params.pq_bits;
+        receipt.n_probes = pq_params.search_params.n_probes;
+        receipt.query_batch = 4096;
+    }
     if (cap.raw_bytes > SIZE_MAX)
     {
         snprintf(error, error_len, "HNSW input exceeds addressable file mapping");
@@ -2222,8 +2293,6 @@ cuvs_hnsw_build_file(int vectors_fd, int owner_fd,
         (unsigned long long)params->host_budget, (unsigned long long)params->gpu_budget,
         (unsigned long long)sdk_host_budget, (unsigned long long)sdk_gpu_budget,
         (unsigned long long)cap.host_peak, (unsigned long long)cap.gpu_peak);
-    try
-    {
         PooledRes resources(device_id);
         try
         {
@@ -2241,29 +2310,35 @@ cuvs_hnsw_build_file(int vectors_fd, int owner_fd,
             hnsw::index_params hp;
             hp.hierarchy = params->hierarchy ? hnsw::HnswHierarchy::GPU : hnsw::HnswHierarchy::NONE;
             hp.num_threads = 1;
+            hp.ef_construction = receipt.hierarchy_ef;
             if (disk)
             {
                 cagra::graph_build_params::ace_params ace;
                 ace.use_disk = true;
+                ace.ef_construction = receipt.ace_ef;
                 ace.build_dir = workdir;
                 ace.npartitions = partitions;
                 ace.max_host_memory_gb = (double)sdk_host_budget / (UINT64_C(1) << 30);
                 ace.max_gpu_memory_gb = (double)sdk_gpu_budget / (UINT64_C(1) << 30);
+#if CUVS_HNSW_HAS_SDK_PLAN
+                size_t effective = cuvs_hnsw_sdk_ace_plan(cp, params->n_vecs, params->dim,
+                    partitions, workdir, ace.max_host_memory_gb, ace.max_gpu_memory_gb);
+                size_t rechecked = cuvs_hnsw_sdk_ace_plan(cp, params->n_vecs, params->dim,
+                    effective, workdir, ace.max_host_memory_gb, ace.max_gpu_memory_gb);
+                if (effective != rechecked)
+                    throw std::runtime_error("ACE SDK partition plan is not stable; no build admitted");
+                ace.npartitions = effective;
+                receipt.partitions = (uint32_t)effective;
+#else
+                throw std::runtime_error("ACE metadata requires matching pinned SDK source planner; set CUVS_SDK_SOURCE_INCLUDE");
+#endif
                 cp.graph_build_params = ace;
                 // Guarded disk serializer reads THESE SAME positive budgets.
                 hp.graph_build_params = ace;
             }
             else
             {
-                cp.graph_build_params = cagra::graph_build_params::ivf_pq_params(data.extents(), cp.metric);
-                auto &pq = std::get<cagra::graph_build_params::ivf_pq_params>(cp.graph_build_params);
-                // Fixed bounded training subset and search batch; the full raw
-                // dataset stays host-addressable and is not attached on GPU.
-                pq.build_params.n_lists = std::min<uint32_t>(pq.build_params.n_lists,
-                    (uint32_t)std::max<uint64_t>(1, sample_rows / 32));
-                if (sample_rows < 256) pq.build_params.pq_bits = 4;
-                pq.build_params.kmeans_trainset_fraction = (double)sample_rows / params->n_vecs;
-                pq.search_params.max_internal_batch_size = 4096;
+                cp.graph_build_params = pq_params;
             }
             fprintf(stderr, "[hnsw_build] job=%s phase=cuvs-enter call=graph mono_us=%llu\n",
                 workdir, (unsigned long long)cuvs_hnsw_monotonic_us());
@@ -2340,6 +2415,8 @@ cuvs_hnsw_build_file(int vectors_fd, int owner_fd,
                 if (fd >= 0) close(fd);
                 throw std::runtime_error("cannot open regular disk HNSW output");
             }
+            receipt.guard_passed = 1; /* route + selected SDK guard returned; not a hard cap */
+            if (params->policy) *params->policy = receipt;
             *out_fd = fd; // files destructor unlinks the private directory
             fprintf(stderr, "[hnsw_build] %s partitions=%u rows=%llu dim=%u host_est=%llu gpu_est=%llu\n",
                 disk ? "ACE-disk" : tiny ? "tiny-GPU" : "host-IVFPQ", partitions, (unsigned long long)params->n_vecs, params->dim,

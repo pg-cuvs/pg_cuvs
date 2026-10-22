@@ -347,6 +347,9 @@ typedef struct CuvsHnswFileBuild {
     uint32_t graph_degree;
     uint32_t intermediate_degree;
     uint32_t hierarchy;
+    uint32_t build_algo;
+    uint32_t ef_construction;
+    CuvsHnswPolicy *policy; /* successful actual build receipt; caller-owned */
     /* Internal safe-boundary observer. Never received from IPC; only a
      * CUVS_TEST_HOOKS daemon installs it for controlled failure fixtures. */
     int (*phase_hook)(void *arg, const char *phase);
