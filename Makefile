@@ -88,7 +88,7 @@ CUVS_LIB      ?= $(CUVS_PREFIX)/lib
 # partition receipts; absent/mismatched support fails before an ACE build.
 CUVS_SDK_SOURCE_INCLUDE ?=
 ifneq ($(strip $(CUVS_SDK_SOURCE_INCLUDE)),)
-NVCC_FLAGS += -I$(CUVS_SDK_SOURCE_INCLUDE) -Xcompiler=-fopenmp
+CUVS_SDK_PLAN_FLAGS = -I$(CUVS_SDK_SOURCE_INCLUDE) -Xcompiler=-fopenmp
 CUVS_SDK_PLAN_LINK = -fopenmp -lrapids_logger
 endif
 
@@ -134,7 +134,7 @@ src/cuvs_wrapper.o: | verify-hnsw-sdk-plan
 endif
 
 src/cuvs_wrapper.o: src/cuvs_wrapper.cu src/cuvs_wrapper.h src/cuvs_hnsw_sdk_plan.cuh
-	$(NVCC) $(NVCC_FLAGS) -I$(CUVS_INCLUDE) -I$(CUVS_RAPIDS_INCLUDE) -I./src -c $< -o $@
+	$(NVCC) $(NVCC_FLAGS) $(CUVS_SDK_PLAN_FLAGS) -I$(CUVS_INCLUDE) -I$(CUVS_RAPIDS_INCLUDE) -I./src -c $< -o $@
 
 # PGXS generates LLVM bitcode (.bc) from .c sources for JIT. The .cu file
 # has no PG-callable functions, so emit a stub bitcode so PGXS doesn't fail.
