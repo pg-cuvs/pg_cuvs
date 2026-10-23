@@ -884,6 +884,39 @@ test_hierarchical_native_packing_case(int dim, int bytes_per_dim, int m)
     packed = malloc(chain_test_nblocks * BLCKSZ);
     assert(packed != NULL);
     memcpy(packed, chain_test_pages, chain_test_nblocks * BLCKSZ);
+    if (getenv("HNSW_PACKING_FIXTURE_OUTPUT") != NULL && (m == 32 || m == 4))
+    {
+        char directory[1024];
+        char path[1100];
+        const int fds[2] = {f.hnsw_fd, f.tids_fd};
+        const char *names[2] = {"native.bin", "tids.bin"};
+        FILE *out;
+        unsigned char buffer[65536];
+
+        assert(snprintf(directory, sizeof(directory), "%s/d%d-b%d-m%d",
+                        getenv("HNSW_PACKING_FIXTURE_OUTPUT"), dim,
+                        bytes_per_dim, m) < (int)sizeof(directory));
+        assert(mkdir(directory, 0700) == 0);
+        for (int input = 0; input < 2; input++)
+        {
+            off_t offset = 0;
+            ssize_t bytes;
+            snprintf(path, sizeof(path), "%s/%s", directory, names[input]);
+            out = fopen(path, "wbx");
+            assert(out != NULL);
+            while ((bytes = pread(fds[input], buffer, sizeof(buffer), offset)) > 0)
+            {
+                assert(fwrite(buffer, 1, (size_t)bytes, out) == (size_t)bytes);
+                offset += bytes;
+            }
+            assert(bytes == 0 && fclose(out) == 0);
+        }
+        snprintf(path, sizeof(path), "%s/pgindex", directory);
+        out = fopen(path, "wbx");
+        assert(out != NULL && fwrite(packed, BLCKSZ, n_pages + 1, out) == n_pages + 1);
+        assert(fclose(out) == 0);
+    }
+
     chain_test_reset();
     hnsw_disk_row_init(&row, &parsed, (uint32_t)dim);
     upper_cursor = HNSWLIB_HEADER_BYTES + N * parsed.sizeDataPerElement;
@@ -944,6 +977,7 @@ test_hierarchical_native_packing_shapes(void)
     test_hierarchical_native_packing_case(768, 2, 32);
     test_hierarchical_native_packing_case(1536, 2, 32);
     test_hierarchical_native_packing_case(3072, 2, 32);
+    test_hierarchical_native_packing_case(768, 2, 4);
     test_hierarchical_native_packing_case(8, 4, 2);
     test_hierarchical_native_packing_case(16, 4, 64);
 }
