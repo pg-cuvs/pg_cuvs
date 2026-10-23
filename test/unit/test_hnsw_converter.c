@@ -29,8 +29,11 @@ static Page test_buffer_get_page(Buffer buffer);
 #undef BufferGetPage
 #define BufferGetPage(buffer) test_buffer_get_page(buffer)
 static void *test_palloc(Size size);
+static void test_pfree(void *pointer);
 #undef palloc
 #define palloc(size) test_palloc(size)
+#undef pfree
+#define pfree(pointer) test_pfree(pointer)
 /* Simulate a cancel arriving after the first location-table read. */
 static jmp_buf test_interrupt_jump;
 static bool test_readback_cancel_enabled;
@@ -134,11 +137,6 @@ palloc0(Size size)
     return calloc(1, size);
 }
 
-void
-pfree(void *pointer)
-{
-    free(pointer);
-}
 #endif
 
 /* A regular-file stand-in for BufFile lets this standalone test exercise the
@@ -254,6 +252,17 @@ test_palloc(Size size)
     result = &chain_test_palloc_arena[chain_test_palloc_used];
     chain_test_palloc_used += aligned_size;
     return result;
+}
+
+static void
+test_pfree(void *pointer)
+{
+    uintptr_t address = (uintptr_t)pointer;
+    uintptr_t start = (uintptr_t)chain_test_palloc_arena;
+
+    /* palloc scratch is reset with the fixture context; palloc0 uses malloc. */
+    if (address < start || address >= start + sizeof(chain_test_palloc_arena))
+        free(pointer);
 }
 
 Buffer
@@ -663,9 +672,9 @@ test_legacy_writer_page_chains(void)
 }
 
 static void
-test_disk_writer_page_chain(void)
+test_disk_writer_page_chain_case(bool hierarchical)
 {
-    Fixture f = fixture_create(true);
+    Fixture f = fixture_create(hierarchical);
     struct BufFile table_file = {.fd = make_temp_fd()};
     HnswLocationTable locations;
     HnswlibHeader header;
@@ -676,7 +685,7 @@ test_disk_writer_page_chain(void)
     locations.file = &table_file;
     locations.n_nodes = 2;
     assert(hnsw_file_preflight(f.hnsw_fd, f.tids_fd, 2, 2,
-                               CUVS_METRIC_COSINE, 4, false,
+                               CUVS_METRIC_COSINE, 4, !hierarchical,
                                &header, &tids_header,
                                hnsw_location_table_append, &locations, NULL,
                                error, sizeof(error)));
@@ -684,11 +693,259 @@ test_disk_writer_page_chain(void)
 
     chain_test_reset();
     hnsw_write_disk_pages(NULL, f.hnsw_fd, f.tids_fd, &header, 2, 2, 4,
-                          false, 1, 2, true, &locations);
-    assert_source_data_page_chain(2);
+                          1, true, &locations);
+    assert_source_data_page_chain(1);
+    assert(PageGetMaxOffsetNumber((Page)chain_test_pages[1]) == 4);
 
     BufFileClose(&table_file);
     fixture_close(&f);
+}
+
+static void
+test_disk_writer_page_chain(void)
+{
+    test_disk_writer_page_chain_case(true);
+    test_disk_writer_page_chain_case(false);
+}
+
+static void
+test_hierarchical_preflight_packs_locations(void)
+{
+    Fixture f = fixture_create(true);
+    struct BufFile table_file = {.fd = make_temp_fd()};
+    HnswLocationTable locations = {0};
+    HnswlibHeader header;
+    CuvsTidsHeader tids_header;
+    HnswNodeLocation first;
+    HnswNodeLocation second;
+    char error[256] = {0};
+
+    locations.file = &table_file;
+    locations.n_nodes = 2;
+    assert(hnsw_file_preflight(f.hnsw_fd, f.tids_fd, 2, 2,
+                               CUVS_METRIC_COSINE, 4, false,
+                               &header, &tids_header,
+                               hnsw_location_table_append, &locations, NULL,
+                               error, sizeof(error)));
+    assert(hnsw_location_table_rewind(&locations, 2));
+    assert(hnsw_location_table_lookup(&locations, 0, &first));
+    assert(hnsw_location_table_lookup(&locations, 1, &second));
+    assert(first.elem_blkno == 1 && first.elem_offno == 1 && first.level == 1);
+    assert(second.elem_blkno == 1 && second.elem_offno == 3 && second.level == 0);
+    BufFileClose(&table_file);
+    fixture_close(&f);
+}
+
+static void
+test_hierarchical_packing_cursor_bounds(void)
+{
+    HnswPackingCursor cursor = {0};
+    HnswNodeLocation location;
+
+    assert(!hnsw_pack_location_next(&cursor, 1, 3, 0, 898, 4, 32, &location));
+    assert(cursor.next_node == 0 && cursor.block == 0);
+    assert(!hnsw_pack_location_next(&cursor, 0, 3, 0, 0, 4, 32, &location));
+    assert(!hnsw_pack_location_next(&cursor, 0, 3, 0, 898, 3, 32, &location));
+    assert(!hnsw_pack_location_next(&cursor, 0, 3, 256, 898, 4, 32, &location));
+    assert(!hnsw_pack_location_next(&cursor, 0, 3, 0, INT16_MAX, 4, 32, &location));
+    /* At D898/M32, two conservative reservations exactly fill 8160 bytes. */
+    assert(hnsw_pack_location_next(&cursor, 0, 3, 0, 898, 4, 32, &location));
+    assert(location.elem_blkno == 1 && location.elem_offno == 1);
+    assert(hnsw_pack_location_next(&cursor, 1, 3, 0, 898, 4, 32, &location));
+    assert(location.elem_blkno == 1 && location.elem_offno == 3);
+    assert(cursor.remaining == 0);
+    assert(hnsw_pack_location_next(&cursor, 2, 3, 0, 898, 4, 32, &location));
+    assert(location.elem_blkno == 2 && location.elem_offno == 1);
+    assert(!hnsw_pack_location_next(&cursor, 3, 3, 0, 898, 4, 32, &location));
+    cursor = (HnswPackingCursor){.block = InvalidBlockNumber - 1};
+    assert(!hnsw_pack_location_next(&cursor, 0, 1, 0, 898, 4, 32, &location));
+}
+
+static uint32_t
+test_pointer_block(const PgvItemPointer *pointer)
+{
+    return ((uint32_t)pointer->ip_blkid.bi_hi << 16) | pointer->ip_blkid.bi_lo;
+}
+
+/* Exercise native files -> production preflight/location table -> staged
+ * metapage/page writer. Compare every tuple against the same row-local
+ * consumer rendered with the original one-pair layout, translating only
+ * physical pointers. Reversed labels and duplicate ordered edges are kept. */
+static void
+test_hierarchical_native_packing_case(int dim, int bytes_per_dim, int m)
+{
+    enum { N = 7 };
+    const int levels[N] = {0, 2, 0, 1, 0, 0, 0};
+    Fixture f = {make_temp_fd(), make_temp_fd()};
+    struct BufFile table_file = {.fd = make_temp_fd()};
+    HnswLocationTable table = {.file = &table_file, .n_nodes = N};
+    HnswlibHeader header = {0};
+    HnswlibHeader parsed;
+    CuvsTidsHeader tids_header = {0};
+    CuvsTidsHeader parsed_tids;
+    CuvsHnswPolicy policy = {0};
+    HnswNodeLocation locations[N];
+    ElemDesc reference_locations[N] = {{0}};
+    uint64_t tids[N];
+    size_t row_bytes = (size_t)(1 + 2 * m) * sizeof(int)
+        + (size_t)dim * sizeof(float) + sizeof(size_t);
+    char *raw_row = calloc(1, row_bytes);
+    char error[256] = {0};
+    char *packed;
+    uint32_t n_pages;
+    HnswDiskRow row;
+    uint64_t upper_cursor;
+
+    assert(raw_row != NULL);
+    header.maxElements = header.curElementCount = N;
+    header.sizeDataPerElement = row_bytes;
+    header.offsetData = (size_t)(1 + 2 * m) * sizeof(int);
+    header.labelOffset = header.offsetData + (size_t)dim * sizeof(float);
+    header.maxlevel = 2;
+    header.enterpointNode = 1;
+    header.maxM = header.M = (size_t)m;
+    header.maxM0 = (size_t)(2 * m);
+    header.mult = 1.0;
+    header.efConstruction = 200;
+    assert(write(f.hnsw_fd, &header, sizeof(header)) == sizeof(header));
+    for (int node = 0; node < N; node++)
+    {
+        int count = 3;
+        int links[3] = {N - 1, N - 1, 0};
+        size_t label = (size_t)(N - 1 - node);
+        memset(raw_row, 0, row_bytes);
+        memcpy(raw_row, &count, sizeof(count));
+        memcpy(raw_row + sizeof(count), links, sizeof(links));
+        for (int d = 0; d < dim; d++)
+        {
+            float value = (float)(node * 16 + d) / 32.0f;
+            memcpy(raw_row + header.offsetData + (size_t)d * sizeof(float),
+                   &value, sizeof(value));
+        }
+        memcpy(raw_row + header.labelOffset, &label, sizeof(label));
+        assert(write(f.hnsw_fd, raw_row, row_bytes) == (ssize_t)row_bytes);
+        tids[node] = cuvs_tid_encode((uint32_t)(100 + node), (uint16_t)(node + 1));
+        reference_locations[node].elem_blkno = (uint32_t)node + 1;
+        reference_locations[node].elem_offno = 1;
+    }
+    free(raw_row);
+    for (int node = 0; node < N; node++)
+    {
+        uint32_t bytes = (uint32_t)(levels[node] * (m + 1) * sizeof(int));
+        int *links = calloc((size_t)(m + 1), sizeof(int));
+        assert(links != NULL);
+        links[0] = 2;
+        links[1] = links[2] = 1;
+        assert(write(f.hnsw_fd, &bytes, sizeof(bytes)) == sizeof(bytes));
+        for (int level = 0; level < levels[node]; level++)
+            assert(write(f.hnsw_fd, links, (size_t)(m + 1) * sizeof(int)) ==
+                   (ssize_t)((m + 1) * sizeof(int)));
+        free(links);
+    }
+    tids_header.magic = CUVS_TIDS_MAGIC;
+    tids_header.version = CUVS_TIDS_VERSION;
+    tids_header.n_vecs = N;
+    tids_header.dim = (uint32_t)dim;
+    tids_header.metric = CUVS_METRIC_L2;
+    tids_header.body_crc32 = cuvs_crc32(tids, sizeof(tids));
+    assert(write(f.tids_fd, &tids_header, sizeof(tids_header)) == sizeof(tids_header));
+    assert(write(f.tids_fd, tids, sizeof(tids)) == sizeof(tids));
+    assert(hnsw_file_preflight(f.hnsw_fd, f.tids_fd, N, (uint32_t)dim,
+                               CUVS_METRIC_L2, bytes_per_dim, false,
+                               &parsed, &parsed_tids, hnsw_location_table_append,
+                               &table, NULL, error, sizeof(error)));
+    assert(hnsw_location_table_rewind(&table, N));
+    for (int node = 0; node < N; node++)
+        assert(hnsw_location_table_lookup(&table, (uint32_t)node, &locations[node]));
+    n_pages = locations[N - 1].elem_blkno;
+    assert(n_pages > 0 && n_pages <= N);
+    policy.magic = CUVS_HNSW_POLICY_MAGIC;
+    policy.version = CUVS_HNSW_POLICY_VERSION;
+    policy.bytes = sizeof(policy);
+    policy.route = CUVS_HNSW_ROUTE_TINY;
+    policy.requested_ef = 64;
+    policy.guard_passed = 1;
+    chain_test_reset();
+    chain_test_nblocks = 0;
+    hnsw_write_disk_metapage(NULL, &parsed, (uint32_t)dim, n_pages,
+                             true, &table, &policy);
+    hnsw_write_disk_pages(NULL, f.hnsw_fd, f.tids_fd, &parsed, N,
+                          (uint32_t)dim, bytes_per_dim, n_pages, true, &table);
+    assert_source_data_page_chain(n_pages);
+    {
+        PgvHnswMeta *meta = (PgvHnswMeta *)PageGetContents(chain_test_pages[0]);
+        assert(meta->entryBlkno == locations[1].elem_blkno &&
+               meta->entryOffno == locations[1].elem_offno && meta->entryLevel == 2);
+        assert(meta->insertPage == n_pages);
+        assert(memcmp((char *)meta + sizeof(*meta), &policy, sizeof(policy)) == 0);
+        if (dim == 768 && bytes_per_dim == 4 && m == 32)
+            assert(n_pages == 4 && meta->entryOffno == 3);
+    }
+    packed = malloc(chain_test_nblocks * BLCKSZ);
+    assert(packed != NULL);
+    memcpy(packed, chain_test_pages, chain_test_nblocks * BLCKSZ);
+    chain_test_reset();
+    hnsw_disk_row_init(&row, &parsed, (uint32_t)dim);
+    upper_cursor = HNSWLIB_HEADER_BYTES + N * parsed.sizeDataPerElement;
+    for (int node = 0; node < N; node++)
+    {
+        hnsw_read_disk_row(f.hnsw_fd, f.tids_fd, &parsed, N, (uint32_t)dim,
+                           (uint64_t)node, &upper_cursor, &table, &row);
+        row.elem.elem_blkno = row.elem.neigh_blkno = (uint32_t)node + 1;
+        row.elem.elem_offno = 1;
+        row.elem.neigh_offno = 2;
+        write_elem_page(NULL, (uint32_t)node + 1, &row.elem, row.vector,
+                        dim, bytes_per_dim, m, N, true,
+                        hnsw_lookup_elem_array, reference_locations);
+    }
+    for (int node = 0; node < N; node++)
+    {
+        Page old_page = chain_test_pages[node + 1];
+        Page new_page = packed + (size_t)locations[node].elem_blkno * BLCKSZ;
+        char *old_element = PageGetItem(old_page, PageGetItemId(old_page, 1));
+        char *new_element = PageGetItem(new_page, PageGetItemId(new_page, locations[node].elem_offno));
+        char *old_neighbors = PageGetItem(old_page, PageGetItemId(old_page, 2));
+        char *new_neighbors = PageGetItem(new_page, PageGetItemId(new_page, locations[node].elem_offno + 1));
+        size_t esize = elem_tuple_size(dim, bytes_per_dim);
+        int slots = (levels[node] + 2) * m;
+        PgvItemPointer *op = (PgvItemPointer *)(old_neighbors + sizeof(PgvHnswNeighHdr));
+        PgvItemPointer *np = (PgvItemPointer *)(new_neighbors + sizeof(PgvHnswNeighHdr));
+        PgvHnswElemHdr *elem = (PgvHnswElemHdr *)new_element;
+        assert(memcmp(old_element, new_element, 64) == 0);
+        assert(memcmp(old_element + 70, new_element + 70, esize - 70) == 0);
+        assert(test_pointer_block(&elem->heaptids[0]) == (uint32_t)(100 + N - 1 - node));
+        assert(elem->heaptids[0].ip_posid == N - node);
+        assert(test_pointer_block(&elem->neighbortid) == locations[node].elem_blkno);
+        assert(elem->neighbortid.ip_posid == locations[node].elem_offno + 1);
+        assert(memcmp(old_neighbors, new_neighbors, sizeof(PgvHnswNeighHdr)) == 0);
+        for (int slot = 0; slot < slots; slot++)
+        {
+            if (op[slot].ip_posid == 0)
+                assert(memcmp(&op[slot], &np[slot], sizeof(*op)) == 0);
+            else
+            {
+                uint32_t target = test_pointer_block(&op[slot]) - 1;
+                assert(target < N);
+                assert(test_pointer_block(&np[slot]) == locations[target].elem_blkno);
+                assert(np[slot].ip_posid == locations[target].elem_offno);
+            }
+        }
+    }
+    free(packed);
+    BufFileClose(&table_file);
+    fixture_close(&f);
+}
+
+static void
+test_hierarchical_native_packing_shapes(void)
+{
+    test_hierarchical_native_packing_case(768, 4, 32);
+    test_hierarchical_native_packing_case(1536, 4, 32);
+    test_hierarchical_native_packing_case(768, 2, 32);
+    test_hierarchical_native_packing_case(1536, 2, 32);
+    test_hierarchical_native_packing_case(3072, 2, 32);
+    test_hierarchical_native_packing_case(8, 4, 2);
+    test_hierarchical_native_packing_case(16, 4, 64);
 }
 
 static void
@@ -933,7 +1190,10 @@ main(void)
     test_empty_page_images();
     test_packed_page_geometry();
     test_legacy_writer_page_chains();
+    test_hierarchical_preflight_packs_locations();
     test_disk_writer_page_chain();
+    test_hierarchical_packing_cursor_bounds();
+    test_hierarchical_native_packing_shapes();
     test_pgvector_page_version_range();
     test_buffered_location_table_contract();
     test_location_readback_interrupt();
