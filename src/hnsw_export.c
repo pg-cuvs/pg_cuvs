@@ -19,8 +19,9 @@
  *
  * pgvector HNSW on-disk layout (all sizes in bytes, LE):
  *   Block 0: metapage (HnswMetaPageData + HnswPageOpaqueData)
- *   Blocks 1..N: interleaved element tuples (type=1) and neighbor tuples (type=2)
- *     One page per element pair; unused space left empty.
+ *   Data blocks: interleaved element tuples (type=1) and neighbor tuples (type=2).
+ *     Source-less imports pack consecutive pairs, including variable levels;
+ *     legacy import paths may retain one page per pair.
  *
  * We do NOT include pgvector's hnsw.h (not installed).  All structs are
  * defined locally matching the pgvector 0.8.x binary layout.
@@ -655,6 +656,52 @@ hnsw_page_pair_fits(int dim, int bytes_per_dim, int m, int level)
     return needed <= PGV_USABLE_BYTES;
 }
 
+/* A bounded cursor assigns hierarchical rows in their serialized order.
+ * The reservation matches the existing page-fit check, including its
+ * conservative item-pointer margin. Node/edge order never changes. */
+typedef struct HnswPackingCursor
+{
+    uint64_t next_node;
+    uint32_t block;
+    uint16_t next_offset;
+    size_t remaining;
+} HnswPackingCursor;
+
+static bool
+hnsw_pack_location_next(HnswPackingCursor *cursor,
+                        uint64_t node, uint64_t n_nodes, int level,
+                        int dim, int bytes_per_dim, int m,
+                        HnswNodeLocation *location)
+{
+    size_t needed;
+
+    if (!cursor || !location || node != cursor->next_node || node >= n_nodes ||
+        level < 0 || level > UINT8_MAX ||
+        !hnsw_page_pair_fits(dim, bytes_per_dim, m, level))
+        return false;
+    needed = elem_tuple_size(dim, bytes_per_dim) + neigh_tuple_size(level, m)
+        + 4 * PGV_ITEM_OVERHEAD;
+    if (cursor->block == 0 || cursor->remaining < needed)
+    {
+        if (cursor->block >= InvalidBlockNumber - 1)
+            return false;
+        cursor->block++;
+        cursor->next_offset = 1;
+        cursor->remaining = PGV_USABLE_BYTES;
+    }
+    if (cursor->next_offset == InvalidOffsetNumber ||
+        cursor->next_offset + 1 > MaxOffsetNumber)
+        return false;
+    location->elem_blkno = cursor->block;
+    location->elem_offno = cursor->next_offset;
+    location->level = (uint8_t)level;
+    location->reserved = 0;
+    cursor->remaining -= needed;
+    cursor->next_offset += 2;
+    cursor->next_node++;
+    return true;
+}
+
 static bool
 hnsw_file_preflight(int hnsw_fd, int tids_fd,
                     uint64_t expected_n_vecs,
@@ -680,6 +727,7 @@ hnsw_file_preflight(int hnsw_fd, int tids_fd,
     uint64_t entrypoint_level = UINT64_MAX;
     uint64_t per_level_bytes;
     uint32_t pairs_per_page = 0;
+    HnswPackingCursor packing = {0};
     unsigned char crc_buffer[HNSW_FILE_IO_CHUNK];
     uint32_t crc_state;
     uint64_t tids_remaining;
@@ -971,8 +1019,12 @@ hnsw_file_preflight(int hnsw_fd, int tids_fd,
             observed_max_level = level;
         if (node == (uint64_t)h.enterpointNode)
             entrypoint_level = level;
-        if (!hnsw_layout_location(node, expected_n_vecs, (uint8_t)level,
-                                  packed_nsw, pairs_per_page, &location))
+        if (!(packed_nsw
+              ? hnsw_layout_location(node, expected_n_vecs, (uint8_t)level,
+                                      true, pairs_per_page, &location)
+              : hnsw_pack_location_next(&packing, node, expected_n_vecs,
+                                         (int)level, (int)expected_dim,
+                                         bytes_per_dim, (int)h.M, &location)))
         {
             hnsw_set_file_error(error, error_size,
                                 "HNSW node layout exceeds PostgreSQL page limits");
@@ -2452,8 +2504,7 @@ hnsw_publish_staged_page(Relation rel, Page staged, bool skip_wal)
 static void
 hnsw_write_disk_pages(Relation rel, int hnsw_fd, int tids_fd,
                       const HnswlibHeader *header, uint64_t n_nodes,
-                      uint32_t dim, int bytes_per_dim, bool packed_nsw,
-                      uint32_t pack_k, uint32_t data_page_count,
+                      uint32_t dim, int bytes_per_dim, uint32_t data_page_count,
                       bool skip_wal,
                       HnswLocationTable *locations)
 {
@@ -2461,7 +2512,7 @@ hnsw_write_disk_pages(Relation rel, int hnsw_fd, int tids_fd,
     Page staged = (Page)palloc(BLCKSZ);
     uint64_t upper_cursor;
     uint64_t level0_bytes;
-    uint64_t page_start = 0;
+    uint32_t current_block = 0;
     int m = (int)header->M;
 
     if (!hnsw_mul_u64(n_nodes, header->sizeDataPerElement, &level0_bytes) ||
@@ -2469,39 +2520,34 @@ hnsw_write_disk_pages(Relation rel, int hnsw_fd, int tids_fd,
         ereport(ERROR, (errmsg("pg_cuvs: HNSW level-0 offset overflow")));
     hnsw_disk_row_init(&row, header, dim);
 
-    while (page_start < n_nodes)
+    for (uint64_t node = 0; node < n_nodes; node++)
     {
-        uint64_t page_end;
-
         CHECK_FOR_INTERRUPTS();
-        if (packed_nsw)
+        hnsw_read_disk_row(hnsw_fd, tids_fd, header, n_nodes, dim,
+                           node, &upper_cursor, locations, &row);
+        if (row.elem.elem_blkno != current_block)
         {
-            page_end = page_start + pack_k;
-            if (page_end > n_nodes)
-                page_end = n_nodes;
+            if (row.elem.elem_blkno != current_block + 1 ||
+                row.elem.elem_blkno > data_page_count)
+                ereport(ERROR,
+                        (errmsg("pg_cuvs: noncontiguous source-less HNSW page layout")));
+            if (current_block != 0)
+                hnsw_publish_staged_page(rel, staged, skip_wal);
+            current_block = row.elem.elem_blkno;
+            hnsw_init_disk_page(staged);
+            if (!hnsw_set_disk_page_chain(staged, current_block, data_page_count))
+                ereport(ERROR,
+                        (errmsg("pg_cuvs: invalid source-less HNSW data page chain position")));
         }
-        else
-            page_end = page_start + 1;
-
-        hnsw_init_disk_page(staged);
-        if (!hnsw_set_disk_page_chain(
-                staged,
-                (packed_nsw ? page_start / pack_k : page_start) + 1,
-                data_page_count))
-            ereport(ERROR,
-                    (errmsg("pg_cuvs: invalid source-less HNSW data page chain position")));
-
-        for (uint64_t node = page_start; node < page_end; node++)
-        {
-            hnsw_read_disk_row(hnsw_fd, tids_fd, header, n_nodes, dim,
-                               node, &upper_cursor, locations, &row);
-            write_elem_pair(staged, &row.elem, row.vector, (int)dim,
-                            bytes_per_dim, m, (size_t)n_nodes,
-                            hnsw_location_table_lookup, locations);
-        }
-        hnsw_publish_staged_page(rel, staged, skip_wal);
-        page_start = page_end;
+        write_elem_pair(staged, &row.elem, row.vector, (int)dim,
+                        bytes_per_dim, m, (size_t)n_nodes,
+                        hnsw_location_table_lookup, locations);
     }
+    if (current_block != data_page_count)
+        ereport(ERROR,
+                (errmsg("pg_cuvs: source-less HNSW page count differs from layout")));
+    if (current_block != 0)
+        hnsw_publish_staged_page(rel, staged, skip_wal);
 }
 
 static void
@@ -2622,11 +2668,10 @@ hnsw_import_build_result(Relation indexRel,
     volatile HnswDiskImportState state;
     HnswlibHeader header;
     CuvsTidsHeader tids_header;
-    uint32_t pack_k = 1;
+    HnswNodeLocation last_location;
     char error[256] = {0};
     Oid index_oid = RelationGetRelid(indexRel);
     Form_pg_attribute attr = TupleDescAttr(RelationGetDescr(indexRel), 0);
-    int dim = (int)attr->atttypmod;
     int bytes_per_dim = bytes_per_dim_for_typid(attr->atttypid);
     bool skip_wal;
     uint32_t data_page_count;
@@ -2658,14 +2703,14 @@ hnsw_import_build_result(Relation indexRel,
         if (!hnsw_location_table_rewind(&s->locations, build->n_vecs))
             ereport(ERROR,
                     (errmsg("pg_cuvs: incomplete disk-backed HNSW location table")));
-        if (packed_nsw &&
-            !hnsw_compute_pack_k(dim, bytes_per_dim, (int)header.M, &pack_k))
-            ereport(ERROR,
-                    (errmsg("pg_cuvs: NSW element and neighbor tuples do not fit on a page")));
-        if (!hnsw_data_page_count(build->n_vecs, packed_nsw, pack_k,
-                                  &data_page_count))
+        if (!hnsw_location_table_lookup(&s->locations,
+                                         (uint32_t)(build->n_vecs - 1),
+                                         &last_location) ||
+            last_location.elem_blkno == 0 ||
+            last_location.elem_blkno == InvalidBlockNumber)
             ereport(ERROR,
                     (errmsg("pg_cuvs: HNSW data page count exceeds block number limits")));
+        data_page_count = last_location.elem_blkno;
 
         s->target = index_open(index_oid, AccessExclusiveLock);
         skip_wal = RelationGetForm(s->target)->relpersistence == RELPERSISTENCE_UNLOGGED;
@@ -2684,8 +2729,7 @@ hnsw_import_build_result(Relation indexRel,
                                  data_page_count, skip_wal, &s->locations, &build->policy);
         hnsw_write_disk_pages(s->target, build->hnsw_fd, build->tids_fd,
                               &header, build->n_vecs, build->dim,
-                              bytes_per_dim, packed_nsw, pack_k,
-                              data_page_count, skip_wal,
+                              bytes_per_dim, data_page_count, skip_wal,
                               &s->locations);
         index_close(s->target, AccessExclusiveLock);
         s->target = NULL;
