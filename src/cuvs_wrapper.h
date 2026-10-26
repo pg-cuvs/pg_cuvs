@@ -363,7 +363,6 @@ int cuvs_hnsw_build_file(int vectors_fd, int owner_fd,
 /* Reap only private temporary directories whose daemon lease lock is gone. */
 int cuvs_hnsw_reap_workdirs(const char *root);
 
-#define CUVS_HNSW_MIN_ELEMENTS       16
 #define CUVS_HNSW_SERIALIZE_OK        0
 #define CUVS_HNSW_SERIALIZE_SKIPPED   1
 

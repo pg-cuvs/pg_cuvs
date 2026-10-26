@@ -16,7 +16,7 @@
  */
 
 #ifndef PG_CUVS_VERSION
-#define PG_CUVS_VERSION "0.8.1"
+#define PG_CUVS_VERSION "0.8.2"
 #endif
 
 #ifndef CUVS_BUILD_VERSION

@@ -133,6 +133,21 @@ typedef struct {
     uint32_t        insertPage;
 } PgvHnswMeta;      /* 28 bytes */
 
+/* Keep the pgvector prefix untouched. The shared bounded decoder consumes
+ * only the stored receipt tail, never current GUCs or a guessed build route. */
+static CuvsHnswPolicyReadStatus
+hnsw_read_disk_policy(Page page, CuvsHnswPolicy *out)
+{
+    Size prefix = SizeOfPageHeaderData + sizeof(PgvHnswMeta);
+    PageHeader header = (PageHeader)page;
+    memset(out, 0, sizeof(*out));
+    if (header->pd_lower < prefix) return CUVS_HNSW_POLICY_NOT_RECORDED;
+    if (header->pd_lower > BLCKSZ || header->pd_lower > header->pd_upper)
+        return CUVS_HNSW_POLICY_CORRUPT;
+    return cuvs_hnsw_policy_read((const char *)page + prefix,
+                                 header->pd_lower - prefix, out);
+}
+
 /* ---- page opaque (special area, 8 bytes) ---- */
 typedef struct {
     uint32_t    nextblkno;
@@ -3559,15 +3574,15 @@ cuvs_hnsw_validate_mode(const char *value)
 static void
 cuvs_hnsw_validate_build_algo(const char *value)
 {
-    if (!value || !strcmp(value, "auto") || !strcmp(value, "ivf_pq")) return;
+    if (cuvs_hnsw_algo_supported(cuvs_hnsw_algo_from_name(value))) return;
     if (!strcmp(value, "nn_descent"))
         ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
             errmsg("pg_cuvs_hnsw: build_algo=nn_descent is reserved but unsupported"),
             errdetail("NN-descent has no supported memory estimate for this build path."),
-            errhint("Use build_algo=auto (bounded resident IVF-PQ or ACE-disk).")));
+            errhint("Use build_algo=auto for tiny/resident IVF-PQ, or build_algo=ace for an explicit disk build.")));
     ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
         errmsg("pg_cuvs_hnsw: invalid build_algo \"%s\"", value),
-        errhint("Valid supported values: auto, ivf_pq.")));
+        errhint("Valid supported values: auto, ivf_pq, ace.")));
 }
 
 /* One-time relopt registration; called from _PG_init. */
@@ -3582,7 +3597,7 @@ cuvs_hnsw_init_reloptions(void)
                          "Conversion mode: nsw (default), hnsw, hnswlib, hnswlib_file",
                          "nsw", cuvs_hnsw_validate_mode, AccessExclusiveLock);
     add_string_reloption(cuvs_hnsw_relopt_kind, "build_algo",
-                         "HNSW route: auto or explicit ivf_pq; estimates are not memory upper bounds",
+                         "HNSW route: auto=tiny/resident IVF-PQ, explicit ivf_pq or ace; estimates are not memory upper bounds",
                          "auto", cuvs_hnsw_validate_build_algo, AccessExclusiveLock);
     add_int_reloption(cuvs_hnsw_relopt_kind, "m",
                       "pgvector HNSW M; informational (graph degree drives layout)",
@@ -3617,6 +3632,7 @@ pg_cuvs_hnsw_build_info(PG_FUNCTION_ARGS)
     Oid oid = PG_GETARG_OID(0);
     Relation rel = index_open(oid, AccessShareLock);
     CuvsHnswPolicy policy = {0};
+    CuvsHnswPolicyReadStatus policy_status = CUVS_HNSW_POLICY_NOT_RECORDED;
     StringInfoData json;
     Oid heap;
     if (rel->rd_rel->relam != get_am_oid("pg_cuvs_hnsw", true))
@@ -3631,15 +3647,18 @@ pg_cuvs_hnsw_build_info(PG_FUNCTION_ARGS)
         Page page;
         LockBuffer(buffer, BUFFER_LOCK_SHARE);
         page = BufferGetPage(buffer);
-        if (((PageHeader)page)->pd_lower >= SizeOfPageHeaderData + sizeof(PgvHnswMeta) + sizeof(policy))
-            memcpy(&policy, (char *)PageGetContents(page) + sizeof(PgvHnswMeta), sizeof(policy));
+        policy_status = hnsw_read_disk_policy(page, &policy);
         UnlockReleaseBuffer(buffer);
     }
     index_close(rel, AccessShareLock);
-    if (policy.magic == CUVS_HNSW_POLICY_MAGIC && !cuvs_hnsw_policy_valid(&policy))
+    if (policy_status == CUVS_HNSW_POLICY_UNSUPPORTED)
+        ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+            errmsg("pg_cuvs: unsupported stored HNSW policy receipt version"),
+            errhint("Use an extension version supporting this receipt; do not rewrite historical metadata.")));
+    if (policy_status == CUVS_HNSW_POLICY_CORRUPT)
         ereport(ERROR, (errcode(ERRCODE_INDEX_CORRUPTED),
-            errmsg("pg_cuvs: invalid or unsupported stored HNSW policy receipt")));
-    if (!cuvs_hnsw_policy_valid(&policy))
+            errmsg("pg_cuvs: invalid stored HNSW policy receipt")));
+    if (policy_status == CUVS_HNSW_POLICY_NOT_RECORDED)
         PG_RETURN_DATUM(DirectFunctionCall1(jsonb_in,
             CStringGetDatum("{\"status\":\"not_recorded\",\"reason\":\"legacy, empty, or reused source graph; rebuild to record a native policy\"}")));
     initStringInfo(&json);
@@ -3658,7 +3677,7 @@ pg_cuvs_hnsw_build_info(PG_FUNCTION_ARGS)
         "\"guard\":\"selected_route_returned\",\"memory_upper_bound_guaranteed\":false}",
         policy.version, cuvs_hnsw_route_name(policy.route),
         (unsigned long long)policy.n_rows, policy.dim, policy.metric,
-        policy.requested_algo ? "ivf_pq" : "auto", policy.requested_ef,
+        cuvs_hnsw_algo_name(policy.requested_algo), policy.requested_ef,
         policy.degree, policy.intermediate, policy.hierarchy,
         policy.hierarchy_ef, policy.ace_ef, policy.partitions,
         policy.route == CUVS_HNSW_ROUTE_ACE ? "same_SDK_stable_explicit_plan" : "not_applicable",
@@ -3696,7 +3715,7 @@ cuvs_hnsw_ambuild(Relation heapRel, Relation indexRel, IndexInfo *indexInfo)
         ? (const char *)opts + opts->build_algo_offset : "auto";
     uint32_t requested_ef = opts ? opts->ef_construction : 64;
     cuvs_hnsw_validate_build_algo(algorithm);
-    uint32_t build_algo = !strcmp(algorithm, "ivf_pq") ? CUVS_HNSW_ALGO_IVF_PQ : CUVS_HNSW_ALGO_AUTO;
+    uint32_t build_algo = cuvs_hnsw_algo_from_name(algorithm);
     if (source_name[0] && build_algo != CUVS_HNSW_ALGO_AUTO)
         ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
             errmsg("pg_cuvs_hnsw: build_algo applies to heap builds, not source graph reuse")));

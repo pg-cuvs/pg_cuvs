@@ -2,6 +2,7 @@
 #define CUVS_HNSW_BUILD_COMMON_H
 
 #include "cuvs_ipc.h" /* CUVS_METRIC_*; PG/CUDA-free */
+#include "cuvs_build_corpus.h" /* FD framing used by the shared request consumer */
 
 /* PG/CUDA-free checks shared by backend, IPC and wrapper. These are admission
  * estimates, never a promise that cuVS max_* enforces an RSS ceiling. */
@@ -15,6 +16,7 @@
 #include <poll.h>
 #include <sys/stat.h>
 #include <sys/socket.h>
+#include <stdio.h>
 #ifdef __linux__
 #include <sys/vfs.h>
 #endif
@@ -25,6 +27,47 @@ typedef struct CuvsHnswCapacity {
     uint64_t host_peak;
     uint64_t gpu_peak;
 } CuvsHnswCapacity;
+
+/* Same daemon request consumer in CPU protocol tests. Check the fixed prefix
+ * before waiting for the remaining fields/owner channel of a newer payload.
+ * The caller retains ownership of any FDs received before an error. */
+static inline int
+cuvs_hnsw_receive_file_request(int socket_fd, CuvsHnswFileRequest *request,
+    int *vectors_fd, int *owner_fd, char *error, size_t error_len)
+{
+    size_t prefix = offsetof(CuvsHnswFileRequest, build_algo), done = prefix;
+    char token;
+    memset(request, 0, sizeof(*request));
+    *vectors_fd = *owner_fd = -1;
+    if (cuvs_fd_recv(socket_fd, request, prefix, vectors_fd))
+    {
+        snprintf(error, error_len, "invalid HNSW file request prefix");
+        return CUVS_STATUS_BUILD_FAILED;
+    }
+    if (!cuvs_hnsw_file_version_supported(request->version))
+    {
+        snprintf(error, error_len, "HNSW file payload version mismatch: expected v%u; co-deploy extension and daemon", CUVS_HNSW_FILE_VERSION);
+        return CUVS_STATUS_PROTO_MISMATCH;
+    }
+    while (done < sizeof(*request))
+    {
+        ssize_t n = recv(socket_fd, (char *)request + done, sizeof(*request) - done, 0);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0)
+        {
+            snprintf(error, error_len, "incomplete HNSW file request fields");
+            return CUVS_STATUS_BUILD_FAILED;
+        }
+        done += (size_t)n;
+    }
+    if (cuvs_fd_recv(socket_fd, &token, 1, owner_fd)
+        || !cuvs_hnsw_file_request_supported(request))
+    {
+        snprintf(error, error_len, "invalid HNSW file request settings/owner frame");
+        return CUVS_STATUS_BUILD_FAILED;
+    }
+    return CUVS_STATUS_OK;
+}
 
 /* Exact pgvector families. In particular, halfvec cosine/IP must not silently
  * take the legacy unrecognized-family L2 fallback during a source-less build. */
@@ -139,6 +182,15 @@ cuvs_hnsw_training_reserve(CuvsHnswCapacity *cap, uint64_t actual_rows, uint32_t
     return 0;
 }
 
+static inline uint64_t
+cuvs_hnsw_sample_rows(uint64_t n, uint32_t dim, uint64_t host, uint64_t gpu)
+{
+    if (!n || !dim) return 0;
+    uint64_t rows = (host < gpu ? host : gpu) / 64 / ((uint64_t)dim * sizeof(float));
+    if (rows < 256) rows = 256;
+    return n < rows ? n : rows;
+}
+
 /* Conservative candidate only. The patched SDK must recheck the ACTUAL
  * histogram, any internal P increase, live reorder buffers and serializer
  * upper-level workspace before allocation. A zero result admits no build. */
@@ -208,6 +260,75 @@ cuvs_hnsw_fix_tiny_counts(int fd, uint64_t expected)
             || pwrite(fd, links, (size_t)header[8] * 4, offset + 4) != (ssize_t)header[8] * 4) return -1;
     }
     return 0;
+}
+
+typedef struct CuvsHnswRouteDecision {
+    uint32_t route;
+    uint32_t partitions; /* candidate only; SDK fixed-point plan records effective P */
+    uint64_t sdk_host_budget;
+    uint64_t sdk_gpu_budget;
+} CuvsHnswRouteDecision;
+
+/* Settings/training reserve must already have been prepared using the SAME
+ * budgets. This decision allocates nothing and never silently changes builder. */
+static inline int
+cuvs_hnsw_resolve_route(uint64_t n, uint32_t dim, uint32_t degree,
+    uint32_t intermediate, uint32_t algo, const CuvsHnswCapacity *cap,
+    uint64_t host, uint64_t gpu, CuvsHnswRouteDecision *out,
+    char *error, size_t error_len)
+{
+    CuvsHnswCapacity base;
+    memset(out, 0, sizeof(*out));
+    if (!cap || !n || !host || !gpu || !cuvs_hnsw_algo_supported(algo))
+    {
+        snprintf(error, error_len, "unsupported HNSW route or unknown capacity budget");
+        return CUVS_STATUS_BUILD_FAILED;
+    }
+    if (cuvs_hnsw_capacity(n, dim, degree, intermediate, 0, &base)
+        || cap->raw_bytes != base.raw_bytes || cap->serializer_floor != base.serializer_floor
+        || cap->host_peak < base.host_peak || cap->gpu_peak < base.gpu_peak)
+    {
+        snprintf(error, error_len, "invalid prepared HNSW shape or capacity");
+        return CUVS_STATUS_BUILD_FAILED;
+    }
+    int tiny = n < CUVS_HNSW_MIN_ELEMENTS;
+    int exceeded = cap->host_peak > host || cap->gpu_peak > gpu;
+    if (tiny && algo != CUVS_HNSW_ALGO_AUTO)
+    {
+        snprintf(error, error_len, "explicit %s requires non-tiny input; use build_algo=auto for tiny exact",
+                 cuvs_hnsw_algo_name(algo));
+        return CUVS_STATUS_BUILD_FAILED;
+    }
+    if (tiny && exceeded)
+    {
+        snprintf(error, error_len, "tiny exact route estimate exceeds host/GPU budget");
+        return CUVS_STATUS_BUILD_FAILED;
+    }
+    if (!tiny && algo != CUVS_HNSW_ALGO_ACE && exceeded)
+    {
+        snprintf(error, error_len, "resident IVF-PQ estimate exceeds host/GPU budget; no fallback; use build_algo=ace explicitly");
+        return CUVS_STATUS_HNSW_RESIDENT_BUDGET_EXCEEDED;
+    }
+    out->sdk_host_budget = host - (host / 8 < (UINT64_C(256) << 20) ? host / 8 : (UINT64_C(256) << 20));
+    out->sdk_gpu_budget = gpu - (gpu / 8 < (UINT64_C(512) << 20) ? gpu / 8 : (UINT64_C(512) << 20));
+    if (algo == CUVS_HNSW_ALGO_ACE)
+    {
+        if (n < 256)
+        {
+            snprintf(error, error_len, "explicit ace needs at least 256 rows for a partition candidate; no resident fallback");
+            return CUVS_STATUS_BUILD_FAILED;
+        }
+        out->partitions = cuvs_hnsw_ace_partitions(n, dim, degree, intermediate,
+                                                  out->sdk_host_budget, out->sdk_gpu_budget);
+        if (!out->partitions)
+        {
+            snprintf(error, error_len, "no ACE partition count fits metadata/reorder/serializer and GPU budgets");
+            return CUVS_STATUS_BUILD_FAILED;
+        }
+        out->route = CUVS_HNSW_ROUTE_ACE;
+    }
+    else out->route = tiny ? CUVS_HNSW_ROUTE_TINY : CUVS_HNSW_ROUTE_IVF_PQ;
+    return CUVS_STATUS_OK;
 }
 
 #endif

@@ -37,6 +37,7 @@ int main(void)
     receipt.version = CUVS_HNSW_POLICY_VERSION;
     receipt.bytes = sizeof(receipt);
     receipt.route = CUVS_HNSW_ROUTE_IVF_PQ;
+    receipt.internal_builder = 2;
     receipt.requested_ef = 64;
     receipt.guard_passed = 1;
     assert(cuvs_hnsw_policy_valid(&receipt));

@@ -2383,8 +2383,13 @@ cuvs_build_hnsw_from_heap(Relation heapRel, Relation indexRel, IndexInfo *indexI
                 64, 128, strcmp(mode, "nsw") != 0, cap,
                 build_algo, ef_construction, &out->policy,
                 &out->hnsw_fd, error, sizeof(error));
+            if (rc == CUVS_STATUS_HNSW_RESIDENT_BUDGET_EXCEEDED)
+                ereport(ERROR, (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+                    errmsg("pg_cuvs: resident IVF-PQ estimate exceeds the HNSW build budget"),
+                    errdetail("%s", error),
+                    errhint("Use build_algo=ace for an explicit disk build; auto does not fall back to ACE.")));
             if (rc == CUVS_STATUS_OK && out->policy.route == CUVS_HNSW_ROUTE_ACE)
-                ereport(NOTICE, (errmsg("pg_cuvs: auto selected ACE-disk (%u partitions): resident IVF-PQ estimate exceeds budget", out->policy.partitions),
+                ereport(NOTICE, (errmsg("pg_cuvs: explicit build_algo=ace selected ACE-disk (%u partitions)", out->policy.partitions),
                     errdetail("Route selection uses memory estimates, not allocation or RSS upper bounds.")));
             if (rc == CUVS_STATUS_CANCELED) CHECK_FOR_INTERRUPTS();
             if (rc != CUVS_STATUS_OK)

@@ -863,6 +863,7 @@ test_hierarchical_native_packing_case(int dim, int bytes_per_dim, int m)
     policy.version = CUVS_HNSW_POLICY_VERSION;
     policy.bytes = sizeof(policy);
     policy.route = CUVS_HNSW_ROUTE_TINY;
+    policy.internal_builder = 1;
     policy.requested_ef = 64;
     policy.guard_passed = 1;
     chain_test_reset();
@@ -1215,9 +1216,41 @@ test_rejects_malformed_upper_links_and_overflow(void)
     fixture_close(&f);
 }
 
+static void test_stored_policy_versions(void)
+{
+    Page page = calloc(1, BLCKSZ), saved = malloc(BLCKSZ);
+    CuvsHnswPolicy p = {0}, out;
+    assert(page && saved && hnsw_init_metapage(page, 768, 32, 200, 1, FirstOffsetNumber, 0, 1));
+    Size prefix = ((PageHeader)page)->pd_lower;
+    assert(hnsw_read_disk_policy(page, &out) == CUVS_HNSW_POLICY_NOT_RECORDED);
+    p.magic = CUVS_HNSW_POLICY_MAGIC; p.version = CUVS_HNSW_POLICY_LEGACY_VERSION;
+    p.bytes = sizeof(p); p.route = CUVS_HNSW_ROUTE_ACE;
+    p.requested_algo = CUVS_HNSW_ALGO_AUTO; p.requested_ef = 64; p.guard_passed = 1;
+    memcpy((char *)page + prefix, &p, sizeof(p));
+    ((PageHeader)page)->pd_lower += sizeof(p); memcpy(saved, page, BLCKSZ);
+    assert(hnsw_read_disk_policy(page, &out) == CUVS_HNSW_POLICY_RECORDED && out.version == 1);
+    assert(!memcmp(saved, page, BLCKSZ)); /* read never rewrites historical metadata */
+    p.version = CUVS_HNSW_POLICY_VERSION; p.requested_algo = CUVS_HNSW_ALGO_ACE;
+    p.internal_builder = 3; p.partitions = 2;
+    memcpy((char *)page + prefix, &p, sizeof(p));
+    assert(hnsw_read_disk_policy(page, &out) == CUVS_HNSW_POLICY_RECORDED && out.version == 2);
+    p.requested_algo = CUVS_HNSW_ALGO_AUTO; memcpy((char *)page + prefix, &p, sizeof(p));
+    assert(hnsw_read_disk_policy(page, &out) == CUVS_HNSW_POLICY_CORRUPT);
+    p.version = 99; memcpy((char *)page + prefix, &p, sizeof(p));
+    assert(hnsw_read_disk_policy(page, &out) == CUVS_HNSW_POLICY_UNSUPPORTED);
+    ((PageHeader)page)->pd_lower = prefix + 2;
+    assert(hnsw_read_disk_policy(page, &out) == CUVS_HNSW_POLICY_CORRUPT);
+    ((PageHeader)page)->pd_lower = BLCKSZ + 1;
+    assert(hnsw_read_disk_policy(page, &out) == CUVS_HNSW_POLICY_CORRUPT);
+    assert(!memcmp(PageGetContents(saved), PageGetContents(page), sizeof(PgvHnswMeta)));
+    free(saved); free(page);
+    puts("PASS stored policy page v1/v2, no receipt, truncation/future/corruption, prefix and historical bytes unchanged");
+}
+
 int
 main(void)
 {
+    test_stored_policy_versions();
     test_valid_flat_and_original_labels();
     test_valid_hierarchy();
     test_disk_location_layout();
