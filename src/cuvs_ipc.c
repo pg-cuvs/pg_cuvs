@@ -2404,8 +2404,7 @@ cuvs_ipc_build_hnsw_file(const char *socket_path, int vectors_fd,
     if (policy) memset(policy, 0, sizeof(*policy));
     if (error_len) error[0] = '\0';
     if (!cuvs_hnsw_regular_disk(vectors_fd) || !n_vecs || n_vecs > INT32_MAX
-        || !dim || metric > CUVS_METRIC_IP || hierarchy > 1 || !host_budget
-        || build_algo > CUVS_HNSW_ALGO_IVF_PQ || ef_construction < 4 || ef_construction > 1000)
+        || !dim || metric > CUVS_METRIC_IP || !cuvs_hnsw_file_request_supported(&request))
         goto done;
     sock = uds_connect_ex(socket_path, 30);
     if (sock < 0) { rc = CUVS_STATUS_UNAVAILABLE; goto done; }
@@ -2455,6 +2454,8 @@ cuvs_ipc_build_hnsw_file(const char *socket_path, int vectors_fd,
             if (!cuvs_hnsw_policy_valid(&wire.policy)
                 || wire.policy.requested_algo != build_algo
                 || wire.policy.requested_ef != ef_construction
+                || wire.policy.n_rows != n_vecs || wire.policy.dim != dim
+                || wire.policy.metric != metric || wire.policy.hierarchy != hierarchy
                 || !cuvs_hnsw_regular_disk(result_fd)
                 || (fcntl(result_fd, F_GETFL) & O_ACCMODE) != O_RDONLY)
             { rc = CUVS_STATUS_ERROR; goto done; }

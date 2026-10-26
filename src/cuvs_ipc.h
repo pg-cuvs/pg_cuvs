@@ -88,7 +88,7 @@
  * then CuvsReplyHeader + read-only regular HNSW file FD (success only).
  * Owner channel: C=cancel, EOF=owner lost, A=result handoff acknowledged. */
 #include "cuvs_hnsw_policy.h"
-#define CUVS_HNSW_FILE_VERSION 2u
+#define CUVS_HNSW_FILE_VERSION 3u
 typedef struct CuvsHnswFileRequest {
     uint32_t version;
     uint32_t hierarchy;        /* 0=NONE (nsw), 1=GPU; never CPU */
@@ -96,6 +96,18 @@ typedef struct CuvsHnswFileRequest {
     uint32_t build_algo;
     uint32_t ef_construction;
 } CuvsHnswFileRequest;
+
+static inline int cuvs_hnsw_file_version_supported(uint32_t version)
+{
+    return version == CUVS_HNSW_FILE_VERSION;
+}
+
+static inline int cuvs_hnsw_file_request_supported(const CuvsHnswFileRequest *r)
+{
+    return r && cuvs_hnsw_file_version_supported(r->version) && r->hierarchy <= 1
+        && r->host_budget && cuvs_hnsw_algo_supported(r->build_algo)
+        && r->ef_construction >= 4 && r->ef_construction <= 1000;
+}
 
 int cuvs_ipc_build_hnsw_file(const char *socket_path, int vectors_fd,
     uint64_t n_vecs, uint32_t dim, uint32_t metric, uint32_t graph_degree,
@@ -132,6 +144,7 @@ int cuvs_ipc_build_hnsw_file(const char *socket_path, int vectors_fd,
 #define CUVS_STATUS_NO_VECTORS    10   /* Phase 3L: brute_force requested but .vectors sidecar missing → REINDEX */
 #define CUVS_STATUS_CANCELED      11   /* 3S: backend aborted the wait (statement_timeout / query cancel) */
 #define CUVS_STATUS_PROTO_MISMATCH 12  /* #77: daemon/extension wire-protocol skew (co-deploy both) */
+#define CUVS_STATUS_HNSW_RESIDENT_BUDGET_EXCEEDED 13 /* AUTO/explicit IVF estimate only; not tiny/ACE/OOM */
 
 /* ----------------------------------------------------------------
  * Command frame (sent over UDS, fixed size)
@@ -223,7 +236,7 @@ typedef struct CuvsReplyHeader {
     char     error[128];
 } CuvsReplyHeader;
 
-/* Only BUILD_HNSW_FILE v2 uses this receipt; global v3 stays unchanged. */
+/* Only BUILD_HNSW_FILE v3 uses this receipt; global v3 stays unchanged. */
 typedef struct CuvsHnswFileReply {
     CuvsReplyHeader header;
     CuvsHnswPolicy policy;

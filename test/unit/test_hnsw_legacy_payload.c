@@ -12,7 +12,7 @@
 #include <unistd.h>
 
 /* Actual-daemon probe: v1's 16-byte prefix must be rejected before waiting
- * for v2 fields. No graph request is admitted, and no GPU build is needed. */
+ * for current payload fields. No graph request is admitted, and no GPU build is needed. */
 int main(int argc, char **argv)
 {
     assert(argc == 3);
@@ -37,7 +37,7 @@ int main(int argc, char **argv)
     assert(read(sock,&token,1)==1 && token=='R');
     CuvsReplyHeader reply={0};
     assert(!cuvs_fd_recv(sock,&reply,sizeof(reply),&result));
-    assert(reply.status==CUVS_STATUS_BUILD_FAILED && result==-1);
+    assert(reply.status==CUVS_STATUS_PROTO_MISMATCH && result==-1);
     assert(strstr(reply.error,"payload version mismatch"));
     close(fd);close(sock);close(owner[0]);close(owner[1]);
     puts("PASS actual daemon rejects v1 HNSW payload promptly; global v3 unchanged; GPU build0");

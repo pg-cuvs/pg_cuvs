@@ -11,7 +11,7 @@
 
 # ---- PGXS configuration -------------------------------------------------
 EXTENSION      = pg_cuvs
-EXTVERSION     = 0.8.1
+EXTVERSION     = 0.8.2
 DATA           = sql/pg_cuvs--0.1.0.sql \
                  sql/pg_cuvs--0.1.0--0.2.0.sql \
                  sql/pg_cuvs--0.2.0.sql \
@@ -28,7 +28,9 @@ DATA           = sql/pg_cuvs--0.1.0.sql \
                  sql/pg_cuvs--0.7.0--0.8.0.sql \
                  sql/pg_cuvs--0.8.0.sql \
                  sql/pg_cuvs--0.8.0--0.8.1.sql \
-                 sql/pg_cuvs--0.8.1.sql
+                 sql/pg_cuvs--0.8.1.sql \
+                 sql/pg_cuvs--0.8.1--0.8.2.sql \
+                 sql/pg_cuvs--0.8.2.sql
 MODULE_big     = pg_cuvs
 REGRESS        = smoke upgrade_path cpu_fallback edge_cases cpu_hnsw_fallback build_hnsw build_hnsw_edge build_hnsw_halfvec build_hnsw_packing pg_cuvs_hnsw metrics brute_force pg_cuvs_batch reloption_dir gc_orphans release_hardening pending_delta delta_recall build_params drop_subxact partition_prune filter_comparison prefilter_short_fill_guard ivfpq_smoke cagra_streaming cagra_dynbatch cagra_search_params auto_compact extend_vram_fallback stream_bf_recall fallback_stat vram_accounting build_lock flat_smoke transient_bf hw_profile routing_golden routing_golden_measured multi_vector daemon_uid_owner unordered_scan null_query_vector
 REGRESS_OPTS   = --inputdir=test --outputdir=test
@@ -280,6 +282,10 @@ test-hnsw-policy: test/unit/test_hnsw_policy.c $(wildcard src/cuvs_hnsw*.h)
 	$(CC) -std=gnu11 -Wall -Wextra -I src -o $@ test/unit/test_hnsw_policy.c -lpthread
 	./$@
 
+test-hnsw-explicit-route: test/unit/test_hnsw_explicit_route.c src/cuvs_hnsw_build_common.h src/cuvs_hnsw_policy.h src/cuvs_ipc.h
+	$(CC) -std=gnu11 -Wall -Wextra -Werror -I src -o $@ test/unit/test_hnsw_explicit_route.c -lpthread
+	./$@
+
 test-hnsw-admission: test/unit/test_hnsw_admission.c src/cuvs_hnsw_build_common.h
 	$(CC) -std=gnu11 -Wall -Wextra -I src -o $@ test/unit/test_hnsw_admission.c -lpthread
 	./$@
@@ -302,8 +308,8 @@ test-hnsw-converter: test/unit/test_hnsw_converter.c src/hnsw_export.c \
 		$(HNSW_CONVERTER_UNIT_LINK) $(TEST_RT_LIB)
 	./$@
 
-EXTRA_CLEAN += test-hnsw-build test-hnsw-build-ipc test-hnsw-converter test-hnsw-admission
-.PHONY: test-hnsw-build test-hnsw-build-ipc test-hnsw-converter test-hnsw-admission
+EXTRA_CLEAN += test-hnsw-build test-hnsw-build-ipc test-hnsw-converter test-hnsw-admission test-hnsw-explicit-route test-hnsw-policy
+.PHONY: test-hnsw-build test-hnsw-build-ipc test-hnsw-converter test-hnsw-admission test-hnsw-explicit-route test-hnsw-policy
 
 # ---- Documentation contract check ---------------------------------------
 # CPU-only drift detector for the current version/defaults and release-facing

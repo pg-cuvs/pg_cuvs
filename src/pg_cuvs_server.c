@@ -7994,24 +7994,14 @@ handle_build_hnsw_file(int client_fd, const CuvsCmdFrame *cmd)
     char workdir[4096] = {0};
     reply.status = CUVS_STATUS_BUILD_FAILED;
     snprintf(reply.error, sizeof(reply.error), "invalid HNSW file request");
-    /* Read the unchanged v1 prefix first. Waiting for the longer v2 struct
-     * before checking version could consume the old owner's one-byte frame
-     * and leave an old backend/new daemon pair waiting on each other. */
-    if (cuvs_fd_recv(client_fd, &request, offsetof(CuvsHnswFileRequest, build_algo), &vectors_fd))
-        goto done;
-    if (request.version != CUVS_HNSW_FILE_VERSION)
+    int request_status = cuvs_hnsw_receive_file_request(client_fd, &request,
+        &vectors_fd, &owner_fd, reply.error, sizeof(reply.error));
+    if (request_status != CUVS_STATUS_OK)
     {
-        snprintf(reply.error, sizeof(reply.error),
-            "HNSW file payload version mismatch: expected v%u; co-deploy extension and daemon", CUVS_HNSW_FILE_VERSION);
+        reply.status = request_status;
         goto done;
     }
-    if (recv_all(client_fd, (char *)&request + offsetof(CuvsHnswFileRequest, build_algo),
-            sizeof(request) - offsetof(CuvsHnswFileRequest, build_algo))
-        || cuvs_fd_recv(client_fd, &token, 1, &owner_fd)) goto done;
-    if (request.version != CUVS_HNSW_FILE_VERSION || request.hierarchy > 1
-        || !request.host_budget || request.build_algo > CUVS_HNSW_ALGO_IVF_PQ
-        || request.ef_construction < 4 || request.ef_construction > 1000
-        || cmd->n_vecs <= 0 || cmd->n_vecs > CUVS_TIDS_MAX_VECS
+    if (cmd->n_vecs <= 0 || cmd->n_vecs > CUVS_TIDS_MAX_VECS
         || cmd->dim == 0 || cmd->dim > CUVS_VECTORS_MAX_DIM
         || cmd->metric > CUVS_METRIC_IP || !cuvs_hnsw_regular_disk(vectors_fd)
         || !shm_check_peer_owner(vectors_fd, g_peer_uid)
