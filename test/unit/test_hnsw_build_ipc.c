@@ -26,7 +26,7 @@ static void *daemon_mock(void *unused) {
     char token;
     assert(c >= 0); accepts++;
     assert(recv(c, &cmd, sizeof(cmd), MSG_WAITALL) == sizeof(cmd));
-    assert(cmd.proto_version == 3 && cmd.op == CUVS_OP_BUILD_HNSW_FILE);
+    assert(cmd.proto_version == CUVS_PROTO_VERSION && cmd.op == CUVS_OP_BUILD_HNSW_FILE);
     struct timeval timeout = {1, 0};
     assert(!setsockopt(c, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)));
     char error[128] = {0};
