@@ -174,5 +174,5 @@ int main(void) {
     }
     assert(accepts == 20);
     close(fd); close(listener); unlink(path); rmdir(dir);
-    puts("PASS 15 actual-client wire cases,4 preconnect refusals,5 shared-daemon prefix/settings cases; explicitACE/IVF, forgedroute/version/request rejection, cancellation/status13/protocolerror; global v3 retained");
+    printf("PASS 15 actual-client wire cases,4 preconnect refusals,5 shared-daemon prefix/settings cases; explicitACE/IVF, forgedroute/version/request rejection, cancellation/status13/protocolerror; current global v%u retained\n", CUVS_PROTO_VERSION);
 }
