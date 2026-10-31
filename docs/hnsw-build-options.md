@@ -1,6 +1,6 @@
 # over-the-vram HNSW 생성 옵션
 
-이 정책은 over-the-vram 계열의 `USING pg_cuvs_hnsw` heap 생성에 적용한다.
+이 정책은 0.8.2 `USING pg_cuvs_hnsw` 직접 heap 생성에 적용한다.
 기존 device CAGRA AUTO 경로의 정책은 바꾸지 않는다.
 
 ```sql
@@ -57,7 +57,7 @@ pgvector metapage prefix와 영수증 크기는 유지한다. 새 writer는 poli
 같은 데이터·같은 ef와 같은 질의 비용에서 각각 비교한다. self 도달성 진단과는 별개다.
 같은 f32 벡터의 다른 ID는 동점 정답이다. 작은 생성 시험은 이 품질 기준의 통과 증거가 아니다.
 
-extension과 daemon은 HNSW op23 payload v3를 함께 배포해야 한다. 글로벌 v3 명령 ABI는 유지된다.
+extension과 daemon은 HNSW op23 payload v3를 함께 배포해야 한다. 통합 기준 main의 글로벌 v4 명령 ABI는 유지되며 HNSW op23 payload v3와 구분한다.
 이전 payload v1/v2 요청은 prefix의 버전을 먼저 검사해 나머지 필드를 기다리지 않고 거부한다.
 기존 0.8.1 단독 reader는 새 policy v2를 읽을 수 없다. 0.8.2 바이너리를 함께 배포한 뒤 `ALTER EXTENSION pg_cuvs UPDATE TO '0.8.2'`를 사용한다. upgrade SQL은 영수증을 이주/덮어쓰기하지 않는다. v2가 있는 인덱스를 예전 reader로 downgrade하는 것은 지원하지 않는다.
 
