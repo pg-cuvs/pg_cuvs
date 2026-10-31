@@ -731,3 +731,13 @@ gpu-anbench-agg:
 # form (sync build install test) rebuilt only the extension and restarted
 # nothing, so it could test code that was never deployed.
 gpu-cycle: gpu-deploy gpu-test
+
+# Actual daemon admission with physical GPU headroom fixture only (Linux CPU CI).
+EXTRA_CLEAN += test-rmm-pending
+.PHONY: test-rmm-pending
+test-rmm-pending:
+	$(CC) -std=gnu11 -O1 -DPGCUVS_CPU_SHIM -ffunction-sections -fdata-sections -I src \
+		test/unit/test_rmm_pending.c src/cuvs_ipc.c src/cuvs_util.c \
+		src/cuvs_objstore.c src/cuvs_build_corpus.c src/cuvs_wrapper_shim_cpu.c \
+		-Wl,--gc-sections -lm -lpthread -lrt -lcurl -lssl -lcrypto -o test-rmm-pending
+	./test-rmm-pending

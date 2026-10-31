@@ -382,6 +382,10 @@ static uint32_t g_rmm_pool_mb     = 512; /* initial reservation per usable GPU *
 #endif
 static uint32_t g_rmm_pool_max_percent = 50;
 static size_t g_rmm_pool_limits[CUVS_MAX_GPUS];
+/* Estimated quota reservations for unlocked builds, separate from logical
+ * residency. Protected by g_index_mutex; allocator counters cannot see these
+ * until the build allocates. Kept until return, conservatively even then. */
+static size_t g_pending_rmm_build_vram[CUVS_MAX_GPUS];
 
 /* ADR-065: default per-device budget when --max-vram-mb is omitted — a fraction
  * of total VRAM, leaving headroom for the untracked cuVS workspace + CUDA
@@ -708,10 +712,16 @@ total_vram_used(int device_id)
     return total;
 }
 
+/* All admission callers hold g_index_mutex. Include unallocated build claims
+ * for cache/transient-BF admissions as well as ensure_vram(). The wrapper's
+ * physical/pool counters alone cannot account for these reservations. */
 static size_t
 gpu_free_vram_bytes(int device_id)
 {
-    return cuvs_vram_free_bytes_on(device_id);
+    size_t available = cuvs_vram_free_bytes_on(device_id);
+    size_t pending = g_rmm_pool_limits[device_id] > 0
+        ? g_pending_rmm_build_vram[device_id] : 0;
+    return pending < available ? available - pending : 0;
 }
 
 /* Phase 3E: return the allowed GPU index (in g_allowed_gpus) for a device_id,
@@ -2096,15 +2106,41 @@ evict_lru(int device_id)
     return freed;
 }
 
+/* Call under g_index_mutex, immediately after successful admission and before
+ * unlocking for a build; release under the same mutex on success or failure. */
+static void
+reserve_build_vram(size_t needed, int device_id)
+{
+    g_pending_build_vram[device_id] += needed;
+    if (g_rmm_pool_limits[device_id] > 0)
+        g_pending_rmm_build_vram[device_id] += needed;
+}
+
+static void
+release_build_vram(size_t needed, int device_id)
+{
+    g_pending_build_vram[device_id] -= needed;
+    if (g_rmm_pool_limits[device_id] > 0)
+        g_pending_rmm_build_vram[device_id] -= needed;
+}
+
 /* Ensure there is enough VRAM on `device_id` for `needed` bytes. */
 static int
 ensure_vram(size_t needed, int device_id)
 {
     size_t budget = g_max_vram_per_gpu[device_id];
-    /* An index that cannot fit even in an empty pool must not evict healthy
-     * indexes while admission repeatedly waits for impossible growth. */
-    if (g_rmm_pool_limits[device_id] > 0 && needed > g_rmm_pool_limits[device_id])
+    size_t quota = g_rmm_pool_limits[device_id];
+    size_t pending = quota > 0 ? g_pending_rmm_build_vram[device_id] : 0;
+    /* Reject impossible concurrent reservations before touching healthy LRUs.
+     * Allocation may already reflect part of pending: retaining it until the
+     * build returns deliberately makes admission conservative, never looser. */
+    if (quota > 0 && (pending > quota || needed > quota - pending))
         return -1;
+    if (pending > 0)
+    {
+        if (needed > gpu_free_vram_bytes(device_id))
+            return -1;
+    }
     if (budget > 0 && total_vram_used(device_id) + needed > budget)
     {
         while (g_n_indexes > 0 && total_vram_used(device_id) + needed > budget)
@@ -2116,7 +2152,9 @@ ensure_vram(size_t needed, int device_id)
     }
 
     size_t free_vram = gpu_free_vram_bytes(device_id);
-    while (g_n_indexes > 0 && needed > free_vram)
+    /* An unlocked builder can allocate between observations. Do not evict on
+     * that transient reservation pressure; the caller can retry later. */
+    while (pending == 0 && g_n_indexes > 0 && needed > free_vram)
     {
         if (evict_lru(device_id) == 0)
             break;
@@ -5288,7 +5326,7 @@ handle_build(int client_fd, const CuvsCmdFrame *cmd)
      * total_vram_used() counts g_pending_build_vram, so concurrent admission and
      * eviction stay correct while we build unlocked. vecs/mem are per-request
      * (not shared state), so reading them unlocked is safe. */
-    g_pending_build_vram[target_gpu] += needed;
+    reserve_build_vram(needed, target_gpu);
     pthread_mutex_unlock(&g_index_mutex);
 
     LOG_DEBUG("[handle_build] calling cuvs_cagra_build n_vecs=%lld dim=%u gpu=%d...\n",
@@ -5328,7 +5366,7 @@ handle_build(int client_fd, const CuvsCmdFrame *cmd)
      * expects the lock held). Release the build reservation now: on success the
      * registry entry below carries vram_bytes; on failure the VRAM is freed. */
     pthread_mutex_lock(&g_index_mutex);
-    g_pending_build_vram[target_gpu] -= needed;
+    release_build_vram(needed, target_gpu);
 
     if (!new_handle)
     {
@@ -5933,7 +5971,7 @@ handle_build_multi(int client_fd, const CuvsCmdFrame *cmd, const char *index_dir
          * GPU build so concurrent searches/stats/drops aren't blocked. Partials
          * (part_vecs/maps) are per-request, so reading them unlocked is safe;
          * total_vram_used() counts g_pending_build_vram during the window. */
-        g_pending_build_vram[target_gpu] += needed;
+        reserve_build_vram(needed, target_gpu);
         pthread_mutex_unlock(&g_index_mutex);
 
         new_handle = cuvs_cagra_build_multi(part_vecs, n_each, nmapped, total,
@@ -5969,7 +6007,7 @@ handle_build_multi(int client_fd, const CuvsCmdFrame *cmd, const char *index_dir
          * expects the lock held). Release the reservation: on success the registry
          * entry carries vram_bytes; on failure the VRAM is freed. */
         pthread_mutex_lock(&g_index_mutex);
-        g_pending_build_vram[target_gpu] -= needed;
+        release_build_vram(needed, target_gpu);
 
         if (!new_handle)
         {
