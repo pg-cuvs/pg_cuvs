@@ -40,6 +40,6 @@ int main(int argc, char **argv)
     assert(reply.status==CUVS_STATUS_PROTO_MISMATCH && result==-1);
     assert(strstr(reply.error,"payload version mismatch"));
     close(fd);close(sock);close(owner[0]);close(owner[1]);
-    puts("PASS actual daemon rejects v1 HNSW payload promptly; global v3 unchanged; GPU build0");
+    printf("PASS actual daemon rejects v1 HNSW payload promptly; current global v%u retained; GPU build0\n", CUVS_PROTO_VERSION);
     return 0;
 }
