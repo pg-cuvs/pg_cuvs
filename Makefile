@@ -11,7 +11,7 @@
 
 # ---- PGXS configuration -------------------------------------------------
 EXTENSION      = pg_cuvs
-EXTVERSION     = 0.8.0
+EXTVERSION     = 0.8.2
 DATA           = sql/pg_cuvs--0.1.0.sql \
                  sql/pg_cuvs--0.1.0--0.2.0.sql \
                  sql/pg_cuvs--0.2.0.sql \
@@ -26,7 +26,11 @@ DATA           = sql/pg_cuvs--0.1.0.sql \
                  sql/pg_cuvs--0.6.0--0.7.0.sql \
                  sql/pg_cuvs--0.7.0.sql \
                  sql/pg_cuvs--0.7.0--0.8.0.sql \
-                 sql/pg_cuvs--0.8.0.sql
+                 sql/pg_cuvs--0.8.0.sql \
+                 sql/pg_cuvs--0.8.0--0.8.1.sql \
+                 sql/pg_cuvs--0.8.1.sql \
+                 sql/pg_cuvs--0.8.1--0.8.2.sql \
+                 sql/pg_cuvs--0.8.2.sql
 MODULE_big     = pg_cuvs
 REGRESS        = smoke upgrade_path cpu_fallback edge_cases cpu_hnsw_fallback build_hnsw build_hnsw_edge build_hnsw_halfvec build_hnsw_packing pg_cuvs_hnsw metrics brute_force pg_cuvs_batch reloption_dir gc_orphans release_hardening pending_delta delta_recall build_params drop_subxact partition_prune filter_comparison prefilter_short_fill_guard ivfpq_smoke cagra_streaming cagra_dynbatch cagra_search_params auto_compact extend_vram_fallback stream_bf_recall fallback_stat vram_accounting build_lock flat_smoke transient_bf hw_profile routing_golden routing_golden_measured multi_vector daemon_uid_owner unordered_scan null_query_vector
 REGRESS_OPTS   = --inputdir=test --outputdir=test
@@ -82,6 +86,13 @@ CUVS_INCLUDE  ?= $(CUVS_PREFIX)/include
 # cuVS 25.x+ ships bundled libcudacxx under include/rapids/
 CUVS_RAPIDS_INCLUDE ?= $(CUVS_PREFIX)/include/rapids
 CUVS_LIB      ?= $(CUVS_PREFIX)/lib
+# Optional matching patched SDK cpp/src root. Required for authoritative ACE
+# partition receipts; absent/mismatched support fails before an ACE build.
+CUVS_SDK_SOURCE_INCLUDE ?=
+ifneq ($(strip $(CUVS_SDK_SOURCE_INCLUDE)),)
+CUVS_SDK_PLAN_FLAGS = -I$(CUVS_SDK_SOURCE_INCLUDE) -Xcompiler=-fopenmp
+CUVS_SDK_PLAN_LINK = -fopenmp -lrapids_logger
+endif
 
 # ---- CI Tier 1: CPU-reference shim (no CUDA/cuVS) -------------------------
 # `make PGCUVS_CPU_SHIM=1` swaps the nvcc-built cuVS wrapper for a pure-C CPU
@@ -101,7 +112,7 @@ endif
 PG_CPPFLAGS    = -I$(CUVS_INCLUDE) -I$(CUVS_RAPIDS_INCLUDE) -I./src
 # -Wl,-rpath embeds the cuVS lib path so postmaster finds libcuvs.so
 # without LD_LIBRARY_PATH being set (ADR-007).
-SHLIB_LINK     = $(CUVS_SO_LINK) \
+SHLIB_LINK     = $(CUVS_SO_LINK) $(CUVS_SDK_PLAN_LINK) \
                  -Wl,-Bstatic -lstdc++ -Wl,-Bdynamic -lrt
 
 PG_CONFIG     ?= pg_config
@@ -117,8 +128,15 @@ $(OBJS): $(wildcard src/*.h)
 
 # Build CUDA object before linking the .so. Pattern rule overrides PGXS
 # default for this specific file since .cu needs nvcc, not gcc.
-src/cuvs_wrapper.o: src/cuvs_wrapper.cu src/cuvs_wrapper.h
-	$(NVCC) $(NVCC_FLAGS) -I$(CUVS_INCLUDE) -I$(CUVS_RAPIDS_INCLUDE) -I./src -c $< -o $@
+ifneq ($(strip $(CUVS_SDK_SOURCE_INCLUDE)),)
+.PHONY: verify-hnsw-sdk-plan
+verify-hnsw-sdk-plan:
+	python3 scripts/verify-hnsw-sdk-plan.py --source '$(CUVS_SDK_SOURCE_INCLUDE)'
+src/cuvs_wrapper.o: | verify-hnsw-sdk-plan
+endif
+
+src/cuvs_wrapper.o: src/cuvs_wrapper.cu src/cuvs_wrapper.h src/cuvs_hnsw_sdk_plan.cuh
+	$(NVCC) $(NVCC_FLAGS) $(CUVS_SDK_PLAN_FLAGS) -I$(CUVS_INCLUDE) -I$(CUVS_RAPIDS_INCLUDE) -I./src -c $< -o $@
 
 # PGXS generates LLVM bitcode (.bc) from .c sources for JIT. The .cu file
 # has no PG-callable functions, so emit a stub bitcode so PGXS doesn't fail.
@@ -142,7 +160,7 @@ SERVER_CFLAGS  = -O2 -g -Wall -Wextra -I./src \
 # Optional sanitizer/debug hooks for the daemon (e.g. CI ASAN job passes
 # EXTRA_SERVER_CFLAGS="-fsanitize=address -fno-omit-frame-pointer"). Empty by default.
 SERVER_CFLAGS += $(EXTRA_SERVER_CFLAGS)
-SERVER_LDFLAGS = $(CUVS_SERVER_LINK) -lstdc++ \
+SERVER_LDFLAGS = $(CUVS_SERVER_LINK) $(CUVS_SDK_PLAN_LINK) -lstdc++ \
                  -lpthread -lrt \
                  -lcurl -lssl -lcrypto
 SERVER_LDFLAGS += $(EXTRA_SERVER_LDFLAGS)
@@ -239,13 +257,59 @@ install-server-test: server-test
 # librt exists on Linux (CI/VM) but not macOS — link it only where present.
 TEST_RT_LIB := $(shell [ "$$(uname -s)" = "Linux" ] && echo -lrt)
 test-unit: test/unit/test_cuvs_util.c src/cuvs_util.c src/cuvs_util.h src/cuvs_ipc.h \
-           test/unit/test_build_corpus.c src/cuvs_build_corpus.c src/cuvs_build_corpus.h
+           test/unit/test_build_corpus.c src/cuvs_build_corpus.c src/cuvs_build_corpus.h \
+           test-hnsw-build test-hnsw-build-ipc test-hnsw-admission
 	$(CC) -I src -DCUVS_TEST_HOOKS -o test-unit test/unit/test_cuvs_util.c src/cuvs_util.c $(TEST_RT_LIB)
 	./test-unit
 	$(CC) -I src -o test-build-corpus test/unit/test_build_corpus.c src/cuvs_build_corpus.c $(TEST_RT_LIB)
 	./test-build-corpus
 
 .PHONY: test-unit
+
+# HNSW admission and op-specific FD/owner lifecycle fixtures. No daemon, PG
+# backend or CUDA is needed. Keep separate targets for bounded worker checks.
+test-hnsw-build: test/unit/test_hnsw_build.c src/cuvs_hnsw_build_common.h
+	$(CC) -std=gnu11 -Wall -Wextra -I src -o $@ test/unit/test_hnsw_build.c
+	./$@
+
+test-hnsw-build-ipc: test/unit/test_hnsw_build_ipc.c src/cuvs_ipc.c \
+                    src/cuvs_util.c src/cuvs_build_corpus.c $(wildcard src/*.h)
+	$(CC) -std=gnu11 -Wall -Wextra -I src -o $@ test/unit/test_hnsw_build_ipc.c \
+		src/cuvs_ipc.c src/cuvs_util.c src/cuvs_build_corpus.c -lpthread -lm $(TEST_RT_LIB)
+	./$@
+
+test-hnsw-policy: test/unit/test_hnsw_policy.c $(wildcard src/cuvs_hnsw*.h)
+	$(CC) -std=gnu11 -Wall -Wextra -I src -o $@ test/unit/test_hnsw_policy.c -lpthread
+	./$@
+
+test-hnsw-explicit-route: test/unit/test_hnsw_explicit_route.c src/cuvs_hnsw_build_common.h src/cuvs_hnsw_policy.h src/cuvs_ipc.h
+	$(CC) -std=gnu11 -Wall -Wextra -Werror -I src -o $@ test/unit/test_hnsw_explicit_route.c -lpthread
+	./$@
+
+test-hnsw-admission: test/unit/test_hnsw_admission.c src/cuvs_hnsw_build_common.h
+	$(CC) -std=gnu11 -Wall -Wextra -I src -o $@ test/unit/test_hnsw_admission.c -lpthread
+	./$@
+
+# Converter fixtures include private PG page helpers, with backend stubs and
+# section garbage collection. Requires server headers, but no running backend.
+ifeq ($(shell uname -s),Darwin)
+HNSW_CONVERTER_UNIT_LINK = -Wl,-undefined,dynamic_lookup -Wl,-dead_strip
+else
+HNSW_CONVERTER_UNIT_LINK = -Wl,--gc-sections \
+                          -L$(shell $(PG_CONFIG) --pkglibdir) -lpgcommon -lpgport -lm
+endif
+HNSW_UNIT_CPPFLAGS ?=
+test-hnsw-converter: test/unit/test_hnsw_converter.c src/hnsw_export.c \
+                     src/hnsw_export.h src/cuvs_util.c $(wildcard src/*.h)
+	$(CC) -std=gnu11 -O0 -Wall -Wextra -Wno-unused-parameter \
+		-ffunction-sections -fdata-sections -I src \
+		-I$(shell $(PG_CONFIG) --includedir) -I$(shell $(PG_CONFIG) --includedir-server) \
+		$(HNSW_UNIT_CPPFLAGS) -o $@ test/unit/test_hnsw_converter.c src/cuvs_util.c \
+		$(HNSW_CONVERTER_UNIT_LINK) $(TEST_RT_LIB)
+	./$@
+
+EXTRA_CLEAN += test-hnsw-build test-hnsw-build-ipc test-hnsw-converter test-hnsw-admission test-hnsw-explicit-route test-hnsw-policy
+.PHONY: test-hnsw-build test-hnsw-build-ipc test-hnsw-converter test-hnsw-admission test-hnsw-explicit-route test-hnsw-policy
 
 # ---- Documentation contract check ---------------------------------------
 # CPU-only drift detector for the current version/defaults and release-facing

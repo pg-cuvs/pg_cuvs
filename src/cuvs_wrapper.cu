@@ -11,11 +11,13 @@
  */
 
 #include "cuvs_wrapper.h"
+#include "cuvs_hnsw_build_common.h"
 #include "cuvs_ipc.h"   /* CUVS_METRIC_* (PG-free, CUDA-free defines) */
 #include "cuvs_util.h"  /* ADR-075: CUVS_HWPROBE_* bits (PG-free, CUDA-free) */
 
 #include <cuvs/neighbors/brute_force.hpp>
-#include <cuvs/neighbors/cagra.hpp>  /* serialize/deserialize merged here in cuVS 25.x+ */
+#include <cuvs/neighbors/cagra.hpp>
+#include "cuvs_hnsw_sdk_plan.cuh"  /* serialize/deserialize merged here in cuVS 25.x+ */
 #include <cuvs/neighbors/hnsw.hpp>   /* Phase 3I-1: CPU HNSW fallback */
 #include <cuvs/neighbors/ivf_pq.hpp> /* 3P: IVF-PQ index */
 #include <cuvs/core/bitset.hpp>      /* 3O: cuvs::core::bitset_view */
@@ -34,6 +36,15 @@
 #include <stdexcept>
 #include <mutex>
 #include <atomic>
+#include <optional>
+#include <utility>
+#include <filesystem>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <sys/file.h>
+#include <ctime>
+#include <fcntl.h>
+#include <dlfcn.h>
 
 /* ----------------------------------------------------------------
  * Per-device device_resources pool (Phase 3E)
@@ -2065,4 +2076,452 @@ extern "C" void
 cuvs_warmup(void)
 {
     cuvs_warmup_device(0);
+}
+
+namespace {
+/* Resolve the marker from the very DSO implementing from_cagra, rather than
+ * trusting an environment flag or an unrelated globally-preloaded symbol. */
+bool hnsw_sdk_marker_verified(const char *symbol, const char *expected)
+{
+    using Dataset = std::optional<raft::host_matrix_view<const float, int64_t, raft::row_major>>;
+    using From = std::unique_ptr<cuvs::neighbors::hnsw::index<float>> (*)(
+        raft::resources const&, cuvs::neighbors::hnsw::index_params const&,
+        cuvs::neighbors::cagra::index<float, uint32_t> const&, Dataset);
+    From fn = &cuvs::neighbors::hnsw::from_cagra;
+    Dl_info impl = {}, marker = {};
+    if (!dladdr(reinterpret_cast<void *>(fn), &impl) || !impl.dli_fname) return false;
+    void *dso = dlopen(impl.dli_fname, RTLD_LAZY | RTLD_NOLOAD);
+    if (!dso) return false;
+    auto patch = reinterpret_cast<const char *(*)()>(dlsym(dso, symbol));
+    bool ok = patch && dladdr(reinterpret_cast<void *>(patch), &marker)
+        && marker.dli_fbase == impl.dli_fbase;
+    if (ok)
+    {
+        const char *id = patch();
+        ok = id && std::strcmp(id, expected) == 0;
+    }
+    dlclose(dso);
+    return ok;
+}
+
+struct HnswBuildFiles {
+    const char *dir;
+    void *mapping = MAP_FAILED;
+    size_t bytes = 0;
+    ~HnswBuildFiles() {
+        if (mapping != MAP_FAILED) munmap(mapping, bytes);
+        std::error_code ec;
+        for (std::filesystem::directory_iterator it(dir, ec), end; !ec && it != end; it.increment(ec)) {
+            if (it->path().filename() != ".lease") std::filesystem::remove_all(it->path(), ec);
+        }
+        if (ec) fprintf(stderr, "[hnsw_build] cleanup failed: %s\n", ec.message().c_str());
+        fprintf(stderr, "[hnsw_build] job=%s phase=cleanup-complete mono_us=%llu files_removed=%d\n",
+            dir, (unsigned long long)cuvs_hnsw_monotonic_us(), !ec);
+    }
+};
+}
+
+namespace {
+using HnswInputView = decltype(raft::make_host_matrix_view<const float, int64_t>(
+    static_cast<const float *>(nullptr), int64_t{0}, int64_t{0}));
+using HnswPqParams = decltype(cuvs::neighbors::cagra::graph_build_params::ivf_pq_params(
+    std::declval<HnswInputView &>().extents(), cuvs_distance_type(CUVS_METRIC_L2)));
+struct HnswPreparedSettings {
+    CuvsHnswCapacity capacity = {};
+    uint32_t degree = 0, intermediate = 0;
+    bool tiny = false;
+    uint64_t sample_rows = 0, actual_training = 0;
+    std::optional<HnswPqParams> pq_params;
+    CuvsHnswRouteDecision route = {};
+    CuvsHnswPolicy receipt = {};
+};
+
+/* Preserve the B factory/sampling/reserve order BEFORE route selection. */
+static int prepare_hnsw_settings(const CuvsHnswFileBuild *params, int vectors_fd,
+    HnswPreparedSettings &prepared, char *error, size_t error_len)
+{
+    using namespace cuvs::neighbors;
+    auto &cap = prepared.capacity;
+    auto &degree = prepared.degree;
+    degree = params->graph_degree;
+    auto &intermediate = prepared.intermediate;
+    intermediate = cuvs_hnsw_scaled_quality(params->intermediate_degree,
+        params->ef_construction, degree, 4096);
+    if (params->policy) memset(params->policy, 0, sizeof(*params->policy));
+    if (!cuvs_hnsw_algo_supported(params->build_algo)
+        || params->ef_construction < 4 || params->ef_construction > 1000)
+    {
+        snprintf(error, error_len, "unsupported HNSW builder/ef_construction; supported: auto, ivf_pq, ace (NN-descent memory model unsupported)");
+        return CUVS_STATUS_BUILD_FAILED;
+    }
+    prepared.tiny = params->n_vecs > 0 && params->n_vecs < CUVS_HNSW_MIN_ELEMENTS;
+    const bool tiny = prepared.tiny;
+    if (tiny)
+    {
+        // A bounded <=15-row GPU exact graph avoids IVF-PQ's minimum training
+        // population and keeps M>=2 even for one/two input rows.
+        degree = std::max<uint32_t>(4, (uint32_t)(params->n_vecs & ~UINT64_C(1)));
+        intermediate = degree;
+    }
+    else
+    {
+        if (degree >= params->n_vecs && params->n_vecs)
+            degree = (uint32_t)((params->n_vecs - 1) & ~UINT64_C(1));
+        if (intermediate >= params->n_vecs && params->n_vecs)
+            intermediate = (uint32_t)(params->n_vecs - 1);
+    }
+    if (cuvs_hnsw_capacity(params->n_vecs, params->dim, degree, intermediate,
+                          params->hierarchy != 0, &cap)
+        || params->metric > CUVS_METRIC_IP || params->hierarchy > 1
+        || !cuvs_hnsw_regular_disk(vectors_fd))
+    {
+        snprintf(error, error_len, "invalid HNSW capacity/dimension/degree/file descriptor");
+        return CUVS_STATUS_BUILD_FAILED;
+    }
+    if (tiny && params->build_algo == CUVS_HNSW_ALGO_IVF_PQ)
+    {
+        snprintf(error, error_len, "explicit ivf_pq requires at least 16 rows; use build_algo=auto for the tiny exact route");
+        return CUVS_STATUS_BUILD_FAILED;
+    }
+    if (tiny && params->build_algo == CUVS_HNSW_ALGO_ACE)
+    {
+        snprintf(error, error_len, "explicit ace conflicts with tiny input; use build_algo=auto for tiny exact");
+        return CUVS_STATUS_BUILD_FAILED;
+    }
+    auto &sample_rows = prepared.sample_rows;
+    sample_rows = cuvs_hnsw_sample_rows(params->n_vecs, params->dim,
+                                         params->host_budget, params->gpu_budget);
+    auto shape = raft::make_host_matrix_view<const float, int64_t>(
+        static_cast<const float *>(nullptr), (int64_t)params->n_vecs, (int64_t)params->dim);
+    prepared.pq_params.emplace(cagra::graph_build_params::ivf_pq_params(shape.extents(),
+        params->metric == CUVS_METRIC_COSINE ? cuvs::distance::DistanceType::InnerProduct
+                                          : cuvs_distance_type(params->metric)));
+    auto &pq_params = *prepared.pq_params;
+    pq_params.build_params.n_lists = std::min<uint32_t>(pq_params.build_params.n_lists,
+        (uint32_t)std::max<uint64_t>(1, sample_rows / 32));
+    if (sample_rows < 256) pq_params.build_params.pq_bits = 4;
+    pq_params.build_params.kmeans_trainset_fraction = (double)sample_rows / params->n_vecs;
+    pq_params.search_params.max_internal_batch_size = 4096;
+    auto &actual_training = prepared.actual_training;
+    actual_training = tiny ? 0 : cuvs_hnsw_training_rows(params->n_vecs,
+        sample_rows, pq_params.build_params.n_lists);
+    if (cuvs_hnsw_training_reserve(&cap, actual_training, params->dim))
+    {
+        snprintf(error, error_len, "HNSW training estimate overflow");
+        return CUVS_STATUS_BUILD_FAILED;
+    }
+    return CUVS_STATUS_OK;
+}
+
+/* Own no outer mapping or result descriptor: the public caller's existing
+ * HnswBuildFiles lifetime still spans preparation through returned FD handoff. */
+static int execute_hnsw_file_build(const CuvsHnswFileBuild *params, int owner_fd,
+    const char *workdir, int device_id, HnswBuildFiles &files,
+    HnswPreparedSettings &prepared, int *out_fd)
+{
+    using namespace cuvs::neighbors;
+    const auto &cap = prepared.capacity;
+    const auto degree = prepared.degree, intermediate = prepared.intermediate;
+    const auto tiny = prepared.tiny;
+    const bool disk = prepared.route.route == CUVS_HNSW_ROUTE_ACE;
+    const auto partitions = prepared.route.partitions;
+    const auto sdk_host_budget = prepared.route.sdk_host_budget;
+    const auto sdk_gpu_budget = prepared.route.sdk_gpu_budget;
+    const auto &pq_params = *prepared.pq_params;
+    auto &receipt = prepared.receipt;
+    PooledRes resources(device_id);
+    try
+    {
+        auto &res = resources.get();
+        auto data = raft::make_host_matrix_view<const float, int64_t>(
+            static_cast<const float *>(files.mapping), (int64_t)params->n_vecs, (int64_t)params->dim);
+        cagra::index_params cp;
+        // Cosine was normalized by the PG scan. hnswlib supports L2/IP,
+        // not CosineExpanded; normalized inner product has the same order.
+        cp.metric = params->metric == CUVS_METRIC_COSINE
+            ? cuvs::distance::DistanceType::InnerProduct : cuvs_distance_type(params->metric);
+        cp.graph_degree = degree;
+        cp.intermediate_graph_degree = intermediate;
+        cp.attach_dataset_on_build = false;
+        hnsw::index_params hp;
+        hp.hierarchy = params->hierarchy ? hnsw::HnswHierarchy::GPU : hnsw::HnswHierarchy::NONE;
+        hp.num_threads = 1;
+        hp.ef_construction = receipt.hierarchy_ef;
+        if (disk)
+        {
+            cagra::graph_build_params::ace_params ace;
+            ace.use_disk = true;
+            ace.ef_construction = receipt.ace_ef;
+            ace.build_dir = workdir;
+            ace.npartitions = partitions;
+            ace.max_host_memory_gb = (double)sdk_host_budget / (UINT64_C(1) << 30);
+            ace.max_gpu_memory_gb = (double)sdk_gpu_budget / (UINT64_C(1) << 30);
+#if CUVS_HNSW_HAS_SDK_PLAN
+            size_t effective = cuvs_hnsw_sdk_ace_plan(cp, params->n_vecs, params->dim,
+                partitions, workdir, ace.max_host_memory_gb, ace.max_gpu_memory_gb);
+            size_t rechecked = cuvs_hnsw_sdk_ace_plan(cp, params->n_vecs, params->dim,
+                effective, workdir, ace.max_host_memory_gb, ace.max_gpu_memory_gb);
+            if (effective != rechecked)
+                throw std::runtime_error("ACE SDK partition plan is not stable; no build admitted");
+            ace.npartitions = effective;
+            receipt.partitions = (uint32_t)effective;
+#else
+            throw std::runtime_error("ACE metadata requires matching pinned SDK source planner; set CUVS_SDK_SOURCE_INCLUDE");
+#endif
+            cp.graph_build_params = ace;
+            // Guarded disk serializer reads THESE SAME positive budgets.
+            hp.graph_build_params = ace;
+        }
+        else
+        {
+            cp.graph_build_params = pq_params;
+        }
+        fprintf(stderr, "[hnsw_build] job=%s phase=cuvs-enter call=graph mono_us=%llu\n",
+            workdir, (unsigned long long)cuvs_hnsw_monotonic_us());
+        auto graph = [&]() {
+            if (!tiny) return cagra::build(res, cp, data);
+            const int n = (int)params->n_vecs;
+            auto bf = cuvs_bf_build(data.data_handle(), n, (int)params->dim,
+                params->metric, 0, device_id);
+            if (!bf) throw std::runtime_error("tiny HNSW GPU graph build failed");
+            auto release = [device_id](void *p) { cuvs_bf_free(p, device_id); };
+            std::unique_ptr<void, decltype(release)> bf_owner(bf, release);
+            std::vector<CuvsSearchResult> nearest((size_t)n * n);
+            if (cuvs_bf_search_batch(bf, data.data_handle(), n, (int)params->dim,
+                n, nearest.data(), device_id))
+                throw std::runtime_error("tiny HNSW GPU graph search failed");
+            auto adjacency = raft::make_host_matrix<uint32_t, int64_t>(n, degree);
+            for (int row = 0; row < n; row++)
+            {
+                uint32_t count = 0;
+                for (int k = 0; k < n && count < degree; k++)
+                {
+                    int64_t id = nearest[(size_t)row * n + k].item_id;
+                    if (id >= 0 && id < n && id != row)
+                        adjacency(row, count++) = (uint32_t)id;
+                }
+                while (count < degree) { adjacency(row, count) = (uint32_t)row; count++; }
+            }
+            cagra::index<float, uint32_t> result(res, cp.metric);
+            result.update_graph(res, raft::make_const_mdspan(adjacency.view()));
+            res.sync_stream();
+            return result;
+        }();
+        res.sync_stream();
+        fprintf(stderr, "[hnsw_build] job=%s phase=cuvs-return call=graph mono_us=%llu cancelled=%d\n",
+            workdir, (unsigned long long)cuvs_hnsw_monotonic_us(), cuvs_hnsw_owner_cancelled(owner_fd));
+        if (params->phase_hook && params->phase_hook(params->phase_arg, "after-graph"))
+            return CUVS_STATUS_CANCELED;
+        if (cuvs_hnsw_owner_cancelled(owner_fd)) return CUVS_STATUS_CANCELED;
+        std::string output = std::string(workdir) + "/result.hnsw";
+        fprintf(stderr, "[hnsw_build] job=%s phase=cuvs-enter call=serialize mono_us=%llu\n",
+            workdir, (unsigned long long)cuvs_hnsw_monotonic_us());
+        if (!params->hierarchy && !disk)
+        {
+            // from_cagra<NONE> uses an uncontrolled /tmp file and loads
+            // it into a full hnswlib heap index. Write the same base-layer
+            // representation directly into our private disk directory.
+            cagra::serialize_to_hnswlib(res, output, graph, data);
+        }
+        else
+        {
+            auto index = hnsw::from_cagra(res, hp, graph, data);
+            res.sync_stream();
+            fprintf(stderr, "[hnsw_build] job=%s phase=cuvs-return call=hierarchy mono_us=%llu cancelled=%d\n",
+                workdir, (unsigned long long)cuvs_hnsw_monotonic_us(), cuvs_hnsw_owner_cancelled(owner_fd));
+            if (cuvs_hnsw_owner_cancelled(owner_fd)) return CUVS_STATUS_CANCELED;
+            if (disk)
+                output = index->file_path(); // already serialized; avoid a second disk copy
+            else
+                hnsw::serialize(res, output, *index);
+        }
+        fprintf(stderr, "[hnsw_build] job=%s phase=cuvs-return call=serialize mono_us=%llu cancelled=%d\n",
+            workdir, (unsigned long long)cuvs_hnsw_monotonic_us(), cuvs_hnsw_owner_cancelled(owner_fd));
+        if (cuvs_hnsw_owner_cancelled(owner_fd)) return CUVS_STATUS_CANCELED;
+        if (tiny)
+        {
+            int patch_fd = open(output.c_str(), O_RDWR | O_CLOEXEC);
+            int rc = patch_fd < 0 ? -1 : cuvs_hnsw_fix_tiny_counts(patch_fd, params->n_vecs);
+            if (patch_fd >= 0) close(patch_fd);
+            if (rc) throw std::runtime_error("invalid tiny HNSW base-row neighbor counts");
+        }
+        int fd = open(output.c_str(), O_RDONLY | O_CLOEXEC);
+        if (fd < 0 || !cuvs_hnsw_regular_disk(fd))
+        {
+            if (fd >= 0) close(fd);
+            throw std::runtime_error("cannot open regular disk HNSW output");
+        }
+        // hnswlib clamps efConstruction to M. Record the serialized value,
+        // not merely the requested value (notably at low ef_construction).
+        uint64_t native_ef;
+        if (pread(fd, &native_ef, sizeof(native_ef), 88) != sizeof(native_ef)
+            || native_ef == 0 || native_ef > UINT16_MAX)
+        {
+            close(fd);
+            throw std::runtime_error("invalid serialized HNSW construction effort");
+        }
+        receipt.hierarchy_ef = (uint32_t)native_ef;
+        receipt.guard_passed = 1; /* route + selected SDK guard returned; not a hard cap */
+        if (params->policy) *params->policy = receipt;
+        *out_fd = fd; // files destructor unlinks the private directory
+        fprintf(stderr, "[hnsw_build] %s partitions=%u rows=%llu dim=%u host_est=%llu gpu_est=%llu\n",
+            disk ? "ACE-disk" : tiny ? "tiny-GPU" : "host-IVFPQ", partitions, (unsigned long long)params->n_vecs, params->dim,
+            (unsigned long long)cap.host_peak, (unsigned long long)cap.gpu_peak);
+        return CUVS_STATUS_OK;
+    }
+    catch (...) { resources.poison(); throw; }
+}
+} // namespace
+
+extern "C" int
+cuvs_hnsw_build_file(int vectors_fd, int owner_fd,
+    const CuvsHnswFileBuild *params, const char *workdir, int device_id,
+    int *out_fd, char *error, size_t error_len)
+{
+    using namespace cuvs::neighbors;
+    *out_fd = -1;
+    if (!params || !workdir || device_id < 0 || device_id >= CUVS_MAX_GPUS)
+        return CUVS_STATUS_ERROR;
+    HnswBuildFiles files{workdir};
+    try
+    {
+        HnswPreparedSettings prepared;
+        int rc = prepare_hnsw_settings(params, vectors_fd, prepared, error, error_len);
+        if (rc != CUVS_STATUS_OK) return rc;
+        const auto &cap = prepared.capacity;
+        const auto degree = prepared.degree, intermediate = prepared.intermediate;
+        const auto tiny = prepared.tiny;
+        const auto sample_rows = prepared.sample_rows, actual_training = prepared.actual_training;
+        const auto &pq_params = *prepared.pq_params;
+        auto &receipt = prepared.receipt;
+        if (params->hierarchy && !hnsw_sdk_marker_verified("pgcuvs_hnsw_disk_copy_patch_id",
+                "pgcuvs-hnsw-disk-copy-v1@60b19a0f62ba0bd716de349382828e43be6e2daa"))
+        {
+            snprintf(error, error_len, "GPU hierarchy requires verified patched cuVS 26.04 DSO identity");
+            return CUVS_STATUS_BUILD_FAILED;
+        }
+        if (cuvs_hnsw_owner_cancelled(owner_fd)) return CUVS_STATUS_CANCELED;
+        rc = cuvs_hnsw_resolve_route(params->n_vecs, params->dim, degree, intermediate,
+            params->build_algo, &cap, params->host_budget, params->gpu_budget,
+            &prepared.route, error, error_len);
+        if (rc != CUVS_STATUS_OK) return rc;
+        const bool disk = prepared.route.route == CUVS_HNSW_ROUTE_ACE;
+        const auto partitions = prepared.route.partitions;
+        const auto sdk_host_budget = prepared.route.sdk_host_budget;
+        const auto sdk_gpu_budget = prepared.route.sdk_gpu_budget;
+        if (disk)
+        {
+            if (std::strlen(workdir) > 255 || std::strstr(workdir, "//"))
+            {
+                snprintf(error, error_len, "ACE private workdir violates SDK path contract; refusing /tmp fallback");
+                return CUVS_STATUS_BUILD_FAILED;
+            }
+            if (!hnsw_sdk_marker_verified("pgcuvs_hnsw_disk_copy_patch_id",
+                    "pgcuvs-hnsw-disk-copy-v1@60b19a0f62ba0bd716de349382828e43be6e2daa")
+                || !hnsw_sdk_marker_verified("pgcuvs_hnsw_memory_guard_patch_id",
+                    "pgcuvs-hnsw-memory-guard-v2@60b19a0f62ba0bd716de349382828e43be6e2daa"))
+            {
+                snprintf(error, error_len, "ACE requires verified SDK partition/reorder/serializer capacity guard");
+                return CUVS_STATUS_BUILD_FAILED;
+            }
+        }
+        receipt.magic = CUVS_HNSW_POLICY_MAGIC;
+        receipt.version = CUVS_HNSW_POLICY_VERSION;
+        receipt.bytes = sizeof(receipt);
+        receipt.route = prepared.route.route;
+        receipt.requested_algo = params->build_algo;
+        receipt.requested_ef = params->ef_construction;
+        receipt.degree = degree;
+        receipt.intermediate = intermediate;
+        receipt.hierarchy = params->hierarchy;
+        receipt.n_rows = params->n_vecs;
+        receipt.dim = params->dim;
+        receipt.metric = params->metric;
+        receipt.hierarchy_ef = params->hierarchy
+            ? cuvs_hnsw_scaled_quality(200, params->ef_construction, 4, 65535) : 200;
+        receipt.ace_ef = cuvs_hnsw_scaled_quality(120, params->ef_construction, 4, 65535);
+        receipt.partitions = partitions;
+        receipt.internal_builder = tiny ? 1 : disk ? 3 : 2; /* exact / IVF-PQ / NN-descent */
+        receipt.training_requested = tiny ? 0 : sample_rows;
+        receipt.training_actual = actual_training; /* resident candidate estimate */
+        receipt.host_estimate = cap.host_peak;
+        receipt.gpu_estimate = cap.gpu_peak;
+        receipt.host_budget = params->host_budget;
+        receipt.gpu_budget = params->gpu_budget;
+        receipt.sdk_host_budget = sdk_host_budget;
+        receipt.sdk_gpu_budget = sdk_gpu_budget;
+        if (!tiny && !disk) {
+            receipt.n_lists = pq_params.build_params.n_lists;
+            receipt.pq_dim = pq_params.build_params.pq_dim;
+            receipt.pq_bits = pq_params.build_params.pq_bits;
+            receipt.n_probes = pq_params.search_params.n_probes;
+            receipt.query_batch = 4096;
+        }
+        if (cap.raw_bytes > SIZE_MAX)
+        {
+            snprintf(error, error_len, "HNSW input exceeds addressable file mapping");
+            return CUVS_STATUS_BUILD_FAILED;
+        }
+        files.bytes = (size_t)cap.raw_bytes;
+        files.mapping = mmap(nullptr, files.bytes, PROT_READ, MAP_SHARED, vectors_fd, 0);
+        if (files.mapping == MAP_FAILED)
+        {
+            snprintf(error, error_len, "cannot map HNSW disk vector spool: %s", strerror(errno));
+            return CUVS_STATUS_BUILD_FAILED;
+        }
+        fprintf(stderr, "[hnsw_build] job=%s phase=route mono_us=%llu route=%s partitions=%u host_budget=%llu gpu_budget=%llu sdk_host_budget=%llu sdk_gpu_budget=%llu host_est=%llu gpu_est=%llu\n",
+            workdir, (unsigned long long)cuvs_hnsw_monotonic_us(),
+            disk ? "ACE-disk" : tiny ? "tiny-GPU" : "host-IVFPQ", partitions,
+            (unsigned long long)params->host_budget, (unsigned long long)params->gpu_budget,
+            (unsigned long long)sdk_host_budget, (unsigned long long)sdk_gpu_budget,
+            (unsigned long long)cap.host_peak, (unsigned long long)cap.gpu_peak);
+        return execute_hnsw_file_build(params, owner_fd, workdir, device_id, files, prepared, out_fd);
+    }
+    catch (const std::exception &e)
+    {
+        snprintf(error, error_len, "%s", e.what());
+        fprintf(stderr, "[hnsw_build] job=%s phase=cuvs-exception mono_us=%llu cancelled=%d error=%s\n",
+            workdir, (unsigned long long)cuvs_hnsw_monotonic_us(), cuvs_hnsw_owner_cancelled(owner_fd), e.what());
+        return CUVS_STATUS_BUILD_FAILED;
+    }
+    catch (...)
+    {
+        fprintf(stderr, "[hnsw_build] job=%s phase=cuvs-exception mono_us=%llu cancelled=%d\n",
+            workdir, (unsigned long long)cuvs_hnsw_monotonic_us(), cuvs_hnsw_owner_cancelled(owner_fd));
+        snprintf(error, error_len, "unknown exception building temporary HNSW");
+        return CUVS_STATUS_BUILD_FAILED;
+    }
+}
+
+extern "C" int
+cuvs_hnsw_reap_workdirs(const char *root)
+{
+    int removed = 0;
+    try {
+        std::error_code ec;
+        if (!std::filesystem::is_directory(root, ec)) return 0;
+        for (const auto &entry : std::filesystem::directory_iterator(root)) {
+            std::string name = entry.path().filename().string();
+            if (name.rfind(".hnsw-job-", 0) != 0) continue;
+            struct stat dir_st, lease_st;
+            std::string path = entry.path().string();
+            if (lstat(path.c_str(), &dir_st) || !S_ISDIR(dir_st.st_mode)
+                || dir_st.st_uid != geteuid() || (dir_st.st_mode & 077) != 0
+                || std::time(nullptr) - dir_st.st_mtime < 60) continue;
+            std::string lease = path + "/.lease";
+            int fd = open(lease.c_str(), O_RDWR | O_CLOEXEC | O_NOFOLLOW);
+            if (fd < 0) continue;
+            if (fstat(fd, &lease_st) == 0 && S_ISREG(lease_st.st_mode)
+                && lease_st.st_uid == geteuid() && flock(fd, LOCK_EX | LOCK_NB) == 0) {
+                std::filesystem::remove_all(path, ec);
+                if (!ec) removed++;
+                else fprintf(stderr, "[hnsw_reap] %s: %s\n", path.c_str(), ec.message().c_str());
+            }
+            close(fd);
+        }
+    } catch (const std::exception &e) {
+        fprintf(stderr, "[hnsw_reap] %s\n", e.what());
+        return -1;
+    }
+    return removed;
 }

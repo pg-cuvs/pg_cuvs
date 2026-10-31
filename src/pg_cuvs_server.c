@@ -29,6 +29,7 @@
 #include "cuvs_ipc.h"
 #include "cuvs_util.h"
 #include "cuvs_wrapper.h"
+#include "cuvs_hnsw_build_common.h"
 #include "cuvs_objstore.h"
 #include "cuvs_build_corpus.h"   /* ADR-057: cuvs_fd_recv (SCM_RIGHTS build payload) */
 #include <curl/curl.h>
@@ -53,6 +54,9 @@
 #include <fcntl.h>
 #include <time.h>
 #include <stdint.h>
+#include <poll.h>
+#include <sys/statvfs.h>
+#include <sys/file.h>
 
 /* CSPRNG fill for reply-shm key suffixes (#87). getrandom(2) is Linux-only;
  * fall back to arc4random_buf() on macOS/BSD (never fails) so this file still
@@ -352,6 +356,11 @@ static uint64_t g_cache_persist_fail[CUVS_MAX_GPUS];
  * g_indexes, so total_vram_used() adds this so concurrent admission/eviction
  * still accounts for the build's VRAM. Mutated under g_index_mutex. */
 static size_t   g_pending_build_vram[CUVS_MAX_GPUS];
+
+/* Existing lock-free shard searches and HNSW exports may allocate GPU scratch
+ * after dropping the registry lock. New HNSW admission drains these scopes.
+ * The global count survives registry slot removal/replacement. Mutex protected. */
+static unsigned g_unlocked_gpu_jobs;
 
 /* Phase 3E: per-device GPU state. */
 static CuvsGpuDeviceInfo g_gpus[CUVS_MAX_GPUS];
@@ -3574,8 +3583,24 @@ handle_search(int client_fd, const CuvsCmdFrame *cmd)
          * that sharded indexes are evictable) cannot free our shard handles
          * while we search them lock-free. Decremented after the re-lock below. */
         e->inflight++;
+        g_unlocked_gpu_jobs++;
 
         pthread_mutex_unlock(&g_index_mutex);   /* ---- lock-free GPU dispatch ---- */
+#ifdef CUVS_TEST_HOOKS
+        {
+            const char *pause = getenv("CUVS_TEST_SHARD_PAUSE_MS");
+            if (pause)
+            {
+                long ms = strtol(pause, NULL, 10);
+                if (ms > 0 && ms <= 10000)
+                {
+                    LOG_INFO("[hnsw_admission_test] phase=shard-registered mono_us=%llu\n",
+                        (unsigned long long)cuvs_hnsw_monotonic_us());
+                    (void)poll(NULL, 0, (int)ms);
+                }
+            }
+        }
+#endif
 
         /* Parallel spawns one worker per non-empty shard; sequential runs them
          * inline (cuvs.parallel_fanout = off). A pthread_create failure degrades
@@ -3600,6 +3625,11 @@ handle_search(int client_fd, const CuvsCmdFrame *cmd)
          * unlocked. The merge (g_merge_metric + qsort) and the small delta BF
          * search run here under the lock; only the base shard fanout was lock-free. */
         pthread_mutex_lock(&g_index_mutex);
+        g_unlocked_gpu_jobs--;
+#ifdef CUVS_TEST_HOOKS
+        LOG_INFO("[hnsw_admission_test] phase=shard-return mono_us=%llu\n",
+            (unsigned long long)cuvs_hnsw_monotonic_us());
+#endif
         e = find_index(snap_db, snap_idx);
         if (!e)
         {
@@ -6451,7 +6481,13 @@ handle_export_hnsw_shm(int client_fd, const CuvsCmdFrame *cmd)
     snprintf(shm_path, sizeof(shm_path), "/proc/self/fd/%d", mfd);
 
     /* Serialize HNSW into the memfd (reuses existing cuvs_hnsw_serialize) */
+    pthread_mutex_lock(&g_index_mutex);
+    g_unlocked_gpu_jobs++;
+    pthread_mutex_unlock(&g_index_mutex);
     int hrc = cuvs_hnsw_serialize(handle, shm_path, gpu);
+    pthread_mutex_lock(&g_index_mutex);
+    g_unlocked_gpu_jobs--;
+    pthread_mutex_unlock(&g_index_mutex);
     if (hrc != CUVS_HNSW_SERIALIZE_OK)
     {
         /*
@@ -7752,7 +7788,9 @@ handle_eat_vram(int client_fd, const CuvsCmdFrame *cmd)
     int     dev         = ((int)cmd->dim >= 0 && (int)cmd->dim < CUVS_MAX_GPUS)
                           ? (int)cmd->dim : 0;
 
+    pthread_mutex_lock(&g_index_mutex);
     int rc = cuvs_eat_vram(leave_bytes, dev);
+    pthread_mutex_unlock(&g_index_mutex);
 
     CuvsReplyHeader ok = {0};
     ok.status = (rc == 0) ? CUVS_STATUS_OK : CUVS_STATUS_ERROR;
@@ -7765,7 +7803,9 @@ handle_free_vram(int client_fd, const CuvsCmdFrame *cmd)
     int dev = ((int)cmd->dim >= 0 && (int)cmd->dim < CUVS_MAX_GPUS)
               ? (int)cmd->dim : 0;
 
+    pthread_mutex_lock(&g_index_mutex);
     cuvs_free_vram(dev);
+    pthread_mutex_unlock(&g_index_mutex);
 
     CuvsReplyHeader ok = {0};
     ok.status = CUVS_STATUS_OK;
@@ -7806,6 +7846,311 @@ handle_inject_build_oom(int client_fd, const CuvsCmdFrame *cmd)
     send_all(client_fd, &ok, sizeof(ok));
 }
 #endif /* CUVS_TEST_HOOKS */
+
+/* Temporary HNSW builds are serialized and accounted independently of the
+ * permanent registry. Holding g_index_mutex during the cuVS call also excludes
+ * legacy GPU builders/search work, whose memory is otherwise not a reservation
+ * in this admission estimate. Cancel/owner EOF remains observable on its FD. */
+static uint64_t
+hnsw_host_headroom(uint64_t requested, char *error, size_t error_len)
+{
+    FILE *f = fopen("/proc/meminfo", "r");
+    char line[4096];
+    unsigned long long available = 0;
+    if (!f) return 0;
+    while (fgets(line, sizeof(line), f))
+        if (sscanf(line, "MemAvailable: %llu kB", &available) == 1) break;
+    fclose(f);
+    if (!available || available > UINT64_MAX / 1024) return 0;
+    uint64_t budget = available * 1024 / 2;
+    if (requested < budget) budget = requested;
+    /* Unified cgroup: include every ancestor, since a parent's remaining
+     * memory limit constrains us even when the leaf says max. */
+    f = fopen("/proc/self/cgroup", "r");
+    if (!f) return 0; // an unreadable cgroup limit is not unlimited
+    if (f)
+    {
+        while (fgets(line, sizeof(line), f))
+        {
+            if (strncmp(line, "0::", 3))
+            {
+                // Do not silently ignore a legacy memory-controller limit.
+                // The bounded path currently resolves unified cgroup v2 only.
+                char *first = strchr(line, ':'), *last;
+                if (first && (last = strchr(first + 1, ':')) != NULL)
+                {
+                    *last = '\0';
+                    char *save = NULL;
+                    char *controller = strtok_r(first + 1, ",", &save);
+                    while (controller)
+                    {
+                        if (strcmp(controller, "memory") == 0)
+                        {
+                            snprintf(error, error_len, "HNSW capacity: cgroup v1 memory controller is unsupported; use verified cgroup v2");
+                            fclose(f); return 0;
+                        }
+                        controller = strtok_r(NULL, ",", &save);
+                    }
+                }
+                continue;
+            }
+            char group[4096], path[8192];
+            snprintf(group, sizeof(group), "%s", line + 3);
+            group[strcspn(group, "\n")] = '\0';
+            if (strstr(group, "..")) { fclose(f); return 0; }
+            for (;;)
+            {
+                unsigned long long limit, current;
+                FILE *m;
+                snprintf(path, sizeof(path), "/sys/fs/cgroup%s/memory.max", group);
+                m = fopen(path, "r");
+                if (m)
+                {
+                    int numeric = fscanf(m, "%llu", &limit) == 1;
+                    fclose(m);
+                    if (numeric)
+                    {
+                        snprintf(path, sizeof(path), "/sys/fs/cgroup%s/memory.current", group);
+                        m = fopen(path, "r");
+                        if (!m) { fclose(f); return 0; }
+                        int ok = fscanf(m, "%llu", &current) == 1;
+                        fclose(m);
+                        if (!ok) { fclose(f); return 0; }
+                        uint64_t remaining = current < limit ? (limit - current) / 2 : 0;
+                        if (remaining < budget) budget = remaining;
+                    }
+                }
+                char *slash = strrchr(group, '/');
+                if (!slash) break;
+                *slash = '\0';
+            }
+        }
+        fclose(f);
+    }
+    return budget;
+}
+
+#ifdef CUVS_TEST_HOOKS
+typedef struct HnswTestPhase {
+    int owner_fd;
+    const char *workdir;
+} HnswTestPhase;
+
+/* Test daemon only. The production daemon never installs this callback, and
+ * no wire field can supply an executable address or a pause configuration. */
+static int
+hnsw_test_phase(void *arg, const char *phase)
+{
+    HnswTestPhase *test = arg;
+    const char *pause = !strcmp(phase, "after-graph")
+        ? getenv("CUVS_TEST_HNSW_POST_GRAPH_PAUSE_MS") : NULL;
+    long ms = pause ? strtol(pause, NULL, 10) : 0;
+    if (ms > 0 && ms <= 10000)
+    {
+        uint64_t until = cuvs_hnsw_monotonic_us() + (uint64_t)ms * 1000;
+        LOG_INFO("[hnsw_diskfull_test] job=%s phase=after-graph mono_us=%llu pause_ms=%ld\n",
+            test->workdir, (unsigned long long)cuvs_hnsw_monotonic_us(), ms);
+        while (cuvs_hnsw_monotonic_us() < until)
+        {
+            struct pollfd owner = {.fd = test->owner_fd, .events = POLLIN};
+            if (cuvs_hnsw_owner_cancelled(test->owner_fd)) return 1;
+            (void)poll(&owner, 1, 100);
+        }
+    }
+    return cuvs_hnsw_owner_cancelled(test->owner_fd);
+}
+#endif
+
+/* Called under g_index_mutex; never wait here while holding that lock. */
+static int
+hnsw_gpu_work_pending(void *unused)
+{
+    int busy = g_unlocked_gpu_jobs != 0;
+    (void)unused;
+    for (int gpu = 0; gpu < CUVS_MAX_GPUS; gpu++)
+        if (g_pending_build_vram[gpu]) busy = 1;
+    for (int i = 0; i < g_n_indexes; i++)
+        if (g_indexes[i].inflight > 0) busy = 1;
+#ifdef CUVS_TEST_HOOKS
+    if (busy)
+        LOG_INFO("[hnsw_admission_test] phase=wait mono_us=%llu unlocked_gpu_jobs=%u\n",
+            (unsigned long long)cuvs_hnsw_monotonic_us(), g_unlocked_gpu_jobs);
+#endif
+    return busy;
+}
+
+static void
+handle_build_hnsw_file(int client_fd, const CuvsCmdFrame *cmd)
+{
+    CuvsHnswFileRequest request = {0};
+    CuvsHnswFileBuild params = {0};
+    CuvsHnswFileReply wire = {0};
+    CuvsReplyHeader reply = {0};
+    struct stat st;
+    struct statvfs disk;
+    int vectors_fd = -1, owner_fd = -1, result_fd = -1;
+    int locked = 0, lease_fd = -1;
+    char token;
+    char workdir[4096] = {0};
+    reply.status = CUVS_STATUS_BUILD_FAILED;
+    snprintf(reply.error, sizeof(reply.error), "invalid HNSW file request");
+    int request_status = cuvs_hnsw_receive_file_request(client_fd, &request,
+        &vectors_fd, &owner_fd, reply.error, sizeof(reply.error));
+    if (request_status != CUVS_STATUS_OK)
+    {
+        reply.status = request_status;
+        goto done;
+    }
+    if (cmd->n_vecs <= 0 || cmd->n_vecs > CUVS_TIDS_MAX_VECS
+        || cmd->dim == 0 || cmd->dim > CUVS_VECTORS_MAX_DIM
+        || cmd->metric > CUVS_METRIC_IP || !cuvs_hnsw_regular_disk(vectors_fd)
+        || !shm_check_peer_owner(vectors_fd, g_peer_uid)
+        || fstat(vectors_fd, &st) || st.st_size < 0
+        || (uint64_t)st.st_size != (uint64_t)cmd->n_vecs * cmd->dim * sizeof(float)) goto done;
+    CuvsHnswCapacity checked;
+    if (cuvs_hnsw_capacity((uint64_t)cmd->n_vecs, cmd->dim,
+        cmd->graph_degree, cmd->intermediate_graph_degree, request.hierarchy, &checked)) goto done;
+    if (owner_fd < 0 || fstat(owner_fd, &st) || !S_ISSOCK(st.st_mode)) goto done;
+    fcntl(owner_fd, F_SETFD, FD_CLOEXEC);
+    fcntl(vectors_fd, F_SETFD, FD_CLOEXEC);
+    params.n_vecs = (uint64_t)cmd->n_vecs;
+    params.dim = cmd->dim;
+    params.metric = cmd->metric;
+    params.graph_degree = cmd->graph_degree;
+    params.intermediate_degree = cmd->intermediate_graph_degree;
+    params.hierarchy = request.hierarchy;
+    params.build_algo = request.build_algo;
+    params.ef_construction = request.ef_construction;
+    params.policy = &wire.policy;
+    if (cuvs_hnsw_wait_for_idle(&g_index_mutex, owner_fd, hnsw_gpu_work_pending, NULL))
+        goto cancelled;
+    locked = 1;
+    reply.error[0] = '\0';
+    params.host_budget = hnsw_host_headroom(request.host_budget, reply.error, sizeof(reply.error));
+    int device = usable_gpu(0);
+    params.gpu_budget = cuvs_vram_free_bytes_on(device);
+    uint64_t used = total_vram_used(device);
+    if (g_max_vram_per_gpu[device])
+    {
+        uint64_t remaining = used < g_max_vram_per_gpu[device]
+            ? g_max_vram_per_gpu[device] - used : 0;
+        if (remaining < params.gpu_budget) params.gpu_budget = remaining;
+    }
+    if (!params.host_budget || !params.gpu_budget)
+    {
+        if (!reply.error[0])
+            snprintf(reply.error, sizeof(reply.error), "HNSW host/GPU/cgroup headroom unavailable");
+        goto done;
+    }
+    (void)cuvs_hnsw_reap_workdirs(g_index_dir);
+    if (snprintf(workdir, sizeof(workdir), "%s/.hnsw-job-XXXXXX", g_index_dir)
+            >= (int)sizeof(workdir) || !mkdtemp(workdir))
+    {
+        workdir[0] = '\0';
+        snprintf(reply.error, sizeof(reply.error), "cannot create private HNSW disk directory");
+        goto done;
+    }
+    char lease_path[8192];
+    snprintf(lease_path, sizeof(lease_path), "%s/.lease", workdir);
+    lease_fd = open(lease_path, O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+    if (lease_fd < 0 || flock(lease_fd, LOCK_EX | LOCK_NB))
+    {
+        snprintf(reply.error, sizeof(reply.error), "cannot acquire HNSW temporary directory lease");
+        goto done;
+    }
+    /* Reject tmpfs even if configured as the daemon's index directory. */
+    int probe = open(workdir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    int disk_ok = 0;
+#ifdef __linux__
+    struct statfs fs;
+    disk_ok = probe >= 0 && fstatfs(probe, &fs) == 0
+        && fs.f_type != 0x01021994 && fs.f_type != 0x858458f6;
+#endif
+    if (probe >= 0) close(probe);
+    uint64_t raw = params.n_vecs * params.dim * sizeof(float);
+    uint64_t needed = raw * 4 + params.n_vecs * (params.graph_degree * 8ULL + 64);
+    if (!disk_ok || statvfs(workdir, &disk)
+        || (long double)disk.f_bavail * disk.f_frsize < needed)
+    {
+        snprintf(reply.error, sizeof(reply.error), "HNSW needs regular disk capacity for input/reorder/graph/serialization");
+        goto done;
+    }
+    (void)fstat(vectors_fd, &st);
+    LOG_INFO("[hnsw_job] job=%s phase=start mono_us=%llu rows=%llu dim=%u input_dev=%llu input_ino=%llu\n",
+        workdir, (unsigned long long)cuvs_hnsw_monotonic_us(),
+        (unsigned long long)params.n_vecs, params.dim,
+        (unsigned long long)st.st_dev, (unsigned long long)st.st_ino);
+#ifdef CUVS_TEST_HOOKS
+    {
+        const char *pause = getenv("CUVS_TEST_HNSW_PRE_GPU_PAUSE_MS");
+        if (pause)
+        {
+            long ms = strtol(pause, NULL, 10);
+            if (ms > 0 && ms <= 10000)
+            {
+                uint64_t until = cuvs_hnsw_monotonic_us() + (uint64_t)ms * 1000;
+                LOG_INFO("[hnsw_oom_test] job=%s phase=admitted-before-cuvs mono_us=%llu pause_ms=%ld\n",
+                    workdir, (unsigned long long)cuvs_hnsw_monotonic_us(), ms);
+                while (cuvs_hnsw_monotonic_us() < until)
+                {
+                    struct pollfd owner = {.fd = owner_fd, .events = POLLIN};
+                    if (cuvs_hnsw_owner_cancelled(owner_fd)) goto cancelled;
+                    (void)poll(&owner, 1, 100);
+                }
+            }
+        }
+    }
+#endif
+#ifdef CUVS_TEST_HOOKS
+    HnswTestPhase phase = {.owner_fd = owner_fd, .workdir = workdir};
+    params.phase_hook = hnsw_test_phase;
+    params.phase_arg = &phase;
+#endif
+    reply.status = cuvs_hnsw_build_file(vectors_fd, owner_fd, &params, workdir,
+        device, &result_fd, reply.error, sizeof(reply.error));
+    LOG_INFO("[hnsw_job] job=%s phase=wrapper-return mono_us=%llu status=%u owner_cancelled=%d gpu_free_now=%zu resident_now=%zu\n",
+        workdir, (unsigned long long)cuvs_hnsw_monotonic_us(), reply.status,
+        cuvs_hnsw_owner_cancelled(owner_fd), cuvs_vram_free_bytes_on(device), total_vram_used(device));
+    goto done;
+ cancelled:
+    reply.status = CUVS_STATUS_CANCELED;
+    snprintf(reply.error, sizeof(reply.error), "HNSW owner cancelled or disconnected");
+ done:
+    if (locked) pthread_mutex_unlock(&g_index_mutex);
+    if (vectors_fd >= 0) close(vectors_fd);
+    if (workdir[0])
+    {
+        char lease_path[8192];
+        snprintf(lease_path, sizeof(lease_path), "%s/.lease", workdir);
+        unlink(lease_path);
+        if (rmdir(workdir) != 0 && errno != ENOENT)
+        {
+            // Keep an unlocked lease marker if cleanup was incomplete, so a
+            // later startup/build can reap the private directory safely.
+            int marker = open(lease_path, O_WRONLY | O_CREAT | O_CLOEXEC, 0600);
+            if (marker >= 0) close(marker);
+            LOG_WARN("[hnsw_build] deferred temporary cleanup: %s\n", workdir);
+        }
+    }
+    if (lease_fd >= 0) close(lease_fd);
+    if (owner_fd >= 0 && cuvs_hnsw_owner_cancelled(owner_fd))
+        reply.status = CUVS_STATUS_CANCELED;
+    if (reply.status != CUVS_STATUS_OK && result_fd >= 0)
+    { close(result_fd); result_fd = -1; }
+    wire.header = reply;
+    token = 'R';
+    if (send_all(client_fd, &token, 1) == 0
+        && cuvs_fd_send(client_fd, result_fd, &wire, sizeof(wire)) == 0
+        && reply.status == CUVS_STATUS_OK)
+    {
+        /* The backend ACKs receipt of its own kernel reference; it then owns
+         * the temporary file through PG conversion and closes it on ERROR. */
+        struct pollfd pfd = {.fd = owner_fd, .events = POLLIN};
+        if (poll(&pfd, 1, 30000) > 0) (void)recv(owner_fd, &token, 1, 0);
+    }
+    if (result_fd >= 0) close(result_fd);
+    if (owner_fd >= 0) close(owner_fd);
+}
 
 /* ----------------------------------------------------------------
  * Per-connection thread
@@ -7889,6 +8234,9 @@ connection_thread(void *arg)
             break;
         case CUVS_OP_SEARCH_BATCH:
             handle_search_batch(client_fd, &cmd);
+            break;
+        case CUVS_OP_BUILD_HNSW_FILE:
+            handle_build_hnsw_file(client_fd, &cmd);
             break;
         case CUVS_OP_BUILD:
             handle_build(client_fd, &cmd);
@@ -8700,6 +9048,7 @@ main(int argc, char **argv)
     }
 
     /* Load persisted indexes */
+    (void)cuvs_hnsw_reap_workdirs(g_index_dir);
     startup_load_indexes();
 
     /* Per-device GPU warm-up so the first client query doesn't pay the

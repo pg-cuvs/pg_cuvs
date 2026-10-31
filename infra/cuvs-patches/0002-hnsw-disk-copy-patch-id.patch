@@ -1,0 +1,13 @@
+diff --git a/cpp/src/neighbors/hnsw.cpp b/cpp/src/neighbors/hnsw.cpp
+--- a/cpp/src/neighbors/hnsw.cpp
++++ b/cpp/src/neighbors/hnsw.cpp
+@@ -105,3 +105,9 @@
+ #undef CUVS_INST_HNSW_SERIALIZE
+ 
+ }  // namespace cuvs::neighbors::hnsw
++
++extern "C" __attribute__((visibility("default"))) const char*
++pgcuvs_hnsw_disk_copy_patch_id()
++{
++  return "pgcuvs-hnsw-disk-copy-v1@60b19a0f62ba0bd716de349382828e43be6e2daa";
++}

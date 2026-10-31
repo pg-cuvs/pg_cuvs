@@ -1,0 +1,76 @@
+{
+  "schema_version": 1,
+  "upstream": {
+    "project": "rapidsai/cuvs",
+    "tag": "v26.04.00",
+    "commit": "60b19a0f62ba0bd716de349382828e43be6e2daa",
+    "archive_sha256": "2507bb2d2fc37da3d487f7130fbd0c0a5ea61c128c0203cce385aac79e72b078",
+    "license": {
+      "path": "LICENSE",
+      "spdx": "Apache-2.0",
+      "sha256": "756005f963846334943e8bfc08ef98cd254257d8467ac7a7ffd42a1be262f442"
+    }
+  },
+  "composition_receipt": {
+    "artifact": "stages/hnsw/evidence/sdk-v2-composed-34831f22/receipt.json",
+    "sha256": "a9a3b19a570f859ea9d1b7b2484d9ef766412ce18c913ac94b01f39b94bb1d1e"
+  },
+  "patches": [
+    {
+      "path": "0001-hnsw-gpu-hierarchy-typed-copy.patch",
+      "sha256": "2f5adf6d3cce3c9d60335e40992250e5044f0ed494c8f5cff6fe3e1654e7b04a"
+    },
+    {
+      "path": "0002-hnsw-disk-copy-patch-id.patch",
+      "sha256": "d52ddd22a0e558849d75ec3ddfba4b52fcc200ed6869568593245289f9f963f8"
+    },
+    {
+      "path": "0003-hnsw-memory-guards.patch",
+      "sha256": "34831f221f32337c025afeb33a32d7aa304e703bd0e3ee85f0ff93902a9a130f"
+    }
+  ],
+  "runtime_markers": {
+    "disk_copy": {
+      "symbol": "pgcuvs_hnsw_disk_copy_patch_id",
+      "value": "pgcuvs-hnsw-disk-copy-v1@60b19a0f62ba0bd716de349382828e43be6e2daa"
+    },
+    "memory_guard": {
+      "symbol": "pgcuvs_hnsw_memory_guard_patch_id",
+      "value": "pgcuvs-hnsw-memory-guard-v2@60b19a0f62ba0bd716de349382828e43be6e2daa"
+    }
+  },
+  "source_files": {
+    "cpp/src/neighbors/detail/hnsw.hpp": {
+      "base_sha256": "6c8530e39c6ed5fa4eb3fe7b9c6c24022842147c41814fc4c130fdb5a6b8fd0b",
+      "patch1_sha256": "49adab846921272a2aaf28f3c5749fb85925fbfde8ca43cd0af61e51adcbba99",
+      "final_sha256": "88192b1da4cb50a2de5a0f374854c1d0659734215136f86d7e53e52c0a1dc911"
+    },
+    "cpp/src/neighbors/hnsw.cpp": {
+      "base_sha256": "59c7874565b049eed090e7423df638eb18e4551ccd1cd4b65f1197dc4a4a7102",
+      "final_sha256": "fcbe6c5c40d35854a6deb6a3182c70dca8e5b53e83bb79c11a2efcb4b1a4a39e"
+    },
+    "cpp/src/neighbors/cagra.cpp": {
+      "base_sha256": "100e9a8702bf1f5b373019583d873a99d9490b575d3aa53dec5a9e34e932c202",
+      "final_sha256": "c270c872b8513179b5c3f9583a653aaa8091a3d08973ea19bd125f823803fcce"
+    },
+    "cpp/src/neighbors/detail/cagra/cagra_build.cuh": {
+      "base_sha256": "f72c7ac38e1b24f2f0b05c5a392a1eef2bec7fc88a1fa27f6393fc87795f5bc1",
+      "final_sha256": "87239d05766dda6f99d17cbfbc75faa9858e976fc0aa80f679f63dc4a6297c8e"
+    },
+    "cpp/src/neighbors/detail/cagra/ace_memory_guard.hpp": {
+      "base_sha256": null,
+      "final_sha256": "dc2ccb2d6920bf81d55e614181e3ceff8e7e0394eae56d0506fbb302190cf555"
+    }
+  },
+  "source_prefix_states": {
+    "0001": ["cpp/src/neighbors/detail/hnsw.hpp"],
+    "0001+0002": ["cpp/src/neighbors/detail/hnsw.hpp", "cpp/src/neighbors/hnsw.cpp"],
+    "0001+0002+0003": [
+      "cpp/src/neighbors/detail/hnsw.hpp",
+      "cpp/src/neighbors/hnsw.cpp",
+      "cpp/src/neighbors/cagra.cpp",
+      "cpp/src/neighbors/detail/cagra/cagra_build.cuh",
+      "cpp/src/neighbors/detail/cagra/ace_memory_guard.hpp"
+    ]
+  }
+}

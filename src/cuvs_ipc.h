@@ -80,6 +80,40 @@
                                      * [vectors][tids] handed off via SCM_RIGHTS memfd (filter_shm_key
                                      * names the SHM-tier fallback); query in shm_key. Non-evicting
                                      * VRAM admission; returns top-k (tid,distance). */
+#define CUVS_OP_BUILD_HNSW_FILE 23 /* temporary, private HNSW build; no registry entry */
+
+/* New op-specific payload: leaves the legacy v3 command/reply ABI intact.
+ * First SCM_RIGHTS frame: this struct + raw float32 vector file FD.
+ * Second frame: one byte + separate owner socket FD. Reply: readiness byte,
+ * then CuvsReplyHeader + read-only regular HNSW file FD (success only).
+ * Owner channel: C=cancel, EOF=owner lost, A=result handoff acknowledged. */
+#include "cuvs_hnsw_policy.h"
+#define CUVS_HNSW_FILE_VERSION 3u
+typedef struct CuvsHnswFileRequest {
+    uint32_t version;
+    uint32_t hierarchy;        /* 0=NONE (nsw), 1=GPU; never CPU */
+    uint64_t host_budget;      /* nonzero admission budget, not an RSS guarantee */
+    uint32_t build_algo;
+    uint32_t ef_construction;
+} CuvsHnswFileRequest;
+
+static inline int cuvs_hnsw_file_version_supported(uint32_t version)
+{
+    return version == CUVS_HNSW_FILE_VERSION;
+}
+
+static inline int cuvs_hnsw_file_request_supported(const CuvsHnswFileRequest *r)
+{
+    return r && cuvs_hnsw_file_version_supported(r->version) && r->hierarchy <= 1
+        && r->host_budget && cuvs_hnsw_algo_supported(r->build_algo)
+        && r->ef_construction >= 4 && r->ef_construction <= 1000;
+}
+
+int cuvs_ipc_build_hnsw_file(const char *socket_path, int vectors_fd,
+    uint64_t n_vecs, uint32_t dim, uint32_t metric, uint32_t graph_degree,
+    uint32_t intermediate_degree, uint32_t hierarchy, uint64_t host_budget,
+    uint32_t build_algo, uint32_t ef_construction, CuvsHnswPolicy *policy,
+    int *hnsw_fd, char *error, size_t error_len);
 
 /* ----------------------------------------------------------------
  * Distance metrics (mirror pgvector operator names)
@@ -110,6 +144,7 @@
 #define CUVS_STATUS_NO_VECTORS    10   /* Phase 3L: brute_force requested but .vectors sidecar missing → REINDEX */
 #define CUVS_STATUS_CANCELED      11   /* 3S: backend aborted the wait (statement_timeout / query cancel) */
 #define CUVS_STATUS_PROTO_MISMATCH 12  /* #77: daemon/extension wire-protocol skew (co-deploy both) */
+#define CUVS_STATUS_HNSW_RESIDENT_BUDGET_EXCEEDED 13 /* AUTO/explicit IVF estimate only; not tiny/ACE/OOM */
 
 /* ----------------------------------------------------------------
  * Command frame (sent over UDS, fixed size)
@@ -200,6 +235,12 @@ typedef struct CuvsReplyHeader {
                              * (Phase 3B); backend then skips its CPU merge */
     char     error[128];
 } CuvsReplyHeader;
+
+/* Only BUILD_HNSW_FILE v3 uses this receipt; global v3 stays unchanged. */
+typedef struct CuvsHnswFileReply {
+    CuvsReplyHeader header;
+    CuvsHnswPolicy policy;
+} CuvsHnswFileReply;
 
 typedef struct CuvsResult {
     uint64_t tid;           /* heap TID encoded as block<<16|offset */
