@@ -182,6 +182,9 @@ jobs:
           # #45's soft-LRU churn deterministically. Installed server = shim (no CUDA).
           bash infra/scripts/tests/max-indexes-scale.sh
 
+      - name: Concurrent RMM pending-quota admission (CPU)
+        run: make PGCUVS_CPU_SHIM=1 test-rmm-pending
+
       # The benchmark harness decides which index a published number describes
       # (ownership keys, reloptions checks, the 3I build-NOTICE parser, --resume
       # row skipping). Until now this job ran no Python at all, so those rules
