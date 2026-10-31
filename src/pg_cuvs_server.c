@@ -375,6 +375,17 @@ static size_t   g_max_vram_per_gpu[CUVS_MAX_GPUS];
 static char   g_socket_path[256]  = "/tmp/.s.pg_cuvs.server";
 static char   g_index_dir[256]    = "/tmp/pg_cuvs_indexes";
 static size_t g_max_vram_bytes    = 0;   /* 0 = use default fraction; >0 = explicit --max-vram-mb */
+#ifdef PGCUVS_CPU_SHIM
+static uint32_t g_rmm_pool_mb     = 0;   /* CPU fixture has no GPU allocator */
+#else
+static uint32_t g_rmm_pool_mb     = 512; /* initial reservation per usable GPU */
+#endif
+static uint32_t g_rmm_pool_max_percent = 50;
+static size_t g_rmm_pool_limits[CUVS_MAX_GPUS];
+/* Estimated quota reservations for unlocked builds, separate from logical
+ * residency. Protected by g_index_mutex; allocator counters cannot see these
+ * until the build allocates. Kept until return, conservatively even then. */
+static size_t g_pending_rmm_build_vram[CUVS_MAX_GPUS];
 
 /* ADR-065: default per-device budget when --max-vram-mb is omitted — a fraction
  * of total VRAM, leaving headroom for the untracked cuVS workspace + CUDA
@@ -701,10 +712,16 @@ total_vram_used(int device_id)
     return total;
 }
 
+/* All admission callers hold g_index_mutex. Include unallocated build claims
+ * for cache/transient-BF admissions as well as ensure_vram(). The wrapper's
+ * physical/pool counters alone cannot account for these reservations. */
 static size_t
 gpu_free_vram_bytes(int device_id)
 {
-    return cuvs_vram_free_bytes_on(device_id);
+    size_t available = cuvs_vram_free_bytes_on(device_id);
+    size_t pending = g_rmm_pool_limits[device_id] > 0
+        ? g_pending_rmm_build_vram[device_id] : 0;
+    return pending < available ? available - pending : 0;
 }
 
 /* Phase 3E: return the allowed GPU index (in g_allowed_gpus) for a device_id,
@@ -746,10 +763,14 @@ pick_gpu_for_index(size_t needed)
     {
         int dev = usable_gpu(i);
         size_t budget = g_max_vram_per_gpu[dev];
+        if (g_rmm_pool_limits[dev] > 0 &&
+            (budget == 0 || g_rmm_pool_limits[dev] < budget))
+            budget = g_rmm_pool_limits[dev];
         if (budget > 0 && needed > budget)
             continue;
         size_t used = total_vram_used(dev);
-        size_t headroom = (budget > 0) ? (budget - used) : gpu_free_vram_bytes(dev);
+        size_t headroom = budget > 0 ? (budget > used ? budget - used : 0)
+                                    : gpu_free_vram_bytes(dev);
         if (best < 0 || headroom > best_headroom) {
             best_headroom = headroom;
             best = dev;
@@ -2085,11 +2106,41 @@ evict_lru(int device_id)
     return freed;
 }
 
+/* Call under g_index_mutex, immediately after successful admission and before
+ * unlocking for a build; release under the same mutex on success or failure. */
+static void
+reserve_build_vram(size_t needed, int device_id)
+{
+    g_pending_build_vram[device_id] += needed;
+    if (g_rmm_pool_limits[device_id] > 0)
+        g_pending_rmm_build_vram[device_id] += needed;
+}
+
+static void
+release_build_vram(size_t needed, int device_id)
+{
+    g_pending_build_vram[device_id] -= needed;
+    if (g_rmm_pool_limits[device_id] > 0)
+        g_pending_rmm_build_vram[device_id] -= needed;
+}
+
 /* Ensure there is enough VRAM on `device_id` for `needed` bytes. */
 static int
 ensure_vram(size_t needed, int device_id)
 {
     size_t budget = g_max_vram_per_gpu[device_id];
+    size_t quota = g_rmm_pool_limits[device_id];
+    size_t pending = quota > 0 ? g_pending_rmm_build_vram[device_id] : 0;
+    /* Reject impossible concurrent reservations before touching healthy LRUs.
+     * Allocation may already reflect part of pending: retaining it until the
+     * build returns deliberately makes admission conservative, never looser. */
+    if (quota > 0 && (pending > quota || needed > quota - pending))
+        return -1;
+    if (pending > 0)
+    {
+        if (needed > gpu_free_vram_bytes(device_id))
+            return -1;
+    }
     if (budget > 0 && total_vram_used(device_id) + needed > budget)
     {
         while (g_n_indexes > 0 && total_vram_used(device_id) + needed > budget)
@@ -2101,7 +2152,9 @@ ensure_vram(size_t needed, int device_id)
     }
 
     size_t free_vram = gpu_free_vram_bytes(device_id);
-    while (g_n_indexes > 0 && needed > free_vram)
+    /* An unlocked builder can allocate between observations. Do not evict on
+     * that transient reservation pressure; the caller can retry later. */
+    while (pending == 0 && g_n_indexes > 0 && needed > free_vram)
     {
         if (evict_lru(device_id) == 0)
             break;
@@ -5273,7 +5326,7 @@ handle_build(int client_fd, const CuvsCmdFrame *cmd)
      * total_vram_used() counts g_pending_build_vram, so concurrent admission and
      * eviction stay correct while we build unlocked. vecs/mem are per-request
      * (not shared state), so reading them unlocked is safe. */
-    g_pending_build_vram[target_gpu] += needed;
+    reserve_build_vram(needed, target_gpu);
     pthread_mutex_unlock(&g_index_mutex);
 
     LOG_DEBUG("[handle_build] calling cuvs_cagra_build n_vecs=%lld dim=%u gpu=%d...\n",
@@ -5313,7 +5366,7 @@ handle_build(int client_fd, const CuvsCmdFrame *cmd)
      * expects the lock held). Release the build reservation now: on success the
      * registry entry below carries vram_bytes; on failure the VRAM is freed. */
     pthread_mutex_lock(&g_index_mutex);
-    g_pending_build_vram[target_gpu] -= needed;
+    release_build_vram(needed, target_gpu);
 
     if (!new_handle)
     {
@@ -5918,7 +5971,7 @@ handle_build_multi(int client_fd, const CuvsCmdFrame *cmd, const char *index_dir
          * GPU build so concurrent searches/stats/drops aren't blocked. Partials
          * (part_vecs/maps) are per-request, so reading them unlocked is safe;
          * total_vram_used() counts g_pending_build_vram during the window. */
-        g_pending_build_vram[target_gpu] += needed;
+        reserve_build_vram(needed, target_gpu);
         pthread_mutex_unlock(&g_index_mutex);
 
         new_handle = cuvs_cagra_build_multi(part_vecs, n_each, nmapped, total,
@@ -5954,7 +6007,7 @@ handle_build_multi(int client_fd, const CuvsCmdFrame *cmd, const char *index_dir
          * expects the lock held). Release the reservation: on success the registry
          * entry carries vram_bytes; on failure the VRAM is freed. */
         pthread_mutex_lock(&g_index_mutex);
-        g_pending_build_vram[target_gpu] -= needed;
+        release_build_vram(needed, target_gpu);
 
         if (!new_handle)
         {
@@ -8250,6 +8303,38 @@ connection_thread(void *arg)
         case CUVS_OP_CACHE_STATS:
             handle_cache_stats(client_fd);
             break;
+        case CUVS_OP_SERVER_SETTINGS:
+        {
+            CuvsReplyHeader hdr = {.status = CUVS_STATUS_OK, .n_results = 1};
+            CuvsServerSettings settings = {.rmm_pool_mb = g_rmm_pool_mb};
+            send_all(client_fd, &hdr, sizeof(hdr));
+            send_all(client_fd, &settings, sizeof(settings));
+            break;
+        }
+        case CUVS_OP_RMM_POOL_STATUS:
+        {
+            CuvsReplyHeader hdr = {.status = CUVS_STATUS_OK, .n_results = 1};
+            CuvsRmmPoolStatus status = {
+                .version = CUVS_RMM_POOL_STATUS_VERSION,
+                .initial_mb = g_rmm_pool_mb,
+                .maximum_percent = g_rmm_pool_mb > 0 ? g_rmm_pool_max_percent : 0
+            };
+            if (g_rmm_pool_mb > 0)
+                for (int i = 0; i < n_usable_gpus(); i++)
+                {
+                    if (cuvs_rmm_pool_stats(usable_gpu(i), &status.devices[i]) != 0)
+                    {
+                        hdr.status = CUVS_STATUS_UNAVAILABLE;
+                        hdr.n_results = 0;
+                        break;
+                    }
+                    status.n_devices++;
+                }
+            send_all(client_fd, &hdr, sizeof(hdr));
+            if (hdr.status == CUVS_STATUS_OK)
+                send_all(client_fd, &status, sizeof(status));
+            break;
+        }
         case CUVS_OP_SHARD_STATS:
             handle_shard_stats(client_fd, &cmd);
             break;
@@ -8895,6 +8980,23 @@ main(int argc, char **argv)
             strncpy(g_index_dir, argv[++i], sizeof(g_index_dir) - 1);
         else if (strcmp(argv[i], "--max-vram-mb") == 0 && i+1 < argc)
             g_max_vram_bytes = (size_t)atol(argv[++i]) * 1024 * 1024;
+        else if (strcmp(argv[i], "--rmm-pool-mb") == 0)
+        {
+            if (i + 1 >= argc || cuvs_parse_rmm_pool_mb(argv[++i], &g_rmm_pool_mb) != 0)
+            {
+                LOG_ERROR("--rmm-pool-mb requires a nonnegative integer MiB value\n");
+                return 1;
+            }
+        }
+        else if (strcmp(argv[i], "--rmm-pool-max-percent") == 0)
+        {
+            if (i + 1 >= argc ||
+                cuvs_parse_rmm_pool_percent(argv[++i], &g_rmm_pool_max_percent) != 0)
+            {
+                LOG_ERROR("--rmm-pool-max-percent requires an integer from 1 to 100\n");
+                return 1;
+            }
+        }
         else if (strcmp(argv[i], "--max-indexes") == 0 && i+1 < argc)
         {
             int n = atoi(argv[++i]);
@@ -9013,6 +9115,30 @@ main(int argc, char **argv)
         return 1;
     }
     LOG_INFO("index registry capacity: %d (--max-indexes)\n", g_max_indexes);
+
+    /* Install the per-device allocator before probes, persisted-index reloads,
+     * warmup or worker threads can make the first RMM allocation. An explicit
+     * zero keeps the old allocation path. Any failed init aborts startup. */
+    if (g_rmm_pool_mb > 0)
+    {
+        for (int i = 0; i < n_usable_gpus(); i++)
+        {
+            int dev = usable_gpu(i);
+            CuvsRmmPoolStats stats;
+            if (cuvs_rmm_pool_init(dev, (size_t)g_rmm_pool_mb * 1024 * 1024,
+                                  g_rmm_pool_max_percent) != 0 ||
+                cuvs_rmm_pool_stats(dev, &stats) != 0)
+            {
+                LOG_ERROR("GPU %d: RMM pool initialization failed (%u MiB)\n",
+                          dev, g_rmm_pool_mb);
+                return 1;
+            }
+            g_rmm_pool_limits[dev] = (size_t)stats.maximum_bytes;
+        }
+    }
+    LOG_INFO("RMM initial pool reservation: %u MiB per GPU (0=disabled)\n", g_rmm_pool_mb);
+    LOG_INFO("RMM maximum pool quota: %u%% of total device memory\n",
+             g_rmm_pool_mb > 0 ? g_rmm_pool_max_percent : 0);
 
     /* ADR-075 Phase 1: probe hardware + write the global cost-model profile. */
     write_hw_profile();

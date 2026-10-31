@@ -73,6 +73,18 @@ IDX=/tmp/cuvs_indexes
 CONDA=/opt/miniforge3
 DEV=$CONDA/envs/cuvs_dev            # C/C++ build toolchain (nvcc, libcuvs)
 BENCH=$CONDA/envs/cuvs_bench        # python bench stack (separate: python 3.12)
+RMM_POOL_MB=${RMM_POOL_MB:-512}     # initial reservation per GPU, MiB; 0 disables
+RMM_POOL_MAX_PERCENT=${RMM_POOL_MAX_PERCENT:-50}
+case "$RMM_POOL_MB" in
+  ''|*[!0-9]*) echo "FATAL: RMM_POOL_MB must be a nonnegative integer" >&2; exit 1 ;;
+esac
+case "$RMM_POOL_MAX_PERCENT" in
+  ''|*[!0-9]*) echo "FATAL: RMM_POOL_MAX_PERCENT must be an integer from 1 to 100" >&2; exit 1 ;;
+esac
+if ! { [ "$RMM_POOL_MAX_PERCENT" -ge 1 ] && [ "$RMM_POOL_MAX_PERCENT" -le 100 ]; } 2>/dev/null; then
+  echo "FATAL: RMM_POOL_MAX_PERCENT must be an integer from 1 to 100" >&2
+  exit 1
+fi
 
 # The Brev image runs its own apt on first boot. Racing it dies with "Could not
 # get lock /var/lib/dpkg/lock-frontend", which is exactly how a bootstrap once
@@ -304,6 +316,10 @@ sudo chmod 755 /usr/local/bin/pg-cuvs-wait-socket
 # unlinks the socket — with several/large indexes this can outrun systemd's
 # default stop timeout (90s), and the ensuing SIGKILL both loses whatever
 # indexes had not yet been saved and reintroduces the stale-socket race above.
+# A benchmark can change this file and restart the daemon to compare pool=0
+# against pool=N without rewriting the unit or changing PostgreSQL GUCs.
+printf 'RMM_POOL_MB=%s\nRMM_POOL_MAX_PERCENT=%s\n' "$RMM_POOL_MB" "$RMM_POOL_MAX_PERCENT" \
+  | sudo tee /etc/default/pg-cuvs-server > /dev/null
 sudo tee /etc/systemd/system/pg-cuvs-server.service > /dev/null <<UNIT
 [Unit]
 Description=pg_cuvs GPU sidecar daemon
@@ -313,9 +329,12 @@ After=network.target
 Type=simple
 User=$(id -un)
 Group=$(id -gn)
+Environment=RMM_POOL_MB=512
+Environment=RMM_POOL_MAX_PERCENT=50
+EnvironmentFile=-/etc/default/pg-cuvs-server
 ExecStartPre=/bin/mkdir -p $IDX
 ExecStartPre=-/bin/rm -f /tmp/.s.pg_cuvs
-ExecStart=$(pg_config --bindir)/pg_cuvs_server --socket /tmp/.s.pg_cuvs --index-dir $IDX --gpu-devices 0
+ExecStart=$(pg_config --bindir)/pg_cuvs_server --socket /tmp/.s.pg_cuvs --index-dir $IDX --gpu-devices 0 --rmm-pool-mb \${RMM_POOL_MB} --rmm-pool-max-percent \${RMM_POOL_MAX_PERCENT}
 ExecStartPost=/usr/local/bin/pg-cuvs-wait-socket
 TimeoutStartSec=600
 TimeoutStopSec=300
