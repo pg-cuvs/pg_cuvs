@@ -168,6 +168,14 @@ Defaults and ranges are from source. "Set by" is the minimum role/scope: `USERSE
 | `cuvs.rmm_pool_status` | string/status | daemon value | JSON, or `unavailable` | read-only (INTERNAL) | Applied initial MiB, quota percentage, and per-device maximum/reserved/used pool bytes. Counters cover RMM pool allocations; they are live snapshots, not process-wide GPU memory |
 | `cuvs.circuit_breaker_threshold` | int | `3` | 1–100 | USERSET | Consecutive GPU errors before the (per-backend) breaker trips |
 
+Unlocked CAGRA builds reserve estimated RMM quota separately from logical index
+residency under the registry mutex. Admission subtracts all in-flight reservations
+from pool headroom and releases them on build success or failure. Since allocator
+counters can already include part of a reservation, this is conservative and may
+reject a concurrent build until the earlier build returns. Pending-quota pressure
+does not evict healthy resident indexes. This remains estimate-based admission;
+workspace allocations can still produce a genuine allocation failure.
+
 ### Build
 
 | GUC | Type | Default | Range | Set by | Purpose |
