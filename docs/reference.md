@@ -19,7 +19,7 @@ pg_cuvs registers four index AMs. All reuse pgvector's `vector` type and operato
 | `cagra` | `CREATE INDEX i ON t USING cagra (col vector_l2_ops)` | `graph_degree`, `intermediate_graph_degree`, `build_algo`, `index_dir` | GPU daemon | `.cagra`, `.tids`, (`.vectors`, `.delta`, `.tombstone`, `.stale`, `.shards`, `.sNNN.cagra`, `.relfilenode`) |
 | `flat` | `CREATE INDEX i ON t USING flat (col vector_l2_ops) WITH (precision='float16')` | `precision`, `index_dir` | GPU daemon | `.tids`, `.vectors` (no `.cagra` graph) |
 | `ivfpq` | `CREATE INDEX i ON t USING ivfpq (col vector_l2_ops)` | `n_lists`, `pq_bits`, `pq_dim`, `index_dir` | GPU daemon | `.ivfpq`, `.tids` |
-| `pg_cuvs_hnsw` | `CREATE INDEX i ON t USING pg_cuvs_hnsw (col vector_l2_ops) WITH (source='my_cagra', mode='nsw')` | `source`, `mode`, `m`, `ef_construction` | **pgvector** (CPU) | `.hnsw` (pgvector page format) |
+| `pg_cuvs_hnsw` | `CREATE INDEX i ON t USING pg_cuvs_hnsw (col vector_l2_ops) WITH (source='my_cagra', mode='nsw')` | `source`, `mode`, `m`, `ef_construction`, `build_algo` | **pgvector** (CPU) | `.hnsw` (pgvector page format) |
 
 `flat` is the first-class exact GPU brute-force AM (ADR-073, extension v0.4.0). It builds only a
 `.tids` + `.vectors` store — no CAGRA graph — so the build is O(N) copy rather than graph
@@ -296,11 +296,21 @@ cagra/ivfpq") rather than silently failing.
 | `source` | string | `` | a `cagra` index name on the same table | empty = ephemeral CAGRA built from the heap |
 | `mode` | string | `nsw` | `nsw`, `hnswlib`, `hnsw`, `hnswlib_file` | `nsw` and `hnswlib` are recommended |
 | `m` | int | `16` | 2–100 | **informational** — the CAGRA graph degree drives the HNSW layout, not `m` |
-| `ef_construction` | int | `64` | 4–1000 | **informational** |
+| `ef_construction` | int | `64` | 4–1000 | Direct heap build: construction effort; source reuse: informational |
+| `build_algo` | enum | `auto` | `auto`, `ivf_pq`, `ace` | Direct heap build only; cannot be combined with explicit `source` |
 
-> `m` / `ef_construction` are *accepted without error* and recorded in the index's reloptions for
-> pgvector compatibility, but they do **not** affect the GPU-built graph. Control graph quality via
-> the source `cagra` index's `graph_degree` / `intermediate_graph_degree`.
+For direct heap construction, `auto` uses tiny exact GPU construction below 16 rows and
+otherwise the resident IVF-PQ route. Exceeding the estimated resident budget returns
+an error with an explicit `build_algo=ace` hint; AUTO does not switch to disk ACE.
+Explicit `ace` consumes the matching patched SDK/planner and a private disk workdir.
+`nn_descent` is reserved for this direct HNSW surface and is rejected until a supported
+memory model exists; the separate `cagra` AM has its own build-algorithm options.
+
+`m` remains informational. Direct `ef_construction` scales intermediate degree from128,
+hierarchy construction effort from200, and ACE effort from120 at the default64;
+receipts record the consumed/clamped values. Reusing a source CAGRA graph does not
+rebuild it according to these options. See [HNSW build options](hnsw-build-options.md)
+for limits, compatibility and estimate-vs-upper-bound caveats.
 
 ---
 
@@ -309,6 +319,7 @@ cagra/ivfpq") rather than silently failing.
 | Function | Returns | Purpose |
 |----------|---------|---------|
 | `pg_cuvs_reset_circuit(index regclass)` | void | Re-enable GPU routing after the (per-session) circuit breaker tripped |
+| `pg_cuvs_hnsw_build_info(index regclass)` | jsonb | Read the stored construction route/settings and estimate-based admission. Version2 writer with historical version1 reader; absent legacy/source/empty receipts are not reconstructed from current GUCs. Requires SELECT on the source table; estimates are not memory upper-bound guarantees |
 | `pg_cuvs_build_hnsw(cagra regclass, mode text DEFAULT 'nsw')` | regclass | Build a pgvector HNSW from a CAGRA index without pgvector's CPU build. **Deprecated** in favor of `CREATE INDEX ... USING pg_cuvs_hnsw`; the older two-step `pg_cuvs_import_hnsw` form (empty `USING hnsw` target + import) is removed |
 | `pg_cuvs_compact(index regclass)` | void | Remove tombstoned vectors via `cuvsCagraMerge`, rebuild `.cagra`/`.tids`, drop `.tombstone` |
 | `pg_cuvs_batch_search(rel regclass, queries vector[], k int)` | SETOF (query_idx int, ctid tid, distance real) | Q queries in one IPC/GPU dispatch; JOIN on `ctid` for visible rows; honors `search_mode`/`bf_precision` |
