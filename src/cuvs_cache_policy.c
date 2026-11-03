@@ -369,6 +369,32 @@ cuvs_self_replace_decide(uint64_t shortfall, int has_old, int old_pinned,
     return old_bytes >= shortfall ? CUVS_SELF_REPLACE : CUVS_SELF_UNAVAILABLE;
 }
 
+int
+cuvs_self_replace_notice(char *msg, size_t mcap, char *detail, size_t dcap,
+                         const char *label, uint64_t need, uint64_t free_bytes)
+{
+    int a = snprintf(msg, mcap,
+                     "pg_cuvs: previous resident copy of %s unloaded from GPU to make "
+                     "room for the rebuild", label);
+    int b = snprintf(detail, dcap,
+                     "GPU memory was insufficient for both copies (need %llu bytes, free "
+                     "%llu bytes). Queries on this index use the CPU path or reload the "
+                     "old copy until the new index is resident",
+                     (unsigned long long) need, (unsigned long long) free_bytes);
+    return (a < 0 || (size_t) a >= mcap || b < 0 || (size_t) b >= dcap) ? -1 : 0;
+}
+
+int
+cuvs_self_replace_fail_notice(char *msg, size_t mcap, char *detail, size_t dcap,
+                              const char *label)
+{
+    int a = snprintf(msg, mcap,
+                     "pg_cuvs: rebuild of %s failed after its previous resident copy was "
+                     "unloaded from GPU", label);
+    int b = snprintf(detail, dcap, "The next query on this index reloads the old copy");
+    return (a < 0 || (size_t) a >= mcap || b < 0 || (size_t) b >= dcap) ? -1 : 0;
+}
+
 /* ------------------------------------------------------------ reclaim */
 
 void

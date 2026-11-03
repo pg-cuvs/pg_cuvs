@@ -2948,6 +2948,7 @@ static void note_self_replace_failure(uint32_t index_oid, uint64_t self_unloaded
 /* NOTICE text for REINDEX self-replace (decision UC-1 2a, exact wording).
  * Delivered through I3-A's notice_out; until that lands it is logged. */
 static __thread char g_build_notice[512];
+static __thread char g_build_notice_detail[512];
 
 /*
  * BUILD_CAGRA admission with REINDEX self-replace (UC-1 2a, KB-26): when the
@@ -2963,6 +2964,7 @@ admit_build_cagra(size_t needed, int device_id, uint32_t db_oid,
 {
     *unloaded = 0;
     g_build_notice[0] = '\0';
+    g_build_notice_detail[0] = '\0';
     g_cur_requester_idx = index_oid;
     if (ensure_vram(needed, device_id, CUVS_RQ_BUILD_CAGRA, NULL) == 0)
         return 0;
@@ -3000,14 +3002,24 @@ admit_build_cagra(size_t needed, int device_id, uint32_t db_oid,
         return -1;
     }
     *unloaded = freed;
-    snprintf(g_build_notice, sizeof(g_build_notice),
-             "pg_cuvs: previous resident copy of index %u unloaded from GPU to make room "
-             "for the rebuild|GPU memory was insufficient for both copies (need %zu, free "
-             "%zu). Queries on this index use the CPU path or reload the old copy until the "
-             "new index is resident",
-             index_oid, needed, budget > 0 && budget > used ? budget - used : fr);
-    LOG_INFO("[self_replace] db=%u idx=%u unloaded=%zu notice=\"%s\"\n",
-             db_oid, index_oid, freed, g_build_notice);
+    {
+        char label[32];
+        /* Room for the build before the old copy was counted: the smaller of
+         * the logical-budget room and the physical free bytes. */
+        uint64_t room = fr;
+        if (budget > 0)
+        {
+            uint64_t lroom = budget > used ? budget - used : 0;
+            if (lroom < room)
+                room = lroom;
+        }
+        snprintf(label, sizeof(label), "index %u", index_oid);
+        (void) cuvs_self_replace_notice(g_build_notice, sizeof(g_build_notice),
+                                        g_build_notice_detail, sizeof(g_build_notice_detail),
+                                        label, needed, room);
+    }
+    LOG_INFO("[self_replace] db=%u idx=%u unloaded=%zu notice=\"%s\" detail=\"%s\"\n",
+             db_oid, index_oid, freed, g_build_notice, g_build_notice_detail);
     if (ensure_vram(needed, device_id, CUVS_RQ_BUILD_CAGRA, NULL) == 0)
         return 0;
     /* The estimate said the old copy was enough but the device disagrees:
@@ -3031,12 +3043,15 @@ admit_build_cagra(size_t needed, int device_id, uint32_t db_oid,
 static void
 note_self_replace_failure(uint32_t index_oid, uint64_t self_unloaded)
 {
+    char label[32];
     if (self_unloaded == 0)
         return;
-    snprintf(g_build_notice, sizeof(g_build_notice),
-             "pg_cuvs: rebuild of index %u failed after its previous resident copy was "
-             "unloaded from GPU|The next query on this index reloads the old copy", index_oid);
-    LOG_INFO("[self_replace] idx=%u build_failed=1 notice=\"%s\"\n", index_oid, g_build_notice);
+    snprintf(label, sizeof(label), "index %u", index_oid);
+    (void) cuvs_self_replace_fail_notice(g_build_notice, sizeof(g_build_notice),
+                                         g_build_notice_detail, sizeof(g_build_notice_detail),
+                                         label);
+    LOG_INFO("[self_replace] idx=%u build_failed=1 notice=\"%s\" detail=\"%s\"\n",
+             index_oid, g_build_notice, g_build_notice_detail);
 }
 
 /* Record a BUILD_* verdict for the reclaim free target F (fences F-1, F-3)

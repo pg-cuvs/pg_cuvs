@@ -192,6 +192,22 @@ test_self_replace(void)
     CHECK(cuvs_self_replace_decide(GiB, 0, 0, 0, 1) == CUVS_SELF_UNAVAILABLE, "no old");
     CHECK(cuvs_self_replace_decide(2 * GiB, 1, 0, GiB, 1) == CUVS_SELF_UNAVAILABLE,
           "old copy too small");
+
+    /* NOTICE/DETAIL wording (decision UC-1 2a), exact strings and numbers. */
+    char m[256], d[512];
+    CHECK(cuvs_self_replace_notice(m, sizeof m, d, sizeof d, "\"public\".\"i1\"",
+                                   10240000, 5734400) == 0, "notice fits");
+    CHECK(strcmp(m, "pg_cuvs: previous resident copy of \"public\".\"i1\" unloaded from GPU "
+                    "to make room for the rebuild") == 0, "notice text: %s", m);
+    CHECK(strcmp(d, "GPU memory was insufficient for both copies (need 10240000 bytes, "
+                    "free 5734400 bytes). Queries on this index use the CPU path or reload "
+                    "the old copy until the new index is resident") == 0, "detail: %s", d);
+    CHECK(cuvs_self_replace_fail_notice(m, sizeof m, d, sizeof d, "index 42") == 0 &&
+          strcmp(m, "pg_cuvs: rebuild of index 42 failed after its previous resident copy "
+                    "was unloaded from GPU") == 0 &&
+          strcmp(d, "The next query on this index reloads the old copy") == 0,
+          "failure notice: %s | %s", m, d);
+    CHECK(cuvs_self_replace_notice(m, 10, d, sizeof d, "x", 1, 1) == -1, "truncation reported");
 }
 
 /* ---------------------------------------------------------------- CK-24 */
@@ -258,6 +274,29 @@ test_free_target_fences(void)
     cuvs_admit_log_forget(&log, 1, 5);
     cuvs_reclaim_free_target(&log, 0, NOW, 1800, B, 50, 0, &t);
     CHECK(t.f_bytes == 0 && log.n == 0, "DROP INDEX forgets its reject at once");
+
+    /* F is the MAXIMUM of the window's eligible requests (not sum, not
+     * min, not last), whatever their order: 8, 12, 5 GiB -> 12 GiB. */
+    memset(&log, 0, sizeof(log));
+    CuvsAdmitRecord r8 = rec(21, 8 * GiB, CUVS_ADMISSION_AR5, NOW - 30);
+    CuvsAdmitRecord r12 = rec(22, 12 * GiB, CUVS_ADMISSION_AR3, NOW - 20);
+    CuvsAdmitRecord r5 = rec(23, 5 * GiB, CUVS_ADMISSION_AR1, NOW - 10);
+    cuvs_admit_log_add(&log, &r8);
+    cuvs_admit_log_add(&log, &r12);
+    cuvs_admit_log_add(&log, &r5);
+    cuvs_reclaim_free_target(&log, 0, NOW, 1800, B, 50, 0, &t);
+    CHECK(t.f_bytes == 12 * GiB && t.src_idx == 22,
+          "F = max of 8/12/5 GiB = 12 GiB (got %llu, src %u)",
+          (unsigned long long) (t.f_bytes / GiB), t.src_idx);
+    /* Window edge: age == window_s counts, window_s + 1 does not. */
+    memset(&log, 0, sizeof(log));
+    CuvsAdmitRecord at_edge = rec(24, 7 * GiB, CUVS_ADMISSION_AR5, NOW - 1800);
+    cuvs_admit_log_add(&log, &at_edge);
+    cuvs_reclaim_free_target(&log, 0, NOW, 1800, B, 50, 0, &t);
+    CHECK(t.f_bytes == 7 * GiB, "age == window_s is inside the window");
+    cuvs_reclaim_free_target(&log, 0, NOW + 1, 1800, B, 50, 0, &t);
+    CHECK(t.f_bytes == 0, "age == window_s + 1 is outside the window");
+    memset(&log, 0, sizeof(log));
 
     /* Fixed F keeps the cap. */
     cuvs_reclaim_free_target(&log, 0, NOW, 1800, B, 50, 70 * GiB, &t);
