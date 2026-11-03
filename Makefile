@@ -312,6 +312,12 @@ test-hnsw-explicit-route: test/unit/test_hnsw_explicit_route.c src/cuvs_hnsw_bui
 	$(CC) -std=gnu11 -Wall -Wextra -Werror -I src -o $@ test/unit/test_hnsw_explicit_route.c -lpthread
 	./$@
 
+# I3-C: CK-17 (12)-(14) auto overflow, pre-spool decision, CAGRA reltuples AR0.
+test-hnsw-auto-overflow: test/unit/test_hnsw_auto_overflow.c src/cuvs_route_preflight.h \
+                         src/cuvs_hnsw_build_common.h src/cuvs_hnsw_policy.h src/cuvs_admission_contract.h
+	$(CC) -std=gnu11 -Wall -Wextra -Werror -I src -o $@ test/unit/test_hnsw_auto_overflow.c -lpthread -lm
+	./$@
+
 test-hnsw-admission: test/unit/test_hnsw_admission.c src/cuvs_hnsw_build_common.h
 	$(CC) -std=gnu11 -Wall -Wextra -I src -o $@ test/unit/test_hnsw_admission.c -lpthread
 	./$@
@@ -436,10 +442,10 @@ test-hnsw-converter: test/unit/test_hnsw_converter.c src/hnsw_export.c \
 
 EXTRA_CLEAN += test-hnsw-build test-hnsw-build-ipc test-hnsw-converter test-hnsw-admission test-hnsw-explicit-route test-hnsw-policy \
                test-admission-contract test-admission-contract-cxx test-admission-contract-util.o \
-               test-admission-wire test-admission-message test-admission-ipc test-build-oom-thread
+               test-admission-wire test-admission-message test-admission-ipc test-build-oom-thread test-hnsw-auto-overflow
 .PHONY: test-hnsw-build test-hnsw-build-ipc test-hnsw-converter test-hnsw-admission test-hnsw-explicit-route test-hnsw-policy \
         test-admission-contract test-admission-contract-mutations test-admission-wire \
-        test-admission-message test-admission-ipc test-build-oom-thread test-gpu-wrapper-i3
+        test-admission-message test-admission-ipc test-build-oom-thread test-gpu-wrapper-i3 test-hnsw-auto-overflow
 
 # ---- Documentation contract check ---------------------------------------
 # CPU-only drift detector for the current version/defaults and release-facing
