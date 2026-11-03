@@ -42,6 +42,17 @@ cuvs_parse_rmm_pool_percent(const char *value, uint32_t *percent_out)
     return 0;
 }
 
+int
+cuvs_parse_scratch_permille(const char *value, uint32_t *permille_out)
+{
+    uint32_t permille;
+    if (cuvs_parse_rmm_pool_mb(value, &permille) != 0 ||
+        permille > CUVS_ADMISSION_RHO_PERMILLE_MAX)
+        return -1;
+    *permille_out = permille;
+    return 0;
+}
+
 size_t
 cuvs_rmm_pool_max_bytes(size_t total_bytes, uint32_t percent)
 {
@@ -1447,8 +1458,9 @@ cuvs_admission_reason_fits(CuvsAdmissionReason r, CuvsAdmissionObject obj)
         case CUVS_ADMISSION_OBJ_LOAD:
             return r >= CUVS_ADMISSION_AR0 && r <= CUVS_ADMISSION_AR5;
         case CUVS_ADMISSION_OBJ_SHARD:
-            return r == CUVS_ADMISSION_AR0 ||
-                   (r >= CUVS_ADMISSION_AR3 && r <= CUVS_ADMISSION_AR5);
+            /* C5 lists AR0 and AR3..AR5; AR1/AR2 still arise when another
+             * build holds a reservation, and get the same text. */
+            return r >= CUVS_ADMISSION_AR0 && r <= CUVS_ADMISSION_AR5;
     }
     return 0;
 }

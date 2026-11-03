@@ -408,13 +408,16 @@ typedef struct CuvsRmmPoolStats {
     uint64_t used_bytes;
 } CuvsRmmPoolStats;
 
-#define CUVS_RMM_POOL_STATUS_VERSION 1u
+/* 2 (I3): + scratch_permille. Fields are append-only, I3-A first, then
+ * I3-B, I3-C, I4, each PR appending its own after the previous PR's. */
+#define CUVS_RMM_POOL_STATUS_VERSION 2u
 typedef struct CuvsRmmPoolStatus {
     uint32_t version;
     uint32_t initial_mb;
     uint32_t maximum_percent;  /* applied percentage; 0 when disabled */
     uint32_t n_devices;
     CuvsRmmPoolStats devices[CUVS_MAX_GPUS];
+    uint32_t scratch_permille; /* I3-A: --rmm-scratch-permille (C3 rho) */
 } CuvsRmmPoolStatus;
 
 int cuvs_ipc_rmm_pool_status(const char *socket_path, CuvsRmmPoolStatus *out);
