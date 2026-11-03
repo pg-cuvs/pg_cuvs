@@ -14,6 +14,8 @@
 #include <stddef.h>
 #include <stdbool.h>
 
+#include "cuvs_admission_contract.h"
+
 /* Strict daemon CLI parser: MiB, 0=disabled, bounded for size_t and the
  * read-only integer GUC reporting the applied setting. Returns 0 on success. */
 #ifdef __cplusplus
@@ -21,6 +23,9 @@ extern "C" {
 #endif
 int cuvs_parse_rmm_pool_mb(const char *value, uint32_t *mb_out);
 int cuvs_parse_rmm_pool_percent(const char *value, uint32_t *percent_out);
+/* --rmm-scratch-permille: decimal 0..CUVS_ADMISSION_RHO_PERMILLE_MAX (C3 rho).
+ * Returns 0, or -1 leaving *permille_out untouched. */
+int cuvs_parse_scratch_permille(const char *value, uint32_t *permille_out);
 
 /* Pool quota is aligned to RMM's 256-byte allocation boundary. A zero quota
  * in the headroom helper means the legacy, unpooled path. */
@@ -440,8 +445,6 @@ int  cuvs_tombstone_read_header(FILE *f, CuvsTombstoneHeader *out);
  * w i. Scalars (MiB, counts) saturate at CUVS_ADMISSION_SCALAR_MAX on encode
  * and are rejected above it on decode; shard i saturates at 999.
  * ---------------------------------------------------------------- */
-#include "cuvs_admission_contract.h"
-
 enum {
     CUVS_ADM_F_N = 1u << 0,  CUVS_ADM_F_F = 1u << 1,  CUVS_ADM_F_Q = 1u << 2,
     CUVS_ADM_F_P = 1u << 3,  CUVS_ADM_F_H = 1u << 4,  CUVS_ADM_F_E = 1u << 5,
@@ -499,7 +502,7 @@ int cuvs_admission_decode(const char *buf, size_t len, CuvsAdmissionFields *out)
 typedef enum CuvsAdmissionObject {
     CUVS_ADMISSION_OBJ_CAGRA,   /* cagra AM build: AR0..AR7, OOM, ATT */
     CUVS_ADMISSION_OBJ_IVFPQ,   /* IVF-PQ AM build: AR0..AR5 */
-    CUVS_ADMISSION_OBJ_SHARD,   /* sharded CAGRA build: AR0, AR3..AR5 */
+    CUVS_ADMISSION_OBJ_SHARD,   /* sharded CAGRA build: AR0..AR5 */
     CUVS_ADMISSION_OBJ_LOAD     /* search-path reload: AR0..AR5 */
 } CuvsAdmissionObject;
 

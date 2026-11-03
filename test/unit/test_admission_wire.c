@@ -267,9 +267,27 @@ test_decode_payload_boundary(void)
     free(p);
 }
 
+static void
+test_parse_scratch_permille(void)
+{
+    uint32_t v = 1234;
+    CHECK("0", cuvs_parse_scratch_permille("0", &v) == 0 && v == 0);
+    CHECK("7726", cuvs_parse_scratch_permille("7726", &v) == 0 && v == 7726);
+    CHECK("max", cuvs_parse_scratch_permille("100000", &v) == 0 && v == 100000);
+    v = 5;
+    CHECK("max+1", cuvs_parse_scratch_permille("100001", &v) != 0 && v == 5);
+    CHECK("negative", cuvs_parse_scratch_permille("-1", &v) != 0);
+    CHECK("plus", cuvs_parse_scratch_permille("+1", &v) != 0);
+    CHECK("junk", cuvs_parse_scratch_permille("12x", &v) != 0);
+    CHECK("empty", cuvs_parse_scratch_permille("", &v) != 0);
+    CHECK("NULL", cuvs_parse_scratch_permille(NULL, &v) != 0);
+    CHECK("huge", cuvs_parse_scratch_permille("99999999999999999999", &v) != 0);
+}
+
 int
 main(void)
 {
+    test_parse_scratch_permille();
     test_mib_saturates();
     test_reason_names_and_sqlstate();
     test_encode_order_and_subset();

@@ -276,6 +276,16 @@ test_shard_and_ivfpq(void)
     HAS("shard msg", o.msg, "this shard of the CAGRA build");
     CHECK("shard detail prefix", strncmp(o.detail, "shard 2: need 3049 MiB", 22) == 0);
     HAS("shard hint", o.hint, "cuvs.shard_count");
+    {
+        /* A shard can meet another build's pending reservation (AR1/AR2). */
+        CuvsAdmissionFields g = base(CUVS_ADMISSION_AR1);
+        Out so;
+        g.present = CUVS_ADM_F_N | CUVS_ADM_F_Q | CUVS_ADM_F_P | CUVS_ADM_F_F | CUVS_ADM_F_I;
+        g.i = 4;
+        so = format(&g, CUVS_ADMISSION_OBJ_SHARD, 0, NULL);
+        CHECK("shard AR1 53200", so.sqlstate && strcmp(so.sqlstate, "53200") == 0);
+        CHECK("shard AR1 prefix", strncmp(so.detail, "shard 4: needs 0 MiB", 20) == 0);
+    }
     o = format(&f, CUVS_ADMISSION_OBJ_IVFPQ, 0, NULL);
     HAS("ivfpq msg", o.msg, "this IVF-PQ build; CREATE INDEX aborted");
     LACKS("ivfpq no shard prefix", o.detail, "shard 2:");

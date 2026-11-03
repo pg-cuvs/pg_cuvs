@@ -1,27 +1,14 @@
--- build_oom_evict_to_fit.sql — a build VRAM OOM that needs MORE THAN ONE eviction
--- must keep evicting the LRU and retrying until it fits, not abort after a single
--- retry. The old behaviour ("evict one LRU, retry once") hard-failed with
--- BUILD failed (status 5) under VRAM pressure when one eviction did not free
--- enough — observed on the 40GB single-GPU VM in full-suite runs. evict-to-fit
--- (handle_build + handle_build_multi) loops the evict+retry until success or
--- nothing is left to evict (then a genuine OOM → clear error).
---
--- pg_cuvs_inject_build_oom(2) arms TWO consecutive build OOMs, so the build OOMs
--- twice: evict-to-fit evicts the LRU twice and the third attempt succeeds. The
--- old evict-once path would still be OOM-armed on its single retry → hard fail.
--- Each scenario creates its OWN >=2 resident victims so it holds standalone.
+-- build_oom_evict_to_fit.sql — the name is historical. ADR-070 made a build
+-- OOM evict the LRU repeatedly until the build fit; ADR-086 (I3) removes that:
+-- an out-of-memory build after admission fails with SQLSTATE 53200 and evicts
+-- NOTHING, even when evicting would have made room. Two OOMs are armed with
+-- two resident victims present, which is exactly the shape evict-to-fit used
+-- to "fix"; the eviction counter must not move on either build path.
 --
 -- REQUIRES: a CUVS_TEST_HOOKS pg_cuvs_server_test daemon on the test socket +
 -- index dir below (`make installcheck-fault`, not `make installcheck` — #124:
 -- CUVS_OP_INJECT_BUILD_OOM only exists in a CUVS_TEST_HOOKS build; the
 -- production daemon rejects it). Tier-1 CI (CPU shim).
---
--- ENVIRONMENT-DEPENDENT (#89 item 2): on the CPU shim (Tier-1 CI) the OOM
--- injection is deterministic, so this test is a stable pass. On real GPU —
--- especially a single-GPU dev VM — the evict-retry outcome is residency-
--- state-dependent: it depends on what is resident and evictable at run
--- time, so a full-suite GPU run may show this test flaking between runs.
--- A flake here on GPU is environment-dependent, NOT a code regression.
 \set ON_ERROR_STOP on
 SET client_min_messages = warning;
 CREATE EXTENSION IF NOT EXISTS vector;
@@ -31,8 +18,7 @@ RESET client_min_messages;
 -- not the production socket/index dir.
 SET cuvs.socket_path = '/tmp/.s.pg_cuvs_test';
 SET cuvs.index_dir = '/tmp/cuvs_indexes_test';
--- ============================================================ single-process path
--- handle_build (max_parallel_maintenance_workers = 0). Two fresh resident victims.
+-- ============================================================ single-process
 SET max_parallel_maintenance_workers = 0;
 CREATE TABLE sv1 (id int, embedding vector(8));
 INSERT INTO sv1 SELECT g, format('[%s,0,0,0,0,0,0,0]', (g*0.1)::numeric(8,3))::vector FROM generate_series(1,1000) g;
@@ -40,8 +26,8 @@ CREATE INDEX sv1_idx ON sv1 USING cagra (embedding vector_l2_ops);
 CREATE TABLE sv2 (id int, embedding vector(8));
 INSERT INTO sv2 SELECT g, format('[0,%s,0,0,0,0,0,0]', (g*0.1)::numeric(8,3))::vector FROM generate_series(1,1000) g;
 CREATE INDEX sv2_idx ON sv2 USING cagra (embedding vector_l2_ops);
-SELECT evictions AS e0 FROM pg_stat_gpu_cache WHERE gpu_device_id = 0 \gset
-SELECT pg_cuvs_inject_build_oom(2);   -- two OOMs → needs two evictions
+SELECT evictions AS e_st FROM pg_stat_gpu_cache WHERE gpu_device_id = 0 \gset
+SELECT pg_cuvs_inject_build_oom(2);   -- evict-to-fit would have evicted twice
  pg_cuvs_inject_build_oom 
 --------------------------
  
@@ -49,31 +35,35 @@ SELECT pg_cuvs_inject_build_oom(2);   -- two OOMs → needs two evictions
 
 CREATE TABLE st (id int, embedding vector(8));
 INSERT INTO st SELECT g, format('[0,0,%s,0,0,0,0,0]', (g*0.1)::numeric(8,3))::vector FROM generate_series(1,1000) g;
-CREATE INDEX st_idx ON st USING cagra (embedding vector_l2_ops);   -- must SUCCEED
+\set ON_ERROR_STOP off
+\set VERBOSITY terse
+CREATE INDEX st_idx ON st USING cagra (embedding vector_l2_ops);   -- must FAIL
+ERROR:  pg_cuvs: GPU memory exhausted during CAGRA build; CREATE INDEX aborted. No resident index was evicted
+\echo :LAST_ERROR_SQLSTATE
+53200
+\set VERBOSITY default
+\set ON_ERROR_STOP on
 SELECT pg_cuvs_inject_build_oom(0);
  pg_cuvs_inject_build_oom 
 --------------------------
  
 (1 row)
 
-SET cuvs.search_mode = 'brute_force';
-SELECT id AS single_proc_top1 FROM st
-  ORDER BY embedding <-> (SELECT embedding FROM st WHERE id = 7) LIMIT 1;
- single_proc_top1 
-------------------
-                7
+SELECT r->>'reason' AS reason, r->>'sqlstate' AS sqlstate
+FROM pg_cuvs_last_rejection() r;
+ reason | sqlstate 
+--------+----------
+ OOM    | 53200
 (1 row)
 
-RESET cuvs.search_mode;
-SELECT evictions >= :e0 + 2 AS single_proc_evicted_to_fit
+SELECT evictions = :e_st AS single_process_nothing_evicted
 FROM pg_stat_gpu_cache WHERE gpu_device_id = 0;
- single_proc_evicted_to_fit 
-----------------------------
+ single_process_nothing_evicted 
+--------------------------------
  t
 (1 row)
 
--- ============================================================ parallel-worker path
--- handle_build_multi (parallel maintenance workers, ADR-058/059). Fresh victims.
+-- ============================================================ parallel
 SET max_parallel_maintenance_workers = 2;
 SET min_parallel_table_scan_size = 0;
 SET parallel_setup_cost = 0;
@@ -84,8 +74,8 @@ CREATE INDEX pv1_idx ON pv1 USING cagra (embedding vector_l2_ops);
 CREATE TABLE pv2 (id int, embedding vector(8));
 INSERT INTO pv2 SELECT g, format('[0,0,0,0,%s,0,0,0]', (g*0.1)::numeric(8,3))::vector FROM generate_series(1,1000) g;
 CREATE INDEX pv2_idx ON pv2 USING cagra (embedding vector_l2_ops);
-SELECT evictions AS e1 FROM pg_stat_gpu_cache WHERE gpu_device_id = 0 \gset
-SELECT pg_cuvs_inject_build_oom(2);
+SELECT evictions AS e_pt FROM pg_stat_gpu_cache WHERE gpu_device_id = 0 \gset
+SELECT pg_cuvs_inject_build_oom(2);   -- evict-to-fit would have evicted twice
  pg_cuvs_inject_build_oom 
 --------------------------
  
@@ -93,26 +83,31 @@ SELECT pg_cuvs_inject_build_oom(2);
 
 CREATE TABLE pt (id int, embedding vector(8));
 INSERT INTO pt SELECT g, format('[0,0,0,0,0,%s,0,0]', (g*0.1)::numeric(8,3))::vector FROM generate_series(1,1000) g;
-CREATE INDEX pt_idx ON pt USING cagra (embedding vector_l2_ops);   -- must SUCCEED
+\set ON_ERROR_STOP off
+\set VERBOSITY terse
+CREATE INDEX pt_idx ON pt USING cagra (embedding vector_l2_ops);   -- must FAIL
+ERROR:  pg_cuvs: GPU memory exhausted during CAGRA build; CREATE INDEX aborted. No resident index was evicted
+\echo :LAST_ERROR_SQLSTATE
+53200
+\set VERBOSITY default
+\set ON_ERROR_STOP on
 SELECT pg_cuvs_inject_build_oom(0);
  pg_cuvs_inject_build_oom 
 --------------------------
  
 (1 row)
 
-SET cuvs.search_mode = 'brute_force';
-SELECT id AS parallel_top1 FROM pt
-  ORDER BY embedding <-> (SELECT embedding FROM pt WHERE id = 7) LIMIT 1;
- parallel_top1 
----------------
-             7
+SELECT r->>'reason' AS reason, r->>'sqlstate' AS sqlstate
+FROM pg_cuvs_last_rejection() r;
+ reason | sqlstate 
+--------+----------
+ OOM    | 53200
 (1 row)
 
-RESET cuvs.search_mode;
-SELECT evictions >= :e1 + 2 AS parallel_evicted_to_fit
+SELECT evictions = :e_pt AS parallel_nothing_evicted
 FROM pg_stat_gpu_cache WHERE gpu_device_id = 0;
- parallel_evicted_to_fit 
--------------------------
+ parallel_nothing_evicted 
+--------------------------
  t
 (1 row)
 

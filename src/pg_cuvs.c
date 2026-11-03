@@ -241,6 +241,167 @@ cuvs_report_proto_mismatch(int rc)
                      "make install-server, then restart the daemon.")));
 }
 
+/* ----------------------------------------------------------------
+ * I3 admission rejections (v6 r18 C5, UC-2): the daemon's err_out becomes
+ * the C5 errmsg/DETAIL/HINT with the per-reason SQLSTATE, and the last one
+ * in this backend is kept for pg_cuvs_last_rejection().
+ * ---------------------------------------------------------------- */
+typedef struct CuvsLastRejection {
+    bool                valid;
+    CuvsAdmissionFields fields;
+    const char         *requester;      /* BUILD, LOAD or SHARD */
+    Oid                 index_oid;
+    char                sqlstate[6];
+    TimestampTz         at;
+} CuvsLastRejection;
+
+static CuvsLastRejection cuvs_last_rejection;
+
+/* Same-DB index -> quote_qualified_identifier(schema, name). */
+static int
+cuvs_admission_index_name(void *ctx, uint32_t index_oid, char *buf, size_t cap)
+{
+    char *rel = get_rel_name((Oid) index_oid);
+    char *nsp;
+
+    (void) ctx;
+    if (rel == NULL)
+        return -1;
+    nsp = get_namespace_name(get_rel_namespace((Oid) index_oid));
+    if (nsp == NULL)
+        return -1;
+    snprintf(buf, cap, "%s", quote_qualified_identifier(nsp, rel));
+    return 0;
+}
+
+/* C7 rule: the caller may unload an index it owns, or any as superuser. */
+static int
+cuvs_admission_can_unload(void *ctx, uint32_t db_oid, uint32_t index_oid)
+{
+    (void) ctx;
+    if (superuser())
+        return 1;
+    if (db_oid != (uint32_t) MyDatabaseId || get_rel_name((Oid) index_oid) == NULL)
+        return 0;
+    return object_ownercheck(RelationRelationId, (Oid) index_oid, GetUserId()) ? 1 : 0;
+}
+
+/*
+ * If the last daemon reply carried an admission payload, raise it as the C5
+ * error and remember it; otherwise return so the caller keeps its legacy
+ * message. obj is CAGRA, IVFPQ or LOAD; a payload with a shard number turns
+ * CAGRA into SHARD. load_rel names the index for LOAD (may be NULL).
+ */
+static void
+cuvs_report_admission(CuvsAdmissionObject obj, Oid index_oid, Relation load_rel)
+{
+    CuvsAdmissionFields  f;
+    CuvsAdmissionCatalog cat;
+    const char *payload = cuvs_ipc_last_err_out();
+    const char *state;
+    char       *load_name = NULL;
+    char        msg[CUVS_ADMISSION_MSG_BYTES];
+    char        detail[CUVS_ADMISSION_MSG_BYTES];
+    char        hint[CUVS_ADMISSION_MSG_BYTES];
+
+    if (payload[0] == '\0' ||
+        cuvs_admission_decode(payload, strlen(payload) + 1, &f) != 0)
+        return;
+    if (obj == CUVS_ADMISSION_OBJ_CAGRA && (f.present & CUVS_ADM_F_I))
+        obj = CUVS_ADMISSION_OBJ_SHARD;
+    if (load_rel != NULL)
+        load_name = quote_qualified_identifier(
+            get_namespace_name(RelationGetNamespace(load_rel)),
+            RelationGetRelationName(load_rel));
+
+    cat.my_db_oid = (uint32_t) MyDatabaseId;
+    cat.superuser = superuser() ? 1 : 0;
+    cat.index_name = cuvs_admission_index_name;
+    cat.can_unload = cuvs_admission_can_unload;
+    cat.ctx = NULL;
+    state = cuvs_admission_format(&f, obj, load_name, &cat, msg, sizeof(msg),
+                                  detail, sizeof(detail), hint, sizeof(hint));
+    if (state == NULL)
+        return;
+
+    cuvs_last_rejection.valid = true;
+    cuvs_last_rejection.fields = f;
+    cuvs_last_rejection.requester = obj == CUVS_ADMISSION_OBJ_LOAD ? "LOAD"
+                                  : obj == CUVS_ADMISSION_OBJ_SHARD ? "SHARD" : "BUILD";
+    cuvs_last_rejection.index_oid = index_oid;
+    strlcpy(cuvs_last_rejection.sqlstate, state, sizeof(cuvs_last_rejection.sqlstate));
+    cuvs_last_rejection.at = GetCurrentTimestamp();
+
+    ereport(ERROR,
+            (errcode(MAKE_SQLSTATE(state[0], state[1], state[2], state[3], state[4])),
+             errmsg("%s", msg),
+             errdetail("%s", detail),
+             errhint("%s", hint)));
+}
+
+PG_FUNCTION_INFO_V1(pg_cuvs_last_rejection);
+
+/* The last admission rejection of this backend as jsonb, or NULL. Backend
+ * memory only (one entry, gone at session end); other-DB candidates are
+ * reported by OID only, as in DETAIL. */
+Datum
+pg_cuvs_last_rejection(PG_FUNCTION_ARGS)
+{
+    const CuvsAdmissionFields *f = &cuvs_last_rejection.fields;
+    StringInfoData j;
+
+    if (!cuvs_last_rejection.valid)
+        PG_RETURN_NULL();
+    initStringInfo(&j);
+    appendStringInfo(&j, "{\"reason\":\"%s\",\"sqlstate\":\"%s\",\"requester\":\"%s\","
+                         "\"index_oid\":%u,\"at\":\"%s\",\"shard\":",
+                     cuvs_admission_reason_name(f->reason), cuvs_last_rejection.sqlstate,
+                     cuvs_last_rejection.requester, cuvs_last_rejection.index_oid,
+                     timestamptz_to_str(cuvs_last_rejection.at));
+    if (f->present & CUVS_ADM_F_I)
+        appendStringInfo(&j, "%u", f->i);
+    else
+        appendStringInfoString(&j, "null");
+    appendStringInfoString(&j, ",\"fields\":{");
+    {
+        bool first = true;
+#define CUVS_J1(bit, key, v) \
+        if (f->present & (bit)) { \
+            appendStringInfo(&j, "%s\"" key "\":%u", first ? "" : ",", (v)); first = false; }
+#define CUVS_J2(bit, key, a, b) \
+        if (f->present & (bit)) { \
+            appendStringInfo(&j, "%s\"" key "_mib\":%u,\"" key "_count\":%u", \
+                             first ? "" : ",", (a), (b)); first = false; }
+        CUVS_J1(CUVS_ADM_F_N, "need_mib", f->n);
+        CUVS_J1(CUVS_ADM_F_F, "free_mib", f->f);
+        CUVS_J1(CUVS_ADM_F_Q, "quota_mib", f->q);
+        CUVS_J1(CUVS_ADM_F_P, "pending_mib", f->p);
+        CUVS_J2(CUVS_ADM_F_H, "resident", f->h_mib, f->h_cnt);
+        CUVS_J2(CUVS_ADM_F_E, "evictable", f->e_mib, f->e_cnt);
+        CUVS_J2(CUVS_ADM_F_K, "pinned", f->k_mib, f->k_cnt);
+        CUVS_J1(CUVS_ADM_F_L, "lw_ub_mib", f->l);
+        CUVS_J1(CUVS_ADM_F_Y, "lw_pending_mib", f->y);
+        CUVS_J1(CUVS_ADM_F_U, "phys_free_mib", f->u);
+        CUVS_J1(CUVS_ADM_F_G, "host_guard_mib", f->g);
+        CUVS_J1(CUVS_ADM_F_S, "self_resident_mib", f->s);
+        CUVS_J1(CUVS_ADM_F_R, "reclaim_can_help", f->r);
+        if (f->present & CUVS_ADM_F_W)
+        {
+            appendStringInfo(&j, "%s\"wait\":%d", first ? "" : ",", f->w);
+            first = false;
+        }
+#undef CUVS_J1
+#undef CUVS_J2
+    }
+    appendStringInfoString(&j, "},\"candidates\":[");
+    for (uint32_t c = 0; c < f->n_cand; c++)
+        appendStringInfo(&j, "%s{\"db_oid\":%u,\"index_oid\":%u,\"mib\":%u,\"idle_s\":%d}",
+                         c ? "," : "", f->cand[c].db_oid, f->cand[c].index_oid,
+                         f->cand[c].mib, f->cand[c].idle_s);
+    appendStringInfoString(&j, "]}");
+    PG_RETURN_DATUM(DirectFunctionCall1(jsonb_in, CStringGetDatum(j.data)));
+}
+
 static object_access_hook_type prev_object_access_hook = NULL;
 static set_rel_pathlist_hook_type prev_set_rel_pathlist_hook = NULL; /* ADR-063 */
 
@@ -809,7 +970,9 @@ cuvs_rmm_pool_status_show(void)
                          (unsigned long long)dev->reserved_bytes,
                          (unsigned long long)dev->used_bytes);
     }
-    appendStringInfoString(&json, "]}");
+    /* v2 (I3): keys appended after "devices", I3-A first (append-only). */
+    appendStringInfo(&json, "],\"version\":%u,\"scratch_permille\":%u}",
+                     status.version, status.scratch_permille);
     return json.data;
 }
 
@@ -2854,6 +3017,8 @@ cuvs_build_parallel(Relation heapRel, Relation indexRel, IndexInfo *indexInfo,
             if (rc != CUVS_STATUS_OK)
             {
                 cuvs_report_proto_mismatch(rc);
+                if (rc == CUVS_STATUS_OOM_FALLBACK)
+                    cuvs_report_admission(CUVS_ADMISSION_OBJ_CAGRA, build_index_oid, NULL);
                 ereport(ERROR,
                         (errcode(ERRCODE_INTERNAL_ERROR),
                          errmsg("pg_cuvs: BUILD failed (status %d); CREATE INDEX "
@@ -3061,6 +3226,8 @@ cuvs_build_cagra_from_heap(Relation heapRel, Relation indexRel, IndexInfo *index
                         break;
                 }
                 cuvs_report_proto_mismatch(rc);
+                if (rc == CUVS_STATUS_OOM_FALLBACK)
+                    cuvs_report_admission(CUVS_ADMISSION_OBJ_CAGRA, build_index_oid, NULL);
                 ereport(ERROR,
                         (errcode(ERRCODE_INTERNAL_ERROR),
                          errmsg("pg_cuvs: BUILD failed (status %d); CREATE INDEX "
@@ -4110,6 +4277,10 @@ cuvs_gettuple(IndexScanDesc scan, ScanDirection dir)
                                      "automatically once the breaker opens.")));
                     break;
                 case CUVS_STATUS_OOM_FALLBACK:
+                    /* I3 (C5): a reload admission rejection carries err_out. */
+                    cuvs_report_admission(CUVS_ADMISSION_OBJ_LOAD,
+                                          RelationGetRelid(scan->indexRelation),
+                                          scan->indexRelation);
                     ereport(ERROR,
                             (errcode(ERRCODE_OUT_OF_MEMORY),
                              errmsg("pg_cuvs: GPU VRAM exhausted; "
@@ -4351,6 +4522,10 @@ flat_gettuple(IndexScanDesc scan, ScanDirection dir)
                                      "automatically once the breaker opens.")));
                     break;
                 case CUVS_STATUS_OOM_FALLBACK:
+                    /* I3 (C5): a reload admission rejection carries err_out. */
+                    cuvs_report_admission(CUVS_ADMISSION_OBJ_LOAD,
+                                          RelationGetRelid(scan->indexRelation),
+                                          scan->indexRelation);
                     ereport(ERROR,
                             (errcode(ERRCODE_OUT_OF_MEMORY),
                              errmsg("pg_cuvs: GPU VRAM exhausted; "
@@ -4859,6 +5034,9 @@ ivfpq_ambuild(Relation heapRel, Relation indexRel, IndexInfo *indexInfo)
                         break;
                 }
                 cuvs_report_proto_mismatch(rc);
+                if (rc == CUVS_STATUS_OOM_FALLBACK)
+                    cuvs_report_admission(CUVS_ADMISSION_OBJ_IVFPQ,
+                                          RelationGetRelid(indexRel), NULL);
                 ereport(ERROR,
                         (errcode(ERRCODE_INTERNAL_ERROR),
                          errmsg("pg_cuvs: IVF-PQ BUILD failed (status %d); "
