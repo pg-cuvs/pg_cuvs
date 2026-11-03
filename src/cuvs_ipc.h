@@ -533,7 +533,7 @@ typedef struct CuvsRmmPoolStatus {
     /* I3-E (append-only, after I4): C8 in-flight builds for
      * pg_cuvs_build_status and the admission rejections that had no GPU. */
     uint32_t n_builds;                 /* rows in builds[] */
-    uint32_t builds_reserved;
+    uint32_t pad_i3e;                  /* always 0 */
     uint64_t builds_unlisted;          /* builds not listed: table full */
     uint64_t rejects_no_gpu[CUVS_I3E_N_REJECT_REASONS]; /* AR0..AR7, gpu = -1 */
     CuvsBuildStatusRow builds[CUVS_MAX_ACTIVE_BUILDS];
