@@ -1059,6 +1059,8 @@ cuvs_append_reclaim_status(StringInfo json)
     appendStringInfoChar(json, '}');
 }
 
+static bool cuvs_status_is_priv(void);   /* I3-E: defined with the status SRFs */
+
 static const char *
 cuvs_rmm_pool_status_show(void)
 {
@@ -1120,6 +1122,14 @@ cuvs_rmm_pool_status_show(void)
     for (int r = 0; r < CUVS_I3E_N_REJECT_REASONS; r++)
         appendStringInfo(&json, "%s\"ar%d\":%llu", r ? "," : "", r,
                          (unsigned long long)status.rejects_no_gpu[r]);
+    /* builds carries other databases' OIDs: superusers and pg_monitor only,
+     * as pg_cuvs_build_status (C8 privilege model); null for other roles and
+     * outside a transaction (no catalog access for the role check). */
+    if (!IsTransactionState() || !cuvs_status_is_priv())
+    {
+        appendStringInfoString(&json, "},\"builds\":null}");
+        return json.data;
+    }
     appendStringInfoString(&json, "},\"builds\":[");
     for (uint32_t i = 0; i < status.n_builds && i < CUVS_MAX_ACTIVE_BUILDS; i++)
     {
