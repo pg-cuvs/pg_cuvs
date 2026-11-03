@@ -111,6 +111,40 @@ if "CUVS_RQ_LOAD_STARTUP" in funcs.get("handle_search", "") or \
    "CUVS_RQ_LOAD_WARMUP" in funcs.get("handle_search", ""):
     fail("CK-36 (a): search side uses a startup/warmup requester")
 
+# Per-handler requester (review BLOCK 4): every build path names its own
+# BUILD_* kind on every admission, slot and post-admission OOM retry call,
+# and has at least one such call (a removed call is also a defect).
+EXPECT = {
+    "admit_build_cagra":   ("CUVS_RQ_BUILD_CAGRA", ("ensure_vram",)),
+    "handle_build":        ("CUVS_RQ_BUILD_CAGRA", ("evict_lru",)),          # OOM retry
+    "handle_build_multi":  ("CUVS_RQ_BUILD_CAGRA", ("evict_lru",)),          # OOM retry
+    "finish_build_commit": ("CUVS_RQ_BUILD_CAGRA", ("make_slot",)),          # slot
+    "build_sharded":       ("CUVS_RQ_BUILD_SHARD", ("ensure_vram", "make_slot")),
+    "handle_build_flat":   ("CUVS_RQ_BUILD_FLAT",  ("make_slot",)),
+    "handle_build_ivfpq":  ("CUVS_RQ_BUILD_IVFPQ", ("ensure_vram", "make_slot")),
+}
+for fname, (want_rq, fns) in EXPECT.items():
+    body = funcs.get(fname)
+    if body is None:
+        fail(f"CK-36 (b): build handler {fname} not found (scan out of date)")
+        continue
+    for fn in fns:
+        found = 0
+        for m in re.finditer(r"\b%s\(" % fn, body):
+            depth, i = 1, m.end()
+            while depth and i < len(body):
+                depth += {"(": 1, ")": -1}.get(body[i], 0)
+                i += 1
+            rq = split_args(body[m.end():i - 1])[-1]
+            found += 1
+            if rq != want_rq:
+                fail(f"CK-36 (b): {fname} calls {fn}() with {rq}, expected {want_rq}")
+        if not found:
+            fail(f"CK-36 (b): {fname} has no {fn}() call (expected requester {want_rq})")
+if "admit_build_cagra(" not in funcs.get("handle_build", "") or \
+   "admit_build_cagra(" not in funcs.get("handle_build_multi", ""):
+    fail("CK-36 (b): CAGRA builds do not admit through admit_build_cagra")
+
 # ---- CK-37 (a): I-FC assignments ----
 assign = re.compile(r"\b(e|existing)->(handle|tids|n_vecs|n_extended)\s*(\+?=)(?!=)")
 for name, body in funcs.items():
