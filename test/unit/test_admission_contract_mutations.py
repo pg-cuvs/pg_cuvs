@@ -127,21 +127,39 @@ def run(argv):
     return q.returncode, q.stdout + q.stderr
 
 
+IPC_TEST = 'test/unit/test_admission_ipc.c'
+# Reply-header I3 fields in the real client (cuvs_ipc.c / cuvs_ipc.h).
+IPC_MUTATIONS = {
+    'stale_err_out_not_cleared': ('cuvs_ipc.c',
+        '    forget_reply();   /* every request starts without a previous reply\'s I3 fields */\n', ''),
+    'err_out_not_bounded': ('cuvs_ipc.c',
+        "    g_last_err_out[sizeof(g_last_err_out) - 1] = '\\0';\n", ''),
+    'reply_fields_not_recorded': ('cuvs_ipc.c',
+        '    int rc = recv_all(fd, hdr, sizeof(*hdr));\n    if (rc == 0)\n        remember_reply(hdr);\n',
+        '    int rc = recv_all(fd, hdr, sizeof(*hdr));\n'),
+    'wire_version_not_bumped': ('cuvs_ipc.h',
+        '#define CUVS_PROTO_VERSION 5u', '#define CUVS_PROTO_VERSION 4u'),
+}
+SAN = ['-fsanitize=address,undefined', '-fno-sanitize-recover=undefined']
+SOURCES = ['cuvs_util.c', 'cuvs_ipc.c', 'cuvs_ipc.h', 'cuvs_build_corpus.c']
+
+
 def main(output):
     out = Path(output).resolve()
     out.mkdir(parents=True, exist_ok=False)
-    originals = {HEADER: (ROOT / 'src' / HEADER).read_text(),
-                 'cuvs_util.c': (ROOT / 'src' / 'cuvs_util.c').read_text()}
+    originals = {n: (ROOT / 'src' / n).read_text() for n in [HEADER] + SOURCES}
     results, ok = [], True
-    cases = [(n, o, w, 'cuvs_util.c' if n in UTIL_MUTATIONS else HEADER, TEST, [])
+    util = ['cuvs_util.c']
+    cases = [(n, o, w, 'cuvs_util.c' if n in UTIL_MUTATIONS else HEADER, TEST, [], util)
              for n, (o, w) in MUTATIONS.items()]
-    cases += [(n, o, w, 'cuvs_util.c', WIRE_TEST,
-               ['-fsanitize=address,undefined', '-fno-sanitize-recover=undefined'])
+    cases += [(n, o, w, 'cuvs_util.c', WIRE_TEST, SAN, util)
               for n, (o, w) in WIRE_MUTATIONS.items()]
-    cases += [(n, o, w, 'cuvs_util.c', MESSAGE_TEST,
-               ['-fsanitize=address,undefined', '-fno-sanitize-recover=undefined'])
+    cases += [(n, o, w, 'cuvs_util.c', MESSAGE_TEST, SAN, util)
               for n, (o, w) in MESSAGE_MUTATIONS.items()]
-    for name, old, new, target, test, extra in cases:
+    cases += [(n, o, w, f, IPC_TEST, SAN + ['-lpthread', '-lm'],
+               ['cuvs_ipc.c', 'cuvs_util.c', 'cuvs_build_corpus.c'])
+              for n, (f, o, w) in IPC_MUTATIONS.items()]
+    for name, old, new, target, test, extra, sources in cases:
         case = out / name
         case.mkdir()
         for fname, body in originals.items():
@@ -150,8 +168,8 @@ def main(output):
                 body = body.replace(old, new, 1)
             (case / fname).write_text(body)
         binary = str(case / 'check')
-        rc, log = run(['cc', '-std=c11', '-Wall', '-Wextra', *extra, '-I', str(case), '-I', 'src',
-                       '-o', binary, test, str(case / 'cuvs_util.c')])
+        rc, log = run(['cc', '-std=gnu11', '-Wall', '-Wextra', '-I', str(case), '-I', 'src',
+                       '-o', binary, test] + [str(case / f) for f in sources] + extra)
         stage = 'compile'
         if rc == 0:
             stage = 'run'

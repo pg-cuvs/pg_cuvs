@@ -264,7 +264,7 @@ TEST_RT_LIB := $(shell [ "$$(uname -s)" = "Linux" ] && echo -lrt)
 test-unit: test/unit/test_cuvs_util.c src/cuvs_util.c src/cuvs_util.h src/cuvs_ipc.h \
            test/unit/test_build_corpus.c src/cuvs_build_corpus.c src/cuvs_build_corpus.h \
            test-hnsw-build test-hnsw-build-ipc test-hnsw-admission test-admission-contract \
-           test-admission-wire test-admission-message
+           test-admission-wire test-admission-message test-admission-ipc
 	$(CC) -I src -DCUVS_TEST_HOOKS -o test-unit test/unit/test_cuvs_util.c src/cuvs_util.c $(TEST_RT_LIB)
 	./test-unit
 	$(CC) -I src -o test-build-corpus test/unit/test_build_corpus.c src/cuvs_build_corpus.c $(TEST_RT_LIB)
@@ -308,19 +308,31 @@ test-admission-contract: test/unit/test_admission_contract.c src/cuvs_admission_
 		test/unit/test_admission_contract.c -x none $@-util.o $(TEST_RT_LIB)
 	./$@-cxx
 
+# Sanitizers for the admission codec/message tests (CK-29 boundary). Set
+# ADMISSION_TEST_SAN= on toolchains without libasan (e.g. musl).
+ADMISSION_TEST_SAN ?= -fsanitize=address,undefined -fno-sanitize-recover=undefined
+
 # err_out payload codec (C5, CK-29); ASAN/UBSan for the 511/512/513 B boundary.
 test-admission-wire: test/unit/test_admission_wire.c src/cuvs_admission_contract.h \
                      src/cuvs_util.c src/cuvs_util.h src/cuvs_ipc.h
-	$(CC) -std=c11 -Wall -Wextra -Werror -fsanitize=address,undefined \
-		-fno-sanitize-recover=undefined -I src -o $@ test/unit/test_admission_wire.c \
+	$(CC) -std=c11 -Wall -Wextra -Werror $(ADMISSION_TEST_SAN) \
+		-I src -o $@ test/unit/test_admission_wire.c \
 		src/cuvs_util.c $(TEST_RT_LIB)
+	./$@
+
+# I3 reply-header fields through the real client against a mock daemon.
+test-admission-ipc: test/unit/test_admission_ipc.c src/cuvs_ipc.c src/cuvs_ipc.h \
+                    src/cuvs_util.c src/cuvs_build_corpus.c $(wildcard src/*.h)
+	$(CC) -std=gnu11 -Wall -Wextra -Werror $(ADMISSION_TEST_SAN) -I src -o $@ \
+		test/unit/test_admission_ipc.c src/cuvs_ipc.c src/cuvs_util.c src/cuvs_build_corpus.c \
+		-lpthread -lm $(TEST_RT_LIB)
 	./$@
 
 # User-visible DETAIL/HINT text built from err_out (C5, CK-8, CK-29).
 test-admission-message: test/unit/test_admission_message.c src/cuvs_admission_contract.h \
                         src/cuvs_util.c src/cuvs_util.h src/cuvs_ipc.h
-	$(CC) -std=c11 -Wall -Wextra -Werror -fsanitize=address,undefined \
-		-fno-sanitize-recover=undefined -I src -o $@ test/unit/test_admission_message.c \
+	$(CC) -std=c11 -Wall -Wextra -Werror $(ADMISSION_TEST_SAN) \
+		-I src -o $@ test/unit/test_admission_message.c \
 		src/cuvs_util.c $(TEST_RT_LIB)
 	./$@
 
@@ -328,7 +340,7 @@ test-admission-message: test/unit/test_admission_message.c src/cuvs_admission_co
 # ADMISSION_MUTATION_OUT must be a new directory.
 ADMISSION_MUTATION_OUT ?= admission-contract-mutations
 test-admission-contract-mutations: test/unit/test_admission_contract_mutations.py test-admission-contract \
-                                   test-admission-wire test-admission-message
+                                   test-admission-wire test-admission-message test-admission-ipc
 	python3 -I test/unit/test_admission_contract_mutations.py $(ADMISSION_MUTATION_OUT)
 
 # Converter fixtures include private PG page helpers, with backend stubs and
@@ -351,10 +363,10 @@ test-hnsw-converter: test/unit/test_hnsw_converter.c src/hnsw_export.c \
 
 EXTRA_CLEAN += test-hnsw-build test-hnsw-build-ipc test-hnsw-converter test-hnsw-admission test-hnsw-explicit-route test-hnsw-policy \
                test-admission-contract test-admission-contract-cxx test-admission-contract-util.o \
-               test-admission-wire test-admission-message
+               test-admission-wire test-admission-message test-admission-ipc
 .PHONY: test-hnsw-build test-hnsw-build-ipc test-hnsw-converter test-hnsw-admission test-hnsw-explicit-route test-hnsw-policy \
         test-admission-contract test-admission-contract-mutations test-admission-wire \
-        test-admission-message
+        test-admission-message test-admission-ipc
 
 # ---- Documentation contract check ---------------------------------------
 # CPU-only drift detector for the current version/defaults and release-facing
