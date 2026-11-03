@@ -29,6 +29,8 @@ cuvs_requester_name(CuvsRequester rq)
         case CUVS_RQ_LOAD_SHARD:   return "LOAD_SHARD";
         case CUVS_RQ_LOAD_STARTUP: return "LOAD_STARTUP";
         case CUVS_RQ_LOAD_WARMUP:  return "LOAD_WARMUP";
+        case CUVS_RQ_RECLAIM:      return "RECLAIM";
+        case CUVS_RQ_MANUAL:       return "MANUAL";
         default:                   return "?";
     }
 }
@@ -626,6 +628,22 @@ cuvs_reclaim_name_is_runtime(const char *name)
             return 1;
     for (size_t i = 0; i < sizeof(k_runtime_extra) / sizeof(k_runtime_extra[0]); i++)
         if (strcmp(k_runtime_extra[i], name) == 0)
+            return 1;
+    return 0;
+}
+
+int
+cuvs_reclaim_flag_known(const char *name)
+{
+    static const char *str_knobs[] = { "reclaim-mode", "build-evict-scope",
+        "load-soft-evict", "reindex-self-replace", "usage-stats-file" };
+    if (!name)
+        return 0;
+    for (size_t i = 0; i < sizeof(str_knobs) / sizeof(str_knobs[0]); i++)
+        if (strcmp(str_knobs[i], name) == 0)
+            return 1;
+    for (size_t i = 0; i < sizeof(k_ranges) / sizeof(k_ranges[0]); i++)
+        if (strcmp(k_ranges[i].name, name) == 0)
             return 1;
     return 0;
 }

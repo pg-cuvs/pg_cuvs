@@ -27,6 +27,8 @@ typedef enum CuvsRequester {
     CUVS_RQ_LOAD_SHARD,    /* sharded reload */
     CUVS_RQ_LOAD_STARTUP,  /* startup_load_indexes: never evicts */
     CUVS_RQ_LOAD_WARMUP,   /* snapshot warmup: eligible-only LRU, no soft */
+    CUVS_RQ_RECLAIM,       /* background reclaim (logging only; not a pick input) */
+    CUVS_RQ_MANUAL,        /* pg_cuvs_unload (logging only) */
     CUVS_RQ__COUNT
 } CuvsRequester;
 
@@ -301,6 +303,8 @@ int cuvs_reclaim_params_check(const CuvsReclaimParams *p, char *err,
 int cuvs_reclaim_runtime_set(CuvsReclaimParams *p, const char *name,
                              const char *value, char *err, size_t errcap);
 int cuvs_reclaim_name_is_runtime(const char *name);
+/* Is `name` (without "--") one of the I3-B daemon flags? */
+int cuvs_reclaim_flag_known(const char *name);
 
 /* ---- Usage stats file (UC-1 4c) ---- */
 #define CUVS_USAGE_STATS_MAX 65536
