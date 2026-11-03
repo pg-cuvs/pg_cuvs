@@ -146,6 +146,17 @@ CuvsSelfReplace cuvs_self_replace_decide(uint64_t shortfall, int has_old,
                                          int old_pinned, uint64_t old_bytes,
                                          int knob_on);
 
+/* REINDEX self-replace NOTICE and DETAIL (decision UC-1 2a wording).
+ * label: the index as the backend will name it (quoted qualified name, or
+ * "index <oid>" in the daemon). need: the build's admission bytes; free_bytes:
+ * room for it before the old copy was counted. Return 0, -1 if truncated. */
+int cuvs_self_replace_notice(char *msg, size_t mcap, char *detail, size_t dcap,
+                             const char *label, uint64_t need, uint64_t free_bytes);
+/* The rebuild failed after the old copy was unloaded: say so and that the
+ * next query reloads the old copy. */
+int cuvs_self_replace_fail_notice(char *msg, size_t mcap, char *detail,
+                                  size_t dcap, const char *label);
+
 /* ---- Reclaim (EV-5): modes, free target F and its four fences ---- */
 typedef enum CuvsReclaimMode {
     CUVS_RECLAIM_OFF = 0,
