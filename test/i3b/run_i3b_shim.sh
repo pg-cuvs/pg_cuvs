@@ -193,7 +193,12 @@ cli load $DB $I1 >/dev/null; cli load $DB $I3 >/dev/null
 q t1; q t3
 MARK=$(wc -l < /tmp/d.log)
 OUTL=$(cli load $DB $I2)
-check "load-soft-evict off: reload with only protected victims refused (AR5 text)" sh -c "echo '$OUTL' | grep -q 'pinned, in use, or still protected'"
+echo "  soft-evict-off load reply: $OUTL"
+# Integration rebind (confirmed by i3-b, xsm 5c064e99): on the I3 stack a
+# manual LOAD refused by admission goes through I3-A's structured reply
+# (status 2, err_out reason AR5; plan C5 reload variant), not the interim I3-B
+# C7 string "...pinned, in use, or still protected".
+check "load-soft-evict off: reload with only protected victims refused (status 2, err_out AR5)" sh -c "echo '$OUTL' | grep -q '^status=2 ' && tail -n +$MARK /tmp/d.log | grep -q '\[admit_reject\] status=2 err_out=\"AR5 '"
 check "load-soft-evict off: no soft_evict" sh -c "! tail -n +$MARK /tmp/d.log | grep -q 'reason=soft_evict'"
 RN3=$(psqlq "SELECT relname FROM pg_class WHERE oid=$I3")
 psqlq "SET client_min_messages=warning; REINDEX INDEX $RN3;" > /tmp/reidx_off.log 2>&1
@@ -276,6 +281,29 @@ cli load $DB $I1 >/dev/null; cli load $DB $I3 >/dev/null
 psqlq "SET client_min_messages=warning; SELECT pg_cuvs_inject_build_oom(1); REINDEX INDEX $RN3;" > /tmp/reidx_fail.log 2>&1
 check "self-replace then build failure: failure NOTICE exact" grep -qF "[self_replace] idx=$I3 build_failed=1 notice=\"pg_cuvs: rebuild of index $I3 failed after its previous resident copy was unloaded from GPU\" detail=\"The next query on this index reloads the old copy\"" /tmp/d.log
 psqlq "SELECT pg_cuvs_inject_build_oom(0);" >/dev/null
+
+# --- 7b. manual LOAD / PIN refused by admission, over SQL (C5 reload variant) ---
+# The err_out of a manual op reaches the backend, which raises the C5 reload
+# variant (plan C5: 53200 for every reason on the reload path, DETAIL with the
+# reason values, HINT) and records it for pg_cuvs_last_rejection().
+# i1 and i3 resident and pinned, i6c not resident.
+startd --reclaim-mode off --pin-max-pct 100
+for i in $(i3b_ipc_cli $S index | awk -F'\t' '$3=="resident"{print $2}'); do cli unload $DB $i >/dev/null; done
+cli load $DB $I1 >/dev/null; cli load $DB $I3 >/dev/null; cli pin $DB $I1 >/dev/null; cli pin $DB $I3 >/dev/null
+sqv() { su pg -c "psql -h /tmp -X -q -At -v VERBOSITY=verbose -d postgres -c \"$1\" -c \"SELECT 'last=' || (pg_cuvs_last_rejection()->>'reason')\"" 2>&1; }
+sqv "SELECT pg_cuvs_load('i6c'::regclass)" > /tmp/load_ar5.log
+sqv "SELECT pg_cuvs_pin('i6c'::regclass)" > /tmp/pin_ar5.log
+echo "  load AR5 reply: $(tr '\n' ' ' < /tmp/load_ar5.log | cut -c1-400)"
+check "pg_cuvs_load AR5: SQLSTATE 53200 and the C5 reload message" grep -q 'ERROR:  53200: pg_cuvs: GPU memory is unavailable to load index "public.i6c"' /tmp/load_ar5.log
+check "pg_cuvs_load AR5: DETAIL and HINT present" sh -c "grep -q '^DETAIL:  ' /tmp/load_ar5.log && grep -q '^HINT:  ' /tmp/load_ar5.log"
+check "pg_cuvs_load AR5: pg_cuvs_last_rejection reason AR5" grep -qx 'last=AR5' /tmp/load_ar5.log
+check "pg_cuvs_pin AR5: SQLSTATE 53200 and the C5 reload message" grep -q 'ERROR:  53200: pg_cuvs: GPU memory is unavailable to load index "public.i6c"' /tmp/pin_ar5.log
+startd --reclaim-mode off --max-vram-mb 9
+sqv "SELECT pg_cuvs_load('i6c'::regclass)" > /tmp/load_ar0.log
+echo "  load AR0 reply: $(tr '\n' ' ' < /tmp/load_ar0.log | cut -c1-400)"
+check "pg_cuvs_load AR0: SQLSTATE 53200 (reload variant) and the C5 reload message" grep -q 'ERROR:  53200: pg_cuvs: GPU memory is unavailable to load index "public.i6c"' /tmp/load_ar0.log
+check "pg_cuvs_load AR0: DETAIL names the per-index limit, HINT present, last_rejection AR0" sh -c "grep -q '^DETAIL:  .*the limit for one index is' /tmp/load_ar0.log && grep -q '^HINT:  The index is larger than the GPU memory limit' /tmp/load_ar0.log && grep -qx 'last=AR0' /tmp/load_ar0.log"
+check "pg_cuvs_load AR5: DETAIL names the pinned bytes, HINT names pg_cuvs_unpin" sh -c "grep -q '^DETAIL:  .*pinned 19 MiB in 2' /tmp/load_ar5.log && grep -q '^HINT:  .*pg_cuvs_unpin' /tmp/load_ar5.log"
 DBIN=pg_cuvs_server
 startd --reclaim-tick-s 1
 
