@@ -13,7 +13,7 @@ M = [
     ("requester dropped from a call", "ensure_vram(needed, dev, CUVS_RQ_BUILD_SHARD)", "ensure_vram(needed, dev)"),
     ("EXTEND keeps file_current", "    e->file_current = 0;   /* I-FC (1): graph now differs from the files */\n", ""),
     ("save_index does not set file_current", "    e->file_current = 1;   /* I-FC (iii) */\n", ""),
-    ("REINDEX branch skips file_current", "        existing->file_current = 1;    /* I-FC (i): build saved its files first */\n", ""),
+    ("REINDEX branch skips file_current", "        existing->file_current = strcmp(save_dir, g_index_dir) == 0;\n", ""),
     ("load sets file_current before reset", "    reset_entry_stats(e);\n    /* I3-B defect 3",
      "    e->file_current = handle != NULL;\n    reset_entry_stats(e);\n    /* I3-B defect 3"),
     ("second skip site", "graceful_shutdown(void)\n{", "graceful_shutdown(void)\n{\n    if (!g_indexes[0].file_current) {}"),
