@@ -65,6 +65,7 @@
 #include "catalog/pg_amop.h"        /* AMOPOPID, Form_pg_amop, AMOP_ORDER (ADR-073 B metric) */
 #include "utils/catcache.h"         /* CatCList (SearchSysCacheList1) */
 #include "utils/acl.h"
+#include "catalog/pg_authid.h"      /* ROLE_PG_MONITOR (I3-B status visibility) */
 #include "nodes/extensible.h"       /* CustomPath, CustomScan (Option A D-wedge) */
 #include "optimizer/paths.h"        /* set_rel_pathlist_hook */
 #include "optimizer/pathnode.h"     /* add_path */
@@ -90,6 +91,7 @@
 #include "hnsw_export.h"
 #include "cuvs_hnsw_build.h"
 #include "cuvs_hnsw_build_common.h"
+#include "cuvs_status_text.h"   /* I3-B status text parsing */
 
 PG_MODULE_MAGIC;
 
@@ -963,6 +965,31 @@ cuvs_rmm_pool_max_percent_show(void)
     return psprintf("%u", status.maximum_percent);
 }
 
+/* I3-B: append the daemon's RECLAIM_STATUS object members to the end of the
+ * rmm_pool_status object. Append-only (existing keys keep their order); on any
+ * failure or a non-object reply the JSON is left unchanged. */
+static void
+cuvs_append_reclaim_status(StringInfo json)
+{
+    char  *raw = NULL;
+    char  *copy;
+    size_t n = 0;
+    size_t body_off;
+    size_t body_len;
+
+    if (cuvs_ipc_text(cuvs_socket_path, CUVS_OP_RECLAIM_STATUS, &raw, &n) != CUVS_STATUS_OK)
+        return;
+    copy = pnstrdup(raw, n);
+    free(raw);
+    if (!cuvs_status_json_body(copy, n, &body_off, &body_len) ||
+        json->len == 0 || json->data[json->len - 1] != '}')
+        return;
+    json->data[--json->len] = '\0';
+    appendStringInfoChar(json, ',');
+    appendBinaryStringInfo(json, copy + body_off, (int) body_len);
+    appendStringInfoChar(json, '}');
+}
+
 static const char *
 cuvs_rmm_pool_status_show(void)
 {
@@ -987,6 +1014,7 @@ cuvs_rmm_pool_status_show(void)
     /* v2 (I3): keys appended after "devices", I3-A first (append-only). */
     appendStringInfo(&json, "],\"version\":%u,\"scratch_permille\":%u}",
                      status.version, status.scratch_permille);
+    cuvs_append_reclaim_status(&json);
     return json.data;
 }
 
@@ -6634,6 +6662,394 @@ pg_cuvs_gc_orphans(PG_FUNCTION_ARGS)
         tuplestore_putvalues(tupstore, tupdesc, values, nulls);
     }
 
+    return (Datum) 0;
+}
+
+/* ----------------------------------------------------------------
+ * I3-B: manual cache control and cache/memory status (ops 30..37).
+ *
+ *   pg_cuvs_unload/load/pin/unpin(regclass)  index owner (or superuser)
+ *   pg_cuvs_unload/unpin(db_oid, index_oid)  superuser only, any database
+ *   pg_cuvs_reclaim_set(name, value)         superuser only
+ *   pg_cuvs_index_status()                   rows filtered per caller
+ *   pg_cuvs_memory_status()                  superuser or pg_monitor
+ *
+ * The SQL grants (REVOKE FROM PUBLIC) are the first gate; the checks here
+ * hold even when a DBA grants EXECUTE more widely. Text parsing lives in
+ * cuvs_status_text.c (unit tested without PG).
+ * ---------------------------------------------------------------- */
+#if PG_VERSION_NUM >= 160000
+#define cuvs_rel_ownercheck(relid, roleid) \
+    object_ownercheck(RelationRelationId, (relid), (roleid))
+#else
+#define cuvs_rel_ownercheck(relid, roleid) pg_class_ownercheck((relid), (roleid))
+#endif
+
+#define CUVS_MANUAL_MSG_LEN 256
+
+static bool
+cuvs_status_is_priv(void)
+{
+    return superuser() || has_privs_of_role(GetUserId(), ROLE_PG_MONITOR);
+}
+
+static void
+cuvs_require_superuser(const char *fn)
+{
+    if (!superuser())
+        ereport(ERROR,
+                (errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+                 errmsg("must be superuser to call %s", fn)));
+}
+
+/* regclass target of a manual op: an existing index the caller owns. */
+static void
+cuvs_manual_check_index(Oid relid)
+{
+    char relkind = get_rel_relkind(relid);
+
+    if (relkind == '\0')
+        ereport(ERROR,
+                (errcode(ERRCODE_UNDEFINED_TABLE),
+                 errmsg("relation with OID %u does not exist", relid)));
+    if (relkind != RELKIND_INDEX)
+        ereport(ERROR,
+                (errcode(ERRCODE_WRONG_OBJECT_TYPE),
+                 errmsg("\"%s\" is not an index", get_rel_name(relid))));
+    if (!cuvs_rel_ownercheck(relid, GetUserId()))
+        aclcheck_error(ACLCHECK_NOT_OWNER, OBJECT_INDEX, get_rel_name(relid));
+}
+
+static Datum
+cuvs_manual_result(int rc, const char *msg)
+{
+    if (rc == CUVS_STATUS_OK)
+        PG_RETURN_TEXT_P(cstring_to_text(msg));
+    if (rc == CUVS_STATUS_UNAVAILABLE)
+        ereport(ERROR,
+                (errcode(ERRCODE_CONNECTION_FAILURE),
+                 errmsg("pg_cuvs: daemon unavailable")));
+    cuvs_report_proto_mismatch(rc);
+    if (msg[0] == '\0')
+        ereport(ERROR,
+                (errcode(ERRCODE_INTERNAL_ERROR),
+                 errmsg("pg_cuvs: daemon returned status %d", rc)));
+    ereport(ERROR,
+            (errcode(cuvs_status_msg_in_use(msg) ? ERRCODE_OBJECT_IN_USE
+                                                 : ERRCODE_INTERNAL_ERROR),
+             errmsg("pg_cuvs: %s", msg)));
+    pg_unreachable();
+}
+
+static Datum
+cuvs_manual_rel(FunctionCallInfo fcinfo, uint32 op)
+{
+    Oid  relid = PG_GETARG_OID(0);
+    char msg[CUVS_MANUAL_MSG_LEN];
+    int  rc;
+
+    cuvs_manual_check_index(relid);
+    rc = cuvs_ipc_manual(cuvs_socket_path, op, (uint32_t) MyDatabaseId,
+                         (uint32_t) relid, msg, sizeof(msg));
+    return cuvs_manual_result(rc, msg);
+}
+
+static Datum
+cuvs_manual_oid(FunctionCallInfo fcinfo, uint32 op, const char *fn)
+{
+    char msg[CUVS_MANUAL_MSG_LEN];
+    int  rc;
+
+    cuvs_require_superuser(fn);
+    rc = cuvs_ipc_manual(cuvs_socket_path, op, (uint32_t) PG_GETARG_OID(0),
+                         (uint32_t) PG_GETARG_OID(1), msg, sizeof(msg));
+    return cuvs_manual_result(rc, msg);
+}
+
+PG_FUNCTION_INFO_V1(pg_cuvs_unload);
+Datum
+pg_cuvs_unload(PG_FUNCTION_ARGS)
+{
+    return cuvs_manual_rel(fcinfo, CUVS_OP_UNLOAD);
+}
+
+PG_FUNCTION_INFO_V1(pg_cuvs_load);
+Datum
+pg_cuvs_load(PG_FUNCTION_ARGS)
+{
+    return cuvs_manual_rel(fcinfo, CUVS_OP_LOAD);
+}
+
+PG_FUNCTION_INFO_V1(pg_cuvs_pin);
+Datum
+pg_cuvs_pin(PG_FUNCTION_ARGS)
+{
+    return cuvs_manual_rel(fcinfo, CUVS_OP_PIN);
+}
+
+PG_FUNCTION_INFO_V1(pg_cuvs_unpin);
+Datum
+pg_cuvs_unpin(PG_FUNCTION_ARGS)
+{
+    return cuvs_manual_rel(fcinfo, CUVS_OP_UNPIN);
+}
+
+PG_FUNCTION_INFO_V1(pg_cuvs_unload_oid);
+Datum
+pg_cuvs_unload_oid(PG_FUNCTION_ARGS)
+{
+    return cuvs_manual_oid(fcinfo, CUVS_OP_UNLOAD, "pg_cuvs_unload(oid, oid)");
+}
+
+PG_FUNCTION_INFO_V1(pg_cuvs_unpin_oid);
+Datum
+pg_cuvs_unpin_oid(PG_FUNCTION_ARGS)
+{
+    return cuvs_manual_oid(fcinfo, CUVS_OP_UNPIN, "pg_cuvs_unpin(oid, oid)");
+}
+
+PG_FUNCTION_INFO_V1(pg_cuvs_reclaim_set);
+Datum
+pg_cuvs_reclaim_set(PG_FUNCTION_ARGS)
+{
+    char *name;
+    char *value;
+    char  msg[CUVS_MANUAL_MSG_LEN];
+    int   rc;
+
+    cuvs_require_superuser("pg_cuvs_reclaim_set");
+    name = text_to_cstring(PG_GETARG_TEXT_PP(0));
+    value = text_to_cstring(PG_GETARG_TEXT_PP(1));
+    rc = cuvs_ipc_reclaim_set(cuvs_socket_path, name, value, msg, sizeof(msg));
+    if (rc == CUVS_STATUS_OK)
+        PG_RETURN_TEXT_P(cstring_to_text(msg));
+    if (rc == CUVS_STATUS_UNAVAILABLE)
+        ereport(ERROR,
+                (errcode(ERRCODE_CONNECTION_FAILURE),
+                 errmsg("pg_cuvs: daemon unavailable")));
+    cuvs_report_proto_mismatch(rc);
+    ereport(ERROR,
+            (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+             msg[0] ? errmsg("pg_cuvs: %s", msg)
+                    : errmsg("pg_cuvs: daemon returned status %d", rc)));
+    PG_RETURN_NULL();
+}
+
+/* Materialize-mode SRF setup shared by the two status functions. */
+static Tuplestorestate *
+cuvs_status_srf_begin(FunctionCallInfo fcinfo, TupleDesc *tupdesc)
+{
+    ReturnSetInfo   *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+    Tuplestorestate *tupstore;
+    MemoryContext    oldcontext;
+
+    if (rsinfo == NULL || !IsA(rsinfo, ReturnSetInfo))
+        ereport(ERROR,
+                (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                 errmsg("set-valued function called in context that cannot accept a set")));
+    if (!(rsinfo->allowedModes & SFRM_Materialize))
+        ereport(ERROR,
+                (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                 errmsg("materialize mode required, but it is not allowed in this context")));
+    if (get_call_result_type(fcinfo, NULL, tupdesc) != TYPEFUNC_COMPOSITE)
+        ereport(ERROR,
+                (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                 errmsg("return type must be a row type")));
+
+    oldcontext = MemoryContextSwitchTo(rsinfo->econtext->ecxt_per_query_memory);
+    tupstore = tuplestore_begin_heap(true, false, work_mem);
+    rsinfo->returnMode = SFRM_Materialize;
+    rsinfo->setResult  = tupstore;
+    rsinfo->setDesc    = *tupdesc;
+    MemoryContextSwitchTo(oldcontext);
+    return tupstore;
+}
+
+/* Fetch a text op into palloc'd memory. NULL when the daemon is unreachable;
+ * any other failure is an ERROR (e.g. a daemon that predates the op). */
+static char *
+cuvs_status_fetch(uint32 op, size_t *len)
+{
+    char  *raw = NULL;
+    char  *copy;
+    size_t n = 0;
+    int    rc = cuvs_ipc_text(cuvs_socket_path, op, &raw, &n);
+
+    if (rc == CUVS_STATUS_UNAVAILABLE)
+        return NULL;
+    if (rc != CUVS_STATUS_OK)
+    {
+        cuvs_report_proto_mismatch(rc);
+        ereport(ERROR,
+                (errcode(ERRCODE_INTERNAL_ERROR),
+                 errmsg("pg_cuvs: status op %u failed (daemon status %d)", op, rc)));
+    }
+    copy = palloc(n + 1);
+    memcpy(copy, raw, n);
+    copy[n] = '\0';
+    free(raw);
+    *len = n;
+    return copy;
+}
+
+static void
+cuvs_status_row_datums(char **f, const char *kinds, int ncols, int row,
+                       Datum *values, bool *nulls)
+{
+    for (int c = 0; c < ncols; c++)
+    {
+        int64_t v;
+        int     isnull;
+
+        if (cuvs_status_parse_field(kinds[c], f[c], &v, &isnull) != 0)
+            ereport(ERROR,
+                    (errcode(ERRCODE_PROTOCOL_VIOLATION),
+                     errmsg("pg_cuvs: malformed status field %d in row %d: \"%.64s\"",
+                            c + 1, row, f[c])));
+        nulls[c] = isnull != 0;
+        values[c] = (Datum) 0;
+        if (isnull)
+            continue;
+        switch (kinds[c])
+        {
+            case CUVS_SF_OID:
+                values[c] = ObjectIdGetDatum((Oid) v);
+                break;
+            case CUVS_SF_INT:
+            case CUVS_SF_GPU:
+                values[c] = Int32GetDatum((int32) v);
+                break;
+            case CUVS_SF_I64:
+                values[c] = Int64GetDatum((int64) v);
+                break;
+            case CUVS_SF_TIME:
+                values[c] = TimestampTzGetDatum(time_t_to_timestamptz((pg_time_t) v));
+                break;
+            case CUVS_SF_BOOL:
+            case CUVS_SF_TRI:
+                values[c] = BoolGetDatum(v != 0);
+                break;
+            case CUVS_SF_TEXT:
+                values[c] = CStringGetTextDatum(f[c]);
+                break;
+        }
+    }
+}
+
+/* Name and ownership of an index in this database, read from one syscache
+ * tuple so a concurrent DROP yields "not found" rather than an ERROR. */
+static bool
+cuvs_status_index_info(Oid relid, char **qualname, bool *owns)
+{
+    HeapTuple     tup = SearchSysCache1(RELOID, ObjectIdGetDatum(relid));
+    Form_pg_class form;
+    bool          found = false;
+
+    if (!HeapTupleIsValid(tup))
+        return false;
+    form = (Form_pg_class) GETSTRUCT(tup);
+    if (form->relkind == RELKIND_INDEX)
+    {
+        *qualname = quote_qualified_identifier(get_namespace_name(form->relnamespace),
+                                               NameStr(form->relname));
+        *owns = superuser() || has_privs_of_role(GetUserId(), form->relowner);
+        found = true;
+    }
+    ReleaseSysCache(tup);
+    return found;
+}
+
+/* Shared walk: header check, exact field count, typed columns. With
+ * index_rows the first output column is index_name and rows are filtered by
+ * cuvs_status_row_visible. */
+static void
+cuvs_status_emit(FunctionCallInfo fcinfo, uint32 op, const char *header,
+                 int ncols, const char *kinds, bool index_rows)
+{
+    TupleDesc        tupdesc;
+    Tuplestorestate *tupstore = cuvs_status_srf_begin(fcinfo, &tupdesc);
+    int              off = index_rows ? 1 : 0;
+    bool             is_priv = cuvs_status_is_priv();
+    size_t           len = 0;
+    size_t           pos = 0;
+    char            *text;
+    char           **f;
+    Datum           *values;
+    bool            *nulls;
+    const char      *line;
+    size_t           line_len;
+    int              row = 0;
+    int              r;
+
+    if (tupdesc->natts != ncols + off)
+        ereport(ERROR,
+                (errcode(ERRCODE_DATATYPE_MISMATCH),
+                 errmsg("pg_cuvs: status function returns %d columns, expected %d",
+                        tupdesc->natts, ncols + off),
+                 errhint("ALTER EXTENSION pg_cuvs UPDATE to match the installed library.")));
+
+    text = cuvs_status_fetch(op, &len);
+    if (text == NULL)
+        return;     /* daemon down -> empty result, not an error */
+    if (!cuvs_status_check_header(text, len, header, &pos))
+        ereport(ERROR,
+                (errcode(ERRCODE_PROTOCOL_VIOLATION),
+                 errmsg("pg_cuvs: status layout mismatch"),
+                 errdetail("The daemon's column header differs from this library's; "
+                           "co-deploy pg_cuvs.so and pg_cuvs_server.")));
+
+    f = palloc(sizeof(char *) * ncols);
+    values = palloc(sizeof(Datum) * (ncols + off));
+    nulls = palloc(sizeof(bool) * (ncols + off));
+    while ((r = cuvs_status_next_line(text, len, &pos, &line, &line_len)) == 1)
+    {
+        row++;
+        if (cuvs_status_split((char *) line, line_len, f, ncols) != ncols)
+            ereport(ERROR,
+                    (errcode(ERRCODE_PROTOCOL_VIOLATION),
+                     errmsg("pg_cuvs: status row %d does not have %d fields", row, ncols)));
+        cuvs_status_row_datums(f, kinds, ncols, row, values + off, nulls + off);
+        if (index_rows)
+        {
+            Oid   row_db = DatumGetObjectId(values[1]);
+            Oid   row_index = DatumGetObjectId(values[2]);
+            char *qualname = NULL;
+            bool  owns = false;
+
+            if (row_db == MyDatabaseId)
+                (void) cuvs_status_index_info(row_index, &qualname, &owns);
+            if (!cuvs_status_row_visible(is_priv, row_db, MyDatabaseId, owns))
+                continue;
+            nulls[0] = qualname == NULL;
+            values[0] = qualname ? CStringGetTextDatum(qualname) : (Datum) 0;
+        }
+        tuplestore_putvalues(tupstore, tupdesc, values, nulls);
+    }
+    if (r < 0)
+        ereport(ERROR,
+                (errcode(ERRCODE_PROTOCOL_VIOLATION),
+                 errmsg("pg_cuvs: status text truncated after row %d", row)));
+}
+
+PG_FUNCTION_INFO_V1(pg_cuvs_index_status);
+Datum
+pg_cuvs_index_status(PG_FUNCTION_ARGS)
+{
+    cuvs_status_emit(fcinfo, CUVS_OP_INDEX_STATUS, CUVS_INDEX_STATUS_COLS,
+                     CUVS_INDEX_STATUS_NCOLS, CUVS_INDEX_STATUS_KINDS, true);
+    return (Datum) 0;
+}
+
+PG_FUNCTION_INFO_V1(pg_cuvs_memory_status);
+Datum
+pg_cuvs_memory_status(PG_FUNCTION_ARGS)
+{
+    if (!cuvs_status_is_priv())
+        ereport(ERROR,
+                (errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+                 errmsg("must be superuser or a member of pg_monitor to call pg_cuvs_memory_status")));
+    cuvs_status_emit(fcinfo, CUVS_OP_MEMORY_STATUS, CUVS_MEMORY_STATUS_COLS,
+                     CUVS_MEMORY_STATUS_NCOLS, CUVS_MEMORY_STATUS_KINDS, false);
     return (Datum) 0;
 }
 
