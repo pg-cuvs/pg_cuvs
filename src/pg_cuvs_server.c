@@ -28,6 +28,8 @@
 
 #include "cuvs_ipc.h"
 #include "cuvs_util.h"
+#include "cuvs_cache_policy.h"
+#include <stdarg.h>
 #include "cuvs_wrapper.h"
 #include "cuvs_hnsw_build_common.h"
 #include "cuvs_objstore.h"
@@ -260,6 +262,13 @@ typedef struct IndexEntry {
     /* 4C: compaction observability */
     uint64_t        compact_count;      /* cuvsCagraMerge compact ops since last build */
     time_t          last_compact_at;    /* epoch seconds of last compact; 0 if never */
+    /* I3-B cache policy (v6 C1 EV-1/EV-2). `last_search` doubles as last_use:
+     * 0 = never searched since registration (UC-1 3b). `inflight` is the
+     * EV-1 (b) in-use count for every entry, not only sharded ones. */
+    uint32_t        hits;               /* OK searches since registration */
+    int             pinned;             /* daemon-lifetime pin; kept by REINDEX */
+    time_t          loaded_at;          /* registration time (order key) */
+    int             file_current;       /* I-FC: 1 iff graph/tids == .cagra/.tids */
 } IndexEntry;
 
 /* Zero just the stat counters of a (re)initialized entry. The slot may carry
@@ -291,6 +300,15 @@ reset_entry_stats(IndexEntry *e)
      * 64), clearing a reused slot's stale value. CAGRA build paths set the real
      * cmd->graph_degree AFTER this call; flat/ivfpq/reload leave it 0. */
     e->graph_degree       = 0;
+    /* I3-B: a fresh instance has no use history (UC-1 3b: last_use 0 is
+     * eligible; order key falls back to loaded_at). `pinned` is deliberately
+     * NOT cleared: REINDEX of the same OID keeps the pin (C7 7.2-N3). New
+     * slots clear it in registry_new_slot(). file_current starts 0; callers
+     * set 1 only after a successful save or load (I-FC). */
+    e->hits               = 0;
+    e->last_search        = 0;
+    e->loaded_at          = time(NULL);
+    e->file_current       = 0;
 }
 
 /* Record a completed search on an entry. Caller MUST hold g_index_mutex. */
@@ -303,6 +321,7 @@ record_search_stat(IndexEntry *e, uint32_t status, uint32_t latency_us,
     if (status == CUVS_STATUS_OK)
     {
         e->search_count++;
+        e->hits++;
         e->total_latency_us += latency_us;
         e->lat_buckets[cuvs_lat_bucket_index(latency_us)]++;
     }
@@ -398,6 +417,7 @@ static size_t g_pending_rmm_build_vram[CUVS_MAX_GPUS];
 #define CUVS_DEFAULT_VRAM_FRACTION 0.90
 static int    g_server_fd         = -1;
 static volatile int g_shutdown    = 0;
+static CuvsReclaimParams g_reclaim;  /* I3-B knobs; defined with the policy state */
 static char   g_snapshot_uri[512] = ""; /* "gs://bucket[/prefix]"; empty = disabled */
 static char   g_cluster_id[128]   = ""; /* multi-node identifier for GCS path */
 static char   g_gcs_key_file[512] = ""; /* service account JSON; empty = instance metadata */
@@ -526,7 +546,7 @@ warmup_dequeue(WarmupJob *out)
 }
 
 /* Forward declarations for warmup worker. */
-static int  load_index(uint32_t db_oid, uint32_t index_oid);
+static int  load_index(uint32_t db_oid, uint32_t index_oid, CuvsRequester rq);
 static void build_rev_tid_map(IndexEntry *e);  /* 3O: TID→item_id reverse map */
 
 static void *
@@ -600,7 +620,7 @@ warmup_worker_thread(void *arg)
             }
         }
 
-        if (load_index(job.db_oid, job.index_oid) != 0)
+        if (load_index(job.db_oid, job.index_oid, CUVS_RQ_LOAD_WARMUP) != 0)
         {
             LOG_WARN("warmup: VRAM load failed for %u/%u\n",
                      job.db_oid, job.index_oid);
@@ -1599,9 +1619,12 @@ static int write_tids_atomic(const char *tids_tmp,
 static int fsync_path(const char *path);
 static void fchmod_sidecar(FILE *f, const char *path);
 static void chmod_sidecar(const char *path);
-static int ensure_vram(size_t needed, int device_id,
-                       CuvsAdmissionFields *rej);   /* defined after the LRU section */
-static size_t evict_lru(int device_id);                 /* soft-cap slot eviction (load_index) */
+static int ensure_vram(size_t needed, int device_id, CuvsRequester rq,
+                       CuvsAdmissionFields *rej); /* after the LRU section */
+static size_t evict_lru(int device_id, CuvsRequester rq);
+static int make_slot(int device_id, CuvsRequester rq);
+static IndexEntry *registry_new_slot(void);
+static size_t entry_bytes_on(const IndexEntry *e, int device_id);
 
 /* save_index: persist a registry entry to disk atomically.
  * Same contract as handle_build's persistence path: tmp + rename + fsync.
@@ -1665,6 +1688,7 @@ save_index(IndexEntry *e)
     int dir_fd = open(g_index_dir, O_RDONLY);
     if (dir_fd >= 0) { fsync(dir_fd); close(dir_fd); }
 
+    e->file_current = 1;   /* I-FC (iii) */
     LOG_INFO("pg_cuvs_server: saved index %u/%u (%lld vecs)\n",
             e->db_oid, e->index_oid, (long long)e->n_vecs);
     return 0;
@@ -1679,8 +1703,11 @@ save_index(IndexEntry *e)
  * Caller holds g_index_mutex. */
 static int
 load_index_sharded(uint32_t db_oid, uint32_t index_oid,
-                   const CuvsTidsHeader *thdr, uint64_t *tids)
+                   const CuvsTidsHeader *thdr, uint64_t *tids, CuvsRequester rq)
 {
+    /* A search-side reload of a sharded index is LOAD_SHARD (C1 RQ table). */
+    if (rq == CUVS_RQ_LOAD)
+        rq = CUVS_RQ_LOAD_SHARD;
     char manifest_path[512];
     shards_manifest_path(manifest_path, sizeof(manifest_path), g_index_dir, db_oid, index_oid);
 
@@ -1713,7 +1740,7 @@ load_index_sharded(uint32_t db_oid, uint32_t index_oid,
 
     /* Soft cap: evict the LRU to free a slot so a sharded reload succeeds. */
     if (g_n_indexes >= g_max_indexes)
-        evict_lru(usable_gpu(0));
+        (void) make_slot(usable_gpu(0), rq);
     if (g_n_indexes >= g_max_indexes)
     {
         free(recs);
@@ -1737,12 +1764,12 @@ load_index_sharded(uint32_t db_oid, uint32_t index_oid,
         /* cold reload: graph_degree not persisted in .shards -> default 64 */
         size_t needed = estimate_vram_bytes(recs[i].n_vecs, (int)recs[i].dim, 64);
         int    dev    = usable_gpu(i % n_gpus);   /* re-place on reload */
-        if (ensure_vram(needed, dev, NULL) != 0)
+        if (ensure_vram(needed, dev, rq, NULL) != 0)
         {
             int alt = pick_gpu_for_index(needed);
             if (alt < 0)
                 admission_fill(&t_reload_rej, CUVS_ADMISSION_AR0, needed, -1);
-            if (alt < 0 || ensure_vram(needed, alt, &t_reload_rej) != 0)
+            if (alt < 0 || ensure_vram(needed, alt, rq, &t_reload_rej) != 0)
             {
                 AdmitLine al = {.op = "LOAD_SHARD", .path = "reload", .algo = "cagra",
                                 .gpu = alt, .db = db_oid, .idx = index_oid,
@@ -1797,7 +1824,7 @@ load_index_sharded(uint32_t db_oid, uint32_t index_oid,
         return rc_fail;   /* fail closed: no partial sharded index registered */
     }
 
-    IndexEntry *e = &g_indexes[g_n_indexes++];
+    IndexEntry *e = registry_new_slot();
     memset(e, 0, sizeof(*e));
     e->db_oid        = db_oid;
     e->index_oid     = index_oid;
@@ -1881,7 +1908,7 @@ build_rev_tid_map(IndexEntry *e)
 }
 
 static int
-load_index(uint32_t db_oid, uint32_t index_oid)
+load_index(uint32_t db_oid, uint32_t index_oid, CuvsRequester rq)
 {
     char idx_path[512], tids_path[512];
 
@@ -1927,7 +1954,7 @@ load_index(uint32_t db_oid, uint32_t index_oid)
      * present-but-invalid manifest fails closed (no unsharded fallback — there
      * is no single .cagra to fall back to). */
     {
-        int src = load_index_sharded(db_oid, index_oid, &thdr, tids);
+        int src = load_index_sharded(db_oid, index_oid, &thdr, tids, rq);
         if (src == 0)
             return 0;            /* sharded load OK; tids ownership transferred */
         if (src < 0)
@@ -1957,14 +1984,14 @@ load_index(uint32_t db_oid, uint32_t index_oid)
 
             /* Soft cap: free a slot if the registry is full (search-miss reload). */
             if (g_n_indexes >= g_max_indexes)
-                evict_lru(fgpu);
+                (void) make_slot(fgpu, rq);
             if (g_n_indexes >= g_max_indexes)
             {
                 free(tids);
                 return -1;
             }
 
-            IndexEntry *e = &g_indexes[g_n_indexes++];
+            IndexEntry *e = registry_new_slot();
             e->db_oid       = db_oid;
             e->index_oid    = index_oid;
             e->dim          = dim;
@@ -2033,7 +2060,7 @@ load_index(uint32_t db_oid, uint32_t index_oid)
         free(tids);
         return -2;  /* VRAM: index too large for any GPU budget */
     }
-    if (ensure_vram(needed, target_gpu, &t_reload_rej) != 0)
+    if (ensure_vram(needed, target_gpu, rq, &t_reload_rej) != 0)
     {
         AdmitLine al = {.op = "LOAD", .path = "reload", .algo = "cagra",
                         .gpu = target_gpu, .db = db_oid, .idx = index_oid, .dim = dim,
@@ -2071,7 +2098,7 @@ load_index(uint32_t db_oid, uint32_t index_oid)
      * under VRAM pressure; with spare VRAM but full slots it would not, leaving
      * an evicted index unable to return. */
     if (g_n_indexes >= g_max_indexes)
-        evict_lru(target_gpu);
+        (void) make_slot(target_gpu, rq);
     if (g_n_indexes >= g_max_indexes)
     {
         if (handle)       cuvs_cagra_free(handle, target_gpu);
@@ -2080,7 +2107,7 @@ load_index(uint32_t db_oid, uint32_t index_oid)
         return -1;
     }
 
-    IndexEntry *e = &g_indexes[g_n_indexes++];
+    IndexEntry *e = registry_new_slot();
     e->db_oid       = db_oid;
     e->index_oid    = index_oid;
     e->dim          = dim;
@@ -2109,6 +2136,14 @@ load_index(uint32_t db_oid, uint32_t index_oid)
     if (!e->ivfpq_handle) e->ivfpq_vram_bytes = 0;
     e->warmup_state = WARMUP_HOT;
     reset_entry_stats(e);
+    /* I3-B defect 3 (FACT-47): a reused slot must not carry the previous
+     * occupant's EXTEND/compact counters into the reloaded instance. */
+    e->n_extended      = 0;
+    e->compact_count   = 0;
+    e->last_compact_at = 0;
+    /* I-FC (ii): just loaded from the files. Only CAGRA single is ever saved
+     * by eviction; other kinds keep 0 (unused). */
+    e->file_current = handle != NULL;
 
     /* Restore staleness from the .stale sidecar so a daemon restart does not
      * silently resurrect a write-stale index as fresh. */
@@ -2133,67 +2168,174 @@ load_index(uint32_t db_oid, uint32_t index_oid)
     return 0;
 }
 
-/* Scan index_dir on startup and load all valid .cagra/.tids pairs. */
+/* I3-B usage stats file (UC-1 4c): beside the index files, a dot-name so
+ * cuvs_parse_index_filename, gc_orphans and the not_resident enumeration
+ * never see it as an index artifact. Written by the reclaim thread each
+ * tick (tmp + fsync + rename), read once at startup. */
+static void
+usage_stats_path(char *out, size_t outlen, int tmp)
+{
+    snprintf(out, outlen, "%s/.pg_cuvs_usage_stats%s", g_index_dir, tmp ? ".tmp" : "");
+}
+
+/* Read the previous run's usage stats. Returns the count, or -1 (missing,
+ * unreadable or corrupt: caller falls back to OID order) with why set. */
+static int
+usage_stats_load(CuvsUsageStat *out, int max, char *why, size_t whylen)
+{
+    char path[512];
+    usage_stats_path(path, sizeof(path), 0);
+    FILE *f = fopen(path, "rb");
+    if (!f)
+    {
+        snprintf(why, whylen, "no usage stats file");
+        return -1;
+    }
+    size_t cap = (size_t)CUVS_USAGE_STATS_MAX * 64 + 128, len = 0;
+    char *buf = malloc(cap);
+    if (!buf)
+    {
+        fclose(f);
+        snprintf(why, whylen, "out of memory");
+        return -1;
+    }
+    len = fread(buf, 1, cap, f);
+    int too_big = !feof(f);
+    fclose(f);
+    int n = 0;
+    if (too_big)
+    {
+        snprintf(why, whylen, "usage stats file too large");
+        free(buf);
+        return -1;
+    }
+    if (cuvs_usage_stats_parse(buf, len, out, max, &n, why, whylen) != 0)
+    {
+        free(buf);
+        return -1;
+    }
+    free(buf);
+    return n;
+}
+
+/* Load the keys of one startup pass in the C1 order (hot first from the
+ * usage stats, else (db, idx) ascending), never evicting (LOAD_STARTUP). */
+static void
+startup_load_ordered(CuvsLoadKey *keys, int n, const CuvsUsageStat *st,
+                     int n_st, int *loaded, int *skipped)
+{
+    if (n <= 0)
+        return;
+    int *perm = calloc((size_t)n, sizeof(int));
+    if (!perm)
+        return;
+    cuvs_startup_order(keys, n, st, n_st, perm);
+    for (int i = 0; i < n; i++)
+    {
+        const CuvsLoadKey *k = &keys[perm[i]];
+        if (find_index(k->db_oid, k->index_oid))
+            continue;
+        if (load_index(k->db_oid, k->index_oid, CUVS_RQ_LOAD_STARTUP) == 0)
+            (*loaded)++;
+        else
+        {
+            (*skipped)++;
+            LOG_INFO("[startup] %u/%u not loaded (no room without eviction or "
+                     "invalid files); first query reloads it\n",
+                     k->db_oid, k->index_oid);
+        }
+    }
+    free(perm);
+}
+
+/* Collect "<db>_<idx>.<ext>" keys of one pass. */
+static int
+startup_collect(const char *ext, CuvsLoadKey **keys_out)
+{
+    DIR *dir = opendir(g_index_dir);
+    int n = 0, cap = 64;
+    CuvsLoadKey *keys = malloc(sizeof(CuvsLoadKey) * (size_t)cap);
+    *keys_out = keys;
+    if (!dir || !keys)
+    {
+        if (dir) closedir(dir);
+        return 0;
+    }
+    struct dirent *ent;
+    while ((ent = readdir(dir)) != NULL)
+    {
+        uint32_t db_oid, index_oid;
+        int ok;
+        if (strcmp(ext, "cagra") == 0)
+            /* "<db_oid>_<index_oid>.cagra" only (rejects .tids and shard
+             * artifacts). See cuvs_parse_index_filename. */
+            ok = cuvs_parse_index_filename(ent->d_name, &db_oid, &index_oid) == 0;
+        else
+        {
+            char tail[16] = {0};
+            ok = sscanf(ent->d_name, "%u_%u.%15s", &db_oid, &index_oid, tail) == 3
+                 && strcmp(tail, ext) == 0;
+        }
+        if (!ok)
+            continue;
+        if (n == cap)
+        {
+            CuvsLoadKey *nk = realloc(keys, sizeof(CuvsLoadKey) * (size_t)cap * 2);
+            if (!nk)
+                break;
+            keys = nk;
+            cap *= 2;
+        }
+        keys[n].db_oid = db_oid;
+        keys[n].index_oid = index_oid;
+        n++;
+    }
+    closedir(dir);
+    *keys_out = keys;
+    return n;
+}
+
+/* Scan index_dir on startup and load valid indexes without evicting any
+ * (LOAD_STARTUP). The three passes keep their order (.cagra, .shards,
+ * .vectors); inside a pass the previous run's usage stats decide (hot
+ * first), else (db_oid, index_oid) ascending, so the resident set depends on
+ * the order key and capacity only, never on readdir order (CK-36 (e)). */
 static void
 startup_load_indexes(void)
 {
     mkdir(g_index_dir, 0700);
 
-    DIR *dir = opendir(g_index_dir);
-    if (!dir)
-        return;
+    CuvsUsageStat *st = NULL;
+    int n_st = -1;
+    char why[128] = "usage stats file disabled";
+    if (g_reclaim.usage_file)
+    {
+        st = calloc(CUVS_USAGE_STATS_MAX, sizeof(CuvsUsageStat));
+        if (st)
+            n_st = usage_stats_load(st, CUVS_USAGE_STATS_MAX, why, sizeof(why));
+    }
+    if (n_st >= 0)
+        LOG_INFO("[startup] load order: usage stats file (%d entries), hot first\n", n_st);
+    else
+        LOG_INFO("[startup] load order: (db_oid, index_oid) ascending (%s)\n", why);
 
+    /* Phase 3F: sharded indexes have no base "<db>_<idx>.cagra" — discover
+     * them via the ".shards" manifest. ADR-073: flat indexes have only
+     * ".vectors" + ".tids". load_index branches on the files present. */
+    static const char *passes[] = { "cagra", "shards", "vectors" };
+    int loaded = 0, skipped = 0;
+    for (int p = 0; p < 3; p++)
+    {
+        CuvsLoadKey *keys = NULL;
+        int n = startup_collect(passes[p], &keys);
+        startup_load_ordered(keys, n, st, n_st, &loaded, &skipped);
+        free(keys);
+    }
+    free(st);
+    LOG_INFO("[startup] loaded %d index(es), %d left not resident\n", loaded, skipped);
+
+    DIR *dir;
     struct dirent *ent;
-    while ((ent = readdir(dir)) != NULL)
-    {
-        uint32_t db_oid, index_oid;
-        /* Parse filenames of the form "<db_oid>_<index_oid>.cagra" (also
-         * rejects .tids files and Phase 3F shard artifacts). See
-         * cuvs_parse_index_filename. */
-        if (cuvs_parse_index_filename(ent->d_name, &db_oid, &index_oid) == 0)
-            load_index(db_oid, index_oid);
-    }
-    closedir(dir);
-
-    /* Phase 3F: sharded indexes have no base "<db>_<idx>.cagra" — discover them
-     * via the ".shards" manifest. load_index dedups against already-loaded
-     * entries and branches to the sharded path when the manifest is present. */
-    dir = opendir(g_index_dir);
-    if (dir)
-    {
-        while ((ent = readdir(dir)) != NULL)
-        {
-            uint32_t db_oid, index_oid;
-            char tail[16] = {0};
-            /* "<db>_<idx>.shards"; %15s after the dot must equal "shards". */
-            if (sscanf(ent->d_name, "%u_%u.%15s", &db_oid, &index_oid, tail) == 3
-                && strcmp(tail, "shards") == 0
-                && !find_index(db_oid, index_oid))
-                load_index(db_oid, index_oid);
-        }
-        closedir(dir);
-    }
-
-    /* ADR-073: flat indexes have a "<db>_<idx>.vectors" + ".tids" but NO ".cagra"
-     * and NO ".shards", so both passes above miss them and they would be
-     * unsearchable after a daemon restart. Discover them via the .vectors sidecar.
-     * Dedup against already-loaded entries (a cagra index also writes a .vectors
-     * sidecar; it is already loaded by the .cagra pass, and even if reloaded here
-     * load_index sees its .cagra and does NOT take the flat branch). */
-    dir = opendir(g_index_dir);
-    if (dir)
-    {
-        while ((ent = readdir(dir)) != NULL)
-        {
-            uint32_t db_oid, index_oid;
-            char tail[16] = {0};
-            if (sscanf(ent->d_name, "%u_%u.%15s", &db_oid, &index_oid, tail) == 3
-                && strcmp(tail, "vectors") == 0
-                && !find_index(db_oid, index_oid))
-                load_index(db_oid, index_oid);
-        }
-        closedir(dir);
-    }
 
     /* Phase 3D: second pass — for indexes that have a .relfilenode sidecar
      * but no local .cagra, register as COLD and enqueue background download.
@@ -2272,50 +2414,194 @@ entry_on_device(const IndexEntry *e, int device_id)
     return e->gpu_device_id == (uint32_t)device_id;
 }
 
-static IndexEntry *
-find_lru_index(int device_id)
+/* ----------------------------------------------------------------
+ * I3-B cache policy state (all under g_index_mutex unless noted).
+ * ---------------------------------------------------------------- */
+static CuvsReclaimParams g_reclaim;               /* flags + pg_cuvs_reclaim_set (tentative) */
+static char     g_reclaim_src[16][16];            /* per runtime knob: flag/function */
+static time_t   g_reclaim_changed_at[16];
+static CuvsAdmitLog g_admit_log;                  /* BUILD_* verdicts driving F */
+static uint64_t g_evict_by_reason[CUVS_MAX_GPUS][CUVS_EVICT__COUNT];
+static uint64_t g_cache_drops;                    /* DROP INDEX cleanups (not evictions) */
+static uint64_t g_reclaim_runs[CUVS_MAX_GPUS];
+static uint64_t g_reclaim_skip_sidecar[CUVS_MAX_GPUS];
+static time_t   g_last_reclaim_at[CUVS_MAX_GPUS];
+static CuvsReclaimTrigger g_last_reclaim_trigger[CUVS_MAX_GPUS];
+static CuvsFreeTarget g_reclaim_f[CUVS_MAX_GPUS];
+/* Provisional reason of the last ensure_vram reject (I3-A replaces this with
+ * its AR classifier; the reclaim F log only needs AR0/AR7 vs the rest). */
+static int      g_last_admit_reason = CUVS_ADMISSION_NONE;
+
+/* Eviction history (C8): survives the registry entry, dropped with DROP
+ * INDEX, bounded; oldest key dropped first (history_dropped). */
+#define CUVS_EVICT_HISTORY_MAX 65536
+typedef struct EvictHistory {
+    uint32_t db_oid, index_oid;
+    uint64_t evict_count;
+    time_t   last_evict_at;
+    int      last_evict_reason;      /* CuvsEvictReason, -1 none */
+    int      last_build_self_replace;/* -1 no build recorded */
+    uint64_t last_build_unloaded;
+    uint64_t seq;                    /* insertion order for eviction */
+} EvictHistory;
+static EvictHistory *g_evict_hist;
+static int      g_n_evict_hist;
+static uint64_t g_evict_hist_seq;
+static uint64_t g_history_dropped;
+
+static EvictHistory *
+evict_history(uint32_t db_oid, uint32_t index_oid, int create)
 {
-    IndexEntry *lru = NULL;
-    for (int i = 0; i < g_n_indexes; i++)
+    for (int i = 0; i < g_n_evict_hist; i++)
+        if (g_evict_hist[i].db_oid == db_oid && g_evict_hist[i].index_oid == index_oid)
+            return &g_evict_hist[i];
+    if (!create)
+        return NULL;
+    if (!g_evict_hist)
     {
-        IndexEntry *e = &g_indexes[i];
-        if (!e->valid)
-            continue;
-        /* Phase 3G.4: sharded indexes are evictable as a WHOLE UNIT, but never
-         * while a lock-free fanout is mid-flight on them (inflight>0) — that
-         * would free shard handles out from under the search. */
-        if (e->shard_count >= 2 && e->inflight > 0)
-            continue;
-        if (!entry_on_device(e, device_id))
-            continue;
-        if (!lru || e->last_search < lru->last_search)
-            lru = e;
+        g_evict_hist = calloc(CUVS_EVICT_HISTORY_MAX, sizeof(EvictHistory));
+        if (!g_evict_hist)
+            return NULL;
     }
-    return lru;
+    int slot = g_n_evict_hist;
+    if (g_n_evict_hist == CUVS_EVICT_HISTORY_MAX)
+    {
+        slot = 0;
+        for (int i = 1; i < g_n_evict_hist; i++)
+            if (g_evict_hist[i].seq < g_evict_hist[slot].seq)
+                slot = i;
+        g_history_dropped++;
+    }
+    else
+        g_n_evict_hist++;
+    EvictHistory *h = &g_evict_hist[slot];
+    memset(h, 0, sizeof(*h));
+    h->db_oid = db_oid;
+    h->index_oid = index_oid;
+    h->last_evict_reason = -1;
+    h->last_build_self_replace = -1;
+    h->seq = ++g_evict_hist_seq;
+    return h;
 }
 
-/* Evict the LRU index on a specific GPU to free VRAM. Returns bytes freed, or 0. */
-static size_t
-evict_lru(int device_id)
+static void
+evict_history_drop(uint32_t db_oid, uint32_t index_oid)
 {
-    IndexEntry *e = find_lru_index(device_id);
-    if (!e)
-        return 0;
+    EvictHistory *h = evict_history(db_oid, index_oid, 0);
+    if (!h)
+        return;
+    *h = g_evict_hist[--g_n_evict_hist];
+}
 
+/* Registry slot for a NEW entry: the slot may hold a shifted copy of another
+ * index, so per-index policy state must not leak (pin, in-use count). */
+static IndexEntry *
+registry_new_slot(void)
+{
+    IndexEntry *e = &g_indexes[g_n_indexes++];
+    e->pinned       = 0;
+    e->inflight     = 0;
+    e->file_current = 0;
+    e->hits         = 0;
+    e->last_search  = 0;
+    e->loaded_at    = time(NULL);
+    return e;
+}
+
+/* Bytes evicting `e` frees on device_id: the same terms as total_vram_used. */
+static size_t
+entry_bytes_on(const IndexEntry *e, int device_id)
+{
+    size_t b = 0;
+    if (e->shard_count >= 2)
+    {
+        for (int s = 0; s < e->shard_count; s++)
+            if (e->shards[s].valid &&
+                e->shards[s].gpu_device_id == (uint32_t)device_id)
+                b += e->shards[s].vram_bytes + e->shards[s].bf_vram_bytes;
+        return b;
+    }
+    if (e->gpu_device_id == (uint32_t)device_id)
+        b = e->vram_bytes + e->delta_vram_bytes + e->main_bf_vram_bytes;
+    return b;
+}
+
+/* EV-5 resident_bytes: registry only, build reservations excluded (R1). */
+static size_t
+resident_bytes(int device_id)
+{
+    size_t t = 0;
+    for (int i = 0; i < g_n_indexes; i++)
+        if (g_indexes[i].valid)
+            t += entry_bytes_on(&g_indexes[i], device_id);
+    return t;
+}
+
+/* Effective budget the reclaim fences use: min(logical budget, quota). */
+static size_t
+budget_eff_bytes(int device_id)
+{
+    size_t b = g_max_vram_per_gpu[device_id];
+    size_t q = g_rmm_pool_limits[device_id];
+    if (q > 0 && (b == 0 || q < b))
+        b = q;
+    return b;
+}
+
+static int
+entry_is_cagra_single(const IndexEntry *e)
+{
+    return e->shard_count < 2 && e->handle != NULL && !e->ivfpq_handle && !e->is_flat;
+}
+
+static CuvsEvictParams
+evict_params_now(void)
+{
+    CuvsEvictParams p = { g_reclaim.t_min_s, g_reclaim.bonus_s, g_reclaim.hits_cap };
+    return p;
+}
+
+static CuvsEvictCand
+entry_cand(const IndexEntry *e, int device_id)
+{
+    CuvsEvictCand c;
+    c.db_oid    = e->db_oid;
+    c.index_oid = e->index_oid;
+    c.last_use  = (int64_t)e->last_search;
+    c.loaded_at = (int64_t)e->loaded_at;
+    c.hits      = e->hits;
+    c.pinned    = e->pinned;
+    c.in_use    = e->inflight;
+    c.bytes     = entry_bytes_on(e, device_id);
+    return c;
+}
+
+/* Free `e` (index into g_indexes is compacted). Returns bytes freed on
+ * device_id, or 0 with *persist_failed = 1 when its save failed (the entry
+ * stays resident). Writes the [evict] line and the counters (EV-7). */
+static size_t
+evict_entry(IndexEntry *e, int device_id, CuvsEvictReason why, int self_replace,
+            CuvsRequester rq, int *persist_failed)
+{
+    CuvsEvictParams pp = evict_params_now();
+    CuvsEvictCand   c = entry_cand(e, device_id);
+    time_t now = time(NULL);
+    int eligible = cuvs_evict_eligible(&c, (int64_t)now, &pp);
+    int saved = 0;
+    uint32_t db = e->db_oid, idx = e->index_oid;
     size_t freed;
+
+    if (persist_failed)
+        *persist_failed = 0;
+    freed = entry_bytes_on(e, device_id);
+
     if (e->shard_count >= 2)
     {
         /* Sharded: every artifact (.tids/.shards/.sNNN.cagra/.delta/.tombstone)
          * is already durable on disk, so eviction needs no save — just free the
          * whole logical index (all shards across their GPUs) as a unit. A later
          * query reloads it from the .shards manifest. `freed` counts only this
-         * device's shards (what ensure_vram is trying to reclaim here); freeing
-         * also releases the index's shards on other GPUs (bonus). */
-        freed = 0;
-        for (int s = 0; s < e->shard_count; s++)
-            if (e->shards[s].valid &&
-                e->shards[s].gpu_device_id == (uint32_t)device_id)
-                freed += e->shards[s].vram_bytes;
+         * device's shards; freeing also releases the index's other shards. */
         free_delta_cache(e);
         free_main_bf_cache(e);
         free_index_shards(e);
@@ -2325,27 +2611,19 @@ evict_lru(int device_id)
     }
     else if (e->ivfpq_handle)
     {
-        /* 3P IVF-PQ: its `.ivfpq`/`.tids` sidecars are durable on disk, so
-         * eviction needs no save — a later query reloads via load_index (like
-         * the sharded path). save_index() assumes a CAGRA handle, but an IVF-PQ
-         * entry's `e->handle` is NULL — calling cuvs_cagra_serialize(NULL) here
-         * SEGV'd the daemon (ADR-070 — pre-existing; IVF-PQ was never evictable).
-         * The ivfpq_handle itself is freed by the shared cleanup below. */
+        /* 3P IVF-PQ: `.ivfpq`/`.tids` are durable on disk, so eviction needs
+         * no save (save_index assumes a CAGRA handle: ADR-070). The
+         * ivfpq_handle itself is freed by the shared cleanup below. */
         free_delta_cache(e);
         free_main_bf_cache(e);
         free(e->tids);
         free(e->rev_tids);     e->rev_tids     = NULL;
         free(e->rev_item_ids); e->rev_item_ids = NULL;
-        freed = e->vram_bytes;   /* IVF-PQ sets vram_bytes == ivfpq_vram_bytes */
     }
     else if (e->is_flat)
     {
-        /* ADR-073: flat's .tids + .vectors are durable on disk, so eviction needs
-         * no save — and MUST NOT call save_index (handle == NULL → it refuses,
-         * which would make the flat index un-evictable and pin VRAM). A later
-         * query reloads via load_index's flat branch and rebuilds the resident BF
-         * lazily. The only VRAM a flat entry holds is the resident main_bf_idx. */
-        freed = e->main_bf_vram_bytes;
+        /* ADR-073: flat's .tids + .vectors are durable on disk; MUST NOT call
+         * save_index (handle == NULL -> refuses -> un-evictable). */
         free_delta_cache(e);
         free_main_bf_cache(e);
         free(e->tids);
@@ -2354,12 +2632,21 @@ evict_lru(int device_id)
     }
     else
     {
-        if (save_index(e) != 0) {
-            LOG_ERROR("evict_lru: save_index FAILED for %u/%u on GPU %u; aborting eviction "
-                      "(VRAM still holds index)\n",
-                    e->db_oid, e->index_oid, e->gpu_device_id);
-            g_cache_persist_fail[device_id]++;
-            return 0;
+        /* I-FC (v6 C1 impact 3): the files already equal the graph only when
+         * file_current == 1; then the save is skipped. This is the ONLY place
+         * the skip is decided (SIGTERM always saves). */
+        if (!e->file_current)
+        {
+            if (save_index(e) != 0) {
+                LOG_ERROR("[evict] save_index FAILED for %u/%u on GPU %u; skipping victim "
+                          "(VRAM still holds index)\n",
+                        e->db_oid, e->index_oid, e->gpu_device_id);
+                g_cache_persist_fail[device_id]++;
+                if (persist_failed)
+                    *persist_failed = 1;
+                return 0;
+            }
+            saved = 1;
         }
         free_delta_cache(e);
         free_main_bf_cache(e);
@@ -2367,7 +2654,6 @@ evict_lru(int device_id)
         free(e->tids);
         free(e->rev_tids);     e->rev_tids     = NULL;
         free(e->rev_item_ids); e->rev_item_ids = NULL;
-        freed = e->vram_bytes;
     }
 
     /* Phase 3I-1: free CPU HNSW sidecar (RAM-only; no VRAM). */
@@ -2375,13 +2661,151 @@ evict_lru(int device_id)
     /* 3P: free IVF-PQ GPU index. */
     if (e->ivfpq_handle) { cuvs_ivfpq_free(e->ivfpq_handle, e->gpu_device_id); e->ivfpq_handle = NULL; }
 
-    int idx = (int)(e - g_indexes);
-    for (int i = idx; i < g_n_indexes - 1; i++)
+    LOG_INFO("[evict] gpu=%d db=%u idx=%u reason=%s requester=%s bytes=%zu "
+             "idle_s=%lld hits=%u protect_s=%lld eligible=%d saved=%d self_replace=%d\n",
+             device_id, db, idx, cuvs_evict_reason_name(why), cuvs_requester_name(rq),
+             freed, c.last_use ? (long long)(now - c.last_use) : -1LL, c.hits,
+             (long long)cuvs_evict_protect_s(c.hits, pp.t_min_s, pp.bonus_s, pp.hits_cap),
+             eligible, saved, self_replace);
+
+    int idx_pos = (int)(e - g_indexes);
+    for (int i = idx_pos; i < g_n_indexes - 1; i++)
         g_indexes[i] = g_indexes[i+1];
     g_n_indexes--;
 
     g_cache_evictions[device_id]++;
+    g_evict_by_reason[device_id][why]++;
+    {
+        EvictHistory *h = evict_history(db, idx, 1);
+        if (h)
+        {
+            h->evict_count++;
+            h->last_evict_at = now;
+            h->last_evict_reason = (int)why;
+        }
+    }
     return freed;
+}
+
+/* Keys a make-room pass must not pick again (their save failed). */
+typedef struct EvictSkip { uint32_t db_oid, index_oid; } EvictSkip;
+
+static int
+evict_skipped(const EvictSkip *sk, int n, const IndexEntry *e)
+{
+    for (int i = 0; i < n; i++)
+        if (sk[i].db_oid == e->db_oid && sk[i].index_oid == e->index_oid)
+            return 1;
+    return 0;
+}
+
+/*
+ * Free `need` bytes on device_id for requester rq under the C1 RQ table:
+ * one pre-summed pick (nothing evicted on a reject), then victims in order.
+ * A victim whose save fails is skipped and the pick is redone for the
+ * remainder (EV-3/EV-4 save-failure rule). slot_mode treats every entry as
+ * 1 "byte" so the same rules choose a registry slot (reason `slot`).
+ * Returns 0 when satisfied, -1 otherwise; *pick_out gets the last pick.
+ */
+static int
+make_room(int device_id, CuvsRequester rq, uint64_t need, int slot_mode,
+          CuvsEvictPick *pick_out)
+{
+    EvictSkip skip[64];
+    int n_skip = 0;
+    CuvsEvictPick dummy;
+    if (!pick_out)
+        pick_out = &dummy;
+    memset(pick_out, 0, sizeof(*pick_out));
+
+    for (int round = 0; round < 64 && need > 0; round++)
+    {
+        int n = 0;
+        CuvsEvictCand *cands = calloc((size_t)(g_n_indexes > 0 ? g_n_indexes : 1), sizeof(CuvsEvictCand));
+        int *victims = calloc((size_t)(g_n_indexes > 0 ? g_n_indexes : 1), sizeof(int));
+        CuvsEvictReason *reasons = calloc((size_t)(g_n_indexes > 0 ? g_n_indexes : 1), sizeof(CuvsEvictReason));
+        EvictSkip *keys = calloc((size_t)(g_n_indexes > 0 ? g_n_indexes : 1), sizeof(EvictSkip));
+        if (!cands || !victims || !reasons || !keys)
+        {
+            free(cands); free(victims); free(reasons); free(keys);
+            return -1;
+        }
+        for (int i = 0; i < g_n_indexes; i++)
+        {
+            IndexEntry *e = &g_indexes[i];
+            if (!e->valid || !entry_on_device(e, device_id) || evict_skipped(skip, n_skip, e))
+                continue;
+            cands[n] = entry_cand(e, device_id);
+            if (slot_mode)
+                cands[n].bytes = 1;
+            keys[n].db_oid = e->db_oid;
+            keys[n].index_oid = e->index_oid;
+            n++;
+        }
+        CuvsEvictRequest req;
+        memset(&req, 0, sizeof(req));
+        req.rq = rq;
+        req.scope = g_reclaim.scope;
+        req.soft_evict = g_reclaim.soft_evict;
+        req.need = need;
+        req.now = (int64_t)time(NULL);
+        CuvsEvictParams pp = evict_params_now();
+        cuvs_evict_pick(cands, n, &pp, &req, victims, reasons, pick_out);
+        if (pick_out->verdict != CUVS_EVICT_OK)
+        {
+            free(cands); free(victims); free(reasons); free(keys);
+            return -1;
+        }
+        int failed = 0;
+        for (int v = 0; v < pick_out->n_victims; v++)
+        {
+            EvictSkip k = keys[victims[v]];
+            IndexEntry *e = find_index(k.db_oid, k.index_oid);
+            int pf = 0;
+            if (!e)
+                continue;
+            CuvsEvictReason why = reasons[v];
+            if (slot_mode && why != CUVS_EVICT_SOFT)
+                why = CUVS_EVICT_SLOT;
+            uint64_t unit = slot_mode ? 1 : cands[victims[v]].bytes;
+            if (evict_entry(e, device_id, why, 0, rq, &pf) == 0 && pf)
+            {
+                if (n_skip < 64)
+                    skip[n_skip++] = k;
+                failed = 1;
+                continue;
+            }
+            need = unit >= need ? 0 : need - unit;
+        }
+        free(cands); free(victims); free(reasons); free(keys);
+        if (!failed)
+            return need == 0 ? 0 : -1;
+    }
+    return need == 0 ? 0 : -1;
+}
+
+/* Registry slot cap (soft LRU working-set cap). Returns 1 if a slot is free
+ * afterwards. BUILD_* with scope none never evicts (registry-full fallback). */
+static int
+make_slot(int device_id, CuvsRequester rq)
+{
+    if (g_n_indexes < g_max_indexes)
+        return 1;
+    (void) make_room(device_id, rq, 1, 1, NULL);
+    return g_n_indexes < g_max_indexes;
+}
+
+/* Evict one victim the rules allow for rq on device_id; bytes freed or 0.
+ * Kept for the post-admission OOM retry loops I3-A removes: with build
+ * scope none it frees nothing, so those loops no longer evict residents. */
+static size_t
+evict_lru(int device_id, CuvsRequester rq)
+{
+    size_t before = resident_bytes(device_id);
+    if (make_room(device_id, rq, 1, 0, NULL) != 0)
+        return 0;
+    size_t after = resident_bytes(device_id);
+    return before > after ? before - after : 0;
 }
 
 /* Call under g_index_mutex, immediately after successful admission and before
@@ -2402,61 +2826,180 @@ release_build_vram(size_t needed, int device_id)
         g_pending_rmm_build_vram[device_id] -= needed;
 }
 
-/* Ensure there is enough VRAM on `device_id` for `needed` bytes. On -1 the
- * C5 reason and fields are written to *rej when non-NULL (FACT-3 order):
- * AR1 quota minus pending, AR2 free while another build is pending, AR3
- * logical budget after LRU eviction, AR4 free after LRU eviction.
- * t_admit_evicted counts the evictions this call made. */
+/* Map a failed pick to the provisional reject reason (I3-A owns the final
+ * AR classifier and the err_out payload). */
 static int
-ensure_vram(size_t needed, int device_id, CuvsAdmissionFields *rej)
+pick_reason(const CuvsEvictPick *pk, int physical_phase)
 {
+    if (pk->verdict == CUVS_EVICT_AR5)
+        return CUVS_ADMISSION_AR5;
+    return physical_phase ? CUVS_ADMISSION_AR4 : CUVS_ADMISSION_AR3;
+}
+
+/* Ensure there is enough VRAM on `device_id` for `needed` bytes, evicting
+ * only what the requester's rules allow (v6 C1 RQ table). The requester is
+ * mandatory: a caller that omits it does not compile (CK-36 (a)). */
+static int
+ensure_vram(size_t needed, int device_id, CuvsRequester rq, CuvsAdmissionFields *rej)
+{
+    t_admit_evicted = 0;
     size_t budget = g_max_vram_per_gpu[device_id];
     size_t quota = g_rmm_pool_limits[device_id];
     size_t pending = quota > 0 ? g_pending_rmm_build_vram[device_id] : 0;
-    CuvsAdmissionReason reason = CUVS_ADMISSION_NONE;
+    size_t beff = budget_eff_bytes(device_id);
+    /* UC-1 6b / r18 B-9: a reload softly evicts even when another build's
+     * pending reservation is what makes it short. */
+    int soft_load = (rq == CUVS_RQ_LOAD || rq == CUVS_RQ_LOAD_SHARD) &&
+                    g_reclaim.soft_evict;
+    CuvsEvictPick pk;
 
-    t_admit_evicted = 0;
+    g_last_admit_reason = CUVS_ADMISSION_NONE;
+    /* Cannot fit in any state: evict nothing (AR0). */
+    if (beff > 0 && needed > beff)
+    {
+        g_last_admit_reason = CUVS_ADMISSION_AR0;
+        goto admission_rejected;
+    }
     /* Reject impossible concurrent reservations before touching healthy LRUs.
      * Allocation may already reflect part of pending: retaining it until the
      * build returns deliberately makes admission conservative, never looser. */
     if (quota > 0 && (pending > quota || needed > quota - pending))
-        reason = CUVS_ADMISSION_AR1;
-    else if (pending > 0 && needed > gpu_free_vram_bytes(device_id))
-        reason = CUVS_ADMISSION_AR2;
-    else if (budget > 0 && total_vram_used(device_id) + needed > budget)
     {
-        while (g_n_indexes > 0 && total_vram_used(device_id) + needed > budget)
+        g_last_admit_reason = CUVS_ADMISSION_AR1;
+        goto admission_rejected;
+    }
+    if (pending > 0)
+    {
+        size_t fr = gpu_free_vram_bytes(device_id);
+        if (needed > fr)
         {
-            if (evict_lru(device_id) == 0)
-                break;
-            t_admit_evicted++;
+            if (!soft_load || make_room(device_id, rq, needed - fr, 0, &pk) != 0 ||
+                needed > gpu_free_vram_bytes(device_id))
+            {
+                g_last_admit_reason = soft_load ? pick_reason(&pk, 1) : CUVS_ADMISSION_AR2;
+                goto admission_rejected;
+            }
         }
-
-        if (total_vram_used(device_id) + needed > budget)
-            reason = CUVS_ADMISSION_AR3;
+    }
+    if (budget > 0 && total_vram_used(device_id) + needed > budget)
+    {
+        uint64_t shortfall = total_vram_used(device_id) + needed - budget;
+        if (make_room(device_id, rq, shortfall, 0, &pk) != 0 ||
+            total_vram_used(device_id) + needed > budget)
+        {
+            g_last_admit_reason = pick_reason(&pk, 0);
+            goto admission_rejected;
+        }
     }
 
-    if (reason == CUVS_ADMISSION_NONE)
+    size_t free_vram = gpu_free_vram_bytes(device_id);
+    /* An unlocked builder can allocate between observations. Do not evict on
+     * that transient reservation pressure (except a soft reload, above). */
+    if (needed > free_vram && (pending == 0 || soft_load))
     {
-        size_t free_vram = gpu_free_vram_bytes(device_id);
-        /* An unlocked builder can allocate between observations. Do not evict on
-         * that transient reservation pressure; the caller can retry later. */
-        while (pending == 0 && g_n_indexes > 0 && needed > free_vram)
-        {
-            if (evict_lru(device_id) == 0)
-                break;
-            t_admit_evicted++;
-            free_vram = gpu_free_vram_bytes(device_id);
-        }
-        if (needed > free_vram)
-            reason = CUVS_ADMISSION_AR4;
+        memset(&pk, 0, sizeof(pk));
+        (void) make_room(device_id, rq, needed - free_vram, 0, &pk);
+        free_vram = gpu_free_vram_bytes(device_id);
     }
-
-    if (reason == CUVS_ADMISSION_NONE)
+    if (needed <= free_vram)
         return 0;
+    g_last_admit_reason = pick_reason(&pk, 1);
+    goto admission_rejected;
+admission_rejected:
     if (rej)
-        admission_fill(rej, reason, needed, device_id);
+        admission_fill(rej, (CuvsAdmissionReason) g_last_admit_reason,
+                       needed, device_id);
     return -1;
+}
+
+/* NOTICE text for REINDEX self-replace (decision UC-1 2a, exact wording).
+ * Delivered through I3-A's notice_out; until that lands it is logged. */
+static __thread char g_build_notice[512];
+
+/*
+ * BUILD_CAGRA admission with REINDEX self-replace (UC-1 2a, KB-26): when the
+ * build does not fit, the same (db, index) resident copy on this GPU counts
+ * as free (self_free) if it is not pinned or in use; the copy is then
+ * unloaded (saved first unless file_current) and the build admitted. Other
+ * indexes are never evicted by this path. *unloaded = bytes freed (0 = no
+ * self-replace).
+ */
+static int
+admit_build_cagra(size_t needed, int device_id, uint32_t db_oid,
+                  uint32_t index_oid, uint64_t *unloaded)
+{
+    *unloaded = 0;
+    g_build_notice[0] = '\0';
+    if (ensure_vram(needed, device_id, CUVS_RQ_BUILD_CAGRA, NULL) == 0)
+        return 0;
+    int reason = g_last_admit_reason;
+    IndexEntry *old = find_index(db_oid, index_oid);
+    int has_old = old && old->valid && entry_on_device(old, device_id) &&
+                  old->inflight == 0;
+    uint64_t old_bytes = has_old ? entry_bytes_on(old, device_id) : 0;
+
+    /* Shortfall without the old copy, under the same three checks as
+     * ensure_vram (quota/pending are unaffected by residents). */
+    size_t budget = g_max_vram_per_gpu[device_id];
+    size_t used = total_vram_used(device_id);
+    size_t fr = gpu_free_vram_bytes(device_id);
+    uint64_t shortfall = 0;
+    if (budget > 0 && used + needed > budget)
+        shortfall = used + needed - budget;
+    if (needed > fr && needed - fr > shortfall)
+        shortfall = needed - fr;
+    if (reason == CUVS_ADMISSION_AR0 || reason == CUVS_ADMISSION_AR1 ||
+        reason == CUVS_ADMISSION_AR2 ||
+        cuvs_self_replace_decide(shortfall, has_old, has_old && old->pinned,
+                                 old_bytes, g_reclaim.self_replace)
+            != CUVS_SELF_REPLACE)
+    {
+        g_last_admit_reason = reason;
+        return -1;
+    }
+    int pf = 0;
+    size_t freed = evict_entry(old, device_id, CUVS_EVICT_ADMIT_BUILD, 1,
+                               CUVS_RQ_BUILD_CAGRA, &pf);
+    if (pf)
+    {
+        g_last_admit_reason = reason;
+        return -1;
+    }
+    *unloaded = freed;
+    snprintf(g_build_notice, sizeof(g_build_notice),
+             "pg_cuvs: previous resident copy of index %u unloaded from GPU to make room "
+             "for the rebuild|GPU memory was insufficient for both copies (need %zu, free "
+             "%zu). Queries on this index use the CPU path or reload the old copy until the "
+             "new index is resident",
+             index_oid, needed, budget > 0 && budget > used ? budget - used : fr);
+    LOG_INFO("[self_replace] db=%u idx=%u unloaded=%zu notice=\"%s\"\n",
+             db_oid, index_oid, freed, g_build_notice);
+    return ensure_vram(needed, device_id, CUVS_RQ_BUILD_CAGRA, NULL);
+}
+
+/* Record a BUILD_* verdict for the reclaim free target F (fences F-1, F-3)
+ * and the last-build receipt fields. Caller holds g_index_mutex. */
+static void
+note_build_admission(uint32_t db_oid, uint32_t index_oid, size_t needed,
+                     int device_id, int admitted, uint64_t self_unloaded)
+{
+    CuvsAdmitRecord r;
+    r.db_oid = db_oid;
+    r.index_oid = index_oid;
+    r.needed = needed;
+    r.reason = admitted ? CUVS_ADMISSION_NONE : g_last_admit_reason;
+    r.gpu = device_id;
+    r.at = (int64_t)time(NULL);
+    cuvs_admit_log_add(&g_admit_log, &r);
+    if (admitted)
+    {
+        EvictHistory *h = evict_history(db_oid, index_oid, 1);
+        if (h)
+        {
+            h->last_build_self_replace = self_unloaded > 0;
+            h->last_build_unloaded = self_unloaded;
+        }
+    }
 }
 
 /* ----------------------------------------------------------------
@@ -2830,7 +3373,7 @@ handle_search_stream_bf(int client_fd, const CuvsCmdFrame *cmd)
     pthread_mutex_lock(&g_index_mutex);
 
     IndexEntry *e = find_index(cmd->db_oid, cmd->index_oid);
-    if (!e && load_index(cmd->db_oid, cmd->index_oid) == 0)
+    if (!e && load_index(cmd->db_oid, cmd->index_oid, CUVS_RQ_LOAD) == 0)
         e = find_index(cmd->db_oid, cmd->index_oid);
     if (!e)
     {
@@ -3234,7 +3777,7 @@ handle_search(int client_fd, const CuvsCmdFrame *cmd)
     }
     else
     {
-        int load_rc = load_index(cmd->db_oid, cmd->index_oid);
+        int load_rc = load_index(cmd->db_oid, cmd->index_oid, CUVS_RQ_LOAD);
         if (load_rc == 0)
         {
             e = find_index(cmd->db_oid, cmd->index_oid);
@@ -4475,7 +5018,7 @@ handle_search_batch(int client_fd, const CuvsCmdFrame *cmd)
     }
     else
     {
-        int load_rc = load_index(cmd->db_oid, cmd->index_oid);
+        int load_rc = load_index(cmd->db_oid, cmd->index_oid, CUVS_RQ_LOAD);
         if (load_rc == 0)
             e = find_index(cmd->db_oid, cmd->index_oid);
         if (!e)
@@ -5132,7 +5675,7 @@ build_sharded(int client_fd, const CuvsCmdFrame *cmd, const char *index_dir,
                                                         cmd->intermediate_graph_degree,
                                                         cmd->build_algo)};
         al.pending_before = g_pending_rmm_build_vram[dev];
-        if (ensure_vram(needed, dev, NULL) != 0)
+        if (ensure_vram(needed, dev, CUVS_RQ_BUILD_SHARD, NULL) != 0)
         {
             int alt = pick_gpu_for_index(needed);
             al.gpu = alt;
@@ -5140,8 +5683,10 @@ build_sharded(int client_fd, const CuvsCmdFrame *cmd, const char *index_dir,
                 admission_fill(&shard_rej, CUVS_ADMISSION_AR0, needed, -1);
             else
                 al.pending_before = g_pending_rmm_build_vram[alt];
-            if (alt < 0 || ensure_vram(needed, alt, &shard_rej) != 0)
+            if (alt < 0 || ensure_vram(needed, alt, CUVS_RQ_BUILD_SHARD, &shard_rej) != 0)
             {
+                note_build_admission(cmd->db_oid, cmd->index_oid, needed,
+                                     alt >= 0 ? alt : dev, 0, 0);
                 LOG_WARN("[build_sharded] shard %d (%lld vecs) won't fit on any GPU\n",
                          i, (long long)shard_n);
                 log_admit(&al, shard_rej.reason);
@@ -5379,7 +5924,7 @@ build_sharded(int client_fd, const CuvsCmdFrame *cmd, const char *index_dir,
     else
     {
         if (g_n_indexes >= g_max_indexes)
-            evict_lru(usable_gpu(0));
+            (void) make_slot(usable_gpu(0), CUVS_RQ_BUILD_SHARD);
         if (g_n_indexes >= g_max_indexes)
         {
             /* Registry full but artifacts are durable on disk: a later search
@@ -5395,7 +5940,7 @@ build_sharded(int client_fd, const CuvsCmdFrame *cmd, const char *index_dir,
             send_all(client_fd, &hdr_ok, sizeof(hdr_ok));
             return;
         }
-        e = &g_indexes[g_n_indexes++];
+        e = registry_new_slot();
         memset(e, 0, sizeof(*e));
     }
 
@@ -5693,7 +6238,15 @@ handle_build(int client_fd, const CuvsCmdFrame *cmd)
     }
     al.gpu = target_gpu;
     al.pending_before = g_pending_rmm_build_vram[target_gpu];
-    if (ensure_vram(needed, target_gpu, &rej) < 0)
+    uint64_t self_unloaded = 0;
+    int admit_rc = admit_build_cagra(needed, target_gpu, cmd->db_oid, cmd->index_oid,
+                                     &self_unloaded);
+    note_build_admission(cmd->db_oid, cmd->index_oid, needed, target_gpu,
+                         admit_rc == 0, self_unloaded);
+    if (admit_rc < 0)
+        admission_fill(&rej, (CuvsAdmissionReason)g_last_admit_reason,
+                       needed, target_gpu);
+    if (admit_rc < 0)
     {
         char legacy[128];
         LOG_WARN("[handle_build] VRAM exhausted on GPU %d for %u/%u "
@@ -6022,13 +6575,14 @@ finish_build_commit(int client_fd, const CuvsCmdFrame *cmd, const char *save_dir
         reset_entry_stats(existing);   /* fresh index instance */
         existing->graph_degree = (int)cmd->graph_degree;  /* for extend/compact VRAM est */
         existing->n_extended = 0;      /* REINDEX resets the extend counter */
+        existing->file_current = 1;    /* I-FC (i): build saved its files first */
         existing->compact_count++;     /* every rebuild counts as a compaction */
         existing->last_compact_at = time(NULL);
         build_rev_tid_map(existing);   /* rebuild map for new tids/n_vecs */
     } else {
         int registry_full;
         if (g_n_indexes >= g_max_indexes)
-            evict_lru(target_gpu);
+            (void) make_slot(target_gpu, CUVS_RQ_BUILD_CAGRA);
         registry_full = g_n_indexes >= g_max_indexes;
 #ifdef CUVS_TEST_HOOKS
         registry_full |= cuvs_fault("CUVS_FAULT_REGISTRY_FULL");
@@ -6055,7 +6609,7 @@ finish_build_commit(int client_fd, const CuvsCmdFrame *cmd, const char *save_dir
             send_all(client_fd, &hdr_ok, sizeof(hdr_ok));
             return;
         }
-        IndexEntry *e = &g_indexes[g_n_indexes++];
+        IndexEntry *e = registry_new_slot();
         e->db_oid      = cmd->db_oid;
         e->index_oid   = cmd->index_oid;
         e->dim         = cmd->dim;
@@ -6096,6 +6650,7 @@ finish_build_commit(int client_fd, const CuvsCmdFrame *cmd, const char *save_dir
         build_rev_tid_map(e);
         reset_entry_stats(e);
         e->graph_degree = (int)cmd->graph_degree;  /* for extend/compact VRAM est */
+        e->file_current = 1;    /* I-FC (i): build saved its files first */
     }
 
     pthread_mutex_unlock(&g_index_mutex);
@@ -6384,7 +6939,15 @@ handle_build_multi(int client_fd, const CuvsCmdFrame *cmd, const char *index_dir
             goto fail;
         }
         al.pending_before = g_pending_rmm_build_vram[target_gpu];
-        if (ensure_vram(needed, target_gpu, &rej) < 0)
+        uint64_t self_unloaded = 0;
+        int admit_rc = admit_build_cagra(needed, target_gpu, cmd->db_oid,
+                                         cmd->index_oid, &self_unloaded);
+        note_build_admission(cmd->db_oid, cmd->index_oid, needed, target_gpu,
+                             admit_rc == 0, self_unloaded);
+        if (admit_rc < 0)
+            admission_fill(&rej, (CuvsAdmissionReason)g_last_admit_reason,
+                           needed, target_gpu);
+        if (admit_rc < 0)
         {
             rej_set = 1;
             log_admit(&al, rej.reason);
@@ -6705,7 +7268,9 @@ handle_drop(int client_fd, const CuvsCmdFrame *cmd)
         for (int i = slot; i < g_n_indexes - 1; i++)
             g_indexes[i] = g_indexes[i + 1];
         g_n_indexes--;
+        g_cache_drops++;   /* EV-7: DROP cleanup is not a policy eviction */
     }
+    evict_history_drop(db, idx);   /* C8: history goes with the index */
 
     /* Drop a cold-registry entry too (Phase 3D), if present. */
     for (int i = 0; i < g_n_cold_indexes; i++)
@@ -7421,7 +7986,7 @@ handle_build_flat(int client_fd, const CuvsCmdFrame *cmd)
         else
         {
             if (g_n_indexes >= g_max_indexes)
-                evict_lru(fgpu);
+                (void) make_slot(fgpu, CUVS_RQ_BUILD_FLAT);
             if (g_n_indexes >= g_max_indexes)
             {
                 /* Soft cap: artifacts durable on disk; reload on demand. */
@@ -7434,7 +7999,7 @@ handle_build_flat(int client_fd, const CuvsCmdFrame *cmd)
                 send_all(client_fd, &hdr_ok, sizeof(hdr_ok));
                 return;
             }
-            IndexEntry *e = &g_indexes[g_n_indexes++];
+            IndexEntry *e = registry_new_slot();
             e->db_oid          = cmd->db_oid;
             e->index_oid       = cmd->index_oid;
             e->dim             = cmd->dim;
@@ -7560,7 +8125,10 @@ handle_build_ivfpq(int client_fd, const CuvsCmdFrame *cmd)
     }
     al.gpu = target_gpu;
     al.pending_before = g_pending_rmm_build_vram[target_gpu];
-    if (ensure_vram(needed, target_gpu, &rej) < 0)
+    int admit_rc = ensure_vram(needed, target_gpu, CUVS_RQ_BUILD_IVFPQ, &rej);
+    note_build_admission(cmd->db_oid, cmd->index_oid, needed, target_gpu,
+                         admit_rc == 0, 0);
+    if (admit_rc < 0)
     {
         char legacy[128];
         log_admit(&al, rej.reason);
@@ -7677,7 +8245,7 @@ handle_build_ivfpq(int client_fd, const CuvsCmdFrame *cmd)
         else
         {
             if (g_n_indexes >= g_max_indexes)
-                evict_lru(target_gpu);
+                (void) make_slot(target_gpu, CUVS_RQ_BUILD_IVFPQ);
             if (g_n_indexes >= g_max_indexes)
             {
                 /* Soft cap: artifacts durable on disk, defer to reload-on-demand
@@ -7694,7 +8262,7 @@ handle_build_ivfpq(int client_fd, const CuvsCmdFrame *cmd)
                 }
                 return;
             }
-            IndexEntry *e = &g_indexes[g_n_indexes++];
+            IndexEntry *e = registry_new_slot();
             e->db_oid          = cmd->db_oid;
             e->index_oid       = cmd->index_oid;
             e->dim             = cmd->dim;
@@ -7722,6 +8290,9 @@ handle_build_ivfpq(int client_fd, const CuvsCmdFrame *cmd)
             e->warmup_state    = WARMUP_HOT;
             e->last_search_mode = 5; /* ivfpq */
             reset_entry_stats(e);
+            e->n_extended      = 0;   /* I3-B defect 3: reused slot */
+            e->compact_count   = 0;
+            e->last_compact_at = 0;
             build_rev_tid_map(e);
         }
     }
@@ -7759,7 +8330,7 @@ handle_search_ivfpq(int client_fd, const CuvsCmdFrame *cmd)
     IndexEntry *e = find_index(cmd->db_oid, cmd->index_oid);
     if (!e)
     {
-        int load_rc = load_index(cmd->db_oid, cmd->index_oid);
+        int load_rc = load_index(cmd->db_oid, cmd->index_oid, CUVS_RQ_LOAD);
         if (load_rc == 0)
             e = find_index(cmd->db_oid, cmd->index_oid);
     }
@@ -8027,6 +8598,7 @@ handle_extend(int client_fd, const CuvsCmdFrame *cmd)
 
     e->n_vecs     += n_new;
     e->n_extended += n_new;
+    e->file_current = 0;   /* I-FC (1): graph now differs from the files */
     e->vram_bytes  = estimate_vram_bytes(e->n_vecs, (int)e->dim, e->graph_degree);
 
     /* Rebuild rev_tids to include new item_ids (needed for 3O prefilter). */
@@ -8215,6 +8787,7 @@ handle_compact(int client_fd, const CuvsCmdFrame *cmd)
     free(e->tids);
     e->tids = new_tids;
     e->n_vecs      = new_n;
+    e->file_current = 0;   /* I-FC: merged in memory; save_index sets 1 */
     e->n_extended       = 0;
     e->compact_count++;
     e->last_compact_at  = time(NULL);
@@ -8652,6 +9225,666 @@ handle_build_hnsw_file(int client_fd, const CuvsCmdFrame *cmd)
 /* ----------------------------------------------------------------
  * Per-connection thread
  * ---------------------------------------------------------------- */
+/* ----------------------------------------------------------------
+ * I3-B: manual cache ops, status text, reclaim thread (v6 C7, C8, EV-5)
+ * ---------------------------------------------------------------- */
+
+/* A text buffer for the status ops. */
+typedef struct TextBuf { char *p; size_t len, cap; int oom; } TextBuf;
+
+static void
+tb_printf(TextBuf *b, const char *fmt, ...)
+{
+    va_list ap;
+    if (b->oom)
+        return;
+    for (;;)
+    {
+        size_t room = b->cap - b->len;
+        va_start(ap, fmt);
+        int w = vsnprintf(b->p ? b->p + b->len : NULL, b->p ? room : 0, fmt, ap);
+        va_end(ap);
+        if (w < 0) { b->oom = 1; return; }
+        if (b->p && (size_t)w < room) { b->len += (size_t)w; return; }
+        size_t ncap = b->cap ? b->cap * 2 : 4096;
+        while (ncap - b->len <= (size_t)w)
+            ncap *= 2;
+        if (ncap > CUVS_IPC_TEXT_MAX + 1) { b->oom = 1; return; }
+        char *np = realloc(b->p, ncap);
+        if (!np) { b->oom = 1; return; }
+        b->p = np;
+        b->cap = ncap;
+    }
+}
+
+static void
+send_text(int client_fd, TextBuf *b)
+{
+    CuvsReplyHeader hdr = {0};
+    if (b->oom)
+    {
+        hdr.status = CUVS_STATUS_ERROR;
+        snprintf(hdr.error, sizeof(hdr.error), "status text too large");
+        send_all(client_fd, &hdr, sizeof(hdr));
+    }
+    else
+    {
+        hdr.status = CUVS_STATUS_OK;
+        hdr.n_results = (uint32_t)b->len;
+        send_all(client_fd, &hdr, sizeof(hdr));
+        if (b->len)
+            send_all(client_fd, b->p, b->len);
+    }
+    free(b->p);
+}
+
+static void
+reply_msg(int client_fd, int status, const char *fmt, ...)
+{
+    CuvsReplyHeader hdr = {0};
+    va_list ap;
+    hdr.status = (uint32_t)status;
+    va_start(ap, fmt);
+    vsnprintf(hdr.error, sizeof(hdr.error), fmt, ap);
+    va_end(ap);
+    send_all(client_fd, &hdr, sizeof(hdr));
+}
+
+/* GPU an entry is accounted on for single-GPU purposes (sharded: shard 0). */
+static int
+entry_home_gpu(const IndexEntry *e)
+{
+    if (e->shard_count >= 2 && e->shards)
+        return (int)e->shards[0].gpu_device_id;
+    return (int)e->gpu_device_id;
+}
+
+static size_t
+entry_total_bytes(const IndexEntry *e)
+{
+    size_t t = 0;
+    for (int i = 0; i < n_usable_gpus(); i++)
+        t += entry_bytes_on(e, usable_gpu(i));
+    return t;
+}
+
+static const char *k_unload_warning =
+    "unloaded; warning: delta or tombstone file present, GPU path switches to "
+    "CPU replan until REINDEX";
+
+static void
+handle_manual(int client_fd, const CuvsCmdFrame *cmd)
+{
+    uint32_t db = cmd->db_oid, idx = cmd->index_oid;
+    pthread_mutex_lock(&g_index_mutex);
+    IndexEntry *e = find_index(db, idx);
+
+    switch (cmd->op)
+    {
+        case CUVS_OP_UNLOAD:
+        {
+            if (!e)
+            {
+                pthread_mutex_unlock(&g_index_mutex);
+                reply_msg(client_fd, CUVS_STATUS_OK, "not resident");
+                return;
+            }
+            if (e->pinned)
+            {
+                pthread_mutex_unlock(&g_index_mutex);
+                reply_msg(client_fd, CUVS_STATUS_ERROR,
+                          "pinned: run pg_cuvs_unpin first");
+                return;
+            }
+            if (e->inflight > 0)
+            {
+                pthread_mutex_unlock(&g_index_mutex);
+                reply_msg(client_fd, CUVS_STATUS_ERROR,
+                          "in use: retry after current queries finish");
+                return;
+            }
+            /* Warn when this save rewrites .tids under a delta/tombstone
+             * sidecar of a CAGRA index that changed since it was saved. */
+            int warn = entry_is_cagra_single(e) && !e->file_current &&
+                       cuvs_entry_sidecar_kind(g_index_dir, db, idx) != CUVS_SIDECAR_NONE;
+            int pf = 0;
+            (void) evict_entry(e, entry_home_gpu(e), CUVS_EVICT_MANUAL_UNLOAD, 0,
+                               CUVS_RQ_MANUAL, &pf);
+            pthread_mutex_unlock(&g_index_mutex);
+            if (pf)
+                reply_msg(client_fd, CUVS_STATUS_ERROR,
+                          "save failed: index stays resident (see daemon log)");
+            else
+                reply_msg(client_fd, CUVS_STATUS_OK, "%s",
+                          warn ? k_unload_warning : "unloaded");
+            return;
+        }
+        case CUVS_OP_LOAD:
+        case CUVS_OP_PIN:
+        {
+            int loaded_now = 0;
+            if (!e)
+            {
+                if (load_index(db, idx, CUVS_RQ_LOAD) != 0)
+                {
+                    int r = g_last_admit_reason;
+                    pthread_mutex_unlock(&g_index_mutex);
+                    if (r == CUVS_ADMISSION_AR5)
+                        reply_msg(client_fd, CUVS_STATUS_ERROR,
+                                  "not loaded: only pinned or in-use indexes could make room");
+                    else if (r == CUVS_ADMISSION_NONE)
+                        reply_msg(client_fd, CUVS_STATUS_ERROR,
+                                  "not loaded: no usable index files for %u/%u", db, idx);
+                    else
+                        reply_msg(client_fd, CUVS_STATUS_ERROR,
+                                  "not loaded: GPU memory is insufficient even after "
+                                  "unloading every unpinned index");
+                    return;
+                }
+                loaded_now = 1;
+                e = find_index(db, idx);
+            }
+            if (cmd->op == CUVS_OP_LOAD)
+            {
+                pthread_mutex_unlock(&g_index_mutex);
+                reply_msg(client_fd, CUVS_STATUS_OK, loaded_now ? "loaded" : "already resident");
+                return;
+            }
+            if (e->pinned)
+            {
+                pthread_mutex_unlock(&g_index_mutex);
+                reply_msg(client_fd, CUVS_STATUS_OK, "already pinned");
+                return;
+            }
+            /* EV-6: per-GPU pinned total <= pin-max-pct of budget_eff. */
+            for (int i = 0; i < n_usable_gpus(); i++)
+            {
+                int dev = usable_gpu(i);
+                size_t mine = entry_bytes_on(e, dev);
+                size_t beff = budget_eff_bytes(dev), pinned = 0;
+                if (mine == 0 || beff == 0)
+                    continue;
+                for (int j = 0; j < g_n_indexes; j++)
+                    if (g_indexes[j].valid && g_indexes[j].pinned)
+                        pinned += entry_bytes_on(&g_indexes[j], dev);
+                if (pinned + mine > beff / 100 * g_reclaim.pin_max_pct)
+                {
+                    pthread_mutex_unlock(&g_index_mutex);
+                    reply_msg(client_fd, CUVS_STATUS_ERROR,
+                              "pin limit: pinned bytes on GPU %d would exceed --pin-max-pct %u%%",
+                              dev, g_reclaim.pin_max_pct);
+                    return;
+                }
+            }
+            e->pinned = 1;
+            pthread_mutex_unlock(&g_index_mutex);
+            reply_msg(client_fd, CUVS_STATUS_OK, loaded_now ? "loaded and pinned" : "pinned");
+            return;
+        }
+        case CUVS_OP_UNPIN:
+        default:
+        {
+            const char *m = !e ? "not resident" : (!e->pinned ? "not pinned" : "unpinned");
+            if (e)
+                e->pinned = 0;
+            pthread_mutex_unlock(&g_index_mutex);
+            reply_msg(client_fd, CUVS_STATUS_OK, "%s", m);
+            return;
+        }
+    }
+}
+
+/* Runtime-settable knob table (index into g_reclaim_src/changed_at). */
+static const char *k_rt_names[] = {
+    "reclaim-mode", "reclaim-free-bytes", "evict-min-idle-s", "evict-hit-bonus-s",
+    "evict-hit-cap", "reclaim-high-pct", "reclaim-low-pct", "reclaim-tick-s",
+};
+#define K_RT_N ((int)(sizeof(k_rt_names) / sizeof(k_rt_names[0])))
+
+static int
+rt_index(const char *name)
+{
+    for (int i = 0; i < K_RT_N; i++)
+        if (strcmp(k_rt_names[i], name) == 0)
+            return i;
+    return -1;
+}
+
+static void
+handle_reclaim_set(int client_fd, const CuvsCmdFrame *cmd)
+{
+    char name[sizeof(cmd->shm_key)], value[sizeof(cmd->filter_shm_key)], err[160];
+    memcpy(name, cmd->shm_key, sizeof(name));
+    name[sizeof(name) - 1] = '\0';
+    memcpy(value, cmd->filter_shm_key, sizeof(value));
+    value[sizeof(value) - 1] = '\0';
+    pthread_mutex_lock(&g_index_mutex);
+    if (cuvs_reclaim_runtime_set(&g_reclaim, name, value, err, sizeof(err)) != 0)
+    {
+        pthread_mutex_unlock(&g_index_mutex);
+        reply_msg(client_fd, CUVS_STATUS_ERROR, "%s", err);
+        return;
+    }
+    int k = rt_index(name);
+    if (k >= 0)
+    {
+        snprintf(g_reclaim_src[k], sizeof(g_reclaim_src[k]), "function");
+        g_reclaim_changed_at[k] = time(NULL);
+    }
+    pthread_mutex_unlock(&g_index_mutex);
+    LOG_INFO("[reclaim_set] %s = %s (takes effect at the next reclaim tick)\n", name, value);
+    reply_msg(client_fd, CUVS_STATUS_OK, "%s = %s", name, value);
+}
+
+/* Current value of a runtime knob as JSON. Caller holds the mutex. */
+static void
+rt_value_json(TextBuf *b, int k)
+{
+    const CuvsReclaimParams *p = &g_reclaim;
+    switch (k)
+    {
+        case 0: tb_printf(b, "\"%s\"", cuvs_reclaim_mode_name(p->mode)); break;
+        case 1: tb_printf(b, "%llu", (unsigned long long)p->f_fixed); break;
+        case 2: tb_printf(b, "%lld", (long long)p->t_min_s); break;
+        case 3: tb_printf(b, "%lld", (long long)p->bonus_s); break;
+        case 4: tb_printf(b, "%u", p->hits_cap); break;
+        case 5: tb_printf(b, "%u", p->hi_pct); break;
+        case 6: tb_printf(b, "%u", p->lo_pct); break;
+        default: tb_printf(b, "%lld", (long long)p->tick_s); break;
+    }
+}
+
+static void
+handle_reclaim_status(int client_fd)
+{
+    TextBuf b = {0};
+    char scope[32];
+    pthread_mutex_lock(&g_index_mutex);
+    cuvs_format_evict_scope(&g_reclaim.scope, scope, sizeof(scope));
+    tb_printf(&b, "{\"build_evict_scope\":\"%s\",\"pin_max_pct\":%u,"
+                  "\"reclaim_free_max_pct\":%u,\"reclaim_free_window_min\":%u,"
+                  "\"reclaim_floor_pct\":%u,\"load_soft_evict\":\"%s\","
+                  "\"reindex_self_replace\":\"%s\",\"usage_stats_file\":\"%s\","
+                  "\"reclaim_params\":{",
+              scope, g_reclaim.pin_max_pct, g_reclaim.f_cap_pct, g_reclaim.window_min,
+              g_reclaim.floor_pct, g_reclaim.soft_evict ? "on" : "off",
+              g_reclaim.self_replace ? "on" : "off", g_reclaim.usage_file ? "on" : "off");
+    for (int k = 0; k < K_RT_N; k++)
+    {
+        tb_printf(&b, "%s\"%s\":{\"value\":", k ? "," : "", k_rt_names[k]);
+        rt_value_json(&b, k);
+        tb_printf(&b, ",\"source\":\"%s\",\"changed_at\":",
+                  g_reclaim_src[k][0] ? g_reclaim_src[k] : "default");
+        if (g_reclaim_changed_at[k])
+            tb_printf(&b, "%lld}", (long long)g_reclaim_changed_at[k]);
+        else
+            tb_printf(&b, "null}");
+    }
+    tb_printf(&b, "}}");
+    pthread_mutex_unlock(&g_index_mutex);
+    send_text(client_fd, &b);
+}
+
+static const char *
+warmup_state_name(WarmupState w)
+{
+    switch (w)
+    {
+        case WARMUP_HOT:         return "hot";
+        case WARMUP_COLD:        return "cold";
+        case WARMUP_QUEUED:      return "queued";
+        case WARMUP_DOWNLOADING: return "downloading";
+        case WARMUP_LOADING:     return "loading";
+        case WARMUP_FAILED:      return "failed";
+    }
+    return "?";
+}
+
+static void
+index_status_row(TextBuf *b, uint32_t db, uint32_t idx, const char *state,
+                 const char *kind, const IndexEntry *e, const char *warm)
+{
+    const EvictHistory *h = evict_history(db, idx, 0);
+    CuvsEvictParams pp = evict_params_now();
+    time_t now = time(NULL);
+    long long protect_until = 0;
+    int eligible = 0;
+    if (e)
+    {
+        CuvsEvictCand c = entry_cand(e, entry_home_gpu(e));
+        eligible = cuvs_evict_eligible(&c, (int64_t)now, &pp);
+        if (e->last_search)
+            protect_until = (long long)e->last_search +
+                cuvs_evict_protect_s(e->hits, pp.t_min_s, pp.bonus_s, pp.hits_cap);
+    }
+    tb_printf(b, "%u\t%u\t%s\t%s\t%d\t%zu\t%lld\t%lld\t%u\t%d\t%d\t%lld\t%d\t%s\t%d\t%lld\t%s\t"
+                 "%llu\t%lld\t%s\t%d\t%llu\n",
+              db, idx, state, kind,
+              e ? entry_home_gpu(e) : -1,
+              e ? entry_total_bytes(e) : (size_t)0,
+              e ? (long long)e->last_search : 0LL,
+              e ? (long long)e->loaded_at : 0LL,
+              e ? e->hits : 0u,
+              e ? e->pinned : 0,
+              e ? e->inflight : 0,
+              protect_until, eligible,
+              cuvs_sidecar_kind_name(cuvs_entry_sidecar_kind(g_index_dir, db, idx)),
+              e ? e->file_current : 0,
+              e ? (long long)e->n_extended : 0LL,
+              warm ? warm : "",
+              h ? (unsigned long long)h->evict_count : 0ULL,
+              h ? (long long)h->last_evict_at : 0LL,
+              h && h->last_evict_reason >= 0
+                  ? cuvs_evict_reason_name((CuvsEvictReason)h->last_evict_reason) : "",
+              h ? h->last_build_self_replace : -1,
+              h ? (unsigned long long)h->last_build_unloaded : 0ULL);
+}
+
+static const char *
+entry_kind(const IndexEntry *e)
+{
+    if (e->shard_count >= 2) return "sharded";
+    if (e->ivfpq_handle)     return "ivfpq";
+    if (e->is_flat)          return "flat";
+    return "cagra";
+}
+
+static int
+key_known(uint32_t db, uint32_t idx)
+{
+    if (find_index(db, idx))
+        return 1;
+    for (int i = 0; i < g_n_cold_indexes; i++)
+        if (g_cold_indexes[i].valid && g_cold_indexes[i].db_oid == db &&
+            g_cold_indexes[i].index_oid == idx)
+            return 1;
+    return 0;
+}
+
+static void
+handle_index_status(int client_fd)
+{
+    TextBuf b = {0};
+    tb_printf(&b, "%s\n", CUVS_INDEX_STATUS_COLS);
+    pthread_mutex_lock(&g_index_mutex);
+    for (int i = 0; i < g_n_indexes; i++)
+    {
+        const IndexEntry *e = &g_indexes[i];
+        if (e->valid)
+            index_status_row(&b, e->db_oid, e->index_oid, "resident", entry_kind(e), e,
+                             warmup_state_name(e->warmup_state));
+    }
+    for (int i = 0; i < g_n_cold_indexes; i++)
+    {
+        const ColdIndexEntry *ce = &g_cold_indexes[i];
+        if (ce->valid)
+            index_status_row(&b, ce->db_oid, ce->index_oid, "cold", "cagra", NULL,
+                             warmup_state_name(ce->warmup_state));
+    }
+    /* not_resident rows come from the index files (C8): .cagra, .shards,
+     * .vectors, .ivfpq keys that are neither resident nor cold. The usage
+     * stats file has a dot-name and never parses as a key. */
+    DIR *dir = opendir(g_index_dir);
+    if (dir)
+    {
+        struct dirent *ent;
+        while ((ent = readdir(dir)) != NULL)
+        {
+            uint32_t db, idx;
+            char tail[16] = {0};
+            if (sscanf(ent->d_name, "%u_%u.%15s", &db, &idx, tail) != 3)
+                continue;
+            const char *kind = strcmp(tail, "cagra") == 0 ? "cagra"
+                             : strcmp(tail, "shards") == 0 ? "sharded"
+                             : strcmp(tail, "ivfpq") == 0 ? "ivfpq"
+                             : strcmp(tail, "vectors") == 0 ? "flat" : NULL;
+            if (!kind || key_known(db, idx))
+                continue;
+            /* a cagra index also writes .vectors: report it once, as cagra */
+            if (strcmp(kind, "flat") == 0)
+            {
+                char p[512];
+                struct stat st;
+                index_file_path(p, sizeof(p), g_index_dir, db, idx);
+                if (stat(p, &st) == 0)
+                    continue;
+                shards_manifest_path(p, sizeof(p), g_index_dir, db, idx);
+                if (stat(p, &st) == 0)
+                    continue;
+            }
+            index_status_row(&b, db, idx, "not_resident", kind, NULL, "");
+        }
+        closedir(dir);
+    }
+    pthread_mutex_unlock(&g_index_mutex);
+    send_text(client_fd, &b);
+}
+
+static void
+handle_memory_status(int client_fd)
+{
+    TextBuf b = {0};
+    tb_printf(&b, "%s\n", CUVS_MEMORY_STATUS_COLS);
+    pthread_mutex_lock(&g_index_mutex);
+    for (int i = 0; i < n_usable_gpus(); i++)
+    {
+        int dev = usable_gpu(i);
+        size_t pinned = 0;
+        int n_res = 0, n_pin = 0;
+        uint64_t total_ev = 0;
+        char fsrc[48];
+        for (int j = 0; j < g_n_indexes; j++)
+        {
+            const IndexEntry *e = &g_indexes[j];
+            size_t on = e->valid ? entry_bytes_on(e, dev) : 0;
+            if (!e->valid || !entry_on_device(e, dev))
+                continue;
+            n_res++;
+            if (e->pinned) { pinned += on; n_pin++; }
+        }
+        for (int r = 0; r < CUVS_EVICT__COUNT; r++)
+            total_ev += g_evict_by_reason[dev][r];
+        cuvs_format_free_src(&g_reclaim_f[dev], fsrc, sizeof(fsrc));
+        CuvsRmmPoolStats ps;
+        memset(&ps, 0, sizeof(ps));
+        tb_printf(&b, "%d\t%zu\t%zu\t%zu\t%zu\t%d\t%d\t%s\t%llu\t%s\t%lld\t%s\t%llu\t%llu\t%llu\t"
+                      "%llu\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu\n",
+                  dev, budget_eff_bytes(dev), resident_bytes(dev),
+                  g_pending_build_vram[dev], pinned, n_res, n_pin,
+                  cuvs_reclaim_mode_name(g_reclaim.mode),
+                  g_reclaim.mode == CUVS_RECLAIM_HEADROOM
+                      ? (unsigned long long)g_reclaim_f[dev].f_bytes : 0ULL,
+                  g_reclaim.mode == CUVS_RECLAIM_HEADROOM ? fsrc : "none",
+                  (long long)g_last_reclaim_at[dev],
+                  cuvs_reclaim_trigger_name(g_last_reclaim_trigger[dev]),
+                  (unsigned long long)g_reclaim_runs[dev],
+                  (unsigned long long)g_reclaim_skip_sidecar[dev],
+                  (unsigned long long)g_cache_persist_fail[dev],
+                  (unsigned long long)g_evict_by_reason[dev][CUVS_EVICT_ADMIT_BUILD],
+                  (unsigned long long)g_evict_by_reason[dev][CUVS_EVICT_RELOAD],
+                  (unsigned long long)g_evict_by_reason[dev][CUVS_EVICT_SOFT],
+                  (unsigned long long)g_evict_by_reason[dev][CUVS_EVICT_RECLAIM],
+                  (unsigned long long)g_evict_by_reason[dev][CUVS_EVICT_MANUAL_UNLOAD],
+                  (unsigned long long)g_evict_by_reason[dev][CUVS_EVICT_SLOT],
+                  (unsigned long long)total_ev,
+                  (unsigned long long)g_cache_drops,
+                  (unsigned long long)g_history_dropped,
+                  (unsigned long long)cuvs_rmm_pool_peak_bytes(dev));
+    }
+    pthread_mutex_unlock(&g_index_mutex);
+    send_text(client_fd, &b);
+}
+
+/* ---- reclaim thread (EV-5) ---- */
+
+static uint64_t g_reclaim_ticks;
+static int      g_reclaim_last_quiet_skips[CUVS_MAX_GPUS];
+
+/* One reclaim pass on device_id. Caller holds g_index_mutex. */
+static void
+reclaim_gpu(int dev, time_t now)
+{
+    size_t beff = budget_eff_bytes(dev);
+    int64_t window_s = (int64_t)g_reclaim.window_min * 60;
+    cuvs_reclaim_free_target(&g_admit_log, dev, (int64_t)now, window_s, beff,
+                             g_reclaim.f_cap_pct, g_reclaim.f_fixed, &g_reclaim_f[dev]);
+    CuvsReclaimGoal g = { g_reclaim.mode, beff, g_reclaim.hi_pct, g_reclaim.lo_pct,
+                          g_reclaim.floor_pct,
+                          g_reclaim.mode == CUVS_RECLAIM_HEADROOM ? g_reclaim_f[dev].f_bytes : 0 };
+    size_t resident = resident_bytes(dev), before = resident;
+    CuvsReclaimTrigger trig = cuvs_reclaim_trigger(&g, resident);
+    if (trig == CUVS_TRIG_NONE || beff == 0)
+        return;   /* below the lines: not a run (r13 13.2-N7) */
+
+    g_reclaim_runs[dev]++;
+    g_last_reclaim_at[dev] = now;
+    g_last_reclaim_trigger[dev] = trig;
+
+    int n = 0, evicted = 0, skipped = 0;
+    CuvsEvictCand *c = calloc((size_t)(g_n_indexes > 0 ? g_n_indexes : 1), sizeof(*c));
+    int *order = calloc((size_t)(g_n_indexes > 0 ? g_n_indexes : 1), sizeof(int));
+    EvictSkip *keys = calloc((size_t)(g_n_indexes > 0 ? g_n_indexes : 1), sizeof(EvictSkip));
+    if (!c || !order || !keys)
+    {
+        free(c); free(order); free(keys);
+        return;
+    }
+    for (int i = 0; i < g_n_indexes; i++)
+    {
+        IndexEntry *e = &g_indexes[i];
+        if (!e->valid || !entry_on_device(e, dev))
+            continue;
+        c[n] = entry_cand(e, dev);
+        keys[n].db_oid = e->db_oid;
+        keys[n].index_oid = e->index_oid;
+        n++;
+    }
+    CuvsEvictParams pp = evict_params_now();
+    int k = cuvs_reclaim_plan(c, n, &pp, (int64_t)now, order);
+    for (int j = 0; j < k && cuvs_reclaim_need_more(&g, trig, resident); j++)
+    {
+        const CuvsEvictCand *v = &c[order[j]];
+        if (!cuvs_reclaim_take(&g, trig, resident, v->bytes))
+            continue;
+        IndexEntry *e = find_index(keys[order[j]].db_oid, keys[order[j]].index_oid);
+        if (!e)
+            continue;
+        /* Sidecar exclusion (track-split decision 4, UC-1 7b), decided under
+         * the lock right before the save from the files themselves. */
+        if (cuvs_reclaim_skip_sidecar(cuvs_entry_sidecar_kind(g_index_dir, e->db_oid,
+                                                              e->index_oid),
+                                      entry_is_cagra_single(e), e->file_current))
+        {
+            skipped++;
+            continue;
+        }
+        int pf = 0;
+        size_t freed = evict_entry(e, dev, CUVS_EVICT_RECLAIM, 0, CUVS_RQ_RECLAIM, &pf);
+        if (pf)
+            continue;   /* persist failure: skip this victim (persist_failures) */
+        resident = freed > resident ? 0 : resident - freed;
+        evicted++;
+    }
+    free(c); free(order); free(keys);
+
+    g_reclaim_skip_sidecar[dev] += (uint64_t)skipped;
+    /* Repeat suppression: an all-sidecar tick that changes nothing logs on
+     * the first tick, every 12th tick, and whenever the skipped set size
+     * changes; the counter above still counts every tick. */
+    int quiet = evicted == 0 && skipped > 0 && skipped == g_reclaim_last_quiet_skips[dev];
+    g_reclaim_last_quiet_skips[dev] = evicted == 0 ? skipped : 0;
+    if (!quiet || g_reclaim_ticks % 12 == 0)
+    {
+        char fsrc[48];
+        cuvs_format_free_src(&g_reclaim_f[dev], fsrc, sizeof(fsrc));
+        LOG_INFO("[reclaim] gpu=%d mode=%s trigger=%s f_bytes=%llu f_src=%s budget_eff=%zu "
+                 "resident_before=%zu resident_after=%zu hi_pct=%u lo_pct=%u floor_pct=%u "
+                 "evicted=%d skip_sidecar=%d\n",
+                 dev, cuvs_reclaim_mode_name(g.mode), cuvs_reclaim_trigger_name(trig),
+                 (unsigned long long)g.f_bytes, g.f_bytes ? fsrc : "none", beff, before,
+                 resident, g.hi_pct, g.lo_pct, g.floor_pct, evicted, skipped);
+    }
+}
+
+/* Snapshot of the registry for the usage stats file (no lock while writing). */
+static void
+usage_stats_write(void)
+{
+    CuvsUsageStat *s;
+    int n = 0;
+    pthread_mutex_lock(&g_index_mutex);
+    s = calloc((size_t)(g_n_indexes > 0 ? g_n_indexes : 1), sizeof(*s));
+    if (s)
+        for (int i = 0; i < g_n_indexes && n < CUVS_USAGE_STATS_MAX; i++)
+            if (g_indexes[i].valid)
+            {
+                s[n].db_oid = g_indexes[i].db_oid;
+                s[n].index_oid = g_indexes[i].index_oid;
+                s[n].last_use = (int64_t)g_indexes[i].last_search;
+                s[n].hits = g_indexes[i].hits;
+                s[n].pinned = g_indexes[i].pinned;
+                n++;
+            }
+    pthread_mutex_unlock(&g_index_mutex);
+    if (!s)
+        return;
+    size_t cap = (size_t)n * 64 + 128;
+    char *buf = malloc(cap);
+    long len = buf ? cuvs_usage_stats_format(s, n, buf, cap) : -1;
+    free(s);
+    if (len < 0)
+    {
+        free(buf);
+        return;
+    }
+    char tmp[512], fin[512];
+    usage_stats_path(tmp, sizeof(tmp), 1);
+    usage_stats_path(fin, sizeof(fin), 0);
+    int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (fd < 0)
+    {
+        free(buf);
+        return;
+    }
+    ssize_t w = write(fd, buf, (size_t)len);
+    int ok = w == len && fsync(fd) == 0;
+    close(fd);
+    free(buf);
+    /* rename is atomic: readers see the old complete file or the new one. */
+    if (!ok || rename(tmp, fin) != 0)
+        unlink(tmp);
+}
+
+static void *
+reclaim_thread(void *arg)
+{
+    (void) arg;
+    while (!g_shutdown)
+    {
+        int64_t tick;
+        pthread_mutex_lock(&g_index_mutex);
+        tick = g_reclaim.tick_s;
+        pthread_mutex_unlock(&g_index_mutex);
+        for (int64_t t = 0; t < tick && !g_shutdown; t++)
+            sleep(1);
+        if (g_shutdown)
+            break;
+        time_t now = time(NULL);
+        pthread_mutex_lock(&g_index_mutex);
+        g_reclaim_ticks++;
+        cuvs_admit_log_expire(&g_admit_log, (int64_t)now,
+                              (int64_t)g_reclaim.window_min * 60);
+        if (g_reclaim.mode != CUVS_RECLAIM_OFF)
+            for (int i = 0; i < n_usable_gpus(); i++)
+                reclaim_gpu(usable_gpu(i), now);
+        pthread_mutex_unlock(&g_index_mutex);
+        /* UC-1 4c: written every tick whatever the mode (CK-24). */
+        if (g_reclaim.usage_file)
+            usage_stats_write();
+    }
+    return NULL;
+}
+
 static void *
 connection_thread(void *arg)
 {
@@ -8830,6 +10063,24 @@ connection_thread(void *arg)
         case CUVS_OP_SEARCH_BF_TRANSIENT:
             handle_search_bf_transient(client_fd, &cmd);
             break;
+        case CUVS_OP_UNLOAD:
+        case CUVS_OP_LOAD:
+        case CUVS_OP_PIN:
+        case CUVS_OP_UNPIN:
+            handle_manual(client_fd, &cmd);
+            break;
+        case CUVS_OP_RECLAIM_SET:
+            handle_reclaim_set(client_fd, &cmd);
+            break;
+        case CUVS_OP_INDEX_STATUS:
+            handle_index_status(client_fd);
+            break;
+        case CUVS_OP_MEMORY_STATUS:
+            handle_memory_status(client_fd);
+            break;
+        case CUVS_OP_RECLAIM_STATUS:
+            handle_reclaim_status(client_fd);
+            break;
         default:
             send_error(client_fd, "unknown op");
             break;
@@ -8887,7 +10138,7 @@ bf_batch_run_group(CuvsBatchRequest **batch, const int *gid, int n, int g)
 
     pthread_mutex_lock(&g_index_mutex);
     IndexEntry *e = find_index(r0->key.db_oid, r0->key.index_oid);
-    if (!e && load_index(r0->key.db_oid, r0->key.index_oid) == 0)
+    if (!e && load_index(r0->key.db_oid, r0->key.index_oid, CUVS_RQ_LOAD) == 0)
         e = find_index(r0->key.db_oid, r0->key.index_oid);
 
     int status = CUVS_STATUS_OK;
@@ -9001,7 +10252,7 @@ cagra_batch_run_group(CuvsBatchRequest **batch, const int *gid, int n, int g)
 
     pthread_mutex_lock(&g_index_mutex);
     IndexEntry *e = find_index(r0->key.db_oid, r0->key.index_oid);
-    if (!e && load_index(r0->key.db_oid, r0->key.index_oid) == 0)
+    if (!e && load_index(r0->key.db_oid, r0->key.index_oid, CUVS_RQ_LOAD) == 0)
         e = find_index(r0->key.db_oid, r0->key.index_oid);
 
     int status = CUVS_STATUS_OK;
@@ -9416,6 +10667,7 @@ write_hw_profile(void)
 int
 main(int argc, char **argv)
 {
+    cuvs_reclaim_params_default(&g_reclaim);
     /* Parse arguments */
     for (int i = 1; i < argc; i++)
     {
@@ -9458,6 +10710,25 @@ main(int argc, char **argv)
             if (n >= 1)
                 g_max_indexes = n;   /* registry working-set capacity */
         }
+        else if (strncmp(argv[i], "--", 2) == 0 && cuvs_reclaim_flag_known(argv[i] + 2))
+        {
+            /* I3-B knobs KB-7..KB-27 (C6): strict values, startup refusal. */
+            char err[256];
+            const char *name = argv[i] + 2;
+            if (i + 1 >= argc)
+            {
+                LOG_ERROR("--%s requires a value\n", name);
+                return 1;
+            }
+            if (cuvs_reclaim_flag_set(&g_reclaim, name, argv[++i], err, sizeof(err)) != 0)
+            {
+                LOG_ERROR("%s\n", err);
+                return 1;
+            }
+            int k = rt_index(name);
+            if (k >= 0)
+                snprintf(g_reclaim_src[k], sizeof(g_reclaim_src[k]), "flag");
+        }
         else if (strcmp(argv[i], "--snapshot-uri") == 0 && i+1 < argc)
             strncpy(g_snapshot_uri, argv[++i], sizeof(g_snapshot_uri) - 1);
         else if (strcmp(argv[i], "--cluster-id") == 0 && i+1 < argc)
@@ -9482,6 +10753,30 @@ main(int argc, char **argv)
                 tok = strtok(NULL, ",");
             }
         }
+    }
+
+    {
+        char err[256], scope[32];
+        if (cuvs_reclaim_params_check(&g_reclaim, err, sizeof(err)) != 0)
+        {
+            LOG_ERROR("%s\n", err);
+            return 1;
+        }
+        cuvs_format_evict_scope(&g_reclaim.scope, scope, sizeof(scope));
+        LOG_INFO("pg_cuvs_server: cache policy build_evict_scope=%s reclaim_mode=%s "
+                 "evict_min_idle_s=%lld evict_hit_bonus_s=%lld evict_hit_cap=%u "
+                 "reclaim_high_pct=%u reclaim_low_pct=%u reclaim_tick_s=%lld pin_max_pct=%u "
+                 "reclaim_free_bytes=%llu reclaim_free_max_pct=%u reclaim_free_window_min=%u "
+                 "reclaim_floor_pct=%u load_soft_evict=%s reindex_self_replace=%s "
+                 "usage_stats_file=%s\n",
+                 scope, cuvs_reclaim_mode_name(g_reclaim.mode),
+                 (long long)g_reclaim.t_min_s, (long long)g_reclaim.bonus_s,
+                 g_reclaim.hits_cap, g_reclaim.hi_pct, g_reclaim.lo_pct,
+                 (long long)g_reclaim.tick_s, g_reclaim.pin_max_pct,
+                 (unsigned long long)g_reclaim.f_fixed, g_reclaim.f_cap_pct,
+                 g_reclaim.window_min, g_reclaim.floor_pct,
+                 g_reclaim.soft_evict ? "on" : "off", g_reclaim.self_replace ? "on" : "off",
+                 g_reclaim.usage_file ? "on" : "off");
     }
 
     LOG_INFO("pg_cuvs_server: starting (socket=%s index-dir=%s snapshot=%s)\n",
@@ -9695,6 +10990,13 @@ main(int argc, char **argv)
 
     /* Phase 3L-9: spawn the single BF micro-batch consumer. Always running but
      * inert until a request with a non-zero batch window is enqueued. */
+    {
+        pthread_t rtid;
+        if (pthread_create(&rtid, NULL, reclaim_thread, NULL) == 0)
+            pthread_detach(rtid);
+        else
+            LOG_WARN("pg_cuvs_server: reclaim thread failed to start; no background reclaim\n");
+    }
     if (pthread_create(&g_batch_worker_tid, NULL, batch_worker_thread, NULL) == 0)
         g_batch_worker_started = 1;
     else
