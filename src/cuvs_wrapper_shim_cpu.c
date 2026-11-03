@@ -210,6 +210,19 @@ cuvs_rmm_pool_stats(int device_id, CuvsRmmPoolStats *out)
     return 1;  /* no GPU allocator to report */
 }
 
+size_t
+cuvs_rmm_pool_peak_bytes(int device_id)
+{
+    (void)device_id;
+    return 0;  /* no pool on the CPU shim */
+}
+
+void
+cuvs_rmm_pool_peak_reset(int device_id)
+{
+    (void)device_id;
+}
+
 /* ======================================================================== */
 /* build / free                                                             */
 /* ======================================================================== */
