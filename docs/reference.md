@@ -261,6 +261,7 @@ daemon-only ones have no session equivalent.
 | `--max-vram-mb N` | — (daemon-only) | 90% of total VRAM | Logical index-residency budget, enforced by self-accounting (ADR-065). Excludes unused pool reservation and temporary workspace; it is separate from the RMM quota |
 | `--rmm-pool-mb N` | `cuvs.rmm_pool_mb` (read-only status) | `512` MiB | Initial RMM pool reservation per allowed GPU, installed before probes/load/warmup. Explicit `0` disables the pool and keeps the legacy allocator. CPU shim builds default to `0`. Init failure aborts startup |
 | `--rmm-pool-max-percent N` | `cuvs.rmm_pool_max_percent` (read-only status) | `50` | Hard upstream quota: total CUDA memory × N%, rounded down to 256 bytes, on each allowed GPU. Range 1–100; initial reservation must fit. Preserves the pool's doubling/backoff growth policy |
+| `--rmm-scratch-permille N` | — (daemon-only, `scratch_permille` in `cuvs.rmm_pool_status`) | `7726` (provisional) | CAGRA build scratch coefficient ρ. Admission, reservation and GPU choice use `N = final + ceil(final × ρ / 1000)`; residency accounting keeps `final`. Range 0–100000. Restart to change |
 | `--max-indexes N` | — (daemon-only) | `1024` | **Soft** LRU working-set cap (ADR-068), not a hard wall (was 64). At the cap, `load_index` evicts the LRU index to free a slot and auto-reloads on next use; a build over the cap defers gracefully |
 | `--gpu-devices LIST` | — (daemon-only) | all visible | CUDA devices the daemon uses (else honors `CUDA_VISIBLE_DEVICES`) |
 | `--snapshot-uri URI` | `cuvs.snapshot_uri` | `` | GCS snapshot root |
@@ -280,6 +281,14 @@ Admission uses **unused pool bytes + min(reclaimable physical memory, remaining
 upstream quota)**. An index estimate larger than an empty pool's quota is rejected
 before evicting resident indexes. The logical index budget still applies separately.
 
+A CAGRA build (single, parallel or per shard) is admitted on
+`N = final + ceil(final × ρ / 1000)`, where `final = n × (4 × ld + 4 × graph_degree)`
+and `ld` is the dimension rounded up to a multiple of 4; ρ is
+`--rmm-scratch-permille`. The registry records `final`. A build that still runs
+out of GPU memory after admission fails with SQLSTATE 53200 and evicts no resident
+index (there is no evict-and-retry); raise `--rmm-scratch-permille` to reserve
+more. IVF-PQ builds and index reloads keep their own estimates.
+
 `pg_stat_gpu_search.vram_bytes` estimates retained dataset/graph memory; it does
 not include unused pool reservation or transient workspace. Pool-backed frees
 become reusable without returning their physical allocation to other CUDA users.
@@ -295,7 +304,8 @@ SHOW cuvs.rmm_pool_status;
 ```
 
 The JSON has `initial_mb`, `maximum_percent`, and a `devices` array containing
-`device_id`, `maximum_bytes`, `reserved_bytes`, and `used_bytes`. A disabled pool
+`device_id`, `maximum_bytes`, `reserved_bytes`, and `used_bytes`, followed by
+`version` (2) and `scratch_permille`. New keys are only appended after these. A disabled pool
 reports initial/percentage zero and an empty device array. An absent or incompatible
 daemon reports `unavailable`, not a fabricated zero. These are read-only settings;
 changing them with SQL SET cannot replace a live allocator. See ADR-085 for the
@@ -365,6 +375,7 @@ for limits, compatibility and estimate-vs-upper-bound caveats.
 | Function | Returns | Purpose |
 |----------|---------|---------|
 | `pg_cuvs_reset_circuit(index regclass)` | void | Re-enable GPU routing after the (per-session) circuit breaker tripped |
+| `pg_cuvs_last_rejection()` | jsonb | This session's last GPU memory admission rejection (NULL if none); see [Admission rejections](#admission-rejections-and-recovery). Backend memory only, cleared at session end; callable by everyone |
 | `pg_cuvs_hnsw_build_info(index regclass)` | jsonb | Read the stored construction route/settings and estimate-based admission. Version2 writer with historical version1 reader; absent legacy/source/empty receipts are not reconstructed from current GUCs. Requires SELECT on the source table; estimates are not memory upper-bound guarantees |
 | `pg_cuvs_build_hnsw(cagra regclass, mode text DEFAULT 'nsw')` | regclass | Build a pgvector HNSW from a CAGRA index without pgvector's CPU build. **Deprecated** in favor of `CREATE INDEX ... USING pg_cuvs_hnsw`; the older two-step `pg_cuvs_import_hnsw` form (empty `USING hnsw` target + import) is removed |
 | `pg_cuvs_compact(index regclass)` | void | Remove tombstoned vectors via `cuvsCagraMerge`, rebuild `.cagra`/`.tids`, drop `.tombstone` |
@@ -381,6 +392,56 @@ The extension also defines fault-injection and test-harness functions (GPU VRAM 
 injection, and a non-persistent daemon budget override). They exist for the test suite only, are
 **not a supported API**, and can OOM or crash the daemon — do not call them in production. The
 supported way to cap VRAM is the daemon's `--max-vram-mb` flag.
+
+### Admission rejections and recovery
+
+When the daemon refuses GPU memory for a CAGRA, IVF-PQ or sharded build, or for
+reloading an index on a query, the error names the reason and the numbers instead of
+`BUILD failed (status 2)`. The SQLSTATE tells permanent from transient:
+
+| Reason | SQLSTATE | Meaning | What to do |
+|---|---|---|---|
+| AR0 | 54000 | The build needs more than one build may ever get (pool quota, or the logical VRAM budget when the pool is disabled) | Use `pg_cuvs_hnsw` with `build_algo='auto'` or `'ace'`; lower `graph_degree`; operators review `--rmm-pool-max-percent`, `--max-vram-mb`, `--rmm-scratch-permille`. Retrying does not help |
+| AR1, AR2 | 53200 | Another CREATE INDEX holds GPU memory | Retry after it finishes |
+| AR3, AR4 | 53200 | Not enough even after evicting what may be evicted | Unload an idle index (HINT names one), then retry |
+| OOM (after admission) | 53200 | The build ran out of GPU memory although admitted; nothing was evicted | Raise `--rmm-scratch-permille`, or retry when memory is free |
+| reload (AR0–AR5 on a query) | 53200 | `GPU memory is unavailable to load index "<name>"` | As the HINT says; a query retried later may load |
+
+AR5–AR7 and ATT are reserved for the eviction-scope, managed large_workspace and
+dataset-attach checks. IVF-PQ admission rejections changed from XX000 to 54000/53200;
+IVF-PQ failures after admission and non-admission failures stay XX000.
+
+DETAIL lists `need`, `free`, the resident total and count, pinned amounts, and up to
+three idle candidates, oldest first: `Idle candidates: public.idx_a 2048 MiB idle 60 min; (db 16385) oid 24576 512 MiB idle never`.
+An index of the current database is named (`quote_qualified_identifier`); one of
+another database appears only as `(db <oid>) oid <oid>`. Values at 99,999,999 MiB
+print as `99999999+`. Shard rejections start with `shard <i>: `.
+
+The HINT depends on what the caller may do: if the caller owns (or as superuser may
+unload) a candidate, it gives `SELECT pg_cuvs_unload('<index>'); then retry CREATE INDEX.`
+(superuser and another database: `SELECT pg_cuvs_unload(<db_oid>, <index_oid>); ...`),
+otherwise `Ask a superuser to unload an idle index (see pg_cuvs_index_status()).`
+With no candidates it says either that pinned indexes hold the space
+(`pg_cuvs_unpin`) or that every resident index is in use. Unloading is not permanent:
+the unloaded index reloads on its next query.
+
+`pg_cuvs_last_rejection()` returns the same rejection for scripts:
+
+```json
+{"reason": "AR3", "sqlstate": "53200", "requester": "BUILD", "index_oid": 24601,
+ "at": "2026-11-03 15:40:00+09", "shard": null,
+ "fields": {"need_mib": 3049, "free_mib": 512, "resident_mib": 6000,
+            "resident_count": 3, "evictable_mib": 0, "evictable_count": 0,
+            "pinned_mib": 0, "pinned_count": 0, "reclaim_can_help": 0},
+ "candidates": [{"db_oid": 16384, "index_oid": 24576, "mib": 2048, "idle_s": 3600}]}
+```
+
+`requester` is `BUILD`, `LOAD` or `SHARD`; `fields` holds only the values the daemon
+reported for that reason; `idle_s` is -1 for an index never searched. Daemon logs
+carry one `[admit]` line per admission decision, `[release]` when a reservation is
+returned and `[build_oom] ... action=fail_no_evict` for an out-of-memory build.
+A build that defers to reload because the GPU index registry is full now prints a
+NOTICE instead of finishing silently.
 
 ---
 

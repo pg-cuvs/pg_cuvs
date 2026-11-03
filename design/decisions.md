@@ -3780,3 +3780,45 @@ prototype의 최대 pool hold 14.435 GB에 두 번째 gd64 index의 보수적 �
 **검증 경계:** quota 정렬·overflow·재사용·남은 quota 계산은 CPU unit, 적용 상태와 readonly 및
 미접속 처리는 SQL regression으로 확인한다. 실제 allocator 동작은 native CUDA build와 별도
 GPU smoke가 필요하다. 과거 FD snapshot 측정과 새 quota/status 구현의 검증 기록을 구분한다.
+
+## ADR-086 — CAGRA 입장 예약에 빌드 scratch를 넣고, 입장 뒤 OOM은 축출 없이 사유별 오류로 끝낸다 (I3-A 부분)
+
+**상태:** 채택(I3 세트, 2026-11-03 PLAN CONFIRMED). supersedes: ADR-070 Bug #3의
+evict-to-fit(빌드 OOM마다 LRU 축출 후 재시도). 현행 SSOT: `docs/reference.md`
+"RMM quota and memory accounting"·"Admission rejections and recovery",
+`src/cuvs_admission_contract.h`. 회수·캐시·차단기(I3-B), hnsw 경로(I3-C),
+managed large_workspace(I4, ADR-088)는 각 PR이 이 ADR에 덧붙인다.
+
+**맥락:** 입장 심사의 `needed`가 최종 상주량만 세어 입장은 통과하고 빌드가 OOM했다.
+OOM마다 상주 인덱스를 축출하는 재시도는 상주 검색 지연을 흔들고, 축출하고도 실패할 수
+있었다. 사용자에게 보인 오류는 `BUILD failed (status 2)`와 journal 안내뿐이었다.
+
+**결정:**
+
+1. CAGRA 단건·병렬·샤드 빌드의 입장, 예약, 해제, GPU 선택은
+   `N = final + ceil(final × ρ / 1000)`을 쓰고 상주 회계는 `final`을 쓴다.
+   `final = n × (4 × ld + 4 × gd)`, `ld = 4 × ceil(dim / 4)`. ρ는
+   `--rmm-scratch-permille`(0~100000, 임시 기본 7726: Q1이 기본 정책에서 잰 값으로 H_M에서
+   교체). 곱셈·덧셈은 포화하며 포화값은 어떤 예산에도 입장되지 않는다.
+2. 입장 뒤 OOM은 상주 인덱스를 내리지 않고 status 2와 OOM 페이로드로 끝낸다.
+   재시도 루프를 지운다. `[build_oom] action=fail_no_evict`.
+3. 거부는 사유 코드(AR0~AR7, OOM, ATT)와 수치를 `err_out`(512 B 텍스트, 후보 최대 3개)으로
+   싣고, 백엔드가 SQLSTATE 54000(영구 AR0)/53200(일시)/53400(AR6), DETAIL, 호출자 권한별
+   HINT로 낸다. 같은 백엔드의 마지막 거부는 `pg_cuvs_last_rejection()`이 jsonb로 돌려준다.
+   ADR-081 핸드셰이크는 5로 한 번 오른다.
+4. IVF-PQ AM과 샤드 빌드의 입장 거부도 같은 체계다(IVF-PQ 거부의 SQLSTATE가 XX000에서
+   54000/53200으로 바뀐다). 입장 뒤 IVF-PQ 실패와 비입장 실패는 XX000을 유지한다.
+
+**대안:**
+
+| 대안 | 선택하지 않은 이유 |
+|---|---|
+| evict-to-fit 유지 | 빌드가 공유 캐시를 밀어내 검색 지연을 흔들고, 축출해도 실패할 수 있음(I2-G G2) |
+| 입장 식에 scratch 없이 OOM만 오류화 | 입장 통과 뒤 실패가 그대로 남음 |
+| 모든 거부를 53200 하나로 | 연결 풀·ORM이 영구 초과(AR0)를 헛되이 재시도함 |
+
+**검증 경계:** 추정식·코덱·문구·IPC 필드는 CPU 단위 시험과 변이(헤더·코덱·문구·IPC 37건
+RED), 데몬·백엔드 경로는 CPU shim의 Tier-1과 fault 묶음(build_oom, build_multi_oom,
+build_oom_evict_to_fit: 축출이 일어나면 RED)으로 확인한다. ρ의 값과 실제 GPU의 입장 뒤
+OOM 빈도는 GPU 검증(Q) 대상이다. wrapper 쪽 항목(dim%4 정렬 stride로 dataset 1벌,
+dataset 부착 확인 ATT)은 CUDA 빌드가 필요해 이 결정의 첫 구현에 들어 있지 않다.
