@@ -84,6 +84,29 @@ cuvs_lw_ub_bytes(uint64_t shape_bytes, uint32_t margin_permille)
     return scaled / 1000u + (scaled % 1000u != 0);
 }
 
+/* LW-8 margin rule (C3; v6 3.5 3a/3b): margin_permille =
+ * ceil(1000 x 1.10 x max_i(lw_peak_i / L_shape_i)), lower bound 1000. Exact
+ * integer form max_i ceil(1100 x lw_peak_i / L_shape_i). Returns 0 for no
+ * points or a zero L_shape (invalid input); saturates at UINT32_MAX. The
+ * result is the value the one-line commit writes into
+ * CUVS_MANAGED_LW_MARGIN_PERMILLE_DEFAULT (startup refuses above the knob
+ * maximum). */
+static inline uint32_t
+cuvs_lw_margin_from_lw8(const uint64_t *lw_peak, const uint64_t *shape, size_t n)
+{
+    unsigned __int128 best = CUVS_MANAGED_LW_MARGIN_PERMILLE_MIN;
+    size_t i;
+    if (n == 0) return 0;
+    for (i = 0; i < n; i++)
+    {
+        unsigned __int128 q;
+        if (shape[i] == 0) return 0;
+        q = ((unsigned __int128)lw_peak[i] * 1100u + shape[i] - 1) / shape[i];
+        if (q > best) best = q;
+    }
+    return best > UINT32_MAX ? UINT32_MAX : (uint32_t)best;
+}
+
 /* C3 large_workspace shape class: lw_checked inside the LW-8 grid (dim
  * 128..768, igd 128..256, n <= 999,000), else lw_extrapolated, for which the
  * margin is not known to cover lw_peak: the [admit] shape_class gets the
