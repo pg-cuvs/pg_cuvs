@@ -118,6 +118,8 @@ cli set reclaim-mode headroom >/dev/null
 # --- 4. manual ops (C7) ---
 R=$(i3b_ipc_cli $S index | awk -F'\t' '$3=="resident"{print $2}' | head -1)
 check "pin" sh -c "i3b_ipc_cli $S pin $DB $R | grep -q 'status=0 pinned'"
+R2=$(i3b_ipc_cli $S index | awk -F'\t' -v r=$R '$3=="resident" && $2!=r{print $2}' | head -1)
+check "pin cap: second pin exceeds --pin-max-pct 50" sh -c "[ -n '$R2' ] && i3b_ipc_cli $S pin $DB $R2 | grep -q 'pin limit'"
 check "unload refuses a pinned index" sh -c "i3b_ipc_cli $S unload $DB $R | grep -q 'pinned: run pg_cuvs_unpin first'"
 check "unpin" sh -c "i3b_ipc_cli $S unpin $DB $R | grep -q 'status=0 unpinned'"
 check "unload" sh -c "i3b_ipc_cli $S unload $DB $R | grep -q 'status=0 unloaded'"
@@ -189,6 +191,8 @@ check "load-soft-evict off: no soft_evict" sh -c "! tail -n +$MARK /tmp/d.log | 
 RN3=$(psqlq "SELECT relname FROM pg_class WHERE oid=$I3")
 psqlq "SET client_min_messages=warning; REINDEX INDEX $RN3;" > /tmp/reidx_off.log 2>&1
 check "reindex-self-replace off: no self-replace, REINDEX refused" sh -c "! tail -n +$MARK /tmp/d.log | grep -q 'self_replace\]' && grep -q ERROR /tmp/reidx_off.log"
+rm -f $IDX/.pg_cuvs_usage_stats; sleep 3
+check "usage stats file written even with --reclaim-mode off" test -s $IDX/.pg_cuvs_usage_stats
 # pinned REINDEX keeps the pin when there is room
 startd --reclaim-tick-s 1 --reclaim-mode off
 for i in $(i3b_ipc_cli $S index | awk -F'\t' '$3=="resident"{print $2}'); do cli unload $DB $i >/dev/null; done
