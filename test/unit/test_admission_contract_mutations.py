@@ -92,6 +92,11 @@ MESSAGE_MUTATIONS = {
 WIRE_TEST = 'test/unit/test_admission_wire.c'
 # err_out codec (cuvs_util.c), checked by the wire test under ASAN/UBSan.
 WIRE_MUTATIONS = {
+    'shape_bracketed_accepts_nn_descent': (
+        'if ((ivf || autoa) && gd >= 32 && gd <= 64',
+        'if (gd >= 32 && gd <= 64'),
+    'shape_checked_ignores_metric': (
+        'if (dim != 768 || metric != CUVS_METRIC_L2)', 'if (dim != 768)'),
     'decoder_reads_past_512': (
         'lim = len < CUVS_ADMISSION_ERR_OUT_BYTES ? len : CUVS_ADMISSION_ERR_OUT_BYTES;',
         'lim = len;'),

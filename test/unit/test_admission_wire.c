@@ -4,6 +4,7 @@
  * Run under ASAN for the 511/512/513 B decoder boundary.
  */
 #include "cuvs_util.h"
+#include "cuvs_ipc.h"   /* CUVS_METRIC_*, CUVS_CAGRA_BUILD_* */
 #include "cuvs_admission_contract.h"
 
 #include <stdint.h>
@@ -284,9 +285,40 @@ test_parse_scratch_permille(void)
     CHECK("huge", cuvs_parse_scratch_permille("99999999999999999999", &v) != 0);
 }
 
+static void
+test_shape_class(void)
+{
+    /* v5 C3 (carried by v6 C3): checked points, bracketed region, rest. */
+    const uint32_t L2 = CUVS_METRIC_L2, IVF = CUVS_CAGRA_BUILD_IVF_PQ,
+                   AUTO = CUVS_CAGRA_BUILD_AUTO, NND = CUVS_CAGRA_BUILD_NN_DESCENT;
+#define SC(n, dim, m, gd, igd, a) cuvs_build_shape_class((n), (dim), (m), (gd), (igd), (a))
+    CHECK("checked 32/128", strcmp(SC(999000, 768, L2, 32, 128, IVF), "checked") == 0);
+    CHECK("checked 64/256", strcmp(SC(999000, 768, L2, 64, 256, IVF), "checked") == 0);
+    CHECK("checked 32/64", strcmp(SC(999000, 768, L2, 32, 64, IVF), "checked") == 0);
+    CHECK("checked 64/128 auto", strcmp(SC(999000, 768, L2, 64, 128, AUTO), "checked") == 0);
+    CHECK("checked defaults", strcmp(SC(999000, 768, L2, 0, 0, AUTO), "checked") == 0);
+    CHECK("checked 250k", strcmp(SC(250000, 768, L2, 32, 128, IVF), "checked") == 0);
+    CHECK("checked 500k", strcmp(SC(500000, 768, L2, 32, 128, IVF), "checked") == 0);
+    CHECK("bracketed 300k", strcmp(SC(300000, 768, L2, 32, 128, IVF), "bracketed") == 0);
+    CHECK("bracketed 64/64", strcmp(SC(999000, 768, L2, 64, 64, IVF), "bracketed") == 0);
+    CHECK("bracketed auto", strcmp(SC(250000, 768, L2, 48, 200, AUTO), "bracketed") == 0);
+    CHECK("64/128 ivf is bracketed", strcmp(SC(999000, 768, L2, 64, 128, IVF), "bracketed") == 0);
+    CHECK("igd < gd", strcmp(SC(999000, 768, L2, 64, 32, IVF), "extrapolated") == 0);
+    CHECK("nn_descent", strcmp(SC(999000, 768, L2, 32, 128, NND), "extrapolated") == 0);
+    CHECK("dim 767", strcmp(SC(999000, 767, L2, 32, 128, IVF), "extrapolated") == 0);
+    CHECK("cosine", strcmp(SC(999000, 768, CUVS_METRIC_COSINE, 32, 128, IVF), "extrapolated") == 0);
+    CHECK("gd 31", strcmp(SC(999000, 768, L2, 31, 128, IVF), "extrapolated") == 0);
+    CHECK("gd 65", strcmp(SC(999000, 768, L2, 65, 128, IVF), "extrapolated") == 0);
+    CHECK("igd 257", strcmp(SC(999000, 768, L2, 64, 257, IVF), "extrapolated") == 0);
+    CHECK("n 249999", strcmp(SC(249999, 768, L2, 32, 128, IVF), "extrapolated") == 0);
+    CHECK("n 999001", strcmp(SC(999001, 768, L2, 32, 128, IVF), "extrapolated") == 0);
+#undef SC
+}
+
 int
 main(void)
 {
+    test_shape_class();
     test_parse_scratch_permille();
     test_mib_saturates();
     test_reason_names_and_sqlstate();

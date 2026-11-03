@@ -943,6 +943,7 @@ static __thread CuvsAdmissionFields t_reload_rej;
 
 typedef struct AdmitLine {
     const char *op, *path, *algo;
+    const char *shape;           /* cuvs_build_shape_class(); NULL = na */
     int         gpu;
     uint32_t    db, idx, dim, gd, igd;
     int64_t     n;
@@ -952,8 +953,9 @@ typedef struct AdmitLine {
 
 /* [admit] with the 41 v6 fields in schema order. I3-A tip: the I3-B/I4
  * fields (lru_free, elig_free, pin_bytes, policy, overcommit, lw_ub,
- * lw_pending, host_guard, self_res) are 0 or na (v6 1.4 (h)). shape_class,
- * auto_probe and phys_free are not yet derived in this tip (na / 0). */
+ * lw_pending, host_guard, self_res) are 0 or na (v6 1.4 (h)). auto_probe is
+ * na (the v5 rule's "not implementable" value); phys_free is not exposed by
+ * the wrapper yet and is 0. */
 static void
 log_admit(const AdmitLine *a, CuvsAdmissionReason reason)
 {
@@ -981,14 +983,15 @@ log_admit(const AdmitLine *a, CuvsAdmissionReason reason)
             reserved = st.reserved_bytes;
         }
     }
-    LOG_INFO("[admit] op=%s path=%s gpu=%d db=%u idx=%u algo=%s shape_class=na "
+    LOG_INFO("[admit] op=%s path=%s gpu=%d db=%u idx=%u algo=%s shape_class=%s "
              "auto_probe=na n=%lld dim=%u gd=%u igd=%u final=%zu scratch=%zu needed=%zu "
              "limit=%zu budget=%zu pending_before=%zu pending_after=%zu quota=%zu "
              "headroom_raw=%zu free_net=%zu pool_used=%llu logical_used=%zu evicted=%d "
              "verdict=%s reason=%s res_bytes=%zu res_n=%u lru_free=0 elig_free=0 "
              "pin_bytes=0 policy=na overcommit=na reserved=%llu phys_free=0 lw_ub=0 "
              "lw_pending=0 host_guard=0 self_res=0 mono_us=%llu\n",
-             a->op, a->path, dev, a->db, a->idx, a->algo, (long long) a->n, a->dim,
+             a->op, a->path, dev, a->db, a->idx, a->algo, a->shape ? a->shape : "na",
+             (long long) a->n, a->dim,
              a->gd, a->igd, a->final, scratch, a->needed, limit, budget,
              a->pending_before, pending_after, quota, headroom_raw, free_net,
              (unsigned long long) pool_used, logical_used, t_admit_evicted,
@@ -996,6 +999,9 @@ log_admit(const AdmitLine *a, CuvsAdmissionReason reason)
              reason == CUVS_ADMISSION_NONE ? "none" : cuvs_admission_reason_name(reason),
              res_bytes, res_n, (unsigned long long) reserved,
              (unsigned long long) admission_mono_us());
+    if (a->shape && strcmp(a->shape, "extrapolated") == 0)
+        LOG_WARN("scratch model unvalidated: n=%lld dim=%u gd=%u igd=%u algo=%s\n",
+                 (long long) a->n, a->dim, a->gd, a->igd, a->algo);
 }
 
 /* Pick the GPU with the most VRAM headroom for a new index of `needed` bytes.
@@ -5114,14 +5120,22 @@ build_sharded(int client_fd, const CuvsCmdFrame *cmd, const char *index_dir,
                          cmd->db_oid, cmd->index_oid, (uint32_t)i);
         snprintf(shard_tmp[i], 576, "%s.tmp", shard_final[i]);
 
+        AdmitLine al = {.op = "BUILD", .path = "sharded",
+                        .algo = admission_algo_name(cmd->build_algo), .gpu = dev,
+                        .db = cmd->db_oid, .idx = cmd->index_oid, .dim = dim,
+                        .gd = cmd->graph_degree ? cmd->graph_degree : 64,
+                        .igd = cmd->intermediate_graph_degree
+                               ? cmd->intermediate_graph_degree : 128,
+                        .n = shard_n, .final = final, .needed = needed,
+                        .shape = cuvs_build_shape_class(shard_n, dim, metric,
+                                                        cmd->graph_degree,
+                                                        cmd->intermediate_graph_degree,
+                                                        cmd->build_algo)};
+        al.pending_before = g_pending_rmm_build_vram[dev];
         if (ensure_vram(needed, dev, NULL) != 0)
         {
             int alt = pick_gpu_for_index(needed);
-            AdmitLine al = {.op = "BUILD", .path = "sharded",
-                            .algo = admission_algo_name(cmd->build_algo), .gpu = alt,
-                            .db = cmd->db_oid, .idx = cmd->index_oid, .dim = dim,
-                            .gd = cmd->graph_degree, .igd = cmd->intermediate_graph_degree,
-                            .n = shard_n, .final = final, .needed = needed};
+            al.gpu = alt;
             if (alt < 0)
                 admission_fill(&shard_rej, CUVS_ADMISSION_AR0, needed, -1);
             else
@@ -5139,6 +5153,7 @@ build_sharded(int client_fd, const CuvsCmdFrame *cmd, const char *index_dir,
             }
             dev = alt;
         }
+        log_admit(&al, CUVS_ADMISSION_NONE);   /* one [admit] line per shard (v5) */
 
         CuvsCagraIndex h = cuvs_cagra_build(vecs + (size_t)off * dim, shard_n,
                                             (int)dim, metric,
@@ -5656,8 +5671,13 @@ handle_build(int client_fd, const CuvsCmdFrame *cmd)
     AdmitLine al = {.op = "BUILD", .path = "single",
                     .algo = admission_algo_name(cmd->build_algo), .gpu = -1,
                     .db = cmd->db_oid, .idx = cmd->index_oid, .dim = cmd->dim,
-                    .gd = cmd->graph_degree, .igd = cmd->intermediate_graph_degree,
-                    .n = cmd->n_vecs, .final = final, .needed = needed};
+                    .gd = cmd->graph_degree ? cmd->graph_degree : 64,
+                    .igd = cmd->intermediate_graph_degree ? cmd->intermediate_graph_degree : 128,
+                    .n = cmd->n_vecs, .final = final, .needed = needed,
+                    .shape = cuvs_build_shape_class(cmd->n_vecs, cmd->dim, cmd->metric,
+                                                    cmd->graph_degree,
+                                                    cmd->intermediate_graph_degree,
+                                                    cmd->build_algo)};
     int target_gpu = pick_gpu_for_index(needed);
     if (target_gpu < 0)
     {
@@ -6333,8 +6353,13 @@ handle_build_multi(int client_fd, const CuvsCmdFrame *cmd, const char *index_dir
         AdmitLine al = {.op = "BUILD", .path = "multi",
                         .algo = admission_algo_name(cmd->build_algo), .gpu = target_gpu,
                         .db = cmd->db_oid, .idx = cmd->index_oid, .dim = cmd->dim,
-                        .gd = cmd->graph_degree, .igd = cmd->intermediate_graph_degree,
-                        .n = total, .final = final, .needed = needed};
+                        .gd = cmd->graph_degree ? cmd->graph_degree : 64,
+                        .igd = cmd->intermediate_graph_degree ? cmd->intermediate_graph_degree : 128,
+                        .n = total, .final = final, .needed = needed,
+                        .shape = cuvs_build_shape_class(total, cmd->dim, cmd->metric,
+                                                        cmd->graph_degree,
+                                                        cmd->intermediate_graph_degree,
+                                                        cmd->build_algo)};
 
         if (target_gpu < 0)
         {
