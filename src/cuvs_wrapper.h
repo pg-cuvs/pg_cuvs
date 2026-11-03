@@ -33,6 +33,15 @@ int cuvs_rmm_pool_stats(int device_id, CuvsRmmPoolStats *out);
 size_t cuvs_rmm_pool_peak_bytes(int device_id);
 void   cuvs_rmm_pool_peak_reset(int device_id);
 
+/* I3-D (UC-6 A): each pooled raft::device_resources owns a dedicated RMM
+ * stream (on) or uses the per-thread default stream (off, the I2 behaviour).
+ * Daemon flag --rmm-dedicated-stream; set before any GPU work. Returns -1
+ * when a different mode is requested after resources were handed out. */
+#ifndef CUVS_RMM_DEDICATED_STREAM_DEFAULT
+#define CUVS_RMM_DEDICATED_STREAM_DEFAULT 1
+#endif
+int cuvs_rmm_set_dedicated_stream(int on);
+
 /* ADR-075 Phase 1: measure physical hardware constants on `device_id`.
  *   link_bw_bpus  -- CPU->GPU H2D bandwidth, bytes per microsecond
  *   hbm_bw_bpus   -- GPU device-memory bandwidth, bytes per microsecond
