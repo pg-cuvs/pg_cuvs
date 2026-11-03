@@ -2690,6 +2690,7 @@ cuvs_hnsw_preflight(double rows, uint32_t dim, uint32_t hierarchy, uint32_t buil
     request.dim = dim;
     request.graph_degree = 64;
     request.intermediate_degree = 128;
+    request.after_scan = may_reject ? 0 : 1;
     request.n_estimate = cuvs_prespool_rows(rows);
     request.host_budget = host_cap;
     if (!request.n_estimate || !host_cap) return CUVS_HNSW_PRESPOOL_FALLBACK;

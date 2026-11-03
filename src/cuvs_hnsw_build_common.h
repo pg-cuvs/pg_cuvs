@@ -436,7 +436,7 @@ cuvs_hnsw_forecast_disk(CuvsHnswForecast *f, int disk_regular,
     f->disk_ok = f->status == CUVS_STATUS_OK && disk_regular && disk_avail >= f->disk_need;
     if (f->status == CUVS_STATUS_OK && !f->disk_ok)
     {
-        snprintf(error, error_len, "HNSW needs regular disk capacity for input/reorder/graph/serialization: need=%llu avail=%llu fs=%s route=%s",
+        snprintf(error, error_len, "HNSW needs regular disk: need=%llu avail=%llu fs=%s route=%s",
                  (unsigned long long)f->disk_need, (unsigned long long)disk_avail,
                  disk_regular ? "regular" : "tmpfs", cuvs_hnsw_route_name(f->decision.route));
         f->status = CUVS_STATUS_BUILD_FAILED;

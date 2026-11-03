@@ -290,7 +290,7 @@ typedef struct CuvsHnswPreflightRequest {
     uint32_t dim;
     uint32_t graph_degree;
     uint32_t intermediate_degree;
-    uint32_t reserved;
+    uint32_t after_scan;       /* 0: from reltuples; 1: no statistics, spooled count */
     uint64_t n_estimate;
     uint64_t host_budget;      /* backend cap, same value the build op sends */
 } CuvsHnswPreflightRequest;
