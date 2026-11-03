@@ -44,13 +44,17 @@ cuvs_prespool_rows(double reltuples)
     return (uint64_t)ceil(reltuples);
 }
 
-/* Receipt timing flag: PRESPOOL when the route was forecast before the scan,
- * STATS_FALLBACK otherwise (C4: "통계가 없거나 0이면 ... 영수증에 남긴다"). */
+/* Receipt timing flags from the PRE-scan action and the statistics that
+ * action saw: PRESPOOL when the route was forecast before the scan; otherwise
+ * AFTER_SCAN, plus NO_STATISTICS only when reltuples was absent or zero
+ * (C4: "통계가 없거나 0이면 ... 영수증에 남긴다"). A failed pre-scan forecast
+ * on a table WITH statistics is not "no statistics" (I3CD-B1). */
 static inline uint32_t
-cuvs_hnsw_timing_flag(CuvsHnswPrespoolAction action)
+cuvs_hnsw_timing_flags(double reltuples, CuvsHnswPrespoolAction action)
 {
-    return action == CUVS_HNSW_PRESPOOL_FALLBACK
-        ? CUVS_HNSW_ROUTE_FLAG_STATS_FALLBACK : CUVS_HNSW_ROUTE_FLAG_PRESPOOL;
+    if (action != CUVS_HNSW_PRESPOOL_FALLBACK) return CUVS_HNSW_ROUTE_FLAG_PRESPOOL;
+    return CUVS_HNSW_ROUTE_FLAG_AFTER_SCAN
+        | (cuvs_prespool_rows(reltuples) ? 0 : CUVS_HNSW_ROUTE_FLAG_NO_STATISTICS);
 }
 
 /* NOTICE lines owed after a successful build (CK-17 (13)): an auto -> ACE

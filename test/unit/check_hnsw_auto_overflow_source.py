@@ -76,7 +76,7 @@ def check(src):
     b = function(code['backend'], 'cuvs_build_hnsw_from_heap(Relation heapRel')
     ordered(b, ['cuvs_hnsw_preflight(stats_rows', 'table_index_build_scan(',
                 'prespool == CUVS_HNSW_PRESPOOL_FALLBACK', 'cuvs_ipc_build_hnsw_file(',
-                'cuvs_hnsw_timing_flag(prespool)', 'cuvs_hnsw_build_notices(&out->policy, transition_sent)'],
+                'cuvs_hnsw_timing_flags(stats_rows, prespool)', 'cuvs_hnsw_build_notices(&out->policy, transition_sent)'],
             'BACKEND_ORDER')
     assert 'heapRel->rd_rel->reltuples' in b.split('table_index_build_scan(', 1)[0], 'STATS_BEFORE_SCAN'
     notices = b.split('cuvs_hnsw_build_notices(', 1)[1]
@@ -115,6 +115,9 @@ MUTANTS = [
      '        if (cuvs_hnsw_forecast_disk(&route, regular, avail, reply.error,', '        if (0 && (regular, avail, reply.error,'),
     ('route_log_receipt_mismatch_ignored', 'server',
      '        && (wire.policy.route != route.decision.route', '        && 0 && (wire.policy.route'),
+    ('timing_flags_ignore_statistics', 'backend',
+     'out->policy.route_flags |= cuvs_hnsw_timing_flags(stats_rows, prespool);',
+     'out->policy.route_flags |= cuvs_hnsw_timing_flags(0, prespool);'),
     ('cagra_ar0_after_scan', 'backend',
      '            && cuvs_cagra_prespool_ar0(reltuples_est,', '            && 0 && (reltuples_est,'),
 ]

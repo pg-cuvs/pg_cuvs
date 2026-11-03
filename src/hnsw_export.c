@@ -3689,9 +3689,7 @@ pg_cuvs_hnsw_build_info(PG_FUNCTION_ARGS)
         (unsigned long long)policy.host_budget, (unsigned long long)policy.gpu_budget,
         (unsigned long long)policy.sdk_host_budget, (unsigned long long)policy.sdk_gpu_budget,
         (policy.route_flags & CUVS_HNSW_ROUTE_FLAG_AUTO_OVERFLOW) ? "true" : "false",
-        (policy.route_flags & CUVS_HNSW_ROUTE_FLAG_PRESPOOL) ? "before_scan_from_statistics"
-        : (policy.route_flags & CUVS_HNSW_ROUTE_FLAG_STATS_FALLBACK) ? "after_scan_no_statistics"
-        : "not_recorded");
+        cuvs_hnsw_route_decided_name(policy.route_flags));
     PG_RETURN_DATUM(DirectFunctionCall1(jsonb_in, CStringGetDatum(json.data)));
 }
 
