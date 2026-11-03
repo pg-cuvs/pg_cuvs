@@ -112,8 +112,8 @@ line with every effective knob.
 |------|---------|--------|
 | Unit (all, macOS) | `make test-unit` | rc=0 — policy 141, status text 80, util 357, corpus 27, circuit/sql/server/docs scans OK (`make-test-unit.txt`) |
 | Unit (Linux image) | `make test-unit` in pgcuvs-i1-cpu | rc=0 (`make-test-unit-linux.txt`) |
-| Shim integration (PG16 + shim daemon) | `sh test/i3b/run_i3b_shim.sh` in the image | 72 PASS, 0 FAIL (`shim-scenario.txt`) |
-| Tier-1 regression | `sh test/i3b/run_i3b_shim.sh` → `test/i3b/run_tier1.sh` | All 37 tests passed (`tier1.txt`) |
+| Shim integration (PG16 + shim daemon) | `sh test/i3b/run_i3b_shim.sh` in the image | 74 PASS, 0 FAIL (`shim-scenario.txt`) |
+| Tier-1 regression | `sh test/i3b/run_tier1.sh` in the image | All 37 tests passed (`tier1.txt`) |
 | max-indexes soft LRU | `run_tier1.sh maxidx` | ALL PASS (`max-indexes-scale.txt`) |
 | Fault suite | `run_tier1.sh fault` | extend_cuda_oom ok; 3 RED by design (item 8) (`fault-suite.txt`) |
 
@@ -131,7 +131,7 @@ CK-25/CK-26 (manual ops, permissions, visibility, history, counters, cross-sessi
 | Status text / SQL permissions | `python3 test/unit/mutate_status_text.py` | 20/20 RED |
 | Server source scan (CK-36 (a), CK-37 (a)) | `python3 test/unit/mutate_i3b_server_source.py` | 9/9 RED |
 | Docs (CK-19/27 parts) | `sh test/unit/mutate_i3b_docs.sh` | 6/6 RED |
-| Daemon/backend via shim scenario | `python3 test/i3b/mutate_i3b_shim.py -j 5` | 18/18 RED (first run 16 RED + 2 MISS; both checks strengthened and the two re-run RED: `mutate-shim-first-run.txt`) |
+| Daemon/backend via shim scenario | `python3 test/i3b/mutate_i3b_shim.py -j 6` | 18/18 RED on the final tree (`mutate-shim.txt`; an earlier run had 2 MISS, both checks were strengthened: `mutate-shim-first-run.txt`) |
 | Circuit breaker | unit + `make test-circuit-source` | 7/7 RED (subagent run, commands in the breaker commits) |
 
 Brief's mutation list mapping: four fences removed (policy F-1..F-4), floor blocking
@@ -141,6 +141,29 @@ corruption fallback (policy parse + shim "startup ignores the usage file"), knob
 not reproducing old behavior (shim, three knobs), stale `reclaim_params` in another
 session (shim "SHOW caches reclaim_params per session"), no half-open after TTL
 (breaker), cached plan 0 rows (breaker source scan).
+
+## Self review (reference only; the official review is conch's Fable reviewer)
+
+An independent code-reviewer subagent read the daemon diff: BLOCK 0, MAJOR 5,
+MINOR 9. Fixed in `fix(daemon): address the I3-B correctness review`: partial
+eviction before a later reject in `ensure_vram` (one pick for the larger
+shortfall), eviction continuing after a failed save, self-replace re-admission
+failure unreported, new registry slots inheriting `hnsw_idx`/`rev_tids` from the
+shifted copy (wrong results, use-after-free), export paths using handle/TIDs
+unlocked while the reclaim thread could free them; plus stale reject reason,
+sharded admission not recorded for F, zero-byte victims, reclaim thread not joined
+at shutdown, OOM-loop `requester_idx`, per-index `index_dir` treated as
+file-current. Left as reported: `pg_cuvs_pin` that loads and then hits the pin cap
+keeps the index loaded; heavy work under `g_index_mutex` (status enumeration,
+reclaim saves) is a latency risk, not a semantic one; AR5 `w = -1` for time
+protection is a contract question for I3-A. No CPU test reproduces the two
+eviction-order races (needs fault injection between the checks) or the stale
+`hnsw_idx` (needs a CPU-HNSW sidecar).
+
+## CUDA compile
+
+NOT_RUN in this worker (no GPU toolchain). The dev VM is announced; when access
+arrives the bundle is built there with nvcc and the result recorded here.
 
 ## Not done / risks (explicit)
 
