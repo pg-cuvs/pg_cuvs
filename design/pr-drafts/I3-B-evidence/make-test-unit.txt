@@ -4,11 +4,20 @@ PASS capacity/ACE, disk FD, cancel/owner EOF, tiny distinct non-self counts and 
 clang -std=gnu11 -Wall -Wextra -I src -o test-hnsw-build-ipc test/unit/test_hnsw_build_ipc.c \
 		src/cuvs_ipc.c src/cuvs_util.c src/cuvs_build_corpus.c -lpthread -lm 
 ./test-hnsw-build-ipc
-[INFO] [hnsw_wait] phase=backend-cancel mono_us=2428572054444 input_dev=16777232 input_ino=369871699
+[INFO] [hnsw_wait] phase=backend-cancel mono_us=2430249836133 input_dev=16777232 input_ino=369955797
 PASS 15 actual-client wire cases,4 preconnect refusals,5 shared-daemon prefix/settings cases; explicitACE/IVF, forgedroute/version/request rejection, cancellation/status13/protocolerror; current global v4 retained
 clang -std=gnu11 -Wall -Wextra -I src -o test-hnsw-admission test/unit/test_hnsw_admission.c -lpthread
 ./test-hnsw-admission
 PASS HNSW drains prior GPU work without holding registry lock; wait is owner-cancellable
+clang -std=c11 -Wall -Wextra -Werror -I src -o test-admission-contract test/unit/test_admission_contract.c \
+		src/cuvs_util.c 
+./test-admission-contract
+test_admission_contract: all checks passed
+clang -I src -c src/cuvs_util.c -o test-admission-contract-util.o
+clang++ -std=c++17 -Wall -Wextra -Werror -I src -o test-admission-contract-cxx -x c++ \
+		test/unit/test_admission_contract.c -x none test-admission-contract-util.o 
+./test-admission-contract-cxx
+test_admission_contract: all checks passed
 clang -std=gnu11 -Wall -Wextra -Werror -I src -o test-cache-policy test/unit/test_cache_policy.c \
 		src/cuvs_cache_policy.c src/cuvs_util.c -lm 
 ./test-cache-policy

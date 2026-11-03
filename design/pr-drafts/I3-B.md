@@ -1,8 +1,9 @@
 # PR I3-B: cache, reclaim, manual functions and circuit breaker (draft)
 
 Stack: I1 → I2 (d058dec6) → I3-A → **I3-B** → I3-C(+D) → I4. This branch sits on
-d058dec6 plus the shared I3-A header commit 36911f50 (`src/cuvs_admission_contract.h`,
-cherry-picked unchanged). IPC version numbers follow the track-split decision
+d058dec6 plus I3-A's shared commits cherry-picked unchanged: 36911f50 (admission
+contract header), c8e6355 (estimate functions and the I4 workspace hook) and
+1c601f9 (extension 0.8.2 → 0.9.0 with empty `-- I3-A begin/end` blocks). IPC version numbers follow the track-split decision
 (`2026-11-02-i2b-track-split.md`): **I3 = 5, I2b = 6**. This PR does not bump
 `CUVS_PROTO_VERSION`; I3-A does (once). New ops are appended in the I3-B range
 **30–37** of 30–39.
@@ -73,9 +74,12 @@ only. **SIGHUP re-reading is not implemented** (the daemon reads no config file)
 
 **GUC**: `cuvs.circuit_breaker_transient_ttl_s` (KB-18).
 
-**SQL**: block `-- I3-B begin/end` in `sql/pg_cuvs--0.8.2--0.9.0.sql` (this file
-holds only the I3-B block; I3-A owns the file and `pg_cuvs--0.9.0.sql`, the block is
-appended to both at stack rebase). Not added to Makefile `DATA` (I3-A's version bump).
+**SQL**: one `-- I3-B begin/end` block appended after I3-A's block, identical in
+`sql/pg_cuvs--0.9.0.sql` and `sql/pg_cuvs--0.8.2--0.9.0.sql` (checked by
+`check_i3b_sql_perms.py`; `upgrade_path` passes). EXECUTE: unload/load/pin/unpin
+PUBLIC with the owner check in C; the `(oid, oid)` overloads, `pg_cuvs_reclaim_set`
+and `pg_cuvs_memory_status` revoked from PUBLIC (`pg_monitor` granted the last);
+`pg_cuvs_index_status`/`pg_cuvs_circuit_status` PUBLIC.
 
 **Logs**: `[evict]` and `[reclaim]` in the ADR-086 13-field schemas; `[self_replace]`
 with the NOTICE text; `[startup]` load order and summary; `cache policy` startup
@@ -110,7 +114,7 @@ line with every effective knob.
 
 | Area | Command | Result |
 |------|---------|--------|
-| Unit (all, macOS) | `make test-unit` | rc=0 — policy 141, status text 80, util 357, corpus 27, circuit/sql/server/docs scans OK (`make-test-unit.txt`) |
+| Unit (all, macOS) | `make test-unit` | rc=0 — admission contract (C11 + C++17), policy 141, status text 80, util 357, corpus 27, circuit/sql/server/docs scans OK (`make-test-unit.txt`) |
 | Unit (Linux image) | `make test-unit` in pgcuvs-i1-cpu | rc=0 (`make-test-unit-linux.txt`) |
 | Shim integration (PG16 + shim daemon) | `sh test/i3b/run_i3b_shim.sh` in the image | 74 PASS, 0 FAIL (`shim-scenario.txt`) |
 | Tier-1 regression | `sh test/i3b/run_tier1.sh` in the image | All 37 tests passed (`tier1.txt`) |
@@ -128,7 +132,7 @@ CK-25/CK-26 (manual ops, permissions, visibility, history, counters, cross-sessi
 | Suite | Command | Result |
 |-------|---------|--------|
 | Policy module | `python3 test/unit/mutate_cache_policy.py` | 38/38 RED (`mutate-cache-policy.txt`) |
-| Status text / SQL permissions | `python3 test/unit/mutate_status_text.py` | 20/20 RED |
+| Status text / SQL permissions | `python3 test/unit/mutate_status_text.py` | 21/21 RED (incl. install/upgrade block divergence) |
 | Server source scan (CK-36 (a), CK-37 (a)) | `python3 test/unit/mutate_i3b_server_source.py` | 9/9 RED |
 | Docs (CK-19/27 parts) | `sh test/unit/mutate_i3b_docs.sh` | 6/6 RED |
 | Daemon/backend via shim scenario | `python3 test/i3b/mutate_i3b_shim.py -j 6` | 18/18 RED on the final tree (`mutate-shim.txt`; an earlier run had 2 MISS, both checks were strengthened: `mutate-shim-first-run.txt`) |
