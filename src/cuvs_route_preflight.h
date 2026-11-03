@@ -141,6 +141,21 @@ cuvs_cagra_prespool_ar0(double reltuples, uint32_t dim, int graph_degree,
     return *estimate > max_limit;
 }
 
+/* HINT for an HNSW allocation failure after admission (status 2, v6 C2:
+ * auto -> explicit ace; ivf_pq -> budget, cleanup, ace; ace -> as is). */
+static inline const char *
+cuvs_hnsw_oom_hint(uint32_t build_algo)
+{
+    switch (build_algo) {
+    case CUVS_HNSW_ALGO_AUTO:
+        return "The resident estimate was admitted but memory ran out; retry with build_algo='ace' explicitly, or free host/GPU memory.";
+    case CUVS_HNSW_ALGO_IVF_PQ:
+        return "Raise the build budget (cuvs.max_build_mem_mb), drop or unload unused GPU indexes, or use build_algo='ace'.";
+    default:
+        return "Free host/GPU memory and retry; ACE has no smaller route.";
+    }
+}
+
 static inline uint32_t
 cuvs_prespool_mib(uint64_t bytes)
 {

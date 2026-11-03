@@ -25,6 +25,7 @@ CREATE INDEX items_disk_ann ON items USING pg_cuvs_hnsw (embedding vector_l2_ops
 
 빈 heap은 GPU 생성/영수증이 없고, source graph 재사용은 재생성 정책을 적용하지 않는다.
 resident 예산 초과 전용 status13과 ACE 힌트는 tiny/ACE 자체 실패·불명 입력·실제 OOM에 쓰지 않는다.
+빌드 중 메모리 할당 실패(`std::bad_alloc`, RMM `out_of_memory`)는 status 2이고 SQLSTATE 53200(`memory exhausted during the HNSW build`)으로 끝나며 상주 인덱스를 내리지 않는다. HINT는 요청 algo별로 다르다(auto: 명시 `ace`, ivf_pq: 예산·정리·`ace`).
 
 `cuvs.max_build_mem_mb`는 이 HNSW 경로에서 host 경로 선택 예산이다.
 훈련 reserve는 실제 SDK 정수 샘플링 행 수를 사용한다. 추정치와 SDK guard는 모든 할당이나 RSS의 상한 보장이 아니다.

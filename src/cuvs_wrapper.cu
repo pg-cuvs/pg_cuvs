@@ -2708,6 +2708,16 @@ cuvs_hnsw_build_file(int vectors_fd, int owner_fd,
             (unsigned long long)cap.host_peak, (unsigned long long)cap.gpu_peak);
         return execute_hnsw_file_build(params, owner_fd, workdir, device_id, files, prepared, out_fd);
     }
+    catch (const std::bad_alloc &e)
+    {
+        /* v6 C2: an allocation failure after the route was admitted (host
+         * std::bad_alloc or RMM out_of_memory, which derives from it) is
+         * status 2, not a generic build failure. Nothing is evicted. */
+        snprintf(error, error_len, "allocation failed during HNSW build: %s", e.what());
+        fprintf(stderr, "[hnsw_build] job=%s phase=cuvs-oom mono_us=%llu cancelled=%d error=%s\n",
+            workdir, (unsigned long long)cuvs_hnsw_monotonic_us(), cuvs_hnsw_owner_cancelled(owner_fd), e.what());
+        return CUVS_STATUS_OOM_FALLBACK;
+    }
     catch (const std::exception &e)
     {
         snprintf(error, error_len, "%s", e.what());
