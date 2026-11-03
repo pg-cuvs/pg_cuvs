@@ -436,6 +436,10 @@ test_memory_columns(void)
     g_rmm_pool_limits[1] = 0;        /* no quota: pool columns NULL even if readable */
     CHECK(mem_row(1, &r));
     CHECK(mcol(&r, "pool_used") == -1 && mcol(&r, "quota_bytes") == 0);
+    /* A saturated counter is clamped to int64 (mem_row parses every field). */
+    g_lw_pending[1] = UINT64_MAX;
+    CHECK(mem_row(1, &r));
+    CHECK(mcol(&r, "lw_pending") == INT64_MAX);
     fx_pool_ok = 0;
     g_max_vram_per_gpu[1] = (size_t)64 << 30;
     g_pending_rmm_build_vram[1] = 0;
