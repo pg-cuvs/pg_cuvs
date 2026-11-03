@@ -41,7 +41,7 @@ header_version="$(sed -n 's/^#define PG_CUVS_VERSION "\([^"]*\)".*/\1/p' src/cuv
 if [[ -z "$control_version" || -z "$make_version" || -z "$header_version" ]]; then
     fail "could not read all extension version declarations"
 else
-    [[ "$control_version" == "0.8.2" ]] || fail "pg_cuvs.control version is $control_version, expected 0.8.2"
+    [[ "$control_version" == "0.9.0" ]] || fail "pg_cuvs.control version is $control_version, expected 0.9.0"
     [[ "$make_version" == "$control_version" ]] || fail "Makefile EXTVERSION ($make_version) differs from control ($control_version)"
     [[ "$header_version" == "$control_version" ]] || fail "PG_CUVS_VERSION ($header_version) differs from control ($control_version)"
 fi
@@ -50,6 +50,8 @@ require_file "sql/pg_cuvs--0.4.0--0.5.0.sql"
 require_file "sql/pg_cuvs--0.8.0--0.8.1.sql"
 require_file "sql/pg_cuvs--0.8.1--0.8.2.sql"
 require_file "sql/pg_cuvs--0.8.2.sql"
+require_file "sql/pg_cuvs--0.8.2--0.9.0.sql"
+require_file "sql/pg_cuvs--0.9.0.sql"
 require_file "test/sql/upgrade_path.sql"
 
 require_text "docs/reference.md" '| `cuvs.filter_auto_threshold` | real | `0.0` |'
