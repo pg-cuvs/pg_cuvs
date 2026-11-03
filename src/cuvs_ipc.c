@@ -2580,3 +2580,105 @@ cuvs_ipc_build_hnsw_file(const char *socket_path, int vectors_fd,
     if (sock >= 0) close(sock);
     return rc;
 }
+
+/* ----------------------------------------------------------------
+ * I3-B: manual cache ops, reclaim parameter change, text status ops.
+ * ---------------------------------------------------------------- */
+static int
+ipc_header_only(const char *socket_path, CuvsCmdFrame *cmd, char *msg,
+                size_t msglen)
+{
+    CuvsReplyHeader hdr;
+    int rc = CUVS_STATUS_ERROR;
+    int sock = uds_connect_ex(socket_path, 30);
+
+    if (msg && msglen)
+        msg[0] = '\0';
+    if (sock < 0)
+        return CUVS_STATUS_UNAVAILABLE;
+    if (send_cmd(sock, cmd) == 0 && recv_all(sock, &hdr, sizeof(hdr)) == 0)
+    {
+        rc = (int) hdr.status;
+        if (msg && msglen)
+        {
+            hdr.error[sizeof(hdr.error) - 1] = '\0';
+            snprintf(msg, msglen, "%s", hdr.error);
+        }
+    }
+    close(sock);
+    return rc;
+}
+
+int
+cuvs_ipc_manual(const char *socket_path, uint32_t op, uint32_t db_oid,
+                uint32_t index_oid, char *msg, size_t msglen)
+{
+    CuvsCmdFrame cmd;
+    memset(&cmd, 0, sizeof(cmd));
+    cmd.op = op;
+    cmd.db_oid = db_oid;
+    cmd.index_oid = index_oid;
+    return ipc_header_only(socket_path, &cmd, msg, msglen);
+}
+
+int
+cuvs_ipc_reclaim_set(const char *socket_path, const char *name,
+                     const char *value, char *msg, size_t msglen)
+{
+    CuvsCmdFrame cmd;
+    memset(&cmd, 0, sizeof(cmd));
+    cmd.op = CUVS_OP_RECLAIM_SET;
+    if (strlen(name) >= sizeof(cmd.shm_key) ||
+        strlen(value) >= sizeof(cmd.filter_shm_key))
+    {
+        if (msg && msglen)
+            snprintf(msg, msglen, "parameter name or value too long");
+        return CUVS_STATUS_ERROR;
+    }
+    snprintf(cmd.shm_key, sizeof(cmd.shm_key), "%s", name);
+    snprintf(cmd.filter_shm_key, sizeof(cmd.filter_shm_key), "%s", value);
+    return ipc_header_only(socket_path, &cmd, msg, msglen);
+}
+
+int
+cuvs_ipc_text(const char *socket_path, uint32_t op, char **text, size_t *len)
+{
+    CuvsCmdFrame cmd;
+    CuvsReplyHeader hdr;
+    int rc = CUVS_STATUS_ERROR;
+    int sock = uds_connect_ex(socket_path, 30);
+
+    *text = NULL;
+    if (len)
+        *len = 0;
+    if (sock < 0)
+        return CUVS_STATUS_UNAVAILABLE;
+    memset(&cmd, 0, sizeof(cmd));
+    cmd.op = op;
+    if (send_cmd(sock, &cmd) == 0 && recv_all(sock, &hdr, sizeof(hdr)) == 0)
+    {
+        rc = (int) hdr.status;
+        if (rc == CUVS_STATUS_OK)
+        {
+            char *buf;
+            if (hdr.n_results > CUVS_IPC_TEXT_MAX ||
+                (buf = malloc((size_t) hdr.n_results + 1)) == NULL)
+                rc = CUVS_STATUS_ERROR;
+            else if (hdr.n_results > 0 &&
+                     recv_all(sock, buf, hdr.n_results) < 0)
+            {
+                free(buf);
+                rc = CUVS_STATUS_ERROR;
+            }
+            else
+            {
+                buf[hdr.n_results] = '\0';
+                *text = buf;
+                if (len)
+                    *len = hdr.n_results;
+            }
+        }
+    }
+    close(sock);
+    return rc;
+}
