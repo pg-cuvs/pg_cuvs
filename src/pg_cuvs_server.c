@@ -1071,6 +1071,93 @@ typedef struct AdmitLine {
     int         workspace_valid;
 } AdmitLine;
 
+/* ---- I3-E observation (C8): rejection counters and in-flight builds ----
+ * Every variable here is read and written under g_index_mutex. Counters are
+ * cumulative and never reset by a read (C8); only a daemon restart clears
+ * them. */
+static uint64_t g_rejects[CUVS_MAX_GPUS][CUVS_I3E_N_REJECT_REASONS];
+static uint64_t g_rejects_no_gpu[CUVS_I3E_N_REJECT_REASONS];
+static int      g_last_reject_reason1[CUVS_MAX_GPUS];   /* reason + 1; 0 = none */
+static time_t   g_last_reject_at[CUVS_MAX_GPUS];
+static CuvsBuildStatusRow g_builds[CUVS_MAX_ACTIVE_BUILDS];
+static int      g_builds_used[CUVS_MAX_ACTIVE_BUILDS];
+static uint64_t g_builds_unlisted;
+
+/* One count per emitted [admit] rejection (log_admit), never in
+ * admission_fill, which also formats replies and rechecks. */
+static void
+observe_reject(int dev, CuvsAdmissionReason reason)
+{
+    if ((int)reason < (int)CUVS_ADMISSION_AR0 || (int)reason > (int)CUVS_ADMISSION_AR7)
+        return;
+    if (dev < 0 || dev >= CUVS_MAX_GPUS)
+    {
+        g_rejects_no_gpu[reason]++;
+        return;
+    }
+    g_rejects[dev][reason]++;
+    g_last_reject_reason1[dev] = (int)reason + 1;
+    g_last_reject_at[dev] = time(NULL);
+}
+
+/* Registers an admitted unlocked CAGRA build in the critical section that
+ * reserves its N (reserve_build_vram). The row copies the AdmitLine, so it
+ * outlives the builder's stack frame. Returns the slot, or -1 when the table
+ * is full (the build runs unlisted and builds_unlisted counts it). */
+static int
+build_status_register(const AdmitLine *a, uint32_t policy, uint64_t lw_ub)
+{
+    struct timespec ts;
+    for (int slot = 0; slot < CUVS_MAX_ACTIVE_BUILDS; slot++)
+    {
+        CuvsBuildStatusRow *r = &g_builds[slot];
+        if (g_builds_used[slot])
+            continue;
+        memset(r, 0, sizeof(*r));
+        clock_gettime(CLOCK_REALTIME, &ts);
+        r->gpu = a->gpu;
+        r->db_oid = a->db;
+        r->index_oid = a->idx;
+        r->dim = a->dim;
+        r->n = a->n;
+        r->started_at_us = (int64_t)ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
+        r->final_bytes = a->final;
+        r->scratch_bytes = a->needed > a->final ? a->needed - a->final : 0;
+        r->reserved_n_bytes = a->needed;
+        r->lw_ub_bytes = lw_ub;
+        r->lw_ub_valid = (uint32_t)(a->workspace_valid != 0);
+        r->policy = policy;
+        snprintf(r->algo, sizeof(r->algo), "%s", a->algo ? a->algo : "");
+        snprintf(r->path, sizeof(r->path), "%s", a->path ? a->path : "");
+        snprintf(r->phase, sizeof(r->phase), "%s", "building");
+        g_builds_used[slot] = 1;
+        return slot;
+    }
+    g_builds_unlisted++;
+    return -1;
+}
+
+/* In the critical section that releases the build's N (release_build_vram). */
+static void
+build_status_unregister(int slot)
+{
+    if (slot >= 0 && slot < CUVS_MAX_ACTIVE_BUILDS)
+        g_builds_used[slot] = 0;
+}
+
+/* Pool status append (I3-E). Takes g_index_mutex for one snapshot. */
+static void
+i3e_fill_pool_status(CuvsRmmPoolStatus *status)
+{
+    pthread_mutex_lock(&g_index_mutex);
+    status->builds_unlisted = g_builds_unlisted;
+    memcpy(status->rejects_no_gpu, g_rejects_no_gpu, sizeof(status->rejects_no_gpu));
+    for (int slot = 0; slot < CUVS_MAX_ACTIVE_BUILDS; slot++)
+        if (g_builds_used[slot])
+            status->builds[status->n_builds++] = g_builds[slot];
+    pthread_mutex_unlock(&g_index_mutex);
+}
+
 /* B's device meter is observed under g_index_mutex. solo follows C8:
  * at most one in-flight build at the point the line is emitted. */
 
@@ -1204,6 +1291,8 @@ log_admit(const AdmitLine *a, CuvsAdmissionReason reason)
              (unsigned long long)phys_free, (unsigned long long)lw_ub,
              (unsigned long long)lw_pending, (unsigned long long)host_guard,
              (unsigned long long)a->self_res, (unsigned long long)admission_mono_us());
+    if (reason != CUVS_ADMISSION_NONE)
+        observe_reject(dev, reason);   /* I3-E: one count per emitted rejection */
     if (a->shape && strcmp(a->shape, "extrapolated") == 0)
         LOG_WARN("scratch model unvalidated: n=%lld dim=%u gd=%u igd=%u algo=%s\n",
                  (long long) a->n, a->dim, a->gd, a->igd, a->algo);
@@ -6960,6 +7049,7 @@ handle_build(int client_fd, const CuvsCmdFrame *cmd)
     CuvsLwBuildStats lw_stats;
     char lw_notice[CUVS_ADMISSION_ERR_OUT_BYTES];
     lw_pending_reserve(lw_ub, target_gpu);
+    int build_slot = build_status_register(&al, lw_policy, lw_ub);   /* I3-E */
     lw_warn_shape(cmd->n_vecs, cmd->dim, (int)cmd->intermediate_graph_degree,
                   cmd->db_oid, cmd->index_oid);
     log_admit(&al, CUVS_ADMISSION_NONE);
@@ -6988,6 +7078,7 @@ handle_build(int client_fd, const CuvsCmdFrame *cmd)
         note_self_replace_failure(cmd->index_oid, self_unloaded);
     release_build_vram(needed, target_gpu);
     lw_pending_release(lw_ub, target_gpu);
+    build_status_unregister(build_slot);   /* I3-E */
     (void)lw_build_finish("build", target_gpu, cmd->db_oid, cmd->index_oid, lw_policy,
                           lw_ub, &lw_stats, lw_notice, sizeof(lw_notice));
     log_release("BUILD", target_gpu, cmd->db_oid, cmd->index_oid, needed,
@@ -7682,6 +7773,7 @@ handle_build_multi(int client_fd, const CuvsCmdFrame *cmd, const char *index_dir
         CuvsLwBuildStats lw_stats;
         char lw_notice[CUVS_ADMISSION_ERR_OUT_BYTES];
         lw_pending_reserve(lw_ub, target_gpu);
+        int build_slot = build_status_register(&al, lw_policy, lw_ub);   /* I3-E */
         lw_warn_shape(total, cmd->dim, (int)cmd->intermediate_graph_degree,
                       cmd->db_oid, cmd->index_oid);
         log_admit(&al, CUVS_ADMISSION_NONE);
@@ -7708,6 +7800,7 @@ handle_build_multi(int client_fd, const CuvsCmdFrame *cmd, const char *index_dir
             note_self_replace_failure(cmd->index_oid, self_unloaded);
         release_build_vram(needed, target_gpu);
         lw_pending_release(lw_ub, target_gpu);
+        build_status_unregister(build_slot);   /* I3-E */
         (void)lw_build_finish("build_multi", target_gpu, cmd->db_oid, cmd->index_oid, lw_policy,
                               lw_ub, &lw_stats, lw_notice, sizeof(lw_notice));
         log_release("BUILD", target_gpu, cmd->db_oid, cmd->index_oid, needed,
@@ -10488,7 +10581,10 @@ index_status_row(TextBuf *b, uint32_t db, uint32_t idx, const char *state,
                 cuvs_evict_protect_s(e->hits, pp.t_min_s, pp.bonus_s, pp.hits_cap);
     }
     tb_printf(b, "%u\t%u\t%s\t%s\t%d\t%zu\t%lld\t%lld\t%u\t%d\t%d\t%lld\t%d\t%s\t%d\t%lld\t%s\t"
-                 "%llu\t%lld\t%s\t%d\t%llu\n",
+                 "%llu\t%lld\t%s\t%d\t%llu"
+                 /* I3-E: dataset_attached = -1 (NULL). No wrapper API reads a
+                  * loaded CAGRA handle's attach state yet (later stage). */
+                 "\t-1\n",
               db, idx, state, kind,
               e ? entry_home_gpu(e) : -1,
               e ? entry_total_bytes(e) : (size_t)0,
@@ -10535,7 +10631,7 @@ static void
 handle_index_status(int client_fd)
 {
     TextBuf b = {0};
-    tb_printf(&b, "%s\n", CUVS_INDEX_STATUS_COLS);
+    tb_printf(&b, "%s%s\n", CUVS_INDEX_STATUS_COLS, CUVS_INDEX_STATUS_COLS_I3E);
     pthread_mutex_lock(&g_index_mutex);
     for (int i = 0; i < g_n_indexes; i++)
     {
@@ -10590,11 +10686,36 @@ handle_index_status(int client_fd)
     send_text(client_fd, &b);
 }
 
+/* I3-E tail of one memory_status row (CUVS_MEMORY_STATUS_COLS_I3E order).
+ * pool_used / pool_reserved are -1 (NULL) when the GPU has no RMM pool quota
+ * or the pool cannot be read. Caller holds g_index_mutex. */
+static void
+memory_status_row_i3e(TextBuf *b, int dev)
+{
+    CuvsRmmPoolStats ps;
+    int pool_ok = g_rmm_pool_limits[dev] > 0 && cuvs_rmm_pool_stats(dev, &ps) == 0;
+    int last = g_last_reject_reason1[dev] - 1;
+    tb_printf(b, "\t%zu\t%zu\t%lld\t%lld\t%zu\t%llu\t%d",
+              g_max_vram_per_gpu[dev], g_rmm_pool_limits[dev],
+              pool_ok ? (long long)ps.used_bytes : -1LL,
+              pool_ok ? (long long)ps.reserved_bytes : -1LL,
+              g_pending_rmm_build_vram[dev],
+              (unsigned long long)g_lw_pending[dev],
+              g_pending_build_count[dev]);
+    for (int r = 0; r < CUVS_I3E_N_REJECT_REASONS; r++)
+        tb_printf(b, "\t%llu", (unsigned long long)g_rejects[dev][r]);
+    tb_printf(b, "\t%s\t%lld\t%llu\t%llu\n",
+              last >= 0 ? cuvs_admission_reason_name((CuvsAdmissionReason)last) : "",
+              (long long)g_last_reject_at[dev],
+              (unsigned long long)g_managed_spill_builds[dev],
+              (unsigned long long)g_managed_spill_bytes_max[dev]);
+}
+
 static void
 handle_memory_status(int client_fd)
 {
     TextBuf b = {0};
-    tb_printf(&b, "%s\n", CUVS_MEMORY_STATUS_COLS);
+    tb_printf(&b, "%s%s\n", CUVS_MEMORY_STATUS_COLS, CUVS_MEMORY_STATUS_COLS_I3E);
     pthread_mutex_lock(&g_index_mutex);
     for (int i = 0; i < n_usable_gpus(); i++)
     {
@@ -10618,7 +10739,7 @@ handle_memory_status(int client_fd)
         CuvsRmmPoolStats ps;
         memset(&ps, 0, sizeof(ps));
         tb_printf(&b, "%d\t%zu\t%zu\t%zu\t%zu\t%d\t%d\t%s\t%llu\t%s\t%lld\t%s\t%llu\t%llu\t%llu\t"
-                      "%llu\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu\n",
+                      "%llu\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu",
                   dev, budget_eff_bytes(dev), resident_bytes(dev),
                   g_pending_build_vram[dev], pinned, n_res, n_pin,
                   cuvs_reclaim_mode_name(g_reclaim.mode),
@@ -10640,6 +10761,7 @@ handle_memory_status(int client_fd)
                   (unsigned long long)g_cache_drops,
                   (unsigned long long)g_history_dropped,
                   (unsigned long long)cuvs_rmm_pool_peak_bytes(dev));
+        memory_status_row_i3e(&b, dev);   /* I3-E columns, then '\n' */
     }
     pthread_mutex_unlock(&g_index_mutex);
     send_text(client_fd, &b);
@@ -10979,6 +11101,8 @@ connection_thread(void *arg)
                 }
             if (hdr.status == CUVS_STATUS_OK)
                 lw_fill_pool_status(&status);
+            if (hdr.status == CUVS_STATUS_OK)
+                i3e_fill_pool_status(&status);   /* I3-E append */
             send_all(client_fd, &hdr, sizeof(hdr));
             if (hdr.status == CUVS_STATUS_OK)
                 send_all(client_fd, &status, sizeof(status));

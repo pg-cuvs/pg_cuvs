@@ -921,6 +921,22 @@ test-lw-daemon:
 		-Wl,--gc-sections -lm -lpthread -lrt -lcurl -lssl -lcrypto -o test-lw-daemon
 	./test-lw-daemon
 
+# I3-E / C8: rejection counters, memory_status I3-E columns, build_status rows
+# for in-flight unlocked CAGRA builds, through the actual daemon source (CPU
+# shim; the build entry points and the RMM pool reader are fixtures).
+test-i3e-observation:
+	$(CC) -std=gnu11 -O1 -DPGCUVS_CPU_SHIM -ffunction-sections -fdata-sections -I src \
+		test/unit/test_i3e_observation.c src/cuvs_ipc.c src/cuvs_util.c src/cuvs_status_text.c \
+		src/cuvs_objstore.c src/cuvs_build_corpus.c src/cuvs_wrapper_shim_cpu.c \
+		src/cuvs_cache_policy.c src/cuvs_peak_meter.c \
+		-Wl,--gc-sections -lm -lpthread -lrt -lcurl -lssl -lcrypto -o test-i3e-observation
+	./test-i3e-observation
+
+# I3-E SQL surface and docs (no PG): the I3-E block in both 0.9.0 scripts,
+# RETURNS TABLE vs daemon headers/kinds, grants, C9 table coverage.
+test-i3e-sql:
+	python3 -I test/unit/check_i3e_sql.py .
+
 # I4 review B-2 (b): start the real CPU-shim daemon (no fixture) and check
 # /proc/<pid>/oom_score_adj, the startup lines and the pool-status IPC reply.
 # Linux, non-root. The daemon binary is built here without PGXS.

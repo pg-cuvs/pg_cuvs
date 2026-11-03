@@ -487,6 +487,30 @@ typedef struct CuvsLwDeviceStatus {
     uint64_t managed_spill_bytes_max;  /* largest lw_peak among them */
 } CuvsLwDeviceStatus;
 
+/* I3-E / C8: one in-flight CAGRA build that runs unlocked (handle_build and
+ * handle_build_multi), registered in the critical section that reserves its
+ * N and removed in the one that releases it. Sharded and IVF-PQ builds hold
+ * g_index_mutex for the whole build and never appear. */
+#define CUVS_MAX_ACTIVE_BUILDS 32
+#define CUVS_I3E_N_REJECT_REASONS 8    /* AR0..AR7 */
+typedef struct CuvsBuildStatusRow {
+    int32_t  gpu;
+    uint32_t db_oid;
+    uint32_t index_oid;
+    uint32_t dim;
+    int64_t  n;
+    int64_t  started_at_us;    /* wall clock (CLOCK_REALTIME) epoch microseconds */
+    uint64_t final_bytes;
+    uint64_t scratch_bytes;    /* reserved_n_bytes - final_bytes */
+    uint64_t reserved_n_bytes; /* N reserved in pending_logical */
+    uint64_t lw_ub_bytes;      /* the lw_ub this build added to lw_pending */
+    uint32_t policy;           /* CuvsLwOverflow passed to the wrapper */
+    uint32_t lw_ub_valid;      /* 1: lw_ub from this build's admission workspace */
+    char     algo[16];
+    char     path[16];         /* single / multi */
+    char     phase[16];        /* building */
+} CuvsBuildStatusRow;
+
 typedef struct CuvsRmmPoolStatus {
     uint32_t version;
     uint32_t initial_mb;
@@ -506,6 +530,13 @@ typedef struct CuvsRmmPoolStatus {
     uint32_t lw_n_devices;
     char     oom_score_adj_result[96]; /* startup line text (C8 second channel) */
     CuvsLwDeviceStatus lw_devices[CUVS_MAX_GPUS];
+    /* I3-E (append-only, after I4): C8 in-flight builds for
+     * pg_cuvs_build_status and the admission rejections that had no GPU. */
+    uint32_t n_builds;                 /* rows in builds[] */
+    uint32_t builds_reserved;
+    uint64_t builds_unlisted;          /* builds not listed: table full */
+    uint64_t rejects_no_gpu[CUVS_I3E_N_REJECT_REASONS]; /* AR0..AR7, gpu = -1 */
+    CuvsBuildStatusRow builds[CUVS_MAX_ACTIVE_BUILDS];
 } CuvsRmmPoolStatus;
 
 int cuvs_ipc_rmm_pool_status(const char *socket_path, CuvsRmmPoolStatus *out);
@@ -1023,6 +1054,19 @@ int cuvs_ipc_inject_build_oom(
     "evict_reclaim\tevict_manual_unload\tevict_slot\tevictions\tdrops\t" \
     "history_dropped\tpeak_bytes"
 #define CUVS_MEMORY_STATUS_NCOLS 25
+
+/* I3-E (append-only, after the I3-B columns): C8 fields no earlier tip
+ * carried. The daemon's header line is *_COLS followed by *_COLS_I3E; the
+ * I3-E SQL block redefines the two functions with the joined column list. */
+#define CUVS_MEMORY_STATUS_COLS_I3E \
+    "\tbudget_bytes\tquota_bytes\tpool_used\tpool_reserved\tpending_rmm\t" \
+    "lw_pending\tbuilds_active\trejects_ar0\trejects_ar1\trejects_ar2\t" \
+    "rejects_ar3\trejects_ar4\trejects_ar5\trejects_ar6\trejects_ar7\t" \
+    "last_reject_reason\tlast_reject_at\tmanaged_spill_builds\t" \
+    "managed_spill_bytes_max"
+#define CUVS_MEMORY_STATUS_NCOLS_I3E 19
+#define CUVS_INDEX_STATUS_COLS_I3E "\tdataset_attached"
+#define CUVS_INDEX_STATUS_NCOLS_I3E 1
 
 /* Manual op: returns CUVS_STATUS_*; msg receives the daemon's text. */
 int cuvs_ipc_manual(const char *socket_path, uint32_t op, uint32_t db_oid,

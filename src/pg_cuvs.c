@@ -1113,6 +1113,43 @@ cuvs_rmm_pool_status_show(void)
                          (unsigned long long)d->managed_spill_builds,
                          (unsigned long long)d->managed_spill_bytes_max);
     }
+    appendStringInfoString(&json, "]");
+    /* I3-E keys (append-only, after I4): C8 in-flight builds. */
+    appendStringInfo(&json, ",\"builds_unlisted\":%llu,\"rejects_no_gpu\":{",
+                     (unsigned long long)status.builds_unlisted);
+    for (int r = 0; r < CUVS_I3E_N_REJECT_REASONS; r++)
+        appendStringInfo(&json, "%s\"ar%d\":%llu", r ? "," : "", r,
+                         (unsigned long long)status.rejects_no_gpu[r]);
+    appendStringInfoString(&json, "},\"builds\":[");
+    for (uint32_t i = 0; i < status.n_builds && i < CUVS_MAX_ACTIVE_BUILDS; i++)
+    {
+        CuvsBuildStatusRow *b = &status.builds[i];
+        b->algo[sizeof(b->algo) - 1] = '\0';
+        b->path[sizeof(b->path) - 1] = '\0';
+        b->phase[sizeof(b->phase) - 1] = '\0';
+        appendStringInfo(&json,
+                         "%s{\"gpu\":%d,\"db_oid\":%u,\"index_oid\":%u,\"algo\":",
+                         i ? "," : "", b->gpu, b->db_oid, b->index_oid);
+        escape_json(&json, b->algo);
+        appendStringInfoString(&json, ",\"path\":");
+        escape_json(&json, b->path);
+        appendStringInfo(&json,
+                         ",\"started_at_us\":%lld,\"n\":%lld,\"dim\":%u,\"final\":%llu,"
+                         "\"scratch\":%llu,\"reserved_n\":%llu,\"policy\":\"%s\",",
+                         (long long)b->started_at_us, (long long)b->n, b->dim,
+                         (unsigned long long)b->final_bytes,
+                         (unsigned long long)b->scratch_bytes,
+                         (unsigned long long)b->reserved_n_bytes,
+                         b->policy == 1 ? "managed" : "error");
+        if (b->lw_ub_valid)
+            appendStringInfo(&json, "\"lw_ub\":%llu,\"lw_ub_src\":\"admission\",",
+                             (unsigned long long)b->lw_ub_bytes);
+        else
+            appendStringInfoString(&json, "\"lw_ub\":null,\"lw_ub_src\":\"none\",");
+        appendStringInfoString(&json, "\"phase\":");
+        escape_json(&json, b->phase);
+        appendStringInfoChar(&json, '}');
+    }
     appendStringInfoString(&json, "]}");
     return json.data;
 }
@@ -7166,6 +7203,7 @@ cuvs_status_row_datums(char **f, const char *kinds, int ncols, int row,
                 values[c] = Int32GetDatum((int32) v);
                 break;
             case CUVS_SF_I64:
+            case CUVS_SF_I64N:      /* I3-E */
                 values[c] = Int64GetDatum((int64) v);
                 break;
             case CUVS_SF_TIME:
@@ -7281,8 +7319,10 @@ PG_FUNCTION_INFO_V1(pg_cuvs_index_status);
 Datum
 pg_cuvs_index_status(PG_FUNCTION_ARGS)
 {
-    cuvs_status_emit(fcinfo, CUVS_OP_INDEX_STATUS, CUVS_INDEX_STATUS_COLS,
-                     CUVS_INDEX_STATUS_NCOLS, CUVS_INDEX_STATUS_KINDS, true);
+    cuvs_status_emit(fcinfo, CUVS_OP_INDEX_STATUS,
+                     CUVS_INDEX_STATUS_COLS CUVS_INDEX_STATUS_COLS_I3E,
+                     CUVS_INDEX_STATUS_NCOLS + CUVS_INDEX_STATUS_NCOLS_I3E,
+                     CUVS_INDEX_STATUS_KINDS CUVS_INDEX_STATUS_KINDS_I3E, true);
     return (Datum) 0;
 }
 
@@ -7294,8 +7334,89 @@ pg_cuvs_memory_status(PG_FUNCTION_ARGS)
         ereport(ERROR,
                 (errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
                  errmsg("must be superuser or a member of pg_monitor to call pg_cuvs_memory_status")));
-    cuvs_status_emit(fcinfo, CUVS_OP_MEMORY_STATUS, CUVS_MEMORY_STATUS_COLS,
-                     CUVS_MEMORY_STATUS_NCOLS, CUVS_MEMORY_STATUS_KINDS, false);
+    cuvs_status_emit(fcinfo, CUVS_OP_MEMORY_STATUS,
+                     CUVS_MEMORY_STATUS_COLS CUVS_MEMORY_STATUS_COLS_I3E,
+                     CUVS_MEMORY_STATUS_NCOLS + CUVS_MEMORY_STATUS_NCOLS_I3E,
+                     CUVS_MEMORY_STATUS_KINDS CUVS_MEMORY_STATUS_KINDS_I3E, false);
+    return (Datum) 0;
+}
+
+/* I3-E (C8): in-flight unlocked CAGRA builds, read from the pool status v2
+ * reply (builds[]). EXECUTE is PUBLIC; rows are filtered like index_status:
+ * superuser and pg_monitor see every build, other roles only builds of an
+ * index of the current database they own. A CREATE INDEX build's index is
+ * not yet visible to other sessions, so only privileged callers see it.
+ * Empty when the daemon (or its pool status) is unavailable. */
+#define CUVS_BUILD_STATUS_NATTS 16
+PG_FUNCTION_INFO_V1(pg_cuvs_build_status);
+Datum
+pg_cuvs_build_status(PG_FUNCTION_ARGS)
+{
+    TupleDesc          tupdesc;
+    Tuplestorestate   *tupstore = cuvs_status_srf_begin(fcinfo, &tupdesc);
+    bool               is_priv = cuvs_status_is_priv();
+    CuvsRmmPoolStatus *st = palloc(sizeof(CuvsRmmPoolStatus));
+    int                rc;
+
+    if (tupdesc->natts != CUVS_BUILD_STATUS_NATTS)
+        ereport(ERROR,
+                (errcode(ERRCODE_DATATYPE_MISMATCH),
+                 errmsg("pg_cuvs: status function returns %d columns, expected %d",
+                        tupdesc->natts, CUVS_BUILD_STATUS_NATTS),
+                 errhint("ALTER EXTENSION pg_cuvs UPDATE to match the installed library.")));
+    rc = cuvs_ipc_rmm_pool_status(cuvs_socket_path, st);
+    if (rc == CUVS_STATUS_UNAVAILABLE)
+        return (Datum) 0;
+    if (rc != CUVS_STATUS_OK)
+    {
+        cuvs_report_proto_mismatch(rc);
+        ereport(ERROR,
+                (errcode(ERRCODE_INTERNAL_ERROR),
+                 errmsg("pg_cuvs: pool status failed (daemon status %d)", rc)));
+    }
+    for (uint32_t i = 0; i < st->n_builds; i++)
+    {
+        CuvsBuildStatusRow *r = &st->builds[i];
+        Datum  values[CUVS_BUILD_STATUS_NATTS];
+        bool   nulls[CUVS_BUILD_STATUS_NATTS];
+        char  *qualname = NULL;
+        bool   owns = false;
+        int    c = 0;
+
+        if ((Oid) r->db_oid == MyDatabaseId)
+            (void) cuvs_status_index_info((Oid) r->index_oid, &qualname, &owns);
+        if (!cuvs_status_row_visible(is_priv, r->db_oid, (uint32_t) MyDatabaseId, owns))
+            continue;
+        r->algo[sizeof(r->algo) - 1] = '\0';
+        r->path[sizeof(r->path) - 1] = '\0';
+        r->phase[sizeof(r->phase) - 1] = '\0';
+        memset(nulls, 0, sizeof(nulls));
+        nulls[c] = qualname == NULL;
+        values[c++] = qualname ? CStringGetTextDatum(qualname) : (Datum) 0;
+        nulls[c] = r->gpu < 0;
+        values[c++] = Int32GetDatum(r->gpu);
+        values[c++] = ObjectIdGetDatum((Oid) r->db_oid);
+        values[c++] = ObjectIdGetDatum((Oid) r->index_oid);
+        values[c++] = CStringGetTextDatum(r->algo);
+        values[c++] = CStringGetTextDatum(r->path);
+        /* wall clock microseconds since the Unix epoch -> timestamptz */
+        values[c++] = TimestampTzGetDatum((TimestampTz) r->started_at_us -
+                                          ((TimestampTz) (POSTGRES_EPOCH_JDATE - UNIX_EPOCH_JDATE) *
+                                           SECS_PER_DAY * USECS_PER_SEC));
+        values[c++] = Int64GetDatum(r->n);
+        values[c++] = Int32GetDatum((int32) r->dim);
+        values[c++] = Int64GetDatum((int64) r->final_bytes);
+        values[c++] = Int64GetDatum((int64) r->scratch_bytes);
+        values[c++] = Int64GetDatum((int64) r->reserved_n_bytes);
+        values[c++] = CStringGetTextDatum(r->policy == 1 ? "managed" : "error");
+        nulls[c] = !r->lw_ub_valid;
+        values[c++] = Int64GetDatum((int64) r->lw_ub_bytes);
+        values[c++] = CStringGetTextDatum(r->lw_ub_valid ? "admission" : "none");
+        values[c++] = CStringGetTextDatum(r->phase);
+        Assert(c == CUVS_BUILD_STATUS_NATTS);
+        tuplestore_putvalues(tupstore, tupdesc, values, nulls);
+    }
+    pfree(st);
     return (Datum) 0;
 }
 

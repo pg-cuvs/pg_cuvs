@@ -964,7 +964,8 @@ cuvs_ipc_rmm_pool_status(const char *socket_path, CuvsRmmPoolStatus *out)
         if (rc == CUVS_STATUS_OK &&
             (hdr.n_results != 1 || recv_all(sock, out, sizeof(*out)) < 0 ||
              out->version != CUVS_RMM_POOL_STATUS_VERSION ||
-             out->n_devices > CUVS_MAX_GPUS || out->lw_n_devices > CUVS_MAX_GPUS))
+             out->n_devices > CUVS_MAX_GPUS || out->lw_n_devices > CUVS_MAX_GPUS ||
+             out->n_builds > CUVS_MAX_ACTIVE_BUILDS))
             rc = CUVS_STATUS_ERROR;
     }
     close(sock);

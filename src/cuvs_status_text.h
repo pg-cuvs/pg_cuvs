@@ -24,11 +24,15 @@
 #define CUVS_SF_BOOL  'b'   /* 0 / 1 */
 #define CUVS_SF_TRI   'r'   /* -1 -> NULL, else 0 / 1 */
 #define CUVS_SF_TEXT  's'   /* any bytes, empty -> NULL */
+#define CUVS_SF_I64N  'n'   /* I3-E: int64 >= 0, -1 -> NULL */
 
 /* Kinds aligned with CUVS_INDEX_STATUS_COLS / CUVS_MEMORY_STATUS_COLS.
  * test_status_text.c asserts strlen == *_NCOLS. */
 #define CUVS_INDEX_STATUS_KINDS  "oossglttlbltbsblsltsrl"
 #define CUVS_MEMORY_STATUS_KINDS "illllllslstslllllllllllll"
+/* I3-E kinds for *_COLS_I3E (appended after the I3-B kinds). */
+#define CUVS_MEMORY_STATUS_KINDS_I3E "llnnlllllllllllstll"
+#define CUVS_INDEX_STATUS_KINDS_I3E  "r"
 
 /* Next line at *pos: returns 1 and sets *line (start) and *line_len (without
  * the '\n'), advancing *pos past the '\n'; 0 at the end of text; -1 when the

@@ -170,3 +170,134 @@ COMMENT ON FUNCTION pg_cuvs_circuit_status() IS
   'permanent ones need pg_cuvs_reset_circuit). opened_at: NULL if never opened. '
   'half_open_count: OPEN->HALF_OPEN transitions.';
 -- I3-B end
+
+-- I3-E begin
+-- ----------------------------------------------------------------
+-- I3-E: C8 observation fields that no earlier set PR carried (append-only).
+-- The daemon appends columns to the I3-B text rows (ops 34 and 35), so the
+-- two status functions are redefined here with the joined column list and
+-- keep the I3-B grants: pg_cuvs_memory_status is for superusers and
+-- pg_monitor; pg_cuvs_index_status is PUBLIC and filters rows in C.
+-- pg_cuvs_build_status reads builds[] of the pool status v2 reply; EXECUTE
+-- stays with PUBLIC and the C function filters rows as index_status does.
+-- ----------------------------------------------------------------
+DROP FUNCTION pg_cuvs_index_status();
+CREATE FUNCTION pg_cuvs_index_status()
+RETURNS TABLE (
+    index_name              text,
+    db_oid                  oid,
+    index_oid               oid,
+    state                   text,
+    kind                    text,
+    gpu                     integer,
+    vram_bytes              bigint,
+    last_use                timestamptz,
+    loaded_at               timestamptz,
+    hits                    bigint,
+    pinned                  boolean,
+    in_use                  bigint,
+    protect_until           timestamptz,
+    eligible                boolean,
+    reclaim_exempt          text,
+    file_current            boolean,
+    extend_count            bigint,
+    warmup_state            text,
+    evict_count             bigint,
+    last_evict_at           timestamptz,
+    last_evict_reason       text,
+    last_build_self_replace boolean,
+    last_build_unloaded     bigint,
+    dataset_attached        boolean
+)
+AS 'MODULE_PATHNAME', 'pg_cuvs_index_status'
+LANGUAGE C VOLATILE;
+COMMENT ON FUNCTION pg_cuvs_index_status() IS
+  'One row per daemon cache entry. Superusers and pg_monitor see every database; '
+  'other roles see only indexes they own in the current database. index_name is '
+  'NULL for entries of other databases or of indexes that no longer exist. '
+  'dataset_attached is NULL in this release. Empty when the daemon is unavailable.';
+
+DROP FUNCTION pg_cuvs_memory_status();
+CREATE FUNCTION pg_cuvs_memory_status()
+RETURNS TABLE (
+    gpu                     integer,
+    budget_eff              bigint,
+    resident_bytes          bigint,
+    pending_bytes           bigint,
+    pinned_bytes            bigint,
+    n_resident              bigint,
+    n_pinned                bigint,
+    reclaim_mode            text,
+    reclaim_f_bytes         bigint,
+    reclaim_f_src           text,
+    last_reclaim_at         timestamptz,
+    last_reclaim_trigger    text,
+    reclaim_runs            bigint,
+    reclaim_skip_sidecar    bigint,
+    persist_failures        bigint,
+    evict_admit_build       bigint,
+    evict_reload            bigint,
+    evict_soft_evict        bigint,
+    evict_reclaim           bigint,
+    evict_manual_unload     bigint,
+    evict_slot              bigint,
+    evictions               bigint,
+    drops                   bigint,
+    history_dropped         bigint,
+    peak_bytes              bigint,
+    budget_bytes            bigint,
+    quota_bytes             bigint,
+    pool_used               bigint,
+    pool_reserved           bigint,
+    pending_rmm             bigint,
+    lw_pending              bigint,
+    builds_active           bigint,
+    rejects_ar0             bigint,
+    rejects_ar1             bigint,
+    rejects_ar2             bigint,
+    rejects_ar3             bigint,
+    rejects_ar4             bigint,
+    rejects_ar5             bigint,
+    rejects_ar6             bigint,
+    rejects_ar7             bigint,
+    last_reject_reason      text,
+    last_reject_at          timestamptz,
+    managed_spill_builds    bigint,
+    managed_spill_bytes_max bigint
+)
+AS 'MODULE_PATHNAME', 'pg_cuvs_memory_status'
+LANGUAGE C VOLATILE;
+COMMENT ON FUNCTION pg_cuvs_memory_status() IS
+  'Per-GPU VRAM accounting, pending build reservations, reclaim state, eviction '
+  'counters by cause and admission rejections by reason (cumulative since daemon '
+  'start). Superuser or pg_monitor only. Empty when the daemon is unavailable.';
+REVOKE ALL ON FUNCTION pg_cuvs_memory_status()       FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION pg_cuvs_memory_status()    TO pg_monitor;
+
+CREATE FUNCTION pg_cuvs_build_status()
+RETURNS TABLE (
+    index_name text,
+    gpu        integer,
+    db_oid     oid,
+    index_oid  oid,
+    algo       text,
+    path       text,
+    started_at timestamptz,
+    n          bigint,
+    dim        integer,
+    final      bigint,
+    scratch    bigint,
+    reserved_n bigint,
+    policy     text,
+    lw_ub      bigint,
+    lw_ub_src  text,
+    phase      text
+)
+AS 'MODULE_PATHNAME', 'pg_cuvs_build_status'
+LANGUAGE C VOLATILE;
+COMMENT ON FUNCTION pg_cuvs_build_status() IS
+  'In-flight CAGRA builds that run outside the daemon lock (single and multi '
+  'path), one row per build. Superusers and pg_monitor see every build; other '
+  'roles see only builds of indexes they own in the current database. Sharded '
+  'and IVF-PQ builds are not listed. Empty when the daemon is unavailable.';
+-- I3-E end
