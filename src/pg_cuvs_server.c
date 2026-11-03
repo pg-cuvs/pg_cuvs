@@ -3163,6 +3163,8 @@ lw_host_guard_bytes(void)
     return hnsw_host_headroom(UINT64_MAX, error, sizeof(error));
 }
 #endif
+/* AR7 reads the guard through this pointer; only unit tests repoint it. */
+static uint64_t (*g_lw_host_guard_fn)(void) = lw_host_guard_bytes;
 
 /* AR6/AR7 pre-admission (ADR-088 decisions 3 and 5): the one call the I3-A
  * admission function makes for a CAGRA build, after AR2 and before scope
@@ -3187,7 +3189,7 @@ lw_admission_check(int device_id, uint64_t needed, int64_t n, uint32_t dim,
     ws->phys_free = cuvs_vram_physical_free_bytes_on(device_id);
     ws->lw_ub = lw_ub_for_build(n, dim, intermediate_graph_degree);
     ws->lw_pending = g_lw_pending[device_id];
-    ws->host_guard = lw_host_guard_bytes();
+    ws->host_guard = g_lw_host_guard_fn();
     return cuvs_admission_workspace_check(ws);
 }
 
@@ -9312,10 +9314,19 @@ handle_inject_build_oom(int client_fd, const CuvsCmdFrame *cmd)
  * permanent registry. Holding g_index_mutex during the cuVS call also excludes
  * legacy GPU builders/search work, whose memory is otherwise not a reservation
  * in this admission estimate. Cancel/owner EOF remains observable on its FD. */
+/* Host RAM headroom reader with injectable roots (tests use a fake tree).
+ * hnsw_host_headroom() below is the production entry with the real paths. */
+typedef struct HostHeadroomPaths {
+    const char *meminfo;      /* /proc/meminfo */
+    const char *self_cgroup;  /* /proc/self/cgroup */
+    const char *cgroup_root;  /* /sys/fs/cgroup */
+} HostHeadroomPaths;
+
 static uint64_t
-hnsw_host_headroom(uint64_t requested, char *error, size_t error_len)
+host_headroom_at(const HostHeadroomPaths *paths, uint64_t requested,
+                 char *error, size_t error_len)
 {
-    FILE *f = fopen("/proc/meminfo", "r");
+    FILE *f = fopen(paths->meminfo, "r");
     char line[4096];
     unsigned long long available = 0;
     if (!f) return 0;
@@ -9327,7 +9338,7 @@ hnsw_host_headroom(uint64_t requested, char *error, size_t error_len)
     if (requested < budget) budget = requested;
     /* Unified cgroup: include every ancestor, since a parent's remaining
      * memory limit constrains us even when the leaf says max. */
-    f = fopen("/proc/self/cgroup", "r");
+    f = fopen(paths->self_cgroup, "r");
     if (!f) return 0; // an unreadable cgroup limit is not unlimited
     if (f)
     {
@@ -9355,7 +9366,7 @@ hnsw_host_headroom(uint64_t requested, char *error, size_t error_len)
                 }
                 continue;
             }
-            char group[4096], path[8192];
+            char group[4096], path[8192 + 512];
             snprintf(group, sizeof(group), "%s", line + 3);
             group[strcspn(group, "\n")] = '\0';
             if (strstr(group, "..")) { fclose(f); return 0; }
@@ -9363,7 +9374,7 @@ hnsw_host_headroom(uint64_t requested, char *error, size_t error_len)
             {
                 unsigned long long limit, current;
                 FILE *m;
-                snprintf(path, sizeof(path), "/sys/fs/cgroup%s/memory.max", group);
+                snprintf(path, sizeof(path), "%s%s/memory.max", paths->cgroup_root, group);
                 m = fopen(path, "r");
                 if (m)
                 {
@@ -9371,7 +9382,7 @@ hnsw_host_headroom(uint64_t requested, char *error, size_t error_len)
                     fclose(m);
                     if (numeric)
                     {
-                        snprintf(path, sizeof(path), "/sys/fs/cgroup%s/memory.current", group);
+                        snprintf(path, sizeof(path), "%s%s/memory.current", paths->cgroup_root, group);
                         m = fopen(path, "r");
                         if (!m) { fclose(f); return 0; }
                         int ok = fscanf(m, "%llu", &current) == 1;
@@ -9389,6 +9400,14 @@ hnsw_host_headroom(uint64_t requested, char *error, size_t error_len)
         fclose(f);
     }
     return budget;
+}
+
+static uint64_t
+hnsw_host_headroom(uint64_t requested, char *error, size_t error_len)
+{
+    static const HostHeadroomPaths system_paths = {
+        "/proc/meminfo", "/proc/self/cgroup", "/sys/fs/cgroup"};
+    return host_headroom_at(&system_paths, requested, error, error_len);
 }
 
 #ifdef CUVS_TEST_HOOKS
