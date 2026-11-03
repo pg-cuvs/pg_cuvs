@@ -116,6 +116,7 @@ check "no other index evicted by the build" sh -c "! grep 'reason=admit_build' /
 cli set reclaim-mode headroom >/dev/null
 
 # --- 4. manual ops (C7) ---
+cli set reclaim-mode off >/dev/null   # no background reclaim racing the manual ops
 R=$(i3b_ipc_cli $S index | awk -F'\t' '$3=="resident"{print $2}' | head -1)
 check "pin" sh -c "i3b_ipc_cli $S pin $DB $R | grep -q 'status=0 pinned'"
 R2=$(i3b_ipc_cli $S index | awk -F'\t' -v r=$R '$3=="resident" && $2!=r{print $2}' | head -1)
@@ -177,7 +178,8 @@ check "usage-stats-file off: OID order" sh -c "tail -50 /tmp/d.log | grep -q 'as
 printf 'garbage' > $IDX/.pg_cuvs_usage_stats
 startd --reclaim-tick-s 1
 check "corrupt file: daemon up, OID order with reason" sh -c "tail -50 /tmp/d.log | grep -q 'ascending (unknown format or version)'"
-check "startup never evicts" sh -c "! grep -q 'op=LOAD_STARTUP' /tmp/d.log"
+check "startup never evicts (no [evict] between load order and loaded lines)" sh -c "! awk '/\[startup\] load order/{f=1} /\[startup\] loaded/{f=0} f && /\[evict\]/{e=1} END{exit !e}' /tmp/d.log"
+check "startup left an index not resident (capacity bound reached)" grep -q 'left not resident' /tmp/d.log
 
 # --- 6b. knobs off reproduce the old behavior (CK-9 r18) ---
 startd --reclaim-tick-s 1 --evict-min-idle-s 3600 --reclaim-mode off --load-soft-evict off --reindex-self-replace off
@@ -217,9 +219,15 @@ check "non-owner unload refused" sh -c "su pg -c \"psql -h /tmp -X -At -d postgr
 check "non-superuser reclaim_set refused" sh -c "su pg -c \"psql -h /tmp -X -At -d postgres -U bob -c \\\"SELECT pg_cuvs_reclaim_set('evict-hit-cap','7')\\\"\" 2>&1 | grep -q 'permission denied'"
 check "non-owner sees no rows of others in index_status" sh -c "[ \"\$(su pg -c \"psql -h /tmp -X -At -d postgres -U bob -c 'SELECT count(*) FROM pg_cuvs_index_status()'\")\" = 0 ]"
 check "non-privileged memory_status refused" sh -c "su pg -c \"psql -h /tmp -X -At -d postgres -U bob -c 'SELECT * FROM pg_cuvs_memory_status()'\" 2>&1 | grep -q 'permission denied'"
-# session A changes a knob; a different session B reads the live value
-sq "SELECT pg_cuvs_reclaim_set('evict-hit-cap','7')" >/dev/null
-check "cross-session SHOW sees reclaim_params change" sh -c "su pg -c \"psql -h /tmp -X -At -d postgres -c 'SHOW cuvs.rmm_pool_status'\" | grep -q '\"evict-hit-cap\":{\"value\":7,\"source\":\"function\"'"
+# session B reads SHOW, session A changes a knob, the same session B reads again
+cat > /tmp/xsess.sql <<'EOSQL'
+SHOW cuvs.rmm_pool_status;
+\! psql -h /tmp -X -q -At -d postgres -c "SELECT pg_cuvs_reclaim_set('evict-hit-cap','7')"
+SHOW cuvs.rmm_pool_status;
+EOSQL
+sq "SELECT pg_cuvs_reclaim_set('evict-hit-cap','20')" >/dev/null
+su pg -c "psql -h /tmp -X -q -At -d postgres -f /tmp/xsess.sql" > /tmp/xsess.out 2>&1
+check "same session B sees A's reclaim_params change (no per-session cache)" sh -c "head -1 /tmp/xsess.out | grep -q '\"evict-hit-cap\":{\"value\":20' && tail -1 /tmp/xsess.out | grep -q '\"evict-hit-cap\":{\"value\":7,\"source\":\"function\"'"
 check "memory_status via SQL has reclaim columns" sh -c "su pg -c \"psql -h /tmp -X -At -d postgres -c 'SELECT reclaim_mode, reclaim_runs >= 0 FROM pg_cuvs_memory_status()'\" | grep -q '|t'"
 check "circuit_status callable by anyone" sh -c "su pg -c \"psql -h /tmp -X -At -d postgres -U bob -c 'SELECT count(*) FROM pg_cuvs_circuit_status()'\" | grep -q '^[0-9]'"
 
@@ -228,6 +236,10 @@ check "circuit_status callable by anyone" sh -c "su pg -c \"psql -h /tmp -X -At 
 psqlq "DROP INDEX i2;" >/dev/null
 check "drop: no row left for i2" sh -c "! i3b_ipc_cli $S index | awk -F'\t' -v i=$I2 '\$2==i' | grep -q ."
 
+# CK-10 (I3-B part): ADR-086 field counts, 13 each, in schema order
+check "[evict] lines have the 13 ADR-086 fields in order" sh -c "grep '\[evict\]' /tmp/d.log | sed 's/.*\[evict\] //' | awk '{n=split(\$0,f,\" \"); s=\"\"; for(i=1;i<=n;i++){split(f[i],kv,\"=\"); s=s kv[1] \",\"} if (s != \"op,gpu,db,idx,reason,requester_idx,idle_s,protect_s,hits,vram_bytes,saved_ms,mono_us,self_replace,\") bad=1} END{exit bad}'"
+check "[reclaim] lines have the 13 ADR-086 fields in order" sh -c "grep '\[reclaim\] op=' /tmp/d.log | sed 's/.*\[reclaim\] //' | awk '{n=split(\$0,f,\" \"); s=\"\"; for(i=1;i<=n;i++){split(f[i],kv,\"=\"); s=s kv[1] \",\"} if (s != \"op,gpu,tick,resident_before,resident_after,hi_bytes,lo_bytes,evicted,skip_sidecar,trigger,f_bytes,f_src,mono_us,\") bad=1} END{exit bad}'"
+echo "--- cross-session SHOW"; cat /tmp/xsess.out | cut -c1-200
 echo "--- [evict]/[reclaim] lines"
 grep -E '\[evict\]|\[reclaim\]|\[self_replace\]' /tmp/d.log | sed 's/^.*\(\[[a-z_]*\]\)/\1/' | head -20
 echo "FAILS=$FAILS"

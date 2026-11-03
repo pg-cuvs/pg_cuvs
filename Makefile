@@ -377,8 +377,9 @@ test-cache-policy: test/unit/test_cache_policy.c src/cuvs_cache_policy.c \
 	./$@
 
 # CK-36 (a) requester arguments and CK-37 (a) I-FC assignment sites.
-test-i3b-source: test/unit/check_i3b_server_source.py src/pg_cuvs_server.c
+test-i3b-source: test/unit/check_i3b_server_source.py src/pg_cuvs_server.c test/unit/check_i3b_docs.py
 	python3 test/unit/check_i3b_server_source.py src/pg_cuvs_server.c
+	python3 test/unit/check_i3b_docs.py
 
 .PHONY: test-i3b-source
 
