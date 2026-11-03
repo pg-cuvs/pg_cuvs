@@ -5429,6 +5429,69 @@ pg_cuvs_reset_circuit(PG_FUNCTION_ARGS)
 }
 
 /* ----------------------------------------------------------------
+ * pg_cuvs_circuit_status() — UC-2: this backend's circuit breakers, one row
+ * per tracked index. Breakers are process-local, so another session's rows are
+ * not visible here. No IPC. The state is read through cuvs_breaker_state(), so
+ * an elapsed transient TTL shows (and is counted) as half_open exactly as the
+ * next plan would see it.
+ * ---------------------------------------------------------------- */
+#define CIRCUIT_STATUS_NCOLS 6
+
+PG_FUNCTION_INFO_V1(pg_cuvs_circuit_status);
+Datum
+pg_cuvs_circuit_status(PG_FUNCTION_ARGS)
+{
+    ReturnSetInfo   *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+    TupleDesc        tupdesc;
+    Tuplestorestate *tupstore;
+    MemoryContext    per_query_ctx;
+    MemoryContext    oldcontext;
+
+    if (rsinfo == NULL || !IsA(rsinfo, ReturnSetInfo))
+        ereport(ERROR,
+                (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                 errmsg("set-valued function called in context that cannot accept a set")));
+    if (!(rsinfo->allowedModes & SFRM_Materialize))
+        ereport(ERROR,
+                (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                 errmsg("materialize mode required, but it is not allowed in this context")));
+    if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+        ereport(ERROR,
+                (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                 errmsg("return type must be a row type")));
+
+    per_query_ctx = rsinfo->econtext->ecxt_per_query_memory;
+    oldcontext = MemoryContextSwitchTo(per_query_ctx);
+    tupstore = tuplestore_begin_heap(true, false, work_mem);
+    rsinfo->returnMode = SFRM_Materialize;
+    rsinfo->setResult  = tupstore;
+    rsinfo->setDesc    = tupdesc;
+    MemoryContextSwitchTo(oldcontext);
+
+    for (int i = 0; i < cuvs_n_circuit_breakers; i++)
+    {
+        const CuvsCircuitBreaker *b = &cuvs_circuit_breakers[i];
+        CuvsCircuitState state = cuvs_breaker_state((Oid) b->index_oid);
+        Datum values[CIRCUIT_STATUS_NCOLS];
+        bool  nulls[CIRCUIT_STATUS_NCOLS];
+
+        memset(nulls, 0, sizeof(nulls));
+        values[0] = ObjectIdGetDatum((Oid) b->index_oid);
+        values[1] = CStringGetTextDatum(cuvs_circuit_state_name(state));
+        values[2] = BoolGetDatum(b->transient != 0);
+        if (b->opened_at != 0)
+            values[3] = TimestampTzGetDatum(time_t_to_timestamptz((pg_time_t) b->opened_at));
+        else
+            nulls[3] = true;   /* never opened */
+        values[4] = Int64GetDatum((int64) b->half_open_count);
+        values[5] = Int32GetDatum((int32) b->consecutive_errors);
+        tuplestore_putvalues(tupstore, tupdesc, values, nulls);
+    }
+
+    return (Datum) 0;
+}
+
+/* ----------------------------------------------------------------
  * pg_cuvs_last_search_* — process-local last-scan stats.
  * Returns the stats from the most recent successful cagra index scan
  * in this backend. NULL if no scan has happened yet.
