@@ -79,6 +79,7 @@ def check(src):
                 'cuvs_hnsw_timing_flags(stats_rows, prespool)', 'cuvs_hnsw_build_notices(&out->policy, transition_sent)'],
             'BACKEND_ORDER')
     assert 'heapRel->rd_rel->reltuples' in b.split('table_index_build_scan(', 1)[0], 'STATS_BEFORE_SCAN'
+    assert 'cuvs_hnsw_after_scan_reason(stats_rows)' in b, 'AFTER_SCAN_REASON_FROM_STATISTICS'
     notices = b.split('cuvs_hnsw_build_notices(', 1)[1]
     assert 'notices & CUVS_HNSW_NOTICE_TRANSITION' in notices and 'cuvs_hnsw_transition_notice(' in notices, 'POST_TRANSITION_NOTICE'
     assert 'auto selected ACE-disk' in notices.split('CUVS_HNSW_NOTICE_AUTO_COMPLETION', 1)[1].split(';', 1)[0] + notices, 'COMPLETION_NOTICE'
@@ -118,6 +119,8 @@ MUTANTS = [
     ('timing_flags_ignore_statistics', 'backend',
      'out->policy.route_flags |= cuvs_hnsw_timing_flags(stats_rows, prespool);',
      'out->policy.route_flags |= cuvs_hnsw_timing_flags(0, prespool);'),
+    ('after_scan_reason_from_row_count', 'backend',
+     'cuvs_hnsw_after_scan_reason(stats_rows),', 'cuvs_prespool_rows(stats_rows) ? "pre-scan forecast unavailable" : "no table statistics",'),
     ('cagra_ar0_after_scan', 'backend',
      '            && cuvs_cagra_prespool_ar0(reltuples_est,', '            && 0 && (reltuples_est,'),
 ]

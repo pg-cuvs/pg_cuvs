@@ -17,15 +17,45 @@ typedef enum CuvsHnswPrespoolAction {
     CUVS_HNSW_PRESPOOL_REJECT          /* status 5 before the scan (route/disk) */
 } CuvsHnswPrespoolAction;
 
-/* reltuples is pg_class.reltuples: -1 (never analyzed, PG14+) or 0 means no
- * statistics. ipc_rc is cuvs_ipc_hnsw_route_preflight's return: only the
- * forecast statuses OK/13/5 carry a decision; any exchange failure
- * (unavailable daemon, protocol error) falls back to the post-scan path. */
+/* Statistics presence is a fact about pg_class.reltuples alone (I3CD-B1 r2):
+ * -1 (never analyzed, PG14+), 0, negative or non-finite means no statistics;
+ * any positive value, however small or large, means statistics exist. It is
+ * deliberately separate from the row-count conversions below, which may
+ * decline to forecast (0) for reasons that are not "no statistics". */
+static inline int
+cuvs_prespool_has_statistics(double reltuples)
+{
+    return isfinite(reltuples) && reltuples > 0.0;
+}
+
+/* Rows implied by positive statistics: ceil, saturated at INT64_MAX; 0 only
+ * without statistics. Used where a large count is still meaningful (CAGRA AR0). */
+static inline uint64_t
+cuvs_prespool_count(double reltuples)
+{
+    if (!cuvs_prespool_has_statistics(reltuples)) return 0;
+    if (reltuples >= 9.2e18) return (uint64_t)INT64_MAX;
+    return (uint64_t)ceil(reltuples);
+}
+
+/* n_estimate sent to the daemon's hnsw forecast (op 40). 0 = do not ask:
+ * no statistics, or a count beyond the HNSW shape limit (INT32_MAX rows),
+ * which the resolver cannot forecast; the build then decides after the scan. */
+static inline uint64_t
+cuvs_prespool_rows(double reltuples)
+{
+    uint64_t n = cuvs_prespool_count(reltuples);
+    return n > (uint64_t)INT32_MAX ? 0 : n;
+}
+
+/* ipc_rc is cuvs_ipc_hnsw_route_preflight's return: only the forecast
+ * statuses OK/13/5 carry a decision; any exchange failure (unavailable
+ * daemon, protocol error) falls back to the post-scan path. */
 static inline CuvsHnswPrespoolAction
 cuvs_hnsw_prespool_action(double reltuples, int ipc_rc, uint32_t route,
                           uint32_t overflowed, uint32_t disk_ok)
 {
-    if (!(reltuples >= 1.0) || !isfinite(reltuples)) return CUVS_HNSW_PRESPOOL_FALLBACK;
+    if (!cuvs_prespool_has_statistics(reltuples)) return CUVS_HNSW_PRESPOOL_FALLBACK;
     if (ipc_rc == CUVS_STATUS_HNSW_RESIDENT_BUDGET_EXCEEDED) return CUVS_HNSW_PRESPOOL_REJECT_BUDGET;
     if (ipc_rc == CUVS_STATUS_BUILD_FAILED) return CUVS_HNSW_PRESPOOL_REJECT;
     if (ipc_rc != CUVS_STATUS_OK || !disk_ok
@@ -33,15 +63,6 @@ cuvs_hnsw_prespool_action(double reltuples, int ipc_rc, uint32_t route,
         return CUVS_HNSW_PRESPOOL_FALLBACK;
     return overflowed && route == CUVS_HNSW_ROUTE_ACE
         ? CUVS_HNSW_PRESPOOL_NOTICE_OVERFLOW : CUVS_HNSW_PRESPOOL_PROCEED;
-}
-
-/* reltuples -> the n_estimate sent to the daemon (0 = do not ask). */
-static inline uint64_t
-cuvs_prespool_rows(double reltuples)
-{
-    if (!(reltuples >= 1.0) || !isfinite(reltuples) || reltuples > (double)INT32_MAX)
-        return 0;
-    return (uint64_t)ceil(reltuples);
 }
 
 /* Receipt timing flags from the PRE-scan action and the statistics that
@@ -54,7 +75,15 @@ cuvs_hnsw_timing_flags(double reltuples, CuvsHnswPrespoolAction action)
 {
     if (action != CUVS_HNSW_PRESPOOL_FALLBACK) return CUVS_HNSW_ROUTE_FLAG_PRESPOOL;
     return CUVS_HNSW_ROUTE_FLAG_AFTER_SCAN
-        | (cuvs_prespool_rows(reltuples) ? 0 : CUVS_HNSW_ROUTE_FLAG_NO_STATISTICS);
+        | (cuvs_prespool_has_statistics(reltuples) ? 0 : CUVS_HNSW_ROUTE_FLAG_NO_STATISTICS);
+}
+
+/* Wording for the post-scan decision point (NOTICE DETAIL), same fact. */
+static inline const char *
+cuvs_hnsw_after_scan_reason(double reltuples)
+{
+    return cuvs_prespool_has_statistics(reltuples)
+        ? "pre-scan forecast unavailable" : "no table statistics";
 }
 
 /* NOTICE lines owed after a successful build (CK-17 (13)): an auto -> ACE
@@ -90,19 +119,11 @@ cuvs_hnsw_overflow_need(uint64_t host_est, uint64_t host_budget,
     *side = host ? "host" : "GPU";
 }
 
-/* CAGRA reltuples AR0 guard (C4 (iii), CK-17 (14)).
- * TEMPORARY estimate: the final resident size the daemon currently admits
- * (estimate_vram_bytes: n x (dim x 4 + graph_degree x 4)). I3-A owns the
- * admission estimate and will expose it as a pure function in
- * cuvs_admission_contract.h; replace this body with that call then. */
-static inline uint64_t
-cuvs_cagra_prespool_final_estimate(uint64_t n, uint32_t dim, int graph_degree)
-{
-    uint64_t gd = graph_degree > 0 ? (uint64_t)graph_degree : 64;
-    if (!n || !dim || n > UINT64_MAX / ((uint64_t)dim * 4 + gd * 4)) return UINT64_MAX;
-    return n * ((uint64_t)dim * 4 + gd * 4);
-}
-
+/* CAGRA reltuples AR0 guard (C4 (iii), CK-17 (14)). The estimate is I3-A's
+ * shared cuvs_admission_estimate_final_bytes (aligned dim stride, saturating).
+ * The guard compares the FINAL size, a lower bound of the admission value
+ * needed = final + scratch: rho is a daemon setting the backend does not know,
+ * and a pre-scan refusal must be certain. */
 /* AR0 is permanent, so it fires only when it is certain: statistics exist,
  * every GPU has a configured limit (max_limit > 0), the build cannot be
  * auto-sharded across GPUs (shard_count 1, or 0 with one GPU), and the
@@ -112,11 +133,11 @@ cuvs_cagra_prespool_ar0(double reltuples, uint32_t dim, int graph_degree,
                         uint32_t shard_count, uint32_t n_devices,
                         uint64_t max_limit, uint64_t *estimate)
 {
-    uint64_t n = cuvs_prespool_rows(reltuples);
+    uint64_t n = cuvs_prespool_count(reltuples);
     *estimate = 0;
-    if (!n || !dim || !max_limit || !n_devices) return 0;
+    if (!n || !dim || dim > INT32_MAX || !max_limit || !n_devices) return 0;
     if (!(shard_count == 1 || (shard_count == 0 && n_devices == 1))) return 0;
-    *estimate = cuvs_cagra_prespool_final_estimate(n, dim, graph_degree);
+    *estimate = cuvs_admission_estimate_final_bytes((int64_t)n, (int32_t)dim, graph_degree);
     return *estimate > max_limit;
 }
 
