@@ -70,7 +70,7 @@ def check(src):
     assert 'if (reply.status != CUVS_STATUS_OK) goto done;' in h.split('hnsw_route_log("build"', 1)[1].split('mkdtemp', 1)[0], 'DECISION_STOPS'
     assert 'wire.policy.route != route.decision.route' in h, 'RECEIPT_EQUALS_ROUTE_LOG'
     pre = function(code['server'], 'handle_hnsw_route_preflight(int client_fd)')
-    ordered(pre, ['cuvs_hnsw_forecast_route(', 'cuvs_hnsw_forecast_disk(', 'hnsw_route_log("prespool"'], 'PREFLIGHT_ORDER')
+    ordered(pre, ['cuvs_hnsw_forecast_route(', 'cuvs_hnsw_forecast_disk(', 'hnsw_route_log(request.after_scan ? "postscan" : "prespool"'], 'PREFLIGHT_ORDER')
     assert 'mkdtemp' not in pre and 'wait_for_idle' not in pre, 'PREFLIGHT_READ_ONLY'
     # --- backend order (CK-17 (14)) -----------------------------------------
     b = function(code['backend'], 'cuvs_build_hnsw_from_heap(Relation heapRel')
