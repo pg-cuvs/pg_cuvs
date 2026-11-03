@@ -450,7 +450,10 @@ test_usage_file(void)
     }
     char bad[4096];
     memcpy(bad, buf, (size_t) len);
-    bad[30] = (bad[30] == '9') ? '8' : '9';    /* flip a body byte */
+    /* Overwrite a prefix in place keeping the format valid ("5000" ->
+     * "6000"): only the crc can catch it. */
+    char *at = strstr(bad, " 5000 ");
+    if (at) at[1] = '6';
     CHECK(cuvs_usage_stats_parse(bad, (size_t) len, got, 8, &n, why, sizeof why) != 0,
           "crc catches overwritten prefix");
     memcpy(bad, buf, (size_t) len);
