@@ -11,9 +11,10 @@ SELECT pg_cuvs_hnsw_build_info('items_ann'::regclass);
 
 ## 생성기와 예산
 
-- `auto`(기본): 16행 미만은 tiny exact GPU 그래프다. 나머지는 bounded-training resident IVF-PQ B 설정을 사용한다. 메모리 추정이 host 또는 GPU 실효 예산을 넘으면 오류와 `build_algo=ace` 힌트를 낸다. 자동으로 ACE를 선택하지 않는다.
+- `auto`(기본): 16행 미만은 tiny exact GPU 그래프다. 나머지는 추정이 host와 GPU 실효 예산 안이면 bounded-training resident IVF-PQ B 설정을 사용하고, 넘으면 기본값에서 ACE-disk로 넘친다(ADR-087, UC-5). 넘칠 때는 전환 NOTICE(`build_algo=auto exceeded the resident budget ...; building with ACE on disk`)와 빌드 뒤 완료 NOTICE(`auto selected ACE-disk`) 두 줄을 내고 영수증에 `requested_algo=auto`, `route=ace_disk`, `auto_overflow=true`를 남긴다. 데몬을 `--hnsw-auto-overflow error`로 띄우면 넘치지 않고 오류와 `build_algo=ace` 힌트를 낸다. 256행 미만은 넘칠 수 없어 오류다. ACE 인덱스의 recall과 지연은 resident와 다를 수 있다. 경로는 빌드 시점 예산으로 정해지므로 작은 호스트로 복원하거나 REINDEX하면 ACE로(또는 `error`에서는 오류로) 다시 만들어질 수 있다. 경로를 고정하려면 `build_algo`를 명시한다.
+- 판정 시점: 테이블 통계(`reltuples` > 0)가 있으면 경로와 디스크 사전 점검을 heap 스캔 전에 `reltuples`와 선언 차원으로 판정한다. 거부와 ACE 전환 NOTICE가 spool 전에 나오고, 빌드는 spool한 행 수로 다시 판정한다. 통계가 없으면 스캔 뒤에 판정하며 영수증 `route_decided`가 어느 쪽인지 기록한다. 통계가 낡았으면 이른 판정이 틀릴 수 있으니 먼저 `ANALYZE`한다.
 - `ivf_pq`: resident IVF-PQ를 명시한다. 추정 예산 초과 또는 16행 미만이면 오류이며 다른 생성기로 대체하지 않는다.
-- `ace`: disk 경로를 명시한다. resident 추정이 예산 안이어도 ACE를 요청한다. N<16은 tiny와 충돌하고 N16–255는 partition 후보가 없어 오류다. 그 밖도 SDK의 형상·고정점 P·private 경로·가드 검사를 통과해야 한다. 다른 생성기로 대체하지 않는다. 성공한 명시 ACE만 NOTICE를 출력한다.
+- `ace`: disk 경로를 명시한다. resident 추정이 예산 안이어도 ACE를 요청한다. N<16은 tiny와 충돌하고 N16–255는 partition 후보가 없어 오류다. 그 밖도 SDK의 형상·고정점 P·private 경로·가드 검사를 통과해야 한다. 다른 생성기로 대체하지 않는다. 성공한 명시 ACE는 `explicit build_algo=ace selected ACE-disk` NOTICE를 출력한다.
 - `nn_descent`: 예약된 미지원 값이다. 메모리 모델 부재와 `auto`(tiny/resident) 또는 명시 `ace` 대안을 설명하는 오류로 거부한다. ACE 내부의 NN-descent 사용과는 별개다.
 
 ```sql

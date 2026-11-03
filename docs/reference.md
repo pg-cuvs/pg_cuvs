@@ -165,7 +165,7 @@ Defaults and ranges are from source. "Set by" is the minimum role/scope: `USERSE
 | `cuvs.k` | int | `100` | 1–2000 | USERSET | GPU top-k candidates fetched per scan (cf. `hnsw.ef_search`) |
 | `cuvs.rmm_pool_mb` | int/status | daemon value | 0–INT_MAX, or `unavailable` | read-only (INTERNAL) | Applied initial RMM pool reservation per GPU, queried from the daemon. `0` = disabled; `unavailable` = no compatible daemon reply. Set using the daemon CLI and restart, not SQL SET. Record with each benchmark run |
 | `cuvs.rmm_pool_max_percent` | int/status | daemon value | 0–100, or `unavailable` | read-only (INTERNAL) | Applied upstream pool quota as a percentage of total CUDA memory on each GPU. `0` when the pool is disabled |
-| `cuvs.rmm_pool_status` | string/status | daemon value | JSON, or `unavailable` | read-only (INTERNAL) | Applied initial MiB, quota percentage, and per-device maximum/reserved/used pool bytes. Counters cover RMM pool allocations; they are live snapshots, not process-wide GPU memory |
+| `cuvs.rmm_pool_status` | string/status | daemon value | JSON, or `unavailable` | read-only (INTERNAL) | Applied initial MiB, quota percentage, per-device maximum/reserved/used pool bytes, and `hnsw_auto_overflow` (`ace` or `error`, from `--hnsw-auto-overflow`). Counters cover RMM pool allocations; they are live snapshots, not process-wide GPU memory |
 | `cuvs.circuit_breaker_threshold` | int | `3` | 1–100 | USERSET | Consecutive GPU errors before the (per-backend) breaker trips |
 | `cuvs.circuit_breaker_transient_ttl_s` | int | `30` | 0–3600 | USERSET | Seconds before a breaker opened by a transient reason half-opens and allows one GPU attempt. `0` = half-open immediately. Breakers opened by a permanent reason ignore it. See § 5 `pg_cuvs_reset_circuit` |
 
@@ -267,6 +267,7 @@ daemon-only ones have no session equivalent.
 | `--rmm-scratch-permille N` | — (daemon-only, `scratch_permille` in `cuvs.rmm_pool_status`) | `7726` (provisional) | CAGRA build scratch coefficient ρ. Admission, reservation and GPU choice use `N = final + ceil(final × ρ / 1000)`; residency accounting keeps `final`. Range 0–100000. Restart to change |
 | `--max-indexes N` | — (daemon-only) | `1024` | **Soft** LRU working-set cap (ADR-068), not a hard wall (was 64). At the cap, a reload or `pg_cuvs_load` frees a slot under the § 8 rules (cold first, then soft eviction; reason `slot`); a build over the cap does not evict (with the default `--build-evict-scope none`): its files are saved and the first query reloads it |
 | `--build-evict-scope …` and the other cache flags | — (daemon-only) | see § 8 | Cache, eviction and reclaim knobs (§ 8.2) |
+| `--hnsw-auto-overflow ace\|error` | `hnsw_auto_overflow` in `cuvs.rmm_pool_status` (read-only) | `ace` | What `pg_cuvs_hnsw` `build_algo=auto` does over the resident budget: `ace` spills to ACE-disk with a NOTICE, `error` refuses with SQLSTATE 54000. Startup-only; logged at startup. Explicit `ivf_pq`/`ace` ignore it |
 | `--gpu-devices LIST` | — (daemon-only) | all visible | CUDA devices the daemon uses (else honors `CUDA_VISIBLE_DEVICES`) |
 | `--snapshot-uri URI` | `cuvs.snapshot_uri` | `` | GCS snapshot root |
 | `--cluster-id ID` | `cuvs.cluster_id` | `` | Cluster id in the GCS artifact path |
@@ -360,8 +361,28 @@ cagra/ivfpq") rather than silently failing.
 | `build_algo` | enum | `auto` | `auto`, `ivf_pq`, `ace` | Direct heap build only; cannot be combined with explicit `source` |
 
 For direct heap construction, `auto` uses tiny exact GPU construction below 16 rows and
-otherwise the resident IVF-PQ route. Exceeding the estimated resident budget returns
-an error with an explicit `build_algo=ace` hint; AUTO does not switch to disk ACE.
+otherwise the resident IVF-PQ route while its estimate fits the host and GPU budgets.
+Over the budget, `auto` spills to ACE on disk by default and says so with a NOTICE
+(`pg_cuvs: build_algo=auto exceeded the resident budget (need X, budget Y); building
+with ACE on disk`, DETAIL with the disk requirement and directory) and, after the
+build, the completion NOTICE `auto selected ACE-disk (<P> partitions)`; the receipt
+records `requested_algo=auto`, `route=ace_disk`, `auto_overflow=true`. To refuse
+instead (SQLSTATE 54000 with a `build_algo=ace` hint), start the daemon with
+`--hnsw-auto-overflow error`. Below 256 rows an over-budget `auto` is refused either way.
+ACE indexes can differ from resident IVF-PQ in recall and latency. Because the route
+depends on the budgets at build time, a restore or `REINDEX` on a smaller host can
+rebuild an `auto` index as ACE (or, with `error`, fail); set `build_algo` explicitly to
+pin the route. Explicit `ivf_pq` and `ace` never read the flag.
+
+When the table has statistics (`pg_class.reltuples` > 0, i.e. after `ANALYZE`), the
+route and the disk precheck are decided from `reltuples` and the declared dimension
+BEFORE the heap scan, so a refusal or the ACE NOTICE comes before any row is spooled;
+the build re-decides from the spooled row count. Without statistics the decision comes
+after the scan. The receipt field `route_decided` says which
+(`before_scan_from_statistics` or `after_scan_no_statistics`). Stale statistics can
+mislead the early decision; run `ANALYZE` first. The `cagra` AM likewise refuses a
+certain AR0 (estimated final size over the per-GPU limit, unsharded) before its scan
+when statistics exist.
 Explicit `ace` consumes the matching patched SDK/planner and a private disk workdir.
 `nn_descent` is reserved for this direct HNSW surface and is rejected until a supported
 memory model exists; the separate `cagra` AM has its own build-algorithm options.
