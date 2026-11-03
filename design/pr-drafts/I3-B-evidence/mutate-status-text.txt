@@ -1,0 +1,23 @@
+GREEN unit: PASS | test_status_text: 80 passed, 0 failed
+GREEN scan: PASS | check_i3b_sql_perms: OK
+RED a1 visibility ignores ownership [unit] | FAIL test/unit/test_status_text.c:195: non-owner hidden
+RED a2 visibility ignores database [unit] | FAIL test/unit/test_status_text.c:196: other db hidden even if owns
+RED a3 caller drops the visibility filter [scan] | FAIL cuvs_status_emit does not skip rows cuvs_status_row_visible rejects
+RED b1 header compare removed [unit] | FAIL test/unit/test_status_text.c:59: renamed column rejected
+RED b2 caller ignores header mismatch [scan] | FAIL cuvs_status_emit does not ERROR when the header check fails
+RED c1 split accepts too few fields [unit] | FAIL test/unit/test_status_text.c:100: too few fields
+RED c2 split accepts too many fields [unit] | FAIL test/unit/test_status_text.c:101: too many fields
+RED c3 caller ignores field count [scan] | FAIL cuvs_status_emit does not ERROR on a wrong field count
+RED c4 unterminated tail accepted [unit] | FAIL test/unit/test_status_text.c:82: missing trailing newline -> -1
+RED d1 (oid, oid) overloads skip superuser [scan] | FAIL pg_cuvs_unload_oid does not reach an `if (!superuser())` guard
+RED d2 reclaim_set skips superuser [scan] | FAIL pg_cuvs_reclaim_set does not reach an `if (!superuser())` guard
+RED d3 superuser guard neutered [scan] | FAIL pg_cuvs_reclaim_set does not reach an `if (!superuser())` guard
+RED d4 SQL keeps reclaim_set PUBLIC [scan] | FAIL REVOKE FROM PUBLIC set differs: missing=['pg_cuvs_reclaim_set(text,text)'] extra=[]
+RED d5 SQL keeps unload(oid, oid) PUBLIC [scan] | FAIL REVOKE FROM PUBLIC set differs: missing=['pg_cuvs_unload(oid,oid)'] extra=[]
+RED d6 SQL keeps unpin(oid, oid) PUBLIC [scan] | FAIL REVOKE FROM PUBLIC set differs: missing=['pg_cuvs_unpin(oid,oid)'] extra=[]
+RED d7 SQL revokes unload(regclass) from PUBLIC (owner check is the gate) [scan] | FAIL REVOKE FROM PUBLIC set differs: missing=[] extra=['pg_cuvs_unload(regclass)']
+RED d8 SQL revokes index_status too [scan] | FAIL REVOKE FROM PUBLIC set differs: missing=[] extra=['pg_cuvs_index_status()']
+RED d9 SQL drops the pg_monitor grant [scan] | FAIL GRANTs differ from memory_status -> pg_monitor only: []
+RED d10 regclass ops skip ownership [scan] | FAIL pg_cuvs_unload does not reach the index ownership check
+RED d11 memory_status skips the privilege check [scan] | FAIL pg_cuvs_memory_status does not reject non-privileged callers
+mutate_status_text: 20 mutations, 0 problem(s)

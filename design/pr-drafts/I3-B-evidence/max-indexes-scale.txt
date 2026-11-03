@@ -1,0 +1,11 @@
+[maxidx] stop production daemon for the duration
+[maxidx] start daemon --max-indexes 4 (tiny cap)
+[PASS] 0. daemon registry capacity = 4 (--max-indexes honored)
+[maxidx] building 10 tenant indexes (cap=4)
+[PASS] 1. built 10 tenant indexes with cap 4 — no registry-full ERROR
+[PASS] 2. all 10 tenant queries returned correct rows (auto-reload of evicted indexes)
+[maxidx] evictions=6 reloads=6
+[PASS] 3. working set churned (evictions=6) and evicted indexes re-hydrated to GPU (reloads=6)
+[maxidx] ALL PASS — MAX_INDEXES is a soft LRU cap, not a hard wall
+[maxidx] cleanup
+[maxidx] restart production pg-cuvs-server
