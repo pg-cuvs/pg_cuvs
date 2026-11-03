@@ -264,7 +264,7 @@ TEST_RT_LIB := $(shell [ "$$(uname -s)" = "Linux" ] && echo -lrt)
 test-unit: test/unit/test_cuvs_util.c src/cuvs_util.c src/cuvs_util.h src/cuvs_ipc.h \
            test/unit/test_build_corpus.c src/cuvs_build_corpus.c src/cuvs_build_corpus.h \
            test-hnsw-build test-hnsw-build-ipc test-hnsw-admission test-admission-contract \
-           test-admission-wire test-admission-message test-admission-ipc test-build-oom-thread
+           test-admission-wire test-admission-message test-admission-ipc test-build-oom-thread test-cache-policy
 	$(CC) -I src -DCUVS_TEST_HOOKS -o test-unit test/unit/test_cuvs_util.c src/cuvs_util.c $(TEST_RT_LIB)
 	./test-unit
 	$(CC) -I src -o test-build-corpus test/unit/test_build_corpus.c src/cuvs_build_corpus.c $(TEST_RT_LIB)
@@ -355,6 +355,17 @@ ADMISSION_MUTATION_OUT ?= admission-contract-mutations
 test-admission-contract-mutations: test/unit/test_admission_contract_mutations.py test-admission-contract \
                                    test-admission-wire test-admission-message test-admission-ipc
 	python3 -I test/unit/test_admission_contract_mutations.py $(ADMISSION_MUTATION_OUT)
+
+# I3-B cache policy (eviction eligibility, reclaim F fences, usage stats
+# file, startup order, sidecar kind). Pure C, no daemon/PG/CUDA.
+test-cache-policy: test/unit/test_cache_policy.c src/cuvs_cache_policy.c \
+                   src/cuvs_cache_policy.h src/cuvs_util.c src/cuvs_admission_contract.h
+	$(CC) -std=gnu11 -Wall -Wextra -Werror -I src -o $@ test/unit/test_cache_policy.c \
+		src/cuvs_cache_policy.c src/cuvs_util.c -lm $(TEST_RT_LIB)
+	./$@
+
+EXTRA_CLEAN += test-cache-policy
+.PHONY: test-cache-policy
 
 # Converter fixtures include private PG page helpers, with backend stubs and
 # section garbage collection. Requires server headers, but no running backend.
