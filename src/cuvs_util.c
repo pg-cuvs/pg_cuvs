@@ -937,6 +937,34 @@ cuvs_batch_group(const CuvsBatchKey *keys, int n,
 }
 
 /* ----------------------------------------------------------------
+ * Build shape class for [admit] (v5 C3 definition, carried by v6 C3).
+ * ---------------------------------------------------------------- */
+const char *
+cuvs_build_shape_class(int64_t n, uint32_t dim, uint32_t metric, uint32_t gd,
+                       uint32_t igd, uint32_t build_algo)
+{
+    int ivf  = build_algo == CUVS_CAGRA_BUILD_IVF_PQ;
+    int autoa = build_algo == CUVS_CAGRA_BUILD_AUTO;
+
+    if (gd == 0)
+        gd = 64;
+    if (igd == 0)
+        igd = 128;
+    if (dim != 768 || metric != CUVS_METRIC_L2)
+        return "extrapolated";
+    if ((n == 999000 &&
+         ((ivf && ((gd == 32 && igd == 128) || (gd == 64 && igd == 256) ||
+                   (gd == 32 && igd == 64))) ||
+          (autoa && gd == 64 && igd == 128))) ||
+        ((n == 250000 || n == 500000) && ivf && gd == 32 && igd == 128))
+        return "checked";
+    if ((ivf || autoa) && gd >= 32 && gd <= 64 && igd >= 64 && igd <= 256 && igd >= gd &&
+        n >= 250000 && n <= 999000)
+        return "bracketed";
+    return "extrapolated";
+}
+
+/* ----------------------------------------------------------------
  * I3 admission rejection payload codec (cuvs_util.h).
  * ---------------------------------------------------------------- */
 static const char *const cuvs_admission_reason_names[] = {

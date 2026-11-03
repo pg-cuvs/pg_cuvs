@@ -467,6 +467,10 @@ typedef struct CuvsAdmissionFields {
     CuvsAdmissionCandidate cand[CUVS_ADMISSION_MAX_CANDIDATES];
 } CuvsAdmissionFields;
 
+/* [admit] shape_class: "checked", "bracketed" or "extrapolated" (v5 C3;
+ * gd/igd 0 mean the defaults 64/128; float32 is implied by the cagra AM). */
+const char *cuvs_build_shape_class(int64_t n, uint32_t dim, uint32_t metric,
+                                   uint32_t gd, uint32_t igd, uint32_t build_algo);
 /* bytes -> MiB, floored, saturated. */
 uint32_t cuvs_admission_mib(uint64_t bytes);
 /* count, saturated. */
