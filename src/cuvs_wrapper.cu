@@ -1154,6 +1154,30 @@ cuvs_cagra_build_multi(const float **vecs, const int64_t *n_each, int n_parts,
             params,
             raft::make_const_mdspan(d_corpus.view()));
 
+        /* I3 (v6 C3, CK-30): cuVS keeps the dataset in rows of
+         * ld = round_up(dim, 4) floats (16-byte alignment, make_aligned_dataset).
+         * A contiguous dim % 4 != 0 corpus made update_dataset copy it into an
+         * owning padded matrix while d_corpus stayed alive: two copies for the
+         * index lifetime. Move the rows into a zero-padded [total x ld] matrix
+         * and attach it as a strided view, which cuVS takes without copying
+         * (stride == required stride); the contiguous copy is freed on return. */
+        const int64_t ld = ((int64_t)dim + 3) / 4 * 4;
+        if (ld != (int64_t)dim) {
+            auto d_padded = raft::make_device_matrix<float, int64_t>(res, total, ld);
+            RAFT_CUDA_TRY(cudaMemsetAsync(d_padded.data_handle(), 0,
+                                          (size_t)total * (size_t)ld * sizeof(float),
+                                          res.get_stream()));
+            RAFT_CUDA_TRY(cudaMemcpy2DAsync(d_padded.data_handle(), (size_t)ld * sizeof(float),
+                                            d_corpus.data_handle(),
+                                            (size_t)dim * sizeof(float),
+                                            (size_t)dim * sizeof(float), (size_t)total,
+                                            cudaMemcpyDeviceToDevice, res.get_stream()));
+            idx.update_dataset(res, raft::make_device_strided_matrix_view<const float, int64_t>(
+                                        d_padded.data_handle(), total, (int64_t)dim, ld));
+            res.sync_stream();
+            return new CuvsCagraIndexImpl(std::move(d_padded), std::move(idx), metric);
+        }
+
         /* Re-attach dataset explicitly so the index owns a valid view that
          * matches our retained d_corpus memory. */
         idx.update_dataset(res, raft::make_const_mdspan(d_corpus.view()));
