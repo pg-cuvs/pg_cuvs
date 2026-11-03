@@ -82,19 +82,28 @@ MUTATIONS = [
     ("S1c NOTICE free number wrong", "review BLOCK 2", SRV,
      "                                        label, needed, room);",
      "                                        label, needed, 0);"),
+    # integration: the failure NOTICE is now set in three places (each CAGRA
+    # builder after it relocks, and attach_build_notices for any non-OK reply
+    # after a self-replace), so deleting one call site was an equivalent
+    # mutation (MISS at every site). Anchor the NOTICE text itself.
     ("S2 failure NOTICE removed", "review BLOCK 2", SRV,
-     "        LOG_ERROR(\"[handle_build] cuvs_cagra_build returned NULL\\n\");\n        note_self_replace_failure(cmd->index_oid, self_unloaded);",
-     "        LOG_ERROR(\"[handle_build] cuvs_cagra_build returned NULL\\n\");"),
+     "    (void) cuvs_self_replace_fail_notice(g_build_notice, sizeof(g_build_notice),\n"
+     "                                         g_build_notice_detail, sizeof(g_build_notice_detail),\n"
+     "                                         label);",
+     "    (void) label;"),
     ("S6 IVF-PQ build admits as LOAD", "review BLOCK 4", SRV,
      # integration: ensure_vram takes (needed, dev, rq, rej, line) on the I3 stack
-     "    int admit_rc = ensure_vram(needed, target_gpu, CUVS_RQ_BUILD_IVFPQ, &rej);",
-     "    int admit_rc = ensure_vram(needed, target_gpu, CUVS_RQ_LOAD, &rej);"),
+     "    int admit_rc = ensure_vram(needed, target_gpu, CUVS_RQ_BUILD_IVFPQ, &rej, &al);",
+     "    int admit_rc = ensure_vram(needed, target_gpu, CUVS_RQ_LOAD, &rej, &al);"),
     ("S7 shard build admits as LOAD", "review BLOCK 4", SRV,
-     "        if (ensure_vram(needed, dev, CUVS_RQ_BUILD_SHARD, NULL) != 0)",
-     "        if (ensure_vram(needed, dev, CUVS_RQ_LOAD, NULL) != 0)"),
+     "        if (ensure_vram(needed, dev, CUVS_RQ_BUILD_SHARD, NULL, &al) != 0)",
+     "        if (ensure_vram(needed, dev, CUVS_RQ_LOAD, NULL, &al) != 0)"),
     ("S8 CAGRA registry slot as LOAD", "review BLOCK 4", SRV,
      "            (void) make_slot(target_gpu, CUVS_RQ_BUILD_CAGRA);",
      "            (void) make_slot(target_gpu, CUVS_RQ_LOAD);"),
+    # integration: I3-A (ADR-086) removed the post-admission evict-to-fit retry
+    # that S10 anchored on. Rebound to the current contract "OOM after
+    # admission fails without evicting": status 2 + one [build_oom] line.
     ("S10 post-admission OOM evicts again (LOAD requester)", "review BLOCK 4 / ADR-086", SRV,
      '        log_build_oom("BUILD", target_gpu, cmd->db_oid, cmd->index_oid, needed);\n'
      '        cuvs_set_inject_build_oom(0);   /* #82: see the failure branch below */',
@@ -111,6 +120,18 @@ MUTATIONS = [
      '                              &oom_rej);',
      '        (void) oom_rej;\n'
      '        send_error_code(client_fd, CUVS_STATUS_BUILD_FAILED, "cuvs_cagra_build failed");'),
+    # integration: the manual-op err_out consumer (backend), SQL-level 7b checks
+    ("manual reply err_out dropped by the client", "C5 reload / CK-8", "src/cuvs_ipc.c",
+     "        remember_reply(&hdr);\n        rc = (int) hdr.status;\n        if (msg && msglen)",
+     "        rc = (int) hdr.status;\n        if (msg && msglen)"),
+    ("admission SQLSTATE fixed to XX000", "C5 SQLSTATE", "src/pg_cuvs.c",
+     "            (errcode(MAKE_SQLSTATE(state[0], state[1], state[2], state[3], state[4])),\n"
+     "             errmsg(\"%s\", msg),",
+     "            (errcode(ERRCODE_INTERNAL_ERROR),\n"
+     "             errmsg(\"%s\", msg),"),
+    ("pg_cuvs_load/pin skip the C5 report", "C5 reload / C7", "src/pg_cuvs.c",
+     "    if (rc != CUVS_STATUS_OK && (op == CUVS_OP_LOAD || op == CUVS_OP_PIN))",
+     "    if (0)"),
     ("startup evicts (LOAD instead of LOAD_STARTUP)", "C1 RQ LOAD_STARTUP", SRV,
      "        if (load_index(k->db_oid, k->index_oid, CUVS_RQ_LOAD_STARTUP) == 0)",
      "        if (load_index(k->db_oid, k->index_oid, CUVS_RQ_LOAD) == 0)"),
