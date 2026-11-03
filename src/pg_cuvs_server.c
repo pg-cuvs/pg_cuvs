@@ -7271,6 +7271,7 @@ handle_drop(int client_fd, const CuvsCmdFrame *cmd)
         g_cache_drops++;   /* EV-7: DROP cleanup is not a policy eviction */
     }
     evict_history_drop(db, idx);   /* C8: history goes with the index */
+    cuvs_admit_log_forget(&g_admit_log, db, idx);  /* its rejects stop driving F */
 
     /* Drop a cold-registry entry too (Phase 3D), if present. */
     for (int i = 0; i < g_n_cold_indexes; i++)

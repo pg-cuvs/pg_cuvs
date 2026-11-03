@@ -254,6 +254,10 @@ test_free_target_fences(void)
     CHECK(t.f_bytes == 0, "F-3: one reject does not outlive the window");
     cuvs_admit_log_expire(&log, NOW + 4000, 1800);
     CHECK(log.n == 0, "expire drops old records");
+    cuvs_admit_log_add(&log, &in);
+    cuvs_admit_log_forget(&log, 1, 5);
+    cuvs_reclaim_free_target(&log, 0, NOW, 1800, B, 50, 0, &t);
+    CHECK(t.f_bytes == 0 && log.n == 0, "DROP INDEX forgets its reject at once");
 
     /* Fixed F keeps the cap. */
     cuvs_reclaim_free_target(&log, 0, NOW, 1800, B, 50, 70 * GiB, &t);
