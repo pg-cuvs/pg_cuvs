@@ -264,7 +264,7 @@ TEST_RT_LIB := $(shell [ "$$(uname -s)" = "Linux" ] && echo -lrt)
 test-unit: test/unit/test_cuvs_util.c src/cuvs_util.c src/cuvs_util.h src/cuvs_ipc.h \
            test/unit/test_build_corpus.c src/cuvs_build_corpus.c src/cuvs_build_corpus.h \
            test-hnsw-build test-hnsw-build-ipc test-hnsw-admission test-admission-contract \
-           test-admission-wire test-admission-message test-admission-ipc
+           test-admission-wire test-admission-message test-admission-ipc test-build-oom-thread
 	$(CC) -I src -DCUVS_TEST_HOOKS -o test-unit test/unit/test_cuvs_util.c src/cuvs_util.c $(TEST_RT_LIB)
 	./test-unit
 	$(CC) -I src -o test-build-corpus test/unit/test_build_corpus.c src/cuvs_build_corpus.c $(TEST_RT_LIB)
@@ -320,6 +320,12 @@ test-admission-wire: test/unit/test_admission_wire.c src/cuvs_admission_contract
 		src/cuvs_util.c $(TEST_RT_LIB)
 	./$@
 
+# The build-OOM flag is per thread (CPU shim mirrors the GPU wrapper).
+test-build-oom-thread: test/unit/test_build_oom_thread.c src/cuvs_wrapper_shim_cpu.c src/cuvs_wrapper.h
+	$(CC) -std=gnu11 -Wall -Wextra -Werror -I src -o $@ test/unit/test_build_oom_thread.c \
+		src/cuvs_wrapper_shim_cpu.c -lpthread -lm $(TEST_RT_LIB)
+	./$@
+
 # I3 reply-header fields through the real client against a mock daemon.
 test-admission-ipc: test/unit/test_admission_ipc.c src/cuvs_ipc.c src/cuvs_ipc.h \
                     src/cuvs_util.c src/cuvs_build_corpus.c $(wildcard src/*.h)
@@ -363,10 +369,10 @@ test-hnsw-converter: test/unit/test_hnsw_converter.c src/hnsw_export.c \
 
 EXTRA_CLEAN += test-hnsw-build test-hnsw-build-ipc test-hnsw-converter test-hnsw-admission test-hnsw-explicit-route test-hnsw-policy \
                test-admission-contract test-admission-contract-cxx test-admission-contract-util.o \
-               test-admission-wire test-admission-message test-admission-ipc
+               test-admission-wire test-admission-message test-admission-ipc test-build-oom-thread
 .PHONY: test-hnsw-build test-hnsw-build-ipc test-hnsw-converter test-hnsw-admission test-hnsw-explicit-route test-hnsw-policy \
         test-admission-contract test-admission-contract-mutations test-admission-wire \
-        test-admission-message test-admission-ipc
+        test-admission-message test-admission-ipc test-build-oom-thread
 
 # ---- Documentation contract check ---------------------------------------
 # CPU-only drift detector for the current version/defaults and release-facing
