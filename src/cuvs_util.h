@@ -542,17 +542,49 @@ typedef struct CuvsCircuitBreaker {
     uint32_t index_oid;
     int      consecutive_errors;
     int      open;              /* 1 = tripped, routing to CPU */
+    int      transient;         /* 1 = last opened by a transient reason (TTL-eligible) */
+    int      half_open;         /* 1 = TTL elapsed; the next GPU attempt decides */
+    int64_t  opened_at;         /* seconds of the last open; 0 = never opened */
+    int64_t  half_open_count;   /* OPEN -> HALF_OPEN transitions */
 } CuvsCircuitBreaker;
+
+/* UC-2: a breaker opened by a transient reason (VRAM pressure, reload, ATT)
+ * half-opens once cuvs.circuit_breaker_transient_ttl_s has elapsed; one opened
+ * by a permanent reason stays open until pg_cuvs_reset_circuit(). */
+typedef enum CuvsCircuitState {
+    CUVS_CIRCUIT_CLOSED = 0,
+    CUVS_CIRCUIT_OPEN,
+    CUVS_CIRCUIT_HALF_OPEN
+} CuvsCircuitState;
+
+/* What a scan does with the breaker state it observes at execution time. */
+typedef enum CuvsCircuitExecAction {
+    CUVS_CIRCUIT_EXEC_TRY_GPU = 0,  /* closed or half-open: run the GPU search */
+    CUVS_CIRCUIT_EXEC_ERROR         /* open: raise 53200 instead of 0 rows */
+} CuvsCircuitExecAction;
 
 /* Defined in cuvs_util.c */
 extern CuvsCircuitBreaker cuvs_circuit_breakers[CUVS_MAX_TRACKED_INDEXES];
 extern int                cuvs_n_circuit_breakers;
 
-void cuvs_circuit_record_error(uint32_t index_oid, int threshold);
+/* Pure, clock-injected core. `now` is seconds; `reason` is a
+ * CuvsAdmissionReason (cuvs_admission_contract.h), CUVS_ADMISSION_NONE when
+ * the reply carried no reason code. */
+int  cuvs_circuit_reason_is_transient(int status, int reason);
+void cuvs_circuit_record_failure(uint32_t index_oid, int threshold,
+                                 int transient, int64_t now);
+void cuvs_circuit_record_status_reason(uint32_t index_oid, int threshold,
+                                       int status, int reason, int64_t now);
+CuvsCircuitState cuvs_circuit_state(uint32_t index_oid, int64_t now, int ttl_s);
+CuvsCircuitExecAction cuvs_circuit_exec_action(CuvsCircuitState state);
+const char *cuvs_circuit_state_name(CuvsCircuitState state);
+
+/* Legacy entry points (thin wrappers: wall clock, no reason code). */
+void cuvs_circuit_record_error(uint32_t index_oid, int threshold); /* permanent */
 void cuvs_circuit_record_status(uint32_t index_oid, int threshold, int status);
-void cuvs_circuit_record_success(uint32_t index_oid); /* reset consecutive_errors */
+void cuvs_circuit_record_success(uint32_t index_oid); /* reset errors; closes a half-open breaker */
 void cuvs_circuit_reset(uint32_t index_oid);          /* also clears open flag */
-int  cuvs_circuit_is_open(uint32_t index_oid);
+int  cuvs_circuit_is_open(uint32_t index_oid);        /* stored state; no TTL check */
 void cuvs_circuit_reset_all(void);                    /* zeroes all breaker state */
 
 /* CAGRA's intermediate buffer must cover the actual dispatch k (including
