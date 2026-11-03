@@ -431,6 +431,61 @@ void cuvs_tombstone_header_init(CuvsTombstoneHeader *h, uint32_t base_tids_crc32
 int  cuvs_tombstone_validate(const CuvsTombstoneHeader *h, int64_t body_bytes);
 int  cuvs_tombstone_read_header(FILE *f, CuvsTombstoneHeader *out);
 
+/* ----------------------------------------------------------------
+ * I3 admission rejection payload codec (v6 r18 C5, UC-2; CK-29).
+ *
+ * Text grammar and key meanings live in cuvs_admission_contract.h. The codec
+ * is format-only: which keys a reason carries is the caller's choice (C5
+ * subsets). Keys are emitted in the fixed order n f q p h e k l y u g s r t*
+ * w i. Scalars (MiB, counts) saturate at CUVS_ADMISSION_SCALAR_MAX on encode
+ * and are rejected above it on decode; shard i saturates at 999.
+ * ---------------------------------------------------------------- */
+#include "cuvs_admission_contract.h"
+
+enum {
+    CUVS_ADM_F_N = 1u << 0,  CUVS_ADM_F_F = 1u << 1,  CUVS_ADM_F_Q = 1u << 2,
+    CUVS_ADM_F_P = 1u << 3,  CUVS_ADM_F_H = 1u << 4,  CUVS_ADM_F_E = 1u << 5,
+    CUVS_ADM_F_K = 1u << 6,  CUVS_ADM_F_L = 1u << 7,  CUVS_ADM_F_Y = 1u << 8,
+    CUVS_ADM_F_U = 1u << 9,  CUVS_ADM_F_G = 1u << 10, CUVS_ADM_F_S = 1u << 11,
+    CUVS_ADM_F_R = 1u << 12, CUVS_ADM_F_W = 1u << 13, CUVS_ADM_F_I = 1u << 14,
+    CUVS_ADM_F_ALL = (1u << 15) - 1u
+};
+
+typedef struct CuvsAdmissionFields {
+    CuvsAdmissionReason reason;
+    uint32_t present;            /* CUVS_ADM_F_* of the scalar keys sent */
+    uint32_t n, f, q, p;         /* MiB */
+    uint32_t h_mib, h_cnt, e_mib, e_cnt, k_mib, k_cnt;
+    uint32_t l, y, u, g, s;      /* MiB */
+    uint32_t r;                  /* 0 or 1, daemon-computed */
+    int32_t  w;                  /* CUVS_ADMISSION_WAIT_QUERIES or _UNPIN */
+    uint32_t i;                  /* shard number */
+    uint32_t n_cand;             /* 0..CUVS_ADMISSION_MAX_CANDIDATES */
+    CuvsAdmissionCandidate cand[CUVS_ADMISSION_MAX_CANDIDATES];
+} CuvsAdmissionFields;
+
+/* bytes -> MiB, floored, saturated. */
+uint32_t cuvs_admission_mib(uint64_t bytes);
+/* count, saturated. */
+uint32_t cuvs_admission_count(uint64_t count);
+/* "AR0".."AR7", "OOM", "ATT"; NULL for NONE or out of range. */
+const char *cuvs_admission_reason_name(CuvsAdmissionReason reason);
+/* 54000 / 53200 / 53400 (C5); NULL for NONE or out of range. */
+const char *cuvs_admission_sqlstate(CuvsAdmissionReason reason);
+/* 1 for reasons a later retry may clear without a config change and that
+ * count as transient for the circuit breaker (UC-2 3): AR1..AR5, AR7, OOM,
+ * ATT. 0 for AR0 (permanent), AR6 (configuration) and NONE. */
+int cuvs_admission_reason_transient(CuvsAdmissionReason reason);
+/* Write the payload into buf (NUL-terminated). Returns its length, or -1
+ * (buf[0] = '\0' when cap > 0) for NONE, more than three candidates,
+ * w not in {0,-1}, r not in {0,1}, idle_s < -1, or a too-small buffer. */
+int cuvs_admission_encode(const CuvsAdmissionFields *in, char *buf, size_t cap);
+/* Parse a payload read from a buffer of len bytes. The NUL must lie within
+ * the first min(len, CUVS_ADMISSION_ERR_OUT_BYTES) bytes; the parser never
+ * reads past it. Returns 0, or -1 for any malformed, unknown, duplicate or
+ * out-of-range token (out is then zeroed). */
+int cuvs_admission_decode(const char *buf, size_t len, CuvsAdmissionFields *out);
+
 #ifdef CUVS_TEST_HOOKS
 /* Test-only fault injection: returns 1 if env var `name` is set, else 0.
  * Compiled in ONLY under CUVS_TEST_HOOKS; absent from production builds. */

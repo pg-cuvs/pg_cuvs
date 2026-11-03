@@ -11,6 +11,7 @@
 #include "cuvs_admission_contract.h"
 
 #include <string.h>
+#include <stdarg.h>
 #include <stdlib.h>
 #include <errno.h>
 #include <limits.h>
@@ -922,6 +923,347 @@ cuvs_batch_group(const CuvsBatchKey *keys, int n,
     }
     if (n_groups_out)
         *n_groups_out = ng;
+}
+
+/* ----------------------------------------------------------------
+ * I3 admission rejection payload codec (cuvs_util.h).
+ * ---------------------------------------------------------------- */
+static const char *const cuvs_admission_reason_names[] = {
+    "AR0", "AR1", "AR2", "AR3", "AR4", "AR5", "AR6", "AR7", "OOM", "ATT"
+};
+#define CUVS_ADMISSION_N_REASONS \
+    ((int) (sizeof(cuvs_admission_reason_names) / sizeof(cuvs_admission_reason_names[0])))
+
+uint32_t
+cuvs_admission_mib(uint64_t bytes)
+{
+    uint64_t mib = bytes >> 20;
+    return mib > CUVS_ADMISSION_SCALAR_MAX ? CUVS_ADMISSION_SCALAR_MAX : (uint32_t) mib;
+}
+
+uint32_t
+cuvs_admission_count(uint64_t count)
+{
+    return count > CUVS_ADMISSION_SCALAR_MAX ? CUVS_ADMISSION_SCALAR_MAX : (uint32_t) count;
+}
+
+const char *
+cuvs_admission_reason_name(CuvsAdmissionReason reason)
+{
+    if ((int) reason < 0 || (int) reason >= CUVS_ADMISSION_N_REASONS)
+        return NULL;
+    return cuvs_admission_reason_names[reason];
+}
+
+const char *
+cuvs_admission_sqlstate(CuvsAdmissionReason reason)
+{
+    if (cuvs_admission_reason_name(reason) == NULL)
+        return NULL;
+    if (reason == CUVS_ADMISSION_AR0)
+        return CUVS_ADMISSION_SQLSTATE_LIMIT;
+    if (reason == CUVS_ADMISSION_AR6)
+        return CUVS_ADMISSION_SQLSTATE_WORKSPACE;
+    return CUVS_ADMISSION_SQLSTATE_MEMORY;
+}
+
+int
+cuvs_admission_reason_transient(CuvsAdmissionReason reason)
+{
+    const char *state = cuvs_admission_sqlstate(reason);
+    return state != NULL && strcmp(state, CUVS_ADMISSION_SQLSTATE_MEMORY) == 0;
+}
+
+static uint32_t
+cuvs_admission_sat(uint32_t v)
+{
+    return v > CUVS_ADMISSION_SCALAR_MAX ? CUVS_ADMISSION_SCALAR_MAX : v;
+}
+
+/* Append to buf at *pos; -1 when it does not fit. */
+static int
+cuvs_admission_put(char *buf, size_t cap, size_t *pos, const char *fmt, ...)
+    __attribute__((format(printf, 4, 5)));
+
+static int
+cuvs_admission_put(char *buf, size_t cap, size_t *pos, const char *fmt, ...)
+{
+    va_list ap;
+    int     w;
+
+    va_start(ap, fmt);
+    w = vsnprintf(buf + *pos, cap - *pos, fmt, ap);
+    va_end(ap);
+    if (w < 0 || (size_t) w >= cap - *pos)
+        return -1;
+    *pos += (size_t) w;
+    return 0;
+}
+
+int
+cuvs_admission_encode(const CuvsAdmissionFields *in, char *buf, size_t cap)
+{
+    const char *name;
+    size_t      pos = 0;
+    uint32_t    pm;
+    int         ok = 0;
+
+    if (buf == NULL || cap == 0)
+        return -1;
+    buf[0] = '\0';
+    if (in == NULL || (name = cuvs_admission_reason_name(in->reason)) == NULL)
+        return -1;
+    pm = in->present;
+    if (in->n_cand > CUVS_ADMISSION_MAX_CANDIDATES)
+        return -1;
+    if ((pm & CUVS_ADM_F_W) && in->w != CUVS_ADMISSION_WAIT_QUERIES &&
+        in->w != CUVS_ADMISSION_WAIT_UNPIN)
+        return -1;
+    if ((pm & CUVS_ADM_F_R) && in->r > 1)
+        return -1;
+    for (uint32_t c = 0; c < in->n_cand; c++)
+        if (in->cand[c].idle_s < CUVS_ADMISSION_IDLE_NEVER)
+            return -1;
+
+#define PUT1(bit, key, v) \
+    if (ok == 0 && (pm & (bit))) \
+        ok = cuvs_admission_put(buf, cap, &pos, " " key "=%u", cuvs_admission_sat(v))
+#define PUT2(bit, key, a, b) \
+    if (ok == 0 && (pm & (bit))) \
+        ok = cuvs_admission_put(buf, cap, &pos, " " key "=%u/%u", \
+                                cuvs_admission_sat(a), cuvs_admission_sat(b))
+    ok = cuvs_admission_put(buf, cap, &pos, "%s", name);
+    PUT1(CUVS_ADM_F_N, "n", in->n);
+    PUT1(CUVS_ADM_F_F, "f", in->f);
+    PUT1(CUVS_ADM_F_Q, "q", in->q);
+    PUT1(CUVS_ADM_F_P, "p", in->p);
+    PUT2(CUVS_ADM_F_H, "h", in->h_mib, in->h_cnt);
+    PUT2(CUVS_ADM_F_E, "e", in->e_mib, in->e_cnt);
+    PUT2(CUVS_ADM_F_K, "k", in->k_mib, in->k_cnt);
+    PUT1(CUVS_ADM_F_L, "l", in->l);
+    PUT1(CUVS_ADM_F_Y, "y", in->y);
+    PUT1(CUVS_ADM_F_U, "u", in->u);
+    PUT1(CUVS_ADM_F_G, "g", in->g);
+    PUT1(CUVS_ADM_F_S, "s", in->s);
+    PUT1(CUVS_ADM_F_R, "r", in->r);
+#undef PUT1
+#undef PUT2
+    for (uint32_t c = 0; ok == 0 && c < in->n_cand; c++)
+    {
+        const CuvsAdmissionCandidate *t = &in->cand[c];
+        int32_t idle = t->idle_s > (int32_t) CUVS_ADMISSION_SCALAR_MAX
+            ? (int32_t) CUVS_ADMISSION_SCALAR_MAX : t->idle_s;
+        ok = cuvs_admission_put(buf, cap, &pos, " t=%u:%u:%u:%d", t->db_oid,
+                                t->index_oid, cuvs_admission_sat(t->mib), idle);
+    }
+    if (ok == 0 && (pm & CUVS_ADM_F_W))
+        ok = cuvs_admission_put(buf, cap, &pos, " w=%d", in->w);
+    if (ok == 0 && (pm & CUVS_ADM_F_I))
+        ok = cuvs_admission_put(buf, cap, &pos, " i=%u",
+                                in->i > CUVS_ADMISSION_SHARD_MAX ? CUVS_ADMISSION_SHARD_MAX : in->i);
+    if (ok != 0)
+    {
+        buf[0] = '\0';
+        return -1;
+    }
+    return (int) pos;
+}
+
+/* Parse decimal digits in [p, end) as an unsigned value <= max. */
+static int
+cuvs_admission_uint(const char *p, const char *end, uint64_t max, uint64_t *out)
+{
+    uint64_t v = 0;
+
+    if (p >= end)
+        return -1;
+    for (; p < end; p++)
+    {
+        if (*p < '0' || *p > '9')
+            return -1;
+        v = v * 10u + (uint64_t) (*p - '0');
+        if (v > max)
+            return -1;
+    }
+    *out = v;
+    return 0;
+}
+
+static int
+cuvs_admission_int(const char *p, const char *end, int64_t min, uint64_t max,
+                   int64_t *out)
+{
+    uint64_t v;
+
+    if (p < end && *p == '-')
+    {
+        if (cuvs_admission_uint(p + 1, end, (uint64_t) (-min), &v) != 0)
+            return -1;
+        *out = -(int64_t) v;
+        return 0;
+    }
+    if (cuvs_admission_uint(p, end, max, &v) != 0)
+        return -1;
+    *out = (int64_t) v;
+    return 0;
+}
+
+/* "a/b" or "a:b:c:d" style: split [p, end) at sep into exactly n parts. */
+static int
+cuvs_admission_split(const char *p, const char *end, char sep, int n,
+                     const char **starts, const char **ends)
+{
+    int k = 0;
+
+    starts[0] = p;
+    for (; p < end; p++)
+        if (*p == sep)
+        {
+            if (k + 1 >= n)
+                return -1;
+            ends[k++] = p;
+            starts[k] = p + 1;
+        }
+    ends[k] = end;
+    return k + 1 == n ? 0 : -1;
+}
+
+int
+cuvs_admission_decode(const char *buf, size_t len, CuvsAdmissionFields *out)
+{
+    const char *nul, *p, *tok_end;
+    size_t      lim;
+    int         reason = -1;
+
+    if (out == NULL)
+        return -1;
+    memset(out, 0, sizeof(*out));
+    out->reason = CUVS_ADMISSION_NONE;
+    if (buf == NULL)
+        return -1;
+    lim = len < CUVS_ADMISSION_ERR_OUT_BYTES ? len : CUVS_ADMISSION_ERR_OUT_BYTES;
+    nul = memchr(buf, '\0', lim);
+    if (nul == NULL)
+        return -1;
+
+    tok_end = memchr(buf, ' ', (size_t) (nul - buf));
+    if (tok_end == NULL)
+        tok_end = nul;
+    for (int r = 0; r < CUVS_ADMISSION_N_REASONS; r++)
+        if ((size_t) (tok_end - buf) == strlen(cuvs_admission_reason_names[r]) &&
+            memcmp(buf, cuvs_admission_reason_names[r], (size_t) (tok_end - buf)) == 0)
+            reason = r;
+    if (reason < 0)
+        goto bad;
+    out->reason = (CuvsAdmissionReason) reason;
+
+    for (p = tok_end; p < nul; p = tok_end)
+    {
+        const char *key, *val, *s[4], *e[4];
+        uint64_t    a, b;
+        int64_t     si;
+        uint32_t    bit = 0;
+
+        if (*p != ' ' || p + 1 >= nul)
+            goto bad;
+        key = p + 1;
+        tok_end = memchr(key, ' ', (size_t) (nul - key));
+        if (tok_end == NULL)
+            tok_end = nul;
+        if (tok_end - key < 3 || key[1] != '=')
+            goto bad;
+        val = key + 2;
+        switch (key[0])
+        {
+            case 'n': bit = CUVS_ADM_F_N; break;
+            case 'f': bit = CUVS_ADM_F_F; break;
+            case 'q': bit = CUVS_ADM_F_Q; break;
+            case 'p': bit = CUVS_ADM_F_P; break;
+            case 'h': bit = CUVS_ADM_F_H; break;
+            case 'e': bit = CUVS_ADM_F_E; break;
+            case 'k': bit = CUVS_ADM_F_K; break;
+            case 'l': bit = CUVS_ADM_F_L; break;
+            case 'y': bit = CUVS_ADM_F_Y; break;
+            case 'u': bit = CUVS_ADM_F_U; break;
+            case 'g': bit = CUVS_ADM_F_G; break;
+            case 's': bit = CUVS_ADM_F_S; break;
+            case 'r': bit = CUVS_ADM_F_R; break;
+            case 'w': bit = CUVS_ADM_F_W; break;
+            case 'i': bit = CUVS_ADM_F_I; break;
+            case 't': bit = 0; break;
+            default: goto bad;
+        }
+        if (bit != 0 && (out->present & bit))
+            goto bad;
+        out->present |= bit;
+        switch (key[0])
+        {
+            case 'h': case 'e': case 'k':
+            {
+                uint32_t *pair = key[0] == 'h' ? &out->h_mib
+                               : key[0] == 'e' ? &out->e_mib : &out->k_mib;
+                if (cuvs_admission_split(val, tok_end, '/', 2, s, e) != 0 ||
+                    cuvs_admission_uint(s[0], e[0], CUVS_ADMISSION_SCALAR_MAX, &a) != 0 ||
+                    cuvs_admission_uint(s[1], e[1], CUVS_ADMISSION_SCALAR_MAX, &b) != 0)
+                    goto bad;
+                pair[0] = (uint32_t) a;
+                pair[1] = (uint32_t) b;
+                break;
+            }
+            case 't':
+            {
+                CuvsAdmissionCandidate *t;
+                uint64_t oid_db, oid_ix;
+                if (out->n_cand >= CUVS_ADMISSION_MAX_CANDIDATES ||
+                    cuvs_admission_split(val, tok_end, ':', 4, s, e) != 0 ||
+                    cuvs_admission_uint(s[0], e[0], UINT32_MAX, &oid_db) != 0 ||
+                    cuvs_admission_uint(s[1], e[1], UINT32_MAX, &oid_ix) != 0 ||
+                    cuvs_admission_uint(s[2], e[2], CUVS_ADMISSION_SCALAR_MAX, &a) != 0 ||
+                    cuvs_admission_int(s[3], e[3], CUVS_ADMISSION_IDLE_NEVER,
+                                       CUVS_ADMISSION_SCALAR_MAX, &si) != 0)
+                    goto bad;
+                t = &out->cand[out->n_cand++];
+                t->db_oid = (uint32_t) oid_db;
+                t->index_oid = (uint32_t) oid_ix;
+                t->mib = (uint32_t) a;
+                t->idle_s = (int32_t) si;
+                break;
+            }
+            case 'w':
+                if (cuvs_admission_int(val, tok_end, CUVS_ADMISSION_WAIT_UNPIN, 0, &si) != 0)
+                    goto bad;
+                out->w = (int32_t) si;
+                break;
+            case 'r':
+                if (cuvs_admission_uint(val, tok_end, 1, &a) != 0)
+                    goto bad;
+                out->r = (uint32_t) a;
+                break;
+            case 'i':
+                if (cuvs_admission_uint(val, tok_end, CUVS_ADMISSION_SHARD_MAX, &a) != 0)
+                    goto bad;
+                out->i = (uint32_t) a;
+                break;
+            default:
+            {
+                uint32_t *slot = key[0] == 'n' ? &out->n : key[0] == 'f' ? &out->f
+                               : key[0] == 'q' ? &out->q : key[0] == 'p' ? &out->p
+                               : key[0] == 'l' ? &out->l : key[0] == 'y' ? &out->y
+                               : key[0] == 'u' ? &out->u : key[0] == 'g' ? &out->g
+                               : &out->s;
+                if (cuvs_admission_uint(val, tok_end, CUVS_ADMISSION_SCALAR_MAX, &a) != 0)
+                    goto bad;
+                *slot = (uint32_t) a;
+                break;
+            }
+        }
+    }
+    return 0;
+
+bad:
+    memset(out, 0, sizeof(*out));
+    out->reason = CUVS_ADMISSION_NONE;
+    return -1;
 }
 
 /* ----------------------------------------------------------------
