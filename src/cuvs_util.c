@@ -1421,6 +1421,8 @@ cuvs_admission_cands(CuvsStrBuf *b, const CuvsAdmissionFields *f,
     " unloading an index that has delta or tombstone sidecar files and" \
     " pg_cuvs_gpu_search_stats().extend_count > 0 switches its GPU path to" \
     " CPU replan until REINDEX)"
+#define CUVS_ADM_SHARD_HINT \
+    " Or make room for one shard, or raise cuvs.shard_count to make the shards smaller."
 #define CUVS_ADM_UNPIN_CLAUSE \
     " (if the index itself is pinned, release it first with pg_cuvs_unpin(index))"
 
@@ -1668,6 +1670,8 @@ cuvs_admission_format(const CuvsAdmissionFields *f, CuvsAdmissionObject obj,
                                 "estimate.");
             cuvs_sb_add(&h, " Operators can review --rmm-pool-max-percent, --max-vram-mb "
                             "and --rmm-scratch-permille.");
+            if (obj == CUVS_ADMISSION_OBJ_SHARD)
+                cuvs_sb_add(&h, CUVS_ADM_SHARD_HINT);
             break;
         case CUVS_ADMISSION_AR1:
         case CUVS_ADMISSION_AR2:
@@ -1704,8 +1708,7 @@ cuvs_admission_format(const CuvsAdmissionFields *f, CuvsAdmissionObject obj,
                 cuvs_sb_add(&h, " Operators can allow build eviction with "
                                 "--build-evict-scope idle:<minutes> or lru.");
             if (obj == CUVS_ADMISSION_OBJ_SHARD)
-                cuvs_sb_add(&h, " Or make room for one shard, or raise cuvs.shard_count "
-                                "to make the shards smaller.");
+                cuvs_sb_add(&h, CUVS_ADM_SHARD_HINT);
             /* (3): only on the daemon's r=1 and never with zero candidates. */
             if (!load && unload && (f->present & CUVS_ADM_F_R) && f->r == 1)
                 cuvs_sb_add(&h, "\nOr wait: background reclaim will free space for a build "

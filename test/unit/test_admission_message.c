@@ -128,6 +128,12 @@ test_ar0_permanent(void)
     HAS("AR0 hint ace", o.hint, "build_algo='auto'");
     HAS("AR0 hint degree", o.hint, "graph_degree");
     LACKS("AR0 no pgvector", o.hint, "pgvector HNSW");
+    f.present |= CUVS_ADM_F_I;
+    f.i = 1;
+    o = format(&f, CUVS_ADMISSION_OBJ_SHARD, 0, NULL);
+    CHECK("AR0 shard prefix", strncmp(o.detail, "shard 1: needs 27895 MiB", 24) == 0);
+    HAS("AR0 shard hint", o.hint, "cuvs.shard_count");
+    f.present &= ~(uint32_t)CUVS_ADM_F_I;
     o = format(&f, CUVS_ADMISSION_OBJ_IVFPQ, 0, NULL);
     CHECK("AR0 ivfpq 54000", o.sqlstate && strcmp(o.sqlstate, "54000") == 0);
     HAS("AR0 ivfpq msg", o.msg, "this IVF-PQ build (needs more than");

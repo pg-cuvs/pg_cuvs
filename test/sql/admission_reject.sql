@@ -40,9 +40,27 @@ SELECT r->>'reason' AS reason, r->>'sqlstate' AS sqlstate,
        (r->>'index_oid')::oid <> 0 AS has_index_oid
 FROM pg_cuvs_last_rejection() r;
 
+-- Sharded build (CK-36 (d')): 4000 rows in 2 shards of 2000, each
+-- N = 576,000 + 4,450,176 = 5,026,176 B (4 MiB) against 3 MiB. The shard
+-- rejection carries its shard number in DETAIL and in the jsonb.
+CREATE TABLE ar_shard (id int, embedding vector(8));
+INSERT INTO ar_shard
+SELECT g, format('[%s,%s,0,0,0,0,1,0]', g, g % 11)::vector FROM generate_series(1, 4000) g;
+SET cuvs.shard_count = 2;
+SELECT pg_cuvs_set_vram_budget(3145728);
+\set ON_ERROR_STOP off
+CREATE INDEX ar_sharded ON ar_shard USING cagra (embedding vector_l2_ops);
+\echo :LAST_ERROR_SQLSTATE
+\set ON_ERROR_STOP on
+SELECT r->>'reason' AS reason, r->>'sqlstate' AS sqlstate, r->>'requester' AS requester,
+       r->'shard' AS shard
+FROM pg_cuvs_last_rejection() r;
+RESET cuvs.shard_count;
+
 -- Restored budget: the same build is admitted.
 SELECT pg_cuvs_set_vram_budget(0);
 CREATE INDEX ar_cagra ON ar_items USING cagra (embedding vector_l2_ops);
 SELECT pg_cuvs_last_rejection()->>'reason' AS last_reason_unchanged;
 
 DROP TABLE ar_items;
+DROP TABLE ar_shard;
