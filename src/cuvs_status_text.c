@@ -129,6 +129,11 @@ cuvs_status_parse_field(char kind, const char *field, int64_t *value,
                 return -1;
             *isnull = v == -1;
             break;
+        case CUVS_SF_I64N:      /* I3-E */
+            if (v < -1)
+                return -1;
+            *isnull = v == -1;
+            break;
         default:
             return -1;
     }

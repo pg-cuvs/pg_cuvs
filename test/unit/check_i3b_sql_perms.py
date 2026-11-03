@@ -135,7 +135,7 @@ check(m is not None and sql.find("-- I3-A end") >= 0 and sql.find("-- I3-A end")
       "I3-B block is not appended after the I3-A block")
 _in_other = None
 for line in outside.splitlines():
-    om = re.match(r"^-- (I3-A|I3-C|I3-D|I4) (begin|end)\s*$", line)
+    om = re.match(r"^-- (I3-A|I3-C|I3-D|I4|I3-E) (begin|end)\s*$", line)
     if om:
         _in_other = om.group(1) if om.group(2) == "begin" else None
         continue
