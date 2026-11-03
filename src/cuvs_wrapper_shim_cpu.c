@@ -222,7 +222,9 @@ void cuvs_bf_free(CuvsBfIndex index, int device_id)
 { (void)device_id; shim_free((ShimIndex *)index); }
 
 /* ADR-070 Bug #3: synthetic build-OOM seam, mirrors the GPU wrapper. */
-static int g_last_build_oom  = 0;
+/* Per thread, like the GPU wrapper (I3): the daemon reads it on the thread
+ * that ran the build, and a concurrent build must not set or clear it. */
+static __thread int g_last_build_oom = 0;
 static int g_inject_build_oom = 0;
 int  cuvs_last_build_was_oom(void) { int v = g_last_build_oom; g_last_build_oom = 0; return v; }
 void cuvs_set_inject_build_oom(int n_fail) { g_inject_build_oom = n_fail; }
