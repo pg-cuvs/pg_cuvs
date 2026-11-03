@@ -38,7 +38,6 @@
  * changes. Deploy the extension and daemon together:
  *   make install && make install-server
  * ---------------------------------------------------------------- */
-#define CUVS_NOTICE_OUT_BYTES 256u  /* CuvsReplyHeader.notice_out, includes NUL */
 #define CUVS_PROTO_MAGIC   0x50435556u  /* 'VUCP' LE — "PG CUVS" tag */
 #define CUVS_PROTO_VERSION 5u   /* 5: I3 set (ADR-081, ADR-086): CuvsReplyHeader
                                  * + err_out (admission payload) + notice_out.
@@ -251,8 +250,8 @@ typedef struct CuvsReplyHeader {
                              * (Phase 3B); backend then skips its CPU merge */
     char     error[128];
     /* 5 (I3): admission rejection payload (grammar in cuvs_admission_contract.h,
-     * "" when the reply is not an admission rejection) and one NOTICE line for
-     * the requester ("" when none). Every reply carries both; the client clears
+     * "" when the reply is not an admission rejection) and up to three NOTICE/DETAIL
+     * pairs for the requester (1024 B total; "" when none). Every reply carries both; the client clears
      * its copy at the start of each request (cuvs_ipc_last_err_out). */
     char     err_out[CUVS_ADMISSION_ERR_OUT_BYTES];
     char     notice_out[CUVS_NOTICE_OUT_BYTES];

@@ -293,6 +293,16 @@ cuvs_admission_can_unload(void *ctx, uint32_t db_oid, uint32_t index_oid)
     return object_ownercheck(RelationRelationId, (Oid) index_oid, GetUserId()) ? 1 : 0;
 }
 
+/* The breaker consumes the same payload decoder as the error renderer. */
+static CuvsAdmissionReason
+cuvs_last_admission_reason(void)
+{
+    CuvsAdmissionFields fields;
+    const char *raw = cuvs_ipc_last_err_out();
+    return raw[0] && cuvs_admission_decode(raw, strlen(raw) + 1, &fields) == 0
+        ? fields.reason : CUVS_ADMISSION_NONE;
+}
+
 /*
  * If the last daemon reply carried an admission payload, raise it as the C5
  * error and remember it; otherwise return so the caller keeps its legacy
@@ -300,20 +310,18 @@ cuvs_admission_can_unload(void *ctx, uint32_t db_oid, uint32_t index_oid)
  * CAGRA into SHARD. load_rel names the index for LOAD (may be NULL).
  */
 static void
-cuvs_report_admission(CuvsAdmissionObject obj, Oid index_oid, Relation load_rel)
+cuvs_report_admission_fields(const CuvsAdmissionFields *input,
+                             CuvsAdmissionObject obj, Oid index_oid,
+                             Relation load_rel, const char *extra_detail)
 {
-    CuvsAdmissionFields  f;
+    CuvsAdmissionFields  f = *input;
     CuvsAdmissionCatalog cat;
-    const char *payload = cuvs_ipc_last_err_out();
     const char *state;
     char       *load_name = NULL;
     char        msg[CUVS_ADMISSION_MSG_BYTES];
     char        detail[CUVS_ADMISSION_MSG_BYTES];
     char        hint[CUVS_ADMISSION_MSG_BYTES];
 
-    if (payload[0] == '\0' ||
-        cuvs_admission_decode(payload, strlen(payload) + 1, &f) != 0)
-        return;
     if (obj == CUVS_ADMISSION_OBJ_CAGRA && (f.present & CUVS_ADM_F_I))
         obj = CUVS_ADMISSION_OBJ_SHARD;
     if (load_rel != NULL)
@@ -342,19 +350,78 @@ cuvs_report_admission(CuvsAdmissionObject obj, Oid index_oid, Relation load_rel)
     ereport(ERROR,
             (errcode(MAKE_SQLSTATE(state[0], state[1], state[2], state[3], state[4])),
              errmsg("%s", msg),
-             errdetail("%s", detail),
+             errdetail("%s%s%s", detail, extra_detail ? "; " : "",
+                       extra_detail ? extra_detail : ""),
              errhint("%s", hint)));
 }
 
-/* I3 (v6 1.4 (g)): a successful build reply may carry one NOTICE line for
- * the requester (for example the registry-full defer-to-reload). Call right
- * after the build IPC returns, before any other IPC call. */
 static void
-cuvs_report_build_notice(void)
+cuvs_report_admission(CuvsAdmissionObject obj, Oid index_oid, Relation load_rel)
 {
-    const char *notice = cuvs_ipc_last_notice_out();
-    if (notice[0] != '\0')
-        ereport(NOTICE, (errmsg("%s", notice)));
+    CuvsAdmissionFields fields;
+    const char *payload = cuvs_ipc_last_err_out();
+    if (payload[0] == '\0' ||
+        cuvs_admission_decode(payload, strlen(payload) + 1, &fields) != 0)
+        return;
+    cuvs_report_admission_fields(&fields, obj, index_oid, load_rel, NULL);
+}
+
+/* A build or explicit load reply may carry up to three NOTICE/DETAIL pairs.
+ * Consume them before any later IPC can replace the request-local fields. */
+static char *
+notice_index_name(const char *text, Oid oid)
+{
+    char old[32], name[CUVS_ADMISSION_MSG_BYTES];
+    const char *at;
+    at = strstr(text, "index ");
+    if (at)
+    {
+        unsigned int db, victim;
+        int consumed = 0;
+        if (sscanf(at, "index %u:%u%n", &db, &victim, &consumed) == 2 &&
+            db == (uint32_t)MyDatabaseId &&
+            cuvs_admission_index_name(NULL, victim, name, sizeof(name)) == 0)
+            return psprintf("%.*sindex %s%s", (int)(at - text), text, name, at + consumed);
+        /* Never resolve another database's OID in the current catalog. */
+        if (strchr(at, ':') && consumed > 0)
+            return pstrdup(text);
+    }
+    snprintf(old, sizeof(old), "index %u", (uint32_t)oid);
+    at = strstr(text, old);
+    if (!at || cuvs_admission_index_name(NULL, (uint32_t)oid, name, sizeof(name)) != 0)
+        return pstrdup(text);
+    return psprintf("%.*s%s%s", (int)(at - text), text, name, at + strlen(old));
+}
+
+static void
+cuvs_report_build_notice(Oid index_oid)
+{
+    const char *wire = cuvs_ipc_last_notice_out();
+    CuvsNoticeBatch batch;
+    if (!wire[0])
+        return;
+    if (cuvs_notice_decode(wire, CUVS_NOTICE_OUT_BYTES, &batch) != 0)
+    {
+        ereport(NOTICE, (errmsg("(+1 more)"),
+                        errdetail("Complete NOTICE is in the daemon journal.")));
+        return;
+    }
+    for (uint32_t i = 0; i < batch.count; i++)
+    {
+        char *message = notice_index_name(batch.pairs[i].message, index_oid);
+        char *detail = notice_index_name(batch.pairs[i].detail, index_oid);
+        if (!detail[0] && strncmp(message, "(+", 2) == 0)
+        {
+            pfree(detail);
+            detail = pstrdup("Complete NOTICE is in the daemon journal.");
+        }
+        if (detail[0])
+            ereport(NOTICE, (errmsg("%s", message), errdetail("%s", detail)));
+        else
+            ereport(NOTICE, (errmsg("%s", message)));
+        pfree(message);
+        pfree(detail);
+    }
 }
 
 PG_FUNCTION_INFO_V1(pg_cuvs_last_rejection);
@@ -3249,6 +3316,7 @@ cuvs_build_parallel(Relation heapRel, Relation indexRel, IndexInfo *indexInfo,
                 shard_count, use_cpu_hnsw ? 1 : 0,
                 (uint32_t) graph_degree, (uint32_t) intermediate_graph_degree, build_algo);
 
+            cuvs_report_build_notice(build_index_oid);
             if (rc != CUVS_STATUS_OK)
             {
                 cuvs_report_proto_mismatch(rc);
@@ -3261,7 +3329,6 @@ cuvs_build_parallel(Relation heapRel, Relation indexRel, IndexInfo *indexInfo,
                          errhint("Check pg_cuvs_server journal (journalctl -u "
                                  "pg-cuvs-server).")));
             }
-            cuvs_report_build_notice();
         }
         PG_FINALLY();
         {
@@ -3349,16 +3416,17 @@ cuvs_build_cagra_from_heap(Relation heapRel, Relation indexRel, IndexInfo *index
             && cuvs_cagra_prespool_ar0(reltuples_est, (uint32_t) typmod, graph_degree,
                                        shard_count, limits.n_devices, limits.max_limit,
                                        &estimate))
-            ereport(ERROR,
-                    (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED), /* 54000 = AR0 */
-                     errmsg("pg_cuvs: GPU memory is insufficient for this CAGRA build "
-                            "(needs more than the configured limit); CREATE INDEX aborted"),
-                     errdetail("AR0 n=%u q=%u; estimated from reltuples=%.0f before the heap scan, no rows were read.",
-                               cuvs_prespool_mib(estimate), cuvs_prespool_mib(limits.max_limit),
-                               reltuples_est),
-                     errhint("For a large table use pg_cuvs_hnsw with build_algo='auto' "
-                             "(spills to ACE-disk over the budget) or 'ace'. If the statistics "
-                             "are stale, run ANALYZE and retry.")));
+        {
+            CuvsAdmissionFields fields = {0};
+            fields.reason = CUVS_ADMISSION_AR0;
+            fields.present = CUVS_ADM_F_N | CUVS_ADM_F_Q;
+            fields.n = cuvs_prespool_mib(estimate);
+            fields.q = cuvs_prespool_mib(limits.max_limit);
+            cuvs_report_admission_fields(&fields, CUVS_ADMISSION_OBJ_CAGRA,
+                (Oid)build_index_oid, NULL,
+                psprintf("estimated from reltuples=%.0f before the heap scan, no rows were read; "
+                         "if the statistics are stale, run ANALYZE and retry", reltuples_est));
+        }
     }
 
     /* ADR-034 §4A-2: parallelize the heap scan + detoast across maintenance
@@ -3461,6 +3529,7 @@ cuvs_build_cagra_from_heap(Relation heapRel, Relation indexRel, IndexInfo *index
                 (uint32_t) intermediate_graph_degree,
                 build_algo);  /* 3R: CAGRA build params from reloptions */
 
+            cuvs_report_build_notice(build_index_oid);
             if (rc != CUVS_STATUS_OK)
             {
                 /* DDL durability contract: fail the transaction so the catalog
@@ -3494,7 +3563,6 @@ cuvs_build_cagra_from_heap(Relation heapRel, Relation indexRel, IndexInfo *index
                                 "aborted to preserve catalog durability", rc),
                          errhint("%s", hint)));
             }
-            cuvs_report_build_notice();
         }
     }
     PG_FINALLY();
@@ -4487,7 +4555,7 @@ cuvs_gettuple(IndexScanDesc scan, ScanDirection dir)
             cuvs_circuit_record_status_reason((uint32_t)index_oid,
                                               cuvs_circuit_breaker_threshold,
                                               rc,
-                                              CUVS_ADMISSION_NONE, /* I3-A: pass decoded err_out reason */
+                                              cuvs_last_admission_reason(),
                                               (int64_t) time(NULL));
 
             switch (rc)
@@ -4753,7 +4821,7 @@ flat_gettuple(IndexScanDesc scan, ScanDirection dir)
             cuvs_circuit_record_status_reason((uint32_t)index_oid,
                                               cuvs_circuit_breaker_threshold,
                                               rc,
-                                              CUVS_ADMISSION_NONE, /* I3-A: pass decoded err_out reason */
+                                              cuvs_last_admission_reason(),
                                               (int64_t) time(NULL));
 
             switch (rc)
@@ -5427,7 +5495,7 @@ ivfpq_gettuple(IndexScanDesc scan, ScanDirection dir)
             cuvs_circuit_record_status_reason((uint32_t)index_oid,
                                               cuvs_circuit_breaker_threshold,
                                               rc,
-                                              CUVS_ADMISSION_NONE, /* I3-A: pass decoded err_out reason */
+                                              cuvs_last_admission_reason(),
                                               (int64_t) time(NULL));
 
             switch (rc)
@@ -6922,6 +6990,13 @@ cuvs_manual_rel(FunctionCallInfo fcinfo, uint32 op)
     cuvs_manual_check_index(relid);
     rc = cuvs_ipc_manual(cuvs_socket_path, op, (uint32_t) MyDatabaseId,
                          (uint32_t) relid, msg, sizeof(msg));
+    cuvs_report_build_notice(relid);
+    if (rc != CUVS_STATUS_OK && (op == CUVS_OP_LOAD || op == CUVS_OP_PIN))
+    {
+        Relation target = index_open(relid, AccessShareLock);
+        cuvs_report_admission(CUVS_ADMISSION_OBJ_LOAD, relid, target);
+        index_close(target, AccessShareLock);
+    }
     return cuvs_manual_result(rc, msg);
 }
 

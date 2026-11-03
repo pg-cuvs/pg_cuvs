@@ -59,7 +59,7 @@ mock_daemon(void *arg)
 }
 
 static int
-round_trip(const char *path, const CuvsReplyHeader *reply, uint32_t *version)
+round_trip_op(const char *path, const CuvsReplyHeader *reply, uint32_t *version, int manual)
 {
     Mock m;
     struct sockaddr_un a;
@@ -77,13 +77,21 @@ round_trip(const char *path, const CuvsReplyHeader *reply, uint32_t *version)
         listen(m.listener, 1) != 0)
         return -100;
     pthread_create(&t, NULL, mock_daemon, &m);
-    rc = cuvs_ipc_drop(path, 1, 2);
+    char msg[256];
+    rc = manual ? cuvs_ipc_manual(path, CUVS_OP_LOAD, 1, 2, msg, sizeof(msg))
+                : cuvs_ipc_drop(path, 1, 2);
     pthread_join(t, NULL);
     close(m.listener);
     unlink(path);
     if (version)
         *version = m.seen_version;
     return rc;
+}
+
+static int
+round_trip(const char *path, const CuvsReplyHeader *reply, uint32_t *version)
+{
+    return round_trip_op(path, reply, version, 0);
 }
 
 int
@@ -108,6 +116,19 @@ main(void)
     CHECK("err_out exposed", strcmp(cuvs_ipc_last_err_out(), "AR0 n=27895 q=23847") == 0);
     CHECK("notice exposed",
           strcmp(cuvs_ipc_last_notice_out(), "pg_cuvs: registry full; fallback") == 0);
+
+    /* B manual LOAD consumes the same err_out / notice_out path. */
+    rc = round_trip_op(path, &r, NULL, 1);
+    CHECK("manual rejection status", rc == CUVS_STATUS_OOM_FALLBACK);
+    CHECK("manual err_out exposed", strcmp(cuvs_ipc_last_err_out(), "AR0 n=27895 q=23847") == 0);
+    CHECK("manual notice exposed", strcmp(cuvs_ipc_last_notice_out(),
+          "pg_cuvs: registry full; fallback") == 0);
+    {
+        CuvsReplyHeader ok = {0};
+        CHECK("manual clean success", round_trip_op(path, &ok, NULL, 1) == CUVS_STATUS_OK);
+        CHECK("manual stale rejection cleared", cuvs_ipc_last_err_out()[0] == '\0');
+        CHECK("manual stale notice cleared", cuvs_ipc_last_notice_out()[0] == '\0');
+    }
 
     /* An unterminated field is cut at its own size, never read beyond it. */
     memset(&r, 'x', sizeof(r));

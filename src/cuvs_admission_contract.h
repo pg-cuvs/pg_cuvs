@@ -8,6 +8,8 @@
  * deploying the new producer and consumer together (ADR-081).
  */
 #define CUVS_ADMISSION_IPC_VERSION 5u
+#define CUVS_NOTICE_OUT_BYTES 1024u /* msg/DETAIL pairs, includes NUL */
+#define CUVS_NOTICE_MAX_PAIRS 3u
 #define CUVS_ADMISSION_ERR_OUT_BYTES 512u /* includes terminating NUL */
 #define CUVS_ADMISSION_MAX_CANDIDATES 3u
 #define CUVS_ADMISSION_SCALAR_MAX UINT32_C(99999999)

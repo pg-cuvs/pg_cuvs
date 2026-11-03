@@ -5,6 +5,7 @@
  * clear or set it. Checked against the CPU shim, which mirrors the wrapper.
  */
 #include "cuvs_wrapper.h"
+#include "cuvs_lw_policy.h"
 
 #include <pthread.h>
 #include <stdio.h>
@@ -24,7 +25,7 @@ static const float g_vecs[8 * 4] = {0};
 static void *
 other_thread_builds(void *arg)
 {
-    CuvsCagraIndex h = cuvs_cagra_build(g_vecs, 8, 4, 0, 0, 0, 0, 0);
+    CuvsCagraIndex h = cuvs_cagra_build(g_vecs, 8, 4, 0, 0, 0, 0, 0, CUVS_LW_OVERFLOW_ERROR, NULL);
     (void) arg;
     if (h)
         cuvs_cagra_free(h, 0);
@@ -47,7 +48,7 @@ main(void)
 
     /* Arrange: this thread's build fails with an injected OOM. */
     cuvs_set_inject_build_oom(1);
-    CHECK("injected build fails", cuvs_cagra_build(g_vecs, 8, 4, 0, 0, 0, 0, 0) == NULL);
+    CHECK("injected build fails", cuvs_cagra_build(g_vecs, 8, 4, 0, 0, 0, 0, 0, CUVS_LW_OVERFLOW_ERROR, NULL) == NULL);
 
     /* Act: another thread builds successfully, a third reads its flag. */
     pthread_create(&t, NULL, other_thread_builds, NULL);

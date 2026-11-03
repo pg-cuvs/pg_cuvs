@@ -765,6 +765,13 @@ a NOTICE. If the build then fails, the next query reloads the old copy. `REINDEX
 OID beside the serving index: do not unload the old index for it; unload another
 cold index instead.
 
+Build and explicit load replies carry up to three NOTICE/DETAIL pairs in a
+1024-byte reply field. Names of evicted indexes are resolved in the requester's
+database; entries of another database retain their database and index OIDs.
+When the field or pair limit is exceeded, `(+N more)` points to the full messages
+in the daemon journal. The admission-error field remains 512 bytes. Co-deploy
+the extension and daemon built from the same reply header.
+
 **Queries got slower.** Causes: the index was evicted and is reloaded (see
 `last_evict_reason`); an open circuit breaker (`pg_cuvs_circuit_status()`); or a
 delta/tombstone invalidation. The last one: if the index has a delta or tombstone

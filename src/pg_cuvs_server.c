@@ -407,6 +407,9 @@ static uint32_t g_rmm_pool_max_percent = 50;
  * H_Q value (v5 C3: ceil(1000 x 7.0235 x 1.10)); Q1 measures the default
  * policy's rho and replaces this literal at H_M. */
 #define CUVS_RMM_SCRATCH_PERMILLE_DEFAULT 7726u
+/* Provisional coefficient came from the I2 in-pool workspace measurements.
+ * Q1 changes this binding together with the measured default coefficient. */
+#define CUVS_RMM_SCRATCH_VALIDATED_OVERFLOW_POLICY CUVS_LW_OVERFLOW_ERROR
 static uint32_t g_scratch_permille = CUVS_RMM_SCRATCH_PERMILLE_DEFAULT;
 /* ADR-087 (UC-5): build_algo=auto over the resident budget spills to ACE
  * (default) or fails with status 13. Startup-only; explicit ivf_pq/ace
@@ -435,6 +438,11 @@ static char     g_oom_score_adj_result[CUVS_LW_OOM_RESULT_LEN] = "oom_score_adj 
 static uint64_t g_lw_pending[CUVS_MAX_GPUS];
 static uint64_t g_managed_spill_builds[CUVS_MAX_GPUS];
 static uint64_t g_managed_spill_bytes_max[CUVS_MAX_GPUS];
+/* Request-local victim notices; background reclaim never queues them. */
+static __thread char t_evict_notices[CUVS_NOTICE_OUT_BYTES];
+static void record_eviction_notice(uint32_t db, uint32_t idx, int64_t idle,
+                                   int64_t protect, CuvsEvictReason why);
+
 
 /* ADR-065: default per-device budget when --max-vram-mb is omitted — a fraction
  * of total VRAM, leaving headroom for the untracked cuVS workspace + CUDA
@@ -845,6 +853,15 @@ admission_entry_bytes_on(const IndexEntry *e, int dev)
     return total;
 }
 
+static size_t
+admission_same_resident(uint32_t db, uint32_t idx, int dev)
+{
+    for (int i = 0; i < g_n_indexes; i++)
+        if (g_indexes[i].db_oid == db && g_indexes[i].index_oid == idx)
+            return admission_entry_bytes_on(&g_indexes[i], dev);
+    return 0;
+}
+
 /* Resident total and count on `dev`, without in-flight build reservations. */
 static void
 admission_resident(int dev, size_t *bytes, uint32_t *count)
@@ -873,9 +890,13 @@ admission_limit(int dev)
     return budget;
 }
 
-/* I3-A tip candidate rule (v6 1.4 (h)): resident on `dev`, oldest
- * last_search first, sharded entries with inflight > 0 excluded. Pins and
- * in-use exclusion are added by I3-B. last_search 0 means never searched. */
+typedef struct AdmissionCacheTotals {
+    uint64_t lru, eligible, pinned, busy, reclaimable;
+    uint32_t lru_count, pinned_count, busy_count;
+} AdmissionCacheTotals;
+static void admission_cache_totals(int dev, AdmissionCacheTotals *out);
+
+/* Resident candidates: oldest first, excluding pinned and in-use entries. */
 static void
 admission_candidates(int dev, CuvsAdmissionFields *f)
 {
@@ -891,7 +912,7 @@ admission_candidates(int dev, CuvsAdmissionFields *f)
             const IndexEntry *e = &g_indexes[i];
             int dup = 0;
             if (admission_entry_bytes_on(e, dev) == 0 ||
-                (e->shard_count >= 2 && e->inflight > 0))
+                e->pinned || e->inflight > 0)
                 continue;
             for (uint32_t k = 0; k < f->n_cand; k++)
                 dup |= picked[k] == i;
@@ -920,10 +941,7 @@ admission_candidates(int dev, CuvsAdmissionFields *f)
     }
 }
 
-/* Fill the C5 per-reason subset for a rejection of `needed` bytes on `dev`
- * (dev < 0: no GPU passed pick_gpu_for_index, AR0 against the largest
- * limit). I3-A tip: no scope, pins or reclaim yet, so e and k are 0/0
- * (every evictable entry was already offered to LRU) and r is 0. */
+/* Fill the C5 per-reason fields from the current B cache policy. */
 static void
 admission_fill(CuvsAdmissionFields *f, CuvsAdmissionReason reason, size_t needed,
                int dev)
@@ -966,12 +984,34 @@ admission_fill(CuvsAdmissionFields *f, CuvsAdmissionReason reason, size_t needed
         }
         case CUVS_ADMISSION_AR3:
         case CUVS_ADMISSION_AR4:
+        case CUVS_ADMISSION_AR5:
             admission_resident(dev, &res_bytes, &res_n);
             f->f = cuvs_admission_mib(gpu_free_vram_bytes(dev));
             f->h_mib = cuvs_admission_mib(res_bytes);
             f->h_cnt = cuvs_admission_count(res_n);
             f->present |= CUVS_ADM_F_F | CUVS_ADM_F_H | CUVS_ADM_F_E | CUVS_ADM_F_K |
                           CUVS_ADM_F_R;
+            {
+                AdmissionCacheTotals totals;
+                uint64_t budget = admission_limit(dev);
+                uint64_t cap = budget / 100 * g_reclaim.f_cap_pct +
+                    (budget % 100) * g_reclaim.f_cap_pct / 100;
+                uint64_t floor = budget / 100 * g_reclaim.floor_pct +
+                    (budget % 100) * g_reclaim.floor_pct / 100;
+                admission_cache_totals(dev, &totals);
+                f->e_mib = cuvs_admission_mib(totals.lru);
+                f->e_cnt = cuvs_admission_count(totals.lru_count);
+                f->k_mib = cuvs_admission_mib(totals.pinned);
+                f->k_cnt = cuvs_admission_count(totals.pinned_count);
+                f->r = cuvs_reclaim_wait_hint(g_reclaim.mode,
+                    gpu_free_vram_bytes(dev), totals.reclaimable, needed,
+                    cap, res_bytes, floor);
+                if (reason == CUVS_ADMISSION_AR5)
+                {
+                    f->present &= ~CUVS_ADM_F_H;
+                    f->present |= CUVS_ADM_F_S;
+                }
+            }
             admission_candidates(dev, f);
             break;
         case CUVS_ADMISSION_OOM:
@@ -986,11 +1026,34 @@ admission_fill(CuvsAdmissionFields *f, CuvsAdmissionReason reason, size_t needed
     }
 }
 
-/* Thread-local count of LRU evictions made by the last ensure_vram call. */
-static __thread int t_admit_evicted;
+static void
+admission_workspace_fields(CuvsAdmissionFields *f,
+                           const CuvsAdmissionWorkspaceInput *ws)
+{
+    if (f->reason == CUVS_ADMISSION_AR6 || f->reason == CUVS_ADMISSION_AR7)
+    {
+        char raw[CUVS_ADMISSION_ERR_OUT_BYTES];
+        CuvsAdmissionFields decoded;
+        int n = cuvs_lw_reject_fields(ws, f->reason, raw, sizeof(raw));
+        if (n >= 0 && (size_t)n < sizeof(raw) &&
+            cuvs_admission_decode(raw, (size_t)n + 1, &decoded) == 0)
+            *f = decoded;
+    }
+}
+
 /* Last search-path reload rejection on this thread (reason NONE when the
  * last load_index failed for another cause or succeeded). */
 static __thread CuvsAdmissionFields t_reload_rej;
+/* LOAD shares the cache policy for search and manual operations, but C8
+ * emits successful admission lines only for the explicit manual operation. */
+static __thread int t_manual_loading;
+static const char *
+admission_load_path(CuvsRequester rq)
+{
+    if (rq == CUVS_RQ_LOAD_STARTUP) return "startup";
+    if (rq == CUVS_RQ_LOAD_WARMUP) return "warmup";
+    return t_manual_loading ? "load" : "reload";
+}
 
 typedef struct AdmitLine {
     const char *op, *path, *algo;
@@ -1000,13 +1063,65 @@ typedef struct AdmitLine {
     int64_t     n;
     size_t      final, needed;
     size_t      pending_before;
+    uint64_t    evictions_before, self_res;
+    uint64_t    used_before, build_started_us, build_finished_us;
+    AdmissionCacheTotals cache;
+    int         cache_valid;
+    CuvsAdmissionWorkspaceInput workspace;
+    int         workspace_valid;
 } AdmitLine;
 
+/* B's device meter is observed under g_index_mutex. solo follows C8:
+ * at most one in-flight build at the point the line is emitted. */
+
+static void
+log_build_begin(AdmitLine *a)
+{
+    CuvsRmmPoolStats st = {0};
+    (void)cuvs_rmm_pool_stats(a->gpu, &st);
+    a->used_before = st.used_bytes;
+    if (g_pending_build_count[a->gpu] == 0)
+        cuvs_rmm_pool_peak_reset(a->gpu);
+    a->build_started_us = admission_mono_us();
+}
+
+static void
+log_build_end(const AdmitLine *a, const CuvsLwBuildStats *lw, int attached,
+              const char *outcome)
+{
+    CuvsRmmPoolStats st = {0};
+    uint64_t lw_peak = lw ? lw->lw_peak : 0;
+    int managed = a->workspace_valid && a->workspace.managed;
+    int spill = lw ? cuvs_lw_spill_flag(managed ? CUVS_LW_OVERFLOW_MANAGED :
+                                      CUVS_LW_OVERFLOW_ERROR,
+                                      lw->lw_peak, lw->free_at_peak) : 0;
+    const char *route = strcmp(a->op, "BUILD_IVFPQ") == 0 ? "ivfpq" :
+                        managed ? "cagra_managed" : "cagra";
+    (void)cuvs_rmm_pool_stats(a->gpu, &st);
+    if (g_rmm_pool_limits[a->gpu] > 0)
+        LOG_INFO("[build_peak] op=%s gpu=%d db=%u idx=%u final=%zu "
+                 "used_before=%llu peak_used=%llu used_after=%llu reserved_after=%llu "
+                 "solo=%d outcome=%s lw_peak=%llu spill=%d mono_us=%llu\n",
+                 a->op, a->gpu, a->db, a->idx, a->final,
+                 (unsigned long long)a->used_before,
+                 (unsigned long long)cuvs_rmm_pool_peak_bytes(a->gpu),
+                 (unsigned long long)st.used_bytes, (unsigned long long)st.reserved_bytes,
+                 g_pending_build_count[a->gpu] <= 1,
+                 outcome, (unsigned long long)lw_peak, spill,
+                 (unsigned long long)admission_mono_us());
+    LOG_INFO("[build_result] op=%s gpu=%d db=%u idx=%u algo=%s n=%lld dim=%u "
+             "gd=%u igd=%u dataset_attached=%d route=%s build_ms=%.3f outcome=%s "
+             "self_replace=%d unloaded=%llu mono_us=%llu\n",
+             a->op, a->gpu, a->db, a->idx, a->algo, (long long)a->n, a->dim,
+             a->gd, a->igd, attached, route,
+             (double)(a->build_finished_us - a->build_started_us) / 1000.0,
+             outcome, a->self_res > 0, (unsigned long long)a->self_res,
+             (unsigned long long)admission_mono_us());
+}
+
 /* [admit] with the 41 v6 fields in schema order. I3-A tip: the I3-B/I4
- * fields (lru_free, elig_free, pin_bytes, policy, overcommit, lw_ub,
- * lw_pending, host_guard, self_res) are 0 or na (v6 1.4 (h)). auto_probe is
- * na (the v5 rule's "not implementable" value); phys_free is not exposed by
- * the wrapper yet and is 0. */
+ * fields consume B cache and I4 workspace observations. auto_probe remains
+ * na (the v5 rule's "not implementable" value). */
 static void
 log_admit(const AdmitLine *a, CuvsAdmissionReason reason)
 {
@@ -1014,7 +1129,16 @@ log_admit(const AdmitLine *a, CuvsAdmissionReason reason)
     size_t   budget = 0, quota = 0, limit = 0, pending_after = 0;
     size_t   headroom_raw = 0, free_net = 0, logical_used = 0, res_bytes = 0;
     uint32_t res_n = 0;
-    uint64_t pool_used = 0, reserved = 0;
+    uint64_t pool_used = 0, reserved = 0, phys_free = 0;
+    AdmissionCacheTotals totals = {0};
+    int cagra = strcmp(a->op, "BUILD") == 0 && strcmp(a->path, "sharded") != 0;
+    const char *policy = cagra ? cuvs_lw_overflow_name(g_cagra_build_overflow) : "na";
+    const char *overcommit = cagra ? (g_managed_overcommit ? "on" : "off") : "na";
+    uint64_t lw_ub = 0, lw_pending = 0, host_guard = 0;
+    char shape[96];
+    snprintf(shape, sizeof(shape), "%s%s", a->shape ? a->shape : "na",
+             cagra && g_cagra_build_overflow == CUVS_LW_OVERFLOW_MANAGED &&
+             !cuvs_lw_shape_checked(a->n, a->dim, a->igd) ? "+lw_extrapolated" : "");
     size_t   scratch = a->needed > a->final ? a->needed - a->final : 0;
 
     if (dev >= 0)
@@ -1028,28 +1152,58 @@ log_admit(const AdmitLine *a, CuvsAdmissionReason reason)
         free_net = gpu_free_vram_bytes(dev);
         logical_used = total_vram_used(dev);
         admission_resident(dev, &res_bytes, &res_n);
+        if (a->cache_valid)
+            totals = a->cache;
+        else
+            admission_cache_totals(dev, &totals);
+        phys_free = cuvs_vram_physical_free_bytes_on(dev);
         if (quota > 0 && cuvs_rmm_pool_stats(dev, &st) == 0)
         {
             pool_used = st.used_bytes;
             reserved = st.reserved_bytes;
         }
     }
+    if (dev < 0)
+        for (int i = 0; i < n_usable_gpus(); i++)
+        {
+            int candidate = usable_gpu(i);
+            size_t candidate_limit = admission_limit(candidate);
+            if (candidate_limit > limit)
+            {
+                limit = candidate_limit;
+                budget = g_max_vram_per_gpu[candidate];
+                quota = g_rmm_pool_limits[candidate];
+            }
+        }
+    if (a->workspace_valid)
+    {
+        reserved = a->workspace.reserved;
+        pool_used = a->workspace.pool_used;
+        phys_free = a->workspace.phys_free;
+        lw_ub = a->workspace.lw_ub;
+        lw_pending = a->workspace.lw_pending;
+        host_guard = a->workspace.host_guard;
+    }
     LOG_INFO("[admit] op=%s path=%s gpu=%d db=%u idx=%u algo=%s shape_class=%s "
              "auto_probe=na n=%lld dim=%u gd=%u igd=%u final=%zu scratch=%zu needed=%zu "
              "limit=%zu budget=%zu pending_before=%zu pending_after=%zu quota=%zu "
              "headroom_raw=%zu free_net=%zu pool_used=%llu logical_used=%zu evicted=%d "
-             "verdict=%s reason=%s res_bytes=%zu res_n=%u lru_free=0 elig_free=0 "
-             "pin_bytes=0 policy=na overcommit=na reserved=%llu phys_free=0 lw_ub=0 "
-             "lw_pending=0 host_guard=0 self_res=0 mono_us=%llu\n",
-             a->op, a->path, dev, a->db, a->idx, a->algo, a->shape ? a->shape : "na",
+             "verdict=%s reason=%s res_bytes=%zu res_n=%u lru_free=%llu elig_free=%llu "
+             "pin_bytes=%llu policy=%s overcommit=%s reserved=%llu phys_free=%llu lw_ub=%llu "
+             "lw_pending=%llu host_guard=%llu self_res=%llu mono_us=%llu\n",
+             a->op, a->path, dev, a->db, a->idx, a->algo, shape,
              (long long) a->n, a->dim,
              a->gd, a->igd, a->final, scratch, a->needed, limit, budget,
              a->pending_before, pending_after, quota, headroom_raw, free_net,
-             (unsigned long long) pool_used, logical_used, t_admit_evicted,
+             (unsigned long long) pool_used, logical_used, dev < 0 ? 0 : (int)(g_cache_evictions[dev] - a->evictions_before),
              reason == CUVS_ADMISSION_NONE ? "admit" : "reject",
              reason == CUVS_ADMISSION_NONE ? "none" : cuvs_admission_reason_name(reason),
-             res_bytes, res_n, (unsigned long long) reserved,
-             (unsigned long long) admission_mono_us());
+             res_bytes, res_n, (unsigned long long)totals.lru,
+             (unsigned long long)totals.eligible, (unsigned long long)totals.pinned,
+             policy, overcommit, (unsigned long long)reserved,
+             (unsigned long long)phys_free, (unsigned long long)lw_ub,
+             (unsigned long long)lw_pending, (unsigned long long)host_guard,
+             (unsigned long long)a->self_res, (unsigned long long)admission_mono_us());
     if (a->shape && strcmp(a->shape, "extrapolated") == 0)
         LOG_WARN("scratch model unvalidated: n=%lld dim=%u gd=%u igd=%u algo=%s\n",
                  (long long) a->n, a->dim, a->gd, a->igd, a->algo);
@@ -1650,8 +1804,12 @@ static int write_tids_atomic(const char *tids_tmp,
 static int fsync_path(const char *path);
 static void fchmod_sidecar(FILE *f, const char *path);
 static void chmod_sidecar(const char *path);
+static CuvsAdmissionReason lw_admission_check(int device_id, uint64_t needed,
+    int64_t n, uint32_t dim, int intermediate_graph_degree,
+    CuvsAdmissionWorkspaceInput *ws);
+
 static int ensure_vram(size_t needed, int device_id, CuvsRequester rq,
-                       CuvsAdmissionFields *rej); /* after the LRU section */
+                       CuvsAdmissionFields *rej, AdmitLine *line); /* after the LRU section */
 static size_t evict_lru(int device_id, CuvsRequester rq);
 static int make_slot(int device_id, CuvsRequester rq);
 static IndexEntry *registry_new_slot(void);
@@ -1795,26 +1953,35 @@ load_index_sharded(uint32_t db_oid, uint32_t index_oid,
         /* cold reload: graph_degree not persisted in .shards -> default 64 */
         size_t needed = estimate_vram_bytes(recs[i].n_vecs, (int)recs[i].dim, 64);
         int    dev    = usable_gpu(i % n_gpus);   /* re-place on reload */
-        if (ensure_vram(needed, dev, rq, NULL) != 0)
+        AdmitLine al = {.op = "LOAD_SHARD", .path = admission_load_path(rq),
+                        .algo = "cagra", .gpu = dev, .db = db_oid, .idx = index_oid,
+                        .dim = recs[i].dim, .gd = 64, .igd = 128, .n = recs[i].n_vecs,
+                        .final = needed, .needed = needed,
+                        .pending_before = g_pending_rmm_build_vram[dev],
+                        .evictions_before = g_cache_evictions[dev]};
+        if (ensure_vram(needed, dev, rq, NULL, &al) != 0)
         {
             int alt = pick_gpu_for_index(needed);
-            if (alt < 0)
-                admission_fill(&t_reload_rej, CUVS_ADMISSION_AR0, needed, -1);
-            if (alt < 0 || ensure_vram(needed, alt, rq, &t_reload_rej) != 0)
+            al.gpu = alt;
+            al.cache_valid = 0;
+            if (alt >= 0)
             {
-                AdmitLine al = {.op = "LOAD_SHARD", .path = "reload", .algo = "cagra",
-                                .gpu = alt, .db = db_oid, .idx = index_oid,
-                                .dim = recs[i].dim, .gd = 64, .igd = 128, .n = recs[i].n_vecs,
-                                .final = needed, .needed = needed};
-                if (alt >= 0)
-                    al.pending_before = g_pending_rmm_build_vram[alt];
+                al.pending_before = g_pending_rmm_build_vram[alt];
+                al.evictions_before = g_cache_evictions[alt];
+            }
+            else
+                admission_fill(&t_reload_rej, CUVS_ADMISSION_AR0, needed, -1);
+            if (alt < 0 || ensure_vram(needed, alt, rq, &t_reload_rej, &al) != 0)
+            {
                 log_admit(&al, t_reload_rej.reason);
-                rc_fail = -2;   /* VRAM pressure */
+                rc_fail = -2;
                 ok = 0;
                 break;
             }
             dev = alt;
         }
+        if (t_manual_loading)
+            log_admit(&al, CUVS_ADMISSION_NONE);
 
         char sp[512];
         shard_cagra_path(sp, sizeof(sp), g_index_dir, db_oid, index_oid, recs[i].shard_id);
@@ -2068,6 +2235,15 @@ load_index(uint32_t db_oid, uint32_t index_oid, CuvsRequester rq)
                 else { e->stale = 0; e->stale_since = 0; }
             }
 
+            if (t_manual_loading)
+            {
+                AdmitLine al = {.op = "LOAD", .path = "load", .algo = "flat",
+                    .gpu = fgpu, .db = db_oid, .idx = index_oid,
+                    .dim = dim, .n = n_vecs,
+                    .pending_before = g_pending_rmm_build_vram[fgpu],
+                    .evictions_before = g_cache_evictions[fgpu]};
+                log_admit(&al, CUVS_ADMISSION_NONE);
+            }
             LOG_INFO("pg_cuvs_server: loaded flat index %u/%u (%lld vecs, BF built lazily)\n",
                      db_oid, index_oid, (long long) n_vecs);
             return 0;
@@ -2083,7 +2259,7 @@ load_index(uint32_t db_oid, uint32_t index_oid, CuvsRequester rq)
     int target_gpu = pick_gpu_for_index(needed);
     if (target_gpu < 0)
     {
-        AdmitLine al = {.op = "LOAD", .path = "reload", .algo = "cagra", .gpu = -1,
+        AdmitLine al = {.op = "LOAD", .path = admission_load_path(rq), .algo = "cagra", .gpu = -1,
                         .db = db_oid, .idx = index_oid, .dim = dim, .gd = 64, .igd = 128,
                         .n = n_vecs, .final = needed, .needed = needed};
         admission_fill(&t_reload_rej, CUVS_ADMISSION_AR0, needed, -1);
@@ -2093,12 +2269,15 @@ load_index(uint32_t db_oid, uint32_t index_oid, CuvsRequester rq)
         free(tids);
         return -2;  /* VRAM: index too large for any GPU budget */
     }
-    if (ensure_vram(needed, target_gpu, rq, &t_reload_rej) != 0)
+    AdmitLine al = {.op = "LOAD",
+                    .path = admission_load_path(rq),
+                    .algo = "cagra", .gpu = target_gpu, .db = db_oid, .idx = index_oid,
+                    .dim = dim, .gd = 64, .igd = 128, .n = n_vecs,
+                    .final = needed, .needed = needed,
+                    .pending_before = g_pending_rmm_build_vram[target_gpu],
+                    .evictions_before = g_cache_evictions[target_gpu]};
+    if (ensure_vram(needed, target_gpu, rq, &t_reload_rej, &al) != 0)
     {
-        AdmitLine al = {.op = "LOAD", .path = "reload", .algo = "cagra",
-                        .gpu = target_gpu, .db = db_oid, .idx = index_oid, .dim = dim,
-                        .gd = 64, .igd = 128, .n = n_vecs, .final = needed, .needed = needed,
-                        .pending_before = g_pending_rmm_build_vram[target_gpu]};
         log_admit(&al, t_reload_rej.reason);
         LOG_WARN("pg_cuvs_server: VRAM exhausted on GPU %d loading %u/%u "
                  "(budget %zu MB, used %zu MB, needed %zu MB)\n",
@@ -2109,6 +2288,9 @@ load_index(uint32_t db_oid, uint32_t index_oid, CuvsRequester rq)
         free(tids);
         return -2;  /* VRAM: exhausted after eviction */
     }
+
+    if (t_manual_loading)
+        log_admit(&al, CUVS_ADMISSION_NONE);
 
     CuvsCagraIndex handle       = cuvs_cagra_deserialize(idx_path, (int)dim, target_gpu);
     CuvsIvfPqIndex ivfpq_handle = NULL;
@@ -2620,6 +2802,44 @@ entry_cand(const IndexEntry *e, int device_id)
     return c;
 }
 
+/* Bind C5/C8 observations to the same B policy state; no policy copy. */
+static void
+admission_cache_totals(int dev, AdmissionCacheTotals *out)
+{
+    CuvsEvictParams params = evict_params_now();
+    int64_t now = (int64_t)time(NULL);
+    memset(out, 0, sizeof(*out));
+    for (int i = 0; i < g_n_indexes; i++)
+    {
+        IndexEntry *e = &g_indexes[i];
+        if (!e->valid || !entry_on_device(e, dev))
+            continue;
+        CuvsEvictCand c = entry_cand(e, dev);
+        if (c.pinned)
+        {
+            out->pinned += c.bytes;
+            out->pinned_count++;
+        }
+        else if (c.in_use)
+        {
+            out->busy += c.bytes;
+            out->busy_count++;
+        }
+        if (!cuvs_evict_protected(&c))
+        {
+            out->lru += c.bytes;
+            out->lru_count++;
+        }
+        if (cuvs_evict_eligible(&c, now, &params))
+        {
+            out->eligible += c.bytes;
+            if (!cuvs_reclaim_skip_sidecar(cuvs_entry_sidecar_kind(g_index_dir,
+                    e->db_oid, e->index_oid), entry_is_cagra_single(e), e->file_current))
+                out->reclaimable += c.bytes;
+        }
+    }
+}
+
 /* Free `e` (index into g_indexes is compacted). Returns bytes freed on
  * device_id, or 0 with *persist_failed = 1 when its save failed (the entry
  * stays resident). Writes the [evict] line and the counters (EV-7). */
@@ -2723,6 +2943,10 @@ evict_entry(IndexEntry *e, int device_id, CuvsEvictReason why, int self_replace,
              (unsigned long long)mono_us(), self_replace);
     (void) eligible;
     (void) saved;
+
+    if (!self_replace && rq != CUVS_RQ_RECLAIM && rq != CUVS_RQ_MANUAL)
+        record_eviction_notice(db, idx, c.last_use ? (int64_t)(now - c.last_use) : -1,
+            cuvs_evict_protect_s(c.hits, pp.t_min_s, pp.bonus_s, pp.hits_cap), why);
 
     int idx_pos = (int)(e - g_indexes);
     for (int i = idx_pos; i < g_n_indexes - 1; i++)
@@ -2904,13 +3128,18 @@ pick_reason(const CuvsEvictPick *pk, int physical_phase)
  * only what the requester's rules allow (v6 C1 RQ table). The requester is
  * mandatory: a caller that omits it does not compile (CK-36 (a)). */
 static int
-ensure_vram(size_t needed, int device_id, CuvsRequester rq, CuvsAdmissionFields *rej)
+ensure_vram(size_t needed, int device_id, CuvsRequester rq, CuvsAdmissionFields *rej,
+            AdmitLine *line)
 {
-    t_admit_evicted = 0;
     size_t budget = g_max_vram_per_gpu[device_id];
     size_t quota = g_rmm_pool_limits[device_id];
     size_t pending = quota > 0 ? g_pending_rmm_build_vram[device_id] : 0;
     size_t beff = budget_eff_bytes(device_id);
+    if (line && !line->cache_valid)
+    {
+        admission_cache_totals(device_id, &line->cache);
+        line->cache_valid = 1;
+    }
     /* UC-1 6b / r18 B-9: a reload softly evicts even when another build's
      * pending reservation is what makes it short. */
     int soft_load = (rq == CUVS_RQ_LOAD || rq == CUVS_RQ_LOAD_SHARD) &&
@@ -2947,6 +3176,25 @@ ensure_vram(size_t needed, int device_id, CuvsRequester rq, CuvsAdmissionFields 
         g_last_admit_reason = CUVS_ADMISSION_AR2;
         goto admission_rejected;
     }
+    /* AR6/7 consume the original pre-eviction observation once per build.
+     * A self-replace second admission reuses it, never a more permissive one. */
+    if (rq == CUVS_RQ_BUILD_CAGRA && line)
+    {
+        CuvsAdmissionReason wr;
+        if (!line->workspace_valid)
+        {
+            wr = lw_admission_check(device_id, needed, line->n, line->dim,
+                                     (int)line->igd, &line->workspace);
+            line->workspace_valid = 1;
+        }
+        else
+            wr = cuvs_admission_workspace_check(&line->workspace);
+        if (wr != CUVS_ADMISSION_NONE)
+        {
+            g_last_admit_reason = wr;
+            goto admission_rejected;
+        }
+    }
     uint64_t need = budget_short > phys_short ? budget_short : phys_short;
     if (need > 0 && make_room(device_id, rq, need, 0, &pk) != 0)
     {
@@ -2966,8 +3214,23 @@ ensure_vram(size_t needed, int device_id, CuvsRequester rq, CuvsAdmissionFields 
     return 0;
 admission_rejected:
     if (rej)
+    {
         admission_fill(rej, (CuvsAdmissionReason)g_last_admit_reason,
                        needed, device_id);
+        if (line && line->workspace_valid)
+            admission_workspace_fields(rej, &line->workspace);
+        if (g_last_admit_reason == CUVS_ADMISSION_AR5 &&
+            (rq == CUVS_RQ_LOAD || rq == CUVS_RQ_LOAD_SHARD))
+        {
+            AdmissionCacheTotals totals;
+            admission_cache_totals(device_id, &totals);
+            rej->present &= ~(CUVS_ADM_F_S | CUVS_ADM_F_R);
+            rej->present |= CUVS_ADM_F_W;
+            rej->w = pk.wait;
+            rej->e_mib = cuvs_admission_mib(totals.pinned + totals.busy);
+            rej->e_cnt = cuvs_admission_count(totals.pinned_count + totals.busy_count);
+        }
+    }
     return -1;
 }
 
@@ -2977,6 +3240,19 @@ static void note_self_replace_failure(uint32_t index_oid, uint64_t self_unloaded
  * Delivered through I3-A's notice_out; until that lands it is logged. */
 static __thread char g_build_notice[512];
 static __thread char g_build_notice_detail[512];
+static __thread char t_lw_notice[512];
+static __thread uint32_t t_notice_index_oid;
+static __thread uint64_t t_notice_self_unloaded;
+
+static void
+clear_build_notices(void)
+{
+    g_build_notice[0] = g_build_notice_detail[0] = t_lw_notice[0] = '\0';
+    t_evict_notices[0] = '\0';
+    t_notice_index_oid = 0;
+    t_notice_self_unloaded = 0;
+}
+
 
 /*
  * BUILD_CAGRA admission with REINDEX self-replace (UC-1 2a, KB-26): when the
@@ -2988,13 +3264,17 @@ static __thread char g_build_notice_detail[512];
  */
 static int
 admit_build_cagra(size_t needed, int device_id, uint32_t db_oid,
-                  uint32_t index_oid, uint64_t *unloaded)
+                  uint32_t index_oid, uint64_t *unloaded, AdmitLine *line)
 {
     *unloaded = 0;
+    line->workspace_valid = 0;
+    line->cache_valid = 0;
+    line->self_res = 0;
     g_build_notice[0] = '\0';
     g_build_notice_detail[0] = '\0';
+    t_notice_index_oid = index_oid;
     g_cur_requester_idx = index_oid;
-    if (ensure_vram(needed, device_id, CUVS_RQ_BUILD_CAGRA, NULL) == 0)
+    if (ensure_vram(needed, device_id, CUVS_RQ_BUILD_CAGRA, NULL, line) == 0)
         return 0;
     int reason = g_last_admit_reason;
     IndexEntry *old = find_index(db_oid, index_oid);
@@ -3013,7 +3293,8 @@ admit_build_cagra(size_t needed, int device_id, uint32_t db_oid,
     if (needed > fr && needed - fr > shortfall)
         shortfall = needed - fr;
     if (reason == CUVS_ADMISSION_AR0 || reason == CUVS_ADMISSION_AR1 ||
-        reason == CUVS_ADMISSION_AR2 ||
+        reason == CUVS_ADMISSION_AR2 || reason == CUVS_ADMISSION_AR6 ||
+        reason == CUVS_ADMISSION_AR7 ||
         cuvs_self_replace_decide(shortfall, has_old, has_old && old->pinned,
                                  old_bytes, g_reclaim.self_replace)
             != CUVS_SELF_REPLACE)
@@ -3030,6 +3311,8 @@ admit_build_cagra(size_t needed, int device_id, uint32_t db_oid,
         return -1;
     }
     *unloaded = freed;
+    t_notice_self_unloaded = freed;
+    line->self_res = freed;
     {
         char label[32];
         /* Room for the build before the old copy was counted: the smaller of
@@ -3048,7 +3331,7 @@ admit_build_cagra(size_t needed, int device_id, uint32_t db_oid,
     }
     LOG_INFO("[self_replace] db=%u idx=%u unloaded=%zu notice=\"%s\" detail=\"%s\"\n",
              db_oid, index_oid, freed, g_build_notice, g_build_notice_detail);
-    if (ensure_vram(needed, device_id, CUVS_RQ_BUILD_CAGRA, NULL) == 0)
+    if (ensure_vram(needed, device_id, CUVS_RQ_BUILD_CAGRA, NULL, line) == 0)
         return 0;
     /* The estimate said the old copy was enough but the device disagrees:
      * the copy is gone and the build is refused. Say so (the next query
@@ -3222,6 +3505,7 @@ lw_build_finish(const char *op, int device_id, uint32_t db_oid, uint32_t index_o
                  device_id, (unsigned long long)st->lw_live_end);
     if (!cuvs_lw_spill_notice(spill, st->lw_peak, st->free_at_peak, notice, notice_len))
         return 0;
+    snprintf(t_lw_notice, sizeof(t_lw_notice), "%s", notice);
     LOG_INFO("[managed_lw] NOTICE %u/%u: %s\n", db_oid, index_oid, notice);
     return 1;
 }
@@ -3402,12 +3686,56 @@ recv_all(int fd, void *buf, size_t len)
 }
 
 static void
+append_notice_logged(CuvsReplyHeader *hdr, const char *msg, const char *detail)
+{
+    int rc;
+    if (!msg || !msg[0])
+        return;
+    LOG_INFO("[notice_full] idx=%u message=\"%s\" detail=\"%s\"\n",
+             t_notice_index_oid, msg, detail ? detail : "");
+    rc = cuvs_notice_append(hdr->notice_out, sizeof(hdr->notice_out), msg, detail);
+    if (rc != 0)
+        LOG_WARN("[notice_overflow] idx=%u wire=\"%s\" complete_pairs=daemon_journal\n",
+                 t_notice_index_oid, hdr->notice_out);
+}
+
+static void
+record_eviction_notice(uint32_t db, uint32_t idx, int64_t idle,
+                       int64_t protect, CuvsEvictReason why)
+{
+    char message[256], idle_text[48];
+    if (idle < 0)
+        snprintf(idle_text, sizeof(idle_text), "never");
+    else
+        snprintf(idle_text, sizeof(idle_text), "%lld s", (long long)idle);
+    snprintf(message, sizeof(message), "pg_cuvs: evicted index %u:%u "
+             "(idle %s, P %lld s, reason %s) to make room", db, idx,
+             idle_text, (long long)protect, cuvs_evict_reason_name(why));
+    LOG_INFO("[notice_full] db=%u idx=%u message=\"%s\" detail=\"\"\n", db, idx, message);
+    (void)cuvs_notice_append(t_evict_notices, sizeof(t_evict_notices), message, "");
+}
+
+static void
+attach_build_notices(CuvsReplyHeader *hdr)
+{
+    char existing[CUVS_NOTICE_OUT_BYTES];
+    snprintf(existing, sizeof(existing), "%s", hdr->notice_out);
+    snprintf(hdr->notice_out, sizeof(hdr->notice_out), "%s", t_evict_notices);
+    if (hdr->status != CUVS_STATUS_OK && t_notice_self_unloaded)
+        note_self_replace_failure(t_notice_index_oid, t_notice_self_unloaded);
+    append_notice_logged(hdr, g_build_notice, g_build_notice_detail);
+    append_notice_logged(hdr, t_lw_notice, "");
+    append_notice_logged(hdr, existing, "");
+}
+
+static void
 send_error_code(int client_fd, int status, const char *msg)
 {
     CuvsReplyHeader hdr = {0};
     hdr.status = status;
     hdr.n_results = 0;
     strncpy(hdr.error, msg, sizeof(hdr.error) - 1);
+    attach_build_notices(&hdr);
     send_all(client_fd, &hdr, sizeof(hdr));
 }
 
@@ -3424,14 +3752,14 @@ admission_algo_name(uint32_t build_algo)
          : build_algo == CUVS_CAGRA_BUILD_NN_DESCENT ? "nn_descent" : "auto";
 }
 
-/* [release] (9 fields). lw_pending_after is I4's; 0 in the I3-A tip. */
+/* [release] (9 fields), after both reservations have been released. */
 static void
 log_release(const char *op, int gpu, uint32_t db, uint32_t idx, size_t needed,
             const char *outcome)
 {
     LOG_INFO("[release] op=%s gpu=%d db=%u idx=%u needed=%zu pending_after=%zu "
-             "outcome=%s lw_pending_after=0 mono_us=%llu\n", op, gpu, db, idx, needed,
-             g_pending_rmm_build_vram[gpu], outcome,
+             "outcome=%s lw_pending_after=%llu mono_us=%llu\n", op, gpu, db, idx, needed,
+             g_pending_rmm_build_vram[gpu], outcome, (unsigned long long)g_lw_pending[gpu],
              (unsigned long long) admission_mono_us());
 }
 
@@ -3456,6 +3784,7 @@ send_admission_reject(int client_fd, int status, const char *legacy_error,
     if (cuvs_admission_encode(f, hdr.err_out, sizeof(hdr.err_out)) < 0)
         hdr.err_out[0] = '\0';
     LOG_WARN("[admit_reject] status=%d err_out=\"%s\"\n", status, hdr.err_out);
+    attach_build_notices(&hdr);
     send_all(client_fd, &hdr, sizeof(hdr));
 }
 
@@ -6003,15 +6332,19 @@ build_sharded(int client_fd, const CuvsCmdFrame *cmd, const char *index_dir,
                                                         cmd->intermediate_graph_degree,
                                                         cmd->build_algo)};
         al.pending_before = g_pending_rmm_build_vram[dev];
-        if (ensure_vram(needed, dev, CUVS_RQ_BUILD_SHARD, NULL) != 0)
+        al.evictions_before = g_cache_evictions[dev];
+        if (ensure_vram(needed, dev, CUVS_RQ_BUILD_SHARD, NULL, &al) != 0)
         {
             int alt = pick_gpu_for_index(needed);
             al.gpu = alt;
             if (alt < 0)
                 admission_fill(&shard_rej, CUVS_ADMISSION_AR0, needed, -1);
             else
+            {
                 al.pending_before = g_pending_rmm_build_vram[alt];
-            if (alt < 0 || ensure_vram(needed, alt, CUVS_RQ_BUILD_SHARD, &shard_rej) != 0)
+                al.evictions_before = g_cache_evictions[alt];
+            }
+            if (alt < 0 || ensure_vram(needed, alt, CUVS_RQ_BUILD_SHARD, &shard_rej, &al) != 0)
             {
                 note_build_admission(cmd->db_oid, cmd->index_oid, needed,
                                      alt >= 0 ? alt : dev, 0, 0);
@@ -6032,12 +6365,17 @@ build_sharded(int client_fd, const CuvsCmdFrame *cmd, const char *index_dir,
 
         /* I4 / CK-28: shards are not admitted through N_m/AR6/AR7, so they
          * never get the managed large_workspace, whatever the active policy. */
+        log_build_begin(&al);
+        al.build_started_us = admission_mono_us();
         CuvsCagraIndex h = cuvs_cagra_build(vecs + (size_t)off * dim, shard_n,
                                             (int)dim, metric,
                                             (int)cmd->graph_degree,
                                             (int)cmd->intermediate_graph_degree,
                                             cmd->build_algo, dev,
                                             CUVS_LW_OVERFLOW_ERROR, NULL);
+        al.build_finished_us = admission_mono_us();
+        log_build_end(&al, NULL, h != NULL,
+                      h ? "built" : cuvs_last_build_was_oom() ? "oom" : "failed");
         if (!h)
         {
             LOG_ERROR("[build_sharded] cuvs_cagra_build failed for shard %d\n", i);
@@ -6395,6 +6733,7 @@ static void finish_build_commit(int client_fd, const CuvsCmdFrame *cmd,
 static void
 handle_build(int client_fd, const CuvsCmdFrame *cmd)
 {
+    clear_build_notices();
     LOG_DEBUG("[handle_build] reading index_dir...\n");
     char index_dir[256] = {0};
     /* ADR-057: the backend may pass the corpus as an SCM_RIGHTS memfd alongside
@@ -6572,14 +6911,21 @@ handle_build(int client_fd, const CuvsCmdFrame *cmd)
     }
     al.gpu = target_gpu;
     al.pending_before = g_pending_rmm_build_vram[target_gpu];
+    al.evictions_before = g_cache_evictions[target_gpu];
     uint64_t self_unloaded = 0;
     int admit_rc = admit_build_cagra(needed, target_gpu, cmd->db_oid, cmd->index_oid,
-                                     &self_unloaded);
+                                     &self_unloaded, &al);
     note_build_admission(cmd->db_oid, cmd->index_oid, needed, target_gpu,
                          admit_rc == 0, self_unloaded);
     if (admit_rc < 0)
+    {
         admission_fill(&rej, (CuvsAdmissionReason)g_last_admit_reason,
                        needed, target_gpu);
+        if (al.workspace_valid)
+            admission_workspace_fields(&rej, &al.workspace);
+        if (rej.reason == CUVS_ADMISSION_AR5)
+            rej.s = cuvs_admission_mib(admission_same_resident(cmd->db_oid, cmd->index_oid, target_gpu));
+    }
     if (admit_rc < 0)
     {
         char legacy[128];
@@ -6606,10 +6952,11 @@ handle_build(int client_fd, const CuvsCmdFrame *cmd)
      * total_vram_used() counts g_pending_build_vram, so concurrent admission and
      * eviction stay correct while we build unlocked. vecs/mem are per-request
      * (not shared state), so reading them unlocked is safe. */
+    log_build_begin(&al);
     reserve_build_vram(needed, target_gpu);
     /* I4: the active policy is passed only here and in handle_build_multi. */
     uint32_t lw_policy = g_cagra_build_overflow;
-    uint64_t lw_ub = lw_ub_for_build(cmd->n_vecs, cmd->dim, (int)cmd->intermediate_graph_degree);
+    uint64_t lw_ub = al.workspace.lw_ub;
     CuvsLwBuildStats lw_stats;
     char lw_notice[CUVS_ADMISSION_ERR_OUT_BYTES];
     lw_pending_reserve(lw_ub, target_gpu);
@@ -6620,10 +6967,12 @@ handle_build(int client_fd, const CuvsCmdFrame *cmd)
 
     LOG_DEBUG("[handle_build] calling cuvs_cagra_build n_vecs=%lld dim=%u gpu=%d...\n",
             (long long)cmd->n_vecs, cmd->dim, target_gpu);
+    al.build_started_us = admission_mono_us();
     CuvsCagraIndex new_handle = cuvs_cagra_build(vecs, cmd->n_vecs, (int)cmd->dim, cmd->metric,
                                                  (int)cmd->graph_degree,
                                                  (int)cmd->intermediate_graph_degree,
                                                  cmd->build_algo, target_gpu, lw_policy, &lw_stats);
+    al.build_finished_us = admission_mono_us();
     /* ADR-086 (I3): an out-of-memory build after admission fails without
      * evicting any resident index; ADR-070's evict-to-fit retry is removed. */
     int build_oom = !new_handle && cuvs_last_build_was_oom();
@@ -6633,6 +6982,10 @@ handle_build(int client_fd, const CuvsCmdFrame *cmd)
      * expects the lock held). Release the build reservation now: on success the
      * registry entry below carries vram_bytes; on failure the VRAM is freed. */
     pthread_mutex_lock(&g_index_mutex);
+    log_build_end(&al, &lw_stats, new_handle != NULL && !build_att,
+                  new_handle ? "built" : build_oom ? "oom" : build_att ? "att" : "failed");
+    if (!new_handle)
+        note_self_replace_failure(cmd->index_oid, self_unloaded);
     release_build_vram(needed, target_gpu);
     lw_pending_release(lw_ub, target_gpu);
     (void)lw_build_finish("build", target_gpu, cmd->db_oid, cmd->index_oid, lw_policy,
@@ -6955,6 +7308,7 @@ finish_build_commit(int client_fd, const CuvsCmdFrame *cmd, const char *save_dir
                      "pg_cuvs: the GPU index registry is full (%d slots); the index "
                      "was saved to disk and loads into GPU memory on its first query",
                      g_max_indexes);
+            attach_build_notices(&hdr_ok);
             send_all(client_fd, &hdr_ok, sizeof(hdr_ok));
             return;
         }
@@ -7010,6 +7364,7 @@ finish_build_commit(int client_fd, const CuvsCmdFrame *cmd, const char *save_dir
 
     CuvsReplyHeader hdr_ok = {0};
     hdr_ok.status = CUVS_STATUS_OK;
+    attach_build_notices(&hdr_ok);
     send_all(client_fd, &hdr_ok, sizeof(hdr_ok));
 
     /* Phase 3C: upload to GCS in a detached thread after replying OK.
@@ -7078,6 +7433,7 @@ persist_fail:
 static void
 handle_build_multi(int client_fd, const CuvsCmdFrame *cmd, const char *index_dir)
 {
+    clear_build_notices();
     uint32_t       n_parts   = cmd->n_partials;
     CuvsPartialDesc *descs    = NULL;
     const float  **part_vecs  = NULL;
@@ -7288,14 +7644,21 @@ handle_build_multi(int client_fd, const CuvsCmdFrame *cmd, const char *index_dir
             goto fail;
         }
         al.pending_before = g_pending_rmm_build_vram[target_gpu];
+        al.evictions_before = g_cache_evictions[target_gpu];
         uint64_t self_unloaded = 0;
         int admit_rc = admit_build_cagra(needed, target_gpu, cmd->db_oid,
-                                         cmd->index_oid, &self_unloaded);
+                                         cmd->index_oid, &self_unloaded, &al);
         note_build_admission(cmd->db_oid, cmd->index_oid, needed, target_gpu,
                              admit_rc == 0, self_unloaded);
         if (admit_rc < 0)
+        {
             admission_fill(&rej, (CuvsAdmissionReason)g_last_admit_reason,
                            needed, target_gpu);
+            if (al.workspace_valid)
+                admission_workspace_fields(&rej, &al.workspace);
+            if (rej.reason == CUVS_ADMISSION_AR5)
+                rej.s = cuvs_admission_mib(admission_same_resident(cmd->db_oid, cmd->index_oid, target_gpu));
+        }
         if (admit_rc < 0)
         {
             rej_set = 1;
@@ -7311,10 +7674,11 @@ handle_build_multi(int client_fd, const CuvsCmdFrame *cmd, const char *index_dir
          * GPU build so concurrent searches/stats/drops aren't blocked. Partials
          * (part_vecs/maps) are per-request, so reading them unlocked is safe;
          * total_vram_used() counts g_pending_build_vram during the window. */
-        reserve_build_vram(needed, target_gpu);
+        log_build_begin(&al);
+    reserve_build_vram(needed, target_gpu);
         /* I4: the active policy is passed only here and in handle_build. */
         uint32_t lw_policy = g_cagra_build_overflow;
-        uint64_t lw_ub = lw_ub_for_build(total, cmd->dim, (int)cmd->intermediate_graph_degree);
+        uint64_t lw_ub = al.workspace.lw_ub;
         CuvsLwBuildStats lw_stats;
         char lw_notice[CUVS_ADMISSION_ERR_OUT_BYTES];
         lw_pending_reserve(lw_ub, target_gpu);
@@ -7323,11 +7687,13 @@ handle_build_multi(int client_fd, const CuvsCmdFrame *cmd, const char *index_dir
         log_admit(&al, CUVS_ADMISSION_NONE);
         pthread_mutex_unlock(&g_index_mutex);
 
+        al.build_started_us = admission_mono_us();
         new_handle = cuvs_cagra_build_multi(part_vecs, n_each, nmapped, total,
                                             (int)cmd->dim, cmd->metric,
                                             (int)cmd->graph_degree,
                                             (int)cmd->intermediate_graph_degree,
                                             cmd->build_algo, target_gpu, lw_policy, &lw_stats);
+    al.build_finished_us = admission_mono_us();
         /* ADR-086 (I3): no evict-to-fit; an OOM after admission is a failure. */
         build_oom = !new_handle && cuvs_last_build_was_oom();
         build_att = !new_handle && !build_oom && cuvs_last_build_attach_failed();
@@ -7336,6 +7702,10 @@ handle_build_multi(int client_fd, const CuvsCmdFrame *cmd, const char *index_dir
          * expects the lock held). Release the reservation: on success the registry
          * entry carries vram_bytes; on failure the VRAM is freed. */
         pthread_mutex_lock(&g_index_mutex);
+        log_build_end(&al, &lw_stats, new_handle != NULL && !build_att,
+                      new_handle ? "built" : build_oom ? "oom" : build_att ? "att" : "failed");
+        if (!new_handle)
+            note_self_replace_failure(cmd->index_oid, self_unloaded);
         release_build_vram(needed, target_gpu);
         lw_pending_release(lw_ub, target_gpu);
         (void)lw_build_finish("build_multi", target_gpu, cmd->db_oid, cmd->index_oid, lw_policy,
@@ -8446,6 +8816,7 @@ handle_build_flat(int client_fd, const CuvsCmdFrame *cmd)
 static void
 handle_build_ivfpq(int client_fd, const CuvsCmdFrame *cmd)
 {
+    clear_build_notices();
     char index_dir[256] = {0};
     int  passed_fd = -1;
     if (cuvs_fd_recv(client_fd, index_dir, sizeof(index_dir), &passed_fd) < 0)
@@ -8515,7 +8886,8 @@ handle_build_ivfpq(int client_fd, const CuvsCmdFrame *cmd)
     g_cur_requester_idx = cmd->index_oid;
     al.gpu = target_gpu;
     al.pending_before = g_pending_rmm_build_vram[target_gpu];
-    int admit_rc = ensure_vram(needed, target_gpu, CUVS_RQ_BUILD_IVFPQ, &rej);
+    al.evictions_before = g_cache_evictions[target_gpu];
+    int admit_rc = ensure_vram(needed, target_gpu, CUVS_RQ_BUILD_IVFPQ, &rej, &al);
     note_build_admission(cmd->db_oid, cmd->index_oid, needed, target_gpu,
                          admit_rc == 0, 0);
     if (admit_rc < 0)
@@ -8534,10 +8906,15 @@ handle_build_ivfpq(int client_fd, const CuvsCmdFrame *cmd)
     LOG_DEBUG("[handle_build_ivfpq] building n_vecs=%lld dim=%u n_lists=%u pq_bits=%u pq_dim=%u gpu=%d\n",
               (long long)cmd->n_vecs, cmd->dim, cmd->n_lists, pq_bits, pq_dim, target_gpu);
 
+    log_build_begin(&al);
+    al.build_started_us = admission_mono_us();
     CuvsIvfPqIndex new_handle = NULL;
     int build_rc = cuvs_ivfpq_build(vecs, cmd->n_vecs, (int)cmd->dim, cmd->metric,
                                     cmd->n_lists, pq_bits, pq_dim,
                                     target_gpu, &new_handle);
+    al.build_finished_us = admission_mono_us();
+    log_build_end(&al, NULL, build_rc == 0 && new_handle != NULL,
+                  build_rc == 0 && new_handle ? "built" : "failed");
     if (build_rc != 0 || !new_handle)
     {
         pthread_mutex_unlock(&g_index_mutex);
@@ -9829,6 +10206,7 @@ reply_msg(int client_fd, int status, const char *fmt, ...)
     va_start(ap, fmt);
     vsnprintf(hdr.error, sizeof(hdr.error), fmt, ap);
     va_end(ap);
+    attach_build_notices(&hdr);
     send_all(client_fd, &hdr, sizeof(hdr));
 }
 
@@ -9907,10 +10285,19 @@ handle_manual(int client_fd, const CuvsCmdFrame *cmd)
             int loaded_now = 0;
             if (!e)
             {
-                if (load_index(db, idx, CUVS_RQ_LOAD) != 0)
+                t_manual_loading = 1;
+                int load_rc = load_index(db, idx, CUVS_RQ_LOAD);
+                t_manual_loading = 0;
+                if (load_rc != 0)
                 {
                     int r = g_last_admit_reason;
                     pthread_mutex_unlock(&g_index_mutex);
+                    if (t_reload_rej.reason != CUVS_ADMISSION_NONE)
+                    {
+                        send_admission_reject(client_fd, CUVS_STATUS_OOM_FALLBACK,
+                            "not loaded: GPU memory admission refused", &t_reload_rej);
+                        return;
+                    }
                     if (r == CUVS_ADMISSION_AR5)
                         reply_msg(client_fd, CUVS_STATUS_ERROR,
                                   "not loaded: the indexes that could make room are pinned, in use, or still protected");
@@ -10440,6 +10827,7 @@ connection_thread(void *arg)
 {
     int client_fd = *(int *)arg;
     free(arg);
+    clear_build_notices();
 
 #ifdef __linux__
     /* #87 finding 1: latch the kernel-verified peer uid for this connection's
@@ -11559,6 +11947,44 @@ main(int argc, char **argv)
                      g_max_vram_bytes ? "explicit --max-vram-mb"
                                       : "default fraction of total");
         }
+    }
+
+    /* C6/CK-27: one effective model line after every flag and GPU budget
+     * has been resolved. This reports provenance; it never changes policy. */
+    {
+        char scope[32], budgets[CUVS_MAX_GPUS * 24];
+        size_t at = 0;
+        cuvs_format_evict_scope(&g_reclaim.scope, scope, sizeof(scope));
+        budgets[0] = '\0';
+        for (int i = 0; i < n_usable_gpus(); i++)
+            at += (size_t)snprintf(budgets + at, sizeof(budgets) - at, "%s%zu",
+                i ? "," : "", g_max_vram_per_gpu[usable_gpu(i)] / (1024u * 1024u));
+        LOG_INFO("build admission model: scratch_permille=%u validated_overflow_policy=%s "
+                 "validated_rows=999000 validated_dim=768 validated_gpu=\"NVIDIA A100 80GB PCIe\" "
+                 "validated_quota_percent=50 overflow=%s overcommit=%s lw_margin_permille=%u "
+                 "evict_scope=%s hnsw_auto_overflow=%s dedicated_stream=%s peak_meter=%s "
+                 "rmm_pool_mb=%u rmm_pool_max_percent=%u evict_min_idle_s=%lld "
+                 "evict_hit_bonus_s=%lld evict_hit_cap=%u reclaim_high_pct=%u "
+                 "reclaim_low_pct=%u reclaim_tick_s=%lld reclaim_mode=%s reclaim_free_bytes=%llu "
+                 "reclaim_free_max_pct=%u reclaim_free_window_min=%u reclaim_floor_pct=%u "
+                 "load_soft_evict=%s reindex_self_replace=%s usage_stats_file=%s pin_max_pct=%u "
+                 "max_vram_mb=%s max_indexes=%d\n",
+                 g_scratch_permille, cuvs_lw_overflow_name(CUVS_RMM_SCRATCH_VALIDATED_OVERFLOW_POLICY),
+                 cuvs_lw_overflow_name(g_cagra_build_overflow), g_managed_overcommit ? "on" : "off",
+                 g_managed_lw_margin_permille, scope, cuvs_hnsw_overflow_name(g_hnsw_auto_overflow),
+                 g_rmm_dedicated_stream ? "on" : "off", g_reclaim.peak_meter ? "on" : "off",
+                 g_rmm_pool_mb, g_rmm_pool_max_percent, (long long)g_reclaim.t_min_s,
+                 (long long)g_reclaim.bonus_s, g_reclaim.hits_cap, g_reclaim.hi_pct,
+                 g_reclaim.lo_pct, (long long)g_reclaim.tick_s, cuvs_reclaim_mode_name(g_reclaim.mode),
+                 (unsigned long long)g_reclaim.f_fixed, g_reclaim.f_cap_pct,
+                 g_reclaim.window_min, g_reclaim.floor_pct, g_reclaim.soft_evict ? "on" : "off",
+                 g_reclaim.self_replace ? "on" : "off", g_reclaim.usage_file ? "on" : "off",
+                 g_reclaim.pin_max_pct, budgets, g_max_indexes);
+        if (g_cagra_build_overflow != CUVS_RMM_SCRATCH_VALIDATED_OVERFLOW_POLICY)
+            LOG_WARN("scratch model unvalidated: overflow=%s validated_overflow_policy=%s; "
+                     "recalibrate scratch_permille for the active policy\n",
+                     cuvs_lw_overflow_name(g_cagra_build_overflow),
+                     cuvs_lw_overflow_name(CUVS_RMM_SCRATCH_VALIDATED_OVERFLOW_POLICY));
     }
 
     /* Load persisted indexes */
