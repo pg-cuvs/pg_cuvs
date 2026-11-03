@@ -638,14 +638,16 @@ cuvs_probe_hw(int device_id, double *link_bw_bpus, double *hbm_bw_bpus,
 /* ----------------------------------------------------------------
  * VRAM query
  * ---------------------------------------------------------------- */
-extern "C" size_t
-cuvs_vram_free_bytes_on(int device_id)
+/* cudaMemGetInfo free and the default async mempool's reclaimable bytes.
+ * Returns false on any CUDA failure before free_bytes is known. */
+static bool
+vram_physical_parts(int device_id, size_t *free_out, size_t *async_out)
 {
     size_t free_bytes = 0, total_bytes = 0;
     if (cudaSetDevice(device_id) != cudaSuccess)
-        return 0;
+        return false;
     if (cudaMemGetInfo(&free_bytes, &total_bytes) != cudaSuccess)
-        return 0;
+        return false;
     size_t async_reclaimable = 0;
 
     /* ADR-065: cuVS allocates through a CUDA async mempool that caches freed
@@ -662,6 +664,17 @@ cuvs_vram_free_bytes_on(int device_id)
             reserved > used)
             async_reclaimable = (size_t)(reserved - used);
     }
+    *free_out = free_bytes;
+    *async_out = async_reclaimable;
+    return true;
+}
+
+extern "C" size_t
+cuvs_vram_free_bytes_on(int device_id)
+{
+    size_t free_bytes = 0, async_reclaimable = 0;
+    if (!vram_physical_parts(device_id, &free_bytes, &async_reclaimable))
+        return 0;
     CuvsRmmPoolStats stats;
     if (cuvs_rmm_pool_stats(device_id, &stats) == 0)
         return cuvs_rmm_pool_headroom(free_bytes, async_reclaimable,
