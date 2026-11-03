@@ -622,6 +622,9 @@ test_callers(void)
 int
 main(void)
 {
+    /* Review C-12: the AR7 guard pointer starts at the production reader,
+     * checked before any test repoints it. */
+    CHECK(g_lw_host_guard_fn == lw_host_guard_bytes);
     snprintf(tmpdir, sizeof(tmpdir), "/tmp/lw_daemon_%d", (int)getpid());
     mkdir(tmpdir, 0700);
     test_flags();
