@@ -279,7 +279,7 @@ TEST_RT_LIB := $(shell [ "$$(uname -s)" = "Linux" ] && echo -lrt)
 test-unit: test/unit/test_cuvs_util.c src/cuvs_util.c src/cuvs_util.h src/cuvs_ipc.h \
            test/unit/test_build_corpus.c src/cuvs_build_corpus.c src/cuvs_build_corpus.h \
            test-hnsw-build test-hnsw-build-ipc test-hnsw-admission test-admission-contract \
-           test-i3-logs test-notice-wire test-admission-wire test-admission-message test-admission-ipc test-build-oom-thread test-cache-policy test-circuit-source test-status-text test-i3b-source test-peak-meter test-lw-policy test-lw-guard
+           test-i3-logs test-notice-wire test-admission-wire test-admission-message test-admission-ipc test-build-oom-thread test-cache-policy test-circuit-source test-status-text test-i3b-source test-peak-meter test-lw-policy test-lw-guard test-i3e-sql
 	$(CC) -I src -DCUVS_TEST_HOOKS -o test-unit test/unit/test_cuvs_util.c src/cuvs_util.c $(TEST_RT_LIB)
 	./test-unit
 	$(CC) -I src -o test-build-corpus test/unit/test_build_corpus.c src/cuvs_build_corpus.c $(TEST_RT_LIB)
