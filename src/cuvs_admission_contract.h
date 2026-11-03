@@ -82,4 +82,101 @@ typedef struct CuvsAdmissionPayload {
     char text[CUVS_ADMISSION_ERR_OUT_BYTES];
 } CuvsAdmissionPayload;
 
+/* Admission estimate (v6 r18 C3, ADR-086). Pure, header-only, C and C++.
+ *
+ *   final  = n * (4 * ld + 4 * gd),  ld = 4 * ceil(dim / 4)
+ *   needed = final + corpus_h2d + ceil(final * rho / 1000) + margin
+ *
+ * Every byte quantity saturates at CUVS_ADMISSION_BYTES_SATURATED, which no
+ * real budget admits; invalid inputs (n < 0, dim <= 0, rho above
+ * CUVS_ADMISSION_RHO_PERMILLE_MAX) return it too, so they fail closed.
+ * graph_degree <= 0 means the cuVS default 64, as estimate_vram_bytes().
+ * Use final for resident accounting and needed for admission, reservation,
+ * release and GPU choice. Under C3 the measured rho already contains the
+ * corpus H2D transfer and the safety factor, so a caller that follows C3 as
+ * written passes corpus_h2d = 0 and margin = 0; the scratch term scales final
+ * only, never corpus_h2d or margin.
+ */
+#define CUVS_ADMISSION_BYTES_SATURATED (UINT64_MAX / 2u)
+#define CUVS_ADMISSION_RHO_PERMILLE_MAX 100000u
+#define CUVS_ADMISSION_DEFAULT_GRAPH_DEGREE 64
+
+static inline uint64_t
+cuvs_admission_sat_add(uint64_t a, uint64_t b)
+{
+    if (a >= CUVS_ADMISSION_BYTES_SATURATED ||
+        b >= CUVS_ADMISSION_BYTES_SATURATED - a)
+        return CUVS_ADMISSION_BYTES_SATURATED;
+    return a + b;
+}
+
+static inline uint64_t
+cuvs_admission_sat_mul(uint64_t a, uint64_t b)
+{
+    if (a != 0 && b > CUVS_ADMISSION_BYTES_SATURATED / a)
+        return CUVS_ADMISSION_BYTES_SATURATED;
+    return a * b;
+}
+
+static inline uint64_t
+cuvs_admission_estimate_final_bytes(int64_t n, int32_t dim, int32_t graph_degree)
+{
+    uint64_t ld, gd, row;
+
+    if (n < 0 || dim <= 0)
+        return CUVS_ADMISSION_BYTES_SATURATED;
+    ld = 4u * (((uint64_t)dim + 3u) / 4u);
+    gd = graph_degree > 0 ? (uint64_t)graph_degree
+                          : (uint64_t)CUVS_ADMISSION_DEFAULT_GRAPH_DEGREE;
+    row = 4u * ld + 4u * gd;
+    return cuvs_admission_sat_mul((uint64_t)n, row);
+}
+
+static inline uint64_t
+cuvs_admission_needed_bytes(uint64_t final_bytes, uint64_t corpus_h2d,
+                            uint32_t scratch_rho_permille, uint64_t margin)
+{
+    uint64_t scratch, needed;
+
+    if (scratch_rho_permille > CUVS_ADMISSION_RHO_PERMILLE_MAX ||
+        final_bytes >= CUVS_ADMISSION_BYTES_SATURATED)
+        return CUVS_ADMISSION_BYTES_SATURATED;
+    /* ceil(final * rho / 1000) without forming final * rho. */
+    scratch = cuvs_admission_sat_add(
+        cuvs_admission_sat_mul(final_bytes / 1000u, scratch_rho_permille),
+        ((final_bytes % 1000u) * scratch_rho_permille + 999u) / 1000u);
+    needed = cuvs_admission_sat_add(final_bytes, corpus_h2d);
+    needed = cuvs_admission_sat_add(needed, scratch);
+    return cuvs_admission_sat_add(needed, margin);
+}
+
+/* I4 admission hook: the out-of-pool large_workspace check (AR6/AR7, v6 1.4
+ * "AR6, AR7 판정식"). The daemon calls it once per CAGRA build admission,
+ * after AR2 and before any scope eviction, with pre-eviction snapshots; it is
+ * not re-run after eviction. Returns CUVS_ADMISSION_NONE, AR6 or AR7 only.
+ * Defined in cuvs_util.c. The I3-A tip has no managed policy, so its
+ * definition returns CUVS_ADMISSION_NONE; I4 owns and replaces that body.
+ * Fields are append-only (I3-A, then I3-B, I3-C, I4).
+ */
+typedef struct CuvsAdmissionWorkspaceInput {
+    uint64_t needed;     /* N_m from cuvs_admission_needed_bytes() */
+    uint64_t reserved;   /* pool reserved bytes on the device */
+    uint64_t pool_used;  /* pool used bytes on the device */
+    uint64_t phys_free;  /* cudaMemGetInfo free + async reclaimable */
+    uint64_t lw_ub;      /* this build's large_workspace upper bound */
+    uint64_t lw_pending; /* sum of lw_ub of admitted managed builds */
+    uint64_t host_guard; /* host RAM allowance for managed spill */
+    uint32_t managed;    /* 1 when the large_workspace policy is managed */
+    uint32_t overcommit; /* 1 when managed overcommit is on */
+} CuvsAdmissionWorkspaceInput;
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+CuvsAdmissionReason
+cuvs_admission_workspace_check(const CuvsAdmissionWorkspaceInput *in);
+#ifdef __cplusplus
+}
+#endif
+
 #endif /* CUVS_ADMISSION_CONTRACT_H */

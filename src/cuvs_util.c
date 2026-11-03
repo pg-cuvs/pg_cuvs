@@ -8,6 +8,7 @@
 
 #include "cuvs_util.h"
 #include "cuvs_ipc.h"   /* CUVS_STATUS_* defines (PG-free, CUDA-free) */
+#include "cuvs_admission_contract.h"
 
 #include <string.h>
 #include <stdlib.h>
@@ -921,4 +922,16 @@ cuvs_batch_group(const CuvsBatchKey *keys, int n,
     }
     if (n_groups_out)
         *n_groups_out = ng;
+}
+
+/* ----------------------------------------------------------------
+ * I4 admission hook (cuvs_admission_contract.h). The I3-A tip has no managed
+ * large_workspace policy, so AR6/AR7 are never emitted here (v6 1.4 (h)).
+ * I4 owns this body and replaces it with the AR6/AR7 rule.
+ * ---------------------------------------------------------------- */
+CuvsAdmissionReason
+cuvs_admission_workspace_check(const CuvsAdmissionWorkspaceInput *in)
+{
+    (void) in;
+    return CUVS_ADMISSION_NONE;
 }
