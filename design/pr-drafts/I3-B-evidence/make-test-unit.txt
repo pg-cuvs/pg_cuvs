@@ -4,7 +4,7 @@ PASS capacity/ACE, disk FD, cancel/owner EOF, tiny distinct non-self counts and 
 clang -std=gnu11 -Wall -Wextra -I src -o test-hnsw-build-ipc test/unit/test_hnsw_build_ipc.c \
 		src/cuvs_ipc.c src/cuvs_util.c src/cuvs_build_corpus.c -lpthread -lm 
 ./test-hnsw-build-ipc
-[INFO] [hnsw_wait] phase=backend-cancel mono_us=2427175521164 input_dev=16777232 input_ino=369838225
+[INFO] [hnsw_wait] phase=backend-cancel mono_us=2428572054444 input_dev=16777232 input_ino=369871699
 PASS 15 actual-client wire cases,4 preconnect refusals,5 shared-daemon prefix/settings cases; explicitACE/IVF, forgedroute/version/request rejection, cancellation/status13/protocolerror; current global v4 retained
 clang -std=gnu11 -Wall -Wextra -I src -o test-hnsw-admission test/unit/test_hnsw_admission.c -lpthread
 ./test-hnsw-admission
