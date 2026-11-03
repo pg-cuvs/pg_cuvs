@@ -158,7 +158,9 @@ Added from the independent review (REVIEW-I3-B-FABLE.md § 6, items 10-18):
     (only the earlier I3-B-only version of that file was dropped in r2).
 
 Implementation-stage conditions from the review (not changed in this PR unless
-noted): (1) KB-17 flag, as item 11; (2) manual-op result strings differ from the C7
+noted): (1) KB-17 flag: implemented in r4 (`--rmm-peak-meter`, `peak_bytes`/`solo` in
+`CuvsRmmPoolStats`, CK-34 test with 8 threads and three mutations; GPU: on gives
+`peak_bytes` 15,360,000 after probes, off gives 0); (2) manual-op result strings differ from the C7
 table (`not resident`/`already resident`/`not pinned`/`name = value` vs
 `not_resident`/`already_resident`/`not_pinned`/`applied`): conch to fix the spelling;
 (3) `pg_cuvs_unload` on a non-daemon AM (e.g. hnsw) answers "not resident" instead
