@@ -177,6 +177,9 @@ typedef struct CuvsAdmitLog {
  * (db, index) so a build that got in no longer drives F (fence F-3). When
  * full, the oldest record is dropped. */
 void cuvs_admit_log_add(CuvsAdmitLog *log, const CuvsAdmitRecord *r);
+/* DROP INDEX: forget that index's records at once (conch 2026-11-03). */
+void cuvs_admit_log_forget(CuvsAdmitLog *log, uint32_t db_oid,
+                           uint32_t index_oid);
 /* Drop records older than now - window_s. */
 void cuvs_admit_log_expire(CuvsAdmitLog *log, int64_t now, int64_t window_s);
 

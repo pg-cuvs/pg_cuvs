@@ -397,6 +397,16 @@ cuvs_admit_log_add(CuvsAdmitLog *log, const CuvsAdmitRecord *r)
 }
 
 void
+cuvs_admit_log_forget(CuvsAdmitLog *log, uint32_t db_oid, uint32_t index_oid)
+{
+    int w = 0;
+    for (int i = 0; i < log->n; i++)
+        if (log->rec[i].db_oid != db_oid || log->rec[i].index_oid != index_oid)
+            log->rec[w++] = log->rec[i];
+    log->n = w;
+}
+
+void
 cuvs_admit_log_expire(CuvsAdmitLog *log, int64_t now, int64_t window_s)
 {
     int w = 0;
