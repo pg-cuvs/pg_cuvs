@@ -271,13 +271,18 @@ TEST_RT_LIB := $(shell [ "$$(uname -s)" = "Linux" ] && echo -lrt)
 test-unit: test/unit/test_cuvs_util.c src/cuvs_util.c src/cuvs_util.h src/cuvs_ipc.h \
            test/unit/test_build_corpus.c src/cuvs_build_corpus.c src/cuvs_build_corpus.h \
            test-hnsw-build test-hnsw-build-ipc test-hnsw-admission test-admission-contract \
-           test-admission-wire test-admission-message test-admission-ipc test-build-oom-thread test-cache-policy
+           test-admission-wire test-admission-message test-admission-ipc test-build-oom-thread test-cache-policy test-circuit-source
 	$(CC) -I src -DCUVS_TEST_HOOKS -o test-unit test/unit/test_cuvs_util.c src/cuvs_util.c $(TEST_RT_LIB)
 	./test-unit
 	$(CC) -I src -o test-build-corpus test/unit/test_build_corpus.c src/cuvs_build_corpus.c $(TEST_RT_LIB)
 	./test-build-corpus
 
-.PHONY: test-unit
+# UC-2: no GPU scan path may end with 0 rows on an open circuit breaker
+# (source check; the AM callbacks need a live backend to execute).
+test-circuit-source: test/unit/check_circuit_source.py src/pg_cuvs.c
+	python3 -B test/unit/check_circuit_source.py
+
+.PHONY: test-unit test-circuit-source
 
 # HNSW admission and op-specific FD/owner lifecycle fixtures. No daemon, PG
 # backend or CUDA is needed. Keep separate targets for bounded worker checks.

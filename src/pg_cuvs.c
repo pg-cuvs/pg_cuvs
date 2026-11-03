@@ -2151,6 +2151,30 @@ cuvs_breaker_state(Oid index_oid)
                               cuvs_circuit_breaker_transient_ttl_s);
 }
 
+/* UC-2: execution-time breaker gate for the GPU scan paths. A breaker can be
+ * open at execution although the plan chose this index: a cached/prepared plan,
+ * or failures recorded by an earlier scan in this backend after costing. Ending
+ * the scan there returned 0 rows with no error, a silent wrong answer, so an
+ * OPEN breaker raises 53200 instead and the re-run statement replans through
+ * the plan-time gate. HALF_OPEN and CLOSED proceed to the GPU search. */
+static void
+cuvs_breaker_check_scan(Relation index_rel)
+{
+    Oid index_oid = RelationGetRelid(index_rel);
+
+    if (cuvs_circuit_exec_action(cuvs_breaker_state(index_oid))
+        == CUVS_CIRCUIT_EXEC_ERROR)
+        ereport(ERROR,
+                (errcode(ERRCODE_OUT_OF_MEMORY),   /* 53200 */
+                 errmsg("pg_cuvs: GPU circuit breaker is open for index \"%s\"",
+                        quote_qualified_identifier(
+                            get_namespace_name(RelationGetNamespace(index_rel)),
+                            RelationGetRelationName(index_rel))),
+                 errhint("If an index build is in progress, retry; otherwise run "
+                         "SELECT pg_cuvs_reset_circuit('<index>'). "
+                         "Re-run the statement to replan.")));
+}
+
 /* PG16 amcostestimate is a direct C function pointer, not a SQL function.
  *
  * IMPORTANT: This runs in the planner on every query — once per candidate
@@ -4156,12 +4180,14 @@ cuvs_gettuple(IndexScanDesc scan, ScanDirection dir)
         ss->searched = true;
 
         /* These should normally be caught by cuvsamcostestimate before this
-         * index path is chosen. If they change between planning and execution,
-         * returning false ends this index scan; the next statement replans
-         * through the cost gates. */
+         * index path is chosen. If enable_cuvs changes between planning and
+         * execution, returning false ends this index scan; the next statement
+         * replans through the cost gates. An open breaker raises instead
+         * (UC-2, see cuvs_breaker_check_scan). */
         Oid index_oid = RelationGetRelid(scan->indexRelation);
-        if (!enable_cuvs || cuvs_circuit_is_open((uint32_t)index_oid))
+        if (!enable_cuvs)
             return false;
+        cuvs_breaker_check_scan(scan->indexRelation);
 
         /* Extract query vector from ORDER BY operator argument.
          *
@@ -4457,8 +4483,9 @@ flat_gettuple(IndexScanDesc scan, ScanDirection dir)
         ss->searched = true;
 
         Oid index_oid = RelationGetRelid(scan->indexRelation);
-        if (!enable_cuvs || cuvs_circuit_is_open((uint32_t)index_oid))
+        if (!enable_cuvs)
             return false;
+        cuvs_breaker_check_scan(scan->indexRelation);   /* UC-2 — see cuvs_gettuple */
 
         /* #141 backstop — see cuvs_gettuple. */
         if (scan->numberOfOrderBys < 1 || !scan->orderByData)
@@ -5156,8 +5183,9 @@ ivfpq_gettuple(IndexScanDesc scan, ScanDirection dir)
         ss->searched = true;
 
         Oid index_oid = RelationGetRelid(scan->indexRelation);
-        if (!enable_cuvs || cuvs_circuit_is_open((uint32_t)index_oid))
+        if (!enable_cuvs)
             return false;
+        cuvs_breaker_check_scan(scan->indexRelation);   /* UC-2 — see cuvs_gettuple */
 
         /* #141 backstop — see cuvs_gettuple. */
         if (scan->numberOfOrderBys < 1 || !scan->orderByData)
