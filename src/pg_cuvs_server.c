@@ -3152,7 +3152,6 @@ lw_pending_release(uint64_t lw_ub, int device_id)
         ? g_lw_pending[device_id] - lw_ub : 0;
 }
 
-#ifndef CUVS_LW_HOST_GUARD_FIXTURE
 static uint64_t hnsw_host_headroom(uint64_t requested, char *error, size_t error_len);
 /* host_guard = min(MemAvailable/2, each cgroup ancestor's remaining/2); 0 on a
  * cgroup v1 memory controller or any read failure (ADR-088 decision 5). */
@@ -3162,7 +3161,6 @@ lw_host_guard_bytes(void)
     char error[160] = "";
     return hnsw_host_headroom(UINT64_MAX, error, sizeof(error));
 }
-#endif
 /* AR7 reads the guard through this pointer; only unit tests repoint it. */
 static uint64_t (*g_lw_host_guard_fn)(void) = lw_host_guard_bytes;
 

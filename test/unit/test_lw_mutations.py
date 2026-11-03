@@ -21,6 +21,7 @@ POLICY = 'src/cuvs_lw_policy.h'
 GUARD = 'src/cuvs_lw_guard.hpp'
 SERVER = 'src/pg_cuvs_server.c'
 UTIL = 'src/cuvs_util.c'
+DOCS = 'docs/reference.md'
 
 # name: (file, [(old, new), ...], tests expected to turn RED)
 MUTATIONS = {
@@ -120,6 +121,45 @@ MUTATIONS = {
     'startup_accepts_bad_value': (SERVER, [(
         '            if (lw_flag < 0)\n                return 1;', '            (void)lw_flag;')],
         {'daemon'}),
+    # review B-2: production host guard and startup application (X1, X10, X11)
+    'host_guard_unbounded': (SERVER, [(
+        '    char error[160] = "";\n    return hnsw_host_headroom(UINT64_MAX, error, sizeof(error));',
+        '    return UINT64_MAX;')], {'daemon'}),
+    'oom_apply_call_deleted': (SERVER, [(
+        '    apply_oom_score_adj("/proc/self/oom_score_adj");\n', '')], {'startup'}),
+    'oom_apply_wrong_path': (SERVER, [(
+        '    apply_oom_score_adj("/proc/self/oom_score_adj");\n',
+        '    apply_oom_score_adj("/proc/self/oom_adj");\n')], {'startup'}),
+    # review C-6: cgroup v1 and read failure give a zero guard
+    'cgroup_v1_accepted': (SERVER, [(
+        '"HNSW capacity: cgroup v1 memory controller is unsupported; use verified cgroup v2");\n'
+        '                            fclose(f); return 0;',
+        '"HNSW capacity: cgroup v1 memory controller is unsupported; use verified cgroup v2");\n'
+        '                            break;')], {'daemon'}),
+    'cgroup_current_unreadable_ignored': (SERVER, [(
+        '                        if (!m) { fclose(f); return 0; }',
+        '                        if (!m) break;')], {'daemon'}),
+    # review C-9 subset: pool status values
+    'pool_status_pending_zero': (SERVER, [(
+        '        d->lw_pending_bytes = g_lw_pending[dev];', '        d->lw_pending_bytes = 0;')],
+        {'daemon'}),
+    'pool_status_spill_max_zero': (SERVER, [(
+        '        d->managed_spill_bytes_max = g_managed_spill_bytes_max[dev];',
+        '        d->managed_spill_bytes_max = 0;')], {'daemon'}),
+    'startup_line_drops_margin': (SERVER, [(
+        '"lw_margin_permille=%u\\n", cuvs_lw_overflow_name(g_cagra_build_overflow),',
+        '"lw_margin=%u\\n", cuvs_lw_overflow_name(g_cagra_build_overflow),')], {'startup'}),
+    # CK-27 (a): docs drift from the macros
+    'docs_default_policy_drift': (DOCS, [(
+        "| `--cagra-build-overflow error\\|managed` | — (daemon-only, restart) | `managed` |",
+        "| `--cagra-build-overflow error\\|managed` | — (daemon-only, restart) | `error` |")],
+        {'docs'}),
+    'docs_margin_number': (DOCS, [(
+        '| see `SHOW cuvs.rmm_pool_status` (`lw_margin_permille`) |',
+        '| `1250` (see `SHOW cuvs.rmm_pool_status`, `lw_margin_permille`) |')], {'docs'}),
+    'macro_oom_default_drift': (POLICY, [(
+        '#define CUVS_OOM_SCORE_ADJ_DEFAULT              500',
+        '#define CUVS_OOM_SCORE_ADJ_DEFAULT              400')], {'policy', 'docs'}),
     # hook body (I4-owned, conch 2026-11-03 16:0x)
     'hook_inert_after_i4': (UTIL, [(
         '    return cuvs_lw_admit(&lw).reason;', '    (void)lw;\n    return CUVS_ADMISSION_NONE;')],
@@ -144,7 +184,16 @@ def build_and_run(tree):
         'guard': [CXX, '-std=c++17', '-Wall', '-Wextra', '-Werror', '-pthread', '-I', 'src', '-o',
                   'bin-guard', 'test/unit/test_lw_guard.cpp'],
     }
+    jobs['docs'] = [sys.executable, '-I', 'test/unit/check_lw_docs.py', str(tree)]
     if LINUX:
+        jobs['server'] = [CC, '-std=gnu11', '-O1', '-DPGCUVS_CPU_SHIM', '-D_POSIX_C_SOURCE=200809L',
+                          '-I', 'src', 'src/pg_cuvs_server.c', 'src/cuvs_ipc.c', 'src/cuvs_util.c',
+                          'src/cuvs_objstore.c', 'src/cuvs_build_corpus.c',
+                          'src/cuvs_wrapper_shim_cpu.c', '-lm', '-lpthread', '-lrt', '-lcurl',
+                          '-lssl', '-lcrypto', '-o', 'bin-server']
+        jobs['startup'] = [CC, '-std=gnu11', '-Wall', '-Wextra', '-I', 'src', '-o', 'bin-startup',
+                           'test/unit/test_lw_startup.c', 'src/cuvs_ipc.c', 'src/cuvs_util.c',
+                           'src/cuvs_build_corpus.c', '-lm', '-lpthread', '-lrt']
         jobs['daemon'] = [CC, '-std=gnu11', '-O1', '-DPGCUVS_CPU_SHIM', '-ffunction-sections',
                           '-fdata-sections', '-I', 'src', '-o', 'bin-daemon',
                           'test/unit/test_lw_daemon.c', 'src/cuvs_ipc.c', 'src/cuvs_util.c',
@@ -152,12 +201,22 @@ def build_and_run(tree):
                           'src/cuvs_wrapper_shim_cpu.c', '-Wl,--gc-sections', '-lm', '-lpthread',
                           '-lrt', '-lcurl', '-lssl', '-lcrypto']
     for name, argv in jobs.items():
+        if name == 'docs':   # a check, not a build
+            rc, text = run(argv, tree)
+            lines = [l for l in text.splitlines() if l.startswith(('FAIL', 'PASS'))]
+            out[name] = ('PASS' if rc == 0 else 'RED (run)', lines[:1] or [''])
+            continue
         rc, text = run(argv, tree)
+        if name == 'server':  # helper binary for the startup test
+            if rc != 0:
+                out[name] = ('BUILD-BROKEN', text.strip().splitlines()[-1:] or [''])
+            continue
         if rc != 0:
             # A planted defect must be caught by an assertion, not by -Werror.
             out[name] = ('BUILD-BROKEN', text.strip().splitlines()[-1:] or [''])
             continue
-        rc, text = run(['./bin-' + name], tree)
+        argv_run = ['./bin-' + name] + (['./bin-server'] if name == 'startup' else [])
+        rc, text = run(argv_run, tree)
         lines = [l for l in text.splitlines() if l.startswith(('FAIL', 'PASS', 'test_lw'))]
         out[name] = ('PASS' if rc == 0 else 'RED (run)', lines[:1] or text.strip().splitlines()[-1:])
     return out
@@ -167,6 +226,8 @@ def copy_tree(dest):
     dest.mkdir(parents=True)
     shutil.copytree(ROOT / 'src', dest / 'src')
     shutil.copytree(ROOT / 'test' / 'unit', dest / 'test' / 'unit')
+    (dest / 'docs').mkdir()
+    shutil.copy2(ROOT / 'docs' / 'reference.md', dest / 'docs' / 'reference.md')
 
 
 def main(argv):

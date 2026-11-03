@@ -14,8 +14,6 @@ static uint64_t g_fixture_phys_free;
 static uint64_t g_fixture_host_guard;
 size_t fixture_phys_free(int device_id);
 #define cuvs_vram_physical_free_bytes_on fixture_phys_free
-#define CUVS_LW_HOST_GUARD_FIXTURE
-static uint64_t lw_host_guard_bytes(void) { return g_fixture_host_guard; }
 #define main pg_cuvs_server_program_main
 #include "../../src/pg_cuvs_server.c"
 #undef main
@@ -27,6 +25,9 @@ static uint64_t lw_host_guard_bytes(void) { return g_fixture_host_guard; }
 #include <sys/wait.h>
 
 size_t fixture_phys_free(int device_id) { (void)device_id; return (size_t)g_fixture_phys_free; }
+/* Pinned guard for the CK-3b races; test_host_guard_production() restores
+ * the production reader and checks it without any fixture. */
+static uint64_t fixture_host_guard(void) { return g_fixture_host_guard; }
 
 void     cuvs_shim_lw_reset(void);
 uint32_t cuvs_shim_lw_calls(uint32_t policy);
@@ -213,6 +214,7 @@ race(int overcommit, uint64_t phys_free, uint64_t host_guard, int want_admitted,
     g_managed_overcommit = overcommit;
     g_fixture_phys_free = phys_free;
     g_fixture_host_guard = host_guard;
+    g_lw_host_guard_fn = fixture_host_guard;
     atomic_store(&admitted, 0); atomic_store(&refused, 0);
     atomic_store(&arrived, 0); atomic_store(&finish, 0); atomic_store(&last_reason, -1);
     pthread_create(&a, NULL, managed_build, NULL);
@@ -224,6 +226,7 @@ race(int overcommit, uint64_t phys_free, uint64_t host_guard, int want_admitted,
     atomic_store(&finish, 1);
     pthread_join(a, NULL); pthread_join(b, NULL);
     CHECK(g_lw_pending[0] == 0);   /* every admitted build returned its lw_ub */
+    g_lw_host_guard_fn = lw_host_guard_bytes;
 }
 
 static void
@@ -249,6 +252,7 @@ test_lw_pending(void)
     reset_knobs();
     g_managed_overcommit = 0;
     g_fixture_phys_free = ub;
+    g_lw_host_guard_fn = fixture_host_guard;
     pthread_mutex_lock(&g_index_mutex);
     CHECK(lw_admission_check(0, 0, SHAPE_N, SHAPE_DIM, SHAPE_IGD, &ws) == CUVS_ADMISSION_NONE);
     lw_pending_reserve(ws.lw_ub, 0);
@@ -269,8 +273,141 @@ test_lw_pending(void)
     /* Release never underflows. */
     lw_pending_release(5, 0);
     CHECK(g_lw_pending[0] == 0);
+    /* Pool status reports the live per-GPU sum (C8). */
+    {
+        CuvsRmmPoolStatus st;
+        memset(&st, 0, sizeof(st));
+        lw_pending_reserve(ub, 0);
+        pthread_mutex_unlock(&g_index_mutex);
+        g_n_gpus = 1;
+        lw_fill_pool_status(&st);
+        CHECK(st.lw_n_devices == 1 && st.lw_devices[0].lw_pending_bytes == ub);
+        pthread_mutex_lock(&g_index_mutex);
+        lw_pending_release(ub, 0);
+        g_n_gpus = 0;
+    }
     pthread_mutex_unlock(&g_index_mutex);
+    g_lw_host_guard_fn = lw_host_guard_bytes;
     reset_knobs();
+}
+
+/* ---- review B-2 (a): the production host guard, no fixture ---- */
+static uint64_t
+mem_available_half(void)
+{
+    FILE *f = fopen("/proc/meminfo", "r");
+    char line[256];
+    unsigned long long kb = 0;
+    if (!f) return 0;
+    while (fgets(line, sizeof(line), f))
+        if (sscanf(line, "MemAvailable: %llu kB", &kb) == 1) break;
+    fclose(f);
+    return (uint64_t)kb * 1024 / 2;
+}
+
+static int
+cgroup_is_v2_only(void)
+{
+    FILE *f = fopen("/proc/self/cgroup", "r");
+    char line[512];
+    int v2 = 0, other = 0;
+    if (!f) return 0;
+    while (fgets(line, sizeof(line), f))
+        if (strncmp(line, "0::", 3) == 0) v2 = 1; else other = 1;
+    fclose(f);
+    return v2 && !other;
+}
+
+static void
+test_host_guard_production(void)
+{
+    CuvsAdmissionWorkspaceInput ws;
+    uint64_t before = mem_available_half(), direct, after;
+    reset_knobs();
+    CHECK(g_lw_host_guard_fn == lw_host_guard_bytes);
+    direct = lw_host_guard_bytes();
+    pthread_mutex_lock(&g_index_mutex);
+    (void)lw_admission_check(0, 0, 1000, 128, 128, &ws);   /* AR7 input path */
+    pthread_mutex_unlock(&g_index_mutex);
+    after = mem_available_half();
+    if (cgroup_is_v2_only())
+    {
+        uint64_t cap = before > after ? before : after;
+        CHECK(direct > 0 && direct <= cap + cap / 20);   /* MemAvailable drifts */
+        CHECK(ws.host_guard > 0 && ws.host_guard <= cap + cap / 20);
+    }
+    else
+    {
+        fprintf(stderr, "NOTE /proc/self/cgroup is not v2-only: production guard must be 0\n");
+        CHECK(direct == 0 && ws.host_guard == 0);
+    }
+}
+
+/* ---- review C-6: the shared reader on a fake tree (CK-28 v1/failure -> 0) ---- */
+static void
+put(const char *root, const char *rel, const char *text)
+{
+    char path[512], dir[512];
+    snprintf(path, sizeof(path), "%s%s", root, rel);
+    snprintf(dir, sizeof(dir), "%s", path);
+    for (char *p = dir + strlen(root) + 1; *p; p++)
+        if (*p == '/') { *p = '\0'; mkdir(dir, 0700); *p = '/'; }
+    write_file(path, text, 0600);
+}
+
+static uint64_t
+headroom_tree(const char *root, uint64_t requested, char *err, size_t len)
+{
+    char meminfo[512], cg[512], cgroot[512];
+    HostHeadroomPaths p = {meminfo, cg, cgroot};
+    snprintf(meminfo, sizeof(meminfo), "%s/proc/meminfo", root);
+    snprintf(cg, sizeof(cg), "%s/proc/self/cgroup", root);
+    snprintf(cgroot, sizeof(cgroot), "%s/sys/fs/cgroup", root);
+    err[0] = '\0';
+    return host_headroom_at(&p, requested, err, len);
+}
+
+static void
+test_host_headroom_tree(void)
+{
+    char root[320], err[160];
+    snprintf(root, sizeof(root), "%s/hr", tmpdir);
+    mkdir(root, 0700);
+    put(root, "/proc/meminfo", "MemTotal: 16000000 kB\nMemAvailable: 8000000 kB\n");
+    put(root, "/proc/self/cgroup", "0::/a/b\n");
+    put(root, "/sys/fs/cgroup/a/b/memory.max", "max\n");
+    put(root, "/sys/fs/cgroup/a/b/memory.current", "100\n");
+    put(root, "/sys/fs/cgroup/a/memory.max", "3000000000\n");
+    put(root, "/sys/fs/cgroup/a/memory.current", "1000000000\n");
+    /* MemAvailable/2 = 4,096,000,000; ancestor remaining/2 = 1,000,000,000 */
+    CHECK(headroom_tree(root, UINT64_MAX, err, sizeof(err)) == 1000000000ull);
+    CHECK(headroom_tree(root, 5, err, sizeof(err)) == 5);
+    put(root, "/sys/fs/cgroup/a/b/memory.max", "500000000\n");   /* leaf tighter */
+    put(root, "/sys/fs/cgroup/a/b/memory.current", "100000000\n");
+    CHECK(headroom_tree(root, UINT64_MAX, err, sizeof(err)) == 200000000ull);
+    put(root, "/sys/fs/cgroup/a/b/memory.current", "600000000\n");  /* over limit */
+    CHECK(headroom_tree(root, UINT64_MAX, err, sizeof(err)) == 0);
+    put(root, "/sys/fs/cgroup/a/b/memory.current", "100000000\n");
+    /* cgroup v1 memory controller: refused with a reason. */
+    put(root, "/proc/self/cgroup", "12:cpu,memory:/x\n0::/a/b\n");
+    CHECK(headroom_tree(root, UINT64_MAX, err, sizeof(err)) == 0 && strstr(err, "cgroup v1") != NULL);
+    put(root, "/proc/self/cgroup", "0::/a/../b\n");                  /* traversal */
+    CHECK(headroom_tree(root, UINT64_MAX, err, sizeof(err)) == 0);
+    put(root, "/proc/self/cgroup", "0::/a/b\n");
+    {   /* numeric limit without a readable current: read failure */
+        char p[512];
+        snprintf(p, sizeof(p), "%s/sys/fs/cgroup/a/b/memory.current", root);
+        unlink(p);
+        CHECK(headroom_tree(root, UINT64_MAX, err, sizeof(err)) == 0);
+        snprintf(p, sizeof(p), "%s/proc/self/cgroup", root);
+        unlink(p);                                               /* unreadable cgroup */
+        put(root, "/sys/fs/cgroup/a/b/memory.current", "100000000\n");
+        CHECK(headroom_tree(root, UINT64_MAX, err, sizeof(err)) == 0);
+        put(root, "/proc/self/cgroup", "0::/a/b\n");
+        snprintf(p, sizeof(p), "%s/proc/meminfo", root);
+        unlink(p);                                               /* unreadable meminfo */
+        CHECK(headroom_tree(root, UINT64_MAX, err, sizeof(err)) == 0);
+    }
 }
 
 /* ---- CK-28 per-caller policy, end to end through the build handlers ---- */
@@ -477,6 +614,9 @@ test_callers(void)
     CHECK(strcmp(status.oom_score_adj_result, "oom_score_adj=500 applied") == 0);
     CHECK(status.lw_n_devices == 2 && status.lw_devices[1].device_id == 1);
     CHECK(status.lw_devices[0].managed_spill_builds + status.lw_devices[1].managed_spill_builds == 2);
+    CHECK(status.lw_devices[0].managed_spill_bytes_max + status.lw_devices[1].managed_spill_bytes_max
+          >= 300 * MiB);
+    CHECK(status.lw_devices[0].lw_pending_bytes == 0 && status.lw_devices[1].lw_pending_bytes == 0);
 }
 
 int
@@ -487,6 +627,8 @@ main(void)
     test_flags();
     test_oom_score_adj();
     test_lw_pending();
+    test_host_guard_production();
+    test_host_headroom_tree();
     test_callers();
     if (failures)
     {
@@ -495,6 +637,7 @@ main(void)
     }
     printf("PASS lw daemon: KB-4/5/6/24 startup refusal, oom_score_adj 0/keep/raise/EACCES/missing, "
            "CK-3b concurrent managed admissions (off/on boundaries, release, GPU isolation, policy error), "
+           "production host guard, cgroup v2 min/v1/read-failure tree, "
            "per-caller policy (build, build_multi active; sharded error), spill counters, NOTICE, pool status\n");
     return 0;
 }
