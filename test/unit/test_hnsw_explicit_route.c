@@ -31,10 +31,17 @@ static void test_receipts(void)
                 || (a == CUVS_HNSW_ALGO_IVF_PQ && r == CUVS_HNSW_ROUTE_IVF_PQ)
                 || (a == CUVS_HNSW_ALGO_ACE && r == CUVS_HNSW_ROUTE_ACE);
             CHECK(!!cuvs_hnsw_policy_valid(&p) == valid);
+            /* ADR-087 (UC-5): the overflow flag is valid exactly on auto -> ACE. */
+            p.route_flags = CUVS_HNSW_ROUTE_FLAG_AUTO_OVERFLOW;
+            CHECK(!!cuvs_hnsw_policy_valid(&p)
+                  == (a == CUVS_HNSW_ALGO_AUTO && r == CUVS_HNSW_ROUTE_ACE));
         }
     p = policy(CUVS_HNSW_ALGO_AUTO, CUVS_HNSW_ROUTE_ACE);
-    CHECK(!cuvs_hnsw_policy_valid(&p)); /* baseline red, now rejected by actual writer */
+    CHECK(!cuvs_hnsw_policy_valid(&p)); /* auto ACE without the overflow record */
     CHECK(cuvs_hnsw_policy_read(&p, sizeof(p), &out) == CUVS_HNSW_POLICY_CORRUPT);
+    p.route_flags = CUVS_HNSW_ROUTE_FLAG_AUTO_OVERFLOW;
+    CHECK(cuvs_hnsw_policy_read(&p, sizeof(p), &out) == CUVS_HNSW_POLICY_RECORDED);
+    p.route_flags = 0;
     p.version = CUVS_HNSW_POLICY_LEGACY_VERSION;
     CuvsHnswPolicy original = p;
     CHECK(cuvs_hnsw_policy_read(&p, sizeof(p), &out) == CUVS_HNSW_POLICY_RECORDED);
@@ -101,45 +108,45 @@ static void test_routes(void)
     CHECK(!cuvs_hnsw_training_reserve(&cap, cuvs_hnsw_training_rows(1000000, 174762, 500), 768));
     for (uint32_t a = 0; a <= 1; a++)
     {
-        CHECK(cuvs_hnsw_resolve_route(1000000, 768, 64, 128, a, &cap, h, g, &d, error, sizeof(error)) == CUVS_STATUS_OK);
+        CHECK(cuvs_hnsw_resolve_route(1000000, 768, 64, 128, a, CUVS_HNSW_OVERFLOW_ERROR, &cap, h, g, &d, error, sizeof(error)) == CUVS_STATUS_OK);
         CHECK(d.route == CUVS_HNSW_ROUTE_IVF_PQ && d.partitions == 0);
         CHECK(d.sdk_host_budget == h - (256ULL << 20) && d.sdk_gpu_budget == g - (512ULL << 20));
-        CHECK(cuvs_hnsw_resolve_route(1000000, 768, 64, 128, a, &cap, cap.host_peak, cap.gpu_peak, &d, error, sizeof(error)) == CUVS_STATUS_OK);
-        CHECK(cuvs_hnsw_resolve_route(1000000, 768, 64, 128, a, &cap, cap.host_peak - 1, g, &d, error, sizeof(error)) == CUVS_STATUS_HNSW_RESIDENT_BUDGET_EXCEEDED);
+        CHECK(cuvs_hnsw_resolve_route(1000000, 768, 64, 128, a, CUVS_HNSW_OVERFLOW_ERROR, &cap, cap.host_peak, cap.gpu_peak, &d, error, sizeof(error)) == CUVS_STATUS_OK);
+        CHECK(cuvs_hnsw_resolve_route(1000000, 768, 64, 128, a, CUVS_HNSW_OVERFLOW_ERROR, &cap, cap.host_peak - 1, g, &d, error, sizeof(error)) == CUVS_STATUS_HNSW_RESIDENT_BUDGET_EXCEEDED);
         CHECK(d.route == 0 && strstr(error, "build_algo=ace"));
-        CHECK(cuvs_hnsw_resolve_route(1000000, 768, 64, 128, a, &cap, h, cap.gpu_peak - 1, &d, error, sizeof(error)) == CUVS_STATUS_HNSW_RESIDENT_BUDGET_EXCEEDED);
+        CHECK(cuvs_hnsw_resolve_route(1000000, 768, 64, 128, a, CUVS_HNSW_OVERFLOW_ERROR, &cap, h, cap.gpu_peak - 1, &d, error, sizeof(error)) == CUVS_STATUS_HNSW_RESIDENT_BUDGET_EXCEEDED);
     }
-    CHECK(cuvs_hnsw_resolve_route(1000000, 768, 64, 128, CUVS_HNSW_ALGO_ACE, &cap, h, g, &d, error, sizeof(error)) == CUVS_STATUS_OK);
+    CHECK(cuvs_hnsw_resolve_route(1000000, 768, 64, 128, CUVS_HNSW_ALGO_ACE, CUVS_HNSW_OVERFLOW_ERROR, &cap, h, g, &d, error, sizeof(error)) == CUVS_STATUS_OK);
     CHECK(d.route == CUVS_HNSW_ROUTE_ACE && d.partitions >= 2); /* candidate, not real SDK support */
-    CHECK(cuvs_hnsw_resolve_route(1000000, 768, 64, 128, CUVS_HNSW_ALGO_ACE, &cap, 1, 1, &d, error, sizeof(error)) == CUVS_STATUS_BUILD_FAILED);
+    CHECK(cuvs_hnsw_resolve_route(1000000, 768, 64, 128, CUVS_HNSW_ALGO_ACE, CUVS_HNSW_OVERFLOW_ERROR, &cap, 1, 1, &d, error, sizeof(error)) == CUVS_STATUS_BUILD_FAILED);
     CHECK(d.route == 0 && !strstr(error, "use build_algo=ace"));
-    CHECK(cuvs_hnsw_resolve_route(1000000, 768, 64, 128, 2, &cap, h, g, &d, error, sizeof(error)) == CUVS_STATUS_BUILD_FAILED);
-    CHECK(cuvs_hnsw_resolve_route(1000000, 768, 64, 128, UINT32_MAX, &cap, h, g, &d, error, sizeof(error)) == CUVS_STATUS_BUILD_FAILED);
-    CHECK(cuvs_hnsw_resolve_route(1000000, 768, 64, 128, 0, &cap, 0, g, &d, error, sizeof(error)) == CUVS_STATUS_BUILD_FAILED);
-    CHECK(cuvs_hnsw_resolve_route(UINT64_MAX, 768, 64, 128, 0, &cap, h, g, &d, error, sizeof(error)) == CUVS_STATUS_BUILD_FAILED);
+    CHECK(cuvs_hnsw_resolve_route(1000000, 768, 64, 128, 2, CUVS_HNSW_OVERFLOW_ERROR, &cap, h, g, &d, error, sizeof(error)) == CUVS_STATUS_BUILD_FAILED);
+    CHECK(cuvs_hnsw_resolve_route(1000000, 768, 64, 128, UINT32_MAX, CUVS_HNSW_OVERFLOW_ERROR, &cap, h, g, &d, error, sizeof(error)) == CUVS_STATUS_BUILD_FAILED);
+    CHECK(cuvs_hnsw_resolve_route(1000000, 768, 64, 128, 0, CUVS_HNSW_OVERFLOW_ERROR, &cap, 0, g, &d, error, sizeof(error)) == CUVS_STATUS_BUILD_FAILED);
+    CHECK(cuvs_hnsw_resolve_route(UINT64_MAX, 768, 64, 128, 0, CUVS_HNSW_OVERFLOW_ERROR, &cap, h, g, &d, error, sizeof(error)) == CUVS_STATUS_BUILD_FAILED);
     for (uint64_t n = 1; n <= 16; n++)
     {
         uint32_t degree = n < 16 ? (n & ~1ULL) : 14;
         if (degree < 4) degree = 4;
         CHECK(!cuvs_hnsw_capacity(n, 768, degree, degree, 0, &cap));
-        CHECK(cuvs_hnsw_resolve_route(n, 768, degree, degree, 0, &cap, h, g, &d, error, sizeof(error)) == CUVS_STATUS_OK);
+        CHECK(cuvs_hnsw_resolve_route(n, 768, degree, degree, 0, CUVS_HNSW_OVERFLOW_ERROR, &cap, h, g, &d, error, sizeof(error)) == CUVS_STATUS_OK);
         CHECK(d.route == (n < 16 ? CUVS_HNSW_ROUTE_TINY : CUVS_HNSW_ROUTE_IVF_PQ));
         if (n < 16)
         {
-            CHECK(cuvs_hnsw_resolve_route(n, 768, degree, degree, 1, &cap, h, g, &d, error, sizeof(error)) == CUVS_STATUS_BUILD_FAILED);
-            CHECK(cuvs_hnsw_resolve_route(n, 768, degree, degree, 3, &cap, h, g, &d, error, sizeof(error)) == CUVS_STATUS_BUILD_FAILED);
-            CHECK(cuvs_hnsw_resolve_route(n, 768, degree, degree, 0, &cap, 1, 1, &d, error, sizeof(error)) == CUVS_STATUS_BUILD_FAILED);
+            CHECK(cuvs_hnsw_resolve_route(n, 768, degree, degree, 1, CUVS_HNSW_OVERFLOW_ERROR, &cap, h, g, &d, error, sizeof(error)) == CUVS_STATUS_BUILD_FAILED);
+            CHECK(cuvs_hnsw_resolve_route(n, 768, degree, degree, 3, CUVS_HNSW_OVERFLOW_ERROR, &cap, h, g, &d, error, sizeof(error)) == CUVS_STATUS_BUILD_FAILED);
+            CHECK(cuvs_hnsw_resolve_route(n, 768, degree, degree, 0, CUVS_HNSW_OVERFLOW_ERROR, &cap, 1, 1, &d, error, sizeof(error)) == CUVS_STATUS_BUILD_FAILED);
         }
     }
     for (uint64_t n = 16; n <= 256; n += n == 16 ? 239 : 1)
     {
         CHECK(!cuvs_hnsw_capacity(n, 768, 64, 128, 0, &cap));
-        int rc = cuvs_hnsw_resolve_route(n, 768, 64, 128, 3, &cap, h, g, &d, error, sizeof(error));
+        int rc = cuvs_hnsw_resolve_route(n, 768, 64, 128, 3, CUVS_HNSW_OVERFLOW_ERROR, &cap, h, g, &d, error, sizeof(error));
         CHECK(rc == (n < 256 ? CUVS_STATUS_BUILD_FAILED : CUVS_STATUS_OK));
     }
     CHECK(!cuvs_hnsw_capacity(14200000, 1536, 64, 128, 1, &cap));
-    CHECK(cuvs_hnsw_resolve_route(14200000, 1536, 64, 128, 0, &cap, 16ULL << 30, g, &d, error, sizeof(error)) == CUVS_STATUS_HNSW_RESIDENT_BUDGET_EXCEEDED);
-    CHECK(cuvs_hnsw_resolve_route(14200000, 1536, 64, 128, 3, &cap, 16ULL << 30, g, &d, error, sizeof(error)) == CUVS_STATUS_OK);
+    CHECK(cuvs_hnsw_resolve_route(14200000, 1536, 64, 128, 0, CUVS_HNSW_OVERFLOW_ERROR, &cap, 16ULL << 30, g, &d, error, sizeof(error)) == CUVS_STATUS_HNSW_RESIDENT_BUDGET_EXCEEDED);
+    CHECK(cuvs_hnsw_resolve_route(14200000, 1536, 64, 128, 3, CUVS_HNSW_OVERFLOW_ERROR, &cap, 16ULL << 30, g, &d, error, sizeof(error)) == CUVS_STATUS_OK);
     CHECK(d.route == CUVS_HNSW_ROUTE_ACE && d.partitions > 0);
 }
 

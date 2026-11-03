@@ -2631,7 +2631,8 @@ cuvs_hnsw_build_file(int vectors_fd, int owner_fd,
         }
         if (cuvs_hnsw_owner_cancelled(owner_fd)) return CUVS_STATUS_CANCELED;
         rc = cuvs_hnsw_resolve_route(params->n_vecs, params->dim, degree, intermediate,
-            params->build_algo, &cap, params->host_budget, params->gpu_budget,
+            params->build_algo, params->auto_overflow, &cap,
+            params->host_budget, params->gpu_budget,
             &prepared.route, error, error_len);
         if (rc != CUVS_STATUS_OK) return rc;
         const bool disk = prepared.route.route == CUVS_HNSW_ROUTE_ACE;
@@ -2659,6 +2660,7 @@ cuvs_hnsw_build_file(int vectors_fd, int owner_fd,
         receipt.bytes = sizeof(receipt);
         receipt.route = prepared.route.route;
         receipt.requested_algo = params->build_algo;
+        receipt.route_flags = prepared.route.overflowed ? CUVS_HNSW_ROUTE_FLAG_AUTO_OVERFLOW : 0;
         receipt.requested_ef = params->ef_construction;
         receipt.degree = degree;
         receipt.intermediate = intermediate;

@@ -20,9 +20,9 @@ def mutate(name, files):
     if name == 'whitelist_range_opens_NN':
         p = replace_once(p, 'return algo == CUVS_HNSW_ALGO_AUTO || algo == CUVS_HNSW_ALGO_IVF_PQ\n        || algo == CUVS_HNSW_ALGO_ACE;', 'return algo <= CUVS_HNSW_ALGO_ACE;')
     elif name == 'resident_budget_guard_removed':
-        c = replace_once(c, 'if (!tiny && algo != CUVS_HNSW_ALGO_ACE && exceeded)', 'if (0 && !tiny && algo != CUVS_HNSW_ALGO_ACE && exceeded)')
+        c = replace_once(c, 'if (!tiny && algo != CUVS_HNSW_ALGO_ACE && exceeded && !overflow_to_ace)', 'if (0 && !tiny && algo != CUVS_HNSW_ALGO_ACE && exceeded && !overflow_to_ace)')
     elif name == 'ACE_not_forced_when_resident_fits':
-        c = replace_once(c, 'if (algo == CUVS_HNSW_ALGO_ACE)', 'if (algo == CUVS_HNSW_ALGO_ACE && exceeded)')
+        c = replace_once(c, 'if (algo == CUVS_HNSW_ALGO_ACE || overflow_to_ace)', 'if ((algo == CUVS_HNSW_ALGO_ACE && exceeded) || overflow_to_ace)')
     elif name == 'legacy_reinterpreted_as_current':
         p = replace_once(p, 'p->version == CUVS_HNSW_POLICY_LEGACY_VERSION && p->bytes', 'p->version == CUVS_HNSW_POLICY_VERSION && p->bytes')
     elif name == 'reader_truncation_guard_removed':

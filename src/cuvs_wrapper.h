@@ -359,6 +359,7 @@ typedef struct CuvsHnswFileBuild {
     uint32_t hierarchy;
     uint32_t build_algo;
     uint32_t ef_construction;
+    uint32_t auto_overflow; /* CUVS_HNSW_OVERFLOW_*: daemon --hnsw-auto-overflow */
     CuvsHnswPolicy *policy; /* successful actual build receipt; caller-owned */
     /* Internal safe-boundary observer. Never received from IPC; only a
      * CUVS_TEST_HOOKS daemon installs it for controlled failure fixtures. */
