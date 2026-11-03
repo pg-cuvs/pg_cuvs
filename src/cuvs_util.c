@@ -9,6 +9,7 @@
 #include "cuvs_util.h"
 #include "cuvs_ipc.h"   /* CUVS_STATUS_* defines (PG-free, CUDA-free) */
 #include "cuvs_admission_contract.h"   /* CuvsAdmissionReason (breaker classification) */
+#include "cuvs_lw_policy.h"   /* I4 workspace rule */
 
 #include <string.h>
 #include <stdarg.h>
@@ -1884,13 +1885,25 @@ cuvs_admission_format(const CuvsAdmissionFields *f, CuvsAdmissionObject obj,
 }
 
 /* ----------------------------------------------------------------
- * I4 admission hook (cuvs_admission_contract.h). The I3-A tip has no managed
- * large_workspace policy, so AR6/AR7 are never emitted here (v6 1.4 (h)).
- * I4 owns this body and replaces it with the AR6/AR7 rule.
+ * I4 admission hook (cuvs_admission_contract.h): AR6/AR7 for the managed
+ * large_workspace (ADR-088). The rule itself is cuvs_lw_admit() in
+ * cuvs_lw_policy.h; policy error (managed = 0) and NULL never refuse.
  * ---------------------------------------------------------------- */
 CuvsAdmissionReason
 cuvs_admission_workspace_check(const CuvsAdmissionWorkspaceInput *in)
 {
-    (void) in;
-    return CUVS_ADMISSION_NONE;
+    CuvsLwAdmitInput lw;
+    if (!in)
+        return CUVS_ADMISSION_NONE;
+    memset(&lw, 0, sizeof(lw));
+    lw.policy = in->managed ? CUVS_LW_OVERFLOW_MANAGED : CUVS_LW_OVERFLOW_ERROR;
+    lw.overcommit = in->overcommit != 0;
+    lw.n_m = in->needed;
+    lw.reserved = in->reserved;
+    lw.pool_used = in->pool_used;
+    lw.phys_free = in->phys_free;
+    lw.lw_ub = in->lw_ub;
+    lw.lw_pending = in->lw_pending;
+    lw.host_guard = in->host_guard;
+    return cuvs_lw_admit(&lw).reason;
 }
