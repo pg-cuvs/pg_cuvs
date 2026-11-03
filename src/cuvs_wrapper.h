@@ -28,6 +28,10 @@ int cuvs_detect_gpus(CuvsGpuDeviceInfo *out, int max_devices);
  * Returns nonzero on init failure. */
 int cuvs_rmm_pool_init(int device_id, size_t initial_pool_bytes, uint32_t maximum_percent);
 int cuvs_rmm_pool_stats(int device_id, CuvsRmmPoolStats *out);
+/* I3-B (UC-6): always-on lock-free peak of live pool bytes (0 without a
+ * pool); reset sets the peak to the current live bytes. */
+size_t cuvs_rmm_pool_peak_bytes(int device_id);
+void   cuvs_rmm_pool_peak_reset(int device_id);
 
 /* ADR-075 Phase 1: measure physical hardware constants on `device_id`.
  *   link_bw_bpus  -- CPU->GPU H2D bandwidth, bytes per microsecond
