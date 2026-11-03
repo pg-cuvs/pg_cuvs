@@ -26,6 +26,7 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <unistd.h>
 #include <string.h>
 #include <math.h>
 #include <stdint.h>
@@ -267,6 +268,10 @@ cuvs_cagra_build(const float *vecs, int64_t n_vecs, int dim, uint32_t metric,
                  uint32_t build_algo, int device_id)
 { (void)graph_degree; (void)intermediate_graph_degree; (void)build_algo; (void)device_id;
   if (shim_build_oom_armed()) return NULL;
+  /* Test seam (CPU shim only): hold the build so a test can act while its
+   * VRAM reservation is pending (I3-B reload-under-build scenario). */
+  { const char *d = getenv("CUVS_SHIM_BUILD_DELAY_MS");
+    if (d && atol(d) > 0) usleep((useconds_t)(atol(d) * 1000)); }
   return (CuvsCagraIndex) shim_new(vecs, n_vecs, dim, metric); }
 
 CuvsCagraIndex
