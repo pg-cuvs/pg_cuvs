@@ -129,6 +129,8 @@ static std::atomic<int> g_inject_extend_oom{0};
  * process-wide flag a concurrent build on another thread could clear or set
  * it between this build and its read. */
 static thread_local int g_last_build_oom = 0;
+/* I3 (C5 ATT): the built index did not hold all rows of its dataset. */
+static thread_local int g_last_build_att = 0;
 /* test-only: armed by cuvs_set_inject_build_oom(n); each build decrements and fails. */
 static std::atomic<int> g_inject_build_oom{0};
 
@@ -1105,6 +1107,7 @@ cuvs_cagra_build_multi(const float **vecs, const int64_t *n_each, int n_parts,
                        uint32_t build_algo, int device_id)
 {
     g_last_build_oom = 0;   /* fresh per build attempt */
+    g_last_build_att = 0;
     PooledRes _pr(device_id);
     try {
         /* test-only: simulate a VRAM OOM to exercise the daemon evict+retry path. */
@@ -1175,6 +1178,12 @@ cuvs_cagra_build_multi(const float **vecs, const int64_t *n_each, int n_parts,
             idx.update_dataset(res, raft::make_device_strided_matrix_view<const float, int64_t>(
                                         d_padded.data_handle(), total, (int64_t)dim, ld));
             res.sync_stream();
+            if (idx.dataset().extent(0) != total) {   /* C5 ATT */
+                fprintf(stderr, "[cuvs_cagra_build_multi] dataset not attached (%lld of %lld rows)\n",
+                        (long long)idx.dataset().extent(0), (long long)total);
+                g_last_build_att = 1;
+                return nullptr;
+            }
             return new CuvsCagraIndexImpl(std::move(d_padded), std::move(idx), metric);
         }
 
@@ -1182,6 +1191,14 @@ cuvs_cagra_build_multi(const float **vecs, const int64_t *n_each, int n_parts,
          * matches our retained d_corpus memory. */
         idx.update_dataset(res, raft::make_const_mdspan(d_corpus.view()));
         res.sync_stream();
+        /* C5 ATT: cuVS only warns when it cannot attach the dataset and returns
+         * a graph-only index; a CAGRA index without its rows cannot be searched. */
+        if (idx.dataset().extent(0) != total) {
+            fprintf(stderr, "[cuvs_cagra_build_multi] dataset not attached (%lld of %lld rows)\n",
+                    (long long)idx.dataset().extent(0), (long long)total);
+            g_last_build_att = 1;
+            return nullptr;
+        }
 
         return new CuvsCagraIndexImpl(std::move(d_corpus), std::move(idx), metric);
     } catch (const std::bad_alloc &) {
@@ -2092,6 +2109,14 @@ cuvs_last_build_was_oom(void)
 {
     int v = g_last_build_oom;   /* read and clear */
     g_last_build_oom = 0;
+    return v;
+}
+
+extern "C" int
+cuvs_last_build_attach_failed(void)
+{
+    int v = g_last_build_att;   /* read and clear */
+    g_last_build_att = 0;
     return v;
 }
 

@@ -5732,6 +5732,7 @@ handle_build(int client_fd, const CuvsCmdFrame *cmd)
     /* ADR-086 (I3): an out-of-memory build after admission fails without
      * evicting any resident index; ADR-070's evict-to-fit retry is removed. */
     int build_oom = !new_handle && cuvs_last_build_was_oom();
+    int build_att = !new_handle && !build_oom && cuvs_last_build_attach_failed();
 
     /* Reacquire for the durable-commit + registry tail (finish_build_commit
      * expects the lock held). Release the build reservation now: on success the
@@ -5739,8 +5740,19 @@ handle_build(int client_fd, const CuvsCmdFrame *cmd)
     pthread_mutex_lock(&g_index_mutex);
     release_build_vram(needed, target_gpu);
     log_release("BUILD", target_gpu, cmd->db_oid, cmd->index_oid, needed,
-                new_handle ? "built" : build_oom ? "oom" : "failed");
+                new_handle ? "built" : build_oom ? "oom" : build_att ? "att" : "failed");
 
+    if (build_att)
+    {
+        CuvsAdmissionFields att;
+        admission_fill(&att, CUVS_ADMISSION_ATT, needed, target_gpu);
+        cuvs_set_inject_build_oom(0);
+        pthread_mutex_unlock(&g_index_mutex);
+        munmap(mem, total);
+        send_admission_reject(client_fd, CUVS_STATUS_OOM_FALLBACK,
+                              "dataset not attached to the CAGRA index", &att);
+        return;
+    }
     if (!new_handle && build_oom)
     {
         log_build_oom("BUILD", target_gpu, cmd->db_oid, cmd->index_oid, needed);
@@ -6349,7 +6361,7 @@ handle_build_multi(int client_fd, const CuvsCmdFrame *cmd, const char *index_dir
         uint32_t tids_gen;
         char vecs_final[512], vecs_tmp[576];
         int  vectors_committed = 0;
-        int  build_oom;
+        int  build_oom, build_att;
         AdmitLine al = {.op = "BUILD", .path = "multi",
                         .algo = admission_algo_name(cmd->build_algo), .gpu = target_gpu,
                         .db = cmd->db_oid, .idx = cmd->index_oid, .dim = cmd->dim,
@@ -6398,6 +6410,7 @@ handle_build_multi(int client_fd, const CuvsCmdFrame *cmd, const char *index_dir
                                             cmd->build_algo, target_gpu);
         /* ADR-086 (I3): no evict-to-fit; an OOM after admission is a failure. */
         build_oom = !new_handle && cuvs_last_build_was_oom();
+        build_att = !new_handle && !build_oom && cuvs_last_build_attach_failed();
 
         /* Reacquire for the durable-commit + registry tail (finish_build_commit
          * expects the lock held). Release the reservation: on success the registry
@@ -6405,8 +6418,18 @@ handle_build_multi(int client_fd, const CuvsCmdFrame *cmd, const char *index_dir
         pthread_mutex_lock(&g_index_mutex);
         release_build_vram(needed, target_gpu);
         log_release("BUILD", target_gpu, cmd->db_oid, cmd->index_oid, needed,
-                    new_handle ? "built" : build_oom ? "oom" : "failed");
+                    new_handle ? "built" : build_oom ? "oom" : build_att ? "att" : "failed");
 
+        if (build_att)
+        {
+            cuvs_set_inject_build_oom(0);
+            admission_fill(&rej, CUVS_ADMISSION_ATT, needed, target_gpu);   /* under the mutex */
+            pthread_mutex_unlock(&g_index_mutex);
+            rej_set = 1;
+            status = CUVS_STATUS_OOM_FALLBACK;
+            err = "dataset not attached to the CAGRA index";
+            goto fail;
+        }
         if (!new_handle && build_oom)
         {
             log_build_oom("BUILD", target_gpu, cmd->db_oid, cmd->index_oid, needed);
