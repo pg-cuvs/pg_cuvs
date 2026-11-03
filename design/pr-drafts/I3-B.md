@@ -160,7 +160,12 @@ Added from the independent review (REVIEW-I3-B-FABLE.md § 6, items 10-18):
 Implementation-stage conditions from the review (not changed in this PR unless
 noted): (1) KB-17 flag: implemented in r4 (`--rmm-peak-meter`, `peak_bytes`/`solo` in
 `CuvsRmmPoolStats`, CK-34 test with 8 threads and three mutations; GPU: on gives
-`peak_bytes` 15,360,000 after probes, off gives 0); (2) manual-op result strings differ from the C7
+`peak_bytes` 15,360,000 after probes, off gives 0); r5 raises the peak only after a successful
+allocation: on the VM, `test/i3b/gpu_peak_oom.c` (pool quota 1%, a 614 MB BF build
+refused by the quota, then a 10 MB one) reports peak 0 after the refusal and
+10,280,192 after the success on 864a649 (CUDA build 0 errors), while the same smoke
+on c0d8993 (r4) fails with peak 614,400,000 after the refusal; the source scan
+requires the commit after `upstream_.allocate` (mutation RED); (2) manual-op result strings differ from the C7
 table (`not resident`/`already resident`/`not pinned`/`name = value` vs
 `not_resident`/`already_resident`/`not_pinned`/`applied`): conch to fix the spelling;
 (3) `pg_cuvs_unload` on a non-daemon AM (e.g. hnsw) answers "not resident" instead

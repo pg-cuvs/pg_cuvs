@@ -1,5 +1,5 @@
 baseline: PASS 0/5 red 
-RED  off ignored (peak updated when off): 5/5 red FAIL test/unit/test_peak_meter.c:119: off: 0 peak updates (7000)
+RED  off ignored (peak updated when off): 5/5 red FAIL test/unit/test_peak_meter.c:130: off: 0 peak updates (7000)
 RED  reset missing: 5/5 red FAIL test/unit/test_peak_meter.c:110: reset -> live 1000 (4000)
-RED  race: load/store instead of CAS: 5/5 red FAIL test/unit/test_peak_meter.c:86: no thread saw the peak below its own level (18)
+RED  race: load/store instead of CAS: 5/5 red FAIL test/unit/test_peak_meter.c:86: no thread saw the peak below its own level (12)
 mutations: 3, survived/invalid: 0
