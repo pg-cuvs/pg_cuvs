@@ -52,6 +52,43 @@ MUTATIONS = {
 }
 UTIL_MUTATIONS = {'hook_emits_ar6_before_i4'}
 
+MESSAGE_TEST = 'test/unit/test_admission_message.c'
+# DETAIL/HINT builder (cuvs_util.c), checked by the message test.
+MESSAGE_MUTATIONS = {
+    'other_db_name_looked_up': (
+        '    *resolved = 0;\n    if (t->db_oid != cat->my_db_oid)\n',
+        '    *resolved = 0;\n    if (0 && t->db_oid != cat->my_db_oid)\n'),
+    'hint_ignores_unload_privilege': (
+        '        if (cat->can_unload == NULL || !cat->can_unload(cat->ctx, t->db_oid, t->index_oid))\n'
+        '            continue;\n',
+        ''),
+    'idle_never_printed_as_minutes': (
+        'if (f->cand[c].idle_s == CUVS_ADMISSION_IDLE_NEVER)',
+        'if (f->cand[c].idle_s < CUVS_ADMISSION_IDLE_NEVER)'),
+    'zero_candidates_ignores_pins': (
+        '    if (f->n_cand == 0)\n    {\n        if (f->k_cnt > 0)',
+        '    if (f->n_cand == 0)\n    {\n        if (0)'),
+    'wait_line_without_candidates': (
+        'if (!load && unload && (f->present & CUVS_ADM_F_R) && f->r == 1)',
+        'if (!load && (f->present & CUVS_ADM_F_R) && f->r == 1)'),
+    'missing_r_authorizes_wait': (
+        'if (!load && unload && (f->present & CUVS_ADM_F_R) && f->r == 1)',
+        'if (!load && unload && f->r == 1)'),
+    'literal_quote_not_doubled': (
+        "cuvs_sb_add(b, *s == '\\'' ? \"''\" : \"%c\", *s);",
+        'cuvs_sb_add(b, "%c", *s);'),
+    'rebuild_unpin_clause_dropped': (
+        '            if (unpin)\n                cuvs_sb_add(&h, CUVS_ADM_UNPIN_CLAUSE);\n', ''),
+    'absent_resident_printed_as_zero': (
+        '    if (f->present & CUVS_ADM_F_H)\n    {\n        cuvs_sb_add(b, ", resident ");',
+        '    if (1)\n    {\n        cuvs_sb_add(b, ", resident ");'),
+    'shard_prefix_dropped': (
+        '        cuvs_sb_add(&d, "shard %u: ", f->i);', '        ;'),
+    'load_hint_says_create_index': (
+        'const char *retry = load ? "then retry the query." : "then retry CREATE INDEX.";',
+        'const char *retry = "then retry CREATE INDEX.";'),
+}
+
 WIRE_TEST = 'test/unit/test_admission_wire.c'
 # err_out codec (cuvs_util.c), checked by the wire test under ASAN/UBSan.
 WIRE_MUTATIONS = {
@@ -101,6 +138,9 @@ def main(output):
     cases += [(n, o, w, 'cuvs_util.c', WIRE_TEST,
                ['-fsanitize=address,undefined', '-fno-sanitize-recover=undefined'])
               for n, (o, w) in WIRE_MUTATIONS.items()]
+    cases += [(n, o, w, 'cuvs_util.c', MESSAGE_TEST,
+               ['-fsanitize=address,undefined', '-fno-sanitize-recover=undefined'])
+              for n, (o, w) in MESSAGE_MUTATIONS.items()]
     for name, old, new, target, test, extra in cases:
         case = out / name
         case.mkdir()
