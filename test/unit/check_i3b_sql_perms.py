@@ -152,12 +152,15 @@ EXPECTED = {
     "pg_cuvs_unload(regclass)", "pg_cuvs_load(regclass)", "pg_cuvs_pin(regclass)",
     "pg_cuvs_unpin(regclass)", "pg_cuvs_unload(oid,oid)", "pg_cuvs_unpin(oid,oid)",
     "pg_cuvs_reclaim_set(text,text)", "pg_cuvs_index_status()", "pg_cuvs_memory_status()",
+    "pg_cuvs_circuit_status()",
 }
 check(set(creates) == EXPECTED, f"CREATE FUNCTION set differs: {sorted(set(creates) ^ EXPECTED)}")
 
 revoked = {norm_sig(n, a) for n, a in re.findall(
     r"REVOKE ALL ON FUNCTION\s+(\w+)\s*\(([^)]*)\)\s+FROM PUBLIC\s*;", block)}
-WANT_REVOKED = EXPECTED - {"pg_cuvs_index_status()"}
+WANT_REVOKED = EXPECTED - {"pg_cuvs_index_status()", "pg_cuvs_circuit_status()",
+                           "pg_cuvs_unload(regclass)", "pg_cuvs_load(regclass)",
+                           "pg_cuvs_pin(regclass)", "pg_cuvs_unpin(regclass)"}
 check(revoked == WANT_REVOKED,
       f"REVOKE FROM PUBLIC set differs: missing={sorted(WANT_REVOKED - revoked)} "
       f"extra={sorted(revoked - WANT_REVOKED)}")

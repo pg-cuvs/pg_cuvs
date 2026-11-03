@@ -142,13 +142,31 @@ COMMENT ON FUNCTION pg_cuvs_memory_status() IS
   'Per-GPU VRAM accounting, reclaim state and eviction counters by cause. '
   'Superuser or pg_monitor only. Empty when the daemon is unavailable.';
 
-REVOKE ALL ON FUNCTION pg_cuvs_unload(regclass)      FROM PUBLIC;
-REVOKE ALL ON FUNCTION pg_cuvs_load(regclass)        FROM PUBLIC;
-REVOKE ALL ON FUNCTION pg_cuvs_pin(regclass)         FROM PUBLIC;
-REVOKE ALL ON FUNCTION pg_cuvs_unpin(regclass)       FROM PUBLIC;
+-- unload/load/pin/unpin(regclass) stay PUBLIC: the C body allows only the
+-- index owner or a superuser (coordination rule, conch 4e421f63).
 REVOKE ALL ON FUNCTION pg_cuvs_unload(oid, oid)      FROM PUBLIC;
 REVOKE ALL ON FUNCTION pg_cuvs_unpin(oid, oid)       FROM PUBLIC;
 REVOKE ALL ON FUNCTION pg_cuvs_reclaim_set(text, text) FROM PUBLIC;
 REVOKE ALL ON FUNCTION pg_cuvs_memory_status()       FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION pg_cuvs_memory_status()    TO pg_monitor;
+-- Circuit breakers of the calling backend (UC-2 3; no IPC, PUBLIC).
+CREATE FUNCTION pg_cuvs_circuit_status()
+RETURNS TABLE (
+    index_oid          oid,
+    state              text,
+    transient          boolean,
+    opened_at          timestamptz,
+    half_open_count    bigint,
+    consecutive_errors integer
+)
+AS 'MODULE_PATHNAME', 'pg_cuvs_circuit_status'
+LANGUAGE C VOLATILE STRICT PARALLEL RESTRICTED;
+-- EXECUTE stays with PUBLIC (default): it reports only the caller's backend.
+
+COMMENT ON FUNCTION pg_cuvs_circuit_status() IS
+  'Circuit breakers tracked by this backend, one row per index (no IPC). '
+  'state: closed/open/half_open, evaluated with cuvs.circuit_breaker_transient_ttl_s. '
+  'transient: reason class of the last open (transient reasons half-open after the TTL; '
+  'permanent ones need pg_cuvs_reset_circuit). opened_at: NULL if never opened. '
+  'half_open_count: OPEN->HALF_OPEN transitions.';
 -- I3-B end
