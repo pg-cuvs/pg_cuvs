@@ -5994,14 +5994,20 @@ finish_build_commit(int client_fd, const CuvsCmdFrame *cmd, const char *save_dir
         existing->last_compact_at = time(NULL);
         build_rev_tid_map(existing);   /* rebuild map for new tids/n_vecs */
     } else {
+        int registry_full;
         if (g_n_indexes >= g_max_indexes)
             evict_lru(target_gpu);
-        if (g_n_indexes >= g_max_indexes) {
+        registry_full = g_n_indexes >= g_max_indexes;
+#ifdef CUVS_TEST_HOOKS
+        registry_full |= cuvs_fault("CUVS_FAULT_REGISTRY_FULL");
+#endif
+        if (registry_full) {
             /* Registry full and the LRU couldn't be evicted (e.g. all entries
              * inflight on other GPUs). The artifacts are already durable on
              * disk, so DON'T roll back — free GPU resources and reply OK; the
              * first query reloads from disk (load_index evicts for a slot).
-             * Mirrors build_sharded's defer-to-reload. */
+             * Mirrors build_sharded's defer-to-reload. I3 (v6 1.4 (g)): the
+             * requester gets a NOTICE through notice_out instead of silence. */
             LOG_WARN("[handle_build] registry full; %u/%u persisted, will reload on demand\n",
                      cmd->db_oid, cmd->index_oid);
             (void) vectors_committed;   /* .vectors stays on disk for the reload */
@@ -6010,6 +6016,10 @@ finish_build_commit(int client_fd, const CuvsCmdFrame *cmd, const char *save_dir
             pthread_mutex_unlock(&g_index_mutex);
             CuvsReplyHeader hdr_ok = {0};
             hdr_ok.status = CUVS_STATUS_OK;
+            snprintf(hdr_ok.notice_out, sizeof(hdr_ok.notice_out),
+                     "pg_cuvs: the GPU index registry is full (%d slots); the index "
+                     "was saved to disk and loads into GPU memory on its first query",
+                     g_max_indexes);
             send_all(client_fd, &hdr_ok, sizeof(hdr_ok));
             return;
         }

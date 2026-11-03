@@ -339,6 +339,17 @@ cuvs_report_admission(CuvsAdmissionObject obj, Oid index_oid, Relation load_rel)
              errhint("%s", hint)));
 }
 
+/* I3 (v6 1.4 (g)): a successful build reply may carry one NOTICE line for
+ * the requester (for example the registry-full defer-to-reload). Call right
+ * after the build IPC returns, before any other IPC call. */
+static void
+cuvs_report_build_notice(void)
+{
+    const char *notice = cuvs_ipc_last_notice_out();
+    if (notice[0] != '\0')
+        ereport(NOTICE, (errmsg("%s", notice)));
+}
+
 PG_FUNCTION_INFO_V1(pg_cuvs_last_rejection);
 
 /* The last admission rejection of this backend as jsonb, or NULL. Backend
@@ -3026,6 +3037,7 @@ cuvs_build_parallel(Relation heapRel, Relation indexRel, IndexInfo *indexInfo,
                          errhint("Check pg_cuvs_server journal (journalctl -u "
                                  "pg-cuvs-server).")));
             }
+            cuvs_report_build_notice();
         }
         PG_FINALLY();
         {
@@ -3234,6 +3246,7 @@ cuvs_build_cagra_from_heap(Relation heapRel, Relation indexRel, IndexInfo *index
                                 "aborted to preserve catalog durability", rc),
                          errhint("%s", hint)));
             }
+            cuvs_report_build_notice();
         }
     }
     PG_FINALLY();
