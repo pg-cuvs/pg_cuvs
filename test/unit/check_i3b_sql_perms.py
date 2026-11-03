@@ -128,14 +128,21 @@ m = re.search(r"^-- I3-B begin\n(.*?)^-- I3-B end\n?", sql, flags=re.S | re.M)
 check(m is not None, "I3-B begin/end block missing")
 block = m.group(1) if m else ""
 outside = (sql[:m.start()] + sql[m.end():]) if m else sql
-# I3-B only appends: its block comes after I3-A's, and nothing I3-B defines
-# appears outside its own block.
+# I3-B only appends: its block comes after I3-A's, and outside it the upgrade
+# script holds only comments, blank lines, the \echo guard and other set PRs'
+# own begin/end blocks (no statement of I3-B's, nothing loose).
 check(m is not None and sql.find("-- I3-A end") >= 0 and sql.find("-- I3-A end") < m.start(),
       "I3-B block is not appended after the I3-A block")
-for fn_name in ("pg_cuvs_unload", "pg_cuvs_load", "pg_cuvs_pin", "pg_cuvs_unpin",
-                "pg_cuvs_reclaim_set", "pg_cuvs_index_status", "pg_cuvs_memory_status",
-                "pg_cuvs_circuit_status"):
-    check(fn_name not in outside, f"{fn_name} appears outside the I3-B block")
+_in_other = None
+for line in outside.splitlines():
+    om = re.match(r"^-- (I3-A|I3-C|I3-D|I4) (begin|end)\s*$", line)
+    if om:
+        _in_other = om.group(1) if om.group(2) == "begin" else None
+        continue
+    if _in_other:
+        continue
+    check(line.strip() == "" or line.startswith("--") or line.startswith("\\echo "),
+          f"statement outside the I3-B block: {line!r}")
 
 
 def norm_sig(name, args):

@@ -81,6 +81,8 @@ MUTATIONS = [
      "    if (false)\n        ereport(ERROR,"),
     ("d12 install and upgrade blocks diverge", "scan", "sql/pg_cuvs--0.9.0.sql",
      "REVOKE ALL ON FUNCTION pg_cuvs_reclaim_set(text, text) FROM PUBLIC;\n", ""),
+    ("d13 loose statement outside the I3-B block", "scan", "sql/pg_cuvs--0.8.2--0.9.0.sql",
+     "-- I3-B begin", "SELECT 1;\n-- I3-B begin"),
 ]
 
 

@@ -685,10 +685,11 @@ and restore the default afterwards.
 copy of that index for a while, and queries on it may be slower meanwhile; to avoid
 this, pin it with `pg_cuvs_pin` or keep enough free room for both copies. A pinned
 index's REINDEX is refused when both copies do not fit. When the old copy is
-unloaded the REINDEX session receives a NOTICE (`previous resident copy of <index>
-unloaded from GPU to make room for the rebuild`), and `pg_cuvs_index_status()`
-shows `last_build_self_replace = true` and `last_build_unloaded`. If the build then
-fails, the next query reloads the old copy. `REINDEX CONCURRENTLY` builds a new
+unloaded, `pg_cuvs_index_status()` shows `last_build_self_replace = true` and
+`last_build_unloaded`, and the daemon log has a `[self_replace]` line with the
+NOTICE text (`previous resident copy of <index> unloaded from GPU to make room for
+the rebuild`); in the 0.9.0 release the REINDEX session also receives that text as
+a NOTICE. If the build then fails, the next query reloads the old copy. `REINDEX CONCURRENTLY` builds a new
 OID beside the serving index: do not unload the old index for it; unload another
 cold index instead.
 

@@ -21,9 +21,9 @@ COMMENT ON FUNCTION pg_cuvs_last_rejection() IS
 -- I3-B begin
 -- ----------------------------------------------------------------
 -- I3-B: manual GPU cache control and cache/memory status (daemon ops 30..37).
--- Grants: the regclass forms are revoked from PUBLIC (the C function also
--- requires index ownership; a DBA grants EXECUTE to roles that need it). The
--- (oid, oid) overloads and pg_cuvs_reclaim_set are superuser only (C checks
+-- Grants: the regclass forms keep EXECUTE for PUBLIC; the C function allows
+-- only the index owner or a superuser. The (oid, oid) overloads and
+-- pg_cuvs_reclaim_set are revoked from PUBLIC and superuser only (C checks
 -- superuser() as well). pg_cuvs_index_status is PUBLIC and filters rows in C;
 -- pg_cuvs_memory_status is for superusers and pg_monitor.
 -- ----------------------------------------------------------------
