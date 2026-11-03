@@ -262,9 +262,19 @@ cuvs_hnsw_fix_tiny_counts(int fd, uint64_t expected)
     return 0;
 }
 
+/* Disk precheck formula kept as-is (UC-5 sub-decision 1(a)): the bound for
+ * input copy + reorder + graph + serialization, all routes. */
+static inline uint64_t cuvs_hnsw_disk_need(uint64_t n, uint32_t dim, uint32_t degree)
+{
+    uint64_t raw = n * dim * sizeof(float);
+    return raw * 4 + n * (degree * 8ULL + 64);
+}
+
 typedef struct CuvsHnswRouteDecision {
     uint32_t route;
     uint32_t partitions; /* candidate only; SDK fixed-point plan records effective P */
+    uint32_t overflowed; /* 1 only via the auto -> ACE overflow branch */
+    uint32_t pad;
     uint64_t sdk_host_budget;
     uint64_t sdk_gpu_budget;
 } CuvsHnswRouteDecision;
@@ -273,13 +283,15 @@ typedef struct CuvsHnswRouteDecision {
  * budgets. This decision allocates nothing and never silently changes builder. */
 static inline int
 cuvs_hnsw_resolve_route(uint64_t n, uint32_t dim, uint32_t degree,
-    uint32_t intermediate, uint32_t algo, const CuvsHnswCapacity *cap,
+    uint32_t intermediate, uint32_t algo, uint32_t overflow,
+    const CuvsHnswCapacity *cap,
     uint64_t host, uint64_t gpu, CuvsHnswRouteDecision *out,
     char *error, size_t error_len)
 {
     CuvsHnswCapacity base;
     memset(out, 0, sizeof(*out));
-    if (!cap || !n || !host || !gpu || !cuvs_hnsw_algo_supported(algo))
+    if (!cap || !n || !host || !gpu || !cuvs_hnsw_algo_supported(algo)
+        || (overflow != CUVS_HNSW_OVERFLOW_ACE && overflow != CUVS_HNSW_OVERFLOW_ERROR))
     {
         snprintf(error, error_len, "unsupported HNSW route or unknown capacity budget");
         return CUVS_STATUS_BUILD_FAILED;
@@ -304,14 +316,25 @@ cuvs_hnsw_resolve_route(uint64_t n, uint32_t dim, uint32_t degree,
         snprintf(error, error_len, "tiny exact route estimate exceeds host/GPU budget");
         return CUVS_STATUS_BUILD_FAILED;
     }
-    if (!tiny && algo != CUVS_HNSW_ALGO_ACE && exceeded)
+    /* ADR-087: the ONLY auto -> ACE transition. Explicit ivf_pq never
+     * overflows; auto overflows only when the daemon flag says ace. */
+    int overflow_to_ace = !tiny && exceeded && algo == CUVS_HNSW_ALGO_AUTO
+        && overflow == CUVS_HNSW_OVERFLOW_ACE;
+    if (overflow_to_ace && n < 256)
     {
-        snprintf(error, error_len, "resident IVF-PQ estimate exceeds host/GPU budget; no fallback; use build_algo=ace explicitly");
+        snprintf(error, error_len, "resident IVF-PQ estimate exceeds host/GPU budget and ACE needs at least 256 rows");
+        return CUVS_STATUS_HNSW_RESIDENT_BUDGET_EXCEEDED;
+    }
+    if (!tiny && algo != CUVS_HNSW_ALGO_ACE && exceeded && !overflow_to_ace)
+    {
+        snprintf(error, error_len, algo == CUVS_HNSW_ALGO_AUTO
+            ? "resident IVF-PQ estimate exceeds host/GPU budget; --hnsw-auto-overflow=error; use build_algo=ace explicitly"
+            : "resident IVF-PQ estimate exceeds host/GPU budget; no fallback; use build_algo=ace explicitly");
         return CUVS_STATUS_HNSW_RESIDENT_BUDGET_EXCEEDED;
     }
     out->sdk_host_budget = host - (host / 8 < (UINT64_C(256) << 20) ? host / 8 : (UINT64_C(256) << 20));
     out->sdk_gpu_budget = gpu - (gpu / 8 < (UINT64_C(512) << 20) ? gpu / 8 : (UINT64_C(512) << 20));
-    if (algo == CUVS_HNSW_ALGO_ACE)
+    if (algo == CUVS_HNSW_ALGO_ACE || overflow_to_ace)
     {
         if (n < 256)
         {
@@ -326,9 +349,99 @@ cuvs_hnsw_resolve_route(uint64_t n, uint32_t dim, uint32_t degree,
             return CUVS_STATUS_BUILD_FAILED;
         }
         out->route = CUVS_HNSW_ROUTE_ACE;
+        out->overflowed = (uint32_t)overflow_to_ace;
     }
     else out->route = tiny ? CUVS_HNSW_ROUTE_TINY : CUVS_HNSW_ROUTE_IVF_PQ;
     return CUVS_STATUS_OK;
+}
+
+/* Shared route preparation (UC-5: I5-j/I5-l moved into I3-C). Reproduces
+ * the wrapper's estimate preparation (degree clamps, scaled intermediate,
+ * training reserve) from (n, dim) alone and then calls the SAME resolver,
+ * so neither the pre-spool forecast nor the daemon's pre-mkdtemp decision
+ * can take a second auto -> ACE branch. n_lists only bounds the training
+ * population from below and the wrapper's n_lists never exceeds
+ * sample_rows/32 < sample_rows, so the training rows (hence the estimate)
+ * do not depend on the SDK default n_lists; test_hnsw_auto_overflow pins
+ * that. disk_need uses the requested graph_degree like the daemon check. */
+typedef struct CuvsHnswForecast {
+    uint32_t status;        /* CUVS_STATUS_* from the resolver or disk check */
+    uint32_t disk_ok;       /* 0 until cuvs_hnsw_forecast_disk() passes */
+    CuvsHnswRouteDecision decision;
+    uint64_t n, host_estimate, gpu_estimate, host_budget, gpu_budget;
+    uint64_t disk_need, disk_avail;
+} CuvsHnswForecast;
+
+static inline int
+cuvs_hnsw_forecast_route(uint64_t n, uint32_t dim, uint32_t graph_degree,
+    uint32_t intermediate_degree, uint32_t hierarchy, uint32_t algo,
+    uint32_t ef_construction, uint32_t overflow, uint64_t host, uint64_t gpu,
+    CuvsHnswForecast *out, char *error, size_t error_len)
+{
+    CuvsHnswCapacity cap;
+    uint32_t degree = graph_degree, intermediate;
+    memset(out, 0, sizeof(*out));
+    out->n = n; out->host_budget = host; out->gpu_budget = gpu;
+    out->status = CUVS_STATUS_BUILD_FAILED;
+    if (!n || !dim || ef_construction < 4 || ef_construction > 1000)
+    {
+        snprintf(error, error_len, "HNSW route decision needs positive row count, dimension and ef_construction");
+        return (int)out->status;
+    }
+    intermediate = cuvs_hnsw_scaled_quality(intermediate_degree, ef_construction, degree, 4096);
+    if (n < CUVS_HNSW_MIN_ELEMENTS)
+    {
+        degree = (uint32_t)(n & ~UINT64_C(1));
+        if (degree < 4) degree = 4;
+        intermediate = degree;
+    }
+    else
+    {
+        if (degree >= n) degree = (uint32_t)((n - 1) & ~UINT64_C(1));
+        if (intermediate >= n) intermediate = (uint32_t)(n - 1);
+    }
+    out->disk_need = cuvs_hnsw_disk_need(n, dim, graph_degree);
+    if (cuvs_hnsw_capacity(n, dim, degree, intermediate, hierarchy != 0, &cap))
+    {
+        snprintf(error, error_len, "invalid HNSW capacity/dimension/degree");
+        return (int)out->status;
+    }
+    if (n >= CUVS_HNSW_MIN_ELEMENTS)
+    {
+        uint64_t sample = cuvs_hnsw_sample_rows(n, dim, host, gpu);
+        uint64_t lists = sample / 32 ? sample / 32 : 1;
+        if (lists > UINT32_MAX) lists = UINT32_MAX;
+        if (cuvs_hnsw_training_reserve(&cap,
+                cuvs_hnsw_training_rows(n, sample, (uint32_t)lists), dim))
+        {
+            snprintf(error, error_len, "HNSW training estimate overflow");
+            return (int)out->status;
+        }
+    }
+    out->host_estimate = cap.host_peak;
+    out->gpu_estimate = cap.gpu_peak;
+    out->status = (uint32_t)cuvs_hnsw_resolve_route(n, dim, degree, intermediate,
+        algo, overflow, &cap, host, gpu, &out->decision, error, error_len);
+    return (int)out->status;
+}
+
+/* Disk precheck for a decided route. The pre-spool forecast calls it on the
+ * daemon's index directory so an insufficient disk fails BEFORE the backend
+ * spools (JI-21); the daemon repeats the same check on the private workdir. */
+static inline int
+cuvs_hnsw_forecast_disk(CuvsHnswForecast *f, int disk_regular,
+    uint64_t disk_avail, char *error, size_t error_len)
+{
+    f->disk_avail = disk_avail;
+    f->disk_ok = f->status == CUVS_STATUS_OK && disk_regular && disk_avail >= f->disk_need;
+    if (f->status == CUVS_STATUS_OK && !f->disk_ok)
+    {
+        snprintf(error, error_len, "HNSW needs regular disk capacity for input/reorder/graph/serialization: need=%llu avail=%llu fs=%s route=%s",
+                 (unsigned long long)f->disk_need, (unsigned long long)disk_avail,
+                 disk_regular ? "regular" : "tmpfs", cuvs_hnsw_route_name(f->decision.route));
+        f->status = CUVS_STATUS_BUILD_FAILED;
+    }
+    return (int)f->status;
 }
 
 #endif

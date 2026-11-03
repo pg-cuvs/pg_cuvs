@@ -18,6 +18,42 @@
 #define CUVS_HNSW_POLICY_VERSION 2u
 #define CUVS_HNSW_POLICY_LEGACY_VERSION 1u
 
+/* ADR-087 (UC-5, 2026-11-03): what build_algo=auto does when the resident
+ * IVF-PQ estimate exceeds the host/GPU budget. Daemon flag
+ * --hnsw-auto-overflow. ace = spill to ACE-disk with NOTICE + receipt;
+ * error = status 13 + ace hint (the I1 behaviour). Explicit ivf_pq/ace never
+ * read this value. Reverting the default is a one-line macro change. */
+#define CUVS_HNSW_OVERFLOW_ERROR 0u
+#define CUVS_HNSW_OVERFLOW_ACE 1u
+#ifndef CUVS_HNSW_AUTO_OVERFLOW_DEFAULT
+#define CUVS_HNSW_AUTO_OVERFLOW_DEFAULT CUVS_HNSW_OVERFLOW_ACE
+#endif
+
+/* CuvsHnswPolicy.route_flags (was the zero `reserved` word; layout unchanged).
+ * AUTO_OVERFLOW: auto exceeded the resident budget and spilled to ACE. It is
+ * set only by cuvs_hnsw_resolve_route's single overflow branch and is the
+ * only way an auto receipt may name route ACE.
+ * PRESPOOL: the backend forecast the route from reltuples/dim before the
+ * heap scan (PN-1). STATS_FALLBACK: no usable statistics, so the route was
+ * decided only after the scan. The two timing bits are mutually exclusive. */
+#define CUVS_HNSW_ROUTE_FLAG_AUTO_OVERFLOW 0x1u
+#define CUVS_HNSW_ROUTE_FLAG_PRESPOOL 0x2u
+#define CUVS_HNSW_ROUTE_FLAG_STATS_FALLBACK 0x4u
+#define CUVS_HNSW_ROUTE_FLAGS_KNOWN 0x7u
+
+static inline const char *cuvs_hnsw_overflow_name(uint32_t mode)
+{
+    return mode == CUVS_HNSW_OVERFLOW_ACE ? "ace"
+         : mode == CUVS_HNSW_OVERFLOW_ERROR ? "error" : "unsupported";
+}
+
+static inline uint32_t cuvs_hnsw_overflow_from_name(const char *name)
+{
+    if (name && !strcmp(name, "ace")) return CUVS_HNSW_OVERFLOW_ACE;
+    if (name && !strcmp(name, "error")) return CUVS_HNSW_OVERFLOW_ERROR;
+    return UINT32_MAX;
+}
+
 /* Stored after the unchanged pgvector metapage prefix and returned by op23.
  * All estimates are route selection inputs, not allocator/RSS upper bounds.
  * A receipt is published only after the native build returns successfully. */
@@ -28,7 +64,7 @@ typedef struct CuvsHnswPolicy {
     uint32_t n_lists, pq_dim, pq_bits, n_probes;
     uint32_t query_batch, guard_passed, hierarchy, dim;
     uint64_t n_rows;
-    uint32_t metric, reserved;
+    uint32_t metric, route_flags;
     uint64_t training_requested, training_actual;
     uint64_t host_estimate, gpu_estimate, host_budget, gpu_budget;
     uint64_t sdk_host_budget, sdk_gpu_budget;
@@ -91,8 +127,15 @@ static inline int cuvs_hnsw_policy_valid(const CuvsHnswPolicy *p)
         /* v2 records this pinned SDK's base/local builder, not upper-layer history. */
         && p->internal_builder == p->route
         && (p->route == CUVS_HNSW_ROUTE_ACE ? p->partitions > 0 : p->partitions == 0)
+        && !(p->route_flags & ~CUVS_HNSW_ROUTE_FLAGS_KNOWN)
+        && (p->route_flags & (CUVS_HNSW_ROUTE_FLAG_PRESPOOL | CUVS_HNSW_ROUTE_FLAG_STATS_FALLBACK))
+            != (CUVS_HNSW_ROUTE_FLAG_PRESPOOL | CUVS_HNSW_ROUTE_FLAG_STATS_FALLBACK)
+        /* auto may name ACE only through the recorded overflow branch. */
+        && (!!(p->route_flags & CUVS_HNSW_ROUTE_FLAG_AUTO_OVERFLOW)
+            == (p->requested_algo == CUVS_HNSW_ALGO_AUTO && p->route == CUVS_HNSW_ROUTE_ACE))
         && ((p->requested_algo == CUVS_HNSW_ALGO_AUTO
-                && (p->route == CUVS_HNSW_ROUTE_TINY || p->route == CUVS_HNSW_ROUTE_IVF_PQ))
+                && (p->route == CUVS_HNSW_ROUTE_TINY || p->route == CUVS_HNSW_ROUTE_IVF_PQ
+                    || p->route == CUVS_HNSW_ROUTE_ACE))
             || (p->requested_algo == CUVS_HNSW_ALGO_IVF_PQ && p->route == CUVS_HNSW_ROUTE_IVF_PQ)
             || (p->requested_algo == CUVS_HNSW_ALGO_ACE && p->route == CUVS_HNSW_ROUTE_ACE));
 }
