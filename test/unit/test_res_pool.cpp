@@ -8,12 +8,15 @@
 #include <cstdio>
 #include <string>
 #include <thread>
+#include <atomic>
 #include <vector>
 
 static unsigned checks;
 #define CHECK(x) do { assert(x); checks++; } while (0)
 
-static int live_streams, live_res, made_streams, made_res;
+// Atomic: the concurrency test constructs fakes on 8 threads (slots are
+// built outside the pool lock by design), so plain ints would race.
+static std::atomic<int> live_streams, live_res, made_streams, made_res;
 static std::vector<std::string> events;
 
 struct FakeStream {
@@ -35,7 +38,7 @@ struct FakeTraits {
 };
 using Pool = CuvsResPool<FakeTraits>;
 
-static void reset() { live_streams = live_res = made_streams = made_res = 0; events.clear(); }
+static void reset() { live_streams = 0; live_res = 0; made_streams = 0; made_res = 0; events.clear(); }
 
 static void test_default_on_owns_and_reuses()
 {
