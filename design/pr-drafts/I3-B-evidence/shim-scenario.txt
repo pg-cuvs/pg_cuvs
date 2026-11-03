@@ -19,6 +19,7 @@ PASS i1 resident again with hits >= 1
 PASS reload with only protected victims soft-evicts (reason=soft_evict)
 PASS soft-evicted index history says soft_evict
 PASS REINDEX self-replace logged
+PASS self-replace NOTICE and DETAIL exact (need 10240000, free 5734400)
 PASS self-replace eviction marked self_replace=1
 PASS receipt: last_build_self_replace=1, unloaded>0
 PASS no other index evicted by the build
@@ -60,6 +61,11 @@ PASS usage stats file written even with --reclaim-mode off
 PASS REINDEX keeps the pin (C7 7.2-N3)
 PASS reload during a pending build evicts a resident (build itself does not)
 PASS the delayed build still completes
+PASS IVF-PQ build that does not fit evicts nothing (BUILD_IVFPQ, scope none)
+PASS sharded build that does not fit evicts nothing (BUILD_SHARD)
+PASS post-admission build OOM evicts nothing (retry loop is BUILD_CAGRA)
+PASS build at the registry cap evicts nothing; saved, not resident
+PASS self-replace then build failure: failure NOTICE exact
 PASS SQL index_status names the resident index (public.i1)
 PASS SQL pin/unpin/unload
 PASS SQL unload of a pinned index raises 55006
@@ -78,24 +84,24 @@ PASS [reclaim] lines have the 13 ADR-086 fields in order
 evict-hit-cap = 7
 {"initial_mb":0,"maximum_percent":0,"devices":[],"build_evict_scope":"none","pin_max_pct":50,"reclaim_free_max_pct":50,"reclaim_free_window_min":30,"reclaim_floor_pct":10,"load_soft_evict":"on","reind
 --- [evict]/[reclaim] lines
-[evict] op=RECLAIM gpu=0 db=5 idx=16851 reason=reclaim requester_idx=0 idle_s=-1 protect_s=3600 hits=0 vram_bytes=10240000 saved_ms=0 mono_us=89760525183 self_replace=0
-[reclaim] op=headroom gpu=0 tick=3 resident_before=20480000 resident_after=10240000 hi_bytes=22282240 lo_bytes=19660800 evicted=1 skip_sidecar=0 trigger=headroom f_bytes=10240000 f_src=build:5:16853 mono_us=89760525235
-[evict] op=LOAD gpu=0 db=5 idx=16852 reason=reload requester_idx=16851 idle_s=-1 protect_s=3600 hits=0 vram_bytes=10240000 saved_ms=0 mono_us=89762860443 self_replace=0
-[evict] op=LOAD gpu=0 db=5 idx=16851 reason=soft_evict requester_idx=16852 idle_s=1 protect_s=3660 hits=2 vram_bytes=10240000 saved_ms=0 mono_us=89763470549 self_replace=0
-[evict] op=BUILD_CAGRA gpu=0 db=5 idx=16854 reason=admit_build requester_idx=16854 idle_s=1 protect_s=3630 hits=1 vram_bytes=10240000 saved_ms=0 mono_us=89763547638 self_replace=1
-[self_replace] db=5 idx=16854 unloaded=10240000 notice="pg_cuvs: previous resident copy of index 16854 unloaded from GPU to make room for the rebuild|GPU memory was insufficient for both copies (need 10240000, free 5734400). Queries on this index use the CPU path or reload the old copy until the new index is resident"
-[evict] op=MANUAL gpu=0 db=5 idx=16852 reason=manual_unload requester_idx=0 idle_s=0 protect_s=3630 hits=1 vram_bytes=10240000 saved_ms=0 mono_us=89763676905 self_replace=0
-[evict] op=MANUAL gpu=0 db=5 idx=16854 reason=manual_unload requester_idx=0 idle_s=-1 protect_s=3600 hits=0 vram_bytes=10240000 saved_ms=0 mono_us=89763725784 self_replace=0
-[evict] op=MANUAL gpu=0 db=5 idx=16852 reason=manual_unload requester_idx=0 idle_s=-1 protect_s=3600 hits=0 vram_bytes=10240000 saved_ms=0 mono_us=89763727099 self_replace=0
-[evict] op=MANUAL gpu=0 db=5 idx=16851 reason=manual_unload requester_idx=0 idle_s=-1 protect_s=3600 hits=0 vram_bytes=10245120 saved_ms=46 mono_us=89763816720 self_replace=0
-[evict] op=MANUAL gpu=0 db=5 idx=16851 reason=manual_unload requester_idx=0 idle_s=-1 protect_s=3600 hits=0 vram_bytes=10245120 saved_ms=0 mono_us=89763826747 self_replace=0
-[evict] op=RECLAIM gpu=0 db=5 idx=16854 reason=reclaim requester_idx=0 idle_s=-1 protect_s=3600 hits=0 vram_bytes=10240000 saved_ms=0 mono_us=89764625682 self_replace=0
-[reclaim] op=headroom gpu=0 tick=7 resident_before=20487680 resident_after=10247680 hi_bytes=22282240 lo_bytes=19660800 evicted=1 skip_sidecar=1 trigger=headroom f_bytes=13107200 f_src=fixed mono_us=89764625722
-[evict] op=MANUAL gpu=0 db=5 idx=16851 reason=manual_unload requester_idx=0 idle_s=-1 protect_s=3600 hits=0 vram_bytes=10247680 saved_ms=43 mono_us=89766920360 self_replace=0
-[evict] op=MANUAL gpu=0 db=5 idx=16851 reason=manual_unload requester_idx=0 idle_s=-1 protect_s=3600 hits=0 vram_bytes=10247680 saved_ms=0 mono_us=89777011455 self_replace=0
-[evict] op=MANUAL gpu=0 db=5 idx=16852 reason=manual_unload requester_idx=0 idle_s=-1 protect_s=3600 hits=0 vram_bytes=10240000 saved_ms=0 mono_us=89777013301 self_replace=0
-[evict] op=MANUAL gpu=0 db=5 idx=16854 reason=manual_unload requester_idx=0 idle_s=-1 protect_s=600 hits=0 vram_bytes=10240000 saved_ms=0 mono_us=89782538868 self_replace=0
-[evict] op=MANUAL gpu=0 db=5 idx=16851 reason=manual_unload requester_idx=0 idle_s=-1 protect_s=600 hits=0 vram_bytes=10247680 saved_ms=0 mono_us=89782541153 self_replace=0
-[evict] op=MANUAL gpu=0 db=5 idx=16854 reason=manual_unload requester_idx=0 idle_s=-1 protect_s=600 hits=0 vram_bytes=10240000 saved_ms=0 mono_us=89786676470 self_replace=0
-[evict] op=MANUAL gpu=0 db=5 idx=16851 reason=manual_unload requester_idx=0 idle_s=-1 protect_s=600 hits=0 vram_bytes=10247680 saved_ms=0 mono_us=89786679349 self_replace=0
+[evict] op=RECLAIM gpu=0 db=5 idx=16851 reason=reclaim requester_idx=0 idle_s=-1 protect_s=3600 hits=0 vram_bytes=10240000 saved_ms=0 mono_us=90720058945 self_replace=0
+[reclaim] op=headroom gpu=0 tick=3 resident_before=20480000 resident_after=10240000 hi_bytes=22282240 lo_bytes=19660800 evicted=1 skip_sidecar=0 trigger=headroom f_bytes=10240000 f_src=build:5:16853 mono_us=90720058987
+[evict] op=RECLAIM gpu=0 db=5 idx=16852 reason=reclaim requester_idx=0 idle_s=-1 protect_s=3600 hits=0 vram_bytes=10240000 saved_ms=0 mono_us=90723093474 self_replace=0
+[reclaim] op=headroom gpu=0 tick=6 resident_before=20480000 resident_after=10240000 hi_bytes=22282240 lo_bytes=19660800 evicted=1 skip_sidecar=0 trigger=headroom f_bytes=10240000 f_src=build:5:16853 mono_us=90723093488
+[evict] op=LOAD gpu=0 db=5 idx=16852 reason=reload requester_idx=16851 idle_s=-1 protect_s=3600 hits=0 vram_bytes=10240000 saved_ms=0 mono_us=90723505269 self_replace=0
+[evict] op=LOAD gpu=0 db=5 idx=16851 reason=soft_evict requester_idx=16852 idle_s=0 protect_s=3660 hits=2 vram_bytes=10240000 saved_ms=0 mono_us=90723908621 self_replace=0
+[evict] op=BUILD_CAGRA gpu=0 db=5 idx=16854 reason=admit_build requester_idx=16854 idle_s=0 protect_s=3630 hits=1 vram_bytes=10240000 saved_ms=0 mono_us=90723957586 self_replace=1
+[self_replace] db=5 idx=16854 unloaded=10240000 notice="pg_cuvs: previous resident copy of index 16854 unloaded from GPU to make room for the rebuild" detail="GPU memory was insufficient for both copies (need 10240000 bytes, free 5734400 bytes). Queries on this index use the CPU path or reload the old copy until the new index is resident"
+[evict] op=MANUAL gpu=0 db=5 idx=16852 reason=manual_unload requester_idx=0 idle_s=0 protect_s=3630 hits=1 vram_bytes=10240000 saved_ms=0 mono_us=90724032248 self_replace=0
+[evict] op=MANUAL gpu=0 db=5 idx=16854 reason=manual_unload requester_idx=0 idle_s=-1 protect_s=3600 hits=0 vram_bytes=10240000 saved_ms=0 mono_us=90724052302 self_replace=0
+[evict] op=MANUAL gpu=0 db=5 idx=16852 reason=manual_unload requester_idx=0 idle_s=-1 protect_s=3600 hits=0 vram_bytes=10240000 saved_ms=0 mono_us=90724053356 self_replace=0
+[evict] op=MANUAL gpu=0 db=5 idx=16851 reason=manual_unload requester_idx=0 idle_s=-1 protect_s=3600 hits=0 vram_bytes=10245120 saved_ms=19 mono_us=90724099331 self_replace=0
+[evict] op=MANUAL gpu=0 db=5 idx=16851 reason=manual_unload requester_idx=0 idle_s=-1 protect_s=3600 hits=0 vram_bytes=10245120 saved_ms=0 mono_us=90724107064 self_replace=0
+[evict] op=RECLAIM gpu=0 db=5 idx=16854 reason=reclaim requester_idx=0 idle_s=-1 protect_s=3600 hits=0 vram_bytes=10240000 saved_ms=0 mono_us=90725108731 self_replace=0
+[reclaim] op=headroom gpu=0 tick=8 resident_before=20487680 resident_after=10247680 hi_bytes=22282240 lo_bytes=19660800 evicted=1 skip_sidecar=1 trigger=headroom f_bytes=13107200 f_src=fixed mono_us=90725109079
+[evict] op=MANUAL gpu=0 db=5 idx=16851 reason=manual_unload requester_idx=0 idle_s=-1 protect_s=3600 hits=0 vram_bytes=10247680 saved_ms=53 mono_us=90727246131 self_replace=0
+[evict] op=MANUAL gpu=0 db=5 idx=16851 reason=manual_unload requester_idx=0 idle_s=-1 protect_s=3600 hits=0 vram_bytes=10247680 saved_ms=0 mono_us=90737378533 self_replace=0
+[evict] op=MANUAL gpu=0 db=5 idx=16852 reason=manual_unload requester_idx=0 idle_s=-1 protect_s=3600 hits=0 vram_bytes=10240000 saved_ms=0 mono_us=90737381400 self_replace=0
+[evict] op=MANUAL gpu=0 db=5 idx=16851 reason=manual_unload requester_idx=0 idle_s=-1 protect_s=600 hits=0 vram_bytes=10247680 saved_ms=0 mono_us=90742866950 self_replace=0
+[evict] op=MANUAL gpu=0 db=5 idx=16854 reason=manual_unload requester_idx=0 idle_s=-1 protect_s=600 hits=0 vram_bytes=10240000 saved_ms=0 mono_us=90742869117 self_replace=0
 FAILS=0
