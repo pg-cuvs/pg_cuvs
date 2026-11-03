@@ -1005,11 +1005,13 @@ cuvs_rmm_pool_status_show(void)
         const CuvsRmmPoolStats *dev = &status.devices[i];
         appendStringInfo(&json,
                          "%s{\"device_id\":%u,\"maximum_bytes\":%llu,"
-                         "\"reserved_bytes\":%llu,\"used_bytes\":%llu}",
+                         "\"reserved_bytes\":%llu,\"used_bytes\":%llu,"
+                         "\"peak_bytes\":%llu,\"solo\":%u}",   /* I3-B append */
                          i ? "," : "", dev->device_id,
                          (unsigned long long)dev->maximum_bytes,
                          (unsigned long long)dev->reserved_bytes,
-                         (unsigned long long)dev->used_bytes);
+                         (unsigned long long)dev->used_bytes,
+                         (unsigned long long)dev->peak_bytes, dev->solo);
     }
     /* v2 (I3): keys appended after "devices", I3-A first (append-only). */
     appendStringInfo(&json, "],\"version\":%u,\"scratch_permille\":%u}",

@@ -594,6 +594,7 @@ next reclaim tick). SIGHUP re-reading of these values is **not implemented**:
 | `--load-soft-evict` | `on` / `off` | `on` | restart | `off`: a reload that cold indexes cannot cover is refused instead of evicting protected ones |
 | `--reindex-self-replace` | `on` / `off` | `on` | restart | `off`: REINDEX never unloads the old copy (§ 8.5) |
 | `--usage-stats-file` | `on` / `off` | `on` | restart | `off`: no usage stats file; startup loads in OID order |
+| `--rmm-peak-meter` | `on` / `off` | `on` | restart | Lock-free RMM pool peak (`peak_bytes` in memory status and in `SHOW cuvs.rmm_pool_status` devices, with `solo` = at most one build in flight). `off` (diagnostics) stops updating the peak; live bytes are still counted |
 
 `budget_eff` is `min(--max-vram-mb budget, RMM pool quota)` per GPU. Out-of-range,
 empty, negative or contradictory values (`--reclaim-low-pct` above

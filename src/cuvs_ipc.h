@@ -406,6 +406,13 @@ typedef struct CuvsRmmPoolStats {
     uint64_t maximum_bytes;
     uint64_t reserved_bytes;
     uint64_t used_bytes;
+    /* I3-B (append-only, ADR-086 decision 9): lock-free pool peak since the
+     * last reset, and solo = 1 when at most one build was in flight on the
+     * GPU at reporting time (a peak shared by concurrent builds is not one
+     * build's peak). Filled by the daemon. */
+    uint64_t peak_bytes;
+    uint32_t solo;
+    uint32_t pad_i3b;
 } CuvsRmmPoolStats;
 
 /* 2 (I3): + scratch_permille. Fields are append-only, I3-A first, then
