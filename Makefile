@@ -320,6 +320,13 @@ test-admission-wire: test/unit/test_admission_wire.c src/cuvs_admission_contract
 		src/cuvs_util.c $(TEST_RT_LIB)
 	./$@
 
+# GPU-only (real CUDA build, not the shim): I3-A wrapper checks (dim%4 padded
+# single dataset copy, attach, self-queries). Run after `make all server`.
+test-gpu-wrapper-i3: test/gpu/test_wrapper_i3.c src/cuvs_wrapper.o src/cuvs_util_server.o
+	$(CC) -std=gnu11 -Wall -Wextra -I src -c test/gpu/test_wrapper_i3.c -o $@.o
+	$(CXX) -o $@ $@.o src/cuvs_wrapper.o src/cuvs_util_server.o $(SHLIB_LINK) -lpthread -lm
+	./$@
+
 # The build-OOM flag is per thread (CPU shim mirrors the GPU wrapper).
 test-build-oom-thread: test/unit/test_build_oom_thread.c src/cuvs_wrapper_shim_cpu.c src/cuvs_wrapper.h
 	$(CC) -std=gnu11 -Wall -Wextra -Werror -I src -o $@ test/unit/test_build_oom_thread.c \
@@ -372,7 +379,7 @@ EXTRA_CLEAN += test-hnsw-build test-hnsw-build-ipc test-hnsw-converter test-hnsw
                test-admission-wire test-admission-message test-admission-ipc test-build-oom-thread
 .PHONY: test-hnsw-build test-hnsw-build-ipc test-hnsw-converter test-hnsw-admission test-hnsw-explicit-route test-hnsw-policy \
         test-admission-contract test-admission-contract-mutations test-admission-wire \
-        test-admission-message test-admission-ipc test-build-oom-thread
+        test-admission-message test-admission-ipc test-build-oom-thread test-gpu-wrapper-i3
 
 # ---- Documentation contract check ---------------------------------------
 # CPU-only drift detector for the current version/defaults and release-facing
