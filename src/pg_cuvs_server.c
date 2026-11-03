@@ -3002,6 +3002,20 @@ admit_build_cagra(size_t needed, int device_id, uint32_t db_oid,
     return ensure_vram(needed, device_id, CUVS_RQ_BUILD_CAGRA, NULL);
 }
 
+/* UC-1 2a: a build that fails after its old copy was unloaded says so and
+ * that the next query reloads the old copy (notice_out text; logged until
+ * I3-A's notice_out carries it). */
+static void
+note_self_replace_failure(uint32_t index_oid, uint64_t self_unloaded)
+{
+    if (self_unloaded == 0)
+        return;
+    snprintf(g_build_notice, sizeof(g_build_notice),
+             "pg_cuvs: rebuild of index %u failed after its previous resident copy was "
+             "unloaded from GPU|The next query on this index reloads the old copy", index_oid);
+    LOG_INFO("[self_replace] idx=%u build_failed=1 notice=\"%s\"\n", index_oid, g_build_notice);
+}
+
 /* Record a BUILD_* verdict for the reclaim free target F (fences F-1, F-3)
  * and the last-build receipt fields. Caller holds g_index_mutex. */
 static void
@@ -6347,6 +6361,7 @@ handle_build(int client_fd, const CuvsCmdFrame *cmd)
     if (!new_handle)
     {
         LOG_ERROR("[handle_build] cuvs_cagra_build returned NULL\n");
+        note_self_replace_failure(cmd->index_oid, self_unloaded);
         /* #82: the build-OOM injection is daemon-global and outlives the test
          * that armed it — a test that arms N failures then aborts under
          * ON_ERROR_STOP never reaches its disarm call, and the leftover arm
@@ -7034,6 +7049,7 @@ handle_build_multi(int client_fd, const CuvsCmdFrame *cmd, const char *index_dir
         }
         if (!new_handle)
         {
+            note_self_replace_failure(cmd->index_oid, self_unloaded);
             cuvs_set_inject_build_oom(0);   /* #82: see handle_build */
             pthread_mutex_unlock(&g_index_mutex);
             status = CUVS_STATUS_BUILD_FAILED;
