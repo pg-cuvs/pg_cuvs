@@ -268,6 +268,10 @@ daemon-only ones have no session equivalent.
 | `--max-indexes N` | — (daemon-only) | `1024` | **Soft** LRU working-set cap (ADR-068), not a hard wall (was 64). At the cap, a reload or `pg_cuvs_load` frees a slot under the § 8 rules (cold first, then soft eviction; reason `slot`); a build over the cap does not evict (with the default `--build-evict-scope none`): its files are saved and the first query reloads it |
 | `--build-evict-scope …` and the other cache flags | — (daemon-only) | see § 8 | Cache, eviction and reclaim knobs (§ 8.2) |
 | `--hnsw-auto-overflow ace\|error` | `hnsw_auto_overflow` in `cuvs.rmm_pool_status` (read-only) | `ace` | What `pg_cuvs_hnsw` `build_algo=auto` does over the resident budget: `ace` spills to ACE-disk with a NOTICE, `error` refuses with SQLSTATE 54000. Startup-only; logged at startup. Explicit `ivf_pq`/`ace` ignore it |
+| `--cagra-build-overflow error\|managed` | — (daemon-only, restart) | `managed` | Where a CAGRA build's large_workspace lives (ADR-088). `managed`: a build-only managed-memory resource outside the RMM pool and quota that can spill to host RAM (slower, see below). `error`: inside the pool, as before. Applies to `cagra` single and parallel (multi-partial) builds only; sharded builds, startup warmup and `pg_cuvs_hnsw` always use `error` |
+| `--managed-overcommit on\|off` | — (daemon-only, restart) | `on` | Policy `managed` only. `off`: refuse (SQLSTATE 53400, reason AR6) a build whose large_workspace estimate would not fit in physical GPU free memory. `on`: allow spill up to the host memory guard, refuse beyond it (53200, AR7) |
+| `--managed-lw-margin-permille N` | — (daemon-only, restart) | see `SHOW cuvs.rmm_pool_status` (`lw_margin_permille`) | Policy `managed` only. Safety factor on the large_workspace estimate `L_shape`. Range 1000–100000; out of range refuses startup |
+| `--oom-score-adj N` | — (daemon-only, restart) | `500` | Written once to `/proc/self/oom_score_adj` at startup so the kernel OOM killer prefers the daemon over PostgreSQL under host RAM pressure. Range 0–1000; `0` leaves the file untouched; a higher current value is kept (never lowered); a write failure is logged, not fatal |
 | `--gpu-devices LIST` | — (daemon-only) | all visible | CUDA devices the daemon uses (else honors `CUDA_VISIBLE_DEVICES`) |
 | `--snapshot-uri URI` | `cuvs.snapshot_uri` | `` | GCS snapshot root |
 | `--cluster-id ID` | `cuvs.cluster_id` | `` | Cluster id in the GCS artifact path |
@@ -315,6 +319,50 @@ reports initial/percentage zero and an empty device array. An absent or incompat
 daemon reports `unavailable`, not a fabricated zero. These are read-only settings;
 changing them with SQL SET cannot replace a live allocator. See ADR-085 for the
 measured default rule and its single-GPU scope.
+
+### Managed large_workspace for CAGRA builds (ADR-088)
+
+Under `--cagra-build-overflow managed` (default) a `cagra` build's large_workspace
+comes from a build-only CUDA managed-memory resource that is installed after the
+build borrows its resources and restored before they return to the pool, on every
+exit path. It is outside the RMM pool, the quota and the logical budget, so
+`SHOW cuvs.rmm_pool_status` pool usage and `nvidia-smi` can disagree during such a
+build. If GPU memory runs short the large_workspace pages move to host RAM: the
+build gets slower (not measured) and the requester receives:
+
+```
+NOTICE:  pg_cuvs: build used managed memory spill (large_workspace peak <MiB>, physical free <MiB>); the build may be slower than usual
+```
+
+Only the large_workspace part can spill. The in-pool part of the build is still
+admitted against the pool and can still fail with an out-of-memory error after
+admission. Before a managed build starts, the daemon estimates
+`lw_ub = ceil(L_shape × lw_margin_permille / 1000)` with
+`L_shape = max(4·n·ld + 4·n·igd, n·(5·igd + 4))` bytes (`ld` = dim rounded up to a
+multiple of 4, `igd` = intermediate_graph_degree) and refuses the build when
+`max(0, N_m − (reserved − used)) + lw_ub + lw_pending` exceeds physical free GPU
+memory (overcommit `off`: AR6, 53400) or exceeds it by more than the host guard
+`min(MemAvailable/2, cgroup remaining/2)` (overcommit `on`: AR7, 53200; an
+unreadable cgroup or cgroup v1 gives a guard of 0). `lw_pending` is the sum of
+`lw_ub` over managed builds already admitted on the same GPU. The estimate is not
+an upper bound.
+
+Status keys appended to `SHOW cuvs.rmm_pool_status`: `cagra_build_overflow`,
+`managed_overcommit`, `lw_margin_permille`, `oom_score_adj`,
+`oom_score_adj_effective` (-1 when not read), `oom_score_adj_result` (the startup
+line), and `managed_lw`, an array of `device_id`, `lw_pending_bytes`,
+`managed_spill_builds`, `managed_spill_bytes_max`. The daemon logs one
+`[managed_lw]` line per cagra build (`policy`, `lw_ub`, `lw_peak`, `spill`,
+`free_at_peak`, `lw_pending_after`, `applied`, `restored`, `live_end`).
+
+**Host protection.** Spill uses host RAM, so the host OOM killer can still end the
+daemon; the guard and the settings below lower that risk but do not remove it, and
+their effect depends on kernel settings. In the daemon's systemd unit, raise
+`OOMScoreAdjust=` (for example `500`, matching `--oom-score-adj`) so the kernel
+kills the daemon before PostgreSQL, and set `MemoryMax=` to bound the daemon's host
+memory. The startup log line reports `oom_score_adj=<n> applied`,
+`oom_score_adj kept current <n>`, or `oom_score_adj not applied: <reason>`
+(`value 0`, `permission denied`, `not Linux`).
 
 ---
 

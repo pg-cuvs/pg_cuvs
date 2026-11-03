@@ -24,6 +24,7 @@
 #include "utils/memutils.h"
 #include "utils/timestamp.h"
 #include "utils/tuplestore.h"
+#include "utils/json.h"          /* escape_json: I4 pool status text */
 #include "access/amapi.h"
 #include "access/heapam.h"
 #include "access/tableam.h"
@@ -1022,6 +1023,30 @@ cuvs_rmm_pool_status_show(void)
     json.data[--json.len] = '\0';
     appendStringInfo(&json, ",\"hnsw_auto_overflow\":\"%s\"}",
                      cuvs_hnsw_overflow_name(status.hnsw_auto_overflow));
+    json.data[--json.len] = '\0';
+    /* I4 keys (append-only): KB-4/5/6/24 effective values and C8 counters. */
+    appendStringInfo(&json, ",\"cagra_build_overflow\":\"%s\",\"managed_overcommit\":\"%s\","
+                     "\"lw_margin_permille\":%u,\"oom_score_adj\":%d,"
+                     "\"oom_score_adj_effective\":%d,\"oom_score_adj_result\":",
+                     status.cagra_build_overflow == 1 ? "managed" : "error",
+                     status.managed_overcommit ? "on" : "off",
+                     status.lw_margin_permille, status.oom_score_adj,
+                     status.oom_score_adj_effective);
+    status.oom_score_adj_result[sizeof(status.oom_score_adj_result) - 1] = '\0';
+    escape_json(&json, status.oom_score_adj_result);
+    appendStringInfoString(&json, ",\"managed_lw\":[");
+    for (uint32_t i = 0; i < status.lw_n_devices; i++)
+    {
+        const CuvsLwDeviceStatus *d = &status.lw_devices[i];
+        appendStringInfo(&json,
+                         "%s{\"device_id\":%u,\"lw_pending_bytes\":%llu,"
+                         "\"managed_spill_builds\":%llu,\"managed_spill_bytes_max\":%llu}",
+                         i ? "," : "", d->device_id,
+                         (unsigned long long)d->lw_pending_bytes,
+                         (unsigned long long)d->managed_spill_builds,
+                         (unsigned long long)d->managed_spill_bytes_max);
+    }
+    appendStringInfoString(&json, "]}");
     return json.data;
 }
 
