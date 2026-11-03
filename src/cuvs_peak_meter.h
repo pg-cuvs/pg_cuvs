@@ -19,6 +19,12 @@ extern "C" {
 
 void   cuvs_peak_meter_set_enabled(int on);
 int    cuvs_peak_meter_enabled(void);
+/* Two-step use by the RMM adaptor: reserve adds to live before the upstream
+ * allocation and returns the live level; commit raises the peak to that level
+ * only after the allocation succeeded (a failed allocation is freed and never
+ * reaches the peak). alloc = reserve + commit, for callers that cannot fail. */
+size_t cuvs_peak_meter_reserve(int dev, size_t bytes);
+void   cuvs_peak_meter_commit(int dev, size_t level);
 /* Returns the live bytes right after this allocation (0 for a bad dev). */
 size_t cuvs_peak_meter_alloc(int dev, size_t bytes);
 void   cuvs_peak_meter_free(int dev, size_t bytes);

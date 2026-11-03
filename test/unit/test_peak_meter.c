@@ -111,6 +111,17 @@ main(void)
     cuvs_peak_meter_alloc(3, 500);
     CHECK(cuvs_peak_meter_peak(3) == 1500, "window restarts (%zu)", cuvs_peak_meter_peak(3));
 
+    /* (3b) reserve without commit (the allocation failed) never reaches the
+     * peak once its bytes are given back. */
+    size_t before = cuvs_peak_meter_peak(5);
+    size_t lvl = cuvs_peak_meter_reserve(5, 1u << 30);
+    cuvs_peak_meter_free(5, 1u << 30);
+    CHECK(lvl == (1u << 30) && cuvs_peak_meter_peak(5) == before && cuvs_peak_meter_live(5) == 0,
+          "failed allocation leaves the peak (%zu) and live (%zu)", cuvs_peak_meter_peak(5),
+          cuvs_peak_meter_live(5));
+    cuvs_peak_meter_commit(5, cuvs_peak_meter_reserve(5, 64));
+    CHECK(cuvs_peak_meter_peak(5) == 64, "committed allocation reaches the peak");
+
     /* (4) off: live kept, peak not updated */
     cuvs_peak_meter_set_enabled(0);
     CHECK(!cuvs_peak_meter_enabled(), "off");

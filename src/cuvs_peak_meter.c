@@ -26,21 +26,33 @@ cuvs_peak_meter_enabled(void)
 }
 
 size_t
-cuvs_peak_meter_alloc(int dev, size_t bytes)
+cuvs_peak_meter_reserve(int dev, size_t bytes)
 {
-    size_t now, prev;
-
     if (!ok(dev))
         return 0;
-    now = atomic_fetch_add_explicit(&g_live[dev], bytes, memory_order_relaxed) + bytes;
-    if (!atomic_load_explicit(&g_enabled, memory_order_relaxed))
-        return now;
+    return atomic_fetch_add_explicit(&g_live[dev], bytes, memory_order_relaxed) + bytes;
+}
+
+void
+cuvs_peak_meter_commit(int dev, size_t level)
+{
+    size_t prev;
+
+    if (!ok(dev) || !atomic_load_explicit(&g_enabled, memory_order_relaxed))
+        return;
     prev = atomic_load_explicit(&g_peak[dev], memory_order_relaxed);
-    while (now > prev &&
-           !atomic_compare_exchange_weak_explicit(&g_peak[dev], &prev, now,
+    while (level > prev &&
+           !atomic_compare_exchange_weak_explicit(&g_peak[dev], &prev, level,
                                                   memory_order_relaxed,
                                                   memory_order_relaxed))
         ;
+}
+
+size_t
+cuvs_peak_meter_alloc(int dev, size_t bytes)
+{
+    size_t now = cuvs_peak_meter_reserve(dev, bytes);
+    cuvs_peak_meter_commit(dev, now);
     return now;
 }
 

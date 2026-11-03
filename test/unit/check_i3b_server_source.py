@@ -12,6 +12,7 @@ one place and the SIGTERM save path never reads it.
 
     python3 test/unit/check_i3b_server_source.py [path/to/pg_cuvs_server.c]
 """
+import os
 import re
 import sys
 
@@ -179,6 +180,18 @@ for name in ("graceful_shutdown",):
         fail(f"CK-37 (a): {name} reads file_current (SIGTERM must always save)")
 if "graceful_shutdown" not in funcs:
     fail("CK-37 (a): SIGTERM save function not found (scan out of date)")
+
+# r5: the RMM adaptor raises the peak only after the upstream allocation
+# succeeded (a failed allocation must not leave a peak).
+wpath = os.path.join(os.path.dirname(os.path.abspath(path)), "cuvs_wrapper.cu")
+if os.path.exists(wpath):
+    w = open(wpath).read()
+    da = w[w.find("do_allocate("):w.find("do_deallocate(")]
+    ia, ic = da.find("upstream_.allocate("), da.find("cuvs_peak_meter_commit(")
+    if "cuvs_peak_meter_alloc(" in da or ia < 0 or ic < 0 or ic < ia:
+        fail("peak meter: do_allocate updates the peak before the upstream allocation succeeds")
+else:
+    fail("peak meter: cuvs_wrapper.cu not found next to the server source")
 
 print(f"check_i3b_server_source: {'OK' if not fails else str(len(fails)) + ' failure(s)'}")
 sys.exit(1 if fails else 0)
