@@ -222,11 +222,12 @@ for fn, cols_macro, kinds_macro, lead in (
 
 # Coordination rule: the I3-B block is identical in the install and upgrade
 # scripts (upgrade_path compares the two catalogs).
-def _block(path):
-    t = open(path).read()
+def _block(rel):
+    t = read(rel)
     a, b = t.find("-- I3-B begin"), t.find("-- I3-B end")
     return t[a:b] if a >= 0 and b > a else None
-_inst = _block("sql/pg_cuvs--0.9.0.sql") if os.path.exists("sql/pg_cuvs--0.9.0.sql") else None
+_inst = _block("sql/pg_cuvs--0.9.0.sql") \
+    if os.path.exists(os.path.join(ROOT, "sql/pg_cuvs--0.9.0.sql")) else None
 check(_inst is not None and _inst == _block("sql/pg_cuvs--0.8.2--0.9.0.sql"),
       "I3-B block differs between pg_cuvs--0.9.0.sql and pg_cuvs--0.8.2--0.9.0.sql")
 
