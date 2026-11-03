@@ -45,6 +45,16 @@ MUTATIONS = {
         '(void)prune_term; return sort_term;')], {'policy'}),
     'lw_ub_floor_not_ceil': (POLICY, [(
         'return scaled / 1000u + (scaled % 1000u != 0);', 'return scaled / 1000u;')], {'policy'}),
+    # review C-5 / CK-11 (l): LW-8 margin rule
+    'margin_rule_no_lower_bound': (POLICY, [(
+        '    unsigned __int128 best = CUVS_MANAGED_LW_MARGIN_PERMILLE_MIN;',
+        '    unsigned __int128 best = 0;')], {'policy'}),
+    'margin_rule_floor_not_ceil': (POLICY, [(
+        'q = ((unsigned __int128)lw_peak[i] * 1100u + shape[i] - 1) / shape[i];',
+        'q = ((unsigned __int128)lw_peak[i] * 1100u) / shape[i];')], {'policy'}),
+    'margin_rule_no_safety_factor': (POLICY, [(
+        'q = ((unsigned __int128)lw_peak[i] * 1100u + shape[i] - 1) / shape[i];',
+        'q = ((unsigned __int128)lw_peak[i] * 1000u + shape[i] - 1) / shape[i];')], {'policy'}),
     'lw_checked_grid_widened': (POLICY, [(
         'g >= 128 && g <= 256;', 'g >= 64 && g <= 256;')], {'policy'}),
     'margin_range_removed': (POLICY, [(

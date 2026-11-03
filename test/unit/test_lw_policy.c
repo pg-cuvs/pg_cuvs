@@ -260,6 +260,31 @@ test_shape_class(void)
     CHECK(!cuvs_lw_shape_checked(1000, 1536, 128));
 }
 
+/* CK-11 (l): the LW-8 margin rule on synthetic points. */
+static void
+test_margin_from_lw8(void)
+{
+    uint64_t p1[] = {1000}, s1[] = {1000};
+    uint64_t p2[] = {500}, s2[] = {1000};
+    uint64_t p3[] = {10}, s3[] = {11};
+    uint64_t p4[] = {11364}, s4[] = {10000};
+    uint64_t p5[] = {1, 12}, s5[] = {3, 10};
+    uint64_t p6[] = {1001}, s6[] = {1000};
+    uint64_t p7[] = {UINT64_MAX}, s7[] = {1};
+    uint64_t p8[] = {1000, 1000}, s8[] = {1000, 0};
+    CHECK(cuvs_lw_margin_from_lw8(p1, s1, 1) == 1100);
+    CHECK(cuvs_lw_margin_from_lw8(p2, s2, 1) == 1000);   /* 550 -> lower bound */
+    CHECK(cuvs_lw_margin_from_lw8(p3, s3, 1) == 1000);   /* exactly 1000 */
+    CHECK(cuvs_lw_margin_from_lw8(p4, s4, 1) == 1251);   /* 1250.04 -> ceil */
+    CHECK(cuvs_lw_margin_from_lw8(p5, s5, 2) == 1320);   /* max over points */
+    CHECK(cuvs_lw_margin_from_lw8(p6, s6, 1) == 1102);   /* 1101.1 -> ceil */
+    CHECK(cuvs_lw_margin_from_lw8(p7, s7, 1) == UINT32_MAX);
+    CHECK(cuvs_lw_margin_from_lw8(p8, s8, 2) == 0);      /* zero L_shape invalid */
+    CHECK(cuvs_lw_margin_from_lw8(p1, s1, 0) == 0);
+    /* The provisional default is a value this rule can produce (>= bound). */
+    CHECK(CUVS_MANAGED_LW_MARGIN_PERMILLE_DEFAULT >= cuvs_lw_margin_from_lw8(p3, s3, 1));
+}
+
 /* The shared I3-A hook delegates to the same rule (cuvs_util.c). */
 static void
 test_hook(void)
@@ -285,6 +310,7 @@ main(void)
 {
     test_hook();
     test_shape_class();
+    test_margin_from_lw8();
     test_shape_and_ub();
     test_admission_boundaries();
     test_parsers();
@@ -297,6 +323,7 @@ main(void)
         return 1;
     }
     printf("PASS lw policy: L_shape/lw_ub table, AR6/AR7 boundaries, lw_pending term, "
-           "knob parsers, oom_score_adj never-lower, spill NOTICE, AR6/AR7 err_out fields\n");
+           "knob parsers, oom_score_adj never-lower, spill NOTICE, AR6/AR7 err_out fields, "
+           "LW-8 margin rule\n");
     return 0;
 }
