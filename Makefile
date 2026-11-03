@@ -261,7 +261,7 @@ install-server-test: server-test
 TEST_RT_LIB := $(shell [ "$$(uname -s)" = "Linux" ] && echo -lrt)
 test-unit: test/unit/test_cuvs_util.c src/cuvs_util.c src/cuvs_util.h src/cuvs_ipc.h \
            test/unit/test_build_corpus.c src/cuvs_build_corpus.c src/cuvs_build_corpus.h \
-           test-hnsw-build test-hnsw-build-ipc test-hnsw-admission
+           test-hnsw-build test-hnsw-build-ipc test-hnsw-admission test-admission-contract
 	$(CC) -I src -DCUVS_TEST_HOOKS -o test-unit test/unit/test_cuvs_util.c src/cuvs_util.c $(TEST_RT_LIB)
 	./test-unit
 	$(CC) -I src -o test-build-corpus test/unit/test_build_corpus.c src/cuvs_build_corpus.c $(TEST_RT_LIB)
@@ -293,6 +293,24 @@ test-hnsw-admission: test/unit/test_hnsw_admission.c src/cuvs_hnsw_build_common.
 	$(CC) -std=gnu11 -Wall -Wextra -I src -o $@ test/unit/test_hnsw_admission.c -lpthread
 	./$@
 
+# I3 shared admission contract: the estimate and the I4 hook, built as C11 and
+# as C++17 (the header is also included by the C++/CUDA wrapper).
+test-admission-contract: test/unit/test_admission_contract.c src/cuvs_admission_contract.h \
+                         src/cuvs_util.c src/cuvs_util.h src/cuvs_ipc.h
+	$(CC) -std=c11 -Wall -Wextra -Werror -I src -o $@ test/unit/test_admission_contract.c \
+		src/cuvs_util.c $(TEST_RT_LIB)
+	./$@
+	$(CC) -I src -c src/cuvs_util.c -o $@-util.o
+	$(CXX) -std=c++17 -Wall -Wextra -Werror -I src -o $@-cxx -x c++ \
+		test/unit/test_admission_contract.c -x none $@-util.o $(TEST_RT_LIB)
+	./$@-cxx
+
+# Each mutation of the real header/definition must turn the test RED.
+# ADMISSION_MUTATION_OUT must be a new directory.
+ADMISSION_MUTATION_OUT ?= admission-contract-mutations
+test-admission-contract-mutations: test/unit/test_admission_contract_mutations.py test-admission-contract
+	python3 -I test/unit/test_admission_contract_mutations.py $(ADMISSION_MUTATION_OUT)
+
 # Converter fixtures include private PG page helpers, with backend stubs and
 # section garbage collection. Requires server headers, but no running backend.
 ifeq ($(shell uname -s),Darwin)
@@ -311,8 +329,10 @@ test-hnsw-converter: test/unit/test_hnsw_converter.c src/hnsw_export.c \
 		$(HNSW_CONVERTER_UNIT_LINK) $(TEST_RT_LIB)
 	./$@
 
-EXTRA_CLEAN += test-hnsw-build test-hnsw-build-ipc test-hnsw-converter test-hnsw-admission test-hnsw-explicit-route test-hnsw-policy
-.PHONY: test-hnsw-build test-hnsw-build-ipc test-hnsw-converter test-hnsw-admission test-hnsw-explicit-route test-hnsw-policy
+EXTRA_CLEAN += test-hnsw-build test-hnsw-build-ipc test-hnsw-converter test-hnsw-admission test-hnsw-explicit-route test-hnsw-policy \
+               test-admission-contract test-admission-contract-cxx test-admission-contract-util.o
+.PHONY: test-hnsw-build test-hnsw-build-ipc test-hnsw-converter test-hnsw-admission test-hnsw-explicit-route test-hnsw-policy \
+        test-admission-contract test-admission-contract-mutations
 
 # ---- Documentation contract check ---------------------------------------
 # CPU-only drift detector for the current version/defaults and release-facing
