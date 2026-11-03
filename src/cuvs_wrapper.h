@@ -436,11 +436,15 @@ int cuvs_free_vram(int device_id);
  * When armed, the next extend call throws bad_alloc and self-clears the flag. */
 void cuvs_set_inject_extend_oom(int enable);
 
-/* ADR-070 Bug #3: was the most recent cuvs_cagra_build[_multi] failure (NULL
- * return) caused by an out-of-memory condition? Returns 1 and clears the flag,
- * so the daemon can distinguish a VRAM OOM (retry after eviction is worthwhile)
- * from a non-OOM build failure. */
+/* Was the most recent cuvs_cagra_build[_multi] failure (NULL return) on this
+ * thread caused by an out-of-memory condition? Returns 1 and clears the flag,
+ * so the daemon can report an after-admission OOM (ADR-086: no eviction, no
+ * retry) apart from a non-OOM build failure. */
 int cuvs_last_build_was_oom(void);
+/* I3 (C5 ATT): 1 if the last cuvs_cagra_build[_multi] on this thread failed
+ * because the built index did not hold all n rows of its dataset (cuVS only
+ * warns and returns a graph-only index). Read and clear, per thread. */
+int cuvs_last_build_attach_failed(void);
 
 /* test: arm synthetic build OOM — the next n_fail cuvs_cagra_build[_multi] calls
  * fail with OOM (each decrements the counter), then builds succeed. Lets a Tier-1
