@@ -32,6 +32,8 @@
 #include <rmm/aligned.hpp>
 #include <rmm/resource_ref.hpp>
 #include "cuvs_peak_meter.h"
+#include <rmm/cuda_stream.hpp>
+#include "cuvs_res_pool.hpp"
 
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>   /* Phase 3L: half precision for brute-force (cuvs.bf_precision) */
@@ -75,10 +77,19 @@
  * ---------------------------------------------------------------- */
 namespace {
 
-struct DevicePool {
-    std::mutex mutex;
-    std::vector<std::unique_ptr<raft::device_resources>> pool;
+/* I3-D: a slot owns rmm::cuda_stream when --rmm-dedicated-stream is on and
+ * builds device_resources on that stream; off keeps the per-thread default. */
+struct RaftResTraits {
+    using Res = raft::device_resources;
+    using Stream = rmm::cuda_stream;
+    static std::unique_ptr<Stream> make_stream() { return std::make_unique<Stream>(); }
+    static std::unique_ptr<Res> make_res(Stream *stream)
+    {
+        return stream ? std::make_unique<Res>(stream->view()) : std::make_unique<Res>();
+    }
 };
+using DevicePool = CuvsResPool<RaftResTraits>;
+using ResSlot = DevicePool::Slot;
 
 static DevicePool g_device_pools[CUVS_MAX_GPUS];
 
@@ -145,14 +156,13 @@ struct RmmPoolRegistry {
             if (cudaSetDevice(dev) != cudaSuccess) {
                 /* Process exit with a lost CUDA context: let the driver reclaim
                  * the pool rather than freeing it on the wrong device. */
-                for (auto &res : g_device_pools[dev].pool) (void)res.release();
-                g_device_pools[dev].pool.clear();
+                g_device_pools[dev].abandon();
                 (void)pools[dev].release();
                 (void)usages[dev].release();
                 (void)upstreams[dev].release();
                 continue;
             }
-            g_device_pools[dev].pool.clear();
+            g_device_pools[dev].clear();
             rmm::mr::set_current_device_resource(previous[dev]);
             usages[dev].reset();
             pools[dev].reset();
@@ -176,31 +186,21 @@ static thread_local int g_last_build_att = 0;
 /* test-only: armed by cuvs_set_inject_build_oom(n); each build decrements and fails. */
 static std::atomic<int> g_inject_build_oom{0};
 
-std::unique_ptr<raft::device_resources> acquire_res(int device_id)
+std::unique_ptr<ResSlot> acquire_res(int device_id)
 {
-    DevicePool &dp = g_device_pools[device_id];
-    {
-        std::lock_guard<std::mutex> lk(dp.mutex);
-        if (!dp.pool.empty()) {
-            auto r = std::move(dp.pool.back());
-            dp.pool.pop_back();
-            return r;
-        }
-    }
+    /* A new slot's stream/handles are created on the selected device. */
     cudaError_t err = cudaSetDevice(device_id);
     if (err != cudaSuccess) {
         fprintf(stderr, "[acquire_res] cudaSetDevice(%d) failed: %s\n",
                 device_id, cudaGetErrorString(err));
         throw std::runtime_error("cudaSetDevice failed in acquire_res");
     }
-    return std::make_unique<raft::device_resources>();
+    return g_device_pools[device_id].acquire();
 }
 
-void release_res(int device_id, std::unique_ptr<raft::device_resources> r)
+void release_res(int device_id, std::unique_ptr<ResSlot> r)
 {
-    DevicePool &dp = g_device_pools[device_id];
-    std::lock_guard<std::mutex> lk(dp.mutex);
-    dp.pool.push_back(std::move(r));
+    g_device_pools[device_id].release(std::move(r));
 }
 
 /* RAII: borrow on construction, return to the pool on destruction. If a cuVS
@@ -216,7 +216,7 @@ void release_res(int device_id, std::unique_ptr<raft::device_resources> r)
  * constructor is safe -- no other thread can race the device selection within
  * the same PooledRes lifetime. */
 struct PooledRes {
-    std::unique_ptr<raft::device_resources> r;
+    std::unique_ptr<ResSlot> r; /* poisoned: destroyed with its own stream */
     int dev;
     bool poisoned = false;
     explicit PooledRes(int device_id) : r(acquire_res(device_id)), dev(device_id) {
@@ -229,11 +229,20 @@ struct PooledRes {
         }
     }
     ~PooledRes() { if (r && !poisoned) release_res(dev, std::move(r)); }
-    raft::device_resources &get() { return *r; }
+    raft::device_resources &get() { return *r->res; }
     void poison() { poisoned = true; }
 };
 
 } // namespace
+
+extern "C" int
+cuvs_rmm_set_dedicated_stream(int on)
+{
+    for (int dev = 0; dev < CUVS_MAX_GPUS; dev++)
+        if (g_device_pools[dev].set_dedicated(on != 0) != 0)
+            return -1;
+    return 0;
+}
 
 extern "C" int
 cuvs_rmm_pool_init(int device_id, size_t initial_pool_bytes, uint32_t maximum_percent)

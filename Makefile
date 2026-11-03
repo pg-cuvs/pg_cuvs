@@ -318,6 +318,11 @@ test-hnsw-auto-overflow: test/unit/test_hnsw_auto_overflow.c src/cuvs_route_pref
 	$(CC) -std=gnu11 -Wall -Wextra -Werror -I src -o $@ test/unit/test_hnsw_auto_overflow.c -lpthread -lm
 	./$@
 
+# I3-D: CK-33 resource pool wiring (dedicated RMM stream) with fake CUDA types.
+test-res-pool: test/unit/test_res_pool.cpp src/cuvs_res_pool.hpp src/cuvs_wrapper.h
+	$(CXX) -std=c++17 -Wall -Wextra -Werror -I src -o $@ test/unit/test_res_pool.cpp -lpthread
+	./$@
+
 test-hnsw-admission: test/unit/test_hnsw_admission.c src/cuvs_hnsw_build_common.h
 	$(CC) -std=gnu11 -Wall -Wextra -I src -o $@ test/unit/test_hnsw_admission.c -lpthread
 	./$@
@@ -442,10 +447,10 @@ test-hnsw-converter: test/unit/test_hnsw_converter.c src/hnsw_export.c \
 
 EXTRA_CLEAN += test-hnsw-build test-hnsw-build-ipc test-hnsw-converter test-hnsw-admission test-hnsw-explicit-route test-hnsw-policy \
                test-admission-contract test-admission-contract-cxx test-admission-contract-util.o \
-               test-admission-wire test-admission-message test-admission-ipc test-build-oom-thread test-hnsw-auto-overflow
+               test-admission-wire test-admission-message test-admission-ipc test-build-oom-thread test-hnsw-auto-overflow test-res-pool
 .PHONY: test-hnsw-build test-hnsw-build-ipc test-hnsw-converter test-hnsw-admission test-hnsw-explicit-route test-hnsw-policy \
         test-admission-contract test-admission-contract-mutations test-admission-wire \
-        test-admission-message test-admission-ipc test-build-oom-thread test-gpu-wrapper-i3 test-hnsw-auto-overflow
+        test-admission-message test-admission-ipc test-build-oom-thread test-gpu-wrapper-i3 test-hnsw-auto-overflow test-res-pool
 
 # ---- Documentation contract check ---------------------------------------
 # CPU-only drift detector for the current version/defaults and release-facing

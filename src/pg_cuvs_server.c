@@ -411,6 +411,9 @@ static uint32_t g_scratch_permille = CUVS_RMM_SCRATCH_PERMILLE_DEFAULT;
  * (default) or fails with status 13. Startup-only; explicit ivf_pq/ace
  * never read it. */
 static uint32_t g_hnsw_auto_overflow = CUVS_HNSW_AUTO_OVERFLOW_DEFAULT;
+/* I3-D (UC-6 A): pooled RAFT resources own a dedicated RMM stream (on) or use
+ * the per-thread default stream (off = I2 behaviour). Startup-only. */
+static int g_rmm_dedicated_stream = CUVS_RMM_DEDICATED_STREAM_DEFAULT;
 static size_t g_rmm_pool_limits[CUVS_MAX_GPUS];
 /* Estimated quota reservations for unlocked builds, separate from logical
  * residency. Protected by g_index_mutex; allocator counters cannot see these
@@ -11010,6 +11013,17 @@ main(int argc, char **argv)
                 return 1;
             }
         }
+        else if (strcmp(argv[i], "--rmm-dedicated-stream") == 0)
+        {
+            const char *v = i + 1 < argc ? argv[++i] : "";
+            if (!strcmp(v, "on")) g_rmm_dedicated_stream = 1;
+            else if (!strcmp(v, "off")) g_rmm_dedicated_stream = 0;
+            else
+            {
+                LOG_ERROR("--rmm-dedicated-stream requires on or off\n");
+                return 1;
+            }
+        }
         else if (strcmp(argv[i], "--hnsw-auto-overflow") == 0)
         {
             if (i + 1 >= argc
@@ -11186,6 +11200,15 @@ main(int argc, char **argv)
     /* Install the per-device allocator before probes, persisted-index reloads,
      * warmup or worker threads can make the first RMM allocation. An explicit
      * zero keeps the old allocation path. Any failed init aborts startup. */
+    /* Before the pool, probes, loads and warmup acquire any RAFT resource. */
+    if (cuvs_rmm_set_dedicated_stream(g_rmm_dedicated_stream) != 0)
+    {
+        LOG_ERROR("RMM dedicated stream mode could not be applied before first GPU use\n");
+        return 1;
+    }
+    LOG_INFO("RMM dedicated stream: %s (--rmm-dedicated-stream; default %s)\n",
+             g_rmm_dedicated_stream ? "on" : "off",
+             CUVS_RMM_DEDICATED_STREAM_DEFAULT ? "on" : "off");
     if (g_rmm_pool_mb > 0)
     {
         for (int i = 0; i < n_usable_gpus(); i++)

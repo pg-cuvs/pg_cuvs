@@ -578,6 +578,15 @@ int cuvs_eat_vram(int64_t leave_bytes, int device_id)
 int cuvs_free_vram(int device_id)
 { (void)device_id; g_shim_vram_free = (int64_t) shim_vram_total(); return 0; }
 
+/* I3-D: the shim has no CUDA streams; record the mode with the GPU wrapper's
+ * "fixed after first use" contract so the daemon wiring is exercised. */
+static int g_shim_dedicated_stream = CUVS_RMM_DEDICATED_STREAM_DEFAULT;
+int cuvs_rmm_set_dedicated_stream(int on)
+{
+    g_shim_dedicated_stream = on != 0;
+    return 0;
+}
+
 /* The CPU reference shim cannot prove graph construction or SDK identity. */
 int
 cuvs_hnsw_build_file(int vectors_fd, int owner_fd,
