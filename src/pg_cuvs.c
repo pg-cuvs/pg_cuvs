@@ -92,6 +92,7 @@
 #include "cuvs_hnsw_build.h"
 #include "cuvs_hnsw_build_common.h"
 #include "cuvs_status_text.h"   /* I3-B status text parsing */
+#include "cuvs_route_preflight.h"
 
 PG_MODULE_MAGIC;
 
@@ -1017,6 +1018,10 @@ cuvs_rmm_pool_status_show(void)
     appendStringInfo(&json, "],\"version\":%u,\"scratch_permille\":%u}",
                      status.version, status.scratch_permille);
     cuvs_append_reclaim_status(&json);
+    /* I3-C follows the A fields and B reclaim members (append-only). */
+    json.data[--json.len] = '\0';
+    appendStringInfo(&json, ",\"hnsw_auto_overflow\":\"%s\"}",
+                     cuvs_hnsw_overflow_name(status.hnsw_auto_overflow));
     return json.data;
 }
 
@@ -2633,6 +2638,80 @@ cuvs_hnsw_spool_callback(Relation index, ItemPointer tid, Datum *values,
     spool->n++;
 }
 
+/* ADR-087 transition NOTICE (UC-5). Sent at the decision point: before the
+ * scan from statistics (PN-1), right after the scan without statistics, or
+ * as a last resort after the build if no forecast was available. */
+static void
+cuvs_hnsw_transition_notice(uint64_t host_est, uint64_t host_budget,
+                            uint64_t gpu_est, uint64_t gpu_budget,
+                            uint64_t disk_need, uint64_t disk_avail,
+                            const char *index_dir, const char *when)
+{
+    uint64_t need, budget;
+    const char *side;
+    cuvs_hnsw_overflow_need(host_est, host_budget, gpu_est, gpu_budget, &need, &budget, &side);
+    ereport(NOTICE,
+        (errmsg("pg_cuvs: build_algo=auto exceeded the resident budget (need %u MiB, budget %u MiB); building with ACE on disk",
+                cuvs_prespool_mib(need), cuvs_prespool_mib(budget)),
+         errdetail("Exceeded %s budget; ACE-disk needs %u MiB of regular disk in a private workdir under %s (available %s%u MiB); route decided %s. "
+                   "ACE quality and latency can differ from resident IVF-PQ.",
+                   side, cuvs_prespool_mib(disk_need), index_dir && index_dir[0] ? index_dir : "the daemon index directory",
+                   disk_avail ? "" : "unknown, ", cuvs_prespool_mib(disk_avail), when),
+         errhint("Set build_algo='ivf_pq' or start the daemon with --hnsw-auto-overflow error to refuse instead.")));
+}
+
+static void
+cuvs_hnsw_budget_error(uint32_t build_algo, const char *error, const char *when)
+{
+    ereport(ERROR, (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+        errmsg("pg_cuvs: resident IVF-PQ estimate exceeds the HNSW build budget"),
+        errdetail("%s; decided %s.", error, when),
+        build_algo == CUVS_HNSW_ALGO_AUTO
+        ? errhint("Use build_algo=ace for an explicit disk build; this daemon refuses auto overflow (--hnsw-auto-overflow error), or ACE needs at least 256 rows.")
+        : errhint("Use build_algo=ace for an explicit disk build; explicit ivf_pq never spills to ACE.")));
+}
+
+/* Op 40 with a row count; returns the backend action (pure decision in
+ * cuvs_route_preflight.h). On NOTICE_OVERFLOW the transition NOTICE is sent
+ * here, so it always precedes the scan or the build op. */
+static CuvsHnswPrespoolAction
+cuvs_hnsw_preflight(double rows, uint32_t dim, uint32_t hierarchy, uint32_t build_algo,
+                    uint32_t ef_construction, uint64_t host_cap, bool may_reject,
+                    const char *when)
+{
+    CuvsHnswPreflightRequest request = {0};
+    CuvsHnswPreflightReply reply;
+    CuvsHnswPrespoolAction action;
+    int rc;
+    request.version = CUVS_HNSW_PREFLIGHT_VERSION;
+    request.hierarchy = hierarchy;
+    request.build_algo = build_algo;
+    request.ef_construction = ef_construction;
+    request.dim = dim;
+    request.graph_degree = 64;
+    request.intermediate_degree = 128;
+    request.n_estimate = cuvs_prespool_rows(rows);
+    request.host_budget = host_cap;
+    if (!request.n_estimate || !host_cap) return CUVS_HNSW_PRESPOOL_FALLBACK;
+    rc = cuvs_ipc_hnsw_route_preflight(cuvs_socket_path, &request, &reply);
+    action = cuvs_hnsw_prespool_action(rows, rc, reply.route, reply.overflowed, reply.disk_ok);
+    if (!may_reject && (action == CUVS_HNSW_PRESPOOL_REJECT_BUDGET
+                        || action == CUVS_HNSW_PRESPOOL_REJECT))
+        return CUVS_HNSW_PRESPOOL_FALLBACK; /* the build op stays authoritative */
+    if (action == CUVS_HNSW_PRESPOOL_REJECT_BUDGET)
+        cuvs_hnsw_budget_error(build_algo, reply.header.error, when);
+    if (action == CUVS_HNSW_PRESPOOL_REJECT)
+        ereport(ERROR, (errmsg("pg_cuvs: temporary HNSW build failed (status %d): %s",
+                               rc, reply.header.error),
+                        errdetail("Decided %s; no rows were spooled.", when),
+                        errhint("If the table statistics are stale, run ANALYZE and retry.")));
+    if (action == CUVS_HNSW_PRESPOOL_NOTICE_OVERFLOW)
+        cuvs_hnsw_transition_notice(reply.host_estimate, reply.host_budget,
+            reply.gpu_estimate, reply.gpu_budget, reply.disk_need, reply.disk_avail,
+            reply.index_dir, when);
+    return action;
+}
+
 void
 cuvs_build_hnsw_from_heap(Relation heapRel, Relation indexRel, IndexInfo *indexInfo,
                           const char *mode, uint32_t build_algo,
@@ -2668,6 +2747,19 @@ cuvs_build_hnsw_from_heap(Relation heapRel, Relation indexRel, IndexInfo *indexI
         CuvsTidsHeader header = {0};
         char error[128] = {0};
         int rc;
+        uint32_t hierarchy = strcmp(mode, "nsw") != 0;
+        uint32_t notices;
+        char when[96];
+        /* UC-5 / ADR-087 decision 4: with statistics, decide the route (and
+         * the disk precheck) BEFORE the heap scan and announce it (PN-1).
+         * Without statistics (reltuples -1 or 0) the scan comes first. */
+        double stats_rows = heapRel->rd_rel->reltuples;
+        CuvsHnswPrespoolAction prespool;
+        bool transition_sent;
+        snprintf(when, sizeof(when), "before the heap scan from reltuples=%.0f", stats_rows);
+        prespool = cuvs_hnsw_preflight(stats_rows, spool->dim, hierarchy, build_algo,
+                                       ef_construction, cap, true, when);
+        transition_sent = prespool == CUVS_HNSW_PRESPOOL_NOTICE_OVERFLOW;
         spool->input_hash = pg_cryptohash_create(PG_SHA256);
         if (!spool->input_hash || pg_cryptohash_init(spool->input_hash) < 0)
             ereport(ERROR, (errmsg("pg_cuvs: cannot initialize HNSW input digest")));
@@ -2707,22 +2799,43 @@ cuvs_build_hnsw_from_heap(Relation heapRel, Relation indexRel, IndexInfo *indexI
                     (unsigned long long)input.st_dev, (unsigned long long)input.st_ino,
                     RelationGetRelid(indexRel))));
             }
+            /* No statistics: the decision point is now, after the scan and
+             * before the build op, from the spooled row count. */
+            if (prespool == CUVS_HNSW_PRESPOOL_FALLBACK)
+            {
+                snprintf(when, sizeof(when), "after the heap scan (no table statistics) from %llu spooled rows",
+                         (unsigned long long)spool->n);
+                transition_sent = cuvs_hnsw_preflight((double)spool->n, spool->dim, hierarchy,
+                    build_algo, ef_construction, cap, false, when)
+                    == CUVS_HNSW_PRESPOOL_NOTICE_OVERFLOW;
+            }
             rc = cuvs_ipc_build_hnsw_file(cuvs_socket_path,
                 FileGetRawDesc(spool->vectors), spool->n, spool->dim, spool->metric,
-                64, 128, strcmp(mode, "nsw") != 0, cap,
+                64, 128, hierarchy, cap,
                 build_algo, ef_construction, &out->policy,
                 &out->hnsw_fd, error, sizeof(error));
             if (rc == CUVS_STATUS_HNSW_RESIDENT_BUDGET_EXCEEDED)
-                ereport(ERROR, (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-                    errmsg("pg_cuvs: resident IVF-PQ estimate exceeds the HNSW build budget"),
-                    errdetail("%s", error),
-                    errhint("Use build_algo=ace for an explicit disk build; auto does not fall back to ACE.")));
-            if (rc == CUVS_STATUS_OK && out->policy.route == CUVS_HNSW_ROUTE_ACE)
-                ereport(NOTICE, (errmsg("pg_cuvs: explicit build_algo=ace selected ACE-disk (%u partitions)", out->policy.partitions),
-                    errdetail("Route selection uses memory estimates, not allocation or RSS upper bounds.")));
+                cuvs_hnsw_budget_error(build_algo, error, "by the build after the heap scan");
             if (rc == CUVS_STATUS_CANCELED) CHECK_FOR_INTERRUPTS();
             if (rc != CUVS_STATUS_OK)
                 ereport(ERROR, (errmsg("pg_cuvs: temporary HNSW build failed (status %d): %s", rc, error)));
+            out->policy.route_flags |= cuvs_hnsw_timing_flag(prespool);
+            /* CK-17 (13): every auto -> ACE receipt gets its NOTICE lines. */
+            notices = cuvs_hnsw_build_notices(&out->policy, transition_sent);
+            if (notices & CUVS_HNSW_NOTICE_TRANSITION)
+                cuvs_hnsw_transition_notice(out->policy.host_estimate, out->policy.host_budget,
+                    out->policy.gpu_estimate, out->policy.gpu_budget,
+                    cuvs_hnsw_disk_need(spool->n, spool->dim, 64), 0, NULL,
+                    "by the build after the heap scan");
+            if (notices & CUVS_HNSW_NOTICE_AUTO_COMPLETION)
+                ereport(NOTICE, (errmsg("pg_cuvs: auto selected ACE-disk (%u partitions): resident IVF-PQ estimate exceeds budget", out->policy.partitions),
+                    errdetail("Route selection uses memory estimates, not allocation or RSS upper bounds.")));
+            if (notices & CUVS_HNSW_NOTICE_EXPLICIT_ACE)
+                ereport(NOTICE, (errmsg("pg_cuvs: explicit build_algo=ace selected ACE-disk (%u partitions)", out->policy.partitions),
+                    errdetail("Route selection uses memory estimates, not allocation or RSS upper bounds.")));
+            if (notices & CUVS_HNSW_NOTICE_NOT_OVERFLOWED)
+                ereport(NOTICE, (errmsg("pg_cuvs: build_algo=auto fit the resident budget after the heap scan; built %s instead of the announced ACE-disk",
+                                        cuvs_hnsw_route_name(out->policy.route))));
             out->tids_fd = dup(FileGetRawDesc(spool->tids));
             if (out->tids_fd < 0)
                 ereport(ERROR, (errcode_for_file_access(), errmsg("pg_cuvs: cannot hand off TID spool: %m")));
@@ -3190,6 +3303,30 @@ cuvs_build_cagra_from_heap(Relation heapRel, Relation indexRel, IndexInfo *index
                      errhint("Raise cuvs.max_build_mem_mb (hard cap) or "
                              "cuvs.build_mem_safety_ratio, shard the table, or see "
                              "docs/playbooks/large-dataset-benchmark.md.")));
+    }
+
+    /* I3-C (C4 (iii), CK-17 (14)): reltuples-based AR0 before the scan. Only a
+     * certain, permanent refusal is raised here; without statistics, without
+     * a configured limit, when the daemon is unreachable or when the build
+     * could be auto-sharded across GPUs, the current post-scan path decides. */
+    if (typmod > 0 && reltuples_est >= 1)
+    {
+        CuvsCagraPreflightReply limits;
+        uint64_t estimate;
+        if (cuvs_ipc_cagra_ar0_preflight(cuvs_socket_path, &limits) == CUVS_STATUS_OK
+            && cuvs_cagra_prespool_ar0(reltuples_est, (uint32_t) typmod, graph_degree,
+                                       shard_count, limits.n_devices, limits.max_limit,
+                                       &estimate))
+            ereport(ERROR,
+                    (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED), /* 54000 = AR0 */
+                     errmsg("pg_cuvs: GPU memory is insufficient for this CAGRA build "
+                            "(needs more than the configured limit); CREATE INDEX aborted"),
+                     errdetail("AR0 n=%u q=%u; estimated from reltuples=%.0f before the heap scan, no rows were read.",
+                               cuvs_prespool_mib(estimate), cuvs_prespool_mib(limits.max_limit),
+                               reltuples_est),
+                     errhint("For a large table use pg_cuvs_hnsw with build_algo='auto' "
+                             "(spills to ACE-disk over the budget) or 'ace'. If the statistics "
+                             "are stale, run ANALYZE and retry.")));
     }
 
     /* ADR-034 §4A-2: parallelize the heap scan + detoast across maintenance

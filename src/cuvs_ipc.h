@@ -123,6 +123,14 @@ int cuvs_ipc_build_hnsw_file(const char *socket_path, int vectors_fd,
 #define CUVS_OP_SERVER_SETTINGS    24 /* read-only daemon startup settings */
 #define CUVS_OP_RMM_POOL_STATUS    25 /* quota and live pool counters */
 
+/* I3-C (UC-5, ADR-087 decision 4; opcode range 40..44). Read-only forecasts
+ * the backend asks for BEFORE its heap scan, from table statistics. Neither
+ * op admits, reserves or locks anything for later; the build op re-decides
+ * from the spooled row count and stays authoritative. */
+#define CUVS_OP_HNSW_ROUTE_PREFLIGHT 40 /* hnsw route + disk precheck forecast */
+#define CUVS_OP_CAGRA_AR0_PREFLIGHT  41 /* CAGRA per-GPU admission limit for AR0 */
+
+
 /* ----------------------------------------------------------------
  * Distance metrics (mirror pgvector operator names)
  * ---------------------------------------------------------------- */
@@ -270,6 +278,59 @@ typedef struct CuvsHnswFileReply {
     CuvsReplyHeader header;
     CuvsHnswPolicy policy;
 } CuvsHnswFileReply;
+
+/* I3-C pre-spool forecast payloads (ops 40, 41 above). */
+#define CUVS_HNSW_PREFLIGHT_VERSION 1u
+/* Sent after the command frame. n_estimate is ceil(pg_class.reltuples). */
+typedef struct CuvsHnswPreflightRequest {
+    uint32_t version;
+    uint32_t hierarchy;
+    uint32_t build_algo;
+    uint32_t ef_construction;
+    uint32_t dim;
+    uint32_t graph_degree;
+    uint32_t intermediate_degree;
+    uint32_t reserved;
+    uint64_t n_estimate;
+    uint64_t host_budget;      /* backend cap, same value the build op sends */
+} CuvsHnswPreflightRequest;
+
+/* header.status is the forecast status: OK, 13 (resident budget exceeded,
+ * overflow=error or explicit ivf_pq) or 5 (other route or disk failure);
+ * header.error carries the resolver/disk text. gpu_static=1 means the GPU
+ * registry lock was busy, so resident usage was not subtracted (GPU budget
+ * static at preflight, ADR-087 decision 4; the build op reads it live). */
+typedef struct CuvsHnswPreflightReply {
+    CuvsReplyHeader header;
+    uint32_t version;
+    uint32_t auto_overflow;    /* CUVS_HNSW_OVERFLOW_* of this daemon */
+    uint32_t route;            /* CUVS_HNSW_ROUTE_*; 0 when status != OK */
+    uint32_t partitions;
+    uint32_t overflowed;
+    uint32_t disk_ok;
+    uint32_t disk_regular;
+    uint32_t gpu_static;
+    uint64_t n_estimate;
+    uint64_t host_estimate, gpu_estimate, host_budget, gpu_budget;
+    uint64_t disk_need, disk_avail;
+    char     index_dir[256];   /* where the daemon's private workdir is made */
+} CuvsHnswPreflightReply;
+
+int cuvs_ipc_hnsw_route_preflight(const char *socket_path,
+    const CuvsHnswPreflightRequest *request, CuvsHnswPreflightReply *reply);
+
+#define CUVS_CAGRA_PREFLIGHT_VERSION 1u
+/* Static startup values only: limit = min(logical budget, pool quota) per
+ * usable GPU (ensure_vram/pick_gpu_for_index use the same pair). max_limit
+ * is the largest such limit; 0 means no configured limit on some GPU, so no
+ * pre-spool AR0 can be proven. */
+typedef struct CuvsCagraPreflightReply {
+    uint32_t version;
+    uint32_t n_devices;
+    uint64_t max_limit;
+} CuvsCagraPreflightReply;
+
+int cuvs_ipc_cagra_ar0_preflight(const char *socket_path, CuvsCagraPreflightReply *out);
 
 typedef struct CuvsResult {
     uint64_t tid;           /* heap TID encoded as block<<16|offset */
@@ -425,6 +486,9 @@ typedef struct CuvsRmmPoolStatus {
     uint32_t n_devices;
     CuvsRmmPoolStats devices[CUVS_MAX_GPUS];
     uint32_t scratch_permille; /* I3-A: --rmm-scratch-permille (C3 rho) */
+    /* I3-C, append-only: CUVS_HNSW_OVERFLOW_* (--hnsw-auto-overflow). */
+    uint32_t hnsw_auto_overflow;
+    uint32_t hnsw_reserved;
 } CuvsRmmPoolStatus;
 
 int cuvs_ipc_rmm_pool_status(const char *socket_path, CuvsRmmPoolStatus *out);
