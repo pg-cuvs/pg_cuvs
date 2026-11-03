@@ -394,6 +394,20 @@ test_rejects(void)
 }
 
 static void
+test_kind_i64n(void)
+{
+    int64_t v;
+    int isnull;
+    CHECK(cuvs_status_parse_field(CUVS_SF_I64N, "-1", &v, &isnull) == 0 && isnull == 1);
+    CHECK(cuvs_status_parse_field(CUVS_SF_I64N, "0", &v, &isnull) == 0 && isnull == 0 && v == 0);
+    CHECK(cuvs_status_parse_field(CUVS_SF_I64N, "1111", &v, &isnull) == 0 && v == 1111);
+    CHECK(cuvs_status_parse_field(CUVS_SF_I64N, "-2", &v, &isnull) == -1);
+    CHECK(cuvs_status_parse_field(CUVS_SF_I64N, "", &v, &isnull) == -1);
+    CHECK(strlen(CUVS_MEMORY_STATUS_KINDS_I3E) == CUVS_MEMORY_STATUS_NCOLS_I3E);
+    CHECK(strlen(CUVS_INDEX_STATUS_KINDS_I3E) == CUVS_INDEX_STATUS_NCOLS_I3E);
+}
+
+static void
 test_memory_columns(void)
 {
     Row r;
@@ -611,6 +625,7 @@ main(void)
     assert(g_indexes && g_cold_indexes);
     g_lw_host_guard_fn = fixture_host_guard;
 
+    test_kind_i64n();
     test_rejects();
     test_memory_columns();
     test_build_status();
