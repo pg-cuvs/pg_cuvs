@@ -170,8 +170,8 @@ arrives the bundle is built there with nvcc and the result recorded here.
 - **CUDA build of `PeakUsage` (cuvs_wrapper.cu) not compiled** in this worker (no GPU
   toolchain, no VM allowed). Written against RMM 26.04 `limiting_resource_adaptor`
   (fetched source). First GPU build must confirm.
-- **`pg_cuvs_build_status()`** (plan C8) is not implemented: the brief's I3-B status
-  fields do not list it. Decision needed: drop from C8 or add later.
+- **`pg_cuvs_build_status()`** (plan C8) is not implemented: conch ruled it outside
+  I3-B (an I4 integration item, handled at the stack integration).
 - **SIGHUP re-read** not implemented (optional per UC-7 ruling; documented).
 - **Pending-build soft reload** (r18 B-9) is implemented in `ensure_vram` but not
   exercised by a CPU test (needs a held build reservation).
