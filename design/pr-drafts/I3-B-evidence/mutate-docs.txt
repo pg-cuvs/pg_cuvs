@@ -1,0 +1,7 @@
+RED  REINDEX sentence loses an element: FAIL CK-19: chapter lacks 'REINDEX: pin or room'
+RED  entry route dropped: FAIL CK-19: chapter lacks 'route: daemon stop'
+RED  search_stats limit dropped: FAIL CK-19: chapter lacks 'search_stats limits'
+RED  documented default drifts: FAIL CK-27: --reclaim-floor-pct documented '5', source 10
+RED  internal track and timing named: FAIL CK-19: chapter names 'I2b'
+RED  source default drifts: FAIL CK-27: --reclaim-high-pct documented '85', source 90
+mutations: 6, survived: 0

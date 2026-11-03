@@ -1,0 +1,42 @@
+gcc -std=gnu11 -Wall -Wextra -I src -o test-hnsw-build test/unit/test_hnsw_build.c
+./test-hnsw-build
+PASS capacity/ACE, disk FD, cancel/owner EOF, tiny distinct non-self counts and malformed-ID rejection
+gcc -std=gnu11 -Wall -Wextra -I src -o test-hnsw-build-ipc test/unit/test_hnsw_build_ipc.c \
+	src/cuvs_ipc.c src/cuvs_util.c src/cuvs_build_corpus.c -lpthread -lm -lrt
+test/unit/test_hnsw_build_ipc.c: In function 'main':
+test/unit/test_hnsw_build_ipc.c:101:53: warning: '%s' directive output may be truncated writing up to 199 bytes into a region of size 108 [-Wformat-truncation=]
+  101 |     snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", path);
+      |                                                     ^~   ~~~~
+test/unit/test_hnsw_build_ipc.c:101:5: note: 'snprintf' output between 1 and 200 bytes into a destination of size 108
+  101 |     snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", path);
+      |     ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+./test-hnsw-build-ipc
+[INFO] [hnsw_wait] phase=backend-cancel mono_us=86976480130 input_dev=43 input_ino=693225
+PASS 15 actual-client wire cases,4 preconnect refusals,5 shared-daemon prefix/settings cases; explicitACE/IVF, forgedroute/version/request rejection, cancellation/status13/protocolerror; current global v4 retained
+gcc -std=gnu11 -Wall -Wextra -I src -o test-hnsw-admission test/unit/test_hnsw_admission.c -lpthread
+./test-hnsw-admission
+PASS HNSW drains prior GPU work without holding registry lock; wait is owner-cancellable
+gcc -std=gnu11 -Wall -Wextra -Werror -I src -o test-cache-policy test/unit/test_cache_policy.c \
+	src/cuvs_cache_policy.c src/cuvs_util.c -lm -lrt
+./test-cache-policy
+test_cache_policy: 141 passed, 0 failed
+python3 -B test/unit/check_circuit_source.py
+PASS circuit source: 3 scan paths gate through cuvs_breaker_check_scan; no breaker-open branch returns false
+gcc -std=gnu11 -Wall -Wextra -Werror -I src -o test-status-text test/unit/test_status_text.c \
+	src/cuvs_status_text.c
+./test-status-text
+test_status_text: 80 passed, 0 failed
+python3 test/unit/check_i3b_sql_perms.py
+check_i3b_sql_perms: OK
+python3 test/unit/check_i3b_server_source.py src/pg_cuvs_server.c
+check_i3b_server_source: OK
+python3 test/unit/check_i3b_docs.py
+check_i3b_docs: OK
+gcc -I src -DCUVS_TEST_HOOKS -o test-unit test/unit/test_cuvs_util.c src/cuvs_util.c -lrt
+./test-unit
+[INFO] cuvs_util unit tests: 357 passed, 0 failed
+[OK] all tests passed
+gcc -I src -o test-build-corpus test/unit/test_build_corpus.c src/cuvs_build_corpus.c -lrt
+./test-build-corpus
+test_build_corpus: 60 passed, 0 failed
+rc=0

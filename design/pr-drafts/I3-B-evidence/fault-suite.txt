@@ -1,0 +1,4 @@
+not ok 1     - build_oom                                  77 ms
+not ok 2     - build_multi_oom                            79 ms
+not ok 3     - build_oom_evict_to_fit                    117 ms
+ok 4         - extend_cuda_oom                           166 ms

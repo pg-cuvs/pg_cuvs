@@ -1,0 +1,97 @@
+PASS flag: bad --reclaim-mode refused
+PASS flag: low > high refused
+PASS flag: idle:-1 refused
+PASS I3-B SQL block installs
+PASS cli reaches daemon (memory status)
+PASS startup INFO prints the effective cache policy
+PASS i1 resident
+PASS i2 resident
+PASS new build: last_use 0 and file_current 1
+  i3 build reply: ERROR:  pg_cuvs: BUILD failed (status 2); CREATE INDEX aborted to preserve catalog durability HINT:  GPU VRAM exhausted. Free VRAM (drop other cagra indexes or restart pg_cuvs_server) and retry, or use pgvector HNSW instead. 
+PASS third build rejected, no admit_build eviction
+PASS i1,i2 still resident after the rejected build
+PASS [reclaim] trigger=headroom with f_src=build
+PASS reclaim evicted one cold index (reason=reclaim)
+PASS retried build admitted after reclaim
+PASS two resident before the reload (i2, i3)
+PASS reload of non-resident i1 evicts an eligible index (reason=reload)
+PASS i1 resident again with hits >= 1
+PASS reload with only protected victims soft-evicts (reason=soft_evict)
+PASS soft-evicted index history says soft_evict
+PASS REINDEX self-replace logged
+PASS self-replace eviction marked self_replace=1
+PASS receipt: last_build_self_replace=1, unloaded>0
+PASS no other index evicted by the build
+PASS pin
+PASS pin cap: second pin exceeds --pin-max-pct 50
+PASS unload refuses a pinned index
+PASS unpin
+PASS unload
+PASS unloaded index listed not_resident
+PASS history kept after eviction (evict_count>=1, manual_unload)
+PASS load
+PASS unpin of an unpinned index
+PASS reclaim_set mode usage
+PASS reclaim_set refuses restart-only knob
+PASS reclaim_set refuses low > high
+PASS reclaim status shows function source
+PASS memory status mode usage, F 0
+PASS after load: file_current 1, extend_count 0
+PASS EXTEND: file_current 0, extend_count 10
+PASS unload after EXTEND saves (no sidecar: plain 'unloaded')
+PASS the unload saved the graph (saved_ms field, manual_unload)
+PASS reload resets extend_count (defect 3) and file_current 1
+PASS unload with file_current 1 skips the save (saved_ms=0)
+PASS reclaim skips the unsaved CAGRA with a delta file (skip_sidecar=1)
+PASS skipped index stays resident; the other was reclaimed
+PASS memory_status counts reclaim_skip_sidecar
+PASS unload of that index warns (CPU replan until REINDEX)
+PASS usage stats file written
+PASS usage stats file not an index artifact (not_resident rows have no dot-name)
+PASS restart reads the usage stats file
+PASS usage-stats-file off: OID order
+PASS corrupt file: daemon up, OID order with reason
+PASS startup never evicts (no [evict] between load order and loaded lines)
+PASS startup left an index not resident (capacity bound reached)
+PASS load-soft-evict off: reload with only protected victims refused (AR5 text)
+PASS load-soft-evict off: no soft_evict
+PASS reindex-self-replace off: no self-replace, REINDEX refused
+PASS usage stats file written even with --reclaim-mode off
+PASS REINDEX keeps the pin (C7 7.2-N3)
+PASS SQL index_status names the resident index (public.i1)
+PASS SQL pin/unpin/unload
+PASS SQL unload of a pinned index raises 55006
+PASS non-owner unload refused
+PASS non-superuser reclaim_set refused
+PASS non-owner sees no rows of others in index_status
+PASS non-privileged memory_status refused
+PASS same session B sees A's reclaim_params change (no per-session cache)
+PASS memory_status via SQL has reclaim columns
+PASS circuit_status callable by anyone
+PASS drop: no row left for i2
+PASS [evict] lines have the 13 ADR-086 fields in order
+PASS [reclaim] lines have the 13 ADR-086 fields in order
+--- cross-session SHOW
+{"initial_mb":0,"maximum_percent":0,"devices":[],"build_evict_scope":"none","pin_max_pct":50,"reclaim_free_max_pct":50,"reclaim_free_window_min":30,"reclaim_floor_pct":10,"load_soft_evict":"on","reind
+evict-hit-cap = 7
+{"initial_mb":0,"maximum_percent":0,"devices":[],"build_evict_scope":"none","pin_max_pct":50,"reclaim_free_max_pct":50,"reclaim_free_window_min":30,"reclaim_floor_pct":10,"load_soft_evict":"on","reind
+--- [evict]/[reclaim] lines
+[evict] op=RECLAIM gpu=0 db=5 idx=16851 reason=reclaim requester_idx=0 idle_s=-1 protect_s=3600 hits=0 vram_bytes=10240000 saved_ms=0 mono_us=86776892510 self_replace=0
+[reclaim] op=headroom gpu=0 tick=2 resident_before=20480000 resident_after=10240000 hi_bytes=22282240 lo_bytes=19660800 evicted=1 skip_sidecar=0 trigger=headroom f_bytes=10240000 f_src=build:5:16853 mono_us=86776892547
+[evict] op=LOAD gpu=0 db=5 idx=16852 reason=reload requester_idx=16851 idle_s=-1 protect_s=3600 hits=0 vram_bytes=10240000 saved_ms=0 mono_us=86781533284 self_replace=0
+[evict] op=LOAD gpu=0 db=5 idx=16851 reason=soft_evict requester_idx=16852 idle_s=1 protect_s=3660 hits=2 vram_bytes=10240000 saved_ms=0 mono_us=86783026588 self_replace=0
+[evict] op=BUILD_CAGRA gpu=0 db=5 idx=16854 reason=admit_build requester_idx=16854 idle_s=1 protect_s=3630 hits=1 vram_bytes=10240000 saved_ms=0 mono_us=86783090931 self_replace=1
+[self_replace] db=5 idx=16854 unloaded=10240000 notice="pg_cuvs: previous resident copy of index 16854 unloaded from GPU to make room for the rebuild|GPU memory was insufficient for both copies (need 10240000, free 5734400). Queries on this index use the CPU path or reload the old copy until the new index is resident"
+[evict] op=MANUAL gpu=0 db=5 idx=16852 reason=manual_unload requester_idx=0 idle_s=0 protect_s=3630 hits=1 vram_bytes=10240000 saved_ms=0 mono_us=86783210139 self_replace=0
+[evict] op=MANUAL gpu=0 db=5 idx=16854 reason=manual_unload requester_idx=0 idle_s=-1 protect_s=3600 hits=0 vram_bytes=10240000 saved_ms=0 mono_us=86783257258 self_replace=0
+[evict] op=MANUAL gpu=0 db=5 idx=16852 reason=manual_unload requester_idx=0 idle_s=-1 protect_s=3600 hits=0 vram_bytes=10240000 saved_ms=0 mono_us=86783258642 self_replace=0
+[evict] op=MANUAL gpu=0 db=5 idx=16851 reason=manual_unload requester_idx=0 idle_s=-1 protect_s=3600 hits=0 vram_bytes=10245120 saved_ms=25 mono_us=86783316330 self_replace=0
+[evict] op=MANUAL gpu=0 db=5 idx=16851 reason=manual_unload requester_idx=0 idle_s=-1 protect_s=3600 hits=0 vram_bytes=10245120 saved_ms=0 mono_us=86783325268 self_replace=0
+[evict] op=RECLAIM gpu=0 db=5 idx=16854 reason=reclaim requester_idx=0 idle_s=-1 protect_s=3600 hits=0 vram_bytes=10240000 saved_ms=0 mono_us=86783957121 self_replace=0
+[reclaim] op=headroom gpu=0 tick=9 resident_before=20487680 resident_after=10247680 hi_bytes=22282240 lo_bytes=19660800 evicted=1 skip_sidecar=1 trigger=headroom f_bytes=13107200 f_src=fixed mono_us=86783957277
+[evict] op=MANUAL gpu=0 db=5 idx=16851 reason=manual_unload requester_idx=0 idle_s=-1 protect_s=3600 hits=0 vram_bytes=10247680 saved_ms=51 mono_us=86786442760 self_replace=0
+[evict] op=MANUAL gpu=0 db=5 idx=16851 reason=manual_unload requester_idx=0 idle_s=-1 protect_s=3600 hits=0 vram_bytes=10247680 saved_ms=0 mono_us=86796556564 self_replace=0
+[evict] op=MANUAL gpu=0 db=5 idx=16852 reason=manual_unload requester_idx=0 idle_s=-1 protect_s=3600 hits=0 vram_bytes=10240000 saved_ms=0 mono_us=86796558130 self_replace=0
+[evict] op=MANUAL gpu=0 db=5 idx=16854 reason=manual_unload requester_idx=0 idle_s=-1 protect_s=600 hits=0 vram_bytes=10240000 saved_ms=0 mono_us=86802134556 self_replace=0
+[evict] op=MANUAL gpu=0 db=5 idx=16851 reason=manual_unload requester_idx=0 idle_s=-1 protect_s=600 hits=0 vram_bytes=10247680 saved_ms=0 mono_us=86802141134 self_replace=0
+FAILS=0
