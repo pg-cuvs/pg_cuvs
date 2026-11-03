@@ -971,6 +971,61 @@ cuvs_ipc_rmm_pool_status(const char *socket_path, CuvsRmmPoolStatus *out)
     return rc;
 }
 
+/* I3-C: read-only pre-spool hnsw route forecast (op 40). A short connect
+ * timeout keeps CREATE INDEX on the post-scan path when the daemon is slow;
+ * every failure here only means "no forecast", never a route decision. */
+int
+cuvs_ipc_hnsw_route_preflight(const char *socket_path,
+    const CuvsHnswPreflightRequest *request, CuvsHnswPreflightReply *reply)
+{
+    int sock, rc = CUVS_STATUS_ERROR;
+    CuvsCmdFrame cmd = {.op = CUVS_OP_HNSW_ROUTE_PREFLIGHT};
+    memset(reply, 0, sizeof(*reply));
+    if (!request || request->version != CUVS_HNSW_PREFLIGHT_VERSION || !request->n_estimate)
+        return CUVS_STATUS_ERROR;
+    sock = uds_connect_ex(socket_path, 1);
+    if (sock < 0)
+        return CUVS_STATUS_UNAVAILABLE;
+    if (send_cmd(sock, &cmd) == 0 && send_all(sock, request, sizeof(*request)) == 0
+        && recv_all(sock, reply, sizeof(*reply)) == 0)
+    {
+        rc = (int)reply->header.status;
+        reply->header.error[sizeof(reply->header.error) - 1] = '\0';
+        reply->index_dir[sizeof(reply->index_dir) - 1] = '\0';
+        if (reply->version != CUVS_HNSW_PREFLIGHT_VERSION
+            || reply->n_estimate != request->n_estimate
+            || (rc == CUVS_STATUS_OK && (reply->route < CUVS_HNSW_ROUTE_TINY
+                                         || reply->route > CUVS_HNSW_ROUTE_ACE
+                                         || !reply->disk_ok)))
+            rc = CUVS_STATUS_ERROR;
+    }
+    close(sock);
+    return rc;
+}
+
+int
+cuvs_ipc_cagra_ar0_preflight(const char *socket_path, CuvsCagraPreflightReply *out)
+{
+    int sock = uds_connect_ex(socket_path, 1);
+    int rc = CUVS_STATUS_ERROR;
+    CuvsCmdFrame cmd = {.op = CUVS_OP_CAGRA_AR0_PREFLIGHT};
+    CuvsReplyHeader hdr;
+    memset(out, 0, sizeof(*out));
+    if (sock < 0)
+        return CUVS_STATUS_UNAVAILABLE;
+    if (send_cmd(sock, &cmd) == 0 && recv_all(sock, &hdr, sizeof(hdr)) == 0)
+    {
+        rc = (int)hdr.status;
+        if (rc == CUVS_STATUS_OK
+            && (hdr.n_results != 1 || recv_all(sock, out, sizeof(*out)) < 0
+                || out->version != CUVS_CAGRA_PREFLIGHT_VERSION
+                || out->n_devices > CUVS_MAX_GPUS))
+            rc = CUVS_STATUS_ERROR;
+    }
+    close(sock);
+    return rc;
+}
+
 /* ----------------------------------------------------------------
  * Public API: cuvs_ipc_shard_stats (Phase 3F)
  * ---------------------------------------------------------------- */

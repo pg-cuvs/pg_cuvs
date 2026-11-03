@@ -407,6 +407,10 @@ static uint32_t g_rmm_pool_max_percent = 50;
  * policy's rho and replaces this literal at H_M. */
 #define CUVS_RMM_SCRATCH_PERMILLE_DEFAULT 7726u
 static uint32_t g_scratch_permille = CUVS_RMM_SCRATCH_PERMILLE_DEFAULT;
+/* ADR-087 (UC-5): build_algo=auto over the resident budget spills to ACE
+ * (default) or fails with status 13. Startup-only; explicit ivf_pq/ace
+ * never read it. */
+static uint32_t g_hnsw_auto_overflow = CUVS_HNSW_AUTO_OVERFLOW_DEFAULT;
 static size_t g_rmm_pool_limits[CUVS_MAX_GPUS];
 /* Estimated quota reservations for unlocked builds, separate from logical
  * residency. Protected by g_index_mutex; allocator counters cannot see these
@@ -9170,6 +9174,134 @@ hnsw_gpu_work_pending(void *unused)
     return busy;
 }
 
+/* One GPU budget formula for the build decision and the preflight. With the
+ * registry lock held (build) residents are subtracted from the logical
+ * budget; the preflight passes locked=0 when the lock is busy and then uses
+ * the static logical budget (ADR-087 decision 4: GPU budget static at the
+ * pre-spool notice; the build re-reads it after wait_for_idle). */
+static uint64_t
+hnsw_gpu_budget(int device, int locked)
+{
+    uint64_t budget = cuvs_vram_free_bytes_on(device);
+    if (g_max_vram_per_gpu[device])
+    {
+        uint64_t used = locked ? total_vram_used(device) : 0;
+        uint64_t remaining = used < g_max_vram_per_gpu[device]
+            ? g_max_vram_per_gpu[device] - used : 0;
+        if (remaining < budget) budget = remaining;
+    }
+    return budget;
+}
+
+/* [hnsw_route]: one line per decision, pre-spool forecast or build. Q4-5/Q4-6
+ * read est_host and route from it; route must equal the receipt's route. */
+static void
+hnsw_route_log(const char *phase, uint32_t algo, const CuvsHnswForecast *f,
+               const char *error)
+{
+    LOG_INFO("[hnsw_route] phase=%s requested_algo=%s route=%s overflow=%s overflowed=%u status=%u rows=%llu est_host=%llu est_gpu=%llu host_budget=%llu gpu_budget=%llu partitions=%u disk_need=%llu%s%s\n",
+        phase, cuvs_hnsw_algo_name(algo),
+        f->status == CUVS_STATUS_OK ? cuvs_hnsw_route_name(f->decision.route) : "none",
+        cuvs_hnsw_overflow_name(g_hnsw_auto_overflow), f->decision.overflowed, f->status,
+        (unsigned long long)f->n, (unsigned long long)f->host_estimate,
+        (unsigned long long)f->gpu_estimate, (unsigned long long)f->host_budget,
+        (unsigned long long)f->gpu_budget, f->decision.partitions,
+        (unsigned long long)f->disk_need,
+        error && error[0] ? " error=" : "", error && error[0] ? error : "");
+}
+
+/* Regular-disk probe of an existing directory (index dir or private
+ * workdir). tmpfs/ramfs are rejected like the input spool. */
+static int
+hnsw_dir_disk(const char *dir, uint64_t *avail)
+{
+    struct statvfs disk;
+    int regular = 0;
+    int probe = open(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+#ifdef __linux__
+    struct statfs fs;
+    regular = probe >= 0 && fstatfs(probe, &fs) == 0
+        && fs.f_type != 0x01021994 && fs.f_type != 0x858458f6;
+#else
+    regular = probe >= 0;
+#endif
+    if (probe >= 0) close(probe);
+    *avail = 0;
+    if (statvfs(dir, &disk) == 0)
+    {
+        long double bytes = (long double)disk.f_bavail * disk.f_frsize;
+        *avail = bytes > (long double)UINT64_MAX ? UINT64_MAX : (uint64_t)bytes;
+    }
+    return regular;
+}
+
+/* Op 40: read-only forecast from table statistics. No wait_for_idle, no
+ * workdir, no reservation; the backend uses it only to announce the route
+ * (PN-1) or to fail before its heap scan. */
+static void
+handle_hnsw_route_preflight(int client_fd)
+{
+    CuvsHnswPreflightRequest request;
+    CuvsHnswPreflightReply reply;
+    CuvsHnswForecast f;
+    int locked = 0;
+    memset(&reply, 0, sizeof(reply));
+    memset(&f, 0, sizeof(f));
+    reply.version = CUVS_HNSW_PREFLIGHT_VERSION;
+    reply.auto_overflow = g_hnsw_auto_overflow;
+    reply.header.status = CUVS_STATUS_BUILD_FAILED;
+    if (recv_all(client_fd, &request, sizeof(request)) < 0) return;
+    reply.n_estimate = request.n_estimate;
+    snprintf(reply.index_dir, sizeof(reply.index_dir), "%s", g_index_dir);
+    if (request.version != CUVS_HNSW_PREFLIGHT_VERSION || request.hierarchy > 1
+        || !request.host_budget || !request.n_estimate
+        || request.n_estimate > CUVS_TIDS_MAX_VECS || !request.dim
+        || request.dim > CUVS_VECTORS_MAX_DIM)
+    {
+        snprintf(reply.header.error, sizeof(reply.header.error), "invalid HNSW preflight request");
+        goto send;
+    }
+    for (int tries = 0; tries < 10 && !locked; tries++)
+    {
+        if (pthread_mutex_trylock(&g_index_mutex) == 0) locked = 1;
+        else (void)poll(NULL, 0, 100);
+    }
+    int device = usable_gpu(0);
+    reply.header.error[0] = '\0';
+    uint64_t host = hnsw_host_headroom(request.host_budget, reply.header.error, sizeof(reply.header.error));
+    uint64_t gpu = hnsw_gpu_budget(device, locked);
+    if (locked) pthread_mutex_unlock(&g_index_mutex);
+    reply.gpu_static = !locked;
+    if (!host || !gpu)
+    {
+        if (!reply.header.error[0])
+            snprintf(reply.header.error, sizeof(reply.header.error), "HNSW host/GPU/cgroup headroom unavailable");
+        f.n = request.n_estimate; f.host_budget = host; f.gpu_budget = gpu;
+        f.status = CUVS_STATUS_BUILD_FAILED;
+    }
+    else if (cuvs_hnsw_forecast_route(request.n_estimate, request.dim, request.graph_degree,
+                 request.intermediate_degree, request.hierarchy, request.build_algo,
+                 request.ef_construction, g_hnsw_auto_overflow, host, gpu, &f,
+                 reply.header.error, sizeof(reply.header.error)) == CUVS_STATUS_OK)
+    {
+        uint64_t avail;
+        reply.disk_regular = (uint32_t)hnsw_dir_disk(g_index_dir, &avail);
+        (void)cuvs_hnsw_forecast_disk(&f, reply.disk_regular, avail,
+            reply.header.error, sizeof(reply.header.error));
+    }
+    hnsw_route_log("prespool", request.build_algo, &f, reply.header.error);
+    reply.header.status = f.status;
+    reply.route = f.status == CUVS_STATUS_OK ? f.decision.route : 0;
+    reply.partitions = f.decision.partitions;
+    reply.overflowed = f.decision.overflowed;
+    reply.disk_ok = f.disk_ok;
+    reply.host_estimate = f.host_estimate; reply.gpu_estimate = f.gpu_estimate;
+    reply.host_budget = f.host_budget; reply.gpu_budget = f.gpu_budget;
+    reply.disk_need = f.disk_need; reply.disk_avail = f.disk_avail;
+ send:
+    send_all(client_fd, &reply, sizeof(reply));
+}
+
 static void
 handle_build_hnsw_file(int client_fd, const CuvsCmdFrame *cmd)
 {
@@ -9178,7 +9310,6 @@ handle_build_hnsw_file(int client_fd, const CuvsCmdFrame *cmd)
     CuvsHnswFileReply wire = {0};
     CuvsReplyHeader reply = {0};
     struct stat st;
-    struct statvfs disk;
     int vectors_fd = -1, owner_fd = -1, result_fd = -1;
     int locked = 0, lease_fd = -1;
     char token;
@@ -9212,6 +9343,7 @@ handle_build_hnsw_file(int client_fd, const CuvsCmdFrame *cmd)
     params.hierarchy = request.hierarchy;
     params.build_algo = request.build_algo;
     params.ef_construction = request.ef_construction;
+    params.auto_overflow = g_hnsw_auto_overflow;
     params.policy = &wire.policy;
     if (cuvs_hnsw_wait_for_idle(&g_index_mutex, owner_fd, hnsw_gpu_work_pending, NULL))
         goto cancelled;
@@ -9219,20 +9351,24 @@ handle_build_hnsw_file(int client_fd, const CuvsCmdFrame *cmd)
     reply.error[0] = '\0';
     params.host_budget = hnsw_host_headroom(request.host_budget, reply.error, sizeof(reply.error));
     int device = usable_gpu(0);
-    params.gpu_budget = cuvs_vram_free_bytes_on(device);
-    uint64_t used = total_vram_used(device);
-    if (g_max_vram_per_gpu[device])
-    {
-        uint64_t remaining = used < g_max_vram_per_gpu[device]
-            ? g_max_vram_per_gpu[device] - used : 0;
-        if (remaining < params.gpu_budget) params.gpu_budget = remaining;
-    }
+    params.gpu_budget = hnsw_gpu_budget(device, 1);
     if (!params.host_budget || !params.gpu_budget)
     {
         if (!reply.error[0])
             snprintf(reply.error, sizeof(reply.error), "HNSW host/GPU/cgroup headroom unavailable");
         goto done;
     }
+    /* ADR-087 decision 4: route decided right after the lock and budgets,
+     * before mkdtemp and the disk check, by the same pure resolver the
+     * wrapper re-runs with these exact inputs. */
+    CuvsHnswForecast route;
+    reply.status = cuvs_hnsw_forecast_route(params.n_vecs, params.dim,
+        params.graph_degree, params.intermediate_degree, params.hierarchy,
+        params.build_algo, params.ef_construction, params.auto_overflow,
+        params.host_budget, params.gpu_budget, &route, reply.error, sizeof(reply.error));
+    hnsw_route_log("build", params.build_algo, &route, reply.error);
+    if (reply.status != CUVS_STATUS_OK) goto done;
+    reply.status = CUVS_STATUS_BUILD_FAILED;
     (void)cuvs_hnsw_reap_workdirs(g_index_dir);
     if (snprintf(workdir, sizeof(workdir), "%s/.hnsw-job-XXXXXX", g_index_dir)
             >= (int)sizeof(workdir) || !mkdtemp(workdir))
@@ -9249,22 +9385,14 @@ handle_build_hnsw_file(int client_fd, const CuvsCmdFrame *cmd)
         snprintf(reply.error, sizeof(reply.error), "cannot acquire HNSW temporary directory lease");
         goto done;
     }
-    /* Reject tmpfs even if configured as the daemon's index directory. */
-    int probe = open(workdir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
-    int disk_ok = 0;
-#ifdef __linux__
-    struct statfs fs;
-    disk_ok = probe >= 0 && fstatfs(probe, &fs) == 0
-        && fs.f_type != 0x01021994 && fs.f_type != 0x858458f6;
-#endif
-    if (probe >= 0) close(probe);
-    uint64_t raw = params.n_vecs * params.dim * sizeof(float);
-    uint64_t needed = raw * 4 + params.n_vecs * (params.graph_degree * 8ULL + 64);
-    if (!disk_ok || statvfs(workdir, &disk)
-        || (long double)disk.f_bavail * disk.f_frsize < needed)
+    /* Reject tmpfs even if configured as the daemon's index directory.
+     * Same formula as the pre-spool check (UC-5 sub-decision 1(a)). */
     {
-        snprintf(reply.error, sizeof(reply.error), "HNSW needs regular disk capacity for input/reorder/graph/serialization");
-        goto done;
+        uint64_t avail;
+        int regular = hnsw_dir_disk(workdir, &avail);
+        if (cuvs_hnsw_forecast_disk(&route, regular, avail, reply.error,
+                                    sizeof(reply.error)) != CUVS_STATUS_OK)
+            goto done;
     }
     (void)fstat(vectors_fd, &st);
     LOG_INFO("[hnsw_job] job=%s phase=start mono_us=%llu rows=%llu dim=%u input_dev=%llu input_ino=%llu\n",
@@ -9299,6 +9427,16 @@ handle_build_hnsw_file(int client_fd, const CuvsCmdFrame *cmd)
 #endif
     reply.status = cuvs_hnsw_build_file(vectors_fd, owner_fd, &params, workdir,
         device, &result_fd, reply.error, sizeof(reply.error));
+    /* [hnsw_route] and the receipt must name the same route (Q4-6 (iii)). */
+    if (reply.status == CUVS_STATUS_OK
+        && (wire.policy.route != route.decision.route
+            || !!(wire.policy.route_flags & CUVS_HNSW_ROUTE_FLAG_AUTO_OVERFLOW)
+               != !!route.decision.overflowed))
+    {
+        reply.status = CUVS_STATUS_BUILD_FAILED;
+        snprintf(reply.error, sizeof(reply.error), "HNSW receipt route %s differs from decided route %s",
+                 cuvs_hnsw_route_name(wire.policy.route), cuvs_hnsw_route_name(route.decision.route));
+    }
     LOG_INFO("[hnsw_job] job=%s phase=wrapper-return mono_us=%llu status=%u owner_cancelled=%d gpu_free_now=%zu resident_now=%zu\n",
         workdir, (unsigned long long)cuvs_hnsw_monotonic_us(), reply.status,
         cuvs_hnsw_owner_cancelled(owner_fd), cuvs_vram_free_bytes_on(device), total_vram_used(device));
@@ -10097,6 +10235,30 @@ connection_thread(void *arg)
         case CUVS_OP_BUILD_HNSW_FILE:
             handle_build_hnsw_file(client_fd, &cmd);
             break;
+        case CUVS_OP_HNSW_ROUTE_PREFLIGHT:
+            handle_hnsw_route_preflight(client_fd);
+            break;
+        case CUVS_OP_CAGRA_AR0_PREFLIGHT:
+        {
+            /* Static startup values; same pair as pick_gpu_for_index. */
+            CuvsReplyHeader hdr = {.status = CUVS_STATUS_OK, .n_results = 1};
+            CuvsCagraPreflightReply ar0 = {.version = CUVS_CAGRA_PREFLIGHT_VERSION};
+            int unlimited = 0;
+            for (int i = 0; i < n_usable_gpus(); i++)
+            {
+                int dev = usable_gpu(i);
+                uint64_t limit = g_max_vram_per_gpu[dev];
+                if (g_rmm_pool_limits[dev] > 0 && (limit == 0 || g_rmm_pool_limits[dev] < limit))
+                    limit = g_rmm_pool_limits[dev];
+                if (limit == 0) unlimited = 1;
+                if (limit > ar0.max_limit) ar0.max_limit = limit;
+                ar0.n_devices++;
+            }
+            if (unlimited || ar0.n_devices == 0) ar0.max_limit = 0;
+            send_all(client_fd, &hdr, sizeof(hdr));
+            send_all(client_fd, &ar0, sizeof(ar0));
+            break;
+        }
         case CUVS_OP_BUILD:
             handle_build(client_fd, &cmd);
             break;
@@ -10124,7 +10286,8 @@ connection_thread(void *arg)
                 .version = CUVS_RMM_POOL_STATUS_VERSION,
                 .initial_mb = g_rmm_pool_mb,
                 .maximum_percent = g_rmm_pool_mb > 0 ? g_rmm_pool_max_percent : 0,
-                .scratch_permille = g_scratch_permille
+                .scratch_permille = g_scratch_permille,
+                .hnsw_auto_overflow = g_hnsw_auto_overflow
             };
             if (g_rmm_pool_mb > 0)
                 for (int i = 0; i < n_usable_gpus(); i++)
@@ -10847,6 +11010,15 @@ main(int argc, char **argv)
                 return 1;
             }
         }
+        else if (strcmp(argv[i], "--hnsw-auto-overflow") == 0)
+        {
+            if (i + 1 >= argc
+                || (g_hnsw_auto_overflow = cuvs_hnsw_overflow_from_name(argv[++i])) == UINT32_MAX)
+            {
+                LOG_ERROR("--hnsw-auto-overflow requires ace or error\n");
+                return 1;
+            }
+        }
         else if (strcmp(argv[i], "--max-indexes") == 0 && i+1 < argc)
         {
             int n = atoi(argv[++i]);
@@ -11036,6 +11208,9 @@ main(int argc, char **argv)
              g_rmm_pool_mb > 0 ? g_rmm_pool_max_percent : 0);
     LOG_INFO("CAGRA build scratch: rmm_scratch_permille=%u (admission N = final + "
              "ceil(final x %u / 1000))\n", g_scratch_permille, g_scratch_permille);
+    LOG_INFO("HNSW auto overflow: %s (--hnsw-auto-overflow; default %s)\n",
+             cuvs_hnsw_overflow_name(g_hnsw_auto_overflow),
+             cuvs_hnsw_overflow_name(CUVS_HNSW_AUTO_OVERFLOW_DEFAULT));
 
     /* ADR-075 Phase 1: probe hardware + write the global cost-model profile. */
     write_hw_profile();
