@@ -52,10 +52,11 @@ def check(wrapper, backend, server, baseline):
     assert resolve < mapping < dispatch, 'ROUTE_BEFORE_MAPPING_AND_EXECUTE'
     assert 'if (rc != CUVS_STATUS_OK) return rc;' in public[resolve:mapping], 'RESOLVER_ERROR_MUST_STOP'
     assert 'receipt.route = prepared.route.route;' in public, 'RECEIPT_ROUTE_SEAM'
-    assert 'bool disk = cap.host_peak' not in public, 'NO_SILENT_AUTO_ACE'
+    # NO_SILENT_AUTO_ACE was replaced by the I3-C invariant (UC-5 sub-decision 4):
+    # check_hnsw_auto_overflow_source.py ONE_OVERFLOW_* / *_NOTICE / RECEIPT_*.
     fn = function(backend, 'cuvs_build_hnsw_from_heap(Relation heapRel')
     assert 'if (rc == CUVS_STATUS_HNSW_RESIDENT_BUDGET_EXCEEDED)' in fn, 'RESIDENT_ONLY_HINT_GUARD'
-    assert 'auto selected ACE-disk' not in fn and 'explicit build_algo=ace selected ACE-disk' in fn, 'EXPLICIT_NOTICE'
+    assert 'explicit build_algo=ace selected ACE-disk' in fn, 'EXPLICIT_NOTICE'
     handler = function(server, 'handle_build_hnsw_file(int client_fd')
     assert handler.index('cuvs_hnsw_receive_file_request(') < handler.index('cuvs_hnsw_wait_for_idle('), 'DAEMON_CONSUMER_BEFORE_ADMISSION'
     return dict(status='PASS_SOURCE_CONFORMANCE_NOT_CUDA',
