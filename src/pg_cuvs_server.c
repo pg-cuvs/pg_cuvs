@@ -10689,26 +10689,35 @@ handle_index_status(int client_fd)
 /* I3-E tail of one memory_status row (CUVS_MEMORY_STATUS_COLS_I3E order).
  * pool_used / pool_reserved are -1 (NULL) when the GPU has no RMM pool quota
  * or the pool cannot be read. Caller holds g_index_mutex. */
+/* Byte counts go out as signed int64 ('l'/'n' kinds): a saturated
+ * uint64 counter (cuvs_lw_sat_add) is clamped, not sent as a value the
+ * backend refuses to parse. */
+static long long
+i3e_i64(uint64_t v)
+{
+    return v > (uint64_t)INT64_MAX ? (long long)INT64_MAX : (long long)v;
+}
+
 static void
 memory_status_row_i3e(TextBuf *b, int dev)
 {
     CuvsRmmPoolStats ps;
     int pool_ok = g_rmm_pool_limits[dev] > 0 && cuvs_rmm_pool_stats(dev, &ps) == 0;
     int last = g_last_reject_reason1[dev] - 1;
-    tb_printf(b, "\t%zu\t%zu\t%lld\t%lld\t%zu\t%llu\t%d",
+    tb_printf(b, "\t%zu\t%zu\t%lld\t%lld\t%zu\t%lld\t%d",
               g_max_vram_per_gpu[dev], g_rmm_pool_limits[dev],
               pool_ok ? (long long)ps.used_bytes : -1LL,
               pool_ok ? (long long)ps.reserved_bytes : -1LL,
               g_pending_rmm_build_vram[dev],
-              (unsigned long long)g_lw_pending[dev],
+              i3e_i64(g_lw_pending[dev]),
               g_pending_build_count[dev]);
     for (int r = 0; r < CUVS_I3E_N_REJECT_REASONS; r++)
-        tb_printf(b, "\t%llu", (unsigned long long)g_rejects[dev][r]);
-    tb_printf(b, "\t%s\t%lld\t%llu\t%llu\n",
+        tb_printf(b, "\t%lld", i3e_i64(g_rejects[dev][r]));
+    tb_printf(b, "\t%s\t%lld\t%lld\t%lld\n",
               last >= 0 ? cuvs_admission_reason_name((CuvsAdmissionReason)last) : "",
               (long long)g_last_reject_at[dev],
-              (unsigned long long)g_managed_spill_builds[dev],
-              (unsigned long long)g_managed_spill_bytes_max[dev]);
+              i3e_i64(g_managed_spill_builds[dev]),
+              i3e_i64(g_managed_spill_bytes_max[dev]));
 }
 
 static void

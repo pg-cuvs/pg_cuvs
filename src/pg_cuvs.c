@@ -7420,7 +7420,8 @@ pg_cuvs_build_status(PG_FUNCTION_ARGS)
         values[c++] = Int64GetDatum((int64) r->reserved_n_bytes);
         values[c++] = CStringGetTextDatum(r->policy == 1 ? "managed" : "error");
         nulls[c] = !r->lw_ub_valid;
-        values[c++] = Int64GetDatum((int64) r->lw_ub_bytes);
+        values[c++] = Int64GetDatum(r->lw_ub_bytes > (uint64) PG_INT64_MAX
+                                    ? PG_INT64_MAX : (int64) r->lw_ub_bytes);
         values[c++] = CStringGetTextDatum(r->lw_ub_valid ? "admission" : "none");
         values[c++] = CStringGetTextDatum(r->phase);
         Assert(c == CUVS_BUILD_STATUS_NATTS);
