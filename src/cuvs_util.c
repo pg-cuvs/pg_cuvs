@@ -1572,7 +1572,9 @@ cuvs_admission_format(const CuvsAdmissionFields *f, CuvsAdmissionObject obj,
     {
         case CUVS_ADMISSION_AR0:
             cuvs_sb_add(&d, "needs "); cuvs_sb_mib(&d, f->n);
-            cuvs_sb_add(&d, " MiB; the limit for one build is "); cuvs_sb_mib(&d, f->q);
+            cuvs_sb_add(&d, load ? " MiB; the limit for one index is "
+                                 : " MiB; the limit for one build is ");
+            cuvs_sb_mib(&d, f->q);
             cuvs_sb_add(&d, " MiB (pool quota, or the logical VRAM budget when the pool "
                             "is disabled)");
             break;
@@ -1662,6 +1664,13 @@ cuvs_admission_format(const CuvsAdmissionFields *f, CuvsAdmissionObject obj,
     switch (f->reason)
     {
         case CUVS_ADMISSION_AR0:
+            if (load)
+            {
+                cuvs_sb_add(&h, "The index is larger than the GPU memory limit of every "
+                                "GPU, so it cannot be loaded. An operator can raise "
+                                "--max-vram-mb or --rmm-pool-max-percent.");
+                break;
+            }
             cuvs_sb_add(&h, "For a large table use pg_cuvs_hnsw with build_algo='auto' "
                             "(it spills to ACE on disk when over budget) or "
                             "build_algo='ace'.");
@@ -1741,7 +1750,9 @@ cuvs_admission_format(const CuvsAdmissionFields *f, CuvsAdmissionObject obj,
         default:
             return NULL;
     }
-    return state;
+    /* CK-8: a search-path reload rejection keeps SQLSTATE 53200 (C5 reload
+     * row), AR0 included. */
+    return load ? CUVS_ADMISSION_SQLSTATE_MEMORY : state;
 }
 
 /* ----------------------------------------------------------------

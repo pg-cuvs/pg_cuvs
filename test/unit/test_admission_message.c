@@ -325,6 +325,18 @@ test_reload_variants(void)
     HAS("load w=-1 detail", o.detail, "(a pinned index is released only by pg_cuvs_unpin)");
     LACKS("load w=-1 no retry prefix", o.hint, "Retry once running searches finish");
     HAS("load w=-1 unpin", o.hint, "pg_cuvs_unpin(index)");
+    /* CK-8: every search-path reload rejection stays 53200, AR0 included,
+     * with load wording rather than build advice. */
+    f = base(CUVS_ADMISSION_AR0);
+    f.present = CUVS_ADM_F_N | CUVS_ADM_F_Q;
+    f.n = 300; f.q = 200;
+    o = format(&f, CUVS_ADMISSION_OBJ_LOAD, 0, "public.items_idx");
+    CHECK("load AR0 53200", o.sqlstate && strcmp(o.sqlstate, "53200") == 0);
+    CHECK("load AR0 detail", strcmp(o.detail, "needs 300 MiB; the limit for one index is "
+                                              "200 MiB (pool quota, or the logical VRAM "
+                                              "budget when the pool is disabled)") == 0);
+    LACKS("load AR0 no build advice", o.hint, "pg_cuvs_hnsw");
+    HAS("load AR0 hint", o.hint, "--max-vram-mb");
     f = base(CUVS_ADMISSION_AR1);
     f.present = CUVS_ADM_F_N | CUVS_ADM_F_F | CUVS_ADM_F_Q | CUVS_ADM_F_P;
     o = format(&f, CUVS_ADMISSION_OBJ_LOAD, 0, "public.items_idx");

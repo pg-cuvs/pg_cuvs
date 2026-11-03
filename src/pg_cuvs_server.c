@@ -1746,7 +1746,7 @@ load_index_sharded(uint32_t db_oid, uint32_t index_oid,
             {
                 AdmitLine al = {.op = "LOAD_SHARD", .path = "reload", .algo = "cagra",
                                 .gpu = alt, .db = db_oid, .idx = index_oid,
-                                .dim = recs[i].dim, .gd = 64, .n = recs[i].n_vecs,
+                                .dim = recs[i].dim, .gd = 64, .igd = 128, .n = recs[i].n_vecs,
                                 .final = needed, .needed = needed};
                 if (alt >= 0)
                     al.pending_before = g_pending_rmm_build_vram[alt];
@@ -2024,7 +2024,7 @@ load_index(uint32_t db_oid, uint32_t index_oid)
     if (target_gpu < 0)
     {
         AdmitLine al = {.op = "LOAD", .path = "reload", .algo = "cagra", .gpu = -1,
-                        .db = db_oid, .idx = index_oid, .dim = dim, .gd = 64,
+                        .db = db_oid, .idx = index_oid, .dim = dim, .gd = 64, .igd = 128,
                         .n = n_vecs, .final = needed, .needed = needed};
         admission_fill(&t_reload_rej, CUVS_ADMISSION_AR0, needed, -1);
         log_admit(&al, CUVS_ADMISSION_AR0);
@@ -2037,7 +2037,7 @@ load_index(uint32_t db_oid, uint32_t index_oid)
     {
         AdmitLine al = {.op = "LOAD", .path = "reload", .algo = "cagra",
                         .gpu = target_gpu, .db = db_oid, .idx = index_oid, .dim = dim,
-                        .gd = 64, .n = n_vecs, .final = needed, .needed = needed,
+                        .gd = 64, .igd = 128, .n = n_vecs, .final = needed, .needed = needed,
                         .pending_before = g_pending_rmm_build_vram[target_gpu]};
         log_admit(&al, t_reload_rej.reason);
         LOG_WARN("pg_cuvs_server: VRAM exhausted on GPU %d loading %u/%u "

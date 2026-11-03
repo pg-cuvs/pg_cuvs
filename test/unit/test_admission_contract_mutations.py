@@ -84,6 +84,8 @@ MESSAGE_MUTATIONS = {
         '    if (1)\n    {\n        cuvs_sb_add(b, ", resident ");'),
     'shard_prefix_dropped': (
         '        cuvs_sb_add(&d, "shard %u: ", f->i);', '        ;'),
+    'load_ar0_reported_permanent': (
+        'return load ? CUVS_ADMISSION_SQLSTATE_MEMORY : state;', 'return state;'),
     'load_hint_says_create_index': (
         'const char *retry = load ? "then retry the query." : "then retry CREATE INDEX.";',
         'const char *retry = "then retry CREATE INDEX.";'),
