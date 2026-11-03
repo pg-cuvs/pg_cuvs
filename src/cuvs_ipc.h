@@ -889,3 +889,58 @@ int cuvs_ipc_inject_build_oom(
 );
 
 /* Circuit breaker state machine moved to cuvs_util.h (structural commit). */
+
+/* ----------------------------------------------------------------
+ * I3-B ops (30..39, append-only; coordination rule 2026-11-03). Same frame
+ * and reply header as every op, so no protocol bump beyond I3-A's 5.
+ *
+ * Manual ops (UNLOAD/LOAD/PIN/UNPIN): cmd.db_oid, cmd.index_oid. Reply is a
+ * header only; status OK or ERROR, and error[] carries the result text the
+ * SQL function returns or raises (C7 strings).
+ *
+ * RECLAIM_SET: cmd.shm_key = parameter name (flag spelling without "--"),
+ * cmd.filter_shm_key = value. Reply as for manual ops.
+ *
+ * Text ops (INDEX_STATUS, MEMORY_STATUS, RECLAIM_STATUS): header with
+ * n_results = byte length of the text that follows (no NUL), at most
+ * CUVS_IPC_TEXT_MAX. INDEX_STATUS/MEMORY_STATUS rows are '\n'-terminated,
+ * '\t'-separated, columns in the order of the *_COLS strings below (the
+ * backend checks the first line equals the column header). RECLAIM_STATUS
+ * is one JSON object (no header line) whose keys the backend appends to
+ * SHOW cuvs.rmm_pool_status.
+ * ---------------------------------------------------------------- */
+#define CUVS_OP_UNLOAD          30
+#define CUVS_OP_LOAD            31
+#define CUVS_OP_PIN             32
+#define CUVS_OP_UNPIN           33
+#define CUVS_OP_INDEX_STATUS    34
+#define CUVS_OP_MEMORY_STATUS   35
+#define CUVS_OP_RECLAIM_SET     36
+#define CUVS_OP_RECLAIM_STATUS  37
+
+#define CUVS_IPC_TEXT_MAX (8u * 1024u * 1024u)
+
+#define CUVS_INDEX_STATUS_COLS \
+    "db_oid\tindex_oid\tstate\tkind\tgpu\tvram_bytes\tlast_use\tloaded_at\t" \
+    "hits\tpinned\tin_use\tprotect_until\teligible\treclaim_exempt\t" \
+    "file_current\textend_count\twarmup_state\tevict_count\tlast_evict_at\t" \
+    "last_evict_reason\tlast_build_self_replace\tlast_build_unloaded"
+#define CUVS_INDEX_STATUS_NCOLS 22
+
+#define CUVS_MEMORY_STATUS_COLS \
+    "gpu\tbudget_eff\tresident_bytes\tpending_bytes\tpinned_bytes\t" \
+    "n_resident\tn_pinned\treclaim_mode\treclaim_f_bytes\treclaim_f_src\t" \
+    "last_reclaim_at\tlast_reclaim_trigger\treclaim_runs\treclaim_skip_sidecar\t" \
+    "persist_failures\tevict_admit_build\tevict_reload\tevict_soft_evict\t" \
+    "evict_reclaim\tevict_manual_unload\tevict_slot\tevictions\tdrops\t" \
+    "history_dropped\tpeak_bytes"
+#define CUVS_MEMORY_STATUS_NCOLS 25
+
+/* Manual op: returns CUVS_STATUS_*; msg receives the daemon's text. */
+int cuvs_ipc_manual(const char *socket_path, uint32_t op, uint32_t db_oid,
+                    uint32_t index_oid, char *msg, size_t msglen);
+int cuvs_ipc_reclaim_set(const char *socket_path, const char *name,
+                         const char *value, char *msg, size_t msglen);
+/* Text op: on OK *text is malloc'd (NUL-terminated, caller frees). */
+int cuvs_ipc_text(const char *socket_path, uint32_t op, char **text,
+                  size_t *len);
