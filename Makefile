@@ -271,7 +271,7 @@ TEST_RT_LIB := $(shell [ "$$(uname -s)" = "Linux" ] && echo -lrt)
 test-unit: test/unit/test_cuvs_util.c src/cuvs_util.c src/cuvs_util.h src/cuvs_ipc.h \
            test/unit/test_build_corpus.c src/cuvs_build_corpus.c src/cuvs_build_corpus.h \
            test-hnsw-build test-hnsw-build-ipc test-hnsw-admission test-admission-contract \
-           test-admission-wire test-admission-message test-admission-ipc test-build-oom-thread test-cache-policy test-circuit-source test-status-text
+           test-admission-wire test-admission-message test-admission-ipc test-build-oom-thread test-cache-policy test-circuit-source test-status-text test-i3b-source
 	$(CC) -I src -DCUVS_TEST_HOOKS -o test-unit test/unit/test_cuvs_util.c src/cuvs_util.c $(TEST_RT_LIB)
 	./test-unit
 	$(CC) -I src -o test-build-corpus test/unit/test_build_corpus.c src/cuvs_build_corpus.c $(TEST_RT_LIB)
@@ -375,6 +375,12 @@ test-cache-policy: test/unit/test_cache_policy.c src/cuvs_cache_policy.c \
 	$(CC) -std=gnu11 -Wall -Wextra -Werror -I src -o $@ test/unit/test_cache_policy.c \
 		src/cuvs_cache_policy.c src/cuvs_util.c -lm $(TEST_RT_LIB)
 	./$@
+
+# CK-36 (a) requester arguments and CK-37 (a) I-FC assignment sites.
+test-i3b-source: test/unit/check_i3b_server_source.py src/pg_cuvs_server.c
+	python3 test/unit/check_i3b_server_source.py src/pg_cuvs_server.c
+
+.PHONY: test-i3b-source
 
 EXTRA_CLEAN += test-cache-policy
 .PHONY: test-cache-policy
