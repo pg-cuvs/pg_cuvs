@@ -5,11 +5,12 @@ ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)
 SRC = os.path.join(ROOT, "src", "cuvs_peak_meter.c")
 M = [
     ("off ignored (peak updated when off)",
-     "    if (!atomic_load_explicit(&g_enabled, memory_order_relaxed))\n        return now;\n", ""),
+     "    if (!ok(dev) || !atomic_load_explicit(&g_enabled, memory_order_relaxed))\n        return;",
+     "    if (!ok(dev))\n        return;"),
     ("reset missing", "    if (ok(dev))\n        atomic_store_explicit(&g_peak[dev],", "    if (0)\n        atomic_store_explicit(&g_peak[dev],"),
     ("race: load/store instead of CAS",
-     "    while (now > prev &&\n           !atomic_compare_exchange_weak_explicit(&g_peak[dev], &prev, now,\n                                                  memory_order_relaxed,\n                                                  memory_order_relaxed))\n        ;",
-     "    if (now > prev)\n        atomic_store_explicit(&g_peak[dev], now, memory_order_relaxed);"),
+     "    while (level > prev &&\n           !atomic_compare_exchange_weak_explicit(&g_peak[dev], &prev, level,\n                                                  memory_order_relaxed,\n                                                  memory_order_relaxed))\n        ;",
+     "    if (level > prev)\n        atomic_store_explicit(&g_peak[dev], level, memory_order_relaxed);"),
 ]
 def run(text):
     d = tempfile.mkdtemp()

@@ -103,9 +103,11 @@ private:
     void *do_allocate(std::size_t bytes, rmm::cuda_stream_view stream) override
     {
         std::size_t sz = rmm::align_up(bytes, rmm::CUDA_ALLOCATION_ALIGNMENT);
-        cuvs_peak_meter_alloc(dev_, sz);
+        std::size_t level = cuvs_peak_meter_reserve(dev_, sz);
         try {
-            return upstream_.allocate(stream, bytes);
+            void *p = upstream_.allocate(stream, bytes);
+            cuvs_peak_meter_commit(dev_, level);   /* only a successful allocation */
+            return p;
         } catch (...) {
             cuvs_peak_meter_free(dev_, sz);
             throw;

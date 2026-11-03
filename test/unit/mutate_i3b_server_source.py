@@ -29,18 +29,27 @@ M = [
     ("multi OOM retry removed", "                freed = evict_lru(target_gpu, CUVS_RQ_BUILD_CAGRA);",
      "                freed = 0;"),
     ("second skip site", "graceful_shutdown(void)\n{", "graceful_shutdown(void)\n{\n    if (!g_indexes[0].file_current) {}"),
+    ("wrapper: peak CAS before the upstream allocate",
+     "        std::size_t level = cuvs_peak_meter_reserve(dev_, sz);\n        try {\n            void *p = upstream_.allocate(stream, bytes);\n            cuvs_peak_meter_commit(dev_, level);",
+     "        std::size_t level = cuvs_peak_meter_reserve(dev_, sz);\n        cuvs_peak_meter_commit(dev_, level);\n        try {\n            void *p = upstream_.allocate(stream, bytes);"),
 ]
+WRAP = os.path.join(ROOT, "src", "cuvs_wrapper.cu")
 orig = open(SRC).read()
+worig = open(WRAP).read()
 base = subprocess.run([sys.executable, SCAN, SRC], capture_output=True, text=True)
 print("baseline:", base.stdout.strip().splitlines()[-1])
 bad = 0 if base.returncode == 0 else 1
 for name, old, new in M:
-    if orig.count(old) != 1:
-        print(f"SETUP-ERROR {name}: {orig.count(old)}x"); bad += 1; continue
-    with tempfile.NamedTemporaryFile("w", suffix=".c", delete=False) as f:
-        f.write(orig.replace(old, new, 1)); tmp = f.name
-    r = subprocess.run([sys.executable, SCAN, tmp], capture_output=True, text=True)
-    os.unlink(tmp)
+    is_wrap = name.startswith("wrapper:")
+    text = worig if is_wrap else orig
+    if text.count(old) != 1:
+        print(f"SETUP-ERROR {name}: {text.count(old)}x"); bad += 1; continue
+    d = tempfile.mkdtemp()
+    # the scan reads cuvs_wrapper.cu next to the server source
+    open(os.path.join(d, "pg_cuvs_server.c"), "w").write(orig if is_wrap else orig.replace(old, new, 1))
+    open(os.path.join(d, "cuvs_wrapper.cu"), "w").write(worig.replace(old, new, 1) if is_wrap else worig)
+    r = subprocess.run([sys.executable, SCAN, os.path.join(d, "pg_cuvs_server.c")],
+                       capture_output=True, text=True)
     red = r.returncode != 0
     bad += 0 if red else 1
     first = next((l for l in r.stdout.splitlines() if l.startswith("FAIL")), "")
