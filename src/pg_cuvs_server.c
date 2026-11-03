@@ -418,6 +418,9 @@ static size_t g_pending_rmm_build_vram[CUVS_MAX_GPUS];
 static int    g_server_fd         = -1;
 static volatile int g_shutdown    = 0;
 static CuvsReclaimParams g_reclaim;  /* I3-B knobs; defined with the policy state */
+/* index_oid of the request now being admitted ([evict] requester_idx; 0 for
+ * reclaim and manual unload). Set under g_index_mutex by each requester. */
+static uint32_t g_cur_requester_idx;
 static char   g_snapshot_uri[512] = ""; /* "gs://bucket[/prefix]"; empty = disabled */
 static char   g_cluster_id[128]   = ""; /* multi-node identifier for GCS path */
 static char   g_gcs_key_file[512] = ""; /* service account JSON; empty = instance metadata */
@@ -1910,6 +1913,7 @@ build_rev_tid_map(IndexEntry *e)
 static int
 load_index(uint32_t db_oid, uint32_t index_oid, CuvsRequester rq)
 {
+    g_cur_requester_idx = index_oid;
     char idx_path[512], tids_path[512];
 
     memset(&t_reload_rej, 0, sizeof(t_reload_rej));
@@ -2432,6 +2436,14 @@ static CuvsFreeTarget g_reclaim_f[CUVS_MAX_GPUS];
  * its AR classifier; the reclaim F log only needs AR0/AR7 vs the rest). */
 static int      g_last_admit_reason = CUVS_ADMISSION_NONE;
 
+static uint64_t
+mono_us(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000u + (uint64_t)ts.tv_nsec / 1000u;
+}
+
 /* Eviction history (C8): survives the registry entry, dropped with DROP
  * INDEX, bounded; oldest key dropped first (history_dropped). */
 #define CUVS_EVICT_HISTORY_MAX 65536
@@ -2588,6 +2600,7 @@ evict_entry(IndexEntry *e, int device_id, CuvsEvictReason why, int self_replace,
     time_t now = time(NULL);
     int eligible = cuvs_evict_eligible(&c, (int64_t)now, &pp);
     int saved = 0;
+    uint64_t saved_ms = 0;
     uint32_t db = e->db_oid, idx = e->index_oid;
     size_t freed;
 
@@ -2637,7 +2650,10 @@ evict_entry(IndexEntry *e, int device_id, CuvsEvictReason why, int self_replace,
          * the skip is decided (SIGTERM always saves). */
         if (!e->file_current)
         {
-            if (save_index(e) != 0) {
+            uint64_t t0 = mono_us();
+            int src = save_index(e);
+            saved_ms = (mono_us() - t0) / 1000u;
+            if (src != 0) {
                 LOG_ERROR("[evict] save_index FAILED for %u/%u on GPU %u; skipping victim "
                           "(VRAM still holds index)\n",
                         e->db_oid, e->index_oid, e->gpu_device_id);
@@ -2661,12 +2677,20 @@ evict_entry(IndexEntry *e, int device_id, CuvsEvictReason why, int self_replace,
     /* 3P: free IVF-PQ GPU index. */
     if (e->ivfpq_handle) { cuvs_ivfpq_free(e->ivfpq_handle, e->gpu_device_id); e->ivfpq_handle = NULL; }
 
-    LOG_INFO("[evict] gpu=%d db=%u idx=%u reason=%s requester=%s bytes=%zu "
-             "idle_s=%lld hits=%u protect_s=%lld eligible=%d saved=%d self_replace=%d\n",
-             device_id, db, idx, cuvs_evict_reason_name(why), cuvs_requester_name(rq),
-             freed, c.last_use ? (long long)(now - c.last_use) : -1LL, c.hits,
+    /* ADR-086 [evict] schema (13): op gpu db idx reason requester_idx idle_s
+     * protect_s hits vram_bytes saved_ms mono_us self_replace. idle_s = -1
+     * for a never-searched victim. op = requester kind. */
+    LOG_INFO("[evict] op=%s gpu=%d db=%u idx=%u reason=%s requester_idx=%u idle_s=%lld "
+             "protect_s=%lld hits=%u vram_bytes=%zu saved_ms=%llu mono_us=%llu "
+             "self_replace=%d\n",
+             cuvs_requester_name(rq), device_id, db, idx, cuvs_evict_reason_name(why),
+             (rq == CUVS_RQ_RECLAIM || rq == CUVS_RQ_MANUAL) ? 0u : g_cur_requester_idx,
+             c.last_use ? (long long)(now - c.last_use) : -1LL,
              (long long)cuvs_evict_protect_s(c.hits, pp.t_min_s, pp.bonus_s, pp.hits_cap),
-             eligible, saved, self_replace);
+             c.hits, freed, (unsigned long long)saved_ms,
+             (unsigned long long)mono_us(), self_replace);
+    (void) eligible;
+    (void) saved;
 
     int idx_pos = (int)(e - g_indexes);
     for (int i = idx_pos; i < g_n_indexes - 1; i++)
@@ -2930,6 +2954,7 @@ admit_build_cagra(size_t needed, int device_id, uint32_t db_oid,
 {
     *unloaded = 0;
     g_build_notice[0] = '\0';
+    g_cur_requester_idx = index_oid;
     if (ensure_vram(needed, device_id, CUVS_RQ_BUILD_CAGRA, NULL) == 0)
         return 0;
     int reason = g_last_admit_reason;
@@ -5663,6 +5688,7 @@ build_sharded(int client_fd, const CuvsCmdFrame *cmd, const char *index_dir,
                          cmd->db_oid, cmd->index_oid, (uint32_t)i);
         snprintf(shard_tmp[i], 576, "%s.tmp", shard_final[i]);
 
+        g_cur_requester_idx = cmd->index_oid;
         AdmitLine al = {.op = "BUILD", .path = "sharded",
                         .algo = admission_algo_name(cmd->build_algo), .gpu = dev,
                         .db = cmd->db_oid, .idx = cmd->index_oid, .dim = dim,
@@ -5923,6 +5949,7 @@ build_sharded(int client_fd, const CuvsCmdFrame *cmd, const char *index_dir,
     }
     else
     {
+        g_cur_requester_idx = cmd->index_oid;
         if (g_n_indexes >= g_max_indexes)
             (void) make_slot(usable_gpu(0), CUVS_RQ_BUILD_SHARD);
         if (g_n_indexes >= g_max_indexes)
@@ -6581,6 +6608,7 @@ finish_build_commit(int client_fd, const CuvsCmdFrame *cmd, const char *save_dir
         build_rev_tid_map(existing);   /* rebuild map for new tids/n_vecs */
     } else {
         int registry_full;
+        g_cur_requester_idx = cmd->index_oid;
         if (g_n_indexes >= g_max_indexes)
             (void) make_slot(target_gpu, CUVS_RQ_BUILD_CAGRA);
         registry_full = g_n_indexes >= g_max_indexes;
@@ -7986,6 +8014,7 @@ handle_build_flat(int client_fd, const CuvsCmdFrame *cmd)
         }
         else
         {
+            g_cur_requester_idx = cmd->index_oid;
             if (g_n_indexes >= g_max_indexes)
                 (void) make_slot(fgpu, CUVS_RQ_BUILD_FLAT);
             if (g_n_indexes >= g_max_indexes)
@@ -8124,6 +8153,7 @@ handle_build_ivfpq(int client_fd, const CuvsCmdFrame *cmd)
                               "IVF-PQ index too large for any GPU VRAM budget", &rej);
         return;
     }
+    g_cur_requester_idx = cmd->index_oid;
     al.gpu = target_gpu;
     al.pending_before = g_pending_rmm_build_vram[target_gpu];
     int admit_rc = ensure_vram(needed, target_gpu, CUVS_RQ_BUILD_IVFPQ, &rej);
@@ -8245,6 +8275,7 @@ handle_build_ivfpq(int client_fd, const CuvsCmdFrame *cmd)
         }
         else
         {
+            g_cur_requester_idx = cmd->index_oid;
             if (g_n_indexes >= g_max_indexes)
                 (void) make_slot(target_gpu, CUVS_RQ_BUILD_IVFPQ);
             if (g_n_indexes >= g_max_indexes)
@@ -9372,7 +9403,7 @@ handle_manual(int client_fd, const CuvsCmdFrame *cmd)
                     pthread_mutex_unlock(&g_index_mutex);
                     if (r == CUVS_ADMISSION_AR5)
                         reply_msg(client_fd, CUVS_STATUS_ERROR,
-                                  "not loaded: only pinned or in-use indexes could make room");
+                                  "not loaded: the indexes that could make room are pinned, in use, or still protected");
                     else if (r == CUVS_ADMISSION_NONE)
                         reply_msg(client_fd, CUVS_STATUS_ERROR,
                                   "not loaded: no usable index files for %u/%u", db, idx);
@@ -9798,12 +9829,17 @@ reclaim_gpu(int dev, time_t now)
     {
         char fsrc[48];
         cuvs_format_free_src(&g_reclaim_f[dev], fsrc, sizeof(fsrc));
-        LOG_INFO("[reclaim] gpu=%d mode=%s trigger=%s f_bytes=%llu f_src=%s budget_eff=%zu "
-                 "resident_before=%zu resident_after=%zu hi_pct=%u lo_pct=%u floor_pct=%u "
-                 "evicted=%d skip_sidecar=%d\n",
-                 dev, cuvs_reclaim_mode_name(g.mode), cuvs_reclaim_trigger_name(trig),
-                 (unsigned long long)g.f_bytes, g.f_bytes ? fsrc : "none", beff, before,
-                 resident, g.hi_pct, g.lo_pct, g.floor_pct, evicted, skipped);
+        /* ADR-086 [reclaim] schema (13): op gpu tick resident_before
+         * resident_after hi_bytes lo_bytes evicted skip_sidecar trigger
+         * f_bytes f_src mono_us. */
+        LOG_INFO("[reclaim] op=%s gpu=%d tick=%llu resident_before=%zu resident_after=%zu "
+                 "hi_bytes=%zu lo_bytes=%zu evicted=%d skip_sidecar=%d trigger=%s "
+                 "f_bytes=%llu f_src=%s mono_us=%llu\n",
+                 cuvs_reclaim_mode_name(g.mode), dev, (unsigned long long)g_reclaim_ticks,
+                 before, resident, beff / 100 * g.hi_pct, beff / 100 * g.lo_pct,
+                 evicted, skipped, cuvs_reclaim_trigger_name(trig),
+                 (unsigned long long)g.f_bytes, g.f_bytes ? fsrc : "none",
+                 (unsigned long long)mono_us());
     }
 }
 
