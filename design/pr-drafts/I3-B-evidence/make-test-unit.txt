@@ -1,29 +1,11 @@
-clang -std=gnu11 -Wall -Wextra -I src -o test-hnsw-build test/unit/test_hnsw_build.c
-./test-hnsw-build
-PASS capacity/ACE, disk FD, cancel/owner EOF, tiny distinct non-self counts and malformed-ID rejection
-clang -std=gnu11 -Wall -Wextra -I src -o test-hnsw-build-ipc test/unit/test_hnsw_build_ipc.c \
-		src/cuvs_ipc.c src/cuvs_util.c src/cuvs_build_corpus.c -lpthread -lm 
-./test-hnsw-build-ipc
-[INFO] [hnsw_wait] phase=backend-cancel mono_us=2430249836133 input_dev=16777232 input_ino=369955797
-PASS 15 actual-client wire cases,4 preconnect refusals,5 shared-daemon prefix/settings cases; explicitACE/IVF, forgedroute/version/request rejection, cancellation/status13/protocolerror; current global v4 retained
-clang -std=gnu11 -Wall -Wextra -I src -o test-hnsw-admission test/unit/test_hnsw_admission.c -lpthread
-./test-hnsw-admission
-PASS HNSW drains prior GPU work without holding registry lock; wait is owner-cancellable
-clang -std=c11 -Wall -Wextra -Werror -I src -o test-admission-contract test/unit/test_admission_contract.c \
-		src/cuvs_util.c 
-./test-admission-contract
-test_admission_contract: all checks passed
-clang -I src -c src/cuvs_util.c -o test-admission-contract-util.o
-clang++ -std=c++17 -Wall -Wextra -Werror -I src -o test-admission-contract-cxx -x c++ \
-		test/unit/test_admission_contract.c -x none test-admission-contract-util.o 
-./test-admission-contract-cxx
-test_admission_contract: all checks passed
 clang -std=gnu11 -Wall -Wextra -Werror -I src -o test-cache-policy test/unit/test_cache_policy.c \
 		src/cuvs_cache_policy.c src/cuvs_util.c -lm 
 ./test-cache-policy
-test_cache_policy: 141 passed, 0 failed
-python3 -B test/unit/check_circuit_source.py
-PASS circuit source: 3 scan paths gate through cuvs_breaker_check_scan; no breaker-open branch returns false
+test_cache_policy: 150 passed, 0 failed
+clang -std=gnu11 -O2 -Wall -Wextra -Werror -I src -o test-peak-meter test/unit/test_peak_meter.c \
+		src/cuvs_peak_meter.c -lpthread
+./test-peak-meter
+test_peak_meter: 16 passed, 0 failed
 clang -std=gnu11 -Wall -Wextra -Werror -I src -o test-status-text test/unit/test_status_text.c \
 		src/cuvs_status_text.c
 ./test-status-text
@@ -34,12 +16,6 @@ python3 test/unit/check_i3b_server_source.py src/pg_cuvs_server.c
 check_i3b_server_source: OK
 python3 test/unit/check_i3b_docs.py
 check_i3b_docs: OK
-clang -I src -DCUVS_TEST_HOOKS -o test-unit test/unit/test_cuvs_util.c src/cuvs_util.c 
-./test-unit
-[INFO] cuvs_util unit tests: 357 passed, 0 failed
-[OK] all tests passed
-clang -I src -o test-build-corpus test/unit/test_build_corpus.c src/cuvs_build_corpus.c 
-./test-build-corpus
-[INFO] memfd/shm-grow/reaper tests skipped (non-Linux)
-test_build_corpus: 27 passed, 0 failed
+python3 -B test/unit/check_circuit_source.py
+PASS circuit source: 3 scan paths gate through cuvs_breaker_check_scan; no breaker-open branch returns false
 rc=0
