@@ -152,7 +152,7 @@ static void test_prespool_and_fallback(void)
 {
     const uint32_t OK = CUVS_STATUS_OK, B13 = CUVS_STATUS_HNSW_RESIDENT_BUDGET_EXCEEDED,
                    F5 = CUVS_STATUS_BUILD_FAILED;
-    const double no_stats[] = {-1.0, 0.0, 0.5, 0.0 / 0.0};
+    const double no_stats[] = {-1.0, 0.0, -0.5, 0.0 / 0.0};
     for (size_t i = 0; i < sizeof(no_stats) / sizeof(no_stats[0]); i++)
     {
         /* whatever the daemon would answer, no statistics never refuses */
@@ -257,13 +257,55 @@ static void test_i3cd_b1_preflight_failure_is_not_no_statistics(void)
                   "before_scan_from_statistics") && valid && sent);
 }
 
+/* I3CD-B1 r2: statistics presence is reltuples > 0, independent of the op 40
+ * row conversion. 0 < reltuples < 1 is a (tiny) forecast; reltuples above
+ * INT32_MAX has statistics but no hnsw forecast. Neither may read as
+ * "no statistics" in the receipt or the NOTICE wording. */
+static void test_i3cd_b1_r2_statistics_boundaries(void)
+{
+    int sent, valid;
+    /* 0 < reltuples < 1 */
+    CHECK(cuvs_prespool_has_statistics(0.5) && cuvs_prespool_rows(0.5) == 1 && cuvs_prespool_count(0.5) == 1);
+    CHECK(cuvs_hnsw_timing_flags(0.5, CUVS_HNSW_PRESPOOL_FALLBACK) == CUVS_HNSW_ROUTE_FLAG_AFTER_SCAN);
+    CHECK(!strcmp(cuvs_hnsw_after_scan_reason(0.5), "pre-scan forecast unavailable"));
+    CHECK(!strcmp(backend_receipt_route_decided(0.5, CUVS_STATUS_OK, CUVS_STATUS_OK, &sent, &valid),
+                  "before_scan_from_statistics") && valid);
+    CHECK(!strcmp(backend_receipt_route_decided(0.5, CUVS_STATUS_UNAVAILABLE, CUVS_STATUS_OK, &sent, &valid),
+                  "after_scan_preflight_unavailable") && valid);
+    /* reltuples > INT32_MAX: no op 40 request, still statistics */
+    CHECK(cuvs_prespool_has_statistics(3e9) && cuvs_prespool_rows(3e9) == 0
+          && cuvs_prespool_count(3e9) == 3000000000ULL);
+    CHECK(cuvs_prespool_rows((double)INT32_MAX) == (uint64_t)INT32_MAX
+          && cuvs_prespool_rows((double)INT32_MAX + 1.0) == 0);
+    CHECK(cuvs_hnsw_timing_flags(3e9, CUVS_HNSW_PRESPOOL_FALLBACK) == CUVS_HNSW_ROUTE_FLAG_AFTER_SCAN);
+    CHECK(!strcmp(cuvs_hnsw_after_scan_reason(3e9), "pre-scan forecast unavailable"));
+    CHECK(!strcmp(backend_receipt_route_decided(3e9, CUVS_STATUS_OK, CUVS_STATUS_OK, &sent, &valid),
+                  "after_scan_preflight_unavailable") && valid);
+    CHECK(cuvs_prespool_count(1e30) == (uint64_t)INT64_MAX);
+    /* the no-statistics side keeps its wording */
+    const double none[] = {-1.0, 0.0, -0.5, 0.0 / 0.0, 1.0 / 0.0};
+    for (size_t i = 0; i < sizeof(none) / sizeof(none[0]); i++)
+    {
+        CHECK(!cuvs_prespool_has_statistics(none[i]) && cuvs_prespool_count(none[i]) == 0);
+        CHECK(!strcmp(cuvs_hnsw_after_scan_reason(none[i]), "no table statistics"));
+        CHECK(!strcmp(backend_receipt_route_decided(none[i], CUVS_STATUS_OK, CUVS_STATUS_OK, &sent, &valid),
+                      "after_scan_no_statistics") && valid);
+    }
+}
+
 /* (14) CAGRA reltuples AR0 guard: refuse before the scan only when certain. */
 static void test_cagra_ar0(void)
 {
     uint64_t est;
     const uint64_t limit = 10ULL << 30, fit = 3000000, over = 4000000; /* 768-d */
-    CHECK(cuvs_cagra_prespool_final_estimate(1000, 768, 64) == 1000ULL * (768 * 4 + 64 * 4));
-    CHECK(cuvs_cagra_prespool_final_estimate(1000, 768, 0) == 1000ULL * (768 * 4 + 64 * 4));
+    /* I3-A's shared estimate (aligned stride ld = 4 * ceil(dim / 4)) */
+    CHECK(cuvs_admission_estimate_final_bytes(1000, 768, 64) == 1000ULL * (768 * 4 + 64 * 4));
+    CHECK(cuvs_admission_estimate_final_bytes(1000, 770, 0) == 1000ULL * (772 * 4 + 64 * 4));
+    CHECK(cuvs_cagra_prespool_ar0((double)over, 770, 64, 1, 1, limit, &est)
+          && est == cuvs_admission_estimate_final_bytes(over, 770, 64));
+    /* statistics beyond the HNSW forecast range still prove a CAGRA AR0 */
+    CHECK(cuvs_cagra_prespool_ar0(3e9, 768, 64, 1, 1, limit, &est)
+          && est == cuvs_admission_estimate_final_bytes(3000000000LL, 768, 64));
     CHECK(cuvs_cagra_prespool_ar0((double)over, 768, 64, 1, 1, limit, &est) && est > limit);
     CHECK(cuvs_cagra_prespool_ar0((double)over, 768, 64, 0, 1, limit, &est)); /* auto, one GPU */
     CHECK(!cuvs_cagra_prespool_ar0((double)fit, 768, 64, 1, 1, limit, &est) && est <= limit);
@@ -284,6 +326,7 @@ int main(void)
 {
     /* First, so its mutants are attributed to the direct regression itself. */
     test_i3cd_b1_preflight_failure_is_not_no_statistics();
+    test_i3cd_b1_r2_statistics_boundaries();
     test_default_and_knob();
     test_estimate_independent_of_lists();
     test_invariant_notices();

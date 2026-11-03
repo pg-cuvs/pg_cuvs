@@ -2757,7 +2757,7 @@ cuvs_build_hnsw_from_heap(Relation heapRel, Relation indexRel, IndexInfo *indexI
         double stats_rows = heapRel->rd_rel->reltuples;
         CuvsHnswPrespoolAction prespool;
         bool transition_sent;
-        snprintf(when, sizeof(when), "before the heap scan from reltuples=%.0f", stats_rows);
+        snprintf(when, sizeof(when), "before the heap scan from reltuples=%.6g", stats_rows);
         prespool = cuvs_hnsw_preflight(stats_rows, spool->dim, hierarchy, build_algo,
                                        ef_construction, cap, true, when);
         transition_sent = prespool == CUVS_HNSW_PRESPOOL_NOTICE_OVERFLOW;
@@ -2805,7 +2805,7 @@ cuvs_build_hnsw_from_heap(Relation heapRel, Relation indexRel, IndexInfo *indexI
             if (prespool == CUVS_HNSW_PRESPOOL_FALLBACK)
             {
                 snprintf(when, sizeof(when), "after the heap scan (%s) from %llu spooled rows",
-                         cuvs_prespool_rows(stats_rows) ? "pre-scan forecast unavailable" : "no table statistics",
+                         cuvs_hnsw_after_scan_reason(stats_rows),
                          (unsigned long long)spool->n);
                 transition_sent = cuvs_hnsw_preflight((double)spool->n, spool->dim, hierarchy,
                     build_algo, ef_construction, cap, false, when)
