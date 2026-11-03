@@ -457,6 +457,7 @@ for limits, compatibility and estimate-vs-upper-bound caveats.
 | `pg_cuvs_reclaim_set(name text, value text)` | text | (0.9.0) Superuser only; change a reclaim parameter at runtime. See § 8.2 |
 | `pg_cuvs_index_status()` | SETOF record | (0.9.0) Per-index residency, protection, sidecar, pin and eviction history; rows filtered by privilege. See § 8.4 |
 | `pg_cuvs_memory_status()` | SETOF record | (0.9.0) Superuser or `pg_monitor`; per-GPU accounting, reclaim state and eviction counters. See § 8.4 |
+| `pg_cuvs_build_status()` | SETOF record | (0.9.0) In-flight CAGRA builds and their reservations; rows filtered by privilege. See § 8.4 |
 | `pg_cuvs_hnsw_build_info(index regclass)` | jsonb | Read the stored construction route/settings and estimate-based admission. Version2 writer with historical version1 reader; absent legacy/source/empty receipts are not reconstructed from current GUCs. Requires SELECT on the source table; estimates are not memory upper-bound guarantees |
 | `pg_cuvs_build_hnsw(cagra regclass, mode text DEFAULT 'nsw')` | regclass | Build a pgvector HNSW from a CAGRA index without pgvector's CPU build. **Deprecated** in favor of `CREATE INDEX ... USING pg_cuvs_hnsw`; the older two-step `pg_cuvs_import_hnsw` form (empty `USING hnsw` target + import) is removed |
 | `pg_cuvs_compact(index regclass)` | void | Remove tombstoned vectors via `cuvsCagraMerge`, rebuild `.cagra`/`.tids`, drop `.tombstone` |
@@ -719,11 +720,34 @@ reservations, so an in-flight build never triggers reclaim by itself.
 | `pg_cuvs_index_status()` | everyone (rows filtered) | One row per resident, cold (snapshot warmup) or not-resident index: `index_name` (NULL for another database), `state`, `kind`, `gpu`, `vram_bytes`, `last_use`, `loaded_at`, `hits`, `pinned`, `in_use`, `protect_until`, `eligible`, `reclaim_exempt` (sidecar kind: `none`/`delta`/`tombstone`/`both`, read from the daemon's `index_dir`; an index with its own `index_dir` reloption shows `none`), `file_current`, `extend_count`, `warmup_state`, `evict_count`, `last_evict_at`, `last_evict_reason`, `last_build_self_replace`, `last_build_unloaded`. Non-privileged callers see only indexes of the current database that they own; superusers and `pg_monitor` members see the whole daemon |
 | `pg_cuvs_memory_status()` | superuser or `pg_monitor` | Per GPU: `budget_eff`, `resident_bytes`, `pending_bytes`, `pinned_bytes`, counts, `reclaim_mode`, `reclaim_f_bytes` and `reclaim_f_src` (`fixed`, `build:<db>:<idx>` or `none`), `last_reclaim_at`, `last_reclaim_trigger`, `reclaim_runs`, `reclaim_skip_sidecar`, `persist_failures`, evictions by reason and in total, `drops`, `history_dropped`, `peak_bytes` (pool peak) |
 
+| `pg_cuvs_build_status()` | everyone (rows filtered) | One row per in-flight CAGRA build that runs outside the daemon lock: `index_name`, `gpu`, `db_oid`, `index_oid`, `algo`, `path` (`single` or `multi`), `started_at` (wall clock when the build was admitted and reserved), `n`, `dim`, `final` (resident footprint), `scratch` (`reserved_n - final`), `reserved_n` (the N held in `pending_bytes` until the build ends), `policy` (`--cagra-build-overflow` passed to this build), `lw_ub` (the large_workspace upper bound this build added to `lw_pending`), `lw_ub_src` (`admission`: the value of this build's admission check; `none`: no admission check ran, `lw_ub` is NULL), `phase` (`building`). Same row filter as `pg_cuvs_index_status()`. A `CREATE INDEX` build's index is not visible to other sessions until commit, so only superusers and `pg_monitor` members see it; a `REINDEX` build is visible to the owner. Sharded CAGRA builds and IVF-PQ builds hold the daemon lock for the whole build and never appear; a status call made during one waits until it ends |
+
+`pg_cuvs_memory_status()` also has these columns per GPU: `budget_bytes`
+(`--max-vram-mb`, 0 = unlimited), `quota_bytes` (the RMM pool quota, 0 = none),
+`pool_used` and `pool_reserved` (RMM pool bytes; NULL when the GPU has no quota or
+the pool cannot be read), `pending_rmm` (build reservations counted against the
+quota), `lw_pending` (sum of `lw_ub` of admitted builds, § 3 managed
+large_workspace), `builds_active` (builds holding a reservation), `rejects_ar0` …
+`rejects_ar7` (admission rejections by reason, one per `[admit] verdict=reject`
+line), `last_reject_reason` and `last_reject_at` (NULL before the first rejection),
+`managed_spill_builds` and `managed_spill_bytes_max`. A rejection that found no GPU
+(AR0 against every budget) has no GPU row; it is counted in
+`rejects_no_gpu` of `SHOW cuvs.rmm_pool_status`. `pg_cuvs_index_status()` also has
+`dataset_attached`, NULL in this release (no wrapper call reports it for a loaded
+index yet; the `[build_result]` line carries it per build). While a build is in
+flight, `builds_active` equals its row count in `pg_cuvs_build_status()`,
+`pending_bytes` the sum of `reserved_n` and `lw_pending` the sum of `lw_ub` on
+that GPU.
+
 `SHOW cuvs.rmm_pool_status` appends these keys to its JSON: `build_evict_scope`,
 `pin_max_pct`, `reclaim_free_max_pct`, `reclaim_free_window_min`,
 `reclaim_floor_pct`, `load_soft_evict`, `reindex_self_replace`, `usage_stats_file`,
 and `reclaim_params`, an object with `value`, `source` (`default`, `flag` or
 `function`) and `changed_at` (epoch seconds or null) for each runtime parameter.
+It then appends `builds_unlisted` (builds not listed because the table of
+32 in-flight builds was full), `rejects_no_gpu` (`ar0` … `ar7`) and `builds`: for superusers and `pg_monitor`
+members, every `pg_cuvs_build_status()` row (`started_at_us` in epoch
+microseconds); for other roles, null.
 
 Counters are cumulative and are not reset when read; only a daemon restart resets
 them. Eviction history (`evict_count`, `last_evict_*`) outlives the resident entry,
