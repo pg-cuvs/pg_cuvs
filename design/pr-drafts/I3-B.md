@@ -51,6 +51,22 @@ tests owned by I3-A, DROP forgets F records).
   makes eviction skip the save when the files are current.
 - Always-on lock-free RMM pool peak meter (`peak_bytes` in memory status).
 
+## Boundary exception (hnsw export functions)
+
+Cited from the brief's coordination appendix (conch commit 9c6fb4c1, ruling on
+review BLOCK 1): "**경계 예외(2026-11-03 16:4x, I3-B 리뷰 BLOCK 1 판정):** I3-B는
+I3-C 소유인 hnsw 내보내기 함수 두 곳(`handle_export_adjacency`,
+`handle_export_hnsw_shm`)에 "in-use 표시(inflight++/--·재조회)와 `e->tids`를 락
+안에서 복사"하는 안전 수정만 더할 수 있다(회수 스레드 해제와의 use-after-free
+방지). 그 밖의 변경은 BLOCK. I3-B PR 본문이 이 문장을 인용한다. 03:00 스택에서
+I3-C가 같은 함수를 고쳤으면 I3-B의 hunk를 기준으로 병합한다."
+
+The I3-B diff in those two functions is limited to exactly that:
+`handle_export_hnsw_shm` re-finds the entry under the lock, checks it is the same
+handle, marks it in use (`inflight++`) across the unlocked serialize and clears it
+after; `handle_export_adjacency` copies `e->tids` into a private buffer under the
+lock (and frees it on every exit). Nothing else in either function changes.
+
 ## Interfaces (append-only)
 
 **IPC ops** (`src/cuvs_ipc.h`): 30 UNLOAD, 31 LOAD, 32 PIN, 33 UNPIN,
@@ -110,6 +126,57 @@ line with every effective knob.
 9. `test/expected/rmm_pool.out` may need the appended keys once both land (Tier-1
    passes on this tip: the shim reports the pool disabled).
 
+Added from the independent review (REVIEW-I3-B-FABLE.md § 6, items 10-18):
+
+10. `ensure_vram` signature: I3-A WIP has `(needed, dev, CuvsAdmissionFields *rej)`,
+    I3-B has `(needed, dev, CuvsRequester rq)`. Merge to `(needed, dev, rq, rej)` and
+    set `ensure_vram` to 4 in the `arity` table of `test/unit/check_i3b_server_source.py`;
+    re-run CK-36 (a) and all I3-B mutations on the merged binary. Trial merge
+    conflicts: server.c (~15 hunks), Makefile, reference.md, header/SQL.
+11. KB-17 `--rmm-peak-meter on|off` is not implemented (the brief says the meter is
+    always on); the startup INFO line of I3-A ("build admission model") should carry
+    the I3-B knobs; this PR prints a separate `cache policy` line.
+12. `pg_cuvs_memory_status()` columns owned by I3-A/I4 (`rejects_ar0..7`,
+    `last_reject_*`, `quota`, `pool_used`, `pool_reserved`, `pending_rmm`,
+    `builds_active`, `lw_pending`, `managed_*`) are appended by them: header string,
+    NCOLS, SQL signature and the status-text test change together.
+13. Resolved in r2: the I3-B block is in both 0.9.0 scripts.
+14. Resolved: `pg_cuvs_build_status()` is outside I3-B (conch).
+15. NOTICE (b) eviction notice text (`pg_cuvs: evicted index ... to make room`) is not
+    produced by I3-B; the registry-full fallback NOTICE (d) is in I3-A WIP.
+16. Item 1 detail: the NOTICE label is `index <oid>` in the daemon; the final text
+    uses `quote_qualified_identifier(schema, name)` (B-7) and I3-A's notice_out
+    encoding. Item 6 detail: `[admit] path=startup` / `path=warmup` lines are I3-A's.
+17. AR5 `w`: the contract defines -1/0; KB-25 off's AR5 "seconds until the first
+    index becomes eligible" is not computed (non-soft AR5 returns -1).
+18. LOAD under quota pending: `ensure_vram` returns AR1 before soft eviction when
+    `needed > quota - pending`; the classifier swap decides AR1 vs AR3/AR4.
+19. `test/unit/test_admission_contract_mutations.py` (and the other files of I3-A's
+    c8e6355/1c601f9, cherry-picked here unchanged) meet I3-A's own copies as add/add
+    at the stack rebase: take I3-A's version. The upgrade script itself stays
+    I3-A's file with its `-- I3-A begin/end` block followed by the I3-B block
+    (only the earlier I3-B-only version of that file was dropped in r2).
+
+Implementation-stage conditions from the review (not changed in this PR unless
+noted): (1) KB-17 flag, as item 11; (2) manual-op result strings differ from the C7
+table (`not resident`/`already resident`/`not pinned`/`name = value` vs
+`not_resident`/`already_resident`/`not_pinned`/`applied`): conch to fix the spelling;
+(3) `pg_cuvs_unload` on a non-daemon AM (e.g. hnsw) answers "not resident" instead
+of 22023; (4) r18 B-8 second channel (startup order source field, breaker
+open/half-open/close log line) missing; (5) user-visible change:
+`pg_cuvs_gpu_search_stats().last_search_at` is NULL for a never-searched index
+(was the registration time), not yet in reference.md; (6) reference.md says the
+REINDEX session receives a NOTICE, which needs I3-A's notice_out (0.9.0 stack);
+(7) shim pending is always 0, so the r18 B-9 quota-pending branch, `budget_eff` with
+a quota, DROP→F cleanup and in-use unload refusal are covered by unit/scan tests
+only; scenario 7b covers the logical reservation path; (8) breaker mutation
+evidence lives in the breaker commits (the reviewer re-ran 13: 12 RED, 1
+equivalent); (9) isolation suite: reviewer ran 6/6 ok; (10) self-replace unloads
+before re-admission (re-admission failure is reported, see self review);
+(11) status enumeration under `g_index_mutex` and the 128-entry admit log are
+follow-up items; (12) a pin that loads and then exceeds the cap stays loaded;
+(13) resolved in r2; (14) CUDA build: see "CUDA compile".
+
 ## Tests (CPU only; commands and outputs in `I3-B-evidence/`)
 
 | Area | Command | Result |
@@ -166,8 +233,23 @@ eviction-order races (needs fault injection between the checks) or the stale
 
 ## CUDA compile
 
-NOT_RUN in this worker (no GPU toolchain). The dev VM is announced; when access
-arrives the bundle is built there with nvcc and the result recorded here.
+Dev VM (RTX A6000, CUDA/cuVS 26.04 env `/work/_setup/env.sh`, lane `/work/i3-b`,
+`/work/build-lane i3-b` = `make -j2 all server`):
+
+- 396e1212 and 3ad5c86: **build OK**, 0 errors; `cuvs_wrapper.cu` (with `PeakUsage`)
+  compiles; warnings are pre-existing (cuVS deprecations, one `%zu` at line 1914).
+  Logs `/work/i3-b/.cuda-build-396e1212.log`, `.cuda-build-3ad5c86.log`.
+- GPU daemon smoke (3ad5c86, private socket/dir, `.gpu-smoke.sh`): real RMM pool,
+  `budget_eff` 25,448,644,608, `peak_bytes` 15,360,000 after the startup probes,
+  ops 30–37 answer (status text, manual ops, runtime allow-list refusal), usage
+  stats file written, SIGTERM exit 0 (reclaim thread joined).
+- ASAN (`EXTRA_SERVER_CFLAGS=-fsanitize=address -fno-omit-frame-pointer`,
+  `ASAN_OPTIONS=protect_shadow_gap=0:detect_leaks=0`): a clean rebuild **with `-g`**
+  runs the same smoke with 0 ASAN reports and exit 0. **Open:** the same clean
+  rebuild **without `-g`** loops `AddressSanitizer:DEADLYSIGNAL` before the first
+  log line (reproduced twice), while d058dec6 built the same way starts normally.
+  Root cause not found (no gdb on the VM, package installs not allowed); the
+  difference lies between d058dec6 and 3ad5c86 and needs a bisect on the VM.
 
 ## Not done / risks (explicit)
 
