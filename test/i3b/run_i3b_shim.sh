@@ -56,6 +56,10 @@ check "flag: idle:-1 refused" sh -c "! pg_cuvs_server --socket /tmp/x.sock --ind
 
 startd --reclaim-tick-s 1 --evict-min-idle-s 3600
 psqlq "CREATE EXTENSION vector; CREATE EXTENSION pg_cuvs;" >/dev/null
+# The 0.9.0 scripts belong to I3-A; apply the I3-B block on top of 0.8.2.
+sed "s#MODULE_PATHNAME#\$libdir/pg_cuvs#" sql/pg_cuvs--0.8.2--0.9.0.sql > /tmp/i3b_block.sql
+su pg -c "psql -h /tmp -X -q -v ON_ERROR_STOP=1 -d postgres -f /tmp/i3b_block.sql" >/tmp/block.log 2>&1
+check "I3-B SQL block installs" sh -c "! grep -q ERROR /tmp/block.log"
 for t in t1 t2 t3; do
   psqlq "CREATE TABLE $t (id int, v vector(64)); INSERT INTO $t SELECT g, (SELECT array_agg(((g*31+i) % 97)::real) FROM generate_series(1,64) i)::vector FROM generate_series(1,20000) g;" >/dev/null
 done
@@ -143,7 +147,29 @@ startd --reclaim-tick-s 1
 check "corrupt file: daemon up, OID order with reason" sh -c "tail -50 /tmp/d.log | grep -q 'ascending (unknown format or version)'"
 check "startup never evicts" sh -c "! grep -q 'requester=LOAD_STARTUP' /tmp/d.log"
 
+# --- 8. SQL surface (C7, C8, CK-25/26): owner checks, superuser-only, SHOW ---
+psqlq "CREATE ROLE bob LOGIN; CREATE TABLE tb (id int, v vector(64)); ALTER TABLE tb OWNER TO bob;" >/dev/null
+sq() { su pg -c "psql -h /tmp -X -q -At -d postgres -v ON_ERROR_STOP=1 -c \"$1\"" 2>&1; }
+sqbob() { su pg -c "psql -h /tmp -X -q -At -d postgres -U bob -c \"$1\"" 2>&1; }
+RN1=$(sq "SELECT index_name FROM pg_cuvs_index_status() WHERE state='resident' ORDER BY index_oid LIMIT 1")
+check "SQL index_status names the resident index ($RN1)" test -n "$RN1"
+check "SQL pin/unpin/unload" sh -c "sq() { su pg -c \"psql -h /tmp -X -q -At -d postgres -c \\\"\$1\\\"\"; }; [ \"\$(sq \"SELECT pg_cuvs_pin('$RN1')\")\" = pinned ] && [ \"\$(sq \"SELECT pg_cuvs_unpin('$RN1')\")\" = unpinned ]"
+sq "SELECT pg_cuvs_pin('$RN1')" >/dev/null
+su pg -c "psql -h /tmp -X -At -d postgres -c \"\\\\set VERBOSITY verbose\" -c \"SELECT pg_cuvs_unload('$RN1')\"" >/tmp/pinunload.log 2>&1
+check "SQL unload of a pinned index raises 55006" grep -q '55006.*pinned: run pg_cuvs_unpin first' /tmp/pinunload.log
+sq "SELECT pg_cuvs_unpin('$RN1')" >/dev/null
+check "non-owner unload refused" sh -c "su pg -c \"psql -h /tmp -X -At -d postgres -U bob -c \\\"SELECT pg_cuvs_unload('$RN1')\\\"\" 2>&1 | grep -q 'must be owner'"
+check "non-superuser reclaim_set refused" sh -c "su pg -c \"psql -h /tmp -X -At -d postgres -U bob -c \\\"SELECT pg_cuvs_reclaim_set('evict-hit-cap','7')\\\"\" 2>&1 | grep -q 'permission denied'"
+check "non-owner sees no rows of others in index_status" sh -c "[ \"\$(su pg -c \"psql -h /tmp -X -At -d postgres -U bob -c 'SELECT count(*) FROM pg_cuvs_index_status()'\")\" = 0 ]"
+check "non-privileged memory_status refused" sh -c "su pg -c \"psql -h /tmp -X -At -d postgres -U bob -c 'SELECT * FROM pg_cuvs_memory_status()'\" 2>&1 | grep -q 'permission denied'"
+# session A changes a knob; a different session B reads the live value
+sq "SELECT pg_cuvs_reclaim_set('evict-hit-cap','7')" >/dev/null
+check "cross-session SHOW sees reclaim_params change" sh -c "su pg -c \"psql -h /tmp -X -At -d postgres -c 'SHOW cuvs.rmm_pool_status'\" | grep -q '\"evict-hit-cap\":{\"value\":7,\"source\":\"function\"'"
+check "memory_status via SQL has reclaim columns" sh -c "su pg -c \"psql -h /tmp -X -At -d postgres -c 'SELECT reclaim_mode, reclaim_runs >= 0 FROM pg_cuvs_memory_status()'\" | grep -q '|t'"
+check "circuit_status callable by anyone" sh -c "su pg -c \"psql -h /tmp -X -At -d postgres -U bob -c 'SELECT count(*) FROM pg_cuvs_circuit_status()'\" | grep -q '^[0-9]'"
+
 # --- 7. DROP removes history and counts drops ---
+# (also forgets the index's reject records for F: unit-tested in test_cache_policy)
 psqlq "DROP INDEX i2;" >/dev/null
 check "drop: no row left for i2" sh -c "! i3b_ipc_cli $S index | awk -F'\t' -v i=$I2 '\$2==i' | grep -q ."
 
