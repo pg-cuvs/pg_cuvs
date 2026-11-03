@@ -167,14 +167,16 @@ Defaults and ranges are from source. "Set by" is the minimum role/scope: `USERSE
 | `cuvs.rmm_pool_max_percent` | int/status | daemon value | 0–100, or `unavailable` | read-only (INTERNAL) | Applied upstream pool quota as a percentage of total CUDA memory on each GPU. `0` when the pool is disabled |
 | `cuvs.rmm_pool_status` | string/status | daemon value | JSON, or `unavailable` | read-only (INTERNAL) | Applied initial MiB, quota percentage, and per-device maximum/reserved/used pool bytes. Counters cover RMM pool allocations; they are live snapshots, not process-wide GPU memory |
 | `cuvs.circuit_breaker_threshold` | int | `3` | 1–100 | USERSET | Consecutive GPU errors before the (per-backend) breaker trips |
-| `cuvs.circuit_breaker_transient_ttl_s` | int | `30` | 0–INT_MAX | USERSET | Seconds before a breaker opened by a transient reason half-opens and allows one GPU attempt. `0` = half-open immediately. Breakers opened by a permanent reason ignore it. See § 5 `pg_cuvs_reset_circuit` |
+| `cuvs.circuit_breaker_transient_ttl_s` | int | `30` | 0–3600 | USERSET | Seconds before a breaker opened by a transient reason half-opens and allows one GPU attempt. `0` = half-open immediately. Breakers opened by a permanent reason ignore it. See § 5 `pg_cuvs_reset_circuit` |
 
 Unlocked CAGRA builds reserve estimated RMM quota separately from logical index
 residency under the registry mutex. Admission subtracts all in-flight reservations
 from pool headroom and releases them on build success or failure. Since allocator
 counters can already include part of a reservation, this is conservative and may
 reject a concurrent build until the earlier build returns. Pending-quota pressure
-does not evict healthy resident indexes. This remains estimate-based admission;
+never makes a build evict resident indexes; a search-side reload that is short
+because of another build's reservation evicts cold (then, with
+`--load-soft-evict on`, protected) indexes to proceed (see § 8). This remains estimate-based admission;
 workspace allocations can still produce a genuine allocation failure.
 
 ### Build
@@ -263,7 +265,8 @@ daemon-only ones have no session equivalent.
 | `--rmm-pool-mb N` | `cuvs.rmm_pool_mb` (read-only status) | `512` MiB | Initial RMM pool reservation per allowed GPU, installed before probes/load/warmup. Explicit `0` disables the pool and keeps the legacy allocator. CPU shim builds default to `0`. Init failure aborts startup |
 | `--rmm-pool-max-percent N` | `cuvs.rmm_pool_max_percent` (read-only status) | `50` | Hard upstream quota: total CUDA memory × N%, rounded down to 256 bytes, on each allowed GPU. Range 1–100; initial reservation must fit. Preserves the pool's doubling/backoff growth policy |
 | `--rmm-scratch-permille N` | — (daemon-only, `scratch_permille` in `cuvs.rmm_pool_status`) | `7726` (provisional) | CAGRA build scratch coefficient ρ. Admission, reservation and GPU choice use `N = final + ceil(final × ρ / 1000)`; residency accounting keeps `final`. Range 0–100000. Restart to change |
-| `--max-indexes N` | — (daemon-only) | `1024` | **Soft** LRU working-set cap (ADR-068), not a hard wall (was 64). At the cap, `load_index` evicts the LRU index to free a slot and auto-reloads on next use; a build over the cap defers gracefully |
+| `--max-indexes N` | — (daemon-only) | `1024` | **Soft** LRU working-set cap (ADR-068), not a hard wall (was 64). At the cap, a reload or `pg_cuvs_load` frees a slot under the § 8 rules (cold first, then soft eviction; reason `slot`); a build over the cap does not evict (with the default `--build-evict-scope none`): its files are saved and the first query reloads it |
+| `--build-evict-scope …` and the other cache flags | — (daemon-only) | see § 8 | Cache, eviction and reclaim knobs (§ 8.2) |
 | `--gpu-devices LIST` | — (daemon-only) | all visible | CUDA devices the daemon uses (else honors `CUDA_VISIBLE_DEVICES`) |
 | `--snapshot-uri URI` | `cuvs.snapshot_uri` | `` | GCS snapshot root |
 | `--cluster-id ID` | `cuvs.cluster_id` | `` | Cluster id in the GCS artifact path |
@@ -378,6 +381,11 @@ for limits, compatibility and estimate-vs-upper-bound caveats.
 | `pg_cuvs_reset_circuit(index regclass)` | void | Close this backend's circuit breaker for the index. Breakers are per backend and per index: `cuvs.circuit_breaker_threshold` consecutive GPU errors open one. A breaker opened by a transient reason (admission AR1–AR5, post-admission OOM, ATT, or `OOM_FALLBACK` with no reason code) half-opens after `cuvs.circuit_breaker_transient_ttl_s`: the plan-time gate restores the GPU path and one GPU attempt decides. Success closes it, a transient failure re-opens it with a fresh TTL, and a permanent failure re-opens it as permanent. A breaker opened by a permanent reason (AR0, protocol mismatch, any other counted status) closes only through this function. When a scan executes against an open breaker (for example a cached plan), it raises SQLSTATE `53200` with a HINT to retry during an index build or run this function, then re-run the statement to replan |
 | `pg_cuvs_circuit_status()` | SETOF (index_oid oid, state text, transient bool, opened_at timestamptz, half_open_count bigint, consecutive_errors int) | (0.9.0) This backend's breakers, one row per tracked index. No IPC. `state` = `closed` \| `open` \| `half_open`, evaluated with the current TTL. `transient` is the reason class of the last open. `opened_at` is NULL if the breaker never opened. `half_open_count` counts OPEN→HALF_OPEN transitions |
 | `pg_cuvs_last_rejection()` | jsonb | This session's last GPU memory admission rejection (NULL if none); see [Admission rejections](#admission-rejections-and-recovery). Backend memory only, cleared at session end; callable by everyone |
+| `pg_cuvs_unload(index regclass)` / `pg_cuvs_load(index regclass)` / `pg_cuvs_pin(index regclass)` / `pg_cuvs_unpin(index regclass)` | text | (0.9.0) Manual cache control; index owner or superuser. See § 8.4 |
+| `pg_cuvs_unload(db_oid oid, index_oid oid)` / `pg_cuvs_unpin(db_oid oid, index_oid oid)` | text | (0.9.0) Superuser only; any database's index. See § 8.4 |
+| `pg_cuvs_reclaim_set(name text, value text)` | text | (0.9.0) Superuser only; change a reclaim parameter at runtime. See § 8.2 |
+| `pg_cuvs_index_status()` | SETOF record | (0.9.0) Per-index residency, protection, sidecar, pin and eviction history; rows filtered by privilege. See § 8.4 |
+| `pg_cuvs_memory_status()` | SETOF record | (0.9.0) Superuser or `pg_monitor`; per-GPU accounting, reclaim state and eviction counters. See § 8.4 |
 | `pg_cuvs_hnsw_build_info(index regclass)` | jsonb | Read the stored construction route/settings and estimate-based admission. Version2 writer with historical version1 reader; absent legacy/source/empty receipts are not reconstructed from current GUCs. Requires SELECT on the source table; estimates are not memory upper-bound guarantees |
 | `pg_cuvs_build_hnsw(cagra regclass, mode text DEFAULT 'nsw')` | regclass | Build a pgvector HNSW from a CAGRA index without pgvector's CPU build. **Deprecated** in favor of `CREATE INDEX ... USING pg_cuvs_hnsw`; the older two-step `pg_cuvs_import_hnsw` form (empty `USING hnsw` target + import) is removed |
 | `pg_cuvs_compact(index regclass)` | void | Remove tombstoned vectors via `cuvsCagraMerge`, rebuild `.cagra`/`.tids`, drop `.tombstone` |
@@ -516,3 +524,196 @@ One row per shard; empty for unsharded indexes.
 The sidecar file suffixes (`.cagra`, `.tids`, `.vectors`, `.delta`, `.tombstone`, `.stale`,
 `.shards`, `.sNNN.cagra`, `.relfilenode`, `.hnsw`) and their formats/lifecycle are documented in
 [ARCHITECTURE.md §5](../ARCHITECTURE.md#5-index-lifecycle-and-on-disk-artifacts).
+
+---
+
+## 8. GPU memory operations
+
+In this chapter, *sidecar* means only the `.delta` and `.tombstone` files of an index
+(not `.cagra`, `.tids` or `.vectors`).
+
+### 8.1 Model: a shared cache and work memory
+
+Resident indexes are a shared cache (like `shared_buffers`); build scratch is work
+memory (like `work_mem`). The files in `index_dir` are the source of truth: an index
+that leaves the GPU is reloaded by its next query.
+
+**When an index is evicted.** Only these paths unload a resident index:
+
+| Path | Who may be evicted | Log `reason` |
+|------|-------------------|--------------|
+| A query reloads a non-resident index, or `pg_cuvs_load` / `pg_cuvs_pin` | Cold (eligible) indexes, oldest first. If they are not enough, protected indexes too (soft eviction, `--load-soft-evict on`); never pinned or in-use ones. Also applies when another build's reservation is what makes the reload short | `reload`, `soft_evict` |
+| Background reclaim (§ 8.3) | Cold indexes only, oldest first | `reclaim` |
+| `pg_cuvs_unload` | The named index (refused if pinned or in use) | `manual_unload` |
+| Registry slot cap (`--max-indexes`) for a reload | Same rule as the reload row | `slot` |
+| `REINDEX` of a resident index when only its old copy makes room | That index's own previous copy (§ 8.5) | `admit_build` (`self_replace=1`) |
+| A build with `--build-evict-scope idle:<min>` or `lru` | Cold indexes idle that long, or any unpinned idle-or-not index | `admit_build` |
+
+**When nothing is evicted.** A build (CREATE INDEX, REINDEX, sharded or IVF-PQ build)
+with the default `--build-evict-scope none`, including a build that hits an
+out-of-memory error after admission; daemon startup (indexes that do not fit stay
+not resident); snapshot warmup never evicts protected indexes; pinned indexes and
+indexes in use are never evicted by any path. Background reclaim does not unload a
+CAGRA index that has a delta or tombstone file and received INSERTs since it was
+last saved (`file_current = false`): saving it would invalidate those files (see
+"Queries got slower"). The insert-durability track handles this (in design); no
+release is promised here.
+
+**Cold, protected, eligible.** An index is *eligible* when it is not pinned, not in
+use, and `now - last_use >= protect_s`, where
+`protect_s = --evict-min-idle-s + min(hits, --evict-hit-cap) x --evict-hit-bonus-s`
+(defaults 600 s, 20, 30 s: 600-1,200 s). `last_use` is the last search; a freshly
+built or loaded index that has never been searched has no `last_use` and is
+eligible. Victims are taken in ascending `max(last_use, loaded_at)` order, so a new
+index is not evicted ahead of one that has been cold for longer. Only searches
+update `last_use`; INSERT (EXTEND) and compaction do not.
+
+### 8.2 Knobs
+
+Daemon flags are read at startup. The *change path* column separates accounting
+knobs (restart) from reclaim parameters (changed at runtime with
+`pg_cuvs_reclaim_set(name, value)`, superuser only; the new value applies from the
+next reclaim tick). SIGHUP re-reading of these values is **not implemented**:
+`pg_cuvs_reclaim_set` is the only runtime path, and a restart returns to the flags.
+
+| Flag | Values | Default | Change path | Effect |
+|------|--------|---------|-------------|--------|
+| `--build-evict-scope` | `none` / `idle:<minutes>` / `lru` | `none` | restart | Which residents a build may evict (`idle:0` = eligible ones) |
+| `--evict-min-idle-s` | 0-86400 | `600` | `pg_cuvs_reclaim_set` | Minimum protection after the last search |
+| `--evict-hit-bonus-s` | 0-3600 | `30` | `pg_cuvs_reclaim_set` | Extra protection per search since load |
+| `--evict-hit-cap` | 0-1000 | `20` | `pg_cuvs_reclaim_set` | Searches counted for the bonus |
+| `--reclaim-mode` | `off` / `usage` / `headroom` | `headroom` | `pg_cuvs_reclaim_set` | Background reclaim mode (§ 8.3) |
+| `--reclaim-free-bytes` | bytes, 0 = automatic | `0` | `pg_cuvs_reclaim_set` | Fixed free target F (still capped and floored) |
+| `--reclaim-high-pct` | 1-100 (100 = usage lines off) | `85` | `pg_cuvs_reclaim_set` | Usage line: reclaim starts above this share of `budget_eff` |
+| `--reclaim-low-pct` | 1-high | `75` | `pg_cuvs_reclaim_set` | Usage line: reclaim stops at this share |
+| `--reclaim-tick-s` | 1-3600 | `10` | `pg_cuvs_reclaim_set` | Reclaim thread period (also the usage stats file period) |
+| `--reclaim-free-max-pct` | 1-100 | `50` | restart | F cap, share of `budget_eff` |
+| `--reclaim-free-window-min` | 1-1440 | `30` | restart | Rejected builds older than this stop driving F |
+| `--reclaim-floor-pct` | 0-100 | `10` | restart | F reclaim never takes residency below this share of `budget_eff` |
+| `--pin-max-pct` | 0-100 | `50` | restart | Pinned bytes per GPU, share of `budget_eff` |
+| `--load-soft-evict` | `on` / `off` | `on` | restart | `off`: a reload that cold indexes cannot cover is refused instead of evicting protected ones |
+| `--reindex-self-replace` | `on` / `off` | `on` | restart | `off`: REINDEX never unloads the old copy (§ 8.5) |
+| `--usage-stats-file` | `on` / `off` | `on` | restart | `off`: no usage stats file; startup loads in OID order |
+
+`budget_eff` is `min(--max-vram-mb budget, RMM pool quota)` per GPU. Out-of-range,
+empty, negative or contradictory values (`--reclaim-low-pct` above
+`--reclaim-high-pct`) refuse startup; at runtime they are refused and the old value
+stays. `pg_cuvs_reclaim_set` accepts only the seven runtime names above plus
+`reclaim-mode`; accounting knobs are refused. The startup log prints every effective
+value on one `cache policy` line, and `SHOW cuvs.rmm_pool_status` shows them live.
+
+Configuration layers:
+
+| Layer | Examples | Takes effect |
+|-------|----------|--------------|
+| Daemon flag | `--max-vram-mb`, `--reclaim-free-max-pct`, `--build-evict-scope` | Daemon restart (reloads indexes, recreates the pool, fails in-flight requests) |
+| Daemon runtime parameter | `--reclaim-mode`, `--evict-min-idle-s`, ... | `pg_cuvs_reclaim_set`, next reclaim tick |
+| `PGC_USERSET` GUC | `cuvs.circuit_breaker_transient_ttl_s`, `cuvs.k` | `SET` in the session |
+| `PGC_SUSET` / `PGC_SIGHUP` / `PGC_POSTMASTER` GUC | `cuvs.socket_path`, `cuvs.index_dir` | Superuser `SET`, reload, or server restart respectively |
+| `PGC_INTERNAL` status | `cuvs.rmm_pool_status` | Read-only; each `SHOW` asks the daemon, so another session's change is visible at once |
+
+### 8.3 Background reclaim
+
+A daemon thread runs every `--reclaim-tick-s` per GPU:
+
+- **`off`**: no reclaim (the usage stats file is still written).
+- **`usage`**: when resident bytes exceed `--reclaim-high-pct` of `budget_eff`,
+  unload eligible indexes oldest first until at or below `--reclaim-low-pct`.
+- **`headroom`** (default): the usage lines, plus a free target **F** for the next
+  build. When `budget_eff - resident < F`, unload eligible indexes oldest first
+  until `budget_eff - resident >= F`. F is the largest size requested by a build
+  that was rejected for room in the last `--reclaim-free-window-min` minutes on that
+  GPU, capped at `--reclaim-free-max-pct` of `budget_eff`. Rejections that no
+  amount of free VRAM can fix (larger than `budget_eff`, or the host RAM guard) do
+  not count. A rejected build drops out of F once the same index is admitted, when
+  the window passes, or when the index is dropped. F reclaim never takes residency
+  below `--reclaim-floor-pct` of `budget_eff` (the usage lines have no floor). A
+  `CREATE INDEX` retried after a rejection gets a new OID, so the old rejection
+  keeps F at that level until the window passes (F is the maximum, not a sum).
+
+Reclaim makes room for the *next* attempt: it cannot prevent the first rejection,
+and it frees nothing when no index is eligible. Resident bytes exclude build
+reservations, so an in-flight build never triggers reclaim by itself.
+
+### 8.4 Manual control and observability
+
+| Function | Who | Effect |
+|----------|-----|--------|
+| `pg_cuvs_unload(index regclass)` | index owner or superuser | Unload now. Refused if pinned (`pinned: run pg_cuvs_unpin first`, SQLSTATE 55006) or in use. Returns `unloaded`, `not resident`, or `unloaded; warning: delta or tombstone file present, GPU path switches to CPU replan until REINDEX` |
+| `pg_cuvs_load(index regclass)` | index owner or superuser | Load now under the reload rules (`loaded`, `already resident`) |
+| `pg_cuvs_pin(index regclass)` / `pg_cuvs_unpin(index regclass)` | index owner or superuser | Pin (loads first if needed) / unpin. A pin protects from every eviction path, lasts until the daemon restarts (it is recorded but not restored), survives `REINDEX` of the same index, and is not inherited by `REINDEX CONCURRENTLY` (new OID). Pinned bytes per GPU are capped by `--pin-max-pct` |
+| `pg_cuvs_unload(db_oid oid, index_oid oid)` / `pg_cuvs_unpin(db_oid oid, index_oid oid)` | superuser | Same for an index of another database (it may need unpin first) |
+| `pg_cuvs_reclaim_set(name text, value text)` | superuser | Change a reclaim parameter at runtime (§ 8.2) |
+| `pg_cuvs_index_status()` | everyone (rows filtered) | One row per resident, cold (snapshot warmup) or not-resident index: `index_name` (NULL for another database), `state`, `kind`, `gpu`, `vram_bytes`, `last_use`, `loaded_at`, `hits`, `pinned`, `in_use`, `protect_until`, `eligible`, `reclaim_exempt` (sidecar kind: `none`/`delta`/`tombstone`/`both`, read from the daemon's `index_dir`; an index with its own `index_dir` reloption shows `none`), `file_current`, `extend_count`, `warmup_state`, `evict_count`, `last_evict_at`, `last_evict_reason`, `last_build_self_replace`, `last_build_unloaded`. Non-privileged callers see only indexes of the current database that they own; superusers and `pg_monitor` members see the whole daemon |
+| `pg_cuvs_memory_status()` | superuser or `pg_monitor` | Per GPU: `budget_eff`, `resident_bytes`, `pending_bytes`, `pinned_bytes`, counts, `reclaim_mode`, `reclaim_f_bytes` and `reclaim_f_src` (`fixed`, `build:<db>:<idx>` or `none`), `last_reclaim_at`, `last_reclaim_trigger`, `reclaim_runs`, `reclaim_skip_sidecar`, `persist_failures`, evictions by reason and in total, `drops`, `history_dropped`, `peak_bytes` (pool peak) |
+
+`SHOW cuvs.rmm_pool_status` appends these keys to its JSON: `build_evict_scope`,
+`pin_max_pct`, `reclaim_free_max_pct`, `reclaim_free_window_min`,
+`reclaim_floor_pct`, `load_soft_evict`, `reindex_self_replace`, `usage_stats_file`,
+and `reclaim_params`, an object with `value`, `source` (`default`, `flag` or
+`function`) and `changed_at` (epoch seconds or null) for each runtime parameter.
+
+Counters are cumulative and are not reset when read; only a daemon restart resets
+them. Eviction history (`evict_count`, `last_evict_*`) outlives the resident entry,
+is removed by `DROP INDEX`, and keeps at most 65,536 indexes (oldest dropped first,
+counted in `history_dropped`). `DROP INDEX` cleanup counts as `drops`, not as an
+eviction. Every eviction writes one `[evict]` line (`op gpu db idx reason
+requester_idx idle_s protect_s hits vram_bytes saved_ms mono_us self_replace`;
+`idle_s = -1` for a never-searched index) and every reclaim pass that acts writes
+one `[reclaim]` line (`op gpu tick resident_before resident_after hi_bytes lo_bytes
+evicted skip_sidecar trigger f_bytes f_src mono_us`).
+
+### 8.5 Procedures
+
+**A build is rejected for lack of room.** Builds no longer evict resident indexes.
+Check `pg_cuvs_index_status()` for cold indexes (`eligible`) and unload one, or wait:
+in `headroom` mode the reclaim thread unloads cold indexes for a build of that size
+within the next tick, if cold indexes exist. A superuser sees every database's
+indexes and can use `pg_cuvs_unload(db_oid, index_oid)` (after
+`pg_cuvs_unpin(db_oid, index_oid)` if pinned). Other users can unload only their own
+indexes; ask the daemon administrator when the idle candidates belong to someone
+else. The usage lines alone do not resolve a rejected build: they run only above
+`--reclaim-high-pct`.
+
+**Bulk creation or restore (pg_restore, REINDEX DATABASE).** Each build needs room
+without evicting, so a series of builds can be rejected once enough indexes are
+resident. Before the restore, unload cold indexes, or restart the daemon with
+`--build-evict-scope idle:0` (new, never-searched indexes are eligible) or `lru`
+and restore the default afterwards.
+
+**Large index creation or REINDEX while serving.** REINDEX may unload the existing
+copy of that index for a while, and queries on it may be slower meanwhile; to avoid
+this, pin it with `pg_cuvs_pin` or keep enough free room for both copies. A pinned
+index's REINDEX is refused when both copies do not fit. When the old copy is
+unloaded the REINDEX session receives a NOTICE (`previous resident copy of <index>
+unloaded from GPU to make room for the rebuild`), and `pg_cuvs_index_status()`
+shows `last_build_self_replace = true` and `last_build_unloaded`. If the build then
+fails, the next query reloads the old copy. `REINDEX CONCURRENTLY` builds a new
+OID beside the serving index: do not unload the old index for it; unload another
+cold index instead.
+
+**Queries got slower.** Causes: the index was evicted and is reloaded (see
+`last_evict_reason`); an open circuit breaker (`pg_cuvs_circuit_status()`); or a
+delta/tombstone invalidation. The last one: if the index has a delta or tombstone
+file (`pg_cuvs_index_status().reclaim_exempt` is not `none`) and received INSERTs
+since it was last loaded (in that database, `SELECT extend_count FROM
+pg_cuvs_gpu_search_stats() WHERE index_oid = ...` is above 0; this function shows
+only the current database and at most 64 rows), then saving it rewrites `.tids` and
+its GPU path switches to CPU replan until REINDEX. That save happens when another
+index needs the room, when a build makes room (non-default build scope), on manual
+`pg_cuvs_unload`, and when the daemon stops. A query already running on the GPU plan
+first fails with SQLSTATE 55000 (`delta sidecar unusable mid-scan`); re-running it
+plans the CPU path. Compaction is separate: compacting a resident index that has a
+tombstone file rewrites `.tids` even without INSERTs and invalidates its delta file;
+a tombstone-only invalidation can clear at the next VACUUM compaction. Background
+reclaim never saves such an index. When choosing what to unload, prefer indexes with
+`reclaim_exempt = none`.
+
+**After a daemon restart.** Startup never evicts. It loads `.cagra`, then
+`.shards`, then `.vectors` indexes; within each pass the hottest indexes of the
+previous run come first (last use, then searches), read from the usage stats file
+`index_dir/.pg_cuvs_usage_stats` that the reclaim thread rewrites atomically every
+tick (whatever the reclaim mode). Without the file, or if it is unreadable or
+corrupt, the order is `(database OID, index OID)`; the startup log names the reason.
+Indexes that do not fit stay not resident until their first query. Pins are not
+restored.
