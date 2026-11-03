@@ -68,6 +68,36 @@ FROM pg_cuvs_last_rejection() r;
  AR0    | 54000    | t
 (1 row)
 
+-- Sharded build (CK-36 (d')): 4000 rows in 2 shards of 2000, each
+-- N = 576,000 + 4,450,176 = 5,026,176 B (4 MiB) against 3 MiB. The shard
+-- rejection carries its shard number in DETAIL and in the jsonb.
+CREATE TABLE ar_shard (id int, embedding vector(8));
+INSERT INTO ar_shard
+SELECT g, format('[%s,%s,0,0,0,0,1,0]', g, g % 11)::vector FROM generate_series(1, 4000) g;
+SET cuvs.shard_count = 2;
+SELECT pg_cuvs_set_vram_budget(3145728);
+ pg_cuvs_set_vram_budget 
+-------------------------
+ 
+(1 row)
+
+\set ON_ERROR_STOP off
+CREATE INDEX ar_sharded ON ar_shard USING cagra (embedding vector_l2_ops);
+ERROR:  pg_cuvs: GPU memory is insufficient for this CAGRA build (needs more than the configured limit); CREATE INDEX aborted
+DETAIL:  shard 0: needs 4 MiB; the limit for one build is 3 MiB (pool quota, or the logical VRAM budget when the pool is disabled)
+HINT:  For a large table use pg_cuvs_hnsw with build_algo='auto' (it spills to ACE on disk when over budget) or build_algo='ace'. A lower graph_degree slightly lowers the admission estimate. Operators can review --rmm-pool-max-percent, --max-vram-mb and --rmm-scratch-permille. Or make room for one shard, or raise cuvs.shard_count to make the shards smaller.
+\echo :LAST_ERROR_SQLSTATE
+54000
+\set ON_ERROR_STOP on
+SELECT r->>'reason' AS reason, r->>'sqlstate' AS sqlstate, r->>'requester' AS requester,
+       r->'shard' AS shard
+FROM pg_cuvs_last_rejection() r;
+ reason | sqlstate | requester | shard 
+--------+----------+-----------+-------
+ AR0    | 54000    | SHARD     | 0
+(1 row)
+
+RESET cuvs.shard_count;
 -- Restored budget: the same build is admitted.
 SELECT pg_cuvs_set_vram_budget(0);
  pg_cuvs_set_vram_budget 
@@ -83,3 +113,4 @@ SELECT pg_cuvs_last_rejection()->>'reason' AS last_reason_unchanged;
 (1 row)
 
 DROP TABLE ar_items;
+DROP TABLE ar_shard;
