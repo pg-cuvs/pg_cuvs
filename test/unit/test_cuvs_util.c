@@ -7,6 +7,7 @@
 
 #include "cuvs_util.h"
 #include "cuvs_ipc.h"   /* CUVS_STATUS_* values */
+#include "cuvs_admission_contract.h"   /* CuvsAdmissionReason (breaker tests) */
 
 #include <stdio.h>
 #include <string.h>
@@ -236,6 +237,215 @@ test_circuit_breaker_status_classification(void)
 
     /* Then the breaker opens for the affected index. */
     ASSERT(cuvs_circuit_is_open(oid) == 1, "repeatable search statuses trip breaker");
+}
+
+/* UC-2 fake clock: every breaker call below passes `now` explicitly. */
+#define CB_T0   1000
+#define CB_TTL  30
+
+static const CuvsCircuitBreaker *
+cb_find(uint32_t oid)
+{
+    for (int i = 0; i < cuvs_n_circuit_breakers; i++)
+        if (cuvs_circuit_breakers[i].index_oid == oid)
+            return &cuvs_circuit_breakers[i];
+    return NULL;
+}
+
+/* Trip `oid` at CB_T0 with `threshold` failures of (status, reason). */
+static void
+cb_trip(uint32_t oid, int threshold, int status, int reason)
+{
+    for (int i = 0; i < threshold; i++)
+        cuvs_circuit_record_status_reason(oid, threshold, status, reason, CB_T0);
+}
+
+static void
+test_circuit_transient_ttl_half_open(void)
+{
+    const uint32_t oid = 21;
+    const int threshold = 3;
+    const CuvsCircuitBreaker *b;
+
+    /* Arrange: a breaker opened by a transient admission reason (AR1). */
+    cuvs_circuit_reset_all();
+    cb_trip(oid, threshold, CUVS_STATUS_OOM_FALLBACK, CUVS_ADMISSION_AR1);
+    b = cb_find(oid);
+
+    /* Assert: transient + opened_at recorded at the trip. */
+    ASSERT(b != NULL && b->transient == 1, "ttl: transient trip records transient=1");
+    ASSERT(b != NULL && b->opened_at == CB_T0, "ttl: transient trip records opened_at");
+
+    /* Act/Assert: still open one second before the TTL. */
+    ASSERT(cuvs_circuit_state(oid, CB_T0 + CB_TTL - 1, CB_TTL) == CUVS_CIRCUIT_OPEN,
+           "ttl: open at t+29");
+    ASSERT(b->half_open_count == 0, "ttl: no half-open before TTL");
+
+    /* Act/Assert: half-open exactly at the TTL; count once per transition. */
+    ASSERT(cuvs_circuit_state(oid, CB_T0 + CB_TTL, CB_TTL) == CUVS_CIRCUIT_HALF_OPEN,
+           "ttl: half-open at t+30");
+    ASSERT(b->half_open_count == 1, "ttl: half_open_count increments on transition");
+    ASSERT(cuvs_circuit_state(oid, CB_T0 + CB_TTL + 5, CB_TTL) == CUVS_CIRCUIT_HALF_OPEN,
+           "ttl: stays half-open on later observation");
+    ASSERT(b->half_open_count == 1, "ttl: repeated observation does not recount");
+    ASSERT(cuvs_circuit_is_open(oid) == 0, "ttl: plan-time is_open false while half-open");
+
+    /* Act: the half-open GPU attempt succeeds. Assert: closed. */
+    cuvs_circuit_record_success(oid);
+    ASSERT(cuvs_circuit_state(oid, CB_T0 + CB_TTL + 6, CB_TTL) == CUVS_CIRCUIT_CLOSED,
+           "ttl: success in half-open closes");
+    ASSERT(b->consecutive_errors == 0 && b->open == 0, "ttl: close zeroes errors and open");
+    ASSERT(b->half_open_count == 1, "ttl: count survives close");
+}
+
+static void
+test_circuit_half_open_failure_reopens(void)
+{
+    const uint32_t oid = 22;
+    const int threshold = 3;
+    const int64_t t1 = CB_T0 + CB_TTL;   /* half-open moment */
+    const int64_t t2 = t1 + 2;           /* probe failure moment */
+    const CuvsCircuitBreaker *b;
+
+    /* Arrange: transient breaker driven to half-open. */
+    cuvs_circuit_reset_all();
+    cb_trip(oid, threshold, CUVS_STATUS_OOM_FALLBACK, CUVS_ADMISSION_NONE);
+    ASSERT(cuvs_circuit_state(oid, t1, CB_TTL) == CUVS_CIRCUIT_HALF_OPEN,
+           "reopen: OOM_FALLBACK w/o reason half-opens");
+
+    /* Act: the probe fails transiently (ATT). */
+    cuvs_circuit_record_status_reason(oid, threshold, CUVS_STATUS_ERROR,
+                                      CUVS_ADMISSION_ATT, t2);
+    b = cb_find(oid);
+
+    /* Assert: re-opened, TTL restarted from t2. */
+    ASSERT(b != NULL && b->opened_at == t2, "reopen: transient failure renews opened_at");
+    ASSERT(cuvs_circuit_state(oid, t2 + CB_TTL - 1, CB_TTL) == CUVS_CIRCUIT_OPEN,
+           "reopen: TTL restarts (open at t2+29)");
+    ASSERT(cuvs_circuit_state(oid, t2 + CB_TTL, CB_TTL) == CUVS_CIRCUIT_HALF_OPEN,
+           "reopen: half-open again at t2+30");
+    ASSERT(b->half_open_count == 2, "reopen: second transition counted");
+
+    /* Act: this probe fails permanently (protocol skew). */
+    cuvs_circuit_record_status_reason(oid, threshold, CUVS_STATUS_PROTO_MISMATCH,
+                                      CUVS_ADMISSION_NONE, t2 + CB_TTL + 1);
+
+    /* Assert: permanent now — no TTL recovery. */
+    ASSERT(b->transient == 0, "reopen: permanent probe failure records transient=0");
+    ASSERT(cuvs_circuit_state(oid, t2 + 100 * CB_TTL, CB_TTL) == CUVS_CIRCUIT_OPEN,
+           "reopen: permanent re-open stays open after TTL");
+}
+
+static void
+test_circuit_permanent_stays_open(void)
+{
+    const int threshold = 2;
+    struct { int status; int reason; const char *msg; } cases[] = {
+        { CUVS_STATUS_ERROR,          CUVS_ADMISSION_AR0,  "permanent: AR0 stays open" },
+        { CUVS_STATUS_PROTO_MISMATCH, CUVS_ADMISSION_NONE, "permanent: PROTO_MISMATCH stays open" },
+        { CUVS_STATUS_ERROR,          CUVS_ADMISSION_NONE, "permanent: generic ERROR stays open" },
+        { CUVS_STATUS_UNAVAILABLE,    CUVS_ADMISSION_NONE, "permanent: UNAVAILABLE stays open" },
+    };
+
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++)
+    {
+        const uint32_t oid = 30 + (uint32_t) i;
+        const CuvsCircuitBreaker *b;
+
+        cuvs_circuit_reset_all();
+        cb_trip(oid, threshold, cases[i].status, cases[i].reason);
+        b = cb_find(oid);
+
+        ASSERT(b != NULL && b->transient == 0 && b->opened_at == CB_T0,
+               "permanent: trip records transient=0 and opened_at");
+        ASSERT(cuvs_circuit_state(oid, CB_T0 + 1000 * CB_TTL, CB_TTL) == CUVS_CIRCUIT_OPEN,
+               cases[i].msg);
+        ASSERT(cuvs_circuit_state(oid, CB_T0 + 1000 * CB_TTL, 0) == CUVS_CIRCUIT_OPEN,
+               "permanent: TTL 0 does not half-open a permanent breaker");
+        ASSERT(b->half_open_count == 0, "permanent: never counts a half-open");
+
+        /* Only the manual reset closes it. */
+        cuvs_circuit_reset(oid);
+        ASSERT(cuvs_circuit_state(oid, CB_T0, CB_TTL) == CUVS_CIRCUIT_CLOSED,
+               "permanent: manual reset closes");
+    }
+}
+
+static void
+test_circuit_ttl_zero(void)
+{
+    const uint32_t oid = 40;
+
+    cuvs_circuit_reset_all();
+    cb_trip(oid, 1, CUVS_STATUS_OOM_FALLBACK, CUVS_ADMISSION_OOM);
+    ASSERT(cuvs_circuit_state(oid, CB_T0, 0) == CUVS_CIRCUIT_HALF_OPEN,
+           "ttl0: transient breaker half-opens immediately");
+    ASSERT(cb_find(oid)->half_open_count == 1, "ttl0: transition counted");
+}
+
+static void
+test_circuit_reason_classification(void)
+{
+    /* Transient admission reasons, regardless of the carrying status. */
+    ASSERT(cuvs_circuit_reason_is_transient(CUVS_STATUS_ERROR, CUVS_ADMISSION_AR1) == 1, "class: AR1 transient");
+    ASSERT(cuvs_circuit_reason_is_transient(CUVS_STATUS_ERROR, CUVS_ADMISSION_AR2) == 1, "class: AR2 transient");
+    ASSERT(cuvs_circuit_reason_is_transient(CUVS_STATUS_ERROR, CUVS_ADMISSION_AR3) == 1, "class: reload AR3 transient");
+    ASSERT(cuvs_circuit_reason_is_transient(CUVS_STATUS_ERROR, CUVS_ADMISSION_AR4) == 1, "class: reload AR4 transient");
+    ASSERT(cuvs_circuit_reason_is_transient(CUVS_STATUS_ERROR, CUVS_ADMISSION_AR5) == 1, "class: AR5 transient");
+    ASSERT(cuvs_circuit_reason_is_transient(CUVS_STATUS_ERROR, CUVS_ADMISSION_OOM) == 1, "class: OOM transient");
+    ASSERT(cuvs_circuit_reason_is_transient(CUVS_STATUS_ERROR, CUVS_ADMISSION_ATT) == 1, "class: ATT transient");
+    ASSERT(cuvs_circuit_reason_is_transient(CUVS_STATUS_OOM_FALLBACK, CUVS_ADMISSION_NONE) == 1,
+           "class: OOM_FALLBACK without reason transient");
+
+    /* Permanent. */
+    ASSERT(cuvs_circuit_reason_is_transient(CUVS_STATUS_ERROR, CUVS_ADMISSION_AR0) == 0, "class: AR0 permanent");
+    ASSERT(cuvs_circuit_reason_is_transient(CUVS_STATUS_PROTO_MISMATCH, CUVS_ADMISSION_NONE) == 0,
+           "class: PROTO_MISMATCH (12) permanent");
+    ASSERT(CUVS_STATUS_PROTO_MISMATCH == 12, "class: PROTO_MISMATCH wire value is 12");
+    ASSERT(cuvs_circuit_reason_is_transient(CUVS_STATUS_ERROR, CUVS_ADMISSION_NONE) == 0,
+           "class: generic ERROR without reason permanent");
+    ASSERT(cuvs_circuit_reason_is_transient(CUVS_STATUS_UNAVAILABLE, CUVS_ADMISSION_NONE) == 0,
+           "class: UNAVAILABLE without reason permanent");
+
+    /* Reload (AR3/AR4) and OOM/ATT trips end up TTL-eligible end to end. */
+    {
+        const int reasons[] = { CUVS_ADMISSION_AR3, CUVS_ADMISSION_AR4,
+                                CUVS_ADMISSION_OOM, CUVS_ADMISSION_ATT };
+        for (size_t i = 0; i < sizeof(reasons) / sizeof(reasons[0]); i++)
+        {
+            const uint32_t oid = 50 + (uint32_t) i;
+            cuvs_circuit_reset_all();
+            cb_trip(oid, 2, CUVS_STATUS_ERROR, reasons[i]);
+            ASSERT(cuvs_circuit_state(oid, CB_T0 + CB_TTL, CB_TTL) == CUVS_CIRCUIT_HALF_OPEN,
+                   "class: AR3/AR4/OOM/ATT trip half-opens after TTL");
+        }
+    }
+
+    /* Not-counted statuses stay neutral even when a transient reason rides along. */
+    {
+        const int neutral[] = { CUVS_STATUS_OK, CUVS_STATUS_CANCELED, CUVS_STATUS_DIM_MISMATCH,
+                                CUVS_STATUS_METRIC_MISMATCH, CUVS_STATUS_STALE,
+                                CUVS_STATUS_NO_VECTORS };
+        cuvs_circuit_reset_all();
+        for (size_t i = 0; i < sizeof(neutral) / sizeof(neutral[0]); i++)
+            cuvs_circuit_record_status_reason(60, 1, neutral[i], CUVS_ADMISSION_AR1, CB_T0);
+        ASSERT(cuvs_n_circuit_breakers == 0, "class: not-counted statuses create no state");
+    }
+}
+
+static void
+test_circuit_exec_action(void)
+{
+    ASSERT(cuvs_circuit_exec_action(CUVS_CIRCUIT_OPEN) == CUVS_CIRCUIT_EXEC_ERROR,
+           "exec: OPEN raises an error");
+    ASSERT(cuvs_circuit_exec_action(CUVS_CIRCUIT_HALF_OPEN) == CUVS_CIRCUIT_EXEC_TRY_GPU,
+           "exec: HALF_OPEN tries the GPU");
+    ASSERT(cuvs_circuit_exec_action(CUVS_CIRCUIT_CLOSED) == CUVS_CIRCUIT_EXEC_TRY_GPU,
+           "exec: CLOSED tries the GPU");
+    ASSERT(strcmp(cuvs_circuit_state_name(CUVS_CIRCUIT_CLOSED), "closed") == 0, "exec: name closed");
+    ASSERT(strcmp(cuvs_circuit_state_name(CUVS_CIRCUIT_OPEN), "open") == 0, "exec: name open");
+    ASSERT(strcmp(cuvs_circuit_state_name(CUVS_CIRCUIT_HALF_OPEN), "half_open") == 0,
+           "exec: name half_open");
 }
 
 static void
@@ -1217,6 +1427,12 @@ main(void)
     test_u64_sorted_set();
     test_circuit_breaker();
     test_circuit_breaker_status_classification();
+    test_circuit_transient_ttl_half_open();
+    test_circuit_half_open_failure_reopens();
+    test_circuit_permanent_stays_open();
+    test_circuit_ttl_zero();
+    test_circuit_reason_classification();
+    test_circuit_exec_action();
     test_crc32();
     test_tids_roundtrip();
     test_tids_rejections();
