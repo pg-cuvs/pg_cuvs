@@ -56,10 +56,8 @@ check "flag: idle:-1 refused" sh -c "! pg_cuvs_server --socket /tmp/x.sock --ind
 
 startd --reclaim-tick-s 1 --evict-min-idle-s 3600
 psqlq "CREATE EXTENSION vector; CREATE EXTENSION pg_cuvs;" >/dev/null
-# The 0.9.0 scripts belong to I3-A; apply the I3-B block on top of 0.8.2.
-sed "s#MODULE_PATHNAME#\$libdir/pg_cuvs#" sql/pg_cuvs--0.8.2--0.9.0.sql > /tmp/i3b_block.sql
-su pg -c "psql -h /tmp -X -q -v ON_ERROR_STOP=1 -d postgres -f /tmp/i3b_block.sql" >/tmp/block.log 2>&1
-check "I3-B SQL block installs" sh -c "! grep -q ERROR /tmp/block.log"
+# 0.9.0 (I3-A's scripts with the I3-B block) is the default version now.
+check "extension installs at 0.9.0 with the I3-B functions" sh -c "[ \"\$(su pg -c \"psql -h /tmp -X -At -d postgres -c \\\"SELECT extversion FROM pg_extension WHERE extname='pg_cuvs'\\\"\")\" = 0.9.0 ] && su pg -c \"psql -h /tmp -X -At -d postgres -c \\\"SELECT count(*) FROM pg_proc WHERE proname IN ('pg_cuvs_unload','pg_cuvs_load','pg_cuvs_pin','pg_cuvs_unpin','pg_cuvs_reclaim_set','pg_cuvs_index_status','pg_cuvs_memory_status','pg_cuvs_circuit_status')\\\"\" | grep -qx 10"
 for t in t1 t2 t3; do
   psqlq "CREATE TABLE $t (id int, v vector(64)); INSERT INTO $t SELECT g, (SELECT array_agg(((g*31+i) % 97)::real) FROM generate_series(1,64) i)::vector FROM generate_series(1,20000) g;" >/dev/null
 done

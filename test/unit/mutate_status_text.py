@@ -79,6 +79,8 @@ MUTATIONS = [
     ("d11 memory_status skips the privilege check", "scan", "src/pg_cuvs.c",
      "    if (!cuvs_status_is_priv())\n        ereport(ERROR,",
      "    if (false)\n        ereport(ERROR,"),
+    ("d12 install and upgrade blocks diverge", "scan", "sql/pg_cuvs--0.9.0.sql",
+     "REVOKE ALL ON FUNCTION pg_cuvs_reclaim_set(text, text) FROM PUBLIC;\n", ""),
 ]
 
 

@@ -124,15 +124,18 @@ check(re.search(r"if\s*\(\s*r\s*<\s*0\s*\)\s*ereport\s*\(\s*ERROR", emit) is not
 # ---- SQL block ----------------------------------------------------------
 sql_path = "sql/pg_cuvs--0.8.2--0.9.0.sql"
 sql = read(sql_path)
-check("I3-A owns this file and pg_cuvs--0.9.0.sql; this I3-B block is appended "
-      "to both at stack rebase." in sql, "header ownership comment missing")
 m = re.search(r"^-- I3-B begin\n(.*?)^-- I3-B end\n?", sql, flags=re.S | re.M)
 check(m is not None, "I3-B begin/end block missing")
 block = m.group(1) if m else ""
 outside = (sql[:m.start()] + sql[m.end():]) if m else sql
-for line in outside.splitlines():
-    check(line.strip() == "" or line.startswith("--"),
-          f"statement outside the I3-B block: {line!r}")
+# I3-B only appends: its block comes after I3-A's, and nothing I3-B defines
+# appears outside its own block.
+check(m is not None and sql.find("-- I3-A end") >= 0 and sql.find("-- I3-A end") < m.start(),
+      "I3-B block is not appended after the I3-A block")
+for fn_name in ("pg_cuvs_unload", "pg_cuvs_load", "pg_cuvs_pin", "pg_cuvs_unpin",
+                "pg_cuvs_reclaim_set", "pg_cuvs_index_status", "pg_cuvs_memory_status",
+                "pg_cuvs_circuit_status"):
+    check(fn_name not in outside, f"{fn_name} appears outside the I3-B block")
 
 
 def norm_sig(name, args):
@@ -216,6 +219,16 @@ for fn, cols_macro, kinds_macro, lead in (
     got = returns_table(fn)
     check(len(names) == len(kinds), f"{kinds_macro} length {len(kinds)} != {len(names)} columns")
     check(got == want, f"{fn} RETURNS TABLE differs from header/kinds:\n  got  {got}\n  want {want}")
+
+# Coordination rule: the I3-B block is identical in the install and upgrade
+# scripts (upgrade_path compares the two catalogs).
+def _block(path):
+    t = open(path).read()
+    a, b = t.find("-- I3-B begin"), t.find("-- I3-B end")
+    return t[a:b] if a >= 0 and b > a else None
+_inst = _block("sql/pg_cuvs--0.9.0.sql") if os.path.exists("sql/pg_cuvs--0.9.0.sql") else None
+check(_inst is not None and _inst == _block("sql/pg_cuvs--0.8.2--0.9.0.sql"),
+      "I3-B block differs between pg_cuvs--0.9.0.sql and pg_cuvs--0.8.2--0.9.0.sql")
 
 if FAILS:
     for f in FAILS:
