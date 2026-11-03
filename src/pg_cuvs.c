@@ -1111,7 +1111,7 @@ _PG_init(void)
         "it. 0 = half-open immediately. Permanent reasons still require "
         "pg_cuvs_reset_circuit().",
         &cuvs_circuit_breaker_transient_ttl_s,
-        30, 0, INT_MAX,
+        30, 0, 3600,                      /* KB-18 range (C6) */
         PGC_USERSET,
         0, NULL, NULL, NULL);
 
