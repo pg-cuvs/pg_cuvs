@@ -1,0 +1,39 @@
+baseline: PASS test_cache_policy: 140 passed, 0 failed
+RED  [CK-23] eligible >= becomes >: FAIL test/unit/test_cache_policy.c:64: t - last_use == P is eligible
+RED  [CK-23] pin ignored: FAIL test/unit/test_cache_policy.c:74: pinned never eligible
+RED  [CK-23] in-use ignored: FAIL test/unit/test_cache_policy.c:76: in use never eligible
+RED  [CK-23] bonus cap removed: FAIL test/unit/test_cache_policy.c:61: bonus cap
+RED  [CK-23] scope none returns victims: FAIL test/unit/test_cache_policy.c:106: scope none: no victim, AR5 (lru set fits) v=0 n=1
+RED  [CK-23] order by raw last_use: FAIL test/unit/test_cache_policy.c:93: ord asc, tie by index_oid: got 0 2 1
+RED  [CK-23] soft evict takes pinned: FAIL test/unit/test_cache_policy.c:149: eligible short -> soft fills the rest (n=2)
+RED  [CK-23] soft victim labeled reload: FAIL test/unit/test_cache_policy.c:149: eligible short -> soft fills the rest (n=2)
+RED  [CK-23] soft applied to warmup: FAIL test/unit/test_cache_policy.c:168: warmup: no soft
+RED  [CK-36] startup evicts: FAIL test/unit/test_cache_policy.c:174: startup no evict
+RED  [CK-36] startup reports AR5: FAIL test/unit/test_cache_policy.c:174: startup no evict
+RED  [CK-23] partial eviction on reject: FAIL test/unit/test_cache_policy.c:106: scope none: no victim, AR5 (lru set fits) v=0 n=0
+RED  [CK-24] F-1: AR0 counted: FAIL test/unit/test_cache_policy.c:216: F-1: AR0/AR7 only -> F=0
+RED  [CK-24] F-1: AR7 counted: FAIL test/unit/test_cache_policy.c:216: F-1: AR0/AR7 only -> F=0
+RED  [CK-24] F-2: cap removed: FAIL test/unit/test_cache_policy.c:233: F-2 cap 50%: 107374182400
+RED  [CK-24] F-2: fixed F uncapped: FAIL test/unit/test_cache_policy.c:260: fixed capped
+RED  [CK-24] F-3: window ignored: FAIL test/unit/test_cache_policy.c:247: F-3: window-1 in, window+1 out (9663676416)
+RED  [CK-24] F-3: admission keeps rejects: FAIL test/unit/test_cache_policy.c:251: F-3: later admission removes the reject
+RED  [CK-24] F-4: floor removed: FAIL test/unit/test_cache_policy.c:331: at floor: F reclaim idle
+RED  [CK-24 r18 A-1] F-4: floor applied to usage lines: FAIL test/unit/test_cache_policy.c:343: usage ignores floor (tr=0 after=89)
+RED  [CK-24] F-4: victim may cross floor: FAIL test/unit/test_cache_policy.c:334: no crossing below floor
+RED  [CK-24] usage mode uses F: FAIL test/unit/test_cache_policy.c:311: usage: hi 85 -> lo 75 ignores F (k=40 after=50)
+RED  [CK-24] off mode reclaims: FAIL test/unit/test_cache_policy.c:305: off: nothing
+RED  [CK-24] headroom loses usage lines: FAIL test/unit/test_cache_policy.c:320: both: max of lo and F
+RED  [CK-24] lo ignored: FAIL test/unit/test_cache_policy.c:311: usage: hi 85 -> lo 75 ignores F (k=5 after=85)
+RED  [UC-2 r18 B-1] r hint without floor: FAIL test/unit/test_cache_policy.c:362: floor
+RED  [CK-9] runtime accepts accounting knob: FAIL test/unit/test_cache_policy.c:408: accounting knob not runtime
+RED  [CK-9] runtime accepts low > high: FAIL test/unit/test_cache_policy.c:404: runtime low>high rejected, value kept
+RED  [CK-9] range check removed: FAIL test/unit/test_cache_policy.c:379: cap 0
+RED  [CK-9] mode validation removed: FAIL test/unit/test_cache_policy.c:378: bad mode
+RED  [CK-36 (e)] usage file crc unchecked: FAIL test/unit/test_cache_policy.c:458: crc catches overwritten prefix
+RED  [CK-36 (e)] usage file partial list: FAIL test/unit/test_cache_policy.c:449: corrupt: mid entry
+RED  [CK-36 (e)] startup ignores stats: FAIL test/unit/test_cache_policy.c:495: hot first then OID, independent of enumeration
+RED  [CK-36 (e)] startup order by enumeration: FAIL test/unit/test_cache_policy.c:495: hot first then OID, independent of enumeration
+RED  [CK-24 r10] sidecar: .tombstone missed: FAIL test/unit/test_cache_policy.c:533: tombstone only
+RED  [UC-1 7b] sidecar: skip ignores file_current: FAIL test/unit/test_cache_policy.c:542: no skip: file_current
+RED  [UC-1 2a] self-replace ignores pin: FAIL test/unit/test_cache_policy.c:190: pinned
+mutations: 37, survived/invalid: 0
