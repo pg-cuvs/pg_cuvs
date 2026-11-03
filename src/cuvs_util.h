@@ -486,6 +486,39 @@ int cuvs_admission_encode(const CuvsAdmissionFields *in, char *buf, size_t cap);
  * out-of-range token (out is then zeroed). */
 int cuvs_admission_decode(const char *buf, size_t len, CuvsAdmissionFields *out);
 
+/* User-visible rejection text (C5 errmsg, DETAIL templates, HINT rules).
+ * PG-free: the backend supplies name lookup and the unload privilege test.
+ * index_name writes the quote_qualified_identifier() form of a same-DB index
+ * and returns 0, or -1 when the OID does not resolve. can_unload returns 1
+ * when the caller owns the index or is superuser (C7). Each output buffer
+ * gets a NUL-terminated (possibly truncated) string. Returns the SQLSTATE,
+ * or NULL (outputs empty) when the reason does not belong to obj or the
+ * fields are invalid; the caller then keeps its legacy message. */
+#define CUVS_ADMISSION_MSG_BYTES 2048
+
+typedef enum CuvsAdmissionObject {
+    CUVS_ADMISSION_OBJ_CAGRA,   /* cagra AM build: AR0..AR7, OOM, ATT */
+    CUVS_ADMISSION_OBJ_IVFPQ,   /* IVF-PQ AM build: AR0..AR5 */
+    CUVS_ADMISSION_OBJ_SHARD,   /* sharded CAGRA build: AR0, AR3..AR5 */
+    CUVS_ADMISSION_OBJ_LOAD     /* search-path reload: AR0..AR5 */
+} CuvsAdmissionObject;
+
+typedef struct CuvsAdmissionCatalog {
+    uint32_t my_db_oid;
+    int      superuser;
+    int    (*index_name)(void *ctx, uint32_t index_oid, char *buf, size_t cap);
+    int    (*can_unload)(void *ctx, uint32_t db_oid, uint32_t index_oid);
+    void    *ctx;
+} CuvsAdmissionCatalog;
+
+const char *cuvs_admission_format(const CuvsAdmissionFields *f,
+                                  CuvsAdmissionObject obj,
+                                  const char *load_index_name,
+                                  const CuvsAdmissionCatalog *cat,
+                                  char *msg, size_t msg_cap,
+                                  char *detail, size_t detail_cap,
+                                  char *hint, size_t hint_cap);
+
 #ifdef CUVS_TEST_HOOKS
 /* Test-only fault injection: returns 1 if env var `name` is set, else 0.
  * Compiled in ONLY under CUVS_TEST_HOOKS; absent from production builds. */

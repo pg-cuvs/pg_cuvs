@@ -1267,6 +1267,441 @@ bad:
 }
 
 /* ----------------------------------------------------------------
+ * User-visible rejection text (cuvs_util.h, v6 r18 C5).
+ * ---------------------------------------------------------------- */
+typedef struct CuvsStrBuf { char *p; size_t cap, len; } CuvsStrBuf;
+
+static void cuvs_sb_add(CuvsStrBuf *b, const char *fmt, ...)
+    __attribute__((format(printf, 2, 3)));
+
+static void
+cuvs_sb_add(CuvsStrBuf *b, const char *fmt, ...)
+{
+    va_list ap;
+    int     w;
+
+    if (b->cap == 0 || b->len + 1 >= b->cap)
+        return;
+    va_start(ap, fmt);
+    w = vsnprintf(b->p + b->len, b->cap - b->len, fmt, ap);
+    va_end(ap);
+    if (w < 0)
+        return;
+    b->len += (size_t) w;
+    if (b->len >= b->cap)
+        b->len = b->cap - 1;           /* truncated, still NUL-terminated */
+}
+
+/* "{v}" with the saturation marker. */
+static void
+cuvs_sb_mib(CuvsStrBuf *b, uint32_t v)
+{
+    if (v >= CUVS_ADMISSION_SCALAR_MAX)
+        cuvs_sb_add(b, "%u+", CUVS_ADMISSION_SCALAR_MAX);
+    else
+        cuvs_sb_add(b, "%u", v);
+}
+
+/* Append s as the body of a SQL string literal (single quotes doubled). */
+static void
+cuvs_sb_literal(CuvsStrBuf *b, const char *s)
+{
+    for (; *s; s++)
+        cuvs_sb_add(b, *s == '\'' ? "''" : "%c", *s);
+}
+
+static void
+cuvs_admission_cand_name(const CuvsAdmissionCatalog *cat,
+                         const CuvsAdmissionCandidate *t, char *buf, size_t cap,
+                         int *resolved)
+{
+    *resolved = 0;
+    if (t->db_oid != cat->my_db_oid)
+    {
+        snprintf(buf, cap, "(db %u) oid %u", t->db_oid, t->index_oid);
+        return;
+    }
+    if (cat->index_name != NULL && cat->index_name(cat->ctx, t->index_oid, buf, cap) == 0)
+    {
+        *resolved = 1;
+        return;
+    }
+    snprintf(buf, cap, "oid %u", t->index_oid);
+}
+
+/* "need ... (pinned P in M)" core of the candidate-bearing DETAIL. */
+static void
+cuvs_admission_core(CuvsStrBuf *b, const CuvsAdmissionFields *f)
+{
+    cuvs_sb_add(b, "need "); cuvs_sb_mib(b, f->n);
+    cuvs_sb_add(b, " MiB, free "); cuvs_sb_mib(b, f->f);
+    cuvs_sb_add(b, " MiB");
+    /* Absent keys are not a measured zero: omit their clause. */
+    if (f->present & CUVS_ADM_F_H)
+    {
+        cuvs_sb_add(b, ", resident "); cuvs_sb_mib(b, f->h_mib);
+        cuvs_sb_add(b, " MiB in "); cuvs_sb_mib(b, f->h_cnt);
+        cuvs_sb_add(b, " indexes");
+    }
+    if (f->present & CUVS_ADM_F_K)
+    {
+        cuvs_sb_add(b, " (pinned "); cuvs_sb_mib(b, f->k_mib);
+        cuvs_sb_add(b, " MiB in "); cuvs_sb_mib(b, f->k_cnt);
+        cuvs_sb_add(b, ")");
+    }
+}
+
+static void
+cuvs_admission_cands(CuvsStrBuf *b, const CuvsAdmissionFields *f,
+                     const CuvsAdmissionCatalog *cat)
+{
+    cuvs_sb_add(b, ". Idle candidates: ");
+    if (f->n_cand == 0)
+    {
+        cuvs_sb_add(b, "none (every other resident index is pinned or in use)");
+        return;
+    }
+    for (uint32_t c = 0; c < f->n_cand; c++)
+    {
+        char name[256];
+        int  resolved;
+
+        cuvs_admission_cand_name(cat, &f->cand[c], name, sizeof(name), &resolved);
+        cuvs_sb_add(b, "%s%s ", c ? "; " : "", name);
+        cuvs_sb_mib(b, f->cand[c].mib);
+        if (f->cand[c].idle_s == CUVS_ADMISSION_IDLE_NEVER)
+            cuvs_sb_add(b, " MiB idle never");
+        else
+            cuvs_sb_add(b, " MiB idle %d min", f->cand[c].idle_s / 60);
+    }
+}
+
+#define CUVS_ADM_UNLOAD_NOTES \
+    " (the unloaded index reloads on its next query)" \
+    " (prefer an index whose pg_cuvs_index_status().reclaim_exempt is none;" \
+    " unloading an index that has delta or tombstone sidecar files and" \
+    " pg_cuvs_gpu_search_stats().extend_count > 0 switches its GPU path to" \
+    " CPU replan until REINDEX)"
+#define CUVS_ADM_UNPIN_CLAUSE \
+    " (if the index itself is pinned, release it first with pg_cuvs_unpin(index))"
+
+/* HINT 2 kinds (1)/(2) or the zero-candidate variants (2b). */
+static void
+cuvs_admission_unload_hint(CuvsStrBuf *b, const CuvsAdmissionFields *f,
+                           const CuvsAdmissionCatalog *cat, int load,
+                           int *recommends_unload)
+{
+    const char *retry = load ? "then retry the query." : "then retry CREATE INDEX.";
+
+    *recommends_unload = 0;
+    if (f->n_cand == 0)
+    {
+        if (f->k_cnt > 0)
+        {
+            cuvs_sb_add(b, "Pinned indexes hold ");
+            cuvs_sb_mib(b, f->k_mib);
+            cuvs_sb_add(b, " MiB; release one with pg_cuvs_unpin(index) (owner or "
+                           "superuser), or retry after current queries finish");
+        }
+        else
+            cuvs_sb_add(b, "All resident indexes are in use; retry after current "
+                           "queries finish");
+        return;
+    }
+    *recommends_unload = 1;
+    for (uint32_t c = 0; c < f->n_cand; c++)
+    {
+        const CuvsAdmissionCandidate *t = &f->cand[c];
+        char name[256];
+        int  resolved;
+
+        if (cat->can_unload == NULL || !cat->can_unload(cat->ctx, t->db_oid, t->index_oid))
+            continue;
+        cuvs_admission_cand_name(cat, t, name, sizeof(name), &resolved);
+        if (resolved)
+        {
+            cuvs_sb_add(b, "SELECT pg_cuvs_unload('");
+            cuvs_sb_literal(b, name);
+            cuvs_sb_add(b, "'); %s", retry);
+        }
+        else if (t->db_oid != cat->my_db_oid && cat->superuser)
+            cuvs_sb_add(b, "SELECT pg_cuvs_unload(%u, %u); %s",
+                        t->db_oid, t->index_oid, retry);
+        else
+            continue;                  /* unresolvable here: try the next one */
+        cuvs_sb_add(b, CUVS_ADM_UNLOAD_NOTES);
+        return;
+    }
+    cuvs_sb_add(b, "Ask a superuser to unload an idle index (see pg_cuvs_index_status())."
+                   CUVS_ADM_UNLOAD_NOTES);
+}
+
+static int
+cuvs_admission_reason_fits(CuvsAdmissionReason r, CuvsAdmissionObject obj)
+{
+    switch (obj)
+    {
+        case CUVS_ADMISSION_OBJ_CAGRA:
+            return r >= CUVS_ADMISSION_AR0 && r <= CUVS_ADMISSION_ATT;
+        case CUVS_ADMISSION_OBJ_IVFPQ:
+        case CUVS_ADMISSION_OBJ_LOAD:
+            return r >= CUVS_ADMISSION_AR0 && r <= CUVS_ADMISSION_AR5;
+        case CUVS_ADMISSION_OBJ_SHARD:
+            return r == CUVS_ADMISSION_AR0 ||
+                   (r >= CUVS_ADMISSION_AR3 && r <= CUVS_ADMISSION_AR5);
+    }
+    return 0;
+}
+
+const char *
+cuvs_admission_format(const CuvsAdmissionFields *f, CuvsAdmissionObject obj,
+                      const char *load_index_name, const CuvsAdmissionCatalog *cat,
+                      char *msg, size_t msg_cap, char *detail, size_t detail_cap,
+                      char *hint, size_t hint_cap)
+{
+    CuvsStrBuf  m = {msg, msg_cap, 0}, d = {detail, detail_cap, 0}, h = {hint, hint_cap, 0};
+    const char *what, *state;
+    int         load = obj == CUVS_ADMISSION_OBJ_LOAD;
+    int         unload = 0;
+
+    if (msg_cap) msg[0] = '\0';
+    if (detail_cap) detail[0] = '\0';
+    if (hint_cap) hint[0] = '\0';
+    if (f == NULL || cat == NULL || f->n_cand > CUVS_ADMISSION_MAX_CANDIDATES ||
+        !cuvs_admission_reason_fits(f->reason, obj) ||
+        (state = cuvs_admission_sqlstate(f->reason)) == NULL)
+        return NULL;
+
+    what = obj == CUVS_ADMISSION_OBJ_IVFPQ ? "this IVF-PQ build"
+         : obj == CUVS_ADMISSION_OBJ_SHARD ? "this shard of the CAGRA build"
+         : "this CAGRA build";
+
+    /* errmsg */
+    if (load)
+        cuvs_sb_add(&m, "pg_cuvs: GPU memory is unavailable to load index \"%s\"",
+                    load_index_name ? load_index_name : "?");
+    else switch (f->reason)
+    {
+        case CUVS_ADMISSION_AR0:
+            cuvs_sb_add(&m, "pg_cuvs: GPU memory is insufficient for %s (needs more than "
+                            "the configured limit); CREATE INDEX aborted",
+                        obj == CUVS_ADMISSION_OBJ_SHARD ? "this CAGRA build" : what);
+            break;
+        case CUVS_ADMISSION_AR1:
+        case CUVS_ADMISSION_AR2:
+            cuvs_sb_add(&m, "pg_cuvs: GPU memory is insufficient while another CREATE "
+                            "INDEX holds GPU memory; CREATE INDEX aborted");
+            break;
+        case CUVS_ADMISSION_AR3:
+        case CUVS_ADMISSION_AR4:
+            cuvs_sb_add(&m, "pg_cuvs: GPU memory is insufficient for %s; CREATE INDEX "
+                            "aborted", what);
+            break;
+        case CUVS_ADMISSION_AR5:
+            cuvs_sb_add(&m, "pg_cuvs: %s would require evicting resident indexes, which "
+                            "the build eviction scope does not allow; CREATE INDEX aborted",
+                        what);
+            break;
+        case CUVS_ADMISSION_AR6:
+            cuvs_sb_add(&m, "pg_cuvs: large_workspace would not fit in GPU memory and "
+                            "managed overcommit is disabled; CREATE INDEX aborted");
+            break;
+        case CUVS_ADMISSION_AR7:
+            cuvs_sb_add(&m, "pg_cuvs: large_workspace would spill beyond the host memory "
+                            "guard; CREATE INDEX aborted");
+            break;
+        case CUVS_ADMISSION_OOM:
+            cuvs_sb_add(&m, "pg_cuvs: GPU memory exhausted during CAGRA build; CREATE "
+                            "INDEX aborted. No resident index was evicted");
+            break;
+        case CUVS_ADMISSION_ATT:
+            cuvs_sb_add(&m, "pg_cuvs: could not attach the dataset to the CAGRA index in "
+                            "GPU memory; CREATE INDEX aborted. No resident index was "
+                            "evicted");
+            break;
+        default:
+            return NULL;
+    }
+
+    /* DETAIL */
+    if (obj == CUVS_ADMISSION_OBJ_SHARD && (f->present & CUVS_ADM_F_I))
+        cuvs_sb_add(&d, "shard %u: ", f->i);
+    switch (f->reason)
+    {
+        case CUVS_ADMISSION_AR0:
+            cuvs_sb_add(&d, "needs "); cuvs_sb_mib(&d, f->n);
+            cuvs_sb_add(&d, " MiB; the limit for one build is "); cuvs_sb_mib(&d, f->q);
+            cuvs_sb_add(&d, " MiB (pool quota, or the logical VRAM budget when the pool "
+                            "is disabled)");
+            break;
+        case CUVS_ADMISSION_AR1:
+        case CUVS_ADMISSION_AR2:
+            cuvs_sb_add(&d, "needs "); cuvs_sb_mib(&d, f->n);
+            cuvs_sb_add(&d, " MiB; "); cuvs_sb_mib(&d, f->f);
+            cuvs_sb_add(&d, " MiB free (quota "); cuvs_sb_mib(&d, f->q);
+            cuvs_sb_add(&d, " MiB); other CREATE INDEX builds hold "); cuvs_sb_mib(&d, f->p);
+            cuvs_sb_add(&d, " MiB");
+            break;
+        case CUVS_ADMISSION_AR3:
+        case CUVS_ADMISSION_AR4:
+            cuvs_admission_core(&d, f);
+            cuvs_sb_add(&d, "; "); cuvs_sb_mib(&d, f->e_mib);
+            cuvs_sb_add(&d, " MiB in "); cuvs_sb_mib(&d, f->e_cnt);
+            cuvs_sb_add(&d, load ? " indexes would be evictable even with protection time "
+                                   "ignored (soft eviction), which is not enough"
+                                 : " indexes would be evictable under scope lru");
+            cuvs_admission_cands(&d, f, cat);
+            break;
+        case CUVS_ADMISSION_AR5:
+            cuvs_admission_core(&d, f);
+            if (load)
+            {
+                cuvs_sb_add(&d, "; nothing was evicted because evicting every unpinned "
+                                "idle index would still not make room; ");
+                cuvs_sb_mib(&d, f->e_mib);
+                cuvs_sb_add(&d, " MiB in "); cuvs_sb_mib(&d, f->e_cnt);
+                cuvs_sb_add(&d, " indexes are pinned or in use and would make room once "
+                                "released");
+                if (f->present & CUVS_ADM_F_W)
+                    cuvs_sb_add(&d, f->w == CUVS_ADMISSION_WAIT_UNPIN
+                                ? " (a pinned index is released only by pg_cuvs_unpin)"
+                                : " (running searches release them when they finish)");
+            }
+            else
+            {
+                cuvs_sb_add(&d, "; nothing was evicted because the build eviction scope "
+                                "does not allow it; ");
+                cuvs_sb_mib(&d, f->e_mib);
+                cuvs_sb_add(&d, " MiB in "); cuvs_sb_mib(&d, f->e_cnt);
+                cuvs_sb_add(&d, " indexes would be evictable under scope lru");
+                if ((f->present & CUVS_ADM_F_S) && f->s > 0)
+                {
+                    cuvs_sb_add(&d, "; this index is already resident with ");
+                    cuvs_sb_mib(&d, f->s);
+                    cuvs_sb_add(&d, " MiB");
+                }
+            }
+            cuvs_admission_cands(&d, f, cat);
+            break;
+        case CUVS_ADMISSION_AR6:
+        case CUVS_ADMISSION_AR7:
+            cuvs_sb_add(&d, "large_workspace estimate "); cuvs_sb_mib(&d, f->l);
+            cuvs_sb_add(&d, " MiB plus "); cuvs_sb_mib(&d, f->y);
+            if (f->reason == CUVS_ADMISSION_AR6)
+            {
+                cuvs_sb_add(&d, " MiB held by other managed builds exceeds physical free "
+                                "memory "); cuvs_sb_mib(&d, f->u);
+                cuvs_sb_add(&d, " MiB; the pool part of the build needs "); cuvs_sb_mib(&d, f->n);
+                cuvs_sb_add(&d, " MiB");
+            }
+            else
+            {
+                cuvs_sb_add(&d, " MiB held by other managed builds would spill beyond the "
+                                "host memory guard "); cuvs_sb_mib(&d, f->g);
+                cuvs_sb_add(&d, " MiB");
+            }
+            break;
+        case CUVS_ADMISSION_OOM:
+            cuvs_sb_add(&d, "needs "); cuvs_sb_mib(&d, f->n);
+            cuvs_sb_add(&d, " MiB; "); cuvs_sb_mib(&d, f->f);
+            cuvs_sb_add(&d, " MiB was free at admission; "); cuvs_sb_mib(&d, f->h_mib);
+            cuvs_sb_add(&d, " MiB held by "); cuvs_sb_mib(&d, f->h_cnt);
+            cuvs_sb_add(&d, " resident indexes; no resident index was evicted");
+            break;
+        case CUVS_ADMISSION_ATT:
+            cuvs_sb_add(&d, "needs "); cuvs_sb_mib(&d, f->n);
+            cuvs_sb_add(&d, " MiB");
+            break;
+        default:
+            return NULL;
+    }
+
+    /* HINT */
+    switch (f->reason)
+    {
+        case CUVS_ADMISSION_AR0:
+            cuvs_sb_add(&h, "For a large table use pg_cuvs_hnsw with build_algo='auto' "
+                            "(it spills to ACE on disk when over budget) or "
+                            "build_algo='ace'.");
+            if (obj != CUVS_ADMISSION_OBJ_IVFPQ)
+                cuvs_sb_add(&h, " A lower graph_degree slightly lowers the admission "
+                                "estimate.");
+            cuvs_sb_add(&h, " Operators can review --rmm-pool-max-percent, --max-vram-mb "
+                            "and --rmm-scratch-permille.");
+            break;
+        case CUVS_ADMISSION_AR1:
+        case CUVS_ADMISSION_AR2:
+            if (load)
+            {
+                cuvs_sb_add(&h, "A CREATE INDEX holds GPU memory (a CREATE INDEX may be "
+                                "running); retry after it finishes. If the circuit breaker "
+                                "opened, run SELECT pg_cuvs_reset_circuit('");
+                cuvs_sb_literal(&h, load_index_name ? load_index_name : "");
+                cuvs_sb_add(&h, "');");
+            }
+            else
+                cuvs_sb_add(&h, "Retry after the other CREATE INDEX finishes.");
+            break;
+        case CUVS_ADMISSION_AR3:
+        case CUVS_ADMISSION_AR4:
+        case CUVS_ADMISSION_AR5:
+        {
+            int unpin = 0;
+            if (load && f->reason == CUVS_ADMISSION_AR5 && (f->present & CUVS_ADM_F_W))
+            {
+                if (f->w == CUVS_ADMISSION_WAIT_QUERIES)
+                    cuvs_sb_add(&h, "Retry once running searches finish, or free space: ");
+                else
+                    unpin = 1;
+            }
+            if (!load && f->reason == CUVS_ADMISSION_AR5 && (f->present & CUVS_ADM_F_S) &&
+                f->s > 0 && f->k_cnt > 0)
+                unpin = 1;
+            cuvs_admission_unload_hint(&h, f, cat, load, &unload);
+            if (unpin)
+                cuvs_sb_add(&h, CUVS_ADM_UNPIN_CLAUSE);
+            if (!load && f->reason == CUVS_ADMISSION_AR5)
+                cuvs_sb_add(&h, " Operators can allow build eviction with "
+                                "--build-evict-scope idle:<minutes> or lru.");
+            if (obj == CUVS_ADMISSION_OBJ_SHARD)
+                cuvs_sb_add(&h, " Or make room for one shard, or raise cuvs.shard_count "
+                                "to make the shards smaller.");
+            /* (3): only on the daemon's r=1 and never with zero candidates. */
+            if (!load && unload && (f->present & CUVS_ADM_F_R) && f->r == 1)
+                cuvs_sb_add(&h, "\nOr wait: background reclaim will free space for a build "
+                                "of this size within the next reclaim tick.");
+            break;
+        }
+        case CUVS_ADMISSION_AR6:
+            if (f->y > 0)
+                cuvs_sb_add(&h, "Retry after the other managed builds finish. ");
+            cuvs_sb_add(&h, "If slower builds are acceptable, an operator can enable "
+                            "--managed-overcommit on; or build smaller tables. "
+                            "(--cagra-build-overflow error keeps large_workspace in the pool "
+                            "and does not fix a physical memory shortage.)");
+            break;
+        case CUVS_ADMISSION_AR7:
+            cuvs_sb_add(&h, "Free host memory, retry after the other managed builds finish, "
+                            "or review --managed-lw-margin-permille.");
+            break;
+        case CUVS_ADMISSION_OOM:
+            cuvs_sb_add(&h, "Raising --rmm-scratch-permille reserves more at admission and "
+                            "avoids this (lowering it admits more builds that may run out of "
+                            "memory). The pool part ran short; managed overflow covers only "
+                            "large_workspace.");
+            break;
+        case CUVS_ADMISSION_ATT:
+            cuvs_sb_add(&h, "Check the pool free memory and retry after other builds "
+                            "finish. cuVS reports a failed dataset attach only as a "
+                            "warning, so this build raised it as an error.");
+            break;
+        default:
+            return NULL;
+    }
+    return state;
+}
+
+/* ----------------------------------------------------------------
  * I4 admission hook (cuvs_admission_contract.h). The I3-A tip has no managed
  * large_workspace policy, so AR6/AR7 are never emitted here (v6 1.4 (h)).
  * I4 owns this body and replaces it with the AR6/AR7 rule.
