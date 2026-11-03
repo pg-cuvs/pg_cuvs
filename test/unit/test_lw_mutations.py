@@ -170,6 +170,14 @@ MUTATIONS = {
     'macro_oom_default_drift': (POLICY, [(
         '#define CUVS_OOM_SCORE_ADJ_DEFAULT              500',
         '#define CUVS_OOM_SCORE_ADJ_DEFAULT              400')], {'policy', 'docs'}),
+    # re-review C-12 (X15) and C-13 (X17)
+    'guard_pointer_default_unbounded': (SERVER, [(
+        'static uint64_t (*g_lw_host_guard_fn)(void) = lw_host_guard_bytes;',
+        'static uint64_t lw_guard_inf(void) { return UINT64_MAX; }\n'
+        'static uint64_t (*g_lw_host_guard_fn)(void) = lw_guard_inf;')], {'daemon'}),
+    'margin_literal_suffix': (POLICY, [(
+        '#define CUVS_MANAGED_LW_MARGIN_PERMILLE_DEFAULT 1250\n',
+        '#define CUVS_MANAGED_LW_MARGIN_PERMILLE_DEFAULT 1250u\n')], {'docs'}),
     # hook body (I4-owned, conch 2026-11-03 16:0x)
     'hook_inert_after_i4': (UTIL, [(
         '    return cuvs_lw_admit(&lw).reason;', '    (void)lw;\n    return CUVS_ADMISSION_NONE;')],

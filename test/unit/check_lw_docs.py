@@ -69,6 +69,9 @@ for c in (row('--cagra-build-overflow'), row('--managed-overcommit'),
           row('--managed-lw-margin-permille'), row('--oom-score-adj')):
     check('restart' in c[1], f'{c[0]}: layer/restart cell {c[1]!r}')
 check(not re.search(rf'\b{margin}\b', DOC), f'provisional margin {margin} appears in the reference')
+# Review C-13: the LW-8 one-line commit (v6 3.5 3b) needs a bare decimal literal.
+check(len(re.findall(r'^#define CUVS_MANAGED_LW_MARGIN_PERMILLE_DEFAULT [0-9]+$', HDR, re.M)) == 1,
+      'CUVS_MANAGED_LW_MARGIN_PERMILLE_DEFAULT is not a bare decimal literal')
 
 if failures:
     for f in failures:
