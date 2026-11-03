@@ -72,7 +72,7 @@ ISOLATION_OPTS = --inputdir=test --outputdir=test
 # C source files + the CUDA-compiled wrapper (built below by nvcc).
 # PGXS only knows how to build .c → .o; the .cu → .o rule is custom,
 # but the resulting object MUST be listed in OBJS to be linked into the .so.
-OBJS           = src/pg_cuvs.o src/cuvs_ipc.o src/cuvs_util.o $(WRAPPER_OBJ) src/hnsw_export.o src/cuvs_build_corpus.o src/pg_cuvs_compaction.o src/cuvs_status_text.o
+OBJS           = src/pg_cuvs.o src/cuvs_ipc.o src/cuvs_util.o $(WRAPPER_OBJ) src/hnsw_export.o src/cuvs_build_corpus.o src/pg_cuvs_compaction.o src/cuvs_status_text.o src/cuvs_peak_meter.o
 
 # nvcc settings (Phase 1: brute-force only; CAGRA added later)
 NVCC          ?= nvcc
@@ -204,6 +204,11 @@ src/cuvs_ipc_server.o: src/cuvs_ipc.c src/cuvs_ipc.h src/cuvs_build_corpus.h
 src/cuvs_util_server.o: src/cuvs_util.c src/cuvs_util.h src/cuvs_ipc.h
 	$(CC) $(SERVER_CFLAGS) -c $< -o $@
 
+# I3-B lock-free pool peak meter (C11 atomics), called by the RMM adaptor in
+# the wrapper; linked wherever the wrapper is (daemon and extension).
+src/cuvs_peak_meter_server.o: src/cuvs_peak_meter.c src/cuvs_peak_meter.h
+	$(CC) $(SERVER_CFLAGS) -c $< -o $@
+
 # I3-B cache policy (pure; daemon only)
 src/cuvs_cache_policy_server.o: src/cuvs_cache_policy.c src/cuvs_cache_policy.h src/cuvs_admission_contract.h src/cuvs_util.h
 	$(CC) $(SERVER_CFLAGS) -c $< -o $@
@@ -217,7 +222,7 @@ src/cuvs_build_corpus_server.o: src/cuvs_build_corpus.c src/cuvs_build_corpus.h
 src/cuvs_wrapper_shim_cpu.o: src/cuvs_wrapper_shim_cpu.c src/cuvs_wrapper.h src/cuvs_ipc.h
 	$(CC) -O2 -g -fPIC -I./src -std=gnu11 -c $< -o $@
 
-$(SERVER_BIN): src/pg_cuvs_server.o src/cuvs_ipc_server.o src/cuvs_util_server.o src/cuvs_objstore_server.o src/cuvs_build_corpus_server.o src/cuvs_cache_policy_server.o $(WRAPPER_OBJ)
+$(SERVER_BIN): src/pg_cuvs_server.o src/cuvs_ipc_server.o src/cuvs_util_server.o src/cuvs_objstore_server.o src/cuvs_build_corpus_server.o src/cuvs_cache_policy_server.o src/cuvs_peak_meter_server.o $(WRAPPER_OBJ)
 	$(CXX) -o $@ $^ $(SERVER_LDFLAGS)
 
 server: $(SERVER_BIN)
@@ -253,7 +258,7 @@ src/cuvs_build_corpus_server_test.o: src/cuvs_build_corpus.c src/cuvs_build_corp
 src/cuvs_cache_policy_server_test.o: src/cuvs_cache_policy.c src/cuvs_cache_policy.h src/cuvs_admission_contract.h src/cuvs_util.h
 	$(CC) $(SERVER_TEST_CFLAGS) -c $< -o $@
 
-$(SERVER_TEST_BIN): src/pg_cuvs_server_test.o src/cuvs_ipc_server_test.o src/cuvs_util_server_test.o src/cuvs_objstore_server_test.o src/cuvs_build_corpus_server_test.o src/cuvs_cache_policy_server_test.o $(WRAPPER_OBJ)
+$(SERVER_TEST_BIN): src/pg_cuvs_server_test.o src/cuvs_ipc_server_test.o src/cuvs_util_server_test.o src/cuvs_objstore_server_test.o src/cuvs_build_corpus_server_test.o src/cuvs_cache_policy_server_test.o src/cuvs_peak_meter_server.o $(WRAPPER_OBJ)
 	$(CXX) -o $@ $^ $(SERVER_LDFLAGS)
 
 server-test: $(SERVER_TEST_BIN)
@@ -271,7 +276,7 @@ TEST_RT_LIB := $(shell [ "$$(uname -s)" = "Linux" ] && echo -lrt)
 test-unit: test/unit/test_cuvs_util.c src/cuvs_util.c src/cuvs_util.h src/cuvs_ipc.h \
            test/unit/test_build_corpus.c src/cuvs_build_corpus.c src/cuvs_build_corpus.h \
            test-hnsw-build test-hnsw-build-ipc test-hnsw-admission test-admission-contract \
-           test-admission-wire test-admission-message test-admission-ipc test-build-oom-thread test-cache-policy test-circuit-source test-status-text test-i3b-source
+           test-admission-wire test-admission-message test-admission-ipc test-build-oom-thread test-cache-policy test-circuit-source test-status-text test-i3b-source test-peak-meter
 	$(CC) -I src -DCUVS_TEST_HOOKS -o test-unit test/unit/test_cuvs_util.c src/cuvs_util.c $(TEST_RT_LIB)
 	./test-unit
 	$(CC) -I src -o test-build-corpus test/unit/test_build_corpus.c src/cuvs_build_corpus.c $(TEST_RT_LIB)
@@ -382,6 +387,15 @@ test-i3b-source: test/unit/check_i3b_server_source.py src/pg_cuvs_server.c test/
 	python3 test/unit/check_i3b_docs.py
 
 .PHONY: test-i3b-source
+
+# CK-34: the peak meter under 8 concurrent threads, reset, and off.
+test-peak-meter: test/unit/test_peak_meter.c src/cuvs_peak_meter.c src/cuvs_peak_meter.h
+	$(CC) -std=gnu11 -O2 -Wall -Wextra -Werror -I src -o $@ test/unit/test_peak_meter.c \
+		src/cuvs_peak_meter.c -lpthread
+	./$@
+
+EXTRA_CLEAN += test-peak-meter
+.PHONY: test-peak-meter
 
 EXTRA_CLEAN += test-cache-policy
 .PHONY: test-cache-policy

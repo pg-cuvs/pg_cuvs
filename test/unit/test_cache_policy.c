@@ -434,6 +434,12 @@ test_params(void)
           p.scope.kind == CUVS_SCOPE_IDLE && p.scope.idle_min == 15, "idle:15");
     CHECK(cuvs_reclaim_flag_set(&p, "load-soft-evict", "off", err, sizeof err) == 0 &&
           p.soft_evict == 0, "soft off");
+    CHECK(p.peak_meter == 1 &&
+          cuvs_reclaim_flag_set(&p, "rmm-peak-meter", "off", err, sizeof err) == 0 &&
+          p.peak_meter == 0 && cuvs_reclaim_flag_known("rmm-peak-meter") &&
+          !cuvs_reclaim_name_is_runtime("rmm-peak-meter") &&
+          cuvs_reclaim_flag_set(&p, "rmm-peak-meter", "maybe", err, sizeof err) != 0,
+          "KB-17 --rmm-peak-meter on|off, restart-only");
     p.lo_pct = 90;
     CHECK(cuvs_reclaim_params_check(&p, err, sizeof err) != 0, "low > high rejected");
 

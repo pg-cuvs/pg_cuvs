@@ -82,7 +82,8 @@ for flag, macro in macros.items():
     elif rows.get(flag) != m.group(1):
         fail(f"CK-27: --{flag} documented {rows.get(flag)!r}, source {m.group(1)}")
 fixed = {"build-evict-scope": "none", "reclaim-mode": "headroom", "reclaim-free-bytes": "0",
-         "load-soft-evict": "on", "reindex-self-replace": "on", "usage-stats-file": "on"}
+         "load-soft-evict": "on", "reindex-self-replace": "on", "usage-stats-file": "on",
+         "rmm-peak-meter": "on"}
 src_default = {
     "build-evict-scope": "p->scope.kind  = CUVS_SCOPE_NONE;" in pol,
     "reclaim-mode": "p->mode        = CUVS_RECLAIM_HEADROOM;" in pol,
@@ -90,6 +91,7 @@ src_default = {
     "load-soft-evict": "p->soft_evict  = 1;" in pol,
     "reindex-self-replace": "p->self_replace = 1;" in pol,
     "usage-stats-file": "p->usage_file  = 1;" in pol,
+    "rmm-peak-meter": "p->peak_meter  = 1;" in pol,
 }
 for flag, val in fixed.items():
     if rows.get(flag) != val:
@@ -99,7 +101,7 @@ for flag, val in fixed.items():
 # Same set: documented flags == flags the daemon accepts.
 known = set(re.findall(r'\{ "([a-z-]+)",\s+\d', pol)) | {
     "reclaim-mode", "build-evict-scope", "load-soft-evict", "reindex-self-replace",
-    "usage-stats-file"}
+    "usage-stats-file", "rmm-peak-meter"}
 if set(rows) != known:
     fail(f"CK-27: knob table vs daemon flags differ: doc-only={sorted(set(rows) - known)} "
          f"source-only={sorted(known - set(rows))}")

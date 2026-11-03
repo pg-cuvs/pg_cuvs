@@ -31,6 +31,7 @@
 #include <rmm/mr/per_device_resource.hpp>
 #include <rmm/aligned.hpp>
 #include <rmm/resource_ref.hpp>
+#include "cuvs_peak_meter.h"
 
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>   /* Phase 3L: half precision for brute-force (cuvs.bf_precision) */
@@ -92,40 +93,35 @@ using RmmPool = rmm::mr::pool_memory_resource<RmmUpstream>;
  * a limit: the upstream adaptor enforces the quota. */
 class PeakUsage final : public rmm::mr::device_memory_resource {
 public:
-    explicit PeakUsage(RmmPool *upstream) : upstream_{*upstream} {}
-    std::size_t get_allocated_bytes() const { return live_.load(std::memory_order_relaxed); }
-    std::size_t get_peak_bytes() const { return peak_.load(std::memory_order_relaxed); }
-    void reset_peak() { peak_.store(live_.load(std::memory_order_relaxed), std::memory_order_relaxed); }
+    PeakUsage(RmmPool *upstream, int dev) : upstream_{*upstream}, dev_{dev} {}
+    std::size_t get_allocated_bytes() const { return cuvs_peak_meter_live(dev_); }
+    std::size_t get_peak_bytes() const { return cuvs_peak_meter_peak(dev_); }
+    void reset_peak() { cuvs_peak_meter_reset(dev_); }
 private:
+    /* Live bytes and the lock-free CAS peak live in cuvs_peak_meter.c (CK-34
+     * tests it on the CPU); --rmm-peak-meter off skips the peak update. */
     void *do_allocate(std::size_t bytes, rmm::cuda_stream_view stream) override
     {
         std::size_t sz = rmm::align_up(bytes, rmm::CUDA_ALLOCATION_ALIGNMENT);
-        std::size_t now = live_.fetch_add(sz, std::memory_order_relaxed) + sz;
+        cuvs_peak_meter_alloc(dev_, sz);
         try {
-            void *p = upstream_.allocate(stream, bytes);
-            std::size_t prev = peak_.load(std::memory_order_relaxed);
-            while (now > prev &&
-                   !peak_.compare_exchange_weak(prev, now, std::memory_order_relaxed))
-                ;
-            return p;
+            return upstream_.allocate(stream, bytes);
         } catch (...) {
-            live_.fetch_sub(sz, std::memory_order_relaxed);
+            cuvs_peak_meter_free(dev_, sz);
             throw;
         }
     }
     void do_deallocate(void *ptr, std::size_t bytes, rmm::cuda_stream_view stream) noexcept override
     {
         upstream_.deallocate(stream, ptr, bytes);
-        live_.fetch_sub(rmm::align_up(bytes, rmm::CUDA_ALLOCATION_ALIGNMENT),
-                        std::memory_order_relaxed);
+        cuvs_peak_meter_free(dev_, rmm::align_up(bytes, rmm::CUDA_ALLOCATION_ALIGNMENT));
     }
     bool do_is_equal(rmm::mr::device_memory_resource const &other) const noexcept override
     {
         return this == std::addressof(other);
     }
     rmm::device_async_resource_ref upstream_;
-    std::atomic<std::size_t> live_{0};
-    std::atomic<std::size_t> peak_{0};
+    int dev_;
 };
 using RmmUsage = PeakUsage;
 struct RmmPoolRegistry;
@@ -264,7 +260,7 @@ cuvs_rmm_pool_init(int device_id, size_t initial_pool_bytes, uint32_t maximum_pe
         /* A finite pool constructor maximum changes growth to remaining/2.
          * Enforce the quota upstream to retain the existing doubling policy. */
         auto pool = std::make_unique<RmmPool>(counted_upstream.get(), initial_pool_bytes);
-        auto usage = std::make_unique<RmmUsage>(pool.get());
+        auto usage = std::make_unique<RmmUsage>(pool.get(), device_id);
         registry.previous[device_id] = upstream;
         rmm::mr::set_current_device_resource(usage.get());
         registry.upstreams[device_id] = std::move(counted_upstream);
@@ -295,6 +291,7 @@ cuvs_rmm_pool_stats(int device_id, CuvsRmmPoolStats *out)
      * pairing a new usage value with the reservation from before its growth. */
     out->used_bytes = g_rmm_registry->usages[device_id]->get_allocated_bytes();
     out->reserved_bytes = g_rmm_registry->upstreams[device_id]->get_allocated_bytes();
+    out->peak_bytes = g_rmm_registry->usages[device_id]->get_peak_bytes();   /* I3-B */
     return 0;
 }
 

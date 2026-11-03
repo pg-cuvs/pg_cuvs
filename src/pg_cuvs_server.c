@@ -29,6 +29,7 @@
 #include "cuvs_ipc.h"
 #include "cuvs_util.h"
 #include "cuvs_cache_policy.h"
+#include "cuvs_peak_meter.h"
 #include <stdarg.h>
 #include "cuvs_wrapper.h"
 #include "cuvs_hnsw_build_common.h"
@@ -375,6 +376,7 @@ static uint64_t g_cache_persist_fail[CUVS_MAX_GPUS];
  * g_indexes, so total_vram_used() adds this so concurrent admission/eviction
  * still accounts for the build's VRAM. Mutated under g_index_mutex. */
 static size_t   g_pending_build_vram[CUVS_MAX_GPUS];
+static int      g_pending_build_count[CUVS_MAX_GPUS];   /* I3-B: solo flag */
 
 /* Existing lock-free shard searches and HNSW exports may allocate GPU scratch
  * after dropping the registry lock. New HNSW admission drains these scopes.
@@ -2850,6 +2852,7 @@ static void
 reserve_build_vram(size_t needed, int device_id)
 {
     g_pending_build_vram[device_id] += needed;
+    g_pending_build_count[device_id]++;
     if (g_rmm_pool_limits[device_id] > 0)
         g_pending_rmm_build_vram[device_id] += needed;
 }
@@ -2858,6 +2861,8 @@ static void
 release_build_vram(size_t needed, int device_id)
 {
     g_pending_build_vram[device_id] -= needed;
+    if (g_pending_build_count[device_id] > 0)
+        g_pending_build_count[device_id]--;
     if (g_rmm_pool_limits[device_id] > 0)
         g_pending_rmm_build_vram[device_id] -= needed;
 }
@@ -9621,10 +9626,11 @@ handle_reclaim_status(int client_fd)
                   "\"reclaim_free_max_pct\":%u,\"reclaim_free_window_min\":%u,"
                   "\"reclaim_floor_pct\":%u,\"load_soft_evict\":\"%s\","
                   "\"reindex_self_replace\":\"%s\",\"usage_stats_file\":\"%s\","
-                  "\"reclaim_params\":{",
+                  "\"rmm_peak_meter\":\"%s\",\"reclaim_params\":{",
               scope, g_reclaim.pin_max_pct, g_reclaim.f_cap_pct, g_reclaim.window_min,
               g_reclaim.floor_pct, g_reclaim.soft_evict ? "on" : "off",
-              g_reclaim.self_replace ? "on" : "off", g_reclaim.usage_file ? "on" : "off");
+              g_reclaim.self_replace ? "on" : "off", g_reclaim.usage_file ? "on" : "off",
+              g_reclaim.peak_meter ? "on" : "off");
     for (int k = 0; k < K_RT_N; k++)
     {
         tb_printf(&b, "%s\"%s\":{\"value\":", k ? "," : "", k_rt_names[k]);
@@ -10123,7 +10129,13 @@ connection_thread(void *arg)
             if (g_rmm_pool_mb > 0)
                 for (int i = 0; i < n_usable_gpus(); i++)
                 {
-                    if (cuvs_rmm_pool_stats(usable_gpu(i), &status.devices[i]) != 0)
+                    if (cuvs_rmm_pool_stats(usable_gpu(i), &status.devices[i]) == 0)
+                    {
+                        pthread_mutex_lock(&g_index_mutex);
+                        status.devices[i].solo = g_pending_build_count[usable_gpu(i)] <= 1;
+                        pthread_mutex_unlock(&g_index_mutex);
+                    }
+                    else
                     {
                         hdr.status = CUVS_STATUS_UNAVAILABLE;
                         hdr.n_results = 0;
@@ -10894,6 +10906,8 @@ main(int argc, char **argv)
             return 1;
         }
         cuvs_format_evict_scope(&g_reclaim.scope, scope, sizeof(scope));
+        cuvs_peak_meter_set_enabled(g_reclaim.peak_meter);   /* KB-17, before the pool */
+        LOG_INFO("pg_cuvs_server: rmm_peak_meter=%s\n", g_reclaim.peak_meter ? "on" : "off");
         LOG_INFO("pg_cuvs_server: cache policy build_evict_scope=%s reclaim_mode=%s "
                  "evict_min_idle_s=%lld evict_hit_bonus_s=%lld evict_hit_cap=%u "
                  "reclaim_high_pct=%u reclaim_low_pct=%u reclaim_tick_s=%lld pin_max_pct=%u "

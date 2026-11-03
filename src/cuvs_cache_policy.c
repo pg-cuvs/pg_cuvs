@@ -618,6 +618,7 @@ cuvs_reclaim_params_default(CuvsReclaimParams *p)
     p->soft_evict  = 1;
     p->self_replace = 1;
     p->usage_file  = 1;
+    p->peak_meter  = 1;
 }
 
 static int
@@ -672,7 +673,8 @@ int
 cuvs_reclaim_flag_known(const char *name)
 {
     static const char *str_knobs[] = { "reclaim-mode", "build-evict-scope",
-        "load-soft-evict", "reindex-self-replace", "usage-stats-file" };
+        "load-soft-evict", "reindex-self-replace", "usage-stats-file",
+        "rmm-peak-meter" };
     if (!name)
         return 0;
     for (size_t i = 0; i < sizeof(str_knobs) / sizeof(str_knobs[0]); i++)
@@ -712,6 +714,12 @@ set_one(CuvsReclaimParams *p, const char *name, const char *value,
     {
         if (parse_onoff(value, &p->self_replace) != 0)
             ERR("--reindex-self-replace must be on or off (got '%s')", value);
+        return 0;
+    }
+    if (strcmp(name, "rmm-peak-meter") == 0)
+    {
+        if (parse_onoff(value, &p->peak_meter) != 0)
+            ERR("--rmm-peak-meter must be on or off (got '%s')", value);
         return 0;
     }
     if (strcmp(name, "usage-stats-file") == 0)

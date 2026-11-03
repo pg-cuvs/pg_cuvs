@@ -289,6 +289,7 @@ typedef struct CuvsReclaimParams {
     int      soft_evict;       /* KB-25 */
     int      self_replace;     /* KB-26 */
     int      usage_file;       /* KB-27 */
+    int      peak_meter;       /* KB-17 --rmm-peak-meter (restart) */
 } CuvsReclaimParams;
 
 #define CUVS_EVICT_MIN_IDLE_S_DEFAULT     600
