@@ -440,11 +440,16 @@ test-lw-guard: test/unit/test_lw_guard.cpp src/cuvs_lw_guard.hpp src/cuvs_lw_pol
 	$(CXX) -std=c++17 -Wall -Wextra -Werror -pthread -I src -o $@ test/unit/test_lw_guard.cpp
 	./$@
 
+# CK-27 (a) for the I4 knobs: docs flag rows vs cuvs_lw_policy.h macros.
+test-lw-docs: test/unit/check_lw_docs.py docs/reference.md src/cuvs_lw_policy.h
+	python3 -I test/unit/check_lw_docs.py
+
 # Each planted I4 defect must turn an I4 test RED. Linux (the daemon fixture
 # needs memfd, /proc and shm); run as a non-root user. LW_MUTATION_OUT must be
 # a new directory.
 LW_MUTATION_OUT ?= lw-mutations
-test-lw-mutations: test/unit/test_lw_mutations.py test-lw-policy test-lw-guard test-lw-daemon
+test-lw-mutations: test/unit/test_lw_mutations.py test-lw-policy test-lw-guard test-lw-daemon \
+                   test-lw-startup test-lw-docs
 	CC=$(CC) CXX=$(CXX) python3 -I test/unit/test_lw_mutations.py $(LW_MUTATION_OUT)
 
 # Converter fixtures include private PG page helpers, with backend stubs and
@@ -470,7 +475,7 @@ EXTRA_CLEAN += test-hnsw-build test-hnsw-build-ipc test-hnsw-converter test-hnsw
                test-admission-wire test-admission-message test-admission-ipc test-build-oom-thread test-hnsw-auto-overflow test-res-pool test-lw-policy test-lw-guard
 .PHONY: test-hnsw-build test-hnsw-build-ipc test-hnsw-converter test-hnsw-admission test-hnsw-explicit-route test-hnsw-policy \
         test-admission-contract test-admission-contract-mutations test-admission-wire \
-        test-admission-message test-admission-ipc test-build-oom-thread test-gpu-wrapper-i3 test-hnsw-auto-overflow test-res-pool test-lw-policy test-lw-guard test-lw-mutations
+        test-admission-message test-admission-ipc test-build-oom-thread test-gpu-wrapper-i3 test-hnsw-auto-overflow test-res-pool test-lw-policy test-lw-guard test-lw-mutations test-lw-docs
 
 # ---- Documentation contract check ---------------------------------------
 # CPU-only drift detector for the current version/defaults and release-facing
@@ -901,6 +906,20 @@ test-lw-daemon:
 		src/cuvs_objstore.c src/cuvs_build_corpus.c src/cuvs_wrapper_shim_cpu.c \
 		-Wl,--gc-sections -lm -lpthread -lrt -lcurl -lssl -lcrypto -o test-lw-daemon
 	./test-lw-daemon
+
+# I4 review B-2 (b): start the real CPU-shim daemon (no fixture) and check
+# /proc/<pid>/oom_score_adj, the startup lines and the pool-status IPC reply.
+# Linux, non-root. The daemon binary is built here without PGXS.
+EXTRA_CLEAN += test-lw-startup test-lw-startup-server
+.PHONY: test-lw-startup
+LW_SHIM_DAEMON_SRCS = src/pg_cuvs_server.c src/cuvs_ipc.c src/cuvs_util.c src/cuvs_objstore.c \
+                      src/cuvs_build_corpus.c src/cuvs_wrapper_shim_cpu.c
+test-lw-startup:
+	$(CC) -std=gnu11 -O1 -DPGCUVS_CPU_SHIM -D_POSIX_C_SOURCE=200809L -I src $(LW_SHIM_DAEMON_SRCS) \
+		-lm -lpthread -lrt -lcurl -lssl -lcrypto -o test-lw-startup-server
+	$(CC) -std=gnu11 -Wall -Wextra -I src -o test-lw-startup test/unit/test_lw_startup.c \
+		src/cuvs_ipc.c src/cuvs_util.c src/cuvs_build_corpus.c -lm -lpthread -lrt
+	./test-lw-startup ./test-lw-startup-server
 
 # Actual daemon admission with physical GPU headroom fixture only (Linux CPU CI).
 EXTRA_CLEAN += test-rmm-pending
