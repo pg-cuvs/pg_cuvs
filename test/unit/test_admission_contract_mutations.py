@@ -46,11 +46,8 @@ MUTATIONS = {
         'if (final_bytes >= CUVS_ADMISSION_BYTES_SATURATED)'),
     'zero_degree_not_default': (
         'gd = graph_degree > 0 ?', 'gd = graph_degree >= 0 ?'),
-    'hook_emits_ar6_before_i4': (
-        '    (void) in;\n    return CUVS_ADMISSION_NONE;',
-        '    (void) in;\n    return CUVS_ADMISSION_AR6;'),
 }
-UTIL_MUTATIONS = {'hook_emits_ar6_before_i4'}
+UTIL_MUTATIONS = set()  # I4 owns the hook body; its mutations live in test_lw_mutations.py
 
 MESSAGE_TEST = 'test/unit/test_admission_message.c'
 # DETAIL/HINT builder (cuvs_util.c), checked by the message test.

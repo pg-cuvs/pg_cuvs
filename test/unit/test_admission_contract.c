@@ -192,14 +192,14 @@ test_c3_admission_table(void)
 static void
 test_workspace_hook_is_inert_before_i4(void)
 {
-    /* I3-A tip: no managed policy exists, so the hook never emits AR6/AR7
-     * (v6 1.4 (h)), even for inputs that I4 would reject. */
+    /* I4 owns the AR6/AR7 rule (test_lw_policy.c). Here only: policy error
+     * (managed = 0) and NULL never refuse (conch 2026-11-03 16:0x). */
     CuvsAdmissionWorkspaceInput spill;
     memset(&spill, 0, sizeof(spill));
     spill.needed = UINT64_C(1) << 40;
     spill.phys_free = 1;
     spill.lw_ub = UINT64_C(1) << 40;
-    spill.managed = 1;
+    spill.managed = 0;
     CHECK("hook none: zero", cuvs_admission_workspace_check(&spill) ==
                                  CUVS_ADMISSION_NONE);
     spill.overcommit = 1;
