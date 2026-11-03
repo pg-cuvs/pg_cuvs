@@ -80,10 +80,12 @@
 #include <dirent.h>     /* opendir/readdir (ADR-046 orphan GC) */
 #include <errno.h>
 #include <math.h>       /* sqrt (cosine distance) */
+#include <time.h>       /* time(): UC-2 breaker TTL clock */
 
 #include "cuvs_wrapper.h"
 #include "cuvs_ipc.h"
 #include "cuvs_util.h"
+#include "cuvs_admission_contract.h"   /* CuvsAdmissionReason (UC-2 breaker reason) */
 #include "cuvs_build_corpus.h"   /* ADR-057: leak-safe tiered build-corpus handoff */
 #include "hnsw_export.h"
 #include "cuvs_hnsw_build.h"
@@ -115,6 +117,7 @@ char *cuvs_socket_path            = NULL;
 char *cuvs_index_dir              = NULL;
 int   cuvs_daemon_uid             = -1;    /* #119: expected owner uid of cuvs.socket_path; -1 = no check */
 int   cuvs_circuit_breaker_threshold = 3;
+static int cuvs_circuit_breaker_transient_ttl_s = 30; /* UC-2: transient breaker half-open TTL */
 int   cuvs_k                      = 100;   /* GPU top-k (pgvector ef_search analog) */
 static int cuvs_itopk_size        = 0;     /* CAGRA intermediate buffer floor; 0=legacy */
 static int cuvs_search_width      = 0;     /* 0=SDK default */
@@ -1069,6 +1072,18 @@ _PG_init(void)
         "Use pg_cuvs_reset_circuit() to re-enable GPU routing.",
         &cuvs_circuit_breaker_threshold,
         3, 1, 100,
+        PGC_USERSET,
+        0, NULL, NULL, NULL);
+
+    DefineCustomIntVariable(
+        "cuvs.circuit_breaker_transient_ttl_s",
+        "Seconds before a breaker opened by a transient GPU failure half-opens.",
+        "Transient reasons (VRAM pressure, reload, attempt timeout) allow one GPU "
+        "attempt after this delay: success closes the breaker, failure re-opens "
+        "it. 0 = half-open immediately. Permanent reasons still require "
+        "pg_cuvs_reset_circuit().",
+        &cuvs_circuit_breaker_transient_ttl_s,
+        30, 0, INT_MAX,
         PGC_USERSET,
         0, NULL, NULL, NULL);
 
@@ -2126,6 +2141,16 @@ cuvs_phys_cost_ready(uint32_t req_bits, int dim, CuvsHwProfile *prof, double *ka
     return true;
 }
 
+/* UC-2: the breaker state this backend sees now, with the transient TTL
+ * half-open transition applied. Plan-time gates and scans both read it, so a
+ * half-open breaker restores the GPU path cost and lets the scan probe once. */
+static CuvsCircuitState
+cuvs_breaker_state(Oid index_oid)
+{
+    return cuvs_circuit_state((uint32_t) index_oid, (int64_t) time(NULL),
+                              cuvs_circuit_breaker_transient_ttl_s);
+}
+
 /* PG16 amcostestimate is a direct C function pointer, not a SQL function.
  *
  * IMPORTANT: This runs in the planner on every query — once per candidate
@@ -2188,7 +2213,7 @@ cuvsamcostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
         int fb_reason = CUVS_FB_NONE;
         if (!enable_cuvs)
             fb_reason = CUVS_FB_DISABLED;
-        else if (cuvs_circuit_is_open((uint32_t) index_oid))
+        else if (cuvs_breaker_state(index_oid) == CUVS_CIRCUIT_OPEN)
             fb_reason = CUVS_FB_BREAKER;
         else if (cuvs_index_is_stale(index_oid))
             fb_reason = CUVS_FB_STALE;
@@ -2303,7 +2328,7 @@ flat_amcostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
         int fb_reason = CUVS_FB_NONE;
         if (!enable_cuvs)
             fb_reason = CUVS_FB_DISABLED;
-        else if (cuvs_circuit_is_open((uint32_t) index_oid))
+        else if (cuvs_breaker_state(index_oid) == CUVS_CIRCUIT_OPEN)
             fb_reason = CUVS_FB_BREAKER;
         else if (cuvs_index_is_stale(index_oid))
             fb_reason = CUVS_FB_STALE;
@@ -4234,9 +4259,11 @@ cuvs_gettuple(IndexScanDesc scan, ScanDirection dir)
              * already gated at plan time. Everything else — including UNAVAILABLE
              * (daemon crash after planning) — counts so the breaker opens and
              * subsequent queries replan to CPU via the socket-existence gate. */
-            cuvs_circuit_record_status((uint32_t)index_oid,
-                                       cuvs_circuit_breaker_threshold,
-                                       rc);
+            cuvs_circuit_record_status_reason((uint32_t)index_oid,
+                                              cuvs_circuit_breaker_threshold,
+                                              rc,
+                                              CUVS_ADMISSION_NONE, /* I3-A: pass decoded err_out reason */
+                                              (int64_t) time(NULL));
 
             switch (rc)
             {
@@ -4497,9 +4524,11 @@ flat_gettuple(IndexScanDesc scan, ScanDirection dir)
 
         if (rc != CUVS_STATUS_OK)
         {
-            cuvs_circuit_record_status((uint32_t)index_oid,
-                                       cuvs_circuit_breaker_threshold,
-                                       rc);
+            cuvs_circuit_record_status_reason((uint32_t)index_oid,
+                                              cuvs_circuit_breaker_threshold,
+                                              rc,
+                                              CUVS_ADMISSION_NONE, /* I3-A: pass decoded err_out reason */
+                                              (int64_t) time(NULL));
 
             switch (rc)
             {
@@ -5168,9 +5197,11 @@ ivfpq_gettuple(IndexScanDesc scan, ScanDirection dir)
 
         if (rc != CUVS_STATUS_OK)
         {
-            cuvs_circuit_record_status((uint32_t)index_oid,
-                                       cuvs_circuit_breaker_threshold,
-                                       rc);
+            cuvs_circuit_record_status_reason((uint32_t)index_oid,
+                                              cuvs_circuit_breaker_threshold,
+                                              rc,
+                                              CUVS_ADMISSION_NONE, /* I3-A: pass decoded err_out reason */
+                                              (int64_t) time(NULL));
 
             switch (rc)
             {
