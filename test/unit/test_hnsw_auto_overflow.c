@@ -130,8 +130,11 @@ static void test_invariant_notices(void)
     CHECK(!cuvs_hnsw_policy_valid(&p));
     p = receipt(CUVS_HNSW_ALGO_AUTO, CUVS_HNSW_ROUTE_ACE,
                 CUVS_HNSW_ROUTE_FLAG_AUTO_OVERFLOW | CUVS_HNSW_ROUTE_FLAG_PRESPOOL
-                | CUVS_HNSW_ROUTE_FLAG_STATS_FALLBACK);
+                | CUVS_HNSW_ROUTE_FLAG_AFTER_SCAN);
     CHECK(!cuvs_hnsw_policy_valid(&p)); /* timing bits are exclusive */
+    p = receipt(CUVS_HNSW_ALGO_AUTO, CUVS_HNSW_ROUTE_ACE,
+                CUVS_HNSW_ROUTE_FLAG_AUTO_OVERFLOW | CUVS_HNSW_ROUTE_FLAG_NO_STATISTICS);
+    CHECK(!cuvs_hnsw_policy_valid(&p)); /* a cause without the after-scan timing */
     p = receipt(CUVS_HNSW_ALGO_AUTO, CUVS_HNSW_ROUTE_ACE, CUVS_HNSW_ROUTE_FLAG_AUTO_OVERFLOW | 0x10);
     CHECK(!cuvs_hnsw_policy_valid(&p)); /* unknown flag */
     CHECK(sizeof(CuvsHnswPolicy) == 160); /* reserved -> route_flags, same layout */
@@ -158,9 +161,21 @@ static void test_prespool_and_fallback(void)
         CHECK(cuvs_hnsw_prespool_action(no_stats[i], OK, CUVS_HNSW_ROUTE_ACE, 1, 1) == CUVS_HNSW_PRESPOOL_FALLBACK);
         CHECK(cuvs_prespool_rows(no_stats[i]) == 0);
     }
-    CHECK(cuvs_hnsw_timing_flag(CUVS_HNSW_PRESPOOL_FALLBACK) == CUVS_HNSW_ROUTE_FLAG_STATS_FALLBACK);
+    for (size_t i = 0; i < sizeof(no_stats) / sizeof(no_stats[0]); i++)
+        CHECK(cuvs_hnsw_timing_flags(no_stats[i], CUVS_HNSW_PRESPOOL_FALLBACK)
+              == (CUVS_HNSW_ROUTE_FLAG_AFTER_SCAN | CUVS_HNSW_ROUTE_FLAG_NO_STATISTICS));
+    /* statistics present but the pre-scan forecast failed: after scan, NOT no-statistics */
+    CHECK(cuvs_hnsw_timing_flags(1e6, CUVS_HNSW_PRESPOOL_FALLBACK) == CUVS_HNSW_ROUTE_FLAG_AFTER_SCAN);
     for (int a = CUVS_HNSW_PRESPOOL_PROCEED; a <= CUVS_HNSW_PRESPOOL_REJECT; a++)
-        CHECK(cuvs_hnsw_timing_flag((CuvsHnswPrespoolAction)a) == CUVS_HNSW_ROUTE_FLAG_PRESPOOL);
+    {
+        CHECK(cuvs_hnsw_timing_flags(1e6, (CuvsHnswPrespoolAction)a) == CUVS_HNSW_ROUTE_FLAG_PRESPOOL);
+        CHECK(cuvs_hnsw_timing_flags(-1, (CuvsHnswPrespoolAction)a) == CUVS_HNSW_ROUTE_FLAG_PRESPOOL);
+    }
+    CHECK(!strcmp(cuvs_hnsw_route_decided_name(CUVS_HNSW_ROUTE_FLAG_PRESPOOL), "before_scan_from_statistics"));
+    CHECK(!strcmp(cuvs_hnsw_route_decided_name(CUVS_HNSW_ROUTE_FLAG_AFTER_SCAN | CUVS_HNSW_ROUTE_FLAG_NO_STATISTICS),
+                  "after_scan_no_statistics"));
+    CHECK(!strcmp(cuvs_hnsw_route_decided_name(CUVS_HNSW_ROUTE_FLAG_AFTER_SCAN), "after_scan_preflight_unavailable"));
+    CHECK(!strcmp(cuvs_hnsw_route_decided_name(0), "not_recorded"));
     /* with statistics */
     CHECK(cuvs_prespool_rows(1000000.0) == 1000000 && cuvs_prespool_rows(10.2) == 11);
     CHECK(cuvs_hnsw_prespool_action(1e6, OK, CUVS_HNSW_ROUTE_ACE, 1, 1) == CUVS_HNSW_PRESPOOL_NOTICE_OVERFLOW);
@@ -193,6 +208,55 @@ static void test_prespool_and_fallback(void)
     CHECK(forecast(0, CUVS_HNSW_ALGO_AUTO, 1, H, G, &f) == CUVS_STATUS_BUILD_FAILED);
 }
 
+/* I3CD-B1 direct regression, as the backend sequences it: positive
+ * statistics, the first op 40 fails (daemon/IPC), the scan runs, the second
+ * op 40 succeeds and announces the overflow, op 23 returns an auto -> ACE
+ * receipt. The stored metadata must say the forecast was unavailable, never
+ * "no statistics"; the no-statistics path keeps its value. */
+static const char *backend_receipt_route_decided(double reltuples, int first_rc, int second_rc,
+                                                 int *transition_sent, int *valid)
+{
+    static CuvsHnswPolicy stored;
+    CuvsHnswPolicy p, read;
+    /* pre-scan: cuvs_hnsw_preflight(stats_rows, ...) */
+    CuvsHnswPrespoolAction pre = cuvs_prespool_rows(reltuples)
+        ? cuvs_hnsw_prespool_action(reltuples, first_rc, CUVS_HNSW_ROUTE_ACE, 1, 1)
+        : CUVS_HNSW_PRESPOOL_FALLBACK;
+    *transition_sent = pre == CUVS_HNSW_PRESPOOL_NOTICE_OVERFLOW;
+    /* after the scan, only on FALLBACK: cuvs_hnsw_preflight(spool->n, ..., may_reject=false) */
+    if (pre == CUVS_HNSW_PRESPOOL_FALLBACK)
+        *transition_sent = cuvs_hnsw_prespool_action(400000, second_rc, CUVS_HNSW_ROUTE_ACE, 1, 1)
+            == CUVS_HNSW_PRESPOOL_NOTICE_OVERFLOW;
+    /* op 23 success: wrapper receipt, then the backend ORs the timing flags */
+    p = receipt(CUVS_HNSW_ALGO_AUTO, CUVS_HNSW_ROUTE_ACE, CUVS_HNSW_ROUTE_FLAG_AUTO_OVERFLOW);
+    p.route_flags |= cuvs_hnsw_timing_flags(reltuples, pre);
+    /* metapage round trip, as pg_cuvs_hnsw_build_info reads it */
+    stored = p;
+    *valid = cuvs_hnsw_policy_read(&stored, sizeof(stored), &read) == CUVS_HNSW_POLICY_RECORDED;
+    return cuvs_hnsw_route_decided_name(read.route_flags);
+}
+
+static void test_i3cd_b1_preflight_failure_is_not_no_statistics(void)
+{
+    int sent, valid;
+    const int fails[] = {CUVS_STATUS_UNAVAILABLE, CUVS_STATUS_ERROR, CUVS_STATUS_PROTO_MISMATCH};
+    for (size_t i = 0; i < sizeof(fails) / sizeof(fails[0]); i++)
+    {
+        const char *decided = backend_receipt_route_decided(400000, fails[i], CUVS_STATUS_OK, &sent, &valid);
+        CHECK(valid && sent);
+        CHECK(!strcmp(decided, "after_scan_preflight_unavailable"));
+        CHECK(!strstr(decided, "no_statistics"));
+    }
+    /* no statistics keeps after_scan_no_statistics */
+    CHECK(!strcmp(backend_receipt_route_decided(-1, CUVS_STATUS_OK, CUVS_STATUS_OK, &sent, &valid),
+                  "after_scan_no_statistics") && valid && sent);
+    CHECK(!strcmp(backend_receipt_route_decided(0, CUVS_STATUS_OK, CUVS_STATUS_OK, &sent, &valid),
+                  "after_scan_no_statistics") && valid);
+    /* statistics and a working pre-scan forecast */
+    CHECK(!strcmp(backend_receipt_route_decided(400000, CUVS_STATUS_OK, CUVS_STATUS_OK, &sent, &valid),
+                  "before_scan_from_statistics") && valid && sent);
+}
+
 /* (14) CAGRA reltuples AR0 guard: refuse before the scan only when certain. */
 static void test_cagra_ar0(void)
 {
@@ -218,6 +282,8 @@ static void test_cagra_ar0(void)
 
 int main(void)
 {
+    /* First, so its mutants are attributed to the direct regression itself. */
+    test_i3cd_b1_preflight_failure_is_not_no_statistics();
     test_default_and_knob();
     test_estimate_independent_of_lists();
     test_invariant_notices();

@@ -2804,7 +2804,8 @@ cuvs_build_hnsw_from_heap(Relation heapRel, Relation indexRel, IndexInfo *indexI
              * before the build op, from the spooled row count. */
             if (prespool == CUVS_HNSW_PRESPOOL_FALLBACK)
             {
-                snprintf(when, sizeof(when), "after the heap scan (no table statistics) from %llu spooled rows",
+                snprintf(when, sizeof(when), "after the heap scan (%s) from %llu spooled rows",
+                         cuvs_prespool_rows(stats_rows) ? "pre-scan forecast unavailable" : "no table statistics",
                          (unsigned long long)spool->n);
                 transition_sent = cuvs_hnsw_preflight((double)spool->n, spool->dim, hierarchy,
                     build_algo, ef_construction, cap, false, when)
@@ -2820,7 +2821,7 @@ cuvs_build_hnsw_from_heap(Relation heapRel, Relation indexRel, IndexInfo *indexI
             if (rc == CUVS_STATUS_CANCELED) CHECK_FOR_INTERRUPTS();
             if (rc != CUVS_STATUS_OK)
                 ereport(ERROR, (errmsg("pg_cuvs: temporary HNSW build failed (status %d): %s", rc, error)));
-            out->policy.route_flags |= cuvs_hnsw_timing_flag(prespool);
+            out->policy.route_flags |= cuvs_hnsw_timing_flags(stats_rows, prespool);
             /* CK-17 (13): every auto -> ACE receipt gets its NOTICE lines. */
             notices = cuvs_hnsw_build_notices(&out->policy, transition_sent);
             if (notices & CUVS_HNSW_NOTICE_TRANSITION)

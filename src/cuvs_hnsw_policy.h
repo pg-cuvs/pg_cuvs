@@ -33,13 +33,28 @@
  * AUTO_OVERFLOW: auto exceeded the resident budget and spilled to ACE. It is
  * set only by cuvs_hnsw_resolve_route's single overflow branch and is the
  * only way an auto receipt may name route ACE.
- * PRESPOOL: the backend forecast the route from reltuples/dim before the
- * heap scan (PN-1). STATS_FALLBACK: no usable statistics, so the route was
- * decided only after the scan. The two timing bits are mutually exclusive. */
+ * Timing and its cause are separate facts (I3CD-B1): PRESPOOL: the backend
+ * forecast the route from reltuples/dim before the heap scan (PN-1).
+ * AFTER_SCAN: the route was decided only after the scan. NO_STATISTICS: the
+ * cause was missing/zero reltuples; without it AFTER_SCAN means statistics
+ * existed but the pre-scan forecast was unavailable (daemon/IPC failure).
+ * PRESPOOL and AFTER_SCAN are mutually exclusive; NO_STATISTICS needs
+ * AFTER_SCAN. */
 #define CUVS_HNSW_ROUTE_FLAG_AUTO_OVERFLOW 0x1u
 #define CUVS_HNSW_ROUTE_FLAG_PRESPOOL 0x2u
-#define CUVS_HNSW_ROUTE_FLAG_STATS_FALLBACK 0x4u
-#define CUVS_HNSW_ROUTE_FLAGS_KNOWN 0x7u
+#define CUVS_HNSW_ROUTE_FLAG_AFTER_SCAN 0x4u
+#define CUVS_HNSW_ROUTE_FLAG_NO_STATISTICS 0x8u
+#define CUVS_HNSW_ROUTE_FLAGS_KNOWN 0xfu
+
+/* Receipt JSON "route_decided" (pg_cuvs_hnsw_build_info). */
+static inline const char *cuvs_hnsw_route_decided_name(uint32_t flags)
+{
+    if (flags & CUVS_HNSW_ROUTE_FLAG_PRESPOOL) return "before_scan_from_statistics";
+    if (flags & CUVS_HNSW_ROUTE_FLAG_AFTER_SCAN)
+        return (flags & CUVS_HNSW_ROUTE_FLAG_NO_STATISTICS)
+            ? "after_scan_no_statistics" : "after_scan_preflight_unavailable";
+    return "not_recorded";
+}
 
 static inline const char *cuvs_hnsw_overflow_name(uint32_t mode)
 {
@@ -128,8 +143,10 @@ static inline int cuvs_hnsw_policy_valid(const CuvsHnswPolicy *p)
         && p->internal_builder == p->route
         && (p->route == CUVS_HNSW_ROUTE_ACE ? p->partitions > 0 : p->partitions == 0)
         && !(p->route_flags & ~CUVS_HNSW_ROUTE_FLAGS_KNOWN)
-        && (p->route_flags & (CUVS_HNSW_ROUTE_FLAG_PRESPOOL | CUVS_HNSW_ROUTE_FLAG_STATS_FALLBACK))
-            != (CUVS_HNSW_ROUTE_FLAG_PRESPOOL | CUVS_HNSW_ROUTE_FLAG_STATS_FALLBACK)
+        && (p->route_flags & (CUVS_HNSW_ROUTE_FLAG_PRESPOOL | CUVS_HNSW_ROUTE_FLAG_AFTER_SCAN))
+            != (CUVS_HNSW_ROUTE_FLAG_PRESPOOL | CUVS_HNSW_ROUTE_FLAG_AFTER_SCAN)
+        && (!(p->route_flags & CUVS_HNSW_ROUTE_FLAG_NO_STATISTICS)
+            || (p->route_flags & CUVS_HNSW_ROUTE_FLAG_AFTER_SCAN))
         /* auto may name ACE only through the recorded overflow branch. */
         && (!!(p->route_flags & CUVS_HNSW_ROUTE_FLAG_AUTO_OVERFLOW)
             == (p->requested_algo == CUVS_HNSW_ALGO_AUTO && p->route == CUVS_HNSW_ROUTE_ACE))

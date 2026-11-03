@@ -379,7 +379,9 @@ route and the disk precheck are decided from `reltuples` and the declared dimens
 BEFORE the heap scan, so a refusal or the ACE NOTICE comes before any row is spooled;
 the build re-decides from the spooled row count. Without statistics the decision comes
 after the scan. The receipt field `route_decided` says which
-(`before_scan_from_statistics` or `after_scan_no_statistics`). Stale statistics can
+(`before_scan_from_statistics`, `after_scan_no_statistics`, or
+`after_scan_preflight_unavailable` when statistics existed but the pre-scan forecast could not be
+obtained from the daemon). Stale statistics can
 mislead the early decision; run `ANALYZE` first. The `cagra` AM likewise refuses a
 certain AR0 (estimated final size over the per-GPU limit, unsharded) before its scan
 when statistics exist.
