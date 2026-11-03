@@ -15,6 +15,7 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <sys/types.h>
+#include "cuvs_admission_contract.h"
 
 #define CUVS_MAX_GPUS 16
 
@@ -37,8 +38,11 @@
  * changes. Deploy the extension and daemon together:
  *   make install && make install-server
  * ---------------------------------------------------------------- */
+#define CUVS_NOTICE_OUT_BYTES 256u  /* CuvsReplyHeader.notice_out, includes NUL */
 #define CUVS_PROTO_MAGIC   0x50435556u  /* 'VUCP' LE — "PG CUVS" tag */
-#define CUVS_PROTO_VERSION 4u   /* 4: + CAGRA itopk_size / search_width.
+#define CUVS_PROTO_VERSION 5u   /* 5: I3 set (ADR-081, ADR-086): CuvsReplyHeader
+                                 * + err_out (admission payload) + notice_out.
+                                 * 4: + CAGRA itopk_size / search_width.
                                  * 3: daemon replies for EXPORT_ADJACENCY /
                                  * EXPORT_HNSW_SHM / SEARCH_BATCH now carry the
                                  * payload as an SCM_RIGHTS fd instead of a
@@ -238,7 +242,28 @@ typedef struct CuvsReplyHeader {
     uint32_t delta_merged;  /* 1 if the daemon already merged the .delta into results
                              * (Phase 3B); backend then skips its CPU merge */
     char     error[128];
+    /* 5 (I3): admission rejection payload (grammar in cuvs_admission_contract.h,
+     * "" when the reply is not an admission rejection) and one NOTICE line for
+     * the requester ("" when none). Every reply carries both; the client clears
+     * its copy at the start of each request (cuvs_ipc_last_err_out). */
+    char     err_out[CUVS_ADMISSION_ERR_OUT_BYTES];
+    char     notice_out[CUVS_NOTICE_OUT_BYTES];
 } CuvsReplyHeader;
+
+#if defined(__cplusplus)
+static_assert(CUVS_PROTO_VERSION == CUVS_ADMISSION_IPC_VERSION,
+              "the I3 wire version is the shared admission contract version");
+#else
+_Static_assert(CUVS_PROTO_VERSION == CUVS_ADMISSION_IPC_VERSION,
+               "the I3 wire version is the shared admission contract version");
+#endif
+
+/* err_out / notice_out of the last reply header this thread received through
+ * cuvs_ipc.c, NUL-terminated within the field size. Both are "" after a
+ * request that got no reply header (connect or send failure). Valid until
+ * the next IPC call on the same thread. */
+const char *cuvs_ipc_last_err_out(void);
+const char *cuvs_ipc_last_notice_out(void);
 
 /* Only BUILD_HNSW_FILE v3 uses this receipt; global v3 stays unchanged. */
 typedef struct CuvsHnswFileReply {

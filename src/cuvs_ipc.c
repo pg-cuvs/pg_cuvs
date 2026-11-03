@@ -73,10 +73,15 @@ cuvs_ipc_set_daemon_uid(int uid)
 /* Open a UDS connection. Returns fd on success, -1 on failure.
  * connect_timeout_ms: short for fail-fast on missing daemon
  * recv_timeout_sec: longer for receiving daemon response (build can be slow) */
+static void forget_reply(void);
+
 static int
 uds_connect_ex(const char *socket_path, int recv_timeout_sec)
 {
-    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    int fd;
+
+    forget_reply();   /* every request starts without a previous reply's I3 fields */
+    fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (fd < 0)
         return -1;
 
@@ -220,16 +225,55 @@ send_all(int fd, const void *buf, size_t len)
 static int recv_all(int fd, void *buf, size_t len);
 static int recv_all_interruptible(int fd, void *buf, size_t len, int timeout_sec);
 
+static __thread char g_last_err_out[CUVS_ADMISSION_ERR_OUT_BYTES];
+static __thread char g_last_notice_out[CUVS_NOTICE_OUT_BYTES];
+
+const char *
+cuvs_ipc_last_err_out(void)
+{
+    return g_last_err_out;
+}
+
+const char *
+cuvs_ipc_last_notice_out(void)
+{
+    return g_last_notice_out;
+}
+
+static void
+forget_reply(void)
+{
+    g_last_err_out[0] = '\0';
+    g_last_notice_out[0] = '\0';
+}
+
+/* Copy the I3 fields; a daemon that fills a field to the brim without a NUL
+ * is cut at the field size, never read past it. */
+static void
+remember_reply(const CuvsReplyHeader *hdr)
+{
+    memcpy(g_last_err_out, hdr->err_out, sizeof(g_last_err_out));
+    g_last_err_out[sizeof(g_last_err_out) - 1] = '\0';
+    memcpy(g_last_notice_out, hdr->notice_out, sizeof(g_last_notice_out));
+    g_last_notice_out[sizeof(g_last_notice_out) - 1] = '\0';
+}
+
 static int
 recv_reply(int fd, CuvsReplyHeader *hdr)
 {
-    return recv_all(fd, hdr, sizeof(*hdr));
+    int rc = recv_all(fd, hdr, sizeof(*hdr));
+    if (rc == 0)
+        remember_reply(hdr);
+    return rc;
 }
 
 static int
 recv_reply_interruptible(int fd, CuvsReplyHeader *hdr, int timeout_sec)
 {
-    return recv_all_interruptible(fd, hdr, sizeof(*hdr), timeout_sec);
+    int rc = recv_all_interruptible(fd, hdr, sizeof(*hdr), timeout_sec);
+    if (rc == 0)
+        remember_reply(hdr);
+    return rc;
 }
 
 /*
