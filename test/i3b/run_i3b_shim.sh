@@ -81,7 +81,7 @@ check "i1,i2 still resident after the rejected build" sh -c "[ \$(i3b_ipc_cli $S
 # --- 2. headroom reclaim frees the rejected size (F) from cold indexes ---
 sleep 3
 check "[reclaim] trigger=headroom with f_src=build" grep -q 'trigger=headroom f_bytes=10240000 f_src=build' /tmp/d.log
-check "reclaim evicted one cold index (reason=reclaim)" grep -q 'reason=reclaim requester=RECLAIM' /tmp/d.log
+check "reclaim evicted one cold index (reason=reclaim)" grep -qE 'op=RECLAIM .*reason=reclaim requester_idx=0' /tmp/d.log
 psqlq "SET client_min_messages=warning; DROP INDEX IF EXISTS i3; CREATE INDEX i3 ON t3 USING cagra (v vector_l2_ops);" >/dev/null
 I3=$(oid i3)
 check "retried build admitted after reclaim" sh -c "[ \"\$(i3b_ipc_cli $S index | awk -F'\t' -v i=$I3 '\$2==i{print \$3}')\" = resident ]"
@@ -95,7 +95,7 @@ for i in $I2 $I3; do cli load $DB $i >/dev/null; done
 check "two resident before the reload (i2, i3)" sh -c "[ \$(i3b_ipc_cli $S index | awk -F'\t' '\$3==\"resident\"' | wc -l) -eq 2 ]"
 q() { psqlq "SET enable_seqscan=off; SELECT id FROM $1 ORDER BY v <-> (SELECT v FROM $1 WHERE id=1) LIMIT 1;" >/dev/null; }
 q t1
-check "reload of non-resident i1 evicts an eligible index (reason=reload)" grep -q 'reason=reload requester=LOAD' /tmp/d.log
+check "reload of non-resident i1 evicts an eligible index (reason=reload)" grep -qE 'op=LOAD .*reason=reload requester_idx=[1-9]' /tmp/d.log
 check "i1 resident again with hits >= 1" sh -c "i3b_ipc_cli $S index | awk -F'\t' -v i=$I1 '\$2==i && \$3==\"resident\" && \$9>=1{f=1} END{exit !f}'"
 # protect both residents by searching them (T_min 3600 s), then reload the third
 for t in t1 t2 t3; do
@@ -103,14 +103,14 @@ for t in t1 t2 t3; do
 done
 NR=$(i3b_ipc_cli $S index | awk -F'\t' '$3=="not_resident" && $4=="cagra"{print $2}' | head -1)
 for t in t1 t2 t3; do [ "$(oid i${t#t})" = "$NR" ] && q $t; done
-check "reload with only protected victims soft-evicts (reason=soft_evict)" grep -q 'reason=soft_evict requester=LOAD' /tmp/d.log
+check "reload with only protected victims soft-evicts (reason=soft_evict)" grep -qE 'op=LOAD .*reason=soft_evict' /tmp/d.log
 check "soft-evicted index history says soft_evict" sh -c "i3b_ipc_cli $S index | awk -F'\t' '\$20==\"soft_evict\"{f=1} END{exit !f}'"
 # REINDEX of a resident index when only its old copy makes room
 RI=$(i3b_ipc_cli $S index | awk -F'\t' '$3=="resident"{print $2}' | head -1)
 RN=$(psqlq "SELECT relname FROM pg_class WHERE oid=$RI")
 psqlq "SET client_min_messages=warning; REINDEX INDEX $RN;" >/dev/null
 check "REINDEX self-replace logged" grep -q '\[self_replace\] db=' /tmp/d.log
-check "self-replace eviction marked self_replace=1" grep -q 'reason=admit_build requester=BUILD_CAGRA .* self_replace=1' /tmp/d.log
+check "self-replace eviction marked self_replace=1" grep -qE 'op=BUILD_CAGRA .*reason=admit_build .*self_replace=1' /tmp/d.log
 check "receipt: last_build_self_replace=1, unloaded>0" sh -c "i3b_ipc_cli $S index | awk -F'\t' -v i=$RI '\$2==i && \$21==1 && \$22>0{f=1} END{exit !f}'"
 check "no other index evicted by the build" sh -c "! grep 'reason=admit_build' /tmp/d.log | grep -v self_replace=1 | grep -q ."
 cli set reclaim-mode headroom >/dev/null
@@ -133,6 +133,36 @@ check "reclaim_set refuses low > high" sh -c "! i3b_ipc_cli $S set reclaim-low-p
 check "reclaim status shows function source" sh -c "i3b_ipc_cli $S reclaim | grep -q '\"reclaim-mode\":{\"value\":\"usage\",\"source\":\"function\"'"
 check "memory status mode usage, F 0" sh -c "i3b_ipc_cli $S memory | awk -F'\t' 'NR==3 && \$8==\"usage\" && \$9==0{f=1} END{exit !f}'"
 
+# --- 5b. I-FC transitions and defect 3 (CK-37 (b), CK-26 r14) ---
+cli set reclaim-mode off >/dev/null
+for i in $(i3b_ipc_cli $S index | awk -F'\t' '$3=="resident"{print $2}'); do cli unload $DB $i >/dev/null; done
+cli load $DB $I1 >/dev/null
+check "after load: file_current 1, extend_count 0" sh -c "[ \"\$(i3b_ipc_cli $S index | awk -F'\t' -v i=$I1 '\$2==i{print \$15\":\"\$16}')\" = 1:0 ]"
+psqlq "INSERT INTO t1 SELECT 90000 + id, v FROM t1 WHERE id <= 10;" >/dev/null
+check "EXTEND: file_current 0, extend_count 10" sh -c "[ \"\$(i3b_ipc_cli $S index | awk -F'\t' -v i=$I1 '\$2==i{print \$15\":\"\$16}')\" = 0:10 ]"
+check "unload after EXTEND saves (no sidecar: plain 'unloaded')" sh -c "i3b_ipc_cli $S unload $DB $I1 | grep -q 'status=0 unloaded\$'"
+check "the unload saved the graph (saved_ms field, manual_unload)" grep -qE "op=MANUAL .* idx=$I1 reason=manual_unload .*saved_ms=" /tmp/d.log
+cli load $DB $I1 >/dev/null
+check "reload resets extend_count (defect 3) and file_current 1" sh -c "[ \"\$(i3b_ipc_cli $S index | awk -F'\t' -v i=$I1 '\$2==i{print \$15\":\"\$16}')\" = 1:0 ]"
+check "unload with file_current 1 skips the save (saved_ms=0)" sh -c "i3b_ipc_cli $S unload $DB $I1 >/dev/null; grep -E 'op=MANUAL .* idx=$I1 ' /tmp/d.log | tail -1 | grep -q 'saved_ms=0 '"
+
+# --- 5c. sidecar exclusion in background reclaim (decision 4, UC-1 7b) ---
+cli load $DB $I1 >/dev/null
+psqlq "INSERT INTO t1 SELECT 91000 + id, v FROM t1 WHERE id <= 5;" >/dev/null
+touch $IDX/${DB}_${I1}.delta
+cli load $DB $I3 >/dev/null
+cli set reclaim-free-bytes 26214400 >/dev/null
+cli set reclaim-mode headroom >/dev/null
+sleep 3
+check "reclaim skips the unsaved CAGRA with a delta file (skip_sidecar=1)" grep -qE '\[reclaim\] .*evicted=1 skip_sidecar=1 trigger=headroom f_bytes=13107200 f_src=fixed' /tmp/d.log
+check "skipped index stays resident; the other was reclaimed" sh -c "[ \"\$(i3b_ipc_cli $S index | awk -F'\t' -v i=$I1 '\$2==i{print \$3\$14}')\" = residentdelta ]"
+check "memory_status counts reclaim_skip_sidecar" sh -c "i3b_ipc_cli $S memory | awk -F'\t' 'NR==3 && \$14>=1{f=1} END{exit !f}'"
+cli set reclaim-mode off >/dev/null
+cli set reclaim-free-bytes 0 >/dev/null
+check "unload of that index warns (CPU replan until REINDEX)" sh -c "i3b_ipc_cli $S unload $DB $I1 | grep -q 'unloaded; warning: delta or tombstone file present, GPU path switches to CPU replan until REINDEX'"
+rm -f $IDX/${DB}_${I1}.delta
+cli set reclaim-mode usage >/dev/null
+
 # --- 6. usage stats file and startup order (UC-1 4c) ---
 sleep 2
 check "usage stats file written" test -s $IDX/.pg_cuvs_usage_stats
@@ -145,7 +175,28 @@ check "usage-stats-file off: OID order" sh -c "tail -50 /tmp/d.log | grep -q 'as
 printf 'garbage' > $IDX/.pg_cuvs_usage_stats
 startd --reclaim-tick-s 1
 check "corrupt file: daemon up, OID order with reason" sh -c "tail -50 /tmp/d.log | grep -q 'ascending (unknown format or version)'"
-check "startup never evicts" sh -c "! grep -q 'requester=LOAD_STARTUP' /tmp/d.log"
+check "startup never evicts" sh -c "! grep -q 'op=LOAD_STARTUP' /tmp/d.log"
+
+# --- 6b. knobs off reproduce the old behavior (CK-9 r18) ---
+startd --reclaim-tick-s 1 --evict-min-idle-s 3600 --reclaim-mode off --load-soft-evict off --reindex-self-replace off
+for i in $(i3b_ipc_cli $S index | awk -F'\t' '$3=="resident"{print $2}'); do cli unload $DB $i >/dev/null; done
+cli load $DB $I1 >/dev/null; cli load $DB $I3 >/dev/null
+q t1; q t3
+MARK=$(wc -l < /tmp/d.log)
+OUTL=$(cli load $DB $I2)
+check "load-soft-evict off: reload with only protected victims refused (AR5 text)" sh -c "echo '$OUTL' | grep -q 'pinned, in use, or still protected'"
+check "load-soft-evict off: no soft_evict" sh -c "! tail -n +$MARK /tmp/d.log | grep -q 'reason=soft_evict'"
+RN3=$(psqlq "SELECT relname FROM pg_class WHERE oid=$I3")
+psqlq "SET client_min_messages=warning; REINDEX INDEX $RN3;" > /tmp/reidx_off.log 2>&1
+check "reindex-self-replace off: no self-replace, REINDEX refused" sh -c "! tail -n +$MARK /tmp/d.log | grep -q 'self_replace\]' && grep -q ERROR /tmp/reidx_off.log"
+# pinned REINDEX keeps the pin when there is room
+startd --reclaim-tick-s 1 --reclaim-mode off
+for i in $(i3b_ipc_cli $S index | awk -F'\t' '$3=="resident"{print $2}'); do cli unload $DB $i >/dev/null; done
+cli pin $DB $I3 >/dev/null
+psqlq "SET client_min_messages=warning; REINDEX INDEX $RN3;" >/dev/null
+check "REINDEX keeps the pin (C7 7.2-N3)" sh -c "[ \"\$(i3b_ipc_cli $S index | awk -F'\t' -v i=$I3 '\$2==i{print \$10}')\" = 1 ]"
+cli unpin $DB $I3 >/dev/null
+startd --reclaim-tick-s 1
 
 # --- 8. SQL surface (C7, C8, CK-25/26): owner checks, superuser-only, SHOW ---
 psqlq "CREATE ROLE bob LOGIN; CREATE TABLE tb (id int, v vector(64)); ALTER TABLE tb OWNER TO bob;" >/dev/null
