@@ -16,9 +16,9 @@ check() { # name, condition-command...
     if "$@" >/dev/null 2>&1; then echo "PASS $name"; else echo "FAIL $name"; FAILS=$((FAILS+1)); fi
 }
 
-make PGCUVS_CPU_SHIM=1 with_llvm=no -j8 all server >/tmp/b.log 2>&1 || { tail -20 /tmp/b.log; exit 2; }
+make PGCUVS_CPU_SHIM=1 with_llvm=no -j8 all server server-test >/tmp/b.log 2>&1 || { tail -20 /tmp/b.log; exit 2; }
 make PGCUVS_CPU_SHIM=1 with_llvm=no install >/tmp/i.log 2>&1 || { tail -20 /tmp/i.log; exit 2; }
-install -m 755 pg_cuvs_server /usr/local/bin/
+install -m 755 pg_cuvs_server pg_cuvs_server_test /usr/local/bin/
 gcc -std=gnu11 -I src -o /usr/local/bin/i3b_ipc_cli test/i3b/i3b_ipc_cli.c src/cuvs_ipc.c \
     src/cuvs_util.c src/cuvs_build_corpus.c -lpthread -lm -lrt || exit 2
 
@@ -34,10 +34,11 @@ EOF
 su pg -c "pg_ctl -D /tmp/pgdata -l /tmp/pg.log -w start >/dev/null"
 
 S=/tmp/.s.pg_cuvs
+DBIN=pg_cuvs_server
 startd() { # extra daemon flags...
     pkill -f pg_cuvs_server 2>/dev/null; sleep 1; pkill -9 -f pg_cuvs_server 2>/dev/null
     rm -f $S
-    su pg -c "pg_cuvs_server --socket $S --index-dir $IDX --max-vram-mb 25 $* >>/tmp/d.log 2>&1 &"
+    su pg -c "$DBIN --socket $S --index-dir $IDX --max-vram-mb 25 $* >>/tmp/d.log 2>&1 &"
     for i in $(seq 1 30); do [ -S $S ] && break; sleep 1; done
 }
 cli() { su pg -c "i3b_ipc_cli $S $*"; }
@@ -108,6 +109,7 @@ RI=$(i3b_ipc_cli $S index | awk -F'\t' '$3=="resident"{print $2}' | head -1)
 RN=$(psqlq "SELECT relname FROM pg_class WHERE oid=$RI")
 psqlq "SET client_min_messages=warning; REINDEX INDEX $RN;" >/dev/null
 check "REINDEX self-replace logged" grep -q '\[self_replace\] db=' /tmp/d.log
+check "self-replace NOTICE and DETAIL exact (need 10240000, free 5734400)" grep -qF "notice=\"pg_cuvs: previous resident copy of index $RI unloaded from GPU to make room for the rebuild\" detail=\"GPU memory was insufficient for both copies (need 10240000 bytes, free 5734400 bytes). Queries on this index use the CPU path or reload the old copy until the new index is resident\"" /tmp/d.log
 check "self-replace eviction marked self_replace=1" grep -qE 'op=BUILD_CAGRA .*reason=admit_build .*self_replace=1' /tmp/d.log
 check "receipt: last_build_self_replace=1, unloaded>0" sh -c "i3b_ipc_cli $S index | awk -F'\t' -v i=$RI '\$2==i && \$21==1 && \$22>0{f=1} END{exit !f}'"
 check "no other index evicted by the build" sh -c "! grep 'reason=admit_build' /tmp/d.log | grep -v self_replace=1 | grep -q ."
@@ -219,6 +221,51 @@ q t1
 wait 2>/dev/null; sleep 6
 check "reload during a pending build evicts a resident (build itself does not)" sh -c "tail -n +$MARK /tmp/d.log | grep -qE 'op=LOAD .*reason=(reload|soft_evict)' && ! tail -n +$MARK /tmp/d.log | grep -q 'reason=admit_build'"
 check "the delayed build still completes" sh -c "! grep -q ERROR /tmp/i4.log"
+startd --reclaim-tick-s 1
+
+# --- 9. every build path keeps scope none (review BLOCK 4) and the
+#        self-replace failure notice (BLOCK 2), with build-OOM injection ---
+noevict_since() { ! tail -n +$1 /tmp/d.log | grep -q '\[evict\]'; }
+resident_n() { i3b_ipc_cli $S index | awk -F'\t' '$3=="resident"' | wc -l; }
+DBIN=pg_cuvs_server_test
+startd --reclaim-mode off
+for i in $(i3b_ipc_cli $S index | awk -F'\t' '$3=="resident"{print $2}'); do cli unload $DB $i >/dev/null; done
+cli load $DB $I1 >/dev/null; cli load $DB $I3 >/dev/null
+psqlq "CREATE TABLE t5 (id int, v vector(64)); INSERT INTO t5 SELECT g, (SELECT array_agg(((g*13+i) % 83)::real) FROM generate_series(1,64) i)::vector FROM generate_series(1,120000) g;" >/dev/null
+psqlq "CREATE TABLE t6 (id int, v vector(64)); INSERT INTO t6 SELECT g, (SELECT array_agg(((g*17+i) % 79)::real) FROM generate_series(1,64) i)::vector FROM generate_series(1,20000) g;" >/dev/null
+MARK=$(wc -l < /tmp/d.log)
+psqlq "SET client_min_messages=warning; CREATE INDEX i5 ON t5 USING ivfpq (v vector_l2_ops);" > /tmp/i5.log 2>&1
+check "IVF-PQ build that does not fit evicts nothing (BUILD_IVFPQ, scope none)" sh -c "grep -q ERROR /tmp/i5.log && ! tail -n +$MARK /tmp/d.log | grep -q '\[evict\]' && [ \$(i3b_ipc_cli $S index | awk -F'\t' '\$3==\"resident\"' | wc -l) -eq 2 ]"
+MARK=$(wc -l < /tmp/d.log)
+# 40,000 rows in 2 shards: each shard (10,240,000 B) exceeds the free room
+psqlq "CREATE TABLE t7 (id int, v vector(64)); INSERT INTO t7 SELECT g, (SELECT array_agg(((g*19+i) % 73)::real) FROM generate_series(1,64) i)::vector FROM generate_series(1,40000) g;" >/dev/null
+MARK=$(wc -l < /tmp/d.log)
+psqlq "SET client_min_messages=warning; SET cuvs.shard_count = 2; CREATE INDEX i7s ON t7 USING cagra (v vector_l2_ops);" > /tmp/i6s.log 2>&1
+check "sharded build that does not fit evicts nothing (BUILD_SHARD)" sh -c "grep -q ERROR /tmp/i6s.log && ! tail -n +$MARK /tmp/d.log | grep -q '\[evict\]' && [ \$(i3b_ipc_cli $S index | awk -F'\t' '\$3==\"resident\"' | wc -l) -eq 2 ]"
+# post-admission OOM retry (BUILD_CAGRA): room exists, the build OOMs once
+startd --reclaim-mode off --max-vram-mb 100
+for i in $(i3b_ipc_cli $S index | awk -F'\t' '$3=="resident"{print $2}'); do cli unload $DB $i >/dev/null; done
+cli load $DB $I1 >/dev/null; cli load $DB $I3 >/dev/null
+MARK=$(wc -l < /tmp/d.log)
+psqlq "SET client_min_messages=warning; SELECT pg_cuvs_inject_build_oom(1); CREATE INDEX i6o ON t6 USING cagra (v vector_l2_ops);" > /tmp/i6o.log 2>&1
+check "post-admission build OOM evicts nothing (retry loop is BUILD_CAGRA)" sh -c "grep -q ERROR /tmp/i6o.log && ! tail -n +$MARK /tmp/d.log | grep -q '\[evict\]'"
+psqlq "SELECT pg_cuvs_inject_build_oom(0);" >/dev/null
+# registry slot cap (BUILD_CAGRA): fits in VRAM, no slot -> saved, not resident
+startd --reclaim-mode off --max-vram-mb 100 --max-indexes 2
+for i in $(i3b_ipc_cli $S index | awk -F'\t' '$3=="resident"{print $2}'); do cli unload $DB $i >/dev/null; done
+cli load $DB $I1 >/dev/null; cli load $DB $I3 >/dev/null
+MARK=$(wc -l < /tmp/d.log)
+psqlq "SET client_min_messages=warning; CREATE INDEX i6c ON t6 USING cagra (v vector_l2_ops);" > /tmp/i6c.log 2>&1
+I6C=$(oid i6c)
+check "build at the registry cap evicts nothing; saved, not resident" sh -c "! grep -q ERROR /tmp/i6c.log && ! tail -n +$MARK /tmp/d.log | grep -q '\[evict\]' && [ \"\$(i3b_ipc_cli $S index | awk -F'\t' -v i=$I6C '\$2==i{print \$3}')\" = not_resident ]"
+# self-replace, then the rebuild OOMs: failure notice (exact)
+startd --reclaim-mode off
+for i in $(i3b_ipc_cli $S index | awk -F'\t' '$3=="resident"{print $2}'); do cli unload $DB $i >/dev/null; done
+cli load $DB $I1 >/dev/null; cli load $DB $I3 >/dev/null
+psqlq "SET client_min_messages=warning; SELECT pg_cuvs_inject_build_oom(1); REINDEX INDEX $RN3;" > /tmp/reidx_fail.log 2>&1
+check "self-replace then build failure: failure NOTICE exact" grep -qF "[self_replace] idx=$I3 build_failed=1 notice=\"pg_cuvs: rebuild of index $I3 failed after its previous resident copy was unloaded from GPU\" detail=\"The next query on this index reloads the old copy\"" /tmp/d.log
+psqlq "SELECT pg_cuvs_inject_build_oom(0);" >/dev/null
+DBIN=pg_cuvs_server
 startd --reclaim-tick-s 1
 
 # --- 8. SQL surface (C7, C8, CK-25/26): owner checks, superuser-only, SHOW ---
