@@ -78,7 +78,7 @@ def split_args(a):
     return parts
 
 
-arity = {"ensure_vram": 4, "evict_lru": 2, "make_slot": 2, "load_index": 3}
+arity = {"ensure_vram": 5, "evict_lru": 2, "make_slot": 2, "load_index": 3}
 load_rq = {}
 for fn, n in arity.items():
     for line, args, before in calls(fn):

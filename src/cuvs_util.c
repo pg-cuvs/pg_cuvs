@@ -20,6 +20,116 @@
 #include <time.h>     /* time(): legacy breaker wrappers */
 
 int
+cuvs_notice_decode(const char *wire, size_t len, CuvsNoticeBatch *out)
+{
+    const char *end, *p;
+    size_t bound = len < CUVS_NOTICE_OUT_BYTES ? len : CUVS_NOTICE_OUT_BYTES;
+    if (!out)
+        return -1;
+    memset(out, 0, sizeof(*out));
+    if (!wire || !bound || !(end = memchr(wire, '\0', bound)))
+        return -1;
+    if (end == wire)
+        return 0;
+    if ((size_t)(end - wire) < 3 || memcmp(wire, "N1:", 3) != 0)
+    {
+        memcpy(out->pairs[0].message, wire, (size_t)(end - wire));
+        out->count = 1;
+        return 0;
+    }
+    p = wire + 3;
+    if (p == end)
+        return -1;
+    while (p < end)
+    {
+        const char *record_end = memchr(p, '\036', (size_t)(end - p));
+        const char *sep;
+        size_t mlen, dlen;
+        if (!record_end)
+            record_end = end;
+        sep = memchr(p, '\037', (size_t)(record_end - p));
+        if (!sep || sep == p || out->count >= CUVS_NOTICE_MAX_PAIRS ||
+            memchr(sep + 1, '\037', (size_t)(record_end - sep - 1)))
+            return -1;
+        mlen = (size_t)(sep - p);
+        dlen = (size_t)(record_end - sep - 1);
+        memcpy(out->pairs[out->count].message, p, mlen);
+        memcpy(out->pairs[out->count].detail, sep + 1, dlen);
+        out->count++;
+        if (record_end == end)
+            break;
+        p = record_end + 1;
+        if (p == end)
+            return -1;
+    }
+    return 0;
+}
+
+static int
+notice_more(char *wire, size_t cap, uint32_t count)
+{
+    int n = snprintf(wire, cap, "(+%u more)", count);
+    if (n < 0 || (size_t)n >= cap)
+    {
+        if (cap)
+            wire[0] = '\0';
+        return -1;
+    }
+    return 1;
+}
+
+int
+cuvs_notice_append(char *wire, size_t cap, const char *message, const char *detail)
+{
+    CuvsNoticeBatch batch;
+    size_t used, required = 4;
+    const char *m = message ? message : "";
+    const char *d = detail ? detail : "";
+    if (!wire || !cap || !*m || strchr(m, '\036') || strchr(m, '\037') ||
+        strchr(d, '\036') || strchr(d, '\037'))
+        return -1;
+    if (cap > CUVS_NOTICE_OUT_BYTES)
+        cap = CUVS_NOTICE_OUT_BYTES;
+    if (cuvs_notice_decode(wire, cap, &batch) != 0)
+        return -1;
+    if (strncmp(wire, "(+", 2) == 0)
+    {
+        char *tail;
+        unsigned long count;
+        errno = 0;
+        count = strtoul(wire + 2, &tail, 10);
+        if (!errno && strcmp(tail, " more)") == 0)
+            return notice_more(wire, cap, count >= UINT32_MAX ? UINT32_MAX : (uint32_t)count + 1);
+    }
+    if (batch.count == CUVS_NOTICE_MAX_PAIRS ||
+        strlen(m) >= CUVS_NOTICE_OUT_BYTES || strlen(d) >= CUVS_NOTICE_OUT_BYTES)
+        return notice_more(wire, cap, batch.count + 1);
+    strcpy(batch.pairs[batch.count].message, m);
+    strcpy(batch.pairs[batch.count].detail, d);
+    batch.count++;
+    for (uint32_t i = 0; i < batch.count; i++)
+        required += strlen(batch.pairs[i].message) + 1 + strlen(batch.pairs[i].detail) + (i != 0);
+    if (required > cap)
+        return notice_more(wire, cap, batch.count);
+    memcpy(wire, "N1:", 3);
+    used = 3;
+    for (uint32_t i = 0; i < batch.count; i++)
+    {
+        size_t mlen = strlen(batch.pairs[i].message);
+        size_t dlen = strlen(batch.pairs[i].detail);
+        if (i)
+            wire[used++] = '\036';
+        memcpy(wire + used, batch.pairs[i].message, mlen);
+        used += mlen;
+        wire[used++] = '\037';
+        memcpy(wire + used, batch.pairs[i].detail, dlen);
+        used += dlen;
+    }
+    wire[used] = '\0';
+    return 0;
+}
+
+int
 cuvs_parse_rmm_pool_mb(const char *value, uint32_t *mb_out)
 {
     char *end;

@@ -467,6 +467,21 @@ typedef struct CuvsAdmissionFields {
     CuvsAdmissionCandidate cand[CUVS_ADMISSION_MAX_CANDIDATES];
 } CuvsAdmissionFields;
 
+/* NOTICE transport: N1:msg<US>detail<RS>..., at most three pairs.
+ * Plain legacy messages decode as one pair. len is the accessible byte count.
+ * append returns0,1 for (+N more), or-1 for malformed arguments.
+ * The daemon logs every full pair before append, including overflowed ones. */
+typedef struct CuvsNoticePair {
+    char message[CUVS_NOTICE_OUT_BYTES];
+    char detail[CUVS_NOTICE_OUT_BYTES];
+} CuvsNoticePair;
+typedef struct CuvsNoticeBatch {
+    uint32_t count;
+    CuvsNoticePair pairs[CUVS_NOTICE_MAX_PAIRS];
+} CuvsNoticeBatch;
+int cuvs_notice_decode(const char *wire, size_t len, CuvsNoticeBatch *out);
+int cuvs_notice_append(char *wire, size_t cap, const char *message, const char *detail);
+
 /* [admit] shape_class: "checked", "bracketed" or "extrapolated" (v5 C3;
  * gd/igd 0 mean the defaults 64/128; float32 is implied by the cagra AM). */
 const char *cuvs_build_shape_class(int64_t n, uint32_t dim, uint32_t metric,

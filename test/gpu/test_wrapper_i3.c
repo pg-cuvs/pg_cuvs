@@ -8,6 +8,7 @@
  * Usage: test_wrapper_i3 [n_rows]   (default 500000)
  */
 #include "cuvs_wrapper.h"
+#include "cuvs_lw_policy.h"
 #include "cuvs_ipc.h"
 
 #include <math.h>
@@ -43,7 +44,7 @@ build_and_check(const float *v, int64_t n, int dim, const char *tag)
     CuvsCagraIndex h;
 
     before = cuvs_vram_free_bytes_on(0);
-    h = cuvs_cagra_build(v, n, dim, CUVS_METRIC_L2, 32, 64, CUVS_CAGRA_BUILD_NN_DESCENT, 0);
+    h = cuvs_cagra_build(v, n, dim, CUVS_METRIC_L2, 32, 64, CUVS_CAGRA_BUILD_NN_DESCENT, 0, CUVS_LW_OVERFLOW_ERROR, NULL);
     snprintf(label, sizeof(label), "%s build", tag);
     CHECK(label, h != NULL);
     snprintf(label, sizeof(label), "%s no attach failure", tag);

@@ -440,11 +440,14 @@ build_cmd(uint32_t index_oid, uint32_t shard_count)
     return cmd;
 }
 
+static CuvsReplyHeader last_reply;
+
 static int
 reply_status(int fd)
 {
     CuvsReplyHeader hdr;
     if (recv(fd, &hdr, sizeof(hdr), MSG_WAITALL) != (ssize_t)sizeof(hdr)) return -1;
+    last_reply = hdr;
     return (int)hdr.status;
 }
 
@@ -541,17 +544,52 @@ test_callers(void)
     char notice[CUVS_ADMISSION_ERR_OUT_BYTES];
     CuvsLwBuildStats st;
 
+    snprintf(g_index_dir, sizeof(g_index_dir), "%s/idx", tmpdir);
     g_n_gpus = 2;
     g_max_vram_per_gpu[0] = g_max_vram_per_gpu[1] = (size_t)64 << 30;
     g_indexes = calloc((size_t)g_max_indexes, sizeof(IndexEntry));
     g_cold_indexes = calloc((size_t)g_max_indexes, sizeof(ColdIndexEntry));
     assert(g_indexes && g_cold_indexes);
 
+    /* Integration: both rejections must reach the real build handler before
+     * the wrapper, any reservation or eviction. Removing the hook turns these
+     * assertions RED, rather than merely testing the pure policy again. */
+    for (int overcommit = 0; overcommit <= 1; overcommit++)
+    {
+        CuvsAdmissionFields fields;
+        reset_knobs();
+        g_managed_overcommit = overcommit;
+        g_fixture_phys_free = 0;
+        g_fixture_host_guard = 0;
+        g_lw_host_guard_fn = fixture_host_guard;
+        cuvs_shim_lw_reset();
+        uint64_t evictions = g_cache_evictions[0] + g_cache_evictions[1];
+        CHECK(run_handle_build(90 + (uint32_t)overcommit, 1) == CUVS_STATUS_OOM_FALLBACK);
+        CHECK(cuvs_admission_decode(last_reply.err_out, sizeof(last_reply.err_out), &fields) == 0);
+        CHECK(fields.reason == (overcommit ? CUVS_ADMISSION_AR7 : CUVS_ADMISSION_AR6));
+        CHECK(cuvs_shim_lw_calls(CUVS_LW_OVERFLOW_MANAGED) == 0);
+        CHECK(g_n_indexes == 0);
+        CHECK(g_cache_evictions[0] + g_cache_evictions[1] == evictions);
+        CHECK(g_pending_rmm_build_vram[0] == 0 && g_lw_pending[0] == 0);
+    }
+
+    /* Successful callers have ample physical headroom; refusal boundaries
+     * are tested separately through the same admission caller. */
+    g_fixture_phys_free = (uint64_t)64 << 30;
+    g_fixture_host_guard = (uint64_t)64 << 30;
+    g_lw_host_guard_fn = fixture_host_guard;
+
     /* handle_build: the active policy reaches the wrapper; lw_pending returns. */
     reset_knobs();
     cuvs_shim_lw_reset();
     cuvs_shim_lw_set_peak(300 * MiB, 200 * MiB);           /* spill */
     CHECK(run_handle_build(101, 1) == CUVS_STATUS_OK);
+    {
+        CuvsNoticeBatch notices;
+        CHECK(cuvs_notice_decode(last_reply.notice_out, sizeof(last_reply.notice_out), &notices) == 0);
+        CHECK(notices.count == 1);
+        CHECK(strstr(notices.pairs[0].message, "build used managed memory spill") != NULL);
+    }
     CHECK(cuvs_shim_lw_calls(CUVS_LW_OVERFLOW_MANAGED) == 1);
     CHECK(cuvs_shim_lw_calls(CUVS_LW_OVERFLOW_ERROR) == 0);
     CHECK(g_lw_pending[0] == 0 && g_lw_pending[1] == 0);
@@ -617,6 +655,33 @@ test_callers(void)
     CHECK(status.lw_devices[0].managed_spill_bytes_max + status.lw_devices[1].managed_spill_bytes_max
           >= 300 * MiB);
     CHECK(status.lw_devices[0].lw_pending_bytes == 0 && status.lw_devices[1].lw_pending_bytes == 0);
+
+    /* A successful B eviction reaches the same requester reply channel,
+     * carrying the victim's own DB/OID (not the rebuilding index's OID). */
+    {
+        CuvsReplyHeader reply = {0};
+        CuvsNoticeBatch batch;
+        int persist_failed = 0;
+        pthread_mutex_lock(&g_index_mutex);
+        clear_build_notices();
+        IndexEntry *victim = find_index(1, 101);
+        CHECK(victim != NULL);
+        if (victim)
+            CHECK(evict_entry(victim, entry_home_gpu(victim), CUVS_EVICT_RELOAD,
+                              0, CUVS_RQ_LOAD, &persist_failed) > 0);
+        CHECK(persist_failed == 0);
+        attach_build_notices(&reply);
+        CHECK(cuvs_notice_decode(reply.notice_out, sizeof(reply.notice_out), &batch) == 0);
+        CHECK(batch.count == 1);
+        CHECK(strstr(batch.pairs[0].message, "evicted index 1:101") != NULL);
+        clear_build_notices();
+        /* A fresh request must not inherit the victim notice. */
+        memset(&reply, 0, sizeof(reply));
+        attach_build_notices(&reply);
+        CHECK(reply.notice_out[0] == '\0');
+        pthread_mutex_unlock(&g_index_mutex);
+    }
+
 }
 
 int

@@ -2645,7 +2645,9 @@ ipc_header_only(const char *socket_path, CuvsCmdFrame *cmd, char *msg,
 {
     CuvsReplyHeader hdr;
     int rc = CUVS_STATUS_ERROR;
-    int sock = uds_connect_ex(socket_path, 30);
+    int sock;
+    forget_reply();
+    sock = uds_connect_ex(socket_path, 30);
 
     if (msg && msglen)
         msg[0] = '\0';
@@ -2653,6 +2655,7 @@ ipc_header_only(const char *socket_path, CuvsCmdFrame *cmd, char *msg,
         return CUVS_STATUS_UNAVAILABLE;
     if (send_cmd(sock, cmd) == 0 && recv_all(sock, &hdr, sizeof(hdr)) == 0)
     {
+        remember_reply(&hdr);
         rc = (int) hdr.status;
         if (msg && msglen)
         {

@@ -7,6 +7,7 @@ mutation. The daemon fixture needs Linux (memfd, /proc, shm); run this inside
 the CPU CI container as a non-root user so the EACCES branch is real.
 """
 import os
+import json
 import shutil
 import subprocess
 import sys
@@ -108,12 +109,12 @@ MUTATIONS = {
         '                                            cmd->build_algo, dev,\n'
         '                                            g_cagra_build_overflow, NULL);')], {'daemon'}),
     'build_drops_policy': (SERVER, [(
-        '    uint32_t lw_policy = g_cagra_build_overflow;\n    uint64_t lw_ub = lw_ub_for_build(cmd->n_vecs',
-        '    uint32_t lw_policy = CUVS_LW_OVERFLOW_ERROR;\n    uint64_t lw_ub = lw_ub_for_build(cmd->n_vecs')],
+        '    uint32_t lw_policy = g_cagra_build_overflow;\n    uint64_t lw_ub = al.workspace.lw_ub;',
+        '    uint32_t lw_policy = CUVS_LW_OVERFLOW_ERROR;\n    uint64_t lw_ub = al.workspace.lw_ub;')],
         {'daemon'}),
     'build_multi_drops_policy': (SERVER, [(
-        '        uint32_t lw_policy = g_cagra_build_overflow;\n        uint64_t lw_ub = lw_ub_for_build(total',
-        '        uint32_t lw_policy = CUVS_LW_OVERFLOW_ERROR;\n        uint64_t lw_ub = lw_ub_for_build(total')],
+        '        uint32_t lw_policy = g_cagra_build_overflow;\n        uint64_t lw_ub = al.workspace.lw_ub;',
+        '        uint32_t lw_policy = CUVS_LW_OVERFLOW_ERROR;\n        uint64_t lw_ub = al.workspace.lw_ub;')],
         {'daemon'}),
     # CK-3b
     'lw_pending_not_subtracted': (SERVER, [(
@@ -190,7 +191,10 @@ def run(argv, cwd):
         q = subprocess.run(argv, cwd=cwd, capture_output=True, text=True, timeout=120)
     except subprocess.TimeoutExpired:
         return 124, 'FAIL timeout after 120 s'
-    return q.returncode, q.stdout + q.stderr
+    text = q.stdout + q.stderr
+    with (Path(cwd) / 'COMMANDS.jsonl').open('a') as log:
+        log.write(json.dumps({'argv': argv, 'exit': q.returncode, 'output': text}) + '\n')
+    return q.returncode, text
 
 
 def build_and_run(tree):
@@ -207,7 +211,7 @@ def build_and_run(tree):
         jobs['server'] = [CC, '-std=gnu11', '-O1', '-DPGCUVS_CPU_SHIM', '-D_POSIX_C_SOURCE=200809L',
                           '-I', 'src', 'src/pg_cuvs_server.c', 'src/cuvs_ipc.c', 'src/cuvs_util.c',
                           'src/cuvs_objstore.c', 'src/cuvs_build_corpus.c',
-                          'src/cuvs_wrapper_shim_cpu.c', '-lm', '-lpthread', '-lrt', '-lcurl',
+                          'src/cuvs_wrapper_shim_cpu.c', 'src/cuvs_cache_policy.c', 'src/cuvs_peak_meter.c', '-lm', '-lpthread', '-lrt', '-lcurl',
                           '-lssl', '-lcrypto', '-o', 'bin-server']
         jobs['startup'] = [CC, '-std=gnu11', '-Wall', '-Wextra', '-I', 'src', '-o', 'bin-startup',
                            'test/unit/test_lw_startup.c', 'src/cuvs_ipc.c', 'src/cuvs_util.c',
@@ -216,7 +220,7 @@ def build_and_run(tree):
                           '-fdata-sections', '-I', 'src', '-o', 'bin-daemon',
                           'test/unit/test_lw_daemon.c', 'src/cuvs_ipc.c', 'src/cuvs_util.c',
                           'src/cuvs_objstore.c', 'src/cuvs_build_corpus.c',
-                          'src/cuvs_wrapper_shim_cpu.c', '-Wl,--gc-sections', '-lm', '-lpthread',
+                          'src/cuvs_wrapper_shim_cpu.c', 'src/cuvs_cache_policy.c', 'src/cuvs_peak_meter.c', '-Wl,--gc-sections', '-lm', '-lpthread',
                           '-lrt', '-lcurl', '-lssl', '-lcrypto']
     for name, argv in jobs.items():
         if name == 'docs':   # a check, not a build
@@ -242,7 +246,8 @@ def build_and_run(tree):
 
 def copy_tree(dest):
     dest.mkdir(parents=True)
-    shutil.copytree(ROOT / 'src', dest / 'src')
+    shutil.copytree(ROOT / 'src', dest / 'src',
+                    ignore=shutil.ignore_patterns('*.o', '*.bc', '*.so', '__pycache__'))
     shutil.copytree(ROOT / 'test' / 'unit', dest / 'test' / 'unit')
     (dest / 'docs').mkdir()
     shutil.copy2(ROOT / 'docs' / 'reference.md', dest / 'docs' / 'reference.md')

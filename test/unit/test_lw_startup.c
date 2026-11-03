@@ -159,6 +159,12 @@ main(int argc, char **argv)
              (int)CUVS_MANAGED_LW_MARGIN_PERMILLE_DEFAULT);
     CHECK(strstr(slurp(r.log), line) != NULL);
     CHECK(strstr(slurp(r.log), expect) != NULL);
+    CHECK(strstr(slurp(r.log), "build admission model: scratch_permille=") != NULL);
+    CHECK(strstr(slurp(r.log), "validated_overflow_policy=error") != NULL);
+    CHECK(strstr(slurp(r.log), "overflow=managed overcommit=on") != NULL);
+    CHECK(strstr(slurp(r.log), "dedicated_stream=on peak_meter=on") != NULL);
+    CHECK(strstr(slurp(r.log), "evict_min_idle_s=600 evict_hit_bonus_s=30 evict_hit_cap=20") != NULL);
+    CHECK(strstr(slurp(r.log), "recalibrate scratch_permille for the active policy") != NULL);
     expect_status(&r, CUVS_CAGRA_BUILD_OVERFLOW_DEFAULT, CUVS_MANAGED_OVERCOMMIT_DEFAULT,
                   CUVS_MANAGED_LW_MARGIN_PERMILLE_DEFAULT, CUVS_OOM_SCORE_ADJ_DEFAULT,
                   CUVS_OOM_SCORE_ADJ_DEFAULT, expect);

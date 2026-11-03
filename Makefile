@@ -279,7 +279,7 @@ TEST_RT_LIB := $(shell [ "$$(uname -s)" = "Linux" ] && echo -lrt)
 test-unit: test/unit/test_cuvs_util.c src/cuvs_util.c src/cuvs_util.h src/cuvs_ipc.h \
            test/unit/test_build_corpus.c src/cuvs_build_corpus.c src/cuvs_build_corpus.h \
            test-hnsw-build test-hnsw-build-ipc test-hnsw-admission test-admission-contract \
-           test-admission-wire test-admission-message test-admission-ipc test-build-oom-thread test-cache-policy test-circuit-source test-status-text test-i3b-source test-peak-meter test-lw-policy test-lw-guard
+           test-i3-logs test-notice-wire test-admission-wire test-admission-message test-admission-ipc test-build-oom-thread test-cache-policy test-circuit-source test-status-text test-i3b-source test-peak-meter test-lw-policy test-lw-guard
 	$(CC) -I src -DCUVS_TEST_HOOKS -o test-unit test/unit/test_cuvs_util.c src/cuvs_util.c $(TEST_RT_LIB)
 	./test-unit
 	$(CC) -I src -o test-build-corpus test/unit/test_build_corpus.c src/cuvs_build_corpus.c $(TEST_RT_LIB)
@@ -342,6 +342,19 @@ test-admission-contract: test/unit/test_admission_contract.c src/cuvs_admission_
 # Sanitizers for the admission codec/message tests (CK-29 boundary). Set
 # ADMISSION_TEST_SAN= on toolchains without libasan (e.g. musl).
 ADMISSION_TEST_SAN ?= -fsanitize=address,undefined -fno-sanitize-recover=undefined
+
+# Integrated NOTICE channel boundary and message/DETAIL transport (CK-29).
+test-i3-logs: test/unit/check_i3_logs.py test/unit/test_i3_logs.py
+	python3 -I -B test/unit/test_i3_logs.py
+
+.PHONY: test-i3-logs
+test-notice-wire: test/unit/test_notice_wire.c src/cuvs_util.c src/cuvs_util.h src/cuvs_admission_contract.h
+	$(CC) -std=c11 -g -Wall -Wextra -Werror $(ADMISSION_TEST_SAN) -I src \
+		-o $@ test/unit/test_notice_wire.c src/cuvs_util.c $(TEST_RT_LIB)
+	./$@
+
+EXTRA_CLEAN += test-notice-wire
+.PHONY: test-notice-wire
 
 # err_out payload codec (C5, CK-29); ASAN/UBSan for the 511/512/513 B boundary.
 test-admission-wire: test/unit/test_admission_wire.c src/cuvs_admission_contract.h \
@@ -904,6 +917,7 @@ test-lw-daemon:
 	$(CC) -std=gnu11 -O1 -DPGCUVS_CPU_SHIM -ffunction-sections -fdata-sections -I src \
 		test/unit/test_lw_daemon.c src/cuvs_ipc.c src/cuvs_util.c \
 		src/cuvs_objstore.c src/cuvs_build_corpus.c src/cuvs_wrapper_shim_cpu.c \
+		src/cuvs_cache_policy.c src/cuvs_peak_meter.c \
 		-Wl,--gc-sections -lm -lpthread -lrt -lcurl -lssl -lcrypto -o test-lw-daemon
 	./test-lw-daemon
 
@@ -913,7 +927,8 @@ test-lw-daemon:
 EXTRA_CLEAN += test-lw-startup test-lw-startup-server
 .PHONY: test-lw-startup
 LW_SHIM_DAEMON_SRCS = src/pg_cuvs_server.c src/cuvs_ipc.c src/cuvs_util.c src/cuvs_objstore.c \
-                      src/cuvs_build_corpus.c src/cuvs_wrapper_shim_cpu.c
+                      src/cuvs_build_corpus.c src/cuvs_wrapper_shim_cpu.c \
+                      src/cuvs_cache_policy.c src/cuvs_peak_meter.c
 test-lw-startup:
 	$(CC) -std=gnu11 -O1 -DPGCUVS_CPU_SHIM -D_POSIX_C_SOURCE=200809L -I src $(LW_SHIM_DAEMON_SRCS) \
 		-lm -lpthread -lrt -lcurl -lssl -lcrypto -o test-lw-startup-server
