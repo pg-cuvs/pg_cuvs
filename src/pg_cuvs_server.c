@@ -9254,7 +9254,7 @@ handle_hnsw_route_preflight(int client_fd)
     reply.n_estimate = request.n_estimate;
     snprintf(reply.index_dir, sizeof(reply.index_dir), "%s", g_index_dir);
     if (request.version != CUVS_HNSW_PREFLIGHT_VERSION || request.hierarchy > 1
-        || !request.host_budget || !request.n_estimate
+        || request.after_scan > 1 || !request.host_budget || !request.n_estimate
         || request.n_estimate > CUVS_TIDS_MAX_VECS || !request.dim
         || request.dim > CUVS_VECTORS_MAX_DIM)
     {
@@ -9289,7 +9289,7 @@ handle_hnsw_route_preflight(int client_fd)
         (void)cuvs_hnsw_forecast_disk(&f, reply.disk_regular, avail,
             reply.header.error, sizeof(reply.header.error));
     }
-    hnsw_route_log("prespool", request.build_algo, &f, reply.header.error);
+    hnsw_route_log(request.after_scan ? "postscan" : "prespool", request.build_algo, &f, reply.header.error);
     reply.header.status = f.status;
     reply.route = f.status == CUVS_STATUS_OK ? f.decision.route : 0;
     reply.partitions = f.decision.partitions;
