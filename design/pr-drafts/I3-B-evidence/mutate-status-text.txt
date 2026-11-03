@@ -21,4 +21,5 @@ RED d9 SQL drops the pg_monitor grant [scan] | FAIL GRANTs differ from memory_st
 RED d10 regclass ops skip ownership [scan] | FAIL pg_cuvs_unload does not reach the index ownership check
 RED d11 memory_status skips the privilege check [scan] | FAIL pg_cuvs_memory_status does not reject non-privileged callers
 RED d12 install and upgrade blocks diverge [scan] | FAIL I3-B block differs between pg_cuvs--0.9.0.sql and pg_cuvs--0.8.2--0.9.0.sql
-mutate_status_text: 21 mutations, 0 problem(s)
+RED d13 loose statement outside the I3-B block [scan] | FAIL statement outside the I3-B block: 'SELECT 1;'
+mutate_status_text: 22 mutations, 0 problem(s)

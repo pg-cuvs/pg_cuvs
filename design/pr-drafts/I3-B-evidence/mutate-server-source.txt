@@ -1,11 +1,17 @@
 baseline: check_i3b_server_source: OK
 RED  startup loads as LOAD: FAIL CK-36 (a): load_index(CUVS_RQ_LOAD_STARTUP) call sites 0, expected 1: None
 RED  warmup loads as LOAD: FAIL CK-36 (a): load_index(CUVS_RQ_LOAD_WARMUP) call sites 0, expected 1: None
-RED  search reload as LOAD_STARTUP: FAIL CK-36 (a): load_index(CUVS_RQ_LOAD_STARTUP) call sites 2, expected 1: [1968, 3111]
-RED  requester dropped from a call: FAIL CK-36 (a): ensure_vram() at line 5392 has 2 args (requester missing?)
+RED  search reload as LOAD_STARTUP: FAIL CK-36 (a): load_index(CUVS_RQ_LOAD_STARTUP) call sites 2, expected 1: [1968, 3126]
+RED  requester dropped from a call: FAIL CK-36 (a): ensure_vram() at line 5407 has 2 args (requester missing?)
 RED  EXTEND keeps file_current: FAIL CK-37 (a): handle_extend assigns graph/tids/n_vecs/n_extended but never sets file_current
 RED  save_index does not set file_current: FAIL CK-37 (a): save_index success does not set file_current
 RED  REINDEX branch skips file_current: FAIL CK-37 (a): finish_build_commit does not set file_current = 1 on both the REINDEX and the new-entry branch
 RED  load sets file_current before reset: FAIL CK-37 (a): load_index does not set file_current after reset_entry_stats
+RED  S6: IVF-PQ build admits as LOAD: FAIL CK-36 (b): handle_build_ivfpq calls ensure_vram() with CUVS_RQ_LOAD, expected CUVS_RQ_BUILD_IVFPQ
+RED  S7: shard build admits as LOAD: FAIL CK-36 (b): build_sharded calls ensure_vram() with CUVS_RQ_LOAD, expected CUVS_RQ_BUILD_SHARD
+RED  S8: CAGRA slot as LOAD: FAIL CK-36 (b): finish_build_commit calls make_slot() with CUVS_RQ_LOAD, expected CUVS_RQ_BUILD_CAGRA
+RED  S10: OOM retry as LOAD: FAIL CK-36 (b): handle_build calls evict_lru() with CUVS_RQ_LOAD, expected CUVS_RQ_BUILD_CAGRA
+RED  flat slot as LOAD: FAIL CK-36 (b): handle_build_flat calls make_slot() with CUVS_RQ_LOAD, expected CUVS_RQ_BUILD_FLAT
+RED  multi OOM retry removed: FAIL CK-36 (b): handle_build_multi has no evict_lru() call (expected requester CUVS_RQ_BUILD_CAGRA)
 RED  second skip site: FAIL CK-37 (a): graceful_shutdown reads file_current (SIGTERM must always save)
-mutations: 9, survived/invalid: 0
+mutations: 15, survived/invalid: 0

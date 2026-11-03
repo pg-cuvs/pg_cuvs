@@ -1,0 +1,8 @@
+RED         [review BLOCK 2] S1 self-replace NOTICE wording replaced: ['FAIL self-replace NOTICE and DETAIL exact (need 10240000, free 5734400)']
+RED         [review BLOCK 2] S1c NOTICE free number wrong: ['FAIL self-replace NOTICE and DETAIL exact (need 10240000, free 5734400)']
+RED         [review BLOCK 2] S2 failure NOTICE removed: ['FAIL self-replace then build failure: failure NOTICE exact']
+RED         [review BLOCK 4] S6 IVF-PQ build admits as LOAD: ['FAIL IVF-PQ build that does not fit evicts nothing (BUILD_IVFPQ, scope none)']
+RED         [review BLOCK 4] S7 shard build admits as LOAD: ['FAIL sharded build that does not fit evicts nothing (BUILD_SHARD)']
+RED         [review BLOCK 4] S8 CAGRA registry slot as LOAD: ['FAIL build at the registry cap evicts nothing; saved, not resident']
+RED         [review BLOCK 4] S10 post-admission OOM retry as LOAD: ['FAIL post-admission build OOM evicts nothing (retry loop is BUILD_CAGRA)', 'FAIL self-replace then build failure: failure NOTICE exact']
+mutations: 7, survived/invalid: 0
