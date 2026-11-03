@@ -2819,6 +2819,11 @@ cuvs_build_hnsw_from_heap(Relation heapRel, Relation indexRel, IndexInfo *indexI
             if (rc == CUVS_STATUS_HNSW_RESIDENT_BUDGET_EXCEEDED)
                 cuvs_hnsw_budget_error(build_algo, error, "by the build after the heap scan");
             if (rc == CUVS_STATUS_CANCELED) CHECK_FOR_INTERRUPTS();
+            if (rc == CUVS_STATUS_OOM_FALLBACK) /* v6 C2: allocation failure after admission */
+                ereport(ERROR, (errcode(ERRCODE_OUT_OF_MEMORY), /* 53200 */
+                    errmsg("pg_cuvs: memory exhausted during the HNSW build; CREATE INDEX aborted. No resident index was evicted"),
+                    errdetail("%s", error),
+                    errhint("%s", cuvs_hnsw_oom_hint(build_algo))));
             if (rc != CUVS_STATUS_OK)
                 ereport(ERROR, (errmsg("pg_cuvs: temporary HNSW build failed (status %d): %s", rc, error)));
             out->policy.route_flags |= cuvs_hnsw_timing_flags(stats_rows, prespool);

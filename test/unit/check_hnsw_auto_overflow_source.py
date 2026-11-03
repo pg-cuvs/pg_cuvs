@@ -61,6 +61,10 @@ def check(src):
     # every receipt path calls the resolver with the daemon flag
     pub = function(code['wrapper'], 'cuvs_hnsw_build_file(int vectors_fd')
     assert 'params->build_algo, params->auto_overflow, &cap,' in pub, 'WRAPPER_PASSES_FLAG'
+    # v6 C2: bad_alloc (incl. RMM out_of_memory) -> status 2 before the generic catch
+    full = code['wrapper'][code['wrapper'].index('cuvs_hnsw_build_file(int vectors_fd'):]
+    ba = full.index('catch (const std::bad_alloc &e)'); ex = full.index('catch (const std::exception &e)')
+    assert ba < ex and 'return CUVS_STATUS_OOM_FALLBACK;' in full[ba:ex], 'HNSW_BAD_ALLOC_IS_STATUS_2'
     # --- daemon order (ADR-087 decision 4) ---------------------------------
     h = function(code['server'], 'handle_build_hnsw_file(int client_fd')
     ordered(h, ['cuvs_hnsw_wait_for_idle(', 'params.gpu_budget = hnsw_gpu_budget(device, 1);',
@@ -83,6 +87,10 @@ def check(src):
     notices = b.split('cuvs_hnsw_build_notices(', 1)[1]
     assert 'notices & CUVS_HNSW_NOTICE_TRANSITION' in notices and 'cuvs_hnsw_transition_notice(' in notices, 'POST_TRANSITION_NOTICE'
     assert 'auto selected ACE-disk' in notices.split('CUVS_HNSW_NOTICE_AUTO_COMPLETION', 1)[1].split(';', 1)[0] + notices, 'COMPLETION_NOTICE'
+    oom = b.split('if (rc == CUVS_STATUS_OOM_FALLBACK)', 1)
+    seg = oom[1].split('if (rc != CUVS_STATUS_OK)', 1)[0] if len(oom) == 2 else ''
+    assert 'errcode(ERRCODE_OUT_OF_MEMORY)' in seg and 'cuvs_hnsw_oom_hint(build_algo)' in seg, 'HNSW_OOM_53200'
+    assert b.index('if (rc == CUVS_STATUS_OOM_FALLBACK)') < b.index('if (rc != CUVS_STATUS_OK)'), 'HNSW_OOM_BEFORE_GENERIC'
     p = function(code['backend'], 'cuvs_hnsw_preflight(double rows')
     assert 'action == CUVS_HNSW_PRESPOOL_NOTICE_OVERFLOW' in p and 'cuvs_hnsw_transition_notice(' in p.split('CUVS_HNSW_PRESPOOL_NOTICE_OVERFLOW)', 1)[1], 'PN1_NOTICE'
     t = function(code['backend'], 'cuvs_hnsw_transition_notice(uint64_t host_est')
@@ -121,6 +129,12 @@ MUTANTS = [
      'out->policy.route_flags |= cuvs_hnsw_timing_flags(0, prespool);'),
     ('after_scan_reason_from_row_count', 'backend',
      'cuvs_hnsw_after_scan_reason(stats_rows),', 'cuvs_prespool_rows(stats_rows) ? "pre-scan forecast unavailable" : "no table statistics",'),
+    ('hnsw_bad_alloc_generic', 'wrapper',
+     '        return CUVS_STATUS_OOM_FALLBACK;\n    }\n    catch (const std::exception &e)',
+     '        return CUVS_STATUS_BUILD_FAILED;\n    }\n    catch (const std::exception &e)'),
+    ('hnsw_oom_not_53200', 'backend',
+     '            if (rc == CUVS_STATUS_OOM_FALLBACK) /* v6 C2: allocation failure after admission */',
+     '            if (0) /* v6 C2: allocation failure after admission */'),
     ('cagra_ar0_after_scan', 'backend',
      '            && cuvs_cagra_prespool_ar0(reltuples_est,', '            && 0 && (reltuples_est,'),
 ]

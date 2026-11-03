@@ -322,6 +322,16 @@ static void test_cagra_ar0(void)
     CHECK(cuvs_prespool_mib(UINT64_MAX / 2) == CUVS_ADMISSION_SCALAR_MAX);
 }
 
+/* v6 C2: HNSW allocation failure after admission -> status 2 -> 53200 hints. */
+static void test_hnsw_oom_hint(void)
+{
+    CHECK(strstr(cuvs_hnsw_oom_hint(CUVS_HNSW_ALGO_AUTO), "build_algo='ace'"));
+    CHECK(strstr(cuvs_hnsw_oom_hint(CUVS_HNSW_ALGO_IVF_PQ), "cuvs.max_build_mem_mb")
+          && strstr(cuvs_hnsw_oom_hint(CUVS_HNSW_ALGO_IVF_PQ), "build_algo='ace'"));
+    CHECK(!strstr(cuvs_hnsw_oom_hint(CUVS_HNSW_ALGO_ACE), "build_algo='ace'"));
+    CHECK(CUVS_STATUS_OOM_FALLBACK == 2);
+}
+
 int main(void)
 {
     /* First, so its mutants are attributed to the direct regression itself. */
@@ -332,6 +342,7 @@ int main(void)
     test_invariant_notices();
     test_prespool_and_fallback();
     test_cagra_ar0();
+    test_hnsw_oom_hint();
     printf("PASS %u CK-17 (12)-(14) CPU checks: default ace + knob, single overflow branch receipts/NOTICEs, pre-spool/fallback, disk precheck, CAGRA reltuples AR0; SDK/GPU/PG not run\n", checks);
     return 0;
 }
