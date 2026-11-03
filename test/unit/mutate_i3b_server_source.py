@@ -16,6 +16,18 @@ M = [
     ("REINDEX branch skips file_current", "        existing->file_current = strcmp(save_dir, g_index_dir) == 0;\n", ""),
     ("load sets file_current before reset", "    reset_entry_stats(e);\n    /* I3-B defect 3",
      "    e->file_current = handle != NULL;\n    reset_entry_stats(e);\n    /* I3-B defect 3"),
+    ("S6: IVF-PQ build admits as LOAD", "    int admit_rc = ensure_vram(needed, target_gpu, CUVS_RQ_BUILD_IVFPQ);",
+     "    int admit_rc = ensure_vram(needed, target_gpu, CUVS_RQ_LOAD);"),
+    ("S7: shard build admits as LOAD", "        if (ensure_vram(needed, dev, CUVS_RQ_BUILD_SHARD) != 0)",
+     "        if (ensure_vram(needed, dev, CUVS_RQ_LOAD) != 0)"),
+    ("S8: CAGRA slot as LOAD", "            (void) make_slot(target_gpu, CUVS_RQ_BUILD_CAGRA);",
+     "            (void) make_slot(target_gpu, CUVS_RQ_LOAD);"),
+    ("S10: OOM retry as LOAD", "            freed = evict_lru(target_gpu, CUVS_RQ_BUILD_CAGRA);\n            pthread_mutex_unlock(&g_index_mutex);",
+     "            freed = evict_lru(target_gpu, CUVS_RQ_LOAD);\n            pthread_mutex_unlock(&g_index_mutex);"),
+    ("flat slot as LOAD", "                (void) make_slot(fgpu, CUVS_RQ_BUILD_FLAT);",
+     "                (void) make_slot(fgpu, CUVS_RQ_LOAD);"),
+    ("multi OOM retry removed", "                freed = evict_lru(target_gpu, CUVS_RQ_BUILD_CAGRA);",
+     "                freed = 0;"),
     ("second skip site", "graceful_shutdown(void)\n{", "graceful_shutdown(void)\n{\n    if (!g_indexes[0].file_current) {}"),
 ]
 orig = open(SRC).read()
