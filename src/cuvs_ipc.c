@@ -214,6 +214,24 @@ send_all(int fd, const void *buf, size_t len)
     return 0;
 }
 
+/* Every client-side reply header is read through these two, so per-reply
+ * bookkeeping has a single home. Same return contract as recv_all and
+ * recv_all_interruptible. */
+static int recv_all(int fd, void *buf, size_t len);
+static int recv_all_interruptible(int fd, void *buf, size_t len, int timeout_sec);
+
+static int
+recv_reply(int fd, CuvsReplyHeader *hdr)
+{
+    return recv_all(fd, hdr, sizeof(*hdr));
+}
+
+static int
+recv_reply_interruptible(int fd, CuvsReplyHeader *hdr, int timeout_sec)
+{
+    return recv_all_interruptible(fd, hdr, sizeof(*hdr), timeout_sec);
+}
+
 /*
  * #77: stamp the protocol identity, then send the command frame. Every
  * CuvsCmdFrame leaves the backend through here, so a newly added op cannot
@@ -572,7 +590,7 @@ cuvs_ipc_search(
      * its per-connection thread cleans up; the backend raises the interrupt. */
     CuvsReplyHeader hdr;
     {
-        int wr = recv_all_interruptible(sock, &hdr, sizeof(hdr), 30 /* sec budget */);
+        int wr = recv_reply_interruptible(sock, &hdr, 30 /* sec budget */);
         if (wr == 1) { rc = CUVS_STATUS_CANCELED; goto cleanup; }
         if (wr < 0)  goto cleanup;
     }
@@ -789,7 +807,7 @@ cuvs_ipc_stats(
         goto cleanup;
 
     CuvsReplyHeader hdr;
-    if (recv_all(sock, &hdr, sizeof(hdr)) < 0)
+    if (recv_reply(sock, &hdr) < 0)
         goto cleanup;
 
     rc = (int)hdr.status;
@@ -842,7 +860,7 @@ cuvs_ipc_cache_stats(const char *socket_path, CuvsCacheStats *out,
 
     rc = CUVS_STATUS_ERROR;
     if (send_cmd(sock, &cmd) == 0
-        && recv_all(sock, &hdr, sizeof(hdr)) == 0)
+        && recv_reply(sock, &hdr) == 0)
     {
         rc = (int) hdr.status;
         if (hdr.status == CUVS_STATUS_OK && hdr.n_results > 0)
@@ -875,7 +893,7 @@ cuvs_ipc_server_settings(const char *socket_path, CuvsServerSettings *out)
     CuvsReplyHeader hdr;
     if (sock < 0)
         return CUVS_STATUS_UNAVAILABLE;
-    if (send_cmd(sock, &cmd) == 0 && recv_all(sock, &hdr, sizeof(hdr)) == 0)
+    if (send_cmd(sock, &cmd) == 0 && recv_reply(sock, &hdr) == 0)
     {
         rc = (int) hdr.status;
         if (rc == CUVS_STATUS_OK &&
@@ -896,7 +914,7 @@ cuvs_ipc_rmm_pool_status(const char *socket_path, CuvsRmmPoolStatus *out)
     if (sock < 0)
         return CUVS_STATUS_UNAVAILABLE;
     memset(out, 0, sizeof(*out));
-    if (send_cmd(sock, &cmd) == 0 && recv_all(sock, &hdr, sizeof(hdr)) == 0)
+    if (send_cmd(sock, &cmd) == 0 && recv_reply(sock, &hdr) == 0)
     {
         rc = (int)hdr.status;
         if (rc == CUVS_STATUS_OK &&
@@ -936,7 +954,7 @@ cuvs_ipc_shard_stats(const char *socket_path, uint32_t db_oid,
         goto cleanup;
 
     CuvsReplyHeader hdr;
-    if (recv_all(sock, &hdr, sizeof(hdr)) < 0)
+    if (recv_reply(sock, &hdr) < 0)
         goto cleanup;
 
     rc = (int)hdr.status;
@@ -986,7 +1004,7 @@ cuvs_ipc_mark_stale(const char *socket_path, uint32_t db_oid, uint32_t index_oid
 
     rc = CUVS_STATUS_ERROR;
     if (send_cmd(sock, &cmd) == 0
-        && recv_all(sock, &hdr, sizeof(hdr)) == 0)
+        && recv_reply(sock, &hdr) == 0)
         rc = (int) hdr.status;
 
     close(sock);
@@ -1014,7 +1032,7 @@ cuvs_ipc_drop(const char *socket_path, uint32_t db_oid, uint32_t index_oid)
 
     rc = CUVS_STATUS_ERROR;
     if (send_cmd(sock, &cmd) == 0
-        && recv_all(sock, &hdr, sizeof(hdr)) == 0)
+        && recv_reply(sock, &hdr) == 0)
         rc = (int) hdr.status;
 
     close(sock);
@@ -1113,7 +1131,7 @@ cuvs_ipc_build(
     if (cuvs_fd_send(sock, pass_fd, dir_buf, sizeof(dir_buf)) < 0)
         goto cleanup;
 
-    if (recv_all(sock, &hdr, sizeof(hdr)) < 0)
+    if (recv_reply(sock, &hdr) < 0)
         goto cleanup;
 
     rc = (int)hdr.status;
@@ -1217,7 +1235,7 @@ cuvs_ipc_build_flat(
     if (cuvs_fd_send(sock, pass_fd, dir_buf, sizeof(dir_buf)) < 0)
         goto cleanup;
 
-    if (recv_all(sock, &hdr, sizeof(hdr)) < 0)
+    if (recv_reply(sock, &hdr) < 0)
         goto cleanup;
 
     rc = (int)hdr.status;
@@ -1313,7 +1331,7 @@ cuvs_ipc_build_multi(
     if (send_all(sock, partials, (size_t)n_partials * sizeof(CuvsPartialDesc)) < 0)
         goto cleanup;
 
-    if (recv_all(sock, &hdr, sizeof(hdr)) < 0)
+    if (recv_reply(sock, &hdr) < 0)
         goto cleanup;
 
     rc = (int)hdr.status;
@@ -1632,7 +1650,7 @@ cuvs_ipc_search_filtered(
 
     CuvsReplyHeader hdr;
     {
-        int wr = recv_all_interruptible(sock, &hdr, sizeof(hdr), 30);
+        int wr = recv_reply_interruptible(sock, &hdr, 30);
         if (wr == 1) { rc = CUVS_STATUS_CANCELED; goto cleanup; }
         if (wr < 0)  goto cleanup;
     }
@@ -1779,7 +1797,7 @@ cuvs_ipc_search_stream_bf(
 
     CuvsReplyHeader hdr;
     {
-        int wr = recv_all_interruptible(sock, &hdr, sizeof(hdr), 30);
+        int wr = recv_reply_interruptible(sock, &hdr, 30);
         if (wr == 1) { rc = CUVS_STATUS_CANCELED; goto cleanup; }
         if (wr < 0)  goto cleanup;
     }
@@ -1932,7 +1950,7 @@ cuvs_ipc_search_bf_transient(
 
     CuvsReplyHeader hdr;
     {
-        int wr = recv_all_interruptible(sock, &hdr, sizeof(hdr), 30);
+        int wr = recv_reply_interruptible(sock, &hdr, 30);
         if (wr == 1) { rc = CUVS_STATUS_CANCELED; goto cleanup; }
         if (wr < 0)  goto cleanup;
     }
@@ -2053,7 +2071,7 @@ cuvs_ipc_build_ivfpq(
     if (cuvs_fd_send(sock, -1, dir_buf, sizeof(dir_buf)) < 0)
         goto cleanup;
 
-    if (recv_all(sock, &hdr, sizeof(hdr)) < 0)
+    if (recv_reply(sock, &hdr) < 0)
         goto cleanup;
 
     rc = (int)hdr.status;
@@ -2124,7 +2142,7 @@ cuvs_ipc_search_ivfpq(
 
     CuvsReplyHeader hdr;
     {
-        int wr = recv_all_interruptible(sock, &hdr, sizeof(hdr), 30);
+        int wr = recv_reply_interruptible(sock, &hdr, 30);
         if (wr == 1) { rc = CUVS_STATUS_CANCELED; goto cleanup; }
         if (wr < 0)  goto cleanup;
     }
@@ -2228,7 +2246,7 @@ cuvs_ipc_extend(
     if (cuvs_fd_send(sock, -1, dir_buf, sizeof(dir_buf)) < 0)
         goto cleanup;
 
-    if (recv_all(sock, &hdr, sizeof(hdr)) < 0)
+    if (recv_reply(sock, &hdr) < 0)
         goto cleanup;
 
     rc = (int)hdr.status;
@@ -2279,7 +2297,7 @@ cuvs_ipc_compact(
     if (cuvs_fd_send(sock, -1, dir_buf, sizeof(dir_buf)) < 0)
         goto cleanup;
 
-    if (recv_all(sock, &hdr, sizeof(hdr)) < 0)
+    if (recv_reply(sock, &hdr) < 0)
         goto cleanup;
 
     rc = (int)hdr.status;
@@ -2312,7 +2330,7 @@ cuvs_ipc_set_vram_budget(const char *socket_path, int64_t budget_bytes)
     cmd.n_vecs = budget_bytes;
 
     if (send_cmd(sock, &cmd) >= 0 &&
-        recv_all(sock, &hdr, sizeof(hdr)) >= 0)
+        recv_reply(sock, &hdr) >= 0)
         rc = (int)hdr.status;
 
     close(sock);
@@ -2347,7 +2365,7 @@ cuvs_ipc_eat_vram(const char *socket_path, int64_t leave_bytes, int device_id)
     cmd.dim    = (uint32_t)device_id;
 
     if (send_cmd(sock, &cmd) >= 0 &&
-        recv_all(sock, &hdr, sizeof(hdr)) >= 0)
+        recv_reply(sock, &hdr) >= 0)
         rc = (int)hdr.status;
 
     close(sock);
@@ -2371,7 +2389,7 @@ cuvs_ipc_free_vram(const char *socket_path, int device_id)
     cmd.dim = (uint32_t)device_id;
 
     if (send_cmd(sock, &cmd) >= 0 &&
-        recv_all(sock, &hdr, sizeof(hdr)) >= 0)
+        recv_reply(sock, &hdr) >= 0)
         rc = (int)hdr.status;
 
     close(sock);
@@ -2395,7 +2413,7 @@ cuvs_ipc_inject_extend_oom(const char *socket_path, int enable)
     cmd.dim = (uint32_t)(enable ? 1 : 0);
 
     if (send_cmd(sock, &cmd) >= 0 &&
-        recv_all(sock, &hdr, sizeof(hdr)) >= 0)
+        recv_reply(sock, &hdr) >= 0)
         rc = (int)hdr.status;
 
     close(sock);
@@ -2419,7 +2437,7 @@ cuvs_ipc_inject_build_oom(const char *socket_path, int n_fail)
     cmd.dim = (uint32_t)(n_fail < 0 ? 0 : n_fail);
 
     if (send_cmd(sock, &cmd) >= 0 &&
-        recv_all(sock, &hdr, sizeof(hdr)) >= 0)
+        recv_reply(sock, &hdr) >= 0)
         rc = (int)hdr.status;
 
     close(sock);
