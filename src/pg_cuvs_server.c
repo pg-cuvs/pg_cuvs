@@ -35,6 +35,7 @@
 #include "cuvs_hnsw_build_common.h"
 #include "cuvs_objstore.h"
 #include "cuvs_build_corpus.h"   /* ADR-057: cuvs_fd_recv (SCM_RIGHTS build payload) */
+#include "cuvs_lw_policy.h"      /* I4 / ADR-088: large_workspace overflow policy */
 #include <curl/curl.h>
 
 #include <stdio.h>
@@ -419,6 +420,21 @@ static size_t g_rmm_pool_limits[CUVS_MAX_GPUS];
  * residency. Protected by g_index_mutex; allocator counters cannot see these
  * until the build allocates. Kept until return, conservatively even then. */
 static size_t g_pending_rmm_build_vram[CUVS_MAX_GPUS];
+
+/* I4 / ADR-088 knobs (KB-4 --cagra-build-overflow, KB-5 --managed-overcommit,
+ * KB-6 --managed-lw-margin-permille, KB-24 --oom-score-adj). Startup flags
+ * only: pool accounting reads them (UC-7), so no runtime change path. */
+static uint32_t g_cagra_build_overflow       = CUVS_CAGRA_BUILD_OVERFLOW_DEFAULT;
+static int      g_managed_overcommit         = CUVS_MANAGED_OVERCOMMIT_DEFAULT;
+static uint32_t g_managed_lw_margin_permille = CUVS_MANAGED_LW_MARGIN_PERMILLE_DEFAULT;
+static int      g_oom_score_adj              = CUVS_OOM_SCORE_ADJ_DEFAULT;
+static int      g_oom_score_adj_effective    = -1;   /* -1 = not read */
+static char     g_oom_score_adj_result[CUVS_LW_OOM_RESULT_LEN] = "oom_score_adj not evaluated";
+/* Per GPU, under g_index_mutex: sum of lw_ub over admitted managed builds
+ * (added at admission, removed at release), and spill counters (C8). */
+static uint64_t g_lw_pending[CUVS_MAX_GPUS];
+static uint64_t g_managed_spill_builds[CUVS_MAX_GPUS];
+static uint64_t g_managed_spill_bytes_max[CUVS_MAX_GPUS];
 
 /* ADR-065: default per-device budget when --max-vram-mb is omitted — a fraction
  * of total VRAM, leaving headroom for the untracked cuVS workspace + CUDA
@@ -3089,6 +3105,228 @@ note_build_admission(uint32_t db_oid, uint32_t index_oid, size_t needed,
             h->last_build_unloaded = self_unloaded;
         }
     }
+}
+
+/* ----------------------------------------------------------------
+ * I4 / ADR-088: large_workspace managed accounting. The admission formula
+ * (ensure_vram, N_m) belongs to I3-A; these helpers only add the managed
+ * part. Call every function here under g_index_mutex.
+ * ---------------------------------------------------------------- */
+
+/* lw_ub of one cagra build; 0 under policy error (no lw_pending is held). */
+static uint64_t
+lw_ub_for_build(int64_t n, uint32_t dim, int intermediate_graph_degree)
+{
+    if (g_cagra_build_overflow != CUVS_LW_OVERFLOW_MANAGED)
+        return 0;
+    return cuvs_lw_ub_bytes(cuvs_lw_shape_bytes(n, dim, intermediate_graph_degree),
+                            g_managed_lw_margin_permille);
+}
+
+/* Admission-time WARN for shapes outside the LW-8 grid (C3). The [admit]
+ * shape_class "+lw_extrapolated" suffix is appended by the I3-A line. */
+static void
+lw_warn_shape(int64_t n, uint32_t dim, int intermediate_graph_degree,
+              uint32_t db_oid, uint32_t index_oid)
+{
+    if (g_cagra_build_overflow != CUVS_LW_OVERFLOW_MANAGED ||
+        cuvs_lw_shape_checked(n, dim, intermediate_graph_degree))
+        return;
+    LOG_WARN("[managed_lw] %u/%u shape_class=+lw_extrapolated (n=%lld dim=%u igd=%d): "
+             "lw_margin_permille=%u is not known to cover lw_peak outside the LW-8 grid\n",
+             db_oid, index_oid, (long long)n, dim,
+             intermediate_graph_degree > 0 ? intermediate_graph_degree : (int)CUVS_LW_DEFAULT_IGD,
+             g_managed_lw_margin_permille);
+}
+
+static void
+lw_pending_reserve(uint64_t lw_ub, int device_id)
+{
+    g_lw_pending[device_id] = cuvs_lw_sat_add(g_lw_pending[device_id], lw_ub);
+}
+
+static void
+lw_pending_release(uint64_t lw_ub, int device_id)
+{
+    g_lw_pending[device_id] = lw_ub < g_lw_pending[device_id]
+        ? g_lw_pending[device_id] - lw_ub : 0;
+}
+
+#ifndef CUVS_LW_HOST_GUARD_FIXTURE
+static uint64_t hnsw_host_headroom(uint64_t requested, char *error, size_t error_len);
+/* host_guard = min(MemAvailable/2, each cgroup ancestor's remaining/2); 0 on a
+ * cgroup v1 memory controller or any read failure (ADR-088 decision 5). */
+static uint64_t
+lw_host_guard_bytes(void)
+{
+    char error[160] = "";
+    return hnsw_host_headroom(UINT64_MAX, error, sizeof(error));
+}
+#endif
+
+/* AR6/AR7 pre-admission (ADR-088 decisions 3 and 5): the one call the I3-A
+ * admission function makes for a CAGRA build, after AR2 and before scope
+ * eviction, with pre-eviction snapshots (not re-run after eviction). needed
+ * is the in-pool N_m I3-A computed. Fills *ws (the [admit]/err_out inputs;
+ * ws->lw_ub is what the caller reserves with lw_pending_reserve once the
+ * build is admitted) and returns NONE, AR6 or AR7 from the shared hook. */
+static __attribute__((unused)) CuvsAdmissionReason   /* called by the I3-A admission */
+lw_admission_check(int device_id, uint64_t needed, int64_t n, uint32_t dim,
+                   int intermediate_graph_degree, CuvsAdmissionWorkspaceInput *ws)
+{
+    CuvsRmmPoolStats pool;
+    memset(ws, 0, sizeof(*ws));
+    ws->managed = g_cagra_build_overflow == CUVS_LW_OVERFLOW_MANAGED;
+    ws->overcommit = (uint32_t)g_managed_overcommit;
+    ws->needed = needed;
+    if (cuvs_rmm_pool_stats(device_id, &pool) == 0)
+    {
+        ws->reserved = pool.reserved_bytes;
+        ws->pool_used = pool.used_bytes;
+    }
+    ws->phys_free = cuvs_vram_physical_free_bytes_on(device_id);
+    ws->lw_ub = lw_ub_for_build(n, dim, intermediate_graph_degree);
+    ws->lw_pending = g_lw_pending[device_id];
+    ws->host_guard = lw_host_guard_bytes();
+    return cuvs_admission_workspace_check(ws);
+}
+
+/* Build end (success or failure), after lw_pending_release. Updates the C8
+ * spill counters, logs the I4 line and returns 1 with the requester NOTICE
+ * text when the build spilled (delivered through notice_out by I3-A). */
+static int
+lw_build_finish(const char *op, int device_id, uint32_t db_oid, uint32_t index_oid,
+                uint32_t policy, uint64_t lw_ub, const CuvsLwBuildStats *st,
+                char *notice, size_t notice_len)
+{
+    int spill = cuvs_lw_spill_flag(policy, st->lw_peak, st->free_at_peak);
+    if (spill)
+    {
+        g_managed_spill_builds[device_id]++;
+        if (st->lw_peak > g_managed_spill_bytes_max[device_id])
+            g_managed_spill_bytes_max[device_id] = st->lw_peak;
+    }
+    LOG_INFO("[managed_lw] op=%s gpu=%d db=%u idx=%u policy=%s lw_ub=%llu lw_peak=%llu "
+             "spill=%d free_at_peak=%llu lw_pending_after=%llu applied=%u restored=%u "
+             "live_end=%llu\n",
+             op, device_id, db_oid, index_oid, cuvs_lw_overflow_name(policy),
+             (unsigned long long)lw_ub, (unsigned long long)st->lw_peak, spill,
+             (unsigned long long)(st->free_at_peak == UINT64_MAX ? 0 : st->free_at_peak),
+             (unsigned long long)g_lw_pending[device_id], st->applied, st->restored,
+             (unsigned long long)st->lw_live_end);
+    if (st->applied && !st->restored)
+        LOG_WARN("[managed_lw] GPU %d: large_workspace default not restored; resources poisoned\n",
+                 device_id);
+    if (st->lw_live_end != 0)
+        LOG_WARN("[managed_lw] GPU %d: %llu managed bytes still live at restore\n",
+                 device_id, (unsigned long long)st->lw_live_end);
+    if (!cuvs_lw_spill_notice(spill, st->lw_peak, st->free_at_peak, notice, notice_len))
+        return 0;
+    LOG_INFO("[managed_lw] NOTICE %u/%u: %s\n", db_oid, index_oid, notice);
+    return 1;
+}
+
+/* Pool status append (I4 keys). Takes g_index_mutex for the counters. */
+static void
+lw_fill_pool_status(CuvsRmmPoolStatus *status)
+{
+    _Static_assert(sizeof(status->oom_score_adj_result) >= CUVS_LW_OOM_RESULT_LEN,
+                   "oom_score_adj_result must hold the startup line");
+    status->cagra_build_overflow = g_cagra_build_overflow;
+    status->managed_overcommit = (uint32_t)g_managed_overcommit;
+    status->lw_margin_permille = g_managed_lw_margin_permille;
+    status->oom_score_adj = g_oom_score_adj;
+    status->oom_score_adj_effective = g_oom_score_adj_effective;
+    snprintf(status->oom_score_adj_result, sizeof(status->oom_score_adj_result), "%s",
+             g_oom_score_adj_result);
+    pthread_mutex_lock(&g_index_mutex);
+    for (int i = 0; i < n_usable_gpus(); i++)
+    {
+        int dev = usable_gpu(i);
+        CuvsLwDeviceStatus *d = &status->lw_devices[status->lw_n_devices++];
+        d->device_id = (uint32_t)dev;
+        d->lw_pending_bytes = g_lw_pending[dev];
+        d->managed_spill_builds = g_managed_spill_builds[dev];
+        d->managed_spill_bytes_max = g_managed_spill_bytes_max[dev];
+    }
+    pthread_mutex_unlock(&g_index_mutex);
+}
+
+/* KB-4/5/6/24 parser. Returns 1 when argv[*i] is an I4 flag (consuming its
+ * value), 0 when it is not, -1 on a missing or out-of-range value (startup
+ * refuses). */
+static int
+parse_lw_flag(int argc, char **argv, int *i)
+{
+    const char *flag = argv[*i];
+    const char *value = *i + 1 < argc ? argv[*i + 1] : NULL;
+    int ok;
+    if (strcmp(flag, "--cagra-build-overflow") == 0)
+        ok = cuvs_lw_parse_overflow(value, &g_cagra_build_overflow) == 0;
+    else if (strcmp(flag, "--managed-overcommit") == 0)
+        ok = cuvs_lw_parse_on_off(value, &g_managed_overcommit) == 0;
+    else if (strcmp(flag, "--managed-lw-margin-permille") == 0)
+        ok = cuvs_lw_parse_margin(value, &g_managed_lw_margin_permille) == 0;
+    else if (strcmp(flag, "--oom-score-adj") == 0)
+        ok = cuvs_lw_parse_oom_score_adj(value, &g_oom_score_adj) == 0;
+    else
+        return 0;
+    if (!ok)
+    {
+        LOG_ERROR("%s: invalid value '%s' (--cagra-build-overflow error|managed, "
+                  "--managed-overcommit on|off, --managed-lw-margin-permille %u..%u, "
+                  "--oom-score-adj 0..%d)\n", flag, value ? value : "",
+                  CUVS_MANAGED_LW_MARGIN_PERMILLE_MIN, CUVS_MANAGED_LW_MARGIN_PERMILLE_MAX,
+                  CUVS_OOM_SCORE_ADJ_MAX);
+        return -1;
+    }
+    (*i)++;
+    return 1;
+}
+
+/* KB-24 / UC-3 (d): raise the daemon's oom_score_adj once at startup so the
+ * kernel OOM killer prefers it over PostgreSQL under host RAM pressure. Never
+ * lowers (kept current N), never writes when the setting is 0, and a failure
+ * never stops the daemon: the result text goes to the log and pool status. */
+static void
+apply_oom_score_adj(const char *path)
+{
+    int current = -1, err = 0;
+    CuvsOomAdjAction action = cuvs_oom_adj_action(g_oom_score_adj, INT32_MIN);
+#ifdef __linux__
+    if (g_oom_score_adj != 0)
+    {
+        FILE *f;
+        errno = 0;
+        f = fopen(path, "r");
+        if (!f || fscanf(f, "%d", &current) != 1)
+            err = errno ? errno : EIO;
+        if (f) fclose(f);
+        if (!err)
+        {
+            action = cuvs_oom_adj_action(g_oom_score_adj, current);
+            if (action == CUVS_OOM_ADJ_WRITE)
+            {
+                char text[16];
+                int len = snprintf(text, sizeof(text), "%d", g_oom_score_adj);
+                int fd = open(path, O_WRONLY);
+                if (fd < 0 || write(fd, text, (size_t)len) != len)
+                    err = errno ? errno : EIO;
+                if (fd >= 0) close(fd);
+            }
+        }
+        else
+            action = CUVS_OOM_ADJ_WRITE;   /* describe the read failure */
+    }
+    g_oom_score_adj_effective = (action == CUVS_OOM_ADJ_WRITE && !err) ? g_oom_score_adj : current;
+    cuvs_oom_adj_describe(action, g_oom_score_adj, current, err, 1,
+                          g_oom_score_adj_result, sizeof(g_oom_score_adj_result));
+#else
+    (void)path;
+    cuvs_oom_adj_describe(action, g_oom_score_adj, current, err, 0,
+                          g_oom_score_adj_result, sizeof(g_oom_score_adj_result));
+#endif
+    LOG_INFO("pg_cuvs_server: %s (--oom-score-adj %d)\n", g_oom_score_adj_result, g_oom_score_adj);
 }
 
 /* ----------------------------------------------------------------
@@ -5792,11 +6030,14 @@ build_sharded(int client_fd, const CuvsCmdFrame *cmd, const char *index_dir,
             note_build_admission(cmd->db_oid, cmd->index_oid, needed, dev, 1, 0);
         log_admit(&al, CUVS_ADMISSION_NONE);   /* one [admit] line per shard (v5) */
 
+        /* I4 / CK-28: shards are not admitted through N_m/AR6/AR7, so they
+         * never get the managed large_workspace, whatever the active policy. */
         CuvsCagraIndex h = cuvs_cagra_build(vecs + (size_t)off * dim, shard_n,
                                             (int)dim, metric,
                                             (int)cmd->graph_degree,
                                             (int)cmd->intermediate_graph_degree,
-                                            cmd->build_algo, dev);
+                                            cmd->build_algo, dev,
+                                            CUVS_LW_OVERFLOW_ERROR, NULL);
         if (!h)
         {
             LOG_ERROR("[build_sharded] cuvs_cagra_build failed for shard %d\n", i);
@@ -6366,6 +6607,14 @@ handle_build(int client_fd, const CuvsCmdFrame *cmd)
      * eviction stay correct while we build unlocked. vecs/mem are per-request
      * (not shared state), so reading them unlocked is safe. */
     reserve_build_vram(needed, target_gpu);
+    /* I4: the active policy is passed only here and in handle_build_multi. */
+    uint32_t lw_policy = g_cagra_build_overflow;
+    uint64_t lw_ub = lw_ub_for_build(cmd->n_vecs, cmd->dim, (int)cmd->intermediate_graph_degree);
+    CuvsLwBuildStats lw_stats;
+    char lw_notice[CUVS_ADMISSION_ERR_OUT_BYTES];
+    lw_pending_reserve(lw_ub, target_gpu);
+    lw_warn_shape(cmd->n_vecs, cmd->dim, (int)cmd->intermediate_graph_degree,
+                  cmd->db_oid, cmd->index_oid);
     log_admit(&al, CUVS_ADMISSION_NONE);
     pthread_mutex_unlock(&g_index_mutex);
 
@@ -6374,7 +6623,7 @@ handle_build(int client_fd, const CuvsCmdFrame *cmd)
     CuvsCagraIndex new_handle = cuvs_cagra_build(vecs, cmd->n_vecs, (int)cmd->dim, cmd->metric,
                                                  (int)cmd->graph_degree,
                                                  (int)cmd->intermediate_graph_degree,
-                                                 cmd->build_algo, target_gpu);
+                                                 cmd->build_algo, target_gpu, lw_policy, &lw_stats);
     /* ADR-086 (I3): an out-of-memory build after admission fails without
      * evicting any resident index; ADR-070's evict-to-fit retry is removed. */
     int build_oom = !new_handle && cuvs_last_build_was_oom();
@@ -6385,6 +6634,9 @@ handle_build(int client_fd, const CuvsCmdFrame *cmd)
      * registry entry below carries vram_bytes; on failure the VRAM is freed. */
     pthread_mutex_lock(&g_index_mutex);
     release_build_vram(needed, target_gpu);
+    lw_pending_release(lw_ub, target_gpu);
+    (void)lw_build_finish("build", target_gpu, cmd->db_oid, cmd->index_oid, lw_policy,
+                          lw_ub, &lw_stats, lw_notice, sizeof(lw_notice));
     log_release("BUILD", target_gpu, cmd->db_oid, cmd->index_oid, needed,
                 new_handle ? "built" : build_oom ? "oom" : build_att ? "att" : "failed");
 
@@ -7060,6 +7312,14 @@ handle_build_multi(int client_fd, const CuvsCmdFrame *cmd, const char *index_dir
          * (part_vecs/maps) are per-request, so reading them unlocked is safe;
          * total_vram_used() counts g_pending_build_vram during the window. */
         reserve_build_vram(needed, target_gpu);
+        /* I4: the active policy is passed only here and in handle_build. */
+        uint32_t lw_policy = g_cagra_build_overflow;
+        uint64_t lw_ub = lw_ub_for_build(total, cmd->dim, (int)cmd->intermediate_graph_degree);
+        CuvsLwBuildStats lw_stats;
+        char lw_notice[CUVS_ADMISSION_ERR_OUT_BYTES];
+        lw_pending_reserve(lw_ub, target_gpu);
+        lw_warn_shape(total, cmd->dim, (int)cmd->intermediate_graph_degree,
+                      cmd->db_oid, cmd->index_oid);
         log_admit(&al, CUVS_ADMISSION_NONE);
         pthread_mutex_unlock(&g_index_mutex);
 
@@ -7067,7 +7327,7 @@ handle_build_multi(int client_fd, const CuvsCmdFrame *cmd, const char *index_dir
                                             (int)cmd->dim, cmd->metric,
                                             (int)cmd->graph_degree,
                                             (int)cmd->intermediate_graph_degree,
-                                            cmd->build_algo, target_gpu);
+                                            cmd->build_algo, target_gpu, lw_policy, &lw_stats);
         /* ADR-086 (I3): no evict-to-fit; an OOM after admission is a failure. */
         build_oom = !new_handle && cuvs_last_build_was_oom();
         build_att = !new_handle && !build_oom && cuvs_last_build_attach_failed();
@@ -7077,6 +7337,9 @@ handle_build_multi(int client_fd, const CuvsCmdFrame *cmd, const char *index_dir
          * entry carries vram_bytes; on failure the VRAM is freed. */
         pthread_mutex_lock(&g_index_mutex);
         release_build_vram(needed, target_gpu);
+        lw_pending_release(lw_ub, target_gpu);
+        (void)lw_build_finish("build_multi", target_gpu, cmd->db_oid, cmd->index_oid, lw_policy,
+                              lw_ub, &lw_stats, lw_notice, sizeof(lw_notice));
         log_release("BUILD", target_gpu, cmd->db_oid, cmd->index_oid, needed,
                     new_handle ? "built" : build_oom ? "oom" : build_att ? "att" : "failed");
 
@@ -10309,6 +10572,8 @@ connection_thread(void *arg)
                     }
                     status.n_devices++;
                 }
+            if (hdr.status == CUVS_STATUS_OK)
+                lw_fill_pool_status(&status);
             send_all(client_fd, &hdr, sizeof(hdr));
             if (hdr.status == CUVS_STATUS_OK)
                 send_all(client_fd, &status, sizeof(status));
@@ -10978,6 +11243,7 @@ main(int argc, char **argv)
 {
     cuvs_reclaim_params_default(&g_reclaim);
     /* Parse arguments */
+    int lw_flag;
     for (int i = 1; i < argc; i++)
     {
         if (strcmp(argv[i], "--socket") == 0 && i+1 < argc)
@@ -11069,6 +11335,11 @@ main(int argc, char **argv)
             int n = atoi(argv[++i]);
             if (n >= 1 && n <= 8)
                 g_warmup_nthreads = n;
+        }
+        else if ((lw_flag = parse_lw_flag(argc, argv, &i)) != 0)
+        {
+            if (lw_flag < 0)
+                return 1;   /* I4 knobs: out-of-range value refuses startup */
         }
         else if (strcmp(argv[i], "--gpu-devices") == 0 && i+1 < argc)
         {
@@ -11234,6 +11505,11 @@ main(int argc, char **argv)
     LOG_INFO("HNSW auto overflow: %s (--hnsw-auto-overflow; default %s)\n",
              cuvs_hnsw_overflow_name(g_hnsw_auto_overflow),
              cuvs_hnsw_overflow_name(CUVS_HNSW_AUTO_OVERFLOW_DEFAULT));
+    /* I4: effective large_workspace knobs, then the host protection line. */
+    LOG_INFO("managed large_workspace: cagra_build_overflow=%s managed_overcommit=%s "
+             "lw_margin_permille=%u\n", cuvs_lw_overflow_name(g_cagra_build_overflow),
+             g_managed_overcommit ? "on" : "off", g_managed_lw_margin_permille);
+    apply_oom_score_adj("/proc/self/oom_score_adj");
 
     /* ADR-075 Phase 1: probe hardware + write the global cost-model profile. */
     write_hw_profile();

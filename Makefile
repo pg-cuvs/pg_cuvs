@@ -279,7 +279,7 @@ TEST_RT_LIB := $(shell [ "$$(uname -s)" = "Linux" ] && echo -lrt)
 test-unit: test/unit/test_cuvs_util.c src/cuvs_util.c src/cuvs_util.h src/cuvs_ipc.h \
            test/unit/test_build_corpus.c src/cuvs_build_corpus.c src/cuvs_build_corpus.h \
            test-hnsw-build test-hnsw-build-ipc test-hnsw-admission test-admission-contract \
-           test-admission-wire test-admission-message test-admission-ipc test-build-oom-thread test-cache-policy test-circuit-source test-status-text test-i3b-source test-peak-meter test-lw-policy
+           test-admission-wire test-admission-message test-admission-ipc test-build-oom-thread test-cache-policy test-circuit-source test-status-text test-i3b-source test-peak-meter test-lw-policy test-lw-guard
 	$(CC) -I src -DCUVS_TEST_HOOKS -o test-unit test/unit/test_cuvs_util.c src/cuvs_util.c $(TEST_RT_LIB)
 	./test-unit
 	$(CC) -I src -o test-build-corpus test/unit/test_build_corpus.c src/cuvs_build_corpus.c $(TEST_RT_LIB)
@@ -427,12 +427,25 @@ test-status-text: test/unit/test_status_text.c src/cuvs_status_text.c \
 EXTRA_CLEAN += test-status-text
 .PHONY: test-status-text
 
-# I4 / ADR-088 managed large_workspace: pure decisions (C). Runs on any host.
+# I4 / ADR-088 managed large_workspace: pure decisions (C) and the build-only
+# resource guard (C++, fake resource). Both run on any host.
 test-lw-policy: test/unit/test_lw_policy.c src/cuvs_lw_policy.h src/cuvs_admission_contract.h \
                 src/cuvs_util.c src/cuvs_util.h src/cuvs_ipc.h
 	$(CC) -std=gnu11 -Wall -Wextra -Werror -I src -o $@ test/unit/test_lw_policy.c \
 		src/cuvs_util.c $(TEST_RT_LIB)
 	./$@
+
+test-lw-guard: test/unit/test_lw_guard.cpp src/cuvs_lw_guard.hpp src/cuvs_lw_policy.h \
+               src/cuvs_admission_contract.h
+	$(CXX) -std=c++17 -Wall -Wextra -Werror -pthread -I src -o $@ test/unit/test_lw_guard.cpp
+	./$@
+
+# Each planted I4 defect must turn an I4 test RED. Linux (the daemon fixture
+# needs memfd, /proc and shm); run as a non-root user. LW_MUTATION_OUT must be
+# a new directory.
+LW_MUTATION_OUT ?= lw-mutations
+test-lw-mutations: test/unit/test_lw_mutations.py test-lw-policy test-lw-guard test-lw-daemon
+	CC=$(CC) CXX=$(CXX) python3 -I test/unit/test_lw_mutations.py $(LW_MUTATION_OUT)
 
 # Converter fixtures include private PG page helpers, with backend stubs and
 # section garbage collection. Requires server headers, but no running backend.
@@ -454,10 +467,10 @@ test-hnsw-converter: test/unit/test_hnsw_converter.c src/hnsw_export.c \
 
 EXTRA_CLEAN += test-hnsw-build test-hnsw-build-ipc test-hnsw-converter test-hnsw-admission test-hnsw-explicit-route test-hnsw-policy \
                test-admission-contract test-admission-contract-cxx test-admission-contract-util.o \
-               test-admission-wire test-admission-message test-admission-ipc test-build-oom-thread test-hnsw-auto-overflow test-res-pool test-lw-policy
+               test-admission-wire test-admission-message test-admission-ipc test-build-oom-thread test-hnsw-auto-overflow test-res-pool test-lw-policy test-lw-guard
 .PHONY: test-hnsw-build test-hnsw-build-ipc test-hnsw-converter test-hnsw-admission test-hnsw-explicit-route test-hnsw-policy \
         test-admission-contract test-admission-contract-mutations test-admission-wire \
-        test-admission-message test-admission-ipc test-build-oom-thread test-gpu-wrapper-i3 test-hnsw-auto-overflow test-res-pool test-lw-policy
+        test-admission-message test-admission-ipc test-build-oom-thread test-gpu-wrapper-i3 test-hnsw-auto-overflow test-res-pool test-lw-policy test-lw-guard test-lw-mutations
 
 # ---- Documentation contract check ---------------------------------------
 # CPU-only drift detector for the current version/defaults and release-facing
@@ -876,6 +889,18 @@ gpu-anbench-agg:
 # form (sync build install test) rebuilt only the extension and restarted
 # nothing, so it could test code that was never deployed.
 gpu-cycle: gpu-deploy gpu-test
+
+# I4 / ADR-088 through the actual daemon source (Linux CPU CI, non-root for the
+# EACCES branch): knob refusal, oom_score_adj, CK-3b lw_pending, per-caller
+# policy through handle_build/_multi/build_sharded, spill NOTICE, pool status.
+EXTRA_CLEAN += test-lw-daemon
+.PHONY: test-lw-daemon
+test-lw-daemon:
+	$(CC) -std=gnu11 -O1 -DPGCUVS_CPU_SHIM -ffunction-sections -fdata-sections -I src \
+		test/unit/test_lw_daemon.c src/cuvs_ipc.c src/cuvs_util.c \
+		src/cuvs_objstore.c src/cuvs_build_corpus.c src/cuvs_wrapper_shim_cpu.c \
+		-Wl,--gc-sections -lm -lpthread -lrt -lcurl -lssl -lcrypto -o test-lw-daemon
+	./test-lw-daemon
 
 # Actual daemon admission with physical GPU headroom fixture only (Linux CPU CI).
 EXTRA_CLEAN += test-rmm-pending

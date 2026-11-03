@@ -479,6 +479,15 @@ typedef struct CuvsRmmPoolStats {
 /* 2 (I3): + scratch_permille. Fields are append-only, I3-A first, then
  * I3-B, I3-C, I4, each PR appending its own after the previous PR's. */
 #define CUVS_RMM_POOL_STATUS_VERSION 2u
+/* I4 / ADR-088 per-GPU managed large_workspace counters (C8). */
+typedef struct CuvsLwDeviceStatus {
+    uint32_t device_id;
+    uint32_t reserved;
+    uint64_t lw_pending_bytes;         /* admitted managed builds' lw_ub sum */
+    uint64_t managed_spill_builds;     /* builds with spill = 1 */
+    uint64_t managed_spill_bytes_max;  /* largest lw_peak among them */
+} CuvsLwDeviceStatus;
+
 typedef struct CuvsRmmPoolStatus {
     uint32_t version;
     uint32_t initial_mb;
@@ -489,6 +498,15 @@ typedef struct CuvsRmmPoolStatus {
     /* I3-C, append-only: CUVS_HNSW_OVERFLOW_* (--hnsw-auto-overflow). */
     uint32_t hnsw_auto_overflow;
     uint32_t hnsw_reserved;
+    /* I4 (append-only, after I3-A..C additions on stack rebase): KB-4/5/6/24. */
+    uint32_t cagra_build_overflow;     /* CuvsLwOverflow: 0 error, 1 managed */
+    uint32_t managed_overcommit;       /* 1 = on */
+    uint32_t lw_margin_permille;
+    int32_t  oom_score_adj;            /* configured --oom-score-adj */
+    int32_t  oom_score_adj_effective;  /* value after startup; -1 = not read */
+    uint32_t lw_n_devices;
+    char     oom_score_adj_result[96]; /* startup line text (C8 second channel) */
+    CuvsLwDeviceStatus lw_devices[CUVS_MAX_GPUS];
 } CuvsRmmPoolStatus;
 
 int cuvs_ipc_rmm_pool_status(const char *socket_path, CuvsRmmPoolStatus *out);

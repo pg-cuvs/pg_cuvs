@@ -262,11 +262,53 @@ shim_build_oom_armed(void)
     return 0;
 }
 
+/* I4 / CK-28: the shim has no large_workspace. It records which policy each
+ * cagra build received (the daemon must pass the active policy only from
+ * handle_build/handle_build_multi) and reports a configurable lw_peak so the
+ * daemon's spill/NOTICE path runs on CPU. Test-only accessors below. */
+static uint32_t g_shim_lw_calls[2];
+static uint32_t g_shim_lw_last = UINT32_MAX;
+static uint64_t g_shim_lw_peak, g_shim_lw_free_at_peak = UINT64_MAX;
+
+void cuvs_shim_lw_reset(void)
+{
+    g_shim_lw_calls[0] = g_shim_lw_calls[1] = 0;
+    g_shim_lw_last = UINT32_MAX;
+    g_shim_lw_peak = 0;
+    g_shim_lw_free_at_peak = UINT64_MAX;
+}
+uint32_t cuvs_shim_lw_calls(uint32_t policy) { return policy < 2 ? g_shim_lw_calls[policy] : 0; }
+uint32_t cuvs_shim_lw_last_policy(void) { return g_shim_lw_last; }
+void cuvs_shim_lw_set_peak(uint64_t peak, uint64_t free_at_peak)
+{
+    g_shim_lw_peak = peak;
+    g_shim_lw_free_at_peak = free_at_peak;
+}
+
+static void
+shim_lw_record(uint32_t lw_overflow, CuvsLwBuildStats *lw_out)
+{
+    int managed = lw_overflow == 1u;   /* CUVS_LW_OVERFLOW_MANAGED */
+    g_shim_lw_calls[managed]++;
+    g_shim_lw_last = lw_overflow;
+    if (!lw_out) return;
+    memset(lw_out, 0, sizeof(*lw_out));
+    lw_out->free_at_peak = UINT64_MAX;
+    if (managed)
+    {
+        lw_out->applied = lw_out->restored = 1;
+        lw_out->lw_peak = g_shim_lw_peak;
+        lw_out->free_at_peak = g_shim_lw_free_at_peak;
+    }
+}
+
 CuvsCagraIndex
 cuvs_cagra_build(const float *vecs, int64_t n_vecs, int dim, uint32_t metric,
                  int graph_degree, int intermediate_graph_degree,
-                 uint32_t build_algo, int device_id)
+                 uint32_t build_algo, int device_id,
+                 uint32_t lw_overflow, CuvsLwBuildStats *lw_out)
 { (void)graph_degree; (void)intermediate_graph_degree; (void)build_algo; (void)device_id;
+  shim_lw_record(lw_overflow, lw_out);
   if (shim_build_oom_armed()) return NULL;
   /* Test seam (CPU shim only): hold the build so a test can act while its
    * VRAM reservation is pending (I3-B reload-under-build scenario). */
@@ -278,9 +320,11 @@ CuvsCagraIndex
 cuvs_cagra_build_multi(const float **vecs, const int64_t *n_each, int n_parts,
                        int64_t total, int dim, uint32_t metric,
                        int graph_degree, int intermediate_graph_degree,
-                       uint32_t build_algo, int device_id)
+                       uint32_t build_algo, int device_id,
+                       uint32_t lw_overflow, CuvsLwBuildStats *lw_out)
 {
     (void)graph_degree; (void)intermediate_graph_degree; (void)build_algo; (void)device_id;
+    shim_lw_record(lw_overflow, lw_out);
     if (shim_build_oom_armed()) return NULL;
     ShimIndex *ix = shim_new(NULL, total, dim, metric);
     if (!ix) return NULL;
@@ -568,6 +612,7 @@ int cuvs_probe_hw(int device_id, double *link_bw_bpus, double *hbm_bw_bpus,
 }
 
 size_t cuvs_vram_free_bytes_on(int device_id) { (void)device_id; return shim_vram_free_get(); }
+size_t cuvs_vram_physical_free_bytes_on(int device_id) { (void)device_id; return shim_vram_free_get(); }
 size_t cuvs_vram_free_bytes(void) { return shim_vram_free_get(); }
 void   cuvs_warmup_device(int device_id) { (void)device_id; }
 void   cuvs_warmup(void) {}

@@ -188,6 +188,22 @@ int cuvs_bf_search_filtered(
  */
 typedef void *CuvsCagraIndex;
 
+/* I4 / ADR-088: lw_overflow is a CuvsLwOverflow value (cuvs_lw_policy.h).
+ * CUVS_LW_OVERFLOW_MANAGED installs a build-only, counted managed resource as
+ * the large_workspace for this build only and restores the default before the
+ * device_resources returns to its free list (exception paths included). The
+ * policy is never read from wrapper globals: the daemon passes the active
+ * policy from handle_build/handle_build_multi only; sharded builds, startup
+ * warmup and every other caller pass CUVS_LW_OVERFLOW_ERROR (CK-28).
+ * lw_out may be NULL; it is zeroed on entry and filled on every exit. */
+typedef struct CuvsLwBuildStats {
+    uint32_t applied;        /* 1 when the managed resource was installed */
+    uint32_t restored;       /* 1 when the default was restored */
+    uint64_t lw_peak;        /* max live bytes of the build-only resource */
+    uint64_t lw_live_end;    /* live bytes at restore; nonzero is a leak */
+    uint64_t free_at_peak;   /* physical free observed at the last peak update */
+} CuvsLwBuildStats;
+
 /* metric is a CUVS_METRIC_* value (see cuvs_ipc.h). It is baked into the
  * CAGRA graph at build time; search inherits it. 3R: graph_degree /
  * intermediate_graph_degree (<=0 keep cuVS defaults 64/128) and build_algo
@@ -200,7 +216,9 @@ CuvsCagraIndex cuvs_cagra_build(
     int          graph_degree,
     int          intermediate_graph_degree,
     uint32_t     build_algo,
-    int          device_id
+    int          device_id,
+    uint32_t     lw_overflow,
+    CuvsLwBuildStats *lw_out
 );
 
 /*
@@ -221,7 +239,9 @@ CuvsCagraIndex cuvs_cagra_build_multi(
     int           graph_degree,
     int           intermediate_graph_degree,
     uint32_t      build_algo,
-    int           device_id
+    int           device_id,
+    uint32_t      lw_overflow,
+    CuvsLwBuildStats *lw_out
 );
 
 int cuvs_cagra_search(
@@ -429,6 +449,11 @@ CuvsCagraIndex cuvs_cagra_deserialize(const char *path, int dim,
 
 /* VRAM query -- returns free VRAM bytes on the specified CUDA device. */
 size_t cuvs_vram_free_bytes_on(int device_id);
+
+/* I4 / FACT-45 phys_free: cudaMemGetInfo free + async mempool reclaimable,
+ * without the RMM pool headroom adjustment and without subtracting other
+ * builds' pending claims. Used only by AR6/AR7. 0 on any CUDA failure. */
+size_t cuvs_vram_physical_free_bytes_on(int device_id);
 
 /* Legacy: free VRAM on device 0 (used by unit test binary). */
 size_t cuvs_vram_free_bytes(void);

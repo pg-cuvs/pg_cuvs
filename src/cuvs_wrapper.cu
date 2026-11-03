@@ -34,6 +34,9 @@
 #include "cuvs_peak_meter.h"
 #include <rmm/cuda_stream.hpp>
 #include "cuvs_res_pool.hpp"
+#include <rmm/mr/managed_memory_resource.hpp>          /* I4: build-only large_workspace */
+#include <raft/core/resource/device_memory_resource.hpp>
+#include "cuvs_lw_guard.hpp"
 
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>   /* Phase 3L: half precision for brute-force (cuvs.bf_precision) */
@@ -231,6 +234,84 @@ struct PooledRes {
     ~PooledRes() { if (r && !poisoned) release_res(dev, std::move(r)); }
     raft::device_resources &get() { return *r->res; }
     void poison() { poisoned = true; }
+};
+
+/* I4 / ADR-088: build-only large_workspace resource. cudaMallocManaged via
+ * RMM's managed resource (outside the pool, the quota and the usage adaptor),
+ * wrapped by a lock-free live/peak counter (lw_peak). At each new peak the
+ * physical free is sampled for the [build_peak] spill flag (C8). */
+class LwManagedResource final : public rmm::mr::device_memory_resource {
+  public:
+    CuvsLwCounter counter;
+
+  private:
+    rmm::mr::managed_memory_resource managed_;
+
+    void *do_allocate(std::size_t bytes, rmm::cuda_stream_view stream) override
+    {
+        void *p = managed_.allocate(stream, bytes);
+        if (counter.on_alloc(bytes)) {
+            size_t free_bytes = 0, total_bytes = 0;
+            if (cudaMemGetInfo(&free_bytes, &total_bytes) == cudaSuccess)
+                counter.note_free_at_peak(free_bytes);
+        }
+        return p;
+    }
+    void do_deallocate(void *p, std::size_t bytes, rmm::cuda_stream_view stream) noexcept override
+    {
+        managed_.deallocate(stream, p, bytes);
+        counter.on_free(bytes);
+    }
+    bool do_is_equal(const rmm::mr::device_memory_resource &other) const noexcept override
+    {
+        return this == &other;
+    }
+};
+
+/* CuvsLwWorkspaceGuard operations on one borrowed device_resources. restore()
+ * reinstalls a default factory (current device resource, i.e. the RMM pool
+ * adaptor), so the resource returns to the free list as it was borrowed. If
+ * restore fails, the resource is poisoned instead of pooled; if allocations
+ * are still live, the counted resource is kept alive rather than destroyed
+ * under them (reported as lw_live_end). */
+struct LwWorkspaceOps {
+    PooledRes &pr;
+    CuvsLwBuildStats *stats;
+    std::shared_ptr<LwManagedResource> mr;
+
+    void install()
+    {
+        mr = std::make_shared<LwManagedResource>();
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+        raft::resource::set_large_workspace_resource(pr.get(), mr);
+#pragma GCC diagnostic pop
+        stats->applied = 1;
+    }
+    void restore() noexcept
+    {
+        try {
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+            raft::resource::set_large_workspace_resource(
+                pr.get(), std::shared_ptr<rmm::mr::device_memory_resource>{});
+#pragma GCC diagnostic pop
+            stats->restored = 1;
+        } catch (...) {
+            fprintf(stderr, "[cuvs_cagra_build_multi] large_workspace restore failed; "
+                            "poisoning resources\n");
+            pr.poison();
+        }
+        stats->lw_peak = mr->counter.peak.load();
+        stats->lw_live_end = mr->counter.live.load();
+        stats->free_at_peak = mr->counter.free_at_peak.load();
+        if (stats->lw_live_end != 0) {
+            fprintf(stderr, "[cuvs_cagra_build_multi] large_workspace live %llu bytes at "
+                            "restore; keeping the managed resource alive\n",
+                    (unsigned long long)stats->lw_live_end);
+            (void)new std::shared_ptr<LwManagedResource>(mr);  /* deliberate leak */
+        }
+    }
 };
 
 } // namespace
@@ -606,7 +687,8 @@ cuvs_probe_hw(int device_id, double *link_bw_bpus, double *hbm_bw_bpus,
             corpus[i] = (float)((i * 2654435761u) % 1000) / 1000.0f;
         std::vector<CuvsSearchResult> res(k);
         CuvsCagraIndex idx = cuvs_cagra_build(corpus.data(), n, dim, CUVS_METRIC_L2,
-                                              0, 0, CUVS_CAGRA_BUILD_AUTO, device_id);
+                                              0, 0, CUVS_CAGRA_BUILD_AUTO, device_id,
+                                              CUVS_LW_OVERFLOW_ERROR, NULL); /* I4: probe never managed */
         if (idx) {
             (void) cuvs_cagra_search(idx, query.data(), dim, k, res.data(), device_id, 0, 0); /* warm */
             double best_us = 1e30;
@@ -667,6 +749,15 @@ vram_physical_parts(int device_id, size_t *free_out, size_t *async_out)
     *free_out = free_bytes;
     *async_out = async_reclaimable;
     return true;
+}
+
+extern "C" size_t
+cuvs_vram_physical_free_bytes_on(int device_id)
+{
+    size_t free_bytes = 0, async_reclaimable = 0;
+    if (!vram_physical_parts(device_id, &free_bytes, &async_reclaimable))
+        return 0;
+    return free_bytes > SIZE_MAX - async_reclaimable ? SIZE_MAX : free_bytes + async_reclaimable;
 }
 
 extern "C" size_t
@@ -1187,12 +1278,22 @@ extern "C" CuvsCagraIndex
 cuvs_cagra_build_multi(const float **vecs, const int64_t *n_each, int n_parts,
                        int64_t total, int dim, uint32_t metric,
                        int graph_degree, int intermediate_graph_degree,
-                       uint32_t build_algo, int device_id)
+                       uint32_t build_algo, int device_id,
+                       uint32_t lw_overflow, CuvsLwBuildStats *lw_out)
 {
+    CuvsLwBuildStats lw_local;
+    CuvsLwBuildStats *lw = lw_out ? lw_out : &lw_local;
+    std::memset(lw, 0, sizeof(*lw));
+    lw->free_at_peak = UINT64_MAX;
     g_last_build_oom = 0;   /* fresh per build attempt */
     g_last_build_att = 0;
     PooledRes _pr(device_id);
+    LwWorkspaceOps lw_ops{_pr, lw, nullptr};
     try {
+        /* I4: install right after acquiring the resources; the guard unwinds
+         * before the catch blocks below and before PooledRes returns them. */
+        CuvsLwWorkspaceGuard<LwWorkspaceOps> lw_guard(lw_ops, lw_overflow);
+
         /* test-only: simulate a VRAM OOM to exercise the daemon evict+retry path. */
         if (g_inject_build_oom.load() > 0) {
             g_inject_build_oom.fetch_sub(1);
@@ -1305,14 +1406,15 @@ cuvs_cagra_build_multi(const float **vecs, const int64_t *n_each, int n_parts,
 extern "C" CuvsCagraIndex
 cuvs_cagra_build(const float *vecs, int64_t n_vecs, int dim, uint32_t metric,
                  int graph_degree, int intermediate_graph_degree,
-                 uint32_t build_algo, int device_id)
+                 uint32_t build_algo, int device_id,
+                 uint32_t lw_overflow, CuvsLwBuildStats *lw_out)
 {
     /* Single-partition special case of the multi-partition build. */
     const float  *parts[1]  = { vecs };
     const int64_t n_each[1] = { n_vecs };
     return cuvs_cagra_build_multi(parts, n_each, 1, n_vecs, dim, metric,
                                   graph_degree, intermediate_graph_degree,
-                                  build_algo, device_id);
+                                  build_algo, device_id, lw_overflow, lw_out);
 }
 
 /* ----------------------------------------------------------------
@@ -2313,7 +2415,8 @@ cuvs_warmup_device(int device_id)
          * real cagra query on a freshly booted daemon is not the one that
          * pays kernel load (~100 ms). */
         CuvsCagraIndex idx = cuvs_cagra_build(corpus.data(), n, dim, CUVS_METRIC_L2,
-                                               0, 0, CUVS_CAGRA_BUILD_AUTO, device_id);
+                                               0, 0, CUVS_CAGRA_BUILD_AUTO, device_id,
+                                               CUVS_LW_OVERFLOW_ERROR, NULL); /* I4: warmup never managed */
         if (idx) {
             (void)cuvs_cagra_search(idx, query.data(), dim, k, out, device_id, 0, 0);
             cuvs_cagra_free(idx, device_id);
