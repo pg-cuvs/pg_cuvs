@@ -204,6 +204,25 @@ check "REINDEX keeps the pin (C7 7.2-N3)" sh -c "[ \"\$(i3b_ipc_cli $S index | a
 cli unpin $DB $I3 >/dev/null
 startd --reclaim-tick-s 1
 
+# --- 7b. reload while another build holds its reservation (R1, r18 B-9) ---
+startd --reclaim-mode off
+for i in $(i3b_ipc_cli $S index | awk -F'\t' '$3=="resident"{print $2}'); do cli unload $DB $i >/dev/null; done
+cli load $DB $I3 >/dev/null
+pkill -f pg_cuvs_server; sleep 1; pkill -9 -f pg_cuvs_server 2>/dev/null; rm -f $S
+su pg -c "CUVS_SHIM_BUILD_DELAY_MS=6000 pg_cuvs_server --socket $S --index-dir $IDX --max-vram-mb 25 --reclaim-mode off >>/tmp/d.log 2>&1 &"
+for i in $(seq 1 30); do [ -S $S ] && break; sleep 1; done
+for i in $(i3b_ipc_cli $S index | awk -F'\t' '$3=="resident"{print $2}'); do [ "$i" = "$I3" ] || cli unload $DB $i >/dev/null; done
+cli load $DB $I3 >/dev/null
+MARK=$(wc -l < /tmp/d.log)
+psqlq "CREATE TABLE t4 (id int, v vector(64)); INSERT INTO t4 SELECT g, (SELECT array_agg(((g*7+i) % 89)::real) FROM generate_series(1,64) i)::vector FROM generate_series(1,20000) g;" >/dev/null
+(psqlq "SET client_min_messages=warning; CREATE INDEX i4 ON t4 USING cagra (v vector_l2_ops);" > /tmp/i4.log 2>&1 &)
+sleep 2
+q t1
+wait 2>/dev/null; sleep 6
+check "reload during a pending build evicts a resident (build itself does not)" sh -c "tail -n +$MARK /tmp/d.log | grep -qE 'op=LOAD .*reason=(reload|soft_evict)' && ! tail -n +$MARK /tmp/d.log | grep -q 'reason=admit_build'"
+check "the delayed build still completes" sh -c "! grep -q ERROR /tmp/i4.log"
+startd --reclaim-tick-s 1
+
 # --- 8. SQL surface (C7, C8, CK-25/26): owner checks, superuser-only, SHOW ---
 psqlq "CREATE ROLE bob LOGIN; CREATE TABLE tb (id int, v vector(64)); ALTER TABLE tb OWNER TO bob;" >/dev/null
 sq() { su pg -c "psql -h /tmp -X -q -At -d postgres -v ON_ERROR_STOP=1 -c \"$1\"" 2>&1; }
