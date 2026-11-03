@@ -421,6 +421,9 @@ static CuvsReclaimParams g_reclaim;  /* I3-B knobs; defined with the policy stat
 /* index_oid of the request now being admitted ([evict] requester_idx; 0 for
  * reclaim and manual unload). Set under g_index_mutex by each requester. */
 static uint32_t g_cur_requester_idx;
+/* Provisional reason of the last ensure_vram reject (I3-A replaces this with
+ * its AR classifier; the reclaim F log only needs AR0/AR7 vs the rest). */
+static int      g_last_admit_reason = CUVS_ADMISSION_NONE;
 static char   g_snapshot_uri[512] = ""; /* "gs://bucket[/prefix]"; empty = disabled */
 static char   g_cluster_id[128]   = ""; /* multi-node identifier for GCS path */
 static char   g_gcs_key_file[512] = ""; /* service account JSON; empty = instance metadata */
@@ -1914,6 +1917,7 @@ static int
 load_index(uint32_t db_oid, uint32_t index_oid, CuvsRequester rq)
 {
     g_cur_requester_idx = index_oid;
+    g_last_admit_reason = CUVS_ADMISSION_NONE;   /* never report a stale reason */
     char idx_path[512], tids_path[512];
 
     memset(&t_reload_rej, 0, sizeof(t_reload_rej));
@@ -2432,9 +2436,6 @@ static uint64_t g_reclaim_skip_sidecar[CUVS_MAX_GPUS];
 static time_t   g_last_reclaim_at[CUVS_MAX_GPUS];
 static CuvsReclaimTrigger g_last_reclaim_trigger[CUVS_MAX_GPUS];
 static CuvsFreeTarget g_reclaim_f[CUVS_MAX_GPUS];
-/* Provisional reason of the last ensure_vram reject (I3-A replaces this with
- * its AR classifier; the reclaim F log only needs AR0/AR7 vs the rest). */
-static int      g_last_admit_reason = CUVS_ADMISSION_NONE;
 
 static uint64_t
 mono_us(void)
@@ -2511,6 +2512,12 @@ static IndexEntry *
 registry_new_slot(void)
 {
     IndexEntry *e = &g_indexes[g_n_indexes++];
+    /* After compaction this slot holds a byte copy of the entry shifted
+     * down: never inherit its owned pointers (the CAGRA reload path does
+     * not assign them all; a stale hnsw_idx is a wrong-result + UAF). */
+    e->hnsw_idx     = NULL;
+    e->rev_tids     = NULL;
+    e->rev_item_ids = NULL;
     e->pinned       = 0;
     e->inflight     = 0;
     e->file_current = 0;
@@ -2762,6 +2769,8 @@ make_room(int device_id, CuvsRequester rq, uint64_t need, int slot_mode,
             cands[n] = entry_cand(e, device_id);
             if (slot_mode)
                 cands[n].bytes = 1;
+            else if (cands[n].bytes == 0)
+                continue;   /* evicting it frees no VRAM on this device */
             keys[n].db_oid = e->db_oid;
             keys[n].index_oid = e->index_oid;
             n++;
@@ -2794,10 +2803,13 @@ make_room(int device_id, CuvsRequester rq, uint64_t need, int slot_mode,
             uint64_t unit = slot_mode ? 1 : cands[victims[v]].bytes;
             if (evict_entry(e, device_id, why, 0, rq, &pf) == 0 && pf)
             {
+                /* Stop here and re-pick the remainder: victims not yet
+                 * evicted stay candidates, and a re-pick that rejects leaves
+                 * them resident (nothing evicted on a reject). */
                 if (n_skip < 64)
                     skip[n_skip++] = k;
                 failed = 1;
-                continue;
+                break;
             }
             need = unit >= need ? 0 : need - unit;
         }
@@ -2876,6 +2888,7 @@ ensure_vram(size_t needed, int device_id, CuvsRequester rq, CuvsAdmissionFields 
     int soft_load = (rq == CUVS_RQ_LOAD || rq == CUVS_RQ_LOAD_SHARD) &&
                     g_reclaim.soft_evict;
     CuvsEvictPick pk;
+    memset(&pk, 0, sizeof(pk));
 
     g_last_admit_reason = CUVS_ADMISSION_NONE;
     /* Cannot fit in any state: evict nothing (AR0). */
@@ -2892,49 +2905,45 @@ ensure_vram(size_t needed, int device_id, CuvsRequester rq, CuvsAdmissionFields 
         g_last_admit_reason = CUVS_ADMISSION_AR1;
         goto admission_rejected;
     }
-    if (pending > 0)
+    /* Both shortfalls shrink together when an index is evicted, so one
+     * pre-summed pick covers the larger of them: no partial eviction followed
+     * by a reject from a later check (ADR-086 "nothing evicted on reject"). */
+    size_t used = total_vram_used(device_id);
+    uint64_t budget_short = (budget > 0 && used + needed > budget) ? used + needed - budget : 0;
+    size_t fr = gpu_free_vram_bytes(device_id);
+    uint64_t phys_short = needed > fr ? needed - fr : 0;
+    /* An unlocked builder can allocate between observations: do not evict on
+     * that transient pressure, except for a soft reload (UC-1 6b, r18 B-9). */
+    if (phys_short > 0 && pending > 0 && !soft_load)
     {
-        size_t fr = gpu_free_vram_bytes(device_id);
-        if (needed > fr)
-        {
-            if (!soft_load || make_room(device_id, rq, needed - fr, 0, &pk) != 0 ||
-                needed > gpu_free_vram_bytes(device_id))
-            {
-                g_last_admit_reason = soft_load ? pick_reason(&pk, 1) : CUVS_ADMISSION_AR2;
-                goto admission_rejected;
-            }
-        }
+        g_last_admit_reason = CUVS_ADMISSION_AR2;
+        goto admission_rejected;
+    }
+    uint64_t need = budget_short > phys_short ? budget_short : phys_short;
+    if (need > 0 && make_room(device_id, rq, need, 0, &pk) != 0)
+    {
+        g_last_admit_reason = pick_reason(&pk, phys_short > budget_short);
+        goto admission_rejected;
     }
     if (budget > 0 && total_vram_used(device_id) + needed > budget)
     {
-        uint64_t shortfall = total_vram_used(device_id) + needed - budget;
-        if (make_room(device_id, rq, shortfall, 0, &pk) != 0 ||
-            total_vram_used(device_id) + needed > budget)
-        {
-            g_last_admit_reason = pick_reason(&pk, 0);
-            goto admission_rejected;
-        }
+        g_last_admit_reason = CUVS_ADMISSION_AR3;
+        goto admission_rejected;
     }
-
-    size_t free_vram = gpu_free_vram_bytes(device_id);
-    /* An unlocked builder can allocate between observations. Do not evict on
-     * that transient reservation pressure (except a soft reload, above). */
-    if (needed > free_vram && (pending == 0 || soft_load))
+    if (needed > gpu_free_vram_bytes(device_id))
     {
-        memset(&pk, 0, sizeof(pk));
-        (void) make_room(device_id, rq, needed - free_vram, 0, &pk);
-        free_vram = gpu_free_vram_bytes(device_id);
+        g_last_admit_reason = CUVS_ADMISSION_AR4;
+        goto admission_rejected;
     }
-    if (needed <= free_vram)
-        return 0;
-    g_last_admit_reason = pick_reason(&pk, 1);
-    goto admission_rejected;
+    return 0;
 admission_rejected:
     if (rej)
-        admission_fill(rej, (CuvsAdmissionReason) g_last_admit_reason,
+        admission_fill(rej, (CuvsAdmissionReason)g_last_admit_reason,
                        needed, device_id);
     return -1;
 }
+
+static void note_self_replace_failure(uint32_t index_oid, uint64_t self_unloaded);
 
 /* NOTICE text for REINDEX self-replace (decision UC-1 2a, exact wording).
  * Delivered through I3-A's notice_out; until that lands it is logged. */
@@ -2999,7 +3008,21 @@ admit_build_cagra(size_t needed, int device_id, uint32_t db_oid,
              index_oid, needed, budget > 0 && budget > used ? budget - used : fr);
     LOG_INFO("[self_replace] db=%u idx=%u unloaded=%zu notice=\"%s\"\n",
              db_oid, index_oid, freed, g_build_notice);
-    return ensure_vram(needed, device_id, CUVS_RQ_BUILD_CAGRA, NULL);
+    if (ensure_vram(needed, device_id, CUVS_RQ_BUILD_CAGRA, NULL) == 0)
+        return 0;
+    /* The estimate said the old copy was enough but the device disagrees:
+     * the copy is gone and the build is refused. Say so (the next query
+     * reloads it) and keep the receipt. */
+    note_self_replace_failure(index_oid, freed);
+    {
+        EvictHistory *h = evict_history(db_oid, index_oid, 1);
+        if (h)
+        {
+            h->last_build_self_replace = 1;
+            h->last_build_unloaded = freed;
+        }
+    }
+    return -1;
 }
 
 /* UC-1 2a: a build that fails after its old copy was unloaded says so and
@@ -5738,6 +5761,8 @@ build_sharded(int client_fd, const CuvsCmdFrame *cmd, const char *index_dir,
             }
             dev = alt;
         }
+        if (i == 0)   /* F-3: an admitted build drops its earlier rejects */
+            note_build_admission(cmd->db_oid, cmd->index_oid, needed, dev, 1, 0);
         log_admit(&al, CUVS_ADMISSION_NONE);   /* one [admit] line per shard (v5) */
 
         CuvsCagraIndex h = cuvs_cagra_build(vecs + (size_t)off * dim, shard_n,
@@ -6617,7 +6642,9 @@ finish_build_commit(int client_fd, const CuvsCmdFrame *cmd, const char *save_dir
         reset_entry_stats(existing);   /* fresh index instance */
         existing->graph_degree = (int)cmd->graph_degree;  /* for extend/compact VRAM est */
         existing->n_extended = 0;      /* REINDEX resets the extend counter */
-        existing->file_current = 1;    /* I-FC (i): build saved its files first */
+        /* I-FC (i): build saved its files first, but eviction saves/reloads
+         * through g_index_dir only, so a per-index index_dir is never current. */
+        existing->file_current = strcmp(save_dir, g_index_dir) == 0;
         existing->compact_count++;     /* every rebuild counts as a compaction */
         existing->last_compact_at = time(NULL);
         build_rev_tid_map(existing);   /* rebuild map for new tids/n_vecs */
@@ -6693,7 +6720,7 @@ finish_build_commit(int client_fd, const CuvsCmdFrame *cmd, const char *save_dir
         build_rev_tid_map(e);
         reset_entry_stats(e);
         e->graph_degree = (int)cmd->graph_degree;  /* for extend/compact VRAM est */
-        e->file_current = 1;    /* I-FC (i): build saved its files first */
+        e->file_current = strcmp(save_dir, g_index_dir) == 0;   /* I-FC (i), as above */
     }
 
     pthread_mutex_unlock(&g_index_mutex);
@@ -7400,8 +7427,18 @@ handle_export_adjacency(int client_fd, const CuvsCmdFrame *cmd)
     }
 
     uint32_t dim     = e->dim;
-    uint64_t *tids   = e->tids;   /* owned by daemon; copy below */
     int64_t   n_vecs_i = e->n_vecs;
+    /* I3-B: copy the TIDs under the lock; the registry's array can be freed
+     * by an eviction (e.g. the reclaim thread) once the lock is released. */
+    uint64_t *tids   = malloc((size_t)n_vecs_i * sizeof(uint64_t));
+    if (!tids)
+    {
+        pthread_mutex_unlock(&g_index_mutex);
+        free(adj); free(vecs);
+        send_error(client_fd, "out of memory for export");
+        return;
+    }
+    memcpy(tids, e->tids, (size_t)n_vecs_i * sizeof(uint64_t));
     pthread_mutex_unlock(&g_index_mutex);
 
     /* Pack into shared memory:
@@ -7424,7 +7461,7 @@ handle_export_adjacency(int client_fd, const CuvsCmdFrame *cmd)
         char hex[17];
         if (shm_key_random(rnd, sizeof(rnd)) != 0)   /* #87 finding 2: fail closed */
         {
-            free(adj); free(vecs);
+            free(adj); free(vecs); free(tids);
             send_error_code(client_fd, CUVS_STATUS_ERROR, "csprng failed");
             return;
         }
@@ -7449,20 +7486,20 @@ handle_export_adjacency(int client_fd, const CuvsCmdFrame *cmd)
     int shm_fd = shm_open(shm_key, O_CREAT | O_EXCL | O_RDWR, 0644);
     if (shm_fd < 0)
     {
-        free(adj); free(vecs);
+        free(adj); free(vecs); free(tids);
         send_error(client_fd, "shm_open failed for export");
         return;
     }
     if (ftruncate(shm_fd, (off_t)total) != 0)
     {
-        close(shm_fd); shm_unlink(shm_key); free(adj); free(vecs);
+        close(shm_fd); shm_unlink(shm_key); free(adj); free(vecs); free(tids);
         send_error(client_fd, "ftruncate failed for export");
         return;
     }
     int pass_fd = shm_open(shm_key, O_RDONLY, 0);
     if (pass_fd < 0)
     {
-        close(shm_fd); shm_unlink(shm_key); free(adj); free(vecs);
+        close(shm_fd); shm_unlink(shm_key); free(adj); free(vecs); free(tids);
         send_error(client_fd, "shm_open(RDONLY) failed for export");
         return;
     }
@@ -7477,7 +7514,7 @@ handle_export_adjacency(int client_fd, const CuvsCmdFrame *cmd)
     close(shm_fd);
     if (mem == MAP_FAILED)
     {
-        close(pass_fd); free(adj); free(vecs);
+        close(pass_fd); free(adj); free(vecs); free(tids);
         send_error(client_fd, "mmap failed for export");
         return;
     }
@@ -7497,6 +7534,7 @@ handle_export_adjacency(int client_fd, const CuvsCmdFrame *cmd)
     munmap(mem, total);
     free(adj);
     free(vecs);
+    free(tids);
 
     LOG_INFO("[handle_export_adjacency] %u/%u N=%zu D=%d dim=%u fd-passed (was %s)\n",
              db, idx, n_vecs, graph_degree, dim, shm_key);
@@ -7578,13 +7616,28 @@ handle_export_hnsw_shm(int client_fd, const CuvsCmdFrame *cmd)
     char shm_path[64];
     snprintf(shm_path, sizeof(shm_path), "/proc/self/fd/%d", mfd);
 
-    /* Serialize HNSW into the memfd (reuses existing cuvs_hnsw_serialize) */
+    /* Serialize HNSW into the memfd (reuses existing cuvs_hnsw_serialize).
+     * I3-B EV-1 (b): the entry is in use while the handle is read without
+     * the lock, so no eviction path (notably the reclaim thread) frees it;
+     * re-check it is still the same resident handle first. */
     pthread_mutex_lock(&g_index_mutex);
+    e = find_index(db, idx);
+    if (!e || e->handle != handle)
+    {
+        pthread_mutex_unlock(&g_index_mutex);
+        close(mfd);
+        send_error_code(client_fd, CUVS_STATUS_NOT_FOUND, "index evicted during export");
+        return;
+    }
+    e->inflight++;
     g_unlocked_gpu_jobs++;
     pthread_mutex_unlock(&g_index_mutex);
     int hrc = cuvs_hnsw_serialize(handle, shm_path, gpu);
     pthread_mutex_lock(&g_index_mutex);
     g_unlocked_gpu_jobs--;
+    e = find_index(db, idx);
+    if (e && e->inflight > 0)
+        e->inflight--;
     pthread_mutex_unlock(&g_index_mutex);
     if (hrc != CUVS_HNSW_SERIALIZE_OK)
     {
@@ -9766,6 +9819,8 @@ handle_memory_status(int client_fd)
 /* ---- reclaim thread (EV-5) ---- */
 
 static uint64_t g_reclaim_ticks;
+static pthread_t g_reclaim_tid;
+static int      g_reclaim_started;
 static int      g_reclaim_last_quiet_skips[CUVS_MAX_GPUS];
 
 /* One reclaim pass on device_id. Caller holds g_index_mutex. */
@@ -10503,6 +10558,14 @@ graceful_shutdown(void)
 {
     LOG_INFO("pg_cuvs_server: SIGTERM received, serializing indexes...\n");
 
+    /* I3-B: stop the reclaim thread before the final saves so no tick
+     * evicts concurrently with them (it checks g_shutdown every second). */
+    if (g_reclaim_started)
+    {
+        pthread_join(g_reclaim_tid, NULL);
+        g_reclaim_started = 0;
+    }
+
     /* Phase 3L-9: wake the batch worker (g_shutdown is already set) so it
      * fails any queued requests and exits, then join it. Always spawned. */
     if (g_batch_worker_started)
@@ -11043,13 +11106,10 @@ main(int argc, char **argv)
 
     /* Phase 3L-9: spawn the single BF micro-batch consumer. Always running but
      * inert until a request with a non-zero batch window is enqueued. */
-    {
-        pthread_t rtid;
-        if (pthread_create(&rtid, NULL, reclaim_thread, NULL) == 0)
-            pthread_detach(rtid);
-        else
-            LOG_WARN("pg_cuvs_server: reclaim thread failed to start; no background reclaim\n");
-    }
+    if (pthread_create(&g_reclaim_tid, NULL, reclaim_thread, NULL) == 0)
+        g_reclaim_started = 1;
+    else
+        LOG_WARN("pg_cuvs_server: reclaim thread failed to start; no background reclaim\n");
     if (pthread_create(&g_batch_worker_tid, NULL, batch_worker_thread, NULL) == 0)
         g_batch_worker_started = 1;
     else

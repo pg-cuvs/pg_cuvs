@@ -122,7 +122,7 @@ for name, body in funcs.items():
 
 # CAGRA regions must set 1 after their reset (reset_entry_stats zeroes it).
 fbc = funcs.get("finish_build_commit", "")
-if len(re.findall(r"(e|existing)->file_current = 1;", fbc)) != 2:
+if len(re.findall(r"(e|existing)->file_current = (1|strcmp\(save_dir, g_index_dir\) == 0);", fbc)) != 2:
     fail("CK-37 (a): finish_build_commit does not set file_current = 1 on both "
          "the REINDEX and the new-entry branch")
 li = funcs.get("load_index", "")
