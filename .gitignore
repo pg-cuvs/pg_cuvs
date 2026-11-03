@@ -33,6 +33,7 @@ src/*.o
 /test-unit
 /test-build-shm
 /test-build-corpus
+/test-status-text
 test/results/
 test/regression.diffs
 test/regression.out

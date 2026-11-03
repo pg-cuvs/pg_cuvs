@@ -72,7 +72,7 @@ ISOLATION_OPTS = --inputdir=test --outputdir=test
 # C source files + the CUDA-compiled wrapper (built below by nvcc).
 # PGXS only knows how to build .c → .o; the .cu → .o rule is custom,
 # but the resulting object MUST be listed in OBJS to be linked into the .so.
-OBJS           = src/pg_cuvs.o src/cuvs_ipc.o src/cuvs_util.o $(WRAPPER_OBJ) src/hnsw_export.o src/cuvs_build_corpus.o src/pg_cuvs_compaction.o
+OBJS           = src/pg_cuvs.o src/cuvs_ipc.o src/cuvs_util.o $(WRAPPER_OBJ) src/hnsw_export.o src/cuvs_build_corpus.o src/pg_cuvs_compaction.o src/cuvs_status_text.o
 
 # nvcc settings (Phase 1: brute-force only; CAGRA added later)
 NVCC          ?= nvcc
@@ -271,7 +271,7 @@ TEST_RT_LIB := $(shell [ "$$(uname -s)" = "Linux" ] && echo -lrt)
 test-unit: test/unit/test_cuvs_util.c src/cuvs_util.c src/cuvs_util.h src/cuvs_ipc.h \
            test/unit/test_build_corpus.c src/cuvs_build_corpus.c src/cuvs_build_corpus.h \
            test-hnsw-build test-hnsw-build-ipc test-hnsw-admission test-admission-contract \
-           test-admission-wire test-admission-message test-admission-ipc test-build-oom-thread test-cache-policy test-circuit-source
+           test-admission-wire test-admission-message test-admission-ipc test-build-oom-thread test-cache-policy test-circuit-source test-status-text
 	$(CC) -I src -DCUVS_TEST_HOOKS -o test-unit test/unit/test_cuvs_util.c src/cuvs_util.c $(TEST_RT_LIB)
 	./test-unit
 	$(CC) -I src -o test-build-corpus test/unit/test_build_corpus.c src/cuvs_build_corpus.c $(TEST_RT_LIB)
@@ -378,6 +378,17 @@ test-cache-policy: test/unit/test_cache_policy.c src/cuvs_cache_policy.c \
 
 EXTRA_CLEAN += test-cache-policy
 .PHONY: test-cache-policy
+
+# I3-B status text parsing (INDEX/MEMORY/RECLAIM_STATUS), row visibility and
+# busy-message class used by the pg_cuvs_* cache SQL functions. Pure C.
+test-status-text: test/unit/test_status_text.c src/cuvs_status_text.c \
+                  src/cuvs_status_text.h src/cuvs_ipc.h
+	$(CC) -std=gnu11 -Wall -Wextra -Werror -I src -o $@ test/unit/test_status_text.c \
+		src/cuvs_status_text.c
+	./$@
+
+EXTRA_CLEAN += test-status-text
+.PHONY: test-status-text
 
 # Converter fixtures include private PG page helpers, with backend stubs and
 # section garbage collection. Requires server headers, but no running backend.
