@@ -2841,9 +2841,15 @@ cuvs_hnsw_preflight(double rows, uint32_t dim, uint32_t hierarchy, uint32_t buil
     if (action == CUVS_HNSW_PRESPOOL_REJECT_BUDGET)
         cuvs_hnsw_budget_error(build_algo, reply.header.error, when);
     if (action == CUVS_HNSW_PRESPOOL_REJECT)
-        ereport(ERROR, (errmsg("pg_cuvs: temporary HNSW build failed (status %d): %s",
+        ereport(ERROR, (errcode(cuvs_hnsw_prespool_budget_refusal(&reply)
+                               ? ERRCODE_PROGRAM_LIMIT_EXCEEDED : ERRCODE_INTERNAL_ERROR),
+                        errmsg("pg_cuvs: temporary HNSW build failed (status %d): %s",
                                rc, reply.header.error),
-                        errdetail("Decided %s; no rows were spooled.", when),
+                        errdetail("he=%llu hb=%llu ge=%llu gb=%llu; decided %s; no rows were spooled.",
+                                  (unsigned long long)reply.host_estimate,
+                                  (unsigned long long)reply.host_budget,
+                                  (unsigned long long)reply.gpu_estimate,
+                                  (unsigned long long)reply.gpu_budget, when),
                         errhint("If the table statistics are stale, run ANALYZE and retry.")));
     if (action == CUVS_HNSW_PRESPOOL_NOTICE_OVERFLOW)
         cuvs_hnsw_transition_notice(reply.host_estimate, reply.host_budget,

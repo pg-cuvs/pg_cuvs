@@ -65,6 +65,18 @@ cuvs_hnsw_prespool_action(double reltuples, int ipc_rc, uint32_t route,
         ? CUVS_HNSW_PRESPOOL_NOTICE_OVERFLOW : CUVS_HNSW_PRESPOOL_PROCEED;
 }
 
+/* A no-fit route before any disk probe is a configured budget refusal,
+ * not an engine error. Keep unrelated status-5 failures internal. */
+static inline int
+cuvs_hnsw_prespool_budget_refusal(const CuvsHnswPreflightReply *reply)
+{
+    if (reply->header.status != CUVS_STATUS_BUILD_FAILED || reply->partitions
+        || reply->disk_regular || reply->disk_avail)
+        return 0;
+    return (reply->host_budget && reply->host_estimate > reply->host_budget)
+        || (reply->gpu_budget && reply->gpu_estimate > reply->gpu_budget);
+}
+
 /* Receipt timing flags from the PRE-scan action and the statistics that
  * action saw: PRESPOOL when the route was forecast before the scan; otherwise
  * AFTER_SCAN, plus NO_STATISTICS only when reltuples was absent or zero
