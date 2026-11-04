@@ -24,7 +24,11 @@ template <class Allocate>
 auto capture(std::size_t request, Allocate &&allocate) -> decltype(allocate())
 {
     try {
-        return allocate();
+        auto result = allocate();
+        // A successful backoff must erase earlier refused growth requests
+        // before the pool can throw from host-side block bookkeeping.
+        clear();
+        return result;
     } catch (...) {
         bytes = request > 0 && request <= static_cast<std::size_t>(INT64_MAX)
                     ? static_cast<int64_t>(request) : -1;

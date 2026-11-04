@@ -44,6 +44,17 @@ int main() {
     } catch (const std::bad_alloc &) {
         assert(failure::take_for_current_exception() == 4096);
     }
+    try {
+        failure::outer([]() -> void * {
+            caught(8192); // initial upstream growth refused
+            failure::capture(4096, []() -> void * { return nullptr; });
+            // Upstream allocation succeeded; pool bookkeeping then failed.
+            // RMM can turn that host exception into its final OOM exception.
+            throw std::bad_alloc();
+        });
+    } catch (const std::bad_alloc &) {
+        assert(failure::take_for_current_exception() == -1);
+    }
     caught(0);
     assert(failure::take() == -1);
     caught(std::numeric_limits<std::size_t>::max());
