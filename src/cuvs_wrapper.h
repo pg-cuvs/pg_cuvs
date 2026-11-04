@@ -480,6 +480,10 @@ void cuvs_set_inject_extend_oom(int enable);
  * so the daemon can report an after-admission OOM (ADR-086: no eviction, no
  * retry) apart from a non-OOM build failure. */
 int cuvs_last_build_was_oom(void);
+/* Pool-upstream growth request matched to the final build exception, not the caller's logical bytes.
+ * Per request thread; read and clear. No captured request (including synthetic
+ * OOM or an exception propagated from another host thread) returns -1. */
+int64_t cuvs_last_failed_allocation_bytes(void);
 /* I3 (C5 ATT): 1 if the last cuvs_cagra_build[_multi] on this thread failed
  * because the built index did not hold all n rows of its dataset (cuVS only
  * warns and returns a graph-only index). Read and clear, per thread. */

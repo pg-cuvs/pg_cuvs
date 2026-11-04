@@ -241,6 +241,7 @@ void cuvs_bf_free(CuvsBfIndex index, int device_id)
 static __thread int g_last_build_oom = 0;
 static int g_inject_build_oom = 0;
 int  cuvs_last_build_was_oom(void) { int v = g_last_build_oom; g_last_build_oom = 0; return v; }
+int64_t cuvs_last_failed_allocation_bytes(void) { return -1; } /* no RMM allocation in the shim */
 /* The CPU shim keeps the corpus itself; a dataset attach cannot fail. */
 int  cuvs_last_build_attach_failed(void) { return 0; }
 void cuvs_set_inject_build_oom(int n_fail) { g_inject_build_oom = n_fail; }

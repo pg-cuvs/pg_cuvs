@@ -3854,14 +3854,16 @@ log_release(const char *op, int gpu, uint32_t db, uint32_t idx, size_t needed,
              (unsigned long long) admission_mono_us());
 }
 
-/* [build_oom] (7 fields): after admission the build ran out of GPU memory and
- * no resident index is evicted (ADR-086; ADR-070's evict-to-fit is gone). */
+/* [build_oom] (8 fields): after admission the build ran out of GPU memory and
+ * no resident index is evicted. failed_bytes is the final failing upstream
+ * growth request, not needed or the logical suballocation; unknown is -1. */
 static void
 log_build_oom(const char *op, int gpu, uint32_t db, uint32_t idx, size_t needed)
 {
+    int64_t failed_bytes = cuvs_last_failed_allocation_bytes();
     LOG_WARN("[build_oom] op=%s gpu=%d db=%u idx=%u needed=%zu action=fail_no_evict "
-             "mono_us=%llu\n", op, gpu, db, idx, needed,
-             (unsigned long long) admission_mono_us());
+             "mono_us=%llu failed_bytes=%lld\n", op, gpu, db, idx, needed,
+             (unsigned long long) admission_mono_us(), (long long)failed_bytes);
 }
 
 /* Reply with an admission rejection: legacy status/error plus err_out. */
