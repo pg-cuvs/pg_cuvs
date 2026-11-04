@@ -3472,7 +3472,11 @@ cuvs_build_cagra_from_heap(Relation heapRel, Relation indexRel, IndexInfo *index
             cuvs_report_admission_fields(&fields, CUVS_ADMISSION_OBJ_CAGRA,
                 (Oid)build_index_oid, NULL,
                 psprintf("estimated from reltuples=%.0f before the heap scan, no rows were read; "
-                         "if the statistics are stale, run ANALYZE and retry", reltuples_est));
+                         "ACE-disk requires regular disk in a private workdir under %s; "
+                         "its disk requirement and availability are checked by the HNSW forecast, "
+                         "not by this CAGRA preflight; if the statistics are stale, run ANALYZE and retry",
+                         reltuples_est, cuvs_index_dir && cuvs_index_dir[0]
+                         ? cuvs_index_dir : "the daemon index directory"));
         }
     }
 
