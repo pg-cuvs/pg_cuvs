@@ -8,6 +8,7 @@ the CPU CI container as a non-root user so the EACCES branch is real.
 """
 import os
 import json
+import re
 import shutil
 import subprocess
 import sys
@@ -123,8 +124,8 @@ MUTATIONS = {
         '    g_lw_pending[device_id] = cuvs_lw_sat_add(g_lw_pending[device_id], lw_ub);',
         '    (void)lw_ub;')], {'daemon'}),
     'lw_pending_not_released': (SERVER, [(
-        '    lw_pending_release(lw_ub, target_gpu);\n    (void)lw_build_finish("build",',
-        '    (void)lw_build_finish("build",')], {'daemon'}),
+        '\n    lw_pending_release(lw_ub, target_gpu);\n',
+        '\n    (void)0; /* mutation: pending release removed */\n')], {'daemon'}),
     'error_policy_adds_pending': (SERVER, [(
         '    if (g_cagra_build_overflow != CUVS_LW_OVERFLOW_MANAGED)\n        return 0;\n'
         '    return cuvs_lw_ub_bytes(',
@@ -176,14 +177,20 @@ MUTATIONS = {
         'static uint64_t (*g_lw_host_guard_fn)(void) = lw_host_guard_bytes;',
         'static uint64_t lw_guard_inf(void) { return UINT64_MAX; }\n'
         'static uint64_t (*g_lw_host_guard_fn)(void) = lw_guard_inf;')], {'daemon'}),
-    'margin_literal_suffix': (POLICY, [(
-        '#define CUVS_MANAGED_LW_MARGIN_PERMILLE_DEFAULT 1250\n',
-        '#define CUVS_MANAGED_LW_MARGIN_PERMILLE_DEFAULT 1250u\n')], {'docs'}),
     # hook body (I4-owned, conch 2026-11-03 16:0x)
     'hook_inert_after_i4': (UTIL, [(
         '    return cuvs_lw_admit(&lw).reason;', '    (void)lw;\n    return CUVS_ADMISSION_NONE;')],
         {'policy', 'daemon'}),
 }
+
+# Bind to the active literal instead of a provisional numeric default.
+margin = re.search(r'^#define CUVS_MANAGED_LW_MARGIN_PERMILLE_DEFAULT ([0-9]+)$',
+                   (ROOT / POLICY).read_text(), re.M)
+if not margin:
+    raise ValueError('margin default must be one bare decimal')
+old_margin = margin.group(0) + '\n'
+MUTATIONS['margin_literal_suffix'] = (POLICY,
+    [(old_margin, old_margin.rstrip('\n') + 'u\n')], {'docs'})
 
 
 def run(argv, cwd):
