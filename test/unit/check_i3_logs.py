@@ -19,11 +19,11 @@ SCHEMAS = {
     'hnsw_route': 'phase requested_algo route overflow overflowed status rows est_host est_gpu host_budget gpu_budget partitions disk_need',
 }
 TEXT = set('op path algo shape_class auto_probe verdict reason policy overcommit outcome action route trigger f_src phase requested_algo overflow error'.split())
-TAG = re.compile(r'\[(' + '|'.join(SCHEMAS) + r')\] ')
+TAG = re.compile(r'^\[(?:INFO|WARN|ERROR|DEBUG)\] \[(' + '|'.join(SCHEMAS) + r')\] ')
 
 
 def parse_line(line):
-    match = TAG.search(line)
+    match = TAG.match(line)
     if not match:
         return None
     tag = match.group(1)
