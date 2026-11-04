@@ -408,7 +408,7 @@ static uint32_t g_rmm_pool_max_percent = 50;
 #define CUVS_RMM_SCRATCH_PERMILLE_DEFAULT 7726
 /* Provisional coefficient came from the I2 in-pool workspace measurements.
  * Q1 changes this binding together with the measured default coefficient. */
-#define CUVS_RMM_SCRATCH_VALIDATED_OVERFLOW_POLICY CUVS_LW_OVERFLOW_ERROR
+#define CUVS_RMM_SCRATCH_VALIDATED_OVERFLOW_POLICY CUVS_LW_OVERFLOW_MANAGED
 static uint32_t g_scratch_permille = CUVS_RMM_SCRATCH_PERMILLE_DEFAULT;
 /* ADR-087 (UC-5): build_algo=auto over the resident budget spills to ACE
  * (default) or fails with status 13. Startup-only; explicit ivf_pq/ace
