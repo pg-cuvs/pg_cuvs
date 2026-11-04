@@ -1184,7 +1184,7 @@ log_build_end(const AdmitLine *a, const CuvsLwBuildStats *lw, int attached,
     const char *route = strcmp(a->op, "BUILD_IVFPQ") == 0 ? "ivfpq" :
                         managed ? "cagra_managed" : "cagra";
     (void)cuvs_rmm_pool_stats(a->gpu, &st);
-    if (g_rmm_pool_limits[a->gpu] > 0)
+    if (g_rmm_pool_limits[a->gpu] > 0 && g_reclaim.peak_meter)
         LOG_INFO("[build_peak] op=%s gpu=%d db=%u idx=%u final=%zu "
                  "used_before=%llu peak_used=%llu used_after=%llu reserved_after=%llu "
                  "solo=%d outcome=%s lw_peak=%llu spill=%d mono_us=%llu\n",
