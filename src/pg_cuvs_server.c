@@ -6823,6 +6823,27 @@ static void finish_build_commit(int client_fd, const CuvsCmdFrame *cmd,
                                 int vectors_committed, const char *vecs_tmp,
                                 const char *vecs_final, uint32_t base_generation);
 
+/* Auto-shard refusal happens before the ordinary admission path. Keep its
+ * permanent AR0 payload and log on both corpus transports (C5). */
+static void
+admission_auto_shard_rejection(const CuvsCmdFrame *cmd, const char *path,
+                                CuvsAdmissionFields *rejection)
+{
+    size_t final = estimate_vram_bytes(cmd->n_vecs, (int)cmd->dim,
+                                       (int)cmd->graph_degree);
+    size_t needed = admission_needed_bytes(final);
+    AdmitLine al = {.op = "BUILD", .path = path,
+        .algo = admission_algo_name(cmd->build_algo), .gpu = -1,
+        .db = cmd->db_oid, .idx = cmd->index_oid, .dim = cmd->dim,
+        .gd = cmd->graph_degree ? cmd->graph_degree : 64,
+        .igd = cmd->intermediate_graph_degree ? cmd->intermediate_graph_degree : 128,
+        .n = cmd->n_vecs, .final = final, .needed = needed};
+    pthread_mutex_lock(&g_index_mutex);
+    admission_fill(rejection, CUVS_ADMISSION_AR0, needed, -1);
+    log_admit(&al, CUVS_ADMISSION_AR0);
+    pthread_mutex_unlock(&g_index_mutex);
+}
+
 static void
 handle_build(int client_fd, const CuvsCmdFrame *cmd)
 {
@@ -6950,13 +6971,11 @@ handle_build(int client_fd, const CuvsCmdFrame *cmd)
                                             ng, CUVS_SHARDS_MAX);
         if (resolved_sc == 0)
         {
+            CuvsAdmissionFields rejection;
+            admission_auto_shard_rejection(cmd, "single", &rejection);
             munmap(mem, total);
-            CuvsReplyHeader hdr = {0};
-            hdr.status = CUVS_STATUS_OOM_FALLBACK;
-            strncpy(hdr.error,
-                    "index too large for GPU VRAM even when fully sharded",
-                    sizeof(hdr.error) - 1);
-            send_all(client_fd, &hdr, sizeof(hdr));
+            send_admission_reject(client_fd, CUVS_STATUS_OOM_FALLBACK,
+                "index too large for GPU VRAM even when fully sharded", &rejection);
             return;
         }
         LOG_INFO("[handle_build] auto shard count: %u/%u %lld vecs dim %u -> %d shard(s)\n",
@@ -7666,6 +7685,8 @@ handle_build_multi(int client_fd, const CuvsCmdFrame *cmd, const char *index_dir
         resolved_sc = cuvs_auto_shard_count(total, (int)cmd->dim, budget, ng, CUVS_SHARDS_MAX);
         if (resolved_sc == 0)
         {
+            admission_auto_shard_rejection(cmd, "multi", &rej);
+            rej_set = 1;
             status = CUVS_STATUS_OOM_FALLBACK;
             err = "index too large for GPU VRAM even when fully sharded";
             goto fail;
