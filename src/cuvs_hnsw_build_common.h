@@ -279,6 +279,12 @@ typedef struct CuvsHnswRouteDecision {
     uint64_t sdk_gpu_budget;
 } CuvsHnswRouteDecision;
 
+/* Canonical preflight no-fit reason. Shared by producer and backend so
+ * generic BUILD_FAILED estimates never imply a configured-budget refusal.
+ * The existing wire status/layout and diagnostic text remain unchanged. */
+#define CUVS_HNSW_BUDGET_NO_FIT_REASON \
+    "no ACE partition count fits metadata/reorder/serializer and GPU budgets"
+
 /* Settings/training reserve must already have been prepared using the SAME
  * budgets. This decision allocates nothing and never silently changes builder. */
 static inline int
@@ -345,7 +351,7 @@ cuvs_hnsw_resolve_route(uint64_t n, uint32_t dim, uint32_t degree,
                                                   out->sdk_host_budget, out->sdk_gpu_budget);
         if (!out->partitions)
         {
-            snprintf(error, error_len, "no ACE partition count fits metadata/reorder/serializer and GPU budgets");
+            snprintf(error, error_len, "%s", CUVS_HNSW_BUDGET_NO_FIT_REASON);
             return CUVS_STATUS_BUILD_FAILED;
         }
         out->route = CUVS_HNSW_ROUTE_ACE;

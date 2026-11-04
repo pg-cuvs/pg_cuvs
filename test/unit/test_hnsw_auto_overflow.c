@@ -199,6 +199,7 @@ static void test_prespool_and_fallback(void)
             CUVS_HNSW_ALGO_AUTO, 128, CUVS_HNSW_OVERFLOW_ACE,
             512ULL << 20, 4ULL << 30, &nofit, why, sizeof(why)) == CUVS_STATUS_BUILD_FAILED);
         reply.header.status = nofit.status;
+        snprintf(reply.header.error, sizeof(reply.header.error), "%s", why);
         reply.host_estimate = nofit.host_estimate; reply.host_budget = nofit.host_budget;
         reply.gpu_estimate = nofit.gpu_estimate; reply.gpu_budget = nofit.gpu_budget;
         reply.partitions = nofit.decision.partitions;
@@ -219,6 +220,28 @@ static void test_prespool_and_fallback(void)
         CHECK(cuvs_hnsw_prespool_budget_refusal(&reply));
         memset(&reply, 0, sizeof(reply)); reply.header.status = CUVS_STATUS_BUILD_FAILED;
         CHECK(!cuvs_hnsw_prespool_budget_refusal(&reply));
+        /* Generic BUILD_FAILED must remain internal even with over-budget
+         * estimates: unsupported algo, unsupported overflow, unknown budget,
+         * and explicit tiny input all precede the no-fit branch. */
+        for (int i = 0; i < 4; i++)
+        {
+            uint32_t algo = i == 0 ? 999u : i == 3
+                ? CUVS_HNSW_ALGO_IVF_PQ : CUVS_HNSW_ALGO_AUTO;
+            uint32_t overflow = i == 1 ? 999u : CUVS_HNSW_OVERFLOW_ACE;
+            CHECK(cuvs_hnsw_forecast_route(i == 3 ? 8 : 20000,
+                128, 64, 128, 1, algo, 128, overflow,
+                i == 2 ? 0 : 1, 1, &nofit, why, sizeof(why))
+                == CUVS_STATUS_BUILD_FAILED);
+            memset(&reply, 0, sizeof(reply));
+            reply.header.status = nofit.status;
+            snprintf(reply.header.error, sizeof(reply.header.error), "%s", why);
+            reply.host_estimate = nofit.host_estimate;
+            reply.host_budget = nofit.host_budget;
+            reply.gpu_estimate = nofit.gpu_estimate;
+            reply.gpu_budget = nofit.gpu_budget;
+            reply.partitions = nofit.decision.partitions;
+            CHECK(!cuvs_hnsw_prespool_budget_refusal(&reply));
+        }
     }
 
     /* disk precheck: same formula as the daemon (UC-5 sub-decision 1(a)) */
