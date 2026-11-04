@@ -476,12 +476,12 @@ run_handle_build(uint32_t index_oid, uint32_t shard_count)
 }
 
 static int
-run_handle_build_multi(uint32_t index_oid)
+run_handle_build_multi(uint32_t index_oid, uint32_t shards)
 {
     int sv[2], st;
     char dir[256];
     CuvsPartialDesc desc[2];
-    CuvsCmdFrame cmd = build_cmd(index_oid, 1);
+    CuvsCmdFrame cmd = build_cmd(index_oid, shards);
     const int64_t half = N / 2;
     size_t per_vec = DIM * sizeof(float);
     char *whole = malloc((size_t)N * (per_vec + sizeof(uint64_t)));
@@ -551,6 +551,29 @@ test_callers(void)
     g_cold_indexes = calloc((size_t)g_max_indexes, sizeof(ColdIndexEntry));
     assert(g_indexes && g_cold_indexes);
 
+    /* Auto-shard impossibility is a permanent AR0 even before admission;
+     * both actual corpus transports must preserve its C5 payload. */
+    g_n_gpus = 1;
+    g_max_vram_per_gpu[0] = g_max_vram_per_gpu[1] = 1;
+    cuvs_shim_lw_reset();
+    for (int multi = 0; multi <= 1; multi++)
+    {
+        CuvsAdmissionFields fields = {0};
+        CHECK((multi ? run_handle_build_multi(80, 0) : run_handle_build(81, 0))
+              == CUVS_STATUS_OOM_FALLBACK);
+        int decoded = cuvs_admission_decode(last_reply.err_out, sizeof(last_reply.err_out), &fields);
+        CHECK(decoded == 0);
+        if (decoded == 0)
+        {
+            CHECK(fields.reason == CUVS_ADMISSION_AR0);
+            CHECK((fields.present & (CUVS_ADM_F_N | CUVS_ADM_F_Q)) == (CUVS_ADM_F_N | CUVS_ADM_F_Q));
+            CHECK(!strcmp(cuvs_admission_sqlstate(fields.reason), "54000"));
+        }
+        CHECK(cuvs_shim_lw_calls(CUVS_LW_OVERFLOW_MANAGED) == 0);
+    }
+    g_n_gpus = 2;
+    g_max_vram_per_gpu[0] = g_max_vram_per_gpu[1] = (size_t)64 << 30;
+
     /* Integration: both rejections must reach the real build handler before
      * the wrapper, any reservation or eviction. Removing the hook turns these
      * assertions RED, rather than merely testing the pure policy again. */
@@ -611,7 +634,7 @@ test_callers(void)
 
     /* handle_build_multi: active policy too. */
     cuvs_shim_lw_reset();
-    CHECK(run_handle_build_multi(104) == CUVS_STATUS_OK);
+    CHECK(run_handle_build_multi(104, 1) == CUVS_STATUS_OK);
     CHECK(cuvs_shim_lw_calls(CUVS_LW_OVERFLOW_MANAGED) == 1 &&
           cuvs_shim_lw_last_policy() == CUVS_LW_OVERFLOW_MANAGED);
     CHECK(g_lw_pending[0] == 0 && g_lw_pending[1] == 0);
