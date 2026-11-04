@@ -88,6 +88,20 @@ SELECT pg_cuvs_reset_circuit('ar_a_idx');
 RESET client_min_messages;
 CREATE INDEX ar_cagra ON ar_items USING cagra (embedding vector_l2_ops);
 SELECT pg_cuvs_last_rejection()->>'reason' AS last_reason_unchanged;
+-- ANALYZE makes the permanent AR0 preflight run before any heap scan.
+DROP INDEX ar_cagra;
+ANALYZE ar_items;
+SELECT pg_cuvs_set_vram_budget(144000);
+SELECT contract_ok
+    AND position('before the heap scan, no rows were read' IN err_detail) > 0
+    AND position('ACE-disk requires regular disk' IN err_detail) > 0
+    AND position('private workdir under /tmp/cuvs_indexes' IN err_detail) > 0
+    AND position('checked by the HNSW forecast' IN err_detail) > 0
+    AND position('build_algo=''ace''' IN err_hint) > 0 AS prespool_guidance_ok
+FROM pg_temp.ar_expect(
+    'CREATE INDEX ar_prespool ON ar_items USING cagra (embedding vector_l2_ops)',
+    'AR0','54000','BUILD',1,1);
+
 DROP TABLE ar_items;
 DROP TABLE ar_shard;
 DROP TABLE ar_a;
