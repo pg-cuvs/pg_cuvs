@@ -189,6 +189,38 @@ static void test_prespool_and_fallback(void)
     CHECK(cuvs_hnsw_prespool_action(1e6, CUVS_STATUS_PROTO_MISMATCH, 0, 0, 0) == CUVS_HNSW_PRESPOOL_FALLBACK);
     CHECK(cuvs_hnsw_prespool_action(1e6, OK, CUVS_HNSW_ROUTE_ACE, 1, 0) == CUVS_HNSW_PRESPOOL_FALLBACK);
 
+    /* The live 20k x128 / 512 MiB no-fit forecast is a configured budget
+     * refusal. An unrelated build failure or completed disk probe is not. */
+    {
+        CuvsHnswForecast nofit;
+        CuvsHnswPreflightReply reply = {0};
+        char why[128];
+        CHECK(cuvs_hnsw_forecast_route(20000, 128, 64, 128, 1,
+            CUVS_HNSW_ALGO_AUTO, 128, CUVS_HNSW_OVERFLOW_ACE,
+            512ULL << 20, 4ULL << 30, &nofit, why, sizeof(why)) == CUVS_STATUS_BUILD_FAILED);
+        reply.header.status = nofit.status;
+        reply.host_estimate = nofit.host_estimate; reply.host_budget = nofit.host_budget;
+        reply.gpu_estimate = nofit.gpu_estimate; reply.gpu_budget = nofit.gpu_budget;
+        reply.partitions = nofit.decision.partitions;
+        CHECK(cuvs_hnsw_prespool_budget_refusal(&reply));
+        reply.header.status = CUVS_STATUS_ERROR;
+        CHECK(!cuvs_hnsw_prespool_budget_refusal(&reply));
+        reply.header.status = CUVS_STATUS_BUILD_FAILED;
+        reply.disk_regular = 1;
+        CHECK(!cuvs_hnsw_prespool_budget_refusal(&reply));
+        reply.disk_regular = 0; reply.partitions = 1;
+        CHECK(!cuvs_hnsw_prespool_budget_refusal(&reply));
+        reply.partitions = 0; reply.disk_avail = 1;
+        CHECK(!cuvs_hnsw_prespool_budget_refusal(&reply));
+        reply.disk_avail = 0; reply.host_estimate = reply.host_budget;
+        reply.gpu_estimate = reply.gpu_budget;
+        CHECK(!cuvs_hnsw_prespool_budget_refusal(&reply));
+        reply.gpu_estimate++;
+        CHECK(cuvs_hnsw_prespool_budget_refusal(&reply));
+        memset(&reply, 0, sizeof(reply)); reply.header.status = CUVS_STATUS_BUILD_FAILED;
+        CHECK(!cuvs_hnsw_prespool_budget_refusal(&reply));
+    }
+
     /* disk precheck: same formula as the daemon (UC-5 sub-decision 1(a)) */
     CuvsHnswForecast f; char error[160];
     CHECK(forecast(1000000, CUVS_HNSW_ALGO_AUTO, CUVS_HNSW_OVERFLOW_ACE, 4ULL << 30, G, &f) == CUVS_STATUS_OK);
