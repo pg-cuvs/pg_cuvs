@@ -25,6 +25,7 @@ static int64_t failed = 4096;
 int64_t cuvs_last_failed_allocation_bytes(void) { int64_t v=failed; failed=-1; return v; }
 static uint64_t admission_mono_us(void) { return 100; }
 static void record(const char *format, ...) {
+ fputs("[WARN] ",stdout);
  va_list args; va_start(args,format); vprintf(format,args); va_end(args);
 }
 #define LOG_WARN(...) record(__VA_ARGS__)

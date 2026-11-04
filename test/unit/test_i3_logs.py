@@ -20,6 +20,13 @@ OOM = ('[WARN] [build_oom] op=BUILD gpu=0 db=1 idx=2 needed=800 '
        'action=fail_no_evict mono_us=1 failed_bytes=4096')
 
 class Logs(unittest.TestCase):
+    def test_only_logger_prefix_at_start_is_consumed(self):
+        self.assertEqual(judge.parse_line(OOM)[0], 'build_oom')
+        for text in ('fixture says ' + OOM, 'test output: ' + HNSW,
+                     OOM.removeprefix('[WARN] '), '  ' + OOM,
+                     '[DEBUG] description: ' + OOM):
+            with self.subTest(text=text):
+                self.assertIsNone(judge.parse_line(text))
     def test_failed_upstream_bytes_and_unknown(self):
         self.assertEqual(judge.parse_line(OOM)[1]['failed_bytes'], '4096')
         self.assertEqual(judge.parse_line(OOM.replace('4096','-1'))[1]['failed_bytes'], '-1')
