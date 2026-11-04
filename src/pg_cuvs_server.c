@@ -3331,6 +3331,7 @@ static __thread char g_build_notice_detail[512];
 static __thread char t_lw_notice[512];
 static __thread uint32_t t_notice_index_oid;
 static __thread uint64_t t_notice_self_unloaded;
+static __thread int t_self_replace_failure_noted;
 
 static void
 clear_build_notices(void)
@@ -3339,6 +3340,7 @@ clear_build_notices(void)
     t_evict_notices[0] = '\0';
     t_notice_index_oid = 0;
     t_notice_self_unloaded = 0;
+    t_self_replace_failure_noted = 0;
 }
 
 
@@ -3443,8 +3445,9 @@ static void
 note_self_replace_failure(uint32_t index_oid, uint64_t self_unloaded)
 {
     char label[32];
-    if (self_unloaded == 0)
+    if (self_unloaded == 0 || t_self_replace_failure_noted)
         return;
+    t_self_replace_failure_noted = 1;
     snprintf(label, sizeof(label), "index %u", index_oid);
     (void) cuvs_self_replace_fail_notice(g_build_notice, sizeof(g_build_notice),
                                          g_build_notice_detail, sizeof(g_build_notice_detail),
