@@ -273,7 +273,7 @@ test_parse_scratch_permille(void)
 {
     uint32_t v = 1234;
     CHECK("0", cuvs_parse_scratch_permille("0", &v) == 0 && v == 0);
-    CHECK("7726", cuvs_parse_scratch_permille("7726", &v) == 0 && v == 7726);
+    CHECK("1109", cuvs_parse_scratch_permille("1109", &v) == 0 && v == 1109);
     CHECK("max", cuvs_parse_scratch_permille("100000", &v) == 0 && v == 100000);
     v = 5;
     CHECK("max+1", cuvs_parse_scratch_permille("100001", &v) != 0 && v == 5);

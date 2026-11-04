@@ -121,7 +121,7 @@ test_needed_scratch_rounds_up(void)
     CHECK_EQ("ceil 999x1", cuvs_admission_needed_bytes(999, 0, 1, 0), 1000);
     CHECK_EQ("exact 1000x1", cuvs_admission_needed_bytes(1000, 0, 1, 0), 1001);
     CHECK_EQ("ceil 1001x1", cuvs_admission_needed_bytes(1001, 0, 1, 0), 1003);
-    CHECK_EQ("final 0", cuvs_admission_needed_bytes(0, 0, 7726, 0), 0);
+    CHECK_EQ("final 0", cuvs_admission_needed_bytes(0, 0, 7700, 0), 0);
     CHECK_EQ("rho max", cuvs_admission_needed_bytes(1000, 0,
              CUVS_ADMISSION_RHO_PERMILLE_MAX, 0), 1000u + 100000u);
     CHECK_EQ("rho past max", cuvs_admission_needed_bytes(1000, 0,
@@ -155,9 +155,9 @@ test_needed_saturates(void)
              cuvs_admission_needed_bytes(SAT / 2u, 0, 100000u, 0), SAT);
     /* Large but representable: no false saturation from final*rho. */
     CHECK_EQ("no false SAT",
-             cuvs_admission_needed_bytes(UINT64_C(1) << 50, 0, 7726u, 0),
-             (UINT64_C(1) << 50) + ((UINT64_C(1) << 50) / 1000u) * 7726u +
-                 (((UINT64_C(1) << 50) % 1000u) * 7726u + 999u) / 1000u);
+             cuvs_admission_needed_bytes(UINT64_C(1) << 50, 0, 7700u, 0),
+             (UINT64_C(1) << 50) + ((UINT64_C(1) << 50) / 1000u) * 7700u +
+                 (((UINT64_C(1) << 50) % 1000u) * 7700u + 999u) / 1000u);
 }
 
 static void
@@ -169,7 +169,7 @@ test_c3_admission_table(void)
     struct { uint32_t rho; int64_t q_rows; int64_t l_rows; } rows[] = {
         {0, 13296230, 23933091},     {2000, 4432076, 7977697},
         {3863, 2734162, 4921466},    {5000, 2216038, 3988848},
-        {7726, 1523748, 2742733},    {10797, 1127085, 2028743},
+        {7700, 1528302, 2750930},    {10797, 1127085, 2028743},
     };
     for (unsigned i = 0; i < sizeof(rows) / sizeof(rows[0]); i++) {
         char label[64];
@@ -182,9 +182,9 @@ test_c3_admission_table(void)
         snprintf(label, sizeof(label), "rho %u logical +1", rows[i].rho);
         CHECK(label, reserve(rows[i].l_rows + 1, 768, 32, rows[i].rho) > logical);
     }
-    /* L40S example: 1M x 768 gd32 at the H_Q rho 7726 and at 3863. */
-    CHECK_EQ("L40S N rho 7726", reserve(999000, 768, 32, 7726),
-             UINT64_C(27895276800));
+    /* L40S example: 1M x 768 gd32 at a high scratch coefficient and at 3863. */
+    CHECK_EQ("L40S N rho 7700", reserve(999000, 768, 32, 7700),
+             UINT64_C(27812160000));
     CHECK_EQ("L40S N rho 3863", reserve(999000, 768, 32, 3863),
              UINT64_C(15546038400));
 }

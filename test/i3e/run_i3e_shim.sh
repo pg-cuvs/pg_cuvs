@@ -39,7 +39,7 @@ startd() { # env assignment ("" for none), extra daemon flags...
     envs=$1; shift
     pkill -f pg_cuvs_server 2>/dev/null; sleep 1; pkill -9 -f pg_cuvs_server 2>/dev/null
     rm -f $S
-    su pg -c "$envs pg_cuvs_server --socket $S --index-dir $IDX --max-vram-mb 100 $* >>/tmp/d.log 2>&1 &"
+    su pg -c "$envs pg_cuvs_server --socket $S --index-dir $IDX --max-vram-mb 100 --rmm-scratch-permille 8000 $* >>/tmp/d.log 2>&1 &"
     for i in $(seq 1 30); do [ -S $S ] && break; sleep 1; done
 }
 # psql as role $1 (pg = superuser)
@@ -70,8 +70,8 @@ check "memory_status allowed for pg_monitor" [ "$(q mon "SELECT count(*) > 0 FRO
 check "build_status callable by another role" [ "$(q alice "SELECT count(*) FROM pg_cuvs_build_status()")" = 0 ]
 
 # --- 3. rejections: counters vs [admit] reject lines ---
-# N = final * (1 + 7.726) (I3-A rho default): a 20000 x 64 index has final
-# 10,240,000 B and N about 89.4 MB, so --max-vram-mb 100 admits i1 and ia
+# Explicit fixture rho = 8000: a 20000 x 64 index has final
+# 10,240,000 B and N = 92,160,000 B, so --max-vram-mb 100 admits i1 and ia
 # and rejects i2 on the GPU (no eviction by default); t4 (60000 rows) is AR0.
 mk() { # role table rows
     q $1 "CREATE TABLE $2 (id int, v vector(64)); INSERT INTO $2 SELECT g, (SELECT array_agg(((g*31+i) % 97)::real) FROM generate_series(1,64) i)::vector FROM generate_series(1,$3) g;" >/dev/null

@@ -403,10 +403,9 @@ static uint32_t g_rmm_pool_mb     = 0;   /* CPU fixture has no GPU allocator */
 static uint32_t g_rmm_pool_mb     = 512; /* initial reservation per usable GPU */
 #endif
 static uint32_t g_rmm_pool_max_percent = 50;
-/* C3 scratch coefficient rho (permille of final). 7,726 is the provisional
- * H_Q value (v5 C3: ceil(1000 x 7.0235 x 1.10)); Q1 measures the default
- * policy's rho and replaces this literal at H_M. */
-#define CUVS_RMM_SCRATCH_PERMILLE_DEFAULT 7726u
+/* C3 provisional coefficient; Q1-DERIVED.json supplies the calibrated
+ * value at H_M. Keep this the only numeric default definition. */
+#define CUVS_RMM_SCRATCH_PERMILLE_DEFAULT 7726
 /* Provisional coefficient came from the I2 in-pool workspace measurements.
  * Q1 changes this binding together with the measured default coefficient. */
 #define CUVS_RMM_SCRATCH_VALIDATED_OVERFLOW_POLICY CUVS_LW_OVERFLOW_ERROR
