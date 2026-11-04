@@ -11,7 +11,7 @@ from pathlib import Path
 SCHEMAS = {
     'admit': 'op path gpu db idx algo shape_class auto_probe n dim gd igd final scratch needed limit budget pending_before pending_after quota headroom_raw free_net pool_used logical_used evicted verdict reason res_bytes res_n lru_free elig_free pin_bytes policy overcommit reserved phys_free lw_ub lw_pending host_guard self_res mono_us',
     'release': 'op gpu db idx needed pending_after outcome lw_pending_after mono_us',
-    'build_oom': 'op gpu db idx needed action mono_us',
+    'build_oom': 'op gpu db idx needed action mono_us failed_bytes',
     'build_peak': 'op gpu db idx final used_before peak_used used_after reserved_after solo outcome lw_peak spill mono_us',
     'build_result': 'op gpu db idx algo n dim gd igd dataset_attached route build_ms outcome self_replace unloaded mono_us',
     'evict': 'op gpu db idx reason requester_idx idle_s protect_s hits vram_bytes saved_ms mono_us self_replace',
@@ -53,7 +53,7 @@ def parse_line(line):
                 raise ValueError('build_result: invalid duration')
         elif not re.fullmatch(r'-?\d+', value):
             raise ValueError(tag + ': invalid integer ' + key)
-        elif int(value) < 0 and key not in ('gpu', 'idle_s'):
+        elif int(value) < 0 and key not in ('gpu', 'idle_s', 'failed_bytes'):
             raise ValueError(tag + ': negative counter ' + key)
     if tag == 'admit':
         n = lambda key: int(row[key])
@@ -87,6 +87,8 @@ def parse_line(line):
                 raise ValueError('admit: AR5 cannot be solved by scope lru')
     if tag == 'build_oom' and row['action'] != 'fail_no_evict':
         raise ValueError('build_oom: retry/eviction action')
+    if tag == 'build_oom' and (int(row['failed_bytes']) == 0 or int(row['failed_bytes']) < -1):
+        raise ValueError('build_oom: failed_bytes must be positive or unknown -1')
     if tag == 'build_peak':
         if int(row['peak_used']) < max(int(row['used_before']), int(row['used_after'])):
             raise ValueError('build_peak: peak below live usage')

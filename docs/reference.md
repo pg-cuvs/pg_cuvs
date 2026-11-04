@@ -522,6 +522,10 @@ the unloaded index reloads on its next query.
 reported for that reason; `idle_s` is -1 for an index never searched. Daemon logs
 carry one `[admit]` line per admission decision, `[release]` when a reservation is
 returned and `[build_oom] ... action=fail_no_evict` for an out-of-memory build.
+The eight-field `[build_oom]` record ends with `failed_bytes`: the final failing
+pool-upstream growth request observed around the RMM limiter, which can differ
+from the caller's logical suballocation and from `needed`. Unobserved sizes
+(including synthetic OOM and failures outside this boundary) are `-1`, not zero.
 A build that defers to reload because the GPU index registry is full now prints a
 NOTICE instead of finishing silently.
 

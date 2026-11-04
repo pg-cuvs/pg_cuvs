@@ -31,6 +31,7 @@ src/*.o
 
 # Local unit-test binaries
 /test-unit
+/test-failed-allocation
 /test-build-shm
 /test-build-corpus
 /test-status-text

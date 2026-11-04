@@ -16,8 +16,19 @@ ADMIT = ('[INFO] [admit] op=BUILD path=single gpu=0 db=1 idx=2 algo=auto shape_c
 HNSW = ('[INFO] [hnsw_route] phase=forecast requested_algo=auto route=ace_disk overflow=ace '
         'overflowed=1 status=0 rows=100 est_host=200 est_gpu=300 host_budget=100 '
         'gpu_budget=100 partitions=2 disk_need=500')
+OOM = ('[WARN] [build_oom] op=BUILD gpu=0 db=1 idx=2 needed=800 '
+       'action=fail_no_evict mono_us=1 failed_bytes=4096')
 
 class Logs(unittest.TestCase):
+    def test_failed_upstream_bytes_and_unknown(self):
+        self.assertEqual(judge.parse_line(OOM)[1]['failed_bytes'], '4096')
+        self.assertEqual(judge.parse_line(OOM.replace('4096','-1'))[1]['failed_bytes'], '-1')
+    def test_failed_bytes_missing_or_zero_rejected(self):
+        for text in [OOM.replace(' failed_bytes=4096',''),
+                     OOM.replace('failed_bytes=4096','failed_bytes=0'),
+                     OOM.replace('failed_bytes=4096','failed_bytes=-2')]:
+            with self.subTest(text=text),self.assertRaises(ValueError):
+                judge.parse_line(text)
     def test_fixed_examples_and_hnsw_optional_error(self):
         self.assertEqual(judge.parse_line(ADMIT)[1]['reason'],'AR6')
         self.assertEqual(len(judge.parse_line(HNSW)[1]),13)

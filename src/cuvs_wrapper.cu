@@ -28,6 +28,7 @@
 
 #include <rmm/mr/pool_memory_resource.hpp>
 #include <rmm/mr/limiting_resource_adaptor.hpp>
+#include "cuvs_rmm_failure_resource.hpp"
 #include <rmm/mr/per_device_resource.hpp>
 #include <rmm/aligned.hpp>
 #include <rmm/resource_ref.hpp>
@@ -98,7 +99,7 @@ static DevicePool g_device_pools[CUVS_MAX_GPUS];
 
 /* Limiting adaptors provide atomic, allocation-aligned byte counters. The
  * upstream enforces the quota; the usage adaptor only counts live allocations. */
-using RmmUpstream = rmm::mr::limiting_resource_adaptor<rmm::mr::device_memory_resource>;
+using RmmUpstream = CuvsRmmFailureUpstream;
 using RmmPool = rmm::mr::pool_memory_resource<RmmUpstream>;
 /* I3-B (UC-6 A): the live-usage adaptor plus an always-on lock-free peak
  * (CAS max on the same atomic counter; no shared_mutex as in
@@ -119,10 +120,16 @@ private:
         std::size_t sz = rmm::align_up(bytes, rmm::CUDA_ALLOCATION_ALIGNMENT);
         std::size_t level = cuvs_peak_meter_reserve(dev_, sz);
         try {
-            void *p = upstream_.allocate(stream, bytes);
+            void *p = cuvs_failed_allocation::outer([&] {
+                return upstream_.allocate(stream, bytes);
+            });
             cuvs_peak_meter_commit(dev_, level);   /* only a successful allocation */
             return p;
+        } catch (const rmm::out_of_memory &) {
+            cuvs_peak_meter_free(dev_, sz);
+            throw;
         } catch (...) {
+            cuvs_failed_allocation::clear();
             cuvs_peak_meter_free(dev_, sz);
             throw;
         }
@@ -184,6 +191,7 @@ static std::atomic<int> g_inject_extend_oom{0};
  * process-wide flag a concurrent build on another thread could clear or set
  * it between this build and its read. */
 static thread_local int g_last_build_oom = 0;
+static thread_local int64_t g_last_build_failed_bytes = -1;
 /* I3 (C5 ATT): the built index did not hold all rows of its dataset. */
 static thread_local int g_last_build_att = 0;
 /* test-only: armed by cuvs_set_inject_build_oom(n); each build decrements and fails. */
@@ -1286,6 +1294,8 @@ cuvs_cagra_build_multi(const float **vecs, const int64_t *n_each, int n_parts,
     std::memset(lw, 0, sizeof(*lw));
     lw->free_at_peak = UINT64_MAX;
     g_last_build_oom = 0;   /* fresh per build attempt */
+    g_last_build_failed_bytes = -1;
+    cuvs_failed_allocation::clear();
     g_last_build_att = 0;
     PooledRes _pr(device_id);
     LwWorkspaceOps lw_ops{_pr, lw, nullptr};
@@ -1386,6 +1396,7 @@ cuvs_cagra_build_multi(const float **vecs, const int64_t *n_each, int n_parts,
 
         return new CuvsCagraIndexImpl(std::move(d_corpus), std::move(idx), metric);
     } catch (const std::bad_alloc &) {
+        g_last_build_failed_bytes = cuvs_failed_allocation::take_for_current_exception();
         /* OOM (incl. RMM out_of_memory). Flag it so the daemon reports an
          * after-admission OOM without evicting (ADR-086). */
         fprintf(stderr, "[cuvs_cagra_build_multi] out of memory\n");
@@ -2295,6 +2306,14 @@ cuvs_last_build_was_oom(void)
     int v = g_last_build_oom;   /* read and clear */
     g_last_build_oom = 0;
     return v;
+}
+
+extern "C" int64_t
+cuvs_last_failed_allocation_bytes(void)
+{
+    int64_t bytes = g_last_build_failed_bytes;
+    g_last_build_failed_bytes = -1;
+    return bytes;
 }
 
 extern "C" int

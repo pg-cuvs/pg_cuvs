@@ -137,12 +137,13 @@ verify-hnsw-sdk-plan:
 src/cuvs_wrapper.o: | verify-hnsw-sdk-plan
 endif
 
-src/cuvs_wrapper.o: src/cuvs_wrapper.cu src/cuvs_wrapper.h src/cuvs_hnsw_sdk_plan.cuh
+src/cuvs_wrapper.o: src/cuvs_wrapper.cu src/cuvs_wrapper.h src/cuvs_hnsw_sdk_plan.cuh \
+                    src/cuvs_failed_allocation.hpp src/cuvs_rmm_failure_resource.hpp
 	$(NVCC) $(NVCC_FLAGS) $(CUVS_SDK_PLAN_FLAGS) -I$(CUVS_INCLUDE) -I$(CUVS_RAPIDS_INCLUDE) -I./src -c $< -o $@
 
 # PGXS generates LLVM bitcode (.bc) from .c sources for JIT. The .cu file
 # has no PG-callable functions, so emit a stub bitcode so PGXS doesn't fail.
-src/cuvs_wrapper.bc: src/cuvs_wrapper.cu
+src/cuvs_wrapper.bc: src/cuvs_wrapper.cu src/cuvs_failed_allocation.hpp src/cuvs_rmm_failure_resource.hpp
 	@echo 'void cuvs_wrapper_jit_stub(void){}' > /tmp/_cuvs_stub.c
 	@clang-15 -emit-llvm -c /tmp/_cuvs_stub.c -o $@ 2>/dev/null \
 		|| clang -emit-llvm -c /tmp/_cuvs_stub.c -o $@
@@ -276,7 +277,7 @@ install-server-test: server-test
 # Deliberately independent of PGXS/pg_config/CUDA so it runs on a laptop.
 # librt exists on Linux (CI/VM) but not macOS — link it only where present.
 TEST_RT_LIB := $(shell [ "$$(uname -s)" = "Linux" ] && echo -lrt)
-test-unit: test-peak-log-switch test/unit/test_cuvs_util.c src/cuvs_util.c src/cuvs_util.h src/cuvs_ipc.h \
+test-unit: test-failed-allocation test-build-oom-log test-peak-log-switch test/unit/test_cuvs_util.c src/cuvs_util.c src/cuvs_util.h src/cuvs_ipc.h \
            test/unit/test_build_corpus.c src/cuvs_build_corpus.c src/cuvs_build_corpus.h \
            test-hnsw-build test-hnsw-build-ipc test-hnsw-admission test-admission-contract \
            test-i3-logs test-notice-wire test-admission-wire test-admission-message test-admission-ipc test-build-oom-thread test-cache-policy test-circuit-source test-status-text test-i3b-source test-peak-meter test-lw-policy test-lw-guard test-i3e-sql test-self-replace-notice
@@ -301,6 +302,15 @@ test-peak-log-switch:
 	python3 -I -B test/unit/test_peak_log_switch.py
 
 .PHONY: test-peak-log-switch
+
+test-failed-allocation: test/unit/test_failed_allocation.cpp src/cuvs_failed_allocation.hpp
+	$(CXX) -std=c++17 -Wall -Wextra -Werror -pthread -I src $< -o $@
+	./$@
+
+test-build-oom-log:
+	python3 -I -B test/unit/test_build_oom_log.py
+
+.PHONY: test-failed-allocation test-build-oom-log
 
 # HNSW admission and op-specific FD/owner lifecycle fixtures. No daemon, PG
 # backend or CUDA is needed. Keep separate targets for bounded worker checks.
@@ -495,7 +505,7 @@ test-hnsw-converter: test/unit/test_hnsw_converter.c src/hnsw_export.c \
 
 EXTRA_CLEAN += test-hnsw-build test-hnsw-build-ipc test-hnsw-converter test-hnsw-admission test-hnsw-explicit-route test-hnsw-policy \
                test-admission-contract test-admission-contract-cxx test-admission-contract-util.o \
-               test-admission-wire test-admission-message test-admission-ipc test-build-oom-thread test-hnsw-auto-overflow test-res-pool test-lw-policy test-lw-guard
+               test-admission-wire test-admission-message test-admission-ipc test-build-oom-thread test-hnsw-auto-overflow test-res-pool test-lw-policy test-lw-guard test-failed-allocation
 .PHONY: test-hnsw-build test-hnsw-build-ipc test-hnsw-converter test-hnsw-admission test-hnsw-explicit-route test-hnsw-policy \
         test-admission-contract test-admission-contract-mutations test-admission-wire \
         test-admission-message test-admission-ipc test-build-oom-thread test-gpu-wrapper-i3 test-hnsw-auto-overflow test-res-pool test-lw-policy test-lw-guard test-lw-mutations test-lw-docs
