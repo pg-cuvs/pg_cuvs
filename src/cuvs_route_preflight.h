@@ -71,7 +71,9 @@ static inline int
 cuvs_hnsw_prespool_budget_refusal(const CuvsHnswPreflightReply *reply)
 {
     if (reply->header.status != CUVS_STATUS_BUILD_FAILED || reply->partitions
-        || reply->disk_regular || reply->disk_avail)
+        || reply->disk_regular || reply->disk_avail
+        || strncmp(reply->header.error, CUVS_HNSW_BUDGET_NO_FIT_REASON,
+                   sizeof(reply->header.error)) != 0)
         return 0;
     return (reply->host_budget && reply->host_estimate > reply->host_budget)
         || (reply->gpu_budget && reply->gpu_estimate > reply->gpu_budget);
