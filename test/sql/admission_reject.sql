@@ -1,12 +1,6 @@
--- admission_reject.sql — I3 (v6 r18 C5, UC-2; CK-8, CK-29): a permanent
--- admission rejection (AR0) of a CAGRA and of an IVF-PQ build reaches the
--- user as SQLSTATE 54000 with the C5 errmsg, DETAIL and HINT, and is kept for
--- pg_cuvs_last_rejection(). AR0 is forced with the daemon's runtime budget
--- override (pg_cuvs_set_vram_budget), so the numbers are deterministic:
---   cagra 1000 x dim 8, gd 64: final 288,000 B, N = final + ceil(final x 7726
---   / 1000) = 2,513,088 B -> 2 MiB against a 1 MiB budget;
---   ivfpq 1000 x dim 8: 1000 x pq_dim 4 x 2 = 8,000 B against 4,096 B.
--- The budget is restored at the end.
+-- Admission errors consume the live daemon coefficient, not a frozen default.
+-- The full diagnostics are logged unchanged; the client comparison normalizes
+-- only numeric DETAIL text and separately checks the independently derived bytes.
 \set ON_ERROR_STOP on
 SET client_min_messages = warning;
 CREATE EXTENSION IF NOT EXISTS vector;
@@ -15,82 +9,85 @@ RESET client_min_messages;
 SET cuvs.index_dir = '/tmp/cuvs_indexes';
 SET max_parallel_maintenance_workers = 0;
 
--- No rejection yet in this session.
-SELECT pg_cuvs_last_rejection() IS NULL AS no_rejection_yet;
+CREATE FUNCTION pg_temp.ar_expect(cmd text, reason text, state text,
+    requester text, need_mib bigint, limit_mib bigint, shard integer DEFAULT NULL)
+RETURNS TABLE(err_message text, err_detail text, err_hint text, contract_ok boolean)
+LANGUAGE plpgsql AS $$
+DECLARE
+    actual_state text;
+    actual_detail text;
+    r jsonb;
+BEGIN
+    BEGIN
+        EXECUTE cmd;
+        RAISE EXCEPTION 'expected admission refusal, command succeeded';
+    EXCEPTION WHEN OTHERS THEN
+        GET STACKED DIAGNOSTICS actual_state = RETURNED_SQLSTATE,
+            err_message = MESSAGE_TEXT, actual_detail = PG_EXCEPTION_DETAIL,
+            err_hint = PG_EXCEPTION_HINT;
+        r := pg_cuvs_last_rejection();
+        contract_ok := actual_state = state AND r->>'reason' = reason
+            AND r->>'sqlstate' = state AND r->>'requester' = requester
+            AND (r->'fields'->>'need_mib')::bigint = need_mib
+            AND (r->'fields'->>'quota_mib')::bigint = limit_mib
+            AND (r->>'shard')::integer IS NOT DISTINCT FROM shard
+            AND position(format('needs %s MiB', need_mib) IN actual_detail) > 0;
+        RAISE LOG 'I3_ERROR_SNAPSHOT state=% message=% detail=% hint=%',
+            actual_state, err_message, actual_detail, err_hint;
+        err_detail := regexp_replace(actual_detail, '[0-9]+', '<n>', 'g');
+        RETURN NEXT;
+    END;
+END
+$$;
 
-CREATE TABLE ar_items (id int, embedding vector(8));
+SELECT pg_cuvs_last_rejection() IS NULL AS no_rejection_yet;
+SELECT (current_setting('cuvs.rmm_pool_status')::jsonb->>'scratch_permille')::bigint AS rho \gset
+
+CREATE TABLE ar_items (id int, embedding vector(8)) WITH (autovacuum_enabled=false);
 INSERT INTO ar_items
 SELECT g, format('[%s,%s,0,0,0,0,0,1]', g, g % 7)::vector FROM generate_series(1, 1000) g;
-
-SELECT pg_cuvs_set_vram_budget(1048576);
-\set ON_ERROR_STOP off
-CREATE INDEX ar_cagra ON ar_items USING cagra (embedding vector_l2_ops);
-\echo :LAST_ERROR_SQLSTATE
-\set ON_ERROR_STOP on
-SELECT r->>'reason' AS reason, r->>'sqlstate' AS sqlstate, r->>'requester' AS requester,
-       r->'fields' AS fields, r->'candidates' AS candidates, r->'shard' AS shard
-FROM pg_cuvs_last_rejection() r;
+-- Half the final footprint refuses for every supported coefficient, even zero.
+SELECT pg_cuvs_set_vram_budget(144000);
+SELECT * FROM pg_temp.ar_expect(
+    'CREATE INDEX ar_cagra ON ar_items USING cagra (embedding vector_l2_ops)',
+    'AR0','54000','BUILD',(288000::bigint+(288000::bigint*:rho+999)/1000)/1048576,0);
 
 SELECT pg_cuvs_set_vram_budget(4096);
-\set ON_ERROR_STOP off
-CREATE INDEX ar_ivfpq ON ar_items USING ivfpq (embedding vector_l2_ops);
-\echo :LAST_ERROR_SQLSTATE
-\set ON_ERROR_STOP on
-SELECT r->>'reason' AS reason, r->>'sqlstate' AS sqlstate,
-       (r->>'index_oid')::oid <> 0 AS has_index_oid
-FROM pg_cuvs_last_rejection() r;
+SELECT * FROM pg_temp.ar_expect(
+    'CREATE INDEX ar_ivfpq ON ar_items USING ivfpq (embedding vector_l2_ops)',
+    'AR0','54000','BUILD',0,0);
+SELECT (r->>'index_oid')::oid <> 0 AS has_index_oid FROM pg_cuvs_last_rejection() r;
 
--- Sharded build (CK-36 (d')): 4000 rows in 2 shards of 2000, each
--- N = 576,000 + 4,450,176 = 5,026,176 B (4 MiB) against 3 MiB. The shard
--- rejection carries its shard number in DETAIL and in the jsonb.
-CREATE TABLE ar_shard (id int, embedding vector(8));
+CREATE TABLE ar_shard (id int, embedding vector(8)) WITH (autovacuum_enabled=false);
 INSERT INTO ar_shard
 SELECT g, format('[%s,%s,0,0,0,0,1,0]', g, g % 11)::vector FROM generate_series(1, 4000) g;
 SET cuvs.shard_count = 2;
-SELECT pg_cuvs_set_vram_budget(3145728);
-\set ON_ERROR_STOP off
-CREATE INDEX ar_sharded ON ar_shard USING cagra (embedding vector_l2_ops);
-\echo :LAST_ERROR_SQLSTATE
-\set ON_ERROR_STOP on
-SELECT r->>'reason' AS reason, r->>'sqlstate' AS sqlstate, r->>'requester' AS requester,
-       r->'shard' AS shard
-FROM pg_cuvs_last_rejection() r;
+SELECT pg_cuvs_set_vram_budget(288000);
+SELECT * FROM pg_temp.ar_expect(
+    'CREATE INDEX ar_sharded ON ar_shard USING cagra (embedding vector_l2_ops)',
+    'AR0','54000','SHARD',(576000::bigint+(576000::bigint*:rho+999)/1000)/1048576,0,0);
 RESET cuvs.shard_count;
 
--- Search-path reload rejection (C5 reload row): unload ar_a explicitly,
--- then query under a budget below its final size. Build scope none must
--- not be bypassed merely to arrange this reload fixture.
+-- Explicit unload arranges a reload miss without bypassing build scope none.
 SELECT pg_cuvs_set_vram_budget(0);
 CREATE TABLE ar_a (id int, embedding vector(8));
-INSERT INTO ar_a
-SELECT g, format('[%s,0,0,0,0,0,0,1]', g)::vector FROM generate_series(1, 1000) g;
+INSERT INTO ar_a SELECT g, format('[%s,0,0,0,0,0,0,1]', g)::vector FROM generate_series(1,1000) g;
 CREATE INDEX ar_a_idx ON ar_a USING cagra (embedding vector_l2_ops);
-CREATE TABLE ar_b (id int, embedding vector(8));
-INSERT INTO ar_b
-SELECT g, format('[0,%s,0,0,0,0,0,1]', g)::vector FROM generate_series(1, 1000) g;
-CREATE INDEX ar_b_idx ON ar_b USING cagra (embedding vector_l2_ops);
 SELECT pg_cuvs_unload('ar_a_idx');
 SELECT pg_cuvs_set_vram_budget(100000);
 SET enable_seqscan = off;
-\set ON_ERROR_STOP off
-SELECT id FROM ar_a ORDER BY embedding <-> '[3,0,0,0,0,0,0,1]'::vector LIMIT 1;
-\echo :LAST_ERROR_SQLSTATE
-\set ON_ERROR_STOP on
+SELECT * FROM pg_temp.ar_expect(
+    'SELECT id FROM ar_a ORDER BY embedding <-> ''[3,0,0,0,0,0,0,1]''::vector LIMIT 1',
+    'AR0','53200','LOAD',0,0);
 RESET enable_seqscan;
-SELECT r->>'reason' AS reason, r->>'sqlstate' AS sqlstate, r->>'requester' AS requester,
-       (r->>'index_oid')::oid = 'ar_a_idx'::regclass AS is_ar_a
-FROM pg_cuvs_last_rejection() r;
+SELECT (r->>'index_oid')::oid = 'ar_a_idx'::regclass AS is_ar_a FROM pg_cuvs_last_rejection() r;
+
 SELECT pg_cuvs_set_vram_budget(0);
-SET client_min_messages = warning;   -- the reset NOTICE prints an OID
+SET client_min_messages = warning;
 SELECT pg_cuvs_reset_circuit('ar_a_idx');
 RESET client_min_messages;
-
--- Restored budget: the same build is admitted.
-SELECT pg_cuvs_set_vram_budget(0);
 CREATE INDEX ar_cagra ON ar_items USING cagra (embedding vector_l2_ops);
 SELECT pg_cuvs_last_rejection()->>'reason' AS last_reason_unchanged;
-
 DROP TABLE ar_items;
 DROP TABLE ar_shard;
 DROP TABLE ar_a;
-DROP TABLE ar_b;

@@ -3798,8 +3798,8 @@ OOM마다 상주 인덱스를 축출하는 재시도는 상주 검색 지연을 
 1. CAGRA 단건·병렬·샤드 빌드의 입장, 예약, 해제, GPU 선택은
    `N = final + ceil(final × ρ / 1000)`을 쓰고 상주 회계는 `final`을 쓴다.
    `final = n × (4 × ld + 4 × gd)`, `ld = 4 × ceil(dim / 4)`. ρ는
-   `--rmm-scratch-permille`(0~100000, 임시 기본 7726: Q1이 기본 정책에서 잰 값으로 H_M에서
-   교체). 곱셈·덧셈은 포화하며 포화값은 어떤 예산에도 입장되지 않는다.
+   `--rmm-scratch-permille`(0~100000, 임시값이며 `Q1-DERIVED.json`이 정한 값으로
+   H_M에서 교체). 곱셈·덧셈은 포화하며 포화값은 어떤 예산에도 입장되지 않는다.
 2. 입장 뒤 OOM은 상주 인덱스를 내리지 않고 status 2와 OOM 페이로드로 끝낸다.
    재시도 루프를 지운다. `[build_oom] action=fail_no_evict`.
 3. 거부는 사유 코드(AR0~AR7, OOM, ATT)와 수치를 `err_out`(512 B 텍스트, 후보 최대 3개)으로
