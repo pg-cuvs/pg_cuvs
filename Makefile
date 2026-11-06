@@ -982,3 +982,16 @@ test-rmm-pending:
 		src/cuvs_cache_policy.c src/cuvs_peak_meter.c \
 		-Wl,--gc-sections -lm -lpthread -lrt -lcurl -lssl -lcrypto -o test-rmm-pending
 	./test-rmm-pending
+
+# ADR-089 AR8 pool-capacity premise through the actual daemon source (Linux
+# CPU CI): Q6 shape refused, order AR1 -> AR8 -> AR6 -> make_room, nothing
+# evicted or reserved, err_out and [admit] fields, knob parsing.
+EXTRA_CLEAN += test-ar8-daemon
+.PHONY: test-ar8-daemon
+test-ar8-daemon:
+	$(CC) -std=gnu11 -O1 -DPGCUVS_CPU_SHIM -ffunction-sections -fdata-sections -I src \
+		test/unit/test_ar8_daemon.c src/cuvs_ipc.c src/cuvs_util.c \
+		src/cuvs_objstore.c src/cuvs_build_corpus.c src/cuvs_wrapper_shim_cpu.c \
+		src/cuvs_cache_policy.c src/cuvs_peak_meter.c \
+		-Wl,--gc-sections -lm -lpthread -lrt -lcurl -lssl -lcrypto -o test-ar8-daemon
+	./test-ar8-daemon

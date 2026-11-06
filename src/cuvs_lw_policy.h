@@ -199,6 +199,16 @@ cuvs_lw_parse_margin(const char *s, uint32_t *out)
     return 0;
 }
 
+/* ADR-089 --rmm-build-headroom-permille, 0..100000 (0 = no headroom). */
+static inline int
+cuvs_lw_parse_build_headroom(const char *s, uint32_t *out)
+{
+    unsigned long v;
+    if (cuvs_lw_parse_uint(s, 0, CUVS_RMM_BUILD_HEADROOM_PERMILLE_MAX, &v) != 0) return -1;
+    *out = (uint32_t)v;
+    return 0;
+}
+
 static inline int
 cuvs_lw_parse_oom_score_adj(const char *s, int *out)
 {

@@ -9,7 +9,7 @@ import re
 from pathlib import Path
 
 SCHEMAS = {
-    'admit': 'op path gpu db idx algo shape_class auto_probe n dim gd igd final scratch needed limit budget pending_before pending_after quota headroom_raw free_net pool_used logical_used evicted verdict reason res_bytes res_n lru_free elig_free pin_bytes policy overcommit reserved phys_free lw_ub lw_pending host_guard self_res mono_us',
+    'admit': 'op path gpu db idx algo shape_class auto_probe n dim gd igd final scratch needed limit budget pending_before pending_after quota headroom_raw free_net pool_used logical_used evicted verdict reason res_bytes res_n lru_free elig_free pin_bytes policy overcommit reserved phys_free lw_ub lw_pending host_guard self_res mono_us pool_need headroom pool_quota pending',
     'release': 'op gpu db idx needed pending_after outcome lw_pending_after mono_us',
     'build_oom': 'op gpu db idx needed action mono_us failed_bytes',
     'build_peak': 'op gpu db idx final used_before peak_used used_after reserved_after solo outcome lw_peak spill mono_us',
@@ -72,9 +72,20 @@ def parse_line(line):
                 raise ValueError('load: reservation changed')
         if row['reason'] == 'AR0' and not n('needed') > n('limit'):
             raise ValueError('admit: AR0 limit does not explain rejection')
+        # ADR-089: pool_need = needed + lw_ub; AR8 when the pool quota cannot
+        # hold pending + pool_need + headroom. Decided before AR6/AR7 and
+        # before eviction.
+        ar8 = n('pool_quota') > 0 and n('pending') + n('pool_need') + n('headroom') > n('pool_quota')
+        if row['reason'] == 'AR8':
+            if n('quota') and n('pending_before') + n('needed') > n('quota'):
+                raise ValueError('admit: AR1 takes precedence over AR8')
+            if n('pool_need') != n('needed') + n('lw_ub') or not ar8 or n('evicted'):
+                raise ValueError('admit: AR8 arithmetic/order differs')
         if row['reason'] in ('AR6', 'AR7'):
             if n('quota') and n('pending_before') + n('needed') > n('quota'):
                 raise ValueError('admit: AR1 takes precedence over workspace rejection')
+            if ar8:
+                raise ValueError('admit: AR8 takes precedence over workspace rejection')
             growth = max(0, n('needed') - max(0, n('reserved') - n('pool_used')))
             spill = max(0, growth + n('lw_ub') + n('lw_pending') - n('phys_free'))
             expected_reason = ('AR6' if spill > 0 else 'none') if row['overcommit'] == 'off' else ('AR7' if spill > n('host_guard') else 'none')

@@ -430,6 +430,9 @@ static uint32_t g_cagra_build_overflow       = CUVS_CAGRA_BUILD_OVERFLOW_DEFAULT
 static int      g_managed_overcommit         = CUVS_MANAGED_OVERCOMMIT_DEFAULT;
 static uint32_t g_managed_lw_margin_permille = CUVS_MANAGED_LW_MARGIN_PERMILLE_DEFAULT;
 static int      g_oom_score_adj              = CUVS_OOM_SCORE_ADJ_DEFAULT;
+/* ADR-089 --rmm-build-headroom-permille: AR8 headroom over pool_need.
+ * Startup flag only, like the I4 knobs above. */
+static uint32_t g_rmm_build_headroom_permille = CUVS_RMM_BUILD_HEADROOM_PERMILLE_DEFAULT;
 static int      g_oom_score_adj_effective    = -1;   /* -1 = not read */
 static char     g_oom_score_adj_result[CUVS_LW_OOM_RESULT_LEN] = "oom_score_adj not evaluated";
 /* Per GPU, under g_index_mutex: sum of lw_ub over admitted managed builds
@@ -1068,7 +1071,24 @@ typedef struct AdmitLine {
     int         cache_valid;
     CuvsAdmissionWorkspaceInput workspace;
     int         workspace_valid;
+    /* ADR-089 AR8 inputs, set by ensure_vram for a CAGRA build. */
+    int         pool_valid;
+    uint64_t    pool_need, pool_headroom, pool_pending;
 } AdmitLine;
+
+/* AR8 err_out subset: n = pool_need (not N_m), q = pool quota, p = pending,
+ * d = headroom (ADR-089). Other reasons are left as filled. */
+static void
+admission_pool_fields(CuvsAdmissionFields *f, const AdmitLine *a, int dev)
+{
+    if (f->reason != CUVS_ADMISSION_AR8 || !a->pool_valid)
+        return;
+    f->n = cuvs_admission_mib(a->pool_need);
+    f->q = cuvs_admission_mib(g_rmm_pool_limits[dev]);
+    f->p = cuvs_admission_mib(a->pool_pending);
+    f->d = cuvs_admission_mib(a->pool_headroom);
+    f->present = CUVS_ADM_F_N | CUVS_ADM_F_Q | CUVS_ADM_F_P | CUVS_ADM_F_D;
+}
 
 /* ---- I3-E observation (C8): rejection counters and in-flight builds ----
  * Every variable here is read and written under g_index_mutex. Counters are
@@ -1276,7 +1296,8 @@ log_admit(const AdmitLine *a, CuvsAdmissionReason reason)
              "headroom_raw=%zu free_net=%zu pool_used=%llu logical_used=%zu evicted=%d "
              "verdict=%s reason=%s res_bytes=%zu res_n=%u lru_free=%llu elig_free=%llu "
              "pin_bytes=%llu policy=%s overcommit=%s reserved=%llu phys_free=%llu lw_ub=%llu "
-             "lw_pending=%llu host_guard=%llu self_res=%llu mono_us=%llu\n",
+             "lw_pending=%llu host_guard=%llu self_res=%llu mono_us=%llu "
+             "pool_need=%llu headroom=%llu pool_quota=%zu pending=%llu\n",
              a->op, a->path, dev, a->db, a->idx, a->algo, shape,
              (long long) a->n, a->dim,
              a->gd, a->igd, a->final, scratch, a->needed, limit, budget,
@@ -1289,7 +1310,10 @@ log_admit(const AdmitLine *a, CuvsAdmissionReason reason)
              policy, overcommit, (unsigned long long)reserved,
              (unsigned long long)phys_free, (unsigned long long)lw_ub,
              (unsigned long long)lw_pending, (unsigned long long)host_guard,
-             (unsigned long long)a->self_res, (unsigned long long)admission_mono_us());
+             (unsigned long long)a->self_res, (unsigned long long)admission_mono_us(),
+             (unsigned long long)(a->pool_valid ? a->pool_need : 0),
+             (unsigned long long)(a->pool_valid ? a->pool_headroom : 0), quota,
+             (unsigned long long)(a->pool_valid ? a->pool_pending : 0));
     if (reason != CUVS_ADMISSION_NONE)
         observe_reject(dev, reason);   /* I3-E: one count per emitted rejection */
     if (a->shape && strcmp(a->shape, "extrapolated") == 0)
@@ -3277,6 +3301,20 @@ ensure_vram(size_t needed, int device_id, CuvsRequester rq, CuvsAdmissionFields 
         }
         else
             wr = cuvs_admission_workspace_check(&line->workspace);
+        /* AR8 (ADR-089): the pool must hold N_m plus large_workspace plus
+         * headroom. A premise about the pool, so it is decided before AR6/7
+         * and before make_room: a refusal evicts and reserves nothing. */
+        line->pool_need = cuvs_admission_pool_need(needed, line->workspace.lw_ub);
+        line->pool_headroom = cuvs_admission_build_headroom(line->pool_need,
+                                                            g_rmm_build_headroom_permille);
+        line->pool_pending = pending;
+        line->pool_valid = 1;
+        if (cuvs_admission_pool_refuses(quota, pending, line->pool_need,
+                                        line->pool_headroom))
+        {
+            g_last_admit_reason = CUVS_ADMISSION_AR8;
+            goto admission_rejected;
+        }
         if (wr != CUVS_ADMISSION_NONE)
         {
             g_last_admit_reason = wr;
@@ -3307,6 +3345,8 @@ admission_rejected:
                        needed, device_id);
         if (line && line->workspace_valid)
             admission_workspace_fields(rej, &line->workspace);
+        if (line)
+            admission_pool_fields(rej, line, device_id);
         if (g_last_admit_reason == CUVS_ADMISSION_AR5 &&
             (rq == CUVS_RQ_LOAD || rq == CUVS_RQ_LOAD_SHARD))
         {
@@ -3358,6 +3398,7 @@ admit_build_cagra(size_t needed, int device_id, uint32_t db_oid,
 {
     *unloaded = 0;
     line->workspace_valid = 0;
+    line->pool_valid = 0;
     line->cache_valid = 0;
     line->self_res = 0;
     g_build_notice[0] = '\0';
@@ -3384,7 +3425,7 @@ admit_build_cagra(size_t needed, int device_id, uint32_t db_oid,
         shortfall = needed - fr;
     if (reason == CUVS_ADMISSION_AR0 || reason == CUVS_ADMISSION_AR1 ||
         reason == CUVS_ADMISSION_AR2 || reason == CUVS_ADMISSION_AR6 ||
-        reason == CUVS_ADMISSION_AR7 ||
+        reason == CUVS_ADMISSION_AR7 || reason == CUVS_ADMISSION_AR8 ||
         cuvs_self_replace_decide(shortfall, has_old, has_old && old->pinned,
                                  old_bytes, g_reclaim.self_replace)
             != CUVS_SELF_REPLACE)
@@ -7035,6 +7076,7 @@ handle_build(int client_fd, const CuvsCmdFrame *cmd)
                        needed, target_gpu);
         if (al.workspace_valid)
             admission_workspace_fields(&rej, &al.workspace);
+        admission_pool_fields(&rej, &al, target_gpu);
         if (rej.reason == CUVS_ADMISSION_AR5)
             rej.s = cuvs_admission_mib(admission_same_resident(cmd->db_oid, cmd->index_oid, target_gpu));
     }
@@ -7772,6 +7814,7 @@ handle_build_multi(int client_fd, const CuvsCmdFrame *cmd, const char *index_dir
                            needed, target_gpu);
             if (al.workspace_valid)
                 admission_workspace_fields(&rej, &al.workspace);
+            admission_pool_fields(&rej, &al, target_gpu);
             if (rej.reason == CUVS_ADMISSION_AR5)
                 rej.s = cuvs_admission_mib(admission_same_resident(cmd->db_oid, cmd->index_oid, target_gpu));
         }
@@ -11833,6 +11876,16 @@ main(int argc, char **argv)
                 return 1;
             }
         }
+        else if (strcmp(argv[i], "--rmm-build-headroom-permille") == 0)
+        {
+            if (i + 1 >= argc ||
+                cuvs_lw_parse_build_headroom(argv[++i], &g_rmm_build_headroom_permille) != 0)
+            {
+                LOG_ERROR("--rmm-build-headroom-permille requires an integer from 0 to %u\n",
+                          CUVS_RMM_BUILD_HEADROOM_PERMILLE_MAX);
+                return 1;
+            }
+        }
         else if (strcmp(argv[i], "--rmm-pool-max-percent") == 0)
         {
             if (i + 1 >= argc ||
@@ -12065,6 +12118,8 @@ main(int argc, char **argv)
              g_rmm_pool_mb > 0 ? g_rmm_pool_max_percent : 0);
     LOG_INFO("CAGRA build scratch: rmm_scratch_permille=%u (admission N = final + "
              "ceil(final x %u / 1000))\n", g_scratch_permille, g_scratch_permille);
+    LOG_INFO("CAGRA build pool headroom: rmm_build_headroom_permille=%u (AR8 refuses "
+             "pending + N + lw_ub + headroom > pool quota)\n", g_rmm_build_headroom_permille);
     LOG_INFO("HNSW auto overflow: %s (--hnsw-auto-overflow; default %s)\n",
              cuvs_hnsw_overflow_name(g_hnsw_auto_overflow),
              cuvs_hnsw_overflow_name(CUVS_HNSW_AUTO_OVERFLOW_DEFAULT));
