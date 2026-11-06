@@ -161,12 +161,17 @@ test_order(void)
     g_max_vram_per_gpu[0] = a.needed + GiB / 2;
     CHECK(admit(&a, NULL) == CUVS_ADMISSION_NONE);
     CHECK(g_cache_evictions[0] == 1 && g_n_indexes == 0);
-    /* ... while the refused Q6 build evicts nothing. */
-    resident.valid = 1;
+    /* ... while the refused Q6 build evicts nothing. Restore the entry the
+     * eviction above cleared, and check the budget is short again, so the
+     * no-eviction check is not vacuous. */
+    resident = (IndexEntry){.valid = 1, .is_flat = 1, .gpu_device_id = 0,
+                            .db_oid = 1, .index_oid = 9, .main_bf_vram_bytes = GiB};
     g_indexes = &resident; g_n_indexes = 1;
+    CHECK(total_vram_used(0) == GiB);
     memset(g_cache_evictions, 0, sizeof(g_cache_evictions));
     a = line_for(999000);
     g_max_vram_per_gpu[0] = a.needed + GiB / 2;
+    CHECK(total_vram_used(0) + a.needed > g_max_vram_per_gpu[0]);   /* make_room would run */
     CHECK(admit(&a, NULL) == CUVS_ADMISSION_AR8);
     CHECK(g_cache_evictions[0] == 0 && g_n_indexes == 1);
     CHECK(g_pending_rmm_build_vram[0] == 0);
