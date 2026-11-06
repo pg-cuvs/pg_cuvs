@@ -1341,6 +1341,8 @@ cuvs_admission_encode(const CuvsAdmissionFields *in, char *buf, size_t cap)
                                 in->i > CUVS_ADMISSION_SHARD_MAX ? CUVS_ADMISSION_SHARD_MAX : in->i);
     if (ok == 0 && (pm & CUVS_ADM_F_D))
         ok = cuvs_admission_put(buf, cap, &pos, " d=%u", cuvs_admission_sat(in->d));
+    if (ok == 0 && (pm & CUVS_ADM_F_O))
+        ok = cuvs_admission_put(buf, cap, &pos, " o=%u", cuvs_admission_sat(in->o));
     if (ok != 0)
     {
         buf[0] = '\0';
@@ -1471,6 +1473,7 @@ cuvs_admission_decode(const char *buf, size_t len, CuvsAdmissionFields *out)
             case 'w': bit = CUVS_ADM_F_W; break;
             case 'i': bit = CUVS_ADM_F_I; break;
             case 'd': bit = CUVS_ADM_F_D; break;
+            case 'o': bit = CUVS_ADM_F_O; break;
             case 't': bit = 0; break;
             default: goto bad;
         }
@@ -1531,7 +1534,7 @@ cuvs_admission_decode(const char *buf, size_t len, CuvsAdmissionFields *out)
                                : key[0] == 'q' ? &out->q : key[0] == 'p' ? &out->p
                                : key[0] == 'l' ? &out->l : key[0] == 'y' ? &out->y
                                : key[0] == 'u' ? &out->u : key[0] == 'g' ? &out->g
-                               : key[0] == 'd' ? &out->d : &out->s;
+                               : key[0] == 'd' ? &out->d : key[0] == 'o' ? &out->o : &out->s;
                 if (cuvs_admission_uint(val, tok_end, CUVS_ADMISSION_SCALAR_MAX, &a) != 0)
                     goto bad;
                 *slot = (uint32_t) a;
@@ -1796,8 +1799,7 @@ cuvs_admission_format(const CuvsAdmissionFields *f, CuvsAdmissionObject obj,
             break;
         case CUVS_ADMISSION_AR8:
             cuvs_sb_add(&m, "pg_cuvs: this CAGRA build does not fit the GPU memory pool "
-                            "(dataset plus large_workspace plus headroom); CREATE INDEX "
-                            "aborted");
+                            "with headroom; CREATE INDEX aborted");
             break;
         case CUVS_ADMISSION_OOM:
             cuvs_sb_add(&m, "pg_cuvs: GPU memory exhausted during CAGRA build; CREATE "
@@ -1897,6 +1899,7 @@ cuvs_admission_format(const CuvsAdmissionFields *f, CuvsAdmissionObject obj,
             cuvs_sb_add(&d, " MiB + headroom "); cuvs_sb_mib(&d, f->d);
             cuvs_sb_add(&d, " MiB > pool quota "); cuvs_sb_mib(&d, f->q);
             cuvs_sb_add(&d, " MiB (pending "); cuvs_sb_mib(&d, f->p);
+            cuvs_sb_add(&d, " MiB, pool used "); cuvs_sb_mib(&d, f->o);
             cuvs_sb_add(&d, " MiB)");
             break;
         case CUVS_ADMISSION_OOM:

@@ -406,15 +406,14 @@ test_ar8_pool_capacity(void)
 {
     CuvsAdmissionFields f = base(CUVS_ADMISSION_AR8);
     Out o;
-    f.present = CUVS_ADM_F_N | CUVS_ADM_F_Q | CUVS_ADM_F_P | CUVS_ADM_F_D;
-    f.n = 6804; f.q = 6492; f.p = 0; f.d = 1020;
+    f.present = CUVS_ADM_F_N | CUVS_ADM_F_Q | CUVS_ADM_F_P | CUVS_ADM_F_D | CUVS_ADM_F_O;
+    f.n = 3048; f.q = 6492; f.p = 0; f.d = 457; f.o = 3048;
     o = format(&f, CUVS_ADMISSION_OBJ_CAGRA, 1, NULL);
     CHECK("AR8 53200", o.sqlstate && strcmp(o.sqlstate, "53200") == 0);
     CHECK("AR8 msg", strcmp(o.msg, "pg_cuvs: this CAGRA build does not fit the GPU memory "
-                                   "pool (dataset plus large_workspace plus headroom); "
-                                   "CREATE INDEX aborted") == 0);
-    CHECK("AR8 detail", strcmp(o.detail, "need 6804 MiB + headroom 1020 MiB > pool quota "
-                                         "6492 MiB (pending 0 MiB)") == 0);
+                                   "pool with headroom; CREATE INDEX aborted") == 0);
+    CHECK("AR8 detail", strcmp(o.detail, "need 3048 MiB + headroom 457 MiB > pool quota "
+                                         "6492 MiB (pending 0 MiB, pool used 3048 MiB)") == 0);
     CHECK("AR8 hint", strcmp(o.hint, "Lower the index size or graph_degree (for example "
                                      "ALTER INDEX ... SET (graph_degree = 32) and REINDEX), "
                                      "or an operator can raise --rmm-pool-max-percent.") == 0);
@@ -423,7 +422,7 @@ test_ar8_pool_capacity(void)
     LACKS("AR8 no unload", o.hint, "pg_cuvs_unload");
     f.p = 512;
     o = format(&f, CUVS_ADMISSION_OBJ_CAGRA, 0, NULL);
-    HAS("AR8 pending", o.detail, "(pending 512 MiB)");
+    HAS("AR8 pending", o.detail, "(pending 512 MiB, pool used 3048 MiB)");
     /* AR8 is a CAGRA single/multi build reason only (shard path unchanged). */
     CHECK("AR8 not shard", format(&f, CUVS_ADMISSION_OBJ_SHARD, 0, NULL).sqlstate == NULL);
     CHECK("AR8 not ivfpq", format(&f, CUVS_ADMISSION_OBJ_IVFPQ, 0, NULL).sqlstate == NULL);

@@ -7,7 +7,6 @@
  * the per-rho admission table, the L40S example) and CK-30 (dim%4 stride).
  */
 #include "cuvs_admission_contract.h"
-#include "cuvs_lw_policy.h"
 
 #include <stdint.h>
 #include <stdio.h>
@@ -210,17 +209,18 @@ test_workspace_hook_is_inert_before_i4(void)
                                  CUVS_ADMISSION_NONE);
 }
 
-/* AR8 (ADR-089) with the Q6 shape: n 999000, dim 768, igd 128, gd 32, pool
- * quota 6,807,502,080 B, rho 0, LW-8 margin 1100. */
+/* AR8 (ADR-089, design 40c33a3b) with the Q6 condition: n 999000, dim 768,
+ * gd 32, rho 0, pool quota 6,807,502,080 B, resident A_res pool_used =
+ * 3,196,800,000 B. */
 static const uint64_t Q6_QUOTA = UINT64_C(6807502080);
+static const uint64_t Q6_POOL_USED = UINT64_C(3196800000);
 
 static int
-ar8(uint64_t quota, uint64_t pending, uint64_t needed, uint64_t lw_ub,
+ar8(uint64_t quota, uint64_t pending, uint64_t pool_used, uint64_t needed,
     uint32_t permille)
 {
-    uint64_t need = cuvs_admission_pool_need(needed, lw_ub);
-    return cuvs_admission_pool_refuses(quota, pending, need,
-                                       cuvs_admission_build_headroom(need, permille));
+    return cuvs_admission_pool_refuses(quota, pending, pool_used, needed,
+                                       cuvs_admission_build_headroom(needed, permille));
 }
 
 static void
@@ -228,43 +228,40 @@ test_ar8_pool_capacity(void)
 {
     uint64_t final_b = cuvs_admission_estimate_final_bytes(999000, 768, 32);
     uint64_t n_m = cuvs_admission_needed_bytes(final_b, 0, 0, 0);
-    uint64_t lw_ub = cuvs_lw_ub_bytes(cuvs_lw_shape_bytes(999000, 768, 128), 1100);
-    uint64_t need = cuvs_admission_pool_need(n_m, lw_ub);
-    uint64_t h150 = cuvs_admission_build_headroom(need, 150);
 
-    CHECK_EQ("Q6 final", final_b, UINT64_C(3196800000));
-    CHECK_EQ("Q6 L_shape", cuvs_lw_shape_bytes(999000, 768, 128), UINT64_C(3580416000));
-    CHECK_EQ("Q6 lw_ub 1100", lw_ub, UINT64_C(3938457600));
-    CHECK_EQ("Q6 pool_need", need, UINT64_C(7135257600));
-    CHECK_EQ("Q6 headroom 150", h150, UINT64_C(1070288640));
-    CHECK_EQ("Q6 need+headroom", need + h150, UINT64_C(8205546240));
+    CHECK_EQ("Q6 N_m", n_m, UINT64_C(3196800000));
+    CHECK_EQ("Q6 headroom 150 on N_m", cuvs_admission_build_headroom(n_m, 150),
+             UINT64_C(479520000));
+    CHECK_EQ("Q6 headroom 100 on N_m", cuvs_admission_build_headroom(n_m, 100),
+             UINT64_C(319680000));
+    CHECK_EQ("Q6 used+N+150", Q6_POOL_USED + n_m + UINT64_C(479520000),
+             UINT64_C(6873120000));
     CHECK("Q6 default is 150", CUVS_RMM_BUILD_HEADROOM_PERMILLE_DEFAULT == 150u);
 
-    /* The Q6 shape is refused with and without headroom. */
-    CHECK("Q6 permille 150 -> AR8", ar8(Q6_QUOTA, 0, n_m, lw_ub, 150));
-    CHECK("Q6 permille 0 -> AR8 (capacity)", ar8(Q6_QUOTA, 0, n_m, lw_ub, 0));
-    CHECK_EQ("permille 0 headroom", cuvs_admission_build_headroom(need, 0), 0);
+    /* 150: 101.0% of quota -> AR8. 100: 98.6% and 0: 93.9% -> admitted
+     * (permille 0 does not close the Q6 door). */
+    CHECK("Q6 permille 150 -> AR8", ar8(Q6_QUOTA, 0, Q6_POOL_USED, n_m, 150));
+    CHECK("Q6 permille 100 admitted", !ar8(Q6_QUOTA, 0, Q6_POOL_USED, n_m, 100));
+    CHECK("Q6 permille 0 admitted", !ar8(Q6_QUOTA, 0, Q6_POOL_USED, n_m, 0));
+    CHECK_EQ("permille 0 headroom", cuvs_admission_build_headroom(n_m, 0), 0);
+    /* Without the resident bytes the request alone fits at 150. */
+    CHECK("Q6 no resident admitted", !ar8(Q6_QUOTA, 0, 0, n_m, 150));
 
-    /* A shape that fits is admitted at 150: half the Q6 rows. */
-    {
-        uint64_t f2 = cuvs_admission_estimate_final_bytes(499500, 768, 32);
-        uint64_t l2 = cuvs_lw_ub_bytes(cuvs_lw_shape_bytes(499500, 768, 128), 1100);
-        CHECK("half Q6 fits", !ar8(Q6_QUOTA, 0, f2, l2, 150));
-        /* Pending pushes the same build into AR8. */
-        CHECK("pending -> AR8", ar8(Q6_QUOTA, UINT64_C(3) << 30, f2, l2, 150));
-    }
-    /* Headroom alone refuses a build that the capacity rule admits. */
-    CHECK("150-only refusal", !ar8(Q6_QUOTA, 0, Q6_QUOTA - (UINT64_C(512) << 20), 0, 0) &&
-                              ar8(Q6_QUOTA, 0, Q6_QUOTA - (UINT64_C(512) << 20), 0, 150));
+    /* Design concurrency example: quota 100, N_m 60, headroom 10. */
+    CHECK("first 0+0+60+10 admitted", !cuvs_admission_pool_refuses(100, 0, 0, 60, 10));
+    CHECK("second 60+0+60+10 -> AR8", cuvs_admission_pool_refuses(100, 60, 0, 60, 10));
+
     /* Quota 0 (pool disabled) never refuses. */
-    CHECK("quota 0", !ar8(0, 0, n_m, lw_ub, 150));
-    CHECK("quota 0 saturated", !cuvs_admission_pool_refuses(0, SAT, SAT, SAT));
+    CHECK("quota 0", !ar8(0, 0, Q6_POOL_USED, n_m, 150));
+    CHECK("quota 0 saturated", !cuvs_admission_pool_refuses(0, SAT, SAT, SAT, SAT));
 
-    /* Boundary: == quota is admitted, one byte more is refused (">"). */
-    CHECK("== quota admitted", !cuvs_admission_pool_refuses(need + h150, 0, need, h150));
-    CHECK("+1 refused", cuvs_admission_pool_refuses(need + h150 - 1, 0, need, h150));
-    CHECK("pending boundary", !cuvs_admission_pool_refuses(need + h150 + 5, 5, need, h150) &&
-                              cuvs_admission_pool_refuses(need + h150 + 5, 6, need, h150));
+    /* Boundary with nonzero pool_used and pending: == quota admitted, +1 refused. */
+    CHECK("== quota admitted", !cuvs_admission_pool_refuses(100, 7, 30, 50, 13));
+    CHECK("+1 refused", cuvs_admission_pool_refuses(99, 7, 30, 50, 13));
+    CHECK("each term counts", cuvs_admission_pool_refuses(100, 8, 30, 50, 13) &&
+                              cuvs_admission_pool_refuses(100, 7, 31, 50, 13) &&
+                              cuvs_admission_pool_refuses(100, 7, 30, 51, 13) &&
+                              cuvs_admission_pool_refuses(100, 7, 30, 50, 14));
 
     /* Floor 256 MiB for small builds; ceil rounding; saturation refuses. */
     CHECK_EQ("floor", cuvs_admission_build_headroom(1000, 150), UINT64_C(256) << 20);
@@ -273,9 +270,8 @@ test_ar8_pool_capacity(void)
     CHECK_EQ("permille above max", cuvs_admission_build_headroom(1, 100001), SAT);
     CHECK_EQ("max permille", cuvs_admission_build_headroom(UINT64_C(1) << 30, 100000),
              UINT64_C(100) << 30);
-    CHECK_EQ("need saturates", cuvs_admission_pool_need(SAT - 1, 2), SAT);
     CHECK("saturated sum refuses", cuvs_admission_pool_refuses(UINT64_MAX / 4, UINT64_MAX / 4,
-                                                               UINT64_MAX / 4, 1));
+                                                               UINT64_MAX / 4, 1, 1));
 }
 
 int
