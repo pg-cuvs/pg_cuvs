@@ -24,8 +24,8 @@ POLICY = 'src/cuvs_lw_policy.h'
 SERVER = 'src/pg_cuvs_server.c'
 UTIL = 'src/cuvs_util.c'
 
-AR8_IF = ('        if (cuvs_admission_pool_refuses(quota, pending, line->pool_need,\n'
-          '                                        line->pool_headroom))\n'
+AR8_IF = ('        if (cuvs_admission_pool_refuses(quota, line->pool_pending, line->pool_used,\n'
+          '                                        needed, line->pool_headroom))\n'
           '        {\n'
           '            g_last_admit_reason = CUVS_ADMISSION_AR8;\n'
           '            goto admission_rejected;\n'
@@ -34,7 +34,7 @@ MAKE_ROOM = ('        g_last_admit_reason = pick_reason(&pk, phys_short > budget
              '        goto admission_rejected;\n'
              '    }\n')
 AR8_MOVED = ('    if (line && line->pool_valid &&\n'
-             '        cuvs_admission_pool_refuses(quota, pending, line->pool_need, line->pool_headroom))\n'
+             '        cuvs_admission_pool_refuses(quota, line->pool_pending, line->pool_used, needed, line->pool_headroom))\n'
              '    {\n'
              '        g_last_admit_reason = CUVS_ADMISSION_AR8;\n'
              '        goto admission_rejected;\n'
@@ -46,7 +46,7 @@ MUTATIONS = {
     'ar8_check_removed_daemon': ([(SERVER, AR8_IF, '')], {'daemon'}),
     'ar8_check_removed_rule': ([(CONTRACT,
         '    if (quota == 0)\n        return 0;\n    return cuvs_admission_sat_add(',
-        '    (void)quota; (void)pending; (void)pool_need; (void)headroom;\n'
+        '    (void)quota; (void)pending; (void)pool_used; (void)needed; (void)headroom;\n'
         '    return 0;\n    return cuvs_admission_sat_add(')], {'contract', 'daemon'}),
     # (2) headroom dropped: permille ignored
     'headroom_dropped_rule': ([(CONTRACT,
@@ -54,31 +54,43 @@ MUTATIONS = {
         '    (void)permille;\n    return 0;\n    if (permille > CUVS_RMM_BUILD_HEADROOM_PERMILLE_MAX ||')],
         {'contract', 'daemon'}),
     'headroom_knob_ignored_daemon': ([(SERVER,
-        '        line->pool_headroom = cuvs_admission_build_headroom(line->pool_need,\n'
+        '        line->pool_headroom = cuvs_admission_build_headroom(needed,\n'
         '                                                            g_rmm_build_headroom_permille);',
-        '        line->pool_headroom = cuvs_admission_build_headroom(line->pool_need, 0);')],
+        '        line->pool_headroom = cuvs_admission_build_headroom(needed, 0);')],
         {'daemon'}),
     'headroom_floor_dropped': ([(CONTRACT,
         '    return h > CUVS_RMM_BUILD_HEADROOM_FLOOR_BYTES ? h\n'
         '                                                   : CUVS_RMM_BUILD_HEADROOM_FLOOR_BYTES;',
         '    return h;')], {'contract'}),
     'headroom_floor_not_ceil': ([(CONTRACT,
-        '        ((pool_need % 1000u) * permille + 999u) / 1000u);\n    return h >',
-        '        ((pool_need % 1000u) * permille) / 1000u);\n    return h >')], {'contract'}),
-    # (3) capacity check removed when permille is 0
-    'capacity_dropped_at_permille_0': ([(CONTRACT,
-        '    if (quota == 0)\n        return 0;\n    return cuvs_admission_sat_add(',
-        '    if (quota == 0 || headroom == 0)\n        return 0;\n    return cuvs_admission_sat_add(')],
-        {'contract', 'daemon'}),
-    'lw_ub_not_in_pool_need': ([(CONTRACT,
-        '    return cuvs_admission_sat_add(needed, lw_ub);',
-        '    (void)lw_ub;\n    return needed;')], {'contract', 'daemon'}),
+        '        ((needed % 1000u) * permille + 999u) / 1000u);\n    return h >',
+        '        ((needed % 1000u) * permille) / 1000u);\n    return h >')], {'contract'}),
+    # design 40c33a3b: headroom is on N_m, not on N_m + lw_ub
+    'headroom_on_n_plus_lw_ub': ([(SERVER,
+        '        line->pool_headroom = cuvs_admission_build_headroom(needed,\n',
+        '        line->pool_headroom = cuvs_admission_build_headroom(\n'
+        '            cuvs_admission_sat_add(needed, line->workspace.lw_ub),\n')], {'daemon'}),
+    # design 40c33a3b: lw_ub of this build is not a pool term
+    'lw_ub_readded_to_pool_rule': ([(SERVER,
+        '                                        needed, line->pool_headroom))',
+        '                                        cuvs_admission_sat_add(needed, line->workspace.lw_ub),\n'
+        '                                        line->pool_headroom))')], {'daemon'}),
+    'pool_used_dropped': ([(SERVER,
+        '        if (cuvs_admission_pool_refuses(quota, line->pool_pending, line->pool_used,',
+        '        if (cuvs_admission_pool_refuses(quota, line->pool_pending, 0,')], {'daemon'}),
+    'pool_used_dropped_rule': ([(CONTRACT,
+        'cuvs_admission_sat_add(cuvs_admission_sat_add(pending, pool_used), needed),',
+        'cuvs_admission_sat_add(cuvs_admission_sat_add(pending, 0 * pool_used), needed),')],
+        {'contract'}),
+    'lw_pending_dropped': ([(SERVER,
+        '        line->pool_pending = cuvs_admission_sat_add(pending, g_lw_pending[device_id]);',
+        '        line->pool_pending = pending;')], {'daemon'}),
+    'build_pending_dropped': ([(SERVER,
+        '        line->pool_pending = cuvs_admission_sat_add(pending, g_lw_pending[device_id]);',
+        '        line->pool_pending = g_lw_pending[device_id];')], {'daemon'}),
     'boundary_ge': ([(CONTRACT,
-        '                                  headroom) > quota;',
-        '                                  headroom) >= quota;')], {'contract', 'daemon'}),
-    'pending_ignored_daemon': ([(SERVER,
-        '        if (cuvs_admission_pool_refuses(quota, pending, line->pool_need,',
-        '        if (cuvs_admission_pool_refuses(quota, 0, line->pool_need,')], {'daemon'}),
+        '               headroom) > quota;',
+        '               headroom) >= quota;')], {'contract', 'daemon'}),
     # (4) AR8 placed after make_room (evicts before refusing)
     'ar8_after_make_room': ([(SERVER, AR8_IF, ''),
                              (SERVER, MAKE_ROOM, MAKE_ROOM + AR8_MOVED)], {'daemon'}),
@@ -107,8 +119,7 @@ MUTATIONS = {
         '        return CUVS_ADMISSION_SQLSTATE_WORKSPACE;')], {'wire', 'message'}),
     'ar8_errmsg_is_ar6': ([(UTIL,
         '            cuvs_sb_add(&m, "pg_cuvs: this CAGRA build does not fit the GPU memory pool "\n'
-        '                            "(dataset plus large_workspace plus headroom); CREATE INDEX "\n'
-        '                            "aborted");',
+        '                            "with headroom; CREATE INDEX aborted");',
         '            cuvs_sb_add(&m, "pg_cuvs: large_workspace would not fit in GPU memory and "\n'
         '                            "managed overcommit is disabled; CREATE INDEX aborted");')],
         {'message'}),
@@ -120,11 +131,12 @@ MUTATIONS = {
         {'message'}),
     'ar8_detail_drops_pending': ([(UTIL,
         '            cuvs_sb_add(&d, " MiB (pending "); cuvs_sb_mib(&d, f->p);\n'
+        '            cuvs_sb_add(&d, " MiB, pool used "); cuvs_sb_mib(&d, f->o);\n'
         '            cuvs_sb_add(&d, " MiB)");',
         '            (void)0;')], {'message'}),
     'ar8_err_out_drops_headroom': ([(SERVER,
-        '    f->present = CUVS_ADM_F_N | CUVS_ADM_F_Q | CUVS_ADM_F_P | CUVS_ADM_F_D;',
-        '    f->present = CUVS_ADM_F_N | CUVS_ADM_F_Q | CUVS_ADM_F_P;')], {'daemon'}),
+        '    f->present = CUVS_ADM_F_N | CUVS_ADM_F_Q | CUVS_ADM_F_P | CUVS_ADM_F_D | CUVS_ADM_F_O;',
+        '    f->present = CUVS_ADM_F_N | CUVS_ADM_F_Q | CUVS_ADM_F_P | CUVS_ADM_F_O;')], {'daemon'}),
     'wire_d_key_dropped': ([(UTIL,
         '    if (ok == 0 && (pm & CUVS_ADM_F_D))\n',
         '    if (ok == 0 && 0)\n')], {'wire'}),
@@ -154,9 +166,12 @@ MUTATIONS = {
     'admit_fields_swapped': ([(SERVER,
         '"pool_need=%llu headroom=%llu pool_quota=%zu pending=%llu\\n",',
         '"headroom=%llu pool_need=%llu pool_quota=%zu pending=%llu\\n",')], {'daemon'}),
+    'wire_o_key_dropped': ([(UTIL,
+        '    if (ok == 0 && (pm & CUVS_ADM_F_O))\n',
+        '    if (ok == 0 && 0)\n')], {'wire'}),
     'logs_judge_ar8_ge': ([('test/unit/check_i3_logs.py',
-        "n('pending') + n('pool_need') + n('headroom') > n('pool_quota')",
-        "n('pending') + n('pool_need') + n('headroom') >= n('pool_quota')")], {'logs'}),
+        "+ n('headroom') > n('pool_quota'))",
+        "+ n('headroom') >= n('pool_quota'))")], {'logs'}),
 }
 
 

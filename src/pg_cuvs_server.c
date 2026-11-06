@@ -430,7 +430,7 @@ static uint32_t g_cagra_build_overflow       = CUVS_CAGRA_BUILD_OVERFLOW_DEFAULT
 static int      g_managed_overcommit         = CUVS_MANAGED_OVERCOMMIT_DEFAULT;
 static uint32_t g_managed_lw_margin_permille = CUVS_MANAGED_LW_MARGIN_PERMILLE_DEFAULT;
 static int      g_oom_score_adj              = CUVS_OOM_SCORE_ADJ_DEFAULT;
-/* ADR-089 --rmm-build-headroom-permille: AR8 headroom over pool_need.
+/* ADR-089 --rmm-build-headroom-permille: AR8 headroom over N_m.
  * Startup flag only, like the I4 knobs above. */
 static uint32_t g_rmm_build_headroom_permille = CUVS_RMM_BUILD_HEADROOM_PERMILLE_DEFAULT;
 static int      g_oom_score_adj_effective    = -1;   /* -1 = not read */
@@ -1073,10 +1073,10 @@ typedef struct AdmitLine {
     int         workspace_valid;
     /* ADR-089 AR8 inputs, set by ensure_vram for a CAGRA build. */
     int         pool_valid;
-    uint64_t    pool_need, pool_headroom, pool_pending;
+    uint64_t    pool_need, pool_headroom, pool_pending, pool_used;
 } AdmitLine;
 
-/* AR8 err_out subset: n = pool_need (not N_m), q = pool quota, p = pending,
+/* AR8 err_out subset: n = N_m, q = pool quota, p = pending, o = pool used,
  * d = headroom (ADR-089). Other reasons are left as filled. */
 static void
 admission_pool_fields(CuvsAdmissionFields *f, const AdmitLine *a, int dev)
@@ -1087,7 +1087,8 @@ admission_pool_fields(CuvsAdmissionFields *f, const AdmitLine *a, int dev)
     f->q = cuvs_admission_mib(g_rmm_pool_limits[dev]);
     f->p = cuvs_admission_mib(a->pool_pending);
     f->d = cuvs_admission_mib(a->pool_headroom);
-    f->present = CUVS_ADM_F_N | CUVS_ADM_F_Q | CUVS_ADM_F_P | CUVS_ADM_F_D;
+    f->o = cuvs_admission_mib(a->pool_used);
+    f->present = CUVS_ADM_F_N | CUVS_ADM_F_Q | CUVS_ADM_F_P | CUVS_ADM_F_D | CUVS_ADM_F_O;
 }
 
 /* ---- I3-E observation (C8): rejection counters and in-flight builds ----
@@ -3301,16 +3302,20 @@ ensure_vram(size_t needed, int device_id, CuvsRequester rq, CuvsAdmissionFields 
         }
         else
             wr = cuvs_admission_workspace_check(&line->workspace);
-        /* AR8 (ADR-089): the pool must hold N_m plus large_workspace plus
-         * headroom. A premise about the pool, so it is decided before AR6/7
-         * and before make_room: a refusal evicts and reserves nothing. */
-        line->pool_need = cuvs_admission_pool_need(needed, line->workspace.lw_ub);
-        line->pool_headroom = cuvs_admission_build_headroom(line->pool_need,
+        /* AR8 (ADR-089): the pool must hold what is resident now (pool_used,
+         * the same pre-eviction snapshot AR6/AR7 read), what admitted builds
+         * hold (N_m in g_pending_rmm_build_vram, lw_ub in g_lw_pending), and
+         * this build's N_m plus headroom. lw_ub of this build is not a term:
+         * the managed large_workspace is not pool memory. Decided before
+         * AR6/7 and before make_room: a refusal evicts and reserves nothing. */
+        line->pool_need = needed;
+        line->pool_used = line->workspace.pool_used;
+        line->pool_headroom = cuvs_admission_build_headroom(needed,
                                                             g_rmm_build_headroom_permille);
-        line->pool_pending = pending;
+        line->pool_pending = cuvs_admission_sat_add(pending, g_lw_pending[device_id]);
         line->pool_valid = 1;
-        if (cuvs_admission_pool_refuses(quota, pending, line->pool_need,
-                                        line->pool_headroom))
+        if (cuvs_admission_pool_refuses(quota, line->pool_pending, line->pool_used,
+                                        needed, line->pool_headroom))
         {
             g_last_admit_reason = CUVS_ADMISSION_AR8;
             goto admission_rejected;

@@ -72,14 +72,16 @@ def parse_line(line):
                 raise ValueError('load: reservation changed')
         if row['reason'] == 'AR0' and not n('needed') > n('limit'):
             raise ValueError('admit: AR0 limit does not explain rejection')
-        # ADR-089: pool_need = needed + lw_ub; AR8 when the pool quota cannot
-        # hold pending + pool_need + headroom. Decided before AR6/AR7 and
-        # before eviction.
-        ar8 = n('pool_quota') > 0 and n('pending') + n('pool_need') + n('headroom') > n('pool_quota')
+        # ADR-089: pool_need = needed (N_m); AR8 when the pool quota cannot
+        # hold pending + pool_used + pool_need + headroom (pool_used is the
+        # existing field: the same pre-eviction snapshot). Decided before
+        # AR6/AR7 and before eviction.
+        ar8 = n('pool_quota') > 0 and (n('pending') + n('pool_used') + n('pool_need')
+                                      + n('headroom') > n('pool_quota'))
         if row['reason'] == 'AR8':
             if n('quota') and n('pending_before') + n('needed') > n('quota'):
                 raise ValueError('admit: AR1 takes precedence over AR8')
-            if n('pool_need') != n('needed') + n('lw_ub') or not ar8 or n('evicted'):
+            if n('pool_need') != n('needed') or not ar8 or n('evicted'):
                 raise ValueError('admit: AR8 arithmetic/order differs')
         if row['reason'] in ('AR6', 'AR7'):
             if n('quota') and n('pending_before') + n('needed') > n('quota'):

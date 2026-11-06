@@ -13,9 +13,12 @@ ADMIT = ('[INFO] [admit] op=BUILD path=single gpu=0 db=1 idx=2 algo=auto shape_c
          'logical_used=0 evicted=0 verdict=reject reason=AR6 res_bytes=0 res_n=0 lru_free=0 '
          'elig_free=0 pin_bytes=0 policy=managed overcommit=off reserved=100 phys_free=100 '
          'lw_ub=200 lw_pending=0 host_guard=50 self_res=0 mono_us=1 '
-         'pool_need=300 headroom=0 pool_quota=1000 pending=0')
-AR8 = (ADMIT.replace('reason=AR6', 'reason=AR8')
-       .replace('pool_need=300 headroom=0 pool_quota=1000', 'pool_need=300 headroom=701 pool_quota=1000'))
+         'pool_need=100 headroom=0 pool_quota=1000 pending=0')
+# AR8: pending 300 + pool_used 500 + pool_need 100 + headroom 101 = 1001 > 1000.
+# pool_used is the existing [admit] field (the AR8 snapshot); free_net and
+# headroom_raw follow so the free_net identity still holds.
+AR8 = (ADMIT.replace('reason=AR6', 'reason=AR8').replace('pool_used=0 ', 'pool_used=500 ')
+       .replace('headroom=0 pool_quota=1000 pending=0', 'headroom=101 pool_quota=1000 pending=300'))
 HNSW = ('[INFO] [hnsw_route] phase=forecast requested_algo=auto route=ace_disk overflow=ace '
         'overflowed=1 status=0 rows=100 est_host=200 est_gpu=300 host_budget=100 '
         'gpu_budget=100 partitions=2 disk_need=500')
@@ -63,11 +66,12 @@ class Logs(unittest.TestCase):
         # The four AR8 fields are appended after mono_us, in this order.
         self.assertEqual(list(judge.parse_line(AR8)[1])[-5:],
                          ['mono_us', 'pool_need', 'headroom', 'pool_quota', 'pending'])
-        variants=[AR8.replace('headroom=701','headroom=700'),          # == quota admits
-                  AR8.replace('pool_need=300','pool_need=301'),         # != needed + lw_ub
+        variants=[AR8.replace('headroom=101','headroom=100'),          # == quota admits
+                  AR8.replace('pool_used=500 ','pool_used=499 '),       # pool_used counts
+                  AR8.replace('pool_need=100','pool_need=300'),         # != needed (lw_ub added)
                   AR8.replace('evicted=0','evicted=1'),                 # evicted before AR8
-                  AR8.replace(' pending=0',''),                         # field missing
-                  ADMIT.replace('headroom=0 ','headroom=701 ')]         # AR6 while AR8 applies
+                  AR8.replace(' pending=300',''),                       # field missing
+                  AR8.replace('reason=AR8','reason=AR6')]               # AR6 while AR8 applies
         for text in variants:
             with self.subTest(text=text):
                 with self.assertRaises(ValueError):judge.parse_line(text)

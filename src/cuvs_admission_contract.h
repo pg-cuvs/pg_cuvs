@@ -64,13 +64,15 @@ typedef enum CuvsAdmissionReason {
 #define CUVS_ADMISSION_KEY_CANDIDATE "t"
 #define CUVS_ADMISSION_KEY_SHARD "i"
 #define CUVS_ADMISSION_KEY_HEADROOM "d"   /* AR8 build headroom */
+#define CUVS_ADMISSION_KEY_POOL_USED "o"  /* AR8 pool used */
 
 /* Text grammar (only the reason-specific subset is emitted):
  * ARx n=MiB f=MiB q=MiB p=MiB h=MiB/count e=MiB/count k=MiB/count
  *     l=MiB y=MiB u=MiB g=MiB s=MiB r=0|1
  *     [t=db_oid:index_oid:MiB:idle_s] (at most three) [w=0|-1] [i=0..999]
- *     [d=MiB]
- * AR8 sends n q p d, where n is pool_need (N_m + lw_ub), not N_m.
+ *     [d=MiB] [o=MiB]
+ * AR8 sends n q p d o: n = N_m, p = pending (build plus lw reservations),
+ * d = headroom, o = pool used before eviction.
  * Candidates are unpinned, not in use, oldest last_use first. A fourth
  * candidate is an error, never silent truncation. idle_s=-1 means never.
  * w is not an estimated countdown: -1 requires unpin; 0 awaits queries.
@@ -160,51 +162,47 @@ cuvs_admission_needed_bytes(uint64_t final_bytes, uint64_t corpus_h2d,
 
 /* AR8 pool-capacity premise (ADR-089). Pure, header-only, C and C++.
  *
- *   pool_need = N_m + lw_ub
- *   headroom  = permille == 0 ? 0
- *             : max(256 MiB, ceil(pool_need * permille / 1000))
- *   AR8       = quota > 0 && pending + pool_need + headroom > quota
+ *   pending   = g_pending_rmm_build_vram + g_lw_pending (admitted builds)
+ *   pool_used = RMM pool used bytes before eviction (resident now)
+ *   headroom  = permille == 0 ? 0 : max(256 MiB, ceil(N_m * permille / 1000))
+ *   AR8       = quota > 0 && pending + pool_used + N_m + headroom > quota
  *
- * Sums saturate (CUVS_ADMISSION_BYTES_SATURATED), so an overflow refuses.
- * A permille above CUVS_RMM_BUILD_HEADROOM_PERMILLE_MAX saturates too.
+ * lw_ub is not a term: the managed large_workspace is not pool memory (it
+ * stays in AR6/AR7). Sums saturate (CUVS_ADMISSION_BYTES_SATURATED), so an
+ * overflow refuses. A permille above the maximum saturates too.
  */
 #define CUVS_RMM_BUILD_HEADROOM_PERMILLE_DEFAULT 150u
 #define CUVS_RMM_BUILD_HEADROOM_PERMILLE_MAX 100000u
 #define CUVS_RMM_BUILD_HEADROOM_FLOOR_BYTES (UINT64_C(256) << 20)
 
 static inline uint64_t
-cuvs_admission_pool_need(uint64_t needed, uint64_t lw_ub)
-{
-    return cuvs_admission_sat_add(needed, lw_ub);
-}
-
-static inline uint64_t
-cuvs_admission_build_headroom(uint64_t pool_need, uint32_t permille)
+cuvs_admission_build_headroom(uint64_t needed, uint32_t permille)
 {
     uint64_t h;
 
     if (permille == 0)
         return 0;
     if (permille > CUVS_RMM_BUILD_HEADROOM_PERMILLE_MAX ||
-        pool_need >= CUVS_ADMISSION_BYTES_SATURATED)
+        needed >= CUVS_ADMISSION_BYTES_SATURATED)
         return CUVS_ADMISSION_BYTES_SATURATED;
-    /* ceil(pool_need * permille / 1000) without forming the product. */
+    /* ceil(needed * permille / 1000) without forming the product. */
     h = cuvs_admission_sat_add(
-        cuvs_admission_sat_mul(pool_need / 1000u, permille),
-        ((pool_need % 1000u) * permille + 999u) / 1000u);
+        cuvs_admission_sat_mul(needed / 1000u, permille),
+        ((needed % 1000u) * permille + 999u) / 1000u);
     return h > CUVS_RMM_BUILD_HEADROOM_FLOOR_BYTES ? h
                                                    : CUVS_RMM_BUILD_HEADROOM_FLOOR_BYTES;
 }
 
 /* 1 when AR8 refuses; quota 0 (pool disabled) never refuses. */
 static inline int
-cuvs_admission_pool_refuses(uint64_t quota, uint64_t pending, uint64_t pool_need,
-                            uint64_t headroom)
+cuvs_admission_pool_refuses(uint64_t quota, uint64_t pending, uint64_t pool_used,
+                            uint64_t needed, uint64_t headroom)
 {
     if (quota == 0)
         return 0;
-    return cuvs_admission_sat_add(cuvs_admission_sat_add(pending, pool_need),
-                                  headroom) > quota;
+    return cuvs_admission_sat_add(
+               cuvs_admission_sat_add(cuvs_admission_sat_add(pending, pool_used), needed),
+               headroom) > quota;
 }
 
 /* I4 admission hook: the out-of-pool large_workspace check (AR6/AR7, v6 1.4

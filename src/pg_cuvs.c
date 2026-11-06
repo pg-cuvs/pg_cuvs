@@ -471,6 +471,7 @@ pg_cuvs_last_rejection(PG_FUNCTION_ARGS)
         CUVS_J1(CUVS_ADM_F_S, "self_resident_mib", f->s);
         CUVS_J1(CUVS_ADM_F_R, "reclaim_can_help", f->r);
         CUVS_J1(CUVS_ADM_F_D, "headroom_mib", f->d);
+        CUVS_J1(CUVS_ADM_F_O, "pool_used_mib", f->o);
         if (f->present & CUVS_ADM_F_W)
         {
             appendStringInfo(&j, "%s\"wait\":%d", first ? "" : ",", f->w);

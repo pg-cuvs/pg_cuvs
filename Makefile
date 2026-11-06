@@ -349,7 +349,7 @@ test-hnsw-admission: test/unit/test_hnsw_admission.c src/cuvs_hnsw_build_common.
 
 # I3 shared admission contract: the estimate and the I4 hook, built as C11 and
 # as C++17 (the header is also included by the C++/CUDA wrapper).
-test-admission-contract: test/unit/test_admission_contract.c src/cuvs_admission_contract.h src/cuvs_lw_policy.h \
+test-admission-contract: test/unit/test_admission_contract.c src/cuvs_admission_contract.h \
                          src/cuvs_util.c src/cuvs_util.h src/cuvs_ipc.h
 	$(CC) -std=c11 -Wall -Wextra -Werror -I src -o $@ test/unit/test_admission_contract.c \
 		src/cuvs_util.c $(TEST_RT_LIB)
