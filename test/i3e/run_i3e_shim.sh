@@ -52,13 +52,13 @@ qs "CREATE ROLE alice LOGIN; CREATE ROLE mon LOGIN IN ROLE pg_monitor; GRANT CRE
 
 # --- 1. column sets (CK-27 e: installed functions) ---
 nargs() { qs "SELECT array_length(proallargtypes, 1) FROM pg_proc WHERE proname = '$1'"; }
-check "memory_status has 44 OUT columns (25 I3-B + 19 I3-E)" [ "$(nargs pg_cuvs_memory_status)" = 44 ]
+check "memory_status has 45 OUT columns (25 I3-B + 20 I3-E)" [ "$(nargs pg_cuvs_memory_status)" = 45 ]
 check "index_status has 24 OUT columns (+ dataset_attached)" [ "$(nargs pg_cuvs_index_status)" = 24 ]
 check "build_status has 16 OUT columns" [ "$(nargs pg_cuvs_build_status)" = 16 ]
 
 # --- 2. idle values ---
 check "idle memory_status: budget 100 MiB, no quota, pool NULL, nothing active or rejected" \
-    [ "$(qs "SELECT budget_bytes, quota_bytes, pool_used IS NULL, pool_reserved IS NULL, pending_rmm, lw_pending, builds_active, rejects_ar0+rejects_ar1+rejects_ar2+rejects_ar3+rejects_ar4+rejects_ar5+rejects_ar6+rejects_ar7, last_reject_reason IS NULL, last_reject_at IS NULL FROM pg_cuvs_memory_status() WHERE gpu = 0")" = "104857600|0|t|t|0|0|0|0|t|t" ]
+    [ "$(qs "SELECT budget_bytes, quota_bytes, pool_used IS NULL, pool_reserved IS NULL, pending_rmm, lw_pending, builds_active, rejects_ar0+rejects_ar1+rejects_ar2+rejects_ar3+rejects_ar4+rejects_ar5+rejects_ar6+rejects_ar7+rejects_ar8, last_reject_reason IS NULL, last_reject_at IS NULL FROM pg_cuvs_memory_status() WHERE gpu = 0")" = "104857600|0|t|t|0|0|0|0|t|t" ]
 check "idle build_status is empty" [ "$(qs "SELECT count(*) FROM pg_cuvs_build_status()")" = 0 ]
 check "SHOW builds [] for a superuser" sh -c "su pg -c \"psql -h /tmp -X -At -d postgres -c 'SHOW cuvs.rmm_pool_status'\" | grep -q '\"builds_unlisted\":0,\"rejects_no_gpu\":{\"ar0\":0,.*},\"builds\":\[\]}'"
 check "SHOW builds null for another role" sh -c "su pg -c \"psql -h /tmp -X -At -d postgres -U alice -c 'SHOW cuvs.rmm_pool_status'\" | grep -q '\"builds\":null}'"
@@ -87,12 +87,12 @@ NN=$(grep '\[admit\]' /tmp/d.log | grep 'verdict=reject' | grep -c 'gpu=-1')
 LR=$(grep '\[admit\]' /tmp/d.log | grep 'verdict=reject' | grep 'gpu=0' | tail -1 | sed 's/.*reason=\(AR[0-7]\).*/\1/')
 check "a GPU rejection and a no-GPU AR0 were logged" [ "$NG" -ge 1 -a "$NN" -ge 1 ]
 check "sum of memory_status rejects = [admit] reject lines with a GPU ($NG)" \
-    [ "$(qs "SELECT sum(rejects_ar0+rejects_ar1+rejects_ar2+rejects_ar3+rejects_ar4+rejects_ar5+rejects_ar6+rejects_ar7) FROM pg_cuvs_memory_status()")" = "$NG" ]
+    [ "$(qs "SELECT sum(rejects_ar0+rejects_ar1+rejects_ar2+rejects_ar3+rejects_ar4+rejects_ar5+rejects_ar6+rejects_ar7+rejects_ar8) FROM pg_cuvs_memory_status()")" = "$NG" ]
 check "SHOW rejects_no_gpu.ar0 = [admit] reject lines with gpu=-1 ($NN)" sh -c "su pg -c \"psql -h /tmp -X -At -d postgres -c 'SHOW cuvs.rmm_pool_status'\" | grep -q '\"rejects_no_gpu\":{\"ar0\":$NN,'"
 check "gpu 0 last_reject_reason = last logged reason ($LR) with a time" \
     [ "$(qs "SELECT last_reject_reason, last_reject_at IS NOT NULL FROM pg_cuvs_memory_status() WHERE gpu = 0")" = "$LR|t" ]
 check "a second read returns the same counters (no reset)" \
-    [ "$(qs "SELECT sum(rejects_ar0+rejects_ar1+rejects_ar2+rejects_ar3+rejects_ar4+rejects_ar5+rejects_ar6+rejects_ar7) FROM pg_cuvs_memory_status()")" = "$NG" ]
+    [ "$(qs "SELECT sum(rejects_ar0+rejects_ar1+rejects_ar2+rejects_ar3+rejects_ar4+rejects_ar5+rejects_ar6+rejects_ar7+rejects_ar8) FROM pg_cuvs_memory_status()")" = "$NG" ]
 check "index_status dataset_attached is NULL" [ "$(qs "SELECT bool_and(dataset_attached IS NULL), count(*) > 0 FROM pg_cuvs_index_status()")" = "t|t" ]
 
 # --- 4. in-flight builds (the shim sleeps 4 s inside the wrapper) ---

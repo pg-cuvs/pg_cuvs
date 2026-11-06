@@ -1107,7 +1107,7 @@ static uint64_t g_builds_unlisted;
 static void
 observe_reject(int dev, CuvsAdmissionReason reason)
 {
-    if ((int)reason < (int)CUVS_ADMISSION_AR0 || (int)reason > (int)CUVS_ADMISSION_AR7)
+    if ((int)reason < (int)CUVS_ADMISSION_AR0 || (int)reason > (int)CUVS_ADMISSION_AR8)
         return;
     if (dev < 0 || dev >= CUVS_MAX_GPUS)
     {

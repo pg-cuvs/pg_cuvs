@@ -144,8 +144,8 @@ sec = sm.group(0) if sm else ""
 check(sm is not None, "docs § 8.4 missing")
 for cols in ("CUVS_MEMORY_STATUS_COLS_I3E", "CUVS_INDEX_STATUS_COLS_I3E"):
     for name in macro_string(ipc, cols).replace("\\t", "\t").split("\t")[1:]:
-        if re.match(r"rejects_ar[1-6]$", name):
-            continue          # written as the range `rejects_ar0` … `rejects_ar7`
+        if re.match(r"rejects_ar[1-7]$", name):
+            continue          # written as the range `rejects_ar0` … `rejects_ar8`
         check(f"`{name}`" in sec, f"docs § 8.4 does not name `{name}`")
 row = [l for l in sec.splitlines() if l.startswith("| `pg_cuvs_build_status()`")]
 check(len(row) == 1, "docs § 8.4 has no single pg_cuvs_build_status() row")

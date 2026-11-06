@@ -969,6 +969,7 @@ RETURNS TABLE (
     rejects_ar5             bigint,
     rejects_ar6             bigint,
     rejects_ar7             bigint,
+    rejects_ar8             bigint,
     last_reject_reason      text,
     last_reject_at          timestamptz,
     managed_spill_builds    bigint,

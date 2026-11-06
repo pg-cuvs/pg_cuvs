@@ -732,7 +732,7 @@ reservations, so an in-flight build never triggers reclaim by itself.
 the pool cannot be read), `pending_rmm` (build reservations counted against the
 quota), `lw_pending` (sum of `lw_ub` of admitted builds, § 3 managed
 large_workspace), `builds_active` (builds holding a reservation), `rejects_ar0` …
-`rejects_ar7` (admission rejections by reason, one per `[admit] verdict=reject`
+`rejects_ar8` (admission rejections by reason, one per `[admit] verdict=reject`
 line), `last_reject_reason` and `last_reject_at` (NULL before the first rejection),
 `managed_spill_builds` and `managed_spill_bytes_max`. A rejection that found no GPU
 (AR0 against every budget) has no GPU row; it is counted in
@@ -749,7 +749,7 @@ that GPU.
 and `reclaim_params`, an object with `value`, `source` (`default`, `flag` or
 `function`) and `changed_at` (epoch seconds or null) for each runtime parameter.
 It then appends `builds_unlisted` (builds not listed because the table of
-32 in-flight builds was full), `rejects_no_gpu` (`ar0` … `ar7`) and `builds`: for superusers and `pg_monitor`
+32 in-flight builds was full), `rejects_no_gpu` (`ar0` … `ar8`) and `builds`: for superusers and `pg_monitor`
 members, every `pg_cuvs_build_status()` row (`started_at_us` in epoch
 microseconds); for other roles, null.
 

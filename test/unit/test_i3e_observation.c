@@ -1,5 +1,5 @@
 /* I3-E / C8 observation through the actual daemon source (Linux, CPU shim):
- * rejection counters (one count per emitted [admit] rejection, AR0..AR7 only,
+ * rejection counters (one count per emitted [admit] rejection, AR0..AR8 only,
  * gpu -1 kept apart), the appended memory_status columns (values equal the
  * daemon variables, pool NULL when unreadable, a read never resets), the
  * index_status dataset_attached column (NULL until a wrapper API exists), and
@@ -353,6 +353,7 @@ test_rejects(void)
 
     log_admit(&al, CUVS_ADMISSION_AR3);
     log_admit(&al, CUVS_ADMISSION_AR3);
+    log_admit(&al, CUVS_ADMISSION_AR8);     /* ADR-089: counted like AR0..AR7 */
     log_admit(&al, CUVS_ADMISSION_AR6);
     log_admit(&al, CUVS_ADMISSION_NONE);    /* an admission is not a rejection */
     log_admit(&al, CUVS_ADMISSION_OOM);     /* not an admission rejection */
@@ -375,6 +376,7 @@ test_rejects(void)
     CHECK(mcol(&r1, "rejects_ar3") == 2);
     CHECK(mcol(&r1, "rejects_ar6") == 1);
     CHECK(mcol(&r1, "rejects_ar0") == 0 && mcol(&r1, "rejects_ar7") == 0);
+    CHECK(mcol(&r1, "rejects_ar8") == 1 && g_rejects[1][CUVS_ADMISSION_AR8] == 1);
     CHECK(strcmp(mtext(&r1, "last_reject_reason"), "AR6") == 0);
     CHECK(mcol(&r1, "last_reject_at") >= (long long)t0 && mcol(&r1, "last_reject_at") <= (long long)t1);
     CHECK(mem_row(0, &r2));
@@ -640,7 +642,7 @@ main(void)
         fprintf(stderr, "test_i3e_observation: %d failure(s)\n", failures);
         return 1;
     }
-    printf("PASS i3e observation: rejects per emitted [admit] (AR0..AR7, gpu -1 apart, "
+    printf("PASS i3e observation: rejects per emitted [admit] (AR0..AR8, gpu -1 apart, "
            "admission_fill not counted, read does not reset), memory_status I3-E columns "
            "equal the daemon variables (pool NULL when unreadable or no quota), build_status "
            "rows for handle_build/handle_build_multi in flight (N, lw_ub, policy, wall start) "
