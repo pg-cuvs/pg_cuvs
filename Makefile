@@ -995,3 +995,11 @@ test-ar8-daemon:
 		src/cuvs_cache_policy.c src/cuvs_peak_meter.c \
 		-Wl,--gc-sections -lm -lpthread -lrt -lcurl -lssl -lcrypto -o test-ar8-daemon
 	./test-ar8-daemon
+
+# Each planted AR8 defect must turn an AR8 test RED. The daemon cases need
+# Linux (elsewhere they are SKIP and the run fails). AR8_MUTATION_OUT must be
+# a new directory.
+AR8_MUTATION_OUT ?= ar8-mutations
+.PHONY: test-ar8-mutations
+test-ar8-mutations: test/unit/test_ar8_mutations.py
+	CC=$(CC) python3 -I test/unit/test_ar8_mutations.py $(AR8_MUTATION_OUT)
