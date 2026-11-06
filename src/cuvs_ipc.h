@@ -477,7 +477,7 @@ typedef struct CuvsRmmPoolStats {
 
 /* 2 (I3): + scratch_permille. Fields are append-only, I3-A first, then
  * I3-B, I3-C, I4, each PR appending its own after the previous PR's. */
-#define CUVS_RMM_POOL_STATUS_VERSION 2u
+#define CUVS_RMM_POOL_STATUS_VERSION 3u   /* 3: rejects_no_gpu gained AR8 (ADR-089) */
 /* I4 / ADR-088 per-GPU managed large_workspace counters (C8). */
 typedef struct CuvsLwDeviceStatus {
     uint32_t device_id;
@@ -492,7 +492,7 @@ typedef struct CuvsLwDeviceStatus {
  * N and removed in the one that releases it. Sharded and IVF-PQ builds hold
  * g_index_mutex for the whole build and never appear. */
 #define CUVS_MAX_ACTIVE_BUILDS 32
-#define CUVS_I3E_N_REJECT_REASONS 8    /* AR0..AR7 */
+#define CUVS_I3E_N_REJECT_REASONS 9    /* AR0..AR8 */
 typedef struct CuvsBuildStatusRow {
     int32_t  gpu;
     uint32_t db_oid;
@@ -535,7 +535,7 @@ typedef struct CuvsRmmPoolStatus {
     uint32_t n_builds;                 /* rows in builds[] */
     uint32_t pad_i3e;                  /* always 0 */
     uint64_t builds_unlisted;          /* builds not listed: table full */
-    uint64_t rejects_no_gpu[CUVS_I3E_N_REJECT_REASONS]; /* AR0..AR7, gpu = -1 */
+    uint64_t rejects_no_gpu[CUVS_I3E_N_REJECT_REASONS]; /* AR0..AR8, gpu = -1 */
     CuvsBuildStatusRow builds[CUVS_MAX_ACTIVE_BUILDS];
 } CuvsRmmPoolStatus;
 
@@ -1062,9 +1062,10 @@ int cuvs_ipc_inject_build_oom(
     "\tbudget_bytes\tquota_bytes\tpool_used\tpool_reserved\tpending_rmm\t" \
     "lw_pending\tbuilds_active\trejects_ar0\trejects_ar1\trejects_ar2\t" \
     "rejects_ar3\trejects_ar4\trejects_ar5\trejects_ar6\trejects_ar7\t" \
+    "rejects_ar8\t" \
     "last_reject_reason\tlast_reject_at\tmanaged_spill_builds\t" \
     "managed_spill_bytes_max"
-#define CUVS_MEMORY_STATUS_NCOLS_I3E 19
+#define CUVS_MEMORY_STATUS_NCOLS_I3E 20
 #define CUVS_INDEX_STATUS_COLS_I3E "\tdataset_attached"
 #define CUVS_INDEX_STATUS_NCOLS_I3E 1
 

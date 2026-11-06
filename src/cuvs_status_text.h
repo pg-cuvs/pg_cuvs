@@ -31,7 +31,7 @@
 #define CUVS_INDEX_STATUS_KINDS  "oossglttlbltbsblsltsrl"
 #define CUVS_MEMORY_STATUS_KINDS "illllllslstslllllllllllll"
 /* I3-E kinds for *_COLS_I3E (appended after the I3-B kinds). */
-#define CUVS_MEMORY_STATUS_KINDS_I3E "llnnlllllllllllstll"
+#define CUVS_MEMORY_STATUS_KINDS_I3E "llnnllllllllllllstll"
 #define CUVS_INDEX_STATUS_KINDS_I3E  "r"
 
 /* Next line at *pos: returns 1 and sets *line (start) and *line_len (without
