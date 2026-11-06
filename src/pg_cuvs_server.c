@@ -11849,6 +11849,12 @@ write_hw_profile(void)
 /* ----------------------------------------------------------------
  * main
  * ---------------------------------------------------------------- */
+/* ADR-089: the startup line states the implemented AR8 rule (index 249395c3). */
+static const char cuvs_ar8_startup_rule[] =
+    "AR8 refuses pending + pool_used + N + headroom > pool quota; pending = in-flight "
+    "build reservations + in-flight lw_ub; headroom = max(256 MiB, N x permille / 1000), "
+    "0 when permille is 0; this build's lw_ub is not a term (AR6/AR7 only)";
+
 int
 main(int argc, char **argv)
 {
@@ -12123,8 +12129,8 @@ main(int argc, char **argv)
              g_rmm_pool_mb > 0 ? g_rmm_pool_max_percent : 0);
     LOG_INFO("CAGRA build scratch: rmm_scratch_permille=%u (admission N = final + "
              "ceil(final x %u / 1000))\n", g_scratch_permille, g_scratch_permille);
-    LOG_INFO("CAGRA build pool headroom: rmm_build_headroom_permille=%u (AR8 refuses "
-             "pending + N + lw_ub + headroom > pool quota)\n", g_rmm_build_headroom_permille);
+    LOG_INFO("CAGRA build pool headroom: rmm_build_headroom_permille=%u (%s)\n",
+             g_rmm_build_headroom_permille, cuvs_ar8_startup_rule);
     LOG_INFO("HNSW auto overflow: %s (--hnsw-auto-overflow; default %s)\n",
              cuvs_hnsw_overflow_name(g_hnsw_auto_overflow),
              cuvs_hnsw_overflow_name(CUVS_HNSW_AUTO_OVERFLOW_DEFAULT));
