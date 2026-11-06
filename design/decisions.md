@@ -3823,65 +3823,84 @@ build_oom_evict_to_fit: 축출이 일어나면 RED)으로 확인한다. ρ의 �
 OOM 빈도는 GPU 검증(Q) 대상이다. wrapper 쪽 항목(dim%4 정렬 stride로 dataset 1벌,
 dataset 부착 확인 ATT)은 CUDA 빌드가 필요해 이 결정의 첫 구현에 들어 있지 않다.
 
-## ADR-089 — CAGRA 빌드가 풀에 dataset과 large_workspace를 함께 담지 못하면 빌드 전에 거부한다 (AR8)
+## ADR-089 — CAGRA 빌드가 풀의 남은 자리에 N_m과 headroom을 담지 못하면 빌드 전에 거부한다 (AR8)
 
-**상태:** 채택(I3-A 블록, conch 44041bb7, 2026-11-06). supersedes: 없음. ADR-086의
-"거부는 아무것도 축출하지 않는다"와 ADR-088의 large_workspace 규칙(lw_ub, AR6/AR7)을
-넓힌다. 구현 기준 커밋: `ysys143/integ-ce2a5a4`
+**상태:** 채택(I3-A 블록, conch 44041bb7, 2026-11-06; 판정식은 설계 개정 40c33a3b의
+소유자 결정). supersedes: 없음. ADR-086의 "거부는 아무것도 축출하지 않는다"와 ADR-088의
+large_workspace 규칙(lw_ub, AR6/AR7)을 넓힌다. 구현 기준 커밋: `ysys143/integ-ce2a5a4`
 (ce2a5a4a15ac754f157719916c895f8e8c23b025) 위의 `ysys143/i3a-ar8`. 현행 SSOT:
 `docs/reference.md` "RMM quota and memory accounting"·"Admission rejections and
 recovery"·"Daemon CLI flags", `src/cuvs_admission_contract.h`(판정식). 설계 메모:
-ADMISSION-HEADROOM-DESIGN.md (i4, 2026-11-06, sha256 f4c97fc2).
+ADMISSION-HEADROOM-DESIGN.md (i4, 2026-11-06, sha256 40c33a3b; 첫 판 f4c97fc2를 대체).
 
-**맥락:** 풀 안 입장 값 `N_m`에는 managed large_workspace가 없다. `lw_ub`는 AR6/AR7에서
-물리 여유와만 비교되고 풀 quota와는 비교되지 않는다. Q6 조건(n 999000, dim 768, igd 128,
-gd 32, quota 6,807,502,080 B, ρ 0)에서 `final` 3,196,800,000 B + `lw_ub`(margin 1100)
-3,938,457,600 B = 7,135,257,600 B로 quota의 104.8%다. 이 빌드는 AR0~AR5를 통과해
-cuVS/RAFT/RMM의 OOM unwind에 들어갔고, 힙 손상은 그 unwind 안에서 생긴다. 방어는 unwind에
-들어가지 않는 것이다.
+**맥락:** 입장 심사는 빌드 요청(`N_m`)만 풀 quota와 비교하고, 풀에 이미 상주한 바이트와
+다른 빌드의 예약을 더해 quota와 비교하지 않았다. Q6 조건(n 999000, dim 768, gd 32, ρ 0,
+quota 6,807,502,080 B)에서 `N_m` = 3,196,800,000 B이고 상주 A_res의 `pool_used` =
+3,196,800,000 B다. 요청만 보면 quota의 47%라 통과했고, 빌드는 quota 경계에서
+cuVS/RAFT/RMM의 OOM unwind에 들어갔으며 힙 손상은 그 unwind 안에서 생긴다. 방어는 unwind에
+들어가지 않는 것이다. 첫 판(f4c97fc2)은 `lw_ub`를 풀 규칙에 넣었으나, managed
+large_workspace는 `LwManagedResource`가 `managed_memory_resource`를 직접 감싸므로
+(`cuvs_wrapper.cu:256-282`) 풀 `used_bytes`에 들어가지 않는다. 그 항은 빠졌다.
 
 **결정:**
 
 1. 새 사유 AR8(AR7 다음, SQLSTATE 53200). `ensure_vram()`의 BUILD_CAGRA 블록에서
    AR0 → AR1 → AR2 → **AR8** → AR6/AR7 → 축출(make_room) → AR3/AR4/AR5 순서로 판정한다.
-   `pool_need = N_m + lw_ub`, `headroom = permille == 0 ? 0 : max(256 MiB,
-   ceil(pool_need × permille / 1000))`, `quota > 0 && pending + pool_need + headroom >
-   quota`이면 거부한다. 합은 포화한다. AR6/AR7의 축출 전 관측은 그대로 한 번만 하고, AR8은
-   그 `lw_ub`만 읽는다.
+   `quota > 0 && pending + pool_used + N_m + headroom > quota`이면 거부한다.
+   - `pending = g_pending_rmm_build_vram + g_lw_pending`(입장했고 끝나지 않은 빌드의 `N_m`과
+     `lw_ub`). `lw_ub` 부분은 풀 메모리가 아니지만, workspace 단계에 있는 빌드가 이미 풀
+     예약을 다 쓴 경우(혼합)를 막기 위해 센다.
+   - `pool_used`는 AR6/AR7이 읽는 같은 축출 전 `cuvs_rmm_pool_stats` 관측의 `used_bytes`다.
+   - `headroom = permille == 0 ? 0 : max(256 MiB, ceil(N_m × permille / 1000))`, `N_m`에만 건다.
+   - 이 빌드의 `lw_ub`는 항이 아니다(AR6/AR7에만 남는다). 합은 포화한다.
 2. 거부는 아무것도 축출하지 않고 예약하지 않는다. `[release]`·`[build_oom]` 줄이 없다.
-   REINDEX self-replace는 AR8을 재시도하지 않는다(상주 인덱스는 AR8 합에 없다).
+   REINDEX self-replace는 AR8을 재시도하지 않는다.
 3. 노브 `--rmm-build-headroom-permille`(0~100000, 기본 150, `--managed-lw-margin-permille`과
    같은 엄격 파서 계열). 0은 headroom만 없애고 용량 검사는 남긴다. 바닥 256 MiB는 상수다.
-4. 표면: err_out `AR8 n q p d`(n = pool_need, 새 키 d = headroom MiB, i 뒤에 붙인다),
-   DETAIL `need <pool_need> MiB + headroom <h> MiB > pool quota <q> MiB (pending <p> MiB)`,
-   HINT는 인덱스 크기·`graph_degree`(`ALTER INDEX … SET (graph_degree = …)`)와
-   `--rmm-pool-max-percent`만 말한다(축출·unpin 안내 없음). `pg_cuvs_last_rejection()`의
-   `headroom_mib`. `[admit]`은 `mono_us` 뒤에 `pool_need`, `headroom`, `pool_quota`,
-   `pending`을 덧붙인다(41 → 45 필드, 앞 41개의 순서는 그대로). I3-E 관측은 AR8도 센다
-   (`rejects_ar8`, `rejects_no_gpu.ar8`, pool status v3).
+4. 표면: err_out `AR8 n q p d o`(n = `N_m`, p = pending, d = headroom MiB, o = pool used MiB;
+   d와 o는 새 키로 i 뒤에 붙는다), DETAIL `need <N_m> MiB + headroom <h> MiB > pool quota
+   <q> MiB (pending <p> MiB, pool used <u> MiB)`, HINT는 인덱스 크기·`graph_degree`
+   (`ALTER INDEX … SET (graph_degree = …)`)와 `--rmm-pool-max-percent`만 말한다(축출·unpin
+   안내 없음). `pg_cuvs_last_rejection()`의 `headroom_mib`·`pool_used_mib`. `[admit]`은
+   `mono_us` 뒤에 `pool_need`(= `needed`), `headroom`, `pool_quota`, `pending`을 덧붙인다
+   (41 → 45 필드, 앞 41개 순서 그대로; AR8의 `pool_used`는 기존 `pool_used` 필드). I3-E 관측은
+   AR8도 센다(`rejects_ar8`, `rejects_no_gpu.ar8`, pool status v3).
 5. 샤드 빌드(BUILD_SHARD)와 수동 경로는 바꾸지 않는다. 샤드 빌드의 같은 검사는 별도 이슈다.
-   AR0~AR7의 코드·문구는 바꾸지 않는다.
+   AR0~AR7의 코드·문구는 바꾸지 않는다. `make_room`도 바꾸지 않는다.
 
-**병합 시점의 동작 변화:** 기본값 150은 병합하는 순간 동작을 바꾼다. Q6 형상은
-`pool_need` 7,135,257,600 B + headroom 1,070,288,640 B = 8,205,546,240 B(quota의 120.5%)로
-AR8 거부되고, permille 0에서도 7,135,257,600 B > quota라 거부된다. 이전에는 입장되던
-(그리고 unwind에 들어가던) 빌드다. 설계 메모의 추정으로 이 quota에서 입장되는 최대 행 수는
-headroom 없이 약 953,111행, 150에서 약 828,000행이다(GPU 검증 A2 대상).
+**병합 시점의 동작 변화:** 기본값 150은 병합하는 순간 동작을 바꾼다. Q6 조건은
+`pool_used + N_m + headroom` = 3,196,800,000 + 3,196,800,000 + 479,520,000 =
+6,873,120,000 B(quota의 101.0%)로 AR8 거부된다. 이전에는 입장되던(그리고 unwind에 들어가던)
+빌드다. 기본값은 일부러 선 바로 위에 둔다(설계 메모: 의도적으로 보수적인 기본값을 두지
+않는다): permille 100에서 Q6은 98.6%로 **입장**된다. 설계 메모의 추정으로 A_res가 상주할 때
+이 quota에서 입장되는 최대 행 수는 150에서 약 977,000행, headroom 없이 약 999,000행이다(GPU
+검증 A2 대상).
+
+**headroom 0은 Q6의 문을 닫지 않는다:** `--rmm-build-headroom-permille 0`(용량만)에서 Q6은
+`pool_used + N_m` = 6,393,600,000 B(93.9%)로 **입장**되고, OOM 경로에 다시 닿을 수 있다.
+노브 0에서도 Q6을 거부하려면 다른 바닥이 필요하다(예: 풀이 `lw_ub` 이상을 비워 두게 하는
+규칙). 이것은 소유자에게 남긴 **별도의 열린 결정**이며 이 ADR이 정하지 않는다.
+
+**후속 기록(코드 아님, 미결):** 입장된 CAGRA 빌드에 대해 `make_room`의 축출 목표는 여전히
+`N_m`뿐이다(논리 예산·물리 여유 부족분). AR8의 headroom은 quota 기준의 입장 전제일 뿐, 축출로
+그만큼의 여유를 만들어 주지 않는다. 축출 목표를 `N_m + headroom`으로 넓히는 안(b1)은 설계
+개정 40c33a3b에서 이 변경 밖으로 빠졌다. 누가: 소유자. 언제·조건: I3-A 세트 계획에서, GPU
+검증 A1~A5 결과를 본 뒤.
 
 **대안:**
 
 | 대안 | 선택하지 않은 이유 |
 |---|---|
-| (a) 용량만(`pending + pool_need > quota`) | Q6 실패는 quota 경계에서 첫 할당 실패가 unwind를 여는 경우라, 경계에 붙은 빌드를 막지 못한다. permille 0으로 여전히 쓸 수 있다 |
-| headroom 1000(+100%) | Q6를 2배로 넘겨 거부하고, 여유 있게 맞는 형상도 거부한다 |
+| 첫 판: `pending + (N_m + lw_ub) + headroom > quota` | `lw_ub`는 풀 메모리가 아니다(`cuvs_wrapper.cu:256-282`); 상주 `pool_used`를 빠뜨려 Q6의 실제 원인을 보지 못했다 |
+| 용량만(`pending + pool_used + N_m > quota`) | Q6을 93.9%로 입장시켜 문이 열린 채 남는다. permille 0으로 여전히 쓸 수 있다 |
+| headroom을 `N_m + lw_ub`에 건다 | 풀 경계의 여유는 풀에 들어가는 `N_m`에 대한 것이다 |
 | AR6의 뜻을 넓혀 재사용 | AR6은 "spill할 것이고 overcommit이 꺼져 있다"는 다른 진술이다 |
-| headroom을 고정 상수로 | UC 원칙(자동 동작마다 노브)과 사용자 지시(일부러 보수적인 기본값을 두지 않음) |
-| ρ(`--rmm-scratch-permille`)를 올려 대신 | ρ는 final에 비례하는 풀 안 scratch이고 workspace를 담지 않는다. 둘은 독립이며 둘 다 남는다 |
+| headroom을 고정 상수로 | UC 원칙(자동 동작마다 노브) |
+| ρ(`--rmm-scratch-permille`)를 올려 대신 | ρ는 final에 비례하는 풀 안 scratch다. 둘은 독립이며 둘 다 남는다 |
 
-**검증 경계:** 판정식·코덱·문구는 CPU 단위 시험(Q6 수치, 경계 ==/+1, pending, quota 0,
-AR0~AR7 문구 고정)과 변이, 데몬 경로는 Linux CPU shim의 `test-ar8-daemon`(실제
-`ensure_vram`: AR1 → AR8 → AR6 순서, 축출·예약 없음, err_out, `[admit]` 필드, 노브 파싱)으로
-확인한다. 실제 GPU에서 Q6 조건이 코어 없이 AR8로 끝나는지와 경계(A1~A5)는 GPU 검증 대상이며
-이 커밋들에서 돌리지 않았다. 이 방어는 upstream의 unwind 중 힙 손상을 고치지 않는다.
-`--cagra-build-overflow error`에서는 `lw_ub`가 0이라 AR8이 large_workspace를 세지 않는다
-(설계 메모가 같은 블록의 `lw_ub` 값을 쓰라고 정했다).
+**검증 경계:** 판정식·코덱·문구는 CPU 단위 시험(Q6 150/100/0, 설계의 동시성 예, 각 항의
+==/+1 경계, quota 0, AR0~AR7 문구 고정)과 변이, 데몬 경로는 Linux CPU shim의
+`test-ar8-daemon`(실제 `ensure_vram`; `pool_used`는 RMM 통계 fixture, 두 빌드 동시 입장,
+AR1 → AR8 → AR6 순서, 축출·예약 없음, err_out, `[admit]` 필드, 노브 파싱)으로 확인한다.
+실제 GPU에서 Q6 조건이 코어 없이 AR8로 끝나는지와 경계(A1~A5)는 GPU 검증 대상이며 이
+커밋들에서 돌리지 않았다. 이 방어는 upstream의 unwind 중 힙 손상을 고치지 않는다.

@@ -271,7 +271,7 @@ daemon-only ones have no session equivalent.
 | `--cagra-build-overflow error\|managed` | — (daemon-only, restart) | `managed` | Where a CAGRA build's large_workspace lives (ADR-088). `managed`: a build-only managed-memory resource outside the RMM pool and quota that can spill to host RAM (slower, see below). `error`: inside the pool, as before. Applies to `cagra` single and parallel (multi-partial) builds only; sharded builds, startup warmup and `pg_cuvs_hnsw` always use `error` |
 | `--managed-overcommit on\|off` | — (daemon-only, restart) | `on` | Policy `managed` only. `off`: refuse (SQLSTATE 53400, reason AR6) a build whose large_workspace estimate would not fit in physical GPU free memory. `on`: allow spill up to the host memory guard, refuse beyond it (53200, AR7) |
 | `--managed-lw-margin-permille N` | — (daemon-only, restart) | see `SHOW cuvs.rmm_pool_status` (`lw_margin_permille`) | Policy `managed` only. Safety factor on the large_workspace estimate `L_shape`. Range 1000–100000; out of range refuses startup |
-| `--rmm-build-headroom-permille N` | — (daemon-only, restart) | `150` | AR8 headroom for a CAGRA single or parallel build (ADR-089): refuse before the build when `pending + pool_need + headroom` exceeds the pool quota, with `pool_need = N + lw_ub` and `headroom = max(256 MiB, ceil(pool_need × N / 1000))`. `0` removes the headroom but keeps the capacity check. Range 0–100000; out of range refuses startup. The value is on the `CAGRA build pool headroom` startup log line |
+| `--rmm-build-headroom-permille N` | — (daemon-only, restart) | `150` | AR8 headroom for a CAGRA single or parallel build (ADR-089): refuse before the build when `pending + pool_used + N + headroom` exceeds the pool quota, with `headroom = max(256 MiB, ceil(N × value / 1000))`. `0` removes the headroom but keeps the capacity check; it does not refuse the Q6 shape (see ADR-089). Range 0–100000; out of range refuses startup. The value is on the `CAGRA build pool headroom` startup log line |
 | `--oom-score-adj N` | — (daemon-only, restart) | `500` | Written once to `/proc/self/oom_score_adj` at startup so the kernel OOM killer prefers the daemon over PostgreSQL under host RAM pressure. Range 0–1000; `0` leaves the file untouched; a higher current value is kept (never lowered); a write failure is logged, not fatal |
 | `--gpu-devices LIST` | — (daemon-only) | all visible | CUDA devices the daemon uses (else honors `CUDA_VISIBLE_DEVICES`) |
 | `--snapshot-uri URI` | `cuvs.snapshot_uri` | `` | GCS snapshot root |
@@ -299,12 +299,13 @@ out of GPU memory after admission fails with SQLSTATE 53200 and evicts no reside
 index (there is no evict-and-retry); raise `--rmm-scratch-permille` to reserve
 more. IVF-PQ builds and index reloads keep their own estimates.
 
-A CAGRA single or parallel build must also fit the pool with its large_workspace
-(AR8, ADR-089): it is refused before any eviction or reservation when
-`pending + pool_need + headroom > quota`, where `pool_need = N + lw_ub` (`lw_ub` is
-0 under `--cagra-build-overflow error`), `pending` is the reservation of builds
-already admitted on that GPU, and `headroom = max(256 MiB, ceil(pool_need ×
---rmm-build-headroom-permille / 1000))`, or 0 when the flag is 0. Without a pool
+A CAGRA single or parallel build must also fit the pool next to what is already
+there (AR8, ADR-089): it is refused before any eviction or reservation when
+`pending + pool_used + N + headroom > quota`. `pool_used` is the pool's used bytes
+before eviction (resident indexes), `pending` is what builds already admitted on
+that GPU hold (their `N` plus their `lw_ub`), and `headroom = max(256 MiB, ceil(N ×
+--rmm-build-headroom-permille / 1000))`, or 0 when the flag is 0. This build's own
+`lw_ub` is not a term: the managed large_workspace is not pool memory. Without a pool
 quota AR8 never applies. Sharded builds, reloads and manual loads do not run it.
 
 `pg_stat_gpu_search.vram_bytes` estimates retained dataset/graph memory; it does
@@ -495,7 +496,7 @@ reloading an index on a query, the error names the reason and the numbers instea
 | AR0 | 54000 | The build needs more than one build may ever get (pool quota, or the logical VRAM budget when the pool is disabled) | Use `pg_cuvs_hnsw` with `build_algo='auto'` or `'ace'`; lower `graph_degree`; operators review `--rmm-pool-max-percent`, `--max-vram-mb`, `--rmm-scratch-permille`. Retrying does not help |
 | AR1, AR2 | 53200 | Another CREATE INDEX holds GPU memory | Retry after it finishes |
 | AR3, AR4 | 53200 | Not enough even after evicting what may be evicted | Unload an idle index (HINT names one), then retry |
-| AR8 | 53200 | A CAGRA build does not fit the GPU memory pool: dataset plus large_workspace plus headroom exceed the pool quota (DETAIL `need … MiB + headroom … MiB > pool quota … MiB (pending … MiB)`, `need` being `N + lw_ub`); nothing was evicted or reserved | Lower the index size or `graph_degree` (`ALTER INDEX … SET (graph_degree = …)` and `REINDEX`); an operator can raise `--rmm-pool-max-percent`. A retry helps only when `pending` was not 0 |
+| AR8 | 53200 | A CAGRA build does not fit the GPU memory pool with headroom: `pending + pool_used + N + headroom` exceeds the pool quota (DETAIL `need … MiB + headroom … MiB > pool quota … MiB (pending … MiB, pool used … MiB)`); nothing was evicted or reserved | Lower the index size or `graph_degree` (`ALTER INDEX … SET (graph_degree = …)` and `REINDEX`); an operator can raise `--rmm-pool-max-percent`. A retry helps when `pending` or the resident pool use goes down |
 | OOM (after admission) | 53200 | The build ran out of GPU memory although admitted; nothing was evicted | Raise `--rmm-scratch-permille`, or retry when memory is free |
 | reload (AR0–AR5 on a query) | 53200 | `GPU memory is unavailable to load index "<name>"` | As the HINT says; a query retried later may load |
 
@@ -529,10 +530,11 @@ the unloaded index reloads on its next query.
 ```
 
 `requester` is `BUILD`, `LOAD` or `SHARD`; `fields` holds only the values the daemon
-reported for that reason (AR8: `need_mib` = pool_need, `quota_mib`, `pending_mib`,
-`headroom_mib`); `idle_s` is -1 for an index never searched. Daemon logs
-carry one `[admit]` line per admission decision (ending with `pool_need`,
-`headroom`, `pool_quota` and `pending`, the AR8 inputs; 0 when AR8 was not evaluated), `[release]` when a reservation is
+reported for that reason (AR8: `need_mib` = N, `quota_mib`, `pending_mib`,
+`headroom_mib`, `pool_used_mib`); `idle_s` is -1 for an index never searched. Daemon logs
+carry one `[admit]` line per admission decision (ending with `pool_need`
+(= `needed`), `headroom`, `pool_quota` and `pending`, the AR8 inputs, 0 when AR8 was not
+evaluated; the AR8 `pool_used` is the line's existing `pool_used` field), `[release]` when a reservation is
 returned and `[build_oom] ... action=fail_no_evict` for an out-of-memory build.
 The eight-field `[build_oom]` record ends with `failed_bytes`: the final failing
 pool-upstream growth request observed around the RMM limiter, which can differ
