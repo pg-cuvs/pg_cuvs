@@ -442,7 +442,7 @@ int  cuvs_tombstone_read_header(FILE *f, CuvsTombstoneHeader *out);
  * Text grammar and key meanings live in cuvs_admission_contract.h. The codec
  * is format-only: which keys a reason carries is the caller's choice (C5
  * subsets). Keys are emitted in the fixed order n f q p h e k l y u g s r t*
- * w i. Scalars (MiB, counts) saturate at CUVS_ADMISSION_SCALAR_MAX on encode
+ * w i d. Scalars (MiB, counts) saturate at CUVS_ADMISSION_SCALAR_MAX on encode
  * and are rejected above it on decode; shard i saturates at 999.
  * ---------------------------------------------------------------- */
 enum {
@@ -451,7 +451,8 @@ enum {
     CUVS_ADM_F_K = 1u << 6,  CUVS_ADM_F_L = 1u << 7,  CUVS_ADM_F_Y = 1u << 8,
     CUVS_ADM_F_U = 1u << 9,  CUVS_ADM_F_G = 1u << 10, CUVS_ADM_F_S = 1u << 11,
     CUVS_ADM_F_R = 1u << 12, CUVS_ADM_F_W = 1u << 13, CUVS_ADM_F_I = 1u << 14,
-    CUVS_ADM_F_ALL = (1u << 15) - 1u
+    CUVS_ADM_F_D = 1u << 15,
+    CUVS_ADM_F_ALL = (1u << 16) - 1u
 };
 
 typedef struct CuvsAdmissionFields {
@@ -465,6 +466,7 @@ typedef struct CuvsAdmissionFields {
     uint32_t i;                  /* shard number */
     uint32_t n_cand;             /* 0..CUVS_ADMISSION_MAX_CANDIDATES */
     CuvsAdmissionCandidate cand[CUVS_ADMISSION_MAX_CANDIDATES];
+    uint32_t d;                  /* MiB, AR8 build headroom */
 } CuvsAdmissionFields;
 
 /* NOTICE transport: N1:msg<US>detail<RS>..., at most three pairs.
@@ -490,12 +492,12 @@ const char *cuvs_build_shape_class(int64_t n, uint32_t dim, uint32_t metric,
 uint32_t cuvs_admission_mib(uint64_t bytes);
 /* count, saturated. */
 uint32_t cuvs_admission_count(uint64_t count);
-/* "AR0".."AR7", "OOM", "ATT"; NULL for NONE or out of range. */
+/* "AR0".."AR8", "OOM", "ATT"; NULL for NONE or out of range. */
 const char *cuvs_admission_reason_name(CuvsAdmissionReason reason);
 /* 54000 / 53200 / 53400 (C5); NULL for NONE or out of range. */
 const char *cuvs_admission_sqlstate(CuvsAdmissionReason reason);
 /* 1 for reasons a later retry may clear without a config change and that
- * count as transient for the circuit breaker (UC-2 3): AR1..AR5, AR7, OOM,
+ * count as transient for the circuit breaker (UC-2 3): AR1..AR5, AR7, AR8, OOM,
  * ATT. 0 for AR0 (permanent), AR6 (configuration) and NONE. */
 int cuvs_admission_reason_transient(CuvsAdmissionReason reason);
 /* Write the payload into buf (NUL-terminated). Returns its length, or -1
@@ -519,7 +521,7 @@ int cuvs_admission_decode(const char *buf, size_t len, CuvsAdmissionFields *out)
 #define CUVS_ADMISSION_MSG_BYTES 2048
 
 typedef enum CuvsAdmissionObject {
-    CUVS_ADMISSION_OBJ_CAGRA,   /* cagra AM build: AR0..AR7, OOM, ATT */
+    CUVS_ADMISSION_OBJ_CAGRA,   /* cagra AM build: AR0..AR8, OOM, ATT */
     CUVS_ADMISSION_OBJ_IVFPQ,   /* IVF-PQ AM build: AR0..AR5 */
     CUVS_ADMISSION_OBJ_SHARD,   /* sharded CAGRA build: AR0..AR5 */
     CUVS_ADMISSION_OBJ_LOAD     /* search-path reload: AR0..AR5 */

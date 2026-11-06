@@ -75,6 +75,16 @@ test_reason_names_and_sqlstate(void)
 {
     CHECK("AR0 name", strcmp(cuvs_admission_reason_name(CUVS_ADMISSION_AR0), "AR0") == 0);
     CHECK("AR7 name", strcmp(cuvs_admission_reason_name(CUVS_ADMISSION_AR7), "AR7") == 0);
+    CHECK("AR8 name", strcmp(cuvs_admission_reason_name(CUVS_ADMISSION_AR8), "AR8") == 0);
+    CHECK("AR8 follows AR7", (int)CUVS_ADMISSION_AR8 == (int)CUVS_ADMISSION_AR7 + 1);
+    CHECK("AR8 53200", strcmp(cuvs_admission_sqlstate(CUVS_ADMISSION_AR8), "53200") == 0);
+    CHECK("AR8 transient", cuvs_admission_reason_transient(CUVS_ADMISSION_AR8));
+    {
+        /* AR0..AR7 spellings are unchanged by AR8. */
+        static const char *const old[] = {"AR0", "AR1", "AR2", "AR3", "AR4", "AR5", "AR6", "AR7"};
+        for (int r = 0; r < 8; r++)
+            CHECK("AR0..AR7 names", strcmp(cuvs_admission_reason_name((CuvsAdmissionReason)r), old[r]) == 0);
+    }
     CHECK("OOM name", strcmp(cuvs_admission_reason_name(CUVS_ADMISSION_OOM), "OOM") == 0);
     CHECK("ATT name", strcmp(cuvs_admission_reason_name(CUVS_ADMISSION_ATT), "ATT") == 0);
     CHECK("NONE name", cuvs_admission_reason_name(CUVS_ADMISSION_NONE) == NULL);
@@ -126,6 +136,24 @@ test_encode_order_and_subset(void)
     f.i = 1000;               /* shard numbers saturate at 999 */
     CHECK("shard encode", cuvs_admission_encode(&f, buf, sizeof(buf)) > 0);
     CHECK("shard text", strcmp(buf, "AR4 n=0 i=999") == 0);
+
+    /* AR8 carries n (pool_need) q p d, d after every older key. */
+    {
+        CuvsAdmissionFields g;
+        int len;
+        f = fields(CUVS_ADMISSION_AR8);
+        f.present = CUVS_ADM_F_N | CUVS_ADM_F_Q | CUVS_ADM_F_P | CUVS_ADM_F_D;
+        f.n = 6804; f.q = 6492; f.p = 0; f.d = 1020;
+        len = cuvs_admission_encode(&f, buf, sizeof(buf));
+        CHECK("AR8 encode", len > 0);
+        CHECK("AR8 text", strcmp(buf, "AR8 n=6804 q=6492 p=0 d=1020") == 0);
+        CHECK("AR8 decode", decode_exact(buf, (size_t)len + 1, &g) == 0);
+        CHECK("AR8 same", memcmp(&f, &g, sizeof(f)) == 0);
+        f.present |= CUVS_ADM_F_I;
+        f.i = 3;
+        CHECK("d after i", cuvs_admission_encode(&f, buf, sizeof(buf)) > 0 &&
+                           strcmp(buf, "AR8 n=6804 q=6492 p=0 i=3 d=1020") == 0);
+    }
 }
 
 static void
@@ -164,7 +192,7 @@ test_round_trip_max(void)
     CuvsAdmissionFields f = fields(CUVS_ADMISSION_AR3), g;
     int len;
     f.present = CUVS_ADM_F_ALL;
-    f.n = f.f = f.q = f.p = f.l = f.y = f.u = f.g = f.s = CUVS_ADMISSION_SCALAR_MAX;
+    f.n = f.f = f.q = f.p = f.l = f.y = f.u = f.g = f.s = f.d = CUVS_ADMISSION_SCALAR_MAX;
     f.h_mib = f.h_cnt = f.e_mib = f.e_cnt = f.k_mib = f.k_cnt = CUVS_ADMISSION_SCALAR_MAX;
     f.r = 1; f.w = CUVS_ADMISSION_WAIT_UNPIN; f.i = CUVS_ADMISSION_SHARD_MAX;
     for (int c = 0; c < 3; c++)
@@ -205,7 +233,9 @@ test_decode_rejects(void)
     CuvsAdmissionFields g;
     const char *bad[] = {
         "",                                   /* no reason */
-        "AR8 n=1",                            /* unknown reason */
+        "AR9 n=1",                            /* unknown reason */
+        "AR8 d=1 d=2",                        /* duplicate headroom */
+        "AR8 d=100000000",                    /* headroom above saturation */
         "NONE n=1",                           /* NONE is never sent */
         "AR0 n=1 n=2",                        /* duplicate key */
         "AR0 z=1",                            /* unknown key */

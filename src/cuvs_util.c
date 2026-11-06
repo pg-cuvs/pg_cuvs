@@ -1207,7 +1207,7 @@ cuvs_build_shape_class(int64_t n, uint32_t dim, uint32_t metric, uint32_t gd,
  * I3 admission rejection payload codec (cuvs_util.h).
  * ---------------------------------------------------------------- */
 static const char *const cuvs_admission_reason_names[] = {
-    "AR0", "AR1", "AR2", "AR3", "AR4", "AR5", "AR6", "AR7", "OOM", "ATT"
+    "AR0", "AR1", "AR2", "AR3", "AR4", "AR5", "AR6", "AR7", "AR8", "OOM", "ATT"
 };
 #define CUVS_ADMISSION_N_REASONS \
     ((int) (sizeof(cuvs_admission_reason_names) / sizeof(cuvs_admission_reason_names[0])))
@@ -1339,6 +1339,8 @@ cuvs_admission_encode(const CuvsAdmissionFields *in, char *buf, size_t cap)
     if (ok == 0 && (pm & CUVS_ADM_F_I))
         ok = cuvs_admission_put(buf, cap, &pos, " i=%u",
                                 in->i > CUVS_ADMISSION_SHARD_MAX ? CUVS_ADMISSION_SHARD_MAX : in->i);
+    if (ok == 0 && (pm & CUVS_ADM_F_D))
+        ok = cuvs_admission_put(buf, cap, &pos, " d=%u", cuvs_admission_sat(in->d));
     if (ok != 0)
     {
         buf[0] = '\0';
@@ -1468,6 +1470,7 @@ cuvs_admission_decode(const char *buf, size_t len, CuvsAdmissionFields *out)
             case 'r': bit = CUVS_ADM_F_R; break;
             case 'w': bit = CUVS_ADM_F_W; break;
             case 'i': bit = CUVS_ADM_F_I; break;
+            case 'd': bit = CUVS_ADM_F_D; break;
             case 't': bit = 0; break;
             default: goto bad;
         }
@@ -1528,7 +1531,7 @@ cuvs_admission_decode(const char *buf, size_t len, CuvsAdmissionFields *out)
                                : key[0] == 'q' ? &out->q : key[0] == 'p' ? &out->p
                                : key[0] == 'l' ? &out->l : key[0] == 'y' ? &out->y
                                : key[0] == 'u' ? &out->u : key[0] == 'g' ? &out->g
-                               : &out->s;
+                               : key[0] == 'd' ? &out->d : &out->s;
                 if (cuvs_admission_uint(val, tok_end, CUVS_ADMISSION_SCALAR_MAX, &a) != 0)
                     goto bad;
                 *slot = (uint32_t) a;
@@ -1791,6 +1794,11 @@ cuvs_admission_format(const CuvsAdmissionFields *f, CuvsAdmissionObject obj,
             cuvs_sb_add(&m, "pg_cuvs: large_workspace would spill beyond the host memory "
                             "guard; CREATE INDEX aborted");
             break;
+        case CUVS_ADMISSION_AR8:
+            cuvs_sb_add(&m, "pg_cuvs: this CAGRA build does not fit the GPU memory pool "
+                            "(dataset plus large_workspace plus headroom); CREATE INDEX "
+                            "aborted");
+            break;
         case CUVS_ADMISSION_OOM:
             cuvs_sb_add(&m, "pg_cuvs: GPU memory exhausted during CAGRA build; CREATE "
                             "INDEX aborted. No resident index was evicted");
@@ -1884,6 +1892,13 @@ cuvs_admission_format(const CuvsAdmissionFields *f, CuvsAdmissionObject obj,
                 cuvs_sb_add(&d, " MiB");
             }
             break;
+        case CUVS_ADMISSION_AR8:
+            cuvs_sb_add(&d, "need "); cuvs_sb_mib(&d, f->n);
+            cuvs_sb_add(&d, " MiB + headroom "); cuvs_sb_mib(&d, f->d);
+            cuvs_sb_add(&d, " MiB > pool quota "); cuvs_sb_mib(&d, f->q);
+            cuvs_sb_add(&d, " MiB (pending "); cuvs_sb_mib(&d, f->p);
+            cuvs_sb_add(&d, " MiB)");
+            break;
         case CUVS_ADMISSION_OOM:
             cuvs_sb_add(&d, "needs "); cuvs_sb_mib(&d, f->n);
             cuvs_sb_add(&d, " MiB; "); cuvs_sb_mib(&d, f->f);
@@ -1974,6 +1989,11 @@ cuvs_admission_format(const CuvsAdmissionFields *f, CuvsAdmissionObject obj,
         case CUVS_ADMISSION_AR7:
             cuvs_sb_add(&h, "Free host memory, retry after the other managed builds finish, "
                             "or review --managed-lw-margin-permille.");
+            break;
+        case CUVS_ADMISSION_AR8:
+            cuvs_sb_add(&h, "Lower the index size or graph_degree (for example ALTER INDEX "
+                            "... SET (graph_degree = 32) and REINDEX), or an operator can "
+                            "raise --rmm-pool-max-percent.");
             break;
         case CUVS_ADMISSION_OOM:
             cuvs_sb_add(&h, "Raising --rmm-scratch-permille reserves more at admission and "
