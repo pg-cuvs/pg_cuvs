@@ -3881,6 +3881,11 @@ large_workspace는 `LwManagedResource`가 `managed_memory_resource`를 직접 �
 노브 0에서도 Q6을 거부하려면 다른 바닥이 필요하다(예: 풀이 `lw_ub` 이상을 비워 두게 하는
 규칙). 이것은 소유자에게 남긴 **별도의 열린 결정**이며 이 ADR이 정하지 않는다.
 
+**열린 결정(self-replace):** REINDEX로 상주 중인 index를 다시 만들 때 그 index의 현재 사본이
+`pool_used`에 잡혀 AR8로 거부될 수 있고, self-replace는 AR8을 재시도하지 않는다. 이 경우
+`self_res`(교체될 옛 사본)를 AR8 비교에서 뺄지는 소유자에게 남긴 열린 결정이다(conch 6f0bb6fa:
+이번 변경은 보수적 거부를 유지하고, HINT가 옛 사본이 pool used에 포함됨을 알린다).
+
 **후속 기록(코드 아님, 미결):** 입장된 CAGRA 빌드에 대해 `make_room`의 축출 목표는 여전히
 `N_m`뿐이다(논리 예산·물리 여유 부족분). AR8의 headroom은 quota 기준의 입장 전제일 뿐, 축출로
 그만큼의 여유를 만들어 주지 않는다. 축출 목표를 `N_m + headroom`으로 넓히는 안(b1)은 설계

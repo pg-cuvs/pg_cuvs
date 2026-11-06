@@ -1996,7 +1996,10 @@ cuvs_admission_format(const CuvsAdmissionFields *f, CuvsAdmissionObject obj,
         case CUVS_ADMISSION_AR8:
             cuvs_sb_add(&h, "Lower the index size or graph_degree (for example ALTER INDEX "
                             "... SET (graph_degree = 32) and REINDEX), or an operator can "
-                            "raise --rmm-pool-max-percent.");
+                            "raise --rmm-pool-max-percent. Pool used includes resident "
+                            "indexes (for REINDEX, the index's own current copy); unloading "
+                            "other indexes frees it; an operator can also lower "
+                            "--rmm-build-headroom-permille.");
             break;
         case CUVS_ADMISSION_OOM:
             cuvs_sb_add(&h, "Raising --rmm-scratch-permille reserves more at admission and "

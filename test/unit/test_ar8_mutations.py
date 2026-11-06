@@ -124,10 +124,15 @@ MUTATIONS = {
         '                            "managed overcommit is disabled; CREATE INDEX aborted");')],
         {'message'}),
     'ar8_hint_offers_unpin': ([(UTIL,
-        '"... SET (graph_degree = 32) and REINDEX), or an operator can "\n'
-        '                            "raise --rmm-pool-max-percent.");',
-        '"... SET (graph_degree = 32) and REINDEX), or an operator can "\n'
-        '                            "raise --rmm-pool-max-percent. Or run pg_cuvs_unpin.");')],
+        '"--rmm-build-headroom-permille.");',
+        '"--rmm-build-headroom-permille. Or run pg_cuvs_unpin.");')],
+        {'message'}),
+    'ar8_hint_drops_resident': ([(UTIL,
+        '"raise --rmm-pool-max-percent. Pool used includes resident "\n'
+        '                            "indexes (for REINDEX, the index\'s own current copy); unloading "\n'
+        '                            "other indexes frees it; an operator can also lower "\n'
+        '                            "--rmm-build-headroom-permille.");',
+        '"raise --rmm-pool-max-percent.");')],
         {'message'}),
     'ar8_detail_drops_pending': ([(UTIL,
         '            cuvs_sb_add(&d, " MiB (pending "); cuvs_sb_mib(&d, f->p);\n'
