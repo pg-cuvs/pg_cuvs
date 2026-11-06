@@ -358,6 +358,16 @@ run_main(const char *flag, const char *value)
 }
 
 static void
+test_startup_rule_text(void)
+{
+    CHECK(strcmp(cuvs_ar8_startup_rule,
+                 "AR8 refuses pending + pool_used + N + headroom > pool quota; pending = "
+                 "in-flight build reservations + in-flight lw_ub; headroom = max(256 MiB, "
+                 "N x permille / 1000), 0 when permille is 0; this build's lw_ub is not a "
+                 "term (AR6/AR7 only)") == 0);
+}
+
+static void
 test_knob(void)
 {
     static const char *const bad[] = {"100001", "-1", "", "150x", " 150", "+150"};
@@ -379,6 +389,7 @@ test_knob(void)
 int
 main(void)
 {
+    test_startup_rule_text();
     test_knob();
     test_q6();
     test_terms_boundary();
