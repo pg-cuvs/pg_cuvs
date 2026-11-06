@@ -416,7 +416,11 @@ test_ar8_pool_capacity(void)
                                          "6492 MiB (pending 0 MiB, pool used 3048 MiB)") == 0);
     CHECK("AR8 hint", strcmp(o.hint, "Lower the index size or graph_degree (for example "
                                      "ALTER INDEX ... SET (graph_degree = 32) and REINDEX), "
-                                     "or an operator can raise --rmm-pool-max-percent.") == 0);
+                                     "or an operator can raise --rmm-pool-max-percent. "
+                                     "Pool used includes resident indexes (for REINDEX, "
+                                     "the index's own current copy); unloading other "
+                                     "indexes frees it; an operator can also lower "
+                                     "--rmm-build-headroom-permille.") == 0);
     LACKS("AR8 no unpin", o.hint, "unpin");
     LACKS("AR8 no evict", o.hint, "evict");
     LACKS("AR8 no unload", o.hint, "pg_cuvs_unload");
