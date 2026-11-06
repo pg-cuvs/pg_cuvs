@@ -138,6 +138,10 @@ MUTATIONS = {
         '    "AR8 refuses pending + pool_used + N + headroom > pool quota; pending = in-flight "',
         '    "AR8 refuses pending + N + lw_ub + headroom > pool quota; pending = in-flight "')],
         {'daemon'}),
+    'ar8_startup_rule_drops_ceil': ([(SERVER,
+        'headroom = max(256 MiB, ceil(N x permille / 1000)), "',
+        'headroom = max(256 MiB, N x permille / 1000), "')],
+        {'daemon'}),
     'ar8_detail_drops_pending': ([(UTIL,
         '            cuvs_sb_add(&d, " MiB (pending "); cuvs_sb_mib(&d, f->p);\n'
         '            cuvs_sb_add(&d, " MiB, pool used "); cuvs_sb_mib(&d, f->o);\n'

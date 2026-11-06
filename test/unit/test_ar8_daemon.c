@@ -363,7 +363,7 @@ test_startup_rule_text(void)
     CHECK(strcmp(cuvs_ar8_startup_rule,
                  "AR8 refuses pending + pool_used + N + headroom > pool quota; pending = "
                  "in-flight build reservations + in-flight lw_ub; headroom = max(256 MiB, "
-                 "N x permille / 1000), 0 when permille is 0; this build's lw_ub is not a "
+                 "ceil(N x permille / 1000)), 0 when permille is 0; this build's lw_ub is not a "
                  "term (AR6/AR7 only)") == 0);
 }
 

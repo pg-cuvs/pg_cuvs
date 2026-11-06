@@ -11852,7 +11852,7 @@ write_hw_profile(void)
 /* ADR-089: the startup line states the implemented AR8 rule (index 249395c3). */
 static const char cuvs_ar8_startup_rule[] =
     "AR8 refuses pending + pool_used + N + headroom > pool quota; pending = in-flight "
-    "build reservations + in-flight lw_ub; headroom = max(256 MiB, N x permille / 1000), "
+    "build reservations + in-flight lw_ub; headroom = max(256 MiB, ceil(N x permille / 1000)), "
     "0 when permille is 0; this build's lw_ub is not a term (AR6/AR7 only)";
 
 int
