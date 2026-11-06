@@ -401,6 +401,97 @@ test_rejects_bad_input(void)
     CHECK("AR6 on load", o.sqlstate == NULL);
 }
 
+static void
+test_ar8_pool_capacity(void)
+{
+    CuvsAdmissionFields f = base(CUVS_ADMISSION_AR8);
+    Out o;
+    f.present = CUVS_ADM_F_N | CUVS_ADM_F_Q | CUVS_ADM_F_P | CUVS_ADM_F_D;
+    f.n = 6804; f.q = 6492; f.p = 0; f.d = 1020;
+    o = format(&f, CUVS_ADMISSION_OBJ_CAGRA, 1, NULL);
+    CHECK("AR8 53200", o.sqlstate && strcmp(o.sqlstate, "53200") == 0);
+    CHECK("AR8 msg", strcmp(o.msg, "pg_cuvs: this CAGRA build does not fit the GPU memory "
+                                   "pool (dataset plus large_workspace plus headroom); "
+                                   "CREATE INDEX aborted") == 0);
+    CHECK("AR8 detail", strcmp(o.detail, "need 6804 MiB + headroom 1020 MiB > pool quota "
+                                         "6492 MiB (pending 0 MiB)") == 0);
+    CHECK("AR8 hint", strcmp(o.hint, "Lower the index size or graph_degree (for example "
+                                     "ALTER INDEX ... SET (graph_degree = 32) and REINDEX), "
+                                     "or an operator can raise --rmm-pool-max-percent.") == 0);
+    LACKS("AR8 no unpin", o.hint, "unpin");
+    LACKS("AR8 no evict", o.hint, "evict");
+    LACKS("AR8 no unload", o.hint, "pg_cuvs_unload");
+    f.p = 512;
+    o = format(&f, CUVS_ADMISSION_OBJ_CAGRA, 0, NULL);
+    HAS("AR8 pending", o.detail, "(pending 512 MiB)");
+    /* AR8 is a CAGRA single/multi build reason only (shard path unchanged). */
+    CHECK("AR8 not shard", format(&f, CUVS_ADMISSION_OBJ_SHARD, 0, NULL).sqlstate == NULL);
+    CHECK("AR8 not ivfpq", format(&f, CUVS_ADMISSION_OBJ_IVFPQ, 0, NULL).sqlstate == NULL);
+    CHECK("AR8 not load", format(&f, CUVS_ADMISSION_OBJ_LOAD, 0, "x").sqlstate == NULL);
+}
+
+/* AR0..AR7 errmsg, SQLSTATE and HINT text for a CAGRA build are pinned
+ * byte for byte (AR8 must not change them). */
+static void
+test_ar0_to_ar7_text_pinned(void)
+{
+    static const struct { CuvsAdmissionReason r; const char *state, *msg, *hint; } pin[] = {
+        {CUVS_ADMISSION_AR0, "54000",
+         "pg_cuvs: GPU memory is insufficient for this CAGRA build (needs more than the "
+         "configured limit); CREATE INDEX aborted",
+         "For a large table use pg_cuvs_hnsw with build_algo='auto' (it spills to ACE on "
+         "disk when over budget) or build_algo='ace'. A lower graph_degree slightly lowers "
+         "the admission estimate. Operators can review --rmm-pool-max-percent, --max-vram-mb "
+         "and --rmm-scratch-permille."},
+        {CUVS_ADMISSION_AR1, "53200",
+         "pg_cuvs: GPU memory is insufficient while another CREATE INDEX holds GPU memory; "
+         "CREATE INDEX aborted",
+         "Retry after the other CREATE INDEX finishes."},
+        {CUVS_ADMISSION_AR2, "53200",
+         "pg_cuvs: GPU memory is insufficient while another CREATE INDEX holds GPU memory; "
+         "CREATE INDEX aborted",
+         "Retry after the other CREATE INDEX finishes."},
+        {CUVS_ADMISSION_AR3, "53200",
+         "pg_cuvs: GPU memory is insufficient for this CAGRA build; CREATE INDEX aborted",
+         NULL},
+        {CUVS_ADMISSION_AR4, "53200",
+         "pg_cuvs: GPU memory is insufficient for this CAGRA build; CREATE INDEX aborted",
+         NULL},
+        {CUVS_ADMISSION_AR5, "53200",
+         "pg_cuvs: this CAGRA build would require evicting resident indexes, which the build "
+         "eviction scope does not allow; CREATE INDEX aborted",
+         NULL},
+        {CUVS_ADMISSION_AR6, "53400",
+         "pg_cuvs: large_workspace would not fit in GPU memory and managed overcommit is "
+         "disabled; CREATE INDEX aborted",
+         "If slower builds are acceptable, an operator can enable --managed-overcommit on; "
+         "or build smaller tables. (--cagra-build-overflow error keeps large_workspace in "
+         "the pool and does not fix a physical memory shortage.)"},
+        {CUVS_ADMISSION_AR7, "53200",
+         "pg_cuvs: large_workspace would spill beyond the host memory guard; CREATE INDEX "
+         "aborted",
+         "Free host memory, retry after the other managed builds finish, or review "
+         "--managed-lw-margin-permille."},
+    };
+    for (size_t i = 0; i < sizeof(pin) / sizeof(pin[0]); i++)
+    {
+        CuvsAdmissionFields f = base(pin[i].r);
+        Out o;
+        char label[64];
+        f.present = CUVS_ADM_F_N;
+        o = format(&f, CUVS_ADMISSION_OBJ_CAGRA, 0, NULL);
+        snprintf(label, sizeof(label), "AR%d pinned state", (int)pin[i].r);
+        CHECK(label, o.sqlstate && strcmp(o.sqlstate, pin[i].state) == 0);
+        snprintf(label, sizeof(label), "AR%d pinned msg", (int)pin[i].r);
+        CHECK(label, strcmp(o.msg, pin[i].msg) == 0);
+        if (pin[i].hint)
+        {
+            snprintf(label, sizeof(label), "AR%d pinned hint", (int)pin[i].r);
+            CHECK(label, strcmp(o.hint, pin[i].hint) == 0);
+        }
+    }
+}
+
 int
 main(void)
 {
@@ -416,6 +507,8 @@ main(void)
     test_reload_variants();
     test_after_admission_and_workspace();
     test_rejects_bad_input();
+    test_ar8_pool_capacity();
+    test_ar0_to_ar7_text_pinned();
     if (g_failures) {
         fprintf(stderr, "test_admission_message: %d failure(s)\n", g_failures);
         return 1;

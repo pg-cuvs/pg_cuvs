@@ -19,7 +19,9 @@
 #define CUVS_ADMISSION_WAIT_UNPIN (-1)
 
 /* Enum numbers are local discriminants, not CuvsReplyHeader.status values.
- * The wire reason is the spelling AR0..AR7, OOM, or ATT. NONE is not sent.
+ * The wire reason is the spelling AR0..AR8, OOM, or ATT. NONE is not sent.
+ * AR8 follows AR7 so AR0..AR8 stay one contiguous range; OOM and ATT moved
+ * up by one, which no wire or stored value depends on.
  */
 typedef enum CuvsAdmissionReason {
     CUVS_ADMISSION_NONE = -1,
@@ -31,12 +33,13 @@ typedef enum CuvsAdmissionReason {
     CUVS_ADMISSION_AR5,
     CUVS_ADMISSION_AR6,
     CUVS_ADMISSION_AR7,
+    CUVS_ADMISSION_AR8,
     CUVS_ADMISSION_OOM,
     CUVS_ADMISSION_ATT
 } CuvsAdmissionReason;
 
 #define CUVS_ADMISSION_SQLSTATE_LIMIT "54000"     /* AR0 */
-#define CUVS_ADMISSION_SQLSTATE_MEMORY "53200"    /* AR1..5, AR7, OOM, ATT */
+#define CUVS_ADMISSION_SQLSTATE_MEMORY "53200"    /* AR1..5, AR7, AR8, OOM, ATT */
 #define CUVS_ADMISSION_SQLSTATE_WORKSPACE "53400" /* AR6 */
 
 /* Field keys: byte-valued metrics are encoded in MiB, saturated at
@@ -60,11 +63,14 @@ typedef enum CuvsAdmissionReason {
 #define CUVS_ADMISSION_KEY_RECLAIM "r"
 #define CUVS_ADMISSION_KEY_CANDIDATE "t"
 #define CUVS_ADMISSION_KEY_SHARD "i"
+#define CUVS_ADMISSION_KEY_HEADROOM "d"   /* AR8 build headroom */
 
 /* Text grammar (only the reason-specific subset is emitted):
  * ARx n=MiB f=MiB q=MiB p=MiB h=MiB/count e=MiB/count k=MiB/count
  *     l=MiB y=MiB u=MiB g=MiB s=MiB r=0|1
  *     [t=db_oid:index_oid:MiB:idle_s] (at most three) [w=0|-1] [i=0..999]
+ *     [d=MiB]
+ * AR8 sends n q p d, where n is pool_need (N_m + lw_ub), not N_m.
  * Candidates are unpinned, not in use, oldest last_use first. A fourth
  * candidate is an error, never silent truncation. idle_s=-1 means never.
  * w is not an estimated countdown: -1 requires unpin; 0 awaits queries.
@@ -150,6 +156,55 @@ cuvs_admission_needed_bytes(uint64_t final_bytes, uint64_t corpus_h2d,
     needed = cuvs_admission_sat_add(final_bytes, corpus_h2d);
     needed = cuvs_admission_sat_add(needed, scratch);
     return cuvs_admission_sat_add(needed, margin);
+}
+
+/* AR8 pool-capacity premise (ADR-089). Pure, header-only, C and C++.
+ *
+ *   pool_need = N_m + lw_ub
+ *   headroom  = permille == 0 ? 0
+ *             : max(256 MiB, ceil(pool_need * permille / 1000))
+ *   AR8       = quota > 0 && pending + pool_need + headroom > quota
+ *
+ * Sums saturate (CUVS_ADMISSION_BYTES_SATURATED), so an overflow refuses.
+ * A permille above CUVS_RMM_BUILD_HEADROOM_PERMILLE_MAX saturates too.
+ */
+#define CUVS_RMM_BUILD_HEADROOM_PERMILLE_DEFAULT 150u
+#define CUVS_RMM_BUILD_HEADROOM_PERMILLE_MAX 100000u
+#define CUVS_RMM_BUILD_HEADROOM_FLOOR_BYTES (UINT64_C(256) << 20)
+
+static inline uint64_t
+cuvs_admission_pool_need(uint64_t needed, uint64_t lw_ub)
+{
+    return cuvs_admission_sat_add(needed, lw_ub);
+}
+
+static inline uint64_t
+cuvs_admission_build_headroom(uint64_t pool_need, uint32_t permille)
+{
+    uint64_t h;
+
+    if (permille == 0)
+        return 0;
+    if (permille > CUVS_RMM_BUILD_HEADROOM_PERMILLE_MAX ||
+        pool_need >= CUVS_ADMISSION_BYTES_SATURATED)
+        return CUVS_ADMISSION_BYTES_SATURATED;
+    /* ceil(pool_need * permille / 1000) without forming the product. */
+    h = cuvs_admission_sat_add(
+        cuvs_admission_sat_mul(pool_need / 1000u, permille),
+        ((pool_need % 1000u) * permille + 999u) / 1000u);
+    return h > CUVS_RMM_BUILD_HEADROOM_FLOOR_BYTES ? h
+                                                   : CUVS_RMM_BUILD_HEADROOM_FLOOR_BYTES;
+}
+
+/* 1 when AR8 refuses; quota 0 (pool disabled) never refuses. */
+static inline int
+cuvs_admission_pool_refuses(uint64_t quota, uint64_t pending, uint64_t pool_need,
+                            uint64_t headroom)
+{
+    if (quota == 0)
+        return 0;
+    return cuvs_admission_sat_add(cuvs_admission_sat_add(pending, pool_need),
+                                  headroom) > quota;
 }
 
 /* I4 admission hook: the out-of-pool large_workspace check (AR6/AR7, v6 1.4
