@@ -268,6 +268,7 @@ daemon-only ones have no session equivalent.
 | `--max-indexes N` | — (daemon-only) | `1024` | **Soft** LRU working-set cap (ADR-068), not a hard wall (was 64). At the cap, a reload or `pg_cuvs_load` frees a slot under the § 8 rules (cold first, then soft eviction; reason `slot`); a build over the cap does not evict (with the default `--build-evict-scope none`): its files are saved and the first query reloads it |
 | `--build-evict-scope …` and the other cache flags | — (daemon-only) | see § 8 | Cache, eviction and reclaim knobs (§ 8.2) |
 | `--hnsw-auto-overflow ace\|error` | `hnsw_auto_overflow` in `cuvs.rmm_pool_status` (read-only) | `ace` | What `pg_cuvs_hnsw` `build_algo=auto` does over the resident budget: `ace` spills to ACE-disk with a NOTICE, `error` refuses with SQLSTATE 54000. The same value decides an auto build whose resident IVF-PQ kNN graph cuVS rejects: `ace` rebuilds on ACE-disk with a NOTICE (receipt `graph_fallback`), `error` fails. Startup-only; logged at startup. Explicit `ivf_pq`/`ace` ignore it |
+| `--hnsw-ace-build-quality auto\|Q` | — (daemon-only, restart) | `auto` | ACE partition build quality handed to cuVS (`ace_params.ef_construction` = A; the SDK uses q = A/16, NN-descent runs 5 + q iterations per partition under 1e6 rows). `auto`: the SDK's `ace_params` default A (120 in cuVS 26.04, 12 iterations) scaled by `ef_construction`/64, the value used before the flag existed. `Q` (0–4095): A = 16·Q for every ACE build, ignoring `ef_construction`. Logged at startup; recorded per index in `pg_cuvs_hnsw_build_info` (`ace_build_quality_source`, `ace_build_quality`). Resident builds ignore it |
 | `--cagra-build-overflow error\|managed` | — (daemon-only, restart) | `managed` | Where a CAGRA build's large_workspace lives (ADR-088). `managed`: a build-only managed-memory resource outside the RMM pool and quota that can spill to host RAM (slower, see below). `error`: inside the pool, as before. Applies to `cagra` single and parallel (multi-partial) builds only; sharded builds, startup warmup and `pg_cuvs_hnsw` always use `error` |
 | `--managed-overcommit on\|off` | — (daemon-only, restart) | `on` | Policy `managed` only. `off`: refuse (SQLSTATE 53400, reason AR6) a build whose large_workspace estimate would not fit in physical GPU free memory. `on`: allow spill up to the host memory guard, refuse beyond it (53200, AR7) |
 | `--managed-lw-margin-permille N` | — (daemon-only, restart) | see `SHOW cuvs.rmm_pool_status` (`lw_margin_permille`) | Policy `managed` only. Safety factor on the large_workspace estimate `L_shape`. Range 1000–100000; out of range refuses startup |
@@ -485,8 +486,12 @@ line then has `status=5` and still names the decided route (`route=none` only wh
 route was decided, such as an over-budget refusal).
 
 `m` remains informational. Direct `ef_construction` scales intermediate degree from128,
-hierarchy construction effort from200, and ACE effort from120 at the default64;
-receipts record the consumed/clamped values. Reusing a source CAGRA graph does not
+hierarchy construction effort from200, and ACE effort from120 at the default64 (ACE: the
+`--hnsw-ace-build-quality auto` rule, the SDK's `ace_params` default);
+receipts record the consumed/clamped values. ACE indexes also record a partition-builder
+readback (`ace_build_quality`, `ace_local_intermediate_degree` = 3 × (graph_degree / 2),
+`ace_local_nn_descent_iterations`); the receipt's `intermediate_degree` is the resident width
+and the ACE memory-plan input, not the width ACE partitions build and optimize with. Reusing a source CAGRA graph does not
 rebuild it according to these options. See [HNSW build options](hnsw-build-options.md)
 for limits, compatibility and estimate-vs-upper-bound caveats.
 

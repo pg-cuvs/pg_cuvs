@@ -2890,6 +2890,14 @@ static int execute_hnsw_file_build(const CuvsHnswFileBuild *params, int owner_fd
 }
 } // namespace
 
+/* The linked SDK's default NN-descent max_iterations (ACE readback,
+ * cuvs_hnsw_policy.h). */
+extern "C" uint32_t
+cuvs_hnsw_sdk_nn_default_iterations(void)
+{
+    return (uint32_t)cuvs::neighbors::nn_descent::index_params{}.max_iterations;
+}
+
 extern "C" int
 cuvs_hnsw_build_file(int vectors_fd, int owner_fd,
     const CuvsHnswFileBuild *params, const char *workdir, int device_id,
@@ -2958,7 +2966,8 @@ cuvs_hnsw_build_file(int vectors_fd, int owner_fd,
         receipt.metric = params->metric;
         receipt.hierarchy_ef = params->hierarchy
             ? cuvs_hnsw_scaled_quality(200, params->ef_construction, 4, 65535) : 200;
-        receipt.ace_ef = cuvs_hnsw_scaled_quality(120, params->ef_construction, 4, 65535);
+        receipt.ace_ef = cuvs_hnsw_ace_ef(params->ace_quality, params->ef_construction,
+            (uint32_t)cagra::graph_build_params::ace_params{}.ef_construction);
         receipt.partitions = partitions;
         receipt.internal_builder = tiny ? 1 : disk ? 3 : 2; /* exact / IVF-PQ / NN-descent */
         receipt.training_requested = tiny ? 0 : sample_rows;

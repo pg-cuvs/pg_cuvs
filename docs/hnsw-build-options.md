@@ -38,7 +38,7 @@ ACE 메타데이터에는 SDK 자체 planner가 산출하고 재소비해도 유
 
 ## ef_construction
 
-기본 64는 검증된 실제 설정을 유지한다: resident 중간 차수 128, hierarchy 200, ACE 120.
+기본 64는 검증된 실제 설정을 유지한다: resident 중간 차수 128, hierarchy 200, ACE 120(아래 절).
 값을 바꾸면 각 기준값에 `ef_construction / 64`를 곱하고 올림한다.
 중간 차수는 최종 차수 이상, 4096 이하 및 데이터 행 수 범위로 제한한다.
 Hierarchy와 ACE 요청 설정은 4–65535 범위다. hnswlib는 native ef를 M 이상으로 제한하며 영수증에는 직렬화된 실제 값을 기록한다. 훈련 비율, probe 수, seed는 이 옵션으로 바꾸지 않는다.
@@ -46,11 +46,22 @@ Hierarchy와 ACE 요청 설정은 4–65535 범위다. hnswlib는 native ef를 M
 `tiny` 경로는 전체 이웃을 다루므로 이 옵션이 그래프 품질을 바꾸지 않는다.
 `m`은 기존처럼 정보용이며 실제 graph degree가 레이아웃을 결정한다.
 
+## ACE 조각 그래프 품질
+
+ACE는 데이터를 겹치는 조각으로 나눠 조각마다 kNN 그래프를 만든 뒤 합친다. cuVS 26.04는 ACE 품질 값 A(영수증 `ace_ef_construction`)를 q = A / 16으로만 쓰며, 100만 행 미만 조각은 NN-descent를 최대 5 + q회 반복한다.
+
+- 데몬 기본 `--hnsw-ace-build-quality auto`: A는 링크한 SDK의 `ace_params` 기본값(cuVS 26.04에서 120, 조각당 12회)이며 다른 `ef_construction`은 `ef_construction / 64` 비율로 올림한다(128이면 240). 4–65535 범위로 제한한다. 노브가 생기기 전과 같은 값이다.
+- 999,000×768, `ef_construction` 64에서 이 기본값의 ACE는 낮은 `hnsw.ef_search`의 recall@10이 같은 데이터의 resident IVF-PQ보다 0.01 넘게 낮을 수 있다. 품질을 올리려면 `ef_construction`을 올리거나 `--hnsw-ace-build-quality`로 q를 고정한다(q가 크면 빌드가 길어지고, `ef_search`별 지연은 resident와 다르게 움직인다).
+- `--hnsw-ace-build-quality Q`(0–4095)는 모든 ACE 빌드에 A = 16 × Q를 쓴다. `ef_construction`과 무관한 진단·고정용 값이다. 시작할 때 로그에 남고, 재시작해야 바뀐다.
+- 조각의 kNN 폭은 SDK 그대로 3 × (graph_degree / 2), degree 64에서 96이다. 영수증의 `intermediate_degree`(128)는 resident 경로의 폭이자 ACE 메모리 계획에 넘기는 값이며, ACE 조각이 kNN 생성과 최적화에 실제로 쓰는 폭이 아니다. 조각 폭을 128로 넓히는 SDK 수정은 같은 데이터에서 12회와 20회 반복 모두 recall을 낮춰 채택하지 않았다.
+- `build_algo=auto`의 ACE 넘침 기본값, 예산 가드, NOTICE는 바뀌지 않는다. ACE와 resident의 recall·지연 차이는 데이터와 `ef_search`에 따라 다르다.
+
 ## 저장된 정보
 
 0.8.2의 `pg_cuvs_hnsw_build_info(regclass)`는 생성 시 저장한 경로, 실제 설정,
 resident 후보 훈련 형상, 추정치·실효 예산과 guard 반환 여부를 조회한다.
 현재 세션 GUC로 과거 설정을 추정하지 않는다. 원 테이블 SELECT 권한이 필요하다.
+ACE 인덱스는 영수증 바로 뒤에 조각 빌더 readback을 저장한다: `ace_build_quality_source`(`auto`/`manual`), `ace_build_quality`(q), `ace_local_intermediate_degree`(조각 kNN 폭), `ace_local_nn_descent_iterations`(조각 NN-descent 반복 상한; 100만 행 이상을 셋 이상의 조각으로 나누면 조각마다 달라 `varies_by_partition`). ACE 빌드는 검증된 고정 SDK(memory-guard marker `@60b19a0f`)에서만 돌므로 이 값은 그 SDK의 동작에서 계산한 값이다. 조각별 실제 값은 데몬 로그의 SDK 줄로 확인한다. 이 기능 이전에 만든 ACE 인덱스는 `"ace_readback":"not_recorded"`, resident·tiny는 `"not_applicable"`이다. 영수증 형식(policy v2)은 그대로이며 readback은 별도 magic의 꼬리 레코드다.
 기존 인덱스, 빈 heap, source 그래프 재사용에는 영수증이 없을 수 있으며 `not_recorded`로 표시한다.
 명시적 `build_algo`와 `source` 그래프 재사용을 함께 지정할 수 없다.
 pgvector metapage prefix와 영수증 크기는 유지한다. 새 writer는 policy v2만 기록하며 새 reader는 역사적 v1 auto→ACE도 당시 값 그대로 읽는다. 손상·잘린 알려진 영수증은 오류, 알 수 없는 미래 버전은 unsupported 오류다. 현재 설정으로 과거 메타를 덮어쓰지 않는다.
@@ -60,8 +71,8 @@ pgvector metapage prefix와 영수증 크기는 유지한다. 새 writer는 poli
 같은 데이터·같은 ef와 같은 질의 비용에서 각각 비교한다. self 도달성 진단과는 별개다.
 같은 f32 벡터의 다른 ID는 동점 정답이다. 작은 생성 시험은 이 품질 기준의 통과 증거가 아니다.
 
-extension과 daemon은 HNSW op23 payload v4를 함께 배포해야 한다(v4는 응답 뒤에 결정 바이트 6개, 즉 status-13 DETAIL의 원값을 덧붙인다). 통합 기준 main의 글로벌 v4 명령 ABI는 유지되며 HNSW op23 payload v4와 구분한다.
-이전 payload v1/v2/v3 요청은 prefix의 버전을 먼저 검사해 나머지 필드를 기다리지 않고 거부한다.
+extension과 daemon은 HNSW op23 payload v5를 함께 배포해야 한다(v4는 응답 뒤에 결정 바이트 6개, 즉 status-13 DETAIL의 원값을 덧붙이고, v5는 그 뒤에 ACE partition builder readback 32바이트를 덧붙인다). 통합 기준 main의 글로벌 v4 명령 ABI는 유지되며 HNSW op23 payload v5와 구분한다.
+이전 payload v1/v2/v3/v4 요청은 prefix의 버전을 먼저 검사해 나머지 필드를 기다리지 않고 거부한다.
 기존 0.8.1 단독 reader는 새 policy v2를 읽을 수 없다. 0.8.2 바이너리를 함께 배포한 뒤 `ALTER EXTENSION pg_cuvs UPDATE TO '0.8.2'`를 사용한다. upgrade SQL은 영수증을 이주/덮어쓰기하지 않는다. v2가 있는 인덱스를 예전 reader로 downgrade하는 것은 지원하지 않는다.
 
 이 구현의 CPU 검사·코드 리뷰와 별개로 작은 실제 CUDA 생성·1M 동일성/비용/품질은 별도 실행 승인과 검증이 필요하다. 같은 native 파일의 변환 보존과 서로 다른 GPU build 간 SHA 불일치는 구분하며, 후자의 비결정성을 성공 판정으로 덮지 않는다.

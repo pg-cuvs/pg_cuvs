@@ -414,6 +414,10 @@ static uint32_t g_scratch_permille = CUVS_RMM_SCRATCH_PERMILLE_DEFAULT;
  * (default) or fails with status 13. Startup-only; explicit ivf_pq/ace
  * never read it. */
 static uint32_t g_hnsw_auto_overflow = CUVS_HNSW_AUTO_OVERFLOW_DEFAULT;
+/* UC-5 ACE quality: auto (the SDK's ace_params default scaled with
+ * ef_construction) or a pinned SDK quality Q. Startup-only; read only by
+ * ACE builds (cuvs_hnsw_ace_ef). */
+static uint32_t g_hnsw_ace_quality = CUVS_HNSW_ACE_QUALITY_AUTO;
 /* I3-D (UC-6 A): pooled RAFT resources own a dedicated RMM stream (on) or use
  * the per-thread default stream (off = I2 behaviour). Startup-only. */
 static int g_rmm_dedicated_stream = CUVS_RMM_DEDICATED_STREAM_DEFAULT;
@@ -10268,6 +10272,7 @@ handle_build_hnsw_file(int client_fd, const CuvsCmdFrame *cmd)
     params.build_algo = request.build_algo;
     params.ef_construction = request.ef_construction;
     params.auto_overflow = g_hnsw_auto_overflow;
+    params.ace_quality = g_hnsw_ace_quality;
     params.policy = &wire.policy;
     if (cuvs_hnsw_wait_for_idle(&g_index_mutex, owner_fd, hnsw_gpu_work_pending, NULL))
         goto cancelled;
@@ -10370,6 +10375,17 @@ handle_build_hnsw_file(int client_fd, const CuvsCmdFrame *cmd)
         reply.status = CUVS_STATUS_BUILD_FAILED;
         snprintf(reply.error, sizeof(reply.error), "HNSW receipt route %s differs from decided route %s",
                  cuvs_hnsw_route_name(wire.policy.route), cuvs_hnsw_route_name(route.decision.route));
+    }
+    /* ACE partition-builder readback from the returned receipt (cuvs_hnsw_policy.h). */
+    if (reply.status == CUVS_STATUS_OK && wire.policy.route == CUVS_HNSW_ROUTE_ACE)
+    {
+        cuvs_hnsw_ace_readback_fill(&wire.ace, params.ace_quality, wire.policy.ace_ef,
+            wire.policy.degree, wire.policy.n_rows, wire.policy.partitions,
+            cuvs_hnsw_sdk_nn_default_iterations());
+        LOG_INFO("[hnsw_job] job=%s phase=ace-readback quality=%u source=%s ace_ef=%u "
+                 "local_intermediate=%u local_iterations=%u partitions=%u\n", workdir,
+                 wire.ace.quality, wire.ace.quality_source ? "manual" : "auto", wire.policy.ace_ef,
+                 wire.ace.local_intermediate, wire.ace.local_iterations, wire.policy.partitions);
     }
     LOG_INFO("[hnsw_job] job=%s phase=wrapper-return mono_us=%llu status=%u owner_cancelled=%d gpu_free_now=%zu resident_now=%zu\n",
         workdir, (unsigned long long)cuvs_hnsw_monotonic_us(), reply.status,
@@ -12034,6 +12050,15 @@ main(int argc, char **argv)
                 return 1;
             }
         }
+        else if (strcmp(argv[i], "--hnsw-ace-build-quality") == 0)
+        {
+            if (i + 1 >= argc || cuvs_hnsw_ace_quality_parse(argv[++i], &g_hnsw_ace_quality))
+            {
+                LOG_ERROR("--hnsw-ace-build-quality requires auto or an SDK quality 0..%u\n",
+                          CUVS_HNSW_ACE_QUALITY_MAX);
+                return 1;
+            }
+        }
         else if (strcmp(argv[i], "--max-indexes") == 0 && i+1 < argc)
         {
             int n = atoi(argv[++i]);
@@ -12242,6 +12267,13 @@ main(int argc, char **argv)
     LOG_INFO("HNSW auto overflow: %s (--hnsw-auto-overflow; default %s)\n",
              cuvs_hnsw_overflow_name(g_hnsw_auto_overflow),
              cuvs_hnsw_overflow_name(CUVS_HNSW_AUTO_OVERFLOW_DEFAULT));
+    if (g_hnsw_ace_quality == CUVS_HNSW_ACE_QUALITY_AUTO)
+        LOG_INFO("HNSW ACE build quality: auto (--hnsw-ace-build-quality; SDK default "
+                 "ace ef_construction scaled with ef_construction)\n");
+    else
+        LOG_INFO("HNSW ACE build quality: %u (--hnsw-ace-build-quality; SDK ace "
+                 "ef_construction %u for every ACE build)\n", g_hnsw_ace_quality,
+                 g_hnsw_ace_quality * CUVS_HNSW_SDK_ACE_QUALITY_DIVISOR);
     /* I4: effective large_workspace knobs, then the host protection line. */
     LOG_INFO("managed large_workspace: cagra_build_overflow=%s managed_overcommit=%s "
              "lw_margin_permille=%u\n", cuvs_lw_overflow_name(g_cagra_build_overflow),

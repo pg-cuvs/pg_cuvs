@@ -75,14 +75,14 @@ static void test_receipts(void)
 static void test_requests(void)
 {
     CuvsHnswFileRequest r = {CUVS_HNSW_FILE_VERSION, 1, 1ULL << 30, CUVS_HNSW_ALGO_ACE, 64};
-    CHECK(CUVS_HNSW_FILE_VERSION == 4);
+    CHECK(CUVS_HNSW_FILE_VERSION == 5);
     CHECK(cuvs_hnsw_file_request_supported(&r));
-    for (uint32_t v = 0; v <= 5; v++)
+    for (uint32_t v = 0; v <= 6; v++)
     {
         r.version = v;
-        CHECK(!!cuvs_hnsw_file_request_supported(&r) == (v == 4));
+        CHECK(!!cuvs_hnsw_file_request_supported(&r) == (v == 5));
     }
-    r.version = 4;
+    r.version = 5;
     for (uint32_t a = 0; a <= 4; a++)
     {
         r.build_algo = a;

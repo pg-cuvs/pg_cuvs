@@ -279,7 +279,7 @@ install-server-test: server-test
 TEST_RT_LIB := $(shell [ "$$(uname -s)" = "Linux" ] && echo -lrt)
 test-unit: test-failed-allocation test-build-oom-log test-peak-log-switch test/unit/test_cuvs_util.c src/cuvs_util.c src/cuvs_util.h src/cuvs_ipc.h \
            test/unit/test_build_corpus.c src/cuvs_build_corpus.c src/cuvs_build_corpus.h \
-           test-hnsw-build test-hnsw-build-ipc test-hnsw-admission test-admission-contract \
+           test-hnsw-build test-hnsw-build-ipc test-hnsw-ace-quality test-hnsw-admission test-admission-contract \
            test-i3-logs test-notice-wire test-admission-wire test-admission-message test-admission-ipc test-build-oom-thread test-cache-policy test-circuit-source test-status-text test-i3b-source test-peak-meter test-lw-policy test-lw-guard test-i3e-sql test-self-replace-notice test-host-free-fence test-vacuum-policy
 	$(CC) -I src -DCUVS_TEST_HOOKS -o test-unit test/unit/test_cuvs_util.c src/cuvs_util.c $(TEST_RT_LIB)
 	./test-unit
@@ -323,6 +323,14 @@ test-hnsw-build-ipc: test/unit/test_hnsw_build_ipc.c src/cuvs_ipc.c \
 	$(CC) -std=gnu11 -Wall -Wextra -I src -o $@ test/unit/test_hnsw_build_ipc.c \
 		src/cuvs_ipc.c src/cuvs_util.c src/cuvs_build_corpus.c -lpthread -lm $(TEST_RT_LIB)
 	./$@
+
+test-hnsw-ace-quality: test/unit/test_hnsw_ace_quality.c src/cuvs_hnsw_policy.h
+	$(CC) -std=gnu11 -Wall -Wextra -Werror -I src -o $@ test/unit/test_hnsw_ace_quality.c
+	./$@
+
+# UC-5 ACE quality rule / readback mutations: each must turn its test RED.
+test-hnsw-ace-quality-mutations: test/unit/test_hnsw_ace_quality_mutations.py test-hnsw-ace-quality test-hnsw-build-ipc
+	CC=$(CC) TEST_RT_LIB="$(TEST_RT_LIB)" python3 -I test/unit/test_hnsw_ace_quality_mutations.py
 
 test-hnsw-policy: test/unit/test_hnsw_policy.c $(wildcard src/cuvs_hnsw*.h)
 	$(CC) -std=gnu11 -Wall -Wextra -I src -o $@ test/unit/test_hnsw_policy.c -lpthread
@@ -523,10 +531,10 @@ test-hnsw-converter: test/unit/test_hnsw_converter.c src/hnsw_export.c \
 		$(HNSW_CONVERTER_UNIT_LINK) $(TEST_RT_LIB)
 	./$@
 
-EXTRA_CLEAN += test-hnsw-build test-hnsw-build-ipc test-hnsw-converter test-hnsw-admission test-hnsw-explicit-route test-hnsw-policy \
+EXTRA_CLEAN += test-hnsw-build test-hnsw-build-ipc test-hnsw-ace-quality test-hnsw-converter test-hnsw-admission test-hnsw-explicit-route test-hnsw-policy \
                test-admission-contract test-admission-contract-cxx test-admission-contract-util.o \
                test-admission-wire test-admission-message test-admission-ipc test-build-oom-thread test-hnsw-auto-overflow test-res-pool test-lw-policy test-lw-guard test-failed-allocation test-host-free-fence test-vacuum-policy
-.PHONY: test-hnsw-build test-hnsw-build-ipc test-hnsw-converter test-hnsw-admission test-hnsw-explicit-route test-hnsw-policy \
+.PHONY: test-hnsw-build test-hnsw-build-ipc test-hnsw-ace-quality test-hnsw-ace-quality-mutations test-hnsw-converter test-hnsw-admission test-hnsw-explicit-route test-hnsw-policy \
         test-admission-contract test-admission-contract-mutations test-admission-wire \
         test-admission-message test-admission-ipc test-build-oom-thread test-gpu-wrapper-i3 test-hnsw-auto-overflow test-res-pool test-lw-policy test-lw-guard test-lw-mutations test-lw-docs \
         test-host-free-fence test-host-free-fence-mutations test-vacuum-policy test-vacuum-policy-mutations test-hnsw-precision-mutations

@@ -2552,7 +2552,8 @@ cuvs_ipc_build_hnsw_file(const char *socket_path, int vectors_fd,
     uint64_t n_vecs, uint32_t dim, uint32_t metric, uint32_t graph_degree,
     uint32_t intermediate_degree, uint32_t hierarchy, uint64_t host_budget,
     uint32_t build_algo, uint32_t ef_construction, CuvsHnswPolicy *policy,
-    CuvsHnswBudgetSnapshot *budget, int *hnsw_fd, char *error, size_t error_len)
+    CuvsHnswBudgetSnapshot *budget, CuvsHnswAceReadback *ace_readback,
+    int *hnsw_fd, char *error, size_t error_len)
 {
     int sock = -1, owner[2] = {-1, -1}, result_fd = -1;
     int rc = CUVS_STATUS_ERROR;
@@ -2563,6 +2564,7 @@ cuvs_ipc_build_hnsw_file(const char *socket_path, int vectors_fd,
     char token = 'O';
     *hnsw_fd = -1;
     if (policy) memset(policy, 0, sizeof(*policy));
+    if (ace_readback) memset(ace_readback, 0, sizeof(*ace_readback));
     if (budget) memset(budget, 0, sizeof(*budget));
     if (error_len) error[0] = '\0';
     if (!cuvs_hnsw_regular_disk(vectors_fd) || !n_vecs || n_vecs > INT32_MAX
@@ -2620,6 +2622,9 @@ cuvs_ipc_build_hnsw_file(const char *socket_path, int vectors_fd,
                 || wire.policy.requested_ef != ef_construction
                 || wire.policy.n_rows != n_vecs || wire.policy.dim != dim
                 || wire.policy.metric != metric || wire.policy.hierarchy != hierarchy
+                || (wire.policy.route == CUVS_HNSW_ROUTE_ACE
+                    ? !cuvs_hnsw_ace_readback_valid(&wire.ace, &wire.policy)
+                    : wire.ace.magic != 0)
                 || !cuvs_hnsw_regular_disk(result_fd)
                 || (fcntl(result_fd, F_GETFL) & O_ACCMODE) != O_RDONLY)
             { rc = CUVS_STATUS_ERROR; goto done; }
@@ -2627,6 +2632,7 @@ cuvs_ipc_build_hnsw_file(const char *socket_path, int vectors_fd,
             token = 'A';
             if (send(owner[0], &token, 1, 0) != 1) { rc = CUVS_STATUS_ERROR; goto done; }
             if (policy) *policy = wire.policy;
+            if (ace_readback) *ace_readback = wire.ace;
             *hnsw_fd = result_fd; result_fd = -1;
         }
         goto done;
