@@ -135,6 +135,11 @@ MUTATIONS = {
         '    if (pk->verdict == CUVS_EVICT_AR5)\n        return pool_short ? CUVS_ADMISSION_AR8 : CUVS_ADMISSION_AR5;\n    if (pool_short')],
         {'daemon'}),
     'uncurable_pool_reported_as_ar3': ([(SERVER, PICK_AR8, '')], {'daemon'}),
+    # a pool-short REINDEX must not unload its old copy (ADR-089 open decision)
+    'self_replace_on_pool_short': ([(SERVER, '        line->pool_short > 0 ||\n', '')], {'daemon'}),
+    'pool_bound_ar5_keeps_wait_hint': ([(SERVER,
+        '    if (f->reason == CUVS_ADMISSION_AR5 && a->pool_valid && a->pool_bound)\n        f->r = 0;\n', '')],
+        {'daemon'}),
     # (5) AR8 reason code / text changed to AR6's
     'ar8_reported_as_ar6': ([(SERVER,
         '        return CUVS_ADMISSION_AR8;\n    return physical_phase',

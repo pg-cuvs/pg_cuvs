@@ -361,6 +361,7 @@ test_pool_shortfall_eviction(void)
     CHECK(g_pending_rmm_build_vram[0] == 0 && g_pending_build_vram[0] == 0);
     CHECK(rej.reason == CUVS_ADMISSION_AR5 && rej.e_mib == 1024 && rej.e_cnt == 1);
     CHECK((rej.present & CUVS_ADM_F_O) == 0);     /* not the AR8 subset */
+    CHECK(a.pool_bound && a.pool_short == UINT64_C(440577280));  /* the pool decided it */
     capture_admit_reason(&a, CUVS_ADMISSION_AR5, buf, sizeof(buf));
     CHECK(strstr(buf, " evicted=0 verdict=reject reason=AR5 ") != NULL);
     CHECK(strstr(buf, " res_n=1 lru_free=1073741824 elig_free=1073741824 ") != NULL);
@@ -424,6 +425,57 @@ test_pool_shortfall_eviction(void)
 
     g_indexes = NULL; g_n_indexes = 0;
     g_reclaim.scope.kind = CUVS_SCOPE_NONE;
+    pthread_mutex_unlock(&g_index_mutex);
+}
+
+/* REINDEX through admit_build_cagra (scope none, self-replace on): the
+ * ADR-089 open decision on self_res against the pool stays conservative, so
+ * a pool-short rebuild never unloads its old copy; without a pool shortfall
+ * self-replace is unchanged. Old copy X (db 1, idx 2, 1 GiB) and Y (7 GiB),
+ * budget and quota 10 GiB, N 3.2e9, headroom 4.8e8: budget short
+ * 1,052,516,352 (X covers it), pool short 1,532,516,352 (X does not). */
+static void
+test_pool_short_reindex(void)
+{
+    const uint64_t ten = 10 * (uint64_t)GiB;
+    AdmitLine a;
+    uint64_t unloaded = 7;
+    reset();
+    g_pool_tracks_residents = 1;
+    g_max_vram_per_gpu[0] = (size_t)ten;
+    pthread_mutex_lock(&g_index_mutex);
+    memset(g_res, 0, sizeof(g_res));
+    g_res[0] = (IndexEntry){.valid = 1, .is_flat = 1, .gpu_device_id = 0, .db_oid = 1,
+                            .index_oid = 2, .main_bf_vram_bytes = GiB};
+    g_res[1] = (IndexEntry){.valid = 1, .is_flat = 1, .gpu_device_id = 0, .db_oid = 1,
+                            .index_oid = 9, .main_bf_vram_bytes = 7 * GiB};
+    g_indexes = g_res; g_n_indexes = 2;
+    g_rmm_pool_limits[0] = (size_t)ten;
+    a = line_for(1000000);
+    CHECK(g_reclaim.self_replace && g_reclaim.scope.kind == CUVS_SCOPE_NONE);
+    CHECK(admit_build_cagra(a.needed, 0, 1, 2, &unloaded, &a) == -1);
+    CHECK(g_last_admit_reason == CUVS_ADMISSION_AR5 && a.pool_short == UINT64_C(1532516352));
+    CHECK(unloaded == 0 && g_n_indexes == 2 && g_cache_evictions[0] == 0);  /* X kept */
+    CHECK(find_index(1, 2) != NULL);
+    {
+        /* The err_out handle_build sends: the budget-based reclaim rule says
+         * "wait" (r = 1: 8 GiB cold, N within the 50% cap), but the pool
+         * shortfall decided this AR5 and reclaim does not target the pool,
+         * so r = 0 and the HINT offers no wait. */
+        CuvsAdmissionFields rej;
+        admission_fill(&rej, (CuvsAdmissionReason)g_last_admit_reason, a.needed, 0);
+        CHECK((rej.present & CUVS_ADM_F_R) && rej.r == 1);
+        admission_pool_fields(&rej, &a, 0);
+        CHECK(rej.reason == CUVS_ADMISSION_AR5 && a.pool_bound && rej.r == 0);
+    }
+
+    /* Positive control: no pool (quota 0), same budget shortfall -> the old
+     * copy alone makes room, is unloaded, and the build is admitted. */
+    g_rmm_pool_limits[0] = 0;
+    a = line_for(1000000);
+    CHECK(admit_build_cagra(a.needed, 0, 1, 2, &unloaded, &a) == 0);
+    CHECK(unloaded == GiB && g_n_indexes == 1 && find_index(1, 2) == NULL);
+    g_indexes = NULL; g_n_indexes = 0;
     pthread_mutex_unlock(&g_index_mutex);
 }
 
@@ -532,6 +584,7 @@ main(void)
     test_concurrent();
     test_order();
     test_pool_shortfall_eviction();
+    test_pool_short_reindex();
     test_admit_line();
     if (failures)
     {
@@ -543,7 +596,8 @@ main(void)
          "concurrent builds, AR1 then AR6 then the pool shortfall offered to make_room "
          "(eligible resident evicted and admitted; scope none / hot idle:0 -> AR5; "
          "beyond evictable or above pool_used -> AR8 unevicted; still short after "
-         "eviction -> AR8), nothing reserved on a refusal, err_out n q p d o, [admit] "
-         "fields, strict knob parsing");
+         "eviction -> AR8; pool-bound AR5 has r 0; a pool-short REINDEX keeps its old "
+         "copy), nothing reserved on a refusal, err_out n q p d o, [admit] fields, "
+         "strict knob parsing");
     return 0;
 }
