@@ -226,6 +226,20 @@ static int fence_sync_stream(void *stream)
     return (int)cudaStreamSynchronize(static_cast<cudaStream_t>(stream));
 }
 
+/* Q6 B1: a failed wait quarantines the block (not freed). Record the CUDA
+ * error, stream and device with the running totals; never throws. */
+static void fence_log_failure(int err, void *stream, int device, std::size_t bytes)
+{
+    CuvsHostFreeFence::Stats &st = CuvsHostFreeFence::stats();
+    fprintf(stderr, "[host_free_fence] stream wait failed: err=%d %s stream=%p device=%d; "
+                    "quarantined %zu bytes (not freed); totals sync_failures=%llu "
+                    "quarantined_blocks=%llu quarantined_bytes=%llu (before this block)\n",
+            err, cudaGetErrorName(static_cast<cudaError_t>(err)), stream, device, bytes,
+            (unsigned long long)st.sync_failures.load(),
+            (unsigned long long)st.quarantined_blocks.load(),
+            (unsigned long long)st.quarantined_bytes.load());
+}
+
 static void ensure_fenced_host_resource()
 {
     static const bool installed = [] {
@@ -265,15 +279,32 @@ struct PooledRes {
             throw std::runtime_error("cudaSetDevice failed");
         }
         ensure_fenced_host_resource();
-        fence.emplace(static_cast<void *>(r->res->get_stream().value()), fence_sync_stream);
+        fence.emplace(static_cast<void *>(r->res->get_stream().value()), fence_sync_stream,
+                      device_id, fence_log_failure);
     }
     ~PooledRes()
     {
+        /* Q6 B1: a failed wait means this stream's work was not confirmed
+         * complete; never pool such a resource. */
+        const bool fence_failed = fence && fence->failures() > 0;
         fence.reset();
+        if (fence_failed && !poisoned) {
+            fprintf(stderr, "[PooledRes] host free fence wait failed on device %d; "
+                            "destroying the resource instead of pooling it\n", dev);
+            poisoned = true;
+        }
         if (r && !poisoned) release_res(dev, std::move(r));
     }
     raft::device_resources &get() { return *r->res; }
     void poison() { poisoned = true; }
+    /* Q6 B1: fail the request (inside its try block) if a host free of this
+     * request could not wait for the stream; the catch then poisons. */
+    void fence_check()
+    {
+        if (fence && fence->failures() > 0)
+            throw std::runtime_error("host free fence: request stream wait failed (err=" +
+                                     std::to_string(fence->last_error()) + ")");
+    }
 };
 
 /* I4 / ADR-088: build-only large_workspace resource. cudaMallocManaged via
@@ -1382,6 +1413,7 @@ cuvs_cagra_build_multi(const float **vecs, const int64_t *n_each, int n_parts,
             res,
             params,
             raft::make_const_mdspan(d_corpus.view()));
+        _pr.fence_check();
 
         /* I3 (v6 C3, CK-30): cuVS keeps the dataset in rows of
          * ld = round_up(dim, 4) floats (16-byte alignment, make_aligned_dataset).
@@ -1747,6 +1779,7 @@ cuvs_cagra_serialize(CuvsCagraIndex index, const char *path, int device_id)
          * device memory alive that idx's view points to. */
         cuvs::neighbors::cagra::serialize(res, std::string(path), impl->idx, true);
         res.sync_stream();
+        _pr.fence_check();
         return 0;
     } catch (const std::exception &e) {
         fprintf(stderr, "[cuvs_cagra_serialize] exception: %s\n", e.what());
@@ -1765,6 +1798,7 @@ cuvs_cagra_deserialize(const char *path, int dim, int device_id)
         cuvs::neighbors::cagra::index<float, uint32_t> idx(res);
         cuvs::neighbors::cagra::deserialize(res, path, &idx);
         res.sync_stream();
+        _pr.fence_check();
         (void)dim;  /* dim is encoded in the serialized index */
 
         /* After deserialize with include_dataset=true at save time, the index
@@ -1845,6 +1879,7 @@ cuvs_cagra_extend(CuvsCagraIndex index,
             raft::make_const_mdspan(d_new.view()),
             impl->idx);
         res.sync_stream();
+        _pr.fence_check();
 
         /* Release the old impl->dataset (no longer referenced by idx). */
         impl->dataset = raft::make_device_matrix<float, int64_t>(res, (int64_t)0, (int64_t)0);
@@ -1963,6 +1998,7 @@ cuvs_ivfpq_build(
             res, params,
             raft::make_const_mdspan(d_corpus.view()));
         res.sync_stream();
+        _pr.fence_check();
 
         *out = new CuvsIvfPqIndexImpl(std::move(idx), n_vecs, dim, metric);
         return 0;
@@ -2056,6 +2092,7 @@ cuvs_ivfpq_serialize(CuvsIvfPqIndex index, const char *path, int device_id)
         PooledRes _pr(device_id); raft::device_resources &res = _pr.get();
         cuvs::neighbors::ivf_pq::serialize(res, std::string(path), impl->idx);
         res.sync_stream();
+        _pr.fence_check();
         return 0;
     } catch (const std::exception &e) {
         fprintf(stderr, "[cuvs_ivfpq_serialize] exception: %s\n", e.what());
@@ -2076,6 +2113,7 @@ cuvs_ivfpq_deserialize(const char *path, int device_id)
         cuvs::neighbors::ivf_pq::index<int64_t> idx(res);
         cuvs::neighbors::ivf_pq::deserialize(res, std::string(path), &idx);
         res.sync_stream();
+        _pr.fence_check();
         int64_t  n   = (int64_t)idx.size();
         int      dim = (int)idx.dim();
         uint32_t met = cuvs_metric_code(idx.metric());
@@ -2137,6 +2175,7 @@ cuvs_hnsw_serialize(CuvsCagraIndex cagra_idx, const char *path, int device_id)
             res, hparams, cimpl->idx);
         res.sync_stream();
         cuvs::neighbors::hnsw::serialize(res, std::string(path), *hnsw);
+        _pr.fence_check();
         return 0;
     } catch (const std::exception &e) {
         _pr.poison();
@@ -2162,6 +2201,7 @@ cuvs_hnsw_deserialize(const char *path, int dim, uint32_t metric, int device_id)
         cuvs::neighbors::hnsw::deserialize(res, hparams, std::string(path),
                                            dim, cuvs_distance_type(metric),
                                            &loaded);
+        _pr.fence_check();
         if (!loaded) return nullptr;
         CuvsHnswIndexImpl *impl = new CuvsHnswIndexImpl;
         impl->idx    = loaded;
@@ -2743,6 +2783,7 @@ static int execute_hnsw_file_build(const CuvsHnswFileBuild *params, int owner_fd
         fprintf(stderr, "[hnsw_build] job=%s phase=cuvs-return call=serialize mono_us=%llu cancelled=%d\n",
             workdir, (unsigned long long)cuvs_hnsw_monotonic_us(), cuvs_hnsw_owner_cancelled(owner_fd));
         if (cuvs_hnsw_owner_cancelled(owner_fd)) return CUVS_STATUS_CANCELED;
+        resources.fence_check();
         if (tiny)
         {
             int patch_fd = open(output.c_str(), O_RDWR | O_CLOEXEC);

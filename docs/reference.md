@@ -299,6 +299,15 @@ out of GPU memory after admission fails with SQLSTATE 53200 and evicts no reside
 index (there is no evict-and-retry); raise `--rmm-scratch-permille` to reserve
 more. IVF-PQ builds and index reloads keep their own estimates.
 
+While a request holds a GPU stream, host buffers that cuVS frees are released only
+after that stream's queued work has completed, including when a failed build unwinds.
+If waiting for the stream reports a CUDA error, the buffer is kept allocated
+instead of freed, because work still queued may write into it. The daemon then logs
+`[host_free_fence] stream wait failed: err=... stream=... device=...` with the bytes
+kept and discards that request's GPU resources instead of reusing them. An index
+build, extend, load or save that hit such a failure is reported as failed. The kept
+memory is not reused until the daemon restarts.
+
 A CAGRA single or parallel build must also fit the pool next to what is already
 there (ADR-089): `pending + pool_used + N + headroom ≤ quota`. `pool_used` is the
 pool's used bytes before eviction (resident indexes), `pending` is what builds already
