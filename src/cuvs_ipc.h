@@ -93,7 +93,9 @@
  * then CuvsReplyHeader + read-only regular HNSW file FD (success only).
  * Owner channel: C=cancel, EOF=owner lost, A=result handoff acknowledged. */
 #include "cuvs_hnsw_policy.h"
-#define CUVS_HNSW_FILE_VERSION 3u
+/* v4 (2026-11-09): the reply appends CuvsHnswBudgetSnapshot, so a v3 peer
+ * is refused with the co-deploy message instead of a short read. */
+#define CUVS_HNSW_FILE_VERSION 4u
 typedef struct CuvsHnswFileRequest {
     uint32_t version;
     uint32_t hierarchy;        /* 0=NONE (nsw), 1=GPU; never CPU */
@@ -286,7 +288,7 @@ typedef struct CuvsHnswBudgetSnapshot {
     uint64_t pool_used, logical_used;
 } CuvsHnswBudgetSnapshot;
 
-/* Only BUILD_HNSW_FILE v3 uses this receipt; global v3 stays unchanged.
+/* Only BUILD_HNSW_FILE (payload v4) uses this receipt; global v3 stays unchanged.
  * budget is appended after the stored receipt (the receipt layout is not
  * touched); extension and daemon are deployed together (ADR-081). */
 typedef struct CuvsHnswFileReply {
