@@ -256,14 +256,16 @@ static void ensure_fenced_host_resource()
     (void)installed;
 }
 
-/* Largest squared row norm of a device row-major matrix (+inf if any row is
- * non-finite), for the fp16 kNN bound (cuvs_hnsw_ivfpq_needs_fp32). */
+/* Largest squared row norm of a device row-major matrix with row stride ld
+ * (+inf if any row is non-finite), for the fp16 kNN bound
+ * (cuvs_hnsw_ivfpq_needs_fp32). */
 struct CuvsRowSqNorm {
     const float *data;
     int64_t dim;
+    int64_t ld;
     __device__ double operator()(int64_t row) const
     {
-        const float *r = data + row * dim;
+        const float *r = data + row * ld;
         double sum = 0.0;
         for (int64_t j = 0; j < dim; j++)
             sum += (double)r[j] * (double)r[j];
@@ -272,12 +274,74 @@ struct CuvsRowSqNorm {
 };
 
 static double device_max_sq_norm(raft::device_resources &res, const float *data,
-                                 int64_t rows, int64_t dim)
+                                 int64_t rows, int64_t dim, int64_t ld)
 {
-    if (rows <= 0) return 0.0;
+    if (rows <= 0 || !data) return 0.0;
     return thrust::transform_reduce(thrust::cuda::par.on(res.get_stream()),
         thrust::counting_iterator<int64_t>(0), thrust::counting_iterator<int64_t>(rows),
-        CuvsRowSqNorm{data, dim}, 0.0, thrust::maximum<double>());
+        CuvsRowSqNorm{data, dim, ld}, 0.0, thrust::maximum<double>());
+}
+
+/* fp16 kNN bound (cuvs_hnsw_ivfpq_needs_fp32) for a CAGRA graph build. Shared
+ * by cuvs_cagra_build_multi and cuvs_cagra_compact, whose cagra::merge
+ * rebuilds the kept rows with the same params (cagra_merge.cuh -> cagra::build).
+ * rows/dim/ld: the device rows that bound the distances; shape: the dataset
+ * cagra::build will see, which cuVS's own heuristic sizes from.
+ * - AUTO, fp16-safe data: graph_build_params is left as given (monostate), so
+ *   cuVS decides exactly as before.
+ * - AUTO, fp16-unsafe data: cuVS's own choice (cagra_build.cuh: NN-descent
+ *   when it fits the device, else IVF-PQ from the shape) is made here and
+ *   pinned, with fp32 IVF-PQ distances.
+ * - IVF_PQ: the shape default, in fp32 when needed. NN_DESCENT: no IVF-PQ. */
+static void cagra_knn_precision(raft::device_resources &res, const float *rows_data,
+    int64_t rows, int64_t dim, int64_t ld, raft::matrix_extent<int64_t> shape,
+    uint32_t metric, uint32_t build_algo, cuvs::neighbors::cagra::index_params &params,
+    const char *who)
+{
+    namespace gbp = cuvs::neighbors::cagra::graph_build_params;
+    const bool may_use_ivf_pq = build_algo == CUVS_CAGRA_BUILD_IVF_PQ
+        || build_algo == CUVS_CAGRA_BUILD_AUTO;
+    const double max_sq = may_use_ivf_pq
+        ? device_max_sq_norm(res, rows_data, rows, dim, ld) : 0.0;
+    const bool fp32 = may_use_ivf_pq && cuvs_hnsw_ivfpq_needs_fp32(max_sq, metric);
+    auto fp32_ivf_pq = [&](gbp::ivf_pq_params pq) {
+        pq.search_params.lut_dtype = CUDA_R_32F;
+        pq.search_params.internal_distance_dtype = CUDA_R_32F;
+        pq.search_params.coarse_search_dtype = CUDA_R_32F;
+        return pq;
+    };
+    const char *knn = "auto";
+    if (build_algo == CUVS_CAGRA_BUILD_IVF_PQ)
+    {
+        auto pq = gbp::ivf_pq_params(shape);
+        params.graph_build_params = fp32 ? fp32_ivf_pq(pq) : pq;
+        knn = "ivf_pq";
+    }
+    else if (build_algo == CUVS_CAGRA_BUILD_NN_DESCENT)
+        params.graph_build_params =
+            gbp::nn_descent_params(params.intermediate_graph_degree);
+    else if (fp32)
+    {
+        if (cuvs::neighbors::nn_descent::has_enough_device_memory(res, shape, sizeof(uint32_t)))
+        {
+            /* cuVS sizes this from its clamped intermediate degree
+             * (check_graph_degree: below the row count). */
+            const size_t n = shape.extent(0) > 1 ? (size_t)shape.extent(0) - 1 : 1;
+            params.graph_build_params = gbp::nn_descent_params(
+                params.intermediate_graph_degree < n ? params.intermediate_graph_degree : n,
+                params.metric);
+            knn = "nn_descent";
+        }
+        else
+        {
+            params.graph_build_params = fp32_ivf_pq(gbp::ivf_pq_params(shape, params.metric));
+            knn = "ivf_pq";
+        }
+    }
+    if (may_use_ivf_pq)
+        fprintf(stderr, "[%s] knn precision max_sq_norm=%.9g fp16_max=%.0f "
+                        "knn_builder=%s ivfpq_distance_dtype=%s\n",
+                who, max_sq, CUVS_HNSW_FP16_MAX, knn, fp32 ? "fp32" : "fp16");
 }
 
 /* RAII: borrow on construction, return to the pool on destruction. If a cuVS
@@ -1430,55 +1494,11 @@ cuvs_cagra_build_multi(const float **vecs, const int64_t *n_each, int n_parts,
         /* build_algo: graph-construction algorithm (cuVS 26.04 graph_build_params
          * std::variant). AUTO leaves std::monostate so cuVS picks heuristically
          * (ivf_pq for large, nn_descent for small). */
-        namespace gbp = cuvs::neighbors::cagra::graph_build_params;
         /* IVF-PQ kNN precision (cuvs_hnsw_ivfpq_needs_fp32): the corpus is
          * already on the GPU, so the bound costs one reduction, not a host
-         * pass. fp16 data keeps every parameter as before. */
-        const bool may_use_ivf_pq = build_algo == CUVS_CAGRA_BUILD_IVF_PQ
-            || build_algo == CUVS_CAGRA_BUILD_AUTO;
-        const double max_sq = may_use_ivf_pq
-            ? device_max_sq_norm(res, d_corpus.data_handle(), total, (int64_t)dim) : 0.0;
-        const bool fp32 = may_use_ivf_pq && cuvs_hnsw_ivfpq_needs_fp32(max_sq, metric);
-        auto fp32_ivf_pq = [&](gbp::ivf_pq_params pq) {
-            pq.search_params.lut_dtype = CUDA_R_32F;
-            pq.search_params.internal_distance_dtype = CUDA_R_32F;
-            pq.search_params.coarse_search_dtype = CUDA_R_32F;
-            return pq;
-        };
-        const char *knn = "auto";
-        if (build_algo == CUVS_CAGRA_BUILD_IVF_PQ)
-        {
-            auto pq = gbp::ivf_pq_params(d_corpus.extents());
-            params.graph_build_params = fp32 ? fp32_ivf_pq(pq) : pq;
-            knn = "ivf_pq";
-        }
-        else if (build_algo == CUVS_CAGRA_BUILD_NN_DESCENT)
-            params.graph_build_params =
-                gbp::nn_descent_params(params.intermediate_graph_degree);
-        else if (fp32)
-        {
-            /* AUTO with fp16-unsafe data: make cuVS's own choice once
-             * (cagra_build.cuh: NN-descent when it fits the device, else
-             * IVF-PQ from the dataset shape) and pin it, with fp32 IVF-PQ. */
-            if (cuvs::neighbors::nn_descent::has_enough_device_memory(res, d_corpus.extents(),
-                    sizeof(uint32_t)))
-            {
-                params.graph_build_params = gbp::nn_descent_params(
-                    params.intermediate_graph_degree, params.metric);
-                knn = "nn_descent";
-            }
-            else
-            {
-                params.graph_build_params = fp32_ivf_pq(
-                    gbp::ivf_pq_params(d_corpus.extents(), params.metric));
-                knn = "ivf_pq";
-            }
-        }
-        /* else CUVS_CAGRA_BUILD_AUTO with fp16-safe data: leave monostate. */
-        if (may_use_ivf_pq)
-            fprintf(stderr, "[cuvs_cagra_build_multi] knn precision max_sq_norm=%.9g fp16_max=%.0f "
-                            "knn_builder=%s ivfpq_distance_dtype=%s\n",
-                    max_sq, CUVS_HNSW_FP16_MAX, knn, fp32 ? "fp32" : "fp16");
+         * pass. fp16-safe data keeps every parameter as before. */
+        cagra_knn_precision(res, d_corpus.data_handle(), total, (int64_t)dim, (int64_t)dim,
+            d_corpus.extents(), metric, build_algo, params, "cuvs_cagra_build_multi");
 
         auto idx = cuvs::neighbors::cagra::build(
             res,
@@ -2004,6 +2024,21 @@ cuvs_cagra_compact(CuvsCagraIndex  index,
 
         cuvs::neighbors::cagra::index_params params;
         params.metric = cuvs_distance_type(metric);
+        /* B1: cagra::merge rebuilds the kept rows with these params
+         * (cagra_merge.cuh -> cagra::build), so the build's fp16 kNN bound
+         * applies here too: bound over the index dataset (a superset of the
+         * kept rows), choice sized from the kept shape like cuVS's own. */
+        const auto ds = impl->idx.dataset();
+        int64_t n_keep = 0;
+        for (int64_t w = 0; w < n_words; w++)
+        {
+            uint32_t bits = keep_bits_words[w];
+            if (w == n_words - 1 && (n_total & 31)) bits &= (1u << (n_total & 31)) - 1u;
+            n_keep += __builtin_popcount(bits);
+        }
+        cagra_knn_precision(res, ds.data_handle(), ds.extent(0), ds.extent(1), ds.stride(0),
+            raft::make_extents<int64_t>(n_keep, ds.extent(1)), metric, CUVS_CAGRA_BUILD_AUTO,
+            params, "cuvs_cagra_compact");
 
         std::vector<cuvs::neighbors::cagra::index<float, uint32_t>*> indices = {&impl->idx};
         auto new_idx = cuvs::neighbors::cagra::merge(res, params, indices, filter);
