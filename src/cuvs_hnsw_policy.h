@@ -129,7 +129,7 @@ static inline const char *cuvs_hnsw_route_name(uint32_t route)
     }
 }
 
-/* Reloption default64 preserves I128 / hierarchy200 / ACE120 (cuvs_hnsw_ace_ef). These control
+/* Reloption default64 preserves I128 / hierarchy200 (ACE: cuvs_hnsw_ace_ef). These control
  * construction effort, not a promise of monotonic recall. Do not replace the
  * pinned IVF training/probe defaults with cuVS AUTO heuristics. */
 static inline uint32_t cuvs_hnsw_scaled_quality(uint32_t base, uint32_t ef,
@@ -144,10 +144,14 @@ static inline uint32_t cuvs_hnsw_scaled_quality(uint32_t base, uint32_t ef,
  * (cagra.cpp graph_params_heuristic): an ACE partition under 1e6 rows builds
  * its kNN graph with NN-descent for 5 + q iterations, a larger one with IVF-PQ
  * at round(2 + sqrt(n_lists) / 20 + q) probes.
- * auto: A is the linked SDK's own ace_params default (120 in cuVS 26.04,
- *   12 NN-descent iterations) scaled with ef_construction like the
- *   intermediate degree and the hierarchy quality; the value the product
- *   has always used.
+ * auto: a partition's NN-descent runs the iteration budget that a whole-
+ *   dataset NN-descent build runs by default (T, nn_descent::index_params
+ *   max_iterations of the linked SDK, 20 in cuVS 26.04) at the reloption
+ *   default ef_construction 64: q = T - 5, A = 16 * (T - 5). Other
+ *   ef_construction values scale A like the intermediate degree and the
+ *   hierarchy quality. (The SDK's own ace_params default A 120 gives 12
+ *   iterations, which left ACE recall at low ef_search 0.01+ below resident
+ *   IVF-PQ at ef_construction 64; UC-5.)
  *   The partition kNN width stays the SDK's 3 * (degree / 2), 96 at degree
  *   64. Handing the scaled intermediate degree (128) to the partition
  *   builder instead lowered recall at both 12 and 20 iterations (999,000 x
@@ -177,13 +181,18 @@ static inline int cuvs_hnsw_ace_quality_parse(const char *name, uint32_t *out)
 
 #define CUVS_HNSW_SDK_ACE_NN_ITERATION_OFFSET 5u
 
-/* The A handed to the SDK. sdk_default_ace_ef is ace_params{}.ef_construction
- * of the linked SDK headers (120 in cuVS 26.04). */
+/* The A handed to the SDK. sdk_nn_iterations is the linked SDK's default
+ * NN-descent max_iterations (nn_descent::index_params{}.max_iterations). */
 static inline uint32_t cuvs_hnsw_ace_ef(uint32_t setting, uint32_t ef,
-                                        uint32_t sdk_default_ace_ef)
+                                        uint32_t sdk_nn_iterations)
 {
     if (setting == CUVS_HNSW_ACE_QUALITY_AUTO)
-        return cuvs_hnsw_scaled_quality(sdk_default_ace_ef, ef, 4, 65535);
+    {
+        uint32_t q = sdk_nn_iterations > CUVS_HNSW_SDK_ACE_NN_ITERATION_OFFSET
+            ? sdk_nn_iterations - CUVS_HNSW_SDK_ACE_NN_ITERATION_OFFSET : 0;
+        if (q > CUVS_HNSW_ACE_QUALITY_MAX) q = CUVS_HNSW_ACE_QUALITY_MAX;
+        return cuvs_hnsw_scaled_quality(q * CUVS_HNSW_SDK_ACE_QUALITY_DIVISOR, ef, 4, 65535);
+    }
     return setting * CUVS_HNSW_SDK_ACE_QUALITY_DIVISOR;
 }
 

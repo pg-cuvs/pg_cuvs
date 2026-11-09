@@ -25,16 +25,17 @@ static void test_parse(void)
 
 static void test_rule(void)
 {
-    /* auto: the linked SDK's ace_params default A at the reloption default,
-     * ceil(A_sdk * E / 64) elsewhere, bounded to the SDK's [4, 65535] domain. */
-    const uint32_t sdk_defaults[] = {120, 200, 64};
+    /* auto: q = T - 5 at the reloption default (T = the SDK's default NN-descent
+     * iterations), A = ceil(16 (T - 5) E / 64) elsewhere, bounded to [4, 65535]. */
+    const uint32_t sdk_iterations[] = {20, 25, 6};
     for (size_t i = 0; i < 3; i++)
     {
-        uint32_t base = sdk_defaults[i], last = 0;
-        CHECK(cuvs_hnsw_ace_ef(CUVS_HNSW_ACE_QUALITY_AUTO, 64, base) == base);
+        uint32_t t = sdk_iterations[i], base = 16 * (t - 5), last = 0;
+        CHECK(cuvs_hnsw_ace_ef(CUVS_HNSW_ACE_QUALITY_AUTO, 64, t) == base);
+        CHECK(cuvs_hnsw_ace_ef(CUVS_HNSW_ACE_QUALITY_AUTO, 64, t) / 16 + 5 == t);
         for (uint32_t ef = 4; ef <= 1000; ef++)
         {
-            uint32_t a = cuvs_hnsw_ace_ef(CUVS_HNSW_ACE_QUALITY_AUTO, ef, base);
+            uint32_t a = cuvs_hnsw_ace_ef(CUVS_HNSW_ACE_QUALITY_AUTO, ef, t);
             uint64_t want = (uint64_t)base * ef;
             if (a > 4) CHECK((uint64_t)a * 64 >= want && (uint64_t)(a - 1) * 64 < want);
             else CHECK(want <= 4 * 64);
@@ -42,18 +43,18 @@ static void test_rule(void)
             last = a;
         }
     }
-    /* cuVS 26.04 at the reloption default: A 120 -> q 7 -> 12 NN-descent
-     * iterations, the value before the knob existed. */
-    CHECK(cuvs_hnsw_ace_ef(CUVS_HNSW_ACE_QUALITY_AUTO, 64, 120) == 120);
-    CHECK(cuvs_hnsw_ace_ef(CUVS_HNSW_ACE_QUALITY_AUTO, 64, 120) / 16 == 7);
-    CHECK(cuvs_hnsw_ace_ef(CUVS_HNSW_ACE_QUALITY_AUTO, 128, 120) == 240);
-    CHECK(cuvs_hnsw_ace_ef(CUVS_HNSW_ACE_QUALITY_AUTO, 1000, 120) == 1875);
-    CHECK(cuvs_hnsw_ace_ef(CUVS_HNSW_ACE_QUALITY_AUTO, 4, 120) == 8);
+    /* cuVS 26.04 (T 20) at the reloption default: A 240 -> q 15 -> 20 iterations. */
+    CHECK(cuvs_hnsw_ace_ef(CUVS_HNSW_ACE_QUALITY_AUTO, 64, 20) == 240);
+    CHECK(cuvs_hnsw_ace_ef(CUVS_HNSW_ACE_QUALITY_AUTO, 128, 20) == 480);
+    /* An SDK without a usable iteration budget never underflows. */
+    CHECK(cuvs_hnsw_ace_ef(CUVS_HNSW_ACE_QUALITY_AUTO, 64, 5) == 4);
+    CHECK(cuvs_hnsw_ace_ef(CUVS_HNSW_ACE_QUALITY_AUTO, 64, 0) == 4);
+    CHECK(cuvs_hnsw_ace_ef(CUVS_HNSW_ACE_QUALITY_AUTO, 1000, UINT32_MAX) == 65535);
     /* manual Q: exactly 16 Q whatever ef_construction is, so q == Q. */
     for (uint32_t qv = 0; qv <= CUVS_HNSW_ACE_QUALITY_MAX; qv++)
         for (uint32_t ef = 4; ef <= 1000; ef += 333)
         {
-            uint32_t a = cuvs_hnsw_ace_ef(qv, ef, 120);
+            uint32_t a = cuvs_hnsw_ace_ef(qv, ef, 20);
             CHECK(a == 16 * qv && a / 16 == qv && a <= 65535);
         }
 }
@@ -137,6 +138,6 @@ int main(void)
     test_rule();
     test_readback();
     if (failures) { fprintf(stderr, "%d failure(s)\n", failures); return 1; }
-    printf("PASS ACE quality knob parser, auto = SDK ace default scaled with ef_construction, manual 16Q, partition-builder readback and its bounded reader\n");
+    printf("PASS ACE quality knob parser, auto = 16 (SDK NN-descent iterations - 5) scaled with ef_construction, manual 16Q, partition-builder readback and its bounded reader\n");
     return 0;
 }
