@@ -2995,7 +2995,10 @@ cuvs_hnsw_build_file(int vectors_fd, int owner_fd,
             (unsigned long long)sdk_host_budget, (unsigned long long)sdk_gpu_budget,
             (unsigned long long)cap.host_peak, (unsigned long long)cap.gpu_peak);
         /* Resident IVF-PQ kNN precision from the rows themselves: fp16 distances
-         * overflow for large-magnitude data (cuvs_hnsw_ivfpq_needs_fp32). */
+         * overflow for large-magnitude data (cuvs_hnsw_ivfpq_needs_fp32). ACE-disk
+         * needs no rule: with the positive budgets passed below, the pinned
+         * SDK's memory-guard patch builds every partition kNN with NN-descent
+         * (cagra_build.cuh bounded_partition_builder), never fp16 IVF-PQ. */
         if (!tiny && !disk)
         {
             const double max_sq = cuvs_hnsw_max_sq_norm(static_cast<const float *>(files.mapping),

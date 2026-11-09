@@ -515,6 +515,35 @@ static void test_disk_refusal_surface(void)
                  "tablespace needs a further n x dim x 4 bytes.") == 0);
 }
 
+/* ACE partitions never take cuVS's fp16 IVF-PQ graph builder: its heuristic
+ * picks IVF-PQ for partitions of >= 1e6 rows (cagra.cpp graph_params_heuristic),
+ * but the pinned SDK's memory-guard patch 0003 builds every partition kNN with
+ * NN-descent when an ACE memory budget is positive (cagra_build.cuh
+ * bounded_partition_builder). So every admitted ACE decision must carry
+ * positive SDK budgets, at and above 1e6 rows per partition too. */
+static void test_ace_budgets_bound_partition_builder(void)
+{
+    static const uint64_t rows[] = {256, 999000, 1000000, 2200000, 100000000};
+    static const uint64_t hosts[] = {64ULL << 20, 512ULL << 20, 4ULL << 30, 64ULL << 30, 1ULL << 40};
+    static const uint64_t gpus[] = {256ULL << 20, 1ULL << 30, 8ULL << 30, 80ULL << 30};
+    static const uint32_t algos[] = {CUVS_HNSW_ALGO_ACE, CUVS_HNSW_ALGO_AUTO};
+    unsigned admitted = 0;
+    for (unsigned i = 0; i < sizeof(rows) / sizeof(rows[0]); i++)
+        for (unsigned h = 0; h < sizeof(hosts) / sizeof(hosts[0]); h++)
+            for (unsigned g = 0; g < sizeof(gpus) / sizeof(gpus[0]); g++)
+                for (unsigned a = 0; a < 2; a++)
+                {
+                    CuvsHnswForecast f;
+                    if (forecast(rows[i], algos[a], CUVS_HNSW_OVERFLOW_ACE, hosts[h], gpus[g], &f)
+                            != CUVS_STATUS_OK || f.decision.route != CUVS_HNSW_ROUTE_ACE)
+                        continue;
+                    admitted++;
+                    CHECK(f.decision.sdk_host_budget > 0 && f.decision.sdk_host_budget <= hosts[h]);
+                    CHECK(f.decision.sdk_gpu_budget > 0 && f.decision.sdk_gpu_budget <= gpus[g]);
+                }
+    CHECK(admitted > 0);
+}
+
 int main(void)
 {
     /* First, so its mutants are attributed to the direct regression itself. */
@@ -528,6 +557,7 @@ int main(void)
     test_hnsw_oom_hint();
     test_budget_detail();
     test_disk_refusal_surface();
+    test_ace_budgets_bound_partition_builder();
     printf("PASS %u CK-17 (12)-(14) CPU checks: default ace + knob, single overflow branch receipts/NOTICEs, pre-spool/fallback, disk precheck and refusal text, six-field MiB DETAIL, CAGRA reltuples AR0; SDK/GPU/PG not run\n", checks);
     return 0;
 }
