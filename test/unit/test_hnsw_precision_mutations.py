@@ -78,6 +78,14 @@ WIRING = {
                                                 r"&& wire\.policy\.route == CUVS_HNSW_ROUTE_ACE;\s*if \(reply\.status == CUVS_STATUS_OK && !graph_fallback"),
     "backend_notice": (BACKEND, r"if \(notices & CUVS_HNSW_NOTICE_GRAPH_FALLBACK\)\s*ereport\(NOTICE"),
     "receipt_json_fields": (EXPORT, r"\\\"ivfpq_distance_dtype\\\":\\\"%s\\\",\\\"graph_fallback\\\":%s"),
+    # CAGRA AM (cuvs_cagra_build_multi): same bound from the corpus already on the GPU
+    "cagra_bound_on_device": (WRAPPER, r"const double max_sq = may_use_ivf_pq\s*\?\s*device_max_sq_norm\(res, d_corpus\.data_handle\(\), total, \(int64_t\)dim\)"),
+    "cagra_rule_used": (WRAPPER, r"const bool fp32 = may_use_ivf_pq && cuvs_hnsw_ivfpq_needs_fp32\(max_sq, metric\);"),
+    "cagra_fp32_three_dtypes": (WRAPPER, r"auto fp32_ivf_pq = \[&\]\(gbp::ivf_pq_params pq\) \{\s*pq\.search_params\.lut_dtype = CUDA_R_32F;\s*"
+                                         r"pq\.search_params\.internal_distance_dtype = CUDA_R_32F;\s*pq\.search_params\.coarse_search_dtype = CUDA_R_32F;"),
+    "cagra_explicit_ivf_pq": (WRAPPER, r"auto pq = gbp::ivf_pq_params\(d_corpus\.extents\(\)\);\s*params\.graph_build_params = fp32 \? fp32_ivf_pq\(pq\) : pq;"),
+    "cagra_auto_pins_choice": (WRAPPER, r"else if \(fp32\)\s*\{[\s\S]{0,300}has_enough_device_memory\(res, d_corpus\.extents\(\),[\s\S]{0,400}"
+                                        r"params\.graph_build_params = fp32_ivf_pq\(\s*gbp::ivf_pq_params\(d_corpus\.extents\(\), params\.metric\)\);"),
 }
 
 WIRING_MUTANTS = {
@@ -90,6 +98,13 @@ WIRING_MUTANTS = {
     "server_rejects_fallback": (SERVER, "    if (reply.status == CUVS_STATUS_OK && !graph_fallback\n",
                                 "    if (reply.status == CUVS_STATUS_OK\n"),
     "backend_notice_dropped": (BACKEND, "            if (notices & CUVS_HNSW_NOTICE_GRAPH_FALLBACK)\n", "            if (0)\n"),
+    "cagra_explicit_keeps_fp16": (WRAPPER, "            params.graph_build_params = fp32 ? fp32_ivf_pq(pq) : pq;\n",
+                                  "            params.graph_build_params = pq;\n"),
+    "cagra_auto_fp16_ivf_pq": (WRAPPER, "                params.graph_build_params = fp32_ivf_pq(\n                    gbp::ivf_pq_params(d_corpus.extents(), params.metric));\n",
+                               "                params.graph_build_params = gbp::ivf_pq_params(d_corpus.extents(), params.metric);\n"),
+    "cagra_coarse_kept_fp16": (WRAPPER, "            pq.search_params.coarse_search_dtype = CUDA_R_32F;\n", ""),
+    "cagra_bound_skipped": (WRAPPER, "        const bool fp32 = may_use_ivf_pq && cuvs_hnsw_ivfpq_needs_fp32(max_sq, metric);\n",
+                            "        const bool fp32 = false;\n"),
 }
 
 
