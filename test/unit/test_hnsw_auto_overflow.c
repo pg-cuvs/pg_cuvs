@@ -253,9 +253,34 @@ static void test_prespool_and_fallback(void)
     CHECK(cuvs_hnsw_forecast_disk(&f, 1, f.disk_need, error, sizeof(error)) == CUVS_STATUS_OK && f.disk_ok);
     CHECK(cuvs_hnsw_forecast_disk(&f, 1, f.disk_need - 1, error, sizeof(error)) == CUVS_STATUS_BUILD_FAILED);
     CHECK(!f.disk_ok && strstr(error, "route=ace_disk") && strstr(error, "need="));
+    {
+        /* v5 C5 / v6 C2: the exact refusal text, prefix first (Q4-4). */
+        char want[160];
+        snprintf(want, sizeof(want),
+                 "HNSW needs regular disk capacity: need=%llu avail=%llu fs=regular route=ace_disk",
+                 (unsigned long long)f.disk_need, (unsigned long long)(f.disk_need - 1));
+        CHECK(strcmp(error, want) == 0);
+        CHECK(strncmp(error, CUVS_HNSW_DISK_REFUSAL_PREFIX, strlen(CUVS_HNSW_DISK_REFUSAL_PREFIX)) == 0);
+    }
     CHECK(forecast(1000000, CUVS_HNSW_ALGO_AUTO, CUVS_HNSW_OVERFLOW_ACE, H, G, &f) == CUVS_STATUS_OK);
     CHECK(cuvs_hnsw_forecast_disk(&f, 0, UINT64_MAX, error, sizeof(error)) == CUVS_STATUS_BUILD_FAILED);
     CHECK(strstr(error, "fs=tmpfs") && strstr(error, "route=resident_ivf_pq"));
+    {
+        /* tmpfs with avail >= need is refused too and says fs=tmpfs; the
+         * worst case (20-digit need/avail, longest route) fits the 128-byte
+         * reply error field without truncation. */
+        char want[160], reply_field[128];
+        snprintf(want, sizeof(want),
+                 "HNSW needs regular disk capacity: need=%llu avail=%llu fs=tmpfs route=resident_ivf_pq",
+                 (unsigned long long)f.disk_need, (unsigned long long)UINT64_MAX);
+        CHECK(strcmp(error, want) == 0);
+        f.status = CUVS_STATUS_OK;      /* the refusal above set BUILD_FAILED */
+        f.disk_need = UINT64_MAX;
+        CHECK(cuvs_hnsw_forecast_disk(&f, 1, UINT64_MAX - 1, reply_field, sizeof(reply_field))
+              == CUVS_STATUS_BUILD_FAILED);
+        CHECK(strlen(reply_field) < sizeof(reply_field) - 1
+              && strstr(reply_field, " route=resident_ivf_pq") != NULL);
+    }
     /* a refused route is not turned into a disk verdict */
     CHECK(forecast(1000000, CUVS_HNSW_ALGO_IVF_PQ, 1, 1 << 20, G, &f) == CUVS_STATUS_HNSW_RESIDENT_BUDGET_EXCEEDED);
     CHECK(cuvs_hnsw_forecast_disk(&f, 1, UINT64_MAX, error, sizeof(error)) == CUVS_STATUS_HNSW_RESIDENT_BUDGET_EXCEEDED);
