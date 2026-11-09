@@ -107,19 +107,27 @@ static void test_invariant_notices(void)
     CuvsHnswPolicy p;
     for (uint32_t a = 0; a <= 3; a++)
         for (uint32_t r = 1; r <= 3; r++)
-            for (uint32_t flags = 0; flags <= 0xf; flags++)
+            for (uint32_t flags = 0; flags <= CUVS_HNSW_ROUTE_FLAGS_KNOWN; flags++)
                 for (int sent = 0; sent <= 1; sent++)
                 {
                     p = receipt(a, r, flags);
                     if (!cuvs_hnsw_policy_valid(&p)) continue;
                     uint32_t n = cuvs_hnsw_build_notices(&p, sent);
                     int auto_ace = a == CUVS_HNSW_ALGO_AUTO && r == CUVS_HNSW_ROUTE_ACE;
-                    /* valid auto ACE receipts all carry the overflow record */
-                    CHECK(!auto_ace || (flags & CUVS_HNSW_ROUTE_FLAG_AUTO_OVERFLOW));
-                    /* every auto -> ACE gets the completion line, and the
-                     * transition line exactly when not already sent */
-                    CHECK(!!(n & CUVS_HNSW_NOTICE_AUTO_COMPLETION) == auto_ace);
-                    CHECK(!!(n & CUVS_HNSW_NOTICE_TRANSITION) == (auto_ace && !sent));
+                    int overflowed = !!(flags & CUVS_HNSW_ROUTE_FLAG_AUTO_OVERFLOW);
+                    int fallback = !!(flags & CUVS_HNSW_ROUTE_FLAG_GRAPH_FALLBACK);
+                    /* valid auto ACE receipts carry exactly one record of why:
+                     * the budget overflow or the kNN-graph fallback */
+                    CHECK(!auto_ace || overflowed + fallback == 1);
+                    CHECK(!fallback || auto_ace);
+                    CHECK(!(flags & CUVS_HNSW_ROUTE_FLAG_IVFPQ_FP32) || r == CUVS_HNSW_ROUTE_IVF_PQ);
+                    /* every auto -> ACE overflow gets the completion line, and
+                     * the transition line exactly when not already sent */
+                    CHECK(!!(n & CUVS_HNSW_NOTICE_AUTO_COMPLETION) == (auto_ace && overflowed));
+                    CHECK(!!(n & CUVS_HNSW_NOTICE_TRANSITION) == (auto_ace && overflowed && !sent));
+                    /* a kNN-graph fallback gets its own line and nothing else */
+                    CHECK(!!(n & CUVS_HNSW_NOTICE_GRAPH_FALLBACK) == (auto_ace && fallback));
+                    CHECK(!fallback || n == CUVS_HNSW_NOTICE_GRAPH_FALLBACK);
                     CHECK(!!(n & CUVS_HNSW_NOTICE_EXPLICIT_ACE) == (a == CUVS_HNSW_ALGO_ACE));
                     CHECK(!!(n & CUVS_HNSW_NOTICE_NOT_OVERFLOWED) == (!auto_ace && a != CUVS_HNSW_ALGO_ACE && sent));
                 }
@@ -135,8 +143,24 @@ static void test_invariant_notices(void)
     p = receipt(CUVS_HNSW_ALGO_AUTO, CUVS_HNSW_ROUTE_ACE,
                 CUVS_HNSW_ROUTE_FLAG_AUTO_OVERFLOW | CUVS_HNSW_ROUTE_FLAG_NO_STATISTICS);
     CHECK(!cuvs_hnsw_policy_valid(&p)); /* a cause without the after-scan timing */
-    p = receipt(CUVS_HNSW_ALGO_AUTO, CUVS_HNSW_ROUTE_ACE, CUVS_HNSW_ROUTE_FLAG_AUTO_OVERFLOW | 0x10);
+    p = receipt(CUVS_HNSW_ALGO_AUTO, CUVS_HNSW_ROUTE_ACE, CUVS_HNSW_ROUTE_FLAG_AUTO_OVERFLOW | 0x40);
     CHECK(!cuvs_hnsw_policy_valid(&p)); /* unknown flag */
+    /* kNN-graph fallback (SIFT): auto -> ACE with its own record only */
+    p = receipt(CUVS_HNSW_ALGO_AUTO, CUVS_HNSW_ROUTE_ACE, CUVS_HNSW_ROUTE_FLAG_GRAPH_FALLBACK);
+    CHECK(cuvs_hnsw_policy_valid(&p));
+    CHECK(cuvs_hnsw_build_notices(&p, 0) == CUVS_HNSW_NOTICE_GRAPH_FALLBACK);
+    p = receipt(CUVS_HNSW_ALGO_AUTO, CUVS_HNSW_ROUTE_ACE,
+                CUVS_HNSW_ROUTE_FLAG_GRAPH_FALLBACK | CUVS_HNSW_ROUTE_FLAG_AUTO_OVERFLOW);
+    CHECK(!cuvs_hnsw_policy_valid(&p)); /* one cause only */
+    p = receipt(CUVS_HNSW_ALGO_IVF_PQ, CUVS_HNSW_ROUTE_ACE, CUVS_HNSW_ROUTE_FLAG_GRAPH_FALLBACK);
+    CHECK(!cuvs_hnsw_policy_valid(&p)); /* explicit ivf_pq never changes builder */
+    p = receipt(CUVS_HNSW_ALGO_AUTO, CUVS_HNSW_ROUTE_IVF_PQ, CUVS_HNSW_ROUTE_FLAG_GRAPH_FALLBACK);
+    CHECK(!cuvs_hnsw_policy_valid(&p)); /* a fallback that did not leave IVF-PQ */
+    p = receipt(CUVS_HNSW_ALGO_IVF_PQ, CUVS_HNSW_ROUTE_IVF_PQ, CUVS_HNSW_ROUTE_FLAG_IVFPQ_FP32);
+    CHECK(cuvs_hnsw_policy_valid(&p));
+    p = receipt(CUVS_HNSW_ALGO_AUTO, CUVS_HNSW_ROUTE_ACE,
+                CUVS_HNSW_ROUTE_FLAG_AUTO_OVERFLOW | CUVS_HNSW_ROUTE_FLAG_IVFPQ_FP32);
+    CHECK(!cuvs_hnsw_policy_valid(&p)); /* precision applies to resident IVF-PQ only */
     CHECK(sizeof(CuvsHnswPolicy) == 160); /* reserved -> route_flags, same layout */
     /* "(need X, budget Y)" names the exceeded side */
     uint64_t need, budget; const char *side;

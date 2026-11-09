@@ -27,7 +27,7 @@ MUTANTS = [
     ('overflow_not_recorded', 'cuvs_hnsw_build_common.h',
      'out->overflowed = (uint32_t)overflow_to_ace;', 'out->overflowed = 0;'),
     ('receipt_accepts_unrecorded_auto_ace', 'cuvs_hnsw_policy.h',
-     '        && (!!(p->route_flags & CUVS_HNSW_ROUTE_FLAG_AUTO_OVERFLOW)\n            == (p->requested_algo == CUVS_HNSW_ALGO_AUTO && p->route == CUVS_HNSW_ROUTE_ACE))\n',
+     '        && (!!(p->route_flags & CUVS_HNSW_ROUTE_FLAG_AUTO_OVERFLOW)\n            + !!(p->route_flags & CUVS_HNSW_ROUTE_FLAG_GRAPH_FALLBACK)\n            == (p->requested_algo == CUVS_HNSW_ALGO_AUTO && p->route == CUVS_HNSW_ROUTE_ACE))\n',
      ''),
     ('transition_notice_skipped', 'cuvs_route_preflight.h',
      '| (transition_sent ? 0 : CUVS_HNSW_NOTICE_TRANSITION);', ';'),

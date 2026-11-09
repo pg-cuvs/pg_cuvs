@@ -12,6 +12,7 @@
 #include <errno.h>
 #include <time.h>
 #include <string.h>
+#include <math.h>
 #include <pthread.h>
 #include <poll.h>
 #include <sys/stat.h>
@@ -284,6 +285,58 @@ typedef struct CuvsHnswRouteDecision {
  * The existing wire status/layout and diagnostic text remain unchanged. */
 #define CUVS_HNSW_BUDGET_NO_FIT_REASON \
     "no ACE partition count fits metadata/reorder/serializer and GPU budgets"
+
+/* Resident IVF-PQ kNN precision. cuVS cagra::graph_build_params::ivf_pq_params
+ * keeps the search LUT, internal and coarse distances in fp16, whose largest
+ * finite value is 65504. For L2, every distance between two rows, and each
+ * expanded term |x|^2, is at most 4 x max|x|^2 (|x - y| <= |x| + |y|); an inner
+ * product is at most max|x|^2. When that bound reaches 65504 the fp16 values
+ * can become inf, the kNN graph loses its own rows (cuVS "Self-included ratio
+ * is low") and the index is unusable or rejected (SIFT1M: values 0..218,
+ * |x|^2 ~ 2.6e5). Such data runs the search in fp32. The threshold is the fp16
+ * format limit, not a measured value. */
+#define CUVS_HNSW_FP16_MAX 65504.0
+
+/* Largest squared row norm; +inf if any row has a non-finite norm. */
+static inline double cuvs_hnsw_max_sq_norm(const float *x, uint64_t n, uint32_t dim)
+{
+    double max = 0.0;
+    for (uint64_t i = 0; i < n; i++)
+    {
+        const float *row = x + i * (uint64_t)dim;
+        double sum = 0.0;
+        for (uint32_t j = 0; j < dim; j++)
+            sum += (double)row[j] * (double)row[j];
+        if (!isfinite(sum))
+            return INFINITY;
+        if (sum > max)
+            max = sum;
+    }
+    return max;
+}
+
+static inline int cuvs_hnsw_ivfpq_needs_fp32(double max_sq_norm, uint32_t metric)
+{
+    double bound = metric == CUVS_METRIC_L2 ? 4.0 * max_sq_norm : max_sq_norm;
+    return !(bound < CUVS_HNSW_FP16_MAX);   /* NaN and inf need fp32 too */
+}
+
+/* cuVS cagra optimize rejects a kNN graph it cannot prune (pinned SDK60
+ * graph_core.cuh: "Could not generate an intermediate CAGRA graph because the
+ * initial kNN graph contains too many invalid or duplicated neighbor nodes"). */
+#define CUVS_HNSW_GRAPH_KNN_REJECTED "Could not generate an intermediate CAGRA graph"
+
+/* R1 for the default path: when auto chose resident IVF-PQ and cuVS rejects
+ * its kNN graph, an overflow mode of ace rebuilds on ACE-disk (with a NOTICE)
+ * instead of failing CREATE INDEX. Explicit ivf_pq never changes builder
+ * (ADR-087), and overflow error keeps the failure. */
+static inline int cuvs_hnsw_graph_failure_to_ace(uint32_t requested_algo, uint32_t route,
+                                                 uint32_t overflow, uint64_t n, const char *what)
+{
+    return requested_algo == CUVS_HNSW_ALGO_AUTO && route == CUVS_HNSW_ROUTE_IVF_PQ
+        && overflow == CUVS_HNSW_OVERFLOW_ACE && n >= 256
+        && what && strstr(what, CUVS_HNSW_GRAPH_KNN_REJECTED) != NULL;
+}
 
 /* Settings/training reserve must already have been prepared using the SAME
  * budgets. This decision allocates nothing and never silently changes builder. */

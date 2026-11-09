@@ -10356,8 +10356,13 @@ handle_build_hnsw_file(int client_fd, const CuvsCmdFrame *cmd)
 #endif
     reply.status = cuvs_hnsw_build_file(vectors_fd, owner_fd, &params, workdir,
         device, &result_fd, reply.error, sizeof(reply.error));
-    /* [hnsw_route] and the receipt must name the same route (Q4-6 (iii)). */
-    if (reply.status == CUVS_STATUS_OK
+    /* [hnsw_route] and the receipt must name the same route (Q4-6 (iii)),
+     * except a recorded kNN-graph fallback: auto decided resident IVF-PQ,
+     * cuVS rejected its kNN graph, the wrapper built ACE-disk. */
+    int graph_fallback = (wire.policy.route_flags & CUVS_HNSW_ROUTE_FLAG_GRAPH_FALLBACK)
+        && route.decision.route == CUVS_HNSW_ROUTE_IVF_PQ && !route.decision.overflowed
+        && wire.policy.route == CUVS_HNSW_ROUTE_ACE;
+    if (reply.status == CUVS_STATUS_OK && !graph_fallback
         && (wire.policy.route != route.decision.route
             || !!(wire.policy.route_flags & CUVS_HNSW_ROUTE_FLAG_AUTO_OVERFLOW)
                != !!route.decision.overflowed))

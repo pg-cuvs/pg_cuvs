@@ -39,12 +39,20 @@
  * cause was missing/zero reltuples; without it AFTER_SCAN means statistics
  * existed but the pre-scan forecast was unavailable (daemon/IPC failure).
  * PRESPOOL and AFTER_SCAN are mutually exclusive; NO_STATISTICS needs
- * AFTER_SCAN. */
+ * AFTER_SCAN.
+ * IVFPQ_FP32: the resident IVF-PQ kNN search ran with fp32 LUT, internal and
+ * coarse distances because fp16 could overflow for this data
+ * (cuvs_hnsw_ivfpq_needs_fp32). Route IVF_PQ only.
+ * GRAPH_FALLBACK: auto chose resident IVF-PQ, cuVS rejected its kNN graph
+ * (CUVS_HNSW_GRAPH_KNN_REJECTED) and, with overflow ace, the build ran on
+ * ACE-disk instead. Requested auto, route ACE, never with AUTO_OVERFLOW. */
 #define CUVS_HNSW_ROUTE_FLAG_AUTO_OVERFLOW 0x1u
 #define CUVS_HNSW_ROUTE_FLAG_PRESPOOL 0x2u
 #define CUVS_HNSW_ROUTE_FLAG_AFTER_SCAN 0x4u
 #define CUVS_HNSW_ROUTE_FLAG_NO_STATISTICS 0x8u
-#define CUVS_HNSW_ROUTE_FLAGS_KNOWN 0xfu
+#define CUVS_HNSW_ROUTE_FLAG_IVFPQ_FP32 0x10u
+#define CUVS_HNSW_ROUTE_FLAG_GRAPH_FALLBACK 0x20u
+#define CUVS_HNSW_ROUTE_FLAGS_KNOWN 0x3fu
 
 /* Receipt JSON "route_decided" (pg_cuvs_hnsw_build_info). */
 static inline const char *cuvs_hnsw_route_decided_name(uint32_t flags)
@@ -147,9 +155,13 @@ static inline int cuvs_hnsw_policy_valid(const CuvsHnswPolicy *p)
             != (CUVS_HNSW_ROUTE_FLAG_PRESPOOL | CUVS_HNSW_ROUTE_FLAG_AFTER_SCAN)
         && (!(p->route_flags & CUVS_HNSW_ROUTE_FLAG_NO_STATISTICS)
             || (p->route_flags & CUVS_HNSW_ROUTE_FLAG_AFTER_SCAN))
-        /* auto may name ACE only through the recorded overflow branch. */
+        /* auto may name ACE only through the recorded overflow branch or the
+         * recorded kNN-graph fallback, exactly one of them. */
         && (!!(p->route_flags & CUVS_HNSW_ROUTE_FLAG_AUTO_OVERFLOW)
+            + !!(p->route_flags & CUVS_HNSW_ROUTE_FLAG_GRAPH_FALLBACK)
             == (p->requested_algo == CUVS_HNSW_ALGO_AUTO && p->route == CUVS_HNSW_ROUTE_ACE))
+        && (!(p->route_flags & CUVS_HNSW_ROUTE_FLAG_IVFPQ_FP32)
+            || p->route == CUVS_HNSW_ROUTE_IVF_PQ)
         && ((p->requested_algo == CUVS_HNSW_ALGO_AUTO
                 && (p->route == CUVS_HNSW_ROUTE_TINY || p->route == CUVS_HNSW_ROUTE_IVF_PQ
                     || p->route == CUVS_HNSW_ROUTE_ACE))

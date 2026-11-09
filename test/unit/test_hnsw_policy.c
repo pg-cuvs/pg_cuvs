@@ -43,6 +43,48 @@ int main(void)
     assert(cuvs_hnsw_policy_valid(&receipt));
     receipt.requested_algo = CUVS_HNSW_ALGO_NN_DESCENT;
     assert(!cuvs_hnsw_policy_valid(&receipt));
-    printf("PASS default preservation, monotonic construction effort, SDK integer training shape, 1M reserve, overflow, forced ACE candidate P%u, receipt validation\n", p);
+    /* Resident IVF-PQ kNN precision: fp16 holds the L2 bound 4 x max|x|^2 only
+     * below 65504 (the fp16 maximum); IP and cosine use max|x|^2. */
+    assert(!cuvs_hnsw_ivfpq_needs_fp32(16375.0, CUVS_METRIC_L2));   /* 65500 */
+    assert(cuvs_hnsw_ivfpq_needs_fp32(16376.0, CUVS_METRIC_L2));    /* 65504 */
+    assert(!cuvs_hnsw_ivfpq_needs_fp32(65503.0, CUVS_METRIC_IP));
+    assert(cuvs_hnsw_ivfpq_needs_fp32(65504.0, CUVS_METRIC_IP));
+    assert(!cuvs_hnsw_ivfpq_needs_fp32(1.0, CUVS_METRIC_COSINE));     /* normalized */
+    assert(cuvs_hnsw_ivfpq_needs_fp32(NAN, CUVS_METRIC_L2));
+    assert(cuvs_hnsw_ivfpq_needs_fp32(INFINITY, CUVS_METRIC_IP));
+    {
+        const float rows[6] = {3, 4, 0, 1, 0, 2};          /* |x|^2 = 25, 1, 4 */
+        assert(cuvs_hnsw_max_sq_norm(rows, 3, 2) == 25.0);
+        assert(cuvs_hnsw_max_sq_norm(rows, 0, 2) == 0.0);
+        const float bad[4] = {1, 2, NAN, 0};
+        assert(isinf(cuvs_hnsw_max_sq_norm(bad, 2, 2)));
+        float sift[128], unit[128];                          /* SIFT-scale and a unit row */
+        for (int j = 0; j < 128; j++) { sift[j] = 45.0f; unit[j] = 0.0f; }
+        unit[7] = 1.0f;
+        assert(cuvs_hnsw_ivfpq_needs_fp32(cuvs_hnsw_max_sq_norm(sift, 1, 128), CUVS_METRIC_L2));
+        assert(!cuvs_hnsw_ivfpq_needs_fp32(cuvs_hnsw_max_sq_norm(unit, 1, 128), CUVS_METRIC_L2));
+    }
+    /* kNN-graph rejection -> ACE only for auto, resident IVF-PQ, overflow ace, n >= 256 */
+    {
+        const char *why = "RAFT failure at file=graph_core.cuh line=1383: " CUVS_HNSW_GRAPH_KNN_REJECTED
+                          " because the initial kNN graph contains too many invalid or duplicated neighbor nodes";
+        assert(cuvs_hnsw_graph_failure_to_ace(CUVS_HNSW_ALGO_AUTO, CUVS_HNSW_ROUTE_IVF_PQ,
+                                              CUVS_HNSW_OVERFLOW_ACE, 999000, why));
+        assert(!cuvs_hnsw_graph_failure_to_ace(CUVS_HNSW_ALGO_IVF_PQ, CUVS_HNSW_ROUTE_IVF_PQ,
+                                               CUVS_HNSW_OVERFLOW_ACE, 999000, why));
+        assert(!cuvs_hnsw_graph_failure_to_ace(CUVS_HNSW_ALGO_AUTO, CUVS_HNSW_ROUTE_IVF_PQ,
+                                               CUVS_HNSW_OVERFLOW_ERROR, 999000, why));
+        assert(!cuvs_hnsw_graph_failure_to_ace(CUVS_HNSW_ALGO_AUTO, CUVS_HNSW_ROUTE_ACE,
+                                               CUVS_HNSW_OVERFLOW_ACE, 999000, why));
+        assert(!cuvs_hnsw_graph_failure_to_ace(CUVS_HNSW_ALGO_AUTO, CUVS_HNSW_ROUTE_TINY,
+                                               CUVS_HNSW_OVERFLOW_ACE, 999000, why));
+        assert(!cuvs_hnsw_graph_failure_to_ace(CUVS_HNSW_ALGO_AUTO, CUVS_HNSW_ROUTE_IVF_PQ,
+                                               CUVS_HNSW_OVERFLOW_ACE, 255, why));
+        assert(!cuvs_hnsw_graph_failure_to_ace(CUVS_HNSW_ALGO_AUTO, CUVS_HNSW_ROUTE_IVF_PQ,
+                                               CUVS_HNSW_OVERFLOW_ACE, 999000, "std::bad_alloc"));
+        assert(!cuvs_hnsw_graph_failure_to_ace(CUVS_HNSW_ALGO_AUTO, CUVS_HNSW_ROUTE_IVF_PQ,
+                                               CUVS_HNSW_OVERFLOW_ACE, 999000, NULL));
+    }
+    printf("PASS default preservation, monotonic construction effort, SDK integer training shape, 1M reserve, overflow, forced ACE candidate P%u, receipt validation, fp16 kNN bound, kNN-graph fallback\n", p);
     return 0;
 }

@@ -3675,6 +3675,7 @@ pg_cuvs_hnsw_build_info(PG_FUNCTION_ARGS)
         "\"host_budget_bytes\":%llu,\"gpu_budget_bytes\":%llu,"
         "\"sdk_host_budget_bytes\":%llu,\"sdk_gpu_budget_bytes\":%llu,"
         "\"auto_overflow\":%s,\"route_decided\":\"%s\","
+        "\"ivfpq_distance_dtype\":\"%s\",\"graph_fallback\":%s,"
         "\"guard\":\"selected_route_returned\",\"memory_upper_bound_guaranteed\":false}",
         policy.version, cuvs_hnsw_route_name(policy.route),
         (unsigned long long)policy.n_rows, policy.dim, policy.metric,
@@ -3689,7 +3690,10 @@ pg_cuvs_hnsw_build_info(PG_FUNCTION_ARGS)
         (unsigned long long)policy.host_budget, (unsigned long long)policy.gpu_budget,
         (unsigned long long)policy.sdk_host_budget, (unsigned long long)policy.sdk_gpu_budget,
         (policy.route_flags & CUVS_HNSW_ROUTE_FLAG_AUTO_OVERFLOW) ? "true" : "false",
-        cuvs_hnsw_route_decided_name(policy.route_flags));
+        cuvs_hnsw_route_decided_name(policy.route_flags),
+        policy.route != CUVS_HNSW_ROUTE_IVF_PQ ? "not_applicable"
+            : (policy.route_flags & CUVS_HNSW_ROUTE_FLAG_IVFPQ_FP32) ? "fp32" : "fp16",
+        (policy.route_flags & CUVS_HNSW_ROUTE_FLAG_GRAPH_FALLBACK) ? "true" : "false");
     PG_RETURN_DATUM(DirectFunctionCall1(jsonb_in, CStringGetDatum(json.data)));
 }
 
