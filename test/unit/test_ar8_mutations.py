@@ -24,26 +24,43 @@ POLICY = 'src/cuvs_lw_policy.h'
 SERVER = 'src/pg_cuvs_server.c'
 UTIL = 'src/cuvs_util.c'
 
-AR8_IF = ('        if (cuvs_admission_pool_refuses(quota, line->pool_pending, line->pool_used,\n'
-          '                                        needed, line->pool_headroom))\n'
+# Owner decision 2026-11-09: AR6/AR7, then the pool shortfall offered to the
+# build scope (make_room), AR8 only when eviction cannot free it or the pool
+# is still short after eviction.
+CAP_IF = ('        if (pool_short > line->pool_used)\n'
           '        {\n'
           '            g_last_admit_reason = CUVS_ADMISSION_AR8;\n'
           '            goto admission_rejected;\n'
           '        }\n')
-MAKE_ROOM = ('        g_last_admit_reason = pick_reason(&pk, phys_short > budget_short);\n'
-             '        goto admission_rejected;\n'
-             '    }\n')
-AR8_MOVED = ('    if (line && line->pool_valid &&\n'
-             '        cuvs_admission_pool_refuses(quota, line->pool_pending, line->pool_used, needed, line->pool_headroom))\n'
-             '    {\n'
-             '        g_last_admit_reason = CUVS_ADMISSION_AR8;\n'
-             '        goto admission_rejected;\n'
-             '    }\n')
+NEED_POOL = '    if (pool_short > need)\n        need = pool_short;\n'
+RECHECK = ('    if (pool_short > 0)\n'
+           '    {\n'
+           '        line->pool_used = admission_pool_used_now(device_id);\n'
+           '        if (cuvs_admission_pool_refuses(quota, line->pool_pending, line->pool_used,\n'
+           '                                        needed, line->pool_headroom))\n'
+           '        {\n'
+           '            g_last_admit_reason = CUVS_ADMISSION_AR8;\n'
+           '            goto admission_rejected;\n'
+           '        }\n'
+           '    }\n')
+PICK_AR8 = '    if (pool_short > 0 && pk->lru_total < pool_short)\n        return CUVS_ADMISSION_AR8;\n'
+WR_IF = ('        if (wr != CUVS_ADMISSION_NONE)\n'
+         '        {\n'
+         '            g_last_admit_reason = wr;\n'
+         '            goto admission_rejected;\n'
+         '        }\n')
+OLD_AR8 = ('        if (cuvs_admission_pool_refuses(quota, line->pool_pending, line->pool_used,\n'
+           '                                        needed, line->pool_headroom))\n'
+           '        {\n'
+           '            g_last_admit_reason = CUVS_ADMISSION_AR8;\n'
+           '            goto admission_rejected;\n'
+           '        }\n')
 
 # name: ([(file, old, new), ...], tests expected to turn RED)
 MUTATIONS = {
-    # (1) AR8 check removed
-    'ar8_check_removed_daemon': ([(SERVER, AR8_IF, '')], {'daemon'}),
+    # (1) AR8 check removed (all three daemon paths)
+    'ar8_check_removed_daemon': ([(SERVER, CAP_IF, ''), (SERVER, RECHECK, ''),
+                                  (SERVER, PICK_AR8, '')], {'daemon'}),
     'ar8_check_removed_rule': ([(CONTRACT,
         '    if (quota == 0)\n        return 0;\n    return cuvs_admission_sat_add(',
         '    (void)quota; (void)pending; (void)pool_used; (void)needed; (void)headroom;\n'
@@ -72,16 +89,20 @@ MUTATIONS = {
         '            cuvs_admission_sat_add(needed, line->workspace.lw_ub),\n')], {'daemon'}),
     # design 40c33a3b: lw_ub of this build is not a pool term
     'lw_ub_readded_to_pool_rule': ([(SERVER,
-        '                                        needed, line->pool_headroom))',
-        '                                        cuvs_admission_sat_add(needed, line->workspace.lw_ub),\n'
-        '                                        line->pool_headroom))')], {'daemon'}),
+        '                                                   needed, line->pool_headroom);',
+        '                                                   cuvs_admission_sat_add(needed, line->workspace.lw_ub),\n'
+        '                                                   line->pool_headroom);')], {'daemon'}),
     'pool_used_dropped': ([(SERVER,
-        '        if (cuvs_admission_pool_refuses(quota, line->pool_pending, line->pool_used,',
-        '        if (cuvs_admission_pool_refuses(quota, line->pool_pending, 0,')], {'daemon'}),
+        '        pool_short = cuvs_admission_pool_shortfall(quota, line->pool_pending, line->pool_used,',
+        '        pool_short = cuvs_admission_pool_shortfall(quota, line->pool_pending, 0,')], {'daemon'}),
     'pool_used_dropped_rule': ([(CONTRACT,
-        'cuvs_admission_sat_add(cuvs_admission_sat_add(pending, pool_used), needed),',
-        'cuvs_admission_sat_add(cuvs_admission_sat_add(pending, 0 * pool_used), needed),')],
+        '    return cuvs_admission_sat_add(\n               cuvs_admission_sat_add(cuvs_admission_sat_add(pending, pool_used), needed),',
+        '    return cuvs_admission_sat_add(\n               cuvs_admission_sat_add(cuvs_admission_sat_add(pending, 0 * pool_used), needed),')],
         {'contract'}),
+    'pool_used_dropped_shortfall': ([(CONTRACT,
+        '    sum = cuvs_admission_sat_add(\n        cuvs_admission_sat_add(cuvs_admission_sat_add(pending, pool_used), needed),',
+        '    sum = cuvs_admission_sat_add(\n        cuvs_admission_sat_add(cuvs_admission_sat_add(pending, 0 * pool_used), needed),')],
+        {'contract', 'daemon'}),
     'lw_pending_dropped': ([(SERVER,
         '        line->pool_pending = cuvs_admission_sat_add(pending, g_lw_pending[device_id]);',
         '        line->pool_pending = pending;')], {'daemon'}),
@@ -90,26 +111,34 @@ MUTATIONS = {
         '        line->pool_pending = g_lw_pending[device_id];')], {'daemon'}),
     'boundary_ge': ([(CONTRACT,
         '               headroom) > quota;',
-        '               headroom) >= quota;')], {'contract', 'daemon'}),
-    # (4) AR8 placed after make_room (evicts before refusing)
-    'ar8_after_make_room': ([(SERVER, AR8_IF, ''),
-                             (SERVER, MAKE_ROOM, MAKE_ROOM + AR8_MOVED)], {'daemon'}),
-    # AR8 placed after AR6/AR7 (AR6 would win)
-    'ar8_after_workspace': ([(SERVER, AR8_IF, ''),
-                             (SERVER, '        if (wr != CUVS_ADMISSION_NONE)\n'
-                                      '        {\n'
-                                      '            g_last_admit_reason = wr;\n'
-                                      '            goto admission_rejected;\n'
-                                      '        }\n',
-                              '        if (wr != CUVS_ADMISSION_NONE)\n'
-                              '        {\n'
-                              '            g_last_admit_reason = wr;\n'
-                              '            goto admission_rejected;\n'
-                              '        }\n' + AR8_IF)], {'daemon'}),
+        '               headroom) >= quota;')], {'contract'}),
+    'shortfall_boundary_ge': ([(CONTRACT,
+        '    return sum > quota ? sum - quota : 0;',
+        '    return sum >= quota ? sum - quota + 1 : 0;')], {'contract', 'daemon'}),
+    'shortfall_off_by_one': ([(CONTRACT,
+        '    return sum > quota ? sum - quota : 0;',
+        '    return sum > quota ? sum - quota - 1 : 0;')], {'contract'}),
+    # (4) the old order (ADR-089 before 2026-11-09) planted back
+    'pool_refused_before_eviction': ([(SERVER,
+        '        if (pool_short > line->pool_used)\n',
+        '        if (pool_short > 0)\n')], {'daemon'}),
+    'pool_short_not_offered_to_make_room': ([(SERVER, NEED_POOL, '')], {'daemon'}),
+    'ar8_before_workspace': ([(SERVER, WR_IF, OLD_AR8 + WR_IF)], {'daemon'}),
+    # the new order's guards removed
+    'pool_used_cap_removed': ([(SERVER, CAP_IF, '')], {'daemon'}),
+    'post_eviction_recheck_removed': ([(SERVER, RECHECK, '')], {'daemon'}),
+    'post_eviction_recheck_stale': ([(SERVER,
+        '        line->pool_used = admission_pool_used_now(device_id);\n        if (cuvs_admission_pool_refuses(',
+        '        if (cuvs_admission_pool_refuses(')], {'daemon'}),
+    'scope_short_reported_as_ar8': ([(SERVER,
+        '    if (pk->verdict == CUVS_EVICT_AR5)\n        return CUVS_ADMISSION_AR5;\n    if (pool_short',
+        '    if (pk->verdict == CUVS_EVICT_AR5)\n        return pool_short ? CUVS_ADMISSION_AR8 : CUVS_ADMISSION_AR5;\n    if (pool_short')],
+        {'daemon'}),
+    'uncurable_pool_reported_as_ar3': ([(SERVER, PICK_AR8, '')], {'daemon'}),
     # (5) AR8 reason code / text changed to AR6's
     'ar8_reported_as_ar6': ([(SERVER,
-        '            g_last_admit_reason = CUVS_ADMISSION_AR8;',
-        '            g_last_admit_reason = CUVS_ADMISSION_AR6;')], {'daemon'}),
+        '        return CUVS_ADMISSION_AR8;\n    return physical_phase',
+        '        return CUVS_ADMISSION_AR6;\n    return physical_phase')], {'daemon'}),
     'ar8_spelled_ar6': ([(UTIL,
         '"AR6", "AR7", "AR8", "OOM", "ATT"', '"AR6", "AR7", "AR6", "OOM", "ATT"')],
         {'wire'}),
@@ -185,6 +214,12 @@ MUTATIONS = {
     'logs_judge_ar8_ge': ([('test/unit/check_i3_logs.py',
         "+ n('headroom') > n('pool_quota'))",
         "+ n('headroom') >= n('pool_quota'))")], {'logs'}),
+    'logs_judge_ar5_ignores_pool': ([('test/unit/check_i3_logs.py',
+        "max(0, n('needed') - n('free_net')), pool_short)",
+        "max(0, n('needed') - n('free_net')))")], {'logs'}),
+    'logs_judge_ar8_coverable_accepted': ([('test/unit/check_i3_logs.py',
+        "pool_short > n('pool_used') or n('lru_free') < pool_short):",
+        "True):")], {'logs'}),
 }
 
 

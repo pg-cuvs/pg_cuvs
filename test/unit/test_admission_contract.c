@@ -274,6 +274,31 @@ test_ar8_pool_capacity(void)
                                                                UINT64_MAX / 4, 1, 1));
 }
 
+/* Owner decision 2026-11-09: the pool shortfall make_room is asked to free
+ * (pending + pool_used + N_m + headroom - quota), nonzero exactly when AR8's
+ * sum refuses. Q6: 6,873,120,000 - 6,807,502,080 = 65,617,920 B. */
+static void
+test_ar8_pool_shortfall(void)
+{
+    uint64_t n_m = UINT64_C(3196800000), h = UINT64_C(479520000);
+    CHECK_EQ("Q6 shortfall", cuvs_admission_pool_shortfall(Q6_QUOTA, 0, Q6_POOL_USED, n_m, h),
+             UINT64_C(65617920));
+    CHECK_EQ("Q6 headroom 0 fits", cuvs_admission_pool_shortfall(Q6_QUOTA, 0, Q6_POOL_USED, n_m, 0), 0);
+    CHECK_EQ("== quota is 0", cuvs_admission_pool_shortfall(100, 7, 30, 50, 13), 0);
+    CHECK_EQ("+1 is 1", cuvs_admission_pool_shortfall(99, 7, 30, 50, 13), 1);
+    CHECK_EQ("each term", cuvs_admission_pool_shortfall(100, 8, 31, 52, 16), 7);
+    CHECK_EQ("quota 0 never short", cuvs_admission_pool_shortfall(0, SAT, SAT, SAT, SAT), 0);
+    CHECK_EQ("saturated sum", cuvs_admission_pool_shortfall(UINT64_MAX / 4, UINT64_MAX / 4,
+                                                            UINT64_MAX / 4, 1, 1),
+             SAT - UINT64_MAX / 4);
+    /* nonzero iff AR8's sum refuses, over a small grid */
+    for (uint64_t q = 0; q < 12; q++)
+        for (uint64_t u = 0; u < 5; u++)
+            CHECK("shortfall > 0 iff refuses",
+                  (cuvs_admission_pool_shortfall(q, 1, u, 3, 2) > 0) ==
+                  cuvs_admission_pool_refuses(q, 1, u, 3, 2));
+}
+
 int
 main(void)
 {
@@ -287,6 +312,7 @@ main(void)
     test_needed_saturates();
     test_c3_admission_table();
     test_ar8_pool_capacity();
+    test_ar8_pool_shortfall();
     if (g_failures) {
         fprintf(stderr, "test_admission_contract: %d failure(s)\n", g_failures);
         return 1;

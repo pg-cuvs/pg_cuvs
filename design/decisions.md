@@ -3826,7 +3826,9 @@ dataset 부착 확인 ATT)은 CUDA 빌드가 필요해 이 결정의 첫 구현�
 ## ADR-089 — CAGRA 빌드가 풀의 남은 자리에 N_m과 headroom을 담지 못하면 빌드 전에 거부한다 (AR8)
 
 **상태:** 채택(I3-A 블록, conch 44041bb7, 2026-11-06; 판정식은 설계 개정 40c33a3b의
-소유자 결정). supersedes: 없음. ADR-086의 "거부는 아무것도 축출하지 않는다"와 ADR-088의
+소유자 결정). 개정 2026-11-09(사용자 설계 결정, GPU run 20261108-q-02 QE 뒤): 풀 부족을
+AR8로 거부하기 전에 빌드 축출 평가(make_room)에 먼저 넘긴다. 판정식·메시지는 그대로다.
+supersedes: 없음. ADR-086의 "거부는 아무것도 축출하지 않는다"와 ADR-088의
 large_workspace 규칙(lw_ub, AR6/AR7)을 넓힌다. 구현 기준 커밋: `ysys143/integ-ce2a5a4`
 (ce2a5a4a15ac754f157719916c895f8e8c23b025) 위의 `ysys143/i3a-ar8`. 현행 SSOT:
 `docs/reference.md` "RMM quota and memory accounting"·"Admission rejections and
@@ -3845,19 +3847,30 @@ large_workspace는 `LwManagedResource`가 `managed_memory_resource`를 직접 �
 **결정:**
 
 1. 새 사유 AR8(AR7 다음, SQLSTATE 53200). `ensure_vram()`의 BUILD_CAGRA 블록에서
-   AR0 → AR1 → AR2 → **AR8** → AR6/AR7 → 축출(make_room) → AR3/AR4/AR5 순서로 판정한다.
-   `quota > 0 && pending + pool_used + N_m + headroom > quota`이면 거부한다.
+   AR0 → AR1 → AR2 → AR6/AR7 → 축출 평가(make_room) → AR3/AR4/AR5/**AR8** → 축출 뒤 풀
+   재확인(**AR8**) 순서로 판정한다(2026-11-09 개정 전에는 AR8이 AR6/AR7과 축출보다 앞이었다).
+   풀 부족분 = `pending + pool_used + N_m + headroom - quota`(quota > 0일 때)이고, 0보다 크면
+   - 축출은 상주 풀 바이트만 돌려주므로 부족분이 `pool_used`보다 크면 축출 없이 AR8이다.
+   - 아니면 부족분을 논리 예산·물리 여유 부족분과 함께 make_room의 사전 합산 선택에 넘긴다
+     (목표는 셋 중 최대). scope가 허용하는 상주를 내리고 입장하거나, scope 집합으로는 모자라고
+     EV-1만 적용한 집합이면 충분하면 AR5(아무것도 내리지 않는다), 그 집합으로도 풀 부족분을
+     못 채우면 AR8(아무것도 내리지 않는다)이다.
+   - 축출 뒤 풀을 다시 읽어(내린 항목의 등록 바이트와 돌아온 풀 바이트가 다를 수 있다)
+     여전히 `pending + pool_used + N_m + headroom > quota`이면 AR8이다.
    - `pending = g_pending_rmm_build_vram + g_lw_pending`(입장했고 끝나지 않은 빌드의 `N_m`과
      `lw_ub`). `lw_ub` 부분은 풀 메모리가 아니지만, workspace 단계에 있는 빌드가 이미 풀
      예약을 다 쓴 경우(혼합)를 막기 위해 센다.
    - `pool_used`는 AR6/AR7이 읽는 같은 축출 전 `cuvs_rmm_pool_stats` 관측의 `used_bytes`다.
+     축출 뒤 재확인과 REINDEX self-replace 재평가는 풀을 다시 읽는다.
    - `headroom = permille == 0 ? 0 : max(256 MiB, ceil(N_m × permille / 1000))`, `N_m`에만 건다.
    - 이 빌드의 `lw_ub`는 항이 아니다(AR6/AR7에만 남는다). 합은 포화한다.
-2. 거부는 아무것도 축출하지 않고 예약하지 않는다. `[release]`·`[build_oom]` 줄이 없다.
-   REINDEX self-replace는 AR8을 재시도하지 않는다.
+2. 거부는 예약하지 않는다. `[release]`·`[build_oom]` 줄이 없다. 축출 전 거부(AR8, AR5)는
+   아무것도 내리지 않는다. 축출 뒤 재확인의 AR8만 이미 내린 상주를 되돌리지 않는다(다음 질의가
+   재적재한다, `[admit] evicted >= 1`). REINDEX self-replace는 AR8을 재시도하지 않는다.
 3. 노브 `--rmm-build-headroom-permille`(0~100000, 기본 150, `--managed-lw-margin-permille`과
    같은 엄격 파서 계열). 0은 headroom만 없애고 용량 검사는 남긴다. 바닥 256 MiB는 상수다.
-4. 표면: err_out `AR8 n q p d o`(n = `N_m`, p = pending, d = headroom MiB, o = pool used MiB;
+4. 표면: err_out `AR8 n q p d o`(n = `N_m`, p = pending, d = headroom MiB, o = pool used MiB,
+   축출 뒤 AR8이면 다시 읽은 값;
    d와 o는 새 키로 i 뒤에 붙는다), DETAIL `need <N_m> MiB + headroom <h> MiB > pool quota
    <q> MiB (pending <p> MiB, pool used <u> MiB)`, HINT는 인덱스 크기·`graph_degree`
    (`ALTER INDEX … SET (graph_degree = …)`)와 `--rmm-pool-max-percent`만 말한다(축출·unpin
@@ -3866,7 +3879,8 @@ large_workspace는 `LwManagedResource`가 `managed_memory_resource`를 직접 �
    (41 → 45 필드, 앞 41개 순서 그대로; AR8의 `pool_used`는 기존 `pool_used` 필드). I3-E 관측은
    AR8도 센다(`rejects_ar8`, `rejects_no_gpu.ar8`, pool status v3).
 5. 샤드 빌드(BUILD_SHARD)와 수동 경로는 바꾸지 않는다. 샤드 빌드의 같은 검사는 별도 이슈다.
-   AR0~AR7의 코드·문구는 바꾸지 않는다. `make_room`도 바꾸지 않는다.
+   AR0~AR7의 코드·문구는 바꾸지 않는다. `make_room` 자체는 바꾸지 않고, 호출부가 축출 목표에
+   풀 부족분을 더한다(2026-11-09 개정).
 
 **병합 시점의 동작 변화:** 기본값 150은 병합하는 순간 동작을 바꾼다. Q6 조건은
 `pool_used + N_m + headroom` = 3,196,800,000 + 3,196,800,000 + 479,520,000 =
@@ -3886,11 +3900,12 @@ large_workspace는 `LwManagedResource`가 `managed_memory_resource`를 직접 �
 `self_res`(교체될 옛 사본)를 AR8 비교에서 뺄지는 소유자에게 남긴 열린 결정이다(conch 6f0bb6fa:
 이번 변경은 보수적 거부를 유지하고, HINT가 옛 사본이 pool used에 포함됨을 알린다).
 
-**후속 기록(코드 아님, 미결):** 입장된 CAGRA 빌드에 대해 `make_room`의 축출 목표는 여전히
-`N_m`뿐이다(논리 예산·물리 여유 부족분). AR8의 headroom은 quota 기준의 입장 전제일 뿐, 축출로
-그만큼의 여유를 만들어 주지 않는다. 축출 목표를 `N_m + headroom`으로 넓히는 안(b1)은 설계
-개정 40c33a3b에서 이 변경 밖으로 빠졌다. 누가: 소유자. 언제·조건: I3-A 세트 계획에서, GPU
-검증 A1~A5 결과를 본 뒤.
+**후속 기록(코드 아님):** 처음 판에서 `make_room`의 축출 목표는 `N_m`뿐(논리 예산·물리 여유
+부족분)이었고, 풀이 모자라면 AR8이 축출 전에 거부해 풀 부족을 축출로 푸는 경로가 없었다(run
+20261108-q-02 QE에서 QE-1a·QE-1c가 AR5 대신 AR8로 끝났다). 2026-11-09 개정으로 축출 목표가
+`max(논리 예산 부족, 물리 부족, 풀 부족분)`이 되어, headroom을 포함한 풀 부족분을 scope가
+허용하는 축출로 메울 수 있다. 논리 예산·물리 여유 쪽 목표는 여전히 `N_m` 기준이다(b1의
+나머지는 이 개정 밖이다).
 
 **대안:**
 
@@ -3905,7 +3920,9 @@ large_workspace는 `LwManagedResource`가 `managed_memory_resource`를 직접 �
 
 **검증 경계:** 판정식·코덱·문구는 CPU 단위 시험(Q6 150/100/0, 설계의 동시성 예, 각 항의
 ==/+1 경계, quota 0, AR0~AR7 문구 고정)과 변이, 데몬 경로는 Linux CPU shim의
-`test-ar8-daemon`(실제 `ensure_vram`; `pool_used`는 RMM 통계 fixture, 두 빌드 동시 입장,
-AR1 → AR8 → AR6 순서, 축출·예약 없음, err_out, `[admit]` 필드, 노브 파싱)으로 확인한다.
+`test-ar8-daemon`(실제 `ensure_vram`; `pool_used`는 RMM 통계 fixture(상주 바이트를 더하는
+모드 포함), 두 빌드 동시 입장, AR1 → AR6 → 풀 부족 축출 평가 순서, 적격 상주 축출 뒤 입장,
+scope none과 뜨거운 `idle:0`의 AR5, 축출로 못 채우는 부족분과 `pool_used` 초과 부족분의 무축출
+AR8, 축출 뒤 재확인 AR8, 거부 시 예약 없음, err_out, `[admit]` 필드, 노브 파싱)으로 확인한다.
 실제 GPU에서 Q6 조건이 코어 없이 AR8로 끝나는지와 경계(A1~A5)는 GPU 검증 대상이며 이
 커밋들에서 돌리지 않았다. 이 방어는 upstream의 unwind 중 힙 손상을 고치지 않는다.
