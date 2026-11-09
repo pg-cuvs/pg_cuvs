@@ -52,6 +52,12 @@ int main(void)
     assert(!cuvs_hnsw_ivfpq_needs_fp32(1.0, CUVS_METRIC_COSINE));     /* normalized */
     assert(cuvs_hnsw_ivfpq_needs_fp32(NAN, CUVS_METRIC_L2));
     assert(cuvs_hnsw_ivfpq_needs_fp32(INFINITY, CUVS_METRIC_IP));
+    /* Q corpus (999,000 x 768, measured max|x|^2 = 10.4503532): fp16-safe under
+     * every metric, so the CAGRA build and its compaction rebuild leave
+     * graph_build_params as cuVS's monostate (behaviour unchanged). */
+    assert(!cuvs_hnsw_ivfpq_needs_fp32(10.4503532, CUVS_METRIC_L2));
+    assert(!cuvs_hnsw_ivfpq_needs_fp32(10.4503532, CUVS_METRIC_IP));
+    assert(!cuvs_hnsw_ivfpq_needs_fp32(10.4503532, CUVS_METRIC_COSINE));
     {
         const float rows[6] = {3, 4, 0, 1, 0, 2};          /* |x|^2 = 25, 1, 4 */
         assert(cuvs_hnsw_max_sq_norm(rows, 3, 2) == 25.0);

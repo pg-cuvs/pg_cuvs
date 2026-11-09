@@ -419,7 +419,7 @@ cagra/ivfpq") rather than silently failing.
 |-----------|------|---------|----------------|-------|
 | `graph_degree` | int | `64` | 8–512 | CAGRA output graph degree |
 | `intermediate_graph_degree` | int | `128` | 8–1024 | Must be ≥ `graph_degree` (fail-closed) |
-| `build_algo` | enum | `auto` | `auto`, `ivf_pq`, `nn_descent` | CAGRA build algorithm. The IVF-PQ kNN search (`ivf_pq`, or `auto` when cuVS picks IVF-PQ) uses fp32 LUT, internal and coarse distances when 4 x max\|x\|^2 of the corpus (max\|x\|^2 for inner product and cosine) reaches 65504, the fp16 maximum; otherwise cuVS's fp16 defaults stay. The daemon logs `[cuvs_cagra_build_multi] knn precision` with the bound and the choice |
+| `build_algo` | enum | `auto` | `auto`, `ivf_pq`, `nn_descent` | CAGRA build algorithm. The IVF-PQ kNN search (`ivf_pq`, or `auto` when cuVS picks IVF-PQ) uses fp32 LUT, internal and coarse distances when 4 x max\|x\|^2 of the corpus (max\|x\|^2 for inner product and cosine) reaches 65504, the fp16 maximum; otherwise cuVS's fp16 defaults stay. The daemon logs `[cuvs_cagra_build_multi] knn precision` with the bound and the choice. Compaction (`pg_cuvs_compact`, VACUUM) rebuilds the kept rows with cuVS's `auto` choice under the same rule and logs `[cuvs_cagra_compact] knn precision` |
 | `index_dir` | string | (uses `cuvs.index_dir`) | path | Per-index artifact directory (ADR-045); self-describes in `reloptions` so no-GUC sessions still find it |
 
 ### `ivfpq`
@@ -512,7 +512,7 @@ for limits, compatibility and estimate-vs-upper-bound caveats.
 | `pg_cuvs_build_status()` | SETOF record | (0.9.0) In-flight CAGRA builds and their reservations; rows filtered by privilege. See § 8.4 |
 | `pg_cuvs_hnsw_build_info(index regclass)` | jsonb | Read the stored construction route/settings and estimate-based admission. Version2 writer with historical version1 reader; absent legacy/source/empty receipts are not reconstructed from current GUCs. Requires SELECT on the source table; estimates are not memory upper-bound guarantees |
 | `pg_cuvs_build_hnsw(cagra regclass, mode text DEFAULT 'nsw')` | regclass | Build a pgvector HNSW from a CAGRA index without pgvector's CPU build. **Deprecated** in favor of `CREATE INDEX ... USING pg_cuvs_hnsw`; the older two-step `pg_cuvs_import_hnsw` form (empty `USING hnsw` target + import) is removed |
-| `pg_cuvs_compact(index regclass)` | void | Remove tombstoned vectors via `cuvsCagraMerge`, rebuild `.cagra`/`.tids`, drop `.tombstone` |
+| `pg_cuvs_compact(index regclass)` | void | Remove tombstoned vectors via `cuvsCagraMerge`, rebuild `.cagra`/`.tids`, drop `.tombstone`. The rebuild uses fp32 IVF-PQ kNN distances under the `build_algo` fp16 rule |
 | `pg_cuvs_batch_search(rel regclass, queries vector[], k int)` | SETOF (query_idx int, ctid tid, distance real) | Q queries in one IPC/GPU dispatch; JOIN on `ctid` for visible rows; honors `search_mode`/`bf_precision` |
 | `cuvs_filtered_knn(index regclass, query vector, filter_tids bigint[], k int)` | TABLE (ctid tid, distance float4) | Exact GPU BF restricted to a sorted TID set (`block<<16\|off`); NULL = unfiltered |
 | `cuvs_filtered_knn(index regclass, query vector, filter_tids tid[], k int)` | TABLE (ctid tid, distance float4) | Type-safe `tid[]` overload (accepts `ctid` directly) |

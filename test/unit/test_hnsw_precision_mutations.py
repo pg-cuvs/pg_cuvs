@@ -78,14 +78,26 @@ WIRING = {
                                                 r"&& wire\.policy\.route == CUVS_HNSW_ROUTE_ACE;\s*if \(reply\.status == CUVS_STATUS_OK && !graph_fallback"),
     "backend_notice": (BACKEND, r"if \(notices & CUVS_HNSW_NOTICE_GRAPH_FALLBACK\)\s*ereport\(NOTICE"),
     "receipt_json_fields": (EXPORT, r"\\\"ivfpq_distance_dtype\\\":\\\"%s\\\",\\\"graph_fallback\\\":%s"),
-    # CAGRA AM (cuvs_cagra_build_multi): same bound from the corpus already on the GPU
-    "cagra_bound_on_device": (WRAPPER, r"const double max_sq = may_use_ivf_pq\s*\?\s*device_max_sq_norm\(res, d_corpus\.data_handle\(\), total, \(int64_t\)dim\)"),
+    # CAGRA AM: one helper (cagra_knn_precision) for the build (cuvs_cagra_build_multi)
+    # and the compaction rebuild (cuvs_cagra_compact -> cagra::merge -> cagra::build)
+    "cagra_bound_on_device": (WRAPPER, r"const double max_sq = may_use_ivf_pq\s*\?\s*device_max_sq_norm\(res, rows_data, rows, dim, ld\)"),
+    "cagra_bound_uses_stride": (WRAPPER, r"const float \*r = data \+ row \* ld;"),
+    "cagra_build_calls_helper": (WRAPPER, r"cagra_knn_precision\(res, d_corpus\.data_handle\(\), total, \(int64_t\)dim, \(int64_t\)dim,\s*"
+                                          r"d_corpus\.extents\(\), metric, build_algo, params, \"cuvs_cagra_build_multi\"\);\s*"
+                                          r"auto idx = cuvs::neighbors::cagra::build\(\s*res,\s*params,"),
+    "cagra_compact_calls_helper": (WRAPPER, r"cagra_knn_precision\(res, ds\.data_handle\(\), ds\.extent\(0\), ds\.extent\(1\), ds\.stride\(0\),\s*"
+                                            r"raft::make_extents<int64_t>\(n_keep, ds\.extent\(1\)\), metric, CUVS_CAGRA_BUILD_AUTO,\s*"
+                                            r"params, \"cuvs_cagra_compact\"\);\s*"
+                                            r"std::vector<cuvs::neighbors::cagra::index<float, uint32_t>\*> indices = \{&impl->idx\};\s*"
+                                            r"auto new_idx = cuvs::neighbors::cagra::merge\(res, params, indices, filter\);"),
+    "cagra_compact_kept_count": (WRAPPER, r"if \(w == n_words - 1 && \(n_total & 31\)\) bits &= \(1u << \(n_total & 31\)\) - 1u;\s*"
+                                          r"n_keep \+= __builtin_popcount\(bits\);"),
     "cagra_rule_used": (WRAPPER, r"const bool fp32 = may_use_ivf_pq && cuvs_hnsw_ivfpq_needs_fp32\(max_sq, metric\);"),
     "cagra_fp32_three_dtypes": (WRAPPER, r"auto fp32_ivf_pq = \[&\]\(gbp::ivf_pq_params pq\) \{\s*pq\.search_params\.lut_dtype = CUDA_R_32F;\s*"
                                          r"pq\.search_params\.internal_distance_dtype = CUDA_R_32F;\s*pq\.search_params\.coarse_search_dtype = CUDA_R_32F;"),
-    "cagra_explicit_ivf_pq": (WRAPPER, r"auto pq = gbp::ivf_pq_params\(d_corpus\.extents\(\)\);\s*params\.graph_build_params = fp32 \? fp32_ivf_pq\(pq\) : pq;"),
-    "cagra_auto_pins_choice": (WRAPPER, r"else if \(fp32\)\s*\{[\s\S]{0,300}has_enough_device_memory\(res, d_corpus\.extents\(\),[\s\S]{0,400}"
-                                        r"params\.graph_build_params = fp32_ivf_pq\(\s*gbp::ivf_pq_params\(d_corpus\.extents\(\), params\.metric\)\);"),
+    "cagra_explicit_ivf_pq": (WRAPPER, r"auto pq = gbp::ivf_pq_params\(shape\);\s*params\.graph_build_params = fp32 \? fp32_ivf_pq\(pq\) : pq;"),
+    "cagra_auto_pins_choice": (WRAPPER, r"else if \(fp32\)\s*\{\s*if \(cuvs::neighbors::nn_descent::has_enough_device_memory\(res, shape, sizeof\(uint32_t\)\)\)[\s\S]{0,600}"
+                                        r"params\.graph_build_params = fp32_ivf_pq\(gbp::ivf_pq_params\(shape, params\.metric\)\);"),
 }
 
 WIRING_MUTANTS = {
@@ -98,13 +110,28 @@ WIRING_MUTANTS = {
     "server_rejects_fallback": (SERVER, "    if (reply.status == CUVS_STATUS_OK && !graph_fallback\n",
                                 "    if (reply.status == CUVS_STATUS_OK\n"),
     "backend_notice_dropped": (BACKEND, "            if (notices & CUVS_HNSW_NOTICE_GRAPH_FALLBACK)\n", "            if (0)\n"),
-    "cagra_explicit_keeps_fp16": (WRAPPER, "            params.graph_build_params = fp32 ? fp32_ivf_pq(pq) : pq;\n",
-                                  "            params.graph_build_params = pq;\n"),
-    "cagra_auto_fp16_ivf_pq": (WRAPPER, "                params.graph_build_params = fp32_ivf_pq(\n                    gbp::ivf_pq_params(d_corpus.extents(), params.metric));\n",
-                               "                params.graph_build_params = gbp::ivf_pq_params(d_corpus.extents(), params.metric);\n"),
-    "cagra_coarse_kept_fp16": (WRAPPER, "            pq.search_params.coarse_search_dtype = CUDA_R_32F;\n", ""),
-    "cagra_bound_skipped": (WRAPPER, "        const bool fp32 = may_use_ivf_pq && cuvs_hnsw_ivfpq_needs_fp32(max_sq, metric);\n",
-                            "        const bool fp32 = false;\n"),
+    "cagra_explicit_keeps_fp16": (WRAPPER, "        params.graph_build_params = fp32 ? fp32_ivf_pq(pq) : pq;\n",
+                                  "        params.graph_build_params = pq;\n"),
+    "cagra_auto_fp16_ivf_pq": (WRAPPER, "            params.graph_build_params = fp32_ivf_pq(gbp::ivf_pq_params(shape, params.metric));\n",
+                               "            params.graph_build_params = gbp::ivf_pq_params(shape, params.metric);\n"),
+    "cagra_coarse_kept_fp16": (WRAPPER, "        pq.search_params.coarse_search_dtype = CUDA_R_32F;\n", ""),
+    "cagra_bound_skipped": (WRAPPER, "    const bool fp32 = may_use_ivf_pq && cuvs_hnsw_ivfpq_needs_fp32(max_sq, metric);\n",
+                            "    const bool fp32 = false;\n"),
+    "cagra_bound_ignores_stride": (WRAPPER, "        const float *r = data + row * ld;\n", "        const float *r = data + row * dim;\n"),
+    "build_multi_helper_dropped": (WRAPPER, "        cagra_knn_precision(res, d_corpus.data_handle(), total, (int64_t)dim, (int64_t)dim,\n"
+                                            "            d_corpus.extents(), metric, build_algo, params, \"cuvs_cagra_build_multi\");\n", ""),
+    "compact_helper_dropped": (WRAPPER, "        cagra_knn_precision(res, ds.data_handle(), ds.extent(0), ds.extent(1), ds.stride(0),\n"
+                                        "            raft::make_extents<int64_t>(n_keep, ds.extent(1)), metric, CUVS_CAGRA_BUILD_AUTO,\n"
+                                        "            params, \"cuvs_cagra_compact\");\n", ""),
+    "compact_merge_default_params": (WRAPPER, "cagra::merge(res, params, indices, filter);",
+                                     "cagra::merge(res, cuvs::neighbors::cagra::index_params{}, indices, filter);"),
+    "compact_shape_all_rows": (WRAPPER, "raft::make_extents<int64_t>(n_keep, ds.extent(1)), metric, CUVS_CAGRA_BUILD_AUTO,",
+                               "raft::make_extents<int64_t>(ds.extent(0), ds.extent(1)), metric, CUVS_CAGRA_BUILD_AUTO,"),
+    "compact_helper_explicit_ivf_pq": (WRAPPER, "metric, CUVS_CAGRA_BUILD_AUTO,\n            params, \"cuvs_cagra_compact\");",
+                                       "metric, CUVS_CAGRA_BUILD_IVF_PQ,\n            params, \"cuvs_cagra_compact\");"),
+    "auto_safe_data_pinned": (WRAPPER, "    else if (fp32)\n    {\n        if (cuvs::neighbors::nn_descent::has_enough_device_memory",
+                              "    else\n    {\n        if (cuvs::neighbors::nn_descent::has_enough_device_memory"),
+    "compact_keep_count_unmasked": (WRAPPER, "            if (w == n_words - 1 && (n_total & 31)) bits &= (1u << (n_total & 31)) - 1u;\n", ""),
 }
 
 
