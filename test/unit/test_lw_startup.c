@@ -161,6 +161,8 @@ main(int argc, char **argv)
     CHECK(strstr(slurp(r.log), expect) != NULL);
     CHECK(strstr(slurp(r.log), "build admission model: scratch_permille=") != NULL);
     CHECK(strstr(slurp(r.log), "validated_overflow_policy=managed") != NULL);
+    /* The GPU Q1 measured rho* on (run 20261108-q-02 startup line). */
+    CHECK(strstr(slurp(r.log), "validated_gpu=\"NVIDIA A100-SXM4-80GB\"") != NULL);
     CHECK(strstr(slurp(r.log), "overflow=managed overcommit=on") != NULL);
     CHECK(strstr(slurp(r.log), "dedicated_stream=on peak_meter=on") != NULL);
     CHECK(strstr(slurp(r.log), "evict_min_idle_s=600 evict_hit_bonus_s=30 evict_hit_cap=20") != NULL);
