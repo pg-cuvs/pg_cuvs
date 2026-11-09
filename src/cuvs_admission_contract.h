@@ -205,6 +205,31 @@ cuvs_admission_pool_refuses(uint64_t quota, uint64_t pending, uint64_t pool_used
                headroom) > quota;
 }
 
+/* Bytes the pool is short by under the AR8 sum (0 when it fits or quota is
+ * 0): pending + pool_used + N_m + headroom - quota, saturating. Nonzero
+ * exactly when cuvs_admission_pool_refuses() is 1.
+ *
+ * Admission order (owner decision 2026-11-09, ADR-089 amended): a pool
+ * shortfall is first offered to the build's eviction scope (make_room)
+ * together with the logical-budget and physical shortfalls. Eviction frees
+ * resident pool bytes only, so a shortfall above pool_used is refused as AR8
+ * before any eviction; a scope that forbids victims a wider set would allow
+ * is AR5; AR8 also refuses when no permissible eviction covers the pool
+ * shortfall, or when the pool is still short after eviction. */
+static inline uint64_t
+cuvs_admission_pool_shortfall(uint64_t quota, uint64_t pending, uint64_t pool_used,
+                              uint64_t needed, uint64_t headroom)
+{
+    uint64_t sum;
+
+    if (quota == 0)
+        return 0;
+    sum = cuvs_admission_sat_add(
+        cuvs_admission_sat_add(cuvs_admission_sat_add(pending, pool_used), needed),
+        headroom);
+    return sum > quota ? sum - quota : 0;
+}
+
 /* I4 admission hook: the out-of-pool large_workspace check (AR6/AR7, v6 1.4
  * "AR6, AR7 판정식"). The daemon calls it once per CAGRA build admission,
  * after AR2 and before any scope eviction, with pre-eviction snapshots; it is

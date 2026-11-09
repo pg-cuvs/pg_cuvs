@@ -1,10 +1,15 @@
-/* ADR-089 AR8 through the actual daemon source (Linux, CPU shim): ensure_vram
- * refuses a CAGRA build when pending (build reservations + lw_pending) +
- * pool_used + N_m + headroom exceeds the pool quota, before AR6/AR7 and
- * before make_room (nothing evicted, nothing reserved), fills the AR8 err_out
- * subset, appends the [admit] fields, and parses --rmm-build-headroom-permille
- * strictly. Fixtures: physical free bytes, the host guard and the RMM pool
- * used bytes. Shapes are the Q6 condition (design 40c33a3b). */
+/* ADR-089 AR8 through the actual daemon source (Linux, CPU shim): a CAGRA
+ * build whose pending (build reservations + lw_pending) + pool_used + N_m +
+ * headroom exceeds the pool quota is first offered to the build eviction
+ * scope (owner decision 2026-11-09): AR6/AR7 refuse before that, a shortfall
+ * above pool_used or beyond every evictable byte is AR8 with nothing evicted,
+ * a scope that forbids the victims a wider set would allow is AR5, eligible
+ * residents are evicted and the build admitted, and the pool is read again
+ * after eviction (still short: AR8). Also the AR8 err_out subset, the [admit]
+ * fields and strict --rmm-build-headroom-permille parsing. Fixtures: physical
+ * free bytes, the host guard and the RMM pool used bytes (optionally plus the
+ * resident entry bytes, so an eviction returns pool memory). Shapes are the
+ * Q6 condition (design 40c33a3b). */
 #define _GNU_SOURCE
 #include <stdint.h>
 #include <stddef.h>
@@ -24,6 +29,7 @@ size_t fixture_free(int device_id);
 
 static size_t g_free;
 static uint64_t g_pool_used;
+static int g_pool_tracks_residents;   /* pool used += resident entry bytes */
 size_t fixture_free(int device_id) { (void)device_id; return g_free; }
 int
 fixture_pool_stats(int device_id, CuvsRmmPoolStats *out)
@@ -31,8 +37,8 @@ fixture_pool_stats(int device_id, CuvsRmmPoolStats *out)
     memset(out, 0, sizeof(*out));
     out->device_id = (uint32_t)device_id;
     out->maximum_bytes = g_rmm_pool_limits[device_id];
-    out->used_bytes = g_pool_used;
-    out->reserved_bytes = g_pool_used;
+    out->used_bytes = g_pool_used + (g_pool_tracks_residents ? resident_bytes(device_id) : 0);
+    out->reserved_bytes = out->used_bytes;
     return 0;
 }
 static uint64_t fixture_guard(void) { return UINT64_C(1) << 40; }
@@ -41,6 +47,7 @@ static int failures;
 #define CHECK(c) do { if (!(c)) { fprintf(stderr, "FAIL %s:%d %s\n", __FILE__, __LINE__, #c); failures++; } } while (0)
 
 #define GiB ((size_t)1024 * 1024 * 1024)
+#define MiB ((size_t)1024 * 1024)
 static const size_t Q6_QUOTA = (size_t)6807502080ull;
 static const size_t Q6_N_M = (size_t)3196800000ull;           /* rho 0 */
 static const uint64_t Q6_POOL_USED = UINT64_C(3196800000);    /* resident A_res */
@@ -68,6 +75,7 @@ reset(void)
     g_max_vram_per_gpu[0] = 80 * GiB;
     g_free = 80 * GiB;
     g_pool_used = 0;
+    g_pool_tracks_residents = 0;
 }
 
 static AdmitLine
@@ -251,11 +259,14 @@ test_order(void)
     CHECK(admit(&a, NULL) == CUVS_ADMISSION_AR1);
     g_pending_rmm_build_vram[0] = 0;
 
-    /* AR8 before AR6: overcommit off and no physical free would be AR6. */
+    /* AR6 before AR8 (owner decision 2026-11-09): AR6/AR7 read the
+     * pre-eviction snapshot and refuse before any eviction, so a build that
+     * is both pool-short and AR6 (overcommit off, no physical free) is AR6. */
     g_managed_overcommit = 0;
     g_free = 0;
     a = line_for(999000);
-    CHECK(admit(&a, NULL) == CUVS_ADMISSION_AR8);
+    CHECK(admit(&a, NULL) == CUVS_ADMISSION_AR6);
+    CHECK(a.pool_valid && a.pool_used == Q6_POOL_USED);   /* AR8 inputs still logged */
     /* AR6 itself is unchanged for a shape that fits the pool. */
     g_pool_used = 0;
     g_free = 2 * GiB;
@@ -264,17 +275,18 @@ test_order(void)
     g_managed_overcommit = 1;
     g_free = 80 * GiB;
 
-    /* AR8 before make_room: with scope lru and the logical budget short, a
-     * fitting build evicts the resident index (positive control) ... */
+    /* Positive control: with scope lru and the logical budget short, a
+     * fitting build evicts the resident index ... */
     g_reclaim.scope.kind = CUVS_SCOPE_LRU;
     g_indexes = &resident; g_n_indexes = 1;
     a = line_for(499500);
     g_max_vram_per_gpu[0] = a.needed + GiB / 2;
     CHECK(admit(&a, NULL) == CUVS_ADMISSION_NONE);
     CHECK(g_cache_evictions[0] == 1 && g_n_indexes == 0);
-    /* ... while the refused Q6 build evicts nothing. Restore the entry the
-     * eviction above cleared, and check the budget is short again, so the
-     * no-eviction check is not vacuous. */
+    /* ... and a Q6 build whose pool is short too is offered to the same pick.
+     * The fixture pool does not return the evicted bytes (its pool used is a
+     * constant): the eviction happens, the pool is read again, still short
+     * -> AR8 after eviction, nothing reserved. */
     resident = (IndexEntry){.valid = 1, .is_flat = 1, .gpu_device_id = 0,
                             .db_oid = 1, .index_oid = 9, .main_bf_vram_bytes = GiB};
     g_indexes = &resident; g_n_indexes = 1;
@@ -285,14 +297,138 @@ test_order(void)
     g_max_vram_per_gpu[0] = a.needed + GiB / 2;
     CHECK(total_vram_used(0) + a.needed > g_max_vram_per_gpu[0]);   /* make_room would run */
     CHECK(admit(&a, NULL) == CUVS_ADMISSION_AR8);
-    CHECK(g_cache_evictions[0] == 0 && g_n_indexes == 1);
-    CHECK(g_pending_rmm_build_vram[0] == 0);
+    CHECK(g_cache_evictions[0] == 1 && g_n_indexes == 0);
+    CHECK(a.pool_used == Q6_POOL_USED);            /* read again after eviction */
+    CHECK(g_pending_rmm_build_vram[0] == 0 && g_pending_build_vram[0] == 0);
     g_indexes = NULL; g_n_indexes = 0;
     pthread_mutex_unlock(&g_index_mutex);
 }
 
+/* Owner decision 2026-11-09: a pool shortfall (pending + pool_used + N +
+ * headroom > quota) is evaluated by make_room under the build scope before
+ * AR8. Half-Q6 shape: N 1,598,400,000, headroom 268,435,456 (floor); quota
+ * 2.5e9; the fixture pool counts the resident entry, so evicting it returns
+ * its bytes. pool_short = 1 GiB + N + h - quota = 440,577,280 <= 1 GiB. */
+static IndexEntry g_res[2];
 static void
-capture_admit(AdmitLine *a, char *buf, size_t cap)
+one_resident(uint64_t bytes, int64_t last_search)
+{
+    memset(g_res, 0, sizeof(g_res));
+    g_res[0] = (IndexEntry){.valid = 1, .is_flat = 1, .gpu_device_id = 0, .db_oid = 1,
+                            .index_oid = 9, .main_bf_vram_bytes = (size_t)bytes,
+                            .last_search = (time_t)last_search};
+    g_indexes = g_res; g_n_indexes = 1;
+}
+
+static void
+capture_admit_reason(AdmitLine *a, int reason, char *buf, size_t cap);
+
+static void
+test_pool_shortfall_eviction(void)
+{
+    const uint64_t quota = UINT64_C(2500000000), n_m = UINT64_C(1598400000),
+                   h = UINT64_C(268435456);
+    AdmitLine a;
+    CuvsAdmissionFields rej;
+    char buf[8192];
+    reset();
+    g_rmm_pool_limits[0] = (size_t)quota;
+    g_pool_tracks_residents = 1;
+    pthread_mutex_lock(&g_index_mutex);
+
+    /* (1) eligible resident (scope lru): evicted, then admitted, no AR8. */
+    g_reclaim.scope.kind = CUVS_SCOPE_LRU;
+    one_resident(GiB, 0);
+    a = line_for(499500);
+    CHECK(a.needed == n_m);
+    CHECK(cuvs_admission_pool_refuses(quota, 0, GiB, n_m, h));       /* old order: AR8 */
+    CHECK(admit(&a, NULL) == CUVS_ADMISSION_NONE);
+    CHECK(g_cache_evictions[0] == 1 && g_n_indexes == 0);
+    CHECK(a.pool_valid && a.pool_headroom == h && a.pool_used == 0);  /* read after eviction */
+    capture_admit_reason(&a, CUVS_ADMISSION_NONE, buf, sizeof(buf));
+    CHECK(strstr(buf, " evicted=1 verdict=admit reason=none ") != NULL);
+    CHECK(g_pending_rmm_build_vram[0] == 0);       /* reservation is the caller's */
+
+    /* (2) scope none (default): no eligible victim for this requester, the
+     * EV-1-only set would fit -> AR5, nothing evicted or reserved, the AR5
+     * DETAIL fields (e = evictable, candidates) and [admit] lru/elig. */
+    memset(g_cache_evictions, 0, sizeof(g_cache_evictions));
+    g_reclaim.scope.kind = CUVS_SCOPE_NONE;
+    one_resident(GiB, 0);
+    a = line_for(499500);
+    CHECK(admit(&a, &rej) == CUVS_ADMISSION_AR5);
+    CHECK(g_cache_evictions[0] == 0 && g_n_indexes == 1);
+    CHECK(g_pending_rmm_build_vram[0] == 0 && g_pending_build_vram[0] == 0);
+    CHECK(rej.reason == CUVS_ADMISSION_AR5 && rej.e_mib == 1024 && rej.e_cnt == 1);
+    CHECK((rej.present & CUVS_ADM_F_O) == 0);     /* not the AR8 subset */
+    capture_admit_reason(&a, CUVS_ADMISSION_AR5, buf, sizeof(buf));
+    CHECK(strstr(buf, " evicted=0 verdict=reject reason=AR5 ") != NULL);
+    CHECK(strstr(buf, " res_n=1 lru_free=1073741824 elig_free=1073741824 ") != NULL);
+    CHECK(strstr(buf, " pool_need=1598400000 headroom=268435456 pool_quota=2500000000 pending=0\n") != NULL);
+
+    /* (3) QE-1c shape: scope idle:0 but the resident is hot (searched now,
+     * inside T_min) -> AR5 with elig_free 0, nothing evicted. */
+    g_reclaim.scope.kind = CUVS_SCOPE_IDLE;
+    g_reclaim.scope.idle_min = 0;
+    one_resident(GiB, (int64_t)time(NULL));
+    a = line_for(499500);
+    CHECK(admit(&a, NULL) == CUVS_ADMISSION_AR5);
+    CHECK(g_cache_evictions[0] == 0 && g_n_indexes == 1);
+    capture_admit_reason(&a, CUVS_ADMISSION_AR5, buf, sizeof(buf));
+    CHECK(strstr(buf, " lru_free=1073741824 elig_free=0 ") != NULL);
+    /* ... and once it is cold the same scope evicts it and admits. */
+    one_resident(GiB, 0);
+    a = line_for(499500);
+    CHECK(admit(&a, NULL) == CUVS_ADMISSION_NONE && g_cache_evictions[0] == 1);
+    memset(g_cache_evictions, 0, sizeof(g_cache_evictions));
+
+    /* (4) eviction cannot cover the pool shortfall (1 GiB of pool use that is
+     * no resident index, a 256 MiB resident): AR8, nothing evicted, even
+     * with scope lru. pool_short = 1.25 GiB + N + h - quota = 709,012,736. */
+    g_reclaim.scope.kind = CUVS_SCOPE_LRU;
+    g_pool_used = GiB;
+    one_resident(256 * MiB, 0);
+    a = line_for(499500);
+    CHECK(admit(&a, &rej) == CUVS_ADMISSION_AR8);
+    CHECK(g_cache_evictions[0] == 0 && g_n_indexes == 1);
+    CHECK(rej.reason == CUVS_ADMISSION_AR8 && rej.o == cuvs_admission_mib(GiB + 256 * MiB));
+    g_pool_used = 0;
+
+    /* (5) a shortfall above pool_used: other builds' lw_ub take the room,
+     * and eviction frees pool bytes only -> AR8 at once, nothing evicted,
+     * although scope lru and the resident's 1 GiB of entry bytes would cover
+     * the shortfall (pool used 256 MiB, the fixture pool does not follow the
+     * entry: entry bytes above pool bytes, as for a gd-64 reload estimate).
+     * pool_short = 1 GiB + 256 MiB + N + h - quota = 709,012,736. */
+    g_pool_tracks_residents = 0;
+    g_pool_used = 256 * MiB;
+    g_lw_pending[0] = GiB;
+    one_resident(GiB, 0);
+    a = line_for(499500);
+    CHECK(cuvs_admission_pool_shortfall(quota, GiB, 256 * MiB, n_m, h) == UINT64_C(709012736));
+    CHECK(admit(&a, NULL) == CUVS_ADMISSION_AR8);
+    CHECK(g_cache_evictions[0] == 0 && g_n_indexes == 1);
+    g_lw_pending[0] = 0;
+
+    /* (6) the pool is read again after eviction: when the eviction does not
+     * return pool bytes (fixture pool constant at 1 GiB), the build is AR8
+     * after an eviction (evicted=1), nothing reserved. */
+    g_pool_used = GiB;
+    one_resident(GiB, 0);
+    a = line_for(499500);
+    CHECK(admit(&a, &rej) == CUVS_ADMISSION_AR8);
+    CHECK(g_cache_evictions[0] == 1 && g_n_indexes == 0);
+    CHECK(rej.o == cuvs_admission_mib(GiB) && g_pending_rmm_build_vram[0] == 0);
+    capture_admit_reason(&a, CUVS_ADMISSION_AR8, buf, sizeof(buf));
+    CHECK(strstr(buf, " evicted=1 verdict=reject reason=AR8 ") != NULL);
+
+    g_indexes = NULL; g_n_indexes = 0;
+    g_reclaim.scope.kind = CUVS_SCOPE_NONE;
+    pthread_mutex_unlock(&g_index_mutex);
+}
+
+static void
+capture_admit_reason(AdmitLine *a, int reason, char *buf, size_t cap)
 {
     char path[] = "/tmp/ar8-admit-XXXXXX";
     int fd = mkstemp(path), saved = dup(2);
@@ -301,7 +437,7 @@ capture_admit(AdmitLine *a, char *buf, size_t cap)
     assert(fd >= 0 && saved >= 0);
     fflush(stderr);
     dup2(fd, 2);
-    log_admit(a, CUVS_ADMISSION_AR8);
+    log_admit(a, (CuvsAdmissionReason)reason);
     fflush(stderr);
     dup2(saved, 2);
     close(fd);
@@ -326,7 +462,7 @@ test_admit_line(void)
     g_lw_pending[0] = 2000;
     a = line_for(999000);
     CHECK(admit(&a, NULL) == CUVS_ADMISSION_AR8);
-    capture_admit(&a, buf, sizeof(buf));
+    capture_admit_reason(&a, CUVS_ADMISSION_AR8, buf, sizeof(buf));
     g_pending_rmm_build_vram[0] = 0;
     g_lw_pending[0] = 0;
     pthread_mutex_unlock(&g_index_mutex);
@@ -395,6 +531,7 @@ main(void)
     test_terms_boundary();
     test_concurrent();
     test_order();
+    test_pool_shortfall_eviction();
     test_admit_line();
     if (failures)
     {
@@ -403,7 +540,10 @@ main(void)
     }
     puts("PASS ar8 daemon: Q6 (pool_used A_res) AR8 at 150, admitted at 100 and 0, "
          "each of pool_used/build pending/lw_pending at the == / -1 boundary, two "
-         "concurrent builds, AR1 then AR8 then AR6, no eviction or reservation on AR8, "
-         "err_out n q p d o, [admit] fields, strict knob parsing");
+         "concurrent builds, AR1 then AR6 then the pool shortfall offered to make_room "
+         "(eligible resident evicted and admitted; scope none / hot idle:0 -> AR5; "
+         "beyond evictable or above pool_used -> AR8 unevicted; still short after "
+         "eviction -> AR8), nothing reserved on a refusal, err_out n q p d o, [admit] "
+         "fields, strict knob parsing");
     return 0;
 }

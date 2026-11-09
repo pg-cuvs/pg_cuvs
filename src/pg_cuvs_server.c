@@ -3227,14 +3227,28 @@ release_build_vram(size_t needed, int device_id)
         g_pending_rmm_build_vram[device_id] -= needed;
 }
 
-/* Map a failed pick to the provisional reject reason (I3-A owns the final
- * AR classifier and the err_out payload). */
+/* Reason for a failed pre-summed pick (nothing was evicted). AR5: the
+ * requester's set is short but the EV-1-only set would fit. Otherwise the
+ * part no permissible eviction can free decides: the pool shortfall when it
+ * exceeds every evictable byte (AR8, owner decision 2026-11-09), else the
+ * physical (AR4) or logical-budget (AR3) shortfall, whichever is larger. */
 static int
-pick_reason(const CuvsEvictPick *pk, int physical_phase)
+pick_reason(const CuvsEvictPick *pk, int physical_phase, uint64_t pool_short)
 {
     if (pk->verdict == CUVS_EVICT_AR5)
         return CUVS_ADMISSION_AR5;
+    if (pool_short > 0 && pk->lru_total < pool_short)
+        return CUVS_ADMISSION_AR8;
     return physical_phase ? CUVS_ADMISSION_AR4 : CUVS_ADMISSION_AR3;
+}
+
+/* RMM pool used bytes now (0 without a pool): the AR8 pool_used when the
+ * admission re-evaluates after an eviction or a self-replace unload. */
+static uint64_t
+admission_pool_used_now(int device_id)
+{
+    CuvsRmmPoolStats st;
+    return cuvs_rmm_pool_stats(device_id, &st) == 0 ? st.used_bytes : 0;
 }
 
 /* Ensure there is enough VRAM on `device_id` for `needed` bytes, evicting
@@ -3291,6 +3305,7 @@ ensure_vram(size_t needed, int device_id, CuvsRequester rq, CuvsAdmissionFields 
     }
     /* AR6/7 consume the original pre-eviction observation once per build.
      * A self-replace second admission reuses it, never a more permissive one. */
+    uint64_t pool_short = 0;
     if (rq == CUVS_RQ_BUILD_CAGRA && line)
     {
         CuvsAdmissionReason wr;
@@ -3302,35 +3317,58 @@ ensure_vram(size_t needed, int device_id, CuvsRequester rq, CuvsAdmissionFields 
         }
         else
             wr = cuvs_admission_workspace_check(&line->workspace);
-        /* AR8 (ADR-089): the pool must hold what is resident now (pool_used,
-         * the same pre-eviction snapshot AR6/AR7 read), what admitted builds
-         * hold (N_m in g_pending_rmm_build_vram, lw_ub in g_lw_pending), and
-         * this build's N_m plus headroom. lw_ub of this build is not a term:
-         * the managed large_workspace is not pool memory. Decided before
-         * AR6/7 and before make_room: a refusal evicts and reserves nothing. */
+        /* AR8 inputs (ADR-089): the pool must hold what is resident now
+         * (pool_used), what admitted builds hold (N_m in
+         * g_pending_rmm_build_vram, lw_ub in g_lw_pending), and this build's
+         * N_m plus headroom. lw_ub of this build is not a term: the managed
+         * large_workspace is not pool memory. pool_used is the pre-eviction
+         * snapshot AR6/AR7 read; a re-evaluation (self-replace after its
+         * unload) reads the pool again. */
         line->pool_need = needed;
-        line->pool_used = line->workspace.pool_used;
+        line->pool_used = line->pool_valid ? admission_pool_used_now(device_id)
+                                           : line->workspace.pool_used;
         line->pool_headroom = cuvs_admission_build_headroom(needed,
                                                             g_rmm_build_headroom_permille);
         line->pool_pending = cuvs_admission_sat_add(pending, g_lw_pending[device_id]);
         line->pool_valid = 1;
+        /* AR6/AR7 before any eviction: a refusal evicts nothing. */
+        if (wr != CUVS_ADMISSION_NONE)
+        {
+            g_last_admit_reason = wr;
+            goto admission_rejected;
+        }
+        /* Owner decision 2026-11-09: a pool shortfall goes to the scope pick
+         * below with the other two, so the scope may evict for it. Eviction
+         * frees resident pool bytes only: a shortfall above pool_used is AR8
+         * now, nothing evicted. */
+        pool_short = cuvs_admission_pool_shortfall(quota, line->pool_pending, line->pool_used,
+                                                   needed, line->pool_headroom);
+        if (pool_short > line->pool_used)
+        {
+            g_last_admit_reason = CUVS_ADMISSION_AR8;
+            goto admission_rejected;
+        }
+    }
+    uint64_t need = budget_short > phys_short ? budget_short : phys_short;
+    if (pool_short > need)
+        need = pool_short;
+    if (need > 0 && make_room(device_id, rq, need, 0, &pk) != 0)
+    {
+        g_last_admit_reason = pick_reason(&pk, phys_short > budget_short, pool_short);
+        goto admission_rejected;
+    }
+    /* AR8 after eviction: the freed entry bytes need not equal the pool bytes
+     * returned (a reloaded index is registered at a graph_degree-64 estimate),
+     * so the pool is read again. */
+    if (pool_short > 0)
+    {
+        line->pool_used = admission_pool_used_now(device_id);
         if (cuvs_admission_pool_refuses(quota, line->pool_pending, line->pool_used,
                                         needed, line->pool_headroom))
         {
             g_last_admit_reason = CUVS_ADMISSION_AR8;
             goto admission_rejected;
         }
-        if (wr != CUVS_ADMISSION_NONE)
-        {
-            g_last_admit_reason = wr;
-            goto admission_rejected;
-        }
-    }
-    uint64_t need = budget_short > phys_short ? budget_short : phys_short;
-    if (need > 0 && make_room(device_id, rq, need, 0, &pk) != 0)
-    {
-        g_last_admit_reason = pick_reason(&pk, phys_short > budget_short);
-        goto admission_rejected;
     }
     if (budget > 0 && total_vram_used(device_id) + needed > budget)
     {

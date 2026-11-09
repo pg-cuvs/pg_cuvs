@@ -66,13 +66,34 @@ class Logs(unittest.TestCase):
         # The four AR8 fields are appended after mono_us, in this order.
         self.assertEqual(list(judge.parse_line(AR8)[1])[-5:],
                          ['mono_us', 'pool_need', 'headroom', 'pool_quota', 'pending'])
-        variants=[AR8.replace('headroom=101','headroom=100'),          # == quota admits
-                  AR8.replace('pool_used=500 ','pool_used=499 '),       # pool_used counts
+        # == quota admits: the arithmetic itself rejects it (not a later rule)
+        with self.assertRaisesRegex(ValueError, 'AR8 arithmetic'):
+            judge.parse_line(AR8.replace('headroom=101','headroom=100'))
+        variants=[AR8.replace('pool_used=500 ','pool_used=499 '),       # pool_used counts
                   AR8.replace('pool_need=100','pool_need=300'),         # != needed (lw_ub added)
-                  AR8.replace('evicted=0','evicted=1'),                 # evicted before AR8
+                  AR8.replace('lru_free=0','lru_free=1'),               # eviction could free it
                   AR8.replace(' pending=300',''),                       # field missing
-                  AR8.replace('reason=AR8','reason=AR6')]               # AR6 while AR8 applies
+                  AR8.replace('reason=AR8','reason=AR7')]               # not the workspace reason
         for text in variants:
+            with self.subTest(text=text):
+                with self.assertRaises(ValueError):judge.parse_line(text)
+    def test_pool_shortfall_order(self):
+        # Owner decision 2026-11-09: AR6/AR7 come before the pool shortfall,
+        # which goes to the build scope (AR5 when the scope forbids victims
+        # the EV-1 set would allow; AR8 when nothing could free it, or after
+        # an eviction left the pool short).
+        self.assertEqual(judge.parse_line(AR8.replace('reason=AR8','reason=AR6'))[1]['reason'], 'AR6')
+        # shortfall 1 above pool_used 0 (pending alone): AR8 even with lru free
+        above = AR8.replace('pool_used=500 ','pool_used=0 ').replace('pending=300','pending=801').replace('lru_free=0','lru_free=999')
+        self.assertEqual(judge.parse_line(above)[1]['reason'], 'AR8')
+        # still short after an eviction
+        self.assertEqual(judge.parse_line(AR8.replace('evicted=0','evicted=1')
+                                          .replace('lru_free=0','lru_free=999'))[1]['reason'], 'AR8')
+        # AR5 for a pool shortfall the EV-1 set covers, nothing evicted
+        ar5 = AR8.replace('reason=AR8','reason=AR5').replace('lru_free=0','lru_free=1')
+        self.assertEqual(judge.parse_line(ar5)[1]['reason'], 'AR5')
+        for text in (AR8.replace('reason=AR8','reason=AR5'),            # lru 0 < shortfall 1
+                     ar5.replace('evicted=0','evicted=1')):             # AR5 never evicts
             with self.subTest(text=text):
                 with self.assertRaises(ValueError):judge.parse_line(text)
     def test_automatic_load_admit_forbidden(self):

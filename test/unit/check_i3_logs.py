@@ -72,22 +72,31 @@ def parse_line(line):
                 raise ValueError('load: reservation changed')
         if row['reason'] == 'AR0' and not n('needed') > n('limit'):
             raise ValueError('admit: AR0 limit does not explain rejection')
-        # ADR-089: pool_need = needed (N_m); AR8 when the pool quota cannot
-        # hold pending + pool_used + pool_need + headroom (pool_used is the
-        # existing field: the same pre-eviction snapshot). Decided before
-        # AR6/AR7 and before eviction.
+        # ADR-089: pool_need = needed (N_m), 0 when AR8 was not evaluated.
+        # The pool shortfall pending + pool_used + pool_need + headroom -
+        # pool_quota (pool_used is the existing field: the pre-eviction
+        # snapshot) goes to the build eviction scope after AR6/AR7 (owner
+        # decision 2026-11-09). A self-replace re-evaluation reads the pool
+        # again, so with self_res > 0 the pool term is not recomputed here.
+        evaluated = n('pool_need') > 0 and n('pool_quota') > 0 and not n('self_res')
+        pool_short = max(0, n('pending') + n('pool_used') + n('pool_need')
+                         + n('headroom') - n('pool_quota')) if evaluated else 0
         ar8 = n('pool_quota') > 0 and (n('pending') + n('pool_used') + n('pool_need')
                                       + n('headroom') > n('pool_quota'))
         if row['reason'] == 'AR8':
             if n('quota') and n('pending_before') + n('needed') > n('quota'):
                 raise ValueError('admit: AR1 takes precedence over AR8')
-            if n('pool_need') != n('needed') or not ar8 or n('evicted'):
+            if n('pool_need') != n('needed') or not ar8:
                 raise ValueError('admit: AR8 arithmetic/order differs')
+            # Refused before eviction only when no permissible eviction could
+            # free the pool shortfall: above pool_used, or beyond every
+            # evictable byte. evicted > 0: still short when read again.
+            if evaluated and not n('evicted') and not (
+                    pool_short > n('pool_used') or n('lru_free') < pool_short):
+                raise ValueError('admit: AR8 refused a pool shortfall eviction could free')
         if row['reason'] in ('AR6', 'AR7'):
             if n('quota') and n('pending_before') + n('needed') > n('quota'):
                 raise ValueError('admit: AR1 takes precedence over workspace rejection')
-            if ar8:
-                raise ValueError('admit: AR8 takes precedence over workspace rejection')
             growth = max(0, n('needed') - max(0, n('reserved') - n('pool_used')))
             spill = max(0, growth + n('lw_ub') + n('lw_pending') - n('phys_free'))
             expected_reason = ('AR6' if spill > 0 else 'none') if row['overcommit'] == 'off' else ('AR7' if spill > n('host_guard') else 'none')
@@ -95,7 +104,7 @@ def parse_line(line):
                 raise ValueError('admit: workspace rejection/order/snapshot differs')
         if row['reason'] == 'AR5':
             shortage = max(max(0, n('logical_used') + n('needed') - n('budget')) if n('budget') else 0,
-                           max(0, n('needed') - n('free_net')))
+                           max(0, n('needed') - n('free_net')), pool_short)
             if n('evicted') or n('lru_free') < shortage:
                 raise ValueError('admit: AR5 cannot be solved by scope lru')
     if tag == 'build_oom' and row['action'] != 'fail_no_evict':
