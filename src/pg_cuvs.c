@@ -94,6 +94,7 @@
 #include "cuvs_hnsw_build_common.h"
 #include "cuvs_status_text.h"   /* I3-B status text parsing */
 #include "cuvs_route_preflight.h"
+#include "cuvs_vacuum_policy.h"   /* amvacuumcleanup: no compaction on ANALYZE */
 
 PG_MODULE_MAGIC;
 
@@ -5354,11 +5355,16 @@ cuvs_ambulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
     return stats;
 }
 
-/* VACUUM calls amvacuumcleanup once per index. A CAGRA index is an immutable
- * GPU snapshot (rebuilt only by REINDEX), so there is nothing to clean up —
- * but the handler must exist, otherwise VACUUM (and autovacuum) ERROR with
- * "function amvacuumcleanup is not defined" on any table that has a cagra
- * index. Return stats unchanged (NULL when no ambulkdelete ran). */
+/* amvacuumcleanup runs once per index after VACUUM (and autovacuum), and also
+ * from ANALYZE (and autoanalyze) with info->analyze_only set. After a VACUUM,
+ * an index that has a .tombstone file is sent COMPACT (69f31f3), which purges
+ * the tombstoned vectors; failure is ignored (the tombstone stays and the
+ * bitset filter keeps covering the dead rows). An ANALYZE does no index work,
+ * as in btree: it returns before any compaction (cuvs_vacuum_policy.h).
+ * cuvs.auto_compact does not gate this; it controls the background REINDEX on
+ * delta growth. Returns stats unchanged (NULL when no ambulkdelete ran). The
+ * handler must exist: without it VACUUM errors with "function amvacuumcleanup
+ * is not defined" on any table that has one of these indexes. */
 static IndexBulkDeleteResult *
 cuvs_amvacuumcleanup(IndexVacuumInfo *info, IndexBulkDeleteResult *stats)
 {
@@ -5367,8 +5373,10 @@ cuvs_amvacuumcleanup(IndexVacuumInfo *info, IndexBulkDeleteResult *stats)
     char     tpath[MAXPGPATH];
     struct   stat st;
 
-    if (cuvs_socket_path && cuvs_socket_path[0] != '\0' &&
-        !cuvs_index_is_stale(index_oid))
+    if (!cuvs_vacuum_cleanup_considers_compact(info->analyze_only,
+                                               cuvs_socket_path && cuvs_socket_path[0] != '\0'))
+        return stats;
+    if (!cuvs_index_is_stale(index_oid))
     {
         cuvs_tombstone_path(index_oid, tpath, sizeof(tpath));
         if (stat(tpath, &st) == 0)
