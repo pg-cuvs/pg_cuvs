@@ -12268,8 +12268,8 @@ main(int argc, char **argv)
              cuvs_hnsw_overflow_name(g_hnsw_auto_overflow),
              cuvs_hnsw_overflow_name(CUVS_HNSW_AUTO_OVERFLOW_DEFAULT));
     if (g_hnsw_ace_quality == CUVS_HNSW_ACE_QUALITY_AUTO)
-        LOG_INFO("HNSW ACE build quality: auto (--hnsw-ace-build-quality; SDK default "
-                 "ace ef_construction scaled with ef_construction)\n");
+        LOG_INFO("HNSW ACE build quality: auto (--hnsw-ace-build-quality; 16 x (SDK default "
+                 "NN-descent iterations - 5) scaled with ef_construction)\n");
     else
         LOG_INFO("HNSW ACE build quality: %u (--hnsw-ace-build-quality; SDK ace "
                  "ef_construction %u for every ACE build)\n", g_hnsw_ace_quality,

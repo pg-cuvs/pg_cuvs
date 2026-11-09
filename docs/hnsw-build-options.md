@@ -38,7 +38,7 @@ ACE 메타데이터에는 SDK 자체 planner가 산출하고 재소비해도 유
 
 ## ef_construction
 
-기본 64는 검증된 실제 설정을 유지한다: resident 중간 차수 128, hierarchy 200, ACE 120(아래 절).
+기본 64는 검증된 실제 설정을 유지한다: resident 중간 차수 128, hierarchy 200. ACE 품질은 아래 절의 규칙으로 240이다.
 값을 바꾸면 각 기준값에 `ef_construction / 64`를 곱하고 올림한다.
 중간 차수는 최종 차수 이상, 4096 이하 및 데이터 행 수 범위로 제한한다.
 Hierarchy와 ACE 요청 설정은 4–65535 범위다. hnswlib는 native ef를 M 이상으로 제한하며 영수증에는 직렬화된 실제 값을 기록한다. 훈련 비율, probe 수, seed는 이 옵션으로 바꾸지 않는다.
@@ -50,8 +50,8 @@ Hierarchy와 ACE 요청 설정은 4–65535 범위다. hnswlib는 native ef를 M
 
 ACE는 데이터를 겹치는 조각으로 나눠 조각마다 kNN 그래프를 만든 뒤 합친다. cuVS 26.04는 ACE 품질 값 A(영수증 `ace_ef_construction`)를 q = A / 16으로만 쓰며, 100만 행 미만 조각은 NN-descent를 최대 5 + q회 반복한다.
 
-- 데몬 기본 `--hnsw-ace-build-quality auto`: A는 링크한 SDK의 `ace_params` 기본값(cuVS 26.04에서 120, 조각당 12회)이며 다른 `ef_construction`은 `ef_construction / 64` 비율로 올림한다(128이면 240). 4–65535 범위로 제한한다. 노브가 생기기 전과 같은 값이다.
-- 999,000×768, `ef_construction` 64에서 이 기본값의 ACE는 낮은 `hnsw.ef_search`의 recall@10이 같은 데이터의 resident IVF-PQ보다 0.01 넘게 낮을 수 있다. 품질을 올리려면 `ef_construction`을 올리거나 `--hnsw-ace-build-quality`로 q를 고정한다(q가 크면 빌드가 길어지고, `ef_search`별 지연은 resident와 다르게 움직인다).
+- 데몬 기본 `--hnsw-ace-build-quality auto`: `ef_construction` 64에서 조각의 NN-descent가 전체 데이터 NN-descent의 기본 반복 수(링크한 SDK의 `nn_descent::index_params` 기본값, cuVS 26.04에서 20)만큼 돌도록 q = 20 - 5 = 15, A = 240으로 정한다. 다른 `ef_construction`은 A를 `ef_construction / 64` 비율로 올림한다(128이면 480). 4–65535 범위로 제한한다.
+- 이전 규칙은 SDK `ace_params` 기본값 A = 120(12회)을 썼다. 999,000×768, `ef_construction` 64에서 이 값은 낮은 `hnsw.ef_search`의 recall@10이 같은 데이터의 resident IVF-PQ보다 0.01 넘게 낮았다(UC-5 기준 미달).
 - `--hnsw-ace-build-quality Q`(0–4095)는 모든 ACE 빌드에 A = 16 × Q를 쓴다. `ef_construction`과 무관한 진단·고정용 값이다. 시작할 때 로그에 남고, 재시작해야 바뀐다.
 - 조각의 kNN 폭은 SDK 그대로 3 × (graph_degree / 2), degree 64에서 96이다. 영수증의 `intermediate_degree`(128)는 resident 경로의 폭이자 ACE 메모리 계획에 넘기는 값이며, ACE 조각이 kNN 생성과 최적화에 실제로 쓰는 폭이 아니다. 조각 폭을 128로 넓히는 SDK 수정은 같은 데이터에서 12회와 20회 반복 모두 recall을 낮춰 채택하지 않았다.
 - `build_algo=auto`의 ACE 넘침 기본값, 예산 가드, NOTICE는 바뀌지 않는다. ACE와 resident의 recall·지연 차이는 데이터와 `ef_search`에 따라 다르다.

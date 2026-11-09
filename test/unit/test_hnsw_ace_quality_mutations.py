@@ -14,11 +14,15 @@ RT = os.environ.get('TEST_RT_LIB', '-lrt' if sys.platform.startswith('linux') el
 
 H = 'cuvs_hnsw_policy.h'
 MUTATIONS = {
-    # auto must read the linked SDK's ace_params default, not a literal.
-    'auto_literal_120': (H, 'return cuvs_hnsw_scaled_quality(sdk_default_ace_ef, ef, 4, 65535);',
-                         'return cuvs_hnsw_scaled_quality(120, ef, 4, 65535);'),
-    'auto_ignores_ef_construction': (H, 'return cuvs_hnsw_scaled_quality(sdk_default_ace_ef, ef, 4, 65535);',
-                                     'return sdk_default_ace_ef;'),
+    # auto must derive q from the linked SDK's NN-descent default, not a literal A.
+    'auto_literal_240': (H, 'return cuvs_hnsw_scaled_quality(q * CUVS_HNSW_SDK_ACE_QUALITY_DIVISOR, ef, 4, 65535);',
+                         'return cuvs_hnsw_scaled_quality(240, ef, 4, 65535);'),
+    'auto_sdk_ace_default_120': (H, 'return cuvs_hnsw_scaled_quality(q * CUVS_HNSW_SDK_ACE_QUALITY_DIVISOR, ef, 4, 65535);',
+                                 'return cuvs_hnsw_scaled_quality(120, ef, 4, 65535);'),
+    'auto_iteration_offset_dropped': (H, '            ? sdk_nn_iterations - CUVS_HNSW_SDK_ACE_NN_ITERATION_OFFSET : 0;',
+                                      '            ? sdk_nn_iterations : 0;'),
+    'auto_ignores_ef_construction': (H, 'return cuvs_hnsw_scaled_quality(q * CUVS_HNSW_SDK_ACE_QUALITY_DIVISOR, ef, 4, 65535);',
+                                     'return q * CUVS_HNSW_SDK_ACE_QUALITY_DIVISOR;'),
     'manual_scaled_by_ef_construction': (H, '    return setting * CUVS_HNSW_SDK_ACE_QUALITY_DIVISOR;\n}',
                                          '    return cuvs_hnsw_scaled_quality(setting * 16, ef, 4, 65535);\n}'),
     'parser_accepts_4096': (H, '    if (q > CUVS_HNSW_ACE_QUALITY_MAX) return -1;\n', ''),
