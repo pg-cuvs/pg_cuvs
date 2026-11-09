@@ -64,6 +64,13 @@ MUTANTS = [
     ('disk_precheck_missing', 'cuvs_hnsw_build_common.h',
      '    f->disk_ok = f->status == CUVS_STATUS_OK && disk_regular && disk_avail >= f->disk_need;',
      '    f->disk_ok = f->status == CUVS_STATUS_OK;'),
+    # v5 C5 / v6 C2: the disk refusal text is a contract (Q4-4 prefix match)
+    ('disk_refusal_prefix_reverted', 'cuvs_hnsw_build_common.h',
+     '#define CUVS_HNSW_DISK_REFUSAL_PREFIX "HNSW needs regular disk capacity: "',
+     '#define CUVS_HNSW_DISK_REFUSAL_PREFIX "HNSW needs regular disk: "'),
+    ('disk_refusal_fs_dropped', 'cuvs_hnsw_build_common.h',
+     '"need=%llu avail=%llu fs=%s route=%s",\n                 (unsigned long long)f->disk_need, (unsigned long long)disk_avail,\n                 disk_regular ? "regular" : "tmpfs",',
+     '"need=%llu avail=%llu fs=%s route=%s",\n                 (unsigned long long)f->disk_need, (unsigned long long)disk_avail,\n                 "regular",'),
     ('disk_formula_changed', 'cuvs_hnsw_build_common.h',
      '    return raw * 4 + n * (degree * 8ULL + 64);', '    return raw * 2 + n * (degree * 8ULL + 64);'),
     ('cagra_ar0_refuses_without_stats', 'cuvs_route_preflight.h',

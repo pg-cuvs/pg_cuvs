@@ -433,7 +433,12 @@ cuvs_hnsw_forecast_route(uint64_t n, uint32_t dim, uint32_t graph_degree,
 
 /* Disk precheck for a decided route. The pre-spool forecast calls it on the
  * daemon's index directory so an insufficient disk fails BEFORE the backend
- * spools (JI-21); the daemon repeats the same check on the private workdir. */
+ * spools (JI-21); the daemon repeats the same check on the private workdir.
+ * Refusal text (v5 C5, v6 C2 "hnsw 전 route 공통"):
+ *   HNSW needs regular disk capacity: need=<u> avail=<u> fs=<tmpfs|regular> route=<s>
+ * need/avail are bytes; fs tells a tmpfs refusal (avail may be >= need) from
+ * a capacity refusal. The backend matches the prefix to attach its HINT. */
+#define CUVS_HNSW_DISK_REFUSAL_PREFIX "HNSW needs regular disk capacity: "
 static inline int
 cuvs_hnsw_forecast_disk(CuvsHnswForecast *f, int disk_regular,
     uint64_t disk_avail, char *error, size_t error_len)
@@ -442,7 +447,7 @@ cuvs_hnsw_forecast_disk(CuvsHnswForecast *f, int disk_regular,
     f->disk_ok = f->status == CUVS_STATUS_OK && disk_regular && disk_avail >= f->disk_need;
     if (f->status == CUVS_STATUS_OK && !f->disk_ok)
     {
-        snprintf(error, error_len, "HNSW needs regular disk: need=%llu avail=%llu fs=%s route=%s",
+        snprintf(error, error_len, CUVS_HNSW_DISK_REFUSAL_PREFIX "need=%llu avail=%llu fs=%s route=%s",
                  (unsigned long long)f->disk_need, (unsigned long long)disk_avail,
                  disk_regular ? "regular" : "tmpfs", cuvs_hnsw_route_name(f->decision.route));
         f->status = CUVS_STATUS_BUILD_FAILED;
