@@ -313,7 +313,9 @@ room, the build is refused with AR5 and nothing is evicted (the default scope `n
 always lands here). AR8 refuses when no eviction could free the pool shortfall (it
 exceeds the resident pool use or every evictable index), with nothing evicted, or when
 the pool, read again after an eviction, is still short. Nothing is reserved on a
-refusal. Without a pool quota AR8 never applies. Sharded builds, reloads and manual
+refusal. A REINDEX whose pool is short does not unload its own old copy (§ 8.5
+self-replace applies only when the pool fits), and an AR5 decided by the pool
+shortfall carries no "wait for reclaim" hint. Without a pool quota AR8 never applies. Sharded builds, reloads and manual
 loads do not run it.
 
 `pg_stat_gpu_search.vram_bytes` estimates retained dataset/graph memory; it does

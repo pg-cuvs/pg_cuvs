@@ -3898,7 +3898,10 @@ large_workspace는 `LwManagedResource`가 `managed_memory_resource`를 직접 �
 **열린 결정(self-replace):** REINDEX로 상주 중인 index를 다시 만들 때 그 index의 현재 사본이
 `pool_used`에 잡혀 AR8로 거부될 수 있고, self-replace는 AR8을 재시도하지 않는다. 이 경우
 `self_res`(교체될 옛 사본)를 AR8 비교에서 뺄지는 소유자에게 남긴 열린 결정이다(conch 6f0bb6fa:
-이번 변경은 보수적 거부를 유지하고, HINT가 옛 사본이 pool used에 포함됨을 알린다).
+이번 변경은 보수적 거부를 유지하고, HINT가 옛 사본이 pool used에 포함됨을 알린다). 2026-11-09
+개정 뒤에도 같다: 풀이 부족한 빌드는 사유가 AR5·AR3·AR4여도 self-replace하지 않는다(그 판정의
+부족분에는 풀 항이 없어, 옛 사본을 내려도 충분하다는 근거가 없기 때문이다). 그런 AR5는 회수가
+풀을 겨누지 않으므로 err_out `r`을 0으로 둔다(대기 힌트 없음).
 
 **후속 기록(코드 아님):** 처음 판에서 `make_room`의 축출 목표는 `N_m`뿐(논리 예산·물리 여유
 부족분)이었고, 풀이 모자라면 AR8이 축출 전에 거부해 풀 부족을 축출로 푸는 경로가 없었다(run

@@ -1074,13 +1074,22 @@ typedef struct AdmitLine {
     /* ADR-089 AR8 inputs, set by ensure_vram for a CAGRA build. */
     int         pool_valid;
     uint64_t    pool_need, pool_headroom, pool_pending, pool_used;
+    /* Last evaluation's pool shortfall (0 = the pool fits) and whether it
+     * was the largest of the three shortfalls make_room was asked for. */
+    uint64_t    pool_short;
+    int         pool_bound;
 } AdmitLine;
 
-/* AR8 err_out subset: n = N_m, q = pool quota, p = pending, o = pool used,
- * d = headroom (ADR-089). Other reasons are left as filled. */
+/* AR8 err_out subset: n = N_m, q = pool quota, p = pending, o = pool used
+ * (read again after an eviction), d = headroom (ADR-089). An AR5 decided by
+ * the pool shortfall keeps the AR5 fields but r = 0: background reclaim
+ * targets the logical budget, not the pool, so no wait hint. Other reasons
+ * are left as filled. */
 static void
 admission_pool_fields(CuvsAdmissionFields *f, const AdmitLine *a, int dev)
 {
+    if (f->reason == CUVS_ADMISSION_AR5 && a->pool_valid && a->pool_bound)
+        f->r = 0;
     if (f->reason != CUVS_ADMISSION_AR8 || !a->pool_valid)
         return;
     f->n = cuvs_admission_mib(a->pool_need);
@@ -3343,6 +3352,8 @@ ensure_vram(size_t needed, int device_id, CuvsRequester rq, CuvsAdmissionFields 
          * now, nothing evicted. */
         pool_short = cuvs_admission_pool_shortfall(quota, line->pool_pending, line->pool_used,
                                                    needed, line->pool_headroom);
+        line->pool_short = pool_short;
+        line->pool_bound = pool_short > budget_short && pool_short > phys_short;
         if (pool_short > line->pool_used)
         {
             g_last_admit_reason = CUVS_ADMISSION_AR8;
@@ -3442,6 +3453,8 @@ admit_build_cagra(size_t needed, int device_id, uint32_t db_oid,
     *unloaded = 0;
     line->workspace_valid = 0;
     line->pool_valid = 0;
+    line->pool_short = 0;
+    line->pool_bound = 0;
     line->cache_valid = 0;
     line->self_res = 0;
     g_build_notice[0] = '\0';
@@ -3466,9 +3479,14 @@ admit_build_cagra(size_t needed, int device_id, uint32_t db_oid,
         shortfall = used + needed - budget;
     if (needed > fr && needed - fr > shortfall)
         shortfall = needed - fr;
+    /* ADR-089 open decision (self_res against the pool) stays conservative:
+     * a build whose pool is short never self-replaces, whatever the reason
+     * (AR8, or AR5/AR3/AR4 since the 2026-11-09 order); shortfall above
+     * counts no pool term, so unloading could not be shown to suffice. */
     if (reason == CUVS_ADMISSION_AR0 || reason == CUVS_ADMISSION_AR1 ||
         reason == CUVS_ADMISSION_AR2 || reason == CUVS_ADMISSION_AR6 ||
         reason == CUVS_ADMISSION_AR7 || reason == CUVS_ADMISSION_AR8 ||
+        line->pool_short > 0 ||
         cuvs_self_replace_decide(shortfall, has_old, has_old && old->pinned,
                                  old_bytes, g_reclaim.self_replace)
             != CUVS_SELF_REPLACE)
