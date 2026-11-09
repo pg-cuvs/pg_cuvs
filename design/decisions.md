@@ -3851,6 +3851,14 @@ large_workspace는 `LwManagedResource`가 `managed_memory_resource`를 직접 �
    재확인(**AR8**) 순서로 판정한다(2026-11-09 개정 전에는 AR8이 AR6/AR7과 축출보다 앞이었다).
    풀 부족분 = `pending + pool_used + N_m + headroom - quota`(quota > 0일 때)이고, 0보다 크면
    - 축출은 상주 풀 바이트만 돌려주므로 부족분이 `pool_used`보다 크면 축출 없이 AR8이다.
+   - 입장 밖의 풀 할당기가 그 장치에서 활성이면 축출 없이 AR8이다(SR-B1, 2026-11-09 추가).
+     활성은 `g_pending_rmm_build_vram`·`g_lw_pending`이 0이 아니거나(입장한 CAGRA 빌드),
+     `g_unlocked_gpu_jobs`가 0이 아니거나(lock-free GPU 작업), 그 장치 항목에 `inflight > 0`이
+     있는 경우다. 이들은 `g_index_mutex` 밖에서 풀을 키울 수 있어, 축출 뒤 재확인의 AR8이
+     축출 부족을 뜻하지 않게 되고 헛된 축출(ADR-086 위반)이 된다. 같은 규칙을 REINDEX
+     self-replace의 AR8 경로에 둔 것이 `ysys143/i3a-self-replace` 6eb0009(SR-B1)이다.
+     부족분 산식 `cuvs_admission_pool_shortfall`은 같은 브랜치 bcc30f1의
+     `cuvs_admission_pool_short`와 같다(같은 포화 합, 같은 항 순서, `quota == 0`이면 0).
    - 아니면 부족분을 논리 예산·물리 여유 부족분과 함께 make_room의 사전 합산 선택에 넘긴다
      (목표는 셋 중 최대). scope가 허용하는 상주를 내리고 입장하거나, scope 집합으로는 모자라고
      EV-1만 적용한 집합이면 충분하면 AR5(아무것도 내리지 않는다), 그 집합으로도 풀 부족분을

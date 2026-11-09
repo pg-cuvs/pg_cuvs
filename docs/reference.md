@@ -321,7 +321,10 @@ admitted; if the scope allows too few but evicting idle unpinned indexes would m
 room, the build is refused with AR5 and nothing is evicted (the default scope `none`
 always lands here). AR8 refuses when no eviction could free the pool shortfall (it
 exceeds the resident pool use or every evictable index), with nothing evicted, or when
-the pool, read again after an eviction, is still short. Nothing is reserved on a
+the pool, read again after an eviction, is still short. AR8 also refuses with nothing
+evicted while another build or lock-free GPU job (a sharded search, an HNSW export) is
+using the same GPU's pool: that work can grow the pool during the eviction, so the
+eviction might free nothing usable. Nothing is reserved on a
 refusal. A REINDEX whose pool is short does not unload its own old copy (§ 8.5
 self-replace applies only when the pool fits), and an AR5 decided by the pool
 shortfall carries no "wait for reclaim" hint. Without a pool quota AR8 never applies. Sharded builds, reloads and manual
