@@ -403,11 +403,11 @@ static uint32_t g_rmm_pool_mb     = 0;   /* CPU fixture has no GPU allocator */
 static uint32_t g_rmm_pool_mb     = 512; /* initial reservation per usable GPU */
 #endif
 static uint32_t g_rmm_pool_max_percent = 50;
-/* C3 provisional coefficient; Q1-DERIVED.json supplies the calibrated
- * value at H_M. Keep this the only numeric default definition. */
+/* C3 coefficient rho. Released default = Q1 rho* (A100-SXM4-80GB, overflow
+ * managed), changed only on this line (C6); the only numeric default. */
 #define CUVS_RMM_SCRATCH_PERMILLE_DEFAULT 7726
-/* Provisional coefficient came from the I2 in-pool workspace measurements.
- * Q1 changes this binding together with the measured default coefficient. */
+/* The overflow policy rho* was measured under. A daemon started with another
+ * --cagra-build-overflow logs "scratch model unvalidated" at startup. */
 #define CUVS_RMM_SCRATCH_VALIDATED_OVERFLOW_POLICY CUVS_LW_OVERFLOW_MANAGED
 static uint32_t g_scratch_permille = CUVS_RMM_SCRATCH_PERMILLE_DEFAULT;
 /* ADR-087 (UC-5): build_algo=auto over the resident budget spills to ACE
@@ -12204,7 +12204,7 @@ main(int argc, char **argv)
             at += (size_t)snprintf(budgets + at, sizeof(budgets) - at, "%s%zu",
                 i ? "," : "", g_max_vram_per_gpu[usable_gpu(i)] / (1024u * 1024u));
         LOG_INFO("build admission model: scratch_permille=%u validated_overflow_policy=%s "
-                 "validated_rows=999000 validated_dim=768 validated_gpu=\"NVIDIA A100 80GB PCIe\" "
+                 "validated_rows=999000 validated_dim=768 validated_gpu=\"NVIDIA A100-SXM4-80GB\" "
                  "validated_quota_percent=50 overflow=%s overcommit=%s lw_margin_permille=%u "
                  "evict_scope=%s hnsw_auto_overflow=%s dedicated_stream=%s peak_meter=%s "
                  "rmm_pool_mb=%u rmm_pool_max_percent=%u evict_min_idle_s=%lld "
