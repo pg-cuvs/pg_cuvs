@@ -996,6 +996,19 @@ test-ar8-daemon:
 		-Wl,--gc-sections -lm -lpthread -lrt -lcurl -lssl -lcrypto -o test-ar8-daemon
 	./test-ar8-daemon
 
+# hnsw route decisions through the actual daemon source (Linux CPU CI): op 40
+# and op 23 (real client) send the status-13 DETAIL bytes he hb ge gb rp rl,
+# the plan's disk refusal text, and the decided route on [hnsw_route].
+EXTRA_CLEAN += test-hnsw-route-daemon
+.PHONY: test-hnsw-route-daemon
+test-hnsw-route-daemon:
+	$(CC) -std=gnu11 -O1 -DPGCUVS_CPU_SHIM -ffunction-sections -fdata-sections -I src \
+		test/unit/test_hnsw_route_daemon.c src/cuvs_ipc.c src/cuvs_util.c \
+		src/cuvs_objstore.c src/cuvs_build_corpus.c src/cuvs_wrapper_shim_cpu.c \
+		src/cuvs_cache_policy.c src/cuvs_peak_meter.c \
+		-Wl,--gc-sections -lm -lpthread -lrt -lcurl -lssl -lcrypto -o test-hnsw-route-daemon
+	./test-hnsw-route-daemon
+
 # Each planted AR8 defect must turn an AR8 test RED. The daemon cases need
 # Linux (elsewhere they are SKIP and the run fails). AR8_MUTATION_OUT must be
 # a new directory.

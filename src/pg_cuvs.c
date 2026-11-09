@@ -2801,12 +2801,17 @@ cuvs_hnsw_transition_notice(uint64_t host_est, uint64_t host_budget,
          errhint("Set build_algo='ivf_pq' or start the daemon with --hnsw-auto-overflow error to refuse instead.")));
 }
 
+/* hnsw status 13 (v5 C5, v6 C5): the DETAIL is exactly the six MiB fields
+ * he hb ge gb rp rl (cuvs_hnsw_budget_detail); the daemon's reason text and
+ * exact bytes are on its [hnsw_route] line. */
 static void
-cuvs_hnsw_budget_error(uint32_t build_algo, const char *error, const char *when)
+cuvs_hnsw_budget_error(uint32_t build_algo, const CuvsHnswBudgetSnapshot *budget)
 {
+    char detail[CUVS_HNSW_BUDGET_DETAIL_MAX + 1];
+    (void)cuvs_hnsw_budget_detail(detail, sizeof(detail), budget);
     ereport(ERROR, (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
         errmsg("pg_cuvs: resident IVF-PQ estimate exceeds the HNSW build budget"),
-        errdetail("%s; decided %s.", error, when),
+        errdetail("%s", detail),
         build_algo == CUVS_HNSW_ALGO_AUTO
         ? errhint("Use build_algo=ace for an explicit disk build; this daemon refuses auto overflow (--hnsw-auto-overflow error), or ACE needs at least 256 rows.")
         : errhint("Use build_algo=ace for an explicit disk build; explicit ivf_pq never spills to ACE.")));
@@ -2841,18 +2846,30 @@ cuvs_hnsw_preflight(double rows, uint32_t dim, uint32_t hierarchy, uint32_t buil
                         || action == CUVS_HNSW_PRESPOOL_REJECT))
         return CUVS_HNSW_PRESPOOL_FALLBACK; /* the build op stays authoritative */
     if (action == CUVS_HNSW_PRESPOOL_REJECT_BUDGET)
-        cuvs_hnsw_budget_error(build_algo, reply.header.error, when);
+    {
+        CuvsHnswBudgetSnapshot budget = cuvs_hnsw_preflight_budget(&reply);
+        cuvs_hnsw_budget_error(build_algo, &budget);
+    }
+    /* v5 C5 / Q4-4: the disk refusal is the message itself; status 5 stays
+     * XX000 (UC-2 sub-question on its SQLSTATE is open). */
+    if (action == CUVS_HNSW_PRESPOOL_REJECT && cuvs_hnsw_disk_refusal(rc, reply.header.error))
+        ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR),
+                        errmsg("%s", reply.header.error),
+                        errdetail("Decided %s; no rows were spooled.", when),
+                        errhint("%s", CUVS_HNSW_DISK_HINT)));
     if (action == CUVS_HNSW_PRESPOOL_REJECT)
+    {
+        CuvsHnswBudgetSnapshot budget = cuvs_hnsw_preflight_budget(&reply);
+        char detail[CUVS_HNSW_BUDGET_DETAIL_MAX + 1];
+        (void)cuvs_hnsw_budget_detail(detail, sizeof(detail), &budget);
         ereport(ERROR, (errcode(cuvs_hnsw_prespool_budget_refusal(&reply)
                                ? ERRCODE_PROGRAM_LIMIT_EXCEEDED : ERRCODE_INTERNAL_ERROR),
                         errmsg("pg_cuvs: temporary HNSW build failed (status %d): %s",
                                rc, reply.header.error),
-                        errdetail("he=%llu hb=%llu ge=%llu gb=%llu; decided %s; no rows were spooled.",
-                                  (unsigned long long)reply.host_estimate,
-                                  (unsigned long long)reply.host_budget,
-                                  (unsigned long long)reply.gpu_estimate,
-                                  (unsigned long long)reply.gpu_budget, when),
-                        errhint("If the table statistics are stale, run ANALYZE and retry.")));
+                        errdetail("%s", detail),
+                        errhint("The forecast ran %s and no rows were spooled; if the table statistics are stale, run ANALYZE and retry.",
+                                when)));
+    }
     if (action == CUVS_HNSW_PRESPOOL_NOTICE_OVERFLOW)
         cuvs_hnsw_transition_notice(reply.host_estimate, reply.host_budget,
             reply.gpu_estimate, reply.gpu_budget, reply.disk_need, reply.disk_avail,
@@ -2897,6 +2914,7 @@ cuvs_build_hnsw_from_heap(Relation heapRel, Relation indexRel, IndexInfo *indexI
         int rc;
         uint32_t hierarchy = strcmp(mode, "nsw") != 0;
         uint32_t notices;
+        CuvsHnswBudgetSnapshot budget;
         char when[96];
         /* UC-5 / ADR-087 decision 4: with statistics, decide the route (and
          * the disk precheck) BEFORE the heap scan and announce it (PN-1).
@@ -2961,16 +2979,21 @@ cuvs_build_hnsw_from_heap(Relation heapRel, Relation indexRel, IndexInfo *indexI
             rc = cuvs_ipc_build_hnsw_file(cuvs_socket_path,
                 FileGetRawDesc(spool->vectors), spool->n, spool->dim, spool->metric,
                 64, 128, hierarchy, cap,
-                build_algo, ef_construction, &out->policy,
+                build_algo, ef_construction, &out->policy, &budget,
                 &out->hnsw_fd, error, sizeof(error));
             if (rc == CUVS_STATUS_HNSW_RESIDENT_BUDGET_EXCEEDED)
-                cuvs_hnsw_budget_error(build_algo, error, "by the build after the heap scan");
+                cuvs_hnsw_budget_error(build_algo, &budget);
             if (rc == CUVS_STATUS_CANCELED) CHECK_FOR_INTERRUPTS();
             if (rc == CUVS_STATUS_OOM_FALLBACK) /* v6 C2: allocation failure after admission */
                 ereport(ERROR, (errcode(ERRCODE_OUT_OF_MEMORY), /* 53200 */
                     errmsg("pg_cuvs: memory exhausted during the HNSW build; CREATE INDEX aborted. No resident index was evicted"),
                     errdetail("%s", error),
                     errhint("%s", cuvs_hnsw_oom_hint(build_algo))));
+            if (cuvs_hnsw_disk_refusal(rc, error)) /* v5 C5: the daemon's workdir check */
+                ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR),
+                                errmsg("%s", error),
+                                errdetail("Decided by the build after the heap scan."),
+                                errhint("%s", CUVS_HNSW_DISK_HINT)));
             if (rc != CUVS_STATUS_OK)
                 ereport(ERROR, (errmsg("pg_cuvs: temporary HNSW build failed (status %d): %s", rc, error)));
             out->policy.route_flags |= cuvs_hnsw_timing_flags(stats_rows, prespool);

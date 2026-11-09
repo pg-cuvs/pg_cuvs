@@ -114,11 +114,14 @@ static inline int cuvs_hnsw_file_request_supported(const CuvsHnswFileRequest *r)
         && r->ef_construction >= 4 && r->ef_construction <= 1000;
 }
 
+/* budget (nullable) receives the daemon's decision bytes from any reply,
+ * including a refusal; it is zeroed when no reply arrived. */
+struct CuvsHnswBudgetSnapshot;
 int cuvs_ipc_build_hnsw_file(const char *socket_path, int vectors_fd,
     uint64_t n_vecs, uint32_t dim, uint32_t metric, uint32_t graph_degree,
     uint32_t intermediate_degree, uint32_t hierarchy, uint64_t host_budget,
     uint32_t build_algo, uint32_t ef_construction, CuvsHnswPolicy *policy,
-    int *hnsw_fd, char *error, size_t error_len);
+    struct CuvsHnswBudgetSnapshot *budget, int *hnsw_fd, char *error, size_t error_len);
 #define CUVS_OP_SERVER_SETTINGS    24 /* read-only daemon startup settings */
 #define CUVS_OP_RMM_POOL_STATUS    25 /* quota and live pool counters */
 
@@ -272,14 +275,29 @@ _Static_assert(CUVS_PROTO_VERSION == CUVS_ADMISSION_IPC_VERSION,
 const char *cuvs_ipc_last_err_out(void);
 const char *cuvs_ipc_last_notice_out(void);
 
-/* Only BUILD_HNSW_FILE v3 uses this receipt; global v3 stays unchanged. */
+/* The bytes an hnsw route decision used, for the status-13 DETAIL (v5 C5:
+ * he hb ge gb rp rl). pool_used = RMM pool used_bytes at the decision (0
+ * without a pool); logical_used = total_vram_used, the logical use the GPU
+ * budget subtracted (0 when the preflight could not take the registry lock,
+ * gpu_static = 1). All zero when the request failed before a decision. */
+typedef struct CuvsHnswBudgetSnapshot {
+    uint64_t host_estimate, host_budget;
+    uint64_t gpu_estimate, gpu_budget;
+    uint64_t pool_used, logical_used;
+} CuvsHnswBudgetSnapshot;
+
+/* Only BUILD_HNSW_FILE v3 uses this receipt; global v3 stays unchanged.
+ * budget is appended after the stored receipt (the receipt layout is not
+ * touched); extension and daemon are deployed together (ADR-081). */
 typedef struct CuvsHnswFileReply {
     CuvsReplyHeader header;
     CuvsHnswPolicy policy;
+    CuvsHnswBudgetSnapshot budget;
 } CuvsHnswFileReply;
 
-/* I3-C pre-spool forecast payloads (ops 40, 41 above). */
-#define CUVS_HNSW_PREFLIGHT_VERSION 1u
+/* I3-C pre-spool forecast payloads (ops 40, 41 above). Version 2 appends
+ * pool_used and logical_used to the reply (status-13 DETAIL rp, rl). */
+#define CUVS_HNSW_PREFLIGHT_VERSION 2u
 /* Sent after the command frame. n_estimate is ceil(pg_class.reltuples). */
 typedef struct CuvsHnswPreflightRequest {
     uint32_t version;
@@ -313,6 +331,7 @@ typedef struct CuvsHnswPreflightReply {
     uint64_t host_estimate, gpu_estimate, host_budget, gpu_budget;
     uint64_t disk_need, disk_avail;
     char     index_dir[256];   /* where the daemon's private workdir is made */
+    uint64_t pool_used, logical_used;  /* as CuvsHnswBudgetSnapshot (v2) */
 } CuvsHnswPreflightReply;
 
 int cuvs_ipc_hnsw_route_preflight(const char *socket_path,
