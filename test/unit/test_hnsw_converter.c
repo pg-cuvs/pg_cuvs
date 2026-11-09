@@ -10,6 +10,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <signal.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include "postgres.h"
@@ -1247,10 +1249,102 @@ static void test_stored_policy_versions(void)
     puts("PASS stored policy page v1/v2, no receipt, truncation/future/corruption, prefix and historical bytes unchanged");
 }
 
+/* d0a51e7 B2: the ACE partition-builder readback written by the production metapage
+ * writer reads back byte-for-byte at prefix + receipt, a resident receipt carries no
+ * tail, and an invalid readback is refused by the writer (backend ERROR). */
+static void
+test_ace_readback_metapage_roundtrip(void)
+{
+    Fixture f = fixture_create(false);
+    struct BufFile fake_file = {.fd = make_temp_fd()};
+    HnswLocationTable table;
+    HnswlibHeader hdr;
+    CuvsTidsHeader tids_hdr;
+    CuvsHnswPolicy p = {0}, out, other, resident;
+    CuvsHnswAceReadback ace, ace_out;
+    char error[256] = {0}, saved_prefix[sizeof(PgvHnswMeta)];
+    const Size prefix = SizeOfPageHeaderData + sizeof(PgvHnswMeta);
+    Page meta;
+    pid_t child;
+    int status;
+
+    memset(&table, 0, sizeof(table));
+    table.file = &fake_file;
+    table.n_nodes = 2;
+    assert(hnsw_file_preflight(f.hnsw_fd, f.tids_fd, 2, 2, CUVS_METRIC_COSINE, 4, true,
+                               &hdr, &tids_hdr, hnsw_location_table_append, &table, NULL,
+                               error, sizeof(error)));
+    p.magic = CUVS_HNSW_POLICY_MAGIC; p.version = CUVS_HNSW_POLICY_VERSION; p.bytes = sizeof(p);
+    p.route = CUVS_HNSW_ROUTE_ACE; p.internal_builder = CUVS_HNSW_ROUTE_ACE;
+    p.requested_algo = CUVS_HNSW_ALGO_ACE; p.requested_ef = 64; p.guard_passed = 1;
+    p.partitions = 2; p.degree = 64; p.intermediate = 128; p.ace_ef = 240;
+    p.n_rows = 999000; p.dim = 2;
+    assert(cuvs_hnsw_policy_valid(&p));
+    cuvs_hnsw_ace_readback_fill(&ace, CUVS_HNSW_ACE_QUALITY_AUTO, p.ace_ef, p.degree,
+                                p.n_rows, p.partitions, 20);
+    assert(cuvs_hnsw_ace_readback_valid(&ace, &p));
+
+    chain_test_reset();
+    hnsw_write_disk_metapage(NULL, &hdr, 2, 1, true, &table, &p, &ace);
+    meta = (Page)chain_test_pages[chain_test_nblocks - 1];
+    assert(((PageHeader)meta)->pd_lower == prefix + sizeof(p) + sizeof(ace));
+    assert(memcmp((char *)meta + prefix, &p, sizeof(p)) == 0); /* receipt bytes unchanged */
+    assert(((PgvHnswMeta *)PageGetContents(meta))->dimensions == 2);
+    memcpy(saved_prefix, PageGetContents(meta), sizeof(saved_prefix));
+    assert(hnsw_read_disk_policy(meta, &out) == CUVS_HNSW_POLICY_RECORDED);
+    assert(memcmp(&out, &p, sizeof(p)) == 0);
+    assert(hnsw_read_disk_ace(meta, &out, &ace_out) == CUVS_HNSW_POLICY_RECORDED);
+    assert(memcmp(&ace_out, &ace, sizeof(ace)) == 0);
+    assert(ace_out.quality == 15 && ace_out.local_intermediate == 96 && ace_out.local_iterations == 20);
+    assert(memcmp(saved_prefix, PageGetContents(meta), sizeof(saved_prefix)) == 0);
+
+    /* An ACE index built before the readback existed: receipt only, no tail. */
+    ((PageHeader)meta)->pd_lower = prefix + sizeof(p);
+    assert(hnsw_read_disk_ace(meta, &out, &ace_out) == CUVS_HNSW_POLICY_NOT_RECORDED);
+    ((PageHeader)meta)->pd_lower = prefix + sizeof(p) + sizeof(ace);
+    /* A tail that does not belong to this receipt is corrupt, not silently accepted. */
+    other = p; other.ace_ef = 112;
+    assert(hnsw_read_disk_ace(meta, &other, &ace_out) == CUVS_HNSW_POLICY_CORRUPT);
+    /* A truncated tail is corrupt. */
+    ((PageHeader)meta)->pd_lower = prefix + sizeof(p) + sizeof(ace) - 1;
+    assert(hnsw_read_disk_ace(meta, &out, &ace_out) == CUVS_HNSW_POLICY_CORRUPT);
+
+    /* A resident receipt writes no tail, even when a readback is passed. */
+    resident = p;
+    resident.route = resident.internal_builder = CUVS_HNSW_ROUTE_IVF_PQ;
+    resident.requested_algo = CUVS_HNSW_ALGO_IVF_PQ; resident.partitions = 0;
+    assert(cuvs_hnsw_policy_valid(&resident));
+    chain_test_reset();
+    hnsw_write_disk_metapage(NULL, &hdr, 2, 1, true, &table, &resident, &ace);
+    meta = (Page)chain_test_pages[chain_test_nblocks - 1];
+    assert(((PageHeader)meta)->pd_lower == prefix + sizeof(resident));
+
+    /* An ACE receipt without a valid readback is refused by the writer. */
+    fflush(stderr);
+    child = fork();
+    assert(child >= 0);
+    if (child == 0)
+    {
+        CuvsHnswAceReadback bad = ace;
+        bad.local_intermediate = 128;
+        assert(freopen("/dev/null", "w", stderr) != NULL);
+        chain_test_reset();
+        hnsw_write_disk_metapage(NULL, &hdr, 2, 1, true, &table, &p, &bad);
+        _exit(0); /* reaching here means the writer accepted it */
+    }
+    assert(waitpid(child, &status, 0) == child);
+    assert(WIFSIGNALED(status) && WTERMSIG(status) == SIGABRT);
+
+    fixture_close(&f);
+    BufFileClose(&fake_file);
+    puts("PASS ACE readback metapage roundtrip: bytes at prefix+receipt, pd_lower, older/foreign/truncated tails, resident has none, writer refuses invalid");
+}
+
 int
 main(void)
 {
     test_stored_policy_versions();
+    test_ace_readback_metapage_roundtrip();
     test_valid_flat_and_original_labels();
     test_valid_hierarchy();
     test_disk_location_layout();

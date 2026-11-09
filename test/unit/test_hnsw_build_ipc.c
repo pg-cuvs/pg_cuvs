@@ -86,6 +86,10 @@ static void *daemon_mock(void *unused) {
         if (reply.policy.route == CUVS_HNSW_ROUTE_ACE && fixture_case != 17)
             cuvs_hnsw_ace_readback_fill(&reply.ace, CUVS_HNSW_ACE_QUALITY_AUTO, 120, 64,
                 reply.policy.n_rows, 2, 20);
+        /* case 18: a resident receipt must not carry a readback tail. */
+        if (fixture_case == 18)
+            cuvs_hnsw_ace_readback_fill(&reply.ace, CUVS_HNSW_ACE_QUALITY_AUTO, 120, 64,
+                reply.policy.n_rows, 2, 20);
         assert(write(c, "R", 1) == 1);
         assert(cuvs_fd_send(c, read_only, &reply, sizeof(reply)) == 0);
         close(read_only);
@@ -113,7 +117,7 @@ int main(void) {
     assert(write(fd, &first, sizeof(first)) == sizeof(first));
     assert(ftruncate(fd, 100 * 128 * sizeof(float)) == 0);
     cuvs_ipc_set_wait_callback(cancel_wait);
-    for (int sequence = 0; sequence < 16; sequence++) {
+    for (int sequence = 0; sequence < 17; sequence++) {
         fixture_case = sequence < 13 ? sequence : sequence + 2;
         pthread_t t;
         int result = -1;
@@ -162,7 +166,7 @@ int main(void) {
         assert(rc == CUVS_STATUS_ERROR && result == -1 && p.magic == 0 && accepts == before);
         assert(b.host_estimate == 0 && b.pool_used == 0 && b.logical_used == 0); /* zeroed, no reply */
     }
-    assert(accepts == 16);
+    assert(accepts == 17);
     /* Directly exercise the daemon's shared production prefix consumer.
      * Legacy/future send only16 bytes: it must reject without reading a tail. */
     for (unsigned k = 0; k < 5; k++) {
@@ -191,7 +195,7 @@ int main(void) {
         close(c); if (channel[0] >= 0) {close(channel[0]); close(channel[1]);}
         assert(!pthread_join(t, NULL) && fcntl(fd, F_GETFD) >= 0);
     }
-    assert(accepts == 21);
+    assert(accepts == 22);
     close(fd); close(listener); unlink(path); rmdir(dir);
-    printf("PASS 16 actual-client wire cases (v5 ACE readback bound),4 preconnect refusals,5 shared-daemon prefix/settings cases; explicitACE/IVF, forgedroute/version/request rejection, cancellation/status13/protocolerror; current global v%u retained\n", CUVS_PROTO_VERSION);
+    printf("PASS 17 actual-client wire cases (v5 ACE readback bound, none on resident),4 preconnect refusals,5 shared-daemon prefix/settings cases; explicitACE/IVF, forgedroute/version/request rejection, cancellation/status13/protocolerror; current global v%u retained\n", CUVS_PROTO_VERSION);
 }
