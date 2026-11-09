@@ -94,6 +94,13 @@ MUTANTS = [
     ('cagra_ar0_refuses_without_stats', 'cuvs_route_preflight.h',
      '    if (!n || !dim || dim > INT32_MAX || !max_limit || !n_devices) return 0;',
      '    if (!n) n = UINT32_MAX;\n    if (!dim || dim > INT32_MAX || !max_limit || !n_devices) return 0;'),
+    # ACE partitions stay on the SDK's bounded NN-descent builder
+    ('ace_admitted_with_unbounded_sdk_host_budget', 'cuvs_hnsw_build_common.h',
+     '        out->route = CUVS_HNSW_ROUTE_ACE;\n        out->overflowed',
+     '        out->route = CUVS_HNSW_ROUTE_ACE; out->sdk_host_budget = 0;\n        out->overflowed'),
+    ('ace_admitted_with_unbounded_sdk_gpu_budget', 'cuvs_hnsw_build_common.h',
+     '        out->route = CUVS_HNSW_ROUTE_ACE;\n        out->overflowed',
+     '        out->route = CUVS_HNSW_ROUTE_ACE; out->sdk_gpu_budget = 0;\n        out->overflowed'),
     ('cagra_ar0_ignores_auto_sharding', 'cuvs_route_preflight.h',
      '    if (!(shard_count == 1 || (shard_count == 0 && n_devices == 1))) return 0;\n', ''),
 ]

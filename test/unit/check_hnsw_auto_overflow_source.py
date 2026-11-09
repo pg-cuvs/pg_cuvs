@@ -1,10 +1,14 @@
 """I3-C source-structure invariant (CK-17 (13), (14); UC-5 sub-decision 4).
 
 Replaces I1's NO_SILENT_AUTO_ACE / EXPLICIT_NOTICE scans with:
-  "auto -> ACE goes through one policy branch only and always leaves a
-   NOTICE and a receipt", plus the decision order of ADR-087 decision 4:
+  "auto -> ACE goes through the named policy branches only and each always
+   leaves a NOTICE and a receipt flag", plus the decision order of ADR-087 decision 4:
    lock -> route decision -> mkdtemp -> disk check -> build (daemon) and
    statistics forecast -> heap scan -> build op -> NOTICEs (backend).
+The branches are (1) the resolver's budget overflow (UC-5) and (2) the R1
+kNN-graph fallback (217d29b): auto chose resident IVF-PQ, cuVS rejected its
+kNN graph, overflow=ace rebuilds on ACE-disk. Each is gated on auto and
+overflow=ace and has its own receipt flag (AUTO_OVERFLOW, GRAPH_FALLBACK).
 CPU source conformance only; it does not compile CUDA or run PG/GPU.
 Every check is paired with a source mutant that must be detected.
 """
@@ -44,27 +48,62 @@ def ordered(body, needles, label):
 
 def check(src):
     code = {k: strip_comments(v) for k, v in src.items()}
-    # --- single overflow branch -------------------------------------------
+    # --- auto -> ACE branches: one overflow test and one ACE writer each ---
     allcode = ''.join(code.values())
-    assert len(re.findall(r'overflow\s*==\s*CUVS_HNSW_OVERFLOW_ACE', allcode)) == 1, 'ONE_OVERFLOW_TEST'
-    assert len(re.findall(r'->overflowed\s*=|\.overflowed\s*=\s*\(', allcode)) == 1, 'ONE_OVERFLOW_WRITER'
-    assert len(re.findall(r'route\s*=\s*CUVS_HNSW_ROUTE_ACE\s*;', allcode)) == 1, 'ONE_ACE_ROUTE_WRITER'
+    overflow_test = r'overflow\s*==\s*CUVS_HNSW_OVERFLOW_ACE'
+    ace_writer = r'route\s*=\s*CUVS_HNSW_ROUTE_ACE\s*;'
     resolver = function(code['common'], 'cuvs_hnsw_resolve_route(uint64_t n')
+    gate = function(code['common'], 'static inline int cuvs_hnsw_graph_failure_to_ace(')
+    pub = function(code['wrapper'], 'cuvs_hnsw_build_file(int vectors_fd')
+    fallback = pub.split('if (!cuvs_hnsw_graph_failure_to_ace(', 1)
+    fallback = fallback[1].split('catch (const std::bad_alloc &e)', 1)[0] if len(fallback) == 2 else ''
+    assert len(re.findall(overflow_test, allcode)) == 2, 'ONE_OVERFLOW_TEST'
+    assert len(re.findall(overflow_test, resolver)) == 1, 'ONE_OVERFLOW_TEST:RESOLVER'
+    assert len(re.findall(overflow_test, gate)) == 1, 'ONE_OVERFLOW_TEST:GRAPH_FALLBACK'
+    assert len(re.findall(r'->overflowed\s*=|\.overflowed\s*=\s*\(', allcode)) == 1, 'ONE_OVERFLOW_WRITER'
+    assert len(re.findall(ace_writer, allcode)) == 2, 'ONE_ACE_ROUTE_WRITER'
+    assert len(re.findall(ace_writer, resolver)) == 1, 'ONE_ACE_ROUTE_WRITER:RESOLVER'
+    assert len(re.findall(ace_writer, fallback)) == 1, 'ONE_ACE_ROUTE_WRITER:GRAPH_FALLBACK'
+    # R1 kNN-graph fallback (217d29b): auto + resident IVF-PQ + overflow=ace only,
+    # only on the cuVS kNN-graph rejection, recorded and announced.
+    assert gate.split('return', 1)[1].lstrip().startswith(
+        'requested_algo == CUVS_HNSW_ALGO_AUTO && route == CUVS_HNSW_ROUTE_IVF_PQ'), 'GRAPH_FALLBACK_ONLY_FOR_AUTO_IVF_PQ'
+    assert 'strstr(what, CUVS_HNSW_GRAPH_KNN_REJECTED)' in gate, 'GRAPH_FALLBACK_ONLY_ON_KNN_REJECTION'
+    assert re.search(r'if \(!cuvs_hnsw_graph_failure_to_ace\(params->build_algo, prepared\.route\.route,\s*'
+                     r'params->auto_overflow, params->n_vecs, e\.what\(\)\)\)\s*throw;', pub), 'GRAPH_FALLBACK_GATED'
+    assert '| CUVS_HNSW_ROUTE_FLAG_GRAPH_FALLBACK;' in fallback.split('return execute_hnsw_file_build(', 1)[0], 'GRAPH_FALLBACK_RECORDED'
+    valid = function(code['policy'], 'static inline int cuvs_hnsw_policy_valid(')
+    assert '+ !!(p->route_flags & CUVS_HNSW_ROUTE_FLAG_GRAPH_FALLBACK)' in valid, 'RECEIPT_CONTRACT_GRAPH_FALLBACK'
+    bn = function(code['preflight'], 'cuvs_hnsw_build_notices(const CuvsHnswPolicy *p')
+    assert 'return CUVS_HNSW_NOTICE_GRAPH_FALLBACK;' in bn, 'GRAPH_FALLBACK_NOTICE_SELECTED'
+    assert re.search(r'if \(notices & CUVS_HNSW_NOTICE_GRAPH_FALLBACK\)\s*ereport\(NOTICE', code['backend']), 'GRAPH_FALLBACK_NOTICE'
+    exempt = function(code['server'], 'handle_build_hnsw_file(int client_fd').split('int graph_fallback =', 1)
+    assert len(exempt) == 2 and all(x in exempt[1].split(';', 1)[0] for x in (
+        'route.decision.route == CUVS_HNSW_ROUTE_IVF_PQ', '!route.decision.overflowed',
+        'wire.policy.route == CUVS_HNSW_ROUTE_ACE')), 'GRAPH_FALLBACK_EXEMPTION_NARROW'
     assert 'algo == CUVS_HNSW_ALGO_AUTO' in resolver.split('overflow_to_ace =', 1)[1].split(';', 1)[0], 'OVERFLOW_ONLY_FOR_AUTO'
     assert 'out->overflowed = (uint32_t)overflow_to_ace;' in resolver, 'OVERFLOW_RECORDED'
     # the default macro is ace (UC-5)
     assert re.search(r'#define CUVS_HNSW_AUTO_OVERFLOW_DEFAULT CUVS_HNSW_OVERFLOW_ACE\b', src['policy']), 'DEFAULT_ACE'
     # receipt: the wrapper records the branch, the contract requires it
     assert 'receipt.route_flags = prepared.route.overflowed ? CUVS_HNSW_ROUTE_FLAG_AUTO_OVERFLOW : 0;' in code['wrapper'], 'RECEIPT_FLAG'
-    valid = function(code['policy'], 'static inline int cuvs_hnsw_policy_valid(')
     assert '(!!(p->route_flags & CUVS_HNSW_ROUTE_FLAG_AUTO_OVERFLOW)' in valid, 'RECEIPT_CONTRACT'
     # every receipt path calls the resolver with the daemon flag
-    pub = function(code['wrapper'], 'cuvs_hnsw_build_file(int vectors_fd')
     assert 'params->build_algo, params->auto_overflow, &cap,' in pub, 'WRAPPER_PASSES_FLAG'
     # v6 C2: bad_alloc (incl. RMM out_of_memory) -> status 2 before the generic catch
     full = code['wrapper'][code['wrapper'].index('cuvs_hnsw_build_file(int vectors_fd'):]
-    ba = full.index('catch (const std::bad_alloc &e)'); ex = full.index('catch (const std::exception &e)')
+    # The outer handlers (4-space indent); the R1 fallback's inner std::exception
+    # handler rethrows anything but the kNN-graph rejection (GRAPH_FALLBACK_GATED).
+    ba = full.index('\n    catch (const std::bad_alloc &e)'); ex = full.index('\n    catch (const std::exception &e)')
     assert ba < ex and 'return CUVS_STATUS_OOM_FALLBACK;' in full[ba:ex], 'HNSW_BAD_ALLOC_IS_STATUS_2'
+    # ACE partitions stay on the SDK's bounded NN-descent builder (memory-guard
+    # patch 0003): the disk route requires its marker and passes the positive
+    # SDK budgets, so cuVS's fp16 IVF-PQ partition builder is never selected.
+    assert '"pgcuvs_hnsw_memory_guard_patch_id"' in pub.split('if (disk)', 1)[1].split('receipt.magic', 1)[0], 'ACE_REQUIRES_MEMORY_GUARD_SDK'
+    ex = function(code['wrapper'], 'static int execute_hnsw_file_build(')
+    for needle in ('ace.max_host_memory_gb = (double)sdk_host_budget / (UINT64_C(1) << 30);',
+                   'ace.max_gpu_memory_gb = (double)sdk_gpu_budget / (UINT64_C(1) << 30);'):
+        assert needle in ex, 'ACE_SDK_BUDGETS_PASSED:' + needle
     # --- daemon order (ADR-087 decision 4) ---------------------------------
     h = function(code['server'], 'handle_build_hnsw_file(int client_fd')
     ordered(h, ['cuvs_hnsw_wait_for_idle(', 'params.gpu_budget = hnsw_gpu_budget(device, 1, &wire.budget.logical_used);',
@@ -198,6 +237,41 @@ MUTANTS = [
      '        f->status == CUVS_STATUS_OK ? cuvs_hnsw_route_name(f->decision.route) : "none",'),
     ('cagra_ar0_after_scan', 'backend',
      '            && cuvs_cagra_prespool_ar0(reltuples_est,', '            && 0 && (reltuples_est,'),
+    # R1 kNN-graph fallback (217d29b)
+    ('graph_fallback_for_explicit_ivf_pq', 'common',
+     '    return requested_algo == CUVS_HNSW_ALGO_AUTO && route == CUVS_HNSW_ROUTE_IVF_PQ',
+     '    return route == CUVS_HNSW_ROUTE_IVF_PQ'),
+    ('graph_fallback_ignores_overflow_error', 'common',
+     '        && overflow == CUVS_HNSW_OVERFLOW_ACE && n >= 256', '        && n >= 256'),
+    ('graph_fallback_on_any_exception', 'common',
+     '        && what && strstr(what, CUVS_HNSW_GRAPH_KNN_REJECTED) != NULL;', '        && what;'),
+    ('graph_fallback_ungated', 'wrapper',
+     '            if (!cuvs_hnsw_graph_failure_to_ace(', '            if (0 && !cuvs_hnsw_graph_failure_to_ace('),
+    ('graph_fallback_unrecorded', 'wrapper',
+     '                | CUVS_HNSW_ROUTE_FLAG_GRAPH_FALLBACK;', '                | 0;'),
+    ('graph_fallback_receipt_keeps_ivf_pq', 'wrapper',
+     '            receipt.route = CUVS_HNSW_ROUTE_ACE;\n            receipt.internal_builder = 3;',
+     '            receipt.internal_builder = 3;'),
+    ('graph_fallback_flag_not_validated', 'policy',
+     '            + !!(p->route_flags & CUVS_HNSW_ROUTE_FLAG_GRAPH_FALLBACK)', '            + 0'),
+    ('graph_fallback_notice_not_selected', 'preflight',
+     '        return CUVS_HNSW_NOTICE_GRAPH_FALLBACK;', '        return 0;'),
+    ('graph_fallback_without_notice', 'backend',
+     '            if (notices & CUVS_HNSW_NOTICE_GRAPH_FALLBACK)\n                ereport(NOTICE',
+     '            if (0)\n                ereport(NOTICE'),
+    ('graph_fallback_exemption_widened', 'server',
+     '        && route.decision.route == CUVS_HNSW_ROUTE_IVF_PQ && !route.decision.overflowed',
+     '        && 1'),
+    ('ace_sdk_host_budget_dropped', 'wrapper',
+     'ace.max_host_memory_gb = (double)sdk_host_budget / (UINT64_C(1) << 30);', 'ace.max_host_memory_gb = 0;'),
+    ('ace_sdk_gpu_budget_dropped', 'wrapper',
+     'ace.max_gpu_memory_gb = (double)sdk_gpu_budget / (UINT64_C(1) << 30);', 'ace.max_gpu_memory_gb = 0;'),
+    ('ace_without_memory_guard_marker', 'wrapper',
+     '                    "pgcuvs-hnsw-disk-copy-v1@60b19a0f62ba0bd716de349382828e43be6e2daa")\n                || !hnsw_sdk_marker_verified("pgcuvs_hnsw_memory_guard_patch_id",\n                    "pgcuvs-hnsw-memory-guard-v2@60b19a0f62ba0bd716de349382828e43be6e2daa"))\n            {\n                snprintf(error, error_len, "ACE requires',
+     '                    "pgcuvs-hnsw-disk-copy-v1@60b19a0f62ba0bd716de349382828e43be6e2daa"))\n            {\n                snprintf(error, error_len, "ACE requires'),
+    ('third_ace_route_writer_in_daemon', 'server',
+     '    params.auto_overflow = g_hnsw_auto_overflow;',
+     '    params.auto_overflow = g_hnsw_auto_overflow;\n    if (0) wire.policy.route = CUVS_HNSW_ROUTE_ACE;'),
 ]
 
 

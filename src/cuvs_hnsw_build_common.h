@@ -375,8 +375,10 @@ cuvs_hnsw_resolve_route(uint64_t n, uint32_t dim, uint32_t degree,
         snprintf(error, error_len, "tiny exact route estimate exceeds host/GPU budget");
         return CUVS_STATUS_BUILD_FAILED;
     }
-    /* ADR-087: the ONLY auto -> ACE transition. Explicit ivf_pq never
-     * overflows; auto overflows only when the daemon flag says ace. */
+    /* ADR-087: the only budget auto -> ACE transition (the other auto -> ACE
+     * branch is the R1 kNN-graph fallback, cuvs_hnsw_graph_failure_to_ace).
+     * Explicit ivf_pq never overflows; auto overflows only when the daemon
+     * flag says ace. */
     int overflow_to_ace = !tiny && exceeded && algo == CUVS_HNSW_ALGO_AUTO
         && overflow == CUVS_HNSW_OVERFLOW_ACE;
     if (overflow_to_ace && n < 256)
@@ -391,6 +393,10 @@ cuvs_hnsw_resolve_route(uint64_t n, uint32_t dim, uint32_t degree,
             : "resident IVF-PQ estimate exceeds host/GPU budget; no fallback; use build_algo=ace explicitly");
         return CUVS_STATUS_HNSW_RESIDENT_BUDGET_EXCEEDED;
     }
+    /* Positive on every admitted ACE route (ACE needs host > serializer floor
+     * and gpu > partition peak). The pinned SDK's memory-guard patch then
+     * builds every ACE partition kNN with NN-descent, whatever its size, so
+     * cuVS's fp16 IVF-PQ partition builder (>= 1e6 rows) is never used. */
     out->sdk_host_budget = host - (host / 8 < (UINT64_C(256) << 20) ? host / 8 : (UINT64_C(256) << 20));
     out->sdk_gpu_budget = gpu - (gpu / 8 < (UINT64_C(512) << 20) ? gpu / 8 : (UINT64_C(512) << 20));
     if (algo == CUVS_HNSW_ALGO_ACE || overflow_to_ace)

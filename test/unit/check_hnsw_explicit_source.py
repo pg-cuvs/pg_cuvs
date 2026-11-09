@@ -8,6 +8,16 @@ import subprocess
 
 ROOT = Path(__file__).resolve().parents[2]
 BASE = '42f8a43daa43451ae3e38d28e729886a74c39a66'
+# Approved changes to the moved native body, each (statement it must directly
+# follow, statement, reason). Each must appear exactly once at its anchor and is
+# removed before the token comparison; any other change still fails
+# NATIVE_EXECUTION_BODY_CHANGED.
+APPROVED_NATIVE_DELTAS = [
+    ('if (cuvs_hnsw_owner_cancelled(owner_fd)) return CUVS_STATUS_CANCELED;',
+     'resources.fence_check();',
+     'fence review B1 (8b64728): a RAFT host free whose request-stream wait failed '
+     'fails the build before the serialized index is returned'),
+]
 
 
 def compact(s):
@@ -45,7 +55,13 @@ def check(wrapper, backend, server, baseline):
     b = old.index('\n    }\n    catch (const std::exception &e)', a)
     native_before = old[a:b]
     native_after = execute[execute.index('    PooledRes resources(device_id);'):execute.rfind('\n}')]
-    assert compact(native_before) == compact(native_after), 'NATIVE_EXECUTION_BODY_CHANGED'
+    native_moved = native_after
+    for anchor, statement, _ in APPROVED_NATIVE_DELTAS:
+        assert native_moved.count(statement) == 1, 'APPROVED_NATIVE_DELTA_COUNT:' + statement
+        head, tail = native_moved.split(statement)
+        assert compact(head).endswith(compact(anchor)), 'APPROVED_NATIVE_DELTA_ANCHOR:' + statement
+        native_moved = head + tail
+    assert compact(native_before) == compact(native_moved), 'NATIVE_EXECUTION_BODY_CHANGED'
     resolve = public.index('rc = cuvs_hnsw_resolve_route(')
     mapping = public.index('files.mapping = mmap(')
     dispatch = public.index('return execute_hnsw_file_build(')
@@ -63,6 +79,7 @@ def check(wrapper, backend, server, baseline):
                 B_order_positions=positions,
                 original_native_tokens_sha256=hashlib.sha256(compact(native_before).encode()).hexdigest(),
                 new_native_tokens_sha256=hashlib.sha256(compact(native_after).encode()).hexdigest(),
+                approved_native_deltas=[dict(after=a, statement=t, reason=r) for a, t, r in APPROVED_NATIVE_DELTAS],
                 actual_NVCC_SDK_GPU_PG='NOT_RUN')
 
 
@@ -86,6 +103,19 @@ def main(output):
                dict(name='resolver_error_fallthrough', w=w.replace(public, altered_guard, 1), b=b, s=s),
                dict(name='attach_dataset_semantics_changed', w=w.replace('cp.attach_dataset_on_build = false;', 'cp.attach_dataset_on_build = true;'), b=b, s=s),
                dict(name='ACE_hint_on_generic_build_failure', w=w, b=b.replace('if (rc == CUVS_STATUS_HNSW_RESIDENT_BUDGET_EXCEEDED)', 'if (rc == CUVS_STATUS_BUILD_FAILED)'), s=s)]
+    # The approved fence delta stays exactly one statement at its anchor.
+    execute = function(w, 'static int execute_hnsw_file_build(')
+    fence = '        resources.fence_check();\n'
+    assert execute.count(fence) == 1, 'MUTANT_ANCHOR:fence_check'
+    for name, changed in (
+            ('fence_check_removed', execute.replace(fence, '', 1)),
+            ('fence_check_duplicated', execute.replace(fence, fence + fence, 1)),
+            ('fence_check_moved_before_cancel_check', execute.replace(fence, '', 1).replace(
+                '        if (cuvs_hnsw_owner_cancelled(owner_fd)) return CUVS_STATUS_CANCELED;\n        if (tiny)',
+                fence + '        if (cuvs_hnsw_owner_cancelled(owner_fd)) return CUVS_STATUS_CANCELED;\n        if (tiny)', 1)),
+            ('native_statement_added_beside_fence', execute.replace(fence, fence + '        resources.sync_stream();\n', 1))):
+        assert changed != execute, ('MUTANT_ANCHOR', name)
+        mutants.append(dict(name=name, w=w.replace(execute, changed, 1), b=b, s=s))
     rows=[]
     for m in mutants:
         try: check(m['w'], m['b'], m['s'], old)
