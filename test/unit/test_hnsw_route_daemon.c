@@ -204,6 +204,10 @@ test_preflight_disk_refusal(void)
     {
         const char *line = route_line(log, "prespool");
         CHECK(line && strstr(line, " status=5 ") && strstr(line, " error=HNSW needs regular disk capacity: "));
+        /* Q4-4: the decided route survives the disk refusal on the journal */
+        CHECK(line && strstr(line, " route=ace_disk ") && !strstr(line, " route=none "));
+        if (line && !strstr(line, " route=ace_disk "))
+            fprintf(stderr, "  journal: %.*s\n", (int)strcspn(line, "\n"), line);
     }
     rmdir(g_index_dir);
 }

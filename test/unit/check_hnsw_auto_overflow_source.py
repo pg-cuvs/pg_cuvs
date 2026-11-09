@@ -84,6 +84,9 @@ def check(src):
     ordered(pre, ['cuvs_hnsw_forecast_route(', 'cuvs_hnsw_forecast_disk(', 'hnsw_route_log(request.after_scan ? "postscan" : "prespool"'], 'PREFLIGHT_ORDER')
     assert 'mkdtemp' not in pre and 'wait_for_idle' not in pre, 'PREFLIGHT_READ_ONLY'
     assert 'hnsw_gpu_budget(device, locked, &reply.logical_used)' in pre, 'PREFLIGHT_RL'
+    # Q4-4: the route field is the decided route (also after a disk refusal)
+    log = function(code['server'], 'hnsw_route_log(const char *phase')
+    assert 'cuvs_hnsw_forecast_route_name(f)' in log and 'f->status == CUVS_STATUS_OK' not in log, 'ROUTE_LOG_DECIDED_ROUTE'
     assert 'reply.pool_used = hnsw_pool_used(device);' in pre, 'PREFLIGHT_RP'
     # --- backend order (CK-17 (14)) -----------------------------------------
     b = function(code['backend'], 'cuvs_build_hnsw_from_heap(Relation heapRel')
@@ -190,6 +193,9 @@ MUTANTS = [
      '    uint64_t unused_rl; uint64_t gpu = hnsw_gpu_budget(device, locked, &unused_rl);'),
     ('preflight_rp_not_sent', 'server',
      '    reply.pool_used = hnsw_pool_used(device);\n', ''),
+    ('route_log_status_gated', 'server',
+     '        cuvs_hnsw_forecast_route_name(f),',
+     '        f->status == CUVS_STATUS_OK ? cuvs_hnsw_route_name(f->decision.route) : "none",'),
     ('cagra_ar0_after_scan', 'backend',
      '            && cuvs_cagra_prespool_ar0(reltuples_est,', '            && 0 && (reltuples_est,'),
 ]

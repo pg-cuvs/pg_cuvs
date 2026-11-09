@@ -455,4 +455,15 @@ cuvs_hnsw_forecast_disk(CuvsHnswForecast *f, int disk_regular,
     return (int)f->status;
 }
 
+/* The route field of [hnsw_route] (v5 Q4-4; v6 [hnsw_route] schema): the
+ * route the resolver decided, also when the disk precheck refused it after
+ * (status 5 with route=ace_disk); "none" only when no route was decided
+ * (status 13, no ACE partition fits, invalid input). The resolver sets
+ * decision.route only on success, so it alone says whether one was. */
+static inline const char *
+cuvs_hnsw_forecast_route_name(const CuvsHnswForecast *f)
+{
+    return f->decision.route ? cuvs_hnsw_route_name(f->decision.route) : "none";
+}
+
 #endif

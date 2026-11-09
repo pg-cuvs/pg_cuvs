@@ -465,7 +465,21 @@ static void test_disk_refusal_surface(void)
 {
     CuvsHnswForecast f; char error[160];
     CHECK(forecast(1000000, CUVS_HNSW_ALGO_AUTO, CUVS_HNSW_OVERFLOW_ACE, 4ULL << 30, G, &f) == CUVS_STATUS_OK);
+    CHECK(strcmp(cuvs_hnsw_forecast_route_name(&f), "ace_disk") == 0);
     CHECK(cuvs_hnsw_forecast_disk(&f, 1, 0, error, sizeof(error)) == CUVS_STATUS_BUILD_FAILED);
+    /* [hnsw_route] route field (Q4-4): the decided route survives the disk
+     * refusal; no decided route (status 13, invalid input) is "none". */
+    CHECK(f.status == CUVS_STATUS_BUILD_FAILED && strcmp(cuvs_hnsw_forecast_route_name(&f), "ace_disk") == 0);
+    {
+        CuvsHnswForecast r;
+        CHECK(forecast(1000000, CUVS_HNSW_ALGO_AUTO, CUVS_HNSW_OVERFLOW_ACE, H, G, &r) == CUVS_STATUS_OK);
+        CHECK(cuvs_hnsw_forecast_disk(&r, 0, UINT64_MAX, error, sizeof(error)) == CUVS_STATUS_BUILD_FAILED);
+        CHECK(strcmp(cuvs_hnsw_forecast_route_name(&r), "resident_ivf_pq") == 0);
+        CHECK(forecast(1000000, CUVS_HNSW_ALGO_IVF_PQ, 1, 1 << 20, G, &r) == CUVS_STATUS_HNSW_RESIDENT_BUDGET_EXCEEDED);
+        CHECK(strcmp(cuvs_hnsw_forecast_route_name(&r), "none") == 0);
+        CHECK(forecast(0, CUVS_HNSW_ALGO_AUTO, 1, H, G, &r) == CUVS_STATUS_BUILD_FAILED);
+        CHECK(strcmp(cuvs_hnsw_forecast_route_name(&r), "none") == 0);
+    }
     CHECK(cuvs_hnsw_disk_refusal(CUVS_STATUS_BUILD_FAILED, error));
     CHECK(!cuvs_hnsw_disk_refusal(CUVS_STATUS_HNSW_RESIDENT_BUDGET_EXCEEDED, error));
     CHECK(!cuvs_hnsw_disk_refusal(CUVS_STATUS_BUILD_FAILED, CUVS_HNSW_BUDGET_NO_FIT_REASON));
