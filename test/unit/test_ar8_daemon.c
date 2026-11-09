@@ -411,6 +411,19 @@ test_pool_shortfall_eviction(void)
     CHECK(g_cache_evictions[0] == 0 && g_n_indexes == 1);
     g_lw_pending[0] = 0;
 
+    /* (5b) the same cap with every other pool allocator quiet (case (5) now
+     * also meets the SR-B1 rule through its lw_pending): no pending, a build
+     * near the quota. N = 750,000 x 3,200 = 2.4e9, headroom 3.6e8, pool used
+     * 256 MiB: pool_short = 256 MiB + N + h - quota = 528,435,456 > pool used,
+     * so AR8 at once with nothing evicted, although the resident's entry bytes
+     * (1 GiB) would cover the shortfall. */
+    one_resident(GiB, 0);
+    a = line_for(750000);
+    CHECK(a.needed == UINT64_C(2400000000));
+    CHECK(admit(&a, NULL) == CUVS_ADMISSION_AR8);
+    CHECK(a.pool_short == UINT64_C(528435456) && a.pool_short > a.pool_used);
+    CHECK(g_cache_evictions[0] == 0 && g_n_indexes == 1);
+
     /* (6) the pool is read again after eviction: when the eviction does not
      * return pool bytes (fixture pool constant at 1 GiB), the build is AR8
      * after an eviction (evicted=1), nothing reserved. */
@@ -422,6 +435,42 @@ test_pool_shortfall_eviction(void)
     CHECK(rej.o == cuvs_admission_mib(GiB) && g_pending_rmm_build_vram[0] == 0);
     capture_admit_reason(&a, CUVS_ADMISSION_AR8, buf, sizeof(buf));
     CHECK(strstr(buf, " evicted=1 verdict=reject reason=AR8 ") != NULL);
+
+    /* (7) SR-B1 on this path: another pool allocator is active, so the
+     * pool could grow between the snapshot, the eviction and the re-read
+     * (case (6) without the cause being knowable). Each shape alone would
+     * be evicted and admitted when quiet (case (1)); here it is AR8 with
+     * nothing evicted. Pool tracks residents, scope lru, one 1 GiB resident.
+     * With 100,000,000 pending: pool_short = 540,577,280 <= 1 GiB. */
+    g_pool_used = 0;
+    g_pool_tracks_residents = 1;
+    for (int shape = 0; shape < 4; shape++) {
+        memset(g_cache_evictions, 0, sizeof(g_cache_evictions));   /* case (6) evicted one */
+        one_resident(GiB, 0);
+        if (shape == 0) g_pending_rmm_build_vram[0] = 100000000;   /* a build in flight */
+        if (shape == 1) g_lw_pending[0] = 100000000;               /* its lw_ub */
+        if (shape == 2) g_unlocked_gpu_jobs = 1;                   /* sharded search / HNSW export */
+        if (shape == 3) {                                          /* lock-free search on an entry */
+            g_res[1] = (IndexEntry){.valid = 1, .is_flat = 1, .gpu_device_id = 0, .db_oid = 1,
+                                    .index_oid = 10, .inflight = 1};
+            g_n_indexes = 2;
+        }
+        a = line_for(499500);
+        CHECK(admit(&a, &rej) == CUVS_ADMISSION_AR8);
+        CHECK(g_cache_evictions[0] == 0 && g_res[0].valid);
+        CHECK(a.pool_short > 0 && a.pool_short <= a.pool_used);    /* eviction could have covered it */
+        capture_admit_reason(&a, CUVS_ADMISSION_AR8, buf, sizeof(buf));
+        CHECK(strstr(buf, " evicted=0 verdict=reject reason=AR8 ") != NULL);
+        g_pending_rmm_build_vram[0] = 0;
+        g_lw_pending[0] = 0;
+        g_unlocked_gpu_jobs = 0;
+    }
+    /* ... and the same resident is evicted and the build admitted once quiet. */
+    memset(g_cache_evictions, 0, sizeof(g_cache_evictions));
+    one_resident(GiB, 0);
+    a = line_for(499500);
+    CHECK(admit(&a, NULL) == CUVS_ADMISSION_NONE && g_cache_evictions[0] == 1);
+    memset(g_cache_evictions, 0, sizeof(g_cache_evictions));
 
     g_indexes = NULL; g_n_indexes = 0;
     g_reclaim.scope.kind = CUVS_SCOPE_NONE;

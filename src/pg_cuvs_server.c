@@ -3260,6 +3260,25 @@ admission_pool_used_now(int device_id)
     return cuvs_rmm_pool_stats(device_id, &st) == 0 ? st.used_bytes : 0;
 }
 
+/* For a pool shortfall (ADR-089 amendment, SR-B1): no allocator
+ * outside admission may grow this device's pool between the shortfall
+ * snapshot, make_room and the post-eviction re-read. Those allocators are
+ * admitted CAGRA builds (g_pending_rmm_build_vram, g_lw_pending) and the
+ * lock-free GPU jobs (g_unlocked_gpu_jobs, entry inflight); every other
+ * allocation path is admitted under g_index_mutex, held here. */
+static int
+pool_allocators_quiet(int device_id)
+{
+    if (g_pending_rmm_build_vram[device_id] != 0 || g_lw_pending[device_id] != 0 ||
+        g_unlocked_gpu_jobs != 0)
+        return 0;
+    for (int i = 0; i < g_n_indexes; i++)
+        if (g_indexes[i].valid && g_indexes[i].inflight > 0 &&
+            entry_on_device(&g_indexes[i], device_id))
+            return 0;
+    return 1;
+}
+
 /* Ensure there is enough VRAM on `device_id` for `needed` bytes, evicting
  * only what the requester's rules allow (v6 C1 RQ table). The requester is
  * mandatory: a caller that omits it does not compile (CK-36 (a)). */
@@ -3355,6 +3374,14 @@ ensure_vram(size_t needed, int device_id, CuvsRequester rq, CuvsAdmissionFields 
         line->pool_short = pool_short;
         line->pool_bound = pool_short > budget_short && pool_short > phys_short;
         if (pool_short > line->pool_used)
+        {
+            g_last_admit_reason = CUVS_ADMISSION_AR8;
+            goto admission_rejected;
+        }
+        /* While another pool allocator is active, a post-eviction AR8
+         * would not mean the eviction under-delivered, and the eviction would
+         * be a false one (ADR-086: nothing evicted on reject). AR8 now. */
+        if (pool_short > 0 && !pool_allocators_quiet(device_id))
         {
             g_last_admit_reason = CUVS_ADMISSION_AR8;
             goto admission_rejected;
