@@ -148,6 +148,18 @@ hnsw_read_disk_policy(Page page, CuvsHnswPolicy *out)
                                  header->pd_lower - prefix, out);
 }
 
+/* The ACE partition-builder readback after a recorded ACE receipt. */
+static CuvsHnswPolicyReadStatus
+hnsw_read_disk_ace(Page page, const CuvsHnswPolicy *policy, CuvsHnswAceReadback *out)
+{
+    Size at = SizeOfPageHeaderData + sizeof(PgvHnswMeta) + sizeof(*policy);
+    PageHeader header = (PageHeader)page;
+    memset(out, 0, sizeof(*out));
+    if (header->pd_lower <= at) return CUVS_HNSW_POLICY_NOT_RECORDED;
+    return cuvs_hnsw_ace_readback_read((const char *)page + at, header->pd_lower - at,
+                                       policy, out);
+}
+
 /* ---- page opaque (special area, 8 bytes) ---- */
 typedef struct {
     uint32_t    nextblkno;
@@ -2568,7 +2580,8 @@ hnsw_write_disk_pages(Relation rel, int hnsw_fd, int tids_fd,
 static void
 hnsw_write_disk_metapage(Relation rel, const HnswlibHeader *header,
                          uint32_t dim, uint32_t n_data_pages, bool skip_wal,
-                         HnswLocationTable *locations, const CuvsHnswPolicy *policy)
+                         HnswLocationTable *locations, const CuvsHnswPolicy *policy,
+                         const CuvsHnswAceReadback *ace)
 {
     Page staged = (Page)palloc(BLCKSZ);
     HnswNodeLocation entry;
@@ -2585,6 +2598,15 @@ hnsw_write_disk_metapage(Relation rel, const HnswlibHeader *header,
         ereport(ERROR, (errmsg("pg_cuvs: missing or invalid native HNSW build policy receipt")));
     memcpy((char *)PageGetContents(staged) + sizeof(PgvHnswMeta), policy, sizeof(*policy));
     ((PageHeader)staged)->pd_lower += sizeof(*policy);
+    /* ACE partition-builder readback right after the receipt (receipt layout unchanged). */
+    if (policy->route == CUVS_HNSW_ROUTE_ACE)
+    {
+        if (!cuvs_hnsw_ace_readback_valid(ace, policy))
+            ereport(ERROR, (errmsg("pg_cuvs: missing or invalid ACE partition-builder readback")));
+        memcpy((char *)PageGetContents(staged) + sizeof(PgvHnswMeta) + sizeof(*policy),
+               ace, sizeof(*ace));
+        ((PageHeader)staged)->pd_lower += sizeof(*ace);
+    }
     hnsw_publish_staged_page(rel, staged, skip_wal);
     pfree(staged);
 }
@@ -2741,7 +2763,8 @@ hnsw_import_build_result(Relation indexRel,
             RelationSetTargetBlock(s->target, InvalidBlockNumber);
         }
         hnsw_write_disk_metapage(s->target, &header, build->dim,
-                                 data_page_count, skip_wal, &s->locations, &build->policy);
+                                 data_page_count, skip_wal, &s->locations, &build->policy,
+                                 &build->ace);
         hnsw_write_disk_pages(s->target, build->hnsw_fd, build->tids_fd,
                               &header, build->n_vecs, build->dim,
                               bytes_per_dim, data_page_count, skip_wal,
@@ -3633,6 +3656,8 @@ pg_cuvs_hnsw_build_info(PG_FUNCTION_ARGS)
     Relation rel = index_open(oid, AccessShareLock);
     CuvsHnswPolicy policy = {0};
     CuvsHnswPolicyReadStatus policy_status = CUVS_HNSW_POLICY_NOT_RECORDED;
+    CuvsHnswAceReadback ace = {0};
+    CuvsHnswPolicyReadStatus ace_status = CUVS_HNSW_POLICY_NOT_RECORDED;
     StringInfoData json;
     Oid heap;
     if (rel->rd_rel->relam != get_am_oid("pg_cuvs_hnsw", true))
@@ -3648,6 +3673,8 @@ pg_cuvs_hnsw_build_info(PG_FUNCTION_ARGS)
         LockBuffer(buffer, BUFFER_LOCK_SHARE);
         page = BufferGetPage(buffer);
         policy_status = hnsw_read_disk_policy(page, &policy);
+        if (policy_status == CUVS_HNSW_POLICY_RECORDED && policy.route == CUVS_HNSW_ROUTE_ACE)
+            ace_status = hnsw_read_disk_ace(page, &policy, &ace);
         UnlockReleaseBuffer(buffer);
     }
     index_close(rel, AccessShareLock);
@@ -3661,6 +3688,12 @@ pg_cuvs_hnsw_build_info(PG_FUNCTION_ARGS)
     if (policy_status == CUVS_HNSW_POLICY_NOT_RECORDED)
         PG_RETURN_DATUM(DirectFunctionCall1(jsonb_in,
             CStringGetDatum("{\"status\":\"not_recorded\",\"reason\":\"legacy, empty, or reused source graph; rebuild to record a native policy\"}")));
+    if (ace_status == CUVS_HNSW_POLICY_UNSUPPORTED)
+        ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+            errmsg("pg_cuvs: unsupported stored ACE partition-builder readback version")));
+    if (ace_status == CUVS_HNSW_POLICY_CORRUPT)
+        ereport(ERROR, (errcode(ERRCODE_INDEX_CORRUPTED),
+            errmsg("pg_cuvs: invalid stored ACE partition-builder readback")));
     initStringInfo(&json);
     appendStringInfo(&json,
         "{\"status\":\"recorded\",\"policy_version\":%u,\"route\":\"%s\","
@@ -3676,7 +3709,7 @@ pg_cuvs_hnsw_build_info(PG_FUNCTION_ARGS)
         "\"sdk_host_budget_bytes\":%llu,\"sdk_gpu_budget_bytes\":%llu,"
         "\"auto_overflow\":%s,\"route_decided\":\"%s\","
         "\"ivfpq_distance_dtype\":\"%s\",\"graph_fallback\":%s,"
-        "\"guard\":\"selected_route_returned\",\"memory_upper_bound_guaranteed\":false}",
+        "\"guard\":\"selected_route_returned\",\"memory_upper_bound_guaranteed\":false",
         policy.version, cuvs_hnsw_route_name(policy.route),
         (unsigned long long)policy.n_rows, policy.dim, policy.metric,
         cuvs_hnsw_algo_name(policy.requested_algo), policy.requested_ef,
@@ -3694,6 +3727,24 @@ pg_cuvs_hnsw_build_info(PG_FUNCTION_ARGS)
         policy.route != CUVS_HNSW_ROUTE_IVF_PQ ? "not_applicable"
             : (policy.route_flags & CUVS_HNSW_ROUTE_FLAG_IVFPQ_FP32) ? "fp32" : "fp16",
         (policy.route_flags & CUVS_HNSW_ROUTE_FLAG_GRAPH_FALLBACK) ? "true" : "false");
+    /* ace_ef_construction above is A; the SDK consumes q = A / 16 (cuvs_hnsw_policy.h). */
+    if (policy.route != CUVS_HNSW_ROUTE_ACE)
+        appendStringInfoString(&json, ",\"ace_readback\":\"not_applicable\"");
+    else if (ace_status != CUVS_HNSW_POLICY_RECORDED)
+        appendStringInfoString(&json, ",\"ace_readback\":\"not_recorded\"");
+    else
+    {
+        appendStringInfo(&json,
+            ",\"ace_readback\":\"recorded\",\"ace_build_quality_source\":\"%s\","
+            "\"ace_build_quality\":%u,\"ace_local_intermediate_degree\":%u,",
+            ace.quality_source == CUVS_HNSW_ACE_SOURCE_MANUAL ? "manual" : "auto",
+            ace.quality, ace.local_intermediate);
+        if (ace.local_iterations)
+            appendStringInfo(&json, "\"ace_local_nn_descent_iterations\":%u", ace.local_iterations);
+        else
+            appendStringInfoString(&json, "\"ace_local_nn_descent_iterations\":\"varies_by_partition\"");
+    }
+    appendStringInfoChar(&json, '}');
     PG_RETURN_DATUM(DirectFunctionCall1(jsonb_in, CStringGetDatum(json.data)));
 }
 

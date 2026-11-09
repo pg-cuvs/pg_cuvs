@@ -389,12 +389,15 @@ typedef struct CuvsHnswFileBuild {
     uint32_t build_algo;
     uint32_t ef_construction;
     uint32_t auto_overflow; /* CUVS_HNSW_OVERFLOW_*: daemon --hnsw-auto-overflow */
+    uint32_t ace_quality;   /* CUVS_HNSW_ACE_QUALITY_AUTO or Q: daemon --hnsw-ace-build-quality */
     CuvsHnswPolicy *policy; /* successful actual build receipt; caller-owned */
     /* Internal safe-boundary observer. Never received from IPC; only a
      * CUVS_TEST_HOOKS daemon installs it for controlled failure fixtures. */
     int (*phase_hook)(void *arg, const char *phase);
     void *phase_arg;
 } CuvsHnswFileBuild;
+
+uint32_t cuvs_hnsw_sdk_nn_default_iterations(void);
 
 int cuvs_hnsw_build_file(int vectors_fd, int owner_fd,
     const CuvsHnswFileBuild *params, const char *workdir, int device_id,

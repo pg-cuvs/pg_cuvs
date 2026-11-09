@@ -217,6 +217,7 @@ typedef struct BuildCall {
     const char *sock;
     int vectors_fd, rc, result_fd;
     CuvsHnswPolicy policy;
+    CuvsHnswAceReadback ace;
     CuvsHnswBudgetSnapshot budget;
     char error[128];
 } BuildCall;
@@ -226,7 +227,7 @@ client_fn(void *arg)
 {
     BuildCall *c = arg;
     c->rc = cuvs_ipc_build_hnsw_file(c->sock, c->vectors_fd, N, DIM, CUVS_METRIC_L2, 64, 128, 0,
-                                     HOST_REQ, CUVS_HNSW_ALGO_AUTO, 64, &c->policy, &c->budget,
+                                     HOST_REQ, CUVS_HNSW_ALGO_AUTO, 64, &c->policy, &c->budget, &c->ace,
                                      &c->result_fd, c->error, sizeof(c->error));
     return NULL;
 }

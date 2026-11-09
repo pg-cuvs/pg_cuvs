@@ -16,7 +16,7 @@
 #include <stdlib.h>
 #include <string.h>
 static int listener, fixture_case, polls, accepts;
-static uint32_t requested_algo(void) { return fixture_case == 5 || fixture_case == 7 ? CUVS_HNSW_ALGO_ACE : fixture_case == 6 ? CUVS_HNSW_ALGO_IVF_PQ : CUVS_HNSW_ALGO_AUTO; }
+static uint32_t requested_algo(void) { return fixture_case == 5 || fixture_case == 7 || fixture_case == 17 ? CUVS_HNSW_ALGO_ACE : fixture_case == 6 ? CUVS_HNSW_ALGO_IVF_PQ : CUVS_HNSW_ALGO_AUTO; }
 static int cancel_wait(void) { return fixture_case == 1 && ++polls >= 3; }
 static void *daemon_mock(void *unused) {
     (void)unused;
@@ -41,7 +41,7 @@ static void *daemon_mock(void *unused) {
         close(c); return NULL;
     }
     assert(request_status == CUVS_STATUS_OK);
-    assert(req.version == CUVS_HNSW_FILE_VERSION && req.version == 4 && req.host_budget == (1ULL << 30));
+    assert(req.version == CUVS_HNSW_FILE_VERSION && req.version == 5 && req.host_budget == (1ULL << 30));
     assert(req.build_algo == requested_algo() && req.ef_construction == 64);
     assert(cuvs_hnsw_file_request_supported(&req));
     assert(cuvs_hnsw_regular_disk(vectors));
@@ -72,7 +72,7 @@ static void *daemon_mock(void *unused) {
         reply.policy.magic = CUVS_HNSW_POLICY_MAGIC;
         reply.policy.version = fixture_case == 4 ? 99 : fixture_case == 9 ? CUVS_HNSW_POLICY_LEGACY_VERSION : CUVS_HNSW_POLICY_VERSION;
         reply.policy.bytes = sizeof(reply.policy);
-        reply.policy.route = fixture_case == 5 || fixture_case == 8 ? CUVS_HNSW_ROUTE_ACE : CUVS_HNSW_ROUTE_IVF_PQ;
+        reply.policy.route = fixture_case == 5 || fixture_case == 8 || fixture_case == 17 ? CUVS_HNSW_ROUTE_ACE : CUVS_HNSW_ROUTE_IVF_PQ;
         reply.policy.requested_algo = fixture_case == 10 ? CUVS_HNSW_ALGO_IVF_PQ : req.build_algo;
         reply.policy.requested_ef = req.ef_construction;
         reply.policy.guard_passed = 1;
@@ -81,11 +81,16 @@ static void *daemon_mock(void *unused) {
         reply.policy.hierarchy = fixture_case == 16 ? !req.hierarchy : req.hierarchy;
         reply.policy.internal_builder = reply.policy.route;
         reply.policy.partitions = reply.policy.route == CUVS_HNSW_ROUTE_ACE ? 2 : 0;
+        reply.policy.degree = 64; reply.policy.intermediate = 128; reply.policy.ace_ef = 120;
+        /* v5: an ACE receipt travels with its partition-builder readback; case 17 omits it. */
+        if (reply.policy.route == CUVS_HNSW_ROUTE_ACE && fixture_case != 17)
+            cuvs_hnsw_ace_readback_fill(&reply.ace, CUVS_HNSW_ACE_QUALITY_AUTO, 120, 64,
+                reply.policy.n_rows, 2, 20);
         assert(write(c, "R", 1) == 1);
         assert(cuvs_fd_send(c, read_only, &reply, sizeof(reply)) == 0);
         close(read_only);
         if (fixture_case == 2 || fixture_case == 4 || (fixture_case >= 7 && fixture_case <= 10) || fixture_case >= 15)
-            assert(recv(owner, &token, 1, 0) == 0); // invalid FD rejected, no ACK
+            assert(recv(owner, &token, 1, 0) == 0); // invalid FD/receipt/readback rejected, no ACK
         else
             assert(recv(owner, &token, 1, 0) == 1 && token == 'A');
     }
@@ -108,17 +113,18 @@ int main(void) {
     assert(write(fd, &first, sizeof(first)) == sizeof(first));
     assert(ftruncate(fd, 100 * 128 * sizeof(float)) == 0);
     cuvs_ipc_set_wait_callback(cancel_wait);
-    for (int sequence = 0; sequence < 15; sequence++) {
+    for (int sequence = 0; sequence < 16; sequence++) {
         fixture_case = sequence < 13 ? sequence : sequence + 2;
         pthread_t t;
         int result = -1;
         CuvsHnswPolicy policy;
+        CuvsHnswAceReadback ace;
         CuvsHnswBudgetSnapshot budget;
         char err[128], bytes[16] = {0};
         polls = 0;
         assert(pthread_create(&t, 0, daemon_mock, 0) == 0);
         int rc = cuvs_ipc_build_hnsw_file(path, fd, 100, 128, CUVS_METRIC_L2,
-            64, 128, 0, 1ULL << 30, requested_algo(), 64, &policy, &budget, &result, err, sizeof(err));
+            64, 128, 0, 1ULL << 30, requested_algo(), 64, &policy, &budget, &ace, &result, err, sizeof(err));
         if (fixture_case == 1) { assert(rc == CUVS_STATUS_CANCELED && result == -1); }
         else if (fixture_case == 2 || fixture_case == 4 || (fixture_case >= 7 && fixture_case <= 10) || fixture_case >= 15) { assert(rc == CUVS_STATUS_ERROR && result == -1); }
         else if (fixture_case == 3 || fixture_case == 11 || fixture_case == 12) {
@@ -133,6 +139,11 @@ int main(void) {
         else {
             assert(rc == CUVS_STATUS_OK && result >= 0);
             assert(cuvs_hnsw_policy_valid(&policy));
+            if (policy.route == CUVS_HNSW_ROUTE_ACE)
+                assert(cuvs_hnsw_ace_readback_valid(&ace, &policy) && ace.local_intermediate == 96
+                       && ace.quality == 7 && ace.local_iterations == 12);
+            else
+                assert(ace.magic == 0);
             assert((fcntl(result, F_GETFL) & O_ACCMODE) == O_RDONLY);
             assert(read(result, bytes, 15) == 15 && strcmp(bytes, "serialized-hnsw") == 0);
             close(result);
@@ -142,16 +153,16 @@ int main(void) {
     /* Actual client must reject reserved/unknown algo BEFORE uds_connect.
      * An unavailable path would otherwise return UNAVAILABLE, not ERROR. */
     for (unsigned i = 0; i < 4; i++) {
-        int result = -1; CuvsHnswPolicy p; CuvsHnswBudgetSnapshot b = {1, 1, 1, 1, 1, 1}; char err[128];
+        int result = -1; CuvsHnswPolicy p; CuvsHnswAceReadback a; CuvsHnswBudgetSnapshot b = {1, 1, 1, 1, 1, 1}; char err[128];
         uint32_t algo = i == 0 ? CUVS_HNSW_ALGO_NN_DESCENT : i == 1 ? UINT32_MAX : CUVS_HNSW_ALGO_AUTO;
         uint32_t ef = i == 2 ? 3 : i == 3 ? 1001 : 64;
         int before = accepts;
         int rc = cuvs_ipc_build_hnsw_file("/nonexistent/never-connect", fd, 100, 128,
-            CUVS_METRIC_L2, 64, 128, 0, 1ULL << 30, algo, ef, &p, &b, &result, err, sizeof(err));
+            CUVS_METRIC_L2, 64, 128, 0, 1ULL << 30, algo, ef, &p, &b, &a, &result, err, sizeof(err));
         assert(rc == CUVS_STATUS_ERROR && result == -1 && p.magic == 0 && accepts == before);
         assert(b.host_estimate == 0 && b.pool_used == 0 && b.logical_used == 0); /* zeroed, no reply */
     }
-    assert(accepts == 15);
+    assert(accepts == 16);
     /* Directly exercise the daemon's shared production prefix consumer.
      * Legacy/future send only16 bytes: it must reject without reading a tail. */
     for (unsigned k = 0; k < 5; k++) {
@@ -164,10 +175,10 @@ int main(void) {
         assert(write(c, &cmd, sizeof(cmd)) == sizeof(cmd));
         int channel[2] = {-1, -1};
         if (k < 3) {
-            struct {uint32_t version, hierarchy; uint64_t host;} prefix = {k == 0 ? 1 : k == 1 ? 3 : 99, 0, 1ULL << 30};
+            struct {uint32_t version, hierarchy; uint64_t host;} prefix = {k == 0 ? 1 : k == 1 ? 4 : 99, 0, 1ULL << 30};
             assert(!cuvs_fd_send(c, fd, &prefix, sizeof(prefix)));
         } else {
-            CuvsHnswFileRequest req = {4, 0, 1ULL << 30, k == 3 ? CUVS_HNSW_ALGO_NN_DESCENT : UINT32_MAX, 64};
+            CuvsHnswFileRequest req = {CUVS_HNSW_FILE_VERSION, 0, 1ULL << 30, k == 3 ? CUVS_HNSW_ALGO_NN_DESCENT : UINT32_MAX, 64};
             assert(!socketpair(AF_UNIX, SOCK_STREAM, 0, channel));
             assert(!cuvs_fd_send(c, fd, &req, sizeof(req)));
             char token = 'O'; assert(!cuvs_fd_send(c, channel[1], &token, 1));
@@ -180,7 +191,7 @@ int main(void) {
         close(c); if (channel[0] >= 0) {close(channel[0]); close(channel[1]);}
         assert(!pthread_join(t, NULL) && fcntl(fd, F_GETFD) >= 0);
     }
-    assert(accepts == 20);
+    assert(accepts == 21);
     close(fd); close(listener); unlink(path); rmdir(dir);
-    printf("PASS 15 actual-client wire cases,4 preconnect refusals,5 shared-daemon prefix/settings cases; explicitACE/IVF, forgedroute/version/request rejection, cancellation/status13/protocolerror; current global v%u retained\n", CUVS_PROTO_VERSION);
+    printf("PASS 16 actual-client wire cases (v5 ACE readback bound),4 preconnect refusals,5 shared-daemon prefix/settings cases; explicitACE/IVF, forgedroute/version/request rejection, cancellation/status13/protocolerror; current global v%u retained\n", CUVS_PROTO_VERSION);
 }

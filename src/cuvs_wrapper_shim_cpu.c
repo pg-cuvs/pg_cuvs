@@ -633,6 +633,13 @@ int cuvs_rmm_set_dedicated_stream(int on)
     return 0;
 }
 
+/* No SDK: the shim never builds an HNSW graph, so no ACE readback is made. */
+uint32_t
+cuvs_hnsw_sdk_nn_default_iterations(void)
+{
+    return 0;
+}
+
 /* The CPU reference shim cannot prove graph construction or SDK identity. */
 int
 cuvs_hnsw_build_file(int vectors_fd, int owner_fd,

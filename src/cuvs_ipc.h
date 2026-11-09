@@ -94,8 +94,9 @@
  * Owner channel: C=cancel, EOF=owner lost, A=result handoff acknowledged. */
 #include "cuvs_hnsw_policy.h"
 /* v4 (2026-11-09): the reply appends CuvsHnswBudgetSnapshot, so a v3 peer
- * is refused with the co-deploy message instead of a short read. */
-#define CUVS_HNSW_FILE_VERSION 4u
+ * is refused with the co-deploy message instead of a short read.
+ * v5 (2026-11-10): the reply appends CuvsHnswAceReadback after the budget. */
+#define CUVS_HNSW_FILE_VERSION 5u
 typedef struct CuvsHnswFileRequest {
     uint32_t version;
     uint32_t hierarchy;        /* 0=NONE (nsw), 1=GPU; never CPU */
@@ -123,7 +124,8 @@ int cuvs_ipc_build_hnsw_file(const char *socket_path, int vectors_fd,
     uint64_t n_vecs, uint32_t dim, uint32_t metric, uint32_t graph_degree,
     uint32_t intermediate_degree, uint32_t hierarchy, uint64_t host_budget,
     uint32_t build_algo, uint32_t ef_construction, CuvsHnswPolicy *policy,
-    struct CuvsHnswBudgetSnapshot *budget, int *hnsw_fd, char *error, size_t error_len);
+    struct CuvsHnswBudgetSnapshot *budget, CuvsHnswAceReadback *ace_readback,
+    int *hnsw_fd, char *error, size_t error_len);
 #define CUVS_OP_SERVER_SETTINGS    24 /* read-only daemon startup settings */
 #define CUVS_OP_RMM_POOL_STATUS    25 /* quota and live pool counters */
 
@@ -295,6 +297,7 @@ typedef struct CuvsHnswFileReply {
     CuvsReplyHeader header;
     CuvsHnswPolicy policy;
     CuvsHnswBudgetSnapshot budget;
+    CuvsHnswAceReadback ace;    /* v5: ACE route only, else zero */
 } CuvsHnswFileReply;
 
 /* I3-C pre-spool forecast payloads (ops 40, 41 above). Version 2 appends

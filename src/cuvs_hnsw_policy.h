@@ -129,7 +129,7 @@ static inline const char *cuvs_hnsw_route_name(uint32_t route)
     }
 }
 
-/* Reloption default64 preserves I128 / hierarchy200 / ACE120. These control
+/* Reloption default64 preserves I128 / hierarchy200 / ACE120 (cuvs_hnsw_ace_ef). These control
  * construction effort, not a promise of monotonic recall. Do not replace the
  * pinned IVF training/probe defaults with cuVS AUTO heuristics. */
 static inline uint32_t cuvs_hnsw_scaled_quality(uint32_t base, uint32_t ef,
@@ -137,6 +137,54 @@ static inline uint32_t cuvs_hnsw_scaled_quality(uint32_t base, uint32_t ef,
 {
     uint64_t value = ((uint64_t)base * ef + 63) / 64;
     return value < minimum ? minimum : value > maximum ? maximum : (uint32_t)value;
+}
+
+/* ACE partition build quality, daemon --hnsw-ace-build-quality auto|Q.
+ * cuVS 26.04 reads ace_params.ef_construction (A) only as q = A / 16
+ * (cagra.cpp graph_params_heuristic): an ACE partition under 1e6 rows builds
+ * its kNN graph with NN-descent for 5 + q iterations, a larger one with IVF-PQ
+ * at round(2 + sqrt(n_lists) / 20 + q) probes.
+ * auto: A is the linked SDK's own ace_params default (120 in cuVS 26.04,
+ *   12 NN-descent iterations) scaled with ef_construction like the
+ *   intermediate degree and the hierarchy quality; the value the product
+ *   has always used.
+ *   The partition kNN width stays the SDK's 3 * (degree / 2), 96 at degree
+ *   64. Handing the scaled intermediate degree (128) to the partition
+ *   builder instead lowered recall at both 12 and 20 iterations (999,000 x
+ *   768, degree 64), so it is recorded, not changed.
+ * Q (0..4095): A = 16 * Q for every build whatever ef_construction is, for
+ *   diagnosis or pinning. Q is the integer the SDK consumes, so distinct Q
+ *   values never collapse to the same SDK input. */
+#define CUVS_HNSW_ACE_QUALITY_AUTO UINT32_MAX
+#define CUVS_HNSW_ACE_QUALITY_MAX 4095u
+#define CUVS_HNSW_SDK_ACE_QUALITY_DIVISOR 16u
+
+/* 0 and *out set on "auto" or a decimal 0..4095; -1 otherwise. */
+static inline int cuvs_hnsw_ace_quality_parse(const char *name, uint32_t *out)
+{
+    uint32_t q = 0;
+    if (!name || !*name) return -1;
+    if (!strcmp(name, "auto")) { *out = CUVS_HNSW_ACE_QUALITY_AUTO; return 0; }
+    for (const char *c = name; *c; c++)
+    {
+        if (*c < '0' || *c > '9' || c - name >= 4) return -1;
+        q = q * 10 + (uint32_t)(*c - '0');
+    }
+    if (q > CUVS_HNSW_ACE_QUALITY_MAX) return -1;
+    *out = q;
+    return 0;
+}
+
+#define CUVS_HNSW_SDK_ACE_NN_ITERATION_OFFSET 5u
+
+/* The A handed to the SDK. sdk_default_ace_ef is ace_params{}.ef_construction
+ * of the linked SDK headers (120 in cuVS 26.04). */
+static inline uint32_t cuvs_hnsw_ace_ef(uint32_t setting, uint32_t ef,
+                                        uint32_t sdk_default_ace_ef)
+{
+    if (setting == CUVS_HNSW_ACE_QUALITY_AUTO)
+        return cuvs_hnsw_scaled_quality(sdk_default_ace_ef, ef, 4, 65535);
+    return setting * CUVS_HNSW_SDK_ACE_QUALITY_DIVISOR;
 }
 
 static inline int cuvs_hnsw_policy_valid(const CuvsHnswPolicy *p)
@@ -207,6 +255,94 @@ cuvs_hnsw_policy_read(const void *data, size_t available, CuvsHnswPolicy *out)
     if (cuvs_hnsw_policy_valid(out) || cuvs_hnsw_policy_legacy_valid(out))
         return CUVS_HNSW_POLICY_RECORDED;
     return CUVS_HNSW_POLICY_CORRUPT;
+}
+
+/* ACE partition-builder readback. Stored on the metapage right after the
+ * receipt of an ACE index and appended to the op-23 reply (payload v5); the
+ * receipt layout and version are unchanged, so an older ACE index simply has
+ * no readback. ACE builds run only on the verified pinned SDK (memory-guard
+ * marker @60b19a0f), whose partition builders do this with A and degree:
+ *   local_intermediate: from_hnsw_params(degree / 2, SAME_GRAPH_FOOTPRINT)
+ *     gives each partition builder a kNN width of 3 * (degree / 2), not the
+ *     receipt's intermediate degree (the resident width and the ACE memory
+ *     plan input).
+ *   local_iterations: NN-descent iterations of every partition. A partition
+ *     under 1e6 rows runs 5 + q; one of 1e6 rows or more is moved from IVF-PQ
+ *     to NN-descent at the SDK default iterations by the positive-budget
+ *     partition ledger (patch 0003). Two partitions each hold every row (core
+ *     plus augmented), so the value is exact; with more partitions and at
+ *     least 1e6 rows it differs between partitions and is recorded as 0. */
+#define CUVS_HNSW_ACE_READBACK_MAGIC UINT32_C(0x43564152)
+#define CUVS_HNSW_ACE_READBACK_VERSION 1u
+#define CUVS_HNSW_SDK_ACE_NN_MAX_ROWS UINT64_C(1000000)
+#define CUVS_HNSW_ACE_SOURCE_AUTO 0u
+#define CUVS_HNSW_ACE_SOURCE_MANUAL 1u
+typedef struct CuvsHnswAceReadback {
+    uint32_t magic, version, bytes;
+    uint32_t quality_source;     /* CUVS_HNSW_ACE_SOURCE_*: --hnsw-ace-build-quality */
+    uint32_t quality;            /* q = ace_ef / 16, the integer the SDK consumes */
+    uint32_t local_intermediate; /* partition kNN width */
+    uint32_t local_iterations;   /* 0: differs between partitions */
+    uint32_t reserved;           /* 0 */
+} CuvsHnswAceReadback;
+
+static inline uint32_t cuvs_hnsw_sdk_ace_local_width(uint32_t degree)
+{
+    return 3u * (degree / 2u);
+}
+
+static inline void cuvs_hnsw_ace_readback_fill(CuvsHnswAceReadback *r,
+    uint32_t setting, uint32_t ace_ef, uint32_t degree, uint64_t n_rows,
+    uint32_t partitions, uint32_t sdk_nn_iterations)
+{
+    uint32_t q = ace_ef / CUVS_HNSW_SDK_ACE_QUALITY_DIVISOR;
+    memset(r, 0, sizeof(*r));
+    r->magic = CUVS_HNSW_ACE_READBACK_MAGIC;
+    r->version = CUVS_HNSW_ACE_READBACK_VERSION;
+    r->bytes = sizeof(*r);
+    r->quality_source = setting == CUVS_HNSW_ACE_QUALITY_AUTO
+        ? CUVS_HNSW_ACE_SOURCE_AUTO : CUVS_HNSW_ACE_SOURCE_MANUAL;
+    r->quality = q;
+    r->local_intermediate = cuvs_hnsw_sdk_ace_local_width(degree);
+    if (n_rows < CUVS_HNSW_SDK_ACE_NN_MAX_ROWS)
+        r->local_iterations = CUVS_HNSW_SDK_ACE_NN_ITERATION_OFFSET + q;
+    else if (partitions == 2)
+        r->local_iterations = sdk_nn_iterations;
+    else
+        r->local_iterations = 0;
+}
+
+/* Shape check of a stored or received readback against its receipt. */
+static inline int cuvs_hnsw_ace_readback_valid(const CuvsHnswAceReadback *r,
+                                               const CuvsHnswPolicy *p)
+{
+    return r && p && r->magic == CUVS_HNSW_ACE_READBACK_MAGIC
+        && r->version == CUVS_HNSW_ACE_READBACK_VERSION && r->bytes == sizeof(*r)
+        && p->route == CUVS_HNSW_ROUTE_ACE
+        && r->quality_source <= CUVS_HNSW_ACE_SOURCE_MANUAL
+        && r->quality == p->ace_ef / CUVS_HNSW_SDK_ACE_QUALITY_DIVISOR
+        && r->local_intermediate == cuvs_hnsw_sdk_ace_local_width(p->degree)
+        && (r->local_iterations == 0
+            || p->n_rows >= CUVS_HNSW_SDK_ACE_NN_MAX_ROWS
+            || r->local_iterations == CUVS_HNSW_SDK_ACE_NN_ITERATION_OFFSET + r->quality)
+        && r->reserved == 0;
+}
+
+/* Bounded reader of the tail after a receipt: absent, valid, or corrupt. */
+static inline CuvsHnswPolicyReadStatus
+cuvs_hnsw_ace_readback_read(const void *data, size_t available,
+                            const CuvsHnswPolicy *p, CuvsHnswAceReadback *out)
+{
+    uint32_t magic;
+    memset(out, 0, sizeof(*out));
+    if (available < sizeof(magic)) return CUVS_HNSW_POLICY_NOT_RECORDED;
+    memcpy(&magic, data, sizeof(magic));
+    if (magic != CUVS_HNSW_ACE_READBACK_MAGIC) return CUVS_HNSW_POLICY_NOT_RECORDED;
+    if (available < sizeof(*out)) return CUVS_HNSW_POLICY_CORRUPT;
+    memcpy(out, data, sizeof(*out));
+    if (out->version != CUVS_HNSW_ACE_READBACK_VERSION) return CUVS_HNSW_POLICY_UNSUPPORTED;
+    return cuvs_hnsw_ace_readback_valid(out, p) ? CUVS_HNSW_POLICY_RECORDED
+                                                : CUVS_HNSW_POLICY_CORRUPT;
 }
 
 /* Match SDK integer sampling: ratio=max(1,N/max(floor(fraction*N),lists));

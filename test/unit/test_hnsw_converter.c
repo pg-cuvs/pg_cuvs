@@ -869,7 +869,7 @@ test_hierarchical_native_packing_case(int dim, int bytes_per_dim, int m)
     chain_test_reset();
     chain_test_nblocks = 0;
     hnsw_write_disk_metapage(NULL, &parsed, (uint32_t)dim, n_pages,
-                             true, &table, &policy);
+                             true, &table, &policy, NULL);
     hnsw_write_disk_pages(NULL, f.hnsw_fd, f.tids_fd, &parsed, N,
                           (uint32_t)dim, bytes_per_dim, n_pages, true, &table);
     assert_source_data_page_chain(n_pages);

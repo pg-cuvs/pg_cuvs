@@ -2980,7 +2980,7 @@ cuvs_build_hnsw_from_heap(Relation heapRel, Relation indexRel, IndexInfo *indexI
             rc = cuvs_ipc_build_hnsw_file(cuvs_socket_path,
                 FileGetRawDesc(spool->vectors), spool->n, spool->dim, spool->metric,
                 64, 128, hierarchy, cap,
-                build_algo, ef_construction, &out->policy, &budget,
+                build_algo, ef_construction, &out->policy, &budget, &out->ace,
                 &out->hnsw_fd, error, sizeof(error));
             if (rc == CUVS_STATUS_HNSW_RESIDENT_BUDGET_EXCEEDED)
                 cuvs_hnsw_budget_error(build_algo, &budget);
