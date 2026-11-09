@@ -38,6 +38,8 @@
 #include <rmm/mr/managed_memory_resource.hpp>          /* I4: build-only large_workspace */
 #include <raft/core/resource/device_memory_resource.hpp>
 #include "cuvs_lw_guard.hpp"
+#include "cuvs_host_free_fence.hpp"        /* Q6: fenced RAFT host frees */
+#include <raft/mr/host_memory_resource.hpp>
 
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>   /* Phase 3L: half precision for brute-force (cuvs.bf_precision) */
@@ -214,6 +216,27 @@ void release_res(int device_id, std::unique_ptr<ResSlot> r)
     g_device_pools[device_id].release(std::move(r));
 }
 
+/* Q6 (cuvs_host_free_fence.hpp): RAFT's default host resource becomes a
+ * fenced new/delete resource, installed once before the first request
+ * borrows a stream. Containers created before that keep their own resource
+ * and free as before. libcuvs exports the default-resource holder as a
+ * unique symbol, so the containers cuVS creates inside libcuvs see it too. */
+static int fence_sync_stream(void *stream)
+{
+    return (int)cudaStreamSynchronize(static_cast<cudaStream_t>(stream));
+}
+
+static void ensure_fenced_host_resource()
+{
+    static const bool installed = [] {
+        static CuvsFencedHostResource fenced;
+        static raft::pmr::resource_adaptor adaptor{&fenced};
+        raft::mr::set_default_host_resource(raft::mr::host_resource_ref{adaptor});
+        return true;
+    }();
+    (void)installed;
+}
+
 /* RAII: borrow on construction, return to the pool on destruction. If a cuVS
  * call threw, the stream/handles may carry a sticky error; reusing such a
  * resource from the pool can abort a later, unrelated request (the whole
@@ -230,6 +253,9 @@ struct PooledRes {
     std::unique_ptr<ResSlot> r; /* poisoned: destroyed with its own stream */
     int dev;
     bool poisoned = false;
+    /* Q6: host frees on this thread wait for the borrowed stream until the
+     * resource is returned or destroyed (closed first in the destructor). */
+    std::optional<CuvsHostFreeFence::Scope> fence;
     explicit PooledRes(int device_id) : r(acquire_res(device_id)), dev(device_id) {
         cudaError_t err = cudaSetDevice(device_id);
         if (err != cudaSuccess) {
@@ -238,8 +264,14 @@ struct PooledRes {
             poisoned = true;
             throw std::runtime_error("cudaSetDevice failed");
         }
+        ensure_fenced_host_resource();
+        fence.emplace(static_cast<void *>(r->res->get_stream().value()), fence_sync_stream);
     }
-    ~PooledRes() { if (r && !poisoned) release_res(dev, std::move(r)); }
+    ~PooledRes()
+    {
+        fence.reset();
+        if (r && !poisoned) release_res(dev, std::move(r));
+    }
     raft::device_resources &get() { return *r->res; }
     void poison() { poisoned = true; }
 };
