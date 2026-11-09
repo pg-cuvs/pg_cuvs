@@ -458,7 +458,9 @@ about `4 × raw vector bytes + n × (graph_degree × 8 + 64)` bytes. Short of th
 tmpfs, the build fails before any GPU work with SQLSTATE XX000 and the message
 `HNSW needs regular disk capacity: need=<bytes> avail=<bytes> fs=<tmpfs|regular>
 route=<route>`; its HINT names the filesystem and adds that the PostgreSQL temporary
-tablespace needs a further `n × dim × 4` bytes for the input spool.
+tablespace needs a further `n × dim × 4` bytes for the input spool. The `[hnsw_route]`
+line then has `status=5` and still names the decided route (`route=none` only when no
+route was decided, such as an over-budget refusal).
 
 `m` remains informational. Direct `ef_construction` scales intermediate degree from128,
 hierarchy construction effort from200, and ACE effort from120 at the default64;

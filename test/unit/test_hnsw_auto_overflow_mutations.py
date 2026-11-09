@@ -85,6 +85,10 @@ MUTANTS = [
      '        && 1;'),
     ('disk_hint_changed', 'cuvs_route_preflight.h',
      '"tablespace needs a further n x dim x 4 bytes."', '"tablespace needs more space."'),
+    # Q4-4: [hnsw_route] keeps the decided route on a disk refusal
+    ('route_log_none_on_disk_refusal', 'cuvs_hnsw_build_common.h',
+     '    return f->decision.route ? cuvs_hnsw_route_name(f->decision.route) : "none";',
+     '    return f->status == CUVS_STATUS_OK ? cuvs_hnsw_route_name(f->decision.route) : "none";'),
     ('disk_formula_changed', 'cuvs_hnsw_build_common.h',
      '    return raw * 4 + n * (degree * 8ULL + 64);', '    return raw * 2 + n * (degree * 8ULL + 64);'),
     ('cagra_ar0_refuses_without_stats', 'cuvs_route_preflight.h',

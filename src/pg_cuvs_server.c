@@ -10032,14 +10032,16 @@ hnsw_pool_used(int device)
 }
 
 /* [hnsw_route]: one line per decision, pre-spool forecast or build. Q4-5/Q4-6
- * read est_host and route from it; route must equal the receipt's route. */
+ * read est_host and route from it; route must equal the receipt's route.
+ * route is the decided route even when the disk precheck refused it (status
+ * 5, Q4-4 route=ace_disk); none only when no route was decided. */
 static void
 hnsw_route_log(const char *phase, uint32_t algo, const CuvsHnswForecast *f,
                const char *error)
 {
     LOG_INFO("[hnsw_route] phase=%s requested_algo=%s route=%s overflow=%s overflowed=%u status=%u rows=%llu est_host=%llu est_gpu=%llu host_budget=%llu gpu_budget=%llu partitions=%u disk_need=%llu%s%s\n",
         phase, cuvs_hnsw_algo_name(algo),
-        f->status == CUVS_STATUS_OK ? cuvs_hnsw_route_name(f->decision.route) : "none",
+        cuvs_hnsw_forecast_route_name(f),
         cuvs_hnsw_overflow_name(g_hnsw_auto_overflow), f->decision.overflowed, f->status,
         (unsigned long long)f->n, (unsigned long long)f->host_estimate,
         (unsigned long long)f->gpu_estimate, (unsigned long long)f->host_budget,
