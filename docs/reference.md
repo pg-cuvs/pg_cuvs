@@ -418,7 +418,7 @@ cagra/ivfpq") rather than silently failing.
 |-----------|------|---------|----------------|-------|
 | `graph_degree` | int | `64` | 8–512 | CAGRA output graph degree |
 | `intermediate_graph_degree` | int | `128` | 8–1024 | Must be ≥ `graph_degree` (fail-closed) |
-| `build_algo` | enum | `auto` | `auto`, `ivf_pq`, `nn_descent` | CAGRA build algorithm |
+| `build_algo` | enum | `auto` | `auto`, `ivf_pq`, `nn_descent` | CAGRA build algorithm. The IVF-PQ kNN search (`ivf_pq`, or `auto` when cuVS picks IVF-PQ) uses fp32 LUT, internal and coarse distances when 4 x max\|x\|^2 of the corpus (max\|x\|^2 for inner product and cosine) reaches 65504, the fp16 maximum; otherwise cuVS's fp16 defaults stay. The daemon logs `[cuvs_cagra_build_multi] knn precision` with the bound and the choice |
 | `index_dir` | string | (uses `cuvs.index_dir`) | path | Per-index artifact directory (ADR-045); self-describes in `reloptions` so no-GUC sessions still find it |
 
 ### `ivfpq`

@@ -20,6 +20,11 @@
 #include "cuvs_hnsw_sdk_plan.cuh"  /* serialize/deserialize merged here in cuVS 25.x+ */
 #include <cuvs/neighbors/hnsw.hpp>   /* Phase 3I-1: CPU HNSW fallback */
 #include <cuvs/neighbors/ivf_pq.hpp> /* 3P: IVF-PQ index */
+#include <cuvs/neighbors/nn_descent.hpp> /* has_enough_device_memory (CAGRA AUTO kNN choice) */
+#include <thrust/execution_policy.h>
+#include <thrust/functional.h>
+#include <thrust/iterator/counting_iterator.h>
+#include <thrust/transform_reduce.h>
 #include <cuvs/core/bitset.hpp>      /* 3O: cuvs::core::bitset_view */
 #include <raft/core/device_resources.hpp>
 #include <raft/core/device_mdarray.hpp>
@@ -249,6 +254,30 @@ static void ensure_fenced_host_resource()
         return true;
     }();
     (void)installed;
+}
+
+/* Largest squared row norm of a device row-major matrix (+inf if any row is
+ * non-finite), for the fp16 kNN bound (cuvs_hnsw_ivfpq_needs_fp32). */
+struct CuvsRowSqNorm {
+    const float *data;
+    int64_t dim;
+    __device__ double operator()(int64_t row) const
+    {
+        const float *r = data + row * dim;
+        double sum = 0.0;
+        for (int64_t j = 0; j < dim; j++)
+            sum += (double)r[j] * (double)r[j];
+        return isfinite(sum) ? sum : INFINITY;
+    }
+};
+
+static double device_max_sq_norm(raft::device_resources &res, const float *data,
+                                 int64_t rows, int64_t dim)
+{
+    if (rows <= 0) return 0.0;
+    return thrust::transform_reduce(thrust::cuda::par.on(res.get_stream()),
+        thrust::counting_iterator<int64_t>(0), thrust::counting_iterator<int64_t>(rows),
+        CuvsRowSqNorm{data, dim}, 0.0, thrust::maximum<double>());
 }
 
 /* RAII: borrow on construction, return to the pool on destruction. If a cuVS
@@ -1402,12 +1431,54 @@ cuvs_cagra_build_multi(const float **vecs, const int64_t *n_each, int n_parts,
          * std::variant). AUTO leaves std::monostate so cuVS picks heuristically
          * (ivf_pq for large, nn_descent for small). */
         namespace gbp = cuvs::neighbors::cagra::graph_build_params;
+        /* IVF-PQ kNN precision (cuvs_hnsw_ivfpq_needs_fp32): the corpus is
+         * already on the GPU, so the bound costs one reduction, not a host
+         * pass. fp16 data keeps every parameter as before. */
+        const bool may_use_ivf_pq = build_algo == CUVS_CAGRA_BUILD_IVF_PQ
+            || build_algo == CUVS_CAGRA_BUILD_AUTO;
+        const double max_sq = may_use_ivf_pq
+            ? device_max_sq_norm(res, d_corpus.data_handle(), total, (int64_t)dim) : 0.0;
+        const bool fp32 = may_use_ivf_pq && cuvs_hnsw_ivfpq_needs_fp32(max_sq, metric);
+        auto fp32_ivf_pq = [&](gbp::ivf_pq_params pq) {
+            pq.search_params.lut_dtype = CUDA_R_32F;
+            pq.search_params.internal_distance_dtype = CUDA_R_32F;
+            pq.search_params.coarse_search_dtype = CUDA_R_32F;
+            return pq;
+        };
+        const char *knn = "auto";
         if (build_algo == CUVS_CAGRA_BUILD_IVF_PQ)
-            params.graph_build_params = gbp::ivf_pq_params(d_corpus.extents());
+        {
+            auto pq = gbp::ivf_pq_params(d_corpus.extents());
+            params.graph_build_params = fp32 ? fp32_ivf_pq(pq) : pq;
+            knn = "ivf_pq";
+        }
         else if (build_algo == CUVS_CAGRA_BUILD_NN_DESCENT)
             params.graph_build_params =
                 gbp::nn_descent_params(params.intermediate_graph_degree);
-        /* else CUVS_CAGRA_BUILD_AUTO: leave monostate (heuristic). */
+        else if (fp32)
+        {
+            /* AUTO with fp16-unsafe data: make cuVS's own choice once
+             * (cagra_build.cuh: NN-descent when it fits the device, else
+             * IVF-PQ from the dataset shape) and pin it, with fp32 IVF-PQ. */
+            if (cuvs::neighbors::nn_descent::has_enough_device_memory(res, d_corpus.extents(),
+                    sizeof(uint32_t)))
+            {
+                params.graph_build_params = gbp::nn_descent_params(
+                    params.intermediate_graph_degree, params.metric);
+                knn = "nn_descent";
+            }
+            else
+            {
+                params.graph_build_params = fp32_ivf_pq(
+                    gbp::ivf_pq_params(d_corpus.extents(), params.metric));
+                knn = "ivf_pq";
+            }
+        }
+        /* else CUVS_CAGRA_BUILD_AUTO with fp16-safe data: leave monostate. */
+        if (may_use_ivf_pq)
+            fprintf(stderr, "[cuvs_cagra_build_multi] knn precision max_sq_norm=%.9g fp16_max=%.0f "
+                            "knn_builder=%s ivfpq_distance_dtype=%s\n",
+                    max_sq, CUVS_HNSW_FP16_MAX, knn, fp32 ? "fp32" : "fp16");
 
         auto idx = cuvs::neighbors::cagra::build(
             res,
