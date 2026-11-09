@@ -2552,7 +2552,7 @@ cuvs_ipc_build_hnsw_file(const char *socket_path, int vectors_fd,
     uint64_t n_vecs, uint32_t dim, uint32_t metric, uint32_t graph_degree,
     uint32_t intermediate_degree, uint32_t hierarchy, uint64_t host_budget,
     uint32_t build_algo, uint32_t ef_construction, CuvsHnswPolicy *policy,
-    int *hnsw_fd, char *error, size_t error_len)
+    CuvsHnswBudgetSnapshot *budget, int *hnsw_fd, char *error, size_t error_len)
 {
     int sock = -1, owner[2] = {-1, -1}, result_fd = -1;
     int rc = CUVS_STATUS_ERROR;
@@ -2563,6 +2563,7 @@ cuvs_ipc_build_hnsw_file(const char *socket_path, int vectors_fd,
     char token = 'O';
     *hnsw_fd = -1;
     if (policy) memset(policy, 0, sizeof(*policy));
+    if (budget) memset(budget, 0, sizeof(*budget));
     if (error_len) error[0] = '\0';
     if (!cuvs_hnsw_regular_disk(vectors_fd) || !n_vecs || n_vecs > INT32_MAX
         || !dim || metric > CUVS_METRIC_IP || !cuvs_hnsw_file_request_supported(&request))
@@ -2610,6 +2611,8 @@ cuvs_ipc_build_hnsw_file(const char *socket_path, int vectors_fd,
         reply = wire.header;
         rc = (int)reply.status;
         if (error_len) snprintf(error, error_len, "%.*s", (int)sizeof(reply.error), reply.error);
+        /* Decision bytes for the status-13 DETAIL; present on refusals too. */
+        if (budget) *budget = wire.budget;
         if (rc == CUVS_STATUS_OK)
         {
             if (!cuvs_hnsw_policy_valid(&wire.policy)

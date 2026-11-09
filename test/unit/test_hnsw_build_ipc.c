@@ -57,6 +57,8 @@ static void *daemon_mock(void *unused) {
         if (fixture_case == 11) reply.header.status = CUVS_STATUS_PROTO_MISMATCH;
         if (fixture_case == 12) reply.header.status = CUVS_STATUS_HNSW_RESIDENT_BUDGET_EXCEEDED;
         snprintf(reply.header.error, sizeof(reply.header.error), "synthetic capacity failure");
+        /* The decision bytes travel after the receipt on every reply. */
+        reply.budget = (CuvsHnswBudgetSnapshot){11, 22, 33, 44, 55, 66 + (uint64_t)fixture_case};
         assert(write(c, "R", 1) == 1);
         assert(cuvs_fd_send(c, -1, &reply, sizeof(reply)) == 0);
     } else {
@@ -111,17 +113,22 @@ int main(void) {
         pthread_t t;
         int result = -1;
         CuvsHnswPolicy policy;
+        CuvsHnswBudgetSnapshot budget;
         char err[128], bytes[16] = {0};
         polls = 0;
         assert(pthread_create(&t, 0, daemon_mock, 0) == 0);
         int rc = cuvs_ipc_build_hnsw_file(path, fd, 100, 128, CUVS_METRIC_L2,
-            64, 128, 0, 1ULL << 30, requested_algo(), 64, &policy, &result, err, sizeof(err));
+            64, 128, 0, 1ULL << 30, requested_algo(), 64, &policy, &budget, &result, err, sizeof(err));
         if (fixture_case == 1) { assert(rc == CUVS_STATUS_CANCELED && result == -1); }
         else if (fixture_case == 2 || fixture_case == 4 || (fixture_case >= 7 && fixture_case <= 10) || fixture_case >= 15) { assert(rc == CUVS_STATUS_ERROR && result == -1); }
         else if (fixture_case == 3 || fixture_case == 11 || fixture_case == 12) {
             int expected_status = fixture_case == 11 ? CUVS_STATUS_PROTO_MISMATCH : fixture_case == 12 ? CUVS_STATUS_HNSW_RESIDENT_BUDGET_EXCEEDED : CUVS_STATUS_BUILD_FAILED;
             assert(rc == expected_status && result == -1);
             assert(strcmp(err, "synthetic capacity failure") == 0);
+            /* status 13 (case 12) DETAIL inputs reach the backend unchanged */
+            assert(budget.host_estimate == 11 && budget.host_budget == 22
+                   && budget.gpu_estimate == 33 && budget.gpu_budget == 44
+                   && budget.pool_used == 55 && budget.logical_used == 66 + (uint64_t)fixture_case);
         }
         else {
             assert(rc == CUVS_STATUS_OK && result >= 0);
@@ -135,13 +142,14 @@ int main(void) {
     /* Actual client must reject reserved/unknown algo BEFORE uds_connect.
      * An unavailable path would otherwise return UNAVAILABLE, not ERROR. */
     for (unsigned i = 0; i < 4; i++) {
-        int result = -1; CuvsHnswPolicy p; char err[128];
+        int result = -1; CuvsHnswPolicy p; CuvsHnswBudgetSnapshot b = {1, 1, 1, 1, 1, 1}; char err[128];
         uint32_t algo = i == 0 ? CUVS_HNSW_ALGO_NN_DESCENT : i == 1 ? UINT32_MAX : CUVS_HNSW_ALGO_AUTO;
         uint32_t ef = i == 2 ? 3 : i == 3 ? 1001 : 64;
         int before = accepts;
         int rc = cuvs_ipc_build_hnsw_file("/nonexistent/never-connect", fd, 100, 128,
-            CUVS_METRIC_L2, 64, 128, 0, 1ULL << 30, algo, ef, &p, &result, err, sizeof(err));
+            CUVS_METRIC_L2, 64, 128, 0, 1ULL << 30, algo, ef, &p, &b, &result, err, sizeof(err));
         assert(rc == CUVS_STATUS_ERROR && result == -1 && p.magic == 0 && accepts == before);
+        assert(b.host_estimate == 0 && b.pool_used == 0 && b.logical_used == 0); /* zeroed, no reply */
     }
     assert(accepts == 15);
     /* Directly exercise the daemon's shared production prefix consumer.

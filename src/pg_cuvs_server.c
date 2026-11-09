@@ -10004,19 +10004,31 @@ hnsw_gpu_work_pending(void *unused)
  * registry lock held (build) residents are subtracted from the logical
  * budget; the preflight passes locked=0 when the lock is busy and then uses
  * the static logical budget (ADR-087 decision 4: GPU budget static at the
- * pre-spool notice; the build re-reads it after wait_for_idle). */
+ * pre-spool notice; the build re-reads it after wait_for_idle).
+ * *logical_used gets the logical use subtracted (total_vram_used; 0 when
+ * not locked): the status-13 DETAIL rl (v5 C5). */
 static uint64_t
-hnsw_gpu_budget(int device, int locked)
+hnsw_gpu_budget(int device, int locked, uint64_t *logical_used)
 {
     uint64_t budget = cuvs_vram_free_bytes_on(device);
+    uint64_t used = locked ? total_vram_used(device) : 0;
+    *logical_used = used;
     if (g_max_vram_per_gpu[device])
     {
-        uint64_t used = locked ? total_vram_used(device) : 0;
         uint64_t remaining = used < g_max_vram_per_gpu[device]
             ? g_max_vram_per_gpu[device] - used : 0;
         if (remaining < budget) budget = remaining;
     }
     return budget;
+}
+
+/* RMM pool used_bytes at an hnsw decision, the status-13 DETAIL rp (v5 C5;
+ * 0 without a pool). The pool counters are read lock-free. */
+static uint64_t
+hnsw_pool_used(int device)
+{
+    CuvsRmmPoolStats st;
+    return cuvs_rmm_pool_stats(device, &st) == 0 ? st.used_bytes : 0;
 }
 
 /* [hnsw_route]: one line per decision, pre-spool forecast or build. Q4-5/Q4-6
@@ -10095,7 +10107,8 @@ handle_hnsw_route_preflight(int client_fd)
     int device = usable_gpu(0);
     reply.header.error[0] = '\0';
     uint64_t host = hnsw_host_headroom(request.host_budget, reply.header.error, sizeof(reply.header.error));
-    uint64_t gpu = hnsw_gpu_budget(device, locked);
+    uint64_t gpu = hnsw_gpu_budget(device, locked, &reply.logical_used);
+    reply.pool_used = hnsw_pool_used(device);
     if (locked) pthread_mutex_unlock(&g_index_mutex);
     reply.gpu_static = !locked;
     if (!host || !gpu)
@@ -10177,7 +10190,8 @@ handle_build_hnsw_file(int client_fd, const CuvsCmdFrame *cmd)
     reply.error[0] = '\0';
     params.host_budget = hnsw_host_headroom(request.host_budget, reply.error, sizeof(reply.error));
     int device = usable_gpu(0);
-    params.gpu_budget = hnsw_gpu_budget(device, 1);
+    params.gpu_budget = hnsw_gpu_budget(device, 1, &wire.budget.logical_used);
+    wire.budget.pool_used = hnsw_pool_used(device);
     if (!params.host_budget || !params.gpu_budget)
     {
         if (!reply.error[0])
@@ -10192,6 +10206,10 @@ handle_build_hnsw_file(int client_fd, const CuvsCmdFrame *cmd)
         params.graph_degree, params.intermediate_degree, params.hierarchy,
         params.build_algo, params.ef_construction, params.auto_overflow,
         params.host_budget, params.gpu_budget, &route, reply.error, sizeof(reply.error));
+    wire.budget.host_estimate = route.host_estimate;
+    wire.budget.host_budget = route.host_budget;
+    wire.budget.gpu_estimate = route.gpu_estimate;
+    wire.budget.gpu_budget = route.gpu_budget;
     hnsw_route_log("build", params.build_algo, &route, reply.error);
     if (reply.status != CUVS_STATUS_OK) goto done;
     reply.status = CUVS_STATUS_BUILD_FAILED;

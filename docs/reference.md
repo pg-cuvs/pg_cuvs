@@ -447,6 +447,19 @@ Explicit `ace` consumes the matching patched SDK/planner and a private disk work
 `nn_descent` is reserved for this direct HNSW surface and is rejected until a supported
 memory model exists; the separate `cagra` AM has its own build-algorithm options.
 
+An over-budget refusal (SQLSTATE 54000, `pg_cuvs: resident IVF-PQ estimate exceeds the
+HNSW build budget`) has the DETAIL `he=<MiB> hb=<MiB> ge=<MiB> gb=<MiB> rp=<MiB> rl=<MiB>`:
+the host estimate and budget, the GPU estimate and budget, the RMM pool's used bytes
+(0 without a pool) and the daemon's logical GPU use (`rl`; a reloaded index counts a
+graph_degree-64 estimate, so it can differ from `rp`), each in MiB rounded down. The
+exact bytes are on the daemon's `[hnsw_route]` line. Every route, resident ones
+included, needs regular disk under the daemon's `--index-dir` for its private workdir,
+about `4 × raw vector bytes + n × (graph_degree × 8 + 64)` bytes. Short of that, or on
+tmpfs, the build fails before any GPU work with SQLSTATE XX000 and the message
+`HNSW needs regular disk capacity: need=<bytes> avail=<bytes> fs=<tmpfs|regular>
+route=<route>`; its HINT names the filesystem and adds that the PostgreSQL temporary
+tablespace needs a further `n × dim × 4` bytes for the input spool.
+
 `m` remains informational. Direct `ef_construction` scales intermediate degree from128,
 hierarchy construction effort from200, and ACE effort from120 at the default64;
 receipts record the consumed/clamped values. Reusing a source CAGRA graph does not

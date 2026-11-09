@@ -67,15 +67,24 @@ def check(src):
     assert ba < ex and 'return CUVS_STATUS_OOM_FALLBACK;' in full[ba:ex], 'HNSW_BAD_ALLOC_IS_STATUS_2'
     # --- daemon order (ADR-087 decision 4) ---------------------------------
     h = function(code['server'], 'handle_build_hnsw_file(int client_fd')
-    ordered(h, ['cuvs_hnsw_wait_for_idle(', 'params.gpu_budget = hnsw_gpu_budget(device, 1);',
-                'cuvs_hnsw_forecast_route(', 'hnsw_route_log("build"', 'mkdtemp(workdir)',
+    ordered(h, ['cuvs_hnsw_wait_for_idle(', 'params.gpu_budget = hnsw_gpu_budget(device, 1, &wire.budget.logical_used);',
+                'cuvs_hnsw_forecast_route(', 'wire.budget.host_estimate = route.host_estimate;',
+                'hnsw_route_log("build"', 'mkdtemp(workdir)',
                 'cuvs_hnsw_forecast_disk(&route', 'cuvs_hnsw_build_file('], 'DAEMON_ORDER')
+    # v5 C5: the build reply carries the status-13 DETAIL bytes (he hb ge gb rp rl)
+    for needle in ('wire.budget.pool_used = hnsw_pool_used(device);',
+                   'wire.budget.host_budget = route.host_budget;',
+                   'wire.budget.gpu_estimate = route.gpu_estimate;',
+                   'wire.budget.gpu_budget = route.gpu_budget;'):
+        assert needle in h, 'DAEMON_BUDGET_FILLED:' + needle
     assert 'params.auto_overflow = g_hnsw_auto_overflow;' in h, 'DAEMON_FLAG'
     assert 'if (reply.status != CUVS_STATUS_OK) goto done;' in h.split('hnsw_route_log("build"', 1)[1].split('mkdtemp', 1)[0], 'DECISION_STOPS'
     assert 'wire.policy.route != route.decision.route' in h, 'RECEIPT_EQUALS_ROUTE_LOG'
     pre = function(code['server'], 'handle_hnsw_route_preflight(int client_fd)')
     ordered(pre, ['cuvs_hnsw_forecast_route(', 'cuvs_hnsw_forecast_disk(', 'hnsw_route_log(request.after_scan ? "postscan" : "prespool"'], 'PREFLIGHT_ORDER')
     assert 'mkdtemp' not in pre and 'wait_for_idle' not in pre, 'PREFLIGHT_READ_ONLY'
+    assert 'hnsw_gpu_budget(device, locked, &reply.logical_used)' in pre, 'PREFLIGHT_RL'
+    assert 'reply.pool_used = hnsw_pool_used(device);' in pre, 'PREFLIGHT_RP'
     # --- backend order (CK-17 (14)) -----------------------------------------
     b = function(code['backend'], 'cuvs_build_hnsw_from_heap(Relation heapRel')
     ordered(b, ['cuvs_hnsw_preflight(stats_rows', 'table_index_build_scan(',
@@ -91,7 +100,26 @@ def check(src):
     seg = oom[1].split('if (rc != CUVS_STATUS_OK)', 1)[0] if len(oom) == 2 else ''
     assert 'errcode(ERRCODE_OUT_OF_MEMORY)' in seg and 'cuvs_hnsw_oom_hint(build_algo)' in seg, 'HNSW_OOM_53200'
     assert b.index('if (rc == CUVS_STATUS_OOM_FALLBACK)') < b.index('if (rc != CUVS_STATUS_OK)'), 'HNSW_OOM_BEFORE_GENERIC'
+    # v5 C5 / v6 C5: status-13 DETAIL is exactly the six MiB fields
+    be = function(code['backend'], 'cuvs_hnsw_budget_error(uint32_t build_algo')
+    assert 'cuvs_hnsw_budget_detail(detail, sizeof(detail), budget)' in be and 'errdetail("%s", detail)' in be, 'STATUS13_DETAIL_SIX_FIELDS'
+    assert be.count('errdetail(') == 1, 'STATUS13_DETAIL_ONLY_FIELDS'
+    assert 'cuvs_hnsw_budget_error(build_algo, &budget);' in b, 'POSTSCAN_STATUS13_BUDGET'
+    assert '&out->policy, &budget,' in b, 'POSTSCAN_BUDGET_RECEIVED'
+    # v5 C5 / Q4-4: a disk refusal is the message itself, with the disk HINT
+    post = b.split('if (rc == CUVS_STATUS_OOM_FALLBACK)', 1)[1]
+    disk = post.split('if (cuvs_hnsw_disk_refusal(rc, error))', 1)
+    assert len(disk) == 2 and post.index('if (cuvs_hnsw_disk_refusal(rc, error))') < post.index('if (rc != CUVS_STATUS_OK)'), 'POSTSCAN_DISK_BEFORE_GENERIC'
+    seg = disk[1].split(';', 1)[0] + disk[1].split('if (rc != CUVS_STATUS_OK)', 1)[0]
+    assert 'errmsg("%s", error)' in seg and 'errhint("%s", CUVS_HNSW_DISK_HINT)' in seg, 'POSTSCAN_DISK_SURFACE'
     p = function(code['backend'], 'cuvs_hnsw_preflight(double rows')
+    rb = p.split('action == CUVS_HNSW_PRESPOOL_REJECT_BUDGET', 1)[1].split('return action;', 1)[0]
+    assert 'cuvs_hnsw_preflight_budget(&reply)' in rb.split('cuvs_hnsw_budget_error(build_algo, &budget);', 1)[0], 'PRESPOOL_STATUS13_BUDGET'
+    pd = p.split('cuvs_hnsw_disk_refusal(rc, reply.header.error)', 1)
+    assert len(pd) == 2 and 'errmsg("%s", reply.header.error)' in pd[1].split(';', 1)[0] + pd[1].split('if (action == CUVS_HNSW_PRESPOOL_REJECT)', 1)[0], 'PRESPOOL_DISK_MESSAGE'
+    assert 'errhint("%s", CUVS_HNSW_DISK_HINT)' in pd[1].split('if (action == CUVS_HNSW_PRESPOOL_REJECT)', 1)[0], 'PRESPOOL_DISK_HINT'
+    rj = pd[1].split('if (action == CUVS_HNSW_PRESPOOL_REJECT)', 1)[1].split('if (action == CUVS_HNSW_PRESPOOL_NOTICE_OVERFLOW)', 1)[0]
+    assert 'cuvs_hnsw_budget_detail(detail, sizeof(detail), &budget)' in rj and 'errdetail("%s", detail)' in rj, 'PRESPOOL_STATUS5_DETAIL'
     assert 'action == CUVS_HNSW_PRESPOOL_NOTICE_OVERFLOW' in p and 'cuvs_hnsw_transition_notice(' in p.split('CUVS_HNSW_PRESPOOL_NOTICE_OVERFLOW)', 1)[1], 'PN1_NOTICE'
     t = function(code['backend'], 'cuvs_hnsw_transition_notice(uint64_t host_est')
     assert 'build_algo=auto exceeded the resident budget (need %u MiB, budget %u MiB); building with ACE on disk' in src['backend'], 'TRANSITION_TEXT'
@@ -135,6 +163,33 @@ MUTANTS = [
     ('hnsw_oom_not_53200', 'backend',
      '            if (rc == CUVS_STATUS_OOM_FALLBACK) /* v6 C2: allocation failure after admission */',
      '            if (0) /* v6 C2: allocation failure after admission */'),
+    ('status13_detail_carries_reason_text', 'backend',
+     '        errdetail("%s", detail),\n        build_algo == CUVS_HNSW_ALGO_AUTO',
+     '        errdetail("%s; decided.", detail),\n        build_algo == CUVS_HNSW_ALGO_AUTO'),
+    ('postscan_status13_without_budget', 'backend',
+     '                cuvs_hnsw_budget_error(build_algo, &budget);\n            if (rc == CUVS_STATUS_CANCELED)',
+     '                cuvs_hnsw_budget_error(build_algo, &(CuvsHnswBudgetSnapshot){0});\n            if (rc == CUVS_STATUS_CANCELED)'),
+    ('prespool_disk_refusal_prefixed', 'backend',
+     '                        errmsg("%s", reply.header.error),\n                        errdetail("Decided %s; no rows were spooled.", when),',
+     '                        errmsg("pg_cuvs: temporary HNSW build failed (status %d): %s", rc, reply.header.error),\n                        errdetail("Decided %s; no rows were spooled.", when),'),
+    ('prespool_disk_hint_dropped', 'backend',
+     '                        errdetail("Decided %s; no rows were spooled.", when),\n                        errhint("%s", CUVS_HNSW_DISK_HINT)));',
+     '                        errdetail("Decided %s; no rows were spooled.", when)));'),
+    ('postscan_disk_refusal_generic', 'backend',
+     '            if (cuvs_hnsw_disk_refusal(rc, error)) /* v5 C5: the daemon\'s workdir check */',
+     '            if (0) /* v5 C5: the daemon\'s workdir check */'),
+    ('prespool_status5_detail_bytes', 'backend',
+     '                        errdetail("%s", detail),\n                        errhint("The forecast ran %s',
+     '                        errdetail("he=%llu", (unsigned long long)reply.host_estimate),\n                        errhint("The forecast ran %s'),
+    ('daemon_rp_not_sent', 'server',
+     '    wire.budget.pool_used = hnsw_pool_used(device);\n', ''),
+    ('daemon_estimates_not_sent', 'server',
+     '    wire.budget.gpu_budget = route.gpu_budget;\n', ''),
+    ('preflight_rl_not_sent', 'server',
+     '    uint64_t gpu = hnsw_gpu_budget(device, locked, &reply.logical_used);',
+     '    uint64_t unused_rl; uint64_t gpu = hnsw_gpu_budget(device, locked, &unused_rl);'),
+    ('preflight_rp_not_sent', 'server',
+     '    reply.pool_used = hnsw_pool_used(device);\n', ''),
     ('cagra_ar0_after_scan', 'backend',
      '            && cuvs_cagra_prespool_ar0(reltuples_est,', '            && 0 && (reltuples_est,'),
 ]

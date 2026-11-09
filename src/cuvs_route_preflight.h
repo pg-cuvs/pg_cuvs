@@ -79,6 +79,64 @@ cuvs_hnsw_prespool_budget_refusal(const CuvsHnswPreflightReply *reply)
         || (reply->gpu_budget && reply->gpu_estimate > reply->gpu_budget);
 }
 
+/* hnsw budget DETAIL (v5 C5 "hnsw status 13", v6 C5): exactly six fields,
+ * in this order, each in MiB rounded DOWN:
+ *   he=<MiB> hb=<MiB> ge=<MiB> gb=<MiB> rp=<MiB> rl=<MiB>
+ * he/hb = host estimate/budget, ge/gb = GPU estimate/budget, rp = RMM pool
+ * used_bytes (0 without a pool), rl = total_vram_used (logical use; a
+ * reloaded index counts its graph_degree-64 estimate, so rl can differ from
+ * rp). Exact bytes are on the daemon's [hnsw_route] line. All six at
+ * UINT64_MAX give 107 bytes; CK-8 bounds the DETAIL at 127. */
+#define CUVS_HNSW_BUDGET_DETAIL_MAX 127u
+
+static inline uint64_t
+cuvs_hnsw_floor_mib(uint64_t bytes)
+{
+    return bytes >> 20;
+}
+
+static inline int
+cuvs_hnsw_budget_detail(char *out, size_t len, const CuvsHnswBudgetSnapshot *s)
+{
+    return snprintf(out, len, "he=%llu hb=%llu ge=%llu gb=%llu rp=%llu rl=%llu",
+                    (unsigned long long)cuvs_hnsw_floor_mib(s->host_estimate),
+                    (unsigned long long)cuvs_hnsw_floor_mib(s->host_budget),
+                    (unsigned long long)cuvs_hnsw_floor_mib(s->gpu_estimate),
+                    (unsigned long long)cuvs_hnsw_floor_mib(s->gpu_budget),
+                    (unsigned long long)cuvs_hnsw_floor_mib(s->pool_used),
+                    (unsigned long long)cuvs_hnsw_floor_mib(s->logical_used));
+}
+
+/* The pre-spool forecast reply (v2) carries the same six values. */
+static inline CuvsHnswBudgetSnapshot
+cuvs_hnsw_preflight_budget(const CuvsHnswPreflightReply *r)
+{
+    CuvsHnswBudgetSnapshot s;
+    s.host_estimate = r->host_estimate;
+    s.host_budget = r->host_budget;
+    s.gpu_estimate = r->gpu_estimate;
+    s.gpu_budget = r->gpu_budget;
+    s.pool_used = r->pool_used;
+    s.logical_used = r->logical_used;
+    return s;
+}
+
+/* The daemon's disk precheck refusal (status 5, CUVS_HNSW_DISK_REFUSAL_PREFIX).
+ * v5 C5 / Q4-4: the backend sends that text as the message itself (no
+ * "temporary HNSW build failed" prefix) and attaches CUVS_HNSW_DISK_HINT. */
+#define CUVS_HNSW_DISK_HINT \
+    "Free space on the filesystem holding pg_cuvs_server --index-dir; the job needs about " \
+    "4 x raw vector bytes + n x (graph_degree x 8 + 64) bytes. The PostgreSQL temporary " \
+    "tablespace needs a further n x dim x 4 bytes."
+
+static inline int
+cuvs_hnsw_disk_refusal(int status, const char *error)
+{
+    return status == CUVS_STATUS_BUILD_FAILED && error != NULL
+        && strncmp(error, CUVS_HNSW_DISK_REFUSAL_PREFIX,
+                   sizeof(CUVS_HNSW_DISK_REFUSAL_PREFIX) - 1) == 0;
+}
+
 /* Receipt timing flags from the PRE-scan action and the statistics that
  * action saw: PRESPOOL when the route was forecast before the scan; otherwise
  * AFTER_SCAN, plus NO_STATISTICS only when reltuples was absent or zero

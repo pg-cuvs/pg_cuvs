@@ -412,6 +412,71 @@ static void test_hnsw_oom_hint(void)
     CHECK(CUVS_STATUS_OOM_FALLBACK == 2);
 }
 
+/* v5 C5 / v6 C5 (CK-8): the hnsw status-13 DETAIL is exactly six MiB fields
+ * he hb ge gb rp rl, rounded down, at most 127 bytes; Q4-2 compares rp with
+ * floor(pool used_bytes / MiB) and the rest with the [hnsw_route] bytes. */
+static void test_budget_detail(void)
+{
+    char d[CUVS_HNSW_BUDGET_DETAIL_MAX + 1];
+    const uint64_t MiB = 1ULL << 20;
+    /* Q4-2 shape: rp = floor(3,196,800,000 / MiB) = 3048 (v5 Q4-2 PASS). */
+    CuvsHnswBudgetSnapshot s = {23298086912ULL, 8589934592ULL, 40ULL * MiB + MiB - 1,
+                                64ULL * MiB, 3196800000ULL, 3324672000ULL};
+    CHECK(cuvs_hnsw_budget_detail(d, sizeof(d), &s) > 0);
+    CHECK(strcmp(d, "he=22218 hb=8192 ge=40 gb=64 rp=3048 rl=3170") == 0);
+    CHECK(cuvs_hnsw_floor_mib(MiB - 1) == 0 && cuvs_hnsw_floor_mib(MiB) == 1);
+    /* worst case: every byte value UINT64_MAX */
+    CuvsHnswBudgetSnapshot max = {UINT64_MAX, UINT64_MAX, UINT64_MAX, UINT64_MAX, UINT64_MAX, UINT64_MAX};
+    int n = cuvs_hnsw_budget_detail(d, sizeof(d), &max);
+    CHECK(n > 0 && (unsigned)n <= CUVS_HNSW_BUDGET_DETAIL_MAX && strlen(d) == (size_t)n);
+    CHECK(strcmp(d, "he=17592186044415 hb=17592186044415 ge=17592186044415 gb=17592186044415 "
+                    "rp=17592186044415 rl=17592186044415") == 0);
+    /* exactly six key=value fields, in order */
+    {
+        static const char *const keys[] = {"he=", "hb=", "ge=", "gb=", "rp=", "rl="};
+        const char *at = d;
+        unsigned fields = 1;
+        for (const char *c = d; *c; c++) fields += *c == ' ';
+        CHECK(fields == 6);
+        for (unsigned i = 0; i < 6; i++)
+        {
+            CHECK(strncmp(at, keys[i], 3) == 0);
+            at = strchr(at, ' ');
+            if (!at) { CHECK(i == 5); break; }
+            at++;
+        }
+    }
+    /* the preflight reply (v2) carries the same six values */
+    {
+        CuvsHnswPreflightReply r;
+        memset(&r, 0, sizeof(r));
+        r.host_estimate = 1; r.host_budget = 2; r.gpu_estimate = 3; r.gpu_budget = 4;
+        r.pool_used = 5; r.logical_used = 6;
+        CuvsHnswBudgetSnapshot b = cuvs_hnsw_preflight_budget(&r);
+        CHECK(b.host_estimate == 1 && b.host_budget == 2 && b.gpu_estimate == 3
+              && b.gpu_budget == 4 && b.pool_used == 5 && b.logical_used == 6);
+        CHECK(CUVS_HNSW_PREFLIGHT_VERSION == 2);
+    }
+}
+
+/* v5 C5 / Q4-4: the backend recognises the daemon's disk refusal by its
+ * prefix and status 5 only; the HINT is the plan's disk text. */
+static void test_disk_refusal_surface(void)
+{
+    CuvsHnswForecast f; char error[160];
+    CHECK(forecast(1000000, CUVS_HNSW_ALGO_AUTO, CUVS_HNSW_OVERFLOW_ACE, 4ULL << 30, G, &f) == CUVS_STATUS_OK);
+    CHECK(cuvs_hnsw_forecast_disk(&f, 1, 0, error, sizeof(error)) == CUVS_STATUS_BUILD_FAILED);
+    CHECK(cuvs_hnsw_disk_refusal(CUVS_STATUS_BUILD_FAILED, error));
+    CHECK(!cuvs_hnsw_disk_refusal(CUVS_STATUS_HNSW_RESIDENT_BUDGET_EXCEEDED, error));
+    CHECK(!cuvs_hnsw_disk_refusal(CUVS_STATUS_BUILD_FAILED, CUVS_HNSW_BUDGET_NO_FIT_REASON));
+    CHECK(!cuvs_hnsw_disk_refusal(CUVS_STATUS_BUILD_FAILED, "HNSW needs regular disk: need=1 avail=0 fs=regular route=ace_disk"));
+    CHECK(!cuvs_hnsw_disk_refusal(CUVS_STATUS_BUILD_FAILED, NULL));
+    CHECK(strcmp(CUVS_HNSW_DISK_HINT,
+                 "Free space on the filesystem holding pg_cuvs_server --index-dir; the job needs about "
+                 "4 x raw vector bytes + n x (graph_degree x 8 + 64) bytes. The PostgreSQL temporary "
+                 "tablespace needs a further n x dim x 4 bytes.") == 0);
+}
+
 int main(void)
 {
     /* First, so its mutants are attributed to the direct regression itself. */
@@ -423,6 +488,8 @@ int main(void)
     test_prespool_and_fallback();
     test_cagra_ar0();
     test_hnsw_oom_hint();
-    printf("PASS %u CK-17 (12)-(14) CPU checks: default ace + knob, single overflow branch receipts/NOTICEs, pre-spool/fallback, disk precheck, CAGRA reltuples AR0; SDK/GPU/PG not run\n", checks);
+    test_budget_detail();
+    test_disk_refusal_surface();
+    printf("PASS %u CK-17 (12)-(14) CPU checks: default ace + knob, single overflow branch receipts/NOTICEs, pre-spool/fallback, disk precheck and refusal text, six-field MiB DETAIL, CAGRA reltuples AR0; SDK/GPU/PG not run\n", checks);
     return 0;
 }
