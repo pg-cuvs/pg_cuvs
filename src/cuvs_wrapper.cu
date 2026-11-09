@@ -2923,7 +2923,64 @@ cuvs_hnsw_build_file(int vectors_fd, int owner_fd,
             (unsigned long long)params->host_budget, (unsigned long long)params->gpu_budget,
             (unsigned long long)sdk_host_budget, (unsigned long long)sdk_gpu_budget,
             (unsigned long long)cap.host_peak, (unsigned long long)cap.gpu_peak);
-        return execute_hnsw_file_build(params, owner_fd, workdir, device_id, files, prepared, out_fd);
+        /* Resident IVF-PQ kNN precision from the rows themselves: fp16 distances
+         * overflow for large-magnitude data (cuvs_hnsw_ivfpq_needs_fp32). */
+        if (!tiny && !disk)
+        {
+            const double max_sq = cuvs_hnsw_max_sq_norm(static_cast<const float *>(files.mapping),
+                params->n_vecs, params->dim);
+            const bool fp32 = cuvs_hnsw_ivfpq_needs_fp32(max_sq, params->metric);
+            if (fp32)
+            {
+                auto &sp = prepared.pq_params->search_params;
+                sp.lut_dtype = CUDA_R_32F;
+                sp.internal_distance_dtype = CUDA_R_32F;
+                sp.coarse_search_dtype = CUDA_R_32F;
+                receipt.route_flags |= CUVS_HNSW_ROUTE_FLAG_IVFPQ_FP32;
+            }
+            fprintf(stderr, "[hnsw_build] job=%s phase=precision max_sq_norm=%.9g fp16_max=%.0f ivfpq_distance_dtype=%s\n",
+                workdir, max_sq, CUVS_HNSW_FP16_MAX, fp32 ? "fp32" : "fp16");
+        }
+        try
+        {
+            return execute_hnsw_file_build(params, owner_fd, workdir, device_id, files, prepared, out_fd);
+        }
+        catch (const std::exception &e)
+        {
+            /* R1 on the default path: auto's resident IVF-PQ kNN graph rejected
+             * by cuVS -> ACE-disk with a NOTICE, when overflow is ace. */
+            if (!cuvs_hnsw_graph_failure_to_ace(params->build_algo, prepared.route.route,
+                    params->auto_overflow, params->n_vecs, e.what()))
+                throw;
+            CuvsHnswRouteDecision ace{};
+            char why[256] = "";
+            const bool sdk_ok = hnsw_sdk_marker_verified("pgcuvs_hnsw_disk_copy_patch_id",
+                    "pgcuvs-hnsw-disk-copy-v1@60b19a0f62ba0bd716de349382828e43be6e2daa")
+                && hnsw_sdk_marker_verified("pgcuvs_hnsw_memory_guard_patch_id",
+                    "pgcuvs-hnsw-memory-guard-v2@60b19a0f62ba0bd716de349382828e43be6e2daa");
+            if (!sdk_ok || std::strlen(workdir) > 255 || std::strstr(workdir, "//")
+                || cuvs_hnsw_resolve_route(params->n_vecs, params->dim, degree, intermediate,
+                       CUVS_HNSW_ALGO_ACE, params->auto_overflow, &cap, params->host_budget,
+                       params->gpu_budget, &ace, why, sizeof(why)) != CUVS_STATUS_OK)
+            {
+                fprintf(stderr, "[hnsw_build] job=%s phase=graph-fallback refused sdk_ok=%d reason=%s\n",
+                    workdir, sdk_ok ? 1 : 0, why[0] ? why : "workdir or SDK guard");
+                throw;
+            }
+            fprintf(stderr, "[hnsw_build] job=%s phase=graph-fallback from=host-IVFPQ to=ACE-disk partitions=%u mono_us=%llu error=%s\n",
+                workdir, ace.partitions, (unsigned long long)cuvs_hnsw_monotonic_us(), e.what());
+            prepared.route = ace;
+            receipt.route = CUVS_HNSW_ROUTE_ACE;
+            receipt.internal_builder = 3; /* NN-descent partitions */
+            receipt.partitions = ace.partitions;
+            receipt.sdk_host_budget = ace.sdk_host_budget;
+            receipt.sdk_gpu_budget = ace.sdk_gpu_budget;
+            receipt.n_lists = receipt.pq_dim = receipt.pq_bits = receipt.n_probes = 0;
+            receipt.query_batch = 0;
+            receipt.route_flags = (receipt.route_flags & ~CUVS_HNSW_ROUTE_FLAG_IVFPQ_FP32)
+                | CUVS_HNSW_ROUTE_FLAG_GRAPH_FALLBACK;
+            return execute_hnsw_file_build(params, owner_fd, workdir, device_id, files, prepared, out_fd);
+        }
     }
     catch (const std::bad_alloc &e)
     {

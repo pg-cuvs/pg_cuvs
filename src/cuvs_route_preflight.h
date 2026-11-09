@@ -166,10 +166,15 @@ cuvs_hnsw_after_scan_reason(double reltuples)
 #define CUVS_HNSW_NOTICE_AUTO_COMPLETION 0x2u
 #define CUVS_HNSW_NOTICE_EXPLICIT_ACE    0x4u
 #define CUVS_HNSW_NOTICE_NOT_OVERFLOWED  0x8u
+/* auto -> ACE after cuVS rejected the resident IVF-PQ kNN graph. */
+#define CUVS_HNSW_NOTICE_GRAPH_FALLBACK  0x10u
 
 static inline uint32_t
 cuvs_hnsw_build_notices(const CuvsHnswPolicy *p, int transition_sent)
 {
+    if (p->requested_algo == CUVS_HNSW_ALGO_AUTO && p->route == CUVS_HNSW_ROUTE_ACE
+        && (p->route_flags & CUVS_HNSW_ROUTE_FLAG_GRAPH_FALLBACK))
+        return CUVS_HNSW_NOTICE_GRAPH_FALLBACK;
     if (p->requested_algo == CUVS_HNSW_ALGO_ACE && p->route == CUVS_HNSW_ROUTE_ACE)
         return CUVS_HNSW_NOTICE_EXPLICIT_ACE;
     if (p->requested_algo == CUVS_HNSW_ALGO_AUTO && p->route == CUVS_HNSW_ROUTE_ACE

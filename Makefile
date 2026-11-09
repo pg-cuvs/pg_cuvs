@@ -489,6 +489,10 @@ test-vacuum-policy: test/unit/test_vacuum_policy.c src/cuvs_vacuum_policy.h
 test-vacuum-policy-mutations: test/unit/test_vacuum_policy_mutations.py test-vacuum-policy src/pg_cuvs.c
 	CC=$(CC) python3 -I test/unit/test_vacuum_policy_mutations.py
 
+# Resident IVF-PQ kNN precision (fp16 bound) and the auto kNN-graph fallback to ACE.
+test-hnsw-precision-mutations: test/unit/test_hnsw_precision_mutations.py test-hnsw-policy
+	CC=$(CC) python3 -I test/unit/test_hnsw_precision_mutations.py
+
 # CK-27 (a) for the I4 knobs: docs flag rows vs cuvs_lw_policy.h macros.
 test-lw-docs: test/unit/check_lw_docs.py docs/reference.md src/cuvs_lw_policy.h
 	python3 -I test/unit/check_lw_docs.py
@@ -525,7 +529,7 @@ EXTRA_CLEAN += test-hnsw-build test-hnsw-build-ipc test-hnsw-converter test-hnsw
 .PHONY: test-hnsw-build test-hnsw-build-ipc test-hnsw-converter test-hnsw-admission test-hnsw-explicit-route test-hnsw-policy \
         test-admission-contract test-admission-contract-mutations test-admission-wire \
         test-admission-message test-admission-ipc test-build-oom-thread test-gpu-wrapper-i3 test-hnsw-auto-overflow test-res-pool test-lw-policy test-lw-guard test-lw-mutations test-lw-docs \
-        test-host-free-fence test-host-free-fence-mutations test-vacuum-policy test-vacuum-policy-mutations
+        test-host-free-fence test-host-free-fence-mutations test-vacuum-policy test-vacuum-policy-mutations test-hnsw-precision-mutations
 
 # ---- Documentation contract check ---------------------------------------
 # CPU-only drift detector for the current version/defaults and release-facing

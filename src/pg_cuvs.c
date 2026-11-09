@@ -3014,6 +3014,9 @@ cuvs_build_hnsw_from_heap(Relation heapRel, Relation indexRel, IndexInfo *indexI
             if (notices & CUVS_HNSW_NOTICE_NOT_OVERFLOWED)
                 ereport(NOTICE, (errmsg("pg_cuvs: build_algo=auto fit the resident budget after the heap scan; built %s instead of the announced ACE-disk",
                                         cuvs_hnsw_route_name(out->policy.route))));
+            if (notices & CUVS_HNSW_NOTICE_GRAPH_FALLBACK)
+                ereport(NOTICE, (errmsg("pg_cuvs: build_algo=auto built ACE-disk (%u partitions) because cuVS rejected the resident IVF-PQ kNN graph", out->policy.partitions),
+                    errdetail("cuVS could not prune the IVF-PQ kNN graph (too many invalid or duplicated neighbors). Starting the daemon with --hnsw-auto-overflow error makes this build fail instead.")));
             out->tids_fd = dup(FileGetRawDesc(spool->tids));
             if (out->tids_fd < 0)
                 ereport(ERROR, (errcode_for_file_access(), errmsg("pg_cuvs: cannot hand off TID spool: %m")));
