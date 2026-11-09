@@ -41,7 +41,7 @@ static void *daemon_mock(void *unused) {
         close(c); return NULL;
     }
     assert(request_status == CUVS_STATUS_OK);
-    assert(req.version == CUVS_HNSW_FILE_VERSION && req.version == 3 && req.host_budget == (1ULL << 30));
+    assert(req.version == CUVS_HNSW_FILE_VERSION && req.version == 4 && req.host_budget == (1ULL << 30));
     assert(req.build_algo == requested_algo() && req.ef_construction == 64);
     assert(cuvs_hnsw_file_request_supported(&req));
     assert(cuvs_hnsw_regular_disk(vectors));
@@ -164,10 +164,10 @@ int main(void) {
         assert(write(c, &cmd, sizeof(cmd)) == sizeof(cmd));
         int channel[2] = {-1, -1};
         if (k < 3) {
-            struct {uint32_t version, hierarchy; uint64_t host;} prefix = {k == 0 ? 1 : k == 1 ? 2 : 99, 0, 1ULL << 30};
+            struct {uint32_t version, hierarchy; uint64_t host;} prefix = {k == 0 ? 1 : k == 1 ? 3 : 99, 0, 1ULL << 30};
             assert(!cuvs_fd_send(c, fd, &prefix, sizeof(prefix)));
         } else {
-            CuvsHnswFileRequest req = {3, 0, 1ULL << 30, k == 3 ? CUVS_HNSW_ALGO_NN_DESCENT : UINT32_MAX, 64};
+            CuvsHnswFileRequest req = {4, 0, 1ULL << 30, k == 3 ? CUVS_HNSW_ALGO_NN_DESCENT : UINT32_MAX, 64};
             assert(!socketpair(AF_UNIX, SOCK_STREAM, 0, channel));
             assert(!cuvs_fd_send(c, fd, &req, sizeof(req)));
             char token = 'O'; assert(!cuvs_fd_send(c, channel[1], &token, 1));
