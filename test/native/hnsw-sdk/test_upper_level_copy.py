@@ -6,9 +6,11 @@
 from __future__ import annotations
 
 import argparse
+import json
 import pathlib
 import re
 import subprocess
+import sys
 import tempfile
 import textwrap
 
@@ -20,12 +22,19 @@ DISK_COPY_BLOCK = re.compile(
     re.MULTILINE | re.DOTALL,
 )
 COPY_STATEMENT = re.compile(r"std::copy\s*\([^;]*;", re.DOTALL)
+COPY_MISMATCH_EXIT = 1
+SETUP_FAILURE_EXIT = 2
+COMPILE_FAILURE_EXIT = 3
+
+
+class CopySetupError(RuntimeError):
+    pass
 
 
 def one_copy_statement(text: str, context: str) -> str:
     statements = list(COPY_STATEMENT.finditer(text))
     if len(statements) != 1:
-        raise SystemExit(f"expected one std::copy in {context}, found {len(statements)}")
+        raise CopySetupError(f"expected one std::copy in {context}, found {len(statements)}")
     return statements[0].group(0)
 
 
@@ -37,14 +46,14 @@ def source_copy_statements(source_root: pathlib.Path) -> tuple[str, str]:
         text=True,
     ).stdout.strip()
     if commit != EXPECTED_SOURCE_COMMIT:
-        raise SystemExit(
+        raise CopySetupError(
             f"source commit mismatch: expected {EXPECTED_SOURCE_COMMIT}, got {commit}"
         )
 
     source_text = (source_root / SOURCE_FILE).read_text(encoding="utf-8")
     disk_blocks = list(DISK_COPY_BLOCK.finditer(source_text))
     if len(disk_blocks) != 1:
-        raise SystemExit(f"expected one disk upper-level hierarchy block, found {len(disk_blocks)}")
+        raise CopySetupError(f"expected one disk upper-level hierarchy block, found {len(disk_blocks)}")
 
     memory_start = source_text.index("// gather points from dataset to form query set on host")
     memory_end = source_text.index("// find neighbors of the query set", memory_start)
@@ -55,32 +64,55 @@ def source_copy_statements(source_root: pathlib.Path) -> tuple[str, str]:
     )
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--source", required=True, type=pathlib.Path)
-    parser.add_argument("--compiler", default="clang++")
-    parser.add_argument("--hnswlib-header", required=True, type=pathlib.Path)
-    parser.add_argument("--mutant", choices=["raw-source", "byte-destination", "short-copy"])
-    args = parser.parse_args()
-
+def prepare(args) -> tuple[str, str]:
     disk_statement, memory_statement = source_copy_statements(args.source.resolve())
     getter = args.hnswlib_header.read_text(encoding="utf-8")
     if not re.search(r"char\s*\*\s*getDataByInternalId\s*\(", getter):
-        raise SystemExit("actual hnswlib getter must return char*; update the fixture if its API changes")
+        raise CopySetupError("actual hnswlib getter must return char*; update the fixture if its API changes")
     if args.mutant == "raw-source":
         memory_statement, count = re.subn(
             r"reinterpret_cast<const T\*>\((appr_algo->getDataByInternalId\(pt_id\))\)",
             r"\1", memory_statement,
         )
         if count != 2:
-            raise SystemExit("raw-source mutant must replace both typed iterators")
+            raise CopySetupError("raw-source mutant must replace both typed iterators")
     elif args.mutant == "byte-destination":
+        if memory_statement.count("&host_query_set(i - start_idx, 0)") != 1:
+            raise CopySetupError("byte-destination mutant must replace one destination")
         memory_statement = memory_statement.replace(
             "&host_query_set(i - start_idx, 0)",
             "reinterpret_cast<char*>(&host_query_set(i - start_idx, 0))",
         )
     elif args.mutant == "short-copy":
+        if memory_statement.count("+ dim") != 1:
+            raise CopySetupError("short-copy mutant must replace one element count")
         memory_statement = memory_statement.replace("+ dim", "+ dim / sizeof(T)")
+    return disk_statement, memory_statement
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--source", required=True, type=pathlib.Path)
+    parser.add_argument("--compiler", default="clang++")
+    parser.add_argument("--hnswlib-header", required=True, type=pathlib.Path)
+    parser.add_argument("--mutant", choices=["raw-source", "byte-destination", "short-copy"])
+    parser.add_argument("--output", type=pathlib.Path)
+    args = parser.parse_args()
+    result = {"phase": "setup", "mutant": args.mutant,
+              "compile_exit": None, "runtime_exit": None}
+
+    def finish(exit_code: int) -> int:
+        if args.output:
+            args.output.write_text(json.dumps(result, indent=2) + "\n")
+        if "error" in result:
+            print(f"ERROR copy {result['phase']}: {result['error']}", file=sys.stderr)
+        return exit_code
+
+    try:
+        disk_statement, memory_statement = prepare(args)
+    except (CopySetupError, OSError, ValueError, subprocess.CalledProcessError) as exc:
+        result["error"] = str(exc)
+        return finish(SETUP_FAILURE_EXIT)
     harness = textwrap.dedent(
         """
         #include <algorithm>
@@ -157,13 +189,23 @@ def main() -> int:
         cpp_file = temp_path / "upper_level_copy.cpp"
         binary = temp_path / "upper_level_copy"
         cpp_file.write_text(harness, encoding="utf-8")
-        compile_result = subprocess.run(
-            [args.compiler, "-std=c++20", "-O0", str(cpp_file), "-o", str(binary)],
-            check=False,
-        )
+        result["phase"] = "compile"
+        try:
+            compile_result = subprocess.run(
+                [args.compiler, "-std=c++20", "-O0", str(cpp_file), "-o", str(binary)],
+                check=False,
+            )
+        except OSError as exc:
+            result["error"] = str(exc)
+            return finish(COMPILE_FAILURE_EXIT)
+        result["compile_exit"] = compile_result.returncode
         if compile_result.returncode != 0:
-            return compile_result.returncode
-        return subprocess.run([str(binary)], check=False).returncode
+            result["error"] = "copy harness compilation failed"
+            return finish(COMPILE_FAILURE_EXIT)
+        result["phase"] = "runtime"
+        result["runtime_exit"] = subprocess.run([str(binary)], check=False).returncode
+        # Only the compiled harness's explicit mismatch exit is a detected mutant.
+        return finish(result["runtime_exit"] if result["runtime_exit"] >= 0 else 1)
 
 
 if __name__ == "__main__":
