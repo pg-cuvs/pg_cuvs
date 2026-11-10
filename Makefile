@@ -516,6 +516,16 @@ test-compact-retry-daemon:
 test-hnsw-precision-mutations: test/unit/test_hnsw_precision_mutations.py test-hnsw-policy
 	CC=$(CC) python3 -I test/unit/test_hnsw_precision_mutations.py
 
+.PHONY: test-hnsw-sdk-upper-precision
+# Requires the exact SDK source and its actual downloaded hnswlib getter header.
+test-hnsw-sdk-upper-precision:
+	@test -n "$(CUVS_SDK_TEST_SOURCE)" -a -n "$(CUVS_HNSWLIB_HEADER)" || \
+	  { echo "set CUVS_SDK_TEST_SOURCE and CUVS_HNSWLIB_HEADER" >&2; exit 2; }
+	python3 test/native/hnsw-sdk/test_upper_level_precision.py \
+	  --source "$(CUVS_SDK_TEST_SOURCE)" --compiler "$(CXX)" \
+	  --hnswlib-header "$(CUVS_HNSWLIB_HEADER)" --mutations \
+	  $(if $(CUVS_SDK_TEST_OUTPUT),--output "$(CUVS_SDK_TEST_OUTPUT)")
+
 # CK-27 (a) for the I4 knobs: docs flag rows vs cuvs_lw_policy.h macros.
 test-lw-docs: test/unit/check_lw_docs.py docs/reference.md src/cuvs_lw_policy.h
 	python3 -I test/unit/check_lw_docs.py

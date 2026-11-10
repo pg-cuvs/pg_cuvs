@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # SPDX-FileCopyrightText: Copyright (c) 2026, JAESOL SHIN
 # SPDX-License-Identifier: PostgreSQL
-"""Compile the exact cuVS disk-serializer copy statement against fractional floats."""
+"""Compile both exact copy expressions with the real hnswlib getter type."""
 
 from __future__ import annotations
 
@@ -59,11 +59,31 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--source", required=True, type=pathlib.Path)
     parser.add_argument("--compiler", default="clang++")
+    parser.add_argument("--hnswlib-header", required=True, type=pathlib.Path)
+    parser.add_argument("--mutant", choices=["raw-source", "byte-destination", "short-copy"])
     args = parser.parse_args()
 
     disk_statement, memory_statement = source_copy_statements(args.source.resolve())
+    getter = args.hnswlib_header.read_text(encoding="utf-8")
+    if not re.search(r"char\s*\*\s*getDataByInternalId\s*\(", getter):
+        raise SystemExit("actual hnswlib getter must return char*; update the fixture if its API changes")
+    if args.mutant == "raw-source":
+        memory_statement, count = re.subn(
+            r"reinterpret_cast<const T\*>\((appr_algo->getDataByInternalId\(pt_id\))\)",
+            r"\1", memory_statement,
+        )
+        if count != 2:
+            raise SystemExit("raw-source mutant must replace both typed iterators")
+    elif args.mutant == "byte-destination":
+        memory_statement = memory_statement.replace(
+            "&host_query_set(i - start_idx, 0)",
+            "reinterpret_cast<char*>(&host_query_set(i - start_idx, 0))",
+        )
+    elif args.mutant == "short-copy":
+        memory_statement = memory_statement.replace("+ dim", "+ dim / sizeof(T)")
     harness = textwrap.dedent(
         """
+        #include <algorithm>
         #include <cstddef>
         #include <cstring>
         #include <iostream>
@@ -78,9 +98,9 @@ def main() -> int:
 
         struct FakeHnsw {
           const float* values;
-          const float* getDataByInternalId(std::size_t id) const noexcept
+          char* getDataByInternalId(std::size_t id) const noexcept
           {
-            return values + id * 4;
+            return const_cast<char*>(reinterpret_cast<const char*>(values + id * 4));
           }
         };
 
@@ -107,6 +127,7 @@ def main() -> int:
             }
           }
           {
+            using T = float;
             float copied[dim] = {};
             FakeHnsw fake_hnsw{original};
             FakeHnsw* appr_algo = &fake_hnsw;

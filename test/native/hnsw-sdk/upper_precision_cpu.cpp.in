@@ -1,0 +1,98 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026, JAESOL SHIN
+// SPDX-License-Identifier: PostgreSQL
+// GPU allocation/build APIs are spies; the policy, memory guard and dispatch body are SDK code.
+#include <algorithm>
+#include <cassert>
+#include <cmath>
+#include <cstdint>
+#include <iostream>
+#include <limits>
+#include <optional>
+#include <vector>
+#include "ace_memory_guard.hpp"
+#include "__POLICY_HEADER__"
+#define CUVS_HNSW_FP16_MAX 65504.0
+enum { CUVS_METRIC_L2=0, CUVS_METRIC_IP=1, CUVS_METRIC_COSINE=2 };
+using std::isfinite;
+__PRODUCT_PRECISION_POLICY__
+
+enum { CUDA_R_16F=16, CUDA_R_32F=32 };
+namespace cuvs::distance {
+enum class DistanceType { L2Expanded, L2SqrtExpanded, InnerProduct, CosineExpanded };
+}
+using Metric=cuvs::distance::DistanceType;
+struct Shape { int64_t rows,dim; };
+template<typename T> struct HostView {
+  T* pointer; int64_t rows,dim;
+  int64_t extent(int i) const { return i==0?rows:dim; }
+  size_t size() const { return size_t(rows)*dim; }
+  Shape extents() const { return {rows,dim}; }
+  T* data_handle() const { return pointer; }
+};
+namespace raft {
+struct resources {}; struct row_major {};
+template<typename T,typename I,typename L=row_major> using host_matrix_view=HostView<T>;
+}
+struct Seen { int builder=0,coarse=0,internal=0,lut=0;size_t degree=0,intermediate=0;Metric metric=Metric::L2Expanded; } seen;
+namespace cuvs::neighbors::nn_descent {
+struct index_params { size_t graph_degree=0,intermediate_graph_degree=0;Metric metric=Metric::L2Expanded;bool return_distances=true; };
+template<typename A,typename B> int build(raft::resources const&,index_params p,A,B) {
+ seen.builder=1;seen.degree=p.graph_degree;seen.intermediate=p.intermediate_graph_degree;seen.metric=p.metric;return 0;
+}
+}
+namespace cuvs::neighbors::cagra {
+namespace graph_build_params {
+struct ivf_pq_params {
+ struct Search { int coarse_search_dtype=CUDA_R_16F,internal_distance_dtype=CUDA_R_16F,lut_dtype=CUDA_R_16F;uint32_t max_internal_batch_size=131072; } search_params;
+ float refinement_rate=1;
+ ivf_pq_params(Shape,Metric) {}
+};
+}
+template<typename A,typename B> void build_knn_graph(raft::resources const&,A,B,graph_build_params::ivf_pq_params p) {
+ seen.builder=2;seen.coarse=p.search_params.coarse_search_dtype;seen.internal=p.search_params.internal_distance_dtype;seen.lut=p.search_params.lut_dtype;
+}
+}
+#define RAFT_EXPECTS(condition, ...) do { if(!(condition)) throw std::runtime_error("RAFT_EXPECTS"); } while(false)
+#define RAFT_LOG_INFO(...) ((void)0)
+namespace cuvs::neighbors::hnsw::detail {
+namespace memory_guard=cuvs::neighbors::cagra::detail::memory_guard;
+__SDK_ALL_NEIGHBORS_GRAPH__
+}
+
+int main() {
+ using namespace cuvs::neighbors::hnsw::detail;
+ raft::resources res;
+ // A misplaced norm scan in the unchanged NN path must fail, not silently pass.
+ seen={};all_neighbors_graph<float>(res,{nullptr,312499,64},{nullptr,312499,32},Metric::L2Expanded);
+ assert(seen.builder==1 && seen.degree==32 && seen.intermediate==64);
+ seen={};all_neighbors_graph<float>(res,{nullptr,312500,1},{nullptr,312500,32},Metric::InnerProduct,size_t{1}<<30,size_t{1}<<30);
+ assert(seen.builder==1 && seen.metric==Metric::InnerProduct);
+ auto check=[&](Metric metric,float value,int expected,bool spike=false) {
+   std::vector<float> values(312500,spike?0:value);if(spike)values.back()=value;
+   seen={};all_neighbors_graph<float>(res,{values.data(),312500,1},{nullptr,312500,32},metric);
+   assert(seen.builder==2 && seen.coarse==expected && seen.internal==expected && seen.lut==expected);
+ };
+ check(Metric::L2Expanded,.25f,16);check(Metric::L2SqrtExpanded,.25f,16);
+ check(Metric::InnerProduct,1.f,16);check(Metric::CosineExpanded,1.f,16);
+ check(Metric::L2Expanded,128.f,32);check(Metric::L2SqrtExpanded,128.f,32);
+ check(Metric::InnerProduct,128.f,16);check(Metric::CosineExpanded,128.f,16);
+ check(Metric::InnerProduct,256.f,32);check(Metric::CosineExpanded,256.f,32);
+ check(Metric::L2Expanded,128.f,32,true);check(Metric::InnerProduct,256.f,32,true);
+ check(Metric::L2Expanded,std::numeric_limits<float>::quiet_NaN(),32,true);
+ check(Metric::InnerProduct,std::numeric_limits<float>::infinity(),32,true);
+ check(Metric::CosineExpanded,-std::numeric_limits<float>::infinity(),32,true);
+ assert(!upper_precision::needs_fp32(16375.999999,true));
+ assert(upper_precision::needs_fp32(16376.,true));
+ assert(!upper_precision::needs_fp32(65503.999999,false));
+ assert(upper_precision::needs_fp32(65504.,false));
+ assert(upper_precision::needs_fp32(std::numeric_limits<double>::quiet_NaN(),true));
+ assert(upper_precision::needs_fp32(std::numeric_limits<double>::infinity(),false));
+ for(double value:{0.,1.,16375.,16376.,65503.,65504.,1e10,std::numeric_limits<double>::infinity(),std::numeric_limits<double>::quiet_NaN()}) {
+   assert(upper_precision::needs_fp32(value,true)==bool(cuvs_hnsw_ivfpq_needs_fp32(value,CUVS_METRIC_L2)));
+   assert(upper_precision::needs_fp32(value,false)==bool(cuvs_hnsw_ivfpq_needs_fp32(value,CUVS_METRIC_IP)));
+   assert(upper_precision::needs_fp32(value,false)==bool(cuvs_hnsw_ivfpq_needs_fp32(value,CUVS_METRIC_COSINE)));
+ }
+ const float normal[64]={.5f,-.5f};assert(upper_precision::max_sq_norm(normal,1,64)==.5);
+ const int8_t small[2]={-128,127};assert(upper_precision::max_sq_norm(small,1,2)==32513.);
+ std::cout<<"PASS: actual upper dispatch, boundary, metrics, all three dtypes, nonfinite, late rows, NN preservation\n";
+}
