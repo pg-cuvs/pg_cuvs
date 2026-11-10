@@ -405,7 +405,7 @@ static uint32_t g_rmm_pool_mb     = 512; /* initial reservation per usable GPU *
 static uint32_t g_rmm_pool_max_percent = 50;
 /* C3 coefficient rho. Released default = Q1 rho* (A100-SXM4-80GB, overflow
  * managed), changed only on this line (C6); the only numeric default. */
-#define CUVS_RMM_SCRATCH_PERMILLE_DEFAULT 7726
+#define CUVS_RMM_SCRATCH_PERMILLE_DEFAULT 9593
 /* The overflow policy rho* was measured under. A daemon started with another
  * --cagra-build-overflow logs "scratch model unvalidated" at startup. */
 #define CUVS_RMM_SCRATCH_VALIDATED_OVERFLOW_POLICY CUVS_LW_OVERFLOW_MANAGED
