@@ -2982,6 +2982,9 @@ cuvs_build_hnsw_from_heap(Relation heapRel, Relation indexRel, IndexInfo *indexI
                 64, 128, hierarchy, cap,
                 build_algo, ef_construction, &out->policy, &budget, &out->ace,
                 &out->hnsw_fd, error, sizeof(error));
+            cuvs_report_build_notice(RelationGetRelid(indexRel));
+            if (rc != CUVS_STATUS_OK)
+                cuvs_report_admission(CUVS_ADMISSION_OBJ_CAGRA, RelationGetRelid(indexRel), NULL);
             if (rc == CUVS_STATUS_HNSW_RESIDENT_BUDGET_EXCEEDED)
                 cuvs_hnsw_budget_error(build_algo, &budget);
             if (rc == CUVS_STATUS_CANCELED) CHECK_FOR_INTERRUPTS();
@@ -5450,6 +5453,8 @@ ivfpq_ambuild(Relation heapRel, Relation indexRel, IndexInfo *indexInfo)
                 relfilenode,
                 n_lists, pq_bits, pq_dim);
 
+            cuvs_report_build_notice(RelationGetRelid(indexRel));
+
             if (rc != CUVS_STATUS_OK)
             {
                 const char *hint;
@@ -6751,6 +6756,7 @@ pg_cuvs_compact(PG_FUNCTION_ARGS)
 
     if (rc != CUVS_STATUS_OK && rc != CUVS_STATUS_NOT_FOUND)
     {
+        cuvs_report_admission(CUVS_ADMISSION_OBJ_CAGRA, index_oid, NULL);
         cuvs_report_proto_mismatch(rc);
         ereport(ERROR,
                 (errcode(ERRCODE_INTERNAL_ERROR),

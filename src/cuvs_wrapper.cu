@@ -920,6 +920,16 @@ vram_physical_parts(int device_id, size_t *free_out, size_t *async_out)
 }
 
 extern "C" size_t
+cuvs_vram_raw_free_bytes_on(int device_id)
+{
+    size_t free_bytes = 0, total_bytes = 0;
+    if (cudaSetDevice(device_id) != cudaSuccess ||
+        cudaMemGetInfo(&free_bytes, &total_bytes) != cudaSuccess)
+        return 0;
+    return free_bytes;
+}
+
+extern "C" size_t
 cuvs_vram_physical_free_bytes_on(int device_id)
 {
     size_t free_bytes = 0, async_reclaimable = 0;

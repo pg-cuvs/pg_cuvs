@@ -389,8 +389,10 @@ comes from a build-only CUDA managed-memory resource that is installed after the
 build borrows its resources and restored before they return to the pool, on every
 exit path. It is outside the RMM pool, the quota and the logical budget, so
 `SHOW cuvs.rmm_pool_status` pool usage and `nvidia-smi` can disagree during such a
-build. If GPU memory runs short the large_workspace pages move to host RAM: the
-build gets slower (not measured) and the requester receives:
+build. If GPU memory runs short, large_workspace pages can move to host RAM.
+This does not guarantee progress when physical GPU memory is exhausted (see the
+physical backing guard below). A spill can slow the build (not measured), and
+the requester receives:
 
 ```
 NOTICE:  pg_cuvs: build used managed memory spill (large_workspace peak <MiB>, physical free <MiB>); the build may be slower than usual
@@ -408,6 +410,35 @@ memory (overcommit `off`: AR6, 53400) or exceeds it by more than the host guard
 unreadable cgroup or cgroup v1 gives a guard of 0). `lw_pending` is the sum of
 `lw_ub` over managed builds already admitted on the same GPU. The estimate is not
 an upper bound.
+
+**Physical backing guard.** Before CAGRA single, parallel or shard builds,
+direct IVF-PQ builds, HNSW file builds and CAGRA compaction enter cuVS, the daemon
+checks raw `cudaMemGetInfo` free memory on the selected GPU. Below **32 MiB**
+(33,554,432 bytes), or if the query fails, it defers the operation with
+SQLSTATE **53200**, reason `PHYS`, and a NOTICE naming physical memory pressure.
+Retry after other GPU users release memory; a daemon restart is not needed for
+this rejection. Idle RMM pool bytes and cached CUDA async allocations do not
+count: they cannot back the SDK's HMM access to pageable host metadata or its
+direct managed allocations. The default overflow policies remain `managed` and
+overcommit `on`; ordinary builds keep their existing algorithm and allocator.
+
+This is an exhaustion mitigation, **not a memory reservation or a bound on a
+build's peak**. The 32 MiB floor leaves margin above the observed sub-MiB failure,
+but does not prove that all shapes fit. Another process, a concurrent build or
+later SDK allocations can consume the sampled free memory before an HMM fault.
+Sticky CUDA errors and daemon abort remain possible in that race. Use GPU
+isolation or coordinate physical memory use when that risk is unacceptable.
+The guard does not change the SDK's host memset or direct managed allocations.
+
+`SHOW cuvs.rmm_pool_status` includes `build_physical_floor_bytes` and
+`physical_build_guard`, an array of `device_id`, `rejects`, and
+`last_reject_free_bytes` (0 before any rejection; check `rejects`). Counters reset
+on daemon restart and stay separate from `rejects_ar0` through `rejects_ar8`.
+The requester can also inspect `pg_cuvs_last_rejection()` (`reason=PHYS`,
+`need_mib=32`, `phys_free_mib`). Logs use `[physical_build_guard]` with the
+operation, GPU, database/index OIDs, raw free bytes, floor and `retryable=1`.
+The text payload adds `PHYS n=32 u=<MiB>` without changing the IPC frame size;
+deploy the extension and daemon together so both recognize the new reason.
 
 Status keys appended to `SHOW cuvs.rmm_pool_status`: `cagra_build_overflow`,
 `managed_overcommit`, `lw_margin_permille`, `oom_score_adj`,
@@ -566,6 +597,7 @@ reloading an index on a query, the error names the reason and the numbers instea
 |---|---|---|---|
 | AR0 | 54000 | The build needs more than one build may ever get (pool quota, or the logical VRAM budget when the pool is disabled) | Use `pg_cuvs_hnsw` with `build_algo='auto'` or `'ace'`; lower `graph_degree`; operators review `--rmm-pool-max-percent`, `--max-vram-mb`, `--rmm-scratch-permille`. Retrying does not help |
 | AR1, AR2 | 53200 | Another CREATE INDEX holds GPU memory | Retry after it finishes |
+| PHYS | 53200 | Raw physical GPU free memory is below the 32 MiB backing floor, or the query failed; the build/compaction was deferred before cuVS | Retry after other GPU users release physical memory; inspect the NOTICE and `SHOW cuvs.rmm_pool_status` |
 | AR3, AR4 | 53200 | Not enough even after evicting what may be evicted | Unload an idle index (HINT names one), then retry |
 | AR8 | 53200 | A CAGRA build does not fit the GPU memory pool with headroom: `pending + pool_used + N + headroom` exceeds the pool quota (DETAIL `need … MiB + headroom … MiB > pool quota … MiB (pending … MiB, pool used … MiB)`) and no permitted eviction frees enough; nothing was reserved, and nothing was evicted unless the pool was still short after an eviction (`pool used` is then the value read after it) | Lower the index size or `graph_degree` (`ALTER INDEX … SET (graph_degree = …)` and `REINDEX`); an operator can raise `--rmm-pool-max-percent`. A retry helps when `pending` or the resident pool use goes down |
 | OOM (after admission) | 53200 | The build ran out of GPU memory although admitted; nothing was evicted | Raise `--rmm-scratch-permille`, or retry when memory is free |

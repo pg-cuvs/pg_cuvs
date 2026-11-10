@@ -2562,6 +2562,7 @@ cuvs_ipc_build_hnsw_file(const char *socket_path, int vectors_fd,
     CuvsHnswFileReply wire = {0};
     CuvsReplyHeader reply = {0};
     char token = 'O';
+    forget_reply();
     *hnsw_fd = -1;
     if (policy) memset(policy, 0, sizeof(*policy));
     if (ace_readback) memset(ace_readback, 0, sizeof(*ace_readback));
@@ -2611,6 +2612,7 @@ cuvs_ipc_build_hnsw_file(const char *socket_path, int vectors_fd,
         if (recv_all(sock, &token, 1) || token != 'R'
             || cuvs_fd_recv(sock, &wire, sizeof(wire), &result_fd)) goto done;
         reply = wire.header;
+        remember_reply(&reply);
         rc = (int)reply.status;
         if (error_len) snprintf(error, error_len, "%.*s", (int)sizeof(reply.error), reply.error);
         /* Decision bytes for the status-13 DETAIL; present on refusals too. */

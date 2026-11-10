@@ -985,6 +985,23 @@ test-lw-daemon:
 		-Wl,--gc-sections -lm -lpthread -lrt -lcurl -lssl -lcrypto -o test-lw-daemon
 	./test-lw-daemon
 
+EXTRA_CLEAN += test-physical-build-guard
+.PHONY: test-physical-build-guard test-physical-build-mutations
+ifeq ($(shell uname -s),Linux)
+test-unit: test-physical-build-guard
+test-admission-contract-mutations: test-physical-build-mutations
+endif
+test-physical-build-guard:
+	$(CC) -std=gnu11 -O1 -DPGCUVS_CPU_SHIM -ffunction-sections -fdata-sections -I src \
+		test/unit/test_physical_build_guard.c src/cuvs_ipc.c src/cuvs_util.c \
+		src/cuvs_objstore.c src/cuvs_build_corpus.c src/cuvs_wrapper_shim_cpu.c \
+		src/cuvs_cache_policy.c src/cuvs_peak_meter.c \
+		-Wl,--gc-sections -lm -lpthread -lrt -lcurl -lssl -lcrypto -o $@
+	./$@
+
+test-physical-build-mutations:
+	CC=$(CC) python3 -I test/unit/test_physical_build_mutations.py
+
 # I3-E / C8: rejection counters, memory_status I3-E columns, build_status rows
 # for in-flight unlocked CAGRA builds, through the actual daemon source (CPU
 # shim; the build entry points and the RMM pool reader are fixtures).

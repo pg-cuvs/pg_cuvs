@@ -615,6 +615,7 @@ int cuvs_probe_hw(int device_id, double *link_bw_bpus, double *hbm_bw_bpus,
 
 size_t cuvs_vram_free_bytes_on(int device_id) { (void)device_id; return shim_vram_free_get(); }
 size_t cuvs_vram_physical_free_bytes_on(int device_id) { (void)device_id; return shim_vram_free_get(); }
+size_t cuvs_vram_raw_free_bytes_on(int device_id) { (void)device_id; return shim_vram_free_get(); }
 size_t cuvs_vram_free_bytes(void) { return shim_vram_free_get(); }
 void   cuvs_warmup_device(int device_id) { (void)device_id; }
 void   cuvs_warmup(void) {}

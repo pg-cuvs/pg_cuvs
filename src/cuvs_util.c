@@ -988,6 +988,7 @@ cuvs_circuit_reason_is_transient(int status, int reason)
         case CUVS_ADMISSION_AR5:
         case CUVS_ADMISSION_OOM:    /* post-admission OOM */
         case CUVS_ADMISSION_ATT:
+        case CUVS_ADMISSION_PHYS:
             return 1;
         case CUVS_ADMISSION_NONE:
             /* No reason code: only the VRAM-shortage status is known transient. */
@@ -1207,7 +1208,7 @@ cuvs_build_shape_class(int64_t n, uint32_t dim, uint32_t metric, uint32_t gd,
  * I3 admission rejection payload codec (cuvs_util.h).
  * ---------------------------------------------------------------- */
 static const char *const cuvs_admission_reason_names[] = {
-    "AR0", "AR1", "AR2", "AR3", "AR4", "AR5", "AR6", "AR7", "AR8", "OOM", "ATT"
+    "AR0", "AR1", "AR2", "AR3", "AR4", "AR5", "AR6", "AR7", "AR8", "OOM", "ATT", "PHYS"
 };
 #define CUVS_ADMISSION_N_REASONS \
     ((int) (sizeof(cuvs_admission_reason_names) / sizeof(cuvs_admission_reason_names[0])))
@@ -1725,6 +1726,8 @@ cuvs_admission_unload_hint(CuvsStrBuf *b, const CuvsAdmissionFields *f,
 static int
 cuvs_admission_reason_fits(CuvsAdmissionReason r, CuvsAdmissionObject obj)
 {
+    if (r == CUVS_ADMISSION_PHYS)
+        return obj != CUVS_ADMISSION_OBJ_LOAD;
     switch (obj)
     {
         case CUVS_ADMISSION_OBJ_CAGRA:
@@ -1769,6 +1772,10 @@ cuvs_admission_format(const CuvsAdmissionFields *f, CuvsAdmissionObject obj,
                     load_index_name ? load_index_name : "?");
     else switch (f->reason)
     {
+        case CUVS_ADMISSION_PHYS:
+            cuvs_sb_add(&m, "pg_cuvs: GPU physical memory is temporarily exhausted; "
+                            "build or compaction deferred before cuVS");
+            break;
         case CUVS_ADMISSION_AR0:
             cuvs_sb_add(&m, "pg_cuvs: GPU memory is insufficient for %s (needs more than "
                             "the configured limit); CREATE INDEX aborted",
@@ -1819,6 +1826,11 @@ cuvs_admission_format(const CuvsAdmissionFields *f, CuvsAdmissionObject obj,
         cuvs_sb_add(&d, "shard %u: ", f->i);
     switch (f->reason)
     {
+        case CUVS_ADMISSION_PHYS:
+            cuvs_sb_add(&d, "physical free "); cuvs_sb_mib(&d, f->u);
+            cuvs_sb_add(&d, " MiB; minimum backing headroom "); cuvs_sb_mib(&d, f->n);
+            cuvs_sb_add(&d, " MiB (idle pool bytes do not back HMM page faults)");
+            break;
         case CUVS_ADMISSION_AR0:
             cuvs_sb_add(&d, "needs "); cuvs_sb_mib(&d, f->n);
             cuvs_sb_add(&d, load ? " MiB; the limit for one index is "
@@ -1920,6 +1932,10 @@ cuvs_admission_format(const CuvsAdmissionFields *f, CuvsAdmissionObject obj,
     /* HINT */
     switch (f->reason)
     {
+        case CUVS_ADMISSION_PHYS:
+            cuvs_sb_add(&h, "Retry after other GPU users release physical memory. "
+                            "Changing the managed overflow policy is not required.");
+            break;
         case CUVS_ADMISSION_AR0:
             if (load)
             {
