@@ -61,6 +61,8 @@ BACKEND = SRC / "pg_cuvs.c"
 EXPORT = SRC / "hnsw_export.c"
 
 WIRING = {
+    "norm_uses_rmm_policy": (WRAPPER, r"return thrust::transform_reduce\(raft::resource::get_thrust_policy\(res\),"),
+    "norm_policy_header": (WRAPPER, r"#include <raft/core/resource/thrust_policy.hpp>"),
     "precision_resident_only": (WRAPPER, r"if \(!tiny && !disk\)\s*\{\s*const double max_sq = cuvs_hnsw_max_sq_norm\("
                                          r"static_cast<const float \*>\(files\.mapping\),\s*params->n_vecs, params->dim\);"),
     "precision_three_dtypes": (WRAPPER, r"if \(fp32\)\s*\{\s*auto &sp = prepared\.pq_params->search_params;\s*"
@@ -101,6 +103,9 @@ WIRING = {
 }
 
 WIRING_MUTANTS = {
+    "norm_uses_default_cuda_allocator": (WRAPPER, "thrust::transform_reduce(raft::resource::get_thrust_policy(res),",
+                                         "thrust::transform_reduce(thrust::cuda::par.on(res.get_stream()),"),
+    "norm_policy_header_removed": (WRAPPER, "#include <raft/core/resource/thrust_policy.hpp>\n", ""),
     "coarse_dtype_kept_fp16": (WRAPPER, "                sp.coarse_search_dtype = CUDA_R_32F;\n", ""),
     "precision_on_ace_route": (WRAPPER, "        if (!tiny && !disk)\n        {\n            const double max_sq",
                                "        if (!tiny)\n        {\n            const double max_sq"),

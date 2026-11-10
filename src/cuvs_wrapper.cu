@@ -6,8 +6,8 @@
  * triggering the float4 typedef collision between PostgreSQL headers
  * and CUDA headers.
  *
- * Dependency: libcuvs (RAPIDS cuVS). Install via conda:
- *   mamba install -c rapidsai -c nvidia libcuvs=24.12 cuda-toolkit=12.4
+ * Dependency: the pinned cuVS SDK and matching libcuvs build; see
+ * Makefile's verify-hnsw-sdk-plan target and the build receipt.
  */
 
 #include "cuvs_wrapper.h"
@@ -27,6 +27,7 @@
 #include <thrust/transform_reduce.h>
 #include <cuvs/core/bitset.hpp>      /* 3O: cuvs::core::bitset_view */
 #include <raft/core/device_resources.hpp>
+#include <raft/core/resource/thrust_policy.hpp>
 #include <raft/core/device_mdarray.hpp>
 #include <raft/core/host_mdarray.hpp>
 #include <raft/core/bitset.cuh>      /* 3O: raft::core::bitset device ops */
@@ -277,7 +278,9 @@ static double device_max_sq_norm(raft::device_resources &res, const float *data,
                                  int64_t rows, int64_t dim, int64_t ld)
 {
     if (rows <= 0 || !data) return 0.0;
-    return thrust::transform_reduce(thrust::cuda::par.on(res.get_stream()),
+    /* RMM policy: temporary reduction storage uses the daemon's current
+     * device resource and this request's stream, including pooled mode. */
+    return thrust::transform_reduce(raft::resource::get_thrust_policy(res),
         thrust::counting_iterator<int64_t>(0), thrust::counting_iterator<int64_t>(rows),
         CuvsRowSqNorm{data, dim, ld}, 0.0, thrust::maximum<double>());
 }
@@ -2458,15 +2461,15 @@ cuvs_cagra_extract_adjacency(
 /* ----------------------------------------------------------------
  * Debug/test helpers: eat and free raw VRAM to simulate physical CUDA OOM.
  *
- * cuvs_eat_vram(leave_bytes, device_id): allocate enough VRAM (in 512 MB
- * chunks) to leave only ~leave_bytes free on the device.  Chunked allocation
+ * cuvs_eat_vram(leave_bytes, device_id): allocate enough VRAM (in 1 GiB,
+ * then 4 MiB chunks) to leave only ~leave_bytes free on the device. Chunked allocation
  * is required because CUDA driver typically refuses a single cudaMalloc of
- * nearly-full VRAM on large GPUs (A100 40 GB etc.) — individual 512 MB
+ * nearly-full VRAM on large GPUs (A100 40 GB etc.) — individual 1 GiB
  * allocations stack up to 39+ GB without triggering the driver limit.
  *
  * cuvs_free_vram(device_id): release all held chunks.
  *
- * Max 256 chunks per device (256 × 512 MB = 128 GB — enough for any GPU).
+ * Max 256 chunks per device (up to 256 GiB with 1 GiB chunks).
  * ---------------------------------------------------------------- */
 
 static void *g_vram_eaten_ptrs[16][256];
