@@ -19,7 +19,7 @@
 #define CUVS_ADMISSION_WAIT_UNPIN (-1)
 
 /* Enum numbers are local discriminants, not CuvsReplyHeader.status values.
- * The wire reason is the spelling AR0..AR8, OOM, or ATT. NONE is not sent.
+ * The wire reason is the spelling AR0..AR8, OOM, ATT, or PHYS. NONE is not sent.
  * AR8 follows AR7 so AR0..AR8 stay one contiguous range; OOM and ATT moved
  * up by one, which no wire or stored value depends on.
  */
@@ -35,11 +35,23 @@ typedef enum CuvsAdmissionReason {
     CUVS_ADMISSION_AR7,
     CUVS_ADMISSION_AR8,
     CUVS_ADMISSION_OOM,
-    CUVS_ADMISSION_ATT
+    CUVS_ADMISSION_ATT,
+    CUVS_ADMISSION_PHYS /* raw physical backing guard; n=floor, u=free (MiB) */
 } CuvsAdmissionReason;
 
+/* HMM host-page faults and SDK-direct managed allocations cannot use idle
+ * RMM pool bytes. This is a preflight floor, not a reservation or a bound on
+ * an entire build. External allocations after the sample remain a race. */
+#define CUVS_BUILD_PHYSICAL_FLOOR_BYTES (UINT64_C(32) << 20)
+
+static inline int
+cuvs_build_physical_refuse(uint64_t raw_free)
+{
+    return raw_free < CUVS_BUILD_PHYSICAL_FLOOR_BYTES;
+}
+
 #define CUVS_ADMISSION_SQLSTATE_LIMIT "54000"     /* AR0 */
-#define CUVS_ADMISSION_SQLSTATE_MEMORY "53200"    /* AR1..5, AR7, AR8, OOM, ATT */
+#define CUVS_ADMISSION_SQLSTATE_MEMORY "53200"    /* AR1..5, AR7, AR8, OOM, ATT, PHYS */
 #define CUVS_ADMISSION_SQLSTATE_WORKSPACE "53400" /* AR6 */
 
 /* Field keys: byte-valued metrics are encoded in MiB, saturated at

@@ -461,6 +461,9 @@ size_t cuvs_vram_free_bytes_on(int device_id);
  * without the RMM pool headroom adjustment and without subtracting other
  * builds' pending claims. Used only by AR6/AR7. 0 on any CUDA failure. */
 size_t cuvs_vram_physical_free_bytes_on(int device_id);
+/* cudaMemGetInfo only: excludes reusable pool/async cache; 0 on query error.
+ * Used before SDK builds whose HMM faults need backing outside those pools. */
+size_t cuvs_vram_raw_free_bytes_on(int device_id);
 
 /* Legacy: free VRAM on device 0 (used by unit test binary). */
 size_t cuvs_vram_free_bytes(void);

@@ -99,6 +99,37 @@ systemd unit의 `ExecStartPost`에서 `chmod 666 /tmp/.s.pg_cuvs`가 실행되�
 PG backend가 connect를 시도하면 `EACCES`로 `UNAVAILABLE`이 된다.
 `sleep 1`이 포함되어 있으나 부하가 높으면 race가 발생할 수 있다.
 
+### F. 물리 GPU 메모리 압박으로 빌드·압축이 거부됨 (`PHYS`)
+
+`NOTICE: ... deferred before cuVS ... physical memory pressure`와 SQLSTATE
+`53200`이 함께 나오면 데몬은 해당 작업을 SDK 진입 전에 거부한 것이다.
+CAGRA 단일·병렬·샤드, 직접 IVF-PQ, HNSW 파일 빌드와 CAGRA 압축에서
+`cudaMemGetInfo`의 물리 여유가 32 MiB 미만이거나 조회가 실패할 때 적용된다.
+RMM 풀 안의 빈 공간과 async 풀의 캐시는 이 여유에 포함되지 않는다.
+기본 `managed`·overcommit `on` 설정은 그대로이며, 이 거부만으로는 재시작할
+필요가 없다. 외부 GPU 사용량이 줄어든 뒤 같은 작업을 다시 실행한다.
+
+```sql
+SELECT pg_cuvs_last_rejection();
+SHOW cuvs.rmm_pool_status;
+```
+
+첫 쿼리는 거부를 받은 같은 세션에서 실행한다(실패한 명시적 트랜잭션이면
+먼저 `ROLLBACK`). `reason=PHYS`, `sqlstate=53200`을 확인한다. 두 번째의
+`build_physical_floor_bytes=33554432`와 `physical_build_guard` 배열에서 GPU별
+`rejects`, `last_reject_free_bytes`를 본다. 카운터는 재시작하면 초기화되며,
+`rejects=0`일 때의 `last_reject_free_bytes=0`은 측정 결과가 아니다.
+journal의 `[physical_build_guard]`에는 작업·GPU·OID와 바이트 단위 여유가 남는다.
+확장과 데몬은 함께 교체해야 새 `PHYS` 사유를 SQLSTATE로 해석한다.
+
+이 점검은 예약이 아니다. 점검 뒤 다른 프로세스나 동시 빌드가 메모리를
+소진하거나, SDK의 후속 할당이 여유를 소비하면 HMM 페이지 접근에서 sticky
+CUDA 700이 발생하고 데몬이 abort할 수 있다. 32 MiB는 전체 빌드의 메모리
+상한이 아니며, SDK의 host memset·직접 managed 할당 자체도 바뀌지 않았다.
+이 경쟁 조건을 허용할 수 없는 운영 환경에서는 GPU를 분리하거나 외부 작업의
+메모리 사용을 조율한다. 이미 CUDA 700으로 종료됐다면 위 표준 재시작 절차를
+따르고, 외부 점유와 해당 journal을 함께 보존한다.
+
 ---
 
 ## 4. Step-by-step 복구

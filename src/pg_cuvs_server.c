@@ -4014,6 +4014,40 @@ send_admission_reject(int client_fd, int status, const char *legacy_error,
     send_all(client_fd, &hdr, sizeof(hdr));
 }
 
+/* Call with g_index_mutex held, before entering the SDK build.
+ * Raw physical free excludes idle RMM/async-pool memory: the SDK's HMM host
+ * memset and directly allocated managed temporaries cannot draw on it.
+ * This sample is NOT a reservation against other processes or later growth. */
+static uint64_t g_physical_build_rejects[CUVS_MAX_GPUS];
+static uint64_t g_physical_build_last_free[CUVS_MAX_GPUS];
+
+static int
+physical_build_check(int dev, const char *op, const CuvsCmdFrame *cmd,
+                     CuvsAdmissionFields *rej)
+{
+    uint64_t raw_free = cuvs_vram_raw_free_bytes_on(dev);
+    if (!cuvs_build_physical_refuse(raw_free))
+        return 0;
+    memset(rej, 0, sizeof(*rej));
+    rej->reason = CUVS_ADMISSION_PHYS;
+    rej->present = CUVS_ADM_F_N | CUVS_ADM_F_U;
+    rej->n = cuvs_admission_mib(CUVS_BUILD_PHYSICAL_FLOOR_BYTES);
+    rej->u = cuvs_admission_mib(raw_free);
+    g_physical_build_rejects[dev]++;
+    g_physical_build_last_free[dev] = raw_free;
+    snprintf(g_build_notice, sizeof(g_build_notice),
+             "pg_cuvs: %s deferred before cuVS: GPU %d physical memory pressure", op, dev);
+    snprintf(g_build_notice_detail, sizeof(g_build_notice_detail),
+             "physical free %llu bytes < %llu bytes; retry after other GPU users release memory",
+             (unsigned long long)raw_free,
+             (unsigned long long)CUVS_BUILD_PHYSICAL_FLOOR_BYTES);
+    LOG_WARN("[physical_build_guard] op=%s gpu=%d db=%u idx=%u reason=PHYS "
+             "raw_free=%llu floor=%llu retryable=1\n", op, dev, cmd->db_oid, cmd->index_oid,
+             (unsigned long long)raw_free,
+             (unsigned long long)CUVS_BUILD_PHYSICAL_FLOOR_BYTES);
+    return 1;
+}
+
 
 /* Phase 3G: one shard's search, run on its own thread for parallel fanout.
  * Each shard lives on a distinct GPU and uses the per-device cuVS resource pool
@@ -6545,6 +6579,15 @@ build_sharded(int client_fd, const CuvsCmdFrame *cmd, const char *index_dir,
                          cmd->db_oid, cmd->index_oid, (uint32_t)i);
         snprintf(shard_tmp[i], 576, "%s.tmp", shard_final[i]);
 
+        if (physical_build_check(dev, "BUILD_SHARD", cmd, &shard_rej))
+        {
+            shard_rej.i = (uint32_t)i;
+            shard_rej.present |= CUVS_ADM_F_I;
+            shard_rejected = 1;
+            ok = 0;
+            break;
+        }
+
         g_cur_requester_idx = cmd->index_oid;
         AdmitLine al = {.op = "BUILD", .path = "sharded",
                         .algo = admission_algo_name(cmd->build_algo), .gpu = dev,
@@ -6584,6 +6627,14 @@ build_sharded(int client_fd, const CuvsCmdFrame *cmd, const char *index_dir,
                 break;
             }
             dev = alt;
+            if (physical_build_check(dev, "BUILD_SHARD", cmd, &shard_rej))
+            {
+                shard_rej.i = (uint32_t)i;
+                shard_rej.present |= CUVS_ADM_F_I;
+                shard_rejected = 1;
+                ok = 0;
+                break;
+            }
         }
         if (i == 0)   /* F-3: an admitted build drops its earlier rejects */
             note_build_admission(cmd->db_oid, cmd->index_oid, needed, dev, 1, 0);
@@ -7152,6 +7203,14 @@ handle_build(int client_fd, const CuvsCmdFrame *cmd)
         munmap(mem, total);
         send_admission_reject(client_fd, CUVS_STATUS_OOM_FALLBACK,
                               "index too large for any GPU VRAM budget", &rej);
+        return;
+    }
+    if (physical_build_check(target_gpu, "BUILD", cmd, &rej))
+    {
+        pthread_mutex_unlock(&g_index_mutex);
+        munmap(mem, total);
+        send_admission_reject(client_fd, CUVS_STATUS_OOM_FALLBACK,
+                              "GPU physical memory pressure; retry later", &rej);
         return;
     }
     al.gpu = target_gpu;
@@ -7891,6 +7950,14 @@ handle_build_multi(int client_fd, const CuvsCmdFrame *cmd, const char *index_dir
             pthread_mutex_unlock(&g_index_mutex);
             status = CUVS_STATUS_OOM_FALLBACK;
             err = "index too large for any GPU VRAM budget";
+            goto fail;
+        }
+        if (physical_build_check(target_gpu, "BUILD_MULTI", cmd, &rej))
+        {
+            rej_set = 1;
+            pthread_mutex_unlock(&g_index_mutex);
+            status = CUVS_STATUS_OOM_FALLBACK;
+            err = "GPU physical memory pressure; retry later";
             goto fail;
         }
         al.pending_before = g_pending_rmm_build_vram[target_gpu];
@@ -9140,6 +9207,14 @@ handle_build_ivfpq(int client_fd, const CuvsCmdFrame *cmd)
     al.gpu = target_gpu;
     al.pending_before = g_pending_rmm_build_vram[target_gpu];
     al.evictions_before = g_cache_evictions[target_gpu];
+    if (physical_build_check(target_gpu, "BUILD_IVFPQ", cmd, &rej))
+    {
+        pthread_mutex_unlock(&g_index_mutex);
+        munmap(mem, total);
+        send_admission_reject(client_fd, CUVS_STATUS_OOM_FALLBACK,
+                              "GPU physical memory pressure; retry later", &rej);
+        return;
+    }
     int admit_rc = ensure_vram(needed, target_gpu, CUVS_RQ_BUILD_IVFPQ, &rej, &al);
     note_build_admission(cmd->db_oid, cmd->index_oid, needed, target_gpu,
                          admit_rc == 0, 0);
@@ -9657,6 +9732,7 @@ cmp_u64(const void *a, const void *b)
 static void
 handle_compact(int client_fd, const CuvsCmdFrame *cmd)
 {
+    clear_build_notices();
     char index_dir[256] = {0};
     int  passed_fd = -1;
 
@@ -9789,6 +9865,16 @@ handle_compact(int client_fd, const CuvsCmdFrame *cmd)
                 new_tids[j++] = e->tids[i];
     }
 
+    CuvsAdmissionFields physical_rej;
+    if (physical_build_check((int)e->gpu_device_id, "COMPACT", cmd, &physical_rej))
+    {
+        pthread_mutex_unlock(&g_index_mutex);
+        free(keep_bits);
+        free(new_tids);
+        send_admission_reject(client_fd, CUVS_STATUS_OOM_FALLBACK,
+                              "GPU physical memory pressure; retry later", &physical_rej);
+        return;
+    }
     int ivfpq_retry = 0;
     CuvsCagraIndex new_handle = cuvs_cagra_compact(
         e->handle, keep_bits, n_vecs, e->metric, (int)e->gpu_device_id, &ivfpq_retry);
@@ -10246,6 +10332,7 @@ handle_hnsw_route_preflight(int client_fd)
 static void
 handle_build_hnsw_file(int client_fd, const CuvsCmdFrame *cmd)
 {
+    clear_build_notices();
     CuvsHnswFileRequest request = {0};
     CuvsHnswFileBuild params = {0};
     CuvsHnswFileReply wire = {0};
@@ -10293,6 +10380,15 @@ handle_build_hnsw_file(int client_fd, const CuvsCmdFrame *cmd)
     reply.error[0] = '\0';
     params.host_budget = hnsw_host_headroom(request.host_budget, reply.error, sizeof(reply.error));
     int device = usable_gpu(0);
+    CuvsAdmissionFields physical_rej;
+    if (physical_build_check(device, "BUILD_HNSW_FILE", cmd, &physical_rej))
+    {
+        reply.status = CUVS_STATUS_OOM_FALLBACK;
+        snprintf(reply.error, sizeof(reply.error), "GPU physical memory pressure; retry later");
+        (void)cuvs_admission_encode(&physical_rej, reply.err_out, sizeof(reply.err_out));
+        attach_build_notices(&reply);
+        goto done;
+    }
     params.gpu_budget = hnsw_gpu_budget(device, 1, &wire.budget.logical_used);
     wire.budget.pool_used = hnsw_pool_used(device);
     if (!params.host_budget || !params.gpu_budget)
@@ -10753,7 +10849,17 @@ handle_reclaim_status(int client_fd)
         else
             tb_printf(&b, "null}");
     }
-    tb_printf(&b, "}}");
+    tb_printf(&b, "},\"build_physical_floor_bytes\":%llu,\"physical_build_guard\":[",
+              (unsigned long long)CUVS_BUILD_PHYSICAL_FLOOR_BYTES);
+    for (int i = 0; i < n_usable_gpus(); i++)
+    {
+        int dev = usable_gpu(i);
+        tb_printf(&b, "%s{\"device_id\":%d,\"rejects\":%llu,\"last_reject_free_bytes\":%llu}",
+                  i ? "," : "", dev,
+                  (unsigned long long)g_physical_build_rejects[dev],
+                  (unsigned long long)g_physical_build_last_free[dev]);
+    }
+    tb_printf(&b, "]}");
     pthread_mutex_unlock(&g_index_mutex);
     send_text(client_fd, &b);
 }
