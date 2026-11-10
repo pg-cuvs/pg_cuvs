@@ -508,6 +508,11 @@ test-compact-retry:
 
 .PHONY: test-compact-retry
 
+test-compact-retry-daemon:
+	CC=$(CC) python3 -I test/unit/test_compact_retry_daemon_mutations.py
+
+.PHONY: test-compact-retry-daemon
+
 test-hnsw-precision-mutations: test/unit/test_hnsw_precision_mutations.py test-hnsw-policy
 	CC=$(CC) python3 -I test/unit/test_hnsw_precision_mutations.py
 

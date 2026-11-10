@@ -212,7 +212,22 @@ def main() -> int:
         red = result.returncode == 1
         print(f"{'RED ' if red else 'SURVIVED'} compact_exec_{name}")
         fails += 0 if red else 1
-    total = len(HEADER_MUTANTS) + len(base) + len(WIRING_MUTANTS) + len(execution_mutants)
+    integrated = "test/unit/test_compact_retry_integrated.py"
+    result = subprocess.run([sys.executable, "-I", str(ROOT / integrated)], capture_output=True)
+    if result.returncode:
+        print("BASELINE FAIL: integrated precision/retry fixture", result.stderr.decode()[-2000:]); fails += 1
+    for name in ("retry_metric_is_cosine", "retry_training_floor_dropped"):
+        result = subprocess.run([sys.executable, "-I", str(ROOT / integrated), name], capture_output=True)
+        red = result.returncode not in (0, 2)
+        print(f"{'RED ' if red else 'SURVIVED'} {name} (rc={result.returncode})")
+        fails += 0 if red else 1
+    daemon = subprocess.run([sys.executable, "-I", str(ROOT / "test/unit/test_compact_retry_daemon_mutations.py")],
+                            capture_output=True, text=True)
+    if daemon.returncode:
+        print("BASELINE/MUTANT FAIL: daemon NOTICE fixture", daemon.stdout[-2000:], daemon.stderr[-2000:]); fails += 1
+    else:
+        print(daemon.stdout.strip())
+    total = len(HEADER_MUTANTS) + len(base) + len(WIRING_MUTANTS) + len(execution_mutants) + 3
     print(f"hnsw precision mutations: {total - fails}/{total}")
     return 1 if fails else 0
 
