@@ -13,7 +13,9 @@
   },
   "composition_receipt": {
     "artifact": "stages/hnsw/evidence/sdk-v2-composed-34831f22/receipt.json",
-    "sha256": "a9a3b19a570f859ea9d1b7b2484d9ef766412ce18c913ac94b01f39b94bb1d1e"
+    "sha256": "a9a3b19a570f859ea9d1b7b2484d9ef766412ce18c913ac94b01f39b94bb1d1e",
+    "patch_prefix": "0001+0002+0003",
+    "scope": "Historical base composition; patch 0004 is verified by the source checks and build recipe."
   },
   "patches": [
     {
@@ -27,6 +29,10 @@
     {
       "path": "0003-hnsw-memory-guards.patch",
       "sha256": "34831f221f32337c025afeb33a32d7aa304e703bd0e3ee85f0ff93902a9a130f"
+    },
+    {
+      "path": "0004-hnsw-upper-precision.patch",
+      "sha256": "8777280bc918cc26e8bca0bbf38021e1e901ccda8510e543738b9a53ff631fdd"
     }
   ],
   "runtime_markers": {
@@ -37,17 +43,23 @@
     "memory_guard": {
       "symbol": "pgcuvs_hnsw_memory_guard_patch_id",
       "value": "pgcuvs-hnsw-memory-guard-v2@60b19a0f62ba0bd716de349382828e43be6e2daa"
+    },
+    "upper_precision": {
+      "symbol": "pgcuvs_hnsw_upper_precision_patch_id",
+      "value": "pgcuvs-hnsw-upper-precision-v1@60b19a0f62ba0bd716de349382828e43be6e2daa"
     }
   },
   "source_files": {
     "cpp/src/neighbors/detail/hnsw.hpp": {
       "base_sha256": "6c8530e39c6ed5fa4eb3fe7b9c6c24022842147c41814fc4c130fdb5a6b8fd0b",
       "patch1_sha256": "49adab846921272a2aaf28f3c5749fb85925fbfde8ca43cd0af61e51adcbba99",
-      "final_sha256": "88192b1da4cb50a2de5a0f374854c1d0659734215136f86d7e53e52c0a1dc911"
+      "final_sha256": "1378471e577268a0abbb5e575a4eeba5a45734f52e7aa35017545e28099d00ca",
+      "patch3_sha256": "88192b1da4cb50a2de5a0f374854c1d0659734215136f86d7e53e52c0a1dc911"
     },
     "cpp/src/neighbors/hnsw.cpp": {
       "base_sha256": "59c7874565b049eed090e7423df638eb18e4551ccd1cd4b65f1197dc4a4a7102",
-      "final_sha256": "fcbe6c5c40d35854a6deb6a3182c70dca8e5b53e83bb79c11a2efcb4b1a4a39e"
+      "final_sha256": "dce2bbaa933c6f046f561e35c6da5fb33c56ac37930cad5285123460e0b64069",
+      "patch3_sha256": "fcbe6c5c40d35854a6deb6a3182c70dca8e5b53e83bb79c11a2efcb4b1a4a39e"
     },
     "cpp/src/neighbors/cagra.cpp": {
       "base_sha256": "100e9a8702bf1f5b373019583d873a99d9490b575d3aa53dec5a9e34e932c202",
@@ -60,17 +72,34 @@
     "cpp/src/neighbors/detail/cagra/ace_memory_guard.hpp": {
       "base_sha256": null,
       "final_sha256": "dc2ccb2d6920bf81d55e614181e3ceff8e7e0394eae56d0506fbb302190cf555"
+    },
+    "cpp/src/neighbors/detail/hnsw_precision.hpp": {
+      "base_sha256": null,
+      "final_sha256": "c051c5bfe6c5b1031c61806ab7d0a8804741724011b41b33bb63eac9cb72dc69"
     }
   },
   "source_prefix_states": {
-    "0001": ["cpp/src/neighbors/detail/hnsw.hpp"],
-    "0001+0002": ["cpp/src/neighbors/detail/hnsw.hpp", "cpp/src/neighbors/hnsw.cpp"],
+    "0001": [
+      "cpp/src/neighbors/detail/hnsw.hpp"
+    ],
+    "0001+0002": [
+      "cpp/src/neighbors/detail/hnsw.hpp",
+      "cpp/src/neighbors/hnsw.cpp"
+    ],
     "0001+0002+0003": [
       "cpp/src/neighbors/detail/hnsw.hpp",
       "cpp/src/neighbors/hnsw.cpp",
       "cpp/src/neighbors/cagra.cpp",
       "cpp/src/neighbors/detail/cagra/cagra_build.cuh",
       "cpp/src/neighbors/detail/cagra/ace_memory_guard.hpp"
+    ],
+    "0001+0002+0003+0004": [
+      "cpp/src/neighbors/detail/hnsw.hpp",
+      "cpp/src/neighbors/hnsw.cpp",
+      "cpp/src/neighbors/cagra.cpp",
+      "cpp/src/neighbors/detail/cagra/cagra_build.cuh",
+      "cpp/src/neighbors/detail/cagra/ace_memory_guard.hpp",
+      "cpp/src/neighbors/detail/hnsw_precision.hpp"
     ]
   }
 }

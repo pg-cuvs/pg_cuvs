@@ -1,0 +1,103 @@
+diff --git a/cpp/src/neighbors/detail/hnsw.hpp b/cpp/src/neighbors/detail/hnsw.hpp
+--- a/cpp/src/neighbors/detail/hnsw.hpp
++++ b/cpp/src/neighbors/detail/hnsw.hpp
+@@ -8,6 +8,7 @@
+ #include "../../core/nvtx.hpp"
+ #include "../../core/omp_wrapper.hpp"
+ #include "cagra/ace_memory_guard.hpp"
++#include "hnsw_precision.hpp"
+ 
+ #include <cuvs/neighbors/brute_force.hpp>
+ #include <cuvs/neighbors/cagra.hpp>
+@@ -362,6 +363,20 @@
+     // Bound the actual IVF-PQ query batches and their device/host I/O arrays before the builder
+     // allocates them. The large-workspace branch in cagra_build.cuh reserves five batch widths.
+     cagra::graph_build_params::ivf_pq_params ivfpq_params(dataset.extents(), metric);
++    // Inspect only this actual upper-level population; keep NN-descent untouched.
++    const bool is_l2 = metric == cuvs::distance::DistanceType::L2Expanded ||
++                       metric == cuvs::distance::DistanceType::L2SqrtExpanded;
++    const double max_sq = upper_precision::max_sq_norm(dataset.data_handle(), rows, dim);
++    const bool fp32 = upper_precision::needs_fp32(max_sq, is_l2);
++    if (fp32) {
++      ivfpq_params.search_params.coarse_search_dtype     = CUDA_R_32F;
++      ivfpq_params.search_params.internal_distance_dtype = CUDA_R_32F;
++      ivfpq_params.search_params.lut_dtype               = CUDA_R_32F;
++    }
++    RAFT_LOG_INFO(
++      "HNSW upper-level IVF-PQ precision rows=%zu degree=%zu max_sq_norm=%.17g bound=%.17g "
++      "coarse_internal_lut=%s",
++      rows, degree, max_sq, upper_precision::distance_bound(max_sq, is_l2), fp32 ? "fp32" : "fp16");
+     const size_t top_k = checked_add(degree, size_t{1});
+     const size_t gpu_top_k = std::min<size_t>(
+       std::max(memory_guard::checked_scale(degree, ivfpq_params.refinement_rate), top_k), rows);
+@@ -1186,8 +1201,9 @@
+ #pragma omp parallel for num_threads(num_threads)
+     for (auto i = start_idx; i < end_idx; i++) {
+       auto pt_id = order[i];
+-      std::copy(appr_algo->getDataByInternalId(pt_id),
+-                appr_algo->getDataByInternalId(pt_id) + dim,
++      // hnswlib exposes raw bytes; both iterators must count T elements.
++      std::copy(reinterpret_cast<const T*>(appr_algo->getDataByInternalId(pt_id)),
++                reinterpret_cast<const T*>(appr_algo->getDataByInternalId(pt_id)) + dim,
+                 &host_query_set(i - start_idx, 0));
+     }
+ 
+diff --git a/cpp/src/neighbors/hnsw.cpp b/cpp/src/neighbors/hnsw.cpp
+--- a/cpp/src/neighbors/hnsw.cpp
++++ b/cpp/src/neighbors/hnsw.cpp
+@@ -122,3 +122,9 @@
+ {
+   return "pgcuvs-hnsw-disk-copy-v1@60b19a0f62ba0bd716de349382828e43be6e2daa";
+ }
++
++extern "C" __attribute__((visibility("default"))) const char*
++pgcuvs_hnsw_upper_precision_patch_id()
++{
++  return "pgcuvs-hnsw-upper-precision-v1@60b19a0f62ba0bd716de349382828e43be6e2daa";
++}
+diff --git a/cpp/src/neighbors/detail/hnsw_precision.hpp b/cpp/src/neighbors/detail/hnsw_precision.hpp
+new file mode 100644
+--- /dev/null
++++ b/cpp/src/neighbors/detail/hnsw_precision.hpp
+@@ -0,0 +1,41 @@
++/*
++ * SPDX-FileCopyrightText: Copyright (c) 2026, JAESOL SHIN
++ * SPDX-License-Identifier: Apache-2.0
++ */
++#pragma once
++
++#include <algorithm>
++#include <cmath>
++#include <cstddef>
++#include <limits>
++
++namespace cuvs::neighbors::hnsw::detail::upper_precision {
++
++// Policy bound shared with the product, not a proof of every PQ intermediate.
++inline double distance_bound(double max_sq_norm, bool is_l2)
++{
++  return is_l2 ? 4.0 * max_sq_norm : max_sq_norm;
++}
++
++inline bool needs_fp32(double max_sq_norm, bool is_l2)
++{
++  return !(distance_bound(max_sq_norm, is_l2) < 65504.0);
++}
++
++template <typename T>
++double max_sq_norm(const T* data, size_t rows, size_t dim)
++{
++  double maximum = 0.0;
++  for (size_t i = 0; i < rows; ++i) {
++    double squared = 0.0;
++    for (size_t j = 0; j < dim; ++j) {
++      const double value = static_cast<double>(data[i * dim + j]);
++      squared += value * value;
++    }
++    if (!std::isfinite(squared)) return std::numeric_limits<double>::infinity();
++    maximum = std::max(maximum, squared);
++  }
++  return maximum;
++}
++
++}  // namespace cuvs::neighbors::hnsw::detail::upper_precision
