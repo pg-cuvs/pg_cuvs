@@ -60,6 +60,7 @@
 #include <limits>
 #include <optional>
 #include <utility>
+#include <variant>
 #include <filesystem>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -1999,13 +2000,25 @@ cuvs_cagra_extend(CuvsCagraIndex index,
  * cagra::merge creates a NEW index; the old handle must be freed by the caller.
  * The new index manages its own dataset internally (same as deserialize path).
  * ---------------------------------------------------------------- */
+/* The pinned filtered-merge SDK catches bad_alloc and replaces it with this
+ * logic_error rather than attempting its unsupported host-memory fallback.
+ * Recognize that specific translation, never arbitrary cuVS logic errors. */
+static bool cagra_compact_is_oom(const std::exception &e)
+{
+    return dynamic_cast<const std::bad_alloc *>(&e)
+        || (dynamic_cast<const raft::logic_error *>(&e)
+            && std::strstr(e.what(), "Filtered merge isn't available on cpu memory"));
+}
+
 extern "C" CuvsCagraIndex
 cuvs_cagra_compact(CuvsCagraIndex  index,
                    const uint32_t *keep_bits_words,
                    int64_t         n_total,
                    uint32_t        metric,
-                   int             device_id)
+                   int             device_id,
+                   int            *ivfpq_retry)
 {
+    if (ivfpq_retry) *ivfpq_retry = 0;
     if (!index || !keep_bits_words || n_total <= 0)
         return nullptr;
 
@@ -2044,7 +2057,57 @@ cuvs_cagra_compact(CuvsCagraIndex  index,
             params, "cuvs_cagra_compact");
 
         std::vector<cuvs::neighbors::cagra::index<float, uint32_t>*> indices = {&impl->idx};
-        auto new_idx = cuvs::neighbors::cagra::merge(res, params, indices, filter);
+        auto new_idx = [&] {
+            namespace gbp = cuvs::neighbors::cagra::graph_build_params;
+            try {
+                return cuvs::neighbors::cagra::merge(res, params, indices, filter);
+            } catch (const std::exception &e) {
+                if (!cagra_compact_is_oom(e)
+                    || std::holds_alternative<gbp::ivf_pq_params>(params.graph_build_params))
+                    throw;
+                /* merge has unwound both dataset copies and its workspace.
+                 * A CUDA/host-fence error is not recoverable by changing the
+                 * graph builder; let the outer catch poison this resource. */
+                res.sync_stream();
+                _pr.fence_check();
+                fprintf(stderr, "[cuvs_cagra_compact] retry=1 to=ivf_pq reason=oom begin: %s\n", e.what());
+                try {
+                    cagra_knn_precision(res, ds.data_handle(), ds.extent(0), ds.extent(1), ds.stride(0),
+                        raft::make_extents<int64_t>(n_keep, ds.extent(1)), metric, CUVS_CAGRA_BUILD_IVF_PQ,
+                        params, "cuvs_cagra_compact_retry");
+                    /* The CAGRA preset raises IVF-PQ's search batch to 128K.
+                     * On this OOM path use at most the ordinary IVF-PQ batch
+                     * default (4K), reducing scratch without changing dtype. */
+                    auto &pq = std::get<gbp::ivf_pq_params>(params.graph_build_params);
+                    pq.search_params.max_internal_batch_size =
+                        std::min(pq.search_params.max_internal_batch_size, 4096u);
+                    /* Bound training on the recovery path as well. Keep the
+                     * preset's recommended 32 samples per coarse list, with
+                     * a 64K sample target when that is larger. The SDK's
+                     * integer sampling can round the actual row count up. */
+                    const uint64_t train_rows = std::max<uint64_t>(65536,
+                        32ULL * pq.build_params.n_lists);
+                    if (n_keep > 0)
+                        pq.build_params.kmeans_trainset_fraction = std::min(
+                            pq.build_params.kmeans_trainset_fraction, (double)train_rows / n_keep);
+                    fprintf(stderr, "[cuvs_cagra_compact] retry=1 ivfpq_max_internal_batch_size=%u\n",
+                            pq.search_params.max_internal_batch_size);
+                    fprintf(stderr, "[cuvs_cagra_compact] retry=1 ivfpq_training_rows_target=%llu "
+                                    "kmeans_trainset_fraction=%.9g\n",
+                            (unsigned long long)train_rows, pq.build_params.kmeans_trainset_fraction);
+                    if (ivfpq_retry) *ivfpq_retry =
+                        std::get<gbp::ivf_pq_params>(params.graph_build_params).search_params.lut_dtype == CUDA_R_32F ? 2 : 1;
+                    auto retried = cuvs::neighbors::cagra::merge(res, params, indices, filter);
+                    res.sync_stream();
+                    _pr.fence_check();
+                    fprintf(stderr, "[cuvs_cagra_compact] retry=1 to=ivf_pq outcome=succeeded\n");
+                    return retried;
+                } catch (const std::exception &retry_error) {
+                    fprintf(stderr, "[cuvs_cagra_compact] retry=1 to=ivf_pq outcome=failed: %s\n", retry_error.what());
+                    throw;
+                }
+            }
+        }();
         res.sync_stream();
 
         /* Wrap in new impl with empty placeholder dataset (same as deserialize). */

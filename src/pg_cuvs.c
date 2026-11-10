@@ -5343,6 +5343,7 @@ cuvs_ambulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
                                         (uint32_t) MyDatabaseId,
                                         (uint32_t) index_oid,
                                         cuvs_resolve_index_dir_rel(indexRel));
+                cuvs_report_build_notice(index_oid);
             }
         }
         else
@@ -5383,10 +5384,13 @@ cuvs_amvacuumcleanup(IndexVacuumInfo *info, IndexBulkDeleteResult *stats)
     {
         cuvs_tombstone_path(index_oid, tpath, sizeof(tpath));
         if (stat(tpath, &st) == 0)
+        {
             (void) cuvs_ipc_compact(cuvs_socket_path,
                                     (uint32_t) MyDatabaseId,
                                     (uint32_t) index_oid,
                                     cuvs_resolve_index_dir_rel(indexRel));
+            cuvs_report_build_notice(index_oid);
+        }
     }
     return stats;
 }
@@ -6741,6 +6745,7 @@ pg_cuvs_compact(PG_FUNCTION_ARGS)
                           (uint32_t) MyDatabaseId,
                           (uint32_t) index_oid,
                           cuvs_resolve_index_dir_rel(indexRel));
+    cuvs_report_build_notice(index_oid);
 
     index_close(indexRel, AccessShareLock);
 

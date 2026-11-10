@@ -24,7 +24,10 @@ For on-prem or private RAG systems, this is useful even when search serving stay
 
 CAGRA build and compaction norm checks use the daemon's RMM allocator for GPU
 reduction scratch on the request stream. See [memory accounting](docs/reference.md#rmm-quota-and-memory-accounting)
-for the pool quota and allocations outside it.
+for the pool quota and allocations outside it. If compaction runs out of memory
+with NN-descent or an auto builder, it retries once with IVF-PQ, using fp32
+distances when required by the data bound; the daemon log and SQL NOTICE
+record the retry result.
 
 ## CI / testing
 

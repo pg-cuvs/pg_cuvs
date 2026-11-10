@@ -302,7 +302,11 @@ CuvsCagraIndex cuvs_cagra_compact(CuvsCagraIndex  index,
                                    const uint32_t *keep_bits_words,
                                    int64_t         n_total,
                                    uint32_t        metric,
-                                   int             device_id);
+                                   int             device_id,
+                                   int            *ivfpq_retry);
+/* Optional ivfpq_retry output: 0 = no retry selected, 1 = fp16 IVF-PQ retry,
+ * 2 = fp32 IVF-PQ retry; populated even if that merge attempt fails.
+ * One retry after memory exhaustion, unless already using explicit IVF-PQ. */
 
 /*
  * 3P: GPU IVF-PQ index — product quantization, 10-100× less VRAM than CAGRA.
