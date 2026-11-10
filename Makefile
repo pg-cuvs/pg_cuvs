@@ -277,7 +277,7 @@ install-server-test: server-test
 # Deliberately independent of PGXS/pg_config/CUDA so it runs on a laptop.
 # librt exists on Linux (CI/VM) but not macOS — link it only where present.
 TEST_RT_LIB := $(shell [ "$$(uname -s)" = "Linux" ] && echo -lrt)
-test-unit: test-device-norm test-failed-allocation test-build-oom-log test-peak-log-switch test/unit/test_cuvs_util.c src/cuvs_util.c src/cuvs_util.h src/cuvs_ipc.h \
+test-unit: test-compact-retry test-device-norm test-failed-allocation test-build-oom-log test-peak-log-switch test/unit/test_cuvs_util.c src/cuvs_util.c src/cuvs_util.h src/cuvs_ipc.h \
            test/unit/test_build_corpus.c src/cuvs_build_corpus.c src/cuvs_build_corpus.h \
            test-hnsw-build test-hnsw-build-ipc test-hnsw-ace-quality test-hnsw-admission test-admission-contract \
            test-i3-logs test-notice-wire test-admission-wire test-admission-message test-admission-ipc test-build-oom-thread test-cache-policy test-circuit-source test-status-text test-i3b-source test-peak-meter test-lw-policy test-lw-guard test-i3e-sql test-self-replace-notice test-host-free-fence test-vacuum-policy
@@ -502,6 +502,11 @@ test-device-norm:
 	CXX=$(CXX) python3 -I test/unit/test_device_norm.py
 
 .PHONY: test-device-norm
+
+test-compact-retry:
+	CXX=$(CXX) python3 -I test/unit/test_compact_retry.py
+
+.PHONY: test-compact-retry
 
 test-hnsw-precision-mutations: test/unit/test_hnsw_precision_mutations.py test-hnsw-policy
 	CC=$(CC) python3 -I test/unit/test_hnsw_precision_mutations.py

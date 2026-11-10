@@ -9789,16 +9789,27 @@ handle_compact(int client_fd, const CuvsCmdFrame *cmd)
                 new_tids[j++] = e->tids[i];
     }
 
+    int ivfpq_retry = 0;
     CuvsCagraIndex new_handle = cuvs_cagra_compact(
-        e->handle, keep_bits, n_vecs, e->metric, (int)e->gpu_device_id);
+        e->handle, keep_bits, n_vecs, e->metric, (int)e->gpu_device_id, &ivfpq_retry);
     free(keep_bits);
 
+    char compact_notice[256] = {0};
+    if (ivfpq_retry)
+        snprintf(compact_notice, sizeof(compact_notice),
+                 "index %u compaction %s after one IVF-PQ %s retry for memory exhaustion",
+                 cmd->index_oid, new_handle ? "succeeded" : "failed",
+                 ivfpq_retry == 2 ? "fp32" : "fp16");
     if (!new_handle)
     {
         pthread_mutex_unlock(&g_index_mutex);
         free(new_tids);
-        send_error_code(client_fd, CUVS_STATUS_BUILD_FAILED,
-                        "cuvs_cagra_compact failed");
+        CuvsReplyHeader failed = {0};
+        failed.status = CUVS_STATUS_BUILD_FAILED;
+        snprintf(failed.error, sizeof(failed.error), "cuvs_cagra_compact failed");
+        if (compact_notice[0])
+            cuvs_notice_append(failed.notice_out, sizeof(failed.notice_out), compact_notice, "The original index and tombstones are retained.");
+        send_all(client_fd, &failed, sizeof(failed));
         return;
     }
 
@@ -9839,6 +9850,8 @@ handle_compact(int client_fd, const CuvsCmdFrame *cmd)
 
     CuvsReplyHeader ok = {0};
     ok.status = CUVS_STATUS_OK;
+    if (compact_notice[0])
+        cuvs_notice_append(ok.notice_out, sizeof(ok.notice_out), compact_notice, "");
     send_all(client_fd, &ok, sizeof(ok));
 }
 

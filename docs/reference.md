@@ -243,6 +243,32 @@ co-deploy the extension and daemon (`make install && make install-server`).
 | `cuvs.gcs_key_file` | string | `` | — | SUSET | Service-account JSON path; empty = GCP instance metadata |
 | `cuvs.warmup_threads` | int | `2` | 1–8 | SUSET | Background warmup (GCS download) thread pool size |
 
+CAGRA compaction (`pg_cuvs_compact` and VACUUM) initially preserves the auto
+builder choice. A memory failure from NN-descent or an unresolved auto choice
+triggers one IVF-PQ merge retry after the first merge's allocations unwind.
+The retry caps the IVF-PQ internal search batch at 4096 rows (the ordinary
+IVF-PQ default, versus the CAGRA preset of 131072) to reduce scratch use.
+It also reduces the training fraction to target at most max(65536, 32 ×
+coarse-list count) rows without increasing the preset fraction. The SDK
+rounds its integer sampling, so the actual training count may be higher.
+This changes only the recovery graph builder and can affect recall and build
+time; it does not change the fp16/fp32 distance rule.
+It recomputes the row-norm bound: LUT, internal and coarse distances
+are fp32 if the fp16 bound is reached; otherwise fp16 defaults remain.
+An already pinned IVF-PQ failure, a non-memory exception, or a failed request
+stream/host-free fence is not retried. This also recognizes the pinned SDK's
+`Filtered merge isn't available on cpu memory` translation of `bad_alloc`.
+The retry may still fail if even the merge's dataset copies do not fit.
+
+The daemon logs `[cuvs_cagra_compact] retry=1 to=ivf_pq reason=oom begin`,
+`[cuvs_cagra_compact_retry] knn precision` (including dtype),
+`retry=1 ivfpq_max_internal_batch_size=4096`,
+`retry=1 ivfpq_training_rows_target=... kmeans_trainset_fraction=...`, and
+`retry=1 to=ivf_pq outcome=succeeded|failed`. Manual compaction and VACUUM
+also receive a NOTICE with the retry dtype and result once the retry params
+are selected. The handle swap increments `compact_count`; successful persistence removes
+the tombstone file. A failed merge keeps the original index and tombstones.
+
 ### Auto-compaction (Phase 4C bgworker)
 
 | GUC | Type | Default | Range | Set by | Purpose |
@@ -515,7 +541,7 @@ for limits, compatibility and estimate-vs-upper-bound caveats.
 | `pg_cuvs_build_status()` | SETOF record | (0.9.0) In-flight CAGRA builds and their reservations; rows filtered by privilege. See § 8.4 |
 | `pg_cuvs_hnsw_build_info(index regclass)` | jsonb | Read the stored construction route/settings and estimate-based admission. Version2 writer with historical version1 reader; absent legacy/source/empty receipts are not reconstructed from current GUCs. Requires SELECT on the source table; estimates are not memory upper-bound guarantees |
 | `pg_cuvs_build_hnsw(cagra regclass, mode text DEFAULT 'nsw')` | regclass | Build a pgvector HNSW from a CAGRA index without pgvector's CPU build. **Deprecated** in favor of `CREATE INDEX ... USING pg_cuvs_hnsw`; the older two-step `pg_cuvs_import_hnsw` form (empty `USING hnsw` target + import) is removed |
-| `pg_cuvs_compact(index regclass)` | void | Remove tombstoned vectors via `cuvsCagraMerge`, rebuild `.cagra`/`.tids`, drop `.tombstone`. The rebuild uses fp32 IVF-PQ kNN distances under the `build_algo` fp16 rule |
+| `pg_cuvs_compact(index regclass)` | void | Remove tombstoned vectors via `cuvsCagraMerge`, rebuild `.cagra`/`.tids`, drop `.tombstone`. The rebuild uses fp32 IVF-PQ kNN distances under the `build_algo` fp16 rule. If the initial NN-descent or auto merge runs out of memory, retry once with explicit IVF-PQ under that same rule. A pinned IVF-PQ failure is not retried |
 | `pg_cuvs_batch_search(rel regclass, queries vector[], k int)` | SETOF (query_idx int, ctid tid, distance real) | Q queries in one IPC/GPU dispatch; JOIN on `ctid` for visible rows; honors `search_mode`/`bf_precision` |
 | `cuvs_filtered_knn(index regclass, query vector, filter_tids bigint[], k int)` | TABLE (ctid tid, distance float4) | Exact GPU BF restricted to a sorted TID set (`block<<16\|off`); NULL = unfiltered |
 | `cuvs_filtered_knn(index regclass, query vector, filter_tids tid[], k int)` | TABLE (ctid tid, distance float4) | Type-safe `tid[]` overload (accepts `ctid` directly) |

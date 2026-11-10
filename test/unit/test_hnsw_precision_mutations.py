@@ -61,6 +61,9 @@ BACKEND = SRC / "pg_cuvs.c"
 EXPORT = SRC / "hnsw_export.c"
 
 WIRING = {
+    "compact_retry_success_notice": (SERVER, r'cuvs_notice_append\(ok.notice_out, sizeof\(ok.notice_out\), compact_notice, ""\);'),
+    "compact_retry_failure_notice": (SERVER, r'cuvs_notice_append\(failed.notice_out, sizeof\(failed.notice_out\), compact_notice,'),
+    "compact_retry_telemetry": (SERVER, r'cuvs_cagra_compact\([\s\S]{0,150}&ivfpq_retry\);'),
     "norm_uses_rmm_policy": (WRAPPER, r"return thrust::transform_reduce\(raft::resource::get_thrust_policy\(res\),"),
     "norm_policy_header": (WRAPPER, r"#include <raft/core/resource/thrust_policy.hpp>"),
     "precision_resident_only": (WRAPPER, r"if \(!tiny && !disk\)\s*\{\s*const double max_sq = cuvs_hnsw_max_sq_norm\("
@@ -91,7 +94,8 @@ WIRING = {
                                             r"raft::make_extents<int64_t>\(n_keep, ds\.extent\(1\)\), metric, CUVS_CAGRA_BUILD_AUTO,\s*"
                                             r"params, \"cuvs_cagra_compact\"\);\s*"
                                             r"std::vector<cuvs::neighbors::cagra::index<float, uint32_t>\*> indices = \{&impl->idx\};\s*"
-                                            r"auto new_idx = cuvs::neighbors::cagra::merge\(res, params, indices, filter\);"),
+                                            r"auto new_idx = \[&\] \{\s*namespace gbp = cuvs::neighbors::cagra::graph_build_params;\s*try \{\s*"
+                                            r"return cuvs::neighbors::cagra::merge\(res, params, indices, filter\);"),
     "cagra_compact_kept_count": (WRAPPER, r"if \(w == n_words - 1 && \(n_total & 31\)\) bits &= \(1u << \(n_total & 31\)\) - 1u;\s*"
                                           r"n_keep \+= __builtin_popcount\(bits\);"),
     "cagra_rule_used": (WRAPPER, r"const bool fp32 = may_use_ivf_pq && cuvs_hnsw_ivfpq_needs_fp32\(max_sq, metric\);"),
@@ -103,6 +107,11 @@ WIRING = {
 }
 
 WIRING_MUTANTS = {
+    "compact_notice_consumer_dropped": (BACKEND, "                cuvs_report_build_notice(index_oid);\n", ""),
+    "compact_retry_success_notice_dropped": (SERVER, 'cuvs_notice_append(ok.notice_out, sizeof(ok.notice_out), compact_notice, "");', ';'),
+    "compact_retry_failure_notice_dropped": (SERVER, 'cuvs_notice_append(failed.notice_out, sizeof(failed.notice_out), compact_notice, "The original index and tombstones are retained.");', ';'),
+    "compact_retry_telemetry_dropped": (SERVER, '(int)e->gpu_device_id, &ivfpq_retry);', '(int)e->gpu_device_id, NULL);'),
+
     "norm_uses_default_cuda_allocator": (WRAPPER, "thrust::transform_reduce(raft::resource::get_thrust_policy(res),",
                                          "thrust::transform_reduce(thrust::cuda::par.on(res.get_stream()),"),
     "norm_policy_header_removed": (WRAPPER, "#include <raft/core/resource/thrust_policy.hpp>\n", ""),
@@ -128,8 +137,8 @@ WIRING_MUTANTS = {
     "compact_helper_dropped": (WRAPPER, "        cagra_knn_precision(res, ds.data_handle(), ds.extent(0), ds.extent(1), ds.stride(0),\n"
                                         "            raft::make_extents<int64_t>(n_keep, ds.extent(1)), metric, CUVS_CAGRA_BUILD_AUTO,\n"
                                         "            params, \"cuvs_cagra_compact\");\n", ""),
-    "compact_merge_default_params": (WRAPPER, "cagra::merge(res, params, indices, filter);",
-                                     "cagra::merge(res, cuvs::neighbors::cagra::index_params{}, indices, filter);"),
+    "compact_merge_default_params": (WRAPPER, "                return cuvs::neighbors::cagra::merge(res, params, indices, filter);",
+                                     "                return cuvs::neighbors::cagra::merge(res, cuvs::neighbors::cagra::index_params{}, indices, filter);"),
     "compact_shape_all_rows": (WRAPPER, "raft::make_extents<int64_t>(n_keep, ds.extent(1)), metric, CUVS_CAGRA_BUILD_AUTO,",
                                "raft::make_extents<int64_t>(ds.extent(0), ds.extent(1)), metric, CUVS_CAGRA_BUILD_AUTO,"),
     "compact_helper_explicit_ivf_pq": (WRAPPER, "metric, CUVS_CAGRA_BUILD_AUTO,\n            params, \"cuvs_cagra_compact\");",
@@ -155,7 +164,10 @@ def run_tests(src_dir: pathlib.Path, work: pathlib.Path) -> int:
 
 
 def wiring_ok(texts: dict) -> dict:
-    return {name: re.search(pat, texts[path]) is not None for name, (path, pat) in WIRING.items()}
+    checks = {name: re.search(pat, texts[path]) is not None for name, (path, pat) in WIRING.items()}
+    checks["compact_all_three_notice_consumers"] = len(re.findall(
+        r"cuvs_ipc_compact\([^;]+;\s*cuvs_report_build_notice\(index_oid\);", texts[BACKEND])) == 3
+    return checks
 
 
 def main() -> int:
@@ -190,7 +202,17 @@ def main() -> int:
         broken = not all(wiring_ok(mutated).values())
         print(f"{'RED ' if broken else 'SURVIVED'} {name}")
         fails += 0 if broken else 1
-    total = len(HEADER_MUTANTS) + len(base) + len(WIRING_MUTANTS)
+    execution_mutants = ["no_retry", "retry_any_error", "retry_existing_ivfpq", "retry_uses_auto",
+                         "retry_no_sync", "retry_no_fence", "retry_not_observed", "masked_oom_not_recognized", "retry_batch_not_capped", "retry_training_unbounded"]
+    baseline = subprocess.run([sys.executable, "-I", str(ROOT / "test/unit/test_compact_retry.py")], capture_output=True)
+    if baseline.returncode:
+        print("BASELINE FAIL: compaction execution fixture", baseline.stderr.decode()); fails += 1
+    for name in execution_mutants:
+        result = subprocess.run([sys.executable, "-I", str(ROOT / "test/unit/test_compact_retry.py"), name], capture_output=True)
+        red = result.returncode == 1
+        print(f"{'RED ' if red else 'SURVIVED'} compact_exec_{name}")
+        fails += 0 if red else 1
+    total = len(HEADER_MUTANTS) + len(base) + len(WIRING_MUTANTS) + len(execution_mutants)
     print(f"hnsw precision mutations: {total - fails}/{total}")
     return 1 if fails else 0
 

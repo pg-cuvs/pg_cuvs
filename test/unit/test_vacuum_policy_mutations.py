@@ -42,7 +42,7 @@ def wiring(src: str) -> dict:
         "gate_before_compaction": gate is not None and compact > gate.start(),
         "vacuum_path_kept": bool(re.search(r"if \(!cuvs_index_is_stale\(index_oid\)\)\s*\{\s*"
                                            r"cuvs_tombstone_path\(index_oid, tpath, sizeof\(tpath\)\);\s*"
-                                           r"if \(stat\(tpath, &st\) == 0\)\s*\(void\) cuvs_ipc_compact\(", body)),
+                                           r"if \(stat\(tpath, &st\) == 0\)\s*\{\s*\(void\) cuvs_ipc_compact\(", body)),
         "header_included": '#include "cuvs_vacuum_policy.h"' in src,
     }
 
@@ -53,8 +53,8 @@ WIRING_MUTANTS = {
                      "        return stats;\n", ""),
     "analyze_only_not_passed": ("cuvs_vacuum_cleanup_considers_compact(info->analyze_only,",
                                 "cuvs_vacuum_cleanup_considers_compact(false,"),
-    "vacuum_compaction_dropped": ("        if (stat(tpath, &st) == 0)\n            (void) cuvs_ipc_compact(",
-                                  "        if (stat(tpath, &st) == 0 && false)\n            (void) cuvs_ipc_compact("),
+    "vacuum_compaction_dropped": ("        if (stat(tpath, &st) == 0)\n        {\n            (void) cuvs_ipc_compact(",
+                                  "        if (stat(tpath, &st) == 0 && false)\n        {\n            (void) cuvs_ipc_compact("),
 }
 
 
