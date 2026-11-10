@@ -8,8 +8,10 @@ import hashlib
 import json
 import pathlib
 import subprocess
+import sys
 import tempfile
 import resource
+from test_upper_level_copy import COPY_MISMATCH_EXIT
 
 ROOT=pathlib.Path(__file__).resolve().parents[3]
 DETAIL=pathlib.Path("cpp/src/neighbors/detail")
@@ -62,16 +64,33 @@ def main() -> int:
     results=[]
     with tempfile.TemporaryDirectory(prefix="upper-precision-") as temp:
         d=pathlib.Path(temp)
+        def copy_check(mutant=None):
+            output=d/("copy-"+(mutant or "baseline")+".json")
+            command=[sys.executable,str(pathlib.Path(__file__).with_name("test_upper_level_copy.py")),"--source",str(source),"--compiler",a.compiler,"--hnswlib-header",str(a.hnswlib_header),"--output",str(output)]
+            if mutant:command.extend(["--mutant",mutant])
+            run=subprocess.run(command,capture_output=True,text=True)
+            detail=json.loads(output.read_text()) if output.is_file() else {"phase":"no-result"}
+            log=run.stdout+run.stderr
+            expected=COPY_MISMATCH_EXIT if mutant else 0
+            if not (detail.get("phase")=="runtime" and detail.get("compile_exit")==0 and detail.get("runtime_exit")==expected and run.returncode==expected):
+                if a.output:a.output.write_text(json.dumps({"passed":False,"copy_check":detail,"exit":run.returncode,"diagnostic":log},indent=2)+"\n")
+                raise RuntimeError(f"copy {mutant or 'baseline'} failed: expected runtime exit {expected}; got {detail}; {log}")
+            print(log,end="")
+            return run.returncode,log,detail
+        # Validate the unmodified gather before any mutation can count as detected.
+        _,_,copy_baseline=copy_check()
+        print("GREEN copy baseline runtime exit 0")
         def execute(label,body,helper):
             (d/"policy.hpp").write_text(helper)
             text=template.replace("__POLICY_HEADER__","policy.hpp").replace("__SDK_ALL_NEIGHBORS_GRAPH__",body).replace("__PRODUCT_PRECISION_POLICY__",product)
             (d/"probe.cpp").write_text(text)
             command=[a.compiler,"-std=c++20","-O0","-I"+str(source/DETAIL/"cagra"),str(d/"probe.cpp"),"-o",str(d/"probe")]
             built=subprocess.run(command,capture_output=True,text=True)
-            if built.returncode:return built.returncode,built.stdout+built.stderr
+            if built.returncode:return "compile",built.returncode,built.stdout+built.stderr
             run=subprocess.run([str(d/"probe")],capture_output=True,text=True)
-            return run.returncode,run.stdout+run.stderr
-        rc,log=execute("original",dispatch,policy);print(log,end="")
+            return "runtime",run.returncode,run.stdout+run.stderr
+        phase,rc,log=execute("original",dispatch,policy);print(log,end="")
+        if phase!="runtime":raise RuntimeError("precision baseline compilation failed: "+log)
         if rc:return rc if rc>0 else 1
         if a.mutations:
             changes=[
@@ -92,15 +111,15 @@ def main() -> int:
                 changes.append(("drop-"+field,changed,policy))
             for name,body,helper in changes:
                 assert body!=dispatch or helper!=policy,name
-                rc,log=execute(name,body,helper)
+                phase,rc,log=execute(name,body,helper)
+                assert phase=="runtime",(name,"mutant did not compile",log)
                 assert rc!=0,(name,"mutant survived")
-                results.append({"mutation":name,"exit":rc,"detected":True,"diagnostic":log[-600:]})
+                results.append({"mutation":name,"phase":phase,"exit":rc,"detected":True,"diagnostic":log[-600:]})
                 print("RED",name,rc)
             for name in ["raw-source","byte-destination","short-copy"]:
-                run=subprocess.run(["python3",str(pathlib.Path(__file__).with_name("test_upper_level_copy.py")),"--source",str(source),"--compiler",a.compiler,"--hnswlib-header",str(a.hnswlib_header),"--mutant",name],capture_output=True,text=True)
-                assert run.returncode!=0,(name,"copy mutant survived")
-                results.append({"mutation":name,"exit":run.returncode,"detected":True,"diagnostic":(run.stdout+run.stderr)[-600:]});print("RED",name,run.returncode)
-    if a.output:a.output.write_text(json.dumps({"source":str(source),"policy_and_dispatch_passed":True,"mutations":results,"limitations":"GPU build/allocation APIs are spies; actual SDK policy, memory guard and complete dispatch body execute; GPU behavior validated separately"},indent=2)+"\n")
+                rc,log,detail=copy_check(name)
+                results.append({"mutation":name,"phase":detail["phase"],"compile_exit":detail["compile_exit"],"runtime_exit":detail["runtime_exit"],"exit":rc,"detected":True,"diagnostic":log[-600:]});print("RED",name,rc)
+    if a.output:a.output.write_text(json.dumps({"source":str(source),"policy_and_dispatch_passed":True,"copy_baseline":copy_baseline,"mutations":results,"limitations":"GPU build/allocation APIs are spies; actual SDK policy, memory guard and complete dispatch body execute; GPU behavior validated separately"},indent=2)+"\n")
     print("PASS upper precision; mutants",len(results));return 0
 
 if __name__=="__main__":raise SystemExit(main())
