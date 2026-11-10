@@ -334,6 +334,9 @@ loads do not run it.
 `pg_stat_gpu_search.vram_bytes` estimates retained dataset/graph memory; it does
 not include unused pool reservation or transient workspace. Pool-backed frees
 become reusable without returning their physical allocation to other CUDA users.
+The maximum row-norm reduction used for CAGRA build/compaction uses RAFT's
+RMM Thrust policy on the request stream, so its temporary device storage is
+included in the current device resource's pool usage and quota when enabled.
 cuVS may also allocate outside the current RMM resource (for example managed or
 CUDA async scratch); the pool quota does not bound those allocations, CUDA context
 memory, or total `nvidia-smi memory.used`. Record both pool status and physical GPU

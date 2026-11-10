@@ -22,6 +22,10 @@ The GPU acts as a **candidate generator** — returning the top-K TID candidates
 
 For on-prem or private RAG systems, this is useful even when search serving stays on CPU. These deployments often already run GPU servers for embedding models, rerankers, or batch embedding jobs. pg_cuvs can reuse that nearby GPU pool for slow index build/rebuild windows, while keeping the online serving path as ordinary PostgreSQL + pgvector HNSW.
 
+CAGRA build and compaction norm checks use the daemon's RMM allocator for GPU
+reduction scratch on the request stream. See [memory accounting](docs/reference.md#rmm-quota-and-memory-accounting)
+for the pool quota and allocations outside it.
+
 ## CI / testing
 
 Two tiers (`design/ci-strategy.md`, ADR-067):
