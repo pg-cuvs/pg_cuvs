@@ -297,9 +297,11 @@ number as a complete capacity estimate:
   reusable. The rejection carries reason `PHYS`, a retryable SQL error/NOTICE,
   and daemon counters. The SDK can allocate memory outside the pool.
 
-These checks are samples and estimates, **not reservations or a full peak-memory
-bound**. Other processes, concurrency, and later SDK allocations can still exhaust
-memory. See [memory accounting and admission](docs/reference.md#rmm-quota-and-memory-accounting)
+Admission reserves estimated pending quota for admitted concurrent builds; it
+does not reserve their entire future physical GPU footprint. The physical-free
+check is a point-in-time sample, and sizing terms are estimates, **not a full
+peak-memory bound**. Other processes, concurrency, and later SDK allocations can
+still exhaust memory. See [memory accounting and admission](docs/reference.md#rmm-quota-and-memory-accounting)
 for controls, reason codes, exclusions, and status fields.
 
 When the applicable admission policy permits it, LRU reclamation serializes an

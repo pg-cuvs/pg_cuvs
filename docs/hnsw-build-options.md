@@ -22,7 +22,7 @@ SELECT pg_cuvs_hnsw_build_info('items_ann'::regclass);
 - `nn_descent`: 예약된 미지원 값이다. 메모리 모델 부재와 `auto`(tiny/resident) 또는 명시 `ace` 대안을 설명하는 오류로 거부한다. ACE 내부의 NN-descent 사용과는 별개다.
 
 ```sql
--- Disk build is an explicit choice, not a fallback from AUTO.
+-- Explicitly choose ACE-disk even when AUTO would fit the resident budget.
 CREATE INDEX items_disk_ann ON items USING pg_cuvs_hnsw (embedding vector_l2_ops)
   WITH (mode = 'hnsw', build_algo = 'ace', ef_construction = 64);
 ```

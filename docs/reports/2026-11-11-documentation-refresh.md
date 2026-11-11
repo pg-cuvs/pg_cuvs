@@ -26,9 +26,10 @@
 | 설치와 SQL 예제 | `CREATE EXTENSION vector`, 양쪽 바이너리 설치, preload·재시작·daemon 경로, 실제 통계 컬럼, 실행 가능한 질의 | `pg_cuvs.control`, `Makefile`의 `install-server`, `sql/pg_cuvs--0.9.0.sql` |
 | 호환성과 SDK | 기본 CUDA 12.4 개발 bootstrap과 별도 12.9/13.1 패치 SDK 레시피를 구분 | `infra/brev/bootstrap.sh`, `infra/cuvs-patches/build-patched-cuvs.sh` |
 | HNSW | source-less heap build의 private op23 파일 경로, PG relation pages와 hnswlib sidecar 구분, global IPC v5와 op23 payload v5 구분 | `src/hnsw_export.c:cuvs_hnsw_ambuild`, `src/pg_cuvs.c:cuvs_build_hnsw_from_heap`, `src/cuvs_ipc.h` |
+| ACE | `auto`의 ACE-disk 전환과 명시 `ace` 선택 구분, 품질 auto의 A=240과 SDK partition/readback 제약 대조. 자동 전환을 부정하던 SQL 예제 주석 정정 | `src/cuvs_hnsw_policy.h:cuvs_hnsw_ace_ef`, `src/cuvs_wrapper.cu`의 route·SDK planner·marker 검사 |
 | 실패·쓰기·복구 | 실행 중 OOM/연결 실패/STALE은 ERROR이며 후속 CPU 재계획과 구별. CAGRA EXTEND 우선, flat delta, IVF-PQ INSERT no-op, marker 유실과 tombstone 잔여 설명 | `src/pg_cuvs.c:cuvs_gettuple`, `cuvs_aminsert`, `ivfpq_aminsert`, `cuvs_report_stale`, `test/stale_interim.py` |
 | GCS 설정 | backend GUC는 standalone daemon 설정으로 전달되지 않음. 실제 daemon flags 안내 | `src/pg_cuvs.c:_PG_init`, `src/pg_cuvs_server.c`의 argument parser와 snapshot job 구성 |
-| 메모리·용량 | host build budget과 GPU budget 분리, scratch 9593, RMM quota, AR8, physical-free 32 MiB preflight 및 비예약 한계 | `src/pg_cuvs_server.c`, `src/cuvs_admission_contract.h`, `src/cuvs_util.c:cuvs_auto_shard_count` |
+| 메모리·용량 | host build budget과 GPU budget 분리, scratch 9593, RMM quota, AR8, physical-free 32 MiB preflight 및 비예약 한계. 동시 빌드의 pending quota 예약과 물리 메모리 비예약을 구분 | `src/pg_cuvs_server.c:reserve_build_vram`, `src/cuvs_admission_contract.h`, `src/cuvs_util.c:cuvs_auto_shard_count` |
 | 검색 의미 | `cuvs.k`와 SQL LIMIT 구분, float16 exhaustive search가 원래 float32 순위를 보장하지 않음 | `src/pg_cuvs.c`, `src/cuvs_wrapper.cu` BF corpus/query conversion |
 | CI·운영 명령 | 현행 runner·trigger·WIF 없는 경로, regression subset, 배포·업그레이드 0.9.0, 폐기된 명령과 잘못된 쉘 치환 수정 | `.github/workflows/ci.yml`, `gpu.yml`, `Makefile`, `infra/scripts/setup/` |
 | 벤치마크 | 서로 다른 측정 셀의 잔차 비율을 시간적 IPC 증가로 해석하지 않음. projection과 실측 구별, 현재 runner/CSV/manifest 계약 반영 | `BENCHMARK.md`, `bench/protocol/run.sh`, `runner*.py`, `bench/legacy/anbench/observe.py`, versioned CSV |
