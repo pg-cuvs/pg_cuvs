@@ -956,7 +956,10 @@ Marking an index stale immediately invalidates cached plans for its parent
 table, including when the writing transaction later rolls back. When marker IPC
 succeeds, the marker also remains after rollback and new plans can choose CPU.
 If marker IPC fails, notification still occurs but the marker may be absent;
-a new plan can choose GPU and fail with UNAVAILABLE while the daemon is down. Invalidation does not replace an executor already running:
+the socket-file gate determines the next plan. If the socket file is absent,
+new plans choose CPU. If a crash leaves the socket file behind, a new plan can
+choose GPU and fail with UNAVAILABLE. Invalidation does not replace an executor
+already running:
 such a scan can fail with `55000`. Roll back the failed transaction (or recover
 to an application-managed savepoint), then retry with a fresh plan. There is no
 automatic replay of the SQL statement. REINDEX normally restores GPU eligibility.
