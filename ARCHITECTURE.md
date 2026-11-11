@@ -335,7 +335,10 @@ PostgreSQL writes don't touch the VRAM index directly. Instead:
   This interim fix does not add marker durability or change the shared delta/tombstone cap.
   A delete-drift backstop (`cuvs.max_stale_fraction`) reroutes to CPU when too many rows were deleted since build.
 
-REINDEX rebuilds the index and clears `.stale` / `.delta` / `.tombstone`.
+REINDEX normally rebuilds the index and clears `.stale` / `.delta` / `.tombstone`.
+IVF-PQ is an exception: `ivfpq_ambuild` does not remove an old tombstone sidecar,
+so ordinary REINDEX can leave the reader blocked. #202 observed recovery with
+REINDEX CONCURRENTLY; verify the resulting plan and sidecar state.
 
 ---
 
