@@ -942,3 +942,23 @@ tick (whatever the reclaim mode). Without the file, or if it is unreadable or
 corrupt, the order is `(database OID, index OID)`; the startup log names the reason.
 Indexes that do not fit stay not resident until their first query. Pins are not
 restored.
+
+### STALE response and retry contract (#202 interim fix)
+
+A STALE daemon response raises SQLSTATE `55000`
+(`object_not_in_prerequisite_state`) in CAGRA, flat, IVF-PQ, batch search,
+and filtered index searches. The error identifies the index and recommends
+`REINDEX INDEX`. A genuine empty filter result remains an empty result.
+
+Marking an index stale immediately invalidates cached plans for its parent
+table, including when the writing transaction later rolls back. New plans can
+choose the CPU path. Invalidation does not replace an executor already running:
+such a scan can fail with `55000`. Roll back the failed transaction (or recover
+to an application-managed savepoint), then retry with a fresh plan. There is no
+automatic replay of the SQL statement. REINDEX restores GPU eligibility.
+
+This is an interim correction. Marker IPC remains best-effort; if the daemon is
+down when the marker is sent, its absence can still cause missing rows after
+restart. Durable stale publication, the shared insertion/deletion cap, and insertion durability
+recovery are separate unfinished work. Do not treat this change as fixing those
+paths.
