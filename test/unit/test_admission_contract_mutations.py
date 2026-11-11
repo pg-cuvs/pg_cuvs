@@ -154,7 +154,20 @@ SOURCES = ['cuvs_util.c', 'cuvs_ipc.c', 'cuvs_ipc.h', 'cuvs_build_corpus.c']
 def main(output):
     out = Path(output).resolve()
     out.mkdir(parents=True, exist_ok=False)
-    originals = {n: (ROOT / 'src' / n).read_text() for n in [HEADER] + SOURCES}
+    # Keep quoted includes in the same fixture namespace as the mutated header.
+    # Mixing a copied cuvs_ipc.h with the original build-common header can
+    # include the IPC declarations twice through different paths.
+    names = set([HEADER] + SOURCES)
+    pending = list(names)
+    import re
+    while pending:
+        name = pending.pop()
+        body = (ROOT / 'src' / name).read_text()
+        for header in re.findall(r'^#include "([^"]+)"', body, re.MULTILINE):
+            if header not in names:
+                names.add(header)
+                pending.append(header)
+    originals = {n: (ROOT / 'src' / n).read_text() for n in sorted(names)}
     results, ok = [], True
     util = ['cuvs_util.c']
     cases = [(n, o, w, 'cuvs_util.c' if n in UTIL_MUTATIONS else HEADER, TEST, [], util)
@@ -181,7 +194,12 @@ def main(output):
         if rc == 0:
             stage = 'run'
             rc, log = run([binary])
-        red = rc != 0
+        # Only the wire-version mutant is a compile-time guard. An unrelated
+        # compiler failure never demonstrates that a runtime mutant was caught.
+        red = rc != 0 and (stage == 'run' or
+              (name == 'wire_version_not_bumped' and
+               'static assertion' in log.lower() and
+               'I3 wire version' in log))
         ok &= red
         (case / 'log.txt').write_text(log)
         first = next((l for l in log.splitlines() if 'FAIL' in l or 'ERROR' in l or 'error' in l), '')
@@ -193,4 +211,8 @@ def main(output):
 
 
 if __name__ == '__main__':
+    if '--ipc-only' in sys.argv[2:]:
+        MUTATIONS.clear()
+        MESSAGE_MUTATIONS.clear()
+        WIRE_MUTATIONS.clear()
     sys.exit(main(sys.argv[1]))
