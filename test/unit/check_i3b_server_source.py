@@ -78,7 +78,7 @@ def split_args(a):
     return parts
 
 
-arity = {"ensure_vram": 3, "evict_lru": 2, "make_slot": 2, "load_index": 3}
+arity = {"ensure_vram": 4, "evict_lru": 2, "make_slot": 2, "load_index": 3}
 load_rq = {}
 for fn, n in arity.items():
     for line, args, before in calls(fn):
@@ -90,7 +90,7 @@ for fn, n in arity.items():
         if len(a) != n:
             fail(f"CK-36 (a): {fn}() at line {line} has {len(a)} args (requester missing?)")
             continue
-        rq = a[-1]
+        rq = a[2] if fn == "ensure_vram" else a[-1]
         if not (rq.startswith("CUVS_RQ_") or rq == "rq"):
             fail(f"CK-36 (a): {fn}() at line {line} passes '{rq}', not a requester")
         if fn == "load_index":
@@ -117,8 +117,6 @@ if "CUVS_RQ_LOAD_STARTUP" in funcs.get("handle_search", "") or \
 # and has at least one such call (a removed call is also a defect).
 EXPECT = {
     "admit_build_cagra":   ("CUVS_RQ_BUILD_CAGRA", ("ensure_vram",)),
-    "handle_build":        ("CUVS_RQ_BUILD_CAGRA", ("evict_lru",)),          # OOM retry
-    "handle_build_multi":  ("CUVS_RQ_BUILD_CAGRA", ("evict_lru",)),          # OOM retry
     "finish_build_commit": ("CUVS_RQ_BUILD_CAGRA", ("make_slot",)),          # slot
     "build_sharded":       ("CUVS_RQ_BUILD_SHARD", ("ensure_vram", "make_slot")),
     "handle_build_flat":   ("CUVS_RQ_BUILD_FLAT",  ("make_slot",)),
@@ -136,7 +134,8 @@ for fname, (want_rq, fns) in EXPECT.items():
             while depth and i < len(body):
                 depth += {"(": 1, ")": -1}.get(body[i], 0)
                 i += 1
-            rq = split_args(body[m.end():i - 1])[-1]
+            args = split_args(body[m.end():i - 1])
+            rq = args[2] if fn == "ensure_vram" else args[-1]
             found += 1
             if rq != want_rq:
                 fail(f"CK-36 (b): {fname} calls {fn}() with {rq}, expected {want_rq}")
@@ -145,6 +144,12 @@ for fname, (want_rq, fns) in EXPECT.items():
 if "admit_build_cagra(" not in funcs.get("handle_build", "") or \
    "admit_build_cagra(" not in funcs.get("handle_build_multi", ""):
     fail("CK-36 (b): CAGRA builds do not admit through admit_build_cagra")
+
+# I3-A: a post-admission build OOM must never evict-and-retry. Both
+# requesters still flow through admit_build_cagra above.
+for name in ("handle_build", "handle_build_multi"):
+    if re.search(r"\bevict_lru\(", funcs.get(name, "")):
+        fail(f"CK-36 (b): {name} reintroduced post-admission eviction")
 
 # ---- CK-37 (a): I-FC assignments ----
 assign = re.compile(r"\b(e|existing)->(handle|tids|n_vecs|n_extended)\s*(\+?=)(?!=)")
