@@ -159,29 +159,6 @@ jobs:
           make installcheck-tier1 || { echo "===== regression.diffs ====="; cat test/regression.diffs; false; }
           make installcheck-isolation || { echo "===== isolation diffs ====="; cat test/output_iso/regression.diffs 2>/dev/null; cat test/regression.diffs 2>/dev/null; false; }
 
-      - name: Stale scan integration (fresh shim daemon)
-        if: ${{ always() && steps.shim-setup.outcome == 'success' }}
-        run: |
-          export PATH=/usr/lib/postgresql/16/bin:$PATH
-          stale_test_dir=$(mktemp -d /tmp/pgcuvs-stale-XXXXXX)
-          mkdir "$stale_test_dir/indexes"
-          chmod 0777 "$stale_test_dir" "$stale_test_dir/indexes"
-          ASAN_OPTIONS="detect_leaks=0:abort_on_error=1:print_stacktrace=1" \
-          /usr/lib/postgresql/16/bin/pg_cuvs_server \
-            --socket "$stale_test_dir/socket" --index-dir "$stale_test_dir/indexes" \
-            --max-vram-mb 38000 >"$stale_test_dir/daemon.log" 2>&1 &
-          stale_test_pid=$!
-          trap 'kill "$stale_test_pid" 2>/dev/null || true; wait "$stale_test_pid" 2>/dev/null || true' EXIT
-          for attempt in $(seq 1 50); do
-            [ -S "$stale_test_dir/socket" ] && break
-            kill -0 "$stale_test_pid" || { cat "$stale_test_dir/daemon.log"; exit 1; }
-            sleep 0.1
-          done
-          test -S "$stale_test_dir/socket"
-          chmod 0666 "$stale_test_dir/socket"
-          export PGOPTIONS="${PGOPTIONS:+$PGOPTIONS }-c cuvs.socket_path=$stale_test_dir/socket -c cuvs.index_dir=$stale_test_dir/indexes"
-          make test-stale-interim || { cat "$stale_test_dir/daemon.log"; exit 1; }
-
       # #124: build_oom/build_multi_oom/build_oom_evict_to_fit/extend_cuda_oom
       # (REGRESS_FAULT, excluded from REGRESS_TIER1 above) call
       # pg_cuvs_inject_{build,extend}_oom(), which reach the daemon's
@@ -237,6 +214,29 @@ jobs:
             /tmp/shim_daemon.log
             /tmp/pg_cuvs_fault_daemon.log
           retention-days: 7
+
+      - name: Stale scan integration (fresh shim daemon)
+        if: ${{ !cancelled() && steps.shim-setup.outcome == 'success' }}
+        run: |
+          export PATH=/usr/lib/postgresql/16/bin:$PATH
+          stale_test_dir=$(mktemp -d /tmp/pgcuvs-stale-XXXXXX)
+          mkdir "$stale_test_dir/indexes"
+          chmod 0777 "$stale_test_dir" "$stale_test_dir/indexes"
+          ASAN_OPTIONS="detect_leaks=0:abort_on_error=1:print_stacktrace=1" \
+          /usr/lib/postgresql/16/bin/pg_cuvs_server \
+            --socket "$stale_test_dir/socket" --index-dir "$stale_test_dir/indexes" \
+            --max-vram-mb 38000 >"$stale_test_dir/daemon.log" 2>&1 &
+          stale_test_pid=$!
+          trap 'kill "$stale_test_pid" 2>/dev/null || true; wait "$stale_test_pid" 2>/dev/null || true' EXIT
+          for attempt in $(seq 1 50); do
+            [ -S "$stale_test_dir/socket" ] && break
+            kill -0 "$stale_test_pid" || { cat "$stale_test_dir/daemon.log"; exit 1; }
+            sleep 0.1
+          done
+          test -S "$stale_test_dir/socket"
+          chmod 0666 "$stale_test_dir/socket"
+          export PGOPTIONS="${PGOPTIONS:+$PGOPTIONS }-c cuvs.socket_path=$stale_test_dir/socket -c cuvs.index_dir=$stale_test_dir/indexes"
+          make test-stale-interim || { cat "$stale_test_dir/daemon.log"; exit 1; }
 
 # ── Tier 2 (real A100 regression) lives in .github/workflows/gpu.yml ───────
 # Run on demand from the Actions UI ("Run workflow"); a hosted runner starts the
