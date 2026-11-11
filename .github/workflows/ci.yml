@@ -216,6 +216,8 @@ jobs:
           retention-days: 7
 
       - name: Stale scan integration (fresh shim daemon)
+        env:
+          PGDATABASE: postgres
         shell: bash
         if: ${{ !cancelled() && steps.shim-setup.outcome == 'success' }}
         run: |

@@ -10,7 +10,8 @@ import subprocess
 import tempfile
 import time
 
-PSQL = ['psql', '-X', '-qAt', '-v', 'ON_ERROR_STOP=1', '-v', 'VERBOSITY=verbose']
+# Use the configured test database; libpq otherwise defaults to the OS username.
+PSQL = ['psql', '-d', os.environ.get('PGDATABASE') or 'postgres', '-X', '-qAt', '-v', 'ON_ERROR_STOP=1', '-v', 'VERBOSITY=verbose']
 Q = "'[10,0,0,0,0,0,0,0]'::vector"
 
 def sql(s, must=True):
