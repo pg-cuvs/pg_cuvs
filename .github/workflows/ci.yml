@@ -26,7 +26,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # gcc + make are preinstalled on ubuntu-22.04 runners; no apt step needed.
+      # gcc + make are preinstalled; daemon-guard unit tests need curl/SSL headers.
+      - name: Install CPU test dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y libcurl4-openssl-dev libssl-dev
+
       - name: Documentation contract checks
         run: make docs-contract-check
 
