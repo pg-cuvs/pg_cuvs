@@ -86,17 +86,31 @@ MUTATIONS = [
      "        LOG_ERROR(\"[handle_build] cuvs_cagra_build returned NULL\\n\");\n        note_self_replace_failure(cmd->index_oid, self_unloaded);",
      "        LOG_ERROR(\"[handle_build] cuvs_cagra_build returned NULL\\n\");"),
     ("S6 IVF-PQ build admits as LOAD", "review BLOCK 4", SRV,
-     "    int admit_rc = ensure_vram(needed, target_gpu, CUVS_RQ_BUILD_IVFPQ);",
-     "    int admit_rc = ensure_vram(needed, target_gpu, CUVS_RQ_LOAD);"),
+     # integration: ensure_vram takes (needed, dev, rq, rej, line) on the I3 stack
+     "    int admit_rc = ensure_vram(needed, target_gpu, CUVS_RQ_BUILD_IVFPQ, &rej);",
+     "    int admit_rc = ensure_vram(needed, target_gpu, CUVS_RQ_LOAD, &rej);"),
     ("S7 shard build admits as LOAD", "review BLOCK 4", SRV,
-     "        if (ensure_vram(needed, dev, CUVS_RQ_BUILD_SHARD) != 0)",
-     "        if (ensure_vram(needed, dev, CUVS_RQ_LOAD) != 0)"),
+     "        if (ensure_vram(needed, dev, CUVS_RQ_BUILD_SHARD, NULL) != 0)",
+     "        if (ensure_vram(needed, dev, CUVS_RQ_LOAD, NULL) != 0)"),
     ("S8 CAGRA registry slot as LOAD", "review BLOCK 4", SRV,
      "            (void) make_slot(target_gpu, CUVS_RQ_BUILD_CAGRA);",
      "            (void) make_slot(target_gpu, CUVS_RQ_LOAD);"),
-    ("S10 post-admission OOM retry as LOAD", "review BLOCK 4", SRV,
-     "            freed = evict_lru(target_gpu, CUVS_RQ_BUILD_CAGRA);\n            pthread_mutex_unlock(&g_index_mutex);",
-     "            freed = evict_lru(target_gpu, CUVS_RQ_LOAD);\n            pthread_mutex_unlock(&g_index_mutex);"),
+    ("S10 post-admission OOM evicts again (LOAD requester)", "review BLOCK 4 / ADR-086", SRV,
+     '        log_build_oom("BUILD", target_gpu, cmd->db_oid, cmd->index_oid, needed);\n'
+     '        cuvs_set_inject_build_oom(0);   /* #82: see the failure branch below */',
+     '        (void) evict_lru(target_gpu, CUVS_RQ_LOAD);\n'
+     '        log_build_oom("BUILD", target_gpu, cmd->db_oid, cmd->index_oid, needed);\n'
+     '        cuvs_set_inject_build_oom(0);   /* #82: see the failure branch below */'),
+    ("S10b post-admission OOM without [build_oom]", "ADR-086 [build_oom]", SRV,
+     '        log_build_oom("BUILD", target_gpu, cmd->db_oid, cmd->index_oid, needed);\n'
+     '        cuvs_set_inject_build_oom(0);   /* #82: see the failure branch below */',
+     '        cuvs_set_inject_build_oom(0);   /* #82: see the failure branch below */'),
+    ("S10c post-admission OOM reported as BUILD_FAILED", "ADR-086 status 2", SRV,
+     '        send_admission_reject(client_fd, CUVS_STATUS_OOM_FALLBACK,\n'
+     '                              "GPU memory exhausted during build; no index evicted",\n'
+     '                              &oom_rej);',
+     '        (void) oom_rej;\n'
+     '        send_error_code(client_fd, CUVS_STATUS_BUILD_FAILED, "cuvs_cagra_build failed");'),
     ("startup evicts (LOAD instead of LOAD_STARTUP)", "C1 RQ LOAD_STARTUP", SRV,
      "        if (load_index(k->db_oid, k->index_oid, CUVS_RQ_LOAD_STARTUP) == 0)",
      "        if (load_index(k->db_oid, k->index_oid, CUVS_RQ_LOAD) == 0)"),

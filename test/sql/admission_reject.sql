@@ -57,9 +57,9 @@ SELECT r->>'reason' AS reason, r->>'sqlstate' AS sqlstate, r->>'requester' AS re
 FROM pg_cuvs_last_rejection() r;
 RESET cuvs.shard_count;
 
--- Search-path reload rejection (C5 reload row): ar_a is evicted by an
--- admission under a tight budget (I2 LRU eviction, kept in the I3-A tip),
--- then queried under a budget below its final size, so the reload is refused.
+-- Search-path reload rejection (C5 reload row): unload ar_a explicitly,
+-- then query under a budget below its final size. Build scope none must
+-- not be bypassed merely to arrange this reload fixture.
 SELECT pg_cuvs_set_vram_budget(0);
 CREATE TABLE ar_a (id int, embedding vector(8));
 INSERT INTO ar_a
@@ -68,9 +68,8 @@ CREATE INDEX ar_a_idx ON ar_a USING cagra (embedding vector_l2_ops);
 CREATE TABLE ar_b (id int, embedding vector(8));
 INSERT INTO ar_b
 SELECT g, format('[0,%s,0,0,0,0,0,1]', g)::vector FROM generate_series(1, 1000) g;
--- 2,700,000 B: B's N (2,513,088) fits only after A (288,000) is evicted.
-SELECT pg_cuvs_set_vram_budget(2700000);
 CREATE INDEX ar_b_idx ON ar_b USING cagra (embedding vector_l2_ops);
+SELECT pg_cuvs_unload('ar_a_idx');
 SELECT pg_cuvs_set_vram_budget(100000);
 SET enable_seqscan = off;
 \set ON_ERROR_STOP off

@@ -35,10 +35,15 @@ su pg -c "pg_ctl -D /tmp/pgdata -l /tmp/pg.log -w start >/dev/null"
 
 S=/tmp/.s.pg_cuvs
 DBIN=pg_cuvs_server
+# Integration fixture (test only, not a policy default): this scenario's byte
+# arithmetic assumes N = final (two 10 MiB indexes in --max-vram-mb 25). On
+# the I3 stack's Q1-derived scratch rho also reserves build scratch, so pin
+# rho = 0 for every daemon this final-footprint-only scenario starts.
+FIXTURE="--rmm-scratch-permille 0"
 startd() { # extra daemon flags...
     pkill -f pg_cuvs_server 2>/dev/null; sleep 1; pkill -9 -f pg_cuvs_server 2>/dev/null
     rm -f $S
-    su pg -c "$DBIN --socket $S --index-dir $IDX --max-vram-mb 25 $* >>/tmp/d.log 2>&1 &"
+    su pg -c "$DBIN --socket $S --index-dir $IDX --max-vram-mb 25 $FIXTURE $* >>/tmp/d.log 2>&1 &"
     for i in $(seq 1 30); do [ -S $S ] && break; sleep 1; done
 }
 cli() { su pg -c "i3b_ipc_cli $S $*"; }
@@ -209,7 +214,7 @@ startd --reclaim-mode off
 for i in $(i3b_ipc_cli $S index | awk -F'\t' '$3=="resident"{print $2}'); do cli unload $DB $i >/dev/null; done
 cli load $DB $I3 >/dev/null
 pkill -f pg_cuvs_server; sleep 1; pkill -9 -f pg_cuvs_server 2>/dev/null; rm -f $S
-su pg -c "CUVS_SHIM_BUILD_DELAY_MS=6000 pg_cuvs_server --socket $S --index-dir $IDX --max-vram-mb 25 --reclaim-mode off >>/tmp/d.log 2>&1 &"
+su pg -c "CUVS_SHIM_BUILD_DELAY_MS=6000 pg_cuvs_server --socket $S --index-dir $IDX --max-vram-mb 25 $FIXTURE --reclaim-mode off >>/tmp/d.log 2>&1 &"
 for i in $(seq 1 30); do [ -S $S ] && break; sleep 1; done
 for i in $(i3b_ipc_cli $S index | awk -F'\t' '$3=="resident"{print $2}'); do [ "$i" = "$I3" ] || cli unload $DB $i >/dev/null; done
 cli load $DB $I3 >/dev/null
@@ -247,8 +252,14 @@ startd --reclaim-mode off --max-vram-mb 100
 for i in $(i3b_ipc_cli $S index | awk -F'\t' '$3=="resident"{print $2}'); do cli unload $DB $i >/dev/null; done
 cli load $DB $I1 >/dev/null; cli load $DB $I3 >/dev/null
 MARK=$(wc -l < /tmp/d.log)
-psqlq "SET client_min_messages=warning; SELECT pg_cuvs_inject_build_oom(1); CREATE INDEX i6o ON t6 USING cagra (v vector_l2_ops);" > /tmp/i6o.log 2>&1
-check "post-admission build OOM evicts nothing (retry loop is BUILD_CAGRA)" sh -c "grep -q ERROR /tmp/i6o.log && ! tail -n +$MARK /tmp/d.log | grep -q '\[evict\]'"
+su pg -c "psql -h /tmp -X -q -At -v VERBOSITY=verbose -d postgres -c \"SET client_min_messages=warning; SELECT pg_cuvs_inject_build_oom(1); CREATE INDEX i6o ON t6 USING cagra (v vector_l2_ops);\"" > /tmp/i6o.log 2>&1
+echo "  post-admission OOM reply: $(grep ERROR /tmp/i6o.log | head -1)"
+# Integration: ADR-086 (I3-A) removed the evict-to-fit retry. The contract is
+# "OOM after admission fails without evicting": OOM_FALLBACK (status 2, reason
+# OOM -> SQLSTATE 53200) and one [build_oom] action=fail_no_evict line.
+check "post-admission build OOM evicts nothing" sh -c "grep -q ERROR /tmp/i6o.log && ! tail -n +$MARK /tmp/d.log | grep -q '\[evict\]'"
+check "post-admission build OOM: [build_oom] action=fail_no_evict" sh -c "tail -n +$MARK /tmp/d.log | grep -q '\[build_oom\] op=BUILD .*action=fail_no_evict'"
+check "post-admission build OOM: status 2 reported as SQLSTATE 53200" grep -q 'ERROR:  53200' /tmp/i6o.log
 psqlq "SELECT pg_cuvs_inject_build_oom(0);" >/dev/null
 # registry slot cap (BUILD_CAGRA): fits in VRAM, no slot -> saved, not resident
 startd --reclaim-mode off --max-vram-mb 100 --max-indexes 2

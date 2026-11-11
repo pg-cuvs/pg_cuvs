@@ -339,9 +339,9 @@ test-admission-wire: test/unit/test_admission_wire.c src/cuvs_admission_contract
 
 # GPU-only (real CUDA build, not the shim): I3-A wrapper checks (dim%4 padded
 # single dataset copy, attach, self-queries). Run after `make all server`.
-test-gpu-wrapper-i3: test/gpu/test_wrapper_i3.c src/cuvs_wrapper.o src/cuvs_util_server.o
+test-gpu-wrapper-i3: test/gpu/test_wrapper_i3.c src/cuvs_wrapper.o src/cuvs_util_server.o src/cuvs_peak_meter_server.o
 	$(CC) -std=gnu11 -Wall -Wextra -I src -c test/gpu/test_wrapper_i3.c -o $@.o
-	$(CXX) -o $@ $@.o src/cuvs_wrapper.o src/cuvs_util_server.o $(SHLIB_LINK) -lpthread -lm
+	$(CXX) -o $@ $@.o src/cuvs_wrapper.o src/cuvs_util_server.o src/cuvs_peak_meter_server.o $(SHLIB_LINK) -lpthread -lm
 	./$@
 
 # The build-OOM flag is per thread (CPU shim mirrors the GPU wrapper).
@@ -863,5 +863,6 @@ test-rmm-pending:
 	$(CC) -std=gnu11 -O1 -DPGCUVS_CPU_SHIM -ffunction-sections -fdata-sections -I src \
 		test/unit/test_rmm_pending.c src/cuvs_ipc.c src/cuvs_util.c \
 		src/cuvs_objstore.c src/cuvs_build_corpus.c src/cuvs_wrapper_shim_cpu.c \
+		src/cuvs_cache_policy.c src/cuvs_peak_meter.c \
 		-Wl,--gc-sections -lm -lpthread -lrt -lcurl -lssl -lcrypto -o test-rmm-pending
 	./test-rmm-pending
