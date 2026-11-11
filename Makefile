@@ -1087,3 +1087,8 @@ AR8_MUTATION_OUT ?= ar8-mutations
 .PHONY: test-ar8-mutations
 test-ar8-mutations: test/unit/test_ar8_mutations.py
 	CC=$(CC) python3 -I test/unit/test_ar8_mutations.py $(AR8_MUTATION_OUT)
+
+# Installed-extension integration check; requires a live CPU-shim or GPU daemon.
+.PHONY: test-stale-interim
+test-stale-interim:
+	python3 test/stale_interim.py

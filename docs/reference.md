@@ -946,16 +946,23 @@ restored.
 ### STALE response and retry contract (#202 interim fix)
 
 A STALE daemon response raises SQLSTATE `55000`
-(`object_not_in_prerequisite_state`) in CAGRA, flat, IVF-PQ, batch search,
-and filtered index searches. The error identifies the index and recommends
+(`object_not_in_prerequisite_state`) in CAGRA, flat, batch search,
+and filtered index searches. IVF-PQ raises the same error from the backend's
+pre-search marker check (`ivfpq_gettuple`); its daemon handler currently has no
+stale gate. The error identifies the index and recommends
 `REINDEX INDEX`. A genuine empty filter result remains an empty result.
 
 Marking an index stale immediately invalidates cached plans for its parent
-table, including when the writing transaction later rolls back. New plans can
-choose the CPU path. Invalidation does not replace an executor already running:
+table, including when the writing transaction later rolls back. When marker IPC
+succeeds, the marker also remains after rollback and new plans can choose CPU.
+If marker IPC fails, notification still occurs but the marker may be absent;
+a new plan can choose GPU and fail with UNAVAILABLE while the daemon is down. Invalidation does not replace an executor already running:
 such a scan can fail with `55000`. Roll back the failed transaction (or recover
 to an application-managed savepoint), then retry with a fresh plan. There is no
-automatic replay of the SQL statement. REINDEX restores GPU eligibility.
+automatic replay of the SQL statement. REINDEX normally restores GPU eligibility.
+For IVF-PQ, ordinary REINDEX can leave an old tombstone sidecar that still blocks
+the reader; #202 observed recovery with REINDEX CONCURRENTLY. Check the resulting
+plan and sidecar state rather than assuming ordinary REINDEX restored GPU use.
 
 This is an interim correction. Marker IPC remains best-effort; if the daemon is
 down when the marker is sent, its absence can still cause missing rows after

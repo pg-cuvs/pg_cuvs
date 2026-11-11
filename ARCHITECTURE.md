@@ -189,9 +189,11 @@ executor (cuvs_amgettuple)            daemon (handle_search)
   return ≤ k visible rows
 ```
 
-On a daemon-side status of `NOT_FOUND`/`OOM_FALLBACK`/`STALE`/`ERROR`/`CANCELED`, the backend
-falls back to the CPU path (seqscan or pgvector). Fallback is a *plan-time/backend* decision, so
-it is visible in `pg_stat_gpu_fallback`, never in the daemon-sourced `pg_stat_gpu_search`.
+New plans use cost gates to choose a CPU path when an index is stale or unavailable.
+An already started scan receiving `STALE` raises SQLSTATE `55000`; it does not
+switch executor nodes or return an empty success. Other daemon errors and query
+cancellation follow their error/interrupt paths. Plan-time fallback is visible
+in `pg_stat_gpu_fallback`; daemon replies are recorded in `pg_stat_gpu_search`.
 
 ---
 
@@ -324,7 +326,8 @@ PostgreSQL writes don't touch the VRAM index directly. Instead:
 - **Fallback marker** — if the delta/tombstone append fails, the path marks the index `.stale`,
   and the planner cost hook routes new plans to CPU until a REINDEX clears it.
   The backend immediately invalidates cached plans depending on the parent table;
-  this notification survives transaction rollback because the marker does too.
+  this notification survives transaction rollback. The marker also survives rollback
+  when the marker IPC succeeds; an unavailable daemon can lose the marker.
   An already executing scan that receives STALE raises SQLSTATE `55000` with the
   index name and REINDEX guidance; it never treats that reply as an empty result.
   The application must roll back the failed transaction before retrying the query.

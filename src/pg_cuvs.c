@@ -35,6 +35,7 @@
 #include "optimizer/optimizer.h"   /* plan_create_index_workers (§4A-2) */
 #include "storage/shm_toc.h"       /* shm_toc for the parallel DSM (§4A-2) */
 #include "utils/snapmgr.h"         /* SnapshotAny / RegisterSnapshot (§4A-2) */
+#include "utils/inval.h"           /* relcache invalidation interface */
 #include "storage/sinval.h"          /* immediate nontransactional plan invalidation */
 #include "access/genam.h"          /* try_index_open (ADR-045 index_dir reloption) */
 #include "access/reloptions.h"     /* CAGRA index_dir reloption (ADR-045) */
@@ -5064,7 +5065,7 @@ cuvs_mark_index_stale(Relation indexRel)
     memset(&msg, 0, sizeof(msg));
     msg.rc.id = SHAREDINVALRELCACHE_ID;
     msg.rc.dbId = MyDatabaseId;
-    msg.rc.relId = IndexGetRelation(RelationGetRelid(indexRel), false);
+    msg.rc.relId = indexRel->rd_index->indrelid;
     SendSharedInvalidMessages(&msg, 1);
     AcceptInvalidationMessages();
 }

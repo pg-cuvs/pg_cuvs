@@ -155,6 +155,7 @@ jobs:
           export PATH=/usr/lib/postgresql/16/bin:$PATH
           # Tier-1 subset: REGRESS minus GPU-graph tests (see Makefile
           # REGRESS_TIER2_ONLY: CAGRA->pgvector HNSW graph export, a real-GPU concern).
+          make test-stale-interim
           make installcheck-tier1 || { echo "===== regression.diffs ====="; cat test/regression.diffs; false; }
           make installcheck-isolation || { echo "===== isolation diffs ====="; cat test/output_iso/regression.diffs 2>/dev/null; cat test/regression.diffs 2>/dev/null; false; }
 
