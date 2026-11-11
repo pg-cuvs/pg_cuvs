@@ -216,6 +216,7 @@ jobs:
           retention-days: 7
 
       - name: Stale scan integration (fresh shim daemon)
+        shell: bash
         if: ${{ !cancelled() && steps.shim-setup.outcome == 'success' }}
         run: |
           export PATH=/usr/lib/postgresql/16/bin:$PATH
