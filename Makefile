@@ -258,7 +258,10 @@ src/cuvs_build_corpus_server_test.o: src/cuvs_build_corpus.c src/cuvs_build_corp
 src/cuvs_cache_policy_server_test.o: src/cuvs_cache_policy.c src/cuvs_cache_policy.h src/cuvs_admission_contract.h src/cuvs_util.h
 	$(CC) $(SERVER_TEST_CFLAGS) -c $< -o $@
 
-$(SERVER_TEST_BIN): src/pg_cuvs_server_test.o src/cuvs_ipc_server_test.o src/cuvs_util_server_test.o src/cuvs_objstore_server_test.o src/cuvs_build_corpus_server_test.o src/cuvs_cache_policy_server_test.o src/cuvs_peak_meter_server.o $(WRAPPER_OBJ)
+src/cuvs_peak_meter_server_test.o: src/cuvs_peak_meter.c src/cuvs_peak_meter.h
+	$(CC) $(SERVER_TEST_CFLAGS) -c $< -o $@
+
+$(SERVER_TEST_BIN): src/pg_cuvs_server_test.o src/cuvs_ipc_server_test.o src/cuvs_util_server_test.o src/cuvs_objstore_server_test.o src/cuvs_build_corpus_server_test.o src/cuvs_cache_policy_server_test.o src/cuvs_peak_meter_server_test.o $(WRAPPER_OBJ)
 	$(CXX) -o $@ $^ $(SERVER_LDFLAGS)
 
 server-test: $(SERVER_TEST_BIN)
