@@ -5,6 +5,8 @@
 > 빌드/테스트는 전부 VM(PG16): `make installcheck` + `make installcheck-isolation`. 로컬 빌드 불가(daemon/CUDA).
 > 상태: 감사 당시의 역사 스냅샷이다. 현재 버전·문서 계약은 `docs/doc-map.md`와
 > `make docs-contract-check`를 따른다.
+> 현재 `Makefile`과 `pg_cuvs.control`은 모두 0.9.0이다. 아래 0.3.0/0.5.0
+> 표기는 감사 및 후속 정정 당시의 기록이며, 현재 릴리스 버전이 아니다.
 
 ---
 
@@ -18,7 +20,7 @@
 
 ### 1.2 고아모듈 / 아티팩트
 - **정정(에이전트 오류)**: `src/*.o`는 git-추적 안 됨(이미 gitignore) -> 조치 불요. `bench/legacy/anbench/observe.py`는 고아 아님 -> issue #56 bench-protocol 하네스로 통합 중인 WIP.
-- **EXTVERSION 불일치 (감사 당시, 해결됨)**: Makefile `EXTVERSION=0.1.0` vs `pg_cuvs.control default_version='0.3.0'`. 현재 저장소는 `0.5.0`으로 정합하며 계약 검사로 재발을 감지한다.
+- **EXTVERSION 불일치 (감사 당시, 해결됨)**: Makefile `EXTVERSION=0.1.0` vs `pg_cuvs.control default_version='0.3.0'`. 이후 0.5.0으로 정합했으며, 현재 두 파일은 0.9.0이다. 계약 검사로 재발을 감지한다.
 - 추적된 bench 산출물 4종(`bench/results/cohere_N1000000.jsonl`/`_summary.csv` · `gpu_resources_bench.csv` · `hnsw_import_bench.csv`) — BENCHMARK.md 증거 인용. 의도면 유지, 아니면 untrack.
 - **정정 — 벤치 스크립트/문서는 고아 아님**: `bench/legacy/ef_recall_sweep.py` · `infra/scripts/recipes/pgbench-multigpu.sql` · `design/benchmarks/competitive-baseline.md`는 **진행 중인 엄밀 벤치마크 작업(ADR-069 / issue #56 web<->local)의 일부**. observe.py와 동일한 false-positive 클래스(감사 에이전트가 멀티-에이전트 벤치 맥락 부재). **삭제 금지.**
 - doc-map 누락 6종(ci-gpu-setup · bruteforce-acceleration-lessons · ecosystem-strategy · filter-threshold-experiment · phase2-* · reports/2026-06-11-prerelease-ci-and-3o) -> doc-map에 historical 항목 추가 **(완료)**.

@@ -1,7 +1,10 @@
 # pg_cuvs GPU Operations Playbook
 
-> 실측 기반 운영 가이드. 모든 권장값은 A100-40GB × 2, N=100K, dim=384 환경에서 측정됨.
+> Historical: 아래 측정 표는 2026-06-01 표본이며 현재 운영 권장값으로 검증되지 않았다.
 > `bench/results/gpu_resources_bench.csv`, `bench/results/hnsw_import_bench.csv` 참조.
+> 현행 설정과 운영 절차는 [reference](../docs/reference.md),
+> [capacity planning](../docs/playbooks/capacity-planning.md),
+> [multi-GPU operations](../docs/playbooks/multi-gpu-sharding-ops.md)을 확인한다.
 
 ---
 
@@ -64,9 +67,8 @@ N > 5M 구간은 아직 검증되지 않았으므로 실제 운영에서는 A/B 
 데몬 시작 시 `--max-vram-mb` 플래그로 지정한다 (GUC 아님).
 
 ```bash
-# systemd override 예시
-sudo systemctl set-environment CUVS_MAX_VRAM_MB=2048
-sudo systemctl restart pg-cuvs-server
+# 실제 unit의 ExecStart에 --max-vram-mb가 지정되었는지 확인
+sudo systemctl cat pg-cuvs-server
 ```
 
 | max_vram_mb | 동작 |
@@ -259,13 +261,13 @@ build/import speedup은 벡터 내용 무관, 실 데이터에서도 유사 예�
 
 ```sql
 -- GPU 인덱스별 검색 통계
-SELECT index_name, search_count, avg_latency_us, p50_us, p95_us,
-       build_time_ms, search_mode
+SELECT index_name, search_count, avg_latency_us,
+       p50_latency_us, p95_latency_us, search_mode
 FROM pg_stat_gpu_search
 ORDER BY search_count DESC;
 
 -- 현재 search_mode 확인
--- 0 = gpu_cagra, 1 = cpu_hnsw (3I-1 fallback), 2 = cpu_fallback
+-- search_mode는 text이며 현행 값은 docs/reference.md와 SQL 정의를 확인한다.
 SELECT index_name, search_mode FROM pg_stat_gpu_search;
 ```
 

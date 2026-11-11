@@ -1,5 +1,10 @@
 # pg_cuvs Cost-Model Calibration & Validation (Stage C freeze)
 
+> **Status: Historical Stage A/B evidence.** This report records the 0.5.0
+> A100 calibration; HEAD declares extension version 0.9.0. Its EXPLAIN and
+> latency tables are not a new run against HEAD. Current planner settings
+> and SQL surface are in [`docs/reference.md`](../reference.md).
+
 > **Status**: cost model = data-movement physics + hardware probe (ADR-075,
 > implemented main 0.5.0). This report **freezes the validated state**: Stage B
 > EXPLAIN-sweep + Stage A measured cross-check both confirm the model routes

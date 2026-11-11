@@ -35,10 +35,12 @@ gcloud storage ls --recursive "gs://<bucket>/**" --project=$PROJ | head
 ## 3. 원인 분기 (Cause branches)
 
 ### A. VM에 service account 없음 (GCS 인증 불가) — 가장 흔한 함정
-데몬 GCS 클라이언트는 (1) instance metadata 토큰, 실패 시 (2) `cuvs.gcs_key_file`의
-SA JSON으로 인증한다. VM에 SA가 없고 key_file도 비면 **토큰을 못 받아 업로드/다운로드
-전부 실패**. (이 저장소의 `pg-cuvs-dev`는 원래 SA가 없어 3C/3D snapshot이 한 번도
-실제로 동작한 적이 없었다.) → `gpu-vm-lifecycle.md`에서 SA 부착.
+데몬 GCS 클라이언트는 (1) instance metadata 토큰, 실패 시 (2) 데몬
+`--gcs-key-file`이 가리키는
+SA JSON으로 인증한다. backend `cuvs.gcs_key_file` GUC는 별도 데몬에
+자동 전달되지 않는다. VM에 SA가 없고 데몬 key file도 비면 토큰을 못 받아
+업로드/다운로드가 실패한다. → `gpu-vm-lifecycle.md`에서 SA 부착 또는
+데몬 시작 인수 설정.
 
 ### B. 버킷 권한 부족
 부착된 SA가 버킷에 `roles/storage.objectAdmin`이 없으면 업로드 PUT/POST/다운로드가
@@ -57,7 +59,9 @@ POST 필요), 매니페스트 파서가 pretty-print 공백을 못 견뎌 "corru
 
 ### E. heap relfilenode mismatch
 manifest의 `relfilenode`가 로컬 `.relfilenode` sidecar와 다르면 hard reject(다른
-heap에서 만든 artifact를 로드하지 않음). 정답은 그 노드에서 REINDEX.
+heap에서 만든 artifact를 로드하지 않음). 쓰기 가능한 노드라면 해당
+heap에서 REINDEX한다. 읽기 전용 standby에서는 REINDEX할 수 없으며
+물리 replica 경로의 warmup은 별도 검증이 필요하다.
 
 ---
 
@@ -78,7 +82,7 @@ gcloud storage buckets add-iam-policy-binding "gs://$BUCKET" --project=$PROJ \
 ```bash
 # systemd unit ExecStart에 다음 인수 추가(또는 수동 데몬):
 #   --snapshot-uri gs://<bucket> --cluster-id <cluster>
-# (인증은 instance metadata SA 자동; 또는 --gcs-key-file / cuvs.gcs_key_file)
+# (인증은 instance metadata SA 자동; 또는 데몬의 --gcs-key-file)
 sudo systemctl daemon-reload && sudo systemctl restart pg-cuvs-server
 ```
 
@@ -88,7 +92,9 @@ sudo systemctl daemon-reload && sudo systemctl restart pg-cuvs-server
    넣고 warmup을 enqueue → `cuvs_objstore_download`가 매니페스트의 `shard_count`로
    분기해 `.tids`+`.shards`+모든 `.sNNN.cagra`를 받고 `.tids`/`.shards` SHA를 검증한 뒤
    atomically 기록 → `load_index_sharded`가 shard별 CRC로 최종 검증(fail-closed).
-3. warmup 완료 전 쿼리는 NOT_FOUND→CPU fallback; 완료 후 GPU path.
+3. warmup 완료 전 새 계획은 cold index를 피하고 CPU 경로를 선택할 수 있다.
+   이미 선택된 GPU scan이 실행 중 NOT_FOUND를 받으면 해당 SELECT는 ERROR로
+   끝날 수 있으므로 재시도한다. 완료 후 GPU 경로를 확인한다.
 
 ---
 
@@ -122,8 +128,8 @@ SELECT count(*) FROM pg_stat_gpu_shards WHERE index_name='<idx>' AND resident;  
   버킷 리전/uniform bucket-level access 정책 점검.
 - `corrupt manifest`/`HTTP 404 upload`가 최신 빌드에서도 나면: 데몬 바이너리가
   fix 커밋(`6e85b58`/`4f68918`) 이전인지 `gpu-server`로 재설치 후 재확인.
-- heap relfilenode mismatch 반복: 그 노드의 heap이 정말 호환인지(같은 dump/replica인지)
-  확인. 호환이면 REINDEX, 아니면 그 노드에서 새로 빌드.
+- heap relfilenode mismatch 반복: 그 노드의 heap 호환성을 확인한다.
+  쓰기 가능한 노드에서만 REINDEX한다. standby에서는 재빌드 절차로 진행하지 않는다.
 - `.delta`/`.tombstone`/`.stale`은 스냅샷에서 제외된다(파생/휘발). 복원 후 write 정합은
   `drop-and-write-path-diagnosis.md` 참조.
 

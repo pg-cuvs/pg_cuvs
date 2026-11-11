@@ -41,10 +41,13 @@ sudo journalctl -u pg-cuvs-server --no-pager | grep -iE "auto shard|built sharde
 ## 3. 원인 분기 (Cause branches)
 
 ### A. shard_count 의미
-`cuvs.shard_count`: **0 = auto**(VRAM로 추론; 한 GPU에 들어가면 1=unsharded),
+`cuvs.shard_count`: **0 = auto**(기본 degree의 final-only 근사로 shard 수 선택;
+한 GPU 예산에 들어가면 1=unsharded),
 **1 = 강제 unsharded**, **N≥2 = 강제 N shard**. build 시점에만 읽는다(CREATE INDEX/
 REINDEX). auto가 ≥2를 만들려면 인덱스 추정 VRAM이 per-GPU budget(`--max-vram-mb`)을
-초과해야 한다(단일 GPU에서는 GPU 1개라 auto는 1로 떨어진다 — sharding은 multi-GPU에서).
+초과해야 한다. 단일 GPU에서 근사치가 예산을 초과하면 auto는 0을 반환해
+빌드를 거부한다. shard 수가 정해져도 각 shard의 scratch를 포함한 admission과
+RMM quota·물리 여유 검사를 별도로 통과해야 한다.
 
 ### B. build가 "won't fit on any GPU"
 per-GPU budget 합보다 큰데 GPU 수/`CUVS_SHARDS_MAX`/`n_vecs/2` 한도로 충분히 못

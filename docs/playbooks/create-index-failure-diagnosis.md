@@ -156,11 +156,7 @@ ls /tmp/cuvs_indexes/*.tmp 2>/dev/null
 sudo journalctl -u pg-cuvs-server --no-pager | grep 'registry full'
 ```
 
-**기대 출력 (registry full 시):**
-```
-pg_cuvs: registry full (64/64 slots occupied), cannot add new index
-```
-**-> registry full:** 복구 Step 5로  
+**→ `registry full`:** 영속화된 artifact의 on-demand reload 가능 여부를 확인한다.
 **-> 출력 없음:** 디스크 권한 확인 (`ls -la /tmp/cuvs_indexes/`) 후 에스컬레이션
 
 ---
@@ -174,7 +170,7 @@ IPC status code별 원인과 힌트 메시지:
 | `CUVS_STATUS_UNAVAILABLE` | 4 | daemon이 내려갔거나 소켓이 없음 | daemon을 시작하고 재시도 |
 | `CUVS_STATUS_OOM_FALLBACK` | 2 | VRAM 부족 — build 단계에서 ensure_vram 실패 | VRAM 확보 후 재시도, 또는 HNSW 사용 |
 | `CUVS_STATUS_BUILD_FAILED` | 5 | GPU CAGRA 빌드 실패 (cuvs_cagra_build 반환 NULL) | journal에서 CUDA 오류 확인 |
-| `CUVS_STATUS_PERSIST_FAILED` | 6 | 빌드 성공, 디스크 직렬화 실패 또는 registry full | 디스크 공간/권한 확인, registry 정원(64) 초과 확인 |
+| `CUVS_STATUS_PERSIST_FAILED` | 6 | 디스크 직렬화 실패 | 디스크 공간/권한 확인 |
 | `CUVS_STATUS_ERROR` | 1 | 기타 daemon 오류 (shm 실패 등) | journal 확인 |
 
 각 원인의 복구 이동:
@@ -182,7 +178,7 @@ IPC status code별 원인과 힌트 메시지:
 - OOM_FALLBACK (status=2) -> 복구 Step 2로
 - BUILD_FAILED (status=5) libcuvs 불일치 -> 복구 Step 3로
 - PERSIST_FAILED 디스크 공간 -> 복구 Step 4로
-- PERSIST_FAILED registry full -> 복구 Step 5로
+- registry full 로그가 있으면 artifact가 영속화됐는지 확인하고 on-demand reload 경로를 점검한다.
 
 ---
 
@@ -255,51 +251,32 @@ CREATE INDEX hnsw_idx ON items USING hnsw (embedding vector_l2_ops);
 ### Step 3 — 바이너리 재빌드 (BUILD_FAILED/버전 불일치 복구)
 
 ```bash
-# 로컬에서 VM으로 소스 동기화 (Makefile:L179)
-rsync -avz --delete \
-    --exclude '.git' --exclude 'src/*.o' --exclude 'src/*.bc' \
-    --exclude '*.so' --exclude 'gpu.conf' --exclude '.env.gpu' \
-    ./ $(VM_SSH_HOST):~/pg_cuvs/
+# 로컬 Makefile의 배포 경로 사용
+make gpu-deploy
 ```
 
-**기대 출력:**
-```
-sending incremental file list
-...
-sent N bytes  received M bytes
-```
-
-```bash
-# VM에서 재빌드 (Makefile:L188)
-ssh -tt $(VM_SSH_HOST) "cd ~/pg_cuvs && source ~/miniforge3/bin/activate $(CONDA_ENV) && make 2>&1 | tee /tmp/pg_cuvs_build.log"
-```
-
-**기대 출력 (마지막 줄):**
-```
-build complete
-```
-**-> 빌드 성공:** Step 3-2로  
-**-> 빌드 실패 (CUDA 컴파일 오류):** `/tmp/pg_cuvs_build.log` 확인 후 에스컬레이션
-
-```bash
-# Step 3-2: VM에서 설치 (Makefile:L193)
-ssh -tt $(VM_SSH_HOST) "cd ~/pg_cuvs && source ~/miniforge3/bin/activate $(CONDA_ENV) && sudo -E make install"
-```
-
-**기대 출력:**
-```
-/bin/install -c pg_cuvs.so $(pkglibdir)/pg_cuvs.so
-```
-**-> 성공:** CREATE INDEX 재시도 후 Step 5 (검증)로  
-**-> 실패 (permission denied):** `sudo -E` 환경 확인
+`gpu-deploy`는 sync, 빌드, 확장·데몬 설치, 두 프로세스 reload,
+배포 신선도 검사를 차례로 실행한다.
+**-> 배포 성공:** CREATE INDEX 재시도 후 Step 5 (검증)로
+**-> `gpu-build` 실패 (CUDA 컴파일 오류):** Makefile이 VM의
+`/tmp/pg_cuvs_build.log`에 tee하므로 해당 로그를 확인한다. 설치·reload·
+`gpu-verify-deployed` 단계 실패라면 그 단계의 출력과 데몬/PostgreSQL journal을
+확인한다. 빌드 로그만으로 후속 단계 실패를 진단하지 않는다.
 
 ---
 
 ### Step 4 — 디스크 공간 확보 (PERSIST_FAILED 복구)
 
 ```bash
-# .tmp 잔재 제거 (daemon이 정리 못한 경우)
-rm -f /tmp/cuvs_indexes/*.tmp
+# 데몬을 중지하고 실패한 인덱스 OID의 .tmp만 목록 확인 후 제거한다.
+# INDEX_DIR, DB_OID, INDEX_OID는 실제 설정·카탈로그와 대조해 지정한다.
+INDEX_DIR=/tmp/cuvs_indexes
+DB_OID=16384
+INDEX_OID=16392
+sudo systemctl stop pg-cuvs-server
+sudo find "$INDEX_DIR" -maxdepth 1 -type f -name "${DB_OID}_${INDEX_OID}*.tmp" -print
+sudo find "$INDEX_DIR" -maxdepth 1 -type f -name "${DB_OID}_${INDEX_OID}*.tmp" -delete
+sudo systemctl start pg-cuvs-server
 ```
 
 **기대 출력:**
@@ -317,35 +294,19 @@ df -h /tmp/cuvs_indexes/
 Avail 이 1G 이상이어야 함
 ```
 **-> 공간 확보:** CREATE INDEX 재시도 후 Step 5 (검증)로  
-**-> 공간 부족 지속:** `/tmp` 전체 정리 또는 `cuvs.index_dir`을 다른 볼륨으로 변경
+**-> 공간 부족 지속:** 대상 인덱스의 실제 `index_dir` 사용량을 조사하고,
+  다른 볼륨으로 옮기는 절차를 검토한다. `/tmp` 전체를 지우지 않는다.
 
 ---
 
-### Step 5 — registry 슬롯 확보 (PERSIST_FAILED / registry full 복구)
+### Step 5 — registry 포화 확인
 
-```sql
--- 인덱스 수 확인 (64개 초과 시 registry full)
-SELECT count(*) FROM pg_indexes WHERE indexdef LIKE '%USING cagra%';
-```
+현재 데몬은 registry가 포화돼도 빌드 artifact를 저장하고 필요할 때 reload하도록
+설계됐다. `registry full` 로그만으로 CREATE INDEX 실패나 artifact 손상을
+판정하지 않는다.
 
-**기대 출력:**
-```
- count
--------
-    64
-```
-
-```sql
--- 불필요한 인덱스 DROP
-DROP INDEX <index_name>;
-```
-
-**기대 출력:**
-```
-DROP INDEX
-```
-**-> 성공:** CREATE INDEX 재시도 후 Step 5 (검증)로  
-**-> DROP 후에도 registry full:** daemon 재시작 후 재시도 (`sudo systemctl restart pg-cuvs-server`)
+인덱스 이름과 `pg_stat_gpu_search`의 `resident` 상태를 확인한다.
+인덱스가 catalog에 있고 artifact가 저장됐다면 조회 시 reload를 시도한다.
 
 ---
 

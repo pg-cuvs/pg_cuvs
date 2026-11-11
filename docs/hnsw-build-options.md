@@ -1,6 +1,6 @@
 # over-the-vram HNSW 생성 옵션
 
-이 정책은 0.8.2 `USING pg_cuvs_hnsw` 직접 heap 생성에 적용한다.
+이 정책은 0.8.2에서 도입된 `USING pg_cuvs_hnsw` 직접 heap 생성에 적용한다. 현재 확장 버전은 `pg_cuvs.control`의 0.9.0이다.
 기존 device CAGRA AUTO 경로의 정책은 바꾸지 않는다.
 
 ```sql
@@ -22,7 +22,7 @@ SELECT pg_cuvs_hnsw_build_info('items_ann'::regclass);
 - `nn_descent`: 예약된 미지원 값이다. 메모리 모델 부재와 `auto`(tiny/resident) 또는 명시 `ace` 대안을 설명하는 오류로 거부한다. ACE 내부의 NN-descent 사용과는 별개다.
 
 ```sql
--- Disk build is an explicit choice, not a fallback from AUTO.
+-- Explicitly choose ACE-disk even when AUTO would fit the resident budget.
 CREATE INDEX items_disk_ann ON items USING pg_cuvs_hnsw (embedding vector_l2_ops)
   WITH (mode = 'hnsw', build_algo = 'ace', ef_construction = 64);
 ```
@@ -61,7 +61,7 @@ ACE는 데이터를 겹치는 조각으로 나눠 조각마다 kNN 그래프를 
 
 ## 저장된 정보
 
-0.8.2의 `pg_cuvs_hnsw_build_info(regclass)`는 생성 시 저장한 경로, 실제 설정,
+0.8.2에서 도입된 `pg_cuvs_hnsw_build_info(regclass)`는 생성 시 저장한 경로, 실제 설정,
 resident 후보 훈련 형상, 추정치·실효 예산과 guard 반환 여부를 조회한다.
 현재 세션 GUC로 과거 설정을 추정하지 않는다. 원 테이블 SELECT 권한이 필요하다.
 ACE 인덱스는 영수증 바로 뒤에 조각 빌더 readback을 저장한다: `ace_build_quality_source`(`auto`/`manual`), `ace_build_quality`(q), `ace_local_intermediate_degree`(조각 kNN 폭), `ace_local_nn_descent_iterations`(조각 NN-descent 반복 상한; 100만 행 이상을 셋 이상의 조각으로 나누면 조각마다 달라 `varies_by_partition`). ACE 빌드는 검증된 고정 SDK(memory-guard marker `@60b19a0f`)에서만 돌므로 이 값은 그 SDK의 동작에서 계산한 값이다. 조각별 실제 값은 데몬 로그의 SDK 줄로 확인한다. 이 기능 이전에 만든 ACE 인덱스는 `"ace_readback":"not_recorded"`, resident·tiny는 `"not_applicable"`이다. 영수증 형식(policy v2)은 그대로이며 readback은 별도 magic의 꼬리 레코드다.
@@ -74,9 +74,9 @@ pgvector metapage prefix와 영수증 크기는 유지한다. 새 writer는 poli
 같은 데이터·같은 ef와 같은 질의 비용에서 각각 비교한다. self 도달성 진단과는 별개다.
 같은 f32 벡터의 다른 ID는 동점 정답이다. 작은 생성 시험은 이 품질 기준의 통과 증거가 아니다.
 
-extension과 daemon은 HNSW op23 payload v5를 함께 배포해야 한다(v4는 응답 뒤에 결정 바이트 6개, 즉 status-13 DETAIL의 원값을 덧붙이고, v5는 그 뒤에 ACE partition builder readback 32바이트를 덧붙인다). 통합 기준 main의 글로벌 v4 명령 ABI는 유지되며 HNSW op23 payload v5와 구분한다.
+extension과 daemon은 HNSW op23 payload v5를 함께 배포해야 한다(v4는 응답 뒤에 결정 바이트 6개, 즉 status-13 DETAIL의 원값을 덧붙이고, v5는 그 뒤에 ACE partition builder readback 32바이트를 덧붙인다). 현재 글로벌 명령·응답 프로토콜은 `CUVS_PROTO_VERSION=5`이며 HNSW op23의 별도 payload 버전 5와 구분한다.
 이전 payload v1/v2/v3/v4 요청은 prefix의 버전을 먼저 검사해 나머지 필드를 기다리지 않고 거부한다.
-기존 0.8.1 단독 reader는 새 policy v2를 읽을 수 없다. 0.8.2 바이너리를 함께 배포한 뒤 `ALTER EXTENSION pg_cuvs UPDATE TO '0.8.2'`를 사용한다. upgrade SQL은 영수증을 이주/덮어쓰기하지 않는다. v2가 있는 인덱스를 예전 reader로 downgrade하는 것은 지원하지 않는다.
+기존 0.8.1 단독 reader는 새 policy v2를 읽을 수 없다. 0.8.2 도입 당시에는 확장과 데몬 바이너리를 함께 배포하고 0.8.2로 업그레이드해야 했다. 현재 배포 대상 버전은 0.9.0이며, 0.8.1에서 출발한다면 `sql/pg_cuvs--0.8.1--0.8.2.sql`과 `sql/pg_cuvs--0.8.2--0.9.0.sql`의 업그레이드 경로를 따른다. upgrade SQL은 영수증을 이주/덮어쓰기하지 않는다. v2가 있는 인덱스를 예전 reader로 downgrade하는 것은 지원하지 않는다.
 
 이 구현의 CPU 검사·코드 리뷰와 별개로 작은 실제 CUDA 생성·1M 동일성/비용/품질은 별도 실행 승인과 검증이 필요하다. 같은 native 파일의 변환 보존과 서로 다른 GPU build 간 SHA 불일치는 구분하며, 후자의 비결정성을 성공 판정으로 덮지 않는다.
 `internal_builder`는 base/local graph 생성기를 표시한다. 다른 계층의 미기록 과거 분기를 추정한 값이 아니다.

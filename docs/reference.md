@@ -3,8 +3,8 @@
 > **Current-state reference (SSOT)** for the user-facing surface: index access methods, search
 > modes, GUCs, reloptions, SQL functions, and observability views. How the pieces fit together is
 > in [ARCHITECTURE.md](../ARCHITECTURE.md); the rationale behind each is in
-> [design/decisions.md](../design/decisions.md). Verified against `src/pg_cuvs.c` and
-> `sql/pg_cuvs--0.5.0.sql` (extension version 0.5.0).
+> [design/decisions.md](../design/decisions.md). Source-checked against `src/pg_cuvs.c` and
+> `sql/pg_cuvs--0.9.0.sql` at HEAD `ae818ad` (extension version 0.9.0; source review only).
 
 ---
 
@@ -14,24 +14,22 @@ pg_cuvs registers four index AMs. All reuse pgvector's `vector` type and operato
 (`<->` L2, `<=>` cosine, `<#>` inner product) via opclasses `vector_l2_ops` (default),
 `vector_cosine_ops`, `vector_ip_ops`.
 
-| AM | Create | Tuning (reloptions) | Served by | Sidecar files |
+| AM | Create | Tuning (reloptions) | Served by | Storage / sidecars |
 |----|--------|---------------------|-----------|---------------|
 | `cagra` | `CREATE INDEX i ON t USING cagra (col vector_l2_ops)` | `graph_degree`, `intermediate_graph_degree`, `build_algo`, `index_dir` | GPU daemon | `.cagra`, `.tids`, (`.vectors`, `.delta`, `.tombstone`, `.stale`, `.shards`, `.sNNN.cagra`, `.relfilenode`) |
 | `flat` | `CREATE INDEX i ON t USING flat (col vector_l2_ops) WITH (precision='float16')` | `precision`, `index_dir` | GPU daemon | `.tids`, `.vectors` (no `.cagra` graph) |
 | `ivfpq` | `CREATE INDEX i ON t USING ivfpq (col vector_l2_ops)` | `n_lists`, `pq_bits`, `pq_dim`, `index_dir` | GPU daemon | `.ivfpq`, `.tids` |
-| `pg_cuvs_hnsw` | `CREATE INDEX i ON t USING pg_cuvs_hnsw (col vector_l2_ops) WITH (source='my_cagra', mode='nsw')` | `source`, `mode`, `m`, `ef_construction`, `build_algo` | **pgvector** (CPU) | `.hnsw` (pgvector page format) |
+| `pg_cuvs_hnsw` | `CREATE INDEX i ON t USING pg_cuvs_hnsw (col vector_l2_ops) WITH (source='my_cagra', mode='nsw')` | `source`, `mode`, `m`, `ef_construction`, `build_algo` | **pgvector** (CPU) | pgvector-format pages in this index's PostgreSQL relation; optional `.hnsw` hnswlib conversion sidecar, not the index storage |
 
 `flat` is the first-class exact GPU brute-force AM (ADR-073, extension v0.4.0). It builds only a
 `.tids` + `.vectors` store — no CAGRA graph — so the build is O(N) copy rather than graph
-construction. Search is always exact (recall=1.0) regardless of `cuvs.search_mode`; the AM
-forces brute-force internally. Freshness uses the same delta/tombstone mechanism as `cagra`
+construction. The AM forces brute-force search over the stored corpus regardless of `cuvs.search_mode`. With `float16`, corpus and query quantization can change float32 top-k ordering; see the precision reloption below. Freshness uses the same delta/tombstone mechanism as `cagra`
 (INSERTs append to `.delta`, merged at search time). The planner picks `flat` via its own cost
 function: when the hardware profile is fully probed and `cuvs.enable_phys_cost` is on, cost is the
 ADR-075 physical model (§ Cost model & hardware profile); otherwise it falls back to the legacy
-constants (`CUVS_FLAT_STARTUP_COST=50`, vs `CUVS_STARTUP_COST=1000` for cagra). Either way small-N
-tables route to `flat` correctly. DROP removes `.tids` + `.vectors` and releases VRAM. The index is
+constants (`CUVS_FLAT_STARTUP_COST=50`, vs `CUVS_STARTUP_COST=1000` for cagra). These are cost inputs, not a guarantee that small tables use `flat`; compare candidates with `EXPLAIN` for the target query and statistics. DROP removes `.tids` + `.vectors` and releases VRAM. The index is
 restart-durable: `.vectors` is reloaded on daemon restart. Use `flat` for read-heavy, stable
-corpora where recall=1.0 is required; use `cagra`/`ivfpq` for approximate search at large N.
+corpora that require exhaustive search; use `cagra`/`ivfpq` for approximate search at large N.
 
 > **Deprecated:** `SET cuvs.search_mode = 'brute_force'` on a `cagra` index was the previous way
 > to get GPU exact BF. It still works (ADR-039) but is deprecated. `USING flat` is the
@@ -145,6 +143,8 @@ decoder.
 > query cancel aborts the daemon round-trip within ~0.5s instead of blocking indefinitely (ADR-053,
 > `recv_all_interruptible`). The daemon ignores SIGPIPE so it survives a client mid-reply disconnect.
 
+An `OOM_FALLBACK` returned during an already planned CAGRA or flat scan raises SQLSTATE `53200` for that statement; it does not replay the statement on CPU. A later attempt can choose a CPU plan after the breaker opens, subject to the planner gate and threshold.
+
 ---
 
 ## 3. GUC reference
@@ -162,7 +162,7 @@ Defaults and ranges are from source. "Set by" is the minimum role/scope: `USERSE
 | `cuvs.socket_path` | string | `/tmp/.s.pg_cuvs` | — | SUSET | UDS path to the daemon |
 | `cuvs.daemon_uid` | int | `-1` | -1– | SUSET | Expected owner uid of `cuvs.socket_path`; backend refuses to connect if the socket is owned by a different uid. `-1` disables the check. See playbooks/daemon-restart-recovery.md § Security / hardening |
 | `cuvs.index_dir` | string | `$PGDATA/cuvs_indexes` | — | SUSET | Artifact directory (empty = resolved at runtime) |
-| `cuvs.k` | int | `100` | 1–2000 | USERSET | GPU top-k candidates fetched per scan (cf. `hnsw.ef_search`) |
+| `cuvs.k` | int | `100` | 1–2000 | USERSET | GPU candidates fetched per CAGRA scan; the AM does not read SQL `LIMIT`, which the executor applies afterward. Set high enough for the desired LIMIT and recall |
 | `cuvs.rmm_pool_mb` | int/status | daemon value | 0–INT_MAX, or `unavailable` | read-only (INTERNAL) | Applied initial RMM pool reservation per GPU, queried from the daemon. `0` = disabled; `unavailable` = no compatible daemon reply. Set using the daemon CLI and restart, not SQL SET. Record with each benchmark run |
 | `cuvs.rmm_pool_max_percent` | int/status | daemon value | 0–100, or `unavailable` | read-only (INTERNAL) | Applied upstream pool quota as a percentage of total CUDA memory on each GPU. `0` when the pool is disabled |
 | `cuvs.rmm_pool_status` | string/status | daemon value | JSON, or `unavailable` | read-only (INTERNAL) | Applied initial MiB, quota percentage, per-device maximum/reserved/used pool bytes, and `hnsw_auto_overflow` (`ace` or `error`, from `--hnsw-auto-overflow`). Counters cover RMM pool allocations; they are live snapshots, not process-wide GPU memory |
@@ -193,7 +193,7 @@ workspace allocations can still produce a genuine allocation failure.
 | `cuvs.search_mode` | enum | `cagra` | `cagra`, `brute_force` | USERSET | CAGRA ANN vs GPU exact BF on a `cagra` index. `brute_force` value is **deprecated** — use `USING flat` AM instead. A `flat` index always forces exact BF regardless of this GUC |
 | `cuvs.gpu_bruteforce` | enum | `off` | `off`, `auto`, `on` | USERSET | **EXPERIMENTAL, hardware-dependent (ADR-074).** Route a no-index single-table vector top-k query to the transient GPU BF CustomScan (`CuvsTransientBF`). On a **PCIe-attached GPU it does NOT beat CPU pgvector** (memory-bound + per-query H2D) — not recommended; use `USING flat` (read-heavy) or plain pgvector no-index (write-heavy). It becomes a first-class W1 path only on **unified-memory hardware** (Grace Hopper / MI300A) where the H2D penalty collapses. `auto` behaves as `off` (reserved until hardware-portable cost auto-enables it where it wins); `on` forces the path for qualifying single-table top-k shapes (ADR-073/ADR-074) |
 | `cuvs.gpu_bruteforce_max_mb` | int | `2048` | 1–INT_MAX | USERSET | Host-side hard cap (MiB) on the per-query corpus materialized before the GPU handoff. Queries whose corpus exceeds this limit fail closed with an ERROR |
-| `cuvs.bf_precision` | enum | `float32` | `float32`, `float16` | USERSET | Resident BF index precision; float16 halves VRAM |
+| `cuvs.bf_precision` | enum | `float32` | `float32`, `float16` | USERSET | BF precision fallback; float16 halves corpus VRAM but quantizes vectors and queries |
 | `cuvs.bf_batch_wait_us` | int | `0` (off) | 0–10000 | USERSET | Daemon BF micro-batch coalescing window (µs) |
 | `cuvs.cagra_batch_wait_us` | int | `0` (off) | 0–10000 | USERSET | Daemon CAGRA micro-batch coalescing window (µs) |
 | `cuvs.itopk_size` | int | `0` (auto) | 0–2147483616, multiples of 32 | USERSET | CAGRA intermediate search buffer floor. Auto preserves `max(64, ceil(actual_k/32)*32)`; an explicit value is raised to cover actual k, including shard/tombstone overfetch. Does not change the number of returned candidates |
@@ -236,12 +236,14 @@ co-deploy the extension and daemon (`make install && make install-server`).
 
 ### GCS snapshot / warmup (multi-node)
 
+These backend GUCs are registered but are not read by the backend build/search path or forwarded to the daemon. Configure the separate daemon flags below for active snapshot and warmup behavior.
+
 | GUC | Type | Default | Range | Set by | Purpose |
 |-----|------|---------|-------|--------|---------|
-| `cuvs.snapshot_uri` | string | `` (off) | — | SUSET | GCS root URI for artifact snapshots, e.g. `gs://bucket/prefix` |
-| `cuvs.cluster_id` | string | `` | — | SUSET | Cluster identifier in the GCS artifact path |
-| `cuvs.gcs_key_file` | string | `` | — | SUSET | Service-account JSON path; empty = GCP instance metadata |
-| `cuvs.warmup_threads` | int | `2` | 1–8 | SUSET | Background warmup (GCS download) thread pool size |
+| `cuvs.snapshot_uri` | string | `` (off) | — | SUSET | Registered backend setting only; does not configure daemon GCS snapshots |
+| `cuvs.cluster_id` | string | `` | — | SUSET | Registered backend setting only; does not configure daemon cluster ID |
+| `cuvs.gcs_key_file` | string | `` | — | SUSET | Registered backend setting only; does not configure daemon credentials |
+| `cuvs.warmup_threads` | int | `2` | 1–8 | SUSET | Registered backend setting only; does not configure daemon warmup threads |
 
 CAGRA compaction (`pg_cuvs_compact` and VACUUM) initially preserves the auto
 builder choice. A memory failure from NN-descent or an unresolved auto choice
@@ -290,7 +292,7 @@ daemon-only ones have no session equivalent.
 | `--max-vram-mb N` | — (daemon-only) | 90% of total VRAM | Logical index-residency budget, enforced by self-accounting (ADR-065). Excludes unused pool reservation and temporary workspace; it is separate from the RMM quota |
 | `--rmm-pool-mb N` | `cuvs.rmm_pool_mb` (read-only status) | `512` MiB | Initial RMM pool reservation per allowed GPU, installed before probes/load/warmup. Explicit `0` disables the pool and keeps the legacy allocator. CPU shim builds default to `0`. Init failure aborts startup |
 | `--rmm-pool-max-percent N` | `cuvs.rmm_pool_max_percent` (read-only status) | `50` | Hard upstream quota: total CUDA memory × N%, rounded down to 256 bytes, on each allowed GPU. Range 1–100; initial reservation must fit. Preserves the pool's doubling/backoff growth policy |
-| `--rmm-scratch-permille N` | — (daemon-only, `scratch_permille` in `cuvs.rmm_pool_status`) | see `SHOW cuvs.rmm_pool_status` (`scratch_permille`). The released default is the value the Q1 qualification stage derived on one NVIDIA A100-SXM4-80GB host with `--cagra-build-overflow managed`; other GPUs or overflow policies may need tuning | CAGRA build scratch coefficient ρ. Admission, reservation and GPU choice use `N = final + ceil(final × ρ / 1000)`; residency accounting keeps `final`. Range 0–100000. Restart to change |
+| `--rmm-scratch-permille N` | — (daemon-only, `scratch_permille` in `cuvs.rmm_pool_status`) | `9593` (Q1 qualification on one NVIDIA A100-SXM4-80GB host with `--cagra-build-overflow managed`; recalibrate for other GPUs or overflow policies) | CAGRA build scratch coefficient ρ. Admission, reservation and GPU choice use `N = final + ceil(final × ρ / 1000)`; residency accounting keeps `final`. Range 0–100000. Restart to change |
 | `--max-indexes N` | — (daemon-only) | `1024` | **Soft** LRU working-set cap (ADR-068), not a hard wall (was 64). At the cap, a reload or `pg_cuvs_load` frees a slot under the § 8 rules (cold first, then soft eviction; reason `slot`); a build over the cap does not evict (with the default `--build-evict-scope none`): its files are saved and the first query reloads it |
 | `--build-evict-scope …` and the other cache flags | — (daemon-only) | see § 8 | Cache, eviction and reclaim knobs (§ 8.2) |
 | `--hnsw-auto-overflow ace\|error` | `hnsw_auto_overflow` in `cuvs.rmm_pool_status` (read-only) | `ace` | What `pg_cuvs_hnsw` `build_algo=auto` does over the resident budget: `ace` spills to ACE-disk with a NOTICE, `error` refuses with SQLSTATE 54000. The same value decides an auto build whose resident IVF-PQ kNN graph cuVS rejects: `ace` rebuilds on ACE-disk with a NOTICE (receipt `graph_fallback`), `error` fails. Startup-only; logged at startup. Explicit `ivf_pq`/`ace` ignore it |
@@ -301,10 +303,10 @@ daemon-only ones have no session equivalent.
 | `--rmm-build-headroom-permille N` | — (daemon-only, restart) | `150` | AR8 headroom for a CAGRA single or parallel build (ADR-089): when `pending + pool_used + N + headroom` exceeds the pool quota, the build eviction scope may evict for the shortfall, otherwise the build is refused (AR5 or AR8, see RMM quota and memory accounting), with `headroom = max(256 MiB, ceil(N × value / 1000))`. `0` removes the headroom but keeps the capacity check; it does not refuse the Q6 shape (see ADR-089). Range 0–100000; out of range refuses startup. The value is on the `CAGRA build pool headroom` startup log line |
 | `--oom-score-adj N` | — (daemon-only, restart) | `500` | Written once to `/proc/self/oom_score_adj` at startup so the kernel OOM killer prefers the daemon over PostgreSQL under host RAM pressure. Range 0–1000; `0` leaves the file untouched; a higher current value is kept (never lowered); a write failure is logged, not fatal |
 | `--gpu-devices LIST` | — (daemon-only) | all visible | CUDA devices the daemon uses (else honors `CUDA_VISIBLE_DEVICES`) |
-| `--snapshot-uri URI` | `cuvs.snapshot_uri` | `` | GCS snapshot root |
-| `--cluster-id ID` | `cuvs.cluster_id` | `` | Cluster id in the GCS artifact path |
-| `--gcs-key-file PATH` | `cuvs.gcs_key_file` | `` | Service-account JSON path |
-| `--warmup-threads N` | `cuvs.warmup_threads` | `2` | Background GCS warmup pool size |
+| `--snapshot-uri URI` | separate daemon flag; backend GUC is not forwarded | `` | GCS snapshot root |
+| `--cluster-id ID` | separate daemon flag; backend GUC is not forwarded | `` | Cluster id in the GCS artifact path |
+| `--gcs-key-file PATH` | separate daemon flag; backend GUC is not forwarded | `` | Service-account JSON path |
+| `--warmup-threads N` | separate daemon flag; backend GUC is not forwarded | `2` | Background GCS warmup pool size |
 
 ### RMM quota and memory accounting
 
@@ -465,7 +467,7 @@ memory. The startup log line reports `oom_score_adj=<n> applied`,
 
 | Reloption | Type | Default | Range / values | Notes |
 |-----------|------|---------|----------------|-------|
-| `precision` | enum | `float32` | `float32`, `float16` | Resident BF index precision. `float16` halves VRAM (N·dim·2 B vs ·4 B); falls back to `cuvs.bf_precision` GUC if not set |
+| `precision` | enum | `float32` | `float32`, `float16` | Resident BF index precision. `float16` halves corpus VRAM (N·dim·2 B vs ·4 B) but quantizes corpus and query, so float32 top-k identity/recall is not guaranteed; falls back to `cuvs.bf_precision` GUC if not set |
 | `index_dir` | string | (uses `cuvs.index_dir`) | path | Per-index artifact directory; same semantics as `cagra` (ADR-045) |
 
 VRAM sizing: `float32` requires N·dim·4 bytes resident (e.g. 1M×1024 ≈ 4 GB); `float16` halves
@@ -495,7 +497,7 @@ cagra/ivfpq") rather than silently failing.
 
 | Reloption | Type | Default | Values | Notes |
 |-----------|------|---------|--------|-------|
-| `source` | string | `` | a `cagra` index name on the same table | empty = ephemeral CAGRA built from the heap |
+| `source` | string | `` | a `cagra` index name on the same table | empty = private direct HNSW file build from the heap (op23), without a persistent CAGRA index |
 | `mode` | string | `nsw` | `nsw`, `hnswlib`, `hnsw`, `hnswlib_file` | `nsw` and `hnswlib` are recommended |
 | `m` | int | `16` | 2–100 | **informational** — the CAGRA graph degree drives the HNSW layout, not `m` |
 | `ef_construction` | int | `64` | 4–1000 | Direct heap build: construction effort; source reuse: informational |
@@ -716,7 +718,7 @@ One row per shard; empty for unsharded indexes.
 
 The sidecar file suffixes (`.cagra`, `.tids`, `.vectors`, `.delta`, `.tombstone`, `.stale`,
 `.shards`, `.sNNN.cagra`, `.relfilenode`, `.hnsw`) and their formats/lifecycle are documented in
-[ARCHITECTURE.md §5](../ARCHITECTURE.md#5-index-lifecycle-and-on-disk-artifacts).
+[ARCHITECTURE.md §5](../ARCHITECTURE.md#5-index-lifecycle-and-on-disk-artifacts). The `.hnsw` file is an optional hnswlib conversion/fallback artifact; `pg_cuvs_hnsw` stores its searchable pgvector pages in the PostgreSQL index relation.
 
 ---
 

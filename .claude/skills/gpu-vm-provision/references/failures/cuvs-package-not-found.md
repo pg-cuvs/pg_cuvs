@@ -13,28 +13,27 @@ PackagesNotFoundInChannelsError: The following packages are not available from c
 
 ## 해결
 
-설치 명령에서 `libcuvs-dev` 제거. `libcuvs`만 명시:
+설치 명령에서 `libcuvs-dev` 제거. 아래는 현재 Brev bootstrap의
+`cuvs_dev` 패키지 조합이다(GCP 레거시 절차는 `~/miniforge3` 사용):
 
 ```bash
-~/miniforge3/bin/conda create -n cuvs_dev -y \
+/opt/miniforge3/bin/mamba create -n cuvs_dev -y \
     -c rapidsai -c conda-forge -c nvidia \
     libcuvs=26.04 \
-    cuda-toolkit=12.* \
-    python=3.11
+    librmm cuda-version=12.4 cuda-nvcc cuda-cudart-dev
 ```
 
 ## 가용 버전 확인
 
 ```bash
-ssh ubuntu@<IP> "source ~/miniforge3/bin/activate && \
-    conda search -c rapidsai -c conda-forge -c nvidia 'libcuvs' 2>&1 | tail -10"
+ssh <name> "/opt/miniforge3/bin/mamba search -c rapidsai -c conda-forge -c nvidia 'libcuvs' 2>&1 | tail -10"
 ```
 
 대표 버전(2026년 5월 기준):
 - 25.10.00 (LTS, pgstrom-results에서 검증)
 - 25.12.00
 - 26.02.00
-- 26.04.00 (현 권장, 단 cagra::serialize SIGSEGV 이슈 있음)
+- 26.04.00 (Brev bootstrap의 버전; 과거 serialize 장애는 [별도 기록](cuvs-serialize-sigsegv.md)에서 해결됨)
 
 ## 헤더 위치 (참고)
 

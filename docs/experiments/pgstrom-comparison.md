@@ -1,5 +1,10 @@
 # PG-Strom 대조 분석 — 왜 pg_cuvs는 영속 `.vectors`를 만들고 PG-Strom은 안 만드나
 
+> **Status: Historical source comparison.** PG-Strom v6.2의 2026-06 소스와
+> 당시 pg_cuvs 설계를 대조한 기록이다. 외부 제품의 최신 동작이나
+> 현재 pg_cuvs 설정 가이드로 읽지 않는다. 현재 pg_cuvs 표면은
+> [`docs/reference.md`](../reference.md)를 따른다.
+
 > 외부 소스 분석: PG-Strom **v6.2** (`github.com/heterodb/pg-strom`, 2026-06 클론).
 > `파일:라인`은 그 PG-Strom 소스 기준이며 본 저장소 경로가 아니다.
 > 목적: 두 GPU-PostgreSQL 확장의 **최적화 축이 정반대**임을 코드 근거로 정리해

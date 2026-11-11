@@ -41,4 +41,5 @@ infra/
 ```
 
 Most `scripts/` are invoked from the `Makefile` `gpu-*` targets (`make gpu-test`,
-`gpu-smoke`, `gpu-bench`, …), piped over SSH to `$(VM_HOST)`.
+`make gpu-e2e`, `make gpu-bench`, …), over SSH to `$(VM_HOST)` (resolved
+from `VM_SSH_HOST`, or from GCP when `USE_GCP_IP=1`).

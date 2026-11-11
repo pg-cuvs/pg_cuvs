@@ -1,5 +1,10 @@
 # pg_cuvs 연산 지역성 프로파일링 결과 (4-preflight / ADR-044)
 
+> **Status: Historical measurements.** §1–10은 2026-06 표본,
+> §11은 다른 데이터·호스트·빌드 파라미터의 2026-08 표본이다.
+> 아래의 당시 제안·예상치와 현재 제품 동작은 구분하며, 현행 표면은
+> [`docs/reference.md`](../reference.md)를 따른다.
+
 > 측정일: 2026-06-05
 > 측정자: 4-preflight 세션
 > 관련 ADR: ADR-044(프로파일링 계획), ADR-034(빌드 오버헤드), ADR-035(page write 병목), ADR-043(TOAST 비용), ADR-039(마이크로배칭)
@@ -381,8 +386,9 @@ nn_descent 커널). 이를 검색 비용으로 오인하지 않도록 **워크�
 
 **읽는 법:**
 - **memcpy는 여전히 무시 가능**(0.16%). 2026-06의 0.4% 결론이 다른 차원·다른 GPU에서도 유지된다.
-- **IPC 비중이 33%(2026-06) → 47.8%로 커졌다.** 커널이 빨라질수록(1024→768 차원) *GPU에 도달하는
-  비용*이 상대적으로 커진다는 §6-3의 방향을 강화한다. 커널:IPC ≈ 1.09:1.
+- **잔차 비율은 이 셀 47.8%, 별개 2026-06 셀 33%다.** 차원과 빌드 조건이
+  달라 IPC 비용의 시간적 증가나 개별 구성요소의 원인을 분리할 수 없다.
+  이 셀의 커널:잔차 ≈ 1.09:1이다.
 
 ### 11.3 배치 경로 (`pg_cuvs_batch_search`, Q=2000, k=200)
 
@@ -477,11 +483,11 @@ BENCHMARK §2.1c(같은 CSV, 708.3 vs 580.5 QPS)에 있다.
 
 ```bash
 # 기저 + 워크로드 캡처 (각각 별도 데몬 세션, SIGTERM finalize)
-bash pg98_nsys_search.sh pg98_none    none
-bash pg98_nsys_search.sh pg98_singles singles
-bash pg98_nsys_search.sh pg98_batch   batch
+bash bench/profiling/nsys_search.sh pg98_none    none
+bash bench/profiling/nsys_search.sh pg98_singles singles
+bash bench/profiling/nsys_search.sh pg98_batch   batch
 # 빌드 (epoch 마커로 CREATE INDEX 구간 정렬)
-bash pg98_nsys_build.sh pg98_build2 ""
+bash bench/profiling/nsys_build.sh pg98_build2
 # 집계
 nsys stats --report cuda_gpu_kern_sum,cuda_gpu_mem_time_sum /tmp/pg98_singles.nsys-rep
 ```
