@@ -1,5 +1,12 @@
 # pg_cuvs Crossover Benchmark — 설계
 
+> **Status: Historical design and measurements.** §0–10은 초기 계획,
+> §11–17은 당시 측정 기록이다. 현행 비교·재현 기준은
+> [`BENCHMARK.md`](../../BENCHMARK.md)와
+> [`bench/results/README.md`](../../bench/results/README.md)를 따른다.
+> 아래 §8의 상수형 코스트모델 설명과 §13/§17의 구 import API는
+> 현재 구현 계약이 아니다. 현행 경로는 [`docs/reference.md`](../../docs/reference.md)를 확인한다.
+
 > 목적: **"언제 pg_cuvs를 써야 하는가"를 숫자로 증명한다.**
 > pgvector / pgvectorscale / VectorChord 대비 pg_cuvs(CAGRA, GPU)가 이기는
 > (N, dim, QPS, p95/p99, cost) 구간(**crossover**)을 찾고, 지는 구간도 정직하게 기록한다.
@@ -9,7 +16,7 @@
 
 ## 데이터 방법론 요약 (필독)
 
-현재까지의 모든 결과는 **합성 데이터**다. 실제 임베딩 데이터로 측정한 결과는 아직 없다.
+§11–14의 당시 결과는 **합성 데이터**다. 실제 임베딩 측정은 아래 §16에 별도 기록했다.
 
 | 벤치 섹션 | 데이터 종류 | 비고 |
 |---|---|---|
@@ -19,7 +26,7 @@
 | §14 GPU resource/MIG | synthetic random, N=100K | 동작 검증 목적, 대표성 낮음 |
 
 **실제 임베딩 데이터 (Cohere Wikipedia 1024d)** 하네스는 `bench/legacy/anbench/fetch_dataset.py`에
-준비되어 있지만 아직 핵심 결과에 미반영이다.
+준비되어 있으며 §16에 당시 결과가 기록되어 있다.
 
 ### 합성 데이터 해석 시 주의
 

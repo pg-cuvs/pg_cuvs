@@ -1,7 +1,9 @@
 # Playbook: GPU VM 빌드 및 테스트
 
 GPU VM에서 pg_cuvs를 처음 빌드하거나 재빌드할 때 사용한다.
-정상 순서: `sync` -> `gpu-build` -> `gpu-install` -> `gpu-server` -> `gpu-postinstall` -> `gpu-test`.
+초기 설정에는 `gpu-postinstall`, 이후 코드 배포에는 `make gpu-deploy`,
+회귀 확인에는 `make gpu-test`를 사용한다. `gpu-deploy`는 두 바이너리 설치와
+PostgreSQL·데몬 재시작 및 신선도 검사를 포함한다.
 
 ---
 
@@ -221,19 +223,10 @@ VM ready: ubuntu@35.224.x.x
 빌드 결과물은 제외한다.
 
 ```bash
-# make sync 가 실제로 하는 것 (Makefile:179):
-rsync -avz --delete \
-    --exclude '.git' \       # git 메타데이터 — VM에 불필요
-    --exclude 'src/*.o' \    # VM에서 nvcc로 컴파일된 오브젝트 — 로컬 것으로 덮으면 GPU 아키텍처 불일치
-    --exclude 'src/*.bc' \   # LLVM 비트코드(PG JIT용) — 마찬가지
-    --exclude '*.so' \       # 빌드 결과물 — sync 방향이 로컬→VM이므로 제외
-    --exclude 'gpu.conf' \   # GCP 자격증명 포함 — VM에 올리면 안 됨
-    --exclude '.env.gpu' \   # gpu.conf 의 옛 이름 — 남아 있는 박스가 있으면 동일하게 제외
-    ./ $VM_SSH_HOST:~/pg_cuvs/
+# Makefile의 sync 타겟을 실행한다.
+make sync
 # --delete: 로컬에서 삭제한 파일은 VM에서도 삭제 (파일명 변경 시 VM에 구버전 좀비 방지)
 
-# 또는 래퍼:
-make sync
 ```
 
 **기대 출력:**
@@ -432,7 +425,7 @@ NOTICE:  pg_cuvs: cagra scan ...
 **→ `BUILD failed (status 4)`:** daemon 미기동 → Step 6 재수행  
 **→ `could not load library`:** rpath 문제 → Step 2~3 재빌드
 
-> **소규모 테이블에서 GPU path 강제 확인:**  
+> **소규모 테이블에서 GPU path 강제 확인:** 위 smoke SQL에서 `DROP TABLE _smoke` 전에 실행한다.
 > PostgreSQL planner는 행 수가 적으면 항상 seqscan을 선택한다.  
 > cagra index 사용 여부를 확인하려면 `enable_seqscan = off`로 강제해야 한다.
 > ```sql

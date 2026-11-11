@@ -1,10 +1,10 @@
 # pg_cuvs Best Practices
 
-릴리스 운영 시 권장 설정. 각 항목은 빌드 시점 NOTICE/WARNING으로도 안내된다(강제 변경 없음).
+릴리스 운영 시 참고할 설정. 아래 측정 수치는 링크한 당시 환경의 결과이며 현행 빌드 성능을 보장하지 않는다.
 
 ## 1. 벡터 컬럼 storage: 고차원은 PLAIN 권장 (ADR-043)
 
-pgvector `vector` 타입의 기본 storage는 **EXTERNAL**이다. 차원이 커서 행이 TOAST 임계(~2KB, 약 dim≥500)를 넘으면 값이 out-of-line으로 저장되고, CAGRA 빌드의 heap scan마다 **detoast 비용**을 낸다. VM 실측(ADR-044, 1M×1024): detoast는 빌드 backend ~15.5s 중 ~6.8s로 **빌드 시간의 ~8%**다(이전의 "~25-35%" 추정은 프로파일링으로 하향 보정됨). PLAIN은 추가로 **INSERT ~10%·총 디스크**에서도 유리하다.
+pgvector `vector` 타입의 기본 storage는 **EXTERNAL**이다. 차원이 커서 행이 TOAST 임계(~2KB, 약 dim≥500)를 넘으면 값이 out-of-line으로 저장되고, CAGRA 빌드의 heap scan마다 **detoast 비용**을 낸다. VM 실측(ADR-044, 1M×1024): detoast는 빌드 backend ~15.5s 중 ~6.8s로 **전체 빌드 시간 83.5s의 ~8%**다(이전의 "~25-35%" 추정은 프로파일링으로 하향 보정됨). PLAIN은 추가로 **INSERT ~10%·총 디스크**에서도 유리하다.
 
 벡터 전용 테이블(다른 큰 컬럼 없음)이라면 **PLAIN storage**를 권장한다:
 

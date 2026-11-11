@@ -1,6 +1,6 @@
 # CI 전략 — 2-tier (CPU-reference shim + on-demand GPU)
 
-> 스펙. 결정 근거는 [decisions.md ADR-067](decisions.md)로 승격됨 — **구현·검증 완료**(PR #46–48/#50). 관련: ROADMAP "CI GPU 전략", [ADR-065](decisions.md)(VRAM budget — mempool).
+> **Current / source-checked** CI tier and workflow guide. The job commands and triggers below were checked against `.github/workflows/ci.yml`, `.github/workflows/gpu.yml`, and `Makefile`. The original motivation and proposed shim details in §§1–4 and §7 are design rationale, not runtime verification evidence; see [ADR-067](decisions.md).
 
 ## 1. 목표와 모델
 
@@ -8,8 +8,8 @@ GPU CI는 무료 옵션이 없다(GitHub hosted 러너에 GPU 없음 → self-ho
 
 | Tier | 머신 | 트리거 | 검증 대상 |
 |------|------|--------|-----------|
-| **1 — CPU-reference shim** | GitHub hosted `ubuntu-latest` (public repo = 무료 무제한) | 매 PR 자동 | plumbing·IPC 계약·fail-closed·mode 라벨링·정확성·VRAM 회계 로직 |
-| **2 — 실 A100 installcheck** | 사용자 GPU VM (self-hosted) | **사용자 on-demand**(`workflow_dispatch` + `/gpu-test` 코멘트/`gpu-ci` 라벨) | GPU 커널 correctness·approximate recall·실 VRAM 거동·latency |
+| **1 — CPU-reference shim** | GitHub hosted `ubuntu-22.04` | `main`, `pr/**`, `design/**` push 및 `main` 대상 PR | plumbing·IPC 계약·fail-closed·mode 라벨링·정확성·VRAM 회계 로직 |
+| **2 — 실 A100 installcheck** | 사용자 GPU VM (self-hosted) | 사용자 on-demand (`workflow_dispatch`) | GPU 커널 correctness·approximate recall·실 VRAM 거동·latency |
 
 release는 트리거가 아니라 머지 정책으로 얹는다("최근 Tier 2 GREEN 있는지 확인").
 
@@ -76,21 +76,23 @@ shim 빌드가 CUDA 툴킷 설치를 요구하면 hosted 러너 무료 이점이
 ## 5. 워크플로 2종
 
 ### `.github/workflows/ci.yml` (Tier 1, 자동)
-- on: `push`, `pull_request`
-- runner: `ubuntu-latest`
-- steps: PG + pgvector 설치 → `make PGCUVS_CPU_SHIM=1` → 데몬 기동 → `make installcheck` + `make test-unit` + isolation
+- on: `main`, `pr/**`, `design/**` push 및 `main` 대상 pull request
+- runner: `ubuntu-22.04`; 별도 `build-check` 잡에서 `make docs-contract-check`와 `make test-unit` 실행
+- `tier1-shim` 잡: PG16 + pgvector 설치 → `make PGCUVS_CPU_SHIM=1` 확장 및 ASAN 데몬 빌드 → 데몬 기동 → `make installcheck-tier1` (`REGRESS_TIER2_ONLY` 제외) + `make installcheck-isolation`; ccache 사용
 - 기존 `.sql` 스위트 대부분 그대로 재사용(BF recall@10=1.0은 shim과 동일, CAGRA recall assert는 `>=`라 exact가 통과, mode assert는 데몬 로직이 진짜 도니 통과)
 
 ### `.github/workflows/gpu.yml` (Tier 2, on-demand) — 구현 모델 (정정)
 - on: **`workflow_dispatch`만** (Actions UI "Run workflow" 버튼 = 쓰기권한자만). 코멘트/라벨
   자동 트리거는 fork-PR가 VM에서 임의 코드를 돌릴 위험이라 **비채택**(UI 버튼이 권한 게이트 내장).
-- 3-job 구조: **start-vm**(hosted, WIF 키리스 인증 → `gcloud instances start`) → **gpu-test**
+- 3-job 구조: **start-vm**(WIF 설정 시 hosted에서 `gcloud instances start`) → **gpu-test**
   (`[self-hosted, gpu, a100]` — VM 위 부팅-시작 러너가 `ubuntu`+conda로 실 `make installcheck`) →
-  **stop-vm**(hosted, `if: always()` → `gcloud instances stop`, 비용 누수 방지).
-- 보안: GCP 권한은 GitHub에 키로 두지 않고 **GCP의 WIF 신뢰정책**(repo 스코프)에 둠. self-hosted
-  러너는 트리거된 런 동안 VM이 켜진 시점만 온라인 → 상시 공격표면 없음. `environment: gpu` +
-  required reviewers로 VM 기동 전 사람 승인 게이트. 셋업: `docs/ci-gpu-setup.md`.
-- 비용은 버튼 누를 때만 발생. (초안의 `runner: [self-hosted, gpu]` 단일-잡 모델은 VM이 대부분
+  **stop-vm**(WIF 설정 시 hosted에서 `if: always()` → `gcloud instances stop`). WIF가 없으면 VM이 이미 켜져 있어야 하고 시작·종료 잡은 skip한다.
+- 보안: WIF 구성 시 GCP 권한은 GitHub에 키로 두지 않고 **GCP의 WIF 신뢰정책**(repo 스코프)에 둔다.
+  `environment: gpu`의 required reviewers는 **start-vm 잡**을 VM 기동 전에 승인받게 한다.
+  WIF가 없고 VM이 이미 켜져 있다면 러너는 그동안 온라인이며 이 승인 게이트를 거치지 않는다.
+  셋업: `docs/ci-gpu-setup.md`.
+- WIF 자동 시작·종료 경로의 VM 비용은 승인 후 기동부터 종료까지 발생한다. WIF 없이 이미
+  켜 둔 VM의 비용은 워크플로 버튼과 무관하게 발생한다. (초안의 `runner: [self-hosted, gpu]` 단일-잡 모델은 VM이 대부분
   꺼져 있고 IP가 바뀌는 비용통제 VM과 맞지 않아 위 hosted-제어 모델로 개정.)
 
 ## 6. 정직성 라벨(필수)

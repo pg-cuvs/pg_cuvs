@@ -7,8 +7,8 @@ reload되고 heap rebuild 없이 검색이 정상 동작하는지 확인한다.
 
 ## 1. 증상 (Symptoms)
 
-- `systemctl restart pg-cuvs-server` 후 검색 쿼리가 `WARNING: pg_cuvs_server unreachable`
-  또는 CPU fallback으로 빠진다.
+- `systemctl restart pg-cuvs-server` 후 검색 쿼리가 실행 중 연결 ERROR로 끝나거나
+  후속 계획에서 CPU 경로로 빠진다.
 - 재시작 후 journal에 `loaded index` 메시지가 없다.
 - 재시작 후 첫 검색이 기대값을 반환하지 않는다.
 - daemon이 비정상 종료(OOM killer, SIGKILL)된 뒤 소켓 파일이 남아 있다.
@@ -316,7 +316,8 @@ uid가 커널에 의해 확정되므로 이후 바꿔치기가 불가능하다. 
    uid로 설정한다.** 예: `SET cuvs.daemon_uid = 999;` 또는
    `postgresql.conf`에 `cuvs.daemon_uid = 999`. 기본값 `-1`은 검사를
    끄며(하위 호환), 소켓 owner가 기대와 다르면 backend는 connect를
-   거부하고 `CUVS_STATUS_UNAVAILABLE`로 CPU fallback한다(fail-closed).
+   거부한다. 계획 단계에서는 CPU 경로로 우회할 수 있지만, 이미 선택된 GPU scan의
+   실행 중 연결 실패는 해당 SELECT의 ERROR다.
    § 3. GUC reference의 `cuvs.daemon_uid` 참고.
 4. **소켓을 non-world-writable 디렉터리에 둔다 — 이것이 1차 완화책이다.**
    기본 경로 `/tmp/.s.pg_cuvs`는 `/tmp`가 sticky(`+t`) + world-writable인

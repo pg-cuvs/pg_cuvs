@@ -47,7 +47,7 @@ SELECT index_name, stale, stale_since, delta_rows, delta_generation,
  mg_cagra   | f     |          1 |                1 | gpu
 ```
 **→ `delta_search_mode=cpu`:** 원인 E → Step 4 (write 정합 / GPU delta path 회복)로  
-**→ `stale=t`:** write 발생 후 merge 대기 중 (정상 과도 상태)
+**→ `stale=t`:** GPU 인덱스 사용을 막는 상태. 원인을 확인하고 REINDEX한다.
 
 ```bash
 # 인덱스의 모든 sidecar (DROP 후엔 전부 사라져야 함)
@@ -98,8 +98,13 @@ rollback 내 DROP, 또는 `DROP EXTENSION CASCADE`가 AM을 먼저 제거하는 
 → Step 2 (artifact 수동 정리)로
 
 ### D. delta/tombstone/stale 의미
-INSERT/UPDATE(new) → `.delta`(pending vectors), DELETE/UPDATE(old) → `.tombstone`,
-기타 write → `.stale` 마커. 검색 시: sharded는 base shard fanout 결과 + **데몬 GPU
+AM별 경로가 다르다. CAGRA INSERT/UPDATE(new)는 먼저 데몬 `EXTEND`를
+시도하고, 실패하면 `.delta`에 append한다. flat INSERT/UPDATE는
+`EXTEND` 없이 `.delta`를 사용한다. IVF-PQ INSERT는 no-op이므로
+변경 후 재검색 정합에는 REINDEX가 필요하다. DELETE/UPDATE(old)는 VACUUM에서
+`.tombstone`으로 기록한다. delta/tombstone append 실패나 cap 도달 등
+보정 불가 상태는 `.stale` 마커로 CPU 재계획을 유도한다.
+검색 시 sharded CAGRA는 base shard fanout 결과 + **데몬 GPU
 delta cache**(3G.3, shard 0 GPU에 brute-force)를 병합해 `delta_merged=1`로 GPU에서
 처리; delta cache 불가(VRAM 부족/corrupt/generation mismatch)면 `delta_merged=0`으로
 **backend CPU delta merge fallback**. tombstone은 backend가 snapshot-aware로 global
@@ -162,10 +167,15 @@ no artifacts (clean)
 ls /tmp/cuvs_indexes/<db>_<idx>.*
 ```
 
-```bash
-sudo rm -f /tmp/cuvs_indexes/<db>_<idx>.*
-sudo systemctl restart pg-cuvs-server
+가능하면 해당 데이터베이스에서 카탈로그 대조를 거치는 GC를 실행한다:
+
+```sql
+SELECT * FROM pg_cuvs_gc_orphans();
+SELECT * FROM pg_cuvs_gc_orphans(true);
 ```
+
+수동 삭제가 필요하면 데몬을 중지하고, DB OID·인덱스 OID가 카탈로그에
+없는지 확인한 뒤 root 권한의 `find`로 해당 정확한 파일명만 삭제한다.
 
 **기대:** 재시작 후 `pg_stat_gpu_shards` 조회 시 해당 인덱스 행 없음  
 **→ 성공:** zombie 없음 확인 → 완료  

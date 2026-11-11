@@ -75,9 +75,12 @@ NVCC_FLAGS += -DRAFT_SYSTEM_LITTLE_ENDIAN=1
 
 당장 마이그레이션 필요 없음. 경고 무시 가능.
 
-## CAGRA serialize SIGSEGV (미해결)
+## CAGRA serialize SIGSEGV (과거 장애, 해결됨)
 
-26.04의 `cuvs::neighbors::cagra::serialize`는 호출 시 SIGSEGV.
+아래는 당시 관찰과 검토한 대응의 기록이다. 현재 원인과 수정 내역은
+[cuvs-serialize-sigsegv.md](failures/cuvs-serialize-sigsegv.md)에 있다.
+
+당시 26.04 환경에서 `cuvs::neighbors::cagra::serialize` 호출 중 SIGSEGV를 관찰했다.
 
 **관찰된 동작**:
 - 파일은 생성됨 (0바이트)
@@ -196,7 +199,8 @@ sparams.itopk_size = itopk;
 
 ## cuVS 버전 다운그레이드 절차 (필요할 경우)
 
-26.04로 Phase 1 완전 검증됨 — 일반적으론 다운그레이드 불필요. 새 버전에서 회귀 발견 시 fallback용:
+아래는 레거시 GCP 환경의 당시 대안 명령이다. 현재 Brev bootstrap의
+`/opt/miniforge3` 경로나 패치 SDK 빌드 절차에 그대로 적용하지 않는다.
 
 ```bash
 ssh ubuntu@<IP> "

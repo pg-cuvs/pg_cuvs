@@ -23,6 +23,10 @@ file exists so a link that lands directly on a CSV does not lose the context.
 | `adr079_3o_recall_after80.csv` | 2026-07-23 | same | wiki_all_1M | Brev A100 | **canonical** — D-wedge after #80 |
 | `adr079_3o_recall_tail.csv` | 2026-07-24 | same | wiki_all_1M | Brev A100 | **canonical** — low-selectivity tail (pre-filter recall collapse) |
 | `adr079_3o_recall_crossover.csv` | 2026-07-24 | same | wiki_all_1M | Brev A100 | **canonical** — D-wedge/stream_bf crossover (~0.004) |
+| `adr079_3o_recall_2ndhost_dgx80.csv` | 2026-08-04 | same | wiki_all_1M | second DGX A100 host | **replication** — selectivity 0.002–0.008; keep host-specific crossover separate from the first-host `~0.004` |
+| `adr079_3o_correlation.csv` | 2026-08 | same | wiki_all_1M | recorded in correlation study | **historical pre-#133** — random/mixed/spatial/anti fixture; pre-filter anti collapse, not current routing |
+| `adr079_3o_correlation_anchor.csv` | 2026-08 | same | wiki_all_1M | recorded in correlation study | **historical pre-#133** — random correlation anchor at selectivity 0.001–0.5 |
+| `adr079_3o_correlation_hisel.csv` | 2026-08 | same | wiki_all_1M | recorded in correlation study | **historical pre-#133** — high-selectivity anti/random/spatial fixtures |
 | `adr079_3paths.csv` | 2026-07-24 | same | wiki_all_1M | Brev A100 | superseded by `_verified` |
 | `adr079_3paths_verified.csv` | 2026-07-24 | same | wiki_all_1M | Brev A100 | **canonical** — per-query route attribution |
 | `pg_cuvsbench_1m_legacy.csv` | 2026-07-16 | cuvs-bench (pg backend), ext 0.5.0 | Cohere wiki-en, 1M×1024 | A100-40GB | **legacy** (superseded by wiki_all_1M canonical rows above; `index_bytes=0` defect, fixed in code by #75/#79 — see below) |

@@ -22,6 +22,7 @@ product surface (what it *is* now) start at [ARCHITECTURE.md](../ARCHITECTURE.md
 | [ci-strategy.md](ci-strategy.md) | 2-tier CI design (ADR-067) |
 | [ops-gpu-playbook.md](ops-gpu-playbook.md) | GPU operations reference: tuning, MIG, monitoring, orphan cleanup |
 | [refactor-audit.md](refactor-audit.md) | Complexity / orphan-code audit + refactor plan (2026-06-12) |
+| [pr-drafts/I3-B.md](pr-drafts/I3-B.md) | Historical I3-B PR draft; implemented interfaces belong to the current reference |
 
 ## Naming
 

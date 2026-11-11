@@ -1,6 +1,6 @@
 # pg_cuvs Architecture
 
-> **Current-state reference (SSOT).** This document describes how pg_cuvs works *as built*.
+> **Current-state reference (SSOT), source-checked at `ae818ad0` (2026-11-11).** This document describes how pg_cuvs works *as built*.
 > For the user-facing surface (GUCs, reloptions, SQL functions, views) see
 > [docs/reference.md](docs/reference.md). For *why* each decision was made see
 > [design/decisions.md](design/decisions.md) (ADRs). For the *history* of how each phase was
@@ -22,8 +22,8 @@ Invariants that shape everything below:
   run in PostgreSQL.
 - **The GPU never owns heap tuples.** The sidecar returns candidate TIDs + distances; the
   backend resolves those to visible rows.
-- **Backends never create a CUDA context.** A single sidecar daemon (`pg_cuvs_server`) owns the
-  one CUDA context and all VRAM-resident indexes.
+- **Backends never create a CUDA context.** A sidecar daemon (`pg_cuvs_server`) owns per-device
+  CUDA resources and the GPU index registry shared by backend sessions.
 - **`CREATE INDEX USING cagra` is durable-or-nothing.** A successful build means the GPU build
   *and* the on-disk persistence both succeeded.
 
@@ -34,18 +34,19 @@ Invariants that shape everything below:
 | Component | Process | Source | Owns |
 |-----------|---------|--------|------|
 | Extension `.so` | each PostgreSQL backend | `src/pg_cuvs.c` | Index AM handlers (`cagra`, `flat`, `ivfpq`, `pg_cuvs_hnsw`), planner cost hook, `set_rel_pathlist_hook` (D-wedge + transient BF `CuvsTransientBF`), GUCs, reloptions, SQL functions, object-access (DROP) hook |
-| Sidecar daemon | standalone `pg_cuvs_server` | `src/pg_cuvs_server.c` | The CUDA context, VRAM-resident index registry, build/search/evict/reload, warmup pool, GCS upload |
+| Sidecar daemon | standalone `pg_cuvs_server` | `src/pg_cuvs_server.c` | Per-device CUDA resources, GPU index registry, build/search/evict/reload, warmup pool, GCS upload |
 | Compaction bgworker | PostgreSQL background worker | `src/pg_cuvs_compaction.c` | Phase 4C auto-`REINDEX CONCURRENTLY` when delta growth crosses a threshold |
 | IPC client | linked into the backend | `src/cuvs_ipc.c` / `.h` | UDS framing, shm/memfd payload handoff, interruptible waits |
 | cuVS wrapper | linked into the daemon | `src/cuvs_wrapper.cu` | C++ bridge to cuVS: CAGRA build/search/serialize, IVF-PQ, HNSW `from_cagra()` |
-| HNSW export | extension + daemon | `src/hnsw_export.c` | CAGRA→pgvector-HNSW conversion, CPU HNSW search |
+| HNSW export | extension; SDK builder in daemon | `src/hnsw_export.c`, `src/cuvs_wrapper.cu` | Import private build files or an existing CAGRA graph into pgvector-compatible PostgreSQL index pages |
 | Corpus builder | extension | `src/cuvs_build_corpus.c` | Tiered build corpus (memfd / shm / heap) + `SCM_RIGHTS` fd passing (ADR-057) |
 | Object store | daemon | `src/cuvs_objstore.c` | GCS client (curl), manifest JSON, upload/download, SHA256 verification |
 | Shared utilities | both | `src/cuvs_util.c` (PG/CUDA-free) | Circuit-breaker FSM, TID encode/decode, `.tids` header magic/CRC32, latency histogram |
 
-The extension and the daemon **never share memory directly** and the daemon has **no catalog
-access** — it is a pure sidecar. They communicate only over the IPC channel (§4). This is the
-root cause of several deliberate designs: orphan reconciliation (§7), fail-closed artifact
+The extension and daemon have separate address spaces and do not share PostgreSQL
+internal memory or catalog access. They explicitly map shared payloads through named
+shared memory or passed file descriptors (§4). This is the
+root cause of several deliberate designs: orphan reconciliation (§11), fail-closed artifact
 validation (§6), and the split between daemon-sourced and backend-sourced statistics
 (see [docs/reference.md](docs/reference.md) observability views).
 
@@ -75,9 +76,10 @@ backend (cuvs_ambuild)                         daemon (handle_build)
   on error: ereport(ERROR) → catalog rollback
 ```
 
-The build of a single index is measured alone (before any co-resident index) to keep VRAM
-accounting clean. Parallel builds (ADR-059, `handle_build_multi`) have the leader receive N
-worker partials via named shm and stream them straight to the GPU.
+Parallel builds (ADR-059, `handle_build_multi`) have the leader collect N worker
+partial descriptors; the daemon streams their mapped corpora to the GPU. Admission
+accounts for resident indexes and pending builds (§6). Measuring an index in isolation
+is a benchmark methodology, not a runtime requirement.
 
 ### 3.1a Build (`CREATE INDEX ... USING flat`)
 
@@ -114,10 +116,28 @@ Key differences from cagra:
 - DROP: `cuvs_object_access` matches the flat index OID and calls `free_main_bf_cache` to release
   the resident BF VRAM before removing artifacts.
 
-### 3.1b Transient no-index brute force (`cuvs.gpu_bruteforce`)
+### 3.1b GPU-built CPU HNSW (`USING pg_cuvs_hnsw`)
 
-When `cuvs.gpu_bruteforce = on`, the extension's `set_rel_pathlist_hook` fires for every base
-relation scan. The hook runs two independent sub-hooks:
+A source-less build scans/spools the heap into private regular files and sends
+`BUILD_HNSW_FILE` (op 23). The daemon produces a temporary hnswlib-format file;
+`hnsw_export.c` imports it into the PostgreSQL index relation and records the
+build-policy receipt. No persistent CAGRA registry entry is created for this
+path. `build_algo=auto` selects a tiny/resident path or ACE on disk according to
+its supported route and budgets; explicit `ivf_pq` does not spill to ACE.
+
+With `source='existing_cagra'`, the exporter instead reuses that index's graph
+on the same table. Explicit non-auto `build_algo` cannot be combined with source
+reuse. The resulting index delegates search and maintenance to pgvector's HNSW
+AM; serving it does not require the daemon. Its pages are PostgreSQL index
+storage, not the optional `.hnsw` sidecar in §5. See
+[HNSW build options](docs/hnsw-build-options.md) for page-size limits, modes,
+precision/SDK guards, budgets, and `pg_cuvs_hnsw_build_info()`.
+
+### 3.1c Transient no-index brute force (`cuvs.gpu_bruteforce`)
+
+The extension's `set_rel_pathlist_hook` runs two independent sub-hooks for base
+relations. `cuvs.gpu_bruteforce = on` enables the transient branch; it is not the
+switch for D-wedge:
 
 - **`cuvs_dwedge_add_path`** (ADR-063) — adds the D-wedge filtered CustomScan path for indexed
   relations.
@@ -142,7 +162,7 @@ executor (CuvsTransientBF ExecCustomScan)          daemon (handle_search_bf_tran
   IPC SEARCH_BF_TRANSIENT (op 22) ────────────▶  non-evicting VRAM admission:
                                                     never evicts a resident flat/cagra index
                                                     corpus too large → OOM_FALLBACK → backend ERROR
-                                                  cuvs_brute_force_search (exact, recall=1.0)
+                                                  cuvs_brute_force_search (exhaustive at selected precision)
                                                   no IndexEntry created
   reply: top-k (tid, dist) ◀──────────────────   reply
   heap recheck (MVCC, ACL)
@@ -175,7 +195,7 @@ planner (cuvsamcostestimate)
          (loads <index_dir>/cuvs_hw_profile sidecar — no CUDA/IPC), else legacy
          k-dominant constants (cuvs.enable_phys_cost gate / probe_status bits)
 
-executor (cuvs_amgettuple)            daemon (handle_search)
+executor (cuvs_gettuple)            daemon (handle_search)
   query vector → shm                  find index (load on miss; cache hit/miss/reload counters)
   IPC SEARCH ─────────────────────▶   gate: stale / dim / metric mismatch
   (interruptible wait, Phase 3S)      [sharded] lock-free snapshot → parallel fanout → merge
@@ -200,7 +220,7 @@ in `pg_stat_gpu_fallback`; daemon replies are recorded in `pg_stat_gpu_search`.
 ## 4. IPC
 
 - **Transport:** Unix domain socket, default `/tmp/.s.pg_cuvs` (GUC `cuvs.socket_path`).
-- **Command frame:** a fixed-size `CuvsCmdFrame` (`src/cuvs_ipc.h`) carrying op code, db/index
+- **Command frame:** global protocol v5, a fixed-size `CuvsCmdFrame` (`src/cuvs_ipc.h`) carrying op code, db/index
   OID, `k`, metric, dim, `n_vecs`, a `shm_key` for the payload, plus per-feature fields
   (shard config, search mode, BF precision, build params, filter TIDs, IVF-PQ params, extend
   chunk size).
@@ -210,11 +230,18 @@ in `pg_stat_gpu_fallback`; daemon replies are recorded in `pg_stat_gpu_search`.
   DROP_INDEX, EXPORT_ADJACENCY, EXPORT_HNSW_SHM, SEARCH_BATCH, BUILD_IVFPQ, SEARCH_IVFPQ,
   EXTEND, COMPACT, SEARCH_STREAM_BF, **BUILD_FLAT** (op 21, vectors-only build for the `flat`
   AM — no graph), **SEARCH_BF_TRANSIENT** (op 22, transient no-index corpus BF — no IndexEntry,
-  non-evicting VRAM admission, handler `handle_search_bf_transient`), plus test-only
-  VRAM-injection ops.
+  non-evicting VRAM admission, handler `handle_search_bf_transient`), private
+  **BUILD_HNSW_FILE** (23), server/pool settings (24/25), load/unload/pin and
+  status/reclaim operations (30–37), and HNSW/CAGRA preflight (40/41).
+  See `src/cuvs_ipc.h` for the full list. Synthetic build/extend OOM injection
+  dispatch is compiled only with `CUVS_TEST_HOOKS`; use the separate test daemon.
 - **Reply status** (`CUVS_STATUS_*`): OK, ERROR, OOM_FALLBACK, NOT_FOUND, UNAVAILABLE,
-  BUILD_FAILED, PERSIST_FAILED, DIM_MISMATCH, METRIC_MISMATCH, STALE, NO_VECTORS, CANCELED.
-  Each maps to a specific backend reaction (error vs. CPU fallback vs. reload-and-retry).
+  BUILD_FAILED, PERSIST_FAILED, DIM_MISMATCH, METRIC_MISMATCH, STALE, NO_VECTORS,
+  CANCELED, PROTO_MISMATCH, and HNSW_RESIDENT_BUDGET_EXCEEDED. Admission replies
+  also carry structured rejection/NOTICE fields. The caller determines the reaction:
+  scan-time STALE/OOM/connection failures raise errors, while future plans can
+  choose CPU paths. Deploy both binaries together; HNSW op 23 additionally checks
+  its own payload v5 and returns a stored build-policy/ACE readback receipt.
 - **Interruptibility (Phase 3S):** the backend's reply wait is a `poll()` loop with a wait
   callback, so `statement_timeout` / query-cancel break a long GPU search (~sub-second) instead
   of blocking indefinitely. The daemon ignores `SIGPIPE` to survive mid-reply client disconnect.
@@ -230,7 +257,7 @@ states (stale / delta / tombstone). All artifacts live under `index_dir` named
 | Suffix | Holds | Written by | Notes |
 |--------|-------|-----------|-------|
 | `.cagra` | CAGRA graph (cuVS binary) | build, eviction | the resident index |
-| `.tids` | versioned header (`TIDS` magic, version, n_vecs, dim, metric, body CRC32) + `uint64_t[]` TID map | build | validated on every load; pre-1.0 headerless files are rejected (REINDEX) |
+| `.tids` | versioned header (`TIDS` magic, version, n_vecs, dim, metric, body CRC32) + `uint64_t[]` TID map | build | validated on every load; headerless files are rejected (REINDEX) |
 | `.vectors` | full corpus `float32[n][dim]` (+ `VECS` header) | build (optional for `cagra`; **required** for `flat`) | required by `flat` AM, brute-force mode, and stream-BF; `flat` indexes reload from this file on daemon restart |
 | `.delta` | pending inserts: `DELT` header + `(tid, vec[dim])` rows | `aminsert` (append) | lazily loaded into a GPU BF delta cache; generation tied to `.tids` CRC; cleared by REINDEX |
 | `.tombstone` | deleted TIDs: `TOMB` header + records | `ambulkdelete` (append) | snapshot-aware filter at search; cleared by REINDEX |
@@ -238,7 +265,8 @@ states (stale / delta / tombstone). All artifacts live under `index_dir` named
 | `.shards` | shard manifest (`SHRS` header + per-shard records) | sharded build | written **last** = commit marker; absent ⇒ fail-closed |
 | `.sNNN.cagra` | one CAGRA artifact per shard | sharded build | loaded together with the manifest |
 | `.relfilenode` | heap relfilenode identity | build | GCS warmup heap-compat gate |
-| `.hnsw` | pgvector-format HNSW | `pg_cuvs_hnsw` build / optional export | served by pgvector, not the daemon |
+| `.hnsw` | serialized hnswlib CPU sidecar | optional CAGRA export | searched by the daemon when `cuvs.cpu_hnsw_fallback=on`; distinct from PostgreSQL index pages |
+| `.ivfpq` | compressed IVF-PQ index | IVF-PQ build/eviction | used with its `.tids`; incremental INSERT is not supported |
 
 **Serialization is atomic:** tmp file → `fsync` → `rename` → `fsync(dir)`. For sharded indexes the
 `.shards` manifest is the commit marker, so a half-written shard set never loads.
@@ -249,30 +277,47 @@ cold indexes (those with a `.relfilenode` marker but no local `.cagra`) for back
 
 ---
 
-## 6. VRAM self-accounting and eviction
+## 6. Memory admission, accounting, and eviction
 
-The daemon tracks its own VRAM use (`Σ per-index estimate`) rather than trusting
-`cudaMemGetInfo`, which under-reports because the CUDA async mempool caches freed memory
-(ADR-065). The budget defaults to a sane fraction of detected VRAM (not unlimited) and is
-capped by the daemon's `--max-vram-mb` flag; per-GPU budgets are tracked separately (Phase 3E).
-A non-persistent runtime override exists for testing (`pg_cuvs_set_vram_budget()`), but the
-daemon flag is the supported configuration surface.
+The daemon combines several budgets rather than treating a single free-memory
+number as a complete capacity estimate:
 
-Allocation is a three-tier policy:
+- The logical index budget defaults to **90% of device VRAM** and can be set with
+  `--max-vram-mb`; resident indexes and pending builds contribute to accounting.
+- The RMM pool defaults to an initial **512 MiB per usable GPU**, with a maximum
+  of **50% of device VRAM**. `--rmm-pool-mb=0` disables the pool. Pool quota and
+  logical index budget are distinct controls.
+- Build admission includes estimated final/scratch needs. The current
+  `--rmm-scratch-permille` default is **9593**, from the recorded Q1 maximum;
+  `--rmm-build-headroom-permille` defaults to **150**. AR8 refuses an insufficient
+  pool-capacity premise before eviction while another pool allocator is active.
+- A physical-free preflight runs before CAGRA single/multi/shard builds,
+  IVF-PQ, HNSW-file builds, and compaction. It refuses when raw physical free
+  memory is below **32 MiB**, including when idle pool memory still appears
+  reusable. The rejection carries reason `PHYS`, a retryable SQL error/NOTICE,
+  and daemon counters. The SDK can allocate memory outside the pool.
 
-1. **Preflight** — does `budget − used ≥ needed` on the target device? If yes, proceed.
-2. **LRU eviction** — evict the least-recently-searched resident index on that device:
-   serialize it to disk, free the cuVS handle, mark it non-resident. Sharded indexes and indexes
-   with in-flight searches are skipped. **If the serialize fails, eviction aborts (fail-closed)**
-   — a `persist_failures` counter increments rather than dropping data.
-3. **CPU fallback** — if still insufficient after evicting everything evictable, reply
-   `OOM_FALLBACK` and let the backend use the CPU path.
+These checks are samples and estimates, **not reservations or a full peak-memory
+bound**. Other processes, concurrency, and later SDK allocations can still exhaust
+memory. See [memory accounting and admission](docs/reference.md#rmm-quota-and-memory-accounting)
+for controls, reason codes, exclusions, and status fields.
 
-Hit/miss/eviction/reload/persist-failure counters are exposed per GPU in `pg_stat_gpu_cache`.
+When the applicable admission policy permits it, LRU reclamation serializes an
+eligible resident index, frees its handle, and leaves artifacts for reload.
+Pinned, in-flight, and unsupported sharded candidates are not ordinary eviction
+victims. A persistence failure aborts eviction and increments `persist_failures`.
+`pg_cuvs_unload/load/pin/unpin`, reclaim controls, `pg_cuvs_index_status()`,
+`pg_cuvs_memory_status()`, and `pg_cuvs_build_status()` expose the current state;
+see the reference for privileges and request-specific policy.
 
-**Fail-closed contracts** guard every load: `.tids` CRC mismatch, `.shards` geometry mismatch,
-GCS manifest SHA256 mismatch, heap-incompatible `.relfilenode`, and cuVS-version skew in the
-manifest all *reject* the index rather than serve possibly-wrong results.
+An `OOM_FALLBACK` reply does not restart an executing SELECT on the CPU. The
+backend reports an error and records the failure for later planner/circuit-breaker
+routing. Build rejection also aborts the DDL. HNSW `auto` has a separate,
+explicitly reported resident-to-ACE-disk policy (§3.1b).
+
+Hit/miss/eviction/reload/persist-failure counters remain available per GPU in
+`pg_stat_gpu_cache`. Load validation checks `.tids` CRC, shard geometry, GCS
+checksums, heap identity, and manifest versions before accepting artifacts.
 
 ---
 
@@ -297,32 +342,42 @@ recall through the global merge. Per-shard placement and stats are in `pg_stat_g
 
 ## 8. GCS snapshot and multi-node warmup (Phase 3C/3D)
 
-When `cuvs.snapshot_uri` is set, a successful build spawns a detached thread that uploads the
+When the daemon is started with `--snapshot-uri`, a successful build spawns a detached thread that uploads the
 artifacts and writes `manifest.json` **last** (commit marker). The manifest records pg_cuvs and
 cuVS versions, OIDs, `relfilenode`, base generation, metric, dim, vector count, and per-file
 SHA256.
 
 A daemon serving a different node downloads on cold-miss: a fixed warmup thread pool
-(`cuvs.warmup_threads`) pulls from GCS, verifies SHA256, checks that the manifest `relfilenode`
+(`--warmup-threads`) pulls from GCS, verifies SHA256, checks that the manifest `relfilenode`
 matches the local heap (a restored/rebuilt heap changes it → REINDEX required), checks cuVS-version
-compatibility, then loads. The daemon opens its socket immediately and does **not** block on
-warmup; queries to a still-cold index fall back to CPU until hydration completes. Authentication
+compatibility, then loads. Background GCS hydration runs asynchronously; socket
+readiness still follows startup initialization and local loading. A cold index
+can be avoided at plan time; a scan that already selected it can fail and require
+a new query. Authentication
 uses the GCP instance metadata service, falling back to a service-account key
-(`cuvs.gcs_key_file`).
+(`--gcs-key-file`). The similarly named PostgreSQL GUCs are not automatically
+forwarded to this standalone process: configure `--snapshot-uri`, `--cluster-id`,
+`--gcs-key-file`, and `--warmup-threads` in its launch command/service. See the
+[GCS playbook](docs/playbooks/gcs-snapshot-ops.md).
 
 ---
 
 ## 9. Write path and correctness
 
-PostgreSQL writes don't touch the VRAM index directly. Instead:
+Write behavior depends on the access method:
 
-- **INSERT/UPDATE** appends `(tid, vector)` to `.delta`. At search time the base CAGRA result is
-  merged (over-fetched) with an exact search over the delta — on the GPU when a resident delta
-  cache matches the index generation, otherwise on the CPU. `cuvs.delta_search` (`auto`/`cpu`/`gpu`)
-  and `cuvs.max_delta_rows` (cap → CPU reroute) govern this. Phase 3Q can instead apply
-  `cuvsCagraExtend` in place.
-- **DELETE/VACUUM** appends dead TIDs to `.tombstone`; the daemon filters them out at search time,
-  over-fetching to recover candidates lost to the filter.
+- **CAGRA INSERT/UPDATE** first attempts daemon `EXTEND`. If that fails, the
+  backend appends `(tid, vector)` to `.delta`. A scan merges base candidates with
+  exact delta search on the GPU when a generation-matching cache is available,
+  otherwise on the CPU, according to `cuvs.delta_search`.
+- **Flat INSERT/UPDATE** uses the delta append/merge path; it does not extend a
+  CAGRA graph. **IVF-PQ INSERT is a no-op** and requires rebuilding after loads
+  or vector changes. It does not inherit the CAGRA/flat freshness mechanism.
+- **VACUUM** appends dead TIDs to `.tombstone`; scan-side filtering observes the
+  snapshot and over-fetches candidates. The same `cuvs.max_delta_rows` setting
+  caps each delta and tombstone file. Reaching the tombstone cap can mark an
+  index stale before compaction, even during normal autovacuum. `ANALYZE` alone
+  does not run tombstone compaction.
 - **Fallback marker** — if the delta/tombstone append fails, the path marks the index `.stale`,
   and the planner cost hook routes new plans to CPU until a REINDEX clears it.
   The backend immediately invalidates cached plans depending on the parent table;
@@ -355,8 +410,9 @@ Non-obvious choices a reader will otherwise rediscover the hard way. Rationale i
   post-filter (a false-done caught by ADR-064 work); the new mode is now asserted in tests.
 - **Fail-closed everywhere (ADR-016/019/024/047/066).** Delta cap, `.tids` CRC, `.shards`
   geometry, GCS SHA256, heap relfilenode, and cuVS-version gates all reject rather than degrade.
-- **VRAM self-accounting (ADR-065).** Track allocations directly; don't trust mempool-cached
-  `cudaMemGetInfo`. Sane default budget instead of unlimited.
+- **Memory accounting and physical preflight.** Logical index usage, pool quota,
+  pending reservations, and raw device free memory answer different questions (§6).
+  None alone guarantees that a later SDK allocation will succeed.
 - **CPU-reference shim CI (ADR-067).** `src/cuvs_wrapper_shim_cpu.c` lets the extension build and
   pass `make installcheck` with no GPU/CUDA, so every PR runs Tier-1 in CI; real-GPU Tier-2 runs
   on demand.
@@ -380,9 +436,11 @@ Non-obvious choices a reader will otherwise rediscover the hard way. Rationale i
 
 ## 11. Boundaries and honest limitations
 
-- **pg_cuvs is not a WAL-logged mutable native index.** The comparison baseline is a static/batch
-  index plus a separate freshness path (delta/tombstone/REINDEX). This is stated in every public
-  artifact.
+- **GPU-serving sidecars are outside PostgreSQL WAL.** CAGRA, flat, and IVF-PQ
+  artifacts have their own persistence/freshness paths. `pg_cuvs_hnsw` instead
+  imports PostgreSQL index pages and WAL-logs page writes for logged relations;
+  its CPU search/maintenance delegates to pgvector. Do not apply the sidecar
+  backup limitations to the HNSW relation's page storage.
 - **The circuit breaker is process-local**, not server-wide (ADR-011 correction): each backend
   tracks and resets its own breaker; `pg_cuvs_reset_circuit` affects the calling session's view.
 - **The default `index_dir` (`$PGDATA/cuvs_indexes`) sits inside the data directory**, so

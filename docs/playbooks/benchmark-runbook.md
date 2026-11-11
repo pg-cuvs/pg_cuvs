@@ -209,8 +209,8 @@ make gpu-bench N=1000000 DIM=384
 make gpu-bench N=100000  DIM=1536
 make gpu-bench N=1000000 DIM=1536
 
-# 결과 집계 (bench/aggregate.py)
-python3 bench/aggregate.py bench/results/
+# ann-benchmarks 결과 집계 (VM의 cuvs_bench Python 사용 후 로컬 복사)
+make gpu-anbench-agg
 ```
 
 **결과 기록 형식 (`bench/results/*.csv`):**
@@ -278,8 +278,8 @@ ls -lh design/bench_*.log 2>/dev/null
   `cuvs.k` 값 확인 — 기본 100 미만이면 recall 급락. `cuvs.k=200` 시도.
 - GT recall이 모두 0.0000: GT 파일이 배치 크기 불일치로 오염됐을 가능성 →
   `build_gt.py` / `gt_faiss.py --regen`으로 GT 재생성.
-- 50M×384 벤치가 데몬 교착으로 실패: 단일 노드 한계(§12 확인됨).
-  A100-80GB × 2(160 GB VRAM) 이상 필요. `capacity-planning.md` 참조.
+- 50M×384 벤치가 데몬 교착으로 실패: §12의 해당 구성에서 실패한 결과다.
+  다른 GPU 구성의 최소 요건은 미측정이다. `capacity-planning.md` 참조.
 - `make gpu-cohere` 실행 전 `fetch_dataset.py`가 없거나 데이터셋 미다운로드:
   `bench/legacy/anbench/fetch_dataset.py` 먼저 실행.
 

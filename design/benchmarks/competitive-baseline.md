@@ -1,5 +1,10 @@
 # Competitive Baseline Plan — pgvectorscale / VectorChord vs pg_cuvs
 
+> **Status: Historical plan.** 아래 버전·설치 명령·VM 운영 절차는 당시 계획이며
+> 현재 설치 가능성 또는 실행 환경을 검증한 지침이 아니다. 측정으로 확인된 비교는
+> [`BENCHMARK.md`](../../BENCHMARK.md)와
+> [`bench/results/README.md`](../../bench/results/README.md)에서 구분한다.
+
 > 목적: **"pgvectorscale / VectorChord와 비교해도 pg_cuvs가 의미 있는 구간이 남는가"**를
 > Pareto frontier로 숫자화한다.
 > 상위 컨텍스트: [[crossover-methodology.md]] §11 (HNSW vs CAGRA 1차 crossover 완료).

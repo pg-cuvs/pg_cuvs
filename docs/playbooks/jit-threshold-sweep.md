@@ -53,7 +53,7 @@ SHOW jit_optimize_above_cost;
 ```sql
 EXPLAIN (ANALYZE, VERBOSE, BUFFERS)
   SELECT id FROM bench_1m_384
-  ORDER BY v <-> '[0.1,0.2,...]'::vector(384)
+  ORDER BY v <-> array_fill(0.1::real, ARRAY[384])::vector(384)
   LIMIT 10;
 ```
 
@@ -109,7 +109,7 @@ JIT이 트리거되는 구조적 원인:
 ```sql
 EXPLAIN (ANALYZE, VERBOSE, BUFFERS)
   SELECT id FROM bench_1m_384
-  ORDER BY v <-> '[0.1,0.2,...]'::vector(384)
+  ORDER BY v <-> array_fill(0.1::real, ARRAY[384])::vector(384)
   LIMIT 10;
 ```
 
@@ -141,7 +141,7 @@ SHOW jit_above_cost;
 ```sql
 EXPLAIN (ANALYZE, BUFFERS)
   SELECT id FROM bench_1m_384
-  ORDER BY v <-> '[0.1,0.2,...]'::vector(384)
+  ORDER BY v <-> array_fill(0.1::real, ARRAY[384])::vector(384)
   LIMIT 10;
 ```
 
@@ -161,7 +161,7 @@ baseline p50 / p95 / p99 값을 메모한 뒤 Step 2로
 SET jit_above_cost = 1000000;
 EXPLAIN (ANALYZE, BUFFERS)
   SELECT id FROM bench_1m_384
-  ORDER BY v <-> '[0.1,0.2,...]'::vector(384)
+  ORDER BY v <-> array_fill(0.1::real, ARRAY[384])::vector(384)
   LIMIT 10;
 ```
 
@@ -189,7 +189,7 @@ Planning/Execution time과 JIT: 섹션 유무를 기록한다.
 SET jit_above_cost = 10000000;
 EXPLAIN (ANALYZE, BUFFERS)
   SELECT id FROM bench_1m_384
-  ORDER BY v <-> '[0.1,0.2,...]'::vector(384)
+  ORDER BY v <-> array_fill(0.1::real, ARRAY[384])::vector(384)
   LIMIT 10;
 ```
 
@@ -212,7 +212,7 @@ Planning/Execution time과 JIT: 섹션 유무를 기록한다.
 SET jit_above_cost = 100000000;
 EXPLAIN (ANALYZE, BUFFERS)
   SELECT id FROM bench_1m_384
-  ORDER BY v <-> '[0.1,0.2,...]'::vector(384)
+  ORDER BY v <-> array_fill(0.1::real, ARRAY[384])::vector(384)
   LIMIT 10;
 ```
 
@@ -287,7 +287,7 @@ ssh $VM_SSH_HOST "psql -d postgres -c 'SHOW jit_above_cost;'"
 
 ## 5. 검증 체크리스트
 
-- [ ] `EXPLAIN (ANALYZE, BUFFERS) SELECT id FROM bench_1m_384 ORDER BY v <-> '[0.1,0.2,...]'::vector(384) LIMIT 10;` → 기대 출력: `JIT:` 섹션 없거나 `Timing: no`
+- [ ] `EXPLAIN (ANALYZE, BUFFERS) SELECT id FROM bench_1m_384 ORDER BY v <-> array_fill(0.1::real, ARRAY[384])::vector(384) LIMIT 10;` → 기대 출력: `JIT:` 섹션 없거나 `Timing: no`
 - [ ] p50/p95/p99 재측정 → 기대 출력: baseline 대비 p95 스파이크 없고 동등하거나 개선됨
 - [ ] `SHOW jit_above_cost;` → 기대 출력: 결정된 threshold 값 (예: `10000000`)
 - [ ] 재시작 후 설정 유지 확인:

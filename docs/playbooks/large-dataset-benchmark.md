@@ -13,7 +13,7 @@ phase-record.md §5 참조.
 
 - Phase 1.5 완료 기준으로 1M/1536d 이상 벤치마크가 필요할 때.
 - `EXPLAIN (ANALYZE)`에 `JIT:` 섹션이 나타나 latency variance가 의심될 때.
-- VRAM 예산(`cuvs.max_vram_mb`) 또는 `--max-vram-mb` 값을 결정해야 할 때.
+- VRAM 예산(`--max-vram-mb`)을 결정해야 할 때.
 
 ---
 
@@ -160,7 +160,7 @@ CREATE TABLE bench_10k_384 (id bigint, v vector(384));
 INSERT INTO bench_10k_384
   SELECT i,
     (SELECT array_agg(random()::float4)::vector(384)
-     FROM generate_series(1,384))
+     FROM generate_series(1,384) WHERE i IS NOT NULL)
   FROM generate_series(1, 10000) i;
 
 -- Medium: 1M x dim=384  (VM에서 직접 실행 권장)
@@ -168,7 +168,7 @@ CREATE TABLE bench_1m_384 (id bigint, v vector(384));
 INSERT INTO bench_1m_384
   SELECT i,
     (SELECT array_agg(random()::float4)::vector(384)
-     FROM generate_series(1,384))
+     FROM generate_series(1,384) WHERE i IS NOT NULL)
   FROM generate_series(1, 1000000) i;
 ```
 
@@ -198,14 +198,14 @@ ssh $VM_SSH_HOST "ls -lh /tmp/cuvs_indexes/"
 -- cold planning: 새 세션에서 첫 번째 EXPLAIN
 EXPLAIN (ANALYZE, BUFFERS)
   SELECT id FROM bench_1m_384
-  ORDER BY v <-> '[0.1,0.2,0.3]'::vector(384)
+  ORDER BY v <-> array_fill(0.1::real, ARRAY[384])::vector(384)
   LIMIT 10;
 -- "Planning Time", "Execution Time", "JIT:" 섹션 여부 기록
 
 -- warm planning: 같은 세션, 두 번째 실행
 EXPLAIN (ANALYZE, BUFFERS)
   SELECT id FROM bench_1m_384
-  ORDER BY v <-> '[0.1,0.2,0.3]'::vector(384)
+  ORDER BY v <-> array_fill(0.1::real, ARRAY[384])::vector(384)
   LIMIT 10;
 ```
 
@@ -227,8 +227,17 @@ ssh $VM_SSH_HOST "sudo journalctl -u pg-cuvs-server --no-pager | grep 'loaded in
 
 ### 4-5. fallback count 확인
 
-Phase 2에서 `pg_stat_gpu_search`가 추가되면 해당 뷰를 사용한다.
-현재는 daemon journal로 확인한다.
+계획 단계의 CPU 우회는 `pg_stat_gpu_fallback`의 `fallback_count`와
+`last_reason`을 확인한다. 이 카운터는 cost hook 호출 횟수에 좌우되므로
+정확한 쿼리 수가 아니라 상대적인 압박 지표다. 실행 중 데몬 오류는
+`pg_stat_gpu_search.error_count`/`last_status`와 journal에서 따로 확인한다.
+하네스의 `fallbacks`는 하네스 자체 정의를 따른다. 실제 latency/recall
+벤치는 고정 벡터 한 개 대신 독립 query set을 사용한다.
+
+```sql
+SELECT index_oid, fallback_count, last_reason FROM pg_stat_gpu_fallback;
+SELECT index_name, error_count, last_status FROM pg_stat_gpu_search;
+```
 
 ```bash
 ssh $VM_SSH_HOST "sudo journalctl -u pg-cuvs-server --no-pager \

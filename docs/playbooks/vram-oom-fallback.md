@@ -13,15 +13,15 @@ ERROR:  pg_cuvs: BUILD failed (status 2); CREATE INDEX aborted to preserve catal
 HINT:   GPU VRAM exhausted. Free VRAM (drop other cagra indexes or restart pg_cuvs_server) and retry, ...
 ```
 
-**검색 시 (SELECT):**
+**검색 시 (SELECT, 실행 중 실패):**
 ```
-WARNING:  pg_cuvs: VRAM exhausted, falling back to CPU
-WARNING:  pg_cuvs: pg_cuvs_server unreachable, falling back to CPU
-WARNING:  pg_cuvs: GPU search failed (status N), falling back to CPU
+ERROR:  pg_cuvs: GPU VRAM exhausted; retry will use CPU while breaker is open
+ERROR:  pg_cuvs: GPU daemon unavailable after planning; retry will use CPU while breaker is open
 ```
 
-검색 시 fallback은 결과를 반환하지만 GPU가 아닌 CPU path(pgvector 또는 seqscan)로 처리된다.
-circuit breaker가 트리거된 뒤에는 `WARNING` 없이 자동으로 CPU로 라우팅된다.
+실행 중 GPU 호출이 OOM 또는 daemon unavailable을 반환하면 해당 SELECT는 ERROR로
+끝날 수 있다. 이후 breaker가 열리면 다음 계획은 CPU 경로로 재계획된다.
+실패한 SELECT가 같은 실행에서 자동으로 다른 index/seqscan으로 이어진다고 가정하지 않는다.
 
 ---
 
@@ -62,8 +62,8 @@ sudo systemctl cat pg-cuvs-server | grep ExecStart
 ```
 ExecStart=/usr/local/bin/pg_cuvs_server --index-dir /tmp/cuvs_indexes --max-vram-mb 32768 ...
 ```
-**→ 정상:** `--max-vram-mb` 값이 물리 VRAM의 70-80% 수준  
-**→ 이상 시:** 값이 지나치게 낮음 → 원인 D로
+**→ 참고:** 생략 시 기본 예산은 GPU별 물리 VRAM의 90%다. 명시값은
+`pg_stat_gpu_cache.vram_budget_mb`와 함께 확인한다.
 
 ---
 
@@ -108,11 +108,11 @@ SHOW cuvs.circuit_breaker_threshold;
 `handle_build`에서 `ensure_vram(needed)`가 -1을 반환한다.
 LRU eviction을 수행했지만 `--max-vram-mb` 예산 또는 물리 VRAM 한계를 넘었다.
 
-3계층 OOM 정책 (ADR-010):
+예산·eviction·거부 경로:
 ```
-Layer 1 — preflight: total_vram_used + needed > max_vram_bytes
-Layer 2 — LRU eviction: 가장 오래된 인덱스를 persist 후 VRAM 해제, 반복
-Layer 3 — fallback: eviction 후에도 부족하면 OOM_FALLBACK 반환
+Layer 1 — admission: 최종 인덱스와 scratch 예산을 확인
+Layer 2 — reclaim/eviction: 정책에 따라 다른 상주 인덱스의 VRAM 회수 시도
+Layer 3 — rejection: 확보하지 못하면 OOM_FALLBACK으로 빌드 거부
 ```
 
 build-time OOM은 DDL 실패로 처리된다 (query path와 달리 fallback success 없음).
@@ -121,13 +121,13 @@ build-time OOM은 DDL 실패로 처리된다 (query path와 달리 fallback succ
 ### B. Search-time OOM: handle_search에서 cuvs_cagra_search 실패
 
 `cuvs_cagra_search` 반환 != 0 시 `CUVS_STATUS_OOM_FALLBACK`을 반환한다.
-`gettuple`이 `WARNING: VRAM exhausted, falling back to CPU`를 내고 false를 반환한다.
-executor는 다음 index path(HNSW 또는 seqscan)로 자동 전환한다.
+실행 중 OOM이면 `gettuple`이 SQLSTATE `53200` ERROR를 낸다. 같은 SELECT는
+중단되므로 트랜잭션을 정리한 뒤 다음 SELECT에서 CPU 재계획 여부를 확인한다.
 → 복구 Step A로
 
 ### C. Circuit breaker 트리거
 
-`CUVS_STATUS_UNAVAILABLE`을 제외한 GPU 오류가 `cuvs.circuit_breaker_threshold`(기본 3)회
+GPU 오류가 `cuvs.circuit_breaker_threshold`(기본 3)회
 연속 발생하면 해당 인덱스에 대해 circuit breaker가 열린다.
 이후 해당 인덱스로의 모든 쿼리는 `WARNING` 없이 자동으로 CPU로 라우팅된다 (process-local).
 → 복구 Step C로
@@ -198,7 +198,8 @@ nvidia-smi --query-gpu=memory.free,memory.total --format=csv,noheader,nounits
 ### Step 3 — --max-vram-mb 조정
 
 ```bash
-sudo systemctl edit pg-cuvs-server --force
+sudo systemctl cat pg-cuvs-server
+sudo systemctl edit pg-cuvs-server
 ```
 
 **기대 출력:**
@@ -206,7 +207,9 @@ sudo systemctl edit pg-cuvs-server --force
 (편집기 열림)
 ```
 
-ExecStart 행의 `--max-vram-mb` 값을 물리 VRAM의 80% 수준으로 수정한다.  
+override에서 기존 `ExecStart=`를 빈 값으로 초기화한 뒤, 원래 인수를 보존한
+새 `ExecStart=` 행의 `--max-vram-mb`를 수정한다. GPU별 물리 여유와
+빌드 scratch를 고려한다.
 예: 물리 40960 MiB → `--max-vram-mb 32768`
 
 저장 후:
@@ -252,24 +255,18 @@ SELECT id FROM items ORDER BY embedding <-> '[1,0,0,0]'::vector LIMIT 1;
 SET cuvs.debug = off;
 ```
 
-**기대 출력 (fallback 중):**
-```
-WARNING:  pg_cuvs: VRAM exhausted, falling back to CPU
- id
-----
-  1
-(1 row)
-```
-또는 WARNING 없이 결과만 반환 (circuit breaker open 상태)  
-**→ WARNING 있음:** 일시적 VRAM 부족 → Step B로  
-**→ WARNING 없이 NOTICE도 없음:** circuit breaker open 가능성 → Step C로
+실행 중 OOM이면 ERROR로 끝난다. 다음 SELECT가 결과만 반환하면
+`pg_cuvs_circuit_status()`와 `EXPLAIN`으로 CPU 경로를 확인한다.
+**→ ERROR:** Step B로
+**→ GPU NOTICE 없음:** Step C에서 breaker와 실제 계획 확인
 
 ---
 
-### Step B — daemon 재시작으로 LRU eviction 초기화
+### Step B — 예산과 다른 상주 인덱스 확인
 
 ```bash
-sudo systemctl restart pg-cuvs-server
+sudo systemctl status pg-cuvs-server --no-pager
+sudo journalctl -u pg-cuvs-server -n 50 --no-pager
 ```
 
 **기대 출력:**
@@ -277,7 +274,9 @@ sudo systemctl restart pg-cuvs-server
 (에러 없이 완료)
 ```
 
-재시작 후 GPU path 복귀 확인:
+인덱스가 미상주이거나 데몬이 실패 상태라면 `daemon-restart-recovery.md`를
+따른다. 데몬이 정상이고 budget 거부라면 다른 상주 인덱스와 물리 여유를
+확인한 뒤, 원인을 조정하고 GPU path 복귀를 확인한다:
 
 ```sql
 SET cuvs.debug = on;
@@ -299,18 +298,18 @@ NOTICE:  pg_cuvs: cagra scan index_oid=XXXXX gpu
 circuit breaker 상태를 확인한다:
 
 ```sql
-SELECT pg_cuvs_last_search_latency_us();
+SELECT * FROM pg_cuvs_circuit_status()
+ WHERE index_oid = 'cagra_idx'::regclass;
 ```
 
 **기대 출력:**
 ```
- pg_cuvs_last_search_latency_us
----------------------------------
-                            (NULL)
-(1 row)
+ index_oid | state | transient | opened_at | half_open_count | consecutive_errors
+-----------+-------+-----------+-----------+-----------------+-------------------
+     16392 | open  | t         | ...       |               0 |                 3
 ```
-**→ NULL:** GPU search가 아직 실행되지 않은 상태 (circuit open 또는 미시도)  
-**→ 값 있음 (us 단위):** 마지막 GPU search 성공 latency — circuit open이 아님
+이 함수는 호출한 backend의 breaker만 표시한다. `transient=true`인 open은
+`cuvs.circuit_breaker_transient_ttl_s`가 지난 뒤 half-open으로 전환될 수 있다.
 
 인덱스 OID를 확인한다:
 
@@ -329,9 +328,7 @@ SELECT oid, relname FROM pg_class WHERE relname = 'cagra_idx';
 circuit breaker를 해제한다:
 
 ```sql
-SELECT pg_cuvs_reset_circuit(16392);
--- 또는:
-SELECT pg_cuvs_reset_circuit('cagra_idx'::regclass::oid);
+SELECT pg_cuvs_reset_circuit('cagra_idx'::regclass);
 ```
 
 **기대 출력:**
@@ -363,15 +360,15 @@ SET enable_cuvs = off;
 - [ ] `nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits` → 기대 출력: 인덱스 로드에 충분한 여유 MiB 값
 - [ ] `sudo journalctl -u pg-cuvs-server --no-pager | tail -20` → 기대 출력: `evict_lru` 또는 `saved index` 메시지 없이 `loaded index` 존재
 - [ ] `SET cuvs.debug = on; SELECT id FROM items ORDER BY embedding <-> '[1,0,0,0]'::vector LIMIT 1;` → 기대 출력: `NOTICE: pg_cuvs: cagra scan ... gpu`
-- [ ] `SELECT pg_cuvs_last_search_latency_us();` → 기대 출력: NULL이 아닌 us 단위 latency 값 (GPU search 실행됨)
+- [ ] `SELECT * FROM pg_cuvs_circuit_status();` → 현재 backend의 breaker 상태 확인
 
 ---
 
 ## 6. Escalation 기준 (When to escalate)
 
-- `--max-vram-mb`를 물리 VRAM의 50% 이하로 낮춰도 build-time OOM이 반복되면:
-  `cuvs_ambuild()`가 backend memory에 전체 corpus를 모으는 과정에서 메모리 압박이
-  커지고 있을 수 있다. phase-record.md Phase 2 §5(streaming handoff)로 에스컬레이션.
+- `--max-vram-mb`와 물리 여유가 충분한데도 build-time OOM이 반복되면:
+  `pg_cuvs_last_rejection()`과 daemon journal에서 VRAM/호스트 RAM/물리 GPU
+  preflight 사유를 구분한다. 같은 SQLSTATE만으로 원인을 단정하지 않는다.
 - circuit breaker가 threshold=1 설정에서도 매 쿼리 트리거되면:
   GPU search 자체가 반복적으로 실패하는 것. daemon journal의 `OOM_FALLBACK` 이유 확인 후
   에스컬레이션.

@@ -1,25 +1,25 @@
 # pg_cuvs Operational Guide — Choosing a Vector-Search Path
 
-> What to run for *your* workload, with the measured numbers behind each choice.
+> Historical single-host measurements below inform workload selection; current API defaults and limits are in [the reference](reference.md).
 > All data: single **A100-40GB**, Cohere embeddings **dim=1024**, **k=10**,
 > approximate paths held at **iso-recall@10 ≈ 0.95**, exact paths at **recall = 1.0**.
 > Raw rows: [`docs/data/concurrency_consolidated.csv`](data/concurrency_consolidated.csv).
 > Numbers are single-run on one GPU — treat as **directional (±~30% run-to-run)**, not spec.
 
-## The five paths
+## Search paths
 
 | Path | What it is | Recall | Build | In the planner? |
 |------|------------|--------|-------|-----------------|
-| **cpu-seq** | CPU brute force (PostgreSQL seq scan) | exact | none | yes (default small-N) |
+| **cpu-seq** | CPU brute force (PostgreSQL seq scan) | exact | none | yes; verify the choice with `EXPLAIN` |
 | **gpu-cagra** | GPU graph ANN (`USING cagra`) | approx | graph (GPU-fast) | yes (the cuvs index) |
 | **gpu-bf (flat)** | GPU exact brute force via `USING flat` AM (ADR-073, first-class path, v0.4.0) | exact | `.tids`+`.vectors` only (no graph) | planner cost (independent AM) |
 | **gpu-bf (legacy)** | GPU exact brute force via `cuvs.search_mode=brute_force` on a `cagra` index (**deprecated**) | exact | rides on a cagra build (graph is dead weight for BF) | runtime GUC |
 | **gpu-bf+batch** | gpu-bf + daemon request **coalescing** (`cuvs.bf_batch_wait_us>0`) | exact | same | runtime mode (GUC) |
-| **hnsw (cpu)** | pgvector HNSW / cagra→hnsw CPU export (`pg_cuvs_import_cagra`) | approx | graph | a **different deployment** (CPU-serve), not a per-query option vs cagra |
+| **hnsw (cpu)** | pgvector HNSW / cagra→hnsw CPU export (`pg_cuvs_import_cagra`) or direct `USING pg_cuvs_hnsw` build | approx | graph | a **different deployment** (CPU-serve), not a per-query option vs cagra |
 
-> **hnsw is a deployment/competitor choice, not a planner option.** A column carries
-> *one* index; the planner never picks "hnsw vs cagra" in a query. hnsw rows below are the
-> CPU-ANN reference, not part of the GPU-box decision surface (`cpu-seq / gpu-bf / gpu-cagra`).
+> **The hnsw rows below are a CPU-ANN benchmark reference.** PostgreSQL can hold multiple
+> indexes on the same column, including CAGRA and HNSW; plan choice depends on the available
+> indexes, costs, settings and query. Use `EXPLAIN` to see the path selected for a deployment.
 
 ## Quick decision guide
 
@@ -27,11 +27,13 @@
 
 | Need | Write pattern | Recommended path |
 |------|--------------|-----------------|
-| Exact (recall=1.0), read-heavy, stable corpus | Infrequent inserts/updates | **`USING flat`** — resident exact BF, recall=1.0, O(N) scan, VRAM warm. First-class AM (ADR-073) |
-| Exact (recall=1.0), write-heavy or always-fresh | Frequent inserts, ad-hoc filters | **transient BF** (`cuvs.gpu_bruteforce=on`, ADR-073) — no index, every query scans live heap |
-| Approximate OK, any N | Any | **`USING cagra`** — ~1.5 ms flat, ~1200 QPS, SLA-robust. GPU workhorse |
-| VRAM too small for cagra graph | Any | **`USING ivfpq`** — 10–100x VRAM savings via PQ, approximate |
-| No GPU at query time | Any | **`USING pg_cuvs_hnsw`** — GPU build, CPU serve |
+| Exact (recall=1.0), read-heavy, stable corpus | Infrequent inserts/updates | **`USING flat`** with float32 precision — exhaustive BF over the stored corpus; validate top-k against the required baseline. First-class AM (ADR-073) |
+| Exact (recall=1.0), write-heavy or always-fresh | Frequent inserts, ad-hoc filters | **transient BF** (`cuvs.gpu_bruteforce=on`, ADR-073) — experimental forced path; no index, every qualifying query scans live heap. Benchmark against CPU seqscan on the target hardware |
+| Approximate OK, any N | Any | **`USING cagra`** — the historical single-host results below measured ~1.5 ms and ~1200 QPS; remeasure for the deployment |
+| VRAM too small for cagra graph | Bulk-loaded, then rebuilt after writes | **`USING ivfpq`** — approximate PQ path; `aminsert` does not update it, so REINDEX after bulk loads; size and recall depend on corpus and settings |
+| No GPU at query time | Any | **`USING pg_cuvs_hnsw`** — private direct HNSW build on GPU when no `source` is set; CPU serve |
+
+`float16` BF is exhaustive over quantized vectors, so the historical exact-recall rows below apply only to their measured precision and workload. For float32 top-k identity, keep `float32` and validate against the intended baseline.
 
 **`flat` cost characteristics:** write cost = delta append on INSERT/UPDATE (cheapest among all
 GPU AMs: O(N) copy, no graph or PQ); periodic compaction merges delta into `.vectors`. Read cost
@@ -42,12 +44,11 @@ exceeds your latency budget, use `cagra`/`ivfpq` instead.
 maintain). Read cost = per-query heap scan + detoast + H2D transfer — paid fresh every call.
 Host corpus is capped by `cuvs.gpu_bruteforce_max_mb` (default 2048 MiB); exceeding it fails
 closed with an ERROR. VRAM admission is non-evicting: a transient corpus never displaces a
-resident `flat` or `cagra` index. Use when write velocity or always-fresh semantics make
-maintaining a `flat` index impractical. For stable, read-heavy corpora `USING flat` is more
+resident `flat` or `cagra` index. Consider only after measuring against CPU seqscan on the target hardware, particularly for PCIe-attached GPUs. For stable, read-heavy corpora `USING flat` is more
 efficient (corpus loaded once, served from resident VRAM).
 
 **`flat` VRAM sizing:** N·dim·4 bytes for float32 resident BF (e.g. 1M×1024 ≈ 4 GB). Use
-`WITH (precision='float16')` to halve it. If the corpus exceeds free VRAM at build time the
+`WITH (precision='float16')` to halve corpus storage; this quantizes vectors and can change float32 top-k. If the corpus exceeds free VRAM at build time the
 daemon emits a dedicated error; options: use `precision='float16'`, shard, or switch to
 `cagra`/`ivfpq`.
 
@@ -63,8 +64,8 @@ The planner chooses GPU index vs CPU seqscan by **cost**. Since v0.5.0 there are
   (`CUVS_STARTUP_COST=1000` preferring seqscan up to ~23k rows) only applies to the legacy fallback.
 - **Legacy fallback.** When `cuvs.enable_phys_cost=off`, the profile is missing/partial, or the
   build is the CPU shim, the planner uses the legacy constants (`CUVS_FLAT_STARTUP_COST=50` vs
-  `CUVS_STARTUP_COST=1000`) — `flat`'s lower startup keeps small-N tables on `flat`. Routing is
-  identical to pre-0.5.0.
+  `CUVS_STARTUP_COST=1000`) — `flat` has a lower startup cost, but actual plan choice
+  depends on competing paths and statistics. Inspect it with `EXPLAIN`.
 
 **Diagnose with `pg_cuvs_hw_profile()`:**
 
@@ -84,8 +85,8 @@ FROM pg_cuvs_hw_profile();
 - To force legacy routing everywhere (e.g. to A/B a routing regression): `SET cuvs.enable_phys_cost
   = off`.
 
-Note: `cuvs.gpu_bruteforce = auto` is **not** cost-driven yet — it stays off-behavior until
-unified-memory hardware makes transient BF a win (ADR-075 Phase 3).
+Note: `cuvs.gpu_bruteforce = auto` currently behaves as `off`; `on` forces the
+qualifying transient BF query shape. See [the reference](reference.md#transient-no-index-gpu-brute-force-cuvsgpu_bruteforce).
 
 ### Within gpu-bf: single-query latency guide
 
@@ -177,7 +178,7 @@ bf+batch  298  1144  2188  3094  3811  4226   ← scales with load
 Use it when **all** hold: exact required, **sustained high concurrency** (requests actually
 overlap in the window), and the SLA tolerates the added queueing latency. At low concurrency
 it is a net loss (the c=1 penalty above). It is **not** the default — it is a high-throughput
-specialization. (Tune the window per workload; `cuvs.bf_float16` halves VRAM / raises throughput.)
+specialization. (Tune the window per workload; `cuvs.bf_precision=float16` halves corpus VRAM but can change float32 top-k.)
 
 ## Caveats & provenance
 
@@ -189,7 +190,7 @@ specialization. (Tune the window per workload; `cuvs.bf_float16` halves VRAM / r
   **deprecated**: it couples exact-BF to an unnecessary graph build and cannot be independently
   cost-calibrated. Use `USING flat` for new deployments.
 - **`.vectors` sidecar = full raw corpus** (N·dim·4 B; 1M·1024 ≈ 4 GB), resident on top of the
-  graph. This is the real cost of exact GPU search; `bf_float16` halves it.
+  graph. This is the float32 corpus cost of GPU BF; `cuvs.bf_precision=float16` halves corpus VRAM but changes precision.
 - **Numbers are single-run on one GPU**; ~30% run-to-run variation observed (e.g. cagra@100k
   peak 914 vs 1206 across runs). Use ranges, not the last digit.
 - **Results branch overwrites per run** — this file + the consolidated CSV are the durable record.

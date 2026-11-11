@@ -15,8 +15,10 @@ Contributions and collaboration inquiries are welcome.
 ## Development
 
 - Requirements, build, and quickstart: see [README.md](README.md).
-- Tests: `make installcheck` on a GPU host, or the CPU-reference suite
-  (`make PGCUVS_CPU_SHIM=1`, no GPU) for the plumbing / contract / correctness tiers.
+- Tests: `make installcheck` and `make installcheck-isolation` on a configured GPU
+  host. The CPU-reference CI path builds with `PGCUVS_CPU_SHIM=1`, starts a shim
+  daemon, then runs `make installcheck-tier1` and `make installcheck-isolation`;
+  `make test-unit` runs separately. See [ci.yml](.github/workflows/ci.yml).
 - Follow the coding guidelines in [CLAUDE.md](CLAUDE.md): surgical changes,
   tests-first where practical, and structural vs behavioral changes in separate commits.
 

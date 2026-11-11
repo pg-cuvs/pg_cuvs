@@ -1,12 +1,15 @@
 # Tier 2 GPU CI — one-time setup
 
 The Tier 2 workflow (`.github/workflows/gpu.yml`) runs the real A100 regression
-**on demand** from the Actions UI. It needs three things set up once: keyless GCP
-auth (WIF), a self-hosted runner on the VM, and a few GitHub Actions variables.
+**on demand** from the Actions UI. It always needs a self-hosted runner on the
+GPU VM. Automatic VM start/stop additionally needs keyless GCP auth (WIF) and
+GitHub Actions variables. Without `GCP_WIF_PROVIDER`, the workflow skips VM
+start/stop and requires an already-running VM with an online runner.
 
 No long-lived secret is stored in GitHub: GCP trusts short-lived GitHub OIDC
-tokens scoped to **this repo only**, and the VM runs PR code only while a
-maintainer-triggered run has it booted.
+tokens scoped to **this repo only** when WIF is configured. A maintainer starts
+the workflow from the Actions UI; an already-running VM can keep its runner
+online outside that workflow.
 
 Concrete values below assume: repo `pg-cuvs/pg_cuvs`, project
 `your-gcp-project`, instance `pg-cuvs-dev`, zone `us-central1-b`. Adjust.
@@ -70,9 +73,9 @@ sudo ./svc.sh start
 sudo systemctl enable actions.runner.* 2>/dev/null || true   # start on boot
 ```
 
-The runner is online only while the VM is started (i.e. during a triggered run);
+The runner is online while the VM is started;
 `gpu.yml`'s `gpu-test` job queues until it appears, then runs `make installcheck`
-as `ubuntu`.
+and `make installcheck-isolation` as `ubuntu`.
 
 ## 3. GitHub Actions variables + environment
 
@@ -87,8 +90,9 @@ identifiers, not secrets):
 | `GPU_CI_ZONE` | `us-central1-b` |
 
 Repo → Settings → **Environments → New environment `gpu`** → add **Required
-reviewers** (yourself). This gates the `start-vm` job behind a manual approval, so
-no GPU cost is incurred without a click.
+reviewers** (yourself). With WIF configured, this gates the `start-vm` job before
+it starts the VM. It does not gate an already-running runner in the no-WIF path
+or stop charges for a VM that is already on.
 
 ---
 
@@ -96,5 +100,6 @@ no GPU cost is incurred without a click.
 
 Actions tab → **GPU regression (Tier 2)** → **Run workflow** → pick a branch (or
 enter a PR number) → Run. Only users with write access see the button. The VM
-boots, the real installcheck runs on the A100, results post to the run, and the VM
-is stopped automatically (even on failure).
+boots, the real installcheck and isolation suite run on the A100, and the VM
+is stopped by the `stop-vm` job, including when `gpu-test` fails. With WIF unset,
+start and stop the VM separately; the workflow does not manage its lifetime.
