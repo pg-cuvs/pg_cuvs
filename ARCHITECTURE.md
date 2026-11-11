@@ -322,8 +322,15 @@ PostgreSQL writes don't touch the VRAM index directly. Instead:
 - **DELETE/VACUUM** appends dead TIDs to `.tombstone`; the daemon filters them out at search time,
   over-fetching to recover candidates lost to the filter.
 - **Fallback marker** — if the delta/tombstone append fails, the path marks the index `.stale`,
-  and the planner cost hook routes the index to CPU until a REINDEX clears it. A delete-drift
-  backstop (`cuvs.max_stale_fraction`) reroutes to CPU when too many rows were deleted since build.
+  and the planner cost hook routes new plans to CPU until a REINDEX clears it.
+  The backend immediately invalidates cached plans depending on the parent table;
+  this notification survives transaction rollback because the marker does too.
+  An already executing scan that receives STALE raises SQLSTATE `55000` with the
+  index name and REINDEX guidance; it never treats that reply as an empty result.
+  The application must roll back the failed transaction before retrying the query.
+  Marker delivery remains best-effort: a daemon outage can lose the marker (#202).
+  This interim fix does not add marker durability or change the shared delta/tombstone cap.
+  A delete-drift backstop (`cuvs.max_stale_fraction`) reroutes to CPU when too many rows were deleted since build.
 
 REINDEX rebuilds the index and clears `.stale` / `.delta` / `.tombstone`.
 

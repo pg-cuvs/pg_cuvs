@@ -35,6 +35,7 @@
 #include "optimizer/optimizer.h"   /* plan_create_index_workers (§4A-2) */
 #include "storage/shm_toc.h"       /* shm_toc for the parallel DSM (§4A-2) */
 #include "utils/snapmgr.h"         /* SnapshotAny / RegisterSnapshot (§4A-2) */
+#include "storage/sinval.h"          /* immediate nontransactional plan invalidation */
 #include "access/genam.h"          /* try_index_open (ADR-045 index_dir reloption) */
 #include "access/reloptions.h"     /* CAGRA index_dir reloption (ADR-045) */
 #include "utils/array.h"           /* deconstruct_array, ARR_ELEMTYPE (Phase 3M) */
@@ -4525,6 +4526,18 @@ cuvs_rescan(IndexScanDesc scan, ScanKey keys, int nkeys,
  * DUP-SIBLING(gettuple): flat_gettuple is a duplicate (ADR-073). Change both
  * together; see the duplicate-pair inventory in ADR-073.
  * ---------------------------------------------------------------- */
+/* A STALE reply is not end-of-scan: callers must never accept empty success. */
+static void
+cuvs_report_stale(Oid index_oid)
+{
+    const char *name = get_rel_name(index_oid);
+    ereport(ERROR,
+            (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+             errmsg("pg_cuvs: index %s is stale", name ? quote_identifier(name) : "<unknown>"),
+             errhint("REINDEX INDEX %s to restore GPU search. After rolling back the failed transaction, retry the query with a fresh CPU plan.",
+                     name ? quote_identifier(name) : "<index>")));
+}
+
 static bool
 cuvs_gettuple(IndexScanDesc scan, ScanDirection dir)
 {
@@ -4650,17 +4663,7 @@ cuvs_gettuple(IndexScanDesc scan, ScanDirection dir)
             switch (rc)
             {
                 case CUVS_STATUS_STALE:
-                    /* The cost path (cuvs_index_is_stale) normally steers the
-                     * planner away from a stale index, so we only reach here
-                     * when a write marked the index stale between planning and
-                     * this scan. Return no rows for this scan; the next query
-                     * replans onto the CPU path. */
-                    ereport(WARNING,
-                            (errmsg("pg_cuvs: cagra index went stale mid-scan; "
-                                    "returning no rows (retry replans to CPU)"),
-                             errhint("REINDEX the index to re-enable GPU search.")));
-                    /* Phase 3: delta correction plugs in here
-                     * (stale && delta-available -> GPU+delta, else fallback). */
+                    cuvs_report_stale(index_oid);
                     break;
                 case CUVS_STATUS_METRIC_MISMATCH:
                     /* The index was built with a different metric (e.g. built
@@ -4916,10 +4919,7 @@ flat_gettuple(IndexScanDesc scan, ScanDirection dir)
             switch (rc)
             {
                 case CUVS_STATUS_STALE:
-                    ereport(WARNING,
-                            (errmsg("pg_cuvs: flat index went stale mid-scan; "
-                                    "returning no rows (retry replans to CPU)"),
-                             errhint("REINDEX the index to re-enable GPU search.")));
+                    cuvs_report_stale(index_oid);
                     break;
                 case CUVS_STATUS_METRIC_MISMATCH:
                     ereport(ERROR,
@@ -5050,15 +5050,23 @@ cuvs_endscan(IndexScanDesc scan)
     scan->opaque = NULL;
 }
 
-/* Flag this index stale on the daemon after a heap write. Best-effort: a
- * daemon that is down must not fail the user's write (the next reachable
- * write or a REINDEX re-establishes the marker). */
+/* The marker outlives transaction abort. Notify plans immediately as well:
+ * transactional relcache invalidation alone is not sent on rollback. This is
+ * only a cache notification, not durable marker publication (see #202). */
 static void
 cuvs_mark_index_stale(Relation indexRel)
 {
+    SharedInvalidationMessage msg;
+
     (void) cuvs_ipc_mark_stale(cuvs_socket_path,
-                               (uint32_t) MyDatabaseId,
-                               (uint32_t) RelationGetRelid(indexRel));
+                              (uint32_t) MyDatabaseId,
+                              (uint32_t) RelationGetRelid(indexRel));
+    memset(&msg, 0, sizeof(msg));
+    msg.rc.id = SHAREDINVALRELCACHE_ID;
+    msg.rc.dbId = MyDatabaseId;
+    msg.rc.relId = IndexGetRelation(RelationGetRelid(indexRel), false);
+    SendSharedInvalidMessages(&msg, 1);
+    AcceptInvalidationMessages();
 }
 
 /* Append one {TID, vector} record to the index's .delta sidecar. flock-
@@ -5554,6 +5562,10 @@ ivfpq_gettuple(IndexScanDesc scan, ScanDirection dir)
         Oid index_oid = RelationGetRelid(scan->indexRelation);
         if (!enable_cuvs)
             return false;
+        /* The IVF-PQ daemon handler does not gate its stale flag. Backstop a
+         * plan selected before the marker appeared, just like a STALE reply. */
+        if (cuvs_index_is_stale(index_oid))
+            cuvs_report_stale(index_oid);
         cuvs_breaker_check_scan(scan->indexRelation);   /* UC-2 — see cuvs_gettuple */
 
         /* #141 backstop — see cuvs_gettuple. */
@@ -5602,6 +5614,9 @@ ivfpq_gettuple(IndexScanDesc scan, ScanDirection dir)
 
             switch (rc)
             {
+                case CUVS_STATUS_STALE:
+                    cuvs_report_stale(index_oid);
+                    break;
                 case CUVS_STATUS_METRIC_MISMATCH:
                     ereport(ERROR,
                             (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
@@ -6120,10 +6135,7 @@ pg_cuvs_batch_search(PG_FUNCTION_ARGS)
                                  errhint("REINDEX the index.")));
                         break;
                     case CUVS_STATUS_STALE:
-                        ereport(ERROR,
-                                (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-                                 errmsg("pg_cuvs_batch_search: cagra index is stale (writes since build)"),
-                                 errhint("REINDEX the index.")));
+                        cuvs_report_stale(index_oid);
                         break;
                     case CUVS_STATUS_UNAVAILABLE:
                         ereport(ERROR,
@@ -7722,6 +7734,8 @@ cuvs_filtered_knn(PG_FUNCTION_ARGS)
             CHECK_FOR_INTERRUPTS();
             return (Datum) 0;
         }
+        if (rc == CUVS_STATUS_STALE)
+            cuvs_report_stale((Oid) index_oid);
         if (rc != CUVS_STATUS_OK)
         {
             cuvs_report_proto_mismatch(rc);
@@ -8057,6 +8071,8 @@ cuvs_cs_build(CuvsFilteredScanState *state, EState *estate)
 
     if (rc == CUVS_STATUS_CANCELED)
         CHECK_FOR_INTERRUPTS();
+    else if (rc == CUVS_STATUS_STALE)
+        cuvs_report_stale(state->index_oid);
     else if (rc != CUVS_STATUS_OK)
     {
         cuvs_report_proto_mismatch(rc);
