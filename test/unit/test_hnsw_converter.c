@@ -98,6 +98,15 @@ test_fault_pread(int fd, void *buffer, size_t length, off_t offset)
 
 #include "../../src/hnsw_export.c"
 
+/* Normal-path PG_TRY scaffolding for this standalone fixture. Real PG error
+ * propagation and cleanup are tested by test-connectivity-pg-interrupts. */
+sigjmp_buf *PG_exception_stack = NULL;
+ErrorContextCallback *error_context_stack = NULL;
+void pg_re_throw(void)
+{
+    abort(); /* an unexpected backend exception must fail this fixture */
+}
+
 /* The fixture has PG page headers but no running backend. These small stubs
  * provide the backend primitives used by the production page writer. */
 /* Unexpected backend ERRORs must fail the standalone fixture, rather than
