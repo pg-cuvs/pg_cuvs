@@ -990,6 +990,10 @@ finite `temp_file_limit` disables the file-backed path (the observation becomes
 unavailable if heap scratch cannot be used); an explicit operator limit is
 never bypassed. File-backed allocation does not imply measured physical disk I/O.
 Failure to reserve or map scratch records unavailable, not an ANN build error.
+Routine PostgreSQL interrupts (including memory-context logging requests) are
+serviced without abandoning the observation. Actual cancellation, statement
+timeout and backend termination retain PostgreSQL's normal error semantics;
+the adapters release their heap/file scratch and input mappings on error.
 
 `unreachable` follows same-level directed edges and downward transitions from
 the actual entrypoint. It is structural possible-path reachability, not the

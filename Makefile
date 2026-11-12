@@ -1103,3 +1103,9 @@ EXTRA_CLEAN += test-connectivity
 .PHONY: test-connectivity
 
 test-unit: test-connectivity
+
+# Isolated native PostgreSQL CPU regression; server/dev binaries and psql needed.
+# It starts its own Unix-socket cluster and does not connect to an existing DB.
+.PHONY: test-connectivity-pg-interrupts
+test-connectivity-pg-interrupts:
+	python3 test/unit/test_connectivity_pg_interrupts.py --output $(or $(CONNECTIVITY_TEST_OUTPUT),/tmp/pgcuvs-connectivity-pg-results)

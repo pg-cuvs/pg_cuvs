@@ -1239,16 +1239,28 @@ hnsw_check_elements(ElemDesc *elems,size_t n,int entry)
     struct timespec start,end;
     uint32_t maxlevel=0;
     void *workspace;size_t bytes;bool spilled;
+    CHECK_FOR_INTERRUPTS();
     c.magic=CUVS_CONNECTIVITY_MAGIC;c.version=1;c.nodes=n;
     if(n==0){c.available=1;return c;}
     if(n>UINT32_MAX || entry<0 || (size_t)entry>=n || n>SIZE_MAX/17)return c;
     bytes=n*17;workspace=hnsw_connectivity_workspace(bytes,&spilled);
     if(!workspace){CHECK_FOR_INTERRUPTS();return c;}
     clock_gettime(CLOCK_MONOTONIC,&start);
-    for(size_t i=0;i<n;i++)if((uint32_t)elems[i].level>maxlevel)maxlevel=elems[i].level;
-    (void)cuvs_connectivity_scratch((uint32_t)n,(uint32_t)entry,elems[entry].level,maxlevel,
-        hnsw_element_links,elems,hnsw_connectivity_cancel,workspace,&c);
-    c.spilled=spilled;hnsw_connectivity_workspace_free(workspace,bytes,spilled);
+    PG_TRY();
+    {
+        for(size_t i=0;i<n;i++) {
+            if((i&4095)==0)CHECK_FOR_INTERRUPTS();
+            if((uint32_t)elems[i].level>maxlevel)maxlevel=elems[i].level;
+        }
+        (void)cuvs_connectivity_scratch((uint32_t)n,(uint32_t)entry,elems[entry].level,maxlevel,
+            hnsw_element_links,elems,hnsw_connectivity_cancel,workspace,&c);
+        c.spilled=spilled;
+    }
+    PG_FINALLY();
+    {
+        hnsw_connectivity_workspace_free(workspace,bytes,spilled);
+    }
+    PG_END_TRY();
     CHECK_FOR_INTERRUPTS();
     clock_gettime(CLOCK_MONOTONIC,&end);
     c.elapsed_us=(uint64_t)(end.tv_sec-start.tv_sec)*1000000+(end.tv_nsec-start.tv_nsec)/1000;
@@ -2731,7 +2743,12 @@ hnsw_connectivity_links(void *arg, uint32_t node, uint32_t level, uint32_t *coun
 }
 static int hnsw_connectivity_cancel(void *arg)
 {
-    (void)arg; return InterruptPending;
+    (void)arg;
+    /* InterruptPending also covers routine PG work (barriers, memory-context
+     * logging, etc.). Let PG service it and distinguish cancellation/termination.
+     * Those errors propagate through the adapters' workspace cleanup blocks. */
+    CHECK_FOR_INTERRUPTS();
+    return 0;
 }
 static void
 hnsw_check_connectivity(int fd, const HnswlibHeader *h, CuvsConnectivity *out)
@@ -2743,6 +2760,7 @@ hnsw_check_connectivity(int fd, const HnswlibHeader *h, CuvsConnectivity *out)
     uint32_t n = (uint32_t)h->curElementCount;
     void *workspace=NULL;
     bool spilled=false;
+    CHECK_FOR_INTERRUPTS();
     memset(out, 0, sizeof(*out));
     out->magic=CUVS_CONNECTIVITY_MAGIC;out->version=1;out->nodes=n;
     clock_gettime(CLOCK_MONOTONIC, &start);
@@ -2753,18 +2771,28 @@ hnsw_check_connectivity(int fd, const HnswlibHeader *h, CuvsConnectivity *out)
     workspace=hnsw_connectivity_workspace(bytes,&spilled);
     if(workspace) {
         in.h=h;in.upper=(size_t*)((char*)workspace+aux);in.levels=(uint32_t*)(in.upper+n);
+    }
+    PG_TRY();
+    {
+      if(workspace) {
         cursor=sizeof(*h)+(size_t)n*h->sizeDataPerElement;
         for(uint32_t i=0;i<n;i++) {
             uint32_t length;
+            if((i&4095)==0)CHECK_FOR_INTERRUPTS();
             memcpy(&length,in.map+cursor,4);cursor+=4;
             in.upper[i]=cursor;in.levels[i]=length/(4+4*h->maxM);cursor+=length;
         }
         (void)cuvs_connectivity_scratch(n,(uint32_t)h->enterpointNode,in.levels[h->enterpointNode],(uint32_t)h->maxlevel,
             hnsw_connectivity_links,&in,hnsw_connectivity_cancel,workspace,out);
+      }
+        out->spilled=spilled;
     }
-    out->spilled=spilled;
-    hnsw_connectivity_workspace_free(workspace,bytes,spilled);
-    munmap((void*)in.map,(size_t)st.st_size);
+    PG_FINALLY();
+    {
+        hnsw_connectivity_workspace_free(workspace,bytes,spilled);
+        munmap((void*)in.map,(size_t)st.st_size);
+    }
+    PG_END_TRY();
     clock_gettime(CLOCK_MONOTONIC,&end);
     out->elapsed_us=(uint64_t)(end.tv_sec-start.tv_sec)*1000000+(end.tv_nsec-start.tv_nsec)/1000;
     CHECK_FOR_INTERRUPTS();
