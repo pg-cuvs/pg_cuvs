@@ -56,6 +56,8 @@ static void test_check_for_interrupts(void)
  * propagation and cleanup are tested by test-connectivity-pg-interrupts. */
 sigjmp_buf *PG_exception_stack = NULL;
 ErrorContextCallback *error_context_stack = NULL;
+bool IsUnderPostmaster = false;
+sigset_t BlockSig;
 void pg_re_throw(void)
 {
     abort(); /* an unexpected backend exception must fail this fixture */

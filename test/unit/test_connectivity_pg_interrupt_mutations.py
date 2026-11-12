@@ -22,10 +22,32 @@ def main():
     bad_callback = callback.replace("CHECK_FOR_INTERRUPTS();\n    return 0;", "return InterruptPending;")
     assert bad_callback != callback
     mutants = {"benign-as-cancel": original[:begin] + bad_callback + original[end:]}
+    for name, replacement in [
+        ("callback-no-cfi", "(void)0;"),
+        ("callback-cancel-die-only", "if(QueryCancelPending || ProcDiePending)CHECK_FOR_INTERRUPTS();")
+    ]:
+        changed = callback.replace("CHECK_FOR_INTERRUPTS();", replacement)
+        mutants[name] = original[:begin] + changed + original[end:]
     pattern = re.compile(r"    PG_FINALLY\(\);\n    \{\n(        hnsw_connectivity_workspace_free\(workspace,bytes,spilled\);\n(?:        munmap\(.*\);\n)?)    \}\n    PG_END_TRY\(\);")
     assert len(list(pattern.finditer(original))) == 2
     mutants["cleanup-only-on-success"] = pattern.sub(
         lambda m: "    PG_CATCH();\n    {\n        PG_RE_THROW();\n    }\n    PG_END_TRY();\n" + m[1], original)
+    start = original.index("hnsw_check_connectivity(int fd,")
+    end = original.index("\n}\n", start) + 3
+    function = original[start:end]
+    loop_start = function.index("        cursor=sizeof(*h)")
+    loop_end = function.index("        (void)cuvs_connectivity_scratch", loop_start)
+    loop = function[loop_start:loop_end]
+    changed = function[:loop_start] + function[loop_end:]
+    changed = changed.replace("    PG_TRY();", "    if(workspace) {\n" + loop + "    }\n    PG_TRY();", 1)
+    mutants["file-loop-outside-try"] = original[:start] + changed + original[end:]
+    expectations = {
+        "benign-as-cancel": ({"generic_pending", "log_memory", "cancel", "timeout", "terminate"}, 20),
+        "callback-no-cfi": ({"log_memory", "cancel", "timeout", "terminate"}, 16),
+        "callback-cancel-die-only": ({"log_memory"}, 4),
+        "cleanup-only-on-success": ({"cancel", "timeout", "loop_cancel"}, 10),
+        "file-loop-outside-try": ({"loop_cancel"}, 2),
+    }
     args.output.mkdir(parents=True, exist_ok=True)
     rows = []
     for name, source in mutants.items():
@@ -36,8 +58,8 @@ def main():
                                 "--source-dir", d, "--output", str(out)], capture_output=True, text=True)
             x = json.loads((out / "result.json").read_text())
             failed = [r for r in x["cases"] if r["verdict"] == "FAIL"]
-            expected = {"generic_pending", "log_memory"} if name == "benign-as-cancel" else {"cancel", "timeout"}
-            detected = p.returncode == 1 and len(x["cases"]) == 24 and len(failed) == 8 and {r["event"] for r in failed} == expected
+            expected, count = expectations[name]
+            detected = p.returncode == 1 and len(x["cases"]) == 26 and len(failed) == count and {r["event"] for r in failed} == expected
             rows.append({"mutant": name, "exit": p.returncode, "detected": detected,
                          "passed": x.get("passed"), "failed": x.get("failed"),
                          "failed_cases": [{k: r[k] for k in ["adapter", "spilled", "event", "error"]} for r in failed]})

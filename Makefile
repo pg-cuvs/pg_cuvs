@@ -1109,3 +1109,8 @@ test-unit: test-connectivity
 .PHONY: test-connectivity-pg-interrupts
 test-connectivity-pg-interrupts:
 	python3 test/unit/test_connectivity_pg_interrupts.py --output $(or $(CONNECTIVITY_TEST_OUTPUT),/tmp/pgcuvs-connectivity-pg-results)
+
+# Requires >=1.25GiB free tmpfs (Docker: --tmpfs /pgtmp:size=1600m,mode=1777).
+.PHONY: test-connectivity-pg-workspace
+test-connectivity-pg-workspace:
+	python3 test/unit/test_connectivity_pg_workspace.py --tmpfs $(or $(CONNECTIVITY_TEST_TMPFS),/pgtmp) --output $(or $(CONNECTIVITY_TEST_OUTPUT),/tmp/pgcuvs-connectivity-workspace-results)

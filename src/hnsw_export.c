@@ -57,6 +57,7 @@
 #include "access/reloptions.h"   /* relopt_kind, add_*_reloption, build_reloptions */
 #include "utils/regproc.h"       /* regclassin */
 #include "miscadmin.h"
+#include "libpq/pqsignal.h"
 #include "nodes/pg_list.h"       /* list_make1 */
 #include "access/genam.h"        /* GetSysCacheOid3 */
 #include "access/table.h"        /* table_open/table_close (pgvector version guard) */
@@ -148,7 +149,8 @@ hnsw_connectivity_workspace(size_t bytes, bool *spilled)
 {
     void *p;
     char path[MAXPGPATH], dir[MAXPGPATH];
-    int fd;
+    int fd, rc, save_errno;
+    sigset_t save_sigmask;
     *spilled=false;
     if(bytes <= (uint64_t)maintenance_work_mem*1024) {
         p=malloc(bytes);
@@ -166,7 +168,19 @@ hnsw_connectivity_workspace(size_t bytes, bool *spilled)
     fd=mkstemp(path);
     if(fd<0)return NULL;
     unlink(path);
-    if(posix_fallocate(fd,0,(off_t)bytes)!=0){close(fd);return NULL;}
+    /* As in dsm_impl_posix_resize, repeated SIGUSR1 must not keep restarting
+     * this all-or-nothing reservation. Defer backend signals until allocation
+     * finishes; SIGCONT can still require an EINTR retry. Do not run CFI here:
+     * the raw fd is not yet protected by the caller's PG_FINALLY block. */
+    if(IsUnderPostmaster)
+        sigprocmask(SIG_SETMASK,&BlockSig,&save_sigmask);
+    do { rc=posix_fallocate(fd,0,(off_t)bytes); } while(rc==EINTR);
+    if(IsUnderPostmaster) {
+        save_errno=errno;
+        sigprocmask(SIG_SETMASK,&save_sigmask,NULL);
+        errno=save_errno;
+    }
+    if(rc!=0){close(fd);errno=rc;return NULL;}
     p=mmap(NULL,bytes,PROT_READ|PROT_WRITE,MAP_SHARED,fd,0);
     close(fd);
     if(p==MAP_FAILED)return NULL;
