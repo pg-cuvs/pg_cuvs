@@ -994,7 +994,7 @@ test_hierarchical_native_packing_case(int dim, int bytes_per_dim, int m)
     chain_test_reset();
     chain_test_nblocks = 0;
     hnsw_write_disk_metapage(NULL, &parsed, (uint32_t)dim, n_pages,
-                             false, &table, &policy, NULL, NULL);
+                             false, &table, &policy, NULL, NULL, NULL);
     hnsw_write_disk_pages(NULL, f.hnsw_fd, f.tids_fd, &parsed, N,
                           (uint32_t)dim, bytes_per_dim, n_pages, false, &table);
     assert(chain_test_wal_images == n_pages + 1);
@@ -1547,8 +1547,17 @@ test_ace_readback_metapage_roundtrip(void)
                                 p.n_rows, p.partitions, 20);
     assert(cuvs_hnsw_ace_readback_valid(&ace, &p));
 
+    {
+        CuvsConnectivity c={0}, readback;
+        c.magic=CUVS_CONNECTIVITY_MAGIC;c.version=1;c.available=1;c.nodes=p.n_rows;c.unreachable=70;c.wcc_all=1;
+        chain_test_reset();
+        hnsw_write_disk_metapage(NULL,&hdr,2,1,true,&table,&p,&ace,NULL,&c);
+        meta=(Page)chain_test_pages[chain_test_nblocks-1];
+        readback=hnsw_read_connectivity(meta);
+        assert(readback.magic==c.magic && readback.unreachable==70 && readback.wcc_all==1);
+    }
     chain_test_reset();
-    hnsw_write_disk_metapage(NULL, &hdr, 2, 1, true, &table, &p, &ace, NULL);
+    hnsw_write_disk_metapage(NULL, &hdr, 2, 1, true, &table, &p, &ace, NULL, NULL);
     meta = (Page)chain_test_pages[chain_test_nblocks - 1];
     assert(((PageHeader)meta)->pd_lower == prefix + sizeof(p) + sizeof(ace));
     assert(memcmp((char *)meta + prefix, &p, sizeof(p)) == 0); /* receipt bytes unchanged */
@@ -1578,7 +1587,7 @@ test_ace_readback_metapage_roundtrip(void)
     resident.requested_algo = CUVS_HNSW_ALGO_IVF_PQ; resident.partitions = 0;
     assert(cuvs_hnsw_policy_valid(&resident));
     chain_test_reset();
-    hnsw_write_disk_metapage(NULL, &hdr, 2, 1, true, &table, &resident, &ace, NULL);
+    hnsw_write_disk_metapage(NULL, &hdr, 2, 1, true, &table, &resident, &ace, NULL, NULL);
     meta = (Page)chain_test_pages[chain_test_nblocks - 1];
     assert(((PageHeader)meta)->pd_lower == prefix + sizeof(resident));
 
@@ -1592,7 +1601,7 @@ test_ace_readback_metapage_roundtrip(void)
         bad.local_intermediate = 128;
         assert(freopen("/dev/null", "w", stderr) != NULL);
         chain_test_reset();
-        hnsw_write_disk_metapage(NULL, &hdr, 2, 1, true, &table, &p, &bad, NULL);
+        hnsw_write_disk_metapage(NULL, &hdr, 2, 1, true, &table, &p, &bad, NULL, NULL);
         _exit(0); /* reaching here means the writer accepted it */
     }
     assert(waitpid(child, &status, 0) == child);
@@ -1608,7 +1617,7 @@ test_ace_readback_metapage_roundtrip(void)
     nn.graph_degree = 128; nn.internal_degree = 192; nn.sdk_default_iterations = 20;
     nn.max_iterations = 20; nn.dtype = CUVS_HNSW_NN_DTYPE_FP32; nn.termination_threshold = 0.0001f;
     chain_test_reset();
-    hnsw_write_disk_metapage(NULL, &hdr, 2, 1, true, &table, &p, &ace, &nn);
+    hnsw_write_disk_metapage(NULL, &hdr, 2, 1, true, &table, &p, &ace, &nn, NULL);
     meta = (Page)chain_test_pages[chain_test_nblocks - 1];
     assert(((PageHeader)meta)->pd_lower == prefix + sizeof(p) + sizeof(nn));
     assert(hnsw_read_disk_policy(meta, &out) == CUVS_HNSW_POLICY_RECORDED);
@@ -1888,8 +1897,50 @@ test_read_window_matches_direct_reads(void)
     puts("PASS read windows match direct reads");
 }
 
+/* Execute the real file adapter and metapage writer, not just the graph kernel. */
+char *DataDir = NULL;
+int temp_file_limit = -1;
+int maintenance_work_mem = 65536;
+volatile sig_atomic_t InterruptPending = 0;
+static void test_connectivity_file_path(void)
+{
+    Fixture f=fixture_create(false);
+    HnswlibHeader h;
+    CuvsConnectivity c, saved;
+    uint32_t zero=0;
+    assert(pread(f.hnsw_fd,&h,sizeof(h),0)==sizeof(h));
+    hnsw_check_connectivity(f.hnsw_fd,&h,&c);
+    assert(c.available && c.unreachable==0 && c.wcc_all==1);
+    /* Delete only the root's outgoing edge: WCC stays one, one node is unreachable. */
+    write_at(f.hnsw_fd,&zero,4,HNSWLIB_HEADER_BYTES);
+    hnsw_check_connectivity(f.hnsw_fd,&h,&c);
+    assert(c.available && c.unreachable==1 && c.wcc_all==1);
+    maintenance_work_mem=0;
+    hnsw_check_connectivity(f.hnsw_fd,&h,&c);
+    assert(c.available && c.spilled && c.unreachable==1);
+    temp_file_limit=0;
+    hnsw_check_connectivity(f.hnsw_fd,&h,&c);
+    assert(!c.available); /* A finite operator cap is never bypassed. */
+    temp_file_limit=-1;
+    {
+        char dir[]="/tmp/conn203-data-XXXXXX", base[MAXPGPATH], scratch[MAXPGPATH];
+        assert(mkdtemp(dir));snprintf(base,sizeof(base),"%s/base",dir);assert(mkdir(base,0700)==0);
+        DataDir=dir;hnsw_check_connectivity(f.hnsw_fd,&h,&c);
+        assert(c.available && c.spilled);
+        snprintf(scratch,sizeof(scratch),"%s/base/pgsql_tmp",dir);
+        assert(rmdir(scratch)==0 && rmdir(base)==0 && rmdir(dir)==0);
+    }
+    DataDir="/nonexistent-conn203-parent/path";
+    hnsw_check_connectivity(f.hnsw_fd,&h,&c);
+    assert(!c.available); /* Temp creation failure is diagnostic, not a build ERROR. */
+    DataDir=NULL;maintenance_work_mem=65536;
+    (void)saved;
+    fixture_close(&f);
+    puts("PASS connectivity file adapter, directed-miss RED fixture, automatic file spill");
+}
+
 int
-main(void)
+main(int argc, char **argv)
 {
     /* HNSW_WINDOW_TESTS_ONLY=1 runs only the read-window tests, so a fault
      * in an earlier fixture cannot hide their result. */
@@ -1900,6 +1951,20 @@ main(void)
         puts("hnsw read-window tests: ok");
         return 0;
     }
+    if(argc==3 && (strcmp(argv[1],"--connectivity-file")==0 || strcmp(argv[1],"--connectivity-file-spill")==0)) {
+        if(strcmp(argv[1],"--connectivity-file-spill")==0)maintenance_work_mem=1;
+        int fd=open(argv[2],O_RDONLY);HnswlibHeader h;CuvsConnectivity c;
+        assert(fd>=0 && pread(fd,&h,sizeof(h),0)==sizeof(h));
+        for(int i=0;i<3;i++) {
+            hnsw_check_connectivity(fd,&h,&c);
+            printf("{\"rows\":%llu,\"available\":%u,\"unreachable\":%llu,\"wcc\":%llu,\"us\":%llu,\"spilled\":%u}\n",
+                (unsigned long long)c.nodes,c.available,(unsigned long long)c.unreachable,
+                (unsigned long long)c.wcc_all,(unsigned long long)c.elapsed_us,c.spilled);
+            assert(c.available);
+        }
+        close(fd);return 0;
+    }
+    test_connectivity_file_path();
     test_stored_policy_versions();
     test_ace_readback_metapage_roundtrip();
     test_valid_flat_and_original_labels();

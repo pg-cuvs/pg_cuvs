@@ -1224,3 +1224,14 @@ test-stale-interim:
 .PHONY: test-k3-digest
 test-k3-digest:
 	python3 test/k3_digest_integration.py
+
+# #203: PostgreSQL/CUDA-free structural checks (real file adapter also lives in
+# test-hnsw-converter). No ANN search-policy defaults are altered.
+test-connectivity: test/unit/test_connectivity.c src/cuvs_connectivity.h
+	$(CC) -std=c11 -O2 -Wall -Wextra -Werror -Isrc $< -o $@
+	./$@
+
+EXTRA_CLEAN += test-connectivity
+.PHONY: test-connectivity
+
+test-unit: test-connectivity
