@@ -6,11 +6,46 @@
 #include <stdlib.h>
 #include <sys/mman.h>
 #include <time.h>
+#include <stdio.h>
+#include <unistd.h>
 #include "cuvs_connectivity.h"
 
 static void *heaps[16], *maps[16];
 static unsigned heap_live, map_live;
 static int probe_action;
+static bool kernel_returned, log_pending_at_return, callback_cancel_seen;
+static unsigned file_cfi_polls;
+static void probe_real_check(void){CHECK_FOR_INTERRUPTS();}
+static void probe_wait(const char *phase)
+{
+    struct timespec start,now;
+    bool ready=false;
+    char line[128];
+    ereport(NOTICE,(errmsg("CONN203_WORKSPACE_READY heap=%u maps=%u",heap_live,map_live)));
+    int n=snprintf(line,sizeof(line),"CONN203_PROBE_WAIT pid=%d phase=%s\n",(int)getpid(),phase);
+    (void)write(STDERR_FILENO,line,(size_t)n);
+    clock_gettime(CLOCK_MONOTONIC,&start);
+    while(!ready){
+        ready=probe_action==2 ? LogMemoryContextPending :
+              probe_action==5 ? ProcDiePending : QueryCancelPending;
+        if(ready)break;
+        pg_usleep(10000L);
+        clock_gettime(CLOCK_MONOTONIC,&now);
+        if(now.tv_sec-start.tv_sec>5)elog(ERROR,"expected PG test signal missing");
+    }
+}
+static void probe_check(const char *function)
+{
+    if(!strcmp(function,"hnsw_check_connectivity") && ++file_cfi_polls==3 && probe_action==6)
+        probe_wait("offsets");
+    if(!strcmp(function,"hnsw_connectivity_cancel") && InterruptPending &&
+       (QueryCancelPending || ProcDiePending)){
+        char line[96];callback_cancel_seen=true;
+        int n=snprintf(line,sizeof(line),"CONN203_CALLBACK_INTERRUPT pid=%d\n",(int)getpid());
+        (void)write(STDERR_FILENO,line,(size_t)n);
+    }
+    probe_real_check();
+}
 static void *probe_malloc(size_t n)
 {
     void *p=malloc(n);
@@ -39,29 +74,20 @@ static int probe_scratch(uint32_t n,uint32_t entry,uint32_t level,uint32_t maxle
                         void *scratch,CuvsConnectivity *out)
 {
     if(probe_action==1)InterruptPending=1; /* benign pending flag, no cancel */
-    if(probe_action>=2){
-        struct timespec start,now;
-        bool ready=false;
-        ereport(NOTICE,(errmsg("CONN203_WORKSPACE_READY heap=%u maps=%u",heap_live,map_live)));
-        clock_gettime(CLOCK_MONOTONIC,&start);
-        /* Unrelated signals may wake pg_usleep. Wait for the requested flag,
-         * without servicing it until the production callback is entered. */
-        while(!ready){
-            ready=probe_action==2 ? LogMemoryContextPending :
-                  probe_action==5 ? ProcDiePending : QueryCancelPending;
-            if(ready)break;
-            pg_usleep(10000L);
-            clock_gettime(CLOCK_MONOTONIC,&now);
-            if(now.tv_sec-start.tv_sec>5)elog(ERROR,"expected PG test signal missing");
-        }
-    }
-    return cuvs_connectivity_scratch(n,entry,level,maxlevel,links,ctx,cancel,scratch,out);
+    if(probe_action>=2)probe_wait("kernel");
+    int rc=cuvs_connectivity_scratch(n,entry,level,maxlevel,links,ctx,cancel,scratch,out);
+    kernel_returned=true;log_pending_at_return=LogMemoryContextPending;
+    char line[96];int len=snprintf(line,sizeof(line),"CONN203_KERNEL_RETURNED pid=%d\n",(int)getpid());
+    (void)write(STDERR_FILENO,line,(size_t)len);
+    return rc;
 }
 #define malloc probe_malloc
 #define free probe_free
 #define mmap probe_mmap
 #define munmap probe_munmap
 #define cuvs_connectivity_scratch probe_scratch
+#undef CHECK_FOR_INTERRUPTS
+#define CHECK_FOR_INTERRUPTS() probe_check(__func__)
 #include "hnsw_export.c"
 #undef cuvs_connectivity_scratch
 #undef malloc
@@ -75,7 +101,8 @@ PG_FUNCTION_INFO_V1(conn203_probe_state);
 
 Datum conn203_probe_state(PG_FUNCTION_ARGS)
 {
-    PG_RETURN_TEXT_P(cstring_to_text(psprintf("{\"heap_live\":%u,\"map_live\":%u}",heap_live,map_live)));
+    PG_RETURN_TEXT_P(cstring_to_text(psprintf("{\"heap_live\":%u,\"map_live\":%u,\"kernel_returned\":%s,\"log_pending_at_return\":%s,\"callback_cancel_seen\":%s,\"file_cfi_polls\":%u}",heap_live,map_live,
+        kernel_returned?"true":"false",log_pending_at_return?"true":"false",callback_cancel_seen?"true":"false",file_cfi_polls)));
 }
 
 Datum conn203_probe(PG_FUNCTION_ARGS)
@@ -85,6 +112,7 @@ Datum conn203_probe(PG_FUNCTION_ARGS)
     CuvsConnectivity c;
     StringInfoData s;
     probe_action=PG_GETARG_INT32(1);
+    kernel_returned=log_pending_at_return=callback_cancel_seen=false;file_cfi_polls=0;
     if(file){
         HnswlibHeader h={0};
         char path[]="/tmp/conn203-test-input-XXXXXX";

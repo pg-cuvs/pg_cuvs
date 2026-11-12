@@ -24,6 +24,7 @@ class Session:
                                   stderr=subprocess.PIPE, text=True, bufsize=1)
         self.lines = queue.Queue()
         self.errors = []
+        self.error_changed = threading.Condition()
         self.ready = threading.Event()
         self.seq = 0
 
@@ -34,12 +35,21 @@ class Session:
 
         def stderr():
             for line in self.p.stderr:
-                self.errors.append(line.rstrip())
+                with self.error_changed:
+                    self.errors.append(line.rstrip())
+                    self.error_changed.notify_all()
                 if "CONN203_WORKSPACE_READY" in line:
                     self.ready.set()
 
         threading.Thread(target=stdout, daemon=True).start()
         threading.Thread(target=stderr, daemon=True).start()
+
+    def wait_error(self, fragment, timeout=2):
+        # stdout and stderr have separate reader threads. Do not turn a reader
+        # scheduling race into an absent SQLSTATE or relax the SQLSTATE check.
+        with self.error_changed:
+            return self.error_changed.wait_for(
+                lambda: any(fragment in line for line in self.errors), timeout)
 
     def ask(self, sql, timeout=15):
         self.seq += 1
@@ -128,7 +138,7 @@ def main():
         setup.close()
         for file in [False, True]:
             for spill in [False, True]:
-                for event in ["normal", "generic_pending", "log_memory", "cancel", "timeout", "terminate"]:
+                for event in ["normal", "generic_pending", "log_memory", "cancel", "timeout", "terminate"] + (["loop_cancel"] if file else []):
                     c = Session(psql)
                     row = {"adapter": "file" if file else "elements", "spilled": spill, "event": event}
                     try:
@@ -138,7 +148,7 @@ def main():
                         if event == "timeout":
                             c.ask("SET statement_timeout='1500ms';")
                         action = {"normal": 0, "generic_pending": 1, "log_memory": 2,
-                                  "cancel": 3, "timeout": 4, "terminate": 5}[event]
+                                  "cancel": 3, "timeout": 4, "terminate": 5, "loop_cancel": 6}[event]
                         outcome = {}
 
                         def run():
@@ -151,11 +161,17 @@ def main():
                         t.start()
                         if action >= 2:
                             assert c.ready.wait(6), "no post-allocation synchronization notice"
+                            phase = "offsets" if event == "loop_cancel" else "kernel"
+                            marker = f"CONN203_PROBE_WAIT pid={pid} phase={phase}"
+                            deadline = time.monotonic() + 3
+                            while marker not in log.read_text() and time.monotonic() < deadline:
+                                time.sleep(0.001)
+                            assert marker in log.read_text(), "not at requested production phase"
                             row["ready_notice"] = [x for x in c.errors if "CONN203_WORKSPACE_READY" in x]
-                            if event in ["log_memory", "cancel", "terminate"]:
+                            if event in ["log_memory", "cancel", "terminate", "loop_cancel"]:
                                 control = Session(psql)
                                 function = {"log_memory": "pg_log_backend_memory_contexts",
-                                            "cancel": "pg_cancel_backend", "terminate": "pg_terminate_backend"}[event]
+                                            "cancel": "pg_cancel_backend", "terminate": "pg_terminate_backend", "loop_cancel": "pg_cancel_backend"}[event]
                                 assert control.ask(f"SELECT {function}({pid});") == ["t"]
                                 control.close()
                         t.join(10)
@@ -166,11 +182,13 @@ def main():
                             while Path(f"/proc/{pid}").exists() and time.monotonic() < deadline:
                                 time.sleep(0.02)
                             assert not Path(f"/proc/{pid}").exists(), "terminated backend remains"
-                            assert any("57P01" in x for x in c.errors), "termination SQLSTATE not propagated"
+                            assert c.wait_error("57P01"), "termination SQLSTATE not propagated"
+                            assert f"CONN203_CALLBACK_INTERRUPT pid={pid}\n" in log.read_text(), "termination deferred past kernel"
+                            assert f"CONN203_KERNEL_RETURNED pid={pid}\n" not in log.read_text(), "kernel completed before termination"
                             row["process_gone"] = True
                         else:
-                            if event in ["cancel", "timeout"]:
-                                assert any("57014" in x for x in c.errors), "cancel SQLSTATE not propagated"
+                            if event in ["cancel", "timeout", "loop_cancel"]:
+                                assert c.wait_error("57014"), "cancel SQLSTATE not propagated"
                             else:
                                 assert not outcome.get("client_error"), outcome
                                 value = json.loads(outcome["lines"][0])
@@ -181,14 +199,21 @@ def main():
                                 assert snap["spilled"] == spill, value
                             state = json.loads(c.ask("SELECT conn203_probe_state();")[0])
                             row["after"] = state
-                            assert state == {"heap_live": 0, "map_live": 0}, state
+                            assert state["heap_live"] == 0 and state["map_live"] == 0, state
+                            if event in ["cancel", "timeout"]:
+                                assert not state["kernel_returned"] and state["callback_cancel_seen"], state
+                            elif event == "loop_cancel":
+                                assert not state["kernel_returned"] and state["file_cfi_polls"] >= 3, state
+                            elif event == "log_memory":
+                                assert state["kernel_returned"] and not state["log_pending_at_return"], state
                             assert c.ask("SELECT 1;") == ["1"], "backend not reusable"
-                        assert not list((temp / "data/base/pgsql_tmp").glob("conn203-*")), "scratch filename leaked"
+                        assert not list((temp / "data/base/pgsql_tmp").glob("*conn203-*")), "scratch filename leaked"
                         row["verdict"] = "PASS"
                     except Exception as e:
                         row.update(verdict="FAIL", error=str(e), error_type=type(e).__name__, stderr=list(c.errors))
                     finally:
                         c.close()
+                        row["stderr"] = list(c.errors)
                         result["cases"].append(row)
                         (output / "result.json").write_text(json.dumps(result, indent=2) + "\n")
         result["passed"] = sum(x["verdict"] == "PASS" for x in result["cases"])
