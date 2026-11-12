@@ -28,6 +28,9 @@
  */
 
 #include "postgres.h"
+#include <sys/mman.h>
+#include <time.h>
+#include "cuvs_connectivity.h"
 #include "fmgr.h"
 #include "access/generic_xlog.h"
 #include "access/xlog.h"            /* log_newpage_buffer */
@@ -63,6 +66,7 @@
 #include "utils/acl.h"
 #include "utils/lsyscache.h"     /* get_rel_name */
 #include "utils/jsonb.h"
+#include "utils/guc.h"
 #include "catalog/pg_type.h"     /* Form_pg_type (#162: vector/halfvec type detection) */
 
 #include <math.h>
@@ -132,6 +136,97 @@ typedef struct {
     int16_t         entryLevel;
     uint32_t        insertPage;
 } PgvHnswMeta;      /* 28 bytes */
+
+/* Reserve a metadata tail OUTSIDE the WAL free-space hole. pd_lower and the
+ * historical policy/ACE receipt prefix remain unchanged for older readers. */
+/* Anonymous scratch respects maintenance_work_mem. Larger checks use a
+ * preallocated, immediately unlinked file under the default PG temp directory.
+ * File-backed pages can be reclaimed by the OS instead of requiring swap.
+ * Reserve disk space before mmap writes, avoiding ENOSPC-induced SIGBUS. */
+static void *
+hnsw_connectivity_workspace(size_t bytes, bool *spilled)
+{
+    void *p;
+    char path[MAXPGPATH], dir[MAXPGPATH];
+    int fd;
+    *spilled=false;
+    if(bytes <= (uint64_t)maintenance_work_mem*1024) {
+        p=malloc(bytes);
+        if(p)return p;
+    }
+    /* This independent mapping is not charged by PostgreSQL VFD accounting.
+     * Never bypass an explicitly finite temp_file_limit: report unavailable
+     * instead. The ANN build itself continues under its existing policy. */
+    if(temp_file_limit>=0)return NULL;
+    if(DataDir) {
+        if(snprintf(dir,sizeof(dir),"%s/base/pgsql_tmp",DataDir)>=(int)sizeof(dir))return NULL;
+        if(mkdir(dir,0700) && errno!=EEXIST)return NULL;
+    } else snprintf(dir,sizeof(dir),"/tmp"); /* standalone CPU fixture */
+    if(snprintf(path,sizeof(path),"%s/conn203-XXXXXX",dir)>=(int)sizeof(path))return NULL;
+    fd=mkstemp(path);
+    if(fd<0)return NULL;
+    unlink(path);
+    if(posix_fallocate(fd,0,(off_t)bytes)!=0){close(fd);return NULL;}
+    p=mmap(NULL,bytes,PROT_READ|PROT_WRITE,MAP_SHARED,fd,0);
+    close(fd);
+    if(p==MAP_FAILED)return NULL;
+    *spilled=true;
+    return p;
+}
+static void
+hnsw_connectivity_workspace_free(void *p,size_t bytes,bool spilled)
+{
+    if(!p)return;
+    if(spilled)munmap(p,bytes);else free(p);
+}
+static void
+hnsw_store_connectivity(Page page, const CuvsConnectivity *c)
+{
+    PageHeader h=(PageHeader)page;
+    Size at=h->pd_special-sizeof(*c);
+    if (!c || h->pd_special<sizeof(*c) || h->pd_lower>at) return;
+    memcpy((char*)page+at,c,sizeof(*c));
+    h->pd_upper=at;
+}
+static CuvsConnectivity
+hnsw_read_connectivity(Page page)
+{
+    CuvsConnectivity c={0};
+    PageHeader h=(PageHeader)page;
+    if(h->pd_special<=BLCKSZ && h->pd_special>=sizeof(c) &&
+       h->pd_upper==h->pd_special-sizeof(c) && h->pd_lower<=h->pd_upper)
+        memcpy(&c,(char*)page+h->pd_upper,sizeof(c));
+    if(c.magic!=CUVS_CONNECTIVITY_MAGIC || c.version!=1 || c.available>1 || c.spilled>1 ||
+       c.unreachable>c.nodes || c.unreachable_l0>c.nodes ||
+       c.wcc_all>c.nodes || c.wcc_l0>c.nodes)
+        memset(&c,0,sizeof(c));
+    return c;
+}
+static void
+hnsw_append_connectivity(StringInfo json, const CuvsConnectivity *c)
+{
+    if(c->magic!=CUVS_CONNECTIVITY_MAGIC)
+        appendStringInfoString(json,",\"connectivity\":{\"status\":\"not_recorded\",\"scope\":\"build_snapshot\"}");
+    else if(!c->available)
+        appendStringInfo(json,",\"connectivity\":{\"status\":\"unavailable\",\"scope\":\"build_snapshot\",\"nodes\":%llu,\"unreachable\":null}",(unsigned long long)c->nodes);
+    else
+        appendStringInfo(json,",\"connectivity\":{\"status\":\"measured\",\"scope\":\"build_snapshot\",\"nodes\":%llu,\"unreachable\":%llu,\"unreachable_l0\":%llu,\"wcc_all\":%llu,\"wcc_l0\":%llu,\"check_us\":%llu,\"spilled\":%s}",
+            (unsigned long long)c->nodes,(unsigned long long)c->unreachable,
+            (unsigned long long)c->unreachable_l0,(unsigned long long)c->wcc_all,
+            (unsigned long long)c->wcc_l0,(unsigned long long)c->elapsed_us,c->spilled?"true":"false");
+}
+static void
+hnsw_notice_connectivity(const CuvsConnectivity *c)
+{
+    if(c->available)
+        ereport(NOTICE,(errmsg("pg_cuvs: build connectivity: unreachable=%llu, L0 unreachable=%llu, WCC=%llu (L0=%llu), check_us=%llu",
+            (unsigned long long)c->unreachable,(unsigned long long)c->unreachable_l0,
+            (unsigned long long)c->wcc_all,(unsigned long long)c->wcc_l0,
+            (unsigned long long)c->elapsed_us),
+            errdetail("Structural possible-path check; it does not guarantee finite-ef recall. Search policy is unchanged.")));
+    else
+        ereport(NOTICE,(errmsg("pg_cuvs: build connectivity check unavailable; search policy is unchanged")));
+}
 
 /* Keep the pgvector prefix untouched. The shared bounded decoder consumes
  * only the stored receipt tail, never current GUCs or a guessed build route. */
@@ -1126,6 +1221,39 @@ typedef struct {
     uint32_t        neigh_blkno;
     uint16_t        neigh_offno;
 } ElemDesc;
+
+static int hnsw_connectivity_cancel(void *arg);
+
+static const unsigned char *
+hnsw_element_links(void *ctx,uint32_t node,uint32_t level,uint32_t *count)
+{
+    ElemDesc *e=&((ElemDesc*)ctx)[node];
+    if(level>(uint32_t)e->level){*count=UINT32_MAX;return NULL;}
+    *count=level ? e->upper_counts[level-1] : e->lv0_count;
+    return (const unsigned char*)(level ? e->upper_links[level-1] : e->lv0_links);
+}
+static CuvsConnectivity
+hnsw_check_elements(ElemDesc *elems,size_t n,int entry)
+{
+    CuvsConnectivity c={0};
+    struct timespec start,end;
+    uint32_t maxlevel=0;
+    void *workspace;size_t bytes;bool spilled;
+    c.magic=CUVS_CONNECTIVITY_MAGIC;c.version=1;c.nodes=n;
+    if(n==0){c.available=1;return c;}
+    if(n>UINT32_MAX || entry<0 || (size_t)entry>=n || n>SIZE_MAX/17)return c;
+    bytes=n*17;workspace=hnsw_connectivity_workspace(bytes,&spilled);
+    if(!workspace){CHECK_FOR_INTERRUPTS();return c;}
+    clock_gettime(CLOCK_MONOTONIC,&start);
+    for(size_t i=0;i<n;i++)if((uint32_t)elems[i].level>maxlevel)maxlevel=elems[i].level;
+    (void)cuvs_connectivity_scratch((uint32_t)n,(uint32_t)entry,elems[entry].level,maxlevel,
+        hnsw_element_links,elems,hnsw_connectivity_cancel,workspace,&c);
+    c.spilled=spilled;hnsw_connectivity_workspace_free(workspace,bytes,spilled);
+    CHECK_FOR_INTERRUPTS();
+    clock_gettime(CLOCK_MONOTONIC,&end);
+    c.elapsed_us=(uint64_t)(end.tv_sec-start.tv_sec)*1000000+(end.tv_nsec-start.tv_nsec)/1000;
+    return c;
+}
 
 typedef bool (*HnswNodeLocationLookup)(void *arg, uint32_t node,
                                        HnswNodeLocation *location);
@@ -2128,6 +2256,8 @@ fill_hnsw_from_hnswlib_impl(Oid cagra_oid, Oid hnsw_oid, bool use_shm,
         RelationSetTargetBlock(hnsw_rel, InvalidBlockNumber);
     }
 
+    CuvsConnectivity connectivity=hnsw_check_elements(elems,N,hdr.enterpointNode);
+    hnsw_notice_connectivity(&connectivity);
     /* ---- 11. Write metapage (block 0) ---- */
     /* Use BufferGetPage directly (pgvector-style build path; WAL safety via
      * transaction rollback on error — the caller's transaction covers all writes). */
@@ -2177,6 +2307,7 @@ fill_hnsw_from_hnswlib_impl(Oid cagra_oid, Oid hnsw_oid, bool use_shm,
         /* Update pd_lower to reflect the metapage data (pgvector pattern). */
         ((PageHeader)page)->pd_lower =
             (uint16_t)(((char *)metap + sizeof(PgvHnswMeta)) - (char *)page);
+        hnsw_store_connectivity(page,&connectivity);
 
         MarkBufferDirty(buf);
         if (!hnsw_unlogged)
@@ -2577,11 +2708,73 @@ hnsw_write_disk_pages(Relation rel, int hnsw_fd, int tids_fd,
         hnsw_publish_staged_page(rel, staged, skip_wal);
 }
 
+/* Inputs have passed hnsw_file_preflight. Only adjacency pages are touched;
+ * vector bytes are not copied into another host buffer. */
+typedef struct HnswConnectivityInput {
+    const unsigned char *map;
+    const HnswlibHeader *h;
+    size_t *upper;
+    uint32_t *levels;
+} HnswConnectivityInput;
+static const unsigned char *
+hnsw_connectivity_links(void *arg, uint32_t node, uint32_t level, uint32_t *count)
+{
+    HnswConnectivityInput *in = arg;
+    const unsigned char *p;
+    uint16_t n;
+    *count = 0;
+    if (level > in->levels[node]) { *count=UINT32_MAX; return NULL; }
+    p = level ? in->map + in->upper[node] + (size_t)(level-1)*(4+4*in->h->maxM)
+              : in->map + sizeof(HnswlibHeader) + (size_t)node*in->h->sizeDataPerElement + in->h->offsetLevel0;
+    memcpy(&n, p, 2); *count=n;
+    return p+4;
+}
+static int hnsw_connectivity_cancel(void *arg)
+{
+    (void)arg; return InterruptPending;
+}
+static void
+hnsw_check_connectivity(int fd, const HnswlibHeader *h, CuvsConnectivity *out)
+{
+    struct stat st;
+    struct timespec start, end;
+    HnswConnectivityInput in = {0};
+    size_t cursor, aux, bytes;
+    uint32_t n = (uint32_t)h->curElementCount;
+    void *workspace=NULL;
+    bool spilled=false;
+    memset(out, 0, sizeof(*out));
+    out->magic=CUVS_CONNECTIVITY_MAGIC;out->version=1;out->nodes=n;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    if (fstat(fd,&st) || st.st_size<=0 || (uint64_t)st.st_size>SIZE_MAX || (uint64_t)n*29+8>SIZE_MAX)return;
+    in.map=mmap(NULL,(size_t)st.st_size,PROT_READ,MAP_PRIVATE,fd,0);
+    if(in.map==MAP_FAILED)return;
+    aux=((size_t)n*17+7)&~(size_t)7;bytes=aux+(size_t)n*12;
+    workspace=hnsw_connectivity_workspace(bytes,&spilled);
+    if(workspace) {
+        in.h=h;in.upper=(size_t*)((char*)workspace+aux);in.levels=(uint32_t*)(in.upper+n);
+        cursor=sizeof(*h)+(size_t)n*h->sizeDataPerElement;
+        for(uint32_t i=0;i<n;i++) {
+            uint32_t length;
+            memcpy(&length,in.map+cursor,4);cursor+=4;
+            in.upper[i]=cursor;in.levels[i]=length/(4+4*h->maxM);cursor+=length;
+        }
+        (void)cuvs_connectivity_scratch(n,(uint32_t)h->enterpointNode,in.levels[h->enterpointNode],(uint32_t)h->maxlevel,
+            hnsw_connectivity_links,&in,hnsw_connectivity_cancel,workspace,out);
+    }
+    out->spilled=spilled;
+    hnsw_connectivity_workspace_free(workspace,bytes,spilled);
+    munmap((void*)in.map,(size_t)st.st_size);
+    clock_gettime(CLOCK_MONOTONIC,&end);
+    out->elapsed_us=(uint64_t)(end.tv_sec-start.tv_sec)*1000000+(end.tv_nsec-start.tv_nsec)/1000;
+    CHECK_FOR_INTERRUPTS();
+}
+
 static void
 hnsw_write_disk_metapage(Relation rel, const HnswlibHeader *header,
                          uint32_t dim, uint32_t n_data_pages, bool skip_wal,
                          HnswLocationTable *locations, const CuvsHnswPolicy *policy,
-                         const CuvsHnswAceReadback *ace)
+                         const CuvsHnswAceReadback *ace, const CuvsConnectivity *connectivity)
 {
     Page staged = (Page)palloc(BLCKSZ);
     HnswNodeLocation entry;
@@ -2607,6 +2800,7 @@ hnsw_write_disk_metapage(Relation rel, const HnswlibHeader *header,
                ace, sizeof(*ace));
         ((PageHeader)staged)->pd_lower += sizeof(*ace);
     }
+    hnsw_store_connectivity(staged, connectivity);
     hnsw_publish_staged_page(rel, staged, skip_wal);
     pfree(staged);
 }
@@ -2667,6 +2861,12 @@ hnsw_import_empty_build_result(Relation indexRel,
                                    CUVS_HNSW_BUILD_M, CUVS_HNSW_BUILD_EF))
             ereport(ERROR, (errmsg("pg_cuvs: cannot initialize empty HNSW pages")));
 
+        {
+            CuvsConnectivity c={0};
+            c.magic=CUVS_CONNECTIVITY_MAGIC;c.version=1;c.available=1;
+            hnsw_store_connectivity(metapage,&c);
+            hnsw_notice_connectivity(&c);
+        }
         s->target = index_open(index_oid, AccessExclusiveLock);
         skip_wal = RelationGetForm(s->target)->relpersistence == RELPERSISTENCE_UNLOGGED;
         if (skip_wal)
@@ -2704,6 +2904,7 @@ hnsw_import_build_result(Relation indexRel,
 {
     volatile HnswDiskImportState state;
     HnswlibHeader header;
+    CuvsConnectivity connectivity;
     CuvsTidsHeader tids_header;
     HnswNodeLocation last_location;
     char error[256] = {0};
@@ -2737,6 +2938,8 @@ hnsw_import_build_result(Relation indexRel,
                                  error, sizeof(error)))
             ereport(ERROR,
                     (errmsg("pg_cuvs: invalid source-less HNSW files: %s", error)));
+        hnsw_check_connectivity(build->hnsw_fd, &header, &connectivity);
+        hnsw_notice_connectivity(&connectivity);
         if (!hnsw_location_table_rewind(&s->locations, build->n_vecs))
             ereport(ERROR,
                     (errmsg("pg_cuvs: incomplete disk-backed HNSW location table")));
@@ -2764,7 +2967,7 @@ hnsw_import_build_result(Relation indexRel,
         }
         hnsw_write_disk_metapage(s->target, &header, build->dim,
                                  data_page_count, skip_wal, &s->locations, &build->policy,
-                                 &build->ace);
+                                 &build->ace, &connectivity);
         hnsw_write_disk_pages(s->target, build->hnsw_fd, build->tids_fd,
                               &header, build->n_vecs, build->dim,
                               bytes_per_dim, data_page_count, skip_wal,
@@ -3218,6 +3421,8 @@ fill_hnsw_from_cagra_ipc_impl(Oid cagra_oid, Oid hnsw_oid, const char *mode,
         RelationSetTargetBlock(hnsw_rel, InvalidBlockNumber);
     }
 
+    CuvsConnectivity connectivity=hnsw_check_elements(elems,N,(int)entry_elem);
+    hnsw_notice_connectivity(&connectivity);
     /* ---- 6. Write metapage (block 0) ---- */
     {
         Buffer buf = ReadBuffer(hnsw_rel, P_NEW);
@@ -3265,6 +3470,7 @@ fill_hnsw_from_cagra_ipc_impl(Oid cagra_oid, Oid hnsw_oid, const char *mode,
 
         ((PageHeader)page)->pd_lower =
             (uint16_t)(((char *)metap + sizeof(PgvHnswMeta)) - (char *)page);
+        hnsw_store_connectivity(page,&connectivity);
 
         MarkBufferDirty(buf);
         if (!hnsw_unlogged)
@@ -3659,6 +3865,7 @@ pg_cuvs_hnsw_build_info(PG_FUNCTION_ARGS)
     CuvsHnswAceReadback ace = {0};
     CuvsHnswPolicyReadStatus ace_status = CUVS_HNSW_POLICY_NOT_RECORDED;
     StringInfoData json;
+    CuvsConnectivity connectivity = {0};
     Oid heap;
     if (rel->rd_rel->relam != get_am_oid("pg_cuvs_hnsw", true))
         ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
@@ -3675,6 +3882,7 @@ pg_cuvs_hnsw_build_info(PG_FUNCTION_ARGS)
         policy_status = hnsw_read_disk_policy(page, &policy);
         if (policy_status == CUVS_HNSW_POLICY_RECORDED && policy.route == CUVS_HNSW_ROUTE_ACE)
             ace_status = hnsw_read_disk_ace(page, &policy, &ace);
+        connectivity=hnsw_read_connectivity(page);
         UnlockReleaseBuffer(buffer);
     }
     index_close(rel, AccessShareLock);
@@ -3686,8 +3894,13 @@ pg_cuvs_hnsw_build_info(PG_FUNCTION_ARGS)
         ereport(ERROR, (errcode(ERRCODE_INDEX_CORRUPTED),
             errmsg("pg_cuvs: invalid stored HNSW policy receipt")));
     if (policy_status == CUVS_HNSW_POLICY_NOT_RECORDED)
-        PG_RETURN_DATUM(DirectFunctionCall1(jsonb_in,
-            CStringGetDatum("{\"status\":\"not_recorded\",\"reason\":\"legacy, empty, or reused source graph; rebuild to record a native policy\"}")));
+    {
+        initStringInfo(&json);
+        appendStringInfoString(&json,"{\"status\":\"not_recorded\",\"reason\":\"native build policy not recorded\"");
+        hnsw_append_connectivity(&json,&connectivity);
+        appendStringInfoChar(&json,'}');
+        PG_RETURN_DATUM(DirectFunctionCall1(jsonb_in,CStringGetDatum(json.data)));
+    }
     if (ace_status == CUVS_HNSW_POLICY_UNSUPPORTED)
         ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
             errmsg("pg_cuvs: unsupported stored ACE partition-builder readback version")));
@@ -3744,6 +3957,7 @@ pg_cuvs_hnsw_build_info(PG_FUNCTION_ARGS)
         else
             appendStringInfoString(&json, "\"ace_local_nn_descent_iterations\":\"varies_by_partition\"");
     }
+    hnsw_append_connectivity(&json, &connectivity);
     appendStringInfoChar(&json, '}');
     PG_RETURN_DATUM(DirectFunctionCall1(jsonb_in, CStringGetDatum(json.data)));
 }

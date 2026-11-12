@@ -972,3 +972,42 @@ down when the marker is sent, its absence can still cause missing rows after
 restart. Durable stale publication, the shared insertion/deletion cap, and insertion durability
 recovery are separate unfinished work. Do not treat this change as fixing those
 paths.
+
+### Build connectivity snapshot (#203)
+
+New `pg_cuvs_hnsw` imports record a CPU structural check in
+`pg_cuvs_hnsw_build_info(index)->'connectivity'` and expose the same object via
+`pg_cuvs_hnsw_connectivity_status(index)`. A NOTICE reports the observation.
+`status` is `measured`, `unavailable` (host memory/mapping/check failure), or
+`not_recorded` (historical metadata). An unavailable check does not reject a
+build or change search policy. Anonymous workspace is bounded by
+`maintenance_work_mem`; larger checks, or a failed heap allocation, automatically
+use preallocated, unlinked file-backed scratch. `spilled` records that path.
+The file uses `DataDir/base/pgsql_tmp` (the default PostgreSQL temp directory);
+custom `temp_tablespaces` routing is not implemented for this diagnostic.
+Because this mapping is not charged to PostgreSQL VFD temp-file accounting, a
+finite `temp_file_limit` disables the file-backed path (the observation becomes
+unavailable if heap scratch cannot be used); an explicit operator limit is
+never bypassed. File-backed allocation does not imply measured physical disk I/O.
+Failure to reserve or map scratch records unavailable, not an ANN build error.
+
+`unreachable` follows same-level directed edges and downward transitions from
+the actual entrypoint. It is structural possible-path reachability, not the
+path a particular query's greedy descent will choose. `unreachable_l0` uses
+only level zero. `wcc_l0` and `wcc_all` count **weak** components, not SCCs.
+One WCC does not imply every node is reachable. Zero unreachable nodes does
+not guarantee finite-ef recall. No repair, seed change, or error policy is
+selected by this diagnostic.
+
+The object has `scope='build_snapshot'`: INSERT, DELETE, VACUUM and entrypoint
+updates do not refresh it. Rebuild to obtain a new observation; do not use it
+as a live graph-integrity status. New receipts live outside the metapage WAL
+free-space hole; pgvector's prefix and existing policy/ACE receipt bytes stay
+unchanged. Existing binaries can search these pages without interpreting this
+snapshot. The status convenience function is installed on fresh installations
+and upgrades from 0.8.2. Existing development 0.9.0 installations can continue
+using the existing `pg_cuvs_hnsw_build_info` JSON surface; registering the new
+SQL alias can be done by the extension owner with
+`scripts/install-connectivity-status.sql` after loading the new binary. The
+script adds extension membership and is idempotent; release-version selection
+is separate.
