@@ -459,11 +459,13 @@ EXTRA_CLEAN += test-cache-policy
 # busy-message class used by the pg_cuvs_* cache SQL functions. Pure C.
 test-status-text: test/unit/test_status_text.c src/cuvs_status_text.c \
                   src/cuvs_status_text.h src/cuvs_ipc.h \
-                  test/unit/check_i3b_sql_perms.py src/pg_cuvs.c sql/pg_cuvs--0.8.2--0.9.0.sql
+                  test/unit/check_i3b_sql_perms.py test/unit/test_connectivity_sql_contract.py src/pg_cuvs.c \
+                  sql/pg_cuvs--0.8.2--0.9.0.sql sql/pg_cuvs--0.9.0.sql
 	$(CC) -std=gnu11 -Wall -Wextra -Werror -I src -o $@ test/unit/test_status_text.c \
 		src/cuvs_status_text.c
 	./$@
 	python3 test/unit/check_i3b_sql_perms.py
+	python3 -I -B test/unit/test_connectivity_sql_contract.py
 
 EXTRA_CLEAN += test-status-text
 .PHONY: test-status-text

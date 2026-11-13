@@ -303,6 +303,7 @@ COMMENT ON FUNCTION pg_cuvs_build_status() IS
   'and IVF-PQ builds are not listed. Empty when the daemon is unavailable.';
 -- I3-E end
 
+-- CONN203 begin
 -- #203: immutable build observation, not a live graph-integrity assertion.
 CREATE FUNCTION pg_cuvs_hnsw_connectivity_status(index regclass) RETURNS jsonb
 LANGUAGE SQL STABLE STRICT AS $$
@@ -311,3 +312,4 @@ LANGUAGE SQL STABLE STRICT AS $$
 $$;
 COMMENT ON FUNCTION pg_cuvs_hnsw_connectivity_status(regclass) IS
  'Last build structural connectivity snapshot; does not track INSERT/DELETE/VACUUM and does not guarantee finite-ef recall. Historical indexes may be not_recorded; new imports attempt the check within maintenance_work_mem.';
+-- CONN203 end
