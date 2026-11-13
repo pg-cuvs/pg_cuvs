@@ -459,11 +459,13 @@ EXTRA_CLEAN += test-cache-policy
 # busy-message class used by the pg_cuvs_* cache SQL functions. Pure C.
 test-status-text: test/unit/test_status_text.c src/cuvs_status_text.c \
                   src/cuvs_status_text.h src/cuvs_ipc.h \
-                  test/unit/check_i3b_sql_perms.py src/pg_cuvs.c sql/pg_cuvs--0.8.2--0.9.0.sql
+                  test/unit/check_i3b_sql_perms.py test/unit/test_connectivity_sql_contract.py src/pg_cuvs.c \
+                  sql/pg_cuvs--0.8.2--0.9.0.sql sql/pg_cuvs--0.9.0.sql
 	$(CC) -std=gnu11 -Wall -Wextra -Werror -I src -o $@ test/unit/test_status_text.c \
 		src/cuvs_status_text.c
 	./$@
 	python3 test/unit/check_i3b_sql_perms.py
+	python3 -I -B test/unit/test_connectivity_sql_contract.py
 
 EXTRA_CLEAN += test-status-text
 .PHONY: test-status-text
@@ -1092,3 +1094,25 @@ test-ar8-mutations: test/unit/test_ar8_mutations.py
 .PHONY: test-stale-interim
 test-stale-interim:
 	python3 test/stale_interim.py
+
+# #203: PostgreSQL/CUDA-free structural checks (real file adapter also lives in
+# test-hnsw-converter). No ANN search-policy defaults are altered.
+test-connectivity: test/unit/test_connectivity.c src/cuvs_connectivity.h
+	$(CC) -std=c11 -O2 -Wall -Wextra -Werror -Isrc $< -o $@
+	./$@
+
+EXTRA_CLEAN += test-connectivity
+.PHONY: test-connectivity
+
+test-unit: test-connectivity
+
+# Isolated native PostgreSQL CPU regression; server/dev binaries and psql needed.
+# It starts its own Unix-socket cluster and does not connect to an existing DB.
+.PHONY: test-connectivity-pg-interrupts
+test-connectivity-pg-interrupts:
+	python3 test/unit/test_connectivity_pg_interrupts.py --output $(or $(CONNECTIVITY_TEST_OUTPUT),/tmp/pgcuvs-connectivity-pg-results)
+
+# Requires >=1.25GiB free tmpfs (Docker: --tmpfs /pgtmp:size=1600m,mode=1777).
+.PHONY: test-connectivity-pg-workspace
+test-connectivity-pg-workspace:
+	python3 test/unit/test_connectivity_pg_workspace.py --tmpfs $(or $(CONNECTIVITY_TEST_TMPFS),/pgtmp) --output $(or $(CONNECTIVITY_TEST_OUTPUT),/tmp/pgcuvs-connectivity-workspace-results)

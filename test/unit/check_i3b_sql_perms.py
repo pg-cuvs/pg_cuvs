@@ -135,7 +135,7 @@ check(m is not None and sql.find("-- I3-A end") >= 0 and sql.find("-- I3-A end")
       "I3-B block is not appended after the I3-A block")
 _in_other = None
 for line in outside.splitlines():
-    om = re.match(r"^-- (I3-A|I3-C|I3-D|I4|I3-E) (begin|end)\s*$", line)
+    om = re.match(r"^-- (I3-A|I3-C|I3-D|I4|I3-E|CONN203) (begin|end)\s*$", line)
     if om:
         _in_other = om.group(1) if om.group(2) == "begin" else None
         continue
@@ -143,6 +143,42 @@ for line in outside.splitlines():
         continue
     check(line.strip() == "" or line.startswith("--") or line.startswith("\\echo "),
           f"statement outside the I3-B block: {line!r}")
+
+
+# #203 owns a separate additive SQL block, not an I3-B privilege surface.
+# Recognizing its marker above is safe only with this exact, invoker-only
+# delegation contract: no extra SQL, grants, or SECURITY DEFINER can hide here.
+conn_pattern = r"^-- CONN203 begin\n(.*?)^-- CONN203 end\n?"
+conn_blocks = []
+conn_function = """CREATE FUNCTION pg_cuvs_hnsw_connectivity_status(index regclass) RETURNS jsonb
+LANGUAGE SQL STABLE STRICT AS $$
+ SELECT COALESCE(pg_cuvs_hnsw_build_info($1)->'connectivity',
+                 '{"status":"not_recorded","scope":"build_snapshot"}'::jsonb)
+$$;"""
+normalize_sql = lambda text: re.sub(r"\s+", " ", text).strip()
+for rel in (sql_path, "sql/pg_cuvs--0.9.0.sql"):
+    text = read(rel)
+    matches = list(re.finditer(conn_pattern, text, flags=re.S | re.M))
+    check(len(matches) == 1 and text.count("-- CONN203 begin") == 1 and
+          text.count("-- CONN203 end") == 1,
+          f"{rel}: exactly one CONN203 begin/end block required")
+    if matches:
+        check(all(not line.strip() or line.startswith("--")
+                  for line in text[matches[0].end():].splitlines()),
+              f"{rel}: loose SQL after CONN203 block")
+    body = matches[0].group(1) if matches else ""
+    conn_blocks.append(body)
+    check(bool(matches) and 0 <= text.find("-- I3-E end") < matches[0].start(),
+          f"{rel}: CONN203 block must follow I3-E")
+    code = "\n".join(line for line in body.splitlines()
+                     if not line.lstrip().startswith("--"))
+    expected = (re.escape(normalize_sql(conn_function)) +
+                r" COMMENT ON FUNCTION pg_cuvs_hnsw_connectivity_status\(regclass\) IS "
+                r"'(?:[^']|'')*';")
+    check(re.fullmatch(expected, normalize_sql(code)) is not None,
+          f"{rel}: CONN203 must contain only its exact status delegation and COMMENT")
+check(conn_blocks[0] == conn_blocks[1],
+      "CONN203 block differs between install and upgrade")
 
 
 def norm_sig(name, args):
