@@ -2638,6 +2638,59 @@ hnsw_publish_staged_page(Relation rel, Page staged, bool skip_wal)
     END_CRIT_SECTION();
 }
 
+/* Source-less data pages have a checked, contiguous layout.  Extend a
+ * bounded group while retaining the existing per-page WAL image and order.
+ * Buffer pins belong to the current ResourceOwner, including on ERROR. */
+#define HNSW_DISK_EXTEND_BATCH 32
+typedef struct HnswDiskPageBatch
+{
+    Buffer buffers[HNSW_DISK_EXTEND_BATCH];
+    uint32 count;
+    uint32 next;
+} HnswDiskPageBatch;
+
+static void
+hnsw_publish_staged_data_page(Relation rel, Page staged, bool skip_wal,
+                              uint32 expected_block, uint32 page_count,
+                              HnswDiskPageBatch *batch)
+{
+#if PG_VERSION_NUM >= 160000
+    Buffer buf;
+
+    if (expected_block == 0 || expected_block > page_count)
+        ereport(ERROR, (errmsg("pg_cuvs: invalid HNSW data page position")));
+    if (batch->next == batch->count)
+    {
+        uint32 remaining = page_count - expected_block + 1;
+        uint32 requested = Min(remaining, (uint32)HNSW_DISK_EXTEND_BATCH);
+        BlockNumber first;
+
+        batch->next = 0;
+        batch->count = 0;
+        first = ExtendBufferedRelBy(BMR_REL(rel), MAIN_FORKNUM, NULL, 0,
+                                    requested, batch->buffers, &batch->count);
+        /* PostgreSQL may return fewer buffers than requested. */
+        if (first != expected_block || batch->count == 0 ||
+            batch->count > requested)
+            ereport(ERROR, (errmsg("pg_cuvs: unexpected HNSW relation extension")));
+    }
+    buf = batch->buffers[batch->next];
+    if (BufferGetBlockNumber(buf) != expected_block)
+        ereport(ERROR, (errmsg("pg_cuvs: noncontiguous HNSW extension buffers")));
+    LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
+    START_CRIT_SECTION();
+    memcpy(BufferGetPage(buf), staged, BLCKSZ);
+    MarkBufferDirty(buf);
+    if (!skip_wal)
+        log_newpage_buffer(buf, true);
+    UnlockReleaseBuffer(buf);
+    END_CRIT_SECTION();
+    batch->next++;
+#else
+    hnsw_publish_staged_page(rel, staged, skip_wal);
+#endif
+}
+
 static void
 hnsw_write_disk_pages(Relation rel, int hnsw_fd, int tids_fd,
                       const HnswlibHeader *header, uint64_t n_nodes,
@@ -2651,6 +2704,7 @@ hnsw_write_disk_pages(Relation rel, int hnsw_fd, int tids_fd,
     uint64_t level0_bytes;
     uint32_t current_block = 0;
     int m = (int)header->M;
+    HnswDiskPageBatch batch = {0};
 
     if (!hnsw_mul_u64(n_nodes, header->sizeDataPerElement, &level0_bytes) ||
         !hnsw_add_u64(HNSWLIB_HEADER_BYTES, level0_bytes, &upper_cursor))
@@ -2669,7 +2723,8 @@ hnsw_write_disk_pages(Relation rel, int hnsw_fd, int tids_fd,
                 ereport(ERROR,
                         (errmsg("pg_cuvs: noncontiguous source-less HNSW page layout")));
             if (current_block != 0)
-                hnsw_publish_staged_page(rel, staged, skip_wal);
+                hnsw_publish_staged_data_page(rel, staged, skip_wal,
+                                              current_block, data_page_count, &batch);
             current_block = row.elem.elem_blkno;
             hnsw_init_disk_page(staged);
             if (!hnsw_set_disk_page_chain(staged, current_block, data_page_count))
@@ -2684,7 +2739,10 @@ hnsw_write_disk_pages(Relation rel, int hnsw_fd, int tids_fd,
         ereport(ERROR,
                 (errmsg("pg_cuvs: source-less HNSW page count differs from layout")));
     if (current_block != 0)
-        hnsw_publish_staged_page(rel, staged, skip_wal);
+        hnsw_publish_staged_data_page(rel, staged, skip_wal,
+                                      current_block, data_page_count, &batch);
+    if (batch.next != batch.count)
+        ereport(ERROR, (errmsg("pg_cuvs: unused HNSW extension buffers")));
 }
 
 static void
