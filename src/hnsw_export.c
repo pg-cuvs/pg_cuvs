@@ -2295,6 +2295,12 @@ typedef struct HnswLocationTable
     BufFile *file;
     uint64_t n_nodes;
     uint64_t n_written;
+    bool formula_candidate;
+    bool formula_ready;
+    uint32_t formula_template_rows;
+    uint32_t formula_period;
+    uint64_t formula_stride;
+    uint64_t formula_verified_rows;
     HnswLocationCachePage cache[HNSW_LOCATION_CACHE_PAGES];
 } HnswLocationTable;
 
@@ -2313,6 +2319,94 @@ typedef struct HnswDiskRow
     int *upper_data;
 } HnswDiskRow;
 
+/* Reuse one existing cache row array as a bounded first-data-page template.
+ * The spill file and its full readback remain authoritative. */
+static bool
+hnsw_location_formula(const HnswLocationTable *table, uint64_t node,
+                       HnswNodeLocation *location)
+{
+    uint32_t count = table->formula_template_rows;
+    const HnswNodeLocation *pattern;
+    uint64_t page;
+    uint64_t delta;
+    uint64_t block;
+
+    if (!table->formula_candidate || count == 0 ||
+        count > HNSW_LOCATION_ROWS_PER_PAGE || node >= table->n_nodes ||
+        (table->formula_period != 0 && table->formula_period != count))
+        return false;
+    page = node / count;
+    if (table->formula_period == 0 && page != 0)
+        return false; /* No second page was observed: only this page is proved. */
+    pattern = &table->cache[0].rows[node % count];
+    if (!hnsw_mul_u64(page, table->formula_stride, &delta) ||
+        !hnsw_add_u64(pattern->elem_blkno, delta, &block) ||
+        block == 0 || block >= (uint64_t)InvalidBlockNumber)
+        return false;
+    location->elem_blkno = (uint32_t)block;
+    location->elem_offno = pattern->elem_offno;
+    location->level = pattern->level;
+    location->reserved = pattern->reserved;
+    return true;
+}
+
+static bool
+hnsw_location_formula_matches(const HnswLocationTable *table, uint64_t node,
+                               const HnswNodeLocation *location)
+{
+    HnswNodeLocation expected;
+
+    return hnsw_location_formula(table, node, &expected) &&
+        expected.elem_blkno == location->elem_blkno &&
+        expected.elem_offno == location->elem_offno &&
+        expected.level == location->level &&
+        expected.reserved == location->reserved;
+}
+
+static void
+hnsw_location_formula_append(HnswLocationTable *table, uint64_t node,
+                              const HnswNodeLocation *location)
+{
+    if (node == 0)
+    {
+        table->formula_candidate = true;
+        table->formula_period = table->formula_template_rows = 0;
+        table->formula_stride = table->formula_verified_rows = 0;
+        /* Do not overwrite an already-populated legacy cache on reuse. */
+        for (int i = 0; i < HNSW_LOCATION_CACHE_PAGES; i++)
+            if (table->cache[i].valid)
+                table->formula_candidate = false;
+    }
+    table->formula_ready = false;
+    if (!table->formula_candidate)
+        return;
+    if (table->formula_template_rows == 0 ||
+        (table->formula_period == 0 &&
+         location->elem_blkno == table->cache[0].rows[0].elem_blkno))
+    {
+        if (table->formula_template_rows >= HNSW_LOCATION_ROWS_PER_PAGE)
+        {
+            table->formula_candidate = false;
+            return;
+        }
+        table->cache[0].rows[table->formula_template_rows++] = *location;
+        return;
+    }
+    if (table->formula_period == 0)
+    {
+        if (location->elem_blkno <= table->cache[0].rows[0].elem_blkno)
+        {
+            table->formula_candidate = false;
+            return;
+        }
+        table->formula_period = table->formula_template_rows;
+        table->formula_stride = (uint64_t)location->elem_blkno -
+            table->cache[0].rows[0].elem_blkno;
+    }
+    if (!hnsw_location_formula_matches(table, node, location))
+        table->formula_candidate = false;
+}
+
 static bool
 hnsw_location_table_append(void *arg, uint64_t node,
                            const HnswNodeLocation *location,
@@ -2324,6 +2418,7 @@ hnsw_location_table_append(void *arg, uint64_t node,
         return hnsw_set_file_error(error, error_size,
                                    "internal node-location table write order error");
     BufFileWrite(table->file, (void *)location, sizeof(*location));
+    hnsw_location_formula_append(table, node, location);
     table->n_written++;
     return true;
 }
@@ -2334,7 +2429,10 @@ hnsw_location_table_rewind(HnswLocationTable *table, uint64_t expected_rows)
     HnswNodeLocation rows[HNSW_LOCATION_ROWS_PER_PAGE];
     uint64_t logical_bytes;
     uint64_t bytes_remaining;
+    uint64_t read_node = 0;
 
+    if (table)
+        table->formula_ready = false;
     if (!table || !table->file || table->n_nodes != expected_rows ||
         table->n_written != expected_rows ||
         !hnsw_mul_u64(expected_rows, sizeof(HnswNodeLocation), &logical_bytes) ||
@@ -2353,11 +2451,24 @@ hnsw_location_table_rewind(HnswLocationTable *table, uint64_t expected_rows)
         CHECK_FOR_INTERRUPTS();
         if (BufFileRead(table->file, rows, bytes) != bytes)
             return false;
+        if (table->formula_candidate)
+            for (size_t i = 0; i < bytes / sizeof(rows[0]); i++)
+                if (!hnsw_location_formula_matches(table, read_node + i, &rows[i]))
+                {
+                    table->formula_candidate = false;
+                    break;
+                }
+        read_node += bytes / sizeof(rows[0]);
         bytes_remaining -= bytes;
     }
 
     /* Rewind after readback so the first lookup starts at logical row zero. */
-    return BufFileSeekBlock(table->file, 0) == 0;
+    if (BufFileSeekBlock(table->file, 0) != 0)
+        return false;
+    table->formula_ready = table->formula_candidate && expected_rows > 0 &&
+        read_node == expected_rows && table->formula_template_rows > 0;
+    table->formula_verified_rows = table->formula_ready ? expected_rows : 0;
+    return true;
 }
 
 static bool
@@ -2373,6 +2484,13 @@ hnsw_location_table_lookup(void *arg, uint32_t node,
     if ((uint64_t)node >= table->n_nodes)
         ereport(ERROR,
                 (errmsg("pg_cuvs: HNSW node-location lookup is out of range")));
+    if (table->formula_ready && table->file &&
+        table->formula_verified_rows == table->n_nodes &&
+        table->n_written == table->n_nodes &&
+        hnsw_location_formula(table, node, location))
+        return true;
+    /* Any legacy lookup can replace the borrowed template rows. */
+    table->formula_ready = table->formula_candidate = false;
     page_no = (uint64_t)node / HNSW_LOCATION_ROWS_PER_PAGE;
     first_node = page_no * HNSW_LOCATION_ROWS_PER_PAGE;
     row_index = (size_t)((uint64_t)node - first_node);
