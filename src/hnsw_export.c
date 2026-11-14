@@ -1444,6 +1444,8 @@ write_elem_pair(Page page,
  * (write_elem_pages_packed() below). Thin wrapper: owns the buffer
  * lifecycle, delegates the tuple construction to write_elem_pair().
  * ---------------------------------------------------------------- */
+static void hnsw_publish_staged_page(Relation rel, Page staged, bool skip_wal);
+
 static void
 write_elem_page(Relation rel,
                 uint32_t blkno,
@@ -1457,15 +1459,11 @@ write_elem_page(Relation rel,
                 HnswNodeLocationLookup location_lookup,
                 void *location_lookup_arg)
 {
-    Buffer              buf;
-    Page                page;
+    Page                page = (Page)palloc(BLCKSZ);
     PgvHnswPageOpaque  *opaque;
 
-    /* always extend with P_NEW; caller loops in blkno order so each call
-     * appends the next block in sequence. */
-    buf  = ReadBuffer(rel, P_NEW);
-    LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
-    page = BufferGetPage(buf);
+    /* Validate/allocate tuples in private memory.  Only publication touches
+     * shared buffers, in the common helper's critical section. */
     PageInit(page, BLCKSZ, sizeof(PgvHnswPageOpaque));
 
     opaque = (PgvHnswPageOpaque *) PageGetSpecialPointer(page);
@@ -1479,10 +1477,8 @@ write_elem_page(Relation rel,
     write_elem_pair(page, e, vec, dim, bytes_per_dim, m, n_elems,
                     location_lookup, location_lookup_arg);
 
-    MarkBufferDirty(buf);
-    if (!skip_wal)
-        log_newpage_buffer(buf, true); /* WAL full-page image for crash safety */
-    UnlockReleaseBuffer(buf);
+    hnsw_publish_staged_page(rel, page, skip_wal);
+    pfree(page);
 }
 
 /* #161: writes N element+neighbor pairs packed k-per-page (fixed k, not
@@ -1513,6 +1509,7 @@ write_elem_pages_packed(Relation rel,
                         void *location_lookup_arg)
 {
     uint32_t data_page_count;
+    Page staged;
 
     if (n_elems == 0)
         return;
@@ -1522,15 +1519,14 @@ write_elem_pages_packed(Relation rel,
         ereport(ERROR,
                 (errmsg("pg_cuvs: invalid packed HNSW data page count")));
 
+    staged = (Page)palloc(BLCKSZ);
     for (size_t page_start = 0; page_start < n_elems; page_start += (size_t) k)
     {
         size_t page_end = page_start + (size_t) k;
         if (page_end > n_elems)
             page_end = n_elems;
 
-        Buffer buf  = ReadBuffer(rel, P_NEW);
-        LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
-        Page   page = BufferGetPage(buf);
+        Page page = staged;
         PageInit(page, BLCKSZ, sizeof(PgvHnswPageOpaque));
 
         PgvHnswPageOpaque *opaque = (PgvHnswPageOpaque *) PageGetSpecialPointer(page);
@@ -1550,11 +1546,9 @@ write_elem_pages_packed(Relation rel,
                             n_elems, location_lookup, location_lookup_arg);
         }
 
-        MarkBufferDirty(buf);
-        if (!skip_wal)
-            log_newpage_buffer(buf, true);
-        UnlockReleaseBuffer(buf);
+        hnsw_publish_staged_page(rel, page, skip_wal);
     }
+    pfree(staged);
 }
 
 /* pg_cuvs writes pgvector on-disk HNSW_VERSION=1 pages, tested with pgvector
@@ -2129,12 +2123,10 @@ fill_hnsw_from_hnswlib_impl(Oid cagra_oid, Oid hnsw_oid, bool use_shm,
     }
 
     /* ---- 11. Write metapage (block 0) ---- */
-    /* Use BufferGetPage directly (pgvector-style build path; WAL safety via
-     * transaction rollback on error — the caller's transaction covers all writes). */
+    /* Build privately so validation/allocation errors remain ordinary ERRORs
+     * before the shared-buffer critical section. */
     {
-        Buffer buf = ReadBuffer(hnsw_rel, P_NEW);   /* → block 0 */
-        LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
-        Page page = BufferGetPage(buf);
+        Page page = (Page)palloc(BLCKSZ);
         PageInit(page, BLCKSZ, sizeof(PgvHnswPageOpaque));
 
         PgvHnswPageOpaque *opaque =
@@ -2178,10 +2170,8 @@ fill_hnsw_from_hnswlib_impl(Oid cagra_oid, Oid hnsw_oid, bool use_shm,
         ((PageHeader)page)->pd_lower =
             (uint16_t)(((char *)metap + sizeof(PgvHnswMeta)) - (char *)page);
 
-        MarkBufferDirty(buf);
-        if (!hnsw_unlogged)
-            log_newpage_buffer(buf, true); /* WAL full-page image for crash safety */
-        UnlockReleaseBuffer(buf);
+        hnsw_publish_staged_page(hnsw_rel, page, hnsw_unlogged);
+        pfree(page);
     }
 
     /* ---- 12. Write element+neighbor pages ---- */
@@ -2639,11 +2629,13 @@ hnsw_publish_staged_page(Relation rel, Page staged, bool skip_wal)
     Buffer buf = ReadBuffer(rel, P_NEW);
 
     LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
+    START_CRIT_SECTION();
     memcpy(BufferGetPage(buf), staged, BLCKSZ);
     MarkBufferDirty(buf);
     if (!skip_wal)
         log_newpage_buffer(buf, true);
     UnlockReleaseBuffer(buf);
+    END_CRIT_SECTION();
 }
 
 static void
@@ -3338,9 +3330,7 @@ fill_hnsw_from_cagra_ipc_impl(Oid cagra_oid, Oid hnsw_oid, const char *mode,
 
     /* ---- 6. Write metapage (block 0) ---- */
     {
-        Buffer buf = ReadBuffer(hnsw_rel, P_NEW);
-        LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
-        Page page = BufferGetPage(buf);
+        Page page = (Page)palloc(BLCKSZ);
         PageInit(page, BLCKSZ, sizeof(PgvHnswPageOpaque));
 
         PgvHnswPageOpaque *opaque =
@@ -3384,10 +3374,8 @@ fill_hnsw_from_cagra_ipc_impl(Oid cagra_oid, Oid hnsw_oid, const char *mode,
         ((PageHeader)page)->pd_lower =
             (uint16_t)(((char *)metap + sizeof(PgvHnswMeta)) - (char *)page);
 
-        MarkBufferDirty(buf);
-        if (!hnsw_unlogged)
-            log_newpage_buffer(buf, true);
-        UnlockReleaseBuffer(buf);
+        hnsw_publish_staged_page(hnsw_rel, page, hnsw_unlogged);
+        pfree(page);
     }
 
     /* ---- 7. Write element+neighbor pages ---- */
