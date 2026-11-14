@@ -14,7 +14,7 @@ checks = {
   'resident FP32 has extra device budget': 'if (resident_fp32) gpu_workspace = checked_add(gpu_workspace,' in h,
   'upper actual dtype propagated': 'nn_params.dist_comp_dtype = resident_fp32 ? nn_descent::DIST_COMP_DTYPE::FP32' in h,
   'private contracts match': (root / 'src/cuvs_hnsw_nn_upper_contract.h').read_bytes() == (sdk / 'detail/cuvs_hnsw_nn_upper_contract.h').read_bytes(),
-  'v2 marker exported and checked': 'pgcuvs-hnsw-resident-nn-upper-v2@616eb202e83f558b59755b521d4d949e5b7b8305' in marker and 'pgcuvs-hnsw-resident-nn-upper-v2@616eb202e83f558b59755b521d4d949e5b7b8305' in wrapper,
+  'v3 marker exported and checked': 'pgcuvs-hnsw-resident-nn-upper-v3@616eb202e83f558b59755b521d4d949e5b7b8305' in marker and 'pgcuvs-hnsw-resident-nn-upper-v3@616eb202e83f558b59755b521d4d949e5b7b8305' in wrapper,
 }
 for name, ok in checks.items():
     print(f'{name}: {"PASS" if ok else "FAIL"} (source only)')
