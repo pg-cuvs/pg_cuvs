@@ -532,8 +532,9 @@ builder. It rejects fewer than 16 rows, an effective intermediate degree above 1
 nonfinite inputs and inputs whose conservative FP32 distance bound overflows. Its
 admission estimate uses FP32 dataset storage even when the selected base dtype is FP16;
 the estimate is not an allocator or RSS upper bound. GPU hierarchy requires the matching
-resident-NN upper-precision SDK patch and receives the base dtype and budgets. Configured
-upper dtype is recorded; per-level observed dtype is logged, not stored.
+resident-NN upper-precision SDK patch and receives the base dtype and budgets. Existing
+receipts do not identify the upper precision contract, so configured upper dtype is null;
+per-level observed dtype is logged, not stored.
 
 An over-budget refusal (SQLSTATE 54000, naming the resident IVF-PQ or NN-descent
 estimate) has the DETAIL `he=<MiB> hb=<MiB> ge=<MiB> gb=<MiB> rp=<MiB> rl=<MiB>`:

@@ -281,7 +281,7 @@ TEST_RT_LIB := $(shell [ "$$(uname -s)" = "Linux" ] && echo -lrt)
 test-unit: test-compact-retry test-device-norm test-failed-allocation test-build-oom-log test-peak-log-switch test/unit/test_cuvs_util.c src/cuvs_util.c src/cuvs_util.h src/cuvs_ipc.h \
            test/unit/test_build_corpus.c src/cuvs_build_corpus.c src/cuvs_build_corpus.h \
            test-hnsw-build test-hnsw-build-ipc test-hnsw-ace-quality test-hnsw-admission test-admission-contract \
-           test-hnsw-nn-policy test-hnsw-nn-route test-hnsw-nn-precision test-hnsw-nn-capacity test-hnsw-nn-sdk-params test-hnsw-nn-consumer \
+           test-hnsw-nn-policy test-hnsw-nn-route test-hnsw-nn-precision test-hnsw-nn-capacity test-hnsw-nn-sdk-params test-hnsw-nn-consumer test-hnsw-nn-upper-receipt \
            test-i3-logs test-notice-wire test-admission-wire test-admission-message test-admission-ipc test-build-oom-thread test-cache-policy test-circuit-source test-status-text test-i3b-source test-peak-meter test-lw-policy test-lw-guard test-i3e-sql test-self-replace-notice test-host-free-fence test-vacuum-policy
 	$(CC) -I src -DCUVS_TEST_HOOKS -o test-unit test/unit/test_cuvs_util.c src/cuvs_util.c $(TEST_RT_LIB)
 	./test-unit
@@ -342,7 +342,7 @@ test-hnsw-explicit-route: test/unit/test_hnsw_explicit_route.c src/cuvs_hnsw_bui
 	$(CC) -std=gnu11 -Wall -Wextra -Werror -I src -o $@ test/unit/test_hnsw_explicit_route.c -lpthread
 	./$@
 
-.PHONY: test-hnsw-nn-precision test-hnsw-nn-policy test-hnsw-nn-capacity test-hnsw-nn-route test-hnsw-nn-sdk-params test-hnsw-nn-consumer
+.PHONY: test-hnsw-nn-precision test-hnsw-nn-policy test-hnsw-nn-capacity test-hnsw-nn-route test-hnsw-nn-sdk-params test-hnsw-nn-consumer test-hnsw-nn-upper-receipt
 test-hnsw-nn-precision: test/unit/test_hnsw_nn_precision.c src/cuvs_hnsw_nn_precision.h
 	$(CC) -std=gnu11 -Wall -Wextra -Werror -I src -o $@ test/unit/test_hnsw_nn_precision.c -lm
 	./$@
@@ -365,6 +365,10 @@ test-hnsw-nn-sdk-params: test/unit/test_hnsw_nn_sdk_params.cpp src/cuvs_hnsw_nn_
 
 test-hnsw-nn-consumer: test/unit/test_hnsw_nn_consumer.py src/cuvs_wrapper.cu src/cuvs_hnsw_nn_sdk_params.cuh
 	ulimit -c 0; python3 test/unit/test_hnsw_nn_consumer.py
+
+test-hnsw-nn-upper-receipt: test/unit/test_hnsw_nn_upper_receipt.py test/unit/test_hnsw_nn_upper_receipt_mutation.py src/hnsw_export.c src/cuvs_hnsw_policy.h
+	python3 -I -B test/unit/test_hnsw_nn_upper_receipt.py
+	python3 -I -B test/unit/test_hnsw_nn_upper_receipt_mutation.py
 
 EXTRA_CLEAN += test-hnsw-nn-policy test-hnsw-nn-precision test-hnsw-nn-capacity test-hnsw-nn-route test-hnsw-nn-sdk-params
 

@@ -68,6 +68,7 @@ ACE 인덱스는 영수증 바로 뒤에 조각 빌더 readback을 저장한다:
 기존 인덱스, 빈 heap, source 그래프 재사용에는 영수증이 없을 수 있으며 `not_recorded`로 표시한다.
 명시적 `build_algo`와 `source` 그래프 재사용을 함께 지정할 수 없다.
 pgvector metapage prefix와 영수증 크기는 유지한다. 기존 경로는 policy v2, resident NN은 policy v3과 NN tail을 기록한다. NN tail은 실제 선택한 base dtype, 그래프 폭, SDK 기본 반복 수와 설정한 반복 상한을 기록하며 실제 반복 횟수는 노출되지 않는다. 새 reader는 역사적 v1 auto→ACE도 당시 값 그대로 읽는다. 손상·잘린 알려진 영수증은 오류, 알 수 없는 미래 버전은 unsupported 오류다. 현재 설정으로 과거 메타를 덮어쓰지 않는다.
+NN tail에는 상위 계층 precision 계약 세대가 없으므로, hierarchy가 있는 인덱스의 `nn_upper_dtype_configured`는 null이다. 이를 base dtype이나 현재 SDK에서 역산하지 않는다. hierarchy가 없으면 `not_applicable`이다.
 실제 재시작·INSERT/DELETE/VACUUM 통합은 별도 검증 대상이며, CPU 페이지 검사는 실행 중인 PostgreSQL의 증거가 아니다.
 
 품질 합격은 새 질의의 exact top10 대비 recall@10이 직접 생성한 pgvector HNSW 이상인지
