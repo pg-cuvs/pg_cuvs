@@ -1063,6 +1063,144 @@ test_location_readback_interrupt(void)
     free(file);
 }
 
+/* Independent row oracle: location addresses repeat every two nodes, while
+ * levels vary independently.  Full lookups must retain the authoritative
+ * level even after they replace the borrowed legacy cache template. */
+static HnswNodeLocation
+address_oracle(uint32_t node, bool irregular)
+{
+    HnswNodeLocation location;
+
+    location.elem_blkno = 1 + node / 2 + (irregular && node >= 1000 ? 1 : 0);
+    location.elem_offno = (uint16_t)(1 + 2 * (node % 2));
+    location.level = (uint8_t)(node % 37 == 0 ? 2 : node % 13 == 0 ? 1 : 0);
+    location.reserved = 0;
+    return location;
+}
+
+static void
+test_address_formula_independent_of_levels(bool irregular)
+{
+    struct BufFile file = {.fd = make_temp_fd()};
+    HnswLocationTable table = {0};
+    const uint32_t probes[] = {0, 1024, 2048, 3072, 4096, 5120, 38, 1, 4097, 1024};
+    char error[128] = {0};
+
+    table.file = &file;
+    table.n_nodes = HNSW_LOCATION_ROWS_PER_PAGE * 5 + 7;
+    for (uint32_t node = 0; node < table.n_nodes; node++)
+    {
+        HnswNodeLocation expected = address_oracle(node, irregular);
+        assert(hnsw_location_table_append(&table, node, &expected,
+                                          error, sizeof(error)));
+    }
+    assert(hnsw_location_table_rewind(&table, table.n_nodes));
+    assert(!table.formula_ready); /* variable levels never synthesize a level */
+    assert(table.address_ready == !irregular);
+    for (size_t i = 0; i < sizeof(probes) / sizeof(probes[0]); i++)
+    {
+        HnswNodeLocation actual, expected = address_oracle(probes[i], irregular);
+        assert(hnsw_location_table_lookup(&table, probes[i], &actual));
+        assert(memcmp(&actual, &expected, sizeof(actual)) == 0);
+    }
+    /* Full lookups above can overwrite cache[0]; the address template must
+     * survive, without any address lookup returning a fabricated level. */
+    test_readback_reads = 0;
+    test_readback_cancel_enabled = true;
+    for (size_t i = 0; i < sizeof(probes) / sizeof(probes[0]); i++)
+    {
+        HnswNodeAddress actual;
+        HnswNodeLocation expected = address_oracle(probes[i], irregular);
+        assert(hnsw_location_table_address_lookup(&table, probes[i], &actual));
+        assert(actual.elem_blkno == expected.elem_blkno &&
+               actual.elem_offno == expected.elem_offno);
+    }
+    test_readback_cancel_enabled = false;
+    if (irregular)
+        assert(test_readback_reads > 0);
+    else
+        assert(test_readback_reads == 0 && table.address_ready);
+    assert(sizeof(table.address_template) <= BLCKSZ);
+    BufFileClose(&file);
+}
+
+static void
+test_address_readback_rejects_changed_and_short_file(void)
+{
+    struct BufFile file = {.fd = make_temp_fd()};
+    HnswLocationTable table = {0};
+    HnswNodeAddress actual;
+    char error[128] = {0};
+
+    table.file = &file;
+    table.n_nodes = HNSW_LOCATION_ROWS_PER_PAGE + 1;
+    for (uint32_t node = 0; node < table.n_nodes; node++)
+    {
+        HnswNodeLocation expected = address_oracle(node, false);
+        assert(hnsw_location_table_append(&table, node, &expected,
+                                          error, sizeof(error)));
+    }
+    /* Change a stored address after append; full readback is authoritative. */
+    HnswNodeLocation changed = address_oracle(HNSW_LOCATION_ROWS_PER_PAGE, false);
+    changed.elem_blkno++;
+    memcpy(file.logical_bytes + HNSW_LOCATION_ROWS_PER_PAGE * sizeof(changed),
+           &changed, sizeof(changed));
+    assert(hnsw_location_table_rewind(&table, table.n_nodes));
+    assert(!table.address_ready);
+    assert(hnsw_location_table_address_lookup(&table, HNSW_LOCATION_ROWS_PER_PAGE,
+                                               &actual));
+    assert(actual.elem_blkno == changed.elem_blkno &&
+           actual.elem_offno == changed.elem_offno);
+    file.logical_size -= sizeof(changed);
+    assert(!hnsw_location_table_rewind(&table, table.n_nodes));
+    assert(!table.address_ready);
+    BufFileClose(&file);
+}
+
+static void
+test_address_single_page_and_out_of_range(void)
+{
+    struct BufFile file = {.fd = make_temp_fd()};
+    HnswLocationTable table = {0};
+    HnswNodeAddress actual;
+    HnswNodeLocation first = {1, 1, 2, 0}, second = {1, 3, 0, 0};
+    char error[128] = {0};
+    pid_t child;
+    int status;
+
+    table.file = &file;
+    table.n_nodes = 2;
+    assert(hnsw_location_table_append(&table, 0, &first, error, sizeof(error)));
+    assert(hnsw_location_table_append(&table, 1, &second, error, sizeof(error)));
+    /* Before complete readback no address is predicted. */
+    assert(!table.address_ready);
+    /* Even a stale ready flag cannot bypass the verified-row guard. */
+    table.address_ready = true;
+    table.address_verified_rows = 0;
+    test_readback_reads = 0;
+    test_readback_cancel_enabled = true;
+    assert(hnsw_location_table_address_lookup(&table, 1, &actual));
+    test_readback_cancel_enabled = false;
+    assert(test_readback_reads > 0 && actual.elem_blkno == 1 &&
+           actual.elem_offno == 3);
+    table.address_ready = false;
+    assert(hnsw_location_table_rewind(&table, 2));
+    assert(table.address_ready && table.address_period == 0);
+    assert(hnsw_location_table_address_lookup(&table, 1, &actual));
+    assert(actual.elem_blkno == 1 && actual.elem_offno == 3);
+    child = fork();
+    assert(child >= 0);
+    if (child == 0)
+    {
+        assert(freopen("/dev/null", "w", stderr) != NULL);
+        (void)hnsw_location_table_address_lookup(&table, 2, &actual);
+        _exit(0);
+    }
+    assert(waitpid(child, &status, 0) == child);
+    assert(WIFSIGNALED(status) && WTERMSIG(status) == SIGABRT);
+    BufFileClose(&file);
+}
+
 static void
 test_disk_location_table_roundtrip(void)
 {
@@ -1386,6 +1524,10 @@ main(void)
     test_pgvector_page_version_range();
     test_buffered_location_table_contract();
     test_location_readback_interrupt();
+    test_address_formula_independent_of_levels(false);
+    test_address_formula_independent_of_levels(true);
+    test_address_readback_rejects_changed_and_short_file();
+    test_address_single_page_and_out_of_range();
     test_disk_location_table_roundtrip();
     test_rejects_count_dimension_metric_and_version_mismatch();
     test_rejects_bad_crc_and_truncated_inputs();
