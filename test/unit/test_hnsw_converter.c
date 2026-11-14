@@ -240,6 +240,8 @@ BufFileClose(BufFile *file)
 #define CHAIN_TEST_MAX_BLOCKS 16
 static char chain_test_pages[CHAIN_TEST_MAX_BLOCKS][BLCKSZ];
 static size_t chain_test_nblocks;
+volatile uint32 CritSectionCount;
+static unsigned chain_test_wal_images;
 static char chain_test_palloc_arena[256 * 1024];
 static size_t chain_test_palloc_used;
 
@@ -301,6 +303,7 @@ void
 MarkBufferDirty(Buffer buffer)
 {
     (void)buffer;
+    assert(CritSectionCount > 0);
 }
 
 XLogRecPtr
@@ -308,13 +311,17 @@ log_newpage_buffer(Buffer buffer, bool page_std)
 {
     (void)buffer;
     (void)page_std;
+    assert(CritSectionCount > 0);
+    chain_test_wal_images++;
     return InvalidXLogRecPtr;
 }
 
 static void
 chain_test_reset(void)
 {
+    assert(CritSectionCount == 0);
     chain_test_nblocks = 1;
+    chain_test_wal_images = 0;
     chain_test_palloc_used = 0;
     memset(chain_test_pages, 0, sizeof(chain_test_pages));
     hnsw_init_disk_page((Page)chain_test_pages[0]);
@@ -871,9 +878,11 @@ test_hierarchical_native_packing_case(int dim, int bytes_per_dim, int m)
     chain_test_reset();
     chain_test_nblocks = 0;
     hnsw_write_disk_metapage(NULL, &parsed, (uint32_t)dim, n_pages,
-                             true, &table, &policy, NULL);
+                             false, &table, &policy, NULL);
     hnsw_write_disk_pages(NULL, f.hnsw_fd, f.tids_fd, &parsed, N,
-                          (uint32_t)dim, bytes_per_dim, n_pages, true, &table);
+                          (uint32_t)dim, bytes_per_dim, n_pages, false, &table);
+    assert(chain_test_wal_images == n_pages + 1);
+    assert(CritSectionCount == 0);
     assert_source_data_page_chain(n_pages);
     {
         PgvHnswMeta *meta = (PgvHnswMeta *)PageGetContents(chain_test_pages[0]);
