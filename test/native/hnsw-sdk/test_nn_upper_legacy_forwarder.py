@@ -30,13 +30,13 @@ namespace raft { struct resources {}; struct row_major {};
 }
 namespace cuvs::distance { enum class DistanceType { L2, IP }; }
 struct Half {};
-struct Seen { int data, neighbors; size_t dtype; const std::optional<size_t> *host,*gpu; cuvs::distance::DistanceType metric; } seen;
+struct Seen { int data, neighbors; size_t dtype; const std::optional<size_t> *host,*gpu; bool host_set,gpu_set; cuvs::distance::DistanceType metric; } seen;
 template<class T> void all_neighbors_graph(raft::resources const&,
  raft::host_matrix_view<const T,int64_t,raft::row_major> dataset,
  raft::host_matrix_view<uint32_t,int64_t,raft::row_major> neighbors,
  cuvs::distance::DistanceType metric,const std::optional<size_t>& host,
  const std::optional<size_t>& gpu,size_t dtype) {
- seen={dataset.marker,neighbors.marker,dtype,&host,&gpu,metric};
+ seen={dataset.marker,neighbors.marker,dtype,&host,&gpu,host.has_value(),gpu.has_value(),metric};
 }
 '''
 suffix=r'''
@@ -45,6 +45,7 @@ template<class T> void legacy(const std::optional<size_t>& host,const std::optio
  raft::host_matrix_view<uint32_t,int64_t,raft::row_major> neighbors{id+10};
  all_neighbors_graph(res,data,neighbors,cuvs::distance::DistanceType::IP,host,gpu);
  assert(seen.data==id && seen.neighbors==id+10 && seen.dtype==0);
+ assert(seen.host_set && seen.gpu_set);
  assert(seen.host==&host && seen.gpu==&gpu && seen.metric==cuvs::distance::DistanceType::IP);
 }
 int main() {
@@ -54,6 +55,8 @@ int main() {
  raft::host_matrix_view<uint32_t,int64_t,raft::row_major> neighbors{19};
  all_neighbors_graph(res,data,neighbors,cuvs::distance::DistanceType::IP,host,gpu,SIZE_MAX-1);
  assert(seen.dtype==SIZE_MAX-1 && seen.host==&host && seen.gpu==&gpu);
+ all_neighbors_graph(res,data,neighbors,cuvs::distance::DistanceType::IP);
+ assert(seen.dtype==0 && !seen.host_set && !seen.gpu_set);
  puts("four legacy type forwarders and new NN sentinel: PASS (CPU mock)");
 }
 '''
