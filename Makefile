@@ -340,6 +340,21 @@ test-hnsw-explicit-route: test/unit/test_hnsw_explicit_route.c src/cuvs_hnsw_bui
 	$(CC) -std=gnu11 -Wall -Wextra -Werror -I src -o $@ test/unit/test_hnsw_explicit_route.c -lpthread
 	./$@
 
+.PHONY: test-hnsw-nn-precision test-hnsw-nn-policy test-hnsw-nn-capacity
+test-hnsw-nn-precision: test/unit/test_hnsw_nn_precision.c src/cuvs_hnsw_nn_precision.h
+	$(CC) -std=gnu11 -Wall -Wextra -Werror -I src -o $@ test/unit/test_hnsw_nn_precision.c -lm
+	./$@
+
+test-hnsw-nn-policy: test/unit/test_hnsw_nn_policy.c src/cuvs_hnsw_policy.h
+	$(CC) -std=gnu11 -Wall -Wextra -Werror -I src -o $@ test/unit/test_hnsw_nn_policy.c
+	./$@
+
+test-hnsw-nn-capacity: test/unit/test_hnsw_nn_capacity.c src/cuvs_hnsw_nn_capacity.h
+	$(CC) -std=gnu11 -Wall -Wextra -Werror -I src -o $@ test/unit/test_hnsw_nn_capacity.c -lm
+	./$@
+
+EXTRA_CLEAN += test-hnsw-nn-policy test-hnsw-nn-precision test-hnsw-nn-capacity
+
 # I3-C: CK-17 (12)-(14) auto overflow, pre-spool decision, CAGRA reltuples AR0.
 test-hnsw-auto-overflow: test/unit/test_hnsw_auto_overflow.c src/cuvs_route_preflight.h \
                          src/cuvs_hnsw_build_common.h src/cuvs_hnsw_policy.h src/cuvs_admission_contract.h
