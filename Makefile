@@ -138,13 +138,13 @@ src/cuvs_wrapper.o: | verify-hnsw-sdk-plan
 endif
 
 src/cuvs_wrapper.o: src/cuvs_wrapper.cu src/cuvs_wrapper.h src/cuvs_hnsw_sdk_plan.cuh \
-                    src/cuvs_hnsw_nn_sdk_params.cuh src/cuvs_hnsw_nn_precision.h src/cuvs_hnsw_nn_capacity.h \
+                    src/cuvs_hnsw_nn_sdk_params.cuh src/cuvs_hnsw_nn_precision.h src/cuvs_hnsw_nn_capacity.h src/cuvs_hnsw_nn_upper_contract.h \
                     src/cuvs_failed_allocation.hpp src/cuvs_rmm_failure_resource.hpp
 	$(NVCC) $(NVCC_FLAGS) $(CUVS_SDK_PLAN_FLAGS) -I$(CUVS_INCLUDE) -I$(CUVS_RAPIDS_INCLUDE) -I./src -c $< -o $@
 
 # PGXS generates LLVM bitcode (.bc) from .c sources for JIT. The .cu file
 # has no PG-callable functions, so emit a stub bitcode so PGXS doesn't fail.
-src/cuvs_wrapper.bc: src/cuvs_wrapper.cu src/cuvs_hnsw_nn_sdk_params.cuh src/cuvs_hnsw_nn_precision.h src/cuvs_hnsw_nn_capacity.h src/cuvs_failed_allocation.hpp src/cuvs_rmm_failure_resource.hpp
+src/cuvs_wrapper.bc: src/cuvs_wrapper.cu src/cuvs_hnsw_nn_sdk_params.cuh src/cuvs_hnsw_nn_precision.h src/cuvs_hnsw_nn_capacity.h src/cuvs_hnsw_nn_upper_contract.h src/cuvs_failed_allocation.hpp src/cuvs_rmm_failure_resource.hpp
 	@echo 'void cuvs_wrapper_jit_stub(void){}' > /tmp/_cuvs_stub.c
 	@clang-15 -emit-llvm -c /tmp/_cuvs_stub.c -o $@ 2>/dev/null \
 		|| clang -emit-llvm -c /tmp/_cuvs_stub.c -o $@

@@ -19,6 +19,7 @@
 #include <cuvs/neighbors/cagra.hpp>
 #include "cuvs_hnsw_sdk_plan.cuh"  /* serialize/deserialize merged here in cuVS 25.x+ */
 #include "cuvs_hnsw_nn_sdk_params.cuh"
+#include "cuvs_hnsw_nn_upper_contract.h"
 #include <cuvs/neighbors/hnsw.hpp>   /* Phase 3I-1: CPU HNSW fallback */
 #include <cuvs/neighbors/ivf_pq.hpp> /* 3P: IVF-PQ index */
 #include <cuvs/neighbors/nn_descent.hpp> /* has_enough_device_memory (CAGRA AUTO kNN choice) */
@@ -2946,6 +2947,9 @@ static int execute_hnsw_file_build(const CuvsHnswFileBuild *params, int owner_fd
             {
                 cagra::graph_build_params::ace_params upper;
                 upper.use_disk = false;
+                /* Private protocol: no ACE partition is built on this path. */
+                upper.npartitions = readback.dtype == CUVS_HNSW_NN_FP32
+                    ? PGC_UVS_NN_UPPER_FP32 : PGC_UVS_NN_UPPER_FP16;
                 upper.max_host_memory_gb = (double)sdk_host_budget / (UINT64_C(1) << 30);
                 upper.max_gpu_memory_gb = (double)sdk_gpu_budget / (UINT64_C(1) << 30);
                 hp.graph_build_params = upper;
@@ -3097,7 +3101,7 @@ cuvs_hnsw_build_file(int vectors_fd, int owner_fd,
         }
         if (params->hierarchy && params->build_algo == CUVS_HNSW_ALGO_NN_DESCENT
             && !hnsw_sdk_marker_verified("pgcuvs_hnsw_resident_nn_upper_patch_id",
-                "pgcuvs-hnsw-resident-nn-upper-v1@616eb202e83f558b59755b521d4d949e5b7b8305"))
+                "pgcuvs-hnsw-resident-nn-upper-v2@616eb202e83f558b59755b521d4d949e5b7b8305"))
         {
             snprintf(error, error_len, "resident NN hierarchy requires the matching SDK upper precision guard");
             return CUVS_STATUS_BUILD_FAILED;

@@ -3874,11 +3874,13 @@ pg_cuvs_hnsw_build_info(PG_FUNCTION_ARGS)
             ",\"nn_readback_version\":%u,\"nn_graph_degree\":%u,\"nn_internal_degree\":%u,"
             "\"nn_sdk_default_iterations\":%u,\"nn_configured_max_iterations\":%u,"
             "\"nn_actual_iterations\":null,\"nn_seed\":null,\"nn_distance_dtype\":\"%s\",\"nn_termination_threshold\":%.9g,"
-            "\"nn_upper_builder\":\"%s\",\"nn_upper_dtype\":\"%s\"",
+            "\"nn_upper_builder\":\"%s\",\"nn_upper_dtype\":\"%s\","
+            "\"nn_upper_dtype_configured\":\"%s\"",
             nn.version, nn.graph_degree, nn.internal_degree, nn.sdk_default_iterations, nn.max_iterations,
             nn.dtype == CUVS_HNSW_NN_DTYPE_FP32 ? "fp32" : "fp16", nn.termination_threshold,
             policy.hierarchy ? "configured_nn_descent_if_built" : "not_applicable",
-            policy.hierarchy ? "per_level_not_recorded" : "not_applicable");
+            policy.hierarchy ? "per_level_not_recorded" : "not_applicable",
+            !policy.hierarchy ? "not_applicable" : nn.dtype == CUVS_HNSW_NN_DTYPE_FP32 ? "fp32" : "fp16");
     appendStringInfoChar(&json, '}');
     PG_RETURN_DATUM(DirectFunctionCall1(jsonb_in, CStringGetDatum(json.data)));
 }
