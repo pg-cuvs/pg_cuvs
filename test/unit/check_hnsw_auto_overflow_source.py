@@ -141,7 +141,7 @@ def check(src):
     oom = b.split('if (rc == CUVS_STATUS_OOM_FALLBACK)', 1)
     seg = oom[1].split('if (rc != CUVS_STATUS_OK)', 1)[0] if len(oom) == 2 else ''
     assert 'errcode(ERRCODE_OUT_OF_MEMORY)' in seg and 'cuvs_hnsw_oom_hint(build_algo)' in seg, 'HNSW_OOM_53200'
-    assert b.index('if (rc == CUVS_STATUS_OOM_FALLBACK)') < b.index('if (rc != CUVS_STATUS_OK)'), 'HNSW_OOM_BEFORE_GENERIC'
+    assert b.index('if (rc == CUVS_STATUS_OOM_FALLBACK)') < b.index('if (rc != CUVS_STATUS_OK)\n                ereport(ERROR'), 'HNSW_OOM_BEFORE_GENERIC'
     # v5 C5 / v6 C5: status-13 DETAIL is exactly the six MiB fields
     be = function(code['backend'], 'cuvs_hnsw_budget_error(uint32_t build_algo')
     assert 'cuvs_hnsw_budget_detail(detail, sizeof(detail), budget)' in be and 'errdetail("%s", detail)' in be, 'STATUS13_DETAIL_SIX_FIELDS'

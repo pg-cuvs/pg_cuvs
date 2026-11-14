@@ -395,6 +395,7 @@ typedef struct CuvsHnswFileBuild {
     uint32_t auto_overflow; /* CUVS_HNSW_OVERFLOW_*: daemon --hnsw-auto-overflow */
     uint32_t ace_quality;   /* CUVS_HNSW_ACE_QUALITY_AUTO or Q: daemon --hnsw-ace-build-quality */
     CuvsHnswPolicy *policy; /* successful actual build receipt; caller-owned */
+    CuvsHnswNnReadback *nn_readback; /* successful direct NN consumed settings */
     /* Internal safe-boundary observer. Never received from IPC; only a
      * CUVS_TEST_HOOKS daemon installs it for controlled failure fixtures. */
     int (*phase_hook)(void *arg, const char *phase);

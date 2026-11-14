@@ -7,7 +7,7 @@
 /* Estimate, not a hard allocation limit: unquantified SDK allocator and
  * hierarchy/serializer scratch remain outside a proven peak bound. */
 typedef struct CuvsHnswNnCapacity {
-    uint64_t raw_bytes, build_host, serialize_host, build_gpu, sort_gpu;
+    uint64_t raw_bytes, build_host, serialize_host, build_gpu, sort_gpu, hierarchy_gpu;
     uint64_t host_peak, gpu_peak;
 } CuvsHnswNnCapacity;
 
@@ -50,6 +50,12 @@ cuvs_hnsw_nn_capacity(uint64_t n, uint32_t dim, uint32_t degree, uint32_t interm
      * locks/maps and hierarchy scratch. Count mapped input pages. */
     serial_row = row * (hierarchy ? 6 : 4)
         + ((uint64_t)intermediate + 3 * (uint64_t)degree) * 8 + 256;
+    if (hierarchy)
+    {
+        uint64_t upper_degree = ((uint64_t)degree + 1) / 2;
+        serial_row += 8 * cuvs_hnsw_nn_extended(upper_degree) + 916
+            + 2 * cuvs_hnsw_nn_extended(2 * upper_degree) + 4 * upper_degree;
+    }
     if (cuvs_hnsw_nn_mul(n, row, &out->raw_bytes)
         || cuvs_hnsw_nn_mul(n, build_row, &out->build_host)
         || cuvs_hnsw_nn_mul(n, serial_row, &out->serialize_host)
@@ -58,9 +64,14 @@ cuvs_hnsw_nn_capacity(uint64_t n, uint32_t dim, uint32_t degree, uint32_t interm
         || cuvs_hnsw_nn_mul(n < 100000 ? n : 100000, row, &staging)
         || cuvs_hnsw_nn_add(out->build_gpu, staging, &out->build_gpu)
         || cuvs_hnsw_nn_mul(n, row + (uint64_t)intermediate * 4, &out->sort_gpu)) return -1;
+    out->hierarchy_gpu = 0;
+    if (hierarchy && (cuvs_hnsw_nn_mul(n, row + 280 + (uint64_t)degree * 4,
+                                       &out->hierarchy_gpu)
+        || cuvs_hnsw_nn_add(out->hierarchy_gpu, staging, &out->hierarchy_gpu))) return -1;
     peak = out->build_host > out->serialize_host ? out->build_host : out->serialize_host;
     if (cuvs_hnsw_nn_add(peak, reserve, &out->host_peak)) return -1;
     peak = out->build_gpu > out->sort_gpu ? out->build_gpu : out->sort_gpu;
+    if (out->hierarchy_gpu > peak) peak = out->hierarchy_gpu;
     return cuvs_hnsw_nn_add(peak, reserve, &out->gpu_peak);
 }
 #endif

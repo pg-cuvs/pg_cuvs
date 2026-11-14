@@ -871,7 +871,7 @@ test_hierarchical_native_packing_case(int dim, int bytes_per_dim, int m)
     chain_test_reset();
     chain_test_nblocks = 0;
     hnsw_write_disk_metapage(NULL, &parsed, (uint32_t)dim, n_pages,
-                             true, &table, &policy, NULL);
+                             true, &table, &policy, NULL, NULL);
     hnsw_write_disk_pages(NULL, f.hnsw_fd, f.tids_fd, &parsed, N,
                           (uint32_t)dim, bytes_per_dim, n_pages, true, &table);
     assert_source_data_page_chain(n_pages);
@@ -1285,7 +1285,7 @@ test_ace_readback_metapage_roundtrip(void)
     assert(cuvs_hnsw_ace_readback_valid(&ace, &p));
 
     chain_test_reset();
-    hnsw_write_disk_metapage(NULL, &hdr, 2, 1, true, &table, &p, &ace);
+    hnsw_write_disk_metapage(NULL, &hdr, 2, 1, true, &table, &p, &ace, NULL);
     meta = (Page)chain_test_pages[chain_test_nblocks - 1];
     assert(((PageHeader)meta)->pd_lower == prefix + sizeof(p) + sizeof(ace));
     assert(memcmp((char *)meta + prefix, &p, sizeof(p)) == 0); /* receipt bytes unchanged */
@@ -1315,7 +1315,7 @@ test_ace_readback_metapage_roundtrip(void)
     resident.requested_algo = CUVS_HNSW_ALGO_IVF_PQ; resident.partitions = 0;
     assert(cuvs_hnsw_policy_valid(&resident));
     chain_test_reset();
-    hnsw_write_disk_metapage(NULL, &hdr, 2, 1, true, &table, &resident, &ace);
+    hnsw_write_disk_metapage(NULL, &hdr, 2, 1, true, &table, &resident, &ace, NULL);
     meta = (Page)chain_test_pages[chain_test_nblocks - 1];
     assert(((PageHeader)meta)->pd_lower == prefix + sizeof(resident));
 
@@ -1329,15 +1329,34 @@ test_ace_readback_metapage_roundtrip(void)
         bad.local_intermediate = 128;
         assert(freopen("/dev/null", "w", stderr) != NULL);
         chain_test_reset();
-        hnsw_write_disk_metapage(NULL, &hdr, 2, 1, true, &table, &p, &bad);
+        hnsw_write_disk_metapage(NULL, &hdr, 2, 1, true, &table, &p, &bad, NULL);
         _exit(0); /* reaching here means the writer accepted it */
     }
     assert(waitpid(child, &status, 0) == child);
     assert(WIFSIGNALED(status) && WTERMSIG(status) == SIGABRT);
 
+    /* Production writer/reader roundtrip for the v3 NN tail. */
+    CuvsHnswNnReadback nn = {0};
+    p.version = CUVS_HNSW_POLICY_NN_VERSION;
+    p.route = p.internal_builder = CUVS_HNSW_ROUTE_NN_DESCENT;
+    p.requested_algo = CUVS_HNSW_ALGO_NN_DESCENT; p.partitions = 0; p.ace_ef = 0;
+    p.n_rows = 10000; p.degree = 64; p.intermediate = 128;
+    nn.magic = CUVS_HNSW_NN_READBACK_MAGIC; nn.version = 1; nn.bytes = sizeof(nn);
+    nn.graph_degree = 128; nn.internal_degree = 192; nn.sdk_default_iterations = 20;
+    nn.max_iterations = 20; nn.dtype = CUVS_HNSW_NN_DTYPE_FP32; nn.termination_threshold = 0.0001f;
+    chain_test_reset();
+    hnsw_write_disk_metapage(NULL, &hdr, 2, 1, true, &table, &p, &ace, &nn);
+    meta = (Page)chain_test_pages[chain_test_nblocks - 1];
+    assert(((PageHeader)meta)->pd_lower == prefix + sizeof(p) + sizeof(nn));
+    assert(hnsw_read_disk_policy(meta, &out) == CUVS_HNSW_POLICY_RECORDED);
+    assert(memcmp((char *)meta + prefix + sizeof(p), &nn, sizeof(nn)) == 0);
+    ((PageHeader)meta)->pd_lower--;
+    assert(hnsw_read_disk_policy(meta, &out) == CUVS_HNSW_POLICY_CORRUPT);
+
     fixture_close(&f);
     BufFileClose(&fake_file);
     puts("PASS ACE readback metapage roundtrip: bytes at prefix+receipt, pd_lower, older/foreign/truncated tails, resident has none, writer refuses invalid");
+    puts("PASS NN v3 metapage roundtrip and truncated tail rejection (CPU fixture)");
 }
 
 int

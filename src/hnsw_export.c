@@ -2699,7 +2699,7 @@ static void
 hnsw_write_disk_metapage(Relation rel, const HnswlibHeader *header,
                          uint32_t dim, uint32_t n_data_pages, bool skip_wal,
                          HnswLocationTable *locations, const CuvsHnswPolicy *policy,
-                         const CuvsHnswAceReadback *ace)
+                         const CuvsHnswAceReadback *ace, const CuvsHnswNnReadback *nn)
 {
     Page staged = (Page)palloc(BLCKSZ);
     HnswNodeLocation entry;
@@ -2724,6 +2724,15 @@ hnsw_write_disk_metapage(Relation rel, const HnswlibHeader *header,
         memcpy((char *)PageGetContents(staged) + sizeof(PgvHnswMeta) + sizeof(*policy),
                ace, sizeof(*ace));
         ((PageHeader)staged)->pd_lower += sizeof(*ace);
+    }
+    if (policy->route == CUVS_HNSW_ROUTE_NN_DESCENT)
+    {
+        if (!cuvs_hnsw_nn_readback_valid(nn, policy)
+            || ((PageHeader)staged)->pd_lower + sizeof(*nn) > ((PageHeader)staged)->pd_upper)
+            ereport(ERROR, (errmsg("pg_cuvs: invalid NN readback or insufficient metapage space")));
+        memcpy((char *)PageGetContents(staged) + sizeof(PgvHnswMeta) + sizeof(*policy),
+               nn, sizeof(*nn));
+        ((PageHeader)staged)->pd_lower += sizeof(*nn);
     }
     hnsw_publish_staged_page(rel, staged, skip_wal);
     pfree(staged);
@@ -2882,7 +2891,7 @@ hnsw_import_build_result(Relation indexRel,
         }
         hnsw_write_disk_metapage(s->target, &header, build->dim,
                                  data_page_count, skip_wal, &s->locations, &build->policy,
-                                 &build->ace);
+                                 &build->ace, &build->nn);
         hnsw_write_disk_pages(s->target, build->hnsw_fd, build->tids_fd,
                               &header, build->n_vecs, build->dim,
                               bytes_per_dim, data_page_count, skip_wal,
@@ -3716,14 +3725,9 @@ static void
 cuvs_hnsw_validate_build_algo(const char *value)
 {
     if (cuvs_hnsw_algo_supported(cuvs_hnsw_algo_from_name(value))) return;
-    if (!strcmp(value, "nn_descent"))
-        ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-            errmsg("pg_cuvs_hnsw: build_algo=nn_descent is reserved but unsupported"),
-            errdetail("NN-descent has no supported memory estimate for this build path."),
-            errhint("Use build_algo=auto for tiny/resident IVF-PQ, or build_algo=ace for an explicit disk build.")));
     ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
         errmsg("pg_cuvs_hnsw: invalid build_algo \"%s\"", value),
-        errhint("Valid supported values: auto, ivf_pq, ace.")));
+        errhint("Valid supported values: auto, ivf_pq, nn_descent, ace.")));
 }
 
 /* One-time relopt registration; called from _PG_init. */
@@ -3738,7 +3742,7 @@ cuvs_hnsw_init_reloptions(void)
                          "Conversion mode: nsw (default), hnsw, hnswlib, hnswlib_file",
                          "nsw", cuvs_hnsw_validate_mode, AccessExclusiveLock);
     add_string_reloption(cuvs_hnsw_relopt_kind, "build_algo",
-                         "HNSW route: auto=tiny/resident IVF-PQ, explicit ivf_pq or ace; estimates are not memory upper bounds",
+                         "HNSW route: auto=tiny/resident IVF-PQ, explicit ivf_pq, nn_descent or ace; estimates are not memory upper bounds",
                          "auto", cuvs_hnsw_validate_build_algo, AccessExclusiveLock);
     add_int_reloption(cuvs_hnsw_relopt_kind, "m",
                       "pgvector HNSW M; informational (graph degree drives layout)",
@@ -3775,6 +3779,7 @@ pg_cuvs_hnsw_build_info(PG_FUNCTION_ARGS)
     CuvsHnswPolicy policy = {0};
     CuvsHnswPolicyReadStatus policy_status = CUVS_HNSW_POLICY_NOT_RECORDED;
     CuvsHnswAceReadback ace = {0};
+    CuvsHnswNnReadback nn = {0};
     CuvsHnswPolicyReadStatus ace_status = CUVS_HNSW_POLICY_NOT_RECORDED;
     StringInfoData json;
     Oid heap;
@@ -3793,6 +3798,8 @@ pg_cuvs_hnsw_build_info(PG_FUNCTION_ARGS)
         policy_status = hnsw_read_disk_policy(page, &policy);
         if (policy_status == CUVS_HNSW_POLICY_RECORDED && policy.route == CUVS_HNSW_ROUTE_ACE)
             ace_status = hnsw_read_disk_ace(page, &policy, &ace);
+        if (policy_status == CUVS_HNSW_POLICY_RECORDED && policy.route == CUVS_HNSW_ROUTE_NN_DESCENT)
+            memcpy(&nn, (const char *)PageGetContents(page) + sizeof(PgvHnswMeta) + sizeof(policy), sizeof(nn));
         UnlockReleaseBuffer(buffer);
     }
     index_close(rel, AccessShareLock);
@@ -3862,6 +3869,16 @@ pg_cuvs_hnsw_build_info(PG_FUNCTION_ARGS)
         else
             appendStringInfoString(&json, "\"ace_local_nn_descent_iterations\":\"varies_by_partition\"");
     }
+    if (policy.route == CUVS_HNSW_ROUTE_NN_DESCENT)
+        appendStringInfo(&json,
+            ",\"nn_readback_version\":%u,\"nn_graph_degree\":%u,\"nn_internal_degree\":%u,"
+            "\"nn_sdk_default_iterations\":%u,\"nn_configured_max_iterations\":%u,"
+            "\"nn_actual_iterations\":null,\"nn_seed\":null,\"nn_distance_dtype\":\"%s\",\"nn_termination_threshold\":%.9g,"
+            "\"nn_upper_builder\":\"%s\",\"nn_upper_dtype\":\"%s\"",
+            nn.version, nn.graph_degree, nn.internal_degree, nn.sdk_default_iterations, nn.max_iterations,
+            nn.dtype == CUVS_HNSW_NN_DTYPE_FP32 ? "fp32" : "fp16", nn.termination_threshold,
+            policy.hierarchy ? "configured_nn_descent_if_built" : "not_applicable",
+            policy.hierarchy ? "per_level_not_recorded" : "not_applicable");
     appendStringInfoChar(&json, '}');
     PG_RETURN_DATUM(DirectFunctionCall1(jsonb_in, CStringGetDatum(json.data)));
 }

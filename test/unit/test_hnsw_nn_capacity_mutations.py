@@ -12,6 +12,7 @@ mutations = {
     'batch staging': ('n < 100000 ? n : 100000, row, &staging', '0, row, &staging'),
     'fp32 dataset': ('dtype == CUVS_HNSW_NN_FP32 ? 4 : 2', 'dtype == CUVS_HNSW_NN_FP32 ? 2 : 2'),
     'host bloom': ('8 * e + 916 + 2 * q', '8 * e + 916 + 0 * q'),
+    'upper hierarchy peak': ('out->hierarchy_gpu, staging, &out->hierarchy_gpu', 'out->hierarchy_gpu, 0, &out->hierarchy_gpu'),
     'serialize hierarchy': ('row * (hierarchy ? 6 : 4)', 'row * (hierarchy ? 4 : 4)'),
 }
 with tempfile.TemporaryDirectory(prefix='pgcuvs-nn-capacity-') as tmp:

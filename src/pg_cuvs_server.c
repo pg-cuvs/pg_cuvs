@@ -10374,6 +10374,7 @@ handle_build_hnsw_file(int client_fd, const CuvsCmdFrame *cmd)
     params.auto_overflow = g_hnsw_auto_overflow;
     params.ace_quality = g_hnsw_ace_quality;
     params.policy = &wire.policy;
+    params.nn_readback = &wire.nn;
     if (cuvs_hnsw_wait_for_idle(&g_index_mutex, owner_fd, hnsw_gpu_work_pending, NULL))
         goto cancelled;
     locked = 1;

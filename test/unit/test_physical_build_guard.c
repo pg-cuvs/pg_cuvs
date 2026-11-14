@@ -190,14 +190,14 @@ static void *hnsw_client(void *arg)
     HnswCall *c=arg;int result=-1;char error[128];CuvsHnswPolicy policy;
     CuvsHnswBudgetSnapshot budget;CuvsHnswAceReadback ace;
     int rc=cuvs_ipc_build_hnsw_file(c->sock,c->fd,N,DIM,CUVS_METRIC_L2,4,8,0,
-        UINT64_C(1)<<30,CUVS_HNSW_ALGO_IVF_PQ,64,&policy,&budget,&ace,&result,error,sizeof(error));
+        UINT64_C(1)<<30,CUVS_HNSW_ALGO_IVF_PQ,64,&policy,&budget,&ace,NULL,&result,error,sizeof(error));
     assert(rc==CUVS_STATUS_OOM_FALLBACK && result==-1);
     last_reply.status=rc;
     snprintf(last_reply.err_out,sizeof(last_reply.err_out),"%s",cuvs_ipc_last_err_out());
     snprintf(last_reply.notice_out,sizeof(last_reply.notice_out),"%s",cuvs_ipc_last_notice_out());
     check_refusal();
     rc=cuvs_ipc_build_hnsw_file(c->sock,c->fd,0,DIM,CUVS_METRIC_L2,4,8,0,
-        UINT64_C(1)<<30,CUVS_HNSW_ALGO_IVF_PQ,64,&policy,&budget,&ace,&result,error,sizeof(error));
+        UINT64_C(1)<<30,CUVS_HNSW_ALGO_IVF_PQ,64,&policy,&budget,&ace,NULL,&result,error,sizeof(error));
     assert(rc!=0 && !cuvs_ipc_last_err_out()[0] && !cuvs_ipc_last_notice_out()[0]);
     return NULL;
 }

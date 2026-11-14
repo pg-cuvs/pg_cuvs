@@ -499,7 +499,7 @@ cagra/ivfpq") rather than silently failing.
 | `mode` | string | `nsw` | `nsw`, `hnswlib`, `hnsw`, `hnswlib_file` | `nsw` and `hnswlib` are recommended |
 | `m` | int | `16` | 2–100 | **informational** — the CAGRA graph degree drives the HNSW layout, not `m` |
 | `ef_construction` | int | `64` | 4–1000 | Direct heap build: construction effort; source reuse: informational |
-| `build_algo` | enum | `auto` | `auto`, `ivf_pq`, `ace` | Direct heap build only; cannot be combined with explicit `source` |
+| `build_algo` | enum | `auto` | `auto`, `ivf_pq`, `nn_descent`, `ace` | Direct heap build only; cannot be combined with explicit `source` |
 
 For direct heap construction, `auto` uses tiny exact GPU construction below 16 rows and
 otherwise the resident IVF-PQ route while its estimate fits the host and GPU budgets.
@@ -527,11 +527,15 @@ mislead the early decision; run `ANALYZE` first. The `cagra` AM likewise refuses
 certain AR0 (estimated final size over the per-GPU limit, unsharded) before its scan
 when statistics exist.
 Explicit `ace` consumes the matching patched SDK/planner and a private disk workdir.
-`nn_descent` is reserved for this direct HNSW surface and is rejected until a supported
-memory model exists; the separate `cagra` AM has its own build-algorithm options.
+`nn_descent` requests a resident NN-descent base graph and never falls back to another
+builder. It rejects fewer than 16 rows, an effective intermediate degree above 1024,
+nonfinite inputs and inputs whose conservative FP32 distance bound overflows. Its
+admission estimate uses FP32 dataset storage even when the selected base dtype is FP16;
+the estimate is not an allocator or RSS upper bound. GPU hierarchy requires the matching
+resident-NN upper-precision SDK patch; per-level upper dtype is logged, not stored.
 
-An over-budget refusal (SQLSTATE 54000, `pg_cuvs: resident IVF-PQ estimate exceeds the
-HNSW build budget`) has the DETAIL `he=<MiB> hb=<MiB> ge=<MiB> gb=<MiB> rp=<MiB> rl=<MiB>`:
+An over-budget refusal (SQLSTATE 54000, naming the resident IVF-PQ or NN-descent
+estimate) has the DETAIL `he=<MiB> hb=<MiB> ge=<MiB> gb=<MiB> rp=<MiB> rl=<MiB>`:
 the host estimate and budget, the GPU estimate and budget, the RMM pool's used bytes
 (0 without a pool) and the daemon's logical GPU use (`rl`; a reloaded index counts a
 graph_degree-64 estimate, so it can differ from `rp`), each in MiB rounded down. The

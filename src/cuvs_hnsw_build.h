@@ -16,6 +16,7 @@ typedef struct CuvsHnswBuildResult {
     double reltuples;
     CuvsHnswPolicy policy;
     CuvsHnswAceReadback ace;  /* ACE route only (cuvs_hnsw_policy.h) */
+    CuvsHnswNnReadback nn;    /* direct resident NN route only */
 } CuvsHnswBuildResult;
 
 void cuvs_build_hnsw_from_heap(Relation heapRel, Relation indexRel,

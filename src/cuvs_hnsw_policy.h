@@ -8,7 +8,7 @@
 
 #define CUVS_HNSW_ALGO_AUTO 0u
 #define CUVS_HNSW_ALGO_IVF_PQ 1u
-#define CUVS_HNSW_ALGO_NN_DESCENT 2u /* reserved; no supported memory model */
+#define CUVS_HNSW_ALGO_NN_DESCENT 2u
 #define CUVS_HNSW_ALGO_ACE 3u
 #define CUVS_HNSW_MIN_ELEMENTS 16
 #define CUVS_HNSW_ROUTE_TINY 1u
@@ -95,11 +95,11 @@ typedef struct CuvsHnswPolicy {
     uint64_t sdk_host_budget, sdk_gpu_budget;
 } CuvsHnswPolicy;
 
-/* HNSW options are not a numeric range: reserved NN-descent must stay closed. */
+/* HNSW options are not a numeric range. */
 static inline int cuvs_hnsw_algo_supported(uint32_t algo)
 {
     return algo == CUVS_HNSW_ALGO_AUTO || algo == CUVS_HNSW_ALGO_IVF_PQ
-        || algo == CUVS_HNSW_ALGO_ACE;
+        || algo == CUVS_HNSW_ALGO_ACE || algo == CUVS_HNSW_ALGO_NN_DESCENT;
 }
 
 static inline const char *cuvs_hnsw_algo_name(uint32_t algo)
@@ -107,6 +107,7 @@ static inline const char *cuvs_hnsw_algo_name(uint32_t algo)
     switch (algo) {
     case CUVS_HNSW_ALGO_AUTO: return "auto";
     case CUVS_HNSW_ALGO_IVF_PQ: return "ivf_pq";
+    case CUVS_HNSW_ALGO_NN_DESCENT: return "nn_descent";
     case CUVS_HNSW_ALGO_ACE: return "ace";
     default: return "unsupported";
     }
@@ -127,8 +128,22 @@ static inline const char *cuvs_hnsw_route_name(uint32_t route)
     case CUVS_HNSW_ROUTE_TINY: return "tiny";
     case CUVS_HNSW_ROUTE_IVF_PQ: return "resident_ivf_pq";
     case CUVS_HNSW_ROUTE_ACE: return "ace_disk";
+    case CUVS_HNSW_ROUTE_NN_DESCENT: return "resident_nn_descent";
     default: return "unknown";
     }
+}
+
+/* Preflight decisions exclude R1, which happens only after a build begins. */
+static inline int cuvs_hnsw_forecast_matches(uint32_t requested, uint32_t route, uint32_t overflowed)
+{
+    if (overflowed > 1) return 0;
+    if (requested == CUVS_HNSW_ALGO_AUTO)
+        return (route == CUVS_HNSW_ROUTE_ACE && overflowed)
+            || ((route == CUVS_HNSW_ROUTE_TINY || route == CUVS_HNSW_ROUTE_IVF_PQ) && !overflowed);
+    if (overflowed) return 0;
+    return (requested == CUVS_HNSW_ALGO_IVF_PQ && route == CUVS_HNSW_ROUTE_IVF_PQ)
+        || (requested == CUVS_HNSW_ALGO_ACE && route == CUVS_HNSW_ROUTE_ACE)
+        || (requested == CUVS_HNSW_ALGO_NN_DESCENT && route == CUVS_HNSW_ROUTE_NN_DESCENT);
 }
 
 /* Reloption default64 preserves I128 / hierarchy200 (ACE: cuvs_hnsw_ace_ef). These control
@@ -294,8 +309,8 @@ typedef enum CuvsHnswPolicyReadStatus {
     CUVS_HNSW_POLICY_CORRUPT
 } CuvsHnswPolicyReadStatus;
 
-/* Bounded metapage tail reader; v1/v2 have the same layout. Unknown future
- * versions are unsupported, not proof of index corruption or absent history. */
+/* Bounded metapage reader; v1/v2/v3 share the receipt prefix and v3 requires
+ * an NN tail. Unknown versions are unsupported, not proof of corruption. */
 static inline CuvsHnswPolicyReadStatus
 cuvs_hnsw_policy_read(const void *data, size_t available, CuvsHnswPolicy *out)
 {

@@ -138,12 +138,13 @@ src/cuvs_wrapper.o: | verify-hnsw-sdk-plan
 endif
 
 src/cuvs_wrapper.o: src/cuvs_wrapper.cu src/cuvs_wrapper.h src/cuvs_hnsw_sdk_plan.cuh \
+                    src/cuvs_hnsw_nn_sdk_params.cuh src/cuvs_hnsw_nn_precision.h src/cuvs_hnsw_nn_capacity.h \
                     src/cuvs_failed_allocation.hpp src/cuvs_rmm_failure_resource.hpp
 	$(NVCC) $(NVCC_FLAGS) $(CUVS_SDK_PLAN_FLAGS) -I$(CUVS_INCLUDE) -I$(CUVS_RAPIDS_INCLUDE) -I./src -c $< -o $@
 
 # PGXS generates LLVM bitcode (.bc) from .c sources for JIT. The .cu file
 # has no PG-callable functions, so emit a stub bitcode so PGXS doesn't fail.
-src/cuvs_wrapper.bc: src/cuvs_wrapper.cu src/cuvs_failed_allocation.hpp src/cuvs_rmm_failure_resource.hpp
+src/cuvs_wrapper.bc: src/cuvs_wrapper.cu src/cuvs_hnsw_nn_sdk_params.cuh src/cuvs_hnsw_nn_precision.h src/cuvs_hnsw_nn_capacity.h src/cuvs_failed_allocation.hpp src/cuvs_rmm_failure_resource.hpp
 	@echo 'void cuvs_wrapper_jit_stub(void){}' > /tmp/_cuvs_stub.c
 	@clang-15 -emit-llvm -c /tmp/_cuvs_stub.c -o $@ 2>/dev/null \
 		|| clang -emit-llvm -c /tmp/_cuvs_stub.c -o $@
@@ -280,6 +281,7 @@ TEST_RT_LIB := $(shell [ "$$(uname -s)" = "Linux" ] && echo -lrt)
 test-unit: test-compact-retry test-device-norm test-failed-allocation test-build-oom-log test-peak-log-switch test/unit/test_cuvs_util.c src/cuvs_util.c src/cuvs_util.h src/cuvs_ipc.h \
            test/unit/test_build_corpus.c src/cuvs_build_corpus.c src/cuvs_build_corpus.h \
            test-hnsw-build test-hnsw-build-ipc test-hnsw-ace-quality test-hnsw-admission test-admission-contract \
+           test-hnsw-nn-policy test-hnsw-nn-route test-hnsw-nn-precision test-hnsw-nn-capacity test-hnsw-nn-sdk-params test-hnsw-nn-consumer \
            test-i3-logs test-notice-wire test-admission-wire test-admission-message test-admission-ipc test-build-oom-thread test-cache-policy test-circuit-source test-status-text test-i3b-source test-peak-meter test-lw-policy test-lw-guard test-i3e-sql test-self-replace-notice test-host-free-fence test-vacuum-policy
 	$(CC) -I src -DCUVS_TEST_HOOKS -o test-unit test/unit/test_cuvs_util.c src/cuvs_util.c $(TEST_RT_LIB)
 	./test-unit
@@ -340,7 +342,7 @@ test-hnsw-explicit-route: test/unit/test_hnsw_explicit_route.c src/cuvs_hnsw_bui
 	$(CC) -std=gnu11 -Wall -Wextra -Werror -I src -o $@ test/unit/test_hnsw_explicit_route.c -lpthread
 	./$@
 
-.PHONY: test-hnsw-nn-precision test-hnsw-nn-policy test-hnsw-nn-capacity
+.PHONY: test-hnsw-nn-precision test-hnsw-nn-policy test-hnsw-nn-capacity test-hnsw-nn-route test-hnsw-nn-sdk-params test-hnsw-nn-consumer
 test-hnsw-nn-precision: test/unit/test_hnsw_nn_precision.c src/cuvs_hnsw_nn_precision.h
 	$(CC) -std=gnu11 -Wall -Wextra -Werror -I src -o $@ test/unit/test_hnsw_nn_precision.c -lm
 	./$@
@@ -353,7 +355,18 @@ test-hnsw-nn-capacity: test/unit/test_hnsw_nn_capacity.c src/cuvs_hnsw_nn_capaci
 	$(CC) -std=gnu11 -Wall -Wextra -Werror -I src -o $@ test/unit/test_hnsw_nn_capacity.c -lm
 	./$@
 
-EXTRA_CLEAN += test-hnsw-nn-policy test-hnsw-nn-precision test-hnsw-nn-capacity
+test-hnsw-nn-route: test/unit/test_hnsw_nn_route.c src/cuvs_hnsw_build_common.h
+	$(CC) -std=gnu11 -Wall -Wextra -Werror -I src -o $@ test/unit/test_hnsw_nn_route.c -lpthread -lm
+	./$@
+
+test-hnsw-nn-sdk-params: test/unit/test_hnsw_nn_sdk_params.cpp src/cuvs_hnsw_nn_sdk_params.cuh
+	$(CXX) -std=c++17 -Wall -Wextra -Werror -I src -o $@ test/unit/test_hnsw_nn_sdk_params.cpp
+	./$@
+
+test-hnsw-nn-consumer: test/unit/test_hnsw_nn_consumer.py src/cuvs_wrapper.cu src/cuvs_hnsw_nn_sdk_params.cuh
+	ulimit -c 0; python3 test/unit/test_hnsw_nn_consumer.py
+
+EXTRA_CLEAN += test-hnsw-nn-policy test-hnsw-nn-precision test-hnsw-nn-capacity test-hnsw-nn-route test-hnsw-nn-sdk-params
 
 # I3-C: CK-17 (12)-(14) auto overflow, pre-spool decision, CAGRA reltuples AR0.
 test-hnsw-auto-overflow: test/unit/test_hnsw_auto_overflow.c src/cuvs_route_preflight.h \

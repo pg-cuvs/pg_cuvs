@@ -3,6 +3,7 @@
 
 #include "cuvs_ipc.h" /* CUVS_METRIC_*; PG/CUDA-free */
 #include "cuvs_build_corpus.h" /* FD framing used by the shared request consumer */
+#include "cuvs_hnsw_nn_capacity.h"
 
 /* PG/CUDA-free checks shared by backend, IPC and wrapper. These are admission
  * estimates, never a promise that cuVS max_* enforces an RSS ceiling. */
@@ -355,8 +356,31 @@ cuvs_hnsw_resolve_route(uint64_t n, uint32_t dim, uint32_t degree,
         snprintf(error, error_len, "unsupported HNSW route or unknown capacity budget");
         return CUVS_STATUS_BUILD_FAILED;
     }
-    if (cuvs_hnsw_capacity(n, dim, degree, intermediate, 0, &base)
-        || cap->raw_bytes != base.raw_bytes || cap->serializer_floor != base.serializer_floor
+    if (algo == CUVS_HNSW_ALGO_NN_DESCENT)
+    {
+        CuvsHnswNnCapacity nn, hierarchy_nn;
+        if (cuvs_hnsw_nn_capacity(n, dim, degree, intermediate, 0,
+                                   CUVS_HNSW_NN_FP32, &nn)
+            || cuvs_hnsw_nn_capacity(n, dim, degree, intermediate, 1,
+                                      CUVS_HNSW_NN_FP32, &hierarchy_nn)
+            || !((cap->gpu_peak == nn.gpu_peak && cap->host_peak == nn.host_peak)
+                || (cap->gpu_peak == hierarchy_nn.gpu_peak
+                    && cap->host_peak == hierarchy_nn.host_peak)))
+        {
+            snprintf(error, error_len, "invalid resident NN shape or capacity");
+            return CUVS_STATUS_BUILD_FAILED;
+        }
+        base.raw_bytes = nn.raw_bytes;
+        base.serializer_floor = n * 20 + (UINT64_C(65) << 20);
+        base.host_peak = nn.host_peak;
+        base.gpu_peak = nn.gpu_peak;
+    }
+    else if (cuvs_hnsw_capacity(n, dim, degree, intermediate, 0, &base))
+    {
+        snprintf(error, error_len, "invalid prepared HNSW shape or capacity");
+        return CUVS_STATUS_BUILD_FAILED;
+    }
+    if (cap->raw_bytes != base.raw_bytes || cap->serializer_floor != base.serializer_floor
         || cap->host_peak < base.host_peak || cap->gpu_peak < base.gpu_peak)
     {
         snprintf(error, error_len, "invalid prepared HNSW shape or capacity");
@@ -388,7 +412,9 @@ cuvs_hnsw_resolve_route(uint64_t n, uint32_t dim, uint32_t degree,
     }
     if (!tiny && algo != CUVS_HNSW_ALGO_ACE && exceeded && !overflow_to_ace)
     {
-        snprintf(error, error_len, algo == CUVS_HNSW_ALGO_AUTO
+        snprintf(error, error_len, algo == CUVS_HNSW_ALGO_NN_DESCENT
+            ? "resident NN-descent estimate exceeds host/GPU budget; no fallback"
+            : algo == CUVS_HNSW_ALGO_AUTO
             ? "resident IVF-PQ estimate exceeds host/GPU budget; --hnsw-auto-overflow=error; use build_algo=ace explicitly"
             : "resident IVF-PQ estimate exceeds host/GPU budget; no fallback; use build_algo=ace explicitly");
         return CUVS_STATUS_HNSW_RESIDENT_BUDGET_EXCEEDED;
@@ -416,7 +442,8 @@ cuvs_hnsw_resolve_route(uint64_t n, uint32_t dim, uint32_t degree,
         out->route = CUVS_HNSW_ROUTE_ACE;
         out->overflowed = (uint32_t)overflow_to_ace;
     }
-    else out->route = tiny ? CUVS_HNSW_ROUTE_TINY : CUVS_HNSW_ROUTE_IVF_PQ;
+    else out->route = tiny ? CUVS_HNSW_ROUTE_TINY
+        : algo == CUVS_HNSW_ALGO_NN_DESCENT ? CUVS_HNSW_ROUTE_NN_DESCENT : CUVS_HNSW_ROUTE_IVF_PQ;
     return CUVS_STATUS_OK;
 }
 
@@ -466,12 +493,26 @@ cuvs_hnsw_forecast_route(uint64_t n, uint32_t dim, uint32_t graph_degree,
         if (intermediate >= n) intermediate = (uint32_t)(n - 1);
     }
     out->disk_need = cuvs_hnsw_disk_need(n, dim, graph_degree);
-    if (cuvs_hnsw_capacity(n, dim, degree, intermediate, hierarchy != 0, &cap))
+    if (algo == CUVS_HNSW_ALGO_NN_DESCENT)
+    {
+        CuvsHnswNnCapacity nn;
+        if (cuvs_hnsw_nn_capacity(n, dim, degree, intermediate, hierarchy != 0,
+                                  CUVS_HNSW_NN_FP32, &nn))
+        {
+            snprintf(error, error_len, "invalid resident NN capacity/dimension/degree");
+            return (int)out->status;
+        }
+        cap.raw_bytes = nn.raw_bytes;
+        cap.serializer_floor = n * 20 + (UINT64_C(65) << 20);
+        cap.host_peak = nn.host_peak;
+        cap.gpu_peak = nn.gpu_peak;
+    }
+    else if (cuvs_hnsw_capacity(n, dim, degree, intermediate, hierarchy != 0, &cap))
     {
         snprintf(error, error_len, "invalid HNSW capacity/dimension/degree");
         return (int)out->status;
     }
-    if (n >= CUVS_HNSW_MIN_ELEMENTS)
+    if (n >= CUVS_HNSW_MIN_ELEMENTS && algo != CUVS_HNSW_ALGO_NN_DESCENT)
     {
         uint64_t sample = cuvs_hnsw_sample_rows(n, dim, host, gpu);
         uint64_t lists = sample / 32 ? sample / 32 : 1;

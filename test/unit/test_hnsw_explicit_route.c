@@ -67,7 +67,7 @@ static void test_receipts(void)
     CHECK(cuvs_hnsw_algo_from_name("ace") == CUVS_HNSW_ALGO_ACE);
     CHECK(cuvs_hnsw_algo_from_name("auto") == CUVS_HNSW_ALGO_AUTO);
     CHECK(cuvs_hnsw_algo_from_name("ivf_pq") == CUVS_HNSW_ALGO_IVF_PQ);
-    CHECK(!cuvs_hnsw_algo_supported(cuvs_hnsw_algo_from_name("nn_descent")));
+    CHECK(cuvs_hnsw_algo_supported(cuvs_hnsw_algo_from_name("nn_descent")));
     CHECK(!cuvs_hnsw_algo_supported(cuvs_hnsw_algo_from_name("typo")));
     CHECK(!strcmp(cuvs_hnsw_algo_name(CUVS_HNSW_ALGO_ACE), "ace"));
 }
@@ -75,18 +75,18 @@ static void test_receipts(void)
 static void test_requests(void)
 {
     CuvsHnswFileRequest r = {CUVS_HNSW_FILE_VERSION, 1, 1ULL << 30, CUVS_HNSW_ALGO_ACE, 64};
-    CHECK(CUVS_HNSW_FILE_VERSION == 5);
+    CHECK(CUVS_HNSW_FILE_VERSION == 6);
     CHECK(cuvs_hnsw_file_request_supported(&r));
     for (uint32_t v = 0; v <= 6; v++)
     {
         r.version = v;
-        CHECK(!!cuvs_hnsw_file_request_supported(&r) == (v == 5));
+        CHECK(!!cuvs_hnsw_file_request_supported(&r) == (v == 6));
     }
-    r.version = 5;
+    r.version = 6;
     for (uint32_t a = 0; a <= 4; a++)
     {
         r.build_algo = a;
-        CHECK(!!cuvs_hnsw_file_request_supported(&r) == (a == 0 || a == 1 || a == 3));
+        CHECK(!!cuvs_hnsw_file_request_supported(&r) == (a == 0 || a == 1 || a == 2 || a == 3));
     }
     r.build_algo = 3; r.hierarchy = 2; CHECK(!cuvs_hnsw_file_request_supported(&r));
     r.hierarchy = 1; r.host_budget = 0; CHECK(!cuvs_hnsw_file_request_supported(&r));
