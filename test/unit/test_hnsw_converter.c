@@ -237,11 +237,15 @@ BufFileClose(BufFile *file)
 
 /* A tiny block store lets the standalone fixture call the production page
  * writers and follow their on-page nextblkno fields like pgvector vacuum. */
-#define CHAIN_TEST_MAX_BLOCKS 16
+#define CHAIN_TEST_MAX_BLOCKS 160
 static char chain_test_pages[CHAIN_TEST_MAX_BLOCKS][BLCKSZ];
 static size_t chain_test_nblocks;
 volatile uint32 CritSectionCount;
 static unsigned chain_test_wal_images;
+#if PG_VERSION_NUM >= 160000
+static uint32 chain_test_extend_limit = 32;
+static unsigned chain_test_extend_calls;
+#endif
 static char chain_test_palloc_arena[256 * 1024];
 static size_t chain_test_palloc_used;
 
@@ -278,6 +282,33 @@ ReadBuffer(Relation rel, BlockNumber block_num)
     memset(chain_test_pages[chain_test_nblocks], 0, BLCKSZ);
     return (Buffer)(++chain_test_nblocks);
 }
+
+#if PG_VERSION_NUM >= 160000
+BlockNumber
+ExtendBufferedRelBy(BufferManagerRelation bmr, ForkNumber fork,
+                     BufferAccessStrategy strategy, uint32 flags,
+                     uint32 extend_by, Buffer *buffers, uint32 *extended_by)
+{
+    BlockNumber first = (BlockNumber)chain_test_nblocks;
+
+    (void)bmr;
+    (void)fork;
+    (void)strategy;
+    assert(flags == 0 && extend_by > 0 && extend_by <= 32);
+    *extended_by = Min(extend_by, chain_test_extend_limit);
+    chain_test_extend_calls++;
+    for (uint32 i = 0; i < *extended_by; i++)
+        buffers[i] = ReadBuffer(NULL, P_NEW);
+    return first;
+}
+
+BlockNumber
+BufferGetBlockNumber(Buffer buffer)
+{
+    assert(buffer > 0 && (size_t)buffer <= chain_test_nblocks);
+    return (BlockNumber)(buffer - 1);
+}
+#endif
 
 static Page
 test_buffer_get_page(Buffer buffer)
@@ -322,9 +353,47 @@ chain_test_reset(void)
     assert(CritSectionCount == 0);
     chain_test_nblocks = 1;
     chain_test_wal_images = 0;
+#if PG_VERSION_NUM >= 160000
+    chain_test_extend_calls = 0;
+    chain_test_extend_limit = 32;
+#endif
     chain_test_palloc_used = 0;
     memset(chain_test_pages, 0, sizeof(chain_test_pages));
     hnsw_init_disk_page((Page)chain_test_pages[0]);
+}
+
+static void
+test_batched_data_page_publication(void)
+{
+#if PG_VERSION_NUM >= 160000
+    const uint32 counts[] = {0, 1, 31, 32, 33, 65, 129};
+    const uint32 limits[] = {1, 7, 32};
+    char staged[BLCKSZ];
+
+    for (size_t c = 0; c < sizeof(counts) / sizeof(counts[0]); c++)
+        for (size_t l = 0; l < sizeof(limits) / sizeof(limits[0]); l++)
+            for (unsigned skip = 0; skip <= 1; skip++)
+            {
+                HnswDiskPageBatch batch = {0};
+                uint32 count = counts[c];
+                uint32 limit = limits[l];
+
+                chain_test_reset();
+                chain_test_extend_limit = limit;
+                for (uint32 block = 1; block <= count; block++)
+                {
+                    memset(staged, (int)(block % 251), sizeof(staged));
+                    hnsw_publish_staged_data_page(NULL, staged, skip != 0,
+                                                  block, count, &batch);
+                    assert(memcmp(chain_test_pages[block], staged, BLCKSZ) == 0);
+                    assert(CritSectionCount == 0);
+                }
+                assert(batch.next == batch.count);
+                assert(chain_test_nblocks == (size_t)count + 1);
+                assert(chain_test_wal_images == (skip ? 0 : count));
+                assert(chain_test_extend_calls == (count + limit - 1) / limit);
+            }
+#endif
 }
 
 static void
@@ -1362,6 +1431,7 @@ main(void)
     test_legacy_writer_page_chains();
     test_hierarchical_preflight_packs_locations();
     test_disk_writer_page_chain();
+    test_batched_data_page_publication();
     test_hierarchical_packing_cursor_bounds();
     test_hierarchical_native_packing_shapes();
     test_pgvector_page_version_range();
