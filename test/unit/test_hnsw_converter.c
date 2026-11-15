@@ -1604,6 +1604,31 @@ test_ace_readback_metapage_roundtrip(void)
     ((PageHeader)meta)->pd_lower = prefix + sizeof(p) + sizeof(ace) - 1;
     assert(hnsw_read_disk_ace(meta, &out, &ace_out) == CUVS_HNSW_POLICY_CORRUPT);
 
+    /* ACE built without the SDK source planner: the requested count is stored with the mark in
+     * route_flags. The receipt keeps its size, the readback follows it unchanged, and the page
+     * decodes back to a requested-only receipt. */
+    {
+        CuvsHnswPolicy marked = p;
+        marked.route_flags |= CUVS_HNSW_ROUTE_FLAG_ACE_PARTITIONS_REQUESTED;
+        assert(cuvs_hnsw_policy_valid(&marked));
+        chain_test_reset();
+        hnsw_write_disk_metapage(NULL, &hdr, 2, 1, true, &table, &marked, &ace, NULL, NULL);
+        meta = (Page)chain_test_pages[chain_test_nblocks - 1];
+        assert(((PageHeader)meta)->pd_lower == prefix + sizeof(marked) + sizeof(ace));
+        assert(memcmp((char *)meta + prefix, &marked, sizeof(marked)) == 0);
+        assert(hnsw_read_disk_policy(meta, &out) == CUVS_HNSW_POLICY_RECORDED
+               && out.route_flags == CUVS_HNSW_ROUTE_FLAG_ACE_PARTITIONS_REQUESTED
+               && out.partitions == 2 && cuvs_hnsw_ace_partitions_unverified(&out));
+        assert(hnsw_read_disk_ace(meta, &out, &ace_out) == CUVS_HNSW_POLICY_RECORDED);
+        assert(memcmp(&ace_out, &ace, sizeof(ace)) == 0);
+        /* The page bytes of an unmarked receipt are the ones stored before the mark existed. */
+        chain_test_reset();
+        hnsw_write_disk_metapage(NULL, &hdr, 2, 1, true, &table, &p, &ace, NULL, NULL);
+        meta = (Page)chain_test_pages[chain_test_nblocks - 1];
+        assert(hnsw_read_disk_policy(meta, &out) == CUVS_HNSW_POLICY_RECORDED
+               && out.route_flags == 0 && !cuvs_hnsw_ace_partitions_unverified(&out));
+    }
+
     /* A resident receipt writes no tail, even when a readback is passed. */
     resident = p;
     resident.route = resident.internal_builder = CUVS_HNSW_ROUTE_IVF_PQ;
@@ -1671,7 +1696,7 @@ test_ace_readback_metapage_roundtrip(void)
 
     fixture_close(&f);
     BufFileClose(&fake_file);
-    puts("PASS ACE readback metapage roundtrip: bytes at prefix+receipt, pd_lower, older/foreign/truncated tails, resident has none, writer refuses invalid");
+    puts("PASS ACE readback metapage roundtrip: bytes at prefix+receipt, pd_lower, older/foreign/truncated tails, requested-only receipt stored and read back, resident has none, writer refuses invalid");
     puts("PASS NN v3 metapage roundtrip and truncated tail rejection (CPU fixture)");
     puts("PASS NN route stores a measured or disabled connectivity record next to the readback");
 }
