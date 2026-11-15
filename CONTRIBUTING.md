@@ -19,6 +19,13 @@ Contributions and collaboration inquiries are welcome.
   host. The CPU-reference CI path builds with `PGCUVS_CPU_SHIM=1`, starts a shim
   daemon, then runs `make installcheck-tier1` and `make installcheck-isolation`;
   `make test-unit` runs separately. See [ci.yml](.github/workflows/ci.yml).
+- Before opening a pull request, run `scripts/check-sdk-patch-path.sh`. It applies
+  `infra/cuvs-patches` to the pinned cuVS source, checks the manifest hashes and the
+  planner source, and checks the Makefile flags for a build with the patched SDK
+  planner. It needs git, python3, make and `pg_config`, not CUDA, and fetches the
+  pinned cuVS source once into `~/.cache/pg_cuvs`. Neither CI job builds that path.
+  In Claude Code, `.claude/hooks/pr-guard.sh` runs it before `gh pr create` and
+  `gh pr ready` and blocks the command when it fails.
 - Follow the coding guidelines in [CLAUDE.md](CLAUDE.md): surgical changes,
   tests-first where practical, and structural vs behavioral changes in separate commits.
 

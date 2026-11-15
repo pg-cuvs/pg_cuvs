@@ -10,6 +10,14 @@ exists for 0.9.0.
 
 ## [Unreleased]
 
+### Added
+
+- `scripts/check-sdk-patch-path.sh` checks the patched cuVS SDK build path without CUDA:
+  the patch set applies to the pinned cuVS source with the manifest hashes, the planner
+  source verifies, and the Makefile passes the planner's compile and link flags. A Claude
+  Code hook (`.claude/hooks/pr-guard.sh`) runs it before a pull request is opened.
+  Development tooling only.
+
 ### Fixed
 
 - Building with the patched cuVS SDK planner (`CUVS_SDK_SOURCE_INCLUDE` set, as the
