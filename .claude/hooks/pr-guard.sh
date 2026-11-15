@@ -17,6 +17,10 @@
 # and after other `&&`/`;`/`|` commands), then options such as `-R OWNER/REPO`, then
 # `pr create` or `pr ready`. It does not parse shell: a commit message or echo that
 # contains those words triggers the check too, which only blocks while the check fails.
+# Finding those spellings takes time linear in the length of the command. The hook as a
+# whole does not: when the command starts with `cd WORD &&` (or `;`), WORD is parsed with
+# shlex.split, which is quadratic in its length (measured: a 400 KB WORD takes about 4 s,
+# 800 KB about 14 s).
 #
 # The checkout checked is the one the command runs in: a leading `cd DIR &&` when DIR is an
 # existing directory, else the tool call's cwd. When the cd target cannot be resolved here

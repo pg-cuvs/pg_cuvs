@@ -360,8 +360,10 @@ class CwdAndCdTests(HookCase):
 
 
 class ScalingTests(HookCase):
-    """The command is user input of any size (a heredoc, a pasted log): finding
-    `gh pr create` in it must take time linear in its length."""
+    """The command is user input of any size (a heredoc, a pasted log): the step that
+    finds `gh pr create` in it must take time linear in its length. The hook as a whole
+    is not linear: the target of a leading `cd` is parsed with shlex.split, which is
+    quadratic in the length of that word, and these tests do not cover it."""
 
     def test_repeated_gh_options_take_linear_time(self):
         set_check(self.proj, passes=False)

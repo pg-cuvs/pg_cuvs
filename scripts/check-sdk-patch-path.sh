@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # SPDX-FileCopyrightText: Copyright (c) 2026, JAESOL SHIN
 # SPDX-License-Identifier: PostgreSQL
-# Pre-PR check of the patched cuVS SDK build path. Needs git, python3, make and pg_config;
-# no CUDA, no GPU.
+# Pre-PR check of the patched cuVS SDK build path. Needs git, python3 and make;
+# no CUDA, no GPU, no pg_config.
 #   1. infra/cuvs-patches 0001..0007 apply to the pinned cuVS source and every manifest hash
 #      matches (scripts/prepare-patched-cuvs-source.sh).
 #   2. scripts/verify-hnsw-sdk-plan.py accepts the patched planner source.
@@ -13,7 +13,7 @@
 # The 0001..0007 patch glob and the manifest file count come from
 # prepare-patched-cuvs-source.sh; this script does not check them itself.
 # The temporary patched tree is removed on every normal exit, on errors and on
-# SIGINT/SIGTERM; after SIGKILL it stays in $TMPDIR.
+# SIGINT/SIGTERM; after SIGKILL it stays in the temporary directory.
 # usage: check-sdk-patch-path.sh [--root PG_CUVS_CHECKOUT] [--cuvs-git CUVS_GIT]
 #   CUVS_GIT defaults to $PGCUVS_CUVS_GIT, then a cache under ~/.cache/pg_cuvs (fetched once).
 set -euo pipefail
@@ -33,9 +33,14 @@ if ! git -C "$CUVS_GIT" cat-file -e "$COMMIT^{commit}" 2>/dev/null; then
   mkdir -p "$CUVS_GIT"
   git -C "$CUVS_GIT" init -q --bare
   # Limits on a stalled network (the pr-guard hook allows 300 s). The low-speed settings
-  # abort a transfer that has started and then runs below 1 kB/s for 30 s; a stall before
-  # the transfer starts is not covered by them. The 120 s limit in total exists only where
-  # timeout(1) does: stock macOS has none, and there the fetch has no upper bound here.
+  # abort a transfer that stays below 1 kB/s for 30 s. That includes a server that accepts
+  # the connection and then sends nothing: measured to fail after 30 s with "Operation too
+  # slow". They do not cover a connection that is never established or a TLS handshake that
+  # stalls; git and the OS end those. Measured on macOS: about 75 s to an address that does
+  # not answer ("Failed to connect"), 300 s for a stalled TLS handshake ("SSL connection
+  # timeout"). Not measured on Linux. Where timeout(1) exists, the fetch as a whole is also
+  # limited to 120 s. Stock macOS has none, and there, by the settings alone, a transfer that
+  # keeps arriving at 1 kB/s or more has no upper bound.
   fetch=(git -C "$CUVS_GIT" -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=30
          fetch -q --depth 1 https://github.com/rapidsai/cuvs.git "$COMMIT")
   if command -v timeout >/dev/null 2>&1; then fetch=(timeout 120 "${fetch[@]}"); fi
