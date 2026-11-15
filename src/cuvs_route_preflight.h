@@ -59,7 +59,7 @@ cuvs_hnsw_prespool_action(double reltuples, int ipc_rc, uint32_t route,
     if (ipc_rc == CUVS_STATUS_HNSW_RESIDENT_BUDGET_EXCEEDED) return CUVS_HNSW_PRESPOOL_REJECT_BUDGET;
     if (ipc_rc == CUVS_STATUS_BUILD_FAILED) return CUVS_HNSW_PRESPOOL_REJECT;
     if (ipc_rc != CUVS_STATUS_OK || !disk_ok
-        || route < CUVS_HNSW_ROUTE_TINY || route > CUVS_HNSW_ROUTE_ACE)
+        || route < CUVS_HNSW_ROUTE_TINY || route > CUVS_HNSW_ROUTE_NN_DESCENT)
         return CUVS_HNSW_PRESPOOL_FALLBACK;
     return overflowed && route == CUVS_HNSW_ROUTE_ACE
         ? CUVS_HNSW_PRESPOOL_NOTICE_OVERFLOW : CUVS_HNSW_PRESPOOL_PROCEED;
@@ -228,6 +228,8 @@ cuvs_hnsw_oom_hint(uint32_t build_algo)
         return "The resident estimate was admitted but memory ran out; retry with build_algo='ace' explicitly, or free host/GPU memory.";
     case CUVS_HNSW_ALGO_IVF_PQ:
         return "Raise the build budget (cuvs.max_build_mem_mb), drop or unload unused GPU indexes, or use build_algo='ace'.";
+    case CUVS_HNSW_ALGO_NN_DESCENT:
+        return "Free host/GPU memory, raise the build budget, or request build_algo='ace' explicitly.";
     default:
         return "Free host/GPU memory and retry; ACE has no smaller route.";
     }

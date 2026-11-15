@@ -4,7 +4,7 @@
 
 This is the B3 SDK change (SHA-256 `3acd107a74bd0fc29ee72e2e206558f86d4bc374e506775af60496b87ae48fa4`, analysis commit `616eb202e83f558b59755b521d4d949e5b7b8305`). It changes only `cagra_build.cuh` and adds `consumer_row_sort_plan.hpp`, and applies on cuVS v26.04.00 `60b19a0f62ba0bd716de349382828e43be6e2daa`. The result is `cagra_build.cuh` `38722f03…95bc` and `consumer_row_sort_plan.hpp` `07b7b724…ac49`.
 
-Patch number 0005 (resident NN-descent upper levels) is not part of this patch set. 0006 touches none of the files that 0005 touches (`hnsw.hpp`, `hnsw.cpp`, `hnsw_precision.hpp` and its own new header), so it applies after 0001~0004 and also after 0005, and both orders give byte-identical trees. The recipe therefore accepts 0001+0002+0003+0004+0006.
+0006 touches none of the files that 0005 (resident NN-descent upper levels) touches (`hnsw.hpp`, `hnsw.cpp`, `hnsw_precision.hpp` and its own new header), so it gives the same `cagra_build.cuh` and `consumer_row_sort_plan.hpp` whether it follows 0001~0004 or 0001~0005. The recipe applies 0001 through 0007 in order.
 
 Applying 0001~0004 and 0006 to the pinned tree gives a `cpp/` tree of 815 files that is byte-identical to the source archive recorded with the validated B3 build.
 

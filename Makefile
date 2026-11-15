@@ -138,12 +138,13 @@ src/cuvs_wrapper.o: | verify-hnsw-sdk-plan
 endif
 
 src/cuvs_wrapper.o: src/cuvs_wrapper.cu src/cuvs_wrapper.h src/cuvs_hnsw_sdk_plan.cuh \
+                    src/cuvs_hnsw_nn_sdk_params.cuh src/cuvs_hnsw_nn_precision.h src/cuvs_hnsw_nn_capacity.h src/cuvs_hnsw_nn_upper_contract.h src/cuvs_hnsw_nn_center.h \
                     src/cuvs_failed_allocation.hpp src/cuvs_rmm_failure_resource.hpp
 	$(NVCC) $(NVCC_FLAGS) $(CUVS_SDK_PLAN_FLAGS) -I$(CUVS_INCLUDE) -I$(CUVS_RAPIDS_INCLUDE) -I./src -c $< -o $@
 
 # PGXS generates LLVM bitcode (.bc) from .c sources for JIT. The .cu file
 # has no PG-callable functions, so emit a stub bitcode so PGXS doesn't fail.
-src/cuvs_wrapper.bc: src/cuvs_wrapper.cu src/cuvs_failed_allocation.hpp src/cuvs_rmm_failure_resource.hpp
+src/cuvs_wrapper.bc: src/cuvs_wrapper.cu src/cuvs_hnsw_nn_sdk_params.cuh src/cuvs_hnsw_nn_precision.h src/cuvs_hnsw_nn_capacity.h src/cuvs_hnsw_nn_upper_contract.h src/cuvs_hnsw_nn_center.h src/cuvs_failed_allocation.hpp src/cuvs_rmm_failure_resource.hpp
 	@echo 'void cuvs_wrapper_jit_stub(void){}' > /tmp/_cuvs_stub.c
 	@clang-15 -emit-llvm -c /tmp/_cuvs_stub.c -o $@ 2>/dev/null \
 		|| clang -emit-llvm -c /tmp/_cuvs_stub.c -o $@
@@ -279,7 +280,8 @@ install-server-test: server-test
 TEST_RT_LIB := $(shell [ "$$(uname -s)" = "Linux" ] && echo -lrt)
 test-unit: test-compact-retry test-device-norm test-failed-allocation test-build-oom-log test-peak-log-switch test/unit/test_cuvs_util.c src/cuvs_util.c src/cuvs_util.h src/cuvs_ipc.h \
            test/unit/test_build_corpus.c src/cuvs_build_corpus.c src/cuvs_build_corpus.h \
-           test-hnsw-build test-hnsw-build-ipc test-hnsw-ace-quality test-hnsw-admission test-admission-contract \
+           test-hnsw-build test-hnsw-build-ipc test-hnsw-owner-lease test-hnsw-ace-quality test-hnsw-admission test-admission-contract \
+           test-hnsw-nn-policy test-hnsw-nn-route test-hnsw-nn-precision test-hnsw-nn-capacity test-hnsw-nn-sdk-params test-hnsw-nn-consumer test-hnsw-nn-upper-receipt test-hnsw-nn-center test-hnsw-nn-mutations \
            test-i3-logs test-notice-wire test-admission-wire test-admission-message test-admission-ipc test-build-oom-thread test-cache-policy test-circuit-source test-status-text test-i3b-source test-peak-meter test-lw-policy test-lw-guard test-i3e-sql test-self-replace-notice test-host-free-fence test-vacuum-policy test-hnsw-digest
 	$(CC) -I src -DCUVS_TEST_HOOKS -o test-unit test/unit/test_cuvs_util.c src/cuvs_util.c $(TEST_RT_LIB)
 	./test-unit
@@ -326,6 +328,12 @@ test-hnsw-build: test/unit/test_hnsw_build.c src/cuvs_hnsw_build_common.h
 	$(CC) -std=gnu11 -Wall -Wextra -I src -o $@ test/unit/test_hnsw_build.c
 	./$@
 
+test-hnsw-owner-lease: test/unit/test_hnsw_owner_lease.c src/cuvs_ipc.c \
+                       src/cuvs_util.c src/cuvs_build_corpus.c $(wildcard src/*.h)
+	$(CC) -std=gnu11 -Wall -Wextra -Werror -I src -o $@ test/unit/test_hnsw_owner_lease.c \
+		src/cuvs_ipc.c src/cuvs_util.c src/cuvs_build_corpus.c -lpthread -lm $(TEST_RT_LIB)
+	./$@
+
 test-hnsw-build-ipc: test/unit/test_hnsw_build_ipc.c src/cuvs_ipc.c \
                     src/cuvs_util.c src/cuvs_build_corpus.c $(wildcard src/*.h)
 	$(CC) -std=gnu11 -Wall -Wextra -I src -o $@ test/unit/test_hnsw_build_ipc.c \
@@ -347,6 +355,89 @@ test-hnsw-policy: test/unit/test_hnsw_policy.c $(wildcard src/cuvs_hnsw*.h)
 test-hnsw-explicit-route: test/unit/test_hnsw_explicit_route.c src/cuvs_hnsw_build_common.h src/cuvs_hnsw_policy.h src/cuvs_ipc.h
 	$(CC) -std=gnu11 -Wall -Wextra -Werror -I src -o $@ test/unit/test_hnsw_explicit_route.c -lpthread
 	./$@
+
+# SDK side of build_algo=nn_descent (infra/cuvs-patches 0005). Needs a cuVS clone
+# containing 60b19a0f; the patched tree is rebuilt from tracked patches each run.
+#   make test-hnsw-nn-sdk CUVS_UPSTREAM_GIT=/path/to/cuvs
+# Graph-consumer row-sort (patch 0006) planner checks on the same rebuilt tree;
+# CUVS_ROW_SORT_SDK_SRC=<cpp/src of another 0006 build> optionally byte-compares it.
+#   make test-hnsw-row-sort-sdk CUVS_UPSTREAM_GIT=...
+.PHONY: test-hnsw-nn-sdk test-hnsw-row-sort-sdk
+test-hnsw-nn-sdk:
+	@test -n "$(CUVS_UPSTREAM_GIT)" || { echo "set CUVS_UPSTREAM_GIT to a cuVS clone containing 60b19a0f" >&2; exit 2; }
+	set -e; t=$$(mktemp -d); trap 'rm -rf "$$t"' EXIT; \
+	scripts/prepare-patched-cuvs-source.sh '$(CUVS_UPSTREAM_GIT)' "$$t/cuvs"; \
+	n="$$t/cuvs/cpp/src/neighbors"; \
+	python3 -I test/unit/check_hnsw_nn_sdk_source.py --sdk-src "$$n"; \
+	python3 -I test/unit/test_hnsw_nn_upper_consumer.py --sdk-src "$$n"; \
+	$(CXX) -std=c++17 -Wall -Wextra -Werror -I "$$n/detail" test/unit/test_hnsw_nn_upper_precision.cpp -o "$$t/upper-precision"; \
+	"$$t/upper-precision"; \
+	python3 -I test/unit/test_hnsw_nn_upper_precision_mutations.py --sdk-src "$$n"; \
+	python3 -I test/native/hnsw-sdk/test_nn_upper_legacy_forwarder.py --source "$$t/cuvs/cpp/src"; \
+	python3 -I test/native/hnsw-sdk/test_nn_upper_legacy_forwarder.py --source "$$t/cuvs/cpp/src" --mutant
+
+test-hnsw-row-sort-sdk:
+	@test -n "$(CUVS_UPSTREAM_GIT)" || { echo "set CUVS_UPSTREAM_GIT to a cuVS clone containing 60b19a0f" >&2; exit 2; }
+	set -e; t=$$(mktemp -d); trap 'rm -rf "$$t"' EXIT; \
+	scripts/prepare-patched-cuvs-source.sh '$(CUVS_UPSTREAM_GIT)' "$$t/cuvs"; \
+	git -C "$$t/cuvs" show level-0005:cpp/src/neighbors/detail/cagra/cagra_build.cuh > "$$t/canonical-cagra_build.cuh"; \
+	c="$$t/canonical-cagra_build.cuh"; b="$$t/cuvs/cpp/src"; \
+	python3 -I scripts/verify-hnsw-sdk-plan.py --source "$$b"; \
+	python3 -I -B test/unit/test_hnsw_sdk_plan_verifier.py --canonical-header "$$c" --row-sort-src "$$b"; \
+	python3 -I -B test/unit/test_hnsw_sdk_plan_mutations.py --canonical-header "$$c" --row-sort-src "$$b"; \
+	python3 -I test/unit/test_hnsw_row_sort_planner_equivalence.py --canonical-header "$$c" --row-sort-src "$$b"; \
+	if [ -n '$(CUVS_ROW_SORT_SDK_SRC)' ]; then \
+	  for f in neighbors/detail/cagra/cagra_build.cuh neighbors/detail/cagra/consumer_row_sort_plan.hpp; do \
+	    cmp "$$b/$$f" '$(CUVS_ROW_SORT_SDK_SRC)'/"$$f"; done; \
+	  echo "external source matches 0006 for the planner/consumer files"; \
+	fi
+
+.PHONY: test-hnsw-nn-precision test-hnsw-nn-policy test-hnsw-nn-capacity test-hnsw-nn-route test-hnsw-nn-sdk-params test-hnsw-nn-consumer test-hnsw-nn-upper-receipt
+test-hnsw-nn-precision: test/unit/test_hnsw_nn_precision.c src/cuvs_hnsw_nn_precision.h
+	$(CC) -std=gnu11 -Wall -Wextra -Werror -I src -o $@ test/unit/test_hnsw_nn_precision.c -lm
+	./$@
+
+test-hnsw-nn-policy: test/unit/test_hnsw_nn_policy.c src/cuvs_hnsw_policy.h
+	$(CC) -std=gnu11 -Wall -Wextra -Werror -I src -o $@ test/unit/test_hnsw_nn_policy.c
+	./$@
+
+test-hnsw-nn-capacity: test/unit/test_hnsw_nn_capacity.c src/cuvs_hnsw_nn_capacity.h src/cuvs_hnsw_build_common.h
+	$(CC) -std=gnu11 -Wall -Wextra -Werror -I src -o $@ test/unit/test_hnsw_nn_capacity.c -lm
+	./$@
+
+test-hnsw-nn-route: test/unit/test_hnsw_nn_route.c src/cuvs_hnsw_build_common.h
+	$(CC) -std=gnu11 -Wall -Wextra -Werror -I src -o $@ test/unit/test_hnsw_nn_route.c -lpthread -lm
+	./$@
+
+test-hnsw-nn-sdk-params: test/unit/test_hnsw_nn_sdk_params.cpp src/cuvs_hnsw_nn_sdk_params.cuh
+	$(CXX) -std=c++17 -Wall -Wextra -Werror -I src -o $@ test/unit/test_hnsw_nn_sdk_params.cpp
+	./$@
+
+test-hnsw-nn-consumer: test/unit/test_hnsw_nn_consumer.py src/cuvs_wrapper.cu src/cuvs_hnsw_nn_sdk_params.cuh
+	ulimit -c 0; python3 test/unit/test_hnsw_nn_consumer.py
+
+test-hnsw-nn-upper-receipt: test/unit/test_hnsw_nn_upper_receipt.py test/unit/test_hnsw_nn_upper_receipt_mutation.py src/hnsw_export.c src/cuvs_hnsw_policy.h
+	python3 -I -B test/unit/test_hnsw_nn_upper_receipt.py
+	python3 -I -B test/unit/test_hnsw_nn_upper_receipt_mutation.py
+
+# NN-descent L2 graph-input centering (docs/hnsw-build-options.md, nn_descent).
+.PHONY: test-hnsw-nn-center
+test-hnsw-nn-center: test/unit/test_hnsw_nn_center.c test/unit/test_hnsw_nn_center_wrapper.py src/cuvs_hnsw_nn_center.h src/cuvs_hnsw_nn_precision.h src/cuvs_wrapper.cu
+	$(CC) -std=gnu11 -O2 -Wall -Wextra -Werror -I src -o $@ test/unit/test_hnsw_nn_center.c -lm
+	./$@
+	ulimit -c 0; python3 -I -B test/unit/test_hnsw_nn_center_wrapper.py
+
+EXTRA_CLEAN += test-hnsw-nn-policy test-hnsw-nn-precision test-hnsw-nn-capacity test-hnsw-nn-route test-hnsw-nn-sdk-params test-hnsw-nn-center
+
+# NN guard mutants (each script compiles mutated copies in a temp dir and
+# requires the matching unit test to fail; part of test-unit).
+.PHONY: test-hnsw-nn-mutations
+test-hnsw-nn-mutations:
+	ulimit -c 0; python3 -I -B test/unit/test_hnsw_nn_policy_mutations.py
+	ulimit -c 0; python3 -I -B test/unit/test_hnsw_nn_precision_mutations.py
+	ulimit -c 0; python3 -I -B test/unit/test_hnsw_nn_capacity_mutations.py
+	ulimit -c 0; python3 -I -B test/unit/test_hnsw_nn_sdk_params_mutations.py
+	ulimit -c 0; python3 -I -B test/unit/test_hnsw_nn_center_mutations.py
 
 # I3-C: CK-17 (12)-(14) auto overflow, pre-spool decision, CAGRA reltuples AR0.
 test-hnsw-auto-overflow: test/unit/test_hnsw_auto_overflow.c src/cuvs_route_preflight.h \
@@ -564,10 +655,10 @@ test-hnsw-converter: test/unit/test_hnsw_converter.c src/hnsw_export.c \
 		$(HNSW_CONVERTER_UNIT_LINK) $(TEST_RT_LIB)
 	./$@
 
-EXTRA_CLEAN += test-hnsw-build test-hnsw-build-ipc test-hnsw-ace-quality test-hnsw-converter test-hnsw-admission test-hnsw-explicit-route test-hnsw-policy \
+EXTRA_CLEAN += test-hnsw-build test-hnsw-build-ipc test-hnsw-owner-lease test-hnsw-ace-quality test-hnsw-converter test-hnsw-admission test-hnsw-explicit-route test-hnsw-policy \
                test-admission-contract test-admission-contract-cxx test-admission-contract-util.o \
                test-admission-wire test-admission-message test-admission-ipc test-build-oom-thread test-hnsw-auto-overflow test-res-pool test-lw-policy test-lw-guard test-failed-allocation test-host-free-fence test-vacuum-policy
-.PHONY: test-hnsw-build test-hnsw-build-ipc test-hnsw-ace-quality test-hnsw-ace-quality-mutations test-hnsw-converter test-hnsw-admission test-hnsw-explicit-route test-hnsw-policy \
+.PHONY: test-hnsw-build test-hnsw-build-ipc test-hnsw-owner-lease test-hnsw-ace-quality test-hnsw-ace-quality-mutations test-hnsw-converter test-hnsw-admission test-hnsw-explicit-route test-hnsw-policy \
         test-admission-contract test-admission-contract-mutations test-admission-wire \
         test-admission-message test-admission-ipc test-build-oom-thread test-gpu-wrapper-i3 test-hnsw-auto-overflow test-res-pool test-lw-policy test-lw-guard test-lw-mutations test-lw-docs \
         test-host-free-fence test-host-free-fence-mutations test-vacuum-policy test-vacuum-policy-mutations test-hnsw-precision-mutations

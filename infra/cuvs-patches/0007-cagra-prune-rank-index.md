@@ -4,7 +4,7 @@
 
 Source: cuVS v26.04.00, commit `60b19a0f62ba0bd716de349382828e43be6e2daa`. Patch: `0007-cagra-prune-rank-index.patch`, SHA-256 `dae5a4fa072bbfeb3676d4d83677913bd922445aca41026815b0028d2685fe6d`. It changes one file, `cpp/src/neighbors/detail/cagra/graph_core.cuh`, whose clean SHA-256 is `c77ad7878831d73a9dd637bb1e35b6450a6e4588312149b48580816b08cbb0d9` and whose patched SHA-256 is `8b2fb100d45f7168bb20a343a3fccb368a2b476da6a52ba1e505eac2a2f77baa`.
 
-No other patch of this set touches that file. 0001 to 0004 change `hnsw.hpp`, `hnsw.cpp`, `cagra.cpp`, `cagra_build.cuh` and add `ace_memory_guard.hpp` and `hnsw_precision.hpp`; 0006 changes `cagra_build.cuh` and adds `consumer_row_sort_plan.hpp`. 0007 therefore applies to the clean source and in any position among them, with byte-identical results (checked with `git apply --check`, `git diff --check` and a tree comparison for 0006-then-0007 and 0007-then-0006). The patch is numbered after 0006 to keep the linear prefix states of the build recipe, which accepts 0001+0002+0003+0004+0006+0007.
+No other patch of this set touches that file. 0001 to 0005 change `hnsw.hpp`, `hnsw.cpp`, `cagra.cpp`, `cagra_build.cuh` and add `ace_memory_guard.hpp`, `hnsw_precision.hpp` and `cuvs_hnsw_nn_upper_contract.h`; 0006 changes `cagra_build.cuh` and adds `consumer_row_sort_plan.hpp`. 0007 therefore applies to the clean source and in any position among them, with byte-identical results (checked with `git apply --check`, `git diff --check` and a tree comparison for 0006-then-0007 and 0007-then-0006). The patch is numbered after 0006 to keep the linear prefix states of the build recipe, which applies 0001 through 0007 in order.
 
 ## What it changes
 

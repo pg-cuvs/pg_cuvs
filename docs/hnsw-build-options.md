@@ -15,11 +15,11 @@ SELECT pg_cuvs_hnsw_build_info('items_ann'::regclass);
 - 판정 시점: 테이블 통계(`reltuples` > 0)가 있으면 경로와 디스크 사전 점검을 heap 스캔 전에 `reltuples`와 선언 차원으로 판정한다. 거부와 ACE 전환 NOTICE가 spool 전에 나오고, 빌드는 spool한 행 수로 다시 판정한다. 통계가 없으면 스캔 뒤에 판정하며 영수증 `route_decided`가 어느 쪽인지 기록한다(`before_scan_from_statistics`, `after_scan_no_statistics`, 통계는 있었으나 데몬에서 스캔 전 예측을 받지 못한 `after_scan_preflight_unavailable`). 통계가 낡았으면 이른 판정이 틀릴 수 있으니 먼저 `ANALYZE`한다.
 - `ivf_pq`: resident IVF-PQ를 명시한다. 추정 예산 초과 또는 16행 미만이면 오류이며 다른 생성기로 대체하지 않는다. cuVS가 kNN 그래프를 거부해도 대체하지 않고 오류다.
 - resident IVF-PQ kNN 정밀도(`auto`, `ivf_pq` 공통): 제품은 원입력의 최대 제곱 노름에 따른 보수적 위험 분류를 사용한다. L2는 `4 * max_squared_norm`, 내적·cosine은 `max_squared_norm`이며, 상한이65504 이상이거나NaN/inf이면 coarse·internal·LUT를 모두fp32로 둔다. 정규화 데이터는 기존fp16 선택을 유지한다. 이 식은 모든PQ 중간항의 수치 범위를 증명하는 공식은 아니다. 영수증 `ivfpq_distance_dtype`은 이 **base graph**의 정밀도다.
-- `mode='hnsw'`의 GPU 상위 계층도 고정SDK 패치0004가 같은 정책을 적용한다. 실제 상위 레벨의 `rows * neighbor_degree >= 10000000`이고 IVF-PQ를 고른 경우에만, 그 레벨에 전달한 원벡터의 노름을 검사해 세 dtype을 함께fp32로 선택한다. 그 미만의 NN-descent 및 예산으로 NN-descent를 고르는 경로는 생성기·정밀도 파라미터를 바꾸지 않는다. 상위 선택은 SDK의 `HNSW upper-level IVF-PQ precision` INFO 로그로 확인한다. base 영수증만으로 upper dtype을 판정하지 않는다.
+- `mode='hnsw'`의 GPU 상위 계층도 고정SDK 패치0004가 같은 정책을 적용한다. 실제 상위 레벨의 `rows * neighbor_degree >= 10000000`이고 IVF-PQ를 고른 경우에만, 그 레벨에 전달한 원벡터의 노름을 검사해 세 dtype을 함께fp32로 선택한다. 기존 IVF-PQ 및 ACE 요청의 NN-descent 경로는 생성기·정밀도 파라미터를 바꾸지 않는다. 명시 resident NN의 GPU 상위 계층은 전용 SDK 가드가 NN과 레벨별 dtype을 선택한다. 상위 선택은 SDK의 `HNSW upper-level IVF-PQ precision` INFO 로그로 확인한다. base 영수증만으로 upper dtype을 판정하지 않는다.
 - SDK0004는 메모리 상위 계층 복사도 수정한다. hnswlib의 `char*`를 `const T*`로 해석해 `dim`개 원소를 복사한다. 과거 잘못된 바이트 좌표로 만든 그래프와는 이웃이 달라질 수 있으며, 정규화/NN 경로의 **파라미터 정책 유지**와 그래프 바이트 동일성은 다르다. 기본 `mode='nsw'`는 이 계층 생성을 통과하지 않는다.
 - ACE-disk 파티션은 이 upper 정책의 대상이 아니다. 제품은 ACE에 양수 host·GPU 예산을 넘기고, 메모리 가드0003은 예산이 있으면 파티션 kNN을 NN-descent로 선택한다. SDK 레시피·마커·소스 해시는 `infra/cuvs-patches`를 따른다.
 - `ace`: disk 경로를 명시한다. resident 추정이 예산 안이어도 ACE를 요청한다. N<16은 tiny와 충돌하고 N16–255는 partition 후보가 없어 오류다. 그 밖도 SDK의 형상·고정점 P·private 경로·가드 검사를 통과해야 한다. 다른 생성기로 대체하지 않는다. 성공한 명시 ACE는 `explicit build_algo=ace selected ACE-disk` NOTICE를 출력한다.
-- `nn_descent`: 예약된 미지원 값이다. 메모리 모델 부재와 `auto`(tiny/resident) 또는 명시 `ace` 대안을 설명하는 오류로 거부한다. ACE 내부의 NN-descent 사용과는 별개다.
+- `nn_descent`: 전체 데이터의 resident NN-descent base 그래프를 명시한다. 다른 생성기로 자동 대체하지 않으며 16행 미만, 실효 중간 차수 1024 초과, 비유한 입력 또는 보수적 FP32 거리 범위 초과는 오류다. ACE의 조각별 NN과 별개다. 차원이 16 이하이거나, 입력 원소가 half 범위를 넘거나, resident IVF-PQ와 같은 노름 상한(L2는 `4 * max_squared_norm`, 내적·cosine은 `max_squared_norm`)이 65504 이상이면 base에 FP32를 선택하고 그 밖에는 FP16을 선택한다. SDK의 FP16 경로는 노름을 FP32로, 내적을 half로 계산하므로 평균 오프셋이 큰 데이터에서는 원소가 half에 들어가도 소거로 이웃 순서가 무너진다(에뮬레이션 재현, GPU recall 미측정). 이 상한은 그 위험을 IVF-PQ와 같은 수준으로 막는 보수적 규칙이며 모든 소거를 막는다는 증명은 아니다. SDK는 FP32에서도 L2를 `||a||^2 + ||b||^2 - 2a·b`로 float32 계산하므로, 공통 오프셋이 큰 입력에서는 이웃 순서가 무너진다(예: 실제 768차원 행 + 오프셋 1000에서 FP32인데도 recall@10 0.40). L2에서는 NN-descent 그래프 입력만 열 평균(FP64 누적)으로 중심화한 사본을 쓴다. `mode='hnsw'`의 상위 계층도 SDK 패치 0005가 각 레벨 점 집합의 평균으로 중심화한 사본으로 NN-descent를 돌린다. L2는 평행이동 불변이므로 정답 이웃은 같고, 저장 벡터와 검색 거리는 원 데이터를 쓴다. base 사본은 그래프 호출 동안만 살고 host 추정에 `n * dim * 4`(L2만)로 반영된다. 상위 계층 사본은 그 레벨의 host workspace 검사에 포함된다. FP16/FP32 선택은 원 데이터 기준이다(0005가 FP16 base를 원 상위 행으로 검사하기 때문). 중심화는 공통 오프셋만 없애며, 서로 멀리 떨어진 조밀 클러스터의 소거는 남을 수 있고 탐지하지 않는다. 내적·cosine은 중심화하지 않는다. GPU에서 4096×768 실제 임베딩에 공통 오프셋을 더한 입력(efC64, 256질의, 독립 FP64 정답)으로 재면 recall@10(ef10)이 중심화 전에는 오프셋 300 이상에서 0.35~0.40, 중심화 후에는 모든 오프셋에서 0.92~0.945였고 계층·단층 모드가 같았다(그 표본에서는). 남은 한계는 issue #209에 있다. 예산 예측은 FP32 저장을 기준으로 하며 추정치는 모든 할당의 상한이 아니다. GPU 상위 계층에는 별도 SDK 패치가 필요하고 base dtype과 예산을 전달한다. 생성된 레벨의 dtype은 데몬 로그에 남는다.
 
 ```sql
 -- Explicitly choose ACE-disk even when AUTO would fit the resident budget.
@@ -67,15 +67,16 @@ resident 후보 훈련 형상, 추정치·실효 예산과 guard 반환 여부�
 ACE 인덱스는 영수증 바로 뒤에 조각 빌더 readback을 저장한다: `ace_build_quality_source`(`auto`/`manual`), `ace_build_quality`(q), `ace_local_intermediate_degree`(조각 kNN 폭), `ace_local_nn_descent_iterations`(조각 NN-descent 반복 상한; 100만 행 이상을 셋 이상의 조각으로 나누면 조각마다 달라 `varies_by_partition`). ACE 빌드는 검증된 고정 SDK(memory-guard marker `@60b19a0f`)에서만 돌므로 이 값은 그 SDK의 동작에서 계산한 값이다. 조각별 실제 값은 데몬 로그의 SDK 줄로 확인한다. 이 기능 이전에 만든 ACE 인덱스는 `"ace_readback":"not_recorded"`, resident·tiny는 `"not_applicable"`이다. 영수증 형식(policy v2)은 그대로이며 readback은 별도 magic의 꼬리 레코드다.
 기존 인덱스, 빈 heap, source 그래프 재사용에는 영수증이 없을 수 있으며 `not_recorded`로 표시한다.
 명시적 `build_algo`와 `source` 그래프 재사용을 함께 지정할 수 없다.
-pgvector metapage prefix와 영수증 크기는 유지한다. 새 writer는 policy v2만 기록하며 새 reader는 역사적 v1 auto→ACE도 당시 값 그대로 읽는다. 손상·잘린 알려진 영수증은 오류, 알 수 없는 미래 버전은 unsupported 오류다. 현재 설정으로 과거 메타를 덮어쓰지 않는다.
+pgvector metapage prefix와 영수증 크기는 유지한다. 기존 경로는 policy v2, resident NN은 policy v3과 NN tail을 기록한다. NN tail은 실제 선택한 base dtype, 그래프 폭, SDK 기본 반복 수와 설정한 반복 상한을 기록하며 실제 반복 횟수는 노출되지 않는다. 새 reader는 역사적 v1 auto→ACE도 당시 값 그대로 읽는다. 손상·잘린 알려진 영수증은 오류, 알 수 없는 미래 버전은 unsupported 오류다. 현재 설정으로 과거 메타를 덮어쓰지 않는다.
+NN tail에는 상위 계층 precision 계약 세대가 없으므로, hierarchy가 있는 인덱스의 `nn_upper_dtype_configured`는 null이다. 이를 base dtype이나 현재 SDK에서 역산하지 않는다. hierarchy가 없으면 `not_applicable`이다.
 실제 재시작·INSERT/DELETE/VACUUM 통합은 별도 검증 대상이며, CPU 페이지 검사는 실행 중인 PostgreSQL의 증거가 아니다.
 
 품질 합격은 새 질의의 exact top10 대비 recall@10이 직접 생성한 pgvector HNSW 이상인지
 같은 데이터·같은 ef와 같은 질의 비용에서 각각 비교한다. self 도달성 진단과는 별개다.
 같은 f32 벡터의 다른 ID는 동점 정답이다. 작은 생성 시험은 이 품질 기준의 통과 증거가 아니다.
 
-extension과 daemon은 HNSW op23 payload v5를 함께 배포해야 한다(v4는 응답 뒤에 결정 바이트 6개, 즉 status-13 DETAIL의 원값을 덧붙이고, v5는 그 뒤에 ACE partition builder readback 32바이트를 덧붙인다). 현재 글로벌 명령·응답 프로토콜은 `CUVS_PROTO_VERSION=5`이며 HNSW op23의 별도 payload 버전 5와 구분한다.
-이전 payload v1/v2/v3/v4 요청은 prefix의 버전을 먼저 검사해 나머지 필드를 기다리지 않고 거부한다.
+extension과 daemon은 HNSW op23 payload v6를 함께 배포해야 한다(v4는 응답 뒤에 결정 바이트 6개, 즉 status-13 DETAIL의 원값을 덧붙이고, v5는 그 뒤에 ACE partition builder readback 32바이트를 덧붙이며, v6는 그 뒤에 resident NN readback을 덧붙인다). 현재 글로벌 명령·응답 프로토콜은 `CUVS_PROTO_VERSION=5`이며 HNSW op23의 별도 payload 버전 6과 구분한다.
+이전 payload v1/v2/v3/v4/v5 요청은 prefix의 버전을 먼저 검사해 나머지 필드를 기다리지 않고 거부한다.
 기존 0.8.1 단독 reader는 새 policy v2를 읽을 수 없다. 0.8.2 도입 당시에는 확장과 데몬 바이너리를 함께 배포하고 0.8.2로 업그레이드해야 했다. 현재 배포 대상 버전은 0.9.0이며, 0.8.1에서 출발한다면 `sql/pg_cuvs--0.8.1--0.8.2.sql`과 `sql/pg_cuvs--0.8.2--0.9.0.sql`의 업그레이드 경로를 따른다. upgrade SQL은 영수증을 이주/덮어쓰기하지 않는다. v2가 있는 인덱스를 예전 reader로 downgrade하는 것은 지원하지 않는다.
 
 이 구현의 CPU 검사·코드 리뷰와 별개로 작은 실제 CUDA 생성·1M 동일성/비용/품질은 별도 실행 승인과 검증이 필요하다. 같은 native 파일의 변환 보존과 서로 다른 GPU build 간 SHA 불일치는 구분하며, 후자의 비결정성을 성공 판정으로 덮지 않는다.

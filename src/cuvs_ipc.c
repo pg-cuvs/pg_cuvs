@@ -995,8 +995,8 @@ cuvs_ipc_hnsw_route_preflight(const char *socket_path,
         reply->index_dir[sizeof(reply->index_dir) - 1] = '\0';
         if (reply->version != CUVS_HNSW_PREFLIGHT_VERSION
             || reply->n_estimate != request->n_estimate
-            || (rc == CUVS_STATUS_OK && (reply->route < CUVS_HNSW_ROUTE_TINY
-                                         || reply->route > CUVS_HNSW_ROUTE_ACE
+            || (rc == CUVS_STATUS_OK && (!cuvs_hnsw_forecast_matches(request->build_algo,
+                                                                      reply->route, reply->overflowed)
                                          || !reply->disk_ok)))
             rc = CUVS_STATUS_ERROR;
     }
@@ -2561,11 +2561,12 @@ cuvs_ipc_build_hnsw_file(const char *socket_path, int vectors_fd,
     uint32_t intermediate_degree, uint32_t hierarchy, uint64_t host_budget,
     uint32_t build_algo, uint32_t ef_construction, CuvsHnswPolicy *policy,
     CuvsHnswBudgetSnapshot *budget, CuvsHnswAceReadback *ace_readback,
+    CuvsHnswNnReadback *nn_readback,
     int *hnsw_fd, char *error, size_t error_len)
 {
     return cuvs_ipc_build_hnsw_file_idle(socket_path, vectors_fd, n_vecs, dim,
         metric, graph_degree, intermediate_degree, hierarchy, host_budget,
-        build_algo, ef_construction, policy, budget, ace_readback, hnsw_fd,
+        build_algo, ef_construction, policy, budget, ace_readback, nn_readback, hnsw_fd,
         error, error_len, NULL, NULL);
 }
 
@@ -2579,6 +2580,7 @@ cuvs_ipc_build_hnsw_file_idle(const char *socket_path, int vectors_fd,
     uint32_t intermediate_degree, uint32_t hierarchy, uint64_t host_budget,
     uint32_t build_algo, uint32_t ef_construction, CuvsHnswPolicy *policy,
     CuvsHnswBudgetSnapshot *budget, CuvsHnswAceReadback *ace_readback,
+    CuvsHnswNnReadback *nn_readback,
     int *hnsw_fd, char *error, size_t error_len,
     CuvsIpcIdleWork idle, void *idle_arg)
 {
@@ -2595,6 +2597,7 @@ cuvs_ipc_build_hnsw_file_idle(const char *socket_path, int vectors_fd,
     *hnsw_fd = -1;
     if (policy) memset(policy, 0, sizeof(*policy));
     if (ace_readback) memset(ace_readback, 0, sizeof(*ace_readback));
+    if (nn_readback) memset(nn_readback, 0, sizeof(*nn_readback));
     if (budget) memset(budget, 0, sizeof(*budget));
     if (error_len) error[0] = '\0';
     if (!cuvs_hnsw_regular_disk(vectors_fd) || !n_vecs || n_vecs > INT32_MAX
@@ -2614,7 +2617,10 @@ cuvs_ipc_build_hnsw_file_idle(const char *socket_path, int vectors_fd,
     if (send_cmd(sock, &cmd)
         || cuvs_fd_send(sock, vectors_fd, &request, sizeof(request))
         || cuvs_fd_send(sock, owner[1], &token, 1)) goto done;
-    close(owner[1]); owner[1] = -1;
+    /* Keep our copy of owner[1] until done: on macOS, closing it while the
+     * SCM_RIGHTS message is still in flight lets the daemon's received copy
+     * read EOF, i.e. a spurious cancel. Cancel still works because
+     * EOF on the daemon's end follows from closing owner[0], its peer. */
     /* A single readiness byte permits interruptible waiting before recvmsg:
      * reading that byte cannot accidentally discard the ancillary result FD. */
     for (unsigned waited = 0; waited < 864000; )
@@ -2646,7 +2652,12 @@ cuvs_ipc_build_hnsw_file_idle(const char *socket_path, int vectors_fd,
         if (pr < 0) goto done;
         if (pr == 0) continue;
         if (recv_all(sock, &token, 1) || token != 'R'
-            || cuvs_fd_recv(sock, &wire, sizeof(wire), &result_fd)) goto done;
+            || cuvs_fd_recv(sock, &wire, sizeof(wire), &result_fd))
+        {
+            if (error_len) snprintf(error, error_len,
+                "incomplete HNSW build reply; check connection and co-deploy matching extension and daemon");
+            goto done;
+        }
         reply = wire.header;
         remember_reply(&reply);
         rc = (int)reply.status;
@@ -2663,6 +2674,9 @@ cuvs_ipc_build_hnsw_file_idle(const char *socket_path, int vectors_fd,
                 || (wire.policy.route == CUVS_HNSW_ROUTE_ACE
                     ? !cuvs_hnsw_ace_readback_valid(&wire.ace, &wire.policy)
                     : wire.ace.magic != 0)
+                || (wire.policy.route == CUVS_HNSW_ROUTE_NN_DESCENT
+                    ? !cuvs_hnsw_nn_readback_valid(&wire.nn, &wire.policy)
+                    : wire.nn.magic != 0)
                 || !cuvs_hnsw_regular_disk(result_fd)
                 || (fcntl(result_fd, F_GETFL) & O_ACCMODE) != O_RDONLY)
             { rc = CUVS_STATUS_ERROR; goto done; }
@@ -2671,6 +2685,7 @@ cuvs_ipc_build_hnsw_file_idle(const char *socket_path, int vectors_fd,
             if (send(owner[0], &token, 1, 0) != 1) { rc = CUVS_STATUS_ERROR; goto done; }
             if (policy) *policy = wire.policy;
             if (ace_readback) *ace_readback = wire.ace;
+            if (nn_readback) *nn_readback = wire.nn;
             *hnsw_fd = result_fd; result_fd = -1;
         }
         goto done;

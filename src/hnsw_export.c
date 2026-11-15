@@ -501,6 +501,17 @@ typedef struct HnswNodeLocation
 _Static_assert(sizeof(HnswNodeLocation) == 8,
                "HNSW location records must stay compact");
 
+/* Neighbor links consume only the address; they must never receive a
+ * synthesized level from the periodic address fast path. */
+typedef struct HnswNodeAddress
+{
+    uint32_t elem_blkno;
+    uint16_t elem_offno;
+} HnswNodeAddress;
+
+_Static_assert(sizeof(HnswNodeAddress) <= sizeof(HnswNodeLocation),
+               "HNSW address template must fit in one location-table page");
+
 typedef void (*HnswInterruptCheck)(void);
 typedef bool (*HnswLocationWriter)(void *arg, uint64_t node,
                                    const HnswNodeLocation *location,
@@ -1295,18 +1306,16 @@ typedef struct {
     uint16_t        neigh_offno;
 } ElemDesc;
 
-typedef bool (*HnswNodeLocationLookup)(void *arg, uint32_t node,
-                                       HnswNodeLocation *location);
+typedef bool (*HnswNodeAddressLookup)(void *arg, uint32_t node,
+                                      HnswNodeAddress *address);
 
 static bool
-hnsw_lookup_elem_array(void *arg, uint32_t node, HnswNodeLocation *location)
+hnsw_lookup_elem_array(void *arg, uint32_t node, HnswNodeAddress *address)
 {
     const ElemDesc *elems = (const ElemDesc *)arg;
 
-    location->elem_blkno = elems[node].elem_blkno;
-    location->elem_offno = elems[node].elem_offno;
-    location->level = (uint8_t)elems[node].level;
-    location->reserved = 0;
+    address->elem_blkno = elems[node].elem_blkno;
+    address->elem_offno = elems[node].elem_offno;
     return true;
 }
 
@@ -1456,7 +1465,7 @@ write_elem_pair(Page page,
                 int bytes_per_dim,
                 int m,
                 size_t n_elems,
-                HnswNodeLocationLookup location_lookup,
+                HnswNodeAddressLookup location_lookup,
                 void *location_lookup_arg)
 {
     /* elem tuple */
@@ -1538,7 +1547,7 @@ write_elem_pair(Page page,
             if (s < lv_count && e->upper_links && e->upper_links[lv_idx])
             {
                 int nb = e->upper_links[lv_idx][s];
-                HnswNodeLocation location;
+                HnswNodeAddress location;
                 if (nb >= 0 && (size_t)nb < n_elems &&
                     location_lookup(location_lookup_arg, (uint32_t)nb, &location))
                     set_item_ptr(&slots[slot], location.elem_blkno,
@@ -1557,7 +1566,7 @@ write_elem_pair(Page page,
         if (s < e->lv0_count && e->lv0_links)
         {
             int nb = e->lv0_links[s];
-            HnswNodeLocation location;
+            HnswNodeAddress location;
             if (nb >= 0 && (size_t)nb < n_elems &&
                 location_lookup(location_lookup_arg, (uint32_t)nb, &location))
                 set_item_ptr(&slots[slot], location.elem_blkno,
@@ -1624,7 +1633,7 @@ write_elem_page(Relation rel,
                 int m,
                 size_t n_elems,
                 bool skip_wal,
-                HnswNodeLocationLookup location_lookup,
+                HnswNodeAddressLookup location_lookup,
                 void *location_lookup_arg)
 {
     Page                page = (Page)palloc(BLCKSZ);
@@ -1673,7 +1682,7 @@ write_elem_pages_packed(Relation rel,
                         size_t n_elems,
                         int k,
                         bool skip_wal,
-                        HnswNodeLocationLookup location_lookup,
+                        HnswNodeAddressLookup location_lookup,
                         void *location_lookup_arg)
 {
     uint32_t data_page_count;
@@ -2460,6 +2469,15 @@ typedef struct HnswLocationTable
     uint64_t formula_stride;
     uint64_t formula_verified_rows;
     HnswLocationCachePage cache[HNSW_LOCATION_CACHE_PAGES];
+    /* Independent of the borrowed full-location cache: a full lookup may
+     * replace cache[0] while neighbor addresses remain periodic. */
+    bool address_candidate;
+    bool address_ready;
+    uint32_t address_template_rows;
+    uint32_t address_period;
+    uint64_t address_stride;
+    uint64_t address_verified_rows;
+    HnswNodeAddress address_template[HNSW_LOCATION_ROWS_PER_PAGE];
 } HnswLocationTable;
 
 typedef struct HnswDiskImportState
@@ -2570,6 +2588,88 @@ hnsw_location_formula_append(HnswLocationTable *table, uint64_t node,
         table->formula_candidate = false;
 }
 
+/* Only block/offset are predicted.  The full location, including level,
+ * always uses its own independently verified formula or the spill file. */
+static bool
+hnsw_address_formula(const HnswLocationTable *table, uint64_t node,
+                     HnswNodeAddress *address)
+{
+    uint32_t count = table->address_template_rows;
+    const HnswNodeAddress *pattern;
+    uint64_t page, delta, block;
+
+    if (!table->address_candidate || count == 0 ||
+        count > HNSW_LOCATION_ROWS_PER_PAGE || node >= table->n_nodes ||
+        (table->address_period != 0 && table->address_period != count))
+        return false;
+    page = node / count;
+    if (table->address_period == 0 && page != 0)
+        return false;
+    pattern = &table->address_template[node % count];
+    if (!hnsw_mul_u64(page, table->address_stride, &delta) ||
+        !hnsw_add_u64(pattern->elem_blkno, delta, &block) ||
+        block == 0 || block >= (uint64_t)InvalidBlockNumber)
+        return false;
+    address->elem_blkno = (uint32_t)block;
+    address->elem_offno = pattern->elem_offno;
+    return true;
+}
+
+static bool
+hnsw_address_formula_matches(const HnswLocationTable *table, uint64_t node,
+                             const HnswNodeLocation *location)
+{
+    HnswNodeAddress expected;
+
+    return hnsw_address_formula(table, node, &expected) &&
+        expected.elem_blkno == location->elem_blkno &&
+        expected.elem_offno == location->elem_offno;
+}
+
+static void
+hnsw_address_formula_append(HnswLocationTable *table, uint64_t node,
+                            const HnswNodeLocation *location)
+{
+    if (node == 0)
+    {
+        table->address_candidate = true;
+        table->address_period = table->address_template_rows = 0;
+        table->address_stride = table->address_verified_rows = 0;
+    }
+    table->address_ready = false;
+    if (!table->address_candidate)
+        return;
+    if (table->address_template_rows == 0 ||
+        (table->address_period == 0 &&
+         location->elem_blkno == table->address_template[0].elem_blkno))
+    {
+        HnswNodeAddress *slot;
+
+        if (table->address_template_rows >= HNSW_LOCATION_ROWS_PER_PAGE)
+        {
+            table->address_candidate = false;
+            return;
+        }
+        slot = &table->address_template[table->address_template_rows++];
+        slot->elem_blkno = location->elem_blkno;
+        slot->elem_offno = location->elem_offno;
+        return;
+    }
+    if (table->address_period == 0)
+    {
+        if (location->elem_blkno <= table->address_template[0].elem_blkno)
+        {
+            table->address_candidate = false;
+            return;
+        }
+        table->address_period = table->address_template_rows;
+        table->address_stride = (uint64_t)location->elem_blkno -
+            table->address_template[0].elem_blkno;
+    }
+    if (!hnsw_address_formula_matches(table, node, location))
+        table->address_candidate = false;
+}
+
 static bool
 hnsw_location_table_append(void *arg, uint64_t node,
                            const HnswNodeLocation *location,
@@ -2582,6 +2682,7 @@ hnsw_location_table_append(void *arg, uint64_t node,
                                    "internal node-location table write order error");
     BufFileWrite(table->file, (void *)location, sizeof(*location));
     hnsw_location_formula_append(table, node, location);
+    hnsw_address_formula_append(table, node, location);
     table->n_written++;
     return true;
 }
@@ -2595,7 +2696,10 @@ hnsw_location_table_rewind(HnswLocationTable *table, uint64_t expected_rows)
     uint64_t read_node = 0;
 
     if (table)
+    {
         table->formula_ready = false;
+        table->address_ready = false;
+    }
     if (!table || !table->file || table->n_nodes != expected_rows ||
         table->n_written != expected_rows ||
         !hnsw_mul_u64(expected_rows, sizeof(HnswNodeLocation), &logical_bytes) ||
@@ -2621,6 +2725,13 @@ hnsw_location_table_rewind(HnswLocationTable *table, uint64_t expected_rows)
                     table->formula_candidate = false;
                     break;
                 }
+        if (table->address_candidate)
+            for (size_t i = 0; i < bytes / sizeof(rows[0]); i++)
+                if (!hnsw_address_formula_matches(table, read_node + i, &rows[i]))
+                {
+                    table->address_candidate = false;
+                    break;
+                }
         read_node += bytes / sizeof(rows[0]);
         bytes_remaining -= bytes;
     }
@@ -2631,6 +2742,9 @@ hnsw_location_table_rewind(HnswLocationTable *table, uint64_t expected_rows)
     table->formula_ready = table->formula_candidate && expected_rows > 0 &&
         read_node == expected_rows && table->formula_template_rows > 0;
     table->formula_verified_rows = table->formula_ready ? expected_rows : 0;
+    table->address_ready = table->address_candidate && expected_rows > 0 &&
+        read_node == expected_rows && table->address_template_rows > 0;
+    table->address_verified_rows = table->address_ready ? expected_rows : 0;
     return true;
 }
 
@@ -2678,6 +2792,28 @@ hnsw_location_table_lookup(void *arg, uint32_t node,
         ereport(ERROR,
                 (errmsg("pg_cuvs: HNSW node-location cache entry is out of range")));
     *location = cache->rows[row_index];
+    return true;
+}
+
+static bool
+hnsw_location_table_address_lookup(void *arg, uint32_t node,
+                                   HnswNodeAddress *address)
+{
+    HnswLocationTable *table = (HnswLocationTable *)arg;
+    HnswNodeLocation location;
+
+    if ((uint64_t)node >= table->n_nodes)
+        ereport(ERROR,
+                (errmsg("pg_cuvs: HNSW node-location lookup is out of range")));
+    if (table->address_ready && table->file &&
+        table->address_verified_rows == table->n_nodes &&
+        table->n_written == table->n_nodes &&
+        hnsw_address_formula(table, node, address))
+        return true;
+    if (!hnsw_location_table_lookup(arg, node, &location))
+        return false;
+    address->elem_blkno = location.elem_blkno;
+    address->elem_offno = location.elem_offno;
     return true;
 }
 
@@ -2920,7 +3056,7 @@ hnsw_write_disk_pages(Relation rel, int hnsw_fd, int tids_fd,
         }
         write_elem_pair(staged, &row.elem, row.vector, (int)dim,
                         bytes_per_dim, m, (size_t)n_nodes,
-                        hnsw_location_table_lookup, locations);
+                        hnsw_location_table_address_lookup, locations);
     }
     if (current_block != data_page_count)
         ereport(ERROR,
@@ -2936,7 +3072,7 @@ static void
 hnsw_write_disk_metapage(Relation rel, const HnswlibHeader *header,
                          uint32_t dim, uint32_t n_data_pages, bool skip_wal,
                          HnswLocationTable *locations, const CuvsHnswPolicy *policy,
-                         const CuvsHnswAceReadback *ace)
+                         const CuvsHnswAceReadback *ace, const CuvsHnswNnReadback *nn)
 {
     Page staged = (Page)palloc(BLCKSZ);
     HnswNodeLocation entry;
@@ -2961,6 +3097,15 @@ hnsw_write_disk_metapage(Relation rel, const HnswlibHeader *header,
         memcpy((char *)PageGetContents(staged) + sizeof(PgvHnswMeta) + sizeof(*policy),
                ace, sizeof(*ace));
         ((PageHeader)staged)->pd_lower += sizeof(*ace);
+    }
+    if (policy->route == CUVS_HNSW_ROUTE_NN_DESCENT)
+    {
+        if (!cuvs_hnsw_nn_readback_valid(nn, policy)
+            || ((PageHeader)staged)->pd_lower + sizeof(*nn) > ((PageHeader)staged)->pd_upper)
+            ereport(ERROR, (errmsg("pg_cuvs: invalid NN readback or insufficient metapage space")));
+        memcpy((char *)PageGetContents(staged) + sizeof(PgvHnswMeta) + sizeof(*policy),
+               nn, sizeof(*nn));
+        ((PageHeader)staged)->pd_lower += sizeof(*nn);
     }
     hnsw_publish_staged_page(rel, staged, skip_wal);
     pfree(staged);
@@ -3119,7 +3264,7 @@ hnsw_import_build_result(Relation indexRel,
         }
         hnsw_write_disk_metapage(s->target, &header, build->dim,
                                  data_page_count, skip_wal, &s->locations, &build->policy,
-                                 &build->ace);
+                                 &build->ace, &build->nn);
         hnsw_write_disk_pages(s->target, build->hnsw_fd, build->tids_fd,
                               &header, build->n_vecs, build->dim,
                               bytes_per_dim, data_page_count, skip_wal,
@@ -3949,14 +4094,9 @@ static void
 cuvs_hnsw_validate_build_algo(const char *value)
 {
     if (cuvs_hnsw_algo_supported(cuvs_hnsw_algo_from_name(value))) return;
-    if (!strcmp(value, "nn_descent"))
-        ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-            errmsg("pg_cuvs_hnsw: build_algo=nn_descent is reserved but unsupported"),
-            errdetail("NN-descent has no supported memory estimate for this build path."),
-            errhint("Use build_algo=auto for tiny/resident IVF-PQ, or build_algo=ace for an explicit disk build.")));
     ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
         errmsg("pg_cuvs_hnsw: invalid build_algo \"%s\"", value),
-        errhint("Valid supported values: auto, ivf_pq, ace.")));
+        errhint("Valid supported values: auto, ivf_pq, nn_descent, ace.")));
 }
 
 /* One-time relopt registration; called from _PG_init. */
@@ -3971,7 +4111,7 @@ cuvs_hnsw_init_reloptions(void)
                          "Conversion mode: nsw (default), hnsw, hnswlib, hnswlib_file",
                          "nsw", cuvs_hnsw_validate_mode, AccessExclusiveLock);
     add_string_reloption(cuvs_hnsw_relopt_kind, "build_algo",
-                         "HNSW route: auto=tiny/resident IVF-PQ, explicit ivf_pq or ace; estimates are not memory upper bounds",
+                         "HNSW route: auto=tiny/resident IVF-PQ, explicit ivf_pq, nn_descent or ace; estimates are not memory upper bounds",
                          "auto", cuvs_hnsw_validate_build_algo, AccessExclusiveLock);
     add_int_reloption(cuvs_hnsw_relopt_kind, "m",
                       "pgvector HNSW M; informational (graph degree drives layout)",
@@ -4008,6 +4148,7 @@ pg_cuvs_hnsw_build_info(PG_FUNCTION_ARGS)
     CuvsHnswPolicy policy = {0};
     CuvsHnswPolicyReadStatus policy_status = CUVS_HNSW_POLICY_NOT_RECORDED;
     CuvsHnswAceReadback ace = {0};
+    CuvsHnswNnReadback nn = {0};
     CuvsHnswPolicyReadStatus ace_status = CUVS_HNSW_POLICY_NOT_RECORDED;
     StringInfoData json;
     Oid heap;
@@ -4026,6 +4167,8 @@ pg_cuvs_hnsw_build_info(PG_FUNCTION_ARGS)
         policy_status = hnsw_read_disk_policy(page, &policy);
         if (policy_status == CUVS_HNSW_POLICY_RECORDED && policy.route == CUVS_HNSW_ROUTE_ACE)
             ace_status = hnsw_read_disk_ace(page, &policy, &ace);
+        if (policy_status == CUVS_HNSW_POLICY_RECORDED && policy.route == CUVS_HNSW_ROUTE_NN_DESCENT)
+            memcpy(&nn, (const char *)PageGetContents(page) + sizeof(PgvHnswMeta) + sizeof(policy), sizeof(nn));
         UnlockReleaseBuffer(buffer);
     }
     index_close(rel, AccessShareLock);
@@ -4095,6 +4238,18 @@ pg_cuvs_hnsw_build_info(PG_FUNCTION_ARGS)
         else
             appendStringInfoString(&json, "\"ace_local_nn_descent_iterations\":\"varies_by_partition\"");
     }
+    if (policy.route == CUVS_HNSW_ROUTE_NN_DESCENT)
+        appendStringInfo(&json,
+            ",\"nn_readback_version\":%u,\"nn_graph_degree\":%u,\"nn_internal_degree\":%u,"
+            "\"nn_sdk_default_iterations\":%u,\"nn_configured_max_iterations\":%u,"
+            "\"nn_actual_iterations\":null,\"nn_seed\":null,\"nn_distance_dtype\":\"%s\",\"nn_termination_threshold\":%.9g,"
+            "\"nn_upper_builder\":\"%s\",\"nn_upper_dtype\":\"%s\","
+            "\"nn_upper_dtype_configured\":%s",
+            nn.version, nn.graph_degree, nn.internal_degree, nn.sdk_default_iterations, nn.max_iterations,
+            nn.dtype == CUVS_HNSW_NN_DTYPE_FP32 ? "fp32" : "fp16", nn.termination_threshold,
+            policy.hierarchy ? "configured_nn_descent_if_built" : "not_applicable",
+            policy.hierarchy ? "per_level_not_recorded" : "not_applicable",
+            policy.hierarchy ? "null" : "\"not_applicable\"");
     appendStringInfoChar(&json, '}');
     PG_RETURN_DATUM(DirectFunctionCall1(jsonb_in, CStringGetDatum(json.data)));
 }

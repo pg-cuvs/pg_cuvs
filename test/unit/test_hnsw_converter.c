@@ -994,7 +994,7 @@ test_hierarchical_native_packing_case(int dim, int bytes_per_dim, int m)
     chain_test_reset();
     chain_test_nblocks = 0;
     hnsw_write_disk_metapage(NULL, &parsed, (uint32_t)dim, n_pages,
-                             false, &table, &policy, NULL);
+                             false, &table, &policy, NULL, NULL);
     hnsw_write_disk_pages(NULL, f.hnsw_fd, f.tids_fd, &parsed, N,
                           (uint32_t)dim, bytes_per_dim, n_pages, false, &table);
     assert(chain_test_wal_images == n_pages + 1);
@@ -1177,6 +1177,144 @@ test_location_readback_interrupt(void)
     assert(test_readback_reads == 1);
     BufFileClose(file);
     free(file);
+}
+
+/* Independent row oracle: location addresses repeat every two nodes, while
+ * levels vary independently.  Full lookups must retain the authoritative
+ * level even after they replace the borrowed legacy cache template. */
+static HnswNodeLocation
+address_oracle(uint32_t node, bool irregular)
+{
+    HnswNodeLocation location;
+
+    location.elem_blkno = 1 + node / 2 + (irregular && node >= 1000 ? 1 : 0);
+    location.elem_offno = (uint16_t)(1 + 2 * (node % 2));
+    location.level = (uint8_t)(node % 37 == 0 ? 2 : node % 13 == 0 ? 1 : 0);
+    location.reserved = 0;
+    return location;
+}
+
+static void
+test_address_formula_independent_of_levels(bool irregular)
+{
+    struct BufFile file = {.fd = make_temp_fd()};
+    HnswLocationTable table = {0};
+    const uint32_t probes[] = {0, 1024, 2048, 3072, 4096, 5120, 38, 1, 4097, 1024};
+    char error[128] = {0};
+
+    table.file = &file;
+    table.n_nodes = HNSW_LOCATION_ROWS_PER_PAGE * 5 + 7;
+    for (uint32_t node = 0; node < table.n_nodes; node++)
+    {
+        HnswNodeLocation expected = address_oracle(node, irregular);
+        assert(hnsw_location_table_append(&table, node, &expected,
+                                          error, sizeof(error)));
+    }
+    assert(hnsw_location_table_rewind(&table, table.n_nodes));
+    assert(!table.formula_ready); /* variable levels never synthesize a level */
+    assert(table.address_ready == !irregular);
+    for (size_t i = 0; i < sizeof(probes) / sizeof(probes[0]); i++)
+    {
+        HnswNodeLocation actual, expected = address_oracle(probes[i], irregular);
+        assert(hnsw_location_table_lookup(&table, probes[i], &actual));
+        assert(memcmp(&actual, &expected, sizeof(actual)) == 0);
+    }
+    /* Full lookups above can overwrite cache[0]; the address template must
+     * survive, without any address lookup returning a fabricated level. */
+    test_readback_reads = 0;
+    test_readback_cancel_enabled = true;
+    for (size_t i = 0; i < sizeof(probes) / sizeof(probes[0]); i++)
+    {
+        HnswNodeAddress actual;
+        HnswNodeLocation expected = address_oracle(probes[i], irregular);
+        assert(hnsw_location_table_address_lookup(&table, probes[i], &actual));
+        assert(actual.elem_blkno == expected.elem_blkno &&
+               actual.elem_offno == expected.elem_offno);
+    }
+    test_readback_cancel_enabled = false;
+    if (irregular)
+        assert(test_readback_reads > 0);
+    else
+        assert(test_readback_reads == 0 && table.address_ready);
+    assert(sizeof(table.address_template) <= BLCKSZ);
+    BufFileClose(&file);
+}
+
+static void
+test_address_readback_rejects_changed_and_short_file(void)
+{
+    struct BufFile file = {.fd = make_temp_fd()};
+    HnswLocationTable table = {0};
+    HnswNodeAddress actual;
+    char error[128] = {0};
+
+    table.file = &file;
+    table.n_nodes = HNSW_LOCATION_ROWS_PER_PAGE + 1;
+    for (uint32_t node = 0; node < table.n_nodes; node++)
+    {
+        HnswNodeLocation expected = address_oracle(node, false);
+        assert(hnsw_location_table_append(&table, node, &expected,
+                                          error, sizeof(error)));
+    }
+    /* Change a stored address after append; full readback is authoritative. */
+    HnswNodeLocation changed = address_oracle(HNSW_LOCATION_ROWS_PER_PAGE, false);
+    changed.elem_blkno++;
+    memcpy(file.logical_bytes + HNSW_LOCATION_ROWS_PER_PAGE * sizeof(changed),
+           &changed, sizeof(changed));
+    assert(hnsw_location_table_rewind(&table, table.n_nodes));
+    assert(!table.address_ready);
+    assert(hnsw_location_table_address_lookup(&table, HNSW_LOCATION_ROWS_PER_PAGE,
+                                               &actual));
+    assert(actual.elem_blkno == changed.elem_blkno &&
+           actual.elem_offno == changed.elem_offno);
+    file.logical_size -= sizeof(changed);
+    assert(!hnsw_location_table_rewind(&table, table.n_nodes));
+    assert(!table.address_ready);
+    BufFileClose(&file);
+}
+
+static void
+test_address_single_page_and_out_of_range(void)
+{
+    struct BufFile file = {.fd = make_temp_fd()};
+    HnswLocationTable table = {0};
+    HnswNodeAddress actual;
+    HnswNodeLocation first = {1, 1, 2, 0}, second = {1, 3, 0, 0};
+    char error[128] = {0};
+    pid_t child;
+    int status;
+
+    table.file = &file;
+    table.n_nodes = 2;
+    assert(hnsw_location_table_append(&table, 0, &first, error, sizeof(error)));
+    assert(hnsw_location_table_append(&table, 1, &second, error, sizeof(error)));
+    /* Before complete readback no address is predicted. */
+    assert(!table.address_ready);
+    /* Even a stale ready flag cannot bypass the verified-row guard. */
+    table.address_ready = true;
+    table.address_verified_rows = 0;
+    test_readback_reads = 0;
+    test_readback_cancel_enabled = true;
+    assert(hnsw_location_table_address_lookup(&table, 1, &actual));
+    test_readback_cancel_enabled = false;
+    assert(test_readback_reads > 0 && actual.elem_blkno == 1 &&
+           actual.elem_offno == 3);
+    table.address_ready = false;
+    assert(hnsw_location_table_rewind(&table, 2));
+    assert(table.address_ready && table.address_period == 0);
+    assert(hnsw_location_table_address_lookup(&table, 1, &actual));
+    assert(actual.elem_blkno == 1 && actual.elem_offno == 3);
+    child = fork();
+    assert(child >= 0);
+    if (child == 0)
+    {
+        assert(freopen("/dev/null", "w", stderr) != NULL);
+        (void)hnsw_location_table_address_lookup(&table, 2, &actual);
+        _exit(0);
+    }
+    assert(waitpid(child, &status, 0) == child);
+    assert(WIFSIGNALED(status) && WTERMSIG(status) == SIGABRT);
+    BufFileClose(&file);
 }
 
 static void
@@ -1410,7 +1548,7 @@ test_ace_readback_metapage_roundtrip(void)
     assert(cuvs_hnsw_ace_readback_valid(&ace, &p));
 
     chain_test_reset();
-    hnsw_write_disk_metapage(NULL, &hdr, 2, 1, true, &table, &p, &ace);
+    hnsw_write_disk_metapage(NULL, &hdr, 2, 1, true, &table, &p, &ace, NULL);
     meta = (Page)chain_test_pages[chain_test_nblocks - 1];
     assert(((PageHeader)meta)->pd_lower == prefix + sizeof(p) + sizeof(ace));
     assert(memcmp((char *)meta + prefix, &p, sizeof(p)) == 0); /* receipt bytes unchanged */
@@ -1440,7 +1578,7 @@ test_ace_readback_metapage_roundtrip(void)
     resident.requested_algo = CUVS_HNSW_ALGO_IVF_PQ; resident.partitions = 0;
     assert(cuvs_hnsw_policy_valid(&resident));
     chain_test_reset();
-    hnsw_write_disk_metapage(NULL, &hdr, 2, 1, true, &table, &resident, &ace);
+    hnsw_write_disk_metapage(NULL, &hdr, 2, 1, true, &table, &resident, &ace, NULL);
     meta = (Page)chain_test_pages[chain_test_nblocks - 1];
     assert(((PageHeader)meta)->pd_lower == prefix + sizeof(resident));
 
@@ -1454,15 +1592,34 @@ test_ace_readback_metapage_roundtrip(void)
         bad.local_intermediate = 128;
         assert(freopen("/dev/null", "w", stderr) != NULL);
         chain_test_reset();
-        hnsw_write_disk_metapage(NULL, &hdr, 2, 1, true, &table, &p, &bad);
+        hnsw_write_disk_metapage(NULL, &hdr, 2, 1, true, &table, &p, &bad, NULL);
         _exit(0); /* reaching here means the writer accepted it */
     }
     assert(waitpid(child, &status, 0) == child);
     assert(WIFSIGNALED(status) && WTERMSIG(status) == SIGABRT);
 
+    /* Production writer/reader roundtrip for the v3 NN tail. */
+    CuvsHnswNnReadback nn = {0};
+    p.version = CUVS_HNSW_POLICY_NN_VERSION;
+    p.route = p.internal_builder = CUVS_HNSW_ROUTE_NN_DESCENT;
+    p.requested_algo = CUVS_HNSW_ALGO_NN_DESCENT; p.partitions = 0; p.ace_ef = 0;
+    p.n_rows = 10000; p.degree = 64; p.intermediate = 128;
+    nn.magic = CUVS_HNSW_NN_READBACK_MAGIC; nn.version = 1; nn.bytes = sizeof(nn);
+    nn.graph_degree = 128; nn.internal_degree = 192; nn.sdk_default_iterations = 20;
+    nn.max_iterations = 20; nn.dtype = CUVS_HNSW_NN_DTYPE_FP32; nn.termination_threshold = 0.0001f;
+    chain_test_reset();
+    hnsw_write_disk_metapage(NULL, &hdr, 2, 1, true, &table, &p, &ace, &nn);
+    meta = (Page)chain_test_pages[chain_test_nblocks - 1];
+    assert(((PageHeader)meta)->pd_lower == prefix + sizeof(p) + sizeof(nn));
+    assert(hnsw_read_disk_policy(meta, &out) == CUVS_HNSW_POLICY_RECORDED);
+    assert(memcmp((char *)meta + prefix + sizeof(p), &nn, sizeof(nn)) == 0);
+    ((PageHeader)meta)->pd_lower--;
+    assert(hnsw_read_disk_policy(meta, &out) == CUVS_HNSW_POLICY_CORRUPT);
+
     fixture_close(&f);
     BufFileClose(&fake_file);
     puts("PASS ACE readback metapage roundtrip: bytes at prefix+receipt, pd_lower, older/foreign/truncated tails, resident has none, writer refuses invalid");
+    puts("PASS NN v3 metapage roundtrip and truncated tail rejection (CPU fixture)");
 }
 
 /* The row reader reserves each level-0 record before reading its fields, so
@@ -1759,6 +1916,10 @@ main(void)
     test_pgvector_page_version_range();
     test_buffered_location_table_contract();
     test_location_readback_interrupt();
+    test_address_formula_independent_of_levels(false);
+    test_address_formula_independent_of_levels(true);
+    test_address_readback_rejects_changed_and_short_file();
+    test_address_single_page_and_out_of_range();
     test_disk_location_table_roundtrip();
     test_rejects_count_dimension_metric_and_version_mismatch();
     test_rejects_bad_crc_and_truncated_inputs();

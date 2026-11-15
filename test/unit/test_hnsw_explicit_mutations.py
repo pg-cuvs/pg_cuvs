@@ -7,7 +7,7 @@ import resource
 import subprocess
 
 ROOT = Path(__file__).resolve().parents[2]
-HEADERS = ['cuvs_hnsw_policy.h', 'cuvs_hnsw_build_common.h', 'cuvs_ipc.h']
+HEADERS = ['cuvs_hnsw_policy.h', 'cuvs_hnsw_build_common.h', 'cuvs_ipc.h', 'cuvs_admission_contract.h', 'cuvs_hnsw_nn_capacity.h', 'cuvs_hnsw_nn_precision.h', 'cuvs_build_corpus.h']
 
 
 def replace_once(body, old, new):
@@ -17,8 +17,9 @@ def replace_once(body, old, new):
 
 def mutate(name, files):
     p = files['cuvs_hnsw_policy.h']; c = files['cuvs_hnsw_build_common.h']
-    if name == 'whitelist_range_opens_NN':
-        p = replace_once(p, 'return algo == CUVS_HNSW_ALGO_AUTO || algo == CUVS_HNSW_ALGO_IVF_PQ\n        || algo == CUVS_HNSW_ALGO_ACE;', 'return algo <= CUVS_HNSW_ALGO_ACE;')
+    if name == 'whitelist_range_opens_unknown_algo':
+        # NN is now allowed, so 'algo <= ACE' equals the whitelist; widen past it instead.
+        p = replace_once(p, 'return algo == CUVS_HNSW_ALGO_AUTO || algo == CUVS_HNSW_ALGO_IVF_PQ\n        || algo == CUVS_HNSW_ALGO_ACE || algo == CUVS_HNSW_ALGO_NN_DESCENT;', 'return algo <= CUVS_HNSW_ALGO_ACE + 1;')
     elif name == 'resident_budget_guard_removed':
         c = replace_once(c, 'if (!tiny && algo != CUVS_HNSW_ALGO_ACE && exceeded && !overflow_to_ace)', 'if (0 && !tiny && algo != CUVS_HNSW_ALGO_ACE && exceeded && !overflow_to_ace)')
     elif name == 'ACE_not_forced_when_resident_fits':
@@ -33,7 +34,7 @@ def mutate(name, files):
         c = replace_once(c, '(host < gpu ? host : gpu) / 64', 'host / 64')
     elif name == 'writer_route_contract_removed':
         a = p.index('static inline int cuvs_hnsw_policy_valid(')
-        b = p.index('/* Historical v1', a)
+        b = p.index('/* NN-only metapage tail', a)
         fn = p[a:b]; k = fn.index('\n        && ((p->requested_algo')
         p = p[:a] + fn[:k] + ';\n}\n\n' + p[b:]
     elif name == 'reply_request_binding_removed':
@@ -61,7 +62,7 @@ def command(argv, folder, label):
 def main(output):
     out = Path(output).resolve(); out.mkdir(exist_ok=False)
     originals = {n: (ROOT / 'src' / n).read_text() for n in HEADERS + ['cuvs_ipc.c']}
-    names = ['whitelist_range_opens_NN', 'resident_budget_guard_removed',
+    names = ['whitelist_range_opens_unknown_algo', 'resident_budget_guard_removed',
              'ACE_not_forced_when_resident_fits', 'legacy_reinterpreted_as_current',
              'reader_truncation_guard_removed', 'tiny_wrongly_gets_resident_status13',
              'sampling_ignores_GPU_budget', 'writer_route_contract_removed',

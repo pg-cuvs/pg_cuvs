@@ -8,15 +8,17 @@
 
 #define CUVS_HNSW_ALGO_AUTO 0u
 #define CUVS_HNSW_ALGO_IVF_PQ 1u
-#define CUVS_HNSW_ALGO_NN_DESCENT 2u /* reserved; no supported memory model */
+#define CUVS_HNSW_ALGO_NN_DESCENT 2u
 #define CUVS_HNSW_ALGO_ACE 3u
 #define CUVS_HNSW_MIN_ELEMENTS 16
 #define CUVS_HNSW_ROUTE_TINY 1u
 #define CUVS_HNSW_ROUTE_IVF_PQ 2u
 #define CUVS_HNSW_ROUTE_ACE 3u
+#define CUVS_HNSW_ROUTE_NN_DESCENT 4u
 #define CUVS_HNSW_POLICY_MAGIC UINT32_C(0x43565031)
 #define CUVS_HNSW_POLICY_VERSION 2u
 #define CUVS_HNSW_POLICY_LEGACY_VERSION 1u
+#define CUVS_HNSW_POLICY_NN_VERSION 3u
 
 /* ADR-087 (UC-5, 2026-11-03): what build_algo=auto does when the resident
  * IVF-PQ estimate exceeds the host/GPU budget. Daemon flag
@@ -93,11 +95,11 @@ typedef struct CuvsHnswPolicy {
     uint64_t sdk_host_budget, sdk_gpu_budget;
 } CuvsHnswPolicy;
 
-/* HNSW options are not a numeric range: reserved NN-descent must stay closed. */
+/* HNSW options are not a numeric range. */
 static inline int cuvs_hnsw_algo_supported(uint32_t algo)
 {
     return algo == CUVS_HNSW_ALGO_AUTO || algo == CUVS_HNSW_ALGO_IVF_PQ
-        || algo == CUVS_HNSW_ALGO_ACE;
+        || algo == CUVS_HNSW_ALGO_ACE || algo == CUVS_HNSW_ALGO_NN_DESCENT;
 }
 
 static inline const char *cuvs_hnsw_algo_name(uint32_t algo)
@@ -105,6 +107,7 @@ static inline const char *cuvs_hnsw_algo_name(uint32_t algo)
     switch (algo) {
     case CUVS_HNSW_ALGO_AUTO: return "auto";
     case CUVS_HNSW_ALGO_IVF_PQ: return "ivf_pq";
+    case CUVS_HNSW_ALGO_NN_DESCENT: return "nn_descent";
     case CUVS_HNSW_ALGO_ACE: return "ace";
     default: return "unsupported";
     }
@@ -125,8 +128,22 @@ static inline const char *cuvs_hnsw_route_name(uint32_t route)
     case CUVS_HNSW_ROUTE_TINY: return "tiny";
     case CUVS_HNSW_ROUTE_IVF_PQ: return "resident_ivf_pq";
     case CUVS_HNSW_ROUTE_ACE: return "ace_disk";
+    case CUVS_HNSW_ROUTE_NN_DESCENT: return "resident_nn_descent";
     default: return "unknown";
     }
+}
+
+/* Preflight decisions exclude R1, which happens only after a build begins. */
+static inline int cuvs_hnsw_forecast_matches(uint32_t requested, uint32_t route, uint32_t overflowed)
+{
+    if (overflowed > 1) return 0;
+    if (requested == CUVS_HNSW_ALGO_AUTO)
+        return (route == CUVS_HNSW_ROUTE_ACE && overflowed)
+            || ((route == CUVS_HNSW_ROUTE_TINY || route == CUVS_HNSW_ROUTE_IVF_PQ) && !overflowed);
+    if (overflowed) return 0;
+    return (requested == CUVS_HNSW_ALGO_IVF_PQ && route == CUVS_HNSW_ROUTE_IVF_PQ)
+        || (requested == CUVS_HNSW_ALGO_ACE && route == CUVS_HNSW_ROUTE_ACE)
+        || (requested == CUVS_HNSW_ALGO_NN_DESCENT && route == CUVS_HNSW_ROUTE_NN_DESCENT);
 }
 
 /* Reloption default64 preserves I128 / hierarchy200 (ACE: cuvs_hnsw_ace_ef). These control
@@ -198,6 +215,25 @@ static inline uint32_t cuvs_hnsw_ace_ef(uint32_t setting, uint32_t ef,
 
 static inline int cuvs_hnsw_policy_valid(const CuvsHnswPolicy *p)
 {
+    if (p && p->magic == CUVS_HNSW_POLICY_MAGIC
+        && p->version == CUVS_HNSW_POLICY_NN_VERSION && p->bytes == sizeof(*p))
+        return p->route == CUVS_HNSW_ROUTE_NN_DESCENT
+            && p->requested_algo == CUVS_HNSW_ALGO_NN_DESCENT
+            && p->internal_builder == CUVS_HNSW_ROUTE_NN_DESCENT
+            && p->requested_ef >= 4 && p->requested_ef <= 1000 && p->guard_passed == 1
+            && p->n_rows >= CUVS_HNSW_MIN_ELEMENTS && p->n_rows < INT32_MAX - 1
+            && p->dim && p->dim <= 65535 && p->metric <= 2 && p->hierarchy <= 1
+            && p->degree >= 2 && !(p->degree & 1)
+            && p->intermediate >= p->degree && p->intermediate <= 1024
+            && p->intermediate < p->n_rows
+            && !p->partitions && !p->ace_ef && !p->n_lists && !p->pq_dim && !p->pq_bits
+            && !p->n_probes && !p->query_batch && !p->training_requested && !p->training_actual
+            && !(p->route_flags & ~(CUVS_HNSW_ROUTE_FLAG_PRESPOOL
+                | CUVS_HNSW_ROUTE_FLAG_AFTER_SCAN | CUVS_HNSW_ROUTE_FLAG_NO_STATISTICS))
+            && (p->route_flags & (CUVS_HNSW_ROUTE_FLAG_PRESPOOL | CUVS_HNSW_ROUTE_FLAG_AFTER_SCAN))
+                != (CUVS_HNSW_ROUTE_FLAG_PRESPOOL | CUVS_HNSW_ROUTE_FLAG_AFTER_SCAN)
+            && (!(p->route_flags & CUVS_HNSW_ROUTE_FLAG_NO_STATISTICS)
+                || (p->route_flags & CUVS_HNSW_ROUTE_FLAG_AFTER_SCAN));
     return p && p->magic == CUVS_HNSW_POLICY_MAGIC
         && p->version == CUVS_HNSW_POLICY_VERSION && p->bytes == sizeof(*p)
         && p->route >= CUVS_HNSW_ROUTE_TINY && p->route <= CUVS_HNSW_ROUTE_ACE
@@ -226,6 +262,35 @@ static inline int cuvs_hnsw_policy_valid(const CuvsHnswPolicy *p)
             || (p->requested_algo == CUVS_HNSW_ALGO_ACE && p->route == CUVS_HNSW_ROUTE_ACE));
 }
 
+/* NN-only metapage tail. Configured maximum is not an observed iteration count. */
+#define CUVS_HNSW_NN_READBACK_MAGIC UINT32_C(0x43564e52)
+#define CUVS_HNSW_NN_DTYPE_FP16 1u
+#define CUVS_HNSW_NN_DTYPE_FP32 2u
+typedef struct CuvsHnswNnReadback {
+    uint32_t magic, version, bytes;
+    uint32_t graph_degree, internal_degree, sdk_default_iterations, max_iterations, dtype;
+    float termination_threshold;
+} CuvsHnswNnReadback;
+
+static inline int cuvs_hnsw_nn_readback_valid(const CuvsHnswNnReadback *r,
+                                               const CuvsHnswPolicy *p)
+{
+    uint64_t internal;
+    if (!r || !p || p->version != CUVS_HNSW_POLICY_NN_VERSION
+        || !cuvs_hnsw_policy_valid(p)) return 0;
+    internal = (uint64_t)p->intermediate * 3 / 2;
+    if (internal >= p->n_rows) internal = p->n_rows - 1;
+    return r->magic == CUVS_HNSW_NN_READBACK_MAGIC && r->version == 1
+        && r->bytes == sizeof(*r) && r->graph_degree == p->intermediate
+        && r->internal_degree == internal && r->sdk_default_iterations > 0
+        && r->sdk_default_iterations <= 1024
+        && r->max_iterations == cuvs_hnsw_scaled_quality(r->sdk_default_iterations,
+                                                          p->requested_ef, 1, 65535)
+        && (r->dtype == CUVS_HNSW_NN_DTYPE_FP16 || r->dtype == CUVS_HNSW_NN_DTYPE_FP32)
+        && (p->dim > 16 || r->dtype == CUVS_HNSW_NN_DTYPE_FP32)
+        && r->termination_threshold == 0.0001f;
+}
+
 /* Historical v1 AUTO could select ACE. Never reinterpret it using v2 policy. */
 static inline int cuvs_hnsw_policy_legacy_valid(const CuvsHnswPolicy *p)
 {
@@ -244,8 +309,8 @@ typedef enum CuvsHnswPolicyReadStatus {
     CUVS_HNSW_POLICY_CORRUPT
 } CuvsHnswPolicyReadStatus;
 
-/* Bounded metapage tail reader; v1/v2 have the same layout. Unknown future
- * versions are unsupported, not proof of index corruption or absent history. */
+/* Bounded metapage reader; v1/v2/v3 share the receipt prefix and v3 requires
+ * an NN tail. Unknown versions are unsupported, not proof of corruption. */
 static inline CuvsHnswPolicyReadStatus
 cuvs_hnsw_policy_read(const void *data, size_t available, CuvsHnswPolicy *out)
 {
@@ -257,10 +322,21 @@ cuvs_hnsw_policy_read(const void *data, size_t available, CuvsHnswPolicy *out)
     if (header[0] != CUVS_HNSW_POLICY_MAGIC) return CUVS_HNSW_POLICY_NOT_RECORDED;
     if (available < sizeof(header)) return CUVS_HNSW_POLICY_CORRUPT;
     memcpy(header, data, sizeof(header));
-    if (header[1] != CUVS_HNSW_POLICY_VERSION && header[1] != CUVS_HNSW_POLICY_LEGACY_VERSION)
+    if (header[1] != CUVS_HNSW_POLICY_VERSION && header[1] != CUVS_HNSW_POLICY_LEGACY_VERSION
+        && header[1] != CUVS_HNSW_POLICY_NN_VERSION)
         return CUVS_HNSW_POLICY_UNSUPPORTED;
     if (header[2] != sizeof(*out) || available < sizeof(*out)) return CUVS_HNSW_POLICY_CORRUPT;
     memcpy(out, data, sizeof(*out));
+    if (out->version == CUVS_HNSW_POLICY_NN_VERSION)
+    {
+        CuvsHnswNnReadback tail;
+        if (available < sizeof(*out) + sizeof(tail)) return CUVS_HNSW_POLICY_CORRUPT;
+        memcpy(&tail, (const char *)data + sizeof(*out), sizeof(tail));
+        if (tail.magic == CUVS_HNSW_NN_READBACK_MAGIC && tail.version != 1)
+            return CUVS_HNSW_POLICY_UNSUPPORTED;
+        return cuvs_hnsw_nn_readback_valid(&tail, out) ? CUVS_HNSW_POLICY_RECORDED
+                                                       : CUVS_HNSW_POLICY_CORRUPT;
+    }
     if (cuvs_hnsw_policy_valid(out) || cuvs_hnsw_policy_legacy_valid(out))
         return CUVS_HNSW_POLICY_RECORDED;
     return CUVS_HNSW_POLICY_CORRUPT;

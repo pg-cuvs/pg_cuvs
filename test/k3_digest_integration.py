@@ -15,11 +15,16 @@ Checks (each guards a regression of src/pg_cuvs.c / cuvs_hnsw_digest.h):
   cancel   daemon status CANCELED: still one LOG + "(status 11)" error
            (only a backend-sent cancel skips the digest)
   ok       successful RPC: exactly one LOG
+  nn-ok    explicit build_algo=nn_descent, NN receipt and readback from the
+           daemon, a convertible graph: one LOG with the expected digest (the
+           idle-wait hashing ran on this route), no error, and the stored
+           build info carries the daemon's NN readback (the backend passed
+           its readback buffer through the K3 idle RPC)
   hold     statement_timeout while the RPC is held: no LOG, timeout error
   late     client lost during the RPC, detected only by the client connection
            check after the reply: interrupt followed before the digest, no LOG
 """
-import array, hashlib, math, os, re, signal, subprocess, sys, tempfile, time
+import array, hashlib, json, math, os, re, signal, subprocess, sys, tempfile, time
 from pathlib import Path
 
 DB = os.environ.get('PGDATABASE') or 'postgres'
@@ -99,10 +104,10 @@ def setup():
     return exp
 
 
-def create(sock, name, extra=''):
+def create(sock, name, extra='', options="mode = 'hnsw'", index=''):
     typ, dim, opc = TABLES[name][:3]
     r = sql(f"SET client_min_messages = log; SET cuvs.socket_path = '{sock}'; {extra}\n"
-            f"CREATE INDEX ON {name} USING pg_cuvs_hnsw (v {opc}) WITH (mode = 'hnsw');\n")
+            f"CREATE INDEX {index} ON {name} USING pg_cuvs_hnsw (v {opc}) WITH ({options});\n")
     logs = LOG_RE.findall(r.stderr)
     errors = [l.split('ERROR:', 1)[1].strip() for l in r.stderr.splitlines() if 'ERROR:' in l]
     return logs, errors, r.stderr
@@ -158,6 +163,24 @@ def main():
             for name in ('k3it_l2', 'k3it_big'):
                 logs, errors, raw = create(sock, name)
                 check(f'ok:{name}:exactly_one_LOG', len(logs) == 1 and logs[0][0] == exp[name][0], (logs, raw[-400:]))
+
+            mode.write_text('nn-ok')
+            sql('DROP INDEX IF EXISTS k3it_l2_nn;')
+            logs, errors, raw = create(sock, 'k3it_l2', options="mode = 'hnsw', build_algo = 'nn_descent'",
+                                       index='k3it_l2_nn')
+            check('nn_ok:k3it_l2:one_LOG_expected_digest_no_error',
+                  len(logs) == 1 and logs[0][0] == exp['k3it_l2'][0] and errors == [], (logs, errors, raw[-400:]))
+            info = sql("SELECT pg_cuvs_hnsw_build_info('k3it_l2_nn'::regclass);").stdout.strip()
+            want = {'route': 'resident_nn_descent', 'requested_algo': 'nn_descent',
+                    'internal_builder': 'nn_descent', 'nn_readback_version': 1, 'nn_graph_degree': 16,
+                    'nn_internal_degree': 24, 'nn_sdk_default_iterations': 20, 'nn_distance_dtype': 'fp32'}
+            try:
+                got = json.loads(info)
+            except ValueError:
+                got = {}
+            check('nn_ok:k3it_l2:stored_nn_readback',
+                  all(got.get(k) == v for k, v in want.items()), info)
+            sql('DROP INDEX IF EXISTS k3it_l2_nn;')
 
             mode.write_text('hold')
             before = events.read_text().count('mode=hold') if events.exists() else 0

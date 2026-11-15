@@ -2880,10 +2880,13 @@ cuvs_hnsw_budget_error(uint32_t build_algo, const CuvsHnswBudgetSnapshot *budget
     char detail[CUVS_HNSW_BUDGET_DETAIL_MAX + 1];
     (void)cuvs_hnsw_budget_detail(detail, sizeof(detail), budget);
     ereport(ERROR, (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-        errmsg("pg_cuvs: resident IVF-PQ estimate exceeds the HNSW build budget"),
+        errmsg("pg_cuvs: resident %s estimate exceeds the HNSW build budget",
+               build_algo == CUVS_HNSW_ALGO_NN_DESCENT ? "NN-descent" : "IVF-PQ"),
         errdetail("%s", detail),
         build_algo == CUVS_HNSW_ALGO_AUTO
         ? errhint("Use build_algo=ace for an explicit disk build; this daemon refuses auto overflow (--hnsw-auto-overflow error), or ACE needs at least 256 rows.")
+        : build_algo == CUVS_HNSW_ALGO_NN_DESCENT
+        ? errhint("Raise the build budget or use build_algo=ace explicitly; explicit nn_descent never falls back.")
         : errhint("Use build_algo=ace for an explicit disk build; explicit ivf_pq never spills to ACE.")));
 }
 
@@ -3039,7 +3042,7 @@ cuvs_build_hnsw_from_heap(Relation heapRel, Relation indexRel, IndexInfo *indexI
             rc = cuvs_ipc_build_hnsw_file_idle(cuvs_socket_path,
                 FileGetRawDesc(spool->vectors), spool->n, spool->dim, spool->metric,
                 64, 128, hierarchy, cap,
-                build_algo, ef_construction, &out->policy, &budget, &out->ace,
+                build_algo, ef_construction, &out->policy, &budget, &out->ace, &out->nn,
                 &out->hnsw_fd, error, sizeof(error), cuvs_hnsw_digest_step, &digest);
             /* The digest LOG also covers failed builds (daemon error reply,
              * including a daemon status CANCELED, IPC or reply-validation
