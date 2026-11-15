@@ -25,7 +25,8 @@ static uint32_t requested_algo(void) { return fixture_case >= 19 && fixture_case
 static volatile int idle_calls, idle_limit, idle_done, reply_sent, mock_checked;
 /* Ordering waits between the mock and the idle unit. A missing event fails
  * with a case-specific reason instead of hanging until an outer timeout. */
-#define SYNC_WAIT_LIMIT_S 10
+/* macOS poll(0) costs ~9 us: case 23's 1,000,000 idle polls take ~10 s there, 0.2 s on Linux. */
+#define SYNC_WAIT_LIMIT_S 60
 #define SYNC_WAIT(cond) do { \
     struct timespec t0_, t_; clock_gettime(CLOCK_MONOTONIC, &t0_); \
     while (!(cond)) { \
