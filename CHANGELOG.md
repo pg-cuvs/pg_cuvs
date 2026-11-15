@@ -10,6 +10,13 @@ exists for 0.9.0.
 
 ## [Unreleased]
 
+## [0.9.1] - 2026-11-15
+
+Faster HNSW import, resident NN-descent builds, a WAL fix and two CAGRA SDK patches
+
+The GPU regression workflow (`gpu.yml`) was not run on `release/v0.9.1`; the GPU
+measurements below are the ones named in each entry.
+
 ### Added
 
 - `pg_cuvs_hnsw_connectivity_status(regclass)` and a `connectivity` object in
