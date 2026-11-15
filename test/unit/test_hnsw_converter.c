@@ -98,14 +98,26 @@ test_fault_pread(int fd, void *buffer, size_t length, off_t offset)
 
 #include "../../src/hnsw_export.c"
 
+/* Normal-path PG_TRY scaffolding for this standalone fixture. Real PG error
+ * propagation and cleanup are tested by test-connectivity-pg-interrupts. */
+sigjmp_buf *PG_exception_stack = NULL;
+ErrorContextCallback *error_context_stack = NULL;
+bool IsUnderPostmaster = false;
+sigset_t BlockSig;
+void pg_re_throw(void)
+{
+    abort(); /* an unexpected backend exception must fail this fixture */
+}
+
 /* The fixture has PG page headers but no running backend. These small stubs
  * provide the backend primitives used by the production page writer. */
 /* Unexpected backend ERRORs must fail the standalone fixture, rather than
  * relying on unresolved symbols that a platform linker might tolerate. */
+static int test_last_elevel;
 bool
 errstart(int elevel, const char *domain)
 {
-    (void)elevel;
+    test_last_elevel = elevel;
     (void)domain;
     return true;
 }
@@ -116,19 +128,30 @@ errstart_cold(int elevel, const char *domain)
     return errstart(elevel, domain);
 }
 
+static unsigned test_errmsg_calls;
 int
 errmsg(const char *format, ...)
 {
     va_list args;
+    test_errmsg_calls++;
     va_start(args, format);
     vfprintf(stderr, format, args);
     va_end(args);
     return 0;
 }
 
+int
+errdetail(const char *format, ...)
+{
+    (void)format; /* only hnsw_notice_connectivity() reaches this stub */
+    return 0;
+}
+
 void
 errfinish(const char *filename, int lineno, const char *funcname)
 {
+    if (test_last_elevel < ERROR)
+        return; /* NOTICE/WARNING/LOG reports (e.g. the connectivity NOTICE) are not failures */
     fprintf(stderr, "\nunexpected backend ERROR at %s:%d (%s)\n",
             filename, lineno, funcname);
     abort();
@@ -994,7 +1017,7 @@ test_hierarchical_native_packing_case(int dim, int bytes_per_dim, int m)
     chain_test_reset();
     chain_test_nblocks = 0;
     hnsw_write_disk_metapage(NULL, &parsed, (uint32_t)dim, n_pages,
-                             false, &table, &policy, NULL, NULL);
+                             false, &table, &policy, NULL, NULL, NULL);
     hnsw_write_disk_pages(NULL, f.hnsw_fd, f.tids_fd, &parsed, N,
                           (uint32_t)dim, bytes_per_dim, n_pages, false, &table);
     assert(chain_test_wal_images == n_pages + 1);
@@ -1547,8 +1570,17 @@ test_ace_readback_metapage_roundtrip(void)
                                 p.n_rows, p.partitions, 20);
     assert(cuvs_hnsw_ace_readback_valid(&ace, &p));
 
+    {
+        CuvsConnectivity c={0}, readback;
+        c.magic=CUVS_CONNECTIVITY_MAGIC;c.version=1;c.available=1;c.nodes=p.n_rows;c.unreachable=70;c.wcc_all=1;
+        chain_test_reset();
+        hnsw_write_disk_metapage(NULL,&hdr,2,1,true,&table,&p,&ace,NULL,&c);
+        meta=(Page)chain_test_pages[chain_test_nblocks-1];
+        readback=hnsw_read_connectivity(meta);
+        assert(readback.magic==c.magic && readback.unreachable==70 && readback.wcc_all==1);
+    }
     chain_test_reset();
-    hnsw_write_disk_metapage(NULL, &hdr, 2, 1, true, &table, &p, &ace, NULL);
+    hnsw_write_disk_metapage(NULL, &hdr, 2, 1, true, &table, &p, &ace, NULL, NULL);
     meta = (Page)chain_test_pages[chain_test_nblocks - 1];
     assert(((PageHeader)meta)->pd_lower == prefix + sizeof(p) + sizeof(ace));
     assert(memcmp((char *)meta + prefix, &p, sizeof(p)) == 0); /* receipt bytes unchanged */
@@ -1578,7 +1610,7 @@ test_ace_readback_metapage_roundtrip(void)
     resident.requested_algo = CUVS_HNSW_ALGO_IVF_PQ; resident.partitions = 0;
     assert(cuvs_hnsw_policy_valid(&resident));
     chain_test_reset();
-    hnsw_write_disk_metapage(NULL, &hdr, 2, 1, true, &table, &resident, &ace, NULL);
+    hnsw_write_disk_metapage(NULL, &hdr, 2, 1, true, &table, &resident, &ace, NULL, NULL);
     meta = (Page)chain_test_pages[chain_test_nblocks - 1];
     assert(((PageHeader)meta)->pd_lower == prefix + sizeof(resident));
 
@@ -1592,7 +1624,7 @@ test_ace_readback_metapage_roundtrip(void)
         bad.local_intermediate = 128;
         assert(freopen("/dev/null", "w", stderr) != NULL);
         chain_test_reset();
-        hnsw_write_disk_metapage(NULL, &hdr, 2, 1, true, &table, &p, &bad, NULL);
+        hnsw_write_disk_metapage(NULL, &hdr, 2, 1, true, &table, &p, &bad, NULL, NULL);
         _exit(0); /* reaching here means the writer accepted it */
     }
     assert(waitpid(child, &status, 0) == child);
@@ -1608,18 +1640,40 @@ test_ace_readback_metapage_roundtrip(void)
     nn.graph_degree = 128; nn.internal_degree = 192; nn.sdk_default_iterations = 20;
     nn.max_iterations = 20; nn.dtype = CUVS_HNSW_NN_DTYPE_FP32; nn.termination_threshold = 0.0001f;
     chain_test_reset();
-    hnsw_write_disk_metapage(NULL, &hdr, 2, 1, true, &table, &p, &ace, &nn);
+    hnsw_write_disk_metapage(NULL, &hdr, 2, 1, true, &table, &p, &ace, &nn, NULL);
     meta = (Page)chain_test_pages[chain_test_nblocks - 1];
     assert(((PageHeader)meta)->pd_lower == prefix + sizeof(p) + sizeof(nn));
     assert(hnsw_read_disk_policy(meta, &out) == CUVS_HNSW_POLICY_RECORDED);
     assert(memcmp((char *)meta + prefix + sizeof(p), &nn, sizeof(nn)) == 0);
     ((PageHeader)meta)->pd_lower--;
     assert(hnsw_read_disk_policy(meta, &out) == CUVS_HNSW_POLICY_CORRUPT);
+    /* The NN route carries the connectivity record in the tail outside the WAL hole, measured or
+     * disabled, and neither record disturbs the receipt or the NN readback in front of it. */
+    {
+        CuvsConnectivity cm = {0}, cd, rb;
+        const CuvsConnectivity *records[2] = {&cm, &cd};
+        cm.magic = CUVS_CONNECTIVITY_MAGIC; cm.version = 1; cm.available = CUVS_CONNECTIVITY_MEASURED;
+        cm.nodes = 10000; cm.unreachable = 3; cm.wcc_all = 1; cm.elapsed_us = 7;
+        cuvs_connectivity_set_disabled(&cd);
+        for (int i = 0; i < 2; i++)
+        {
+            chain_test_reset();
+            hnsw_write_disk_metapage(NULL, &hdr, 2, 1, true, &table, &p, &ace, &nn, records[i]);
+            meta = (Page)chain_test_pages[chain_test_nblocks - 1];
+            assert(((PageHeader)meta)->pd_lower == prefix + sizeof(p) + sizeof(nn));
+            assert(hnsw_read_disk_policy(meta, &out) == CUVS_HNSW_POLICY_RECORDED);
+            assert(memcmp((char *)meta + prefix + sizeof(p), &nn, sizeof(nn)) == 0);
+            rb = hnsw_read_connectivity(meta);
+            assert(rb.magic == CUVS_CONNECTIVITY_MAGIC && rb.available == records[i]->available &&
+                   rb.nodes == records[i]->nodes && rb.unreachable == records[i]->unreachable);
+        }
+    }
 
     fixture_close(&f);
     BufFileClose(&fake_file);
     puts("PASS ACE readback metapage roundtrip: bytes at prefix+receipt, pd_lower, older/foreign/truncated tails, resident has none, writer refuses invalid");
     puts("PASS NN v3 metapage roundtrip and truncated tail rejection (CPU fixture)");
+    puts("PASS NN route stores a measured or disabled connectivity record next to the readback");
 }
 
 /* The row reader reserves each level-0 record before reading its fields, so
@@ -1888,8 +1942,106 @@ test_read_window_matches_direct_reads(void)
     puts("PASS read windows match direct reads");
 }
 
+/* Execute the real file adapter and metapage writer, not just the graph kernel. */
+char *DataDir = NULL;
+int temp_file_limit = -1;
+int maintenance_work_mem = 65536;
+volatile sig_atomic_t InterruptPending = 0;
+/* The GUC lives in pg_cuvs.c; the fixture owns its own. The existing adapter
+ * tests run with the check on; test_connectivity_guc_off() covers the default. */
+bool cuvs_hnsw_connectivity_check = true;
+static void test_connectivity_guc_off(void)
+{
+    Fixture f=fixture_create(false);
+    HnswlibHeader h;
+    CuvsConnectivity c, back;
+    StringInfoData json;
+    unsigned before;
+    assert(pread(f.hnsw_fd,&h,sizeof(h),0)==sizeof(h));
+    cuvs_hnsw_connectivity_check=false;
+    /* An unusable descriptor, no temp directory and a zero memory budget would make a
+     * check that runs end as 'unavailable'. Only a check that never starts is 'disabled'. */
+    maintenance_work_mem=0;DataDir="/nonexistent-conn203-parent/path";
+    memset(&c,0xAA,sizeof(c));
+    hnsw_check_connectivity(-1,&h,&c);
+    assert(c.magic==CUVS_CONNECTIVITY_MAGIC && c.version==1 && c.available==CUVS_CONNECTIVITY_DISABLED);
+    assert(c.nodes==0 && c.unreachable==0 && c.unreachable_l0==0 && c.wcc_all==0 && c.wcc_l0==0 &&
+           c.elapsed_us==0 && c.spilled==0);
+    /* The element adapter must not even look at its input when the check is off. */
+    c=hnsw_check_elements(NULL,5,0);
+    assert(c.available==CUVS_CONNECTIVITY_DISABLED && c.nodes==0 && c.elapsed_us==0);
+    before=test_errmsg_calls;
+    hnsw_notice_connectivity(&c);
+    assert(test_errmsg_calls==before); /* no NOTICE for a check that was not run */
+    initStringInfo(&json);
+    hnsw_append_connectivity(&json,&c);
+    assert(strstr(json.data,"\"status\":\"disabled\"") && strstr(json.data,"cuvs.hnsw_connectivity_check") &&
+           !strstr(json.data,"not_recorded") && !strstr(json.data,"measured") && !strstr(json.data,"unavailable"));
+    /* The disabled record survives the metapage tail and reads back as disabled, not as not_recorded. */
+    {
+        static char page[BLCKSZ];
+        PageHeader ph=(PageHeader)page;
+        memset(page,0,sizeof(page));
+        ph->pd_lower=SizeOfPageHeaderData+64;ph->pd_upper=BLCKSZ;ph->pd_special=BLCKSZ;
+        hnsw_store_connectivity((Page)page,&c);
+        assert(ph->pd_upper==BLCKSZ-sizeof(c));
+        back=hnsw_read_connectivity((Page)page);
+        assert(back.magic==CUVS_CONNECTIVITY_MAGIC && back.available==CUVS_CONNECTIVITY_DISABLED);
+        /* A disabled record that carries counters is corrupt: reported as not_recorded. */
+        ((CuvsConnectivity*)(page+ph->pd_upper))->nodes=7;
+        back=hnsw_read_connectivity((Page)page);
+        assert(back.magic==0);
+    }
+    /* Positive control: the same fixture measures once the setting is on. */
+    cuvs_hnsw_connectivity_check=true;
+    maintenance_work_mem=65536;DataDir=NULL;
+    hnsw_check_connectivity(f.hnsw_fd,&h,&c);
+    assert(c.available==CUVS_CONNECTIVITY_MEASURED && c.wcc_all==1 && c.unreachable==0);
+    before=test_errmsg_calls;
+    hnsw_notice_connectivity(&c);
+    assert(test_errmsg_calls==before+1); /* the counter above can see a NOTICE */
+    fixture_close(&f);
+    puts("PASS connectivity check off by setting: disabled record, no work, no NOTICE, status disabled, tail roundtrip");
+}
+static void test_connectivity_file_path(void)
+{
+    Fixture f=fixture_create(false);
+    HnswlibHeader h;
+    CuvsConnectivity c, saved;
+    uint32_t zero=0;
+    assert(pread(f.hnsw_fd,&h,sizeof(h),0)==sizeof(h));
+    hnsw_check_connectivity(f.hnsw_fd,&h,&c);
+    assert(c.available && c.unreachable==0 && c.wcc_all==1);
+    /* Delete only the root's outgoing edge: WCC stays one, one node is unreachable. */
+    write_at(f.hnsw_fd,&zero,4,HNSWLIB_HEADER_BYTES);
+    hnsw_check_connectivity(f.hnsw_fd,&h,&c);
+    assert(c.available && c.unreachable==1 && c.wcc_all==1);
+    maintenance_work_mem=0;
+    hnsw_check_connectivity(f.hnsw_fd,&h,&c);
+    assert(c.available && c.spilled && c.unreachable==1);
+    temp_file_limit=0;
+    hnsw_check_connectivity(f.hnsw_fd,&h,&c);
+    assert(!c.available); /* A finite operator cap is never bypassed. */
+    temp_file_limit=-1;
+    {
+        char dir[]="/tmp/conn203-data-XXXXXX", base[MAXPGPATH], scratch[MAXPGPATH];
+        assert(mkdtemp(dir));snprintf(base,sizeof(base),"%s/base",dir);assert(mkdir(base,0700)==0);
+        DataDir=dir;hnsw_check_connectivity(f.hnsw_fd,&h,&c);
+        assert(c.available && c.spilled);
+        snprintf(scratch,sizeof(scratch),"%s/base/pgsql_tmp",dir);
+        assert(rmdir(scratch)==0 && rmdir(base)==0 && rmdir(dir)==0);
+    }
+    DataDir="/nonexistent-conn203-parent/path";
+    hnsw_check_connectivity(f.hnsw_fd,&h,&c);
+    assert(!c.available); /* Temp creation failure is diagnostic, not a build ERROR. */
+    DataDir=NULL;maintenance_work_mem=65536;
+    (void)saved;
+    fixture_close(&f);
+    puts("PASS connectivity file adapter, directed-miss RED fixture, automatic file spill");
+}
+
 int
-main(void)
+main(int argc, char **argv)
 {
     /* HNSW_WINDOW_TESTS_ONLY=1 runs only the read-window tests, so a fault
      * in an earlier fixture cannot hide their result. */
@@ -1900,6 +2052,21 @@ main(void)
         puts("hnsw read-window tests: ok");
         return 0;
     }
+    if(argc==3 && (strcmp(argv[1],"--connectivity-file")==0 || strcmp(argv[1],"--connectivity-file-spill")==0)) {
+        if(strcmp(argv[1],"--connectivity-file-spill")==0)maintenance_work_mem=1;
+        int fd=open(argv[2],O_RDONLY);HnswlibHeader h;CuvsConnectivity c;
+        assert(fd>=0 && pread(fd,&h,sizeof(h),0)==sizeof(h));
+        for(int i=0;i<3;i++) {
+            hnsw_check_connectivity(fd,&h,&c);
+            printf("{\"rows\":%llu,\"available\":%u,\"unreachable\":%llu,\"wcc\":%llu,\"us\":%llu,\"spilled\":%u}\n",
+                (unsigned long long)c.nodes,c.available,(unsigned long long)c.unreachable,
+                (unsigned long long)c.wcc_all,(unsigned long long)c.elapsed_us,c.spilled);
+            assert(c.available);
+        }
+        close(fd);return 0;
+    }
+    test_connectivity_file_path();
+    test_connectivity_guc_off();
     test_stored_policy_versions();
     test_ace_readback_metapage_roundtrip();
     test_valid_flat_and_original_labels();

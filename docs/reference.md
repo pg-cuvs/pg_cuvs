@@ -202,6 +202,7 @@ workspace allocations can still produce a genuine allocation failure.
 | `cuvs.itopk_size` | int | `0` (auto) | 0–2147483616, multiples of 32 | USERSET | CAGRA intermediate search buffer floor. Auto preserves `max(64, ceil(actual_k/32)*32)`; an explicit value is raised to cover actual k, including shard/tombstone overfetch. Does not change the number of returned candidates |
 | `cuvs.search_width` | int | `0` (SDK default) | 0–INT_MAX | USERSET | CAGRA vertices expanded per iteration. Applies to single, filtered, sharded and batched CAGRA search; ignored by exact BF |
 | `cuvs.cpu_hnsw_fallback` | bool | `off` | — | USERSET | Serve from the `.hnsw` sidecar instead of GPU CAGRA |
+| `cuvs.hnsw_connectivity_check` | bool | `off` | — | USERSET | After a `pg_cuvs_hnsw` build, run the structural connectivity check and record it in `pg_cuvs_hnsw_build_info(index)->'connectivity'` (see § Build connectivity snapshot). Off skips the check, its scratch allocation and its NOTICE and records `disabled`. Read per index build |
 | `cuvs.max_stale_fraction` | real | `0.10` | 0.0–1.0 | USERSET | Delete-drift fraction above which a CAGRA index reroutes to CPU; 1.0 disables |
 | `cuvs.max_delta_rows` | int | `10000` | 0–INT_MAX | USERSET | Pending-insert rows merged before CPU reroute; 0 disables delta |
 | `cuvs.delta_search` | enum | `auto` | `auto`, `cpu`, `gpu` | USERSET | Delta merge mode: GPU-with-CPU-fallback / always CPU / GPU-only |
@@ -994,3 +995,64 @@ down when the marker is sent, its absence can still cause missing rows after
 restart. Durable stale publication, the shared insertion/deletion cap, and insertion durability
 recovery are separate unfinished work. Do not treat this change as fixing those
 paths.
+
+### Build connectivity snapshot (#203)
+
+The check is opt-in. `cuvs.hnsw_connectivity_check` (bool, default `off`,
+USERSET) is read when an index build imports its graph; set it with
+`SET cuvs.hnsw_connectivity_check = on` before `CREATE INDEX` or `REINDEX`.
+With it off the build allocates no scratch, maps no graph file, traverses
+nothing and emits no NOTICE, and the build snapshot records
+`{"status":"disabled","scope":"build_snapshot","setting":"cuvs.hnsw_connectivity_check"}`.
+With it on, new `pg_cuvs_hnsw` imports record a CPU structural check in
+`pg_cuvs_hnsw_build_info(index)->'connectivity'`, and a NOTICE reports the
+observation. `pg_cuvs_hnsw_connectivity_status(index)` exposes the same object
+in both cases. `status` is `measured`, `unavailable` (host memory/mapping/check
+failure), `disabled` (the build ran with the setting off) or `not_recorded`
+(historical metadata, built before this snapshot existed). An unavailable check
+does not reject a build or change search policy. Anonymous workspace is bounded
+by `maintenance_work_mem`; larger checks, or a failed heap allocation,
+automatically use preallocated, unlinked file-backed scratch. `spilled` records
+that path.
+
+Why it is off by default: the check only reads the finished graph and changes
+neither edges, seeds, search results nor search policy, but it costs time at
+scale. Measured on one A100-SXM4-80GB host (PostgreSQL 16.15, `build_algo='ivf_pq'`, resident route): on 999,000 rows x 768 dimensions the check took 2.26-2.31 s (graph file 3.34 GB, page cache warm), about +2 s on a 25.6 s `CREATE INDEX` (mean of five builds with the check off; mean of four builds with it on: 27.6 s); on 100,000 rows it took 0.13-0.16 s. The explicit `build_algo='nn_descent'` route follows the same setting (999,000 rows: check 2.40 s, 34.4 s off, 36.6 s on). The time grows with the graph file size; a graph file larger than the page cache has not been measured.
+The file uses `DataDir/base/pgsql_tmp` (the default PostgreSQL temp directory);
+custom `temp_tablespaces` routing is not implemented for this diagnostic.
+Because this mapping is not charged to PostgreSQL VFD temp-file accounting, a
+finite `temp_file_limit` disables the file-backed path (the observation becomes
+unavailable if heap scratch cannot be used); an explicit operator limit is
+never bypassed. File-backed allocation does not imply measured physical disk I/O.
+Failure to reserve or map scratch records unavailable, not an ANN build error.
+Routine PostgreSQL interrupts (including memory-context logging requests) are
+serviced without abandoning the observation. Actual cancellation, statement
+timeout and backend termination retain PostgreSQL's normal error semantics;
+the adapters release their heap/file scratch and input mappings on error.
+File reservation temporarily blocks backend signals and retries `EINTR`, as
+PostgreSQL does for shared-memory allocation. This prevents repeated SIGUSR1
+from starving `posix_fallocate`; pending requests are serviced after reservation,
+so cancellation can wait for that operating-system operation to finish.
+
+`unreachable` follows same-level directed edges and downward transitions from
+the actual entrypoint. It is structural possible-path reachability, not the
+path a particular query's greedy descent will choose. `unreachable_l0` uses
+only level zero. `wcc_l0` and `wcc_all` count **weak** components, not SCCs.
+One WCC does not imply every node is reachable. Zero unreachable nodes does
+not guarantee finite-ef recall. No repair, seed change, or error policy is
+selected by this diagnostic.
+
+The object has `scope='build_snapshot'`: INSERT, DELETE, VACUUM and entrypoint
+updates do not refresh it. Rebuild to obtain a new observation; do not use it
+as a live graph-integrity status. New receipts live outside the metapage WAL
+free-space hole; pgvector's prefix and existing policy/ACE receipt bytes stay
+unchanged. Existing binaries can search these pages without interpreting this
+snapshot. The status convenience function is created by the 0.9.1 scripts
+(`sql/pg_cuvs--0.9.1.sql` for fresh installations, `sql/pg_cuvs--0.9.0--0.9.1.sql`
+for `ALTER EXTENSION pg_cuvs UPDATE` from 0.9.0, and from 0.8.2 through 0.9.0);
+the two 0.9.0 scripts do not contain it. A database whose extension is already
+at 0.9.1 from before this function existed can continue using the existing
+`pg_cuvs_hnsw_build_info` JSON surface; registering the alias can be done by the
+extension owner with `scripts/install-connectivity-status.sql` after loading the
+new binary. The script adds extension membership and is idempotent;
+release-version selection is separate.
