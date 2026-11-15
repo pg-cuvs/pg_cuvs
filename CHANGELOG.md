@@ -28,6 +28,18 @@ exists for 0.9.0.
   version's `pg_cuvs_hnsw_build_info()` rejects an index carrying it as an invalid
   receipt.
 
+### Fixed
+
+- A GPU build without `CUVS_SDK_SOURCE_INCLUDE` failed to link with
+  `ld: .../librapids_logger.so: error adding symbols: DSO missing from command line`.
+  The wrapper expands `RMM_LOG_*`, which call `rapids_logger::logger::log`, and
+  `libcuvs.so` and `librmm.so` need `librapids_logger.so` only indirectly, which `ld`
+  does not follow; the Makefile named `-lrapids_logger` only inside the
+  `CUVS_SDK_SOURCE_INCLUDE` branch. It is now a separate `CUVS_LOGGER_LINK` on the
+  extension and daemon link lines of every GPU build (not the CPU shim), and a
+  hand-written `CUVS_SO_LINK` / `CUVS_SERVER_LINK` keeps it. Seen on a GPU host on
+  2026-11-15 with the planner off; the same link succeeded once the library was named.
+
 ## [0.9.2] - 2026-11-15
 
 Micro-batched index scans no longer fail with 64 or more concurrent clients
