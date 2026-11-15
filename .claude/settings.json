@@ -8,11 +8,6 @@
             "type": "command",
             "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/gpu-guard.sh",
             "timeout": 15
-          },
-          {
-            "type": "command",
-            "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/pr-guard.sh",
-            "timeout": 300
           }
         ]
       }

@@ -32,7 +32,7 @@ if ! git -C "$CUVS_GIT" cat-file -e "$COMMIT^{commit}" 2>/dev/null; then
   echo "fetching cuVS $COMMIT into $CUVS_GIT (once)"
   mkdir -p "$CUVS_GIT"
   git -C "$CUVS_GIT" init -q --bare
-  # Limits on a stalled network (the pr-guard hook allows 300 s). The low-speed settings
+  # Limits on a stalled network. The low-speed settings
   # abort a transfer that stays below 1 kB/s for 30 s. That includes a server that accepts
   # the connection and then sends nothing: measured to fail after 30 s with "Operation too
   # slow". They do not cover a connection that is never established or a TLS handshake that
