@@ -50,6 +50,48 @@ static void test_check_for_interrupts(void)
 
 /* Include the implementation so this bounded test can exercise its private
  * file preflight and label lookup without a running PostgreSQL backend. */
+/* Fault-injecting pread for the read-window differential test.  It passes
+ * through unless a test arms it for one descriptor: EIO for any call that
+ * starts inside [eio_lo, eio_hi) and a short prefix for calls crossing
+ * eio_lo, EINTR every Nth call, and short positive reads every Mth call. */
+static int test_fault_fd = -1;
+static uint64_t test_fault_eio_lo = UINT64_MAX;
+static uint64_t test_fault_eio_hi = UINT64_MAX;
+static unsigned test_fault_eintr_every;
+static unsigned test_fault_short_every;
+static unsigned long test_fault_calls;
+static unsigned long test_fault_eio_hits;
+
+static ssize_t
+test_fault_pread(int fd, void *buffer, size_t length, off_t offset)
+{
+    if (fd == test_fault_fd)
+    {
+        test_fault_calls++;
+        if (test_fault_eintr_every &&
+            test_fault_calls % test_fault_eintr_every == 0)
+        {
+            errno = EINTR;
+            return -1;
+        }
+        if ((uint64_t)offset >= test_fault_eio_lo &&
+            (uint64_t)offset < test_fault_eio_hi)
+        {
+            test_fault_eio_hits++;
+            errno = EIO;
+            return -1;
+        }
+        if ((uint64_t)offset < test_fault_eio_lo &&
+            (uint64_t)offset + length > test_fault_eio_lo)
+            length = (size_t)(test_fault_eio_lo - (uint64_t)offset);
+        if (test_fault_short_every && length > 1 &&
+            test_fault_calls % test_fault_short_every == 0)
+            length = 1 + test_fault_calls % length;
+    }
+    return pread(fd, buffer, length, offset);
+}
+#define pread test_fault_pread
+
 #include "../../src/hnsw_export.c"
 
 /* The fixture has PG page headers but no running backend. These small stubs
@@ -1419,6 +1461,155 @@ test_ace_readback_metapage_roundtrip(void)
     puts("PASS ACE readback metapage roundtrip: bytes at prefix+receipt, pd_lower, older/foreign/truncated tails, resident has none, writer refuses invalid");
 }
 
+/* Differential test of the import read windows against hnsw_pread_exact.
+ * Small capacities make reads straddle window ends, exceed the capacity
+ * (direct path), cross EOF, hit failed or short fills, and drive a window
+ * into its direct mode.  Every read must return the same result as the
+ * direct reader and, on success, the file's bytes. */
+static uint32_t
+test_window_rand(uint32_t *state)
+{
+    *state ^= *state << 13;
+    *state ^= *state >> 17;
+    *state ^= *state << 5;
+    return *state;
+}
+
+static void
+test_read_window_matches_direct_reads(void)
+{
+    enum { FILE_BYTES = 997, GUARD = 128, READS = 3000 };
+    static const size_t capacities[] = {7, 64, 256};
+    unsigned char file[FILE_BYTES];
+    unsigned char got[512];
+    unsigned char want[512];
+    uint32_t state = 0x9e3779b9u;
+    int fd = make_temp_fd();
+    unsigned long straddles = 0, oversized = 0, eof_reads = 0;
+    unsigned long eof_partial_fills = 0, failed_fills_tolerated = 0;
+    unsigned long direct_modes = 0, total = 0;
+
+    for (size_t i = 0; i < FILE_BYTES; i++)
+        file[i] = (unsigned char)(i * 131u + 7u);
+    write_at(fd, file, FILE_BYTES, 0);
+    test_fault_fd = fd;
+
+    for (size_t c = 0; c < sizeof(capacities) / sizeof(capacities[0]); c++)
+        for (int mode = 0; mode < 6; mode++)
+        {
+            size_t capacity = capacities[c];
+            unsigned char *buffer = malloc(capacity + GUARD);
+            HnswReadWindow window;
+            uint64_t cursor = 0;
+
+            assert(buffer != NULL);
+            /* Bytes past the valid window prefix never match the file. */
+            memset(buffer, 0xEE, capacity + GUARD);
+            hnsw_window_init(&window, fd, buffer, capacity);
+            test_fault_eio_lo = test_fault_eio_hi = UINT64_MAX;
+            test_fault_eintr_every = test_fault_short_every = 0;
+            test_fault_calls = 0;
+            if (mode == 1)          /* persistent EIO band mid-file */
+            {
+                test_fault_eio_lo = 300 + capacity;
+                test_fault_eio_hi = test_fault_eio_lo + capacity / 2 + 3;
+            }
+            if (mode == 2)
+                test_fault_eintr_every = 3;
+            if (mode == 3)
+                test_fault_short_every = 2;
+            if (mode == 4)          /* EIO to EOF with short reads and EINTR */
+            {
+                test_fault_eio_lo = 700;
+                test_fault_short_every = 3;
+                test_fault_eintr_every = 5;
+            }
+            for (int i = 0; i < READS; i++)
+            {
+                uint32_t r = test_window_rand(&state);
+                uint64_t offset;
+                size_t length;
+                bool covered_before;
+                bool served_after;
+                unsigned long eio_before = test_fault_eio_hits;
+                bool window_ok;
+                bool direct_ok;
+
+                if (mode == 5)                  /* scattered: idle fills */
+                {
+                    offset = test_window_rand(&state) % (FILE_BYTES + 40);
+                    length = test_window_rand(&state) % (capacity + 9);
+                }
+                else                            /* forward, small gaps */
+                {
+                    /* Mostly small reads so a fill serves many of them; some
+                     * reach or exceed the capacity. */
+                    length = r % 11 == 0
+                        ? test_window_rand(&state) % (capacity + 4)
+                        : test_window_rand(&state) % (capacity / 12 + 2);
+                    offset = cursor;
+                    cursor += length + test_window_rand(&state) % 2;
+                    if (cursor > FILE_BYTES + 20)
+                        cursor = test_window_rand(&state) % 64;
+                }
+                if (r % 41 == 0)
+                    hnsw_window_reserve(&window, offset,
+                                        test_window_rand(&state) % (capacity + 2));
+                covered_before = window.buffer != NULL &&
+                    hnsw_window_covers(&window, offset, length);
+                if (window.buffer != NULL && window.filled && !covered_before &&
+                    length > 0 && length <= capacity && offset >= window.start &&
+                    offset < window.start + window.length)
+                    straddles++;
+                if (length > capacity)
+                    oversized++;
+                if (offset + length > FILE_BYTES)
+                    eof_reads++;
+                memset(got, 0xAA, sizeof(got));
+                memset(want, 0x55, sizeof(want));
+                window_ok = hnsw_window_read(&window, got, length, offset);
+                served_after = window.buffer != NULL &&
+                    hnsw_window_covers(&window, offset, length);
+                if (window_ok && test_fault_eio_hits > eio_before)
+                    failed_fills_tolerated++;
+                if (served_after && window.length < capacity &&
+                    window.start + window.length == FILE_BYTES)
+                    eof_partial_fills++;
+                direct_ok = hnsw_pread_exact(fd, want, length, offset);
+                total++;
+                if (window_ok != direct_ok ||
+                    (window_ok && memcmp(got, want, length) != 0) ||
+                    (window_ok && length > 0 &&
+                     (offset + length > FILE_BYTES ||
+                      memcmp(got, file + offset, length) != 0)))
+                {
+                    fprintf(stderr,
+                            "read window mismatch: capacity=%zu mode=%d read=%d "
+                            "offset=%llu length=%zu window=%d direct=%d\n",
+                            capacity, mode, i, (unsigned long long)offset,
+                            length, window_ok, direct_ok);
+                    abort();
+                }
+            }
+            if (window.buffer == NULL)
+                direct_modes++;
+            free(buffer);
+        }
+    test_fault_fd = -1;
+    test_fault_eio_lo = test_fault_eio_hi = UINT64_MAX;
+    test_fault_eintr_every = test_fault_short_every = 0;
+    close(fd);
+    fprintf(stderr, "read windows: %lu reads, %lu straddles, %lu oversized, %lu EOF, "
+           "%lu EOF partial fills, %lu failed fills tolerated, %lu direct\n",
+           total, straddles, oversized, eof_reads, eof_partial_fills,
+           failed_fills_tolerated, direct_modes);
+    /* Each path the windows can take must actually have been exercised. */
+    assert(straddles > 0 && oversized > 0 && eof_reads > 0);
+    assert(eof_partial_fills > 0 && failed_fills_tolerated > 0);
+    assert(direct_modes > 0);
+    puts("PASS read windows match direct reads");
+}
+
 int
 main(void)
 {
@@ -1444,6 +1635,7 @@ main(void)
     test_rejects_invalid_heap_tid_offset_and_tids_size();
     test_rejects_invalid_offsets_labels_and_links();
     test_rejects_malformed_upper_links_and_overflow();
+    test_read_window_matches_direct_reads();
     puts("hnsw converter preflight fixtures: ok");
     return 0;
 }
