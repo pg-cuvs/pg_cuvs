@@ -130,7 +130,7 @@ def check(src):
     # --- backend order (CK-17 (14)) -----------------------------------------
     b = function(code['backend'], 'cuvs_build_hnsw_from_heap(Relation heapRel')
     ordered(b, ['cuvs_hnsw_preflight(stats_rows', 'table_index_build_scan(',
-                'prespool == CUVS_HNSW_PRESPOOL_FALLBACK', 'cuvs_ipc_build_hnsw_file(',
+                'prespool == CUVS_HNSW_PRESPOOL_FALLBACK', 'cuvs_ipc_build_hnsw_file_idle(',
                 'cuvs_hnsw_timing_flags(stats_rows, prespool)', 'cuvs_hnsw_build_notices(&out->policy, transition_sent)'],
             'BACKEND_ORDER')
     assert 'heapRel->rd_rel->reltuples' in b.split('table_index_build_scan(', 1)[0], 'STATS_BEFORE_SCAN'
@@ -141,7 +141,11 @@ def check(src):
     oom = b.split('if (rc == CUVS_STATUS_OOM_FALLBACK)', 1)
     seg = oom[1].split('if (rc != CUVS_STATUS_OK)', 1)[0] if len(oom) == 2 else ''
     assert 'errcode(ERRCODE_OUT_OF_MEMORY)' in seg and 'cuvs_hnsw_oom_hint(build_algo)' in seg, 'HNSW_OOM_53200'
-    assert b.index('if (rc == CUVS_STATUS_OOM_FALLBACK)') < b.index('if (rc != CUVS_STATUS_OK)\n                ereport(ERROR'), 'HNSW_OOM_BEFORE_GENERIC'
+    # 773c29be put `if (rc != CUVS_STATUS_OK) cuvs_report_admission(...)` in front of
+    # the OOM branch; that guard only reports a daemon admission payload. The generic
+    # build failure is the guard that raises ereport directly.
+    generic = re.search(r'if \(rc != CUVS_STATUS_OK\)\s*ereport\(', b)
+    assert generic and b.index('if (rc == CUVS_STATUS_OOM_FALLBACK)') < generic.start(), 'HNSW_OOM_BEFORE_GENERIC'
     # v5 C5 / v6 C5: status-13 DETAIL is exactly the six MiB fields
     be = function(code['backend'], 'cuvs_hnsw_budget_error(uint32_t build_algo')
     assert 'cuvs_hnsw_budget_detail(detail, sizeof(detail), budget)' in be and 'errdetail("%s", detail)' in be, 'STATUS13_DETAIL_SIX_FIELDS'
@@ -269,6 +273,14 @@ MUTANTS = [
     ('ace_without_memory_guard_marker', 'wrapper',
      '                    "pgcuvs-hnsw-disk-copy-v1@60b19a0f62ba0bd716de349382828e43be6e2daa")\n                || !hnsw_sdk_marker_verified("pgcuvs_hnsw_memory_guard_patch_id",\n                    "pgcuvs-hnsw-memory-guard-v2@60b19a0f62ba0bd716de349382828e43be6e2daa"))\n            {\n                snprintf(error, error_len, "ACE requires',
      '                    "pgcuvs-hnsw-disk-copy-v1@60b19a0f62ba0bd716de349382828e43be6e2daa"))\n            {\n                snprintf(error, error_len, "ACE requires'),
+    # The OOM branch must precede the generic build failure (HNSW_OOM_BEFORE_GENERIC).
+    ('hnsw_generic_failure_before_oom', 'backend',
+     '            if (rc == CUVS_STATUS_OOM_FALLBACK) /* v6 C2: allocation failure after admission */',
+     '            if (rc != CUVS_STATUS_OK)\n                ereport(ERROR, (errmsg("pg_cuvs: temporary HNSW build failed (status %d): %s", rc, error)));\n            if (rc == CUVS_STATUS_OOM_FALLBACK) /* v6 C2: allocation failure after admission */'),
+    # The build RPC must come before the receipt flags and NOTICEs (BACKEND_ORDER).
+    ('timing_flags_before_build_rpc', 'backend',
+     '            rc = cuvs_ipc_build_hnsw_file_idle(cuvs_socket_path,',
+     '            (void)cuvs_hnsw_timing_flags(stats_rows, prespool);\n            rc = cuvs_ipc_build_hnsw_file_idle(cuvs_socket_path,'),
     ('third_ace_route_writer_in_daemon', 'server',
      '    params.auto_overflow = g_hnsw_auto_overflow;',
      '    params.auto_overflow = g_hnsw_auto_overflow;\n    if (0) wire.policy.route = CUVS_HNSW_ROUTE_ACE;'),
