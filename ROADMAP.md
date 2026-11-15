@@ -12,8 +12,8 @@
 > 아래 표는 완료 시점의 역사적 증거를 보존한다. 현재 기본값, 지원 범위, release
 > readiness는 표의 문구가 아니라 아래 active sections와 current-state SSOT를 따른다.
 
-> **Current contract (2026-11-11, source `ae818ad0`):** extension version `0.9.2`
-> (bumped from `0.9.1` on 2026-11-15; no other item of this contract changed),
+> **Current contract (2026-11-11, source `ae818ad0`):** extension version `0.9.3`
+> (bumped from `0.9.2` on 2026-11-15; no other item of this contract changed),
 > `cuvs.filter_auto_threshold=0.0` (3O opt-in), and
 > `cuvs.stream_bf_selectivity_threshold=0.004` as the canonical-host operational
 > default. The historical completion rows below retain earlier values for provenance;
@@ -128,8 +128,8 @@
 
 - **운영 플레이북 정합성 — 핵심 절차 완료; 환경별 검증 잔여**
   - `design/ops-gpu-playbook.md`와 `docs/playbooks/`가 배포·모니터링·장애복구·업그레이드·
-    롤백·GCS·용량계획·벤치마크 절차를 나눈다. `release-upgrade.md`는 현재 0.9.2와
-    0.1.0→0.9.2 migration chain을 반영한다.
+    롤백·GCS·용량계획·벤치마크 절차를 나눈다. `release-upgrade.md`는 현재 0.9.3과
+    0.1.0→0.9.3 migration chain을 반영한다.
   - `--max-vram-mb` 기본 90%, extension version, artifact caveat 같은 운영 계약은
     source-backed 문구와 `make docs-contract-check`로 고정한다.
   - 남은 환경별 검증(예: streaming physical replication, real GPU/host별 benchmark)은
