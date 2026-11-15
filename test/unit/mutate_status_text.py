@@ -10,6 +10,7 @@ The unmutated tree must pass both (GREEN).
     python3 test/unit/mutate_status_text.py
 """
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -17,6 +18,13 @@ import tempfile
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 CC = os.environ.get("CC", "cc")
+
+# Newest full install script in sql/ (the one CREATE EXTENSION reads today);
+# check_i3b_sql_perms.py compares its I3-B block with the 0.8.2 -> 0.9.0 script.
+NEWEST_INSTALL = "sql/" + max(
+    (n for n in os.listdir(os.path.join(ROOT, "sql"))
+     if re.fullmatch(r"pg_cuvs--\d+\.\d+\.\d+\.sql", n)),
+    key=lambda n: tuple(int(x) for x in re.findall(r"\d+", n)))
 
 # (id, check, file, old, new)
 MUTATIONS = [
@@ -70,8 +78,14 @@ MUTATIONS = [
      "REVOKE ALL ON FUNCTION pg_cuvs_unload(regclass) FROM PUBLIC;\nREVOKE ALL ON FUNCTION pg_cuvs_unload(oid, oid)"),
     ("d8 SQL revokes index_status too", "scan", "sql/pg_cuvs--0.8.2--0.9.0.sql",
      "-- I3-B end", "REVOKE ALL ON FUNCTION pg_cuvs_index_status() FROM PUBLIC;\n-- I3-B end"),
+    # The I3-E block re-grants after recreating memory_status, so the anchor
+    # carries the I3-B block's preceding lines to occur exactly once.
     ("d9 SQL drops the pg_monitor grant", "scan", "sql/pg_cuvs--0.8.2--0.9.0.sql",
-     "GRANT EXECUTE ON FUNCTION pg_cuvs_memory_status()    TO pg_monitor;\n", ""),
+     "REVOKE ALL ON FUNCTION pg_cuvs_reclaim_set(text, text) FROM PUBLIC;\n"
+     "REVOKE ALL ON FUNCTION pg_cuvs_memory_status()       FROM PUBLIC;\n"
+     "GRANT EXECUTE ON FUNCTION pg_cuvs_memory_status()    TO pg_monitor;\n",
+     "REVOKE ALL ON FUNCTION pg_cuvs_reclaim_set(text, text) FROM PUBLIC;\n"
+     "REVOKE ALL ON FUNCTION pg_cuvs_memory_status()       FROM PUBLIC;\n"),
     ("d10 regclass ops skip ownership", "scan", "src/pg_cuvs.c",
      "    if (!cuvs_rel_ownercheck(relid, GetUserId()))\n"
      "        aclcheck_error(ACLCHECK_NOT_OWNER, OBJECT_INDEX, get_rel_name(relid));\n",
@@ -80,6 +94,8 @@ MUTATIONS = [
      "    if (!cuvs_status_is_priv())\n        ereport(ERROR,",
      "    if (false)\n        ereport(ERROR,"),
     ("d12 install and upgrade blocks diverge", "scan", "sql/pg_cuvs--0.9.0.sql",
+     "REVOKE ALL ON FUNCTION pg_cuvs_reclaim_set(text, text) FROM PUBLIC;\n", ""),
+    ("d12b newest install and upgrade blocks diverge", "scan", NEWEST_INSTALL,
      "REVOKE ALL ON FUNCTION pg_cuvs_reclaim_set(text, text) FROM PUBLIC;\n", ""),
     ("d13 loose statement outside the I3-B block", "scan", "sql/pg_cuvs--0.8.2--0.9.0.sql",
      "-- I3-B begin", "SELECT 1;\n-- I3-B begin"),

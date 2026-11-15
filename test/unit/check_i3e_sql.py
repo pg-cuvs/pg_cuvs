@@ -2,11 +2,12 @@
 """Source scan for the I3-E SQL surface and docs (no PG, no daemon). CK-26/27
 for the I3-E fields.
 
-Asserts, against both 0.9.0 scripts, src/cuvs_ipc.h, src/cuvs_status_text.h,
+Asserts, against the 0.9.0 upgrade script, every install script from 0.9.0 on
+(pg_cuvs--0.9.0.sql and the newest one), src/cuvs_ipc.h, src/cuvs_status_text.h,
 src/pg_cuvs.c and docs/reference.md:
 
   * the "-- I3-E begin/end" block is appended after the I3-B block, is the
-    same in pg_cuvs--0.9.0.sql and pg_cuvs--0.8.2--0.9.0.sql, drops and
+    same in those install scripts and pg_cuvs--0.8.2--0.9.0.sql, drops and
     recreates exactly pg_cuvs_index_status() and pg_cuvs_memory_status(), and
     creates pg_cuvs_build_status();
   * the recreated RETURNS TABLE equals the I3-B header + kinds followed by the
@@ -68,16 +69,32 @@ def returns_table(blk, fn):
     return [tuple(c.split()) for c in [x.strip() for x in rm.group(1).split(",")] if c]
 
 
+def install_scripts():
+    """pg_cuvs--0.9.0.sql (frozen) and the newest full install script in sql/."""
+    versions = []
+    for n in os.listdir(os.path.join(ROOT, "sql")):
+        vm = re.fullmatch(r"pg_cuvs--(\d+)\.(\d+)\.(\d+)\.sql", n)
+        if vm:
+            versions.append((tuple(int(x) for x in vm.groups()), "sql/" + n))
+    newest = max(versions)[1] if versions else "sql/pg_cuvs--0.9.0.sql"
+    return ["sql/pg_cuvs--0.9.0.sql"] + ([newest] if newest != "sql/pg_cuvs--0.9.0.sql" else [])
+
+
 up = read("sql/pg_cuvs--0.8.2--0.9.0.sql")
-inst = read("sql/pg_cuvs--0.9.0.sql")
-mu, mi = block(up, "I3-E"), block(inst, "I3-E")
-check(mu is not None and mi is not None, "I3-E begin/end block missing in a 0.9.0 script")
+mu = block(up, "I3-E")
+check(mu is not None, "I3-E begin/end block missing in pg_cuvs--0.8.2--0.9.0.sql")
 blk = mu.group(1) if mu else ""
-check(mu is not None and mi is not None and mu.group(0) == mi.group(0),
-      "I3-E block differs between pg_cuvs--0.9.0.sql and pg_cuvs--0.8.2--0.9.0.sql")
-for name, text, m in (("upgrade", up, mu), ("install", inst, mi)):
-    b = text.find("-- I3-B end")
-    check(m is not None and 0 <= b < m.start(), f"{name}: I3-E block is not after the I3-B block")
+b = up.find("-- I3-B end")
+check(mu is not None and 0 <= b < mu.start(), "upgrade: I3-E block is not after the I3-B block")
+for rel in install_scripts():
+    inst = read(rel)
+    mi = block(inst, "I3-E")
+    name = os.path.basename(rel)
+    check(mi is not None, f"I3-E begin/end block missing in {name}")
+    check(mu is not None and mi is not None and mu.group(0) == mi.group(0),
+          f"I3-E block differs between {name} and pg_cuvs--0.8.2--0.9.0.sql")
+    b = inst.find("-- I3-B end")
+    check(mi is not None and 0 <= b < mi.start(), f"{name}: I3-E block is not after the I3-B block")
 
 drops = re.findall(r"DROP FUNCTION\s+(\w+)\s*\(\s*\)\s*;", blk)
 check(sorted(drops) == ["pg_cuvs_index_status", "pg_cuvs_memory_status"],
@@ -164,5 +181,5 @@ if FAILS:
         print("FAIL", f)
     print(f"check_i3e_sql: {len(FAILS)} failure(s)")
     sys.exit(1)
-print("check_i3e_sql: OK (I3-E block in both scripts, joined RETURNS TABLE, grants, "
+print("check_i3e_sql: OK (I3-E block in the upgrade script and each install script, joined RETURNS TABLE, grants, "
       "build_status C/SQL arity and row filter, docs § 8.4 columns)")

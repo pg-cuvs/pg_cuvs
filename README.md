@@ -4,9 +4,10 @@ GPU-accelerated vector search for PostgreSQL via NVIDIA cuVS — a heterogeneous
 
 **Built on** [pgvector](https://github.com/pgvector/pgvector) and [RAPIDS cuVS](https://github.com/rapidsai/cuvs).
 
-Current extension version: **0.9.0**. This overview was checked against source
-commit `ae818ad0` (2026-11-11); historical GPU measurements below retain their
-original versions and are not a validation run of this HEAD.
+Current extension version: **0.9.1**. This overview was checked against source
+commit `ae818ad0` (2026-11-11), when the extension version was 0.9.0; historical
+GPU measurements below retain their original versions and are not a validation
+run of this HEAD.
 
 ## What it is
 
@@ -300,7 +301,7 @@ In the target database, as an extension-installing role:
 ```sql
 CREATE EXTENSION IF NOT EXISTS vector;
 CREATE EXTENSION pg_cuvs;
-SELECT extversion FROM pg_extension WHERE extname = 'pg_cuvs'; -- 0.9.0
+SELECT extversion FROM pg_extension WHERE extname = 'pg_cuvs'; -- 0.9.1
 ```
 
 Existing installations use the [upgrade playbook](docs/playbooks/release-upgrade.md)
