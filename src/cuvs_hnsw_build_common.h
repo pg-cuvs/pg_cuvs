@@ -358,14 +358,25 @@ cuvs_hnsw_resolve_route(uint64_t n, uint32_t dim, uint32_t degree,
     }
     if (algo == CUVS_HNSW_ALGO_NN_DESCENT)
     {
-        CuvsHnswNnCapacity nn, hierarchy_nn;
-        if (cuvs_hnsw_nn_capacity(n, dim, degree, intermediate, 0,
-                                   CUVS_HNSW_NN_FP32, &nn)
-            || cuvs_hnsw_nn_capacity(n, dim, degree, intermediate, 1,
-                                      CUVS_HNSW_NN_FP32, &hierarchy_nn)
-            || !((cap->gpu_peak == nn.gpu_peak && cap->host_peak == nn.host_peak)
-                || (cap->gpu_peak == hierarchy_nn.gpu_peak
-                    && cap->host_peak == hierarchy_nn.host_peak)))
+        /* The caller's estimate must be one of {hierarchy 0/1} x {centered
+         * copy (L2) / none (IP, cosine)}; use the matching one as the base. */
+        CuvsHnswNnCapacity nn;
+        int matched = 0;
+        memset(&nn, 0, sizeof(nn));
+        for (int h = 0; h <= 1 && !matched; h++)
+            for (int centered = 1; centered >= 0 && !matched; centered--)
+            {
+                CuvsHnswNnCapacity variant;
+                if (cuvs_hnsw_nn_capacity_ex(n, dim, degree, intermediate, h, centered,
+                                             CUVS_HNSW_NN_FP32, &variant))
+                    break;
+                if (cap->gpu_peak == variant.gpu_peak && cap->host_peak == variant.host_peak)
+                {
+                    nn = variant;
+                    matched = 1;
+                }
+            }
+        if (!matched)
         {
             snprintf(error, error_len, "invalid resident NN shape or capacity");
             return CUVS_STATUS_BUILD_FAILED;

@@ -32,8 +32,10 @@ static uint32_t dtype_for(double offset, double sd, uint32_t metric)
 }
 static void test_review_offsets(void)
 {
-    /* D2: never FP16 for these. Since the r87 cancellation guard, offsets whose
-     * mean squared norm exceeds 4096 x spread are refused outright (L2). */
+    /* D2: never FP16 for these. This exercises cuvs_hnsw_nn_precision, i.e.
+     * UNCENTERED input, where offsets whose mean squared norm exceeds 4096 x
+     * spread are refused. The product centers L2 input and does not take this
+     * path (see test_hnsw_nn_center.c). */
     assert(dtype_for(0.0, 1.0, CUVS_METRIC_L2) == CUVS_HNSW_NN_FP16);
     assert(dtype_for(100.0, 5.0, CUVS_METRIC_L2) == CUVS_HNSW_NN_FP32);         /* ratio ~400 */
     assert(dtype_for(1000.0, 5.0, CUVS_METRIC_L2) == REFUSED_CANCELLATION);      /* ~4e4 */

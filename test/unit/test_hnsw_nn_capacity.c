@@ -1,4 +1,7 @@
+/* nn_capacity first: test_hnsw_nn_capacity_mutations.py puts a mutated copy
+ * on the include path, and build_common's own include must not shadow it. */
 #include "cuvs_hnsw_nn_capacity.h"
+#include "cuvs_hnsw_build_common.h"
 #include <assert.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -36,6 +39,31 @@ int main(void)
         assert(tall.serialize_host - flat.serialize_host
                == UINT64_C(1000000) * (2 * 768 * 4 + 8 * 32 + 916 + 2 * 96 + 4 * 32));
         assert(flat.build_host == tall.build_host && flat.build_gpu == tall.build_gpu);
+    }
+    {   /* Decision B copy is reserved only for centered (L2) builds */
+        CuvsHnswNnCapacity l2, ip;
+        assert(cuvs_hnsw_nn_capacity_ex(1000000, 768, 64, 128, 0, 1, CUVS_HNSW_NN_FP32, &l2) == 0);
+        assert(cuvs_hnsw_nn_capacity_ex(1000000, 768, 64, 128, 0, 0, CUVS_HNSW_NN_FP32, &ip) == 0);
+        assert(l2.build_host - ip.build_host == UINT64_C(1000000) * 4 * 768);
+        assert(l2.serialize_host == ip.serialize_host && l2.build_gpu == ip.build_gpu);
+        assert(cuvs_hnsw_nn_capacity_ex(1000, 768, 64, 128, 0, 2, CUVS_HNSW_NN_FP32, &ip) != 0);
+        /* small dim: the copy decides host_peak (build > serialize) */
+        assert(cuvs_hnsw_nn_capacity_ex(1000000, 8, 8, 16, 0, 1, CUVS_HNSW_NN_FP32, &l2) == 0);
+        assert(cuvs_hnsw_nn_capacity_ex(1000000, 8, 8, 16, 0, 0, CUVS_HNSW_NN_FP32, &ip) == 0);
+        assert(l2.host_peak > ip.host_peak);
+        /* the resolver accepts both estimates and keeps their own peaks */
+        CuvsHnswRouteDecision dec; char error[256];
+        CuvsHnswCapacity cap = {0};
+        cap.raw_bytes = ip.raw_bytes; cap.serializer_floor = UINT64_C(1000000) * 20 + (UINT64_C(65) << 20);
+        cap.host_peak = ip.host_peak; cap.gpu_peak = ip.gpu_peak;
+        assert(cuvs_hnsw_resolve_route(1000000, 8, 8, 16, CUVS_HNSW_ALGO_NN_DESCENT, CUVS_HNSW_OVERFLOW_ERROR,
+            &cap, UINT64_C(1) << 40, UINT64_C(1) << 40, &dec, error, sizeof(error)) == CUVS_STATUS_OK);
+        cap.host_peak = l2.host_peak; cap.gpu_peak = l2.gpu_peak;
+        assert(cuvs_hnsw_resolve_route(1000000, 8, 8, 16, CUVS_HNSW_ALGO_NN_DESCENT, CUVS_HNSW_OVERFLOW_ERROR,
+            &cap, UINT64_C(1) << 40, UINT64_C(1) << 40, &dec, error, sizeof(error)) == CUVS_STATUS_OK);
+        cap.host_peak = ip.host_peak + 1;
+        assert(cuvs_hnsw_resolve_route(1000000, 8, 8, 16, CUVS_HNSW_ALGO_NN_DESCENT, CUVS_HNSW_OVERFLOW_ERROR,
+            &cap, UINT64_C(1) << 40, UINT64_C(1) << 40, &dec, error, sizeof(error)) != CUVS_STATUS_OK);
     }
     uint64_t checked;
     assert(cuvs_hnsw_nn_mul(UINT64_MAX, 2, &checked) != 0);

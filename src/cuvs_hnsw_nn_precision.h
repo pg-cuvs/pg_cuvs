@@ -17,15 +17,19 @@
 #define CUVS_HNSW_NN_PRECISION_INVALID (-1)       /* nonfinite, FP32 range, bad args */
 #define CUVS_HNSW_NN_PRECISION_CANCELLATION (-2)  /* L2 norm-expansion cancellation */
 
-/* L2 cancellation bound (r87 offset diagnosis). The pinned SDK's NN-descent
- * computes L2 as ||a||^2 + ||b||^2 - 2*a.b in float32 on both the FP16 and
- * FP32 paths (nn_descent.cuh calculate_metric). Its rounding error scales
- * with the squared norm, while neighbor distances scale with the spread V
- * (mean squared distance to the column mean). On the frozen corpus rows plus
- * a common offset, the k=64 graph overlap with exact neighbors was
+/* L2 cancellation bound for UNCENTERED NN-descent input (r87 offset diagnosis,
+ * commit 04615fea). The pinned SDK's NN-descent computes L2 as
+ * ||a||^2 + ||b||^2 - 2*a.b in float32 on both the FP16 and FP32 paths
+ * (nn_descent.cuh calculate_metric). Its rounding error scales with the
+ * squared norm, while neighbor distances scale with the spread V (mean
+ * squared distance to the column mean). On the frozen corpus rows plus a
+ * common offset, the k=64 graph overlap with exact neighbors was
  * 0.9997/0.998/0.979/0.83/0.18/0.012 at offset 1/3/10/30/100/1000, i.e. mean
- * squared norm / V = 160/1440/15965/1.4e5/1.6e6/1.6e8. Refuse when the ratio
- * exceeds 4096 (relative float32 error about 1e-3 of V). */
+ * squared norm / V = 160/1440/15965/1.4e5/1.6e6/1.6e8; the bound is 4096.
+ * Since decision B the product centers every L2 NN-descent input (base and
+ * upper levels), so this refusal only applies to callers that pass
+ * graph_input_centered=0; none in the product does. It is kept until the
+ * GPU H1/H2/H6 results decide its fate (offset-r87/GUARD-ANALYSIS.md). */
 #define CUVS_HNSW_NN_L2_NORM_TO_SPREAD_MAX 4096.0
 
 typedef struct CuvsHnswNnPrecision {
@@ -35,11 +39,12 @@ typedef struct CuvsHnswNnPrecision {
 } CuvsHnswNnPrecision;
 
 /* graph_input_centered: the caller feeds NN-descent a column-centered copy
- * (cuvs_hnsw_nn_center.h, L2 only). The cancellation guard then does not
- * apply to the base graph: centering removes the common offset it detects.
- * dtype is still chosen from the ORIGINAL rows, because the GPU hierarchy's
- * upper levels run on the original rows with the base dtype (patch 0005);
- * choosing from the centered copy would send offset data to FP16 there. */
+ * (cuvs_hnsw_nn_center.h, L2 only; patch 0005 centers each upper level too).
+ * The cancellation guard then does not apply. dtype is still chosen from the
+ * ORIGINAL rows: patch 0005 checks an FP16 base against the original upper
+ * rows (|x| <= 65504) before it centers them, so a dtype chosen from the
+ * centered copy could be rejected there. Centering does not raise the
+ * element bound: an FP16 choice here implies |x| < 128, centered |x| < 256. */
 static inline int
 cuvs_hnsw_nn_precision_ex(const float *data, uint64_t rows, uint32_t dim,
                           uint32_t metric, int graph_input_centered,

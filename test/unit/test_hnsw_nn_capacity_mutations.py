@@ -14,6 +14,8 @@ mutations = {
     'host bloom': ('8 * e + 916 + 2 * q', '8 * e + 916 + 0 * q'),
     'upper hierarchy peak': ('out->hierarchy_gpu, staging, &out->hierarchy_gpu', 'out->hierarchy_gpu, 0, &out->hierarchy_gpu'),
     'serialize hierarchy': ('row * (hierarchy ? 6 : 4)', 'row * (hierarchy ? 4 : 4)'),
+    'centered copy dropped': ('if (centered_copy) build_row += row;', '(void)centered_copy;'),
+    'centered copy for every metric': ('if (centered_copy) build_row += row;', 'build_row += row;'),
 }
 with tempfile.TemporaryDirectory(prefix='pgcuvs-nn-capacity-') as tmp:
     dst = Path(tmp)

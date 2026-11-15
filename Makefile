@@ -393,7 +393,7 @@ test-hnsw-nn-policy: test/unit/test_hnsw_nn_policy.c src/cuvs_hnsw_policy.h
 	$(CC) -std=gnu11 -Wall -Wextra -Werror -I src -o $@ test/unit/test_hnsw_nn_policy.c
 	./$@
 
-test-hnsw-nn-capacity: test/unit/test_hnsw_nn_capacity.c src/cuvs_hnsw_nn_capacity.h
+test-hnsw-nn-capacity: test/unit/test_hnsw_nn_capacity.c src/cuvs_hnsw_nn_capacity.h src/cuvs_hnsw_build_common.h
 	$(CC) -std=gnu11 -Wall -Wextra -Werror -I src -o $@ test/unit/test_hnsw_nn_capacity.c -lm
 	./$@
 

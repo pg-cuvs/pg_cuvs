@@ -534,10 +534,13 @@ base dtype is FP32 when dim <= 16, any element exceeds half range, or the reside
 IVF-PQ norm bound reaches 65504 (4 x max\|x\|^2 for L2, max\|x\|^2 for inner product and
 cosine), because the SDK's FP16 path mixes FP32 norms with half dot products; otherwise FP16.
 Because the SDK computes L2 as ||a||^2 + ||b||^2 - 2a.b in float32 on both paths, L2 builds
-feed NN-descent a column-centered copy (mean accumulated in float64). L2 is translation
-invariant; stored vectors, upper hierarchy levels and search use the original rows. The copy
-is counted in the host estimate (n x dim x 4) and freed before serialization. IP and cosine
-are not centered.
+feed NN-descent a column-centered copy (mean accumulated in float64); with `mode='hnsw'`
+the SDK patch 0005 does the same for each upper level's point set (its own mean). L2 is
+translation invariant; stored vectors and search distances use the original rows. The base
+copy is counted in the host estimate (n x dim x 4, L2 only) and freed before serialization;
+each upper-level copy is counted in that level's NN-descent host workspace check. IP and
+cosine are not centered. Centering removes a common offset only: well-separated tight
+clusters can still lose order to the float32 expansion (not detected; GPU validation pending).
 Its admission estimate uses FP32 dataset storage even when the selected base dtype is FP16;
 the estimate is not an allocator or RSS upper bound. GPU hierarchy requires the matching
 resident-NN upper-precision SDK patch and receives the base dtype and budgets. Existing

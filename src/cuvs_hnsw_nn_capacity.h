@@ -28,15 +28,20 @@ static inline uint64_t cuvs_hnsw_nn_extended(uint64_t degree)
     uint64_t x = degree <= 32 ? degree : degree * 13 / 10;
     return (x + 31) / 32 * 32;
 }
+/* centered_copy: the build feeds NN-descent a centered host copy of the input
+ * (decision B, L2 only). It lives through the graph call only, so it is a
+ * build-phase term. */
 static inline int
-cuvs_hnsw_nn_capacity(uint64_t n, uint32_t dim, uint32_t degree, uint32_t intermediate,
-                      int hierarchy, uint32_t dtype, CuvsHnswNnCapacity *out)
+cuvs_hnsw_nn_capacity_ex(uint64_t n, uint32_t dim, uint32_t degree, uint32_t intermediate,
+                         int hierarchy, int centered_copy, uint32_t dtype,
+                         CuvsHnswNnCapacity *out)
 {
     uint64_t e, q, internal, row, build_row, serial_row, staging, peak;
     const uint64_t reserve = UINT64_C(512) << 20;
     if (!out || n < CUVS_HNSW_MIN_ELEMENTS || n >= INT32_MAX - 1 || !dim || dim > 65535
         || degree < 2 || (degree & 1) || intermediate < degree || intermediate > 1024
         || intermediate >= n || (hierarchy != 0 && hierarchy != 1)
+        || (centered_copy != 0 && centered_copy != 1)
         || (dtype != CUVS_HNSW_NN_FP16 && dtype != CUVS_HNSW_NN_FP32)) return -1;
     internal = (uint64_t)intermediate * 3 / 2;
     if (internal >= n) internal = n - 1;
@@ -46,10 +51,7 @@ cuvs_hnsw_nn_capacity(uint64_t n, uint32_t dim, uint32_t degree, uint32_t interm
     /* File mapping + external kNN graph + internal graph/dists + sample,
      * pinned arrays, list sizes, bloom, and random-sequence allowance. */
     build_row = row + (uint64_t)intermediate * 4 + 8 * e + 916 + 2 * q;
-    /* Decision B: L2 builds feed NN-descent a centered host copy that lives
-     * through the graph call only (freed before serialization). The forecast
-     * has no metric, so every NN build reserves it (conservative for IP/cos). */
-    build_row += row;
+    if (centered_copy) build_row += row;
     /* Existing host serializer/hierarchy inputs: graph, records, dataset,
      * locks/maps and hierarchy scratch. Count mapped input pages. */
     serial_row = row * (hierarchy ? 6 : 4)
@@ -77,5 +79,14 @@ cuvs_hnsw_nn_capacity(uint64_t n, uint32_t dim, uint32_t degree, uint32_t interm
     peak = out->build_gpu > out->sort_gpu ? out->build_gpu : out->sort_gpu;
     if (out->hierarchy_gpu > peak) peak = out->hierarchy_gpu;
     return cuvs_hnsw_nn_add(peak, reserve, &out->gpu_peak);
+}
+
+/* Metric-agnostic callers (the pre-spool forecast has no metric): reserve the
+ * centered copy, an upper bound for IP/cosine builds that do not make one. */
+static inline int
+cuvs_hnsw_nn_capacity(uint64_t n, uint32_t dim, uint32_t degree, uint32_t intermediate,
+                      int hierarchy, uint32_t dtype, CuvsHnswNnCapacity *out)
+{
+    return cuvs_hnsw_nn_capacity_ex(n, dim, degree, intermediate, hierarchy, 1, dtype, out);
 }
 #endif

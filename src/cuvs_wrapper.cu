@@ -2806,8 +2806,8 @@ static int prepare_hnsw_settings(const CuvsHnswFileBuild *params, int vectors_fd
     if (params->build_algo == CUVS_HNSW_ALGO_NN_DESCENT)
     {
         CuvsHnswNnCapacity nn{};
-        capacity_status = cuvs_hnsw_nn_capacity(params->n_vecs, params->dim, degree, intermediate,
-            params->hierarchy != 0, CUVS_HNSW_NN_FP32, &nn);
+        capacity_status = cuvs_hnsw_nn_capacity_ex(params->n_vecs, params->dim, degree, intermediate,
+            params->hierarchy != 0, cuvs_hnsw_nn_centers(params->metric), CUVS_HNSW_NN_FP32, &nn);
         if (!capacity_status) {
             cap.raw_bytes = nn.raw_bytes;
             cap.serializer_floor = params->n_vecs * 20 + (UINT64_C(65) << 20);
@@ -3215,19 +3215,13 @@ cuvs_hnsw_build_file(int vectors_fd, int owner_fd,
          * (cagra_build.cuh bounded_partition_builder), never fp16 IVF-PQ. */
         if (prepared.route.route == CUVS_HNSW_ROUTE_NN_DESCENT)
         {
-            int precision_rc = cuvs_hnsw_nn_precision_ex(static_cast<const float *>(files.mapping),
-                params->n_vecs, params->dim, params->metric, cuvs_hnsw_nn_centers(params->metric),
-                &prepared.nn_precision);
-            if (precision_rc == CUVS_HNSW_NN_PRECISION_CANCELLATION)
-            {
-                snprintf(error, error_len,
-                         "NN-descent L2 input has a large common offset (mean squared norm %.6g > %.0f x spread %.6g); "
-                         "its expanded float32 distances lose neighbor order. Use build_algo='ivf_pq' or center the vectors",
-                         prepared.nn_precision.mean_sq_norm, CUVS_HNSW_NN_L2_NORM_TO_SPREAD_MAX,
-                         prepared.nn_precision.spread);
-                return CUVS_STATUS_BUILD_FAILED;
-            }
-            if (precision_rc)
+            /* L2 graph input is centered (base and, via patch 0005, upper levels),
+             * so the uncentered cancellation refusal cannot fire here; IP/cosine
+             * are outside that check. Whether a refusal returns for any case is
+             * decided after GPU H1/H2/H6 (offset-r87/GUARD-ANALYSIS.md). */
+            if (cuvs_hnsw_nn_precision_ex(static_cast<const float *>(files.mapping),
+                    params->n_vecs, params->dim, params->metric, cuvs_hnsw_nn_centers(params->metric),
+                    &prepared.nn_precision))
             {
                 snprintf(error, error_len, "NN-descent input is nonfinite or its FP32 distance bound overflows");
                 return CUVS_STATUS_BUILD_FAILED;
