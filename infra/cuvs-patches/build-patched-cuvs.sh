@@ -491,7 +491,7 @@ declare -A EXPECTED_CACHE_VALUES=(
   [BUILD_TESTS]=OFF
   [BUILD_C_TESTS]=OFF
   [BUILD_C_LIBRARY]=OFF
-  [BUILD_MG_ALGOS]=OFF
+  [BUILD_MG_ALGOS]=ON
   [BUILD_CUVS_BENCH]=OFF
   [BUILD_CAGRA_HNSWLIB]=ON
   [BUILD_SHARED_LIBS]=ON
@@ -711,7 +711,8 @@ mkdir -p "${INSTALL_PREFIX}" "$BUILD_DIR" "${RUN_ROOT}/build" \
   "$DISK_PILOT_ARTIFACT_DIR" "$GUARD_PILOT_ARTIFACT_DIR"
 
 readonly PARALLEL_JOBS="${PARALLEL_LEVEL:-$(getconf _NPROCESSORS_ONLN)}"
-readonly BUILD_CMAKE_ARGS='-DBUILD_TESTS=OFF -DBUILD_C_TESTS=OFF -DBUILD_C_LIBRARY=OFF -DBUILD_MG_ALGOS=OFF -DBUILD_CUVS_BENCH=OFF -DBUILD_CAGRA_HNSWLIB=ON -DBUILD_SHARED_LIBS=ON -DCUVS_COMPILE_DYNAMIC_ONLY=ON -DCUVS_NVTX=OFF'
+# MG ON matches the A2/B3/r3 SDK objects (their hnsw TU argv has -DCUVS_BUILD_MG_ALGOS).
+readonly BUILD_CMAKE_ARGS='-DBUILD_TESTS=OFF -DBUILD_C_TESTS=OFF -DBUILD_C_LIBRARY=OFF -DBUILD_MG_ALGOS=ON -DBUILD_CUVS_BENCH=OFF -DBUILD_CAGRA_HNSWLIB=ON -DBUILD_SHARED_LIBS=ON -DCUVS_COMPILE_DYNAMIC_ONLY=ON -DCUVS_NVTX=OFF'
 
 echo "source=$SOURCE_ROOT"
 echo "source_commit=$ACTUAL_COMMIT"
@@ -756,6 +757,30 @@ echo "previous_prefix_inventory_sha256=${OLD_PREFIX_INVENTORY_SHA:-none}"
 echo "sdk_build_dir=$LIBCUVS_BUILD_DIR"
 echo "native_run_root=$RUN_ROOT"
 
+# RAFT: rapids-cmake/CPM prefers an installed package over a download (the
+# r87c cold run logged "CPM: Using local package raft@26.04.0" and left
+# CPM_PACKAGE_raft_SOURCE_DIR empty). Patch a private copy of that package and
+# pin raft_DIR to it, as the A2/B3 build did. Only when no installed RAFT exists
+# does the CPM source path below get patched instead.
+set +e
+RAFT_DIR_PRIVATE="$(bash "${SCRIPT_DIR}/prepare-raft-prefix.sh" "${BUILD_DIR}/pgcuvs-raft-prefix" "${DEPENDENCY_PREFIXES[@]}")"
+raft_prefix_rc=$?
+set -e
+if [[ "$raft_prefix_rc" == 3 ]]; then
+  RAFT_DIR_PRIVATE=""
+  echo "raft_source=cpm (no installed RAFT package)"
+elif [[ "$raft_prefix_rc" != 0 ]]; then
+  echo "cannot prepare the patched private RAFT prefix (rc=$raft_prefix_rc)" >&2
+  exit 1
+else
+  echo "raft_source=installed-private-copy raft_DIR=$RAFT_DIR_PRIVATE"
+fi
+readonly RAFT_DIR_PRIVATE
+RAFT_CMAKE_ARGS=()
+if [[ -n "$RAFT_DIR_PRIVATE" ]]; then
+  RAFT_CMAKE_ARGS=("-Draft_DIR=${RAFT_DIR_PRIVATE}")
+fi
+
 env \
   CUDACXX="$NVCC" \
   CUDAHOSTCXX="$SDK_CUDA_HOST_COMPILER" \
@@ -780,12 +805,13 @@ env \
     -DBUILD_TESTS=OFF \
     -DBUILD_C_TESTS=OFF \
     -DBUILD_C_LIBRARY=OFF \
-    -DBUILD_MG_ALGOS=OFF \
+    -DBUILD_MG_ALGOS=ON \
     -DBUILD_CUVS_BENCH=OFF \
     -DBUILD_CAGRA_HNSWLIB=ON \
     -DBUILD_SHARED_LIBS=ON \
     -DCUVS_COMPILE_DYNAMIC_ONLY=ON \
     -DCUVS_NVTX=OFF \
+    ${RAFT_CMAKE_ARGS[@]+"${RAFT_CMAKE_ARGS[@]}"} \
     2>&1 | tee "${RUN_ROOT}/cuvs-configure.log"
 
 cuvs_cache="${LIBCUVS_BUILD_DIR}/CMakeCache.txt"
@@ -947,8 +973,22 @@ while IFS= read -r implicit_link_dir; do
 done < "${TOOLCHAIN_OBSERVATION_DIR}/cxx-implicit-link-directories.txt"
 
 # RAFT dependency patch (select_k radix sort bit width uses KeyT, not ValT).
-# Applied to the CPM RAFT source that this build compiles; base and result are
-# pinned, and an unknown header stops the build.
+# Installed-package case: the configure must have used the private patched copy.
+if [[ -n "$RAFT_DIR_PRIVATE" ]]; then
+  configured_raft_dir="$(cache_value "$cuvs_cache" raft_DIR)"
+  if [[ "$(python3 -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "${configured_raft_dir:-/nonexistent}")" != \
+        "$(python3 -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "$RAFT_DIR_PRIVATE")" ]]; then
+    echo "cuVS configure did not use the patched private RAFT package: raft_DIR=${configured_raft_dir:-unset}" >&2
+    exit 1
+  fi
+  raft_select_k_sha="$(sha256_of "${RAFT_DIR_PRIVATE}/../../../include/raft/matrix/detail/select_k-inl.cuh")"
+  if [[ "$raft_select_k_sha" != "$EXPECTED_RAFT_SELECT_K_FINAL_SHA" ]]; then
+    echo "private RAFT select_k-inl.cuh is not the patched header: $raft_select_k_sha" >&2
+    exit 1
+  fi
+  echo "raft_select_k_sha256=$raft_select_k_sha"
+else
+# CPM-source case: patch the downloaded RAFT source; base and result are pinned.
 RAFT_SOURCE_DIR="$(cache_value "$cuvs_cache" CPM_PACKAGE_raft_SOURCE_DIR)"
 if [[ -z "$RAFT_SOURCE_DIR" ]]; then
   RAFT_SOURCE_DIR="$(cache_value "$cuvs_cache" raft_SOURCE_DIR)"
@@ -968,6 +1008,7 @@ if [[ "$raft_select_k_sha" != "$EXPECTED_RAFT_SELECT_K_FINAL_SHA" ]]; then
   exit 1
 fi
 echo "raft_select_k_sha256=$raft_select_k_sha"
+fi
 
 env LD_LIBRARY_PATH="$BUILD_RUNTIME_PATH" \
   cmake --build "$LIBCUVS_BUILD_DIR" --target cuvs --parallel "$PARALLEL_JOBS" \
