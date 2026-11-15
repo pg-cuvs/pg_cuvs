@@ -23,7 +23,8 @@ Contributions and collaboration inquiries are welcome.
   `infra/cuvs-patches` to the pinned cuVS source, checks the manifest hashes and the
   planner source, and checks the Makefile flags for a build with the patched SDK
   planner. It needs git, python3, make and `pg_config`, not CUDA, and fetches the
-  pinned cuVS source once into `~/.cache/pg_cuvs`. Neither CI job builds that path.
+  pinned cuVS source once into `~/.cache/pg_cuvs`. Neither CI job builds that path;
+  the Unit tests (CPU) job runs this check.
   In a Claude Code session started in a pg_cuvs checkout, `.claude/hooks/pr-guard.sh`
   runs it for the common spellings of `gh pr create` and `gh pr ready` (`gh` anywhere
   in the command, including inside `bash -c`, `sh -c` and `eval`, after a path or after
