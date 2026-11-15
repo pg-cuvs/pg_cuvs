@@ -20,6 +20,7 @@
 #include "cuvs_hnsw_sdk_plan.cuh"  /* serialize/deserialize merged here in cuVS 25.x+ */
 #include "cuvs_hnsw_nn_sdk_params.cuh"
 #include "cuvs_hnsw_nn_upper_contract.h"
+#include "cuvs_hnsw_nn_center.h"
 #include <cuvs/neighbors/hnsw.hpp>   /* Phase 3I-1: CPU HNSW fallback */
 #include <cuvs/neighbors/ivf_pq.hpp> /* 3P: IVF-PQ index */
 #include <cuvs/neighbors/nn_descent.hpp> /* has_enough_device_memory (CAGRA AUTO kNN choice) */
@@ -2962,6 +2963,25 @@ static int execute_hnsw_file_build(const CuvsHnswFileBuild *params, int owner_fd
         fprintf(stderr, "[hnsw_build] job=%s phase=cuvs-enter call=graph mono_us=%llu\n",
             workdir, (unsigned long long)cuvs_hnsw_monotonic_us());
         auto graph = [&]() {
+            if (!tiny && prepared.route.route == CUVS_HNSW_ROUTE_NN_DESCENT
+                && cuvs_hnsw_nn_centers(params->metric))
+            {
+                /* Decision B: only the NN-descent graph input is centered; the
+                 * returned index's attached dataset is never serialized (both
+                 * serializers below receive the original `data`). The copy is
+                 * freed when this scope returns, before serialization. */
+                std::vector<float> centered((size_t)params->n_vecs * params->dim);
+                double mean_sq = 0.0;
+                if (cuvs_hnsw_nn_center(data.data_handle(), params->n_vecs, params->dim,
+                                        centered.data(), &mean_sq))
+                    throw std::runtime_error("NN-descent input centering failed");
+                fprintf(stderr, "[hnsw_build] job=%s phase=nn-center rows=%llu dim=%u mean_sq_norm=%.9g mono_us=%llu\n",
+                    workdir, (unsigned long long)params->n_vecs, params->dim, mean_sq,
+                    (unsigned long long)cuvs_hnsw_monotonic_us());
+                auto centered_view = raft::make_host_matrix_view<const float, int64_t>(
+                    centered.data(), (int64_t)params->n_vecs, (int64_t)params->dim);
+                return cagra::build(res, cp, centered_view);
+            }
             if (!tiny) return cagra::build(res, cp, data);
             const int n = (int)params->n_vecs;
             auto bf = cuvs_bf_build(data.data_handle(), n, (int)params->dim,
@@ -3195,8 +3215,9 @@ cuvs_hnsw_build_file(int vectors_fd, int owner_fd,
          * (cagra_build.cuh bounded_partition_builder), never fp16 IVF-PQ. */
         if (prepared.route.route == CUVS_HNSW_ROUTE_NN_DESCENT)
         {
-            int precision_rc = cuvs_hnsw_nn_precision(static_cast<const float *>(files.mapping),
-                params->n_vecs, params->dim, params->metric, &prepared.nn_precision);
+            int precision_rc = cuvs_hnsw_nn_precision_ex(static_cast<const float *>(files.mapping),
+                params->n_vecs, params->dim, params->metric, cuvs_hnsw_nn_centers(params->metric),
+                &prepared.nn_precision);
             if (precision_rc == CUVS_HNSW_NN_PRECISION_CANCELLATION)
             {
                 snprintf(error, error_len,

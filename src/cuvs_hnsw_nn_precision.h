@@ -34,9 +34,16 @@ typedef struct CuvsHnswNnPrecision {
     double mean_sq_norm, spread;   /* mean ||x||^2 and mean ||x - mean||^2 */
 } CuvsHnswNnPrecision;
 
+/* graph_input_centered: the caller feeds NN-descent a column-centered copy
+ * (cuvs_hnsw_nn_center.h, L2 only). The cancellation guard then does not
+ * apply to the base graph: centering removes the common offset it detects.
+ * dtype is still chosen from the ORIGINAL rows, because the GPU hierarchy's
+ * upper levels run on the original rows with the base dtype (patch 0005);
+ * choosing from the centered copy would send offset data to FP16 there. */
 static inline int
-cuvs_hnsw_nn_precision(const float *data, uint64_t rows, uint32_t dim,
-                       uint32_t metric, CuvsHnswNnPrecision *out)
+cuvs_hnsw_nn_precision_ex(const float *data, uint64_t rows, uint32_t dim,
+                          uint32_t metric, int graph_input_centered,
+                          CuvsHnswNnPrecision *out)
 {
     double max_abs = 0.0, max_norm = 0.0, sum_norm = 0.0, mean_norm = 0.0;
     double *column;
@@ -75,7 +82,7 @@ cuvs_hnsw_nn_precision(const float *data, uint64_t rows, uint32_t dim,
     if (max_norm >= (double)FLT_MAX / (metric == CUVS_METRIC_L2 ? 8.0 : 2.0))
         return CUVS_HNSW_NN_PRECISION_INVALID;
     /* Identical rows (spread 0) have no neighbor order to lose. */
-    if (metric == CUVS_METRIC_L2 && out->spread > 0.0
+    if (metric == CUVS_METRIC_L2 && !graph_input_centered && out->spread > 0.0
         && out->mean_sq_norm > CUVS_HNSW_NN_L2_NORM_TO_SPREAD_MAX * out->spread)
         return CUVS_HNSW_NN_PRECISION_CANCELLATION;
     /* The pinned SDK's FP16 path takes norms from the FP32 input but the dot
@@ -91,5 +98,13 @@ cuvs_hnsw_nn_precision(const float *data, uint64_t rows, uint32_t dim,
     out->max_abs = max_abs;
     out->max_sq_norm = max_norm;
     return 0;
+}
+
+/* Uncentered graph input (all metrics); keeps the 04615fea refusal. */
+static inline int
+cuvs_hnsw_nn_precision(const float *data, uint64_t rows, uint32_t dim,
+                       uint32_t metric, CuvsHnswNnPrecision *out)
+{
+    return cuvs_hnsw_nn_precision_ex(data, rows, dim, metric, 0, out);
 }
 #endif

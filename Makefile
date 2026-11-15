@@ -138,13 +138,13 @@ src/cuvs_wrapper.o: | verify-hnsw-sdk-plan
 endif
 
 src/cuvs_wrapper.o: src/cuvs_wrapper.cu src/cuvs_wrapper.h src/cuvs_hnsw_sdk_plan.cuh \
-                    src/cuvs_hnsw_nn_sdk_params.cuh src/cuvs_hnsw_nn_precision.h src/cuvs_hnsw_nn_capacity.h src/cuvs_hnsw_nn_upper_contract.h \
+                    src/cuvs_hnsw_nn_sdk_params.cuh src/cuvs_hnsw_nn_precision.h src/cuvs_hnsw_nn_capacity.h src/cuvs_hnsw_nn_upper_contract.h src/cuvs_hnsw_nn_center.h \
                     src/cuvs_failed_allocation.hpp src/cuvs_rmm_failure_resource.hpp
 	$(NVCC) $(NVCC_FLAGS) $(CUVS_SDK_PLAN_FLAGS) -I$(CUVS_INCLUDE) -I$(CUVS_RAPIDS_INCLUDE) -I./src -c $< -o $@
 
 # PGXS generates LLVM bitcode (.bc) from .c sources for JIT. The .cu file
 # has no PG-callable functions, so emit a stub bitcode so PGXS doesn't fail.
-src/cuvs_wrapper.bc: src/cuvs_wrapper.cu src/cuvs_hnsw_nn_sdk_params.cuh src/cuvs_hnsw_nn_precision.h src/cuvs_hnsw_nn_capacity.h src/cuvs_hnsw_nn_upper_contract.h src/cuvs_failed_allocation.hpp src/cuvs_rmm_failure_resource.hpp
+src/cuvs_wrapper.bc: src/cuvs_wrapper.cu src/cuvs_hnsw_nn_sdk_params.cuh src/cuvs_hnsw_nn_precision.h src/cuvs_hnsw_nn_capacity.h src/cuvs_hnsw_nn_upper_contract.h src/cuvs_hnsw_nn_center.h src/cuvs_failed_allocation.hpp src/cuvs_rmm_failure_resource.hpp
 	@echo 'void cuvs_wrapper_jit_stub(void){}' > /tmp/_cuvs_stub.c
 	@clang-15 -emit-llvm -c /tmp/_cuvs_stub.c -o $@ 2>/dev/null \
 		|| clang -emit-llvm -c /tmp/_cuvs_stub.c -o $@
@@ -281,7 +281,7 @@ TEST_RT_LIB := $(shell [ "$$(uname -s)" = "Linux" ] && echo -lrt)
 test-unit: test-compact-retry test-device-norm test-failed-allocation test-build-oom-log test-peak-log-switch test/unit/test_cuvs_util.c src/cuvs_util.c src/cuvs_util.h src/cuvs_ipc.h \
            test/unit/test_build_corpus.c src/cuvs_build_corpus.c src/cuvs_build_corpus.h \
            test-hnsw-build test-hnsw-build-ipc test-hnsw-owner-lease test-hnsw-ace-quality test-hnsw-admission test-admission-contract \
-           test-hnsw-nn-policy test-hnsw-nn-route test-hnsw-nn-precision test-hnsw-nn-capacity test-hnsw-nn-sdk-params test-hnsw-nn-consumer test-hnsw-nn-upper-receipt test-hnsw-nn-mutations \
+           test-hnsw-nn-policy test-hnsw-nn-route test-hnsw-nn-precision test-hnsw-nn-capacity test-hnsw-nn-sdk-params test-hnsw-nn-consumer test-hnsw-nn-upper-receipt test-hnsw-nn-center test-hnsw-nn-mutations \
            test-i3-logs test-notice-wire test-admission-wire test-admission-message test-admission-ipc test-build-oom-thread test-cache-policy test-circuit-source test-status-text test-i3b-source test-peak-meter test-lw-policy test-lw-guard test-i3e-sql test-self-replace-notice test-host-free-fence test-vacuum-policy
 	$(CC) -I src -DCUVS_TEST_HOOKS -o test-unit test/unit/test_cuvs_util.c src/cuvs_util.c $(TEST_RT_LIB)
 	./test-unit
@@ -412,7 +412,13 @@ test-hnsw-nn-upper-receipt: test/unit/test_hnsw_nn_upper_receipt.py test/unit/te
 	python3 -I -B test/unit/test_hnsw_nn_upper_receipt.py
 	python3 -I -B test/unit/test_hnsw_nn_upper_receipt_mutation.py
 
-EXTRA_CLEAN += test-hnsw-nn-policy test-hnsw-nn-precision test-hnsw-nn-capacity test-hnsw-nn-route test-hnsw-nn-sdk-params
+# Decision B: NN-descent L2 graph input centering (offset-r87/DECISION-B-CENTERING.md).
+.PHONY: test-hnsw-nn-center
+test-hnsw-nn-center: test/unit/test_hnsw_nn_center.c src/cuvs_hnsw_nn_center.h src/cuvs_hnsw_nn_precision.h
+	$(CC) -std=gnu11 -O2 -Wall -Wextra -Werror -I src -o $@ test/unit/test_hnsw_nn_center.c -lm
+	./$@
+
+EXTRA_CLEAN += test-hnsw-nn-policy test-hnsw-nn-precision test-hnsw-nn-capacity test-hnsw-nn-route test-hnsw-nn-sdk-params test-hnsw-nn-center
 
 # NN guard mutants (each script compiles mutated copies in a temp dir and
 # requires the matching unit test to fail; r87 D4 wired these into test-unit).
@@ -422,6 +428,7 @@ test-hnsw-nn-mutations:
 	ulimit -c 0; python3 -I -B test/unit/test_hnsw_nn_precision_mutations.py
 	ulimit -c 0; python3 -I -B test/unit/test_hnsw_nn_capacity_mutations.py
 	ulimit -c 0; python3 -I -B test/unit/test_hnsw_nn_sdk_params_mutations.py
+	ulimit -c 0; python3 -I -B test/unit/test_hnsw_nn_center_mutations.py
 
 # I3-C: CK-17 (12)-(14) auto overflow, pre-spool decision, CAGRA reltuples AR0.
 test-hnsw-auto-overflow: test/unit/test_hnsw_auto_overflow.c src/cuvs_route_preflight.h \

@@ -46,6 +46,10 @@ cuvs_hnsw_nn_capacity(uint64_t n, uint32_t dim, uint32_t degree, uint32_t interm
     /* File mapping + external kNN graph + internal graph/dists + sample,
      * pinned arrays, list sizes, bloom, and random-sequence allowance. */
     build_row = row + (uint64_t)intermediate * 4 + 8 * e + 916 + 2 * q;
+    /* Decision B: L2 builds feed NN-descent a centered host copy that lives
+     * through the graph call only (freed before serialization). The forecast
+     * has no metric, so every NN build reserves it (conservative for IP/cos). */
+    build_row += row;
     /* Existing host serializer/hierarchy inputs: graph, records, dataset,
      * locks/maps and hierarchy scratch. Count mapped input pages. */
     serial_row = row * (hierarchy ? 6 : 4)

@@ -7,7 +7,8 @@ int main(void)
     CuvsHnswNnCapacity a, b;
     assert(cuvs_hnsw_nn_capacity(1000000, 768, 64, 128, 1, CUVS_HNSW_NN_FP16, &a) == 0);
     assert(cuvs_hnsw_nn_capacity(1000000, 768, 64, 128, 1, CUVS_HNSW_NN_FP32, &b) == 0);
-    assert(a.build_host == UINT64_C(1000000) * 6548);
+    /* 6548 before decision B + 4*768 for the centered NN-descent input copy */
+    assert(a.build_host == UINT64_C(1000000) * (6548 + 4 * 768));
     assert(a.serialize_host == UINT64_C(1000000) * 22740);
     assert(a.sort_gpu == UINT64_C(1000000) * (4 * 768 + 4 * 128));
     assert(a.build_gpu == UINT64_C(1000000) * (2 * 768 + 280) + UINT64_C(100000) * 4 * 768);
