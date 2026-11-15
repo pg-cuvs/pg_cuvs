@@ -12,19 +12,23 @@ The upstream is [`rapidsai/cuvs`](https://github.com/rapidsai/cuvs), tag `v26.04
 | `0002-hnsw-disk-copy-patch-id.patch` | `d52ddd22a0e558849d75ec3ddfba4b52fcc200ed6869568593245289f9f963f8` | Exports the disk-copy runtime marker. |
 | `0003-hnsw-memory-guards.patch` | `34831f221f32337c025afeb33a32d7aa304e703bd0e3ee85f0ff93902a9a130f` | Propagates ACE metric parameters and checks allocation peaks across ACE sub-builders and disk serialization; exports the memory-guard runtime marker. |
 | `0004-hnsw-upper-precision.patch` | `8777280bc918cc26e8bca0bbf38021e1e901ccda8510e543738b9a53ff631fdd` | Applies the product norm policy to upper IVF-PQ and restores typed memory gather sources; exports the upper-precision marker. |
+| `0005-hnsw-resident-nn-upper.patch` | `9d55a10e78f5ad285b94a133a583d4f576fc0586aa13c6ff32b5948a7be4dc06` | Lets a resident `build_algo=nn_descent` hierarchy pass its host/GPU budgets and base NN dtype to upper levels, keeps the legacy six-argument `all_neighbors_graph` forwarders, and exports the resident-NN-upper marker. See `0005-hnsw-resident-nn-upper.md`. |
 
 Patches 0001 and 0002 alone do not advertise memory-guard support. Only a library built with 0003 exports `pgcuvs_hnsw_memory_guard_patch_id()` with value `pgcuvs-hnsw-memory-guard-v2@60b19a0f62ba0bd716de349382828e43be6e2daa`. Patch 0002 independently exports `pgcuvs_hnsw_disk_copy_patch_id()` with value `pgcuvs-hnsw-disk-copy-v1@60b19a0f62ba0bd716de349382828e43be6e2daa`.
 
-The hashes below bind the clean source and the complete ordered patch set. `hnsw.hpp` includes 0001, 0003, and 0004. The historical composition receipt in the manifest covers only the first three patches.
+Only a library built with 0005 exports `pgcuvs_hnsw_resident_nn_upper_patch_id()` with value `pgcuvs-hnsw-resident-nn-upper-v3@9a18eb49f1e124f9c7806033a1544ce8d50a25bbc4164a22f54d0d441c1b8746`. Unlike the earlier markers, its suffix is not the upstream commit: it is the SHA-256 of the concatenated post-0005 bytes of `hnsw.hpp`, `hnsw_precision.hpp`, and `cuvs_hnsw_nn_upper_contract.h`, so it names the patched content. The recipe recomputes that digest from the source before building. The product refuses hierarchy builds with `build_algo=nn_descent` unless the loaded SDK returns exactly this value.
+
+The hashes below bind the clean source and the complete ordered patch set. `hnsw.hpp` includes 0001, 0003, 0004, and 0005. The historical composition receipt in the manifest covers only the first three patches.
 
 | Source path | Clean base SHA-256 | Complete patch-set SHA-256 |
 | --- | --- | --- |
-| `cpp/src/neighbors/detail/hnsw.hpp` | `6c8530e39c6ed5fa4eb3fe7b9c6c24022842147c41814fc4c130fdb5a6b8fd0b` | `1378471e577268a0abbb5e575a4eeba5a45734f52e7aa35017545e28099d00ca` |
-| `cpp/src/neighbors/hnsw.cpp` | `59c7874565b049eed090e7423df638eb18e4551ccd1cd4b65f1197dc4a4a7102` | `dce2bbaa933c6f046f561e35c6da5fb33c56ac37930cad5285123460e0b64069` |
+| `cpp/src/neighbors/detail/hnsw.hpp` | `6c8530e39c6ed5fa4eb3fe7b9c6c24022842147c41814fc4c130fdb5a6b8fd0b` | `3e85f3b185b214617065cbce597d67b28424078221b55f74384987cee3caf755` (through 0004: `1378471e577268a0abbb5e575a4eeba5a45734f52e7aa35017545e28099d00ca`) |
+| `cpp/src/neighbors/hnsw.cpp` | `59c7874565b049eed090e7423df638eb18e4551ccd1cd4b65f1197dc4a4a7102` | `5f7b5d6e2efe5024d6d11420148325900f49790544130440eae3f3c99054446d` (through 0004: `dce2bbaa933c6f046f561e35c6da5fb33c56ac37930cad5285123460e0b64069`) |
 | `cpp/src/neighbors/cagra.cpp` | `100e9a8702bf1f5b373019583d873a99d9490b575d3aa53dec5a9e34e932c202` | `c270c872b8513179b5c3f9583a653aaa8091a3d08973ea19bd125f823803fcce` |
 | `cpp/src/neighbors/detail/cagra/cagra_build.cuh` | `f72c7ac38e1b24f2f0b05c5a392a1eef2bec7fc88a1fa27f6393fc87795f5bc1` | `87239d05766dda6f99d17cbfbc75faa9858e976fc0aa80f679f63dc4a6297c8e` |
 | `cpp/src/neighbors/detail/cagra/ace_memory_guard.hpp` | absent | `dc2ccb2d6920bf81d55e614181e3ceff8e7e0394eae56d0506fbb302190cf555` |
-| `cpp/src/neighbors/detail/hnsw_precision.hpp` | absent | `c051c5bfe6c5b1031c61806ab7d0a8804741724011b41b33bb63eac9cb72dc69` |
+| `cpp/src/neighbors/detail/hnsw_precision.hpp` | absent | `e6a0839d761fa6720c11c94f7b4a2b485ac707446b173b4c5946a9c56979838c` (through 0004: `c051c5bfe6c5b1031c61806ab7d0a8804741724011b41b33bb63eac9cb72dc69`) |
+| `cpp/src/neighbors/detail/cuvs_hnsw_nn_upper_contract.h` | absent | `6db8ffea2fb73695ab107e95135e37d04599c03013cdcc6a3bbe614382758e42` |
 
 ## Build environment
 
@@ -50,7 +54,7 @@ infra/cuvs-patches/build-patched-cuvs.sh \
 
 To choose a CUDA host compiler explicitly, export `CUDAHOSTCXX=/absolute/path/to/g++` before running the recipe. For a reused cache this is an identity check against the cached CUDA host; for a cold build it selects the host compiler used for both SDK and pilot configuration.
 
-The install prefix must be empty, outside the active Conda environment, and separate from the source and build trees. The recipe never installs into Conda. It accepts only these source states: clean base, 0001 applied, 0001+0002 applied, 0001+0002+0003 applied, or all four applied. After each patch it checks exact source-file hashes and allowed Git paths. It rejects partial 0003 or 0004 application and unrelated staged, unstaged, untracked, or ignored source changes. The root license hash and the `BUILD_CAGRA_HNSWLIB=ON` setting are checked before the build is accepted.
+The install prefix must be empty, outside the active Conda environment, and separate from the source and build trees. The recipe never installs into Conda. It accepts only these source states: clean base, 0001 applied, 0001+0002 applied, 0001+0002+0003 applied, all four applied, or all five applied. After each patch it checks exact source-file hashes and allowed Git paths. It rejects partial 0003, 0004, or 0005 application and unrelated staged, unstaged, untracked, or ignored source changes. The root license hash and the `BUILD_CAGRA_HNSWLIB=ON` setting are checked before the build is accepted.
 
 An existing build cache is reusable only when it has the pinned cuVS source, Ninja generator, same C/C++/CUDA compilers, a valid cached `CMAKE_CUDA_HOST_COMPILER`, CUDA architecture, CCCL 3.3.0, and supported build options. The CUDA host compiler is preserved independently from CXX. If `CUDAHOSTCXX` is set for a reused cache, its canonical executable path must match the cached CUDA host; if unset, the cached host is used without inferring it from CXX. A reused cache without a CUDA host compiler is rejected. A cold build uses `CUDAHOSTCXX` when set and otherwise declares CXX as its CUDA host compiler. The chosen host is passed to the SDK and both pilots; after configure/build, each SDK/pilot CMake cache is checked for the same canonical host path. The recipe records CXX and CUDA host separately in stdout and `sdk-provenance.txt`.
 

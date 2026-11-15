@@ -348,6 +348,36 @@ test-hnsw-explicit-route: test/unit/test_hnsw_explicit_route.c src/cuvs_hnsw_bui
 	$(CC) -std=gnu11 -Wall -Wextra -Werror -I src -o $@ test/unit/test_hnsw_explicit_route.c -lpthread
 	./$@
 
+# SDK side of build_algo=nn_descent (infra/cuvs-patches 0005). Needs a cuVS clone
+# containing 60b19a0f; the patched tree is rebuilt from tracked patches each run.
+#   make test-hnsw-nn-sdk CUVS_UPSTREAM_GIT=/path/to/cuvs
+# The B3 planner checks also need the fixed B3 consumer source (cpp/src):
+#   make test-hnsw-b3-sdk CUVS_UPSTREAM_GIT=... CUVS_B3_SDK_SRC=/path/to/b3/cpp/src
+.PHONY: test-hnsw-nn-sdk test-hnsw-b3-sdk
+test-hnsw-nn-sdk:
+	@test -n "$(CUVS_UPSTREAM_GIT)" || { echo "set CUVS_UPSTREAM_GIT to a cuVS clone containing 60b19a0f" >&2; exit 2; }
+	set -e; t=$$(mktemp -d); trap 'rm -rf "$$t"' EXIT; \
+	scripts/prepare-patched-cuvs-source.sh '$(CUVS_UPSTREAM_GIT)' "$$t/cuvs"; \
+	n="$$t/cuvs/cpp/src/neighbors"; \
+	python3 -I test/unit/check_hnsw_nn_sdk_source.py --sdk-src "$$n"; \
+	python3 -I test/unit/test_hnsw_nn_upper_consumer.py --sdk-src "$$n"; \
+	$(CXX) -std=c++17 -Wall -Wextra -Werror -I "$$n/detail" test/unit/test_hnsw_nn_upper_precision.cpp -o "$$t/upper-precision"; \
+	"$$t/upper-precision"; \
+	python3 -I test/unit/test_hnsw_nn_upper_precision_mutations.py --sdk-src "$$n"; \
+	python3 -I test/native/hnsw-sdk/test_nn_upper_legacy_forwarder.py --source "$$t/cuvs/cpp/src"; \
+	python3 -I test/native/hnsw-sdk/test_nn_upper_legacy_forwarder.py --source "$$t/cuvs/cpp/src" --mutant
+
+test-hnsw-b3-sdk:
+	@test -n "$(CUVS_UPSTREAM_GIT)" -a -n "$(CUVS_B3_SDK_SRC)" || { echo "set CUVS_UPSTREAM_GIT and CUVS_B3_SDK_SRC" >&2; exit 2; }
+	set -e; t=$$(mktemp -d); trap 'rm -rf "$$t"' EXIT; \
+	scripts/prepare-patched-cuvs-source.sh '$(CUVS_UPSTREAM_GIT)' "$$t/cuvs"; \
+	c="$$t/cuvs/cpp/src/neighbors/detail/cagra/cagra_build.cuh"; \
+	python3 -I scripts/verify-hnsw-sdk-plan.py --source "$$t/cuvs/cpp/src"; \
+	python3 -I scripts/verify-hnsw-sdk-plan.py --source '$(CUVS_B3_SDK_SRC)'; \
+	python3 -I -B test/unit/test_hnsw_sdk_plan_verifier.py --canonical-header "$$c" --b3-src '$(CUVS_B3_SDK_SRC)'; \
+	python3 -I -B test/unit/test_hnsw_sdk_plan_mutations.py --canonical-header "$$c" --b3-src '$(CUVS_B3_SDK_SRC)'; \
+	python3 -I test/unit/test_hnsw_b3_planner_equivalence.py --canonical-header "$$c" --b3-src '$(CUVS_B3_SDK_SRC)'
+
 .PHONY: test-hnsw-nn-precision test-hnsw-nn-policy test-hnsw-nn-capacity test-hnsw-nn-route test-hnsw-nn-sdk-params test-hnsw-nn-consumer test-hnsw-nn-upper-receipt
 test-hnsw-nn-precision: test/unit/test_hnsw_nn_precision.c src/cuvs_hnsw_nn_precision.h
 	$(CC) -std=gnu11 -Wall -Wextra -Werror -I src -o $@ test/unit/test_hnsw_nn_precision.c -lm

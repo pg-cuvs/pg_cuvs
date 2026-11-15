@@ -1,8 +1,15 @@
 #!/usr/bin/env python3
 """Check B3 source branch binding; this is static, not native execution."""
+import argparse
+import json
 from pathlib import Path
 root = Path(__file__).resolve().parents[2]
-sdk = root / 'evidence/nn-descent-implementation-20261115/sdk-b3-nn/cpp/src/neighbors'
+ap = argparse.ArgumentParser()
+ap.add_argument('--sdk-src', type=Path, required=True,
+                help='cpp/src/neighbors of upstream 60b19a0f + infra/cuvs-patches 0001..0005 '
+                     '(scripts/prepare-patched-cuvs-source.sh)')
+sdk = ap.parse_args().sdk_src
+expected_marker = json.loads((root / 'infra/cuvs-patches/patchset-manifest.json').read_text())['runtime_markers']['resident_nn_upper']['value']
 h = (sdk / 'detail/hnsw.hpp').read_text()
 core = (sdk / 'detail/cagra/cagra_build.cuh').read_text()
 marker = (sdk / 'hnsw.cpp').read_text()
@@ -14,7 +21,7 @@ checks = {
   'resident FP32 has extra device budget': 'if (resident_fp32) gpu_workspace = checked_add(gpu_workspace,' in h,
   'upper actual dtype propagated': 'nn_params.dist_comp_dtype = resident_fp32 ? nn_descent::DIST_COMP_DTYPE::FP32' in h,
   'private contracts match': (root / 'src/cuvs_hnsw_nn_upper_contract.h').read_bytes() == (sdk / 'detail/cuvs_hnsw_nn_upper_contract.h').read_bytes(),
-  'v3 marker exported and checked': 'pgcuvs-hnsw-resident-nn-upper-v3@616eb202e83f558b59755b521d4d949e5b7b8305' in marker and 'pgcuvs-hnsw-resident-nn-upper-v3@616eb202e83f558b59755b521d4d949e5b7b8305' in wrapper,
+  'manifest marker exported and checked': ('"' + expected_marker + '"') in marker and ('"' + expected_marker + '"') in wrapper,
 }
 for name, ok in checks.items():
     print(f'{name}: {"PASS" if ok else "FAIL"} (source only)')

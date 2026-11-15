@@ -2,8 +2,11 @@
 from pathlib import Path
 import subprocess
 import tempfile
+import argparse
 root = Path(__file__).resolve().parents[2]
-header = (root / 'evidence/nn-descent-implementation-20261115/sdk-b3-nn/cpp/src/neighbors/detail/hnsw_precision.hpp').read_text()
+ap = argparse.ArgumentParser()
+ap.add_argument('--sdk-src', type=Path, required=True, help='patched cpp/src/neighbors')
+header = (ap.parse_args().sdk_src / 'detail/hnsw_precision.hpp').read_text()
 test = root / 'test/unit/test_hnsw_nn_upper_precision.cpp'
 changes = {'half overflow': ('std::abs(value) > 65504.0', 'std::abs(value) > INFINITY'),
            'nonfinite': ('!std::isfinite(value) || ', '')}

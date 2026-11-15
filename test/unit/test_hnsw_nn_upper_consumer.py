@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 """Run the patched SDK's actual resident-upper parameter code in a CPU fixture."""
+import argparse
 from pathlib import Path
 import subprocess
 import tempfile
 
 root = Path(__file__).resolve().parents[2]
-sdk = root / 'evidence/nn-descent-implementation-20261115/sdk-b3-nn/cpp/src/neighbors/detail'
+ap = argparse.ArgumentParser()
+ap.add_argument('--sdk-src', type=Path, required=True, help='patched cpp/src/neighbors')
+sdk = ap.parse_args().sdk_src / 'detail'
 source = (sdk / 'hnsw.hpp').read_text()
 def block_at(anchor):
     start = source.index(anchor)

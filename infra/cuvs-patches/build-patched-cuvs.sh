@@ -9,13 +9,18 @@ readonly EXPECTED_PATCH1_SHA="2f5adf6d3cce3c9d60335e40992250e5044f0ed494c8f5cff6
 readonly EXPECTED_PATCH2_SHA="d52ddd22a0e558849d75ec3ddfba4b52fcc200ed6869568593245289f9f963f8"
 readonly EXPECTED_PATCH3_SHA="34831f221f32337c025afeb33a32d7aa304e703bd0e3ee85f0ff93902a9a130f"
 readonly EXPECTED_PATCH4_SHA="8777280bc918cc26e8bca0bbf38021e1e901ccda8510e543738b9a53ff631fdd"
-readonly EXPECTED_PATCHSET_MANIFEST_SHA="51bc6c770e9db26a22ee68a15ff2197fe65d0dd9e9ca9aba870ce621a5db634a"
+readonly EXPECTED_PATCH5_SHA="9d55a10e78f5ad285b94a133a583d4f576fc0586aa13c6ff32b5948a7be4dc06"
+readonly EXPECTED_PATCHSET_MANIFEST_SHA="650940f2bcdbee00e3752d3421e74d3779c0fb03c332546616c0dfbbbcfe7f8f"
 readonly EXPECTED_BASE_HNSW_HPP_SHA="6c8530e39c6ed5fa4eb3fe7b9c6c24022842147c41814fc4c130fdb5a6b8fd0b"
 readonly EXPECTED_PATCH1_HNSW_HPP_SHA="49adab846921272a2aaf28f3c5749fb85925fbfde8ca43cd0af61e51adcbba99"
 readonly EXPECTED_PATCH3_HNSW_HPP_SHA="88192b1da4cb50a2de5a0f374854c1d0659734215136f86d7e53e52c0a1dc911"
-readonly EXPECTED_FINAL_HNSW_HPP_SHA="1378471e577268a0abbb5e575a4eeba5a45734f52e7aa35017545e28099d00ca"
-readonly EXPECTED_FINAL_HNSW_CPP_SHA="dce2bbaa933c6f046f561e35c6da5fb33c56ac37930cad5285123460e0b64069"
+readonly EXPECTED_PATCH4_HNSW_HPP_SHA="1378471e577268a0abbb5e575a4eeba5a45734f52e7aa35017545e28099d00ca"
+readonly EXPECTED_FINAL_HNSW_HPP_SHA="3e85f3b185b214617065cbce597d67b28424078221b55f74384987cee3caf755"
+readonly EXPECTED_PATCH4_HNSW_CPP_SHA="dce2bbaa933c6f046f561e35c6da5fb33c56ac37930cad5285123460e0b64069"
+readonly EXPECTED_FINAL_HNSW_CPP_SHA="5f7b5d6e2efe5024d6d11420148325900f49790544130440eae3f3c99054446d"
 readonly EXPECTED_PRECISION_HEADER_SHA="c051c5bfe6c5b1031c61806ab7d0a8804741724011b41b33bb63eac9cb72dc69"
+readonly EXPECTED_FINAL_PRECISION_HEADER_SHA="e6a0839d761fa6720c11c94f7b4a2b485ac707446b173b4c5946a9c56979838c"
+readonly EXPECTED_NN_CONTRACT_SHA="6db8ffea2fb73695ab107e95135e37d04599c03013cdcc6a3bbe614382758e42"
 readonly EXPECTED_BASE_HNSW_CPP_SHA="59c7874565b049eed090e7423df638eb18e4551ccd1cd4b65f1197dc4a4a7102"
 readonly EXPECTED_PATCHED_HNSW_CPP_SHA="fcbe6c5c40d35854a6deb6a3182c70dca8e5b53e83bb79c11a2efcb4b1a4a39e"
 readonly EXPECTED_BASE_CAGRA_CPP_SHA="100e9a8702bf1f5b373019583d873a99d9490b575d3aa53dec5a9e34e932c202"
@@ -28,6 +33,8 @@ readonly EXPECTED_DISK_MARKER="pgcuvs-hnsw-disk-copy-v1@60b19a0f62ba0bd716de3493
 readonly EXPECTED_GUARD_MARKER="pgcuvs-hnsw-memory-guard-v2@60b19a0f62ba0bd716de349382828e43be6e2daa"
 
 readonly EXPECTED_PRECISION_MARKER="pgcuvs-hnsw-upper-precision-v1@60b19a0f62ba0bd716de349382828e43be6e2daa"
+# 0005 marker suffix = sha256(hnsw.hpp || hnsw_precision.hpp || cuvs_hnsw_nn_upper_contract.h) after 0005.
+readonly EXPECTED_NN_UPPER_MARKER="pgcuvs-hnsw-resident-nn-upper-v3@9a18eb49f1e124f9c7806033a1544ce8d50a25bbc4164a22f54d0d441c1b8746"
 
 readonly SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 readonly REPO_ROOT="$(cd -- "${SCRIPT_DIR}/../.." && pwd)"
@@ -35,6 +42,7 @@ readonly PATCH1_FILE="${SCRIPT_DIR}/0001-hnsw-gpu-hierarchy-typed-copy.patch"
 readonly PATCH2_FILE="${SCRIPT_DIR}/0002-hnsw-disk-copy-patch-id.patch"
 readonly PATCH3_FILE="${SCRIPT_DIR}/0003-hnsw-memory-guards.patch"
 readonly PATCH4_FILE="${SCRIPT_DIR}/0004-hnsw-upper-precision.patch"
+readonly PATCH5_FILE="${SCRIPT_DIR}/0005-hnsw-resident-nn-upper.patch"
 readonly PATCHSET_MANIFEST_FILE="${SCRIPT_DIR}/patchset-manifest.json"
 readonly HNSW_HPP_REL="cpp/src/neighbors/detail/hnsw.hpp"
 readonly HNSW_CPP_REL="cpp/src/neighbors/hnsw.cpp"
@@ -42,11 +50,13 @@ readonly CAGRA_CPP_REL="cpp/src/neighbors/cagra.cpp"
 readonly CAGRA_BUILD_REL="cpp/src/neighbors/detail/cagra/cagra_build.cuh"
 readonly ACE_GUARD_REL="cpp/src/neighbors/detail/cagra/ace_memory_guard.hpp"
 readonly PRECISION_HEADER_REL="cpp/src/neighbors/detail/hnsw_precision.hpp"
+readonly NN_CONTRACT_REL="cpp/src/neighbors/detail/cuvs_hnsw_nn_upper_contract.h"
 readonly EXPECTED_TRACKED_0001="$(printf '%s\n' "$HNSW_HPP_REL" | LC_ALL=C sort)"
 readonly EXPECTED_TRACKED_0002="$(printf '%s\n' "$HNSW_CPP_REL" "$HNSW_HPP_REL" | LC_ALL=C sort)"
 readonly EXPECTED_TRACKED_0003="$(printf '%s\n' "$CAGRA_BUILD_REL" "$CAGRA_CPP_REL" "$HNSW_CPP_REL" "$HNSW_HPP_REL" | LC_ALL=C sort)"
 
 readonly EXPECTED_TRACKED_0004="$EXPECTED_TRACKED_0003"
+readonly EXPECTED_TRACKED_0005="$EXPECTED_TRACKED_0003"
 
 if [[ $# -ne 3 ]]; then
   echo "usage: $0 CUVS_SOURCE_ROOT EMPTY_ISOLATED_INSTALL_PREFIX SDK_BUILD_DIR" >&2
@@ -125,12 +135,14 @@ readonly PATCH1_SHA="$(sha256_of "$PATCH1_FILE")"
 readonly PATCH2_SHA="$(sha256_of "$PATCH2_FILE")"
 readonly PATCH3_SHA="$(sha256_of "$PATCH3_FILE")"
 readonly PATCH4_SHA="$(sha256_of "$PATCH4_FILE")"
+readonly PATCH5_SHA="$(sha256_of "$PATCH5_FILE")"
 readonly PATCHSET_MANIFEST_SHA="$(sha256_of "$PATCHSET_MANIFEST_FILE")"
 for patch_tuple in \
   "0001:$PATCH1_SHA:$EXPECTED_PATCH1_SHA" \
   "0002:$PATCH2_SHA:$EXPECTED_PATCH2_SHA" \
   "0003:$PATCH3_SHA:$EXPECTED_PATCH3_SHA" \
   "0004:$PATCH4_SHA:$EXPECTED_PATCH4_SHA" \
+  "0005:$PATCH5_SHA:$EXPECTED_PATCH5_SHA" \
   "manifest:$PATCHSET_MANIFEST_SHA:$EXPECTED_PATCHSET_MANIFEST_SHA"; do
   IFS=: read -r patch_name actual_sha expected_sha <<< "$patch_tuple"
   if [[ "$actual_sha" != "$expected_sha" ]]; then
@@ -178,12 +190,20 @@ source_state_matches() {
       expected_untracked="$ACE_GUARD_REL"
       ;;
     4)
-      expected_hpp="$EXPECTED_FINAL_HNSW_HPP_SHA"
-      expected_cpp="$EXPECTED_FINAL_HNSW_CPP_SHA"
+      expected_hpp="$EXPECTED_PATCH4_HNSW_HPP_SHA"
+      expected_cpp="$EXPECTED_PATCH4_HNSW_CPP_SHA"
       expected_cagra="$EXPECTED_PATCHED_CAGRA_CPP_SHA"
       expected_cagra_build="$EXPECTED_PATCHED_CAGRA_BUILD_SHA"
       expected_tracked="$EXPECTED_TRACKED_0004"
       expected_untracked="$(printf '%s\n' "$ACE_GUARD_REL" "$PRECISION_HEADER_REL" | LC_ALL=C sort)"
+      ;;
+    5)
+      expected_hpp="$EXPECTED_FINAL_HNSW_HPP_SHA"
+      expected_cpp="$EXPECTED_FINAL_HNSW_CPP_SHA"
+      expected_cagra="$EXPECTED_PATCHED_CAGRA_CPP_SHA"
+      expected_cagra_build="$EXPECTED_PATCHED_CAGRA_BUILD_SHA"
+      expected_tracked="$EXPECTED_TRACKED_0005"
+      expected_untracked="$(printf '%s\n' "$ACE_GUARD_REL" "$PRECISION_HEADER_REL" "$NN_CONTRACT_REL" | LC_ALL=C sort)"
       ;;
     *) return 1 ;;
   esac
@@ -192,7 +212,7 @@ source_state_matches() {
   source_file_matches "$HNSW_CPP_REL" "$expected_cpp" || return 1
   source_file_matches "$CAGRA_CPP_REL" "$expected_cagra" || return 1
   source_file_matches "$CAGRA_BUILD_REL" "$expected_cagra_build" || return 1
-  if [[ "$prefix_level" == 3 || "$prefix_level" == 4 ]]; then
+  if [[ "$prefix_level" == 3 || "$prefix_level" == 4 || "$prefix_level" == 5 ]]; then
     source_file_matches "$ACE_GUARD_REL" "$EXPECTED_ACE_GUARD_SHA" || return 1
   elif [[ -e "${SOURCE_ROOT}/${ACE_GUARD_REL}" ]]; then
     return 1
@@ -200,7 +220,15 @@ source_state_matches() {
 
   if [[ "$prefix_level" == 4 ]]; then
     source_file_matches "$PRECISION_HEADER_REL" "$EXPECTED_PRECISION_HEADER_SHA" || return 1
+  elif [[ "$prefix_level" == 5 ]]; then
+    source_file_matches "$PRECISION_HEADER_REL" "$EXPECTED_FINAL_PRECISION_HEADER_SHA" || return 1
   elif [[ -e "${SOURCE_ROOT}/${PRECISION_HEADER_REL}" ]]; then
+    return 1
+  fi
+
+  if [[ "$prefix_level" == 5 ]]; then
+    source_file_matches "$NN_CONTRACT_REL" "$EXPECTED_NN_CONTRACT_SHA" || return 1
+  elif [[ -e "${SOURCE_ROOT}/${NN_CONTRACT_REL}" ]]; then
     return 1
   fi
 
@@ -214,7 +242,7 @@ source_state_matches() {
 }
 
 SOURCE_PATCH_LEVEL=""
-for candidate_level in 0 1 2 3 4; do
+for candidate_level in 0 1 2 3 4 5; do
   if source_state_matches "$candidate_level"; then
     if [[ -n "$SOURCE_PATCH_LEVEL" ]]; then
       echo "source checkout ambiguously matches multiple patch-prefix states" >&2
@@ -224,7 +252,7 @@ for candidate_level in 0 1 2 3 4; do
   fi
 done
 if [[ -z "$SOURCE_PATCH_LEVEL" ]]; then
-  echo "source checkout is not clean or an exact ordered patch prefix from 0001 through 0004" >&2
+  echo "source checkout is not clean or an exact ordered patch prefix from 0001 through 0005" >&2
   echo "tracked changes:" >&2
   git -C "$SOURCE_ROOT" diff --name-only HEAD >&2
   echo "untracked/ignored paths:" >&2
@@ -260,12 +288,22 @@ if [[ "$SOURCE_PATCH_LEVEL" == 3 ]]; then
   apply_next_patch "$PATCH4_FILE" 4
   SOURCE_PATCH_LEVEL=4
 fi
-if [[ "$SOURCE_PATCH_LEVEL" != 4 ]] || ! source_state_matches 4; then
-  echo "source checkout did not reach the exact complete 0001+0002+0003+0004 patch state" >&2
+if [[ "$SOURCE_PATCH_LEVEL" == 4 ]]; then
+  apply_next_patch "$PATCH5_FILE" 5
+  SOURCE_PATCH_LEVEL=5
+fi
+if [[ "$SOURCE_PATCH_LEVEL" != 5 ]] || ! source_state_matches 5; then
+  echo "source checkout did not reach the exact complete 0001+0002+0003+0004+0005 patch state" >&2
   exit 2
 fi
 
 git -C "$SOURCE_ROOT" diff --check HEAD
+readonly ACTUAL_NN_UPPER_DIGEST="$(cat "${SOURCE_ROOT}/${HNSW_HPP_REL}" "${SOURCE_ROOT}/${PRECISION_HEADER_REL}" "${SOURCE_ROOT}/${NN_CONTRACT_REL}" | sha256sum | awk '{print $1}')"
+if [[ "pgcuvs-hnsw-resident-nn-upper-v3@${ACTUAL_NN_UPPER_DIGEST}" != "$EXPECTED_NN_UPPER_MARKER" ]] \
+  || ! LC_ALL=C grep -qF "\"${EXPECTED_NN_UPPER_MARKER}\"" "${SOURCE_ROOT}/${HNSW_CPP_REL}"; then
+  echo "resident NN upper marker does not identify the patched source content" >&2
+  exit 2
+fi
 if LC_ALL=C grep -nE '[[:blank:]]+$' "${SOURCE_ROOT}/${ACE_GUARD_REL}"; then
   echo "new ACE guard header contains trailing whitespace" >&2
   exit 2
@@ -647,10 +685,12 @@ echo "source=$SOURCE_ROOT"
 echo "source_commit=$ACTUAL_COMMIT"
 echo "source_archive_sha256=$EXPECTED_SOURCE_ARCHIVE_SHA"
 echo "source_initial_patch_level=$INITIAL_PATCH_LEVEL"
-echo "patch_prefix=0001+0002+0003+0004"
+echo "patch_prefix=0001+0002+0003+0004+0005"
 echo "0001_patch_sha256=$PATCH1_SHA"
 echo "0002_patch_sha256=$PATCH2_SHA"
 echo "0003_patch_sha256=$PATCH3_SHA"
+echo "0004_patch_sha256=$PATCH4_SHA"
+echo "0005_patch_sha256=$PATCH5_SHA"
 echo "patchset_manifest_sha256=$PATCHSET_MANIFEST_SHA"
 echo "hnsw_hpp_sha256=$(sha256_of "${SOURCE_ROOT}/${HNSW_HPP_REL}")"
 echo "hnsw_cpp_sha256=$(sha256_of "${SOURCE_ROOT}/${HNSW_CPP_REL}")"
@@ -941,7 +981,7 @@ readonly LIBCUVS_DIR="$(dirname -- "$LIBCUVS_REAL")"
 readonly LIBCUVS_SHA="$(sha256_of "$LIBCUVS_REAL")"
 readonly RUNTIME_LIBRARY_PATH="${LIBCUVS_DIR}:${PILOT_RUNTIME_PATH}"
 
-LD_LIBRARY_PATH="$RUNTIME_LIBRARY_PATH" python3 - "$LIBCUVS_REAL" "$EXPECTED_DISK_MARKER" "$EXPECTED_GUARD_MARKER" "$EXPECTED_PRECISION_MARKER" "$LIBCUVS_SHA" <<'PY' | tee "${RUN_ROOT}/runtime-markers.txt"
+LD_LIBRARY_PATH="$RUNTIME_LIBRARY_PATH" python3 - "$LIBCUVS_REAL" "$EXPECTED_DISK_MARKER" "$EXPECTED_GUARD_MARKER" "$EXPECTED_PRECISION_MARKER" "$EXPECTED_NN_UPPER_MARKER" "$LIBCUVS_SHA" <<'PY' | tee "${RUN_ROOT}/runtime-markers.txt"
 import ctypes
 import hashlib
 import os
@@ -949,8 +989,8 @@ import pathlib
 import sys
 
 library_path = pathlib.Path(sys.argv[1]).resolve(strict=True)
-expected = (sys.argv[2], sys.argv[3], sys.argv[4])
-expected_sha = sys.argv[5]
+expected = (sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5])
+expected_sha = sys.argv[6]
 actual_sha = hashlib.sha256(library_path.read_bytes()).hexdigest()
 if actual_sha != expected_sha:
     raise SystemExit(f"loaded DSO hash changed: expected {expected_sha}, got {actual_sha}")
@@ -959,19 +999,21 @@ try:
     disk_marker_function = loaded_library.pgcuvs_hnsw_disk_copy_patch_id
     guard_marker_function = loaded_library.pgcuvs_hnsw_memory_guard_patch_id
     precision_marker_function = loaded_library.pgcuvs_hnsw_upper_precision_patch_id
+    nn_upper_marker_function = loaded_library.pgcuvs_hnsw_resident_nn_upper_patch_id
 except (AttributeError, OSError) as error:
     raise SystemExit(f"same loaded libcuvs DSO is missing a required marker: {error}")
 
-for marker_function in (disk_marker_function, guard_marker_function, precision_marker_function):
+for marker_function in (disk_marker_function, guard_marker_function, precision_marker_function, nn_upper_marker_function):
     marker_function.argtypes = []
     marker_function.restype = ctypes.c_char_p
 
 disk_marker = disk_marker_function()
 guard_marker = guard_marker_function()
 precision_marker = precision_marker_function()
-if disk_marker is None or guard_marker is None or precision_marker is None:
+nn_upper_marker = nn_upper_marker_function()
+if disk_marker is None or guard_marker is None or precision_marker is None or nn_upper_marker is None:
     raise SystemExit("loaded libcuvs returned a null runtime marker")
-actual = (disk_marker.decode("ascii"), guard_marker.decode("ascii"), precision_marker.decode("ascii"))
+actual = (disk_marker.decode("ascii"), guard_marker.decode("ascii"), precision_marker.decode("ascii"), nn_upper_marker.decode("ascii"))
 if actual != expected:
     raise SystemExit(f"loaded libcuvs marker mismatch: expected {expected}, got {actual}")
 print(f"marker_dso={library_path}")
@@ -979,6 +1021,7 @@ print(f"marker_dso_sha256={actual_sha}")
 print(f"disk_copy_marker={actual[0]}")
 print(f"memory_guard_marker={actual[1]}")
 print(f"upper_precision_marker={actual[2]}")
+print(f"resident_nn_upper_marker={actual[3]}")
 PY
 
 LD_LIBRARY_PATH="$RUNTIME_LIBRARY_PATH" ldd "$LIBCUVS_REAL" | tee "${RUN_ROOT}/libcuvs-ldd.txt"
@@ -1082,7 +1125,7 @@ cp "$cuvs_cache" "${RUN_ROOT}/CMakeCache-final.txt"
 cat > "${RUN_ROOT}/sdk-provenance.txt" <<EOF
 source_commit=$ACTUAL_COMMIT
 source_archive_sha256=$EXPECTED_SOURCE_ARCHIVE_SHA
-patch_prefix=0001+0002+0003+0004
+patch_prefix=0001+0002+0003+0004+0005
 patch_0001_sha256=$PATCH1_SHA
 patch_0002_sha256=$PATCH2_SHA
 patch_0003_sha256=$PATCH3_SHA
