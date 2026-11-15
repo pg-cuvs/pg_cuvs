@@ -5,9 +5,10 @@
 > in [ARCHITECTURE.md](../ARCHITECTURE.md); the rationale behind each is in
 > [design/decisions.md](../design/decisions.md). Source-checked against `src/pg_cuvs.c` and
 > `sql/pg_cuvs--0.9.0.sql` at HEAD `ae818ad` (extension version 0.9.0; source review only).
-> The current install script `sql/pg_cuvs--0.9.1.sql` creates the same catalog: the
-> 0.9.0 → 0.9.1 script changes no SQL object (`test/sql/upgrade_path.sql` compares the
-> upgrade chain with a fresh install).
+> The current install script `sql/pg_cuvs--0.9.2.sql` creates the catalog of `sql/pg_cuvs--0.9.1.sql`
+> (the 0.9.1 → 0.9.2 script changes no SQL object), which is the 0.9.0 catalog plus
+> `pg_cuvs_hnsw_connectivity_status()` (`test/sql/upgrade_path.sql` compares the upgrade chain
+> with a fresh install).
 
 ---
 
@@ -1047,9 +1048,9 @@ updates do not refresh it. Rebuild to obtain a new observation; do not use it
 as a live graph-integrity status. New receipts live outside the metapage WAL
 free-space hole; pgvector's prefix and existing policy/ACE receipt bytes stay
 unchanged. Existing binaries can search these pages without interpreting this
-snapshot. The status convenience function is created by the 0.9.1 scripts
-(`sql/pg_cuvs--0.9.1.sql` for fresh installations, `sql/pg_cuvs--0.9.0--0.9.1.sql`
-for `ALTER EXTENSION pg_cuvs UPDATE` from 0.9.0, and from 0.8.2 through 0.9.0);
+snapshot. The status convenience function was added in 0.9.1: `sql/pg_cuvs--0.9.1.sql` and every
+later install script create it, `sql/pg_cuvs--0.9.0--0.9.1.sql` adds it on
+`ALTER EXTENSION pg_cuvs UPDATE` from 0.9.0 (and from 0.8.2 through 0.9.0);
 the two 0.9.0 scripts do not contain it. A database whose extension is already
 at 0.9.1 from before this function existed can continue using the existing
 `pg_cuvs_hnsw_build_info` JSON surface; registering the alias can be done by the

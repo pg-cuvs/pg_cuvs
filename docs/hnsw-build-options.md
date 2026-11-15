@@ -1,6 +1,6 @@
 # over-the-vram HNSW 생성 옵션
 
-이 정책은 0.8.2에서 도입된 `USING pg_cuvs_hnsw` 직접 heap 생성에 적용한다. 현재 확장 버전은 `pg_cuvs.control`의 0.9.1이다.
+이 정책은 0.8.2에서 도입된 `USING pg_cuvs_hnsw` 직접 heap 생성에 적용한다. 현재 확장 버전은 `pg_cuvs.control`의 0.9.2이다.
 기존 device CAGRA AUTO 경로의 정책은 바꾸지 않는다.
 
 ```sql
@@ -77,7 +77,7 @@ NN tail에는 상위 계층 precision 계약 세대가 없으므로, hierarchy�
 
 extension과 daemon은 HNSW op23 payload v6를 함께 배포해야 한다(v4는 응답 뒤에 결정 바이트 6개, 즉 status-13 DETAIL의 원값을 덧붙이고, v5는 그 뒤에 ACE partition builder readback 32바이트를 덧붙이며, v6는 그 뒤에 resident NN readback을 덧붙인다). 현재 글로벌 명령·응답 프로토콜은 `CUVS_PROTO_VERSION=5`이며 HNSW op23의 별도 payload 버전 6과 구분한다.
 이전 payload v1/v2/v3/v4/v5 요청은 prefix의 버전을 먼저 검사해 나머지 필드를 기다리지 않고 거부한다.
-기존 0.8.1 단독 reader는 새 policy v2를 읽을 수 없다. 0.8.2 도입 당시에는 확장과 데몬 바이너리를 함께 배포하고 0.8.2로 업그레이드해야 했다. 현재 배포 대상 버전은 0.9.1이며, 0.8.1에서 출발한다면 `sql/pg_cuvs--0.8.1--0.8.2.sql`, `sql/pg_cuvs--0.8.2--0.9.0.sql`, `sql/pg_cuvs--0.9.0--0.9.1.sql`의 업그레이드 경로를 따른다. upgrade SQL은 영수증을 이주/덮어쓰기하지 않는다. v2가 있는 인덱스를 예전 reader로 downgrade하는 것은 지원하지 않는다.
+기존 0.8.1 단독 reader는 새 policy v2를 읽을 수 없다. 0.8.2 도입 당시에는 확장과 데몬 바이너리를 함께 배포하고 0.8.2로 업그레이드해야 했다. 현재 배포 대상 버전은 0.9.2이며, 0.8.1에서 출발한다면 `sql/pg_cuvs--0.8.1--0.8.2.sql`, `sql/pg_cuvs--0.8.2--0.9.0.sql`, `sql/pg_cuvs--0.9.0--0.9.1.sql`, `sql/pg_cuvs--0.9.1--0.9.2.sql`의 업그레이드 경로를 따른다. upgrade SQL은 영수증을 이주/덮어쓰기하지 않는다. v2가 있는 인덱스를 예전 reader로 downgrade하는 것은 지원하지 않는다.
 
 이 구현의 CPU 검사·코드 리뷰와 별개로 작은 실제 CUDA 생성·1M 동일성/비용/품질은 별도 실행 승인과 검증이 필요하다. 같은 native 파일의 변환 보존과 서로 다른 GPU build 간 SHA 불일치는 구분하며, 후자의 비결정성을 성공 판정으로 덮지 않는다.
 `internal_builder`는 base/local graph 생성기를 표시한다. 다른 계층의 미기록 과거 분기를 추정한 값이 아니다.
