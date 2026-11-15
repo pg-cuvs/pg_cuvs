@@ -104,7 +104,7 @@ CUVS_SDK_SOURCE_INCLUDE ?=
 CUVS_SDK_PLAN_NOTE =
 ifneq ($(strip $(CUVS_SDK_SOURCE_INCLUDE)),)
 CUVS_SDK_PLAN_FLAGS = -I$(CUVS_SDK_SOURCE_INCLUDE) -Xcompiler=-fopenmp
-CUVS_SDK_PLAN_LINK = -fopenmp -lrapids_logger
+CUVS_SDK_PLAN_LINK = -fopenmp
 else
 # One line when the GPU wrapper is compiled without the planner source. It is part of the
 # src/cuvs_wrapper.o recipe, so CPU shim builds (which never build that object) and the
@@ -121,16 +121,24 @@ ifdef PGCUVS_CPU_SHIM
 WRAPPER_OBJ      = src/cuvs_wrapper_shim_cpu.o
 CUVS_SO_LINK     = -lm
 CUVS_SERVER_LINK = -lm
+CUVS_LOGGER_LINK =
 else
 WRAPPER_OBJ      = src/cuvs_wrapper.o
 CUVS_SO_LINK     = -L$(CUVS_LIB) -lcuvs -lcudart -Wl,-rpath,$(CUVS_LIB)
 CUVS_SERVER_LINK = -L$(CUVS_LIB) -lcuvs -lrmm -lcudart -Wl,-rpath,$(CUVS_LIB)
+# The wrapper expands RMM_LOG_* (rmm/mr/pool_memory_resource.hpp), which call
+# rapids_logger::logger::log, defined in librapids_logger.so. libcuvs.so and
+# librmm.so need it only indirectly, and `ld` does not take symbols from a
+# library's own dependencies, so the link fails with "DSO missing from command
+# line" unless it is named here, with or without CUVS_SDK_SOURCE_INCLUDE. A
+# separate variable, so a hand-written CUVS_SO_LINK / CUVS_SERVER_LINK keeps it.
+CUVS_LOGGER_LINK = -lrapids_logger
 endif
 
 PG_CPPFLAGS    = -I$(CUVS_INCLUDE) -I$(CUVS_RAPIDS_INCLUDE) -I./src
 # -Wl,-rpath embeds the cuVS lib path so postmaster finds libcuvs.so
 # without LD_LIBRARY_PATH being set (ADR-007).
-SHLIB_LINK     = $(CUVS_SO_LINK) $(CUVS_SDK_PLAN_LINK) \
+SHLIB_LINK     = $(CUVS_SO_LINK) $(CUVS_LOGGER_LINK) $(CUVS_SDK_PLAN_LINK) \
                  -Wl,-Bstatic -lstdc++ -Wl,-Bdynamic -lrt
 
 PG_CONFIG     ?= pg_config
@@ -184,7 +192,7 @@ SERVER_CFLAGS += $(EXTRA_SERVER_CFLAGS)
 ifdef PGCUVS_CPU_SHIM
 SERVER_CFLAGS += -DPGCUVS_CPU_SHIM
 endif
-SERVER_LDFLAGS = $(CUVS_SERVER_LINK) $(CUVS_SDK_PLAN_LINK) -lstdc++ \
+SERVER_LDFLAGS = $(CUVS_SERVER_LINK) $(CUVS_LOGGER_LINK) $(CUVS_SDK_PLAN_LINK) -lstdc++ \
                  -lpthread -lrt \
                  -lcurl -lssl -lcrypto
 SERVER_LDFLAGS += $(EXTRA_SERVER_LDFLAGS)
@@ -298,7 +306,7 @@ TEST_RT_LIB := $(shell [ "$$(uname -s)" = "Linux" ] && echo -lrt)
 test-unit: test-compact-retry test-device-norm test-failed-allocation test-build-oom-log test-peak-log-switch test/unit/test_cuvs_util.c src/cuvs_util.c src/cuvs_util.h src/cuvs_ipc.h \
            test/unit/test_build_corpus.c src/cuvs_build_corpus.c src/cuvs_build_corpus.h \
            test-hnsw-build test-hnsw-build-ipc test-hnsw-owner-lease test-hnsw-ace-quality test-hnsw-admission test-admission-contract \
-           test-hnsw-nn-policy test-hnsw-nn-route test-hnsw-nn-precision test-hnsw-nn-capacity test-hnsw-nn-sdk-params test-hnsw-nn-consumer test-hnsw-nn-upper-receipt test-hnsw-nn-center test-hnsw-nn-mutations test-hnsw-ace-origin-json test-hnsw-ace-planner-branch test-hnsw-sdk-plan-gate \
+           test-hnsw-nn-policy test-hnsw-nn-route test-hnsw-nn-precision test-hnsw-nn-capacity test-hnsw-nn-sdk-params test-hnsw-nn-consumer test-hnsw-nn-upper-receipt test-hnsw-nn-center test-hnsw-nn-mutations test-hnsw-ace-origin-json test-hnsw-ace-planner-branch test-hnsw-sdk-plan-gate test-hnsw-gpu-link-lines \
            test-i3-logs test-notice-wire test-admission-wire test-admission-message test-admission-ipc test-build-oom-thread test-cache-policy test-circuit-source test-status-text test-i3b-source test-peak-meter test-lw-policy test-lw-guard test-i3e-sql test-self-replace-notice test-host-free-fence test-vacuum-policy test-hnsw-digest
 	$(CC) -I src -DCUVS_TEST_HOOKS -o test-unit test/unit/test_cuvs_util.c src/cuvs_util.c $(TEST_RT_LIB)
 	./test-unit
@@ -477,6 +485,11 @@ test-hnsw-ace-planner-branch: test/unit/test_hnsw_ace_planner_branch.py src/cuvs
 .PHONY: test-hnsw-sdk-plan-gate
 test-hnsw-sdk-plan-gate: test/unit/test_hnsw_sdk_plan_gate.py src/cuvs_hnsw_sdk_plan.cuh src/cuvs_wrapper.cu Makefile
 	CXX="$(CXX)" python3 -I -B test/unit/test_hnsw_sdk_plan_gate.py
+
+# librapids_logger is named on the extension and daemon link lines of every GPU build.
+.PHONY: test-hnsw-gpu-link-lines
+test-hnsw-gpu-link-lines: test/unit/test_hnsw_gpu_link_lines.py Makefile
+	python3 -I -B test/unit/test_hnsw_gpu_link_lines.py
 
 # NN-descent L2 graph-input centering (docs/hnsw-build-options.md, nn_descent).
 .PHONY: test-hnsw-nn-center
