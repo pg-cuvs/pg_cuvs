@@ -100,8 +100,11 @@ CUVS_LIB      ?= $(CUVS_PREFIX)/lib
 # as requested, effective count not guaranteed. The patched libcuvs.so is
 # required either way.
 CUVS_SDK_SOURCE_INCLUDE ?=
-# Reset here: a make started from a recipe sees this variable in its environment.
+# Reset, and kept out of the environment (this Makefile has a bare `export` further down): a make
+# started from a recipe would otherwise inherit the note and print it for a set variable, and nvcc
+# would get it in its environment.
 CUVS_SDK_PLAN_NOTE =
+unexport CUVS_SDK_PLAN_NOTE
 ifneq ($(strip $(CUVS_SDK_SOURCE_INCLUDE)),)
 CUVS_SDK_PLAN_FLAGS = -I$(CUVS_SDK_SOURCE_INCLUDE) -Xcompiler=-fopenmp
 CUVS_SDK_PLAN_LINK = -fopenmp

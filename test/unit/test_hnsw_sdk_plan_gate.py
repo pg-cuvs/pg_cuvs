@@ -64,7 +64,8 @@ def check_gate(header_text, wrapper_text, makefile_text):
         env = {k: v for k, v in os.environ.items() if k not in ('CUVS_SDK_SOURCE_INCLUDE', 'PGCUVS_CPU_SHIM')}
 
         def noted(*args):
-            r = subprocess.run(['make', '-n', '-f', str(mk)] + list(args), cwd=root, env=env,
+            # -B: an up to date server binary in a built tree would leave no recipe to print.
+            r = subprocess.run(['make', '-n', '-B', '-f', str(mk)] + list(args), cwd=root, env=env,
                                capture_output=True, text=True)
             return NOTE in r.stdout
         assert noted('src/cuvs_wrapper.o'), 'NOTE_WHEN_GPU_WRAPPER_WITHOUT_SOURCE'
@@ -73,6 +74,12 @@ def check_gate(header_text, wrapper_text, makefile_text):
         assert not noted('PGCUVS_CPU_SHIM=1', 'server'), 'NO_NOTE_IN_SHIM_BUILD'
         assert not noted('PGCUVS_CPU_SHIM=1'), 'NO_NOTE_IN_SHIM_DEFAULT_BUILD'
         assert not noted('test-hnsw-policy'), 'NO_NOTE_IN_CPU_TESTS'
+        # The note must not reach the environment of recipe processes (the Makefile has a bare `export`).
+        probe = Path(tmp) / 'probe.mk'
+        probe.write_text("pgcuvs-print-env:\n\t@env | grep -c '^CUVS_SDK_PLAN_NOTE=' || true\n")
+        r = subprocess.run(['make', '-s', '-f', str(mk), '-f', str(probe), 'pgcuvs-print-env'], cwd=root, env=env,
+                           capture_output=True, text=True)
+        assert r.stdout.strip() == '0', 'NOTE_NOT_EXPORTED:' + r.stdout.strip() + r.stderr[-200:]
 
 
 MUTANTS = [
@@ -91,6 +98,7 @@ MUTANTS = [
      'CUVS_SDK_PLAN_FLAGS = -I$(CUVS_SDK_SOURCE_INCLUDE) -Xcompiler=-fopenmp',
      'CUVS_SDK_PLAN_FLAGS = -I$(CUVS_SDK_SOURCE_INCLUDE)'),
     ('makefile_note_removed', 'makefile', '\t$(CUVS_SDK_PLAN_NOTE)\n', ''),
+    ('makefile_note_exported', 'makefile', 'unexport CUVS_SDK_PLAN_NOTE\n', ''),
     ('makefile_note_unconditional', 'makefile', '\t$(CUVS_SDK_PLAN_NOTE)\n',
      '\t@echo "pg_cuvs: ACE effective partition count guarantee is OFF"\n'),
     ('makefile_note_never_defined', 'makefile', 'CUVS_SDK_PLAN_NOTE = @echo', 'CUVS_SDK_PLAN_NOTE_UNUSED = @echo'),

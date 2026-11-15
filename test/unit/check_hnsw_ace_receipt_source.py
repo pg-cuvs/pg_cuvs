@@ -24,6 +24,8 @@ FILES = {
     'wrapper': 'src/cuvs_wrapper.cu',
     'export': 'src/hnsw_export.c',
     'backend': 'src/pg_cuvs.c',
+    'server': 'src/pg_cuvs_server.c',
+    'makefile': 'Makefile',
 }
 FLAG = 'CUVS_HNSW_ROUTE_FLAG_ACE_PARTITIONS_REQUESTED'
 
@@ -115,6 +117,26 @@ def check(src):
     assert 'receipt.partitions = ace.partitions;' in fb, 'FALLBACK_RECEIPT_COUNT_IS_REQUESTED'
     assert 'prepared.route = ace;' in fb, 'FALLBACK_ROUTE_RECORDED'
 
+    # --- the receipt reaches the backend as the wrapper wrote it: the daemon hands the wire reply to the
+    # wrapper and never edits a field of it (a cleared mark would read as an effective count) ---
+    handler = function(code['server'], 'handle_build_hnsw_file(int client_fd')
+    assert 'params.policy = &wire.policy;' in handler, 'DAEMON_RECEIPT_IS_THE_WIRE_REPLY'
+    assert not re.search(r'wire\.policy\.\w+\s*(?:[-+|&^*/%]|<<|>>)?=(?!=)', handler), 'DAEMON_NEVER_EDITS_RECEIPT_FIELDS'
+    assert not re.search(r'(?:memset|memcpy)\s*\(\s*&wire\.policy|wire\.policy\s*=(?!=)', handler), 'DAEMON_NEVER_REPLACES_RECEIPT'
+    assert 'if (params->policy) *params->policy = receipt;' in execute, 'WRAPPER_COPIES_WHOLE_RECEIPT'
+
+    # --- Makefile: the tests that guard the planner switch run in test-unit, and the note names the variable ---
+    mk = code['makefile']
+    unit = mk[at(mk, 'test-unit:', 'TEST_UNIT_RULE'):]
+    unit = unit[:unit.index('\n\t')]
+    for target in ('test-hnsw-ace-origin-json', 'test-hnsw-ace-planner-branch', 'test-hnsw-sdk-plan-gate',
+                   'test-hnsw-gpu-link-lines', 'test-hnsw-ace-quality'):
+        assert re.search(r'(?<![\w-])' + target + r'(?![\w-])', unit), 'TEST_UNIT_RUNS:' + target
+    note = mk[at(mk, 'CUVS_SDK_PLAN_NOTE = @echo', 'NOTE_DEFINED'):]
+    note = note[:note.index('\n')]
+    assert 'CUVS_SDK_SOURCE_INCLUDE is not set' in note and 'set CUVS_SDK_SOURCE_INCLUDE to' in note \
+        and 'guarantee is OFF' in note, 'NOTE_NAMES_THE_VARIABLE'
+
     # --- build_info: origin and exactness come from the receipt, not from a constant ---
     info = function(code['export'], 'pg_cuvs_hnsw_build_info(PG_FUNCTION_ARGS)')
     assert 'cuvs_hnsw_ace_partitions_origin(&policy)' in info, 'BUILD_INFO_ORIGIN_FROM_RECEIPT'
@@ -133,7 +155,8 @@ def check(src):
     assert 'the effective count is not guaranteed' in notice, 'NOTICE_SAYS_GUARANTEE_OFF'
     assert 'built without the cuVS SDK source planner' in notice, 'NOTICE_SAYS_WHY'
     assert 'errhint(' in notice and 'CUVS_SDK_SOURCE_INCLUDE' in notice, 'NOTICE_SAYS_HOW'
-    assert 'neighbors/detail/cagra/cagra_build.cuh' in notice and '-fopenmp' in notice, 'NOTICE_SAYS_HOW_COMPLETELY'
+    assert 'neighbors/detail/cagra/cagra_build.cuh' in notice and '-fopenmp' in notice \
+        and 'planner source check' in notice, 'NOTICE_SAYS_HOW_COMPLETELY'
     assert re.search(r'errmsg\("[^"]*%u[^"]*",\s*out->policy\.partitions\)', notice), 'NOTICE_PRINTS_RECEIPT_COUNT'
     assert backend.count('the effective count is not guaranteed') == 1, 'NOTICE_ONCE'
     return 'PASS_SOURCE_INVARIANT_NOT_CUDA'
@@ -175,7 +198,7 @@ MUTANTS = [
      '            if (cuvs_hnsw_ace_partitions_unverified(&out->policy))',
      '            if (0 && cuvs_hnsw_ace_partitions_unverified(&out->policy))'),
     ('notice_without_how_to_enable', 'backend',
-     'errhint("Build pg_cuvs_server with CUVS_SDK_SOURCE_INCLUDE set to a path of the patched SDK source whose neighbors/detail/cagra/cagra_build.cuh exists and with OpenMP (-fopenmp); a variable that is set but misses either still builds without the planner.")',
+     'errhint("Build pg_cuvs_server with CUVS_SDK_SOURCE_INCLUDE set to the cpp/src of the patched SDK source: neighbors/detail/cagra/cagra_build.cuh must be under it (the make build stops in its planner source check otherwise) and the wrapper must be compiled with OpenMP (-fopenmp), without which the planner is left out.")',
      'errhint("Build pg_cuvs_server with CUVS_SDK_SOURCE_INCLUDE.")'),
     ('notice_prints_wrong_field', 'backend',
      'is the requested count; the effective count is not guaranteed", out->policy.partitions)',
@@ -190,6 +213,17 @@ MUTANTS = [
      '                ;'),
     ('fallback_marker_gate_unused', 'wrapper',
      '            if (!sdk_ok || std::strlen(workdir) > 255', '            if (std::strlen(workdir) > 255'),
+    ('daemon_clears_requested_mark', 'server',
+     '    reply.status = cuvs_hnsw_build_file(vectors_fd, owner_fd, &params, workdir,\n        device, &result_fd, reply.error, sizeof(reply.error));\n',
+     '    reply.status = cuvs_hnsw_build_file(vectors_fd, owner_fd, &params, workdir,\n        device, &result_fd, reply.error, sizeof(reply.error));\n    wire.policy.route_flags &= ~CUVS_HNSW_ROUTE_FLAG_ACE_PARTITIONS_REQUESTED;\n'),
+    ('daemon_replaces_receipt', 'server',
+     '    params.policy = &wire.policy;', '    params.policy = &wire.policy; memset(&wire.policy, 0, sizeof(wire.policy));'),
+    ('wrapper_copies_partial_receipt', 'wrapper',
+     'if (params->policy) *params->policy = receipt;', 'if (params->policy) params->policy->partitions = receipt.partitions;'),
+    ('test_unit_drops_plan_gate', 'makefile',
+     'test-hnsw-ace-planner-branch test-hnsw-sdk-plan-gate test-hnsw-gpu-link-lines \\', 'test-hnsw-ace-planner-branch test-hnsw-gpu-link-lines \\'),
+    ('note_misnames_the_variable', 'makefile',
+     'set CUVS_SDK_SOURCE_INCLUDE to the patched SDK cpp/src to turn it on', 'set CUVS_SDK_SOURCE_INC to the patched SDK cpp/src to turn it on'),
     ('notice_without_reason', 'backend',
      'This pg_cuvs_server was built without the cuVS SDK source planner, so the receipt records',
      'The receipt records'),
