@@ -62,8 +62,11 @@ check "flag: idle:-1 refused" sh -c "! pg_cuvs_server --socket /tmp/x.sock --ind
 
 startd --reclaim-tick-s 1 --evict-min-idle-s 3600
 psqlq "CREATE EXTENSION vector; CREATE EXTENSION pg_cuvs;" >/dev/null
-# 0.9.0 (I3-A's scripts with the I3-B block) is the default version now.
-check "extension installs at 0.9.0 with the I3-B functions" sh -c "[ \"\$(su pg -c \"psql -h /tmp -X -At -d postgres -c \\\"SELECT extversion FROM pg_extension WHERE extname='pg_cuvs'\\\"\")\" = 0.9.0 ] && su pg -c \"psql -h /tmp -X -At -d postgres -c \\\"SELECT count(*) FROM pg_proc WHERE proname IN ('pg_cuvs_unload','pg_cuvs_load','pg_cuvs_pin','pg_cuvs_unpin','pg_cuvs_reclaim_set','pg_cuvs_index_status','pg_cuvs_memory_status','pg_cuvs_circuit_status')\\\"\" | grep -qx 10"
+# CREATE EXTENSION installs default_version (pg_cuvs.control); the I3-B block is in
+# every install script from 0.9.0 on, so no version number is hard-coded here.
+EXTVER=$(psqlq "SELECT extversion FROM pg_extension WHERE extname='pg_cuvs'")
+DEFVER=$(psqlq "SELECT default_version FROM pg_available_extensions WHERE name='pg_cuvs'")
+check "extension installs at the default version ($DEFVER) with the I3-B functions" sh -c "[ -n '$EXTVER' ] && [ '$EXTVER' = '$DEFVER' ] && su pg -c \"psql -h /tmp -X -At -d postgres -c \\\"SELECT count(*) FROM pg_proc WHERE proname IN ('pg_cuvs_unload','pg_cuvs_load','pg_cuvs_pin','pg_cuvs_unpin','pg_cuvs_reclaim_set','pg_cuvs_index_status','pg_cuvs_memory_status','pg_cuvs_circuit_status')\\\"\" | grep -qx 10"
 for t in t1 t2 t3; do
   psqlq "CREATE TABLE $t (id int, v vector(64)); INSERT INTO $t SELECT g, (SELECT array_agg(((g*31+i) % 97)::real) FROM generate_series(1,64) i)::vector FROM generate_series(1,20000) g;" >/dev/null
 done

@@ -200,10 +200,10 @@ docs/best-practices.md / docs/playbooks/*.
 - 미설명 플래그: `--max-indexes`, `--gpu-devices`.
 
 ### 5.6 [낮음] TBD/스테일 (2026-06-11 audit snapshot)
-- `release-upgrade.md`: 당시 cross-version 업그레이드 = TBD였다. 0.1.0→0.5.0 migration chain과 `test/sql/upgrade_path.sql`은 이후 상태의 기록이며, 현재 `pg_cuvs.control` 기본 버전은 0.9.0이다. 현행 upgrade 절차는 별도 재검증이 필요하다.
+- `release-upgrade.md`: 당시 cross-version 업그레이드 = TBD였다. 0.1.0→0.5.0 migration chain과 `test/sql/upgrade_path.sql`은 이후 상태의 기록이며, 현재 `pg_cuvs.control` 기본 버전은 0.9.1이다. 현행 upgrade 절차는 별도 재검증이 필요하다.
 - `replica-bootstrap.md`: 스트리밍 물리복제 standby warmup = 미검증(TBD).
 - `ops-gpu-playbook §1.4`: `--max-vram-mb` 기본값 "40000" 표기 오류는 현재 0→90% 정책으로 수정됨.
-- `rollback-and-cleanup.md:47`의 `extversion = 1.0` 표기는 이후 0.5.0으로 수정된 기록이다. 현재 기본 버전은 0.9.0이다.
+- `rollback-and-cleanup.md:47`의 `extversion = 1.0` 표기는 이후 0.5.0으로 수정된 기록이다. 현재 기본 버전은 0.9.1이다.
 - `large-dataset-benchmark.md`: backend peak RSS 컬럼 빈칸.
 
 ### 5.7 구조: 운영 문서가 흩어져 있음

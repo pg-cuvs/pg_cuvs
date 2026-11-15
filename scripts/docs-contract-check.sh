@@ -41,10 +41,20 @@ header_version="$(sed -n 's/^#define PG_CUVS_VERSION "\([^"]*\)".*/\1/p' src/cuv
 if [[ -z "$control_version" || -z "$make_version" || -z "$header_version" ]]; then
     fail "could not read all extension version declarations"
 else
-    [[ "$control_version" == "0.9.0" ]] || fail "pg_cuvs.control version is $control_version, expected 0.9.0"
     [[ "$make_version" == "$control_version" ]] || fail "Makefile EXTVERSION ($make_version) differs from control ($control_version)"
     [[ "$header_version" == "$control_version" ]] || fail "PG_CUVS_VERSION ($header_version) differs from control ($control_version)"
 fi
+
+# The version is declared once, in pg_cuvs.control. Every script that CREATE
+# EXTENSION and ALTER EXTENSION UPDATE can read must be installed by `make
+# install` (the DATA list), or an installed copy cannot reach that version.
+require_file "sql/pg_cuvs--${control_version}.sql"
+data_block="$(awk '/^DATA[[:space:]]*=/{f=1} f{print} f&&!/\\$/{exit}' Makefile)"
+for script in sql/pg_cuvs--*.sql; do
+    if ! grep -Eq "(^|[[:space:]=])${script//./\\.}([[:space:]\\]|$)" <<<"$data_block"; then
+        fail "Makefile DATA does not list $script"
+    fi
+done
 
 require_file "sql/pg_cuvs--0.4.0--0.5.0.sql"
 require_file "sql/pg_cuvs--0.8.0--0.8.1.sql"
@@ -58,8 +68,11 @@ require_text "docs/reference.md" '| `cuvs.filter_auto_threshold` | real | `0.0` 
 require_text "docs/reference.md" '| `cuvs.stream_bf_selectivity_threshold` | real | `0.004` |'
 require_text "docs/reference.md" 'not a portable crossover'
 require_text "ROADMAP.md" 'Current contract (2026-11-11, source `ae818ad0`)'
-require_text "ROADMAP.md" 'extension version `0.9.0`'
-require_text "docs/doc-map.md" 'sql/pg_cuvs--0.9.0.sql'
+require_text "ROADMAP.md" "extension version \`${control_version}\`"
+require_text "docs/doc-map.md" "sql/pg_cuvs--${control_version}.sql"
+require_text "README.md" "Current extension version: **${control_version}**"
+require_text "README.md" "WHERE extname = 'pg_cuvs'; -- ${control_version}"
+require_text "docs/playbooks/release-upgrade.md" "**${control_version}**이다."
 require_text "README.md" 'CREATE EXTENSION IF NOT EXISTS vector;'
 require_text "README.md" 'p50_latency_us, p95_latency_us, search_mode'
 reject_text "README.md" 'CREATE EXTENSION pgvector;'
@@ -80,7 +93,7 @@ require_text "README.md" 'bench/results/README.md'
 require_text "bench/results/README.md" '**known defect**'
 require_text "design/ops-gpu-playbook.md" '| 0 또는 생략 (기본) | GPU별 물리 VRAM의 90%를 budget으로 사용 |'
 reject_text "design/ops-gpu-playbook.md" '40000 (기본)'
-require_text "docs/playbooks/rollback-and-cleanup.md" '기대값은 `0.9.0`이다.'
+require_text "docs/playbooks/rollback-and-cleanup.md" "기대값은 \`${control_version}\`이다."
 
 reject_text "docs/playbooks/README.md" '0.1.0 설치/재설치'
 reject_text "docs/playbooks/release-upgrade.md" '현재 default_version은 **0.1.0**'
