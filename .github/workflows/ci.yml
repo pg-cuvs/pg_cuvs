@@ -36,6 +36,7 @@ jobs:
         run: make docs-contract-check
 
       - name: Unit tests (CPU-only, no PG/CUDA required)
+        timeout-minutes: 20
         run: make test-unit
 
 # ── Job 1b: Tier 1 — CPU-reference shim (full build + installcheck) ────────
@@ -251,6 +252,7 @@ jobs:
           make test-stale-interim || { cat "$stale_test_dir/daemon.log"; exit 1; }
 
       - name: K3 HNSW input digest (live backend, fake daemon)
+        timeout-minutes: 10
         env:
           PGDATABASE: postgres
           PGCUVS_SERVER_LOG: /var/log/postgresql/postgresql-16-main.log
