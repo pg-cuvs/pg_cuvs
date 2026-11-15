@@ -9,6 +9,7 @@ BUILD-BROKEN, not RED. Defect classes (task brief): field omission, unit
 error, stale value; plus counting, filtering and bound defects.
 """
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -22,12 +23,20 @@ BACKEND = 'src/pg_cuvs.c'
 IPC_C = 'src/cuvs_ipc.c'
 TEXT_C = 'src/cuvs_status_text.c'
 UP = 'sql/pg_cuvs--0.8.2--0.9.0.sql'
-INST = 'sql/pg_cuvs--0.9.0.sql'
+# Every install script check_i3e_sql.py compares with UP: pg_cuvs--0.9.0.sql and
+# the newest full install script in sql/.
+_VERSIONED = sorted((tuple(int(x) for x in m.groups()), m.group(0))
+                    for m in (re.fullmatch(r'pg_cuvs--(\d+)\.(\d+)\.(\d+)\.sql', n)
+                              for n in os.listdir(ROOT / 'sql')) if m)
+INSTALLS = ['sql/' + n for n in dict.fromkeys(
+    ['pg_cuvs--0.9.0.sql', _VERSIONED[-1][1]])]
 DOCS = 'docs/reference.md'
 
 
 def both(old, new):
-    return [(UP, old, new), (INST, old, new)]
+    """The same edit in the upgrade script and every install script, so the
+    blocks stay identical and only the rule under test can turn the scan RED."""
+    return [(UP, old, new)] + [(inst, old, new) for inst in INSTALLS]
 
 
 # name: ([(file, old, new), ...], tests expected to turn RED)

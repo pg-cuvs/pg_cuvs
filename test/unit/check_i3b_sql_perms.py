@@ -227,16 +227,30 @@ for fn, cols_macro, kinds_macro, lead in (
     check(len(names) == len(kinds), f"{kinds_macro} length {len(kinds)} != {len(names)} columns")
     check(got == want, f"{fn} RETURNS TABLE differs from header/kinds:\n  got  {got}\n  want {want}")
 
-# Coordination rule: the I3-B block is identical in the install and upgrade
-# scripts (upgrade_path compares the two catalogs).
+# Coordination rule: the I3-B block is identical in the upgrade script that
+# introduced it and in every install script from 0.9.0 on: pg_cuvs--0.9.0.sql
+# (frozen) and the newest one (upgrade_path compares the two catalogs).
 def _block(rel):
     t = read(rel)
     a, b = t.find("-- I3-B begin"), t.find("-- I3-B end")
     return t[a:b] if a >= 0 and b > a else None
-_inst = _block("sql/pg_cuvs--0.9.0.sql") \
-    if os.path.exists(os.path.join(ROOT, "sql/pg_cuvs--0.9.0.sql")) else None
-check(_inst is not None and _inst == _block("sql/pg_cuvs--0.8.2--0.9.0.sql"),
-      "I3-B block differs between pg_cuvs--0.9.0.sql and pg_cuvs--0.8.2--0.9.0.sql")
+
+
+def install_scripts():
+    """pg_cuvs--0.9.0.sql and the newest full install script in sql/."""
+    versions = []
+    for n in os.listdir(os.path.join(ROOT, "sql")):
+        vm = re.fullmatch(r"pg_cuvs--(\d+)\.(\d+)\.(\d+)\.sql", n)
+        if vm:
+            versions.append((tuple(int(x) for x in vm.groups()), "sql/" + n))
+    newest = max(versions)[1] if versions else "sql/pg_cuvs--0.9.0.sql"
+    return ["sql/pg_cuvs--0.9.0.sql"] + ([newest] if newest != "sql/pg_cuvs--0.9.0.sql" else [])
+
+
+for _rel in install_scripts():
+    _inst = _block(_rel) if os.path.exists(os.path.join(ROOT, _rel)) else None
+    check(_inst is not None and _inst == _block("sql/pg_cuvs--0.8.2--0.9.0.sql"),
+          f"I3-B block differs between {os.path.basename(_rel)} and pg_cuvs--0.8.2--0.9.0.sql")
 
 if FAILS:
     for f in FAILS:
