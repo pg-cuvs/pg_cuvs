@@ -22,4 +22,4 @@ Earlier contents of 0005 (digest `9a18eb49…`) did not center the upper levels.
 
 ## Verification
 
-`make test-hnsw-nn-sdk CUVS_UPSTREAM_GIT=<cuvs clone containing 60b19a0f>` prepares upstream+0001~0005 with `scripts/prepare-patched-cuvs-source.sh`, checks every manifest `final_sha256`, and runs the CPU source/fixture tests for this patch. CUDA compilation and GPU execution are separate.
+`make test-hnsw-nn-sdk CUVS_UPSTREAM_GIT=<cuvs clone containing 60b19a0f>` prepares upstream+0001~0007 with `scripts/prepare-patched-cuvs-source.sh`, checks every manifest `final_sha256`, and runs the CPU source/fixture tests for this patch. CUDA compilation and GPU execution are separate.
