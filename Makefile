@@ -280,7 +280,7 @@ install-server-test: server-test
 TEST_RT_LIB := $(shell [ "$$(uname -s)" = "Linux" ] && echo -lrt)
 test-unit: test-compact-retry test-device-norm test-failed-allocation test-build-oom-log test-peak-log-switch test/unit/test_cuvs_util.c src/cuvs_util.c src/cuvs_util.h src/cuvs_ipc.h \
            test/unit/test_build_corpus.c src/cuvs_build_corpus.c src/cuvs_build_corpus.h \
-           test-hnsw-build test-hnsw-build-ipc test-hnsw-ace-quality test-hnsw-admission test-admission-contract \
+           test-hnsw-build test-hnsw-build-ipc test-hnsw-owner-lease test-hnsw-ace-quality test-hnsw-admission test-admission-contract \
            test-hnsw-nn-policy test-hnsw-nn-route test-hnsw-nn-precision test-hnsw-nn-capacity test-hnsw-nn-sdk-params test-hnsw-nn-consumer test-hnsw-nn-upper-receipt \
            test-i3-logs test-notice-wire test-admission-wire test-admission-message test-admission-ipc test-build-oom-thread test-cache-policy test-circuit-source test-status-text test-i3b-source test-peak-meter test-lw-policy test-lw-guard test-i3e-sql test-self-replace-notice test-host-free-fence test-vacuum-policy
 	$(CC) -I src -DCUVS_TEST_HOOKS -o test-unit test/unit/test_cuvs_util.c src/cuvs_util.c $(TEST_RT_LIB)
@@ -318,6 +318,12 @@ test-build-oom-log:
 # backend or CUDA is needed. Keep separate targets for bounded worker checks.
 test-hnsw-build: test/unit/test_hnsw_build.c src/cuvs_hnsw_build_common.h
 	$(CC) -std=gnu11 -Wall -Wextra -I src -o $@ test/unit/test_hnsw_build.c
+	./$@
+
+test-hnsw-owner-lease: test/unit/test_hnsw_owner_lease.c src/cuvs_ipc.c \
+                       src/cuvs_util.c src/cuvs_build_corpus.c $(wildcard src/*.h)
+	$(CC) -std=gnu11 -Wall -Wextra -Werror -I src -o $@ test/unit/test_hnsw_owner_lease.c \
+		src/cuvs_ipc.c src/cuvs_util.c src/cuvs_build_corpus.c -lpthread -lm $(TEST_RT_LIB)
 	./$@
 
 test-hnsw-build-ipc: test/unit/test_hnsw_build_ipc.c src/cuvs_ipc.c \
@@ -588,7 +594,7 @@ test-hnsw-converter: test/unit/test_hnsw_converter.c src/hnsw_export.c \
 		$(HNSW_CONVERTER_UNIT_LINK) $(TEST_RT_LIB)
 	./$@
 
-EXTRA_CLEAN += test-hnsw-build test-hnsw-build-ipc test-hnsw-ace-quality test-hnsw-converter test-hnsw-admission test-hnsw-explicit-route test-hnsw-policy \
+EXTRA_CLEAN += test-hnsw-build test-hnsw-build-ipc test-hnsw-owner-lease test-hnsw-ace-quality test-hnsw-converter test-hnsw-admission test-hnsw-explicit-route test-hnsw-policy \
                test-admission-contract test-admission-contract-cxx test-admission-contract-util.o \
                test-admission-wire test-admission-message test-admission-ipc test-build-oom-thread test-hnsw-auto-overflow test-res-pool test-lw-policy test-lw-guard test-failed-allocation test-host-free-fence test-vacuum-policy
 .PHONY: test-hnsw-build test-hnsw-build-ipc test-hnsw-ace-quality test-hnsw-ace-quality-mutations test-hnsw-converter test-hnsw-admission test-hnsw-explicit-route test-hnsw-policy \
