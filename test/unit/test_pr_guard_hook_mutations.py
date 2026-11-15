@@ -15,7 +15,7 @@ HOOK = ROOT / ".claude" / "hooks" / "pr-guard.sh"
 TESTS = ROOT / "test" / "unit" / "test_pr_guard_hook.py"
 
 FIND_PR = "if not opens_pr(cmd):"
-# The pattern before the review: `gh` only at the start or after ; & | ( or a space.
+# The first pattern this hook had: `gh` only at the start or after ; & | ( or a space.
 OLD_FIND_PR = r'if not re.search(r"(^|[;&|(\s])gh\s+pr\s+(create|ready)\b", cmd):'
 UNRESOLVED = '    print(cwd)\n    print("@self")'
 
