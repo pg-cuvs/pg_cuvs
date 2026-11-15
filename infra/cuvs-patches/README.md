@@ -1,6 +1,6 @@
 # Reproducible cuVS 26.04 HNSW/ACE SDK
 
-This patch set builds the cuVS disk HNSW hierarchy copy fix, runtime identity markers, and ACE/HNSW allocation guards from one pinned upstream source tree. The recipe applies patches in order, verifies exact source states and hashes, builds a shared cuVS SDK in an isolated prefix, then builds and runs both native GPU pilots.
+This patch set builds the cuVS disk HNSW hierarchy copy fix, runtime identity markers, ACE/HNSW allocation guards, and the CAGRA kNN-graph consumer row order from one pinned upstream source tree. The recipe applies patches in order, verifies exact source states and hashes, builds a shared cuVS SDK in an isolated prefix, then builds and runs both native GPU pilots.
 
 ## Upstream and patch provenance
 
@@ -13,7 +13,8 @@ The upstream is [`rapidsai/cuvs`](https://github.com/rapidsai/cuvs), tag `v26.04
 | `0003-hnsw-memory-guards.patch` | `34831f221f32337c025afeb33a32d7aa304e703bd0e3ee85f0ff93902a9a130f` | Propagates ACE metric parameters and checks allocation peaks across ACE sub-builders and disk serialization; exports the memory-guard runtime marker. |
 | `0004-hnsw-upper-precision.patch` | `8777280bc918cc26e8bca0bbf38021e1e901ccda8510e543738b9a53ff631fdd` | Applies the product norm policy to upper IVF-PQ and restores typed memory gather sources; exports the upper-precision marker. |
 | `0005-hnsw-resident-nn-upper.patch` | `9fdaa065195e5234097c1083ffd5b984bb9ff79b10991bc4626649a9cd58b86b` | Lets a resident `build_algo=nn_descent` hierarchy pass its host/GPU budgets and base NN dtype to upper levels, keeps the legacy six-argument `all_neighbors_graph` forwarders, centers each upper level's L2 NN-descent input, and exports the resident-NN-upper marker. See `0005-hnsw-resident-nn-upper.md`. |
-| `0006-cagra-consumer-row-sort.patch` | `3acd107a74bd0fc29ee72e2e206558f86d4bc374e506775af60496b87ae48fa4` | Graph consumer row sort: sorts the no-refine CAGRA IVF kNN result rows (score, ID) before the writer/prune consume positions as ranks, with row-chunked CUB temp allocation. See `0006-cagra-consumer-row-sort.md`. |
+| `0006-cagra-consumer-row-sort.patch` | `3acd107a74bd0fc29ee72e2e206558f86d4bc374e506775af60496b87ae48fa4` | B3 graph consumer: sorts the no-refine CAGRA IVF kNN result rows (score, ID) before the writer/prune consume positions as ranks, with row-chunked CUB temp allocation. See `0006-cagra-consumer-row-sort.md`. |
+| `0007-cagra-prune-rank-index.patch` | `dae5a4fa072bbfeb3676d4d83677913bd922445aca41026815b0028d2685fe6d` | CAGRA prune: replaces the rank scan of `kern_prune` by a binary search on a sorted (ID, rank) shared-memory index at row degree 256 with 32-bit IDs; same output, device trap guard, shared row helpers. Checked on a CPU and on an A100. See `0007-cagra-prune-rank-index.md`. |
 
 Patches 0001 and 0002 alone do not advertise memory-guard support. Only a library built with 0003 exports `pgcuvs_hnsw_memory_guard_patch_id()` with value `pgcuvs-hnsw-memory-guard-v2@60b19a0f62ba0bd716de349382828e43be6e2daa`. Patch 0002 independently exports `pgcuvs_hnsw_disk_copy_patch_id()` with value `pgcuvs-hnsw-disk-copy-v1@60b19a0f62ba0bd716de349382828e43be6e2daa`.
 
@@ -21,7 +22,7 @@ Only a library built with 0005 exports `pgcuvs_hnsw_resident_nn_upper_patch_id()
 
 RAFT dependency patch `raft/0001-raft-select-k-key-bitwidth.patch` (SHA-256 `a2d153ccc4a6b3d61bf4c9bbadf6c98f8e104a85352312d2588b90899c58058c`) makes RAFT `select_k` radix sorts use the key bit width (`sizeof(KeyT) * 8`) instead of the value's. rapids-cmake/CPM prefers an installed RAFT package over a download. When the dependency prefixes contain one (`lib/cmake/raft` and the header), `prepare-raft-prefix.sh` copies it to `<build>/pgcuvs-raft-prefix`. It patches `include/raft/matrix/detail/select_k-inl.cuh` there from `3d6959c06710d420ceaf9236793a0eb91b2b587ba879a5c59ee79c76ee23abec` to `64a54cbaf855b2c3a333ad380ad85ceac41d222b6a557af6c1f490dacf5cf908`, configures with `-Draft_DIR` pinned to that copy, and checks after configure that the cache used it. This is how the measured SDK was built, and the shared environment is never edited. Without an installed package, the recipe patches the CPM-downloaded RAFT source after configure with the same pins. Any other header stops the build.
 
-The hashes below bind the clean source and the complete ordered patch set. `hnsw.hpp` includes 0001, 0003, 0004, and 0005. The historical composition receipt in the manifest covers only the first three patches.
+The hashes below bind the clean source and the complete ordered patch set. `hnsw.hpp` includes 0001, 0003, 0004, and 0005; `cagra_build.cuh` includes 0003 and 0006, and `graph_core.cuh` is changed only by 0007. 0005 and 0007 change disjoint files, as do 0005 and 0006. Patches 0006 and 0007 export no runtime marker, so their identity is bound by the patch hash and these source hashes. The historical composition receipt in the manifest covers only the first three patches.
 
 | Source path | Clean base SHA-256 | Complete patch-set SHA-256 |
 | --- | --- | --- |
@@ -33,6 +34,7 @@ The hashes below bind the clean source and the complete ordered patch set. `hnsw
 | `cpp/src/neighbors/detail/cagra/ace_memory_guard.hpp` | absent | `dc2ccb2d6920bf81d55e614181e3ceff8e7e0394eae56d0506fbb302190cf555` |
 | `cpp/src/neighbors/detail/hnsw_precision.hpp` | absent | `1ad79816c9057c7289213799e3c5ed71d53c4299e85bdad4bfd58dd7ccf37072` (through 0004: `c051c5bfe6c5b1031c61806ab7d0a8804741724011b41b33bb63eac9cb72dc69`) |
 | `cpp/src/neighbors/detail/cuvs_hnsw_nn_upper_contract.h` | absent | `6db8ffea2fb73695ab107e95135e37d04599c03013cdcc6a3bbe614382758e42` |
+| `cpp/src/neighbors/detail/cagra/graph_core.cuh` | `c77ad7878831d73a9dd637bb1e35b6450a6e4588312149b48580816b08cbb0d9` | `8b2fb100d45f7168bb20a343a3fccb368a2b476da6a52ba1e505eac2a2f77baa` |
 
 ## Build environment
 
@@ -58,7 +60,7 @@ infra/cuvs-patches/build-patched-cuvs.sh \
 
 To choose a CUDA host compiler explicitly, export `CUDAHOSTCXX=/absolute/path/to/g++` before running the recipe. For a reused cache this is an identity check against the cached CUDA host; for a cold build it selects the host compiler used for both SDK and pilot configuration.
 
-The install prefix must be empty, outside the active Conda environment, and separate from the source and build trees. The recipe never installs into Conda. It accepts only these source states: clean base, 0001 applied, 0001+0002 applied, 0001+0002+0003 applied, all four, all five, or all six applied. After each patch it checks exact source-file hashes and allowed Git paths. It rejects partial 0003~0006 application and unrelated staged, unstaged, untracked, or ignored source changes. The root license hash and the `BUILD_CAGRA_HNSWLIB=ON` setting are checked before the build is accepted.
+The install prefix must be empty, outside the active Conda environment, and separate from the source and build trees. The recipe never installs into Conda. It accepts only these source states: clean base, 0001 applied, 0001+0002 applied, 0001+0002+0003 applied, or 0001 through 0004, 0005, 0006, or 0007 applied in order. After each patch it checks exact source-file hashes and allowed Git paths. It rejects partial 0003~0007 application and unrelated staged, unstaged, untracked, or ignored source changes. The root license hash and the `BUILD_CAGRA_HNSWLIB=ON` setting are checked before the build is accepted.
 
 An existing build cache is reusable only when it has the pinned cuVS source, Ninja generator, same C/C++/CUDA compilers, a valid cached `CMAKE_CUDA_HOST_COMPILER`, CUDA architecture, CCCL 3.3.0, and supported build options. The CUDA host compiler is preserved independently from CXX. If `CUDAHOSTCXX` is set for a reused cache, its canonical executable path must match the cached CUDA host; if unset, the cached host is used without inferring it from CXX. A reused cache without a CUDA host compiler is rejected. A cold build uses `CUDAHOSTCXX` when set and otherwise declares CXX as its CUDA host compiler. The chosen host is passed to the SDK and both pilots; after configure/build, each SDK/pilot CMake cache is checked for the same canonical host path. The recipe records CXX and CUDA host separately in stdout and `sdk-provenance.txt`.
 
@@ -119,3 +121,13 @@ python3 test/native/hnsw-sdk/test_upper_level_precision.py \
 ```
 
 These CPU tests execute the actual dispatch body, norm helper and memory guard with GPU builders replaced by argument spies. They check all three selected dtypes, metric distinctions, threshold equality, late unsafe rows, non-finite norms, and that the NN branch never scans its input. Copy mutants use the actual source expressions and actual hnswlib getter type. GPU quality/performance and allocation peaks are separate checks.
+
+## CAGRA consumer row order (0006)
+
+With refinement disabled (`top_k == gpu_top_k`), the CAGRA kNN-graph builder takes the public IVF-PQ search output as it is and later treats each position in a row as the neighbor's rank. That select does not sort its output, and its returned order differs between the warp-select path (K up to 256) and the radix path (K above 256), so a build with intermediate degree 256 (K = 257) consumed unordered rows as ranked ones. Patch 0006 sorts each row's `(float score, int64 id)` pairs with `cub::DeviceSegmentedRadixSort` into the existing refined-output buffers and makes the async host copy read them. The public IVF-PQ parameters and the existing I/O and large-memory policies are unchanged; scratch comes from the normal workspace only, and a workspace that cannot hold one row raises an explicit RMM error with no retry.
+
+Because `cagra_build.cuh` changes, the planner source verifier (`scripts/verify-hnsw-sdk-plan.py`) accepts either the post-0003 planner file (`patch3_sha256`) or the post-0006 file together with the pinned `ace_memory_guard.hpp` and `consumer_row_sort_plan.hpp`. See [0006 evidence](0006-cagra-consumer-row-sort.md). The CPU test of the 0004 section above also checks that the patch, source, recipe and README hashes agree for the complete state.
+
+## CAGRA prune rank index (0007)
+
+Patch 0007 replaces the O(row degree) rank scan inside `kern_prune` by a binary search on a sorted (ID, rank) key array in shared memory when the graph degree is 256 and the IDs are 32-bit, with a device trap if the kernel is ever launched for another degree. All other degrees and ID types keep the original kernel. It changes only `graph_core.cuh`, which no other patch touches, so it composes with the others in any order; the recipe applies it after 0006. See [0007 evidence](0007-cagra-prune-rank-index.md) for the CPU and GPU checks.

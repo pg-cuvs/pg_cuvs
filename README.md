@@ -226,7 +226,7 @@ inputs, not a tested minimum-version matrix for every GPU and driver.
 - The HNSW exporter depends on pgvector's HNSW page format and opclass support
   functions. Validate upgrades against the [HNSW build contract](docs/hnsw-build-options.md).
 - HNSW/ACE paths that require SDK patches use the separately pinned
-  [patched cuVS recipe](infra/cuvs-patches/README.md), including patches 0001–0004.
+  [patched cuVS recipe](infra/cuvs-patches/README.md), including patches 0001–0004, 0006 and 0007.
   That recipe requires CMake 3.30.4+, Ninja, and nvcc 12.9 or 13.1 with matching
   RAPIDS dependencies. The CUDA 12.4 development bootstrap does not install that
   patched SDK. Follow the recipe's `CUVS_SDK_SOURCE_INCLUDE` and link settings.

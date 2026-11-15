@@ -1,0 +1,277 @@
+diff --git a/cpp/src/neighbors/detail/cagra/graph_core.cuh b/cpp/src/neighbors/detail/cagra/graph_core.cuh
+--- a/cpp/src/neighbors/detail/cagra/graph_core.cuh
++++ b/cpp/src/neighbors/detail/cagra/graph_core.cuh
+@@ -32,6 +32,7 @@
+ #include <iostream>
+ #include <memory>
+ #include <random>
++#include <type_traits>
+ 
+ namespace cuvs::neighbors::cagra::detail::graph {
+ 
+@@ -165,6 +166,62 @@ __global__ void kern_sort(const DATA_T* const dataset,  // [dataset_chunk_size,
+   }
+ }
+ 
++// kern_prune and kern_prune_rank_index share the row setup (prune_init_row) and the row epilogue
++// (prune_finish_row). They differ only in how a detour A->D->B is attributed to the edge A->B.
++
++// Zero the detour counters of row iA, giving self edges the lowest priority. When rank_index is not
++// nullptr, also fill rank_index[k] = (ID of edge k << 32) | k for kern_prune_rank_index.
++// knn_graph is [graph_size, graph_degree].
++template <class IdxT>
++__device__ __forceinline__ void prune_init_row(const IdxT* const knn_graph,
++                                               const uint32_t graph_degree,
++                                               const uint64_t iA,
++                                               uint32_t* const smem_num_detour,
++                                               uint64_t* const rank_index)
++{
++  for (uint32_t k = threadIdx.x; k < graph_degree; k += blockDim.x) {
++    smem_num_detour[k] = 0;
++    const auto id      = knn_graph[k + ((uint64_t)graph_degree * iA)];
++    if (id == iA) {
++      // Lower the priority of self-edge
++      smem_num_detour[k] = graph_degree;
++    }
++    if (rank_index != nullptr) { rank_index[k] = (static_cast<uint64_t>(id) << 32) | k; }
++  }
++}
++
++// Write the detour counts of row iA and update the statistics. Needs all 32 lanes of a warp.
++// detour_count is [graph_chunk_size, graph_degree], num_no_detour_edges is [graph_size].
++__device__ __forceinline__ void prune_finish_row(const uint32_t* const smem_num_detour,
++                                                 const uint32_t graph_degree,
++                                                 const uint32_t degree,
++                                                 const uint64_t iA,
++                                                 uint8_t* const detour_count,
++                                                 uint32_t* const num_no_detour_edges,
++                                                 uint64_t* const stats)
++{
++  uint64_t* const num_retain = stats;
++  uint64_t* const num_full   = stats + 1;
++
++  uint32_t num_edges_no_detour = 0;
++  for (uint32_t k = threadIdx.x; k < graph_degree; k += blockDim.x) {
++    detour_count[k + (graph_degree * iA)] = min(smem_num_detour[k], (uint32_t)255);
++    if (smem_num_detour[k] == 0) { num_edges_no_detour++; }
++  }
++  num_edges_no_detour += __shfl_xor_sync(0xffffffff, num_edges_no_detour, 1);
++  num_edges_no_detour += __shfl_xor_sync(0xffffffff, num_edges_no_detour, 2);
++  num_edges_no_detour += __shfl_xor_sync(0xffffffff, num_edges_no_detour, 4);
++  num_edges_no_detour += __shfl_xor_sync(0xffffffff, num_edges_no_detour, 8);
++  num_edges_no_detour += __shfl_xor_sync(0xffffffff, num_edges_no_detour, 16);
++  num_edges_no_detour = min(num_edges_no_detour, degree);
++
++  if (threadIdx.x == 0) {
++    num_no_detour_edges[iA] = num_edges_no_detour;
++    atomicAdd((unsigned long long int*)num_retain, (unsigned long long int)num_edges_no_detour);
++    if (num_edges_no_detour >= degree) { atomicAdd((unsigned long long int*)num_full, 1); }
++  }
++}
++
+ template <int MAX_DEGREE, class IdxT>
+ __global__ void kern_prune(const IdxT* const knn_graph,  // [graph_chunk_size, graph_degree]
+                            const uint32_t graph_size,
+@@ -177,18 +234,10 @@ __global__ void kern_prune(const IdxT* const knn_graph,  // [graph_chunk_size, g
+                            uint64_t* const stats)
+ {
+   __shared__ uint32_t smem_num_detour[MAX_DEGREE];
+-  uint64_t* const num_retain = stats;
+-  uint64_t* const num_full   = stats + 1;
+ 
+   const uint64_t iA = blockIdx.x + (batch_size * batch_id);
+   if (iA >= graph_size) { return; }
+-  for (uint32_t k = threadIdx.x; k < graph_degree; k += blockDim.x) {
+-    smem_num_detour[k] = 0;
+-    if (knn_graph[k + ((uint64_t)graph_degree * iA)] == iA) {
+-      // Lower the priority of self-edge
+-      smem_num_detour[k] = graph_degree;
+-    }
+-  }
++  prune_init_row(knn_graph, graph_degree, iA, smem_num_detour, static_cast<uint64_t*>(nullptr));
+   __syncthreads();
+ 
+   // count number of detours (A->D->B)
+@@ -211,23 +260,138 @@ __global__ void kern_prune(const IdxT* const knn_graph,  // [graph_chunk_size, g
+     __syncthreads();
+   }
+ 
+-  uint32_t num_edges_no_detour = 0;
+-  for (uint32_t k = threadIdx.x; k < graph_degree; k += blockDim.x) {
+-    detour_count[k + (graph_degree * iA)] = min(smem_num_detour[k], (uint32_t)255);
+-    if (smem_num_detour[k] == 0) { num_edges_no_detour++; }
++  prune_finish_row(
++    smem_num_detour, graph_degree, degree, iA, detour_count, num_no_detour_edges, stats);
++}
++
++// Same result as kern_prune. kern_prune finds the first edge A->B' after kAD with B' == B by
++// scanning A's row for every (kAD, kDB) pair. Here the row is sorted once into rank_index, the keys
++// (ID << 32) | rank of its edges, and the first rank > kAD with that ID is a lower_bound on
++// (B << 32) | (kAD + 1). Only this auxiliary index is sorted; knn_graph is read-only.
++//
++// Supported launches (anything else is a bug in the caller, never a silent wrong result):
++//  - graph_degree == DEGREE: the shared arrays are sized by DEGREE, and the kernel traps otherwise.
++//    DEGREE is a power of two in [2, 1024] (bitonic network; 1024 is kern_prune's MAX_DEGREE).
++//  - IdxT == uint32_t: an ID must fit the 32 high bits of a key.
++//  - 32 threads per block: the row epilogue is a full-warp reduction, as in kern_prune.
++template <uint32_t DEGREE, class IdxT>
++__global__ void kern_prune_rank_index(
++  const IdxT* const knn_graph,  // [graph_chunk_size, graph_degree]
++  const uint32_t graph_size,
++  const uint32_t graph_degree,
++  const uint32_t degree,
++  const uint32_t batch_size,
++  const uint32_t batch_id,
++  uint8_t* const detour_count,          // [graph_chunk_size, graph_degree]
++  uint32_t* const num_no_detour_edges,  // [graph_size]
++  uint64_t* const stats)
++{
++  static_assert(std::is_same_v<IdxT, uint32_t>, "rank index keys pack a 32-bit ID");
++  static_assert(DEGREE >= 2 && DEGREE <= 1024 && (DEGREE & (DEGREE - 1)) == 0,
++                "the bitonic network needs a power-of-two DEGREE up to kern_prune's MAX_DEGREE");
++  if (graph_degree != DEGREE) { __trap(); }
++
++  __shared__ uint32_t smem_num_detour[DEGREE];
++  __shared__ uint64_t rank_index[DEGREE];
++
++  const uint64_t iA = blockIdx.x + (batch_size * batch_id);
++  if (iA >= graph_size) { return; }
++  prune_init_row(knn_graph, graph_degree, iA, smem_num_detour, rank_index);
++  __syncthreads();
++
++  // Bitonic sort of the unique keys (ID high 32 bits, original rank low 32 bits).
++  // No floating-point or tie handling: the order is total.
++  for (uint32_t width = 2; width <= DEGREE; width <<= 1) {
++    for (uint32_t stride = width >> 1; stride != 0; stride >>= 1) {
++      for (uint32_t i = threadIdx.x; i < DEGREE; i += blockDim.x) {
++        const uint32_t partner = i ^ stride;
++        if (partner > i) {
++          const uint64_t left = rank_index[i], right = rank_index[partner];
++          const bool ascending = (i & width) == 0;
++          if ((left > right) == ascending) {
++            rank_index[i]       = right;
++            rank_index[partner] = left;
++          }
++        }
++      }
++      __syncthreads();
++    }
+   }
+-  num_edges_no_detour += __shfl_xor_sync(0xffffffff, num_edges_no_detour, 1);
+-  num_edges_no_detour += __shfl_xor_sync(0xffffffff, num_edges_no_detour, 2);
+-  num_edges_no_detour += __shfl_xor_sync(0xffffffff, num_edges_no_detour, 4);
+-  num_edges_no_detour += __shfl_xor_sync(0xffffffff, num_edges_no_detour, 8);
+-  num_edges_no_detour += __shfl_xor_sync(0xffffffff, num_edges_no_detour, 16);
+-  num_edges_no_detour = min(num_edges_no_detour, degree);
+ 
+-  if (threadIdx.x == 0) {
+-    num_no_detour_edges[iA] = num_edges_no_detour;
+-    atomicAdd((unsigned long long int*)num_retain, (unsigned long long int)num_edges_no_detour);
+-    if (num_edges_no_detour >= degree) { atomicAdd((unsigned long long int*)num_full, 1); }
++  // count number of detours (A->D->B)
++  for (uint32_t kAD = 0; kAD < graph_degree - 1; kAD++) {
++    const uint64_t iD = knn_graph[kAD + (graph_degree * iA)];
++    if (iD >= graph_size) { continue; }
++    for (uint32_t kDB = threadIdx.x; kDB < graph_degree; kDB += blockDim.x) {
++      const uint64_t iB_candidate = knn_graph[kDB + ((uint64_t)graph_degree * iD)];
++      // kern_prune's rule: the first rank kAB > kAD in A's row with ID iB_candidate. Candidate IDs
++      // are not filtered, so duplicate and out-of-range IDs match exactly as in kern_prune.
++      const uint64_t key = (iB_candidate << 32) | static_cast<uint64_t>(kAD + 1);
++      uint32_t lo = 0, hi = DEGREE;
++      while (lo < hi) {
++        const uint32_t mid = lo + (hi - lo) / 2;
++        if (rank_index[mid] < key) {
++          lo = mid + 1;
++        } else {
++          hi = mid;
++        }
++      }
++      if (lo < DEGREE && (rank_index[lo] >> 32) == iB_candidate) {
++        const uint32_t kAB = static_cast<uint32_t>(rank_index[lo]);
++        atomicAdd(smem_num_detour + kAB, 1);
++      }
++    }
++    __syncthreads();
++  }
++
++  prune_finish_row(
++    smem_num_detour, graph_degree, degree, iA, detour_count, num_no_detour_edges, stats);
++}
++
++// Row degree at which kern_prune_rank_index replaces kern_prune (uint32_t IDs only). This is the
++// only degree it was tested and measured at; enable another power of two together with its own
++// CPU and GPU checks. kern_prune serves every other degree and ID type.
++constexpr uint32_t kPruneRankIndexDegree = 256;
++
++// Chooses the pruning kernel. The choice affects speed only: both kernels write identical output.
++template <int MAX_DEGREE, class IdxT>
++void launch_kern_prune(cudaStream_t stream,
++                       dim3 blocks,
++                       dim3 threads,
++                       const IdxT* const knn_graph,  // [graph_chunk_size, graph_degree]
++                       const uint32_t graph_size,
++                       const uint32_t graph_degree,
++                       const uint32_t degree,
++                       const uint32_t batch_size,
++                       const uint32_t batch_id,
++                       uint8_t* const detour_count,          // [graph_chunk_size, graph_degree]
++                       uint32_t* const num_no_detour_edges,  // [graph_size]
++                       uint64_t* const stats)
++{
++  if constexpr (std::is_same_v<IdxT, uint32_t>) {
++    if (graph_degree == kPruneRankIndexDegree) {
++      kern_prune_rank_index<kPruneRankIndexDegree, IdxT><<<blocks, threads, 0, stream>>>(
++        knn_graph,
++        graph_size,
++        graph_degree,
++        degree,
++        batch_size,
++        batch_id,
++        detour_count,
++        num_no_detour_edges,
++        stats);
++      return;
++    }
+   }
++  kern_prune<MAX_DEGREE, IdxT><<<blocks, threads, 0, stream>>>(knn_graph,
++                                                                 graph_size,
++                                                                 graph_degree,
++                                                                 degree,
++                                                                 batch_size,
++                                                                 batch_id,
++                                                                 detour_count,
++                                                                 num_no_detour_edges,
++                                                                 stats);
+ }
+ 
+ template <class IdxT>
+@@ -1280,17 +1444,18 @@ void optimize(
+       raft::matrix::fill(res, dev_stats.view(), uint64_t(0));
+ 
+       for (uint32_t i_batch = 0; i_batch < num_batch; i_batch++) {
+-        kern_prune<MAX_DEGREE, IdxT>
+-          <<<blocks_prune, threads_prune, 0, raft::resource::get_cuda_stream(res)>>>(
+-            d_input_graph.data_handle(),
+-            graph_size,
+-            knn_graph_degree,
+-            output_graph_degree,
+-            batch_size,
+-            i_batch,
+-            d_detour_count.data_handle(),
+-            d_num_no_detour_edges.data_handle(),
+-            dev_stats.data_handle());
++        launch_kern_prune<MAX_DEGREE, IdxT>(raft::resource::get_cuda_stream(res),
++                                            blocks_prune,
++                                            threads_prune,
++                                            d_input_graph.data_handle(),
++                                            graph_size,
++                                            knn_graph_degree,
++                                            output_graph_degree,
++                                            batch_size,
++                                            i_batch,
++                                            d_detour_count.data_handle(),
++                                            d_num_no_detour_edges.data_handle(),
++                                            dev_stats.data_handle());
+         raft::resource::sync_stream(res);
+         RAFT_LOG_DEBUG(
+           "# Pruning kNN Graph on GPUs (%.1lf %%)\r",
