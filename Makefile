@@ -94,16 +94,29 @@ CUVS_INCLUDE  ?= $(CUVS_PREFIX)/include
 # cuVS 25.x+ ships bundled libcudacxx under include/rapids/
 CUVS_RAPIDS_INCLUDE ?= $(CUVS_PREFIX)/include/rapids
 CUVS_LIB      ?= $(CUVS_PREFIX)/lib
-# Optional matching patched SDK cpp/src root. Required for authoritative ACE
-# partition receipts; absent/mismatched support fails before an ACE build.
+# Optional matching patched SDK cpp/src root. With it the ACE partition receipt
+# records the effective count (computed twice, build refused if unstable); without
+# it an ACE build hands the requested count to the SDK and the receipt records it
+# as requested, effective count not guaranteed. The patched libcuvs.so is
+# required either way.
 CUVS_SDK_SOURCE_INCLUDE ?=
+# Reset, and kept out of the environment (this Makefile has a bare `export` further down): a make
+# started from a recipe would otherwise inherit the note and print it for a set variable, and nvcc
+# would get it in its environment.
+CUVS_SDK_PLAN_NOTE =
+unexport CUVS_SDK_PLAN_NOTE
 ifneq ($(strip $(CUVS_SDK_SOURCE_INCLUDE)),)
 # The planner header pulls patched SDK sources (cagra_build.cuh, which patch 0006
 # makes call raft::linalg::map_offset) into cuvs_wrapper.cu. Those RAFT kernels call
 # constexpr host functions from device code, which nvcc rejects unless
 # --expt-relaxed-constexpr is set, as the SDK's own build does.
 CUVS_SDK_PLAN_FLAGS = -I$(CUVS_SDK_SOURCE_INCLUDE) -Xcompiler=-fopenmp --expt-relaxed-constexpr
-CUVS_SDK_PLAN_LINK = -fopenmp -lrapids_logger
+CUVS_SDK_PLAN_LINK = -fopenmp
+else
+# One line when the GPU wrapper is compiled without the planner source. It is part of the
+# src/cuvs_wrapper.o recipe, so CPU shim builds (which never build that object) and the
+# CPU-only CI jobs print nothing.
+CUVS_SDK_PLAN_NOTE = @echo "pg_cuvs: CUVS_SDK_SOURCE_INCLUDE is not set: the ACE effective partition count guarantee is OFF; the HNSW receipt will record the requested count (set CUVS_SDK_SOURCE_INCLUDE to the patched SDK cpp/src to turn it on)"
 endif
 
 # ---- CI Tier 1: CPU-reference shim (no CUDA/cuVS) -------------------------
@@ -115,16 +128,24 @@ ifdef PGCUVS_CPU_SHIM
 WRAPPER_OBJ      = src/cuvs_wrapper_shim_cpu.o
 CUVS_SO_LINK     = -lm
 CUVS_SERVER_LINK = -lm
+CUVS_LOGGER_LINK =
 else
 WRAPPER_OBJ      = src/cuvs_wrapper.o
 CUVS_SO_LINK     = -L$(CUVS_LIB) -lcuvs -lcudart -Wl,-rpath,$(CUVS_LIB)
 CUVS_SERVER_LINK = -L$(CUVS_LIB) -lcuvs -lrmm -lcudart -Wl,-rpath,$(CUVS_LIB)
+# The wrapper expands RMM_LOG_* (rmm/mr/pool_memory_resource.hpp), which call
+# rapids_logger::logger::log, defined in librapids_logger.so. libcuvs.so and
+# librmm.so need it only indirectly, and `ld` does not take symbols from a
+# library's own dependencies, so the link fails with "DSO missing from command
+# line" unless it is named here, with or without CUVS_SDK_SOURCE_INCLUDE. A
+# separate variable, so a hand-written CUVS_SO_LINK / CUVS_SERVER_LINK keeps it.
+CUVS_LOGGER_LINK = -lrapids_logger
 endif
 
 PG_CPPFLAGS    = -I$(CUVS_INCLUDE) -I$(CUVS_RAPIDS_INCLUDE) -I./src
 # -Wl,-rpath embeds the cuVS lib path so postmaster finds libcuvs.so
 # without LD_LIBRARY_PATH being set (ADR-007).
-SHLIB_LINK     = $(CUVS_SO_LINK) $(CUVS_SDK_PLAN_LINK) \
+SHLIB_LINK     = $(CUVS_SO_LINK) $(CUVS_LOGGER_LINK) $(CUVS_SDK_PLAN_LINK) \
                  -Wl,-Bstatic -lstdc++ -Wl,-Bdynamic -lrt
 
 PG_CONFIG     ?= pg_config
@@ -150,6 +171,7 @@ endif
 src/cuvs_wrapper.o: src/cuvs_wrapper.cu src/cuvs_wrapper.h src/cuvs_hnsw_sdk_plan.cuh \
                     src/cuvs_hnsw_nn_sdk_params.cuh src/cuvs_hnsw_nn_precision.h src/cuvs_hnsw_nn_capacity.h src/cuvs_hnsw_nn_upper_contract.h src/cuvs_hnsw_nn_center.h \
                     src/cuvs_failed_allocation.hpp src/cuvs_rmm_failure_resource.hpp
+	$(CUVS_SDK_PLAN_NOTE)
 	$(NVCC) $(NVCC_FLAGS) $(CUVS_SDK_PLAN_FLAGS) -I$(CUVS_INCLUDE) -I$(CUVS_RAPIDS_INCLUDE) -I./src -c $< -o $@
 
 # PGXS generates LLVM bitcode (.bc) from .c sources for JIT. The .cu file
@@ -177,7 +199,7 @@ SERVER_CFLAGS += $(EXTRA_SERVER_CFLAGS)
 ifdef PGCUVS_CPU_SHIM
 SERVER_CFLAGS += -DPGCUVS_CPU_SHIM
 endif
-SERVER_LDFLAGS = $(CUVS_SERVER_LINK) $(CUVS_SDK_PLAN_LINK) -lstdc++ \
+SERVER_LDFLAGS = $(CUVS_SERVER_LINK) $(CUVS_LOGGER_LINK) $(CUVS_SDK_PLAN_LINK) -lstdc++ \
                  -lpthread -lrt \
                  -lcurl -lssl -lcrypto
 SERVER_LDFLAGS += $(EXTRA_SERVER_LDFLAGS)
@@ -291,7 +313,7 @@ TEST_RT_LIB := $(shell [ "$$(uname -s)" = "Linux" ] && echo -lrt)
 test-unit: test-compact-retry test-device-norm test-failed-allocation test-build-oom-log test-peak-log-switch test/unit/test_cuvs_util.c src/cuvs_util.c src/cuvs_util.h src/cuvs_ipc.h \
            test/unit/test_build_corpus.c src/cuvs_build_corpus.c src/cuvs_build_corpus.h \
            test-hnsw-build test-hnsw-build-ipc test-hnsw-owner-lease test-hnsw-ace-quality test-hnsw-admission test-admission-contract \
-           test-hnsw-nn-policy test-hnsw-nn-route test-hnsw-nn-precision test-hnsw-nn-capacity test-hnsw-nn-sdk-params test-hnsw-nn-consumer test-hnsw-nn-upper-receipt test-hnsw-nn-center test-hnsw-nn-mutations \
+           test-hnsw-nn-policy test-hnsw-nn-route test-hnsw-nn-precision test-hnsw-nn-capacity test-hnsw-nn-sdk-params test-hnsw-nn-consumer test-hnsw-nn-upper-receipt test-hnsw-nn-center test-hnsw-nn-mutations test-hnsw-ace-origin-json test-hnsw-ace-planner-branch test-hnsw-sdk-plan-gate test-hnsw-gpu-link-lines \
            test-i3-logs test-notice-wire test-admission-wire test-admission-message test-admission-ipc test-build-oom-thread test-cache-policy test-circuit-source test-status-text test-i3b-source test-peak-meter test-lw-policy test-lw-guard test-i3e-sql test-self-replace-notice test-host-free-fence test-vacuum-policy test-hnsw-digest
 	$(CC) -I src -DCUVS_TEST_HOOKS -o test-unit test/unit/test_cuvs_util.c src/cuvs_util.c $(TEST_RT_LIB)
 	./test-unit
@@ -306,7 +328,7 @@ test-circuit-source: test/unit/check_circuit_source.py src/pg_cuvs.c
 .PHONY: test-unit test-circuit-source
 
 # Source structure checks of the HNSW build routes, run by the CPU job of
-# .github/workflows/ci.yml. The two check_* scripts read src/ as text, enforce
+# .github/workflows/ci.yml. The three check_* scripts read src/ as text, enforce
 # the invariants the approved route design relies on, and replay planted
 # defects against their own rules. The two test_* scripts compile copies of the
 # real headers with one planted defect each and need the unit test to fail.
@@ -315,13 +337,14 @@ test-circuit-source: test/unit/check_circuit_source.py src/pg_cuvs.c
 # mutation scripts also run the unmutated build themselves before the first
 # mutant and fail with BASELINE_NOT_GREEN if it does not pass. Each script
 # writes a report into a directory that must not exist yet, so they get a fresh
-# temporary one. All four run even if one fails. Python 3 stdlib and cc only:
+# temporary one. All five run even if one fails. Python 3 stdlib and cc only:
 # no git history, PostgreSQL, CUDA or daemon.
 .PHONY: test-source-checks
 test-source-checks: test-hnsw-auto-overflow test-hnsw-explicit-route
 	set -e; out=$$(mktemp -d "$${TMPDIR:-/tmp}/pgcuvs-source-checks.XXXXXX"); \
 	trap 'rm -rf "$$out"' EXIT; rc=0; \
 	for c in check_hnsw_auto_overflow_source check_hnsw_explicit_source \
+	         check_hnsw_ace_receipt_source \
 	         test_hnsw_auto_overflow_mutations test_hnsw_explicit_mutations; do \
 	    echo "== $$c"; python3 -I test/unit/$$c.py "$$out/$$c" || rc=1; \
 	done; \
@@ -451,6 +474,29 @@ test-hnsw-nn-consumer: test/unit/test_hnsw_nn_consumer.py src/cuvs_wrapper.cu sr
 test-hnsw-nn-upper-receipt: test/unit/test_hnsw_nn_upper_receipt.py test/unit/test_hnsw_nn_upper_receipt_mutation.py src/hnsw_export.c src/cuvs_hnsw_policy.h
 	python3 -I -B test/unit/test_hnsw_nn_upper_receipt.py
 	python3 -I -B test/unit/test_hnsw_nn_upper_receipt_mutation.py
+
+# ACE build_info JSON (origin of the partition count, exactness of the readback) rendered from
+# the production hnsw_export.c on stored receipts, with and without the SDK source planner.
+.PHONY: test-hnsw-ace-origin-json
+test-hnsw-ace-origin-json: test/unit/test_hnsw_ace_origin_json.py src/hnsw_export.c src/cuvs_hnsw_policy.h
+	python3 -I -B test/unit/test_hnsw_ace_origin_json.py
+
+# The ACE branch of cuvs_wrapper.cu compiled with and without the SDK source planner, against
+# stubs of the cuVS types it touches (no CUDA, no GPU).
+.PHONY: test-hnsw-ace-planner-branch
+test-hnsw-ace-planner-branch: test/unit/test_hnsw_ace_planner_branch.py src/cuvs_wrapper.cu src/cuvs_hnsw_policy.h
+	CXX="$(CXX)" python3 -I -B test/unit/test_hnsw_ace_planner_branch.py
+
+# The switch that turns the SDK source planner on (header include, OpenMP + source path gate, nvcc
+# flags) and the one-line note of a GPU build without it; ACE no longer fails without the planner.
+.PHONY: test-hnsw-sdk-plan-gate
+test-hnsw-sdk-plan-gate: test/unit/test_hnsw_sdk_plan_gate.py src/cuvs_hnsw_sdk_plan.cuh src/cuvs_wrapper.cu Makefile
+	CXX="$(CXX)" python3 -I -B test/unit/test_hnsw_sdk_plan_gate.py
+
+# librapids_logger is named on the extension and daemon link lines of every GPU build.
+.PHONY: test-hnsw-gpu-link-lines
+test-hnsw-gpu-link-lines: test/unit/test_hnsw_gpu_link_lines.py Makefile
+	python3 -I -B test/unit/test_hnsw_gpu_link_lines.py
 
 # NN-descent L2 graph-input centering (docs/hnsw-build-options.md, nn_descent).
 .PHONY: test-hnsw-nn-center

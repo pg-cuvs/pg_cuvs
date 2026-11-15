@@ -47,14 +47,22 @@
  * (cuvs_hnsw_ivfpq_needs_fp32). Route IVF_PQ only.
  * GRAPH_FALLBACK: auto chose resident IVF-PQ, cuVS rejected its kNN graph
  * (CUVS_HNSW_GRAPH_KNN_REJECTED) and, with overflow ace, the build ran on
- * ACE-disk instead. Requested auto, route ACE, never with AUTO_OVERFLOW. */
+ * ACE-disk instead. Requested auto, route ACE, never with AUTO_OVERFLOW.
+ * ACE_PARTITIONS_REQUESTED: the build that ran this ACE route had no SDK source
+ * planner (CUVS_HNSW_HAS_SDK_PLAN 0, no CUVS_SDK_SOURCE_INCLUDE), so `partitions`
+ * is the count pg_cuvs requested and handed to the SDK, not a count computed
+ * twice and found stable. The SDK may have built another one. Clear: `partitions`
+ * is the effective count of the planner. An ACE receipt written before this bit
+ * existed has it clear, and every one of them came from a planner build, because
+ * a build without the planner refused ACE. Route ACE only. */
 #define CUVS_HNSW_ROUTE_FLAG_AUTO_OVERFLOW 0x1u
 #define CUVS_HNSW_ROUTE_FLAG_PRESPOOL 0x2u
 #define CUVS_HNSW_ROUTE_FLAG_AFTER_SCAN 0x4u
 #define CUVS_HNSW_ROUTE_FLAG_NO_STATISTICS 0x8u
 #define CUVS_HNSW_ROUTE_FLAG_IVFPQ_FP32 0x10u
 #define CUVS_HNSW_ROUTE_FLAG_GRAPH_FALLBACK 0x20u
-#define CUVS_HNSW_ROUTE_FLAGS_KNOWN 0x3fu
+#define CUVS_HNSW_ROUTE_FLAG_ACE_PARTITIONS_REQUESTED 0x40u
+#define CUVS_HNSW_ROUTE_FLAGS_KNOWN 0x7fu
 
 /* Receipt JSON "route_decided" (pg_cuvs_hnsw_build_info). */
 static inline const char *cuvs_hnsw_route_decided_name(uint32_t flags)
@@ -131,6 +139,22 @@ static inline const char *cuvs_hnsw_route_name(uint32_t route)
     case CUVS_HNSW_ROUTE_NN_DESCENT: return "resident_nn_descent";
     default: return "unknown";
     }
+}
+
+/* 1 when an ACE receipt's `partitions` is the requested count and the effective
+ * count is not guaranteed (CUVS_HNSW_ROUTE_FLAG_ACE_PARTITIONS_REQUESTED). */
+static inline int cuvs_hnsw_ace_partitions_unverified(const CuvsHnswPolicy *p)
+{
+    return p && p->route == CUVS_HNSW_ROUTE_ACE
+        && (p->route_flags & CUVS_HNSW_ROUTE_FLAG_ACE_PARTITIONS_REQUESTED) != 0;
+}
+
+/* Receipt JSON "ace_partitions_origin" (pg_cuvs_hnsw_build_info). */
+static inline const char *cuvs_hnsw_ace_partitions_origin(const CuvsHnswPolicy *p)
+{
+    if (p->route != CUVS_HNSW_ROUTE_ACE) return "not_applicable";
+    return cuvs_hnsw_ace_partitions_unverified(p)
+        ? "requested_effective_not_guaranteed" : "same_SDK_stable_explicit_plan";
 }
 
 /* Preflight decisions exclude R1, which happens only after a build begins. */
@@ -255,6 +279,8 @@ static inline int cuvs_hnsw_policy_valid(const CuvsHnswPolicy *p)
             == (p->requested_algo == CUVS_HNSW_ALGO_AUTO && p->route == CUVS_HNSW_ROUTE_ACE))
         && (!(p->route_flags & CUVS_HNSW_ROUTE_FLAG_IVFPQ_FP32)
             || p->route == CUVS_HNSW_ROUTE_IVF_PQ)
+        && (!(p->route_flags & CUVS_HNSW_ROUTE_FLAG_ACE_PARTITIONS_REQUESTED)
+            || p->route == CUVS_HNSW_ROUTE_ACE)
         && ((p->requested_algo == CUVS_HNSW_ALGO_AUTO
                 && (p->route == CUVS_HNSW_ROUTE_TINY || p->route == CUVS_HNSW_ROUTE_IVF_PQ
                     || p->route == CUVS_HNSW_ROUTE_ACE))
@@ -356,7 +382,10 @@ cuvs_hnsw_policy_read(const void *data, size_t available, CuvsHnswPolicy *out)
  *     to NN-descent at the SDK default iterations by the positive-budget
  *     partition ledger (patch 0003). Two partitions each hold every row (core
  *     plus augmented), so the value is exact; with more partitions and at
- *     least 1e6 rows it differs between partitions and is recorded as 0. */
+ *     least 1e6 rows it differs between partitions and is recorded as 0.
+ *     The exact value assumes `partitions` is the effective count; when the
+ *     receipt only records the requested count (ACE_PARTITIONS_REQUESTED),
+ *     cuvs_hnsw_ace_iterations_guaranteed says it is not guaranteed. */
 #define CUVS_HNSW_ACE_READBACK_MAGIC UINT32_C(0x43564152)
 #define CUVS_HNSW_ACE_READBACK_VERSION 1u
 #define CUVS_HNSW_SDK_ACE_NN_MAX_ROWS UINT64_C(1000000)
@@ -411,6 +440,17 @@ static inline int cuvs_hnsw_ace_readback_valid(const CuvsHnswAceReadback *r,
             || p->n_rows >= CUVS_HNSW_SDK_ACE_NN_MAX_ROWS
             || r->local_iterations == CUVS_HNSW_SDK_ACE_NN_ITERATION_OFFSET + r->quality)
         && r->reserved == 0;
+}
+
+/* 0 when local_iterations is an exact value that rests on the partition count and the receipt
+ * records only the requested count: from 1e6 rows the readback holds an exact value for two
+ * partitions alone (cuvs_hnsw_ace_readback_fill), and the SDK is not known to have built two.
+ * Under 1e6 rows the value does not depend on the count, and 0 claims no exact value. */
+static inline int cuvs_hnsw_ace_iterations_guaranteed(const CuvsHnswPolicy *p,
+                                                      const CuvsHnswAceReadback *r)
+{
+    return !(cuvs_hnsw_ace_partitions_unverified(p)
+             && p->n_rows >= CUVS_HNSW_SDK_ACE_NN_MAX_ROWS && r->local_iterations != 0);
 }
 
 /* Bounded reader of the tail after a receipt: absent, valid, or corrupt. */

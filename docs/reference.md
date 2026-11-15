@@ -576,7 +576,13 @@ hierarchy construction effort from200, and ACE effort from240 at the default64 (
 receipts record the consumed/clamped values. ACE indexes also record a partition-builder
 readback (`ace_build_quality`, `ace_local_intermediate_degree` = 3 × (graph_degree / 2),
 `ace_local_nn_descent_iterations`); the receipt's `intermediate_degree` is the resident width
-and the ACE memory-plan input, not the width ACE partitions build and optimize with. Reusing a source CAGRA graph does not
+and the ACE memory-plan input, not the width ACE partitions build and optimize with.
+`ace_partitions` is the effective partition count (`ace_partitions_origin` =
+`same_SDK_stable_explicit_plan`) when pg_cuvs was built with `CUVS_SDK_SOURCE_INCLUDE`. Built
+without it, an ACE build still runs on the patched SDK but records the requested count:
+`ace_partitions_origin` is `requested_effective_not_guaranteed`, and
+`ace_local_nn_descent_iterations` is `not_guaranteed` for two requested partitions from 1e6
+rows; `CREATE INDEX` raises a NOTICE. Reusing a source CAGRA graph does not
 rebuild it according to these options. See [HNSW build options](hnsw-build-options.md)
 for limits, compatibility and estimate-vs-upper-bound caveats.
 
@@ -595,7 +601,7 @@ for limits, compatibility and estimate-vs-upper-bound caveats.
 | `pg_cuvs_index_status()` | SETOF record | (0.9.0) Per-index residency, protection, sidecar, pin and eviction history; rows filtered by privilege. See § 8.4 |
 | `pg_cuvs_memory_status()` | SETOF record | (0.9.0) Superuser or `pg_monitor`; per-GPU accounting, reclaim state and eviction counters. See § 8.4 |
 | `pg_cuvs_build_status()` | SETOF record | (0.9.0) In-flight CAGRA builds and their reservations; rows filtered by privilege. See § 8.4 |
-| `pg_cuvs_hnsw_build_info(index regclass)` | jsonb | Read the stored construction route/settings and estimate-based admission. Version2 writer with historical version1 reader; absent legacy/source/empty receipts are not reconstructed from current GUCs. Requires SELECT on the source table; estimates are not memory upper-bound guarantees |
+| `pg_cuvs_hnsw_build_info(index regclass)` | jsonb | Read the stored construction route/settings and estimate-based admission. Version2 writer with historical version1 reader; absent legacy/source/empty receipts are not reconstructed from current GUCs. For ACE, `ace_partitions_origin` says whether `ace_partitions` is the effective count or only the requested one. Requires SELECT on the source table; estimates are not memory upper-bound guarantees |
 | `pg_cuvs_build_hnsw(cagra regclass, mode text DEFAULT 'nsw')` | regclass | Build a pgvector HNSW from a CAGRA index without pgvector's CPU build. **Deprecated** in favor of `CREATE INDEX ... USING pg_cuvs_hnsw`; the older two-step `pg_cuvs_import_hnsw` form (empty `USING hnsw` target + import) is removed |
 | `pg_cuvs_compact(index regclass)` | void | Remove tombstoned vectors via `cuvsCagraMerge`, rebuild `.cagra`/`.tids`, drop `.tombstone`. The rebuild uses fp32 IVF-PQ kNN distances under the `build_algo` fp16 rule. If the initial NN-descent or auto merge runs out of memory, retry once with explicit IVF-PQ under that same rule. A pinned IVF-PQ failure is not retried |
 | `pg_cuvs_batch_search(rel regclass, queries vector[], k int)` | SETOF (query_idx int, ctid tid, distance real) | Q queries in one IPC/GPU dispatch; JOIN on `ctid` for visible rows; honors `search_mode`/`bf_precision` |

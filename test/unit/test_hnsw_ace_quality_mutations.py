@@ -31,6 +31,18 @@ MUTATIONS = {
     'readback_reports_receipt_width': (H, '    return 3u * (degree / 2u);', '    return 2u * degree;'),
     'readback_ignores_1e6_ledger': (H, 'if (n_rows < CUVS_HNSW_SDK_ACE_NN_MAX_ROWS)', 'if (1)'),
     'readback_valid_unbound_from_quality': (H, '        && r->quality == p->ace_ef / CUVS_HNSW_SDK_ACE_QUALITY_DIVISOR\n', ''),
+    # The ACE effective partition count is optional: the requested-only mark, its origin and its reach into the readback.
+    'requested_mark_accepted_off_ace_route': (H, '        && (!(p->route_flags & CUVS_HNSW_ROUTE_FLAG_ACE_PARTITIONS_REQUESTED)\n            || p->route == CUVS_HNSW_ROUTE_ACE)\n', ''),
+    'requested_mark_unknown_to_reader': (H, '#define CUVS_HNSW_ROUTE_FLAGS_KNOWN 0x7fu', '#define CUVS_HNSW_ROUTE_FLAGS_KNOWN 0x3fu'),
+    'requested_mark_claimed_off_ace_route': (H, '    return p && p->route == CUVS_HNSW_ROUTE_ACE\n        && (p->route_flags & CUVS_HNSW_ROUTE_FLAG_ACE_PARTITIONS_REQUESTED) != 0;',
+                                             '    return p && (p->route_flags & CUVS_HNSW_ROUTE_FLAG_ACE_PARTITIONS_REQUESTED) != 0;'),
+    'origin_ignores_requested_mark': (H, '    return cuvs_hnsw_ace_partitions_unverified(p)\n        ? "requested_effective_not_guaranteed" : "same_SDK_stable_explicit_plan";',
+                                      '    return "same_SDK_stable_explicit_plan";'),
+    'iterations_guarantee_ignores_mark': (H, '    return !(cuvs_hnsw_ace_partitions_unverified(p)\n             && p->n_rows', '    return !(0\n             && p->n_rows'),
+    'iterations_guarantee_drops_1e6_bound': (H, '             && p->n_rows >= CUVS_HNSW_SDK_ACE_NN_MAX_ROWS && r->local_iterations != 0);',
+                                             '             && r->local_iterations != 0);'),
+    'iterations_guarantee_marks_zero': (H, '             && p->n_rows >= CUVS_HNSW_SDK_ACE_NN_MAX_ROWS && r->local_iterations != 0);',
+                                       '             && p->n_rows >= CUVS_HNSW_SDK_ACE_NN_MAX_ROWS);'),
     'reader_accepts_short_tail': (H, '    if (available < sizeof(*out)) return CUVS_HNSW_POLICY_CORRUPT;\n    memcpy(out, data, sizeof(*out));',
                                   '    memcpy(out, data, sizeof(*out));'),
     'client_skips_ace_readback': ('cuvs_ipc.c', '                    ? !cuvs_hnsw_ace_readback_valid(&wire.ace, &wire.policy)\n',
@@ -39,6 +51,8 @@ MUTATIONS = {
     'meta_pd_lower_not_bumped': ('hnsw_export.c', '        ((PageHeader)staged)->pd_lower += sizeof(*ace);\n', ''),
     'meta_read_wrong_offset': ('hnsw_export.c', '    Size at = SizeOfPageHeaderData + sizeof(PgvHnswMeta) + sizeof(*policy);',
                                '    Size at = SizeOfPageHeaderData + sizeof(PgvHnswMeta);'),
+    'client_skips_policy_validation': ('cuvs_ipc.c', '            if (!cuvs_hnsw_policy_valid(&wire.policy)\n',
+                                       '            if (0 && !cuvs_hnsw_policy_valid(&wire.policy)\n'),
     'client_accepts_readback_on_resident': ('cuvs_ipc.c', '                    : wire.ace.magic != 0)', '                    : 0)'),
 }
 
@@ -50,7 +64,7 @@ def run_converter(tree):
 
 
 def copy_tree(dst):
-    shutil.copytree(ROOT, dst, ignore=shutil.ignore_patterns('.git', '*.o', '*.so', 'test-*', 'pg_cuvs_server', '*.bc'))
+    shutil.copytree(ROOT, dst, ignore=shutil.ignore_patterns('.git', '.ccache', '*.o', '*.so', 'test-*', 'pg_cuvs_server', '*.bc'))
 
 
 def build_and_run(src, work, test):

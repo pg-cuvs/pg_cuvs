@@ -25,5 +25,5 @@ elif actual==row_sort:
         if not dependency.is_file() or hashlib.sha256(dependency.read_bytes()).hexdigest()!=digest:
             raise SystemExit('Unsupported HNSW SDK planner dependency: '+name)
 else:
-    raise SystemExit('Unsupported HNSW SDK planner source: expected canonical '+expected+' or fixed row-sort consumer '+row_sort+', got '+actual+'. Resident builds do not require this source; ACE must not use an unverified planner.')
+    raise SystemExit('Unsupported HNSW SDK planner source: expected canonical '+expected+' or fixed row-sort consumer '+row_sort+', got '+actual+'. Resident builds do not require this source, and CUVS_SDK_SOURCE_INCLUDE may be left unset (ACE then records the requested partition count, not the effective one). This check runs only when the variable is set, and ACE must not use an unverified planner.')
 print(json.dumps({'path':str(f.resolve()),'sha256':actual,'variant':variant,'status':'PINNED_PLANNER_SOURCE_MATCH','scope':'planner source only, not a whole SDK/runtime audit'}))

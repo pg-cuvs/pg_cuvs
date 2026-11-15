@@ -4484,7 +4484,7 @@ pg_cuvs_hnsw_build_info(PG_FUNCTION_ARGS)
         cuvs_hnsw_algo_name(policy.requested_algo), policy.requested_ef,
         policy.degree, policy.intermediate, policy.hierarchy,
         policy.hierarchy_ef, policy.ace_ef, policy.partitions,
-        policy.route == CUVS_HNSW_ROUTE_ACE ? "same_SDK_stable_explicit_plan" : "not_applicable",
+        cuvs_hnsw_ace_partitions_origin(&policy),
         policy.internal_builder == 1 ? "exact" : policy.internal_builder == 2 ? "ivf_pq" : "nn_descent",
         policy.n_lists, policy.pq_dim, policy.pq_bits, policy.n_probes, policy.query_batch,
         (unsigned long long)policy.training_requested, (unsigned long long)policy.training_actual,
@@ -4508,7 +4508,9 @@ pg_cuvs_hnsw_build_info(PG_FUNCTION_ARGS)
             "\"ace_build_quality\":%u,\"ace_local_intermediate_degree\":%u,",
             ace.quality_source == CUVS_HNSW_ACE_SOURCE_MANUAL ? "manual" : "auto",
             ace.quality, ace.local_intermediate);
-        if (ace.local_iterations)
+        if (!cuvs_hnsw_ace_iterations_guaranteed(&policy, &ace))
+            appendStringInfoString(&json, "\"ace_local_nn_descent_iterations\":\"not_guaranteed\"");
+        else if (ace.local_iterations)
             appendStringInfo(&json, "\"ace_local_nn_descent_iterations\":%u", ace.local_iterations);
         else
             appendStringInfoString(&json, "\"ace_local_nn_descent_iterations\":\"varies_by_partition\"");

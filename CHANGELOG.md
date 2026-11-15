@@ -38,8 +38,35 @@ exists for 0.9.0.
   Tested on PostgreSQL 16 CPU only, not on GPU builds, other pgvector versions or in
   GitHub Actions at the time of writing.
 
+### Changed
+
+- A pg_cuvs built without `CUVS_SDK_SOURCE_INCLUDE` no longer refuses ACE
+  (`build_algo='ace'`, and `auto` when it spills to ACE). It hands the requested
+  partition count to the patched cuVS SDK and records it in the HNSW receipt as
+  requested only: `pg_cuvs_hnsw_build_info()` reports `ace_partitions_origin` as
+  `requested_effective_not_guaranteed`, `ace_local_nn_descent_iterations` as
+  `not_guaranteed` for two requested partitions from 1e6 rows, and `CREATE INDEX`
+  raises a NOTICE that says how to turn the guarantee on; a GPU build prints one
+  line about it when it compiles `src/cuvs_wrapper.cu` without the variable. A pg_cuvs built with
+  `CUVS_SDK_SOURCE_INCLUDE` is unchanged: the effective count is computed twice,
+  an unstable plan refuses the build, and the origin stays
+  `same_SDK_stable_explicit_plan`. The patched `libcuvs.so` is required either way;
+  a plain one is still refused before the build. The mark is a bit of the receipt's
+  `route_flags` (receipt size and version unchanged, no SQL change); an earlier
+  version's `pg_cuvs_hnsw_build_info()` rejects an index carrying it as an invalid
+  receipt.
+
 ### Fixed
 
+- A GPU build without `CUVS_SDK_SOURCE_INCLUDE` failed to link with
+  `ld: .../librapids_logger.so: error adding symbols: DSO missing from command line`.
+  The wrapper expands `RMM_LOG_*`, which call `rapids_logger::logger::log`, and
+  `libcuvs.so` and `librmm.so` need `librapids_logger.so` only indirectly, which `ld`
+  does not follow; the Makefile named `-lrapids_logger` only inside the
+  `CUVS_SDK_SOURCE_INCLUDE` branch. It is now a separate `CUVS_LOGGER_LINK` on the
+  extension and daemon link lines of every GPU build (not the CPU shim), and a
+  hand-written `CUVS_SO_LINK` / `CUVS_SERVER_LINK` keeps it. Seen on a GPU host on
+  2026-11-15 with the planner off; the same link succeeded once the library was named.
 - Building with the patched cuVS SDK planner (`CUVS_SDK_SOURCE_INCLUDE` set, as the
   HNSW/ACE paths require) failed to compile `src/cuvs_wrapper.cu`: the planner pulls in
   the patched `cagra_build.cuh`, whose RAFT `map_offset` kernel calls a constexpr host

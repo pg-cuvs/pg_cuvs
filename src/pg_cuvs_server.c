@@ -10496,9 +10496,10 @@ handle_build_hnsw_file(int client_fd, const CuvsCmdFrame *cmd)
             wire.policy.degree, wire.policy.n_rows, wire.policy.partitions,
             cuvs_hnsw_sdk_nn_default_iterations());
         LOG_INFO("[hnsw_job] job=%s phase=ace-readback quality=%u source=%s ace_ef=%u "
-                 "local_intermediate=%u local_iterations=%u partitions=%u\n", workdir,
+                 "local_intermediate=%u local_iterations=%u partitions=%u partitions_origin=%s\n", workdir,
                  wire.ace.quality, wire.ace.quality_source ? "manual" : "auto", wire.policy.ace_ef,
-                 wire.ace.local_intermediate, wire.ace.local_iterations, wire.policy.partitions);
+                 wire.ace.local_intermediate, wire.ace.local_iterations, wire.policy.partitions,
+                 cuvs_hnsw_ace_partitions_origin(&wire.policy));
     }
     LOG_INFO("[hnsw_job] job=%s phase=wrapper-return mono_us=%llu status=%u owner_cancelled=%d gpu_free_now=%zu resident_now=%zu\n",
         workdir, (unsigned long long)cuvs_hnsw_monotonic_us(), reply.status,

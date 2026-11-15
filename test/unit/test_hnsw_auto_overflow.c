@@ -143,8 +143,8 @@ static void test_invariant_notices(void)
     p = receipt(CUVS_HNSW_ALGO_AUTO, CUVS_HNSW_ROUTE_ACE,
                 CUVS_HNSW_ROUTE_FLAG_AUTO_OVERFLOW | CUVS_HNSW_ROUTE_FLAG_NO_STATISTICS);
     CHECK(!cuvs_hnsw_policy_valid(&p)); /* a cause without the after-scan timing */
-    p = receipt(CUVS_HNSW_ALGO_AUTO, CUVS_HNSW_ROUTE_ACE, CUVS_HNSW_ROUTE_FLAG_AUTO_OVERFLOW | 0x40);
-    CHECK(!cuvs_hnsw_policy_valid(&p)); /* unknown flag */
+    p = receipt(CUVS_HNSW_ALGO_AUTO, CUVS_HNSW_ROUTE_ACE, CUVS_HNSW_ROUTE_FLAG_AUTO_OVERFLOW | 0x80);
+    CHECK(!cuvs_hnsw_policy_valid(&p)); /* unknown flag (0x40 is ACE_PARTITIONS_REQUESTED) */
     /* kNN-graph fallback (SIFT): auto -> ACE with its own record only */
     p = receipt(CUVS_HNSW_ALGO_AUTO, CUVS_HNSW_ROUTE_ACE, CUVS_HNSW_ROUTE_FLAG_GRAPH_FALLBACK);
     CHECK(cuvs_hnsw_policy_valid(&p));
