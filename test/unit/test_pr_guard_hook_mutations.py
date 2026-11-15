@@ -14,14 +14,17 @@ ROOT = pathlib.Path(__file__).resolve().parents[2]
 HOOK = ROOT / ".claude" / "hooks" / "pr-guard.sh"
 TESTS = ROOT / "test" / "unit" / "test_pr_guard_hook.py"
 
-GH_PR_RE = r'GH_PR_RE = r"(?<![\w-])gh(?:\s+-\S+(?:\s+[^\s-][^\s;&|()]*)?)*\s+pr\s+(?:create|ready)\b"'
+FIND_PR = "if not any(AFTER_GH.match(cmd, w.end(), b) for w, b in zip(words, bounds)):"
 # The pattern before the review: `gh` only at the start or after ; & | ( or a space.
-OLD_GH_PR_RE = r'GH_PR_RE = r"(^|[;&|(\s])gh\s+pr\s+(create|ready)\b"'
+OLD_FIND_PR = r'if not re.search(r"(^|[;&|(\s])gh\s+pr\s+(create|ready)\b", cmd):'
 UNRESOLVED = '    print(cwd)\n    print("@self")'
 
 # name: (text in the hook, planted replacement)
 MUTANTS = {
-    "old_regex": (GH_PR_RE, OLD_GH_PR_RE),
+    "old_regex": (FIND_PR, OLD_FIND_PR),
+    # Every `gh` scans to the end of the command: quadratic on `gh -a gh -a ...`.
+    "scan_not_bounded_by_next_gh": ("bounds = [w.start() for w in words[1:]] + [len(cmd)]",
+                                    "bounds = [len(cmd)] * len(words)"),
     "no_unresolved_cd_fallback": (UNRESOLVED, '    print("/nonexistent")'),
     "unresolved_cd_checks_cwd_only": (UNRESOLVED, "    print(cwd)"),
     "unresolved_cd_checks_project_only": (UNRESOLVED, '    print("@self")'),
@@ -32,6 +35,11 @@ MUTANTS = {
     "stops_at_first_failing_tree": ("    failed=1\n", "    failed=1\n    break\n"),
     "same_tree_checked_twice": ("*$'\\n'\"$root\"$'\\n'*) continue;;", "*NEVER*) continue;;"),
     "non_pg_cuvs_checkout_checked": ('[ -f "$root/scripts/prepare-patched-cuvs-source.sh" ] || continue', "true"),
+    "check_called_with_bogus_flag": ('"$check" --root "$root"', '"$check" --rooot "$root"'),
+    "stderr_dropped_from_out": ('out=$("$check" --root "$root" 2>&1)', 'out=$("$check" --root "$root" 2>/dev/null)'),
+    "bypass_at_checked_root": ('bypass="$self_root/.claude', 'bypass="${root:-$self_root}/.claude'),
+    "no_self_script_fallback": ('    [ -x "$check" ] || check="$self_root/scripts/check-sdk-patch-path.sh"\n', ""),
+    "root_not_toplevel": ('root=$(git -C "$where" rev-parse --show-toplevel 2>/dev/null) || continue', 'root="$where"'),
     "resolved_cd_ignored": ("if target:\n    print(target)", "if False:\n    print(target)"),
 }
 

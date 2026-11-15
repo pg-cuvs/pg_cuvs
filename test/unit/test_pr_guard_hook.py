@@ -32,12 +32,19 @@ def make_checkout(path, passes):
     return path
 
 
-def set_check(path, passes):
+def set_check(path, passes, stream="stdout"):
+    """Stub of scripts/check-sdk-patch-path.sh. Like the real script it accepts
+    only `--root DIR` (anything else: usage, exit 2) and records DIR. A failing
+    stub reports on stdout, or on stderr with stream="stderr"."""
     check = path / "scripts" / "check-sdk-patch-path.sh"
+    redirect = " >&2" if stream == "stderr" else ""
     check.write_text(
         "#!/bin/sh\n"
+        '[ "$1" = "--root" ] && [ -n "$2" ] && [ "$#" = 2 ] || '
+        '{ echo "usage: $0 [--root DIR]" >&2; exit 2; }\n'
         'echo "$2" >> "$(dirname "$0")/calls"\n'
-        + ('echo "stub: ok"\nexit 0\n' if passes else 'echo "stub: patched path broken"\nexit 1\n')
+        + ('echo "stub: ok"\nexit 0\n' if passes else
+           f'echo "stub: patched path broken ({stream})"{redirect}\nexit 1\n')
     )
     check.chmod(0o755)
 
@@ -57,7 +64,7 @@ class HookCase(unittest.TestCase):
         # The session's own checkout: CLAUDE_PROJECT_DIR, where the bypass file lives.
         self.proj = make_checkout(self.tmp / "proj", passes=True)
 
-    def run_hook(self, command, cwd=None, raw=None, env_extra=None, path_env=None):
+    def run_hook(self, command, cwd=None, raw=None, env_extra=None, path_env=None, timeout=60):
         payload = raw if raw is not None else json.dumps(
             {"tool_input": {"command": command}, "cwd": str(cwd or self.proj)})
         env = dict(os.environ, CLAUDE_PROJECT_DIR=str(self.proj))
@@ -65,8 +72,11 @@ class HookCase(unittest.TestCase):
         if path_env is not None:
             env["PATH"] = path_env
         env.update(env_extra or {})
-        p = subprocess.run([BASH, HOOK], input=payload, capture_output=True,
-                           text=True, env=env, timeout=60)
+        try:
+            p = subprocess.run([BASH, HOOK], input=payload, capture_output=True,
+                               text=True, env=env, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            self.fail(f"hook still running after {timeout} s on a {len(payload)} byte payload")
         return p.returncode, p.stderr
 
     def assert_blocked(self, command, **kw):
@@ -150,8 +160,20 @@ class SpellingTests(HookCase):
         rc, err = self.run_hook("gh pr create")
         self.assertEqual(rc, 2)
         self.assertIn(str(self.proj), err)
-        self.assertIn("stub: patched path broken", err)
+        self.assertIn("stub: patched path broken (stdout)", err)
         self.assertIn("pr-guard-bypass", err)
+
+    def test_check_is_called_as_the_real_script_expects(self):
+        # The stub exits 2 with a usage line on anything but `--root DIR`, so a
+        # hook that passes another flag sees a failing check and blocks here.
+        self.assert_passes("gh pr create")
+        self.assertEqual(calls(self.proj), [str(self.proj)])
+
+    def test_stderr_of_the_check_is_in_the_block_message(self):
+        set_check(self.proj, passes=False, stream="stderr")
+        rc, err = self.run_hook("gh pr create")
+        self.assertEqual(rc, 2)
+        self.assertIn("stub: patched path broken (stderr)", err)
 
 
 class FailOpenTests(HookCase):
@@ -208,6 +230,19 @@ class BypassTests(HookCase):
         self.bypass(f"until={int(time.time()) - 5}\nreason=old\n")
         self.assert_blocked("gh pr create")
 
+    def test_bypass_of_the_session_checkout_covers_another_checkout(self):
+        wt = make_checkout(self.tmp / "wt", passes=False)
+        self.bypass(f"until={int(time.time()) + 600}\nreason=session wide\n")
+        self.assert_passes("gh pr create", cwd=wt)
+
+    def test_bypass_file_in_the_checked_checkout_is_ignored(self):
+        # Only the session checkout (CLAUDE_PROJECT_DIR) may hold the bypass.
+        wt = make_checkout(self.tmp / "wt", passes=False)
+        state = wt / ".claude" / "state"
+        state.mkdir(parents=True)
+        (state / "pr-guard-bypass").write_text(f"until={int(time.time()) + 600}\nreason=planted\n")
+        self.assert_blocked("gh pr create", cwd=wt)
+
     def test_garbage_bypass_blocks(self):
         for text in ["until=soon\nreason=x\n", "reason=no until line\n", "", "until=\n",
                      "until=-1\n", "garbage\n"]:
@@ -222,6 +257,29 @@ class CwdAndCdTests(HookCase):
         self.assert_blocked("gh pr create", cwd=wt)
         self.assertEqual(calls(wt), [str(wt)])
         self.assertEqual(calls(self.proj), [], "the session checkout was checked, not the cwd")
+
+    def test_root_passed_to_the_check_is_the_top_level_of_a_subdirectory_cwd(self):
+        sub = self.proj / "src" / "deep"
+        sub.mkdir(parents=True)
+        self.assert_passes("gh pr create", cwd=sub)
+        self.assertEqual(calls(self.proj), [str(self.proj)])
+
+    def test_checkout_without_the_script_is_checked_with_the_session_copy(self):
+        wt = make_checkout(self.tmp / "wt", passes=True)
+        (wt / "scripts" / "check-sdk-patch-path.sh").unlink()
+        set_check(self.proj, passes=False)
+        self.assert_blocked("gh pr create", cwd=wt)
+        self.assertEqual(calls(self.proj), [str(wt)], "the session copy runs with --root of the checked tree")
+        set_check(self.proj, passes=True)
+        self.assert_passes("gh pr create", cwd=wt)
+
+    def test_no_script_anywhere_passes_with_a_notice(self):
+        wt = make_checkout(self.tmp / "wt", passes=True)
+        (wt / "scripts" / "check-sdk-patch-path.sh").unlink()
+        (self.proj / "scripts" / "check-sdk-patch-path.sh").unlink()
+        rc, err = self.run_hook("gh pr create", cwd=wt)
+        self.assertEqual(rc, 0)
+        self.assertIn("check script not found", err)
 
     def test_a_resolvable_cd_selects_the_checkout_to_check(self):
         wt = make_checkout(self.tmp / "wt", passes=True)
@@ -264,6 +322,27 @@ class CwdAndCdTests(HookCase):
         plain.mkdir()
         set_check(self.proj, passes=False)
         self.assert_blocked("cd $M && gh pr create", cwd=plain)
+
+
+class ScalingTests(HookCase):
+    """The command is user input of any size (a heredoc, a pasted log): finding
+    `gh pr create` in it must take time linear in its length."""
+
+    def test_repeated_gh_options_take_linear_time(self):
+        set_check(self.proj, passes=False)
+        for unit in ["gh -a ", "gh -x\n"]:
+            t = {}
+            for n in (4000, 16000):  # about 24 KB and 96 KB
+                start = time.monotonic()
+                self.assert_passes(unit * n, timeout=10)
+                t[n] = time.monotonic() - start
+                self.assertLess(t[n], 2.0, f"{unit!r} x {n}")
+            # Four times the input: a quadratic scan takes about sixteen times as long.
+            self.assertLess(t[16000], 6 * max(t[4000], 0.3), f"{unit!r}: {t}")
+
+    def test_a_pr_after_a_long_run_of_gh_words_is_still_found(self):
+        set_check(self.proj, passes=False)
+        self.assert_blocked("gh -a " * 16000 + "gh pr create", timeout=10)
 
 
 if __name__ == "__main__":

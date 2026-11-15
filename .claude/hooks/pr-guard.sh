@@ -36,8 +36,13 @@ try:
 except Exception:
     sys.exit(0)
 cmd = ((d.get("tool_input") or {}).get("command", "") or "")
-GH_PR_RE = r"(?<![\w-])gh(?:\s+-\S+(?:\s+[^\s-][^\s;&|()]*)?)*\s+pr\s+(?:create|ready)\b"
-if not re.search(GH_PR_RE, cmd):
+GH_WORD = re.compile(r"(?<![\w-])gh(?![\w-])")
+AFTER_GH = re.compile(r"(?:\s+-\S+(?:\s+[^\s-][^\s;&|()]*)?)*\s+pr\s+(?:create|ready)\b")
+words = list(GH_WORD.finditer(cmd))
+# Each `gh` is scanned only up to the next one, so the total work is linear in the
+# command length (one pattern over the whole command was quadratic on `gh -a gh -a ...`).
+bounds = [w.start() for w in words[1:]] + [len(cmd)]
+if not any(AFTER_GH.match(cmd, w.end(), b) for w, b in zip(words, bounds)):
     sys.exit(0)
 cwd = d.get("cwd") or os.getcwd()
 print(d.get("agent_type") or "main")
