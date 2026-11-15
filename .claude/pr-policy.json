@@ -1,7 +1,7 @@
 {
   "version": 1,
   "generated_by": "hooks/validate_pr_label.js",
-  "fingerprint": "bdc125e6a657dfec519c59e9bea5157d",
+  "fingerprint": "905d1cd4e3d7379ecccd27b494aee05b",
   "observed_prs": 50,
   "declared_sources": [
     "CONTRIBUTING.md",
