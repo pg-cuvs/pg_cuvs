@@ -538,6 +538,34 @@ test-admission-ipc: test/unit/test_admission_ipc.c src/cuvs_ipc.c src/cuvs_ipc.h
 		-lpthread -lm $(TEST_RT_LIB)
 	./$@
 
+# #224: a connect() that waits for a full listen backlog retries after EINTR
+# and expired slices within the call's budget, a pending cancel ends it as
+# CANCELED, and the connection gets its full send timeout back. Linux only: on
+# macOS a full backlog refuses at once instead of waiting. The mutations run
+# with test-unit there, like test-hnsw-nn-mutations.
+ifeq ($(shell uname -s),Linux)
+test-unit: test-ipc-connect-eintr test-ipc-connect-eintr-mutations
+endif
+test-unit: test-ipc-backlog-source
+test-ipc-connect-eintr: test/unit/test_ipc_connect_eintr.c src/cuvs_ipc.c src/cuvs_ipc.h \
+                        src/cuvs_util.c src/cuvs_build_corpus.c $(wildcard src/*.h)
+	$(CC) -std=gnu11 -Wall -Wextra -Werror -I src -o $@ \
+		test/unit/test_ipc_connect_eintr.c src/cuvs_ipc.c src/cuvs_util.c src/cuvs_build_corpus.c \
+		-lpthread -lm $(TEST_RT_LIB)
+	./$@
+
+# #224: the daemon listen() backlog holds at least one batch of reconnects.
+test-ipc-backlog-source: test/unit/check_listen_backlog_source.py src/pg_cuvs_server.c
+	python3 -I -B test/unit/check_listen_backlog_source.py
+
+# Each #224 mutation (retry, slice, cancel, budget, send timeout, backlog) must
+# turn a check RED. Client mutants need Linux; elsewhere only the backlog ones run.
+test-ipc-connect-eintr-mutations: test/unit/test_ipc_connect_eintr_mutations.py
+	CC=$(CC) TEST_RT_LIB="$(TEST_RT_LIB)" python3 -I -B test/unit/test_ipc_connect_eintr_mutations.py
+
+EXTRA_CLEAN += test-ipc-connect-eintr
+.PHONY: test-ipc-connect-eintr test-ipc-backlog-source test-ipc-connect-eintr-mutations
+
 # User-visible DETAIL/HINT text built from err_out (C5, CK-8, CK-29).
 test-admission-message: test/unit/test_admission_message.c src/cuvs_admission_contract.h \
                         src/cuvs_util.c src/cuvs_util.h src/cuvs_ipc.h

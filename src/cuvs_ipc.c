@@ -5,8 +5,9 @@
  * receive CuvsReplyHeader + n×CuvsResult over UDS.
  *
  * Called from PostgreSQL backend process context. All paths that fail
- * to reach the daemon return an error code — pg_cuvs.c converts that
- * to a CPU fallback without crashing the backend.
+ * to reach the daemon return an error code without crashing the backend;
+ * pg_cuvs.c decides per call site whether that becomes a CPU fallback, a
+ * WARNING or an ERROR (an already planned scan raises an ERROR).
  */
 
 /* This file is compiled twice: once via PGXS into the extension .so (PG
@@ -56,6 +57,10 @@
 static int g_expected_daemon_uid = -1;
 static uint32_t g_cagra_itopk_size = 0;
 static uint32_t g_cagra_search_width = 0;
+/* 3S: query-cancel / statement_timeout hook. The backend registers a callback
+ * (cuvs_ipc_set_wait_callback) that reports whether an interrupt is pending;
+ * the search reply-wait and every connect() wait (#224) poll it. */
+static int (*g_wait_cb)(void) = NULL;
 
 void
 cuvs_ipc_set_cagra_search_params(uint32_t itopk_size, uint32_t search_width)
@@ -70,20 +75,38 @@ cuvs_ipc_set_daemon_uid(int uid)
     g_expected_daemon_uid = uid;
 }
 
-/* Open a UDS connection. Returns fd on success, -1 on failure.
- * connect_timeout_ms: short for fail-fast on missing daemon
- * recv_timeout_sec: longer for receiving daemon response (build can be slow) */
+/* Slice of one connect() wait (#224), the same 250 ms as the reply wait in
+ * recv_all_interruptible: between slices the wait callback is asked again. */
+#define CUVS_CONNECT_SLICE_US 250000
+
+/* Open a UDS connection. Returns fd on success, -1 on failure with errno set
+ * to: the errno of the call that failed (socket, lstat, connect, getsockopt);
+ * ENOTSOCK if socket_path is not a socket; EACCES if the socket's owner or the
+ * peer's uid is not the expected daemon uid (cuvs.daemon_uid); ECANCELED if
+ * the wait callback (3S) reported a pending cancel while connect() waited.
+ * recv_timeout_sec: SO_RCVTIMEO/SO_SNDTIMEO of the connection (longer for
+ *   requests whose reply is slow, e.g. builds), and the upper bound of the
+ *   whole connect() wait including its retries (#224). All callers pass > 0.
+ * canceled: if non-NULL, set to 1 for the ECANCELED case, else 0. */
 static void forget_reply(void);
 
 static int
-uds_connect_ex(const char *socket_path, int recv_timeout_sec)
+uds_connect_wait(const char *socket_path, int recv_timeout_sec, int *canceled)
 {
     int fd;
 
+    if (canceled)
+        *canceled = 0;
     forget_reply();   /* every request starts without a previous reply's I3 fields */
     fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (fd < 0)
+    {
+        int err = errno;
+        LOG_WARN("[cuvs_ipc] socket() for %s failed: %s (errno=%d)\n",
+                 socket_path, strerror(err), err);
+        errno = err;
         return -1;
+    }
 
     /* #119: verify socket_path owner before connect(). This is a fast-path
      * pre-check only — the actual security boundary is the post-connect
@@ -100,24 +123,27 @@ uds_connect_ex(const char *socket_path, int recv_timeout_sec)
         struct stat st;
         if (lstat(socket_path, &st) != 0)
         {
+            int err = errno;
             /* ENOENT is the normal "daemon is down" shape (restart window,
              * crash, not yet started) — happens on every query while the
              * daemon is out; don't drown a real hijack signal in restart
              * noise. Anything else (EACCES, ELOOP, ...) is unusual enough
              * to warrant the louder level. */
-            if (errno == ENOENT)
+            if (err == ENOENT)
                 LOG_WARN("[cuvs_ipc] cannot stat socket_path %s: %s\n",
-                          socket_path, strerror(errno));
+                          socket_path, strerror(err));
             else
                 LOG_ERROR("[cuvs_ipc] cannot stat socket_path %s: %s\n",
-                          socket_path, strerror(errno));
+                          socket_path, strerror(err));
             close(fd);
+            errno = err;
             return -1;
         }
         if (!S_ISSOCK(st.st_mode))
         {
             LOG_ERROR("[cuvs_ipc] socket_path %s is not a socket\n", socket_path);
             close(fd);
+            errno = ENOTSOCK;
             return -1;
         }
         if (st.st_uid != (uid_t) g_expected_daemon_uid)
@@ -126,6 +152,7 @@ uds_connect_ex(const char *socket_path, int recv_timeout_sec)
                       "— refusing to connect (possible hijack)\n",
                       socket_path, (unsigned) st.st_uid, g_expected_daemon_uid);
             close(fd);
+            errno = EACCES;
             return -1;
         }
         /* No S_IWOTH check: connect() needs write access to the socket
@@ -149,12 +176,98 @@ uds_connect_ex(const char *socket_path, int recv_timeout_sec)
 
     struct timeval tv = {.tv_sec = recv_timeout_sec, .tv_usec = 0};
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 
-    if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0)
+    /* #224: when the daemon's listen backlog is full, a blocking connect()
+     * waits for a slot, bounded by SO_SNDTIMEO (EAGAIN when it expires). A
+     * socket call with a send timeout is never restarted after a signal
+     * handler, SA_RESTART or not (signal(7)): the kernel returns EINTR instead
+     * of ERESTARTSYS (sock_intr_errno() in include/net/sock.h). PostgreSQL 15
+     * and later arm IDLE_STATS_UPDATE_TIMEOUT (PGSTAT_IDLE_INTERVAL, 10 s)
+     * when a backend goes idle with stats left to flush and do not disarm it
+     * when the next query starts (src/backend/tcop/postgres.c: "we don't
+     * disable the timeout below"), so a busy backend can receive SIGALRM while
+     * it runs queries; its handlers are SA_RESTART (src/port/pqsignal.c). A busy
+     * but live daemon therefore used to look unreachable.
+     *
+     * Calling connect() again on the same fd is safe for AF_UNIX stream
+     * sockets on Linux: unix_stream_connect() (net/unix/af_unix.c, checked in
+     * v5.15 and master) waits for the backlog before it touches the client
+     * socket's state, and on a signal or a timeout it frees the half-built
+     * peer and returns with the socket still TCP_CLOSE. Nothing is left in
+     * progress, unlike TCP, where a second connect() would see EALREADY.
+     *
+     * The wait runs in slices of CUVS_CONNECT_SLICE_US (SO_SNDTIMEO), all
+     * within one monotonic budget of recv_timeout_sec. After every failed
+     * attempt the wait callback is asked first: a cancel whose signal arrived
+     * before connect() started leaves no EINTR, and the slice bounds how long
+     * it goes unseen. EINTR and EAGAIN (a slice expired) retry while budget is
+     * left; anything else fails at once. */
     {
-        close(fd);
-        return -1;
+        struct timespec start;
+        int attempts = 0;
+        int connected = 0;
+        int err = 0;
+
+        clock_gettime(CLOCK_MONOTONIC, &start);
+        for (;;)
+        {
+            struct timespec now;
+            struct timeval slice;
+            long long left_us;
+            long long slice_us;
+
+            clock_gettime(CLOCK_MONOTONIC, &now);
+            left_us = (long long) recv_timeout_sec * 1000000
+                    - ((long long) (now.tv_sec - start.tv_sec) * 1000000
+                       + (now.tv_nsec - start.tv_nsec) / 1000);
+            if (attempts > 0 && left_us <= 0)
+                break;              /* budget spent: err is the last attempt's */
+            slice_us = left_us < CUVS_CONNECT_SLICE_US ? left_us : CUVS_CONNECT_SLICE_US;
+            if (slice_us < 1)
+                slice_us = 1;       /* a zero timeval would mean no timeout */
+            slice.tv_sec = (time_t) (slice_us / 1000000);
+            slice.tv_usec = (suseconds_t) (slice_us % 1000000);
+            setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &slice, sizeof(slice));
+            attempts++;
+            if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) == 0)
+            {
+                connected = 1;
+                break;
+            }
+            err = errno;
+            if (g_wait_cb && g_wait_cb())
+            {
+                if (canceled)
+                    *canceled = 1;
+                close(fd);
+                errno = ECANCELED;
+                return -1;
+            }
+            if (err != EINTR && err != EAGAIN)
+                break;              /* not a wait for the backlog */
+        }
+        if (!connected)
+        {
+            /* ENOENT and ECONNREFUSED are the "daemon is down" shapes (no
+             * socket file, or a stale one without a listener). They repeat on
+             * every query while the daemon is out and the caller already
+             * reports that, so they stay at DEBUG. Anything else (EAGAIN: the
+             * backlog stayed full for the whole budget, EINTR: the budget ran
+             * out on a signal, EACCES, ...) means a daemon that is there but
+             * could not be reached, which an operator needs to see. */
+            if (err == ENOENT || err == ECONNREFUSED)
+                LOG_DEBUG("[cuvs_ipc] connect to %s failed: %s (errno=%d)\n",
+                          socket_path, strerror(err), err);
+            else
+                LOG_WARN("[cuvs_ipc] connect to %s failed: %s (errno=%d, "
+                         "%d attempts, budget %d s)\n",
+                         socket_path, strerror(err), err, attempts, recv_timeout_sec);
+            close(fd);
+            errno = err;
+            return -1;
+        }
+        /* The request itself gets the full send timeout, not the last slice. */
+        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
     }
 
     /* #119 (adversarial review F1): post-connect SO_PEERCRED check. The
@@ -173,9 +286,11 @@ uds_connect_ex(const char *socket_path, int recv_timeout_sec)
         socklen_t    cred_len = sizeof(cred);
         if (getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &cred, &cred_len) != 0)
         {
+            int err = errno;
             LOG_ERROR("[cuvs_ipc] SO_PEERCRED failed: %s — refusing to connect\n",
-                      strerror(errno));
+                      strerror(err));
             close(fd);
+            errno = err;
             return -1;
         }
         if (cred.uid != (uid_t) g_expected_daemon_uid)
@@ -184,12 +299,19 @@ uds_connect_ex(const char *socket_path, int recv_timeout_sec)
                       "— refusing to connect (possible hijack)\n",
                       (unsigned) cred.uid, g_expected_daemon_uid);
             close(fd);
+            errno = EACCES;
             return -1;
         }
     }
 #endif
 
     return fd;
+}
+
+static int
+uds_connect_ex(const char *socket_path, int recv_timeout_sec)
+{
+    return uds_connect_wait(socket_path, recv_timeout_sec, NULL);
 }
 
 static int
@@ -319,10 +441,7 @@ recv_all(int fd, void *buf, size_t len)
     return 0;
 }
 
-/* 3S: query-cancel / statement_timeout hook. The backend registers a callback
- * that reports whether an interrupt is pending; the search reply-wait polls it. */
-static int (*g_wait_cb)(void) = NULL;
-
+/* 3S: the backend registers g_wait_cb (defined with the socket helpers). */
 void
 cuvs_ipc_set_wait_callback(int (*cb)(void))
 {
@@ -585,7 +704,7 @@ cuvs_ipc_search(
     uint32_t     *latency_us_out,
     int          *delta_merged_out)
 {
-    char shm_key[64];
+    char shm_key[64] = "";   /* stays empty if make_shm_key fails */
     int  shm_fd = -1;
     int  sock   = -1;
     int  rc     = CUVS_STATUS_ERROR;
@@ -601,10 +720,16 @@ cuvs_ipc_search(
     if (shm_fd < 0)
         goto cleanup;       /* rc stays CUVS_STATUS_ERROR — our side issue */
 
-    sock = uds_connect(socket_path);
-    if (sock < 0) {
-        rc = CUVS_STATUS_UNAVAILABLE;   /* daemon not reachable */
-        goto cleanup;
+    {
+        int canceled;
+        sock = uds_connect_wait(socket_path, 30 /* sec budget */, &canceled);
+        if (sock < 0) {
+            /* #224: a cancel that interrupted the connect is not a daemon
+             * failure; report it like a canceled reply wait (3S). */
+            rc = canceled ? CUVS_STATUS_CANCELED
+                          : CUVS_STATUS_UNAVAILABLE;   /* daemon not reachable */
+            goto cleanup;
+        }
     }
 
     CuvsCmdFrame cmd = {
@@ -682,7 +807,8 @@ cleanup:
         close(sock);
     if (shm_fd >= 0)
         close(shm_fd);
-    shm_unlink(shm_key);
+    if (shm_key[0])
+        shm_unlink(shm_key);
     return rc;
 }
 
@@ -716,7 +842,7 @@ cuvs_ipc_search_batch(
     uint32_t     *k_out,
     uint32_t     *latency_us_out)
 {
-    char   req_key[64];
+    char   req_key[64] = "";   /* stays empty if make_shm_key fails */
     int    shm_fd   = -1;
     int    sock     = -1;
     int    reply_fd = -1;
@@ -815,7 +941,8 @@ cleanup:
     if (rmem != MAP_FAILED) munmap(rmem, rtotal);
     if (reply_fd >= 0)      close(reply_fd);
     if (shm_fd >= 0)        close(shm_fd);
-    shm_unlink(req_key);
+    if (req_key[0])
+        shm_unlink(req_key);
     if (sock >= 0)          close(sock);
     return rc;
 }
@@ -1669,8 +1796,8 @@ cuvs_ipc_search_filtered(
     int            use_prefilter,
     int            exact_chunk_cap)
 {
-    char shm_key[64];
-    char filter_shm_key[64];
+    char shm_key[64] = "";   /* stays empty if make_shm_key fails */
+    char filter_shm_key[64] = "";
     int  shm_fd        = -1;
     int  filter_shm_fd = -1;
     int  sock          = -1;
@@ -1792,8 +1919,9 @@ cleanup:
     if (sock >= 0)        close(sock);
     if (shm_fd >= 0)      close(shm_fd);
     if (filter_shm_fd >= 0) close(filter_shm_fd);
-    shm_unlink(shm_key);
-    if (has_filter)
+    if (shm_key[0])
+        shm_unlink(shm_key);
+    if (has_filter && filter_shm_key[0])
         shm_unlink(filter_shm_key);
     return rc;
 }
@@ -1823,8 +1951,8 @@ cuvs_ipc_search_stream_bf(
     int            *n_out,
     uint32_t       *latency_us_out)
 {
-    char shm_key[64];
-    char filter_shm_key[64];
+    char shm_key[64] = "";   /* stays empty if make_shm_key fails */
+    char filter_shm_key[64] = "";
     int  shm_fd        = -1;
     int  filter_shm_fd = -1;
     int  sock          = -1;
@@ -1938,8 +2066,9 @@ cleanup:
     if (sock >= 0)          close(sock);
     if (shm_fd >= 0)        close(shm_fd);
     if (filter_shm_fd >= 0) close(filter_shm_fd);
-    shm_unlink(shm_key);
-    if (has_filter)
+    if (shm_key[0])
+        shm_unlink(shm_key);
+    if (has_filter && filter_shm_key[0])
         shm_unlink(filter_shm_key);
     return rc;
 }
@@ -2206,7 +2335,7 @@ cuvs_ipc_search_ivfpq(
     int          *n_out,
     uint32_t     *latency_us_out)
 {
-    char shm_key[64];
+    char shm_key[64] = "";   /* stays empty if make_shm_key fails */
     int  shm_fd = -1;
     int  sock   = -1;
     int  rc     = CUVS_STATUS_ERROR;
@@ -2280,7 +2409,8 @@ cuvs_ipc_search_ivfpq(
 cleanup:
     if (sock >= 0)   close(sock);
     if (shm_fd >= 0) close(shm_fd);
-    shm_unlink(shm_key);
+    if (shm_key[0])
+        shm_unlink(shm_key);
     return rc;
 }
 
