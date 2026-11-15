@@ -55,22 +55,43 @@ def no_core():
     resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
 
 
+def build_and_run(case):
+    """Compile test_res_pool.cpp against the headers in `case` and run it."""
+    c = subprocess.run(['c++', '-std=c++17', '-I', str(case), '-I', 'src', '-o', str(case / 't'),
+                        'test/unit/test_res_pool.cpp', '-lpthread'], cwd=ROOT, capture_output=True)
+    if c.returncode:
+        return dict(stage='compile', exit=c.returncode, stderr=c.stderr.decode()[-300:])
+    r = subprocess.run([str(case / 't')], cwd=ROOT, capture_output=True, preexec_fn=no_core, timeout=60)
+    return dict(stage='run', exit=r.returncode, stderr=r.stderr.decode())
+
+
 def main(output):
     out = Path(output).resolve(); out.mkdir(exist_ok=False)
     orig = {n: (ROOT / 'src' / n).read_text() for n in HEADERS}
+    # A mutant only counts as detected when the same build passes without the
+    # mutation: against a test that already fails, every mutant would "fail".
+    base = out / 'baseline'; base.mkdir()
+    for n, body in orig.items():
+        (base / n).write_text(body)
+    control = build_and_run(base)
+    if control['stage'] != 'run' or control['exit'] != 0:
+        (out / 'RESULT.json').write_text(json.dumps(dict(status='FAIL_BASELINE_NOT_GREEN', baseline=control), indent=2) + '\n')
+        raise AssertionError('BASELINE_NOT_GREEN: test_res_pool.cpp does not pass on the unmutated headers '
+                             '(%s, exit %s); no mutant result is meaningful. %s'
+                             % (control['stage'], control['exit'], control['stderr'].strip()[-300:]))
     rows = []
     for name, header, old, new in BEHAVIOUR:
         case = out / name; case.mkdir()
         assert orig[header].count(old) == 1, ('ANCHOR', name)
         for n, body in orig.items():
             (case / n).write_text(body.replace(old, new, 1) if n == header else body)
-        c = subprocess.run(['c++', '-std=c++17', '-I', str(case), '-I', 'src', '-o', str(case / 't'),
-                            'test/unit/test_res_pool.cpp', '-lpthread'], cwd=ROOT, capture_output=True)
-        if c.returncode:
-            rows.append(dict(name=name, status='FAIL_COMPILE', err=c.stderr.decode()[-300:])); continue
-        r = subprocess.run([str(case / 't')], cwd=ROOT, capture_output=True, preexec_fn=no_core, timeout=60)
-        err = r.stderr.decode()
-        rows.append(dict(name=name, status='PASS_MUTATION_DETECTED' if r.returncode and 'Assertion' in err else 'FAIL_MUTATION_SURVIVED',
+        ran = build_and_run(case)
+        if ran['stage'] == 'compile':
+            rows.append(dict(name=name, status='FAIL_COMPILE', err=ran['stderr'])); continue
+        err = ran['stderr']
+        # Detected: the run, which passes unmutated, now fails on a failed assertion.
+        rows.append(dict(name=name,
+                         status='PASS_MUTATION_DETECTED' if ran['exit'] and 'Assertion' in err else 'FAIL_MUTATION_SURVIVED',
                          assertion=err.strip().splitlines()[-1][:160] if err.strip() else ''))
     src = dict(w=(ROOT / 'src/cuvs_wrapper.cu').read_text(), s=(ROOT / 'src/pg_cuvs_server.c').read_text(),
                sh=(ROOT / 'src/cuvs_wrapper_shim_cpu.c').read_text())

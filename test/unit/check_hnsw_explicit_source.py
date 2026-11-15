@@ -4,10 +4,12 @@ import argparse
 import hashlib
 import json
 import re
-import subprocess
 
 ROOT = Path(__file__).resolve().parents[2]
 BASE = '42f8a43daa43451ae3e38d28e729886a74c39a66'
+# cuvs_hnsw_build_file() of src/cuvs_wrapper.cu at BASE, kept in the tree so the
+# check does not need the git history of that commit (CI checks out depth 1).
+BASELINE = ROOT / 'test/unit/fixtures/hnsw_build_file.42f8a43d.cu.txt'
 # Approved changes to the moved native body, each (statement it must directly
 # follow, statement, reason). Each must appear exactly once at its anchor and is
 # removed before the token comparison; any other change still fails
@@ -138,7 +140,7 @@ def main(output):
     out = Path(output).resolve(); out.mkdir(exist_ok=False)
     w = (ROOT/'src/cuvs_wrapper.cu').read_text(); b = (ROOT/'src/pg_cuvs.c').read_text()
     s = (ROOT/'src/pg_cuvs_server.c').read_text()
-    old = subprocess.check_output(['git', 'show', BASE+':src/cuvs_wrapper.cu'], cwd=ROOT, text=True)
+    old = BASELINE.read_text()
     result = check(w, b, s, old)
     # Valid source deltas that must no longer conform to the preserved contract.
     prep = function(w, 'static int prepare_hnsw_settings(')

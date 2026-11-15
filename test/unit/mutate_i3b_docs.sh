@@ -5,6 +5,12 @@ set -u
 cd "$(dirname "$0")/../.."
 T=$(mktemp -d); cp docs/reference.md "$T/ref"; cp src/cuvs_cache_policy.h "$T/hdr"
 trap 'cp "$T/ref" docs/reference.md; cp "$T/hdr" src/cuvs_cache_policy.h; rm -rf "$T"' EXIT
+# A mutant only counts as caught when the check passes without the mutation:
+# against a check that already fails, every mutant would turn it RED.
+if ! python3 test/unit/check_i3b_docs.py >"$T/o" 2>&1; then
+    echo "BASELINE_NOT_GREEN: check_i3b_docs.py fails on the unmutated docs and header; no mutant result is meaningful"
+    tail -n 3 "$T/o"; exit 1
+fi
 bad=0
 run() { # file sed-expr label
     cp "$T/ref" docs/reference.md; cp "$T/hdr" src/cuvs_cache_policy.h

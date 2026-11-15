@@ -59,6 +59,23 @@ def command(argv, folder, label):
                 stderr_sha256=hashlib.sha256(q.stderr).hexdigest())
 
 
+def build_and_run(case, files, ipc):
+    """Write `files` into `case`, build the unit test they feed and run it.
+    Returns (compile record, run record or None when the build failed)."""
+    for n, body in files.items():
+        (case / n).write_text(body)
+    test = 'test_hnsw_build_ipc.c' if ipc else 'test_hnsw_explicit_route.c'
+    argv = ['/usr/bin/cc', '-std=gnu11', '-Wall', '-Wextra', '-I', str(case), '-I', 'src',
+            '-o', str(case / 'check'), 'test/unit/' + test]
+    if ipc:
+        argv += [str(case / 'cuvs_ipc.c'), 'src/cuvs_util.c', 'src/cuvs_build_corpus.c', '-lm']
+    argv += ['-lpthread']
+    compiled = command(argv, case, 'compile')
+    if compiled['exit'] != 0:
+        return compiled, None
+    return compiled, command([str(case / 'check')], case, 'run')
+
+
 def main(output):
     out = Path(output).resolve(); out.mkdir(exist_ok=False)
     originals = {n: (ROOT / 'src' / n).read_text() for n in HEADERS + ['cuvs_ipc.c']}
@@ -67,26 +84,38 @@ def main(output):
              'reader_truncation_guard_removed', 'tiny_wrongly_gets_resident_status13',
              'sampling_ignores_GPU_budget', 'writer_route_contract_removed',
              'reply_request_binding_removed', 'prefix_version_guard_after_tail']
+    # A mutant only counts as detected when the same build passes without the
+    # mutation: against a test that already fails, every mutant would "fail".
+    # Each of the two unit tests the mutants feed gets its own unmutated run.
+    controls = {}
+    for label, ipc in (('baseline-explicit-route', False), ('baseline-build-ipc', True)):
+        case = out / label; case.mkdir()
+        compiled, ran = build_and_run(case, dict(originals), ipc)
+        controls[label] = dict(compile=compiled, run=ran)
+        if ran is None or ran['exit'] != 0:
+            (out / 'RESULT.json').write_text(json.dumps(dict(status='FAIL_BASELINE_NOT_GREEN', controls=controls), indent=2) + '\n')
+            tail = (case / ('compile.stderr' if ran is None else 'run.stderr')).read_text().strip()[-300:]
+            raise AssertionError('BASELINE_NOT_GREEN: %s does not %s on the unmutated sources; no mutant result is meaningful. %s'
+                                 % ('test_hnsw_build_ipc.c' if ipc else 'test_hnsw_explicit_route.c',
+                                    'build' if ran is None else 'pass', tail))
     results = []
     for name in names:
         case = out / name; case.mkdir(); files = dict(originals); mutate(name, files)
-        for n, body in files.items():
-            (case / n).write_text(body)
         ipc = name in ('reply_request_binding_removed', 'prefix_version_guard_after_tail')
-        test = 'test_hnsw_build_ipc.c' if ipc else 'test_hnsw_explicit_route.c'
-        argv = ['/usr/bin/cc', '-std=gnu11', '-Wall', '-Wextra', '-I', str(case), '-I', 'src',
-                '-o', str(case / 'check'), 'test/unit/' + test]
-        if ipc:
-            argv += [str(case / 'cuvs_ipc.c'), 'src/cuvs_util.c', 'src/cuvs_build_corpus.c', '-lm']
-        argv += ['-lpthread']
-        compiled = command(argv, case, 'compile')
-        if compiled['exit'] != 0:
+        compiled, ran = build_and_run(case, files, ipc)
+        if ran is None:
             row = dict(name=name, status='FAIL_COMPILE_NOT_GUARD_DETECTION', compile=compiled)
         else:
-            ran = command([str(case / 'check')], case, 'run')
             error = (case / 'run.stderr').read_text()
-            caught = ran['exit'] != 0 and ('Assertion failed' in error or 'assertion' in error.lower())
-            row = dict(name=name, status='PASS_MUTATION_DETECTED' if caught else 'FAIL_MUTATION_SURVIVED',
+            # Detected: the run, which passes unmutated, now fails on a failed assertion.
+            # A signal or an exit status without an assertion says nothing about the guard.
+            if ran['exit'] == 0:
+                status = 'FAIL_MUTATION_SURVIVED'
+            elif 'assertion' in error.lower():
+                status = 'PASS_MUTATION_DETECTED'
+            else:
+                status = 'FAIL_NOT_AN_ASSERTION'
+            row = dict(name=name, status=status,
                        compile=compiled, run=ran,
                        changes={n: dict(before_sha256=hashlib.sha256(originals[n].encode()).hexdigest(),
                                         after_sha256=hashlib.sha256(v.encode()).hexdigest())
@@ -95,7 +124,7 @@ def main(output):
         (case / 'RESULT.json').write_text(json.dumps(row, indent=2) + '\n')
     unchanged = all((ROOT / 'src' / n).read_text() == v for n, v in originals.items())
     value = dict(status='PASS' if unchanged and all(r['status'] == 'PASS_MUTATION_DETECTED' for r in results) else 'FAIL',
-                 count=len(results), results=results, production_sources_unchanged=unchanged,
+                 count=len(results), controls=controls, results=results, production_sources_unchanged=unchanged,
                  scope='CPU actual-header/IPC mutants; real GPU/SDK/PG/daemon not run')
     (out / 'RESULT.json').write_text(json.dumps(value, indent=2) + '\n')
     print(json.dumps(dict(status=value['status'], count=len(results), output=str(out / 'RESULT.json'))))

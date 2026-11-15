@@ -148,6 +148,18 @@ SAN = ['-fsanitize=address,undefined', '-fno-sanitize-recover=undefined']
 SOURCES = ['cuvs_util.c', 'cuvs_ipc.c', 'cuvs_ipc.h', 'cuvs_build_corpus.c']
 
 
+def build_and_run(case, test, extra, sources):
+    """Compile `test` against the sources in `case` and run it: (stage, exit, log)."""
+    binary = str(case / 'check')
+    rc, log = run(['cc', '-std=gnu11', '-Wall', '-Wextra', '-I', str(case), '-I', 'src',
+                   '-o', binary, test] + [str(case / f) for f in sources] + extra)
+    stage = 'compile'
+    if rc == 0:
+        stage = 'run'
+        rc, log = run([binary])
+    return stage, rc, log
+
+
 def main(output):
     out = Path(output).resolve()
     out.mkdir(parents=True, exist_ok=False)
@@ -176,6 +188,23 @@ def main(output):
     cases += [(n, o, w, f, IPC_TEST, SAN + ['-lpthread', '-lm'],
                ['cuvs_ipc.c', 'cuvs_util.c', 'cuvs_build_corpus.c'])
               for n, (f, o, w) in IPC_MUTATIONS.items()]
+    # A mutant only counts as detected when the same build passes without the
+    # mutation: against a test that already fails, every mutant would "fail".
+    # Each distinct (test, flags, sources) combination gets one unmutated run.
+    configs = list(dict.fromkeys((test, tuple(extra), tuple(sources))
+                                 for _, _, _, _, test, extra, sources in cases))
+    for i, (test, extra, sources) in enumerate(configs):
+        case = out / ('baseline-%d' % i)
+        case.mkdir()
+        for fname, body in originals.items():
+            (case / fname).write_text(body)
+        stage, rc, log = build_and_run(case, test, list(extra), list(sources))
+        (case / 'log.txt').write_text(log)
+        print(('GREEN ' if stage == 'run' and rc == 0 else 'NOT GREEN ') + 'baseline ' + test)
+        if stage != 'run' or rc != 0:
+            print('BASELINE_NOT_GREEN: %s does not %s on the unmutated sources (exit %s); no mutant result is meaningful.\n%s'
+                  % (test, 'build' if stage == 'compile' else 'pass', rc, log.strip()[-600:]))
+            return 1
     for name, old, new, target, test, extra, sources in cases:
         case = out / name
         case.mkdir()
@@ -184,13 +213,7 @@ def main(output):
                 assert body.count(old) == 1, (name, body.count(old))
                 body = body.replace(old, new, 1)
             (case / fname).write_text(body)
-        binary = str(case / 'check')
-        rc, log = run(['cc', '-std=gnu11', '-Wall', '-Wextra', '-I', str(case), '-I', 'src',
-                       '-o', binary, test] + [str(case / f) for f in sources] + extra)
-        stage = 'compile'
-        if rc == 0:
-            stage = 'run'
-            rc, log = run([binary])
+        stage, rc, log = build_and_run(case, test, extra, sources)
         # Only the wire-version mutant is a compile-time guard. An unrelated
         # compiler failure never demonstrates that a runtime mutant was caught.
         red = rc != 0 and (stage == 'run' or
