@@ -300,13 +300,13 @@ test-circuit-source: test/unit/check_circuit_source.py src/pg_cuvs.c
 # the invariants the approved route design relies on, and replay planted
 # defects against their own rules. The two test_* scripts compile copies of the
 # real headers with one planted defect each and need the unit test to fail.
-# A mutation script reports "detected" for every mutant when the unit test it
-# mutates already fails, so those two tests (test-hnsw-auto-overflow,
-# test-hnsw-explicit-route) are prerequisites and run unmutated first. The IPC
-# test behind the other mutants, test-hnsw-build-ipc, is a prerequisite of
-# test-unit. Each script writes a report into a directory that must not exist
-# yet, so they get a fresh temporary one. All four run even if one fails.
-# Python 3 stdlib and cc only: no git history, PostgreSQL, CUDA or daemon.
+# The two unit tests the mutation scripts mutate (test-hnsw-auto-overflow,
+# test-hnsw-explicit-route) are prerequisites: no other CI step runs them. The
+# mutation scripts also run the unmutated build themselves before the first
+# mutant and fail with BASELINE_NOT_GREEN if it does not pass. Each script
+# writes a report into a directory that must not exist yet, so they get a fresh
+# temporary one. All four run even if one fails. Python 3 stdlib and cc only:
+# no git history, PostgreSQL, CUDA or daemon.
 .PHONY: test-source-checks
 test-source-checks: test-hnsw-auto-overflow test-hnsw-explicit-route
 	set -e; out=$$(mktemp -d "$${TMPDIR:-/tmp}/pgcuvs-source-checks.XXXXXX"); \

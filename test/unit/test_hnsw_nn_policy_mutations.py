@@ -15,17 +15,31 @@ mutations = {
     'missing max iterations': ('r->max_iterations == cuvs_hnsw_scaled_quality(r->sdk_default_iterations,\n                                                          p->requested_ef, 1, 65535)', 'r->max_iterations <= 65535'),
     'wrong termination': ('&& r->termination_threshold == 0.0001f;', ';'),
 }
+
+
+def build_and_run(dst, text):
+    (dst / 'cuvs_hnsw_policy.h').write_text(text)
+    exe = dst / 'check'
+    built = subprocess.run(['cc', '-std=gnu11', '-Wall', '-Wextra', '-Werror',
+                            '-I', str(dst), str(test), '-o', str(exe)], capture_output=True, text=True)
+    if built.returncode:
+        return built, None
+    return built, subprocess.run([str(exe)], capture_output=True, text=True)
+
+
 with tempfile.TemporaryDirectory(prefix='pgcuvs-nn-policy-') as tmp:
     dst = Path(tmp)
+    # A mutant only counts when the same build passes without the mutation:
+    # against a test that already fails, every mutant would "fail".
+    built, run = build_and_run(dst, header)
+    if run is None or run.returncode:
+        raise RuntimeError('BASELINE_NOT_GREEN: test_hnsw_nn_policy.c does not pass on the unmutated header; '
+                           'no mutant result is meaningful. ' + (built.stderr if run is None else run.stdout + run.stderr))
     for name, (old, new) in mutations.items():
         assert header.count(old) == 1, name
-        (dst / 'cuvs_hnsw_policy.h').write_text(header.replace(old, new))
-        exe = dst / 'check'
-        built = subprocess.run(['cc', '-std=gnu11', '-Wall', '-Wextra', '-Werror',
-                                '-I', str(dst), str(test), '-o', str(exe)], capture_output=True, text=True)
-        if built.returncode:
+        built, run = build_and_run(dst, header.replace(old, new))
+        if run is None:
             raise RuntimeError(f'{name}: mutation did not compile: {built.stderr}')
-        run = subprocess.run([str(exe)], capture_output=True, text=True)
         if not run.returncode:
             raise RuntimeError(f'{name}: mutation survived')
         print(f'{name}: detected (rc={run.returncode})')

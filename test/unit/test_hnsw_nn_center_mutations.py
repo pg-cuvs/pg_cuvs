@@ -33,20 +33,34 @@ mutants = {
     'dtype from centered rows': ('precision', 'double half_bound = metric == CUVS_METRIC_L2 ? 4.0 * max_norm : max_norm;',
                                  'double half_bound = graph_input_centered ? 4.0 * out->spread : metric == CUVS_METRIC_L2 ? 4.0 * max_norm : max_norm;'),
 }
+
+
+def build_and_run(d, files):
+    (d / 'cuvs_hnsw_nn_center.h').write_text(files['center'])
+    (d / 'cuvs_hnsw_nn_precision.h').write_text(files['precision'])
+    exe = d / 'check'
+    b = subprocess.run(['cc', '-std=gnu11', '-O2', '-Wall', '-Wextra', '-I', str(d), '-I', str(root / 'src'),
+                        str(test), '-lm', '-o', str(exe)], capture_output=True, text=True)
+    if b.returncode:
+        return b, None
+    return b, subprocess.run([str(exe)], capture_output=True, text=True)
+
+
 with tempfile.TemporaryDirectory(prefix='pgcuvs-nn-center-') as tmp:
     d = Path(tmp)
+    # A mutant only counts when the same build passes without the mutation:
+    # against a test that already fails, every mutant would "fail".
+    b, r = build_and_run(d, {'center': center, 'precision': precision})
+    if r is None or r.returncode:
+        raise RuntimeError('BASELINE_NOT_GREEN: test_hnsw_nn_center.c does not pass on the unmutated headers; '
+                           'no mutant result is meaningful. ' + (b.stderr if r is None else r.stdout + r.stderr))
     for name, (which, old, new) in mutants.items():
         files = {'center': center, 'precision': precision}
         assert files[which].count(old) == 1, name
         files[which] = files[which].replace(old, new)
-        (d / 'cuvs_hnsw_nn_center.h').write_text(files['center'])
-        (d / 'cuvs_hnsw_nn_precision.h').write_text(files['precision'])
-        exe = d / 'check'
-        b = subprocess.run(['cc', '-std=gnu11', '-O2', '-Wall', '-Wextra', '-I', str(d), '-I', str(root / 'src'),
-                            str(test), '-lm', '-o', str(exe)], capture_output=True, text=True)
-        if b.returncode:
+        b, r = build_and_run(d, files)
+        if r is None:
             raise RuntimeError(f'{name}: did not compile: {b.stderr}')
-        r = subprocess.run([str(exe)], capture_output=True, text=True)
         if r.returncode == 0:
             raise RuntimeError(f'{name}: survived')
         print(f'{name}: detected (rc={r.returncode})')

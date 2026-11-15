@@ -110,29 +110,56 @@ def no_core():
     resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
 
 
+def build_and_run(case):
+    """Compile test_hnsw_auto_overflow.c against the headers in `case` and run it."""
+    argv = ['cc', '-std=gnu11', '-Wall', '-Wextra', '-I', str(case), '-I', 'src', '-o',
+            str(case / 'check'), 'test/unit/test_hnsw_auto_overflow.c', '-lpthread', '-lm']
+    c = subprocess.run(argv, cwd=ROOT, capture_output=True, timeout=60)
+    if c.returncode != 0:
+        return dict(stage='compile', exit=c.returncode, stderr=c.stderr.decode()[-400:])
+    r = subprocess.run([str(case / 'check')], cwd=ROOT, capture_output=True, timeout=60, preexec_fn=no_core)
+    return dict(stage='run', exit=r.returncode, stderr=r.stderr.decode())
+
+
 def main(output):
     out = Path(output).resolve(); out.mkdir(exist_ok=False)
     originals = {n: (ROOT / 'src' / n).read_text() for n in HEADERS}
+    # A mutant only counts as detected when the same build passes without the
+    # mutation: against a test that already fails, every mutant would "fail".
+    base = out / 'baseline'; base.mkdir()
+    for n, body in originals.items():
+        (base / n).write_text(body)
+    control = build_and_run(base)
+    if control['stage'] != 'run' or control['exit'] != 0:
+        (out / 'RESULT.json').write_text(json.dumps(dict(status='FAIL_BASELINE_NOT_GREEN', baseline=control), indent=2) + '\n')
+        raise AssertionError('BASELINE_NOT_GREEN: test_hnsw_auto_overflow.c does not pass on the unmutated headers '
+                             '(%s, exit %s); no mutant result is meaningful. %s'
+                             % (control['stage'], control['exit'], control['stderr'].strip()[-300:]))
     rows = []
     for name, header, old, new in MUTANTS:
         case = out / name; case.mkdir()
         assert originals[header].count(old) == 1, ('MUTANT_ANCHOR', name, originals[header].count(old))
         for n, body in originals.items():
             (case / n).write_text(body.replace(old, new, 1) if n == header else body)
-        argv = ['cc', '-std=gnu11', '-Wall', '-Wextra', '-I', str(case), '-I', 'src', '-o',
-                str(case / 'check'), 'test/unit/test_hnsw_auto_overflow.c', '-lpthread', '-lm']
-        c = subprocess.run(argv, cwd=ROOT, capture_output=True, timeout=60)
-        if c.returncode != 0:
-            rows.append(dict(name=name, status='FAIL_COMPILE_NOT_GUARD_DETECTION', stderr=c.stderr.decode()[-400:]))
+        ran = build_and_run(case)
+        if ran['stage'] == 'compile':
+            rows.append(dict(name=name, status='FAIL_COMPILE_NOT_GUARD_DETECTION', stderr=ran['stderr']))
             continue
-        r = subprocess.run([str(case / 'check')], cwd=ROOT, capture_output=True, timeout=60, preexec_fn=no_core)
-        err = r.stderr.decode()
-        caught = r.returncode != 0 and 'Assertion failed' in err or 'assertion' in err.lower()
-        rows.append(dict(name=name, status='PASS_MUTATION_DETECTED' if caught else 'FAIL_MUTATION_SURVIVED',
-                         exit=r.returncode, assertion=err.strip().splitlines()[-1][:200] if err.strip() else ''))
+        err = ran['stderr']
+        # Detected: the run, which passes unmutated, now fails on a failed assertion.
+        # Any other failure (a signal, an exit status without an assertion) says nothing about the guard.
+        if ran['exit'] == 0:
+            status = 'FAIL_MUTATION_SURVIVED'
+        elif 'assertion' in err.lower():
+            status = 'PASS_MUTATION_DETECTED'
+        else:
+            status = 'FAIL_NOT_AN_ASSERTION'
+        rows.append(dict(name=name, status=status, exit=ran['exit'],
+                         assertion=err.strip().splitlines()[-1][:200] if err.strip() else ''))
     unchanged = all((ROOT / 'src' / n).read_text() == v for n, v in originals.items())
     status = 'PASS' if unchanged and all(r['status'] == 'PASS_MUTATION_DETECTED' for r in rows) else 'FAIL'
-    value = dict(status=status, count=len(rows), production_sources_unchanged=unchanged, results=rows,
+    value = dict(status=status, count=len(rows), baseline=dict(stage=control['stage'], exit=control['exit']),
+                 production_sources_unchanged=unchanged, results=rows,
                  scope='CPU header mutants vs test_hnsw_auto_overflow.c; GPU/SDK/PG not run')
     (out / 'RESULT.json').write_text(json.dumps(value, indent=2) + '\n')
     print(json.dumps(value))
