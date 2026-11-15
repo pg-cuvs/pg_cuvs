@@ -566,6 +566,152 @@ hnsw_pread_exact(int fd, void *buffer, size_t length, uint64_t offset)
     return true;
 }
 
+/* Bounded read-ahead for the sequential import passes.  Each logical field
+ * read keeps hnsw_pread_exact's bounds and result: a window only supplies
+ * bytes it already holds completely, and any request it cannot satisfy is
+ * read with hnsw_pread_exact itself.  A failed or short window fill is never
+ * reported; only the requested range decides success, as before.  A fill
+ * that serves fewer than HNSW_READ_WINDOW_MIN_SERVED reads is idle; after two
+ * consecutive or eight total idle fills (scattered TID labels) the stream
+ * reads directly for the rest of its life, so it never issues more than a
+ * few reads beyond the direct path. */
+#define HNSW_READ_WINDOW_BYTES (1024 * 1024)
+#define HNSW_READ_WINDOW_MIN_SERVED 8
+#define HNSW_READ_WINDOW_IDLE_RUN 2
+#define HNSW_READ_WINDOW_IDLE_TOTAL 8
+
+typedef struct HnswReadWindow
+{
+    int fd;
+    unsigned char *buffer;      /* NULL: every read is hnsw_pread_exact */
+    size_t capacity;
+    uint64_t start;
+    size_t length;              /* valid bytes at start */
+    bool filled;                /* a fill has been attempted at start */
+    uint32_t served;            /* reads served by the current fill */
+    uint32_t idle_run;          /* consecutive idle fills */
+    uint32_t idle_total;        /* idle fills over the window's life */
+} HnswReadWindow;
+
+static void
+hnsw_window_init(HnswReadWindow *window, int fd, void *buffer, size_t capacity)
+{
+    window->fd = fd;
+    window->buffer = (unsigned char *)buffer;
+    window->capacity = buffer ? capacity : 0;
+    window->start = 0;
+    window->length = 0;
+    window->filled = false;
+    window->served = 0;
+    window->idle_run = 0;
+    window->idle_total = 0;
+}
+
+static void
+hnsw_window_bind(HnswReadWindow *window, int fd)
+{
+    if (window->fd == fd)
+        return;
+    window->fd = fd;
+    window->start = 0;
+    window->length = 0;
+    window->filled = false;
+    window->served = 0;
+    window->idle_run = 0;
+    window->idle_total = 0;
+}
+
+static bool
+hnsw_window_covers(const HnswReadWindow *window, uint64_t offset, size_t length)
+{
+    return window->filled && offset >= window->start &&
+        offset - window->start <= window->length &&
+        length <= window->length - (size_t)(offset - window->start);
+}
+
+/* Read up to capacity bytes from offset.  Stops at EOF or a read error;
+ * retries EINTR and continues after short positive reads. */
+static void
+hnsw_window_fill(HnswReadWindow *window, uint64_t offset)
+{
+    size_t want = window->capacity;
+
+    if (window->filled)
+    {
+        if (window->served < HNSW_READ_WINDOW_MIN_SERVED)
+        {
+            window->idle_run++;
+            window->idle_total++;
+        }
+        else
+            window->idle_run = 0;
+        if (window->idle_run >= HNSW_READ_WINDOW_IDLE_RUN ||
+            window->idle_total >= HNSW_READ_WINDOW_IDLE_TOTAL)
+        {
+            window->buffer = NULL;      /* direct reads from now on */
+            window->capacity = 0;
+            window->filled = false;
+            window->length = 0;
+            return;
+        }
+    }
+    window->start = offset;
+    window->length = 0;
+    window->filled = true;
+    window->served = 0;
+    if (offset > (uint64_t)INT64_MAX)
+        return;
+    if ((uint64_t)want > (uint64_t)INT64_MAX - offset)
+        want = (size_t)((uint64_t)INT64_MAX - offset);
+    while (window->length < want)
+    {
+        ssize_t n = pread(window->fd, window->buffer + window->length,
+                          want - window->length,
+                          (off_t)(offset + (uint64_t)window->length));
+        if (n < 0 && errno == EINTR)
+            continue;
+        if (n <= 0)
+            break;
+        window->length += (size_t)n;
+    }
+}
+
+/* Make [offset, offset + length) resident when it fits; never fails. */
+static void
+hnsw_window_reserve(HnswReadWindow *window, uint64_t offset, uint64_t length)
+{
+    if (window->buffer == NULL || length > window->capacity ||
+        offset > (uint64_t)INT64_MAX ||
+        length > (uint64_t)INT64_MAX - offset ||
+        hnsw_window_covers(window, offset, (size_t)length))
+        return;
+    hnsw_window_fill(window, offset);
+}
+
+static bool
+hnsw_window_read(HnswReadWindow *window, void *buffer, size_t length,
+                 uint64_t offset)
+{
+    if (offset > (uint64_t)INT64_MAX ||
+        length > (uint64_t)INT64_MAX - offset)
+        return false;
+    if (length == 0)
+        return true;
+    if (window->buffer != NULL && length <= window->capacity)
+    {
+        if (!hnsw_window_covers(window, offset, length))
+            hnsw_window_fill(window, offset);
+        if (window->buffer != NULL &&
+            hnsw_window_covers(window, offset, length))
+        {
+            memcpy(buffer, window->buffer + (offset - window->start), length);
+            window->served++;
+            return true;
+        }
+    }
+    return hnsw_pread_exact(window->fd, buffer, length, offset);
+}
+
 static bool
 hnsw_tid_is_valid(uint64_t tid)
 {
@@ -578,8 +724,8 @@ hnsw_tid_is_valid(uint64_t tid)
 }
 
 static bool
-hnsw_read_tid_for_label(int tids_fd, uint64_t n_vecs, uint64_t label,
-                        uint64_t *tid_out, char *error, size_t error_size)
+hnsw_read_tid_window(HnswReadWindow *tids, uint64_t n_vecs, uint64_t label,
+                     uint64_t *tid_out, char *error, size_t error_size)
 {
     uint64_t body_offset;
     uint64_t file_offset;
@@ -590,7 +736,7 @@ hnsw_read_tid_for_label(int tids_fd, uint64_t n_vecs, uint64_t label,
                                    "HNSW label is outside the TID row count");
     if (!hnsw_mul_u64(label, sizeof(uint64_t), &body_offset) ||
         !hnsw_add_u64(sizeof(CuvsTidsHeader), body_offset, &file_offset) ||
-        !hnsw_pread_exact(tids_fd, &tid, sizeof(tid), file_offset))
+        !hnsw_window_read(tids, &tid, sizeof(tid), file_offset))
         return hnsw_set_file_error(error, error_size,
                                    "cannot read TID for HNSW label");
     if (!hnsw_tid_is_valid(tid))
@@ -598,6 +744,18 @@ hnsw_read_tid_for_label(int tids_fd, uint64_t n_vecs, uint64_t label,
                                    "TID file contains an invalid heap TID");
     *tid_out = tid;
     return true;
+}
+
+pg_attribute_unused()
+static bool
+hnsw_read_tid_for_label(int tids_fd, uint64_t n_vecs, uint64_t label,
+                        uint64_t *tid_out, char *error, size_t error_size)
+{
+    HnswReadWindow direct;
+
+    hnsw_window_init(&direct, tids_fd, NULL, 0);
+    return hnsw_read_tid_window(&direct, n_vecs, label, tid_out,
+                                error, error_size);
 }
 
 static bool
@@ -760,6 +918,8 @@ hnsw_file_preflight(int hnsw_fd, int tids_fd,
     uint64_t tids_remaining;
     uint64_t tids_offset;
     int *links = NULL;
+    void *window_buffer = NULL;
+    HnswReadWindow window;
     bool ok = false;
 
     if (fstat(hnsw_fd, &hs) != 0 || fstat(tids_fd, &ts) != 0)
@@ -924,6 +1084,9 @@ hnsw_file_preflight(int hnsw_fd, int tids_fd,
                             "cannot allocate bounded HNSW link scratch");
         goto done;
     }
+    /* Without the optional read-ahead buffer every read stays direct. */
+    window_buffer = malloc(HNSW_READ_WINDOW_BYTES);
+    hnsw_window_init(&window, hnsw_fd, window_buffer, HNSW_READ_WINDOW_BYTES);
     for (uint64_t node = 0; node < expected_n_vecs; node++)
     {
         uint64_t row_offset;
@@ -934,10 +1097,13 @@ hnsw_file_preflight(int hnsw_fd, int tids_fd,
 
         if (check_interrupts)
             check_interrupts();
+        if (hnsw_mul_u64(node, h.sizeDataPerElement, &row_offset) &&
+            hnsw_add_u64(HNSWLIB_HEADER_BYTES, row_offset, &base))
+            hnsw_window_reserve(&window, base, h.sizeDataPerElement);
         if (!hnsw_mul_u64(node, h.sizeDataPerElement, &row_offset) ||
             !hnsw_add_u64(HNSWLIB_HEADER_BYTES, row_offset, &base) ||
             !hnsw_add_u64(base, h.offsetLevel0, &row_offset) ||
-            !hnsw_pread_exact(hnsw_fd, &count, sizeof(count), row_offset) ||
+            !hnsw_window_read(&window, &count, sizeof(count), row_offset) ||
             count < 0 || (uint64_t)count > h.maxM0)
         {
             hnsw_set_file_errorf(error, error_size,
@@ -946,7 +1112,7 @@ hnsw_file_preflight(int hnsw_fd, int tids_fd,
             goto done;
         }
         if (!hnsw_add_u64(row_offset, sizeof(count), &row_offset) ||
-            !hnsw_pread_exact(hnsw_fd, links, (size_t)count * sizeof(int), row_offset))
+            !hnsw_window_read(&window, links, (size_t)count * sizeof(int), row_offset))
         {
             hnsw_set_file_error(error, error_size,
                                 "short read on level-0 links");
@@ -962,7 +1128,7 @@ hnsw_file_preflight(int hnsw_fd, int tids_fd,
             }
         }
         if (!hnsw_add_u64(base, h.labelOffset, &label_offset) ||
-            !hnsw_pread_exact(hnsw_fd, &label, sizeof(label), label_offset) ||
+            !hnsw_window_read(&window, &label, sizeof(label), label_offset) ||
             (uint64_t)label >= expected_n_vecs)
         {
             hnsw_set_file_error(error, error_size,
@@ -973,6 +1139,7 @@ hnsw_file_preflight(int hnsw_fd, int tids_fd,
 
     per_level_bytes = (h.M + 1) * sizeof(int);
     file_cursor = level0_end;
+    hnsw_window_init(&window, hnsw_fd, window_buffer, HNSW_READ_WINDOW_BYTES);
     for (uint64_t node = 0; node < expected_n_vecs; node++)
     {
         uint32_t list_bytes;
@@ -986,7 +1153,7 @@ hnsw_file_preflight(int hnsw_fd, int tids_fd,
             check_interrupts();
         if (file_cursor > (uint64_t)hs.st_size ||
             (uint64_t)hs.st_size - file_cursor < sizeof(list_bytes) ||
-            !hnsw_pread_exact(hnsw_fd, &list_bytes, sizeof(list_bytes), file_cursor))
+            !hnsw_window_read(&window, &list_bytes, sizeof(list_bytes), file_cursor))
         {
             hnsw_set_file_error(error, error_size,
                                 "short read on upper-level link size");
@@ -1016,7 +1183,7 @@ hnsw_file_preflight(int hnsw_fd, int tids_fd,
 
             if (!hnsw_mul_u64(lv, per_level_bytes, &level_offset) ||
                 !hnsw_add_u64(links_start, level_offset, &level_offset) ||
-                !hnsw_pread_exact(hnsw_fd, &upper_count, sizeof(upper_count),
+                !hnsw_window_read(&window, &upper_count, sizeof(upper_count),
                                   level_offset) ||
                 upper_count < 0 || (uint64_t)upper_count > h.M)
             {
@@ -1025,7 +1192,7 @@ hnsw_file_preflight(int hnsw_fd, int tids_fd,
                 goto done;
             }
             if (!hnsw_add_u64(level_offset, sizeof(upper_count), &level_offset) ||
-                !hnsw_pread_exact(hnsw_fd, links,
+                !hnsw_window_read(&window, links,
                                   (size_t)upper_count * sizeof(int), level_offset))
             {
                 hnsw_set_file_error(error, error_size,
@@ -1086,6 +1253,7 @@ hnsw_file_preflight(int hnsw_fd, int tids_fd,
     ok = true;
 
 done:
+    free(window_buffer);
     free(links);
     return ok;
 }
@@ -2307,6 +2475,11 @@ typedef struct HnswDiskRow
     int **upper_links;
     int *upper_counts;
     int *upper_data;
+    /* Read-ahead for level-0 records, upper-level records and TIDs.  The
+     * buffers live in the caller's memory context for the whole import. */
+    HnswReadWindow level0;
+    HnswReadWindow upper;
+    HnswReadWindow tids;
 } HnswDiskRow;
 
 /* Reuse one existing cache row array as a bounded first-data-page template.
@@ -2533,6 +2706,12 @@ hnsw_disk_row_init(HnswDiskRow *row, const HnswlibHeader *header,
             row->upper_links[level] = row->upper_data +
                 (size_t)level * (size_t)header->M;
     }
+    hnsw_window_init(&row->level0, -1, palloc(HNSW_READ_WINDOW_BYTES),
+                     HNSW_READ_WINDOW_BYTES);
+    hnsw_window_init(&row->upper, -1, palloc(HNSW_READ_WINDOW_BYTES),
+                     HNSW_READ_WINDOW_BYTES);
+    hnsw_window_init(&row->tids, -1, palloc(HNSW_READ_WINDOW_BYTES),
+                     HNSW_READ_WINDOW_BYTES);
 }
 
 static void
@@ -2553,27 +2732,35 @@ hnsw_read_disk_row(int hnsw_fd, int tids_fd,
     HnswNodeLocation location;
     char error[256] = {0};
 
+    hnsw_window_bind(&row->level0, hnsw_fd);
+    hnsw_window_bind(&row->upper, hnsw_fd);
+    hnsw_window_bind(&row->tids, tids_fd);
+    if (node < n_nodes &&
+        hnsw_mul_u64(node, header->sizeDataPerElement, &row_delta) &&
+        hnsw_add_u64(HNSWLIB_HEADER_BYTES, row_delta, &row_base))
+        hnsw_window_reserve(&row->level0, row_base,
+                            header->sizeDataPerElement);
     if (node >= n_nodes ||
         !hnsw_mul_u64(node, header->sizeDataPerElement, &row_delta) ||
         !hnsw_add_u64(HNSWLIB_HEADER_BYTES, row_delta, &row_base) ||
         !hnsw_add_u64(row_base, header->offsetLevel0, &level0_links_offset) ||
-        !hnsw_pread_exact(hnsw_fd, &link_count, sizeof(link_count),
+        !hnsw_window_read(&row->level0, &link_count, sizeof(link_count),
                           level0_links_offset) ||
         link_count < 0 || (uint64_t)link_count > header->maxM0 ||
         !hnsw_add_u64(level0_links_offset, sizeof(link_count), &field_offset) ||
-        !hnsw_pread_exact(hnsw_fd, row->elem.lv0_links,
+        !hnsw_window_read(&row->level0, row->elem.lv0_links,
                           (size_t)link_count * sizeof(int), field_offset))
         ereport(ERROR,
                 (errmsg("pg_cuvs: cannot read HNSW level-0 row %llu",
                         (unsigned long long)node)));
 
     if (!hnsw_add_u64(row_base, header->offsetData, &field_offset) ||
-        !hnsw_pread_exact(hnsw_fd, row->vector,
+        !hnsw_window_read(&row->level0, row->vector,
                           (size_t)dim * sizeof(float), field_offset) ||
         !hnsw_add_u64(row_base, header->labelOffset, &field_offset) ||
-        !hnsw_pread_exact(hnsw_fd, &label, sizeof(size_t), field_offset) ||
-        !hnsw_read_tid_for_label(tids_fd, n_nodes, label, &tid,
-                                 error, sizeof(error)) ||
+        !hnsw_window_read(&row->level0, &label, sizeof(size_t), field_offset) ||
+        !hnsw_read_tid_window(&row->tids, n_nodes, label, &tid,
+                              error, sizeof(error)) ||
         !hnsw_location_table_lookup(locations, (uint32_t)node, &location))
         ereport(ERROR,
                 (errmsg("pg_cuvs: cannot read HNSW vector, label or location for row %llu: %s",
@@ -2589,7 +2776,7 @@ hnsw_read_disk_row(int hnsw_fd, int tids_fd,
     row->elem.neigh_blkno = location.elem_blkno;
     row->elem.neigh_offno = location.elem_offno + 1;
 
-    if (!hnsw_pread_exact(hnsw_fd, &upper_bytes, sizeof(upper_bytes),
+    if (!hnsw_window_read(&row->upper, &upper_bytes, sizeof(upper_bytes),
                           *upper_cursor))
         ereport(ERROR,
                 (errmsg("pg_cuvs: cannot read HNSW upper-level size for row %llu",
@@ -2607,10 +2794,10 @@ hnsw_read_disk_row(int hnsw_fd, int tids_fd,
 
         if (!hnsw_mul_u64((uint64_t)level, per_level_bytes, &level_delta) ||
             !hnsw_add_u64(field_offset, level_delta, &links_offset) ||
-            !hnsw_pread_exact(hnsw_fd, &count, sizeof(count), links_offset) ||
+            !hnsw_window_read(&row->upper, &count, sizeof(count), links_offset) ||
             count < 0 || (uint64_t)count > header->M ||
             !hnsw_add_u64(links_offset, sizeof(count), &links_offset) ||
-            !hnsw_pread_exact(hnsw_fd, row->upper_links[level],
+            !hnsw_window_read(&row->upper, row->upper_links[level],
                               (size_t)header->M * sizeof(int), links_offset))
             ereport(ERROR,
                     (errmsg("pg_cuvs: cannot read HNSW upper-level links for row %llu",
