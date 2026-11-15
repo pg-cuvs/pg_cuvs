@@ -16,10 +16,11 @@ The GPU acts as a **candidate generator**: it returns the top-K TID candidates a
 
 ![How pg_cuvs connects PostgreSQL backends to a GPU sidecar daemon](docs/assets/pg-cuvs-overview.svg)
 
-> **Release status.** Current extension version: **0.9.3**. This overview was checked against source
-> commit `ae818ad0` (2026-11-11), when the extension version was 0.9.0; historical
-> GPU measurements below retain their original versions and are not a validation
-> run of this HEAD.
+> **Release status.** Current extension version: **0.9.3** (in development on `main`). The latest
+> release is [v0.9.2](https://github.com/pg-cuvs/pg_cuvs/releases/tag/v0.9.2). This overview is not
+> re-verified against every commit: for current behavior, the code, [`docs/reference.md`](docs/reference.md)
+> and [`ARCHITECTURE.md`](ARCHITECTURE.md) take precedence. Historical GPU measurements below retain
+> their original versions and are not a validation run of this HEAD.
 
 > **What a green CI badge means.** It means the **CPU-reference** suite passed. It does **not** mean
 > GPU kernels or approximate recall were verified. Those are the on-demand Tier 2 run
