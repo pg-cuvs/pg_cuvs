@@ -281,7 +281,7 @@ TEST_RT_LIB := $(shell [ "$$(uname -s)" = "Linux" ] && echo -lrt)
 test-unit: test-compact-retry test-device-norm test-failed-allocation test-build-oom-log test-peak-log-switch test/unit/test_cuvs_util.c src/cuvs_util.c src/cuvs_util.h src/cuvs_ipc.h \
            test/unit/test_build_corpus.c src/cuvs_build_corpus.c src/cuvs_build_corpus.h \
            test-hnsw-build test-hnsw-build-ipc test-hnsw-owner-lease test-hnsw-ace-quality test-hnsw-admission test-admission-contract \
-           test-hnsw-nn-policy test-hnsw-nn-route test-hnsw-nn-precision test-hnsw-nn-capacity test-hnsw-nn-sdk-params test-hnsw-nn-consumer test-hnsw-nn-upper-receipt \
+           test-hnsw-nn-policy test-hnsw-nn-route test-hnsw-nn-precision test-hnsw-nn-capacity test-hnsw-nn-sdk-params test-hnsw-nn-consumer test-hnsw-nn-upper-receipt test-hnsw-nn-mutations \
            test-i3-logs test-notice-wire test-admission-wire test-admission-message test-admission-ipc test-build-oom-thread test-cache-policy test-circuit-source test-status-text test-i3b-source test-peak-meter test-lw-policy test-lw-guard test-i3e-sql test-self-replace-notice test-host-free-fence test-vacuum-policy
 	$(CC) -I src -DCUVS_TEST_HOOKS -o test-unit test/unit/test_cuvs_util.c src/cuvs_util.c $(TEST_RT_LIB)
 	./test-unit
@@ -407,6 +407,15 @@ test-hnsw-nn-upper-receipt: test/unit/test_hnsw_nn_upper_receipt.py test/unit/te
 	python3 -I -B test/unit/test_hnsw_nn_upper_receipt_mutation.py
 
 EXTRA_CLEAN += test-hnsw-nn-policy test-hnsw-nn-precision test-hnsw-nn-capacity test-hnsw-nn-route test-hnsw-nn-sdk-params
+
+# NN guard mutants (each script compiles mutated copies in a temp dir and
+# requires the matching unit test to fail; r87 D4 wired these into test-unit).
+.PHONY: test-hnsw-nn-mutations
+test-hnsw-nn-mutations:
+	ulimit -c 0; python3 -I -B test/unit/test_hnsw_nn_policy_mutations.py
+	ulimit -c 0; python3 -I -B test/unit/test_hnsw_nn_precision_mutations.py
+	ulimit -c 0; python3 -I -B test/unit/test_hnsw_nn_capacity_mutations.py
+	ulimit -c 0; python3 -I -B test/unit/test_hnsw_nn_sdk_params_mutations.py
 
 # I3-C: CK-17 (12)-(14) auto overflow, pre-spool decision, CAGRA reltuples AR0.
 test-hnsw-auto-overflow: test/unit/test_hnsw_auto_overflow.c src/cuvs_route_preflight.h \

@@ -42,6 +42,23 @@ static void test_review_offsets(void)
     }
 }
 
+/* nn-diff-review-r87 D4: the FP32 distance-range margins are 8x (L2) and 2x
+ * (IP/cosine) below FLT_MAX; metrics above IP are rejected. */
+static void test_distance_margins(void)
+{
+    CuvsHnswNnPrecision r;
+    float v[17] = {0};
+    v[0] = (float)sqrt((double)FLT_MAX / 4.0);   /* norm = FLT_MAX/4 */
+    assert(cuvs_hnsw_nn_precision(v, 1, 17, CUVS_METRIC_L2, &r) != 0);
+    assert(cuvs_hnsw_nn_precision(v, 1, 17, CUVS_METRIC_IP, &r) == 0);
+    v[0] = (float)sqrt((double)FLT_MAX / 16.0);  /* norm = FLT_MAX/16 */
+    assert(cuvs_hnsw_nn_precision(v, 1, 17, CUVS_METRIC_L2, &r) == 0);
+    v[0] = (float)sqrt((double)FLT_MAX * 0.75);  /* norm = 0.75 FLT_MAX */
+    assert(cuvs_hnsw_nn_precision(v, 1, 17, CUVS_METRIC_IP, &r) != 0);
+    v[0] = 1.0f;
+    assert(cuvs_hnsw_nn_precision(v, 1, 17, CUVS_METRIC_IP + 1, &r) != 0);
+}
+
 int main(void)
 {
     CuvsHnswNnPrecision result;
@@ -77,6 +94,7 @@ int main(void)
     assert(cuvs_hnsw_nn_precision(safe, 0, 17, CUVS_METRIC_L2, &result) != 0);
     assert(cuvs_hnsw_nn_precision(safe, 1, 17, UINT32_MAX, &result) != 0);
     test_review_offsets();
+    test_distance_margins();
     puts("NN precision input guard: PASS");
     return 0;
 }

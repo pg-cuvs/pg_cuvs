@@ -19,6 +19,23 @@ int main(void)
     assert(cuvs_hnsw_nn_capacity(INT32_MAX - 1, 768, 64, 128, 1, CUVS_HNSW_NN_FP32, &a) != 0);
     assert(cuvs_hnsw_nn_capacity(1000, 768, 64, 1025, 1, CUVS_HNSW_NN_FP32, &a) != 0);
     assert(cuvs_hnsw_nn_capacity(1000, 768, 64, 128, 1, 99, &a) != 0);
+    /* nn-diff-review-r87 D4: shape guards and hierarchy/dtype terms */
+    assert(cuvs_hnsw_nn_capacity(1000, 768, 64, 128, 2, CUVS_HNSW_NN_FP32, &a) != 0);
+    assert(cuvs_hnsw_nn_capacity(1000, 65535, 64, 128, 0, CUVS_HNSW_NN_FP32, &a) == 0);
+    assert(cuvs_hnsw_nn_capacity(1000, 65536, 64, 128, 0, CUVS_HNSW_NN_FP32, &a) != 0);
+    assert(cuvs_hnsw_nn_capacity(1000, 768, 63, 128, 0, CUVS_HNSW_NN_FP32, &a) != 0);
+    assert(cuvs_hnsw_nn_capacity(1000, 768, 0, 128, 0, CUVS_HNSW_NN_FP32, &a) != 0);
+    assert(cuvs_hnsw_nn_capacity(100, 768, 64, 100, 0, CUVS_HNSW_NN_FP32, &a) != 0);
+    assert(cuvs_hnsw_nn_capacity(101, 768, 64, 100, 0, CUVS_HNSW_NN_FP32, &a) == 0);
+    {
+        CuvsHnswNnCapacity flat, tall;
+        assert(cuvs_hnsw_nn_capacity(1000000, 768, 64, 128, 0, CUVS_HNSW_NN_FP32, &flat) == 0);
+        assert(cuvs_hnsw_nn_capacity(1000000, 768, 64, 128, 1, CUVS_HNSW_NN_FP32, &tall) == 0);
+        assert(flat.hierarchy_gpu == 0 && tall.hierarchy_gpu > 0);
+        assert(tall.serialize_host - flat.serialize_host
+               == UINT64_C(1000000) * (2 * 768 * 4 + 8 * 32 + 916 + 2 * 96 + 4 * 32));
+        assert(flat.build_host == tall.build_host && flat.build_gpu == tall.build_gpu);
+    }
     uint64_t checked;
     assert(cuvs_hnsw_nn_mul(UINT64_MAX, 2, &checked) != 0);
     assert(cuvs_hnsw_nn_add(UINT64_MAX, 1, &checked) != 0);
