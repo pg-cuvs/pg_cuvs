@@ -19,6 +19,55 @@ APPROVED_NATIVE_DELTAS = [
      'fails the build before the serialized index is returned'),
 ]
 
+# Approved explicit nn_descent additions to the moved native body, each
+# (first line, the text that must follow the block, SHA-256 of the block's
+# whitespace-free tokens, reason). Each block must appear exactly once, end
+# exactly at its follower, and match its pinned tokens; it is removed before
+# the token comparison. Any edit inside a block changes its hash and fails.
+APPROVED_NN_BLOCKS = [
+    ('        else if (prepared.route.route == CUVS_HNSW_ROUTE_NN_DESCENT)\n',
+     '        else\n        {\n            cp.graph_build_params = *prepared.pq_params;',
+     '3232a7e86a9a6292d739e9aae686f9e14c8c26dbfa75c352737a40d678cf7c2d',
+     'explicit build_algo=nn_descent: SDK NN-descent parameters with the '
+     'replacement guard, readback fill, and the resident upper-level budget protocol'),
+    ('            if (!tiny && prepared.route.route == CUVS_HNSW_ROUTE_NN_DESCENT\n',
+     '            if (!tiny) return cagra::build(res, cp, data);',
+     '46258d7cb9dd3667ddccb9fd9d50f8387ccfdbc6519bbfc267c082f80d0f3a39',
+     'only the NN-descent L2 graph input is centered; serializers keep `data`'),
+    ('        if (prepared.route.route == CUVS_HNSW_ROUTE_NN_DESCENT\n'
+     '            && !cuvs_hnsw_nn_readback_valid(',
+     '        if (params->policy) *params->policy = receipt;',
+     '27000e91e34527b9ed1a7cd5a789e3746944d2bc4f1a813874675a1ec9111511',
+     'an NN receipt must match the consumed parameters before it is published'),
+    ('        if (params->nn_readback && prepared.route.route == CUVS_HNSW_ROUTE_NN_DESCENT)\n',
+     '        *out_fd = fd;',
+     '61a91fbe699fa913bafdd4f4458ab33bf0983b5fd5e936f9e660e4492641afbc',
+     'the NN readback reaches the caller only on the NN route'),
+]
+# Approved one-for-one replacements in the moved body: (before, after, reason).
+APPROVED_NATIVE_REPLACEMENTS = [
+    ('cp.graph_build_params = pq_params;', 'cp.graph_build_params = *prepared.pq_params;',
+     'the IVF-PQ parameters are owned by the prepared settings (NN routes have none)'),
+    ('disk ? "ACE-disk" : tiny ? "tiny-GPU" : "host-IVFPQ"', 'cuvs_hnsw_route_name(prepared.route.route)',
+     'route names come from one table that includes nn-descent'),
+]
+
+
+def strip_nn_blocks(body):
+    for first, follower, digest, _ in APPROVED_NN_BLOCKS:
+        assert body.count(first) == 1, 'APPROVED_NN_BLOCK_COUNT:' + first.strip()
+        start = body.index(first)
+        end = body.find(follower, start)
+        assert end > start, 'APPROVED_NN_BLOCK_FOLLOWER:' + first.strip()
+        block = body[start:end]
+        actual = hashlib.sha256(compact(block).encode()).hexdigest()
+        assert actual == digest, 'APPROVED_NN_BLOCK_CHANGED:' + first.strip() + ':' + actual
+        body = body[:start] + body[end:]
+    for before, after, _ in APPROVED_NATIVE_REPLACEMENTS:
+        assert body.count(after) == 1, 'APPROVED_REPLACEMENT_COUNT:' + after
+        body = body.replace(after, before, 1)
+    return body
+
 
 def compact(s):
     return re.sub(r'\s+', '', s)
@@ -55,7 +104,7 @@ def check(wrapper, backend, server, baseline):
     b = old.index('\n    }\n    catch (const std::exception &e)', a)
     native_before = old[a:b]
     native_after = execute[execute.index('    PooledRes resources(device_id);'):execute.rfind('\n}')]
-    native_moved = native_after
+    native_moved = strip_nn_blocks(native_after)
     for anchor, statement, _ in APPROVED_NATIVE_DELTAS:
         assert native_moved.count(statement) == 1, 'APPROVED_NATIVE_DELTA_COUNT:' + statement
         head, tail = native_moved.split(statement)
@@ -80,6 +129,8 @@ def check(wrapper, backend, server, baseline):
                 original_native_tokens_sha256=hashlib.sha256(compact(native_before).encode()).hexdigest(),
                 new_native_tokens_sha256=hashlib.sha256(compact(native_after).encode()).hexdigest(),
                 approved_native_deltas=[dict(after=a, statement=t, reason=r) for a, t, r in APPROVED_NATIVE_DELTAS],
+                approved_nn_blocks=[dict(first=f.strip(), sha256=d, reason=r) for f, _, d, r in APPROVED_NN_BLOCKS],
+                approved_native_replacements=[dict(before=b, after=a, reason=r) for b, a, r in APPROVED_NATIVE_REPLACEMENTS],
                 actual_NVCC_SDK_GPU_PG='NOT_RUN')
 
 
@@ -116,6 +167,23 @@ def main(output):
             ('native_statement_added_beside_fence', execute.replace(fence, fence + '        resources.sync_stream();\n', 1))):
         assert changed != execute, ('MUTANT_ANCHOR', name)
         mutants.append(dict(name=name, w=w.replace(execute, changed, 1), b=b, s=s))
+    for name, old_text, new_text in (
+            ('nn_readback_copy_dropped',
+             '            *params->nn_readback = prepared.nn_readback;\n', '            ;\n'),
+            ('nn_receipt_validation_dropped',
+             '            && !cuvs_hnsw_nn_readback_valid(&prepared.nn_readback, &receipt))',
+             '            && false)'),
+            ('centering_on_every_route',
+             '            if (!tiny && prepared.route.route == CUVS_HNSW_ROUTE_NN_DESCENT\n                && cuvs_hnsw_nn_centers(params->metric))',
+             '            if (!tiny && cuvs_hnsw_nn_centers(params->metric))'),
+            ('nn_sdk_replacement_guard_dropped',
+             'if (selected.graph_degree != cp.intermediate_graph_degree || selected.metric != cp.metric)',
+             'if (false)'),
+            ('nn_statement_added_after_readback_copy',
+             '            *params->nn_readback = prepared.nn_readback;\n',
+             '            *params->nn_readback = prepared.nn_readback;\n        resources.sync_stream();\n')):
+        assert execute.count(old_text) == 1, ('MUTANT_ANCHOR', name)
+        mutants.append(dict(name=name, w=w.replace(execute, execute.replace(old_text, new_text, 1), 1), b=b, s=s))
     rows=[]
     for m in mutants:
         try: check(m['w'], m['b'], m['s'], old)
