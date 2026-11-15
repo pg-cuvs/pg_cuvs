@@ -329,6 +329,16 @@ for _rel in install_scripts():
     check(_inst is not None and _inst == _block("sql/pg_cuvs--0.8.2--0.9.0.sql"),
           f"I3-B block differs between {os.path.basename(_rel)} and pg_cuvs--0.8.2--0.9.0.sql")
 
+# The #203 block was added in 0.9.1; every later install script is a copy of the
+# previous one and carries the identical block (the newest one is what CREATE
+# EXTENSION reads).
+for _rel in install_scripts()[1:]:
+    if _rel == CONN_INSTALL:
+        continue
+    _m = re.search(conn_pattern, read(_rel), flags=re.S | re.M)
+    check(_m is not None and read(_rel).count("-- CONN203 begin") == 1 and _m.group(1) == conn_blocks[1],
+          f"{os.path.basename(_rel)}: the CONN203 block differs from the one in pg_cuvs--0.9.1.sql or is missing")
+
 if FAILS:
     for f in FAILS:
         print("FAIL", f)

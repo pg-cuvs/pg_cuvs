@@ -105,6 +105,11 @@ MUTATIONS = [
 def copy_tree(dst):
     for d in ("src", "sql", os.path.join("test", "unit")):
         shutil.copytree(os.path.join(ROOT, d), os.path.join(dst, d))
+    # check_i3b_sql_perms.py also reads the #203 development installer; without it
+    # the unmutated tree fails and every scan mutation is red for that reason.
+    installer = os.path.join("scripts", "install-connectivity-status.sql")
+    os.makedirs(os.path.join(dst, "scripts"), exist_ok=True)
+    shutil.copy2(os.path.join(ROOT, installer), os.path.join(dst, installer))
 
 
 def run_unit(tree):

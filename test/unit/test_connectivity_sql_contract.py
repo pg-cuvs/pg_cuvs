@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Mutation checks for the scoped #203 SQL block and unchanged I3-B ACLs."""
 from pathlib import Path
+import os
+import re
 import shutil
 import subprocess
 import sys
@@ -16,12 +18,21 @@ FROZEN_INSTALL = 'sql/pg_cuvs--0.9.0.sql'
 INSTALLER = 'scripts/install-connectivity-status.sql'
 
 
+def newest_install():
+    """The newest full install script in sql/ (what CREATE EXTENSION reads)."""
+    names = [n for n in os.listdir(ROOT / 'sql') if re.fullmatch(r'pg_cuvs--\d+\.\d+\.\d+\.sql', n)]
+    return 'sql/' + max(names, key=lambda n: tuple(int(x) for x in re.findall(r'\d+', n)))
+
+
+NEWEST = newest_install()
+
+
 class SQLContract(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
-        for name in [UP, INSTALL, INSTALLER, FROZEN_UP, FROZEN_INSTALL, 'src/pg_cuvs.c', 'src/cuvs_ipc.h',
+        for name in [UP, INSTALL, NEWEST, INSTALLER, FROZEN_UP, FROZEN_INSTALL, 'src/pg_cuvs.c', 'src/cuvs_ipc.h',
                      'src/cuvs_status_text.h']:
             target = self.root / name
             target.parent.mkdir(parents=True, exist_ok=True)
@@ -42,6 +53,21 @@ class SQLContract(unittest.TestCase):
 
     def test_current_tree(self):
         self.check(True)
+
+    def test_newest_install_script_must_carry_the_same_block(self):
+        # Vacuous while the newest install script is the 0.9.1 one.
+        if NEWEST == INSTALL:
+            self.skipTest('the newest install script is the 0.9.1 script')
+        self.edit(NEWEST, 'CREATE FUNCTION pg_cuvs_hnsw_connectivity_status(index regclass) RETURNS jsonb',
+                  'CREATE FUNCTION pg_cuvs_hnsw_connectivity_status(idx regclass) RETURNS jsonb')
+        self.check(False, 'the CONN203 block differs')
+
+    def test_newest_install_script_without_the_block(self):
+        if NEWEST == INSTALL:
+            self.skipTest('the newest install script is the 0.9.1 script')
+        self.edit(NEWEST, '-- CONN203 begin\n', '')
+        self.edit(NEWEST, '-- CONN203 end\n', '')
+        self.check(False, 'the CONN203 block differs')
 
     def test_original_loose_function(self):
         self.edit(UP, '-- CONN203 begin\n', '')
