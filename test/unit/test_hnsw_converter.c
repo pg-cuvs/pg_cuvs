@@ -61,6 +61,8 @@ static unsigned test_fault_eintr_every;
 static unsigned test_fault_short_every;
 static unsigned long test_fault_calls;
 static unsigned long test_fault_eio_hits;
+static uint64_t test_fault_count_below;      /* count calls starting below */
+static unsigned long test_fault_calls_below;
 
 static ssize_t
 test_fault_pread(int fd, void *buffer, size_t length, off_t offset)
@@ -68,6 +70,8 @@ test_fault_pread(int fd, void *buffer, size_t length, off_t offset)
     if (fd == test_fault_fd)
     {
         test_fault_calls++;
+        if ((uint64_t)offset < test_fault_count_below)
+            test_fault_calls_below++;
         if (test_fault_eintr_every &&
             test_fault_calls % test_fault_eintr_every == 0)
         {
@@ -1461,6 +1465,118 @@ test_ace_readback_metapage_roundtrip(void)
     puts("PASS ACE readback metapage roundtrip: bytes at prefix+receipt, pd_lower, older/foreign/truncated tails, resident has none, writer refuses invalid");
 }
 
+/* The row reader reserves each level-0 record before reading its fields, so
+ * a window always starts at a record boundary.  With labels and vectors
+ * stored before the link list, a window that started at the link count
+ * would miss the record's earlier fields and refill.  Use a 3.2-record
+ * window and count level-0 reads: one per three records, fields intact. */
+static void
+test_row_reader_reserves_records(void)
+{
+    enum { N = 40, DIM = 4, M = 2, MAXM0 = 2 * M };
+    const size_t vec_off = 0, label_off = DIM * sizeof(float);
+    const size_t links_off = label_off + sizeof(size_t);
+    const size_t row_bytes = links_off + (1 + MAXM0) * sizeof(int);
+    const size_t capacity = 3 * row_bytes + 12;
+    Fixture f = {make_temp_fd(), make_temp_fd()};
+    struct BufFile table_file = {.fd = make_temp_fd()};
+    HnswLocationTable table = {.file = &table_file, .n_nodes = N};
+    HnswlibHeader header = {0};
+    HnswlibHeader parsed;
+    CuvsTidsHeader tids_header = {0};
+    CuvsTidsHeader parsed_tids;
+    uint64_t tids[N];
+    unsigned char raw[64];
+    unsigned char *small;
+    char error[256] = {0};
+    HnswDiskRow row;
+    uint64_t upper_start = HNSWLIB_HEADER_BYTES + (uint64_t)N * row_bytes;
+    uint64_t upper_cursor = upper_start;
+    off_t at = 0;
+
+    assert(row_bytes <= sizeof(raw));
+    header.maxElements = header.curElementCount = N;
+    header.sizeDataPerElement = row_bytes;
+    header.offsetData = vec_off;
+    header.labelOffset = label_off;
+    header.offsetLevel0 = links_off;
+    header.maxlevel = 1;
+    header.enterpointNode = 0;
+    header.maxM = header.M = M;
+    header.maxM0 = MAXM0;
+    header.mult = 1.0;
+    header.efConstruction = 64;
+    write_at(f.hnsw_fd, &header, sizeof(header), at);
+    at += sizeof(header);
+    for (int node = 0; node < N; node++)
+    {
+        int count = 2;
+        int links[MAXM0] = {(node + 1) % N, (node + 7) % N, -1, -1};
+        size_t label = (size_t)(N - 1 - node);
+
+        memset(raw, 0, sizeof(raw));
+        for (int d = 0; d < DIM; d++)
+        {
+            float value = (float)(node * 10 + d);
+            memcpy(raw + vec_off + d * sizeof(float), &value, sizeof(value));
+        }
+        memcpy(raw + label_off, &label, sizeof(label));
+        memcpy(raw + links_off, &count, sizeof(count));
+        memcpy(raw + links_off + sizeof(int), links, sizeof(links));
+        write_at(f.hnsw_fd, raw, row_bytes, at);
+        at += (off_t)row_bytes;
+        tids[node] = cuvs_tid_encode((uint32_t)(10 + node), (uint16_t)(1 + node % 7));
+    }
+    for (int node = 0; node < N; node++)
+    {
+        uint32_t no_upper = 0;
+        write_at(f.hnsw_fd, &no_upper, sizeof(no_upper), at);
+        at += sizeof(no_upper);
+    }
+    tids_header.magic = CUVS_TIDS_MAGIC;
+    tids_header.version = CUVS_TIDS_VERSION;
+    tids_header.n_vecs = N;
+    tids_header.dim = DIM;
+    tids_header.metric = CUVS_METRIC_L2;
+    tids_header.body_crc32 = cuvs_crc32(tids, sizeof(tids));
+    write_at(f.tids_fd, &tids_header, sizeof(tids_header), 0);
+    write_at(f.tids_fd, tids, sizeof(tids), sizeof(tids_header));
+    assert(hnsw_file_preflight(f.hnsw_fd, f.tids_fd, N, DIM, CUVS_METRIC_L2,
+                               4, true, &parsed, &parsed_tids,
+                               hnsw_location_table_append, &table, NULL,
+                               error, sizeof(error)));
+    assert(hnsw_location_table_rewind(&table, N));
+
+    chain_test_reset();
+    hnsw_disk_row_init(&row, &parsed, DIM);
+    small = malloc(capacity);
+    assert(small != NULL);
+    hnsw_window_init(&row.level0, -1, small, capacity);
+    test_fault_fd = f.hnsw_fd;
+    test_fault_count_below = upper_start;
+    test_fault_calls_below = 0;
+    for (int node = 0; node < N; node++)
+    {
+        hnsw_read_disk_row(f.hnsw_fd, f.tids_fd, &parsed, N, DIM,
+                           (uint64_t)node, &upper_cursor, &table, &row);
+        assert(row.elem.lv0_count == 2);
+        assert(row.elem.lv0_links[0] == (node + 1) % N &&
+               row.elem.lv0_links[1] == (node + 7) % N);
+        for (int d = 0; d < DIM; d++)
+            assert(row.vector[d] == (float)(node * 10 + d));
+        assert(row.elem.tid_encoded == tids[N - 1 - node]);
+    }
+    /* One level-0 fill per three records; the window never went direct. */
+    assert(test_fault_calls_below == (N + 2) / 3);
+    assert(row.level0.buffer == small);
+    test_fault_fd = -1;
+    test_fault_count_below = 0;
+    free(small);
+    BufFileClose(&table_file);
+    fixture_close(&f);
+    puts("PASS row reader reserves level-0 records");
+}
+
 /* Differential test of the import read windows against hnsw_pread_exact.
  * Small capacities make reads straddle window ends, exceed the capacity
  * (direct path), cross EOF, hit failed or short fills, and drive a window
@@ -1636,6 +1752,7 @@ main(void)
     test_rejects_invalid_offsets_labels_and_links();
     test_rejects_malformed_upper_links_and_overflow();
     test_read_window_matches_direct_reads();
+    test_row_reader_reserves_records();
     puts("hnsw converter preflight fixtures: ok");
     return 0;
 }
