@@ -572,6 +572,18 @@ test-ipc-connect-eintr-mutations: test/unit/test_ipc_connect_eintr_mutations.py
 EXTRA_CLEAN += test-ipc-connect-eintr
 .PHONY: test-ipc-connect-eintr test-ipc-backlog-source test-ipc-connect-eintr-mutations
 
+# The Claude Code hook that runs scripts/check-sdk-patch-path.sh before a pull request is
+# opened (.claude/hooks/pr-guard.sh). Python 3 standard library, bash and git only;
+# the mutations plant one defect each in a copy of the hook and need the tests to fail.
+test-unit: test-pr-guard-hook test-pr-guard-hook-mutations
+test-pr-guard-hook: test/unit/test_pr_guard_hook.py .claude/hooks/pr-guard.sh
+	python3 -I -B test/unit/test_pr_guard_hook.py
+
+test-pr-guard-hook-mutations: test/unit/test_pr_guard_hook_mutations.py test/unit/test_pr_guard_hook.py .claude/hooks/pr-guard.sh
+	python3 -I -B test/unit/test_pr_guard_hook_mutations.py
+
+.PHONY: test-pr-guard-hook test-pr-guard-hook-mutations
+
 # User-visible DETAIL/HINT text built from err_out (C5, CK-8, CK-29).
 test-admission-message: test/unit/test_admission_message.c src/cuvs_admission_contract.h \
                         src/cuvs_util.c src/cuvs_util.h src/cuvs_ipc.h
