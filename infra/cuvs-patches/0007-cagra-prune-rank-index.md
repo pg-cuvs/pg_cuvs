@@ -26,16 +26,26 @@ Compared with the first form of this change, this patch:
 - Launch geometry: 32 threads per block, as in `kern_prune` (the epilogue is a full-warp reduction). The host launch geometry is unchanged.
 - Shared memory: `kern_prune<1024, IdxT>` 4096 bytes (unchanged); `kern_prune_rank_index<256, uint32_t>` 1024 + 2048 = 3072 bytes.
 
-## Verification (CPU, no GPU)
+## Verification on a CPU
 
-The CUDA kernel text is not executed on a GPU. The CPU checks compile the kernel, helper and launch-helper text extracted mechanically from the patched and the original `graph_core.cuh`, run them with one host thread per CUDA thread and per-block shared memory poisoned before each block, with `__syncthreads`, warp shuffles, atomics and `__trap` emulated, and compare against an independent oracle that counts per target rank instead of per (kAD, kDB) pair. The matrix covers output equality (detour bytes, no-detour counts and statistics) of the original kernel, the refactored `kern_prune`, the rank kernel and the oracle; thread-order perturbation; ThreadSanitizer; hand-computed boundary rows; every power-of-two DEGREE from 2 to 1024; launches whose degree differs from DEGREE; batch-split launches; and mutation tests of the kernel, the shared helpers, the dispatch and the template constant. These checks are not part of this repository.
+The CPU checks compile the kernel, helper and launch-helper text extracted mechanically from the patched and the original `graph_core.cuh`, run them with one host thread per CUDA thread and per-block shared memory poisoned before each block, with `__syncthreads`, warp shuffles, atomics and `__trap` emulated, and compare against an independent oracle that counts per target rank instead of per (kAD, kDB) pair. The matrix covers output equality (detour bytes, no-detour counts and statistics) of the original kernel, the refactored `kern_prune`, the rank kernel and the oracle; thread-order perturbation; ThreadSanitizer; hand-computed boundary rows; every power-of-two DEGREE from 2 to 1024; launches whose degree differs from DEGREE; batch-split launches; and mutation tests of the kernel, the shared helpers, the dispatch and the template constant. These checks are not part of this repository.
 
 A clang CUDA front-end parse of the patched region in host and device mode (`sm_80`, no SDK, stubbed runtime declarations) is clean and rejects an instantiation with `IdxT = uint64_t` through the `static_assert`; this is a syntax and type check, not a build.
 
+## Verification on a GPU
+
+On an A100-SXM4-80GB, with cuVS at the pinned commit plus 0001 to 0004, 0006 and this patch:
+
+- nvcc build with `-Werror -Wall -Werror=all-warnings`: no warnings. `cuobjdump`: `kern_prune_rank_index<256, uint32_t>` 20 registers, 3072 bytes of shared memory, no spills; `kern_prune<1024, IdxT>` unchanged at 21 registers and 4096 bytes.
+- Byte equality of `d_detour_count`, `d_num_no_detour_edges` and the statistics against the unpatched `kern_prune` in 52 cases: `uint32_t` degrees 2 to 1024, `uint64_t` degrees 128 and 256 (`graph::optimize` is instantiated for `uint32_t` and `uint64_t`), and a 999000 x 256 graph repeated three times. Also on synthetic `uint32_t` degree-256 graphs of 17,000,000 and 30,000,000 nodes (4.35e9 and 7.68e9 elements, past 2^32), with the output buffer pre-filled to check that every byte is written.
+- Eight launches whose degree differs from DEGREE trap before writing output; no trap on the normal path.
+- `compute-sanitizer` memcheck, racecheck, initcheck and synccheck: no errors on a small suite.
+- Kernel time on the 999000 x 256 graph: 7.58 s to 0.55 s; the refactored `kern_prune` shows no regression. Standalone `cagra::build` on a 999000 x 768 corpus (three interleaved runs, median): 15.60 s without the prune change, 9.15 s with the earlier form, 8.92 s with this patch.
+
 ## Not covered
 
-nvcc compilation, register and shared-memory allocation, occupancy, real warp-level behaviour, memory-model effects on a GPU, and any timing. GPU acceptance before relying on this patch: an nvcc build without new warnings for `uint32_t` and `int64_t`; `ptxas -v` resource usage of both kernels; byte equality of `d_detour_count`, `d_num_no_detour_edges` and the statistics (or of the final graph) against the unpatched build at degree 256, and the unpatched kernel path at other degrees and for `int64_t`; `compute-sanitizer` memcheck, racecheck and synccheck on a small graph; no trap in a normal run.
+Occupancy; an nsys trace showing the new kernel inside a full SDK build (its use is inferred from the timing); `compute-sanitizer` at the 999000-row or larger sizes; an end-to-end `CREATE INDEX` with this exact patch; an in-tree test (the checks above are not part of this repository). The kernel does not check `blockDim.x == 32`; the only launch site fixes it.
 
 ## Scope
 
-An earlier form of this change (the literal-256 version without the helpers) took the `cagra::build` call of a 999000-row build with intermediate degree 256 on an A100 from 13.65 s to 6.96 s (median of three runs). That effect belongs to the earlier form; this generalised patch has not been measured on a GPU. The patch does not change the default parameters, the algorithm, the precision or the ID type policy, and exports no runtime marker (a marker would need an edit of `cagra.cpp` or `hnsw.cpp`, which other patches own); the build recipe verifies it by source hash only.
+An earlier form of this change (the literal-256 version without the helpers) took the `cagra::build` call of a 999000-row build with intermediate degree 256 on an A100 from 13.65 s to 6.96 s (median of three runs). That effect belongs to the earlier form; for this patch see the standalone timing above. The patch does not change the default parameters, the algorithm, the precision or the ID type policy, and exports no runtime marker (a marker would need an edit of `cagra.cpp` or `hnsw.cpp`, which other patches own); the build recipe verifies it by source hash only.
