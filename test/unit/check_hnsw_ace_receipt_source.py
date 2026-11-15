@@ -100,6 +100,21 @@ def check(src):
         and 'return CUVS_STATUS_BUILD_FAILED;' in block, 'ACE_MARKER_REFUSAL'
     assert public.index('if (disk)') < at(public, 'return execute_hnsw_file_build(', 'EXECUTE_CALL'), 'MARKERS_BEFORE_EXECUTE'
 
+    # --- where a requested-only receipt gets its count: the route resolver's candidate, in both ACE writers ---
+    assert 'const auto partitions = prepared.route.partitions;' in execute, 'EXECUTE_PARTITIONS_FROM_ROUTE'
+    assert 'const auto partitions = prepared.route.partitions;' in public, 'PUBLIC_PARTITIONS_FROM_ROUTE'
+    assert public.count('receipt.partitions = partitions;') == 1, 'RECEIPT_COUNT_IS_REQUESTED'
+    assert public.index('receipt.partitions = partitions;') > public.index('receipt.magic = CUVS_HNSW_POLICY_MAGIC;'), 'RECEIPT_COUNT_IN_RECEIPT_BLOCK'
+    # graph-failure fallback: the second ACE writer, with its own marker gate (the old throw is gone)
+    fb_start = at(public, 'const bool sdk_ok =', 'FALLBACK_MARKER_GATE')
+    fb = public[fb_start:]
+    fb = fb[:at(fb, 'return execute_hnsw_file_build(', 'FALLBACK_EXECUTE')]
+    for marker in ('pgcuvs_hnsw_disk_copy_patch_id', 'pgcuvs_hnsw_memory_guard_patch_id'):
+        assert fb.count('hnsw_sdk_marker_verified("' + marker + '"') == 1, 'FALLBACK_MARKER_REQUIRED:' + marker
+    assert compact('if (!sdk_ok ||') in compact(fb) and 'throw;' in fb[fb.index('if (!sdk_ok ||'):], 'FALLBACK_MARKER_REFUSES'
+    assert 'receipt.partitions = ace.partitions;' in fb, 'FALLBACK_RECEIPT_COUNT_IS_REQUESTED'
+    assert 'prepared.route = ace;' in fb, 'FALLBACK_ROUTE_RECORDED'
+
     # --- build_info: origin and exactness come from the receipt, not from a constant ---
     info = function(code['export'], 'pg_cuvs_hnsw_build_info(PG_FUNCTION_ARGS)')
     assert 'cuvs_hnsw_ace_partitions_origin(&policy)' in info, 'BUILD_INFO_ORIGIN_FROM_RECEIPT'
@@ -118,6 +133,8 @@ def check(src):
     assert 'the effective count is not guaranteed' in notice, 'NOTICE_SAYS_GUARANTEE_OFF'
     assert 'built without the cuVS SDK source planner' in notice, 'NOTICE_SAYS_WHY'
     assert 'errhint(' in notice and 'CUVS_SDK_SOURCE_INCLUDE' in notice, 'NOTICE_SAYS_HOW'
+    assert 'neighbors/detail/cagra/cagra_build.cuh' in notice and '-fopenmp' in notice, 'NOTICE_SAYS_HOW_COMPLETELY'
+    assert re.search(r'errmsg\("[^"]*%u[^"]*",\s*out->policy\.partitions\)', notice), 'NOTICE_PRINTS_RECEIPT_COUNT'
     assert backend.count('the effective count is not guaranteed') == 1, 'NOTICE_ONCE'
     return 'PASS_SOURCE_INVARIANT_NOT_CUDA'
 
@@ -158,8 +175,21 @@ MUTANTS = [
      '            if (cuvs_hnsw_ace_partitions_unverified(&out->policy))',
      '            if (0 && cuvs_hnsw_ace_partitions_unverified(&out->policy))'),
     ('notice_without_how_to_enable', 'backend',
-     'errhint("Build pg_cuvs_server with CUVS_SDK_SOURCE_INCLUDE set to the patched SDK\'s cpp/src to record and verify the effective count.")',
-     'errhint("Build pg_cuvs_server again.")'),
+     'errhint("Build pg_cuvs_server with CUVS_SDK_SOURCE_INCLUDE set to a path of the patched SDK source whose neighbors/detail/cagra/cagra_build.cuh exists and with OpenMP (-fopenmp); a variable that is set but misses either still builds without the planner.")',
+     'errhint("Build pg_cuvs_server with CUVS_SDK_SOURCE_INCLUDE.")'),
+    ('notice_prints_wrong_field', 'backend',
+     'is the requested count; the effective count is not guaranteed", out->policy.partitions)',
+     'is the requested count; the effective count is not guaranteed", out->policy.n_lists)'),
+    ('receipt_count_not_the_request', 'wrapper',
+     '        receipt.partitions = partitions;\n', '        receipt.partitions = 2;\n'),
+    ('fallback_receipt_count_not_the_request', 'wrapper',
+     '            receipt.partitions = ace.partitions;\n', '            receipt.partitions = 2;\n'),
+    ('fallback_memory_guard_marker_dropped', 'wrapper',
+     '                && hnsw_sdk_marker_verified("pgcuvs_hnsw_memory_guard_patch_id",\n'
+     '                    "pgcuvs-hnsw-memory-guard-v2@60b19a0f62ba0bd716de349382828e43be6e2daa");',
+     '                ;'),
+    ('fallback_marker_gate_unused', 'wrapper',
+     '            if (!sdk_ok || std::strlen(workdir) > 255', '            if (std::strlen(workdir) > 255'),
     ('notice_without_reason', 'backend',
      'This pg_cuvs_server was built without the cuVS SDK source planner, so the receipt records',
      'The receipt records'),

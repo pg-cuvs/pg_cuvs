@@ -21,7 +21,7 @@
 #include <string.h>
 static int listener, fixture_case, polls;
 static int *accepts;
-static uint32_t requested_algo(void) { return fixture_case >= 19 && fixture_case <= 24 ? CUVS_HNSW_ALGO_NN_DESCENT : fixture_case == 5 || fixture_case == 7 || fixture_case == 17 ? CUVS_HNSW_ALGO_ACE : fixture_case == 6 ? CUVS_HNSW_ALGO_IVF_PQ : CUVS_HNSW_ALGO_AUTO; }
+static uint32_t requested_algo(void) { return fixture_case >= 19 && fixture_case <= 24 ? CUVS_HNSW_ALGO_NN_DESCENT : fixture_case == 5 || fixture_case == 7 || fixture_case == 17 || fixture_case == 30 ? CUVS_HNSW_ALGO_ACE : fixture_case == 6 ? CUVS_HNSW_ALGO_IVF_PQ : CUVS_HNSW_ALGO_AUTO; }
 static volatile int idle_calls, idle_limit, idle_done, reply_sent, mock_checked;
 /* Ordering waits between the mock and the idle unit. A missing event fails
  * with a case-specific reason instead of hanging until an outer timeout. */
@@ -114,7 +114,7 @@ static void *daemon_mock(void *unused) {
         reply.policy.magic = CUVS_HNSW_POLICY_MAGIC;
         reply.policy.version = fixture_case == 4 ? 99 : fixture_case == 9 ? CUVS_HNSW_POLICY_LEGACY_VERSION : CUVS_HNSW_POLICY_VERSION;
         reply.policy.bytes = sizeof(reply.policy);
-        reply.policy.route = fixture_case == 5 || fixture_case == 8 || fixture_case == 17 ? CUVS_HNSW_ROUTE_ACE : CUVS_HNSW_ROUTE_IVF_PQ;
+        reply.policy.route = fixture_case == 5 || fixture_case == 8 || fixture_case == 17 || fixture_case == 30 ? CUVS_HNSW_ROUTE_ACE : CUVS_HNSW_ROUTE_IVF_PQ;
         reply.policy.requested_algo = fixture_case == 10 ? CUVS_HNSW_ALGO_IVF_PQ : req.build_algo;
         reply.policy.requested_ef = req.ef_construction;
         reply.policy.guard_passed = 1;
@@ -122,6 +122,10 @@ static void *daemon_mock(void *unused) {
         reply.policy.dim = cmd.dim; reply.policy.metric = cmd.metric;
         reply.policy.hierarchy = fixture_case == 16 ? !req.hierarchy : req.hierarchy;
         reply.policy.internal_builder = reply.policy.route;
+        /* 30: an ACE receipt from a build without the SDK source planner (count only requested) is
+         * accepted; 31: the same mark on a resident receipt is refused. */
+        if (fixture_case == 30 || fixture_case == 31)
+            reply.policy.route_flags = CUVS_HNSW_ROUTE_FLAG_ACE_PARTITIONS_REQUESTED;
         reply.policy.partitions = reply.policy.route == CUVS_HNSW_ROUTE_ACE ? 2 : 0;
         reply.policy.degree = 64; reply.policy.intermediate = 128; reply.policy.ace_ef = 120;
         /* v5: an ACE receipt travels with its partition-builder readback; case 17 omits it. */
@@ -155,7 +159,7 @@ static void *daemon_mock(void *unused) {
         assert(cuvs_fd_send(c, read_only, &reply, sizeof(reply)) == 0);
         __atomic_store_n(&reply_sent, 1, __ATOMIC_RELEASE);
         close(read_only);
-        if (fixture_case == 2 || fixture_case == 4 || (fixture_case >= 7 && fixture_case <= 10) || (fixture_case >= 15 && fixture_case <= 24 && fixture_case != 19))
+        if (fixture_case == 2 || fixture_case == 4 || (fixture_case >= 7 && fixture_case <= 10) || (fixture_case >= 15 && fixture_case <= 24 && fixture_case != 19) || fixture_case == 31)
             assert(recv(owner, &token, 1, 0) == 0); // invalid FD/receipt/readback rejected, no ACK
         else
             assert(recv(owner, &token, 1, 0) == 1 && token == 'A');
@@ -181,8 +185,8 @@ int main(void) {
     assert(write(fd, &first, sizeof(first)) == sizeof(first));
     assert(ftruncate(fd, 100 * 128 * sizeof(float)) == 0);
     cuvs_ipc_set_wait_callback(cancel_wait);
-    for (int sequence = 0; sequence < 23; sequence++) {
-        fixture_case = sequence < 13 ? sequence : sequence + 2;
+    for (int sequence = 0; sequence < 25; sequence++) {
+        fixture_case = sequence < 13 ? sequence : sequence < 23 ? sequence + 2 : sequence + 7;
         int child_status;
         pid_t child;
         int result = -1;
@@ -197,7 +201,7 @@ int main(void) {
         int rc = cuvs_ipc_build_hnsw_file(path, fd, 100, 128, CUVS_METRIC_L2,
             64, 128, 0, 1ULL << 30, requested_algo(), 64, &policy, &budget, &ace, &nn, &result, err, sizeof(err));
         if (fixture_case == 1) { assert(rc == CUVS_STATUS_CANCELED && result == -1); }
-        else if (fixture_case == 2 || fixture_case == 4 || (fixture_case >= 7 && fixture_case <= 10) || (fixture_case >= 15 && fixture_case <= 24 && fixture_case != 19)) { assert(rc == CUVS_STATUS_ERROR && result == -1); if (fixture_case == 24) assert(strstr(err, "co-deploy")); }
+        else if (fixture_case == 2 || fixture_case == 4 || (fixture_case >= 7 && fixture_case <= 10) || (fixture_case >= 15 && fixture_case <= 24 && fixture_case != 19) || fixture_case == 31) { assert(rc == CUVS_STATUS_ERROR && result == -1); if (fixture_case == 24) assert(strstr(err, "co-deploy")); }
         else if (fixture_case == 3 || fixture_case == 11 || fixture_case == 12) {
             int expected_status = fixture_case == 11 ? CUVS_STATUS_PROTO_MISMATCH : fixture_case == 12 ? CUVS_STATUS_HNSW_RESIDENT_BUDGET_EXCEEDED : CUVS_STATUS_BUILD_FAILED;
             assert(rc == expected_status && result == -1);
@@ -210,6 +214,7 @@ int main(void) {
         else {
             assert(rc == CUVS_STATUS_OK && result >= 0);
             assert(cuvs_hnsw_policy_valid(&policy));
+            if (fixture_case == 30) assert(cuvs_hnsw_ace_partitions_unverified(&policy) && policy.partitions == 2);
             if (policy.route == CUVS_HNSW_ROUTE_ACE)
                 assert(cuvs_hnsw_ace_readback_valid(&ace, &policy) && ace.local_intermediate == 96
                        && ace.quality == 7 && ace.local_iterations == 12);
@@ -236,7 +241,7 @@ int main(void) {
         assert(rc == CUVS_STATUS_ERROR && result == -1 && p.magic == 0 && *accepts == before);
         assert(b.host_estimate == 0 && b.pool_used == 0 && b.logical_used == 0); /* zeroed, no reply */
     }
-    assert(*accepts == 23);
+    assert(*accepts == 25);
     /* Directly exercise the daemon's shared production prefix consumer.
      * Legacy/future send only16 bytes: it must reject without reading a tail. */
     for (unsigned k = 0; k < 5; k++) {
@@ -267,7 +272,7 @@ int main(void) {
         assert(waitpid(child, &child_status, 0) == child && WIFEXITED(child_status)
                && WEXITSTATUS(child_status) == 0 && fcntl(fd, F_GETFD) >= 0);
     }
-    assert(*accepts == 28);
+    assert(*accepts == 30);
     /* K3: idle work runs while the reply is pending, never delays reading a
      * ready reply, and does not hide a cancel. */
     for (int k = 25; k <= 29; k++) {
@@ -292,8 +297,8 @@ int main(void) {
         printf("K3 idle case %d: rc=%d idle_calls=%d\n", k, rc, idle_calls);
         assert(pthread_join(t, 0) == 0);
     }
-    assert(*accepts == 33);
+    assert(*accepts == 35);
     close(fd); close(listener); unlink(path); rmdir(dir);
     assert(munmap(accepts, sizeof(*accepts)) == 0);
-    printf("PASS 23 actual-client wire cases (v6 ACE readback bound, none on resident),4 preconnect refusals,5 shared-daemon prefix/settings cases,5 K3 idle-wait cases; explicitACE/IVF, forgedroute/version/request rejection, cancellation/status13/protocolerror; current global v%u retained\n", CUVS_PROTO_VERSION);
+    printf("PASS 25 actual-client wire cases (v6 ACE readback bound, none on resident; requested-only ACE receipt accepted, mark off the ACE route refused),4 preconnect refusals,5 shared-daemon prefix/settings cases,5 K3 idle-wait cases; explicitACE/IVF, forgedroute/version/request rejection, cancellation/status13/protocolerror; current global v%u retained\n", CUVS_PROTO_VERSION);
 }

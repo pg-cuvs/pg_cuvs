@@ -51,6 +51,8 @@ MUTATIONS = {
     'meta_pd_lower_not_bumped': ('hnsw_export.c', '        ((PageHeader)staged)->pd_lower += sizeof(*ace);\n', ''),
     'meta_read_wrong_offset': ('hnsw_export.c', '    Size at = SizeOfPageHeaderData + sizeof(PgvHnswMeta) + sizeof(*policy);',
                                '    Size at = SizeOfPageHeaderData + sizeof(PgvHnswMeta);'),
+    'client_skips_policy_validation': ('cuvs_ipc.c', '            if (!cuvs_hnsw_policy_valid(&wire.policy)\n',
+                                       '            if (0 && !cuvs_hnsw_policy_valid(&wire.policy)\n'),
     'client_accepts_readback_on_resident': ('cuvs_ipc.c', '                    : wire.ace.magic != 0)', '                    : 0)'),
 }
 
@@ -62,7 +64,7 @@ def run_converter(tree):
 
 
 def copy_tree(dst):
-    shutil.copytree(ROOT, dst, ignore=shutil.ignore_patterns('.git', '*.o', '*.so', 'test-*', 'pg_cuvs_server', '*.bc'))
+    shutil.copytree(ROOT, dst, ignore=shutil.ignore_patterns('.git', '.ccache', '*.o', '*.so', 'test-*', 'pg_cuvs_server', '*.bc'))
 
 
 def build_and_run(src, work, test):

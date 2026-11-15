@@ -274,7 +274,7 @@ static inline uint64_t cuvs_hnsw_disk_need(uint64_t n, uint32_t dim, uint32_t de
 
 typedef struct CuvsHnswRouteDecision {
     uint32_t route;
-    uint32_t partitions; /* candidate only; SDK fixed-point plan records effective P */
+    uint32_t partitions; /* candidate (requested) count; the receipt keeps it as requested unless the SDK source planner replaced it with the effective P */
     uint32_t overflowed; /* 1 only via the auto -> ACE overflow branch */
     uint32_t pad;
     uint64_t sdk_host_budget;

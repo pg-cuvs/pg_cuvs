@@ -189,6 +189,16 @@ jobs:
           make installcheck-tier1 || { echo "===== regression.diffs ====="; cat test/regression.diffs; false; }
           make installcheck-isolation || { echo "===== isolation diffs ====="; cat test/output_iso/regression.diffs 2>/dev/null; cat test/regression.diffs 2>/dev/null; false; }
 
+      # The ACE receipt / readback mutations (Makefile: test-hnsw-ace-quality-mutations)
+      # build test-hnsw-converter, which needs the PostgreSQL server headers and Linux libc
+      # (posix_fallocate, mkdtemp): it is red on macOS and the CPU-only job above has no
+      # server headers, so it runs here and is not a prerequisite of test-unit.
+      - name: ACE receipt mutations (converter, needs PG headers)
+        timeout-minutes: 15
+        run: |
+          export PATH=/usr/lib/postgresql/16/bin:$PATH
+          make test-hnsw-ace-quality-mutations
+
       # #124: build_oom/build_multi_oom/build_oom_evict_to_fit/extend_cuda_oom
       # (REGRESS_FAULT, excluded from REGRESS_TIER1 above) call
       # pg_cuvs_inject_{build,extend}_oom(), which reach the daemon's

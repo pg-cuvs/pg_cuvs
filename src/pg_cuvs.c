@@ -3118,7 +3118,7 @@ cuvs_build_hnsw_from_heap(Relation heapRel, Relation indexRel, IndexInfo *indexI
             if (cuvs_hnsw_ace_partitions_unverified(&out->policy))
                 ereport(NOTICE, (errmsg("pg_cuvs: ACE partition count %u is the requested count; the effective count is not guaranteed", out->policy.partitions),
                     errdetail("This pg_cuvs_server was built without the cuVS SDK source planner, so the receipt records the count that was requested and cannot confirm the count the SDK built. pg_cuvs_hnsw_build_info() reports ace_partitions_origin as requested_effective_not_guaranteed."),
-                    errhint("Build pg_cuvs_server with CUVS_SDK_SOURCE_INCLUDE set to the patched SDK's cpp/src to record and verify the effective count.")));
+                    errhint("Build pg_cuvs_server with CUVS_SDK_SOURCE_INCLUDE set to a path of the patched SDK source whose neighbors/detail/cagra/cagra_build.cuh exists and with OpenMP (-fopenmp); a variable that is set but misses either still builds without the planner.")));
             out->tids_fd = dup(FileGetRawDesc(spool->tids));
             if (out->tids_fd < 0)
                 ereport(ERROR, (errcode_for_file_access(), errmsg("pg_cuvs: cannot hand off TID spool: %m")));
