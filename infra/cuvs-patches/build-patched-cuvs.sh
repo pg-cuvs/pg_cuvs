@@ -244,40 +244,64 @@ source_state_matches() {
       expected_tracked="$EXPECTED_TRACKED_0007"
       expected_untracked="$(printf '%s\n' "$ACE_GUARD_REL" "$PRECISION_HEADER_REL" "$NN_CONTRACT_REL" "$ROW_SORT_PLAN_REL" | LC_ALL=C sort)"
       ;;
+    4+6|4+6+7)
+      # The state main's recipe accepts: 0001..0004, 0006 (and 0007) without
+      # 0005. 0005 changes other files, so applying it next yields level 6 or 7.
+      expected_hpp="$EXPECTED_PATCH4_HNSW_HPP_SHA"
+      expected_cpp="$EXPECTED_PATCH4_HNSW_CPP_SHA"
+      expected_cagra="$EXPECTED_PATCHED_CAGRA_CPP_SHA"
+      expected_cagra_build="$EXPECTED_FINAL_CAGRA_BUILD_SHA"
+      expected_tracked="$EXPECTED_TRACKED_0006"
+      [[ "$prefix_level" == 4+6+7 ]] && expected_tracked="$EXPECTED_TRACKED_0007"
+      expected_untracked="$(printf '%s\n' "$ACE_GUARD_REL" "$PRECISION_HEADER_REL" "$ROW_SORT_PLAN_REL" | LC_ALL=C sort)"
+      ;;
     *) return 1 ;;
+  esac
+  # Which patches the state contains (ordinal levels 0..7 or 4+6[+7]).
+  local has3=0 has4=0 has5=0 has6=0 has7=0
+  case "$prefix_level" in
+    4+6) has3=1; has4=1; has6=1 ;;
+    4+6+7) has3=1; has4=1; has6=1; has7=1 ;;
+    *)
+      [[ "$prefix_level" -ge 3 ]] && has3=1
+      [[ "$prefix_level" -ge 4 ]] && has4=1
+      [[ "$prefix_level" -ge 5 ]] && has5=1
+      [[ "$prefix_level" -ge 6 ]] && has6=1
+      [[ "$prefix_level" -ge 7 ]] && has7=1
+      ;;
   esac
 
   source_file_matches "$HNSW_HPP_REL" "$expected_hpp" || return 1
   source_file_matches "$HNSW_CPP_REL" "$expected_cpp" || return 1
   source_file_matches "$CAGRA_CPP_REL" "$expected_cagra" || return 1
   source_file_matches "$CAGRA_BUILD_REL" "$expected_cagra_build" || return 1
-  if [[ "$prefix_level" -ge 3 ]]; then
+  if [[ "$has3" == 1 ]]; then
     source_file_matches "$ACE_GUARD_REL" "$EXPECTED_ACE_GUARD_SHA" || return 1
   elif [[ -e "${SOURCE_ROOT}/${ACE_GUARD_REL}" ]]; then
     return 1
   fi
 
-  if [[ "$prefix_level" == 4 ]]; then
-    source_file_matches "$PRECISION_HEADER_REL" "$EXPECTED_PRECISION_HEADER_SHA" || return 1
-  elif [[ "$prefix_level" -ge 5 ]]; then
+  if [[ "$has5" == 1 ]]; then
     source_file_matches "$PRECISION_HEADER_REL" "$EXPECTED_FINAL_PRECISION_HEADER_SHA" || return 1
+  elif [[ "$has4" == 1 ]]; then
+    source_file_matches "$PRECISION_HEADER_REL" "$EXPECTED_PRECISION_HEADER_SHA" || return 1
   elif [[ -e "${SOURCE_ROOT}/${PRECISION_HEADER_REL}" ]]; then
     return 1
   fi
 
-  if [[ "$prefix_level" -ge 5 ]]; then
+  if [[ "$has5" == 1 ]]; then
     source_file_matches "$NN_CONTRACT_REL" "$EXPECTED_NN_CONTRACT_SHA" || return 1
   elif [[ -e "${SOURCE_ROOT}/${NN_CONTRACT_REL}" ]]; then
     return 1
   fi
 
-  if [[ "$prefix_level" -ge 6 ]]; then
+  if [[ "$has6" == 1 ]]; then
     source_file_matches "$ROW_SORT_PLAN_REL" "$EXPECTED_ROW_SORT_PLAN_SHA" || return 1
   elif [[ -e "${SOURCE_ROOT}/${ROW_SORT_PLAN_REL}" ]]; then
     return 1
   fi
 
-  if [[ "$prefix_level" == 7 ]]; then
+  if [[ "$has7" == 1 ]]; then
     source_file_matches "$GRAPH_CORE_REL" "$EXPECTED_FINAL_GRAPH_CORE_SHA" || return 1
   else
     source_file_matches "$GRAPH_CORE_REL" "$EXPECTED_BASE_GRAPH_CORE_SHA" || return 1
@@ -293,7 +317,7 @@ source_state_matches() {
 }
 
 SOURCE_PATCH_LEVEL=""
-for candidate_level in 0 1 2 3 4 5 6 7; do
+for candidate_level in 0 1 2 3 4 5 6 7 4+6 4+6+7; do
   if source_state_matches "$candidate_level"; then
     if [[ -n "$SOURCE_PATCH_LEVEL" ]]; then
       echo "source checkout ambiguously matches multiple patch-prefix states" >&2
@@ -303,7 +327,7 @@ for candidate_level in 0 1 2 3 4 5 6 7; do
   fi
 done
 if [[ -z "$SOURCE_PATCH_LEVEL" ]]; then
-  echo "source checkout is not clean or an exact ordered patch prefix from 0001 through 0007" >&2
+  echo "source checkout is not clean, an exact ordered patch prefix from 0001 through 0007, or 0001..0004+0006[+0007]" >&2
   echo "tracked changes:" >&2
   git -C "$SOURCE_ROOT" diff --name-only HEAD >&2
   echo "untracked/ignored paths:" >&2
@@ -323,6 +347,14 @@ apply_next_patch() {
   fi
 }
 
+# main's patch-set state without 0005: add 0005, which touches disjoint files.
+if [[ "$SOURCE_PATCH_LEVEL" == 4+6 ]]; then
+  apply_next_patch "$PATCH5_FILE" 6
+  SOURCE_PATCH_LEVEL=6
+elif [[ "$SOURCE_PATCH_LEVEL" == 4+6+7 ]]; then
+  apply_next_patch "$PATCH5_FILE" 7
+  SOURCE_PATCH_LEVEL=7
+fi
 if [[ "$SOURCE_PATCH_LEVEL" == 0 ]]; then
   apply_next_patch "$PATCH1_FILE" 1
   SOURCE_PATCH_LEVEL=1
