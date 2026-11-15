@@ -23,7 +23,7 @@ Contributions and collaboration inquiries are welcome.
   ([.github/pull_request_template.md](.github/pull_request_template.md)) and tick what
   applies in the description. The list is a matter of judgement, and nothing enforces
   it; the two CI jobs are the mechanical checks.
-  - Run `make docs-contract-check` and `make test-unit`.
+  - Run `make docs-contract-check`, `make test-unit` and `make test-source-checks`.
   - If the change touches the Makefile's GPU compile or link flags, `infra/cuvs-patches`
     or the SDK planner sources, run `scripts/check-sdk-patch-path.sh`. It applies
     `infra/cuvs-patches` to the pinned cuVS source, checks the manifest hashes and the
@@ -34,7 +34,10 @@ Contributions and collaboration inquiries are welcome.
     from github.com on every run, so a failed fetch turns that job red; there is no
     retry. It checks flags, not compilation.
   - If the change touches a GPU path, say in the description what was run on a GPU,
-    on which hardware and toolchain, and what was not run. CI has no GPU.
+    on which hardware and toolchain, and what was not run. The jobs that run on
+    every pull request ([ci.yml](.github/workflows/ci.yml)) have no GPU; the GPU
+    regression ([gpu.yml](.github/workflows/gpu.yml)) runs only when a maintainer
+    starts it.
   - List what was not verified. A reader should not have to guess it from what is absent.
   - Add a `CHANGELOG.md` entry under `[Unreleased]` for a user-visible change.
 - Follow the coding guidelines in [CLAUDE.md](CLAUDE.md): surgical changes,
