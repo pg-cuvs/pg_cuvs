@@ -1,0 +1,222 @@
+# Changelog
+
+All notable changes to pg_cuvs are recorded here. The format follows
+[Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Version numbers and the
+release procedure are described in [CONTRIBUTING.md](CONTRIBUTING.md#branches-and-releases).
+
+This file starts after commit `2afe8b2b`, the source baseline of the 0.9.0
+documentation. Earlier changes are in the git history. No tag or GitHub release
+exists for 0.9.0.
+
+## [Unreleased]
+
+### Added
+
+- `pg_cuvs_hnsw_connectivity_status(regclass)` and a `connectivity` object in
+  `pg_cuvs_hnsw_build_info()`: a snapshot, taken when an HNSW index is built, of
+  structural reachability from the entry point, level-0 reachability and the number
+  of weakly connected components. It is opt-in: `SET cuvs.hnsw_connectivity_check =
+  on` (bool, default `off`, USERSET) before `CREATE INDEX` or `REINDEX`. A build with
+  the setting off records `{"status":"disabled",...}`, which differs from
+  `not_recorded` of an index built before the snapshot existed. It is a build
+  snapshot, not live graph integrity: INSERT, DELETE, VACUUM and entry-point changes
+  do not update it, structural reachability does not guarantee recall at a finite
+  `ef_search`, and rows that the check finds unreachable are not recovered by search
+  (#203 stays open for that). The check changes no edge, seed or search result, and a
+  check that cannot finish does not fail the build. One that needs more than
+  `maintenance_work_mem` continues in an unlinked file under `base/pgsql_tmp` and is
+  unavailable under a finite `temp_file_limit`. Cost on one A100-SXM4-80GB over a
+  999,000 x 768 fp32 heap with `build_algo='ivf_pq'`: `CREATE INDEX` took 25.41 to
+  25.95 s with the setting off (five runs, median 25.60 s) and 27.45 to 27.74 s with
+  it on (four runs, mean 27.59 s, of which the check is 2.26 to 2.28 s); the
+  unchanged `main` took 25.60 to 25.70 s (four runs). recall@10 at `ef_search` 40 and
+  160 was 0.9667 and 0.9948 off and 0.9675 and 0.9947 on; two builds of the same
+  index differ from each other, so this is not a claim of identical results. With
+  `build_algo='nn_descent'` the same setting applies: 34.46 s off, 36.56 s on, 34.32 s
+  on unchanged `main`, one run each, recall not measured. A graph file larger than the
+  page cache was not measured. Native GPU runs on four inputs of 1.0 to 2.2 million
+  rows passed, made with the check always on before the setting existed, and were not
+  repeated on the final code. (#208)
+- `build_algo='nn_descent'` for `CREATE INDEX ... USING pg_cuvs_hnsw` builds a
+  resident NN-descent base graph and never falls back to another builder. It rejects
+  fewer than 16 rows, an effective intermediate degree above 1024, non-finite input
+  and input whose conservative FP32 distance bound overflows. The base dtype is FP32
+  when the dimension is 16 or less, an element exceeds the half range, or the
+  resident IVF-PQ norm bound reaches 65504, and FP16 otherwise. L2 builds feed
+  NN-descent a column-centered copy (mean accumulated in float64) so that a common
+  offset does not destroy the neighbour order; stored vectors and search distances use
+  the original rows. The build receipt is policy v3 with an NN tail, and the HNSW
+  op 23 payload is v6: deploy the extension and the daemon together. GPU check, made
+  after the merge message was written, on one A100 80GB PCIe VM: `CREATE INDEX ...
+  USING pg_cuvs_hnsw (embedding vector_l2_ops) WITH (build_algo='nn_descent',
+  ef_construction=64, mode='hnsw')` over a 999000 x 768 fp32 heap took 40.8 s (one
+  run) and gave recall@10 0.7905, 0.9850 and 0.9953 at `ef_search` 10, 80 and 160;
+  with `ef_construction=128` (one run, a profiler attached) 49.4 s and 0.7584,
+  0.9812 and 0.9949, a lower recall at small `ef_search` than at 64 that is not
+  explained yet (#209). The binary was built from commit `09de6aef` with a cuVS SDK
+  of patches 0001 to 0007 (`libcuvs.so` SHA-256 `ceda5af3...`). That commit has the
+  source files of the merged code (the head of the merged branch has the tree of the
+  merge commit and differs from `09de6aef` in tests and documentation only); the
+  merged commit itself was not rebuilt. (#211)
+- SDK patch 0005 (resident NN-descent upper levels) is tracked in
+  `infra/cuvs-patches`. The runtime marker that the daemon requires now ends in the
+  SHA-256 of the three patched files, so for `build_algo='nn_descent'` with a GPU
+  hierarchy an SDK build with the old marker is rejected and must be rebuilt. The
+  recipe builds against a copy of the installed RAFT patched by `raft/0001` and with
+  `BUILD_MG_ALGOS=ON` (`infra/cuvs-patches/prepare-raft-prefix.sh`,
+  `scripts/prepare-patched-cuvs-source.sh`). (#211)
+- The Tier 1 CI job runs `make test-hnsw-converter` (fixtures of the HNSW page
+  writers, the node-location table and the source-less import). No workflow ran it
+  before. (#210)
+- The Tier 1 CI job runs `make test-k3-digest`: `CREATE INDEX` on a live backend
+  against a scripted fake daemon (daemon failure, daemon `CANCELED`, success, a
+  held RPC with `statement_timeout`, a client lost during the RPC), checking the
+  digest LOG line count, the digest against SHA-256 of the inserted rows and the
+  build error. The unit-test step has a 20 minute limit and the digest step 10. (#214)
+- Unit tests: `test-hnsw-digest` (in `test-unit`); the read windows of the
+  source-less import against direct reads under injected EIO, EINTR and short
+  reads; idle-work cases in `test-hnsw-build-ipc` that are ordered by flags instead
+  of sleeps and fail after 10 s with a named condition instead of hanging.
+  (#214, #215)
+- The CPU CI job runs `make test-source-checks`: the HNSW route source checks and
+  their mutation scripts, which no workflow ran before. Two of the checks had gone
+  stale on `main` (one expected an order of calls that a later change had renamed,
+  one read a commit that a depth-1 checkout does not have) and were repaired, each
+  with a planted defect that must turn it red. (#218)
+- Release process: `CHANGELOG.md`; the "Branches and releases" rules in
+  `CONTRIBUTING.md`; CI runs on `release/**` branches; the `Release draft` workflow
+  creates a draft GitHub release from a `vX.Y.Z` tag and refuses a tag that is not
+  on `release/vX.Y.Z` or whose version files or changelog section do not match
+  (`scripts/release-check.sh`, `scripts/release-notes.sh`, tested by
+  `test/release/test_release_scripts.sh`).
+- CI refuses a pull request that edits, renames or deletes an SQL script of a
+  version below `default_version`, and any SQL script change into a release branch
+  (`scripts/check-sql-frozen.sh`, tested by `test/release/test_sql_frozen.sh`).
+
+### Changed
+
+- Extension version 0.9.1. `sql/pg_cuvs--0.9.1.sql` is the 0.9.0 install script plus
+  `pg_cuvs_hnsw_connectivity_status()`, which `sql/pg_cuvs--0.9.0--0.9.1.sql` adds
+  too and which is the only SQL object it changes; the two 0.9.0 scripts are
+  frozen. Object-store manifests are stamped with the
+  new `PG_CUVS_VERSION`; a manifest with another pg_cuvs version logs a version
+  drift warning and loads, and only a cuVS version mismatch rejects an artifact.
+  `make docs-contract-check` reads the version from `pg_cuvs.control` and checks
+  that every `sql/pg_cuvs--*.sql` is in the Makefile `DATA` list. (#219)
+- Source-less HNSW import (`CREATE INDEX ... USING pg_cuvs_hnsw`), four changes
+  that leave pages, page order and WAL records as they were. Timings are from one
+  A100-SXM4-80GB VM (24 vCPU, 113 GiB RAM) with `build_algo='ivf_pq'`,
+  `ef_construction=128`, `shared_buffers` 32GB, `maintenance_work_mem` 8GB and 11
+  parallel maintenance workers, over a 999000 x 768 fp32 heap, with cuVS 26.04
+  patches 0001 to 0004, 0006 and an earlier form of 0007 held fixed (the absolute
+  times need that SDK). Medians of three runs with min to max in parentheses,
+  except where one run is stated; the daemon and PostgreSQL were started fresh for
+  every run. On the 10,000 official queries recall@10 stayed in the run-to-run range
+  (0.966 to 0.968 at `ef_search` 40, 0.994 to 0.995 at 160).
+  - (#210) Node locations that follow the regular page layout are computed instead of read
+    back through a four-page cache. Replaying the access order of the import gave
+    64,935,002 lookups with 56,497,735 cache misses, about 462 GB of 8 KB read
+    requests against a table of about 8 MB. One run on a diagnostic build: import
+    of the data pages 48.57 s to 11.25 s, `CREATE INDEX` 81.67 s to 44.27 s, the same
+    3,588,907,769 bytes of WAL. Any row that does not match the layout turns the
+    computation off for that table and the old path serves it; for graphs with
+    hierarchy the computation switched off, so they take the old path and gain
+    nothing from this change.
+  - (#213) Data pages are added to the relation in groups of up to 32 buffers
+    (`ExtendBufferedRelBy()`, PostgreSQL 16 and later) instead of one block per
+    call. `CREATE INDEX` 33.150 s (32.77 to 33.36) to 30.004 s (29.94 to 30.08); the
+    import after the daemon reply 14.105 s to 11.130 s. A batch holds up to 32 extra
+    buffer pins. Not run on a PostgreSQL build with assertions, not through crash
+    recovery.
+  - (#214) The input digest (the SHA-256 LOG line that binds a build to its input) is
+    computed from the vectors spool file while the backend waits for the daemon,
+    not inside the heap scan. Against the code before the read windows below:
+    `CREATE INDEX` 30.145 s (29.99 to 30.77) to 28.145 s (27.99 to 28.70); heap scan,
+    spool and preflight 8.982 s to 6.882 s; the daemon job did not change. The
+    value and the text of the LOG line are unchanged, but it is now printed after
+    the daemon reply, an interrupt or an error before the RPC no longer prints it,
+    and if rereading the spool fails after a successful daemon build `CREATE INDEX`
+    aborts and the GPU build time is lost. The gain depends on the CPU (about 2 s
+    here, on a VM with SHA instructions).
+  - (#215) Level-0 fields, upper-level records and TIDs are read through fixed 1 MiB
+    windows instead of one `pread` each. Against the same baseline: `CREATE INDEX`
+    27.739 s (27.58 to 27.94), together with the digest change 25.608 s (25.58 to
+    25.74); `pread` calls of the backend 9,991,134 to 7,537; bytes read by the backend
+    3.64 GB to 6.73 GB (9.80 GB with the digest change).
+- SDK patch 0007 (CAGRA prune, #216): at row degree 256 with 32-bit IDs the rank scan of
+  `kern_prune` is replaced by a binary search on a sorted index in shared memory;
+  every other degree keeps the old kernel. On the A100-SXM4-80GB, standalone
+  `cagra::build` of a 999000 x 768 corpus, median of three interleaved runs: 15.60 s
+  without the prune change, 8.92 s with this patch (9.15 s with an earlier form).
+  Byte equality of the detour counts with the unpatched kernel in 52 cases and
+  `compute-sanitizer` on a small suite were checked. An end-to-end `CREATE INDEX`
+  with exactly this patch and an nsys trace of the new kernel were not.
+- Project skills for coding agents moved from `.claude/skills` to `.agents/skills`;
+  `.claude/skills/<name>` are relative symlinks. Development tooling only. (#217)
+
+### Fixed
+
+- The connectivity check of #208 answers PostgreSQL's ordinary interrupts (such as a
+  memory-context log request) with `CHECK_FOR_INTERRUPTS()` instead of treating any
+  pending interrupt as a cancel, which had discarded a valid observation as
+  `unavailable`; a real cancel, timeout or backend termination returns PostgreSQL's
+  error. `posix_fallocate` of its file workspace retries on `EINTR` with the backend's
+  signals blocked, and the workspace is released on error paths. The earlier
+  behaviour was in the revision of that change before it merged, not in a release.
+  (#208)
+- On macOS the backend closed its copy of the HNSW build owner descriptor right
+  after sending it with `SCM_RIGHTS`; while the message was in flight the daemon
+  could read EOF and treat a live build as cancelled (`test-hnsw-build-ipc` failed
+  in about 5% of runs at that commit and 23% at `ae818ad0`; none in Linux 6.8 arm64
+  runs). The backend now keeps the descriptor until the reply. (#211)
+- The HNSW page writers (#212; `write_elem_page()`, `write_elem_pages_packed()`, both
+  metapage writers and the source-less publisher) changed a shared buffer, called
+  `MarkBufferDirty()` and wrote the WAL record outside one critical section, which
+  PostgreSQL requires, and built page contents that can `ereport` directly in the
+  locked buffer. Pages are now built in private memory and published through one
+  helper that runs the copy, `MarkBufferDirty()` and `log_newpage_buffer()` inside
+  `START_CRIT_SECTION()`/`END_CRIT_SECTION()`; the unit fixtures assert it. No
+  corruption or crash caused by this was observed. The change was not run on a
+  PostgreSQL build with assertions, and replaying the WAL it writes was not tested.
+- SDK patch 0006 (#216): with refinement disabled, the CAGRA kNN-graph builder passed IVF-PQ
+  search rows to the graph writer and the pruning step, which read each position as
+  the neighbour's rank, but the select returns a different order on its warp-select
+  path (K up to 256) than on its radix path (K above 256). A build with intermediate
+  degree 256 (K = 257) consumed unordered rows. The patch sorts each row; the
+  recipe also applies the RAFT `select_k` key bit width patch that the validated
+  binaries used. On a 999000 x 768 fp32 corpus with intermediate degree 256,
+  recall@10 at `ef_search` 10 over 10,000 queries went from 0.53653 to 0.84139 in
+  one build configuration and from 0.62018 to 0.93995 in another.
+
+### Upgrading
+
+- Build the release from its tag, install the extension and the daemon together
+  (`make install` and `make install-server`), restart PostgreSQL and then the
+  daemon, and run `ALTER EXTENSION pg_cuvs UPDATE TO '0.9.1';` in each database
+  (`SELECT extversion FROM pg_extension WHERE extname = 'pg_cuvs'` shows `0.9.1`
+  afterwards). The upgrade script adds one function, `pg_cuvs_hnsw_connectivity_status(regclass)`. The steps and the
+  restart order are in `docs/playbooks/release-upgrade.md`. The HNSW op 23 payload
+  is v6, so an extension and a daemon of different builds do not work together.
+- 0.9.0 was never tagged and its scripts changed in place until this release. A
+  database that got `pg_cuvs` 0.9.0 from a development build may hold a catalog
+  that differs from the final 0.9.0 scripts, and `ALTER EXTENSION ... UPDATE`
+  does not repair it: a database installed from the first 0.9.0 commit
+  (`4e5d25f3`) and updated to 0.9.1 still lacked 12 of the 35 `pg_cuvs*` functions
+  that a fresh 0.9.1 database has. For such a database, note the definitions of its
+  pg_cuvs indexes (`SELECT indexdef FROM pg_indexes WHERE indexdef ~ 'USING (cagra|flat|ivfpq|pg_cuvs_hnsw)'`),
+  run `DROP EXTENSION pg_cuvs CASCADE` (it drops those indexes), `CREATE EXTENSION
+  pg_cuvs`, and run the noted `CREATE INDEX` statements again, instead of updating
+  in place. The same sequence on that database gave a function list equal to the
+  fresh database's and a `cagra` index that the planner used (checked on the CPU
+  reference build, PostgreSQL 16.15).
+- The cuVS SDK is built from `infra/cuvs-patches`. With `build_algo='nn_descent'`
+  and a GPU hierarchy (`mode='hnsw'`) the daemon refuses the build unless the
+  library exports the marker of patch 0005 (`src/cuvs_wrapper.cu`, the
+  `hnsw_sdk_marker_verified("pgcuvs_hnsw_resident_nn_upper_patch_id", ...)` check).
+  Patch 0005 itself refuses an upper level only when it does not fit the base FP16
+  precision (the dimension is 16 or less, or a value is non-finite or beyond the half
+  range: `RAFT_EXPECTS(dim > 16 && !nn_input_needs_fp32(...))` in
+  `infra/cuvs-patches/0005-hnsw-resident-nn-upper.patch`) or, for L2, when non-finite
+  values prevent centering. Other build algorithms are unchanged. To get the CAGRA
+  row-order fix (0006) and the faster prune (0007), rebuild the SDK with
+  `infra/cuvs-patches/build-patched-cuvs.sh`.

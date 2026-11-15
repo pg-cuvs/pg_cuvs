@@ -1,0 +1,63 @@
+name: Release draft
+
+# A tag vX.Y.Z pushed to the last commit of release/vX.Y.Z creates a DRAFT GitHub
+# release whose title and notes come from the "## [X.Y.Z]" section of
+# CHANGELOG.md. The workflow never publishes: a person reads the draft and
+# publishes it. See "Branches and releases" in CONTRIBUTING.md.
+#
+# Before the draft is created, scripts/release-check.sh refuses a tag that is not
+# on release/vX.Y.Z or whose pg_cuvs.control, Makefile, PG_CUVS_VERSION, install
+# script or CHANGELOG section does not match the tag. The scripts are tested by
+# test/release/test_release_scripts.sh in ci.yml.
+
+on:
+  push:
+    tags: ["v[0-9]+.[0-9]+.[0-9]+"]
+
+# No token permission by default; the one job asks for the one it needs.
+permissions: {}
+
+concurrency:
+  group: release-${{ github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  draft:
+    name: Draft GitHub release
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    permissions:
+      contents: write   # gh release create --draft
+    steps:
+      # Full history: release-check.sh looks for the tagged commit on origin/release/vX.Y.Z.
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Check the tag against the tree and the release branch
+        env:
+          TAG: ${{ github.ref_name }}
+        run: bash scripts/release-check.sh "$TAG"
+
+      - name: Extract title and notes from CHANGELOG.md
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          version="${TAG#v}"
+          bash scripts/release-notes.sh "$version" body > "$RUNNER_TEMP/notes.md"
+          bash scripts/release-notes.sh "$version" title > "$RUNNER_TEMP/title.txt"
+          echo "--- title ---"; cat "$RUNNER_TEMP/title.txt"
+          echo "--- notes ---"; cat "$RUNNER_TEMP/notes.md"
+
+      - name: Create the draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          gh release create "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --draft \
+            --verify-tag \
+            --title "$(cat "$RUNNER_TEMP/title.txt")" \
+            --notes-file "$RUNNER_TEMP/notes.md"
