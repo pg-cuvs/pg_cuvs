@@ -246,7 +246,8 @@ static unsigned chain_test_wal_images;
 static uint32 chain_test_extend_limit = 32;
 static unsigned chain_test_extend_calls;
 #endif
-static char chain_test_palloc_arena[256 * 1024];
+/* The source-less row reader holds three fixed read-ahead windows. */
+static char chain_test_palloc_arena[3 * HNSW_READ_WINDOW_BYTES + 256 * 1024];
 static size_t chain_test_palloc_used;
 
 static void *
