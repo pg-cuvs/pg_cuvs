@@ -30,11 +30,12 @@ jobs:
         with:
           fetch-depth: 2
 
-      # gcc + make are preinstalled; daemon-guard unit tests need curl/SSL headers.
+      # gcc + make are preinstalled; daemon-guard unit tests need curl/SSL headers; the
+      # patched-SDK path check below needs pg_config (PGXS) to evaluate the Makefile.
       - name: Install CPU test dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y libcurl4-openssl-dev libssl-dev
+          sudo apt-get install -y libcurl4-openssl-dev libssl-dev postgresql-server-dev-14
 
       - name: Documentation contract checks
         run: make docs-contract-check
@@ -67,6 +68,14 @@ jobs:
       - name: Source structure checks (CPU)
         timeout-minutes: 10
         run: make test-source-checks
+
+      # The patched cuVS SDK build path (CUVS_SDK_SOURCE_INCLUDE set) is built by
+      # neither CI job. This step applies infra/cuvs-patches to the pinned cuVS
+      # source and checks the Makefile's nvcc and link flags for it, without CUDA.
+      # It fetches one pinned commit of rapidsai/cuvs (about 3 MB, bounded to 120 s).
+      - name: Patched cuVS SDK build path (CPU, no CUDA)
+        timeout-minutes: 10
+        run: scripts/check-sdk-patch-path.sh
 
 # ── Job 1b: Tier 1 — CPU-reference shim (full build + installcheck) ────────
 # Builds the extension + daemon with the pure-C CPU shim (PGCUVS_CPU_SHIM=1, no
