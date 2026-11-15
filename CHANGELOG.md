@@ -10,6 +10,26 @@ exists for 0.9.0.
 
 ## [Unreleased]
 
+### Added
+
+- `cuvs.hnsw_exact_scan` (bool, default `off`, USERSET): with `on`, an ordered scan of a
+  `pg_cuvs_hnsw` index computes exact SQL distances over the MVCC-visible heap rows
+  instead of reading the HNSW graph, so rows the graph cannot reach (#203) are returned
+  and the result matches Seq Scan + Sort. With the default `off` the scan is unchanged
+  and #203 stays open: nothing recovers unreachable rows without the setting. A scan runs
+  exactly or stops with SQLSTATE `0A000`; it never continues approximately. Statements
+  with row-level security, a security barrier, an index expression or a partial index are
+  planned as Seq Scan + Sort instead, so that security quals run before any distance
+  function; a statement whose final plan would keep a `pg_cuvs_hnsw` scan that cannot run
+  exactly is planned a second time, and planning side effects such as the `NOTICE` of an
+  `IMMUTABLE` function on constants then happen twice. Cost: the whole heap is read even
+  with a small `LIMIT`; the best candidates that fit in `work_mem` (16 bytes each) are
+  kept, and a caller that reads more makes a second pass through temporary files. On one
+  CPU container (PostgreSQL 16.15, pgvector 0.8.7), `LIMIT 10`, warm: 11 ms over
+  100,000 x 96 (Seq Scan + top-N Sort 11 ms) and 284 ms over 1,000,000 x 96 (143 ms).
+  Tested on PostgreSQL 16 CPU only, not on GPU builds, other pgvector versions or in
+  GitHub Actions at the time of writing.
+
 ## [0.9.2] - 2026-11-15
 
 Micro-batched index scans no longer fail with 64 or more concurrent clients
