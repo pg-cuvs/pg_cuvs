@@ -1,7 +1,7 @@
 # pg_cuvs Cost-Model Calibration & Validation (Stage C freeze)
 
 > **Status: Historical Stage A/B evidence.** This report records the 0.5.0
-> A100 calibration; HEAD declares extension version 0.9.2. Its EXPLAIN and
+> A100 calibration; HEAD declares extension version 0.9.3. Its EXPLAIN and
 > latency tables are not a new run against HEAD. Current planner settings
 > and SQL surface are in [`docs/reference.md`](../reference.md).
 

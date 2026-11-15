@@ -5,8 +5,8 @@
 > in [ARCHITECTURE.md](../ARCHITECTURE.md); the rationale behind each is in
 > [design/decisions.md](../design/decisions.md). Source-checked against `src/pg_cuvs.c` and
 > `sql/pg_cuvs--0.9.0.sql` at HEAD `ae818ad` (extension version 0.9.0; source review only).
-> The current install script `sql/pg_cuvs--0.9.2.sql` creates the catalog of `sql/pg_cuvs--0.9.1.sql`
-> (the 0.9.1 → 0.9.2 script changes no SQL object), which is the 0.9.0 catalog plus
+> The current install script `sql/pg_cuvs--0.9.3.sql` creates the catalog of `sql/pg_cuvs--0.9.1.sql`
+> (the 0.9.1 → 0.9.2 and 0.9.2 → 0.9.3 scripts change no SQL object), which is the 0.9.0 catalog plus
 > `pg_cuvs_hnsw_connectivity_status()` (`test/sql/upgrade_path.sql` compares the upgrade chain
 > with a fresh install).
 
