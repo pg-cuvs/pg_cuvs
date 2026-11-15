@@ -1,5 +1,9 @@
 # Document Map
 
+Source baseline: `ae818ad0` (2026-11-11), extension `0.9.0`. “Verified” below
+means the stated source or dated evidence was checked; it does not certify a new
+GPU or PostgreSQL run.
+
 This file is the documentation routing contract for `pg_cuvs`. It separates
 current product behavior, measured evidence, design history, planning, and
 operations. A historical document must never override the current source or
@@ -9,7 +13,7 @@ the current-state documents listed below.
 
 | Domain | Runtime/source authority | Canonical document | Rule |
 |---|---|---|---|
-| Product surface | `src/pg_cuvs.c`, `sql/pg_cuvs--0.5.0.sql`, `pg_cuvs.control` | [docs/reference.md](reference.md) | GUC defaults, AMs, SQL functions, views, and search modes are documented here. |
+| Product surface | `src/pg_cuvs.c`, `sql/pg_cuvs--0.9.0.sql`, `pg_cuvs.control` | [docs/reference.md](reference.md) | GUC defaults, AMs, SQL functions, views, and search modes are documented here. |
 | Architecture | `src/pg_cuvs.c`, `src/pg_cuvs_server.c`, `src/cuvs_ipc.*` | [ARCHITECTURE.md](../ARCHITECTURE.md) | Process ownership, IPC, persistence, lifecycle, and failure boundaries are documented here. |
 | Overview | Current-state documents above | [README.md](../README.md) | Overview and quickstart only; do not duplicate detailed defaults or benchmark caveats. |
 | Workload guidance | Current reference plus measured evidence | [operational guide](operational-guide.md) and [best practices](best-practices.md) | Selection guidance and deployment recommendations must cite current measurements or source-backed defaults. |
@@ -44,6 +48,7 @@ document explicitly links a still-valid section.
 
 ## Supporting planning and evidence records
 
+- [2026-11-11 documentation refresh](reports/2026-11-11-documentation-refresh.md) — source baseline, all-file inventory, corrections, checks, and runtime verification limits.
 - [benchmark protocol](../design/benchmarks/protocol.md) — active experiment design; publish only through `BENCHMARK.md` and the results ledger.
 - [CI strategy](../design/ci-strategy.md) — active CI scope and tier boundaries.
 - [refactor audit](../design/refactor-audit.md) — historical audit/trigger list; stale findings do not override current source or checks.

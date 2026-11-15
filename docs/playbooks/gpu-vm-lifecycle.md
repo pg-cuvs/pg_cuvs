@@ -18,7 +18,7 @@ project `your-gcp-project`에 있다** — gcloud 명령에 항상
 
 ## 1. 증상 (Symptoms)
 
-- VM stop/start 후 `make sync`/`ssh`가 **이전 IP로 접속 실패**(timeout/no route).
+- GCP VM stop/start 후 `USE_GCP_IP=0` 상태에서 `make sync`/`ssh`가 **이전 IP로 접속 실패**(timeout/no route).
 - VM stop/start 후 데몬이 `[ERROR] pg_cuvs_server: no CUDA GPUs detected`로 죽는다.
 - `nvidia-smi`가 `Failed to initialize NVML: Driver/library version mismatch`.
 - 재시작 후 `/tmp/cuvs_indexes`가 비어 있다(인덱스 artifact가 사라짐).
@@ -48,8 +48,8 @@ ssh ubuntu@<IP> 'sudo journalctl -u pg-cuvs-server --no-pager -n 20 | grep -i "G
 
 ### A. Ephemeral 외부 IP 변경
 `pg-cuvs-dev`/`pg-cuvs-dev-mgpu`는 정적 IP가 아니다. stop/start 시 외부 IP가
-바뀐다(예: 이번 세션 `35.224.130.40` → `104.197.150.30`). `gpu.conf`의 `VM_SSH_HOST`은
-이전 IP를 가리키므로 `make sync`/`gpu-*`가 죽은 호스트로 붙는다.
+바뀔 수 있다. `USE_GCP_IP=1`이면 Makefile이 현재 GCP IP를 조회한다.
+그렇지 않으면 `gpu.conf`의 `VM_SSH_HOST`가 이전 IP를 가리킬 수 있다.
 
 ### B. NVIDIA driver/library version mismatch (stop/start의 주 함정)
 stop/start 후 userspace NVML 라이브러리와 로드된 커널 모듈 버전이 어긋나
@@ -82,6 +82,7 @@ NEWIP=$(gcloud compute instances describe pg-cuvs-dev --zone=us-central1-b --pro
 echo "new IP = $NEWIP"
 # gpu.conf 의 VM_SSH_HOST=ubuntu@<old> 를 ubuntu@$NEWIP 로 수정.
 # 일회성으로는 make 에 override: make sync VM_SSH_HOST=ubuntu@$NEWIP
+# GCP 자동 조회를 쓰는 경우: make sync USE_GCP_IP=1
 ```
 
 ### Driver/library mismatch 후 (reset)

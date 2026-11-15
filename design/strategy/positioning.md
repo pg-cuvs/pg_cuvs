@@ -1,5 +1,11 @@
 # pg_cuvs Positioning, Differentiation, and Limits
 
+> **Historical strategy analysis.** Product behavior and assurance levels below
+> reflect the analysis at the time of writing. For the current contract, use
+> [docs/reference.md](../../docs/reference.md) and
+> [ARCHITECTURE.md](../../ARCHITECTURE.md); for measured claims, use
+> [BENCHMARK.md](../../BENCHMARK.md).
+
 ## One-line Positioning
 
 pg_cuvs is not a thin cuVS wrapper. It is a PostgreSQL semantic adapter and

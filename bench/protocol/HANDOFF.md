@@ -1,5 +1,9 @@
 # Benchmark Continuation — Handoff
 
+> **Status: Historical handoff (2026-06-17).** 아래의 VM 상시 가동·설치 버전·
+> 다음 작업 목록은 당시 스냅샷이다. 새 실행에는 현재 `bench.yml`,
+> `run.sh`, 엔진 스크립트와 실제 VM 상태를 다시 확인한다.
+
 > **Purpose**: hand off the pg_cuvs benchmark campaign to the next session/operator.
 > Validation (cost model) is **done & merged**; this is the map for the remaining
 > Stage D suite + the harness gaps each module needs. Read this, then
@@ -125,10 +129,10 @@ stage=D module=concurrency ref=main build=false \
 > resource/$ Pareto. Everything ivfpq is blocked on one Tier-0 item: `forced-ivfpq`
 > in `runner.py` (build reloptions `n_lists/pq_bits/pq_dim` + `cuvs.ivfpq_n_probes` sweep).
 
-> **Schema note**: `observe.PROTOCOL_FIELDS` already has first-class `selectivity`,
-> `correlation`, `filter_mode`, `stream_op`, `ops_done`, `delta_rows`,
-> `sla_bounded_qps`, `detoast_ms`, `build_kind` — it was designed for D2/D3/D4.
-> **No schema gap.** The old D-prep "promote columns to first-class" item is already done.
+> **Schema correction (HEAD):** `observe.PROTOCOL_FIELDS` has first-class
+> `selectivity`, `correlation`, `filter_mode`, `stream_op`, `ops_done`,
+> `delta_rows`, and `sla_bounded_qps`. It does **not** contain `detoast_ms`
+> or `build_kind`; those remain protocol-design fields, not CSV columns.
 
 ### Priority order (value / effort)
 

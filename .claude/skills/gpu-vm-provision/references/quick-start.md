@@ -1,6 +1,7 @@
 # Quick Start — 처음부터 VM 프로비저닝
 
-처음 시작하거나 깨끗하게 다시 시작할 때. 검증된 순서.
+GCP Terraform 기반 레거시 VM 절차다. 현재 Brev 부트스트랩은
+[`infra/brev/bootstrap.sh`](../../../../infra/brev/bootstrap.sh)를 따른다.
 
 ## 0. 사전 조건 확인
 
@@ -50,8 +51,8 @@ cp terraform.tfvars.example terraform.tfvars
 terraform init && terraform apply -auto-approve
 # ~30초 안에 VM 생성됨
 
-terraform output env_gpu_snippet > ../../gpu.conf
-# gpu.conf에 VM_SSH_HOST, GCP_INSTANCE, CUDA_ARCH 등 자동 채워짐
+terraform output -raw env_gpu_snippet > ../../gpu.conf
+# 현재 outputs.tf는 VM_SSH_HOST가 아닌 레거시 GCP_VM을 출력한다.
 ```
 
 **STOCKOUT 오류 시**: tfvars의 zone을 b/c/f로 변경 후 재시도.
@@ -76,7 +77,13 @@ ssh ubuntu@$IP "sudo tail -3 /var/log/pg_cuvs_setup.log"
 - PostgreSQL 16 (PGDG repo) + postgresql-server-dev-16
 - pgvector 0.8.0 (소스 빌드 + install)
 
-## 5. 빌드 + 설치
+## 5. 빌드 + 설치 (레거시 명령, 현재 원격 환경 계약과 불일치)
+
+현재 `Makefile`의 원격 `gpu-*` 타깃은 VM의 `~/.pg_cuvs_env`를 필수로
+읽는다. GCP startup script는 이 파일을 만들지 않으므로 아래 명령은
+현재 GCP 신규 VM에서 그대로 실행할 수 없다. 현행 개발 경로는 Brev
+bootstrap 문서를 사용한다. GCP 경로를 재사용하려면 startup script와
+원격 환경 계약을 먼저 맞추고 그 VM에서 빌드·설치를 검증해야 한다.
 
 ```bash
 make sync         # 로컬 → VM rsync

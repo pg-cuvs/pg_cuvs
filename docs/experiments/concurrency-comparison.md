@@ -1,5 +1,9 @@
 # 동시성 대조 — GPU 벡터 인덱스에 동시 insert+query를 업계는 어떻게 푸나
 
+> **Status: Historical external-system comparison (2026-06).** 외부 제품·버전의
+> 현행 동작은 이 문서에서 재확인하지 않았다. pg_cuvs 관련 동시성·쓰기 경로의
+> 현재 계약은 [`docs/reference.md`](../reference.md)와 소스를 따른다.
+
 > 외부 시스템 조사: FAISS · Milvus · OpenSearch · Kinetica의 cuVS/RAFT 통합과
 > "동시 insert+query 시 GPU flat/인덱스 정합성" 처리. 2026-06 웹 조사(병렬 서브에이전트).
 > 목적: pg_cuvs flat의 동시-쓰기 race(ADR-077)를 업계 패턴에 비춰 **우리 설계 정당성과

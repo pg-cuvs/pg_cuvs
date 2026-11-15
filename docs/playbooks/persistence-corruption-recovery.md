@@ -9,7 +9,8 @@ daemon 재시작 시 persisted index가 로드되지 않거나 `.tids` 검증이
 - daemon 재시작 후 journal에 특정 인덱스의 `loaded index` 메시지가 없다.
 - journal에 `.tids validation failed`, `bad magic`, `crc mismatch`, `dim=0` 등의 메시지가 있다.
 - journal에 `skip` 메시지와 함께 인덱스가 건너뛰어진다.
-- 해당 인덱스에 대한 검색이 CPU fallback한다 (`WARNING: index not loaded on daemon`).
+- 해당 인덱스가 계획 단계에서 CPU로 우회되거나, 이미 선택된 GPU scan 실행 중
+  `index not loaded` 오류가 난다.
 - `.cagra` 파일은 있으나 `.tids`가 없거나 반대인 경우.
 - pre-1.0 코드베이스에서 생성된 headerless `.tids` 파일이 남아 있다.
 

@@ -3,6 +3,10 @@
 실행할 때마다 이 파일을 먼저 읽고, 종료 시 신규 패턴을 추가한다.
 형식: `- [YYYY-MM-DD] <패턴 요약> — <발견 위치> — <탐지 방법> (재발 N회)`
 
+**Historical** — 날짜가 붙은 결함·측정·파일:행은 그 시점의 관찰이다. 현재
+재현 여부와 심각도를 주장하기 전에 HEAD의 소스·테스트·CI를 다시 확인한다.
+`현재 해소` 항목도 해당 범위만 해소된 것이며 다른 항목의 현행 상태를 뜻하지 않는다.
+
 ## 버그 클래스
 
 - [2026-07-28] **shim이 실제 wrapper보다 "친절"해서 호출자 결함을 가린다** — `src/cuvs_wrapper_shim_cpu.c` vs `src/cuvs_wrapper.cu` — 두 파일이 같은 `cuvs_wrapper.h`를 구현하므로 함수별로 (1) 인자 무시 여부 (2) 출력 버퍼 tail 처리 (3) 반환 부호/정렬 규약을 1:1 대조. 이번 패스의 최상위 3건이 전부 이 축이었고 **전부 Tier-1 CI 100% 통과 + Tier-2에서만 발현**. 다음 패스에서도 최우선으로 볼 것.
@@ -15,9 +19,9 @@
 ## 테스트/속도 안티패턴
 
 - [2026-07-28] **`DROP EXTENSION`이 만드는 테스트 간 순서 결합** — `test/sql/` 37개 중 15개가 `DROP EXTENSION pg_cuvs`로 끝남 — 그 결과 정확히 15개 `.out`이 `NOTICE: extension "pg_cuvs" already exists, skipping`를 기대값으로 박아둠. **REGRESS 순서를 바꾸거나 테스트 하나를 빼면 무관한 테스트의 diff가 깨진다.** 스위트 정리를 시도하기 전에 반드시 먼저 해소해야 할 선행 항목.
-- [2026-07-28] **업그레이드 경로 커버리지 0** — `test/`, `.github/`, `infra/` 전체에 `ALTER EXTENSION`/`UPDATE TO` 문자열이 단 1건도 없음 — `grep -r "ALTER EXTENSION" test/`로 즉시 확인 가능. 37개 회귀 테스트가 전부 base 스크립트만 검증.
+- [2026-07-28, 현재 해소] **업그레이드 경로 커버리지 0** — 당시에는 업그레이드 회귀 테스트가 없었다. 현재 `test/sql/upgrade_path.sql`에 `ALTER EXTENSION pg_cuvs UPDATE` 경로가 있고 `Makefile`의 `REGRESS`에 등록되어 있다. 이 항목의 과거 0건 수치를 현행 커버리지로 읽지 않는다.
 - [2026-07-28] **부트스트랩 중복** — `build_lock.sql` ↔ `vram_accounting.sql`(8000x64 생성기 표현식까지 동일), `auto_compact.sql` ↔ `extend_vram_fallback.sql` — 파일별 `generate_series` 행수 x 차원을 표로 뽑아 정렬. 단언만 다르고 준비 과정이 같으면 한 테이블 위에서 순차 검증 가능.
-- [2026-07-28] **CI 캐시 전무** — `.github/workflows/*.yml`에 `actions/cache` 0건 — PGDG repo 추가 + PG16 설치가 2개 job에서 매 push마다 cold. ccache 도입이 가장 효과 큼(단 ASAN/non-ASAN 캐시 키 분리 필요).
+- [2026-07-28, 현재 해소] **CI 캐시 전무** — 당시 `.github/workflows/*.yml`에 `actions/cache` 0건이었다. 현재 `ci.yml`의 `tier1-shim` 잡은 `actions/cache@v4`와 extension/ASAN daemon 별도 `CCACHE_DIR`을 사용한다. PGDG/apt 패키지 설치는 여전히 별도로 수행한다.
 - [2026-07-28] **정의됐으나 테스트가 건드리지 않는 GUC 18/36개** — `auto_compact*`, `max_stale_fraction` 등 — 테스트가 참조하는 `cuvs.*`를 `src/*.c`의 `DefineCustom*` 정의와 대조. 축소가 아니라 **추가** 대상(커버리지 공백).
 
 - [2026-07-28] **Makefile 재귀 확장 `=` + `$(shell)` = 참조 횟수만큼 프로세스 fork** — `Makefile:280` `VM_IP` — `make -n <타깃>`(아무것도 실행 안 함) 시간을 참조 0회/1회/6회 타깃끼리 비교하면 선형 증가로 즉시 드러난다. 실측 `gpu-test-all` 6.69s vs 로컬 타깃 0.24s. **더 중요한 건 정확성** — 조회 결과가 사용자 지정 호스트보다 우선하면 프로바이더 이전 후 옛 머신을 조용히 향한다(`sync`는 `rsync --delete`).

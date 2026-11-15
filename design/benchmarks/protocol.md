@@ -1,5 +1,11 @@
 # pg_cuvs 벤치마크 실험 프로토콜 (v3)
 
+> **Status: Proposed protocol with historical implementation notes.** 이 문서의
+> 셀·통계·CSV 확장 열은 목표 설계다. 현재 생성되는 열과 실행 명령은
+> [`bench/protocol/CONTRACT.md`](../../bench/protocol/CONTRACT.md),
+> `bench/legacy/anbench/observe.py`, `bench/protocol/run.sh`를 확인한다.
+> 문서의 Stage 완료 서술은 당시 기록이며 최신 실행 증거가 아니다.
+
 > **이 문서는 무엇인가**
 > 우리가 직접 엄밀한 벤치마크를 돌리기 위한 **내부 실험 설계서**다.
 > 운영자용 절차서(`docs/playbooks/benchmark-runbook.md`)가 아니다.

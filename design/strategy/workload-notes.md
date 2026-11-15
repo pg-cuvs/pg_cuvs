@@ -1,6 +1,12 @@
 # pg_cuvs 전략 노트 (경쟁 포지셔닝 · 워크로드 표적)
 
 > 상태: **작업 노트.** 전략 방향(A·B·C·D·E)은 **ADR-061로 승격·채택**(2026-06-07). 이 노트는 ADR 뒤의 상세 분석·미해결 쟁점을 보관하는 스크래치패드로 유지.
+> **현행 상태 주의 (HEAD ae818ad):** 아래 G의 `MAX_INDEXES=64`와
+> "auto-reload 안 됨/REINDEX 필요"는 2026-06-08 스파이크의 관찰이다.
+> 현재 [reference §8](../../docs/reference.md)는 기본 `--max-indexes=1024`의
+> soft working-set cap과 reload 시 슬롯 회수를 설명한다. H의 "미착수"도
+> 당시 계획 상태이며, 현재 stream BF 표면은
+> [reference](../../docs/reference.md)에서 확인한다.
 > 작성 계기: VectorChord 0.4 / 3B 사례 분석에서 "cuVS를 *왜* 쓰는가"를 다시 물었고,
 > 어제까지의 "3P가 핵심" 결론이 데이터로 뒤집혔다. 쟁점이 많아 먼저 노트로 고정.
 >

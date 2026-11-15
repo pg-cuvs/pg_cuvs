@@ -15,8 +15,8 @@ heap과 .relfilenode가 자동으로 복사되지만 데몬 측 index_dir의 art
 
 ## 1. 증상 (Symptoms)
 
-- 새 노드 투입 후 모든 쿼리가 CPU fallback으로 빠진다(`WARNING: pg_cuvs_server unreachable`
-  또는 `pg_cuvs: cagra index not loaded`).
+- 새 노드 투입 후 쿼리가 CPU 경로로 계획되거나, 이미 선택된 GPU scan이
+  데몬 연결·인덱스 미상주 ERROR로 끝난다.
 - `pg_stat_gpu_search`에서 `warmup_state`가 `pending` 또는 `downloading`으로 계속
   멈춰 있다.
 - `pg_stat_gpu_search`에서 `resident=f`이고 `download_count=0`이라 다운로드 자체가
@@ -82,15 +82,18 @@ warmup은 데몬 `--snapshot-uri gs://<bucket>`(+`--cluster-id`)가 있어야 GC
 측 인수 필요). → 복구 Step 1.
 
 ### B. GCS 인증 실패 (SA 없거나 key_file 미설정)
-데몬은 (1) instance metadata SA 토큰, 실패 시 (2) `cuvs.gcs_key_file`의 SA JSON으로
-인증한다. VM에 SA가 없고 key_file도 없으면 manifest 요청 시 HTTP 403/401로 실패.
+데몬은 (1) instance metadata SA 토큰, 실패 시 (2) 데몬
+`--gcs-key-file`의 SA JSON으로 인증한다. backend의 `cuvs.gcs_key_file` GUC는
+데몬에 자동 전달되지 않는다. VM에 SA가 없고 데몬 key file도 없으면
+manifest 요청이 실패한다.
 → `gpu-vm-lifecycle.md`에서 SA 부착 후 데몬 재시작. → 복구 Step 1.
 
 ### C. `.relfilenode` sidecar 없음
 데몬 startup은 `.relfilenode` sidecar가 있는 인덱스만 cold warmup 후보로 등록한다.
 새 노드에 heap dump/restore는 됐지만 `.relfilenode`가 누락된 경우 warmup이 트리거되지
 않는다. `.relfilenode`는 `CREATE INDEX USING cagra` 시 pg 백엔드가 `$index_dir/` 아래에
-기록한다. heap이 복원된 후 `REINDEX`로 재생성하는 것이 가장 안전하다.
+기록한다. 쓰기 가능한 노드라면 heap 복원 후 `REINDEX`로 재생성한다.
+읽기 전용 standby에는 이 명령을 실행할 수 없으며, 해당 복제 운영 경로는 미검증이다.
 → 복구 Step 2.
 
 ### D. heap relfilenode mismatch (heap 불호환)
@@ -101,7 +104,8 @@ manifest의 `relfilenode`가 이 노드의 `.relfilenode`와 다르면 데몬이
 ### E. manifest SHA mismatch (artifact 손상)
 GCS에서 받은 `.tids`나 `.shards`의 SHA256이 manifest 기록과 다르면 데몬이 거부한다
 (`manifest SHA mismatch`). 업로드 전 artifact가 손상됐거나 GCS 객체가 부분 덮어써진
-경우. 원본 노드에서 GCS에 재업로드(REINDEX 또는 데몬 재시작으로 재업로드)가 필요하다.
+경우. 원본 노드에서 새 빌드로 GCS에 재업로드해야 한다. 데몬 재시작만으로
+업로드가 다시 트리거되지는 않는다.
 → 복구 Step 3.
 
 ---
@@ -142,6 +146,7 @@ sudo systemctl restart pg-cuvs-server
 
 ```sql
 -- 해당 인덱스를 이 노드에서 재빌드 (heap 호환 .relfilenode + 새 artifact 생성)
+-- 쓰기 가능한 노드에서만 실행한다.
 REINDEX INDEX <idx>;
 ```
 
@@ -167,9 +172,12 @@ ls -1 /tmp/cuvs_indexes/*relfilenode
 
 원본 노드(artifact를 만든 노드)에서:
 
+```sql
+-- 재빌드 성공 후 데몬의 비동기 업로드가 시작된다.
+REINDEX INDEX <idx>;
+```
+
 ```bash
-# 데몬 재시작으로 artifact를 재로드 → GCS에 재업로드 트리거
-sudo systemctl restart pg-cuvs-server
 sudo journalctl -u pg-cuvs-server --no-pager | grep "snapshot complete"
 ```
 

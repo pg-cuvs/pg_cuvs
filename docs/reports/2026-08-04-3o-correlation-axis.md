@@ -1,5 +1,13 @@
 # 2026-08-04 — 3O 상관 축 측정 (#88)
 
+> **Historical measurement (2026-08-04).** 아래 수치는 당시 ext 0.5.0,
+> wiki_all_1M/A100 조건의 증거이며 현재 버전의 재측정 결과가 아니다.
+> #88은 2026-08-04 종료됐다(원격 이슈 상태 확인). 후속 short-fill 완화는
+> [현행 reference](../reference.md)의 filtered search 설명과
+> `test/sql/prefilter_short_fill_guard.sql`을 참조한다. 이 테스트의 존재만으로
+> 당시 측정값이 최신 버전에서 재현되거나 모든 필터 형상에 대한 recall이
+> 보장된다는 뜻은 아니다.
+
 **결론: CAGRA BITSET prefilter(3O)의 recall 붕괴는 selectivity가 아니라 필터–쿼리 상관 방향이
 지배한다.** anti-correlated 필터에서는 selectivity 0.0001부터 **0.5까지 전 구간 recall 0.0**이며,
 같은 sel=0.5에서 비상관 필터는 0.989다. 즉 통과 집합의 **크기를 고정한 채 방향만 바꿔도** recall이
@@ -180,7 +188,10 @@ python bench/filter_recall/adr079_3o_recall.py \
 
 - **결정**: ADR-083 — selectivity 단일 변수 라우팅은 안전하지 않으며, 그래프 densification(ACORN)이
   아니라 런타임 탐지 + 폴백을 채택한다.
-- **구현**: `mean_returned ≪ k` 탐지 + D-wedge 폴백, `cuvs.filter_auto_threshold` 문서 정정(별도 이슈).
+- **당시 구현 제안**: `mean_returned ≪ k` 탐지 + D-wedge 폴백,
+  `cuvs.filter_auto_threshold` 문서 정정(별도 이슈). 현재 소스의 short-fill
+  경로는 D-wedge post-filter가 아닌 GPU exact BF prefilter로 재시도한다
+  (`src/pg_cuvs_server.c`, `docs/reference.md`의 filtered search 절).
 - **ADR-079 정정**: VecFlow가 제기한 3O recall-ceiling 리스크는 확인되되 **귀인이 바뀐다** — 붕괴는
   실재하나 원인은 작은 교집합이 아니라 상관 방향이다(교집합이 커도 붕괴).
 - **ADR-082 공백 해소**: "3O에 대해서는 상관 축을 재지 않았다"가 본 측정으로 닫힌다.

@@ -1,5 +1,21 @@
 # bench/protocol — 실행 아키텍처
 
+> **Status: Historical workflow design.** 아래의 `pg-cuvs-dev` 상시 VM,
+> self-hosted runner 등록, 웹 에이전트 dispatch 및 results 브랜치 push는 이
+> 프로토콜의 당시 운영 가정이다. 현재 인프라가 이 상태인지 이 문서만으로
+> 확인할 수 없다. 새 실행은 [`run.sh`](run.sh)의 입력 계약과 실제
+> [워크플로우](../../.github/workflows/bench.yml), 실행 환경을 각각 확인한다.
+
+> **Open / Blocked at HEAD `ae818ad`:** `bench/protocol/runner.py`,
+> `runner_explain.py`, `runner_concurrency.py`, `runner_incremental.py`,
+> `lib/shim_runner.py`가 없는 `infra/anbench`를 import 경로로 사용한다.
+> 실제 `observe.py`·`anbench_common.py`·`build_gt.py`는
+> `bench/legacy/anbench/`에 있다. CPU 전용 재현
+> (`env -u PYTHONPATH python3 bench/protocol/runner.py --selfcheck`)은
+> `runner.py:32`의 `ModuleNotFoundError: No module named 'observe'`로 exit 1이다.
+> 이 때문에 아래 dispatch 흐름은 이 checkout에서 실행 검증된 절차가 아니다.
+> `PGCUVS_DRY_RUN=1`은 import를 건너뛰며, CPU shim도 같은 경로 오류에 걸린다.
+
 > 벤치마크를 **누가 운전하고, 누가 실행하며, 결과가 어떻게 도는가**의 큰 틀.
 > 실험 설계(무엇을 재는가)는 [`design/benchmarks/protocol.md`](../../design/benchmarks/protocol.md)(ADR-069),
 > 스크립트 인터페이스(어떻게 호출하는가)는 [`CONTRACT.md`](CONTRACT.md).
@@ -51,7 +67,7 @@ get_file_contents    ◄─────── results 브랜치 push ◄──�
 6. 웹: 동결(Stage C) → 이후 Stage D 스위트 dispatch
 ```
 
-단일 run은 12h가 아니라 **Stage/셀-배치 단위로 종료·체크포인트**한다(§CONTRACT 멱등 resume).
+단일 run은 12h가 아니라 **Stage/셀-배치 단위로 종료·체크포인트**한다(CONTRACT §3의 progress 기반 resume).
 적응 이분탐색이 곧 "거친 run → 결과 보고 → refine run"의 자연스러운 단위.
 
 ---
@@ -77,9 +93,9 @@ get_file_contents    ◄─────── results 브랜치 push ◄──�
 ## 5. 안전 / 동시성
 
 - **`concurrency: gpu-singleton`** — 단일 A100 더블부킹 방지(한 번에 한 run).
-- **멱등 resume** — run이 죽으면 `PGCUVS_RESUME=1` 재dispatch로 완료 셀 스킵하고 이어감.
+- **progress 기반 resume** — `PGCUVS_RESUME=1`은 해당 run_id의 progress에 기록된 완료 셀만 건너뛴다. CSV 기록 뒤 progress 기록 전 종료하면 중복행이 생길 수 있다.
 - **dry-run** — `PGCUVS_DRY_RUN=1`로 GPU 쓰기 전 cell 전개 검증.
-- **종료 마커** — `run.sh` stdout 마지막 줄 `PGCUVS_RESULT: status=OK|FAIL|OOM` → 웹 진단.
+- **종료 마커** — `run.sh` stdout 마지막 줄 `PGCUVS_RESULT: status=OK|FAIL` → 웹 진단.
 
 ---
 

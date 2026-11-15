@@ -1,5 +1,11 @@
 # GPU 브루트포스 검색 가속 교훈
 
+> **Status: Historical design input.** 아래의 체크리스트와 구현 제안은
+> 2026-06-04 시점의 계획이다. 현재 제품의 GUC·AM·SQL 표면은
+> [`docs/reference.md`](../reference.md), 측정 결과는
+> [`BENCHMARK.md`](../../BENCHMARK.md)를 따른다. 표의 cuVS A100 수치는
+> 추정 또는 당시 참조값이며 이 실험의 Apple Silicon 실측이 아니다.
+
 **작성일**: 2026-06-04  
 **출처**: cuvs-silicon (Apple Silicon Metal GPU 구현) 실험 결과  
 **대상**: Phase 3L `cuvs.search_mode='brute_force'` 구현 참고

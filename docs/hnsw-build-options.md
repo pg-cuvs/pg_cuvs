@@ -1,6 +1,6 @@
 # over-the-vram HNSW 생성 옵션
 
-이 정책은 0.8.2 `USING pg_cuvs_hnsw` 직접 heap 생성에 적용한다.
+이 정책은 0.8.2에서 도입된 `USING pg_cuvs_hnsw` 직접 heap 생성에 적용한다. 현재 확장 버전은 `pg_cuvs.control`의 0.9.0이다.
 기존 device CAGRA AUTO 경로의 정책은 바꾸지 않는다.
 
 ```sql
@@ -22,7 +22,7 @@ SELECT pg_cuvs_hnsw_build_info('items_ann'::regclass);
 - `nn_descent`: 전체 데이터의 resident NN-descent base 그래프를 명시한다. 다른 생성기로 자동 대체하지 않으며 16행 미만, 실효 중간 차수 1024 초과, 비유한 입력 또는 보수적 FP32 거리 범위 초과는 오류다. ACE의 조각별 NN과 별개다. 차원이 16 이하이거나, 입력 원소가 half 범위를 넘거나, resident IVF-PQ와 같은 노름 상한(L2는 `4 * max_squared_norm`, 내적·cosine은 `max_squared_norm`)이 65504 이상이면 base에 FP32를 선택하고 그 밖에는 FP16을 선택한다. SDK의 FP16 경로는 노름을 FP32로, 내적을 half로 계산하므로 평균 오프셋이 큰 데이터에서는 원소가 half에 들어가도 소거로 이웃 순서가 무너진다(에뮬레이션 재현, GPU recall 미측정). 이 상한은 그 위험을 IVF-PQ와 같은 수준으로 막는 보수적 규칙이며 모든 소거를 막는다는 증명은 아니다. SDK는 FP32에서도 L2를 `||a||^2 + ||b||^2 - 2a·b`로 float32 계산하므로, 공통 오프셋이 큰 입력에서는 이웃 순서가 무너진다(예: 실제 768차원 행 + 오프셋 1000에서 FP32인데도 recall@10 0.40). L2에서는 NN-descent 그래프 입력만 열 평균(FP64 누적)으로 중심화한 사본을 쓴다. `mode='hnsw'`의 상위 계층도 SDK 패치 0005가 각 레벨 점 집합의 평균으로 중심화한 사본으로 NN-descent를 돌린다. L2는 평행이동 불변이므로 정답 이웃은 같고, 저장 벡터와 검색 거리는 원 데이터를 쓴다. base 사본은 그래프 호출 동안만 살고 host 추정에 `n * dim * 4`(L2만)로 반영된다. 상위 계층 사본은 그 레벨의 host workspace 검사에 포함된다. FP16/FP32 선택은 원 데이터 기준이다(0005가 FP16 base를 원 상위 행으로 검사하기 때문). 중심화는 공통 오프셋만 없애며, 서로 멀리 떨어진 조밀 클러스터의 소거는 남을 수 있고 탐지하지 않는다. 내적·cosine은 중심화하지 않는다. GPU 검증 전이다(offset-r87 GPU 계획 H1~H7). 예산 예측은 FP32 저장을 기준으로 하며 추정치는 모든 할당의 상한이 아니다. GPU 상위 계층에는 별도 SDK 패치가 필요하고 base dtype과 예산을 전달한다. 생성된 레벨의 dtype은 데몬 로그에 남는다.
 
 ```sql
--- Disk build is an explicit choice, not a fallback from AUTO.
+-- Explicitly choose ACE-disk even when AUTO would fit the resident budget.
 CREATE INDEX items_disk_ann ON items USING pg_cuvs_hnsw (embedding vector_l2_ops)
   WITH (mode = 'hnsw', build_algo = 'ace', ef_construction = 64);
 ```
@@ -61,7 +61,7 @@ ACE는 데이터를 겹치는 조각으로 나눠 조각마다 kNN 그래프를 
 
 ## 저장된 정보
 
-0.8.2의 `pg_cuvs_hnsw_build_info(regclass)`는 생성 시 저장한 경로, 실제 설정,
+0.8.2에서 도입된 `pg_cuvs_hnsw_build_info(regclass)`는 생성 시 저장한 경로, 실제 설정,
 resident 후보 훈련 형상, 추정치·실효 예산과 guard 반환 여부를 조회한다.
 현재 세션 GUC로 과거 설정을 추정하지 않는다. 원 테이블 SELECT 권한이 필요하다.
 ACE 인덱스는 영수증 바로 뒤에 조각 빌더 readback을 저장한다: `ace_build_quality_source`(`auto`/`manual`), `ace_build_quality`(q), `ace_local_intermediate_degree`(조각 kNN 폭), `ace_local_nn_descent_iterations`(조각 NN-descent 반복 상한; 100만 행 이상을 셋 이상의 조각으로 나누면 조각마다 달라 `varies_by_partition`). ACE 빌드는 검증된 고정 SDK(memory-guard marker `@60b19a0f`)에서만 돌므로 이 값은 그 SDK의 동작에서 계산한 값이다. 조각별 실제 값은 데몬 로그의 SDK 줄로 확인한다. 이 기능 이전에 만든 ACE 인덱스는 `"ace_readback":"not_recorded"`, resident·tiny는 `"not_applicable"`이다. 영수증 형식(policy v2)은 그대로이며 readback은 별도 magic의 꼬리 레코드다.
@@ -75,9 +75,9 @@ NN tail에는 상위 계층 precision 계약 세대가 없으므로, hierarchy�
 같은 데이터·같은 ef와 같은 질의 비용에서 각각 비교한다. self 도달성 진단과는 별개다.
 같은 f32 벡터의 다른 ID는 동점 정답이다. 작은 생성 시험은 이 품질 기준의 통과 증거가 아니다.
 
-extension과 daemon은 HNSW op23 payload v6를 함께 배포해야 한다(v4는 응답 뒤에 결정 바이트 6개, 즉 status-13 DETAIL의 원값을 덧붙이고, v5는 그 뒤에 ACE partition builder readback 32바이트를 덧붙이며, v6는 그 뒤에 resident NN readback을 덧붙인다). 글로벌 명령 ABI는 v5이며 HNSW op23 payload v6와 구분한다.
+extension과 daemon은 HNSW op23 payload v6를 함께 배포해야 한다(v4는 응답 뒤에 결정 바이트 6개, 즉 status-13 DETAIL의 원값을 덧붙이고, v5는 그 뒤에 ACE partition builder readback 32바이트를 덧붙이며, v6는 그 뒤에 resident NN readback을 덧붙인다). 현재 글로벌 명령·응답 프로토콜은 `CUVS_PROTO_VERSION=5`이며 HNSW op23의 별도 payload 버전 6과 구분한다.
 이전 payload v1/v2/v3/v4/v5 요청은 prefix의 버전을 먼저 검사해 나머지 필드를 기다리지 않고 거부한다.
-기존 0.8.1 단독 reader는 새 policy v2를 읽을 수 없다. 0.8.2 바이너리를 함께 배포한 뒤 `ALTER EXTENSION pg_cuvs UPDATE TO '0.8.2'`를 사용한다. upgrade SQL은 영수증을 이주/덮어쓰기하지 않는다. v2가 있는 인덱스를 예전 reader로 downgrade하는 것은 지원하지 않는다.
+기존 0.8.1 단독 reader는 새 policy v2를 읽을 수 없다. 0.8.2 도입 당시에는 확장과 데몬 바이너리를 함께 배포하고 0.8.2로 업그레이드해야 했다. 현재 배포 대상 버전은 0.9.0이며, 0.8.1에서 출발한다면 `sql/pg_cuvs--0.8.1--0.8.2.sql`과 `sql/pg_cuvs--0.8.2--0.9.0.sql`의 업그레이드 경로를 따른다. upgrade SQL은 영수증을 이주/덮어쓰기하지 않는다. v2가 있는 인덱스를 예전 reader로 downgrade하는 것은 지원하지 않는다.
 
 이 구현의 CPU 검사·코드 리뷰와 별개로 작은 실제 CUDA 생성·1M 동일성/비용/품질은 별도 실행 승인과 검증이 필요하다. 같은 native 파일의 변환 보존과 서로 다른 GPU build 간 SHA 불일치는 구분하며, 후자의 비결정성을 성공 판정으로 덮지 않는다.
 `internal_builder`는 base/local graph 생성기를 표시한다. 다른 계층의 미기록 과거 분기를 추정한 값이 아니다.

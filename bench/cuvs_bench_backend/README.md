@@ -19,7 +19,7 @@ This backend exposes:
 | `pgvector_hnsw` | pgvector CPU HNSW | `CREATE INDEX … USING hnsw` (m=16, ef_construction=64) | `hnsw.ef_search` |
 | `pgvector_ivfflat` | pgvector CPU IVFFlat | `CREATE INDEX … USING ivfflat` (lists=4√N) | `ivfflat.probes` |
 | `pgcuvs_cagra` | pg_cuvs GPU CAGRA (resident) | `CREATE INDEX … USING cagra` | `cuvs.k` (GPU candidate list) |
-| `pgcuvs_hnsw_import` | pg_cuvs HNSW export path: GPU CAGRA build → pgvector HNSW export | CAGRA build + `pg_cuvs_build_hnsw(cagra,'nsw')` | `hnsw.ef_search` (CPU search) |
+| `pgcuvs_hnsw_import` | pg_cuvs HNSW export path: GPU CAGRA build → pgvector HNSW export | CAGRA build + `CREATE INDEX ... USING pg_cuvs_hnsw WITH (source='t_cagra', mode='nsw')` | `hnsw.ef_search` (CPU search) |
 | `cuvs` | **raw cuVS CAGRA — no PostgreSQL** (`cuvs_engine.py`) | `cagra.build()` in-process, on the GPU | GPU candidate count (same values as `cuvs.k`) |
 
 `cuvs` is the odd one out and is meant to be: it runs no SQL, holds its index in
@@ -100,7 +100,7 @@ caveats when reading it: (1) searches are single-query and **serial**, so QPS is
 latency-bound; batch/concurrent clients would raise throughput (the GPU's
 strength, not measured here). (2) The build advantage is **data-dependent**: on
 real embeddings (Cohere 1M×1024, legacy dataset — see
-`docs/experiments/benchmark-archive.md` §2.1a) it is ~2×
+`bench/results/README.md`'s legacy Cohere entry) it is ~2×
 (pgvector native ~237 s vs the GPU-accelerated CAGRA-build+conversion ~120 s, both from
 `bench/results/pg_cuvsbench_1m_legacy.csv`); much larger build ratios seen elsewhere come from
 **synthetic random data**, where pgvector's HNSW build hits its worst case, and
@@ -123,9 +123,10 @@ Queries are issued one statement at a time with the query vector as an **inline
 literal** (not a bind parameter) so every algo runs an identical statement shape
 — matching `bench/legacy/anbench/run_pg.py`.
 
-`index_bytes` for `pgcuvs_cagra` is the PG heap relation size only (≈0) — the
-CAGRA graph lives off-heap in `cuvs.index_dir` / GPU VRAM and isn't counted, so
-don't read cagra's `index_bytes` as "storage-free."
+`index_bytes` for `pgcuvs_cagra` is the daemon-reported `vram_bytes` from
+`pg_stat_gpu_search`, not `pg_relation_size()` (which is ≈0 for the off-heap
+graph). If the daemon has no resident row, the engine warns and falls back to
+0; treat that row as missing VRAM evidence, not a storage-free index.
 
 ## Daemon toggling (VRAM-fair baselines)
 
@@ -162,18 +163,18 @@ orchestrator, `Dataset`, `IndexConfig`, `BuildResult`/`SearchResult`, and
 `cuvs_bench.run.run()` is deprecated upstream in favour of this call):
 
 ```bash
-# GPU VM, cuvs_bench env (needs psycopg + pgvector), daemon up, ext >= 0.5.0.
+# GPU VM, cuvs_bench env (needs psycopg + pgvector), daemon up, matching installed extension.
 python bench/cuvs_bench_backend/run_pg_cuvsbench.py \
   --data-dir ~/anbench/data --n 1000000 \
   --algos pgcuvs_cagra,pgvector_hnsw,pgcuvs_hnsw_import \
-  --k 10 --max-queries 2000 --out bench/results/pg_cuvsbench_1m_legacy.csv
+  --k 10 --max-queries 2000 --out /tmp/pg_cuvsbench_new.csv
 ```
 
-Requires the pg_cuvs extension at **0.5.0** (a fresh `CREATE EXTENSION pg_cuvs`,
-or `ALTER EXTENSION pg_cuvs UPDATE TO '0.5.0'` on an older database): the
-`pgcuvs_hnsw_import` algo
-calls the unified `pg_cuvs_build_hnsw(cagra, 'nsw')` (the older two-step
-`pg_cuvs_import_hnsw(cagra, hnsw)` was removed). The gt is read as a big-ann
+The `pgcuvs_hnsw_import` algo builds through `CREATE INDEX ... USING pg_cuvs_hnsw`
+with `source`/`mode` reloptions (`pg_engine.py`), not the deprecated
+`pg_cuvs_build_hnsw()` function. HEAD declares extension version `0.9.0`
+in `pg_cuvs.control`; verify the installed SQL/daemon match before measurement.
+The gt is read as a big-ann
 `.ibin`; the loader converts `gt_<n>.npy` → `gt_<n>_q<nq>.ibin` sliced to the
 searched query count so `compute_recall` gets matching shapes.
 

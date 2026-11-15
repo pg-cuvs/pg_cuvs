@@ -1,5 +1,12 @@
 # PR I3-B: cache, reclaim, manual functions and circuit breaker (draft)
 
+> **Historical draft.** The 0.9.0 SQL installation script contains the manual
+> cache and status functions described here (`sql/pg_cuvs--0.9.0.sql`). For
+> shipped signatures, permissions, defaults and behavior, use
+> [docs/reference.md](../../docs/reference.md), especially § 8. This draft's
+> stack, tests and open risks remain evidence from its preparation, not a
+> current release checklist.
+
 Stack: I1 → I2 (d058dec6) → I3-A → **I3-B** → I3-C(+D) → I4. This branch sits on
 d058dec6 plus I3-A's shared commits cherry-picked unchanged: 36911f50 (admission
 contract header), c8e6355 (estimate functions and the I4 workspace hook) and

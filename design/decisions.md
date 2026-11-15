@@ -3738,7 +3738,7 @@ retained dataset, graph 적재와 빌드의 RMM 할당도 포함된다. `initial
 아니며, 빌드가 끝나도 pool의 high-water reservation이 남는다. index별 `vram_bytes`는
 retained dataset/graph 추정치이므로 이 선점분과 temporary workspace를 표현하지 않는다.
 
-[`bench/results/index-accel-20261021/rmm-study.md`](../bench/results/index-accel-20261021/rmm-study.md)의
+[`bench/results/index-accel-20261021/rmm-study.md`](https://github.com/pg-cuvs/pg_cuvs/blob/8688bf8b9feff9d6d7deaae6f5272deb69926a1c/bench/results/index-accel-20261021/rmm-study.md)의
 L40S(sm89), wiki 1M 고정 graph, private SQL harness, 크기별 N=3 비교에서 검색 p50은
 initial 512 MiB부터 평탄했다. 참조 initial 1024 MiB의 IVF-PQ 빌드는 live peak 8.797 GB와
 pool high-water 16.583 GB를 보였다. 별도 upstream-quota prototype(initial 512 MiB,

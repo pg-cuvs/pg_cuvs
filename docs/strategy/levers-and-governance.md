@@ -8,6 +8,10 @@
 > **상태 표기**: 이 문서는 2026-06-11 소스 추출에 기반한 작업용 감사 스냅샷이다.
 > 현행 SSOT가 아니며, 현재 기본값·운영 절차는 `docs/doc-map.md`, `docs/reference.md`,
 > `design/ops-gpu-playbook.md`, `docs/playbooks/`에서 확인한다.
+> **2026-11-11 소스 대조:** 이 문서의 §1 목록과 §5 미반영 판정은
+> 2026-06-11 스냅샷이다. 현행 `docs/reference.md`에는 auto-compact GUC,
+> `pg_stat_gpu_fallback`, 캐시/회수 데몬 플래그와 0.9.0 수동 SQL 인터페이스가
+> 문서화되어 있다. §5의 당시 TODO를 현재 미완료 목록으로 사용하지 않는다.
 
 ---
 
@@ -158,7 +162,9 @@ Tier-2 A100 installcheck 30/30 + isolation 3/3 + no-starvation 실측.**
 
 ## §5. 문서화 감사 결과 (문서 정리 작업의 체크리스트)
 
-2026-06-11 감사(Explore 3종 + 코드 검증). 운영자 문서 = README / design/ops-gpu-playbook.md /
+2026-06-11 감사(Explore 3종 + 코드 검증). 아래 판정과 조치는 당시 스냅샷이며,
+현재 완료 여부는 현행 reference·playbook·소스에서 다시 확인해야 한다.
+운영자 문서 = README / design/ops-gpu-playbook.md /
 docs/best-practices.md / docs/playbooks/*.
 
 ### 5.1 [높음] 드리프트 — 문서가 존재하지 않는 GUC를 안내 (코드로 확정: 소스 정의 0개)
@@ -194,10 +200,10 @@ docs/best-practices.md / docs/playbooks/*.
 - 미설명 플래그: `--max-indexes`, `--gpu-devices`.
 
 ### 5.6 [낮음] TBD/스테일 (2026-06-11 audit snapshot)
-- `release-upgrade.md`: 당시 cross-version 업그레이드 = TBD였으나, 현재는 0.1.0→0.5.0 migration chain과 `test/sql/upgrade_path.sql`로 갱신됨.
+- `release-upgrade.md`: 당시 cross-version 업그레이드 = TBD였다. 0.1.0→0.5.0 migration chain과 `test/sql/upgrade_path.sql`은 이후 상태의 기록이며, 현재 `pg_cuvs.control` 기본 버전은 0.9.0이다. 현행 upgrade 절차는 별도 재검증이 필요하다.
 - `replica-bootstrap.md`: 스트리밍 물리복제 standby warmup = 미검증(TBD).
 - `ops-gpu-playbook §1.4`: `--max-vram-mb` 기본값 "40000" 표기 오류는 현재 0→90% 정책으로 수정됨.
-- `rollback-and-cleanup.md:47`의 `extversion = 1.0` 표기는 현재 0.5.0으로 수정됨.
+- `rollback-and-cleanup.md:47`의 `extversion = 1.0` 표기는 이후 0.5.0으로 수정된 기록이다. 현재 기본 버전은 0.9.0이다.
 - `large-dataset-benchmark.md`: backend peak RSS 컬럼 빈칸.
 
 ### 5.7 구조: 운영 문서가 흩어져 있음

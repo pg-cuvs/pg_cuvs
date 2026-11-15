@@ -4,13 +4,17 @@ GPU-accelerated vector search for PostgreSQL via NVIDIA cuVS — a heterogeneous
 
 **Built on** [pgvector](https://github.com/pgvector/pgvector) and [RAPIDS cuVS](https://github.com/rapidsai/cuvs).
 
+Current extension version: **0.9.0**. This overview was checked against source
+commit `ae818ad0` (2026-11-11); historical GPU measurements below retain their
+original versions and are not a validation run of this HEAD.
+
 ## What it is
 
 pg_cuvs is **not** a replacement for pgvector. It is a GPU acceleration layer that sits on top of pgvector's interface. SQL syntax, transaction semantics, MVCC, and planner decisions remain entirely within PostgreSQL.
 
 It supports two complementary modes:
 
-- **GPU search tier**: keep CAGRA indexes resident in GPU VRAM and use the GPU as a candidate generator.
+- **GPU search tier**: use resident CAGRA, flat brute-force, or compressed IVF-PQ indexes as GPU candidate generators.
 - **GPU build accelerator tier**: use nearby GPUs to build indexes quickly, then convert the result into a standard pgvector HNSW index (`USING pg_cuvs_hnsw`) and serve queries on CPU.
 
 ```sql
@@ -35,8 +39,8 @@ Two tiers (`design/ci-strategy.md`, ADR-067):
 
 - **Tier 1 — CPU reference (every PR, hosted, free).** The single GPU boundary
   (`src/cuvs_wrapper.h`) is replaced by an exact-kNN **CPU shim** (`make
-  PGCUVS_CPU_SHIM=1`, zero CUDA), and the full daemon + IPC + fail-closed +
-  correctness regression suite runs against it. This catches the bug class that
+  PGCUVS_CPU_SHIM=1`, zero CUDA), and the daemon + IPC + fail-closed +
+  Tier-1 correctness regression subset runs against it. This catches the bug class that
   actually bites — IPC/struct drift, `search_mode` labeling, fail-closed rejects,
   manifest contract, recall — without a GPU.
 - **Tier 2 — real A100 (on demand).** GPU-kernel correctness, **approximate-recall
@@ -57,7 +61,7 @@ pg_cuvs uses a **tightly coupled sidecar model** (PG-Strom style), not an in-pro
 ```
 ┌─────────────────────────────────────────────┐
 │  PostgreSQL                                  │
-│  ┌──────────┐   Shared Memory IPC            │
+│  ┌──────────┐   UDS + shared payloads        │
 │  │ Backend 1│ ──────────────────────────┐    │
 │  │ Backend 2│ ──────────────────────────┤    │
 │  │ Backend N│ ──────────────────────────┤    │
@@ -65,23 +69,28 @@ pg_cuvs uses a **tightly coupled sidecar model** (PG-Strom style), not an in-pro
 │                                         ▼    │
 │  ┌──────────────────────────────────────┐    │
 │  │  pg_cuvs_server (GPU Service Daemon) │    │
-│  │  - Single CUDA context               │    │
+│  │  - Per-device CUDA resources         │    │
 │  │  - CAGRA/IVF index in VRAM           │    │
 │  │  - Task queue + thread pool          │    │
 │  └──────────────────────────────────────┘    │
 └─────────────────────────────────────────────┘
 ```
 
-Why not in-process? Each PostgreSQL backend is a separate process. Initializing a CUDA context per backend wastes hundreds of MB of VRAM per connection and takes hundreds of milliseconds. The sidecar model shares a single context across all sessions.
+Each PostgreSQL backend is a separate process. The sidecar shares GPU resources
+across sessions, with per-device resources for multi-GPU operation, instead of
+creating a CUDA context in every backend.
 
-If the GPU service dies, PostgreSQL **gracefully degrades** to CPU-based pgvector (HNSW/IVFFlat) or SeqScan — no service interruption.
+New plans can choose a CPU index or SeqScan when the GPU path is unavailable.
+If the daemon fails after a GPU scan has been planned, that statement raises an
+error; it does not switch executor nodes in place. Roll back a failed transaction
+before retrying. See [failure and recovery](docs/playbooks/daemon-restart-recovery.md).
 
 ## Index Types
 
 | Index | Storage | Use Case |
 |-------|---------|----------|
 | `USING cagra` | GPU VRAM | Approximate NN, low latency (~2.9 ms p50 end-to-end at 1M×1024 real; ~1.5 ms at 384-dim), hot data, fits in GPU VRAM |
-| `USING flat` | GPU VRAM (`.vectors` only, no graph) | Exact GPU brute-force (recall=1.0), read-heavy/stable corpora; first-class BF AM (v0.4.0, ADR-073) |
+| `USING flat` | GPU VRAM (`.vectors` and TID map, no graph) | Exhaustive GPU brute-force for read-heavy corpora; float16 storage can change ranking relative to float32 |
 | `USING ivfpq` | GPU VRAM (compressed) | Approximate NN, 10–100x VRAM savings vs cagra via product quantization |
 | `USING pg_cuvs_hnsw` (built from heap, or reuses a `USING cagra` source) | GPU build / CPU serve | Faster GPU-accelerated build (~2× vs pgvector on real embeddings, higher on synthetic), then served by pgvector HNSW on CPU |
 
@@ -89,13 +98,18 @@ If the GPU service dies, PostgreSQL **gracefully degrades** to CPU-based pgvecto
 > API is unstable in cuVS 26.04 and DiskANN at 50M×384 timed out at 2 GB cache.
 > Revisit when demand for billion-scale is confirmed. See `design/spikes/3b-diskann-decision.md`.
 
-Both use the same `vector <->` / `<=>` / `<#>` operator interface from pgvector. The planner selects the cheaper path based on a cost model that accounts for IPC overhead, GPU kernel cost, and data transfer:
+All four AMs expose pgvector's `vector <->` / `<=>` / `<#>` operator interface;
+`pg_cuvs_hnsw` also supports `halfvec`. The planner compares available paths using
+a cost model that accounts for IPC overhead, GPU kernel cost, and data transfer:
 
 ```
 Cost_total = Cost_IPC + Cost_GPU_kernel + Cost_CPU_recheck
 ```
 
-Small tables route to CPU; large tables route to GPU automatically.
+Table size alone does not determine the route: query shape, filters, available
+indexes, hardware profile, and freshness gates also matter. Check `EXPLAIN` for
+the selected path. The index-scan candidate budget is `cuvs.k` (default 100),
+independent of SQL `LIMIT`; size it for the requested result count and filtering.
 
 ## When to Use
 
@@ -106,24 +120,26 @@ Small tables route to CPU; large tables route to GPU automatically.
 | Fast build/rebuild needed, CPU serving preferred | CAGRA build + `USING pg_cuvs_hnsw` | ~2× faster than pgvector native build on real embeddings (1M×1024, end-to-end); much higher on synthetic random data (1M×384, pgvector's HNSW worst case). Serves as standard pgvector HNSW afterward |
 | On-prem RAG, embedding GPU pool already available | Reuse GPU for batch index build via the GPU Build Accelerator — the HNSW export path (GPU CAGRA build → pgvector-servable HNSW) | GPU pool not idle; online search stays on pgvector HNSW CPU path |
 | Larger-than-VRAM / billion-scale / NVMe cold tier | pgvectorscale DiskANN or VectorChord | the pg_cuvs DiskANN path is a no-go in cuVS 26.04; revisit when demand is confirmed |
-| Multi-GPU horizontal scale | pg_cuvs CAGRA with `shard_count` | Recall improves with sharding; latency increases due to merge overhead |
+| Multi-GPU placement within one daemon | pg_cuvs CAGRA with `shard_count` | Measure recall and latency at the intended shard count; neither changes monotonically |
 
 ## Feature Support
 
 | Feature | Status | Verified on |
 |---------|--------|-------------|
-| CAGRA GPU search | Production-tested | A100 VM, MIG, multi-GPU |
-| Exact GPU brute-force (`USING flat`, v0.4.0) | Production-tested | A100 VM, installcheck 31/31, recall=1.0, restart-durable (ADR-073) |
-| GPU Build Accelerator (`USING pg_cuvs_hnsw`) | Production-tested | VM E2E, 1M×384, recall=1.0 |
-| Multi-GPU sharding (`shard_count`) | Production-tested | 2×A100, shard_count=1/2 |
-| MIG (Multi-Instance GPU) | Verified | No code change; `CUDA_VISIBLE_DEVICES=MIG-uuid` |
-| GCS snapshot restore | Production-tested | Snapshot/restore rollout |
-| CPU HNSW fallback (`cuvs.cpu_hnsw_fallback`) | Production-tested | GPU Build Accelerator rollout |
+| CAGRA GPU search | Implemented; historical GPU evidence | A100 VM, MIG, multi-GPU |
+| Exhaustive GPU brute-force (`USING flat`) | Implemented; historical GPU evidence | A100 VM, installcheck 31/31 at introduction, restart test (ADR-073) |
+| GPU Build Accelerator (`USING pg_cuvs_hnsw`) | Implemented; route-specific validation required | Historical 1M×384 export; current [build options and SDK requirements](docs/hnsw-build-options.md) |
+| Multi-GPU sharding (`shard_count`) | Implemented; historical GPU evidence | 2×A100, shard_count=1/2 |
+| MIG (Multi-Instance GPU) | Historical deployment evidence | `CUDA_VISIBLE_DEVICES=MIG-uuid` |
+| GCS snapshot restore | Implemented; historical round-trip evidence | [Snapshot operations](docs/playbooks/gcs-snapshot-ops.md) |
+| CPU HNSW sidecar (`cuvs.cpu_hnsw_fallback`) | Implemented; requires a live daemon and sidecar | Distinct from the daemon-independent `pg_cuvs_hnsw` index |
 | DiskANN / NVMe cold tier | Deferred (no-go) | cuVS 26.04 PQFlash API unstable; see `design/spikes/3b-diskann-decision.md` |
 
 ## Current Status
 
-Implemented on GCP (NVIDIA A100-40GB × 2, PostgreSQL 16), VM E2E verified:
+The capabilities below are implemented. Original VM checks used GCP
+(NVIDIA A100-40GB × 2, PostgreSQL 16); current release gaps are tracked in
+[ROADMAP.md](ROADMAP.md), and those old checks do not certify every later change:
 
 - [x] PostgreSQL C extension with C++ wrapper (resolves `float4` type collision between PG and CUDA headers)
 - [x] CAGRA index build + GPU search via cuVS `cuvs::neighbors::cagra`
@@ -131,8 +147,9 @@ Implemented on GCP (NVIDIA A100-40GB × 2, PostgreSQL 16), VM E2E verified:
 - [x] Index Access Method handler (`cuvsamhandler`) registered with PostgreSQL planner
 - [x] Hardware-anchored cost model (ADR-075): the daemon probes the deployment's GPU/CPU/IPC at boot and the planner costs GPU vs seqscan in real units (`κ = cpu_operator_cost·cpu_dist_tput/dim`); falls back to the legacy `startup_cost=1000` constants when unprobed or `cuvs.enable_phys_cost=off`
 - [x] `enable_cuvs`, `cuvs.cpu_hnsw_fallback` GUCs for runtime GPU toggle and CPU fallback
-- [x] `pg_stat_gpu_search` view: per-index GPU stats (build time, search count, p50/p95 latency, recall)
-- [x] `CREATE INDEX ... USING pg_cuvs_hnsw`: GPU CAGRA → pgvector HNSW DDL. `source` optional — built from the heap (ephemeral CAGRA, auto-dropped) or reused from a `USING cagra` index; served by pgvector
+- [x] `pg_stat_gpu_search`: per-index search/error counts, latency histograms, freshness, and mode; recall and build time require separate measurements
+- [x] `CREATE INDEX ... USING pg_cuvs_hnsw`: heap builds use private disk-backed build/export files, or reuse a `USING cagra` source; the resulting PostgreSQL index serves through pgvector on CPU
+- [x] Admission diagnostics and memory controls: `pg_cuvs_last_rejection()`, `pg_cuvs_memory_status()`, `pg_cuvs_build_status()`, and index load/unload/pin controls; see the [reference](docs/reference.md)
 - [x] Multi-GPU sharding (`shard_count`), GCS snapshot restore
 - [x] MIG verified (no code changes needed)
 
@@ -175,7 +192,7 @@ unaffected, and the result must be read with the
 
 \* recall=1.0000 on synthetic random data (uniform distribution).  
 \*\* 0.978 on synthetic clustered data (20 clusters, sigma=0.05).  
-On synthetic **random** data pgvector's native HNSW build is pathologically slow (918s), which inflates the build ratio to ~13.9× — that is pgvector's worst case, not the real-embedding figure (~2×). GPU CAGRA build is content-independent, so its advantage balloons on random data.
+On synthetic **random** data pgvector's native HNSW build is pathologically slow (918s), which inflates the build ratio to ~13.9× — that is pgvector's worst case, not the real-embedding figure (~2×). The measured ratio therefore describes that synthetic workload; it does not establish data-independent GPU build cost.
 </details>
 
 See [`BENCHMARK.md`](BENCHMARK.md) for the latency decomposition and the current wiki_all_1M results, [`docs/experiments/benchmark-archive.md`](docs/experiments/benchmark-archive.md) for the full Cohere 1M×1024 Pareto and the pre-#80 filtered-search selectivity sweep, and `design/benchmarks/crossover-methodology.md` for crossover methodology.
@@ -189,87 +206,113 @@ build history (now frozen) is in [design/specs/phase-record.md](design/specs/pha
 |-----------|------|--------|
 | Proof of Mechanism | PostgreSQL pipeline + sidecar CAGRA search | Done |
 | Test & Ops Hardening | DDL durability, large-data benchmarks, GPU e2e, playbooks | Done |
-| Production Ready | `pg_stat_gpu_search`, LIMIT-k/metric, write/staleness, large-build memory, tiered cache | Done |
+| Single-node feature milestone | `pg_stat_gpu_search`, candidate-k/metric, write/staleness, large-build memory, tiered cache | Historical milestone; current stale and memory limitations below |
 | Scale Out | pending-delta, snapshots, replicas, multi-GPU sharding, query optimization | Done (the DiskANN path is a **no-go** — see 3b-diskann-decision.md) |
 | GPU Build Accelerator — HNSW export | CAGRA build → pgvector HNSW export (~2× faster build on real embeddings 1M×1024; 13× on synthetic 1M×384) | Done (VM E2E verified, MIG tested) |
-| HNSW DDL export | `CREATE INDEX ... USING pg_cuvs_hnsw`: standard DDL for the build accelerator; `source` optional (ephemeral CAGRA from heap) + metric pre-check | Done (VM E2E, installcheck 8/8) |
-| Ops Playbooks | sizing guide, when-to-use, runbooks | In progress |
-| Release Hardening | compat matrix, known limitations, README, upgrade path | Planned |
+| HNSW DDL export | `CREATE INDEX ... USING pg_cuvs_hnsw`: standard DDL for the build accelerator; `source` optional (private heap-build files) + metric pre-check | Done (VM E2E, installcheck 8/8) |
+| Ops Playbooks | sizing guide, when-to-use, runbooks | Implemented procedures; deployment-specific verification remains |
+| Release Hardening | compat matrix, known limitations, README, upgrade path | Active; see current release-readiness evidence in ROADMAP |
 
-## Compatibility
+## Compatibility and requirements
 
-| Component | Tested version | Minimum |
-|-----------|---------------|---------|
-| PostgreSQL | 16.3 | 16 |
-| pgvector | 0.8.x | 0.7.0 |
-| NVIDIA CUDA | 12.4 | 12.0 |
-| cuVS / RAPIDS | 26.04 | 24.12 |
-| NVIDIA driver | 550.x | 525 |
-| GCC | 11.4 | 11 |
-| CMake | 3.26 | 3.26 |
-| OS | Ubuntu 22.04 | Ubuntu 20.04 |
+The repository targets **Linux and PostgreSQL 16**. Its automated development
+bootstrap uses Ubuntu 22.04, PG16 development headers, pgvector, Conda
+`libcuvs=26.04`, and `cuda-version=12.4`; see
+[the bootstrap and its assumptions](infra/brev/README.md). These are recipe
+inputs, not a tested minimum-version matrix for every GPU and driver.
 
-`pg_cuvs_hnsw` (via `src/hnsw_export.c`) is pinned to pgvector's HNSW page layout
-(`HNSW_VERSION=1`, stable since pgvector 0.5.0 / Aug 2023) and mirrors pgvector 0.8.0's
-hnsw opclass support functions. A pgvector major version bump that changes the on-disk
-format or opclass procs would require a matching update to `src/hnsw_export.c` and the
-`pg_cuvs_hnsw` operator classes.
+- Install pgvector **0.7.0 or newer**: current extension SQL creates `halfvec`
+  opclasses, so the type is required even when queries only use `vector`.
+- The HNSW exporter depends on pgvector's HNSW page format and opclass support
+  functions. Validate upgrades against the [HNSW build contract](docs/hnsw-build-options.md).
+- HNSW/ACE paths that require SDK patches use the separately pinned
+  [patched cuVS recipe](infra/cuvs-patches/README.md), including patches 0001–0004.
+  That recipe requires CMake 3.30.4+, Ninja, and nvcc 12.9 or 13.1 with matching
+  RAPIDS dependencies. The CUDA 12.4 development bootstrap does not install that
+  patched SDK. Follow the recipe's `CUVS_SDK_SOURCE_INCLUDE` and link settings.
+- Deploy the extension and daemon from the same revision: global IPC protocol
+  v5 and HNSW op-23 payload v5 are separate compatibility checks.
 
-## Known Limitations
+## Known limitations
 
-| Limitation | Detail |
-|------------|--------|
-| `USING pg_cuvs_hnsw` build is offline | A `CREATE INDEX` build takes normal index-build locks; there is no `CONCURRENTLY` support for the GPU import path |
-| pgvector layout dependency | `hnsw_export.c` hardcodes pgvector 0.5.0+ page format; pgvector major version upgrade requires validation |
-| DiskANN / NVMe cold tier not supported | The DiskANN spike was abandoned; cuVS 26.04 PQFlash API is unstable. See `design/spikes/3b-diskann-decision.md` |
-| MIG requires VM reboot on GCP | `nvidia-smi -mig 1` only sets pending mode; reboot required to activate or deactivate |
-| GCS snapshot restore requires bucket setup | The snapshot restore path needs `cuvs.gcs_bucket` GUC set and credentials available |
-| `parallel_fanout` at N > 5M unverified | Parallel dispatch may help at large scale; current measurement only covers N ≤ 100K |
-| Crash during build rolls back | A crash during the `USING pg_cuvs_hnsw` build rolls back the `CREATE INDEX` (no partial index left behind); re-run required |
-| No online index swap | No built-in equivalent of `CREATE INDEX CONCURRENTLY` for import; use table rename pattern for minimal downtime |
-
-## Requirements
-
-- PostgreSQL 16
-- NVIDIA GPU with CUDA 12+ (A100, L4, H100, or similar; MIG supported)
-- RAPIDS cuVS 26.04+ (`libcuvs`) — installed via Conda/Mamba
-- pgvector 0.7.0+ (0.8.0's `sql/pg_cuvs--0.8.0.sql` unconditionally installs the
-  `halfvec_*_ops` opclasses, which require pgvector's `halfvec` type — added in
-  0.7.0 — so `CREATE EXTENSION`/`ALTER EXTENSION ... UPDATE` fails outright on
-  older pgvector even for callers who only ever target `vector`. The fp32-only
-  HNSW page format itself is compatible back to 0.5.0, but that no longer
-  matters once install-time SQL requires 0.7.0's type)
-- GCC 11.4+, CMake 3.26+
+| Limitation | Operational consequence |
+|------------|-------------------------|
+| GPU scans can fail after planning | Daemon loss, OOM, and stale replies raise errors; retry after rollback and verify the new plan. `enable_cuvs=off` disables the GPU planner path. |
+| Stale delivery remains best-effort (#202) | A daemon outage can lose the stale marker. Delta and tombstone files share the `cuvs.max_delta_rows` limit. A normal VACUUM can hit it; increasing the limit does not clear an existing stale marker. See [write-path recovery](docs/playbooks/drop-and-write-path-diagnosis.md). |
+| IVF-PQ inserts are not indexed incrementally | `ivfpq_aminsert` is a no-op. Rebuild after loading or changing vectors; ordinary REINDEX can leave an old tombstone sidecar, so verify recovery. |
+| GPU sidecars are outside PostgreSQL WAL | Validate backup/restore and physical-replica procedures; do not infer artifact replication from catalog replication. |
+| Memory admission is a preflight check | RMM quota, build estimates, and physical-free checks do not reserve memory against other processes or bound every SDK allocation. See [memory accounting](docs/reference.md#rmm-quota-and-memory-accounting). |
+| HNSW layout and build resources | Export must fit PostgreSQL pages; disk space, host budget, SDK patches, and the selected build route matter. See [build options](docs/hnsw-build-options.md). |
+| DiskANN/NVMe cold tier | Deferred; the historical spike does not provide a shipping DiskANN AM. |
+| Multi-GPU and replica coverage | Historical runs cover particular hardware and workloads; validate the intended deployment and shard count. |
 
 ## Install
 
+For a disposable Ubuntu GPU development VM, follow
+[the bootstrap guide](infra/brev/README.md). It installs PostgreSQL, the extension,
+the daemon, and a systemd unit. It changes host packages and PostgreSQL settings;
+use the manual path below for an existing installation.
+
+The following manual example assumes PG16 and its development headers,
+pgvector, the selected CUDA/cuVS SDK, and compiler dependencies are already
+installed, with the SDK environment active and PG16's `pg_config` on `PATH`.
+For a patched SDK, use its documented build flags instead of the plain `make`.
+
 ```bash
-# 1. Install RAPIDS cuVS (if not already)
-conda create -n cuvs_dev -c rapidsai -c nvidia -c conda-forge \
-    cuvs=26.04 cuda-version=12.4 python=3.11
-conda activate cuvs_dev
-
-# 2. Build pg_cuvs
-source ~/miniforge3/bin/activate cuvs_dev
+# Install BOTH artifacts. `make install` alone does not install the daemon.
 make
-sudo make install
+make server
+sudo make install install-server
 
-# 3. Start the GPU daemon
-sudo systemctl enable --now pg-cuvs-server
-
-# 4. Load extensions in PostgreSQL
-CREATE EXTENSION pgvector;
-CREATE EXTENSION pg_cuvs;
+# Example persistent directory shared by the postgres backend and daemon.
+sudo install -d -o postgres -g postgres -m 0750 /var/lib/postgresql/cuvs_indexes
 ```
+
+Add `pg_cuvs` to the existing `shared_preload_libraries` list in
+`postgresql.conf` and set matching paths. Preserve other preload entries:
+
+```conf
+shared_preload_libraries = 'pg_cuvs'  # append to existing entries, if any
+cuvs.socket_path = '/var/run/postgresql/.s.pg_cuvs'
+cuvs.index_dir = '/var/lib/postgresql/cuvs_indexes'
+```
+
+Restart PostgreSQL using the installation's service manager (on the example
+Debian/Ubuntu PG16 cluster: `sudo systemctl restart postgresql@16-main`).
+Preload is required before loading the extension because it registers startup
+settings and the compaction worker. In a separate terminal, start a daemon
+under the same OS user for this example:
+
+```bash
+sudo -u postgres "$(pg_config --bindir)/pg_cuvs_server" \
+    --socket /var/run/postgresql/.s.pg_cuvs \
+    --index-dir /var/lib/postgresql/cuvs_indexes
+```
+
+The service environment must resolve the same SDK shared libraries used at
+build time. Wait for the daemon's `listening on` message. A systemd unit is
+created by the development bootstrap, not by `make install`; for a persistent
+service and a separate daemon user, follow [deployment operations](design/ops-gpu-playbook.md),
+including socket/directory access and `cuvs.daemon_uid`.
+
+In the target database, as an extension-installing role:
+
+```sql
+CREATE EXTENSION IF NOT EXISTS vector;
+CREATE EXTENSION pg_cuvs;
+SELECT extversion FROM pg_extension WHERE extname = 'pg_cuvs'; -- 0.9.0
+```
+
+Existing installations use the [upgrade playbook](docs/playbooks/release-upgrade.md)
+to co-deploy both binaries and run `ALTER EXTENSION pg_cuvs UPDATE`.
 
 ### GPU Build Accelerator (HNSW export) Quick Start
 
 ```sql
--- Simplest: one self-contained DDL. ambuild builds an ephemeral CAGRA on the
--- GPU, converts it into this index's own pages (pgvector-HNSW format, no CPU
--- build), then drops the temporary CAGRA. The result is a first-class catalog
--- index (pg_indexes / DROP INDEX / REINDEX / pg_dump all work), and REINDEX
--- rebuilds from the heap with no extra dependency.
+-- The table must already contain vectors; see the runnable Usage example below.
+-- A heap build spools a private corpus, asks the daemon for a temporary HNSW
+-- file, and imports it into PostgreSQL index pages. No persistent CAGRA source
+-- index is created. `auto` can select a resident or ACE-disk build route.
 CREATE INDEX my_hnsw ON items USING pg_cuvs_hnsw (embedding vector_l2_ops);
 
 -- Serve queries via standard pgvector HNSW on CPU (GPU not required).
@@ -280,7 +323,13 @@ SELECT * FROM items ORDER BY embedding <-> $1 LIMIT 10;
 CREATE INDEX my_cagra  ON items USING cagra (embedding vector_l2_ops);
 CREATE INDEX my_hnsw2  ON items USING pg_cuvs_hnsw (embedding vector_l2_ops)
     WITH (source = 'my_cagra', mode = 'nsw');
+
+-- Inspect the stored route/settings of the heap-built index.
+SELECT pg_cuvs_hnsw_build_info('my_hnsw'::regclass);
 ```
+
+See [HNSW build options](docs/hnsw-build-options.md) for `build_algo`,
+`ef_construction`, disk and host budgets, precision guards, and SDK requirements.
 
 > The older `SELECT pg_cuvs_import_hnsw(cagra, hnsw)` two-step form (create an
 > empty `USING hnsw` target, then import) is removed. `pg_cuvs_build_hnsw(cagra,
@@ -288,44 +337,58 @@ CREATE INDEX my_hnsw2  ON items USING pg_cuvs_hnsw (embedding vector_l2_ops)
 
 ## Usage
 
+Run this in a fresh test schema after installation. The small corpus demonstrates
+syntax and result visibility; it is not a performance or GPU-routing benchmark.
+
 ```sql
--- CAGRA GPU search
-CREATE TABLE items (id bigint, embedding vector(1536));
-CREATE INDEX ON items USING cagra (embedding vector_l2_ops);
-SELECT id FROM items ORDER BY embedding <-> '[...]'::vector LIMIT 10;
+CREATE TABLE items (id bigint PRIMARY KEY, embedding vector(3));
+INSERT INTO items VALUES (1, '[1,0,0]'), (2, '[0,1,0]'), (3, '[0,0,1]');
 
--- GPU exact brute-force search via flat AM (v0.4.0, first-class path, ADR-073)
--- recall=1.0 regardless of cuvs.search_mode; no graph build.
-CREATE INDEX ON items USING flat (embedding vector_l2_ops) WITH (precision='float16');
-SELECT id FROM items ORDER BY embedding <-> '[...]'::vector LIMIT 10;
+CREATE INDEX items_cagra ON items USING cagra (embedding vector_l2_ops);
+SELECT id FROM items ORDER BY embedding <-> '[1,0,0]'::vector LIMIT 2;
+EXPLAIN SELECT id FROM items ORDER BY embedding <-> '[1,0,0]'::vector LIMIT 2;
 
--- Legacy exact BF via cagra index (deprecated — use USING flat instead)
--- SET cuvs.search_mode = 'brute_force';
--- SET cuvs.bf_precision = 'float16';
--- SELECT id FROM items ORDER BY embedding <-> '[...]'::vector LIMIT 10;
+-- Alternative index: exhaustive BF, with no graph build.
+-- float16 is an optional space/precision tradeoff, not a recall=1 promise
+-- against the original float32 vectors.
+CREATE INDEX items_flat ON items USING flat (embedding vector_l2_ops)
+    WITH (precision='float32');
 
--- Batch search — Q queries in one GPU dispatch
-SELECT query_idx, id, distance
+-- Batch API takes the TABLE, returns candidate ctids, and needs a heap join
+-- for MVCC-visible rows. Explicit k is independent of cuvs.k here.
+SELECT b.query_idx, t.id, b.distance
 FROM pg_cuvs_batch_search(
     'items'::regclass,
-    ARRAY[q1, q2, q3]::vector[],  -- Q query vectors
-    k := 10
+    ARRAY['[1,0,0]'::vector, '[0,1,0]'::vector], 2
 ) b
 JOIN items t ON t.ctid = b.ctid
-ORDER BY query_idx, distance;
+ORDER BY b.query_idx, b.distance;
 
--- Runtime toggles
-SET enable_cuvs = off;              -- force CPU path
-SET cuvs.cpu_hnsw_fallback = on;   -- serve via CPU HNSW sidecar if loaded
-SET cuvs.k = 200;                  -- increase GPU candidate list for higher recall
-SET cuvs.shard_count = 0;          -- auto shard across available GPUs
-
--- Monitor GPU search stats
-SELECT index_name, search_count, avg_latency_us, p50_us, p95_us, search_mode
+SELECT index_name, search_count, avg_latency_us,
+       p50_latency_us, p95_latency_us, search_mode
 FROM pg_stat_gpu_search;
 ```
 
-See `design/ops-gpu-playbook.md` for parameter tuning and MIG operations.
+`pg_stat_gpu_search` can be empty while the daemon is unavailable. Histogram
+latencies describe daemon searches, not complete SQL statement latency.
+`pg_cuvs_memory_status()` and `pg_cuvs_build_status()` expose memory/admission
+and in-flight build information; administrative functions require the privileges
+listed in the [reference](docs/reference.md).
+
+For GPU index scans, tune the candidate budget before a query:
+
+```sql
+SET cuvs.k = 200;
+-- CPU serving via an existing CPU index or SeqScan:
+SET enable_cuvs = off;
+RESET enable_cuvs;
+```
+
+`cuvs.cpu_hnsw_fallback=on` selects a CPU **sidecar** through the running daemon
+when that sidecar exists. To serve without the daemon, build a
+`USING pg_cuvs_hnsw` index instead. Choose sharding at CAGRA build time using the
+[reference](docs/reference.md); changing `cuvs.shard_count` does not repartition
+an already built index.
 
 ## Contributing
 

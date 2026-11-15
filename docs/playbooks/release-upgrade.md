@@ -1,8 +1,8 @@
 # Playbook: 릴리스 및 업그레이드 (release-upgrade)
 
 pg_cuvs 설치/재설치, 데몬 재시작 순서, artifact magic 호환성 확인 절차.
-현재 저장소의 `default_version`은 **0.8.0**이다.
-`0.1.0`부터 `0.8.0`까지의 SQL migration chain이 저장소에 있고,
+현재 저장소의 `default_version`은 **0.9.0**이다.
+`0.1.0`부터 `0.9.0`까지의 SQL migration chain이 저장소에 있고,
 `test/sql/upgrade_path.sql`이 설치·업데이트 경로를 회귀 검증한다.
 
 이 playbook은 현재 버전의 신규 설치/재설치, cross-version UPDATE,
@@ -15,7 +15,7 @@ pg_cuvs 설치/재설치, 데몬 재시작 순서, artifact magic 호환성 확�
 
 - 소스 변경 후 `make install`만 했는데 데몬 기능(GCS snapshot, HNSW 사이드카
   직렬화 등)이 반영되지 않는다.
-- 재설치 후 검색 쿼리가 `WARNING: pg_cuvs_server unreachable`로 CPU fallback한다.
+- 재설치 후 실행 중 검색 쿼리가 daemon 연결 오류를 내거나 후속 쿼리가 CPU로 재계획된다.
 - 데몬 재시작 없이 `.so` 교체 후 기존 backend 세션이 이전 코드로 동작한다.
 - 업그레이드 후 `loaded index` 메시지 없이 데몬이 뜨거나, artifact magic 오류가
   journal에 나온다.
@@ -34,7 +34,7 @@ psql -d postgres -c "SELECT name, default_version, installed_version
 ```
  name   | default_version | installed_version
 ---------+-----------------+-------------------
- pg_cuvs | 0.8.0           | 0.8.0
+ pg_cuvs | 0.9.0           | 0.9.0
 ```
 **→ `installed_version IS NULL`:** `CREATE EXTENSION pg_cuvs`가 아직 실행되지 않음  
 **→ `installed_version != default_version`:** `ALTER EXTENSION pg_cuvs UPDATE` 필요
@@ -84,7 +84,7 @@ PostgreSQL을 재시작(`pg_ctl restart`)해야 한다. 데몬은 별도 프로�
 인덱스를 건너뛴다(journal에 magic 불일치 메시지). 이 경우 REINDEX로 현재 버전
 artifact를 새로 만들어야 한다.
 
-> 현재 대상 버전은 0.8.0이다. 소스 변경 없이 같은 코드베이스로 재빌드하면
+> 현재 대상 버전은 0.9.0이다. 소스 변경 없이 같은 코드베이스로 재빌드하면
 > magic은 동일하지만, format-breaking 변경이 있는 버전 전환은 해당 migration
 > script와 REINDEX 필요성을 별도로 확인한다. 저장소의 전체 버전 전환 경로는
 > `test/sql/upgrade_path.sql`에서 다룬다.
@@ -92,8 +92,9 @@ artifact를 새로 만들어야 한다.
 
 ### D. `ALTER EXTENSION pg_cuvs UPDATE` (cross-version)
 `pg_cuvs--<old>--<new>.sql` migration script가 있을 때 아래 명령으로 카탈로그를
-업데이트한다. 현재 저장소에는 `pg_cuvs--0.7.0--0.8.0.sql`을 포함한
-0.1.0→0.8.0 chain이 있다.
+업데이트한다. 현재 저장소에는 `pg_cuvs--0.7.0--0.8.0.sql`,
+`0.8.0--0.8.1`, `0.8.1--0.8.2`, `0.8.2--0.9.0`을 포함한
+0.1.0→0.9.0 chain이 있다.
 
 ---
 
@@ -120,29 +121,28 @@ VM 원격 배포 시:
 make sync              # 소스 VM 동기화
 make gpu-build         # VM에서 빌드
 make gpu-install       # make install 실행
-make gpu-server        # pg_cuvs_server 빌드
-make gpu-install       # (또는 별도 gpu-server-install 타겟 — Makefile 확인)
+make gpu-server        # pg_cuvs_server 빌드 + make install-server
+make gpu-reload        # PostgreSQL과 daemon 재시작
+make gpu-verify-deployed
 ```
 
 ---
 
 ### Step 2 — 올바른 재시작 순서
 
-**순서가 중요하다**: 데몬을 먼저 재시작해 소켓을 준비한 뒤 PostgreSQL을 재시작한다.
-PostgreSQL이 `shared_preload_libraries`를 로드할 때 데몬이 이미 listening이면
-startup hook에서 연결을 시도해 `pg_stat_gpu_search` 초기화가 성공한다.
+배포에는 `make gpu-reload`를 우선 사용한다. 이 타겟은 PostgreSQL을 먼저,
+데몬을 다음에 재시작하고 데몬이 `active`가 될 때까지 기다린다.
 
 ```bash
-# 1. 데몬 재시작 (새 pg_cuvs_server 바이너리 적용)
+# 1. PostgreSQL 재시작 (.so 교체 반영, 기존 세션 종료)
+sudo systemctl restart postgresql@16-main
+
+# 2. 데몬 재시작 (새 pg_cuvs_server 바이너리 적용)
 sudo systemctl restart pg-cuvs-server
 
-# 2. 데몬이 listening 중인지 확인
+# 3. 데몬이 listening 중인지 확인
 sudo journalctl -u pg-cuvs-server --no-pager -n 20 | grep "listening"
 # 기대: pg_cuvs_server: listening on /tmp/.s.pg_cuvs
-
-# 3. PostgreSQL 재시작 (.so 교체 반영, 기존 세션 종료)
-sudo systemctl restart postgresql
-# 또는: pg_ctl restart -D $PGDATA
 ```
 
 **기대 출력 (데몬 로그):**
@@ -196,14 +196,14 @@ grep default_version pg_cuvs.control
 # 3. 재설치
 make install && make install-server
 
-# 4. 데몬 재시작 (새 artifact format 지원)
-sudo systemctl restart pg-cuvs-server
+# 4. PostgreSQL 재시작 (새 공유 라이브러리 적용)
+sudo systemctl restart postgresql@16-main
 
-# 5. 카탈로그 업데이트
+# 5. 카탈로그 업데이트 (각 데이터베이스에서 실행)
 psql -d <dbname> -c "ALTER EXTENSION pg_cuvs UPDATE;"
 
-# 6. PostgreSQL 재시작
-sudo systemctl restart postgresql
+# 6. 데몬 재시작 (새 바이너리 적용)
+sudo systemctl restart pg-cuvs-server
 ```
 
 저장소의 전체 설치·업데이트 경로를 CPU shim에서 재현하려면
@@ -218,7 +218,7 @@ sudo systemctl restart postgresql
 # 확장 버전 일치
 psql -d postgres -c "SELECT installed_version FROM pg_available_extensions
                      WHERE name='pg_cuvs';"
-# 기대: 0.8.0
+# 기대: 0.9.0
 ```
 
 ```bash
@@ -244,7 +244,7 @@ SELECT index_name, resident, search_count, last_status
 -- 기대: resident=t, last_status='ok'
 ```
 
-- [ ] `installed_version = default_version = 0.8.0`
+- [ ] `installed_version = default_version = 0.9.0`
 - [ ] `sudo systemctl is-active pg-cuvs-server` → `active`
 - [ ] journalctl에 `loaded index` 1줄 이상
 - [ ] `EXPLAIN` 결과에 GPU scan path 확인
@@ -269,5 +269,5 @@ SELECT index_name, resident, search_count, last_status
   `pg_config --pkglibdir` 경로가 설치 경로와 맞는지 확인.
 
 관련: `daemon-restart-recovery.md`, `persistence-corruption-recovery.md`.  
-설계 근거: `pg_cuvs.control(default_version=0.8.0)`,
+설계 근거: `pg_cuvs.control(default_version=0.9.0)`,
 `test/sql/upgrade_path.sql`, Makefile `install` / `install-server` 타겟.

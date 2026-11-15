@@ -29,7 +29,7 @@ description: >
 | 격리 | `make installcheck-isolation` | VM (데몬 필요) | pg_isolation_regress |
 
 로컬 Mac에서는 CUDA 빌드가 불가하다. C 변경의 로컬 검증은
-`gcc -fsyntax-only`(ci.yml Job 1 방식) + `make test-unit`까지만 가능하고,
+`make test-unit`까지만 가능하고,
 REGRESS/격리 테스트에 영향이 가는 변경은 "VM 검증 필요"로 표시해 보고한다.
 
 ## 루프 구조 (패스당)
@@ -60,7 +60,7 @@ REGRESS/격리 테스트에 영향이 가는 변경은 "VM 검증 필요"로 표
 4. **과대 데이터셋**: 회귀 검증에 1000행이면 충분한데 10만 행을 넣는 테스트
 5. **Tier 배치 오류**: GPU 없이 검증 가능한 테스트가 REGRESS_TIER2_ONLY에
    있거나, 그 반대
-6. **캐시 미활용**: CI(ci.yml)에서 apt/빌드 캐시가 없어 매번 cold start인가
+6. **캐시 확인**: CI(ci.yml)의 ccache 설정과 실제 hit rate는 어떤가
 7. **순차 실행 병목**: pg_regress는 순차다 — 가장 느린 테스트 상위권을
    식별하고 축소 가능성을 본다 (test/results/ 타이밍 또는 CI 로그 활용)
 
@@ -84,7 +84,7 @@ REGRESS/격리 테스트에 영향이 가는 변경은 "VM 검증 필요"로 표
   절대 같은 커밋에 섞지 않는다.
 - 버그 수정은 재현 테스트 먼저 (Red → Green). 테스트 삭제/축소는 해당
   커버리지가 다른 테스트에 있음을 증거로 제시한 뒤에만.
-- 수정 단위마다 검증: `make test-unit` + 영향 소스 `gcc -fsyntax-only`.
+- 수정 단위마다 검증: `make test-unit`; PGXS/CUDA 영향 소스는 해당 빌드 환경에서 컴파일 확인.
 - 확신이 없는 발견은 수정하지 말고 보고서에 "제안"으로만 남긴다.
 - expected/*.out 은 손으로 고치지 않는다 — 출력이 바뀌는 수정은 VM에서
   재생성해야 하므로 "VM 검증 필요"로 분류한다.
