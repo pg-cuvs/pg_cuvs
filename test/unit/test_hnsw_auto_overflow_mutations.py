@@ -13,7 +13,7 @@ import subprocess
 
 ROOT = Path(__file__).resolve().parents[2]
 HEADERS = ['cuvs_hnsw_policy.h', 'cuvs_hnsw_build_common.h', 'cuvs_route_preflight.h',
-           'cuvs_ipc.h', 'cuvs_admission_contract.h']  # copied together: quoted includes resolve next to the includer
+           'cuvs_ipc.h', 'cuvs_admission_contract.h', 'cuvs_hnsw_nn_capacity.h', 'cuvs_hnsw_nn_precision.h', 'cuvs_build_corpus.h']  # copied together: quoted includes resolve next to the includer
 
 MUTANTS = [
     ('default_reverted_to_error', 'cuvs_hnsw_policy.h',
