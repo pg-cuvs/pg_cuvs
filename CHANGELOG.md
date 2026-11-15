@@ -18,7 +18,8 @@ exists for 0.9.0.
   requested only: `pg_cuvs_hnsw_build_info()` reports `ace_partitions_origin` as
   `requested_effective_not_guaranteed`, `ace_local_nn_descent_iterations` as
   `not_guaranteed` for two requested partitions from 1e6 rows, and `CREATE INDEX`
-  raises a NOTICE that says how to turn the guarantee on. A pg_cuvs built with
+  raises a NOTICE that says how to turn the guarantee on; a GPU build prints one
+  line about it when it compiles `src/cuvs_wrapper.cu` without the variable. A pg_cuvs built with
   `CUVS_SDK_SOURCE_INCLUDE` is unchanged: the effective count is computed twice,
   an unstable plan refuses the build, and the origin stays
   `same_SDK_stable_explicit_plan`. The patched `libcuvs.so` is required either way;
