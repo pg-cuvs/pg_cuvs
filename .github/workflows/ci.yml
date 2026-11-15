@@ -7,17 +7,21 @@ on:
     branches: [main, "release/**"]
 
 # ── Job 1: CPU-only unit tests ────────────────────────────────────────────
-# Runs on standard GitHub-hosted runners. No CUDA, no GPU, no daemon, no PG.
-# Validates: the pure-C unit suites (cuvs_util.c + cuvs_build_corpus.c helpers).
+# Runs on standard GitHub-hosted runners. No CUDA, no GPU, no daemon, no running PG.
+# Validates: the pure-C unit suites (cuvs_util.c + cuvs_build_corpus.c helpers), the
+# source structure checks, and the patched cuVS SDK path check (scripts/check-sdk-patch-path.sh).
 #
 # This job used to also run `gcc -fsyntax-only` over three sources, which
 # required installing PostgreSQL solely to obtain `pg_config --cflags`. That
 # check was a strict subset of tier1-shim below (which compiles AND links the
 # whole tree), and its file list had gone stale — src/pg_cuvs_compaction.c is in
-# OBJS but was never checked. Both it and the PG install are gone; `make
-# test-unit` uses plain $(CC) and never touches PGXS, so an absent pg_config
-# just makes `include $(PGXS)` a no-op. Coverage is unchanged: this job remains
-# the only place test-unit runs.
+# OBJS but was never checked, so it was removed together with the PG install.
+# The PG development package (postgresql-server-dev-14) is installed again for
+# the patched SDK path check, whose `make -n` needs `pg_config --pgxs`. The make
+# targets of this job therefore run with PGXS active. `make test-unit` uses plain
+# $(CC) and does not need it: in a Linux container, `make test-unit` with and
+# without PGXS (PG_CONFIG=false) ran to the same results line for line; only the
+# compiler name differs (gcc from PGXS, cc from make's default).
 jobs:
   build-check:
     name: Unit tests (CPU)
@@ -72,7 +76,8 @@ jobs:
       # The patched cuVS SDK build path (CUVS_SDK_SOURCE_INCLUDE set) is built by
       # neither CI job. This step applies infra/cuvs-patches to the pinned cuVS
       # source and checks the Makefile's nvcc and link flags for it, without CUDA.
-      # It fetches one pinned commit of rapidsai/cuvs (about 3 MB, bounded to 120 s).
+      # It fetches one pinned commit of rapidsai/cuvs (about 3 MB, limited to 120 s) on every
+      # run, with no retry: a failed fetch turns this job red.
       - name: Patched cuVS SDK build path (CPU, no CUDA)
         timeout-minutes: 10
         run: scripts/check-sdk-patch-path.sh

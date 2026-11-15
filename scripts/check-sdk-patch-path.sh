@@ -32,9 +32,10 @@ if ! git -C "$CUVS_GIT" cat-file -e "$COMMIT^{commit}" 2>/dev/null; then
   echo "fetching cuVS $COMMIT into $CUVS_GIT (once)"
   mkdir -p "$CUVS_GIT"
   git -C "$CUVS_GIT" init -q --bare
-  # A stalled network must not hang the caller (the pr-guard hook allows 300 s, CI more):
-  # give up below 1 kB/s for 30 s, and after 120 s in total where timeout(1) exists
-  # (not on stock macOS).
+  # Limits on a stalled network (the pr-guard hook allows 300 s). The low-speed settings
+  # abort a transfer that has started and then runs below 1 kB/s for 30 s; a stall before
+  # the transfer starts is not covered by them. The 120 s limit in total exists only where
+  # timeout(1) does: stock macOS has none, and there the fetch has no upper bound here.
   fetch=(git -C "$CUVS_GIT" -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=30
          fetch -q --depth 1 https://github.com/rapidsai/cuvs.git "$COMMIT")
   if command -v timeout >/dev/null 2>&1; then fetch=(timeout 120 "${fetch[@]}"); fi
