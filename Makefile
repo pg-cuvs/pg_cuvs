@@ -1100,3 +1100,10 @@ test-ar8-mutations: test/unit/test_ar8_mutations.py
 .PHONY: test-stale-interim
 test-stale-interim:
 	python3 test/stale_interim.py
+
+# K3 input digest against a live backend and a scripted fake daemon
+# (test/k3_fake_daemon.c); needs the installed extension, a superuser
+# session (PGDATABASE/PGHOST) and PGCUVS_SERVER_LOG = the server log file.
+.PHONY: test-k3-digest
+test-k3-digest:
+	python3 test/k3_digest_integration.py
