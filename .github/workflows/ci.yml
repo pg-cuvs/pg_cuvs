@@ -24,7 +24,11 @@ jobs:
     runs-on: ubuntu-22.04
 
     steps:
+      # Depth 2: on a pull request the checkout is the merge commit, and the SQL
+      # freeze step below diffs it against its first parent (the base branch tip).
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
 
       # gcc + make are preinstalled; daemon-guard unit tests need curl/SSL headers.
       - name: Install CPU test dependencies
@@ -37,8 +41,19 @@ jobs:
 
       # The release workflow (release.yml) runs these scripts on a tag push, where
       # a failure would be found too late. The tests build throwaway repositories.
-      - name: Release scripts (tests)
-        run: bash test/release/test_release_scripts.sh
+      - name: Release scripts and SQL freeze guard (tests)
+        run: |
+          bash test/release/test_release_scripts.sh
+          bash test/release/test_sql_frozen.sh
+
+      # SQL scripts of a version below default_version are never edited; a pull
+      # request into release/** touches no SQL script. See CONTRIBUTING.md.
+      - name: SQL scripts of released versions stay unchanged
+        if: github.event_name == 'pull_request'
+        run: |
+          strict=()
+          case "$GITHUB_BASE_REF" in release/v*) strict=(--release-branch "${GITHUB_BASE_REF#release/v}") ;; esac
+          bash scripts/check-sql-frozen.sh HEAD^1 HEAD "${strict[@]}"
 
       - name: Unit tests (CPU-only, no PG/CUDA required)
         timeout-minutes: 20
