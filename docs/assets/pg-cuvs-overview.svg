@@ -1,0 +1,113 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 470" width="960" height="470" role="img" aria-labelledby="t d">
+  <title id="t">How pg_cuvs connects PostgreSQL backends to a GPU sidecar daemon</title>
+  <desc id="d">Applications send ordinary SQL to PostgreSQL. Each backend talks to the pg_cuvs_server sidecar daemon over a Unix domain socket with shared payloads. The daemon holds CAGRA, flat or IVF-PQ indexes in GPU memory and returns top-K TIDs and distances. PostgreSQL keeps the planner, MVCC, heap access and filters. For the build accelerator, the daemon builds on the GPU and the result is exported as a pgvector HNSW index that PostgreSQL serves on the CPU.</desc>
+  <style>
+    text { font-family: -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; }
+    .h { font-size: 13px; font-weight: 600; letter-spacing: .06em; }
+    .t { font-size: 15px; font-weight: 600; }
+    .s { font-size: 12.5px; }
+    .c { font-size: 12px; }
+    .m { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 13.5px; font-weight: 600; }
+    .box, .pg, .gpu, .card { stroke-width: 1.2; }
+    .pg, .gpu { stroke-width: 1.4; }
+    .frame { fill: none; stroke-width: 1.2; }
+    .arrow { fill: none; stroke-width: 1.6; marker-end: url(#ah); }
+    .back { fill: none; stroke-width: 1.6; stroke-dasharray: 5 4; marker-end: url(#ah); }
+    .ahp { fill: none; stroke-width: 1.6; stroke-linecap: round; stroke-linejoin: round; }
+
+    .bg { fill: #ffffff; }
+    text { fill: #1f2328; }
+    .h, .s, .c { fill: #59636e; }
+    .box, .card { fill: #f6f8fa; stroke: #8c959f; }
+    .pg { fill: #ddf4ff; stroke: #0969da; }
+    .gpu { fill: #dafbe1; stroke: #1a7f37; }
+    .frame, .arrow, .back, .ahp { stroke: #8c959f; }
+    .fpg { stroke: #0969da; }
+    .fgpu { stroke: #1a7f37; }
+    .ink { fill: #1f2328; }
+    @media (prefers-color-scheme: dark) {
+      .bg { fill: #0d1117; }
+      text { fill: #e6edf3; }
+      .h, .s, .c { fill: #9198a1; }
+      .box, .card { fill: #161b22; stroke: #6e7681; }
+      .pg { fill: #0c2d6b; stroke: #58a6ff; }
+      .gpu { fill: #0f2d1a; stroke: #3fb950; }
+      .frame, .arrow, .back, .ahp { stroke: #6e7681; }
+      .fpg { stroke: #58a6ff; }
+      .fgpu { stroke: #3fb950; }
+      .ink { fill: #e6edf3; }
+    }
+  </style>
+  <defs>
+    <marker id="ah" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path class="ahp" d="M1 1 L9 5 L1 9"/>
+    </marker>
+  </defs>
+
+  <rect class="bg" x="0" y="0" width="960" height="470"/>
+
+  <text class="h" x="30" y="34">YOUR APPLICATION</text>
+  <text class="h" x="240" y="34">POSTGRESQL</text>
+  <text class="h" x="640" y="34">GPU SIDECAR (SEPARATE PROCESS)</text>
+
+  <!-- application -->
+  <rect class="box" x="30" y="60" width="170" height="108" rx="8"/>
+  <text class="t" x="46" y="86">Plain SQL</text>
+  <text class="s" x="46" y="107">ORDER BY embedding</text>
+  <text class="s" x="46" y="124">&lt;=&gt; $1 LIMIT 10</text>
+  <text class="s" x="46" y="148">no query changes</text>
+  <path class="arrow" d="M200 114 H238"/>
+
+  <!-- postgres frame -->
+  <rect class="frame fpg" x="240" y="48" width="280" height="296" rx="12"/>
+  <rect class="pg" x="258" y="64" width="244" height="44" rx="8"/>
+  <text class="m" x="274" y="84">Backend 1</text>
+  <text class="s" x="274" y="100">one process per session</text>
+  <rect class="pg" x="258" y="116" width="244" height="44" rx="8"/>
+  <text class="m" x="274" y="136">Backend 2</text>
+  <text class="s" x="274" y="152">no CUDA context here</text>
+  <rect class="pg" x="258" y="168" width="244" height="44" rx="8"/>
+  <text class="m" x="274" y="188">Backend N</text>
+  <text class="s" x="274" y="204">asks the daemon for candidates</text>
+
+  <rect class="box" x="258" y="226" width="244" height="46" rx="8"/>
+  <text class="t" x="274" y="246">PostgreSQL keeps</text>
+  <text class="s" x="274" y="263">planner, MVCC, heap access, filters</text>
+
+  <rect class="box" x="258" y="284" width="244" height="46" rx="8"/>
+  <text class="t" x="274" y="304">pgvector HNSW pages</text>
+  <text class="s" x="274" y="321">build-accelerator output, CPU serve</text>
+
+  <!-- socket arrows -->
+  <path class="arrow" d="M502 112 H636"/>
+  <text class="c" x="522" y="104">UDS + shared</text>
+  <text class="c" x="536" y="130">payloads</text>
+  <path class="back" d="M636 186 H502"/>
+  <text class="c" x="520" y="178">top-K TIDs</text>
+  <text class="c" x="520" y="204">+ distances</text>
+  <path class="back" d="M636 307 H502"/>
+  <text class="c" x="524" y="299">HNSW file</text>
+  <text class="c" x="528" y="325">on export</text>
+
+  <!-- daemon frame -->
+  <rect class="frame fgpu" x="640" y="48" width="290" height="296" rx="12"/>
+  <text class="m" x="658" y="76">pg_cuvs_server</text>
+  <rect class="gpu" x="658" y="92" width="254" height="56" rx="8"/>
+  <text class="t" x="674" y="114">Index in GPU memory</text>
+  <text class="s" x="674" y="133">CAGRA, flat, or IVF-PQ</text>
+  <rect class="gpu" x="658" y="160" width="254" height="56" rx="8"/>
+  <text class="t" x="674" y="182">GPU build</text>
+  <text class="s" x="674" y="201">CAGRA build, converted for HNSW export</text>
+  <rect class="box" x="658" y="228" width="254" height="48" rx="8"/>
+  <text class="t" x="674" y="249">Shared across sessions</text>
+  <text class="s" x="674" y="266">task queue, thread pool, per-device state</text>
+  <rect class="box" x="658" y="288" width="254" height="42" rx="8"/>
+  <text class="t" x="674" y="308">Multi-GPU</text>
+  <text class="s" x="674" y="323">shard_count, MIG</text>
+
+  <!-- two tiers band -->
+  <rect class="card" x="30" y="366" width="900" height="82" rx="8"/>
+  <text class="t" x="48" y="392">Two ways to use the GPU</text>
+  <text class="s" x="48" y="414"><tspan class="ink" font-weight="600">Search tier:</tspan> the daemon keeps CAGRA, flat or IVF-PQ indexes resident and returns candidates for each query.</text>
+  <text class="s" x="48" y="434"><tspan class="ink" font-weight="600">Build accelerator:</tspan> the GPU builds, the result becomes a pgvector HNSW index (USING pg_cuvs_hnsw), and queries run on the CPU.</text>
+</svg>

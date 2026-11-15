@@ -78,7 +78,7 @@ ISOLATION_OPTS = --inputdir=test --outputdir=test
 # C source files + the CUDA-compiled wrapper (built below by nvcc).
 # PGXS only knows how to build .c → .o; the .cu → .o rule is custom,
 # but the resulting object MUST be listed in OBJS to be linked into the .so.
-OBJS           = src/pg_cuvs.o src/cuvs_ipc.o src/cuvs_util.o $(WRAPPER_OBJ) src/hnsw_export.o src/cuvs_build_corpus.o src/pg_cuvs_compaction.o src/cuvs_status_text.o src/cuvs_peak_meter.o
+OBJS           = src/pg_cuvs.o src/cuvs_ipc.o src/cuvs_util.o $(WRAPPER_OBJ) src/hnsw_export.o src/cuvs_hnsw_scan.o src/cuvs_hnsw_rls.o src/cuvs_hnsw_exact.o src/cuvs_build_corpus.o src/pg_cuvs_compaction.o src/cuvs_status_text.o src/cuvs_peak_meter.o
 
 # nvcc settings (Phase 1: brute-force only; CAGRA added later)
 NVCC          ?= nvcc
@@ -106,7 +106,11 @@ CUVS_SDK_SOURCE_INCLUDE ?=
 CUVS_SDK_PLAN_NOTE =
 unexport CUVS_SDK_PLAN_NOTE
 ifneq ($(strip $(CUVS_SDK_SOURCE_INCLUDE)),)
-CUVS_SDK_PLAN_FLAGS = -I$(CUVS_SDK_SOURCE_INCLUDE) -Xcompiler=-fopenmp
+# The planner header pulls patched SDK sources (cagra_build.cuh, which patch 0006
+# makes call raft::linalg::map_offset) into cuvs_wrapper.cu. Those RAFT kernels call
+# constexpr host functions from device code, which nvcc rejects unless
+# --expt-relaxed-constexpr is set, as the SDK's own build does.
+CUVS_SDK_PLAN_FLAGS = -I$(CUVS_SDK_SOURCE_INCLUDE) -Xcompiler=-fopenmp --expt-relaxed-constexpr
 CUVS_SDK_PLAN_LINK = -fopenmp
 else
 # One line when the GPU wrapper is compiled without the planner source. It is part of the
@@ -613,6 +617,18 @@ test-ipc-connect-eintr-mutations: test/unit/test_ipc_connect_eintr_mutations.py
 
 EXTRA_CLEAN += test-ipc-connect-eintr
 .PHONY: test-ipc-connect-eintr test-ipc-backlog-source test-ipc-connect-eintr-mutations
+
+# The Claude Code hook that runs scripts/check-sdk-patch-path.sh before a pull request is
+# opened (.claude/hooks/pr-guard.sh). Python 3 standard library, bash and git only;
+# the mutations plant one defect each in a copy of the hook and need the tests to fail.
+test-unit: test-pr-guard-hook test-pr-guard-hook-mutations
+test-pr-guard-hook: test/unit/test_pr_guard_hook.py .claude/hooks/pr-guard.sh
+	python3 -I -B test/unit/test_pr_guard_hook.py
+
+test-pr-guard-hook-mutations: test/unit/test_pr_guard_hook_mutations.py test/unit/test_pr_guard_hook.py .claude/hooks/pr-guard.sh
+	python3 -I -B test/unit/test_pr_guard_hook_mutations.py
+
+.PHONY: test-pr-guard-hook test-pr-guard-hook-mutations
 
 # User-visible DETAIL/HINT text built from err_out (C5, CK-8, CK-29).
 test-admission-message: test/unit/test_admission_message.c src/cuvs_admission_contract.h \
@@ -1315,6 +1331,32 @@ EXTRA_CLEAN += test-connectivity
 .PHONY: test-connectivity
 
 test-unit: test-connectivity
+
+# Explicit exact scans of pg_cuvs_hnsw on a real PostgreSQL 16 backend (CPU only, no
+# daemon). The four scripts need a disposable cluster that preloads pg_cuvs, with the
+# vector and pg_cuvs extensions created in HNSW_EXACT_DB; they create their own schemas
+# and refuse to run unless the data directory matches HNSW_EXACT_DATADIR.
+#   make test-hnsw-exact-pg HNSW_EXACT_DATADIR=/var/lib/postgresql/16/main \
+#        HNSW_EXACT_SOCKET=/var/run/postgresql HNSW_EXACT_PORT=5432 HNSW_EXACT_USER=$$USER
+HNSW_EXACT_OUT ?= /tmp/pgcuvs-hnsw-exact-results
+HNSW_EXACT_DB ?= postgres
+HNSW_EXACT_PORT ?= 5432
+HNSW_EXACT_SOCKET ?= /var/run/postgresql
+HNSW_EXACT_USER ?= $(USER)
+HNSW_EXACT_DATADIR ?= /var/lib/postgresql/16/main
+.PHONY: test-hnsw-exact-pg
+test-hnsw-exact-pg:
+	@test -n "$(HNSW_EXACT_DATADIR)" || { echo "set HNSW_EXACT_DATADIR"; exit 2; }
+	rm -rf $(HNSW_EXACT_OUT)
+	mkdir -p $(HNSW_EXACT_OUT)
+	run=$$(date +%s); \
+	for t in pg product_pg rls_pg protected_pg; do \
+	    python3 test/unit/test_hnsw_exact_$$t.py --output $(HNSW_EXACT_OUT)/$$t \
+	        --schema hx$${run}_$$t --socket $(HNSW_EXACT_SOCKET) --port $(HNSW_EXACT_PORT) \
+	        --user $(HNSW_EXACT_USER) --database $(HNSW_EXACT_DB) \
+	        --expected-data-directory $(HNSW_EXACT_DATADIR) --pg-bin $$(pg_config --bindir) \
+	        || exit 1; \
+	done
 
 # Isolated native PostgreSQL CPU regression; server/dev binaries and psql needed.
 # It starts its own Unix-socket cluster and does not connect to an existing DB.

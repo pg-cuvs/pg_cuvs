@@ -8,7 +8,8 @@ on:
 
 # ── Job 1: CPU-only unit tests ────────────────────────────────────────────
 # Runs on standard GitHub-hosted runners. No CUDA, no GPU, no daemon, no PG.
-# Validates: the pure-C unit suites (cuvs_util.c + cuvs_build_corpus.c helpers).
+# Validates: the pure-C unit suites (cuvs_util.c + cuvs_build_corpus.c helpers), the
+# source structure checks, and the patched cuVS SDK path check (scripts/check-sdk-patch-path.sh).
 #
 # This job used to also run `gcc -fsyntax-only` over three sources, which
 # required installing PostgreSQL solely to obtain `pg_config --cflags`. That
@@ -17,7 +18,10 @@ on:
 # OBJS but was never checked. Both it and the PG install are gone; `make
 # test-unit` uses plain $(CC) and never touches PGXS, so an absent pg_config
 # just makes `include $(PGXS)` a no-op. Coverage is unchanged: this job remains
-# the only place test-unit runs.
+# the only place test-unit runs. The patched SDK path check below needs no PG
+# either: in an ubuntu:22.04 container without pg_config (GNU make 4.3) it ends
+# with OK, and with GNU make 3.81 on macOS it does so with PG_CONFIG pointing at
+# a file that does not exist.
 jobs:
   build-check:
     name: Unit tests (CPU)
@@ -67,6 +71,16 @@ jobs:
       - name: Source structure checks (CPU)
         timeout-minutes: 10
         run: make test-source-checks
+
+      # The patched cuVS SDK build path (CUVS_SDK_SOURCE_INCLUDE set) is built by
+      # neither CI job. This step applies infra/cuvs-patches to the pinned cuVS
+      # source and checks the Makefile's nvcc and link flags for it, without CUDA.
+      # It fetches one pinned commit of rapidsai/cuvs (about 3 MB) on every run, with no
+      # retry: a failed fetch turns this job red. A stalled fetch is cut off; the script
+      # says by which limits.
+      - name: Patched cuVS SDK build path (CPU, no CUDA)
+        timeout-minutes: 10
+        run: scripts/check-sdk-patch-path.sh
 
 # ── Job 1b: Tier 1 — CPU-reference shim (full build + installcheck) ────────
 # Builds the extension + daemon with the pure-C CPU shim (PGCUVS_CPU_SHIM=1, no
@@ -239,6 +253,16 @@ jobs:
         run: |
           export PATH=/usr/lib/postgresql/16/bin:$PATH
           make test-hnsw-converter
+
+      # Explicit exact scans (cuvs.hnsw_exact_scan=on) on the shim cluster: result
+      # equality with Seq Scan + Sort, row-level security and partition shapes,
+      # mid-statement setting changes, and the planner safety checks. No daemon is
+      # used; the indexes are created on empty tables and filled by INSERT.
+      - name: HNSW exact-mode PostgreSQL regression (CPU)
+        run: |
+          export PATH=/usr/lib/postgresql/16/bin:$PATH
+          psql -d postgres -v ON_ERROR_STOP=1 -c "CREATE EXTENSION IF NOT EXISTS vector; CREATE EXTENSION IF NOT EXISTS pg_cuvs;"
+          make test-hnsw-exact-pg HNSW_EXACT_USER="$USER" HNSW_EXACT_DATADIR=/var/lib/postgresql/16/main
 
       # The benchmark harness decides which index a published number describes
       # (ownership keys, reloptions checks, the 3I build-NOTICE parser, --resume

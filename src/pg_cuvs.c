@@ -93,6 +93,7 @@
 #include "cuvs_admission_contract.h"   /* CuvsAdmissionReason (UC-2 breaker reason) */
 #include "cuvs_build_corpus.h"   /* ADR-057: leak-safe tiered build-corpus handoff */
 #include "hnsw_export.h"
+#include "cuvs_hnsw_scan.h"
 #include "cuvs_hnsw_build.h"
 #include "cuvs_hnsw_build_common.h"
 #include "cuvs_status_text.h"   /* I3-B status text parsing */
@@ -1176,6 +1177,7 @@ _PG_init(void)
 {
     /* Phase 3K: register pg_cuvs_hnsw WITH(source, mode, ...) reloptions. */
     cuvs_hnsw_init_reloptions();
+    cuvs_hnsw_scan_init();
 
     /* ADR-045: register CAGRA WITH(index_dir) reloption. */
     cuvs_cagra_init_reloptions();
