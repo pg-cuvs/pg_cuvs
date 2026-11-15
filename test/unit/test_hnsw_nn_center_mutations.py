@@ -21,7 +21,9 @@ assert wrapper.count('cagra::serialize_to_hnswlib(res, output, graph, data);') =
 assert wrapper.count('hnsw::from_cagra(res, hp, graph, data);') == 1
 assert 'cuvs_hnsw_nn_precision_ex(static_cast<const float *>(files.mapping),' in wrapper
 assert 'cuvs_hnsw_nn_centers(params->metric),' in wrapper
-print('wrapper contract: graph input centered, serializers and upper levels get original data')
+# Text-level contract only; test_hnsw_nn_center_wrapper.py executes this code.
+# Upper hierarchy levels are centered inside the SDK (patch 0005), not here.
+print('wrapper contract (text): graph input centered, serializers get original data')
 
 mutants = {
     'no subtraction': ('center', '(float)((double)data[k] - mean[j])', '(float)((double)data[k])'),

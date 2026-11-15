@@ -414,9 +414,10 @@ test-hnsw-nn-upper-receipt: test/unit/test_hnsw_nn_upper_receipt.py test/unit/te
 
 # Decision B: NN-descent L2 graph input centering (offset-r87/DECISION-B-CENTERING.md).
 .PHONY: test-hnsw-nn-center
-test-hnsw-nn-center: test/unit/test_hnsw_nn_center.c src/cuvs_hnsw_nn_center.h src/cuvs_hnsw_nn_precision.h
+test-hnsw-nn-center: test/unit/test_hnsw_nn_center.c test/unit/test_hnsw_nn_center_wrapper.py src/cuvs_hnsw_nn_center.h src/cuvs_hnsw_nn_precision.h src/cuvs_wrapper.cu
 	$(CC) -std=gnu11 -O2 -Wall -Wextra -Werror -I src -o $@ test/unit/test_hnsw_nn_center.c -lm
 	./$@
+	ulimit -c 0; python3 -I -B test/unit/test_hnsw_nn_center_wrapper.py
 
 EXTRA_CLEAN += test-hnsw-nn-policy test-hnsw-nn-precision test-hnsw-nn-capacity test-hnsw-nn-route test-hnsw-nn-sdk-params test-hnsw-nn-center
 
