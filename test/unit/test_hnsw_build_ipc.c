@@ -9,6 +9,7 @@
 #include <assert.h>
 #include <pthread.h>
 #include <sched.h>
+#include <time.h>
 #include <sys/un.h>
 #include <sys/time.h>
 #include <fcntl.h>
@@ -19,6 +20,17 @@
 static int listener, fixture_case, polls, accepts;
 static uint32_t requested_algo(void) { return fixture_case == 5 || fixture_case == 7 || fixture_case == 17 ? CUVS_HNSW_ALGO_ACE : fixture_case == 6 ? CUVS_HNSW_ALGO_IVF_PQ : CUVS_HNSW_ALGO_AUTO; }
 static volatile int idle_calls, idle_limit, idle_done, reply_sent, mock_checked;
+/* Ordering waits between the mock and the idle unit. A missing event fails
+ * with a case-specific reason instead of hanging until an outer timeout. */
+#define SYNC_WAIT_LIMIT_S 10
+#define SYNC_WAIT(cond) do { \
+    struct timespec t0_, t_; clock_gettime(CLOCK_MONOTONIC, &t0_); \
+    while (!(cond)) { \
+        clock_gettime(CLOCK_MONOTONIC, &t_); \
+        if (t_.tv_sec - t0_.tv_sec >= SYNC_WAIT_LIMIT_S) { \
+            fprintf(stderr, "ipc case %d sync wait timed out: %s\n", fixture_case, #cond); \
+            fflush(stderr); abort(); } \
+        sched_yield(); } } while (0)
 /* K3 idle work: one unit per empty poll; cases 19-23. No sleeps or timing:
  * case 19: the mock replies only after the backend has finished all work;
  * case 20: the first unit blocks until the mock has sent its reply, so the
@@ -31,9 +43,9 @@ static int idle_work(void *arg) {
     (void)arg;
     idle_calls++;
     if (fixture_case == 20 && idle_calls == 1)
-        while (!__atomic_load_n(&reply_sent, __ATOMIC_ACQUIRE)) sched_yield();
+        SYNC_WAIT(__atomic_load_n(&reply_sent, __ATOMIC_ACQUIRE));
     if (fixture_case == 21 && idle_calls == 5)
-        while (!__atomic_load_n(&mock_checked, __ATOMIC_ACQUIRE)) sched_yield();
+        SYNC_WAIT(__atomic_load_n(&mock_checked, __ATOMIC_ACQUIRE));
     if (idle_calls >= idle_limit) { __atomic_store_n(&idle_done, 1, __ATOMIC_RELEASE); return 0; }
     return 1;
 }
@@ -86,9 +98,9 @@ static void *daemon_mock(void *unused) {
     } else {
         char path[] = "/tmp/pgcuvs-core-reply-XXXXXX";
         if (fixture_case == 19 || fixture_case == 23) /* reply only after the backend's idle work */
-            while (!__atomic_load_n(&idle_done, __ATOMIC_ACQUIRE)) sched_yield();
+            SYNC_WAIT(__atomic_load_n(&idle_done, __ATOMIC_ACQUIRE));
         if (fixture_case == 20) /* reply only once the backend is inside its first idle unit */
-            while (__atomic_load_n(&idle_calls, __ATOMIC_ACQUIRE) < 1) sched_yield();
+            SYNC_WAIT(__atomic_load_n(&idle_calls, __ATOMIC_ACQUIRE) >= 1);
         int writable = mkstemp(path);
         assert(writable >= 0);
         assert(write(writable, "serialized-hnsw", 15) == 15);
