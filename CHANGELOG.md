@@ -15,8 +15,11 @@ exists for 0.9.0.
 - `scripts/check-sdk-patch-path.sh` checks the patched cuVS SDK build path without CUDA:
   the patch set applies to the pinned cuVS source with the manifest hashes, the planner
   source verifies, and the Makefile passes the planner's compile and link flags. A Claude
-  Code hook (`.claude/hooks/pr-guard.sh`) runs it before a pull request is opened.
-  Development tooling only.
+  Code hook (`.claude/hooks/pr-guard.sh`) runs it when a session started in a pg_cuvs
+  checkout opens a pull request with the common spellings of `gh pr create` or
+  `gh pr ready`, and blocks the command while the check fails. It guards against
+  mistakes and is not a security boundary; it checks the working tree, not the pull
+  request head. Development tooling only.
 
 ### Fixed
 
