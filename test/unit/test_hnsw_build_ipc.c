@@ -17,7 +17,10 @@
 #include <string.h>
 static int listener, fixture_case, polls, accepts;
 static uint32_t requested_algo(void) { return fixture_case == 5 || fixture_case == 7 || fixture_case == 17 ? CUVS_HNSW_ALGO_ACE : fixture_case == 6 ? CUVS_HNSW_ALGO_IVF_PQ : CUVS_HNSW_ALGO_AUTO; }
-static int cancel_wait(void) { return fixture_case == 1 && ++polls >= 3; }
+static int idle_calls, idle_limit;
+/* K3 idle work: one unit per empty poll; cases 19-21 only. */
+static int idle_work(void *arg) { (void)arg; idle_calls++; usleep(1000); return idle_calls < idle_limit; }
+static int cancel_wait(void) { return (fixture_case == 1 && ++polls >= 3) || (fixture_case == 21 && idle_calls >= 5); }
 static void *daemon_mock(void *unused) {
     (void)unused;
     int c = accept(listener, 0, 0), vectors = -1, owner = -1;
@@ -48,14 +51,15 @@ static void *daemon_mock(void *unused) {
     float first = 0;
     assert(pread(vectors, &first, sizeof(first), 0) == sizeof(first) && first == -1.25f);
     assert(!cuvs_hnsw_owner_cancelled(owner));
-    if (fixture_case == 1) {
+    if (fixture_case == 1 || fixture_case == 21) {
         struct pollfd p = {.fd = owner, .events = POLLIN};
         assert(poll(&p, 1, 3000) > 0);
         assert(cuvs_hnsw_owner_cancelled(owner));
-    } else if (fixture_case == 3 || fixture_case == 11 || fixture_case == 12) {
+    } else if (fixture_case == 3 || fixture_case == 11 || fixture_case == 12 || fixture_case == 22) {
         CuvsHnswFileReply reply = {.header = {.status = CUVS_STATUS_BUILD_FAILED}};
         if (fixture_case == 11) reply.header.status = CUVS_STATUS_PROTO_MISMATCH;
         if (fixture_case == 12) reply.header.status = CUVS_STATUS_HNSW_RESIDENT_BUDGET_EXCEEDED;
+        if (fixture_case == 22) reply.header.status = CUVS_STATUS_CANCELED; /* daemon-side cancel */
         snprintf(reply.header.error, sizeof(reply.header.error), "synthetic capacity failure");
         /* The decision bytes travel after the receipt on every reply. */
         reply.budget = (CuvsHnswBudgetSnapshot){11, 22, 33, 44, 55, 66 + (uint64_t)fixture_case};
@@ -63,6 +67,7 @@ static void *daemon_mock(void *unused) {
         assert(cuvs_fd_send(c, -1, &reply, sizeof(reply)) == 0);
     } else {
         char path[] = "/tmp/pgcuvs-core-reply-XXXXXX";
+        if (fixture_case == 19) usleep(300000); /* the backend finishes its idle work first */
         int writable = mkstemp(path);
         assert(writable >= 0);
         assert(write(writable, "serialized-hnsw", 15) == 15);
@@ -93,7 +98,7 @@ static void *daemon_mock(void *unused) {
         assert(write(c, "R", 1) == 1);
         assert(cuvs_fd_send(c, read_only, &reply, sizeof(reply)) == 0);
         close(read_only);
-        if (fixture_case == 2 || fixture_case == 4 || (fixture_case >= 7 && fixture_case <= 10) || fixture_case >= 15)
+        if (fixture_case == 2 || fixture_case == 4 || (fixture_case >= 7 && fixture_case <= 10) || (fixture_case >= 15 && fixture_case <= 18))
             assert(recv(owner, &token, 1, 0) == 0); // invalid FD/receipt/readback rejected, no ACK
         else
             assert(recv(owner, &token, 1, 0) == 1 && token == 'A');
@@ -130,7 +135,7 @@ int main(void) {
         int rc = cuvs_ipc_build_hnsw_file(path, fd, 100, 128, CUVS_METRIC_L2,
             64, 128, 0, 1ULL << 30, requested_algo(), 64, &policy, &budget, &ace, &result, err, sizeof(err));
         if (fixture_case == 1) { assert(rc == CUVS_STATUS_CANCELED && result == -1); }
-        else if (fixture_case == 2 || fixture_case == 4 || (fixture_case >= 7 && fixture_case <= 10) || fixture_case >= 15) { assert(rc == CUVS_STATUS_ERROR && result == -1); }
+        else if (fixture_case == 2 || fixture_case == 4 || (fixture_case >= 7 && fixture_case <= 10) || (fixture_case >= 15 && fixture_case <= 18)) { assert(rc == CUVS_STATUS_ERROR && result == -1); }
         else if (fixture_case == 3 || fixture_case == 11 || fixture_case == 12) {
             int expected_status = fixture_case == 11 ? CUVS_STATUS_PROTO_MISMATCH : fixture_case == 12 ? CUVS_STATUS_HNSW_RESIDENT_BUDGET_EXCEEDED : CUVS_STATUS_BUILD_FAILED;
             assert(rc == expected_status && result == -1);
@@ -196,6 +201,30 @@ int main(void) {
         assert(!pthread_join(t, NULL) && fcntl(fd, F_GETFD) >= 0);
     }
     assert(accepts == 22);
+    /* K3: idle work runs while the reply is pending, never delays reading a
+     * ready reply, and does not hide a cancel. */
+    for (int k = 19; k <= 22; k++) {
+        pthread_t t; int result = -1; CuvsHnswPolicy p; CuvsHnswAceReadback a; CuvsHnswBudgetSnapshot b; char err[128], bytes[16] = {0};
+        fixture_case = k; idle_calls = 0; polls = 0;
+        idle_limit = k == 20 ? 1000000 : 100;
+        assert(pthread_create(&t, 0, daemon_mock, 0) == 0);
+        int rc = cuvs_ipc_build_hnsw_file_idle(path, fd, 100, 128, CUVS_METRIC_L2, 64, 128, 0, 1ULL << 30,
+            requested_algo(), 64, &p, &b, &a, &result, err, sizeof(err), idle_work, NULL);
+        if (k == 21) assert(rc == CUVS_STATUS_CANCELED && result == -1 && idle_calls >= 5 && idle_calls < 100
+                            && cuvs_ipc_hnsw_backend_cancelled() == 1);
+        /* A daemon reply with status CANCELED is not a backend interrupt. */
+        else if (k == 22) assert(rc == CUVS_STATUS_CANCELED && result == -1 && cuvs_ipc_hnsw_backend_cancelled() == 0);
+        else {
+            assert(rc == CUVS_STATUS_OK && result >= 0 && cuvs_ipc_hnsw_backend_cancelled() == 0);
+            assert(read(result, bytes, 15) == 15 && strcmp(bytes, "serialized-hnsw") == 0);
+            close(result);
+            if (k == 19) assert(idle_calls == 100);         /* all work done before the reply */
+            else assert(idle_calls < 1000);                 /* reply taken while work remained */
+        }
+        printf("K3 idle case %d: rc=%d idle_calls=%d\n", k, rc, idle_calls);
+        assert(pthread_join(t, 0) == 0);
+    }
+    assert(accepts == 26);
     close(fd); close(listener); unlink(path); rmdir(dir);
     printf("PASS 17 actual-client wire cases (v5 ACE readback bound, none on resident),4 preconnect refusals,5 shared-daemon prefix/settings cases; explicitACE/IVF, forgedroute/version/request rejection, cancellation/status13/protocolerror; current global v%u retained\n", CUVS_PROTO_VERSION);
 }

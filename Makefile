@@ -280,7 +280,7 @@ TEST_RT_LIB := $(shell [ "$$(uname -s)" = "Linux" ] && echo -lrt)
 test-unit: test-compact-retry test-device-norm test-failed-allocation test-build-oom-log test-peak-log-switch test/unit/test_cuvs_util.c src/cuvs_util.c src/cuvs_util.h src/cuvs_ipc.h \
            test/unit/test_build_corpus.c src/cuvs_build_corpus.c src/cuvs_build_corpus.h \
            test-hnsw-build test-hnsw-build-ipc test-hnsw-ace-quality test-hnsw-admission test-admission-contract \
-           test-i3-logs test-notice-wire test-admission-wire test-admission-message test-admission-ipc test-build-oom-thread test-cache-policy test-circuit-source test-status-text test-i3b-source test-peak-meter test-lw-policy test-lw-guard test-i3e-sql test-self-replace-notice test-host-free-fence test-vacuum-policy
+           test-i3-logs test-notice-wire test-admission-wire test-admission-message test-admission-ipc test-build-oom-thread test-cache-policy test-circuit-source test-status-text test-i3b-source test-peak-meter test-lw-policy test-lw-guard test-i3e-sql test-self-replace-notice test-host-free-fence test-vacuum-policy test-hnsw-digest
 	$(CC) -I src -DCUVS_TEST_HOOKS -o test-unit test/unit/test_cuvs_util.c src/cuvs_util.c $(TEST_RT_LIB)
 	./test-unit
 	$(CC) -I src -o test-build-corpus test/unit/test_build_corpus.c src/cuvs_build_corpus.c $(TEST_RT_LIB)
@@ -292,6 +292,14 @@ test-circuit-source: test/unit/check_circuit_source.py src/pg_cuvs.c
 	python3 -B test/unit/check_circuit_source.py
 
 .PHONY: test-unit test-circuit-source
+
+# K3: chunked spool digest used by the HNSW build during the daemon RPC.
+test-hnsw-digest: test/unit/test_hnsw_digest.c src/cuvs_hnsw_digest.h
+	$(CC) -std=gnu11 -O2 -Wall -Wextra -Werror -I src -o $@ $< -lcrypto
+	./$@
+
+.PHONY: test-hnsw-digest
+EXTRA_CLEAN += test-hnsw-digest
 
 test-self-replace-notice:
 	python3 -I -B test/unit/test_self_replace_notice.py

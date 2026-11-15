@@ -2547,6 +2547,14 @@ cuvs_ipc_inject_build_oom(const char *socket_path, int n_fail)
 /* Temporary HNSW jobs use ordinary disk and a separate owner lease. Cancel
  * never frees GPU state asynchronously: the daemon observes the lease at safe
  * boundaries and destroys cuVS objects after any in-flight call returns. */
+static int g_hnsw_backend_cancel = 0;
+
+int
+cuvs_ipc_hnsw_backend_cancelled(void)
+{
+    return g_hnsw_backend_cancel;
+}
+
 int
 cuvs_ipc_build_hnsw_file(const char *socket_path, int vectors_fd,
     uint64_t n_vecs, uint32_t dim, uint32_t metric, uint32_t graph_degree,
@@ -2555,6 +2563,26 @@ cuvs_ipc_build_hnsw_file(const char *socket_path, int vectors_fd,
     CuvsHnswBudgetSnapshot *budget, CuvsHnswAceReadback *ace_readback,
     int *hnsw_fd, char *error, size_t error_len)
 {
+    return cuvs_ipc_build_hnsw_file_idle(socket_path, vectors_fd, n_vecs, dim,
+        metric, graph_degree, intermediate_degree, hierarchy, host_budget,
+        build_algo, ef_construction, policy, budget, ace_readback, hnsw_fd,
+        error, error_len, NULL, NULL);
+}
+
+/* Same request/reply as above. While idle work remains, the wait polls the
+ * socket without blocking and runs one unit of work per empty poll; the
+ * reply is read as soon as it is ready, even if work remains. Idle
+ * iterations do not count toward the 864000 x 100 ms wait limit. */
+int
+cuvs_ipc_build_hnsw_file_idle(const char *socket_path, int vectors_fd,
+    uint64_t n_vecs, uint32_t dim, uint32_t metric, uint32_t graph_degree,
+    uint32_t intermediate_degree, uint32_t hierarchy, uint64_t host_budget,
+    uint32_t build_algo, uint32_t ef_construction, CuvsHnswPolicy *policy,
+    CuvsHnswBudgetSnapshot *budget, CuvsHnswAceReadback *ace_readback,
+    int *hnsw_fd, char *error, size_t error_len,
+    CuvsIpcIdleWork idle, void *idle_arg)
+{
+    int idle_more = idle != NULL;
     int sock = -1, owner[2] = {-1, -1}, result_fd = -1;
     int rc = CUVS_STATUS_ERROR;
     CuvsCmdFrame cmd = {0};
@@ -2562,6 +2590,7 @@ cuvs_ipc_build_hnsw_file(const char *socket_path, int vectors_fd,
     CuvsHnswFileReply wire = {0};
     CuvsReplyHeader reply = {0};
     char token = 'O';
+    g_hnsw_backend_cancel = 0;
     forget_reply();
     *hnsw_fd = -1;
     if (policy) memset(policy, 0, sizeof(*policy));
@@ -2588,7 +2617,7 @@ cuvs_ipc_build_hnsw_file(const char *socket_path, int vectors_fd,
     close(owner[1]); owner[1] = -1;
     /* A single readiness byte permits interruptible waiting before recvmsg:
      * reading that byte cannot accidentally discard the ancillary result FD. */
-    for (unsigned waited = 0; waited < 864000; waited++)
+    for (unsigned waited = 0; waited < 864000; )
     {
         struct pollfd pfd = {.fd = sock, .events = POLLIN};
         int pr;
@@ -2601,11 +2630,18 @@ cuvs_ipc_build_hnsw_file(const char *socket_path, int vectors_fd,
                 (unsigned long long)cuvs_hnsw_monotonic_us(),
                 (unsigned long long)input.st_dev, (unsigned long long)input.st_ino);
             rc = CUVS_STATUS_CANCELED;
+            g_hnsw_backend_cancel = 1;
             token = 'C';
             (void)send(owner[0], &token, 1, MSG_DONTWAIT);
             goto done;
         }
-        pr = poll(&pfd, 1, 100);
+        pr = poll(&pfd, 1, idle_more ? 0 : 100);
+        if (pr == 0 && idle_more)
+        {
+            idle_more = idle(idle_arg);
+            continue;
+        }
+        waited++;
         if (pr < 0 && errno == EINTR) continue;
         if (pr < 0) goto done;
         if (pr == 0) continue;
