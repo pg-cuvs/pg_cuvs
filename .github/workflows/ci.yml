@@ -2,9 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [main, "pr/**", "design/**"]
+    branches: [main, "release/**", "pr/**", "design/**"]
   pull_request:
-    branches: [main]
+    branches: [main, "release/**"]
 
 # ── Job 1: CPU-only unit tests ────────────────────────────────────────────
 # Runs on standard GitHub-hosted runners. No CUDA, no GPU, no daemon, no PG.
@@ -34,6 +34,11 @@ jobs:
 
       - name: Documentation contract checks
         run: make docs-contract-check
+
+      # The release workflow (release.yml) runs these scripts on a tag push, where
+      # a failure would be found too late. The tests build throwaway repositories.
+      - name: Release scripts (tests)
+        run: bash test/release/test_release_scripts.sh
 
       - name: Unit tests (CPU-only, no PG/CUDA required)
         timeout-minutes: 20
