@@ -33,6 +33,10 @@
     {
       "path": "0004-hnsw-upper-precision.patch",
       "sha256": "8777280bc918cc26e8bca0bbf38021e1e901ccda8510e543738b9a53ff631fdd"
+    },
+    {
+      "path": "0006-cagra-consumer-row-sort.patch",
+      "sha256": "3acd107a74bd0fc29ee72e2e206558f86d4bc374e506775af60496b87ae48fa4"
     }
   ],
   "runtime_markers": {
@@ -67,7 +71,8 @@
     },
     "cpp/src/neighbors/detail/cagra/cagra_build.cuh": {
       "base_sha256": "f72c7ac38e1b24f2f0b05c5a392a1eef2bec7fc88a1fa27f6393fc87795f5bc1",
-      "final_sha256": "87239d05766dda6f99d17cbfbc75faa9858e976fc0aa80f679f63dc4a6297c8e"
+      "final_sha256": "38722f03f72efeb5a92e92ea30ebe9d87ec9b9b1afc2ca392a07de4b645c95bc",
+      "patch3_sha256": "87239d05766dda6f99d17cbfbc75faa9858e976fc0aa80f679f63dc4a6297c8e"
     },
     "cpp/src/neighbors/detail/cagra/ace_memory_guard.hpp": {
       "base_sha256": null,
@@ -76,6 +81,10 @@
     "cpp/src/neighbors/detail/hnsw_precision.hpp": {
       "base_sha256": null,
       "final_sha256": "c051c5bfe6c5b1031c61806ab7d0a8804741724011b41b33bb63eac9cb72dc69"
+    },
+    "cpp/src/neighbors/detail/cagra/consumer_row_sort_plan.hpp": {
+      "base_sha256": null,
+      "final_sha256": "07b7b724fce554cec74ee1cb779e24ced31867981f33e6afda4f2c17d98cac49"
     }
   },
   "source_prefix_states": {
@@ -100,6 +109,25 @@
       "cpp/src/neighbors/detail/cagra/cagra_build.cuh",
       "cpp/src/neighbors/detail/cagra/ace_memory_guard.hpp",
       "cpp/src/neighbors/detail/hnsw_precision.hpp"
+    ],
+    "0001+0002+0003+0004+0006": [
+      "cpp/src/neighbors/detail/hnsw.hpp",
+      "cpp/src/neighbors/hnsw.cpp",
+      "cpp/src/neighbors/cagra.cpp",
+      "cpp/src/neighbors/detail/cagra/cagra_build.cuh",
+      "cpp/src/neighbors/detail/cagra/ace_memory_guard.hpp",
+      "cpp/src/neighbors/detail/hnsw_precision.hpp",
+      "cpp/src/neighbors/detail/cagra/consumer_row_sort_plan.hpp"
     ]
+  },
+  "dependency_patches": {
+    "raft_select_k_key_bitwidth": {
+      "path": "raft/0001-raft-select-k-key-bitwidth.patch",
+      "sha256": "a2d153ccc4a6b3d61bf4c9bbadf6c98f8e104a85352312d2588b90899c58058c",
+      "target": "RAFT cpp/include/raft/matrix/detail/select_k-inl.cuh (CPM raft source of the cuVS build)",
+      "base_sha256": "3d6959c06710d420ceaf9236793a0eb91b2b587ba879a5c59ee79c76ee23abec",
+      "final_sha256": "64a54cbaf855b2c3a333ad380ad85ceac41d222b6a557af6c1f490dacf5cf908",
+      "provenance": "SDK-B3-FINAL raft-key-bitwidth.patch; A2/B2/B3 build dependency"
+    }
   }
 }

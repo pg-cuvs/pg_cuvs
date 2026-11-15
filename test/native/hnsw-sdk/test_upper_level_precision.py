@@ -32,8 +32,8 @@ def assets(source: pathlib.Path) -> None:
     for path,entry in m["source_files"].items():
         assert hashlib.sha256((source/path).read_bytes()).hexdigest()==entry["final_sha256"],path
     recipe=(folder/"build-patched-cuvs.sh").read_text();readme=(folder/"README.md").read_text()
-    assert 'for candidate_level in 0 1 2 3 4' in recipe
-    assert 'source_state_matches 4' in recipe
+    assert 'for candidate_level in 0 1 2 3 4 6' in recipe
+    assert 'source_state_matches 6' in recipe
     for entry in m["patches"]:assert entry["sha256"] in recipe and entry["sha256"] in readme
     marker=m["runtime_markers"]["upper_precision"]
     assert marker["symbol"] in recipe and marker["value"] in recipe and marker["value"] in readme

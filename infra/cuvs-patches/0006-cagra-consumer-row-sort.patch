@@ -1,0 +1,215 @@
+diff --git a/cpp/src/neighbors/detail/cagra/cagra_build.cuh b/cpp/src/neighbors/detail/cagra/cagra_build.cuh
+index 3e75ebf..1714eda 100644
+--- a/cpp/src/neighbors/detail/cagra/cagra_build.cuh
++++ b/cpp/src/neighbors/detail/cagra/cagra_build.cuh
+@@ -7,6 +7,7 @@
+ #include "../../../core/nvtx.hpp"
+ #include "../../vpq_dataset.cuh"
+ #include "graph_core.cuh"
++#include "consumer_row_sort_plan.hpp"
+ 
+ #include <raft/core/copy.cuh>
+ #include <raft/core/device_mdarray.hpp>
+@@ -26,6 +27,11 @@
+ #include <cuvs/neighbors/ivf_pq.hpp>
+ #include <cuvs/neighbors/nn_descent.hpp>
+ #include <cuvs/neighbors/refine.hpp>
++#include <cub/device/device_segmented_radix_sort.cuh>
++#include <raft/linalg/map.cuh>
++#include <raft/core/resource/device_memory_resource.hpp>
++#include <rmm/device_buffer.hpp>
++#include <rmm/error.hpp>
+ #include <cuvs/util/file_io.hpp>
+ #include <cuvs/util/host_memory.hpp>
+ 
+@@ -1967,6 +1973,74 @@ void refine_host_and_write_graph(
+     knn_graph, refined_neighbors_host_view, num_self_included, batch_size, batch_offset);
+ }
+ 
++// New scratch uses only the normal workspace MR; existing I/O allocators stay unchanged.
++// Pinned normal-MR accounting contract: default RMM alignment is 256 bytes.
++// Custom limiting-adaptor alignment is not publicly queryable in pinned RMM.
++inline void sort_cagra_consumer_rows(raft::resources const& res,
++                                     const float* distances, const int64_t* neighbors,
++                                     float* sorted_distances, int64_t* sorted_neighbors,
++                                     std::size_t rows, std::size_t k,
++                                     std::size_t input_stride, std::size_t output_stride,
++                                     cuvs::distance::DistanceType metric)
++{
++  using namespace consumer_row_sort;
++  validate_shape(rows, k, input_stride, output_stride);
++  auto stream = raft::resource::get_cuda_stream(res);
++  auto normal_mr = raft::resource::get_workspace_resource_ref(res);
++  auto const asc = cuvs::distance::is_min_close(metric);
++  constexpr std::size_t mr_alignment = 256;
++  std::size_t row_offset = 0;
++  std::size_t row_cap = rows;
++  while (row_offset < rows) {
++    auto element_offset = checked_mul(row_offset, k);
++    auto dispatch = [&](void* temp, std::size_t& bytes, std::size_t chunk_rows,
++                        const int64_t* offsets) {
++      auto const* end_offsets = offsets == nullptr ? nullptr : offsets + 1;
++      if (asc) {
++        return cub::DeviceSegmentedRadixSort::SortPairs(
++          temp, bytes, distances + element_offset, sorted_distances + element_offset,
++          neighbors + element_offset, sorted_neighbors + element_offset,
++          static_cast<int64_t>(checked_mul(chunk_rows, k)), static_cast<int64_t>(chunk_rows),
++          offsets, end_offsets, 0, 32, stream);
++      }
++      return cub::DeviceSegmentedRadixSort::SortPairsDescending(
++        temp, bytes, distances + element_offset, sorted_distances + element_offset,
++        neighbors + element_offset, sorted_neighbors + element_offset,
++        static_cast<int64_t>(checked_mul(chunk_rows, k)), static_cast<int64_t>(chunk_rows),
++        offsets, end_offsets, 0, 32, stream);
++    };
++    auto query = [&](std::size_t chunk_rows, std::size_t) {
++      std::size_t bytes = 0;
++      // The nullptr storage query returns before input access in pinned CUB.
++      RAFT_CUDA_TRY(dispatch(nullptr, bytes, chunk_rows, nullptr));
++      return bytes;
++    };
++    auto free_bytes = raft::resource::get_workspace_free_bytes(res);
++    plan chunk;
++    for (;;) {
++      chunk = choose(rows - row_offset, row_cap, k, free_bytes, mr_alignment, query);
++      if (chunk.rows == 0) {
++        throw rmm::out_of_memory("CAGRA consumer sort: normal workspace cannot fit one complete row");
++      }
++      auto free_now = raft::resource::get_workspace_free_bytes(res);
++      if (chunk.charged_bytes <= free_now) { break; }
++      free_bytes = free_now;
++      row_cap = chunk.rows;
++    }
++    rmm::device_buffer scratch(chunk.allocation_bytes, stream, normal_mr);
++    auto* offsets = static_cast<int64_t*>(scratch.data());
++    auto offset_view = raft::make_device_vector_view<int64_t, int64_t>(
++      offsets, static_cast<int64_t>(chunk.rows + 1));
++    raft::linalg::map_offset(res, offset_view, raft::mul_const_op<int64_t>{static_cast<int64_t>(k)});
++    auto* temp = static_cast<char*>(scratch.data()) + chunk.temp_offset;
++    auto actual_temp_bytes = chunk.temp_bytes;
++    RAFT_CUDA_TRY(dispatch(temp, actual_temp_bytes, chunk.rows, offsets));
++    row_offset += chunk.rows;
++    row_cap = chunk.rows;
++  }
++}
++
++
+ template <typename DataT, typename IdxT, typename accessor>
+ void build_knn_graph(
+   raft::resources const& res,
+@@ -2114,6 +2188,19 @@ void build_knn_graph(
+     cuvs::neighbors::ivf_pq::search(
+       res, pq.search_params, index, queries_view, neighbors_view, distances_view);
+ 
++    // With refinement disabled, pruning consumes these positions as ranks.
++    // Sort only this CAGRA consumer, reusing the existing refinement outputs.
++    // Returned IP scores are maximized; L2/cosine distances are minimized.
++    auto graph_neighbors = neighbors.data_handle();
++    if (top_k == gpu_top_k) {
++      sort_cagra_consumer_rows(res,
++                                distances.data_handle(), neighbors.data_handle(),
++                                refined_distances.data_handle(), refined_neighbors.data_handle(),
++                                batch.size(), gpu_top_k, gpu_top_k, top_k,
++                                pq.build_params.metric);
++      graph_neighbors = refined_neighbors.data_handle();
++    }
++
+     if (async_host_processing) {
+       // process previous batch async on host
+       // NOTE: the async path also covers disabled refinement (top_k == gpu_top_k)
+@@ -2136,7 +2223,7 @@ void build_knn_graph(
+       // copy next batch to host
+       raft::copy(res,
+                  raft::make_host_vector_view(neighbors_host.data_handle(), neighbors_view.size()),
+-                 raft::make_device_vector_view(neighbors.data_handle(), neighbors_view.size()));
++                 raft::make_device_vector_view(graph_neighbors, neighbors_view.size()));
+       if (top_k != gpu_top_k) {
+         // can be skipped for disabled refinement
+         raft::copy(res,
+diff --git a/cpp/src/neighbors/detail/cagra/consumer_row_sort_plan.hpp b/cpp/src/neighbors/detail/cagra/consumer_row_sort_plan.hpp
+new file mode 100644
+index 0000000..e4445e7
+--- /dev/null
++++ b/cpp/src/neighbors/detail/cagra/consumer_row_sort_plan.hpp
+@@ -0,0 +1,81 @@
++/* SPDX-License-Identifier: Apache-2.0 */
++#pragma once
++#include <algorithm>
++#include <cstddef>
++#include <cstdint>
++#include <limits>
++#include <stdexcept>
++
++namespace cuvs::neighbors::cagra::detail::consumer_row_sort {
++inline std::size_t checked_add(std::size_t a, std::size_t b)
++{
++  if (b > std::numeric_limits<std::size_t>::max() - a) {
++    throw std::overflow_error("consumer row sort byte addition overflow");
++  }
++  return a + b;
++}
++inline std::size_t checked_mul(std::size_t a, std::size_t b)
++{
++  if (a != 0 && b > std::numeric_limits<std::size_t>::max() / a) {
++    throw std::overflow_error("consumer row sort byte multiplication overflow");
++  }
++  return a * b;
++}
++inline std::size_t round_up(std::size_t n, std::size_t alignment)
++{
++  if (alignment == 0 || (alignment & (alignment - 1)) != 0) {
++    throw std::invalid_argument("consumer row sort alignment must be a power of two");
++  }
++  auto remainder = n % alignment;
++  return remainder == 0 ? n : checked_add(n, alignment - remainder);
++}
++inline void validate_shape(std::size_t rows, std::size_t k,
++                           std::size_t input_stride, std::size_t output_stride)
++{
++  if (k == 0 || k > static_cast<std::size_t>(std::numeric_limits<int>::max()) ||
++      input_stride != k || output_stride != k) {
++    throw std::invalid_argument("consumer row sort requires packed complete rows and INT_MAX K");
++  }
++  auto items = checked_mul(rows, k);
++  if (items > static_cast<std::size_t>(std::numeric_limits<int64_t>::max()) ||
++      rows >= static_cast<std::size_t>(std::numeric_limits<int64_t>::max())) {
++    throw std::overflow_error("consumer row sort CUB item/offset range overflow");
++  }
++  (void)checked_mul(items, sizeof(int64_t));
++}
++struct plan {
++  std::size_t rows = 0;
++  std::size_t items = 0;
++  std::size_t offsets_bytes = 0;
++  std::size_t temp_offset = 0;
++  std::size_t temp_bytes = 0;
++  std::size_t allocation_bytes = 0;
++  std::size_t charged_bytes = 0;
++};
++template <typename Query>
++plan choose(std::size_t remaining_rows, std::size_t row_cap, std::size_t k,
++            std::size_t free_bytes, std::size_t mr_alignment, Query&& query)
++{
++  for (auto rows = std::min(remaining_rows, row_cap); rows != 0; rows /= 2) {
++    plan p;
++    p.rows          = rows;
++    try {
++      p.items         = checked_mul(rows, k);
++      p.offsets_bytes = checked_mul(checked_add(rows, 1), sizeof(int64_t));
++      p.temp_offset   = round_up(p.offsets_bytes, 256);  // CUB buffer starts aligned
++      // Prevent overflow inside pinned CUB's two-buffer size query. This is
++      // representability validation only; the real query below determines fit.
++      auto cub_bound = checked_add(round_up(checked_mul(p.items, sizeof(float)), 256),
++                                   round_up(checked_mul(p.items, sizeof(int64_t)), 256));
++      (void)checked_add(p.temp_offset, checked_add(cub_bound, 255));
++    } catch (const std::overflow_error&) {
++      continue;  // smaller rows, before any CUB query or allocation
++    }
++    p.temp_bytes    = query(rows, p.items);          // no allocation in this callback
++    p.allocation_bytes = checked_add(p.temp_offset, p.temp_bytes);
++    p.charged_bytes    = round_up(p.allocation_bytes, mr_alignment);
++    if (p.charged_bytes <= free_bytes) { return p; }
++  }
++  return {};
++}
++}  // namespace cuvs::neighbors::cagra::detail::consumer_row_sort
