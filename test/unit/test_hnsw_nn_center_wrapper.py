@@ -26,6 +26,9 @@ def block(start_marker, end_marker):
 graph_src = block('        auto graph = [&]() {', '\n        }();\n')
 serial_src = block('        if (!params->hierarchy && !disk)\n',
                    '                hnsw::serialize(res, output, *index);\n        }\n')
+# precision step of the prepare phase (decides whether an L2 offset input is refused)
+precision_src = block('        if (prepared.route.route == CUVS_HNSW_ROUTE_NN_DESCENT)\n        {\n            /* L2 graph input is centered',
+                      '                return CUVS_STATUS_BUILD_FAILED;\n            }\n        }\n')
 
 prefix = r'''
 #include "cuvs_hnsw_build_common.h"
@@ -93,12 +96,21 @@ int cuvs_bf_search_batch(CuvsBfIndex, const float *, int, int, int, CuvsSearchRe
 
 struct Params { uint64_t n_vecs; uint32_t dim, metric, hierarchy; };
 struct Route { uint32_t route; };
-struct Prepared { Route route; };
+struct Prepared { Route route; CuvsHnswNnPrecision nn_precision; };
+struct Files { const void *mapping; };
+
+/* the wrapper's prepare-phase precision step, verbatim */
+static int run_precision(const Params *params, const float *rows, char *error, size_t error_len) {
+    Prepared prepared{{CUVS_HNSW_ROUTE_NN_DESCENT}, {}};
+    Files files{rows};
+@@PRECISION@@
+    return 0;
+}
 
 static int run_build(const Params *params, const float *rows, bool tiny, bool disk) {
     Res res; int hp = 0; uint32_t degree = 4; int device_id = 0; int owner_fd = -1;
     struct CP { int metric; } cp{(int)params->metric};
-    Prepared prepared{{CUVS_HNSW_ROUTE_NN_DESCENT}};
+    Prepared prepared{{CUVS_HNSW_ROUTE_NN_DESCENT}, {}};
     const char *workdir = "cpu-fixture";
     View data{rows, (int64_t)params->n_vecs, (int64_t)params->dim};
     (void)degree; (void)device_id; (void)hp; (void)owner_fd;
@@ -146,6 +158,20 @@ int main() {
         run_build(&p, rows.data(), false, false);
         assert(built.ptr == rows.data() && built.values == original);
     }
+    {   /* prepare-phase precision: an L2 offset input is built (centered), not
+         * refused; dtype comes from the original rows (FP32 here) */
+        char error[256] = {};
+        std::vector<float> tight(n * d);   /* offset 1000, spread 0.01-scale: ratio >> 4096 */
+        for (uint64_t i = 0; i < n * d; i++) tight[i] = 1000.0f + 0.01f * (float)i;
+        CuvsHnswNnPrecision raw;
+        assert(cuvs_hnsw_nn_precision(tight.data(), n, d, CUVS_METRIC_L2, &raw) == CUVS_HNSW_NN_PRECISION_CANCELLATION);
+        Params p{n, d, CUVS_METRIC_L2, 0};
+        assert(run_precision(&p, tight.data(), error, sizeof(error)) == 0);
+        Params ip{n, d, CUVS_METRIC_IP, 0};
+        assert(run_precision(&ip, tight.data(), error, sizeof(error)) == 0);
+        std::vector<float> nan = rows; nan[3] = NAN;
+        assert(run_precision(&p, nan.data(), error, sizeof(error)) == CUVS_STATUS_BUILD_FAILED);
+    }
     {   /* centering failure throws before cagra::build */
         built = Seen();
         std::vector<float> bad = rows; bad[5] = INFINITY;
@@ -160,8 +186,8 @@ int main() {
 '''
 
 
-def fixture(graph, serial):
-    return prefix + graph + middle + serial + suffix
+def fixture(graph, serial, precision):
+    return prefix.replace('@@PRECISION@@', precision) + graph + middle + serial + suffix
 
 
 mutations = {
@@ -174,30 +200,35 @@ mutations = {
     'serializer gets centered copy': ('serial', 'cagra::serialize_to_hnswlib(res, output, graph, data);',
                                       'cagra::serialize_to_hnswlib(res, output, graph, raft::make_host_matrix_view<const float, int64_t>(built.values.data(), (int64_t)params->n_vecs, (int64_t)params->dim));'),
     'IP centered too': ('graph', '                && cuvs_hnsw_nn_centers(params->metric))', '                && 1)'),
+    'precision guard on for L2': ('precision', 'params->metric, cuvs_hnsw_nn_centers(params->metric),\n                    &prepared.nn_precision', 'params->metric, 0,\n                    &prepared.nn_precision'),
 }
+
+
+def build_and_run(d, name, g, s, pr):
+    (d / 'fixture.cpp').write_text(fixture(g, s, pr))
+    exe = d / 'fixture'
+    b = subprocess.run(['c++', '-std=c++17', '-Wall', '-Wextra', '-Wno-unused-parameter', '-Wno-unused-variable',
+                        '-Wno-unused-but-set-variable', '-I', str(root / 'src'), str(d / 'fixture.cpp'),
+                        '-lpthread', '-lm', '-o', str(exe)], capture_output=True, text=True)
+    if b.returncode:
+        raise RuntimeError(f'{name}: COMPILE FAILED (not a kill): {b.stderr[-1500:]}')
+    return subprocess.run([str(exe)], capture_output=True, text=True)
+
 
 with tempfile.TemporaryDirectory(prefix='pgcuvs-nn-center-wrapper-') as tmp:
     d = Path(tmp)
-    cases = [('baseline', graph_src, serial_src)]
+    # 1. the production code as it is: must pass
+    r = build_and_run(d, 'baseline', graph_src, serial_src, precision_src)
+    if r.returncode:
+        raise SystemExit(f'BASELINE FAILED (production wrapper behavior): {r.stderr.strip()}')
+    print(r.stdout.strip())
+    # 2. own mutants: must fail at run time; a missing anchor is an error, not a kill
+    parts = {'graph': graph_src, 'serial': serial_src, 'precision': precision_src}
     for name, (part, old, new) in mutations.items():
-        src = graph_src if part == 'graph' else serial_src
-        if src.count(old) != 1:
-            raise RuntimeError(f'{name}: anchor not found exactly once (not a kill)')
-        mutated = src.replace(old, new)
-        cases.append((name, mutated if part == 'graph' else graph_src, mutated if part == 'serial' else serial_src))
-    for name, g, s in cases:
-        (d / 'fixture.cpp').write_text(fixture(g, s))
-        exe = d / 'fixture'
-        b = subprocess.run(['c++', '-std=c++17', '-Wall', '-Wextra', '-Wno-unused-parameter', '-Wno-unused-variable',
-                            '-Wno-unused-but-set-variable', '-I', str(root / 'src'), str(d / 'fixture.cpp'),
-                            '-lpthread', '-lm', '-o', str(exe)], capture_output=True, text=True)
-        if b.returncode:
-            raise RuntimeError(f'{name}: compile failed (not a kill): {b.stderr[-1500:]}')
-        r = subprocess.run([str(exe)], capture_output=True, text=True)
-        ok = r.returncode == 0
-        if name == 'baseline':
-            if not ok: raise RuntimeError(f'baseline failed: {r.stderr}')
-            print(r.stdout.strip())
-        else:
-            if ok: raise RuntimeError(f'{name}: survived')
-            print(f'{name}: detected at run time (rc={r.returncode})')
+        if parts[part].count(old) != 1:
+            raise SystemExit(f'ANCHOR MISSING (not a kill): {name}')
+        p = dict(parts); p[part] = p[part].replace(old, new)
+        r = build_and_run(d, name, p['graph'], p['serial'], p['precision'])
+        if r.returncode == 0:
+            raise SystemExit(f'MUTANT SURVIVED: {name}')
+        print(f'{name}: detected at run time (rc={r.returncode})')
