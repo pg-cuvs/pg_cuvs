@@ -10,5 +10,5 @@ int main() {
     assert(nn_input_needs_fp32(x, 1, 3));
     x[0] = NAN;
     assert(nn_input_needs_fp32(x, 1, 3));
-    puts("B3 NN upper input conversion precision: PASS (CPU helper)");
+    puts("SDK NN upper input conversion precision: PASS (CPU helper)");
 }

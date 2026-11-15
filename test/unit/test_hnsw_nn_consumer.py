@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Execute the production NN wrapper branch with a CPU model of B3's consumer."""
+"""Execute the production NN wrapper branch with a CPU model of the pinned SDK's consumer."""
 from pathlib import Path
 import subprocess
 import tempfile
@@ -83,7 +83,7 @@ suffix = r'''
     CuvsHnswPolicy read{};
     assert(cuvs_hnsw_policy_read(&page, sizeof(page), &read) == CUVS_HNSW_POLICY_RECORDED);
     assert(read.route == CUVS_HNSW_ROUTE_NN_DESCENT);
-    puts("production NN wrapper branch -> modeled B3 -> receipt: PASS (CPU mock)");
+    puts("production NN wrapper branch -> modeled SDK -> receipt: PASS (CPU mock)");
 }
 '''
 mutations = {

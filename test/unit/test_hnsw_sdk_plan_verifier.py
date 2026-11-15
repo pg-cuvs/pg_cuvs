@@ -11,7 +11,7 @@ import tempfile
 root = Path(__file__).resolve().parents[2]
 p = argparse.ArgumentParser()
 p.add_argument('--canonical-header', type=Path, required=True)
-p.add_argument('--b3-src', type=Path, required=True)
+p.add_argument('--row-sort-src', type=Path, required=True)
 p.add_argument('--verifier', type=Path, default=root / 'scripts/verify-hnsw-sdk-plan.py')
 a = p.parse_args()
 
@@ -26,11 +26,11 @@ with tempfile.TemporaryDirectory(prefix='pgcuvs-plan-verifier-') as temp:
     target.mkdir(parents=True)
     names = ('cagra_build.cuh', 'ace_memory_guard.hpp', 'consumer_row_sort_plan.hpp')
     for name in names:
-        shutil.copyfile(a.b3_src / 'neighbors/detail/cagra' / name, target / name)
-    b3 = run(src)
-    if b3.returncode != 0:
-        raise AssertionError('B3 expected accepted: '+b3.stderr.strip())
-    assert json.loads(b3.stdout)['status'] == 'PINNED_PLANNER_SOURCE_MATCH'
+        shutil.copyfile(a.row_sort_src / 'neighbors/detail/cagra' / name, target / name)
+    sorted_run = run(src)
+    if sorted_run.returncode != 0:
+        raise AssertionError('row-sort consumer expected accepted: '+sorted_run.stderr.strip())
+    assert json.loads(sorted_run.stdout)['status'] == 'PINNED_PLANNER_SOURCE_MATCH'
     for name in names:
         f = target / name
         before = f.read_bytes()
@@ -46,4 +46,4 @@ with tempfile.TemporaryDirectory(prefix='pgcuvs-plan-verifier-') as temp:
     (target / 'cagra_build.cuh').write_bytes(b'unknown planner\n')
     rejected = run(src)
     assert rejected.returncode != 0 and 'Unsupported HNSW SDK planner source' in rejected.stderr
-    print('canonical accepted, exact B3 accepted, unrecognized planner rejected')
+    print('canonical accepted, exact row-sort consumer accepted, unrecognized planner rejected')

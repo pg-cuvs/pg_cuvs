@@ -39,10 +39,10 @@ static struct Page stored(unsigned dtype, unsigned hierarchy) {
  b.nn.dtype=dtype;b.nn.termination_threshold=0.0001f;return b;
 }
 int main(void) {
- struct Page r1=stored(CUVS_HNSW_NN_DTYPE_FP32,1),r2=stored(CUVS_HNSW_NN_DTYPE_FP32,1);
- CuvsHnswPolicy policy;assert(!memcmp(&r1,&r2,sizeof(r1)));
+ struct Page older=stored(CUVS_HNSW_NN_DTYPE_FP32,1),newer=stored(CUVS_HNSW_NN_DTYPE_FP32,1);
+ CuvsHnswPolicy policy;assert(!memcmp(&older,&newer,sizeof(older)));
  for (unsigned i=0;i<3;i++) {
-  struct Page page=i==0?r1:i==1?r2:stored(CUVS_HNSW_NN_DTYPE_FP16,1);
+  struct Page page=i==0?older:i==1?newer:stored(CUVS_HNSW_NN_DTYPE_FP16,1);
   assert(cuvs_hnsw_policy_read(&page,sizeof(page),&policy)==CUVS_HNSW_POLICY_RECORDED);
   Buffer out=render(policy,page.nn);
   if(!strstr(out.data,"\"nn_upper_dtype_configured\":null")) {fprintf(stderr,"unrecorded upper configured dtype inferred: %s\n",out.data);return 2;}
@@ -52,7 +52,7 @@ int main(void) {
  struct Page nsw=stored(CUVS_HNSW_NN_DTYPE_FP32,0);
  assert(cuvs_hnsw_policy_read(&nsw,sizeof(nsw),&policy)==CUVS_HNSW_POLICY_RECORDED);
  Buffer out=render(policy,nsw.nn);assert(strstr(out.data,"\"nn_upper_dtype_configured\":\"not_applicable\""));
- puts("r1/r2 stored NN upper configured dtype unknown; nsw not applicable: PASS (CPU fixture)");
+ puts("byte-identical receipts from two SDK revisions: NN upper configured dtype unknown; nsw not applicable: PASS (CPU fixture)");
 }
 '''
 with tempfile.TemporaryDirectory(prefix='pgcuvs-upper-receipt-') as tmp:

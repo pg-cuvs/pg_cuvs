@@ -1,4 +1,4 @@
-/* Decision B (offset-r87/DECISION-B-CENTERING.md): explicit nn_descent + L2
+/* Explicit nn_descent + L2
  * builds the NN-descent graph from a column-centered copy. CPU only. */
 #include "cuvs_hnsw_nn_center.h"
 #include "cuvs_hnsw_nn_precision.h"
@@ -68,7 +68,7 @@ int main(void)
 {
     static int exact[N][K], raw_exp[N][K], cen_exp[N][K];
     double mean_sq = 0.0;
-    /* unit-scale rows plus a common offset of 1000 (nn-native-r87c D2 shape) */
+    /* unit-scale rows plus a common offset of 1000 (the shape of the GPU offset check) */
     for (int i = 0; i < N * D; i++) x[i] = (float)(1000.0 + (unit() - 0.5) * 0.6);
     float before = x[17];
 
@@ -108,6 +108,6 @@ int main(void)
         assert(cuvs_hnsw_nn_center(x, 0, D, c, NULL) != 0);
         assert(cuvs_hnsw_nn_center(x, N, 0, c, NULL) != 0);
     }
-    puts("NN-descent L2 centering (decision B): PASS");
+    puts("NN-descent L2 centering: PASS");
     return 0;
 }

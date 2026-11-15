@@ -108,7 +108,7 @@ int main() {
   data[0]=1.0f; upper.npartitions=0; params.graph_build_params=upper;
   run(params,dataset);
   assert(nn_descent::consumed.dist_comp_dtype == nn_descent::DIST_COMP_DTYPE::AUTO);
-  /* Decision B upper levels (REVIEW-B F1): resident NN + L2 gives NN-descent
+  /* Upper-level centering: resident NN + L2 gives NN-descent
    * this level's column-centered copy and reserves its host bytes; IP/cosine
    * and non-resident calls get the original rows. The caller's rows stay intact. */
   data[0]=1001.0f; for (int j = 1; j < 17; j++) data[j] = 1000.0f;
@@ -137,7 +137,7 @@ mutations = {
     'upper budget omitted': (body.replace('if (resident_fp32) gpu_workspace = checked_add(gpu_workspace,\n        checked_mul(checked_mul(rows, dim), sizeof(float)));', 'if (resident_fp32) gpu_workspace = checked_add(gpu_workspace, 0);'), guard),
     'upper dtype reverted': (body.replace('nn_params.dist_comp_dtype = resident_fp32 ? nn_descent::DIST_COMP_DTYPE::FP32\n                                                  : nn_descent::DIST_COMP_DTYPE::FP16;', 'nn_params.dist_comp_dtype = nn_descent::DIST_COMP_DTYPE::AUTO;'), guard),
     'private marker ignored': (body, guard.replace('resident_guard.npartitions == PGC_UVS_NN_UPPER_FP32', 'resident_guard.npartitions == 0')),
-    # REVIEW-B F1: upper-level centering
+    # upper-level centering
     'upper centering skipped': (body.replace('if (center_upper) {\n        centered.resize', 'if (false) {\n        centered.resize'), guard),
     'upper centering for IP too': (body.replace('center_upper = resident_nn_upper &&', 'center_upper = resident_nn_upper || '), guard),
     'upper centering budget omitted': (body.replace('if (center_upper) host_workspace = checked_add(host_workspace,', 'if (false) host_workspace = checked_add(host_workspace,'), guard),

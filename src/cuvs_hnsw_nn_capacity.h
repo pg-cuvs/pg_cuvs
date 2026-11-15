@@ -29,7 +29,7 @@ static inline uint64_t cuvs_hnsw_nn_extended(uint64_t degree)
     return (x + 31) / 32 * 32;
 }
 /* centered_copy: the build feeds NN-descent a centered host copy of the input
- * (decision B, L2 only). It lives through the graph call only, so it is a
+ * (L2 only). It lives through the graph call only, so it is a
  * build-phase term. */
 static inline int
 cuvs_hnsw_nn_capacity_ex(uint64_t n, uint32_t dim, uint32_t degree, uint32_t intermediate,

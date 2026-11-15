@@ -2589,7 +2589,7 @@ cuvs_ipc_build_hnsw_file(const char *socket_path, int vectors_fd,
         || cuvs_fd_send(sock, owner[1], &token, 1)) goto done;
     /* Keep our copy of owner[1] until done: on macOS, closing it while the
      * SCM_RIGHTS message is still in flight lets the daemon's received copy
-     * read EOF, i.e. a spurious cancel (r87 B1). Cancel still works because
+     * read EOF, i.e. a spurious cancel. Cancel still works because
      * EOF on the daemon's end follows from closing owner[0], its peer. */
     /* A single readiness byte permits interruptible waiting before recvmsg:
      * reading that byte cannot accidentally discard the ancillary result FD. */

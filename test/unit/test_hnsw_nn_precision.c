@@ -5,8 +5,8 @@
 #include <stdint.h>
 #include <stdio.h>
 
-/* nn-diff-review-r87 D2 emulation inputs: dim 128, n 4000, N(0, sd) + offset.
- * With FP16 dot + FP32 norm the reviewer measured recall@10 1.000/0.899/0.017/
+/* FP16-cancellation emulation inputs: dim 128, n 4000, N(0, sd) + offset.
+ * With FP16 dot + FP32 norm a CPU emulation measured recall@10 1.000/0.899/0.017/
  * 0.001 for offset 0/100/1000/5000; every offset >= 100 must select FP32. */
 static uint64_t rng_state = 1;
 static double uniform01(void)
@@ -32,7 +32,7 @@ static uint32_t dtype_for(double offset, double sd, uint32_t metric)
 }
 static void test_review_offsets(void)
 {
-    /* D2: never FP16 for these. This exercises cuvs_hnsw_nn_precision, i.e.
+    /* Never FP16 for these. This exercises cuvs_hnsw_nn_precision, i.e.
      * UNCENTERED input, where offsets whose mean squared norm exceeds 4096 x
      * spread are refused. The product centers L2 input and does not take this
      * path (see test_hnsw_nn_center.c). */
@@ -41,7 +41,7 @@ static void test_review_offsets(void)
     assert(dtype_for(1000.0, 5.0, CUVS_METRIC_L2) == REFUSED_CANCELLATION);      /* ~4e4 */
     assert(dtype_for(5000.0, 5.0, CUVS_METRIC_L2) == REFUSED_CANCELLATION);
     assert(dtype_for(100.0, 5.0, CUVS_METRIC_IP) == CUVS_HNSW_NN_FP32);
-    /* unit-scale 768-d rows (the frozen corpus has max_abs 0.79) stay FP16 */
+    /* unit-scale 768-d rows (a 768-d embedding corpus with max_abs 0.79) stay FP16 */
     {
         static float u[64 * 768];
         CuvsHnswNnPrecision r;
@@ -50,11 +50,11 @@ static void test_review_offsets(void)
     }
 }
 
-/* r87 offset diagnosis (nn-native-r87c): 768-d unit-scale rows (spread ~4.8
- * like the frozen corpus) plus a common offset. Native recall@10 at offset
+/* Offset diagnosis: 768-d unit-scale rows (spread ~4.8, like a real 768-d
+ * embedding corpus) plus a common offset. On GPU, recall@10 at offset
  * 1000 was 0.40/0.79/0.90 even with FP32; the CPU emulation of the SDK's
  * float32 norm expansion gave k=64 graph overlap 0.998 at offset 3, 0.979 at
- * 10 and 0.012 at 1000. L2 must refuse from offset 10; IP is not affected. */
+ * 10 and 0.012 at 1000. The uncentered L2 rule refuses from offset 10; IP is not affected. */
 static int offset_rc(double offset, uint32_t metric, int outlier)
 {
     enum { N = 256, D = 768 };
@@ -72,7 +72,7 @@ static void test_offset_cancellation(void)
     assert(offset_rc(10.0, CUVS_METRIC_L2, 0) == CUVS_HNSW_NN_PRECISION_CANCELLATION);
     assert(offset_rc(1000.0, CUVS_METRIC_L2, 0) == CUVS_HNSW_NN_PRECISION_CANCELLATION);
     assert(offset_rc(1000.0, CUVS_METRIC_IP, 0) == 0);
-    assert(offset_rc(0.0, CUVS_METRIC_L2, 1) == 0);  /* r87c C5 abs>65504 case built fine */
+    assert(offset_rc(0.0, CUVS_METRIC_L2, 1) == 0);  /* one row with an element > 65504 built normally on GPU */
     {
         float same[4 * 17];
         CuvsHnswNnPrecision r;
@@ -81,7 +81,7 @@ static void test_offset_cancellation(void)
     }
 }
 
-/* nn-diff-review-r87 D4: the FP32 distance-range margins are 8x (L2) and 2x
+/* The FP32 distance-range margins are 8x (L2) and 2x
  * (IP/cosine) below FLT_MAX; metrics above IP are rejected. */
 static void test_distance_margins(void)
 {
@@ -110,7 +110,7 @@ int main(void)
     assert(cuvs_hnsw_nn_precision(safe, 1, 17, CUVS_METRIC_L2, &result) == 0);
     assert(result.dtype == CUVS_HNSW_NN_FP32 && result.max_abs == 65505.0);
     /* Every element fits half, but the expanded-L2 cancellation bound does
-     * not (r87 D2): FP32, matching cuvs_hnsw_ivfpq_needs_fp32. */
+     * not: FP32, matching cuvs_hnsw_ivfpq_needs_fp32. */
     safe[0] = 65504.0f;
     assert(cuvs_hnsw_nn_precision(safe, 1, 17, CUVS_METRIC_L2, &result) == 0);
     assert(result.dtype == CUVS_HNSW_NN_FP32 && result.max_sq_norm > 65504.0);

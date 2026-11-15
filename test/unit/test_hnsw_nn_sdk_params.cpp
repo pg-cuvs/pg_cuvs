@@ -17,7 +17,7 @@ struct NN {
 };
 struct IVF {};
 using Choice = std::variant<std::monostate, NN, IVF>;
-/* B3 behavior: mismatched graph_degree reconstructs defaults, losing settings. */
+/* Pinned SDK behavior: mismatched graph_degree reconstructs defaults, losing settings. */
 static NN sdk_consume(Choice selected, size_t intermediate, int metric)
 {
     NN p = std::get<NN>(selected);
@@ -38,5 +38,5 @@ int main()
     choice = NN(64, 7);
     consumed = sdk_consume(choice, 96, 7);
     assert(consumed.max_iterations == 20 && consumed.dist_comp_dtype == DType::fp16);
-    puts("NN configured params survive modeled B3 consumer: PASS (CPU mock)");
+    puts("NN configured params survive modeled SDK consumer: PASS (CPU mock)");
 }

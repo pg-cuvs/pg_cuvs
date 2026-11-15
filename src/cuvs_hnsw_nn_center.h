@@ -8,15 +8,16 @@
 #include <stdlib.h>
 
 /* Explicit nn_descent + L2 builds the NN-descent graph from a column-centered
- * copy of the input (user decision B, offset-r87/DECISION-B-CENTERING.md).
+ * copy of the input.
  *
  * Why: the pinned SDK's NN-descent computes L2 as ||a||^2 + ||b||^2 - 2*a.b in
  * float32 (nn_descent.cuh calculate_metric), so a large common offset cancels
  * away the neighbor order. L2 distances are translation invariant, so the
  * exact neighbor sets of the centered copy equal those of the input.
  *
- * Only the graph input is centered. The stored vectors, HNSW serialization,
- * upper hierarchy levels and all search distances use the original rows.
+ * Only the graph input is centered. The stored vectors, HNSW serialization
+ * and all search distances use the original rows. With mode='hnsw', SDK
+ * patch 0005 centers each upper level's NN-descent input the same way.
  * IP and cosine are not translation invariant and are never centered. */
 static inline int cuvs_hnsw_nn_centers(uint32_t metric)
 {

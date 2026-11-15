@@ -1,4 +1,4 @@
-/* r87 B1: the daemon must never observe EOF on the owner lease while the
+/* The daemon must never observe EOF on the owner lease while the
  * backend is still waiting for the reply. On macOS, closing the backend's
  * copy of the in-flight owner socket right after SCM_RIGHTS send lets the
  * daemon's received copy read EOF (~0.2% of calls); Linux 6.8 did not.

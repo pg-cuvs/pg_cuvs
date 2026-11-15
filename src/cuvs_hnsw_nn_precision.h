@@ -17,19 +17,19 @@
 #define CUVS_HNSW_NN_PRECISION_INVALID (-1)       /* nonfinite, FP32 range, bad args */
 #define CUVS_HNSW_NN_PRECISION_CANCELLATION (-2)  /* L2 norm-expansion cancellation */
 
-/* L2 cancellation bound for UNCENTERED NN-descent input (r87 offset diagnosis,
+/* L2 cancellation bound for UNCENTERED NN-descent input (offset diagnosis,
  * commit 04615fea). The pinned SDK's NN-descent computes L2 as
  * ||a||^2 + ||b||^2 - 2*a.b in float32 on both the FP16 and FP32 paths
  * (nn_descent.cuh calculate_metric). Its rounding error scales with the
  * squared norm, while neighbor distances scale with the spread V (mean
- * squared distance to the column mean). On the frozen corpus rows plus a
+ * squared distance to the column mean). On 4096 rows of a 768-d embedding corpus plus a
  * common offset, the k=64 graph overlap with exact neighbors was
  * 0.9997/0.998/0.979/0.83/0.18/0.012 at offset 1/3/10/30/100/1000, i.e. mean
  * squared norm / V = 160/1440/15965/1.4e5/1.6e6/1.6e8; the bound is 4096.
- * Since decision B the product centers every L2 NN-descent input (base and
+ * The product now centers every L2 NN-descent input (base and
  * upper levels), so this refusal only applies to callers that pass
- * graph_input_centered=0; none in the product does. It is kept until the
- * GPU H1/H2/H6 results decide its fate (offset-r87/GUARD-ANALYSIS.md). */
+ * graph_input_centered=0; none in the product does. Whether it is removed
+ * or reused for IP/cosine is open (issue #209). */
 #define CUVS_HNSW_NN_L2_NORM_TO_SPREAD_MAX 4096.0
 
 typedef struct CuvsHnswNnPrecision {
@@ -94,7 +94,7 @@ cuvs_hnsw_nn_precision_ex(const float *data, uint64_t rows, uint32_t dim,
      * product from half-converted data (nn_descent.cuh preprocess_data_kernel
      * and the norm_a + norm_b - 2*dot epilogue). With a large common offset the
      * dot's rounding error exceeds the true distance differences and neighbors
-     * collapse even though every element fits half (nn-diff-review-r87 D2).
+     * collapse even though every element fits half (CPU emulation).
      * Use the same bound as cuvs_hnsw_ivfpq_needs_fp32: FP16 only when
      * 4*max_sq_norm (L2) or max_sq_norm (IP/cosine) stays below 65504. */
     double half_bound = metric == CUVS_METRIC_L2 ? 4.0 * max_norm : max_norm;

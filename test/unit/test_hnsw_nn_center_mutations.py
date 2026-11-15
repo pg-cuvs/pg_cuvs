@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Decision B guard mutants: each must make test_hnsw_nn_center.c fail, and the
+"""L2 graph-input centering guard mutants: each must make test_hnsw_nn_center.c fail, and the
 wrapper source contract must hold (centered copy only reaches cagra::build;
 both serializers receive the original `data`). CPU only."""
 from pathlib import Path

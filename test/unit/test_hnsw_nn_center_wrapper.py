@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""Execute the production wrapper's graph lambda and serializer block (decision B)
+"""Execute the production wrapper's graph lambda and serializer block (L2 graph-input centering)
 with CPU mocks of cuVS. Checks by running, not by text:
   - cagra::build receives the column-centered copy with the right shape (L2)
     and the original rows otherwise (IP);
   - a centering failure throws before any build;
   - the centered copy is freed when the lambda returns (global new/delete);
   - serialize_to_hnswlib / hnsw::from_cagra receive the ORIGINAL data pointer
-    and the original bytes are unchanged (H7 at the wrapper boundary).
+    and the original bytes are unchanged (stored vectors stay original at the wrapper boundary).
 Mutants are applied to the extracted wrapper text; a mutant whose anchor is
 missing is an error, not a kill."""
 from pathlib import Path
@@ -146,7 +146,7 @@ int main() {
             for (uint32_t j = 0; j < d; j++)
                 assert(std::fabs(built.values[i * d + j] - (rows[i * d + j] - (1000.0f + 25.0f + (float)j))) < 1e-3);
         assert(live->count((void *)built.ptr) == 0);
-        /* H7: serializers / upper levels get the original rows, unchanged */
+        /* serializers / upper levels get the original rows, unchanged */
         Seen &out = hier ? hierarchy : serialized;
         assert(out.calls == 1 && out.ptr == rows.data() && out.values == original);
         assert((hier ? serialized.calls : hierarchy.calls) == 0);
@@ -180,7 +180,7 @@ int main() {
         try { run_build(&p, bad.data(), false, false); } catch (const std::runtime_error &) { threw = true; }
         assert(threw && built.calls == 0);
     }
-    puts("wrapper graph lambda + serializers (decision B): PASS (CPU mock)");
+    puts("wrapper graph lambda + serializers (L2 centering): PASS (CPU mock)");
     return 0;
 }
 '''

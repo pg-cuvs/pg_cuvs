@@ -10,7 +10,7 @@ int main(void)
     CuvsHnswNnCapacity a, b;
     assert(cuvs_hnsw_nn_capacity(1000000, 768, 64, 128, 1, CUVS_HNSW_NN_FP16, &a) == 0);
     assert(cuvs_hnsw_nn_capacity(1000000, 768, 64, 128, 1, CUVS_HNSW_NN_FP32, &b) == 0);
-    /* 6548 before decision B + 4*768 for the centered NN-descent input copy */
+    /* 6548 without the copy + 4*768 for the centered NN-descent input copy */
     assert(a.build_host == UINT64_C(1000000) * (6548 + 4 * 768));
     assert(a.serialize_host == UINT64_C(1000000) * 22740);
     assert(a.sort_gpu == UINT64_C(1000000) * (4 * 768 + 4 * 128));
@@ -23,7 +23,7 @@ int main(void)
     assert(cuvs_hnsw_nn_capacity(INT32_MAX - 1, 768, 64, 128, 1, CUVS_HNSW_NN_FP32, &a) != 0);
     assert(cuvs_hnsw_nn_capacity(1000, 768, 64, 1025, 1, CUVS_HNSW_NN_FP32, &a) != 0);
     assert(cuvs_hnsw_nn_capacity(1000, 768, 64, 128, 1, 99, &a) != 0);
-    /* nn-diff-review-r87 D4: shape guards and hierarchy/dtype terms */
+    /* shape guards and hierarchy/dtype terms (each was a surviving mutant) */
     assert(cuvs_hnsw_nn_capacity(1000, 768, 64, 128, 2, CUVS_HNSW_NN_FP32, &a) != 0);
     assert(cuvs_hnsw_nn_capacity(1000, 65535, 64, 128, 0, CUVS_HNSW_NN_FP32, &a) == 0);
     assert(cuvs_hnsw_nn_capacity(1000, 65536, 64, 128, 0, CUVS_HNSW_NN_FP32, &a) != 0);
@@ -40,7 +40,7 @@ int main(void)
                == UINT64_C(1000000) * (2 * 768 * 4 + 8 * 32 + 916 + 2 * 96 + 4 * 32));
         assert(flat.build_host == tall.build_host && flat.build_gpu == tall.build_gpu);
     }
-    {   /* Decision B copy is reserved only for centered (L2) builds */
+    {   /* the centered copy is reserved only for centered (L2) builds */
         CuvsHnswNnCapacity l2, ip;
         assert(cuvs_hnsw_nn_capacity_ex(1000000, 768, 64, 128, 0, 1, CUVS_HNSW_NN_FP32, &l2) == 0);
         assert(cuvs_hnsw_nn_capacity_ex(1000000, 768, 64, 128, 0, 0, CUVS_HNSW_NN_FP32, &ip) == 0);

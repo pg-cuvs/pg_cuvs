@@ -36,7 +36,7 @@
     },
     {
       "path": "0005-hnsw-resident-nn-upper.patch",
-      "sha256": "3eb4959800693e760ba10f89c7f9c7a2261515549dacf2015443e7771196d393"
+      "sha256": "9fdaa065195e5234097c1083ffd5b984bb9ff79b10991bc4626649a9cd58b86b"
     },
     {
       "path": "0006-cagra-consumer-row-sort.patch",
@@ -58,10 +58,10 @@
     },
     "resident_nn_upper": {
       "symbol": "pgcuvs_hnsw_resident_nn_upper_patch_id",
-      "value": "pgcuvs-hnsw-resident-nn-upper-v3@dd5cb9847eb0ee78d5b0cc6e543f3a3ba80ee5942871b8baf568e0df040931d2",
+      "value": "pgcuvs-hnsw-resident-nn-upper-v3@e2bcd729e91b2c332dddd3981460469e45d43cc946fe5b2e93d5e49253d24276",
       "content_digest": {
         "algorithm": "sha256 over concatenated post-0005 bytes",
-        "value": "dd5cb9847eb0ee78d5b0cc6e543f3a3ba80ee5942871b8baf568e0df040931d2",
+        "value": "e2bcd729e91b2c332dddd3981460469e45d43cc946fe5b2e93d5e49253d24276",
         "files": [
           "cpp/src/neighbors/detail/hnsw.hpp",
           "cpp/src/neighbors/detail/hnsw_precision.hpp",
@@ -74,13 +74,13 @@
     "cpp/src/neighbors/detail/hnsw.hpp": {
       "base_sha256": "6c8530e39c6ed5fa4eb3fe7b9c6c24022842147c41814fc4c130fdb5a6b8fd0b",
       "patch1_sha256": "49adab846921272a2aaf28f3c5749fb85925fbfde8ca43cd0af61e51adcbba99",
-      "final_sha256": "1cbf108599373d7af791bd28b6174f408deb32562584389c243a809818791f7a",
+      "final_sha256": "2e5cf0c56439d35cdc01e52399d7b9e3294b1d22d6e6910207b3ba5d23bb59f3",
       "patch3_sha256": "88192b1da4cb50a2de5a0f374854c1d0659734215136f86d7e53e52c0a1dc911",
       "patch4_sha256": "1378471e577268a0abbb5e575a4eeba5a45734f52e7aa35017545e28099d00ca"
     },
     "cpp/src/neighbors/hnsw.cpp": {
       "base_sha256": "59c7874565b049eed090e7423df638eb18e4551ccd1cd4b65f1197dc4a4a7102",
-      "final_sha256": "4d992e9a475123a9ef243ebdcbd30050f297a964b5621ab1ef83799da0e435e9",
+      "final_sha256": "a6db9925d46c87228fae87091df31010c44f564e112a706c96804c525887dea4",
       "patch3_sha256": "fcbe6c5c40d35854a6deb6a3182c70dca8e5b53e83bb79c11a2efcb4b1a4a39e",
       "patch4_sha256": "dce2bbaa933c6f046f561e35c6da5fb33c56ac37930cad5285123460e0b64069"
     },
@@ -161,7 +161,7 @@
       "target": "RAFT cpp/include/raft/matrix/detail/select_k-inl.cuh (CPM raft source of the cuVS build)",
       "base_sha256": "3d6959c06710d420ceaf9236793a0eb91b2b587ba879a5c59ee79c76ee23abec",
       "final_sha256": "64a54cbaf855b2c3a333ad380ad85ceac41d222b6a557af6c1f490dacf5cf908",
-      "provenance": "SDK-B3-FINAL raft-key-bitwidth.patch; A2/B2/B3 build dependency"
+      "provenance": "build dependency of the SDK the product was measured with (patch 0006 builds)"
     }
   }
 }

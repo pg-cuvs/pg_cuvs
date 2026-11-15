@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Check B3 source branch binding; this is static, not native execution."""
+"""Check the patched SDK source branch binding; this is static, not native execution."""
 import argparse
 import json
 from pathlib import Path

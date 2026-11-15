@@ -5,7 +5,7 @@
 #
 # cuVS 26.04 resolves RAFT through rapids-cmake/CPM, which prefers an installed
 # package ("CPM: Using local package raft@26.04.0") over a source download. The
-# B3/A2 SDK was built against such an installed RAFT with
+# SDK the product was measured with was built against such an installed RAFT with
 # raft/0001-raft-select-k-key-bitwidth.patch applied to a private copy. This
 # script reproduces that: it never edits the shared environment.
 #

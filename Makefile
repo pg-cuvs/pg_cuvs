@@ -351,10 +351,10 @@ test-hnsw-explicit-route: test/unit/test_hnsw_explicit_route.c src/cuvs_hnsw_bui
 # SDK side of build_algo=nn_descent (infra/cuvs-patches 0005). Needs a cuVS clone
 # containing 60b19a0f; the patched tree is rebuilt from tracked patches each run.
 #   make test-hnsw-nn-sdk CUVS_UPSTREAM_GIT=/path/to/cuvs
-# B3 graph-consumer planner checks on the same rebuilt tree (0006 is the B3
-# change); CUVS_B3_SDK_SRC=<b3 cpp/src> optionally byte-compares an external copy.
-#   make test-hnsw-b3-sdk CUVS_UPSTREAM_GIT=...
-.PHONY: test-hnsw-nn-sdk test-hnsw-b3-sdk
+# Graph-consumer row-sort (patch 0006) planner checks on the same rebuilt tree;
+# CUVS_ROW_SORT_SDK_SRC=<cpp/src of another 0006 build> optionally byte-compares it.
+#   make test-hnsw-row-sort-sdk CUVS_UPSTREAM_GIT=...
+.PHONY: test-hnsw-nn-sdk test-hnsw-row-sort-sdk
 test-hnsw-nn-sdk:
 	@test -n "$(CUVS_UPSTREAM_GIT)" || { echo "set CUVS_UPSTREAM_GIT to a cuVS clone containing 60b19a0f" >&2; exit 2; }
 	set -e; t=$$(mktemp -d); trap 'rm -rf "$$t"' EXIT; \
@@ -368,20 +368,20 @@ test-hnsw-nn-sdk:
 	python3 -I test/native/hnsw-sdk/test_nn_upper_legacy_forwarder.py --source "$$t/cuvs/cpp/src"; \
 	python3 -I test/native/hnsw-sdk/test_nn_upper_legacy_forwarder.py --source "$$t/cuvs/cpp/src" --mutant
 
-test-hnsw-b3-sdk:
+test-hnsw-row-sort-sdk:
 	@test -n "$(CUVS_UPSTREAM_GIT)" || { echo "set CUVS_UPSTREAM_GIT to a cuVS clone containing 60b19a0f" >&2; exit 2; }
 	set -e; t=$$(mktemp -d); trap 'rm -rf "$$t"' EXIT; \
 	scripts/prepare-patched-cuvs-source.sh '$(CUVS_UPSTREAM_GIT)' "$$t/cuvs"; \
 	git -C "$$t/cuvs" show level-0005:cpp/src/neighbors/detail/cagra/cagra_build.cuh > "$$t/canonical-cagra_build.cuh"; \
 	c="$$t/canonical-cagra_build.cuh"; b="$$t/cuvs/cpp/src"; \
 	python3 -I scripts/verify-hnsw-sdk-plan.py --source "$$b"; \
-	python3 -I -B test/unit/test_hnsw_sdk_plan_verifier.py --canonical-header "$$c" --b3-src "$$b"; \
-	python3 -I -B test/unit/test_hnsw_sdk_plan_mutations.py --canonical-header "$$c" --b3-src "$$b"; \
-	python3 -I test/unit/test_hnsw_b3_planner_equivalence.py --canonical-header "$$c" --b3-src "$$b"; \
-	if [ -n '$(CUVS_B3_SDK_SRC)' ]; then \
+	python3 -I -B test/unit/test_hnsw_sdk_plan_verifier.py --canonical-header "$$c" --row-sort-src "$$b"; \
+	python3 -I -B test/unit/test_hnsw_sdk_plan_mutations.py --canonical-header "$$c" --row-sort-src "$$b"; \
+	python3 -I test/unit/test_hnsw_row_sort_planner_equivalence.py --canonical-header "$$c" --row-sort-src "$$b"; \
+	if [ -n '$(CUVS_ROW_SORT_SDK_SRC)' ]; then \
 	  for f in neighbors/detail/cagra/cagra_build.cuh neighbors/detail/cagra/consumer_row_sort_plan.hpp; do \
-	    cmp "$$b/$$f" '$(CUVS_B3_SDK_SRC)'/"$$f"; done; \
-	  echo "external B3 source matches 0006 for the planner/consumer files"; \
+	    cmp "$$b/$$f" '$(CUVS_ROW_SORT_SDK_SRC)'/"$$f"; done; \
+	  echo "external source matches 0006 for the planner/consumer files"; \
 	fi
 
 .PHONY: test-hnsw-nn-precision test-hnsw-nn-policy test-hnsw-nn-capacity test-hnsw-nn-route test-hnsw-nn-sdk-params test-hnsw-nn-consumer test-hnsw-nn-upper-receipt
@@ -412,7 +412,7 @@ test-hnsw-nn-upper-receipt: test/unit/test_hnsw_nn_upper_receipt.py test/unit/te
 	python3 -I -B test/unit/test_hnsw_nn_upper_receipt.py
 	python3 -I -B test/unit/test_hnsw_nn_upper_receipt_mutation.py
 
-# Decision B: NN-descent L2 graph input centering (offset-r87/DECISION-B-CENTERING.md).
+# NN-descent L2 graph-input centering (docs/hnsw-build-options.md, nn_descent).
 .PHONY: test-hnsw-nn-center
 test-hnsw-nn-center: test/unit/test_hnsw_nn_center.c test/unit/test_hnsw_nn_center_wrapper.py src/cuvs_hnsw_nn_center.h src/cuvs_hnsw_nn_precision.h src/cuvs_wrapper.cu
 	$(CC) -std=gnu11 -O2 -Wall -Wextra -Werror -I src -o $@ test/unit/test_hnsw_nn_center.c -lm
@@ -422,7 +422,7 @@ test-hnsw-nn-center: test/unit/test_hnsw_nn_center.c test/unit/test_hnsw_nn_cent
 EXTRA_CLEAN += test-hnsw-nn-policy test-hnsw-nn-precision test-hnsw-nn-capacity test-hnsw-nn-route test-hnsw-nn-sdk-params test-hnsw-nn-center
 
 # NN guard mutants (each script compiles mutated copies in a temp dir and
-# requires the matching unit test to fail; r87 D4 wired these into test-unit).
+# requires the matching unit test to fail; part of test-unit).
 .PHONY: test-hnsw-nn-mutations
 test-hnsw-nn-mutations:
 	ulimit -c 0; python3 -I -B test/unit/test_hnsw_nn_policy_mutations.py

@@ -13,7 +13,7 @@ static CuvsHnswPolicy nn_policy(void)
     return p;
 }
 
-/* nn-diff-review-r87 D4: v3 field checks that previously survived mutation. */
+/* v3 field checks; each assertion kills a mutant that survived before. */
 static void test_v3_fields(void)
 {
     CuvsHnswPolicy p = nn_policy();

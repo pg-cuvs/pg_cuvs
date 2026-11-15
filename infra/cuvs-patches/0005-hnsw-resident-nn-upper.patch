@@ -14,7 +14,7 @@ index 0000000..94a0b59
 +#define PGC_UVS_NN_UPPER_FP32 (SIZE_MAX - 1)
 +#endif
 diff --git a/cpp/src/neighbors/detail/hnsw.hpp b/cpp/src/neighbors/detail/hnsw.hpp
-index cdcf166..443f9f8 100644
+index cdcf166..11cd22a 100644
 --- a/cpp/src/neighbors/detail/hnsw.hpp
 +++ b/cpp/src/neighbors/detail/hnsw.hpp
 @@ -9,6 +9,7 @@
@@ -71,7 +71,7 @@ index cdcf166..443f9f8 100644
 +      if (resident_fp32) gpu_workspace = checked_add(gpu_workspace,
 +        checked_mul(checked_mul(rows, dim), sizeof(float)));
 +    }
-+    // pg_cuvs decision B: resident NN + L2 upper levels use a centered copy of this
++    // pg_cuvs L2 centering: resident NN + L2 upper levels use a centered copy of this
 +    // level's query set as the NN-descent input (see upper_precision::center_columns).
 +    bool center_upper = false;
 +    if constexpr (std::is_same_v<T, float>) {
@@ -122,7 +122,7 @@ index cdcf166..443f9f8 100644
    }
  }
  
-+/* Preserve the original B3 six-argument ABI for existing consumers. */
++/* Preserve the original six-argument ABI for existing consumers. */
 +template <typename T>
 +__attribute__((noinline, used)) void all_neighbors_graph(
 +  raft::resources const& res,
@@ -222,7 +222,7 @@ index 6274afc..844185d 100644
 +
  }  // namespace cuvs::neighbors::hnsw::detail::upper_precision
 diff --git a/cpp/src/neighbors/hnsw.cpp b/cpp/src/neighbors/hnsw.cpp
-index b2da14d..054b0ff 100644
+index b2da14d..1781ab2 100644
 --- a/cpp/src/neighbors/hnsw.cpp
 +++ b/cpp/src/neighbors/hnsw.cpp
 @@ -128,3 +128,9 @@ pgcuvs_hnsw_upper_precision_patch_id()
@@ -233,5 +233,5 @@ index b2da14d..054b0ff 100644
 +extern "C" __attribute__((visibility("default"))) const char*
 +pgcuvs_hnsw_resident_nn_upper_patch_id()
 +{
-+  return "pgcuvs-hnsw-resident-nn-upper-v3@dd5cb9847eb0ee78d5b0cc6e543f3a3ba80ee5942871b8baf568e0df040931d2";
++  return "pgcuvs-hnsw-resident-nn-upper-v3@e2bcd729e91b2c332dddd3981460469e45d43cc946fe5b2e93d5e49253d24276";
 +}

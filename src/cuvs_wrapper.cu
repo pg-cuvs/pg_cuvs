@@ -2966,7 +2966,7 @@ static int execute_hnsw_file_build(const CuvsHnswFileBuild *params, int owner_fd
             if (!tiny && prepared.route.route == CUVS_HNSW_ROUTE_NN_DESCENT
                 && cuvs_hnsw_nn_centers(params->metric))
             {
-                /* Decision B: only the NN-descent graph input is centered; the
+                /* Only the NN-descent graph input is centered; the
                  * returned index's attached dataset is never serialized (both
                  * serializers below receive the original `data`). The copy is
                  * freed when this scope returns, before serialization. */
@@ -3121,7 +3121,7 @@ cuvs_hnsw_build_file(int vectors_fd, int owner_fd,
         }
         if (params->hierarchy && params->build_algo == CUVS_HNSW_ALGO_NN_DESCENT
             && !hnsw_sdk_marker_verified("pgcuvs_hnsw_resident_nn_upper_patch_id",
-                "pgcuvs-hnsw-resident-nn-upper-v3@dd5cb9847eb0ee78d5b0cc6e543f3a3ba80ee5942871b8baf568e0df040931d2"))
+                "pgcuvs-hnsw-resident-nn-upper-v3@e2bcd729e91b2c332dddd3981460469e45d43cc946fe5b2e93d5e49253d24276"))
         {
             snprintf(error, error_len, "resident NN hierarchy requires the matching SDK upper precision guard");
             return CUVS_STATUS_BUILD_FAILED;
@@ -3218,7 +3218,7 @@ cuvs_hnsw_build_file(int vectors_fd, int owner_fd,
             /* L2 graph input is centered (base and, via patch 0005, upper levels),
              * so the uncentered cancellation refusal cannot fire here; IP/cosine
              * are outside that check. Whether a refusal returns for any case is
-             * decided after GPU H1/H2/H6 (offset-r87/GUARD-ANALYSIS.md). */
+             * open (issue #209). */
             if (cuvs_hnsw_nn_precision_ex(static_cast<const float *>(files.mapping),
                     params->n_vecs, params->dim, params->metric, cuvs_hnsw_nn_centers(params->metric),
                     &prepared.nn_precision))

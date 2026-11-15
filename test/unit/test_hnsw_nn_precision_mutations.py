@@ -7,7 +7,7 @@ import tempfile
 root = Path(__file__).resolve().parents[2]
 header = (root / 'src/cuvs_hnsw_nn_precision.h').read_text()
 test = root / 'test/unit/test_hnsw_nn_precision.c'
-# Since r87 D2 the norm bound implies the element bound (|x| > 65504 gives
+# Since the FP16 norm bound was added, it implies the element bound (|x| > 65504 gives
 # 4*norm >= 65504), so removing only 'max_abs > 65504.0' is an equivalent
 # mutant. Remove the whole half-safety condition, and the bound alone.
 mutations = {
@@ -15,7 +15,7 @@ mutations = {
     'norm cancellation bound': ('|| !(half_bound < 65504.0)', '|| (half_bound < 0.0)'),
     'small dimension': ('dim <= 16 || ', ''),
     'distance overflow': ('(double)FLT_MAX / (metric == CUVS_METRIC_L2 ? 8.0 : 2.0)', '(double)INFINITY'),
-    # r87 offset guard: L2 norm-expansion cancellation must refuse
+    # offset guard: L2 norm-expansion cancellation must refuse
     'cancellation guard': ('        return CUVS_HNSW_NN_PRECISION_CANCELLATION;', '        return 0;'),
     'cancellation threshold': ('#define CUVS_HNSW_NN_L2_NORM_TO_SPREAD_MAX 4096.0', '#define CUVS_HNSW_NN_L2_NORM_TO_SPREAD_MAX 1e12'),
 }

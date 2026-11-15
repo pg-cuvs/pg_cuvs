@@ -9,17 +9,17 @@ readonly EXPECTED_PATCH1_SHA="2f5adf6d3cce3c9d60335e40992250e5044f0ed494c8f5cff6
 readonly EXPECTED_PATCH2_SHA="d52ddd22a0e558849d75ec3ddfba4b52fcc200ed6869568593245289f9f963f8"
 readonly EXPECTED_PATCH3_SHA="34831f221f32337c025afeb33a32d7aa304e703bd0e3ee85f0ff93902a9a130f"
 readonly EXPECTED_PATCH4_SHA="8777280bc918cc26e8bca0bbf38021e1e901ccda8510e543738b9a53ff631fdd"
-readonly EXPECTED_PATCH5_SHA="3eb4959800693e760ba10f89c7f9c7a2261515549dacf2015443e7771196d393"
+readonly EXPECTED_PATCH5_SHA="9fdaa065195e5234097c1083ffd5b984bb9ff79b10991bc4626649a9cd58b86b"
 readonly EXPECTED_PATCH6_SHA="3acd107a74bd0fc29ee72e2e206558f86d4bc374e506775af60496b87ae48fa4"
 readonly EXPECTED_RAFT_PATCH_SHA="a2d153ccc4a6b3d61bf4c9bbadf6c98f8e104a85352312d2588b90899c58058c"
-readonly EXPECTED_PATCHSET_MANIFEST_SHA="4bfdbfdbd1032002bab989ab4f4bfc7e4add75eeca8e4ff21c20b770d5c5a988"
+readonly EXPECTED_PATCHSET_MANIFEST_SHA="fd103677d43656cc20178670786edb109c797a81ee9635f59d774107547b7e2c"
 readonly EXPECTED_BASE_HNSW_HPP_SHA="6c8530e39c6ed5fa4eb3fe7b9c6c24022842147c41814fc4c130fdb5a6b8fd0b"
 readonly EXPECTED_PATCH1_HNSW_HPP_SHA="49adab846921272a2aaf28f3c5749fb85925fbfde8ca43cd0af61e51adcbba99"
 readonly EXPECTED_PATCH3_HNSW_HPP_SHA="88192b1da4cb50a2de5a0f374854c1d0659734215136f86d7e53e52c0a1dc911"
 readonly EXPECTED_PATCH4_HNSW_HPP_SHA="1378471e577268a0abbb5e575a4eeba5a45734f52e7aa35017545e28099d00ca"
-readonly EXPECTED_FINAL_HNSW_HPP_SHA="1cbf108599373d7af791bd28b6174f408deb32562584389c243a809818791f7a"
+readonly EXPECTED_FINAL_HNSW_HPP_SHA="2e5cf0c56439d35cdc01e52399d7b9e3294b1d22d6e6910207b3ba5d23bb59f3"
 readonly EXPECTED_PATCH4_HNSW_CPP_SHA="dce2bbaa933c6f046f561e35c6da5fb33c56ac37930cad5285123460e0b64069"
-readonly EXPECTED_FINAL_HNSW_CPP_SHA="4d992e9a475123a9ef243ebdcbd30050f297a964b5621ab1ef83799da0e435e9"
+readonly EXPECTED_FINAL_HNSW_CPP_SHA="a6db9925d46c87228fae87091df31010c44f564e112a706c96804c525887dea4"
 readonly EXPECTED_PRECISION_HEADER_SHA="c051c5bfe6c5b1031c61806ab7d0a8804741724011b41b33bb63eac9cb72dc69"
 readonly EXPECTED_FINAL_PRECISION_HEADER_SHA="1ad79816c9057c7289213799e3c5ed71d53c4299e85bdad4bfd58dd7ccf37072"
 readonly EXPECTED_NN_CONTRACT_SHA="6db8ffea2fb73695ab107e95135e37d04599c03013cdcc6a3bbe614382758e42"
@@ -40,7 +40,7 @@ readonly EXPECTED_GUARD_MARKER="pgcuvs-hnsw-memory-guard-v2@60b19a0f62ba0bd716de
 
 readonly EXPECTED_PRECISION_MARKER="pgcuvs-hnsw-upper-precision-v1@60b19a0f62ba0bd716de349382828e43be6e2daa"
 # 0005 marker suffix = sha256(hnsw.hpp || hnsw_precision.hpp || cuvs_hnsw_nn_upper_contract.h) after 0005.
-readonly EXPECTED_NN_UPPER_MARKER="pgcuvs-hnsw-resident-nn-upper-v3@dd5cb9847eb0ee78d5b0cc6e543f3a3ba80ee5942871b8baf568e0df040931d2"
+readonly EXPECTED_NN_UPPER_MARKER="pgcuvs-hnsw-resident-nn-upper-v3@e2bcd729e91b2c332dddd3981460469e45d43cc946fe5b2e93d5e49253d24276"
 
 readonly SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 readonly REPO_ROOT="$(cd -- "${SCRIPT_DIR}/../.." && pwd)"
@@ -711,7 +711,7 @@ mkdir -p "${INSTALL_PREFIX}" "$BUILD_DIR" "${RUN_ROOT}/build" \
   "$DISK_PILOT_ARTIFACT_DIR" "$GUARD_PILOT_ARTIFACT_DIR"
 
 readonly PARALLEL_JOBS="${PARALLEL_LEVEL:-$(getconf _NPROCESSORS_ONLN)}"
-# MG ON matches the A2/B3/r3 SDK objects (their hnsw TU argv has -DCUVS_BUILD_MG_ALGOS).
+# MG ON matches the SDK objects the product was measured with (their compile lines carry -DCUVS_BUILD_MG_ALGOS).
 readonly BUILD_CMAKE_ARGS='-DBUILD_TESTS=OFF -DBUILD_C_TESTS=OFF -DBUILD_C_LIBRARY=OFF -DBUILD_MG_ALGOS=ON -DBUILD_CUVS_BENCH=OFF -DBUILD_CAGRA_HNSWLIB=ON -DBUILD_SHARED_LIBS=ON -DCUVS_COMPILE_DYNAMIC_ONLY=ON -DCUVS_NVTX=OFF'
 
 echo "source=$SOURCE_ROOT"
@@ -758,9 +758,9 @@ echo "sdk_build_dir=$LIBCUVS_BUILD_DIR"
 echo "native_run_root=$RUN_ROOT"
 
 # RAFT: rapids-cmake/CPM prefers an installed package over a download (the
-# r87c cold run logged "CPM: Using local package raft@26.04.0" and left
+# cold run of this recipe logged "CPM: Using local package raft@26.04.0" and left
 # CPM_PACKAGE_raft_SOURCE_DIR empty). Patch a private copy of that package and
-# pin raft_DIR to it, as the A2/B3 build did. Only when no installed RAFT exists
+# pin raft_DIR to it, as the measured SDK build did. Only when no installed RAFT exists
 # does the CPM source path below get patched instead.
 set +e
 RAFT_DIR_PRIVATE="$(bash "${SCRIPT_DIR}/prepare-raft-prefix.sh" "${BUILD_DIR}/pgcuvs-raft-prefix" "${DEPENDENCY_PREFIXES[@]}")"
