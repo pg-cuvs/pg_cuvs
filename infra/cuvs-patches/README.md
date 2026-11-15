@@ -13,6 +13,7 @@ The upstream is [`rapidsai/cuvs`](https://github.com/rapidsai/cuvs), tag `v26.04
 | `0003-hnsw-memory-guards.patch` | `34831f221f32337c025afeb33a32d7aa304e703bd0e3ee85f0ff93902a9a130f` | Propagates ACE metric parameters and checks allocation peaks across ACE sub-builders and disk serialization; exports the memory-guard runtime marker. |
 | `0004-hnsw-upper-precision.patch` | `8777280bc918cc26e8bca0bbf38021e1e901ccda8510e543738b9a53ff631fdd` | Applies the product norm policy to upper IVF-PQ and restores typed memory gather sources; exports the upper-precision marker. |
 | `0006-cagra-consumer-row-sort.patch` | `3acd107a74bd0fc29ee72e2e206558f86d4bc374e506775af60496b87ae48fa4` | B3 graph consumer: sorts the no-refine CAGRA IVF kNN result rows (score, ID) before the writer/prune consume positions as ranks, with row-chunked CUB temp allocation. See `0006-cagra-consumer-row-sort.md`. |
+| `0007-cagra-prune-rank-index.patch` | `dae5a4fa072bbfeb3676d4d83677913bd922445aca41026815b0028d2685fe6d` | CAGRA prune: replaces the rank scan of `kern_prune` by a binary search on a sorted (ID, rank) shared-memory index at row degree 256 with 32-bit IDs; same output, device trap guard, shared row helpers. Not measured on a GPU in this form. See `0007-cagra-prune-rank-index.md`. |
 
 Patch number 0005 is reserved for the resident NN-descent upper-level patch, which is not part of this patch set. 0006 changes different files (`cagra_build.cuh` and a new header), so it applies after 0001 through 0004 with the same result as it does after 0005, and the recipe accepts the state 0001+0002+0003+0004+0006.
 
@@ -20,7 +21,7 @@ Patches 0001 and 0002 alone do not advertise memory-guard support. Only a librar
 
 RAFT dependency patch `raft/0001-raft-select-k-key-bitwidth.patch` (SHA-256 `a2d153ccc4a6b3d61bf4c9bbadf6c98f8e104a85352312d2588b90899c58058c`) makes RAFT `select_k` radix sorts use the key bit width (`sizeof(KeyT) * 8`) instead of the value's. After configure, the recipe patches the CPM RAFT source header `cpp/include/raft/matrix/detail/select_k-inl.cuh` from `3d6959c06710d420ceaf9236793a0eb91b2b587ba879a5c59ee79c76ee23abec` to `64a54cbaf855b2c3a333ad380ad85ceac41d222b6a557af6c1f490dacf5cf908` and stops on any other header.
 
-The hashes below bind the clean source and the complete ordered patch set. `hnsw.hpp` includes 0001, 0003, and 0004; `cagra_build.cuh` includes 0003 and 0006. Patch 0006 exports no runtime marker, so its identity is bound by the patch hash and these source hashes. The historical composition receipt in the manifest covers only the first three patches.
+The hashes below bind the clean source and the complete ordered patch set. `hnsw.hpp` includes 0001, 0003, and 0004; `cagra_build.cuh` includes 0003 and 0006, and `graph_core.cuh` is changed only by 0007. Patches 0006 and 0007 export no runtime marker, so its identity is bound by the patch hash and these source hashes. The historical composition receipt in the manifest covers only the first three patches.
 
 | Source path | Clean base SHA-256 | Complete patch-set SHA-256 |
 | --- | --- | --- |
@@ -31,6 +32,7 @@ The hashes below bind the clean source and the complete ordered patch set. `hnsw
 | `cpp/src/neighbors/detail/cagra/ace_memory_guard.hpp` | absent | `dc2ccb2d6920bf81d55e614181e3ceff8e7e0394eae56d0506fbb302190cf555` |
 | `cpp/src/neighbors/detail/hnsw_precision.hpp` | absent | `c051c5bfe6c5b1031c61806ab7d0a8804741724011b41b33bb63eac9cb72dc69` |
 | `cpp/src/neighbors/detail/cagra/consumer_row_sort_plan.hpp` | absent | `07b7b724fce554cec74ee1cb779e24ced31867981f33e6afda4f2c17d98cac49` |
+| `cpp/src/neighbors/detail/cagra/graph_core.cuh` | `c77ad7878831d73a9dd637bb1e35b6450a6e4588312149b48580816b08cbb0d9` | `8b2fb100d45f7168bb20a343a3fccb368a2b476da6a52ba1e505eac2a2f77baa` |
 
 ## Build environment
 
@@ -56,7 +58,7 @@ infra/cuvs-patches/build-patched-cuvs.sh \
 
 To choose a CUDA host compiler explicitly, export `CUDAHOSTCXX=/absolute/path/to/g++` before running the recipe. For a reused cache this is an identity check against the cached CUDA host; for a cold build it selects the host compiler used for both SDK and pilot configuration.
 
-The install prefix must be empty, outside the active Conda environment, and separate from the source and build trees. The recipe never installs into Conda. It accepts only these source states: clean base, 0001 applied, 0001+0002 applied, 0001+0002+0003 applied, all four applied, or all four followed by 0006. After each patch it checks exact source-file hashes and allowed Git paths. It rejects partial 0003, 0004 or 0006 application and unrelated staged, unstaged, untracked, or ignored source changes. The root license hash and the `BUILD_CAGRA_HNSWLIB=ON` setting are checked before the build is accepted.
+The install prefix must be empty, outside the active Conda environment, and separate from the source and build trees. The recipe never installs into Conda. It accepts only these source states: clean base, 0001 applied, 0001+0002 applied, 0001+0002+0003 applied, all four applied, all four followed by 0006, or all four followed by 0006 and 0007. After each patch it checks exact source-file hashes and allowed Git paths. It rejects partial 0003, 0004, 0006 or 0007 application and unrelated staged, unstaged, untracked, or ignored source changes. The root license hash and the `BUILD_CAGRA_HNSWLIB=ON` setting are checked before the build is accepted.
 
 An existing build cache is reusable only when it has the pinned cuVS source, Ninja generator, same C/C++/CUDA compilers, a valid cached `CMAKE_CUDA_HOST_COMPILER`, CUDA architecture, CCCL 3.3.0, and supported build options. The CUDA host compiler is preserved independently from CXX. If `CUDAHOSTCXX` is set for a reused cache, its canonical executable path must match the cached CUDA host; if unset, the cached host is used without inferring it from CXX. A reused cache without a CUDA host compiler is rejected. A cold build uses `CUDAHOSTCXX` when set and otherwise declares CXX as its CUDA host compiler. The chosen host is passed to the SDK and both pilots; after configure/build, each SDK/pilot CMake cache is checked for the same canonical host path. The recipe records CXX and CUDA host separately in stdout and `sdk-provenance.txt`.
 
@@ -123,3 +125,7 @@ These CPU tests execute the actual dispatch body, norm helper and memory guard w
 With refinement disabled (`top_k == gpu_top_k`), the CAGRA kNN-graph builder takes the public IVF-PQ search output as it is and later treats each position in a row as the neighbor's rank. That select does not sort its output, and its returned order differs between the warp-select path (K up to 256) and the radix path (K above 256), so a build with intermediate degree 256 (K = 257) consumed unordered rows as ranked ones. Patch 0006 sorts each row's `(float score, int64 id)` pairs with `cub::DeviceSegmentedRadixSort` into the existing refined-output buffers and makes the async host copy read them. The public IVF-PQ parameters and the existing I/O and large-memory policies are unchanged; scratch comes from the normal workspace only, and a workspace that cannot hold one row raises an explicit RMM error with no retry.
 
 Because `cagra_build.cuh` changes, the planner source verifier (`scripts/verify-hnsw-sdk-plan.py`) accepts either the post-0003 planner file (`patch3_sha256`) or the post-0006 file together with the pinned `ace_memory_guard.hpp` and `consumer_row_sort_plan.hpp`. See [0006 evidence](0006-cagra-consumer-row-sort.md). The CPU test of the 0004 section above also checks that the patch, source, recipe and README hashes agree for the complete state.
+
+## CAGRA prune rank index (0007)
+
+Patch 0007 replaces the O(row degree) rank scan inside `kern_prune` by a binary search on a sorted (ID, rank) key array in shared memory when the graph degree is 256 and the IDs are 32-bit, with a device trap if the kernel is ever launched for another degree. All other degrees and ID types keep the original kernel. It changes only `graph_core.cuh`, which no other patch touches, so it composes with the others in any order; the recipe applies it after 0006. See [0007 evidence](0007-cagra-prune-rank-index.md) for the checks that were run on a CPU and the GPU checks that were not.

@@ -37,6 +37,10 @@
     {
       "path": "0006-cagra-consumer-row-sort.patch",
       "sha256": "3acd107a74bd0fc29ee72e2e206558f86d4bc374e506775af60496b87ae48fa4"
+    },
+    {
+      "path": "0007-cagra-prune-rank-index.patch",
+      "sha256": "dae5a4fa072bbfeb3676d4d83677913bd922445aca41026815b0028d2685fe6d"
     }
   ],
   "runtime_markers": {
@@ -85,6 +89,10 @@
     "cpp/src/neighbors/detail/cagra/consumer_row_sort_plan.hpp": {
       "base_sha256": null,
       "final_sha256": "07b7b724fce554cec74ee1cb779e24ced31867981f33e6afda4f2c17d98cac49"
+    },
+    "cpp/src/neighbors/detail/cagra/graph_core.cuh": {
+      "base_sha256": "c77ad7878831d73a9dd637bb1e35b6450a6e4588312149b48580816b08cbb0d9",
+      "final_sha256": "8b2fb100d45f7168bb20a343a3fccb368a2b476da6a52ba1e505eac2a2f77baa"
     }
   },
   "source_prefix_states": {
@@ -118,6 +126,16 @@
       "cpp/src/neighbors/detail/cagra/ace_memory_guard.hpp",
       "cpp/src/neighbors/detail/hnsw_precision.hpp",
       "cpp/src/neighbors/detail/cagra/consumer_row_sort_plan.hpp"
+    ],
+    "0001+0002+0003+0004+0006+0007": [
+      "cpp/src/neighbors/detail/hnsw.hpp",
+      "cpp/src/neighbors/hnsw.cpp",
+      "cpp/src/neighbors/cagra.cpp",
+      "cpp/src/neighbors/detail/cagra/cagra_build.cuh",
+      "cpp/src/neighbors/detail/cagra/ace_memory_guard.hpp",
+      "cpp/src/neighbors/detail/hnsw_precision.hpp",
+      "cpp/src/neighbors/detail/cagra/consumer_row_sort_plan.hpp",
+      "cpp/src/neighbors/detail/cagra/graph_core.cuh"
     ]
   },
   "dependency_patches": {
