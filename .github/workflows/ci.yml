@@ -250,6 +250,16 @@ jobs:
           export PGOPTIONS="${PGOPTIONS:+$PGOPTIONS }-c cuvs.socket_path=$stale_test_dir/socket -c cuvs.index_dir=$stale_test_dir/indexes"
           make test-stale-interim || { cat "$stale_test_dir/daemon.log"; exit 1; }
 
+      - name: K3 HNSW input digest (live backend, fake daemon)
+        env:
+          PGDATABASE: postgres
+          PGCUVS_SERVER_LOG: /var/log/postgresql/postgresql-16-main.log
+        shell: bash
+        if: ${{ !cancelled() && steps.shim-setup.outcome == 'success' }}
+        run: |
+          export PATH=/usr/lib/postgresql/16/bin:$PATH
+          make test-k3-digest
+
 # ── Tier 2 (real A100 regression) lives in .github/workflows/gpu.yml ───────
 # Run on demand from the Actions UI ("Run workflow"); a hosted runner starts the
 # GPU VM (keyless WIF auth), a self-hosted runner on the VM runs the real
