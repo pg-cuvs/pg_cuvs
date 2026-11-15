@@ -246,6 +246,15 @@ in `pg_stat_gpu_fallback`; daemon replies are recorded in `pg_stat_gpu_search`.
 - **Interruptibility (Phase 3S):** the backend's reply wait is a `poll()` loop with a wait
   callback, so `statement_timeout` / query-cancel break a long GPU search (~sub-second) instead
   of blocking indefinitely. The daemon ignores `SIGPIPE` to survive mid-reply client disconnect.
+- **Connect (#224):** each request opens its own connection. A `connect()` that waits for
+  room in the daemon's listen backlog waits in 250 ms slices and is retried after a signal
+  or an expired slice, within the call's timeout (30 s for SEARCH). The wait callback is
+  checked after every failed attempt, so a pending cancel ends the wait within one slice;
+  `cuvs_ipc_search` (CAGRA and flat scans) then returns CANCELED, the other calls their
+  connect-failure status. The daemon listens with a backlog of `PG_CUVS_LISTEN_BACKLOG`
+  (1024) because a micro-batch releases all its waiters at once; the kernel caps it at
+  `net.core.somaxconn`, and the daemon logs a WARN at startup when that cap is below one
+  batch (`CUVS_BATCH_MAX`).
 
 ---
 

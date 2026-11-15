@@ -247,7 +247,7 @@ cuvs_report_proto_mismatch(int rc)
     ereport(ERROR,
             (errcode(ERRCODE_PROTOCOL_VIOLATION),
              errmsg("pg_cuvs: IPC protocol mismatch between the extension and "
-                    "the GPU daemon; retry will use CPU while breaker is open"),
+                    "the GPU daemon"),
              errhint("The .so and pg_cuvs_server were built from different "
                      "revisions. Reinstall both together: make install && "
                      "make install-server, then restart the daemon.")));
@@ -1961,7 +1961,8 @@ cuvs_hw_profile_load(CuvsHwProfile *out)
  *
  * A crash leaves the socket file in place (stale socket). That case is handled
  * at runtime: UNAVAILABLE → ERROR + circuit-breaker record. After N consecutive
- * errors the breaker opens and this plan-time gate fires on the next query too. */
+ * errors the breaker opens and the plan-time breaker gate (checked before this
+ * one) routes the next query to CPU. */
 static bool
 cuvs_daemon_socket_ready(void)
 {
@@ -4744,8 +4745,8 @@ cuvs_gettuple(IndexScanDesc scan, ScanDirection dir)
             /* Record error for circuit breaker. DIM_MISMATCH and METRIC_MISMATCH
              * are user/config errors, not repeatable GPU failures. STALE is
              * already gated at plan time. Everything else — including UNAVAILABLE
-             * (daemon crash after planning) — counts so the breaker opens and
-             * subsequent queries replan to CPU via the socket-existence gate. */
+             * (connect failure after planning) — counts so the breaker opens and
+             * subsequent queries replan to CPU via the plan-time breaker gate. */
             cuvs_circuit_record_status_reason((uint32_t)index_oid,
                                               cuvs_circuit_breaker_threshold,
                                               rc,
@@ -4781,17 +4782,23 @@ cuvs_gettuple(IndexScanDesc scan, ScanDirection dir)
                     cuvs_report_proto_mismatch(rc);
                     break;
                 case CUVS_STATUS_UNAVAILABLE:
-                    /* Daemon was reachable at plan time (socket existed) but
-                     * unreachable now — crash or restart between plan and execute.
-                     * ERROR aborts this query; the breaker records the failure so
-                     * the next query replans to CPU via the socket-existence gate. */
+                    /* The socket file existed at plan time, but the connect at
+                     * execute time failed: the daemon stopped or restarted, or a
+                     * running daemon could not be reached (#224). ERROR aborts
+                     * this query; the breaker counts the failure and opens after
+                     * cuvs.circuit_breaker_threshold consecutive ones, so the
+                     * first failures do not open it yet. */
                     ereport(ERROR,
                             (errcode(ERRCODE_CONNECTION_FAILURE),
                              errmsg("pg_cuvs: GPU daemon unavailable after planning; "
-                                    "retry will use CPU while breaker is open"),
-                             errhint("The daemon crashed or restarted between plan and "
-                                     "execute time. Subsequent queries replan to CPU "
-                                     "automatically once the breaker opens.")));
+                                    "connecting to the daemon socket failed"),
+                             errhint("The daemon may have stopped or restarted, a running "
+                                     "daemon could not be reached, or the socket failed the "
+                                     "cuvs.daemon_uid owner check; for a running daemon a "
+                                     "\"[cuvs_ipc]\" line in the server log gives the reason. "
+                                     "This backend's circuit breaker counts the failure; "
+                                     "after cuvs.circuit_breaker_threshold consecutive "
+                                     "failures new plans use CPU.")));
                     break;
                 case CUVS_STATUS_OOM_FALLBACK:
                     /* I3 (C5): a reload admission rejection carries err_out. */
@@ -4801,14 +4808,16 @@ cuvs_gettuple(IndexScanDesc scan, ScanDirection dir)
                     ereport(ERROR,
                             (errcode(ERRCODE_OUT_OF_MEMORY),
                              errmsg("pg_cuvs: GPU VRAM exhausted; "
-                                    "retry will use CPU while breaker is open"),
+                                    "new plans use CPU after cuvs.circuit_breaker_threshold "
+                                    "consecutive failures in this backend"),
                              errhint("REINDEX or reduce cuvs.k to lower GPU memory use.")));
                     break;
                 case CUVS_STATUS_NOT_FOUND:
                     ereport(ERROR,
                             (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
                              errmsg("pg_cuvs: cagra index not loaded on GPU daemon; "
-                                    "retry will use CPU while breaker is open"),
+                                    "new plans use CPU after cuvs.circuit_breaker_threshold "
+                                    "consecutive failures in this backend"),
                              errhint("REINDEX the index to reload it on the daemon.")));
                     break;
                 case CUVS_STATUS_NO_VECTORS:
@@ -4827,7 +4836,8 @@ cuvs_gettuple(IndexScanDesc scan, ScanDirection dir)
                     ereport(ERROR,
                             (errcode(ERRCODE_INTERNAL_ERROR),
                              errmsg("pg_cuvs: GPU search failed (status %d); "
-                                    "retry will use CPU while breaker is open", rc)));
+                                    "new plans use CPU after cuvs.circuit_breaker_threshold "
+                                    "consecutive failures in this backend", rc)));
                     break;
             }
             return false;
@@ -5033,10 +5043,14 @@ flat_gettuple(IndexScanDesc scan, ScanDirection dir)
                     ereport(ERROR,
                             (errcode(ERRCODE_CONNECTION_FAILURE),
                              errmsg("pg_cuvs: GPU daemon unavailable after planning; "
-                                    "retry will use CPU while breaker is open"),
-                             errhint("The daemon crashed or restarted between plan and "
-                                     "execute time. Subsequent queries replan to CPU "
-                                     "automatically once the breaker opens.")));
+                                    "connecting to the daemon socket failed"),
+                             errhint("The daemon may have stopped or restarted, a running "
+                                     "daemon could not be reached, or the socket failed the "
+                                     "cuvs.daemon_uid owner check; for a running daemon a "
+                                     "\"[cuvs_ipc]\" line in the server log gives the reason. "
+                                     "This backend's circuit breaker counts the failure; "
+                                     "after cuvs.circuit_breaker_threshold consecutive "
+                                     "failures new plans use CPU.")));
                     break;
                 case CUVS_STATUS_OOM_FALLBACK:
                     /* I3 (C5): a reload admission rejection carries err_out. */
@@ -5046,7 +5060,8 @@ flat_gettuple(IndexScanDesc scan, ScanDirection dir)
                     ereport(ERROR,
                             (errcode(ERRCODE_OUT_OF_MEMORY),
                              errmsg("pg_cuvs: GPU VRAM exhausted; "
-                                    "retry will use CPU while breaker is open"),
+                                    "new plans use CPU after cuvs.circuit_breaker_threshold "
+                                    "consecutive failures in this backend"),
                              errhint("Use WITH (precision='float16'), shard the table, "
                                      "or free VRAM, then REINDEX.")));
                     break;
@@ -5054,7 +5069,8 @@ flat_gettuple(IndexScanDesc scan, ScanDirection dir)
                     ereport(ERROR,
                             (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
                              errmsg("pg_cuvs: flat index not loaded on GPU daemon; "
-                                    "retry will use CPU while breaker is open"),
+                                    "new plans use CPU after cuvs.circuit_breaker_threshold "
+                                    "consecutive failures in this backend"),
                              errhint("REINDEX the index to reload it on the daemon.")));
                     break;
                 case CUVS_STATUS_NO_VECTORS:
@@ -5070,7 +5086,8 @@ flat_gettuple(IndexScanDesc scan, ScanDirection dir)
                     ereport(ERROR,
                             (errcode(ERRCODE_INTERNAL_ERROR),
                              errmsg("pg_cuvs: GPU search failed (status %d); "
-                                    "retry will use CPU while breaker is open", rc)));
+                                    "new plans use CPU after cuvs.circuit_breaker_threshold "
+                                    "consecutive failures in this backend", rc)));
                     break;
             }
             return false;
@@ -5738,7 +5755,8 @@ ivfpq_gettuple(IndexScanDesc scan, ScanDirection dir)
                     ereport(ERROR,
                             (errcode(ERRCODE_INTERNAL_ERROR),
                              errmsg("pg_cuvs: IVF-PQ search failed (status %d: %s); "
-                                    "retry will use CPU while breaker is open",
+                                    "new plans use CPU after cuvs.circuit_breaker_threshold "
+                                    "consecutive failures in this backend",
                                     rc, cuvs_status_str(rc))));
                     break;
             }

@@ -509,6 +509,9 @@ static pthread_t       g_warmup_tids[8];
  * both defaults at 0 nothing is ever enqueued and this subsystem is inert.
  * ---------------------------------------------------------------- */
 #define CUVS_BATCH_MAX 256          /* cap on concurrently queued requests */
+/* listen() backlog of the daemon socket (#224, see the listen() call):
+ * room for several batches of simultaneous reconnects. */
+#define PG_CUVS_LISTEN_BACKLOG 1024
 
 typedef struct CuvsBatchRequest {
     CuvsBatchKey key;          /* db_oid, index_oid, precision, dim, mode */
@@ -12515,13 +12518,46 @@ main(int argc, char **argv)
 
     chmod(g_socket_path, 0660);
 
-    if (listen(g_server_fd, 32) < 0)
+    /* #224: every backend request opens its own connection, and a micro-batch
+     * (cuvs.cagra_batch_wait_us / cuvs.bf_batch_wait_us) releases all of its
+     * waiters with one broadcast, so up to a batch's worth of backends
+     * (CUVS_BATCH_MAX) reconnect at the same instant. With the old backlog
+     * of 32, 64 pgbench clients filled it and their connect() calls waited in
+     * the kernel. This value only shortens that wait: the correctness fix is
+     * the retrying connect wait in uds_connect_wait() (cuvs_ipc.c), since a
+     * waiting connect() is still possible with any backlog. Linux silently caps the
+     * value at net.core.somaxconn (4096 by default since Linux 5.4, 128
+     * before); macOS caps it at kern.ipc.somaxconn. */
+    if (listen(g_server_fd, PG_CUVS_LISTEN_BACKLOG) < 0)
     {
         perror("listen");
         return 1;
     }
 
     LOG_INFO("pg_cuvs_server: listening on %s\n", g_socket_path);
+
+    /* #224: the kernel caps the backlog at net.core.somaxconn without an
+     * error, so say so when the effective value cannot hold one batch of
+     * reconnects. No /proc (macOS) or an unreadable value: say nothing. */
+    {
+        FILE *f = fopen("/proc/sys/net/core/somaxconn", "r");
+        long  somaxconn;
+
+        if (f)
+        {
+            if (fscanf(f, "%ld", &somaxconn) == 1)
+            {
+                long effective = somaxconn < PG_CUVS_LISTEN_BACKLOG
+                               ? somaxconn : PG_CUVS_LISTEN_BACKLOG;
+                if (effective < CUVS_BATCH_MAX)
+                    LOG_WARN("pg_cuvs_server: listen backlog is %ld "
+                             "(net.core.somaxconn=%ld), below one batch of %d "
+                             "reconnects; raise net.core.somaxconn\n",
+                             effective, somaxconn, CUVS_BATCH_MAX);
+            }
+            fclose(f);
+        }
+    }
 
     /* Phase 3D: spawn warmup worker threads. They process the queue populated
      * by startup_load_indexes() Pass 2 and by on-demand cache miss triggers.

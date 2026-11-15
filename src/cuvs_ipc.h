@@ -475,15 +475,22 @@ typedef struct CuvsIndexStats {
  *
  * Returns CUVS_STATUS_OK on success.
  * Returns CUVS_STATUS_OOM_FALLBACK if daemon has no VRAM → use CPU.
- * Returns CUVS_STATUS_ERROR if daemon is unreachable → use CPU.
+ * Returns CUVS_STATUS_UNAVAILABLE if the daemon could not be reached (the
+ *   connect failed or the cuvs.daemon_uid check refused the socket; a connect
+ *   that waits for the listen backlog is retried within the 30 s budget, #224).
  * Returns CUVS_STATUS_NOT_FOUND if index not loaded → use CPU.
- * Returns CUVS_STATUS_CANCELED if the wait callback (3S) aborted the reply wait.
+ * Returns CUVS_STATUS_CANCELED if the wait callback (3S) aborted the connect
+ *   or the reply wait.
  */
 
 /* 3S: register a callback the search reply-wait polls (~250ms) to detect a
  * pending query cancel / statement_timeout. Return nonzero to abort the wait
- * (cuvs_ipc_search then returns CUVS_STATUS_CANCELED after cleanup). The callback
- * must NOT longjmp (no CHECK_FOR_INTERRUPTS) — it only inspects flags; the PG
+ * (cuvs_ipc_search then returns CUVS_STATUS_CANCELED after cleanup). Every
+ * connect() is asked about after each failed attempt as well (#224; a wait for
+ * the listen backlog runs in 250 ms slices, so a pending cancel is seen within
+ * one slice); a nonzero answer ends that connect as a failure, which
+ * cuvs_ipc_search reports as CUVS_STATUS_CANCELED and the other calls as their
+ * usual connect-failure status. The callback must NOT longjmp (no CHECK_FOR_INTERRUPTS) — it only inspects flags; the PG
  * caller raises the interrupt after cuvs_ipc_search returns. NULL = no cancel
  * checking (blocking wait, legacy behavior). */
 void cuvs_ipc_set_wait_callback(int (*cb)(void));

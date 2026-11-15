@@ -10,6 +10,38 @@ exists for 0.9.0.
 
 ## [Unreleased]
 
+### Fixed
+
+- With a CAGRA or brute-force micro-batch window (`cuvs.cagra_batch_wait_us` or
+  `cuvs.bf_batch_wait_us` > 0) and 64 pgbench clients, some statements failed with
+  `GPU daemon unavailable after planning` while the daemon was running. A batch
+  releases all its waiters at once, every request opens a new connection, and the
+  daemon's listen backlog of 32 filled up. A backend whose `connect()` waited for a
+  slot and received a signal failed with `EINTR`, because the socket's send timeout
+  keeps the kernel from restarting the call. PostgreSQL 15 and later backends can receive
+  `SIGALRM` while busy: the idle stats-flush timeout (10 s) is armed when a backend
+  goes idle and is not disarmed when the next query starts (`postgres.c`, "we don't
+  disable the timeout below"). Every `connect()` now waits in 250 ms slices and
+  retries after a signal or an expired slice within the call's timeout (30 s for a
+  search), and checks for a pending cancel or termination after each attempt.
+  `cuvs_ipc_search`, which CAGRA and flat index scans use, then reports a canceled
+  query; the other calls (filtered, streaming, transient brute-force, IVF-PQ and
+  batch search, builds) end the connect as before with their connect-failure status.
+  A connect that finally fails is logged with its `errno` (`[cuvs_ipc] connect to
+  ... failed`; a missing or stale socket stays at debug level). The daemon listens
+  with a backlog of 1024, which shortens the wait but is not the fix; the kernel caps
+  it at `net.core.somaxconn`, and the daemon logs a warning at startup when that cap
+  is below one batch (256). The scan errors no longer say that the breaker is open
+  (`retry will use CPU while breaker is open`): the per-backend breaker opens only
+  after `cuvs.circuit_breaker_threshold` consecutive failures, and the errors now say
+  so. The UNAVAILABLE error reads `GPU daemon unavailable after planning; connecting
+  to the daemon socket failed`, and its HINT no longer says that the daemon crashed.
+  The protocol-mismatch error, which non-scan paths raise too, drops the breaker
+  clause. When `make_shm_key` fails, the plain, batch, filtered, streaming
+  brute-force and IVF-PQ search calls no longer pass an uninitialized name to
+  `shm_unlink`. The retry is covered by a Linux unit test against a full
+  backlog. (#224)
+
 ## [0.9.1] - 2026-11-15
 
 Faster HNSW import, resident NN-descent builds, a WAL fix and two CAGRA SDK patches

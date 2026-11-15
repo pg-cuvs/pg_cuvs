@@ -15,13 +15,19 @@ HINT:   GPU VRAM exhausted. Free VRAM (drop other cagra indexes or restart pg_cu
 
 **검색 시 (SELECT, 실행 중 실패):**
 ```
-ERROR:  pg_cuvs: GPU VRAM exhausted; retry will use CPU while breaker is open
-ERROR:  pg_cuvs: GPU daemon unavailable after planning; retry will use CPU while breaker is open
+ERROR:  pg_cuvs: GPU VRAM exhausted; new plans use CPU after cuvs.circuit_breaker_threshold consecutive failures in this backend
+ERROR:  pg_cuvs: GPU daemon unavailable after planning; connecting to the daemon socket failed
 ```
 
 실행 중 GPU 호출이 OOM 또는 daemon unavailable을 반환하면 해당 SELECT는 ERROR로
 끝날 수 있다. 이후 breaker가 열리면 다음 계획은 CPU 경로로 재계획된다.
 실패한 SELECT가 같은 실행에서 자동으로 다른 index/seqscan으로 이어진다고 가정하지 않는다.
+breaker는 backend마다, index마다 따로 있고 `cuvs.circuit_breaker_threshold`(기본 3)번
+연속 실패해야 열리므로, 첫 실패들은 breaker가 열리기 전에 난다. daemon unavailable은
+daemon이 멈추거나 재시작한 경우뿐 아니라, 살아 있는 daemon에 연결하지 못한 경우와 소켓이
+`cuvs.daemon_uid` 소유자 검사에서 거부된 경우에도 난다. daemon이 살아 있으면 서버 로그의
+`[cuvs_ipc]` 줄에 이유가 남는다(`connect to ... failed`와 errno, 또는 `socket_path ... owned by uid`,
+`socket peer uid`).
 
 ---
 
