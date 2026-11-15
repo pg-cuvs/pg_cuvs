@@ -231,7 +231,7 @@ inputs, not a tested minimum-version matrix for every GPU and driver.
   RAPIDS dependencies. The CUDA 12.4 development bootstrap does not install that
   patched SDK. Follow the recipe's `CUVS_SDK_SOURCE_INCLUDE` and link settings.
 - Deploy the extension and daemon from the same revision: global IPC protocol
-  v5 and HNSW op-23 payload v5 are separate compatibility checks.
+  v5 and HNSW op-23 payload v6 are separate compatibility checks.
 
 ## Known limitations
 

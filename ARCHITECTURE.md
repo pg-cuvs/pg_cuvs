@@ -241,7 +241,8 @@ in `pg_stat_gpu_fallback`; daemon replies are recorded in `pg_stat_gpu_search`.
   also carry structured rejection/NOTICE fields. The caller determines the reaction:
   scan-time STALE/OOM/connection failures raise errors, while future plans can
   choose CPU paths. Deploy both binaries together; HNSW op 23 additionally checks
-  its own payload v5 and returns a stored build-policy/ACE readback receipt.
+  its own payload v6 and returns a stored build-policy receipt with the ACE or
+  NN-descent readback of the route it used.
 - **Interruptibility (Phase 3S):** the backend's reply wait is a `poll()` loop with a wait
   callback, so `statement_timeout` / query-cancel break a long GPU search (~sub-second) instead
   of blocking indefinitely. The daemon ignores `SIGPIPE` to survive mid-reply client disconnect.
