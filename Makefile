@@ -100,9 +100,16 @@ CUVS_LIB      ?= $(CUVS_PREFIX)/lib
 # as requested, effective count not guaranteed. The patched libcuvs.so is
 # required either way.
 CUVS_SDK_SOURCE_INCLUDE ?=
+# Reset here: a make started from a recipe sees this variable in its environment.
+CUVS_SDK_PLAN_NOTE =
 ifneq ($(strip $(CUVS_SDK_SOURCE_INCLUDE)),)
 CUVS_SDK_PLAN_FLAGS = -I$(CUVS_SDK_SOURCE_INCLUDE) -Xcompiler=-fopenmp
 CUVS_SDK_PLAN_LINK = -fopenmp -lrapids_logger
+else
+# One line when the GPU wrapper is compiled without the planner source. It is part of the
+# src/cuvs_wrapper.o recipe, so CPU shim builds (which never build that object) and the
+# CPU-only CI jobs print nothing.
+CUVS_SDK_PLAN_NOTE = @echo "pg_cuvs: CUVS_SDK_SOURCE_INCLUDE is not set: the ACE effective partition count guarantee is OFF; the HNSW receipt will record the requested count (set CUVS_SDK_SOURCE_INCLUDE to the patched SDK cpp/src to turn it on)"
 endif
 
 # ---- CI Tier 1: CPU-reference shim (no CUDA/cuVS) -------------------------
@@ -149,6 +156,7 @@ endif
 src/cuvs_wrapper.o: src/cuvs_wrapper.cu src/cuvs_wrapper.h src/cuvs_hnsw_sdk_plan.cuh \
                     src/cuvs_hnsw_nn_sdk_params.cuh src/cuvs_hnsw_nn_precision.h src/cuvs_hnsw_nn_capacity.h src/cuvs_hnsw_nn_upper_contract.h src/cuvs_hnsw_nn_center.h \
                     src/cuvs_failed_allocation.hpp src/cuvs_rmm_failure_resource.hpp
+	$(CUVS_SDK_PLAN_NOTE)
 	$(NVCC) $(NVCC_FLAGS) $(CUVS_SDK_PLAN_FLAGS) -I$(CUVS_INCLUDE) -I$(CUVS_RAPIDS_INCLUDE) -I./src -c $< -o $@
 
 # PGXS generates LLVM bitcode (.bc) from .c sources for JIT. The .cu file
@@ -290,7 +298,7 @@ TEST_RT_LIB := $(shell [ "$$(uname -s)" = "Linux" ] && echo -lrt)
 test-unit: test-compact-retry test-device-norm test-failed-allocation test-build-oom-log test-peak-log-switch test/unit/test_cuvs_util.c src/cuvs_util.c src/cuvs_util.h src/cuvs_ipc.h \
            test/unit/test_build_corpus.c src/cuvs_build_corpus.c src/cuvs_build_corpus.h \
            test-hnsw-build test-hnsw-build-ipc test-hnsw-owner-lease test-hnsw-ace-quality test-hnsw-admission test-admission-contract \
-           test-hnsw-nn-policy test-hnsw-nn-route test-hnsw-nn-precision test-hnsw-nn-capacity test-hnsw-nn-sdk-params test-hnsw-nn-consumer test-hnsw-nn-upper-receipt test-hnsw-nn-center test-hnsw-nn-mutations test-hnsw-ace-origin-json test-hnsw-ace-planner-branch \
+           test-hnsw-nn-policy test-hnsw-nn-route test-hnsw-nn-precision test-hnsw-nn-capacity test-hnsw-nn-sdk-params test-hnsw-nn-consumer test-hnsw-nn-upper-receipt test-hnsw-nn-center test-hnsw-nn-mutations test-hnsw-ace-origin-json test-hnsw-ace-planner-branch test-hnsw-sdk-plan-gate \
            test-i3-logs test-notice-wire test-admission-wire test-admission-message test-admission-ipc test-build-oom-thread test-cache-policy test-circuit-source test-status-text test-i3b-source test-peak-meter test-lw-policy test-lw-guard test-i3e-sql test-self-replace-notice test-host-free-fence test-vacuum-policy test-hnsw-digest
 	$(CC) -I src -DCUVS_TEST_HOOKS -o test-unit test/unit/test_cuvs_util.c src/cuvs_util.c $(TEST_RT_LIB)
 	./test-unit
@@ -463,6 +471,12 @@ test-hnsw-ace-origin-json: test/unit/test_hnsw_ace_origin_json.py src/hnsw_expor
 .PHONY: test-hnsw-ace-planner-branch
 test-hnsw-ace-planner-branch: test/unit/test_hnsw_ace_planner_branch.py src/cuvs_wrapper.cu src/cuvs_hnsw_policy.h
 	CXX="$(CXX)" python3 -I -B test/unit/test_hnsw_ace_planner_branch.py
+
+# The switch that turns the SDK source planner on (header include, OpenMP + source path gate, nvcc
+# flags) and the one-line note of a GPU build without it; ACE no longer fails without the planner.
+.PHONY: test-hnsw-sdk-plan-gate
+test-hnsw-sdk-plan-gate: test/unit/test_hnsw_sdk_plan_gate.py src/cuvs_hnsw_sdk_plan.cuh src/cuvs_wrapper.cu Makefile
+	CXX="$(CXX)" python3 -I -B test/unit/test_hnsw_sdk_plan_gate.py
 
 # NN-descent L2 graph-input centering (docs/hnsw-build-options.md, nn_descent).
 .PHONY: test-hnsw-nn-center
