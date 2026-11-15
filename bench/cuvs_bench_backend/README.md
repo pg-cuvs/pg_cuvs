@@ -172,7 +172,7 @@ python bench/cuvs_bench_backend/run_pg_cuvsbench.py \
 
 The `pgcuvs_hnsw_import` algo builds through `CREATE INDEX ... USING pg_cuvs_hnsw`
 with `source`/`mode` reloptions (`pg_engine.py`), not the deprecated
-`pg_cuvs_build_hnsw()` function. HEAD declares extension version `0.9.1`
+`pg_cuvs_build_hnsw()` function. HEAD declares extension version `0.9.2`
 in `pg_cuvs.control`; verify the installed SQL/daemon match before measurement.
 The gt is read as a big-ann
 `.ibin`; the loader converts `gt_<n>.npy` → `gt_<n>_q<nq>.ibin` sliced to the

@@ -13,7 +13,7 @@ the current-state documents listed below.
 
 | Domain | Runtime/source authority | Canonical document | Rule |
 |---|---|---|---|
-| Product surface | `src/pg_cuvs.c`, `sql/pg_cuvs--0.9.1.sql`, `pg_cuvs.control` | [docs/reference.md](reference.md) | GUC defaults, AMs, SQL functions, views, and search modes are documented here. |
+| Product surface | `src/pg_cuvs.c`, `sql/pg_cuvs--0.9.2.sql`, `pg_cuvs.control` | [docs/reference.md](reference.md) | GUC defaults, AMs, SQL functions, views, and search modes are documented here. |
 | Architecture | `src/pg_cuvs.c`, `src/pg_cuvs_server.c`, `src/cuvs_ipc.*` | [ARCHITECTURE.md](../ARCHITECTURE.md) | Process ownership, IPC, persistence, lifecycle, and failure boundaries are documented here. |
 | Overview | Current-state documents above | [README.md](../README.md) | Overview and quickstart only; do not duplicate detailed defaults or benchmark caveats. |
 | Workload guidance | Current reference plus measured evidence | [operational guide](operational-guide.md) and [best practices](best-practices.md) | Selection guidance and deployment recommendations must cite current measurements or source-backed defaults. |
