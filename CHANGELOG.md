@@ -12,6 +12,14 @@ exists for 0.9.0.
 
 ### Added
 
+- `scripts/check-sdk-patch-path.sh` checks the patched cuVS SDK build path without CUDA:
+  the patch set applies to the pinned cuVS source with the manifest hashes, the planner
+  source verifies, and the Makefile passes the planner's compile and link flags. The
+  Unit tests (CPU) CI job runs it. A Claude Code hook (`.claude/hooks/pr-guard.sh`) runs
+  it when a session started in a pg_cuvs checkout opens a pull request with the common
+  spellings of `gh pr create` or `gh pr ready`, and blocks the command while the check
+  fails. It guards against mistakes and is not a security boundary; it checks the
+  working tree, not the pull request head. Development tooling only.
 - `cuvs.hnsw_exact_scan` (bool, default `off`, USERSET): with `on`, an ordered scan of a
   `pg_cuvs_hnsw` index computes exact SQL distances over the MVCC-visible heap rows
   instead of reading the HNSW graph, so rows the graph cannot reach (#203) are returned
@@ -29,6 +37,15 @@ exists for 0.9.0.
   100,000 x 96 (Seq Scan + top-N Sort 11 ms) and 284 ms over 1,000,000 x 96 (143 ms).
   Tested on PostgreSQL 16 CPU only, not on GPU builds, other pgvector versions or in
   GitHub Actions at the time of writing.
+
+### Fixed
+
+- Building with the patched cuVS SDK planner (`CUVS_SDK_SOURCE_INCLUDE` set, as the
+  HNSW/ACE paths require) failed to compile `src/cuvs_wrapper.cu`: the planner pulls in
+  the patched `cagra_build.cuh`, whose RAFT `map_offset` kernel calls a constexpr host
+  function from device code, and nvcc rejects that without `--expt-relaxed-constexpr`.
+  The planner flags now pass it, as the SDK's own build does. Builds without the
+  planner are unchanged. 0.9.1 and 0.9.2 have the same defect.
 
 ## [0.9.2] - 2026-11-15
 
