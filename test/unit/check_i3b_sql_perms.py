@@ -193,6 +193,34 @@ for rel in (CONN_UPGRADE, CONN_INSTALL):
 check(conn_blocks[0] == conn_blocks[1],
       "CONN203 block differs between install and upgrade")
 
+# The COMMENT is what \df+ shows. It must name the setting that decides whether a
+# snapshot exists and must not promise a maintenance_work_mem-only check (larger
+# checks continue in file-backed scratch). The development installer must carry
+# the very same function and COMMENT as the fresh-install block.
+comment_re = (r"COMMENT ON FUNCTION pg_cuvs_hnsw_connectivity_status\(regclass\) IS\s*"
+              r"'((?:[^']|'')*)';")
+conn_comments = []
+for body in conn_blocks:
+    m = re.search(comment_re, body)
+    conn_comments.append(m.group(1) if m else "")
+check(all(c for c in conn_comments), "CONN203 COMMENT not found")
+for c in conn_comments:
+    check("cuvs.hnsw_connectivity_check" in c and "disabled" in c and "not_recorded" in c,
+          "CONN203 COMMENT must name cuvs.hnsw_connectivity_check and the disabled/not_recorded states")
+    check("within maintenance_work_mem" not in c,
+          "CONN203 COMMENT must not say the check stays within maintenance_work_mem")
+installer = "scripts/install-connectivity-status.sql"
+if os.path.exists(os.path.join(ROOT, installer)):
+    inst = read(installer)
+    code = "\n".join(line for line in inst.splitlines() if not line.lstrip().startswith("--"))
+    im = re.search(comment_re, code)
+    check(im is not None and im.group(1) == conn_comments[1],
+          f"{installer}: COMMENT missing or differs from the CONN203 block")
+    fn = normalize_sql(conn_function.replace("CREATE FUNCTION", "CREATE OR REPLACE FUNCTION"))
+    check(fn in normalize_sql(code), f"{installer}: status function differs from the CONN203 block")
+else:
+    check(False, f"{installer} missing")
+
 
 def norm_sig(name, args):
     types = []

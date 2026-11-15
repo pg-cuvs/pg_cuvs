@@ -8,11 +8,24 @@
 #include <stdlib.h>
 #include <string.h>
 #include <limits.h>
+/* `available` is a three-state value, kept under its original name so the
+ * 64-byte stored layout and its readers do not change:
+ *   UNAVAILABLE  the check was attempted and could not complete;
+ *   MEASURED     the check completed (the counters are valid);
+ *   DISABLED     the check was not attempted because cuvs.hnsw_connectivity_check
+ *                was off; every counter is zero. */
 typedef struct CuvsConnectivity {
     uint32_t magic, version, available, spilled;
     uint64_t nodes, unreachable, unreachable_l0, wcc_l0, wcc_all, elapsed_us;
 } CuvsConnectivity;
 #define CUVS_CONNECTIVITY_MAGIC 0x434F4E31u
+#define CUVS_CONNECTIVITY_UNAVAILABLE 0u
+#define CUVS_CONNECTIVITY_MEASURED 1u
+#define CUVS_CONNECTIVITY_DISABLED 2u
+static inline void cuvs_connectivity_set_disabled(CuvsConnectivity *c) {
+    memset(c,0,sizeof(*c));c->magic=CUVS_CONNECTIVITY_MAGIC;c->version=1;
+    c->available=CUVS_CONNECTIVITY_DISABLED;
+}
 typedef const unsigned char *(*CuvsLinks)(void *, uint32_t, uint32_t, uint32_t *);
 typedef int (*CuvsConnectivityCancel)(void *);
 static uint32_t cuvs_conn_root(uint32_t *p, uint32_t a) {
@@ -77,7 +90,7 @@ static int cuvs_connectivity_scratch(uint32_t n,uint32_t entry,uint32_t entry_le
     }
     if(!cuvs_conn_reach(n,entry,0,links,ctx,seen,queued,stack,cancel,&out->unreachable_l0) ||
        !cuvs_conn_reach(n,entry,entry_level,links,ctx,seen,queued,stack,cancel,&out->unreachable))goto done;
-    out->available=1;ok=1;
+    out->available=CUVS_CONNECTIVITY_MEASURED;ok=1;
 done:
     if(!scratch){free(parents);free(stack);free(seen);free(queued);}
     return ok;

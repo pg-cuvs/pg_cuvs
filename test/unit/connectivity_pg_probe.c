@@ -3,6 +3,7 @@
 #include "postgres.h"
 #include "fmgr.h"
 #include "miscadmin.h"
+#include "utils/guc.h"
 #include <stdlib.h>
 #include <sys/mman.h>
 #include <time.h>
@@ -15,6 +16,12 @@ static unsigned heap_live, map_live;
 static int probe_action;
 static bool kernel_returned, log_pending_at_return, callback_cancel_seen;
 static unsigned file_cfi_polls;
+/* Work counters, reset at every conn203_probe() call: a check that is switched
+ * off must leave all of them at zero (no scratch, no mapping, no kernel call,
+ * no interrupt poll), while a check that runs must move them. */
+static unsigned alloc_total, map_total, kernel_calls, cfi_total;
+/* Probe copy of the production GUC (pg_cuvs.c registers the real one). */
+bool cuvs_hnsw_connectivity_check = false;
 static void probe_real_check(void){CHECK_FOR_INTERRUPTS();}
 static void probe_wait(const char *phase)
 {
@@ -36,6 +43,7 @@ static void probe_wait(const char *phase)
 }
 static void probe_check(const char *function)
 {
+    cfi_total++;
     if(!strcmp(function,"hnsw_check_connectivity") && ++file_cfi_polls==3 && probe_action==6)
         probe_wait("offsets");
     if(!strcmp(function,"hnsw_connectivity_cancel") && InterruptPending &&
@@ -49,6 +57,7 @@ static void probe_check(const char *function)
 static void *probe_malloc(size_t n)
 {
     void *p=malloc(n);
+    alloc_total++;
     if(p){for(unsigned i=0;i<16;i++)if(!heaps[i]){heaps[i]=p;heap_live++;break;}}
     return p;
 }
@@ -60,6 +69,7 @@ static void probe_free(void *p)
 static void *probe_mmap(void *a,size_t n,int prot,int flags,int fd,off_t off)
 {
     void *p=mmap(a,n,prot,flags,fd,off);
+    map_total++;
     if(p!=MAP_FAILED){for(unsigned i=0;i<16;i++)if(!maps[i]){maps[i]=p;map_live++;break;}}
     return p;
 }
@@ -73,6 +83,7 @@ static int probe_scratch(uint32_t n,uint32_t entry,uint32_t level,uint32_t maxle
                         CuvsLinks links,void *ctx,CuvsConnectivityCancel cancel,
                         void *scratch,CuvsConnectivity *out)
 {
+    kernel_calls++;
     if(probe_action==1)InterruptPending=1; /* benign pending flag, no cancel */
     if(probe_action>=2)probe_wait("kernel");
     int rc=cuvs_connectivity_scratch(n,entry,level,maxlevel,links,ctx,cancel,scratch,out);
@@ -96,13 +107,20 @@ static int probe_scratch(uint32_t n,uint32_t entry,uint32_t level,uint32_t maxle
 #undef munmap
 
 PG_MODULE_MAGIC;
+void _PG_init(void);
+void _PG_init(void)
+{
+    DefineCustomBoolVariable("cuvs.hnsw_connectivity_check",
+        "Probe copy of the production setting.", NULL,
+        &cuvs_hnsw_connectivity_check, false, PGC_USERSET, 0, NULL, NULL, NULL);
+}
 PG_FUNCTION_INFO_V1(conn203_probe);
 PG_FUNCTION_INFO_V1(conn203_probe_state);
 
 Datum conn203_probe_state(PG_FUNCTION_ARGS)
 {
-    PG_RETURN_TEXT_P(cstring_to_text(psprintf("{\"heap_live\":%u,\"map_live\":%u,\"kernel_returned\":%s,\"log_pending_at_return\":%s,\"callback_cancel_seen\":%s,\"file_cfi_polls\":%u}",heap_live,map_live,
-        kernel_returned?"true":"false",log_pending_at_return?"true":"false",callback_cancel_seen?"true":"false",file_cfi_polls)));
+    PG_RETURN_TEXT_P(cstring_to_text(psprintf("{\"heap_live\":%u,\"map_live\":%u,\"kernel_returned\":%s,\"log_pending_at_return\":%s,\"callback_cancel_seen\":%s,\"file_cfi_polls\":%u,\"alloc_total\":%u,\"map_total\":%u,\"kernel_calls\":%u,\"cfi_total\":%u}",heap_live,map_live,
+        kernel_returned?"true":"false",log_pending_at_return?"true":"false",callback_cancel_seen?"true":"false",file_cfi_polls,alloc_total,map_total,kernel_calls,cfi_total)));
 }
 
 Datum conn203_probe(PG_FUNCTION_ARGS)
@@ -113,6 +131,7 @@ Datum conn203_probe(PG_FUNCTION_ARGS)
     StringInfoData s;
     probe_action=PG_GETARG_INT32(1);
     kernel_returned=log_pending_at_return=callback_cancel_seen=false;file_cfi_polls=0;
+    alloc_total=map_total=kernel_calls=cfi_total=0;
     if(file){
         HnswlibHeader h={0};
         char path[]="/tmp/conn203-test-input-XXXXXX";
@@ -149,6 +168,7 @@ Datum conn203_probe(PG_FUNCTION_ARGS)
     initStringInfo(&s);appendStringInfoString(&s,"{");
     /* The production JSON helper appends a comma to an existing object. */
     appendStringInfo(&s,"\"heap_live\":%u,\"map_live\":%u",heap_live,map_live);
+    hnsw_notice_connectivity(&c); /* the production order: check, then report */
     hnsw_append_connectivity(&s,&c);appendStringInfoChar(&s,'}');
     PG_RETURN_TEXT_P(cstring_to_text(s.data));
 }

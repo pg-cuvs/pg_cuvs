@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""RED controls: benign-as-cancel and cleanup only on successful return."""
+"""RED controls: benign-as-cancel, cleanup only on successful return, and the cuvs.hnsw_connectivity_check gate."""
 import argparse
 import json
 from pathlib import Path
@@ -41,12 +41,29 @@ def main():
     changed = function[:loop_start] + function[loop_end:]
     changed = changed.replace("    PG_TRY();", "    if(workspace) {\n" + loop + "    }\n    PG_TRY();", 1)
     mutants["file-loop-outside-try"] = original[:start] + changed + original[end:]
+    # The setting must gate both adapters, the NOTICE and the JSON state.
+    guard_elements = "    if(!cuvs_hnsw_connectivity_check){cuvs_connectivity_set_disabled(&c);return c;}\n"
+    guard_file = "    if(!cuvs_hnsw_connectivity_check){cuvs_connectivity_set_disabled(out);return;}\n"
+    notice_guard = ("    if(c->available==CUVS_CONNECTIVITY_DISABLED)\n"
+                    "        return; /* The check was not run; there is nothing to report. */\n")
+    assert original.count(guard_elements) == 1 and original.count(guard_file) == 1
+    assert original.count(notice_guard) == 1
+    mutants["guc-ignored-elements"] = original.replace(guard_elements, "")
+    mutants["guc-ignored-file"] = original.replace(guard_file, "")
+    mutants["disabled-notice-emitted"] = original.replace(notice_guard, "")
+    json_start = original.index("    else if(c->available==CUVS_CONNECTIVITY_DISABLED)\n        appendStringInfoString(json")
+    json_end = original.index("    else if(c->available!=CUVS_CONNECTIVITY_MEASURED)", json_start)
+    mutants["disabled-json-missing"] = original[:json_start] + original[json_end:]
     expectations = {
         "benign-as-cancel": ({"generic_pending", "log_memory", "cancel", "timeout", "terminate"}, 20),
         "callback-no-cfi": ({"log_memory", "cancel", "timeout", "terminate"}, 16),
         "callback-cancel-die-only": ({"log_memory"}, 4),
         "cleanup-only-on-success": ({"cancel", "timeout", "loop_cancel"}, 10),
         "file-loop-outside-try": ({"loop_cancel"}, 2),
+        "guc-ignored-elements": ({"guc_off"}, 1),
+        "guc-ignored-file": ({"guc_off"}, 1),
+        "disabled-notice-emitted": ({"guc_off"}, 2),
+        "disabled-json-missing": ({"guc_off"}, 2),
     }
     args.output.mkdir(parents=True, exist_ok=True)
     rows = []
@@ -59,7 +76,7 @@ def main():
             x = json.loads((out / "result.json").read_text())
             failed = [r for r in x["cases"] if r["verdict"] == "FAIL"]
             expected, count = expectations[name]
-            detected = p.returncode == 1 and len(x["cases"]) == 26 and len(failed) == count and {r["event"] for r in failed} == expected
+            detected = p.returncode == 1 and len(x["cases"]) == 28 and len(failed) == count and {r["event"] for r in failed} == expected
             rows.append({"mutant": name, "exit": p.returncode, "detected": detected,
                          "passed": x.get("passed"), "failed": x.get("failed"),
                          "failed_cases": [{k: r[k] for k in ["adapter", "spilled", "event", "error"]} for r in failed]})

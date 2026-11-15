@@ -67,6 +67,8 @@ require_file "test/sql/upgrade_path.sql"
 require_text "docs/reference.md" '| `cuvs.filter_auto_threshold` | real | `0.0` |'
 require_text "docs/reference.md" '| `cuvs.stream_bf_selectivity_threshold` | real | `0.004` |'
 require_text "docs/reference.md" 'not a portable crossover'
+require_text "docs/reference.md" '| `cuvs.hnsw_connectivity_check` | bool | `off` | — | USERSET |'
+require_text "docs/reference.md" '"status":"disabled"'
 require_text "ROADMAP.md" 'Current contract (2026-11-11, source `ae818ad0`)'
 require_text "ROADMAP.md" "extension version \`${control_version}\`"
 require_text "docs/doc-map.md" "sql/pg_cuvs--${control_version}.sql"

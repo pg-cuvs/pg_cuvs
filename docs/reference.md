@@ -202,6 +202,7 @@ workspace allocations can still produce a genuine allocation failure.
 | `cuvs.itopk_size` | int | `0` (auto) | 0–2147483616, multiples of 32 | USERSET | CAGRA intermediate search buffer floor. Auto preserves `max(64, ceil(actual_k/32)*32)`; an explicit value is raised to cover actual k, including shard/tombstone overfetch. Does not change the number of returned candidates |
 | `cuvs.search_width` | int | `0` (SDK default) | 0–INT_MAX | USERSET | CAGRA vertices expanded per iteration. Applies to single, filtered, sharded and batched CAGRA search; ignored by exact BF |
 | `cuvs.cpu_hnsw_fallback` | bool | `off` | — | USERSET | Serve from the `.hnsw` sidecar instead of GPU CAGRA |
+| `cuvs.hnsw_connectivity_check` | bool | `off` | — | USERSET | After a `pg_cuvs_hnsw` build, run the structural connectivity check and record it in `pg_cuvs_hnsw_build_info(index)->'connectivity'` (see § Build connectivity snapshot). Off skips the check, its scratch allocation and its NOTICE and records `disabled`. Read per index build |
 | `cuvs.max_stale_fraction` | real | `0.10` | 0.0–1.0 | USERSET | Delete-drift fraction above which a CAGRA index reroutes to CPU; 1.0 disables |
 | `cuvs.max_delta_rows` | int | `10000` | 0–INT_MAX | USERSET | Pending-insert rows merged before CPU reroute; 0 disables delta |
 | `cuvs.delta_search` | enum | `auto` | `auto`, `cpu`, `gpu` | USERSET | Delta merge mode: GPU-with-CPU-fallback / always CPU / GPU-only |
@@ -997,14 +998,26 @@ paths.
 
 ### Build connectivity snapshot (#203)
 
-New `pg_cuvs_hnsw` imports record a CPU structural check in
-`pg_cuvs_hnsw_build_info(index)->'connectivity'` and expose the same object via
-`pg_cuvs_hnsw_connectivity_status(index)`. A NOTICE reports the observation.
-`status` is `measured`, `unavailable` (host memory/mapping/check failure), or
-`not_recorded` (historical metadata). An unavailable check does not reject a
-build or change search policy. Anonymous workspace is bounded by
-`maintenance_work_mem`; larger checks, or a failed heap allocation, automatically
-use preallocated, unlinked file-backed scratch. `spilled` records that path.
+The check is opt-in. `cuvs.hnsw_connectivity_check` (bool, default `off`,
+USERSET) is read when an index build imports its graph; set it with
+`SET cuvs.hnsw_connectivity_check = on` before `CREATE INDEX` or `REINDEX`.
+With it off the build allocates no scratch, maps no graph file, traverses
+nothing and emits no NOTICE, and the build snapshot records
+`{"status":"disabled","scope":"build_snapshot","setting":"cuvs.hnsw_connectivity_check"}`.
+With it on, new `pg_cuvs_hnsw` imports record a CPU structural check in
+`pg_cuvs_hnsw_build_info(index)->'connectivity'`, and a NOTICE reports the
+observation. `pg_cuvs_hnsw_connectivity_status(index)` exposes the same object
+in both cases. `status` is `measured`, `unavailable` (host memory/mapping/check
+failure), `disabled` (the build ran with the setting off) or `not_recorded`
+(historical metadata, built before this snapshot existed). An unavailable check
+does not reject a build or change search policy. Anonymous workspace is bounded
+by `maintenance_work_mem`; larger checks, or a failed heap allocation,
+automatically use preallocated, unlinked file-backed scratch. `spilled` records
+that path.
+
+Why it is off by default: the check only reads the finished graph and changes
+neither edges, seeds, search results nor search policy, but it costs time at
+scale. Measured on one A100-SXM4-80GB host (PostgreSQL 16.15, `build_algo='ivf_pq'`, resident route): on 999,000 rows x 768 dimensions the check took 2.26-2.31 s (graph file 3.34 GB, page cache warm), about +2 s on a 25.6 s `CREATE INDEX` (mean of five builds with the check off; mean of four builds with it on: 27.6 s); on 100,000 rows it took 0.13-0.16 s. The explicit `build_algo='nn_descent'` route follows the same setting (999,000 rows: check 2.40 s, 34.4 s off, 36.6 s on). The time grows with the graph file size; a graph file larger than the page cache has not been measured.
 The file uses `DataDir/base/pgsql_tmp` (the default PostgreSQL temp directory);
 custom `temp_tablespaces` routing is not implemented for this diagnostic.
 Because this mapping is not charged to PostgreSQL VFD temp-file accounting, a

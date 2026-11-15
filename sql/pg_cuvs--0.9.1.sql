@@ -1020,5 +1020,5 @@ LANGUAGE SQL STABLE STRICT AS $$
                  '{"status":"not_recorded","scope":"build_snapshot"}'::jsonb)
 $$;
 COMMENT ON FUNCTION pg_cuvs_hnsw_connectivity_status(regclass) IS
- 'Last build structural connectivity snapshot; does not track INSERT/DELETE/VACUUM and does not guarantee finite-ef recall. Historical indexes may be not_recorded; new imports attempt the check within maintenance_work_mem.';
+ 'Last build structural connectivity snapshot; does not track INSERT/DELETE/VACUUM and does not guarantee finite-ef recall. The check runs only when cuvs.hnsw_connectivity_check was on for the build: status is disabled when it was off and not_recorded for indexes built before the snapshot existed. A check that needs more than maintenance_work_mem continues in file-backed scratch, and is unavailable under a finite temp_file_limit.';
 -- CONN203 end

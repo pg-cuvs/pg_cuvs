@@ -19,7 +19,7 @@ python3 test/experimental/conn203/page_mutation.py
 `postgres.sh` assumes the CPU shim extension/daemon are built/installed at
 `/tmp/conn203-product`. It creates its own temporary cluster, exercises a real
 SQL/NOTICE snapshot and INSERT, and uses immediate stop/restart to test WAL
-recovery. It does not execute cuVS. `file_cost.py` constructs hnswlib-layout
+recovery. It checks that `cuvs.hnsw_connectivity_check` is registered as a user-settable bool with boot value `off`, that a default build stores a `disabled` record without a NOTICE, and that the record survives the restart. It does not execute cuVS. `file_cost.py` constructs hnswlib-layout
 fixtures with original adjacency and zero vectors (the check does not read
 vectors); `final_cost.py` replays both heap and file-backed scratch paths.
 The `--connectivity-file*` modes of the converter fixture invoke the actual

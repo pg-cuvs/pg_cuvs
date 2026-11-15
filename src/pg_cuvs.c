@@ -142,6 +142,7 @@ int   cuvs_shard_count             = 0;    /* 0 = auto (Phase 3G); 1 = unsharded
 int   cuvs_shard_overfetch         = 0;    /* per-shard request k = k + this; recall slop at scale (Phase 3G) */
 bool  cuvs_parallel_fanout         = true; /* dispatch shards concurrently in the daemon (Phase 3G) */
 bool  cuvs_cpu_hnsw_fallback       = false; /* Phase 3I-1: prefer CPU HNSW over GPU CAGRA */
+bool  cuvs_hnsw_connectivity_check = false; /* #203: post-build structural check of pg_cuvs_hnsw imports (hnsw_export.c) */
 char *cuvs_snapshot_uri            = NULL;  /* "gs://bucket[/prefix]" — empty = disabled (Phase 3C) */
 char *cuvs_cluster_id              = NULL;  /* multi-node identifier for GCS path (Phase 3C) */
 char *cuvs_gcs_key_file            = NULL;  /* service account JSON path; "" = instance metadata (Phase 3C) */
@@ -1568,6 +1569,19 @@ _PG_init(void)
         "and searches it on CPU.  Useful for GPU-less testing or when latency "
         "requirements allow CPU serving.  Default off.",
         &cuvs_cpu_hnsw_fallback,
+        false,
+        PGC_USERSET,
+        0, NULL, NULL, NULL);
+
+    DefineCustomBoolVariable(
+        "cuvs.hnsw_connectivity_check",
+        "Run the structural connectivity check after a pg_cuvs_hnsw build (#203).",
+        "Off (default): the check, its scratch allocation and its NOTICE are skipped and "
+        "pg_cuvs_hnsw_build_info()->'connectivity' reports status 'disabled'. On: the "
+        "import records reachability and weak-component counts in that object and "
+        "reports them in a NOTICE. The check only reads the finished graph; it never "
+        "changes edges, seeds, search results or search policy. Read per index build.",
+        &cuvs_hnsw_connectivity_check,
         false,
         PGC_USERSET,
         0, NULL, NULL, NULL);

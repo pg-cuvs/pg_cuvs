@@ -140,6 +140,11 @@ typedef struct {
 
 /* Reserve a metadata tail OUTSIDE the WAL free-space hole. pd_lower and the
  * historical policy/ACE receipt prefix remain unchanged for older readers. */
+/* cuvs.hnsw_connectivity_check (defined and registered in pg_cuvs.c). When off
+ * the adapters return a "disabled" record before any scratch allocation, input
+ * mapping, interrupt poll or graph traversal, and report no NOTICE. */
+extern bool cuvs_hnsw_connectivity_check;
+
 /* Anonymous scratch respects maintenance_work_mem. Larger checks use a
  * preallocated, immediately unlinked file under the default PG temp directory.
  * File-backed pages can be reclaimed by the OS instead of requiring swap.
@@ -210,9 +215,13 @@ hnsw_read_connectivity(Page page)
     if(h->pd_special<=BLCKSZ && h->pd_special>=sizeof(c) &&
        h->pd_upper==h->pd_special-sizeof(c) && h->pd_lower<=h->pd_upper)
         memcpy(&c,(char*)page+h->pd_upper,sizeof(c));
-    if(c.magic!=CUVS_CONNECTIVITY_MAGIC || c.version!=1 || c.available>1 || c.spilled>1 ||
+    if(c.magic!=CUVS_CONNECTIVITY_MAGIC || c.version!=1 ||
+       c.available>CUVS_CONNECTIVITY_DISABLED || c.spilled>1 ||
        c.unreachable>c.nodes || c.unreachable_l0>c.nodes ||
-       c.wcc_all>c.nodes || c.wcc_l0>c.nodes)
+       c.wcc_all>c.nodes || c.wcc_l0>c.nodes ||
+       (c.available==CUVS_CONNECTIVITY_DISABLED &&
+        (c.spilled || c.nodes || c.unreachable || c.unreachable_l0 ||
+         c.wcc_l0 || c.wcc_all || c.elapsed_us)))
         memset(&c,0,sizeof(c));
     return c;
 }
@@ -221,7 +230,9 @@ hnsw_append_connectivity(StringInfo json, const CuvsConnectivity *c)
 {
     if(c->magic!=CUVS_CONNECTIVITY_MAGIC)
         appendStringInfoString(json,",\"connectivity\":{\"status\":\"not_recorded\",\"scope\":\"build_snapshot\"}");
-    else if(!c->available)
+    else if(c->available==CUVS_CONNECTIVITY_DISABLED)
+        appendStringInfoString(json,",\"connectivity\":{\"status\":\"disabled\",\"scope\":\"build_snapshot\",\"setting\":\"cuvs.hnsw_connectivity_check\"}");
+    else if(c->available!=CUVS_CONNECTIVITY_MEASURED)
         appendStringInfo(json,",\"connectivity\":{\"status\":\"unavailable\",\"scope\":\"build_snapshot\",\"nodes\":%llu,\"unreachable\":null}",(unsigned long long)c->nodes);
     else
         appendStringInfo(json,",\"connectivity\":{\"status\":\"measured\",\"scope\":\"build_snapshot\",\"nodes\":%llu,\"unreachable\":%llu,\"unreachable_l0\":%llu,\"wcc_all\":%llu,\"wcc_l0\":%llu,\"check_us\":%llu,\"spilled\":%s}",
@@ -232,7 +243,9 @@ hnsw_append_connectivity(StringInfo json, const CuvsConnectivity *c)
 static void
 hnsw_notice_connectivity(const CuvsConnectivity *c)
 {
-    if(c->available)
+    if(c->available==CUVS_CONNECTIVITY_DISABLED)
+        return; /* The check was not run; there is nothing to report. */
+    if(c->available==CUVS_CONNECTIVITY_MEASURED)
         ereport(NOTICE,(errmsg("pg_cuvs: build connectivity: unreachable=%llu, L0 unreachable=%llu, WCC=%llu (L0=%llu), check_us=%llu",
             (unsigned long long)c->unreachable,(unsigned long long)c->unreachable_l0,
             (unsigned long long)c->wcc_all,(unsigned long long)c->wcc_l0,
@@ -1435,9 +1448,10 @@ hnsw_check_elements(ElemDesc *elems,size_t n,int entry)
     struct timespec start,end;
     uint32_t maxlevel=0;
     void *workspace;size_t bytes;bool spilled;
+    if(!cuvs_hnsw_connectivity_check){cuvs_connectivity_set_disabled(&c);return c;}
     CHECK_FOR_INTERRUPTS();
     c.magic=CUVS_CONNECTIVITY_MAGIC;c.version=1;c.nodes=n;
-    if(n==0){c.available=1;return c;}
+    if(n==0){c.available=CUVS_CONNECTIVITY_MEASURED;return c;}
     if(n>UINT32_MAX || entry<0 || (size_t)entry>=n || n>SIZE_MAX/17)return c;
     bytes=n*17;workspace=hnsw_connectivity_workspace(bytes,&spilled);
     if(!workspace){CHECK_FOR_INTERRUPTS();return c;}
@@ -3265,6 +3279,7 @@ hnsw_check_connectivity(int fd, const HnswlibHeader *h, CuvsConnectivity *out)
     uint32_t n = (uint32_t)h->curElementCount;
     void *workspace=NULL;
     bool spilled=false;
+    if(!cuvs_hnsw_connectivity_check){cuvs_connectivity_set_disabled(out);return;}
     CHECK_FOR_INTERRUPTS();
     memset(out, 0, sizeof(*out));
     out->magic=CUVS_CONNECTIVITY_MAGIC;out->version=1;out->nodes=n;
@@ -3406,7 +3421,10 @@ hnsw_import_empty_build_result(Relation indexRel,
 
         {
             CuvsConnectivity c={0};
-            c.magic=CUVS_CONNECTIVITY_MAGIC;c.version=1;c.available=1;
+            if(cuvs_hnsw_connectivity_check){
+                c.magic=CUVS_CONNECTIVITY_MAGIC;c.version=1;c.available=CUVS_CONNECTIVITY_MEASURED;
+            } else
+                cuvs_connectivity_set_disabled(&c);
             hnsw_store_connectivity(metapage,&c);
             hnsw_notice_connectivity(&c);
         }

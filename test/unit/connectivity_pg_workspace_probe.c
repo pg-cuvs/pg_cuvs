@@ -10,6 +10,8 @@
 #include <time.h>
 #include <unistd.h>
 
+/* Referenced by the production file; the workspace helper itself ignores it. */
+bool cuvs_hnsw_connectivity_check = true;
 static unsigned calls;
 static int last_rc, all_masked;
 static bool inject_eintr;

@@ -26,15 +26,35 @@ ALTER EXTENSION pg_cuvs DROP FUNCTION pg_cuvs_hnsw_connectivity_status(regclass)
 DROP FUNCTION pg_cuvs_hnsw_connectivity_status(regclass);
 \i /src/scripts/install-connectivity-status.sql
 \i /src/scripts/install-connectivity-status.sql
+-- The check is opt-in: the registered default is off, user-settable.
+SELECT name,boot_val,setting,context FROM pg_settings WHERE name='cuvs.hnsw_connectivity_check';
+DO $$BEGIN
+ ASSERT (SELECT boot_val FROM pg_settings WHERE name='cuvs.hnsw_connectivity_check')='off';
+ ASSERT current_setting('cuvs.hnsw_connectivity_check')='off';
+ ASSERT (SELECT context FROM pg_settings WHERE name='cuvs.hnsw_connectivity_check')='user';END$$;
 CREATE TABLE conn_empty(v vector(4));
 CREATE INDEX conn_empty_idx ON conn_empty USING pg_cuvs_hnsw(v vector_l2_ops);
-DO $$BEGIN ASSERT pg_cuvs_hnsw_connectivity_status('conn_empty_idx')->>'status'='measured';
- ASSERT (pg_cuvs_hnsw_connectivity_status('conn_empty_idx')->>'nodes')::int=0;END$$;
+DO $$BEGIN ASSERT pg_cuvs_hnsw_connectivity_status('conn_empty_idx')->>'status'='disabled';
+ ASSERT pg_cuvs_hnsw_connectivity_status('conn_empty_idx')=pg_cuvs_hnsw_build_info('conn_empty_idx')->'connectivity';
+ ASSERT NOT (pg_cuvs_hnsw_connectivity_status('conn_empty_idx') ? 'nodes');END$$;
+SET cuvs.hnsw_connectivity_check=on;
+CREATE INDEX conn_empty_idx_on ON conn_empty USING pg_cuvs_hnsw(v vector_l2_ops);
+RESET cuvs.hnsw_connectivity_check;
+DO $$BEGIN ASSERT pg_cuvs_hnsw_connectivity_status('conn_empty_idx_on')->>'status'='measured';
+ ASSERT (pg_cuvs_hnsw_connectivity_status('conn_empty_idx_on')->>'nodes')::int=0;END$$;
 SELECT version();
 CREATE TABLE conn_rows(id int,v vector(4));
 INSERT INTO conn_rows SELECT i,ARRAY[(i/128)*100+i*0.001,(i/128)*100+i*0.001,(i/128)*100+i*0.001,(i/128)*100+i*0.001]::vector FROM generate_series(0,255)i;
 CREATE INDEX conn_source ON conn_rows USING cagra(v vector_l2_ops);
+-- Default (off): no check, no NOTICE, status disabled; the graph is built all the same.
+CREATE INDEX conn_target_off ON conn_rows USING pg_cuvs_hnsw(v vector_l2_ops) WITH(source='conn_source',mode='nsw');
+DO $$DECLARE c jsonb;BEGIN
+ c:=pg_cuvs_hnsw_connectivity_status('conn_target_off');
+ ASSERT c='{"status":"disabled","scope":"build_snapshot","setting":"cuvs.hnsw_connectivity_check"}'::jsonb,c::text;
+END$$;
+SET cuvs.hnsw_connectivity_check=on;
 CREATE INDEX conn_target ON conn_rows USING pg_cuvs_hnsw(v vector_l2_ops) WITH(source='conn_source',mode='nsw');
+RESET cuvs.hnsw_connectivity_check;
 SELECT pg_cuvs_hnsw_build_info('conn_target');
 SELECT pg_cuvs_hnsw_connectivity_status('conn_target');
 DO $$DECLARE c jsonb;BEGIN
@@ -51,6 +71,19 @@ SET enable_seqscan=off;
 EXPLAIN (COSTS OFF) SELECT id FROM conn_rows ORDER BY v <-> '[0,0,0,0]'::vector LIMIT 1;
 DO $$DECLARE got int;BEGIN SELECT id INTO got FROM conn_rows ORDER BY v <-> '[0,0,0,0]'::vector LIMIT 1;ASSERT got=0;END$$;
 SQL
+# NOTICE visibility: default (off) emits none, on emits the measured line.
+off_out=$(psql -X -h "$D/socket" -p 55449 -U runner -d postgres -v ON_ERROR_STOP=1 2>&1 <<'SQL'
+CREATE INDEX conn_notice_off ON conn_rows USING pg_cuvs_hnsw(v vector_l2_ops) WITH(source='conn_source',mode='nsw');
+SQL
+)
+if printf '%s\n' "$off_out" | grep -q 'build connectivity'; then echo "FAIL: NOTICE with the check off: $off_out"; exit 1; fi
+on_out=$(psql -X -h "$D/socket" -p 55449 -U runner -d postgres -v ON_ERROR_STOP=1 2>&1 <<'SQL'
+SET cuvs.hnsw_connectivity_check=on;
+CREATE INDEX conn_notice_on ON conn_rows USING pg_cuvs_hnsw(v vector_l2_ops) WITH(source='conn_source',mode='nsw');
+SQL
+)
+printf '%s\n' "$on_out" | grep -q 'pg_cuvs: build connectivity: unreachable=' || { echo "FAIL: no NOTICE with the check on: $on_out"; exit 1; }
+echo "PASS NOTICE only when the check is on"
 # Crash/recovery exercises the FPI hole boundary, not just a clean flush.
 runuser -u runner -- pg_ctl -D "$D/data" -m immediate stop
 runuser -u runner -- pg_ctl -D "$D/data" -l "$D/pg.log" start
@@ -59,7 +92,9 @@ DO $$DECLARE c jsonb;BEGIN
  c:=pg_cuvs_hnsw_connectivity_status('conn_target');
  ASSERT c->>'status'='measured';
  ASSERT (c->>'nodes')::int=256 AND (c->>'unreachable')::int=128;
+ ASSERT pg_cuvs_hnsw_connectivity_status('conn_target_off')->>'status'='disabled';
+ ASSERT pg_cuvs_hnsw_connectivity_status('conn_empty_idx')->>'status'='disabled';
 END$$;
-SELECT 'PASS SQL status/NOTICE, snapshot after INSERT, immediate recovery';
+SELECT 'PASS SQL status/NOTICE, default-off disabled record, snapshot after INSERT, immediate recovery';
 SQL
 cp "$D/pg.log" /out/pg-runtime.log

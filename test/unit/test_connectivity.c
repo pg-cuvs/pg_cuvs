@@ -14,6 +14,13 @@ int main(void) {
  edges[0][1][0]=1;edges[0][1][1]=2;
  assert(cuvs_connectivity(4,0,1,1,links,NULL,NULL,&s));
  assert(s.unreachable==0 && s.unreachable_l0==2 && s.wcc_l0==2 && s.wcc_all==1);
+ assert(s.available==CUVS_CONNECTIVITY_MEASURED);
+ memset(&s,0xAA,sizeof(s));cuvs_connectivity_set_disabled(&s); /* the record stored when the check is off */
+ assert(s.magic==CUVS_CONNECTIVITY_MAGIC && s.version==1 && s.available==CUVS_CONNECTIVITY_DISABLED &&
+        s.spilled==0 && s.nodes==0 && s.unreachable==0 && s.unreachable_l0==0 && s.wcc_l0==0 &&
+        s.wcc_all==0 && s.elapsed_us==0);
+ assert(CUVS_CONNECTIVITY_UNAVAILABLE==0 && sizeof(CuvsConnectivity)==64);
+ assert(cuvs_connectivity(4,0,1,1,links,NULL,NULL,&s));
  assert(!cuvs_connectivity(4,0,1,1,links,(void*)1,NULL,&s));
  assert(cuvs_connectivity(4,0,0,1,links,NULL,NULL,&s));
  assert(s.unreachable==2 && s.wcc_all==1); /* No upward traversal at a non-entry node. */

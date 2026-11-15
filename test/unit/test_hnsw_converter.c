@@ -113,10 +113,11 @@ void pg_re_throw(void)
  * provide the backend primitives used by the production page writer. */
 /* Unexpected backend ERRORs must fail the standalone fixture, rather than
  * relying on unresolved symbols that a platform linker might tolerate. */
+static int test_last_elevel;
 bool
 errstart(int elevel, const char *domain)
 {
-    (void)elevel;
+    test_last_elevel = elevel;
     (void)domain;
     return true;
 }
@@ -127,19 +128,30 @@ errstart_cold(int elevel, const char *domain)
     return errstart(elevel, domain);
 }
 
+static unsigned test_errmsg_calls;
 int
 errmsg(const char *format, ...)
 {
     va_list args;
+    test_errmsg_calls++;
     va_start(args, format);
     vfprintf(stderr, format, args);
     va_end(args);
     return 0;
 }
 
+int
+errdetail(const char *format, ...)
+{
+    (void)format; /* only hnsw_notice_connectivity() reaches this stub */
+    return 0;
+}
+
 void
 errfinish(const char *filename, int lineno, const char *funcname)
 {
+    if (test_last_elevel < ERROR)
+        return; /* NOTICE/WARNING/LOG reports (e.g. the connectivity NOTICE) are not failures */
     fprintf(stderr, "\nunexpected backend ERROR at %s:%d (%s)\n",
             filename, lineno, funcname);
     abort();
@@ -1635,11 +1647,33 @@ test_ace_readback_metapage_roundtrip(void)
     assert(memcmp((char *)meta + prefix + sizeof(p), &nn, sizeof(nn)) == 0);
     ((PageHeader)meta)->pd_lower--;
     assert(hnsw_read_disk_policy(meta, &out) == CUVS_HNSW_POLICY_CORRUPT);
+    /* The NN route carries the connectivity record in the tail outside the WAL hole, measured or
+     * disabled, and neither record disturbs the receipt or the NN readback in front of it. */
+    {
+        CuvsConnectivity cm = {0}, cd, rb;
+        const CuvsConnectivity *records[2] = {&cm, &cd};
+        cm.magic = CUVS_CONNECTIVITY_MAGIC; cm.version = 1; cm.available = CUVS_CONNECTIVITY_MEASURED;
+        cm.nodes = 10000; cm.unreachable = 3; cm.wcc_all = 1; cm.elapsed_us = 7;
+        cuvs_connectivity_set_disabled(&cd);
+        for (int i = 0; i < 2; i++)
+        {
+            chain_test_reset();
+            hnsw_write_disk_metapage(NULL, &hdr, 2, 1, true, &table, &p, &ace, &nn, records[i]);
+            meta = (Page)chain_test_pages[chain_test_nblocks - 1];
+            assert(((PageHeader)meta)->pd_lower == prefix + sizeof(p) + sizeof(nn));
+            assert(hnsw_read_disk_policy(meta, &out) == CUVS_HNSW_POLICY_RECORDED);
+            assert(memcmp((char *)meta + prefix + sizeof(p), &nn, sizeof(nn)) == 0);
+            rb = hnsw_read_connectivity(meta);
+            assert(rb.magic == CUVS_CONNECTIVITY_MAGIC && rb.available == records[i]->available &&
+                   rb.nodes == records[i]->nodes && rb.unreachable == records[i]->unreachable);
+        }
+    }
 
     fixture_close(&f);
     BufFileClose(&fake_file);
     puts("PASS ACE readback metapage roundtrip: bytes at prefix+receipt, pd_lower, older/foreign/truncated tails, resident has none, writer refuses invalid");
     puts("PASS NN v3 metapage roundtrip and truncated tail rejection (CPU fixture)");
+    puts("PASS NN route stores a measured or disabled connectivity record next to the readback");
 }
 
 /* The row reader reserves each level-0 record before reading its fields, so
@@ -1913,6 +1947,62 @@ char *DataDir = NULL;
 int temp_file_limit = -1;
 int maintenance_work_mem = 65536;
 volatile sig_atomic_t InterruptPending = 0;
+/* The GUC lives in pg_cuvs.c; the fixture owns its own. The existing adapter
+ * tests run with the check on; test_connectivity_guc_off() covers the default. */
+bool cuvs_hnsw_connectivity_check = true;
+static void test_connectivity_guc_off(void)
+{
+    Fixture f=fixture_create(false);
+    HnswlibHeader h;
+    CuvsConnectivity c, back;
+    StringInfoData json;
+    unsigned before;
+    assert(pread(f.hnsw_fd,&h,sizeof(h),0)==sizeof(h));
+    cuvs_hnsw_connectivity_check=false;
+    /* An unusable descriptor, no temp directory and a zero memory budget would make a
+     * check that runs end as 'unavailable'. Only a check that never starts is 'disabled'. */
+    maintenance_work_mem=0;DataDir="/nonexistent-conn203-parent/path";
+    memset(&c,0xAA,sizeof(c));
+    hnsw_check_connectivity(-1,&h,&c);
+    assert(c.magic==CUVS_CONNECTIVITY_MAGIC && c.version==1 && c.available==CUVS_CONNECTIVITY_DISABLED);
+    assert(c.nodes==0 && c.unreachable==0 && c.unreachable_l0==0 && c.wcc_all==0 && c.wcc_l0==0 &&
+           c.elapsed_us==0 && c.spilled==0);
+    /* The element adapter must not even look at its input when the check is off. */
+    c=hnsw_check_elements(NULL,5,0);
+    assert(c.available==CUVS_CONNECTIVITY_DISABLED && c.nodes==0 && c.elapsed_us==0);
+    before=test_errmsg_calls;
+    hnsw_notice_connectivity(&c);
+    assert(test_errmsg_calls==before); /* no NOTICE for a check that was not run */
+    initStringInfo(&json);
+    hnsw_append_connectivity(&json,&c);
+    assert(strstr(json.data,"\"status\":\"disabled\"") && strstr(json.data,"cuvs.hnsw_connectivity_check") &&
+           !strstr(json.data,"not_recorded") && !strstr(json.data,"measured") && !strstr(json.data,"unavailable"));
+    /* The disabled record survives the metapage tail and reads back as disabled, not as not_recorded. */
+    {
+        static char page[BLCKSZ];
+        PageHeader ph=(PageHeader)page;
+        memset(page,0,sizeof(page));
+        ph->pd_lower=SizeOfPageHeaderData+64;ph->pd_upper=BLCKSZ;ph->pd_special=BLCKSZ;
+        hnsw_store_connectivity((Page)page,&c);
+        assert(ph->pd_upper==BLCKSZ-sizeof(c));
+        back=hnsw_read_connectivity((Page)page);
+        assert(back.magic==CUVS_CONNECTIVITY_MAGIC && back.available==CUVS_CONNECTIVITY_DISABLED);
+        /* A disabled record that carries counters is corrupt: reported as not_recorded. */
+        ((CuvsConnectivity*)(page+ph->pd_upper))->nodes=7;
+        back=hnsw_read_connectivity((Page)page);
+        assert(back.magic==0);
+    }
+    /* Positive control: the same fixture measures once the setting is on. */
+    cuvs_hnsw_connectivity_check=true;
+    maintenance_work_mem=65536;DataDir=NULL;
+    hnsw_check_connectivity(f.hnsw_fd,&h,&c);
+    assert(c.available==CUVS_CONNECTIVITY_MEASURED && c.wcc_all==1 && c.unreachable==0);
+    before=test_errmsg_calls;
+    hnsw_notice_connectivity(&c);
+    assert(test_errmsg_calls==before+1); /* the counter above can see a NOTICE */
+    fixture_close(&f);
+    puts("PASS connectivity check off by setting: disabled record, no work, no NOTICE, status disabled, tail roundtrip");
+}
 static void test_connectivity_file_path(void)
 {
     Fixture f=fixture_create(false);
@@ -1976,6 +2066,7 @@ main(int argc, char **argv)
         close(fd);return 0;
     }
     test_connectivity_file_path();
+    test_connectivity_guc_off();
     test_stored_policy_versions();
     test_ace_readback_metapage_roundtrip();
     test_valid_flat_and_original_labels();

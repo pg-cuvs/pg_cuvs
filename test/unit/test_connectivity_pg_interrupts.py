@@ -66,6 +66,12 @@ class Session:
                 return out
             out.append(line)
 
+    def stderr_barrier(self, tag):
+        """psql writes NOTICEs to one ordered stderr stream: once this sentinel is read, every NOTICE
+        the earlier statements raised is already in self.errors (stdout/stderr are separate threads)."""
+        self.ask(f"DO $$BEGIN RAISE NOTICE 'CONN203_BARRIER_{tag}'; END$$;")
+        assert self.wait_error(f"CONN203_BARRIER_{tag}", 3), "stderr barrier not seen"
+
     def close(self):
         if self.p.poll() is None:
             try:
@@ -106,7 +112,7 @@ def main():
     log = temp / "postgres.log"
     try:
         exports = temp / "probe.exports"
-        exports.write_text("{global: Pg_magic_func; conn203_probe; pg_finfo_conn203_probe; "
+        exports.write_text("{global: Pg_magic_func; _PG_init; conn203_probe; pg_finfo_conn203_probe; "
                            "conn203_probe_state; pg_finfo_conn203_probe_state; local: *;};\n")
         command = [os.environ.get("CC", "cc"), "-std=gnu11", "-O2", "-g", "-fPIC", "-shared",
                    "-ffunction-sections", "-fdata-sections", "-Wl,--gc-sections",
@@ -144,7 +150,8 @@ def main():
                     try:
                         pid = int(c.ask("SELECT pg_backend_pid();")[0])
                         row["pid"] = pid
-                        c.ask("SET maintenance_work_mem='" + ("1MB" if spill else "64MB") + "';")
+                        # The check is opt-in (default off): every case below that runs the kernel turns it on.
+                        c.ask("SET cuvs.hnsw_connectivity_check=on; SET maintenance_work_mem='" + ("1MB" if spill else "64MB") + "';")
                         if event == "timeout":
                             c.ask("SET statement_timeout='1500ms';")
                         action = {"normal": 0, "generic_pending": 1, "log_memory": 2,
@@ -197,6 +204,9 @@ def main():
                                 assert snap["status"] == "measured", value
                                 assert snap["unreachable"] == 0 and snap["wcc_all"] == 1, value
                                 assert snap["spilled"] == spill, value
+                                c.stderr_barrier("m")
+                                assert any("pg_cuvs: build connectivity: unreachable=0" in x for x in c.errors), \
+                                    "a measured build must report its NOTICE (positive control for the off cases)"
                             state = json.loads(c.ask("SELECT conn203_probe_state();")[0])
                             row["after"] = state
                             assert state["heap_live"] == 0 and state["map_live"] == 0, state
@@ -216,6 +226,47 @@ def main():
                         row["stderr"] = list(c.errors)
                         result["cases"].append(row)
                         (output / "result.json").write_text(json.dumps(result, indent=2) + "\n")
+        # Default setting (off): the check must not run at all. Same backend then turns it on as a
+        # positive control, so a counter or NOTICE filter that can see nothing cannot pass vacuously.
+        for file in [False, True]:
+            c = Session(psql)
+            row = {"adapter": "file" if file else "elements", "spilled": False, "event": "guc_off"}
+            try:
+                row["pid"] = int(c.ask("SELECT pg_backend_pid();")[0])
+                # Settings that would make a running check expensive or spill; none may matter when off.
+                c.ask("SET maintenance_work_mem='1MB';")
+                flag = "true" if file else "false"
+                off = json.loads(c.ask(f"SELECT conn203_probe({flag},0);")[0])
+                row["off"] = off
+                assert c.ask("SHOW cuvs.hnsw_connectivity_check;") == ["off"], "default must be off"
+                snap = off["connectivity"]
+                assert snap == {"status": "disabled", "scope": "build_snapshot",
+                                "setting": "cuvs.hnsw_connectivity_check"}, off
+                state = json.loads(c.ask("SELECT conn203_probe_state();")[0])
+                row["off_state"] = state
+                assert state["alloc_total"] == 0 and state["map_total"] == 0 and state["kernel_calls"] == 0 \
+                    and state["cfi_total"] == 0 and state["heap_live"] == 0 and state["map_live"] == 0, state
+                c.stderr_barrier("off")
+                assert not any("build connectivity" in x for x in c.errors), c.errors
+                assert not list((temp / "data/base/pgsql_tmp").glob("*conn203-*")), "scratch created while off"
+                c.ask("SET cuvs.hnsw_connectivity_check=on;")
+                on = json.loads(c.ask(f"SELECT conn203_probe({flag},0);")[0])
+                row["on"] = on
+                assert on["connectivity"]["status"] == "measured" and on["connectivity"]["spilled"] is True, on
+                state = json.loads(c.ask("SELECT conn203_probe_state();")[0])
+                row["on_state"] = state
+                assert state["kernel_calls"] == 1 and state["cfi_total"] > 0 and \
+                    state["alloc_total"] + state["map_total"] > 0, state
+                c.stderr_barrier("on")
+                assert any("pg_cuvs: build connectivity: unreachable=0" in x for x in c.errors), c.errors
+                row["verdict"] = "PASS"
+            except Exception as e:
+                row.update(verdict="FAIL", error=str(e), error_type=type(e).__name__, stderr=list(c.errors))
+            finally:
+                c.close()
+                row["stderr"] = list(c.errors)
+                result["cases"].append(row)
+                (output / "result.json").write_text(json.dumps(result, indent=2) + "\n")
         result["passed"] = sum(x["verdict"] == "PASS" for x in result["cases"])
         result["failed"] = len(result["cases"]) - result["passed"]
         return 0 if result["failed"] == 0 else 1
