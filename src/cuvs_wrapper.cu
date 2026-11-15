@@ -3121,7 +3121,7 @@ cuvs_hnsw_build_file(int vectors_fd, int owner_fd,
         }
         if (params->hierarchy && params->build_algo == CUVS_HNSW_ALGO_NN_DESCENT
             && !hnsw_sdk_marker_verified("pgcuvs_hnsw_resident_nn_upper_patch_id",
-                "pgcuvs-hnsw-resident-nn-upper-v3@9a18eb49f1e124f9c7806033a1544ce8d50a25bbc4164a22f54d0d441c1b8746"))
+                "pgcuvs-hnsw-resident-nn-upper-v3@dd5cb9847eb0ee78d5b0cc6e543f3a3ba80ee5942871b8baf568e0df040931d2"))
         {
             snprintf(error, error_len, "resident NN hierarchy requires the matching SDK upper precision guard");
             return CUVS_STATUS_BUILD_FAILED;

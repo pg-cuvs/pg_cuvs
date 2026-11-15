@@ -36,7 +36,7 @@
     },
     {
       "path": "0005-hnsw-resident-nn-upper.patch",
-      "sha256": "9d55a10e78f5ad285b94a133a583d4f576fc0586aa13c6ff32b5948a7be4dc06"
+      "sha256": "3eb4959800693e760ba10f89c7f9c7a2261515549dacf2015443e7771196d393"
     },
     {
       "path": "0006-cagra-consumer-row-sort.patch",
@@ -58,10 +58,10 @@
     },
     "resident_nn_upper": {
       "symbol": "pgcuvs_hnsw_resident_nn_upper_patch_id",
-      "value": "pgcuvs-hnsw-resident-nn-upper-v3@9a18eb49f1e124f9c7806033a1544ce8d50a25bbc4164a22f54d0d441c1b8746",
+      "value": "pgcuvs-hnsw-resident-nn-upper-v3@dd5cb9847eb0ee78d5b0cc6e543f3a3ba80ee5942871b8baf568e0df040931d2",
       "content_digest": {
         "algorithm": "sha256 over concatenated post-0005 bytes",
-        "value": "9a18eb49f1e124f9c7806033a1544ce8d50a25bbc4164a22f54d0d441c1b8746",
+        "value": "dd5cb9847eb0ee78d5b0cc6e543f3a3ba80ee5942871b8baf568e0df040931d2",
         "files": [
           "cpp/src/neighbors/detail/hnsw.hpp",
           "cpp/src/neighbors/detail/hnsw_precision.hpp",
@@ -74,13 +74,13 @@
     "cpp/src/neighbors/detail/hnsw.hpp": {
       "base_sha256": "6c8530e39c6ed5fa4eb3fe7b9c6c24022842147c41814fc4c130fdb5a6b8fd0b",
       "patch1_sha256": "49adab846921272a2aaf28f3c5749fb85925fbfde8ca43cd0af61e51adcbba99",
-      "final_sha256": "3e85f3b185b214617065cbce597d67b28424078221b55f74384987cee3caf755",
+      "final_sha256": "1cbf108599373d7af791bd28b6174f408deb32562584389c243a809818791f7a",
       "patch3_sha256": "88192b1da4cb50a2de5a0f374854c1d0659734215136f86d7e53e52c0a1dc911",
       "patch4_sha256": "1378471e577268a0abbb5e575a4eeba5a45734f52e7aa35017545e28099d00ca"
     },
     "cpp/src/neighbors/hnsw.cpp": {
       "base_sha256": "59c7874565b049eed090e7423df638eb18e4551ccd1cd4b65f1197dc4a4a7102",
-      "final_sha256": "5f7b5d6e2efe5024d6d11420148325900f49790544130440eae3f3c99054446d",
+      "final_sha256": "4d992e9a475123a9ef243ebdcbd30050f297a964b5621ab1ef83799da0e435e9",
       "patch3_sha256": "fcbe6c5c40d35854a6deb6a3182c70dca8e5b53e83bb79c11a2efcb4b1a4a39e",
       "patch4_sha256": "dce2bbaa933c6f046f561e35c6da5fb33c56ac37930cad5285123460e0b64069"
     },
@@ -99,7 +99,7 @@
     },
     "cpp/src/neighbors/detail/hnsw_precision.hpp": {
       "base_sha256": null,
-      "final_sha256": "e6a0839d761fa6720c11c94f7b4a2b485ac707446b173b4c5946a9c56979838c",
+      "final_sha256": "1ad79816c9057c7289213799e3c5ed71d53c4299e85bdad4bfd58dd7ccf37072",
       "patch4_sha256": "c051c5bfe6c5b1031c61806ab7d0a8804741724011b41b33bb63eac9cb72dc69"
     },
     "cpp/src/neighbors/detail/cuvs_hnsw_nn_upper_contract.h": {

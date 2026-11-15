@@ -14,7 +14,7 @@ index 0000000..94a0b59
 +#define PGC_UVS_NN_UPPER_FP32 (SIZE_MAX - 1)
 +#endif
 diff --git a/cpp/src/neighbors/detail/hnsw.hpp b/cpp/src/neighbors/detail/hnsw.hpp
-index cdcf166..7a3dbdb 100644
+index cdcf166..443f9f8 100644
 --- a/cpp/src/neighbors/detail/hnsw.hpp
 +++ b/cpp/src/neighbors/detail/hnsw.hpp
 @@ -9,6 +9,7 @@
@@ -54,7 +54,7 @@ index cdcf166..7a3dbdb 100644
    // Keep the legacy IVF-PQ heuristic when no guard budget was supplied. The bounded path uses
    // NN-descent because its source allocations are explicit and can be preflighted as one ledger;
    // IVF-PQ's training/index build has additional data-dependent device allocations.
-@@ -348,8 +353,18 @@ void all_neighbors_graph(raft::resources const& res,
+@@ -348,8 +353,28 @@ void all_neighbors_graph(raft::resources const& res,
    if (memory_guard::hnsw_upper_level_uses_nn_descent(rows, degree, has_memory_budget)) {
      RAFT_EXPECTS(rows > 0 && rows < static_cast<size_t>(std::numeric_limits<int>::max() - 1),
                   "memory guard: HNSW upper-level row count is unsupported by NN-descent");
@@ -71,13 +71,24 @@ index cdcf166..7a3dbdb 100644
 +      if (resident_fp32) gpu_workspace = checked_add(gpu_workspace,
 +        checked_mul(checked_mul(rows, dim), sizeof(float)));
 +    }
++    // pg_cuvs decision B: resident NN + L2 upper levels use a centered copy of this
++    // level's query set as the NN-descent input (see upper_precision::center_columns).
++    bool center_upper = false;
++    if constexpr (std::is_same_v<T, float>) {
++      center_upper = resident_nn_upper &&
++                     (metric == cuvs::distance::DistanceType::L2Expanded ||
++                      metric == cuvs::distance::DistanceType::L2SqrtExpanded);
++    }
++    if (center_upper) host_workspace = checked_add(host_workspace,
++      checked_mul(checked_mul(rows, dim), sizeof(T)));
      require_within("HNSW upper-level NN-descent host workspace", host_workspace, host_budget);
      require_within("HNSW upper-level NN-descent GPU workspace", gpu_workspace, gpu_budget);
  
-@@ -358,6 +373,19 @@ void all_neighbors_graph(raft::resources const& res,
+@@ -358,7 +383,32 @@ void all_neighbors_graph(raft::resources const& res,
      nn_params.intermediate_graph_degree = checked_mul(degree, size_t{2});
      nn_params.metric                    = metric;
      nn_params.return_distances          = false;
+-    auto nn_index                       = nn_descent::build(res, nn_params, dataset, neighbors);
 +    if constexpr (std::is_same_v<T, float>) {
 +      if (resident_nn_upper) {
 +        nn_params.dist_comp_dtype = resident_fp32 ? nn_descent::DIST_COMP_DTYPE::FP32
@@ -91,10 +102,23 @@ index cdcf166..7a3dbdb 100644
 +                      resident_fp32 ? "fp32" : "fp16");
 +      }
 +    }
-     auto nn_index                       = nn_descent::build(res, nn_params, dataset, neighbors);
++    std::vector<T> centered;
++    auto nn_input = dataset;
++    if constexpr (std::is_same_v<T, float>) {
++      if (center_upper) {
++        centered.resize(checked_mul(rows, dim));
++        RAFT_EXPECTS(upper_precision::center_columns(dataset.data_handle(), rows, dim, centered.data()),
++                     "HNSW upper-level NN input centering failed");
++        nn_input = raft::make_host_matrix_view<const T, int64_t>(
++          centered.data(), static_cast<int64_t>(rows), static_cast<int64_t>(dim));
++        RAFT_LOG_INFO("HNSW upper-level NN input centered rows=%zu dim=%zu", rows, dim);
++      }
++    }
++    auto nn_index                       = nn_descent::build(res, nn_params, nn_input, neighbors);
    } else {
      // Bound the actual IVF-PQ query batches and their device/host I/O arrays before the builder
-@@ -405,6 +433,19 @@ void all_neighbors_graph(raft::resources const& res,
+     // allocates them. The large-workspace branch in cagra_build.cuh reserves five batch widths.
+@@ -405,6 +455,19 @@ void all_neighbors_graph(raft::resources const& res,
    }
  }
  
@@ -114,7 +138,7 @@ index cdcf166..7a3dbdb 100644
  template <typename T, typename IdxT>
  void serialize_to_hnswlib_from_disk(raft::resources const& res,
                                      std::ostream& os_raw,
-@@ -1040,6 +1081,17 @@ std::enable_if_t<hierarchy == HnswHierarchy::GPU, std::unique_ptr<index<T>>> fro
+@@ -1040,6 +1103,17 @@ std::enable_if_t<hierarchy == HnswHierarchy::GPU, std::unique_ptr<index<T>>> fro
    auto stream = raft::resource::get_cuda_stream(res);
    auto num_threads =
      params.num_threads == 0 ? cuvs::core::omp::get_max_threads() : params.num_threads;
@@ -132,7 +156,7 @@ index cdcf166..7a3dbdb 100644
  
    /* Note: NNSW data layout
  
-@@ -1212,7 +1264,8 @@ std::enable_if_t<hierarchy == HnswHierarchy::GPU, std::unique_ptr<index<T>>> fro
+@@ -1212,7 +1286,8 @@ std::enable_if_t<hierarchy == HnswHierarchy::GPU, std::unique_ptr<index<T>>> fro
      all_neighbors_graph(res,
                          raft::make_const_mdspan(host_query_set.view()),
                          host_neighbors.view(),
@@ -143,10 +167,14 @@ index cdcf166..7a3dbdb 100644
      {
        common::nvtx::range<common::nvtx::domain::cuvs> copy_scope(
 diff --git a/cpp/src/neighbors/detail/hnsw_precision.hpp b/cpp/src/neighbors/detail/hnsw_precision.hpp
-index 6274afc..ad027cb 100644
+index 6274afc..844185d 100644
 --- a/cpp/src/neighbors/detail/hnsw_precision.hpp
 +++ b/cpp/src/neighbors/detail/hnsw_precision.hpp
-@@ -11,6 +11,19 @@
+@@ -8,9 +8,23 @@
+ #include <cmath>
+ #include <cstddef>
+ #include <limits>
++#include <vector>
  
  namespace cuvs::neighbors::hnsw::detail::upper_precision {
  
@@ -166,8 +194,35 @@ index 6274afc..ad027cb 100644
  // Policy bound shared with the product, not a proof of every PQ intermediate.
  inline double distance_bound(double max_sq_norm, bool is_l2)
  {
+@@ -38,4 +52,26 @@ double max_sq_norm(const T* data, size_t rows, size_t dim)
+   return maximum;
+ }
+ 
++/* NN-descent computes L2 as ||a||^2 + ||b||^2 - 2 a.b in float32, so a large
++ * common offset cancels the neighbor order. L2 is translation invariant: build
++ * the upper-level NN graph from this level's column-centered copy (mean in
++ * float64). The copy is only the NN-descent input; hnswlib keeps the original
++ * vectors. Returns false for empty or nonfinite input. */
++template <typename T>
++bool center_columns(const T* data, size_t rows, size_t dim, T* out)
++{
++  if (rows == 0 || dim == 0) return false;
++  std::vector<double> mean(dim, 0.0);
++  for (size_t i = 0; i < rows; ++i)
++    for (size_t j = 0; j < dim; ++j) mean[j] += static_cast<double>(data[i * dim + j]);
++  for (size_t j = 0; j < dim; ++j) {
++    mean[j] /= static_cast<double>(rows);
++    if (!std::isfinite(mean[j])) return false;
++  }
++  for (size_t i = 0; i < rows; ++i)
++    for (size_t j = 0; j < dim; ++j)
++      out[i * dim + j] = static_cast<T>(static_cast<double>(data[i * dim + j]) - mean[j]);
++  return true;
++}
++
+ }  // namespace cuvs::neighbors::hnsw::detail::upper_precision
 diff --git a/cpp/src/neighbors/hnsw.cpp b/cpp/src/neighbors/hnsw.cpp
-index b2da14d..13b5d24 100644
+index b2da14d..054b0ff 100644
 --- a/cpp/src/neighbors/hnsw.cpp
 +++ b/cpp/src/neighbors/hnsw.cpp
 @@ -128,3 +128,9 @@ pgcuvs_hnsw_upper_precision_patch_id()
@@ -178,5 +233,5 @@ index b2da14d..13b5d24 100644
 +extern "C" __attribute__((visibility("default"))) const char*
 +pgcuvs_hnsw_resident_nn_upper_patch_id()
 +{
-+  return "pgcuvs-hnsw-resident-nn-upper-v3@9a18eb49f1e124f9c7806033a1544ce8d50a25bbc4164a22f54d0d441c1b8746";
++  return "pgcuvs-hnsw-resident-nn-upper-v3@dd5cb9847eb0ee78d5b0cc6e543f3a3ba80ee5942871b8baf568e0df040931d2";
 +}

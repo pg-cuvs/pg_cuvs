@@ -12,10 +12,13 @@ The patch body was first written against the B3 consumer snapshot `616eb202e83f5
 - The product carries the base NN dtype through two impossible ACE partition counts (`PGC_UVS_NN_UPPER_FP16 = SIZE_MAX`, `PGC_UVS_NN_UPPER_FP32 = SIZE_MAX - 1`, `cuvs_hnsw_nn_upper_contract.h`). The upper level uses FP32 when the base used FP32 or when a level's values do not fit half.
 - The existing six-argument `all_neighbors_graph` instantiations stay exported as forwarders, so older callers keep linking.
 - Auto, IVF-PQ, and ACE builds never set the private signal and keep the 0004 behavior.
+- Upper-level centering (pg_cuvs decision B, REVIEW-B F1). `from_cagra<GPU>` gathers each level's points from hnswlib's original vectors into `host_query_set` and calls `all_neighbors_graph`, which calls `nn_descent::build`. NN-descent then evaluates L2 as `||a||^2 + ||b||^2 - 2a.b` in float32 (`nn_descent.cuh` `calculate_metric`). On the resident NN path with an L2 metric, `all_neighbors_graph` now passes `nn_descent::build` a copy of that level's set centered by its own float64 column mean (`upper_precision::center_columns`). That copy is counted in the level's host workspace check. Only neighbor indices come back, so hnswlib's stored vectors and all search distances are unchanged. IP/cosine and non-resident calls are not centered.
+
+Earlier contents of 0005 (digest `9a18eb49…`) did not center the upper levels.
 
 ## Marker
 
-`pgcuvs_hnsw_resident_nn_upper_patch_id()` returns `pgcuvs-hnsw-resident-nn-upper-v3@<digest>`. The digest is the SHA-256 of the concatenated post-0005 bytes of `hnsw.hpp`, `hnsw_precision.hpp`, and `cuvs_hnsw_nn_upper_contract.h`, currently `9a18eb49f1e124f9c7806033a1544ce8d50a25bbc4164a22f54d0d441c1b8746`. The marker lives in `hnsw.cpp`, which is excluded from the digest to avoid self-reference. Earlier builds used the suffix `@616eb202...`, which named the pre-patch snapshot rather than the patch content. Those DSOs are rejected by the current product and must be rebuilt.
+`pgcuvs_hnsw_resident_nn_upper_patch_id()` returns `pgcuvs-hnsw-resident-nn-upper-v3@<digest>`. The digest is the SHA-256 of the concatenated post-0005 bytes of `hnsw.hpp`, `hnsw_precision.hpp`, and `cuvs_hnsw_nn_upper_contract.h`, currently `dd5cb9847eb0ee78d5b0cc6e543f3a3ba80ee5942871b8baf568e0df040931d2`. The marker lives in `hnsw.cpp`, which is excluded from the digest to avoid self-reference. Earlier builds used the suffix `@616eb202...`, which named the pre-patch snapshot rather than the patch content. Those DSOs are rejected by the current product and must be rebuilt.
 
 ## Verification
 
