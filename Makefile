@@ -597,7 +597,7 @@ test-hnsw-converter: test/unit/test_hnsw_converter.c src/hnsw_export.c \
 EXTRA_CLEAN += test-hnsw-build test-hnsw-build-ipc test-hnsw-owner-lease test-hnsw-ace-quality test-hnsw-converter test-hnsw-admission test-hnsw-explicit-route test-hnsw-policy \
                test-admission-contract test-admission-contract-cxx test-admission-contract-util.o \
                test-admission-wire test-admission-message test-admission-ipc test-build-oom-thread test-hnsw-auto-overflow test-res-pool test-lw-policy test-lw-guard test-failed-allocation test-host-free-fence test-vacuum-policy
-.PHONY: test-hnsw-build test-hnsw-build-ipc test-hnsw-ace-quality test-hnsw-ace-quality-mutations test-hnsw-converter test-hnsw-admission test-hnsw-explicit-route test-hnsw-policy \
+.PHONY: test-hnsw-build test-hnsw-build-ipc test-hnsw-owner-lease test-hnsw-ace-quality test-hnsw-ace-quality-mutations test-hnsw-converter test-hnsw-admission test-hnsw-explicit-route test-hnsw-policy \
         test-admission-contract test-admission-contract-mutations test-admission-wire \
         test-admission-message test-admission-ipc test-build-oom-thread test-gpu-wrapper-i3 test-hnsw-auto-overflow test-res-pool test-lw-policy test-lw-guard test-lw-mutations test-lw-docs \
         test-host-free-fence test-host-free-fence-mutations test-vacuum-policy test-vacuum-policy-mutations test-hnsw-precision-mutations
