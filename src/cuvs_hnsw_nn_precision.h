@@ -43,7 +43,16 @@ cuvs_hnsw_nn_precision(const float *data, uint64_t rows, uint32_t dim,
      * two margin beyond their mathematical absolute-sum bound. IP uses dot. */
     if (max_norm >= (double)FLT_MAX / (metric == CUVS_METRIC_L2 ? 8.0 : 2.0))
         return -1;
-    out->dtype = dim <= 16 || max_abs > 65504.0 ? CUVS_HNSW_NN_FP32 : CUVS_HNSW_NN_FP16;
+    /* The pinned SDK's FP16 path takes norms from the FP32 input but the dot
+     * product from half-converted data (nn_descent.cuh preprocess_data_kernel
+     * and the norm_a + norm_b - 2*dot epilogue). With a large common offset the
+     * dot's rounding error exceeds the true distance differences and neighbors
+     * collapse even though every element fits half (nn-diff-review-r87 D2).
+     * Use the same bound as cuvs_hnsw_ivfpq_needs_fp32: FP16 only when
+     * 4*max_sq_norm (L2) or max_sq_norm (IP/cosine) stays below 65504. */
+    double half_bound = metric == CUVS_METRIC_L2 ? 4.0 * max_norm : max_norm;
+    out->dtype = dim <= 16 || max_abs > 65504.0 || !(half_bound < 65504.0)
+        ? CUVS_HNSW_NN_FP32 : CUVS_HNSW_NN_FP16;
     out->max_abs = max_abs;
     out->max_sq_norm = max_norm;
     return 0;

@@ -530,7 +530,10 @@ Explicit `ace` consumes the matching patched SDK/planner and a private disk work
 `nn_descent` requests a resident NN-descent base graph and never falls back to another
 builder. It rejects fewer than 16 rows, an effective intermediate degree above 1024,
 nonfinite inputs and inputs whose conservative FP32 distance bound overflows. Its
-admission estimate uses FP32 dataset storage even when the selected base dtype is FP16;
+base dtype is FP32 when dim <= 16, any element exceeds half range, or the resident
+IVF-PQ norm bound reaches 65504 (4 x max\|x\|^2 for L2, max\|x\|^2 for inner product and
+cosine), because the SDK's FP16 path mixes FP32 norms with half dot products; otherwise FP16.
+Its admission estimate uses FP32 dataset storage even when the selected base dtype is FP16;
 the estimate is not an allocator or RSS upper bound. GPU hierarchy requires the matching
 resident-NN upper-precision SDK patch and receives the base dtype and budgets. Existing
 receipts do not identify the upper precision contract, so configured upper dtype is null;

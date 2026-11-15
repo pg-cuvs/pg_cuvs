@@ -5,6 +5,43 @@
 #include <stdint.h>
 #include <stdio.h>
 
+/* nn-diff-review-r87 D2 emulation inputs: dim 128, n 4000, N(0, sd) + offset.
+ * With FP16 dot + FP32 norm the reviewer measured recall@10 1.000/0.899/0.017/
+ * 0.001 for offset 0/100/1000/5000; every offset >= 100 must select FP32. */
+static uint64_t rng_state = 1;
+static double uniform01(void)
+{
+    rng_state = rng_state * 6364136223846793005ULL + 1442695040888963407ULL;
+    return ((rng_state >> 11) + 0.5) * (1.0 / 9007199254740992.0);
+}
+static uint32_t dtype_for(double offset, double sd, uint32_t metric)
+{
+    enum { N = 4000, D = 128 };
+    static float x[N * D];
+    CuvsHnswNnPrecision r;
+    rng_state = 1;
+    for (int i = 0; i < N * D; i++)
+        x[i] = (float)(offset + sd * sqrt(-2.0 * log(uniform01())) * cos(6.283185307179586 * uniform01()));
+    assert(cuvs_hnsw_nn_precision(x, N, D, metric, &r) == 0);
+    assert(r.max_abs < 65504.0);  /* the old element-only rule chose FP16 for all of these */
+    return r.dtype;
+}
+static void test_review_offsets(void)
+{
+    assert(dtype_for(0.0, 1.0, CUVS_METRIC_L2) == CUVS_HNSW_NN_FP16);
+    assert(dtype_for(100.0, 5.0, CUVS_METRIC_L2) == CUVS_HNSW_NN_FP32);
+    assert(dtype_for(1000.0, 5.0, CUVS_METRIC_L2) == CUVS_HNSW_NN_FP32);
+    assert(dtype_for(5000.0, 5.0, CUVS_METRIC_L2) == CUVS_HNSW_NN_FP32);
+    assert(dtype_for(100.0, 5.0, CUVS_METRIC_IP) == CUVS_HNSW_NN_FP32);
+    /* unit-scale 768-d rows (the frozen corpus has max_abs 0.79) stay FP16 */
+    {
+        static float u[64 * 768];
+        CuvsHnswNnPrecision r;
+        for (int i = 0; i < 64 * 768; i++) u[i] = (float)((uniform01() - 0.5) * 0.072);
+        assert(cuvs_hnsw_nn_precision(u, 64, 768, CUVS_METRIC_L2, &r) == 0 && r.dtype == CUVS_HNSW_NN_FP16);
+    }
+}
+
 int main(void)
 {
     CuvsHnswNnPrecision result;
@@ -16,12 +53,20 @@ int main(void)
     safe[0] = 65505.0f;
     assert(cuvs_hnsw_nn_precision(safe, 1, 17, CUVS_METRIC_L2, &result) == 0);
     assert(result.dtype == CUVS_HNSW_NN_FP32 && result.max_abs == 65505.0);
+    /* Every element fits half, but the expanded-L2 cancellation bound does
+     * not (r87 D2): FP32, matching cuvs_hnsw_ivfpq_needs_fp32. */
     safe[0] = 65504.0f;
     assert(cuvs_hnsw_nn_precision(safe, 1, 17, CUVS_METRIC_L2, &result) == 0);
-    assert(result.dtype == CUVS_HNSW_NN_FP16);
-    /* A half-representable input may have squared distances > 65504;
-     * this is not an element conversion overflow. */
-    assert(result.max_sq_norm > 65504.0);
+    assert(result.dtype == CUVS_HNSW_NN_FP32 && result.max_sq_norm > 65504.0);
+    /* Bound edges: L2 uses 4*max_sq_norm < 65504, IP uses max_sq_norm < 65504. */
+    safe[0] = 127.0f;  /* 16129 * 4 = 64516 */
+    assert(cuvs_hnsw_nn_precision(safe, 1, 17, CUVS_METRIC_L2, &result) == 0 && result.dtype == CUVS_HNSW_NN_FP16);
+    safe[0] = 128.0f;  /* 16384 * 4 = 65536 */
+    assert(cuvs_hnsw_nn_precision(safe, 1, 17, CUVS_METRIC_L2, &result) == 0 && result.dtype == CUVS_HNSW_NN_FP32);
+    assert(cuvs_hnsw_nn_precision(safe, 1, 17, CUVS_METRIC_IP, &result) == 0 && result.dtype == CUVS_HNSW_NN_FP16);
+    safe[0] = 256.0f;  /* 65536 */
+    assert(cuvs_hnsw_nn_precision(safe, 1, 17, CUVS_METRIC_IP, &result) == 0 && result.dtype == CUVS_HNSW_NN_FP32);
+    safe[0] = 1.0f;
     safe[0] = INFINITY;
     assert(cuvs_hnsw_nn_precision(safe, 1, 17, CUVS_METRIC_L2, &result) != 0);
     safe[0] = FLT_MAX;
@@ -31,6 +76,7 @@ int main(void)
     assert(cuvs_hnsw_nn_precision(safe, UINT64_MAX, 17, CUVS_METRIC_L2, &result) != 0);
     assert(cuvs_hnsw_nn_precision(safe, 0, 17, CUVS_METRIC_L2, &result) != 0);
     assert(cuvs_hnsw_nn_precision(safe, 1, 17, UINT32_MAX, &result) != 0);
+    test_review_offsets();
     puts("NN precision input guard: PASS");
     return 0;
 }
