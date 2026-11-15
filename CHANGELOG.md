@@ -10,6 +10,21 @@ exists for 0.9.0.
 
 ## [Unreleased]
 
+## [0.9.2] - 2026-11-15
+
+Micro-batched index scans no longer fail with 64 or more concurrent clients
+
+The GPU regression workflow (`gpu.yml`) was not run on `release/v0.9.2`. The fix
+below was run on one GPU host: 1x A100-SXM4-80GB, 24 vCPU, PostgreSQL 16.15, cuVS
+26.04 built with SDK patches 0001-0004, 0006 and 0007, 999,000 x 768 float32
+vectors, L2, `LIMIT 10`, pgbench in prepared mode, 30 s per run, one run per client
+count unless noted. With a `cagra` index, `cuvs.k = 100` and
+`cuvs.cagra_batch_wait_us = 200`, the source of 0.9.1 plus the version bump
+(`dfdce616`) aborted 14 and 11 of 64 clients (two runs) and 461 of 512; the source
+of this release aborted none at 64, 128, 256 and 2048 clients. With a `flat` index,
+`cuvs.k = 10` and `cuvs.bf_batch_wait_us = 200`, `dfdce616` aborted 4 of 64 clients
+and this release none at 64 and 256.
+
 ### Fixed
 
 - With a CAGRA or brute-force micro-batch window (`cuvs.cagra_batch_wait_us` or
@@ -41,6 +56,17 @@ exists for 0.9.0.
   brute-force and IVF-PQ search calls no longer pass an uninitialized name to
   `shm_unlink`. The retry is covered by a Linux unit test against a full
   backlog. (#224)
+
+### Upgrading
+
+- Build the release from its tag, install the extension and the daemon together
+  (`make install` and `make install-server`), restart PostgreSQL and then the
+  daemon, and run `ALTER EXTENSION pg_cuvs UPDATE TO '0.9.2';` in each database
+  (`SELECT extversion FROM pg_extension WHERE extname = 'pg_cuvs'` shows `0.9.2`
+  afterwards). The upgrade script changes no SQL object, and the IPC protocol is
+  the one of 0.9.1. The connect retry is in the extension and the larger listen
+  backlog is in the daemon. The steps and the restart order are in
+  `docs/playbooks/release-upgrade.md`.
 
 ## [0.9.1] - 2026-11-15
 
