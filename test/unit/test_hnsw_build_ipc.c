@@ -8,6 +8,8 @@
 #include "cuvs_hnsw_build_common.h"
 #include <assert.h>
 #include <pthread.h>
+#include <sched.h>
+#include <time.h>
 #include <sys/un.h>
 #include <sys/time.h>
 #include <sys/mman.h>
@@ -19,8 +21,38 @@
 #include <string.h>
 static int listener, fixture_case, polls;
 static int *accepts;
-static uint32_t requested_algo(void) { return fixture_case >= 19 ? CUVS_HNSW_ALGO_NN_DESCENT : fixture_case == 5 || fixture_case == 7 || fixture_case == 17 ? CUVS_HNSW_ALGO_ACE : fixture_case == 6 ? CUVS_HNSW_ALGO_IVF_PQ : CUVS_HNSW_ALGO_AUTO; }
-static int cancel_wait(void) { return fixture_case == 1 && ++polls >= 3; }
+static uint32_t requested_algo(void) { return fixture_case >= 19 && fixture_case <= 24 ? CUVS_HNSW_ALGO_NN_DESCENT : fixture_case == 5 || fixture_case == 7 || fixture_case == 17 ? CUVS_HNSW_ALGO_ACE : fixture_case == 6 ? CUVS_HNSW_ALGO_IVF_PQ : CUVS_HNSW_ALGO_AUTO; }
+static volatile int idle_calls, idle_limit, idle_done, reply_sent, mock_checked;
+/* Ordering waits between the mock and the idle unit. A missing event fails
+ * with a case-specific reason instead of hanging until an outer timeout. */
+#define SYNC_WAIT_LIMIT_S 10
+#define SYNC_WAIT(cond) do { \
+    struct timespec t0_, t_; clock_gettime(CLOCK_MONOTONIC, &t0_); \
+    while (!(cond)) { \
+        clock_gettime(CLOCK_MONOTONIC, &t_); \
+        if (t_.tv_sec - t0_.tv_sec >= SYNC_WAIT_LIMIT_S) { \
+            fprintf(stderr, "ipc case %d sync wait timed out: %s\n", fixture_case, #cond); \
+            fflush(stderr); abort(); } \
+        sched_yield(); } } while (0)
+/* K3 idle work: one unit per empty poll; cases 25-29. No sleeps or timing:
+ * case 25: the mock replies only after the backend has finished all work;
+ * case 26: the first unit blocks until the mock has sent its reply, so the
+ *          next poll must take the reply while work remains;
+ * case 27: the 5th unit blocks until the mock has checked the request, then
+ *          the wait callback cancels before the next poll;
+ * case 29: 1,000,000 cheap units (> the 864000-iteration wait limit) before
+ *          the mock replies; idle units must not count toward that limit. */
+static int idle_work(void *arg) {
+    (void)arg;
+    idle_calls++;
+    if (fixture_case == 26 && idle_calls == 1)
+        SYNC_WAIT(__atomic_load_n(&reply_sent, __ATOMIC_ACQUIRE));
+    if (fixture_case == 27 && idle_calls == 5)
+        SYNC_WAIT(__atomic_load_n(&mock_checked, __ATOMIC_ACQUIRE));
+    if (idle_calls >= idle_limit) { __atomic_store_n(&idle_done, 1, __ATOMIC_RELEASE); return 0; }
+    return 1;
+}
+static int cancel_wait(void) { return (fixture_case == 1 && ++polls >= 3) || (fixture_case == 27 && idle_calls >= 5); }
 static void *daemon_mock(void *unused) {
     (void)unused;
     int c = accept(listener, 0, 0), vectors = -1, owner = -1;
@@ -51,14 +83,16 @@ static void *daemon_mock(void *unused) {
     float first = 0;
     assert(pread(vectors, &first, sizeof(first), 0) == sizeof(first) && first == -1.25f);
     if (fixture_case != 1) assert(!cuvs_hnsw_owner_cancelled(owner));
-    if (fixture_case == 1) {
+    if (fixture_case == 1 || fixture_case == 27) {
         struct pollfd p = {.fd = owner, .events = POLLIN};
+        __atomic_store_n(&mock_checked, 1, __ATOMIC_RELEASE);
         assert(poll(&p, 1, 3000) > 0);
         assert(cuvs_hnsw_owner_cancelled(owner));
-    } else if (fixture_case == 3 || fixture_case == 11 || fixture_case == 12) {
+    } else if (fixture_case == 3 || fixture_case == 11 || fixture_case == 12 || fixture_case == 28) {
         CuvsHnswFileReply reply = {.header = {.status = CUVS_STATUS_BUILD_FAILED}};
         if (fixture_case == 11) reply.header.status = CUVS_STATUS_PROTO_MISMATCH;
         if (fixture_case == 12) reply.header.status = CUVS_STATUS_HNSW_RESIDENT_BUDGET_EXCEEDED;
+        if (fixture_case == 28) reply.header.status = CUVS_STATUS_CANCELED; /* daemon-side cancel */
         snprintf(reply.header.error, sizeof(reply.header.error), "synthetic capacity failure");
         /* The decision bytes travel after the receipt on every reply. */
         reply.budget = (CuvsHnswBudgetSnapshot){11, 22, 33, 44, 55, 66 + (uint64_t)fixture_case};
@@ -66,6 +100,10 @@ static void *daemon_mock(void *unused) {
         assert(cuvs_fd_send(c, -1, &reply, sizeof(reply)) == 0);
     } else {
         char path[] = "/tmp/pgcuvs-core-reply-XXXXXX";
+        if (fixture_case == 25 || fixture_case == 29) /* reply only after the backend's idle work */
+            SYNC_WAIT(__atomic_load_n(&idle_done, __ATOMIC_ACQUIRE));
+        if (fixture_case == 26) /* reply only once the backend is inside its first idle unit */
+            SYNC_WAIT(__atomic_load_n(&idle_calls, __ATOMIC_ACQUIRE) >= 1);
         int writable = mkstemp(path);
         assert(writable >= 0);
         assert(write(writable, "serialized-hnsw", 15) == 15);
@@ -93,7 +131,7 @@ static void *daemon_mock(void *unused) {
         if (fixture_case == 18)
             cuvs_hnsw_ace_readback_fill(&reply.ace, CUVS_HNSW_ACE_QUALITY_AUTO, 120, 64,
                 reply.policy.n_rows, 2, 20);
-        if (fixture_case >= 19) {
+        if (fixture_case >= 19 && fixture_case <= 24) {
             reply.policy.version = CUVS_HNSW_POLICY_NN_VERSION;
             reply.policy.route = CUVS_HNSW_ROUTE_NN_DESCENT;
             reply.policy.internal_builder = CUVS_HNSW_ROUTE_NN_DESCENT;
@@ -114,8 +152,9 @@ static void *daemon_mock(void *unused) {
             close(read_only); close(vectors); close(owner); close(c); return NULL;
         }
         assert(cuvs_fd_send(c, read_only, &reply, sizeof(reply)) == 0);
+        __atomic_store_n(&reply_sent, 1, __ATOMIC_RELEASE);
         close(read_only);
-        if (fixture_case == 2 || fixture_case == 4 || (fixture_case >= 7 && fixture_case <= 10) || (fixture_case >= 15 && fixture_case != 19))
+        if (fixture_case == 2 || fixture_case == 4 || (fixture_case >= 7 && fixture_case <= 10) || (fixture_case >= 15 && fixture_case <= 24 && fixture_case != 19))
             assert(recv(owner, &token, 1, 0) == 0); // invalid FD/receipt/readback rejected, no ACK
         else
             assert(recv(owner, &token, 1, 0) == 1 && token == 'A');
@@ -157,7 +196,7 @@ int main(void) {
         int rc = cuvs_ipc_build_hnsw_file(path, fd, 100, 128, CUVS_METRIC_L2,
             64, 128, 0, 1ULL << 30, requested_algo(), 64, &policy, &budget, &ace, &nn, &result, err, sizeof(err));
         if (fixture_case == 1) { assert(rc == CUVS_STATUS_CANCELED && result == -1); }
-        else if (fixture_case == 2 || fixture_case == 4 || (fixture_case >= 7 && fixture_case <= 10) || (fixture_case >= 15 && fixture_case != 19)) { assert(rc == CUVS_STATUS_ERROR && result == -1); if (fixture_case == 24) assert(strstr(err, "co-deploy")); }
+        else if (fixture_case == 2 || fixture_case == 4 || (fixture_case >= 7 && fixture_case <= 10) || (fixture_case >= 15 && fixture_case <= 24 && fixture_case != 19)) { assert(rc == CUVS_STATUS_ERROR && result == -1); if (fixture_case == 24) assert(strstr(err, "co-deploy")); }
         else if (fixture_case == 3 || fixture_case == 11 || fixture_case == 12) {
             int expected_status = fixture_case == 11 ? CUVS_STATUS_PROTO_MISMATCH : fixture_case == 12 ? CUVS_STATUS_HNSW_RESIDENT_BUDGET_EXCEEDED : CUVS_STATUS_BUILD_FAILED;
             assert(rc == expected_status && result == -1);
@@ -228,7 +267,32 @@ int main(void) {
                && WEXITSTATUS(child_status) == 0 && fcntl(fd, F_GETFD) >= 0);
     }
     assert(*accepts == 28);
+    /* K3: idle work runs while the reply is pending, never delays reading a
+     * ready reply, and does not hide a cancel. */
+    for (int k = 25; k <= 29; k++) {
+        pthread_t t; int result = -1; CuvsHnswPolicy p; CuvsHnswAceReadback a; CuvsHnswBudgetSnapshot b; char err[128], bytes[16] = {0};
+        fixture_case = k; idle_calls = 0; polls = 0; idle_done = 0; reply_sent = 0; mock_checked = 0;
+        idle_limit = k == 26 || k == 27 || k == 29 ? 1000000 : 100;
+        assert(pthread_create(&t, 0, daemon_mock, 0) == 0);
+        int rc = cuvs_ipc_build_hnsw_file_idle(path, fd, 100, 128, CUVS_METRIC_L2, 64, 128, 0, 1ULL << 30,
+            requested_algo(), 64, &p, &b, &a, NULL, &result, err, sizeof(err), idle_work, NULL);
+        if (k == 27) assert(rc == CUVS_STATUS_CANCELED && result == -1 && idle_calls == 5
+                            && cuvs_ipc_hnsw_backend_cancelled() == 1);
+        /* A daemon reply with status CANCELED is not a backend interrupt. */
+        else if (k == 28) assert(rc == CUVS_STATUS_CANCELED && result == -1 && cuvs_ipc_hnsw_backend_cancelled() == 0);
+        else {
+            assert(rc == CUVS_STATUS_OK && result >= 0 && cuvs_ipc_hnsw_backend_cancelled() == 0);
+            assert(read(result, bytes, 15) == 15 && strcmp(bytes, "serialized-hnsw") == 0);
+            close(result);
+            if (k == 25) assert(idle_calls == 100);         /* all work done before the reply */
+            else if (k == 26) assert(idle_calls == 1 && !idle_done); /* reply taken while work remained */
+            else assert(idle_calls == 1000000);             /* M1: idle units are not wait-limit ticks */
+        }
+        printf("K3 idle case %d: rc=%d idle_calls=%d\n", k, rc, idle_calls);
+        assert(pthread_join(t, 0) == 0);
+    }
+    assert(*accepts == 33);
     close(fd); close(listener); unlink(path); rmdir(dir);
     assert(munmap(accepts, sizeof(*accepts)) == 0);
-    printf("PASS 23 actual-client wire cases (v6 ACE readback bound, none on resident),4 preconnect refusals,5 shared-daemon prefix/settings cases; explicitACE/IVF, forgedroute/version/request rejection, cancellation/status13/protocolerror; current global v%u retained\n", CUVS_PROTO_VERSION);
+    printf("PASS 23 actual-client wire cases (v6 ACE readback bound, none on resident),4 preconnect refusals,5 shared-daemon prefix/settings cases,5 K3 idle-wait cases; explicitACE/IVF, forgedroute/version/request rejection, cancellation/status13/protocolerror; current global v%u retained\n", CUVS_PROTO_VERSION);
 }

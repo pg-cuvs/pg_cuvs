@@ -46,6 +46,7 @@
 #include "commands/defrem.h"
 #include "commands/tablespace.h"
 #include "common/cryptohash.h"
+#include "cuvs_hnsw_digest.h"
 #include "nodes/pg_list.h"
 #include "nodes/value.h"
 #include "nodes/pathnodes.h"
@@ -2723,6 +2724,74 @@ cuvs_half_to_float(uint16_t h)
     return h & 0x8000 ? -value : value;
 }
 
+/* K3: SHA-256 of the vectors spool file, computed by the backend itself
+ * while it waits for the daemon's build reply (no helper thread). The scan
+ * writes rows at n*rowbytes in scan order, so the file bytes are exactly
+ * the accepted post-transform rows the per-row digest used to hash. The
+ * chunk step lives in cuvs_hnsw_digest.h (unit-tested without PG). */
+static int
+cuvs_hnsw_digest_pg_update(void *ctx, const uint8_t *data, size_t len)
+{
+    return pg_cryptohash_update((pg_cryptohash_ctx *)ctx, data, len);
+}
+
+/* After the reply: hash what remains (interruptible between chunks) and emit
+ * the same LOG line as the synchronous path. A digest error is an ERROR with
+ * the synchronous path's message when the build succeeded. When the build
+ * itself failed (rpc_ok false) the build error must stay the statement's
+ * error, so a digest error is reported as a WARNING with the same message,
+ * no LOG line is emitted, and the caller raises the build error. */
+static void
+cuvs_hnsw_digest_finish_log(CuvsHnswSpool *spool, CuvsHnswDigest *d, Relation indexRel,
+                            bool rpc_ok)
+{
+    uint8 digest[32];
+    char hex[65];
+    struct stat input;
+    const char digits[] = "0123456789abcdef";
+    int level = rpc_ok ? ERROR : WARNING;
+    /* An interrupt that arrived after the reply is followed here, before the
+     * first chunk and between chunks; the digest and its LOG are dropped. */
+    CHECK_FOR_INTERRUPTS();
+    while (cuvs_hnsw_digest_step(d))
+        CHECK_FOR_INTERRUPTS();
+    if (d->hash_failed)
+    {
+        ereport(level, (errmsg("pg_cuvs: HNSW input digest failed: %s",
+                              pg_cryptohash_error((pg_cryptohash_ctx *)d->ctx))));
+        return;
+    }
+    if (d->read_failed)
+    {
+        if (d->read_errno)
+        {
+            errno = d->read_errno;
+            ereport(level, (errcode_for_file_access(),
+                            errmsg("pg_cuvs: HNSW input digest failed: cannot read HNSW spool: %m")));
+        }
+        else
+            ereport(level, (errmsg("pg_cuvs: HNSW input digest failed: HNSW spool is shorter than written")));
+        return;
+    }
+    if (pg_cryptohash_final((pg_cryptohash_ctx *)d->ctx, digest, sizeof(digest)) < 0)
+    {
+        ereport(level, (errmsg("pg_cuvs: cannot finalize HNSW input digest")));
+        return;
+    }
+    if (fstat(FileGetRawDesc(spool->vectors), &input))
+    {
+        ereport(level, (errcode_for_file_access(), errmsg("pg_cuvs: cannot stat HNSW input: %m")));
+        return;
+    }
+    for (int i = 0; i < 32; i++)
+    { hex[i * 2] = digits[digest[i] >> 4]; hex[i * 2 + 1] = digits[digest[i] & 15]; }
+    hex[64] = '\0';
+    ereport(LOG, (errmsg("pg_cuvs: HNSW input kind=sha256-float32-native-row-scan-order digest=%s rows=%llu dim=%u metric=%u input_dev=%llu input_ino=%llu index_oid=%u",
+        hex, (unsigned long long)spool->n, spool->dim, spool->metric,
+        (unsigned long long)input.st_dev, (unsigned long long)input.st_ino,
+        RelationGetRelid(indexRel))));
+}
+
 static void
 cuvs_hnsw_spool_callback(Relation index, ItemPointer tid, Datum *values,
                           bool *isnull, bool alive, void *state)
@@ -2776,9 +2845,7 @@ cuvs_hnsw_spool_callback(Relation index, ItemPointer tid, Datum *values,
     cuvs_hnsw_spool_write(spool->tids, &encoded, sizeof(encoded),
         (off_t)(sizeof(CuvsTidsHeader) + spool->n * sizeof(encoded)));
     spool->crc = cuvs_crc32_stream_update(spool->crc, &encoded, sizeof(encoded));
-    if (pg_cryptohash_update(spool->input_hash, (const uint8 *)spool->row, rowbytes) < 0)
-        ereport(ERROR, (errmsg("pg_cuvs: HNSW input digest failed: %s",
-                              pg_cryptohash_error(spool->input_hash))));
+    /* K3: the digest is computed from the spool file during the RPC. */
     spool->n++;
 }
 
@@ -2921,6 +2988,7 @@ cuvs_build_hnsw_from_heap(Relation heapRel, Relation indexRel, IndexInfo *indexI
         uint32_t hierarchy = strcmp(mode, "nsw") != 0;
         uint32_t notices;
         CuvsHnswBudgetSnapshot budget;
+        CuvsHnswDigest digest = {0};
         char when[96];
         /* UC-5 / ADR-087 decision 4: with statistics, decide the route (and
          * the disk precheck) BEFORE the heap scan and announce it (PN-1).
@@ -2954,23 +3022,11 @@ cuvs_build_hnsw_from_heap(Relation heapRel, Relation indexRel, IndexInfo *indexI
             header.metric = spool->metric;
             header.body_crc32 = cuvs_crc32_stream_end(spool->crc);
             cuvs_hnsw_spool_write(spool->tids, &header, sizeof(header), 0);
-            {
-                uint8 digest[32];
-                char hex[65];
-                struct stat input;
-                const char digits[] = "0123456789abcdef";
-                if (pg_cryptohash_final(spool->input_hash, digest, sizeof(digest)) < 0)
-                    ereport(ERROR, (errmsg("pg_cuvs: cannot finalize HNSW input digest")));
-                if (fstat(FileGetRawDesc(spool->vectors), &input))
-                    ereport(ERROR, (errcode_for_file_access(), errmsg("pg_cuvs: cannot stat HNSW input: %m")));
-                for (int i = 0; i < 32; i++)
-                { hex[i * 2] = digits[digest[i] >> 4]; hex[i * 2 + 1] = digits[digest[i] & 15]; }
-                hex[64] = '\0';
-                ereport(LOG, (errmsg("pg_cuvs: HNSW input kind=sha256-float32-native-row-scan-order digest=%s rows=%llu dim=%u metric=%u input_dev=%llu input_ino=%llu index_oid=%u",
-                    hex, (unsigned long long)spool->n, spool->dim, spool->metric,
-                    (unsigned long long)input.st_dev, (unsigned long long)input.st_ino,
-                    RelationGetRelid(indexRel))));
-            }
+            digest.fd = FileGetRawDesc(spool->vectors);
+            digest.ctx = spool->input_hash;
+            digest.update = cuvs_hnsw_digest_pg_update;
+            digest.total = cuvs_hnsw_digest_total(spool->n, spool->dim);
+            digest.buf = palloc(CUVS_HNSW_DIGEST_CHUNK);
             /* No statistics: the decision point is now, after the scan and
              * before the build op, from the spooled row count. */
             if (prespool == CUVS_HNSW_PRESPOOL_FALLBACK)
@@ -2982,11 +3038,29 @@ cuvs_build_hnsw_from_heap(Relation heapRel, Relation indexRel, IndexInfo *indexI
                     build_algo, ef_construction, cap, false, when)
                     == CUVS_HNSW_PRESPOOL_NOTICE_OVERFLOW;
             }
-            rc = cuvs_ipc_build_hnsw_file(cuvs_socket_path,
+            /* K3: hash the spool while the daemon builds; join after the reply. */
+            rc = cuvs_ipc_build_hnsw_file_idle(cuvs_socket_path,
                 FileGetRawDesc(spool->vectors), spool->n, spool->dim, spool->metric,
                 64, 128, hierarchy, cap,
                 build_algo, ef_construction, &out->policy, &budget, &out->ace, &out->nn,
-                &out->hnsw_fd, error, sizeof(error));
+                &out->hnsw_fd, error, sizeof(error), cuvs_hnsw_digest_step, &digest);
+            /* The digest LOG also covers failed builds (daemon error reply,
+             * including a daemon status CANCELED, IPC or reply-validation
+             * failure), as the pre-RPC LOG did; the build error below is
+             * raised after it. Only a wait the backend itself stopped for a
+             * user interrupt (the IPC sent its cancel token) skips the digest,
+             * and that interrupt is followed at once. */
+#ifdef CUVS_HNSW_DIGEST_TEST_LATE_CANCEL
+            /* Test only: a query cancel that arrives after the reply. */
+            QueryCancelPending = true;
+            InterruptPending = true;
+#endif
+            if (cuvs_ipc_hnsw_backend_cancelled())
+                CHECK_FOR_INTERRUPTS();
+            else
+                cuvs_hnsw_digest_finish_log(spool, &digest, indexRel,
+                                            rc == CUVS_STATUS_OK);
+            pfree(digest.buf);
             cuvs_report_build_notice(RelationGetRelid(indexRel));
             if (rc != CUVS_STATUS_OK)
                 cuvs_report_admission(CUVS_ADMISSION_OBJ_CAGRA, RelationGetRelid(indexRel), NULL);

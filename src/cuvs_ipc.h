@@ -128,6 +128,24 @@ int cuvs_ipc_build_hnsw_file(const char *socket_path, int vectors_fd,
     struct CuvsHnswBudgetSnapshot *budget, CuvsHnswAceReadback *ace_readback,
     CuvsHnswNnReadback *nn_readback,
     int *hnsw_fd, char *error, size_t error_len);
+/* Work the backend runs while it waits for the build reply. Returns nonzero
+ * while more work remains. It runs between socket polls on the calling
+ * thread and MUST NOT longjmp (no ereport/CHECK_FOR_INTERRUPTS): this
+ * function owns the socket and owner FDs until it returns. Interrupts are
+ * still observed through the wait callback before every poll. */
+typedef int (*CuvsIpcIdleWork)(void *arg);
+/* 1 when the last cuvs_ipc_build_hnsw_file_idle() call stopped because the
+ * wait callback reported a backend interrupt and the backend sent its cancel
+ * token; 0 otherwise, including a daemon reply whose status is CANCELED. */
+int cuvs_ipc_hnsw_backend_cancelled(void);
+int cuvs_ipc_build_hnsw_file_idle(const char *socket_path, int vectors_fd,
+    uint64_t n_vecs, uint32_t dim, uint32_t metric, uint32_t graph_degree,
+    uint32_t intermediate_degree, uint32_t hierarchy, uint64_t host_budget,
+    uint32_t build_algo, uint32_t ef_construction, CuvsHnswPolicy *policy,
+    struct CuvsHnswBudgetSnapshot *budget, CuvsHnswAceReadback *ace_readback,
+    CuvsHnswNnReadback *nn_readback,
+    int *hnsw_fd, char *error, size_t error_len,
+    CuvsIpcIdleWork idle, void *idle_arg);
 #define CUVS_OP_SERVER_SETTINGS    24 /* read-only daemon startup settings */
 #define CUVS_OP_RMM_POOL_STATUS    25 /* quota and live pool counters */
 

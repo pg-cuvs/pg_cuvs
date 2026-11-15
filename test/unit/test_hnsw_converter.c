@@ -50,6 +50,52 @@ static void test_check_for_interrupts(void)
 
 /* Include the implementation so this bounded test can exercise its private
  * file preflight and label lookup without a running PostgreSQL backend. */
+/* Fault-injecting pread for the read-window differential test.  It passes
+ * through unless a test arms it for one descriptor: EIO for any call that
+ * starts inside [eio_lo, eio_hi) and a short prefix for calls crossing
+ * eio_lo, EINTR every Nth call, and short positive reads every Mth call. */
+static int test_fault_fd = -1;
+static uint64_t test_fault_eio_lo = UINT64_MAX;
+static uint64_t test_fault_eio_hi = UINT64_MAX;
+static unsigned test_fault_eintr_every;
+static unsigned test_fault_short_every;
+static unsigned long test_fault_calls;
+static unsigned long test_fault_eio_hits;
+static uint64_t test_fault_count_below;      /* count calls starting below */
+static unsigned long test_fault_calls_below;
+
+static ssize_t
+test_fault_pread(int fd, void *buffer, size_t length, off_t offset)
+{
+    if (fd == test_fault_fd)
+    {
+        test_fault_calls++;
+        if ((uint64_t)offset < test_fault_count_below)
+            test_fault_calls_below++;
+        if (test_fault_eintr_every &&
+            test_fault_calls % test_fault_eintr_every == 0)
+        {
+            errno = EINTR;
+            return -1;
+        }
+        if ((uint64_t)offset >= test_fault_eio_lo &&
+            (uint64_t)offset < test_fault_eio_hi)
+        {
+            test_fault_eio_hits++;
+            errno = EIO;
+            return -1;
+        }
+        if ((uint64_t)offset < test_fault_eio_lo &&
+            (uint64_t)offset + length > test_fault_eio_lo)
+            length = (size_t)(test_fault_eio_lo - (uint64_t)offset);
+        if (test_fault_short_every && length > 1 &&
+            test_fault_calls % test_fault_short_every == 0)
+            length = 1 + test_fault_calls % length;
+    }
+    return pread(fd, buffer, length, offset);
+}
+#define pread test_fault_pread
+
 #include "../../src/hnsw_export.c"
 
 /* The fixture has PG page headers but no running backend. These small stubs
@@ -237,12 +283,17 @@ BufFileClose(BufFile *file)
 
 /* A tiny block store lets the standalone fixture call the production page
  * writers and follow their on-page nextblkno fields like pgvector vacuum. */
-#define CHAIN_TEST_MAX_BLOCKS 16
+#define CHAIN_TEST_MAX_BLOCKS 160
 static char chain_test_pages[CHAIN_TEST_MAX_BLOCKS][BLCKSZ];
 static size_t chain_test_nblocks;
 volatile uint32 CritSectionCount;
 static unsigned chain_test_wal_images;
-static char chain_test_palloc_arena[256 * 1024];
+#if PG_VERSION_NUM >= 160000
+static uint32 chain_test_extend_limit = 32;
+static unsigned chain_test_extend_calls;
+#endif
+/* The source-less row reader holds three fixed read-ahead windows. */
+static char chain_test_palloc_arena[3 * HNSW_READ_WINDOW_BYTES + 256 * 1024];
 static size_t chain_test_palloc_used;
 
 static void *
@@ -278,6 +329,33 @@ ReadBuffer(Relation rel, BlockNumber block_num)
     memset(chain_test_pages[chain_test_nblocks], 0, BLCKSZ);
     return (Buffer)(++chain_test_nblocks);
 }
+
+#if PG_VERSION_NUM >= 160000
+BlockNumber
+ExtendBufferedRelBy(BufferManagerRelation bmr, ForkNumber fork,
+                     BufferAccessStrategy strategy, uint32 flags,
+                     uint32 extend_by, Buffer *buffers, uint32 *extended_by)
+{
+    BlockNumber first = (BlockNumber)chain_test_nblocks;
+
+    (void)bmr;
+    (void)fork;
+    (void)strategy;
+    assert(flags == 0 && extend_by > 0 && extend_by <= 32);
+    *extended_by = Min(extend_by, chain_test_extend_limit);
+    chain_test_extend_calls++;
+    for (uint32 i = 0; i < *extended_by; i++)
+        buffers[i] = ReadBuffer(NULL, P_NEW);
+    return first;
+}
+
+BlockNumber
+BufferGetBlockNumber(Buffer buffer)
+{
+    assert(buffer > 0 && (size_t)buffer <= chain_test_nblocks);
+    return (BlockNumber)(buffer - 1);
+}
+#endif
 
 static Page
 test_buffer_get_page(Buffer buffer)
@@ -322,9 +400,47 @@ chain_test_reset(void)
     assert(CritSectionCount == 0);
     chain_test_nblocks = 1;
     chain_test_wal_images = 0;
+#if PG_VERSION_NUM >= 160000
+    chain_test_extend_calls = 0;
+    chain_test_extend_limit = 32;
+#endif
     chain_test_palloc_used = 0;
     memset(chain_test_pages, 0, sizeof(chain_test_pages));
     hnsw_init_disk_page((Page)chain_test_pages[0]);
+}
+
+static void
+test_batched_data_page_publication(void)
+{
+#if PG_VERSION_NUM >= 160000
+    const uint32 counts[] = {0, 1, 31, 32, 33, 65, 129};
+    const uint32 limits[] = {1, 7, 32};
+    char staged[BLCKSZ];
+
+    for (size_t c = 0; c < sizeof(counts) / sizeof(counts[0]); c++)
+        for (size_t l = 0; l < sizeof(limits) / sizeof(limits[0]); l++)
+            for (unsigned skip = 0; skip <= 1; skip++)
+            {
+                HnswDiskPageBatch batch = {0};
+                uint32 count = counts[c];
+                uint32 limit = limits[l];
+
+                chain_test_reset();
+                chain_test_extend_limit = limit;
+                for (uint32 block = 1; block <= count; block++)
+                {
+                    memset(staged, (int)(block % 251), sizeof(staged));
+                    hnsw_publish_staged_data_page(NULL, staged, skip != 0,
+                                                  block, count, &batch);
+                    assert(memcmp(chain_test_pages[block], staged, BLCKSZ) == 0);
+                    assert(CritSectionCount == 0);
+                }
+                assert(batch.next == batch.count);
+                assert(chain_test_nblocks == (size_t)count + 1);
+                assert(chain_test_wal_images == (skip ? 0 : count));
+                assert(chain_test_extend_calls == (count + limit - 1) / limit);
+            }
+#endif
 }
 
 static void
@@ -1506,9 +1622,284 @@ test_ace_readback_metapage_roundtrip(void)
     puts("PASS NN v3 metapage roundtrip and truncated tail rejection (CPU fixture)");
 }
 
+/* The row reader reserves each level-0 record before reading its fields, so
+ * a window always starts at a record boundary.  With labels and vectors
+ * stored before the link list, a window that started at the link count
+ * would miss the record's earlier fields and refill.  Use a 3.2-record
+ * window and count level-0 reads: one per three records, fields intact. */
+static void
+test_row_reader_reserves_records(void)
+{
+    enum { N = 40, DIM = 4, M = 2, MAXM0 = 2 * M };
+    const size_t vec_off = 0, label_off = DIM * sizeof(float);
+    const size_t links_off = label_off + sizeof(size_t);
+    const size_t row_bytes = links_off + (1 + MAXM0) * sizeof(int);
+    const size_t capacity = 3 * row_bytes + 12;
+    Fixture f = {make_temp_fd(), make_temp_fd()};
+    struct BufFile table_file = {.fd = make_temp_fd()};
+    HnswLocationTable table = {.file = &table_file, .n_nodes = N};
+    HnswlibHeader header = {0};
+    HnswlibHeader parsed;
+    CuvsTidsHeader tids_header = {0};
+    CuvsTidsHeader parsed_tids;
+    uint64_t tids[N];
+    unsigned char raw[64];
+    unsigned char *small;
+    char error[256] = {0};
+    HnswDiskRow row;
+    uint64_t upper_start = HNSWLIB_HEADER_BYTES + (uint64_t)N * row_bytes;
+    uint64_t upper_cursor = upper_start;
+    off_t at = 0;
+
+    assert(row_bytes <= sizeof(raw));
+    header.maxElements = header.curElementCount = N;
+    header.sizeDataPerElement = row_bytes;
+    header.offsetData = vec_off;
+    header.labelOffset = label_off;
+    header.offsetLevel0 = links_off;
+    header.maxlevel = 1;
+    header.enterpointNode = 0;
+    header.maxM = header.M = M;
+    header.maxM0 = MAXM0;
+    header.mult = 1.0;
+    header.efConstruction = 64;
+    write_at(f.hnsw_fd, &header, sizeof(header), at);
+    at += sizeof(header);
+    for (int node = 0; node < N; node++)
+    {
+        int count = 2;
+        int links[MAXM0] = {(node + 1) % N, (node + 7) % N, -1, -1};
+        size_t label = (size_t)(N - 1 - node);
+
+        memset(raw, 0, sizeof(raw));
+        for (int d = 0; d < DIM; d++)
+        {
+            float value = (float)(node * 10 + d);
+            memcpy(raw + vec_off + d * sizeof(float), &value, sizeof(value));
+        }
+        memcpy(raw + label_off, &label, sizeof(label));
+        memcpy(raw + links_off, &count, sizeof(count));
+        memcpy(raw + links_off + sizeof(int), links, sizeof(links));
+        write_at(f.hnsw_fd, raw, row_bytes, at);
+        at += (off_t)row_bytes;
+        tids[node] = cuvs_tid_encode((uint32_t)(10 + node), (uint16_t)(1 + node % 7));
+    }
+    for (int node = 0; node < N; node++)
+    {
+        uint32_t no_upper = 0;
+        write_at(f.hnsw_fd, &no_upper, sizeof(no_upper), at);
+        at += sizeof(no_upper);
+    }
+    tids_header.magic = CUVS_TIDS_MAGIC;
+    tids_header.version = CUVS_TIDS_VERSION;
+    tids_header.n_vecs = N;
+    tids_header.dim = DIM;
+    tids_header.metric = CUVS_METRIC_L2;
+    tids_header.body_crc32 = cuvs_crc32(tids, sizeof(tids));
+    write_at(f.tids_fd, &tids_header, sizeof(tids_header), 0);
+    write_at(f.tids_fd, tids, sizeof(tids), sizeof(tids_header));
+    assert(hnsw_file_preflight(f.hnsw_fd, f.tids_fd, N, DIM, CUVS_METRIC_L2,
+                               4, true, &parsed, &parsed_tids,
+                               hnsw_location_table_append, &table, NULL,
+                               error, sizeof(error)));
+    assert(hnsw_location_table_rewind(&table, N));
+
+    chain_test_reset();
+    hnsw_disk_row_init(&row, &parsed, DIM);
+    small = malloc(capacity);
+    assert(small != NULL);
+    hnsw_window_init(&row.level0, -1, small, capacity);
+    test_fault_fd = f.hnsw_fd;
+    test_fault_count_below = upper_start;
+    test_fault_calls_below = 0;
+    for (int node = 0; node < N; node++)
+    {
+        hnsw_read_disk_row(f.hnsw_fd, f.tids_fd, &parsed, N, DIM,
+                           (uint64_t)node, &upper_cursor, &table, &row);
+        assert(row.elem.lv0_count == 2);
+        assert(row.elem.lv0_links[0] == (node + 1) % N &&
+               row.elem.lv0_links[1] == (node + 7) % N);
+        for (int d = 0; d < DIM; d++)
+            assert(row.vector[d] == (float)(node * 10 + d));
+        assert(row.elem.tid_encoded == tids[N - 1 - node]);
+    }
+    /* One level-0 fill per three records; the window never went direct. */
+    if (test_fault_calls_below != (N + 2) / 3)
+    {
+        fprintf(stderr, "row-reserve read-count mismatch: level0 reads=%lu "
+                "expected=%d\n", test_fault_calls_below, (N + 2) / 3);
+        abort();
+    }
+    assert(row.level0.buffer == small);
+    test_fault_fd = -1;
+    test_fault_count_below = 0;
+    free(small);
+    BufFileClose(&table_file);
+    fixture_close(&f);
+    puts("PASS row reader reserves level-0 records");
+}
+
+/* Differential test of the import read windows against hnsw_pread_exact.
+ * Small capacities make reads straddle window ends, exceed the capacity
+ * (direct path), cross EOF, hit failed or short fills, and drive a window
+ * into its direct mode.  Every read must return the same result as the
+ * direct reader and, on success, the file's bytes. */
+static uint32_t
+test_window_rand(uint32_t *state)
+{
+    *state ^= *state << 13;
+    *state ^= *state >> 17;
+    *state ^= *state << 5;
+    return *state;
+}
+
+static void
+test_read_window_matches_direct_reads(void)
+{
+    enum { FILE_BYTES = 997, GUARD = 128, READS = 3000 };
+    static const size_t capacities[] = {7, 64, 256};
+    unsigned char file[FILE_BYTES];
+    unsigned char got[512];
+    unsigned char want[512];
+    uint32_t state = 0x9e3779b9u;
+    int fd = make_temp_fd();
+    unsigned long straddles = 0, oversized = 0, eof_reads = 0;
+    unsigned long eof_partial_fills = 0, failed_fills_tolerated = 0;
+    unsigned long direct_modes = 0, total = 0;
+
+    for (size_t i = 0; i < FILE_BYTES; i++)
+        file[i] = (unsigned char)(i * 131u + 7u);
+    write_at(fd, file, FILE_BYTES, 0);
+    test_fault_fd = fd;
+
+    for (size_t c = 0; c < sizeof(capacities) / sizeof(capacities[0]); c++)
+        for (int mode = 0; mode < 6; mode++)
+        {
+            size_t capacity = capacities[c];
+            unsigned char *buffer = malloc(capacity + GUARD);
+            HnswReadWindow window;
+            uint64_t cursor = 0;
+
+            assert(buffer != NULL);
+            /* Bytes past the valid window prefix never match the file. */
+            memset(buffer, 0xEE, capacity + GUARD);
+            hnsw_window_init(&window, fd, buffer, capacity);
+            test_fault_eio_lo = test_fault_eio_hi = UINT64_MAX;
+            test_fault_eintr_every = test_fault_short_every = 0;
+            test_fault_calls = 0;
+            if (mode == 1)          /* persistent EIO band mid-file */
+            {
+                test_fault_eio_lo = 300 + capacity;
+                test_fault_eio_hi = test_fault_eio_lo + capacity / 2 + 3;
+            }
+            if (mode == 2)
+                test_fault_eintr_every = 3;
+            if (mode == 3)
+                test_fault_short_every = 2;
+            if (mode == 4)          /* EIO to EOF with short reads and EINTR */
+            {
+                test_fault_eio_lo = 700;
+                test_fault_short_every = 3;
+                test_fault_eintr_every = 5;
+            }
+            for (int i = 0; i < READS; i++)
+            {
+                uint32_t r = test_window_rand(&state);
+                uint64_t offset;
+                size_t length;
+                bool covered_before;
+                bool served_after;
+                unsigned long eio_before = test_fault_eio_hits;
+                bool window_ok;
+                bool direct_ok;
+
+                if (mode == 5)                  /* scattered: idle fills */
+                {
+                    offset = test_window_rand(&state) % (FILE_BYTES + 40);
+                    length = test_window_rand(&state) % (capacity + 9);
+                }
+                else                            /* forward, small gaps */
+                {
+                    /* Mostly small reads so a fill serves many of them; some
+                     * reach or exceed the capacity. */
+                    length = r % 11 == 0
+                        ? test_window_rand(&state) % (capacity + 4)
+                        : test_window_rand(&state) % (capacity / 12 + 2);
+                    offset = cursor;
+                    cursor += length + test_window_rand(&state) % 2;
+                    if (cursor > FILE_BYTES + 20)
+                        cursor = test_window_rand(&state) % 64;
+                }
+                if (r % 41 == 0)
+                    hnsw_window_reserve(&window, offset,
+                                        test_window_rand(&state) % (capacity + 2));
+                covered_before = window.buffer != NULL &&
+                    hnsw_window_covers(&window, offset, length);
+                if (window.buffer != NULL && window.filled && !covered_before &&
+                    length > 0 && length <= capacity && offset >= window.start &&
+                    offset < window.start + window.length)
+                    straddles++;
+                if (length > capacity)
+                    oversized++;
+                if (offset + length > FILE_BYTES)
+                    eof_reads++;
+                memset(got, 0xAA, sizeof(got));
+                memset(want, 0x55, sizeof(want));
+                window_ok = hnsw_window_read(&window, got, length, offset);
+                served_after = window.buffer != NULL &&
+                    hnsw_window_covers(&window, offset, length);
+                if (window_ok && test_fault_eio_hits > eio_before)
+                    failed_fills_tolerated++;
+                if (served_after && window.length < capacity &&
+                    window.start + window.length == FILE_BYTES)
+                    eof_partial_fills++;
+                direct_ok = hnsw_pread_exact(fd, want, length, offset);
+                total++;
+                if (window_ok != direct_ok ||
+                    (window_ok && memcmp(got, want, length) != 0) ||
+                    (window_ok && length > 0 &&
+                     (offset + length > FILE_BYTES ||
+                      memcmp(got, file + offset, length) != 0)))
+                {
+                    fprintf(stderr,
+                            "window-vs-direct mismatch case=capacity%zu/mode%d "
+                            "read=%d off=%llu len=%zu window=%d direct=%d\n",
+                            capacity, mode, i, (unsigned long long)offset,
+                            length, window_ok, direct_ok);
+                    abort();
+                }
+            }
+            if (window.buffer == NULL)
+                direct_modes++;
+            free(buffer);
+        }
+    test_fault_fd = -1;
+    test_fault_eio_lo = test_fault_eio_hi = UINT64_MAX;
+    test_fault_eintr_every = test_fault_short_every = 0;
+    close(fd);
+    fprintf(stderr, "read windows: %lu reads, %lu straddles, %lu oversized, %lu EOF, "
+           "%lu EOF partial fills, %lu failed fills tolerated, %lu direct\n",
+           total, straddles, oversized, eof_reads, eof_partial_fills,
+           failed_fills_tolerated, direct_modes);
+    /* Each path the windows can take must actually have been exercised. */
+    assert(straddles > 0 && oversized > 0 && eof_reads > 0);
+    assert(eof_partial_fills > 0 && failed_fills_tolerated > 0);
+    assert(direct_modes > 0);
+    puts("PASS read windows match direct reads");
+}
+
 int
 main(void)
 {
+    /* HNSW_WINDOW_TESTS_ONLY=1 runs only the read-window tests, so a fault
+     * in an earlier fixture cannot hide their result. */
+    if (getenv("HNSW_WINDOW_TESTS_ONLY") != NULL)
+    {
+        test_read_window_matches_direct_reads();
+        test_row_reader_reserves_records();
+        puts("hnsw read-window tests: ok");
+        return 0;
+    }
     test_stored_policy_versions();
     test_ace_readback_metapage_roundtrip();
     test_valid_flat_and_original_labels();
@@ -1519,6 +1910,7 @@ main(void)
     test_legacy_writer_page_chains();
     test_hierarchical_preflight_packs_locations();
     test_disk_writer_page_chain();
+    test_batched_data_page_publication();
     test_hierarchical_packing_cursor_bounds();
     test_hierarchical_native_packing_shapes();
     test_pgvector_page_version_range();
@@ -1534,6 +1926,8 @@ main(void)
     test_rejects_invalid_heap_tid_offset_and_tids_size();
     test_rejects_invalid_offsets_labels_and_links();
     test_rejects_malformed_upper_links_and_overflow();
+    test_read_window_matches_direct_reads();
+    test_row_reader_reserves_records();
     puts("hnsw converter preflight fixtures: ok");
     return 0;
 }

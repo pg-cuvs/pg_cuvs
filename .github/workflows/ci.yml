@@ -36,6 +36,7 @@ jobs:
         run: make docs-contract-check
 
       - name: Unit tests (CPU-only, no PG/CUDA required)
+        timeout-minutes: 20
         run: make test-unit
 
 # ── Job 1b: Tier 1 — CPU-reference shim (full build + installcheck) ────────
@@ -191,6 +192,15 @@ jobs:
       - name: Concurrent RMM pending-quota admission (CPU)
         run: make PGCUVS_CPU_SHIM=1 test-rmm-pending
 
+      # test-hnsw-converter holds the unit fixtures of the HNSW page writers, the
+      # node-location table and the source-less import (hnsw_export.c). It is not
+      # a prerequisite of test-unit, so until this step no workflow ran it. It
+      # compiles against the PostgreSQL 16 server headers and needs no backend.
+      - name: HNSW converter fixtures (CPU)
+        run: |
+          export PATH=/usr/lib/postgresql/16/bin:$PATH
+          make test-hnsw-converter
+
       # The benchmark harness decides which index a published number describes
       # (ownership keys, reloptions checks, the 3I build-NOTICE parser, --resume
       # row skipping). Until now this job ran no Python at all, so those rules
@@ -240,6 +250,17 @@ jobs:
           chmod 0666 "$stale_test_dir/socket"
           export PGOPTIONS="${PGOPTIONS:+$PGOPTIONS }-c cuvs.socket_path=$stale_test_dir/socket -c cuvs.index_dir=$stale_test_dir/indexes"
           make test-stale-interim || { cat "$stale_test_dir/daemon.log"; exit 1; }
+
+      - name: K3 HNSW input digest (live backend, fake daemon)
+        timeout-minutes: 10
+        env:
+          PGDATABASE: postgres
+          PGCUVS_SERVER_LOG: /var/log/postgresql/postgresql-16-main.log
+        shell: bash
+        if: ${{ !cancelled() && steps.shim-setup.outcome == 'success' }}
+        run: |
+          export PATH=/usr/lib/postgresql/16/bin:$PATH
+          make test-k3-digest
 
 # ── Tier 2 (real A100 regression) lives in .github/workflows/gpu.yml ───────
 # Run on demand from the Actions UI ("Run workflow"); a hosted runner starts the
