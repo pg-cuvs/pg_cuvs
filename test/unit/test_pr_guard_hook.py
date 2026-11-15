@@ -8,11 +8,16 @@ checkout) and a stub `scripts/check-sdk-patch-path.sh` that exits 0 or 1 and
 records the --root it was given. Python 3 standard library only; runs on macOS
 and Linux. PR_GUARD_HOOK overrides the hook under test (the mutation test uses it).
 """
+import io
+import itertools
 import json
 import os
 import pathlib
+import random
+import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -111,7 +116,31 @@ SPELLINGS = [
     "cd . && gh pr create",
 ]
 
+# `gh` as a word inside an option value or inside a word of the options must not hide
+# the `pr create` that follows: the scan has to run past every later `gh`.
+GH_IN_OPTIONS = [
+    "gh -R gh/foo pr create",
+    "gh --repo gh.io/o/r pr create",
+    'gh -R "gh" pr create',
+    "gh -R cli/gh.x pr create",
+    "gh --repo=github.com/gh/x pr create",
+    "gh -R gh pr create",
+    "gh -R foo/gh pr ready",
+    "gh -R gh/gh pr ready 7",
+    "gh --repo=gh pr create",
+    "gh -a gh -a gh pr create",
+    "gh -R gh -R gh pr create",
+    "gh -R x gh pr create",
+    "echo gh -R gh/foo pr create",
+    "gh -R gh/foo -R gh/bar pr create",
+    "cd . && gh --repo gh.io/o/r pr ready",
+]
+
 NOT_A_PR = [
+    "gh -R gh/foo pr view",
+    "gh --repo gh.io/o/r pr list",
+    "gh -R gh pr",
+    "gh -R gh/foo issue create",
     "gh pr view 12",
     "gh pr list",
     "gh pr checks",
@@ -139,6 +168,12 @@ class SpellingTests(HookCase):
     def test_every_spelling_blocks_when_the_check_fails(self):
         set_check(self.proj, passes=False)
         for cmd in SPELLINGS:
+            with self.subTest(cmd=cmd):
+                self.assert_blocked(cmd)
+
+    def test_gh_inside_the_options_does_not_hide_the_pr_command(self):
+        set_check(self.proj, passes=False)
+        for cmd in GH_IN_OPTIONS:
             with self.subTest(cmd=cmd):
                 self.assert_blocked(cmd)
 
@@ -330,7 +365,7 @@ class ScalingTests(HookCase):
 
     def test_repeated_gh_options_take_linear_time(self):
         set_check(self.proj, passes=False)
-        for unit in ["gh -a ", "gh -x\n"]:
+        for unit in ["gh -a ", "gh -x\n", "gh -R gh "]:
             t = {}
             for n in (4000, 16000):  # about 24 KB and 96 KB
                 start = time.monotonic()
@@ -340,9 +375,96 @@ class ScalingTests(HookCase):
             # Four times the input: a quadratic scan takes about sixteen times as long.
             self.assertLess(t[16000], 6 * max(t[4000], 0.3), f"{unit!r}: {t}")
 
+    def test_a_megabyte_of_gh_options_is_scanned_in_seconds(self):
+        set_check(self.proj, passes=False)
+        for unit in ["gh -a ", "gh -x\n"]:
+            start = time.monotonic()
+            self.assert_passes(unit * 170000, timeout=30)  # about 1 MB
+            self.assertLess(time.monotonic() - start, 5.0, repr(unit))
+
     def test_a_pr_after_a_long_run_of_gh_words_is_still_found(self):
         set_check(self.proj, passes=False)
         self.assert_blocked("gh -a " * 16000 + "gh pr create", timeout=10)
+
+    def test_a_pr_after_a_long_run_of_gh_in_option_values_is_still_found(self):
+        # Each `gh` here is an option value or part of one; the first `gh` still reaches
+        # the `pr create` at the end.
+        set_check(self.proj, passes=False)
+        for unit in ["-R gh/foo ", "--repo gh.io/o/r ", "-R gh "]:
+            with self.subTest(unit=unit):
+                self.assert_blocked("gh " + unit * 10000 + "pr create", timeout=10)
+
+
+def load_opens_pr(hook):
+    """The hook's `opens_pr(command)`, taken from the python program inside the hook
+    script (run up to its first exit, which it takes on an empty command)."""
+    m = re.search(r"python3 -c '(.*?)'\) \|\| exit 0", pathlib.Path(hook).read_text(), re.S)
+    if not m:
+        raise AssertionError("python program not found in the hook")
+    ns = {"__name__": "pr_guard_program"}
+    stdin, sys.stdin = sys.stdin, io.StringIO('{"tool_input": {"command": ""}}')
+    try:
+        exec(compile(m.group(1), "pr-guard.sh", "exec"), ns)
+    except SystemExit:
+        pass
+    finally:
+        sys.stdin = stdin
+    return ns["opens_pr"]
+
+
+# The pattern the token scan replaces, as one regular expression (quadratic on some
+# inputs, which is why the hook does not use it, but the reference for what it must find).
+REFERENCE = re.compile(r"(?<![\w-])gh(?:\s+-\S+(?:\s+[^\s-][^\s;&|()]*)?)*\s+pr\s+(?:create|ready)\b")
+
+# Tokens that matter to the pattern: gh at the end of a word or not, preceded by a word
+# character or `-` or not, options, a lone dash, values with and without `;&|()`, `pr`,
+# the subcommands with and without a word boundary after them.
+TOKENS = ["gh", "/bin/gh", "xgh", "gh-", "-gh", "-x", "-", "--repo=gh", "pr", "create",
+          "ready", "create-x", "createx", "v", "a;b", ";"]
+SEPARATORS = [" ", "  ", "\n", "\t", "\r\n", "\u00a0", "\x1c", "\x85", "\u2003", "\u3000",
+              "", ";", "&&", "|"]
+
+
+class DetectionEquivalenceTests(unittest.TestCase):
+    """The token scan decides exactly what the single pattern decides."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.opens_pr = staticmethod(load_opens_pr(HOOK))
+
+    def compare(self, commands):
+        n = positives = 0
+        for cmd in commands:
+            want = REFERENCE.search(cmd) is not None
+            if self.opens_pr(cmd) != want:
+                self.fail(f"{cmd!r}: pattern says {want}, the hook says {not want}")
+            n += 1
+            positives += want
+        return n, positives
+
+    def test_every_sequence_of_up_to_five_tokens(self):
+        n, positives = self.compare(
+            " ".join(seq) for length in range(6) for seq in itertools.product(TOKENS, repeat=length))
+        self.assertGreater(n, 500000)
+        self.assertGreater(positives, 5000, "the comparison hardly ever sees a command that opens a PR")
+
+    def test_random_commands_with_every_kind_of_separator(self):
+        rnd = random.Random(223)
+        def command():
+            out = rnd.choice(SEPARATORS)
+            for _ in range(rnd.randint(1, 10)):
+                out += rnd.choice(TOKENS) + (rnd.choice(SEPARATORS) if rnd.random() < 0.6 else " ")
+            return out
+        n, positives = self.compare(command() for _ in range(100000))
+        self.assertGreater(positives, 300)
+
+    def test_gh_inside_option_values_is_found(self):
+        for cmd in GH_IN_OPTIONS + SPELLINGS:
+            with self.subTest(cmd=cmd):
+                self.assertTrue(self.opens_pr(cmd))
+        for cmd in NOT_A_PR:
+            with self.subTest(cmd=cmd):
+                self.assertFalse(self.opens_pr(cmd))
 
 
 if __name__ == "__main__":

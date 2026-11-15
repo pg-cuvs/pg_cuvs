@@ -36,13 +36,32 @@ try:
 except Exception:
     sys.exit(0)
 cmd = ((d.get("tool_input") or {}).get("command", "") or "")
-GH_WORD = re.compile(r"(?<![\w-])gh(?![\w-])")
-AFTER_GH = re.compile(r"(?:\s+-\S+(?:\s+[^\s-][^\s;&|()]*)?)*\s+pr\s+(?:create|ready)\b")
-words = list(GH_WORD.finditer(cmd))
-# Each `gh` is scanned only up to the next one, so the total work is linear in the
-# command length (one pattern over the whole command was quadratic on `gh -a gh -a ...`).
-bounds = [w.start() for w in words[1:]] + [len(cmd)]
-if not any(AFTER_GH.match(cmd, w.end(), b) for w, b in zip(words, bounds)):
+# Does the command contain `gh`, then options, then `pr create|ready`? As one pattern,
+#   (?<![\w-])gh(?:\s+-\S+(?:\s+[^\s-][^\s;&|()]*)?)*\s+pr\s+(?:create|ready)\b
+# it is quadratic on `gh -a gh -a ...` (every `gh` backtracks over the rest of the command).
+# The same language is decided here per whitespace-separated token instead: `gh` ends a
+# token, an option is a token of `-` and more, an option may be followed by one value token
+# (not starting with `-`, without `;&|()` after its first character), then the tokens `pr`
+# and `create|ready`. ok[i] says whether the tokens from i on read
+# `(option [value])* pr create|ready`; it is filled once from the end, so the work is
+# linear in the length of the command, and a `gh` inside an option value is just another
+# token that cannot hide the `gh` before it.
+TOKEN = re.compile(r"\S+")
+GH_END = re.compile(r"(?<![\w-])gh\Z")
+VALUE = re.compile(r"[^\s-][^\s;&|()]*\Z")
+SUBCOMMAND = re.compile(r"(?:create|ready)\b")
+def opens_pr(cmd):
+    toks = TOKEN.findall(cmd)
+    n = len(toks)
+    ok = [False] * (n + 2)
+    for i in range(n - 1, -1, -1):
+        t = toks[i]
+        if t == "pr":
+            ok[i] = i + 1 < n and SUBCOMMAND.match(toks[i + 1]) is not None
+        elif t[0] == "-" and len(t) > 1:
+            ok[i] = ok[i + 1] or (i + 1 < n and ok[i + 2] and VALUE.match(toks[i + 1]) is not None)
+    return any(ok[i + 1] and GH_END.search(t) for i, t in enumerate(toks))
+if not opens_pr(cmd):
     sys.exit(0)
 cwd = d.get("cwd") or os.getcwd()
 print(d.get("agent_type") or "main")
