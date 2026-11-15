@@ -1567,7 +1567,12 @@ test_row_reader_reserves_records(void)
         assert(row.elem.tid_encoded == tids[N - 1 - node]);
     }
     /* One level-0 fill per three records; the window never went direct. */
-    assert(test_fault_calls_below == (N + 2) / 3);
+    if (test_fault_calls_below != (N + 2) / 3)
+    {
+        fprintf(stderr, "row-reserve read-count mismatch: level0 reads=%lu "
+                "expected=%d\n", test_fault_calls_below, (N + 2) / 3);
+        abort();
+    }
     assert(row.level0.buffer == small);
     test_fault_fd = -1;
     test_fault_count_below = 0;
@@ -1700,8 +1705,8 @@ test_read_window_matches_direct_reads(void)
                       memcmp(got, file + offset, length) != 0)))
                 {
                     fprintf(stderr,
-                            "read window mismatch: capacity=%zu mode=%d read=%d "
-                            "offset=%llu length=%zu window=%d direct=%d\n",
+                            "window-vs-direct mismatch case=capacity%zu/mode%d "
+                            "read=%d off=%llu len=%zu window=%d direct=%d\n",
                             capacity, mode, i, (unsigned long long)offset,
                             length, window_ok, direct_ok);
                     abort();
@@ -1729,6 +1734,15 @@ test_read_window_matches_direct_reads(void)
 int
 main(void)
 {
+    /* HNSW_WINDOW_TESTS_ONLY=1 runs only the read-window tests, so a fault
+     * in an earlier fixture cannot hide their result. */
+    if (getenv("HNSW_WINDOW_TESTS_ONLY") != NULL)
+    {
+        test_read_window_matches_direct_reads();
+        test_row_reader_reserves_records();
+        puts("hnsw read-window tests: ok");
+        return 0;
+    }
     test_stored_policy_versions();
     test_ace_readback_metapage_roundtrip();
     test_valid_flat_and_original_labels();
