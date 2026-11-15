@@ -94,8 +94,11 @@ CUVS_INCLUDE  ?= $(CUVS_PREFIX)/include
 # cuVS 25.x+ ships bundled libcudacxx under include/rapids/
 CUVS_RAPIDS_INCLUDE ?= $(CUVS_PREFIX)/include/rapids
 CUVS_LIB      ?= $(CUVS_PREFIX)/lib
-# Optional matching patched SDK cpp/src root. Required for authoritative ACE
-# partition receipts; absent/mismatched support fails before an ACE build.
+# Optional matching patched SDK cpp/src root. With it the ACE partition receipt
+# records the effective count (computed twice, build refused if unstable); without
+# it an ACE build hands the requested count to the SDK and the receipt records it
+# as requested, effective count not guaranteed. The patched libcuvs.so is
+# required either way.
 CUVS_SDK_SOURCE_INCLUDE ?=
 ifneq ($(strip $(CUVS_SDK_SOURCE_INCLUDE)),)
 CUVS_SDK_PLAN_FLAGS = -I$(CUVS_SDK_SOURCE_INCLUDE) -Xcompiler=-fopenmp
@@ -287,7 +290,7 @@ TEST_RT_LIB := $(shell [ "$$(uname -s)" = "Linux" ] && echo -lrt)
 test-unit: test-compact-retry test-device-norm test-failed-allocation test-build-oom-log test-peak-log-switch test/unit/test_cuvs_util.c src/cuvs_util.c src/cuvs_util.h src/cuvs_ipc.h \
            test/unit/test_build_corpus.c src/cuvs_build_corpus.c src/cuvs_build_corpus.h \
            test-hnsw-build test-hnsw-build-ipc test-hnsw-owner-lease test-hnsw-ace-quality test-hnsw-admission test-admission-contract \
-           test-hnsw-nn-policy test-hnsw-nn-route test-hnsw-nn-precision test-hnsw-nn-capacity test-hnsw-nn-sdk-params test-hnsw-nn-consumer test-hnsw-nn-upper-receipt test-hnsw-nn-center test-hnsw-nn-mutations \
+           test-hnsw-nn-policy test-hnsw-nn-route test-hnsw-nn-precision test-hnsw-nn-capacity test-hnsw-nn-sdk-params test-hnsw-nn-consumer test-hnsw-nn-upper-receipt test-hnsw-nn-center test-hnsw-nn-mutations test-hnsw-ace-origin-json test-hnsw-ace-planner-branch \
            test-i3-logs test-notice-wire test-admission-wire test-admission-message test-admission-ipc test-build-oom-thread test-cache-policy test-circuit-source test-status-text test-i3b-source test-peak-meter test-lw-policy test-lw-guard test-i3e-sql test-self-replace-notice test-host-free-fence test-vacuum-policy test-hnsw-digest
 	$(CC) -I src -DCUVS_TEST_HOOKS -o test-unit test/unit/test_cuvs_util.c src/cuvs_util.c $(TEST_RT_LIB)
 	./test-unit
@@ -302,7 +305,7 @@ test-circuit-source: test/unit/check_circuit_source.py src/pg_cuvs.c
 .PHONY: test-unit test-circuit-source
 
 # Source structure checks of the HNSW build routes, run by the CPU job of
-# .github/workflows/ci.yml. The two check_* scripts read src/ as text, enforce
+# .github/workflows/ci.yml. The three check_* scripts read src/ as text, enforce
 # the invariants the approved route design relies on, and replay planted
 # defects against their own rules. The two test_* scripts compile copies of the
 # real headers with one planted defect each and need the unit test to fail.
@@ -311,13 +314,14 @@ test-circuit-source: test/unit/check_circuit_source.py src/pg_cuvs.c
 # mutation scripts also run the unmutated build themselves before the first
 # mutant and fail with BASELINE_NOT_GREEN if it does not pass. Each script
 # writes a report into a directory that must not exist yet, so they get a fresh
-# temporary one. All four run even if one fails. Python 3 stdlib and cc only:
+# temporary one. All five run even if one fails. Python 3 stdlib and cc only:
 # no git history, PostgreSQL, CUDA or daemon.
 .PHONY: test-source-checks
 test-source-checks: test-hnsw-auto-overflow test-hnsw-explicit-route
 	set -e; out=$$(mktemp -d "$${TMPDIR:-/tmp}/pgcuvs-source-checks.XXXXXX"); \
 	trap 'rm -rf "$$out"' EXIT; rc=0; \
 	for c in check_hnsw_auto_overflow_source check_hnsw_explicit_source \
+	         check_hnsw_ace_receipt_source \
 	         test_hnsw_auto_overflow_mutations test_hnsw_explicit_mutations; do \
 	    echo "== $$c"; python3 -I test/unit/$$c.py "$$out/$$c" || rc=1; \
 	done; \
@@ -447,6 +451,18 @@ test-hnsw-nn-consumer: test/unit/test_hnsw_nn_consumer.py src/cuvs_wrapper.cu sr
 test-hnsw-nn-upper-receipt: test/unit/test_hnsw_nn_upper_receipt.py test/unit/test_hnsw_nn_upper_receipt_mutation.py src/hnsw_export.c src/cuvs_hnsw_policy.h
 	python3 -I -B test/unit/test_hnsw_nn_upper_receipt.py
 	python3 -I -B test/unit/test_hnsw_nn_upper_receipt_mutation.py
+
+# ACE build_info JSON (origin of the partition count, exactness of the readback) rendered from
+# the production hnsw_export.c on stored receipts, with and without the SDK source planner.
+.PHONY: test-hnsw-ace-origin-json
+test-hnsw-ace-origin-json: test/unit/test_hnsw_ace_origin_json.py src/hnsw_export.c src/cuvs_hnsw_policy.h
+	python3 -I -B test/unit/test_hnsw_ace_origin_json.py
+
+# The ACE branch of cuvs_wrapper.cu compiled with and without the SDK source planner, against
+# stubs of the cuVS types it touches (no CUDA, no GPU).
+.PHONY: test-hnsw-ace-planner-branch
+test-hnsw-ace-planner-branch: test/unit/test_hnsw_ace_planner_branch.py src/cuvs_wrapper.cu src/cuvs_hnsw_policy.h
+	CXX="$(CXX)" python3 -I -B test/unit/test_hnsw_ace_planner_branch.py
 
 # NN-descent L2 graph-input centering (docs/hnsw-build-options.md, nn_descent).
 .PHONY: test-hnsw-nn-center

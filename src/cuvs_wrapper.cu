@@ -2912,7 +2912,9 @@ static int execute_hnsw_file_build(const CuvsHnswFileBuild *params, int owner_fd
             ace.npartitions = effective;
             receipt.partitions = (uint32_t)effective;
 #else
-            throw std::runtime_error("ACE metadata requires matching pinned SDK source planner; set CUVS_SDK_SOURCE_INCLUDE");
+            /* No SDK source planner in this build: ace.npartitions stays the requested count
+             * and the receipt says so. The patched-DSO markers were verified before this point. */
+            receipt.route_flags |= CUVS_HNSW_ROUTE_FLAG_ACE_PARTITIONS_REQUESTED;
 #endif
             cp.graph_build_params = ace;
             // Guarded disk serializer reads THESE SAME positive budgets.

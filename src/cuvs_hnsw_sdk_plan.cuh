@@ -5,7 +5,9 @@
  * our candidate as an observed count or maintaining a second memory model.
  * No GPU allocation/build is performed here. Successful fixed-point checking
  * makes the explicit count stable under the same SDK build-time planner.
- * Builds without the matching SDK source refuse ACE before generating it. */
+ * Builds without the matching SDK source do not refuse ACE: they hand the
+ * requested count to the SDK and the receipt records it as requested only
+ * (CUVS_HNSW_ROUTE_FLAG_ACE_PARTITIONS_REQUESTED), with no stability check. */
 #if defined(_OPENMP) && __has_include(<neighbors/detail/cagra/cagra_build.cuh>)
 #include <neighbors/detail/cagra/cagra_build.cuh>
 #define CUVS_HNSW_HAS_SDK_PLAN 1

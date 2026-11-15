@@ -52,6 +52,12 @@ APPROVED_NATIVE_REPLACEMENTS = [
      'the IVF-PQ parameters are owned by the prepared settings (NN routes have none)'),
     ('disk ? "ACE-disk" : tiny ? "tiny-GPU" : "host-IVFPQ"', 'cuvs_hnsw_route_name(prepared.route.route)',
      'route names come from one table that includes nn-descent'),
+    ('throw std::runtime_error("ACE metadata requires matching pinned SDK source planner; set CUVS_SDK_SOURCE_INCLUDE");',
+     '/* No SDK source planner in this build: ace.npartitions stays the requested count\n'
+     '             * and the receipt says so. The patched-DSO markers were verified before this point. */\n'
+     '            receipt.route_flags |= CUVS_HNSW_ROUTE_FLAG_ACE_PARTITIONS_REQUESTED;',
+     'without the SDK source planner ACE is no longer refused: the requested partition count goes to '
+     'the SDK and the receipt is marked requested-only'),
 ]
 
 

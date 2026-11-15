@@ -3114,6 +3114,11 @@ cuvs_build_hnsw_from_heap(Relation heapRel, Relation indexRel, IndexInfo *indexI
             if (notices & CUVS_HNSW_NOTICE_GRAPH_FALLBACK)
                 ereport(NOTICE, (errmsg("pg_cuvs: build_algo=auto built ACE-disk (%u partitions) because cuVS rejected the resident IVF-PQ kNN graph", out->policy.partitions),
                     errdetail("cuVS could not prune the IVF-PQ kNN graph (too many invalid or duplicated neighbors). Starting the daemon with --hnsw-auto-overflow error makes this build fail instead.")));
+            /* ACE built without the SDK source planner: the receipt holds the requested count. */
+            if (cuvs_hnsw_ace_partitions_unverified(&out->policy))
+                ereport(NOTICE, (errmsg("pg_cuvs: ACE partition count %u is the requested count; the effective count is not guaranteed", out->policy.partitions),
+                    errdetail("This pg_cuvs_server was built without the cuVS SDK source planner, so the receipt records the count that was requested and cannot confirm the count the SDK built. pg_cuvs_hnsw_build_info() reports ace_partitions_origin as requested_effective_not_guaranteed."),
+                    errhint("Build pg_cuvs_server with CUVS_SDK_SOURCE_INCLUDE set to the patched SDK's cpp/src to record and verify the effective count.")));
             out->tids_fd = dup(FileGetRawDesc(spool->tids));
             if (out->tids_fd < 0)
                 ereport(ERROR, (errcode_for_file_access(), errmsg("pg_cuvs: cannot hand off TID spool: %m")));
