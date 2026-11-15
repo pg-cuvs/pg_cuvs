@@ -191,6 +191,15 @@ jobs:
       - name: Concurrent RMM pending-quota admission (CPU)
         run: make PGCUVS_CPU_SHIM=1 test-rmm-pending
 
+      # test-hnsw-converter holds the unit fixtures of the HNSW page writers, the
+      # node-location table and the source-less import (hnsw_export.c). It is not
+      # a prerequisite of test-unit, so until this step no workflow ran it. It
+      # compiles against the PostgreSQL 16 server headers and needs no backend.
+      - name: HNSW converter fixtures (CPU)
+        run: |
+          export PATH=/usr/lib/postgresql/16/bin:$PATH
+          make test-hnsw-converter
+
       # The benchmark harness decides which index a published number describes
       # (ownership keys, reloptions checks, the 3I build-NOTICE parser, --resume
       # row skipping). Until now this job ran no Python at all, so those rules
