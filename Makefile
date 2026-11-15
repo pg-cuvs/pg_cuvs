@@ -295,6 +295,28 @@ test-circuit-source: test/unit/check_circuit_source.py src/pg_cuvs.c
 
 .PHONY: test-unit test-circuit-source
 
+# Source structure checks of the HNSW build routes, run by the CPU job of
+# .github/workflows/ci.yml. The two check_* scripts read src/ as text, enforce
+# the invariants the approved route design relies on, and replay planted
+# defects against their own rules. The two test_* scripts compile copies of the
+# real headers with one planted defect each and need the unit test to fail.
+# A mutation script reports "detected" for every mutant when the unit test it
+# mutates already fails, so those two tests (test-hnsw-auto-overflow,
+# test-hnsw-explicit-route) are prerequisites and run unmutated first. The IPC
+# test behind the other mutants, test-hnsw-build-ipc, is a prerequisite of
+# test-unit. Each script writes a report into a directory that must not exist
+# yet, so they get a fresh temporary one. All four run even if one fails.
+# Python 3 stdlib and cc only: no git history, PostgreSQL, CUDA or daemon.
+.PHONY: test-source-checks
+test-source-checks: test-hnsw-auto-overflow test-hnsw-explicit-route
+	set -e; out=$$(mktemp -d "$${TMPDIR:-/tmp}/pgcuvs-source-checks.XXXXXX"); \
+	trap 'rm -rf "$$out"' EXIT; rc=0; \
+	for c in check_hnsw_auto_overflow_source check_hnsw_explicit_source \
+	         test_hnsw_auto_overflow_mutations test_hnsw_explicit_mutations; do \
+	    echo "== $$c"; python3 -I test/unit/$$c.py "$$out/$$c" || rc=1; \
+	done; \
+	exit $$rc
+
 # K3: chunked spool digest used by the HNSW build during the daemon RPC.
 test-hnsw-digest: test/unit/test_hnsw_digest.c src/cuvs_hnsw_digest.h
 	$(CC) -std=gnu11 -O2 -Wall -Wextra -Werror -I src -o $@ $< -lcrypto

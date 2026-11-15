@@ -39,6 +39,15 @@ jobs:
         timeout-minutes: 20
         run: make test-unit
 
+      # The HNSW route source checks (Makefile: test-source-checks) are not
+      # prerequisites of test-unit, so this is the step that runs them. Each one
+      # also has to fail on planted defects, so a check that stops guarding its
+      # invariant turns the step red. Python 3 and cc only; no PostgreSQL, CUDA
+      # or git history.
+      - name: Source structure checks (CPU)
+        timeout-minutes: 10
+        run: make test-source-checks
+
 # ── Job 1b: Tier 1 — CPU-reference shim (full build + installcheck) ────────
 # Builds the extension + daemon with the pure-C CPU shim (PGCUVS_CPU_SHIM=1, no
 # CUDA/cuVS), runs the real PostgreSQL regression suite against a shim daemon.
