@@ -98,7 +98,11 @@ CUVS_LIB      ?= $(CUVS_PREFIX)/lib
 # partition receipts; absent/mismatched support fails before an ACE build.
 CUVS_SDK_SOURCE_INCLUDE ?=
 ifneq ($(strip $(CUVS_SDK_SOURCE_INCLUDE)),)
-CUVS_SDK_PLAN_FLAGS = -I$(CUVS_SDK_SOURCE_INCLUDE) -Xcompiler=-fopenmp
+# The planner header pulls patched SDK sources (cagra_build.cuh, which patch 0006
+# makes call raft::linalg::map_offset) into cuvs_wrapper.cu. Those RAFT kernels call
+# constexpr host functions from device code, which nvcc rejects unless
+# --expt-relaxed-constexpr is set, as the SDK's own build does.
+CUVS_SDK_PLAN_FLAGS = -I$(CUVS_SDK_SOURCE_INCLUDE) -Xcompiler=-fopenmp --expt-relaxed-constexpr
 CUVS_SDK_PLAN_LINK = -fopenmp -lrapids_logger
 endif
 

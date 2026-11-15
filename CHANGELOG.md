@@ -10,6 +10,15 @@ exists for 0.9.0.
 
 ## [Unreleased]
 
+### Fixed
+
+- Building with the patched cuVS SDK planner (`CUVS_SDK_SOURCE_INCLUDE` set, as the
+  HNSW/ACE paths require) failed to compile `src/cuvs_wrapper.cu`: the planner pulls in
+  the patched `cagra_build.cuh`, whose RAFT `map_offset` kernel calls a constexpr host
+  function from device code, and nvcc rejects that without `--expt-relaxed-constexpr`.
+  The planner flags now pass it, as the SDK's own build does. Builds without the
+  planner are unchanged. 0.9.1 and 0.9.2 have the same defect.
+
 ## [0.9.2] - 2026-11-15
 
 Micro-batched index scans no longer fail with 64 or more concurrent clients
