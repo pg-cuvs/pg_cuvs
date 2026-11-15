@@ -3195,8 +3195,18 @@ cuvs_hnsw_build_file(int vectors_fd, int owner_fd,
          * (cagra_build.cuh bounded_partition_builder), never fp16 IVF-PQ. */
         if (prepared.route.route == CUVS_HNSW_ROUTE_NN_DESCENT)
         {
-            if (cuvs_hnsw_nn_precision(static_cast<const float *>(files.mapping), params->n_vecs,
-                    params->dim, params->metric, &prepared.nn_precision))
+            int precision_rc = cuvs_hnsw_nn_precision(static_cast<const float *>(files.mapping),
+                params->n_vecs, params->dim, params->metric, &prepared.nn_precision);
+            if (precision_rc == CUVS_HNSW_NN_PRECISION_CANCELLATION)
+            {
+                snprintf(error, error_len,
+                         "NN-descent L2 input has a large common offset (mean squared norm %.6g > %.0f x spread %.6g); "
+                         "its expanded float32 distances lose neighbor order. Use build_algo='ivf_pq' or center the vectors",
+                         prepared.nn_precision.mean_sq_norm, CUVS_HNSW_NN_L2_NORM_TO_SPREAD_MAX,
+                         prepared.nn_precision.spread);
+                return CUVS_STATUS_BUILD_FAILED;
+            }
+            if (precision_rc)
             {
                 snprintf(error, error_len, "NN-descent input is nonfinite or its FP32 distance bound overflows");
                 return CUVS_STATUS_BUILD_FAILED;

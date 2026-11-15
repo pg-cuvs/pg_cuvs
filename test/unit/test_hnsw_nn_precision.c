@@ -14,24 +14,30 @@ static double uniform01(void)
     rng_state = rng_state * 6364136223846793005ULL + 1442695040888963407ULL;
     return ((rng_state >> 11) + 0.5) * (1.0 / 9007199254740992.0);
 }
+#define REFUSED_CANCELLATION 99u
 static uint32_t dtype_for(double offset, double sd, uint32_t metric)
 {
     enum { N = 4000, D = 128 };
     static float x[N * D];
     CuvsHnswNnPrecision r;
+    int rc;
     rng_state = 1;
     for (int i = 0; i < N * D; i++)
         x[i] = (float)(offset + sd * sqrt(-2.0 * log(uniform01())) * cos(6.283185307179586 * uniform01()));
-    assert(cuvs_hnsw_nn_precision(x, N, D, metric, &r) == 0);
+    rc = cuvs_hnsw_nn_precision(x, N, D, metric, &r);
+    if (rc == CUVS_HNSW_NN_PRECISION_CANCELLATION) return REFUSED_CANCELLATION;
+    assert(rc == 0);
     assert(r.max_abs < 65504.0);  /* the old element-only rule chose FP16 for all of these */
     return r.dtype;
 }
 static void test_review_offsets(void)
 {
+    /* D2: never FP16 for these. Since the r87 cancellation guard, offsets whose
+     * mean squared norm exceeds 4096 x spread are refused outright (L2). */
     assert(dtype_for(0.0, 1.0, CUVS_METRIC_L2) == CUVS_HNSW_NN_FP16);
-    assert(dtype_for(100.0, 5.0, CUVS_METRIC_L2) == CUVS_HNSW_NN_FP32);
-    assert(dtype_for(1000.0, 5.0, CUVS_METRIC_L2) == CUVS_HNSW_NN_FP32);
-    assert(dtype_for(5000.0, 5.0, CUVS_METRIC_L2) == CUVS_HNSW_NN_FP32);
+    assert(dtype_for(100.0, 5.0, CUVS_METRIC_L2) == CUVS_HNSW_NN_FP32);         /* ratio ~400 */
+    assert(dtype_for(1000.0, 5.0, CUVS_METRIC_L2) == REFUSED_CANCELLATION);      /* ~4e4 */
+    assert(dtype_for(5000.0, 5.0, CUVS_METRIC_L2) == REFUSED_CANCELLATION);
     assert(dtype_for(100.0, 5.0, CUVS_METRIC_IP) == CUVS_HNSW_NN_FP32);
     /* unit-scale 768-d rows (the frozen corpus has max_abs 0.79) stay FP16 */
     {
@@ -39,6 +45,37 @@ static void test_review_offsets(void)
         CuvsHnswNnPrecision r;
         for (int i = 0; i < 64 * 768; i++) u[i] = (float)((uniform01() - 0.5) * 0.072);
         assert(cuvs_hnsw_nn_precision(u, 64, 768, CUVS_METRIC_L2, &r) == 0 && r.dtype == CUVS_HNSW_NN_FP16);
+    }
+}
+
+/* r87 offset diagnosis (nn-native-r87c): 768-d unit-scale rows (spread ~4.8
+ * like the frozen corpus) plus a common offset. Native recall@10 at offset
+ * 1000 was 0.40/0.79/0.90 even with FP32; the CPU emulation of the SDK's
+ * float32 norm expansion gave k=64 graph overlap 0.998 at offset 3, 0.979 at
+ * 10 and 0.012 at 1000. L2 must refuse from offset 10; IP is not affected. */
+static int offset_rc(double offset, uint32_t metric, int outlier)
+{
+    enum { N = 256, D = 768 };
+    static float x[N * D];
+    CuvsHnswNnPrecision r;
+    rng_state = 7;
+    for (int i = 0; i < N * D; i++) x[i] = (float)(offset + (uniform01() - 0.5) * 0.276);
+    if (outlier) x[5 * D] = 65505.0f;  /* one large row: spread grows with it */
+    return cuvs_hnsw_nn_precision(x, N, D, metric, &r);
+}
+static void test_offset_cancellation(void)
+{
+    assert(offset_rc(0.0, CUVS_METRIC_L2, 0) == 0);
+    assert(offset_rc(3.0, CUVS_METRIC_L2, 0) == 0);
+    assert(offset_rc(10.0, CUVS_METRIC_L2, 0) == CUVS_HNSW_NN_PRECISION_CANCELLATION);
+    assert(offset_rc(1000.0, CUVS_METRIC_L2, 0) == CUVS_HNSW_NN_PRECISION_CANCELLATION);
+    assert(offset_rc(1000.0, CUVS_METRIC_IP, 0) == 0);
+    assert(offset_rc(0.0, CUVS_METRIC_L2, 1) == 0);  /* r87c C5 abs>65504 case built fine */
+    {
+        float same[4 * 17];
+        CuvsHnswNnPrecision r;
+        for (int i = 0; i < 4 * 17; i++) same[i] = 1000.0f;  /* spread 0: nothing to order */
+        assert(cuvs_hnsw_nn_precision(same, 4, 17, CUVS_METRIC_L2, &r) == 0);
     }
 }
 
@@ -95,6 +132,7 @@ int main(void)
     assert(cuvs_hnsw_nn_precision(safe, 1, 17, UINT32_MAX, &result) != 0);
     test_review_offsets();
     test_distance_margins();
+    test_offset_cancellation();
     puts("NN precision input guard: PASS");
     return 0;
 }

@@ -533,6 +533,9 @@ nonfinite inputs and inputs whose conservative FP32 distance bound overflows. It
 base dtype is FP32 when dim <= 16, any element exceeds half range, or the resident
 IVF-PQ norm bound reaches 65504 (4 x max\|x\|^2 for L2, max\|x\|^2 for inner product and
 cosine), because the SDK's FP16 path mixes FP32 norms with half dot products; otherwise FP16.
+Because the SDK computes L2 as ||a||^2 + ||b||^2 - 2a.b in float32 on both paths, an L2
+input whose mean squared norm exceeds 4096 x its spread (mean squared distance to the
+column mean) is rejected; use `ivf_pq` or center the vectors.
 Its admission estimate uses FP32 dataset storage even when the selected base dtype is FP16;
 the estimate is not an allocator or RSS upper bound. GPU hierarchy requires the matching
 resident-NN upper-precision SDK patch and receives the base dtype and budgets. Existing

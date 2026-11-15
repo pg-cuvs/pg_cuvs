@@ -15,6 +15,9 @@ mutations = {
     'norm cancellation bound': ('|| !(half_bound < 65504.0)', '|| (half_bound < 0.0)'),
     'small dimension': ('dim <= 16 || ', ''),
     'distance overflow': ('(double)FLT_MAX / (metric == CUVS_METRIC_L2 ? 8.0 : 2.0)', '(double)INFINITY'),
+    # r87 offset guard: L2 norm-expansion cancellation must refuse
+    'cancellation guard': ('        return CUVS_HNSW_NN_PRECISION_CANCELLATION;', '        return 0;'),
+    'cancellation threshold': ('#define CUVS_HNSW_NN_L2_NORM_TO_SPREAD_MAX 4096.0', '#define CUVS_HNSW_NN_L2_NORM_TO_SPREAD_MAX 1e12'),
 }
 with tempfile.TemporaryDirectory(prefix='pgcuvs-nn-precision-') as tmp:
     dst = Path(tmp)
@@ -31,7 +34,10 @@ with tempfile.TemporaryDirectory(prefix='pgcuvs-nn-precision-') as tmp:
         if not run.returncode:
             raise RuntimeError(f'{name}: mutation survived')
         print(f'{name}: detected (rc={run.returncode})')
-    broken = header.replace('if (!isfinite(v)) return -1;', 'if (0) return -1;').replace('if (!isfinite(norm)) return -1;', 'if (0) return -1;')
+    finite_checks = ('if (!isfinite(v)) {', 'if (!isfinite(norm)) {')
+    for anchor in finite_checks:
+        assert header.count(anchor) == 1, anchor
+    broken = header.replace(finite_checks[0], 'if (0) {').replace(finite_checks[1], 'if (0) {')
     (dst / 'cuvs_hnsw_nn_precision.h').write_text(broken)
     built = subprocess.run(['cc', '-std=gnu11', '-Wall', '-Wextra', '-Werror', '-I', str(dst), '-I', str(root / 'src'), str(test), '-lm', '-o', str(exe)], capture_output=True, text=True)
     if built.returncode:
