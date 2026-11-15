@@ -5,7 +5,9 @@ from pathlib import Path
 p=argparse.ArgumentParser();p.add_argument('--source',required=True);a=p.parse_args()
 f=Path(a.source)/'neighbors/detail/cagra/cagra_build.cuh'
 manifest=Path(__file__).resolve().parents[1]/'infra/cuvs-patches/patchset-manifest.json'
-expected=json.loads(manifest.read_text())['source_files']['cpp/src/neighbors/detail/cagra/cagra_build.cuh']['final_sha256']
+entry=json.loads(manifest.read_text())['source_files']['cpp/src/neighbors/detail/cagra/cagra_build.cuh']
+# 'canonical' is the ACE planner after 0003; 0006 adds the B3 graph-consumer sort (b3 below).
+expected=entry.get('patch3_sha256', entry['final_sha256'])
 actual=hashlib.sha256(f.read_bytes()).hexdigest()
 # B3's graph-consumer sorting patch changes this file outside the ACE planner.
 # The two planner functions and ace_memory_guard.hpp match the canonical source;
