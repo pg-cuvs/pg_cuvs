@@ -336,6 +336,13 @@ See [HNSW build options](docs/hnsw-build-options.md) for `build_algo`,
 > empty `USING hnsw` target, then import) is removed. `pg_cuvs_build_hnsw(cagra,
 > mode)` still works but is deprecated in favor of the DDL above.
 
+### Explicit exact scans for `pg_cuvs_hnsw`
+
+`SET cuvs.hnsw_exact_scan = on` makes ordered `pg_cuvs_hnsw` scans return exact results
+over the visible heap rows, including rows the approximate graph cannot reach. It is off by
+default, reads the whole heap and stops with an error instead of returning approximate rows.
+See [docs/reference.md](docs/reference.md#explicit-exact-scans-for-pg_cuvs_hnsw-203).
+
 ## Usage
 
 Run this in a fresh test schema after installation. The small corpus demonstrates
