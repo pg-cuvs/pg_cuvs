@@ -83,6 +83,7 @@
 #include "cuvs_util.h"
 #include "cuvs_hnsw_build.h"
 #include "hnsw_export.h"
+#include "cuvs_hnsw_scan.h"
 #include "storage/buffile.h"
 
 /* GUC declared in pg_cuvs.c — socket path for daemon IPC */
@@ -4724,10 +4725,9 @@ PG_FUNCTION_INFO_V1(pg_cuvs_hnsw_handler);
 Datum
 pg_cuvs_hnsw_handler(PG_FUNCTION_ARGS)
 {
-    /* Borrow pgvector hnsw's IndexAmRoutine for the entire read path, then
-     * override only the build + options entry points (Phase 3K). Copying the
-     * routine inherits amsupport / amcanorderbyop / scan / cost / vacuum so the
-     * built index is served by pgvector's own hnsw code. */
+    /* Borrow pgvector's build-independent operations and read capabilities.
+     * The scan wrapper delegates by default and selects exact heap execution
+     * only when the explicit session policy requests it. */
     Oid hnsw_am = get_am_oid("hnsw", false);
     HeapTuple amtup = SearchSysCache1(AMOID, ObjectIdGetDatum(hnsw_am));
     if (!HeapTupleIsValid(amtup))
@@ -4742,7 +4742,9 @@ pg_cuvs_hnsw_handler(PG_FUNCTION_ARGS)
 
     amroutine->ambuild   = cuvs_hnsw_ambuild;   /* GPU CAGRA -> HNSW pages */
     amroutine->amoptions = cuvs_hnsw_amoptions;  /* WITH (source, mode, ...) */
-    /* ambuildempty / aminsert / scan / cost / vacuum stay pgvector's. */
+    /* Writes/maintenance retain pgvector's behavior. The scan wrapper keeps
+     * its delegate path and connects the explicitly selected exact heap mode. */
+    cuvs_hnsw_scan_wrap(amroutine);
 
     PG_RETURN_POINTER(amroutine);
 }

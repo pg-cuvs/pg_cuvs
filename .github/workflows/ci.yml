@@ -244,6 +244,16 @@ jobs:
           export PATH=/usr/lib/postgresql/16/bin:$PATH
           make test-hnsw-converter
 
+      # Explicit exact scans (cuvs.hnsw_exact_scan=on) on the shim cluster: result
+      # equality with Seq Scan + Sort, row-level security and partition shapes,
+      # mid-statement setting changes, and the planner safety checks. No daemon is
+      # used; the indexes are created on empty tables and filled by INSERT.
+      - name: HNSW exact-mode PostgreSQL regression (CPU)
+        run: |
+          export PATH=/usr/lib/postgresql/16/bin:$PATH
+          psql -d postgres -v ON_ERROR_STOP=1 -c "CREATE EXTENSION IF NOT EXISTS vector; CREATE EXTENSION IF NOT EXISTS pg_cuvs;"
+          make test-hnsw-exact-pg HNSW_EXACT_USER="$USER" HNSW_EXACT_DATADIR=/var/lib/postgresql/16/main
+
       # The benchmark harness decides which index a published number describes
       # (ownership keys, reloptions checks, the 3I build-NOTICE parser, --resume
       # row skipping). Until now this job ran no Python at all, so those rules

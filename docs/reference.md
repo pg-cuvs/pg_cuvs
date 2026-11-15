@@ -204,6 +204,7 @@ workspace allocations can still produce a genuine allocation failure.
 | `cuvs.search_width` | int | `0` (SDK default) | 0–INT_MAX | USERSET | CAGRA vertices expanded per iteration. Applies to single, filtered, sharded and batched CAGRA search; ignored by exact BF |
 | `cuvs.cpu_hnsw_fallback` | bool | `off` | — | USERSET | Serve from the `.hnsw` sidecar instead of GPU CAGRA |
 | `cuvs.hnsw_connectivity_check` | bool | `off` | — | USERSET | After a `pg_cuvs_hnsw` build, run the structural connectivity check and record it in `pg_cuvs_hnsw_build_info(index)->'connectivity'` (see § Build connectivity snapshot). Off skips the check, its scratch allocation and its NOTICE and records `disabled`. Read per index build |
+| `cuvs.hnsw_exact_scan` | bool | `off` | — | USERSET | When `on`, ordered scans of a `pg_cuvs_hnsw` index compute exact SQL distances over the MVCC-visible heap rows instead of reading the HNSW graph (see § Explicit exact scans for pg_cuvs_hnsw). A scan runs exactly or stops with an error; it never falls back to approximate results. Changing the value invalidates the saved plans and cached expressions of the current backend. Read at scan start and rescan. Does not recover unreachable rows in the default configuration (#203 stays open) |
 | `cuvs.max_stale_fraction` | real | `0.10` | 0.0–1.0 | USERSET | Delete-drift fraction above which a CAGRA index reroutes to CPU; 1.0 disables |
 | `cuvs.max_delta_rows` | int | `10000` | 0–INT_MAX | USERSET | Pending-insert rows merged before CPU reroute; 0 disables delta |
 | `cuvs.delta_search` | enum | `auto` | `auto`, `cpu`, `gpu` | USERSET | Delta merge mode: GPU-with-CPU-fallback / always CPU / GPU-only |
@@ -1057,3 +1058,77 @@ at 0.9.1 from before this function existed can continue using the existing
 extension owner with `scripts/install-connectivity-status.sql` after loading the
 new binary. The script adds extension membership and is idempotent;
 release-version selection is separate.
+
+### Explicit exact scans for pg_cuvs_hnsw (#203)
+
+**Status: current; CPU PostgreSQL 16 with pgvector 0.8.7 only.** `cuvs.hnsw_exact_scan` defaults to `off`. Setting it to `on` makes ordered
+`pg_cuvs_hnsw` scans use exact SQL distances over MVCC-visible heap rows; the
+approximate graph is not read.
+
+```sql
+SET cuvs.hnsw_exact_scan = on;
+SELECT * FROM items ORDER BY embedding <-> $1 LIMIT 10;
+SET cuvs.hnsw_exact_scan = off;
+```
+
+With the setting on, a scan runs exactly or stops with an error; it never falls back to
+approximate results. Changing the setting invalidates all saved plans and cached
+expressions in the current backend, so prepared statements are replanned.
+
+**Row-level security, security barriers, index expressions and partial indexes.** For
+these shapes PostgreSQL plans its own filtering and sorting path (Seq Scan + Sort) using
+the original quals, so security quals run before any distance function. Row-level security
+on a partition or inheritance child counts: when the statement names a table with such
+children the whole statement is planned without `pg_cuvs_hnsw` paths. A table with
+row-level security that only appears while planning (inside an inlined SQL function, a
+view, or a partitioned parent read through a function) loses its `pg_cuvs_hnsw` paths
+where the planner can see it. After planning, the final plan is checked once with the same
+three facts the scan uses (row-level security or a security barrier on the statement,
+row-level security on the scan's table, an index expression or predicate). If the plan still
+holds a `pg_cuvs_hnsw` scan that could not run exactly, for example an unprotected table
+that shares a statement with such a function, the statement is planned a second time
+without any `pg_cuvs_hnsw` path and runs as Seq Scan + Sort. Planning side effects, such as
+the `NOTICE` of an `IMMUTABLE` function evaluated on constants, then happen twice in that
+case only.
+
+**Where an unsupported shape stops** (all with SQLSTATE `0A000`, feature not supported):
+
+| When | Shape | Message |
+|---|---|---|
+| Planning | a `pg_cuvs_hnsw` path that could not run exactly survived the second planning (another planner hook added it) | `an exact query retained an unsupported HNSW index path` |
+| Scan (re)start | the setting was turned on, or row-level security was enabled, after the statement was planned, and this scan is protected (security barrier, row-level security) or uses an index expression or predicate | `cuvs.hnsw_exact_scan is on, but this scan cannot run exactly`, with the reason in `DETAIL`; run the statement again |
+| Reading further | more rows were fetched than one pass keeps, and a STABLE ordering function returned different values in between (for example after `SET LOCAL` between two `FETCH`es) | `the ordering function returned different results during one exact scan` |
+| First fetch | a direct caller of the exact scan on a table with row-level security enabled | `RLS exact scans require the PostgreSQL executor path` |
+| First fetch | the scan is not a heap MVCC scan with one ordering operator, or the ordering function is not a strict scalar `float8` | `HNSW exact routing requires ...` |
+
+Turning the setting off while a statement runs returns to the delegate access method at
+the next rescan.
+
+**Rows the graph never holds.** Exact mode returns rows whose vector is NULL and, for
+cosine, zero vectors, last, in the same position as `ORDER BY ... <=> ...` over a Seq Scan
+(NULL distance last, NaN after numbers). An ordinary index scan omits them, so the row set
+can differ.
+
+**Cost.** Exact mode reads the whole heap even with a small `LIMIT`, evaluates one distance
+per visible row, and keeps the best candidates that fit in `work_mem` (16 bytes each, 262,144 at the default 4MB). A `LIMIT` within
+that needs no temporary file. A caller that reads more makes a second pass over the heap,
+which goes through PostgreSQL temporary files (`temp_file_limit` applies) and reads the heap
+and evaluates every distance a second time. On 100,000 x 96 at `work_mem = 64kB` (one pass
+keeps 4,096 answers), `LIMIT 4000` took 14 to 16 ms and `LIMIT 5000` took 50 to 84 ms, about
+what Seq Scan + top-N Sort took for `LIMIT 5000` (47 to 79 ms). On one CPU container, `LIMIT 10`, warm, 100,000 x 96 took
+11 ms against 11 ms for Seq Scan + top-N Sort, and 1,000,000 x 96 took 284 ms against
+143 ms; the graph scan took about 2 ms at 100,000. It uses the current role's function
+privileges; evaluating an index expression or partial predicate can require EXECUTE even
+when an index path did not call that function. Standard vector distance operators return
+strict scalar `float8`.
+
+**pgvector coupling.** `pg_cuvs_hnsw` wraps pgvector's scan callbacks and relies on its
+`amrescan` copying the ordering operators into the scan descriptor and on its not using
+`scan->opaque` or `xs_orderbyvals` outside its own state. This was checked against
+pgvector 0.8.7 on PostgreSQL 16 only. If a pgvector version does not copy the ordering
+operators, the exact scan stops with the first-fetch error above instead of returning
+rows.
+
+CPU PostgreSQL 16 regressions cover this explicit mode (`make test-hnsw-exact-pg`). Automatic
+recovery of unreachable rows in the default configuration, native/GPU runs and large-scale
+performance qualification are not done (#203 stays open).

@@ -42,9 +42,9 @@ FOR TYPE vector USING cagra AS
 -- Exposes the GPU CAGRA -> pgvector-HNSW conversion as standard CREATE INDEX
 -- DDL:  CREATE INDEX my_idx ON items USING pg_cuvs_hnsw (embedding vector_l2_ops)
 --         WITH (source = 'my_cagra', mode = 'nsw');
--- The handler borrows pgvector hnsw's IndexAmRoutine for the read path and
--- overrides only ambuild (CAGRA->HNSW page conversion) and amoptions
--- (WITH (source, mode, ...)). See src/hnsw_export.c.
+-- The handler borrows pgvector hnsw's IndexAmRoutine, overrides ambuild and
+-- amoptions, and wraps scans for the explicit cuvs.hnsw_exact_scan policy.
+-- The default scan remains pgvector HNSW. See src/hnsw_export.c.
 -- ----------------------------------------------------------------
 CREATE FUNCTION pg_cuvs_hnsw_handler(internal)
 RETURNS index_am_handler

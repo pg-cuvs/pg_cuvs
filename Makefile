@@ -78,7 +78,7 @@ ISOLATION_OPTS = --inputdir=test --outputdir=test
 # C source files + the CUDA-compiled wrapper (built below by nvcc).
 # PGXS only knows how to build .c → .o; the .cu → .o rule is custom,
 # but the resulting object MUST be listed in OBJS to be linked into the .so.
-OBJS           = src/pg_cuvs.o src/cuvs_ipc.o src/cuvs_util.o $(WRAPPER_OBJ) src/hnsw_export.o src/cuvs_build_corpus.o src/pg_cuvs_compaction.o src/cuvs_status_text.o src/cuvs_peak_meter.o
+OBJS           = src/pg_cuvs.o src/cuvs_ipc.o src/cuvs_util.o $(WRAPPER_OBJ) src/hnsw_export.o src/cuvs_hnsw_scan.o src/cuvs_hnsw_rls.o src/cuvs_hnsw_exact.o src/cuvs_build_corpus.o src/pg_cuvs_compaction.o src/cuvs_status_text.o src/cuvs_peak_meter.o
 
 # nvcc settings (Phase 1: brute-force only; CAGRA added later)
 NVCC          ?= nvcc
@@ -1285,6 +1285,32 @@ EXTRA_CLEAN += test-connectivity
 .PHONY: test-connectivity
 
 test-unit: test-connectivity
+
+# Explicit exact scans of pg_cuvs_hnsw on a real PostgreSQL 16 backend (CPU only, no
+# daemon). The four scripts need a disposable cluster that preloads pg_cuvs, with the
+# vector and pg_cuvs extensions created in HNSW_EXACT_DB; they create their own schemas
+# and refuse to run unless the data directory matches HNSW_EXACT_DATADIR.
+#   make test-hnsw-exact-pg HNSW_EXACT_DATADIR=/var/lib/postgresql/16/main \
+#        HNSW_EXACT_SOCKET=/var/run/postgresql HNSW_EXACT_PORT=5432 HNSW_EXACT_USER=$$USER
+HNSW_EXACT_OUT ?= /tmp/pgcuvs-hnsw-exact-results
+HNSW_EXACT_DB ?= postgres
+HNSW_EXACT_PORT ?= 5432
+HNSW_EXACT_SOCKET ?= /var/run/postgresql
+HNSW_EXACT_USER ?= $(USER)
+HNSW_EXACT_DATADIR ?= /var/lib/postgresql/16/main
+.PHONY: test-hnsw-exact-pg
+test-hnsw-exact-pg:
+	@test -n "$(HNSW_EXACT_DATADIR)" || { echo "set HNSW_EXACT_DATADIR"; exit 2; }
+	rm -rf $(HNSW_EXACT_OUT)
+	mkdir -p $(HNSW_EXACT_OUT)
+	run=$$(date +%s); \
+	for t in pg product_pg rls_pg protected_pg; do \
+	    python3 test/unit/test_hnsw_exact_$$t.py --output $(HNSW_EXACT_OUT)/$$t \
+	        --schema hx$${run}_$$t --socket $(HNSW_EXACT_SOCKET) --port $(HNSW_EXACT_PORT) \
+	        --user $(HNSW_EXACT_USER) --database $(HNSW_EXACT_DB) \
+	        --expected-data-directory $(HNSW_EXACT_DATADIR) --pg-bin $$(pg_config --bindir) \
+	        || exit 1; \
+	done
 
 # Isolated native PostgreSQL CPU regression; server/dev binaries and psql needed.
 # It starts its own Unix-socket cluster and does not connect to an existing DB.
