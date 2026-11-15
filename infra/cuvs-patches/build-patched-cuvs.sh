@@ -9,7 +9,9 @@ readonly EXPECTED_PATCH1_SHA="2f5adf6d3cce3c9d60335e40992250e5044f0ed494c8f5cff6
 readonly EXPECTED_PATCH2_SHA="d52ddd22a0e558849d75ec3ddfba4b52fcc200ed6869568593245289f9f963f8"
 readonly EXPECTED_PATCH3_SHA="34831f221f32337c025afeb33a32d7aa304e703bd0e3ee85f0ff93902a9a130f"
 readonly EXPECTED_PATCH4_SHA="8777280bc918cc26e8bca0bbf38021e1e901ccda8510e543738b9a53ff631fdd"
-readonly EXPECTED_PATCHSET_MANIFEST_SHA="51bc6c770e9db26a22ee68a15ff2197fe65d0dd9e9ca9aba870ce621a5db634a"
+readonly EXPECTED_PATCH6_SHA="3acd107a74bd0fc29ee72e2e206558f86d4bc374e506775af60496b87ae48fa4"
+readonly EXPECTED_RAFT_PATCH_SHA="a2d153ccc4a6b3d61bf4c9bbadf6c98f8e104a85352312d2588b90899c58058c"
+readonly EXPECTED_PATCHSET_MANIFEST_SHA="d35f367e0e647538d7a59a0bfbfb23ed6051701322b020d79ac157d1b3ae1870"
 readonly EXPECTED_BASE_HNSW_HPP_SHA="6c8530e39c6ed5fa4eb3fe7b9c6c24022842147c41814fc4c130fdb5a6b8fd0b"
 readonly EXPECTED_PATCH1_HNSW_HPP_SHA="49adab846921272a2aaf28f3c5749fb85925fbfde8ca43cd0af61e51adcbba99"
 readonly EXPECTED_PATCH3_HNSW_HPP_SHA="88192b1da4cb50a2de5a0f374854c1d0659734215136f86d7e53e52c0a1dc911"
@@ -22,6 +24,10 @@ readonly EXPECTED_BASE_CAGRA_CPP_SHA="100e9a8702bf1f5b373019583d873a99d9490b575d
 readonly EXPECTED_PATCHED_CAGRA_CPP_SHA="c270c872b8513179b5c3f9583a653aaa8091a3d08973ea19bd125f823803fcce"
 readonly EXPECTED_BASE_CAGRA_BUILD_SHA="f72c7ac38e1b24f2f0b05c5a392a1eef2bec7fc88a1fa27f6393fc87795f5bc1"
 readonly EXPECTED_PATCHED_CAGRA_BUILD_SHA="87239d05766dda6f99d17cbfbc75faa9858e976fc0aa80f679f63dc4a6297c8e"
+readonly EXPECTED_FINAL_CAGRA_BUILD_SHA="38722f03f72efeb5a92e92ea30ebe9d87ec9b9b1afc2ca392a07de4b645c95bc"
+readonly EXPECTED_ROW_SORT_PLAN_SHA="07b7b724fce554cec74ee1cb779e24ced31867981f33e6afda4f2c17d98cac49"
+readonly EXPECTED_RAFT_SELECT_K_BASE_SHA="3d6959c06710d420ceaf9236793a0eb91b2b587ba879a5c59ee79c76ee23abec"
+readonly EXPECTED_RAFT_SELECT_K_FINAL_SHA="64a54cbaf855b2c3a333ad380ad85ceac41d222b6a557af6c1f490dacf5cf908"
 readonly EXPECTED_ACE_GUARD_SHA="dc2ccb2d6920bf81d55e614181e3ceff8e7e0394eae56d0506fbb302190cf555"
 readonly EXPECTED_LICENSE_SHA="756005f963846334943e8bfc08ef98cd254257d8467ac7a7ffd42a1be262f442"
 readonly EXPECTED_DISK_MARKER="pgcuvs-hnsw-disk-copy-v1@60b19a0f62ba0bd716de349382828e43be6e2daa"
@@ -35,6 +41,8 @@ readonly PATCH1_FILE="${SCRIPT_DIR}/0001-hnsw-gpu-hierarchy-typed-copy.patch"
 readonly PATCH2_FILE="${SCRIPT_DIR}/0002-hnsw-disk-copy-patch-id.patch"
 readonly PATCH3_FILE="${SCRIPT_DIR}/0003-hnsw-memory-guards.patch"
 readonly PATCH4_FILE="${SCRIPT_DIR}/0004-hnsw-upper-precision.patch"
+readonly PATCH6_FILE="${SCRIPT_DIR}/0006-cagra-consumer-row-sort.patch"
+readonly RAFT_PATCH_FILE="${SCRIPT_DIR}/raft/0001-raft-select-k-key-bitwidth.patch"
 readonly PATCHSET_MANIFEST_FILE="${SCRIPT_DIR}/patchset-manifest.json"
 readonly HNSW_HPP_REL="cpp/src/neighbors/detail/hnsw.hpp"
 readonly HNSW_CPP_REL="cpp/src/neighbors/hnsw.cpp"
@@ -42,11 +50,13 @@ readonly CAGRA_CPP_REL="cpp/src/neighbors/cagra.cpp"
 readonly CAGRA_BUILD_REL="cpp/src/neighbors/detail/cagra/cagra_build.cuh"
 readonly ACE_GUARD_REL="cpp/src/neighbors/detail/cagra/ace_memory_guard.hpp"
 readonly PRECISION_HEADER_REL="cpp/src/neighbors/detail/hnsw_precision.hpp"
+readonly ROW_SORT_PLAN_REL="cpp/src/neighbors/detail/cagra/consumer_row_sort_plan.hpp"
 readonly EXPECTED_TRACKED_0001="$(printf '%s\n' "$HNSW_HPP_REL" | LC_ALL=C sort)"
 readonly EXPECTED_TRACKED_0002="$(printf '%s\n' "$HNSW_CPP_REL" "$HNSW_HPP_REL" | LC_ALL=C sort)"
 readonly EXPECTED_TRACKED_0003="$(printf '%s\n' "$CAGRA_BUILD_REL" "$CAGRA_CPP_REL" "$HNSW_CPP_REL" "$HNSW_HPP_REL" | LC_ALL=C sort)"
 
 readonly EXPECTED_TRACKED_0004="$EXPECTED_TRACKED_0003"
+readonly EXPECTED_TRACKED_0006="$EXPECTED_TRACKED_0003"
 
 if [[ $# -ne 3 ]]; then
   echo "usage: $0 CUVS_SOURCE_ROOT EMPTY_ISOLATED_INSTALL_PREFIX SDK_BUILD_DIR" >&2
@@ -58,7 +68,7 @@ readonly INSTALL_PREFIX="$2"
 readonly BUILD_DIR="$3"
 readonly LICENSE_FILE="${SOURCE_ROOT}/LICENSE"
 
-for command_name in git sha256sum cmake ninja python3 ldd; do
+for command_name in git sha256sum cmake ninja python3 ldd patch; do
   command -v "$command_name" >/dev/null || {
     echo "required build command not found: $command_name" >&2
     exit 2
@@ -125,12 +135,16 @@ readonly PATCH1_SHA="$(sha256_of "$PATCH1_FILE")"
 readonly PATCH2_SHA="$(sha256_of "$PATCH2_FILE")"
 readonly PATCH3_SHA="$(sha256_of "$PATCH3_FILE")"
 readonly PATCH4_SHA="$(sha256_of "$PATCH4_FILE")"
+readonly PATCH6_SHA="$(sha256_of "$PATCH6_FILE")"
+readonly RAFT_PATCH_SHA="$(sha256_of "$RAFT_PATCH_FILE")"
 readonly PATCHSET_MANIFEST_SHA="$(sha256_of "$PATCHSET_MANIFEST_FILE")"
 for patch_tuple in \
   "0001:$PATCH1_SHA:$EXPECTED_PATCH1_SHA" \
   "0002:$PATCH2_SHA:$EXPECTED_PATCH2_SHA" \
   "0003:$PATCH3_SHA:$EXPECTED_PATCH3_SHA" \
   "0004:$PATCH4_SHA:$EXPECTED_PATCH4_SHA" \
+  "0006:$PATCH6_SHA:$EXPECTED_PATCH6_SHA" \
+  "raft-0001:$RAFT_PATCH_SHA:$EXPECTED_RAFT_PATCH_SHA" \
   "manifest:$PATCHSET_MANIFEST_SHA:$EXPECTED_PATCHSET_MANIFEST_SHA"; do
   IFS=: read -r patch_name actual_sha expected_sha <<< "$patch_tuple"
   if [[ "$actual_sha" != "$expected_sha" ]]; then
@@ -185,6 +199,16 @@ source_state_matches() {
       expected_tracked="$EXPECTED_TRACKED_0004"
       expected_untracked="$(printf '%s\n' "$ACE_GUARD_REL" "$PRECISION_HEADER_REL" | LC_ALL=C sort)"
       ;;
+    6)
+      # 0001..0004 followed by 0006. Patch 0005 (resident NN upper) is not in this
+      # patch set; 0006 touches different files, so the numbering gap is allowed.
+      expected_hpp="$EXPECTED_FINAL_HNSW_HPP_SHA"
+      expected_cpp="$EXPECTED_FINAL_HNSW_CPP_SHA"
+      expected_cagra="$EXPECTED_PATCHED_CAGRA_CPP_SHA"
+      expected_cagra_build="$EXPECTED_FINAL_CAGRA_BUILD_SHA"
+      expected_tracked="$EXPECTED_TRACKED_0006"
+      expected_untracked="$(printf '%s\n' "$ACE_GUARD_REL" "$PRECISION_HEADER_REL" "$ROW_SORT_PLAN_REL" | LC_ALL=C sort)"
+      ;;
     *) return 1 ;;
   esac
 
@@ -192,15 +216,21 @@ source_state_matches() {
   source_file_matches "$HNSW_CPP_REL" "$expected_cpp" || return 1
   source_file_matches "$CAGRA_CPP_REL" "$expected_cagra" || return 1
   source_file_matches "$CAGRA_BUILD_REL" "$expected_cagra_build" || return 1
-  if [[ "$prefix_level" == 3 || "$prefix_level" == 4 ]]; then
+  if [[ "$prefix_level" == 3 || "$prefix_level" == 4 || "$prefix_level" == 6 ]]; then
     source_file_matches "$ACE_GUARD_REL" "$EXPECTED_ACE_GUARD_SHA" || return 1
   elif [[ -e "${SOURCE_ROOT}/${ACE_GUARD_REL}" ]]; then
     return 1
   fi
 
-  if [[ "$prefix_level" == 4 ]]; then
+  if [[ "$prefix_level" == 4 || "$prefix_level" == 6 ]]; then
     source_file_matches "$PRECISION_HEADER_REL" "$EXPECTED_PRECISION_HEADER_SHA" || return 1
   elif [[ -e "${SOURCE_ROOT}/${PRECISION_HEADER_REL}" ]]; then
+    return 1
+  fi
+
+  if [[ "$prefix_level" == 6 ]]; then
+    source_file_matches "$ROW_SORT_PLAN_REL" "$EXPECTED_ROW_SORT_PLAN_SHA" || return 1
+  elif [[ -e "${SOURCE_ROOT}/${ROW_SORT_PLAN_REL}" ]]; then
     return 1
   fi
 
@@ -214,7 +244,7 @@ source_state_matches() {
 }
 
 SOURCE_PATCH_LEVEL=""
-for candidate_level in 0 1 2 3 4; do
+for candidate_level in 0 1 2 3 4 6; do
   if source_state_matches "$candidate_level"; then
     if [[ -n "$SOURCE_PATCH_LEVEL" ]]; then
       echo "source checkout ambiguously matches multiple patch-prefix states" >&2
@@ -224,7 +254,7 @@ for candidate_level in 0 1 2 3 4; do
   fi
 done
 if [[ -z "$SOURCE_PATCH_LEVEL" ]]; then
-  echo "source checkout is not clean or an exact ordered patch prefix from 0001 through 0004" >&2
+  echo "source checkout is not clean or an exact ordered patch prefix from 0001 through 0004, optionally followed by 0006" >&2
   echo "tracked changes:" >&2
   git -C "$SOURCE_ROOT" diff --name-only HEAD >&2
   echo "untracked/ignored paths:" >&2
@@ -260,8 +290,12 @@ if [[ "$SOURCE_PATCH_LEVEL" == 3 ]]; then
   apply_next_patch "$PATCH4_FILE" 4
   SOURCE_PATCH_LEVEL=4
 fi
-if [[ "$SOURCE_PATCH_LEVEL" != 4 ]] || ! source_state_matches 4; then
-  echo "source checkout did not reach the exact complete 0001+0002+0003+0004 patch state" >&2
+if [[ "$SOURCE_PATCH_LEVEL" == 4 ]]; then
+  apply_next_patch "$PATCH6_FILE" 6
+  SOURCE_PATCH_LEVEL=6
+fi
+if [[ "$SOURCE_PATCH_LEVEL" != 6 ]] || ! source_state_matches 6; then
+  echo "source checkout did not reach the exact complete 0001+0002+0003+0004+0006 patch state" >&2
   exit 2
 fi
 
@@ -647,10 +681,13 @@ echo "source=$SOURCE_ROOT"
 echo "source_commit=$ACTUAL_COMMIT"
 echo "source_archive_sha256=$EXPECTED_SOURCE_ARCHIVE_SHA"
 echo "source_initial_patch_level=$INITIAL_PATCH_LEVEL"
-echo "patch_prefix=0001+0002+0003+0004"
+echo "patch_prefix=0001+0002+0003+0004+0006"
 echo "0001_patch_sha256=$PATCH1_SHA"
 echo "0002_patch_sha256=$PATCH2_SHA"
 echo "0003_patch_sha256=$PATCH3_SHA"
+echo "0004_patch_sha256=$PATCH4_SHA"
+echo "0006_patch_sha256=$PATCH6_SHA"
+echo "raft_select_k_patch_sha256=$RAFT_PATCH_SHA"
 echo "patchset_manifest_sha256=$PATCHSET_MANIFEST_SHA"
 echo "hnsw_hpp_sha256=$(sha256_of "${SOURCE_ROOT}/${HNSW_HPP_REL}")"
 echo "hnsw_cpp_sha256=$(sha256_of "${SOURCE_ROOT}/${HNSW_CPP_REL}")"
@@ -872,6 +909,29 @@ while IFS= read -r implicit_link_dir; do
   done
 done < "${TOOLCHAIN_OBSERVATION_DIR}/cxx-implicit-link-directories.txt"
 
+# RAFT dependency patch (select_k radix sort bit width uses KeyT, not ValT).
+# Applied to the CPM RAFT source that this build compiles; base and result are
+# pinned, and an unknown header stops the build.
+RAFT_SOURCE_DIR="$(cache_value "$cuvs_cache" CPM_PACKAGE_raft_SOURCE_DIR)"
+if [[ -z "$RAFT_SOURCE_DIR" ]]; then
+  RAFT_SOURCE_DIR="$(cache_value "$cuvs_cache" raft_SOURCE_DIR)"
+fi
+readonly RAFT_SELECT_K="${RAFT_SOURCE_DIR}/cpp/include/raft/matrix/detail/select_k-inl.cuh"
+if [[ -z "$RAFT_SOURCE_DIR" || ! -f "$RAFT_SELECT_K" ]]; then
+  echo "cuVS build cache does not expose the RAFT source header to patch: ${RAFT_SELECT_K}" >&2
+  exit 1
+fi
+raft_select_k_sha="$(sha256_of "$RAFT_SELECT_K")"
+if [[ "$raft_select_k_sha" == "$EXPECTED_RAFT_SELECT_K_BASE_SHA" ]]; then
+  patch --batch --forward -p1 -d "${RAFT_SOURCE_DIR}/cpp" < "$RAFT_PATCH_FILE"
+  raft_select_k_sha="$(sha256_of "$RAFT_SELECT_K")"
+fi
+if [[ "$raft_select_k_sha" != "$EXPECTED_RAFT_SELECT_K_FINAL_SHA" ]]; then
+  echo "RAFT select_k-inl.cuh is neither the pinned base nor the patched header: $raft_select_k_sha" >&2
+  exit 1
+fi
+echo "raft_select_k_sha256=$raft_select_k_sha"
+
 env LD_LIBRARY_PATH="$BUILD_RUNTIME_PATH" \
   cmake --build "$LIBCUVS_BUILD_DIR" --target cuvs --parallel "$PARALLEL_JOBS" \
   2>&1 | tee "${RUN_ROOT}/cuvs-build.log"
@@ -1082,11 +1142,13 @@ cp "$cuvs_cache" "${RUN_ROOT}/CMakeCache-final.txt"
 cat > "${RUN_ROOT}/sdk-provenance.txt" <<EOF
 source_commit=$ACTUAL_COMMIT
 source_archive_sha256=$EXPECTED_SOURCE_ARCHIVE_SHA
-patch_prefix=0001+0002+0003+0004
+patch_prefix=0001+0002+0003+0004+0006
 patch_0001_sha256=$PATCH1_SHA
 patch_0002_sha256=$PATCH2_SHA
 patch_0003_sha256=$PATCH3_SHA
 patch_0004_sha256=$PATCH4_SHA
+patch_0006_sha256=$PATCH6_SHA
+raft_select_k_patch_sha256=$RAFT_PATCH_SHA
 patchset_manifest_sha256=$PATCHSET_MANIFEST_SHA
 source_hnsw_hpp_sha256=$(sha256_of "${SOURCE_ROOT}/${HNSW_HPP_REL}")
 source_hnsw_cpp_sha256=$(sha256_of "${SOURCE_ROOT}/${HNSW_CPP_REL}")
@@ -1094,6 +1156,7 @@ source_cagra_cpp_sha256=$(sha256_of "${SOURCE_ROOT}/${CAGRA_CPP_REL}")
 source_cagra_build_sha256=$(sha256_of "${SOURCE_ROOT}/${CAGRA_BUILD_REL}")
 source_ace_memory_guard_sha256=$(sha256_of "${SOURCE_ROOT}/${ACE_GUARD_REL}")
 source_upper_precision_sha256=$(sha256_of "${SOURCE_ROOT}/${PRECISION_HEADER_REL}")
+source_consumer_row_sort_sha256=$(sha256_of "${SOURCE_ROOT}/${ROW_SORT_PLAN_REL}")
 source_license_sha256=$ACTUAL_LICENSE_SHA
 install_prefix_previous=${CONFIGURED_INSTALL_PREFIX:-none}
 install_prefix_new=$INSTALL_PREFIX

@@ -1,0 +1,38 @@
+--- a/include/raft/matrix/detail/select_k-inl.cuh
++++ b/include/raft/matrix/detail/select_k-inl.cuh
+@@ -104,7 +104,7 @@
+                                              offsets,
+                                              offsets + 1,
+                                              0,
+-                                             sizeof(ValT) * 8,
++                                             sizeof(KeyT) * 8,
+                                              stream);
+   } else {
+     cub::DeviceSegmentedRadixSort::SortPairsDescending(nullptr,
+@@ -118,7 +118,7 @@
+                                                        offsets,
+                                                        offsets + 1,
+                                                        0,
+-                                                       sizeof(ValT) * 8,
++                                                       sizeof(KeyT) * 8,
+                                                        stream);
+   }
+ 
+@@ -138,7 +138,7 @@
+                                              offsets,
+                                              offsets + 1,
+                                              0,
+-                                             sizeof(ValT) * 8,
++                                             sizeof(KeyT) * 8,
+                                              stream);
+ 
+   } else {
+@@ -154,7 +154,7 @@
+                                                        offsets,
+                                                        offsets + 1,
+                                                        0,
+-                                                       sizeof(ValT) * 8,
++                                                       sizeof(KeyT) * 8,
+                                                        stream);
+   }
+ 
