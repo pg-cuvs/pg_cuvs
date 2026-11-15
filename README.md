@@ -231,6 +231,10 @@ inputs, not a tested minimum-version matrix for every GPU and driver.
   That recipe requires CMake 3.30.4+, Ninja, and nvcc 12.9 or 13.1 with matching
   RAPIDS dependencies. The CUDA 12.4 development bootstrap does not install that
   patched SDK. Follow the recipe's `CUVS_SDK_SOURCE_INCLUDE` and link settings.
+  `CUVS_SDK_SOURCE_INCLUDE` makes the ACE receipt record and verify the effective
+  partition count. Without it ACE still builds on the patched SDK, the receipt
+  records the requested count and says the effective count is not guaranteed, and
+  `CREATE INDEX` raises a NOTICE; see [HNSW build options](docs/hnsw-build-options.md).
 - Deploy the extension and daemon from the same revision: global IPC protocol
   v5 and HNSW op-23 payload v6 are separate compatibility checks.
 
