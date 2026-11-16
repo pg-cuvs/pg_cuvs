@@ -759,7 +759,7 @@ In this chapter, *sidecar* means only the `.delta` and `.tombstone` files of an 
 ### 8.1 Model: a shared cache and work memory
 
 Resident indexes are a shared cache (like `shared_buffers`); build scratch is work
-memory (like `work_mem`). The files in `index_dir` are the source of truth: an index
+memory (like `maintenance_work_mem`). The files in `index_dir` are the source of truth: an index
 that leaves the GPU is reloaded by its next query.
 
 **When an index is evicted.** Only these paths unload a resident index:
