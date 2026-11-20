@@ -1239,6 +1239,7 @@ shm 크기: Q×dim×4 (input) + Q×K×12 (output). Q=1000, dim=1024, K=10 기준
 - `pg_cuvs_batch_search(rel regclass, queries vector[], k int) RETURNS TABLE(query_idx int, ctid tid, distance real)` SRF 완성.
 - CAGRA mode, BF mode(ADR-039), sharded index(3F/3G) 모두 지원. 데몬이 단일 GPU dispatch로 Q개 쿼리를 처리하고 global top-K merge(sharded) 또는 direct Q×K 반환(unsharded).
 - **MVCC**: 함수 내부에서 heap_fetch를 하지 않고 raw ctid + 데몬 distance를 반환한다(단일 쿼리 AM scan이 xs_recheck=true로 두는 것과 동일 의미). caller가 `JOIN ... ON t.ctid = b.ctid`로 visibility를 처리 → 단일 쿼리 API와 byte-identical top-K 보장. 결과는 `query_idx` 기준 반환(정렬 안 함, GPU 반환 순서 유지).
+  - **정정 (2026-11-20, #243):** HOT 갱신된 행이 있으면 이 보장은 성립하지 않는다. 함수는 인덱스가 가진 HOT 체인의 뿌리 TID를 돌려주므로 `t.ctid = b.ctid` 조인이 그 행을 찾지 못한다. 단일 쿼리 인덱스 스캔은 실행기가 HOT 체인을 따라가므로 그 행을 돌려준다.
 - **reply 전송**: Q×K가 클 수 있어 inline UDS 대신 데몬-할당 reply shm(키는 `CuvsReplyHeader.error[]`, K는 `delta_merged`)을 사용 — `handle_export_adjacency`의 reply-shm 메커니즘 재사용.
 - 주의: cuVS L2 distance는 SQUARED(pgvector `<->`의 sqrt와 다름). ranking은 동일하므로 거리값이 아닌 ctid(JOIN)로 비교.
 - installcheck 10/10 PASS(`pg_cuvs_batch` 신규 테스트 포함). 각 query_idx의 top-K가 단일 쿼리 API와 일치(L2/cosine, sharded, BF mode).

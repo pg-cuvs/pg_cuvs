@@ -179,6 +179,11 @@ CREATE INDEX items_flat ON items USING flat (embedding vector_l2_ops)
 
 -- Batch API takes the TABLE, returns candidate ctids, and needs a heap join
 -- for MVCC-visible rows. Explicit k is independent of cuvs.k here.
+-- The ctid join silently drops HOT-updated rows (an UPDATE that changes no
+-- indexed column, such as a metadata column, and fits in the same heap page):
+-- the function returns the root TID of the HOT chain, which matches no visible
+-- row. VACUUM, REINDEX and pg_cuvs_compact do not bring the row back (#243).
+-- On a table that receives UPDATEs, use the ORDER BY ... LIMIT form below.
 SELECT b.query_idx, t.id, b.distance
 FROM pg_cuvs_batch_search(
     'items'::regclass,
@@ -186,6 +191,21 @@ FROM pg_cuvs_batch_search(
 ) b
 JOIN items t ON t.ctid = b.ctid
 ORDER BY b.query_idx, b.distance;
+
+-- Several queries as index scans, one per query; the executor follows HOT
+-- chains. query_idx starts at 1 here (0 in pg_cuvs_batch_search), and distance
+-- is the L2 of <->, not the squared L2 that pg_cuvs_batch_search returns.
+-- On a small table the planner can choose a sequential scan; check EXPLAIN.
+SELECT q.query_idx, r.id, r.distance
+FROM unnest(ARRAY['[1,0,0]'::vector, '[0,1,0]'::vector])
+     WITH ORDINALITY AS q(v, query_idx)
+CROSS JOIN LATERAL (
+    SELECT t.id, t.embedding <-> q.v AS distance
+    FROM items t
+    ORDER BY t.embedding <-> q.v
+    LIMIT 2
+) r
+ORDER BY q.query_idx, r.distance;
 
 SELECT index_name, search_count, avg_latency_us,
        p50_latency_us, p95_latency_us, search_mode
