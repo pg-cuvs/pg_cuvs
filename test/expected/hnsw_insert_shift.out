@@ -1,0 +1,68 @@
+-- hnsw_insert_shift.sql — rows inserted after a GPU build must not hide the rows the build wrote.
+--
+-- mode='nsw' writes a graph with one layer (every element at level 0, the entry point at level 0). pgvector's insert makes a new element the
+-- entry point as soon as its level is above the entry point's (hnswinsert.c, HNSW_UPDATE_ENTRY_GREATER), and links a new element's upper
+-- layers only to elements that already exist there (hnswutils.c, HnswFindElementNeighbors), so after a GPU build the upper layers hold only
+-- inserted rows. When those rows lie elsewhere than the built ones, a search descends to them and its layer-0 walk stays there: the built
+-- rows are not found any more, not even by their own vector (measured: recall@10 0.0 on this data before the fix).
+--
+-- Coverage: 2,000 built rows in [0,1]^16, 400 inserted rows in [3,4]^16; for 20 built rows, the row is its own first answer and none of the
+-- inserted rows is among its 10 nearest (the exact answer has none of them), with mode 'nsw' and 'hnswlib'.
+\set ON_ERROR_STOP on
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS vector;
+CREATE EXTENSION IF NOT EXISTS pg_cuvs;
+RESET client_min_messages;
+CREATE TABLE m23(id int PRIMARY KEY, v vector(16));
+INSERT INTO m23 SELECT g, (SELECT array_agg(((hashtext(g::text || ':' || d::text) & 65535) / 65536.0)::real) FROM generate_series(1, 16) d)::vector
+FROM generate_series(1, 2000) g;
+ANALYZE m23;
+-- mode 'nsw' (the default)
+CREATE INDEX m23_i ON m23 USING pg_cuvs_hnsw (v vector_l2_ops) WITH (mode = 'nsw');
+INSERT INTO m23 SELECT g, (SELECT array_agg((3.0 + ((hashtext(g::text || ':' || d::text) & 65535) / 65536.0))::real) FROM generate_series(1, 16) d)::vector
+FROM generate_series(2001, 2400) g;
+SET enable_seqscan = off;
+SELECT count(*) AS own_first_of_20
+FROM generate_series(7, 2000, 100) s(g)
+WHERE (SELECT id FROM m23 ORDER BY v <-> (SELECT v FROM m23 WHERE id = s.g) LIMIT 1) = s.g;
+ own_first_of_20 
+-----------------
+              20
+(1 row)
+
+SELECT count(*) AS inserted_rows_in_top10
+FROM generate_series(7, 2000, 100) s(g),
+     LATERAL (SELECT id FROM m23 ORDER BY v <-> (SELECT v FROM m23 WHERE id = s.g) LIMIT 10) a
+WHERE a.id > 2000;
+ inserted_rows_in_top10 
+------------------------
+                      0
+(1 row)
+
+RESET enable_seqscan;
+DROP INDEX m23_i;
+DELETE FROM m23 WHERE id > 2000;
+-- mode 'hnswlib' (a layered graph)
+CREATE INDEX m23_i ON m23 USING pg_cuvs_hnsw (v vector_l2_ops) WITH (mode = 'hnswlib');
+INSERT INTO m23 SELECT g, (SELECT array_agg((3.0 + ((hashtext(g::text || ':' || d::text) & 65535) / 65536.0))::real) FROM generate_series(1, 16) d)::vector
+FROM generate_series(2001, 2400) g;
+SET enable_seqscan = off;
+SELECT count(*) AS own_first_of_20
+FROM generate_series(7, 2000, 100) s(g)
+WHERE (SELECT id FROM m23 ORDER BY v <-> (SELECT v FROM m23 WHERE id = s.g) LIMIT 1) = s.g;
+ own_first_of_20 
+-----------------
+              20
+(1 row)
+
+SELECT count(*) AS inserted_rows_in_top10
+FROM generate_series(7, 2000, 100) s(g),
+     LATERAL (SELECT id FROM m23 ORDER BY v <-> (SELECT v FROM m23 WHERE id = s.g) LIMIT 10) a
+WHERE a.id > 2000;
+ inserted_rows_in_top10 
+------------------------
+                      0
+(1 row)
+
+RESET enable_seqscan;
+DROP TABLE m23;
