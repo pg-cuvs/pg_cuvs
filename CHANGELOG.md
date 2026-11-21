@@ -56,6 +56,13 @@ exists for 0.9.0.
 
 ### Fixed
 
+- Documentation: the README batch example, `docs/reference.md` and ADR-040 said that
+  joining the results of `pg_cuvs_batch_search` and `cuvs_filtered_knn` on `ctid` gives
+  the visible rows. That join silently drops HOT-updated rows, because the functions
+  return the root TID of the HOT chain (#243); the documents now say so and show the
+  `CROSS JOIN LATERAL ... ORDER BY ... LIMIT` form, which follows HOT chains.
+  `docs/reference.md` also notes the brute_force cache defects #237 and #239. The
+  functions are unchanged.
 - A GPU build without `CUVS_SDK_SOURCE_INCLUDE` failed to link with
   `ld: .../librapids_logger.so: error adding symbols: DSO missing from command line`.
   The wrapper expands `RMM_LOG_*`, which call `rapids_logger::logger::log`, and
