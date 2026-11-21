@@ -67,6 +67,7 @@
 #include "utils/acl.h"
 #include "utils/lsyscache.h"     /* get_rel_name */
 #include "utils/jsonb.h"
+#include "funcapi.h"               /* get_call_result_type (layer counts) */
 #include "utils/guc.h"
 #include "catalog/pg_type.h"     /* Form_pg_type (#162: vector/halfvec type detection) */
 
@@ -4794,6 +4795,97 @@ cuvs_hnsw_ambuild(Relation heapRel, Relation indexRel, IndexInfo *indexInfo)
         result->index_tuples = ntuples;
     }
     return result;
+}
+
+/*
+ * mode='nsw' before 0.9.3 wrote every element of a pg_cuvs_hnsw index at level 0, so the upper layers of such an index
+ * hold only rows pgvector inserted after the build, and a search that descends through them can miss the built rows. This
+ * counts, for one index, the elements that are not marked deleted, those above level 0, the metapage's m and entry level,
+ * and the hierarchy flag of the heap build's policy receipt (NULL when the build recorded none, e.g. a CAGRA-source build).
+ * pg_cuvs_hnsw_layer_status() turns these into a verdict. It reads every page of the index.
+ */
+PG_FUNCTION_INFO_V1(pg_cuvs_hnsw_layer_counts);
+Datum
+pg_cuvs_hnsw_layer_counts(PG_FUNCTION_ARGS)
+{
+    Oid oid = PG_GETARG_OID(0);
+    Relation rel;
+    Oid heap;
+    TupleDesc tupdesc;
+    Datum values[5];
+    bool nulls[5] = {false, false, true, true, true};
+    int64 elements = 0;
+    int64 upper = 0;
+    BlockNumber nblocks;
+    BufferAccessStrategy strategy;
+
+    if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+        elog(ERROR, "pg_cuvs_hnsw_layer_counts: return type must be a row type");
+    heap = IndexGetRelation(oid, false);
+    if (pg_class_aclcheck(heap, GetUserId(), ACL_SELECT) != ACLCHECK_OK)
+        aclcheck_error(ACLCHECK_NO_PRIV, OBJECT_TABLE, get_rel_name(heap));
+    rel = index_open(oid, AccessShareLock);
+    if (rel->rd_rel->relam != get_am_oid("pg_cuvs_hnsw", true))
+        ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+            errmsg("pg_cuvs_hnsw_layer_counts requires a pg_cuvs_hnsw index")));
+    nblocks = RelationGetNumberOfBlocks(rel);
+    if (nblocks > 0)
+    {
+        Buffer buffer = ReadBuffer(rel, 0);
+        Page page;
+        PgvHnswMeta *meta;
+        CuvsHnswPolicy policy = {0};
+
+        LockBuffer(buffer, BUFFER_LOCK_SHARE);
+        page = BufferGetPage(buffer);
+        meta = (PgvHnswMeta *) PageGetContents(page);
+        if (meta->magicNumber == PGV_HNSW_MAGIC)
+        {
+            values[2] = Int32GetDatum((int32) meta->m);
+            values[3] = Int32GetDatum((int32) meta->entryLevel);
+            nulls[2] = nulls[3] = false;
+        }
+        if (hnsw_read_disk_policy(page, &policy) == CUVS_HNSW_POLICY_RECORDED)
+        {
+            values[4] = Int32GetDatum((int32) policy.hierarchy);
+            nulls[4] = false;
+        }
+        UnlockReleaseBuffer(buffer);
+    }
+    strategy = GetAccessStrategy(BAS_BULKREAD);
+    for (BlockNumber blkno = 1; blkno < nblocks; blkno++)
+    {
+        Buffer buffer;
+        Page page;
+        OffsetNumber maxoff;
+
+        CHECK_FOR_INTERRUPTS();
+        buffer = ReadBufferExtended(rel, MAIN_FORKNUM, blkno, RBM_NORMAL, strategy);
+        LockBuffer(buffer, BUFFER_LOCK_SHARE);
+        page = BufferGetPage(buffer);
+        maxoff = PageGetMaxOffsetNumber(page);
+        for (OffsetNumber off = FirstOffsetNumber; off <= maxoff; off = OffsetNumberNext(off))
+        {
+            ItemId item = PageGetItemId(page, off);
+            const PgvHnswElemHdr *etup;
+
+            if (!ItemIdIsUsed(item) || !ItemIdHasStorage(item) ||
+                ItemIdGetLength(item) < sizeof(PgvHnswElemHdr))
+                continue;
+            etup = (const PgvHnswElemHdr *) PageGetItem(page, item);
+            if (etup->type != 1 || etup->deleted)
+                continue;
+            elements++;
+            if (etup->level > 0)
+                upper++;
+        }
+        UnlockReleaseBuffer(buffer);
+    }
+    FreeAccessStrategy(strategy);
+    index_close(rel, AccessShareLock);
+    values[0] = Int64GetDatum(elements);
+    values[1] = Int64GetDatum(upper);
+    PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(tupdesc, values, nulls)));
 }
 
 PG_FUNCTION_INFO_V1(pg_cuvs_hnsw_handler);
