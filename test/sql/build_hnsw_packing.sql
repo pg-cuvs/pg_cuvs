@@ -7,6 +7,14 @@
 -- relationships are unchanged, so search correctness must be identical to
 -- the pre-packing one-pair-per-page layout.
 --
+-- mode='nsw' now builds upper layers (see hnsw_insert_shift.sql), so
+-- about 1/32 of the elements carry a larger neighbor tuple. Pairs are packed
+-- in element order, each taking its own size: level-0 pairs still go k=9 to
+-- a page here, and the page count grows by the room the upper-layer pairs
+-- take. Levels come from cagra_assign_level() seeded by (N, M), so the page
+-- count is a pure function of N, M and dim (measured: 59 pages for N=500 and
+-- for N=504, dim 100, M=32; 57 before 0.9.3).
+--
 -- Coverage:
 --   1. index_bytes shrinks below the old one-page-per-element size — direct
 --      evidence packing actually happened, not just that the build succeeded.
@@ -65,9 +73,9 @@ SET client_min_messages = 'notice';
 
 -- ── Case 1: index_bytes shrinks below the old 1-pair-per-page size ──
 -- Old layout: 1 (meta) + 500 (one per element) = 501 pages = 4,104,192 bytes.
--- Packed (k=9): 1 + ceil(500/9) = 1 + 56 = 57 pages = 466,944 bytes.
+-- Packed (k=9 for level-0 pairs, upper-layer pairs larger): 59 pages = 483,328 bytes.
 SELECT pg_relation_size('hp_hnsw') < 501 * 8192 AS packed_smaller_than_unpacked,
-       pg_relation_size('hp_hnsw') = 57 * 8192   AS packed_size_matches_k9;
+       pg_relation_size('hp_hnsw') = 59 * 8192   AS packed_size_matches_k9;
 
 -- ── Case 2: full correctness sweep ──
 -- Every row must be its own exact-match (distance 0) nearest neighbor,
@@ -129,8 +137,8 @@ CREATE INDEX hp_hnsw2 ON hp_test2 USING pg_cuvs_hnsw
     (embedding vector_l2_ops) WITH (source = 'hp_cagra2', mode = 'nsw');
 SET client_min_messages = 'notice';
 
--- 504/9 = 56 exactly: 1 (meta) + 56 pages, no trailing partial/empty page.
-SELECT pg_relation_size('hp_hnsw2') = 57 * 8192 AS exact_multiple_size_matches;
+-- 504/9 = 56 exactly for level-0 pairs only; with the upper layers 1 (meta) + 58 pages.
+SELECT pg_relation_size('hp_hnsw2') = 59 * 8192 AS exact_multiple_size_matches;
 
 SET enable_cuvs = off; SET enable_seqscan = off;
 SELECT count(*) AS mismatches_exact_multiple

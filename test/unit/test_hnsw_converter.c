@@ -733,8 +733,7 @@ test_packed_page_geometry(void)
     assert((uint64_t)pack_k * reserved_pair_bytes <= PGV_USABLE_BYTES);
     assert((uint64_t)(pack_k + 1) * reserved_pair_bytes > PGV_USABLE_BYTES);
     n_nodes = 2 * (uint64_t)pack_k + 1;
-    assert(hnsw_data_page_count(n_nodes, true, pack_k, &page_count));
-    assert(page_count == 3);
+    page_count = 3;
     assert(hnsw_layout_location(n_nodes - 1, n_nodes, 0, true, pack_k,
                                 &location));
     assert(location.elem_blkno == page_count && location.elem_offno == 1);
@@ -754,7 +753,7 @@ test_packed_page_geometry(void)
         elem.elem_offno = elem_off;
         elem.neigh_blkno = 1;
         elem.neigh_offno = neigh_off;
-        write_elem_pair(page, &elem, vector, dim, bytes_per_dim, m,
+        write_elem_pair(page, page, &elem, vector, dim, bytes_per_dim, m,
                         (size_t)n_nodes, hnsw_lookup_elem_array, &elem);
     }
     assert(PageGetMaxOffsetNumber(page) == (OffsetNumber)(2 * pack_k));
@@ -764,15 +763,6 @@ test_packed_page_geometry(void)
     assert(((PageHeader)page)->pd_upper ==
            BLCKSZ - sizeof(PgvHnswPageOpaque) - pack_k * (esize + nsize));
     free(page);
-
-    assert(!hnsw_data_page_count(0, true, pack_k, &page_count));
-    assert(!hnsw_data_page_count(n_nodes, true, 0, &page_count));
-    assert(hnsw_data_page_count((uint64_t)InvalidBlockNumber - 1, false,
-                                1, &page_count));
-    assert(page_count == InvalidBlockNumber - 1);
-    assert(!hnsw_data_page_count((uint64_t)InvalidBlockNumber, false,
-                                 1, &page_count));
-    assert(!hnsw_data_page_count(UINT64_MAX, true, pack_k, &page_count));
 }
 
 static void
@@ -814,7 +804,7 @@ test_legacy_writer_page_chains(void)
     }
 
     chain_test_reset();
-    write_elem_pages_packed(NULL, elems, &vectors[0][0], 2, 4, 1, 5, 2,
+    write_elem_pages_packed(NULL, elems, &vectors[0][0], 2, 4, 1, 5,
                             true, hnsw_lookup_elem_array, elems);
     assert_source_data_page_chain(3);
 }
@@ -907,6 +897,69 @@ test_hierarchical_packing_cursor_bounds(void)
     assert(!hnsw_pack_location_next(&cursor, 3, 3, 0, 898, 4, 32, &location));
     cursor = (HnswPackingCursor){.block = InvalidBlockNumber - 1};
     assert(!hnsw_pack_location_next(&cursor, 0, 1, 0, 898, 4, 32, &location));
+}
+
+/* a pair too large for one page keeps the element and puts its neighbor tuple first on the next page, pgvector's build
+ * rule (hnswbuild.c); each tuple must still fit a page by itself. */
+static void
+test_packing_cursor_splits_large_pairs(void)
+{
+    HnswPackingCursor cursor = {0};
+    HnswNodeLocation location;
+
+    /* D2000/fp32/M32: even a level-0 pair exceeds a page. */
+    assert(hnsw_pack_location_next(&cursor, 0, 3, 0, 2000, 4, 32, &location));
+    assert(location.elem_blkno == 1 && location.elem_offno == 1 &&
+           location.reserved == HNSW_LOCATION_SPLIT);
+    assert(hnsw_location_neigh_blkno(&location) == 2 &&
+           hnsw_location_neigh_offno(&location) == 1);
+    assert(hnsw_pack_location_next(&cursor, 1, 3, 0, 2000, 4, 32, &location));
+    assert(location.elem_blkno == 3 && location.elem_offno == 1);
+    assert(hnsw_pack_location_next(&cursor, 2, 3, 0, 2000, 4, 32, &location));
+    assert(location.elem_blkno == 5 && cursor.block == 6);
+
+    /* D1900: a level-0 pair fits one page, a level-1 pair does not. */
+    cursor = (HnswPackingCursor){0};
+    assert(hnsw_pack_location_next(&cursor, 0, 3, 0, 1900, 4, 32, &location));
+    assert(location.reserved == 0 && hnsw_location_neigh_blkno(&location) == 1 &&
+           hnsw_location_neigh_offno(&location) == 2);
+    assert(hnsw_pack_location_next(&cursor, 1, 3, 1, 1900, 4, 32, &location));
+    assert(location.elem_blkno == 2 && location.elem_offno == 1 &&
+           location.reserved == HNSW_LOCATION_SPLIT &&
+           hnsw_location_neigh_blkno(&location) == 3);
+    /* An element tuple larger than a page is refused. */
+    assert(!hnsw_pack_location_next(&cursor, 2, 3, 0, 2100, 4, 32, &location));
+}
+
+/* the CAGRA-source writer puts a split pair's neighbor tuple first on the next page and keeps the chain contiguous. */
+static void
+test_packed_writer_split_pairs(void)
+{
+    enum { N = 3, D = 2000 };
+    static float vectors[N][D];
+    ElemDesc elems[N] = {{0}};
+    HnswPackingCursor cursor = {0};
+    HnswNodeLocation location;
+
+    for (size_t node = 0; node < N; node++)
+    {
+        assert(hnsw_pack_location_next(&cursor, node, N, 0, D, 4, 32, &location));
+        elems[node].level = 0;
+        elems[node].tid_encoded = cuvs_tid_encode((uint32_t)node + 1, 1);
+        elems[node].elem_blkno = location.elem_blkno;
+        elems[node].elem_offno = location.elem_offno;
+        elems[node].neigh_blkno = hnsw_location_neigh_blkno(&location);
+        elems[node].neigh_offno = hnsw_location_neigh_offno(&location);
+        vectors[node][0] = (float)node;
+    }
+    assert(elems[0].neigh_blkno == 2 && elems[2].neigh_blkno == 6);
+
+    chain_test_reset();
+    write_elem_pages_packed(NULL, elems, &vectors[0][0], D, 4, 32, N,
+                            true, hnsw_lookup_elem_array, elems);
+    assert_source_data_page_chain(6);
+    for (uint32_t block = 1; block <= 6; block++)
+        assert(PageGetMaxOffsetNumber((Page)chain_test_pages[block]) == 1);
 }
 
 static uint32_t
@@ -2104,6 +2157,8 @@ main(int argc, char **argv)
     test_disk_writer_page_chain();
     test_batched_data_page_publication();
     test_hierarchical_packing_cursor_bounds();
+    test_packing_cursor_splits_large_pairs();
+    test_packed_writer_split_pairs();
     test_hierarchical_native_packing_shapes();
     test_pgvector_page_version_range();
     test_buffered_location_table_contract();

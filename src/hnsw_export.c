@@ -464,12 +464,39 @@ elems_per_page(int dim, int bytes_per_dim, int m, int level)
 }
 
 /*
- * Errors if not even one element+neighbor pair at the worst-case level
- * fits on a page (#162/#161) — a failure here means the index cannot be
- * built at all with this dim/type/M, regardless of packing.
+ * Errors if the element tuple or the neighbor tuple at the worst-case level
+ * does not fit on a page by itself (#162/#161) — a failure here means the
+ * index cannot be built at all with this dim/type/M. A pair that does not fit
+ * one page together is split the way pgvector's own build splits it (
+ * hnswbuild.c keeps the element and puts its neighbor tuple first on the next
+ * page; hnsw_pack_location_next()).
  */
 static void
 check_hnsw_page_fit(int dim, int bytes_per_dim, int m, int maxlevel)
+{
+    if (dim <= 0)
+        (void) elems_per_page(dim, bytes_per_dim, m, maxlevel);	/* its "no fixed dimension" ERROR */
+    {
+        size_t eneed = elem_tuple_size(dim, bytes_per_dim) + 2 * PGV_ITEM_OVERHEAD;
+        size_t nneed = neigh_tuple_size(maxlevel, m) + 2 * PGV_ITEM_OVERHEAD;
+
+        if (eneed > (size_t) PGV_USABLE_BYTES || nneed > (size_t) PGV_USABLE_BYTES)
+            ereport(ERROR,
+                    (errmsg("pg_cuvs: HNSW tuple too large for one page: "
+                            "element=%zu, neighbor=%zu, available=%d "
+                            "(dim=%d, bytes_per_dim=%d, maxlevel=%d, M=%d)",
+                            eneed, nneed, PGV_USABLE_BYTES, dim, bytes_per_dim,
+                            maxlevel, m)));
+    }
+}
+
+/*
+ * The one-pair-per-page layout (the CAGRA-source 'hnswlib' / 'hnswlib_file'
+ * import, write_elem_page()) has no split pairs: errors unless one
+ * element+neighbor pair at the worst-case level fits a page.
+ */
+static void
+check_hnsw_pair_fit(int dim, int bytes_per_dim, int m, int maxlevel)
 {
     if (elems_per_page(dim, bytes_per_dim, m, maxlevel) < 1)
     {
@@ -618,8 +645,25 @@ typedef struct HnswNodeLocation
     uint32_t elem_blkno;
     uint16_t elem_offno;
     uint8_t  level;
-    uint8_t  reserved;
+    uint8_t  reserved;	/* 0, or HNSW_LOCATION_SPLIT */
 } HnswNodeLocation;
+
+/* a pair too large for one page keeps the element at (elem_blkno, elem_offno) and puts its neighbor tuple first on the next
+ * page, as pgvector's build does (hnswbuild.c: neighborPage = blkno + 1, neighborOffno = FirstOffsetNumber). Otherwise the neighbor
+ * tuple follows the element on the same page. */
+#define HNSW_LOCATION_SPLIT 1
+
+static inline uint32_t
+hnsw_location_neigh_blkno(const HnswNodeLocation *location)
+{
+    return location->elem_blkno + (location->reserved == HNSW_LOCATION_SPLIT ? 1 : 0);
+}
+
+static inline uint16_t
+hnsw_location_neigh_offno(const HnswNodeLocation *location)
+{
+    return location->reserved == HNSW_LOCATION_SPLIT ? 1 : (uint16_t) (location->elem_offno + 1);
+}
 
 _Static_assert(sizeof(HnswNodeLocation) == 8,
                "HNSW location records must stay compact");
@@ -943,36 +987,15 @@ hnsw_compute_pack_k(int dim, int bytes_per_dim, int m, uint32_t *k_out)
     return *k_out > 0;
 }
 
-static bool
-hnsw_data_page_count(uint64_t n_nodes, bool packed_nsw, uint32_t pack_k,
-                     uint32_t *page_count_out)
-{
-    uint64_t page_count;
-
-    if (n_nodes == 0 || page_count_out == NULL ||
-        (packed_nsw && pack_k == 0))
-        return false;
-    page_count = packed_nsw ? 1 + (n_nodes - 1) / pack_k : n_nodes;
-    if (page_count == 0 || page_count >= (uint64_t)InvalidBlockNumber)
-        return false;
-    *page_count_out = (uint32_t)page_count;
-    return true;
-}
-
+/* Each tuple fits a page by itself; a pair too large for one page is split (HNSW_LOCATION_SPLIT). */
 static bool
 hnsw_page_pair_fits(int dim, int bytes_per_dim, int m, int level)
 {
-    size_t esize;
-    size_t nsize;
-    size_t needed;
-
     if (dim <= 0 || (bytes_per_dim != 2 && bytes_per_dim != 4) ||
         m <= 0 || level < 0)
         return false;
-    esize = elem_tuple_size(dim, bytes_per_dim);
-    nsize = neigh_tuple_size(level, m);
-    needed = esize + nsize + 4 * PGV_ITEM_OVERHEAD;
-    return needed <= PGV_USABLE_BYTES;
+    return elem_tuple_size(dim, bytes_per_dim) + 2 * PGV_ITEM_OVERHEAD <= PGV_USABLE_BYTES &&
+        neigh_tuple_size(level, m) + 2 * PGV_ITEM_OVERHEAD <= PGV_USABLE_BYTES;
 }
 
 /* A bounded cursor assigns hierarchical rows in their serialized order.
@@ -992,14 +1015,21 @@ hnsw_pack_location_next(HnswPackingCursor *cursor,
                         int dim, int bytes_per_dim, int m,
                         HnswNodeLocation *location)
 {
+    size_t esize;
+    size_t nsize;
     size_t needed;
+    bool split;
 
     if (!cursor || !location || node != cursor->next_node || node >= n_nodes ||
         level < 0 || level > UINT8_MAX ||
         !hnsw_page_pair_fits(dim, bytes_per_dim, m, level))
         return false;
-    needed = elem_tuple_size(dim, bytes_per_dim) + neigh_tuple_size(level, m)
-        + 4 * PGV_ITEM_OVERHEAD;
+    esize = elem_tuple_size(dim, bytes_per_dim) + 2 * PGV_ITEM_OVERHEAD;
+    nsize = neigh_tuple_size(level, m) + 2 * PGV_ITEM_OVERHEAD;
+    /* pgvector's build rule (hnswbuild.c): keep the pair on one page if it fits one page, else the element here and its
+     * neighbor tuple first on the next page. */
+    split = esize + nsize > PGV_USABLE_BYTES;
+    needed = split ? esize : esize + nsize;
     if (cursor->block == 0 || cursor->remaining < needed)
     {
         if (cursor->block >= InvalidBlockNumber - 1)
@@ -1014,9 +1044,20 @@ hnsw_pack_location_next(HnswPackingCursor *cursor,
     location->elem_blkno = cursor->block;
     location->elem_offno = cursor->next_offset;
     location->level = (uint8_t)level;
-    location->reserved = 0;
-    cursor->remaining -= needed;
-    cursor->next_offset += 2;
+    location->reserved = split ? HNSW_LOCATION_SPLIT : 0;
+    if (split)
+    {
+        if (cursor->block >= InvalidBlockNumber - 1)
+            return false;
+        cursor->block++;
+        cursor->next_offset = 2;
+        cursor->remaining = PGV_USABLE_BYTES - nsize;
+    }
+    else
+    {
+        cursor->remaining -= needed;
+        cursor->next_offset += 2;
+    }
     cursor->next_node++;
     return true;
 }
@@ -1628,6 +1669,7 @@ hnsw_fill_res_free(HnswFillRes *r)
  * ---------------------------------------------------------------- */
 static void
 write_elem_pair(Page page,
+                Page npage,
                 ElemDesc *e,
                 const float *vec,
                 int dim,
@@ -1766,14 +1808,14 @@ write_elem_pair(Page page,
                         "offno %u, layout pass assigned %u",
                         eoff, e->elem_offno)));
 
-    /* Add neighbor tuple, same assertion. */
-    OffsetNumber noff = PageAddItem(page, (Item)ntup, nsize, InvalidOffsetNumber,
+    /* Add neighbor tuple, same assertion. npage is page unless the layout split the pair (then the next page, at offno 1). */
+    OffsetNumber noff = PageAddItem(npage, (Item)ntup, nsize, InvalidOffsetNumber,
                                     false, false);
     if (noff == InvalidOffsetNumber)
         ereport(ERROR,
                 (errmsg("pg_cuvs: hnsw_export: neighbor tuple does not fit on page "
                         "(nsize=%zu, free=%zu)", nsize,
-                        (size_t)PageGetFreeSpace(page))));
+                        (size_t)PageGetFreeSpace(npage))));
     if (noff != (OffsetNumber) e->neigh_offno)
         ereport(ERROR,
                 (errmsg("pg_cuvs: hnsw_export: internal error — neighbor tuple "
@@ -1820,27 +1862,33 @@ write_elem_page(Relation rel,
         ereport(ERROR,
                 (errmsg("pg_cuvs: invalid HNSW data page chain position")));
 
-    write_elem_pair(page, e, vec, dim, bytes_per_dim, m, n_elems,
+    write_elem_pair(page, page, e, vec, dim, bytes_per_dim, m, n_elems,
                     location_lookup, location_lookup_arg);
 
     hnsw_publish_staged_page(rel, page, skip_wal);
     pfree(page);
 }
 
-/* #161: writes N element+neighbor pairs packed k-per-page (fixed k, not
- * greedy — same k for every page, chosen once from (dim, bytes_per_dim, m,
- * level) so index_bytes stays a pure function of the build parameters, not
- * of runtime packing choices). elems[i].elem_blkno/elem_offno/neigh_blkno/
- * neigh_offno must already encode this k (the layout pass's job, not this
- * function's) — this function only opens/fills/closes each page in that
- * pre-assigned order and asserts (via write_elem_pair()) that what it
- * writes lands where the layout pass said it would.
- *
- * Only valid for a uniform-size element sequence, i.e. every elems[i] at
- * the SAME level (today: the nsw path, where every element is level 0).
- * A hierarchical sequence has per-element neighbor-tuple sizes that vary
- * with level, which a single fixed k cannot pack losslessly — callers with
- * varying levels must keep using write_elem_page() in a per-element loop. */
+/* #161: writes N element+neighbor pairs onto the pages the layout pass assigned: elems[i].elem_blkno must be ascending
+ * from 1 with no gap, elems[i].elem_offno/neigh_offno the slots in that page in order, and a split pair's neighbor tuple
+ * (neigh_blkno = elem_blkno + 1, neigh_offno 1) first on the next page (the layout pass's job, hnsw_pack_location_next()).
+ * This function fills each page in element order and asserts (via write_elem_pair()) that each tuple lands where the
+ * layout said. */
+static void
+hnsw_init_source_data_page(Page page, uint32_t blkno, uint32_t data_page_count)
+{
+    PgvHnswPageOpaque *opaque;
+
+    PageInit(page, BLCKSZ, sizeof(PgvHnswPageOpaque));
+    opaque = (PgvHnswPageOpaque *) PageGetSpecialPointer(page);
+    opaque->nextblkno = InvalidBlockNumber;
+    opaque->unused    = 0;
+    opaque->page_id   = PGV_HNSW_PAGE_ID;
+    if (!hnsw_set_disk_page_chain(page, (uint64_t) blkno, data_page_count))
+        ereport(ERROR,
+                (errmsg("pg_cuvs: invalid packed HNSW data page chain position")));
+}
+
 static void
 write_elem_pages_packed(Relation rel,
                         ElemDesc *elems,
@@ -1849,52 +1897,75 @@ write_elem_pages_packed(Relation rel,
                         int bytes_per_dim,
                         int m,
                         size_t n_elems,
-                        int k,
                         bool skip_wal,
                         HnswNodeAddressLookup location_lookup,
                         void *location_lookup_arg)
 {
     uint32_t data_page_count;
-    Page staged;
+    Page cur;
+    Page next;
+    uint32_t cur_blkno = 0;
+    bool next_started = false;
 
     if (n_elems == 0)
         return;
-    if (k <= 0 ||
-        !hnsw_data_page_count((uint64_t)n_elems, true, (uint32_t)k,
-                              &data_page_count))
+    data_page_count = elems[n_elems - 1].neigh_blkno;
+    if (elems[0].elem_blkno != 1 || data_page_count == 0 ||
+        data_page_count >= InvalidBlockNumber)
         ereport(ERROR,
                 (errmsg("pg_cuvs: invalid packed HNSW data page count")));
 
-    staged = (Page)palloc(BLCKSZ);
-    for (size_t page_start = 0; page_start < n_elems; page_start += (size_t) k)
+    cur = (Page)palloc(BLCKSZ);
+    next = (Page)palloc(BLCKSZ);
+    for (size_t i = 0; i < n_elems; i++)
     {
-        size_t page_end = page_start + (size_t) k;
-        if (page_end > n_elems)
-            page_end = n_elems;
+        ElemDesc *e = &elems[i];
+        const float *vec = vecs + i * (size_t) dim;
 
-        Page page = staged;
-        PageInit(page, BLCKSZ, sizeof(PgvHnswPageOpaque));
-
-        PgvHnswPageOpaque *opaque = (PgvHnswPageOpaque *) PageGetSpecialPointer(page);
-        opaque->nextblkno = InvalidBlockNumber;
-        opaque->unused    = 0;
-        opaque->page_id   = PGV_HNSW_PAGE_ID;
-        if (!hnsw_set_disk_page_chain(page,
-                                      (uint64_t)(page_start / (size_t)k) + 1,
-                                      data_page_count))
-            ereport(ERROR,
-                    (errmsg("pg_cuvs: invalid packed HNSW data page chain position")));
-
-        for (size_t i = page_start; i < page_end; i++)
+        if (e->elem_blkno != cur_blkno)
         {
-            const float *vec = vecs + i * (size_t) dim;
-            write_elem_pair(page, &elems[i], vec, dim, bytes_per_dim, m,
+            if (cur_blkno != 0)
+                hnsw_publish_staged_page(rel, cur, skip_wal);
+            if (next_started)
+            {
+                /* the page holding the last split pair's neighbor tuple; the element may start on it or on the page after */
+                Page t = cur;
+
+                cur = next;
+                next = t;
+                next_started = false;
+                cur_blkno++;
+                if (e->elem_blkno != cur_blkno)
+                    hnsw_publish_staged_page(rel, cur, skip_wal);
+            }
+            if (e->elem_blkno != cur_blkno)
+            {
+                if (e->elem_blkno != cur_blkno + 1)
+                    ereport(ERROR,
+                            (errmsg("pg_cuvs: packed HNSW layout skips a page after block %u", cur_blkno)));
+                hnsw_init_source_data_page(cur, e->elem_blkno, data_page_count);
+                cur_blkno = e->elem_blkno;
+            }
+        }
+        if (e->neigh_blkno == cur_blkno)
+            write_elem_pair(cur, cur, e, vec, dim, bytes_per_dim, m,
+                            n_elems, location_lookup, location_lookup_arg);
+        else
+        {
+            if (e->neigh_blkno != cur_blkno + 1 || e->neigh_offno != 1 || next_started)
+                ereport(ERROR,
+                        (errmsg("pg_cuvs: packed HNSW layout places a neighbor tuple off the next page's first slot")));
+            hnsw_init_source_data_page(next, cur_blkno + 1, data_page_count);
+            next_started = true;
+            write_elem_pair(cur, next, e, vec, dim, bytes_per_dim, m,
                             n_elems, location_lookup, location_lookup_arg);
         }
-
-        hnsw_publish_staged_page(rel, page, skip_wal);
     }
-    pfree(staged);
+    hnsw_publish_staged_page(rel, cur, skip_wal);
+    if (next_started)
+        hnsw_publish_staged_page(rel, next, skip_wal);
+    pfree(cur);
+    pfree(next);
 }
 
 /* pg_cuvs writes pgvector on-disk HNSW_VERSION=1 pages, tested with pgvector
@@ -2417,7 +2488,7 @@ fill_hnsw_from_hnswlib_impl(Oid cagra_oid, Oid hnsw_oid, bool use_shm,
 
     /* Verify that elem+neigh fit on one page for the worst-case element level.
      * We check against the largest possible level. */
-    check_hnsw_page_fit(dim, bytes_per_dim, M, hdr.maxlevel);
+    check_hnsw_pair_fit(dim, bytes_per_dim, M, hdr.maxlevel);
 
     /* ---- 9. Re-open .hnsw to read vectors sequentially ---- */
     hf = hnsw_open_stream(hnsw_path, res->shm_fd);
@@ -3081,8 +3152,8 @@ hnsw_read_disk_row(int hnsw_fd, int tids_fd,
     row->elem.upper_counts = row->upper_counts;
     row->elem.elem_blkno = location.elem_blkno;
     row->elem.elem_offno = location.elem_offno;
-    row->elem.neigh_blkno = location.elem_blkno;
-    row->elem.neigh_offno = location.elem_offno + 1;
+    row->elem.neigh_blkno = hnsw_location_neigh_blkno(&location);
+    row->elem.neigh_offno = hnsw_location_neigh_offno(&location);
 
     if (!hnsw_window_read(&row->upper, &upper_bytes, sizeof(upper_bytes),
                           *upper_cursor))
@@ -3195,6 +3266,8 @@ hnsw_write_disk_pages(Relation rel, int hnsw_fd, int tids_fd,
 {
     HnswDiskRow row;
     Page staged = (Page)palloc(BLCKSZ);
+    Page next = (Page)palloc(BLCKSZ);
+    bool next_started = false;
     uint64_t upper_cursor;
     uint64_t level0_bytes;
     uint32_t current_block = 0;
@@ -3213,29 +3286,65 @@ hnsw_write_disk_pages(Relation rel, int hnsw_fd, int tids_fd,
                            node, &upper_cursor, locations, &row);
         if (row.elem.elem_blkno != current_block)
         {
-            if (row.elem.elem_blkno != current_block + 1 ||
-                row.elem.elem_blkno > data_page_count)
-                ereport(ERROR,
-                        (errmsg("pg_cuvs: noncontiguous source-less HNSW page layout")));
             if (current_block != 0)
                 hnsw_publish_staged_data_page(rel, staged, skip_wal,
                                               current_block, data_page_count, &batch);
-            current_block = row.elem.elem_blkno;
-            hnsw_init_disk_page(staged);
-            if (!hnsw_set_disk_page_chain(staged, current_block, data_page_count))
+            if (next_started)
+            {
+                /* the page holding the last split pair's neighbor tuple; the element may start on it or on the page after */
+                Page t = staged;
+
+                staged = next;
+                next = t;
+                next_started = false;
+                current_block++;
+                if (row.elem.elem_blkno != current_block)
+                    hnsw_publish_staged_data_page(rel, staged, skip_wal,
+                                                  current_block, data_page_count, &batch);
+            }
+            if (row.elem.elem_blkno != current_block)
+            {
+                if (row.elem.elem_blkno != current_block + 1 ||
+                    row.elem.elem_blkno > data_page_count)
+                    ereport(ERROR,
+                            (errmsg("pg_cuvs: noncontiguous source-less HNSW page layout")));
+                current_block = row.elem.elem_blkno;
+                hnsw_init_disk_page(staged);
+                if (!hnsw_set_disk_page_chain(staged, current_block, data_page_count))
+                    ereport(ERROR,
+                            (errmsg("pg_cuvs: invalid source-less HNSW data page chain position")));
+            }
+        }
+        if (row.elem.neigh_blkno == current_block)
+            write_elem_pair(staged, staged, &row.elem, row.vector, (int)dim,
+                            bytes_per_dim, m, (size_t)n_nodes,
+                            hnsw_location_table_address_lookup, locations);
+        else
+        {
+            /* a split pair's neighbor tuple goes first on the next page (pgvector's build rule). */
+            if (row.elem.neigh_blkno != current_block + 1 || row.elem.neigh_offno != 1 ||
+                next_started || row.elem.neigh_blkno > data_page_count)
+                ereport(ERROR,
+                        (errmsg("pg_cuvs: source-less HNSW layout places a neighbor tuple off the next page's first slot")));
+            hnsw_init_disk_page(next);
+            if (!hnsw_set_disk_page_chain(next, row.elem.neigh_blkno, data_page_count))
                 ereport(ERROR,
                         (errmsg("pg_cuvs: invalid source-less HNSW data page chain position")));
+            next_started = true;
+            write_elem_pair(staged, next, &row.elem, row.vector, (int)dim,
+                            bytes_per_dim, m, (size_t)n_nodes,
+                            hnsw_location_table_address_lookup, locations);
         }
-        write_elem_pair(staged, &row.elem, row.vector, (int)dim,
-                        bytes_per_dim, m, (size_t)n_nodes,
-                        hnsw_location_table_address_lookup, locations);
     }
-    if (current_block != data_page_count)
+    if (current_block + (next_started ? 1 : 0) != data_page_count)
         ereport(ERROR,
                 (errmsg("pg_cuvs: source-less HNSW page count differs from layout")));
     if (current_block != 0)
         hnsw_publish_staged_data_page(rel, staged, skip_wal,
                                       current_block, data_page_count, &batch);
+    if (next_started)
+        hnsw_publish_staged_data_page(rel, next, skip_wal,
+                                      current_block + 1, data_page_count, &batch);
     if (batch.next != batch.count)
         ereport(ERROR, (errmsg("pg_cuvs: unused HNSW extension buffers")));
 }
@@ -3512,7 +3621,7 @@ hnsw_import_build_result(Relation indexRel,
             last_location.elem_blkno == InvalidBlockNumber)
             ereport(ERROR,
                     (errmsg("pg_cuvs: HNSW data page count exceeds block number limits")));
-        data_page_count = last_location.elem_blkno;
+        data_page_count = hnsw_location_neigh_blkno(&last_location);	/* a split last pair ends one page later */
 
         s->target = index_open(index_oid, AccessExclusiveLock);
         skip_wal = RelationGetForm(s->target)->relpersistence == RELPERSISTENCE_UNLOGGED;
@@ -3648,13 +3757,15 @@ cagra_assign_level(int M, unsigned int *seed)
 
 /* Internal helper: fill an existing HNSW index from CAGRA adjacency via IPC.
  * Called by pg_cuvs_build_hnsw() for modes 'nsw' and 'hnsw'.
- * mode='nsw'  → flat NSW (no hierarchy, level 0 only)
- * mode='hnsw' → hierarchical with heuristic neighbor selection */
+ * mode='nsw' and mode='hnsw' → hierarchical with heuristic neighbor selection ('nsw' was level 0 only) */
 static void
 fill_hnsw_from_cagra_ipc_impl(Oid cagra_oid, Oid hnsw_oid, const char *mode,
                               HnswFillRes *res)
 {
-    bool do_hierarchy = (strcmp(mode, "hnsw") == 0);
+    /* 'nsw' assigns levels and links the upper layers too. A graph with layer 0 only lets pgvector's insert make a new element
+     * the entry point (hnswinsert.c, HNSW_UPDATE_ENTRY_GREATER) and link the upper layers among inserted rows only, so a search
+     * descends to them and misses the converted rows when the inserted rows lie elsewhere. */
+    bool do_hierarchy = (strcmp(mode, "hnsw") == 0 || strcmp(mode, "nsw") == 0);
 
     /* ---- 0. pgvector compatibility check ---- */
     {
@@ -3935,40 +4046,31 @@ fill_hnsw_from_cagra_ipc_impl(Oid cagra_oid, Oid hnsw_oid, const char *mode,
     res->tids = NULL;
 
     /* ---- 4. Layout pass ---- */
-    /* Verify elem+neigh fit on one page (worst-case: max_level, M neighbors)
-     * BEFORE computing pack_k below — pack_k divides the loop that follows,
-     * and elems_per_page() (which both this check and pack_k are built on)
-     * returns 0 when a pair doesn't fit at all. This call is what turns
-     * that 0 into a clean ERROR instead of a SIGFPE two lines down; it must
-     * run first, not after. (It used to run after the old one-element/page
-     * loop too, harmlessly, since that loop never divided by anything —
-     * this ordering only became load-bearing when the loop below started
-     * dividing by pack_k.) */
+    /* Verify elem+neigh fit on one page (worst case: max_level, M neighbors) before the layout below, so a pair that cannot fit
+     * at all is the user-facing page-fit ERROR rather than the layout's internal one. */
     check_hnsw_page_fit((int)ipc_dim, bytes_per_dim, M, max_level);
 
-    /* #161: pack k elements/page on the nsw path (do_hierarchy=false), where
-     * every element is level 0 and neighbor-tuple size is therefore uniform
-     * — the one case a single fixed k packs losslessly (see
-     * write_elem_pages_packed()'s header comment). The hierarchical path
-     * keeps one element per page: per-element level varies there, so no
-     * single k fits every element without wasting space on the low-level
-     * majority — out of scope for #161 (mode='nsw' is the recommended
-     * default per #161's own lever-2b measurement; 'hnsw' is not). */
-    int pack_k = do_hierarchy ? 1 : elems_per_page((int)ipc_dim, bytes_per_dim, M, 0);
-    if (pack_k < 1)
-        ereport(ERROR,
-                (errmsg("pg_cuvs: internal error — pack_k=%d after "
-                        "check_hnsw_page_fit() passed (dim=%d, bytes_per_dim=%d, M=%d)",
-                        pack_k, (int)ipc_dim, bytes_per_dim, M)));
-    for (size_t i = 0; i < N; i++)
+    /* #161: pack element+neighbor pairs onto pages in element order, each pair taking its own size (a level-l element's
+     * neighbor tuple has (l + 2) * M slots), with the cursor the heap build's importer uses (hnsw_pack_location_next). With every
+     * element at level 0 this is the fixed k per page of #161; upper-layer elements take more room. */
     {
-        size_t   page_idx = i / (size_t) pack_k;
-        size_t   slot      = i % (size_t) pack_k;
-        uint32_t blkno = (uint32_t)(page_idx + 1);   /* block 0 = meta */
-        elems[i].elem_blkno  = blkno;
-        elems[i].elem_offno  = (uint16_t)(2 * slot + 1);
-        elems[i].neigh_blkno = blkno;
-        elems[i].neigh_offno = (uint16_t)(2 * slot + 2);
+        HnswPackingCursor packing = {0};
+
+        for (size_t i = 0; i < N; i++)
+        {
+            HnswNodeLocation location;
+
+            if (!hnsw_pack_location_next(&packing, (uint64_t) i, (uint64_t) N, elems[i].level,
+                                         (int) ipc_dim, bytes_per_dim, M, &location))
+                ereport(ERROR,
+                        (errmsg("pg_cuvs: HNSW element %zu (level %d) does not fit the page layout "
+                                "(dim=%d, bytes_per_dim=%d, M=%d)",
+                                i, elems[i].level, (int) ipc_dim, bytes_per_dim, M)));
+            elems[i].elem_blkno  = location.elem_blkno;
+            elems[i].elem_offno  = location.elem_offno;
+            elems[i].neigh_blkno = hnsw_location_neigh_blkno(&location);
+            elems[i].neigh_offno = hnsw_location_neigh_offno(&location);
+        }
     }
 
     /* ---- 5. Open target HNSW with AccessExclusiveLock and truncate ---- */
@@ -4026,7 +4128,7 @@ fill_hnsw_from_cagra_ipc_impl(Oid cagra_oid, Oid hnsw_oid, const char *mode,
          * (= 1 + (N-1)/pack_k) — pointing INSERT at the true last page,
          * not one past it, preserves the "append into free space" property
          * pgvector's own writer already relies on (hnswinsert.c). */
-        metap->insertPage = (N > 0) ? elems[N - 1].elem_blkno : (uint32_t) N;
+        metap->insertPage = (N > 0) ? elems[N - 1].neigh_blkno : (uint32_t) N;	/* the last page, also when the last pair is split */
 
         ((PageHeader)page)->pd_lower =
             (uint16_t)(((char *)metap + sizeof(PgvHnswMeta)) - (char *)page);
@@ -4037,32 +4139,9 @@ fill_hnsw_from_cagra_ipc_impl(Oid cagra_oid, Oid hnsw_oid, const char *mode,
     }
 
     /* ---- 7. Write element+neighbor pages ---- */
-    /* #161: pack_k>1 only when !do_hierarchy (nsw); the packed writer with
-     * pack_k==1 would behave identically to the per-element loop below (one
-     * ReadBuffer(P_NEW) per element) but takes the dedicated path anyway to
-     * keep this branch a direct, obviously-correct mirror of the layout
-     * pass's pack_k choice above. */
-    if (pack_k > 1)
-    {
-        write_elem_pages_packed(hnsw_rel, elems, vecs, ipc_dim, bytes_per_dim,
-                                M, N, pack_k, hnsw_unlogged,
-                                hnsw_lookup_elem_array, elems);
-    }
-    else
-    {
-        for (size_t i = 0; i < N; i++)
-        {
-            const float *vec = vecs + i * (size_t)ipc_dim;
-
-            write_elem_page(hnsw_rel,
-                            elems[i].elem_blkno,
-                            &elems[i],
-                            vec,
-                            ipc_dim, bytes_per_dim, M,
-                            N, hnsw_unlogged,
+    write_elem_pages_packed(hnsw_rel, elems, vecs, ipc_dim, bytes_per_dim,
+                            M, N, hnsw_unlogged,
                             hnsw_lookup_elem_array, elems);
-        }
-    }
 
     /* vecs / elems are released by the PG_FINALLY in fill_hnsw_from_cagra_ipc(). */
 
@@ -4280,9 +4359,8 @@ pg_cuvs_build_hnsw(PG_FUNCTION_ARGS)
         int graph_degree  = cuvs_cagra_reloption_graph_degree(cagra_rel_pc);
         index_close(cagra_rel_pc, AccessShareLock);
         int m0 = (graph_degree < 64) ? graph_degree : 64;
-        /* mode='nsw' always builds level 0 only (see cuvs_hnsw_ambuild()'s
-         * matching comment) -- the exact bound, not a guess, there. */
-        int precheck_maxlevel = (strcmp(mode, "nsw") == 0) ? 0 : 5;
+        /* 'nsw' builds upper layers too, so the conservative bound of the other modes applies. */
+        int precheck_maxlevel = 5;
         check_hnsw_page_fit(precheck_dim, 4, m0 / 2, precheck_maxlevel);
     }
 
@@ -4577,19 +4655,14 @@ cuvs_hnsw_ambuild(Relation heapRel, Relation indexRel, IndexInfo *indexInfo)
      * rare case where this pre-check's M assumption undershoots the actual
      * build.
      *
-     * mode='nsw' is the one case where maxlevel is not a guess: do_hierarchy
-     * in fill_hnsw_from_cagra_ipc_impl() is only true for mode='hnsw', so
-     * 'nsw' always builds every element at level 0 (elems[i].level stays
-     * calloc'd 0, max_level=0). Using the conservative 5 there anyway
-     * rejects fp32 builds in the dim≈1679–1918 band that built fine before
-     * this pre-check existed — a real regression on the default mode, not a
-     * conservative-but-safe over-reject. Every other mode ('hnsw',
-     * 'hnswlib', 'hnswlib_file') genuinely can reach a nonzero level, so
-     * they keep the conservative bound. */
+     * every mode builds upper layers, and the check asks that the element
+     * tuple and the level-5 neighbor tuple each fit a page (a pair too large for
+     * one page is split as pgvector's build splits it), so the bound of 5 no
+     * longer narrows the dimension ceiling below pgvector's own. */
     Form_pg_attribute precheck_att = TupleDescAttr(RelationGetDescr(indexRel), 0);
     int precheck_dim           = (int) precheck_att->atttypmod;
     int precheck_bytes_per_dim = bytes_per_dim_for_typid(precheck_att->atttypid);
-    const int safe_maxlevel = (strcmp(mode, "nsw") == 0) ? 0 : 5;
+    const int safe_maxlevel = 5;	/* nsw builds upper layers too, so its elements reach nonzero levels like every other mode */
 
     /* ── Source-less: build and convert from regular disk files. ── */
     if (source_name[0] == '\0')
@@ -4609,7 +4682,7 @@ cuvs_hnsw_ambuild(Relation heapRel, Relation indexRel, IndexInfo *indexInfo)
             result->heap_tuples = b->reltuples;
             result->index_tuples = (double)b->n_vecs;
             if (b->n_vecs > 0)
-                hnsw_import_build_result(indexRel, b, strcmp(mode, "nsw") == 0);
+                hnsw_import_build_result(indexRel, b, false);	/* the graph has upper layers, so not the level-0-only packing */
             else
                 hnsw_import_empty_build_result(indexRel, b);
         }

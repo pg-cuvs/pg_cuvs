@@ -3002,7 +3002,10 @@ cuvs_build_hnsw_from_heap(Relation heapRel, Relation indexRel, IndexInfo *indexI
         CuvsTidsHeader header = {0};
         char error[128] = {0};
         int rc;
-        uint32_t hierarchy = strcmp(mode, "nsw") != 0;
+        /* every mode builds the upper layers. A graph with layer 0 only (the earlier nsw) lets pgvector's insert make a new
+         * element the entry point (hnswinsert.c, HNSW_UPDATE_ENTRY_GREATER) and link the upper layers among inserted rows only, so a
+         * search descends to them and misses the built rows when the inserted rows lie elsewhere. */
+        uint32_t hierarchy = 1;
         uint32_t notices;
         CuvsHnswBudgetSnapshot budget;
         CuvsHnswDigest digest = {0};
