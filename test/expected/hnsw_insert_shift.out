@@ -7,7 +7,8 @@
 -- rows are not found any more, not even by their own vector (measured: recall@10 0.0 on this data before the fix).
 --
 -- Coverage: 2,000 built rows in [0,1]^16, 400 inserted rows in [3,4]^16; for 20 built rows, the row is its own first answer and none of the
--- inserted rows is among its 10 nearest (the exact answer has none of them), with mode 'nsw' and 'hnswlib'.
+-- inserted rows is among its 10 nearest (the exact answer has none of them), with mode 'nsw' and 'hnswlib' built from the heap and mode
+-- 'nsw' converted from a CAGRA index (source = ...).
 \set ON_ERROR_STOP on
 SET client_min_messages = warning;
 CREATE EXTENSION IF NOT EXISTS vector;
@@ -44,6 +45,35 @@ DROP INDEX m23_i;
 DELETE FROM m23 WHERE id > 2000;
 -- mode 'hnswlib' (a layered graph)
 CREATE INDEX m23_i ON m23 USING pg_cuvs_hnsw (v vector_l2_ops) WITH (mode = 'hnswlib');
+INSERT INTO m23 SELECT g, (SELECT array_agg((3.0 + ((hashtext(g::text || ':' || d::text) & 65535) / 65536.0))::real) FROM generate_series(1, 16) d)::vector
+FROM generate_series(2001, 2400) g;
+SET enable_seqscan = off;
+SELECT count(*) AS own_first_of_20
+FROM generate_series(7, 2000, 100) s(g)
+WHERE (SELECT id FROM m23 ORDER BY v <-> (SELECT v FROM m23 WHERE id = s.g) LIMIT 1) = s.g;
+ own_first_of_20 
+-----------------
+              20
+(1 row)
+
+SELECT count(*) AS inserted_rows_in_top10
+FROM generate_series(7, 2000, 100) s(g),
+     LATERAL (SELECT id FROM m23 ORDER BY v <-> (SELECT v FROM m23 WHERE id = s.g) LIMIT 10) a
+WHERE a.id > 2000;
+ inserted_rows_in_top10 
+------------------------
+                      0
+(1 row)
+
+RESET enable_seqscan;
+DROP INDEX m23_i;
+DELETE FROM m23 WHERE id > 2000;
+-- mode 'nsw' converted from a CAGRA index (source = ...), the other build route
+SET client_min_messages = error;	-- the CAGRA build warns about where index_dir lies, which depends on the test cluster
+CREATE INDEX m23_c ON m23 USING cagra (v vector_l2_ops) WITH (graph_degree = 64);
+CREATE INDEX m23_i ON m23 USING pg_cuvs_hnsw (v vector_l2_ops) WITH (source = 'm23_c', mode = 'nsw');
+RESET client_min_messages;
+DROP INDEX m23_c;
 INSERT INTO m23 SELECT g, (SELECT array_agg((3.0 + ((hashtext(g::text || ':' || d::text) & 65535) / 65536.0))::real) FROM generate_series(1, 16) d)::vector
 FROM generate_series(2001, 2400) g;
 SET enable_seqscan = off;
