@@ -13,12 +13,13 @@ CREATE FUNCTION pg_cuvs_hnsw_layer_counts(
     OUT upper_elements bigint,
     OUT m integer,
     OUT entry_level integer,
-    OUT built_hierarchy integer)
+    OUT built_hierarchy integer,
+    OUT level1_unlinked bigint)
 RETURNS record
 AS 'MODULE_PATHNAME', 'pg_cuvs_hnsw_layer_counts'
 LANGUAGE C STRICT VOLATILE;
 COMMENT ON FUNCTION pg_cuvs_hnsw_layer_counts(regclass) IS
-    'Elements of a pg_cuvs_hnsw index (not marked deleted), how many are above level 0, the metapage m and entry level, and the hierarchy flag the heap build recorded (NULL if none). Reads every page; needs SELECT on the table.';
+    'Elements of a pg_cuvs_hnsw index (not marked deleted), how many are above level 0, the metapage m and entry level, the hierarchy flag the heap build recorded (NULL if none), and how many elements above level 0 have no level-1 link (0 when the upper layer is connected). Reads every page; needs SELECT on the table.';
 
 CREATE FUNCTION pg_cuvs_hnsw_layer_status()
 RETURNS TABLE (index regclass, access_method name, current boolean, reason text)
