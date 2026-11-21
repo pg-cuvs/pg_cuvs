@@ -9,7 +9,8 @@
 -- Coverage: 2,000 built rows in [0,1]^16, 400 inserted rows in [3,4]^16; for 20 built rows, the row is its own first answer and none of the
 -- inserted rows is among its 10 nearest (the exact answer has none of them), with mode 'nsw' and 'hnswlib' built from the heap and mode
 -- 'nsw' converted from a CAGRA index (source = ...).
--- pg_cuvs_hnsw_layer_status() must call each of these indexes current (it has upper layers).
+-- pg_cuvs_hnsw_layer_status() must call each of these indexes current (it has upper layers), and every element above
+-- level 0 must have a level-1 link (an unlinked one stops a search that descends through it).
 
 \set ON_ERROR_STOP on
 SET client_min_messages = warning;
@@ -36,6 +37,7 @@ FROM generate_series(7, 2000, 100) s(g),
 WHERE a.id > 2000;
 RESET enable_seqscan;
 SELECT current, reason FROM pg_cuvs_hnsw_layer_status() WHERE index = 'm23_i'::regclass;
+SELECT upper_elements > 0 AS has_upper_layer, level1_unlinked FROM pg_cuvs_hnsw_layer_counts('m23_i');
 DROP INDEX m23_i;
 DELETE FROM m23 WHERE id > 2000;
 
@@ -53,6 +55,7 @@ FROM generate_series(7, 2000, 100) s(g),
 WHERE a.id > 2000;
 RESET enable_seqscan;
 SELECT current, reason FROM pg_cuvs_hnsw_layer_status() WHERE index = 'm23_i'::regclass;
+SELECT upper_elements > 0 AS has_upper_layer, level1_unlinked FROM pg_cuvs_hnsw_layer_counts('m23_i');
 DROP INDEX m23_i;
 DELETE FROM m23 WHERE id > 2000;
 
@@ -74,5 +77,6 @@ FROM generate_series(7, 2000, 100) s(g),
 WHERE a.id > 2000;
 RESET enable_seqscan;
 SELECT current, reason FROM pg_cuvs_hnsw_layer_status() WHERE index = 'm23_i'::regclass;
+SELECT upper_elements > 0 AS has_upper_layer, level1_unlinked FROM pg_cuvs_hnsw_layer_counts('m23_i');
 
 DROP TABLE m23;
