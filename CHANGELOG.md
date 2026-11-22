@@ -56,6 +56,32 @@ exists for 0.9.0.
 
 ### Fixed
 
+- A rebuild (`REINDEX`, or a `CREATE INDEX` that reuses an OID) left parts of the old build in
+  the daemon. The unsharded CAGRA rebuild kept the old resident brute-force cache, and freed the
+  old delta and IVF-PQ caches with the new GPU's device number; the sharded rebuild dropped the
+  pointer to the old brute-force cache without freeing it and kept the old reverse TID map (used
+  by TID-filtered exact searches, which could then read positions of the old build), the CPU
+  HNSW structure and an IVF-PQ handle; the flat rebuild dropped the pointer to old shards
+  without freeing them; the IVF-PQ rebuild left shards on the entry. All four now take the old
+  build off the entry as one unit and free it with the function eviction and `DROP` use, on the
+  devices it lives on. The brute-force cache is built again the next time a search needs it; the
+  sharded rebuild no longer keeps a reverse map, as a new sharded build has none.
+- A rebuild of one index kind left the artifacts of other kinds for the same OID: an IVF-PQ
+  build left `.shards` (the next load tried the sharded path first and failed), a sharded build
+  left `.ivfpq` and `.hnsw`, a flat build left the shard graphs, and no build removed an old
+  `.hnsw` (a CAGRA build replaces it only when it writes a new one), which a `cpu_hnsw` search
+  would load for the new index. Each build now removes the other kinds' artifacts from one
+  table. `DROP` removes every file of the index in `index_dir` by its name prefix.
+- `pg_cuvs_memory_status().resident_bytes`, eviction and admission did not count the delta cache
+  of a sharded index (it lives on the first shard's GPU). Builds, loads and the brute-force and
+  delta cache checks on that GPU now count it, so they can refuse or evict where they did not
+  before.
+- Because a CAGRA build now removes an old `.hnsw` it does not replace, `CREATE INDEX ... USING
+  pg_cuvs_hnsw` from a `cagra` index (the file import, without the daemon's shared-memory
+  export) after a `REINDEX` without `cuvs.cpu_hnsw_fallback` fails with `cannot open .hnsw
+  sidecar` instead of reading the graph of the earlier build. The import checks only that the
+  `.tids` file has at least as many entries as the graph, so before it paired the old graph with
+  the new `.tids` (labels naming other rows) whenever the table had not shrunk.
 - Documentation: the README batch example, `docs/reference.md` and ADR-040 said that
   joining the results of `pg_cuvs_batch_search` and `cuvs_filtered_knn` on `ctid` gives
   the visible rows. That join silently drops HOT-updated rows, because the functions
