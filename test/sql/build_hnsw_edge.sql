@@ -143,6 +143,12 @@ INSERT INTO ec_ceiling_f32
                 FROM generate_series(1,2000));
 SELECT id AS f32_2000_inserted_first FROM ec_ceiling_f32
 ORDER BY embedding <-> (SELECT embedding FROM ec_ceiling_f32 WHERE id = 201) LIMIT 1;
+-- DELETE and VACUUM on split pairs: pgvector's bulk delete and graph repair follow each element's neighbor tuple on the
+-- next page and rewrite it there; every remaining row (134 of 201) must still be its own nearest neighbor.
+DELETE FROM ec_ceiling_f32 WHERE id % 3 = 0;
+VACUUM ec_ceiling_f32;
+SELECT count(*) AS f32_2000_self_first_after_vacuum FROM ec_ceiling_f32 t
+WHERE (SELECT id FROM ec_ceiling_f32 ORDER BY embedding <-> t.embedding LIMIT 1) = t.id;
 RESET enable_seqscan;
 DROP TABLE ec_ceiling_f32;
 
