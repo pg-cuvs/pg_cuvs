@@ -8384,6 +8384,7 @@ handle_export_adjacency(int client_fd, const CuvsCmdFrame *cmd)
     uint32_t idx = cmd->index_oid;
 
     pthread_mutex_lock(&g_index_mutex);
+    uint64_t lock_t0 = cuvs_hnsw_monotonic_us();
     IndexEntry *e = find_index(db, idx);
     if (!e || !e->valid || !e->handle || e->shard_count >= 2)
     {
@@ -8422,6 +8423,7 @@ handle_export_adjacency(int client_fd, const CuvsCmdFrame *cmd)
         return;
     }
     memcpy(tids, e->tids, (size_t)n_vecs_i * sizeof(uint64_t));
+    uint64_t lock_held_us = cuvs_hnsw_monotonic_us() - lock_t0;
     pthread_mutex_unlock(&g_index_mutex);
 
     /* Pack into shared memory:
@@ -8519,8 +8521,8 @@ handle_export_adjacency(int client_fd, const CuvsCmdFrame *cmd)
     free(vecs);
     free(tids);
 
-    LOG_INFO("[handle_export_adjacency] %u/%u N=%zu D=%d dim=%u fd-passed (was %s)\n",
-             db, idx, n_vecs, graph_degree, dim, shm_key);
+    LOG_INFO("[handle_export_adjacency] %u/%u N=%zu D=%d dim=%u lock_held_us=%llu fd-passed (was %s)\n",
+             db, idx, n_vecs, graph_degree, dim, (unsigned long long)lock_held_us, shm_key);
 
     /* Reply: n_vecs/graph_degree/dim in header fields; the segment itself rides
      * along as an SCM_RIGHTS fd (#165). error[] carries the former name for log
