@@ -535,9 +535,10 @@ cuvs_object_access(ObjectAccessType access, Oid classId, Oid objectId,
              * otherwise the artifacts orphan and a restart reloads them as zombies. */
             Oid cagra_am = get_am_oid("cagra", true);
             Oid flat_am  = get_am_oid("flat", true);
+            Oid ivfpq_am = get_am_oid("ivfpq", true);   /* handle + .ivfpq/.tids */
             if (cf->relkind == RELKIND_INDEX &&
                 OidIsValid(cf->relam) &&
-                (cf->relam == cagra_am || cf->relam == flat_am))
+                (cf->relam == cagra_am || cf->relam == flat_am || cf->relam == ivfpq_am))
             {
                 MemoryContext old = MemoryContextSwitchTo(TopMemoryContext);
                 CuvsPendingDrop *pd = (CuvsPendingDrop *) palloc(sizeof(CuvsPendingDrop));
