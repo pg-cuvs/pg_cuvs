@@ -213,7 +213,7 @@ workspace allocations can still produce a genuine allocation failure.
 | `cuvs.hnsw_exact_scan` | bool | `off` | — | USERSET | When `on`, ordered scans of a `pg_cuvs_hnsw` index compute exact SQL distances over the MVCC-visible heap rows instead of reading the HNSW graph (see § Explicit exact scans for pg_cuvs_hnsw). A scan runs exactly or stops with an error; it never falls back to approximate results. Changing the value invalidates the saved plans and cached expressions of the current backend. Read at scan start and rescan. Does not recover unreachable rows in the default configuration (#203 stays open) |
 | `cuvs.max_stale_fraction` | real | `0.10` | 0.0–1.0 | USERSET | Delete-drift fraction above which a CAGRA index reroutes to CPU; 1.0 disables |
 | `cuvs.max_delta_rows` | int | `10000` | 0–INT_MAX | USERSET | Pending-insert rows merged before CPU reroute; 0 disables delta |
-| `cuvs.delta_search` | enum | `auto` | `auto`, `cpu`, `gpu` | USERSET | Delta merge mode: GPU-with-CPU-fallback / always CPU (the daemon then neither refreshes nor searches its delta cache, and reports `delta_search_mode` = `cpu`) / GPU-only |
+| `cuvs.delta_search` | enum | `auto` | `auto`, `cpu`, `gpu` | USERSET | Delta merge mode: GPU-with-CPU-fallback / always CPU (the daemon then neither refreshes nor searches its delta cache) / GPU-only. The `delta_search_mode` column of `pg_stat_gpu_search` is per index, not per session: `cpu` when the last CAGRA search of the index asked for `cpu`, otherwise `gpu` while a delta cache is resident, otherwise `none` |
 
 The CAGRA tuning defaults preserve the previous search parameters. Micro-batches
 only combine CAGRA requests with identical tuning, so concurrent sessions can

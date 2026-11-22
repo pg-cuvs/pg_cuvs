@@ -5331,7 +5331,8 @@ handle_search(int client_fd, const CuvsCmdFrame *cmd)
      * cuvs.parallel_fanout is on, cutting latency from sum(shard_i) toward
      * max(shard_i); off runs them sequentially (A/B baseline / kill switch).
      * cuvs.shard_overfetch widens each shard's request for recall at scale.
-     * Delta is left to the backend CPU merge (delta_merged=0). Fail closed: any
+     * .delta: merged here from shard 0's GPU cache for auto/gpu (delta_merged=1);
+     * cpu, or no usable cache, leaves it to the backend. Fail closed: any
      * shard search failure returns OOM_FALLBACK (CPU), never a partial result. */
     if (e->shard_count >= 2)
     {

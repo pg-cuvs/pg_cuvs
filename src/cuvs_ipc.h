@@ -435,7 +435,9 @@ typedef struct CuvsIndexStats {
     uint32_t delta_generation;   /* base_tids_crc32 the delta cache was built on */
     uint64_t delta_vram_bytes;   /* VRAM held by the delta brute-force cache */
     uint64_t delta_merged_count; /* searches where daemon merged delta on GPU */
-    uint32_t delta_search_mode;  /* 0=none, 1=cpu, 2=gpu (what last search used) */
+    uint32_t delta_search_mode;  /* per index, not per session; not CuvsCmdFrame's encoding:
+                                  * 1=cpu (the last CAGRA search asked for cpu; BF/flat/HNSW searches
+                                  * do not change it), else 2=gpu (delta cache resident), else 0=none */
     /* Phase 3D: warmup stats (wire ABI extension — co-deploy daemon+extension) */
     uint32_t warmup_state;       /* WarmupState enum value (0=hot..5=failed) */
     int64_t  last_warmup_at;     /* epoch seconds of last completed warmup; 0 if never */

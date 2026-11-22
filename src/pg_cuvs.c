@@ -186,9 +186,9 @@ static const struct config_enum_entry cuvs_bf_precision_options[] = {
 };
 /* Phase 3A delta search mode (string in SQL, mapped to int in C). */
 static const struct config_enum_entry cuvs_delta_search_options[] = {
-    {"auto", 0, false},
-    {"cpu",  1, false},
-    {"gpu",  2, false},
+    {"auto", CUVS_DELTA_SEARCH_AUTO, false},   /* sent on the wire as is */
+    {"cpu",  CUVS_DELTA_SEARCH_CPU,  false},
+    {"gpu",  CUVS_DELTA_SEARCH_GPU,  false},
     {NULL, 0, false}
 };
 /* ADR-073 B: transient no-index GPU brute-force routing (string in SQL → int). */
