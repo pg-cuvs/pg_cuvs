@@ -56,6 +56,10 @@ exists for 0.9.0.
 
 ### Fixed
 
+- `DROP INDEX CONCURRENTLY` on a `cagra`, `flat` or `ivfpq` index notified the daemon at
+  its first internal commit, while it still waited for older transactions that could be
+  scanning the index: the daemon had already dropped the entry and the files. The notice
+  now goes at the commit that removes the index from the catalog.
 - Documentation: the README batch example, `docs/reference.md` and ADR-040 said that
   joining the results of `pg_cuvs_batch_search` and `cuvs_filtered_knn` on `ctid` gives
   the visible rows. That join silently drops HOT-updated rows, because the functions

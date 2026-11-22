@@ -513,6 +513,7 @@ typedef struct CuvsPendingDrop
 {
     Oid              oid;
     SubTransactionId subid;
+    bool             row_left;   /* the index's pg_class row was still there at PRE_COMMIT (an internal commit of DROP INDEX CONCURRENTLY) */
 } CuvsPendingDrop;
 
 static List *cuvs_pending_drops = NIL;   /* of CuvsPendingDrop*, in TopMemoryContext */
@@ -541,7 +542,7 @@ cuvs_object_access(ObjectAccessType access, Oid classId, Oid objectId,
                 (cf->relam == cagra_am || cf->relam == flat_am || cf->relam == ivfpq_am))
             {
                 MemoryContext old = MemoryContextSwitchTo(TopMemoryContext);
-                CuvsPendingDrop *pd = (CuvsPendingDrop *) palloc(sizeof(CuvsPendingDrop));
+                CuvsPendingDrop *pd = (CuvsPendingDrop *) palloc0(sizeof(CuvsPendingDrop));
                 pd->oid   = objectId;
                 pd->subid = GetCurrentSubTransactionId();
                 cuvs_pending_drops = lappend(cuvs_pending_drops, pd);
@@ -558,13 +559,44 @@ cuvs_xact_callback(XactEvent event, void *arg)
     if (cuvs_pending_drops == NIL)
         return;
 
-    if (event == XACT_EVENT_COMMIT)
+    /* DROP INDEX CONCURRENTLY runs the drop hook in its first transaction and commits twice before the index's pg_class row is
+     * deleted (index_drop with concurrent = true); between those commits it waits for older transactions, which may still scan the
+     * index. A drop whose row is still visible at PRE_COMMIT (the catalog can be read here, not at COMMIT) is therefore kept past this
+     * commit; it is sent at the commit that deletes the row. An ordinary DROP deletes the row in its own transaction, so it is sent at
+     * its commit as before. If DIC fails after its first commit, the abort discards the kept drop: the index stays in the catalog
+     * (invalid) and a later DROP INDEX notifies the daemon. */
+    if (event == XACT_EVENT_PRE_COMMIT)
     {
         ListCell *lc;
         foreach(lc, cuvs_pending_drops)
         {
             CuvsPendingDrop *pd = (CuvsPendingDrop *) lfirst(lc);
-            int rc = cuvs_ipc_drop(cuvs_socket_path,
+            pd->row_left = SearchSysCacheExists1(RELOID, ObjectIdGetDatum(pd->oid));
+        }
+        return;
+    }
+
+    if (event == XACT_EVENT_COMMIT)
+    {
+        ListCell *lc;
+        List     *kept = NIL;
+        MemoryContext old;
+
+        foreach(lc, cuvs_pending_drops)
+        {
+            CuvsPendingDrop *pd = (CuvsPendingDrop *) lfirst(lc);
+            int rc;
+            if (pd->row_left)
+            {
+                /* the index is still in the catalog; it belongs to the next top transaction now. */
+                pd->row_left = false;
+                pd->subid = TopSubTransactionId;
+                old = MemoryContextSwitchTo(TopMemoryContext);
+                kept = lappend(kept, pd);
+                MemoryContextSwitchTo(old);
+                continue;
+            }
+            rc = cuvs_ipc_drop(cuvs_socket_path,
                                    (uint32_t) MyDatabaseId, (uint32_t) pd->oid);
             if (rc != CUVS_STATUS_OK)
                 ereport(WARNING,
@@ -574,12 +606,15 @@ cuvs_xact_callback(XactEvent event, void *arg)
                                  "a daemon restart will NOT clean them (it reloads them as "
                                  "zombies). Run SELECT pg_cuvs_gc_orphans(true); to reclaim "
                                  "them, or follow the manual cleanup in ops-gpu-playbook.")));
+            pfree(pd);
         }
+        list_free(cuvs_pending_drops);
+        cuvs_pending_drops = kept;
+        return;
     }
 
-    /* Clear on COMMIT, ABORT, or PREPARE — whatever ends the top transaction. */
-    if (event == XACT_EVENT_COMMIT || event == XACT_EVENT_ABORT ||
-        event == XACT_EVENT_PREPARE)
+    /* Clear on ABORT or PREPARE (COMMIT returned above with only the drops it keeps). */
+    if (event == XACT_EVENT_ABORT || event == XACT_EVENT_PREPARE)
     {
         list_free_deep(cuvs_pending_drops);   /* frees the CuvsPendingDrop structs too */
         cuvs_pending_drops = NIL;

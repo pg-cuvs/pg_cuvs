@@ -924,7 +924,8 @@ them. Eviction history (`evict_count`, `last_evict_*`) outlives the resident ent
 is removed by `DROP INDEX`, and keeps at most 65,536 indexes (oldest dropped first,
 counted in `history_dropped`). `DROP INDEX` cleanup counts as `drops`, not as an
 eviction. The daemon hears of a drop of a `cagra`, `ivfpq` or `flat` index when the
-dropping transaction commits (`DROP INDEX CONCURRENTLY`: at its first internal commit);
+dropping transaction commits (`DROP INDEX CONCURRENTLY`: at its last internal commit, when
+the index leaves the catalog, so the entry and files stay while it waits for older transactions);
 a drop inside a transaction that is prepared with `PREPARE TRANSACTION` is not passed
 on, even after `COMMIT PREPARED`: its daemon entry and files stay. Every eviction writes one `[evict]` line (`op gpu db idx reason
 requester_idx idle_s protect_s hits vram_bytes saved_ms mono_us self_replace`;

@@ -72,7 +72,7 @@ REGRESS_FAULT  = build_oom build_multi_oom build_oom_evict_to_fit extend_cuda_oo
 # pg_regress cannot express: snapshot-aware tombstone filtering and write/query
 # interleaving. Specs live in test/specs/*.spec, expected in test/expected/*.out.
 # The daemon + GPU must be up, same as REGRESS.
-ISOLATION      = delta_tombstone_snapshot delta_interleaving reindex_concurrent_delete flat_tombstone_snapshot flat_delta_interleaving flat_reindex_concurrent_delete
+ISOLATION      = drop_concurrently_notice delta_tombstone_snapshot delta_interleaving reindex_concurrent_delete flat_tombstone_snapshot flat_delta_interleaving flat_reindex_concurrent_delete
 ISOLATION_OPTS = --inputdir=test --outputdir=test
 
 # C source files + the CUDA-compiled wrapper (built below by nvcc).
