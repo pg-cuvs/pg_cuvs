@@ -1045,10 +1045,13 @@ RETURNS TABLE (index regclass, access_method name, current boolean, reason text)
 LANGUAGE sql STABLE
 AS $$
 SELECT c.oid::regclass, a.amname,
-       CASE WHEN k.built_hierarchy IS NOT NULL THEN k.built_hierarchy = 1
+       CASE WHEN k.level1_unlinked > 0 THEN false
+            WHEN k.built_hierarchy IS NOT NULL THEN k.built_hierarchy = 1
             WHEN k.m IS NULL OR k.elements < 16 * k.m THEN NULL
             ELSE k.upper_elements * k.m * 4 >= k.elements END,
-       CASE WHEN k.built_hierarchy = 0
+       CASE WHEN k.level1_unlinked > 0
+                THEN 'elements above level 0 without a level-1 link (converted from a CAGRA index with levels linked only among each row''s own neighbors): searches can miss rows; REINDEX INDEX'
+            WHEN k.built_hierarchy = 0
                 THEN 'built without upper layers (mode nsw before 0.9.3): rows inserted since can hide the built rows; REINDEX INDEX'
             WHEN k.built_hierarchy = 1 THEN NULL
             WHEN k.m IS NULL OR k.elements < 16 * k.m
