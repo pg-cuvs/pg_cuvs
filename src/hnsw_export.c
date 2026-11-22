@@ -3953,8 +3953,10 @@ fill_hnsw_from_cagra_ipc_impl(Oid cagra_oid, Oid hnsw_oid, const char *mode,
             ereport(ERROR,
                     (errmsg("pg_cuvs: IPC export_hnsw_upper failed (status=%d); "
                             "ensure index %u is loaded in daemon", urc, cagra_oid),
-                     errhint("A daemon older than this extension answers this request with an error: "
-                             "restart pg_cuvs_server after installing the extension.")));
+                     urc == CUVS_STATUS_ERROR
+                     ? errhint("A daemon older than this extension answers this request with status 1 "
+                               "(unknown op): restart pg_cuvs_server after installing the extension.")
+                     : 0));
         }
     }
 

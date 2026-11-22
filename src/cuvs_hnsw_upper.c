@@ -428,6 +428,9 @@ out_put(Out *o, const void *p, size_t len)
     }
 }
 
+#define UPPER_WRITE_CANCEL_ROWS 65536
+
+/* 1 written, 0 write error, -1 canceled (asked every UPPER_WRITE_CANCEL_ROWS rows). */
 static int
 write_file(Upper *u, int fd, const uint32_t *graph, int stride, int degree, int ef_construction,
            const int *level_of_row, const int32_t *local_of_row, uint64_t entry_row)
@@ -463,6 +466,12 @@ write_file(Upper *u, int fd, const uint32_t *graph, int stride, int degree, int 
 
     for (uint64_t i = 0; i < u->n; i++)
     {
+        if (u->cancel_cb && i > 0 && i % UPPER_WRITE_CANCEL_ROWS == 0 && u->cancel_cb(u->cancel_arg))
+        {
+            free(o);
+            free(rec);
+            return -1;
+        }
         const uint32_t *row = graph + i * (uint64_t)stride;
         uint32_t cnt = 0;
         memset(rec, 0, (size_t)links0);
@@ -628,10 +637,13 @@ cuvs_hnsw_upper_write(int out_fd, const uint32_t *graph, int graph_stride, int d
     else
     {
         uint64_t t1 = mono_us();
+        int wr = 0;
         if (cancel && cancel(cancel_arg))
             rc = CUVS_HNSW_UPPER_CANCELED;
-        else if (!write_file(u, out_fd, graph, graph_stride, degree, ef_construction,
-                             level_of_row, local_of_row, entry_row))
+        else if ((wr = write_file(u, out_fd, graph, graph_stride, degree, ef_construction,
+                                  level_of_row, local_of_row, entry_row)) < 0)
+            rc = CUVS_HNSW_UPPER_CANCELED;
+        else if (wr == 0)
         {
             snprintf(error, error_len, "cannot write the hnswlib file: %s", strerror(errno));
             rc = CUVS_HNSW_UPPER_ERROR;
