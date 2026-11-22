@@ -202,7 +202,8 @@ typedef struct IndexEntry {
     uint64_t       *delta_tids;       /* host: delta item_id -> heap TID [n_delta] */
     int64_t         n_delta;          /* delta vectors in the cache */
     uint32_t        delta_generation; /* base .tids body_crc32 the cache was built on */
-    int64_t         delta_mtime;      /* .delta st_mtime when the cache was built */
+    int64_t         delta_mtime;      /* .delta mtime in nanoseconds when the cache was built */
+    int64_t         delta_size;       /* .delta size then */
     size_t          delta_vram_bytes; /* estimated VRAM held by the delta cache */
     float          *delta_vecs_host; /* host copy for incremental rebuild (Phase 3A-4) */
     int64_t         delta_n_cached;  /* rows in current GPU BF + host buffer */
@@ -1557,7 +1558,11 @@ refresh_delta_cache(IndexEntry *e)
         free_delta_cache(e);            /* .delta gone (REINDEX) -> base-only */
         return;
     }
-    if ((int64_t) st.st_mtime == e->delta_mtime)
+    /* A change is a different size or a different mtime, to the nanosecond. Seconds were not enough: a row appended in the
+     * same second as the cached state left the cache one row short while the reply still claimed the delta was merged, so
+     * the backend did not merge it on the CPU and an INSERT was not visible to the next query. */
+    int64_t mtime_ns = (int64_t) st.st_mtim.tv_sec * 1000000000LL + (int64_t) st.st_mtim.tv_nsec;
+    if (mtime_ns == e->delta_mtime && (int64_t) st.st_size == e->delta_size)
         return;                         /* unchanged -> reuse current cache */
 
     /* The file changed. Save previous state for incremental check, then
@@ -1569,16 +1574,28 @@ refresh_delta_cache(IndexEntry *e)
     if (e->delta_idx) { cuvs_bf_free(e->delta_idx, dg); e->delta_idx = NULL; }
     e->n_delta          = 0;
     e->delta_vram_bytes = 0;
-    e->delta_mtime      = (int64_t) st.st_mtime;
+    e->delta_mtime      = mtime_ns;
+    e->delta_size       = (int64_t) st.st_size;
 
     f = fopen(path, "rb");
     if (!f)
         goto fail_cleanup;
-    if (cuvs_delta_read_header(f, &hdr) != 0
-        || cuvs_delta_validate(&hdr, (int64_t) st.st_size - (int64_t) sizeof(hdr)) != 0
+    if (cuvs_delta_read_header(f, &hdr) != 0)
+    {
+        fclose(f);
+        e->delta_size = -1;             /* a header still being written: look again at the next search */
+        goto fail_cleanup;
+    }
+    if (cuvs_delta_validate(&hdr, (int64_t) st.st_size - (int64_t) sizeof(hdr)) != 0
         || hdr.dim != e->dim || hdr.metric != e->metric)
     {
         fclose(f);
+        /* The size says more rows than the header: an append is between writing the record and the header. The header
+         * write changes neither the size nor, within one tick of the file system's clock, the mtime, so do not remember
+         * this state: the next search reads the header again. */
+        if (hdr.dim == e->dim && hdr.n_rows >= 0
+            && (int64_t) st.st_size - (int64_t) sizeof(hdr) > hdr.n_rows * (int64_t) cuvs_delta_record_bytes(hdr.dim))
+            e->delta_size = -1;
         goto fail_cleanup;
     }
 
