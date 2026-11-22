@@ -1,0 +1,249 @@
+-- empty_build_stale.sql — a rebuild with no rows must not leave the old build in the daemon.
+--
+-- TRUNCATE (like REINDEX, VACUUM FULL, CLUSTER or a rewriting ALTER TABLE on a table
+-- with no rows) rebuilds the index under the same OID. With no rows, cagra, flat and
+-- ivfpq returned without telling the daemon, so the daemon kept the old entry and its
+-- files, and an index scan answered with the old build's TIDs, which now point at new
+-- rows. Each block: rows, index, one search, TRUNCATE, rows with another
+-- order, the same query through the index path and through the heap; the two answers
+-- must be equal. Then the control: CREATE INDEX on an empty table and then rows (no
+-- old build exists, the planner avoids the index without its files). Last, a rolled-back
+-- TRUNCATE must change nothing: the index is still used and answers like the heap.
+--
+-- The plan is not asserted: once the rebuild with no rows is handled the planner
+-- correctly takes the heap, and before that it took the index.
+\set ON_ERROR_STOP on
+SET client_min_messages = WARNING;
+CREATE EXTENSION IF NOT EXISTS vector;
+CREATE EXTENSION IF NOT EXISTS pg_cuvs;
+SET cuvs.index_dir = '/tmp/cuvs_indexes';
+SET cuvs.ivfpq_n_probes = 4;
+SET cuvs.k = 8;
+CREATE FUNCTION ebs_uses_index(q text) RETURNS boolean LANGUAGE plpgsql AS $$
+DECLARE r text;
+BEGIN
+  FOR r IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
+    IF r LIKE '%Index Scan%' THEN RETURN true; END IF;
+  END LOOP;
+  RETURN false;
+END $$;
+-- cagra
+CREATE TABLE ebs_c (id int, v vector(4));
+INSERT INTO ebs_c SELECT g, ARRAY[g, 0, 0, 0]::real[]::vector FROM generate_series(1, 200) g;
+CREATE INDEX ebs_c_i ON ebs_c USING cagra (v vector_l2_ops);
+SET enable_seqscan = off;
+SELECT count(*) = 5 AS searched FROM (SELECT id FROM ebs_c ORDER BY v <-> '[1,0,0,0]' LIMIT 5) s;
+ searched 
+----------
+ t
+(1 row)
+
+RESET enable_seqscan;
+TRUNCATE ebs_c;
+INSERT INTO ebs_c SELECT g + 1000, ARRAY[201 - g, 0, 0, 0]::real[]::vector FROM generate_series(1, 200) g;
+SET enable_seqscan = off;
+SELECT string_agg(id::text, ',' ORDER BY d, id) AS ans FROM (SELECT id, v <-> '[1,0,0,0]' d FROM ebs_c ORDER BY v <-> '[1,0,0,0]' LIMIT 5) s \gset
+RESET enable_seqscan;
+SET enable_indexscan = off;
+SET enable_bitmapscan = off;
+SELECT string_agg(id::text, ',' ORDER BY d, id) = :'ans' AS answers_like_the_heap FROM (SELECT id, v <-> '[1,0,0,0]' d FROM ebs_c ORDER BY v <-> '[1,0,0,0]' LIMIT 5) s;
+ answers_like_the_heap 
+-----------------------
+ t
+(1 row)
+
+RESET enable_indexscan;
+RESET enable_bitmapscan;
+DROP TABLE ebs_c;
+-- flat
+CREATE TABLE ebs_f (id int, v vector(4));
+INSERT INTO ebs_f SELECT g, ARRAY[g, 0, 0, 0]::real[]::vector FROM generate_series(1, 200) g;
+CREATE INDEX ebs_f_i ON ebs_f USING flat (v vector_l2_ops);
+SET enable_seqscan = off;
+SELECT count(*) = 5 AS searched FROM (SELECT id FROM ebs_f ORDER BY v <-> '[1,0,0,0]' LIMIT 5) s;
+ searched 
+----------
+ t
+(1 row)
+
+RESET enable_seqscan;
+TRUNCATE ebs_f;
+INSERT INTO ebs_f SELECT g + 1000, ARRAY[201 - g, 0, 0, 0]::real[]::vector FROM generate_series(1, 200) g;
+SET enable_seqscan = off;
+SELECT string_agg(id::text, ',' ORDER BY d, id) AS ans FROM (SELECT id, v <-> '[1,0,0,0]' d FROM ebs_f ORDER BY v <-> '[1,0,0,0]' LIMIT 5) s \gset
+RESET enable_seqscan;
+SET enable_indexscan = off;
+SET enable_bitmapscan = off;
+SELECT string_agg(id::text, ',' ORDER BY d, id) = :'ans' AS answers_like_the_heap FROM (SELECT id, v <-> '[1,0,0,0]' d FROM ebs_f ORDER BY v <-> '[1,0,0,0]' LIMIT 5) s;
+ answers_like_the_heap 
+-----------------------
+ t
+(1 row)
+
+RESET enable_indexscan;
+RESET enable_bitmapscan;
+DROP TABLE ebs_f;
+-- ivfpq
+CREATE TABLE ebs_q (id int, v vector(4));
+INSERT INTO ebs_q SELECT g, ARRAY[g, 0, 0, 0]::real[]::vector FROM generate_series(1, 200) g;
+CREATE INDEX ebs_q_i ON ebs_q USING ivfpq (v vector_l2_ops) WITH (n_lists = 4, pq_bits = 8, pq_dim = 2);
+SET enable_seqscan = off;
+SELECT count(*) = 5 AS searched FROM (SELECT id FROM ebs_q ORDER BY v <-> '[1,0,0,0]' LIMIT 5) s;
+ searched 
+----------
+ t
+(1 row)
+
+RESET enable_seqscan;
+TRUNCATE ebs_q;
+INSERT INTO ebs_q SELECT g + 1000, ARRAY[201 - g, 0, 0, 0]::real[]::vector FROM generate_series(1, 200) g;
+SET enable_seqscan = off;
+SELECT string_agg(id::text, ',' ORDER BY d, id) AS ans FROM (SELECT id, v <-> '[1,0,0,0]' d FROM ebs_q ORDER BY v <-> '[1,0,0,0]' LIMIT 5) s \gset
+RESET enable_seqscan;
+SET enable_indexscan = off;
+SET enable_bitmapscan = off;
+SELECT string_agg(id::text, ',' ORDER BY d, id) = :'ans' AS answers_like_the_heap FROM (SELECT id, v <-> '[1,0,0,0]' d FROM ebs_q ORDER BY v <-> '[1,0,0,0]' LIMIT 5) s;
+ answers_like_the_heap 
+-----------------------
+ t
+(1 row)
+
+RESET enable_indexscan;
+RESET enable_bitmapscan;
+DROP TABLE ebs_q;
+-- cagra: control, CREATE INDEX on an empty table
+CREATE TABLE ebs_c0 (id int, v vector(4));
+CREATE INDEX ebs_c0_i ON ebs_c0 USING cagra (v vector_l2_ops);
+INSERT INTO ebs_c0 SELECT g + 1000, ARRAY[201 - g, 0, 0, 0]::real[]::vector FROM generate_series(1, 200) g;
+SET enable_seqscan = off;
+SELECT string_agg(id::text, ',' ORDER BY d, id) AS ans FROM (SELECT id, v <-> '[1,0,0,0]' d FROM ebs_c0 ORDER BY v <-> '[1,0,0,0]' LIMIT 5) s \gset
+RESET enable_seqscan;
+SET enable_indexscan = off;
+SET enable_bitmapscan = off;
+SELECT string_agg(id::text, ',' ORDER BY d, id) = :'ans' AS answers_like_the_heap FROM (SELECT id, v <-> '[1,0,0,0]' d FROM ebs_c0 ORDER BY v <-> '[1,0,0,0]' LIMIT 5) s;
+ answers_like_the_heap 
+-----------------------
+ t
+(1 row)
+
+RESET enable_indexscan;
+RESET enable_bitmapscan;
+DROP TABLE ebs_c0;
+-- flat: control, CREATE INDEX on an empty table
+CREATE TABLE ebs_f0 (id int, v vector(4));
+CREATE INDEX ebs_f0_i ON ebs_f0 USING flat (v vector_l2_ops);
+INSERT INTO ebs_f0 SELECT g + 1000, ARRAY[201 - g, 0, 0, 0]::real[]::vector FROM generate_series(1, 200) g;
+SET enable_seqscan = off;
+SELECT string_agg(id::text, ',' ORDER BY d, id) AS ans FROM (SELECT id, v <-> '[1,0,0,0]' d FROM ebs_f0 ORDER BY v <-> '[1,0,0,0]' LIMIT 5) s \gset
+RESET enable_seqscan;
+SET enable_indexscan = off;
+SET enable_bitmapscan = off;
+SELECT string_agg(id::text, ',' ORDER BY d, id) = :'ans' AS answers_like_the_heap FROM (SELECT id, v <-> '[1,0,0,0]' d FROM ebs_f0 ORDER BY v <-> '[1,0,0,0]' LIMIT 5) s;
+ answers_like_the_heap 
+-----------------------
+ t
+(1 row)
+
+RESET enable_indexscan;
+RESET enable_bitmapscan;
+DROP TABLE ebs_f0;
+-- ivfpq: control, CREATE INDEX on an empty table
+CREATE TABLE ebs_q0 (id int, v vector(4));
+CREATE INDEX ebs_q0_i ON ebs_q0 USING ivfpq (v vector_l2_ops) WITH (n_lists = 4, pq_bits = 8, pq_dim = 2);
+INSERT INTO ebs_q0 SELECT g + 1000, ARRAY[201 - g, 0, 0, 0]::real[]::vector FROM generate_series(1, 200) g;
+SET enable_seqscan = off;
+SELECT string_agg(id::text, ',' ORDER BY d, id) AS ans FROM (SELECT id, v <-> '[1,0,0,0]' d FROM ebs_q0 ORDER BY v <-> '[1,0,0,0]' LIMIT 5) s \gset
+RESET enable_seqscan;
+SET enable_indexscan = off;
+SET enable_bitmapscan = off;
+SELECT string_agg(id::text, ',' ORDER BY d, id) = :'ans' AS answers_like_the_heap FROM (SELECT id, v <-> '[1,0,0,0]' d FROM ebs_q0 ORDER BY v <-> '[1,0,0,0]' LIMIT 5) s;
+ answers_like_the_heap 
+-----------------------
+ t
+(1 row)
+
+RESET enable_indexscan;
+RESET enable_bitmapscan;
+DROP TABLE ebs_q0;
+-- cagra: a rolled-back TRUNCATE leaves the index as it was (still used, same answer)
+CREATE TABLE ebs_cr (id int, v vector(4));
+INSERT INTO ebs_cr SELECT g, ARRAY[g, 0, 0, 0]::real[]::vector FROM generate_series(1, 200) g;
+CREATE INDEX ebs_cr_i ON ebs_cr USING cagra (v vector_l2_ops);
+BEGIN;
+TRUNCATE ebs_cr;
+ROLLBACK;
+SET enable_seqscan = off;
+SELECT ebs_uses_index('SELECT id FROM ebs_cr ORDER BY v <-> ''[1,0,0,0]'' LIMIT 5') AS index_used;
+ index_used 
+------------
+ t
+(1 row)
+
+SELECT string_agg(id::text, ',' ORDER BY d, id) AS ans FROM (SELECT id, v <-> '[1,0,0,0]' d FROM ebs_cr ORDER BY v <-> '[1,0,0,0]' LIMIT 5) s \gset
+RESET enable_seqscan;
+SET enable_indexscan = off;
+SET enable_bitmapscan = off;
+SELECT string_agg(id::text, ',' ORDER BY d, id) = :'ans' AS answers_like_the_heap FROM (SELECT id, v <-> '[1,0,0,0]' d FROM ebs_cr ORDER BY v <-> '[1,0,0,0]' LIMIT 5) s;
+ answers_like_the_heap 
+-----------------------
+ t
+(1 row)
+
+RESET enable_indexscan;
+RESET enable_bitmapscan;
+DROP TABLE ebs_cr;
+-- flat: a rolled-back TRUNCATE leaves the index as it was (still used, same answer)
+CREATE TABLE ebs_fr (id int, v vector(4));
+INSERT INTO ebs_fr SELECT g, ARRAY[g, 0, 0, 0]::real[]::vector FROM generate_series(1, 200) g;
+CREATE INDEX ebs_fr_i ON ebs_fr USING flat (v vector_l2_ops);
+BEGIN;
+TRUNCATE ebs_fr;
+ROLLBACK;
+SET enable_seqscan = off;
+SELECT ebs_uses_index('SELECT id FROM ebs_fr ORDER BY v <-> ''[1,0,0,0]'' LIMIT 5') AS index_used;
+ index_used 
+------------
+ t
+(1 row)
+
+SELECT string_agg(id::text, ',' ORDER BY d, id) AS ans FROM (SELECT id, v <-> '[1,0,0,0]' d FROM ebs_fr ORDER BY v <-> '[1,0,0,0]' LIMIT 5) s \gset
+RESET enable_seqscan;
+SET enable_indexscan = off;
+SET enable_bitmapscan = off;
+SELECT string_agg(id::text, ',' ORDER BY d, id) = :'ans' AS answers_like_the_heap FROM (SELECT id, v <-> '[1,0,0,0]' d FROM ebs_fr ORDER BY v <-> '[1,0,0,0]' LIMIT 5) s;
+ answers_like_the_heap 
+-----------------------
+ t
+(1 row)
+
+RESET enable_indexscan;
+RESET enable_bitmapscan;
+DROP TABLE ebs_fr;
+-- ivfpq: a rolled-back TRUNCATE leaves the index as it was (still used, same answer)
+CREATE TABLE ebs_qr (id int, v vector(4));
+INSERT INTO ebs_qr SELECT g, ARRAY[g, 0, 0, 0]::real[]::vector FROM generate_series(1, 200) g;
+CREATE INDEX ebs_qr_i ON ebs_qr USING ivfpq (v vector_l2_ops) WITH (n_lists = 4, pq_bits = 8, pq_dim = 2);
+BEGIN;
+TRUNCATE ebs_qr;
+ROLLBACK;
+SET enable_seqscan = off;
+SELECT ebs_uses_index('SELECT id FROM ebs_qr ORDER BY v <-> ''[1,0,0,0]'' LIMIT 5') AS index_used;
+ index_used 
+------------
+ t
+(1 row)
+
+SELECT string_agg(id::text, ',' ORDER BY d, id) AS ans FROM (SELECT id, v <-> '[1,0,0,0]' d FROM ebs_qr ORDER BY v <-> '[1,0,0,0]' LIMIT 5) s \gset
+RESET enable_seqscan;
+SET enable_indexscan = off;
+SET enable_bitmapscan = off;
+SELECT string_agg(id::text, ',' ORDER BY d, id) = :'ans' AS answers_like_the_heap FROM (SELECT id, v <-> '[1,0,0,0]' d FROM ebs_qr ORDER BY v <-> '[1,0,0,0]' LIMIT 5) s;
+ answers_like_the_heap 
+-----------------------
+ t
+(1 row)
+
+RESET enable_indexscan;
+RESET enable_bitmapscan;
+DROP TABLE ebs_qr;
+DROP FUNCTION ebs_uses_index(text);

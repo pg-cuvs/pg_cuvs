@@ -112,7 +112,7 @@ main(void)
     snprintf(r.notice_out, sizeof(r.notice_out), "pg_cuvs: registry full; fallback");
     rc = round_trip(path, &r, &version);
     CHECK("status", rc == CUVS_STATUS_OOM_FALLBACK);
-    CHECK("client sends version 5", version == 5u);
+    CHECK("client sends version 6", version == 6u);
     CHECK("err_out exposed", strcmp(cuvs_ipc_last_err_out(), "AR0 n=27895 q=23847") == 0);
     CHECK("notice exposed",
           strcmp(cuvs_ipc_last_notice_out(), "pg_cuvs: registry full; fallback") == 0);

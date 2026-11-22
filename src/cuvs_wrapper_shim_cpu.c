@@ -544,7 +544,7 @@ void cuvs_hnsw_free(CuvsHnswIndex hidx) { shim_free((ShimIndex *)hidx); }
 int
 cuvs_cagra_extract_adjacency(CuvsCagraIndex handle, uint32_t **adj_out,
                              float **vecs_out, size_t *n_vecs_out,
-                             int *graph_degree_out, int device_id)
+                             int *graph_degree_out, int *dim_out, int device_id)
 {
     (void)device_id;
     ShimIndex *ix = (ShimIndex *)handle;
@@ -568,6 +568,7 @@ cuvs_cagra_extract_adjacency(CuvsCagraIndex handle, uint32_t **adj_out,
     }
     free(nbr);
     *adj_out = adj; *vecs_out = vecs; *n_vecs_out = (size_t)ix->n; *graph_degree_out = gd;
+    *dim_out = ix->dim;
     return 0;
 }
 

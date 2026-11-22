@@ -33,6 +33,7 @@
 #include <stdarg.h>
 #include "cuvs_wrapper.h"
 #include "cuvs_hnsw_build_common.h"
+#include "cuvs_hnsw_upper.h"
 #include "cuvs_objstore.h"
 #include "cuvs_build_corpus.h"   /* ADR-057: cuvs_fd_recv (SCM_RIGHTS build payload) */
 #include "cuvs_lw_policy.h"      /* I4 / ADR-088: large_workspace overflow policy */
@@ -163,6 +164,11 @@ typedef struct ShardEntry {
 typedef struct IndexEntry {
     uint32_t        db_oid;
     uint32_t        index_oid;
+    uint32_t        index_rfn;    /* the index relfilenode this build was made for (build frame, or the .relfilenode record
+                                   * at load); 0 = unknown. Searches, EXTEND and COMPACT are refused unless the request carries the same
+                                   * value (entry_current). */
+    uint32_t        heap_rfn;     /* the heap relfilenode of the table the build was made from (same sources) */
+    uint8_t         identity_legacy;   /* the record at load was of an earlier version (heap relfilenode and table oid only) */
     uint32_t        dim;
     uint32_t        metric;
     int64_t         n_vecs;
@@ -1467,6 +1473,64 @@ read_relfilenode_sidecar(const char *dir, uint32_t db_oid, uint32_t index_oid,
     return ok ? 0 : -1;
 }
 
+/* what the .relfilenode record on disk says the build was made for: "<heap relfilenode> <table oid> <index relfilenode> ...".
+ * A record of an earlier version has the first two fields only (identity_legacy); a missing or unreadable record leaves 0, which
+ * never answers. A record emptied in place ("<heap> <oid> 0 0") has four fields and index 0: it never answers either. */
+static void
+read_index_identity(const char *dir, uint32_t db_oid, uint32_t index_oid, IndexEntry *e)
+{
+    char path[512];
+    unsigned heap_rfn = 0, table_oid = 0, index_rfn = 0;
+    int n;
+    FILE *f;
+
+    e->index_rfn = 0;
+    e->heap_rfn = 0;
+    e->identity_legacy = 0;
+    relfilenode_file_path(path, sizeof(path), dir, db_oid, index_oid);
+    f = fopen(path, "r");
+    if (!f)
+        return;
+    n = fscanf(f, "%u %u %u", &heap_rfn, &table_oid, &index_rfn);
+    fclose(f);
+    if (n == 3)
+    {
+        e->index_rfn = index_rfn;
+        e->heap_rfn = heap_rfn;
+    }
+    else if (n == 2)
+    {
+        e->heap_rfn = heap_rfn;
+        e->identity_legacy = 1;
+    }
+}
+
+/* a build answers a request only if both name the same index relfilenode. The catalog gives an index a new relfilenode
+ * whenever its contents are rebuilt (REINDEX, TRUNCATE, CLUSTER, VACUUM FULL, a rewriting ALTER TABLE) and gives the old one back when
+ * that is rolled back, so a build of another heap, or of a rolled-back state, never matches. The heap relfilenode is compared too
+ * when strict, for the exports of a build as another index's source (in a rewrite the indexes are rebuilt one by
+ * one, and one not rebuilt yet still has its own relfilenode with the new heap), and never otherwise (ALTER TABLE
+ * SET TABLESPACE gives the table a new relfilenode with the same rows and TIDs and leaves the indexes alone). A build loaded with a
+ * record of an earlier version knows only the heap relfilenode; it answers a request for that heap (the backend accepts such a
+ * record by the same rule, cuvs_build_identity). 0 on either side never matches. Caller holds g_index_mutex. */
+static int
+entry_current_as(IndexEntry *e, const CuvsCmdFrame *cmd, int strict)
+{
+    /* An entry that knows nothing of its build (the record could not be read at load: a record of an earlier version left 0600 and
+     * a daemon of another uid; the backend that accepts such a record makes it readable, cuvs_build_identity): read the record again,
+     * only for such an entry and only when the request carries an identity. */
+    if (e->heap_rfn == 0 && e->index_rfn == 0 && cmd->heap_relfilenode != 0)
+        read_index_identity(g_index_dir, e->db_oid, e->index_oid, e);
+    if (e->identity_legacy)
+        return cmd->heap_relfilenode != 0 && e->heap_rfn == cmd->heap_relfilenode;
+    if (strict && (cmd->heap_relfilenode == 0 || e->heap_rfn != cmd->heap_relfilenode))
+        return 0;
+    return e->index_rfn != 0 && e->index_rfn == cmd->index_relfilenode;
+}
+#define entry_current(e, cmd) entry_current_as((e), (cmd), 0)
+
+#define ENTRY_NOT_CURRENT_TEXT "the build does not match the index's current relfilenode (rebuilt, truncated or rolled back since)"
+
 /* ----------------------------------------------------------------
  * Phase 3B delta cache: resident GPU brute-force over the pending `.delta`.
  * ----------------------------------------------------------------
@@ -2163,6 +2227,7 @@ load_index_sharded(uint32_t db_oid, uint32_t index_oid,
     build_rev_tid_map(e);             /* 3O: TID → item_id reverse map */
     e->vram_bytes    = 0;
     e->last_search   = time(NULL);
+    read_index_identity(g_index_dir, db_oid, index_oid, e);
     e->valid         = 1;
     e->warmup_state  = WARMUP_HOT;
     e->gpu_device_id = 0xFFFFFFFFu;    /* sharded: not LRU-evictable */
@@ -2336,6 +2401,7 @@ load_index(uint32_t db_oid, uint32_t index_oid, CuvsRequester rq)
             build_rev_tid_map(e);            /* 3O: TID -> item_id reverse map */
             e->vram_bytes   = 0;             /* BF is lazy; tracked in main_bf_vram_bytes */
             e->last_search  = time(NULL);
+            read_index_identity(g_index_dir, db_oid, index_oid, e);
             e->valid        = 1;
             e->gpu_device_id = (uint32_t) fgpu;
             e->shard_count  = 0;
@@ -2464,6 +2530,7 @@ load_index(uint32_t db_oid, uint32_t index_oid, CuvsRequester rq)
     build_rev_tid_map(e);   /* 3O: TID → item_id reverse map */
     e->vram_bytes  = needed;
     e->last_search = time(NULL);
+    read_index_identity(g_index_dir, db_oid, index_oid, e);
     e->valid       = 1;
     e->gpu_device_id = (uint32_t)target_gpu;
     e->shard_count = 0;     /* unsharded; slot may be reused post-eviction */
@@ -4316,6 +4383,16 @@ handle_search_stream_bf(int client_fd, const CuvsCmdFrame *cmd)
         send_all(client_fd, &hdr, sizeof(hdr));
         return;
     }
+    if (!entry_current(e, cmd))
+    {
+        record_search_stat(e, CUVS_STATUS_NOT_CURRENT, 0, ENTRY_NOT_CURRENT_TEXT);
+        pthread_mutex_unlock(&g_index_mutex);
+        CuvsReplyHeader hdr = {0};
+        hdr.status = CUVS_STATUS_NOT_CURRENT;
+        strncpy(hdr.error, ENTRY_NOT_CURRENT_TEXT, sizeof(hdr.error) - 1);
+        send_all(client_fd, &hdr, sizeof(hdr));
+        return;
+    }
 
     /* Need the 3O reverse map (heapTID -> item_id), built at build/load time.
      * Genuinely absent only if build_rev_tid_map hit a malloc failure -> the
@@ -4767,6 +4844,16 @@ handle_search(int client_fd, const CuvsCmdFrame *cmd)
         hdr.status = CUVS_STATUS_STALE;
         strncpy(hdr.error, "index stale (writes since build)", sizeof(hdr.error) - 1);
         record_search_stat(e, CUVS_STATUS_STALE, 0, hdr.error);
+        pthread_mutex_unlock(&g_index_mutex);
+        send_all(client_fd, &hdr, sizeof(hdr));
+        return;
+    }
+    if (!entry_current(e, cmd))
+    {
+        CuvsReplyHeader hdr = {0};
+        hdr.status = CUVS_STATUS_NOT_CURRENT;
+        strncpy(hdr.error, ENTRY_NOT_CURRENT_TEXT, sizeof(hdr.error) - 1);
+        record_search_stat(e, CUVS_STATUS_NOT_CURRENT, 0, hdr.error);
         pthread_mutex_unlock(&g_index_mutex);
         send_all(client_fd, &hdr, sizeof(hdr));
         return;
@@ -5968,6 +6055,16 @@ handle_search_batch(int client_fd, const CuvsCmdFrame *cmd)
         send_all(client_fd, &hdr, sizeof(hdr));
         return;
     }
+    if (!entry_current(e, cmd))
+    {
+        CuvsReplyHeader hdr = {0};
+        hdr.status = CUVS_STATUS_NOT_CURRENT;
+        strncpy(hdr.error, ENTRY_NOT_CURRENT_TEXT, sizeof(hdr.error) - 1);
+        record_search_stat(e, CUVS_STATUS_NOT_CURRENT, 0, hdr.error);
+        pthread_mutex_unlock(&g_index_mutex);
+        send_all(client_fd, &hdr, sizeof(hdr));
+        return;
+    }
     if (cmd->metric != e->metric)
     {
         CuvsReplyHeader hdr = {0};
@@ -6905,6 +7002,9 @@ build_sharded(int client_fd, const CuvsCmdFrame *cmd, const char *index_dir,
     e->tids         = new_tids;
     e->vram_bytes   = 0;
     e->last_search  = time(NULL);
+    e->index_rfn = cmd->index_relfilenode;
+    e->heap_rfn = cmd->heap_relfilenode;
+    e->identity_legacy = 0;
     e->valid        = 1;
     e->stale        = 0;
     e->stale_since  = 0;
@@ -7570,6 +7670,9 @@ finish_build_commit(int client_fd, const CuvsCmdFrame *cmd, const char *save_dir
         existing->tids        = new_tids;
         existing->vram_bytes  = needed;
         existing->last_search = time(NULL);
+        existing->index_rfn = cmd->index_relfilenode;
+        existing->heap_rfn = cmd->heap_relfilenode;
+        existing->identity_legacy = 0;
         existing->valid       = 1;
         existing->stale       = 0;     /* rebuilt -> fresh */
         existing->stale_since = 0;
@@ -7632,6 +7735,9 @@ finish_build_commit(int client_fd, const CuvsCmdFrame *cmd, const char *save_dir
         e->tids        = new_tids;
         e->vram_bytes  = needed;
         e->last_search = time(NULL);
+        e->index_rfn = cmd->index_relfilenode;
+        e->heap_rfn = cmd->heap_relfilenode;
+        e->identity_legacy = 0;
         e->valid       = 1;
         e->stale       = 0;
         e->stale_since = 0;
@@ -8384,12 +8490,19 @@ handle_export_adjacency(int client_fd, const CuvsCmdFrame *cmd)
     uint32_t idx = cmd->index_oid;
 
     pthread_mutex_lock(&g_index_mutex);
+    uint64_t lock_t0 = cuvs_hnsw_monotonic_us();
     IndexEntry *e = find_index(db, idx);
     if (!e || !e->valid || !e->handle || e->shard_count >= 2)
     {
         pthread_mutex_unlock(&g_index_mutex);
         send_error_code(client_fd, CUVS_STATUS_NOT_FOUND,
                         "index not loaded or sharded (call after CREATE INDEX USING cagra)");
+        return;
+    }
+    if (!entry_current_as(e, cmd, 1))   /* never export a build of another index or heap state */
+    {
+        pthread_mutex_unlock(&g_index_mutex);
+        send_error_code(client_fd, CUVS_STATUS_NOT_CURRENT, ENTRY_NOT_CURRENT_TEXT);
         return;
     }
 
@@ -8400,8 +8513,9 @@ handle_export_adjacency(int client_fd, const CuvsCmdFrame *cmd)
     int       graph_degree;
     int       gpu  = (int)e->gpu_device_id;
 
+    int       vec_dim = 0;
     if (cuvs_cagra_extract_adjacency(e->handle, &adj, &vecs, &n_vecs,
-                                      &graph_degree, gpu) != 0)
+                                      &graph_degree, &vec_dim, gpu) != 0)
     {
         pthread_mutex_unlock(&g_index_mutex);
         free(adj); free(vecs);
@@ -8422,6 +8536,7 @@ handle_export_adjacency(int client_fd, const CuvsCmdFrame *cmd)
         return;
     }
     memcpy(tids, e->tids, (size_t)n_vecs_i * sizeof(uint64_t));
+    uint64_t lock_held_us = cuvs_hnsw_monotonic_us() - lock_t0;
     pthread_mutex_unlock(&g_index_mutex);
 
     /* Pack into shared memory:
@@ -8519,8 +8634,8 @@ handle_export_adjacency(int client_fd, const CuvsCmdFrame *cmd)
     free(vecs);
     free(tids);
 
-    LOG_INFO("[handle_export_adjacency] %u/%u N=%zu D=%d dim=%u fd-passed (was %s)\n",
-             db, idx, n_vecs, graph_degree, dim, shm_key);
+    LOG_INFO("[handle_export_adjacency] %u/%u N=%zu D=%d dim=%u lock_held_us=%llu fd-passed (was %s)\n",
+             db, idx, n_vecs, graph_degree, dim, (unsigned long long)lock_held_us, shm_key);
 
     /* Reply: n_vecs/graph_degree/dim in header fields; the segment itself rides
      * along as an SCM_RIGHTS fd (#165). error[] carries the former name for log
@@ -8558,6 +8673,12 @@ handle_export_hnsw_shm(int client_fd, const CuvsCmdFrame *cmd)
         pthread_mutex_unlock(&g_index_mutex);
         send_error_code(client_fd, CUVS_STATUS_NOT_FOUND,
                         "index not loaded or sharded");
+        return;
+    }
+    if (!entry_current_as(e, cmd, 1))   /* never export a build of another index or heap state */
+    {
+        pthread_mutex_unlock(&g_index_mutex);
+        send_error_code(client_fd, CUVS_STATUS_NOT_CURRENT, ENTRY_NOT_CURRENT_TEXT);
         return;
     }
     CuvsCagraIndex handle = e->handle;
@@ -8680,6 +8801,233 @@ handle_export_hnsw_shm(int client_fd, const CuvsCmdFrame *cmd)
     if (cuvs_fd_send(client_fd, mfd, &reply, sizeof(reply)) != 0)
         LOG_ERROR("[handle_export_hnsw_shm] fd handoff failed for %u/%u\n", db, idx);
     close(mfd);
+}
+
+static int
+write_all_fd(int fd, const void *buf, size_t len)
+{
+    const char *p = (const char *)buf;
+    while (len > 0)
+    {
+        ssize_t n = write(fd, p, len);
+        if (n < 0 && errno == EINTR)
+            continue;
+        if (n <= 0)
+            return -1;
+        p += n;
+        len -= (size_t)n;
+    }
+    return 0;
+}
+
+/* one EXPORT_HNSW_UPPER builds at a time (each holds a copy of its
+ * graph and vectors); a request that waits for it gives up when its client
+ * has gone. Other operations never wait on this lock. */
+static pthread_mutex_t g_upper_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+/* The client of a request has closed its end: the backend gave up (query
+ * cancel, statement_timeout) or exited. It sends nothing after the frame, so
+ * a readable socket here means end of file. */
+static int
+client_gone(void *arg)
+{
+    int fd = *(const int *)arg;
+    struct pollfd p = { .fd = fd, .events = POLLIN | POLLRDHUP, .revents = 0 };
+    char c;
+
+    if (poll(&p, 1, 0) <= 0)
+        return 0;
+    if (p.revents & (POLLHUP | POLLERR | POLLRDHUP | POLLNVAL))
+        return 1;
+    return (p.revents & POLLIN) && recv(fd, &c, 1, MSG_PEEK | MSG_DONTWAIT) == 0;
+}
+
+/* ----------------------------------------------------------------
+ * Handle EXPORT_HNSW_UPPER (CUVS_OP_EXPORT_HNSW_UPPER, cuvs_ipc.h).
+ *
+ * The registry lock covers what handle_export_adjacency does under it (find
+ * the entry, copy graph and vectors out of VRAM, copy the TIDs) plus copying
+ * the scalars used later, so it is held no longer than there. After the
+ * unlock nothing reads the entry. The upper layers are built on the host
+ * over those copies (cuvs_hnsw_upper.c: no GPU memory, several threads,
+ * stopped when the client goes) and written as the hnswlib file.
+ * ---------------------------------------------------------------- */
+static void
+export_hnsw_upper_locked_out(int client_fd, const CuvsCmdFrame *cmd)
+{
+    uint32_t  db  = cmd->db_oid;
+    uint32_t  idx = cmd->index_oid;
+    uint32_t *adj  = NULL;
+    float    *vecs = NULL;
+    uint64_t *tids = NULL;
+    size_t    n_vecs = 0;
+    int       graph_degree = 0, vec_dim = 0;
+    int       hfd = -1, tfd = -1;
+    char      err[160];
+    CuvsHnswUpperStats st;
+
+    pthread_mutex_lock(&g_index_mutex);
+    uint64_t lock_t0 = cuvs_hnsw_monotonic_us();
+    IndexEntry *e = find_index(db, idx);
+    if (!e || !e->valid || !e->handle || e->shard_count >= 2)
+    {
+        pthread_mutex_unlock(&g_index_mutex);
+        send_error_code(client_fd, CUVS_STATUS_NOT_FOUND,
+                        "index not loaded or sharded (call after CREATE INDEX USING cagra)");
+        return;
+    }
+    if (!entry_current_as(e, cmd, 1))   /* never export a build of another index or heap state */
+    {
+        pthread_mutex_unlock(&g_index_mutex);
+        send_error_code(client_fd, CUVS_STATUS_NOT_CURRENT, ENTRY_NOT_CURRENT_TEXT);
+        return;
+    }
+    int      gpu    = (int)e->gpu_device_id;
+    uint32_t dim    = e->dim;
+    uint32_t metric = e->metric;
+    int64_t  n_reg  = e->n_vecs;
+    if (cuvs_cagra_extract_adjacency(e->handle, &adj, &vecs, &n_vecs,
+                                      &graph_degree, &vec_dim, gpu) != 0)
+    {
+        pthread_mutex_unlock(&g_index_mutex);
+        free(adj); free(vecs);
+        send_error(client_fd, "cuvs_cagra_extract_adjacency failed");
+        return;
+    }
+    if ((int64_t)n_vecs != n_reg || n_vecs > UINT32_MAX || vec_dim != (int)dim)
+    {
+        pthread_mutex_unlock(&g_index_mutex);
+        free(adj); free(vecs);
+        send_error(client_fd, "graph rows or vector width do not match the registered index");
+        return;
+    }
+    tids = malloc(n_vecs * sizeof(uint64_t));
+    if (!tids)
+    {
+        pthread_mutex_unlock(&g_index_mutex);
+        free(adj); free(vecs);
+        send_error(client_fd, "out of memory for export");
+        return;
+    }
+    memcpy(tids, e->tids, n_vecs * sizeof(uint64_t));
+    uint64_t lock_held_us = cuvs_hnsw_monotonic_us() - lock_t0;
+    pthread_mutex_unlock(&g_index_mutex);
+    e = NULL;   /* not read again */
+    (void)gpu;
+
+    /* Level 0 as the backend's own conversion takes it: the first
+     * min(graph_degree, 64) CAGRA neighbors, rounded down to even. */
+    int degree = graph_degree < 64 ? graph_degree : 64;
+    if (degree % 2 != 0)
+        degree--;
+    if (degree < 4)     /* M = degree / 2 >= 2: the level draw and hnswlib's mult = 1 / ln M need it */
+    {
+        free(adj); free(vecs); free(tids);
+        send_error_code(client_fd, CUVS_STATUS_HNSW_UPPER_SKIPPED,
+                        "graph degree below 4: no upper layers");
+        return;
+    }
+    /* Inner product over unit rows orders as cosine does, and pgvector stores
+     * cosine rows normalized too. A zero row stays zero. */
+    if (metric == CUVS_METRIC_COSINE)
+        for (size_t i = 0; i < n_vecs; i++)
+        {
+            float *v = vecs + i * dim;
+            double s = 0.0;
+            for (uint32_t k = 0; k < dim; k++)
+                s += (double)v[k] * v[k];
+            if (s > 0.0)
+            {
+                float inv = (float)(1.0 / sqrt(s));
+                for (uint32_t k = 0; k < dim; k++)
+                    v[k] *= inv;
+            }
+        }
+    int rc = CUVS_HNSW_UPPER_ERROR;
+    hfd = memfd_create("pg_cuvs_hnsw_upper", MFD_CLOEXEC | MFD_ALLOW_SEALING);
+    if (hfd < 0)
+        snprintf(err, sizeof(err), "memfd_create failed errno=%d", errno);
+    else
+        rc = cuvs_hnsw_upper_write(hfd, adj, graph_degree, degree, vecs, (uint64_t)n_vecs, (int)dim,
+                                   metric != CUVS_METRIC_L2, 2 * degree, 0,
+                                   client_gone, &client_fd, &st, err, sizeof(err));
+    free(adj);
+    free(vecs);
+    if (rc == CUVS_HNSW_UPPER_CANCELED)
+    {
+        LOG_INFO("[handle_export_hnsw_upper] %u/%u N=%zu client gone after %llu us: stopped\n",
+                 db, idx, n_vecs, (unsigned long long)st.build_us);
+        free(tids);
+        close(hfd);
+        return;
+    }
+    if (rc != CUVS_HNSW_UPPER_OK)
+    {
+        LOG_ERROR("[handle_export_hnsw_upper] %u/%u: %s\n", db, idx, err);
+        free(tids);
+        if (hfd >= 0) close(hfd);
+        send_error_code(client_fd, CUVS_STATUS_BUILD_FAILED, "upper-layer build failed");
+        return;
+    }
+
+    CuvsTidsHeader th = {0};
+    th.magic      = CUVS_TIDS_MAGIC;
+    th.version    = CUVS_TIDS_VERSION;
+    th.n_vecs     = (int64_t)n_vecs;
+    th.dim        = dim;
+    th.metric     = metric;
+    th.body_crc32 = cuvs_crc32(tids, n_vecs * sizeof(uint64_t));
+    tfd = memfd_create("pg_cuvs_hnsw_tids", MFD_CLOEXEC | MFD_ALLOW_SEALING);
+    int tids_ok = tfd >= 0 && write_all_fd(tfd, &th, sizeof(th)) == 0 &&
+                  write_all_fd(tfd, tids, n_vecs * sizeof(uint64_t)) == 0;
+    free(tids);
+    /* Sealed as in handle_export_hnsw_shm: immutable for every holder. */
+    const int seals = F_SEAL_WRITE | F_SEAL_GROW | F_SEAL_SHRINK | F_SEAL_SEAL;
+    if (!tids_ok || fcntl(hfd, F_ADD_SEALS, seals) != 0 || fcntl(tfd, F_ADD_SEALS, seals) != 0)
+    {
+        LOG_ERROR("[handle_export_hnsw_upper] tids write or seal failed errno=%d\n", errno);
+        close(hfd);
+        if (tfd >= 0) close(tfd);
+        send_error(client_fd, "cannot write or seal the hnswlib files");
+        return;
+    }
+
+    LOG_INFO("[handle_export_hnsw_upper] %u/%u N=%zu degree=%d dim=%u lock_held_us=%llu "
+             "upper_nodes=%llu max_level=%d threads=%d upper_build_us=%llu write_us=%llu fd-passed\n",
+             db, idx, n_vecs, degree, dim, (unsigned long long)lock_held_us,
+             (unsigned long long)st.upper_nodes, st.max_level, st.threads,
+             (unsigned long long)st.build_us, (unsigned long long)st.write_us);
+
+    CuvsReplyHeader reply = {0};
+    reply.status       = CUVS_STATUS_OK;
+    reply.n_results    = (uint32_t)n_vecs;
+    reply.latency_us   = (uint32_t)degree;
+    reply.delta_merged = dim;
+    snprintf(reply.error, sizeof(reply.error), "memfd:pg_cuvs_hnsw_upper %u/%u", db, idx);
+    char token = 'T';
+    if (cuvs_fd_send(client_fd, hfd, &reply, sizeof(reply)) != 0 ||
+        cuvs_fd_send(client_fd, tfd, &token, 1) != 0)
+        LOG_ERROR("[handle_export_hnsw_upper] fd handoff failed for %u/%u\n", db, idx);
+    close(hfd);
+    close(tfd);
+}
+
+static void
+handle_export_hnsw_upper(int client_fd, const CuvsCmdFrame *cmd)
+{
+    /* Wait for the one running build, as long as the client still waits. */
+    while (pthread_mutex_trylock(&g_upper_mutex) != 0)
+    {
+        if (client_gone(&client_fd))
+        {
+            LOG_INFO("[handle_export_hnsw_upper] %u/%u: client gone while queued\n",
+                     cmd->db_oid, cmd->index_oid);
+            return;
+        }
+        (void)poll(NULL, 0, 50);
+    }
+    export_hnsw_upper_locked_out(client_fd, cmd);
+    pthread_mutex_unlock(&g_upper_mutex);
 }
 
 /* ----------------------------------------------------------------
@@ -9050,6 +9398,9 @@ handle_build_flat(int client_fd, const CuvsCmdFrame *cmd)
             existing->inflight       = 0;
             existing->gpu_device_id  = (uint32_t) fgpu;
             existing->last_search    = time(NULL);
+            existing->index_rfn = cmd->index_relfilenode;
+            existing->heap_rfn = cmd->heap_relfilenode;
+            existing->identity_legacy = 0;
             existing->valid          = 1;
             existing->stale          = 0;
             existing->stale_since    = 0;
@@ -9097,6 +9448,9 @@ handle_build_flat(int client_fd, const CuvsCmdFrame *cmd)
             build_rev_tid_map(e);
             e->vram_bytes      = 0;
             e->last_search     = time(NULL);
+            e->index_rfn = cmd->index_relfilenode;
+            e->heap_rfn = cmd->heap_relfilenode;
+            e->identity_legacy = 0;
             e->valid           = 1;
             e->stale           = 0;
             e->stale_since     = 0;
@@ -9330,6 +9684,9 @@ handle_build_ivfpq(int client_fd, const CuvsCmdFrame *cmd)
             existing->vram_bytes     = needed;
             existing->gpu_device_id  = (uint32_t)target_gpu;
             existing->last_search    = time(NULL);
+            existing->index_rfn = cmd->index_relfilenode;
+            existing->heap_rfn = cmd->heap_relfilenode;
+            existing->identity_legacy = 0;
             existing->valid          = 1;
             existing->stale          = 0;
             existing->stale_since    = 0;
@@ -9374,6 +9731,9 @@ handle_build_ivfpq(int client_fd, const CuvsCmdFrame *cmd)
             e->tids            = new_tids;
             e->vram_bytes      = needed;
             e->last_search     = time(NULL);
+            e->index_rfn = cmd->index_relfilenode;
+            e->heap_rfn = cmd->heap_relfilenode;
+            e->identity_legacy = 0;
             e->valid           = 1;
             e->stale           = 0;
             e->stale_since     = 0;
@@ -9441,6 +9801,15 @@ handle_search_ivfpq(int client_fd, const CuvsCmdFrame *cmd)
         hdr.status = e ? CUVS_STATUS_NOT_FOUND : CUVS_STATUS_NOT_FOUND;
         snprintf(hdr.error, sizeof(hdr.error), "IVF-PQ index %u/%u not found",
                  cmd->db_oid, cmd->index_oid);
+        send_all(client_fd, &hdr, sizeof(hdr));
+        return;
+    }
+    if (!entry_current(e, cmd))
+    {
+        pthread_mutex_unlock(&g_index_mutex);
+        CuvsReplyHeader hdr = {0};
+        hdr.status = CUVS_STATUS_NOT_CURRENT;
+        strncpy(hdr.error, ENTRY_NOT_CURRENT_TEXT, sizeof(hdr.error) - 1);
         send_all(client_fd, &hdr, sizeof(hdr));
         return;
     }
@@ -9641,6 +10010,16 @@ handle_extend(int client_fd, const CuvsCmdFrame *cmd)
         send_all(client_fd, &hdr, sizeof(hdr));
         return;
     }
+    if (!entry_current(e, cmd))   /* never extend a build of another index state */
+    {
+        pthread_mutex_unlock(&g_index_mutex);
+        munmap(mem, total);
+        CuvsReplyHeader hdr = {0};
+        hdr.status = CUVS_STATUS_NOT_CURRENT;
+        strncpy(hdr.error, ENTRY_NOT_CURRENT_TEXT, sizeof(hdr.error) - 1);
+        send_all(client_fd, &hdr, sizeof(hdr));
+        return;
+    }
 
     int64_t  old_n = e->n_vecs;
     int64_t  n_new = cmd->n_vecs;
@@ -9805,6 +10184,13 @@ handle_compact(int client_fd, const CuvsCmdFrame *cmd)
         free(dead_tids);
         send_error_code(client_fd, CUVS_STATUS_NOT_FOUND,
                         "CAGRA index not loaded for compact");
+        return;
+    }
+    if (!entry_current(e, cmd))
+    {
+        pthread_mutex_unlock(&g_index_mutex);
+        free(dead_tids);
+        send_error_code(client_fd, CUVS_STATUS_NOT_CURRENT, ENTRY_NOT_CURRENT_TEXT);
         return;
     }
 
@@ -11449,6 +11835,9 @@ connection_thread(void *arg)
             break;
         case CUVS_OP_EXPORT_HNSW_SHM:
             handle_export_hnsw_shm(client_fd, &cmd);
+            break;
+        case CUVS_OP_EXPORT_HNSW_UPPER:
+            handle_export_hnsw_upper(client_fd, &cmd);
             break;
         case CUVS_OP_BUILD_IVFPQ:
             handle_build_ivfpq(client_fd, &cmd);

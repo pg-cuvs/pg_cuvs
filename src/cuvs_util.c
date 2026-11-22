@@ -242,6 +242,7 @@ cuvs_status_str(int status)
         case CUVS_STATUS_DIM_MISMATCH:   return "dim_mismatch";
         case CUVS_STATUS_METRIC_MISMATCH: return "metric_mismatch";
         case CUVS_STATUS_STALE:          return "stale";
+        case CUVS_STATUS_NOT_CURRENT:    return "not_current";
         case CUVS_STATUS_PROTO_MISMATCH: return "proto_mismatch";
         default:                       return "unknown";
     }
@@ -966,6 +967,7 @@ circuit_status_is_counted(int status)
              || status == CUVS_STATUS_DIM_MISMATCH
              || status == CUVS_STATUS_METRIC_MISMATCH
              || status == CUVS_STATUS_STALE
+             || status == CUVS_STATUS_NOT_CURRENT
              || status == CUVS_STATUS_NO_VECTORS);
 }
 

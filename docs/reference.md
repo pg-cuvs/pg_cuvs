@@ -510,7 +510,7 @@ cagra/ivfpq") rather than silently failing.
 | Reloption | Type | Default | Values | Notes |
 |-----------|------|---------|--------|-------|
 | `source` | string | `` | a `cagra` index name on the same table | empty = private direct HNSW file build from the heap (op23), without a persistent CAGRA index |
-| `mode` | string | `nsw` | `nsw`, `hnswlib`, `hnsw`, `hnswlib_file` | `nsw` and `hnswlib` are recommended |
+| `mode` | string | `nsw` | `nsw`, `hnswlib`, `hnsw`, `hnswlib_file` | `nsw` and `hnswlib` are recommended. With `source`, `nsw` and `hnsw` give the same graph: level 0 from the CAGRA graph and upper layers built by the daemon on the host. Since 0.9.3 this path checks the pgvector version as the heap build does (outside the supported range is an error, not a warning) |
 | `m` | int | `16` | 2–100 | **informational** — the CAGRA graph degree drives the HNSW layout, not `m` |
 | `ef_construction` | int | `64` | 4–1000 | Direct heap build: construction effort; source reuse: informational |
 | `build_algo` | enum | `auto` | `auto`, `ivf_pq`, `nn_descent`, `ace` | Direct heap build only; cannot be combined with explicit `source` |
@@ -548,8 +548,9 @@ base dtype is FP32 when dim <= 16, any element exceeds half range, or the reside
 IVF-PQ norm bound reaches 65504 (4 x max\|x\|^2 for L2, max\|x\|^2 for inner product and
 cosine), because the SDK's FP16 path mixes FP32 norms with half dot products; otherwise FP16.
 Because the SDK computes L2 as ||a||^2 + ||b||^2 - 2a.b in float32 on both paths, L2 builds
-feed NN-descent a column-centered copy (mean accumulated in float64); with `mode='hnsw'`
-the SDK patch 0005 does the same for each upper level's point set (its own mean). L2 is
+feed NN-descent a column-centered copy (mean accumulated in float64); since every mode of
+the heap build builds the upper layers, the SDK patch 0005 does the same for each upper
+level's point set (its own mean). L2 is
 translation invariant; stored vectors and search distances use the original rows. The base
 copy is counted in the host estimate (n x dim x 4, L2 only) and freed before serialization;
 each upper-level copy is counted in that level's NN-descent host workspace check. IP and
@@ -608,12 +609,15 @@ for limits, compatibility and estimate-vs-upper-bound caveats.
 | `pg_cuvs_memory_status()` | SETOF record | (0.9.0) Superuser or `pg_monitor`; per-GPU accounting, reclaim state and eviction counters. See § 8.4 |
 | `pg_cuvs_build_status()` | SETOF record | (0.9.0) In-flight CAGRA builds and their reservations; rows filtered by privilege. See § 8.4 |
 | `pg_cuvs_hnsw_build_info(index regclass)` | jsonb | Read the stored construction route/settings and estimate-based admission. Version2 writer with historical version1 reader; absent legacy/source/empty receipts are not reconstructed from current GUCs. For ACE, `ace_partitions_origin` says whether `ace_partitions` is the effective count or only the requested one. Requires SELECT on the source table; estimates are not memory upper-bound guarantees |
+| `pg_cuvs_hnsw_layer_counts(index regclass)` | record (elements bigint, upper_elements bigint, m integer, entry_level integer, built_hierarchy integer, level1_unlinked bigint) | One `pg_cuvs_hnsw` index: elements not marked deleted, how many are above level 0, the metapage `m` and entry level, the hierarchy flag its heap build recorded (NULL when none, e.g. a CAGRA-source build), and how many elements above level 0 have no level-1 link (0 when the upper layer is connected; a search descending through level 1 stops at such an element). Reads every page; requires SELECT on the table |
+| `pg_cuvs_hnsw_layer_status()` | SETOF (index regclass, access_method name, current boolean, reason text) | Every `pg_cuvs_hnsw` index the caller can read: whether it has upper layers, and why not. `mode='nsw'` before 0.9.3 wrote level 0 only, so rows inserted afterwards held the upper layers alone and searches could miss the built rows; such an index needs `REINDEX INDEX`. A heap build is judged from its recorded hierarchy flag; a CAGRA-source build from the share of elements above level 0 (about 1/m expected, under a quarter of that means none), and NULL below 16 × m elements. With two or more elements above level 0, any of them without a level-1 link makes an index not current, whatever built it (a single upper element, the entry point, has nobody to link to) |
 | `pg_cuvs_build_hnsw(cagra regclass, mode text DEFAULT 'nsw')` | regclass | Build a pgvector HNSW from a CAGRA index without pgvector's CPU build. **Deprecated** in favor of `CREATE INDEX ... USING pg_cuvs_hnsw`; the older two-step `pg_cuvs_import_hnsw` form (empty `USING hnsw` target + import) is removed |
 | `pg_cuvs_compact(index regclass)` | void | Remove tombstoned vectors via `cuvsCagraMerge`, rebuild `.cagra`/`.tids`, drop `.tombstone`. The rebuild uses fp32 IVF-PQ kNN distances under the `build_algo` fp16 rule. If the initial NN-descent or auto merge runs out of memory, retry once with explicit IVF-PQ under that same rule. A pinned IVF-PQ failure is not retried |
 | `pg_cuvs_batch_search(rel regclass, queries vector[], k int)` | SETOF (query_idx int, ctid tid, distance real) | Q queries in one IPC/GPU dispatch; JOIN on `ctid` for visible rows, which drops HOT-updated rows (see the note below the table); honors `search_mode`/`bf_precision` |
 | `cuvs_filtered_knn(index regclass, query vector, filter_tids bigint[], k int)` | TABLE (ctid tid, distance float4) | Exact GPU BF restricted to a sorted TID set (`block<<16\|off`); NULL = unfiltered. A `ctid` join drops HOT-updated rows (see the note below the table) |
 | `cuvs_filtered_knn(index regclass, query vector, filter_tids tid[], k int)` | TABLE (ctid tid, distance float4) | Type-safe `tid[]` overload (accepts `ctid` directly; a HOT-updated row's current `ctid` does not match, see the note below the table) |
 | `pg_cuvs_gc_orphans(do_delete bool DEFAULT false)` | SETOF (db_oid oid, index_oid oid, reason text, action text) | Reconcile `index_dir` vs catalog; dry-run by default (ADR-046) |
+| `pg_cuvs_build_identity_status()` | SETOF (index regclass, access_method name, current boolean, reason text) | Every `cagra`, `flat` and `ivfpq` index of the database: whether its GPU build is the one for the index as the catalog has it now, and why not (no build record, a record of an earlier version that does not match the table, built for another relfilenode, emptied in place, unlogged index built before the last restart, the daemon refused its build in this session). An index whose table moved with `ALTER TABLE ... SET TABLESPACE` is current, with that said in its reason. An index that is not current answers from the table until `REINDEX INDEX`; the first backend that plans it says so once (NOTICE) |
 | `pg_cuvs_last_search_latency_us()` / `_n_results()` / `_k()` / `_index()` / `_metric()` | int / int / int / oid / text | Process-local stats for the most recent scan in this backend; NULL if none |
 | `pg_cuvs_hw_profile()` | SETOF (gpu_name text, n_gpus int, total_vram_bytes bigint, link_bw_bytes_per_us float8, hbm_bw_bytes_per_us float8, gpu_bf_tput float8, ipc_rtt_us float8, measured_at_epoch bigint, probe_status int, source text, matches_running_daemon bool, cpu_dist_tput float8, gpu_cagra_lat_us float8) | The measured (or DEFAULT) hardware profile the daemon wrote at boot, consumed by the ADR-075 cost model. `source` = `measured` \| `default`; `probe_status` is a bitmask of which coefficients were measured; `matches_running_daemon` = false flags a stale profile (GPU swap / migration). Read-only, no CUDA/IPC |
 
@@ -747,7 +751,7 @@ Watch `vram_used_mb` vs `vram_budget_mb` for headroom, and `evictions`/`reloads`
 `index_oid, fallback_count, last_reason, last_fallback_at`
 
 The only place plan-time CPU routing is visible. `last_reason` ∈ `disabled / circuit_breaker /
-stale / delete_drift / daemon_down / no_artifact / delta_unusable / tombstone_unusable`. Watch the
+stale / delete_drift / daemon_down / no_artifact / not_current / delta_unusable / tombstone_unusable`. Watch the
 trend against `pg_stat_gpu_search.search_count` to catch queries silently dropping to CPU. Counts
 are a relative pressure signal (the cost hook can run more than once per query), not exact query
 counts.
@@ -1000,6 +1004,85 @@ and filtered index searches. IVF-PQ raises the same error from the backend's
 pre-search marker check (`ivfpq_gettuple`); its daemon handler currently has no
 stale gate. The error identifies the index and recommends
 `REINDEX INDEX`. A genuine empty filter result remains an empty result.
+
+A refusal by the build identity check below is a separate daemon status
+(`not_current`), not STALE, and has its own message: "index ... was rebuilt,
+truncated or rolled back since this statement was planned" when this session also
+finds the build not current, or "the GPU daemon could not match the build of index
+..." when only the daemon does (it cannot read the build record). Either way the
+statement fails with SQLSTATE `55000` and the next plan answers from the table.
+
+A `cagra`, `flat` or `ivfpq` build is used only for the index it was built for. Each
+build with rows writes a record `<db>_<index>.relfilenode` beside its files with the
+index's relfilenode and its table's, and the daemon keeps the same values with the
+build. The planner takes the index only while the record names its current relfilenode,
+and the daemon answers a search, `EXTEND` or `COMPACT` only when the request carries the
+value its build was made for. The table's relfilenode is compared only when a build is
+exported as the source of a `pg_cuvs_hnsw` index: while a table is rewritten its indexes
+are rebuilt one at a time, and an index not rebuilt yet still has its own relfilenode
+with the new heap; such a `pg_cuvs_hnsw` index is then built from the table instead of
+the source. `ALTER TABLE ... SET TABLESPACE` gives the table a new relfilenode with the
+same rows and TIDs and leaves its indexes alone, so their builds stay in use for
+searches and inserts; such a build is not exported as a source any more (a `REINDEX` of
+a `pg_cuvs_hnsw` index on it builds from the table, and `pg_cuvs_build_hnsw` refuses
+with 55000) until the `cagra` index is rebuilt. The catalog gives the index a new
+relfilenode when its contents are rebuilt by `REINDEX`, `TRUNCATE`, `CLUSTER`, `VACUUM
+FULL` or a rewriting `ALTER TABLE`, and gives the old one back when that rolls back, so
+a build of another heap or of a rolled-back state is not used. Two rebuilds keep the
+relfilenode: a `TRUNCATE` of a table created, or already given a new relfilenode, in the
+same transaction (PostgreSQL empties it in place), and `ON COMMIT DELETE ROWS` of a
+temporary table; there the rebuild with no rows rewrites the record as an empty build. A
+crash reset of an `UNLOGGED` table also keeps it (see below). An index that is not
+current answers from the heap and
+`pg_stat_gpu_fallback.last_reason` is `not_current` until `REINDEX INDEX`. A rebuild
+with no rows writes no record, so after a `TRUNCATE` that commits the index answers from
+the heap until `REINDEX INDEX` with rows, and the old build is dropped from the daemon
+at commit; a `TRUNCATE` that rolls back changes nothing. `pg_cuvs_batch_search`,
+`cuvs_filtered_knn` and the filtered custom scan have no exact path: on an index that is
+not current they fail with SQLSTATE 55000 and a `REINDEX` hint. Four cases answer from
+the heap although the build would still be right (known limits): a rolled-back `REINDEX`
+of an unchanged table, `ALTER INDEX ... SET TABLESPACE` (a new relfilenode without a
+build), an `UNLOGGED` table's index after any restart of PostgreSQL (its contents are
+reset after a crash without a new relfilenode, so the record also keeps the postmaster
+start time), and a transaction that runs `ALTER TABLE ... SET TABLESPACE` and then
+`TRUNCATE` and rolls back (the `TRUNCATE` empties the index in place and rewrites the
+record as empty; the rollback does not bring the record back). A record of an earlier
+version (heap relfilenode and table oid) is accepted when both still match the table;
+its contents are not rewritten, so this also holds on a standby or with a read-only
+`index_dir`: requests carry the table's relfilenode and the daemon accepts a build
+loaded with such a record for the same heap. The backend makes such a record readable
+(mode 0644) for a daemon running as another user; where that cannot be done and the
+daemon cannot read the record, the first statement on the index fails with SQLSTATE
+55000 and the next ones in that session answer from the heap, prepared statements and
+generic plans included (their plans are invalidated at once), until the index gets a new
+relfilenode. A record of an earlier version knows only the table's relfilenode, so after
+an `ALTER TABLE ... SET TABLESPACE` such an index answers from the heap until `REINDEX
+INDEX`; a session that judged it before the move gets one 55000 on its next statement,
+and then the heap. Known limit (not run): an expression or a partial-index predicate
+that queries the same table while a rewrite rebuilds the indexes (a function that breaks
+IMMUTABLE) may use an index not rebuilt yet. An `ivfpq` index of an earlier version has
+no record, and an `UNLOGGED` index's earlier record is not accepted, so those answer
+from the heap until `REINDEX INDEX`. States of an earlier version that cannot be told
+apart from a good one keep answering as they did in 0.9.2, which answered wrongly in
+them: an index rebuilt with no rows while the table kept its relfilenode, that is a
+`TRUNCATE` that emptied the table in place (in the transaction that created it, or after
+another `TRUNCATE` or rewrite in that transaction) and a `REINDEX` committed while no
+row had a vector (all rows deleted without `TRUNCATE`, or the column NULL in every row);
+and a `REINDEX` rolled back inside a savepoint after a committed `TRUNCATE`. Run with a
+0.9.2 build and then this version (CPU shim), an index emptied in place by `TRUNCATE` answered
+with the same wrong rows after the upgrade, unless the plan-time delete-drift gate
+(`cuvs.max_stale_fraction`) sent it to the heap because its build held more rows than the
+table; that gate, not the build record, is what told those apart. Rebuild an
+index that may have gone through one of them. `pg_cuvs_build_identity_status()` lists
+the indexes that are not current, with the reason; it only reads, and an index locked by
+another session (a `REINDEX`, a `DROP`) is listed as not judged instead of waited for. A
+build that is not used is not reclaimed either: the daemon keeps it in GPU memory and in
+its registry, with its files, until the next `REINDEX` or `DROP` of the index; for an
+`ivfpq` index a `DROP` does not free its GPU memory yet either (a separate fix,
+#251), so there only a daemon restart does. That holds for a
+rolled-back build (also when a `TRUNCATE` commits while a rebuild with rows rolls back
+inside a savepoint), the build of an index moved with `SET TABLESPACE`, the build of an
+index of an earlier version, and the build of an `UNLOGGED` index after a restart.
 
 Marking an index stale immediately invalidates cached plans for its parent
 table, including when the writing transaction later rolls back. When marker IPC

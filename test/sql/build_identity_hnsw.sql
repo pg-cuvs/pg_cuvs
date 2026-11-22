@@ -1,0 +1,116 @@
+-- build_identity_hnsw.sql — a pg_cuvs_hnsw index built from a cagra source takes only the source's current
+-- build. GPU only (the source mode exports the daemon's CAGRA graph): in REGRESS_TIER2_ONLY.
+--
+-- Old rows: id g, v [g,0,0,0], g = 1..200; new rows in reverse (id 1000+g, v [201-g,0,0,0]). Query [1,0,0,0], k 5. Every case ends
+-- with only h on the table and asserts that the plan uses h and that h answers like the heap.
+--   (a) TRUNCATE of a table with a cagra index c and a pg_cuvs_hnsw index h (source c): h is rebuilt empty; after new rows and
+--       REINDEX of both, h answers like the heap. Does not tell trees apart: the same with and without the fix (a regression check).
+--   (b) a rolled-back REINDEX of c on a refilled table, then CREATE INDEX h (source c): c's daemon build is the rolled-back one, so h
+--       is built from the table instead and answers like the heap. Without the fix h is built from the
+--       rolled-back source build and answers differently from the heap (seen once the helpers set every scan setting, below).
+--   (c) c dropped and created again after h (c's OID is now larger than h's), rows deleted, VACUUM FULL: the table's indexes are
+--       rebuilt in OID order, h before c, while c still names the old heap; h is built from the table and answers like the heap.
+--   (d) a table whose v is NULL in every row: REINDEX TABLE rebuilds c with no vectors and h succeeds. Not run on a tree
+--       without the fix yet. (b) and (c) tell the trees apart (they fail without the fix; so does (e)).
+-- bh_answer and bh_uses set every scan setting: SET LOCAL lasts to the end of the transaction, and before they did, the 'heap' side
+-- of `bh_answer(t, true) = bh_answer(t, false)` ran with every scan off after the index side, could be planned on h, and compared
+-- h with itself (earlier runs of this file).
+--   (e) as (c), with a search on the table in the same session before VACUUM FULL: the search leaves c judged
+--       current in the relcache; the export of c for h's rebuild must judge c again (the heap has a new relfilenode by then) and
+--       build h from the table, not ask the daemon to export c (refused, status 14, and VACUUM FULL failed without the fix).
+\set ON_ERROR_STOP on
+SET client_min_messages = WARNING;
+CREATE EXTENSION IF NOT EXISTS vector;
+CREATE EXTENSION IF NOT EXISTS pg_cuvs;
+SET cuvs.index_dir = '/tmp/cuvs_indexes';
+SET hnsw.ef_search = 100;
+
+CREATE FUNCTION bh_answer(t text, use_index boolean, q text DEFAULT '[1,0,0,0]') RETURNS text LANGUAGE plpgsql AS $$
+DECLARE r text;
+BEGIN
+  -- every setting each time: SET LOCAL lasts to the end of the transaction, so a call that set only some would inherit the others
+  -- from an earlier call in the same statement (an index answer, then a 'heap' answer with every scan off, planned on the index)
+  IF use_index THEN SET LOCAL enable_seqscan = off; SET LOCAL enable_indexscan = on; SET LOCAL enable_bitmapscan = on;
+  ELSE SET LOCAL enable_seqscan = on; SET LOCAL enable_indexscan = off; SET LOCAL enable_bitmapscan = off; END IF;
+  EXECUTE format('SELECT string_agg(id::text, '','' ORDER BY d, id) FROM (SELECT id, v <-> %L d FROM %I ORDER BY v <-> %L LIMIT 5) s', q, t, q) INTO r;
+  RETURN r;
+END $$;
+CREATE FUNCTION bh_uses(t text, i text) RETURNS boolean LANGUAGE plpgsql AS $$
+DECLARE p text; used boolean := false;
+BEGIN
+  SET LOCAL enable_seqscan = off; SET LOCAL enable_indexscan = on; SET LOCAL enable_bitmapscan = on;
+  FOR p IN EXECUTE format('EXPLAIN (COSTS OFF) SELECT id FROM %I ORDER BY v <-> ''[1,0,0,0]'' LIMIT 5', t) LOOP
+    IF p LIKE '%Index Scan using ' || i || ' %' THEN used := true; END IF;
+  END LOOP;
+  RETURN used;
+END $$;
+
+-- (a)
+CREATE TABLE bh1 (id int, v vector(4));
+INSERT INTO bh1 SELECT g, ARRAY[g,0,0,0]::real[]::vector FROM generate_series(1,200) g;
+CREATE INDEX bh1_c ON bh1 USING cagra (v vector_l2_ops);
+CREATE INDEX bh1_h ON bh1 USING pg_cuvs_hnsw (v vector_l2_ops) WITH (source = 'bh1_c');
+TRUNCATE bh1;
+SELECT pg_relation_size('bh1_h') > 0 AS h_rebuilt;
+INSERT INTO bh1 SELECT 1000+g, ARRAY[201-g,0,0,0]::real[]::vector FROM generate_series(1,200) g;
+REINDEX INDEX bh1_c;
+REINDEX INDEX bh1_h;
+DROP INDEX bh1_c;   -- leave only h, so the index path is h's
+SELECT bh_uses('bh1', 'bh1_h') AS h_used, bh_answer('bh1', true) = bh_answer('bh1', false) AS h_like_heap;
+DROP TABLE bh1;
+
+-- (b)
+CREATE TABLE bh2 (id int, v vector(4));
+INSERT INTO bh2 SELECT g, ARRAY[g,0,0,0]::real[]::vector FROM generate_series(1,200) g;
+CREATE INDEX bh2_c ON bh2 USING cagra (v vector_l2_ops);
+BEGIN;
+TRUNCATE bh2;
+INSERT INTO bh2 SELECT 1000+g, ARRAY[201-g,0,0,0]::real[]::vector FROM generate_series(1,200) g;
+REINDEX INDEX bh2_c;
+ROLLBACK;
+CREATE INDEX bh2_h ON bh2 USING pg_cuvs_hnsw (v vector_l2_ops) WITH (source = 'bh2_c');
+DROP INDEX bh2_c;
+SELECT bh_uses('bh2', 'bh2_h') AS h_used, bh_answer('bh2', true) = bh_answer('bh2', false) AS h_like_heap;
+DROP TABLE bh2;
+
+-- (c)
+CREATE TABLE bh3 (id int, v vector(4));
+INSERT INTO bh3 SELECT g, ARRAY[g,0,0,0]::real[]::vector FROM generate_series(1,200) g;
+CREATE INDEX bh3_c ON bh3 USING cagra (v vector_l2_ops);
+CREATE INDEX bh3_h ON bh3 USING pg_cuvs_hnsw (v vector_l2_ops) WITH (source = 'bh3_c');
+DROP INDEX bh3_c;
+CREATE INDEX bh3_c ON bh3 USING cagra (v vector_l2_ops);
+SELECT 'bh3_c'::regclass::oid > 'bh3_h'::regclass::oid AS c_after_h;
+DELETE FROM bh3 WHERE id <= 100;   -- VACUUM FULL moves the remaining rows: their TIDs change
+VACUUM FULL bh3;
+DROP INDEX bh3_c;
+-- the query is far from the first rows: the old build's TIDs of rows 101..200 name positions that now hold nothing or other rows
+SELECT bh_uses('bh3', 'bh3_h') AS h_used, bh_answer('bh3', true, '[150,0,0,0]') = bh_answer('bh3', false, '[150,0,0,0]') AS h_like_heap;
+DROP TABLE bh3;
+
+-- (d)
+CREATE TABLE bh4 (id int, v vector(4));
+INSERT INTO bh4 SELECT g, ARRAY[g,0,0,0]::real[]::vector FROM generate_series(1,200) g;
+CREATE INDEX bh4_c ON bh4 USING cagra (v vector_l2_ops);
+CREATE INDEX bh4_h ON bh4 USING pg_cuvs_hnsw (v vector_l2_ops) WITH (source = 'bh4_c');
+UPDATE bh4 SET v = NULL;
+REINDEX TABLE bh4;
+SELECT count(*) AS indexes_after_reindex FROM pg_index WHERE indrelid = 'bh4'::regclass;
+DROP TABLE bh4;
+
+-- (e)
+CREATE TABLE bh5 (id int, v vector(4));
+INSERT INTO bh5 SELECT g, ARRAY[g,0,0,0]::real[]::vector FROM generate_series(1,200) g;
+CREATE INDEX bh5_c ON bh5 USING cagra (v vector_l2_ops);
+CREATE INDEX bh5_h ON bh5 USING pg_cuvs_hnsw (v vector_l2_ops) WITH (source = 'bh5_c');
+DROP INDEX bh5_c;
+CREATE INDEX bh5_c ON bh5 USING cagra (v vector_l2_ops);
+SELECT 'bh5_c'::regclass::oid > 'bh5_h'::regclass::oid AS c_after_h;
+SELECT bh_answer('bh5', true) IS NOT NULL AS searched_before;   -- plans with c and h: c is judged (and cached) current
+DELETE FROM bh5 WHERE id <= 100;
+VACUUM FULL bh5;
+DROP INDEX bh5_c;
+SELECT bh_uses('bh5', 'bh5_h') AS h_used, bh_answer('bh5', true, '[150,0,0,0]') = bh_answer('bh5', false, '[150,0,0,0]') AS h_like_heap;
+DROP TABLE bh5;
+
+DROP FUNCTION bh_answer(text, boolean, text), bh_uses(text, text);

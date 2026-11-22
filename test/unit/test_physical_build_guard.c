@@ -42,6 +42,8 @@ build_cmd(uint32_t index_oid, uint32_t shard_count)
     cmd.graph_degree = 4;
     cmd.intermediate_graph_degree = 8;
     cmd.shard_count = shard_count;
+    cmd.index_relfilenode = 7000 + index_oid;   /* the build identity a later request must carry */
+    cmd.heap_relfilenode = 16384;               /* and the heap's */
     return cmd;
 }
 
@@ -229,7 +231,7 @@ static void run_compact(void)
     FILE *f=fopen(tomb,"wb");assert(f && fwrite(&h,sizeof(h),1,f)==1 && fwrite(&r,sizeof(r),1,f)==1);fclose(f);
     int sv[2];assert(socketpair(AF_UNIX,SOCK_STREAM,0,sv)==0);
     assert(cuvs_fd_send(sv[0],-1,dir,sizeof(dir))==0);
-    CuvsCmdFrame cmd={.op=CUVS_OP_COMPACT,.db_oid=1,.index_oid=101};
+    CuvsCmdFrame cmd={.op=CUVS_OP_COMPACT,.db_oid=1,.index_oid=101,.index_relfilenode=7000+101,.heap_relfilenode=16384};
     handle_compact(sv[1],&cmd);reply_status(sv[0]);close(sv[0]);close(sv[1]);
     check_refusal();
     assert(e->handle==before && e->tids==before_tids && e->n_vecs==N && !e->compact_count);

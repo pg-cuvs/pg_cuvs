@@ -7,6 +7,16 @@
 -- relationships are unchanged, so search correctness must be identical to
 -- the pre-packing one-pair-per-page layout.
 --
+-- mode='nsw' now builds upper layers (see hnsw_insert_shift.sql), so
+-- about 1/32 of the elements carry a larger neighbor tuple. Pairs are packed
+-- in element order, each taking its own size: level-0 pairs still go k=9 to
+-- a page here, and the page count grows by the room the upper-layer pairs
+-- take. Levels come from the cagra_assign_level() draw seeded by (N, M), made
+-- by the daemon's upper-layer builder (cuvs_hnsw_upper.c) or, when it builds
+-- none, by the backend; elements keep row order. So the page count is a pure
+-- function of N, M and dim whatever the builder's thread timing (measured: 59
+-- pages for N=500 and for N=504, dim 100, M=32; 57 before 0.9.3).
+--
 -- Coverage:
 --   1. index_bytes shrinks below the old one-page-per-element size — direct
 --      evidence packing actually happened, not just that the build succeeded.
@@ -61,9 +71,9 @@ CREATE INDEX hp_hnsw ON hp_test USING pg_cuvs_hnsw
 SET client_min_messages = 'notice';
 -- ── Case 1: index_bytes shrinks below the old 1-pair-per-page size ──
 -- Old layout: 1 (meta) + 500 (one per element) = 501 pages = 4,104,192 bytes.
--- Packed (k=9): 1 + ceil(500/9) = 1 + 56 = 57 pages = 466,944 bytes.
+-- Packed (k=9 for level-0 pairs, upper-layer pairs larger): 59 pages = 483,328 bytes.
 SELECT pg_relation_size('hp_hnsw') < 501 * 8192 AS packed_smaller_than_unpacked,
-       pg_relation_size('hp_hnsw') = 57 * 8192   AS packed_size_matches_k9;
+       pg_relation_size('hp_hnsw') = 59 * 8192   AS packed_size_matches_k9;
  packed_smaller_than_unpacked | packed_size_matches_k9 
 ------------------------------+------------------------
  t                            | t
@@ -142,8 +152,8 @@ SET client_min_messages = 'warning';
 CREATE INDEX hp_hnsw2 ON hp_test2 USING pg_cuvs_hnsw
     (embedding vector_l2_ops) WITH (source = 'hp_cagra2', mode = 'nsw');
 SET client_min_messages = 'notice';
--- 504/9 = 56 exactly: 1 (meta) + 56 pages, no trailing partial/empty page.
-SELECT pg_relation_size('hp_hnsw2') = 57 * 8192 AS exact_multiple_size_matches;
+-- 504/9 = 56 exactly for level-0 pairs only; with the upper layers 1 (meta) + 58 pages.
+SELECT pg_relation_size('hp_hnsw2') = 59 * 8192 AS exact_multiple_size_matches;
  exact_multiple_size_matches 
 -----------------------------
  t

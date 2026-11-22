@@ -1,0 +1,172 @@
+-- build_identity_legacy.sql — a build record of an earlier version.
+--
+-- Up to 0.9.2 cagra and flat builds wrote "<heap relfilenode> <table oid>\n" as <db>_<idx>.relfilenode. Such a record is accepted
+-- when both still match the table (nothing is written: the daemon accepts the build by the same rule, for the heap relfilenode the
+-- request carries); otherwise the index answers from the heap
+-- until REINDEX. Each case makes the state an earlier version could leave, writes the record in the old format (the fixture is the
+-- format itself, written with COPY ... TO PROGRAM and left 0600 as a backend's umask left it), makes the daemon load the build from
+-- disk again (pg_cuvs_unload), and judges it in a new session. In CI the daemon runs as another uid (nobody), so it reads only what
+-- the backend made readable. Old rows: id g, v [g,0,0,0]; new rows in reverse (id 1000+g, v [201-g,0,0,0]); query [1,0,0,0], k 5.
+--
+--   L0 a build of this version, loaded again from disk: the index answers like the heap (the daemon can read the record)
+--   L1 untouched index                         accepted, the index answers like the heap, the record still has two fields
+--                                              (loaded with the earlier record first: the daemon accepts it for its heap)
+--   L2 committed TRUNCATE, old build left      not accepted (the heap has another relfilenode): the heap answers
+--   L3 rolled-back REINDEX of a refilled table not accepted (the record names the rolled-back heap): the heap answers
+--   L4 rolled-back REINDEX of the same rows    accepted; the daemon's build is of the same rows: the index answers like the heap
+--   L5 emptied in place after the build        cannot be told apart: accepted; only whether the index is used is printed. A
+--                                              KNOWN LIMIT, not a wanted behavior: the expected output fixes today's (the old
+--                                              build answers, as in 0.9.2; docs/reference.md)
+\set ON_ERROR_STOP on
+SET client_min_messages = WARNING;
+CREATE EXTENSION IF NOT EXISTS vector;
+CREATE EXTENSION IF NOT EXISTS pg_cuvs;
+SET cuvs.index_dir = '/tmp/cuvs_indexes';
+SET cuvs.k = 8;
+CREATE FUNCTION bl_case(t text) RETURNS TABLE (index_used boolean, like_heap boolean, answer text) LANGUAGE plpgsql AS $$
+DECLARE q text := format('SELECT string_agg(id::text, '','' ORDER BY d, id) FROM (SELECT id, v <-> ''[1,0,0,0]'' d FROM %I ORDER BY v <-> ''[1,0,0,0]'' LIMIT 5) s', t);
+        p text; h text;
+BEGIN
+  index_used := false;
+  SET LOCAL enable_seqscan = off;
+  FOR p IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP IF p LIKE '%Index Scan%' THEN index_used := true; END IF; END LOOP;
+  BEGIN EXECUTE q INTO answer; EXCEPTION WHEN OTHERS THEN answer := 'ERROR ' || SQLSTATE || ': ' || SQLERRM; END;
+  SET LOCAL enable_seqscan = on; SET LOCAL enable_indexscan = off; SET LOCAL enable_bitmapscan = off;
+  EXECUTE q INTO h;
+  like_heap := answer = h;
+  RETURN NEXT;
+END $$;
+CREATE FUNCTION bl_record(i regclass) RETURNS text LANGUAGE sql AS $$
+  SELECT format('%s/%s_%s.relfilenode', current_setting('cuvs.index_dir'), (SELECT oid FROM pg_database WHERE datname = current_database()), i::oid)
+$$;
+-- write the record of index i in the format of 0.9.2: "<heap relfilenode> <table oid>"
+CREATE FUNCTION bl_old_record(i regclass, heap_rfn oid) RETURNS void LANGUAGE plpgsql AS $$
+BEGIN
+  EXECUTE format('COPY (SELECT %s || '' '' || %s) TO PROGRAM %L', heap_rfn, (SELECT indrelid FROM pg_index WHERE indexrelid = i), 'cat > ' || bl_record(i) || ' && chmod 600 ' || bl_record(i));
+END $$;
+CREATE FUNCTION bl_fields(i regclass) RETURNS int LANGUAGE sql AS $$
+  SELECT array_length(regexp_split_to_array(trim(pg_read_file(bl_record(i))), ' '), 1)
+$$;
+CREATE FUNCTION bl_fill(t text, new boolean) RETURNS void LANGUAGE plpgsql AS $$
+BEGIN
+  IF new THEN EXECUTE format('INSERT INTO %I SELECT 1000+g, ARRAY[201-g,0,0,0]::real[]::vector FROM generate_series(1,200) g', t);
+  ELSE EXECUTE format('INSERT INTO %I SELECT g, ARRAY[g,0,0,0]::real[]::vector FROM generate_series(1,200) g', t); END IF;
+END $$;
+CREATE TABLE bl_sink (x text);
+
+-- L0
+CREATE TABLE bl0 (id int, v vector(4));
+SELECT bl_fill('bl0', false);
+CREATE INDEX bl0_i ON bl0 USING cagra (v vector_l2_ops);
+SELECT pg_cuvs_unload('bl0_i') IS NOT NULL AS unloaded;
+\c
+SET client_min_messages = WARNING;
+SET cuvs.index_dir = '/tmp/cuvs_indexes';
+SET cuvs.k = 8;
+SELECT * FROM bl_case('bl0');
+DROP TABLE bl0;
+
+-- L1
+CREATE TABLE bl1 (id int, v vector(4));
+SELECT bl_fill('bl1', false);
+CREATE INDEX bl1_i ON bl1 USING cagra (v vector_l2_ops);
+SELECT bl_old_record('bl1_i', (SELECT relfilenode FROM pg_class WHERE relname = 'bl1'));
+SELECT bl_fields('bl1_i') AS fields_before;
+SELECT pg_cuvs_unload('bl1_i') IS NOT NULL AS unloaded;
+-- load it again with the earlier record, as a daemon of this version does at its start: the entry has no identity until a backend
+-- has completed the record
+SELECT pg_cuvs_load('bl1_i') IS NOT NULL AS loaded;
+\c
+SET client_min_messages = WARNING;
+SET cuvs.index_dir = '/tmp/cuvs_indexes';
+SET cuvs.k = 8;
+SELECT * FROM bl_case('bl1');
+SELECT bl_fields('bl1_i') AS fields_after;
+SELECT current, reason FROM pg_cuvs_build_identity_status() WHERE index = 'bl1_i'::regclass;
+DROP TABLE bl1;
+
+-- L2: the files of the build before a committed TRUNCATE are put back, as 0.9.2 left them
+CREATE TABLE bl2 (id int, v vector(4));
+SELECT bl_fill('bl2', false);
+CREATE INDEX bl2_i ON bl2 USING cagra (v vector_l2_ops);
+SELECT relfilenode AS bl2_heap FROM pg_class WHERE relname = 'bl2' \gset
+SELECT pg_cuvs_unload('bl2_i') IS NOT NULL AS saved;   -- the daemon writes the build's files when it unloads it
+SELECT format('mkdir -p /tmp/bl2 && cp %s/%s_%s.* /tmp/bl2/', current_setting('cuvs.index_dir'), (SELECT oid FROM pg_database WHERE datname = current_database()), 'bl2_i'::regclass::oid) AS save \gset
+COPY bl_sink FROM PROGRAM :'save';
+TRUNCATE bl2;
+COPY bl_sink FROM PROGRAM 'ls /tmp/bl2 | sed "s/^[0-9]*_[0-9]*//" | sort';
+SELECT string_agg(x, ' ') AS saved_files FROM bl_sink; TRUNCATE bl_sink;
+-- put back as the daemon left them: readable by the daemon, which may run as another uid
+COPY bl_sink FROM PROGRAM 'for f in /tmp/bl2/*; do cp $f /tmp/cuvs_indexes/ && chmod 644 /tmp/cuvs_indexes/$(basename $f); done; rm -rf /tmp/bl2';
+SELECT bl_old_record('bl2_i', :bl2_heap);
+SELECT bl_fill('bl2', true);
+\c
+SET client_min_messages = WARNING;
+SET cuvs.index_dir = '/tmp/cuvs_indexes';
+SET cuvs.k = 8;
+SELECT * FROM bl_case('bl2');
+SELECT current, reason FROM pg_cuvs_build_identity_status() WHERE index = 'bl2_i'::regclass;
+DROP TABLE bl2;
+
+-- L3
+CREATE TABLE bl3 (id int, v vector(4));
+SELECT bl_fill('bl3', false);
+CREATE INDEX bl3_i ON bl3 USING cagra (v vector_l2_ops);
+BEGIN;
+TRUNCATE bl3;
+SELECT bl_fill('bl3', true);
+REINDEX INDEX bl3_i;
+ROLLBACK;
+-- the record the rolled-back REINDEX wrote names the rolled-back heap; keep that heap relfilenode, in the old format
+SELECT bl_old_record('bl3_i', split_part(trim(pg_read_file(bl_record('bl3_i'))), ' ', 1)::oid);
+SELECT pg_cuvs_unload('bl3_i') IS NOT NULL AS unloaded;
+\c
+SET client_min_messages = WARNING;
+SET cuvs.index_dir = '/tmp/cuvs_indexes';
+SET cuvs.k = 8;
+SELECT * FROM bl_case('bl3');
+SELECT current, reason FROM pg_cuvs_build_identity_status() WHERE index = 'bl3_i'::regclass;
+DROP TABLE bl3;
+
+-- L4
+CREATE TABLE bl4 (id int, v vector(4));
+SELECT bl_fill('bl4', false);
+CREATE INDEX bl4_i ON bl4 USING cagra (v vector_l2_ops);
+BEGIN;
+REINDEX INDEX bl4_i;
+ROLLBACK;
+SELECT bl_old_record('bl4_i', (SELECT relfilenode FROM pg_class WHERE relname = 'bl4'));
+SELECT pg_cuvs_unload('bl4_i') IS NOT NULL AS unloaded;
+\c
+SET client_min_messages = WARNING;
+SET cuvs.index_dir = '/tmp/cuvs_indexes';
+SET cuvs.k = 8;
+SELECT * FROM bl_case('bl4');
+SELECT current, reason FROM pg_cuvs_build_identity_status() WHERE index = 'bl4_i'::regclass;
+DROP TABLE bl4;
+
+-- L5 (known limit, recorded only): the table was created and emptied in place in one transaction after the build; 0.9.2 left the build
+BEGIN;
+CREATE TABLE bl5 (id int, v vector(4));
+SELECT bl_fill('bl5', false);
+CREATE INDEX bl5_i ON bl5 USING cagra (v vector_l2_ops);
+SELECT pg_cuvs_unload('bl5_i') IS NOT NULL AS saved;   -- the daemon writes the build's files when it unloads it
+SELECT format('mkdir -p /tmp/bl5 && cp %s/%s_%s.* /tmp/bl5/', current_setting('cuvs.index_dir'), (SELECT oid FROM pg_database WHERE datname = current_database()), 'bl5_i'::regclass::oid) AS save \gset
+COPY bl_sink FROM PROGRAM :'save';
+TRUNCATE bl5;
+COMMIT;
+COPY bl_sink FROM PROGRAM 'ls /tmp/bl5 | sed "s/^[0-9]*_[0-9]*//" | sort';
+SELECT string_agg(x, ' ') AS saved_files FROM bl_sink; TRUNCATE bl_sink;
+-- put back as the daemon left them: readable by the daemon, which may run as another uid
+COPY bl_sink FROM PROGRAM 'for f in /tmp/bl5/*; do cp $f /tmp/cuvs_indexes/ && chmod 644 /tmp/cuvs_indexes/$(basename $f); done; rm -rf /tmp/bl5';
+SELECT bl_old_record('bl5_i', (SELECT relfilenode FROM pg_class WHERE relname = 'bl5'));
+SELECT bl_fill('bl5', true);
+\c
+SET client_min_messages = WARNING;
+SET cuvs.index_dir = '/tmp/cuvs_indexes';
+SET cuvs.k = 8;
+SELECT index_used FROM bl_case('bl5');
+DROP TABLE bl5;
+
+DROP TABLE bl_sink;
+DROP FUNCTION bl_case(text), bl_record(regclass), bl_old_record(regclass, oid), bl_fields(regclass), bl_fill(text, boolean);

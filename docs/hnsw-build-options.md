@@ -76,7 +76,7 @@ NN tail에는 상위 계층 precision 계약 세대가 없으므로, hierarchy�
 같은 데이터·같은 ef와 같은 질의 비용에서 각각 비교한다. self 도달성 진단과는 별개다.
 같은 f32 벡터의 다른 ID는 동점 정답이다. 작은 생성 시험은 이 품질 기준의 통과 증거가 아니다.
 
-extension과 daemon은 HNSW op23 payload v6를 함께 배포해야 한다(v4는 응답 뒤에 결정 바이트 6개, 즉 status-13 DETAIL의 원값을 덧붙이고, v5는 그 뒤에 ACE partition builder readback 32바이트를 덧붙이며, v6는 그 뒤에 resident NN readback을 덧붙인다). 현재 글로벌 명령·응답 프로토콜은 `CUVS_PROTO_VERSION=5`이며 HNSW op23의 별도 payload 버전 6과 구분한다.
+extension과 daemon은 HNSW op23 payload v6를 함께 배포해야 한다(v4는 응답 뒤에 결정 바이트 6개, 즉 status-13 DETAIL의 원값을 덧붙이고, v5는 그 뒤에 ACE partition builder readback 32바이트를 덧붙이며, v6는 그 뒤에 resident NN readback을 덧붙인다). 현재 글로벌 명령·응답 프로토콜은 `CUVS_PROTO_VERSION=6`이며 HNSW op23의 별도 payload 버전 6과 구분한다.
 이전 payload v1/v2/v3/v4/v5 요청은 prefix의 버전을 먼저 검사해 나머지 필드를 기다리지 않고 거부한다.
 기존 0.8.1 단독 reader는 새 policy v2를 읽을 수 없다. 0.8.2 도입 당시에는 확장과 데몬 바이너리를 함께 배포하고 0.8.2로 업그레이드해야 했다. 현재 배포 대상 버전은 0.9.3이며, 0.8.1에서 출발한다면 `sql/pg_cuvs--0.8.1--0.8.2.sql`, `sql/pg_cuvs--0.8.2--0.9.0.sql`, `sql/pg_cuvs--0.9.0--0.9.1.sql`, `sql/pg_cuvs--0.9.1--0.9.2.sql`, `sql/pg_cuvs--0.9.2--0.9.3.sql`의 업그레이드 경로를 따른다. upgrade SQL은 영수증을 이주/덮어쓰기하지 않는다. v2가 있는 인덱스를 예전 reader로 downgrade하는 것은 지원하지 않는다. 비트 0x40이 있는 인덱스를 이 비트를 모르는 예전 reader의 `pg_cuvs_hnsw_build_info()`로 읽으면 `invalid stored HNSW policy receipt` 오류로 거부된다(실효값이 보증된 것으로 잘못 읽지 않는다).
 

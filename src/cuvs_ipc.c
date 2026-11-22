@@ -69,6 +69,16 @@ cuvs_ipc_set_cagra_search_params(uint32_t itopk_size, uint32_t search_width)
     g_cagra_search_width = search_width;
 }
 
+/* see send_cmd. */
+static uint32_t g_identity_oid, g_identity_rfn, g_identity_heap;
+void
+cuvs_ipc_set_index_identity(uint32_t index_oid, uint32_t index_relfilenode, uint32_t heap_relfilenode)
+{
+    g_identity_oid = index_oid;
+    g_identity_rfn = index_relfilenode;
+    g_identity_heap = heap_relfilenode;
+}
+
 void
 cuvs_ipc_set_daemon_uid(int uid)
 {
@@ -91,7 +101,7 @@ cuvs_ipc_set_daemon_uid(int uid)
 static void forget_reply(void);
 
 static int
-uds_connect_wait(const char *socket_path, int recv_timeout_sec, int *canceled)
+uds_connect_wait_impl(const char *socket_path, int recv_timeout_sec, int *canceled)
 {
     int fd;
 
@@ -308,6 +318,21 @@ uds_connect_wait(const char *socket_path, int recv_timeout_sec, int *canceled)
     return fd;
 }
 
+/* an IPC that returns before send_cmd (no daemon) would leave the identity set for a later frame of the same
+ * index; a failed connect drops it. */
+static int
+uds_connect_wait(const char *socket_path, int recv_timeout_sec, int *canceled)
+{
+    int fd = uds_connect_wait_impl(socket_path, recv_timeout_sec, canceled);
+    if (fd < 0)
+    {
+        g_identity_oid = 0;
+        g_identity_rfn = 0;
+        g_identity_heap = 0;
+    }
+    return fd;
+}
+
 static int
 uds_connect_ex(const char *socket_path, int recv_timeout_sec)
 {
@@ -408,6 +433,12 @@ send_cmd(int fd, CuvsCmdFrame *cmd)
 {
     cmd->proto_magic = CUVS_PROTO_MAGIC;
     cmd->proto_version = CUVS_PROTO_VERSION;
+    /* the identity set for this index goes with this one frame only, so a path that does not set it sends 0 and is refused. */
+    cmd->index_relfilenode = (g_identity_oid != 0 && cmd->index_oid == g_identity_oid) ? g_identity_rfn : 0;
+    cmd->heap_relfilenode = (g_identity_oid != 0 && cmd->index_oid == g_identity_oid) ? g_identity_heap : 0;
+    g_identity_oid = 0;
+    g_identity_rfn = 0;
+    g_identity_heap = 0;
     if (cmd->op == CUVS_OP_SEARCH || cmd->op == CUVS_OP_SEARCH_BATCH)
     {
         cmd->itopk_size = g_cagra_itopk_size;
@@ -1761,6 +1792,95 @@ cuvs_ipc_export_hnsw_shm(
 
 cleanup:
     if (pass_fd >= 0) close(pass_fd);
+    if (sock >= 0)    close(sock);
+    return rc;
+}
+
+/* ----------------------------------------------------------------
+ * CUVS_OP_EXPORT_HNSW_UPPER — the hnswlib file and the TID file of a
+ * loaded CAGRA index, each as a daemon-owned memfd (see cuvs_ipc.h).
+ * ---------------------------------------------------------------- */
+int
+cuvs_ipc_export_hnsw_upper(
+    const char  *socket_path,
+    uint32_t     db_oid,
+    uint32_t     index_oid,
+    int         *hnsw_fd_out,
+    int         *tids_fd_out,
+    size_t      *n_vecs_out,
+    int         *degree_out,
+    int         *dim_out)
+{
+    int  sock = -1, hnsw_fd = -1, tids_fd = -1;
+    int  rc = CUVS_STATUS_ERROR;
+    char token;
+
+    *hnsw_fd_out = *tids_fd_out = -1;
+    sock = uds_connect_ex(socket_path, 120);
+    if (sock < 0)
+        return CUVS_STATUS_UNAVAILABLE;
+
+    CuvsCmdFrame cmd = {
+        .op        = CUVS_OP_EXPORT_HNSW_UPPER,
+        .db_oid    = db_oid,
+        .index_oid = index_oid,
+    };
+    if (send_cmd(sock, &cmd) < 0)
+        goto cleanup;
+
+    /* The daemon replies only after building the upper layers, which grows
+     * with the index and may take longer than any fixed receive timeout. Wait
+     * for the reply without one, in 250 ms slices that ask the wait callback
+     * (query cancel, statement_timeout): on a cancel the socket is closed,
+     * which the daemon takes as the signal to stop building. A daemon that
+     * exits closes the socket as well and ends the wait. */
+    for (;;)
+    {
+        struct pollfd pfd = { .fd = sock, .events = POLLIN, .revents = 0 };
+        int pr = poll(&pfd, 1, 250);
+
+        if (pr > 0)
+            break;
+        if (pr < 0 && errno != EINTR)
+            goto cleanup;
+        if (g_wait_cb && g_wait_cb())
+        {
+            rc = CUVS_STATUS_CANCELED;
+            goto cleanup;
+        }
+    }
+
+    CuvsReplyHeader hdr;
+    if (cuvs_fd_recv(sock, &hdr, sizeof(hdr), &hnsw_fd) < 0)
+        goto cleanup;
+    if (hdr.status != CUVS_STATUS_OK) {
+        rc = (int)hdr.status;
+        goto cleanup;
+    }
+    if (hnsw_fd < 0 || cuvs_fd_recv(sock, &token, 1, &tids_fd) < 0 || tids_fd < 0) {
+        LOG_ERROR("[export_hnsw_upper] reply without its two SCM_RIGHTS fds\n");
+        goto cleanup;
+    }
+    if (!shm_check_daemon_owner(sock, hnsw_fd) || !shm_check_daemon_owner(sock, tids_fd)) {
+        LOG_ERROR("[export_hnsw_upper] owner mismatch on a passed fd\n");
+        goto cleanup;
+    }
+    if (hdr.n_results == 0 || hdr.latency_us == 0 || hdr.delta_merged == 0) {
+        LOG_ERROR("[export_hnsw_upper] bad reply n=%u degree=%u dim=%u\n",
+                  hdr.n_results, hdr.latency_us, hdr.delta_merged);
+        goto cleanup;
+    }
+    *n_vecs_out  = (size_t)hdr.n_results;
+    *degree_out  = (int)hdr.latency_us;
+    *dim_out     = (int)hdr.delta_merged;
+    *hnsw_fd_out = hnsw_fd;
+    *tids_fd_out = tids_fd;
+    hnsw_fd = tids_fd = -1;        /* ownership transferred to the caller */
+    rc = CUVS_STATUS_OK;
+
+cleanup:
+    if (hnsw_fd >= 0) close(hnsw_fd);
+    if (tids_fd >= 0) close(tids_fd);
     if (sock >= 0)    close(sock);
     return rc;
 }

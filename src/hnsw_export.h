@@ -20,7 +20,8 @@
  * Creates the HNSW index internally via INDEX_CREATE_SKIP_BUILD.
  *
  * Recommended modes:
- *   'nsw'     — flat NSW, 117s, 2.4x vs native. Default.
+ *   'nsw'     — level 0 from the CAGRA graph, upper layers built by the daemon
+ *               (the same as 'hnsw'). Default. (117s / 2.4x were the old level-0-only path.)
  *   'hnswlib' — from_cagra() hierarchy via /dev/shm, 139s, 2.0x.
  *
  * Hidden modes (research only):

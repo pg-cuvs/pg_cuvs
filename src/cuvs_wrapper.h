@@ -434,6 +434,7 @@ void          cuvs_hnsw_free(CuvsHnswIndex hidx);
  * vecs_out      : [n_vecs * dim] float32 corpus vectors
  * n_vecs_out    : number of vectors
  * graph_degree_out : adjacency list width (CAGRA build parameter)
+ * dim_out       : width of each row of vecs_out (the index's dataset)
  *
  * Returns 0 on success, -1 on failure (logs to stderr).
  */
@@ -443,6 +444,7 @@ int cuvs_cagra_extract_adjacency(
     float         **vecs_out,
     size_t         *n_vecs_out,
     int            *graph_degree_out,
+    int            *dim_out,
     int             device_id
 );
 

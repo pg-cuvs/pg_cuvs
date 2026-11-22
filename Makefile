@@ -40,15 +40,15 @@ DATA           = sql/pg_cuvs--0.1.0.sql \
                  sql/pg_cuvs--0.9.2--0.9.3.sql \
                  sql/pg_cuvs--0.9.3.sql
 MODULE_big     = pg_cuvs
-REGRESS        = smoke upgrade_path cpu_fallback edge_cases cpu_hnsw_fallback build_hnsw build_hnsw_edge build_hnsw_halfvec build_hnsw_packing pg_cuvs_hnsw metrics brute_force pg_cuvs_batch reloption_dir gc_orphans release_hardening pending_delta delta_recall build_params drop_subxact partition_prune filter_comparison prefilter_short_fill_guard ivfpq_smoke cagra_streaming cagra_dynbatch cagra_search_params auto_compact extend_vram_fallback stream_bf_recall fallback_stat vram_accounting build_lock flat_smoke transient_bf hw_profile routing_golden routing_golden_measured multi_vector daemon_uid_owner unordered_scan null_query_vector rmm_pool admission_reject
+REGRESS        = smoke upgrade_path cpu_fallback edge_cases cpu_hnsw_fallback build_hnsw build_hnsw_edge build_hnsw_halfvec build_hnsw_packing hnsw_insert_shift hnsw_layer_status pg_cuvs_hnsw metrics brute_force pg_cuvs_batch reloption_dir gc_orphans release_hardening pending_delta delta_recall build_params drop_subxact partition_prune filter_comparison prefilter_short_fill_guard ivfpq_smoke empty_build_stale build_identity build_identity_legacy build_identity_hnsw cagra_streaming cagra_dynbatch cagra_search_params auto_compact extend_vram_fallback stream_bf_recall fallback_stat vram_accounting build_lock flat_smoke transient_bf hw_profile routing_golden routing_golden_measured multi_vector daemon_uid_owner unordered_scan null_query_vector rmm_pool admission_reject
 REGRESS_OPTS   = --inputdir=test --outputdir=test
 
 # Tier-1 CI (CPU-reference shim, PGCUVS_CPU_SHIM=1) runs a SUBSET of REGRESS.
 # Excluded = tests the shim cannot/should not reproduce on CPU:
 #   build_hnsw/build_hnsw_edge/pg_cuvs_hnsw/build_hnsw_halfvec/
-#     build_hnsw_packing — CAGRA->pgvector HNSW *graph export* (real graph
+#     build_hnsw_packing/hnsw_insert_shift — CAGRA->pgvector HNSW *graph export* (real graph
 #     structure; a Tier-2 / real-GPU concern).
-REGRESS_TIER2_ONLY = build_hnsw build_hnsw_edge build_hnsw_halfvec build_hnsw_packing pg_cuvs_hnsw routing_golden_measured
+REGRESS_TIER2_ONLY = build_hnsw build_hnsw_edge build_hnsw_halfvec build_hnsw_packing hnsw_insert_shift pg_cuvs_hnsw routing_golden_measured build_identity_hnsw
 REGRESS_TIER1      = $(filter-out $(REGRESS_TIER2_ONLY),$(REGRESS))
 
 # #124: build_oom, build_multi_oom, build_oom_evict_to_fit, and extend_cuda_oom
@@ -72,7 +72,7 @@ REGRESS_FAULT  = build_oom build_multi_oom build_oom_evict_to_fit extend_cuda_oo
 # pg_regress cannot express: snapshot-aware tombstone filtering and write/query
 # interleaving. Specs live in test/specs/*.spec, expected in test/expected/*.out.
 # The daemon + GPU must be up, same as REGRESS.
-ISOLATION      = delta_tombstone_snapshot delta_interleaving reindex_concurrent_delete flat_tombstone_snapshot flat_delta_interleaving flat_reindex_concurrent_delete
+ISOLATION      = build_identity_cross delta_tombstone_snapshot delta_interleaving reindex_concurrent_delete flat_tombstone_snapshot flat_delta_interleaving flat_reindex_concurrent_delete
 ISOLATION_OPTS = --inputdir=test --outputdir=test
 
 # C source files + the CUDA-compiled wrapper (built below by nvcc).
@@ -143,6 +143,8 @@ CUVS_LOGGER_LINK = -lrapids_logger
 endif
 
 PG_CPPFLAGS    = -I$(CUVS_INCLUDE) -I$(CUVS_RAPIDS_INCLUDE) -I./src
+# A statement added before the body of an unbraced if silently moves out of it; -Wall warns, this fails.
+PG_CFLAGS     += -Werror=misleading-indentation
 # -Wl,-rpath embeds the cuVS lib path so postmaster finds libcuvs.so
 # without LD_LIBRARY_PATH being set (ADR-007).
 SHLIB_LINK     = $(CUVS_SO_LINK) $(CUVS_LOGGER_LINK) $(CUVS_SDK_PLAN_LINK) \
@@ -190,7 +192,7 @@ SERVER_OBJS    = src/pg_cuvs_server.o src/cuvs_ipc.o src/cuvs_util.o
 SERVER_BIN     = pg_cuvs_server
 
 CC             ?= gcc
-SERVER_CFLAGS  = -O2 -g -Wall -Wextra -I./src \
+SERVER_CFLAGS  = -O2 -g -Wall -Wextra -Werror=misleading-indentation -I./src \
                  -I$(CUVS_INCLUDE) -I$(CUVS_RAPIDS_INCLUDE) -std=gnu11 \
                  -D_POSIX_C_SOURCE=200809L
 # Optional sanitizer/debug hooks for the daemon (e.g. CI ASAN job passes
@@ -251,12 +253,16 @@ src/cuvs_cache_policy_server.o: src/cuvs_cache_policy.c src/cuvs_cache_policy.h 
 src/cuvs_build_corpus_server.o: src/cuvs_build_corpus.c src/cuvs_build_corpus.h
 	$(CC) $(SERVER_CFLAGS) -c $< -o $@
 
+# host-built HNSW upper layers for CUVS_OP_EXPORT_HNSW_UPPER (plain C, both daemon builds)
+src/cuvs_hnsw_upper_server.o: src/cuvs_hnsw_upper.c src/cuvs_hnsw_upper.h
+	$(CC) $(SERVER_CFLAGS) -c $< -o $@
+
 # CI Tier 1: pure-C CPU shim object (no CUDA). Shared by the .so and the daemon
 # (same object both link cuvs_wrapper.o today). Built with gcc, -fPIC for the .so.
 src/cuvs_wrapper_shim_cpu.o: src/cuvs_wrapper_shim_cpu.c src/cuvs_wrapper.h src/cuvs_ipc.h
 	$(CC) -O2 -g -fPIC -I./src -std=gnu11 -c $< -o $@
 
-$(SERVER_BIN): src/pg_cuvs_server.o src/cuvs_ipc_server.o src/cuvs_util_server.o src/cuvs_objstore_server.o src/cuvs_build_corpus_server.o src/cuvs_cache_policy_server.o src/cuvs_peak_meter_server.o $(WRAPPER_OBJ)
+$(SERVER_BIN): src/pg_cuvs_server.o src/cuvs_ipc_server.o src/cuvs_util_server.o src/cuvs_objstore_server.o src/cuvs_build_corpus_server.o src/cuvs_cache_policy_server.o src/cuvs_peak_meter_server.o src/cuvs_hnsw_upper_server.o $(WRAPPER_OBJ)
 	$(CXX) -o $@ $^ $(SERVER_LDFLAGS)
 
 server: $(SERVER_BIN)
@@ -295,7 +301,10 @@ src/cuvs_cache_policy_server_test.o: src/cuvs_cache_policy.c src/cuvs_cache_poli
 src/cuvs_peak_meter_server_test.o: src/cuvs_peak_meter.c src/cuvs_peak_meter.h
 	$(CC) $(SERVER_TEST_CFLAGS) -c $< -o $@
 
-$(SERVER_TEST_BIN): src/pg_cuvs_server_test.o src/cuvs_ipc_server_test.o src/cuvs_util_server_test.o src/cuvs_objstore_server_test.o src/cuvs_build_corpus_server_test.o src/cuvs_cache_policy_server_test.o src/cuvs_peak_meter_server_test.o $(WRAPPER_OBJ)
+src/cuvs_hnsw_upper_server_test.o: src/cuvs_hnsw_upper.c src/cuvs_hnsw_upper.h
+	$(CC) $(SERVER_TEST_CFLAGS) -c $< -o $@
+
+$(SERVER_TEST_BIN): src/pg_cuvs_server_test.o src/cuvs_ipc_server_test.o src/cuvs_util_server_test.o src/cuvs_objstore_server_test.o src/cuvs_build_corpus_server_test.o src/cuvs_cache_policy_server_test.o src/cuvs_peak_meter_server_test.o src/cuvs_hnsw_upper_server_test.o $(WRAPPER_OBJ)
 	$(CXX) -o $@ $^ $(SERVER_LDFLAGS)
 
 server-test: $(SERVER_TEST_BIN)
@@ -1207,6 +1216,35 @@ EXTRA_CLEAN += test-physical-build-guard
 .PHONY: test-physical-build-guard test-physical-build-mutations
 ifeq ($(shell uname -s),Linux)
 test-unit: test-physical-build-guard
+
+# the host upper-layer builder: levels and file size fixed by the input whatever the thread count,
+# every element above level 0 linked on level 1, level 0 without self links or duplicates, the cancel stop.
+test-hnsw-upper: test/unit/test_hnsw_upper.c src/cuvs_hnsw_upper.c src/cuvs_hnsw_upper.h
+	$(CC) -std=gnu11 -O2 -Wall -Wextra -I src -o $@ test/unit/test_hnsw_upper.c src/cuvs_hnsw_upper.c -lm -pthread
+	./$@
+
+test-unit: test-hnsw-upper
+EXTRA_CLEAN += test-hnsw-upper
+.PHONY: test-hnsw-upper
+
+test-unit: test-build-identity-daemon
+# the restart cases (an UNLOGGED index after a crash restart, an in-place TRUNCATE committed with COMMIT PREPARED) restart a
+# disposable cluster: BI_PGDATA, BI_SOCK and BI_IDX name it, its daemon socket and its index_dir. Not part of installcheck.
+.PHONY: test-build-identity-restart test-build-identity-mutations
+test-build-identity-restart:
+	python3 -I test/build_identity_unlogged_restart.py $(BI_PGDATA) $(BI_SOCK) $(BI_IDX)
+	python3 -I test/build_identity_prepared.py $(BI_PGDATA) $(BI_SOCK) $(BI_IDX)
+# Builds each mutant with the CPU shim and runs build_identity, build_identity_cross and test-build-identity-daemon (as root in the
+# CPU CI container, with no cluster running).
+test-build-identity-mutations:
+	python3 -I test/build_identity_mutations.py
+test-build-identity-daemon:
+	$(CC) -std=gnu11 -O1 -DPGCUVS_CPU_SHIM -ffunction-sections -fdata-sections -I src \
+		test/unit/test_build_identity_daemon.c src/cuvs_ipc.c src/cuvs_util.c \
+		src/cuvs_objstore.c src/cuvs_build_corpus.c src/cuvs_wrapper_shim_cpu.c \
+		src/cuvs_cache_policy.c src/cuvs_peak_meter.c src/cuvs_hnsw_upper.c \
+		-Wl,--gc-sections -lm -lpthread -lrt -lcurl -lssl -lcrypto -o $@
+	./$@
 test-admission-contract-mutations: test-physical-build-mutations
 endif
 test-physical-build-guard:

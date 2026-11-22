@@ -39,7 +39,8 @@
  *   make install && make install-server
  * ---------------------------------------------------------------- */
 #define CUVS_PROTO_MAGIC   0x50435556u  /* 'VUCP' LE — "PG CUVS" tag */
-#define CUVS_PROTO_VERSION 5u   /* 5: I3 set (ADR-081, ADR-086): CuvsReplyHeader
+#define CUVS_PROTO_VERSION 6u   /* 6: + index_relfilenode and heap_relfilenode (the build identity), CUVS_STATUS_NOT_CURRENT.
+                                 * 5: I3 set (ADR-081, ADR-086): CuvsReplyHeader
                                  * + err_out (admission payload) + notice_out.
                                  * 4: + CAGRA itopk_size / search_width.
                                  * 3: daemon replies for EXPORT_ADJACENCY /
@@ -187,6 +188,11 @@ int cuvs_ipc_build_hnsw_file_idle(const char *socket_path, int vectors_fd,
 #define CUVS_STATUS_CANCELED      11   /* 3S: backend aborted the wait (statement_timeout / query cancel) */
 #define CUVS_STATUS_PROTO_MISMATCH 12  /* #77: daemon/extension wire-protocol skew (co-deploy both) */
 #define CUVS_STATUS_HNSW_RESIDENT_BUDGET_EXCEEDED 13 /* AUTO/explicit IVF estimate only; not tiny/ACE/OOM */
+#define CUVS_STATUS_NOT_CURRENT    14  /* the build is not the one for the index the request names (its
+                                     * relfilenode, or for an export the table's); not the writes-since-build STALE */
+#define CUVS_STATUS_HNSW_UPPER_SKIPPED 16 /* EXPORT_HNSW_UPPER built no upper layers (the
+                                           * graph degree is below 4, so M < 2); the backend
+                                           * keeps its own level assignment */
 
 /* ----------------------------------------------------------------
  * Command frame (sent over UDS, fixed size)
@@ -242,6 +248,15 @@ typedef struct CuvsCmdFrame {
     uint32_t cagra_batch_wait_us; /* SEARCH: daemon CAGRA micro-batch window (0=off) */
     uint32_t itopk_size;    /* SEARCH/SEARCH_BATCH: CAGRA buffer floor; 0=legacy auto */
     uint32_t search_width;  /* SEARCH/SEARCH_BATCH: CAGRA width; 0=SDK default */
+    /* 6: the index relfilenode the backend's catalog has now. BUILD*: the build is for it; SEARCH*, EXTEND, COMPACT: the
+     * daemon answers only if its build was made for the same value (0 never matches). Stamped by send_cmd from
+     * cuvs_ipc_set_index_identity, for the one next frame of that index. */
+    uint32_t index_relfilenode;
+    /* 6: the heap relfilenode of the index's table now. BUILD*: the build is of that heap; requests: a build made
+     * for another heap (the table rewritten by VACUUM FULL, CLUSTER, ALTER TABLE) does not answer, and a build loaded with a record of
+     * an earlier version (heap relfilenode and table oid only) answers only a request for the same heap. Stamped with
+     * index_relfilenode. */
+    uint32_t heap_relfilenode;
     /* shm_key reused: EXTEND payload = [float32 vecs: n_vecs×dim][uint64_t tids: n_vecs]
      * COMPACT has no extra payload — daemon reads .tombstone directly. */
 } CuvsCmdFrame;
@@ -500,6 +515,8 @@ void cuvs_ipc_set_wait_callback(int (*cb)(void));
  * SO_PEERCRED alone can't catch this, since it only verifies the peer after
  * a connection is already made to whoever holds the path). -1 (default) =
  * no check. Set from cuvs.daemon_uid via _PG_init. */
+/* the index relfilenode the next request for index_oid carries (one frame). */
+void cuvs_ipc_set_index_identity(uint32_t index_oid, uint32_t index_relfilenode, uint32_t heap_relfilenode);
 void cuvs_ipc_set_daemon_uid(int uid);
 
 /* Backend-local GUC assign hooks update these values. send_cmd stamps them on
@@ -879,6 +896,19 @@ int cuvs_ipc_export_adjacency(
     uint32_t    *metric_out      /* CUVS_METRIC_* of the source CAGRA index */
 );
 
+/* CUVS_OP_EXPORT_HNSW_UPPER. On CUVS_STATUS_OK the caller owns and
+ * closes *hnsw_fd_out and *tids_fd_out; on any other status both are -1. */
+int cuvs_ipc_export_hnsw_upper(
+    const char  *socket_path,
+    uint32_t     db_oid,
+    uint32_t     index_oid,
+    int         *hnsw_fd_out,
+    int         *tids_fd_out,
+    size_t      *n_vecs_out,
+    int         *degree_out,
+    int         *dim_out
+);
+
 /*
  * cuvs_ipc_stats — fetch per-index search statistics (CUVS_OP_STATUS).
  *
@@ -1088,6 +1118,20 @@ int cuvs_ipc_inject_build_oom(
 #define CUVS_OP_MEMORY_STATUS   35
 #define CUVS_OP_RECLAIM_SET     36
 #define CUVS_OP_RECLAIM_STATUS  37
+
+/* a loaded CAGRA index as an hnswlib file with upper layers. The daemon
+ * copies the graph, vectors and TIDs under the registry lock exactly as
+ * CUVS_OP_EXPORT_ADJACENCY does, releases it, and builds the upper layers on
+ * the host over those copies (cuvs_hnsw_upper.c; one such build at a time,
+ * stopped when the client goes); level 0 is the CAGRA graph cut to
+ * min(graph_degree, 64) rounded down to even, without self links or duplicates.
+ * The client waits for the reply without a receive timeout, asking its wait
+ * callback, and closes the socket on a cancel. Reply: the header with
+ * n_results = rows, latency_us = level-0 degree, delta_merged = dim and the
+ * hnswlib file as an SCM_RIGHTS memfd, then one byte with a second memfd
+ * holding a CuvsTidsHeader (its metric is the source metric) and the TIDs in
+ * hnswlib label order. CUVS_STATUS_HNSW_UPPER_SKIPPED carries no fd. */
+#define CUVS_OP_EXPORT_HNSW_UPPER 38
 
 #define CUVS_IPC_TEXT_MAX (8u * 1024u * 1024u)
 

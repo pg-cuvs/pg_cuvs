@@ -142,7 +142,7 @@ IPC_MUTATIONS = {
         '    int rc = recv_all(fd, hdr, sizeof(*hdr));\n    if (rc == 0)\n        remember_reply(hdr);\n',
         '    int rc = recv_all(fd, hdr, sizeof(*hdr));\n'),
     'wire_version_not_bumped': ('cuvs_ipc.h',
-        '#define CUVS_PROTO_VERSION 5u', '#define CUVS_PROTO_VERSION 4u'),
+        '#define CUVS_PROTO_VERSION 6u', '#define CUVS_PROTO_VERSION 5u'),
 }
 SAN = ['-fsanitize=address,undefined', '-fno-sanitize-recover=undefined']
 SOURCES = ['cuvs_util.c', 'cuvs_ipc.c', 'cuvs_ipc.h', 'cuvs_build_corpus.c']

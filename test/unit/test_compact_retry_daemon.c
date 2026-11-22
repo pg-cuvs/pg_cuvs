@@ -41,7 +41,8 @@ static void run_case(int dtype,int fail_merge,int fail_persist)
     g_indexes=calloc(1,sizeof(IndexEntry));g_n_indexes=1;
     IndexEntry *e=&g_indexes[0];
     float vecs[]={1,0,2,0,3,0,4,0};
-    e->valid=1;e->db_oid=1;e->index_oid=2;e->dim=2;e->n_vecs=4;
+    e->valid=1;e->db_oid=1;e->index_oid=2;e->index_rfn=9002;e->heap_rfn=16384;   /* the build identity (index and heap) */
+    e->dim=2;e->n_vecs=4;
     e->graph_degree=2;e->metric=CUVS_METRIC_L2;
     e->handle=cuvs_cagra_build(vecs,4,2,CUVS_METRIC_L2,2,3,CUVS_CAGRA_BUILD_AUTO,0,0,NULL);
     assert(e->handle);e->tids=malloc(4*sizeof(uint64_t));
@@ -62,7 +63,7 @@ static void run_case(int dtype,int fail_merge,int fail_persist)
     int sv[2];assert(socketpair(AF_UNIX,SOCK_STREAM,0,sv)==0);
     char dirbuf[256]={0};snprintf(dirbuf,sizeof(dirbuf),"%s",dir);
     assert(cuvs_fd_send(sv[0],-1,dirbuf,sizeof(dirbuf))==0);
-    CuvsCmdFrame cmd={.op=CUVS_OP_COMPACT,.db_oid=1,.index_oid=2};
+    CuvsCmdFrame cmd={.op=CUVS_OP_COMPACT,.db_oid=1,.index_oid=2,.index_relfilenode=9002,.heap_relfilenode=16384};
     handle_compact(sv[1],&cmd);
     CuvsReplyHeader hdr;assert(recv_all(sv[0],&hdr,sizeof(hdr))==0);
     assert(merge_calls==1);
