@@ -47,6 +47,7 @@
  * PG_CUVS_DEBUG) is provided by cuvs_util.h. Enable hot-path traces via
  * -DPG_CUVS_DEBUG=1 in the Makefile or env. */
 #include <errno.h>
+#include <math.h>
 #include <signal.h>
 #include <pthread.h>
 #include <dirent.h>
@@ -206,7 +207,9 @@ typedef struct IndexEntry {
     int64_t         delta_size;       /* .delta size then */
     size_t          delta_vram_bytes; /* estimated VRAM held by the delta cache */
     float          *delta_vecs_host; /* host copy for incremental rebuild (Phase 3A-4) */
-    int64_t         delta_n_cached;  /* rows in current GPU BF + host buffer */
+    int64_t         delta_n_cached;  /* rows in the host buffer */
+    int64_t         delta_n_indexed; /* prefix of them in delta_idx; the tail is scanned on the CPU */
+    uint64_t        delta_ino;       /* the file they were read from */
 
     /* Phase 3L: resident GPU brute-force index over the full base vector matrix
      * (the `.vectors` sidecar), used when a search request sets search_mode=BF.
@@ -1513,6 +1516,8 @@ free_delta_cache(IndexEntry *e)
     if (e->delta_vecs_host) { free(e->delta_vecs_host); e->delta_vecs_host = NULL; }
     e->n_delta          = 0;
     e->delta_n_cached   = 0;
+    e->delta_n_indexed  = 0;
+    e->delta_ino        = 0;
     e->delta_generation = 0;
     e->delta_mtime      = 0;
     e->delta_size       = 0;
@@ -1532,10 +1537,64 @@ free_main_bf_cache(IndexEntry *e)
     e->main_bf_generation = 0;
 }
 
+/* The appended rows that delta_idx does not cover yet stay below this; past it the index is rebuilt. An append
+ * under search costs one record read and one distance, not an upload of the whole delta under g_index_mutex. */
+static int64_t
+delta_tail_max(int64_t n_indexed)
+{
+    return 32 + n_indexed / 128;
+}
+
+/* The scales cuVS returns: squared L2, 1 - cosine similarity, raw inner product. */
+static float
+delta_tail_distance(uint32_t metric, const float *q, const float *v, int dim)
+{
+    double a = 0.0, b = 0.0, c = 0.0;
+
+    if (metric == CUVS_METRIC_IP)
+    {
+        for (int i = 0; i < dim; i++) a += (double) q[i] * (double) v[i];
+        return (float) a;
+    }
+    if (metric == CUVS_METRIC_COSINE)
+    {
+        for (int i = 0; i < dim; i++)
+        {
+            a += (double) q[i] * (double) v[i];
+            b += (double) q[i] * (double) q[i];
+            c += (double) v[i] * (double) v[i];
+        }
+        c = sqrt(b) * sqrt(c);
+        return c > 0.0 ? (float) (1.0 - a / c) : 1.0f;
+    }
+    for (int i = 0; i < dim; i++)
+    {
+        double d = (double) q[i] - (double) v[i];
+        a += d * d;
+    }
+    return (float) a;
+}
+
+/* Append the tail rows' candidates to cand (room for n_delta - delta_n_indexed). */
+static int
+delta_tail_candidates(const IndexEntry *e, const float *query, CuvsResult *cand)
+{
+    int n = 0;
+
+    for (int64_t i = e->delta_n_indexed; i < e->n_delta; i++, n++)
+    {
+        cand[n].tid      = e->delta_tids[i];
+        cand[n].distance = delta_tail_distance(e->metric, query,
+                                               e->delta_vecs_host + (size_t) i * e->dim, (int) e->dim);
+    }
+    return n;
+}
+
 /* Make e's GPU delta cache match the current `.delta` file. Cheap when nothing
- * changed (one stat, compares size and mtime). On a change it rebuilds the resident
- * brute-force index; any failure (corrupt / generation mismatch / no spare
- * VRAM) leaves the cache empty so the search runs base-only and the backend
+ * changed (one stat, compares size and mtime). On a change it reads the appended rows; it
+ * rebuilds the resident brute-force index only when they outgrow delta_tail_max, and until
+ * then a search adds their distances on the CPU. Any failure (corrupt / generation mismatch /
+ * no spare VRAM) leaves the cache empty so the search runs base-only and the backend
  * CPU-merges. Best-effort, non-evicting: the delta must never evict a base
  * CAGRA index. Caller holds g_index_mutex. */
 static void
@@ -1566,18 +1625,16 @@ refresh_delta_cache(IndexEntry *e)
     if (mtime_ns == e->delta_mtime && (int64_t) st.st_size == e->delta_size)
         return;                         /* unchanged -> reuse current cache */
 
-    /* The file changed. Save previous state for incremental check, then
-     * selectively clear: free the GPU index but keep host buffers if the
-     * generation might still match. Record the new size and mtime up front so a
-     * persistent failure below (another base's generation, no VRAM) is not retried
-     * on every search. The exception is a header that is short or behind the size
-     * (an append may be in progress): those set delta_size = -1 and are read again
-     * by the next search. */
+    /* The file changed. A cache of the same file and the same base only grows (the backend appends). Record the
+     * new size and mtime up front so a persistent failure below (another base's generation, no VRAM) is not retried
+     * on every search. The exception is a header that is short or behind the size (an append may be in progress):
+     * those set delta_size = -1 and are read again by the next search. */
     uint32_t prev_gen    = e->delta_generation;
     int64_t  prev_cached = e->delta_n_cached;
-    if (e->delta_idx) { cuvs_bf_free(e->delta_idx, dg); e->delta_idx = NULL; }
-    e->n_delta          = 0;
-    e->delta_vram_bytes = 0;
+    uint64_t prev_ino    = e->delta_ino;
+    struct stat fst;
+    int64_t  n, body;
+
     e->delta_mtime      = mtime_ns;
     e->delta_size       = (int64_t) st.st_size;
 
@@ -1586,151 +1643,110 @@ refresh_delta_cache(IndexEntry *e)
         goto fail_cleanup;
     if (cuvs_delta_read_header(f, &hdr) != 0)
     {
-        fclose(f);
         e->delta_size = -1;             /* a header still being written: look again at the next search */
         goto fail_cleanup;
     }
-    if (cuvs_delta_validate(&hdr, (int64_t) st.st_size - (int64_t) sizeof(hdr)) != 0
-        || hdr.dim != e->dim || hdr.metric != e->metric)
-    {
-        fclose(f);
-        /* The size says more rows than the header: an append is between writing the record and the header. The header
-         * write changes neither the size nor, within one tick of the file system's clock, the mtime, so do not remember
-         * this state: the next search reads the header again. */
-        if (hdr.dim == e->dim && hdr.n_rows >= 0
-            && hdr.n_rows <= CUVS_TIDS_MAX_VECS     /* a corrupt header must not overflow the product */
-            && (int64_t) st.st_size - (int64_t) sizeof(hdr) > hdr.n_rows * (int64_t) cuvs_delta_record_bytes(hdr.dim))
-            e->delta_size = -1;
+    /* The size is taken after the header, so it covers at least the header's rows. More than those is an append
+     * between its record and its header: the header's rows are complete, and that state is not remembered (the
+     * header write changes neither the size nor, within one clock tick, the mtime). */
+    if (hdr.dim != e->dim || hdr.metric != e->metric
+        || hdr.n_rows < 0 || hdr.n_rows > CUVS_TIDS_MAX_VECS
+        || fstat(fileno(f), &fst) != 0)
         goto fail_cleanup;
-    }
+    rec_bytes = cuvs_delta_record_bytes(hdr.dim);
+    n    = hdr.n_rows;
+    body = (int64_t) fst.st_size - (int64_t) sizeof(hdr);
+    if (cuvs_delta_validate(&hdr, n * (int64_t) rec_bytes) != 0 || body < n * (int64_t) rec_bytes)
+        goto fail_cleanup;              /* bad header, or truncated */
+    if (body > n * (int64_t) rec_bytes)
+        e->delta_size = -1;
 
     /* Generation: the delta must belong to the current base build's .tids. */
     tids_file_path(tids_path, sizeof(tids_path), g_index_dir, e->db_oid, e->index_oid);
     {
         FILE *tf = fopen(tids_path, "rb");
-        if (!tf) { fclose(f); goto fail_cleanup; }
+        if (!tf) goto fail_cleanup;
         got = fread(&th, 1, sizeof(th), tf);
         fclose(tf);
     }
     if (got != sizeof(th) || th.magic != CUVS_TIDS_MAGIC
         || th.body_crc32 != hdr.base_tids_crc32)
-    {
-        fclose(f);
         goto fail_cleanup;              /* stale delta from an old base -> base-only */
-    }
-    e->delta_generation = hdr.base_tids_crc32;
-    if (hdr.n_rows == 0)
-    {
-        fclose(f);
+    if (n == 0)
         goto fail_cleanup;              /* empty delta -> base-only */
-    }
 
-    /* VRAM: best-effort, NON-evicting (never evict a base index for the delta). */
-    needed = (size_t) hdr.n_rows * ((size_t) hdr.dim * sizeof(float) + sizeof(uint64_t));
-    if ((g_max_vram_per_gpu[dg] > 0
-         && total_vram_used(dg) + needed > g_max_vram_per_gpu[dg])
-        || needed > gpu_free_vram_bytes(dg))
+    /* Phase 3A-4 incremental path: same base, same file, not shorter: read only the new records. */
+    if (!(e->delta_idx && e->delta_vecs_host && e->delta_tids
+          && hdr.base_tids_crc32 == prev_gen && (uint64_t) fst.st_ino == prev_ino && n >= prev_cached))
     {
-        fclose(f);
-        goto fail_cleanup;              /* no spare VRAM -> backend CPU-merges */
+        free_delta_cache(e);
+        e->delta_mtime = mtime_ns;
+        e->delta_size  = body > n * (int64_t) rec_bytes ? -1 : (int64_t) st.st_size;
+        prev_cached = 0;
     }
-
-    rec_bytes = cuvs_delta_record_bytes(hdr.dim);
-
-    /* Phase 3A-4 incremental path: if the generation matches, the file just
-     * grew (append-only), and we still have the host-side buffers, read only
-     * the new records and rebuild the GPU BF from the full host buffer. */
-    if (hdr.base_tids_crc32 == prev_gen
-        && hdr.n_rows > prev_cached
-        && e->delta_vecs_host != NULL && e->delta_tids != NULL)
+    if (n > prev_cached)
     {
-        int64_t new_rows = hdr.n_rows - prev_cached;
-        float    *new_vecs = realloc(e->delta_vecs_host,
-                                     (size_t) hdr.n_rows * hdr.dim * sizeof(float));
-        uint64_t *new_tids = realloc(e->delta_tids,
-                                     (size_t) hdr.n_rows * sizeof(uint64_t));
+        vecs = realloc(e->delta_vecs_host, (size_t) n * hdr.dim * sizeof(float));
+        if (!vecs)
+            goto fail_cleanup;
+        e->delta_vecs_host = vecs;
+        tids = realloc(e->delta_tids, (size_t) n * sizeof(uint64_t));
+        if (!tids)
+            goto fail_cleanup;
+        e->delta_tids = tids;
         rec = malloc(rec_bytes);
-        if (new_vecs && new_tids && rec)
+        if (!rec || fseek(f, (long) sizeof(hdr) + (long) (prev_cached * rec_bytes), SEEK_SET) != 0)
+            goto fail_cleanup;
+        for (int64_t i = prev_cached; i < n; i++)
         {
-            e->delta_vecs_host = new_vecs;
-            e->delta_tids      = new_tids;
-            long seek_off = (long) sizeof(hdr) + (long)(prev_cached * rec_bytes);
-            if (fseek(f, seek_off, SEEK_SET) == 0)
-            {
-                int ok = 1;
-                for (int64_t i = 0; i < new_rows; i++)
-                {
-                    int64_t idx = prev_cached + i;
-                    if (fread(rec, 1, rec_bytes, f) != rec_bytes) { ok = 0; break; }
-                    memcpy(&e->delta_tids[idx], rec, sizeof(uint64_t));
-                    memcpy(&e->delta_vecs_host[(size_t) idx * hdr.dim],
-                           rec + sizeof(uint64_t),
-                           (size_t) hdr.dim * sizeof(float));
-                }
-                if (ok)
-                {
-                    if (e->delta_idx) { cuvs_bf_free(e->delta_idx, dg); e->delta_idx = NULL; }
-                    e->delta_idx = cuvs_bf_build(e->delta_vecs_host, hdr.n_rows,
-                                                 (int) hdr.dim, hdr.metric,
-                                                 0 /* float32: CPU-exact equivalence */, dg);
-                    if (e->delta_idx)
-                    {
-                        e->n_delta          = hdr.n_rows;
-                        e->delta_n_cached   = hdr.n_rows;
-                        e->delta_vram_bytes = needed;
-                        LOG_INFO("pg_cuvs_server: delta cache %u/%u incremental (%lld -> %lld rows)\n",
-                                e->db_oid, e->index_oid,
-                                (long long) prev_cached, (long long) hdr.n_rows);
-                    }
-                }
-            }
+            if (fread(rec, 1, rec_bytes, f) != rec_bytes)
+                goto fail_cleanup;
+            memcpy(&tids[i], rec, sizeof(uint64_t));
+            memcpy(&vecs[(size_t) i * hdr.dim], rec + sizeof(uint64_t), (size_t) hdr.dim * sizeof(float));
         }
-        free(rec);
-        fclose(f);
-        return;
     }
 
-    /* Full rebuild path */
-    vecs = malloc((size_t) hdr.n_rows * hdr.dim * sizeof(float));
-    tids = malloc((size_t) hdr.n_rows * sizeof(uint64_t));
-    rec  = malloc(rec_bytes);
-    if (vecs && tids && rec && fseek(f, (long) sizeof(hdr), SEEK_SET) == 0)
+    if (!e->delta_idx || n - e->delta_n_indexed > delta_tail_max(e->delta_n_indexed))
     {
-        int ok = 1;
-        for (int64_t i = 0; i < hdr.n_rows; i++)
-        {
-            if (fread(rec, 1, rec_bytes, f) != rec_bytes) { ok = 0; break; }
-            memcpy(&tids[i], rec, sizeof(uint64_t));
-            memcpy(&vecs[(size_t) i * hdr.dim], rec + sizeof(uint64_t),
-                   (size_t) hdr.dim * sizeof(float));
-        }
-        if (ok)
-        {
-            e->delta_idx = cuvs_bf_build(vecs, hdr.n_rows, (int) hdr.dim, hdr.metric,
-                                         0 /* float32: CPU-exact equivalence */, dg);
-            if (e->delta_idx)
-            {
-                e->delta_tids       = tids;  tids = NULL;
-                e->delta_vecs_host  = vecs;  vecs = NULL;
-                e->n_delta          = hdr.n_rows;
-                e->delta_n_cached   = hdr.n_rows;
-                e->delta_vram_bytes = needed;
-                LOG_INFO("pg_cuvs_server: delta cache %u/%u built (%lld rows, %zu KB VRAM)\n",
-                        e->db_oid, e->index_oid, (long long) e->n_delta, needed / 1024);
-            }
-        }
+        if (e->delta_idx) { cuvs_bf_free(e->delta_idx, dg); e->delta_idx = NULL; }
+        e->delta_vram_bytes = 0;
+        /* VRAM: best-effort, NON-evicting (never evict a base index for the delta). */
+        needed = (size_t) n * ((size_t) hdr.dim * sizeof(float) + sizeof(uint64_t));
+        if ((g_max_vram_per_gpu[dg] > 0
+             && total_vram_used(dg) + needed > g_max_vram_per_gpu[dg])
+            || needed > gpu_free_vram_bytes(dg))
+            goto fail_cleanup;          /* no spare VRAM -> backend CPU-merges */
+        e->delta_idx = cuvs_bf_build(e->delta_vecs_host, n, (int) hdr.dim, hdr.metric,
+                                     0 /* float32: CPU-exact equivalence */, dg);
+        if (!e->delta_idx)
+            goto fail_cleanup;
+        e->delta_n_indexed  = n;
+        e->delta_vram_bytes = needed;
+        if (prev_cached > 0)
+            LOG_INFO("pg_cuvs_server: delta cache %u/%u incremental (%lld -> %lld rows)\n",
+                    e->db_oid, e->index_oid, (long long) prev_cached, (long long) n);
+        else
+            LOG_INFO("pg_cuvs_server: delta cache %u/%u built (%lld rows, %zu KB VRAM)\n",
+                    e->db_oid, e->index_oid, (long long) n, needed / 1024);
     }
-    free(vecs);
-    free(tids);
+    e->n_delta          = n;
+    e->delta_n_cached   = n;
+    e->delta_generation = hdr.base_tids_crc32;
+    e->delta_ino        = (uint64_t) fst.st_ino;
     free(rec);
     fclose(f);
     return;
 
 fail_cleanup:
-    if (e->delta_tids) { free(e->delta_tids); e->delta_tids = NULL; }
-    if (e->delta_vecs_host) { free(e->delta_vecs_host); e->delta_vecs_host = NULL; }
-    e->delta_n_cached   = 0;
-    e->delta_generation = 0;
+    free(rec);
+    if (f) fclose(f);
+    {
+        int64_t remember = e->delta_size;
+
+        free_delta_cache(e);
+        e->delta_mtime = mtime_ns;
+        e->delta_size  = remember;
+    }
 }
 
 /* Phase 3L: make e's resident main brute-force index match the current
@@ -2365,7 +2381,7 @@ load_index(uint32_t db_oid, uint32_t index_oid, CuvsRequester rq)
             e->inflight     = 0;
             e->delta_idx = NULL; e->delta_tids = NULL; e->n_delta = 0;
             e->delta_generation = 0; e->delta_mtime = 0; e->delta_size = 0; e->delta_vram_bytes = 0;
-            e->delta_vecs_host = NULL; e->delta_n_cached = 0;
+            e->delta_vecs_host = NULL; e->delta_n_cached = 0; e->delta_n_indexed = 0;
             e->main_bf_idx = NULL; e->main_bf_n = 0; e->main_bf_vram_bytes = 0;
             e->main_bf_mtime = 0; e->main_bf_generation = 0; e->bf_precision = 0;
             e->hnsw_idx     = NULL;
@@ -2494,7 +2510,7 @@ load_index(uint32_t db_oid, uint32_t index_oid, CuvsRequester rq)
      * previously evicted index. It is lazily (re)built in handle_search. */
     e->delta_idx = NULL; e->delta_tids = NULL; e->n_delta = 0;
     e->delta_generation = 0; e->delta_mtime = 0; e->delta_size = 0; e->delta_vram_bytes = 0;
-    e->delta_vecs_host = NULL; e->delta_n_cached = 0;
+    e->delta_vecs_host = NULL; e->delta_n_cached = 0; e->delta_n_indexed = 0;
     /* Phase 3L: main BF cache starts empty; lazily built on a BF search. */
     e->main_bf_idx = NULL; e->main_bf_n = 0; e->main_bf_vram_bytes = 0;
     e->main_bf_mtime = 0; e->main_bf_generation = 0; e->bf_precision = 0;
@@ -4629,7 +4645,7 @@ handle_search_bf_transient(int client_fd, const CuvsCmdFrame *cmd)
  * g_index_mutex (g_merge_metric and the entry's counters are read/written here).
  * ---------------------------------------------------------------- */
 static int
-cagra_finish_one(IndexEntry *e, const CuvsSearchResult *base, int k,
+cagra_finish_one(IndexEntry *e, const float *query, const CuvsSearchResult *base, int k,
                  const CuvsSearchResult *draw, int n_dc,
                  CuvsResult *out, int *delta_merged_out)
 {
@@ -4638,7 +4654,7 @@ cagra_finish_one(IndexEntry *e, const CuvsSearchResult *base, int k,
 
     if (draw && n_dc > 0)
     {
-        CuvsResult *cand = malloc((size_t) (k + n_dc) * sizeof(CuvsResult));
+        CuvsResult *cand = malloc((size_t) (k + n_dc + (e->n_delta - e->delta_n_indexed)) * sizeof(CuvsResult));
         if (cand)
         {
             int n_total = 0;
@@ -4653,11 +4669,12 @@ cagra_finish_one(IndexEntry *e, const CuvsSearchResult *base, int k,
             for (int i = 0; i < n_dc; i++)           /* delta candidates */
             {
                 int64_t id = draw[i].item_id;
-                if (id < 0 || id >= e->n_delta) continue;
+                if (id < 0 || id >= e->delta_n_indexed) continue;
                 cand[n_total].tid      = e->delta_tids[id];
                 cand[n_total].distance = draw[i].distance;
                 n_total++;
             }
+            n_total += delta_tail_candidates(e, query, cand + n_total);
             g_merge_metric = e->metric;   /* read by delta_cand_cmp under the mutex */
             qsort(cand, (size_t) n_total, sizeof(CuvsResult), delta_cand_cmp);
             n_valid = (n_total < k) ? n_total : k;
@@ -5612,19 +5629,24 @@ handle_search(int client_fd, const CuvsCmdFrame *cmd)
             refresh_delta_cache(e);
         if (!use_bf && e->delta_idx && e->n_delta > 0)
         {
-            int eff_dk = (int) ((int64_t) k < e->n_delta ? (int64_t) k : e->n_delta);
+            int eff_dk = (int) ((int64_t) k < e->delta_n_indexed ? (int64_t) k : e->delta_n_indexed);
             CuvsSearchResult *draw = malloc((size_t) eff_dk * sizeof(CuvsSearchResult));
-            if (draw && cuvs_bf_search(e->delta_idx, query, (int) cmd->dim, eff_dk,
+            CuvsResult       *room = realloc(cand, (size_t) (n_total + eff_dk + (e->n_delta - e->delta_n_indexed))
+                                                   * sizeof(CuvsResult));
+            if (room)
+                cand = room;
+            if (draw && room && cuvs_bf_search(e->delta_idx, query, (int) cmd->dim, eff_dk,
                                        draw, delta_gpu_of(e)) == 0)
             {
                 for (int i = 0; i < eff_dk; i++)
                 {
                     int64_t id = draw[i].item_id;
-                    if (id < 0 || id >= e->n_delta) continue;
+                    if (id < 0 || id >= e->delta_n_indexed) continue;
                     cand[n_total].tid      = e->delta_tids[id];
                     cand[n_total].distance = draw[i].distance;
                     n_total++;
                 }
+                n_total += delta_tail_candidates(e, query, cand + n_total);
                 delta_merged = 1;
                 e->delta_merged_count++;
             }
@@ -5890,7 +5912,7 @@ handle_search(int client_fd, const CuvsCmdFrame *cmd)
     refresh_delta_cache(e);
     if (e->delta_idx && e->n_delta > 0)
     {
-        n_dc = (int) ((int64_t) k < e->n_delta ? (int64_t) k : e->n_delta);
+        n_dc = (int) ((int64_t) k < e->delta_n_indexed ? (int64_t) k : e->delta_n_indexed);
         draw = malloc((size_t) n_dc * sizeof(CuvsSearchResult));
         if (!draw
             || cuvs_bf_search(e->delta_idx, query, (int) cmd->dim, n_dc, draw,
@@ -5901,9 +5923,8 @@ handle_search(int client_fd, const CuvsCmdFrame *cmd)
             n_dc = 0;
         }
     }
+    n_valid = cagra_finish_one(e, query, raw, k, draw, n_dc, results, &delta_merged);
     munmap(query, vec_bytes);
-
-    n_valid = cagra_finish_one(e, raw, k, draw, n_dc, results, &delta_merged);
     free(draw);
     free(raw);
 
@@ -6932,7 +6953,7 @@ build_sharded(int client_fd, const CuvsCmdFrame *cmd, const char *index_dir,
     e->stale_since  = 0;
     e->delta_idx = NULL; e->delta_tids = NULL; e->n_delta = 0;
     e->delta_generation = 0; e->delta_mtime = 0; e->delta_size = 0; e->delta_vram_bytes = 0;
-    e->delta_vecs_host = NULL; e->delta_n_cached = 0;
+    e->delta_vecs_host = NULL; e->delta_n_cached = 0; e->delta_n_indexed = 0;
     /* Phase 3L: main BF cache starts empty; sharded uses per-shard bf_idx. */
     e->main_bf_idx = NULL; e->main_bf_n = 0; e->main_bf_vram_bytes = 0;
     e->main_bf_mtime = 0; e->main_bf_generation = 0; e->bf_precision = 0;
@@ -7659,7 +7680,7 @@ finish_build_commit(int client_fd, const CuvsCmdFrame *cmd, const char *save_dir
         e->stale_since = 0;
         e->delta_idx = NULL; e->delta_tids = NULL; e->n_delta = 0;
         e->delta_generation = 0; e->delta_mtime = 0; e->delta_size = 0; e->delta_vram_bytes = 0;
-        e->delta_vecs_host = NULL; e->delta_n_cached = 0;
+        e->delta_vecs_host = NULL; e->delta_n_cached = 0; e->delta_n_indexed = 0;
         /* Phase 3L: main BF cache starts empty; lazily built on a BF search. */
         e->main_bf_idx = NULL; e->main_bf_n = 0; e->main_bf_vram_bytes = 0;
         e->main_bf_mtime = 0; e->main_bf_generation = 0; e->bf_precision = 0;
@@ -9128,7 +9149,7 @@ handle_build_flat(int client_fd, const CuvsCmdFrame *cmd)
             e->gpu_device_id   = (uint32_t) fgpu;
             e->delta_idx = NULL; e->delta_tids = NULL; e->n_delta = 0;
             e->delta_generation = 0; e->delta_mtime = 0; e->delta_size = 0; e->delta_vram_bytes = 0;
-            e->delta_vecs_host = NULL; e->delta_n_cached = 0;
+            e->delta_vecs_host = NULL; e->delta_n_cached = 0; e->delta_n_indexed = 0;
             e->main_bf_idx = NULL; e->main_bf_n = 0; e->main_bf_vram_bytes = 0;
             e->main_bf_mtime = 0; e->main_bf_generation = 0; e->bf_precision = 0;
             e->hnsw_idx        = NULL;
@@ -9404,7 +9425,7 @@ handle_build_ivfpq(int client_fd, const CuvsCmdFrame *cmd)
             e->gpu_device_id   = (uint32_t)target_gpu;
             e->delta_idx = NULL; e->delta_tids = NULL; e->n_delta = 0;
             e->delta_generation = 0; e->delta_mtime = 0; e->delta_size = 0; e->delta_vram_bytes = 0;
-            e->delta_vecs_host = NULL; e->delta_n_cached = 0;
+            e->delta_vecs_host = NULL; e->delta_n_cached = 0; e->delta_n_indexed = 0;
             e->main_bf_idx = NULL; e->main_bf_n = 0; e->main_bf_vram_bytes = 0;
             e->main_bf_mtime = 0; e->main_bf_generation = 0; e->bf_precision = 0;
             e->hnsw_idx        = NULL;
@@ -11756,7 +11777,7 @@ cagra_batch_run_group(CuvsBatchRequest **batch, const int *gid, int n, int g)
     refresh_delta_cache(e);
     if (e->delta_idx && e->n_delta > 0)
     {
-        n_dc = (int) ((int64_t) maxk < e->n_delta ? (int64_t) maxk : e->n_delta);
+        n_dc = (int) ((int64_t) maxk < e->delta_n_indexed ? (int64_t) maxk : e->delta_n_indexed);
         draw = malloc((size_t) Q * (size_t) n_dc * sizeof(CuvsSearchResult));
         if (!draw
             || cuvs_bf_search_batch(e->delta_idx, queries, Q, dim, n_dc, draw,
@@ -11776,7 +11797,7 @@ cagra_batch_run_group(CuvsBatchRequest **batch, const int *gid, int n, int g)
         int di = (n_dc < r->k) ? n_dc : r->k;
         int dm = 0;
 
-        r->n_out = cagra_finish_one(e, raw + (size_t) i * maxk, r->k,
+        r->n_out = cagra_finish_one(e, queries + (size_t) i * dim, raw + (size_t) i * maxk, r->k,
                                     draw ? draw + (size_t) i * n_dc : NULL, di,
                                     r->out, &dm);
         r->delta_merged = dm;
