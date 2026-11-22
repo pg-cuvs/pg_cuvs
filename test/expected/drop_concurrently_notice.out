@@ -1,0 +1,88 @@
+Parsed test spec with 3 sessions
+
+starting permutation: s1_c s2_c s3_c s1_commit s3_c
+step s1_c: BEGIN; SELECT count(*) = 1 AS searched FROM (SELECT id FROM dic_c ORDER BY v <-> '[1,0,0,0]'::vector LIMIT 1) s;
+searched
+--------
+t       
+(1 row)
+
+step s2_c: DROP INDEX CONCURRENTLY dic_c_i; <waiting ...>
+step s3_c: SELECT (SELECT count(*) FROM pg_cuvs_index_status() WHERE index_oid = o.oid) AS status_rows,
+                     (SELECT count(*) FROM pg_ls_dir(current_setting('cuvs.index_dir')) f
+                       WHERE starts_with(f, format('%s_%s.', (SELECT oid FROM pg_database WHERE datname = current_database()), o.oid))) > 0 AS has_files
+              FROM dic_oid o WHERE name = 'dic_c_i';
+status_rows|has_files
+-----------+---------
+          1|t        
+(1 row)
+
+step s1_commit: COMMIT;
+step s2_c: <... completed>
+step s3_c: SELECT (SELECT count(*) FROM pg_cuvs_index_status() WHERE index_oid = o.oid) AS status_rows,
+                     (SELECT count(*) FROM pg_ls_dir(current_setting('cuvs.index_dir')) f
+                       WHERE starts_with(f, format('%s_%s.', (SELECT oid FROM pg_database WHERE datname = current_database()), o.oid))) > 0 AS has_files
+              FROM dic_oid o WHERE name = 'dic_c_i';
+status_rows|has_files
+-----------+---------
+          0|f        
+(1 row)
+
+
+starting permutation: s1_f s2_f s3_f s1_commit s3_f
+step s1_f: BEGIN; SELECT count(*) = 1 AS searched FROM (SELECT id FROM dic_f ORDER BY v <-> '[1,0,0,0]'::vector LIMIT 1) s;
+searched
+--------
+t       
+(1 row)
+
+step s2_f: DROP INDEX CONCURRENTLY dic_f_i; <waiting ...>
+step s3_f: SELECT (SELECT count(*) FROM pg_cuvs_index_status() WHERE index_oid = o.oid) AS status_rows,
+                     (SELECT count(*) FROM pg_ls_dir(current_setting('cuvs.index_dir')) f
+                       WHERE starts_with(f, format('%s_%s.', (SELECT oid FROM pg_database WHERE datname = current_database()), o.oid))) > 0 AS has_files
+              FROM dic_oid o WHERE name = 'dic_f_i';
+status_rows|has_files
+-----------+---------
+          1|t        
+(1 row)
+
+step s1_commit: COMMIT;
+step s2_f: <... completed>
+step s3_f: SELECT (SELECT count(*) FROM pg_cuvs_index_status() WHERE index_oid = o.oid) AS status_rows,
+                     (SELECT count(*) FROM pg_ls_dir(current_setting('cuvs.index_dir')) f
+                       WHERE starts_with(f, format('%s_%s.', (SELECT oid FROM pg_database WHERE datname = current_database()), o.oid))) > 0 AS has_files
+              FROM dic_oid o WHERE name = 'dic_f_i';
+status_rows|has_files
+-----------+---------
+          0|f        
+(1 row)
+
+
+starting permutation: s1_q s2_q s3_q s1_commit s3_q
+step s1_q: BEGIN; SELECT count(*) = 1 AS searched FROM (SELECT id FROM dic_q ORDER BY v <-> '[1,0,0,0]'::vector LIMIT 1) s;
+searched
+--------
+t       
+(1 row)
+
+step s2_q: DROP INDEX CONCURRENTLY dic_q_i; <waiting ...>
+step s3_q: SELECT (SELECT count(*) FROM pg_cuvs_index_status() WHERE index_oid = o.oid) AS status_rows,
+                     (SELECT count(*) FROM pg_ls_dir(current_setting('cuvs.index_dir')) f
+                       WHERE starts_with(f, format('%s_%s.', (SELECT oid FROM pg_database WHERE datname = current_database()), o.oid))) > 0 AS has_files
+              FROM dic_oid o WHERE name = 'dic_q_i';
+status_rows|has_files
+-----------+---------
+          1|t        
+(1 row)
+
+step s1_commit: COMMIT;
+step s2_q: <... completed>
+step s3_q: SELECT (SELECT count(*) FROM pg_cuvs_index_status() WHERE index_oid = o.oid) AS status_rows,
+                     (SELECT count(*) FROM pg_ls_dir(current_setting('cuvs.index_dir')) f
+                       WHERE starts_with(f, format('%s_%s.', (SELECT oid FROM pg_database WHERE datname = current_database()), o.oid))) > 0 AS has_files
+              FROM dic_oid o WHERE name = 'dic_q_i';
+status_rows|has_files
+-----------+---------
+          0|f        
+(1 row)
+

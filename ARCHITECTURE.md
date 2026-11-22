@@ -113,8 +113,14 @@ Key differences from cagra:
   they reload from `.vectors` on next use.
 - On daemon restart: `startup_load_indexes` detects `.vectors` present without `.cagra`/`.ivfpq`
   and registers the entry as `is_flat=1` (restart-durable).
-- DROP: `cuvs_object_access` matches the flat index OID and calls `free_main_bf_cache` to release
-  the resident BF VRAM before removing artifacts.
+- DROP: `cuvs_object_access` notifies the daemon of the drop of a `cagra`, `flat` or `ivfpq`
+  index when the transaction that drops it commits; `DROP INDEX CONCURRENTLY` commits several
+  times and the notice goes at the commit that deletes the index's `pg_class` row (a drop whose
+  row is still visible at `PRE_COMMIT` is kept past that commit).
+  A DROP inside a transaction that is prepared (`PREPARE TRANSACTION`) is not notified.
+  `handle_drop` releases what the entry holds (the CAGRA graph, the resident BF cache, the IVF-PQ
+  handle, the CPU HNSW structure) and removes the index's files from the daemon's `index_dir`;
+  files written to a per-index `index_dir` (reloption) stay.
 
 ### 3.1b GPU-built CPU HNSW (`USING pg_cuvs_hnsw`)
 
