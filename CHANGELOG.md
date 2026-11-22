@@ -58,8 +58,8 @@ exists for 0.9.0.
 
 - A row appended to `.delta` in the second in which the daemon built its delta cache was
   missing from `cagra` searches with `cuvs.delta_search` `auto` (the default) or `gpu`
-  until the next write to the index: the cache compared the file's mtime in whole
-  seconds. It now compares size and nanosecond mtime, and reads the header again when
+  until a write in a later second or a REINDEX: the cache compared the file's mtime in
+  whole seconds. It now compares size and nanosecond mtime, and reads the header again when
   it met an append in progress. A search of an unchanged index does no more work.
 - Documentation: the README batch example, `docs/reference.md` and ADR-040 said that
   joining the results of `pg_cuvs_batch_search` and `cuvs_filtered_knn` on `ctid` gives

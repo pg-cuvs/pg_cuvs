@@ -1515,6 +1515,7 @@ free_delta_cache(IndexEntry *e)
     e->delta_n_cached   = 0;
     e->delta_generation = 0;
     e->delta_mtime      = 0;
+    e->delta_size       = 0;
     e->delta_vram_bytes = 0;
 }
 
@@ -1532,7 +1533,7 @@ free_main_bf_cache(IndexEntry *e)
 }
 
 /* Make e's GPU delta cache match the current `.delta` file. Cheap when nothing
- * changed (one stat + mtime compare). On a change it rebuilds the resident
+ * changed (one stat, compares size and mtime). On a change it rebuilds the resident
  * brute-force index; any failure (corrupt / generation mismatch / no spare
  * VRAM) leaves the cache empty so the search runs base-only and the backend
  * CPU-merges. Best-effort, non-evicting: the delta must never evict a base
@@ -1567,8 +1568,11 @@ refresh_delta_cache(IndexEntry *e)
 
     /* The file changed. Save previous state for incremental check, then
      * selectively clear: free the GPU index but keep host buffers if the
-     * generation might still match. Record new mtime up front so a persistent
-     * failure below does not retry on every search. */
+     * generation might still match. Record the new size and mtime up front so a
+     * persistent failure below (another base's generation, no VRAM) is not retried
+     * on every search. The exception is a header that is short or behind the size
+     * (an append may be in progress): those set delta_size = -1 and are read again
+     * by the next search. */
     uint32_t prev_gen    = e->delta_generation;
     int64_t  prev_cached = e->delta_n_cached;
     if (e->delta_idx) { cuvs_bf_free(e->delta_idx, dg); e->delta_idx = NULL; }
@@ -1594,6 +1598,7 @@ refresh_delta_cache(IndexEntry *e)
          * write changes neither the size nor, within one tick of the file system's clock, the mtime, so do not remember
          * this state: the next search reads the header again. */
         if (hdr.dim == e->dim && hdr.n_rows >= 0
+            && hdr.n_rows <= CUVS_TIDS_MAX_VECS     /* a corrupt header must not overflow the product */
             && (int64_t) st.st_size - (int64_t) sizeof(hdr) > hdr.n_rows * (int64_t) cuvs_delta_record_bytes(hdr.dim))
             e->delta_size = -1;
         goto fail_cleanup;
@@ -2359,7 +2364,7 @@ load_index(uint32_t db_oid, uint32_t index_oid, CuvsRequester rq)
             e->shards       = NULL;
             e->inflight     = 0;
             e->delta_idx = NULL; e->delta_tids = NULL; e->n_delta = 0;
-            e->delta_generation = 0; e->delta_mtime = 0; e->delta_vram_bytes = 0;
+            e->delta_generation = 0; e->delta_mtime = 0; e->delta_size = 0; e->delta_vram_bytes = 0;
             e->delta_vecs_host = NULL; e->delta_n_cached = 0;
             e->main_bf_idx = NULL; e->main_bf_n = 0; e->main_bf_vram_bytes = 0;
             e->main_bf_mtime = 0; e->main_bf_generation = 0; e->bf_precision = 0;
@@ -2488,7 +2493,7 @@ load_index(uint32_t db_oid, uint32_t index_oid, CuvsRequester rq)
     /* Delta cache starts empty; this slot may carry stale delta fields from a
      * previously evicted index. It is lazily (re)built in handle_search. */
     e->delta_idx = NULL; e->delta_tids = NULL; e->n_delta = 0;
-    e->delta_generation = 0; e->delta_mtime = 0; e->delta_vram_bytes = 0;
+    e->delta_generation = 0; e->delta_mtime = 0; e->delta_size = 0; e->delta_vram_bytes = 0;
     e->delta_vecs_host = NULL; e->delta_n_cached = 0;
     /* Phase 3L: main BF cache starts empty; lazily built on a BF search. */
     e->main_bf_idx = NULL; e->main_bf_n = 0; e->main_bf_vram_bytes = 0;
@@ -6926,7 +6931,7 @@ build_sharded(int client_fd, const CuvsCmdFrame *cmd, const char *index_dir,
     e->stale        = 0;
     e->stale_since  = 0;
     e->delta_idx = NULL; e->delta_tids = NULL; e->n_delta = 0;
-    e->delta_generation = 0; e->delta_mtime = 0; e->delta_vram_bytes = 0;
+    e->delta_generation = 0; e->delta_mtime = 0; e->delta_size = 0; e->delta_vram_bytes = 0;
     e->delta_vecs_host = NULL; e->delta_n_cached = 0;
     /* Phase 3L: main BF cache starts empty; sharded uses per-shard bf_idx. */
     e->main_bf_idx = NULL; e->main_bf_n = 0; e->main_bf_vram_bytes = 0;
@@ -7653,7 +7658,7 @@ finish_build_commit(int client_fd, const CuvsCmdFrame *cmd, const char *save_dir
         e->stale       = 0;
         e->stale_since = 0;
         e->delta_idx = NULL; e->delta_tids = NULL; e->n_delta = 0;
-        e->delta_generation = 0; e->delta_mtime = 0; e->delta_vram_bytes = 0;
+        e->delta_generation = 0; e->delta_mtime = 0; e->delta_size = 0; e->delta_vram_bytes = 0;
         e->delta_vecs_host = NULL; e->delta_n_cached = 0;
         /* Phase 3L: main BF cache starts empty; lazily built on a BF search. */
         e->main_bf_idx = NULL; e->main_bf_n = 0; e->main_bf_vram_bytes = 0;
@@ -9122,7 +9127,7 @@ handle_build_flat(int client_fd, const CuvsCmdFrame *cmd)
             e->inflight        = 0;
             e->gpu_device_id   = (uint32_t) fgpu;
             e->delta_idx = NULL; e->delta_tids = NULL; e->n_delta = 0;
-            e->delta_generation = 0; e->delta_mtime = 0; e->delta_vram_bytes = 0;
+            e->delta_generation = 0; e->delta_mtime = 0; e->delta_size = 0; e->delta_vram_bytes = 0;
             e->delta_vecs_host = NULL; e->delta_n_cached = 0;
             e->main_bf_idx = NULL; e->main_bf_n = 0; e->main_bf_vram_bytes = 0;
             e->main_bf_mtime = 0; e->main_bf_generation = 0; e->bf_precision = 0;
@@ -9398,7 +9403,7 @@ handle_build_ivfpq(int client_fd, const CuvsCmdFrame *cmd)
             e->shards          = NULL;
             e->gpu_device_id   = (uint32_t)target_gpu;
             e->delta_idx = NULL; e->delta_tids = NULL; e->n_delta = 0;
-            e->delta_generation = 0; e->delta_mtime = 0; e->delta_vram_bytes = 0;
+            e->delta_generation = 0; e->delta_mtime = 0; e->delta_size = 0; e->delta_vram_bytes = 0;
             e->delta_vecs_host = NULL; e->delta_n_cached = 0;
             e->main_bf_idx = NULL; e->main_bf_n = 0; e->main_bf_vram_bytes = 0;
             e->main_bf_mtime = 0; e->main_bf_generation = 0; e->bf_precision = 0;
