@@ -55,6 +55,7 @@
 #include "storage/fd.h"
 #include "storage/itemptr.h"
 #include "storage/ipc.h"       /* shmem_request_hook, shmem_startup_hook */
+#include "storage/lmgr.h"      /* ConditionalLockRelationOid (pg_cuvs_build_identity_status) */
 #include "storage/lwlock.h"    /* AddinShmemInitLock */
 #include "storage/shmem.h"     /* ShmemInitStruct, RequestAddinShmemSpace */
 #include "storage/spin.h"      /* slock_t — fallback-stats array guard */
@@ -495,6 +496,42 @@ pg_cuvs_last_rejection(PG_FUNCTION_ARGS)
     PG_RETURN_DATUM(DirectFunctionCall1(jsonb_in, CStringGetDatum(j.data)));
 }
 
+/* the catalog's identity of an index (its relfilenode and its table's) for the next daemon request about it (cuvs_ipc_set_index_identity: one
+ * frame only). A build is made for it and a search, EXTEND or COMPACT is answered only by a build made for the same value. */
+/* the relfilenode of the index's table now (relcache, no system call); 0 when it cannot be had. */
+static uint32_t
+cuvs_heap_rfn_of(Relation indexRel)
+{
+    uint32_t v = 0;
+    Relation h;
+
+    if (indexRel->rd_index == NULL)
+        return 0;
+    h = RelationIdGetRelation(indexRel->rd_index->indrelid);
+    if (RelationIsValid(h))
+    {
+        v = (uint32_t) h->rd_rel->relfilenode;
+        RelationClose(h);
+    }
+    return v;
+}
+static void
+cuvs_identity_for(Oid index_oid, Relation indexRel)
+{
+    cuvs_ipc_set_index_identity((uint32_t) index_oid, (uint32_t) indexRel->rd_rel->relfilenode, cuvs_heap_rfn_of(indexRel));
+}
+void cuvs_identity_oid(Oid index_oid);
+void
+cuvs_identity_oid(Oid index_oid)
+{
+    Relation r = RelationIdGetRelation(index_oid);   /* relcache; the caller holds a lock on the index */
+    if (RelationIsValid(r))
+    {
+        cuvs_identity_for(index_oid, r);
+        RelationClose(r);
+    }
+}
+
 static object_access_hook_type prev_object_access_hook = NULL;
 static set_rel_pathlist_hook_type prev_set_rel_pathlist_hook = NULL; /* ADR-063 */
 
@@ -513,9 +550,13 @@ typedef struct CuvsPendingDrop
 {
     Oid              oid;
     SubTransactionId subid;
+    bool             empty_rebuild;   /* queued by a rebuild with no rows (to reclaim the old build), not by DROP; a later build
+                                       * with rows in the same transaction takes it back */
 } CuvsPendingDrop;
 
 static List *cuvs_pending_drops = NIL;   /* of CuvsPendingDrop*, in TopMemoryContext */
+static void cuvs_empty_rebuild(Relation indexRel);   /* defined after cuvs_mark_index_stale */
+static void cuvs_empty_rebuild_cancel(Oid oid);
 
 static void
 cuvs_object_access(ObjectAccessType access, Oid classId, Oid objectId,
@@ -543,6 +584,7 @@ cuvs_object_access(ObjectAccessType access, Oid classId, Oid objectId,
                 CuvsPendingDrop *pd = (CuvsPendingDrop *) palloc(sizeof(CuvsPendingDrop));
                 pd->oid   = objectId;
                 pd->subid = GetCurrentSubTransactionId();
+                pd->empty_rebuild = false;
                 cuvs_pending_drops = lappend(cuvs_pending_drops, pd);
                 MemoryContextSwitchTo(old);
             }
@@ -565,7 +607,8 @@ cuvs_xact_callback(XactEvent event, void *arg)
             CuvsPendingDrop *pd = (CuvsPendingDrop *) lfirst(lc);
             int rc = cuvs_ipc_drop(cuvs_socket_path,
                                    (uint32_t) MyDatabaseId, (uint32_t) pd->oid);
-            if (rc != CUVS_STATUS_OK)
+            if (rc != CUVS_STATUS_OK && !pd->empty_rebuild)   /* an old build left by a rebuild with no rows is not used (its
+                                                               * record no longer matches); it is only not reclaimed until REINDEX */
                 ereport(WARNING,
                         (errmsg("pg_cuvs: daemon DROP-notify failed for index %u (status %d)",
                                 pd->oid, rc),
@@ -875,7 +918,8 @@ typedef enum CuvsFbReason
     CUVS_FB_DAEMON_DOWN,     /* daemon socket missing */
     CUVS_FB_NO_ARTIFACT,     /* no .tids (built on empty table) */
     CUVS_FB_DELTA,           /* .delta corrupt / over cap / gen mismatch */
-    CUVS_FB_TOMBSTONE        /* .tombstone corrupt / over cap / gen mismatch */
+    CUVS_FB_TOMBSTONE,       /* .tombstone corrupt / over cap / gen mismatch */
+    CUVS_FB_NOT_CURRENT      /* the build is not for the index's current relfilenode (or has no record) */
 } CuvsFbReason;
 
 #define CUVS_FB_SLOTS 128    /* > MAX_INDEXES(64); lazy slots, never freed on DROP */
@@ -912,6 +956,7 @@ cuvs_fb_reason_name(int r)
         case CUVS_FB_NO_ARTIFACT: return "no_artifact";
         case CUVS_FB_DELTA:       return "delta_unusable";
         case CUVS_FB_TOMBSTONE:   return "tombstone_unusable";
+        case CUVS_FB_NOT_CURRENT: return "not_current";
         default:                  return "none";
     }
 }
@@ -1981,6 +2026,482 @@ cuvs_daemon_socket_ready(void)
  * such an index would reach amgettuple, get CUVS_STATUS_NOT_FOUND from the
  * daemon, and ERROR. Instead, silence it at plan time: no .tids → no GPU
  * artifact → route to seqscan/CPU. */
+/* the build record "<db>_<idx>.relfilenode" in the index's directory:
+ *   <heap relfilenode> <table oid> <index relfilenode> <postmaster start of the build, unlogged indexes only, else 0>
+ * Written after a build with rows (never by a rebuild with no rows, so that a TRUNCATE that commits leaves a record that no
+ * longer matches, and one that rolls back leaves the matching one). The first two fields are what the GCS cold registry reads. */
+/* the daemon reads the build record when it loads a build from disk, and it may run as another uid (#87): the backend's umask
+ * (077) would leave the record 0600. Every writer of the record opens it with this. */
+static FILE *
+cuvs_open_build_record(const char *path)
+{
+    FILE *f = fopen(path, "w");
+    if (f)
+        (void) fchmod(fileno(f), 0644);   /* guarantee daemon (other uid) read access, as for the other files it reads (#87) */
+    return f;
+}
+
+static void
+cuvs_write_build_record(Relation heapRel, Relation indexRel)
+{
+    char sidecar[MAXPGPATH];
+    long long pm_start = indexRel->rd_rel->relpersistence == RELPERSISTENCE_UNLOGGED ? (long long) PgStartTime : 0;
+    FILE *f;
+
+    snprintf(sidecar, sizeof(sidecar), "%s/%u_%u.relfilenode",
+             cuvs_resolve_index_dir_rel(indexRel), (uint32_t) MyDatabaseId, (uint32_t) RelationGetRelid(indexRel));
+    f = cuvs_open_build_record(sidecar);
+    if (f)
+    {
+        fprintf(f, "%u %u %u %lld\n", (uint32_t) heapRel->rd_rel->relfilenode, (uint32_t) RelationGetRelid(heapRel),
+                (uint32_t) indexRel->rd_rel->relfilenode, pm_start);
+        fclose(f);
+    }
+    /* Non-fatal: without a record the build is not used (cuvs_build_current) until the next REINDEX writes one. */
+}
+
+/* per relcache life of the index (rd_amcache is freed whenever the index's relcache entry is rebuilt, which every change of
+ * its relfilenode causes): whether its build record matches the catalog's index, and the aminsert stale mark of Phase 2. */
+typedef struct CuvsIndexAmCache
+{
+    bool stale_marked;        /* cuvs.max_delta_rows = 0: the index was marked stale once in this relcache life */
+    bool identity_checked;    /* identity_current holds a result */
+    bool identity_current;
+    int  identity_reason;     /* CuvsIdentityReason of that result */
+    bool identity_noticed;    /* the NOTICE for a build that is not current was considered in this relcache life */
+} CuvsIndexAmCache;
+
+/* why a build is or is not the one for the catalog's index (cuvs_build_identity). */
+typedef enum CuvsIdentityReason
+{
+    CUVS_ID_CURRENT = 0,
+    CUVS_ID_NO_RECORD,          /* no build record (an ivfpq index of an earlier version, or a build whose record could not be written) */
+    CUVS_ID_OLDER_RECORD,       /* a record of an earlier version that does not match the table as it is now */
+    CUVS_ID_OTHER_RELFILENODE,  /* built for another index relfilenode (rebuilt, rolled back, moved to another tablespace) */
+    CUVS_ID_OTHER_HEAP,         /* the index's relfilenode, another of the table: moved by ALTER TABLE SET TABLESPACE (rows and TIDs as
+                                 * they were; current for searches) or rewritten and its indexes not rebuilt yet (a source being
+                                 * exported in the same statement: not current for that, cuvs_build_current_strict_oid) */
+    CUVS_ID_DAEMON_REFUSED,     /* judged current here but refused by the daemon (it could not read or match the record) */
+    CUVS_ID_EMPTIED,            /* emptied in place (TRUNCATE in the transaction that created it, ON COMMIT DELETE ROWS) */
+    CUVS_ID_RESTARTED           /* an UNLOGGED index built before the running postmaster (or a record of an earlier version) */
+} CuvsIdentityReason;
+
+static const char *
+cuvs_identity_reason_text(int r)
+{
+    switch (r)
+    {
+        case CUVS_ID_CURRENT:           return "current";
+        case CUVS_ID_NO_RECORD:         return "no build record";
+        case CUVS_ID_OLDER_RECORD:      return "build record of an earlier version that does not match the table";
+        case CUVS_ID_OTHER_RELFILENODE: return "built for another relfilenode of the index";
+        case CUVS_ID_OTHER_HEAP:        return "current; the table has another relfilenode since the build (SET TABLESPACE), so it is not exported as a source";
+        case CUVS_ID_DAEMON_REFUSED:    return "the daemon refused its build (its record may be unreadable to the daemon's user)";
+        case CUVS_ID_EMPTIED:           return "emptied in place since its build";
+        case CUVS_ID_RESTARTED:         return "unlogged index built before the last restart";
+        default:                        return "unknown";
+    }
+}
+
+static CuvsIndexAmCache *
+cuvs_index_amcache(Relation indexRel)
+{
+    if (indexRel->rd_amcache == NULL)
+        indexRel->rd_amcache = MemoryContextAllocZero(indexRel->rd_indexcxt, sizeof(CuvsIndexAmCache));
+    return (CuvsIndexAmCache *) indexRel->rd_amcache;
+}
+
+/* is the build on disk (and in the daemon) the one made for the catalog's index as it is now? The record must name the index's
+ * current relfilenode, and for an unlogged index the postmaster the build was made under (a crash restart resets unlogged relations
+ * without changing their relfilenode; any restart is treated alike). Reads the record once per relcache life: no system call on a
+ * search otherwise. Not current: the planner takes the heap, aminsert adds nothing, the functions refuse. */
+/* judge the build record of indexRel against the catalog (see cuvs_build_current). A record of this version must name the
+ * index's relfilenode and its table's (while a table is rewritten its indexes are rebuilt one by one, and one not
+ * rebuilt yet still names its own relfilenode with the new heap). A record of an earlier version (two fields: heap relfilenode and
+ * table oid, written by cagra and flat builds up to 0.9.2) is accepted when both still match the table, which is then the table the
+ * build was made from. Nothing is written for it (a standby, a read-only index_dir, a full disk): the request
+ * carries the heap relfilenode, and the daemon accepts a build loaded with such a record for that heap by the same rule
+ * (entry_current). States in which accepting it is wrong are states 0.9.2 already answers wrongly from: see docs/reference.md. An
+ * UNLOGGED index's earlier record is not accepted (no postmaster start time to rule out a crash reset). Only reads, no write. */
+static int
+cuvs_build_identity(Relation indexRel, bool make_readable)
+{
+    char path[MAXPGPATH];
+    unsigned heap_rfn = 0, table_oid = 0, index_rfn = 0;
+    long long pm_start = 0;
+    FILE *f;
+    int n = 0;
+    bool unlogged = indexRel->rd_rel->relpersistence == RELPERSISTENCE_UNLOGGED;
+    uint32_t heap_now = cuvs_heap_rfn_of(indexRel);
+
+    snprintf(path, sizeof(path), "%s/%u_%u.relfilenode",
+             cuvs_resolve_index_dir_rel(indexRel), (uint32_t) MyDatabaseId, (uint32_t) RelationGetRelid(indexRel));
+    f = fopen(path, "r");
+    if (!f)
+        return CUVS_ID_NO_RECORD;
+    n = fscanf(f, "%u %u %u %lld", &heap_rfn, &table_oid, &index_rfn, &pm_start);
+    fclose(f);
+    if (n == 4)
+    {
+        if (index_rfn == 0)
+            return CUVS_ID_EMPTIED;
+        if (index_rfn != (uint32_t) indexRel->rd_rel->relfilenode)
+            return CUVS_ID_OTHER_RELFILENODE;
+        if (heap_now == 0 || heap_rfn != heap_now)
+            return CUVS_ID_OTHER_HEAP;
+        if (unlogged && pm_start != (long long) PgStartTime)
+            return CUVS_ID_RESTARTED;
+        return CUVS_ID_CURRENT;
+    }
+    if (n == 2)
+    {
+        if ((Oid) table_oid != indexRel->rd_index->indrelid || heap_now == 0 || heap_rfn != heap_now)
+            return CUVS_ID_OLDER_RECORD;
+        if (unlogged)
+            return CUVS_ID_RESTARTED;
+        /* The daemon judges this record too, and may run as another uid (#87): an earlier version left it 0600 (the backend's umask).
+         * Make it readable; only its mode changes, and where that fails (a read-only index_dir) the refusal below is what remains. */
+        if (make_readable)
+            (void) chmod(path, 0644);
+        return CUVS_ID_CURRENT;
+    }
+    return CUVS_ID_NO_RECORD;
+}
+
+/* a build is used for searches, inserts and the functions when it was made for the index's relfilenode,
+ * whatever the table's relfilenode is now: the only command that gives the table a new relfilenode and leaves its indexes alone is
+ * ALTER TABLE SET TABLESPACE, which copies the blocks (rows and TIDs unchanged). Every rewrite (VACUUM FULL, CLUSTER, TRUNCATE, SET
+ * LOGGED/UNLOGGED, SET ACCESS METHOD, a type change) rebuilds the indexes too, so they get new relfilenodes; between the heap's swap
+ * and an index's own rebuild nothing but the same statement can use it (AccessExclusiveLock), and the one thing it does with another
+ * index is export it as a source (pg_cuvs_hnsw), which asks cuvs_build_current_strict_oid. */
+static bool
+cuvs_identity_usable(int reason)
+{
+    return reason == CUVS_ID_CURRENT || reason == CUVS_ID_OTHER_HEAP;
+}
+
+/* is the build on disk (and in the daemon) the one made for the catalog's index as it is now? cuvs_build_identity decides,
+ * once per relcache life (rd_amcache is freed whenever the index's relcache entry is rebuilt, which every change of its relfilenode
+ * causes): no system call on a search otherwise. Not current: the planner takes the heap, aminsert adds nothing, the functions
+ * refuse. With notice, a build that is not current is reported once per index in this backend (NOTICE): the planner and the
+ * functions ask with it, aminsert without (not on every INSERT). Past 256 indexes nothing more is reported. */
+static bool cuvs_build_refused(Relation indexRel);
+static bool
+cuvs_build_current_ex(Relation indexRel, bool notice)
+{
+    CuvsIndexAmCache *c = cuvs_index_amcache(indexRel);
+
+    if (c->identity_checked && c->identity_reason == CUVS_ID_DAEMON_REFUSED && !cuvs_build_refused(indexRel))
+        c->identity_checked = false;   /* the record changed since the refusal: judge it again */
+    if (!c->identity_checked)
+    {
+        c->identity_reason = cuvs_build_identity(indexRel, true);
+        if (cuvs_identity_usable(c->identity_reason) && cuvs_build_refused(indexRel))
+            c->identity_reason = CUVS_ID_DAEMON_REFUSED;   /* outlives this relcache entry */
+        c->identity_current = cuvs_identity_usable(c->identity_reason);
+        c->identity_checked = true;
+    }
+    if (notice && !c->identity_current && !c->identity_noticed)
+    {
+        static Oid  noticed[256];
+        static int  n_noticed;
+        Oid         oid = RelationGetRelid(indexRel);
+        bool        seen = false;
+
+        c->identity_noticed = true;
+        for (int i = 0; i < n_noticed; i++)
+            if (noticed[i] == oid) { seen = true; break; }
+        if (!seen && n_noticed < (int) lengthof(noticed))
+        {
+            noticed[n_noticed++] = oid;
+            ereport(NOTICE,
+                    (errmsg("pg_cuvs: index \"%s\" answers from the table until REINDEX: %s",
+                            RelationGetRelationName(indexRel), cuvs_identity_reason_text(c->identity_reason)),
+                     errhint("pg_cuvs_build_identity_status() lists every such index.")));
+        }
+    }
+    return c->identity_current;
+}
+static bool
+cuvs_build_current(Relation indexRel)
+{
+    return cuvs_build_current_ex(indexRel, true);
+}
+
+bool cuvs_build_current_oid(Oid index_oid);
+bool
+cuvs_build_current_oid(Oid index_oid)
+{
+    Relation r = RelationIdGetRelation(index_oid);   /* relcache; the caller holds a lock on the index */
+    bool     current = false;
+
+    if (RelationIsValid(r))
+    {
+        current = cuvs_build_current(r);
+        RelationClose(r);
+    }
+    return current;
+}
+
+/* for exporting a cagra build as the source of another index: the build must be of the
+ * table's relfilenode too. In a rewrite (VACUUM FULL, CLUSTER, ALTER TABLE) the indexes are rebuilt in OID order after the heap's
+ * swap, so a source rebuilt after the index being built still holds the old heap's TIDs. */
+bool cuvs_build_current_strict_oid(Oid index_oid);
+bool
+cuvs_build_current_strict_oid(Oid index_oid)
+{
+    bool current = false;
+    Relation r = RelationIdGetRelation(index_oid);
+    if (RelationIsValid(r))
+    {
+        /* judged now, not from this relcache life's cache: a search earlier in the session may have cached CURRENT
+         * before the rewrite swapped the heap. One fopen per export (exports are rare). */
+        current = cuvs_build_identity(r, false) == CUVS_ID_CURRENT && !cuvs_build_refused(r);
+        RelationClose(r);
+    }
+    return current;
+}
+
+/* every cagra, flat and ivfpq index of this database with whether its build is the one for the index as the
+ * catalog has it now, and why not: the indexes that answer from the table until REINDEX (after an upgrade, the ones whose record could
+ * not be accepted). It only judges: nothing is written, and an index whose lock another session holds (a REINDEX, a
+ * DROP) is not waited for; its row says so, with current NULL. */
+PG_FUNCTION_INFO_V1(pg_cuvs_build_identity_status);
+Datum
+pg_cuvs_build_identity_status(PG_FUNCTION_ARGS)
+{
+    ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+    TupleDesc      tupdesc;
+    Tuplestorestate *tupstore;
+    MemoryContext  per_query_ctx, oldcontext;
+    Oid            ams[3];
+    const char    *am_names[3] = {"cagra", "flat", "ivfpq"};
+    List          *oids = NIL;
+    List          *ams_of = NIL;
+    ListCell      *lc, *lc2;
+    Relation       pgclass;
+    TableScanDesc  scan;
+    HeapTuple      tup;
+
+    if (rsinfo == NULL || !IsA(rsinfo, ReturnSetInfo) || !(rsinfo->allowedModes & SFRM_Materialize))
+        ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg("pg_cuvs_build_identity_status: set-valued function called in a context that cannot accept a set")));
+    if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+        elog(ERROR, "pg_cuvs_build_identity_status: return type must be a row type");
+    for (int i = 0; i < 3; i++)
+        ams[i] = get_am_oid(am_names[i], true);
+
+    pgclass = table_open(RelationRelationId, AccessShareLock);
+    scan = table_beginscan_catalog(pgclass, 0, NULL);
+    while ((tup = heap_getnext(scan, ForwardScanDirection)) != NULL)
+    {
+        Form_pg_class cf = (Form_pg_class) GETSTRUCT(tup);
+        if (cf->relkind != RELKIND_INDEX)
+            continue;
+        for (int i = 0; i < 3; i++)
+            if (OidIsValid(ams[i]) && cf->relam == ams[i])
+            {
+                oids = lappend_oid(oids, cf->oid);
+                ams_of = lappend_int(ams_of, i);
+                break;
+            }
+    }
+    table_endscan(scan);
+    table_close(pgclass, AccessShareLock);
+
+    per_query_ctx = rsinfo->econtext->ecxt_per_query_memory;
+    oldcontext = MemoryContextSwitchTo(per_query_ctx);
+    tupstore = tuplestore_begin_heap(true, false, work_mem);
+    rsinfo->returnMode = SFRM_Materialize;
+    rsinfo->setResult = tupstore;
+    rsinfo->setDesc = CreateTupleDescCopy(tupdesc);
+    MemoryContextSwitchTo(oldcontext);
+
+    forboth(lc, oids, lc2, ams_of)
+    {
+        Oid      oid = lfirst_oid(lc);
+        Relation r;
+        Datum    values[4];
+        bool     nulls[4] = {false, false, false, false};
+        int      reason;
+
+        values[0] = ObjectIdGetDatum(oid);
+        values[1] = DirectFunctionCall1(namein, CStringGetDatum(am_names[lfirst_int(lc2)]));
+        if (!ConditionalLockRelationOid(oid, AccessShareLock))
+        {
+            nulls[2] = true;
+            values[3] = CStringGetTextDatum("not judged: another session holds a lock on the index");
+            tuplestore_putvalues(tupstore, rsinfo->setDesc, values, nulls);
+            continue;
+        }
+        r = try_index_open(oid, NoLock);
+        if (!r)
+        {
+            UnlockRelationOid(oid, AccessShareLock);
+            continue;   /* dropped meanwhile */
+        }
+        reason = cuvs_build_identity(r, false);   /* the status function only judges, not even the mode */
+        if (cuvs_identity_usable(reason) && cuvs_build_refused(r))
+            reason = CUVS_ID_DAEMON_REFUSED;         /* what this backend's plans use; no cache is written */
+        values[2] = BoolGetDatum(cuvs_identity_usable(reason));
+        values[3] = CStringGetTextDatum(cuvs_identity_reason_text(reason));
+        index_close(r, AccessShareLock);
+        tuplestore_putvalues(tupstore, rsinfo->setDesc, values, nulls);
+    }
+    return (Datum) 0;
+}
+
+/* the daemon refused a request because its build is not the catalog's index (another session rolled back a rebuild, which
+ * does not invalidate this backend's relcache): read the record again on the next plan. */
+static void
+cuvs_build_identity_forget(Oid index_oid)
+{
+    Relation r = RelationIdGetRelation(index_oid);
+    if (RelationIsValid(r))
+    {
+        if (r->rd_amcache)
+            ((CuvsIndexAmCache *) r->rd_amcache)->identity_checked = false;
+        RelationClose(r);
+    }
+}
+
+/* the daemon refused a build this backend judges current (it may not read the record: an earlier
+ * version's record left 0600 with a daemon of another uid on a read-only index_dir). Remembered in this backend by (index, relfilenode)
+ * so that it outlives relcache rebuilds (VACUUM, ANALYZE) and goes with the next REINDEX, and every cached plan on the table is told
+ * at once (a nontransactional relcache invalidation, as cuvs_mark_index_stale does: the statement is about to fail, and a
+ * transactional one is not sent on abort), so a generic plan is planned again and takes the heap. */
+/* an entry also keeps what the record looked like (mode, owner, group, mtime) when the daemon refused it. Every
+ * 60 s at most a backend that plans the index looks at the record again; if an operator changed it (chmod, chown, a new record), the
+ * refusal is forgotten and the next statement asks the daemon again. A full table overwrites nothing: an index refused past 256 is
+ * remembered for its relcache life only. */
+#define CUVS_REFUSED_RECHECK_S 60
+static struct { Oid oid; Oid relfilenode; mode_t mode; uid_t uid; gid_t gid; time_t mtime; time_t next_check; } cuvs_refused[256];
+static int cuvs_n_refused;
+
+static bool
+cuvs_refused_record_stat(Relation indexRel, struct stat *st)
+{
+    char path[MAXPGPATH];
+    snprintf(path, sizeof(path), "%s/%u_%u.relfilenode",
+             cuvs_resolve_index_dir_rel(indexRel), (uint32_t) MyDatabaseId, (uint32_t) RelationGetRelid(indexRel));
+    return stat(path, st) == 0;
+}
+
+static bool
+cuvs_build_refused(Relation indexRel)
+{
+    for (int i = 0; i < cuvs_n_refused; i++)
+    {
+        struct stat st;
+        time_t      now;
+
+        if (cuvs_refused[i].oid != RelationGetRelid(indexRel) || cuvs_refused[i].relfilenode != indexRel->rd_rel->relfilenode)
+            continue;
+        now = time(NULL);
+        if (now < cuvs_refused[i].next_check)
+            return true;
+        cuvs_refused[i].next_check = now + CUVS_REFUSED_RECHECK_S;
+        if (cuvs_refused_record_stat(indexRel, &st)
+            && st.st_mode == cuvs_refused[i].mode && st.st_uid == cuvs_refused[i].uid && st.st_gid == cuvs_refused[i].gid
+            && st.st_mtime == cuvs_refused[i].mtime)
+            return true;
+        cuvs_refused[i] = cuvs_refused[--cuvs_n_refused];   /* the record changed: ask the daemon again */
+        return false;
+    }
+    return false;
+}
+
+static void
+cuvs_build_identity_refused(Oid index_oid)
+{
+    Relation r = RelationIdGetRelation(index_oid);
+    if (RelationIsValid(r))
+    {
+        CuvsIndexAmCache *c = cuvs_index_amcache(r);
+        SharedInvalidationMessage msg;
+
+        if (!cuvs_build_refused(r) && cuvs_n_refused < (int) lengthof(cuvs_refused))
+        {
+            struct stat st;
+            int slot = cuvs_n_refused++;
+
+            memset(&st, 0, sizeof(st));
+            (void) cuvs_refused_record_stat(r, &st);
+            cuvs_refused[slot].oid = index_oid;
+            cuvs_refused[slot].relfilenode = r->rd_rel->relfilenode;
+            cuvs_refused[slot].mode = st.st_mode;
+            cuvs_refused[slot].uid = st.st_uid;
+            cuvs_refused[slot].gid = st.st_gid;
+            cuvs_refused[slot].mtime = st.st_mtime;
+            cuvs_refused[slot].next_check = time(NULL) + CUVS_REFUSED_RECHECK_S;
+        }
+        c->identity_reason = CUVS_ID_DAEMON_REFUSED;
+        c->identity_current = false;
+        c->identity_checked = true;
+        memset(&msg, 0, sizeof(msg));
+        msg.rc.id = SHAREDINVALRELCACHE_ID;
+        msg.rc.dbId = MyDatabaseId;
+        msg.rc.relId = r->rd_index->indrelid;
+        RelationClose(r);
+        SendSharedInvalidMessages(&msg, 1);
+    }
+}
+
+/* a rebuild with no rows under the SAME index relfilenode (PostgreSQL empties a table in place when it was created, or got a
+ * new relfilenode, in the current (sub)transaction: TRUNCATE through heap_truncate_one_rel, and ON COMMIT DELETE ROWS through
+ * heap_truncate; both rebuild every index with zero rows under its relfilenode). The record would still call the old build current,
+ * so it is rewritten as an empty build (index relfilenode 0), and this backend's cached result is forgotten. Only when the record
+ * names the current relfilenode: in place means a rollback throws that physical file away, so nothing that survives the rollback
+ * depended on the record; a rebuild that got a new relfilenode leaves the record alone (it no longer matches, and after a rollback
+ * it matches the old relfilenode again). */
+static void
+cuvs_record_empty_in_place(Relation heapRel, Relation indexRel)
+{
+    char path[MAXPGPATH];
+    unsigned heap_rfn = 0, table_oid = 0, index_rfn = 0;
+    long long pm_start = 0;
+    FILE *f;
+    bool in_place = false;
+
+    snprintf(path, sizeof(path), "%s/%u_%u.relfilenode",
+             cuvs_resolve_index_dir_rel(indexRel), (uint32_t) MyDatabaseId, (uint32_t) RelationGetRelid(indexRel));
+    f = fopen(path, "r");
+    if (f)
+    {
+        in_place = fscanf(f, "%u %u %u %lld", &heap_rfn, &table_oid, &index_rfn, &pm_start) >= 3
+                   && index_rfn != 0 && index_rfn == (uint32_t) indexRel->rd_rel->relfilenode;
+        fclose(f);
+    }
+    if (in_place)
+    {
+        f = cuvs_open_build_record(path);
+        if (f)
+        {
+            fprintf(f, "%u %u 0 0\n", (uint32_t) heapRel->rd_rel->relfilenode, (uint32_t) RelationGetRelid(heapRel));
+            fclose(f);
+        }
+        else
+            ereport(WARNING,
+                    (errmsg("pg_cuvs: index \"%s\" was emptied in place and its build record could not be rewritten: %m",
+                            RelationGetRelationName(indexRel)),
+                     errhint("REINDEX INDEX %s before using it.", quote_identifier(RelationGetRelationName(indexRel)))));
+    }
+    if (indexRel->rd_amcache)
+        ((CuvsIndexAmCache *) indexRel->rd_amcache)->identity_checked = false;
+}
+
+/* a function path asked for an index whose build is not the catalog's index; there is no exact path there. */
+void cuvs_report_not_current(Oid index_oid) pg_attribute_noreturn();
+void
+cuvs_report_not_current(Oid index_oid)
+{
+    const char *name = get_rel_name(index_oid);
+    ereport(ERROR,
+            (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+             errmsg("pg_cuvs: index %s has no GPU build for its current contents", name ? quote_identifier(name) : "<unknown>"),
+             errdetail("The index was rebuilt, truncated or rolled back since its build, or its build has no record (built by an older version)."),
+             errhint("REINDEX INDEX %s. Index scans answer from the table until then.", name ? quote_identifier(name) : "<index>")));
+}
+
 static bool
 cuvs_index_has_artifact(Oid index_oid)
 {
@@ -2444,6 +2965,8 @@ cuvsamcostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
             fb_reason = CUVS_FB_DAEMON_DOWN;
         else if (!cuvs_index_has_artifact(index_oid))
             fb_reason = CUVS_FB_NO_ARTIFACT;
+        else if (!cuvs_build_current_oid(index_oid))
+            fb_reason = CUVS_FB_NOT_CURRENT;
         else if (cuvs_index_delta_unusable(index_oid))
             fb_reason = CUVS_FB_DELTA;
         else if (cuvs_index_tombstone_unusable(index_oid))
@@ -2559,6 +3082,8 @@ flat_amcostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
             fb_reason = CUVS_FB_DAEMON_DOWN;
         else if (!cuvs_index_has_artifact(index_oid))
             fb_reason = CUVS_FB_NO_ARTIFACT;
+        else if (!cuvs_build_current_oid(index_oid))
+            fb_reason = CUVS_FB_NOT_CURRENT;
         else if (cuvs_index_delta_unusable(index_oid))
             fb_reason = CUVS_FB_DELTA;
         else if (cuvs_index_tombstone_unusable(index_oid))
@@ -3496,6 +4021,7 @@ cuvs_build_parallel(Relation heapRel, Relation indexRel, IndexInfo *indexInfo,
 
         PG_TRY();
         {
+            cuvs_identity_for(build_index_oid, indexRel);
             rc = cuvs_ipc_build_multi(
                 cuvs_socket_path, (uint32_t) MyDatabaseId, build_index_oid,
                 descs, ndesc, total, dim, metric,
@@ -3703,6 +4229,7 @@ cuvs_build_cagra_from_heap(Relation heapRel, Relation indexRel, IndexInfo *index
                 memcpy((char *) bs.corpus.base + vec_bytes, bs.tids, tid_bytes);
             }
 
+            cuvs_identity_for(build_index_oid, indexRel);
             rc = cuvs_ipc_build(
                 cuvs_socket_path,
                 (uint32_t) MyDatabaseId,
@@ -3851,26 +4378,16 @@ cuvs_ambuild(Relation heapRel, Relation indexRel, IndexInfo *indexInfo)
     result->index_tuples = (double) n_vecs;
 
     if (n_vecs == 0)
-        return result;  /* empty table — nothing built */
-
-    /* Phase 3C: write .relfilenode sidecar so the daemon can verify heap
-     * compatibility before loading a GCS artifact on a new node. */
     {
-        uint32_t heap_table_oid   = (uint32_t) RelationGetRelid(heapRel);
-        uint32_t heap_relfilenode = (uint32_t) heapRel->rd_rel->relfilenode;
-        char sidecar[MAXPGPATH];
-        snprintf(sidecar, sizeof(sidecar), "%s/%u_%u.relfilenode",
-                 cuvs_resolve_index_dir_rel(indexRel),
-                 (uint32_t) MyDatabaseId,
-                 (uint32_t) RelationGetRelid(indexRel));
-        FILE *f = fopen(sidecar, "w");
-        if (f)
-        {
-            fprintf(f, "%u %u\n", heap_relfilenode, heap_table_oid);
-            fclose(f);
-        }
-        /* Non-fatal: GCS download will skip compat check if sidecar is absent */
+        /* Nothing built; the old build under this OID must not answer. Its delta and tombstones go with the drop at commit. */
+        cuvs_empty_rebuild(indexRel);
+        cuvs_record_empty_in_place(heapRel, indexRel);   /* an in-place TRUNCATE empties the build: say so in its record */
+        return result;
     }
+    cuvs_empty_rebuild_cancel(RelationGetRelid(indexRel));
+
+    /* Phase 3C / the build record (heap compatibility for GCS, and the index identity). */
+    cuvs_write_build_record(heapRel, indexRel);
 
     /* Phase 3A: the fresh base absorbs all current rows, so any pending-insert
      * delta and tombstones from before this (RE)build are obsolete. Drop them;
@@ -3982,6 +4499,7 @@ cuvs_build_flat_from_heap(Relation heapRel, Relation indexRel, IndexInfo *indexI
                 memcpy((char *) bs.corpus.base + vec_bytes, bs.tids, tid_bytes);
             }
 
+            cuvs_identity_for(build_index_oid, indexRel);
             rc = cuvs_ipc_build_flat(
                 cuvs_socket_path,
                 (uint32_t) MyDatabaseId,
@@ -4099,24 +4617,16 @@ flat_ambuild(Relation heapRel, Relation indexRel, IndexInfo *indexInfo)
     result->index_tuples = (double) n_vecs;
 
     if (n_vecs == 0)
-        return result;  /* empty table — nothing built */
-
-    /* Phase 3C: .relfilenode sidecar (heap compat verification). */
     {
-        uint32_t heap_table_oid   = (uint32_t) RelationGetRelid(heapRel);
-        uint32_t heap_relfilenode = (uint32_t) heapRel->rd_rel->relfilenode;
-        char sidecar[MAXPGPATH];
-        snprintf(sidecar, sizeof(sidecar), "%s/%u_%u.relfilenode",
-                 cuvs_resolve_index_dir_rel(indexRel),
-                 (uint32_t) MyDatabaseId,
-                 (uint32_t) RelationGetRelid(indexRel));
-        FILE *f = fopen(sidecar, "w");
-        if (f)
-        {
-            fprintf(f, "%u %u\n", heap_relfilenode, heap_table_oid);
-            fclose(f);
-        }
+        /* Nothing built; the old build under this OID must not answer. */
+        cuvs_empty_rebuild(indexRel);
+        cuvs_record_empty_in_place(heapRel, indexRel);   /* an in-place TRUNCATE empties the build: say so in its record */
+        return result;
     }
+    cuvs_empty_rebuild_cancel(RelationGetRelid(indexRel));
+
+    /* Phase 3C / the build record. */
+    cuvs_write_build_record(heapRel, indexRel);
 
     /* A fresh base absorbs all current rows — drop obsolete delta/tombstones. */
     cuvs_delta_unlink(RelationGetRelid(indexRel));
@@ -4641,6 +5151,34 @@ cuvs_report_stale(Oid index_oid)
                      name ? quote_identifier(name) : "<index>")));
 }
 
+/* the daemon's identity check refused the request (CUVS_STATUS_NOT_CURRENT, never the writes-since-build
+ * STALE above). Read the record again: if the build is not current for this backend either, another session rebuilt, truncated or
+ * rolled back the index after this statement was planned; if it is, the daemon could not match the record (an earlier version's
+ * record it cannot read), which this backend remembers so that the next plans take the heap. Either way the next plan answers from
+ * the table. */
+static void
+cuvs_report_daemon_not_current(Oid index_oid)
+{
+    const char *name = get_rel_name(index_oid);
+    bool        refused;
+
+    cuvs_build_identity_forget(index_oid);
+    refused = cuvs_build_current_oid(index_oid);
+    if (refused)
+        cuvs_build_identity_refused(index_oid);
+    ereport(ERROR,
+            (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+             refused
+             ? errmsg("pg_cuvs: the GPU daemon could not match the build of index %s", name ? quote_identifier(name) : "<unknown>")
+             : errmsg("pg_cuvs: index %s was rebuilt, truncated or rolled back since this statement was planned",
+                      name ? quote_identifier(name) : "<unknown>"),
+             refused
+             ? errdetail("Its build record may be unreadable to the daemon's user (a record of an earlier version left with mode 0600).")
+             : errdetail("The GPU build of the index is not the one for its current contents."),
+             errhint("Run the statement again: it then answers from the table until REINDEX INDEX %s.",
+                     name ? quote_identifier(name) : "<index>")));
+}
+
 static bool
 cuvs_gettuple(IndexScanDesc scan, ScanDirection dir)
 {
@@ -4722,7 +5260,9 @@ cuvs_gettuple(IndexScanDesc scan, ScanDirection dir)
 
         uint32_t latency_us = 0;
         int      delta_merged = 0;
-        int rc = cuvs_ipc_search(
+        int rc;
+        cuvs_identity_oid(index_oid);
+        rc = cuvs_ipc_search(
             cuvs_socket_path,
             (uint32_t)MyDatabaseId,
             (uint32_t)index_oid,
@@ -4767,6 +5307,9 @@ cuvs_gettuple(IndexScanDesc scan, ScanDirection dir)
             {
                 case CUVS_STATUS_STALE:
                     cuvs_report_stale(index_oid);
+                    break;
+                case CUVS_STATUS_NOT_CURRENT:
+                    cuvs_report_daemon_not_current(index_oid);
                     break;
                 case CUVS_STATUS_METRIC_MISMATCH:
                     /* The index was built with a different metric (e.g. built
@@ -4995,7 +5538,9 @@ flat_gettuple(IndexScanDesc scan, ScanDirection dir)
 
         uint32_t latency_us = 0;
         int      delta_merged = 0;
-        int rc = cuvs_ipc_search(
+        int rc;
+        cuvs_identity_oid(index_oid);
+        rc = cuvs_ipc_search(
             cuvs_socket_path,
             (uint32_t)MyDatabaseId,
             (uint32_t)index_oid,
@@ -5032,6 +5577,9 @@ flat_gettuple(IndexScanDesc scan, ScanDirection dir)
             {
                 case CUVS_STATUS_STALE:
                     cuvs_report_stale(index_oid);
+                    break;
+                case CUVS_STATUS_NOT_CURRENT:
+                    cuvs_report_daemon_not_current(index_oid);
                     break;
                 case CUVS_STATUS_METRIC_MISMATCH:
                     ereport(ERROR,
@@ -5188,6 +5736,47 @@ cuvs_mark_index_stale(Relation indexRel)
     AcceptInvalidationMessages();
 }
 
+/* a rebuild that found no rows (TRUNCATE; REINDEX, VACUUM FULL, CLUSTER or a rewriting ALTER TABLE of a table with no live rows)
+ * keeps the index's OID, and the daemon still holds the old build under it. Whether a build may answer is decided by its record
+ * (cuvs_build_current, entry_current): a rebuild with no rows writes none, so once it commits the old record names the old index
+ * relfilenode and the old build is not used, and a rollback gives the old relfilenode back with the old build. What remains is the
+ * reclaim: the OID goes on the DROP queue, flagged empty_rebuild, and the commit drops the old build from the daemon (with its files in
+ * the daemon's index_dir). A later build of the same OID with rows in the same transaction takes the queued drop back
+ * (cuvs_empty_rebuild_cancel). If the drop is not sent (PREPARE TRANSACTION, daemon down) the old build is only not reclaimed until a
+ * REINDEX or DROP. */
+static void
+cuvs_empty_rebuild(Relation indexRel)
+{
+    Oid           oid = RelationGetRelid(indexRel);
+    MemoryContext old;
+    CuvsPendingDrop *pd;
+
+    old = MemoryContextSwitchTo(TopMemoryContext);
+    pd = (CuvsPendingDrop *) palloc0(sizeof(CuvsPendingDrop));
+    pd->oid = oid;
+    pd->subid = GetCurrentSubTransactionId();
+    pd->empty_rebuild = true;
+    cuvs_pending_drops = lappend(cuvs_pending_drops, pd);
+    MemoryContextSwitchTo(old);
+}
+
+/* a build of the index with rows replaces what a rebuild with no rows queued: the commit must not drop the new build. */
+static void
+cuvs_empty_rebuild_cancel(Oid oid)
+{
+    ListCell *lc;
+
+    foreach(lc, cuvs_pending_drops)
+    {
+        CuvsPendingDrop *pd = (CuvsPendingDrop *) lfirst(lc);
+        if (pd->oid == oid && pd->empty_rebuild)
+        {
+            pfree(pd);
+            cuvs_pending_drops = foreach_delete_current(cuvs_pending_drops, lc);
+        }
+    }
+}
+
 /* Append one {TID, vector} record to the index's .delta sidecar. flock-
  * serialized across backends; positions the record at the canonical offset
  * (sizeof(header) + n_rows*record_bytes) and ftruncates, so a torn tail from a
@@ -5293,15 +5882,20 @@ cuvs_aminsert(Relation indexRel, Datum *values, bool *isnull,
     if (isnull[0])
         return false;
 
+    /* the build is not the catalog's index (rebuilt, truncated or rolled back since, or no record): nothing to add to it. The
+     * planner takes the heap for this index until REINDEX, which builds from the heap. */
+    if (!cuvs_build_current_ex(indexRel, false))
+        return false;
+
     /* Delta disabled (GUC 0): fall back to Phase 2 behavior — mark stale once
      * per relcache life and route to CPU. */
     if (cuvs_max_delta_rows <= 0)
     {
-        if (indexRel->rd_amcache == NULL)
+        CuvsIndexAmCache *amcache = cuvs_index_amcache(indexRel);
+        if (!amcache->stale_marked)
         {
             cuvs_mark_index_stale(indexRel);
-            indexRel->rd_amcache = MemoryContextAllocZero(indexRel->rd_indexcxt,
-                                                          sizeof(bool));
+            amcache->stale_marked = true;
         }
         return false;
     }
@@ -5325,7 +5919,9 @@ cuvs_aminsert(Relation indexRel, Datum *values, bool *isnull,
     if (cuvs_socket_path && cuvs_socket_path[0] != '\0'
         && OidIsValid(cagra_am) && indexRel->rd_rel->relam == cagra_am)
     {
-        int rc = cuvs_ipc_extend(cuvs_socket_path,
+        int rc;
+        cuvs_identity_for(RelationGetRelid(indexRel), indexRel);
+        rc = cuvs_ipc_extend(cuvs_socket_path,
                                  (uint32_t) MyDatabaseId,
                                  (uint32_t) RelationGetRelid(indexRel),
                                  vec->x, &tid, 1, (int) vec->dim,
@@ -5469,6 +6065,7 @@ cuvs_ambulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
                 (double) stats->tuples_removed / (double) n_total_vecs
                     >= cuvs_compact_delete_ratio)
             {
+                cuvs_identity_for(index_oid, indexRel);
                 (void) cuvs_ipc_compact(cuvs_socket_path,
                                         (uint32_t) MyDatabaseId,
                                         (uint32_t) index_oid,
@@ -5515,6 +6112,7 @@ cuvs_amvacuumcleanup(IndexVacuumInfo *info, IndexBulkDeleteResult *stats)
         cuvs_tombstone_path(index_oid, tpath, sizeof(tpath));
         if (stat(tpath, &st) == 0)
         {
+            cuvs_identity_for(index_oid, indexRel);
             (void) cuvs_ipc_compact(cuvs_socket_path,
                                     (uint32_t) MyDatabaseId,
                                     (uint32_t) index_oid,
@@ -5566,7 +6164,9 @@ ivfpq_ambuild(Relation heapRel, Relation indexRel, IndexInfo *indexInfo)
             uint32_t table_oid   = (uint32_t) RelationGetRelid(heapRel);
             uint32_t relfilenode = (uint32_t) heapRel->rd_rel->relfilenode;
 
-            int rc = cuvs_ipc_build_ivfpq(
+            int rc;
+            cuvs_identity_for(RelationGetRelid(indexRel), indexRel);
+            rc = cuvs_ipc_build_ivfpq(
                 cuvs_socket_path,
                 (uint32_t) MyDatabaseId,
                 (uint32_t) RelationGetRelid(indexRel),
@@ -5621,6 +6221,16 @@ ivfpq_ambuild(Relation heapRel, Relation indexRel, IndexInfo *indexInfo)
 
     result->heap_tuples  = reltuples;
     result->index_tuples = (double) bs.n_vecs;
+    if (bs.n_vecs == 0)
+    {
+        cuvs_empty_rebuild(indexRel);   /* nothing built: the old build is reclaimed at commit */
+        cuvs_record_empty_in_place(heapRel, indexRel);   /* an in-place TRUNCATE empties the build: say so in its record */
+    }
+    else
+    {
+        cuvs_empty_rebuild_cancel(RelationGetRelid(indexRel));
+        cuvs_write_build_record(heapRel, indexRel);   /* ivfpq wrote no record before; without one its build is not used */
+    }
     return result;
 }
 
@@ -5713,7 +6323,9 @@ ivfpq_gettuple(IndexScanDesc scan, ScanDirection dir)
         ss->tids      = palloc(k * sizeof(uint64_t));
         ss->distances = palloc(k * sizeof(float));
 
-        int rc = cuvs_ipc_search_ivfpq(
+        int rc;
+        cuvs_identity_oid(index_oid);
+        rc = cuvs_ipc_search_ivfpq(
             cuvs_socket_path,
             (uint32_t) MyDatabaseId,
             (uint32_t) index_oid,
@@ -5735,6 +6347,9 @@ ivfpq_gettuple(IndexScanDesc scan, ScanDirection dir)
             {
                 case CUVS_STATUS_STALE:
                     cuvs_report_stale(index_oid);
+                    break;
+                case CUVS_STATUS_NOT_CURRENT:
+                    cuvs_report_daemon_not_current(index_oid);
                     break;
                 case CUVS_STATUS_METRIC_MISMATCH:
                     ereport(ERROR,
@@ -6223,7 +6838,11 @@ pg_cuvs_batch_search(PG_FUNCTION_ARGS)
             uint64_t *tids = palloc((size_t) Q * (size_t) k * sizeof(uint64_t));
             float    *dists = palloc((size_t) Q * (size_t) k * sizeof(float));
             uint32_t  Kout = 0, latency_us = 0;
-            int rc = cuvs_ipc_search_batch(
+            int rc;
+            if (!cuvs_build_current_oid(index_oid))   /* no exact path here */
+                cuvs_report_not_current(index_oid);
+            cuvs_identity_oid(index_oid);
+            rc = cuvs_ipc_search_batch(
                 cuvs_socket_path, (uint32_t) MyDatabaseId, (uint32_t) index_oid,
                 qbuf, (uint32_t) Q, dim, k, metric,
                 (uint32_t) cuvs_shard_overfetch, cuvs_parallel_fanout ? 1 : 0,
@@ -6256,6 +6875,9 @@ pg_cuvs_batch_search(PG_FUNCTION_ARGS)
                         break;
                     case CUVS_STATUS_STALE:
                         cuvs_report_stale(index_oid);
+                        break;
+                    case CUVS_STATUS_NOT_CURRENT:
+                        cuvs_report_daemon_not_current(index_oid);
                         break;
                     case CUVS_STATUS_UNAVAILABLE:
                         ereport(ERROR,
@@ -6878,6 +7500,7 @@ pg_cuvs_compact(PG_FUNCTION_ARGS)
 
     cuvs_require_index_owner(index_oid);
 
+    cuvs_identity_for(index_oid, indexRel);
     rc = cuvs_ipc_compact(cuvs_socket_path,
                           (uint32_t) MyDatabaseId,
                           (uint32_t) index_oid,
@@ -7786,6 +8409,9 @@ cuvs_filtered_knn(PG_FUNCTION_ARGS)
 
             if (use_stream_bf)
             {
+                if (!cuvs_build_current_oid(index_oid))   /* no exact path here */
+                    cuvs_report_not_current(index_oid);
+                cuvs_identity_oid(index_oid);
                 rc = cuvs_ipc_search_stream_bf(
                     cuvs_socket_path,
                     (uint32_t) MyDatabaseId,
@@ -7803,6 +8429,10 @@ cuvs_filtered_knn(PG_FUNCTION_ARGS)
             }
 
             if (!use_stream_bf)
+            {
+                if (!cuvs_build_current_oid(index_oid))   /* no exact path here */
+                    cuvs_report_not_current(index_oid);
+                cuvs_identity_oid(index_oid);
                 rc = cuvs_ipc_search_filtered(
                     cuvs_socket_path,
                     (uint32_t) MyDatabaseId,
@@ -7814,6 +8444,7 @@ cuvs_filtered_knn(PG_FUNCTION_ARGS)
                     filter_arr, n_filter,
                     tids_out, dists_out, &n_results, &latency_us, &delta_merged,
                     (int) use_prefilter, cuvs_stream_bf_chunk_vectors);
+            }
 
             /* Merge .delta pending-insert rows (filtered) and apply tombstones. */
             if (rc == CUVS_STATUS_OK && cuvs_max_delta_rows > 0)
@@ -7832,6 +8463,9 @@ cuvs_filtered_knn(PG_FUNCTION_ARGS)
         else
         {
             int delta_merged = 0;
+            if (!cuvs_build_current_oid(index_oid))   /* no exact path here */
+                cuvs_report_not_current(index_oid);
+            cuvs_identity_oid(index_oid);
             rc = cuvs_ipc_search(
                 cuvs_socket_path,
                 (uint32_t) MyDatabaseId,
@@ -7856,6 +8490,8 @@ cuvs_filtered_knn(PG_FUNCTION_ARGS)
         }
         if (rc == CUVS_STATUS_STALE)
             cuvs_report_stale((Oid) index_oid);
+        if (rc == CUVS_STATUS_NOT_CURRENT)
+            cuvs_report_daemon_not_current((Oid) index_oid);
         if (rc != CUVS_STATUS_OK)
         {
             cuvs_report_proto_mismatch(rc);
@@ -8141,6 +8777,9 @@ cuvs_cs_build(CuvsFilteredScanState *state, EState *estate)
     int rc;
     if (use_stream_bf)
     {
+        if (!cuvs_build_current_oid(state->index_oid))   /* no exact path here */
+            cuvs_report_not_current(state->index_oid);
+        cuvs_identity_oid(state->index_oid);
         rc = cuvs_ipc_search_stream_bf(
             cuvs_socket_path,
             (uint32_t) MyDatabaseId,
@@ -8157,6 +8796,10 @@ cuvs_cs_build(CuvsFilteredScanState *state, EState *estate)
         }
     }
     if (!use_stream_bf)
+    {
+        if (!cuvs_build_current_oid(state->index_oid))   /* no exact path here */
+            cuvs_report_not_current(state->index_oid);
+        cuvs_identity_oid(state->index_oid);
         rc = cuvs_ipc_search_filtered(
             cuvs_socket_path,
             (uint32_t) MyDatabaseId,
@@ -8168,6 +8811,7 @@ cuvs_cs_build(CuvsFilteredScanState *state, EState *estate)
             state->result_tids, state->result_dists, &state->n_results,
             &latency_us, &delta_merged, (int) use_prefilter,
             cuvs_stream_bf_chunk_vectors);
+    }
 
     state->last_latency_us = latency_us;
 
@@ -8193,6 +8837,8 @@ cuvs_cs_build(CuvsFilteredScanState *state, EState *estate)
         CHECK_FOR_INTERRUPTS();
     else if (rc == CUVS_STATUS_STALE)
         cuvs_report_stale(state->index_oid);
+    else if (rc == CUVS_STATUS_NOT_CURRENT)
+        cuvs_report_daemon_not_current(state->index_oid);
     else if (rc != CUVS_STATUS_OK)
     {
         cuvs_report_proto_mismatch(rc);
@@ -8381,6 +9027,8 @@ cuvs_dwedge_add_path(PlannerInfo *root, RelOptInfo *rel,
     }
     if (!OidIsValid(index_oid))
         return;
+    if (!cuvs_build_current_oid(index_oid))
+        return;   /* the build is not the catalog's index; the planner keeps the heap */
 
     /* Build the CustomPath. */
     cpath = makeNode(CustomPath);

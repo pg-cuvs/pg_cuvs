@@ -120,6 +120,50 @@ SELECT
 (1 row)
 
 -- ----------------------------------------------------------------
+-- Test 5: one daemon request per call: with the stream path
+-- taken, cuvs_filtered_knn and the filtered custom scan must not send the D-wedge
+-- search after it (an unbraced if ran it too and its answer replaced the stream's).
+-- search_count counts the daemon's searches of the index.
+-- ----------------------------------------------------------------
+SELECT search_count AS c0 FROM pg_stat_gpu_search WHERE index_oid = 'sbf_cagra'::regclass \gset
+SELECT count(*) AS n FROM cuvs_filtered_knn(
+    'sbf_cagra'::regclass,
+    '[0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5]'::vector(8),
+    ARRAY(SELECT ctid FROM sbf WHERE tenant_id = 2),
+    10) f;
+ n  
+----
+ 10
+(1 row)
+
+SELECT search_count - :c0 AS requests_per_function_call, search_mode
+FROM pg_stat_gpu_search WHERE index_oid = 'sbf_cagra'::regclass;
+ requests_per_function_call | search_mode 
+----------------------------+-------------
+                          1 | stream_bf
+(1 row)
+
+SET cuvs.filtered_knn_hook = on;
+SET enable_seqscan = off;
+SELECT search_count AS c1 FROM pg_stat_gpu_search WHERE index_oid = 'sbf_cagra'::regclass \gset
+SELECT count(*) AS n FROM (
+    SELECT row_id FROM sbf WHERE tenant_id = 2
+    ORDER BY v <-> '[0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5]'::vector(8) LIMIT 10) s;
+ n  
+----
+ 10
+(1 row)
+
+SELECT search_count - :c1 AS requests_per_custom_scan, search_mode
+FROM pg_stat_gpu_search WHERE index_oid = 'sbf_cagra'::regclass;
+ requests_per_custom_scan | search_mode 
+--------------------------+-------------
+                        1 | stream_bf
+(1 row)
+
+RESET enable_seqscan;
+RESET cuvs.filtered_knn_hook;
+-- ----------------------------------------------------------------
 -- Cleanup
 -- ----------------------------------------------------------------
 SET cuvs.stream_bf_selectivity_threshold = 0.0;

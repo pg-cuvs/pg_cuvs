@@ -617,6 +617,7 @@ for limits, compatibility and estimate-vs-upper-bound caveats.
 | `cuvs_filtered_knn(index regclass, query vector, filter_tids bigint[], k int)` | TABLE (ctid tid, distance float4) | Exact GPU BF restricted to a sorted TID set (`block<<16\|off`); NULL = unfiltered. A `ctid` join drops HOT-updated rows (see the note below the table) |
 | `cuvs_filtered_knn(index regclass, query vector, filter_tids tid[], k int)` | TABLE (ctid tid, distance float4) | Type-safe `tid[]` overload (accepts `ctid` directly; a HOT-updated row's current `ctid` does not match, see the note below the table) |
 | `pg_cuvs_gc_orphans(do_delete bool DEFAULT false)` | SETOF (db_oid oid, index_oid oid, reason text, action text) | Reconcile `index_dir` vs catalog; dry-run by default (ADR-046) |
+| `pg_cuvs_build_identity_status()` | SETOF (index regclass, access_method name, current boolean, reason text) | Every `cagra`, `flat` and `ivfpq` index of the database: whether its GPU build is the one for the index as the catalog has it now, and why not (no build record, a record of an earlier version that does not match the table, built for another relfilenode, emptied in place, unlogged index built before the last restart, the daemon refused its build in this session). An index whose table moved with `ALTER TABLE ... SET TABLESPACE` is current, with that said in its reason. An index that is not current answers from the table until `REINDEX INDEX`; the first backend that plans it says so once (NOTICE) |
 | `pg_cuvs_last_search_latency_us()` / `_n_results()` / `_k()` / `_index()` / `_metric()` | int / int / int / oid / text | Process-local stats for the most recent scan in this backend; NULL if none |
 | `pg_cuvs_hw_profile()` | SETOF (gpu_name text, n_gpus int, total_vram_bytes bigint, link_bw_bytes_per_us float8, hbm_bw_bytes_per_us float8, gpu_bf_tput float8, ipc_rtt_us float8, measured_at_epoch bigint, probe_status int, source text, matches_running_daemon bool, cpu_dist_tput float8, gpu_cagra_lat_us float8) | The measured (or DEFAULT) hardware profile the daemon wrote at boot, consumed by the ADR-075 cost model. `source` = `measured` \| `default`; `probe_status` is a bitmask of which coefficients were measured; `matches_running_daemon` = false flags a stale profile (GPU swap / migration). Read-only, no CUDA/IPC |
 
@@ -750,7 +751,7 @@ Watch `vram_used_mb` vs `vram_budget_mb` for headroom, and `evictions`/`reloads`
 `index_oid, fallback_count, last_reason, last_fallback_at`
 
 The only place plan-time CPU routing is visible. `last_reason` ∈ `disabled / circuit_breaker /
-stale / delete_drift / daemon_down / no_artifact / delta_unusable / tombstone_unusable`. Watch the
+stale / delete_drift / daemon_down / no_artifact / not_current / delta_unusable / tombstone_unusable`. Watch the
 trend against `pg_stat_gpu_search.search_count` to catch queries silently dropping to CPU. Counts
 are a relative pressure signal (the cost hook can run more than once per query), not exact query
 counts.
@@ -1003,6 +1004,85 @@ and filtered index searches. IVF-PQ raises the same error from the backend's
 pre-search marker check (`ivfpq_gettuple`); its daemon handler currently has no
 stale gate. The error identifies the index and recommends
 `REINDEX INDEX`. A genuine empty filter result remains an empty result.
+
+A refusal by the build identity check below is a separate daemon status
+(`not_current`), not STALE, and has its own message: "index ... was rebuilt,
+truncated or rolled back since this statement was planned" when this session also
+finds the build not current, or "the GPU daemon could not match the build of index
+..." when only the daemon does (it cannot read the build record). Either way the
+statement fails with SQLSTATE `55000` and the next plan answers from the table.
+
+A `cagra`, `flat` or `ivfpq` build is used only for the index it was built for. Each
+build with rows writes a record `<db>_<index>.relfilenode` beside its files with the
+index's relfilenode and its table's, and the daemon keeps the same values with the
+build. The planner takes the index only while the record names its current relfilenode,
+and the daemon answers a search, `EXTEND` or `COMPACT` only when the request carries the
+value its build was made for. The table's relfilenode is compared only when a build is
+exported as the source of a `pg_cuvs_hnsw` index: while a table is rewritten its indexes
+are rebuilt one at a time, and an index not rebuilt yet still has its own relfilenode
+with the new heap; such a `pg_cuvs_hnsw` index is then built from the table instead of
+the source. `ALTER TABLE ... SET TABLESPACE` gives the table a new relfilenode with the
+same rows and TIDs and leaves its indexes alone, so their builds stay in use for
+searches and inserts; such a build is not exported as a source any more (a `REINDEX` of
+a `pg_cuvs_hnsw` index on it builds from the table, and `pg_cuvs_build_hnsw` refuses
+with 55000) until the `cagra` index is rebuilt. The catalog gives the index a new
+relfilenode when its contents are rebuilt by `REINDEX`, `TRUNCATE`, `CLUSTER`, `VACUUM
+FULL` or a rewriting `ALTER TABLE`, and gives the old one back when that rolls back, so
+a build of another heap or of a rolled-back state is not used. Two rebuilds keep the
+relfilenode: a `TRUNCATE` of a table created, or already given a new relfilenode, in the
+same transaction (PostgreSQL empties it in place), and `ON COMMIT DELETE ROWS` of a
+temporary table; there the rebuild with no rows rewrites the record as an empty build. A
+crash reset of an `UNLOGGED` table also keeps it (see below). An index that is not
+current answers from the heap and
+`pg_stat_gpu_fallback.last_reason` is `not_current` until `REINDEX INDEX`. A rebuild
+with no rows writes no record, so after a `TRUNCATE` that commits the index answers from
+the heap until `REINDEX INDEX` with rows, and the old build is dropped from the daemon
+at commit; a `TRUNCATE` that rolls back changes nothing. `pg_cuvs_batch_search`,
+`cuvs_filtered_knn` and the filtered custom scan have no exact path: on an index that is
+not current they fail with SQLSTATE 55000 and a `REINDEX` hint. Four cases answer from
+the heap although the build would still be right (known limits): a rolled-back `REINDEX`
+of an unchanged table, `ALTER INDEX ... SET TABLESPACE` (a new relfilenode without a
+build), an `UNLOGGED` table's index after any restart of PostgreSQL (its contents are
+reset after a crash without a new relfilenode, so the record also keeps the postmaster
+start time), and a transaction that runs `ALTER TABLE ... SET TABLESPACE` and then
+`TRUNCATE` and rolls back (the `TRUNCATE` empties the index in place and rewrites the
+record as empty; the rollback does not bring the record back). A record of an earlier
+version (heap relfilenode and table oid) is accepted when both still match the table;
+its contents are not rewritten, so this also holds on a standby or with a read-only
+`index_dir`: requests carry the table's relfilenode and the daemon accepts a build
+loaded with such a record for the same heap. The backend makes such a record readable
+(mode 0644) for a daemon running as another user; where that cannot be done and the
+daemon cannot read the record, the first statement on the index fails with SQLSTATE
+55000 and the next ones in that session answer from the heap, prepared statements and
+generic plans included (their plans are invalidated at once), until the index gets a new
+relfilenode. A record of an earlier version knows only the table's relfilenode, so after
+an `ALTER TABLE ... SET TABLESPACE` such an index answers from the heap until `REINDEX
+INDEX`; a session that judged it before the move gets one 55000 on its next statement,
+and then the heap. Known limit (not run): an expression or a partial-index predicate
+that queries the same table while a rewrite rebuilds the indexes (a function that breaks
+IMMUTABLE) may use an index not rebuilt yet. An `ivfpq` index of an earlier version has
+no record, and an `UNLOGGED` index's earlier record is not accepted, so those answer
+from the heap until `REINDEX INDEX`. States of an earlier version that cannot be told
+apart from a good one keep answering as they did in 0.9.2, which answered wrongly in
+them: an index rebuilt with no rows while the table kept its relfilenode, that is a
+`TRUNCATE` that emptied the table in place (in the transaction that created it, or after
+another `TRUNCATE` or rewrite in that transaction) and a `REINDEX` committed while no
+row had a vector (all rows deleted without `TRUNCATE`, or the column NULL in every row);
+and a `REINDEX` rolled back inside a savepoint after a committed `TRUNCATE`. Run with a
+0.9.2 build and then this version (CPU shim), an index emptied in place by `TRUNCATE` answered
+with the same wrong rows after the upgrade, unless the plan-time delete-drift gate
+(`cuvs.max_stale_fraction`) sent it to the heap because its build held more rows than the
+table; that gate, not the build record, is what told those apart. Rebuild an
+index that may have gone through one of them. `pg_cuvs_build_identity_status()` lists
+the indexes that are not current, with the reason; it only reads, and an index locked by
+another session (a `REINDEX`, a `DROP`) is listed as not judged instead of waited for. A
+build that is not used is not reclaimed either: the daemon keeps it in GPU memory and in
+its registry, with its files, until the next `REINDEX` or `DROP` of the index; for an
+`ivfpq` index a `DROP` does not free its GPU memory yet either (a separate fix,
+#251), so there only a daemon restart does. That holds for a
+rolled-back build (also when a `TRUNCATE` commits while a rebuild with rows rolls back
+inside a savepoint), the build of an index moved with `SET TABLESPACE`, the build of an
+index of an earlier version, and the build of an `UNLOGGED` index after a restart.
 
 Marking an index stale immediately invalidates cached plans for its parent
 table, including when the writing transaction later rolls back. When marker IPC

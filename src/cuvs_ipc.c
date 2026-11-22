@@ -69,6 +69,16 @@ cuvs_ipc_set_cagra_search_params(uint32_t itopk_size, uint32_t search_width)
     g_cagra_search_width = search_width;
 }
 
+/* see send_cmd. */
+static uint32_t g_identity_oid, g_identity_rfn, g_identity_heap;
+void
+cuvs_ipc_set_index_identity(uint32_t index_oid, uint32_t index_relfilenode, uint32_t heap_relfilenode)
+{
+    g_identity_oid = index_oid;
+    g_identity_rfn = index_relfilenode;
+    g_identity_heap = heap_relfilenode;
+}
+
 void
 cuvs_ipc_set_daemon_uid(int uid)
 {
@@ -91,7 +101,7 @@ cuvs_ipc_set_daemon_uid(int uid)
 static void forget_reply(void);
 
 static int
-uds_connect_wait(const char *socket_path, int recv_timeout_sec, int *canceled)
+uds_connect_wait_impl(const char *socket_path, int recv_timeout_sec, int *canceled)
 {
     int fd;
 
@@ -308,6 +318,21 @@ uds_connect_wait(const char *socket_path, int recv_timeout_sec, int *canceled)
     return fd;
 }
 
+/* an IPC that returns before send_cmd (no daemon) would leave the identity set for a later frame of the same
+ * index; a failed connect drops it. */
+static int
+uds_connect_wait(const char *socket_path, int recv_timeout_sec, int *canceled)
+{
+    int fd = uds_connect_wait_impl(socket_path, recv_timeout_sec, canceled);
+    if (fd < 0)
+    {
+        g_identity_oid = 0;
+        g_identity_rfn = 0;
+        g_identity_heap = 0;
+    }
+    return fd;
+}
+
 static int
 uds_connect_ex(const char *socket_path, int recv_timeout_sec)
 {
@@ -408,6 +433,12 @@ send_cmd(int fd, CuvsCmdFrame *cmd)
 {
     cmd->proto_magic = CUVS_PROTO_MAGIC;
     cmd->proto_version = CUVS_PROTO_VERSION;
+    /* the identity set for this index goes with this one frame only, so a path that does not set it sends 0 and is refused. */
+    cmd->index_relfilenode = (g_identity_oid != 0 && cmd->index_oid == g_identity_oid) ? g_identity_rfn : 0;
+    cmd->heap_relfilenode = (g_identity_oid != 0 && cmd->index_oid == g_identity_oid) ? g_identity_heap : 0;
+    g_identity_oid = 0;
+    g_identity_rfn = 0;
+    g_identity_heap = 0;
     if (cmd->op == CUVS_OP_SEARCH || cmd->op == CUVS_OP_SEARCH_BATCH)
     {
         cmd->itopk_size = g_cagra_itopk_size;

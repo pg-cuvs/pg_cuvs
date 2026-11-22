@@ -1068,3 +1068,12 @@ ORDER BY c.oid
 $$;
 COMMENT ON FUNCTION pg_cuvs_hnsw_layer_status() IS
     'Every pg_cuvs_hnsw index the caller can read: whether it has the upper layers mode nsw lacked before 0.9.3, and why not. A heap build answers from its recorded hierarchy flag; a CAGRA-source build from the share of elements above level 0 (expected about 1/m; fewer than a quarter of that means no upper layers). Reads every page of every such index.';
+
+-- which cagra, flat and ivfpq indexes answer from the table until REINDEX, and why.
+CREATE FUNCTION pg_cuvs_build_identity_status(
+    OUT index regclass, OUT access_method name, OUT current boolean, OUT reason text)
+RETURNS SETOF record
+AS 'MODULE_PATHNAME', 'pg_cuvs_build_identity_status'
+LANGUAGE C STRICT VOLATILE;
+COMMENT ON FUNCTION pg_cuvs_build_identity_status() IS
+  'Every cagra, flat and ivfpq index of this database: whether its GPU build is the one for the index as the catalog has it now (current), and the reason when it is not. Such an index answers from the table until REINDEX INDEX.';

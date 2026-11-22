@@ -1,0 +1,107 @@
+Parsed test spec with 2 sessions
+
+starting permutation: s1_search s2_rebuild_rollback s1_search s1_reason s1_search s1_reason
+step s1_search: SELECT string_agg(id::text, ',' ORDER BY d, id) AS ids FROM (SELECT id, v <-> '[1,0,0,0]' d FROM bic ORDER BY v <-> '[1,0,0,0]' LIMIT 5) s;
+ids      
+---------
+1,2,3,4,5
+(1 row)
+
+step s2_rebuild_rollback: BEGIN; TRUNCATE bic; INSERT INTO bic SELECT 1000+g, ARRAY[31-g,0,0,0]::real[]::vector FROM generate_series(1, 30) g; REINDEX INDEX bic_i; ROLLBACK;
+s1: NOTICE:  pg_cuvs: index "bic_i" answers from the table until REINDEX: built for another relfilenode of the index
+HINT:  pg_cuvs_build_identity_status() lists every such index.
+step s1_search: SELECT string_agg(id::text, ',' ORDER BY d, id) AS ids FROM (SELECT id, v <-> '[1,0,0,0]' d FROM bic ORDER BY v <-> '[1,0,0,0]' LIMIT 5) s;
+ids      
+---------
+1,2,3,4,5
+(1 row)
+
+step s1_reason: SELECT coalesce((SELECT last_reason FROM pg_stat_gpu_fallback WHERE index_oid = 'bic_i'::regclass), 'none') AS last_reason;
+last_reason
+-----------
+not_current
+(1 row)
+
+step s1_search: SELECT string_agg(id::text, ',' ORDER BY d, id) AS ids FROM (SELECT id, v <-> '[1,0,0,0]' d FROM bic ORDER BY v <-> '[1,0,0,0]' LIMIT 5) s;
+ids      
+---------
+1,2,3,4,5
+(1 row)
+
+step s1_reason: SELECT coalesce((SELECT last_reason FROM pg_stat_gpu_fallback WHERE index_oid = 'bic_i'::regclass), 'none') AS last_reason;
+last_reason
+-----------
+not_current
+(1 row)
+
+
+starting permutation: s1_search s2_reindex_rollback s1_search s1_reason s1_search s1_reason
+step s1_search: SELECT string_agg(id::text, ',' ORDER BY d, id) AS ids FROM (SELECT id, v <-> '[1,0,0,0]' d FROM bic ORDER BY v <-> '[1,0,0,0]' LIMIT 5) s;
+ids      
+---------
+1,2,3,4,5
+(1 row)
+
+step s2_reindex_rollback: BEGIN; REINDEX INDEX bic_i; ROLLBACK;
+s1: NOTICE:  pg_cuvs: index "bic_i" answers from the table until REINDEX: built for another relfilenode of the index
+HINT:  pg_cuvs_build_identity_status() lists every such index.
+step s1_search: SELECT string_agg(id::text, ',' ORDER BY d, id) AS ids FROM (SELECT id, v <-> '[1,0,0,0]' d FROM bic ORDER BY v <-> '[1,0,0,0]' LIMIT 5) s;
+ids      
+---------
+1,2,3,4,5
+(1 row)
+
+step s1_reason: SELECT coalesce((SELECT last_reason FROM pg_stat_gpu_fallback WHERE index_oid = 'bic_i'::regclass), 'none') AS last_reason;
+last_reason
+-----------
+not_current
+(1 row)
+
+step s1_search: SELECT string_agg(id::text, ',' ORDER BY d, id) AS ids FROM (SELECT id, v <-> '[1,0,0,0]' d FROM bic ORDER BY v <-> '[1,0,0,0]' LIMIT 5) s;
+ids      
+---------
+1,2,3,4,5
+(1 row)
+
+step s1_reason: SELECT coalesce((SELECT last_reason FROM pg_stat_gpu_fallback WHERE index_oid = 'bic_i'::regclass), 'none') AS last_reason;
+last_reason
+-----------
+not_current
+(1 row)
+
+
+starting permutation: s1_prepare s1_execute s2_rebuild_rollback s1_execute s1_execute s1_execute s1_reason
+step s1_prepare: SET plan_cache_mode = force_generic_plan; PREPARE q AS SELECT string_agg(id::text, ',' ORDER BY d, id) AS ids FROM (SELECT id, v <-> '[1,0,0,0]' d FROM bic ORDER BY v <-> '[1,0,0,0]' LIMIT 5) s;
+step s1_execute: EXECUTE q;
+ids      
+---------
+1,2,3,4,5
+(1 row)
+
+step s2_rebuild_rollback: BEGIN; TRUNCATE bic; INSERT INTO bic SELECT 1000+g, ARRAY[31-g,0,0,0]::real[]::vector FROM generate_series(1, 30) g; REINDEX INDEX bic_i; ROLLBACK;
+s1: NOTICE:  pg_cuvs: index "bic_i" answers from the table until REINDEX: built for another relfilenode of the index
+HINT:  pg_cuvs_build_identity_status() lists every such index.
+step s1_execute: EXECUTE q;
+ids      
+---------
+1,2,3,4,5
+(1 row)
+
+step s1_execute: EXECUTE q;
+ids      
+---------
+1,2,3,4,5
+(1 row)
+
+step s1_execute: EXECUTE q;
+ids      
+---------
+1,2,3,4,5
+(1 row)
+
+step s1_reason: SELECT coalesce((SELECT last_reason FROM pg_stat_gpu_fallback WHERE index_oid = 'bic_i'::regclass), 'none') AS last_reason;
+last_reason
+-----------
+not_current
+(1 row)
+

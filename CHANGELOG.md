@@ -75,6 +75,26 @@ exists for 0.9.0.
   With `source`, modes `nsw` and `hnsw` now give the same graph, and a pgvector version
   outside the supported range is an error, as for a heap build.
 
+- An index scan, `pg_cuvs_batch_search` or `cuvs_filtered_knn` on a `cagra`, `flat` or
+  `ivfpq` index could return wrong rows without an error after the index was rebuilt
+  under the same OID while the daemon kept another build: after `TRUNCATE` (and after
+  any rebuild that found no rows: `REINDEX`, `VACUUM FULL`, `CLUSTER` or a rewriting
+  `ALTER TABLE` of a table with no live rows), the rebuild returned without telling the
+  daemon; after a rolled-back `REINDEX` of a refilled table, or one inside a rolled-back
+  savepoint, the daemon kept the rolled-back build; and an index with a per-index
+  `index_dir` kept its old files after `TRUNCATE` (on `main` it answered with them: in
+  one run the ids `1200,1199,1003,1002,1001` where the table gives
+  `1200,1199,1198,1197,1196`). Reproduced on `main` and on 0.9.2 for all three access
+  methods. A build is now used only for the index relfilenode it was built for: the
+  build records it, the planner takes the index only while the record matches the
+  catalog, and the daemon refuses requests that carry another value. An index that is
+  not current answers from the heap (`pg_stat_gpu_fallback.last_reason = not_current`)
+  until `REINDEX INDEX`; the functions fail with 55000. A rebuild with no rows writes no
+  record and drops the old build from the daemon at commit.
+- The same rule sends three cases to the heap until `REINDEX INDEX` although the build
+  would still be right: a rolled-back `REINDEX` of an unchanged table, `ALTER INDEX ...
+  SET TABLESPACE`, and the index of an `UNLOGGED` table after any restart of PostgreSQL
+  (a crash resets it without a new relfilenode).
 - Documentation: the README batch example, `docs/reference.md` and ADR-040 said that
   joining the results of `pg_cuvs_batch_search` and `cuvs_filtered_knn` on `ctid` gives
   the visible rows. That join silently drops HOT-updated rows, because the functions
@@ -98,23 +118,23 @@ exists for 0.9.0.
   The planner flags now pass it, as the SDK's own build does. Builds without the
   planner are unchanged. 0.9.1 and 0.9.2 have the same defect.
 
-## [0.9.2] - 2026-11-15
+### Upgrading
 
-Micro-batched index scans no longer fail with 64 or more concurrent clients
-
-The GPU regression workflow (`gpu.yml`) was not run on `release/v0.9.2`. The fix
-below was run on one GPU host: 1x A100-SXM4-80GB, 24 vCPU, PostgreSQL 16.15, cuVS
-26.04 built with SDK patches 0001-0004, 0006 and 0007, 999,000 x 768 float32
-vectors, L2, `LIMIT 10`, pgbench in prepared mode, 30 s per run, one run per client
-count unless noted. With a `cagra` index, `cuvs.k = 100` and
-`cuvs.cagra_batch_wait_us = 200`, the source of 0.9.1 plus the version bump
-(`dfdce616`) aborted 14 and 11 of 64 clients (two runs) and 461 of 512; the source
-of this release aborted none at 64, 128, 256 and 2048 clients. With a `flat` index,
-`cuvs.k = 10` and `cuvs.bf_batch_wait_us = 200`, `dfdce616` aborted 4 of 64 clients
-and this release none at 64 and 256.
-
-### Fixed
-
+- The extension and the daemon must be upgraded together: the IPC protocol is 6
+  (requests carry the index's and its table's relfilenodes). With a mixed pair every request to the
+  daemon fails with a protocol-mismatch error, index scans included, until both are the
+  same version.
+- Most `cagra` and `flat` indexes are used as before: their build record of an earlier
+  version is accepted when it still matches the table (its contents are not rewritten, so
+  standbys and read-only index directories recover the same way). `ivfpq` indexes (no record) and
+  indexes of `UNLOGGED` tables answer from the heap until `REINDEX INDEX`, and
+  `pg_cuvs_batch_search` and `cuvs_filtered_knn` fail with SQLSTATE 55000 on them; `SELECT
+  * FROM pg_cuvs_build_identity_status() WHERE NOT current` lists them, and the first
+  backend that plans one says so once. Rebuild also an index that may have gone through a
+  state an earlier record cannot reveal (docs/reference.md): rebuilt with no rows while its
+  table kept its relfilenode (a `TRUNCATE` that emptied the table in place, a `REINDEX`
+  committed while no row had a vector), or a `REINDEX` rolled back inside a savepoint after
+  a committed `TRUNCATE`.
 - With a CAGRA or brute-force micro-batch window (`cuvs.cagra_batch_wait_us` or
   `cuvs.bf_batch_wait_us` > 0) and 64 pgbench clients, some statements failed with
   `GPU daemon unavailable after planning` while the daemon was running. A batch

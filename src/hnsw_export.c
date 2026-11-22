@@ -93,6 +93,11 @@ extern char *cuvs_socket_path;
 /* #162: read-only accessor into pg_cuvs.c's local CuvsCagraOptions —
  * used by the pre-GPU dim-ceiling check below. */
 extern int cuvs_cagra_reloption_graph_degree(Relation cagra_rel);
+/* (pg_cuvs.c): the build identity of the source cagra index. */
+extern bool cuvs_build_current_oid(Oid index_oid);
+extern bool cuvs_build_current_strict_oid(Oid index_oid);   /* exports need the table's relfilenode too */
+extern void cuvs_identity_oid(Oid index_oid);
+extern void cuvs_report_not_current(Oid index_oid) pg_attribute_noreturn();
 
 static uint32_t cagra_index_metric(Oid index_oid);
 
@@ -2169,6 +2174,7 @@ fill_hnsw_from_hnswlib_impl(Oid cagra_oid, Oid hnsw_oid, bool use_shm,
         /* Request daemon to run from_cagra() → /dev/shm (no disk I/O) */
         if (!cuvs_socket_path || cuvs_socket_path[0] == '\0')
             ereport(ERROR, (errmsg("pg_cuvs: daemon socket not set")));
+        cuvs_identity_oid(cagra_oid);
         int shm_rc = cuvs_ipc_export_hnsw_shm(
             cuvs_socket_path, db_oid, index_oid, hnsw_path, sizeof(hnsw_path),
             &res->shm_fd);
@@ -2666,6 +2672,12 @@ fill_hnsw_from_hnswlib(Oid cagra_oid, Oid hnsw_oid, bool use_shm)
      * usual idiom, safe because the value is only consumed after the jump.
      */
     volatile HnswFillRes res;
+
+    /* the source's build must be the one made for the cagra index as the catalog has it now (not a rolled-back or emptied one,
+     * which names other rows); there is no exact path to take instead. Both entries (pg_cuvs_hnsw source mode, pg_cuvs_build_hnsw)
+     * come through here. */
+    if (!cuvs_build_current_strict_oid(cagra_oid))
+        cuvs_report_not_current(cagra_oid);
 
     memset((void *) &res, 0, sizeof(res));
     res.shm_fd = -1;            /* #165: 0 is stdin — never a valid sentinel */
@@ -3901,9 +3913,12 @@ fill_hnsw_from_cagra_ipc_impl(Oid cagra_oid, Oid hnsw_oid, const char *mode,
     {
         size_t up_n = 0;
         int    up_degree = 0, up_dim = 0;
-        int    urc = cuvs_ipc_export_hnsw_upper(cuvs_socket_path, (uint32_t)MyDatabaseId,
-                                                (uint32_t)cagra_oid, &res->shm_fd,
-                                                &res->tids_fd, &up_n, &up_degree, &up_dim);
+        int    urc;
+
+        cuvs_identity_oid(cagra_oid);   /* the daemon refuses a build that is not the source's current one */
+        urc = cuvs_ipc_export_hnsw_upper(cuvs_socket_path, (uint32_t)MyDatabaseId,
+                                         (uint32_t)cagra_oid, &res->shm_fd,
+                                         &res->tids_fd, &up_n, &up_degree, &up_dim);
 
         if (urc == CUVS_STATUS_OK)
         {
@@ -3967,6 +3982,7 @@ fill_hnsw_from_cagra_ipc_impl(Oid cagra_oid, Oid hnsw_oid, const char *mode,
     int       graph_degree, ipc_dim;
     uint32_t  src_metric;
 
+    cuvs_identity_oid(cagra_oid);
     int rc = cuvs_ipc_export_adjacency(
         cuvs_socket_path,
         (uint32_t)MyDatabaseId,
@@ -4244,6 +4260,12 @@ fill_hnsw_from_cagra_ipc(Oid cagra_oid, Oid hnsw_oid, const char *mode)
 {
     /* #166 review 3: volatile across the longjmp — see fill_hnsw_from_hnswlib. */
     volatile HnswFillRes res;
+
+    /* the source's build must be the one made for the cagra index as the catalog has it now (not a rolled-back or emptied one,
+     * which names other rows); there is no exact path to take instead. Both entries (pg_cuvs_hnsw source mode, pg_cuvs_build_hnsw)
+     * come through here. */
+    if (!cuvs_build_current_strict_oid(cagra_oid))
+        cuvs_report_not_current(cagra_oid);
 
     memset((void *) &res, 0, sizeof(res));
     res.shm_fd = -1;            /* #165: 0 is stdin — never a valid sentinel */
@@ -4696,6 +4718,51 @@ pg_cuvs_hnsw_build_info(PG_FUNCTION_ARGS)
     PG_RETURN_DATUM(DirectFunctionCall1(jsonb_in, CStringGetDatum(json.data)));
 }
 
+/* The heap mode of cuvs_hnsw_ambuild: build an ephemeral CAGRA from the heap and convert it into this index. Also taken by a
+ * source-mode build whose source's build is not the one for the source index as the catalog has it now (a table
+ * rewritten by VACUUM FULL, CLUSTER or ALTER TABLE rebuilds its indexes one by one, and the source may come after;
+ * a source rebuilt with no vectors). */
+static void
+cuvs_hnsw_build_heap_mode(Relation heapRel, Relation indexRel, IndexInfo *indexInfo, const char *mode, uint32_t build_algo,
+                          uint32_t requested_ef, int precheck_dim, int precheck_bytes_per_dim, int safe_maxlevel,
+                          IndexBuildResult *result)
+{
+    volatile CuvsHnswBuildResult build;
+
+    /* The helper uses graph degree 64, which serializes HNSW M=32. */
+    check_hnsw_page_fit(precheck_dim, precheck_bytes_per_dim,
+                        CUVS_HNSW_BUILD_M, safe_maxlevel);
+    memset((void *)&build, 0, sizeof(build));
+    ((CuvsHnswBuildResult *)&build)->hnsw_fd = -1;
+    ((CuvsHnswBuildResult *)&build)->tids_fd = -1;
+    PG_TRY();
+    {
+        CuvsHnswBuildResult *b = (CuvsHnswBuildResult *)&build;
+        cuvs_build_hnsw_from_heap(heapRel, indexRel, indexInfo, mode, build_algo, requested_ef, b);
+        result->heap_tuples = b->reltuples;
+        result->index_tuples = (double)b->n_vecs;
+        if (b->n_vecs > 0)
+            hnsw_import_build_result(indexRel, b, false, true);	/* the graph has upper layers, so not the level-0-only packing */
+        else
+            hnsw_import_empty_build_result(indexRel, b);
+    }
+    PG_FINALLY();
+    {
+        CuvsHnswBuildResult *b = (CuvsHnswBuildResult *)&build;
+        if (b->hnsw_fd >= 0)
+        {
+            close(b->hnsw_fd);
+            b->hnsw_fd = -1;
+        }
+        if (b->tids_fd >= 0)
+        {
+            close(b->tids_fd);
+            b->tids_fd = -1;
+        }
+    }
+    PG_END_TRY();
+}
+
 /* ambuild: build a pgvector-HNSW index, served by pgvector (Phase 3K).
  *
  * Two modes (ADR-041):
@@ -4751,41 +4818,8 @@ cuvs_hnsw_ambuild(Relation heapRel, Relation indexRel, IndexInfo *indexInfo)
     /* ── Source-less: build and convert from regular disk files. ── */
     if (source_name[0] == '\0')
     {
-        volatile CuvsHnswBuildResult build;
-
-        /* The helper uses graph degree 64, which serializes HNSW M=32. */
-        check_hnsw_page_fit(precheck_dim, precheck_bytes_per_dim,
-                            CUVS_HNSW_BUILD_M, safe_maxlevel);
-        memset((void *)&build, 0, sizeof(build));
-        ((CuvsHnswBuildResult *)&build)->hnsw_fd = -1;
-        ((CuvsHnswBuildResult *)&build)->tids_fd = -1;
-        PG_TRY();
-        {
-            CuvsHnswBuildResult *b = (CuvsHnswBuildResult *)&build;
-            cuvs_build_hnsw_from_heap(heapRel, indexRel, indexInfo, mode, build_algo, requested_ef, b);
-            result->heap_tuples = b->reltuples;
-            result->index_tuples = (double)b->n_vecs;
-            if (b->n_vecs > 0)
-                hnsw_import_build_result(indexRel, b, false, true);	/* the graph has upper layers, so not the level-0-only packing */
-            else
-                hnsw_import_empty_build_result(indexRel, b);
-        }
-        PG_FINALLY();
-        {
-            CuvsHnswBuildResult *b = (CuvsHnswBuildResult *)&build;
-            if (b->hnsw_fd >= 0)
-            {
-                close(b->hnsw_fd);
-                b->hnsw_fd = -1;
-            }
-            if (b->tids_fd >= 0)
-            {
-                close(b->tids_fd);
-                b->tids_fd = -1;
-            }
-        }
-        PG_END_TRY();
-
+        cuvs_hnsw_build_heap_mode(heapRel, indexRel, indexInfo, mode, build_algo, requested_ef,
+                                  precheck_dim, precheck_bytes_per_dim, safe_maxlevel, result);
         return result;
     }
 
@@ -4858,6 +4892,39 @@ cuvs_hnsw_ambuild(Relation heapRel, Relation indexRel, IndexInfo *indexInfo)
      * object this backend already holds (the index under construction) is a
      * no-op re-grant, and the freshly created relation has 0 blocks so no
      * truncate happens. */
+    /* a source-mode index on a table with no rows (TRUNCATE rebuilds every index with zero rows, the source cagra index first)
+     * is built empty, as the heap mode builds it; the source's build is the table's earlier contents, not this one's. */
+    if (RelationGetNumberOfBlocks(heapRel) == 0)
+    {
+        CuvsHnswBuildResult empty;
+        memset(&empty, 0, sizeof(empty));
+        empty.hnsw_fd = -1;
+        empty.tids_fd = -1;
+        empty.dim = (uint32_t) TupleDescAttr(RelationGetDescr(indexRel), 0)->atttypmod;
+        empty.metric = cagra_index_metric(self_oid);
+        hnsw_import_empty_build_result(indexRel, &empty);
+        result->heap_tuples  = 0;
+        result->index_tuples = 0;
+        return result;
+    }
+    /* the source's build names other rows than the table has now. Build from the heap instead, as
+     * the heap mode does, rather than fail the statement (a VACUUM FULL, CLUSTER, REINDEX TABLE). */
+    if (!cuvs_build_current_strict_oid(cagra_oid))
+    {
+        /* a WARNING, so that a session that does not show NOTICEs (automation) still sees that the index was not
+         * built from its source: it is a heap-mode build (graph degree 64, M 32, whatever the source's; pg_cuvs_hnsw_build_info shows
+         * what was built), and a table rewrite builds a CAGRA once more for it. pg_cuvs_build_hnsw, which names the source to
+         * convert, refuses instead (fill_hnsw_from_cagra_ipc). */
+        ereport(WARNING,
+                (errmsg("pg_cuvs_hnsw: the build of source \"%s\" is not the one for its index now; index \"%s\" is built from the table",
+                        source_name, RelationGetRelationName(indexRel)),
+                 errdetail("It is a heap-mode build: its graph degree is the heap mode's, not the source's."),
+                 errhint("REINDEX INDEX %s and then REINDEX INDEX %s to build it from the source again.",
+                         quote_identifier(source_name), quote_identifier(RelationGetRelationName(indexRel)))));
+        cuvs_hnsw_build_heap_mode(heapRel, indexRel, indexInfo, mode, CUVS_HNSW_ALGO_AUTO, requested_ef,
+                                  precheck_dim, precheck_bytes_per_dim, safe_maxlevel, result);
+        return result;
+    }
     size_t n_elems_written;
     if (strcmp(mode, "nsw") == 0 || strcmp(mode, "hnsw") == 0)
         n_elems_written = fill_hnsw_from_cagra_ipc(cagra_oid, self_oid, mode);

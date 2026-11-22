@@ -154,7 +154,7 @@ inputs, not a tested minimum-version matrix for every GPU and driver.
   receipt records the requested count and says the effective count is not guaranteed,
   and `CREATE INDEX` raises a NOTICE; see [HNSW build options](docs/hnsw-build-options.md).
 - Deploy the extension and daemon from the same revision: global IPC protocol
-  v5 and HNSW op-23 payload v6 are separate compatibility checks.
+  v6 and HNSW op-23 payload v6 are separate compatibility checks.
 
 ## Use cases
 
