@@ -1,0 +1,28 @@
+-- hnsw_layer_status.sql — pg_cuvs_hnsw_layer_status() counts an element above level 0 without a level-1 link as a
+-- defect only when two or more elements are above level 0. 40 rows converted from a CAGRA graph of degree 32 (M = 16)
+-- draw exactly one upper element (the levels follow from the row count and M), the entry point, which has nobody to
+-- link to; REINDEX would draw the same. That index must not be reported as needing a REINDEX.
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS vector;
+CREATE EXTENSION IF NOT EXISTS pg_cuvs;
+RESET client_min_messages;
+CREATE TABLE ls (id int, v vector(8));
+INSERT INTO ls SELECT g, (SELECT array_agg(((hashtext(g::text || ':' || d::text) & 65535) / 65536.0)::real) FROM generate_series(1, 8) d)::vector
+FROM generate_series(1, 40) g;
+SET client_min_messages = 'error';
+CREATE INDEX ls_c ON ls USING cagra (v vector_l2_ops) WITH (graph_degree = 32);
+CREATE INDEX ls_h ON ls USING pg_cuvs_hnsw (v vector_l2_ops) WITH (source = 'ls_c', mode = 'nsw');
+RESET client_min_messages;
+SELECT elements, upper_elements, m, level1_unlinked FROM pg_cuvs_hnsw_layer_counts('ls_h');
+ elements | upper_elements | m  | level1_unlinked 
+----------+----------------+----+-----------------
+       40 |              1 | 16 |               1
+(1 row)
+
+SELECT current IS NOT FALSE AS not_flagged, reason FROM pg_cuvs_hnsw_layer_status() WHERE index = 'ls_h'::regclass;
+ not_flagged |                            reason                            
+-------------+--------------------------------------------------------------
+ t           | too few elements to tell from the layers (fewer than 16 x m)
+(1 row)
+
+DROP TABLE ls;
