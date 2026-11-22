@@ -1785,8 +1785,6 @@ cuvs_ipc_export_hnsw_upper(
     char token;
 
     *hnsw_fd_out = *tids_fd_out = -1;
-    /* The daemon copies under its lock and then runs hnswlib insertion over
-     * every row: as long as EXPORT_HNSW_SHM's from_cagra. */
     sock = uds_connect_ex(socket_path, 120);
     if (sock < 0)
         return CUVS_STATUS_UNAVAILABLE;
@@ -1798,6 +1796,28 @@ cuvs_ipc_export_hnsw_upper(
     };
     if (send_cmd(sock, &cmd) < 0)
         goto cleanup;
+
+    /* The daemon replies only after building the upper layers, which grows
+     * with the index and may take longer than any fixed receive timeout. Wait
+     * for the reply without one, in 250 ms slices that ask the wait callback
+     * (query cancel, statement_timeout): on a cancel the socket is closed,
+     * which the daemon takes as the signal to stop building. A daemon that
+     * exits closes the socket as well and ends the wait. */
+    for (;;)
+    {
+        struct pollfd pfd = { .fd = sock, .events = POLLIN, .revents = 0 };
+        int pr = poll(&pfd, 1, 250);
+
+        if (pr > 0)
+            break;
+        if (pr < 0 && errno != EINTR)
+            goto cleanup;
+        if (g_wait_cb && g_wait_cb())
+        {
+            rc = CUVS_STATUS_CANCELED;
+            goto cleanup;
+        }
+    }
 
     CuvsReplyHeader hdr;
     if (cuvs_fd_recv(sock, &hdr, sizeof(hdr), &hnsw_fd) < 0)

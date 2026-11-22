@@ -526,14 +526,6 @@ int cuvs_hnsw_serialize(CuvsCagraIndex cagra_idx, const char *path, int device_i
   if (ix->n < CUVS_HNSW_MIN_ELEMENTS) return CUVS_HNSW_SERIALIZE_SKIPPED;
   return shim_write(ix, path); }
 
-/* The shim has no hnswlib; the backend keeps its own levels. */
-int cuvs_hnsw_upper_from_graph(const uint32_t *graph, int64_t n, int degree,
-                               const float *vecs, int dim, uint32_t metric,
-                               int ef_construction, const char *path, int device_id)
-{ (void)graph; (void)n; (void)degree; (void)vecs; (void)dim; (void)metric;
-  (void)ef_construction; (void)path; (void)device_id;
-  return CUVS_HNSW_SERIALIZE_SKIPPED; }
-
 CuvsHnswIndex cuvs_hnsw_deserialize(const char *path, int dim, uint32_t metric, int device_id)
 { (void)dim; (void)metric; (void)device_id; return (CuvsHnswIndex) shim_read(path); }
 
@@ -552,7 +544,7 @@ void cuvs_hnsw_free(CuvsHnswIndex hidx) { shim_free((ShimIndex *)hidx); }
 int
 cuvs_cagra_extract_adjacency(CuvsCagraIndex handle, uint32_t **adj_out,
                              float **vecs_out, size_t *n_vecs_out,
-                             int *graph_degree_out, int device_id)
+                             int *graph_degree_out, int *dim_out, int device_id)
 {
     (void)device_id;
     ShimIndex *ix = (ShimIndex *)handle;
@@ -576,6 +568,7 @@ cuvs_cagra_extract_adjacency(CuvsCagraIndex handle, uint32_t **adj_out,
     }
     free(nbr);
     *adj_out = adj; *vecs_out = vecs; *n_vecs_out = (size_t)ix->n; *graph_degree_out = gd;
+    *dim_out = ix->dim;
     return 0;
 }
 

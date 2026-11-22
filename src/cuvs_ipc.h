@@ -187,9 +187,9 @@ int cuvs_ipc_build_hnsw_file_idle(const char *socket_path, int vectors_fd,
 #define CUVS_STATUS_CANCELED      11   /* 3S: backend aborted the wait (statement_timeout / query cancel) */
 #define CUVS_STATUS_PROTO_MISMATCH 12  /* #77: daemon/extension wire-protocol skew (co-deploy both) */
 #define CUVS_STATUS_HNSW_RESIDENT_BUDGET_EXCEEDED 13 /* AUTO/explicit IVF estimate only; not tiny/ACE/OOM */
-#define CUVS_STATUS_HNSW_UPPER_SKIPPED 14 /* EXPORT_HNSW_UPPER built no upper layers (fewer than
-                                           * CUVS_HNSW_MIN_ELEMENTS rows, or the CPU shim); the
-                                           * backend keeps its own level assignment */
+#define CUVS_STATUS_HNSW_UPPER_SKIPPED 16 /* EXPORT_HNSW_UPPER built no upper layers (the
+                                           * graph degree is below 4, so M < 2); the backend
+                                           * keeps its own level assignment */
 
 /* ----------------------------------------------------------------
  * Command frame (sent over UDS, fixed size)
@@ -1107,9 +1107,12 @@ int cuvs_ipc_inject_build_oom(
 
 /* a loaded CAGRA index as an hnswlib file with upper layers. The daemon
  * copies the graph, vectors and TIDs under the registry lock exactly as
- * CUVS_OP_EXPORT_ADJACENCY does, releases it, and builds the upper layers by
- * hnswlib insertion over those copies; level 0 is the CAGRA graph cut to
- * min(graph_degree, 64) rounded down to even. Reply: the header with
+ * CUVS_OP_EXPORT_ADJACENCY does, releases it, and builds the upper layers on
+ * the host over those copies (cuvs_hnsw_upper.c; one such build at a time,
+ * stopped when the client goes); level 0 is the CAGRA graph cut to
+ * min(graph_degree, 64) rounded down to even, without self links or duplicates.
+ * The client waits for the reply without a receive timeout, asking its wait
+ * callback, and closes the socket on a cancel. Reply: the header with
  * n_results = rows, latency_us = level-0 degree, delta_merged = dim and the
  * hnswlib file as an SCM_RIGHTS memfd, then one byte with a second memfd
  * holding a CuvsTidsHeader (its metric is the source metric) and the TIDs in

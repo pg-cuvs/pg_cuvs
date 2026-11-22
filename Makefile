@@ -251,12 +251,16 @@ src/cuvs_cache_policy_server.o: src/cuvs_cache_policy.c src/cuvs_cache_policy.h 
 src/cuvs_build_corpus_server.o: src/cuvs_build_corpus.c src/cuvs_build_corpus.h
 	$(CC) $(SERVER_CFLAGS) -c $< -o $@
 
+# host-built HNSW upper layers for CUVS_OP_EXPORT_HNSW_UPPER (plain C, both daemon builds)
+src/cuvs_hnsw_upper_server.o: src/cuvs_hnsw_upper.c src/cuvs_hnsw_upper.h
+	$(CC) $(SERVER_CFLAGS) -c $< -o $@
+
 # CI Tier 1: pure-C CPU shim object (no CUDA). Shared by the .so and the daemon
 # (same object both link cuvs_wrapper.o today). Built with gcc, -fPIC for the .so.
 src/cuvs_wrapper_shim_cpu.o: src/cuvs_wrapper_shim_cpu.c src/cuvs_wrapper.h src/cuvs_ipc.h
 	$(CC) -O2 -g -fPIC -I./src -std=gnu11 -c $< -o $@
 
-$(SERVER_BIN): src/pg_cuvs_server.o src/cuvs_ipc_server.o src/cuvs_util_server.o src/cuvs_objstore_server.o src/cuvs_build_corpus_server.o src/cuvs_cache_policy_server.o src/cuvs_peak_meter_server.o $(WRAPPER_OBJ)
+$(SERVER_BIN): src/pg_cuvs_server.o src/cuvs_ipc_server.o src/cuvs_util_server.o src/cuvs_objstore_server.o src/cuvs_build_corpus_server.o src/cuvs_cache_policy_server.o src/cuvs_peak_meter_server.o src/cuvs_hnsw_upper_server.o $(WRAPPER_OBJ)
 	$(CXX) -o $@ $^ $(SERVER_LDFLAGS)
 
 server: $(SERVER_BIN)
@@ -1207,6 +1211,16 @@ EXTRA_CLEAN += test-physical-build-guard
 .PHONY: test-physical-build-guard test-physical-build-mutations
 ifeq ($(shell uname -s),Linux)
 test-unit: test-physical-build-guard
+
+# the host upper-layer builder: levels and file size fixed by the input whatever the thread count,
+# every element above level 0 linked on level 1, level 0 without self links or duplicates, the cancel stop.
+test-hnsw-upper: test/unit/test_hnsw_upper.c src/cuvs_hnsw_upper.c src/cuvs_hnsw_upper.h
+	$(CC) -std=gnu11 -O2 -Wall -Wextra -I src -o $@ test/unit/test_hnsw_upper.c src/cuvs_hnsw_upper.c -lm -pthread
+	./$@
+
+test-unit: test-hnsw-upper
+EXTRA_CLEAN += test-hnsw-upper
+.PHONY: test-hnsw-upper
 test-admission-contract-mutations: test-physical-build-mutations
 endif
 test-physical-build-guard:

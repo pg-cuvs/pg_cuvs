@@ -416,18 +416,6 @@ int cuvs_hnsw_reap_workdirs(const char *root);
 
 int           cuvs_hnsw_serialize(CuvsCagraIndex cagra_idx,
                                    const char *path, int device_id);
-/* an hnswlib file at `path` whose level 0 is `graph` (n x degree, every
- * entry < n, degree even) and whose upper layers hnswlib builds by inserting
- * every row of `vecs` (n x dim) in row order, on one thread so that the same
- * input gives the same file, with M = degree / 2 and `ef_construction`.
- * Host copies only, except that cuVS holds the graph on `device_id` while it
- * builds. metric: CUVS_METRIC_L2 or CUVS_METRIC_IP (the caller normalizes
- * cosine rows and passes IP). Same three outcomes as cuvs_hnsw_serialize; the
- * CPU shim returns CUVS_HNSW_SERIALIZE_SKIPPED. */
-int           cuvs_hnsw_upper_from_graph(const uint32_t *graph, int64_t n, int degree,
-                                          const float *vecs, int dim, uint32_t metric,
-                                          int ef_construction, const char *path,
-                                          int device_id);
 CuvsHnswIndex cuvs_hnsw_deserialize(const char *path, int dim,
                                      uint32_t metric, int device_id);
 /* ef <= 0 => use max(200, k) */
@@ -446,6 +434,7 @@ void          cuvs_hnsw_free(CuvsHnswIndex hidx);
  * vecs_out      : [n_vecs * dim] float32 corpus vectors
  * n_vecs_out    : number of vectors
  * graph_degree_out : adjacency list width (CAGRA build parameter)
+ * dim_out       : width of each row of vecs_out (the index's dataset)
  *
  * Returns 0 on success, -1 on failure (logs to stderr).
  */
@@ -455,6 +444,7 @@ int cuvs_cagra_extract_adjacency(
     float         **vecs_out,
     size_t         *n_vecs_out,
     int            *graph_degree_out,
+    int            *dim_out,
     int             device_id
 );
 

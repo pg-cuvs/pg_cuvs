@@ -11,9 +11,11 @@
 -- about 1/32 of the elements carry a larger neighbor tuple. Pairs are packed
 -- in element order, each taking its own size: level-0 pairs still go k=9 to
 -- a page here, and the page count grows by the room the upper-layer pairs
--- take. Levels come from cagra_assign_level() seeded by (N, M), so the page
--- count is a pure function of N, M and dim (measured: 59 pages for N=500 and
--- for N=504, dim 100, M=32; 57 before 0.9.3).
+-- take. Levels come from the cagra_assign_level() draw seeded by (N, M), made
+-- by the daemon's upper-layer builder (cuvs_hnsw_upper.c) or, when it builds
+-- none, by the backend; elements keep row order. So the page count is a pure
+-- function of N, M and dim whatever the builder's thread timing (measured: 59
+-- pages for N=500 and for N=504, dim 100, M=32; 57 before 0.9.3).
 --
 -- Coverage:
 --   1. index_bytes shrinks below the old one-page-per-element size — direct

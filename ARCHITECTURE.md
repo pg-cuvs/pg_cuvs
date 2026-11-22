@@ -234,7 +234,9 @@ in `pg_stat_gpu_fallback`; daemon replies are recorded in `pg_stat_gpu_search`.
   **BUILD_HNSW_FILE** (23), server/pool settings (24/25), load/unload/pin and
   status/reclaim operations (30–37), **EXPORT_HNSW_UPPER** (38: the graph, vectors and TIDs
   of a CAGRA index copied under the registry lock as EXPORT_ADJACENCY copies them, then
-  hnswlib builds the upper layers over the copies outside the lock and two sealed memfds
+  the daemon builds the upper layers on the host over the copies outside the lock
+  (`cuvs_hnsw_upper.c`: no GPU memory, one build at a time, stopped when the client
+  goes) and two sealed memfds
   carry the hnswlib file and the TIDs to the `pg_cuvs_hnsw` source conversion), and
   HNSW/CAGRA preflight (40/41).
   See `src/cuvs_ipc.h` for the full list. Synthetic build/extend OOM injection
@@ -242,7 +244,7 @@ in `pg_stat_gpu_fallback`; daemon replies are recorded in `pg_stat_gpu_search`.
 - **Reply status** (`CUVS_STATUS_*`): OK, ERROR, OOM_FALLBACK, NOT_FOUND, UNAVAILABLE,
   BUILD_FAILED, PERSIST_FAILED, DIM_MISMATCH, METRIC_MISMATCH, STALE, NO_VECTORS,
   CANCELED, PROTO_MISMATCH, HNSW_RESIDENT_BUDGET_EXCEEDED, and HNSW_UPPER_SKIPPED (no
-  upper layers from EXPORT_HNSW_UPPER: fewer than 16 rows or the CPU shim). Admission replies
+  upper layers from EXPORT_HNSW_UPPER: graph degree below 4). Admission replies
   also carry structured rejection/NOTICE fields. The caller determines the reaction:
   scan-time STALE/OOM/connection failures raise errors, while future plans can
   choose CPU paths. Deploy both binaries together; HNSW op 23 additionally checks

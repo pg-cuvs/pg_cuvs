@@ -3676,9 +3676,11 @@ hnsw_import_build_result(Relation indexRel,
 /* ================================================================
  * pg_cuvs_import_cagra — Phase 3J: direct CAGRA → pgvector HNSW
  *
- * Skips the hnswlib intermediate format entirely. Gets CAGRA adjacency
- * + corpus vectors from the daemon via IPC, builds a flat pgvector HNSW
- * (all nodes at level 0), and writes it directly into the target relation.
+ * Skips the hnswlib intermediate format of mode 'hnswlib'. For 'nsw' and
+ * 'hnsw' the daemon builds the upper layers over a copy of the CAGRA graph
+ * (CUVS_OP_EXPORT_HNSW_UPPER) and the heap build's importer writes the
+ * pages; if the daemon builds none (CUVS_STATUS_HNSW_UPPER_SKIPPED), CAGRA
+ * adjacency + corpus vectors come over IPC and the levels are drawn here.
  *
  * Does NOT require cuvs.cpu_hnsw_fallback=on.
  * Supports UNLOGGED target for faster import (see pg_cuvs_import_hnsw).
@@ -3767,7 +3769,8 @@ cagra_assign_level(int M, unsigned int *seed)
 
 /* Internal helper: fill an existing HNSW index from CAGRA adjacency via IPC.
  * Called by pg_cuvs_build_hnsw() for modes 'nsw' and 'hnsw'.
- * mode='nsw' and mode='hnsw' → hierarchical with heuristic neighbor selection ('nsw' was level 0 only) */
+ * mode='nsw' and mode='hnsw' → upper layers from the daemon (CUVS_OP_EXPORT_HNSW_UPPER); levels drawn here and
+ * heuristic neighbor selection among each row's CAGRA neighbors only when it builds none ('nsw' was level 0 only) */
 static void
 fill_hnsw_from_cagra_ipc_impl(Oid cagra_oid, Oid hnsw_oid, const char *mode,
                               HnswFillRes *res)
@@ -3935,19 +3938,23 @@ fill_hnsw_from_cagra_ipc_impl(Oid cagra_oid, Oid hnsw_oid, const char *mode,
             index_close(target, AccessExclusiveLock);
             ereport(NOTICE,
                     (errmsg("pg_cuvs: direct import %zu elements (dim=%d, M=%d, "
-                            "graph_degree=%d, upper layers by hnswlib, mode=%s) "
+                            "graph_degree=%d, upper layers built by the daemon, mode=%s) "
                             "from cagra index %u into hnsw index %u",
                             up_n, up_dim, up_degree / 2, up_degree, mode,
                             cagra_oid, hnsw_oid)));
             res->n_elems = up_n;    /* the element count returned; elems stays NULL */
             return;
         }
+        if (urc == CUVS_STATUS_CANCELED)
+            CHECK_FOR_INTERRUPTS();     /* the wait stopped for a pending cancel */
         if (urc != CUVS_STATUS_HNSW_UPPER_SKIPPED)
         {
             cuvs_report_proto_mismatch(urc);
             ereport(ERROR,
                     (errmsg("pg_cuvs: IPC export_hnsw_upper failed (status=%d); "
-                            "ensure index %u is loaded in daemon", urc, cagra_oid)));
+                            "ensure index %u is loaded in daemon", urc, cagra_oid),
+                     errhint("A daemon older than this extension answers this request with an error: "
+                             "restart pg_cuvs_server after installing the extension.")));
         }
     }
 
@@ -4444,8 +4451,9 @@ pg_cuvs_build_hnsw(PG_FUNCTION_ARGS)
     /* Dispatch to internal C helpers — no SQL/SPI overhead.
      *
      * RECOMMENDED modes:
-     *   'nsw'     — flat NSW via IPC adjacency. 117s, 2.4x speedup.
-     *               Empirically equal quality at ef>=40 (Cohere 1M×1024 benchmark).
+     *   'nsw'     — level 0 from the CAGRA graph, upper layers built by the daemon
+     *               (the same as 'hnsw' now). The 117s / 2.4x of the old level-0-only
+     *               conversion (Cohere 1M×1024) are not measured again.
      *   'hnswlib' — from_cagra() hierarchy via /dev/shm (no disk I/O). 139s, 2.0x.
      *               Slight recall advantage at ef<20.
      *
