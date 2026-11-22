@@ -1632,6 +1632,13 @@ test_ace_readback_metapage_roundtrip(void)
         readback=hnsw_read_connectivity(meta);
         assert(readback.magic==c.magic && readback.unreachable==70 && readback.wcc_all==1);
     }
+    /* a graph converted from a CAGRA index carries no build receipt. */
+    chain_test_reset();
+    hnsw_write_disk_metapage(NULL, &hdr, 2, 1, true, &table, NULL, NULL, NULL, NULL);
+    meta = (Page)chain_test_pages[chain_test_nblocks - 1];
+    assert(((PageHeader)meta)->pd_lower == prefix);
+    assert(hnsw_read_disk_policy(meta, &out) == CUVS_HNSW_POLICY_NOT_RECORDED);
+    assert(((PgvHnswMeta *)PageGetContents(meta))->dimensions == 2);
     chain_test_reset();
     hnsw_write_disk_metapage(NULL, &hdr, 2, 1, true, &table, &p, &ace, NULL, NULL);
     meta = (Page)chain_test_pages[chain_test_nblocks - 1];

@@ -2373,6 +2373,53 @@ cuvs_hnsw_serialize(CuvsCagraIndex cagra_idx, const char *path, int device_id)
     }
 }
 
+/* see cuvs_wrapper.h. from_cagra<CPU> inserts every row into hnswlib
+ * with base_layer_init = false (upper layers only, heuristic neighbor
+ * selection with M = degree / 2), then copies the graph into level 0. */
+extern "C" int
+cuvs_hnsw_upper_from_graph(const uint32_t *graph, int64_t n, int degree,
+                           const float *vecs, int dim, uint32_t metric,
+                           int ef_construction, const char *path, int device_id)
+{
+    if (!graph || !vecs || !path || degree < 2 || degree % 2 != 0 || dim <= 0 ||
+        (metric != CUVS_METRIC_L2 && metric != CUVS_METRIC_IP))
+        return -1;
+    if (n < (int64_t)CUVS_HNSW_MIN_ELEMENTS)
+        return CUVS_HNSW_SERIALIZE_SKIPPED;
+    PooledRes _pr(device_id);
+    try {
+        raft::device_resources &res = _pr.get();
+        cuvs::neighbors::cagra::index<float, uint32_t> cidx(
+            res, metric == CUVS_METRIC_IP ? cuvs::distance::DistanceType::InnerProduct
+                                          : cuvs::distance::DistanceType::L2Expanded);
+        cidx.update_graph(res, raft::make_host_matrix_view<const uint32_t, int64_t>(
+                                   graph, n, (int64_t)degree));
+        res.sync_stream();
+        cuvs::neighbors::hnsw::index_params hparams;
+        hparams.hierarchy = cuvs::neighbors::hnsw::HnswHierarchy::CPU;
+        hparams.ef_construction = ef_construction;
+        /* One thread inserts the rows in label order, so the same graph gives
+         * the same levels and pages on every build (build_hnsw_packing Case 3);
+         * the heap build's hierarchy runs single-threaded too. */
+        hparams.num_threads = 1;
+        auto hnsw = cuvs::neighbors::hnsw::from_cagra(
+            res, hparams, cidx,
+            raft::make_host_matrix_view<const float, int64_t>(vecs, n, (int64_t)dim));
+        res.sync_stream();
+        cuvs::neighbors::hnsw::serialize(res, std::string(path), *hnsw);
+        _pr.fence_check();
+        return 0;
+    } catch (const std::exception &e) {
+        _pr.poison();
+        fprintf(stderr, "[cuvs_hnsw_upper_from_graph] %s\n", e.what());
+        return -1;
+    } catch (...) {
+        _pr.poison();
+        fprintf(stderr, "[cuvs_hnsw_upper_from_graph] unknown exception\n");
+        return -1;
+    }
+}
+
 extern "C" CuvsHnswIndex
 cuvs_hnsw_deserialize(const char *path, int dim, uint32_t metric, int device_id)
 {

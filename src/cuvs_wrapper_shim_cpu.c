@@ -526,6 +526,14 @@ int cuvs_hnsw_serialize(CuvsCagraIndex cagra_idx, const char *path, int device_i
   if (ix->n < CUVS_HNSW_MIN_ELEMENTS) return CUVS_HNSW_SERIALIZE_SKIPPED;
   return shim_write(ix, path); }
 
+/* The shim has no hnswlib; the backend keeps its own levels. */
+int cuvs_hnsw_upper_from_graph(const uint32_t *graph, int64_t n, int degree,
+                               const float *vecs, int dim, uint32_t metric,
+                               int ef_construction, const char *path, int device_id)
+{ (void)graph; (void)n; (void)degree; (void)vecs; (void)dim; (void)metric;
+  (void)ef_construction; (void)path; (void)device_id;
+  return CUVS_HNSW_SERIALIZE_SKIPPED; }
+
 CuvsHnswIndex cuvs_hnsw_deserialize(const char *path, int dim, uint32_t metric, int device_id)
 { (void)dim; (void)metric; (void)device_id; return (CuvsHnswIndex) shim_read(path); }
 

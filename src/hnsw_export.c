@@ -1608,6 +1608,7 @@ typedef struct HnswFillRes
     float    *vecs;         /* IPC corpus vectors */
     int      *cand_buf;     /* heuristic candidate scratch */
     int       shm_fd;       /* #165: SCM_RIGHTS sidecar fd (-1 = none) */
+    int       tids_fd;      /* EXPORT_HNSW_UPPER TID memfd (-1 = none) */
 } HnswFillRes;
 
 /*
@@ -1645,6 +1646,7 @@ hnsw_fill_res_free(HnswFillRes *r)
 {
     if (r->hf)        { fclose(r->hf);      r->hf = NULL; }
     if (r->shm_fd >= 0) { close(r->shm_fd); r->shm_fd = -1; }
+    if (r->tids_fd >= 0) { close(r->tids_fd); r->tids_fd = -1; }
     if (r->tids)      { free(r->tids);      r->tids = NULL; }
     if (r->lv0_block) { free(r->lv0_block); r->lv0_block = NULL; }
     if (r->llbuf)     { free(r->llbuf);     r->llbuf = NULL; }
@@ -2667,6 +2669,7 @@ fill_hnsw_from_hnswlib(Oid cagra_oid, Oid hnsw_oid, bool use_shm)
 
     memset((void *) &res, 0, sizeof(res));
     res.shm_fd = -1;            /* #165: 0 is stdin — never a valid sentinel */
+    res.tids_fd = -1;
     PG_TRY();
     {
         fill_hnsw_from_hnswlib_impl(cagra_oid, hnsw_oid, use_shm,
@@ -3447,12 +3450,17 @@ hnsw_write_disk_metapage(Relation rel, const HnswlibHeader *header,
                             entry.elem_blkno, entry.elem_offno, entry.level,
                             n_data_pages))
         ereport(ERROR, (errmsg("pg_cuvs: invalid HNSW metapage fields")));
-    if (!cuvs_hnsw_policy_valid(policy))
+    /* a graph converted from a CAGRA index (policy NULL) has no build
+     * receipt, as the backend's own conversion writes none. */
+    if (policy && !cuvs_hnsw_policy_valid(policy))
         ereport(ERROR, (errmsg("pg_cuvs: missing or invalid native HNSW build policy receipt")));
-    memcpy((char *)PageGetContents(staged) + sizeof(PgvHnswMeta), policy, sizeof(*policy));
-    ((PageHeader)staged)->pd_lower += sizeof(*policy);
+    if (policy)
+    {
+        memcpy((char *)PageGetContents(staged) + sizeof(PgvHnswMeta), policy, sizeof(*policy));
+        ((PageHeader)staged)->pd_lower += sizeof(*policy);
+    }
     /* ACE partition-builder readback right after the receipt (receipt layout unchanged). */
-    if (policy->route == CUVS_HNSW_ROUTE_ACE)
+    if (policy && policy->route == CUVS_HNSW_ROUTE_ACE)
     {
         if (!cuvs_hnsw_ace_readback_valid(ace, policy))
             ereport(ERROR, (errmsg("pg_cuvs: missing or invalid ACE partition-builder readback")));
@@ -3460,7 +3468,7 @@ hnsw_write_disk_metapage(Relation rel, const HnswlibHeader *header,
                ace, sizeof(*ace));
         ((PageHeader)staged)->pd_lower += sizeof(*ace);
     }
-    if (policy->route == CUVS_HNSW_ROUTE_NN_DESCENT)
+    if (policy && policy->route == CUVS_HNSW_ROUTE_NN_DESCENT)
     {
         if (!cuvs_hnsw_nn_readback_valid(nn, policy)
             || ((PageHeader)staged)->pd_lower + sizeof(*nn) > ((PageHeader)staged)->pd_upper)
@@ -3572,7 +3580,7 @@ hnsw_import_empty_build_result(Relation indexRel,
 static void
 hnsw_import_build_result(Relation indexRel,
                          const CuvsHnswBuildResult *build,
-                         bool packed_nsw)
+                         bool packed_nsw, bool with_receipt)
 {
     volatile HnswDiskImportState state;
     HnswlibHeader header;
@@ -3638,7 +3646,8 @@ hnsw_import_build_result(Relation indexRel,
             RelationSetTargetBlock(s->target, InvalidBlockNumber);
         }
         hnsw_write_disk_metapage(s->target, &header, build->dim,
-                                 data_page_count, skip_wal, &s->locations, &build->policy,
+                                 data_page_count, skip_wal, &s->locations,
+                                 with_receipt ? &build->policy : NULL,
                                  &build->ace, &build->nn, &connectivity);
         hnsw_write_disk_pages(s->target, build->hnsw_fd, build->tids_fd,
                               &header, build->n_vecs, build->dim,
@@ -3878,6 +3887,69 @@ fill_hnsw_from_cagra_ipc_impl(Oid cagra_oid, Oid hnsw_oid, const char *mode,
         ereport(ERROR,
                 (errmsg("pg_cuvs: daemon socket not set (cuvs.socket_path); "
                         "is pg_cuvs_server running?")));
+
+    /* the upper layers come from the daemon, built by hnswlib insertion
+     * over a copy of this graph (CUVS_OP_EXPORT_HNSW_UPPER), and are written by
+     * the heap build's importer. Levels drawn here and linked among each
+     * row's CAGRA neighbors leave most upper-layer elements without a link on
+     * level 1. This path is kept for graphs the daemon builds no upper layers
+     * for (CUVS_STATUS_HNSW_UPPER_SKIPPED). */
+    if (do_hierarchy)
+    {
+        size_t up_n = 0;
+        int    up_degree = 0, up_dim = 0;
+        int    urc = cuvs_ipc_export_hnsw_upper(cuvs_socket_path, (uint32_t)MyDatabaseId,
+                                                (uint32_t)cagra_oid, &res->shm_fd,
+                                                &res->tids_fd, &up_n, &up_degree, &up_dim);
+
+        if (urc == CUVS_STATUS_OK)
+        {
+            CuvsTidsHeader th;
+            CuvsHnswBuildResult build;
+            Relation target;
+
+            if (pread(res->tids_fd, &th, sizeof(th), 0) != (ssize_t) sizeof(th))
+                ereport(ERROR,
+                        (errmsg("pg_cuvs: cannot read the TID header from the daemon")));
+            if (th.metric != tgt_metric)
+            {
+                static const char *mname[] = {"l2", "cosine", "ip"};
+                ereport(ERROR,
+                        (errmsg("pg_cuvs: metric mismatch: source CAGRA uses %s but "
+                                "target HNSW uses %s",
+                                th.metric < 3 ? mname[th.metric] : "unknown",
+                                tgt_metric < 3 ? mname[tgt_metric] : "unknown")));
+            }
+            if (up_dim != dim)
+                ereport(ERROR,
+                        (errmsg("pg_cuvs: dimension mismatch: daemon graph dim=%d but "
+                                "source CAGRA dim=%d", up_dim, dim)));
+            memset(&build, 0, sizeof(build));
+            build.hnsw_fd = res->shm_fd;
+            build.tids_fd = res->tids_fd;
+            build.n_vecs  = up_n;
+            build.dim     = (uint32_t) up_dim;
+            build.metric  = tgt_metric;
+            target = index_open(hnsw_oid, AccessExclusiveLock);
+            hnsw_import_build_result(target, &build, false, false);
+            index_close(target, AccessExclusiveLock);
+            ereport(NOTICE,
+                    (errmsg("pg_cuvs: direct import %zu elements (dim=%d, M=%d, "
+                            "graph_degree=%d, upper layers by hnswlib, mode=%s) "
+                            "from cagra index %u into hnsw index %u",
+                            up_n, up_dim, up_degree / 2, up_degree, mode,
+                            cagra_oid, hnsw_oid)));
+            res->n_elems = up_n;    /* the element count returned; elems stays NULL */
+            return;
+        }
+        if (urc != CUVS_STATUS_HNSW_UPPER_SKIPPED)
+        {
+            cuvs_report_proto_mismatch(urc);
+            ereport(ERROR,
+                    (errmsg("pg_cuvs: IPC export_hnsw_upper failed (status=%d); "
+                            "ensure index %u is loaded in daemon", urc, cagra_oid)));
+        }
+    }
 
     uint32_t *adj   = NULL;
     float    *vecs  = NULL;
@@ -4166,6 +4238,7 @@ fill_hnsw_from_cagra_ipc(Oid cagra_oid, Oid hnsw_oid, const char *mode)
 
     memset((void *) &res, 0, sizeof(res));
     res.shm_fd = -1;            /* #165: 0 is stdin — never a valid sentinel */
+    res.tids_fd = -1;
     PG_TRY();
     {
         fill_hnsw_from_cagra_ipc_impl(cagra_oid, hnsw_oid, mode,
@@ -4683,7 +4756,7 @@ cuvs_hnsw_ambuild(Relation heapRel, Relation indexRel, IndexInfo *indexInfo)
             result->heap_tuples = b->reltuples;
             result->index_tuples = (double)b->n_vecs;
             if (b->n_vecs > 0)
-                hnsw_import_build_result(indexRel, b, false);	/* the graph has upper layers, so not the level-0-only packing */
+                hnsw_import_build_result(indexRel, b, false, true);	/* the graph has upper layers, so not the level-0-only packing */
             else
                 hnsw_import_empty_build_result(indexRel, b);
         }
