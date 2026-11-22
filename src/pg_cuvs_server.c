@@ -237,6 +237,7 @@ typedef struct IndexEntry {
     uint64_t        delta_merged_count; /* searches where daemon merged delta on GPU */
     uint64_t        bf_batch_count;     /* Phase 3L-9: coalesced BF batch dispatches */
     uint64_t        cagra_batch_count;  /* #160: coalesced CAGRA batch dispatches */
+    uint32_t        delta_cpu_last;     /* the last CAGRA search asked for cuvs.delta_search=cpu */
     uint64_t        prefilter_fallback_count; /* #133/ADR-083: 3O->gpu_bf_prefilter retries
                                                 * after a short-fill (mean_returned<<k)
                                                 * detection actually falls back (not merely
@@ -286,6 +287,7 @@ reset_entry_stats(IndexEntry *e)
     e->last_requested_k    = 0;
     e->last_returned_k    = 0;
     e->delta_merged_count = 0;
+    e->delta_cpu_last     = 0;
     e->bf_batch_count     = 0;
     e->cagra_batch_count  = 0;
     e->prefilter_fallback_count = 0;
@@ -5586,9 +5588,12 @@ handle_search(int client_fd, const CuvsCmdFrame *cmd)
         /* Phase 3L: brute_force already searches the full base corpus exactly via
          * the per-shard .vectors caches; the pending .delta is a separate concern
          * and is NOT merged in BF mode (consistent with the unsharded BF path). */
+        int gpu_delta = !use_bf && cmd->delta_search_mode != CUVS_DELTA_SEARCH_CPU;
         if (!use_bf)
-            refresh_delta_cache(e);
-        if (!use_bf && e->delta_idx && e->n_delta > 0)
+            e->delta_cpu_last = !gpu_delta;
+        if (gpu_delta)
+            refresh_delta_cache(e);     /* cpu: not even the refresh, it costs GPU work under g_index_mutex */
+        if (gpu_delta && e->delta_idx && e->n_delta > 0)
         {
             int eff_dk = (int) ((int64_t) k < e->n_delta ? (int64_t) k : e->n_delta);
             CuvsSearchResult *draw = malloc((size_t) eff_dk * sizeof(CuvsSearchResult));
@@ -5726,7 +5731,8 @@ handle_search(int client_fd, const CuvsCmdFrame *cmd)
     {
         CuvsBatchKey     key = { cmd->db_oid, cmd->index_oid, 0 /* n/a */,
                                  cmd->dim, 0 /* mode: cagra */,
-                                 cmd->itopk_size, cmd->search_width };
+                                 cmd->itopk_size, cmd->search_width,
+                                 cmd->delta_search_mode == CUVS_DELTA_SEARCH_CPU };
         CuvsResult      *rout = malloc((size_t) k * sizeof(CuvsResult));
         int              enqueued = 0;
         CuvsBatchRequest req;
@@ -5865,8 +5871,11 @@ handle_search(int client_fd, const CuvsCmdFrame *cmd)
     int n_valid      = 0;
     CuvsSearchResult *draw = NULL;
     int               n_dc = 0;
-    refresh_delta_cache(e);
-    if (e->delta_idx && e->n_delta > 0)
+    int gpu_delta = cmd->delta_search_mode != CUVS_DELTA_SEARCH_CPU;
+    e->delta_cpu_last = !gpu_delta;
+    if (gpu_delta)
+        refresh_delta_cache(e);         /* cpu: not even the refresh, it costs GPU work under g_index_mutex */
+    if (gpu_delta && e->delta_idx && e->n_delta > 0)
     {
         n_dc = (int) ((int64_t) k < e->n_delta ? (int64_t) k : e->n_delta);
         draw = malloc((size_t) n_dc * sizeof(CuvsSearchResult));
@@ -8191,7 +8200,7 @@ handle_stats(int client_fd, const CuvsCmdFrame *cmd)
         s->delta_generation   = e->delta_generation;
         s->delta_vram_bytes   = e->delta_vram_bytes;
         s->delta_merged_count = e->delta_merged_count;
-        s->delta_search_mode  = (e->delta_idx && e->n_delta > 0) ? 2 : 0;
+        s->delta_search_mode  = e->delta_cpu_last ? 1 : (e->delta_idx && e->n_delta > 0) ? 2 : 0;
         s->warmup_state       = (uint32_t)e->warmup_state;
         s->last_warmup_at     = (int64_t)e->last_warmup_at;       /* Phase 3D: retained post-hydration */
         s->warmup_duration_ms = e->warmup_duration_ms;
@@ -11731,8 +11740,11 @@ cagra_batch_run_group(CuvsBatchRequest **batch, const int *gid, int n, int g)
      * results with delta_merged=0, the same fail-open the immediate path has. */
     CuvsSearchResult *draw = NULL;
     int               n_dc = 0;
-    refresh_delta_cache(e);
-    if (e->delta_idx && e->n_delta > 0)
+    int gpu_delta = !r0->key.delta_cpu; /* part of the key: the same for the whole group */
+    e->delta_cpu_last = !gpu_delta;
+    if (gpu_delta)
+        refresh_delta_cache(e);
+    if (gpu_delta && e->delta_idx && e->n_delta > 0)
     {
         n_dc = (int) ((int64_t) maxk < e->n_delta ? (int64_t) maxk : e->n_delta);
         draw = malloc((size_t) Q * (size_t) n_dc * sizeof(CuvsSearchResult));

@@ -327,7 +327,7 @@ run(const char *path, Mode mode, int use_search, double *elapsed, Peer *out)
         uint64_t tids[4];
         float dist[4];
         int n = -1;
-        rc = cuvs_ipc_search(path, 1, 2, q, 4, 4, CUVS_METRIC_L2, 0, 0, 0, 0, 0, 0, 0,
+        rc = cuvs_ipc_search(path, 1, 2, q, 4, 4, CUVS_METRIC_L2, 0, 0, 0, 0, 0, 0, 0, 0,
                              tids, dist, &n, NULL, NULL);
     }
     else

@@ -4732,6 +4732,7 @@ cuvs_gettuple(IndexScanDesc scan, ScanDirection dir)
             (uint32_t)cuvs_bf_precision,     /* Phase 3L: 0=float32, 1=float16 */
             (uint32_t)cuvs_bf_batch_wait_us, /* Phase 3L: BF micro-batch window μs */
             (uint32_t)cuvs_cagra_batch_wait_us, /* #160: CAGRA micro-batch window μs */
+            (uint32_t)cuvs_delta_search_mode,   /* cpu: the daemon leaves .delta to us */
             ss->tids,
             ss->distances,
             &ss->n_results,
@@ -5005,6 +5006,7 @@ flat_gettuple(IndexScanDesc scan, ScanDirection dir)
             cuvs_resolve_flat_precision(scan->indexRelation), /* reloption / GUC */
             (uint32_t)cuvs_bf_batch_wait_us,
             0,   /* cagra_batch_wait_us: this path forces brute_force (ADR-073) */
+            (uint32_t)cuvs_delta_search_mode,
             ss->tids,
             ss->distances,
             &ss->n_results,
@@ -7842,6 +7844,7 @@ cuvs_filtered_knn(PG_FUNCTION_ARGS)
                 (uint32_t) cuvs_bf_precision,
                 0,   /* bf_batch_wait_us */
                 0,   /* cagra_batch_wait_us */
+                (uint32_t) cuvs_delta_search_mode,
                 tids_out, dists_out, &n_results,
                 &latency_us, &delta_merged);
         }
