@@ -89,6 +89,7 @@ jobs:
           source ~/miniforge3/bin/activate cuvs_dev
           make installcheck
           make installcheck-isolation
+          make installcheck-isolation-gpu
 
       - name: Upload diffs on failure
         if: failure()

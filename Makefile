@@ -1052,7 +1052,7 @@ gpu-test-regress:
 gpu-test-isolation:
 	ssh -tt $(VM_HOST) "cd ~/pg_cuvs && \
 		$(REMOTE_ENV) && \
-		make installcheck-isolation"
+		make installcheck-isolation && make installcheck-isolation-gpu"
 
 # Fault-injection daemon integration tests. Builds the CUVS_TEST_HOOKS
 # daemon, drives daemon-down / persist-fault / clean-build scenarios on a
