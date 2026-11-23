@@ -1,6 +1,7 @@
 #ifndef CUVS_CAGRA_PAGES_H
 #define CUVS_CAGRA_PAGES_H
 
+#include "access/amapi.h"
 #include "storage/bufmgr.h"
 #include "utils/rel.h"
 
@@ -68,6 +69,14 @@ void cuvs_cagra_init_pages(Relation index, ForkNumber fork, uint64 index_nonce,
 void cuvs_cagra_append_pending(Relation index, CuvsCagraRelCache *cache,
                                ItemPointer tid, int dim);
 void cuvs_cagra_check_dim(int expected, int actual);
+void cuvs_cagra_check_query_dim(Relation index, int dim);
+IndexBulkDeleteResult *cuvs_cagra_page_bulkdelete(IndexVacuumInfo *info,
+    IndexBulkDeleteResult *stats, IndexBulkDeleteCallback callback, void *callback_state);
+IndexBulkDeleteResult *cuvs_cagra_page_vacuumcleanup(IndexVacuumInfo *info,
+    IndexBulkDeleteResult *stats);
+#ifdef CUVS_TEST_HOOKS
+void cuvs_cagra_vacuum_init_test_hook(void);
+#endif
 #endif
 
 #endif

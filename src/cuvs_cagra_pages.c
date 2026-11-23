@@ -34,6 +34,9 @@ cuvs_cagra_require_legacy(Relation index)
 #include "access/xloginsert.h"
 #include "cuvs_util.h"
 #include "storage/bufpage.h"
+#include "miscadmin.h"
+#include "storage/lmgr.h"
+#include "utils/guc.h"
 
 enum CuvsCagraPageKind
 {
@@ -311,6 +314,19 @@ cuvs_cagra_check_dim(int expected, int actual)
                         errhint("Use a vector column with a fixed dimension.")));
 }
 
+void
+cuvs_cagra_check_query_dim(Relation index, int dim)
+{
+    CuvsCagraMeta meta;
+
+    if (!cuvs_cagra_read_meta(index, &meta))
+        ereport(WARNING, (errmsg("unrecognized CAGRA metapage for index \"%s\"",
+                                 RelationGetRelationName(index)),
+                          errdetail("Using an exact heap scan.")));
+    else if (dim != 0)
+        cuvs_cagra_check_dim(meta.dim, dim);
+}
+
 static CuvsCagraPending *
 page_pending(Relation index, BlockNumber block, Page page, uint64 nonce)
 {
@@ -438,6 +454,247 @@ cuvs_cagra_append_pending(Relation index, CuvsCagraRelCache *cache,
         cache->dim = dim;
         return;
     }
+}
+
+typedef struct CagraVacuum
+{
+    Relation                index;
+    IndexBulkDeleteCallback callback;
+    void                   *callback_state;
+    GenericXLogState       *wal;
+    Buffer                  held[MAX_GENERIC_XLOG_PAGES];
+    int                     nheld;
+    uint64                  removed;
+    uint64                  live;
+    uint64                  dead_slots;
+} CagraVacuum;
+
+#ifdef CUVS_TEST_HOOKS
+static bool cuvs_test_pause_page_vacuum;
+
+void
+cuvs_cagra_vacuum_init_test_hook(void)
+{
+    DefineCustomBoolVariable("cuvs.test_pause_page_vacuum",
+                             "Pause a page-format VACUUM after the TID records.",
+                             NULL, &cuvs_test_pause_page_vacuum, false, PGC_SUSET,
+                             GUC_NOT_IN_SAMPLE, NULL, NULL, NULL);
+}
+#endif
+
+/* Record only dirty pages; retain their locks until this batch is published. */
+static void
+vacuum_finish_batch(CagraVacuum *vac)
+{
+    if (vac->wal)
+    {
+        GenericXLogFinish(vac->wal);
+        vac->wal = NULL;
+    }
+    while (vac->nheld)
+        UnlockReleaseBuffer(vac->held[--vac->nheld]);
+}
+
+static Buffer
+vacuum_lock(CagraVacuum *vac, BlockNumber block)
+{
+    Buffer buf;
+
+    if (vac->nheld == lengthof(vac->held))
+        vacuum_finish_batch(vac);
+    CHECK_FOR_INTERRUPTS();
+    buf = ReadBuffer(vac->index, block);
+    LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
+    vac->held[vac->nheld++] = buf;
+    return buf;
+}
+
+static void
+vacuum_tids(CagraVacuum *vac, Buffer buf, uint32 start, uint32 count,
+            const CuvsCagraTidPage *tid_tag)
+{
+    Page page = BufferGetPage(buf);
+    const ItemPointerData *items = (ItemPointerData *) PageGetContents(page);
+    Page image = NULL;
+    uint32 old_dead = 0;
+    uint32 removed = 0;
+
+    for (uint32 i = start; i < count; ++i)
+    {
+        ItemPointerData tid = items[i];
+
+        if (!ItemPointerIsValid(&tid))
+        {
+            ++old_dead;
+            continue;
+        }
+        if (!vac->callback(&tid, vac->callback_state))
+        {
+            ++vac->live;
+            continue;
+        }
+        if (!image)
+        {
+            if (!vac->wal)
+                vac->wal = GenericXLogStart(vac->index);
+            image = GenericXLogRegisterBuffer(vac->wal, buf, 0);
+        }
+        ItemPointerSetInvalid(&((ItemPointerData *) PageGetContents(image))[i]);
+        ++removed;
+    }
+
+    vac->removed += removed;
+    if (tid_tag)
+    {
+        if (old_dead != tid_tag->dead)
+            bad_page(vac->index, BufferGetBlockNumber(buf));
+        if (image)
+            ((CuvsCagraTidPage *) PageGetSpecialPointer(image))->dead = old_dead + removed;
+        vac->dead_slots += old_dead + removed;
+    }
+}
+
+static void
+vacuum_pending(CagraVacuum *vac, const CuvsCagraMeta *meta)
+{
+    BlockNumber block = meta->pending_head;
+    uint64 expected = 0;
+
+    for (;;)
+    {
+        Buffer buf = vacuum_lock(vac, block);
+        CuvsCagraPending *tag = page_pending(vac->index, block, BufferGetPage(buf),
+                                            meta->index_nonce);
+        uint32 start = 0;
+
+        if ((expected && tag->first_pos != expected) ||
+            tag->first_pos > UINT64_MAX - tag->count)
+            bad_page(vac->index, block);
+        if (meta->folded > tag->first_pos)
+            start = Min(meta->folded - tag->first_pos, (uint64) tag->count);
+        vacuum_tids(vac, buf, start, tag->count, NULL);
+        /* Inserts can append after the metapage snapshot. Their TIDs are not
+         * old enough to be removed by this VACUUM. Validation also only needs
+         * pending entries present when it read the metapage. */
+        if (block == meta->pending_tail)
+            break;
+        if (!BlockNumberIsValid(tag->next) || tag->count != CUVS_CAGRA_PENDING_PER_PAGE)
+            bad_page(vac->index, block);
+        expected = tag->first_pos + tag->count;
+        block = tag->next;
+    }
+}
+
+static void
+vacuum_slots(CagraVacuum *vac, const CuvsCagraMeta *meta)
+{
+    uint64 slot = 0;
+
+    for (uint32 extent = 0; slot < meta->n_slots; ++extent)
+    {
+        BlockNumber base;
+
+        if (extent >= meta->n_extents)
+            bad_page(vac->index, 0);
+        base = meta->extents[extent];
+        if (base == 0 ||
+            base >= InvalidBlockNumber - CUVS_CAGRA_PAGE_EXTENT)
+            bad_page(vac->index, 0);
+        for (uint32 i = 0; i < CUVS_CAGRA_PAGE_EXTENT && slot < meta->n_slots; ++i)
+        {
+            BlockNumber block = base + i;
+            uint32 count = Min((uint64) CUVS_CAGRA_TIDS_PER_PAGE, meta->n_slots - slot);
+            Buffer buf = vacuum_lock(vac, block);
+            Page page = BufferGetPage(buf);
+            PageHeader header = (PageHeader) page;
+            const CuvsCagraTidPage *tag;
+
+            if (PageIsNew(page) || PageGetSpecialSize(page) != sizeof(*tag) ||
+                header->pd_lower < MAXALIGN(SizeOfPageHeaderData) + count * sizeof(ItemPointerData) ||
+                header->pd_lower > header->pd_upper)
+                bad_page(vac->index, block);
+            tag = (CuvsCagraTidPage *) PageGetSpecialPointer(page);
+            if (tag->kind != CUVS_PAGE_TIDS || tag->base_nonce != meta->base_nonce ||
+                tag->first_slot != slot || tag->flags != 0 || tag->dead > count)
+                bad_page(vac->index, block);
+            vacuum_tids(vac, buf, 0, count, tag);
+            slot += count;
+        }
+    }
+}
+
+IndexBulkDeleteResult *
+cuvs_cagra_page_bulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
+                           IndexBulkDeleteCallback callback, void *callback_state)
+{
+    Relation index = info->index;
+    CuvsCagraMeta meta;
+    CagraVacuum vac = {.index = index, .callback = callback, .callback_state = callback_state};
+    Buffer mb;
+    CuvsCagraMeta *updated;
+    GenericXLogState *wal;
+
+    if (stats == NULL)
+        stats = palloc0(sizeof(*stats));
+
+    LockPage(index, 0, ExclusiveLock);
+    if (!cuvs_cagra_read_meta(index, &meta))
+        bad_page(index, 0);
+    vacuum_pending(&vac, &meta);
+    vacuum_slots(&vac, &meta);
+    vacuum_finish_batch(&vac);
+
+#ifdef CUVS_TEST_HOOKS
+    if (cuvs_test_pause_page_vacuum && vac.removed)
+    {
+        elog(LOG, "page-format VACUUM paused before publishing its generation");
+        for (int i = 0; i < 3000; ++i)
+        {
+            CHECK_FOR_INTERRUPTS();
+            pg_usleep(10000L);
+        }
+    }
+#endif
+
+    mb = ReadBuffer(index, 0);
+    LockBuffer(mb, BUFFER_LOCK_EXCLUSIVE);
+    updated = page_meta(BufferGetPage(mb));
+    if (updated == NULL || updated->index_nonce != meta.index_nonce ||
+        updated->base_nonce != meta.base_nonce || updated->delete_generation == UINT64_MAX)
+        bad_page(index, 0);
+    wal = GenericXLogStart(index);
+    updated = (CuvsCagraMeta *) PageGetContents(GenericXLogRegisterBuffer(wal, mb, 0));
+    /* A canceled predecessor can already have invalidated the slots. The
+     * heap can free those TIDs after this callback returns even if this call
+     * changed no data page, so always advance the generation. */
+    ++updated->delete_generation;
+    updated->dead_slots = vac.dead_slots;
+    GenericXLogFinish(wal);
+    UnlockReleaseBuffer(mb);
+    UnlockPage(index, 0, ExclusiveLock);
+
+    stats->num_pages = RelationGetNumberOfBlocks(index);
+    stats->estimated_count = true;
+    stats->num_index_tuples = vac.live;
+    stats->tuples_removed += vac.removed;
+    return stats;
+}
+
+IndexBulkDeleteResult *
+cuvs_cagra_page_vacuumcleanup(IndexVacuumInfo *info, IndexBulkDeleteResult *stats)
+{
+    CuvsCagraMeta meta;
+
+    if (info->analyze_only)
+        return stats;
+
+    LockPage(info->index, 0, ExclusiveLock);
+    if (!cuvs_cagra_read_meta(info->index, &meta))
+        bad_page(info->index, 0);
+    if (stats != NULL)
+        stats->num_pages = RelationGetNumberOfBlocks(info->index);
+    UnlockPage(info->index, 0, ExclusiveLock);
+    return stats;
 }
 
 #endif

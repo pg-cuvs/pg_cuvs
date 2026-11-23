@@ -7196,8 +7196,22 @@ page_corpus_fits(int fd, size_t total)
 }
 
 static void
-handle_build(int client_fd, const CuvsCmdFrame *cmd, const CuvsPageBuildRequest *page_build)
+handle_build(int client_fd, const CuvsCmdFrame *cmd)
 {
+    CuvsPageBuildRequest request;
+    const CuvsPageBuildRequest *page_build = NULL;
+
+    if (cmd->op == CUVS_OP_BUILD_PAGES)
+    {
+        if (recv_all(client_fd, &request, sizeof(request)) < 0 ||
+            request.length != sizeof(request) || request.flags != 0 ||
+            !request.index_nonce || !request.build_xid)
+        {
+            send_error(client_fd, "invalid page-format BUILD frame");
+            return;
+        }
+        page_build = &request;
+    }
     clear_build_notices();
     LOG_DEBUG("[handle_build] reading index_dir...\n");
     char index_dir[256] = {0};
@@ -12129,20 +12143,9 @@ connection_thread(void *arg)
             break;
         }
         case CUVS_OP_BUILD:
-            handle_build(client_fd, &cmd, NULL);
-            break;
         case CUVS_OP_BUILD_PAGES:
-        {
-            CuvsPageBuildRequest request;
-
-            if (recv_all(client_fd, &request, sizeof(request)) < 0 ||
-                request.length != sizeof(request) || request.flags != 0 ||
-                !request.index_nonce || !request.build_xid)
-                send_error(client_fd, "invalid page-format BUILD frame");
-            else
-                handle_build(client_fd, &cmd, &request);
+            handle_build(client_fd, &cmd);
             break;
-        }
         case CUVS_OP_SEARCH_PAGES:
             send_error_code(client_fd, CUVS_STATUS_NOT_FOUND, "page-format graph is not registered");
             break;

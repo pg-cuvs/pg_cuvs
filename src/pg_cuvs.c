@@ -1190,6 +1190,9 @@ _PG_init(void)
 {
 #ifdef CUVS_PAGE_FORMAT
     cuvs_page_preloaded = process_shared_preload_libraries_in_progress;
+#ifdef CUVS_TEST_HOOKS
+    cuvs_cagra_vacuum_init_test_hook();
+#endif
 #endif
     /* Phase 3K: register pg_cuvs_hnsw WITH(source, mode, ...) reloptions. */
     cuvs_hnsw_init_reloptions();
@@ -1732,18 +1735,23 @@ _PG_init(void)
         0.10, 0.01, 1.0,
         PGC_SIGHUP, 0, NULL, NULL, NULL);
 
-    DefineCustomStringVariable(
-        "cuvs.auto_compact_database",
-        "Database to monitor for auto-compaction (empty = disabled).",
-        NULL,
-        &cuvs_auto_compact_database,
-        "",
-        PGC_POSTMASTER, 0, NULL, NULL, NULL);
-
-    /* Phase 4C: register compaction bgworker */
+    /* This worker and its startup-only setting belong to the postmaster.
+     * A backend loading page-format support on demand can still serve and
+     * maintain an existing index without either of them. */
+#ifdef CUVS_PAGE_FORMAT
+    if (cuvs_page_preloaded)
+#endif
     {
         extern PGDLLEXPORT void cuvs_compaction_worker_main(Datum);
         BackgroundWorker worker;
+
+        DefineCustomStringVariable(
+            "cuvs.auto_compact_database",
+            "Database to monitor for auto-compaction (empty = disabled).",
+            NULL,
+            &cuvs_auto_compact_database,
+            "",
+            PGC_POSTMASTER, 0, NULL, NULL, NULL);
         memset(&worker, 0, sizeof(worker));
         snprintf(worker.bgw_name, BGW_MAXLEN, "pg_cuvs compaction worker");
         snprintf(worker.bgw_type, BGW_MAXLEN, "pg_cuvs compaction");
@@ -3891,9 +3899,6 @@ cuvs_ambuild(Relation heapRel, Relation indexRel, IndexInfo *indexInfo)
         if (cuvs_shard_count > 1)
             ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
                             errmsg("the experimental CAGRA page format is not sharded")));
-        if (indexInfo->ii_Concurrent)
-            ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-                            errmsg("concurrent builds are disabled for the experimental page format")));
         cuvs_resolve_build_params_rel(indexRel, &gd, &igd, &algo);
         cuvs_build_cagra_from_heap_impl(heapRel, indexRel, indexInfo,
                                       RelationGetRelid(indexRel), 1, false,
@@ -4356,15 +4361,13 @@ cuvs_cagra_sql_exact(Oid index_oid, uint32 metric, int dim, const float *queries
                         predicate == NIL ? "" :
                         deparse_expression((Node *) make_ands_explicit(predicate),
                                            context, false, false));
-    CuvsCagraMeta meta;
     int *counts = palloc0(nq * sizeof(int));
     SPIPlanPtr plan;
     Portal cursor;
     int first_count;
     bool descending = metric == CUVS_METRIC_IP;
 
-    if (cuvs_cagra_read_meta(index, &meta))
-        cuvs_cagra_check_dim(meta.dim, dim);
+    cuvs_cagra_check_query_dim(index, dim);
     memset(tids, 0, (size_t) nq * k * sizeof(*tids));
     if (filter)
         qsort(filter, nfilter, sizeof(*filter), page_tid_cmp);
@@ -4912,11 +4915,12 @@ cuvs_gettuple(IndexScanDesc scan, ScanDirection dir)
 #ifdef CUVS_PAGE_FORMAT
         if (!ss->page_exact)
         {
-            CuvsCagraMeta meta;
+            int dim = 0;
 
-            if (cuvs_cagra_read_meta(scan->indexRelation, &meta) && meta.dim != 0 &&
-                scan->numberOfOrderBys == 1 && !(scan->orderByData[0].sk_flags & SK_ISNULL))
-                cuvs_cagra_check_dim(meta.dim, DatumGetPgVector(scan->orderByData[0].sk_argument)->dim);
+            if (scan->numberOfOrderBys == 1 && scan->orderByData != NULL &&
+                !(scan->orderByData[0].sk_flags & SK_ISNULL))
+                dim = DatumGetPgVector(scan->orderByData[0].sk_argument)->dim;
+            cuvs_cagra_check_query_dim(scan->indexRelation, dim);
             ss->page_exact = cuvs_hnsw_exact_begin(scan);
         }
         if (ss->cur >= cuvs_k ||
@@ -5716,8 +5720,7 @@ cuvs_ambulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
     if (cuvs_cagra_has_pages(info->index))
     {
 #ifdef CUVS_PAGE_FORMAT
-        ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-                        errmsg("VACUUM is disabled for the experimental page format")));
+        return cuvs_cagra_page_bulkdelete(info, stats, callback, callback_state);
 #else
         cuvs_cagra_require_legacy(info->index);
 #endif
@@ -5820,8 +5823,7 @@ cuvs_amvacuumcleanup(IndexVacuumInfo *info, IndexBulkDeleteResult *stats)
     if (cuvs_cagra_has_pages(info->index))
     {
 #ifdef CUVS_PAGE_FORMAT
-        ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-                        errmsg("VACUUM is disabled for the experimental page format")));
+        return cuvs_cagra_page_vacuumcleanup(info, stats);
 #else
         cuvs_cagra_require_legacy(info->index);
 #endif
