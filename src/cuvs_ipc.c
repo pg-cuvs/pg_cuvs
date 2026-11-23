@@ -649,10 +649,8 @@ shm_write_query_batch(const char *shm_key, const float *queries,
 
 /* Write query vector into a new shm segment. Returns shm fd or -1. */
 static int
-shm_write_query(const char *shm_key, const float *query_vec, int dim)
+shm_write_page_bytes(const char *shm_key, const void *query_vec, size_t vec_bytes)
 {
-    size_t vec_bytes = (size_t)dim * sizeof(float);
-
     int fd = shm_open(shm_key, O_CREAT | O_EXCL | O_RDWR, 0644);
     if (fd < 0)
         return -1;
@@ -677,6 +675,99 @@ shm_write_query(const char *shm_key, const float *query_vec, int dim)
     memcpy(mem, query_vec, vec_bytes);
     munmap(mem, vec_bytes);
     return fd;
+}
+
+static int
+shm_write_query(const char *shm_key, const float *query_vec, int dim)
+{
+    return shm_write_page_bytes(shm_key, query_vec, (size_t) dim * sizeof(float));
+}
+
+/* A page reply uses CuvsResult.tid as a zero-based slot number. */
+int
+cuvs_ipc_search_pages(const char *socket_path, uint32_t db_oid, uint32_t index_oid,
+    const CuvsPageSearchRequest *request, const float *queries, int nq, int dim, int k,
+    uint32_t metric, uint32_t itopk_size, uint32_t search_width, uint32_t use_cpu_hnsw,
+    uint32_t search_mode, uint32_t bf_precision, const uint32_t *excluded, uint32_t words,
+    CuvsResult *results, int *count, uint32_t *latency_us)
+{
+    char key[64] = "", filter_key[64] = "";
+    int fd = -1, filter_fd = -1;
+    int sock = -1;
+    int status = CUVS_STATUS_ERROR;
+    int canceled;
+    int waiting;
+    CuvsReplyHeader reply;
+    CuvsCmdFrame cmd = {.op = excluded ? CUVS_OP_SEARCH_PAGES_FILTERED :
+            nq > 1 ? CUVS_OP_SEARCH_PAGES_BATCH : CUVS_OP_SEARCH_PAGES,
+        .db_oid = db_oid,
+        .index_oid = index_oid, .dim = (uint32_t) dim, .k = (uint32_t) k,
+        .metric = metric, .itopk_size = itopk_size, .search_width = search_width,
+        .n_vecs = nq, .n_filter_tids = words, .search_mode = search_mode,
+        .bf_precision = bf_precision, .use_cpu_hnsw = use_cpu_hnsw};
+
+    *count = 0;
+    *latency_us = 0;
+    if (nq < 1 || nq > 1024 || make_shm_key(key, sizeof(key)) != 0)
+        goto done;
+    fd = nq > 1 ? shm_write_query_batch(key, queries, (uint32_t) nq, dim) :
+        shm_write_query(key, queries, dim);
+    if (fd < 0)
+        goto done;
+    if (excluded)
+    {
+        if (make_shm_key(filter_key, sizeof(filter_key)) != 0)
+            goto done;
+        filter_fd = shm_write_page_bytes(filter_key, excluded, (size_t) words * sizeof(*excluded));
+        if (filter_fd < 0)
+            goto done;
+        memcpy(cmd.filter_shm_key, filter_key, sizeof(filter_key));
+    }
+    sock = uds_connect_wait(socket_path, 30, &canceled);
+    if (sock < 0)
+    {
+        status = canceled ? CUVS_STATUS_CANCELED : CUVS_STATUS_UNAVAILABLE;
+        goto done;
+    }
+    memcpy(cmd.shm_key, key, sizeof(key));
+    if (send_cmd(sock, &cmd) < 0 || send_all(sock, request, sizeof(*request)) < 0)
+        goto done;
+
+    waiting = recv_reply_interruptible(sock, &reply, 30);
+    if (waiting != 0)
+    {
+        if (waiting == 1)
+            status = CUVS_STATUS_CANCELED;
+        goto done;
+    }
+    status = (int) reply.status;
+    if (status == CUVS_STATUS_OK)
+    {
+        if (reply.n_results > (uint32_t) (nq * k) ||
+            (reply.n_results != 0 &&
+             recv_all(sock, results, reply.n_results * sizeof(*results)) < 0))
+            status = CUVS_STATUS_ERROR;
+        else
+        {
+            *count = (int) reply.n_results;
+            *latency_us = reply.latency_us;
+        }
+    }
+
+done:
+    if (sock >= 0)
+        close(sock);
+    if (fd >= 0)
+    {
+        close(fd);
+        shm_unlink(key);
+    }
+    if (filter_fd >= 0)
+    {
+        close(filter_fd);
+        shm_unlink(filter_key);
+    }
+    return status;
 }
 
 /* ----------------------------------------------------------------

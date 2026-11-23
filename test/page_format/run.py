@@ -4,6 +4,7 @@ from contextlib import contextmanager
 import os
 from pathlib import Path
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
@@ -46,6 +47,15 @@ def build(source, flag, output, *, install=None):
     targets = ["all", "server"] if install is None else ["install", f"DESTDIR={install}"]
     jobs = min(8, len(os.sched_getaffinity(0)))
     command(["make", "-C", source, f"-j{jobs}", *options, *targets], output, timeout=900)
+
+
+def copy_source(original, target):
+    target.mkdir()
+    for name in ("Makefile", "pg_cuvs.control"):
+        shutil.copy2(original / name, target)
+    for name in ("src", "sql"):
+        shutil.copytree(original / name, target / name,
+                        ignore=shutil.ignore_patterns("*.o", "*.so", "*.bc"))
 
 
 class Cluster:
@@ -173,6 +183,51 @@ def check_off(cluster):
         cluster.stop()
 
 
+def check_slots(cluster, source):
+    cluster.sql("beta1a", "pageinspect", "-c", "CREATE EXTENSION pageinspect;")
+    cluster.sql("beta1a", "slots-meta", "-At", "-c", """
+        SELECT (SELECT oid FROM pg_database WHERE datname=current_database()),
+               'g14_idx'::regclass::oid, system_identifier,
+               encode(get_raw_page('g14_idx',0),'hex')
+          FROM pg_control_system();
+    """)
+    record = (cluster.logs / "main-slots-meta.log").read_text().splitlines()[-1]
+    db, oid, sysid, raw = record.split("|")
+    nonces_and_slots = struct.unpack_from("=QQQQ", bytes.fromhex(raw), 48)
+    binary = source / "slots-test"
+    command(["cc", "-std=gnu11", "-O2", "-I", source / "src", "-o", binary,
+             CASES / "beta1a_slots.c", source / "src/cuvs_ipc.c",
+             source / "src/cuvs_util.c", source / "src/cuvs_build_corpus.c",
+             "-lm", "-lpthread", "-lrt"], cluster.logs / "slots-build.log")
+    cluster.run(binary, [cluster.socket, db, oid, sysid, *nonces_and_slots], "slots")
+
+
+def old_daemon_search(cluster):
+    cluster.sql("beta1a", "old-daemon-search", "-c", """
+        SET enable_seqscan=off;
+        DO $$
+        BEGIN
+            IF (SELECT id FROM g14_pages
+                 ORDER BY v <-> '[1,1,1,1,1,1,1,1]' LIMIT 1) IS DISTINCT FROM 1
+               OR pg_cuvs_last_search_k() IS NOT NULL THEN
+                RAISE EXCEPTION 'the new extension did not use the heap with the old daemon';
+            END IF;
+        END $$;
+    """)
+    cluster.run("createdb", ["old_build"], "createdb-old-build")
+    cluster.file("old_build", "old_daemon")
+
+
+def legacy_search(cluster, daemon, label):
+    with cluster.daemon(daemon, label):
+        cluster.start(label)
+        try:
+            cluster.run("createdb", [label], f"createdb-{label}")
+            cluster.file(label, "legacy")
+        finally:
+            cluster.stop()
+
+
 def run(work, logs):
     paths = {key: Path(subprocess.check_output([PG_CONFIG, "--" + key], text=True).strip())
              for key in ("bindir", "pkglibdir", "sharedir")}
@@ -186,24 +241,25 @@ def run(work, logs):
     source_on = work / "on"
     source_off = work / "off"
     for source in (source_on, source_off):
-        source.mkdir()
-        for name in ("Makefile", "pg_cuvs.control"):
-            shutil.copy2(ROOT / name, source)
-        for name in ("src", "sql"):
-            shutil.copytree(ROOT / name, source / name,
-                            ignore=shutil.ignore_patterns("*.o", "*.so", "*.bc"))
+        copy_source(ROOT, source)
     build(source_on, 1, logs / "build-on.log")
     build(source_on, 1, logs / "install.log", install=stage)
     build(source_off, 0, logs / "build-off.log")
+    legacy_source = os.environ.get("PAGE_TEST_LEGACY_SOURCE")
+    if legacy_source:
+        source_base = work / "base"
+        copy_source(Path(legacy_source), source_base)
+        build(source_base, 0, logs / "build-base.log")
 
     cluster = Cluster(work / "main", bindir, logs)
     with cluster.daemon(source_on / "pg_cuvs_server", "on"):
         cluster.start()
         try:
-            for case in ("alpha1", "alpha2_basic", "truncate", "relcache"):
+            for case in ("alpha1", "alpha2_basic", "truncate", "relcache", "beta1a"):
                 cluster.run("createdb", [case], f"createdb-{case}")
                 cluster.file(case, case)
                 print(f"{case}: PASS", flush=True)
+            check_slots(cluster, source_on)
             cluster.run(sys.executable, [CASES / "alpha1_concurrency.py", "alpha1"], "alpha1-concurrency")
             cluster.run(sys.executable, [CASES / "alpha2_concurrency.py", "alpha2_basic", cluster.log],
                         "alpha2-concurrency")
@@ -213,6 +269,14 @@ def run(work, logs):
             print("Dimension, pending tail, CIC, canceled VACUUM, standby and no-preload: PASS", flush=True)
         finally:
             cluster.stop()
+
+    if legacy_source:
+        with cluster.daemon(source_base / "pg_cuvs_server", "historical"):
+            cluster.start("historical")
+            try:
+                old_daemon_search(cluster)
+            finally:
+                cluster.stop()
 
     wal(Cluster(work / "wal", bindir, logs))
     changed = source_on / "src/cuvs_cagra_pages.c"
@@ -245,6 +309,20 @@ def run(work, logs):
     shutil.copy2(source_off / "pg_cuvs.so", lib)
     with cluster.daemon(source_off / "pg_cuvs_server", "off"):
         check_off(cluster)
+
+    if legacy_source:
+        legacy_search(cluster, source_base / "pg_cuvs_server", "candidate_off")
+        build(source_base, 0, logs / "install-base.log", install=stage)
+        old_cluster = Cluster(work / "old", bindir, logs)
+        legacy_search(old_cluster, source_off / "pg_cuvs_server", "old_extension")
+        for log in logs.glob("daemon-*.log"):
+            if "IPC protocol mismatch" in log.read_text():
+                raise RuntimeError(f"protocol mismatch reported in {log.name}")
+        print("G14: old daemon and new extension in both modes; old extension and new daemon: PASS",
+              flush=True)
+    else:
+        print("G14 mixed builds skipped: set PAGE_TEST_LEGACY_SOURCE to the reference checkout",
+              flush=True)
 
 
 if __name__ == "__main__":

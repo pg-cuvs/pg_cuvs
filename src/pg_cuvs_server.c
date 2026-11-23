@@ -355,6 +355,94 @@ static IndexEntry *g_indexes      = NULL;   /* calloc(g_max_indexes) at startup 
 static int         g_n_indexes   = 0;
 static pthread_mutex_t g_index_mutex = PTHREAD_MUTEX_INITIALIZER;
 
+/* Page-format graphs never participate in the OID-only legacy registry. */
+typedef struct PageCagraGraph
+{
+    struct PageCagraGraph *next;
+    uint64_t system_identifier;
+    uint32_t db_oid;
+    uint32_t index_oid;
+    uint64_t index_nonce;
+    uint64_t graph_nonce;
+    uint64_t build_xid;
+    uint64_t n_slots;
+    uint32_t dim;
+    uint32_t metric;
+    int gpu;
+    CuvsCagraIndex handle;
+    CuvsHnswIndex cpu_hnsw;
+    CuvsBfIndex bf;
+    size_t bf_bytes;
+    uint32_t bf_precision;
+    size_t bytes;
+    uint64_t last_use;
+} PageCagraGraph;
+
+static PageCagraGraph *g_page_graphs;
+static int g_n_page_graphs;
+static uint64_t g_page_access;
+static size_t g_page_graph_bytes[CUVS_MAX_GPUS];
+
+/* These helpers run under the registry lock. The disk directories outlive
+ * residency and are reconciled against the committed catalog separately. */
+static void
+free_page_graph(PageCagraGraph **link)
+{
+    PageCagraGraph *entry = *link;
+
+    *link = entry->next;
+    --g_n_page_graphs;
+    g_page_graph_bytes[entry->gpu] -= entry->bytes + entry->bf_bytes;
+    if (entry->bf) cuvs_bf_free(entry->bf, entry->gpu);
+    if (entry->cpu_hnsw) cuvs_hnsw_free(entry->cpu_hnsw);
+    cuvs_cagra_free(entry->handle, entry->gpu);
+    free(entry);
+}
+
+static void
+drop_page_graphs(uint32_t db_oid, uint32_t index_oid)
+{
+    PageCagraGraph **link = &g_page_graphs;
+
+    while (*link)
+    {
+        PageCagraGraph *entry = *link;
+        if (entry->db_oid == db_oid && entry->index_oid == index_oid)
+            free_page_graph(link);
+        else
+            link = &entry->next;
+    }
+}
+
+static bool
+evict_page_graph(int gpu)
+{
+    PageCagraGraph **victim = NULL;
+
+    for (PageCagraGraph **link = &g_page_graphs; *link; link = &(*link)->next)
+        if ((gpu < 0 || (*link)->gpu == gpu) &&
+            (!victim || (*link)->last_use < (*victim)->last_use))
+            victim = link;
+    if (!victim)
+        return false;
+    free_page_graph(victim);
+    return true;
+}
+
+static PageCagraGraph *
+find_page_graph(const CuvsCmdFrame *cmd, const CuvsPageSearchRequest *request)
+{
+    for (PageCagraGraph *entry = g_page_graphs; entry; entry = entry->next)
+        if (entry->system_identifier == request->system_identifier &&
+            entry->db_oid == cmd->db_oid && entry->index_oid == cmd->index_oid &&
+            entry->index_nonce == request->index_nonce &&
+            entry->graph_nonce == request->graph_nonce &&
+            request->base_nonce == entry->graph_nonce &&
+            entry->n_slots == request->n_slots)
+            return entry;
+    return NULL;
+}
+
 /* Phase 3D: cold index registry — indexes known from .relfilenode sidecars but
  * not yet VRAM-resident. Protected by g_index_mutex. When warmup completes,
  * the entry is removed here and load_index() adds it to g_indexes. */
@@ -802,7 +890,7 @@ total_vram_used(int device_id)
     /* ADR-070 Bug #2: include VRAM reserved by in-flight builds on this device
      * (released the mutex for the GPU build; not yet in g_indexes). */
     if (device_id >= 0 && device_id < CUVS_MAX_GPUS)
-        total += g_pending_build_vram[device_id];
+        total += g_pending_build_vram[device_id] + g_page_graph_bytes[device_id];
     return total;
 }
 
@@ -7142,7 +7230,7 @@ sync_build_path(const char *path, int flags)
 static int
 persist_page_build(const CuvsCmdFrame *cmd, const CuvsPageBuildRequest *request,
                    const char *index_dir, CuvsCagraIndex handle, int gpu,
-                   uint64_t *graph_nonce)
+                   uint64_t *graph_nonce, CuvsHnswIndex *cpu_hnsw)
 {
     const char *root = index_dir[0] ? index_dir : g_index_dir;
     char index_path[512], generation[512], graph[512], filename[512];
@@ -7182,6 +7270,10 @@ persist_page_build(const CuvsCmdFrame *cmd, const CuvsPageBuildRequest *request,
         sync_build_path(index_path, O_DIRECTORY) != 0 ||
         sync_build_path(root, O_DIRECTORY) != 0)
         return -1;
+    if (cmd->use_cpu_hnsw &&
+        snprintf(filename, sizeof(filename), "%s/index.hnsw", graph) < (int) sizeof(filename) &&
+        cuvs_hnsw_serialize(handle, filename, gpu) == CUVS_HNSW_SERIALIZE_OK)
+        *cpu_hnsw = cuvs_hnsw_deserialize(filename, (int) cmd->dim, cmd->metric, gpu);
     *graph_nonce = nonce;
     return 0;
 }
@@ -7203,9 +7295,12 @@ handle_build(int client_fd, const CuvsCmdFrame *cmd)
 
     if (cmd->op == CUVS_OP_BUILD_PAGES)
     {
-        if (recv_all(client_fd, &request, sizeof(request)) < 0 ||
-            request.length != sizeof(request) || request.flags != 0 ||
-            !request.index_nonce || !request.build_xid)
+        if (recv_all(client_fd, &request.length, sizeof(request.length)) < 0 ||
+            request.length != sizeof(request) ||
+            recv_all(client_fd, (char *) &request + sizeof(request.length),
+                     sizeof(request) - sizeof(request.length)) < 0 ||
+            request.flags != 0 || !request.index_nonce || !request.build_xid ||
+            !request.system_identifier)
         {
             send_error(client_fd, "invalid page-format BUILD frame");
             return;
@@ -7227,7 +7322,7 @@ handle_build(int client_fd, const CuvsCmdFrame *cmd)
     LOG_DEBUG("[handle_build] got index_dir=%s passed_fd=%d\n", index_dir, passed_fd);
 
     if (page_build && (cmd->n_partials != 0 || cmd->shard_count != 1 ||
-                       cmd->use_cpu_hnsw != 0))
+                       cmd->use_cpu_hnsw > 1))
     {
         if (passed_fd >= 0)
             close(passed_fd);
@@ -7415,6 +7510,17 @@ handle_build(int client_fd, const CuvsCmdFrame *cmd)
                               "GPU physical memory pressure; retry later", &rej);
         return;
     }
+    if (page_build)
+    {
+        size_t budget = g_max_vram_per_gpu[target_gpu];
+
+        while (budget && needed <= budget &&
+               total_vram_used(target_gpu) > budget - needed &&
+               evict_page_graph(target_gpu))
+            ;
+        while (g_n_indexes + g_n_page_graphs >= g_max_indexes && evict_page_graph(-1))
+            ;
+    }
     al.gpu = target_gpu;
     al.pending_before = g_pending_rmm_build_vram[target_gpu];
     al.evictions_before = g_cache_evictions[target_gpu];
@@ -7487,8 +7593,10 @@ handle_build(int client_fd, const CuvsCmdFrame *cmd)
     int build_oom = !new_handle && cuvs_last_build_was_oom();
     int build_att = !new_handle && !build_oom && cuvs_last_build_attach_failed();
     uint64_t page_graph_nonce = 0;
+    CuvsHnswIndex page_cpu_hnsw = NULL;
     int page_status = page_build && new_handle ?
-        persist_page_build(cmd, page_build, index_dir, new_handle, target_gpu, &page_graph_nonce) : 0;
+        persist_page_build(cmd, page_build, index_dir, new_handle, target_gpu,
+                           &page_graph_nonce, &page_cpu_hnsw) : 0;
 
     /* Reacquire for the durable-commit + registry tail (finish_build_commit
      * expects the lock held). Release the build reservation now: on success the
@@ -7551,7 +7659,37 @@ handle_build(int client_fd, const CuvsCmdFrame *cmd)
     {
         CuvsReplyHeader reply = {0};
 
-        cuvs_cagra_free(new_handle, target_gpu);
+        PageCagraGraph *entry = NULL;
+
+        if (page_status == 0 && g_n_indexes + g_n_page_graphs < g_max_indexes)
+            entry = calloc(1, sizeof(*entry));
+        if (entry != NULL)
+        {
+            entry->system_identifier = page_build->system_identifier;
+            entry->db_oid = cmd->db_oid;
+            entry->index_oid = cmd->index_oid;
+            entry->index_nonce = page_build->index_nonce;
+            entry->graph_nonce = page_graph_nonce;
+            entry->build_xid = page_build->build_xid;
+            entry->n_slots = cmd->n_vecs;
+            entry->dim = cmd->dim;
+            entry->metric = cmd->metric;
+            entry->gpu = target_gpu;
+            entry->handle = new_handle;
+            entry->last_use = ++g_page_access;
+            entry->cpu_hnsw = page_cpu_hnsw;
+            entry->bytes = final;
+            entry->next = g_page_graphs;
+            g_page_graphs = entry;
+            ++g_n_page_graphs;
+            g_page_graph_bytes[target_gpu] += final;
+        }
+        else
+        {
+            if (page_cpu_hnsw)
+                cuvs_hnsw_free(page_cpu_hnsw);
+            cuvs_cagra_free(new_handle, target_gpu);
+        }
         pthread_mutex_unlock(&g_index_mutex);
         munmap(mem, total);
         if (page_status != 0)
@@ -8837,6 +8975,8 @@ handle_drop(int client_fd, const CuvsCmdFrame *cmd)
     char     p[512];
 
     pthread_mutex_lock(&g_index_mutex);
+
+    drop_page_graphs(db, idx);
 
     /* Free the resident entry (if any) and compact the registry. */
     IndexEntry *e = find_index(db, idx);
@@ -12034,6 +12174,198 @@ reclaim_thread(void *arg)
     return NULL;
 }
 
+
+/* The attached dataset follows graph slot order. Keep its optional BF
+ * materialization with the same graph and account for it in admission. */
+static bool
+page_refresh_bf(PageCagraGraph *graph, uint32_t precision)
+{
+    int device = graph->gpu;
+    size_t elements = (size_t) graph->n_slots * graph->dim;
+    size_t bytes = elements * (precision == 1 ? 2 : 4);
+    size_t budget = g_max_vram_per_gpu[device];
+    float *vectors;
+
+    if (graph->bf && graph->bf_precision == precision)
+        return true;
+    if (graph->bf)
+    {
+        cuvs_bf_free(graph->bf, device);
+        graph->bf = NULL;
+        g_page_graph_bytes[device] -= graph->bf_bytes;
+        graph->bf_bytes = 0;
+    }
+    if ((budget && (bytes > budget || total_vram_used(device) > budget - bytes)) ||
+        bytes > gpu_free_vram_bytes(device))
+        return false;
+
+    vectors = malloc(elements * sizeof(*vectors));
+    if (!vectors)
+        return false;
+    if (cuvs_cagra_copy_dataset(graph->handle, vectors, graph->n_slots, graph->dim, device) == 0)
+        graph->bf = cuvs_bf_build(vectors, graph->n_slots, graph->dim, graph->metric,
+                                  precision, device);
+    free(vectors);
+    if (!graph->bf)
+        return false;
+    graph->bf_precision = precision;
+    graph->bf_bytes = bytes;
+    g_page_graph_bytes[device] += bytes;
+    return true;
+}
+
+static void *
+map_page_shm(const char *key, size_t key_size, size_t bytes)
+{
+    int fd;
+    void *mem = MAP_FAILED;
+
+    if (!memchr(key, '\0', key_size))
+        return mem;
+    fd = shm_open(key, O_RDONLY, 0);
+    if (fd >= 0)
+    {
+        if (shm_check_peer_owner(fd, g_peer_uid) && page_corpus_fits(fd, bytes))
+            mem = mmap(NULL, bytes, PROT_READ, MAP_SHARED, fd, 0);
+        close(fd);
+    }
+    return mem;
+}
+
+static int
+page_graph_search(PageCagraGraph *graph, const CuvsCmdFrame *cmd, const float *queries,
+                  int nq, int k, const uint32_t *excluded, CuvsSearchResult *raw)
+{
+    if (excluded || cmd->search_mode == 1)
+    {
+        if (!page_refresh_bf(graph, cmd->bf_precision))
+            return 1;
+        if (excluded)
+            return cuvs_bf_search_filtered(graph->bf, queries, graph->dim, k,
+                                           excluded, graph->n_slots, raw, graph->gpu);
+        if (nq == 1)
+            return cuvs_bf_search(graph->bf, queries, graph->dim, k, raw, graph->gpu);
+        return cuvs_bf_search_batch(graph->bf, queries, nq, graph->dim, k, raw, graph->gpu);
+    }
+    if (cmd->use_cpu_hnsw && graph->cpu_hnsw)
+    {
+        for (int q = 0; q < nq; ++q)
+            if (cuvs_hnsw_search(graph->cpu_hnsw, queries + (size_t) q * graph->dim,
+                                 graph->dim, k, 0, raw + (size_t) q * k) != 0)
+                return 1;
+        return 0;
+    }
+    if (nq == 1)
+        return cuvs_cagra_search(graph->handle, queries, graph->dim, k, raw,
+                                 graph->gpu, cmd->itopk_size, cmd->search_width);
+    return cuvs_cagra_search_batch(graph->handle, queries, nq, graph->dim, k, raw,
+                                   graph->gpu, cmd->itopk_size, cmd->search_width);
+}
+
+/* Base-only serving. Slot ranges are independent from the legacy registry. */
+static void
+handle_page_search(int client_fd, const CuvsCmdFrame *cmd)
+{
+    CuvsPageSearchRequest request;
+    CuvsReplyHeader reply = {0};
+    void *query = MAP_FAILED, *filter = MAP_FAILED;
+    const float *vectors;
+    CuvsSearchResult *raw = NULL;
+    CuvsResult *results = NULL;
+    size_t bytes = 0, filter_bytes = 0;
+    int nq = 1;
+    bool batch = cmd->op == CUVS_OP_SEARCH_PAGES_BATCH;
+    bool filtered = cmd->op == CUVS_OP_SEARCH_PAGES_FILTERED;
+    uint32_t prefix = batch ? 2 * sizeof(uint32_t) : 0;
+    struct timespec start, finish;
+
+    reply.status = CUVS_STATUS_ERROR;
+    if (recv_all(client_fd, &request.length, sizeof(request.length)) < 0 ||
+        request.length != sizeof(request) ||
+        recv_all(client_fd, (char *) &request + sizeof(request.length),
+                 sizeof(request) - sizeof(request.length)) < 0 ||
+        request.resume_count != 0 || request.resume_distance != 0 ||
+        request.reserved != 0 || cmd->dim == 0 || cmd->dim > 65535 ||
+        cmd->k == 0 || cmd->k > 4000 || cmd->search_mode > 1 || cmd->bf_precision > 1 ||
+        cmd->n_vecs < 1 || cmd->n_vecs > 1024 || batch != (cmd->n_vecs > 1) ||
+        request.n_slots == 0 || request.n_slots > INT32_MAX ||
+        (filtered ? cmd->n_filter_tids != (request.n_slots + 31) / 32 :
+                    cmd->n_filter_tids != 0))
+        goto done;
+    if (request.folded != 0 || request.tail != request.folded)
+    {
+        reply.status = CUVS_STATUS_NOT_FOUND;
+        goto done;
+    }
+
+    nq = (int) cmd->n_vecs;
+    bytes = prefix + (size_t) nq * cmd->dim * sizeof(float);
+    query = map_page_shm(cmd->shm_key, sizeof(cmd->shm_key), bytes);
+    if (query == MAP_FAILED)
+        goto done;
+    if (batch && (((const uint32_t *) query)[0] != (uint32_t) nq ||
+                  ((const uint32_t *) query)[1] != cmd->dim))
+        goto done;
+    if (filtered)
+    {
+        filter_bytes = (size_t) cmd->n_filter_tids * sizeof(uint32_t);
+        filter = map_page_shm(cmd->filter_shm_key, sizeof(cmd->filter_shm_key), filter_bytes);
+        if (filter == MAP_FAILED)
+            goto done;
+    }
+    vectors = (const float *) ((const char *) query + prefix);
+    raw = malloc((size_t) nq * cmd->k * sizeof(*raw));
+    results = calloc((size_t) nq * cmd->k, sizeof(*results));
+    if (raw == NULL || results == NULL)
+        goto done;
+
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    pthread_mutex_lock(&g_index_mutex);
+    PageCagraGraph *graph = find_page_graph(cmd, &request);
+    if (!graph || graph->dim != cmd->dim || graph->metric != cmd->metric)
+        reply.status = CUVS_STATUS_NOT_FOUND;
+    else
+    {
+        int k = (int) (graph->n_slots < cmd->k ? graph->n_slots : cmd->k);
+        graph->last_use = ++g_page_access;
+        int rc = page_graph_search(graph, cmd, vectors, nq, k, filtered ? filter : NULL, raw);
+
+        reply.status = rc == 0 ? CUVS_STATUS_OK : CUVS_STATUS_OOM_FALLBACK;
+        if (rc == 0)
+            for (int q = 0; q < nq; ++q)
+            {
+                int written = 0;
+                CuvsResult *row = results + (size_t) q * cmd->k;
+
+                for (int i = 0; i < k; ++i)
+                {
+                    CuvsSearchResult *candidate = &raw[(size_t) q * k + i];
+                    if (candidate->item_id >= 0 && (uint64_t) candidate->item_id < graph->n_slots)
+                    {
+                        row[written].tid = (uint64_t) candidate->item_id;
+                        row[written++].distance = candidate->distance;
+                    }
+                }
+                if (batch)
+                    while ((uint32_t) written < cmd->k)
+                        row[written++].tid = CUVS_PAGE_SLOT_INVALID;
+                reply.n_results += written;
+            }
+    }
+    pthread_mutex_unlock(&g_index_mutex);
+    clock_gettime(CLOCK_MONOTONIC, &finish);
+    reply.latency_us = (uint32_t) ((finish.tv_sec - start.tv_sec) * 1000000 +
+                                  (finish.tv_nsec - start.tv_nsec) / 1000);
+
+done:
+    if (query != MAP_FAILED) munmap(query, bytes);
+    if (filter != MAP_FAILED) munmap(filter, filter_bytes);
+    free(raw);
+    if (send_all(client_fd, &reply, sizeof(reply)) == 0 && reply.n_results)
+        send_all(client_fd, results, reply.n_results * sizeof(*results));
+    free(results);
+}
+
 static void *
 connection_thread(void *arg)
 {
@@ -12147,7 +12479,9 @@ connection_thread(void *arg)
             handle_build(client_fd, &cmd);
             break;
         case CUVS_OP_SEARCH_PAGES:
-            send_error_code(client_fd, CUVS_STATUS_NOT_FOUND, "page-format graph is not registered");
+        case CUVS_OP_SEARCH_PAGES_BATCH:
+        case CUVS_OP_SEARCH_PAGES_FILTERED:
+            handle_page_search(client_fd, &cmd);
             break;
         case CUVS_OP_STATUS:
             handle_stats(client_fd, &cmd);

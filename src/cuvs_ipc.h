@@ -160,7 +160,10 @@ int cuvs_ipc_build_hnsw_file_idle(const char *socket_path, int vectors_fd,
 /* Page-format requests keep the v6 command and reply layouts. BUILD_PAGES
  * carries this length-prefixed frame before the ordinary corpus handoff. */
 #define CUVS_OP_BUILD_PAGES   45
-#define CUVS_OP_SEARCH_PAGES  46
+#define CUVS_OP_SEARCH_PAGES          46
+#define CUVS_OP_SEARCH_PAGES_BATCH    47
+#define CUVS_OP_SEARCH_PAGES_FILTERED 48
+#define CUVS_PAGE_SLOT_INVALID UINT64_MAX
 
 typedef struct CuvsPageBuildRequest
 {
@@ -168,7 +171,26 @@ typedef struct CuvsPageBuildRequest
     uint32_t flags;
     uint64_t index_nonce;
     uint64_t build_xid;
+    uint64_t system_identifier;
 } CuvsPageBuildRequest;
+
+/* Both requests use the unchanged v6 envelope. This unit serves the base
+ * range only. The resume fields must be zero until continuation is enabled. */
+typedef struct CuvsPageSearchRequest
+{
+    uint32_t length;
+    uint32_t resume_count;
+    uint64_t system_identifier;
+    uint64_t index_nonce;
+    uint64_t base_nonce;
+    uint64_t graph_nonce;
+    uint64_t n_slots;
+    uint64_t folded;
+    uint64_t tail;
+    uint64_t dead_slots;
+    float    resume_distance;
+    uint32_t reserved;
+} CuvsPageSearchRequest;
 
 
 
@@ -405,6 +427,12 @@ typedef struct CuvsResult {
     uint64_t tid;           /* heap TID encoded as block<<16|offset */
     float    distance;
 } CuvsResult;
+
+int cuvs_ipc_search_pages(const char *socket_path, uint32_t db_oid, uint32_t index_oid,
+    const CuvsPageSearchRequest *request, const float *queries, int nq, int dim, int k,
+    uint32_t metric, uint32_t itopk_size, uint32_t search_width, uint32_t use_cpu_hnsw,
+    uint32_t search_mode, uint32_t bf_precision, const uint32_t *excluded, uint32_t words,
+    CuvsResult *results, int *count, uint32_t *latency_us);
 
 /* ----------------------------------------------------------------
  * STATS reply payload (CUVS_OP_STATUS).

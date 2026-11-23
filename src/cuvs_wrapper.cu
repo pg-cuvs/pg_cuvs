@@ -2688,6 +2688,43 @@ cuvs_hnsw_free(CuvsHnswIndex hidx)
     delete impl;
 }
 
+static void
+copy_cagra_rows(CuvsCagraIndexImpl *index, float *out, size_t n, size_t dim,
+                raft::device_resources &res)
+{
+    auto ds = index->idx.dataset();
+    auto stream = raft::resource::get_cuda_stream(res);
+    size_t stride = (size_t) ds.stride(0);
+
+    if (stride == dim)
+        raft::copy(out, ds.data_handle(), n * dim, stream);
+    else
+        for (size_t i = 0; i < n; ++i)
+            raft::copy(out + i * dim, ds.data_handle() + i * stride, dim, stream);
+}
+
+extern "C" int
+cuvs_cagra_copy_dataset(CuvsCagraIndex index, float *vectors, int64_t n,
+                         int dim, int device_id)
+{
+    if (!index || !vectors || n <= 0 || dim <= 0)
+        return -1;
+    auto *impl = static_cast<CuvsCagraIndexImpl *>(index);
+    PooledRes lease(device_id);
+    try {
+        auto ds = impl->idx.dataset();
+        if ((int64_t) ds.extent(0) != n || (int) ds.extent(1) != dim || !ds.data_handle())
+            return -1;
+        raft::device_resources &res = lease.get();
+        copy_cagra_rows(impl, vectors, (size_t) n, (size_t) dim, res);
+        res.sync_stream();
+        return 0;
+    } catch (...) {
+        lease.poison();
+        return -1;
+    }
+}
+
 /* ----------------------------------------------------------------
  * Phase 3J: extract CAGRA adjacency list + corpus vectors from VRAM to CPU.
  * Used by handle_export_adjacency in the daemon to serve pg_cuvs_import_cagra.
@@ -2735,21 +2772,7 @@ cuvs_cagra_extract_adjacency(
 
         auto stream = raft::resource::get_cuda_stream(res);
         raft::copy(adj, graph_view.data_handle(), N * D, stream);
-        /* cagra::index::dataset() is a strided view — cuVS pads rows for
-         * alignment, so a flat N*dim copy is only valid when the row stride
-         * equals dim. Fall back to a row-wise copy otherwise, or every vector
-         * after the first would be read at the wrong offset. */
-        {
-            size_t row_stride = (size_t)ds.stride(0);
-            if (row_stride == dim) {
-                raft::copy(vecs, ds.data_handle(), N * dim, stream);
-            } else {
-                for (size_t i = 0; i < N; i++)
-                    raft::copy(vecs + i * dim,
-                               ds.data_handle() + i * row_stride,
-                               dim, stream);
-            }
-        }
+        copy_cagra_rows(cimpl, vecs, N, dim, res);
         res.sync_stream();
 
         *adj_out          = adj;
