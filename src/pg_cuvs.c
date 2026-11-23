@@ -5580,15 +5580,18 @@ cuvs_aminsert(Relation indexRel, Datum *values, bool *isnull,
     uint64_t  tid;
     uint32_t  metric;
     Oid       cagra_am;
-    CuvsCagraRelCache *cache = cuvs_cagra_relation_cache(indexRel);
 
     (void) heapRel; (void) checkUnique; (void) indexUnchanged; (void) indexInfo;
 
-    if (cache->page_format)
+    if (cuvs_cagra_relation_cache(indexRel)->page_format)
     {
 #ifdef CUVS_PAGE_FORMAT
         if (!isnull[0])
-            cuvs_cagra_append_pending(indexRel, cache, heap_tid, DatumGetPgVector(values[0])->dim);
+        {
+            int dim = DatumGetPgVector(values[0])->dim;
+
+            cuvs_cagra_append_pending(indexRel, heap_tid, dim);
+        }
         return false;
 #else
         cuvs_cagra_require_legacy(indexRel);
@@ -5603,10 +5606,11 @@ cuvs_aminsert(Relation indexRel, Datum *values, bool *isnull,
      * per relcache life and route to CPU. */
     if (cuvs_max_delta_rows <= 0)
     {
-        if (!cache->stale_sent)
+        if (!cuvs_cagra_relation_cache(indexRel)->stale_sent)
         {
             cuvs_mark_index_stale(indexRel);
-            cache->stale_sent = true;
+            /* The stale notification processes relcache invalidations. */
+            cuvs_cagra_relation_cache(indexRel)->stale_sent = true;
         }
         return false;
     }
@@ -5820,6 +5824,10 @@ cuvs_amvacuumcleanup(IndexVacuumInfo *info, IndexBulkDeleteResult *stats)
     Oid      index_oid = RelationGetRelid(indexRel);
     char     tpath[MAXPGPATH];
     struct   stat st;
+
+    if (info->analyze_only)
+        return stats;
+
     if (cuvs_cagra_has_pages(info->index))
     {
 #ifdef CUVS_PAGE_FORMAT
@@ -5830,7 +5838,7 @@ cuvs_amvacuumcleanup(IndexVacuumInfo *info, IndexBulkDeleteResult *stats)
     }
 
 
-    if (!cuvs_vacuum_cleanup_considers_compact(info->analyze_only,
+    if (!cuvs_vacuum_cleanup_considers_compact(false,
                                                cuvs_socket_path && cuvs_socket_path[0] != '\0'))
         return stats;
     if (!cuvs_index_is_stale(index_oid))

@@ -363,6 +363,11 @@ test-source-checks: test-hnsw-auto-overflow test-hnsw-explicit-route
 	done; \
 	exit $$rc
 
+# PostgreSQL 16, pgvector and the CPU shim. Uses private builds and clusters.
+.PHONY: test-page-format
+test-page-format:
+	python3 -B test/page_format/run.py "$(PG_CONFIG)"
+
 # K3: chunked spool digest used by the HNSW build during the daemon RPC.
 test-hnsw-digest: test/unit/test_hnsw_digest.c src/cuvs_hnsw_digest.h
 	$(CC) -std=gnu11 -O2 -Wall -Wextra -Werror -I src -o $@ $< -lcrypto

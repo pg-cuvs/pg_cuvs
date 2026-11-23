@@ -66,8 +66,7 @@ bool cuvs_cagra_read_meta(Relation index, CuvsCagraMeta *meta);
 void cuvs_cagra_init_pages(Relation index, ForkNumber fork, uint64 index_nonce,
                           uint64 graph_nonce, int dim, uint32 metric,
                           const uint64 *tids, int64 n);
-void cuvs_cagra_append_pending(Relation index, CuvsCagraRelCache *cache,
-                               ItemPointer tid, int dim);
+void cuvs_cagra_append_pending(Relation index, ItemPointer tid, int dim);
 void cuvs_cagra_check_dim(int expected, int actual);
 void cuvs_cagra_check_query_dim(Relation index, int dim);
 IndexBulkDeleteResult *cuvs_cagra_page_bulkdelete(IndexVacuumInfo *info,

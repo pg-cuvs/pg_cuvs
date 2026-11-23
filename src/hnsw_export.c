@@ -4424,6 +4424,19 @@ create_empty_hnsw(Oid cagra_oid)
     return hnsw_oid;
 }
 
+static void
+hnsw_require_legacy_cagra_source(Relation source)
+{
+#ifdef CUVS_PAGE_FORMAT
+    if (cuvs_cagra_has_pages(source))
+        ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                        errmsg("page-format CAGRA is not yet a supported HNSW source"),
+                        errhint("Build the HNSW index from the heap without a source.")));
+#else
+    cuvs_cagra_require_legacy(source);
+#endif
+}
+
 PG_FUNCTION_INFO_V1(pg_cuvs_build_hnsw);
 Datum
 pg_cuvs_build_hnsw(PG_FUNCTION_ARGS)
@@ -4464,12 +4477,7 @@ pg_cuvs_build_hnsw(PG_FUNCTION_ARGS)
                     (errmsg("pg_cuvs_build_hnsw: \"%s\" is not a cagra index",
                             get_rel_name(cagra_oid))));
         }
-#ifdef CUVS_PAGE_FORMAT
-        if (cuvs_cagra_has_pages(cagra_rel_pc))
-            ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-                            errmsg("page-format CAGRA is not yet a supported HNSW source"),
-                            errhint("Build the HNSW index from the heap without a source.")));
-#endif
+        hnsw_require_legacy_cagra_source(cagra_rel_pc);
         int precheck_dim = (int) TupleDescAttr(RelationGetDescr(cagra_rel_pc), 0)->atttypmod;
         int graph_degree  = cuvs_cagra_reloption_graph_degree(cagra_rel_pc);
         index_close(cagra_rel_pc, AccessShareLock);
@@ -4870,12 +4878,7 @@ cuvs_hnsw_ambuild(Relation heapRel, Relation indexRel, IndexInfo *indexInfo)
          * graph_degree reloption, before paying the IPC round-trip. */
         {
             Relation cagra_rel_gd = index_open(cagra_oid, AccessShareLock);
-    #ifdef CUVS_PAGE_FORMAT
-            if (cuvs_cagra_has_pages(cagra_rel_gd))
-                ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-                                errmsg("page-format CAGRA is not yet a supported HNSW source"),
-                                errhint("Build the HNSW index from the heap without a source.")));
-    #endif
+            hnsw_require_legacy_cagra_source(cagra_rel_gd);
             int graph_degree = cuvs_cagra_reloption_graph_degree(cagra_rel_gd);
             index_close(cagra_rel_gd, AccessShareLock);
             int m0 = (graph_degree < 64) ? graph_degree : 64;

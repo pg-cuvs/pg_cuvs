@@ -171,7 +171,7 @@ def check(src):
     assert 'build_algo=auto exceeded the resident budget (need %u MiB, budget %u MiB); building with ACE on disk' in src['backend'], 'TRANSITION_TEXT'
     assert 'ereport(NOTICE' in t, 'TRANSITION_IS_NOTICE'
     # CAGRA reltuples AR0 before any scan
-    c = function(code['backend'], 'cuvs_build_cagra_from_heap(Relation heapRel')
+    c = function(code['backend'], 'cuvs_build_cagra_from_heap_impl(Relation heapRel')
     ordered(c, ['cuvs_cagra_prespool_ar0(', 'cuvs_build_parallel(', 'table_index_build_scan('], 'CAGRA_AR0_BEFORE_SCAN')
     return 'PASS_SOURCE_INVARIANT_NOT_CUDA'
 
@@ -239,7 +239,7 @@ MUTANTS = [
     ('route_log_status_gated', 'server',
      '        cuvs_hnsw_forecast_route_name(f),',
      '        f->status == CUVS_STATUS_OK ? cuvs_hnsw_route_name(f->decision.route) : "none",'),
-    ('cagra_ar0_after_scan', 'backend',
+    ('cagra_ar0_removed', 'backend',
      '            && cuvs_cagra_prespool_ar0(reltuples_est,', '            && 0 && (reltuples_est,'),
     # R1 kNN-graph fallback (217d29b)
     ('graph_fallback_for_explicit_ivf_pq', 'common',
@@ -301,6 +301,21 @@ def main(output):
             rows.append(dict(name=name, status='PASS_SOURCE_MUTANT_DETECTED', reason=str(e)))
         else:
             raise AssertionError('SOURCE_MUTANT_SURVIVED:' + name)
+
+    backend = src['backend']
+    impl = backend.index('cuvs_build_cagra_from_heap_impl(Relation heapRel')
+    start = backend.index('    /* I3-C (', impl)
+    stop = backend.index('    /* ADR-034', start)
+    after_scan = backend.index('        if (out_reltuples)', stop)
+    moved = dict(src, backend=(backend[:start] + backend[stop:after_scan]
+                               + backend[start:stop] + backend[after_scan:]))
+    try:
+        check(moved)
+    except AssertionError as e:
+        assert str(e) == 'CAGRA_AR0_BEFORE_SCAN:ORDER', str(e)
+        rows.append(dict(name='cagra_ar0_after_scan', status='PASS_SOURCE_MUTANT_DETECTED', reason=str(e)))
+    else:
+        raise AssertionError('SOURCE_MUTANT_SURVIVED:cagra_ar0_after_scan')
     result['count'] = len(rows)
     (out / 'RESULT.json').write_text(json.dumps(result, indent=2) + '\n')
     print(json.dumps(result))

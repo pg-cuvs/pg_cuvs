@@ -111,7 +111,8 @@ bad_page(Relation index, BlockNumber block)
 {
     ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
                     errmsg("invalid CAGRA index page at block %u of \"%s\"",
-                           block, RelationGetRelationName(index))));
+                           block, RelationGetRelationName(index)),
+                    errhint("REINDEX the index using a build that supports the page format.")));
 }
 
 static void
@@ -355,24 +356,25 @@ append_item(Page page, ItemPointer tid)
 }
 
 void
-cuvs_cagra_append_pending(Relation index, CuvsCagraRelCache *cache,
-                          ItemPointer tid, int dim)
+cuvs_cagra_append_pending(Relation index, ItemPointer tid, int dim)
 {
+    /* Buffer operations may outlive an rd_amcache allocation. */
+    CuvsCagraRelCache cached = *cuvs_cagra_relation_cache(index);
     BlockNumber tail;
     uint64 next_pos = 0;
 
-    if (cache->index_nonce == 0)
+    if (cached.index_nonce == 0)
     {
         CuvsCagraMeta meta;
 
         if (!cuvs_cagra_read_meta(index, &meta))
             bad_page(index, 0);
-        cache->tail = meta.pending_tail;
-        cache->index_nonce = meta.index_nonce;
-        cache->dim = meta.dim;
+        cached.tail = meta.pending_tail;
+        cached.index_nonce = meta.index_nonce;
+        cached.dim = meta.dim;
     }
-    cuvs_cagra_check_dim(cache->dim, dim);
-    tail = cache->tail;
+    cuvs_cagra_check_dim(cached.dim, dim);
+    tail = cached.tail;
 
     for (;;)
     {
@@ -384,9 +386,10 @@ cuvs_cagra_append_pending(Relation index, CuvsCagraRelCache *cache,
         GenericXLogState *wal;
         Page image;
         bool full;
+        CuvsCagraRelCache *cache;
 
         LockBuffer(tb, BUFFER_LOCK_EXCLUSIVE);
-        pending = page_pending(index, tail, BufferGetPage(tb), cache->index_nonce);
+        pending = page_pending(index, tail, BufferGetPage(tb), cached.index_nonce);
         if (next_pos != 0 && pending->first_pos != next_pos)
             bad_page(index, tail);
         if (BlockNumberIsValid(pending->next))
@@ -401,23 +404,23 @@ cuvs_cagra_append_pending(Relation index, CuvsCagraRelCache *cache,
         }
 
         full = pending->count == CUVS_CAGRA_PENDING_PER_PAGE;
-        if (full && cache->dim == 0)
+        if (full && cached.dim == 0)
         {
             CuvsCagraMeta current;
 
             if (!cuvs_cagra_read_meta(index, &current) ||
-                current.index_nonce != cache->index_nonce || current.pending_tail != tail)
+                current.index_nonce != cached.index_nonce || current.pending_tail != tail)
                 bad_page(index, 0);
             cuvs_cagra_check_dim(current.dim, dim);
         }
         if (full)
             nb = extend_page(index, MAIN_FORKNUM);
-        if (cache->dim == 0 || full)
+        if (cached.dim == 0 || full)
         {
             mb = ReadBuffer(index, 0);
             LockBuffer(mb, BUFFER_LOCK_EXCLUSIVE);
             meta = page_meta(BufferGetPage(mb));
-            if (meta == NULL || meta->index_nonce != cache->index_nonce ||
+            if (meta == NULL || meta->index_nonce != cached.index_nonce ||
                 meta->pending_tail != tail)
                 bad_page(index, 0);
             cuvs_cagra_check_dim(meta->dim, dim);
@@ -432,7 +435,7 @@ cuvs_cagra_append_pending(Relation index, CuvsCagraRelCache *cache,
 
             old->next = next;
             image = new_page(wal, nb, sizeof(*pending));
-            init_pending(image, cache->index_nonce, old->first_pos + old->count);
+            init_pending(image, cached.index_nonce, old->first_pos + old->count);
             tail = next;
         }
         append_item(image, tid);
@@ -450,6 +453,8 @@ cuvs_cagra_append_pending(Relation index, CuvsCagraRelCache *cache,
         if (BufferIsValid(nb))
             UnlockReleaseBuffer(nb);
         UnlockReleaseBuffer(tb);
+        cache = cuvs_cagra_relation_cache(index);
+        cache->index_nonce = cached.index_nonce;
         cache->tail = tail;
         cache->dim = dim;
         return;
