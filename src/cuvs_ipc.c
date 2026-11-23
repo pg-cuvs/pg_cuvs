@@ -1768,6 +1768,95 @@ cleanup:
 }
 
 /* ----------------------------------------------------------------
+ * CUVS_OP_EXPORT_HNSW_UPPER — the hnswlib file and the TID file of a
+ * loaded CAGRA index, each as a daemon-owned memfd (see cuvs_ipc.h).
+ * ---------------------------------------------------------------- */
+int
+cuvs_ipc_export_hnsw_upper(
+    const char  *socket_path,
+    uint32_t     db_oid,
+    uint32_t     index_oid,
+    int         *hnsw_fd_out,
+    int         *tids_fd_out,
+    size_t      *n_vecs_out,
+    int         *degree_out,
+    int         *dim_out)
+{
+    int  sock = -1, hnsw_fd = -1, tids_fd = -1;
+    int  rc = CUVS_STATUS_ERROR;
+    char token;
+
+    *hnsw_fd_out = *tids_fd_out = -1;
+    sock = uds_connect_ex(socket_path, 120);
+    if (sock < 0)
+        return CUVS_STATUS_UNAVAILABLE;
+
+    CuvsCmdFrame cmd = {
+        .op        = CUVS_OP_EXPORT_HNSW_UPPER,
+        .db_oid    = db_oid,
+        .index_oid = index_oid,
+    };
+    if (send_cmd(sock, &cmd) < 0)
+        goto cleanup;
+
+    /* The daemon replies only after building the upper layers, which grows
+     * with the index and may take longer than any fixed receive timeout. Wait
+     * for the reply without one, in 250 ms slices that ask the wait callback
+     * (query cancel, statement_timeout): on a cancel the socket is closed,
+     * which the daemon takes as the signal to stop building. A daemon that
+     * exits closes the socket as well and ends the wait. */
+    for (;;)
+    {
+        struct pollfd pfd = { .fd = sock, .events = POLLIN, .revents = 0 };
+        int pr = poll(&pfd, 1, 250);
+
+        if (pr > 0)
+            break;
+        if (pr < 0 && errno != EINTR)
+            goto cleanup;
+        if (g_wait_cb && g_wait_cb())
+        {
+            rc = CUVS_STATUS_CANCELED;
+            goto cleanup;
+        }
+    }
+
+    CuvsReplyHeader hdr;
+    if (cuvs_fd_recv(sock, &hdr, sizeof(hdr), &hnsw_fd) < 0)
+        goto cleanup;
+    if (hdr.status != CUVS_STATUS_OK) {
+        rc = (int)hdr.status;
+        goto cleanup;
+    }
+    if (hnsw_fd < 0 || cuvs_fd_recv(sock, &token, 1, &tids_fd) < 0 || tids_fd < 0) {
+        LOG_ERROR("[export_hnsw_upper] reply without its two SCM_RIGHTS fds\n");
+        goto cleanup;
+    }
+    if (!shm_check_daemon_owner(sock, hnsw_fd) || !shm_check_daemon_owner(sock, tids_fd)) {
+        LOG_ERROR("[export_hnsw_upper] owner mismatch on a passed fd\n");
+        goto cleanup;
+    }
+    if (hdr.n_results == 0 || hdr.latency_us == 0 || hdr.delta_merged == 0) {
+        LOG_ERROR("[export_hnsw_upper] bad reply n=%u degree=%u dim=%u\n",
+                  hdr.n_results, hdr.latency_us, hdr.delta_merged);
+        goto cleanup;
+    }
+    *n_vecs_out  = (size_t)hdr.n_results;
+    *degree_out  = (int)hdr.latency_us;
+    *dim_out     = (int)hdr.delta_merged;
+    *hnsw_fd_out = hnsw_fd;
+    *tids_fd_out = tids_fd;
+    hnsw_fd = tids_fd = -1;        /* ownership transferred to the caller */
+    rc = CUVS_STATUS_OK;
+
+cleanup:
+    if (hnsw_fd >= 0) close(hnsw_fd);
+    if (tids_fd >= 0) close(tids_fd);
+    if (sock >= 0)    close(sock);
+    return rc;
+}
+
+/* ----------------------------------------------------------------
  * Public API: cuvs_ipc_search_filtered (D-wedge spike)
  *
  * Thin wrapper around cuvs_ipc_search that adds a second shm segment

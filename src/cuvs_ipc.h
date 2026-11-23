@@ -188,6 +188,9 @@ int cuvs_ipc_build_hnsw_file_idle(const char *socket_path, int vectors_fd,
 #define CUVS_STATUS_CANCELED      11   /* 3S: backend aborted the wait (statement_timeout / query cancel) */
 #define CUVS_STATUS_PROTO_MISMATCH 12  /* #77: daemon/extension wire-protocol skew (co-deploy both) */
 #define CUVS_STATUS_HNSW_RESIDENT_BUDGET_EXCEEDED 13 /* AUTO/explicit IVF estimate only; not tiny/ACE/OOM */
+#define CUVS_STATUS_HNSW_UPPER_SKIPPED 16 /* EXPORT_HNSW_UPPER built no upper layers (the
+                                           * graph degree is below 4, so M < 2); the backend
+                                           * keeps its own level assignment */
 
 /* ----------------------------------------------------------------
  * Command frame (sent over UDS, fixed size)
@@ -890,6 +893,19 @@ int cuvs_ipc_export_adjacency(
     uint32_t    *metric_out      /* CUVS_METRIC_* of the source CAGRA index */
 );
 
+/* CUVS_OP_EXPORT_HNSW_UPPER. On CUVS_STATUS_OK the caller owns and
+ * closes *hnsw_fd_out and *tids_fd_out; on any other status both are -1. */
+int cuvs_ipc_export_hnsw_upper(
+    const char  *socket_path,
+    uint32_t     db_oid,
+    uint32_t     index_oid,
+    int         *hnsw_fd_out,
+    int         *tids_fd_out,
+    size_t      *n_vecs_out,
+    int         *degree_out,
+    int         *dim_out
+);
+
 /*
  * cuvs_ipc_stats — fetch per-index search statistics (CUVS_OP_STATUS).
  *
@@ -1099,6 +1115,20 @@ int cuvs_ipc_inject_build_oom(
 #define CUVS_OP_MEMORY_STATUS   35
 #define CUVS_OP_RECLAIM_SET     36
 #define CUVS_OP_RECLAIM_STATUS  37
+
+/* a loaded CAGRA index as an hnswlib file with upper layers. The daemon
+ * copies the graph, vectors and TIDs under the registry lock exactly as
+ * CUVS_OP_EXPORT_ADJACENCY does, releases it, and builds the upper layers on
+ * the host over those copies (cuvs_hnsw_upper.c; one such build at a time,
+ * stopped when the client goes); level 0 is the CAGRA graph cut to
+ * min(graph_degree, 64) rounded down to even, without self links or duplicates.
+ * The client waits for the reply without a receive timeout, asking its wait
+ * callback, and closes the socket on a cancel. Reply: the header with
+ * n_results = rows, latency_us = level-0 degree, delta_merged = dim and the
+ * hnswlib file as an SCM_RIGHTS memfd, then one byte with a second memfd
+ * holding a CuvsTidsHeader (its metric is the source metric) and the TIDs in
+ * hnswlib label order. CUVS_STATUS_HNSW_UPPER_SKIPPED carries no fd. */
+#define CUVS_OP_EXPORT_HNSW_UPPER 38
 
 #define CUVS_IPC_TEXT_MAX (8u * 1024u * 1024u)
 

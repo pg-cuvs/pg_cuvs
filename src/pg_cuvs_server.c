@@ -33,6 +33,7 @@
 #include <stdarg.h>
 #include "cuvs_wrapper.h"
 #include "cuvs_hnsw_build_common.h"
+#include "cuvs_hnsw_upper.h"
 #include "cuvs_objstore.h"
 #include "cuvs_build_corpus.h"   /* ADR-057: cuvs_fd_recv (SCM_RIGHTS build payload) */
 #include "cuvs_lw_policy.h"      /* I4 / ADR-088: large_workspace overflow policy */
@@ -8394,6 +8395,7 @@ handle_export_adjacency(int client_fd, const CuvsCmdFrame *cmd)
     uint32_t idx = cmd->index_oid;
 
     pthread_mutex_lock(&g_index_mutex);
+    uint64_t lock_t0 = cuvs_hnsw_monotonic_us();
     IndexEntry *e = find_index(db, idx);
     if (!e || !e->valid || !e->handle || e->shard_count >= 2)
     {
@@ -8410,8 +8412,9 @@ handle_export_adjacency(int client_fd, const CuvsCmdFrame *cmd)
     int       graph_degree;
     int       gpu  = (int)e->gpu_device_id;
 
+    int       vec_dim = 0;
     if (cuvs_cagra_extract_adjacency(e->handle, &adj, &vecs, &n_vecs,
-                                      &graph_degree, gpu) != 0)
+                                      &graph_degree, &vec_dim, gpu) != 0)
     {
         pthread_mutex_unlock(&g_index_mutex);
         free(adj); free(vecs);
@@ -8432,6 +8435,7 @@ handle_export_adjacency(int client_fd, const CuvsCmdFrame *cmd)
         return;
     }
     memcpy(tids, e->tids, (size_t)n_vecs_i * sizeof(uint64_t));
+    uint64_t lock_held_us = cuvs_hnsw_monotonic_us() - lock_t0;
     pthread_mutex_unlock(&g_index_mutex);
 
     /* Pack into shared memory:
@@ -8529,8 +8533,8 @@ handle_export_adjacency(int client_fd, const CuvsCmdFrame *cmd)
     free(vecs);
     free(tids);
 
-    LOG_INFO("[handle_export_adjacency] %u/%u N=%zu D=%d dim=%u fd-passed (was %s)\n",
-             db, idx, n_vecs, graph_degree, dim, shm_key);
+    LOG_INFO("[handle_export_adjacency] %u/%u N=%zu D=%d dim=%u lock_held_us=%llu fd-passed (was %s)\n",
+             db, idx, n_vecs, graph_degree, dim, (unsigned long long)lock_held_us, shm_key);
 
     /* Reply: n_vecs/graph_degree/dim in header fields; the segment itself rides
      * along as an SCM_RIGHTS fd (#165). error[] carries the former name for log
@@ -8690,6 +8694,227 @@ handle_export_hnsw_shm(int client_fd, const CuvsCmdFrame *cmd)
     if (cuvs_fd_send(client_fd, mfd, &reply, sizeof(reply)) != 0)
         LOG_ERROR("[handle_export_hnsw_shm] fd handoff failed for %u/%u\n", db, idx);
     close(mfd);
+}
+
+static int
+write_all_fd(int fd, const void *buf, size_t len)
+{
+    const char *p = (const char *)buf;
+    while (len > 0)
+    {
+        ssize_t n = write(fd, p, len);
+        if (n < 0 && errno == EINTR)
+            continue;
+        if (n <= 0)
+            return -1;
+        p += n;
+        len -= (size_t)n;
+    }
+    return 0;
+}
+
+/* one EXPORT_HNSW_UPPER builds at a time (each holds a copy of its
+ * graph and vectors); a request that waits for it gives up when its client
+ * has gone. Other operations never wait on this lock. */
+static pthread_mutex_t g_upper_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+/* The client of a request has closed its end: the backend gave up (query
+ * cancel, statement_timeout) or exited. It sends nothing after the frame, so
+ * a readable socket here means end of file. */
+static int
+client_gone(void *arg)
+{
+    int fd = *(const int *)arg;
+    struct pollfd p = { .fd = fd, .events = POLLIN | POLLRDHUP, .revents = 0 };
+    char c;
+
+    if (poll(&p, 1, 0) <= 0)
+        return 0;
+    if (p.revents & (POLLHUP | POLLERR | POLLRDHUP | POLLNVAL))
+        return 1;
+    return (p.revents & POLLIN) && recv(fd, &c, 1, MSG_PEEK | MSG_DONTWAIT) == 0;
+}
+
+/* ----------------------------------------------------------------
+ * Handle EXPORT_HNSW_UPPER (CUVS_OP_EXPORT_HNSW_UPPER, cuvs_ipc.h).
+ *
+ * The registry lock covers what handle_export_adjacency does under it (find
+ * the entry, copy graph and vectors out of VRAM, copy the TIDs) plus copying
+ * the scalars used later, so it is held no longer than there. After the
+ * unlock nothing reads the entry. The upper layers are built on the host
+ * over those copies (cuvs_hnsw_upper.c: no GPU memory, several threads,
+ * stopped when the client goes) and written as the hnswlib file.
+ * ---------------------------------------------------------------- */
+static void
+export_hnsw_upper_locked_out(int client_fd, const CuvsCmdFrame *cmd)
+{
+    uint32_t  db  = cmd->db_oid;
+    uint32_t  idx = cmd->index_oid;
+    uint32_t *adj  = NULL;
+    float    *vecs = NULL;
+    uint64_t *tids = NULL;
+    size_t    n_vecs = 0;
+    int       graph_degree = 0, vec_dim = 0;
+    int       hfd = -1, tfd = -1;
+    char      err[160];
+    CuvsHnswUpperStats st;
+
+    pthread_mutex_lock(&g_index_mutex);
+    uint64_t lock_t0 = cuvs_hnsw_monotonic_us();
+    IndexEntry *e = find_index(db, idx);
+    if (!e || !e->valid || !e->handle || e->shard_count >= 2)
+    {
+        pthread_mutex_unlock(&g_index_mutex);
+        send_error_code(client_fd, CUVS_STATUS_NOT_FOUND,
+                        "index not loaded or sharded (call after CREATE INDEX USING cagra)");
+        return;
+    }
+    int      gpu    = (int)e->gpu_device_id;
+    uint32_t dim    = e->dim;
+    uint32_t metric = e->metric;
+    int64_t  n_reg  = e->n_vecs;
+    if (cuvs_cagra_extract_adjacency(e->handle, &adj, &vecs, &n_vecs,
+                                      &graph_degree, &vec_dim, gpu) != 0)
+    {
+        pthread_mutex_unlock(&g_index_mutex);
+        free(adj); free(vecs);
+        send_error(client_fd, "cuvs_cagra_extract_adjacency failed");
+        return;
+    }
+    if ((int64_t)n_vecs != n_reg || n_vecs > UINT32_MAX || vec_dim != (int)dim)
+    {
+        pthread_mutex_unlock(&g_index_mutex);
+        free(adj); free(vecs);
+        send_error(client_fd, "graph rows or vector width do not match the registered index");
+        return;
+    }
+    tids = malloc(n_vecs * sizeof(uint64_t));
+    if (!tids)
+    {
+        pthread_mutex_unlock(&g_index_mutex);
+        free(adj); free(vecs);
+        send_error(client_fd, "out of memory for export");
+        return;
+    }
+    memcpy(tids, e->tids, n_vecs * sizeof(uint64_t));
+    uint64_t lock_held_us = cuvs_hnsw_monotonic_us() - lock_t0;
+    pthread_mutex_unlock(&g_index_mutex);
+    e = NULL;   /* not read again */
+    (void)gpu;
+
+    /* Level 0 as the backend's own conversion takes it: the first
+     * min(graph_degree, 64) CAGRA neighbors, rounded down to even. */
+    int degree = graph_degree < 64 ? graph_degree : 64;
+    if (degree % 2 != 0)
+        degree--;
+    if (degree < 4)     /* M = degree / 2 >= 2: the level draw and hnswlib's mult = 1 / ln M need it */
+    {
+        free(adj); free(vecs); free(tids);
+        send_error_code(client_fd, CUVS_STATUS_HNSW_UPPER_SKIPPED,
+                        "graph degree below 4: no upper layers");
+        return;
+    }
+    /* Inner product over unit rows orders as cosine does, and pgvector stores
+     * cosine rows normalized too. A zero row stays zero. */
+    if (metric == CUVS_METRIC_COSINE)
+        for (size_t i = 0; i < n_vecs; i++)
+        {
+            float *v = vecs + i * dim;
+            double s = 0.0;
+            for (uint32_t k = 0; k < dim; k++)
+                s += (double)v[k] * v[k];
+            if (s > 0.0)
+            {
+                float inv = (float)(1.0 / sqrt(s));
+                for (uint32_t k = 0; k < dim; k++)
+                    v[k] *= inv;
+            }
+        }
+    int rc = CUVS_HNSW_UPPER_ERROR;
+    hfd = memfd_create("pg_cuvs_hnsw_upper", MFD_CLOEXEC | MFD_ALLOW_SEALING);
+    if (hfd < 0)
+        snprintf(err, sizeof(err), "memfd_create failed errno=%d", errno);
+    else
+        rc = cuvs_hnsw_upper_write(hfd, adj, graph_degree, degree, vecs, (uint64_t)n_vecs, (int)dim,
+                                   metric != CUVS_METRIC_L2, 2 * degree, 0,
+                                   client_gone, &client_fd, &st, err, sizeof(err));
+    free(adj);
+    free(vecs);
+    if (rc == CUVS_HNSW_UPPER_CANCELED)
+    {
+        LOG_INFO("[handle_export_hnsw_upper] %u/%u N=%zu client gone after %llu us: stopped\n",
+                 db, idx, n_vecs, (unsigned long long)st.build_us);
+        free(tids);
+        close(hfd);
+        return;
+    }
+    if (rc != CUVS_HNSW_UPPER_OK)
+    {
+        LOG_ERROR("[handle_export_hnsw_upper] %u/%u: %s\n", db, idx, err);
+        free(tids);
+        if (hfd >= 0) close(hfd);
+        send_error_code(client_fd, CUVS_STATUS_BUILD_FAILED, "upper-layer build failed");
+        return;
+    }
+
+    CuvsTidsHeader th = {0};
+    th.magic      = CUVS_TIDS_MAGIC;
+    th.version    = CUVS_TIDS_VERSION;
+    th.n_vecs     = (int64_t)n_vecs;
+    th.dim        = dim;
+    th.metric     = metric;
+    th.body_crc32 = cuvs_crc32(tids, n_vecs * sizeof(uint64_t));
+    tfd = memfd_create("pg_cuvs_hnsw_tids", MFD_CLOEXEC | MFD_ALLOW_SEALING);
+    int tids_ok = tfd >= 0 && write_all_fd(tfd, &th, sizeof(th)) == 0 &&
+                  write_all_fd(tfd, tids, n_vecs * sizeof(uint64_t)) == 0;
+    free(tids);
+    /* Sealed as in handle_export_hnsw_shm: immutable for every holder. */
+    const int seals = F_SEAL_WRITE | F_SEAL_GROW | F_SEAL_SHRINK | F_SEAL_SEAL;
+    if (!tids_ok || fcntl(hfd, F_ADD_SEALS, seals) != 0 || fcntl(tfd, F_ADD_SEALS, seals) != 0)
+    {
+        LOG_ERROR("[handle_export_hnsw_upper] tids write or seal failed errno=%d\n", errno);
+        close(hfd);
+        if (tfd >= 0) close(tfd);
+        send_error(client_fd, "cannot write or seal the hnswlib files");
+        return;
+    }
+
+    LOG_INFO("[handle_export_hnsw_upper] %u/%u N=%zu degree=%d dim=%u lock_held_us=%llu "
+             "upper_nodes=%llu max_level=%d threads=%d upper_build_us=%llu write_us=%llu fd-passed\n",
+             db, idx, n_vecs, degree, dim, (unsigned long long)lock_held_us,
+             (unsigned long long)st.upper_nodes, st.max_level, st.threads,
+             (unsigned long long)st.build_us, (unsigned long long)st.write_us);
+
+    CuvsReplyHeader reply = {0};
+    reply.status       = CUVS_STATUS_OK;
+    reply.n_results    = (uint32_t)n_vecs;
+    reply.latency_us   = (uint32_t)degree;
+    reply.delta_merged = dim;
+    snprintf(reply.error, sizeof(reply.error), "memfd:pg_cuvs_hnsw_upper %u/%u", db, idx);
+    char token = 'T';
+    if (cuvs_fd_send(client_fd, hfd, &reply, sizeof(reply)) != 0 ||
+        cuvs_fd_send(client_fd, tfd, &token, 1) != 0)
+        LOG_ERROR("[handle_export_hnsw_upper] fd handoff failed for %u/%u\n", db, idx);
+    close(hfd);
+    close(tfd);
+}
+
+static void
+handle_export_hnsw_upper(int client_fd, const CuvsCmdFrame *cmd)
+{
+    /* Wait for the one running build, as long as the client still waits. */
+    while (pthread_mutex_trylock(&g_upper_mutex) != 0)
+    {
+        if (client_gone(&client_fd))
+        {
+            LOG_INFO("[handle_export_hnsw_upper] %u/%u: client gone while queued\n",
+                     cmd->db_oid, cmd->index_oid);
+            return;
+        }
+        (void)poll(NULL, 0, 50);
+    }
+    export_hnsw_upper_locked_out(client_fd, cmd);
+    pthread_mutex_unlock(&g_upper_mutex);
 }
 
 /* ----------------------------------------------------------------
@@ -11459,6 +11684,9 @@ connection_thread(void *arg)
             break;
         case CUVS_OP_EXPORT_HNSW_SHM:
             handle_export_hnsw_shm(client_fd, &cmd);
+            break;
+        case CUVS_OP_EXPORT_HNSW_UPPER:
+            handle_export_hnsw_upper(client_fd, &cmd);
             break;
         case CUVS_OP_BUILD_IVFPQ:
             handle_build_ivfpq(client_fd, &cmd);

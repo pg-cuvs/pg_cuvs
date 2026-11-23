@@ -112,61 +112,113 @@ COMMIT;
 -- Cleanup.
 DROP TABLE ec_dropped;
 
--- ── Case 6: #162 dim-ceiling pre-check ───────────────────────────
--- mode='nsw' always builds level 0 only (do_hierarchy is only true for
--- mode='hnsw'), so the pre-check uses the EXACT maxlevel=0 ceiling for
--- 'nsw', not the conservative safe_maxlevel=5 used by every other mode.
--- fp32, M=32 (graph_degree=64), maxlevel=0: ceiling is 1918. dim=2000 must
--- be rejected — and rejected BEFORE the HNSW-conversion IPC round-trip
--- (only the source CAGRA build itself pays GPU time).
-\set ON_ERROR_STOP off
+-- ── Case 6: #162 dimension ceiling ────────────────────────
+-- mode='nsw' builds upper layers, so element levels reach above 0.
+-- An element+neighbor pair too large for one page is split the way
+-- pgvector's own build splits it (hnswbuild.c): the element stays, its
+-- neighbor tuple goes first on the next page. The ceiling is therefore each
+-- tuple fitting a page by itself, which for vector is pgvector's own HNSW
+-- limit of 2000 dimensions. fp32 dim=2000 needs the split already at level
+-- 0 (pair 8488 bytes > 8160); halfvec dim=3900 likewise. Each index must
+-- build, find every row as its own nearest neighbor, and find a row
+-- inserted afterwards (pgvector's aminsert, which splits the same way).
+-- (random() + i * 0.0 + j * 0.0 makes the subquery run per row, not once.)
 CREATE TABLE ec_ceiling_f32 (id bigint, embedding vector(2000));
 INSERT INTO ec_ceiling_f32
-    SELECT i, (SELECT ('[' || string_agg(random()::text, ',') || ']')::vector
-               FROM generate_series(1,2000))
-    FROM generate_series(1,5) i;
+    SELECT i, (SELECT ('[' || string_agg((random() + i * 0.0 + j * 0.0)::text, ',') || ']')::vector
+               FROM generate_series(1,2000) j)
+    FROM generate_series(1,200) i;
 SET client_min_messages = 'warning';
 CREATE INDEX ec_ceiling_f32_cagra ON ec_ceiling_f32 USING cagra
     (embedding vector_l2_ops) WITH (graph_degree = 64);
-SET client_min_messages = 'notice';
 CREATE INDEX ec_ceiling_f32_hnsw ON ec_ceiling_f32 USING pg_cuvs_hnsw
     (embedding vector_l2_ops) WITH (source = 'ec_ceiling_f32_cagra', mode = 'nsw');
+DROP INDEX ec_ceiling_f32_cagra;
+SET client_min_messages = 'notice';
+SET enable_seqscan = off;
+SELECT count(*) AS f32_2000_self_first FROM ec_ceiling_f32 t
+WHERE (SELECT id FROM ec_ceiling_f32 ORDER BY embedding <-> t.embedding LIMIT 1) = t.id;
+INSERT INTO ec_ceiling_f32
+    SELECT 201, (SELECT ('[' || string_agg(random()::text, ',') || ']')::vector
+                FROM generate_series(1,2000));
+SELECT id AS f32_2000_inserted_first FROM ec_ceiling_f32
+ORDER BY embedding <-> (SELECT embedding FROM ec_ceiling_f32 WHERE id = 201) LIMIT 1;
+-- DELETE and VACUUM on split pairs: pgvector's bulk delete and graph repair follow each element's neighbor tuple on the
+-- next page and rewrite it there; every remaining row (134 of 201) must still be its own nearest neighbor.
+DELETE FROM ec_ceiling_f32 WHERE id % 3 = 0;
+VACUUM ec_ceiling_f32;
+SELECT count(*) AS f32_2000_self_first_after_vacuum FROM ec_ceiling_f32 t
+WHERE (SELECT id FROM ec_ceiling_f32 ORDER BY embedding <-> t.embedding LIMIT 1) = t.id;
+RESET enable_seqscan;
 DROP TABLE ec_ceiling_f32;
 
--- halfvec, M=32 (graph_degree=64), maxlevel=0: ceiling is 3836. dim=3900
--- must be rejected the same way (still comfortably under halfvec's own
--- pgvector dimension cap of 4000).
 CREATE TABLE ec_ceiling_hv (id bigint, embedding vector(3900));
 INSERT INTO ec_ceiling_hv
-    SELECT i, (SELECT ('[' || string_agg(random()::text, ',') || ']')::vector
-               FROM generate_series(1,3900))
-    FROM generate_series(1,5) i;
+    SELECT i, (SELECT ('[' || string_agg((random() + i * 0.0 + j * 0.0)::text, ',') || ']')::vector
+               FROM generate_series(1,3900) j)
+    FROM generate_series(1,200) i;
 SET client_min_messages = 'warning';
 CREATE INDEX ec_ceiling_hv_cagra ON ec_ceiling_hv USING cagra
     (embedding vector_l2_ops) WITH (graph_degree = 64);
-SET client_min_messages = 'notice';
 CREATE INDEX ec_ceiling_hv_hnsw ON ec_ceiling_hv USING pg_cuvs_hnsw
-    ((embedding::halfvec(3900)) halfvec_l2_ops)
-    WITH (source = 'ec_ceiling_hv_cagra', mode = 'nsw');
+    ((embedding::halfvec(3900)) halfvec_l2_ops) WITH (source = 'ec_ceiling_hv_cagra', mode = 'nsw');
+DROP INDEX ec_ceiling_hv_cagra;
+SET client_min_messages = 'notice';
+SET enable_seqscan = off;
+SELECT count(*) AS hv_3900_self_first FROM ec_ceiling_hv t
+WHERE (SELECT id FROM ec_ceiling_hv ORDER BY embedding::halfvec(3900) <-> t.embedding::halfvec(3900) LIMIT 1) = t.id;
+INSERT INTO ec_ceiling_hv
+    SELECT 201, (SELECT ('[' || string_agg(random()::text, ',') || ']')::vector
+                FROM generate_series(1,3900));
+SELECT id AS hv_3900_inserted_first FROM ec_ceiling_hv
+ORDER BY embedding::halfvec(3900) <-> (SELECT embedding::halfvec(3900) FROM ec_ceiling_hv WHERE id = 201) LIMIT 1;
+RESET enable_seqscan;
 DROP TABLE ec_ceiling_hv;
-\set ON_ERROR_STOP on
 
--- ── Case 7: regression guard for the mode-aware ceiling fix ──────
--- dim=1900 is BELOW the mode='nsw' exact ceiling (1918) but was, before
--- this fix, incorrectly rejected by a conservative safe_maxlevel=5 applied
--- regardless of mode. This must now SUCCEED — a real fp32 build in the
--- 1679-1918 band that the unconditional safe_maxlevel=5 pre-check broke.
+-- The heap build (no source) at the same ceiling.
+CREATE TABLE ec_ceiling_direct (id bigint, embedding vector(2000));
+INSERT INTO ec_ceiling_direct
+    SELECT i, (SELECT ('[' || string_agg((random() + i * 0.0 + j * 0.0)::text, ',') || ']')::vector
+               FROM generate_series(1,2000) j)
+    FROM generate_series(1,200) i;
+SET client_min_messages = 'warning';
+CREATE INDEX ec_ceiling_direct_hnsw ON ec_ceiling_direct USING pg_cuvs_hnsw
+    (embedding vector_l2_ops) WITH (mode = 'nsw');
+SET client_min_messages = 'notice';
+SET enable_seqscan = off;
+SELECT count(*) AS direct_2000_self_first FROM ec_ceiling_direct t
+WHERE (SELECT id FROM ec_ceiling_direct ORDER BY embedding <-> t.embedding LIMIT 1) = t.id;
+INSERT INTO ec_ceiling_direct
+    SELECT 201, (SELECT ('[' || string_agg(random()::text, ',') || ']')::vector
+                FROM generate_series(1,2000));
+SELECT id AS direct_2000_inserted_first FROM ec_ceiling_direct
+ORDER BY embedding <-> (SELECT embedding FROM ec_ceiling_direct WHERE id = 201) LIMIT 1;
+RESET enable_seqscan;
+DROP TABLE ec_ceiling_direct;
+
+-- ── Case 7: the 1679-1918 fp32 band ──────────────────────────────
+-- dim=1900: a level-0 pair fits one page (8088 bytes) but a level-1 pair
+-- does not, so only the upper-layer elements are split. Before 0.9.3 this
+-- band built only because nsw had no upper layers.
 CREATE TABLE ec_nsw_1900 (id bigint, embedding vector(1900));
 INSERT INTO ec_nsw_1900
-    SELECT i, (SELECT ('[' || string_agg(random()::text, ',') || ']')::vector
-               FROM generate_series(1,1900))
-    FROM generate_series(1,5) i;
+    SELECT i, (SELECT ('[' || string_agg((random() + i * 0.0 + j * 0.0)::text, ',') || ']')::vector
+               FROM generate_series(1,1900) j)
+    FROM generate_series(1,200) i;
 SET client_min_messages = 'warning';
 CREATE INDEX ec_nsw_1900_cagra ON ec_nsw_1900 USING cagra
     (embedding vector_l2_ops) WITH (graph_degree = 64);
 CREATE INDEX ec_nsw_1900_hnsw ON ec_nsw_1900 USING pg_cuvs_hnsw
     (embedding vector_l2_ops) WITH (source = 'ec_nsw_1900_cagra', mode = 'nsw');
+DROP INDEX ec_nsw_1900_cagra;
 SET client_min_messages = 'notice';
-SELECT count(*) AS nsw_1900_built FROM pg_indexes
-WHERE tablename = 'ec_nsw_1900' AND indexname = 'ec_nsw_1900_hnsw';
-DROP TABLE ec_nsw_1900 CASCADE;
+SET enable_seqscan = off;
+SELECT count(*) AS nsw_1900_self_first FROM ec_nsw_1900 t
+WHERE (SELECT id FROM ec_nsw_1900 ORDER BY embedding <-> t.embedding LIMIT 1) = t.id;
+INSERT INTO ec_nsw_1900
+    SELECT 201, (SELECT ('[' || string_agg(random()::text, ',') || ']')::vector
+                FROM generate_series(1,1900));
+SELECT id AS nsw_1900_inserted_first FROM ec_nsw_1900
+ORDER BY embedding <-> (SELECT embedding FROM ec_nsw_1900 WHERE id = 201) LIMIT 1;
+RESET enable_seqscan;
+DROP TABLE ec_nsw_1900;
