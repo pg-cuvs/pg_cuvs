@@ -7122,8 +7122,81 @@ admission_auto_shard_rejection(const CuvsCmdFrame *cmd, const char *path,
     pthread_mutex_unlock(&g_index_mutex);
 }
 
+
+static int
+sync_build_path(const char *path, int flags)
+{
+    int fd = open(path, O_RDONLY | flags);
+    int result;
+
+    if (fd < 0)
+        return -1;
+    result = fsync(fd);
+    if (close(fd) < 0)
+        result = -1;
+    return result;
+}
+
+/* An unregistered page-format graph is identified by both nonces. Never
+ * write the legacy OID-keyed files here: the catalog update can roll back. */
+static int
+persist_page_build(const CuvsCmdFrame *cmd, const CuvsPageBuildRequest *request,
+                   const char *index_dir, CuvsCagraIndex handle, int gpu,
+                   uint64_t *graph_nonce)
+{
+    const char *root = index_dir[0] ? index_dir : g_index_dir;
+    char index_path[512], generation[512], graph[512], filename[512];
+    uint64_t nonce;
+    FILE *marker;
+    int result;
+
+    do {
+        if (shm_key_random((unsigned char *) &nonce, sizeof(nonce)) != 0)
+            return -1;
+    } while (nonce == 0);
+    if (snprintf(index_path, sizeof(index_path), "%s/%u_%u", root,
+                 cmd->db_oid, cmd->index_oid) >= (int) sizeof(index_path) ||
+        snprintf(generation, sizeof(generation), "%s/%016llx", index_path,
+                 (unsigned long long) request->index_nonce) >= (int) sizeof(generation) ||
+        snprintf(graph, sizeof(graph), "%s/%016llx", generation,
+                 (unsigned long long) nonce) >= (int) sizeof(graph) ||
+        snprintf(filename, sizeof(filename), "%s/index.cagra", graph) >= (int) sizeof(filename))
+        return -1;
+    if ((mkdir(root, 0700) != 0 && errno != EEXIST) ||
+        (mkdir(index_path, 0700) != 0 && errno != EEXIST) ||
+        mkdir(generation, 0700) != 0 || mkdir(graph, 0700) != 0)
+        return -1;
+    if (cuvs_cagra_serialize(handle, filename, gpu) != 0 ||
+        sync_build_path(filename, 0) != 0 ||
+        snprintf(filename, sizeof(filename), "%s/build.xid", graph) >= (int) sizeof(filename))
+        return -1;
+    marker = fopen(filename, "wx");
+    if (!marker)
+        return -1;
+    result = fprintf(marker, "%llu\n", (unsigned long long) request->build_xid) < 0 ||
+             fflush(marker) != 0 || fsync(fileno(marker)) != 0;
+    if (fclose(marker) != 0)
+        result = -1;
+    if (result || sync_build_path(graph, O_DIRECTORY) != 0 ||
+        sync_build_path(generation, O_DIRECTORY) != 0 ||
+        sync_build_path(index_path, O_DIRECTORY) != 0 ||
+        sync_build_path(root, O_DIRECTORY) != 0)
+        return -1;
+    *graph_nonce = nonce;
+    return 0;
+}
+
+static int
+page_corpus_fits(int fd, size_t total)
+{
+    struct stat st;
+
+    return fstat(fd, &st) == 0 && S_ISREG(st.st_mode) && st.st_size >= 0 &&
+        (uint64_t) st.st_size >= total;
+}
+
 static void
-handle_build(int client_fd, const CuvsCmdFrame *cmd)
+handle_build(int client_fd, const CuvsCmdFrame *cmd, const CuvsPageBuildRequest *page_build)
 {
     clear_build_notices();
     LOG_DEBUG("[handle_build] reading index_dir...\n");
@@ -7138,6 +7211,15 @@ handle_build(int client_fd, const CuvsCmdFrame *cmd)
         return;
     }
     LOG_DEBUG("[handle_build] got index_dir=%s passed_fd=%d\n", index_dir, passed_fd);
+
+    if (page_build && (cmd->n_partials != 0 || cmd->shard_count != 1 ||
+                       cmd->use_cpu_hnsw != 0))
+    {
+        if (passed_fd >= 0)
+            close(passed_fd);
+        send_error(client_fd, "page-format CAGRA build requires one corpus on one device");
+        return;
+    }
 
     /* Reject degenerate or overflowing payload sizes before any allocation.
      * n_vecs*dim*4 can wrap size_t on a 32-bit-ish product (e.g. n_vecs ~2^31,
@@ -7188,6 +7270,12 @@ handle_build(int client_fd, const CuvsCmdFrame *cmd)
     void *mem;
     if (passed_fd >= 0)
     {
+        if (page_build && !page_corpus_fits(passed_fd, total))
+        {
+            close(passed_fd);
+            send_error(client_fd, "page-format build corpus has the wrong size");
+            return;
+        }
         LOG_INFO("[handle_build] corpus via memfd(SCM_RIGHTS) fd=%d total=%zu\n", passed_fd, total);
         mem = mmap(NULL, total, PROT_READ, MAP_SHARED, passed_fd, 0);
         close(passed_fd);   /* mapping holds the memory; daemon's ref is dropped here */
@@ -7207,6 +7295,12 @@ handle_build(int client_fd, const CuvsCmdFrame *cmd)
             LOG_ERROR("[handle_build] shm owner mismatch for %s\n", cmd->shm_key);
             close(shm_fd);
             send_error(client_fd, "shm owner mismatch");
+            return;
+        }
+        if (page_build && !page_corpus_fits(shm_fd, total))
+        {
+            close(shm_fd);
+            send_error(client_fd, "page-format build corpus has the wrong size");
             return;
         }
         LOG_DEBUG("[handle_build] shm_open OK fd=%d\n", shm_fd);
@@ -7311,7 +7405,8 @@ handle_build(int client_fd, const CuvsCmdFrame *cmd)
     al.pending_before = g_pending_rmm_build_vram[target_gpu];
     al.evictions_before = g_cache_evictions[target_gpu];
     uint64_t self_unloaded = 0;
-    int admit_rc = admit_build_cagra(needed, target_gpu, cmd->db_oid, cmd->index_oid,
+    int admit_rc = admit_build_cagra(needed, target_gpu, cmd->db_oid,
+                                     page_build ? 0 : cmd->index_oid,
                                      &self_unloaded, &al);
     note_build_admission(cmd->db_oid, cmd->index_oid, needed, target_gpu,
                          admit_rc == 0, self_unloaded);
@@ -7377,6 +7472,9 @@ handle_build(int client_fd, const CuvsCmdFrame *cmd)
      * evicting any resident index; ADR-070's evict-to-fit retry is removed. */
     int build_oom = !new_handle && cuvs_last_build_was_oom();
     int build_att = !new_handle && !build_oom && cuvs_last_build_attach_failed();
+    uint64_t page_graph_nonce = 0;
+    int page_status = page_build && new_handle ?
+        persist_page_build(cmd, page_build, index_dir, new_handle, target_gpu, &page_graph_nonce) : 0;
 
     /* Reacquire for the durable-commit + registry tail (finish_build_commit
      * expects the lock held). Release the build reservation now: on success the
@@ -7434,6 +7532,24 @@ handle_build(int client_fd, const CuvsCmdFrame *cmd)
         return;
     }
     LOG_DEBUG("[handle_build] cuvs_cagra_build OK\n");
+
+    if (page_build)
+    {
+        CuvsReplyHeader reply = {0};
+
+        cuvs_cagra_free(new_handle, target_gpu);
+        pthread_mutex_unlock(&g_index_mutex);
+        munmap(mem, total);
+        if (page_status != 0)
+        {
+            send_error_code(client_fd, CUVS_STATUS_PERSIST_FAILED, "could not persist page-format graph");
+            return;
+        }
+        reply.status = CUVS_STATUS_OK;
+        if (send_all(client_fd, &reply, sizeof(reply)) == 0)
+            send_all(client_fd, &page_graph_nonce, sizeof(page_graph_nonce));
+        return;
+    }
 
     uint64_t *new_tids = malloc(tid_bytes);
     if (!new_tids)
@@ -12013,7 +12129,22 @@ connection_thread(void *arg)
             break;
         }
         case CUVS_OP_BUILD:
-            handle_build(client_fd, &cmd);
+            handle_build(client_fd, &cmd, NULL);
+            break;
+        case CUVS_OP_BUILD_PAGES:
+        {
+            CuvsPageBuildRequest request;
+
+            if (recv_all(client_fd, &request, sizeof(request)) < 0 ||
+                request.length != sizeof(request) || request.flags != 0 ||
+                !request.index_nonce || !request.build_xid)
+                send_error(client_fd, "invalid page-format BUILD frame");
+            else
+                handle_build(client_fd, &cmd, &request);
+            break;
+        }
+        case CUVS_OP_SEARCH_PAGES:
+            send_error_code(client_fd, CUVS_STATUS_NOT_FOUND, "page-format graph is not registered");
             break;
         case CUVS_OP_STATUS:
             handle_stats(client_fd, &cmd);

@@ -157,6 +157,20 @@ int cuvs_ipc_build_hnsw_file_idle(const char *socket_path, int vectors_fd,
 #define CUVS_OP_HNSW_ROUTE_PREFLIGHT 40 /* hnsw route + disk precheck forecast */
 #define CUVS_OP_CAGRA_AR0_PREFLIGHT  41 /* CAGRA per-GPU admission limit for AR0 */
 
+/* Page-format requests keep the v6 command and reply layouts. BUILD_PAGES
+ * carries this length-prefixed frame before the ordinary corpus handoff. */
+#define CUVS_OP_BUILD_PAGES   45
+#define CUVS_OP_SEARCH_PAGES  46
+
+typedef struct CuvsPageBuildRequest
+{
+    uint32_t length;
+    uint32_t flags;
+    uint64_t index_nonce;
+    uint64_t build_xid;
+} CuvsPageBuildRequest;
+
+
 
 /* ----------------------------------------------------------------
  * Distance metrics (mirror pgvector operator names)
@@ -785,7 +799,9 @@ int cuvs_ipc_build(
     uint32_t       graph_degree,             /* 3R; 0 = cuVS default (64) */
     uint32_t       intermediate_graph_degree,/* 3R; 0 = cuVS default (128) */
     uint32_t       build_algo                /* 3R; CUVS_CAGRA_BUILD_* (0=AUTO) */
-);
+,
+    const CuvsPageBuildRequest *page_build,
+    uint64_t *graph_nonce_out);
 
 /*
  * cuvs_ipc_build_flat — ADR-073: send a BUILD_FLAT command to the daemon.

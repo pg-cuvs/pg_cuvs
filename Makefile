@@ -81,7 +81,7 @@ ISOLATION_GPU  = pg_cuvs_hnsw_cic_writes
 # C source files + the CUDA-compiled wrapper (built below by nvcc).
 # PGXS only knows how to build .c → .o; the .cu → .o rule is custom,
 # but the resulting object MUST be listed in OBJS to be linked into the .so.
-OBJS           = src/pg_cuvs.o src/cuvs_ipc.o src/cuvs_util.o $(WRAPPER_OBJ) src/hnsw_export.o src/cuvs_hnsw_scan.o src/cuvs_hnsw_rls.o src/cuvs_hnsw_exact.o src/cuvs_build_corpus.o src/pg_cuvs_compaction.o src/cuvs_status_text.o src/cuvs_peak_meter.o
+OBJS           = src/pg_cuvs.o src/cuvs_ipc.o src/cuvs_util.o $(WRAPPER_OBJ) src/hnsw_export.o src/cuvs_hnsw_scan.o src/cuvs_hnsw_rls.o src/cuvs_hnsw_exact.o src/cuvs_build_corpus.o src/pg_cuvs_compaction.o src/cuvs_status_text.o src/cuvs_peak_meter.o src/cuvs_cagra_pages.o
 
 # nvcc settings (Phase 1: brute-force only; CAGRA added later)
 NVCC          ?= nvcc
@@ -146,6 +146,9 @@ CUVS_LOGGER_LINK = -lrapids_logger
 endif
 
 PG_CPPFLAGS    = -I$(CUVS_INCLUDE) -I$(CUVS_RAPIDS_INCLUDE) -I./src
+ifeq ($(CUVS_PAGE_FORMAT),1)
+PG_CPPFLAGS += -DCUVS_PAGE_FORMAT
+endif
 # -Wl,-rpath embeds the cuVS lib path so postmaster finds libcuvs.so
 # without LD_LIBRARY_PATH being set (ADR-007).
 SHLIB_LINK     = $(CUVS_SO_LINK) $(CUVS_LOGGER_LINK) $(CUVS_SDK_PLAN_LINK) \
