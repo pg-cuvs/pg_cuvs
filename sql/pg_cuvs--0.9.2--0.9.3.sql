@@ -44,8 +44,8 @@ FROM pg_class c
 JOIN pg_am a ON a.oid = c.relam
 JOIN pg_index i ON i.indexrelid = c.oid
 CROSS JOIN LATERAL pg_cuvs_hnsw_layer_counts(c.oid::regclass) k
-WHERE a.amname = 'pg_cuvs_hnsw' AND has_table_privilege(i.indrelid, 'SELECT')
+WHERE a.amname = 'pg_cuvs_hnsw' AND i.indisready AND has_table_privilege(i.indrelid, 'SELECT')
 ORDER BY c.oid
 $$;
 COMMENT ON FUNCTION pg_cuvs_hnsw_layer_status() IS
-    'Every pg_cuvs_hnsw index the caller can read: whether it has the upper layers mode nsw lacked before 0.9.3, and why not. A heap build answers from its recorded hierarchy flag; a CAGRA-source build from the share of elements above level 0 (expected about 1/m; fewer than a quarter of that means no upper layers). Reads every page of every such index.';
+    'Every pg_cuvs_hnsw index the caller can read that is ready (one a concurrent build is writing is left out): whether it has the upper layers mode nsw lacked before 0.9.3, and why not. A heap build answers from its recorded hierarchy flag; a CAGRA-source build from the share of elements above level 0 (expected about 1/m; fewer than a quarter of that means no upper layers). Reads every page of every such index.';

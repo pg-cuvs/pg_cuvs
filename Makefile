@@ -74,6 +74,9 @@ REGRESS_FAULT  = build_oom build_multi_oom build_oom_evict_to_fit extend_cuda_oo
 # The daemon + GPU must be up, same as REGRESS.
 ISOLATION      = delta_tombstone_snapshot delta_interleaving reindex_concurrent_delete flat_tombstone_snapshot flat_delta_interleaving flat_reindex_concurrent_delete
 ISOLATION_OPTS = --inputdir=test --outputdir=test
+# Specs that need a real GPU daemon (the CPU shim cannot build an HNSW graph from the heap), kept out of ISOLATION so that
+# the tier1-shim CI job's installcheck-isolation does not run them; run them with installcheck-isolation-gpu.
+ISOLATION_GPU  = pg_cuvs_hnsw_cic_writes
 
 # C source files + the CUDA-compiled wrapper (built below by nvcc).
 # PGXS only knows how to build .c → .o; the .cu → .o rule is custom,
@@ -822,6 +825,10 @@ installcheck-nogpu: test-unit
 installcheck-isolation:
 	$(pg_isolation_regress_installcheck) $(ISOLATION_OPTS) $(ISOLATION)
 
+# The isolation specs that need a real GPU daemon (ISOLATION_GPU). Requires a running GPU daemon.
+installcheck-isolation-gpu:
+	$(pg_isolation_regress_installcheck) $(ISOLATION_OPTS) $(ISOLATION_GPU)
+
 # ---- Tier-1 installcheck (CPU-reference shim subset) ----------------------
 # The REGRESS suite minus REGRESS_TIER2_ONLY. Used by the tier1-shim CI job;
 # requires a (shim) daemon up, same as installcheck.
@@ -875,7 +882,7 @@ installcheck-fault: server-test
 	chmod 666 $(FAULT_SOCK); \
 	$(pg_regress_installcheck) $(REGRESS_OPTS) $(REGRESS_FAULT)
 
-.PHONY: installcheck-isolation installcheck-tier1 installcheck-fault
+.PHONY: installcheck-isolation installcheck-isolation-gpu installcheck-tier1 installcheck-fault
 
 .PHONY: installcheck-isolation
 
@@ -1045,7 +1052,7 @@ gpu-test-regress:
 gpu-test-isolation:
 	ssh -tt $(VM_HOST) "cd ~/pg_cuvs && \
 		$(REMOTE_ENV) && \
-		make installcheck-isolation"
+		make installcheck-isolation && make installcheck-isolation-gpu"
 
 # Fault-injection daemon integration tests. Builds the CUVS_TEST_HOOKS
 # daemon, drives daemon-down / persist-fault / clean-build scenarios on a
