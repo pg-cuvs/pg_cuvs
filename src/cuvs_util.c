@@ -18,6 +18,8 @@
 #include <limits.h>
 #include <stddef.h>   /* offsetof (cuvs_hw_profile crc range) */
 #include <time.h>     /* time(): legacy breaker wrappers */
+#include <pthread.h>  /* crc32 table once-init, parallel crc verifier */
+#include <unistd.h>   /* sysconf: parallel crc thread count */
 
 int
 cuvs_notice_decode(const char *wire, size_t len, CuvsNoticeBatch *out)
@@ -365,22 +367,44 @@ cuvs_lat_percentile(const uint32_t *buckets, int nbuckets, double q)
  * CRC-32 (IEEE 802.3, reflected, poly 0xEDB88320) and versioned .tids I/O.
  * LE-only: see cuvs_util.h header comment.
  * ---------------------------------------------------------------- */
-static uint32_t crc32_table[256];
-static int      crc32_table_init = 0;
+/* Slicing-by-8 tables: crc32_tab[0] is the classic byte table; crc32_tab[k]
+ * advances a byte that sits k positions earlier in an 8-byte word. Same
+ * polynomial and same values as the byte-at-a-time loop, eight bytes per
+ * step. pthread_once: the parallel verifier (cuvs_crc32_parallel) can make
+ * the first call from several threads at once.
+ * The guard needs __BYTE_ORDER__ (GCC, Clang and the nvcc host compilers
+ * define it); a compiler without it compiles this file unchecked. */
+#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ != __ORDER_LITTLE_ENDIAN__
+#error "cuvs_util.c: slicing-by-8 crc32 assumes a little-endian host (see cuvs_util.h)"
+#endif
+static uint32_t       crc32_tab[8][256];
+static pthread_once_t crc32_once = PTHREAD_ONCE_INIT;
 
 static void
-crc32_ensure_table(void)
+crc32_init_tables(void)
 {
-    if (crc32_table_init)
-        return;
     for (uint32_t i = 0; i < 256; i++)
     {
         uint32_t c = i;
         for (int k = 0; k < 8; k++)
             c = (c & 1) ? (0xEDB88320u ^ (c >> 1)) : (c >> 1);
-        crc32_table[i] = c;
+        crc32_tab[0][i] = c;
     }
-    crc32_table_init = 1;
+    for (uint32_t i = 0; i < 256; i++)
+    {
+        uint32_t c = crc32_tab[0][i];
+        for (int k = 1; k < 8; k++)
+        {
+            c = crc32_tab[0][c & 0xFFu] ^ (c >> 8);
+            crc32_tab[k][i] = c;
+        }
+    }
+}
+
+static void
+crc32_ensure_table(void)
+{
+    pthread_once(&crc32_once, crc32_init_tables);
 }
 
 uint32_t
@@ -395,9 +419,176 @@ cuvs_crc32_stream_update(uint32_t crc, const void *data, size_t len)
 {
     const unsigned char *p = (const unsigned char *)data;
     crc32_ensure_table();
-    for (size_t i = 0; i < len; i++)
-        crc = crc32_table[(crc ^ p[i]) & 0xFFu] ^ (crc >> 8);
+    /* LE-only (see cuvs_util.h): the low word of an 8-byte load holds the
+     * first four bytes. memcpy keeps unaligned loads defined. */
+    while (len >= 8)
+    {
+        uint64_t w;
+        uint32_t lo, hi;
+        memcpy(&w, p, 8);
+        lo = (uint32_t)w ^ crc;
+        hi = (uint32_t)(w >> 32);
+        crc = crc32_tab[7][lo & 0xFFu] ^ crc32_tab[6][(lo >> 8) & 0xFFu]
+            ^ crc32_tab[5][(lo >> 16) & 0xFFu] ^ crc32_tab[4][lo >> 24]
+            ^ crc32_tab[3][hi & 0xFFu] ^ crc32_tab[2][(hi >> 8) & 0xFFu]
+            ^ crc32_tab[1][(hi >> 16) & 0xFFu] ^ crc32_tab[0][hi >> 24];
+        p += 8;
+        len -= 8;
+    }
+    while (len--)
+        crc = crc32_tab[0][(crc ^ *p++) & 0xFFu] ^ (crc >> 8);
     return crc;
+}
+
+/* GF(2) 32x32 matrix helpers for crc32_combine (zlib's method). A matrix is
+ * 32 columns; mat[i] is the image of bit i. */
+static uint32_t
+gf2_times(const uint32_t *mat, uint32_t vec)
+{
+    uint32_t sum = 0;
+    while (vec)
+    {
+        if (vec & 1u)
+            sum ^= *mat;
+        vec >>= 1;
+        mat++;
+    }
+    return sum;
+}
+
+static void
+gf2_square(uint32_t *square, const uint32_t *mat)
+{
+    for (int n = 0; n < 32; n++)
+        square[n] = gf2_times(mat, mat[n]);
+}
+
+uint32_t
+cuvs_crc32_combine(uint32_t crc1, uint32_t crc2, size_t len2)
+{
+    uint32_t even[32], odd[32], row = 1;
+
+    if (len2 == 0)
+        return crc1;
+    /* odd = operator for one zero bit */
+    odd[0] = 0xEDB88320u;
+    for (int n = 1; n < 32; n++)
+    {
+        odd[n] = row;
+        row <<= 1;
+    }
+    gf2_square(even, odd);   /* two zero bits */
+    gf2_square(odd, even);   /* four zero bits */
+    /* apply len2 zero bytes to crc1: square up to 8, 16, ... bits per step */
+    for (;;)
+    {
+        gf2_square(even, odd);
+        if (len2 & 1u)
+            crc1 = gf2_times(even, crc1);
+        len2 >>= 1;
+        if (len2 == 0)
+            break;
+        gf2_square(odd, even);
+        if (len2 & 1u)
+            crc1 = gf2_times(odd, crc1);
+        len2 >>= 1;
+        if (len2 == 0)
+            break;
+    }
+    return crc1 ^ crc2;
+}
+
+int
+cuvs_crc_threads(int ncpu)
+{
+    int n = ncpu / 3;
+    if (n < 2)
+        n = 2;
+    if (n > 8)
+        n = 8;
+    return n;
+}
+
+/* Parallel CRC over fixed-size chunks: workers take chunk indices from a
+ * shared counter, then the per-chunk crcs are folded in order. Every chunk
+ * but the last has the same length, so the "append chunk bytes" operator is
+ * built once (32 combines) and each fold costs one matrix-vector product. */
+typedef struct CrcChunkJob {
+    const unsigned char *p;
+    size_t   len, chunk, nchunks;
+    uint32_t *crcs;
+    size_t   next;   /* taken with __atomic_fetch_add */
+} CrcChunkJob;
+
+static void *
+crc_chunk_worker(void *arg)
+{
+    CrcChunkJob *j = (CrcChunkJob *)arg;
+    for (;;)
+    {
+        size_t k = __atomic_fetch_add(&j->next, 1, __ATOMIC_RELAXED);
+        size_t off, n;
+        if (k >= j->nchunks)
+            break;
+        off = k * j->chunk;
+        n = j->len - off < j->chunk ? j->len - off : j->chunk;
+        j->crcs[k] = cuvs_crc32(j->p + off, n);
+    }
+    return NULL;
+}
+
+uint32_t
+cuvs_crc32_parallel_ex(const void *data, size_t len, int nthreads, size_t chunk)
+{
+    CrcChunkJob j;
+    pthread_t   th[CUVS_CRC_MAX_THREADS];
+    uint32_t    op[32], crc;
+    int         started = 0, extra;
+    size_t      last_len;
+
+    if (chunk == 0)
+        chunk = CUVS_CRC_CHUNK_BYTES;
+    if (nthreads > CUVS_CRC_MAX_THREADS)
+        nthreads = CUVS_CRC_MAX_THREADS;
+    memset(&j, 0, sizeof(j));
+    j.p = (const unsigned char *)data;
+    j.len = len;
+    j.chunk = chunk;
+    j.nchunks = len ? (len - 1) / chunk + 1 : 0;
+    if (nthreads <= 1 || j.nchunks <= 1)
+        return cuvs_crc32(data, len);
+    j.crcs = malloc(j.nchunks * sizeof(uint32_t));
+    if (!j.crcs)
+        return cuvs_crc32(data, len);
+    crc32_ensure_table();
+
+    /* The caller works too; start at most one helper per remaining chunk.
+     * A failed pthread_create only means fewer workers. */
+    extra = nthreads - 1;
+    if ((size_t)extra > j.nchunks - 1)
+        extra = (int)(j.nchunks - 1);
+    for (int i = 0; i < extra; i++)
+        if (pthread_create(&th[started], NULL, crc_chunk_worker, &j) == 0)
+            started++;
+    crc_chunk_worker(&j);
+    for (int i = 0; i < started; i++)
+        pthread_join(th[i], NULL);
+
+    for (int b = 0; b < 32; b++)
+        op[b] = cuvs_crc32_combine(1u << b, 0, chunk);
+    crc = j.crcs[0];
+    for (size_t k = 1; k + 1 < j.nchunks; k++)
+        crc = gf2_times(op, crc) ^ j.crcs[k];
+    last_len = len - (j.nchunks - 1) * chunk;
+    crc = cuvs_crc32_combine(crc, j.crcs[j.nchunks - 1], last_len);
+    free(j.crcs);
+    return crc;
+}
+
+uint32_t
+cuvs_crc32_parallel(const void *data, size_t len, int nthreads)
+{
+    return cuvs_crc32_parallel_ex(data, len, nthreads, CUVS_CRC_CHUNK_BYTES);
 }
 
 uint32_t
@@ -613,7 +804,13 @@ cuvs_vectors_read(FILE *f, CuvsVectorsHeader *hdr_out, float **vecs_out)
         free(vecs);
         return CUVS_VECTORS_READ_IO;
     }
-    if (cuvs_crc32(vecs, body_n * sizeof(float)) != hdr.body_crc32)
+    /* Whole-body verification runs while the daemon holds g_index_mutex
+     * (brute_force cache build), so it is split over clamp(ncpu / 3, 2, 8)
+     * threads (ncpu = online cpus; a cgroup quota is not seen) to shorten that
+     * stall. Same crc value. */
+    if (cuvs_crc32_parallel(vecs, body_n * sizeof(float),
+                            cuvs_crc_threads((int)sysconf(_SC_NPROCESSORS_ONLN)))
+        != hdr.body_crc32)
     {
         free(vecs);
         return CUVS_VECTORS_READ_BAD;

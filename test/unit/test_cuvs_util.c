@@ -461,6 +461,166 @@ test_crc32(void)
            "crc32 detects single-byte diff");
 }
 
+/* Reference: the original byte-at-a-time table loop. The fast implementation
+ * must produce the same value for every length and alignment. */
+static uint32_t
+ref_crc32(const unsigned char *p, size_t len)
+{
+    static uint32_t t[256];
+    static int init = 0;
+    uint32_t c = 0xFFFFFFFFu;
+    if (!init)
+    {
+        for (uint32_t i = 0; i < 256; i++)
+        {
+            uint32_t v = i;
+            for (int k = 0; k < 8; k++)
+                v = (v & 1) ? (0xEDB88320u ^ (v >> 1)) : (v >> 1);
+            t[i] = v;
+        }
+        init = 1;
+    }
+    for (size_t i = 0; i < len; i++)
+        c = t[(c ^ p[i]) & 0xFFu] ^ (c >> 8);
+    return c ^ 0xFFFFFFFFu;
+}
+
+static unsigned char *
+random_bytes(size_t n, unsigned seed)
+{
+    unsigned char *b = malloc(n ? n : 1);
+    uint32_t x = seed * 2654435761u + 1u;
+    for (size_t i = 0; i < n; i++)
+    {
+        x ^= x << 13; x ^= x >> 17; x ^= x << 5;
+        b[i] = (unsigned char)x;
+    }
+    return b;
+}
+
+static void
+test_crc32_fast_matches_reference(void)
+{
+    unsigned char *b = random_bytes(200003, 7);
+    int bad = 0;
+
+    /* every length 0..70 at every start offset 0..7 (alignment) */
+    for (size_t off = 0; off < 8; off++)
+        for (size_t len = 0; len <= 70; len++)
+            if (cuvs_crc32(b + off, len) != ref_crc32(b + off, len))
+                bad++;
+    ASSERT(bad == 0, "crc32 fast == reference for len 0..70, offsets 0..7");
+
+    ASSERT(cuvs_crc32(b + 3, 200000) == ref_crc32(b + 3, 200000),
+           "crc32 fast == reference on 200 KB unaligned");
+
+    /* streaming split at odd points equals one call */
+    {
+        uint32_t s = cuvs_crc32_stream_begin();
+        s = cuvs_crc32_stream_update(s, b, 13);
+        s = cuvs_crc32_stream_update(s, b + 13, 0);
+        s = cuvs_crc32_stream_update(s, b + 13, 99990);
+        s = cuvs_crc32_stream_update(s, b + 100003, 100000);
+        ASSERT(cuvs_crc32_stream_end(s) == ref_crc32(b, 200003),
+               "crc32 stream split at odd points == reference");
+    }
+    free(b);
+}
+
+static void
+test_crc32_combine(void)
+{
+    unsigned char *b = random_bytes(70001, 11);
+    size_t splits[] = { 0, 1, 7, 8, 9, 4096, 35000, 70000, 70001 };
+    int bad = 0;
+
+    for (size_t i = 0; i < sizeof(splits) / sizeof(splits[0]); i++)
+    {
+        size_t a = splits[i], blen = 70001 - a;
+        uint32_t ca = cuvs_crc32(b, a), cb = cuvs_crc32(b + a, blen);
+        if (cuvs_crc32_combine(ca, cb, blen) != cuvs_crc32(b, 70001))
+            bad++;
+    }
+    ASSERT(bad == 0, "crc32_combine(crc(A), crc(B), |B|) == crc(A||B) at every split");
+    ASSERT(cuvs_crc32_combine(0xDEADBEEFu, cuvs_crc32("", 0), 0) == 0xDEADBEEFu,
+           "crc32_combine with empty B is identity");
+    ASSERT(cuvs_crc32_combine(cuvs_crc32("", 0), cuvs_crc32(b, 5), 5) == cuvs_crc32(b, 5),
+           "crc32_combine with empty A returns crc(B)");
+    free(b);
+}
+
+static void
+test_crc32_parallel(void)
+{
+    size_t lens[] = { 0, 1, 7, 8, 9, 1000, 100003 };
+    size_t chunks[] = { 1, 7, 64, 4096, 1u << 20 };
+    int threads[] = { 0, 1, 2, 3, 8 };
+    unsigned char *b = random_bytes(100004, 23);
+    int bad = 0, cases = 0;
+
+    for (size_t li = 0; li < sizeof(lens) / sizeof(lens[0]); li++)
+        for (size_t ci = 0; ci < sizeof(chunks) / sizeof(chunks[0]); ci++)
+            for (size_t ti = 0; ti < sizeof(threads) / sizeof(threads[0]); ti++)
+            {
+                /* +1: unaligned start */
+                uint32_t want = ref_crc32(b + 1, lens[li]);
+                uint32_t got = cuvs_crc32_parallel_ex(b + 1, lens[li], threads[ti], chunks[ci]);
+                cases++;
+                if (got != want)
+                    bad++;
+            }
+    ASSERT(bad == 0, "crc32_parallel_ex == reference over lengths x chunk sizes x thread counts");
+    ASSERT(cases == 175, "crc32_parallel_ex case count");
+    ASSERT(cuvs_crc32_parallel(b, 100004, 4) == ref_crc32(b, 100004),
+           "crc32_parallel (8 MiB chunks) == reference below one chunk");
+    free(b);
+}
+
+/* A body larger than one 8 MiB crc chunk: the read-side verification runs
+ * the chunked parallel crc. Round trip must be exact, and a flipped byte in
+ * a later chunk must still be rejected. */
+static void
+test_vectors_read_multichunk(void)
+{
+    const int64_t  n = 4000;
+    const uint32_t dim = 768;   /* 12.3 MB body = 2 chunks */
+    size_t body = (size_t)n * dim * sizeof(float);
+    unsigned char *raw = random_bytes(body, 31);
+    FILE *f = tmpfile();
+    CuvsVectorsHeader hdr;
+    float *out = NULL;
+
+    ASSERT(f != NULL, "multichunk tmpfile");
+    ASSERT(cuvs_vectors_write(f, n, dim, CUVS_METRIC_L2, 7u, (const float *)raw) == 0,
+           "multichunk write");
+    rewind(f);
+    ASSERT(cuvs_vectors_read(f, &hdr, &out) == 0, "multichunk read ok");
+    ASSERT(out && memcmp(out, raw, body) == 0, "multichunk body identity");
+    ASSERT(hdr.body_crc32 == ref_crc32(raw, body), "multichunk header crc == reference");
+    free(out);
+    out = NULL;
+
+    /* flip one byte 10 MB into the body (second chunk) */
+    fseek(f, (long)(sizeof(CuvsVectorsHeader) + 10000000), SEEK_SET);
+    fputc(raw[10000000] ^ 0x5A, f);
+    rewind(f);
+    ASSERT(cuvs_vectors_read(f, &hdr, &out) != 0, "multichunk corruption in chunk 2 rejected");
+    ASSERT(out == NULL, "multichunk rejected read returns no buffer");
+    fclose(f);
+    free(raw);
+}
+
+static void
+test_crc_threads(void)
+{
+    ASSERT(cuvs_crc_threads(0) == 2, "crc threads: unknown cpu count -> 2");
+    ASSERT(cuvs_crc_threads(1) == 2, "crc threads: 1 cpu -> 2");
+    ASSERT(cuvs_crc_threads(8) == 2, "crc threads: 8 cpu -> 2");
+    ASSERT(cuvs_crc_threads(14) == 4, "crc threads: 14 cpu -> 4");
+    ASSERT(cuvs_crc_threads(24) == 8, "crc threads: 24 cpu -> 8");
+    ASSERT(cuvs_crc_threads(200) == 8, "crc threads: 200 cpu -> 8");
+}
+
 static void
 test_tids_roundtrip(void)
 {
@@ -1438,6 +1598,11 @@ main(void)
     test_circuit_reason_classification();
     test_circuit_exec_action();
     test_crc32();
+    test_crc32_fast_matches_reference();
+    test_crc32_combine();
+    test_crc32_parallel();
+    test_crc_threads();
+    test_vectors_read_multichunk();
     test_tids_roundtrip();
     test_tids_rejections();
     test_vectors_roundtrip();

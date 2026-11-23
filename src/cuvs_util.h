@@ -145,6 +145,12 @@ typedef struct CuvsTidsHeader {
 } CuvsTidsHeader;          /* 32 bytes, LE-only, x86-64 daemon */
 
 /* Standard table-based CRC-32 (IEEE 802.3, reflected, poly 0xEDB88320). */
+/* C linkage, so a C++ translation unit that includes this header and calls
+ * these functions links against the C symbols. (cuvs_wrapper.cu includes it
+ * for the CUVS_HWPROBE_* bits and does not call them.) */
+#ifdef __cplusplus
+extern "C" {
+#endif
 uint32_t cuvs_crc32(const void *data, size_t len);
 
 /* Streaming CRC-32 for data that does not fit in one buffer (e.g. a large
@@ -156,6 +162,28 @@ uint32_t cuvs_crc32(const void *data, size_t len);
 uint32_t cuvs_crc32_stream_begin(void);
 uint32_t cuvs_crc32_stream_update(uint32_t state, const void *data, size_t len);
 uint32_t cuvs_crc32_stream_end(uint32_t state);
+
+/* crc of A||B from crc(A), crc(B) and |B| (final crc values, zlib's
+ * crc32_combine). |B| == 0 returns crc1. */
+uint32_t cuvs_crc32_combine(uint32_t crc1, uint32_t crc2, size_t len2);
+
+/* Chunked parallel crc: equals cuvs_crc32(data, len). The calling thread
+ * works too and at most nthreads - 1 helpers are started (nthreads <= 1 or
+ * a single chunk runs inline). Daemon-only: do not call from a PostgreSQL
+ * backend. chunk == 0 means CUVS_CRC_CHUNK_BYTES. */
+#define CUVS_CRC_CHUNK_BYTES ((size_t)8 << 20)
+#define CUVS_CRC_MAX_THREADS 64
+uint32_t cuvs_crc32_parallel(const void *data, size_t len, int nthreads);
+uint32_t cuvs_crc32_parallel_ex(const void *data, size_t len, int nthreads, size_t chunk);
+
+/* Threads for latency-critical crc verification: clamp(ncpu / 3, 2, 8).
+ * On six or more cores a verifier leaves at least two thirds of them to the
+ * rest of the daemon, including a GPU build that runs at the same time; below
+ * that the floor of two threads takes a larger share (all of a two-core host). */
+int cuvs_crc_threads(int ncpu);
+#ifdef __cplusplus
+}
+#endif
 
 /* Write header + TID body to an open FILE*. Returns 0 on success, -1 on a
  * short/failed fwrite. Caller is responsible for fflush/fsync/rename. */
