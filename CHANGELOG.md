@@ -61,11 +61,13 @@ exists for 0.9.0.
 ### Fixed
 
 - `CREATE INDEX CONCURRENTLY ... USING pg_cuvs_hnsw` and `REINDEX INDEX CONCURRENTLY` of a heap-built `pg_cuvs_hnsw`
-  index no longer make the table's writers wait. The build opened the index it writes with `AccessExclusiveLock`,
-  while a concurrent build holds `RowExclusiveLock` on it and every writer of the table opens it with
-  `RowExclusiveLock` too; the build waited for the open writers and queued every new one behind it (15.5 s of no
-  committed write during a 22.5 s build of 300,000 rows on one A100). The build now writes under the lock its command
-  holds. `pg_cuvs_hnsw_layer_counts()` and `pg_cuvs_hnsw_build_info()` refuse an index that is not ready (SQLSTATE
+  index no longer make the table's write statements wait for a lock. The build opened the index it writes with
+  `AccessExclusiveLock`, while a concurrent build holds `RowExclusiveLock` on it and every write statement on the table
+  opens it with `RowExclusiveLock` too; the build waited for the running write statements and queued every new one
+  behind it (15.5 s of no committed write during a 22.5 s build of 300,000 rows on one A100). The build now writes
+  under the lock its command holds. Measured on the same host with 200 writes/s: no write waited for a lock and none
+  took over 1 s during either command; the 99th percentile write latency rose from 0.99 ms to 18.4 ms during the
+  concurrent build and to 27.0 ms during the concurrent reindex (pgvector's own: 9.8 ms and 13.6 ms). `pg_cuvs_hnsw_layer_counts()` and `pg_cuvs_hnsw_build_info()` refuse an index that is not ready (SQLSTATE
   `55000`) and `pg_cuvs_hnsw_layer_status()` leaves it out, since nothing keeps them from reading pages being written.
 - `cuvs.delta_search = 'cpu'` returned every row of a pending `.delta` twice, pushing
   correct rows out of the top k: the daemon merged its GPU delta cache whatever the mode
