@@ -215,8 +215,18 @@ int cuvs_vectors_write_multi(FILE *f, const int64_t *n_each, int n_parts,
 /* Read + validate a .vectors file from an open FILE*. On success returns 0,
  * fills *hdr_out, and allocates *vecs_out via malloc (caller frees). Validates
  * magic, version, n_vecs range (0 < n_vecs <= CUVS_TIDS_MAX_VECS), dim range
- * (0 < dim <= CUVS_VECTORS_MAX_DIM), reserved==0, full body read, and body
- * crc32. On any failure returns -1 and leaves *vecs_out NULL. */
+ * (0 < dim <= CUVS_VECTORS_MAX_DIM), reserved==0, a file long enough for
+ * the body, full body read, and body crc32. On failure leaves *vecs_out NULL
+ * and returns
+ *   CUVS_VECTORS_READ_BAD (-1): the content is defective (magic, version,
+ *     n_vecs or dim range, reserved, body crc, or a file shorter than the
+ *     header's n_vecs * dim floats); the same file fails again;
+ *   CUVS_VECTORS_READ_IO  (-2): a resource or I/O failure (malloc, a short
+ *     header, a short body read on a stream whose size cannot be found by
+ *     seeking, read error); a retry can succeed.
+ * hdr_out is filled only on success. */
+#define CUVS_VECTORS_READ_BAD (-1)
+#define CUVS_VECTORS_READ_IO  (-2)
 int cuvs_vectors_read(FILE *f, CuvsVectorsHeader *hdr_out, float **vecs_out);
 
 /* ----------------------------------------------------------------

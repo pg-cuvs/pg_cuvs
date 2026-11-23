@@ -56,6 +56,27 @@ exists for 0.9.0.
 
 ### Fixed
 
+- A brute_force search on an unsharded index whose `.vectors` sidecar cannot serve it
+  (row count or `.tids` generation mismatch, as after an extend that the daemon saved at
+  shutdown, or defective content) read the whole sidecar and checked its body crc under
+  the daemon's index lock on every search, so every other search and extend of that
+  daemon waited (#238). The daemon now remembers what that read found: defective content
+  (magic, version, range, reserved field, body crc, or a file shorter than its header
+  says), or the header's row count, dimension, metric and `.tids` generation, together
+  with the file's inode, size and nanosecond mtime. While the file is the same, a search decides from that record against
+  the index's current row count, dimension, metric and `.tids` crc without reading the
+  file, so INSERTs (extend) no longer cause a re-read; a new sidecar (REINDEX) is read
+  again. The record does not depend on `cuvs.bf_precision`. `cuvs_vectors_read` now
+  reports a truncated sidecar (shorter than its header's row count times dimension) as
+  defective content, so it is remembered too. Allocation failures, a short header and
+  read errors are not remembered, so the next search retries as before. When the cache
+  cannot fit in VRAM, the search now fails before reading the file (not remembered).
+  The result of each search (`NO_VECTORS` or a brute_force answer) is the same as before.
+  Not changed: the sharded brute_force path (`refresh_shard_bf_caches`) still reads the
+  whole sidecar on every search in these states; a missing `.tids` with no earlier record
+  still reads the sidecar on every search; and the first failing search after a daemon
+  start or a reload after eviction still reads the whole file under the lock (moving the
+  read out of the lock is not part of this change).
 - Documentation: the README batch example, `docs/reference.md` and ADR-040 said that
   joining the results of `pg_cuvs_batch_search` and `cuvs_filtered_knn` on `ctid` gives
   the visible rows. That join silently drops HOT-updated rows, because the functions
