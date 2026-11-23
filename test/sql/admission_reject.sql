@@ -42,6 +42,9 @@ $$;
 
 SELECT pg_cuvs_last_rejection() IS NULL AS no_rejection_yet;
 SELECT (current_setting('cuvs.rmm_pool_status')::jsonb->>'scratch_permille')::bigint AS rho \gset
+-- Save the daemon cap before applying the fixture's temporary limits.
+-- The setter broadcasts one cap; with different device limits use the lowest finite cap.
+SELECT coalesce(min(nullif(budget_bytes, 0)), 0) AS ar_saved_budget FROM pg_cuvs_memory_status() \gset
 
 CREATE TABLE ar_items (id int, embedding vector(8)) WITH (autovacuum_enabled=false);
 INSERT INTO ar_items
@@ -105,3 +108,8 @@ FROM pg_temp.ar_expect(
 DROP TABLE ar_items;
 DROP TABLE ar_shard;
 DROP TABLE ar_a;
+
+-- The next regression uses the same daemon.
+SELECT pg_cuvs_set_vram_budget(:ar_saved_budget) AS ar_budget_reset \gset
+SELECT coalesce(bool_and(budget_bytes = :ar_saved_budget), false) AS ar_budget_restored FROM pg_cuvs_memory_status() \gset
+\echo budget_restored :ar_budget_restored
