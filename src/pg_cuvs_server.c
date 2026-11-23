@@ -7097,7 +7097,9 @@ static void finish_build_commit(int client_fd, const CuvsCmdFrame *cmd,
                                 const char *save_dir, CuvsCagraIndex new_handle,
                                 uint64_t *new_tids, int target_gpu, size_t needed,
                                 int vectors_committed, const char *vecs_tmp,
-                                const char *vecs_final, uint32_t base_generation);
+                                const char *vecs_final, uint32_t base_generation,
+                                const char *pre_cagra_tmp, int pre_cagra_fd,
+                                const CuvsCagraFileLayout *pre_layout);
 
 /* Auto-shard refusal happens before the ordinary admission path. Keep its
  * permanent AR0 payload and log on both corpus transports (C5). */
@@ -7484,22 +7486,94 @@ handle_build(int client_fd, const CuvsCmdFrame *cmd)
      * multi-partial build path (handle_build_multi). */
     finish_build_commit(client_fd, cmd, save_dir, new_handle, new_tids,
                         target_gpu, final, vectors_committed, vecs_tmp, vecs_final,
-                        tids_gen);
+                        tids_gen, NULL, -1, NULL);
+}
+
+/* Direct .cagra check (PG_CUVS_DIRECT_CAGRA_VERIFY=1): serialize the same index
+ * with cuvs_cagra_serialize to "<direct>.ref", compare the two files byte for
+ * byte and log the result. Returns 1 when they are equal, 0 when they differ,
+ * -1 when the comparison could not be made. The .ref file is always removed;
+ * the caller commits the direct file only on 1. Otherwise the caller deletes
+ * the direct file and serializes with cuVS again for the committed file, so a
+ * mismatch runs cuvs_cagra_serialize twice under g_index_mutex, and a failed
+ * reference serialize is retried once with the same input. This is a
+ * diagnostic mode, off by default. */
+static int
+cagra_direct_verify(CuvsCagraIndex handle, const char *direct_path, int target_gpu)
+{
+    char ref_path[640];
+    snprintf(ref_path, sizeof(ref_path), "%s.ref", direct_path);
+    if (cuvs_cagra_serialize(handle, ref_path, target_gpu) != 0)
+    {
+        LOG_WARN("[build] direct_cagra_verify: reference serialize failed\n");
+        unlink(ref_path);
+        return -1;
+    }
+    struct stat sta, stb;
+    FILE *fa = fopen(direct_path, "rb");
+    FILE *fb = fopen(ref_path, "rb");
+    int  io_ok = fa && fb && stat(direct_path, &sta) == 0 && stat(ref_path, &stb) == 0;
+    long long first_diff = -1;
+    long long size_a = io_ok ? (long long)sta.st_size : 0;
+    long long size_b = io_ok ? (long long)stb.st_size : 0;
+    if (io_ok)
+    {
+        static unsigned char ba[1 << 20], bb[1 << 20];   /* under g_index_mutex: one caller */
+        long long common = size_a < size_b ? size_a : size_b;
+        for (long long pos = 0; pos < common && io_ok && first_diff < 0; )
+        {
+            size_t n = (common - pos) < (long long)sizeof(ba) ? (size_t)(common - pos)
+                                                              : sizeof(ba);
+            if (fread(ba, 1, n, fa) != n || fread(bb, 1, n, fb) != n)
+            {
+                io_ok = 0;
+                break;
+            }
+            for (size_t i = 0; i < n; i++)
+                if (ba[i] != bb[i]) { first_diff = pos + (long long)i; break; }
+            pos += (long long)n;
+        }
+        if (io_ok && first_diff < 0 && size_a != size_b)
+            first_diff = common;   /* one file is a prefix of the other */
+    }
+    if (fa) fclose(fa);
+    if (fb) fclose(fb);
+    unlink(ref_path);
+    if (!io_ok)
+    {
+        LOG_WARN("[build] direct_cagra_verify: could not read the files\n");
+        return -1;
+    }
+    LOG_INFO("[build] direct_cagra_verify equal=%d first_diff=%lld size=%lld/%lld\n",
+             first_diff < 0, first_diff, size_a, size_b);
+    return first_diff < 0 ? 1 : 0;
 }
 
 /* Persist a freshly built CAGRA index (tmp+rename), swap it into the registry,
  * and reply OK — the durable commit tail shared by the single-corpus and ADR-059
  * multi-partial build paths. On entry the caller holds g_index_mutex, has built
  * new_handle, assembled the contiguous new_tids, and staged the .vectors sidecar
- * (vectors_committed + vecs_tmp/vecs_final). This releases g_index_mutex. */
+ * (vectors_committed + vecs_tmp/vecs_final). This releases g_index_mutex.
+ *
+ * pre_cagra_tmp/pre_cagra_fd/pre_layout (NULL/-1/NULL = none) are a
+ * .cagra temp file whose dataset body the caller already wrote at the layout's
+ * offset. This function takes the fd (closes it on every path), writes the
+ * rest with cuvs_cagra_write_prefix and, on success, commits that file as the
+ * index; on a shape mismatch or an error, or when PG_CUVS_DIRECT_CAGRA_VERIFY=1
+ * does not confirm the file, it deletes it and serializes with
+ * cuvs_cagra_serialize as before. On failure the temp file is deleted. */
 static void
 finish_build_commit(int client_fd, const CuvsCmdFrame *cmd, const char *save_dir,
                     CuvsCagraIndex new_handle, uint64_t *new_tids, int target_gpu,
                     size_t needed, int vectors_committed, const char *vecs_tmp,
-                    const char *vecs_final, uint32_t base_generation)
+                    const char *vecs_final, uint32_t base_generation,
+                    const char *pre_cagra_tmp, int pre_cagra_fd,
+                    const CuvsCagraFileLayout *pre_layout)
 {
     char idx_final[512],  idx_tmp[576];
     char tids_final[512], tids_tmp[576];
+    int  cagra_fd = pre_cagra_fd;
+    int  cagra_direct = 0;
     index_file_path(idx_final,  sizeof(idx_final),  save_dir, cmd->db_oid, cmd->index_oid);
     tids_file_path(tids_final,  sizeof(tids_final), save_dir, cmd->db_oid, cmd->index_oid);
     snprintf(idx_tmp,  sizeof(idx_tmp),  "%s.tmp", idx_final);
@@ -7521,13 +7595,41 @@ finish_build_commit(int client_fd, const CuvsCmdFrame *cmd, const char *save_dir
         goto persist_fail;
     }
 #endif
-    LOG_DEBUG("[handle_build] cuvs_cagra_serialize(%s)...\n", idx_tmp);
-    if (cuvs_cagra_serialize(new_handle, idx_tmp, target_gpu) != 0) {
-        LOG_ERROR("[handle_build] cuvs_cagra_serialize FAILED (path=%s)\n", idx_tmp);
-        goto persist_fail;
+    if (cagra_fd >= 0 && pre_layout && pre_cagra_tmp) {
+        /* The dataset body is already on disk; write head + graph + middle
+         * (and fsync) here. Anything but 0 leaves the pre-written file unused. */
+        int prc = cuvs_cagra_write_prefix(new_handle, cagra_fd, pre_layout, target_gpu);
+        close(cagra_fd);
+        cagra_fd = -1;
+        if (prc == 0) {
+            cagra_direct = 1;
+            snprintf(idx_tmp, sizeof(idx_tmp), "%s", pre_cagra_tmp);
+            LOG_INFO("[build] direct_cagra=1\n");
+            const char *vfy = getenv("PG_CUVS_DIRECT_CAGRA_VERIFY");
+            if (vfy && strcmp(vfy, "1") == 0 &&
+                cagra_direct_verify(new_handle, idx_tmp, target_gpu) != 1) {
+                LOG_WARN("[build] direct_cagra_verify did not confirm the direct file; "
+                         "serializing with cuVS instead\n");
+                unlink(pre_cagra_tmp);
+                cagra_direct = 0;
+                snprintf(idx_tmp, sizeof(idx_tmp), "%s.tmp", idx_final);
+            }
+        } else {
+            LOG_WARN("[build] direct_cagra=0 cuvs_cagra_write_prefix rc=%d; "
+                     "serializing with cuVS instead\n", prc);
+            unlink(pre_cagra_tmp);
+        }
+    }
+    if (!cagra_direct) {
+        LOG_DEBUG("[handle_build] cuvs_cagra_serialize(%s)...\n", idx_tmp);
+        if (cuvs_cagra_serialize(new_handle, idx_tmp, target_gpu) != 0) {
+            LOG_ERROR("[handle_build] cuvs_cagra_serialize FAILED (path=%s)\n", idx_tmp);
+            goto persist_fail;
+        }
     }
     chmod_sidecar(idx_tmp);
-    if (fsync_path(idx_tmp) != 0) {
+    /* the direct file was fsynced inside cuvs_cagra_write_prefix */
+    if (!cagra_direct && fsync_path(idx_tmp) != 0) {
         LOG_ERROR("[handle_build] fsync %s failed errno=%d; aborting commit\n", idx_tmp, errno);
         goto persist_fail;
     }
@@ -7807,6 +7909,10 @@ persist_fail:
      * intact in registry. Clean up new resources and tmp files. The prior
      * `.vectors` (if any) is left intact — it still matches the surviving
      * (un-renamed) prior `.tids`/`.cagra`; only our new tmp is removed. */
+    if (cagra_fd >= 0)
+        close(cagra_fd);                    /* pre-written file never reached the prefix step */
+    if (pre_cagra_tmp)
+        unlink(pre_cagra_tmp);
     unlink(idx_tmp);
     unlink(tids_tmp);
     unlink(vecs_tmp);
@@ -7814,6 +7920,123 @@ persist_fail:
     free(new_tids);
     pthread_mutex_unlock(&g_index_mutex);
     send_error_code(client_fd, CUVS_STATUS_PERSIST_FAILED, "disk persistence failed");
+}
+
+/* The .vectors sidecar of a multi-partial build is written by a
+ * per-build helper thread while the GPU build runs, so its crc, write and
+ * fsync no longer run under g_index_mutex after the build.
+ * The same thread then writes the dataset body of the .cagra temp file.
+ * The partials are PROT_READ mappings the GPU build only reads, and they stay
+ * mapped until the helper is joined, which happens right after
+ * cuvs_cagra_build_multi returns and before any munmap or commit step. The
+ * helper writes a per-build temp name (build_token) because it now runs
+ * outside g_index_mutex, so two builds of the same index (a backend that died
+ * and a REINDEX retry) must not share one temp file. */
+typedef struct VecsWriteJob {
+    FILE               *vf;
+    const int64_t      *n_each;
+    int                 n_parts;
+    uint32_t            dim, metric, tids_gen;
+    const float *const *part_vecs;
+    const uint64_t     *new_tids;
+    size_t              tid_bytes;
+    int                 ok;
+    /* When cagra_fd >= 0 the helper also writes the dataset body of
+     * the .cagra temp file (partials in order, packed n*dim*4 bytes from
+     * cagra_body_off) and fdatasyncs it. cagra_ok is separate from ok: the
+     * .vectors sidecar and the direct .cagra fail independently. */
+    int                 cagra_fd;
+    uint64_t            cagra_body_off;
+    int                 cagra_ok;
+} VecsWriteJob;
+
+/* pwrite the whole buffer (short writes and EINTR retried). 0 / -1. */
+static int
+pwrite_all(int fd, const void *buf, size_t len, uint64_t off)
+{
+    const char *p = (const char *)buf;
+    while (len > 0)
+    {
+        ssize_t w = pwrite(fd, p, len, (off_t)off);
+        if (w < 0)
+        {
+            if (errno == EINTR)
+                continue;
+            return -1;
+        }
+        if (w == 0)
+        {
+            errno = ENOSPC;
+            return -1;
+        }
+        p += w;
+        len -= (size_t)w;
+        off += (uint64_t)w;
+    }
+    return 0;
+}
+
+static void *
+vecs_write_thread(void *arg)
+{
+    VecsWriteJob *j = (VecsWriteJob *)arg;
+    int ok = (j->vf != NULL);
+
+    /* generation token: crc of the .tids body (also returned to the caller) */
+    j->tids_gen = cuvs_crc32(j->new_tids, j->tid_bytes);
+    if (ok && cuvs_vectors_write_multi(j->vf, j->n_each, j->n_parts, j->dim, j->metric,
+                                       j->tids_gen, j->part_vecs) != 0)
+        ok = 0;
+    if (ok && fflush(j->vf) != 0) ok = 0;
+    if (ok && fsync(fileno(j->vf)) != 0) ok = 0;
+    if (j->vf && fclose(j->vf) != 0) ok = 0;
+    j->vf = NULL;
+    j->ok = ok;
+
+    /* Dataset body of the direct .cagra, straight from the partials. */
+    if (j->cagra_fd >= 0)
+    {
+        int  cok = 1;
+        uint64_t off = j->cagra_body_off;
+        for (int i = 0; cok && i < j->n_parts; i++)
+        {
+            size_t len = (size_t)j->n_each[i] * j->dim * sizeof(float);
+            if (len == 0)
+                continue;
+            if (pwrite_all(j->cagra_fd, j->part_vecs[i], len, off) != 0)
+                cok = 0;
+            off += len;
+        }
+        if (cok && fdatasync(j->cagra_fd) != 0)
+            cok = 0;
+        j->cagra_ok = cok;
+    }
+    return NULL;
+}
+
+/* Build token for every temp file one build writes: <pid>.<epoch>.<seq>.
+ * The epoch is the time (in seconds) the token source was first used in this
+ * daemon, so a restarted daemon that reuses the pid and restarts seq at 1
+ * does not collide with a previous daemon's leftover temp files unless it
+ * started within the same second; it then truncates the dead daemon's file.
+ * The token has no host part: two daemons sharing one index directory over a
+ * network file system collide in the same case. */
+static uint64_t       g_build_token_seq = 0;
+static time_t         g_build_token_epoch;
+static pthread_once_t g_build_token_once = PTHREAD_ONCE_INIT;
+
+static void
+build_token_init(void)
+{
+    g_build_token_epoch = time(NULL);
+}
+
+static void
+build_token(char *out, size_t outlen)
+{
+    pthread_once(&g_build_token_once, build_token_init);
+    snprintf(out, outlen, "%d.%lld.%llu", (int)getpid(), (long long)g_build_token_epoch,
+             (unsigned long long)__atomic_add_fetch(&g_build_token_seq, 1, __ATOMIC_RELAXED));
 }
 
 /* ----------------------------------------------------------------
@@ -8098,6 +8321,91 @@ handle_build_multi(int client_fd, const CuvsCmdFrame *cmd, const char *index_dir
         log_admit(&al, CUVS_ADMISSION_NONE);
         pthread_mutex_unlock(&g_index_mutex);
 
+        /* Stage the .vectors sidecar while the GPU builds. */
+        VecsWriteJob vjob;
+        pthread_t    vth;
+        int          vth_started = 0;
+        memset(&vjob, 0, sizeof(vjob));
+        vectors_file_path(vecs_final, sizeof(vecs_final), save_dir, cmd->db_oid, cmd->index_oid);
+        char btok[64];
+        build_token(btok, sizeof(btok));   /* one token for every temp file of this build */
+        /* A truncated temp name could collide with another build's, so a
+         * name that does not fit means no sidecar (as if fopen had failed),
+         * and an empty name so the later unlink(vecs_tmp) touches nothing. */
+        if ((size_t)snprintf(vecs_tmp, sizeof(vecs_tmp), "%s.%s.tmp", vecs_final, btok)
+            >= sizeof(vecs_tmp))
+        {
+            LOG_WARN("[handle_build_multi] .vectors temp name too long for %u/%u\n",
+                     cmd->db_oid, cmd->index_oid);
+            vecs_tmp[0] = '\0';
+            vjob.vf = NULL;
+        }
+        else
+            vjob.vf = fopen(vecs_tmp, "wb");
+        if (vjob.vf)
+            fchmod_sidecar(vjob.vf, vecs_tmp);
+
+        /* Stage the dataset body of the .cagra too (most of the file),
+         * at its offset in a pre-sized temp file. The layout is a pure host
+         * computation; any failure here only turns the direct write off and
+         * finish_build_commit serializes with cuVS as before. */
+        CuvsCagraFileLayout cagra_layout;
+        char cagra_tmp[576];
+        int  cagra_fd = -1;
+        memset(&cagra_layout, 0, sizeof(cagra_layout));
+        cagra_tmp[0] = '\0';
+        {
+            const char *dc = getenv("PG_CUVS_DIRECT_CAGRA");
+            if (dc && strcmp(dc, "0") == 0)
+                LOG_INFO("[build] direct_cagra=0 (PG_CUVS_DIRECT_CAGRA=0)\n");
+            else if (cuvs_cagra_file_layout(total, (int)cmd->dim, (int)cmd->graph_degree,
+                                            cmd->metric, &cagra_layout) != 0)
+                LOG_INFO("[build] direct_cagra=0 (no .cagra layout for this build)\n");
+            else
+            {
+                char cagra_final[512];
+                index_file_path(cagra_final, sizeof(cagra_final), save_dir,
+                                cmd->db_oid, cmd->index_oid);
+                if ((size_t)snprintf(cagra_tmp, sizeof(cagra_tmp), "%s.%s.tmp", cagra_final, btok)
+                    >= sizeof(cagra_tmp))
+                {
+                    LOG_INFO("[build] direct_cagra=0 (temp name too long)\n");
+                    cagra_tmp[0] = '\0';
+                }
+                else
+                    cagra_fd = open(cagra_tmp, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+                if (cagra_tmp[0] == '\0')
+                    ;   /* direct write off, logged above */
+                else if (cagra_fd < 0)
+                    LOG_WARN("[build] direct_cagra=0 (open %s failed errno=%d)\n",
+                             cagra_tmp, errno);
+                else if (fchmod(cagra_fd, 0644) != 0)
+                    LOG_WARN("[build] fchmod(%s, 0644) failed errno=%d\n", cagra_tmp, errno);
+                if (cagra_fd >= 0 &&
+                    ftruncate(cagra_fd, (off_t)cagra_layout.total_bytes) != 0)
+                {
+                    LOG_WARN("[build] direct_cagra=0 (ftruncate %s failed errno=%d)\n",
+                             cagra_tmp, errno);
+                    close(cagra_fd);
+                    cagra_fd = -1;
+                    unlink(cagra_tmp);
+                }
+            }
+        }
+        vjob.cagra_fd = cagra_fd;
+        vjob.cagra_body_off = cagra_fd >= 0 ? cagra_layout.dataset_body_off : 0;
+        vjob.n_each = n_each;
+        vjob.n_parts = nmapped;
+        vjob.dim = cmd->dim;
+        vjob.metric = cmd->metric;
+        vjob.new_tids = new_tids;
+        vjob.tid_bytes = tid_bytes;
+        vjob.part_vecs = part_vecs;
+        if (pthread_create(&vth, NULL, vecs_write_thread, &vjob) == 0)
+            vth_started = 1;
+        else
+            vecs_write_thread(&vjob);   /* no thread: write inline, before the GPU build */
+
         al.build_started_us = admission_mono_us();
         new_handle = cuvs_cagra_build_multi(part_vecs, n_each, nmapped, total,
                                             (int)cmd->dim, cmd->metric,
@@ -8105,9 +8413,28 @@ handle_build_multi(int client_fd, const CuvsCmdFrame *cmd, const char *index_dir
                                             (int)cmd->intermediate_graph_degree,
                                             cmd->build_algo, target_gpu, lw_policy, &lw_stats);
     al.build_finished_us = admission_mono_us();
+        /* Join before relocking and before any path below can munmap the
+         * partials the helper reads. The join also waits when the GPU build
+         * failed: the helper first finishes writing and syncing its temp
+         * files, so a failed build deletes them, releases its VRAM reservation
+         * and replies only after that. */
+        if (vth_started)
+            pthread_join(vth, NULL);
+        tids_gen = vjob.tids_gen;
         /* ADR-086 (I3): no evict-to-fit; an OOM after admission is a failure. */
         build_oom = !new_handle && cuvs_last_build_was_oom();
         build_att = !new_handle && !build_oom && cuvs_last_build_attach_failed();
+        if (!new_handle)
+            unlink(vecs_tmp);   /* the staged sidecar belongs to a build that failed */
+        if (cagra_fd >= 0 && (!new_handle || !vjob.cagra_ok))
+        {
+            if (new_handle)
+                LOG_WARN("[build] direct_cagra=0 (dataset body write failed); "
+                         "serializing with cuVS instead\n");
+            close(cagra_fd);        /* nothing usable: a failed build, or a failed helper write */
+            cagra_fd = -1;
+            unlink(cagra_tmp);
+        }
 
         /* Reacquire for the durable-commit + registry tail (finish_build_commit
          * expects the lock held). Release the reservation: on success the registry
@@ -8156,25 +8483,14 @@ handle_build_multi(int client_fd, const CuvsCmdFrame *cmd, const char *index_dir
             goto fail;
         }
 
-        /* .vectors sidecar streamed from the partials (no contiguous host copy). */
-        tids_gen = cuvs_crc32(new_tids, tid_bytes);
-        vectors_file_path(vecs_final, sizeof(vecs_final), save_dir, cmd->db_oid, cmd->index_oid);
-        snprintf(vecs_tmp, sizeof(vecs_tmp), "%s.tmp", vecs_final);
+        /* .vectors sidecar streamed from the partials by the helper (written,
+         * flushed and fsynced during the GPU build; joined above). */
         {
-            FILE *vf = fopen(vecs_tmp, "wb");
-            int vok = (vf != NULL);
-            if (vok) fchmod_sidecar(vf, vecs_tmp);
-            if (vok && cuvs_vectors_write_multi(vf, n_each, nmapped, cmd->dim,
-                                                cmd->metric, tids_gen, part_vecs) != 0)
-                vok = 0;
-            if (vok && fflush(vf) != 0) vok = 0;
-            if (vok && fsync(fileno(vf)) != 0) vok = 0;
-            if (vf && fclose(vf) != 0) vok = 0;
-            if (vok)
+            if (vjob.ok)
                 vectors_committed = 1;
             else
             {
-                if (vf) unlink(vecs_tmp);
+                unlink(vecs_tmp);
                 unlink(vecs_final);
                 LOG_WARN("[handle_build_multi] .vectors sidecar not written for %u/%u; "
                          "brute_force unavailable until REINDEX\n",
@@ -8189,7 +8505,8 @@ handle_build_multi(int client_fd, const CuvsCmdFrame *cmd, const char *index_dir
 
         finish_build_commit(client_fd, cmd, save_dir, new_handle, new_tids,
                             target_gpu, final, vectors_committed, vecs_tmp, vecs_final,
-                            tids_gen);
+                            tids_gen, cagra_fd >= 0 ? cagra_tmp : NULL, cagra_fd,
+                            cagra_fd >= 0 ? &cagra_layout : NULL);
         return;   /* new_tids ownership passed to the registry */
     }
 
