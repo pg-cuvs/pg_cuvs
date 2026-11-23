@@ -7816,6 +7816,70 @@ persist_fail:
     send_error_code(client_fd, CUVS_STATUS_PERSIST_FAILED, "disk persistence failed");
 }
 
+/* The .vectors sidecar of a multi-partial build is written by a
+ * per-build helper thread while the GPU build runs, so its crc, write and
+ * fsync no longer run under g_index_mutex after the build.
+ * The partials are PROT_READ mappings the GPU build only reads, and they stay
+ * mapped until the helper is joined, which happens right after
+ * cuvs_cagra_build_multi returns and before any munmap or commit step. The
+ * helper writes a per-build temp name (build_token) because it now runs
+ * outside g_index_mutex, so two builds of the same index (a backend that died
+ * and a REINDEX retry) must not share one temp file. */
+typedef struct VecsWriteJob {
+    FILE               *vf;
+    const int64_t      *n_each;
+    int                 n_parts;
+    uint32_t            dim, metric, tids_gen;
+    const float *const *part_vecs;
+    const uint64_t     *new_tids;
+    size_t              tid_bytes;
+    int                 ok;
+} VecsWriteJob;
+
+static void *
+vecs_write_thread(void *arg)
+{
+    VecsWriteJob *j = (VecsWriteJob *)arg;
+    int ok = (j->vf != NULL);
+
+    /* generation token: crc of the .tids body (also returned to the caller) */
+    j->tids_gen = cuvs_crc32(j->new_tids, j->tid_bytes);
+    if (ok && cuvs_vectors_write_multi(j->vf, j->n_each, j->n_parts, j->dim, j->metric,
+                                       j->tids_gen, j->part_vecs) != 0)
+        ok = 0;
+    if (ok && fflush(j->vf) != 0) ok = 0;
+    if (ok && fsync(fileno(j->vf)) != 0) ok = 0;
+    if (j->vf && fclose(j->vf) != 0) ok = 0;
+    j->vf = NULL;
+    j->ok = ok;
+    return NULL;
+}
+
+/* Build token for every temp file one build writes: <pid>.<epoch>.<seq>.
+ * The epoch is the time (in seconds) the token source was first used in this
+ * daemon, so a restarted daemon that reuses the pid and restarts seq at 1
+ * does not collide with a previous daemon's leftover temp files unless it
+ * started within the same second; it then truncates the dead daemon's file.
+ * The token has no host part: two daemons sharing one index directory over a
+ * network file system collide in the same case. */
+static uint64_t       g_build_token_seq = 0;
+static time_t         g_build_token_epoch;
+static pthread_once_t g_build_token_once = PTHREAD_ONCE_INIT;
+
+static void
+build_token_init(void)
+{
+    g_build_token_epoch = time(NULL);
+}
+
+static void
+build_token(char *out, size_t outlen)
+{
+    pthread_once(&g_build_token_once, build_token_init);
+    snprintf(out, outlen, "%d.%lld.%llu", (int)getpid(), (long long)g_build_token_epoch,
+             (unsigned long long)__atomic_add_fetch(&g_build_token_seq, 1, __ATOMIC_RELAXED));
+}
+
 /* ----------------------------------------------------------------
  * ADR-059: multi-partial CAGRA build.
  *
@@ -8098,6 +8162,41 @@ handle_build_multi(int client_fd, const CuvsCmdFrame *cmd, const char *index_dir
         log_admit(&al, CUVS_ADMISSION_NONE);
         pthread_mutex_unlock(&g_index_mutex);
 
+        /* Stage the .vectors sidecar while the GPU builds. */
+        VecsWriteJob vjob;
+        pthread_t    vth;
+        int          vth_started = 0;
+        memset(&vjob, 0, sizeof(vjob));
+        vectors_file_path(vecs_final, sizeof(vecs_final), save_dir, cmd->db_oid, cmd->index_oid);
+        char btok[64];
+        build_token(btok, sizeof(btok));
+        /* A truncated temp name could collide with another build's, so a
+         * name that does not fit means no sidecar (as if fopen had failed),
+         * and an empty name so the later unlink(vecs_tmp) touches nothing. */
+        if ((size_t)snprintf(vecs_tmp, sizeof(vecs_tmp), "%s.%s.tmp", vecs_final, btok)
+            >= sizeof(vecs_tmp))
+        {
+            LOG_WARN("[handle_build_multi] .vectors temp name too long for %u/%u\n",
+                     cmd->db_oid, cmd->index_oid);
+            vecs_tmp[0] = '\0';
+            vjob.vf = NULL;
+        }
+        else
+            vjob.vf = fopen(vecs_tmp, "wb");
+        if (vjob.vf)
+            fchmod_sidecar(vjob.vf, vecs_tmp);
+        vjob.n_each = n_each;
+        vjob.n_parts = nmapped;
+        vjob.dim = cmd->dim;
+        vjob.metric = cmd->metric;
+        vjob.new_tids = new_tids;
+        vjob.tid_bytes = tid_bytes;
+        vjob.part_vecs = part_vecs;
+        if (pthread_create(&vth, NULL, vecs_write_thread, &vjob) == 0)
+            vth_started = 1;
+        else
+            vecs_write_thread(&vjob);   /* no thread: write inline, before the GPU build */
+
         al.build_started_us = admission_mono_us();
         new_handle = cuvs_cagra_build_multi(part_vecs, n_each, nmapped, total,
                                             (int)cmd->dim, cmd->metric,
@@ -8105,9 +8204,19 @@ handle_build_multi(int client_fd, const CuvsCmdFrame *cmd, const char *index_dir
                                             (int)cmd->intermediate_graph_degree,
                                             cmd->build_algo, target_gpu, lw_policy, &lw_stats);
     al.build_finished_us = admission_mono_us();
+        /* Join before relocking and before any path below can munmap the
+         * partials the helper reads. The join also waits when the GPU build
+         * failed: the helper first finishes writing and syncing its temp
+         * files, so a failed build deletes them, releases its VRAM reservation
+         * and replies only after that. */
+        if (vth_started)
+            pthread_join(vth, NULL);
+        tids_gen = vjob.tids_gen;
         /* ADR-086 (I3): no evict-to-fit; an OOM after admission is a failure. */
         build_oom = !new_handle && cuvs_last_build_was_oom();
         build_att = !new_handle && !build_oom && cuvs_last_build_attach_failed();
+        if (!new_handle)
+            unlink(vecs_tmp);   /* the staged sidecar belongs to a build that failed */
 
         /* Reacquire for the durable-commit + registry tail (finish_build_commit
          * expects the lock held). Release the reservation: on success the registry
@@ -8156,25 +8265,14 @@ handle_build_multi(int client_fd, const CuvsCmdFrame *cmd, const char *index_dir
             goto fail;
         }
 
-        /* .vectors sidecar streamed from the partials (no contiguous host copy). */
-        tids_gen = cuvs_crc32(new_tids, tid_bytes);
-        vectors_file_path(vecs_final, sizeof(vecs_final), save_dir, cmd->db_oid, cmd->index_oid);
-        snprintf(vecs_tmp, sizeof(vecs_tmp), "%s.tmp", vecs_final);
+        /* .vectors sidecar streamed from the partials by the helper (written,
+         * flushed and fsynced during the GPU build; joined above). */
         {
-            FILE *vf = fopen(vecs_tmp, "wb");
-            int vok = (vf != NULL);
-            if (vok) fchmod_sidecar(vf, vecs_tmp);
-            if (vok && cuvs_vectors_write_multi(vf, n_each, nmapped, cmd->dim,
-                                                cmd->metric, tids_gen, part_vecs) != 0)
-                vok = 0;
-            if (vok && fflush(vf) != 0) vok = 0;
-            if (vok && fsync(fileno(vf)) != 0) vok = 0;
-            if (vf && fclose(vf) != 0) vok = 0;
-            if (vok)
+            if (vjob.ok)
                 vectors_committed = 1;
             else
             {
-                if (vf) unlink(vecs_tmp);
+                unlink(vecs_tmp);
                 unlink(vecs_final);
                 LOG_WARN("[handle_build_multi] .vectors sidecar not written for %u/%u; "
                          "brute_force unavailable until REINDEX\n",
