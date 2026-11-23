@@ -696,8 +696,8 @@ test_vectors_rejections(void)
         fwrite(vecs, sizeof(float), (size_t)dim, f);   /* short body */
         rewind(f);
         CuvsVectorsHeader hr; float *o = NULL;
-        ASSERT(cuvs_vectors_read(f, &hr, &o) == -1, "reject truncated body");
-        ASSERT(o == NULL, "truncated body frees alloc");
+        ASSERT(cuvs_vectors_read(f, &hr, &o) == CUVS_VECTORS_READ_BAD, "truncated file is defective content");
+        ASSERT(o == NULL, "truncated body leaves no alloc");
         fclose(f);
     }
 

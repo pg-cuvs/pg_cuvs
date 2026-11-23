@@ -35,6 +35,7 @@ src/*.o
 /test-build-shm
 /test-build-corpus
 /test-status-text
+/test-bf-verdict
 test/results/
 test/regression.diffs
 test/regression.out

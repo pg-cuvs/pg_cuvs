@@ -29,6 +29,7 @@
 #include "cuvs_ipc.h"
 #include "cuvs_util.h"
 #include "cuvs_cache_policy.h"
+#include "cuvs_bf_verdict.h"     /* #238: remembered brute_force unavailable verdict */
 #include "cuvs_peak_meter.h"
 #include <stdarg.h>
 #include "cuvs_wrapper.h"
@@ -219,6 +220,14 @@ typedef struct IndexEntry {
     uint32_t        main_bf_generation; /* base .tids body_crc32 the BF was built on */
     uint32_t        bf_precision;       /* precision of the resident BF index(es):
                                          * 0=float32, 1=float16 (cuvs.bf_precision) */
+    /* #238: remembered "brute_force unavailable" verdict for the unsharded BF
+     * cache (cuvs_bf_verdict.h): what the last read of `.vectors` found, tied
+     * to that file's identity. While the identity is unchanged,
+     * refresh_main_bf_cache re-decides from it against the entry's current
+     * shape and `.tids` crc without reading `.vectors` again (it used to
+     * re-read and re-CRC the whole file under g_index_mutex on every failing
+     * brute_force search). The sharded BF path does not use it. */
+    CuvsBfVerdict   bf_verdict;
 
     /* 3O pre-filter: TID-sorted reverse map for query-time BITSET construction.
      * rev_tids[i] is sorted ascending; rev_item_ids[i] is the corresponding item_id.
@@ -1714,6 +1723,35 @@ fail_cleanup:
     e->delta_generation = 0;
 }
 
+/* #238: current `.tids` body crc (the generation token a `.vectors` sidecar is
+ * tied to). Reads only the 32-byte header. Returns 0 on success, -1 if the
+ * file is missing or its header is invalid. */
+static int
+tids_body_crc_of(const IndexEntry *e, uint32_t *crc_out)
+{
+    char           path[512];
+    CuvsTidsHeader th;
+    FILE          *f;
+    size_t         got;
+
+    tids_file_path(path, sizeof(path), g_index_dir, e->db_oid, e->index_oid);
+    f = fopen(path, "rb");
+    if (!f)
+        return -1;
+    got = fread(&th, 1, sizeof(th), f);
+    fclose(f);
+    if (got != sizeof(th) || th.magic != CUVS_TIDS_MAGIC)
+        return -1;
+    *crc_out = th.body_crc32;
+    return 0;
+}
+
+static int64_t
+stat_mtime_ns(const struct stat *st)
+{
+    return (int64_t) st->st_mtim.tv_sec * 1000000000LL + (int64_t) st->st_mtim.tv_nsec;
+}
+
 /* Phase 3L: make e's resident main brute-force index match the current
  * `.vectors` sidecar and the requested precision. Lazily (re)built on the first
  * brute_force search and whenever the sidecar's mtime or the precision changes.
@@ -1733,6 +1771,7 @@ refresh_main_bf_cache(IndexEntry *e, uint32_t want_precision)
     float            *vecs = NULL;
     size_t            got, needed;
     uint32_t          dg = delta_gpu_of(e);   /* unsharded: the index's GPU */
+    int               rc;
 
     vectors_file_path(path, sizeof(path), g_index_dir, e->db_oid, e->index_oid);
     if (stat(path, &st) != 0)
@@ -1745,25 +1784,58 @@ refresh_main_bf_cache(IndexEntry *e, uint32_t want_precision)
         && e->bf_precision == want_precision)
         return;                         /* unchanged + same precision -> reuse */
 
+    /* #238: the same `.vectors` file as the last "unavailable" verdict -> decide
+     * from what that read found, against the current row count, shape and
+     * `.tids` crc, without reading the file. An extend or a new `.tids`
+     * re-decides here; a new sidecar (REINDEX) has another identity and is
+     * read. */
+    if (!e->main_bf_idx)
+    {
+        uint32_t cur_tids_crc = 0;
+        int      tids_ok = (tids_body_crc_of(e, &cur_tids_crc) == 0);
+        if (cuvs_bf_verdict_unavailable(&e->bf_verdict, (uint64_t) st.st_ino,
+                                        (int64_t) st.st_size, stat_mtime_ns(&st),
+                                        e->n_vecs, e->dim, e->metric,
+                                        tids_ok, cur_tids_crc))
+            return;
+    }
+
     /* Sidecar changed or precision toggled: drop the old index and rebuild.
-     * Record the new mtime/precision up front so a persistent failure below
-     * does not retry the (re)build on every search. */
+     * A failure below leaves main_bf_idx NULL, so the next search comes back
+     * here; the read is skipped then only for a failure noted in bf_verdict
+     * or when the VRAM pre-check below fails (which is checked again on every
+     * search, not remembered). */
     free_main_bf_cache(e);
     e->main_bf_mtime = (int64_t) st.st_mtime;
     e->bf_precision  = want_precision;
 
+    /* #238: VRAM pre-check from the entry's shape before reading the file, so a
+     * VRAM-starved index does not read the whole sidecar per search. Not
+     * remembered as a negative verdict: VRAM can free up later. */
+    needed = (size_t) e->n_vecs * (size_t) e->dim * (want_precision == 1 ? 2 : 4);
+    if ((g_max_vram_per_gpu[dg] > 0
+         && total_vram_used(dg) + needed > g_max_vram_per_gpu[dg])
+        || needed > gpu_free_vram_bytes(dg))
+        return;                         /* no spare VRAM -> brute_force unavailable */
+
     f = fopen(path, "rb");
     if (!f)
         return;
-    if (cuvs_vectors_read(f, &vh, &vecs) != 0)
-    {
-        fclose(f);
-        return;                         /* corrupt / short read -> unavailable */
-    }
+    rc = cuvs_vectors_read(f, &vh, &vecs);
     fclose(f);
+    if (rc != 0)
+    {
+        /* Remembered only for defective content (a truncated file included);
+         * malloc / short header / read error are retried on the next search. */
+        (void) cuvs_bf_verdict_note(&e->bf_verdict, rc, NULL, (uint64_t) st.st_ino,
+                                    (int64_t) st.st_size, stat_mtime_ns(&st));
+        return;                         /* corrupt / truncated / I/O -> unavailable */
+    }
     if (vh.dim != e->dim || vh.metric != e->metric || vh.n_vecs != e->n_vecs)
     {
         free(vecs);
+        (void) cuvs_bf_verdict_note(&e->bf_verdict, 0, &vh, (uint64_t) st.st_ino,
+                                    (int64_t) st.st_size, stat_mtime_ns(&st));
         return;                         /* shape mismatch -> unavailable */
     }
 
@@ -1779,6 +1851,8 @@ refresh_main_bf_cache(IndexEntry *e, uint32_t want_precision)
         || th.body_crc32 != vh.base_tids_crc32)
     {
         free(vecs);
+        (void) cuvs_bf_verdict_note(&e->bf_verdict, 0, &vh, (uint64_t) st.st_ino,
+                                    (int64_t) st.st_size, stat_mtime_ns(&st));
         return;                         /* stale sidecar (torn build) -> unavailable */
     }
 
@@ -1797,6 +1871,7 @@ refresh_main_bf_cache(IndexEntry *e, uint32_t want_precision)
     free(vecs);
     if (e->main_bf_idx)
     {
+        e->bf_verdict.valid   = 0;      /* #238 */
         e->main_bf_n          = vh.n_vecs;
         e->main_bf_generation = vh.base_tids_crc32;
         e->main_bf_vram_bytes = needed;
@@ -2349,6 +2424,7 @@ load_index(uint32_t db_oid, uint32_t index_oid, CuvsRequester rq)
             e->delta_vecs_host = NULL; e->delta_n_cached = 0;
             e->main_bf_idx = NULL; e->main_bf_n = 0; e->main_bf_vram_bytes = 0;
             e->main_bf_mtime = 0; e->main_bf_generation = 0; e->bf_precision = 0;
+            e->bf_verdict.valid = 0; /* #238 */
             e->hnsw_idx     = NULL;
             e->n_extended   = 0;
             e->compact_count = 0;
@@ -2479,6 +2555,7 @@ load_index(uint32_t db_oid, uint32_t index_oid, CuvsRequester rq)
     /* Phase 3L: main BF cache starts empty; lazily built on a BF search. */
     e->main_bf_idx = NULL; e->main_bf_n = 0; e->main_bf_vram_bytes = 0;
     e->main_bf_mtime = 0; e->main_bf_generation = 0; e->bf_precision = 0;
+    e->bf_verdict.valid = 0; /* #238 */
     /* 3P: ivfpq_vram_bytes already set above; ensure it's 0 for CAGRA entries */
     if (!e->ivfpq_handle) e->ivfpq_vram_bytes = 0;
     e->warmup_state = WARMUP_HOT;
@@ -2860,6 +2937,7 @@ registry_new_slot(void)
     e->pinned       = 0;
     e->inflight     = 0;
     e->file_current = 0;
+    e->bf_verdict.valid = 0;            /* #238: never another index's verdict */
     e->hits         = 0;
     e->last_search  = 0;
     e->loaded_at    = time(NULL);

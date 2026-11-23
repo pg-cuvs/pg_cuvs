@@ -565,33 +565,58 @@ cuvs_vectors_read(FILE *f, CuvsVectorsHeader *hdr_out, float **vecs_out)
     *vecs_out = NULL;
 
     if (fread(&hdr, sizeof(hdr), 1, f) != 1)
-        return -1;
+        return CUVS_VECTORS_READ_IO;
     if (hdr.magic != CUVS_VECTORS_MAGIC)
-        return -1;
+        return CUVS_VECTORS_READ_BAD;
     if (hdr.version != CUVS_VECTORS_VERSION)
-        return -1;
+        return CUVS_VECTORS_READ_BAD;
     if (hdr.n_vecs <= 0 || hdr.n_vecs > CUVS_TIDS_MAX_VECS)
-        return -1;
+        return CUVS_VECTORS_READ_BAD;
     if (hdr.dim == 0 || hdr.dim > CUVS_VECTORS_MAX_DIM)
-        return -1;
+        return CUVS_VECTORS_READ_BAD;
     /* reserved must be 0 (forward-compat, like .tids). */
     if (hdr.reserved != 0)
-        return -1;
+        return CUVS_VECTORS_READ_BAD;
 
     body_n = (size_t)hdr.n_vecs * (size_t)hdr.dim;
+
+    /* A file shorter than its header says (header + n_vecs * dim floats) is
+     * truncated: that is content, so the same file fails the same way again
+     * (READ_BAD), not a short read. The size comes from seeking to the end
+     * (ISO C: this file is also built with -std=c11, so no fstat/fileno) and
+     * is compared by division so the size product cannot overflow. A stream
+     * that cannot seek falls through to the read below. */
+    {
+        long pos = ftell(f);
+
+        if (pos >= 0 && fseek(f, 0, SEEK_END) == 0)
+        {
+            long end = ftell(f);
+
+            if (fseek(f, pos, SEEK_SET) != 0)
+                return CUVS_VECTORS_READ_IO;
+            if (end >= 0)
+            {
+                uint64_t avail = end > pos ? (uint64_t)(end - pos) : 0;
+                if (avail / sizeof(float) < (uint64_t) body_n)
+                    return CUVS_VECTORS_READ_BAD;
+            }
+        }
+    }
+
     vecs = malloc(body_n * sizeof(float));
     if (!vecs)
-        return -1;
+        return CUVS_VECTORS_READ_IO;
 
     if (fread(vecs, sizeof(float), body_n, f) != body_n)
     {
         free(vecs);
-        return -1;
+        return CUVS_VECTORS_READ_IO;
     }
     if (cuvs_crc32(vecs, body_n * sizeof(float)) != hdr.body_crc32)
     {
         free(vecs);
-        return -1;
+        return CUVS_VECTORS_READ_BAD;
     }
 
     if (hdr_out)

@@ -221,7 +221,7 @@ SERVER_ALL_OBJS = src/pg_cuvs_server.o src/cuvs_objstore_server.o \
 $(SERVER_ALL_OBJS): $(wildcard src/*.h)
 
 # server .c → .o (not via PGXS — separate rule with no PG headers)
-src/pg_cuvs_server.o: src/pg_cuvs_server.c src/cuvs_ipc.h src/cuvs_util.h src/cuvs_wrapper.h src/cuvs_objstore.h src/cuvs_build_corpus.h
+src/pg_cuvs_server.o: src/pg_cuvs_server.c src/cuvs_ipc.h src/cuvs_util.h src/cuvs_wrapper.h src/cuvs_objstore.h src/cuvs_build_corpus.h src/cuvs_bf_verdict.h
 	$(CC) $(SERVER_CFLAGS) -c $< -o $@
 
 # cuvs_objstore.o for server (GCS client — not linked into the PG extension .so)
@@ -278,7 +278,7 @@ install-server: server
 SERVER_TEST_BIN     = pg_cuvs_server_test
 SERVER_TEST_CFLAGS  = $(SERVER_CFLAGS) -DCUVS_TEST_HOOKS
 
-src/pg_cuvs_server_test.o: src/pg_cuvs_server.c src/cuvs_ipc.h src/cuvs_util.h src/cuvs_wrapper.h src/cuvs_objstore.h
+src/pg_cuvs_server_test.o: src/pg_cuvs_server.c src/cuvs_ipc.h src/cuvs_util.h src/cuvs_wrapper.h src/cuvs_objstore.h src/cuvs_bf_verdict.h
 	$(CC) $(SERVER_TEST_CFLAGS) -c $< -o $@
 
 src/cuvs_ipc_server_test.o: src/cuvs_ipc.c src/cuvs_ipc.h src/cuvs_build_corpus.h
@@ -321,7 +321,7 @@ test-unit: test-compact-retry test-device-norm test-failed-allocation test-build
            test/unit/test_build_corpus.c src/cuvs_build_corpus.c src/cuvs_build_corpus.h \
            test-hnsw-build test-hnsw-build-ipc test-hnsw-owner-lease test-hnsw-ace-quality test-hnsw-admission test-admission-contract \
            test-hnsw-nn-policy test-hnsw-nn-route test-hnsw-nn-precision test-hnsw-nn-capacity test-hnsw-nn-sdk-params test-hnsw-nn-consumer test-hnsw-nn-upper-receipt test-hnsw-nn-center test-hnsw-nn-mutations test-hnsw-ace-origin-json test-hnsw-ace-planner-branch test-hnsw-sdk-plan-gate test-hnsw-gpu-link-lines \
-           test-i3-logs test-notice-wire test-admission-wire test-admission-message test-admission-ipc test-build-oom-thread test-cache-policy test-circuit-source test-status-text test-i3b-source test-peak-meter test-lw-policy test-lw-guard test-i3e-sql test-self-replace-notice test-host-free-fence test-vacuum-policy test-hnsw-digest
+           test-i3-logs test-notice-wire test-admission-wire test-admission-message test-admission-ipc test-build-oom-thread test-cache-policy test-circuit-source test-status-text test-i3b-source test-peak-meter test-lw-policy test-lw-guard test-i3e-sql test-self-replace-notice test-host-free-fence test-vacuum-policy test-bf-verdict test-hnsw-digest
 	$(CC) -I src -DCUVS_TEST_HOOKS -o test-unit test/unit/test_cuvs_util.c src/cuvs_util.c $(TEST_RT_LIB)
 	./test-unit
 	$(CC) -I src -o test-build-corpus test/unit/test_build_corpus.c src/cuvs_build_corpus.c $(TEST_RT_LIB)
@@ -709,6 +709,19 @@ test-vacuum-policy: test/unit/test_vacuum_policy.c src/cuvs_vacuum_policy.h
 	$(CC) -std=gnu11 -Wall -Wextra -Werror -I src -o $@ test/unit/test_vacuum_policy.c
 	./$@
 
+# #238: remembered brute_force unavailable verdict (cuvs_bf_verdict.h) and the
+# cuvs_vectors_read failure classes it depends on.
+test-bf-verdict: test/unit/test_bf_verdict.c src/cuvs_bf_verdict.h src/cuvs_util.c src/cuvs_util.h
+	$(CC) -std=gnu11 -Wall -Wextra -Werror -I src -o $@ test/unit/test_bf_verdict.c src/cuvs_util.c -lm $(TEST_RT_LIB)
+	./$@
+
+# #238: refresh_main_bf_cache consults the verdict before reading `.vectors`,
+# notes a failed read with its real return value, and clears the verdict on a
+# successful build (source check; also replays one planted defect per rule).
+test-unit: test-bf-verdict-source
+test-bf-verdict-source: test/unit/check_bf_verdict_source.py src/pg_cuvs_server.c
+	python3 -I -B test/unit/check_bf_verdict_source.py
+
 test-vacuum-policy-mutations: test/unit/test_vacuum_policy_mutations.py test-vacuum-policy src/pg_cuvs.c
 	CC=$(CC) python3 -I test/unit/test_vacuum_policy_mutations.py
 
@@ -773,11 +786,11 @@ test-hnsw-converter: test/unit/test_hnsw_converter.c src/hnsw_export.c \
 
 EXTRA_CLEAN += test-hnsw-build test-hnsw-build-ipc test-hnsw-owner-lease test-hnsw-ace-quality test-hnsw-converter test-hnsw-admission test-hnsw-explicit-route test-hnsw-policy \
                test-admission-contract test-admission-contract-cxx test-admission-contract-util.o \
-               test-admission-wire test-admission-message test-admission-ipc test-build-oom-thread test-hnsw-auto-overflow test-res-pool test-lw-policy test-lw-guard test-failed-allocation test-host-free-fence test-vacuum-policy
+               test-admission-wire test-admission-message test-admission-ipc test-build-oom-thread test-hnsw-auto-overflow test-res-pool test-lw-policy test-lw-guard test-failed-allocation test-host-free-fence test-vacuum-policy test-bf-verdict
 .PHONY: test-hnsw-build test-hnsw-build-ipc test-hnsw-owner-lease test-hnsw-ace-quality test-hnsw-ace-quality-mutations test-hnsw-converter test-hnsw-admission test-hnsw-explicit-route test-hnsw-policy \
         test-admission-contract test-admission-contract-mutations test-admission-wire \
         test-admission-message test-admission-ipc test-build-oom-thread test-gpu-wrapper-i3 test-hnsw-auto-overflow test-res-pool test-lw-policy test-lw-guard test-lw-mutations test-lw-docs \
-        test-host-free-fence test-host-free-fence-mutations test-vacuum-policy test-vacuum-policy-mutations test-hnsw-precision-mutations
+        test-host-free-fence test-host-free-fence-mutations test-vacuum-policy test-vacuum-policy-mutations test-bf-verdict test-bf-verdict-source test-hnsw-precision-mutations
 
 # ---- Documentation contract check ---------------------------------------
 # CPU-only drift detector for the current version/defaults and release-facing
