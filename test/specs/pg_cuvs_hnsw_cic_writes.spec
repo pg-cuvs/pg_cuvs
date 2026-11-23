@@ -2,11 +2,12 @@
 # the table's writers wait while it writes the index pages. GPU only: the CPU shim cannot build an HNSW graph from the heap.
 #
 # PostgreSQL's concurrent build opens the new index with RowExclusiveLock (index_concurrently_build), and every write
-# statement on the table opens every index of the table, a not-yet-ready one too, with RowExclusiveLock (ExecOpenIndices);
-# on the PostgreSQL 16 this was written against a write transaction no longer holds the index locks once its statement
-# has ended (seen in pg_locks), so it is a statement that is running that holds them. An index build that takes
-# AccessExclusiveLock on the new index while it writes the pages waits for the write statements that are running and
-# queues every write statement that starts behind it.
+# statement on the table opens every index of the table, a not-yet-ready one too, with RowExclusiveLock (ExecOpenIndices).
+# A plain INSERT releases those index locks when its statement ends (ExecCloseIndices; seen in pg_locks), so here it is a
+# running INSERT that holds them. UPDATE, DELETE and INSERT ... ON CONFLICT keep the locks the planner took on the
+# indexes to the end of their transaction (get_relation_info), and a SELECT keeps AccessShareLock on them the same way:
+# an index build that takes AccessExclusiveLock on the new index while it writes the pages waits for all of these and
+# queues every query that starts behind it. This spec checks the INSERT case only.
 #
 # How the steps meet at that moment:
 #   l_lock     holds two advisory locks: 54541, which the index expression waits for, so the build stops in its heap scan
