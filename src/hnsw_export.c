@@ -45,6 +45,7 @@
 #include "storage/bufmgr.h"
 #include "storage/itemptr.h"
 #include "storage/smgr.h"
+#include "storage/lmgr.h"         /* CheckRelationLockedByMe */
 #include "catalog/storage.h"       /* RelationTruncate */
 #include "utils/rel.h"
 #include "utils/relcache.h"
@@ -3547,7 +3548,11 @@ hnsw_import_empty_build_result(Relation indexRel,
             hnsw_store_connectivity(metapage,&c);
             hnsw_notice_connectivity(&c);
         }
-        s->target = index_open(index_oid, AccessExclusiveLock);
+        /* The caller holds the lock its command takes on the index being built: AccessExclusiveLock for CREATE INDEX
+         * and REINDEX, RowExclusiveLock for a concurrent build (index_concurrently_build). Asking for more here would
+         * make every writer of the table wait, since a writer opens a not-yet-ready index with RowExclusiveLock too
+         * (ExecOpenIndices); nobody else reads or writes the pages of an index that is not ready. */
+        s->target = index_open(index_oid, NoLock);
         skip_wal = RelationGetForm(s->target)->relpersistence == RELPERSISTENCE_UNLOGGED;
         if (skip_wal)
             ereport(NOTICE,
@@ -3557,12 +3562,20 @@ hnsw_import_empty_build_result(Relation indexRel,
             SMgrRelation smgr = RelationGetSmgr(s->target);
             BlockNumber current = smgrnblocks(smgr, MAIN_FORKNUM);
             if (current > 0)
+            {
+                /* Only an AccessExclusiveLock holder may cut pages others could read; a concurrent build's new
+                 * relation has none. */
+                if (!CheckRelationLockedByMe(s->target, AccessExclusiveLock, false))
+                    ereport(ERROR,
+                            (errmsg("pg_cuvs: HNSW build target \"%s\" already has %u pages",
+                                    RelationGetRelationName(s->target), current)));
                 RelationTruncate(s->target, 0);
+            }
             RelationSetTargetBlock(s->target, InvalidBlockNumber);
         }
         hnsw_publish_staged_page(s->target, metapage, skip_wal);
         hnsw_publish_staged_page(s->target, first_data_page, skip_wal);
-        index_close(s->target, AccessExclusiveLock);
+        index_close(s->target, NoLock);
         s->target = NULL;
     }
     PG_FINALLY();
@@ -3570,7 +3583,7 @@ hnsw_import_empty_build_result(Relation indexRel,
         HnswDiskImportState *s = (HnswDiskImportState *)&state;
         if (s->target)
         {
-            index_close(s->target, AccessExclusiveLock);
+            index_close(s->target, NoLock);
             s->target = NULL;
         }
     }
@@ -3632,7 +3645,11 @@ hnsw_import_build_result(Relation indexRel,
                     (errmsg("pg_cuvs: HNSW data page count exceeds block number limits")));
         data_page_count = hnsw_location_neigh_blkno(&last_location);	/* a split last pair ends one page later */
 
-        s->target = index_open(index_oid, AccessExclusiveLock);
+        /* The caller holds the lock its command takes on the index being built: AccessExclusiveLock for CREATE INDEX
+         * and REINDEX, RowExclusiveLock for a concurrent build (index_concurrently_build). Asking for more here would
+         * make every writer of the table wait, since a writer opens a not-yet-ready index with RowExclusiveLock too
+         * (ExecOpenIndices); nobody else reads or writes the pages of an index that is not ready. */
+        s->target = index_open(index_oid, NoLock);
         skip_wal = RelationGetForm(s->target)->relpersistence == RELPERSISTENCE_UNLOGGED;
         if (skip_wal)
             ereport(NOTICE,
@@ -3642,7 +3659,15 @@ hnsw_import_build_result(Relation indexRel,
             SMgrRelation smgr = RelationGetSmgr(s->target);
             BlockNumber current = smgrnblocks(smgr, MAIN_FORKNUM);
             if (current > 0)
+            {
+                /* Only an AccessExclusiveLock holder may cut pages others could read; a concurrent build's new
+                 * relation has none. */
+                if (!CheckRelationLockedByMe(s->target, AccessExclusiveLock, false))
+                    ereport(ERROR,
+                            (errmsg("pg_cuvs: HNSW build target \"%s\" already has %u pages",
+                                    RelationGetRelationName(s->target), current)));
                 RelationTruncate(s->target, 0);
+            }
             RelationSetTargetBlock(s->target, InvalidBlockNumber);
         }
         hnsw_write_disk_metapage(s->target, &header, build->dim,
@@ -3653,7 +3678,7 @@ hnsw_import_build_result(Relation indexRel,
                               &header, build->n_vecs, build->dim,
                               bytes_per_dim, data_page_count, skip_wal,
                               &s->locations);
-        index_close(s->target, AccessExclusiveLock);
+        index_close(s->target, NoLock);
         s->target = NULL;
     }
     PG_FINALLY();
@@ -3661,7 +3686,7 @@ hnsw_import_build_result(Relation indexRel,
         HnswDiskImportState *s = (HnswDiskImportState *)&state;
         if (s->target)
         {
-            index_close(s->target, AccessExclusiveLock);
+            index_close(s->target, NoLock);
             s->target = NULL;
         }
         if (s->locations.file)
@@ -4567,6 +4592,20 @@ cuvs_hnsw_amoptions(Datum reloptions, bool validate)
                                       tab, lengthof(tab));
 }
 
+/* A concurrent build writes the pages of an index that is not ready yet without a lock that keeps readers out (its
+ * writers' RowExclusiveLock must not wait), so a function that reads those pages refuses the index until it is ready;
+ * a failed concurrent build leaves such an index behind too. */
+static void
+hnsw_require_ready_index(Relation rel, const char *fn)
+{
+    if (!rel->rd_index->indisready)
+        ereport(ERROR,
+                (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+                 errmsg("%s: index \"%s\" is not ready: a concurrent build is writing it, or one failed",
+                        fn, RelationGetRelationName(rel)),
+                 errhint("Wait for CREATE INDEX CONCURRENTLY to finish, or DROP INDEX the invalid index and build it again.")));
+}
+
 /* Read the build-time receipt, never infer history from today's GUCs. The
  * pgvector-compatible prefix stays unchanged, including for INSERT/VACUUM. */
 PG_FUNCTION_INFO_V1(pg_cuvs_hnsw_build_info);
@@ -4586,6 +4625,7 @@ pg_cuvs_hnsw_build_info(PG_FUNCTION_ARGS)
     if (rel->rd_rel->relam != get_am_oid("pg_cuvs_hnsw", true))
         ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
             errmsg("pg_cuvs_hnsw_build_info requires a pg_cuvs_hnsw index")));
+    hnsw_require_ready_index(rel, "pg_cuvs_hnsw_build_info");
     heap = IndexGetRelation(oid, false);
     if (pg_class_aclcheck(heap, GetUserId(), ACL_SELECT) != ACLCHECK_OK)
         aclcheck_error(ACLCHECK_NO_PRIV, OBJECT_TABLE, get_rel_name(heap));
@@ -4854,10 +4894,12 @@ cuvs_hnsw_ambuild(Relation heapRel, Relation indexRel, IndexInfo *indexInfo)
     }
 
     /* Fill THIS index's relation (pgvector page format) from the CAGRA graph.
-     * fill_* open the target by OID with AccessExclusiveLock; re-locking an
-     * object this backend already holds (the index under construction) is a
-     * no-op re-grant, and the freshly created relation has 0 blocks so no
-     * truncate happens. */
+     * fill_* open the target by OID with AccessExclusiveLock. For CREATE INDEX
+     * and REINDEX this backend already holds that lock on the index under
+     * construction (a no-op re-grant); a concurrent build holds RowExclusiveLock
+     * only, so there the request waits for the table's writers and queues new
+     * ones behind it. The freshly created relation has 0 blocks so no truncate
+     * happens. */
     size_t n_elems_written;
     if (strcmp(mode, "nsw") == 0 || strcmp(mode, "hnsw") == 0)
         n_elems_written = fill_hnsw_from_cagra_ipc(cagra_oid, self_oid, mode);
@@ -4918,6 +4960,7 @@ pg_cuvs_hnsw_layer_counts(PG_FUNCTION_ARGS)
     if (rel->rd_rel->relam != get_am_oid("pg_cuvs_hnsw", true))
         ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
             errmsg("pg_cuvs_hnsw_layer_counts requires a pg_cuvs_hnsw index")));
+    hnsw_require_ready_index(rel, "pg_cuvs_hnsw_layer_counts");
     nblocks = RelationGetNumberOfBlocks(rel);
     if (nblocks > 0)
     {
