@@ -640,6 +640,7 @@ typedef struct CuvsBatchKey {
     uint32_t mode;        /* 0=cagra, 1=brute_force */
     uint32_t itopk_size;  /* CAGRA only; 0 = derive from dispatch k */
     uint32_t search_width;/* CAGRA only; 0 = SDK default */
+    uint32_t delta_cpu;   /* CAGRA only; 1 = cuvs.delta_search=cpu: no daemon delta merge */
 } CuvsBatchKey;
 
 /* group_id_out[i] = group of request i (requests with equal keys share it);

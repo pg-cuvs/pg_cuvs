@@ -39,7 +39,8 @@
  *   make install && make install-server
  * ---------------------------------------------------------------- */
 #define CUVS_PROTO_MAGIC   0x50435556u  /* 'VUCP' LE — "PG CUVS" tag */
-#define CUVS_PROTO_VERSION 5u   /* 5: I3 set (ADR-081, ADR-086): CuvsReplyHeader
+#define CUVS_PROTO_VERSION 6u   /* 6: + delta_search_mode (the daemon honors cuvs.delta_search).
+                                 * 5: I3 set (ADR-081, ADR-086): CuvsReplyHeader
                                  * + err_out (admission payload) + notice_out.
                                  * 4: + CAGRA itopk_size / search_width.
                                  * 3: daemon replies for EXPORT_ADJACENCY /
@@ -194,6 +195,11 @@ int cuvs_ipc_build_hnsw_file_idle(const char *socket_path, int vectors_fd,
 /* ----------------------------------------------------------------
  * Command frame (sent over UDS, fixed size)
  * ---------------------------------------------------------------- */
+/* cuvs.delta_search, as the GUC and CuvsCmdFrame.delta_search_mode carry it */
+#define CUVS_DELTA_SEARCH_AUTO 0u
+#define CUVS_DELTA_SEARCH_CPU  1u
+#define CUVS_DELTA_SEARCH_GPU  2u
+
 typedef struct CuvsCmdFrame {
     /* #77: must stay the first two fields — the daemon reads and validates them
      * before reading the rest of the frame. Stamped by send_cmd(). */
@@ -245,6 +251,8 @@ typedef struct CuvsCmdFrame {
     uint32_t cagra_batch_wait_us; /* SEARCH: daemon CAGRA micro-batch window (0=off) */
     uint32_t itopk_size;    /* SEARCH/SEARCH_BATCH: CAGRA buffer floor; 0=legacy auto */
     uint32_t search_width;  /* SEARCH/SEARCH_BATCH: CAGRA width; 0=SDK default */
+    uint32_t delta_search_mode; /* SEARCH: CUVS_DELTA_SEARCH_*; CPU = the daemon neither refreshes nor
+                                 * merges its GPU delta cache, the backend merges .delta alone */
     /* shm_key reused: EXTEND payload = [float32 vecs: n_vecs×dim][uint64_t tids: n_vecs]
      * COMPACT has no extra payload — daemon reads .tombstone directly. */
 } CuvsCmdFrame;
@@ -430,7 +438,9 @@ typedef struct CuvsIndexStats {
     uint32_t delta_generation;   /* base_tids_crc32 the delta cache was built on */
     uint64_t delta_vram_bytes;   /* VRAM held by the delta brute-force cache */
     uint64_t delta_merged_count; /* searches where daemon merged delta on GPU */
-    uint32_t delta_search_mode;  /* 0=none, 1=cpu, 2=gpu (what last search used) */
+    uint32_t delta_search_mode;  /* per index, not per session; not CuvsCmdFrame's encoding:
+                                  * 1=cpu (the last CAGRA search asked for cpu; BF/flat/HNSW searches
+                                  * do not change it), else 2=gpu (delta cache resident), else 0=none */
     /* Phase 3D: warmup stats (wire ABI extension — co-deploy daemon+extension) */
     uint32_t warmup_state;       /* WarmupState enum value (0=hot..5=failed) */
     int64_t  last_warmup_at;     /* epoch seconds of last completed warmup; 0 if never */
@@ -707,6 +717,7 @@ int cuvs_ipc_search(
     uint32_t      bf_precision,    /* Phase 3L: 0=float32, 1=float16 (BF only) */
     uint32_t      bf_batch_wait_us,/* Phase 3L: daemon BF micro-batch window μs (0=off) */
     uint32_t      cagra_batch_wait_us,/* #160: daemon CAGRA micro-batch window μs (0=off) */
+    uint32_t      delta_search_mode, /* CUVS_DELTA_SEARCH_*: cpu keeps the daemon out of the delta merge */
     uint64_t     *tids_out,
     float        *dist_out,
     int          *n_out,
