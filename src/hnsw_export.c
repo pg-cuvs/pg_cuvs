@@ -61,6 +61,7 @@
 #include "miscadmin.h"
 #include "libpq/pqsignal.h"
 #include "nodes/pg_list.h"       /* list_make1 */
+#include "nodes/parsenodes.h"    /* DefElem */
 #include "access/genam.h"        /* GetSysCacheOid3 */
 #include "access/table.h"        /* table_open/table_close (pgvector version guard) */
 #include "access/stratnum.h"     /* BTEqualStrategyNumber */
@@ -104,9 +105,9 @@ static uint32_t cagra_index_metric(Oid index_oid);
 #define PGV_HNSW_MAGIC          0xA953A953u
 #define PGV_HNSW_VERSION        1u
 #define PGV_HNSW_PAGE_ID        0xFF90u
-/* The m of a heap build that does not set it: the degree 64 (M 32) every heap build used before m was read. A
- * provisional default, kept until the default is settled from measurements. */
+/* Heap builds default to M 32, which requests a graph degree of 64. */
 #define CUVS_HNSW_DEFAULT_M     32
+#define CUVS_HNSW_SOURCE_MAX_M  32
 #define CUVS_HNSW_BUILD_EF      128
 
 /* Byte size of the 13-field hnswlib binary header (fixed across versions):
@@ -1071,7 +1072,7 @@ static bool
 hnsw_file_preflight(int hnsw_fd, int tids_fd,
                     uint64_t expected_n_vecs,
                     uint32_t expected_dim, uint32_t expected_metric,
-                    int bytes_per_dim, bool packed_nsw,
+                    int bytes_per_dim, bool packed_nsw, uint16_t heap_m,
                     HnswlibHeader *hnsw_out,
                     CuvsTidsHeader *tids_out,
                     HnswLocationWriter location_writer,
@@ -1196,15 +1197,25 @@ hnsw_file_preflight(int hnsw_fd, int tids_fd,
         hnsw_set_file_error(error, error_size, "invalid hnswlib header fields");
         goto done;
     }
+    /* Decode the actual graph width and reserve the heap index's full
+     * configured neighbor capacity in the PostgreSQL layout. */
+    int layout_m = heap_m ? heap_m : (int)h.M;
     int layout_maxlevel = packed_nsw ? 0 : h.maxlevel;
-    if ((uint64_t)(layout_maxlevel + 2) * h.M > UINT16_MAX)
+
+    if ((size_t)layout_m < h.M)
+    {
+        hnsw_set_file_error(error, error_size,
+                            "HNSW graph width exceeds the requested heap M");
+        goto done;
+    }
+    if ((uint64_t)(layout_maxlevel + 2) * layout_m > UINT16_MAX)
     {
         hnsw_set_file_error(error, error_size,
                             "HNSW neighbor slot count exceeds the page format");
         goto done;
     }
     if (!hnsw_page_pair_fits((int)expected_dim, bytes_per_dim,
-                             (int)h.M, layout_maxlevel))
+                             layout_m, layout_maxlevel))
     {
         hnsw_set_file_error(error, error_size,
                             "HNSW element and neighbor tuples do not fit on a page");
@@ -1217,7 +1228,7 @@ hnsw_file_preflight(int hnsw_fd, int tids_fd,
         goto done;
     }
     if (packed_nsw && !hnsw_compute_pack_k((int)expected_dim, bytes_per_dim,
-                                          (int)h.M, &pairs_per_page))
+                                          layout_m, &pairs_per_page))
     {
         hnsw_set_file_error(error, error_size,
                             "NSW element and neighbor tuples do not fit on a page");
@@ -1398,7 +1409,7 @@ hnsw_file_preflight(int hnsw_fd, int tids_fd,
                                       true, pairs_per_page, &location)
               : hnsw_pack_location_next(&packing, node, expected_n_vecs,
                                          (int)level, (int)expected_dim,
-                                         bytes_per_dim, (int)h.M, &location)))
+                                         bytes_per_dim, layout_m, &location)))
         {
             hnsw_set_file_error(error, error_size,
                                 "HNSW node layout exceeds PostgreSQL page limits");
@@ -2039,13 +2050,25 @@ cuvs_warn_pgvector_version(void)
 /* ================================================================
  * Main SQL function
  * ================================================================ */
+/* A zero request is internal only: the source decides M when m was omitted. */
+static void
+hnsw_check_source_m(int requested_m, int actual_m)
+{
+    if (requested_m != 0 && requested_m != actual_m)
+        ereport(ERROR,
+                (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+                 errmsg("pg_cuvs_hnsw: m = %d does not match the source graph's M = %d",
+                        requested_m, actual_m),
+                 errhint("Omit m to use the source graph's M.")));
+}
+
 /* Internal helper: fill an existing HNSW index from hnswlib sidecar.
  * Called by pg_cuvs_build_hnsw() for modes 'hnswlib' and 'hnswlib_file'.
  * use_shm=true  → daemon runs from_cagra() → /dev/shm (no disk I/O)
  * use_shm=false → reads pre-built .hnsw sidecar from index_dir */
 static void
 fill_hnsw_from_hnswlib_impl(Oid cagra_oid, Oid hnsw_oid, bool use_shm,
-                            HnswFillRes *res)
+                            int source_m, HnswFillRes *res)
 {
 
     /* ---- 0. pgvector compatibility check ---- */
@@ -2235,6 +2258,8 @@ fill_hnsw_from_hnswlib_impl(Oid cagra_oid, Oid hnsw_oid, bool use_shm,
         ereport(ERROR, (errmsg("pg_cuvs: invalid M=%d M0=%d in .hnsw header",
                                M, M0)));
     }
+
+    hnsw_check_source_m(source_m, M);
 
     /* ---- 4. Read .tids sidecar ---- */
     FILE *tf = fopen(tids_path, "rb");
@@ -2661,7 +2686,7 @@ fill_hnsw_from_hnswlib_impl(Oid cagra_oid, Oid hnsw_oid, bool use_shm,
  * scalar) and is unreachable on the error path, where PG_TRY's longjmp
  * skips the return entirely — no stale-value case to guard against. */
 static size_t
-fill_hnsw_from_hnswlib(Oid cagra_oid, Oid hnsw_oid, bool use_shm)
+fill_hnsw_from_hnswlib(Oid cagra_oid, Oid hnsw_oid, bool use_shm, int source_m)
 {
     /*
      * #166 review 3: `res` is written inside PG_TRY (through the pointer the
@@ -2676,7 +2701,7 @@ fill_hnsw_from_hnswlib(Oid cagra_oid, Oid hnsw_oid, bool use_shm)
     res.tids_fd = -1;
     PG_TRY();
     {
-        fill_hnsw_from_hnswlib_impl(cagra_oid, hnsw_oid, use_shm,
+        fill_hnsw_from_hnswlib_impl(cagra_oid, hnsw_oid, use_shm, source_m,
                                     (HnswFillRes *) &res);
     }
     PG_FINALLY();
@@ -3267,7 +3292,7 @@ hnsw_publish_staged_data_page(Relation rel, Page staged, bool skip_wal,
 
 static void
 hnsw_write_disk_pages(Relation rel, int hnsw_fd, int tids_fd,
-                      const HnswlibHeader *header, uint64_t n_nodes,
+                      const HnswlibHeader *header, int m, uint64_t n_nodes,
                       uint32_t dim, int bytes_per_dim, uint32_t data_page_count,
                       bool skip_wal,
                       HnswLocationTable *locations)
@@ -3279,7 +3304,6 @@ hnsw_write_disk_pages(Relation rel, int hnsw_fd, int tids_fd,
     uint64_t upper_cursor;
     uint64_t level0_bytes;
     uint32_t current_block = 0;
-    int m = (int)header->M;
     HnswDiskPageBatch batch = {0};
 
     if (!hnsw_mul_u64(n_nodes, header->sizeDataPerElement, &level0_bytes) ||
@@ -3438,7 +3462,7 @@ hnsw_check_connectivity(int fd, const HnswlibHeader *h, CuvsConnectivity *out)
 
 static void
 hnsw_write_disk_metapage(Relation rel, const HnswlibHeader *header,
-                         uint32_t dim, uint32_t n_data_pages, bool skip_wal,
+                         uint16_t m, uint32_t dim, uint32_t n_data_pages, bool skip_wal,
                          HnswLocationTable *locations, const CuvsHnswPolicy *policy,
                          const CuvsHnswAceReadback *ace, const CuvsHnswNnReadback *nn,
                          const CuvsConnectivity *connectivity)
@@ -3449,8 +3473,7 @@ hnsw_write_disk_metapage(Relation rel, const HnswlibHeader *header,
     if (!hnsw_location_table_lookup(locations, (uint32_t)header->enterpointNode,
                                     &entry))
         ereport(ERROR, (errmsg("pg_cuvs: cannot resolve HNSW entrypoint")));
-    if (!hnsw_init_metapage(staged, dim, (uint16_t)header->M,
-                            (uint16_t)header->efConstruction,
+    if (!hnsw_init_metapage(staged, dim, m, (uint16_t)header->efConstruction,
                             entry.elem_blkno, entry.elem_offno, entry.level,
                             n_data_pages))
         ereport(ERROR, (errmsg("pg_cuvs: invalid HNSW metapage fields")));
@@ -3596,7 +3619,7 @@ hnsw_import_empty_build_result(Relation indexRel,
 static void
 hnsw_import_build_result(Relation indexRel,
                          const CuvsHnswBuildResult *build,
-                         bool packed_nsw, bool with_receipt)
+                         bool packed_nsw, uint16_t heap_m, int source_m)
 {
     volatile HnswDiskImportState state;
     HnswlibHeader header;
@@ -3609,6 +3632,7 @@ hnsw_import_build_result(Relation indexRel,
     int bytes_per_dim = bytes_per_dim_for_typid(attr->atttypid);
     bool skip_wal;
     uint32_t data_page_count;
+    uint16_t layout_m;
 
     memset((void *)&state, 0, sizeof(state));
     PG_TRY();
@@ -3627,13 +3651,15 @@ hnsw_import_build_result(Relation indexRel,
                     (errmsg("pg_cuvs: cannot create disk-backed HNSW location table")));
         if (!hnsw_file_preflight(build->hnsw_fd, build->tids_fd,
                                  build->n_vecs, build->dim, build->metric,
-                                 bytes_per_dim, packed_nsw,
+                                 bytes_per_dim, packed_nsw, heap_m,
                                  &header, &tids_header,
                                  hnsw_location_table_append, &s->locations,
                                  hnsw_pg_check_interrupts,
                                  error, sizeof(error)))
             ereport(ERROR,
                     (errmsg("pg_cuvs: invalid source-less HNSW files: %s", error)));
+        hnsw_check_source_m(source_m, (int)header.M);
+        layout_m = heap_m ? heap_m : (uint16_t)header.M;
         hnsw_check_connectivity(build->hnsw_fd, &header, &connectivity);
         hnsw_notice_connectivity(&connectivity);
         if (!hnsw_location_table_rewind(&s->locations, build->n_vecs))
@@ -3673,12 +3699,12 @@ hnsw_import_build_result(Relation indexRel,
             }
             RelationSetTargetBlock(s->target, InvalidBlockNumber);
         }
-        hnsw_write_disk_metapage(s->target, &header, build->dim,
+        hnsw_write_disk_metapage(s->target, &header, layout_m, build->dim,
                                  data_page_count, skip_wal, &s->locations,
-                                 with_receipt ? &build->policy : NULL,
+                                 heap_m ? &build->policy : NULL,
                                  &build->ace, &build->nn, &connectivity);
         hnsw_write_disk_pages(s->target, build->hnsw_fd, build->tids_fd,
-                              &header, build->n_vecs, build->dim,
+                              &header, layout_m, build->n_vecs, build->dim,
                               bytes_per_dim, data_page_count, skip_wal,
                               &s->locations);
         index_close(s->target, NoLock);
@@ -3801,7 +3827,7 @@ cagra_assign_level(int M, unsigned int *seed)
  * heuristic neighbor selection among each row's CAGRA neighbors only when it builds none ('nsw' was level 0 only) */
 static void
 fill_hnsw_from_cagra_ipc_impl(Oid cagra_oid, Oid hnsw_oid, const char *mode,
-                              HnswFillRes *res)
+                              int source_m, HnswFillRes *res)
 {
     /* 'nsw' assigns levels and links the upper layers too. A graph with layer 0 only lets pgvector's insert make a new element
      * the entry point (hnswinsert.c, HNSW_UPDATE_ENTRY_GREATER) and link the upper layers among inserted rows only, so a search
@@ -3962,7 +3988,7 @@ fill_hnsw_from_cagra_ipc_impl(Oid cagra_oid, Oid hnsw_oid, const char *mode,
             build.dim     = (uint32_t) up_dim;
             build.metric  = tgt_metric;
             target = index_open(hnsw_oid, AccessExclusiveLock);
-            hnsw_import_build_result(target, &build, false, false);
+            hnsw_import_build_result(target, &build, false, 0, source_m);
             index_close(target, AccessExclusiveLock);
             ereport(NOTICE,
                     (errmsg("pg_cuvs: direct import %zu elements (dim=%d, M=%d, "
@@ -4032,6 +4058,7 @@ fill_hnsw_from_cagra_ipc_impl(Oid cagra_oid, Oid hnsw_oid, const char *mode,
     if (M0 % 2 != 0) M0--;
     if (M0 < 2) M0 = 2;
     int M = M0 / 2;
+    hnsw_check_source_m(source_m, M);
 
     ElemDesc *elems = (ElemDesc *)calloc(N, sizeof(ElemDesc));
     if (!elems)
@@ -4268,7 +4295,7 @@ fill_hnsw_from_cagra_ipc_impl(Oid cagra_oid, Oid hnsw_oid, const char *mode,
 /* #161: returns the actual element count — see the matching comment on
  * fill_hnsw_from_hnswlib(). */
 static size_t
-fill_hnsw_from_cagra_ipc(Oid cagra_oid, Oid hnsw_oid, const char *mode)
+fill_hnsw_from_cagra_ipc(Oid cagra_oid, Oid hnsw_oid, const char *mode, int source_m)
 {
     /* #166 review 3: volatile across the longjmp — see fill_hnsw_from_hnswlib. */
     volatile HnswFillRes res;
@@ -4278,7 +4305,7 @@ fill_hnsw_from_cagra_ipc(Oid cagra_oid, Oid hnsw_oid, const char *mode)
     res.tids_fd = -1;
     PG_TRY();
     {
-        fill_hnsw_from_cagra_ipc_impl(cagra_oid, hnsw_oid, mode,
+        fill_hnsw_from_cagra_ipc_impl(cagra_oid, hnsw_oid, mode, source_m,
                                       (HnswFillRes *) &res);
     }
     PG_FINALLY();
@@ -4508,11 +4535,11 @@ pg_cuvs_build_hnsw(PG_FUNCTION_ARGS)
      *   'hnswlib_file' — on-disk .hnsw sidecar; superceded by 'hnswlib' (shm).
      */
     if (strcmp(mode, "nsw") == 0 || strcmp(mode, "hnsw") == 0)
-        fill_hnsw_from_cagra_ipc(cagra_oid, hnsw_oid, mode);
+        fill_hnsw_from_cagra_ipc(cagra_oid, hnsw_oid, mode, 0);
     else if (strcmp(mode, "hnswlib") == 0)
-        fill_hnsw_from_hnswlib(cagra_oid, hnsw_oid, true);
+        fill_hnsw_from_hnswlib(cagra_oid, hnsw_oid, true, 0);
     else  /* hnswlib_file */
-        fill_hnsw_from_hnswlib(cagra_oid, hnsw_oid, false);
+        fill_hnsw_from_hnswlib(cagra_oid, hnsw_oid, false, 0);
 
     PG_RETURN_OID(hnsw_oid);
 }
@@ -4586,7 +4613,7 @@ cuvs_hnsw_init_reloptions(void)
                          "HNSW route: auto=tiny/resident IVF-PQ, explicit ivf_pq, nn_descent or ace; estimates are not memory upper bounds",
                          "auto", cuvs_hnsw_validate_build_algo, AccessExclusiveLock);
     add_int_reloption(cuvs_hnsw_relopt_kind, "m",
-                      "HNSW M of a heap build: the GPU graph degree is 2 * m; with source, the CAGRA graph degree decides",
+                      "HNSW M for heap builds; with source, an explicit m must match the converted graph (maximum 32)",
                       CUVS_HNSW_DEFAULT_M, 2, 100, AccessExclusiveLock);
     add_int_reloption(cuvs_hnsw_relopt_kind, "ef_construction",
                       "Construction effort: default 64 preserves route defaults; changes intermediate degree / ACE effort",
@@ -4638,6 +4665,7 @@ pg_cuvs_hnsw_build_info(PG_FUNCTION_ARGS)
     CuvsHnswPolicyReadStatus ace_status = CUVS_HNSW_POLICY_NOT_RECORDED;
     StringInfoData json;
     CuvsConnectivity connectivity = {0};
+    uint16_t meta_m = 0;
     Oid heap;
     if (rel->rd_rel->relam != get_am_oid("pg_cuvs_hnsw", true))
         ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
@@ -4653,6 +4681,8 @@ pg_cuvs_hnsw_build_info(PG_FUNCTION_ARGS)
         LockBuffer(buffer, BUFFER_LOCK_SHARE);
         page = BufferGetPage(buffer);
         policy_status = hnsw_read_disk_policy(page, &policy);
+        if (policy_status == CUVS_HNSW_POLICY_RECORDED)
+            meta_m = ((const PgvHnswMeta *)PageGetContents(page))->m;
         if (policy_status == CUVS_HNSW_POLICY_RECORDED && policy.route == CUVS_HNSW_ROUTE_ACE)
             ace_status = hnsw_read_disk_ace(page, &policy, &ace);
         if (policy_status == CUVS_HNSW_POLICY_RECORDED && policy.route == CUVS_HNSW_ROUTE_NN_DESCENT)
@@ -4715,6 +4745,8 @@ pg_cuvs_hnsw_build_info(PG_FUNCTION_ARGS)
         policy.route != CUVS_HNSW_ROUTE_IVF_PQ ? "not_applicable"
             : (policy.route_flags & CUVS_HNSW_ROUTE_FLAG_IVFPQ_FP32) ? "fp32" : "fp16",
         (policy.route_flags & CUVS_HNSW_ROUTE_FLAG_GRAPH_FALLBACK) ? "true" : "false");
+    if (policy.degree < 2u * meta_m)
+        appendStringInfoString(&json, ",\"graph_degree_limited_by\":\"input_rows\"");
     /* ace_ef_construction above is A; the SDK consumes q = A / 16 (cuvs_hnsw_policy.h). */
     if (policy.route != CUVS_HNSW_ROUTE_ACE)
         appendStringInfoString(&json, ",\"ace_readback\":\"not_applicable\"");
@@ -4751,6 +4783,33 @@ pg_cuvs_hnsw_build_info(PG_FUNCTION_ARGS)
             policy.hierarchy ? "null" : "\"not_applicable\"");
     appendStringInfoChar(&json, '}');
     PG_RETURN_DATUM(DirectFunctionCall1(jsonb_in, CStringGetDatum(json.data)));
+}
+
+/* The parsed rd_options fills in defaults. Keep the catalog's distinction
+ * between omission and an explicit default, including after ALTER or REINDEX. */
+static bool
+cuvs_hnsw_m_is_explicit(Oid index_oid)
+{
+    HeapTuple tuple = SearchSysCache1(RELOID, ObjectIdGetDatum(index_oid));
+    bool isnull;
+    Datum options;
+    List *defs;
+    ListCell *cell;
+
+    if (!HeapTupleIsValid(tuple))
+        elog(ERROR, "cache lookup failed for relation %u", index_oid);
+    options = SysCacheGetAttr(RELOID, tuple, Anum_pg_class_reloptions, &isnull);
+    defs = isnull ? NIL : untransformRelOptions(options);
+    ReleaseSysCache(tuple);
+
+    foreach(cell, defs)
+    {
+        DefElem *def = lfirst_node(DefElem, cell);
+
+        if (strcmp(def->defname, "m") == 0)
+            return true;
+    }
+    return false;
 }
 
 /* ambuild: build a pgvector-HNSW index, served by pgvector (Phase 3K).
@@ -4824,7 +4883,7 @@ cuvs_hnsw_ambuild(Relation heapRel, Relation indexRel, IndexInfo *indexInfo)
             result->heap_tuples = b->reltuples;
             result->index_tuples = (double)b->n_vecs;
             if (b->n_vecs > 0)
-                hnsw_import_build_result(indexRel, b, false, true);	/* the graph has upper layers, so not the level-0-only packing */
+                hnsw_import_build_result(indexRel, b, false, (uint16_t)requested_m, 0);	/* the graph has upper layers, so not the level-0-only packing */
             else
                 hnsw_import_empty_build_result(indexRel, b, (uint16_t) requested_m);
         }
@@ -4912,6 +4971,14 @@ cuvs_hnsw_ambuild(Relation heapRel, Relation indexRel, IndexInfo *indexInfo)
         }
     }
 
+    int source_m = cuvs_hnsw_m_is_explicit(self_oid) ? (int) requested_m : 0;
+    if (source_m > CUVS_HNSW_SOURCE_MAX_M)
+        ereport(ERROR,
+                (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+                 errmsg("pg_cuvs_hnsw: m = %d is out of range for source conversion (maximum %d)",
+                        source_m, CUVS_HNSW_SOURCE_MAX_M),
+                 errhint("Omit m to use the source graph's M.")));
+
     /* Fill THIS index's relation (pgvector page format) from the CAGRA graph.
      * fill_* open the target by OID with AccessExclusiveLock. For CREATE INDEX
      * and REINDEX this backend already holds that lock on the index under
@@ -4921,11 +4988,11 @@ cuvs_hnsw_ambuild(Relation heapRel, Relation indexRel, IndexInfo *indexInfo)
      * happens. */
     size_t n_elems_written;
     if (strcmp(mode, "nsw") == 0 || strcmp(mode, "hnsw") == 0)
-        n_elems_written = fill_hnsw_from_cagra_ipc(cagra_oid, self_oid, mode);
+        n_elems_written = fill_hnsw_from_cagra_ipc(cagra_oid, self_oid, mode, source_m);
     else if (strcmp(mode, "hnswlib") == 0)
-        n_elems_written = fill_hnsw_from_hnswlib(cagra_oid, self_oid, true);
+        n_elems_written = fill_hnsw_from_hnswlib(cagra_oid, self_oid, true, source_m);
     else  /* hnswlib_file */
-        n_elems_written = fill_hnsw_from_hnswlib(cagra_oid, self_oid, false);
+        n_elems_written = fill_hnsw_from_hnswlib(cagra_oid, self_oid, false, source_m);
 
     /* #161: element count from fill_*'s own return, not inferred from block
      * count. nblocks-1 == N only holds while every page carries exactly one

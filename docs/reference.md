@@ -511,9 +511,27 @@ cagra/ivfpq") rather than silently failing.
 |-----------|------|---------|--------|-------|
 | `source` | string | `` | a `cagra` index name on the same table | empty = private direct HNSW file build from the heap (op23), without a persistent CAGRA index |
 | `mode` | string | `nsw` | `nsw`, `hnswlib`, `hnsw`, `hnswlib_file` | `nsw` and `hnswlib` are recommended. With `source`, `nsw` and `hnsw` give the same graph: level 0 from the CAGRA graph and upper layers built by the daemon on the host. Since 0.9.3 this path checks the pgvector version as the heap build does (outside the supported range is an error, not a warning) |
-| `m` | int | `32` | 2–100 | Heap build (no `source`): the HNSW M; the GPU graph is built with degree 2 × `m`, and the metapage records `m`, which later inserts use. With `source`: informational, the CAGRA graph degree decides (M = min(graph degree, 64) / 2). The default 32 is the degree 64 every heap build used before `m` was read; the default is still being decided from measurements |
+| `m` | int | `32` | 2–100; explicit values with `source` 2–32 | Heap builds use `m` as the HNSW neighbor capacity. With `source`, omitting `m` uses the converted graph's M. If you supply `m`, it must match that M. |
 | `ef_construction` | int | `64` | 4–1000 | Direct heap build: construction effort; source reuse: informational |
 | `build_algo` | enum | `auto` | `auto`, `ivf_pq`, `nn_descent`, `ace` | Direct heap build only; cannot be combined with explicit `source` |
+
+A heap build reserves `m` neighbors per upper layer and 2 × `m` at level 0. The metapage records
+`m`, which later inserts use. The GPU requests degree 2 × `m` and reduces it for small inputs.
+`pg_cuvs_hnsw_build_info()` reports the constructed graph width as `graph_degree` and adds
+`graph_degree_limited_by: "input_rows"` when that width was reduced. Tiny graphs may include
+padding in their serialized width. The importer removes that padding from the neighbor counts.
+Choose `m` above 3 for general use. Values 2 and 3 substantially lowered recall in a 5,000-row
+test (128 dimensions), and quality depends on the data.
+
+In source modes `nsw` and `hnsw`, the converter caps the CAGRA degree at 64 and rounds it down
+to an even number, then divides by two. Modes `hnswlib` and `hnswlib_file` read M from the SDK
+or file header. Omit `m` to inherit that value, including an existing header with M above 32.
+An explicitly supplied `m` above 32 or one that differs from the converted graph's M is an error.
+Use `(pg_cuvs_hnsw_layer_counts('index_name')).m` to see the built value.
+`ALTER INDEX ... SET (m = ...)` changes the stored option without rebuilding the index. The new
+setting applies on the next `REINDEX` or other rebuild, when source compatibility is checked.
+Use `ALTER INDEX ... RESET (m)` to restore the default for a future heap build or inherit M on the
+next source conversion.
 
 For direct heap construction, `auto` uses tiny exact GPU construction below 16 rows and
 otherwise the resident IVF-PQ route while its estimate fits the host and GPU budgets.
@@ -577,8 +595,8 @@ tablespace needs a further `n × dim × 4` bytes for the input spool. The `[hnsw
 line then has `status=5` and still names the decided route (`route=none` only when no
 route was decided, such as an over-budget refusal).
 
-`m` remains informational. Direct `ef_construction` scales intermediate degree from128,
-hierarchy construction effort from200, and ACE effort from240 at the default64 (ACE: the
+Direct `ef_construction` scales the intermediate degree from 4 × `m`, the hierarchy effort
+from 200, and the ACE effort from 240 at the default 64 (ACE: the
 `--hnsw-ace-build-quality auto` rule, 20 NN-descent iterations per partition at 64);
 receipts record the consumed/clamped values. ACE indexes also record a partition-builder
 readback (`ace_build_quality`, `ace_local_intermediate_degree` = 3 × (graph_degree / 2),

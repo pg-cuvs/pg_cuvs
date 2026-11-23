@@ -240,6 +240,8 @@ cuvs_hnsw_fix_tiny_counts(int fd, uint64_t expected)
         || header[4] > header[3] || header[3] - header[4] != 8
         || fstat(fd, &st) || st.st_size < 0
         || (uint64_t)st.st_size < 96 + expected * header[3]) return -1;
+    uint32_t expected_links = expected - 1 < header[8] ? (uint32_t)(expected - 1) : (uint32_t)header[8];
+
     for (uint64_t row = 0; row < expected; row++)
     {
         uint32_t links[16], count, kept = 0;
@@ -256,7 +258,7 @@ cuvs_hnsw_fix_tiny_counts(int fd, uint64_t expected)
             for (k = 0; k < kept && links[k] != id; k++) {}
             if (k == kept) links[kept++] = id;
         }
-        if (kept != expected - 1) return -1;
+        if (kept != expected_links) return -1;
         for (uint32_t j = kept; j < header[8]; j++) links[j] = 0;
         if (pwrite(fd, &kept, 4, offset) != 4
             || pwrite(fd, links, (size_t)header[8] * 4, offset + 4) != (ssize_t)header[8] * 4) return -1;
@@ -475,6 +477,27 @@ typedef struct CuvsHnswForecast {
     uint64_t disk_need, disk_avail;
 } CuvsHnswForecast;
 
+/* Forecasting and GPU construction use the same input-row caps. The tiny
+ * serializer needs width four even for one row and removes padding from
+ * the stored neighbor counts. */
+static inline void
+cuvs_hnsw_limit_graph_degrees(uint64_t n, uint32_t *degree, uint32_t *intermediate)
+{
+    if (n > 0 && n < CUVS_HNSW_MIN_ELEMENTS)
+    {
+        uint32_t limit = (uint32_t)(n & ~UINT64_C(1));
+
+        if (limit < 4) limit = 4;
+        if (*degree > limit) *degree = limit;
+        *intermediate = *degree;
+    }
+    else if (n > 0)
+    {
+        if (*degree >= n) *degree = (uint32_t)((n - 1) & ~UINT64_C(1));
+        if (*intermediate >= n) *intermediate = (uint32_t)(n - 1);
+    }
+}
+
 static inline int
 cuvs_hnsw_forecast_route(uint64_t n, uint32_t dim, uint32_t graph_degree,
     uint32_t intermediate_degree, uint32_t hierarchy, uint32_t algo,
@@ -492,17 +515,7 @@ cuvs_hnsw_forecast_route(uint64_t n, uint32_t dim, uint32_t graph_degree,
         return (int)out->status;
     }
     intermediate = cuvs_hnsw_scaled_quality(intermediate_degree, ef_construction, degree, 4096);
-    if (n < CUVS_HNSW_MIN_ELEMENTS)
-    {
-        degree = (uint32_t)(n & ~UINT64_C(1));
-        if (degree < 4) degree = 4;
-        intermediate = degree;
-    }
-    else
-    {
-        if (degree >= n) degree = (uint32_t)((n - 1) & ~UINT64_C(1));
-        if (intermediate >= n) intermediate = (uint32_t)(n - 1);
-    }
+    cuvs_hnsw_limit_graph_degrees(n, &degree, &intermediate);
     out->disk_need = cuvs_hnsw_disk_need(n, dim, graph_degree);
     if (algo == CUVS_HNSW_ALGO_NN_DESCENT)
     {
