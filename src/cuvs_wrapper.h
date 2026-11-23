@@ -457,6 +457,47 @@ int            cuvs_cagra_serialize(CuvsCagraIndex index, const char *path,
 CuvsCagraIndex cuvs_cagra_deserialize(const char *path, int dim,
                                        int device_id);
 
+/*
+ * Write a .cagra file that is meant to be byte for byte the file
+ * cagra::serialize(include_dataset=true) writes for a float32 strided dataset
+ * (the layout follows the cuVS 26.04 source; the daemon's
+ * PG_CUVS_DIRECT_CAGRA_VERIFY=1 compares the two files), so the daemon can
+ * write the dataset body (most of the file: n*dim*4 bytes against
+ * n*degree*4 for the graph) from host memory while the GPU builds and only
+ * the head, the graph and the middle after the build.
+ *
+ * File: [head][graph body n*degree*4][middle][dataset body n*dim*4].
+ * `head` and `middle` are the numpy-framed scalars and npy headers; their
+ * bytes are produced by the same RAFT serializer calls and C++ types that
+ * cuVS uses (cuvs_wrapper.cu), never spelled out by hand.
+ */
+typedef struct CuvsCagraFileLayout {
+    int64_t  n_rows;
+    uint32_t dim, graph_degree, stride, metric;  /* metric = CUVS_METRIC_* */
+    uint64_t graph_body_off;     /* start of the graph body (= head length) */
+    uint64_t middle_off;         /* content_map scalar = graph_body_off + n*degree*4 */
+    uint64_t dataset_body_off;   /* start of the dataset body */
+    uint64_t total_bytes;
+} CuvsCagraFileLayout;
+
+/* Compute the layout on the host, no GPU. stride = round_up(dim, 4) (the
+ * dataset row stride cuvs_cagra_build_multi attaches). graph_degree <= 0 means
+ * the build default 64. Returns 0, or -1 (bad argument, no cuVS format in this
+ * build). */
+int cuvs_cagra_file_layout(int64_t n_rows, int dim, int graph_degree, uint32_t metric,
+                           CuvsCagraFileLayout *out);
+
+/* After the build: check the index really has the shape `layout` was computed
+ * for (size, dim, graph_degree, metric, a strided float32 dataset of n_rows x
+ * dim with that stride, no source_indices), write the head, the graph body
+ * and the middle at their offsets of `fd` (pwrite) and fsync it. The dataset
+ * body is the caller's.
+ * Must be called with the daemon's g_index_mutex held (it shares one static
+ * pinned staging buffer). Returns 0 on success, 1 when the shape differs (the
+ * caller falls back to cuvs_cagra_serialize), -1 on an I/O or CUDA error. */
+int cuvs_cagra_write_prefix(CuvsCagraIndex index, int fd, const CuvsCagraFileLayout *layout,
+                            int device_id);
+
 /* VRAM query -- returns free VRAM bytes on the specified CUDA device. */
 size_t cuvs_vram_free_bytes_on(int device_id);
 

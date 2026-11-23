@@ -42,6 +42,34 @@ exists for 0.9.0.
 
 ### Changed
 
+- A CAGRA build that the daemon receives in several partials does less work while it
+  holds the daemon's index lock after the GPU build. A helper thread writes the
+  `.vectors` sidecar and the dataset body of the `.cagra` file while the GPU builds;
+  after the build the daemon writes only the file head, the graph and the remaining
+  header bytes, instead of copying the dataset back from the GPU and serializing it with
+  cuVS. The `.cagra` file is meant to be byte for byte the file cuVS 26.04
+  `cagra::serialize` writes (its layout follows the cuVS source); when the built index
+  does not have the expected shape, or any step of the direct write fails, the daemon
+  serializes with cuVS as before. Two daemon environment variables control it:
+  `PG_CUVS_DIRECT_CAGRA=0` turns the direct write off (default on), and
+  `PG_CUVS_DIRECT_CAGRA_VERIFY=1` (default off) also serializes each direct file with
+  cuVS, compares the two and commits the cuVS file instead when they differ or cannot be
+  compared. When they differ, the check runs the cuVS serialize twice while the daemon
+  holds the index lock (once for the comparison, once for the committed file), so it is
+  meant for testing a cuVS upgrade, not for routine builds. The `.vectors` temp file
+  and the directly written `.cagra` temp file of such a build are named
+  `<file>.<pid>.<epoch>.<seq>.tmp`; a daemon that dies during the build leaves these two
+  behind, and nothing removes them yet. The `.tids` temp file and the `.cagra` temp file
+  that cuVS serializes keep the fixed name `<file>.tmp`, which the next build of the
+  same index overwrites; with the check on, a daemon that dies while comparing also
+  leaves `<.cagra temp file>.ref`. When the GPU build fails, the daemon still waits for
+  the helper thread to finish writing and syncing its temp files before it deletes
+  them, releases the build's GPU memory reservation and replies with the error.
+  Single-corpus builds are unchanged.
+- pg_cuvs's CRC-32 (the checksum of `.vectors`, `.tids` and other files) is computed
+  eight bytes per step, and the daemon verifies a `.vectors` body with several threads
+  when it loads one for the brute-force cache. The CRC values and the file formats are
+  unchanged.
 - A pg_cuvs built without `CUVS_SDK_SOURCE_INCLUDE` no longer refuses ACE
   (`build_algo='ace'`, and `auto` when it spills to ACE). It hands the requested
   partition count to the patched cuVS SDK and records it in the HNSW receipt as

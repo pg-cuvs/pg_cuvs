@@ -33,6 +33,8 @@
 #include <raft/core/resource/thrust_policy.hpp>
 #include <raft/core/device_mdarray.hpp>
 #include <raft/core/host_mdarray.hpp>
+#include <raft/core/serialize.hpp>   /* raft::serialize_scalar (same call cagra::serialize makes) */
+#include <raft/core/detail/mdspan_numpy_serializer.hpp>   /* npy header writer (direct .cagra write) */
 #include <raft/core/bitset.cuh>      /* 3O: raft::core::bitset device ops */
 
 #include <rmm/mr/pool_memory_resource.hpp>
@@ -52,7 +54,12 @@
 
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>   /* Phase 3L: half precision for brute-force (cuvs.bf_precision) */
+#include <algorithm>
 #include <cstring>
+#include <cerrno>
+#include <sstream>
+#include <string>
+#include <unistd.h>
 #include <memory>
 #include <vector>
 #include <chrono>   /* ADR-075: host wall-clock for the BF throughput probe */
@@ -1895,6 +1902,232 @@ cuvs_cagra_serialize(CuvsCagraIndex index, const char *path, int device_id)
     } catch (...) {
         fprintf(stderr, "[cuvs_cagra_serialize] unknown exception\n");
         return 1;
+    }
+}
+
+/* ----------------------------------------------------------------
+ * .cagra written outside cuVS, meant to be byte for byte the output of
+ * cagra::serialize(include_dataset=true); the layout follows the cuVS source
+ * named below.
+ *
+ * Order, from cuvs/cpp/src/neighbors/detail/cagra/cagra_serialize.cuh
+ * detail::serialize (v26.04) and neighbors/detail/dataset_serialize.hpp:
+ *   dtype string (4 bytes) | scalars: version, size, dim, graph_degree,
+ *   metric | graph (npy header + body) | content_map | dataset tag, dtype,
+ *   n_rows, dim, stride | dataset (npy header + unpadded rows).
+ * Every header byte below comes from the SAME RAFT functions called with the
+ * SAME C++ types as in cuVS (see the per-line type notes); nothing is
+ * hand-formatted. Both constants below are private to cuVS (not in an
+ * installed header) and nothing checks them against the linked cuVS at
+ * compile or load time: re-check them on a cuVS upgrade. The daemon's
+ * PG_CUVS_DIRECT_CAGRA_VERIFY=1 (off by default) compares each direct file
+ * with cagra::serialize and commits the cuVS file instead when they differ or
+ * cannot be compared.
+ * ---------------------------------------------------------------- */
+static constexpr int      kCagraSerializationVersion = 5;  /* cagra_serialize.cuh:28 (int) */
+static constexpr uint32_t kCagraStridedDatasetTag    = 2;  /* dataset_serialize.hpp:24 (dataset_instance_tag = uint32_t) */
+
+/* `head` = [0, graph body); `middle` = [end of graph body, dataset body). */
+static void
+cagra_file_pieces(int64_t n_rows, uint32_t dim, uint32_t degree, uint32_t stride,
+                  cuvs::distance::DistanceType metric, std::string &head, std::string &middle)
+{
+    namespace ns = raft::detail::numpy_serializer;
+    raft::resources res;   /* serialize_scalar ignores it; touches no CUDA */
+    std::ostringstream os;
+
+    std::string dtype_string = ns::get_numpy_dtype<float>().to_string();
+    dtype_string.resize(4);
+    os << dtype_string;
+    raft::serialize_scalar(res, os, kCagraSerializationVersion);   /* const int */
+    raft::serialize_scalar(res, os, static_cast<uint32_t>(n_rows)); /* index.size(): IdxT = uint32_t */
+    raft::serialize_scalar(res, os, dim);                          /* index.dim(): uint32_t */
+    raft::serialize_scalar(res, os, degree);                       /* index.graph_degree(): uint32_t */
+    raft::serialize_scalar(res, os, metric);                       /* index.metric(): DistanceType */
+    /* serialize_mdspan(graph): device_matrix_view<const uint32_t, int64_t, row_major>;
+     * header of its host copy = {<u4, C order, (extent0, extent1)} */
+    const ns::header_t graph_hdr = {ns::get_numpy_dtype<uint32_t>(), false,
+                                    std::vector<ns::ndarray_len_t>{
+                                        static_cast<ns::ndarray_len_t>(n_rows),
+                                        static_cast<ns::ndarray_len_t>(degree)}};
+    ns::write_header(os, graph_hdr);
+    head = os.str();
+
+    os.str(std::string());
+    os.clear();
+    const uint32_t content_map = 0x1u;                             /* dataset, no source_indices */
+    raft::serialize_scalar(res, os, content_map);                  /* uint32_t */
+    raft::serialize_scalar(res, os, kCagraStridedDatasetTag);      /* dataset_instance_tag = uint32_t */
+    raft::serialize_scalar(res, os, CUDA_R_32F);                   /* cudaDataType_t, as in cuVS */
+    raft::serialize_scalar(res, os, n_rows);                       /* strided_dataset<float,int64_t>::n_rows(): int64_t */
+    raft::serialize_scalar(res, os, dim);                          /* dataset.dim(): uint32_t */
+    raft::serialize_scalar(res, os, stride);                       /* dataset.stride(): uint32_t */
+    /* serialize_mdspan(host_matrix_view<float, int64_t, row_major> (n_rows, dim)) */
+    const ns::header_t data_hdr = {ns::get_numpy_dtype<float>(), false,
+                                   std::vector<ns::ndarray_len_t>{
+                                       static_cast<ns::ndarray_len_t>(n_rows),
+                                       static_cast<ns::ndarray_len_t>(dim)}};
+    ns::write_header(os, data_hdr);
+    middle = os.str();
+}
+
+extern "C" int
+cuvs_cagra_file_layout(int64_t n_rows, int dim, int graph_degree, uint32_t metric,
+                       CuvsCagraFileLayout *out)
+{
+    /* cagra::index<float, uint32_t>: at most UINT32_MAX rows. */
+    if (!out || n_rows <= 0 || n_rows > (int64_t)UINT32_MAX || dim <= 0)
+        return -1;
+    try {
+        const uint32_t d      = (uint32_t)dim;
+        const uint32_t degree = graph_degree > 0 ? (uint32_t)graph_degree : 64u;
+        const uint32_t stride = (d + 3u) / 4u * 4u;   /* ld of cuvs_cagra_build_multi */
+        std::string head, middle;
+        cagra_file_pieces(n_rows, d, degree, stride, cuvs_distance_type(metric), head, middle);
+        out->n_rows           = n_rows;
+        out->dim              = d;
+        out->graph_degree     = degree;
+        out->stride           = stride;
+        out->metric           = metric;
+        out->graph_body_off   = head.size();
+        out->middle_off       = out->graph_body_off + (uint64_t)n_rows * degree * sizeof(uint32_t);
+        out->dataset_body_off = out->middle_off + middle.size();
+        out->total_bytes      = out->dataset_body_off + (uint64_t)n_rows * d * sizeof(float);
+        return 0;
+    } catch (const std::exception &e) {
+        fprintf(stderr, "[cuvs_cagra_file_layout] exception: %s\n", e.what());
+        return -1;
+    }
+}
+
+static bool
+cagra_pwrite_all(int fd, const void *buf, size_t len, uint64_t off)
+{
+    const char *p = static_cast<const char *>(buf);
+    while (len > 0) {
+        ssize_t w = pwrite(fd, p, len, (off_t)off);
+        if (w < 0) {
+            if (errno == EINTR)
+                continue;
+            return false;
+        }
+        if (w == 0) {
+            errno = ENOSPC;
+            return false;
+        }
+        p   += w;
+        len -= (size_t)w;
+        off += (uint64_t)w;
+    }
+    return true;
+}
+
+extern "C" int
+cuvs_cagra_write_prefix(CuvsCagraIndex index, int fd, const CuvsCagraFileLayout *layout,
+                        int device_id)
+{
+    if (!index || fd < 0 || !layout)
+        return -1;
+
+    /* One pinned staging buffer for the process lifetime, shared by every call
+     * (portable: usable from any device's stream). The daemon calls this under
+     * g_index_mutex; the lock keeps a stray concurrent caller from interleaving
+     * two graphs in the same buffer. */
+    static std::mutex g_prefix_mutex;
+    static void      *g_prefix_pinned = nullptr;
+    constexpr size_t  kChunk          = (size_t)16 << 20;
+    std::lock_guard<std::mutex> lock(g_prefix_mutex);
+
+    std::unique_ptr<PooledRes> pr;   /* outside the try so the catch can poison it */
+    try {
+        CuvsCagraIndexImpl *impl = static_cast<CuvsCagraIndexImpl *>(index);
+        const auto &idx = impl->idx;
+        const auto *ds = dynamic_cast<const cuvs::neighbors::strided_dataset<float, int64_t> *>(
+            &idx.data());
+        const auto graph = idx.graph();
+        const bool same =
+            !idx.dataset_fd().has_value() && ds != nullptr && layout->n_rows > 0 &&
+            (int64_t)idx.size() == layout->n_rows && idx.dim() == layout->dim &&
+            idx.graph_degree() == layout->graph_degree &&
+            idx.metric() == cuvs_distance_type(layout->metric) &&
+            ds->n_rows() == layout->n_rows && ds->dim() == layout->dim &&
+            ds->stride() == layout->stride && !idx.source_indices().has_value() &&
+            graph.extent(0) == layout->n_rows &&
+            graph.extent(1) == (int64_t)layout->graph_degree;
+        if (!same) {
+            fprintf(stderr, "[cuvs_cagra_write_prefix] index shape differs from the layout "
+                            "(layout n=%lld dim=%u degree=%u stride=%u; index n=%lld dim=%u "
+                            "degree=%u strided_float=%d source_indices=%d)\n",
+                    (long long)layout->n_rows, layout->dim, layout->graph_degree, layout->stride,
+                    (long long)idx.size(), idx.dim(), idx.graph_degree(), ds != nullptr,
+                    (int)idx.source_indices().has_value());
+            return 1;
+        }
+
+        /* The bytes come from the layout's arguments; they must reproduce the
+         * offsets the caller already used for the dataset body. */
+        std::string head, middle;
+        cagra_file_pieces(layout->n_rows, layout->dim, layout->graph_degree, layout->stride,
+                          idx.metric(), head, middle);
+        const uint64_t graph_bytes =
+            (uint64_t)layout->n_rows * layout->graph_degree * sizeof(uint32_t);
+        if (head.size() != layout->graph_body_off ||
+            layout->middle_off != layout->graph_body_off + graph_bytes ||
+            layout->dataset_body_off != layout->middle_off + middle.size()) {
+            fprintf(stderr, "[cuvs_cagra_write_prefix] layout offsets do not match the header bytes\n");
+            return -1;
+        }
+
+        pr = std::make_unique<PooledRes>(device_id);
+        raft::device_resources &res = pr->get();
+        const cudaStream_t stream = res.get_stream().value();
+
+        std::vector<char> heap_buf;   /* used only when pinned memory is unavailable */
+        void *buf = g_prefix_pinned;
+        if (!buf) {
+            if (cudaHostAlloc(&buf, kChunk, cudaHostAllocPortable) == cudaSuccess) {
+                g_prefix_pinned = buf;
+            } else {
+                (void)cudaGetLastError();   /* clear the (non-sticky) allocation error; same result, slower */
+                heap_buf.resize(kChunk);
+                buf = heap_buf.data();
+            }
+        }
+
+        if (!cagra_pwrite_all(fd, head.data(), head.size(), 0)) {
+            fprintf(stderr, "[cuvs_cagra_write_prefix] head pwrite failed errno=%d\n", errno);
+            return -1;
+        }
+
+        const char  *src   = reinterpret_cast<const char *>(graph.data_handle());
+        for (uint64_t off = 0; off < graph_bytes; off += kChunk) {
+            const size_t len = (size_t)std::min<uint64_t>(kChunk, graph_bytes - off);
+            RAFT_CUDA_TRY(cudaMemcpyAsync(buf, src + off, len, cudaMemcpyDefault, stream));
+            RAFT_CUDA_TRY(cudaStreamSynchronize(stream));
+            if (!cagra_pwrite_all(fd, buf, len, layout->graph_body_off + off)) {
+                fprintf(stderr, "[cuvs_cagra_write_prefix] graph pwrite failed errno=%d\n", errno);
+                return -1;
+            }
+        }
+
+        if (!cagra_pwrite_all(fd, middle.data(), middle.size(), layout->middle_off)) {
+            fprintf(stderr, "[cuvs_cagra_write_prefix] middle pwrite failed errno=%d\n", errno);
+            return -1;
+        }
+        if (fsync(fd) != 0) {
+            fprintf(stderr, "[cuvs_cagra_write_prefix] fsync failed errno=%d\n", errno);
+            return -1;
+        }
+        pr->fence_check();
+        return 0;
+    } catch (const std::exception &e) {
+        fprintf(stderr, "[cuvs_cagra_write_prefix] exception: %s\n", e.what());
+        if (pr) pr->poison();
+        return -1;
+    } catch (...) {
+        fprintf(stderr, "[cuvs_cagra_write_prefix] unknown exception\n");
+        if (pr) pr->poison();
+        return -1;
     }
 }
 

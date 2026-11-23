@@ -490,6 +490,16 @@ int cuvs_cagra_serialize(CuvsCagraIndex index, const char *path, int device_id)
 CuvsCagraIndex cuvs_cagra_deserialize(const char *path, int dim, int device_id)
 { (void)dim; (void)device_id; return (CuvsCagraIndex) shim_read(path); }
 
+/* Direct .cagra write: the shim has no cuVS file format, so there is nothing to lay out:
+ * the daemon sees -1 and keeps using cuvs_cagra_serialize. */
+int cuvs_cagra_file_layout(int64_t n_rows, int dim, int graph_degree, uint32_t metric,
+                           CuvsCagraFileLayout *out)
+{ (void)n_rows; (void)dim; (void)graph_degree; (void)metric; (void)out; return -1; }
+
+int cuvs_cagra_write_prefix(CuvsCagraIndex index, int fd, const CuvsCagraFileLayout *layout,
+                            int device_id)
+{ (void)index; (void)fd; (void)layout; (void)device_id; return -1; }
+
 int cuvs_ivfpq_build(const float *vecs, int64_t n_vecs, int dim, uint32_t metric,
                      uint32_t n_lists, uint32_t pq_bits, uint32_t pq_dim,
                      int device_id, CuvsIvfPqIndex *out)
