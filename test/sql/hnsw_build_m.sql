@@ -27,4 +27,42 @@ INSERT INTO hbm VALUES (9001, '[9,9,9,9,9,9,9,9]');
 SET enable_seqscan = off;
 SELECT id FROM hbm ORDER BY v <-> '[9,9,9,9,9,9,9,9]' LIMIT 1;
 RESET enable_seqscan;
+\pset format unaligned
+\pset tuples_only on
+-- ALTER stores the next heap-build setting; the live index still has its old M.
+ALTER INDEX hbm_m8 SET (m = 24);
+SELECT (pg_cuvs_hnsw_layer_counts('hbm_m8')).m = 8 AS before_reindex;
+REINDEX INDEX hbm_m8;
+SELECT (pg_cuvs_hnsw_layer_counts('hbm_m8')).m = 24 AS after_reindex;
+
+-- Reuse the source's actual graph degree when m is omitted; an explicit m
+-- (including 32, the heap default) has to match the converted graph.
+CREATE INDEX hbm_c32 ON hbm USING cagra (v vector_l2_ops) WITH (graph_degree = 32);
+CREATE INDEX hbm_c80 ON hbm USING cagra (v vector_l2_ops)
+    WITH (graph_degree = 80, intermediate_graph_degree = 128);
+CREATE INDEX hbm_source ON hbm USING pg_cuvs_hnsw (v vector_l2_ops) WITH (source = 'hbm_c32');
+CREATE INDEX hbm_source_match ON hbm USING pg_cuvs_hnsw (v vector_l2_ops)
+    WITH (source = 'hbm_c32', m = 16, mode = 'hnsw');
+CREATE INDEX hbm_source_cap ON hbm USING pg_cuvs_hnsw (v vector_l2_ops)
+    WITH (source = 'hbm_c80', m = 32);
+CREATE INDEX hbm_source_legacy ON hbm USING pg_cuvs_hnsw (v vector_l2_ops)
+    WITH (source = 'hbm_c32', m = 16, mode = 'hnswlib');
+SELECT bool_and((pg_cuvs_hnsw_layer_counts(idx)).m = m) AS source_m_matches
+FROM (VALUES ('hbm_source'::regclass, 16), ('hbm_source_match', 16),
+             ('hbm_source_cap', 32), ('hbm_source_legacy', 16)) AS expected(idx, m);
+
+\set VERBOSITY terse
+CREATE INDEX hbm_bad_default ON hbm USING pg_cuvs_hnsw (v vector_l2_ops)
+    WITH (source = 'hbm_c32', m = 32);
+CREATE INDEX hbm_bad_cap ON hbm USING pg_cuvs_hnsw (v vector_l2_ops)
+    WITH (source = 'hbm_c80', m = 33);
+CREATE INDEX hbm_bad_legacy ON hbm USING pg_cuvs_hnsw (v vector_l2_ops)
+    WITH (source = 'hbm_c32', m = 32, mode = 'hnswlib');
+ALTER INDEX hbm_source SET (m = 32);
+REINDEX INDEX hbm_source;
+\set VERBOSITY default
+SELECT (pg_cuvs_hnsw_layer_counts('hbm_source')).m = 16 AS after_failed_reindex;
+ALTER INDEX hbm_source RESET (m);
+REINDEX INDEX hbm_source;
+SELECT (pg_cuvs_hnsw_layer_counts('hbm_source')).m = 16 AS after_reset;
 DROP TABLE hbm, hbm_empty;
