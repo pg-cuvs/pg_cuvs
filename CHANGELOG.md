@@ -105,6 +105,11 @@ exists for 0.9.0.
   Not changed: the concurrent build and `REINDEX ... CONCURRENTLY` of a `pg_cuvs_hnsw` index with `source = ...`
   still ask for `AccessExclusiveLock` on the index while they convert, so the table's reads and writes wait for
   them, as they did before.
+- A `pg_cuvs_hnsw` index built from the heap (without `source`) now follows its `m` reloption: the GPU graph is
+  built with degree 2 × `m` and the metapage records `m`, which pgvector's inserts read. Before, every heap build used
+  degree 64 (M 32) and `m` was ignored, so `m = 16` in the catalog described an index with M 32. Without `m` the build
+  is unchanged (the default is now shown as 32). An index that set `m` gets that `m` the next time it is built, by
+  `REINDEX`, a restore or a table rewrite. With `source`, `m` is still informational.
 - `cuvs.delta_search = 'cpu'` returned every row of a pending `.delta` twice, pushing
   correct rows out of the top k: the daemon merged its GPU delta cache whatever the mode
   was and the backend merged `.delta` again. The SEARCH request now carries the mode, and

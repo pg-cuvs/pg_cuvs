@@ -511,7 +511,7 @@ cagra/ivfpq") rather than silently failing.
 |-----------|------|---------|--------|-------|
 | `source` | string | `` | a `cagra` index name on the same table | empty = private direct HNSW file build from the heap (op23), without a persistent CAGRA index |
 | `mode` | string | `nsw` | `nsw`, `hnswlib`, `hnsw`, `hnswlib_file` | `nsw` and `hnswlib` are recommended. With `source`, `nsw` and `hnsw` give the same graph: level 0 from the CAGRA graph and upper layers built by the daemon on the host. Since 0.9.3 this path checks the pgvector version as the heap build does (outside the supported range is an error, not a warning) |
-| `m` | int | `16` | 2–100 | **informational** — the CAGRA graph degree drives the HNSW layout, not `m` |
+| `m` | int | `32` | 2–100 | Heap build (no `source`): the HNSW M; the GPU graph is built with degree 2 × `m`, and the metapage records `m`, which later inserts use. With `source`: informational, the CAGRA graph degree decides (M = min(graph degree, 64) / 2). The default 32 is the degree 64 every heap build used before `m` was read; the default is still being decided from measurements |
 | `ef_construction` | int | `64` | 4–1000 | Direct heap build: construction effort; source reuse: informational |
 | `build_algo` | enum | `auto` | `auto`, `ivf_pq`, `nn_descent`, `ace` | Direct heap build only; cannot be combined with explicit `source` |
 

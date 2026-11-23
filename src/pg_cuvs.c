@@ -2970,7 +2970,7 @@ cuvs_hnsw_budget_error(uint32_t build_algo, const CuvsHnswBudgetSnapshot *budget
  * here, so it always precedes the scan or the build op. */
 static CuvsHnswPrespoolAction
 cuvs_hnsw_preflight(double rows, uint32_t dim, uint32_t hierarchy, uint32_t build_algo,
-                    uint32_t ef_construction, uint64_t host_cap, bool may_reject,
+                    uint32_t ef_construction, uint32_t graph_degree, uint64_t host_cap, bool may_reject,
                     const char *when)
 {
     CuvsHnswPreflightRequest request = {0};
@@ -2982,8 +2982,8 @@ cuvs_hnsw_preflight(double rows, uint32_t dim, uint32_t hierarchy, uint32_t buil
     request.build_algo = build_algo;
     request.ef_construction = ef_construction;
     request.dim = dim;
-    request.graph_degree = 64;
-    request.intermediate_degree = 128;
+    request.graph_degree = graph_degree;
+    request.intermediate_degree = 2 * graph_degree;
     request.after_scan = may_reject ? 0 : 1;
     request.n_estimate = cuvs_prespool_rows(rows);
     request.host_budget = host_cap;
@@ -3028,7 +3028,7 @@ cuvs_hnsw_preflight(double rows, uint32_t dim, uint32_t hierarchy, uint32_t buil
 void
 cuvs_build_hnsw_from_heap(Relation heapRel, Relation indexRel, IndexInfo *indexInfo,
                           const char *mode, uint32_t build_algo,
-                          uint32_t ef_construction, CuvsHnswBuildResult *out)
+                          uint32_t ef_construction, uint32_t m, CuvsHnswBuildResult *out)
 {
     CuvsHnswSpool *spool = palloc0(sizeof(*spool));
     Form_pg_attribute attr = TupleDescAttr(RelationGetDescr(indexRel), 0);
@@ -3076,7 +3076,7 @@ cuvs_build_hnsw_from_heap(Relation heapRel, Relation indexRel, IndexInfo *indexI
         bool transition_sent;
         snprintf(when, sizeof(when), "before the heap scan from reltuples=%.6g", stats_rows);
         prespool = cuvs_hnsw_preflight(stats_rows, spool->dim, hierarchy, build_algo,
-                                       ef_construction, cap, true, when);
+                                       ef_construction, 2 * m, cap, true, when);
         transition_sent = prespool == CUVS_HNSW_PRESPOOL_NOTICE_OVERFLOW;
         spool->input_hash = pg_cryptohash_create(PG_SHA256);
         if (!spool->input_hash || pg_cryptohash_init(spool->input_hash) < 0)
@@ -3113,13 +3113,13 @@ cuvs_build_hnsw_from_heap(Relation heapRel, Relation indexRel, IndexInfo *indexI
                          cuvs_hnsw_after_scan_reason(stats_rows),
                          (unsigned long long)spool->n);
                 transition_sent = cuvs_hnsw_preflight((double)spool->n, spool->dim, hierarchy,
-                    build_algo, ef_construction, cap, false, when)
+                    build_algo, ef_construction, 2 * m, cap, false, when)
                     == CUVS_HNSW_PRESPOOL_NOTICE_OVERFLOW;
             }
             /* K3: hash the spool while the daemon builds; join after the reply. */
             rc = cuvs_ipc_build_hnsw_file_idle(cuvs_socket_path,
                 FileGetRawDesc(spool->vectors), spool->n, spool->dim, spool->metric,
-                64, 128, hierarchy, cap,
+                2 * m, 4 * m, hierarchy, cap,	/* HNSW M = m: level 0 holds 2 * m neighbours, as pgvector's */
                 build_algo, ef_construction, &out->policy, &budget, &out->ace, &out->nn,
                 &out->hnsw_fd, error, sizeof(error), cuvs_hnsw_digest_step, &digest);
             /* The digest LOG also covers failed builds (daemon error reply,

@@ -104,7 +104,9 @@ static uint32_t cagra_index_metric(Oid index_oid);
 #define PGV_HNSW_MAGIC          0xA953A953u
 #define PGV_HNSW_VERSION        1u
 #define PGV_HNSW_PAGE_ID        0xFF90u
-#define CUVS_HNSW_BUILD_M       32
+/* The m of a heap build that does not set it: the degree 64 (M 32) every heap build used before m was read. A
+ * provisional default, kept until the default is settled from measurements. */
+#define CUVS_HNSW_DEFAULT_M     32
 #define CUVS_HNSW_BUILD_EF      128
 
 /* Byte size of the 13-field hnswlib binary header (fixed across versions):
@@ -3519,7 +3521,7 @@ hnsw_validate_build_target(Relation indexRel,
 
 static void
 hnsw_import_empty_build_result(Relation indexRel,
-                               const CuvsHnswBuildResult *build)
+                               const CuvsHnswBuildResult *build, uint16_t m)
 {
     volatile HnswDiskImportState state;
     bool skip_wal;
@@ -3537,7 +3539,7 @@ hnsw_import_empty_build_result(Relation indexRel,
             ereport(ERROR,
                     (errmsg("pg_cuvs: empty HNSW build returned files or a nonzero count")));
         if (!hnsw_init_empty_pages(metapage, first_data_page, build->dim,
-                                   CUVS_HNSW_BUILD_M, CUVS_HNSW_BUILD_EF))
+                                   m, CUVS_HNSW_BUILD_EF))
             ereport(ERROR, (errmsg("pg_cuvs: cannot initialize empty HNSW pages")));
 
         {
@@ -4584,8 +4586,8 @@ cuvs_hnsw_init_reloptions(void)
                          "HNSW route: auto=tiny/resident IVF-PQ, explicit ivf_pq, nn_descent or ace; estimates are not memory upper bounds",
                          "auto", cuvs_hnsw_validate_build_algo, AccessExclusiveLock);
     add_int_reloption(cuvs_hnsw_relopt_kind, "m",
-                      "pgvector HNSW M; informational (graph degree drives layout)",
-                      16, 2, 100, AccessExclusiveLock);
+                      "HNSW M of a heap build: the GPU graph degree is 2 * m; with source, the CAGRA graph degree decides",
+                      CUVS_HNSW_DEFAULT_M, 2, 100, AccessExclusiveLock);
     add_int_reloption(cuvs_hnsw_relopt_kind, "ef_construction",
                       "Construction effort: default 64 preserves route defaults; changes intermediate degree / ACE effort",
                       64, 4, 1000, AccessExclusiveLock);
@@ -4775,6 +4777,7 @@ cuvs_hnsw_ambuild(Relation heapRel, Relation indexRel, IndexInfo *indexInfo)
     const char *algorithm = (opts && opts->build_algo_offset)
         ? (const char *)opts + opts->build_algo_offset : "auto";
     uint32_t requested_ef = opts ? opts->ef_construction : 64;
+    uint32_t requested_m = opts ? (uint32_t) opts->m : CUVS_HNSW_DEFAULT_M;
     cuvs_hnsw_validate_build_algo(algorithm);
     uint32_t build_algo = cuvs_hnsw_algo_from_name(algorithm);
     if (source_name[0] && build_algo != CUVS_HNSW_ALGO_AUTO)
@@ -4808,22 +4811,22 @@ cuvs_hnsw_ambuild(Relation heapRel, Relation indexRel, IndexInfo *indexInfo)
     {
         volatile CuvsHnswBuildResult build;
 
-        /* The helper uses graph degree 64, which serializes HNSW M=32. */
+        /* The daemon builds the graph with degree 2 * m, which serializes HNSW M = m. */
         check_hnsw_page_fit(precheck_dim, precheck_bytes_per_dim,
-                            CUVS_HNSW_BUILD_M, safe_maxlevel);
+                            (int) requested_m, safe_maxlevel);
         memset((void *)&build, 0, sizeof(build));
         ((CuvsHnswBuildResult *)&build)->hnsw_fd = -1;
         ((CuvsHnswBuildResult *)&build)->tids_fd = -1;
         PG_TRY();
         {
             CuvsHnswBuildResult *b = (CuvsHnswBuildResult *)&build;
-            cuvs_build_hnsw_from_heap(heapRel, indexRel, indexInfo, mode, build_algo, requested_ef, b);
+            cuvs_build_hnsw_from_heap(heapRel, indexRel, indexInfo, mode, build_algo, requested_ef, requested_m, b);
             result->heap_tuples = b->reltuples;
             result->index_tuples = (double)b->n_vecs;
             if (b->n_vecs > 0)
                 hnsw_import_build_result(indexRel, b, false, true);	/* the graph has upper layers, so not the level-0-only packing */
             else
-                hnsw_import_empty_build_result(indexRel, b);
+                hnsw_import_empty_build_result(indexRel, b, (uint16_t) requested_m);
         }
         PG_FINALLY();
         {
