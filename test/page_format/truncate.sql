@@ -39,3 +39,24 @@ BEGIN
         RAISE EXCEPTION 'committed TRUNCATE reused the old index state';
     END IF;
 END $$;
+
+BEGIN;
+CREATE TABLE page_new (id int, v vector);
+INSERT INTO page_new VALUES (1, '[1,0,0]');
+CREATE INDEX page_new_idx ON page_new USING cagra (v vector_l2_ops);
+CREATE TEMP TABLE original_new_layout ON COMMIT DROP AS
+    SELECT pg_relation_filenode('page_new') AS filenode,
+           substr(get_raw_page('page_new_idx', 0), 49, 8) AS nonce;
+TRUNCATE page_new;
+INSERT INTO page_new VALUES (2, '[3,4]');
+DO $$
+BEGIN
+    IF pg_relation_filenode('page_new') <> (SELECT filenode FROM original_new_layout) THEN
+        RAISE EXCEPTION 'same-transaction fixture did not take the in-place TRUNCATE path';
+    END IF;
+    IF substr(get_raw_page('page_new_idx', 0), 49, 8) = (SELECT nonce FROM original_new_layout)
+       OR ARRAY(SELECT id FROM page_new ORDER BY v <-> '[3,4]' LIMIT 2) <> ARRAY[2] THEN
+        RAISE EXCEPTION 'in-place TRUNCATE reused the old index state';
+    END IF;
+END $$;
+COMMIT;

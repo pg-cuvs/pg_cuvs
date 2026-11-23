@@ -20,6 +20,8 @@ MUTATIONS = {
     "wal-lower": ("    set_lower(page, pending->count * sizeof(*items));", ""),
     "unknown": ("    meta.major = CUVS_CAGRA_PAGE_MAJOR;",
                 "    meta.major = CUVS_CAGRA_PAGE_MAJOR + 1;"),
+    "flags": ("    meta.major = CUVS_CAGRA_PAGE_MAJOR;",
+              "    meta.major = CUVS_CAGRA_PAGE_MAJOR;\n    meta.flags = 1;"),
 }
 
 
@@ -124,8 +126,24 @@ def wal(cluster, *, mutant=None):
     try:
         cluster.sql("postgres", "extensions", "-c", "CREATE EXTENSION vector; CREATE EXTENSION pg_cuvs;")
         cluster.file("postgres", "wal_prepare")
+        cluster.sql("postgres", "wal-path", "-At", "-c", """
+            SELECT pg_relation_filepath('page_durable_idx'), current_setting('block_size');
+        """)
+        row = (cluster.logs / f"{cluster.data.parent.name}-wal-path.log").read_text().splitlines()[-1]
+        filename, block_size = row.split("|")
         cluster.stop("immediate")
+        if mutant is None:
+            # The original pending page was checkpointed before INSERT. Verify
+            # that the new TID was still absent on disk before starting redo.
+            with (cluster.data / filename).open("rb") as relation:
+                relation.seek(int(block_size) + 24)
+                before_redo = relation.read(6)
+            if before_redo != b"\0" * 6:
+                raise RuntimeError(f"checkpoint page already contains a pending TID: {before_redo.hex()}")
+            print("wal: pending TID absent from the relation file before redo", flush=True)
         cluster.start("after-crash")
+        # These mutations change the image before WAL is written. The
+        # unmutated run above independently verifies the replay boundary.
         expect = ["pending TID was lost after WAL replay"] if mutant else None
         cluster.file("postgres", "wal_verify", expect=expect)
         print(f"{mutant or 'wal'}: {'mutation detected after WAL replay' if mutant else 'PASS'}", flush=True)
@@ -206,19 +224,19 @@ def run(work, logs):
         build(source_on, 1, logs / f"build-{mutation}.log")
         shutil.copy2(source_on / "pg_cuvs.so", lib)
         fixture = Cluster(work / mutation, bindir, logs)
-        if mutation == "unknown":
+        if mutation in ("unknown", "flags"):
             with fixture.daemon(source_on / "pg_cuvs_server", mutation):
                 fixture.start()
                 try:
                     fixture.file("postgres", "alpha2_unknown")
                     if "unrecognized CAGRA metapage" not in (
-                            logs / "unknown-alpha2_unknown.log").read_text():
+                            logs / f"{mutation}-alpha2_unknown.log").read_text():
                         raise RuntimeError("unknown metapage fallback was not observed")
                     fixture.sql("postgres", "vacuum", "-v", "VERBOSITY=verbose",
                                 "-c", "VACUUM (INDEX_CLEANUP ON) unknown_layout;",
                                 expect=["XX001", "invalid CAGRA index page at block 0", "HINT:",
-                                        "REINDEX the index"])
-                    print("Unknown format heap fallback and write/VACUUM refusal: PASS", flush=True)
+                                        "REINDEX INDEX unknown_layout_idx"])
+                    print(f"{mutation}: heap fallback and write/VACUUM refusal: PASS", flush=True)
                 finally:
                     fixture.stop()
         else:

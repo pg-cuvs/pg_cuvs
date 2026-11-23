@@ -36,6 +36,7 @@ cuvs_cagra_require_legacy(Relation index)
 #include "storage/bufpage.h"
 #include "miscadmin.h"
 #include "storage/lmgr.h"
+#include "utils/builtins.h"
 #include "utils/guc.h"
 
 enum CuvsCagraPageKind
@@ -112,7 +113,8 @@ bad_page(Relation index, BlockNumber block)
     ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
                     errmsg("invalid CAGRA index page at block %u of \"%s\"",
                            block, RelationGetRelationName(index)),
-                    errhint("REINDEX the index using a build that supports the page format.")));
+                    errhint("REINDEX INDEX %s using a build that supports the page format.",
+                            quote_identifier(RelationGetRelationName(index)))));
 }
 
 static void
@@ -132,7 +134,7 @@ page_meta(Page page)
         return NULL;
     meta = (CuvsCagraMeta *) PageGetContents(page);
     if (meta->magic != CUVS_CAGRA_PAGE_MAGIC || meta->major != CUVS_CAGRA_PAGE_MAJOR ||
-        meta->minor != 0 || meta->index_nonce == 0 || meta->base_nonce == 0 ||
+        meta->minor != 0 || meta->flags != 0 || meta->index_nonce == 0 || meta->base_nonce == 0 ||
         meta->n_extents > CUVS_CAGRA_PAGE_DIR ||
         meta->folded > meta->n_slots || meta->base_slots != meta->n_slots - meta->folded ||
         meta->n_slots > (uint64) meta->n_extents * CUVS_CAGRA_PAGE_EXTENT * CUVS_CAGRA_TIDS_PER_PAGE ||

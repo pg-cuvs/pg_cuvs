@@ -5838,7 +5838,7 @@ cuvs_amvacuumcleanup(IndexVacuumInfo *info, IndexBulkDeleteResult *stats)
     }
 
 
-    if (!cuvs_vacuum_cleanup_considers_compact(false,
+    if (!cuvs_vacuum_cleanup_considers_compact(info->analyze_only,
                                                cuvs_socket_path && cuvs_socket_path[0] != '\0'))
         return stats;
     if (!cuvs_index_is_stale(index_oid))

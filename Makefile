@@ -362,6 +362,7 @@ test-source-checks: test-hnsw-auto-overflow test-hnsw-explicit-route
 	    echo "== $$c"; python3 -I test/unit/$$c.py "$$out/$$c" || rc=1; \
 	done; \
 	exit $$rc
+	python3 -I -B test/unit/check_cagra_relcache_source.py
 
 # PostgreSQL 16, pgvector and the CPU shim. Uses private builds and clusters.
 .PHONY: test-page-format
