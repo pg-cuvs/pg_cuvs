@@ -163,7 +163,9 @@ int cuvs_ipc_build_hnsw_file_idle(const char *socket_path, int vectors_fd,
 #define CUVS_OP_SEARCH_PAGES          46
 #define CUVS_OP_SEARCH_PAGES_BATCH    47
 #define CUVS_OP_SEARCH_PAGES_FILTERED 48
+#define CUVS_OP_MARK_PAGES_EMPTY      49
 #define CUVS_PAGE_SLOT_INVALID UINT64_MAX
+#define CUVS_PAGE_BUILD_DEFER_LEGACY 1U
 
 typedef struct CuvsPageBuildRequest
 {
@@ -173,6 +175,9 @@ typedef struct CuvsPageBuildRequest
     uint64_t build_xid;
     uint64_t system_identifier;
 } CuvsPageBuildRequest;
+
+void cuvs_ipc_mark_pages_empty(const char *socket_path, uint32_t db_oid,
+    uint32_t index_oid, const char *index_dir, const CuvsPageBuildRequest *request);
 
 /* Both requests use the unchanged v6 envelope. This unit serves the base
  * range only. The resume fields must be zero until continuation is enabled. */

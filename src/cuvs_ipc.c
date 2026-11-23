@@ -770,6 +770,28 @@ done:
     return status;
 }
 
+void
+cuvs_ipc_mark_pages_empty(const char *socket_path, uint32_t db_oid, uint32_t index_oid,
+                          const char *index_dir, const CuvsPageBuildRequest *request)
+{
+    CuvsCmdFrame cmd = {.op = CUVS_OP_MARK_PAGES_EMPTY, .db_oid = db_oid, .index_oid = index_oid};
+    CuvsReplyHeader reply;
+    char dir[256] = "";
+    int sock;
+
+    if (!socket_path || !socket_path[0])
+        return;
+    sock = uds_connect_ex(socket_path, 1);
+    if (sock < 0)
+        return;
+    if (index_dir)
+        strncpy(dir, index_dir, sizeof(dir) - 1);
+    if (send_cmd(sock, &cmd) == 0 && send_all(sock, request, sizeof(*request)) == 0 &&
+        cuvs_fd_send(sock, -1, dir, sizeof(dir)) == 0)
+        (void) recv_all(sock, &reply, sizeof(reply));
+    close(sock);
+}
+
 /* ----------------------------------------------------------------
  * Public API: cuvs_ipc_search
  * ---------------------------------------------------------------- */

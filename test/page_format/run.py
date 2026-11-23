@@ -1,6 +1,7 @@
 """Run the CAGRA page-format CPU matrix in disposable PG16 clusters."""
 
 from contextlib import contextmanager
+import hashlib
 import os
 from pathlib import Path
 import shutil
@@ -228,6 +229,73 @@ def legacy_search(cluster, daemon, label):
             cluster.stop()
 
 
+def check_deferral(cluster, daemon, library, enabled, disabled, *, mutant=False):
+    shutil.copy2(disabled, library)
+    with cluster.daemon(daemon, cluster.data.parent.name):
+        cluster.start("g13-off")
+        try:
+            cluster.file("postgres", "g13_setup")
+            legacy_files = sorted(cluster.indexdir.glob("*.cagra")) + sorted(cluster.indexdir.glob("*.tids"))
+            if len(legacy_files) != 6:
+                raise RuntimeError("expected three legacy graphs and TID files")
+            before = {path: hashlib.sha256(path.read_bytes()).digest() for path in legacy_files}
+        finally:
+            cluster.stop()
+        shutil.copy2(enabled, library)
+        cluster.start("g13-on")
+        try:
+            cluster.file("postgres", "g13_rollback", expect=[
+                "rollback displaced the dirty legacy graph",
+            ] if mutant else None)
+            if mutant:
+                print("G13: rollback detected the discarded resident graph", flush=True)
+                return
+            cluster.sql("postgres", "g13-small", "-c", f"""
+                ALTER INDEX page_to_one_idx SET (index_dir = '{cluster.data.parent / 'custom'}');
+                REINDEX INDEX page_to_empty_idx;
+                REINDEX INDEX page_to_one_idx;
+                DO $$
+                BEGIN
+                    IF pg_relation_size('page_to_empty_idx') = 0 OR
+                       pg_relation_size('page_to_one_idx') = 0 THEN
+                        RAISE EXCEPTION 'small REINDEX did not use page storage';
+                    END IF;
+                END $$;
+            """)
+            if any(hashlib.sha256(path.read_bytes()).digest() != digest
+                   for path, digest in before.items()):
+                raise RuntimeError("REINDEX rewrote a legacy graph or TID file")
+            local = list(cluster.indexdir.glob("*/*/empty.xid"))
+            redirected = list(cluster.indexdir.glob("*/*/legacy.xid"))
+            custom = list((cluster.data.parent / "custom").glob("*/*/empty.xid"))
+            if any(len(paths) != 1 or not int(paths[0].read_text()) for paths in (local, redirected, custom)):
+                raise RuntimeError("missing marked xid for an empty build or its directory override")
+        finally:
+            cluster.stop()
+
+    label = "restart-deferred"
+    with cluster.daemon(daemon, label):
+        cluster.start(label)
+        try:
+            startup = (cluster.logs / f"daemon-{label}.log").read_text()
+            if "[startup] loaded 0 index(es)" not in startup:
+                raise RuntimeError("startup loaded an index marked for legacy deferral")
+            cluster.sql("postgres", "g13-explicit", "-c", """
+                SET enable_seqscan=off;
+                DO $$
+                BEGIN
+                    IF (SELECT id FROM page_dirty ORDER BY v <-> '[0,0,0,0,0,0,0,0]' LIMIT 1)
+                       IS DISTINCT FROM 0 OR pg_cuvs_last_search_k() IS NULL THEN
+                        RAISE EXCEPTION 'rollback legacy index could not explicitly reload';
+                    END IF;
+                END $$;
+            """)
+        finally:
+            cluster.stop()
+    print("G13: rollback EXTEND row, 0/1-row markers, deferral across restart and explicit v6 reload: PASS",
+          flush=True)
+
+
 def run(work, logs):
     paths = {key: Path(subprocess.check_output([PG_CONFIG, "--" + key], text=True).strip())
              for key in ("bindir", "pkglibdir", "sharedir")}
@@ -245,6 +313,9 @@ def run(work, logs):
     build(source_on, 1, logs / "build-on.log")
     build(source_on, 1, logs / "install.log", install=stage)
     build(source_off, 0, logs / "build-off.log")
+    enabled = work / "enabled.so"
+    disabled = source_off / "pg_cuvs.so"
+    shutil.copy2(lib, enabled)
     legacy_source = os.environ.get("PAGE_TEST_LEGACY_SOURCE")
     if legacy_source:
         source_base = work / "base"
@@ -278,6 +349,9 @@ def run(work, logs):
             finally:
                 cluster.stop()
 
+    check_deferral(Cluster(work / "g13", bindir, logs), source_on / "pg_cuvs_server",
+                   lib, enabled, disabled)
+
     wal(Cluster(work / "wal", bindir, logs))
     changed = source_on / "src/cuvs_cagra_pages.c"
     original = changed.read_text()
@@ -306,15 +380,38 @@ def run(work, logs):
         else:
             wal(fixture, mutant=mutation)
 
-    shutil.copy2(source_off / "pg_cuvs.so", lib)
+    shutil.copy2(disabled, lib)
     with cluster.daemon(source_off / "pg_cuvs_server", "off"):
         check_off(cluster)
+
+    # Mark the old entry absent after page BUILD. Preserve the real daemon
+    # binary for the mixed-version tests and isolate the mutant in its cluster.
+    server_source = source_off / "src/pg_cuvs_server.c"
+    server_text = server_source.read_text()
+    original = """        if (page_status == 0 && (page_build->flags & CUVS_PAGE_BUILD_DEFER_LEGACY))
+            ++g_page_deferral_epoch;"""
+    if server_text.count(original) != 1:
+        raise RuntimeError("non-unique legacy discard mutation anchor")
+    server_source.write_text(server_text.replace(original, original + """
+        if (page_status == 0)
+        {
+            IndexEntry *legacy = find_index(cmd->db_oid, cmd->index_oid);
+            if (legacy)
+                legacy->valid = 0;
+        }""", 1))
+    daemon = source_off / "pg_cuvs_server"
+    original_daemon = work / "unmutated-daemon"
+    shutil.copy2(daemon, original_daemon)
+    build(source_off, 0, logs / "build-discarded-legacy.log")
+    check_deferral(Cluster(work / "g13-mutant", bindir, logs), daemon,
+                   lib, enabled, disabled, mutant=True)
+    shutil.copy2(disabled, lib)
 
     if legacy_source:
         legacy_search(cluster, source_base / "pg_cuvs_server", "candidate_off")
         build(source_base, 0, logs / "install-base.log", install=stage)
         old_cluster = Cluster(work / "old", bindir, logs)
-        legacy_search(old_cluster, source_off / "pg_cuvs_server", "old_extension")
+        legacy_search(old_cluster, original_daemon, "old_extension")
         for log in logs.glob("daemon-*.log"):
             if "IPC protocol mismatch" in log.read_text():
                 raise RuntimeError(f"protocol mismatch reported in {log.name}")

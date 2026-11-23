@@ -3632,6 +3632,7 @@ cuvs_build_cagra_from_heap_impl(Relation heapRel, Relation indexRel, IndexInfo *
     if (page_format)
     {
         page_request.length = sizeof(page_request);
+        page_request.flags = CUVS_PAGE_BUILD_DEFER_LEGACY;
         page_request.index_nonce = cuvs_cagra_nonce();
         page_request.system_identifier = GetSystemIdentifier();
         shard_count = 1;
@@ -3845,9 +3846,17 @@ cuvs_build_cagra_from_heap_impl(Relation heapRel, Relation indexRel, IndexInfo *
 
 #ifdef CUVS_PAGE_FORMAT
         if (page_format)
+        {
+            if (bs.n_vecs < 2)
+            {
+                page_request.build_xid = U64FromFullTransactionId(GetTopFullTransactionId());
+                cuvs_ipc_mark_pages_empty(cuvs_socket_path, MyDatabaseId, build_index_oid,
+                                          cuvs_resolve_index_dir_rel(indexRel), &page_request);
+            }
             cuvs_cagra_init_pages(indexRel, MAIN_FORKNUM, page_request.index_nonce,
                                   graph_nonce, bs.dim > 0 ? bs.dim : Max(typmod, 0),
                                   bs.metric, bs.tids, bs.n_vecs);
+        }
 #endif
     }
     PG_FINALLY();
@@ -7013,6 +7022,35 @@ pg_cuvs_hw_profile(PG_FUNCTION_ARGS)
     return (Datum) 0;
 }
 
+static bool
+cuvs_relation_is_page_cagra(Relation index)
+{
+    return index->rd_rel->relam == get_am_oid("cagra", true) &&
+        cuvs_cagra_has_pages(index);
+}
+
+static bool
+cuvs_oid_is_page_cagra(Oid oid)
+{
+    Relation index = try_relation_open(oid, AccessShareLock);
+    bool page_format;
+
+    if (!index)
+        return false;
+    page_format = index->rd_rel->relkind == RELKIND_INDEX && cuvs_relation_is_page_cagra(index);
+    relation_close(index, AccessShareLock);
+    return page_format;
+}
+
+static void
+cuvs_require_legacy_operation(Relation index)
+{
+    if (cuvs_relation_is_page_cagra(index))
+        ereport(ERROR,
+                (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                 errmsg("this operation requires a legacy CAGRA index")));
+}
+
 PG_FUNCTION_INFO_V1(pg_cuvs_gpu_search_stats);
 Datum
 pg_cuvs_gpu_search_stats(PG_FUNCTION_ARGS)
@@ -7059,6 +7097,8 @@ pg_cuvs_gpu_search_stats(PG_FUNCTION_ARGS)
         char   *relname;
         double  avg_us;
 
+        if (cuvs_oid_is_page_cagra((Oid) s->index_oid))
+            continue;
         memset(nulls, 0, sizeof(nulls));
 
         values[0] = ObjectIdGetDatum((Oid) s->db_oid);
@@ -7479,6 +7519,7 @@ pg_cuvs_compact(PG_FUNCTION_ARGS)
                  errmsg("index %u does not exist", index_oid)));
 
     cuvs_require_index_owner(index_oid);
+    cuvs_require_legacy_operation(indexRel);
 
     rc = cuvs_ipc_compact(cuvs_socket_path,
                           (uint32_t) MyDatabaseId,
@@ -7822,19 +7863,19 @@ static Datum
 cuvs_manual_rel(FunctionCallInfo fcinfo, uint32 op)
 {
     Oid  relid = PG_GETARG_OID(0);
+    Relation target;
     char msg[CUVS_MANUAL_MSG_LEN];
     int  rc;
 
     cuvs_manual_check_index(relid);
+    target = index_open(relid, AccessShareLock);
+    cuvs_require_legacy_operation(target);
     rc = cuvs_ipc_manual(cuvs_socket_path, op, (uint32_t) MyDatabaseId,
                          (uint32_t) relid, msg, sizeof(msg));
     cuvs_report_build_notice(relid);
     if (rc != CUVS_STATUS_OK && (op == CUVS_OP_LOAD || op == CUVS_OP_PIN))
-    {
-        Relation target = index_open(relid, AccessShareLock);
         cuvs_report_admission(CUVS_ADMISSION_OBJ_LOAD, relid, target);
-        index_close(target, AccessShareLock);
-    }
+    index_close(target, AccessShareLock);
     return cuvs_manual_result(rc, msg);
 }
 
@@ -8104,6 +8145,8 @@ cuvs_status_emit(FunctionCallInfo fcinfo, uint32 op, const char *header,
             if (row_db == MyDatabaseId)
                 (void) cuvs_status_index_info(row_index, &qualname, &owns);
             if (!cuvs_status_row_visible(is_priv, row_db, MyDatabaseId, owns))
+                continue;
+            if (row_db == MyDatabaseId && cuvs_oid_is_page_cagra(row_index))
                 continue;
             nulls[0] = qualname == NULL;
             values[0] = qualname ? CStringGetTextDatum(qualname) : (Datum) 0;

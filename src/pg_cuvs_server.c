@@ -496,6 +496,21 @@ static size_t   g_max_vram_per_gpu[CUVS_MAX_GPUS];
  * ---------------------------------------------------------------- */
 static char   g_socket_path[256]  = "/tmp/.s.pg_cuvs.server";
 static char   g_index_dir[256]    = "/tmp/pg_cuvs_indexes";
+
+/* Acknowledged page builds publish the durable marker before advancing this
+ * counter under the registry lock. */
+static uint64_t g_page_deferral_epoch;
+
+static bool
+page_legacy_deferred(uint32_t db_oid, uint32_t index_oid)
+{
+    char path[512];
+    struct stat st;
+    int len = snprintf(path, sizeof(path), "%s/%u_%u", g_index_dir, db_oid, index_oid);
+
+    return len >= 0 && len < (int) sizeof(path) && stat(path, &st) == 0 &&
+        S_ISDIR(st.st_mode);
+}
 static size_t g_max_vram_bytes    = 0;   /* 0 = use default fraction; >0 = explicit --max-vram-mb */
 #ifdef PGCUVS_CPU_SHIM
 static uint32_t g_rmm_pool_mb     = 0;   /* CPU fixture has no GPU allocator */
@@ -697,6 +712,26 @@ warmup_dequeue(WarmupJob *out)
 static int  load_index(uint32_t db_oid, uint32_t index_oid, CuvsRequester rq);
 static void build_rev_tid_map(IndexEntry *e);  /* 3O: TID→item_id reverse map */
 
+/* Returns with g_index_mutex held. Recheck after a concurrent publication
+ * without performing a filesystem lookup under that lock. */
+static bool
+lock_warmup_registry(const WarmupJob *job)
+{
+    pthread_mutex_lock(&g_index_mutex);
+    while (!job->from_cache_miss)
+    {
+        uint64_t epoch = g_page_deferral_epoch;
+        bool deferred;
+
+        pthread_mutex_unlock(&g_index_mutex);
+        deferred = page_legacy_deferred(job->db_oid, job->index_oid);
+        pthread_mutex_lock(&g_index_mutex);
+        if (epoch == g_page_deferral_epoch)
+            return !deferred;
+    }
+    return true;
+}
+
 static void *
 warmup_worker_thread(void *arg)
 {
@@ -706,23 +741,22 @@ warmup_worker_thread(void *arg)
         WarmupJob job;
         if (warmup_dequeue(&job) != 0)
             break;
-
-        LOG_INFO("warmup: downloading %u/%u from GCS\n",
-                 job.db_oid, job.index_oid);
-
         /* Update cold entry state -> DOWNLOADING (under g_index_mutex). */
-        pthread_mutex_lock(&g_index_mutex);
+        bool allowed = lock_warmup_registry(&job);
         for (int i = 0; i < g_n_cold_indexes; i++)
         {
             ColdIndexEntry *ce = &g_cold_indexes[i];
             if (ce->valid && ce->db_oid == job.db_oid &&
                 ce->index_oid == job.index_oid)
             {
-                ce->warmup_state = WARMUP_DOWNLOADING;
+                ce->warmup_state = allowed ? WARMUP_DOWNLOADING : WARMUP_COLD;
                 break;
             }
         }
         pthread_mutex_unlock(&g_index_mutex);
+        if (!allowed)
+            continue;
+        LOG_INFO("warmup: downloading %u/%u from GCS\n", job.db_oid, job.index_oid);
 
         struct timespec t0, t1;
         clock_gettime(CLOCK_MONOTONIC, &t0);
@@ -752,7 +786,7 @@ warmup_worker_thread(void *arg)
         }
 
         /* Download succeeded — load into VRAM. */
-        pthread_mutex_lock(&g_index_mutex);
+        allowed = lock_warmup_registry(&job);
 
         /* Mark LOADING. */
         ColdIndexEntry *target_ce = NULL;
@@ -762,10 +796,16 @@ warmup_worker_thread(void *arg)
             if (ce->valid && ce->db_oid == job.db_oid &&
                 ce->index_oid == job.index_oid)
             {
-                ce->warmup_state = WARMUP_LOADING;
+                ce->warmup_state = allowed ? WARMUP_LOADING : WARMUP_COLD;
                 target_ce = ce;
                 break;
             }
+        }
+
+        if (!allowed)
+        {
+            pthread_mutex_unlock(&g_index_mutex);
+            continue;
         }
 
         if (load_index(job.db_oid, job.index_oid, CUVS_RQ_LOAD_WARMUP) != 0)
@@ -2745,7 +2785,8 @@ startup_load_ordered(CuvsLoadKey *keys, int n, const CuvsUsageStat *st,
     for (int i = 0; i < n; i++)
     {
         const CuvsLoadKey *k = &keys[perm[i]];
-        if (find_index(k->db_oid, k->index_oid))
+        if (find_index(k->db_oid, k->index_oid) ||
+            page_legacy_deferred(k->db_oid, k->index_oid))
             continue;
         if (load_index(k->db_oid, k->index_oid, CUVS_RQ_LOAD_STARTUP) == 0)
             (*loaded)++;
@@ -2864,7 +2905,8 @@ startup_load_indexes(void)
     while ((ent = readdir(dir)) != NULL)
     {
         uint32_t db_oid, index_oid;
-        if (sscanf(ent->d_name, "%u_%u.relfilenode", &db_oid, &index_oid) != 2)
+        if (sscanf(ent->d_name, "%u_%u.relfilenode", &db_oid, &index_oid) != 2 ||
+            page_legacy_deferred(db_oid, index_oid))
             continue;
 
         int already_loaded = 0;
@@ -7225,50 +7267,91 @@ sync_build_path(const char *path, int flags)
     return result;
 }
 
-/* An unregistered page-format graph is identified by both nonces. Never
- * write the legacy OID-keyed files here: the catalog update can roll back. */
+static int
+page_incarnation_dirs(const CuvsCmdFrame *cmd, const CuvsPageBuildRequest *request,
+                      const char *root, char index_path[512], char incarnation[512])
+{
+    if (snprintf(index_path, 512, "%s/%u_%u", root,
+                 cmd->db_oid, cmd->index_oid) >= 512 ||
+        snprintf(incarnation, 512, "%s/%016llx", index_path,
+                 (unsigned long long) request->index_nonce) >= 512)
+        return -1;
+    if ((mkdir(root, 0700) != 0 && errno != EEXIST) ||
+        (mkdir(index_path, 0700) != 0 && errno != EEXIST) ||
+        mkdir(incarnation, 0700) != 0)
+        return -1;
+    return 0;
+}
+
+static int
+write_page_build_xid(const char *path, const char *name, uint64_t xid)
+{
+    char file[512];
+    FILE *marker;
+    int failed;
+
+    if (snprintf(file, sizeof(file), "%s/%s", path, name) >= (int) sizeof(file))
+        return -1;
+    marker = fopen(file, "wx");
+    if (!marker)
+        return -1;
+    failed = fprintf(marker, "%llu\n", (unsigned long long) xid) < 0 ||
+        fflush(marker) != 0 || fsync(fileno(marker)) != 0;
+    if (fclose(marker) != 0)
+        failed = 1;
+    return failed ? -1 : 0;
+}
+
+static int
+sync_page_incarnation(const char *root, const char *index_path, const char *incarnation)
+{
+    return (sync_build_path(incarnation, O_DIRECTORY) != 0 ||
+            sync_build_path(index_path, O_DIRECTORY) != 0 ||
+            sync_build_path(root, O_DIRECTORY) != 0) ? -1 : 0;
+}
+
+/* A pathname in the daemon's discovery root fences off automatic legacy
+ * loads even when the build used a per-index directory. Keep the xid under
+ * its own incarnation so a later reconciliation can distinguish rollbacks. */
+static int
+persist_page_deferral(const CuvsCmdFrame *cmd, const CuvsPageBuildRequest *request,
+                      const char *root)
+{
+    char index_path[512], incarnation[512];
+
+    if (!(request->flags & CUVS_PAGE_BUILD_DEFER_LEGACY) || strcmp(root, g_index_dir) == 0)
+        return 0;
+    if (page_incarnation_dirs(cmd, request, g_index_dir, index_path, incarnation) != 0 ||
+        write_page_build_xid(incarnation, "legacy.xid", request->build_xid) != 0)
+        return -1;
+    return sync_page_incarnation(g_index_dir, index_path, incarnation);
+}
+
+/* An unregistered page-format graph is identified by both nonces. */
 static int
 persist_page_build(const CuvsCmdFrame *cmd, const CuvsPageBuildRequest *request,
                    const char *index_dir, CuvsCagraIndex handle, int gpu,
                    uint64_t *graph_nonce, CuvsHnswIndex *cpu_hnsw)
 {
     const char *root = index_dir[0] ? index_dir : g_index_dir;
-    char index_path[512], generation[512], graph[512], filename[512];
+    char index_path[512], incarnation[512], graph[512], filename[512];
     uint64_t nonce;
-    FILE *marker;
-    int result;
 
     do {
         if (shm_key_random((unsigned char *) &nonce, sizeof(nonce)) != 0)
             return -1;
     } while (nonce == 0);
-    if (snprintf(index_path, sizeof(index_path), "%s/%u_%u", root,
-                 cmd->db_oid, cmd->index_oid) >= (int) sizeof(index_path) ||
-        snprintf(generation, sizeof(generation), "%s/%016llx", index_path,
-                 (unsigned long long) request->index_nonce) >= (int) sizeof(generation) ||
-        snprintf(graph, sizeof(graph), "%s/%016llx", generation,
+    if (page_incarnation_dirs(cmd, request, root, index_path, incarnation) != 0 ||
+        snprintf(graph, sizeof(graph), "%s/%016llx", incarnation,
                  (unsigned long long) nonce) >= (int) sizeof(graph) ||
-        snprintf(filename, sizeof(filename), "%s/index.cagra", graph) >= (int) sizeof(filename))
-        return -1;
-    if ((mkdir(root, 0700) != 0 && errno != EEXIST) ||
-        (mkdir(index_path, 0700) != 0 && errno != EEXIST) ||
-        mkdir(generation, 0700) != 0 || mkdir(graph, 0700) != 0)
-        return -1;
-    if (cuvs_cagra_serialize(handle, filename, gpu) != 0 ||
+        snprintf(filename, sizeof(filename), "%s/index.cagra", graph) >= (int) sizeof(filename) ||
+        mkdir(graph, 0700) != 0 ||
+        cuvs_cagra_serialize(handle, filename, gpu) != 0 ||
         sync_build_path(filename, 0) != 0 ||
-        snprintf(filename, sizeof(filename), "%s/build.xid", graph) >= (int) sizeof(filename))
-        return -1;
-    marker = fopen(filename, "wx");
-    if (!marker)
-        return -1;
-    result = fprintf(marker, "%llu\n", (unsigned long long) request->build_xid) < 0 ||
-             fflush(marker) != 0 || fsync(fileno(marker)) != 0;
-    if (fclose(marker) != 0)
-        result = -1;
-    if (result || sync_build_path(graph, O_DIRECTORY) != 0 ||
-        sync_build_path(generation, O_DIRECTORY) != 0 ||
-        sync_build_path(index_path, O_DIRECTORY) != 0 ||
-        sync_build_path(root, O_DIRECTORY) != 0)
+        write_page_build_xid(graph, "build.xid", request->build_xid) != 0 ||
+        sync_build_path(graph, O_DIRECTORY) != 0 ||
+        sync_page_incarnation(root, index_path, incarnation) != 0 ||
+        persist_page_deferral(cmd, request, root) != 0)
         return -1;
     if (cmd->use_cpu_hnsw &&
         snprintf(filename, sizeof(filename), "%s/index.hnsw", graph) < (int) sizeof(filename) &&
@@ -7276,6 +7359,51 @@ persist_page_build(const CuvsCmdFrame *cmd, const CuvsPageBuildRequest *request,
         *cpu_hnsw = cuvs_hnsw_deserialize(filename, (int) cmd->dim, cmd->metric, gpu);
     *graph_nonce = nonce;
     return 0;
+}
+
+static bool
+receive_page_build(int client_fd, CuvsPageBuildRequest *request)
+{
+    return recv_all(client_fd, &request->length, sizeof(request->length)) == 0 &&
+        request->length == sizeof(*request) &&
+        recv_all(client_fd, (char *) request + sizeof(request->length),
+                 sizeof(*request) - sizeof(request->length)) == 0 &&
+        !(request->flags & ~CUVS_PAGE_BUILD_DEFER_LEGACY) &&
+        request->index_nonce && request->build_xid && request->system_identifier;
+}
+
+static void
+handle_mark_pages_empty(int client_fd, const CuvsCmdFrame *cmd)
+{
+    CuvsPageBuildRequest request;
+    char index_dir[256] = "";
+    char index_path[512], incarnation[512];
+    const char *root;
+    int fd = -1;
+    CuvsReplyHeader reply = {.status = CUVS_STATUS_PERSIST_FAILED};
+
+    if (!receive_page_build(client_fd, &request) ||
+        !(request.flags & CUVS_PAGE_BUILD_DEFER_LEGACY) ||
+        cuvs_fd_recv(client_fd, index_dir, sizeof(index_dir), &fd) < 0 || fd >= 0)
+    {
+        if (fd >= 0)
+            close(fd);
+        send_error(client_fd, "invalid empty page-format BUILD notification");
+        return;
+    }
+    index_dir[sizeof(index_dir) - 1] = '\0';
+    root = index_dir[0] ? index_dir : g_index_dir;
+    if (page_incarnation_dirs(cmd, &request, root, index_path, incarnation) == 0 &&
+        write_page_build_xid(incarnation, "empty.xid", request.build_xid) == 0 &&
+        sync_page_incarnation(root, index_path, incarnation) == 0 &&
+        persist_page_deferral(cmd, &request, root) == 0)
+    {
+        pthread_mutex_lock(&g_index_mutex);
+        ++g_page_deferral_epoch;
+        pthread_mutex_unlock(&g_index_mutex);
+        reply.status = CUVS_STATUS_OK;
+    }
+    send_all(client_fd, &reply, sizeof(reply));
 }
 
 static int
@@ -7295,12 +7423,7 @@ handle_build(int client_fd, const CuvsCmdFrame *cmd)
 
     if (cmd->op == CUVS_OP_BUILD_PAGES)
     {
-        if (recv_all(client_fd, &request.length, sizeof(request.length)) < 0 ||
-            request.length != sizeof(request) ||
-            recv_all(client_fd, (char *) &request + sizeof(request.length),
-                     sizeof(request) - sizeof(request.length)) < 0 ||
-            request.flags != 0 || !request.index_nonce || !request.build_xid ||
-            !request.system_identifier)
+        if (!receive_page_build(client_fd, &request))
         {
             send_error(client_fd, "invalid page-format BUILD frame");
             return;
@@ -7525,9 +7648,22 @@ handle_build(int client_fd, const CuvsCmdFrame *cmd)
     al.pending_before = g_pending_rmm_build_vram[target_gpu];
     al.evictions_before = g_cache_evictions[target_gpu];
     uint64_t self_unloaded = 0;
+    /* Until the page-format DDL commits, even a dirty legacy graph may be
+     * the only copy containing successful EXTENDs. Protect it from the
+     * configured legacy admission eviction as well as self-replace. */
+    IndexEntry *legacy = page_build ? find_index(cmd->db_oid, cmd->index_oid) : NULL;
+    bool protect_legacy = legacy != NULL;
+    if (protect_legacy)
+        ++legacy->inflight;
     int admit_rc = admit_build_cagra(needed, target_gpu, cmd->db_oid,
                                      page_build ? 0 : cmd->index_oid,
                                      &self_unloaded, &al);
+    if (protect_legacy)
+    {
+        /* Evicting another index may shift the legacy registry. */
+        legacy = find_index(cmd->db_oid, cmd->index_oid);
+        --legacy->inflight;
+    }
     note_build_admission(cmd->db_oid, cmd->index_oid, needed, target_gpu,
                          admit_rc == 0, self_unloaded);
     if (admit_rc < 0)
@@ -7690,6 +7826,8 @@ handle_build(int client_fd, const CuvsCmdFrame *cmd)
                 cuvs_hnsw_free(page_cpu_hnsw);
             cuvs_cagra_free(new_handle, target_gpu);
         }
+        if (page_status == 0 && (page_build->flags & CUVS_PAGE_BUILD_DEFER_LEGACY))
+            ++g_page_deferral_epoch;
         pthread_mutex_unlock(&g_index_mutex);
         munmap(mem, total);
         if (page_status != 0)
@@ -12477,6 +12615,9 @@ connection_thread(void *arg)
         case CUVS_OP_BUILD:
         case CUVS_OP_BUILD_PAGES:
             handle_build(client_fd, &cmd);
+            break;
+        case CUVS_OP_MARK_PAGES_EMPTY:
+            handle_mark_pages_empty(client_fd, &cmd);
             break;
         case CUVS_OP_SEARCH_PAGES:
         case CUVS_OP_SEARCH_PAGES_BATCH:
