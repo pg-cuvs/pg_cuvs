@@ -56,6 +56,12 @@ exists for 0.9.0.
 
 ### Fixed
 
+- `cuvs.delta_search = 'cpu'` returned every row of a pending `.delta` twice, pushing
+  correct rows out of the top k: the daemon merged its GPU delta cache whatever the mode
+  was and the backend merged `.delta` again. The SEARCH request now carries the mode, and
+  in `cpu` the daemon neither refreshes nor searches that cache. `delta_search_mode` in
+  `pg_stat_gpu_search` can now read `cpu`. `auto` and `gpu` are unchanged. The IPC protocol
+  version changes (6): install the extension and the daemon together.
 - Documentation: the README batch example, `docs/reference.md` and ADR-040 said that
   joining the results of `pg_cuvs_batch_search` and `cuvs_filtered_knn` on `ctid` gives
   the visible rows. That join silently drops HOT-updated rows, because the functions

@@ -7,7 +7,7 @@
  * The I3-A integration must bind CUVS_PROTO_VERSION to this version before
  * deploying the new producer and consumer together (ADR-081).
  */
-#define CUVS_ADMISSION_IPC_VERSION 5u
+#define CUVS_ADMISSION_IPC_VERSION 6u
 #define CUVS_NOTICE_OUT_BYTES 1024u /* msg/DETAIL pairs, includes NUL */
 #define CUVS_NOTICE_MAX_PAIRS 3u
 #define CUVS_ADMISSION_ERR_OUT_BYTES 512u /* includes terminating NUL */
