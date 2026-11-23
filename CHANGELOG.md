@@ -60,15 +60,23 @@ exists for 0.9.0.
 
 ### Fixed
 
-- `CREATE INDEX CONCURRENTLY ... USING pg_cuvs_hnsw` and `REINDEX INDEX CONCURRENTLY` of a heap-built `pg_cuvs_hnsw`
-  index no longer make the table's write statements wait for a lock. The build opened the index it writes with
-  `AccessExclusiveLock`, while a concurrent build holds `RowExclusiveLock` on it and every write statement on the table
-  opens it with `RowExclusiveLock` too; the build waited for the running write statements and queued every new one
-  behind it (15.5 s of no committed write during a 22.5 s build of 300,000 rows on one A100). The build now writes
-  under the lock its command holds. Measured on the same host with 200 writes/s: no write waited for a lock and none
-  took over 1 s during either command; the 99th percentile write latency rose from 0.99 ms to 18.4 ms during the
-  concurrent build and to 27.0 ms during the concurrent reindex (pgvector's own: 9.8 ms and 13.6 ms). `pg_cuvs_hnsw_layer_counts()` and `pg_cuvs_hnsw_build_info()` refuse an index that is not ready (SQLSTATE
-  `55000`) and `pg_cuvs_hnsw_layer_status()` leaves it out, since nothing keeps them from reading pages being written.
+- `CREATE INDEX CONCURRENTLY ... USING pg_cuvs_hnsw` and `REINDEX INDEX CONCURRENTLY` of a `pg_cuvs_hnsw` index
+  built from the heap (without `source`) no longer make the table's queries wait for a lock. The build opened the
+  index it writes with `AccessExclusiveLock`, while a concurrent build holds `RowExclusiveLock` on it. Every write
+  statement on the table opens the not-yet-ready index with `RowExclusiveLock`, and the planner opens it with the
+  query's lock (`AccessShareLock` for a `SELECT`) and keeps it to the end of the transaction. So the build waited
+  for the running statements and for every open transaction that had updated or deleted rows, and every query that
+  started after it queued behind it until the pages were written: 15.5 s of no committed write during a 22.5 s
+  build of 300,000 rows on one A100. The build now writes under the lock its command holds. Measured on the same
+  host with 200 writes/s (INSERT, UPDATE and DELETE from three clients): no write waited for a lock and none took
+  over 1 s during either command. The 99th percentile write latency rose from 0.99 ms to 18.4 ms during the
+  concurrent build and to 27.0 ms during the concurrent reindex; pgvector's own `hnsw` index measured 9.8 ms and
+  13.6 ms in the same run. `pg_cuvs_hnsw_layer_counts()`, `pg_cuvs_hnsw_build_info()` and
+  `pg_cuvs_hnsw_connectivity_status()` refuse an index that is not ready (SQLSTATE `55000`), and
+  `pg_cuvs_hnsw_layer_status()` leaves it out, since no lock keeps them away from pages being written.
+  Not changed: the concurrent build and `REINDEX ... CONCURRENTLY` of a `pg_cuvs_hnsw` index with `source = ...`
+  still ask for `AccessExclusiveLock` on the index while they convert, so the table's reads and writes wait for
+  them, as they did before.
 - `cuvs.delta_search = 'cpu'` returned every row of a pending `.delta` twice, pushing
   correct rows out of the top k: the daemon merged its GPU delta cache whatever the mode
   was and the backend merged `.delta` again. The SEARCH request now carries the mode, and
