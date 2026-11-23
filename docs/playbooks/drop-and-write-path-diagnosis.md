@@ -46,7 +46,8 @@ SELECT index_name, stale, stale_since, delta_rows, delta_generation,
 ------------+-------+------------+------------------+-------------------
  mg_cagra   | f     |          1 |                1 | gpu
 ```
-**→ `delta_search_mode=cpu`:** 원인 E → Step 4 (write 정합 / GPU delta path 회복)로  
+**→ `delta_search_mode=cpu`:** 어느 세션이 `cuvs.delta_search=cpu`로 검색했음. 정상(백엔드가 병합)이고 REINDEX 사유가 아님  
+**→ delta 행이 있는데 검색 뒤에도 `delta_search_mode=none`:** 원인 E → Step 4 (write 정합 / GPU delta path 회복)로  
 **→ `stale=t`:** GPU 인덱스 사용을 막는 상태. 원인을 확인하고 REINDEX한다.
 
 ```bash
@@ -111,8 +112,9 @@ delta cache**(3G.3, shard 0 GPU에 brute-force)를 병합해 `delta_merged=1`로
 TID 기준 필터(샤딩 무관).
 → Step 3 (write 정합 확인)으로
 
-### E. delta_search_mode가 cpu
-`cuvs.delta_search`(auto/cpu/gpu, 기본 auto) 또는 GPU delta cache 미가용이면 cpu.
+### E. delta 행이 있는데 delta_search_mode가 none
+GPU delta cache 미가용(VRAM 부족, `.delta` generation 불일치)이면 none.
+`cpu`는 다른 뜻이다: 이 인덱스의 마지막 CAGRA 검색이 `cuvs.delta_search=cpu`를 요청했다(세션 설정, 정상).
 delta가 `cuvs.max_delta_rows` 초과면 GPU+delta 중지 → REINDEX 권고.
 → Step 4 (GPU delta path 회복)로
 
@@ -227,7 +229,7 @@ SELECT delta_search_mode FROM pg_stat_gpu_search WHERE index_name='mg_cagra';
 ### Step 4 — GPU delta path 회복
 
 ```sql
--- delta가 너무 커서 cpu로 떨어지면 base 재빌드로 delta/stale 해소
+-- delta cache를 쓸 수 없으면(none) base 재빌드로 delta/stale 해소
 REINDEX INDEX <idx>;
 ```
 
@@ -245,10 +247,12 @@ SELECT delta_search_mode FROM pg_stat_gpu_search WHERE index_name='<idx>';
 ```
  delta_search_mode
 -------------------
- gpu
+ none
 ```
+REINDEX 직후에는 delta가 없으므로 `none`이다. INSERT와 검색을 한 번씩 한 뒤 다시 본다.
+
 **→ gpu:** 회복 완료  
-**→ 여전히 cpu:** VRAM 여유 확인 + `.delta` generation이 현재 `.tids`와 맞는지 확인
+**→ delta 행이 있는데 여전히 none:** VRAM 여유 확인 + `.delta` generation이 현재 `.tids`와 맞는지 확인
 
 ```sql
 -- GPU delta를 강제로 확인하고 싶을 때 (관측용)
@@ -316,7 +320,7 @@ SELECT delta_search_mode FROM pg_stat_gpu_search WHERE index_name='mg_cagra';
 
 - DROP 후에도 shard 행이 남으면: 데몬이 살아 있었는지(통지 도달) 확인 — 죽어 있었으면
   위의 수동 정리. 살아 있었는데 남으면 데몬 바이너리가 3G.1 이전인지 점검.
-- `delta_search_mode`가 계속 cpu: VRAM 여유(delta는 non-evicting, base를 밀어내지
+- delta 행이 있는데 `delta_search_mode`가 계속 none: VRAM 여유(delta는 non-evicting, base를 밀어내지
   않음) + `.delta` generation이 현재 `.tids`와 맞는지(REINDEX로 정렬).
 - DELETE한 행이 계속 보이면: tombstone generation mismatch 또는 stale 마커 누락 →
   REINDEX.

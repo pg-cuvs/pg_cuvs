@@ -80,10 +80,8 @@ RESET enable_seqscan;
 -- Scenario C — cuvs.delta_search tri-mode correctness.
 -- cuvs.delta_search is an ENUM GUC: auto (default), cpu, gpu. The merge must
 -- return the correct top-1 in every mode. We assert correctness (the extremum
--- probe), NOT daemon counters: the GUC is backend-only (not forwarded to the
--- daemon), so the daemon merges on GPU whenever a cache is present regardless of
--- mode — counter deltas are not a per-mode signal. The user-facing contract is
--- result correctness in all three modes. An invalid label must ERROR.
+-- probe) in all three modes, and (Scenario E) that cpu reaches the daemon: it
+-- does not refresh or merge its GPU delta cache then. An invalid label must ERROR.
 -- ============================================================================
 SET enable_seqscan = off;
 SET cuvs.delta_search = 'auto';   -- GPU-merge when daemon can, CPU-exact fallback
@@ -94,6 +92,47 @@ SET cuvs.delta_search = 'gpu';    -- GPU-only (daemon merge), no CPU fallback
 SELECT id FROM pd_gpu ORDER BY embedding <-> '[101,0,0,0]'::vector LIMIT 1;  -- 102
 SET cuvs.delta_search = 'bogus';  -- invalid enum label -> ERROR
 RESET cuvs.delta_search;
+RESET enable_seqscan;
+
+-- ============================================================================
+-- Scenario E — cuvs.delta_search = cpu reaches the daemon on all three merge
+-- paths (immediate, micro-batch, sharded). The contract is the rows: the top k,
+-- with k above the number of delta rows, is the seq scan's, so no delta row
+-- comes back twice. The daemon's merge counter does not move, the status reports
+-- cpu, and the micro-batch step really went through the batch worker.
+-- ============================================================================
+SET enable_seqscan = off;
+SET cuvs.itopk_size = 512;
+SELECT ARRAY(SELECT id FROM pd_gpu ORDER BY embedding <-> '[100,0,0,0]'::vector LIMIT 5) AS auto_top5;
+SELECT delta_merged_count AS pd_merged FROM pg_stat_gpu_search WHERE index_oid = 'pd_gpu_cagra'::regclass \gset
+SET cuvs.delta_search = 'cpu';
+SELECT ARRAY(SELECT id FROM pd_gpu ORDER BY embedding <-> '[100,0,0,0]'::vector LIMIT 5) AS cpu_top5;
+SELECT delta_merged_count = :pd_merged AS cpu_no_gpu_merge, delta_search_mode
+FROM pg_stat_gpu_search WHERE index_oid = 'pd_gpu_cagra'::regclass;
+SELECT cagra_batch_count AS pd_batched FROM pg_stat_gpu_search WHERE index_oid = 'pd_gpu_cagra'::regclass \gset
+SET cuvs.cagra_batch_wait_us = 200;
+SELECT ARRAY(SELECT id FROM pd_gpu ORDER BY embedding <-> '[102,0,0,0]'::vector LIMIT 5) AS cpu_batch_top5;
+SELECT cagra_batch_count > :pd_batched AS went_through_batch_worker
+FROM pg_stat_gpu_search WHERE index_oid = 'pd_gpu_cagra'::regclass;
+SELECT delta_merged_count = :pd_merged AS cpu_no_gpu_merge, delta_search_mode
+FROM pg_stat_gpu_search WHERE index_oid = 'pd_gpu_cagra'::regclass;
+RESET cuvs.cagra_batch_wait_us;
+CREATE TABLE pd_shard (id bigint, embedding vector(4));
+INSERT INTO pd_shard SELECT g, ('['||g||',1,0,0]')::vector FROM generate_series(1,200) g;
+SET cuvs.shard_count = 2;
+SET client_min_messages = warning;
+CREATE INDEX pd_shard_cagra ON pd_shard USING cagra (embedding vector_l2_ops);
+RESET client_min_messages;
+RESET cuvs.shard_count;
+INSERT INTO pd_shard VALUES (901,'[900,0,0,0]'),(902,'[902,0,0,0]');
+SELECT ARRAY(SELECT id FROM pd_shard ORDER BY embedding <-> '[900,0,0,0]'::vector LIMIT 4) AS cpu_shard_top4;
+SELECT delta_merged_count = 0 AS cpu_no_gpu_merge, delta_search_mode
+FROM pg_stat_gpu_search WHERE index_oid = 'pd_shard_cagra'::regclass;
+RESET cuvs.delta_search;
+SELECT ARRAY(SELECT id FROM pd_shard ORDER BY embedding <-> '[900,0,0,0]'::vector LIMIT 4) AS auto_shard_top4;
+SELECT delta_merged_count > 0 AS auto_gpu_merge, delta_search_mode
+FROM pg_stat_gpu_search WHERE index_oid = 'pd_shard_cagra'::regclass;
+RESET cuvs.itopk_size;
 RESET enable_seqscan;
 
 -- ============================================================================
@@ -114,4 +153,4 @@ RESET cuvs.max_delta_rows;
 -- ============================================================================
 -- Cleanup
 -- ============================================================================
-DROP TABLE pd_cap, pd_gpu, pd_off;
+DROP TABLE pd_cap, pd_gpu, pd_shard, pd_off;

@@ -12,6 +12,10 @@ exists for 0.9.0.
 
 ### Added
 
+- `pg_cuvs_hnsw_layer_counts(regclass)` and `pg_cuvs_hnsw_layer_status()`: the elements of
+  a `pg_cuvs_hnsw` index above level 0, and whether each index has the upper layers that
+  `mode = 'nsw'` did not build before 0.9.3 (such an index needs `REINDEX INDEX`) and links
+  every upper element on level 1.
 - `scripts/check-sdk-patch-path.sh` checks the patched cuVS SDK build path without CUDA:
   the patch set applies to the pinned cuVS source with the manifest hashes, the planner
   source verifies, and the Makefile passes the planner's compile and link flags. The
@@ -56,6 +60,26 @@ exists for 0.9.0.
 
 ### Fixed
 
+- `cuvs.delta_search = 'cpu'` returned every row of a pending `.delta` twice, pushing
+  correct rows out of the top k: the daemon merged its GPU delta cache whatever the mode
+  was and the backend merged `.delta` again. The SEARCH request now carries the mode, and
+  in `cpu` the daemon neither refreshes nor searches that cache. `delta_search_mode` in
+  `pg_stat_gpu_search` can now read `cpu`. `auto` and `gpu` are unchanged. The IPC protocol
+  version changes (6): install the extension and the daemon together.
+- `pg_cuvs_hnsw` with `mode = 'nsw'` (the default) built every element at level 0, so the
+  upper layers came to hold only the rows inserted after the build, and when those lay
+  elsewhere a search no longer found the built rows (recall@10 of the built rows 0.0 on
+  the test data; on 100,000 wiki rows of 768 dimensions after 2,000 rows of another
+  distribution, 0.979 for a heap build and 0.929 for a conversion from CAGRA, against
+  0.996 for pgvector's own HNSW). Every mode now builds the upper layers: a heap build
+  through the cuVS GPU hierarchy, a conversion from CAGRA (`WITH (source = ...)`) by the
+  daemon on the host over a copy of the graph taken as before, with no GPU memory, one
+  conversion at a time, stopped when the client goes. After the same inserts: 0.999 (heap
+  build), 0.997 (CAGRA source), 0.997 (pgvector). A pair too large for one page is split
+  as pgvector's build splits it, so the dimension ceiling is each tuple fitting a page.
+  Indexes built by earlier versions keep their level-0-only graph: `REINDEX INDEX` them.
+  With `source`, modes `nsw` and `hnsw` now give the same graph, and a pgvector version
+  outside the supported range is an error, as for a heap build.
 - A brute_force search on an unsharded index whose `.vectors` sidecar cannot serve it
   (row count or `.tids` generation mismatch, as after an extend that the daemon saved at
   shutdown, or defective content) read the whole sidecar and checked its body crc under

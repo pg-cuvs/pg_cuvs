@@ -2466,9 +2466,10 @@ cuvs_cagra_extract_adjacency(
     float         **vecs_out,
     size_t         *n_vecs_out,
     int            *graph_degree_out,
+    int            *dim_out,
     int             device_id)
 {
-    if (!handle || !adj_out || !vecs_out || !n_vecs_out || !graph_degree_out)
+    if (!handle || !adj_out || !vecs_out || !n_vecs_out || !graph_degree_out || !dim_out)
         return -1;
     CuvsCagraIndexImpl *cimpl = static_cast<CuvsCagraIndexImpl *>(handle);
     PooledRes _pr(device_id);
@@ -2522,6 +2523,7 @@ cuvs_cagra_extract_adjacency(
         *vecs_out         = vecs;
         *n_vecs_out       = N;
         *graph_degree_out = (int)D;
+        *dim_out          = (int)dim;
         return 0;
     } catch (const std::exception &e) {
         _pr.poison();

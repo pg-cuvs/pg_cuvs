@@ -879,6 +879,10 @@ test_bf_batch_group(void)
     /* A 4-field positional key means mode=0 (cagra); two of them still group. */
     {
         CuvsBatchKey kz[2] = { {1, 10, 0, 8}, {1, 10, 0, 8, 0} };
+        CuvsBatchKey kc[2] = { {1, 10, 0, 8}, {1, 10, 0, 8, .delta_cpu = 1} };
+        int gc[2], nc;
+        cuvs_batch_group(kc, 2, gc, &nc);
+        ASSERT(nc == 2, "cagra requests with and without the daemon delta merge never share a dispatch");
         int g[2], n = -1;
         cuvs_batch_group(kz, 2, g, &n);
         ASSERT(n == 1, "omitted mode defaults to 0 and still groups");

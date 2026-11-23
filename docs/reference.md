@@ -213,7 +213,7 @@ workspace allocations can still produce a genuine allocation failure.
 | `cuvs.hnsw_exact_scan` | bool | `off` | — | USERSET | When `on`, ordered scans of a `pg_cuvs_hnsw` index compute exact SQL distances over the MVCC-visible heap rows instead of reading the HNSW graph (see § Explicit exact scans for pg_cuvs_hnsw). A scan runs exactly or stops with an error; it never falls back to approximate results. Changing the value invalidates the saved plans and cached expressions of the current backend. Read at scan start and rescan. Does not recover unreachable rows in the default configuration (#203 stays open) |
 | `cuvs.max_stale_fraction` | real | `0.10` | 0.0–1.0 | USERSET | Delete-drift fraction above which a CAGRA index reroutes to CPU; 1.0 disables |
 | `cuvs.max_delta_rows` | int | `10000` | 0–INT_MAX | USERSET | Pending-insert rows merged before CPU reroute; 0 disables delta |
-| `cuvs.delta_search` | enum | `auto` | `auto`, `cpu`, `gpu` | USERSET | Delta merge mode: GPU-with-CPU-fallback / always CPU / GPU-only |
+| `cuvs.delta_search` | enum | `auto` | `auto`, `cpu`, `gpu` | USERSET | Delta merge mode: GPU-with-CPU-fallback / always CPU (the daemon then neither refreshes nor searches its delta cache) / GPU-only. The `delta_search_mode` column of `pg_stat_gpu_search` is per index, not per session: `cpu` when the last CAGRA search of the index asked for `cpu`, otherwise `gpu` while a delta cache is resident, otherwise `none` |
 
 The CAGRA tuning defaults preserve the previous search parameters. Micro-batches
 only combine CAGRA requests with identical tuning, so concurrent sessions can
@@ -510,7 +510,7 @@ cagra/ivfpq") rather than silently failing.
 | Reloption | Type | Default | Values | Notes |
 |-----------|------|---------|--------|-------|
 | `source` | string | `` | a `cagra` index name on the same table | empty = private direct HNSW file build from the heap (op23), without a persistent CAGRA index |
-| `mode` | string | `nsw` | `nsw`, `hnswlib`, `hnsw`, `hnswlib_file` | `nsw` and `hnswlib` are recommended |
+| `mode` | string | `nsw` | `nsw`, `hnswlib`, `hnsw`, `hnswlib_file` | `nsw` and `hnswlib` are recommended. With `source`, `nsw` and `hnsw` give the same graph: level 0 from the CAGRA graph and upper layers built by the daemon on the host. Since 0.9.3 this path checks the pgvector version as the heap build does (outside the supported range is an error, not a warning) |
 | `m` | int | `16` | 2–100 | **informational** — the CAGRA graph degree drives the HNSW layout, not `m` |
 | `ef_construction` | int | `64` | 4–1000 | Direct heap build: construction effort; source reuse: informational |
 | `build_algo` | enum | `auto` | `auto`, `ivf_pq`, `nn_descent`, `ace` | Direct heap build only; cannot be combined with explicit `source` |
@@ -548,8 +548,9 @@ base dtype is FP32 when dim <= 16, any element exceeds half range, or the reside
 IVF-PQ norm bound reaches 65504 (4 x max\|x\|^2 for L2, max\|x\|^2 for inner product and
 cosine), because the SDK's FP16 path mixes FP32 norms with half dot products; otherwise FP16.
 Because the SDK computes L2 as ||a||^2 + ||b||^2 - 2a.b in float32 on both paths, L2 builds
-feed NN-descent a column-centered copy (mean accumulated in float64); with `mode='hnsw'`
-the SDK patch 0005 does the same for each upper level's point set (its own mean). L2 is
+feed NN-descent a column-centered copy (mean accumulated in float64); since every mode of
+the heap build builds the upper layers, the SDK patch 0005 does the same for each upper
+level's point set (its own mean). L2 is
 translation invariant; stored vectors and search distances use the original rows. The base
 copy is counted in the host estimate (n x dim x 4, L2 only) and freed before serialization;
 each upper-level copy is counted in that level's NN-descent host workspace check. IP and
@@ -608,6 +609,8 @@ for limits, compatibility and estimate-vs-upper-bound caveats.
 | `pg_cuvs_memory_status()` | SETOF record | (0.9.0) Superuser or `pg_monitor`; per-GPU accounting, reclaim state and eviction counters. See § 8.4 |
 | `pg_cuvs_build_status()` | SETOF record | (0.9.0) In-flight CAGRA builds and their reservations; rows filtered by privilege. See § 8.4 |
 | `pg_cuvs_hnsw_build_info(index regclass)` | jsonb | Read the stored construction route/settings and estimate-based admission. Version2 writer with historical version1 reader; absent legacy/source/empty receipts are not reconstructed from current GUCs. For ACE, `ace_partitions_origin` says whether `ace_partitions` is the effective count or only the requested one. Requires SELECT on the source table; estimates are not memory upper-bound guarantees |
+| `pg_cuvs_hnsw_layer_counts(index regclass)` | record (elements bigint, upper_elements bigint, m integer, entry_level integer, built_hierarchy integer, level1_unlinked bigint) | One `pg_cuvs_hnsw` index: elements not marked deleted, how many are above level 0, the metapage `m` and entry level, the hierarchy flag its heap build recorded (NULL when none, e.g. a CAGRA-source build), and how many elements above level 0 have no level-1 link (0 when the upper layer is connected; a search descending through level 1 stops at such an element). Reads every page; requires SELECT on the table |
+| `pg_cuvs_hnsw_layer_status()` | SETOF (index regclass, access_method name, current boolean, reason text) | Every `pg_cuvs_hnsw` index the caller can read: whether it has upper layers, and why not. `mode='nsw'` before 0.9.3 wrote level 0 only, so rows inserted afterwards held the upper layers alone and searches could miss the built rows; such an index needs `REINDEX INDEX`. A heap build is judged from its recorded hierarchy flag; a CAGRA-source build from the share of elements above level 0 (about 1/m expected, under a quarter of that means none), and NULL below 16 × m elements. With two or more elements above level 0, any of them without a level-1 link makes an index not current, whatever built it (a single upper element, the entry point, has nobody to link to) |
 | `pg_cuvs_build_hnsw(cagra regclass, mode text DEFAULT 'nsw')` | regclass | Build a pgvector HNSW from a CAGRA index without pgvector's CPU build. **Deprecated** in favor of `CREATE INDEX ... USING pg_cuvs_hnsw`; the older two-step `pg_cuvs_import_hnsw` form (empty `USING hnsw` target + import) is removed |
 | `pg_cuvs_compact(index regclass)` | void | Remove tombstoned vectors via `cuvsCagraMerge`, rebuild `.cagra`/`.tids`, drop `.tombstone`. The rebuild uses fp32 IVF-PQ kNN distances under the `build_algo` fp16 rule. If the initial NN-descent or auto merge runs out of memory, retry once with explicit IVF-PQ under that same rule. A pinned IVF-PQ failure is not retried |
 | `pg_cuvs_batch_search(rel regclass, queries vector[], k int)` | SETOF (query_idx int, ctid tid, distance real) | Q queries in one IPC/GPU dispatch; JOIN on `ctid` for visible rows, which drops HOT-updated rows (see the note below the table); honors `search_mode`/`bf_precision` |

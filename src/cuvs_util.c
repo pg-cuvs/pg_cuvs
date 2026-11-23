@@ -1187,7 +1187,8 @@ cuvs_batch_group(const CuvsBatchKey *keys, int n,
                 keys[j].mode      == keys[i].mode &&
                 (keys[i].mode != 0 ||
                  (keys[j].itopk_size == keys[i].itopk_size &&
-                  keys[j].search_width == keys[i].search_width)))
+                  keys[j].search_width == keys[i].search_width &&
+                  keys[j].delta_cpu == keys[i].delta_cpu)))
             {
                 g = group_id_out[j];
                 break;

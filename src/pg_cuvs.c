@@ -186,9 +186,9 @@ static const struct config_enum_entry cuvs_bf_precision_options[] = {
 };
 /* Phase 3A delta search mode (string in SQL, mapped to int in C). */
 static const struct config_enum_entry cuvs_delta_search_options[] = {
-    {"auto", 0, false},
-    {"cpu",  1, false},
-    {"gpu",  2, false},
+    {"auto", CUVS_DELTA_SEARCH_AUTO, false},   /* sent on the wire as is */
+    {"cpu",  CUVS_DELTA_SEARCH_CPU,  false},
+    {"gpu",  CUVS_DELTA_SEARCH_GPU,  false},
     {NULL, 0, false}
 };
 /* ADR-073 B: transient no-index GPU brute-force routing (string in SQL → int). */
@@ -3002,7 +3002,10 @@ cuvs_build_hnsw_from_heap(Relation heapRel, Relation indexRel, IndexInfo *indexI
         CuvsTidsHeader header = {0};
         char error[128] = {0};
         int rc;
-        uint32_t hierarchy = strcmp(mode, "nsw") != 0;
+        /* every mode builds the upper layers. A graph with layer 0 only (the earlier nsw) lets pgvector's insert make a new
+         * element the entry point (hnswinsert.c, HNSW_UPDATE_ENTRY_GREATER) and link the upper layers among inserted rows only, so a
+         * search descends to them and misses the built rows when the inserted rows lie elsewhere. */
+        uint32_t hierarchy = 1;
         uint32_t notices;
         CuvsHnswBudgetSnapshot budget;
         CuvsHnswDigest digest = {0};
@@ -4732,6 +4735,7 @@ cuvs_gettuple(IndexScanDesc scan, ScanDirection dir)
             (uint32_t)cuvs_bf_precision,     /* Phase 3L: 0=float32, 1=float16 */
             (uint32_t)cuvs_bf_batch_wait_us, /* Phase 3L: BF micro-batch window μs */
             (uint32_t)cuvs_cagra_batch_wait_us, /* #160: CAGRA micro-batch window μs */
+            (uint32_t)cuvs_delta_search_mode,   /* cpu: the daemon leaves .delta to us */
             ss->tids,
             ss->distances,
             &ss->n_results,
@@ -5005,6 +5009,7 @@ flat_gettuple(IndexScanDesc scan, ScanDirection dir)
             cuvs_resolve_flat_precision(scan->indexRelation), /* reloption / GUC */
             (uint32_t)cuvs_bf_batch_wait_us,
             0,   /* cagra_batch_wait_us: this path forces brute_force (ADR-073) */
+            (uint32_t)cuvs_delta_search_mode,
             ss->tids,
             ss->distances,
             &ss->n_results,
@@ -7842,6 +7847,7 @@ cuvs_filtered_knn(PG_FUNCTION_ARGS)
                 (uint32_t) cuvs_bf_precision,
                 0,   /* bf_batch_wait_us */
                 0,   /* cagra_batch_wait_us */
+                (uint32_t) cuvs_delta_search_mode,
                 tids_out, dists_out, &n_results,
                 &latency_us, &delta_merged);
         }

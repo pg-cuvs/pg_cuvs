@@ -40,15 +40,15 @@ DATA           = sql/pg_cuvs--0.1.0.sql \
                  sql/pg_cuvs--0.9.2--0.9.3.sql \
                  sql/pg_cuvs--0.9.3.sql
 MODULE_big     = pg_cuvs
-REGRESS        = smoke upgrade_path cpu_fallback edge_cases cpu_hnsw_fallback build_hnsw build_hnsw_edge build_hnsw_halfvec build_hnsw_packing pg_cuvs_hnsw metrics brute_force pg_cuvs_batch reloption_dir gc_orphans release_hardening pending_delta delta_recall build_params drop_subxact partition_prune filter_comparison prefilter_short_fill_guard ivfpq_smoke cagra_streaming cagra_dynbatch cagra_search_params auto_compact extend_vram_fallback stream_bf_recall fallback_stat vram_accounting build_lock flat_smoke transient_bf hw_profile routing_golden routing_golden_measured multi_vector daemon_uid_owner unordered_scan null_query_vector rmm_pool admission_reject
+REGRESS        = smoke upgrade_path cpu_fallback edge_cases cpu_hnsw_fallback build_hnsw build_hnsw_edge build_hnsw_halfvec build_hnsw_packing hnsw_insert_shift hnsw_layer_status pg_cuvs_hnsw metrics brute_force pg_cuvs_batch reloption_dir gc_orphans release_hardening pending_delta delta_recall build_params drop_subxact partition_prune filter_comparison prefilter_short_fill_guard ivfpq_smoke cagra_streaming cagra_dynbatch cagra_search_params auto_compact extend_vram_fallback stream_bf_recall fallback_stat vram_accounting build_lock flat_smoke transient_bf hw_profile routing_golden routing_golden_measured multi_vector daemon_uid_owner unordered_scan null_query_vector rmm_pool admission_reject
 REGRESS_OPTS   = --inputdir=test --outputdir=test
 
 # Tier-1 CI (CPU-reference shim, PGCUVS_CPU_SHIM=1) runs a SUBSET of REGRESS.
 # Excluded = tests the shim cannot/should not reproduce on CPU:
 #   build_hnsw/build_hnsw_edge/pg_cuvs_hnsw/build_hnsw_halfvec/
-#     build_hnsw_packing — CAGRA->pgvector HNSW *graph export* (real graph
+#     build_hnsw_packing/hnsw_insert_shift — CAGRA->pgvector HNSW *graph export* (real graph
 #     structure; a Tier-2 / real-GPU concern).
-REGRESS_TIER2_ONLY = build_hnsw build_hnsw_edge build_hnsw_halfvec build_hnsw_packing pg_cuvs_hnsw routing_golden_measured
+REGRESS_TIER2_ONLY = build_hnsw build_hnsw_edge build_hnsw_halfvec build_hnsw_packing hnsw_insert_shift pg_cuvs_hnsw routing_golden_measured
 REGRESS_TIER1      = $(filter-out $(REGRESS_TIER2_ONLY),$(REGRESS))
 
 # #124: build_oom, build_multi_oom, build_oom_evict_to_fit, and extend_cuda_oom
@@ -251,12 +251,16 @@ src/cuvs_cache_policy_server.o: src/cuvs_cache_policy.c src/cuvs_cache_policy.h 
 src/cuvs_build_corpus_server.o: src/cuvs_build_corpus.c src/cuvs_build_corpus.h
 	$(CC) $(SERVER_CFLAGS) -c $< -o $@
 
+# host-built HNSW upper layers for CUVS_OP_EXPORT_HNSW_UPPER (plain C, both daemon builds)
+src/cuvs_hnsw_upper_server.o: src/cuvs_hnsw_upper.c src/cuvs_hnsw_upper.h
+	$(CC) $(SERVER_CFLAGS) -c $< -o $@
+
 # CI Tier 1: pure-C CPU shim object (no CUDA). Shared by the .so and the daemon
 # (same object both link cuvs_wrapper.o today). Built with gcc, -fPIC for the .so.
 src/cuvs_wrapper_shim_cpu.o: src/cuvs_wrapper_shim_cpu.c src/cuvs_wrapper.h src/cuvs_ipc.h
 	$(CC) -O2 -g -fPIC -I./src -std=gnu11 -c $< -o $@
 
-$(SERVER_BIN): src/pg_cuvs_server.o src/cuvs_ipc_server.o src/cuvs_util_server.o src/cuvs_objstore_server.o src/cuvs_build_corpus_server.o src/cuvs_cache_policy_server.o src/cuvs_peak_meter_server.o $(WRAPPER_OBJ)
+$(SERVER_BIN): src/pg_cuvs_server.o src/cuvs_ipc_server.o src/cuvs_util_server.o src/cuvs_objstore_server.o src/cuvs_build_corpus_server.o src/cuvs_cache_policy_server.o src/cuvs_peak_meter_server.o src/cuvs_hnsw_upper_server.o $(WRAPPER_OBJ)
 	$(CXX) -o $@ $^ $(SERVER_LDFLAGS)
 
 server: $(SERVER_BIN)
@@ -295,7 +299,10 @@ src/cuvs_cache_policy_server_test.o: src/cuvs_cache_policy.c src/cuvs_cache_poli
 src/cuvs_peak_meter_server_test.o: src/cuvs_peak_meter.c src/cuvs_peak_meter.h
 	$(CC) $(SERVER_TEST_CFLAGS) -c $< -o $@
 
-$(SERVER_TEST_BIN): src/pg_cuvs_server_test.o src/cuvs_ipc_server_test.o src/cuvs_util_server_test.o src/cuvs_objstore_server_test.o src/cuvs_build_corpus_server_test.o src/cuvs_cache_policy_server_test.o src/cuvs_peak_meter_server_test.o $(WRAPPER_OBJ)
+src/cuvs_hnsw_upper_server_test.o: src/cuvs_hnsw_upper.c src/cuvs_hnsw_upper.h
+	$(CC) $(SERVER_TEST_CFLAGS) -c $< -o $@
+
+$(SERVER_TEST_BIN): src/pg_cuvs_server_test.o src/cuvs_ipc_server_test.o src/cuvs_util_server_test.o src/cuvs_objstore_server_test.o src/cuvs_build_corpus_server_test.o src/cuvs_cache_policy_server_test.o src/cuvs_peak_meter_server_test.o src/cuvs_hnsw_upper_server_test.o $(WRAPPER_OBJ)
 	$(CXX) -o $@ $^ $(SERVER_LDFLAGS)
 
 server-test: $(SERVER_TEST_BIN)
@@ -1220,6 +1227,16 @@ EXTRA_CLEAN += test-physical-build-guard
 .PHONY: test-physical-build-guard test-physical-build-mutations
 ifeq ($(shell uname -s),Linux)
 test-unit: test-physical-build-guard
+
+# the host upper-layer builder: levels and file size fixed by the input whatever the thread count,
+# every element above level 0 linked on level 1, level 0 without self links or duplicates, the cancel stop.
+test-hnsw-upper: test/unit/test_hnsw_upper.c src/cuvs_hnsw_upper.c src/cuvs_hnsw_upper.h
+	$(CC) -std=gnu11 -O2 -Wall -Wextra -I src -o $@ test/unit/test_hnsw_upper.c src/cuvs_hnsw_upper.c -lm -pthread
+	./$@
+
+test-unit: test-hnsw-upper
+EXTRA_CLEAN += test-hnsw-upper
+.PHONY: test-hnsw-upper
 test-admission-contract-mutations: test-physical-build-mutations
 endif
 test-physical-build-guard:
