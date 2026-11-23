@@ -1,0 +1,84 @@
+Parsed test spec with 5 sessions
+
+starting permutation: l_lock a_cic l_phase b_insert r_status_during r_counts_during l_unlock l_wait_cic c_insert l_release r_found
+step l_lock: SELECT pg_advisory_lock(54541), pg_advisory_lock(54542);
+pg_advisory_lock|pg_advisory_lock
+----------------+----------------
+                |                
+(1 row)
+
+step a_cic: CREATE INDEX CONCURRENTLY cicw_i ON cicw USING pg_cuvs_hnsw ((cicw_gate(v)::vector(4)) vector_l2_ops); <waiting ...>
+step l_phase: 
+    DO $$ BEGIN
+        FOR i IN 1 .. 1200 LOOP
+            EXIT WHEN EXISTS (SELECT 1 FROM pg_stat_progress_create_index WHERE relid = 'cicw'::regclass AND phase LIKE 'building index%');
+            PERFORM pg_sleep(0.05);
+        END LOOP;
+    END $$;
+    SELECT command, phase FROM pg_stat_progress_create_index WHERE relid = 'cicw'::regclass;
+
+command                  |phase                       
+-------------------------+----------------------------
+CREATE INDEX CONCURRENTLY|building index: initializing
+(1 row)
+
+step b_insert: 
+    INSERT INTO cicw SELECT 5000 + 2 * g - 1, CASE WHEN g = 1 THEN '[5001,1,1,1]'::vector ELSE cicw_hold('[5003,3,3,3]') END
+    FROM generate_series(1, 2) g;
+ <waiting ...>
+step r_status_during: SELECT count(*) AS listed FROM pg_cuvs_hnsw_layer_status() WHERE index = 'cicw_i'::regclass;
+listed
+------
+     0
+(1 row)
+
+step r_counts_during: SELECT elements FROM pg_cuvs_hnsw_layer_counts('cicw_i');
+ERROR:  pg_cuvs_hnsw_layer_counts: index "cicw_i" is not ready: a concurrent build is writing it, or one failed
+step l_unlock: SELECT pg_advisory_unlock(54541) AS unlocked;
+unlocked
+--------
+t       
+(1 row)
+
+step l_wait_cic: 
+    DO $$ BEGIN
+        FOR i IN 1 .. 1200 LOOP
+            EXIT WHEN EXISTS (SELECT 1 FROM pg_locks k JOIN pg_stat_activity a USING (pid)
+                              WHERE NOT k.granted AND k.locktype <> 'advisory' AND a.query LIKE 'CREATE INDEX CONCURRENTLY cicw_i%');
+            PERFORM pg_sleep(0.05);
+        END LOOP;
+    END $$;
+    SELECT k.locktype, k.mode FROM pg_locks k JOIN pg_stat_activity a USING (pid)
+    WHERE NOT k.granted AND a.query LIKE 'CREATE INDEX CONCURRENTLY cicw_i%';
+
+locktype  |mode     
+----------+---------
+virtualxid|ShareLock
+(1 row)
+
+step c_insert: INSERT INTO cicw VALUES (5002, '[5002,2,2,2]');
+step l_release: SELECT pg_advisory_unlock(54542) AS released;
+released
+--------
+t       
+(1 row)
+
+step a_cic: <... completed>
+step b_insert: <... completed>
+step r_found: 
+    DO $$ BEGIN
+        FOR i IN 1 .. 1200 LOOP
+            EXIT WHEN (SELECT indisvalid FROM pg_index WHERE indexrelid = 'cicw_i'::regclass);
+            PERFORM pg_sleep(0.05);
+        END LOOP;
+    END $$;
+    SELECT (SELECT id FROM cicw ORDER BY cicw_gate(v)::vector(4) <-> '[5001,1,1,1]'::vector(4) LIMIT 1) = 5001 AND
+           (SELECT id FROM cicw ORDER BY cicw_gate(v)::vector(4) <-> '[5003,3,3,3]'::vector(4) LIMIT 1) = 5003 AS b_found,
+           (SELECT id FROM cicw ORDER BY cicw_gate(v)::vector(4) <-> '[5002,2,2,2]'::vector(4) LIMIT 1) = 5002 AS c_found,
+           (SELECT indisvalid FROM pg_index WHERE indexrelid = 'cicw_i'::regclass) AS valid;
+
+b_found|c_found|valid
+-------+-------+-----
+t      |t      |t    
+(1 row)
+
