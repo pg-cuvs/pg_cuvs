@@ -37,6 +37,7 @@ SELECT (pg_cuvs_hnsw_layer_counts('hbm_m8')).m = 24 AS after_reindex;
 
 -- Reuse the source's actual graph degree when m is omitted; an explicit m
 -- (including 32, the heap default) has to match the converted graph.
+SET cuvs.index_dir = '/tmp/cuvs_indexes';
 CREATE INDEX hbm_c32 ON hbm USING cagra (v vector_l2_ops) WITH (graph_degree = 32);
 CREATE INDEX hbm_c80 ON hbm USING cagra (v vector_l2_ops)
     WITH (graph_degree = 80, intermediate_graph_degree = 128);
@@ -93,7 +94,6 @@ BEGIN
             RAISE EXCEPTION 'n=%, m=%, metadata M=%, graph degree=%, limit=%',
                 sample.n, sample.m, actual_m, receipt ->> 'graph_degree', receipt ->> 'graph_degree_limited_by';
         END IF;
-
         INSERT INTO hbm_small VALUES (100, '[100,0,0,0,0,0,0,0]');
         PERFORM set_config('enable_seqscan', 'off', true);
         SELECT id INTO nearest FROM hbm_small ORDER BY v <-> '[100,0,0,0,0,0,0,0]' LIMIT 1;
