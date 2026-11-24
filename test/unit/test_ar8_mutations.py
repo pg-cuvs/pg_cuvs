@@ -44,11 +44,7 @@ RECHECK = ('    if (pool_short > 0)\n'
            '        }\n'
            '    }\n')
 PICK_AR8 = '    if (pool_short > 0 && pk->lru_total < pool_short)\n        return CUVS_ADMISSION_AR8;\n'
-WR_IF = ('        if (wr != CUVS_ADMISSION_NONE)\n'
-         '        {\n'
-         '            g_last_admit_reason = wr;\n'
-         '            goto admission_rejected;\n'
-         '        }\n')
+WR_IF = '        if (wr != CUVS_ADMISSION_NONE)\n'
 OLD_AR8 = ('        if (cuvs_admission_pool_refuses(quota, line->pool_pending, line->pool_used,\n'
            '                                        needed, line->pool_headroom))\n'
            '        {\n'
