@@ -27,6 +27,7 @@ void cuvs_cagra_require_legacy(Relation index);
 
 #ifdef CUVS_PAGE_FORMAT
 #define CUVS_CAGRA_PAGE_MAGIC 0x43565047U
+#define CUVS_CAGRA_REINDEX_REQUIRED 1U  /* reserved across all format versions */
 #define CUVS_CAGRA_PAGE_MAJOR 0   /* development format, never accepted by a release */
 #define CUVS_CAGRA_PAGE_EXTENT 64
 #define CUVS_CAGRA_PAGE_DIR 1950
@@ -63,6 +64,8 @@ typedef struct CuvsCagraMeta
 
 uint64 cuvs_cagra_nonce(void);
 bool cuvs_cagra_read_meta(Relation index, CuvsCagraMeta *meta);
+/* Given a locked CAGRA index, inspect only the common metapage prefix. */
+bool cuvs_cagra_reindex_required(Relation index);
 
 typedef enum CuvsCagraSlotResult
 {

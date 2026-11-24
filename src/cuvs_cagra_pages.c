@@ -31,6 +31,7 @@ cuvs_cagra_require_legacy(Relation index)
 #ifdef CUVS_PAGE_FORMAT
 
 #include "access/generic_xlog.h"
+#include "access/htup_details.h"
 #include "access/xloginsert.h"
 #include "cuvs_util.h"
 #include "storage/bufpage.h"
@@ -38,6 +39,12 @@ cuvs_cagra_require_legacy(Relation index)
 #include "storage/lmgr.h"
 #include "utils/builtins.h"
 #include "utils/guc.h"
+#include "utils/lsyscache.h"
+#include "utils/resowner.h"
+
+#ifdef CUVS_TEST_HOOKS
+#include "fmgr.h"
+#endif
 
 enum CuvsCagraPageKind
 {
@@ -82,6 +89,13 @@ typedef struct CuvsCagraFoldRecord
     uint64      folded;
 } CuvsCagraFoldRecord;
 
+#define CAGRA_META_PREFIX_SIZE 12
+
+StaticAssertDecl(offsetof(CuvsCagraMeta, magic) == 0 &&
+                 offsetof(CuvsCagraMeta, major) == 4 &&
+                 offsetof(CuvsCagraMeta, minor) == 6 &&
+                 offsetof(CuvsCagraMeta, flags) + sizeof(uint32) == CAGRA_META_PREFIX_SIZE,
+                 "CAGRA common metapage prefix must not change");
 StaticAssertDecl(sizeof(ItemPointerData) == 6, "CAGRA TID size");
 StaticAssertDecl(sizeof(CuvsCagraTidPage) == 24, "CAGRA TID page tag size");
 StaticAssertDecl(sizeof(CuvsCagraPending) == 32, "CAGRA pending page tag size");
@@ -123,18 +137,43 @@ set_lower(Page page, Size bytes)
     ((PageHeader) page)->pd_lower = MAXALIGN(SizeOfPageHeaderData) + bytes;
 }
 
+static bool
+page_bounds_valid(Page page)
+{
+    PageHeader header = (PageHeader) page;
+
+    return !PageIsNew(page) && PageGetPageSize(page) == BLCKSZ &&
+        PageGetPageLayoutVersion(page) == PG_PAGE_LAYOUT_VERSION &&
+        header->pd_lower >= MAXALIGN(SizeOfPageHeaderData) &&
+        header->pd_lower <= header->pd_upper && header->pd_upper <= header->pd_special &&
+        header->pd_special <= BLCKSZ;
+}
+
+/* The common prefix is independent of the format version and payload length. */
+static CuvsCagraMeta *
+page_meta_prefix(Page page)
+{
+    PageHeader header = (PageHeader) page;
+    CuvsCagraMeta *prefix;
+
+    if (!page_bounds_valid(page) ||
+        header->pd_lower < MAXALIGN(SizeOfPageHeaderData) + CAGRA_META_PREFIX_SIZE)
+        return NULL;
+    prefix = (CuvsCagraMeta *) PageGetContents(page);
+    return prefix->magic == CUVS_CAGRA_PAGE_MAGIC ? prefix : NULL;
+}
+
 static CuvsCagraMeta *
 page_meta(Page page)
 {
-    CuvsCagraMeta *meta;
+    CuvsCagraMeta *meta = page_meta_prefix(page);
     PageHeader header = (PageHeader) page;
 
-    if (PageIsNew(page) || header->pd_lower < MAXALIGN(SizeOfPageHeaderData) + sizeof(*meta) ||
-        header->pd_lower > header->pd_upper || header->pd_upper > BLCKSZ)
+    if (meta == NULL || header->pd_lower < MAXALIGN(SizeOfPageHeaderData) + sizeof(*meta))
         return NULL;
-    meta = (CuvsCagraMeta *) PageGetContents(page);
-    if (meta->magic != CUVS_CAGRA_PAGE_MAGIC || meta->major != CUVS_CAGRA_PAGE_MAJOR ||
-        meta->minor != 0 || meta->flags != 0 || meta->index_nonce == 0 || meta->base_nonce == 0 ||
+    /* This format accepts no flags. REINDEX_REQUIRED also makes known layouts unusable. */
+    if (meta->major != CUVS_CAGRA_PAGE_MAJOR || meta->minor != 0 || meta->flags != 0 ||
+        meta->index_nonce == 0 || meta->base_nonce == 0 ||
         meta->n_extents > CUVS_CAGRA_PAGE_DIR ||
         meta->folded > meta->n_slots || meta->base_slots != meta->n_slots - meta->folded ||
         meta->n_slots > (uint64) meta->n_extents * CUVS_CAGRA_PAGE_EXTENT * CUVS_CAGRA_TIDS_PER_PAGE ||
@@ -144,18 +183,84 @@ page_meta(Page page)
     return meta;
 }
 
+/* PG16 leaves a failed read's pin and buffer I/O in the resource owner.
+ * Catch only page corruption and release those resources before continuing. */
+static void
+discard_corrupt_read(ResourceOwner reader, MemoryContext context)
+{
+    if (geterrcode() != ERRCODE_DATA_CORRUPTED)
+        PG_RE_THROW();
+    MemoryContextSwitchTo(context);
+    FlushErrorState();
+    ResourceOwnerRelease(reader, RESOURCE_RELEASE_BEFORE_LOCKS, false, false);
+}
+
+static Buffer
+read_meta_buffer(Relation index, BufferAccessStrategy strategy)
+{
+    MemoryContext context = CurrentMemoryContext;
+    ResourceOwner caller = CurrentResourceOwner;
+    ResourceOwner reader = ResourceOwnerCreate(caller, "CAGRA metapage read");
+    Buffer buf = InvalidBuffer;
+
+    PG_TRY();
+    {
+        CurrentResourceOwner = reader;
+        buf = ReadBufferExtended(index, MAIN_FORKNUM, 0, RBM_NORMAL, strategy);
+    }
+    PG_CATCH();
+    {
+        CurrentResourceOwner = caller;
+        discard_corrupt_read(reader, context);
+        buf = InvalidBuffer;
+    }
+    PG_END_TRY();
+    CurrentResourceOwner = caller;
+
+    if (BufferIsValid(buf))
+    {
+        IncrBufferRefCount(buf);
+        CurrentResourceOwner = reader;
+        ReleaseBuffer(buf);
+        CurrentResourceOwner = caller;
+    }
+    ResourceOwnerDelete(reader);
+    return buf;
+}
+
 bool
 cuvs_cagra_read_meta(Relation index, CuvsCagraMeta *meta)
 {
-    Buffer buf = ReadBuffer(index, 0);
+    Buffer buf = read_meta_buffer(index, NULL);
     CuvsCagraMeta *found;
 
+    if (!BufferIsValid(buf))
+        return false;
     LockBuffer(buf, BUFFER_LOCK_SHARE);
     found = page_meta(BufferGetPage(buf));
     if (found != NULL)
         memcpy(meta, found, sizeof(*meta));
     UnlockReleaseBuffer(buf);
     return found != NULL;
+}
+
+bool
+cuvs_cagra_reindex_required(Relation index)
+{
+    Buffer buf;
+    CuvsCagraMeta *prefix;
+    bool required;
+
+    if (!cuvs_cagra_has_pages(index))
+        return false;
+    buf = read_meta_buffer(index, NULL);
+    if (!BufferIsValid(buf))
+        return false;
+    LockBuffer(buf, BUFFER_LOCK_SHARE);
+    prefix = page_meta_prefix(BufferGetPage(buf));
+    required = prefix != NULL && (prefix->flags & CUVS_CAGRA_REINDEX_REQUIRED) != 0;
+    UnlockReleaseBuffer(buf);
+    return required;
 }
 
 static Buffer
@@ -336,7 +441,7 @@ pending_tag(Page page, BlockNumber block, uint64 nonce)
     CuvsCagraPending *pending;
     PageHeader header = (PageHeader) page;
 
-    if (PageIsNew(page) || PageGetSpecialSize(page) != sizeof(*pending))
+    if (!page_bounds_valid(page) || PageGetSpecialSize(page) != sizeof(*pending))
         return NULL;
     pending = (CuvsCagraPending *) PageGetSpecialPointer(page);
     if (pending->kind != CUVS_PAGE_PENDING || pending->index_nonce != nonce ||
@@ -404,10 +509,9 @@ read_slots(Relation index, const CuvsCagraMeta *meta,
     buf = ReadBuffer(index, block);
     LockBuffer(buf, BUFFER_LOCK_SHARE);
     page = BufferGetPage(buf);
-    if (!PageIsNew(page) && PageGetSpecialSize(page) == sizeof(*tag) &&
+    if (page_bounds_valid(page) && PageGetSpecialSize(page) == sizeof(*tag) &&
         ((PageHeader) page)->pd_lower >= MAXALIGN(SizeOfPageHeaderData) +
-            (offset + count) * sizeof(ItemPointerData) &&
-        ((PageHeader) page)->pd_lower <= ((PageHeader) page)->pd_upper)
+            (offset + count) * sizeof(ItemPointerData))
     {
         tag = (CuvsCagraTidPage *) PageGetSpecialPointer(page);
         if (tag->kind == CUVS_PAGE_TIDS && tag->base_nonce == meta->base_nonce &&
@@ -505,13 +609,14 @@ cuvs_cagra_append_pending(Relation index, ItemPointer tid, int dim)
     for (;;)
     {
         Buffer tb = ReadBuffer(index, tail);
-        Buffer mb = InvalidBuffer;
+        Buffer mb;
         Buffer nb = InvalidBuffer;
         CuvsCagraPending *pending;
-        CuvsCagraMeta *meta = NULL;
+        CuvsCagraMeta *meta;
         GenericXLogState *wal;
         Page image;
         bool full;
+        bool update_meta;
         CuvsCagraRelCache *cache;
 
         LockBuffer(tb, BUFFER_LOCK_EXCLUSIVE);
@@ -530,27 +635,18 @@ cuvs_cagra_append_pending(Relation index, ItemPointer tid, int dim)
         }
 
         full = pending->count == CUVS_CAGRA_PENDING_PER_PAGE;
-        if (full && cached.dim == 0)
-        {
-            CuvsCagraMeta current;
-
-            if (!cuvs_cagra_read_meta(index, &current) ||
-                current.index_nonce != cached.index_nonce || current.pending_tail != tail)
-                bad_page(index, 0);
-            cuvs_cagra_check_dim(current.dim, dim);
-        }
+        update_meta = cached.dim == 0 || full;
+        /* Hold the metapage lock through publication. A cached tail must
+         * still reject writes after another backend marks the index. */
+        mb = ReadBuffer(index, 0);
+        LockBuffer(mb, update_meta ? BUFFER_LOCK_EXCLUSIVE : BUFFER_LOCK_SHARE);
+        meta = page_meta(BufferGetPage(mb));
+        if (meta == NULL || meta->index_nonce != cached.index_nonce ||
+            meta->pending_tail != tail)
+            bad_page(index, 0);
+        cuvs_cagra_check_dim(meta->dim, dim);
         if (full)
             nb = extend_page(index, MAIN_FORKNUM);
-        if (cached.dim == 0 || full)
-        {
-            mb = ReadBuffer(index, 0);
-            LockBuffer(mb, BUFFER_LOCK_EXCLUSIVE);
-            meta = page_meta(BufferGetPage(mb));
-            if (meta == NULL || meta->index_nonce != cached.index_nonce ||
-                meta->pending_tail != tail)
-                bad_page(index, 0);
-            cuvs_cagra_check_dim(meta->dim, dim);
-        }
 
         wal = GenericXLogStart(index);
         image = GenericXLogRegisterBuffer(wal, tb, 0);
@@ -565,7 +661,7 @@ cuvs_cagra_append_pending(Relation index, ItemPointer tid, int dim)
             tail = next;
         }
         append_item(image, tid);
-        if (meta != NULL)
+        if (update_meta)
         {
             CuvsCagraMeta *updated = (CuvsCagraMeta *)
                 PageGetContents(GenericXLogRegisterBuffer(wal, mb, 0));
@@ -574,8 +670,7 @@ cuvs_cagra_append_pending(Relation index, ItemPointer tid, int dim)
             updated->pending_tail = tail;
         }
         GenericXLogFinish(wal);
-        if (BufferIsValid(mb))
-            UnlockReleaseBuffer(mb);
+        UnlockReleaseBuffer(mb);
         if (BufferIsValid(nb))
             UnlockReleaseBuffer(nb);
         UnlockReleaseBuffer(tb);
@@ -595,12 +690,28 @@ typedef struct CagraVacuum
     GenericXLogState       *wal;
     Buffer                  held[MAX_GENERIC_XLOG_PAGES];
     int                     nheld;
+    BlockNumber             nblocks;
+    BlockNumber             block;
+    BufferAccessStrategy    strategy;
+    bool                    validate_only;
     uint64                  removed;
     uint64                  live;
     uint64                  dead_slots;
 } CagraVacuum;
 
 #ifdef CUVS_TEST_HOOKS
+PG_FUNCTION_INFO_V1(cuvs_test_cagra_reindex_required);
+
+Datum
+cuvs_test_cagra_reindex_required(PG_FUNCTION_ARGS)
+{
+    Relation index = index_open(PG_GETARG_OID(0), AccessShareLock);
+    bool required = cuvs_cagra_reindex_required(index);
+
+    index_close(index, AccessShareLock);
+    PG_RETURN_BOOL(required);
+}
+
 static bool cuvs_test_pause_page_vacuum;
 
 void
@@ -612,6 +723,79 @@ cuvs_cagra_vacuum_init_test_hook(void)
                              GUC_NOT_IN_SAMPLE, NULL, NULL, NULL);
 }
 #endif
+
+static List *vacuum_warned_indexes = NIL;
+
+static void
+vacuum_reset_warnings(void *arg)
+{
+    vacuum_warned_indexes = NIL;
+}
+
+/* Both VACUUM callbacks can visit each index, including multiple bulk-delete
+ * rounds. Keep all warned OIDs for the command, even when they interleave. */
+static void
+vacuum_warn_reindex(Relation index)
+{
+    Oid oid = RelationGetRelid(index);
+    MemoryContext old;
+
+    if (list_member_oid(vacuum_warned_indexes, oid))
+        return;
+
+    old = MemoryContextSwitchTo(TopTransactionContext);
+    if (vacuum_warned_indexes == NIL)
+    {
+        MemoryContextCallback *reset = palloc0(sizeof(*reset));
+
+        reset->func = vacuum_reset_warnings;
+        MemoryContextRegisterResetCallback(TopTransactionContext, reset);
+    }
+    vacuum_warned_indexes = lappend_oid(vacuum_warned_indexes, oid);
+    MemoryContextSwitchTo(old);
+    ereport(WARNING,
+            (errmsg("VACUUM skipped unrecognized or damaged CAGRA index \"%s\"",
+                    RelationGetRelationName(index)),
+             errhint("REINDEX INDEX %s using a build that supports the page format.",
+                     quote_qualified_identifier(get_namespace_name(RelationGetNamespace(index)),
+                                                RelationGetRelationName(index)))));
+}
+
+static void
+vacuum_mark_reindex(Relation index, BufferAccessStrategy strategy)
+{
+    Buffer buf = read_meta_buffer(index, strategy);
+    CuvsCagraMeta *prefix;
+
+    if (!BufferIsValid(buf))
+        return;
+    LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
+    prefix = page_meta_prefix(BufferGetPage(buf));
+    if (prefix != NULL && !(prefix->flags & CUVS_CAGRA_REINDEX_REQUIRED))
+    {
+        GenericXLogState *wal = GenericXLogStart(index);
+
+        prefix = (CuvsCagraMeta *) PageGetContents(GenericXLogRegisterBuffer(wal, buf, 0));
+        prefix->flags |= CUVS_CAGRA_REINDEX_REQUIRED;
+        GenericXLogFinish(wal);
+    }
+    UnlockReleaseBuffer(buf);
+}
+
+static IndexBulkDeleteResult *
+vacuum_skip(IndexVacuumInfo *info, BlockNumber block)
+{
+    Relation index = info->index;
+
+    /* PG16 also calls ambulkdelete for CREATE INDEX CONCURRENTLY validation. */
+    if (info->report_progress)
+        bad_page(index, block);
+
+    vacuum_mark_reindex(index, info->strategy);
+    UnlockPage(index, 0, ExclusiveLock);
+    vacuum_warn_reindex(index);
+    return NULL;
+}
 
 /* Record only dirty pages; retain their locks until this batch is published. */
 static void
@@ -631,16 +815,19 @@ vacuum_lock(CagraVacuum *vac, BlockNumber block)
 {
     Buffer buf;
 
+    CHECK_FOR_INTERRUPTS();
+    vac->block = block;
+    if (block == 0 || block >= vac->nblocks)
+        return InvalidBuffer;
     if (vac->nheld == lengthof(vac->held))
         vacuum_finish_batch(vac);
-    CHECK_FOR_INTERRUPTS();
-    buf = ReadBuffer(vac->index, block);
-    LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
+    buf = ReadBufferExtended(vac->index, MAIN_FORKNUM, block, RBM_NORMAL, vac->strategy);
+    LockBuffer(buf, vac->validate_only ? BUFFER_LOCK_SHARE : BUFFER_LOCK_EXCLUSIVE);
     vac->held[vac->nheld++] = buf;
     return buf;
 }
 
-static void
+static bool
 vacuum_tids(CagraVacuum *vac, Buffer buf, uint32 start, uint32 count,
             const CuvsCagraTidPage *tid_tag)
 {
@@ -659,6 +846,13 @@ vacuum_tids(CagraVacuum *vac, Buffer buf, uint32 start, uint32 count,
             ++old_dead;
             continue;
         }
+        if (vac->validate_only)
+        {
+            if (!BlockNumberIsValid(ItemPointerGetBlockNumber(&tid)) ||
+                ItemPointerGetOffsetNumber(&tid) > MaxHeapTuplesPerPage)
+                return false;
+            continue;
+        }
         if (!vac->callback(&tid, vac->callback_state))
         {
             ++vac->live;
@@ -674,18 +868,22 @@ vacuum_tids(CagraVacuum *vac, Buffer buf, uint32 start, uint32 count,
         ++removed;
     }
 
-    vac->removed += removed;
-    if (tid_tag)
+    if (tid_tag && old_dead != tid_tag->dead)
+        return false;
+    if (!vac->validate_only)
     {
-        if (old_dead != tid_tag->dead)
-            bad_page(vac->index, BufferGetBlockNumber(buf));
-        if (image)
-            ((CuvsCagraTidPage *) PageGetSpecialPointer(image))->dead = old_dead + removed;
-        vac->dead_slots += old_dead + removed;
+        vac->removed += removed;
+        if (tid_tag)
+        {
+            if (image)
+                ((CuvsCagraTidPage *) PageGetSpecialPointer(image))->dead = old_dead + removed;
+            vac->dead_slots += old_dead + removed;
+        }
     }
+    return true;
 }
 
-static void
+static bool
 vacuum_pending(CagraVacuum *vac, const CuvsCagraMeta *meta)
 {
     BlockNumber block = meta->pending_head;
@@ -694,29 +892,36 @@ vacuum_pending(CagraVacuum *vac, const CuvsCagraMeta *meta)
     for (;;)
     {
         Buffer buf = vacuum_lock(vac, block);
-        CuvsCagraPending *tag = page_pending(vac->index, block, BufferGetPage(buf),
-                                            meta->index_nonce);
+        const CuvsCagraPending *tag;
         uint32 start = 0;
+        BlockNumber next;
 
-        if ((expected && tag->first_pos != expected) ||
+        if (!BufferIsValid(buf))
+            return false;
+        tag = pending_tag(BufferGetPage(buf), block, meta->index_nonce);
+        if (tag == NULL || (expected && tag->first_pos != expected) ||
             tag->first_pos > UINT64_MAX - tag->count)
-            bad_page(vac->index, block);
+            return false;
+        next = tag->next;
+        /* A concurrent insert may extend the snapshotted tail. Other pages
+         * must be full and link to the next position in the snapshot. */
+        if (block != meta->pending_tail &&
+            (!BlockNumberIsValid(next) || tag->count != CUVS_CAGRA_PENDING_PER_PAGE))
+            return false;
+        expected = tag->first_pos + tag->count;
         if (meta->folded > tag->first_pos)
             start = Min(meta->folded - tag->first_pos, (uint64) tag->count);
-        vacuum_tids(vac, buf, start, tag->count, NULL);
-        /* Inserts can append after the metapage snapshot. Their TIDs are not
-         * old enough to be removed by this VACUUM. Validation also only needs
-         * pending entries present when it read the metapage. */
+        if (!vacuum_tids(vac, buf, start, tag->count, NULL))
+            return false;
+        if (vac->validate_only)
+            vacuum_finish_batch(vac);
         if (block == meta->pending_tail)
-            break;
-        if (!BlockNumberIsValid(tag->next) || tag->count != CUVS_CAGRA_PENDING_PER_PAGE)
-            bad_page(vac->index, block);
-        expected = tag->first_pos + tag->count;
-        block = tag->next;
+            return true;
+        block = next;
     }
 }
 
-static void
+static bool
 vacuum_slots(CagraVacuum *vac, const CuvsCagraMeta *meta)
 {
     uint64 slot = 0;
@@ -725,33 +930,75 @@ vacuum_slots(CagraVacuum *vac, const CuvsCagraMeta *meta)
     {
         BlockNumber base;
 
+        vac->block = 0;
         if (extent >= meta->n_extents)
-            bad_page(vac->index, 0);
+            return false;
         base = meta->extents[extent];
-        if (base == 0 ||
-            base >= InvalidBlockNumber - CUVS_CAGRA_PAGE_EXTENT)
-            bad_page(vac->index, 0);
+        if (base == 0 || base >= InvalidBlockNumber - CUVS_CAGRA_PAGE_EXTENT)
+            return false;
         for (uint32 i = 0; i < CUVS_CAGRA_PAGE_EXTENT && slot < meta->n_slots; ++i)
         {
             BlockNumber block = base + i;
             uint32 count = Min((uint64) CUVS_CAGRA_TIDS_PER_PAGE, meta->n_slots - slot);
             Buffer buf = vacuum_lock(vac, block);
-            Page page = BufferGetPage(buf);
-            PageHeader header = (PageHeader) page;
+            Page page;
+            PageHeader header;
             const CuvsCagraTidPage *tag;
 
-            if (PageIsNew(page) || PageGetSpecialSize(page) != sizeof(*tag) ||
-                header->pd_lower < MAXALIGN(SizeOfPageHeaderData) + count * sizeof(ItemPointerData) ||
-                header->pd_lower > header->pd_upper)
-                bad_page(vac->index, block);
+            if (!BufferIsValid(buf))
+                return false;
+            page = BufferGetPage(buf);
+            header = (PageHeader) page;
+            if (!page_bounds_valid(page) || PageGetSpecialSize(page) != sizeof(*tag) ||
+                header->pd_lower < MAXALIGN(SizeOfPageHeaderData) + count * sizeof(ItemPointerData))
+                return false;
             tag = (CuvsCagraTidPage *) PageGetSpecialPointer(page);
             if (tag->kind != CUVS_PAGE_TIDS || tag->base_nonce != meta->base_nonce ||
-                tag->first_slot != slot || tag->flags != 0 || tag->dead > count)
-                bad_page(vac->index, block);
-            vacuum_tids(vac, buf, 0, count, tag);
+                tag->first_slot != slot || tag->flags != 0 || tag->dead > count ||
+                !vacuum_tids(vac, buf, 0, count, tag))
+                return false;
+            if (vac->validate_only)
+                vacuum_finish_batch(vac);
             slot += count;
         }
     }
+    return true;
+}
+
+/* Validate the snapshot before the first TID WAL batch. The page lock excludes
+ * other vacuum writers; inserts can only append or extend the pending tail. */
+static bool
+vacuum_validate(CagraVacuum *vac, const CuvsCagraMeta *meta)
+{
+    MemoryContext context = CurrentMemoryContext;
+    ResourceOwner caller = CurrentResourceOwner;
+    ResourceOwner reader;
+    bool valid = false;
+
+    if (meta->delete_generation == UINT64_MAX)
+        return false;
+    vac->nblocks = RelationGetNumberOfBlocks(vac->index);
+    vac->validate_only = true;
+    reader = ResourceOwnerCreate(caller, "CAGRA VACUUM validation");
+    PG_TRY();
+    {
+        CurrentResourceOwner = reader;
+        valid = vacuum_pending(vac, meta) && vacuum_slots(vac, meta);
+        vacuum_finish_batch(vac);
+    }
+    PG_CATCH();
+    {
+        /* The read-only pass releases each content lock before reading the
+         * next block. A failed read can only leave its I/O and pin behind. */
+        CurrentResourceOwner = caller;
+        discard_corrupt_read(reader, context);
+        valid = false;
+    }
+    PG_END_TRY();
+    CurrentResourceOwner = caller;
+    ResourceOwnerDelete(reader);
+    vac->validate_only = false;
+    return valid;
 }
 
 IndexBulkDeleteResult *
@@ -760,19 +1007,17 @@ cuvs_cagra_page_bulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 {
     Relation index = info->index;
     CuvsCagraMeta meta;
-    CagraVacuum vac = {.index = index, .callback = callback, .callback_state = callback_state};
+    CagraVacuum vac = {.index = index, .callback = callback, .callback_state = callback_state,
+                       .strategy = info->strategy};
     Buffer mb;
     CuvsCagraMeta *updated;
     GenericXLogState *wal;
 
-    if (stats == NULL)
-        stats = palloc0(sizeof(*stats));
-
     LockPage(index, 0, ExclusiveLock);
-    if (!cuvs_cagra_read_meta(index, &meta))
-        bad_page(index, 0);
-    vacuum_pending(&vac, &meta);
-    vacuum_slots(&vac, &meta);
+    if (!cuvs_cagra_read_meta(index, &meta) || !vacuum_validate(&vac, &meta))
+        return vacuum_skip(info, vac.block);
+    if (!vacuum_pending(&vac, &meta) || !vacuum_slots(&vac, &meta))
+        bad_page(index, vac.block);
     vacuum_finish_batch(&vac);
 
 #ifdef CUVS_TEST_HOOKS
@@ -804,6 +1049,8 @@ cuvs_cagra_page_bulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
     UnlockReleaseBuffer(mb);
     UnlockPage(index, 0, ExclusiveLock);
 
+    if (stats == NULL)
+        stats = palloc0(sizeof(*stats));
     stats->num_pages = RelationGetNumberOfBlocks(index);
     stats->estimated_count = true;
     stats->num_index_tuples = vac.live;
@@ -815,13 +1062,15 @@ IndexBulkDeleteResult *
 cuvs_cagra_page_vacuumcleanup(IndexVacuumInfo *info, IndexBulkDeleteResult *stats)
 {
     CuvsCagraMeta meta;
+    CagraVacuum vac = {.index = info->index, .strategy = info->strategy};
 
     if (info->analyze_only)
         return stats;
 
     LockPage(info->index, 0, ExclusiveLock);
-    if (!cuvs_cagra_read_meta(info->index, &meta))
-        bad_page(info->index, 0);
+    if (!cuvs_cagra_read_meta(info->index, &meta) ||
+        (stats == NULL && !vacuum_validate(&vac, &meta)))
+        return vacuum_skip(info, vac.block);
     if (stats != NULL)
         stats->num_pages = RelationGetNumberOfBlocks(info->index);
     UnlockPage(info->index, 0, ExclusiveLock);

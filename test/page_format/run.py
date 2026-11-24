@@ -24,7 +24,7 @@ MUTATIONS = {
     "unknown": ("    meta.major = CUVS_CAGRA_PAGE_MAJOR;",
                 "    meta.major = CUVS_CAGRA_PAGE_MAJOR + 1;"),
     "flags": ("    meta.major = CUVS_CAGRA_PAGE_MAJOR;",
-              "    meta.major = CUVS_CAGRA_PAGE_MAJOR;\n    meta.flags = 1;"),
+              "    meta.major = CUVS_CAGRA_PAGE_MAJOR;\n    meta.flags = 128;"),
 }
 
 
@@ -489,7 +489,244 @@ def check_page_eviction(cluster, daemon, library, enabled, disabled):
     print("Legacy LOAD reclaimed unsearched page graphs while retaining the active graph: PASS", flush=True)
 
 
-def run(work, logs):
+def check_unsupported_vacuum(cluster, binary, mutation):
+    with cluster.daemon(binary, mutation):
+        cluster.start()
+        try:
+            cluster.file("postgres", "alpha2_unknown")
+            if "unrecognized CAGRA metapage" not in (
+                    cluster.logs / f"{mutation}-alpha2_unknown.log").read_text():
+                raise RuntimeError("unknown metapage fallback was not observed")
+            cluster.sql("postgres", "delete", "-c", "DELETE FROM unknown_layout WHERE id=2;")
+            for case in ("vacuum", "vacuum-again"):
+                cluster.sql("postgres", case, "-c",
+                            "VACUUM (INDEX_CLEANUP ON, TRUNCATE OFF) unknown_layout;")
+                log = (cluster.logs / f"{mutation}-{case}.log").read_text()
+                for index in ("unknown_layout_idx", "unknown_layout_idx2"):
+                    if (log.count(f'WARNING:  VACUUM skipped unrecognized or damaged CAGRA index "{index}"') != 1
+                            or log.count(f"HINT:  REINDEX INDEX public.{index} ") != 1):
+                        raise RuntimeError(f"{case}: expected one VACUUM warning and REINDEX hint for {index}: {log}")
+            flags = 129 if mutation == "flags" else 1
+            cluster.sql("postgres", "reindex-mark", "-c", f"""
+                DO $$
+                BEGIN
+                    IF (SELECT array_agg(get_byte(get_raw_page(index, 0), 32) ORDER BY index)
+                        FROM unnest(ARRAY['unknown_layout_idx', 'unknown_layout_idx2']) AS index)
+                        IS DISTINCT FROM ARRAY[{flags}, {flags}] THEN
+                        RAISE EXCEPTION 'VACUUM did not set only the REINDEX flag';
+                    END IF;
+                    IF coalesce((SELECT lp_flags FROM heap_page_items(get_raw_page('unknown_layout', 0))
+                        WHERE lp = 2), 0) <> 0 THEN
+                        RAISE EXCEPTION 'VACUUM did not reclaim the dead heap TID';
+                    END IF;
+                END $$;
+            """)
+            print(f"{mutation}: heap fallback, write refusal, VACUUM and REINDEX mark: PASS", flush=True)
+        finally:
+            cluster.stop()
+
+
+def check_corrupt_vacuum(cluster, binary):
+    with cluster.daemon(binary, "corrupt"):
+        cluster.start()
+        try:
+            cluster.sql("postgres", "prepare", "-c", """
+                CREATE EXTENSION vector;
+                CREATE EXTENSION pg_cuvs;
+                CREATE EXTENSION pageinspect;
+                CREATE TABLE corrupt_layout(id int PRIMARY KEY, v vector(3));
+                INSERT INTO corrupt_layout
+                SELECT i, CASE WHEN i = 6900 THEN '[2,0,0]' ELSE '[1,2,3]' END::vector
+                FROM generate_series(1,6900) i;
+                CREATE INDEX corrupt_layout_idx ON corrupt_layout USING cagra(v vector_l2_ops);
+                DELETE FROM corrupt_layout WHERE id IN (1, 1400, 2800, 4200);
+            """)
+            cluster.sql("postgres", "path", "-At", "-c", """
+                SELECT pg_relation_filepath('corrupt_layout_idx'), current_setting('block_size');
+            """)
+            filename, block_size = (cluster.logs / "corrupt-path.log").read_text().splitlines()[-1].split("|")
+            block_size = int(block_size)
+            cluster.stop()
+            relation = cluster.data / filename
+            with relation.open("r+b") as file:
+                before = file.read()
+                bad_page = 5 * block_size
+                special = struct.unpack_from("=H", before, bad_page + 16)[0]
+                file.seek(bad_page + special)
+                file.write(b"\xff\xff")
+
+            cluster.start("damaged")
+            cluster.sql("postgres", "cached-write", "-c",
+                        "INSERT INTO corrupt_layout VALUES (8000, '[0,0,0]');",
+                        "-c", "DELETE FROM corrupt_layout WHERE id=8000;",
+                        "-c", "CHECKPOINT;",
+                        "-c", "VACUUM (INDEX_CLEANUP ON, TRUNCATE OFF) corrupt_layout;",
+                        "-c", """
+                DO $$
+                BEGIN
+                    IF get_byte(get_raw_page('corrupt_layout_idx', 0), 32) <> 1 THEN
+                        RAISE EXCEPTION 'corrupt TID page did not cause a REINDEX mark';
+                    END IF;
+                    BEGIN
+                        INSERT INTO corrupt_layout VALUES (8001, '[0,0,0]');
+                        RAISE EXCEPTION 'cached pending tail bypassed the REINDEX mark';
+                    EXCEPTION WHEN data_corrupted THEN
+                        NULL;
+                    END;
+                END $$;
+            """)
+            log = (cluster.logs / "corrupt-cached-write.log").read_text()
+            if log.count('WARNING:  VACUUM skipped unrecognized or damaged CAGRA index "corrupt_layout_idx"') != 1:
+                raise RuntimeError(f"corrupt VACUUM did not warn once: {log}")
+            cluster.sql("postgres", "flush-wal", "-c", "SELECT pg_switch_wal();")
+            cluster.stop("immediate")
+            if relation.read_bytes()[32] != 0:
+                raise RuntimeError("REINDEX flag reached the index file before WAL replay")
+            cluster.start("redo")
+            cluster.sql("postgres", "redo-flag", "-c", """
+                DO $$ BEGIN
+                    IF get_byte(get_raw_page('corrupt_layout_idx', 0), 32) <> 1 THEN
+                        RAISE EXCEPTION 'REINDEX mark lost after WAL replay';
+                    END IF;
+                END $$;
+            """)
+            cluster.stop()
+            after = relation.read_bytes()
+            # The checkpoint before VACUUM captured the appended pending TID.
+            # Compare all earlier base pages, where a one-pass VACUUM could
+            # have committed earlier batches before it saw the bad tag.
+            if after[block_size:bad_page] != before[block_size:bad_page]:
+                raise RuntimeError("VACUUM modified TID pages before detecting corruption")
+            with relation.open("r+b") as file:
+                file.seek(bad_page + special)
+                file.write(before[bad_page + special:bad_page + special + 2])
+            cluster.start("restored-tag")
+            cluster.sql("postgres", "fallback-rebuild", "-c", """
+                SET enable_seqscan = off;
+                DO $$
+                BEGIN
+                    IF (SELECT id FROM corrupt_layout ORDER BY v <-> '[2,0,0]' LIMIT 1)
+                        IS DISTINCT FROM 6900 THEN
+                        RAISE EXCEPTION 'marked index did not return an exact result';
+                    END IF;
+                END $$;
+                REINDEX INDEX corrupt_layout_idx;
+                INSERT INTO corrupt_layout VALUES (8001, '[0,0,0]');
+                DO $$ BEGIN
+                    IF get_byte(get_raw_page('corrupt_layout_idx', 0), 32) <> 0 THEN
+                        RAISE EXCEPTION 'REINDEX retained the marker';
+                    END IF;
+                END $$;
+            """)
+            if "unrecognized CAGRA metapage" not in (
+                    cluster.logs / "corrupt-fallback-rebuild.log").read_text():
+                raise RuntimeError("marked known format did not use the exact heap fallback")
+            print("corrupt TID page: no TID changes, cached write refusal, WAL replay and REINDEX: PASS",
+                  flush=True)
+        finally:
+            cluster.stop()
+
+
+def check_corrupt_prefix(cluster, binary):
+    indexes = ("future_idx", "short_idx", "bad_magic_idx", "bad_header_idx", "bad_slot_idx")
+    names = ", ".join(f"'{name}'" for name in indexes)
+    with cluster.daemon(binary, "prefix"):
+        cluster.start()
+        try:
+            cluster.sql("postgres", "prepare", "-c", """
+                CREATE EXTENSION vector;
+                CREATE EXTENSION pg_cuvs;
+                CREATE EXTENSION pageinspect;
+                CREATE TABLE broken_prefix(id int PRIMARY KEY, v vector(3));
+                INSERT INTO broken_prefix VALUES (1, '[1,2,3]'), (2, '[2,0,0]');
+            """ + "".join(f"CREATE INDEX {name} ON broken_prefix USING cagra(v vector_l2_ops);"
+                          for name in indexes))
+            cluster.sql("postgres", "paths", "-At", "-c", f"""
+                SELECT name, pg_relation_filepath(name::regclass), current_setting('block_size')
+                FROM unnest(ARRAY[{names}]) AS name;
+            """)
+            rows = [line for line in (cluster.logs / "prefix-paths.log").read_text().splitlines()
+                    if line.count("|") == 2]
+            if len(rows) != len(indexes):
+                raise RuntimeError("did not resolve every damaged index fixture")
+            cluster.stop()
+            relations = {}
+            for row in rows:
+                name, filename, block_size = row.split("|")
+                relation = cluster.data / filename
+                images = bytearray(relation.read_bytes())
+                if name in ("future_idx", "short_idx"):
+                    struct.pack_into("=H", images, 12, 36 if name == "future_idx" else 35)
+                    struct.pack_into("=HHI", images, 28, 777, 12, 128)
+                elif name == "bad_magic_idx":
+                    struct.pack_into("=I", images, 24, 0)
+                else:
+                    block = int(block_size) if name == "bad_slot_idx" else 0
+                    struct.pack_into("=H", images, block + 16, 0)
+                relation.write_bytes(images)
+                relations[name] = (relation, bytes(images), int(block_size))
+
+            cluster.start("damaged")
+            cluster.sql("postgres", "vacuum", "-c",
+                        "VACUUM (INDEX_CLEANUP ON, TRUNCATE OFF) broken_prefix;",
+                        "-c", "DELETE FROM broken_prefix WHERE id=2;",
+                        "-c", "VACUUM (INDEX_CLEANUP ON, TRUNCATE OFF) broken_prefix;")
+            log = (cluster.logs / "prefix-vacuum.log").read_text()
+            for name in indexes:
+                warning = f'WARNING:  VACUUM skipped unrecognized or damaged CAGRA index "{name}"'
+                if log.count(warning) != 2 or log.count(f"HINT:  REINDEX INDEX public.{name} ") != 2:
+                    raise RuntimeError(f"expected a warning and hint for {name} in each VACUUM: {log}")
+
+            cluster.sql("postgres", "worker-reader", "-c", """
+                CREATE FUNCTION test_cagra_reindex_required(regclass) RETURNS bool
+                AS '$libdir/pg_cuvs', 'cuvs_test_cagra_reindex_required' LANGUAGE C STRICT;
+                DO $$ BEGIN
+                    IF NOT test_cagra_reindex_required('future_idx')
+                        OR NOT test_cagra_reindex_required('bad_slot_idx')
+                        OR test_cagra_reindex_required('short_idx')
+                        OR test_cagra_reindex_required('bad_magic_idx')
+                        OR test_cagra_reindex_required('bad_header_idx')
+                        OR test_cagra_reindex_required('broken_prefix_pkey') THEN
+                        RAISE EXCEPTION 'the rebuild worker reader misclassified a metapage';
+                    END IF;
+                END $$;
+            """)
+            cluster.stop()
+            for name, (relation, before, block_size) in relations.items():
+                after = relation.read_bytes()
+                if name in ("future_idx", "bad_slot_idx"):
+                    flag = struct.unpack_from("=I", after, 32)[0]
+                    expected = 129 if name == "future_idx" else 1
+                    if flag != expected or after[block_size:] != before[block_size:]:
+                        raise RuntimeError(f"incorrect marker or data changes for {name}")
+                elif after != before:
+                    raise RuntimeError(f"VACUUM changed an index without a valid common prefix: {name}")
+            print("damaged prefix: cleanup-only and bulk delete, guarded writes and warning scope: PASS",
+                  flush=True)
+        finally:
+            cluster.stop()
+
+
+def check_page_mutations(work, logs, source, bindir, lib, *, u12_only):
+    changed = source / "src/cuvs_cagra_pages.c"
+    original = changed.read_text()
+    for mutation, (old, new) in MUTATIONS.items():
+        unsupported = mutation in ("unknown", "flags")
+        if u12_only and not unsupported:
+            continue
+        if original.count(old) != 1:
+            raise RuntimeError(f"non-unique mutation anchor: {mutation}")
+        changed.write_text(original.replace(old, new, 1))
+        build(source, 1, logs / f"build-{mutation}.log")
+        shutil.copy2(source / "pg_cuvs.so", lib)
+        fixture = Cluster(work / mutation, bindir, logs)
+        if unsupported:
+            check_unsupported_vacuum(fixture, source / "pg_cuvs_server", mutation)
+        else:
+            wal(fixture, mutant=mutation)
+
+
+def run(work, logs, *, u12_only=False):
     paths = {key: Path(subprocess.check_output([PG_CONFIG, "--" + key], text=True).strip())
              for key in ("bindir", "pkglibdir", "sharedir")}
     stage = work / "pg"
@@ -501,10 +738,15 @@ def run(work, logs):
 
     source_on = work / "on"
     source_off = work / "off"
-    for source in (source_on, source_off):
-        copy_source(ROOT, source)
+    copy_source(ROOT, source_on)
     build(source_on, 1, logs / "build-on.log")
     build(source_on, 1, logs / "install.log", install=stage)
+    check_corrupt_vacuum(Cluster(work / "corrupt", bindir, logs), source_on / "pg_cuvs_server")
+    check_corrupt_prefix(Cluster(work / "prefix", bindir, logs), source_on / "pg_cuvs_server")
+    if u12_only:
+        check_page_mutations(work, logs, source_on, bindir, lib, u12_only=True)
+        return
+    copy_source(ROOT, source_off)
     build(source_off, 0, logs / "build-off.log")
     enabled = work / "enabled.so"
     disabled = source_off / "pg_cuvs.so"
@@ -570,32 +812,7 @@ def run(work, logs):
                         lib, enabled, disabled)
 
     wal(Cluster(work / "wal", bindir, logs))
-    changed = source_on / "src/cuvs_cagra_pages.c"
-    original = changed.read_text()
-    for mutation, (old, new) in MUTATIONS.items():
-        if original.count(old) != 1:
-            raise RuntimeError(f"non-unique mutation anchor: {mutation}")
-        changed.write_text(original.replace(old, new, 1))
-        build(source_on, 1, logs / f"build-{mutation}.log")
-        shutil.copy2(source_on / "pg_cuvs.so", lib)
-        fixture = Cluster(work / mutation, bindir, logs)
-        if mutation in ("unknown", "flags"):
-            with fixture.daemon(source_on / "pg_cuvs_server", mutation):
-                fixture.start()
-                try:
-                    fixture.file("postgres", "alpha2_unknown")
-                    if "unrecognized CAGRA metapage" not in (
-                            logs / f"{mutation}-alpha2_unknown.log").read_text():
-                        raise RuntimeError("unknown metapage fallback was not observed")
-                    fixture.sql("postgres", "vacuum", "-v", "VERBOSITY=verbose",
-                                "-c", "VACUUM (INDEX_CLEANUP ON) unknown_layout;",
-                                expect=["XX001", "invalid CAGRA index page at block 0", "HINT:",
-                                        "REINDEX INDEX unknown_layout_idx"])
-                    print(f"{mutation}: heap fallback and write/VACUUM refusal: PASS", flush=True)
-                finally:
-                    fixture.stop()
-        else:
-            wal(fixture, mutant=mutation)
+    check_page_mutations(work, logs, source_on, bindir, lib, u12_only=False)
 
     shutil.copy2(disabled, lib)
     with cluster.daemon(source_off / "pg_cuvs_server", "off"):
@@ -648,4 +865,4 @@ if __name__ == "__main__":
         scratch = Path(directory)
         output = Path(os.environ.get("PAGE_TEST_OUTPUT", scratch / "logs")).resolve()
         output.mkdir(parents=True, exist_ok=True)
-        run(scratch, output)
+        run(scratch, output, u12_only="--u12-only" in sys.argv[2:])
