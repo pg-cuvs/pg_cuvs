@@ -48,6 +48,10 @@ ACE 영수증의 조각 수는 pg_cuvs를 빌드할 때 SDK 소스를 지정했�
 hnswlib 파일 EF와 ACE 요청 설정은 4–65535 범위다. hnswlib는 native EF를 M 이상으로 제한한다. 영수증의 `hierarchy_ef_construction`은 파일에서 읽은 EF다. GPU 상위 그래프 빌더는 SDK의 이웃 행렬과 예산을 받아 동작한다. 훈련 비율, probe 수, seed는 그대로다.
 이는 생성 노력의 전달 계약이며 recall의 단조 증가를 보장하지 않는다.
 `tiny` 경로는 전체 이웃을 다루므로 이 옵션이 그래프 품질을 바꾸지 않는다.
+`source`를 지정한 CAGRA 변환에서는 `ef_construction`을 이후 PostgreSQL 삽입에
+쓸 메타페이지 값으로만 기록한다. `nsw`와 `hnsw` 모드의 상위 계층은 변환
+빌더 자체 설정으로 만든다. `hnswlib`는 SDK 변환 설정을 쓰고,
+`hnswlib_file`은 앞서 만든 파일을 가져온다.
 `m`은 기존처럼 정보용이며 실제 graph degree가 레이아웃을 결정한다.
 
 ## ACE 조각 그래프 품질

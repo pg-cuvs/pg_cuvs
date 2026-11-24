@@ -512,7 +512,7 @@ cagra/ivfpq") rather than silently failing.
 | `source` | string | `` | a `cagra` index name on the same table | empty = private direct HNSW file build from the heap (op23), without a persistent CAGRA index |
 | `mode` | string | `nsw` | `nsw`, `hnswlib`, `hnsw`, `hnswlib_file` | `nsw` and `hnswlib` are recommended. With `source`, `nsw` and `hnsw` give the same graph: level 0 from the CAGRA graph and upper layers built by the daemon on the host. Since 0.9.3 this path checks the pgvector version as the heap build does (outside the supported range is an error, not a warning) |
 | `m` | int | `16` | 2–100 | **informational** — the CAGRA graph degree drives the HNSW layout, not `m` |
-| `ef_construction` | int | `64` | 4–1000 | Heap construction effort. Builds store the configured value in the metapage, including empty and source builds. Source builds reuse the source graph. |
+| `ef_construction` | int | `64` | 4–1000 | Heap construction effort. All builds store the configured value in the metapage for later PostgreSQL inserts. In a CAGRA source conversion, this option affects the metapage only and the upper layers use the source-conversion builder settings. |
 | `build_algo` | enum | `auto` | `auto`, `ivf_pq`, `nn_descent`, `ace` | Direct heap build only; cannot be combined with explicit `source` |
 
 For direct heap construction, `auto` uses tiny exact GPU construction below 16 rows and
