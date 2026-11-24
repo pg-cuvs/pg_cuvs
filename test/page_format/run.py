@@ -845,7 +845,8 @@ def run(work, logs):
     with cluster.daemon(source_on / "pg_cuvs_server", "on", overlay_host_bytes=4 * 1024**3) as daemon:
         cluster.start()
         try:
-            for case in ("alpha1", "alpha2_basic", "truncate", "relcache", "beta1a", "beta1b_expression"):
+            for case in ("alpha1", "alpha2_basic", "truncate", "relcache", "beta1a",
+                         "beta1b_expression", "beta3a_fold_prepare"):
                 cluster.run("createdb", [case], f"createdb-{case}")
                 cluster.file(case, case)
                 print(f"{case}: PASS", flush=True)
@@ -994,6 +995,8 @@ def run_slots_only(work, logs):
             cluster.file("beta1a", "beta1a")
             check_slots(cluster, source)
             cluster.file("postgres", "pending_overlay_scan")
+            cluster.run("createdb", ["beta3a_fold_prepare"], "createdb-beta3a-fold-prepare")
+            cluster.file("beta3a_fold_prepare", "beta3a_fold_prepare")
         finally:
             cluster.stop()
     check_overlay_budget(Cluster(work / "budget", bindir, logs), source)

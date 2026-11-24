@@ -34,6 +34,7 @@ cuvs_cagra_require_legacy(Relation index)
 #include "access/genam.h"
 #include "access/xloginsert.h"
 #include "cuvs_util.h"
+#include "lib/stringinfo.h"
 #include "storage/bufpage.h"
 #include "miscadmin.h"
 #include "storage/lmgr.h"
@@ -493,7 +494,118 @@ cuvs_cagra_copy_pending(Relation index, const CuvsCagraMeta *meta, BlockNumber n
     return true;
 }
 
+CuvsCagraFoldPrepareResult
+cuvs_cagra_prepare_fold(Relation index, const CuvsCagraFoldCandidate *candidate,
+                        CuvsCagraMeta *base, CuvsCagraPendingLocation *locations)
+{
+    const uint64 capacity = (uint64) CUVS_CAGRA_PAGE_DIR *
+        CUVS_CAGRA_PAGE_EXTENT * CUVS_CAGRA_TIDS_PER_PAGE;
+    CuvsCagraMeta meta;
+    BlockNumber blocks;
+
+    if (candidate->positions == 0 || candidate->graph_nonce == 0 ||
+        candidate->parent_graph_nonce == 0 ||
+        candidate->graph_nonce == candidate->parent_graph_nonce ||
+        candidate->parent_n_slots > capacity ||
+        candidate->positions > capacity - candidate->parent_n_slots ||
+        candidate->parent_folded > candidate->parent_n_slots)
+        return CUVS_CAGRA_FOLD_DISCARD;
+
+    /* Use the same heavyweight fence as VACUUM. No metapage buffer lock is
+     * held while taking locks on the pending pages. */
+    if (!ConditionalLockPage(index, 0, ExclusiveLock))
+        return CUVS_CAGRA_FOLD_DEFERRED;
+
+    blocks = RelationGetNumberOfBlocks(index);
+    if (blocks == 0 || !cuvs_cagra_read_meta(index, &meta) ||
+        meta.index_nonce != candidate->index_nonce ||
+        meta.base_nonce != candidate->base_nonce ||
+        meta.graph_nonce != candidate->parent_graph_nonce ||
+        meta.n_slots != candidate->parent_n_slots ||
+        meta.folded != candidate->parent_folded ||
+        !cuvs_cagra_copy_pending(index, &meta, RelationGetNumberOfBlocks(index), meta.folded,
+                                 meta.folded + candidate->positions, locations, NULL))
+    {
+        UnlockPage(index, 0, ExclusiveLock);
+        return CUVS_CAGRA_FOLD_DISCARD;
+    }
+    *base = meta;
+    return CUVS_CAGRA_FOLD_PREPARED;
+}
+
 #ifdef CUVS_TEST_HOOKS
+PG_FUNCTION_INFO_V1(cuvs_test_fold_prepare);
+
+Datum
+cuvs_test_fold_prepare(PG_FUNCTION_ARGS)
+{
+    Oid oid = PG_GETARG_OID(0);
+    int32 positions = PG_GETARG_INT32(1);
+    int32 mismatch = PG_GETARG_INT32(2);
+    Relation index;
+    CuvsCagraMeta meta;
+    CuvsCagraFoldCandidate candidate;
+    CuvsCagraPendingLocation *locations;
+    CuvsCagraFoldPrepareResult status;
+    StringInfoData result;
+
+    if (positions < 0 ||
+        (Size) positions > MaxAllocSize / sizeof(*locations))
+        ereport(ERROR, (errmsg("invalid fold test position count")));
+
+    index = index_open(oid, RowExclusiveLock);
+    if (RelationGetNumberOfBlocks(index) == 0 ||
+        !cuvs_cagra_read_meta(index, &meta))
+    {
+        index_close(index, RowExclusiveLock);
+        PG_RETURN_TEXT_P(cstring_to_text("discard"));
+    }
+    candidate = (CuvsCagraFoldCandidate) {
+        .index_nonce = meta.index_nonce,
+        .base_nonce = meta.base_nonce,
+        .parent_graph_nonce = meta.graph_nonce,
+        .parent_n_slots = meta.n_slots,
+        .parent_folded = meta.folded,
+        .graph_nonce = cuvs_cagra_nonce(),
+        .positions = (uint32) positions,
+    };
+    switch (mismatch)
+    {
+        case 0: break;
+        case 1: candidate.index_nonce ^= 1; break;
+        case 2: candidate.base_nonce ^= 1; break;
+        case 3: candidate.parent_graph_nonce ^= 1; break;
+        case 4: ++candidate.parent_n_slots; break;
+        case 5: ++candidate.parent_folded; break;
+        case 6: candidate.graph_nonce = candidate.parent_graph_nonce; break;
+        default: ereport(ERROR, (errmsg("invalid fold test mismatch")));
+    }
+
+    locations = palloc((Size) positions * sizeof(*locations));
+    status = cuvs_cagra_prepare_fold(index, &candidate, &meta, locations);
+    if (status != CUVS_CAGRA_FOLD_PREPARED)
+    {
+        index_close(index, RowExclusiveLock);
+        PG_RETURN_TEXT_P(cstring_to_text(status == CUVS_CAGRA_FOLD_DEFERRED ?
+                                        "deferred" : "discard"));
+    }
+    initStringInfo(&result);
+    appendStringInfoString(&result, "prepared");
+    for (int32 i = 0; i < positions; ++i)
+    {
+        ItemPointer tid = &locations[i].tid;
+
+        if (ItemPointerIsValid(tid))
+            appendStringInfo(&result, " (%u,%u)", ItemPointerGetBlockNumber(tid),
+                             ItemPointerGetOffsetNumber(tid));
+        else
+            appendStringInfoString(&result, " null");
+    }
+    UnlockPage(index, 0, ExclusiveLock);
+    index_close(index, RowExclusiveLock);
+    PG_RETURN_TEXT_P(cstring_to_text(result.data));
+}
+
 PG_FUNCTION_INFO_V1(cuvs_test_pending_first);
 
 Datum

@@ -84,6 +84,34 @@ typedef struct CuvsCagraPendingLocation
 bool cuvs_cagra_copy_pending(Relation index, const CuvsCagraMeta *meta,
                              BlockNumber nblocks, uint64 from, uint64 upto,
                              CuvsCagraPendingLocation *locations, float *vectors);
+
+/* Local PG storage input. The caller has already authenticated the worker's
+ * database, relation and postmaster lifetime before preparing this candidate. */
+typedef struct CuvsCagraFoldCandidate
+{
+    uint64 index_nonce;
+    uint64 base_nonce;
+    uint64 parent_graph_nonce;
+    uint64 parent_n_slots;
+    uint64 parent_folded;
+    uint64 graph_nonce;
+    uint32 positions;
+} CuvsCagraFoldCandidate;
+
+typedef enum CuvsCagraFoldPrepareResult
+{
+    CUVS_CAGRA_FOLD_PREPARED,
+    CUVS_CAGRA_FOLD_DEFERRED,
+    CUVS_CAGRA_FOLD_DISCARD
+} CuvsCagraFoldPrepareResult;
+
+/* Caller holds the relation lock and supplies storage for candidate->positions
+ * entries. A successful preparation retains the exclusive FCL (page lock 0).
+ * Use the copied positions only under that lock. Failure retains no FCL.
+ * Preparation does not change any published page. */
+CuvsCagraFoldPrepareResult cuvs_cagra_prepare_fold(Relation index,
+                        const CuvsCagraFoldCandidate *candidate,
+                        CuvsCagraMeta *base, CuvsCagraPendingLocation *locations);
 CuvsCagraSlotResult cuvs_cagra_pending_tid(Relation index, const CuvsCagraMeta *meta,
                                          BlockNumber nblocks, BlockNumber block,
                                          uint64 position, ItemPointer tid);
