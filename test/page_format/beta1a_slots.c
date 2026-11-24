@@ -33,6 +33,58 @@ try_search(const char *socket, uint32_t db, uint32_t idx,
     return 0;
 }
 
+static int
+expect_supply(const char *socket, uint32_t db, uint32_t index,
+              const CuvsPageOverlayRequest *request, const CuvsPageSupplement *rows,
+              int expected, uint64_t covered)
+{
+    CuvsPageProgress progress;
+    int status = cuvs_ipc_supply_pages(socket, db, index, request, 8, CUVS_METRIC_L2,
+                                       rows, &progress);
+
+    if (status != expected || (expected != CUVS_STATUS_ERROR &&
+                              (!progress.daemon_id || progress.covered_upto != covered)))
+    {
+        fprintf(stderr, "SUPPLY returned status=%d coverage=%llu; want status=%d coverage=%llu\n",
+                status, (unsigned long long) progress.covered_upto, expected,
+                (unsigned long long) covered);
+        return 1;
+    }
+    return 0;
+}
+
+static int
+check_supply(const char *socket, uint32_t db, uint32_t index, CuvsPageSearchRequest base)
+{
+    const float vector[8] = {0};
+    CuvsPagePosition marks[2] = {
+        {.state = CUVS_PAGE_POSITION_DEAD},
+        {.block = 65, .state = CUVS_PAGE_POSITION_VECTOR}
+    };
+    CuvsPageSupplement rows = {.marks = marks, .vectors = vector, .positions = 2, .vector_rows = 1};
+    CuvsPageOverlayRequest request = {.base = base, .boot_id = 1, .from = 1};
+
+    request.base.tail = 3;
+    if (expect_supply(socket, db, index, &request, &rows, CUVS_STATUS_PAGE_NEED, 0))
+        return 1;
+    request.from = 0;
+    request.base.tail = 2;
+    if (expect_supply(socket, db, index, &request, &rows, CUVS_STATUS_OK, 2) ||
+        expect_supply(socket, db, index, &request, &rows, CUVS_STATUS_OK, 2))
+        return 1;
+    request.from = 1;
+    request.base.tail = 3;
+    if (expect_supply(socket, db, index, &request, &rows, CUVS_STATUS_PAGE_NEED, 2))
+        return 1;
+    request.boot_id = 2;
+    if (expect_supply(socket, db, index, &request, &rows, CUVS_STATUS_PAGE_NEED, 0))
+        return 1;
+    request.from = 0;
+    request.base.tail = 2;
+    marks[0].state = CUVS_PAGE_POSITION_INVISIBLE;
+    return expect_supply(socket, db, index, &request, &rows, CUVS_STATUS_ERROR, 0);
+}
+
 int
 main(int argc, char **argv)
 {
@@ -80,6 +132,8 @@ main(int argc, char **argv)
             return 1;
         *keys[i] ^= 1;
     }
-    puts("single and batch slots; eight mismatched requests: PASS");
+    if (check_supply(argv[1], db, idx, request))
+        return 1;
+    puts("single and batch slots, eight mismatches, supply acknowledgments and boot fencing: PASS");
     return 0;
 }

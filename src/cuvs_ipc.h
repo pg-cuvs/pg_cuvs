@@ -165,8 +165,11 @@ int cuvs_ipc_build_hnsw_file_idle(const char *socket_path, int vectors_fd,
 #define CUVS_OP_SEARCH_PAGES_FILTERED 48
 #define CUVS_OP_MARK_PAGES_EMPTY      49
 #define CUVS_OP_UNLOAD_PAGE_LEGACY    50
+#define CUVS_OP_SUPPLY_PAGES          51
 #define CUVS_PAGE_SLOT_INVALID UINT64_MAX
 #define CUVS_PAGE_BUILD_DEFER_LEGACY 1U
+#define CUVS_PAGE_BATCH_MAX 4096U
+#define CUVS_PAGE_OVERLAY_MAX 200000U
 
 typedef struct CuvsPageBuildRequest
 {
@@ -197,6 +200,49 @@ typedef struct CuvsPageSearchRequest
     float    resume_distance;
     uint32_t reserved;
 } CuvsPageSearchRequest;
+
+/* Only SUPPLY_PAGES uses the extended frame. The existing page search
+ * opcodes keep their original request and result layouts. */
+typedef struct CuvsPageOverlayRequest
+{
+    CuvsPageSearchRequest base;
+    uint64_t boot_id;
+    uint64_t from;
+    uint32_t positions;
+    uint32_t vector_rows;
+    char supplement_shm[64];
+} CuvsPageOverlayRequest;
+
+enum CuvsPagePositionState
+{
+    CUVS_PAGE_POSITION_DEAD = 0,
+    CUVS_PAGE_POSITION_VECTOR = 1,
+    CUVS_PAGE_POSITION_INVISIBLE = 2
+};
+
+typedef struct CuvsPagePosition
+{
+    uint32_t block;
+    uint32_t state;
+} CuvsPagePosition;
+
+typedef struct CuvsPageSupplement
+{
+    const CuvsPagePosition *marks;
+    const float *vectors;
+    uint32_t positions;
+    uint32_t vector_rows;
+} CuvsPageSupplement;
+
+typedef struct CuvsPageProgress
+{
+    uint64_t daemon_id;
+    uint64_t covered_upto;
+} CuvsPageProgress;
+
+int cuvs_ipc_supply_pages(const char *socket_path, uint32_t db_oid, uint32_t index_oid,
+    const CuvsPageOverlayRequest *request, int dim, uint32_t metric,
+    const CuvsPageSupplement *supplement, CuvsPageProgress *progress);
 
 
 
@@ -230,6 +276,8 @@ typedef struct CuvsPageSearchRequest
 #define CUVS_STATUS_CANCELED      11   /* 3S: backend aborted the wait (statement_timeout / query cancel) */
 #define CUVS_STATUS_PROTO_MISMATCH 12  /* #77: daemon/extension wire-protocol skew (co-deploy both) */
 #define CUVS_STATUS_HNSW_RESIDENT_BUDGET_EXCEEDED 13 /* AUTO/explicit IVF estimate only; not tiny/ACE/OOM */
+#define CUVS_STATUS_PAGE_NEED 14
+#define CUVS_STATUS_PAGE_OVERLAY_FULL 15
 #define CUVS_STATUS_HNSW_UPPER_SKIPPED 16 /* EXPORT_HNSW_UPPER built no upper layers (the
                                            * graph degree is below 4, so M < 2); the backend
                                            * keeps its own level assignment */

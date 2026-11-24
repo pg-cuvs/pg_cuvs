@@ -683,6 +683,88 @@ shm_write_query(const char *shm_key, const float *query_vec, int dim)
     return shm_write_page_bytes(shm_key, query_vec, (size_t) dim * sizeof(float));
 }
 
+static int
+shm_write_page_supplement(const char *key, const CuvsPageSupplement *supplement, uint32_t dim)
+{
+    size_t marks = (size_t) supplement->positions * sizeof(CuvsPagePosition);
+    size_t values = (size_t) supplement->vector_rows * dim * sizeof(float);
+    size_t bytes = marks + values;
+    int fd = shm_open(key, O_CREAT | O_EXCL | O_RDWR, 0644);
+    void *memory = MAP_FAILED;
+
+    if (fd < 0)
+        return -1;
+    if (fchmod(fd, 0644) == 0 && ftruncate(fd, (off_t) bytes) == 0)
+        memory = mmap(NULL, bytes, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (memory == MAP_FAILED)
+    {
+        close(fd);
+        shm_unlink(key);
+        return -1;
+    }
+    memcpy(memory, supplement->marks, marks);
+    if (values)
+        memcpy((char *) memory + marks, supplement->vectors, values);
+    munmap(memory, bytes);
+    return fd;
+}
+
+int
+cuvs_ipc_supply_pages(const char *socket_path, uint32_t db_oid, uint32_t index_oid,
+    const CuvsPageOverlayRequest *request, int dim, uint32_t metric,
+    const CuvsPageSupplement *supplement, CuvsPageProgress *progress)
+{
+    CuvsCmdFrame cmd = {.op = CUVS_OP_SUPPLY_PAGES, .db_oid = db_oid, .index_oid = index_oid,
+        .dim = (uint32_t) dim, .metric = metric};
+    CuvsPageOverlayRequest frame = *request;
+    CuvsReplyHeader reply;
+    int status = CUVS_STATUS_ERROR;
+    int fd, sock, canceled, waiting;
+
+    if (!progress || !supplement || dim < 1 || dim > 65535)
+        return status;
+    memset(progress, 0, sizeof(*progress));
+    if (!supplement->positions || supplement->positions > CUVS_PAGE_BATCH_MAX ||
+        supplement->vector_rows > supplement->positions || !supplement->marks ||
+        (supplement->vector_rows && !supplement->vectors) ||
+        make_shm_key(frame.supplement_shm, sizeof(frame.supplement_shm)) != 0)
+        return status;
+
+    frame.base.length = sizeof(frame);
+    frame.positions = supplement->positions;
+    frame.vector_rows = supplement->vector_rows;
+    fd = shm_write_page_supplement(frame.supplement_shm, supplement, cmd.dim);
+    if (fd < 0)
+        return status;
+    sock = uds_connect_wait(socket_path, 30, &canceled);
+    if (sock < 0)
+        status = canceled ? CUVS_STATUS_CANCELED : CUVS_STATUS_UNAVAILABLE;
+    else
+    {
+        if (send_cmd(sock, &cmd) == 0 && send_all(sock, &frame, sizeof(frame)) == 0)
+        {
+            waiting = recv_reply_interruptible(sock, &reply, 30);
+            if (waiting == 1)
+                status = CUVS_STATUS_CANCELED;
+            else if (waiting == 0)
+            {
+                status = reply.status;
+                if (status == CUVS_STATUS_OK || status == CUVS_STATUS_PAGE_NEED ||
+                    status == CUVS_STATUS_PAGE_OVERLAY_FULL)
+                {
+                    waiting = recv_all_interruptible(sock, progress, sizeof(*progress), 30);
+                    if (waiting)
+                        status = waiting == 1 ? CUVS_STATUS_CANCELED : CUVS_STATUS_ERROR;
+                }
+            }
+        }
+        close(sock);
+    }
+    close(fd);
+    shm_unlink(frame.supplement_shm);
+    return status;
+}
+
 /* A page reply uses CuvsResult.tid as a zero-based slot number. */
 int
 cuvs_ipc_search_pages(const char *socket_path, uint32_t db_oid, uint32_t index_oid,
