@@ -2003,21 +2003,26 @@ cuvs_daemon_socket_ready(void)
     return stat(cuvs_socket_path, &st) == 0;
 }
 
-/* Plan-time artifact-existence gate. The daemon writes a .tids file when it
- * completes a build. An index created on an empty table (ambuildempty path)
- * skips the daemon entirely, so no .tids exists. Without this gate, a query on
- * such an index would reach amgettuple, get CUVS_STATUS_NOT_FOUND from the
- * daemon, and ERROR. Instead, silence it at plan time: no .tids → no GPU
- * artifact → route to seqscan/CPU. */
+/* Empty builds skip the daemon. The index relation records that an old
+ * OID-keyed .tids file, if present, belongs to a previous generation. */
 static bool
 cuvs_index_has_artifact(Oid index_oid)
 {
+    Relation    index = try_index_open(index_oid, NoLock);
     char        path[MAXPGPATH];
     struct stat st;
+    bool        exists = false;
 
-    snprintf(path, sizeof(path), "%s/%u_%u.tids",
-             cuvs_resolve_index_dir(index_oid), (uint32_t) MyDatabaseId, (uint32_t) index_oid);
-    return stat(path, &st) == 0;
+    if (index == NULL)
+        return false;
+    if (!cuvs_legacy_index_is_empty(index))
+    {
+        snprintf(path, sizeof(path), "%s/%u_%u.tids",
+                 cuvs_resolve_index_dir_rel(index), (uint32_t) MyDatabaseId, (uint32_t) index_oid);
+        exists = stat(path, &st) == 0;
+    }
+    index_close(index, NoLock);
+    return exists;
 }
 
 /* ----------------------------------------------------------------
@@ -2039,25 +2044,32 @@ cuvs_delta_path(Oid index_oid, char *buf, size_t buflen)
              cuvs_resolve_index_dir(index_oid), (uint32_t) MyDatabaseId, (uint32_t) index_oid);
 }
 
-/* Read the base .tids body_crc32 (generation token). Returns true + *crc_out on
- * success; false if the .tids artifact is missing or its header unreadable. */
+/* Read only the base .tids header. A missing or unreadable artifact
+ * supplies neither a generation token nor a known base dimension. */
 static bool
-cuvs_read_tids_crc(Oid index_oid, uint32_t *crc_out)
+cuvs_read_tids_header(Oid index_oid, const char *dir, CuvsTidsHeader *hdr)
 {
-    char            path[MAXPGPATH];
-    FILE           *f;
-    CuvsTidsHeader  hdr;
-    size_t          got;
+    char path[MAXPGPATH];
+    FILE *f;
+    size_t got;
 
     snprintf(path, sizeof(path), "%s/%u_%u.tids",
-             cuvs_resolve_index_dir(index_oid), (uint32_t) MyDatabaseId, (uint32_t) index_oid);
+             dir, (uint32_t) MyDatabaseId, (uint32_t) index_oid);
     f = AllocateFile(path, PG_BINARY_R);
     if (f == NULL)
         return false;
-    got = fread(&hdr, 1, sizeof(hdr), f);
+    got = fread(hdr, 1, sizeof(*hdr), f);
     FreeFile(f);
-    if (got != sizeof(hdr) || hdr.magic != CUVS_TIDS_MAGIC
-        || hdr.version != CUVS_TIDS_VERSION)
+    return got == sizeof(*hdr) && hdr->magic == CUVS_TIDS_MAGIC
+           && hdr->version == CUVS_TIDS_VERSION;
+}
+
+static bool
+cuvs_read_tids_crc(Oid index_oid, uint32_t *crc_out)
+{
+    CuvsTidsHeader hdr;
+
+    if (!cuvs_read_tids_header(index_oid, cuvs_resolve_index_dir(index_oid), &hdr))
         return false;
     *crc_out = hdr.body_crc32;
     return true;
@@ -3210,9 +3222,6 @@ cuvs_build_hnsw_from_heap(Relation heapRel, Relation indexRel, IndexInfo *indexI
  * Build state for CREATE INDEX scan
  * ---------------------------------------------------------------- */
 typedef struct CuvsBuildState {
-#ifdef CUVS_PAGE_FORMAT
-    bool strict_dim;
-#endif
     int      dim;
     int64_t  n_vecs;
     int64_t  n_allocated;
@@ -3279,6 +3288,46 @@ grow_build_buffers(CuvsBuildState *bs)
     bs->n_allocated = new_size;
 }
 
+static void
+cuvs_require_vector_dimension(Relation index, Relation heap, ItemPointer tid,
+                              int expected, int actual)
+{
+    const char *table_name = heap ? RelationGetRelationName(heap) :
+        get_rel_name(index->rd_index->indrelid);
+
+    if (tid != NULL)
+        ereport(ERROR,
+                (errcode(ERRCODE_DATA_EXCEPTION),
+                 errmsg("pg_cuvs: expected %d dimensions, not %d", expected, actual),
+                 errdetail("Index \"%s\" on table \"%s\", index TID (%u,%u).",
+                           RelationGetRelationName(index), table_name,
+                           ItemPointerGetBlockNumber(tid),
+                           ItemPointerGetOffsetNumber(tid)),
+                 errhint("Use a vector column with a fixed dimension.")));
+    ereport(ERROR,
+            (errcode(ERRCODE_DATA_EXCEPTION),
+             errmsg("pg_cuvs: expected %d dimensions, not %d", expected, actual),
+             errdetail("Index \"%s\" on table \"%s\" recorded %d dimensions.",
+                       RelationGetRelationName(index), table_name, expected),
+             errhint("Use a vector column with a fixed dimension.")));
+}
+
+/* The SQL type enforces declared dimensions. Untyped legacy indexes infer
+ * a dimension at build time and persist it in the base header. */
+static void
+cuvs_check_untyped_index_dimension(Relation index, Relation heap, Datum value)
+{
+    CuvsTidsHeader hdr;
+    int dim;
+
+    if (TupleDescAttr(RelationGetDescr(index), 0)->atttypmod > 0)
+        return;
+    dim = DatumGetPgVector(value)->dim;
+    if (cuvs_read_tids_header(RelationGetRelid(index), cuvs_resolve_index_dir_rel(index), &hdr) &&
+        hdr.dim != 0 && hdr.dim != dim)
+        cuvs_require_vector_dimension(index, heap, NULL, (int) hdr.dim, dim);
+}
+
 /* Callback invoked for each heap tuple during CREATE INDEX scan */
 static void
 cuvs_build_callback(Relation index,
@@ -3297,14 +3346,8 @@ cuvs_build_callback(Relation index,
 
     if (bs->dim == 0)
         bs->dim = (int) vec->dim;
-    else if ((int) vec->dim != bs->dim)
-    {
-#ifdef CUVS_PAGE_FORMAT
-        if (bs->strict_dim)
-            cuvs_cagra_check_dim(bs->dim, vec->dim);
-#endif
-        return;             /* legacy: dimension mismatch */
-    }
+    else if (bs->dim != vec->dim)
+        cuvs_require_vector_dimension(index, NULL, tid, bs->dim, vec->dim);
 
     if (bs->n_vecs >= bs->n_allocated)
         grow_build_buffers(bs);
@@ -3630,7 +3673,6 @@ cuvs_build_cagra_from_heap_impl(Relation heapRel, Relation indexRel, IndexInfo *
 
     memset(&bs, 0, sizeof(bs));
 #ifdef CUVS_PAGE_FORMAT
-    bs.strict_dim = page_format;
     if (page_format)
     {
         page_request.length = sizeof(page_request);
@@ -3991,7 +4033,10 @@ cuvs_ambuild(Relation heapRel, Relation indexRel, IndexInfo *indexInfo)
     result->index_tuples = (double) n_vecs;
 
     if (n_vecs == 0)
-        return result;  /* empty table — nothing built */
+    {
+        cuvs_legacy_index_init_empty(indexRel, MAIN_FORKNUM);
+        return result;
+    }
 
     /* Phase 3C: write .relfilenode sidecar so the daemon can verify heap
      * compatibility before loading a GCS artifact on a new node. */
@@ -4239,7 +4284,10 @@ flat_ambuild(Relation heapRel, Relation indexRel, IndexInfo *indexInfo)
     result->index_tuples = (double) n_vecs;
 
     if (n_vecs == 0)
-        return result;  /* empty table — nothing built */
+    {
+        cuvs_legacy_index_init_empty(indexRel, MAIN_FORKNUM);
+        return result;
+    }
 
     /* Phase 3C: .relfilenode sidecar (heap compat verification). */
     {
@@ -4270,12 +4318,14 @@ cuvs_ambuildempty(Relation indexRel)
 {
 #ifdef CUVS_PAGE_FORMAT
     if (RelationGetForm(indexRel)->relam == get_am_oid("cagra", true))
+    {
         cuvs_cagra_init_pages(indexRel, INIT_FORKNUM, cuvs_cagra_nonce(), 0,
                              Max(0, TupleDescAttr(RelationGetDescr(indexRel), 0)->atttypmod),
                              cuvs_index_metric(indexRel), NULL, 0);
-#else
-    (void)indexRel;
+        return;
+    }
 #endif
+    cuvs_legacy_index_init_empty(indexRel, INIT_FORKNUM);
 }
 
 /* ----------------------------------------------------------------
@@ -5222,6 +5272,7 @@ cuvs_gettuple(IndexScanDesc scan, ScanDirection dir)
         Oid index_oid = RelationGetRelid(scan->indexRelation);
         if (!enable_cuvs)
             return false;
+        cuvs_legacy_index_require_base(scan->indexRelation);
         cuvs_breaker_check_scan(scan->indexRelation);
 
         /* Extract query vector from ORDER BY operator argument.
@@ -5520,6 +5571,7 @@ flat_gettuple(IndexScanDesc scan, ScanDirection dir)
         Oid index_oid = RelationGetRelid(scan->indexRelation);
         if (!enable_cuvs)
             return false;
+        cuvs_legacy_index_require_base(scan->indexRelation);
         cuvs_breaker_check_scan(scan->indexRelation);   /* UC-2 — see cuvs_gettuple */
 
         /* #141 backstop — see cuvs_gettuple. */
@@ -5857,7 +5909,7 @@ cuvs_aminsert(Relation indexRel, Datum *values, bool *isnull,
     uint32_t  metric;
     Oid       cagra_am;
 
-    (void) heapRel; (void) checkUnique; (void) indexUnchanged; (void) indexInfo;
+    (void) checkUnique; (void) indexUnchanged; (void) indexInfo;
 
     if (cuvs_cagra_relation_cache(indexRel)->page_format)
     {
@@ -5874,9 +5926,11 @@ cuvs_aminsert(Relation indexRel, Datum *values, bool *isnull,
 #endif
     }
 
-    /* NULL vector: nothing to index (pgvector does not search NULLs either). */
-    if (isnull[0])
+    /* A missing base stays on the heap until a nonempty REINDEX. */
+    if (isnull[0] || cuvs_legacy_index_is_empty(indexRel))
         return false;
+
+    cuvs_check_untyped_index_dimension(indexRel, heapRel, values[0]);
 
     /* Delta disabled (GUC 0): fall back to Phase 2 behavior — mark stale once
      * per relcache life and route to CPU. */
@@ -6010,6 +6064,9 @@ cuvs_ambulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
     if (stats == NULL)
         stats = (IndexBulkDeleteResult *) palloc0(sizeof(IndexBulkDeleteResult));
 
+    if (cuvs_legacy_index_is_empty(indexRel))
+        return stats;
+
     if (cuvs_max_delta_rows <= 0)
     {
         cuvs_mark_index_stale(indexRel);
@@ -6101,7 +6158,7 @@ cuvs_amvacuumcleanup(IndexVacuumInfo *info, IndexBulkDeleteResult *stats)
     char     tpath[MAXPGPATH];
     struct   stat st;
 
-    if (info->analyze_only)
+    if (info->analyze_only || cuvs_legacy_index_is_empty(indexRel))
         return stats;
 
     if (cuvs_cagra_has_pages(info->index))
@@ -6168,7 +6225,9 @@ ivfpq_ambuild(Relation heapRel, Relation indexRel, IndexInfo *indexInfo)
             true, true,
             cuvs_build_callback, &bs, NULL);
 
-        if (bs.n_vecs > 0)
+        if (bs.n_vecs == 0)
+            cuvs_legacy_index_init_empty(indexRel, MAIN_FORKNUM);
+        else
         {
             uint32_t table_oid   = (uint32_t) RelationGetRelid(heapRel);
             uint32_t relfilenode = (uint32_t) heapRel->rd_rel->relfilenode;
@@ -6231,21 +6290,17 @@ ivfpq_ambuild(Relation heapRel, Relation indexRel, IndexInfo *indexInfo)
     return result;
 }
 
-static void
-ivfpq_ambuildempty(Relation indexRel)
-{
-    (void)indexRel;
-}
-
 static bool
 ivfpq_aminsert(Relation indexRel, Datum *values, bool *isnull,
                ItemPointer ht_ctid, Relation heapRel,
                IndexUniqueCheck checkUnique,
                bool indexUnchanged, IndexInfo *indexInfo)
 {
-    /* IVF-PQ does not support incremental inserts. REINDEX after bulk loads. */
-    (void)indexRel; (void)values; (void)isnull; (void)ht_ctid;
-    (void)heapRel; (void)checkUnique; (void)indexUnchanged; (void)indexInfo;
+    /* IVF-PQ indexes new rows on REINDEX, but enforce the built dimension
+     * at INSERT just as the other AMs do. */
+    (void)ht_ctid; (void)checkUnique; (void)indexUnchanged; (void)indexInfo;
+    if (!isnull[0] && !cuvs_legacy_index_is_empty(indexRel))
+        cuvs_check_untyped_index_dimension(indexRel, heapRel, values[0]);
     return false;
 }
 
@@ -6288,6 +6343,7 @@ ivfpq_gettuple(IndexScanDesc scan, ScanDirection dir)
         Oid index_oid = RelationGetRelid(scan->indexRelation);
         if (!enable_cuvs)
             return false;
+        cuvs_legacy_index_require_base(scan->indexRelation);
         /* The IVF-PQ daemon handler does not gate its stale flag. Backstop a
          * plan selected before the marker appeared, just like a STALE reply. */
         if (cuvs_index_is_stale(index_oid))
@@ -6468,7 +6524,7 @@ ivfpqamhandler(PG_FUNCTION_ARGS)
     amroutine->amoptionalkey     = true;
 
     amroutine->ambuild           = ivfpq_ambuild;
-    amroutine->ambuildempty      = ivfpq_ambuildempty;
+    amroutine->ambuildempty      = cuvs_ambuildempty;
     amroutine->aminsert          = ivfpq_aminsert;
     amroutine->ambulkdelete      = cuvs_ambulkdelete;
     amroutine->amvacuumcleanup   = cuvs_amvacuumcleanup;
@@ -6776,6 +6832,8 @@ pg_cuvs_batch_search(PG_FUNCTION_ARGS)
     {
         Relation indexRel = index_open(index_oid, AccessShareLock);
         uint32_t metric   = cuvs_index_metric(indexRel);
+
+        cuvs_legacy_index_require_base(indexRel);
 #ifdef CUVS_PAGE_FORMAT
         bool page_format = cuvs_cagra_has_pages(indexRel);
 
@@ -8374,6 +8432,7 @@ cuvs_filtered_knn(PG_FUNCTION_ARGS)
     bool page_format = cuvs_cagra_has_pages(indexRel);
 
     cuvs_require_table_select(heap_oid);
+    cuvs_legacy_index_require_base(indexRel);
 #ifndef CUVS_PAGE_FORMAT
     if (page_format)
         cuvs_cagra_require_legacy(indexRel);
@@ -8732,6 +8791,8 @@ cuvs_cs_begin(CustomScanState *node, EState *estate, int eflags)
     /* Get metric from the CAGRA index. */
     {
         Relation indexRel = index_open(state->index_oid, AccessShareLock);
+
+        cuvs_legacy_index_require_base(indexRel);
         state->metric = cuvs_index_metric(indexRel);
 #ifdef CUVS_PAGE_FORMAT
         state->page_format = cuvs_cagra_has_pages(indexRel);
@@ -9148,6 +9209,11 @@ cuvs_dwedge_add_path(PlannerInfo *root, RelOptInfo *rel,
 
             if (index == NULL)
                 continue;
+            if (cuvs_legacy_index_is_empty(index))
+            {
+                index_close(index, NoLock);
+                continue;
+            }
             usable = !cuvs_cagra_has_pages(index);
 #ifdef CUVS_PAGE_FORMAT
             if (!usable)

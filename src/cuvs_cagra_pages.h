@@ -5,11 +5,10 @@
 #include "storage/bufmgr.h"
 #include "utils/rel.h"
 
-static inline bool
-cuvs_cagra_has_pages(Relation index)
-{
-    return RelationGetNumberOfBlocks(index) != 0;
-}
+bool cuvs_cagra_has_pages(Relation index);
+bool cuvs_legacy_index_is_empty(Relation index);
+void cuvs_legacy_index_init_empty(Relation index, ForkNumber fork);
+void cuvs_legacy_index_require_base(Relation index);
 
 typedef struct CuvsCagraRelCache
 {

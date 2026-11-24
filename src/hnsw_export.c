@@ -4427,6 +4427,7 @@ create_empty_hnsw(Oid cagra_oid)
 static void
 hnsw_require_legacy_cagra_source(Relation source)
 {
+    cuvs_legacy_index_require_base(source);
 #ifdef CUVS_PAGE_FORMAT
     if (cuvs_cagra_has_pages(source))
         ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
