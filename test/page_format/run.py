@@ -377,28 +377,50 @@ def check_custom_index_drop(cluster, custom, keys):
 
 
 def check_invalid_index_drop(cluster, custom):
-    cluster.sql("beta1a", "invalid-drop-setup", "-At", "-c", f"""
-        CREATE INDEX page_bad_drop_idx ON page_custom USING cagra (v vector_l2_ops)
-            WITH (index_dir = '{custom}');
-        SELECT oid || '_' || 'page_bad_drop_idx'::regclass::oid
-        FROM pg_database WHERE datname = current_database();
-    """)
-    key = (cluster.logs / "main-invalid-drop-setup.log").read_text().splitlines()[-1]
-    witness, = (custom / key).glob("*/*/build.xid")
-    other = cluster.indexdir / key
-    other.mkdir()
-    missing = cluster.data.parent / "missing-root"
-    cluster.sql("beta1a", "invalid-drop", "-At", "-c", f"""
-        ALTER INDEX page_bad_drop_idx SET (index_dir = '{missing}');
-        DROP INDEX page_bad_drop_idx;
-        SELECT to_regclass('page_bad_drop_idx') IS NULL;
-    """)
-    result = (cluster.logs / "main-invalid-drop.log").read_text()
-    if ("page-format DROP-notify failed" not in result or not result.endswith("\nt\n")
-            or not witness.is_file() or not other.is_dir() or missing.exists()):
-        raise RuntimeError("invalid DROP root did not warn, commit and leave both roots alone")
-    other.rmdir()
-    print("Invalid targeted DROP warns after commit and leaves both roots intact: PASS", flush=True)
+    bad_roots = (
+        ("missing", cluster.data.parent / "missing-root"),
+        ("overlong", cluster.data.parent / ("x" * 200) / ("y" * 80)),
+    )
+    for label, bad_root in bad_roots:
+        cluster.sql("beta1a", f"invalid-drop-setup-{label}", "-At", "-c", f"""
+            CREATE INDEX page_bad_drop_idx ON page_custom USING cagra (v vector_l2_ops)
+                WITH (index_dir = '{custom}');
+            SELECT oid || '_' || 'page_bad_drop_idx'::regclass::oid
+            FROM pg_database WHERE datname = current_database();
+        """)
+        setup = cluster.logs / f"main-invalid-drop-setup-{label}.log"
+        key = setup.read_text().splitlines()[-1]
+        _, oid = (int(part) for part in key.split("_"))
+        witness, = (custom / key).glob("*/*/build.xid")
+        other = cluster.indexdir / key
+        other.mkdir()
+        cluster.sql("beta1a", f"invalid-drop-{label}", "-At", "-c", f"""
+            DO $$
+            BEGIN
+                IF NOT EXISTS (
+                    SELECT FROM pg_cuvs_index_status() WHERE index_oid={oid} AND kind='page_cagra'
+                ) THEN
+                    RAISE EXCEPTION 'invalid DROP fixture needs a resident page graph';
+                END IF;
+            END $$;
+            ALTER INDEX page_bad_drop_idx SET (index_dir = '{bad_root}');
+            DROP INDEX page_bad_drop_idx;
+        """)
+        cluster.sql("beta1a", f"invalid-drop-after-{label}", "-At", "-c", f"""
+            SELECT to_regclass('page_bad_drop_idx') IS NULL;
+            SELECT count(*) FROM pg_cuvs_index_status()
+            WHERE index_oid={oid} AND kind='page_cagra';
+        """)
+        result = (cluster.logs / f"main-invalid-drop-{label}.log").read_text()
+        after = (cluster.logs / f"main-invalid-drop-after-{label}.log").read_text().splitlines()
+        if ("page-format DROP-notify failed" not in result or after[-2] != "t"
+                or not witness.is_file() or not other.is_dir() or bad_root.exists()):
+            raise RuntimeError(f"{label}: invalid DROP root did not warn, commit and leave both roots alone")
+        if after[-1] != "0":
+            raise RuntimeError(f"{label}: invalid DROP root retained a resident page graph")
+        other.rmdir()
+    print("Invalid targeted DROP warns, clears the resident graph and leaves both roots intact: PASS",
+          flush=True)
 
 
 def check_index_root_spellings(cluster):

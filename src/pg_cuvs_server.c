@@ -9392,12 +9392,7 @@ handle_drop(int client_fd, const CuvsCmdFrame *cmd)
 
         if (recv_all(client_fd, requested, sizeof(requested)) != 0)
             return;
-        if (!resolve_page_root(requested, root))
-        {
-            send_error_code(client_fd, CUVS_STATUS_INVALID_PAGE_ROOT, "invalid page-format index_dir for DROP");
-            return;
-        }
-        directory = root;
+        directory = resolve_page_root(requested, root) ? root : NULL;
     }
 
     pthread_mutex_lock(&g_index_mutex);
@@ -9439,6 +9434,14 @@ handle_drop(int client_fd, const CuvsCmdFrame *cmd)
             g_n_cold_indexes--;
             break;
         }
+
+    /* The committed DROP invalidates residency even without a usable root. */
+    if (!directory)
+    {
+        pthread_mutex_unlock(&g_index_mutex);
+        send_error_code(client_fd, CUVS_STATUS_INVALID_PAGE_ROOT, "invalid page-format index_dir for DROP");
+        return;
+    }
 
     /* Unlink every per-index artifact so a restart won't reload a zombie. */
     index_file_path(p, sizeof(p), directory, db, idx);       unlink(p); /* .cagra */

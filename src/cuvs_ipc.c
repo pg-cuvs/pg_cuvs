@@ -1375,10 +1375,10 @@ ipc_drop(const char *socket_path, uint32_t db_oid, uint32_t index_oid,
     int rc = CUVS_STATUS_ERROR;
     int sock;
 
-    if (index_dir && strlen(index_dir) >= sizeof(dir))
-        return CUVS_STATUS_INVALID_PAGE_ROOT;
+    /* Forward a committed DROP even if its path is too long. An overlong
+     * path fills the wire field without a terminator and cannot name a root. */
     if (index_dir)
-        strcpy(dir, index_dir);
+        memcpy(dir, index_dir, strnlen(index_dir, sizeof(dir)));
     sock = index_dir ? uds_connect_ex(socket_path, 2) : uds_connect(socket_path);
     if (sock < 0)
         return CUVS_STATUS_UNAVAILABLE;   /* daemon down — caller must not fail the DROP */
