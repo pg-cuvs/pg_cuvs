@@ -88,6 +88,12 @@ exists for 0.9.0.
 
 ### Fixed
 
+- CAGRA, flat, and IVF-PQ builds now reject mixed vector dimensions with SQLSTATE
+  22000. Builds that previously succeeded after dropping mismatched rows now report
+  the heap TID and both dimensions. A uniform column declared as vector still
+  infers its dimension from the first indexed row. A later insert into an untyped
+  column must match the dimension recorded by the existing build.
+
 - `CREATE INDEX CONCURRENTLY ... USING pg_cuvs_hnsw` and `REINDEX INDEX CONCURRENTLY` of a `pg_cuvs_hnsw` index
   built from the heap (without `source`) no longer make the table's queries wait for a lock. The build opened the
   index it writes with `AccessExclusiveLock`, while a concurrent build holds `RowExclusiveLock` on it. Every write

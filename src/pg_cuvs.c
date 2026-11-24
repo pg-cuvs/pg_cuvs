@@ -2039,25 +2039,32 @@ cuvs_delta_path(Oid index_oid, char *buf, size_t buflen)
              cuvs_resolve_index_dir(index_oid), (uint32_t) MyDatabaseId, (uint32_t) index_oid);
 }
 
-/* Read the base .tids body_crc32 (generation token). Returns true + *crc_out on
- * success; false if the .tids artifact is missing or its header unreadable. */
+/* Read only the base .tids header. A missing or unreadable artifact
+ * supplies neither a generation token nor a known base dimension. */
 static bool
-cuvs_read_tids_crc(Oid index_oid, uint32_t *crc_out)
+cuvs_read_tids_header(Oid index_oid, CuvsTidsHeader *hdr)
 {
-    char            path[MAXPGPATH];
-    FILE           *f;
-    CuvsTidsHeader  hdr;
-    size_t          got;
+    char path[MAXPGPATH];
+    FILE *f;
+    size_t got;
 
     snprintf(path, sizeof(path), "%s/%u_%u.tids",
              cuvs_resolve_index_dir(index_oid), (uint32_t) MyDatabaseId, (uint32_t) index_oid);
     f = AllocateFile(path, PG_BINARY_R);
     if (f == NULL)
         return false;
-    got = fread(&hdr, 1, sizeof(hdr), f);
+    got = fread(hdr, 1, sizeof(*hdr), f);
     FreeFile(f);
-    if (got != sizeof(hdr) || hdr.magic != CUVS_TIDS_MAGIC
-        || hdr.version != CUVS_TIDS_VERSION)
+    return got == sizeof(*hdr) && hdr->magic == CUVS_TIDS_MAGIC
+           && hdr->version == CUVS_TIDS_VERSION;
+}
+
+static bool
+cuvs_read_tids_crc(Oid index_oid, uint32_t *crc_out)
+{
+    CuvsTidsHeader hdr;
+
+    if (!cuvs_read_tids_header(index_oid, &hdr))
         return false;
     *crc_out = hdr.body_crc32;
     return true;
@@ -3210,9 +3217,6 @@ cuvs_build_hnsw_from_heap(Relation heapRel, Relation indexRel, IndexInfo *indexI
  * Build state for CREATE INDEX scan
  * ---------------------------------------------------------------- */
 typedef struct CuvsBuildState {
-#ifdef CUVS_PAGE_FORMAT
-    bool strict_dim;
-#endif
     int      dim;
     int64_t  n_vecs;
     int64_t  n_allocated;
@@ -3279,6 +3283,32 @@ grow_build_buffers(CuvsBuildState *bs)
     bs->n_allocated = new_size;
 }
 
+static void
+cuvs_require_vector_dimension(ItemPointer tid, int expected, int actual)
+{
+    if (expected != actual)
+        ereport(ERROR,
+                (errcode(ERRCODE_DATA_EXCEPTION),
+                 errmsg("pg_cuvs: expected %d dimensions, not %d", expected, actual),
+                 errdetail("Heap TID (%u,%u).",
+                           ItemPointerGetBlockNumber(tid),
+                           ItemPointerGetOffsetNumber(tid)),
+                 errhint("Use a vector column with a fixed dimension.")));
+}
+
+/* The SQL type enforces declared dimensions. Untyped legacy indexes infer
+ * a dimension at build time and persist it in the base header. */
+static void
+cuvs_check_untyped_index_dimension(Relation index, ItemPointer tid, Datum value)
+{
+    CuvsTidsHeader hdr;
+
+    if (TupleDescAttr(RelationGetDescr(index), 0)->atttypmod > 0)
+        return;
+    if (cuvs_read_tids_header(RelationGetRelid(index), &hdr) && hdr.dim != 0)
+        cuvs_require_vector_dimension(tid, (int)hdr.dim, DatumGetPgVector(value)->dim);
+}
+
 /* Callback invoked for each heap tuple during CREATE INDEX scan */
 static void
 cuvs_build_callback(Relation index,
@@ -3297,14 +3327,8 @@ cuvs_build_callback(Relation index,
 
     if (bs->dim == 0)
         bs->dim = (int) vec->dim;
-    else if ((int) vec->dim != bs->dim)
-    {
-#ifdef CUVS_PAGE_FORMAT
-        if (bs->strict_dim)
-            cuvs_cagra_check_dim(bs->dim, vec->dim);
-#endif
-        return;             /* legacy: dimension mismatch */
-    }
+    else
+        cuvs_require_vector_dimension(tid, bs->dim, vec->dim);
 
     if (bs->n_vecs >= bs->n_allocated)
         grow_build_buffers(bs);
@@ -3630,7 +3654,6 @@ cuvs_build_cagra_from_heap_impl(Relation heapRel, Relation indexRel, IndexInfo *
 
     memset(&bs, 0, sizeof(bs));
 #ifdef CUVS_PAGE_FORMAT
-    bs.strict_dim = page_format;
     if (page_format)
     {
         page_request.length = sizeof(page_request);
@@ -5878,6 +5901,8 @@ cuvs_aminsert(Relation indexRel, Datum *values, bool *isnull,
     if (isnull[0])
         return false;
 
+    cuvs_check_untyped_index_dimension(indexRel, heap_tid, values[0]);
+
     /* Delta disabled (GUC 0): fall back to Phase 2 behavior — mark stale once
      * per relcache life and route to CPU. */
     if (cuvs_max_delta_rows <= 0)
@@ -6243,9 +6268,11 @@ ivfpq_aminsert(Relation indexRel, Datum *values, bool *isnull,
                IndexUniqueCheck checkUnique,
                bool indexUnchanged, IndexInfo *indexInfo)
 {
-    /* IVF-PQ does not support incremental inserts. REINDEX after bulk loads. */
-    (void)indexRel; (void)values; (void)isnull; (void)ht_ctid;
+    /* IVF-PQ indexes new rows on REINDEX, but enforce the built dimension
+     * at INSERT just as the other AMs do. */
     (void)heapRel; (void)checkUnique; (void)indexUnchanged; (void)indexInfo;
+    if (!isnull[0])
+        cuvs_check_untyped_index_dimension(indexRel, ht_ctid, values[0]);
     return false;
 }
 

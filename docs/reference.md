@@ -25,6 +25,13 @@ pg_cuvs registers four index AMs. All reuse pgvector's `vector` type and operato
 | `ivfpq` | `CREATE INDEX i ON t USING ivfpq (col vector_l2_ops)` | `n_lists`, `pq_bits`, `pq_dim`, `index_dir` | GPU daemon | `.ivfpq`, `.tids` |
 | `pg_cuvs_hnsw` | `CREATE INDEX i ON t USING pg_cuvs_hnsw (col vector_l2_ops) WITH (source='my_cagra', mode='nsw')` | `source`, `mode`, `m`, `ef_construction`, `build_algo` | **pgvector** (CPU) | pgvector-format pages in this index's PostgreSQL relation; optional `.hnsw` hnswlib conversion sidecar, not the index storage |
 
+**Vector dimensions.** `cagra`, `flat`, and `ivfpq` infer the dimension of an untyped
+`vector` column from the first non-NULL row selected for the index. A later row
+with a different dimension aborts `CREATE INDEX` with SQLSTATE 22000. The error
+reports the heap TID and both dimensions. An insert also has to match the
+dimension once an existing build has recorded it. Use a column declared as
+`vector(n)` to enforce its dimension at the table boundary.
+
 `flat` is the first-class exact GPU brute-force AM (ADR-073, extension v0.4.0). It builds only a
 `.tids` + `.vectors` store — no CAGRA graph — so the build is O(N) copy rather than graph
 construction. The AM forces brute-force search over the stored corpus regardless of `cuvs.search_mode`. With `float16`, corpus and query quantization can change float32 top-k ordering; see the precision reloption below. Freshness uses the same delta/tombstone mechanism as `cagra`
