@@ -45,7 +45,7 @@ def run_case(name, mutation):
             p.write_text(text.replace(before, after))
         cmd = [CC, "-std=gnu11", "-O1", "-DPGCUVS_CPU_SHIM", "-ffunction-sections", "-fdata-sections", "-I", str(work / "src"),
                str(work / "test/unit/test_physical_build_guard.c"),
-               *[str(work / "src" / f) for f in ("cuvs_ipc.c", "cuvs_util.c", "cuvs_objstore.c", "cuvs_build_corpus.c", "cuvs_wrapper_shim_cpu.c", "cuvs_cache_policy.c", "cuvs_peak_meter.c")],
+               *[str(work / "src" / f) for f in ("cuvs_ipc.c", "cuvs_util.c", "cuvs_objstore.c", "cuvs_build_corpus.c", "cuvs_wrapper_shim_cpu.c", "cuvs_cache_policy.c", "cuvs_peak_meter.c", "cuvs_page_overlay.c")],
                "-Wl,--gc-sections", "-lm", "-lpthread", "-lrt", "-lcurl", "-lssl", "-lcrypto", "-o", str(work / "test-guard")]
         built = subprocess.run(cmd, capture_output=True, text=True)
         if built.returncode:

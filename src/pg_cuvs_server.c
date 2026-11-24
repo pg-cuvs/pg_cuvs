@@ -27,6 +27,7 @@
 #endif
 
 #include "cuvs_ipc.h"
+#include "cuvs_page_overlay.h"
 #include "cuvs_util.h"
 #include "cuvs_cache_policy.h"
 #include "cuvs_bf_verdict.h"     /* #238: remembered brute_force unavailable verdict */
@@ -380,11 +381,14 @@ typedef struct PageCagraGraph
     time_t loaded_at;
     time_t last_search;
     uint32_t hits;
+    CuvsPageOverlay overlay;
 } PageCagraGraph;
 
 static PageCagraGraph *g_page_graphs;
 static int g_n_page_graphs;
 static uint64_t g_page_access;
+static uint64_t g_page_daemon_id;
+static pthread_once_t g_page_daemon_once = PTHREAD_ONCE_INIT;
 static size_t g_page_graph_bytes[CUVS_MAX_GPUS];
 
 /* These helpers run under the registry lock. The disk directories outlive
@@ -398,6 +402,7 @@ dispose_page_graph(PageCagraGraph *entry)
             cuvs_bf_free(entry->bf[precision], entry->gpu);
     if (entry->cpu_hnsw) cuvs_hnsw_free(entry->cpu_hnsw);
     cuvs_cagra_free(entry->handle, entry->gpu);
+    cuvs_page_overlay_free(entry->overlay.head);
     free(entry);
 }
 
@@ -12776,6 +12781,80 @@ done:
     free(results);
 }
 
+static void
+initialize_page_daemon_id(void)
+{
+    uint64_t id;
+
+    if (shm_key_random((unsigned char *) &id, sizeof(id)) == 0)
+        g_page_daemon_id = id ? id : 1;
+}
+
+static void
+handle_page_supply(int client_fd, const CuvsCmdFrame *cmd)
+{
+    CuvsPageOverlayRequest request;
+    CuvsReplyHeader reply = {.status = CUVS_STATUS_ERROR};
+    CuvsPageProgress progress = {0};
+    CuvsPageOverlayChunk *chunk = NULL, *obsolete = NULL;
+    size_t bytes;
+    void *mapping;
+    PageCagraGraph *graph;
+
+    if (recv_all(client_fd, &request.base.length, sizeof(request.base.length)) < 0 ||
+        request.base.length != sizeof(request) ||
+        recv_all(client_fd, (char *) &request + sizeof(request.base.length),
+                 sizeof(request) - sizeof(request.base.length)) < 0)
+        goto done;
+    if (cmd->dim == 0 || cmd->dim > 65535 || cmd->n_vecs || cmd->k || cmd->n_filter_tids ||
+        request.base.resume_count || request.base.resume_distance || request.base.reserved ||
+        !request.boot_id || request.from < request.base.folded ||
+        request.from > request.base.tail ||
+        request.base.tail - request.from != request.positions ||
+        !request.positions || request.positions > CUVS_PAGE_BATCH_MAX ||
+        request.vector_rows > request.positions)
+        goto done;
+    if (request.base.folded != 0)
+    {
+        reply.status = CUVS_STATUS_NOT_FOUND;
+        goto done;
+    }
+
+    /* Legacy-only daemons need no overlay identity. */
+    (void) pthread_once(&g_page_daemon_once, initialize_page_daemon_id);
+    if (!g_page_daemon_id)
+        goto done;
+    progress.daemon_id = g_page_daemon_id;
+    bytes = (size_t) request.positions * sizeof(CuvsPagePosition) +
+            (size_t) request.vector_rows * cmd->dim * sizeof(float);
+    mapping = map_page_shm(request.supplement_shm, sizeof(request.supplement_shm), bytes);
+    if (mapping == MAP_FAILED)
+        goto done;
+    chunk = cuvs_page_overlay_copy(&request, mapping, bytes);
+    munmap(mapping, bytes);
+    if (!chunk)
+        goto done;
+
+    pthread_mutex_lock(&g_index_mutex);
+    graph = find_page_graph(cmd, &request.base);
+    if (graph && graph->dim == cmd->dim && graph->metric == cmd->metric)
+    {
+        reply.status = cuvs_page_overlay_supply(&graph->overlay, &request, &chunk, &obsolete);
+        progress.covered_upto = graph->overlay.covered_upto;
+    }
+    else
+        reply.status = CUVS_STATUS_NOT_FOUND;
+    pthread_mutex_unlock(&g_index_mutex);
+
+done:
+    free(chunk);
+    cuvs_page_overlay_free(obsolete);
+    if (send_all(client_fd, &reply, sizeof(reply)) == 0 &&
+        (reply.status == CUVS_STATUS_OK || reply.status == CUVS_STATUS_PAGE_NEED ||
+         reply.status == CUVS_STATUS_PAGE_OVERLAY_FULL))
+        (void) send_all(client_fd, &progress, sizeof(progress));
+}
+
 static void *
 connection_thread(void *arg)
 {
@@ -12890,6 +12969,9 @@ connection_thread(void *arg)
             break;
         case CUVS_OP_MARK_PAGES_EMPTY:
             handle_mark_pages_empty(client_fd, &cmd);
+            break;
+        case CUVS_OP_SUPPLY_PAGES:
+            handle_page_supply(client_fd, &cmd);
             break;
         case CUVS_OP_SEARCH_PAGES:
         case CUVS_OP_SEARCH_PAGES_BATCH:

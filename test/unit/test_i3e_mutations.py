@@ -158,7 +158,7 @@ def run(argv, cwd):
 
 OBS_SRCS = ['test/unit/test_i3e_observation.c', 'src/cuvs_ipc.c', 'src/cuvs_util.c',
             'src/cuvs_status_text.c', 'src/cuvs_objstore.c', 'src/cuvs_build_corpus.c',
-            'src/cuvs_wrapper_shim_cpu.c', 'src/cuvs_cache_policy.c', 'src/cuvs_peak_meter.c']
+            'src/cuvs_wrapper_shim_cpu.c', 'src/cuvs_cache_policy.c', 'src/cuvs_peak_meter.c', 'src/cuvs_page_overlay.c']
 
 
 def build_and_run(tree):
