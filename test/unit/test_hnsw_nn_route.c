@@ -27,7 +27,7 @@ int main(void)
     assert(route(16, 128, 64, budget, budget, &f, error) == CUVS_STATUS_OK);
     assert(f.decision.route == CUVS_HNSW_ROUTE_NN_DESCENT);
     CuvsHnswNnCapacity capped;
-    assert(cuvs_hnsw_nn_capacity(10000, 128, 64, 1024, true,
+    assert(cuvs_hnsw_nn_capacity(10000, 128, 64, 1024, 1,
                                  CUVS_HNSW_NN_FP32, &capped) == 0);
     assert(route(10000, 128, 1000, budget, budget, &f, error) == CUVS_STATUS_OK);
     assert(f.decision.route == CUVS_HNSW_ROUTE_NN_DESCENT && !f.decision.overflowed);
