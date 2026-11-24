@@ -100,8 +100,6 @@ extern char *cuvs_socket_path;
 extern int cuvs_cagra_reloption_graph_degree(Relation cagra_rel);
 
 static uint32_t cagra_index_metric(Oid index_oid);
-static IndexBuildResult *hnsw_cpu_build(Relation heap, Relation index,
-                                       IndexInfo *index_info, const char *reason);
 
 /* ----------------------------------------------------------------
  * pgvector HNSW on-disk constants (must match pgvector source)
@@ -687,7 +685,8 @@ typedef struct HnswNodeAddress
 _Static_assert(sizeof(HnswNodeAddress) <= sizeof(HnswNodeLocation),
                "HNSW address template must fit in one location-table page");
 
-typedef void (*HnswInterruptCheck)(void);
+/* The callback owns the two scratch allocations only if it throws. */
+typedef void (*HnswInterruptCheck)(int *links, void *window_buffer);
 typedef bool (*HnswLocationWriter)(void *arg, uint64_t node,
                                    const HnswNodeLocation *location,
                                    char *error, size_t error_size);
@@ -1162,7 +1161,7 @@ hnsw_file_preflight(int hnsw_fd, int tids_fd,
         uint64_t *chunk_tids = (uint64_t *)crc_buffer;
 
         if (check_interrupts)
-            check_interrupts();
+            check_interrupts(links, window_buffer);
         if (!hnsw_pread_exact(tids_fd, crc_buffer, chunk, tids_offset))
         {
             hnsw_set_file_error(error, error_size,
@@ -1279,7 +1278,7 @@ hnsw_file_preflight(int hnsw_fd, int tids_fd,
         size_t label;
 
         if (check_interrupts)
-            check_interrupts();
+            check_interrupts(links, window_buffer);
         if (hnsw_mul_u64(node, h.sizeDataPerElement, &row_offset) &&
             hnsw_add_u64(HNSWLIB_HEADER_BYTES, row_offset, &base))
             hnsw_window_reserve(&window, base, h.sizeDataPerElement);
@@ -1333,7 +1332,7 @@ hnsw_file_preflight(int hnsw_fd, int tids_fd,
         HnswNodeLocation location;
 
         if (check_interrupts)
-            check_interrupts();
+            check_interrupts(links, window_buffer);
         if (file_cursor > (uint64_t)hs.st_size ||
             (uint64_t)hs.st_size - file_cursor < sizeof(list_bytes) ||
             !hnsw_window_read(&window, &list_bytes, sizeof(list_bytes), file_cursor))
@@ -2110,6 +2109,25 @@ hnsw_array_tid_result(const uint64_t *tids, const float *vecs, size_t n, uint32_
     return result;
 }
 
+static void
+hnsw_pg_check_interrupts(int *links, void *window_buffer)
+{
+    if (!INTERRUPTS_PENDING_CONDITION())
+        return;
+
+    PG_TRY();
+    {
+        CHECK_FOR_INTERRUPTS();
+    }
+    PG_CATCH();
+    {
+        free(window_buffer);
+        free(links);
+        PG_RE_THROW();
+    }
+    PG_END_TRY();
+}
+
 static HnswSourceTidResult
 hnsw_file_tid_result(int graph_fd, int tids_fd, const uint64_t *tids,
                      const CuvsTidsHeader *tids_header, int bytes_per_dim)
@@ -2130,7 +2148,7 @@ hnsw_file_tid_result(int graph_fd, int tids_fd, const uint64_t *tids,
         return HNSW_SOURCE_TIDS_UNIQUE;
     if (!hnsw_file_preflight(graph_fd, tids_fd, n, dim, tids_header->metric,
                              bytes_per_dim, false, &header, NULL, NULL, NULL,
-                             NULL, error, sizeof(error)))
+                             hnsw_pg_check_interrupts, error, sizeof(error)))
         ereport(ERROR, (errmsg("pg_cuvs: cannot validate duplicate source entries: %s", error)));
 
     /* Level-0 rows need not be in label order. Validate the label mapping
@@ -2159,6 +2177,7 @@ hnsw_file_tid_result(int graph_fd, int tids_fd, const uint64_t *tids,
     {
         if (members[i - 1].tid != members[i].tid)
             continue;
+        CHECK_FOR_INTERRUPTS();
         uint64_t offset_a = HNSWLIB_HEADER_BYTES + header.offsetData +
             (uint64_t) row_for_label[members[i - 1].label] * header.sizeDataPerElement;
         uint64_t offset_b = HNSWLIB_HEADER_BYTES + header.offsetData +
@@ -3277,12 +3296,6 @@ hnsw_location_table_address_lookup(void *arg, uint32_t node,
     address->elem_blkno = location.elem_blkno;
     address->elem_offno = location.elem_offno;
     return true;
-}
-
-static void
-hnsw_pg_check_interrupts(void)
-{
-    CHECK_FOR_INTERRUPTS();
 }
 
 static void
@@ -4521,8 +4534,8 @@ hnsw_fill_source(Oid source, Oid target, const char *mode,
 /* ================================================================
  * pg_cuvs_build_hnsw — unified GPU import: creates HNSW WITHOUT CPU build.
  *
- * Uses INDEX_CREATE_SKIP_BUILD so pgvector's CPU ambuild() is never called.
- * The 285s CPU HNSW build is eliminated entirely.
+ * Creates the target with INDEX_CREATE_SKIP_BUILD. Import normally populates
+ * it directly. Redundant source entries require an ordinary heap build.
  *
  * Usage: SELECT pg_cuvs_build_hnsw('my_cagra'::regclass, 'hnsw');
  * Returns: OID of the newly created HNSW index (regclass).
@@ -4892,7 +4905,11 @@ pg_cuvs_build_hnsw(PG_FUNCTION_ARGS)
         Relation target = index_open(hnsw_oid, AccessExclusiveLock);
         IndexInfo *index_info = BuildIndexInfo(target);
 
-        pfree(hnsw_cpu_build(heap_rel, target, index_info, "the source has redundant entries"));
+        /* Let PostgreSQL run expressions and predicates as the heap owner,
+         * with security-restricted operations and command-local GUCs. */
+        index_build(heap_rel, target, index_info, false, false);
+        ereport(NOTICE,
+                (errmsg("pg_cuvs_hnsw: rebuilt from the heap because the source has redundant entries")));
         index_close(target, AccessExclusiveLock);
     }
 

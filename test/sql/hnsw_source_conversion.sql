@@ -13,7 +13,8 @@ SET hnsw.ef_search = 400;
 -- Probe an accepted conversion with its actual target scan and a sequential
 -- oracle. A refusal only passes if it describes the source state and has a hint.
 CREATE FUNCTION pg_temp.check_conversion(command text, target_name text,
-                                         probe text, refusal text DEFAULT NULL)
+                                         probe text, refusal text DEFAULT NULL,
+                                         expect_build_stats boolean DEFAULT false)
 RETURNS boolean LANGUAGE plpgsql AS $$
 DECLARE
     target regclass;
@@ -38,6 +39,13 @@ BEGIN
         RAISE WARNING 'conversion failed for another reason (%): %', SQLSTATE, SQLERRM;
         RETURN false;
     END;
+
+    IF expect_build_stats AND NOT EXISTS (
+        SELECT FROM pg_class WHERE oid = target AND reltuples > 0 AND relpages > 0
+    ) THEN
+        RAISE WARNING 'heap rebuild did not populate index statistics for %', target;
+        RETURN false;
+    END IF;
 
     PERFORM set_config('enable_seqscan', 'on', true);
     PERFORM set_config('enable_indexscan', 'off', true);
@@ -238,5 +246,5 @@ SELECT pg_temp.check_conversion(
     'CREATE INDEX hsc_same_dst ON hsc_same USING pg_cuvs_hnsw (v vector_l2_ops) WITH (source = hsc_same_src)',
     'hsc_same_dst', 'SELECT id FROM hsc_same ORDER BY v <-> ''[200,0,0]'' LIMIT 1'),
     pg_temp.check_conversion('SELECT pg_cuvs_build_hnsw(''hsc_same_src'', ''hnsw'')',
-    NULL, 'SELECT id FROM hsc_same ORDER BY v <-> ''[200,0,0]'' LIMIT 1');
+    NULL, 'SELECT id FROM hsc_same ORDER BY v <-> ''[200,0,0]'' LIMIT 1', NULL, true);
 DROP TABLE hsc_same;
