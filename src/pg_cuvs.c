@@ -3212,7 +3212,7 @@ cuvs_build_hnsw_from_heap(Relation heapRel, Relation indexRel, IndexInfo *indexI
 typedef struct CuvsBuildState {
 #ifdef CUVS_PAGE_FORMAT
     bool strict_dim;
-    bool expression_page_candidate;
+    bool expression_index;
 #endif
     int      dim;
     int64_t  n_vecs;
@@ -3301,9 +3301,14 @@ cuvs_build_callback(Relation index,
     else if ((int) vec->dim != bs->dim)
     {
 #ifdef CUVS_PAGE_FORMAT
-        if (bs->strict_dim && (!bs->expression_page_candidate ||
-                               cuvs_cagra_can_store_pending_vector(bs->dim)))
+        if (bs->strict_dim)
+        {
+            if (bs->expression_index)
+                ereport(ERROR, (errcode(ERRCODE_DATA_EXCEPTION),
+                                errmsg("expression CAGRA index has mixed vector dimensions"),
+                                errhint("Cast the index expression to vector(n) to fix its dimension.")));
             cuvs_cagra_check_dim(bs->dim, vec->dim);
+        }
 #endif
         return;             /* legacy: dimension mismatch */
     }
@@ -3632,10 +3637,11 @@ cuvs_build_cagra_from_heap_impl(Relation heapRel, Relation indexRel, IndexInfo *
 
     memset(&bs, 0, sizeof(bs));
 #ifdef CUVS_PAGE_FORMAT
-    bool pending_vectors = page_format && indexInfo->ii_IndexAttrNumbers[0] == 0;
+    bool expression = indexInfo->ii_IndexAttrNumbers[0] == 0;
+    bool pending_vectors = page_format && expression;
 
-    bs.strict_dim = page_format;
-    bs.expression_page_candidate = pending_vectors;
+    bs.strict_dim = page_format || expression;
+    bs.expression_index = expression;
     if (page_format)
     {
         page_request.length = sizeof(page_request);
@@ -3773,8 +3779,6 @@ cuvs_build_cagra_from_heap_impl(Relation heapRel, Relation indexRel, IndexInfo *
         *out_n_vecs = bs.n_vecs;
 
 #ifdef CUVS_PAGE_FORMAT
-        if (pending_vectors && !cuvs_cagra_can_store_pending_vector(bs.dim > 0 ? bs.dim : typmod))
-            page_format = false;
         if (page_format)
         {
             if (!cuvs_page_preloaded || RecoveryInProgress())
@@ -3961,7 +3965,7 @@ cuvs_ambuild(Relation heapRel, Relation indexRel, IndexInfo *indexInfo)
         int dim = TupleDescAttr(RelationGetDescr(indexRel), 0)->atttypmod;
         bool expression = indexInfo->ii_IndexAttrNumbers[0] == 0;
 
-        if (!expression || dim <= 0 || cuvs_cagra_can_store_pending_vector(dim))
+        if (!expression || (dim > 0 && cuvs_cagra_can_store_pending_vector(dim)))
         {
             int gd, igd;
             uint32_t algo;

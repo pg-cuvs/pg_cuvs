@@ -21,6 +21,10 @@ MUTATIONS = {
         "        append_item(BufferGetPage(full ? nb : tb), tid, vector);",
     ),
     "wal-lower": ("    set_lower(page, pending->count * stride);", ""),
+    "wal-vector": (
+        "        memcpy(item + sizeof(*tid), vector, (Size) pending->vector_dim * sizeof(float));",
+        "        memset(item + sizeof(*tid), 0, (Size) pending->vector_dim * sizeof(float));",
+    ),
     "unknown": ("    meta.major = CUVS_CAGRA_PAGE_MAJOR;",
                 "    meta.major = CUVS_CAGRA_PAGE_MAJOR + 1;"),
     "flags": ("    meta.flags = pending_vectors ? CUVS_CAGRA_PENDING_VECTOR : 0;",
@@ -151,10 +155,12 @@ def wal(cluster, *, mutant=None):
         cluster.sql("postgres", "extensions", "-c", "CREATE EXTENSION vector; CREATE EXTENSION pg_cuvs;")
         cluster.file("postgres", "wal_prepare")
         cluster.sql("postgres", "wal-path", "-At", "-c", """
-            SELECT pg_relation_filepath('page_durable_idx'), current_setting('block_size');
+            SELECT pg_relation_filepath('page_durable_idx'),
+                   pg_relation_filepath('page_durable_expr_idx'),
+                   current_setting('block_size');
         """)
         row = (cluster.logs / f"{cluster.data.parent.name}-wal-path.log").read_text().splitlines()[-1]
-        filename, block_size = row.split("|")
+        filename, expression_filename, block_size = row.split("|")
         cluster.stop("immediate")
         if mutant is None:
             # The original pending page was checkpointed before INSERT. Verify
@@ -164,11 +170,19 @@ def wal(cluster, *, mutant=None):
                 before_redo = relation.read(6)
             if before_redo != b"\0" * 6:
                 raise RuntimeError(f"checkpoint page already contains a pending TID: {before_redo.hex()}")
-            print("wal: pending TID absent from the relation file before redo", flush=True)
+            with (cluster.data / expression_filename).open("rb") as relation:
+                relation.seek(int(block_size) + 24)
+                expression_before_redo = relation.read(18)
+            if expression_before_redo != b"\0" * 18:
+                raise RuntimeError("checkpoint page already contains a pending expression vector: "
+                                   f"{expression_before_redo.hex()}")
+            print("wal: pending TID and expression vector absent before redo", flush=True)
         cluster.start("after-crash")
         # These mutations change the image before WAL is written. The
         # unmutated run above independently verifies the replay boundary.
-        expect = ["pending TID was lost after WAL replay"] if mutant else None
+        expect = (["pending expression vector was lost after WAL replay"]
+                  if mutant == "wal-vector" else
+                  ["pending TID was lost after WAL replay"] if mutant else None)
         cluster.file("postgres", "wal_verify", expect=expect)
         print(f"{mutant or 'wal'}: {'mutation detected after WAL replay' if mutant else 'PASS'}", flush=True)
     finally:

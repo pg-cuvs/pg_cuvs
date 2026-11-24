@@ -36,7 +36,7 @@ def concurrent_validation(label, incoming, expect_error):
             if guard.poll() is not None:
                 raise RuntimeError("lock session exited")
         builder = subprocess.Popen(psql + ["-c",
-            f"CREATE INDEX CONCURRENTLY {idx} ON {table} USING cagra(page_test_gate(v) vector_l2_ops);"],
+            f"CREATE INDEX CONCURRENTLY {idx} ON {table} USING cagra((page_test_gate(v)::vector(3)) vector_l2_ops);"],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         wait_until(lambda: sql("SELECT count(*) FROM pg_locks WHERE locktype='advisory' AND objid=7471 AND NOT granted;") == "1",
                    "CIC heap scan at the expression gate")
@@ -72,7 +72,7 @@ def concurrent_validation(label, incoming, expect_error):
             raise RuntimeError(f"CIC did not add the post-snapshot row in validation: {state}")
         if sql(f"""
              SET enable_seqscan=off;
-             SELECT id FROM {table} ORDER BY page_test_gate(v) <-> '{incoming}' LIMIT 1;
+             SELECT id FROM {table} ORDER BY (page_test_gate(v)::vector(3)) <-> '{incoming}' LIMIT 1;
         """) != "3":
             raise RuntimeError("CIC did not find the post-snapshot row")
     print(f"CIC {label} PASS")

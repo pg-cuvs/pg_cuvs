@@ -17,6 +17,15 @@ BEGIN
         RAISE EXCEPTION 'legacy CAGRA did not get three candidates from the daemon';
     END IF;
 END $$;
+CREATE TABLE legacy_expression_mixed (v vector);
+INSERT INTO legacy_expression_mixed VALUES ('[1,2,3]'), ('[1,2]'), ('[2,3,4]');
+CREATE INDEX legacy_expression_mixed_idx ON legacy_expression_mixed
+    USING cagra ((v + v) vector_l2_ops);
+DO $$ BEGIN
+    IF pg_relation_size('legacy_expression_mixed_idx') <> 0 THEN
+        RAISE EXCEPTION 'feature-off mixed expression did not retain legacy storage';
+    END IF;
+END $$;
 
 SET cuvs.max_delta_rows=0;
 DO $$

@@ -8,6 +8,17 @@ BEGIN
         RAISE EXCEPTION 'pending TID was lost after WAL replay';
     END IF;
 END $$;
+DO $$
+DECLARE
+    pending bytea := get_raw_page('page_durable_expr_idx', 1);
+BEGIN
+    IF get_byte(pending, 8160) <> 4 OR
+       (SELECT lower FROM page_header(pending)) <> 42 OR
+       encode(substr(pending, 25, 18), 'hex') <>
+           '00000000010000000040000080400000c040' THEN
+        RAISE EXCEPTION 'pending expression vector was lost after WAL replay';
+    END IF;
+END $$;
 SET enable_seqscan = off;
 DO $$
 BEGIN

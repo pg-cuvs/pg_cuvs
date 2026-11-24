@@ -422,6 +422,7 @@ cuvs_cagra_copy_pending(Relation index, const CuvsCagraMeta *meta, BlockNumber n
 {
     BlockNumber block = meta->pending_tail;
     bool seek_tail = true;
+    bool first_page = true;
     uint32 vector_dim = pending_vector_dim(meta);
     Size stride = pending_stride(vector_dim);
     uint64 position = from;
@@ -445,7 +446,7 @@ cuvs_cagra_copy_pending(Relation index, const CuvsCagraMeta *meta, BlockNumber n
         page = BufferGetPage(buf);
         tag = pending_tag(page, block, meta->index_nonce, vector_dim);
         if (!tag || tag->first_pos > UINT64_MAX - tag->count ||
-            (!seek_tail && tag->first_pos != next_position))
+            (!first_page && tag->first_pos != next_position))
         {
             UnlockReleaseBuffer(buf);
             return false;
@@ -455,7 +456,13 @@ cuvs_cagra_copy_pending(Relation index, const CuvsCagraMeta *meta, BlockNumber n
             UnlockReleaseBuffer(buf);
             block = meta->pending_head;
             seek_tail = false;
+            first_page = true;
             continue;
+        }
+        if (position < tag->first_pos)
+        {
+            UnlockReleaseBuffer(buf);
+            return false;
         }
 
         end = tag->first_pos + tag->count;
@@ -473,6 +480,7 @@ cuvs_cagra_copy_pending(Relation index, const CuvsCagraMeta *meta, BlockNumber n
                        entry + sizeof(item->tid), (Size) vector_dim * sizeof(float));
         }
         seek_tail = false;
+        first_page = false;
         if (position < upto && (!BlockNumberIsValid(next) || !tag->count))
         {
             UnlockReleaseBuffer(buf);
@@ -501,6 +509,17 @@ cuvs_test_pending_first(PG_FUNCTION_ARGS)
     if (requested < 0 || !cuvs_cagra_read_meta(index, &meta) ||
         !(meta.flags & CUVS_CAGRA_PENDING_VECTOR))
         ereport(ERROR, (errmsg("expected a vector-bearing CAGRA pending list")));
+    if (PG_NARGS() == 4)
+    {
+        int32 head = PG_GETARG_INT32(2);
+        int64 folded = PG_GETARG_INT64(3);
+
+        if (head <= 0 || folded < 0)
+            ereport(ERROR, (errmsg("invalid test pending head")));
+        /* Simulate the metadata snapshot after a fold moves the head page. */
+        meta.pending_head = (BlockNumber) head;
+        meta.folded = (uint64) folded;
+    }
     vector = palloc((Size) meta.dim * sizeof(float));
     valid = cuvs_cagra_copy_pending(index, &meta, RelationGetNumberOfBlocks(index),
                                    (uint64) requested, (uint64) requested + 1,
