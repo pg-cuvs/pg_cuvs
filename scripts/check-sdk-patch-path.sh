@@ -14,17 +14,19 @@
 # prepare-patched-cuvs-source.sh; this script does not check them itself.
 # The temporary patched tree is removed on every normal exit, on errors and on
 # SIGINT/SIGTERM; after SIGKILL it stays in the temporary directory.
-# usage: check-sdk-patch-path.sh [--root PG_CUVS_CHECKOUT] [--cuvs-git CUVS_GIT]
+# usage: check-sdk-patch-path.sh [--root PG_CUVS_CHECKOUT] [--cuvs-git CUVS_GIT] [--manual-checks]
 #   CUVS_GIT defaults to $PGCUVS_CUVS_GIT, then a cache under ~/.cache/pg_cuvs (fetched once).
 set -euo pipefail
 readonly COMMIT="60b19a0f62ba0bd716de349382828e43be6e2daa"
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 CUVS_GIT="${PGCUVS_CUVS_GIT:-$HOME/.cache/pg_cuvs/cuvs.git}"
+manual_checks=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --root) ROOT="$(cd -- "$2" && pwd)"; shift 2;;
     --cuvs-git) CUVS_GIT="$2"; shift 2;;
-    *) echo "usage: $0 [--root DIR] [--cuvs-git DIR]" >&2; exit 2;;
+    --manual-checks) manual_checks=1; shift;;
+    *) echo "usage: $0 [--root DIR] [--cuvs-git DIR] [--manual-checks]" >&2; exit 2;;
   esac
 done
 
@@ -93,3 +95,13 @@ for var in SHLIB_LINK SERVER_LDFLAGS; do
 done
 [[ "$fail" == 0 ]] || { echo "nvcc: $nvcc_line"; echo "nvcc (default): $nvcc_default"; echo "links: $links"; exit 1; }
 echo "OK: patch set, planner source and planner build flags"
+
+if [[ "$manual_checks" == 1 ]]; then
+  git -C "$TMP/cuvs" show level-0005:cpp/src/neighbors/detail/cagra/cagra_build.cuh > "$TMP/canonical.cuh"
+  ulimit -c 0
+  manual_args=(--sdk-source "$SRC" --canonical-header "$TMP/canonical.cuh")
+  if [[ -n "${PGCUVS_MANUAL_CHECKS_OUTPUT:-}" ]]; then
+    manual_args+=(--output "$PGCUVS_MANUAL_CHECKS_OUTPUT")
+  fi
+  python3 -B "$ROOT/test/unit/run_manual_checks.py" "${manual_args[@]}"
+fi

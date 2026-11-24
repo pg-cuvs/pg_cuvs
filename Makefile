@@ -800,14 +800,17 @@ HNSW_CONVERTER_UNIT_LINK = -Wl,--gc-sections \
                           -L$(shell $(PG_CONFIG) --pkglibdir) -lpgcommon -lpgport -lm
 endif
 HNSW_UNIT_CPPFLAGS ?=
-test-hnsw-converter: test/unit/test_hnsw_converter.c src/hnsw_export.c \
-                     src/hnsw_export.h src/cuvs_util.c $(wildcard src/*.h)
+.PHONY: test-hnsw-converter-build
+test-hnsw-converter: test-hnsw-converter-build
+	./$@
+
+test-hnsw-converter-build: test/unit/test_hnsw_converter.c src/hnsw_export.c \
+                           src/hnsw_export.h src/cuvs_util.c $(wildcard src/*.h)
 	$(CC) -std=gnu11 -O0 -Wall -Wextra -Wno-unused-parameter \
 		-ffunction-sections -fdata-sections -I src \
 		-I$(shell $(PG_CONFIG) --includedir) -I$(shell $(PG_CONFIG) --includedir-server) \
-		$(HNSW_UNIT_CPPFLAGS) -o $@ test/unit/test_hnsw_converter.c src/cuvs_util.c \
+		$(HNSW_UNIT_CPPFLAGS) -o test-hnsw-converter test/unit/test_hnsw_converter.c src/cuvs_util.c \
 		$(HNSW_CONVERTER_UNIT_LINK) $(TEST_RT_LIB)
-	./$@
 
 EXTRA_CLEAN += test-hnsw-build test-hnsw-build-ipc test-hnsw-owner-lease test-hnsw-ace-quality test-hnsw-converter test-hnsw-admission test-hnsw-explicit-route test-hnsw-policy \
                test-admission-contract test-admission-contract-cxx test-admission-contract-util.o \
@@ -1248,7 +1251,7 @@ test-lw-daemon:
 	$(CC) -std=gnu11 -O1 -DPGCUVS_CPU_SHIM -ffunction-sections -fdata-sections -I src \
 		test/unit/test_lw_daemon.c src/cuvs_ipc.c src/cuvs_util.c \
 		src/cuvs_objstore.c src/cuvs_build_corpus.c src/cuvs_wrapper_shim_cpu.c \
-		src/cuvs_cache_policy.c src/cuvs_peak_meter.c src/cuvs_page_overlay.c \
+		src/cuvs_cache_policy.c src/cuvs_peak_meter.c src/cuvs_page_overlay.c src/cuvs_hnsw_upper.c \
 		-Wl,--gc-sections -lm -lpthread -lrt -lcurl -lssl -lcrypto -o test-lw-daemon
 	./test-lw-daemon
 
@@ -1303,7 +1306,7 @@ EXTRA_CLEAN += test-lw-startup test-lw-startup-server
 .PHONY: test-lw-startup
 LW_SHIM_DAEMON_SRCS = src/pg_cuvs_server.c src/cuvs_ipc.c src/cuvs_util.c src/cuvs_objstore.c \
                       src/cuvs_build_corpus.c src/cuvs_wrapper_shim_cpu.c \
-                      src/cuvs_cache_policy.c src/cuvs_peak_meter.c src/cuvs_page_overlay.c
+                      src/cuvs_cache_policy.c src/cuvs_peak_meter.c src/cuvs_page_overlay.c src/cuvs_hnsw_upper.c
 test-lw-startup:
 	$(CC) -std=gnu11 -O1 -DPGCUVS_CPU_SHIM -D_POSIX_C_SOURCE=200809L -I src $(LW_SHIM_DAEMON_SRCS) \
 		-lm -lpthread -lrt -lcurl -lssl -lcrypto -o test-lw-startup-server
@@ -1331,7 +1334,7 @@ test-ar8-daemon:
 	$(CC) -std=gnu11 -O1 -DPGCUVS_CPU_SHIM -ffunction-sections -fdata-sections -I src \
 		test/unit/test_ar8_daemon.c src/cuvs_ipc.c src/cuvs_util.c \
 		src/cuvs_objstore.c src/cuvs_build_corpus.c src/cuvs_wrapper_shim_cpu.c \
-		src/cuvs_cache_policy.c src/cuvs_peak_meter.c src/cuvs_page_overlay.c \
+		src/cuvs_cache_policy.c src/cuvs_peak_meter.c src/cuvs_page_overlay.c src/cuvs_hnsw_upper.c \
 		-Wl,--gc-sections -lm -lpthread -lrt -lcurl -lssl -lcrypto -o test-ar8-daemon
 	./test-ar8-daemon
 

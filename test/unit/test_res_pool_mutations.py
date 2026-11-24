@@ -33,7 +33,8 @@ def wiring(w, s, sh):
     assert 'std::make_unique<Stream>()' in traits, 'OWNS_RMM_CUDA_STREAM'
     assert ': std::make_unique<Res>()' in traits, 'OFF_IS_PER_THREAD_DEFAULT'
     assert 'return g_device_pools[device_id].acquire();' in w, 'ACQUIRE_FROM_POOL'
-    assert '~PooledRes() { if (r && !poisoned) release_res(dev, std::move(r)); }' in w, 'POISON_DESTROYS'
+    destructor = w[w.index('~PooledRes()'):w.index('raft::device_resources &get()')]
+    assert 'if (r && !poisoned) release_res(dev, std::move(r));' in destructor, 'POISON_DESTROYS'
     assert 'raft::device_resources &get() { return *r->res; }' in w, 'GET_SLOT_RES'
     main = s[s.index('\nmain(int argc'):]
     a = main.index('cuvs_rmm_set_dedicated_stream(g_rmm_dedicated_stream)')
@@ -44,7 +45,7 @@ def wiring(w, s, sh):
 
 SOURCE = [
     ('traits_ignore_stream', 'w', 'stream ? std::make_unique<Res>(stream->view()) : std::make_unique<Res>()', 'std::make_unique<Res>()'),
-    ('poisoned_slot_pooled', 'w', '~PooledRes() { if (r && !poisoned) release_res(dev, std::move(r)); }', '~PooledRes() { if (r) release_res(dev, std::move(r)); }'),
+    ('poisoned_slot_pooled', 'w', 'if (r && !poisoned) release_res(dev, std::move(r));', 'if (r) release_res(dev, std::move(r));'),
     ('mode_set_after_pool_init', 's', '    /* Before the pool, probes, loads and warmup acquire any RAFT resource. */\n    if (cuvs_rmm_set_dedicated_stream(g_rmm_dedicated_stream) != 0)',
      '    if (0)'),
     ('daemon_default_off', 's', 'static int g_rmm_dedicated_stream = CUVS_RMM_DEDICATED_STREAM_DEFAULT;', 'static int g_rmm_dedicated_stream = 0;'),

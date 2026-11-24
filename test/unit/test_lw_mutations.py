@@ -197,14 +197,37 @@ def run(argv, cwd):
     try:
         q = subprocess.run(argv, cwd=cwd, capture_output=True, text=True, timeout=120)
     except subprocess.TimeoutExpired:
-        return 124, 'FAIL timeout after 120 s'
+        with (Path(cwd) / 'COMMANDS.jsonl').open('a') as log:
+            log.write(json.dumps({'argv': argv, 'exit': 124, 'output': 'timeout after 120 s'}) + '\n')
+        return 124, 'timeout after 120 s'
     text = q.stdout + q.stderr
     with (Path(cwd) / 'COMMANDS.jsonl').open('a') as log:
         log.write(json.dumps({'argv': argv, 'exit': q.returncode, 'output': text}) + '\n')
     return q.returncode, text
 
 
-def build_and_run(tree):
+STARTUP_FAILURES = {
+    'oom_apply_call_deleted': 'pid_adj(&r) == explicit_value',
+    'oom_apply_wrong_path': 'pid_adj(&r) == explicit_value',
+    'startup_line_drops_margin': 'LW startup log uses lw_margin instead of lw_margin_permille',
+}
+
+
+def run_status(rc, output, expected_check=None):
+    if rc == 0:
+        return 'PASS'
+    if rc == 124:
+        return 'TIMEOUT'
+    if rc == 1 and any(
+        line.startswith(('FAIL ', 'AssertionError'))
+        and (expected_check is None or line.endswith(' ' + expected_check))
+        for line in output.splitlines()
+    ):
+        return 'RED (run)'
+    return 'RUN-BROKEN'
+
+
+def build_and_run(tree, startup_check=None):
     """Returns {test: (status, tail)} with status PASS, RED (run) or RED (build)."""
     out = {}
     jobs = {
@@ -218,7 +241,8 @@ def build_and_run(tree):
         jobs['server'] = [CC, '-std=gnu11', '-O1', '-DPGCUVS_CPU_SHIM', '-D_POSIX_C_SOURCE=200809L',
                           '-I', 'src', 'src/pg_cuvs_server.c', 'src/cuvs_ipc.c', 'src/cuvs_util.c',
                           'src/cuvs_objstore.c', 'src/cuvs_build_corpus.c',
-                          'src/cuvs_wrapper_shim_cpu.c', 'src/cuvs_cache_policy.c', 'src/cuvs_peak_meter.c', 'src/cuvs_page_overlay.c', '-lm', '-lpthread', '-lrt', '-lcurl',
+                          'src/cuvs_wrapper_shim_cpu.c', 'src/cuvs_cache_policy.c', 'src/cuvs_peak_meter.c',
+                          'src/cuvs_page_overlay.c', 'src/cuvs_hnsw_upper.c', '-lm', '-lpthread', '-lrt', '-lcurl',
                           '-lssl', '-lcrypto', '-o', 'bin-server']
         jobs['startup'] = [CC, '-std=gnu11', '-Wall', '-Wextra', '-I', 'src', '-o', 'bin-startup',
                            'test/unit/test_lw_startup.c', 'src/cuvs_ipc.c', 'src/cuvs_util.c',
@@ -227,13 +251,14 @@ def build_and_run(tree):
                           '-fdata-sections', '-I', 'src', '-o', 'bin-daemon',
                           'test/unit/test_lw_daemon.c', 'src/cuvs_ipc.c', 'src/cuvs_util.c',
                           'src/cuvs_objstore.c', 'src/cuvs_build_corpus.c',
-                          'src/cuvs_wrapper_shim_cpu.c', 'src/cuvs_cache_policy.c', 'src/cuvs_peak_meter.c', 'src/cuvs_page_overlay.c', '-Wl,--gc-sections', '-lm', '-lpthread',
+                          'src/cuvs_wrapper_shim_cpu.c', 'src/cuvs_cache_policy.c', 'src/cuvs_peak_meter.c',
+                          'src/cuvs_page_overlay.c', 'src/cuvs_hnsw_upper.c', '-Wl,--gc-sections', '-lm', '-lpthread',
                           '-lrt', '-lcurl', '-lssl', '-lcrypto']
     for name, argv in jobs.items():
         if name == 'docs':   # a check, not a build
             rc, text = run(argv, tree)
             lines = [l for l in text.splitlines() if l.startswith(('FAIL', 'PASS'))]
-            out[name] = ('PASS' if rc == 0 else 'RED (run)', lines[:1] or [''])
+            out[name] = (run_status(rc, text), lines[:1] or [''])
             continue
         rc, text = run(argv, tree)
         if name == 'server':  # helper binary for the startup test
@@ -247,7 +272,8 @@ def build_and_run(tree):
         argv_run = ['./bin-' + name] + (['./bin-server'] if name == 'startup' else [])
         rc, text = run(argv_run, tree)
         lines = [l for l in text.splitlines() if l.startswith(('FAIL', 'PASS', 'test_lw'))]
-        out[name] = ('PASS' if rc == 0 else 'RED (run)', lines[:1] or text.strip().splitlines()[-1:])
+        expected = startup_check if name == 'startup' else None
+        out[name] = (run_status(rc, text, expected), lines[:1] or text.strip().splitlines()[-1:])
     return out
 
 
@@ -286,10 +312,10 @@ def main(argv):
                 return 1
             text = text.replace(old, new)
         path.write_text(text)
-        res = build_and_run(tree)
+        res = build_and_run(tree, STARTUP_FAILURES.get(name))
         expect_here = {t for t in expect if t in res}
         reds = {t for t, (s, _) in res.items() if s == 'RED (run)'}
-        broken = {t for t, (s, _) in res.items() if s == 'BUILD-BROKEN'}
+        broken = {t for t, (s, _) in res.items() if s in ('BUILD-BROKEN', 'RUN-BROKEN', 'TIMEOUT')}
         ok = bool(reds) and expect_here <= reds and not broken
         red += ok
         detail = '; '.join(f'{t}={s} {tail[0] if tail else ""}'.strip() for t, (s, tail) in res.items()

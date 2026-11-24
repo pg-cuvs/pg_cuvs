@@ -22,6 +22,11 @@ def main():
     mutants = {"unmasked-EINTR-retry": s.replace(block, "").replace(restore, ""),
                "blocked-no-retry": s.replace(loop, "rc=posix_fallocate(fd,0,(off_t)bytes);")}
     a.output.mkdir(parents=True, exist_ok=True)
+    command = [sys.executable, str(repo / 'test/unit/test_connectivity_pg_workspace.py'),
+               '--tmpfs', str(a.tmpfs), '--rounds', '1']
+    baseline = subprocess.run(command + ['--output', str(a.output / 'baseline')])
+    if baseline.returncode:
+        return 1
     rows = []
     for name, changed in mutants.items():
         out = a.output / name
