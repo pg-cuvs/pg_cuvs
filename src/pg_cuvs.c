@@ -97,6 +97,7 @@
 
 #include "cuvs_wrapper.h"
 #include "cuvs_cagra_pages.h"
+#include "cuvs_cagra_pending_search.h"
 #include "cuvs_hnsw_exact.h"
 #include "cuvs_ipc.h"
 #include "cuvs_util.h"
@@ -521,11 +522,20 @@ static void cuvs_transient_bf_add_path(PlannerInfo *root, RelOptInfo *rel,
 static int  cuvs_metric_from_order_op(Oid opno);   /* defined below; used by both hooks */
 void cuvs_register_custom_scan(void);
 
+#ifdef CUVS_PAGE_FORMAT
+static const char *cuvs_resolve_index_dir_rel(Relation indexRel);
+#endif
+
 /* A pending DROP and the subtransaction that observed it (ADR-060). */
 typedef struct CuvsPendingDrop
 {
     Oid              oid;
     SubTransactionId subid;
+#ifdef CUVS_PAGE_FORMAT
+    bool             page_format;
+    /* Keep an overlong path overlong so the IPC layer can reject it. */
+    char             index_dir[CUVS_PAGE_INDEX_DIR_SIZE + 1];
+#endif
 } CuvsPendingDrop;
 
 static List *cuvs_pending_drops = NIL;   /* of CuvsPendingDrop*, in TopMemoryContext */
@@ -552,10 +562,32 @@ cuvs_object_access(ObjectAccessType access, Oid classId, Oid objectId,
                 OidIsValid(cf->relam) &&
                 (cf->relam == cagra_am || cf->relam == flat_am))
             {
-                MemoryContext old = MemoryContextSwitchTo(TopMemoryContext);
-                CuvsPendingDrop *pd = (CuvsPendingDrop *) palloc(sizeof(CuvsPendingDrop));
-                pd->oid   = objectId;
-                pd->subid = GetCurrentSubTransactionId();
+                CuvsPendingDrop pending = {
+                    .oid = objectId, .subid = GetCurrentSubTransactionId()
+                };
+                MemoryContext old;
+                CuvsPendingDrop *pd;
+
+#ifdef CUVS_PAGE_FORMAT
+                if (cf->relam == cagra_am)
+                {
+                    /* The deletion path already holds a lock on the index.
+                     * Read reloptions before the catalog entry is removed. */
+                    Relation index = try_index_open(objectId, NoLock);
+
+                    if (index != NULL)
+                    {
+                        pending.page_format = cuvs_cagra_has_pages(index);
+                        if (pending.page_format)
+                            strlcpy(pending.index_dir, cuvs_resolve_index_dir_rel(index),
+                                    sizeof(pending.index_dir));
+                        index_close(index, NoLock);
+                    }
+                }
+#endif
+                old = MemoryContextSwitchTo(TopMemoryContext);
+                pd = palloc(sizeof(*pd));
+                *pd = pending;
                 cuvs_pending_drops = lappend(cuvs_pending_drops, pd);
                 MemoryContextSwitchTo(old);
             }
@@ -576,8 +608,21 @@ cuvs_xact_callback(XactEvent event, void *arg)
         foreach(lc, cuvs_pending_drops)
         {
             CuvsPendingDrop *pd = (CuvsPendingDrop *) lfirst(lc);
-            int rc = cuvs_ipc_drop(cuvs_socket_path,
-                                   (uint32_t) MyDatabaseId, (uint32_t) pd->oid);
+            int rc;
+
+#ifdef CUVS_PAGE_FORMAT
+            if (pd->page_format)
+            {
+                rc = cuvs_ipc_drop_pages(cuvs_socket_path, MyDatabaseId, pd->oid, pd->index_dir);
+                if (rc != CUVS_STATUS_OK)
+                    ereport(WARNING,
+                            (errmsg("pg_cuvs: daemon page-format DROP-notify failed for index %u (status %d)",
+                                    pd->oid, rc),
+                             errhint("Check the daemon and the index directory; cached artifacts may remain.")));
+                continue;
+            }
+#endif
+            rc = cuvs_ipc_drop(cuvs_socket_path, MyDatabaseId, pd->oid);
             if (rc != CUVS_STATUS_OK)
                 ereport(WARNING,
                         (errmsg("pg_cuvs: daemon DROP-notify failed for index %u (status %d)",
@@ -888,7 +933,8 @@ typedef enum CuvsFbReason
     CUVS_FB_DAEMON_DOWN,     /* daemon socket missing */
     CUVS_FB_NO_ARTIFACT,     /* no .tids (built on empty table) */
     CUVS_FB_DELTA,           /* .delta corrupt / over cap / gen mismatch */
-    CUVS_FB_TOMBSTONE        /* .tombstone corrupt / over cap / gen mismatch */
+    CUVS_FB_TOMBSTONE,       /* .tombstone corrupt / over cap / gen mismatch */
+    CUVS_FB_PAGE_HOST_BUDGET /* page-overlay daemon host budget exhausted */
 } CuvsFbReason;
 
 #define CUVS_FB_SLOTS 128    /* > MAX_INDEXES(64); lazy slots, never freed on DROP */
@@ -925,6 +971,7 @@ cuvs_fb_reason_name(int r)
         case CUVS_FB_NO_ARTIFACT: return "no_artifact";
         case CUVS_FB_DELTA:       return "delta_unusable";
         case CUVS_FB_TOMBSTONE:   return "tombstone_unusable";
+        case CUVS_FB_PAGE_HOST_BUDGET: return "page_overlay_host_budget";
         default:                  return "none";
     }
 }
@@ -3212,6 +3259,7 @@ cuvs_build_hnsw_from_heap(Relation heapRel, Relation indexRel, IndexInfo *indexI
 typedef struct CuvsBuildState {
 #ifdef CUVS_PAGE_FORMAT
     bool strict_dim;
+    bool expression_index;
 #endif
     int      dim;
     int64_t  n_vecs;
@@ -3301,7 +3349,13 @@ cuvs_build_callback(Relation index,
     {
 #ifdef CUVS_PAGE_FORMAT
         if (bs->strict_dim)
+        {
+            if (bs->expression_index)
+                ereport(ERROR, (errcode(ERRCODE_DATA_EXCEPTION),
+                                errmsg("expression CAGRA index has mixed vector dimensions"),
+                                errhint("Cast the index expression to vector(n) to fix its dimension.")));
             cuvs_cagra_check_dim(bs->dim, vec->dim);
+        }
 #endif
         return;             /* legacy: dimension mismatch */
     }
@@ -3613,7 +3667,20 @@ cuvs_build_parallel(Relation heapRel, Relation indexRel, IndexInfo *indexInfo,
  * DUP-SIBLING(build-heap): cuvs_build_flat_from_heap is a duplicate (ADR-073).
  * Change both together; see the duplicate-pair inventory in ADR-073.
  * ---------------------------------------------------------------- */
+#ifdef CUVS_PAGE_FORMAT
 static void
+check_page_build_root(int status)
+{
+    if (status == CUVS_STATUS_INVALID_PAGE_ROOT)
+        ereport(ERROR,
+                (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+                 errmsg("invalid page-format CAGRA index_dir"),
+                 errhint("Use an existing directory owned by the daemon user, "
+                         "with a path shorter than %d bytes.", CUVS_PAGE_INDEX_DIR_SIZE)));
+}
+#endif
+
+static bool
 cuvs_build_cagra_from_heap_impl(Relation heapRel, Relation indexRel, IndexInfo *indexInfo,
                            uint32_t build_index_oid, uint32_t shard_count,
                            bool use_cpu_hnsw, int graph_degree,
@@ -3630,14 +3697,17 @@ cuvs_build_cagra_from_heap_impl(Relation heapRel, Relation indexRel, IndexInfo *
 
     memset(&bs, 0, sizeof(bs));
 #ifdef CUVS_PAGE_FORMAT
-    bs.strict_dim = page_format;
+    bool expression = indexInfo->ii_IndexAttrNumbers[0] == 0;
+    bool pending_vectors = page_format && expression;
+
+    bs.strict_dim = page_format || expression;
+    bs.expression_index = expression;
     if (page_format)
     {
         page_request.length = sizeof(page_request);
         page_request.flags = CUVS_PAGE_BUILD_DEFER_LEGACY;
         page_request.index_nonce = cuvs_cagra_nonce();
         page_request.system_identifier = GetSystemIdentifier();
-        shard_count = 1;
     }
 #endif
     bs.metric = cuvs_index_metric(indexRel);  /* baked into the CAGRA graph */
@@ -3652,6 +3722,10 @@ cuvs_build_cagra_from_heap_impl(Relation heapRel, Relation indexRel, IndexInfo *
     typmod = (heap_attno >= 1)
         ? TupleDescAttr(RelationGetDescr(heapRel), heap_attno - 1)->atttypmod
         : -1;
+#ifdef CUVS_PAGE_FORMAT
+    if (pending_vectors)
+        typmod = TupleDescAttr(RelationGetDescr(indexRel), 0)->atttypmod;
+#endif
     reltuples_est = heapRel->rd_rel->reltuples;
 
     if (bs.cap_bytes > 0 && typmod > 0 && reltuples_est > 0)
@@ -3718,7 +3792,7 @@ cuvs_build_cagra_from_heap_impl(Relation heapRel, Relation indexRel, IndexInfo *
                                    bs.cap_bytes, nworkers,
                                    graph_degree, intermediate_graph_degree, build_algo,
                                    out_n_vecs, out_reltuples))
-            return;
+            return false;
     }
 
     /* ADR-057: when the column has a declared dimension (vector(N), the common
@@ -3764,6 +3838,19 @@ cuvs_build_cagra_from_heap_impl(Relation heapRel, Relation indexRel, IndexInfo *
         if (out_reltuples) *out_reltuples = bs.reltuples;
         *out_n_vecs = bs.n_vecs;
 
+#ifdef CUVS_PAGE_FORMAT
+        if (page_format)
+        {
+            if (!cuvs_page_preloaded || RecoveryInProgress())
+                ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+                                errmsg("cannot create a page-format CAGRA index on this server"),
+                                errhint("Create the index on a primary with pg_cuvs in shared_preload_libraries.")));
+            if (cuvs_shard_count > 1)
+                ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                                errmsg("the experimental CAGRA page format is not sharded")));
+        }
+#endif
+
         if (bs.n_vecs >= (page_format ? 2 : 1))
         {
             uint32_t heap_table_oid   = (uint32_t) RelationGetRelid(heapRel);
@@ -3798,13 +3885,17 @@ cuvs_build_cagra_from_heap_impl(Relation heapRel, Relation indexRel, IndexInfo *
                 cuvs_resolve_index_dir_rel(indexRel),
                 heap_table_oid,
                 heap_relfilenode,
-                shard_count,
+                page_format ? 1 : shard_count,
                 use_cpu_hnsw ? 1 : 0,  /* Phase 3I-1: serialize .hnsw sidecar */
                 (uint32_t) graph_degree,
                 (uint32_t) intermediate_graph_degree,
                 build_algo,
                 page_format ? &page_request : NULL, &graph_nonce);
 
+#ifdef CUVS_PAGE_FORMAT
+            if (page_format)
+                check_page_build_root(rc);
+#endif
             cuvs_report_build_notice(build_index_oid);
             if (rc != CUVS_STATUS_OK)
             {
@@ -3854,12 +3945,14 @@ cuvs_build_cagra_from_heap_impl(Relation heapRel, Relation indexRel, IndexInfo *
             if (bs.n_vecs < 2)
             {
                 page_request.build_xid = U64FromFullTransactionId(GetTopFullTransactionId());
-                cuvs_ipc_mark_pages_empty(cuvs_socket_path, MyDatabaseId, build_index_oid,
-                                          cuvs_resolve_index_dir_rel(indexRel), &page_request);
+                rc = cuvs_ipc_mark_pages_empty(cuvs_socket_path, MyDatabaseId, build_index_oid,
+                                               cuvs_resolve_index_dir_rel(indexRel), &page_request);
+                /* An unreachable or older daemon can still serve heap-only pages. */
+                check_page_build_root(rc);
             }
             cuvs_cagra_init_pages(indexRel, MAIN_FORKNUM, page_request.index_nonce,
                                   graph_nonce, bs.dim > 0 ? bs.dim : Max(typmod, 0),
-                                  bs.metric, bs.tids, bs.n_vecs);
+                                  bs.metric, bs.tids, bs.n_vecs, pending_vectors);
         }
 #endif
     }
@@ -3874,6 +3967,7 @@ cuvs_build_cagra_from_heap_impl(Relation heapRel, Relation indexRel, IndexInfo *
             free(bs.tids);
     }
     PG_END_TRY();
+    return page_format;
 }
 
 void
@@ -3887,6 +3981,36 @@ cuvs_build_cagra_from_heap(Relation heapRel, Relation indexRel, IndexInfo *index
                                   shard_count, use_cpu_hnsw, graph_degree,
                                   intermediate_graph_degree, build_algo,
                                   out_n_vecs, out_reltuples, false);
+}
+
+static void
+cuvs_finish_legacy_cagra_build(Relation heapRel, Relation indexRel)
+{
+    /* Phase 3C: write .relfilenode sidecar so the daemon can verify heap
+     * compatibility before loading a GCS artifact on a new node. */
+    {
+        uint32_t heap_table_oid   = (uint32_t) RelationGetRelid(heapRel);
+        uint32_t heap_relfilenode = (uint32_t) heapRel->rd_rel->relfilenode;
+        char sidecar[MAXPGPATH];
+        snprintf(sidecar, sizeof(sidecar), "%s/%u_%u.relfilenode",
+                 cuvs_resolve_index_dir_rel(indexRel),
+                 (uint32_t) MyDatabaseId,
+                 (uint32_t) RelationGetRelid(indexRel));
+        FILE *f = fopen(sidecar, "w");
+        if (f)
+        {
+            fprintf(f, "%u %u\n", heap_relfilenode, heap_table_oid);
+            fclose(f);
+        }
+        /* Non-fatal: GCS download will skip compat check if sidecar is absent */
+    }
+
+    /* Phase 3A: the fresh base absorbs all current rows, so any pending-insert
+     * delta and tombstones from before this (RE)build are obsolete. Drop them;
+     * the new base .tids CRC also invalidates leftovers via generation guard. */
+    cuvs_delta_unlink(RelationGetRelid(indexRel));
+    cuvs_tombstone_unlink(RelationGetRelid(indexRel));
+
 }
 
 /* ----------------------------------------------------------------
@@ -3904,23 +4028,25 @@ cuvs_ambuild(Relation heapRel, Relation indexRel, IndexInfo *indexInfo)
 
 #ifdef CUVS_PAGE_FORMAT
     {
-        int gd, igd;
-        uint32_t algo;
+        int dim = TupleDescAttr(RelationGetDescr(indexRel), 0)->atttypmod;
+        bool expression = indexInfo->ii_IndexAttrNumbers[0] == 0;
 
-        if (!cuvs_page_preloaded || RecoveryInProgress())
-            ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-                            errmsg("cannot create a page-format CAGRA index on this server"),
-                            errhint("Create the index on a primary with pg_cuvs in shared_preload_libraries.")));
-        if (cuvs_shard_count > 1)
-            ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-                            errmsg("the experimental CAGRA page format is not sharded")));
-        cuvs_resolve_build_params_rel(indexRel, &gd, &igd, &algo);
-        cuvs_build_cagra_from_heap_impl(heapRel, indexRel, indexInfo,
-                                      RelationGetRelid(indexRel), 1, cuvs_cpu_hnsw_fallback,
-                                      gd, igd, algo, &n_vecs, &reltuples, true);
-        result->heap_tuples = reltuples;
-        result->index_tuples = n_vecs;
-        return result;
+        if (!expression || (dim > 0 && cuvs_cagra_can_store_pending_vector(dim)))
+        {
+            int gd, igd;
+            uint32_t algo;
+            bool page_format;
+
+            cuvs_resolve_build_params_rel(indexRel, &gd, &igd, &algo);
+            page_format = cuvs_build_cagra_from_heap_impl(heapRel, indexRel, indexInfo,
+                RelationGetRelid(indexRel), cuvs_shard_count, cuvs_cpu_hnsw_fallback,
+                gd, igd, algo, &n_vecs, &reltuples, true);
+            result->heap_tuples = reltuples;
+            result->index_tuples = n_vecs;
+            if (!page_format && n_vecs != 0)
+                cuvs_finish_legacy_cagra_build(heapRel, indexRel);
+            return result;
+        }
     }
 #endif
 
@@ -3993,30 +4119,7 @@ cuvs_ambuild(Relation heapRel, Relation indexRel, IndexInfo *indexInfo)
     if (n_vecs == 0)
         return result;  /* empty table — nothing built */
 
-    /* Phase 3C: write .relfilenode sidecar so the daemon can verify heap
-     * compatibility before loading a GCS artifact on a new node. */
-    {
-        uint32_t heap_table_oid   = (uint32_t) RelationGetRelid(heapRel);
-        uint32_t heap_relfilenode = (uint32_t) heapRel->rd_rel->relfilenode;
-        char sidecar[MAXPGPATH];
-        snprintf(sidecar, sizeof(sidecar), "%s/%u_%u.relfilenode",
-                 cuvs_resolve_index_dir_rel(indexRel),
-                 (uint32_t) MyDatabaseId,
-                 (uint32_t) RelationGetRelid(indexRel));
-        FILE *f = fopen(sidecar, "w");
-        if (f)
-        {
-            fprintf(f, "%u %u\n", heap_relfilenode, heap_table_oid);
-            fclose(f);
-        }
-        /* Non-fatal: GCS download will skip compat check if sidecar is absent */
-    }
-
-    /* Phase 3A: the fresh base absorbs all current rows, so any pending-insert
-     * delta and tombstones from before this (RE)build are obsolete. Drop them;
-     * the new base .tids CRC also invalidates leftovers via generation guard. */
-    cuvs_delta_unlink(RelationGetRelid(indexRel));
-    cuvs_tombstone_unlink(RelationGetRelid(indexRel));
+    cuvs_finish_legacy_cagra_build(heapRel, indexRel);
 
     return result;
 }
@@ -4269,10 +4372,20 @@ static void
 cuvs_ambuildempty(Relation indexRel)
 {
 #ifdef CUVS_PAGE_FORMAT
-    if (RelationGetForm(indexRel)->relam == get_am_oid("cagra", true))
+    if (RelationGetForm(indexRel)->relam == get_am_oid("cagra", true) &&
+        cuvs_cagra_has_pages(indexRel))
+    {
+        CuvsCagraMeta meta;
+
+        if (!cuvs_cagra_read_meta(indexRel, &meta))
+            elog(ERROR, "cannot initialize an unlogged CAGRA index without valid metadata");
+        bool pending_vectors = (meta.flags & CUVS_CAGRA_PENDING_VECTOR) != 0;
+        int dim = pending_vectors ? meta.dim :
+            Max(0, TupleDescAttr(RelationGetDescr(indexRel), 0)->atttypmod);
+
         cuvs_cagra_init_pages(indexRel, INIT_FORKNUM, cuvs_cagra_nonce(), 0,
-                             Max(0, TupleDescAttr(RelationGetDescr(indexRel), 0)->atttypmod),
-                             cuvs_index_metric(indexRel), NULL, 0);
+                             dim, meta.metric, NULL, 0, pending_vectors);
+    }
 #else
     (void)indexRel;
 #endif
@@ -4292,6 +4405,7 @@ typedef struct CuvsScanState {
     CuvsHnswExact *page_exact;
     CuvsCagraMeta *page_meta;
     CuvsResult *page_results;
+    bool page_heap_tids;
     BlockNumber page_blocks;
     int page_returned;
 #endif
@@ -4879,6 +4993,7 @@ cuvs_rescan(IndexScanDesc scan, ScanKey keys, int nkeys,
     ss->page_exact = NULL;
     if (ss->page_meta) { pfree(ss->page_meta); ss->page_meta = NULL; }
     if (ss->page_results) { pfree(ss->page_results); ss->page_results = NULL; }
+    ss->page_heap_tids = false;
     ss->page_returned = 0;
 #endif
     ss->searched  = false;
@@ -4940,7 +5055,7 @@ page_search_request(Relation index, Snapshot snapshot, int dim,
         return false;
     cuvs_cagra_check_dim(meta->dim, dim);
     if (!meta->graph_nonce || !cuvs_cagra_read_tail(index, meta, *blocks, &request->tail) ||
-        request->tail != meta->folded)
+        request->tail < meta->folded)
         return false;
 
     request->length = sizeof(*request);
@@ -5050,7 +5165,8 @@ page_search_filtered(Oid oid, Relation heap, Snapshot snapshot, const float *que
         RelationGetForm(heap)->relam != HEAP_TABLE_AM_OID)
         return false;
     index = index_open(oid, AccessShareLock);
-    if (!page_search_request(index, snapshot, dim, &meta, &blocks, &request))
+    if (!page_search_request(index, snapshot, dim, &meta, &blocks, &request) ||
+        request.tail != request.folded)
     {
         index_close(index, AccessShareLock);
         return false;
@@ -5083,6 +5199,68 @@ page_search_filtered(Oid oid, Relation heap, Snapshot snapshot, const float *que
     return ok;
 }
 
+/* Resolve the merged shortlist under the scan snapshot before emitting a row.
+ * Invisible candidates can leave fewer answers than cuvs.k. A bad slot identity
+ * invalidates the shortlist before the scan has emitted any rows. */
+static bool
+page_resolve_overlay(IndexScanDesc scan, CuvsScanState *ss, const CuvsCagraMeta *meta,
+                     const CuvsPageSearchRequest *request,
+                     const CuvsPageOverlayResult *results, int count)
+{
+    Relation heap = scan->heapRelation;
+    IndexFetchTableData *fetch = table_index_fetch_begin(heap);
+    TupleTableSlot *tuple = table_slot_create(heap, NULL);
+    bool valid = true;
+
+    ss->n_results = 0;
+    for (int i = 0; i < count && ss->n_results < cuvs_k; ++i)
+    {
+        const CuvsPageOverlayResult *candidate = &results[i];
+        ItemPointerData root, visible;
+        CuvsCagraSlotResult state;
+        bool again = false, dead = false;
+
+        CHECK_FOR_INTERRUPTS();
+        if (candidate->slot < meta->n_slots)
+            state = cuvs_cagra_slot_tid(scan->indexRelation, meta, ss->page_blocks,
+                                        candidate->slot, &root);
+        else
+        {
+            uint64 pending = candidate->slot - meta->n_slots;
+
+            if (pending >= request->tail - request->folded)
+            {
+                ++cuvs_page_bad_slots;
+                valid = false;
+                break;
+            }
+            state = cuvs_cagra_pending_tid(scan->indexRelation, meta, ss->page_blocks,
+                                           candidate->block, request->folded + pending, &root);
+        }
+        if (state == CUVS_CAGRA_SLOT_BAD)
+        {
+            valid = false;
+            break;
+        }
+        if (state == CUVS_CAGRA_SLOT_DEAD)
+            continue;
+        /* Heap fetch may replace the root with a visible HOT child. The
+         * PostgreSQL index scan must still give its caller the root TID. */
+        visible = root;
+        table_index_fetch_reset(fetch);
+        if (!table_index_fetch_tuple(fetch, &visible, scan->xs_snapshot, tuple, &again, &dead))
+            continue;
+        ss->page_results[ss->n_results++] = (CuvsResult) {
+            .tid = cuvs_tid_encode(ItemPointerGetBlockNumber(&root),
+                                   ItemPointerGetOffsetNumber(&root)),
+            .distance = candidate->distance,
+        };
+    }
+    table_index_fetch_end(fetch);
+    ExecDropSingleTupleTableSlot(tuple);
+    return valid;
+}
+
 static bool
 page_start_search(IndexScanDesc scan, CuvsScanState *ss)
 {
@@ -5102,12 +5280,51 @@ page_start_search(IndexScanDesc scan, CuvsScanState *ss)
         return false;
     k = cuvs_k + (int) Min(meta.dead_slots, (uint64) cuvs_k);
 
-    ss->page_results = palloc(k * sizeof(*ss->page_results));
-    rc = cuvs_ipc_search_pages(cuvs_socket_path, MyDatabaseId, RelationGetRelid(index),
-                               &request, query->x, 1, query->dim, k, meta.metric,
-                               cuvs_itopk_size, cuvs_search_width, cuvs_cpu_hnsw_fallback,
-                               cuvs_search_mode, cuvs_bf_precision, NULL, 0,
-                               ss->page_results, &ss->n_results, &latency);
+    if (request.tail == request.folded)
+    {
+        ss->page_results = palloc(k * sizeof(*ss->page_results));
+        rc = cuvs_ipc_search_pages(cuvs_socket_path, MyDatabaseId, RelationGetRelid(index),
+                                   &request, query->x, 1, query->dim, k, meta.metric,
+                                   cuvs_itopk_size, cuvs_search_width, cuvs_cpu_hnsw_fallback,
+                                   cuvs_search_mode, cuvs_bf_precision, NULL, 0,
+                                   ss->page_results, &ss->n_results, &latency);
+    }
+    else
+    {
+        CuvsPageOverlayRequest overlay = {.base = request, .boot_id = (uint64) PgStartTime,
+                                          .from = request.folded};
+        CuvsPageSupplement supplement = {0};
+        CuvsPageProgress progress;
+        CuvsPageOverlayResult *results;
+        int count;
+
+        if (!cuvs_cagra_local_supplement(index, scan->heapRelation, scan->xs_snapshot,
+                                         &meta, ss->page_blocks, overlay.from, request.tail,
+                                         &supplement))
+            return false;
+        results = palloc(k * sizeof(*results));
+        rc = cuvs_ipc_search_page_overlay(cuvs_socket_path, MyDatabaseId, RelationGetRelid(index),
+                                          &overlay, query->x, 1, query->dim, k, meta.metric,
+                                          cuvs_itopk_size, cuvs_search_width, cuvs_cpu_hnsw_fallback,
+                                          cuvs_search_mode, cuvs_bf_precision, &supplement,
+                                          results, &count, &latency, &progress);
+        cuvs_cagra_free_supplement(&supplement);
+        if (rc == CUVS_STATUS_OK)
+        {
+            ss->page_results = palloc(k * sizeof(*ss->page_results));
+            if (page_resolve_overlay(scan, ss, &meta, &request, results, count))
+                ss->page_heap_tids = true;
+            else
+            {
+                pfree(ss->page_results);
+                ss->page_results = NULL;
+                rc = CUVS_STATUS_NOT_FOUND;
+            }
+        }
+        else if (rc == CUVS_STATUS_PAGE_OVERLAY_HOST_FULL)
+            cuvs_fb_record(RelationGetRelid(index), CUVS_FB_PAGE_HOST_BUDGET);
+        pfree(results);
+    }
     if (rc == CUVS_STATUS_CANCELED)
         CHECK_FOR_INTERRUPTS();
     if (rc != CUVS_STATUS_OK)
@@ -5132,6 +5349,7 @@ page_start_exact(IndexScanDesc scan, CuvsScanState *ss)
         !(scan->orderByData[0].sk_flags & SK_ISNULL))
         dim = DatumGetPgVector(scan->orderByData[0].sk_argument)->dim;
     cuvs_cagra_check_query_dim(scan->indexRelation, dim);
+    cuvs_last_n_results = -1;
     ss->page_exact = cuvs_hnsw_exact_begin(scan);
 }
 
@@ -5152,9 +5370,20 @@ page_gettuple(IndexScanDesc scan, CuvsScanState *ss)
         while (ss->cur < ss->n_results && ss->page_returned < cuvs_k)
         {
             CuvsResult *candidate = &ss->page_results[ss->cur++];
-            CuvsCagraSlotResult state = cuvs_cagra_slot_tid(scan->indexRelation,
-                ss->page_meta, ss->page_blocks, candidate->tid, &scan->xs_heaptid);
+            CuvsCagraSlotResult state = CUVS_CAGRA_SLOT_LIVE;
             double distance = candidate->distance;
+
+            if (ss->page_heap_tids)
+            {
+                uint32 block;
+                uint16 offset;
+
+                cuvs_tid_decode(candidate->tid, &block, &offset);
+                ItemPointerSet(&scan->xs_heaptid, block, offset);
+            }
+            else
+                state = cuvs_cagra_slot_tid(scan->indexRelation, ss->page_meta, ss->page_blocks,
+                                            candidate->tid, &scan->xs_heaptid);
 
             if (state == CUVS_CAGRA_SLOT_DEAD)
                 continue;
@@ -5864,9 +6093,9 @@ cuvs_aminsert(Relation indexRel, Datum *values, bool *isnull,
 #ifdef CUVS_PAGE_FORMAT
         if (!isnull[0])
         {
-            int dim = DatumGetPgVector(values[0])->dim;
+            PgVector *value = DatumGetPgVector(values[0]);
 
-            cuvs_cagra_append_pending(indexRel, heap_tid, dim);
+            cuvs_cagra_append_pending(indexRel, heap_tid, value->dim, value->x);
         }
         return false;
 #else

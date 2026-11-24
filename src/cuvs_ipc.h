@@ -165,8 +165,15 @@ int cuvs_ipc_build_hnsw_file_idle(const char *socket_path, int vectors_fd,
 #define CUVS_OP_SEARCH_PAGES_FILTERED 48
 #define CUVS_OP_MARK_PAGES_EMPTY      49
 #define CUVS_OP_UNLOAD_PAGE_LEGACY    50
+#define CUVS_OP_SUPPLY_PAGES          51
+#define CUVS_OP_DROP_PAGES_INDEX      52 /* fixed index_dir after the v6 command */
+#define CUVS_OP_SEARCH_PAGE_OVERLAY   56
+#define CUVS_OP_SEARCH_PAGE_OVERLAY_BATCH 57
+#define CUVS_PAGE_INDEX_DIR_SIZE 256 /* fixed path field on the wire */
 #define CUVS_PAGE_SLOT_INVALID UINT64_MAX
 #define CUVS_PAGE_BUILD_DEFER_LEGACY 1U
+#define CUVS_PAGE_BATCH_MAX 4096U
+#define CUVS_PAGE_OVERLAY_MAX 200000U
 
 typedef struct CuvsPageBuildRequest
 {
@@ -177,7 +184,7 @@ typedef struct CuvsPageBuildRequest
     uint64_t system_identifier;
 } CuvsPageBuildRequest;
 
-void cuvs_ipc_mark_pages_empty(const char *socket_path, uint32_t db_oid,
+int cuvs_ipc_mark_pages_empty(const char *socket_path, uint32_t db_oid,
     uint32_t index_oid, const char *index_dir, const CuvsPageBuildRequest *request);
 
 /* Both requests use the unchanged v6 envelope. This unit serves the base
@@ -197,6 +204,65 @@ typedef struct CuvsPageSearchRequest
     float    resume_distance;
     uint32_t reserved;
 } CuvsPageSearchRequest;
+
+/* Only new overlay opcodes use this extended frame. Existing page search
+ * opcodes keep their original request and result layouts. */
+typedef struct CuvsPageOverlayRequest
+{
+    CuvsPageSearchRequest base;
+    uint64_t boot_id;
+    uint64_t from;
+    uint32_t positions;
+    uint32_t vector_rows;
+    char supplement_shm[64];
+} CuvsPageOverlayRequest;
+
+enum CuvsPagePositionState
+{
+    CUVS_PAGE_POSITION_DEAD = 0,
+    CUVS_PAGE_POSITION_VECTOR = 1,
+    CUVS_PAGE_POSITION_INVISIBLE = 2
+};
+
+typedef struct CuvsPagePosition
+{
+    uint32_t block;
+    uint32_t state;
+} CuvsPagePosition;
+
+typedef struct CuvsPageSupplement
+{
+    const CuvsPagePosition *marks;
+    const float *vectors;
+    uint32_t positions;
+    uint32_t vector_rows;
+} CuvsPageSupplement;
+
+typedef struct CuvsPageProgress
+{
+    uint64_t daemon_id;
+    uint64_t covered_upto;
+} CuvsPageProgress;
+
+typedef struct CuvsPageOverlayResult
+{
+    uint64_t slot;
+    float distance;
+    uint32_t block;
+} CuvsPageOverlayResult;
+
+int cuvs_ipc_supply_pages(const char *socket_path, uint32_t db_oid, uint32_t index_oid,
+    const CuvsPageOverlayRequest *request, int dim, uint32_t metric,
+    const CuvsPageSupplement *supplement, CuvsPageProgress *progress);
+
+/* results must hold nq * k entries. Batch rows pad unused positions with
+ * CUVS_PAGE_SLOT_INVALID; base graph rows use block=0 (no heap block hint). */
+int cuvs_ipc_search_page_overlay(const char *socket_path, uint32_t db_oid, uint32_t index_oid,
+    const CuvsPageOverlayRequest *request, const float *queries, int nq, int dim, int k,
+    uint32_t metric, uint32_t itopk_size, uint32_t search_width, uint32_t use_cpu_hnsw,
+    uint32_t search_mode, uint32_t bf_precision, const CuvsPageSupplement *supplement,
+    CuvsPageOverlayResult *results, int *count, uint32_t *latency_us, CuvsPageProgress *progress);
+
 
 
 
@@ -233,6 +299,13 @@ typedef struct CuvsPageSearchRequest
 #define CUVS_STATUS_HNSW_UPPER_SKIPPED 16 /* EXPORT_HNSW_UPPER built no upper layers (the
                                            * graph degree is below 4, so M < 2); the backend
                                            * keeps its own level assignment */
+
+#define CUVS_STATUS_INVALID_PAGE_ROOT 17 /* page-format index_dir rejected */
+
+/* 14/15 are reserved by other changes. 17 is INVALID_PAGE_ROOT. */
+#define CUVS_STATUS_PAGE_NEED          18
+#define CUVS_STATUS_PAGE_OVERLAY_FULL  19
+#define CUVS_STATUS_PAGE_OVERLAY_HOST_FULL 20 /* daemon host budget: use exact heap search */
 
 /* ----------------------------------------------------------------
  * Command frame (sent over UDS, fixed size)
@@ -1043,6 +1116,10 @@ int cuvs_ipc_drop(
     uint32_t    db_oid,
     uint32_t    index_oid
 );
+
+/* Committed page-format DROP with the index directory resolved by the daemon. */
+int cuvs_ipc_drop_pages(const char *socket_path, uint32_t db_oid, uint32_t index_oid,
+                        const char *index_dir);
 
 /* 3P: IVF-PQ build — heap-tier corpus (vecs+tids direct pointers). */
 int cuvs_ipc_build_ivfpq(

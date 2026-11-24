@@ -32,7 +32,7 @@ def compile_and_run(mutated: bool) -> tuple[int, int | None]:
                str(tests / fixture.name),
                *[str(ROOT / f"src/{name}") for name in (
                    "cuvs_ipc.c", "cuvs_util.c", "cuvs_objstore.c", "cuvs_build_corpus.c",
-                   "cuvs_wrapper_shim_cpu.c", "cuvs_cache_policy.c", "cuvs_peak_meter.c")],
+                   "cuvs_wrapper_shim_cpu.c", "cuvs_cache_policy.c", "cuvs_peak_meter.c", "cuvs_page_overlay.c")],
                "-Wl,--gc-sections", "-lm", "-lpthread", "-lrt", "-lcurl", "-lssl", "-lcrypto",
                "-o", str(binary)]
         built = subprocess.run(cmd, capture_output=True, text=True)
