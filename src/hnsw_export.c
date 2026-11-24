@@ -107,7 +107,6 @@ static uint32_t cagra_index_metric(Oid index_oid);
 #define PGV_HNSW_PAGE_ID        0xFF90u
 /* Heap builds default to M 32, which requests a graph degree of 64. */
 #define CUVS_HNSW_DEFAULT_M     32
-#define CUVS_HNSW_SOURCE_MAX_M  32
 #define CUVS_HNSW_BUILD_EF      128
 
 /* Byte size of the 13-field hnswlib binary header (fixed across versions):
@@ -2052,14 +2051,12 @@ cuvs_warn_pgvector_version(void)
  * ================================================================ */
 /* A zero request is internal only: the source decides M when m was omitted. */
 static void
-hnsw_check_source_m(int requested_m, int actual_m)
+hnsw_report_source_m(int requested_m, int actual_m)
 {
     if (requested_m != 0 && requested_m != actual_m)
-        ereport(ERROR,
-                (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-                 errmsg("pg_cuvs_hnsw: m = %d does not match the source graph's M = %d",
-                        requested_m, actual_m),
-                 errhint("Omit m to use the source graph's M.")));
+        ereport(WARNING,
+                (errmsg("pg_cuvs_hnsw: source graph uses M = %d, ignoring m = %d",
+                        actual_m, requested_m)));
 }
 
 /* Internal helper: fill an existing HNSW index from hnswlib sidecar.
@@ -2259,7 +2256,7 @@ fill_hnsw_from_hnswlib_impl(Oid cagra_oid, Oid hnsw_oid, bool use_shm,
                                M, M0)));
     }
 
-    hnsw_check_source_m(source_m, M);
+    hnsw_report_source_m(source_m, M);
 
     /* ---- 4. Read .tids sidecar ---- */
     FILE *tf = fopen(tids_path, "rb");
@@ -3658,7 +3655,7 @@ hnsw_import_build_result(Relation indexRel,
                                  error, sizeof(error)))
             ereport(ERROR,
                     (errmsg("pg_cuvs: invalid source-less HNSW files: %s", error)));
-        hnsw_check_source_m(source_m, (int)header.M);
+        hnsw_report_source_m(source_m, (int)header.M);
         layout_m = heap_m ? heap_m : (uint16_t)header.M;
         hnsw_check_connectivity(build->hnsw_fd, &header, &connectivity);
         hnsw_notice_connectivity(&connectivity);
@@ -3701,6 +3698,7 @@ hnsw_import_build_result(Relation indexRel,
         }
         hnsw_write_disk_metapage(s->target, &header, layout_m, build->dim,
                                  data_page_count, skip_wal, &s->locations,
+                                 /* Only direct heap builds carry a native receipt. */
                                  heap_m ? &build->policy : NULL,
                                  &build->ace, &build->nn, &connectivity);
         hnsw_write_disk_pages(s->target, build->hnsw_fd, build->tids_fd,
@@ -4058,7 +4056,7 @@ fill_hnsw_from_cagra_ipc_impl(Oid cagra_oid, Oid hnsw_oid, const char *mode,
     if (M0 % 2 != 0) M0--;
     if (M0 < 2) M0 = 2;
     int M = M0 / 2;
-    hnsw_check_source_m(source_m, M);
+    hnsw_report_source_m(source_m, M);
 
     ElemDesc *elems = (ElemDesc *)calloc(N, sizeof(ElemDesc));
     if (!elems)
@@ -4613,7 +4611,7 @@ cuvs_hnsw_init_reloptions(void)
                          "HNSW route: auto=tiny/resident IVF-PQ, explicit ivf_pq, nn_descent or ace; estimates are not memory upper bounds",
                          "auto", cuvs_hnsw_validate_build_algo, AccessExclusiveLock);
     add_int_reloption(cuvs_hnsw_relopt_kind, "m",
-                      "HNSW M for heap builds; with source, an explicit m must match the converted graph (maximum 32)",
+                      "HNSW M for heap builds; source builds use the converted graph's M and warn about a differing explicit m",
                       CUVS_HNSW_DEFAULT_M, 2, 100, AccessExclusiveLock);
     add_int_reloption(cuvs_hnsw_relopt_kind, "ef_construction",
                       "Construction effort: default 64 preserves route defaults; changes intermediate degree / ACE effort",
@@ -4972,12 +4970,6 @@ cuvs_hnsw_ambuild(Relation heapRel, Relation indexRel, IndexInfo *indexInfo)
     }
 
     int source_m = cuvs_hnsw_m_is_explicit(self_oid) ? (int) requested_m : 0;
-    if (source_m > CUVS_HNSW_SOURCE_MAX_M)
-        ereport(ERROR,
-                (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-                 errmsg("pg_cuvs_hnsw: m = %d is out of range for source conversion (maximum %d)",
-                        source_m, CUVS_HNSW_SOURCE_MAX_M),
-                 errhint("Omit m to use the source graph's M.")));
 
     /* Fill THIS index's relation (pgvector page format) from the CAGRA graph.
      * fill_* open the target by OID with AccessExclusiveLock. For CREATE INDEX
