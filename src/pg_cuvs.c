@@ -522,10 +522,6 @@ static void cuvs_transient_bf_add_path(PlannerInfo *root, RelOptInfo *rel,
 static int  cuvs_metric_from_order_op(Oid opno);   /* defined below; used by both hooks */
 void cuvs_register_custom_scan(void);
 
-#ifdef CUVS_PAGE_FORMAT
-static const char *cuvs_resolve_index_dir_rel(Relation indexRel);
-#endif
-
 /* A pending DROP and the subtransaction that observed it (ADR-060). */
 typedef struct CuvsPendingDrop
 {
