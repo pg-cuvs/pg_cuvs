@@ -165,6 +165,8 @@ int cuvs_ipc_build_hnsw_file_idle(const char *socket_path, int vectors_fd,
 #define CUVS_OP_SEARCH_PAGES_FILTERED 48
 #define CUVS_OP_MARK_PAGES_EMPTY      49
 #define CUVS_OP_UNLOAD_PAGE_LEGACY    50
+#define CUVS_OP_DROP_PAGES_INDEX      52 /* fixed index_dir after the v6 command */
+#define CUVS_PAGE_INDEX_DIR_SIZE 256 /* fixed path field on the wire */
 #define CUVS_PAGE_SLOT_INVALID UINT64_MAX
 #define CUVS_PAGE_BUILD_DEFER_LEGACY 1U
 
@@ -177,7 +179,7 @@ typedef struct CuvsPageBuildRequest
     uint64_t system_identifier;
 } CuvsPageBuildRequest;
 
-void cuvs_ipc_mark_pages_empty(const char *socket_path, uint32_t db_oid,
+int cuvs_ipc_mark_pages_empty(const char *socket_path, uint32_t db_oid,
     uint32_t index_oid, const char *index_dir, const CuvsPageBuildRequest *request);
 
 /* Both requests use the unchanged v6 envelope. This unit serves the base
@@ -233,6 +235,7 @@ typedef struct CuvsPageSearchRequest
 #define CUVS_STATUS_HNSW_UPPER_SKIPPED 16 /* EXPORT_HNSW_UPPER built no upper layers (the
                                            * graph degree is below 4, so M < 2); the backend
                                            * keeps its own level assignment */
+#define CUVS_STATUS_INVALID_PAGE_ROOT 17 /* page-format index_dir rejected */
 
 /* ----------------------------------------------------------------
  * Command frame (sent over UDS, fixed size)
@@ -1043,6 +1046,10 @@ int cuvs_ipc_drop(
     uint32_t    db_oid,
     uint32_t    index_oid
 );
+
+/* Committed page-format DROP with the index directory resolved by the daemon. */
+int cuvs_ipc_drop_pages(const char *socket_path, uint32_t db_oid, uint32_t index_oid,
+                        const char *index_dir);
 
 /* 3P: IVF-PQ build — heap-tier corpus (vecs+tids direct pointers). */
 int cuvs_ipc_build_ivfpq(

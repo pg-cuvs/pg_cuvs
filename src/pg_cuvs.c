@@ -521,11 +521,20 @@ static void cuvs_transient_bf_add_path(PlannerInfo *root, RelOptInfo *rel,
 static int  cuvs_metric_from_order_op(Oid opno);   /* defined below; used by both hooks */
 void cuvs_register_custom_scan(void);
 
+#ifdef CUVS_PAGE_FORMAT
+static const char *cuvs_resolve_index_dir_rel(Relation indexRel);
+#endif
+
 /* A pending DROP and the subtransaction that observed it (ADR-060). */
 typedef struct CuvsPendingDrop
 {
     Oid              oid;
     SubTransactionId subid;
+#ifdef CUVS_PAGE_FORMAT
+    bool             page_format;
+    /* Keep an overlong path overlong so the IPC layer can reject it. */
+    char             index_dir[CUVS_PAGE_INDEX_DIR_SIZE + 1];
+#endif
 } CuvsPendingDrop;
 
 static List *cuvs_pending_drops = NIL;   /* of CuvsPendingDrop*, in TopMemoryContext */
@@ -552,10 +561,32 @@ cuvs_object_access(ObjectAccessType access, Oid classId, Oid objectId,
                 OidIsValid(cf->relam) &&
                 (cf->relam == cagra_am || cf->relam == flat_am))
             {
-                MemoryContext old = MemoryContextSwitchTo(TopMemoryContext);
-                CuvsPendingDrop *pd = (CuvsPendingDrop *) palloc(sizeof(CuvsPendingDrop));
-                pd->oid   = objectId;
-                pd->subid = GetCurrentSubTransactionId();
+                CuvsPendingDrop pending = {
+                    .oid = objectId, .subid = GetCurrentSubTransactionId()
+                };
+                MemoryContext old;
+                CuvsPendingDrop *pd;
+
+#ifdef CUVS_PAGE_FORMAT
+                if (cf->relam == cagra_am)
+                {
+                    /* The deletion path already holds a lock on the index.
+                     * Read reloptions before the catalog entry is removed. */
+                    Relation index = try_index_open(objectId, NoLock);
+
+                    if (index != NULL)
+                    {
+                        pending.page_format = cuvs_cagra_has_pages(index);
+                        if (pending.page_format)
+                            strlcpy(pending.index_dir, cuvs_resolve_index_dir_rel(index),
+                                    sizeof(pending.index_dir));
+                        index_close(index, NoLock);
+                    }
+                }
+#endif
+                old = MemoryContextSwitchTo(TopMemoryContext);
+                pd = palloc(sizeof(*pd));
+                *pd = pending;
                 cuvs_pending_drops = lappend(cuvs_pending_drops, pd);
                 MemoryContextSwitchTo(old);
             }
@@ -576,8 +607,21 @@ cuvs_xact_callback(XactEvent event, void *arg)
         foreach(lc, cuvs_pending_drops)
         {
             CuvsPendingDrop *pd = (CuvsPendingDrop *) lfirst(lc);
-            int rc = cuvs_ipc_drop(cuvs_socket_path,
-                                   (uint32_t) MyDatabaseId, (uint32_t) pd->oid);
+            int rc;
+
+#ifdef CUVS_PAGE_FORMAT
+            if (pd->page_format)
+            {
+                rc = cuvs_ipc_drop_pages(cuvs_socket_path, MyDatabaseId, pd->oid, pd->index_dir);
+                if (rc != CUVS_STATUS_OK)
+                    ereport(WARNING,
+                            (errmsg("pg_cuvs: daemon page-format DROP-notify failed for index %u (status %d)",
+                                    pd->oid, rc),
+                             errhint("Check the daemon and the index directory; cached artifacts may remain.")));
+                continue;
+            }
+#endif
+            rc = cuvs_ipc_drop(cuvs_socket_path, MyDatabaseId, pd->oid);
             if (rc != CUVS_STATUS_OK)
                 ereport(WARNING,
                         (errmsg("pg_cuvs: daemon DROP-notify failed for index %u (status %d)",
@@ -3613,6 +3657,19 @@ cuvs_build_parallel(Relation heapRel, Relation indexRel, IndexInfo *indexInfo,
  * DUP-SIBLING(build-heap): cuvs_build_flat_from_heap is a duplicate (ADR-073).
  * Change both together; see the duplicate-pair inventory in ADR-073.
  * ---------------------------------------------------------------- */
+#ifdef CUVS_PAGE_FORMAT
+static void
+check_page_build_root(int status)
+{
+    if (status == CUVS_STATUS_INVALID_PAGE_ROOT)
+        ereport(ERROR,
+                (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+                 errmsg("invalid page-format CAGRA index_dir"),
+                 errhint("Use an existing directory owned by the daemon user, "
+                         "with a path shorter than %d bytes.", CUVS_PAGE_INDEX_DIR_SIZE)));
+}
+#endif
+
 static void
 cuvs_build_cagra_from_heap_impl(Relation heapRel, Relation indexRel, IndexInfo *indexInfo,
                            uint32_t build_index_oid, uint32_t shard_count,
@@ -3805,6 +3862,10 @@ cuvs_build_cagra_from_heap_impl(Relation heapRel, Relation indexRel, IndexInfo *
                 build_algo,
                 page_format ? &page_request : NULL, &graph_nonce);
 
+#ifdef CUVS_PAGE_FORMAT
+            if (page_format)
+                check_page_build_root(rc);
+#endif
             cuvs_report_build_notice(build_index_oid);
             if (rc != CUVS_STATUS_OK)
             {
@@ -3854,8 +3915,10 @@ cuvs_build_cagra_from_heap_impl(Relation heapRel, Relation indexRel, IndexInfo *
             if (bs.n_vecs < 2)
             {
                 page_request.build_xid = U64FromFullTransactionId(GetTopFullTransactionId());
-                cuvs_ipc_mark_pages_empty(cuvs_socket_path, MyDatabaseId, build_index_oid,
-                                          cuvs_resolve_index_dir_rel(indexRel), &page_request);
+                rc = cuvs_ipc_mark_pages_empty(cuvs_socket_path, MyDatabaseId, build_index_oid,
+                                               cuvs_resolve_index_dir_rel(indexRel), &page_request);
+                /* An unreachable or older daemon can still serve heap-only pages. */
+                check_page_build_root(rc);
             }
             cuvs_cagra_init_pages(indexRel, MAIN_FORKNUM, page_request.index_nonce,
                                   graph_nonce, bs.dim > 0 ? bs.dim : Max(typmod, 0),
