@@ -196,6 +196,17 @@ GPU time and the number of visible rows found are separate.
 `EXPLAIN (ANALYZE)` reports candidate counts,
 additional requests, scored rows and the reason the node stopped.
 
+**Known limitations.** Replacing the configured index directory after the
+final BUILD identity check, while auxiliary sidecars are being published, can
+leave the new files in the previous directory. A subsequent reload from the
+configured path can find missing or older artifacts.
+
+In the [#284 A100 trial](https://github.com/pg-cuvs/pg_cuvs/pull/284), the
+additional search raised median total execution time from 0.575 ms with the
+option off to 5.572 ms with it on. This was a single PostgreSQL 16.16 fixture on
+an A100 80GB with 10,000 seed rows, 768 dimensions, 100 deletions, one additional
+insert and `LIMIT 100`, using 24 `EXPLAIN (ANALYZE)` samples per mode.
+
 Unlocked CAGRA builds reserve estimated RMM quota separately from logical index
 residency under the registry mutex. Admission subtracts all in-flight reservations
 from pool headroom and releases them on build success or failure. Since allocator
