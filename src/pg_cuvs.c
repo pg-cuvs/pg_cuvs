@@ -4405,8 +4405,7 @@ typedef struct CuvsScanState {
     CuvsHnswExact *page_exact;
     CuvsCagraMeta *page_meta;
     CuvsResult *page_results;
-    CuvsPageOverlayResult *page_overlay_results;
-    uint64 page_tail;
+    bool page_heap_tids;
     BlockNumber page_blocks;
     int page_returned;
 #endif
@@ -4994,11 +4993,7 @@ cuvs_rescan(IndexScanDesc scan, ScanKey keys, int nkeys,
     ss->page_exact = NULL;
     if (ss->page_meta) { pfree(ss->page_meta); ss->page_meta = NULL; }
     if (ss->page_results) { pfree(ss->page_results); ss->page_results = NULL; }
-    if (ss->page_overlay_results)
-    {
-        pfree(ss->page_overlay_results);
-        ss->page_overlay_results = NULL;
-    }
+    ss->page_heap_tids = false;
     ss->page_returned = 0;
 #endif
     ss->searched  = false;
@@ -5204,6 +5199,74 @@ page_search_filtered(Oid oid, Relation heap, Snapshot snapshot, const float *que
     return ok;
 }
 
+/* Resolve the merged shortlist under the scan snapshot before emitting a row.
+ * The daemon has no visibility information for base graph slots. If invisible
+ * candidates leave too few answers, the executor must start over on the heap. */
+static bool
+page_resolve_overlay(IndexScanDesc scan, CuvsScanState *ss, const CuvsCagraMeta *meta,
+                     const CuvsPageSearchRequest *request,
+                     const CuvsPageOverlayResult *results, int count)
+{
+    Relation heap = scan->heapRelation;
+    IndexFetchTableData *fetch = table_index_fetch_begin(heap);
+    TupleTableSlot *tuple = table_slot_create(heap, NULL);
+    bool valid = true, discarded = false;
+
+    ss->n_results = 0;
+    for (int i = 0; i < count && ss->n_results < cuvs_k; ++i)
+    {
+        const CuvsPageOverlayResult *candidate = &results[i];
+        ItemPointerData root, visible;
+        CuvsCagraSlotResult state;
+        bool again = false, dead = false;
+
+        CHECK_FOR_INTERRUPTS();
+        if (candidate->slot < meta->n_slots)
+            state = cuvs_cagra_slot_tid(scan->indexRelation, meta, ss->page_blocks,
+                                        candidate->slot, &root);
+        else
+        {
+            uint64 pending = candidate->slot - meta->n_slots;
+
+            if (pending >= request->tail - request->folded)
+            {
+                ++cuvs_page_bad_slots;
+                valid = false;
+                break;
+            }
+            state = cuvs_cagra_pending_tid(scan->indexRelation, meta, ss->page_blocks,
+                                           candidate->block, request->folded + pending, &root);
+        }
+        if (state == CUVS_CAGRA_SLOT_BAD)
+        {
+            valid = false;
+            break;
+        }
+        if (state == CUVS_CAGRA_SLOT_DEAD)
+        {
+            discarded = true;
+            continue;
+        }
+        /* Heap fetch may replace the root with a visible HOT child. The
+         * PostgreSQL index scan must still give its caller the root TID. */
+        visible = root;
+        table_index_fetch_reset(fetch);
+        if (!table_index_fetch_tuple(fetch, &visible, scan->xs_snapshot, tuple, &again, &dead))
+        {
+            discarded = true;
+            continue;
+        }
+        ss->page_results[ss->n_results++] = (CuvsResult) {
+            .tid = cuvs_tid_encode(ItemPointerGetBlockNumber(&root),
+                                   ItemPointerGetOffsetNumber(&root)),
+            .distance = candidate->distance,
+        };
+    }
+    table_index_fetch_end(fetch);
+    ExecDropSingleTupleTableSlot(tuple);
+    return valid && (!discarded || ss->n_results == cuvs_k);
+}
+
 static bool
 page_start_search(IndexScanDesc scan, CuvsScanState *ss)
 {
@@ -5238,25 +5301,35 @@ page_start_search(IndexScanDesc scan, CuvsScanState *ss)
                                           .from = request.folded};
         CuvsPageSupplement supplement = {0};
         CuvsPageProgress progress;
+        CuvsPageOverlayResult *results;
+        int count;
 
         if (!cuvs_cagra_local_supplement(index, scan->heapRelation, scan->xs_snapshot,
                                          &meta, ss->page_blocks, overlay.from, request.tail,
                                          &supplement))
             return false;
-        ss->page_overlay_results = palloc(k * sizeof(*ss->page_overlay_results));
+        results = palloc(k * sizeof(*results));
         rc = cuvs_ipc_search_page_overlay(cuvs_socket_path, MyDatabaseId, RelationGetRelid(index),
                                           &overlay, query->x, 1, query->dim, k, meta.metric,
                                           cuvs_itopk_size, cuvs_search_width, cuvs_cpu_hnsw_fallback,
                                           cuvs_search_mode, cuvs_bf_precision, &supplement,
-                                          ss->page_overlay_results, &ss->n_results, &latency, &progress);
+                                          results, &count, &latency, &progress);
         cuvs_cagra_free_supplement(&supplement);
-        if (rc != CUVS_STATUS_OK)
+        if (rc == CUVS_STATUS_OK)
         {
-            pfree(ss->page_overlay_results);
-            ss->page_overlay_results = NULL;
-            if (rc == CUVS_STATUS_PAGE_OVERLAY_HOST_FULL)
-                cuvs_fb_record(RelationGetRelid(index), CUVS_FB_PAGE_HOST_BUDGET);
+            ss->page_results = palloc(k * sizeof(*ss->page_results));
+            if (page_resolve_overlay(scan, ss, &meta, &request, results, count))
+                ss->page_heap_tids = true;
+            else
+            {
+                pfree(ss->page_results);
+                ss->page_results = NULL;
+                rc = CUVS_STATUS_NOT_FOUND;
+            }
         }
+        else if (rc == CUVS_STATUS_PAGE_OVERLAY_HOST_FULL)
+            cuvs_fb_record(RelationGetRelid(index), CUVS_FB_PAGE_HOST_BUDGET);
+        pfree(results);
     }
     if (rc == CUVS_STATUS_CANCELED)
         CHECK_FOR_INTERRUPTS();
@@ -5265,7 +5338,6 @@ page_start_search(IndexScanDesc scan, CuvsScanState *ss)
 
     ss->page_meta = palloc(sizeof(*ss->page_meta));
     *ss->page_meta = meta;
-    ss->page_tail = request.tail;
     cuvs_last_latency_us = latency;
     cuvs_last_n_results = ss->n_results;
     cuvs_last_k_requested = k;
@@ -5303,44 +5375,28 @@ page_gettuple(IndexScanDesc scan, CuvsScanState *ss)
     {
         while (ss->cur < ss->n_results && ss->page_returned < cuvs_k)
         {
-            CuvsCagraSlotResult state;
-            uint64 slot;
-            double distance;
-            bool out_of_range;
-            int result = ss->cur++;
+            CuvsResult *candidate = &ss->page_results[ss->cur++];
+            CuvsCagraSlotResult state = CUVS_CAGRA_SLOT_LIVE;
+            double distance = candidate->distance;
 
-            if (ss->page_overlay_results)
+            if (ss->page_heap_tids)
             {
-                slot = ss->page_overlay_results[result].slot;
-                distance = ss->page_overlay_results[result].distance;
+                uint32 block;
+                uint16 offset;
+
+                cuvs_tid_decode(candidate->tid, &block, &offset);
+                ItemPointerSet(&scan->xs_heaptid, block, offset);
             }
             else
-            {
-                slot = ss->page_results[result].tid;
-                distance = ss->page_results[result].distance;
-            }
-            if (slot < ss->page_meta->n_slots)
-            {
-                out_of_range = false;
                 state = cuvs_cagra_slot_tid(scan->indexRelation, ss->page_meta, ss->page_blocks,
-                                            slot, &scan->xs_heaptid);
-            }
-            else
-            {
-                uint64 pending = slot - ss->page_meta->n_slots;
-
-                out_of_range = !ss->page_overlay_results ||
-                    pending >= ss->page_tail - ss->page_meta->folded;
-                state = out_of_range ? CUVS_CAGRA_SLOT_BAD :
-                    cuvs_cagra_pending_tid(scan->indexRelation, ss->page_meta, ss->page_blocks,
-                        ss->page_overlay_results[result].block, pending + ss->page_meta->folded,
-                        &scan->xs_heaptid);
-            }
+                                            candidate->tid, &scan->xs_heaptid);
 
             if (state == CUVS_CAGRA_SLOT_DEAD)
                 continue;
             if (state == CUVS_CAGRA_SLOT_BAD)
             {
+                bool out_of_range = candidate->tid >= ss->page_meta->n_slots;
+
                 if (out_of_range)
                     ++cuvs_page_bad_slots;
                 if (ss->page_returned != 0)
@@ -5911,7 +5967,6 @@ cuvs_endscan(IndexScanDesc scan)
     cuvs_hnsw_exact_end(ss->page_exact);
     if (ss->page_meta) pfree(ss->page_meta);
     if (ss->page_results) pfree(ss->page_results);
-    if (ss->page_overlay_results) pfree(ss->page_overlay_results);
 #endif
     if (ss->tids)      pfree(ss->tids);
     if (ss->distances) pfree(ss->distances);

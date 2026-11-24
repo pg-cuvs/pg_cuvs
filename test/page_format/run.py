@@ -850,6 +850,7 @@ def run(work, logs):
                 cluster.file(case, case)
                 print(f"{case}: PASS", flush=True)
             check_slots(cluster, source_on)
+            cluster.file("postgres", "pending_overlay_scan")
             cluster.file("beta1a", "beta1a_rollback")
             check_index_directory_aliases(cluster)
             custom, keys = check_custom_index_directory(cluster)
