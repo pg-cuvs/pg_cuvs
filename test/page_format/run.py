@@ -689,6 +689,9 @@ def check_fold_extent_reuse(cluster, db):
     next_page = fold_raw_page(cluster, db, second_extent + 1, "fold_extent_idx")
     if extent_count != 2 or struct.unpack_from("=Q", next_page, 8184)[0] != 88205:
         raise RuntimeError("the second fold did not use the next page of the existing extent")
+    last_page = fold_raw_page(cluster, db, second_extent + 63, "fold_extent_idx")
+    if struct.unpack_from("=II", last_page) == (0, 0):
+        raise RuntimeError("WAL did not reserve the full extent on a fresh standby")
     cluster.sql(db, "fold-extent-vacuum", "-c", "VACUUM (INDEX_CLEANUP ON, TRUNCATE OFF) fold_extent;")
     print("Fold extent rollover and reuse: PASS", flush=True)
 
