@@ -112,6 +112,15 @@ def copy_tree(dst):
     shutil.copy2(os.path.join(ROOT, installer), os.path.join(dst, installer))
 
 
+def result_status(run):
+    output = (run.stdout + run.stderr).strip()
+    if run.returncode == 0:
+        return "PASS", output
+    if run.returncode == 1 and any(line.startswith("FAIL") for line in output.splitlines()):
+        return "RED", output
+    return "RUN-FAIL", output or f"exit {run.returncode}"
+
+
 def run_unit(tree):
     exe = os.path.join(tree, "t")
     b = subprocess.run([CC, "-std=gnu11", "-Wall", "-Wextra", "-I", os.path.join(tree, "src"),
@@ -119,15 +128,15 @@ def run_unit(tree):
                         os.path.join(tree, "src/cuvs_status_text.c")],
                        capture_output=True, text=True)
     if b.returncode != 0:
-        return False, "build failed: " + b.stderr.strip().splitlines()[-1]
+        return "BUILD-FAIL", b.stderr.strip() or f"exit {b.returncode}"
     r = subprocess.run([exe], capture_output=True, text=True)
-    return r.returncode == 0, r.stdout.strip()
+    return result_status(r)
 
 
 def run_scan(tree):
     r = subprocess.run([sys.executable, os.path.join(tree, "test/unit/check_i3b_sql_perms.py"), tree],
                        capture_output=True, text=True)
-    return r.returncode == 0, r.stdout.strip()
+    return result_status(r)
 
 
 CHECKS = {"unit": run_unit, "scan": run_scan}
@@ -146,9 +155,11 @@ def main():
         base = os.path.join(tmp, "base")
         copy_tree(base)
         for name, fn in CHECKS.items():
-            ok, out = fn(base)
-            print(f"GREEN {name}: {'PASS' if ok else 'FAIL'} | {out.splitlines()[-1]}")
-            bad += not ok
+            status, out = fn(base)
+            print(f"BASE {name}: {status} | {first_fail(out)}")
+            bad += status != "PASS"
+        if bad:
+            return 1
         for mid, check, rel, old, new in MUTATIONS:
             tree = os.path.join(tmp, "m")
             shutil.rmtree(tree, ignore_errors=True)
@@ -162,9 +173,9 @@ def main():
                 continue
             with open(path, "w") as f:
                 f.write(src.replace(old, new))
-            ok, out = CHECKS[check](tree)
-            print(f"{'SURVIVED' if ok else 'RED'} {mid} [{check}] | {first_fail(out)}")
-            bad += ok
+            status, out = CHECKS[check](tree)
+            print(f"{'SURVIVED' if status == 'PASS' else status} {mid} [{check}] | {first_fail(out)}")
+            bad += status != "RED"
     print(f"mutate_status_text: {len(MUTATIONS)} mutations, {bad} problem(s)")
     return 1 if bad else 0
 

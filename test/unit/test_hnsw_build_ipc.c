@@ -201,7 +201,17 @@ int main(void) {
         int rc = cuvs_ipc_build_hnsw_file(path, fd, 100, 128, CUVS_METRIC_L2,
             64, 128, 0, 1ULL << 30, requested_algo(), 64, &policy, &budget, &ace, &nn, &result, err, sizeof(err));
         if (fixture_case == 1) { assert(rc == CUVS_STATUS_CANCELED && result == -1); }
-        else if (fixture_case == 2 || fixture_case == 4 || (fixture_case >= 7 && fixture_case <= 10) || (fixture_case >= 15 && fixture_case <= 24 && fixture_case != 19) || fixture_case == 31) { assert(rc == CUVS_STATUS_ERROR && result == -1); if (fixture_case == 24) assert(strstr(err, "co-deploy")); }
+        else if (fixture_case == 2 || fixture_case == 4 || (fixture_case >= 7 && fixture_case <= 10) || (fixture_case >= 15 && fixture_case <= 24 && fixture_case != 19) || fixture_case == 31) {
+            if (rc == CUVS_STATUS_OK && result >= 0) {
+                close(result);
+                if (waitpid(child, &child_status, 0) != child)
+                    return 2;
+                fprintf(stderr, "\nFAIL IPC fixture %d accepted an invalid reply\n", fixture_case);
+                return 1;
+            }
+            assert(rc == CUVS_STATUS_ERROR && result == -1);
+            if (fixture_case == 24) assert(strstr(err, "co-deploy"));
+        }
         else if (fixture_case == 3 || fixture_case == 11 || fixture_case == 12) {
             int expected_status = fixture_case == 11 ? CUVS_STATUS_PROTO_MISMATCH : fixture_case == 12 ? CUVS_STATUS_HNSW_RESIDENT_BUDGET_EXCEEDED : CUVS_STATUS_BUILD_FAILED;
             assert(rc == expected_status && result == -1);

@@ -49,7 +49,7 @@ HEADER_MUTANTS = {
     "fp32_flag_any_route": ("cuvs_hnsw_policy.h",
         "        && (!(p->route_flags & CUVS_HNSW_ROUTE_FLAG_IVFPQ_FP32)\n            || p->route == CUVS_HNSW_ROUTE_IVF_PQ)\n", ""),
     "new_flags_unknown": ("cuvs_hnsw_policy.h",
-        "#define CUVS_HNSW_ROUTE_FLAGS_KNOWN 0x3fu", "#define CUVS_HNSW_ROUTE_FLAGS_KNOWN 0xfu"),
+        "#define CUVS_HNSW_ROUTE_FLAGS_KNOWN 0x7fu", "#define CUVS_HNSW_ROUTE_FLAGS_KNOWN 0xfu"),
     # NOTICE
     "fallback_notice_dropped": ("cuvs_route_preflight.h",
         "        return CUVS_HNSW_NOTICE_GRAPH_FALLBACK;\n", "        return 0;\n"),
@@ -66,7 +66,7 @@ WIRING = {
     "compact_retry_telemetry": (SERVER, r'cuvs_cagra_compact\([\s\S]{0,150}&ivfpq_retry\);'),
     "norm_uses_rmm_policy": (WRAPPER, r"return thrust::transform_reduce\(raft::resource::get_thrust_policy\(res\),"),
     "norm_policy_header": (WRAPPER, r"#include <raft/core/resource/thrust_policy.hpp>"),
-    "precision_resident_only": (WRAPPER, r"if \(!tiny && !disk\)\s*\{\s*const double max_sq = cuvs_hnsw_max_sq_norm\("
+    "precision_resident_only": (WRAPPER, r"if \(!tiny && !disk && prepared\.route\.route == CUVS_HNSW_ROUTE_IVF_PQ\)\s*\{\s*const double max_sq = cuvs_hnsw_max_sq_norm\("
                                          r"static_cast<const float \*>\(files\.mapping\),\s*params->n_vecs, params->dim\);"),
     "precision_three_dtypes": (WRAPPER, r"if \(fp32\)\s*\{\s*auto &sp = prepared\.pq_params->search_params;\s*"
                                         r"sp\.lut_dtype = CUDA_R_32F;\s*sp\.internal_distance_dtype = CUDA_R_32F;\s*"
@@ -116,7 +116,7 @@ WIRING_MUTANTS = {
                                          "thrust::transform_reduce(thrust::cuda::par.on(res.get_stream()),"),
     "norm_policy_header_removed": (WRAPPER, "#include <raft/core/resource/thrust_policy.hpp>\n", ""),
     "coarse_dtype_kept_fp16": (WRAPPER, "                sp.coarse_search_dtype = CUDA_R_32F;\n", ""),
-    "precision_on_ace_route": (WRAPPER, "        if (!tiny && !disk)\n        {\n            const double max_sq",
+    "precision_on_ace_route": (WRAPPER, "        if (!tiny && !disk && prepared.route.route == CUVS_HNSW_ROUTE_IVF_PQ)\n        {\n            const double max_sq",
                                "        if (!tiny)\n        {\n            const double max_sq"),
     "fallback_not_caught": (WRAPPER, "            if (!cuvs_hnsw_graph_failure_to_ace(params->build_algo, prepared.route.route,",
                             "            if (true || !cuvs_hnsw_graph_failure_to_ace(params->build_algo, prepared.route.route,"),

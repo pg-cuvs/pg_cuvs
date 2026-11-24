@@ -546,6 +546,12 @@ int cuvs_hnsw_search(CuvsHnswIndex hidx, const float *query, int dim, int k,
   if (!ix) return 1;
   if (dim != ix->dim) return 2;
   shim_topk(ix, query, dim, k, NULL, 0, out);
+  /* cuVS HNSW exposes hnswlib InnerProductSpace distance: 1 - dot.
+   * Keep the raw-dot contract of the CAGRA/BF shim entry points. */
+  if (ix->metric == CUVS_METRIC_IP)
+      for (int i = 0; i < k; ++i)
+          if (out[i].item_id != CUVS_PAD_ITEM_ID)
+              out[i].distance = 1.0f - out[i].distance;
   return 0; }
 
 void cuvs_hnsw_free(CuvsHnswIndex hidx) { shim_free((ShimIndex *)hidx); }

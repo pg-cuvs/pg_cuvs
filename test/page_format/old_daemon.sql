@@ -13,8 +13,30 @@ BEGIN
         RAISE EXCEPTION 'an older daemon accepted the new BUILD message';
     EXCEPTION WHEN object_not_in_prerequisite_state THEN
         GET STACKED DIAGNOSTICS hint = PG_EXCEPTION_HINT;
-        IF hint NOT LIKE '%supports the page format%' THEN
+        IF hint IS NULL OR hint NOT LIKE '%supports the page format%' THEN
             RAISE EXCEPTION 'wrong upgrade hint: %',hint;
         END IF;
     END;
+END $$;
+
+-- A daemon without the advisory empty-build opcode must still allow PostgreSQL
+-- to initialize a 0- or 1-row page index.
+TRUNCATE page_current;
+CREATE INDEX page_current_idx ON page_current USING cagra(v vector_l2_ops);
+CREATE TABLE page_one_old_daemon AS SELECT 1 AS id, '[1,0,0]'::vector(3) AS v;
+CREATE INDEX page_one_old_daemon_idx ON page_one_old_daemon USING cagra(v vector_l2_ops);
+DO $$
+BEGIN
+    IF pg_relation_size('page_current_idx') = 0 OR pg_relation_size('page_one_old_daemon_idx') = 0 THEN
+        RAISE EXCEPTION 'an older daemon blocked an empty or single-row page build';
+    END IF;
+END $$;
+
+-- The old daemon cannot handle the targeted notification; catalog DROP commits.
+DROP INDEX page_one_old_daemon_idx;
+DO $$
+BEGIN
+    IF to_regclass('page_one_old_daemon_idx') IS NOT NULL THEN
+        RAISE EXCEPTION 'an older daemon blocked page-format DROP';
+    END IF;
 END $$;

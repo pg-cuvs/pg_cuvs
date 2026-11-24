@@ -81,7 +81,7 @@ ISOLATION_GPU  = pg_cuvs_hnsw_cic_writes
 # C source files + the CUDA-compiled wrapper (built below by nvcc).
 # PGXS only knows how to build .c → .o; the .cu → .o rule is custom,
 # but the resulting object MUST be listed in OBJS to be linked into the .so.
-OBJS           = src/pg_cuvs.o src/cuvs_ipc.o src/cuvs_util.o $(WRAPPER_OBJ) src/hnsw_export.o src/cuvs_hnsw_scan.o src/cuvs_hnsw_rls.o src/cuvs_hnsw_exact.o src/cuvs_build_corpus.o src/pg_cuvs_compaction.o src/cuvs_status_text.o src/cuvs_peak_meter.o src/cuvs_cagra_pages.o
+OBJS           = src/pg_cuvs.o src/cuvs_ipc.o src/cuvs_util.o $(WRAPPER_OBJ) src/hnsw_export.o src/cuvs_hnsw_scan.o src/cuvs_hnsw_rls.o src/cuvs_hnsw_exact.o src/cuvs_build_corpus.o src/pg_cuvs_compaction.o src/cuvs_status_text.o src/cuvs_peak_meter.o src/cuvs_cagra_pages.o src/cuvs_cagra_pending_search.o
 
 # nvcc settings (Phase 1: brute-force only; CAGRA added later)
 NVCC          ?= nvcc
@@ -223,11 +223,12 @@ SERVER_ALL_OBJS = src/pg_cuvs_server.o src/cuvs_objstore_server.o \
                   src/cuvs_build_corpus_server.o \
                   src/pg_cuvs_server_test.o src/cuvs_objstore_server_test.o \
                   src/cuvs_ipc_server_test.o src/cuvs_util_server_test.o \
-                  src/cuvs_build_corpus_server_test.o
+                  src/cuvs_build_corpus_server_test.o \
+                  src/cuvs_page_overlay_server.o src/cuvs_page_overlay_server_test.o
 $(SERVER_ALL_OBJS): $(wildcard src/*.h)
 
 # server .c → .o (not via PGXS — separate rule with no PG headers)
-src/pg_cuvs_server.o: src/pg_cuvs_server.c src/cuvs_ipc.h src/cuvs_util.h src/cuvs_wrapper.h src/cuvs_objstore.h src/cuvs_build_corpus.h src/cuvs_bf_verdict.h
+src/pg_cuvs_server.o: src/pg_cuvs_server.c src/cuvs_ipc.h src/cuvs_page_overlay.h src/cuvs_util.h src/cuvs_wrapper.h src/cuvs_objstore.h src/cuvs_build_corpus.h src/cuvs_bf_verdict.h
 	$(CC) $(SERVER_CFLAGS) -c $< -o $@
 
 # cuvs_objstore.o for server (GCS client — not linked into the PG extension .so)
@@ -266,7 +267,10 @@ src/cuvs_hnsw_upper_server.o: src/cuvs_hnsw_upper.c src/cuvs_hnsw_upper.h
 src/cuvs_wrapper_shim_cpu.o: src/cuvs_wrapper_shim_cpu.c src/cuvs_wrapper.h src/cuvs_ipc.h
 	$(CC) -O2 -g -fPIC -I./src -std=gnu11 -c $< -o $@
 
-$(SERVER_BIN): src/pg_cuvs_server.o src/cuvs_ipc_server.o src/cuvs_util_server.o src/cuvs_objstore_server.o src/cuvs_build_corpus_server.o src/cuvs_cache_policy_server.o src/cuvs_peak_meter_server.o src/cuvs_hnsw_upper_server.o $(WRAPPER_OBJ)
+src/cuvs_page_overlay_server.o: src/cuvs_page_overlay.c src/cuvs_page_overlay.h src/cuvs_ipc.h
+	$(CC) $(SERVER_CFLAGS) -c $< -o $@
+
+$(SERVER_BIN): src/pg_cuvs_server.o src/cuvs_ipc_server.o src/cuvs_util_server.o src/cuvs_objstore_server.o src/cuvs_build_corpus_server.o src/cuvs_cache_policy_server.o src/cuvs_peak_meter_server.o src/cuvs_hnsw_upper_server.o src/cuvs_page_overlay_server.o $(WRAPPER_OBJ)
 	$(CXX) -o $@ $^ $(SERVER_LDFLAGS)
 
 server: $(SERVER_BIN)
@@ -284,7 +288,7 @@ install-server: server
 SERVER_TEST_BIN     = pg_cuvs_server_test
 SERVER_TEST_CFLAGS  = $(SERVER_CFLAGS) -DCUVS_TEST_HOOKS
 
-src/pg_cuvs_server_test.o: src/pg_cuvs_server.c src/cuvs_ipc.h src/cuvs_util.h src/cuvs_wrapper.h src/cuvs_objstore.h src/cuvs_bf_verdict.h
+src/pg_cuvs_server_test.o: src/pg_cuvs_server.c src/cuvs_ipc.h src/cuvs_page_overlay.h src/cuvs_util.h src/cuvs_wrapper.h src/cuvs_objstore.h src/cuvs_bf_verdict.h
 	$(CC) $(SERVER_TEST_CFLAGS) -c $< -o $@
 
 src/cuvs_ipc_server_test.o: src/cuvs_ipc.c src/cuvs_ipc.h src/cuvs_build_corpus.h
@@ -308,7 +312,10 @@ src/cuvs_peak_meter_server_test.o: src/cuvs_peak_meter.c src/cuvs_peak_meter.h
 src/cuvs_hnsw_upper_server_test.o: src/cuvs_hnsw_upper.c src/cuvs_hnsw_upper.h
 	$(CC) $(SERVER_TEST_CFLAGS) -c $< -o $@
 
-$(SERVER_TEST_BIN): src/pg_cuvs_server_test.o src/cuvs_ipc_server_test.o src/cuvs_util_server_test.o src/cuvs_objstore_server_test.o src/cuvs_build_corpus_server_test.o src/cuvs_cache_policy_server_test.o src/cuvs_peak_meter_server_test.o src/cuvs_hnsw_upper_server_test.o $(WRAPPER_OBJ)
+src/cuvs_page_overlay_server_test.o: src/cuvs_page_overlay.c src/cuvs_page_overlay.h src/cuvs_ipc.h
+	$(CC) $(SERVER_TEST_CFLAGS) -c $< -o $@
+
+$(SERVER_TEST_BIN): src/pg_cuvs_server_test.o src/cuvs_ipc_server_test.o src/cuvs_util_server_test.o src/cuvs_objstore_server_test.o src/cuvs_build_corpus_server_test.o src/cuvs_cache_policy_server_test.o src/cuvs_peak_meter_server_test.o src/cuvs_hnsw_upper_server_test.o src/cuvs_page_overlay_server_test.o $(WRAPPER_OBJ)
 	$(CXX) -o $@ $^ $(SERVER_LDFLAGS)
 
 server-test: $(SERVER_TEST_BIN)
@@ -667,6 +674,12 @@ test-i3b-source: test/unit/check_i3b_server_source.py src/pg_cuvs_server.c test/
 
 .PHONY: test-i3b-source
 
+test-unit: test-page-overlay
+.PHONY: test-page-overlay
+test-page-overlay:
+	ulimit -c 0; CC="$(CC)" python3 -I -B test/unit/test_page_overlay_mutations.py
+
+
 # CK-34: the peak meter under 8 concurrent threads, reset, and off.
 test-peak-meter: test/unit/test_peak_meter.c src/cuvs_peak_meter.c src/cuvs_peak_meter.h
 	$(CC) -std=gnu11 -O2 -Wall -Wextra -Werror -I src -o $@ test/unit/test_peak_meter.c \
@@ -787,14 +800,17 @@ HNSW_CONVERTER_UNIT_LINK = -Wl,--gc-sections \
                           -L$(shell $(PG_CONFIG) --pkglibdir) -lpgcommon -lpgport -lm
 endif
 HNSW_UNIT_CPPFLAGS ?=
-test-hnsw-converter: test/unit/test_hnsw_converter.c src/hnsw_export.c \
-                     src/hnsw_export.h src/cuvs_util.c $(wildcard src/*.h)
+.PHONY: test-hnsw-converter-build
+test-hnsw-converter: test-hnsw-converter-build
+	./$@
+
+test-hnsw-converter-build: test/unit/test_hnsw_converter.c src/hnsw_export.c \
+                           src/hnsw_export.h src/cuvs_util.c $(wildcard src/*.h)
 	$(CC) -std=gnu11 -O0 -Wall -Wextra -Wno-unused-parameter \
 		-ffunction-sections -fdata-sections -I src \
 		-I$(shell $(PG_CONFIG) --includedir) -I$(shell $(PG_CONFIG) --includedir-server) \
-		$(HNSW_UNIT_CPPFLAGS) -o $@ test/unit/test_hnsw_converter.c src/cuvs_util.c \
+		$(HNSW_UNIT_CPPFLAGS) -o test-hnsw-converter test/unit/test_hnsw_converter.c src/cuvs_util.c \
 		$(HNSW_CONVERTER_UNIT_LINK) $(TEST_RT_LIB)
-	./$@
 
 EXTRA_CLEAN += test-hnsw-build test-hnsw-build-ipc test-hnsw-owner-lease test-hnsw-ace-quality test-hnsw-converter test-hnsw-admission test-hnsw-explicit-route test-hnsw-policy \
                test-admission-contract test-admission-contract-cxx test-admission-contract-util.o \
@@ -1244,7 +1260,7 @@ test-lw-daemon:
 	$(CC) -std=gnu11 -O1 -DPGCUVS_CPU_SHIM -ffunction-sections -fdata-sections -I src \
 		test/unit/test_lw_daemon.c src/cuvs_ipc.c src/cuvs_util.c \
 		src/cuvs_objstore.c src/cuvs_build_corpus.c src/cuvs_wrapper_shim_cpu.c \
-		src/cuvs_cache_policy.c src/cuvs_peak_meter.c \
+		src/cuvs_cache_policy.c src/cuvs_peak_meter.c src/cuvs_page_overlay.c src/cuvs_hnsw_upper.c \
 		-Wl,--gc-sections -lm -lpthread -lrt -lcurl -lssl -lcrypto -o test-lw-daemon
 	./test-lw-daemon
 
@@ -1268,7 +1284,7 @@ test-physical-build-guard:
 	$(CC) -std=gnu11 -O1 -DPGCUVS_CPU_SHIM -ffunction-sections -fdata-sections -I src \
 		test/unit/test_physical_build_guard.c src/cuvs_ipc.c src/cuvs_util.c \
 		src/cuvs_objstore.c src/cuvs_build_corpus.c src/cuvs_wrapper_shim_cpu.c \
-		src/cuvs_cache_policy.c src/cuvs_peak_meter.c \
+		src/cuvs_cache_policy.c src/cuvs_peak_meter.c src/cuvs_page_overlay.c \
 		-Wl,--gc-sections -lm -lpthread -lrt -lcurl -lssl -lcrypto -o $@
 	./$@
 
@@ -1282,7 +1298,7 @@ test-i3e-observation:
 	$(CC) -std=gnu11 -O1 -DPGCUVS_CPU_SHIM -ffunction-sections -fdata-sections -I src \
 		test/unit/test_i3e_observation.c src/cuvs_ipc.c src/cuvs_util.c src/cuvs_status_text.c \
 		src/cuvs_objstore.c src/cuvs_build_corpus.c src/cuvs_wrapper_shim_cpu.c \
-		src/cuvs_cache_policy.c src/cuvs_peak_meter.c \
+		src/cuvs_cache_policy.c src/cuvs_peak_meter.c src/cuvs_page_overlay.c \
 		-Wl,--gc-sections -lm -lpthread -lrt -lcurl -lssl -lcrypto -o test-i3e-observation
 	./test-i3e-observation
 
@@ -1299,7 +1315,7 @@ EXTRA_CLEAN += test-lw-startup test-lw-startup-server
 .PHONY: test-lw-startup
 LW_SHIM_DAEMON_SRCS = src/pg_cuvs_server.c src/cuvs_ipc.c src/cuvs_util.c src/cuvs_objstore.c \
                       src/cuvs_build_corpus.c src/cuvs_wrapper_shim_cpu.c \
-                      src/cuvs_cache_policy.c src/cuvs_peak_meter.c
+                      src/cuvs_cache_policy.c src/cuvs_peak_meter.c src/cuvs_page_overlay.c src/cuvs_hnsw_upper.c
 test-lw-startup:
 	$(CC) -std=gnu11 -O1 -DPGCUVS_CPU_SHIM -D_POSIX_C_SOURCE=200809L -I src $(LW_SHIM_DAEMON_SRCS) \
 		-lm -lpthread -lrt -lcurl -lssl -lcrypto -o test-lw-startup-server
@@ -1314,7 +1330,7 @@ test-rmm-pending:
 	$(CC) -std=gnu11 -O1 -DPGCUVS_CPU_SHIM -ffunction-sections -fdata-sections -I src \
 		test/unit/test_rmm_pending.c src/cuvs_ipc.c src/cuvs_util.c \
 		src/cuvs_objstore.c src/cuvs_build_corpus.c src/cuvs_wrapper_shim_cpu.c \
-		src/cuvs_cache_policy.c src/cuvs_peak_meter.c \
+		src/cuvs_cache_policy.c src/cuvs_peak_meter.c src/cuvs_page_overlay.c \
 		-Wl,--gc-sections -lm -lpthread -lrt -lcurl -lssl -lcrypto -o test-rmm-pending
 	./test-rmm-pending
 
@@ -1327,7 +1343,7 @@ test-ar8-daemon:
 	$(CC) -std=gnu11 -O1 -DPGCUVS_CPU_SHIM -ffunction-sections -fdata-sections -I src \
 		test/unit/test_ar8_daemon.c src/cuvs_ipc.c src/cuvs_util.c \
 		src/cuvs_objstore.c src/cuvs_build_corpus.c src/cuvs_wrapper_shim_cpu.c \
-		src/cuvs_cache_policy.c src/cuvs_peak_meter.c \
+		src/cuvs_cache_policy.c src/cuvs_peak_meter.c src/cuvs_page_overlay.c src/cuvs_hnsw_upper.c \
 		-Wl,--gc-sections -lm -lpthread -lrt -lcurl -lssl -lcrypto -o test-ar8-daemon
 	./test-ar8-daemon
 
@@ -1340,7 +1356,7 @@ test-hnsw-route-daemon:
 	$(CC) -std=gnu11 -O1 -DPGCUVS_CPU_SHIM -ffunction-sections -fdata-sections -I src \
 		test/unit/test_hnsw_route_daemon.c src/cuvs_ipc.c src/cuvs_util.c \
 		src/cuvs_objstore.c src/cuvs_build_corpus.c src/cuvs_wrapper_shim_cpu.c \
-		src/cuvs_cache_policy.c src/cuvs_peak_meter.c \
+		src/cuvs_cache_policy.c src/cuvs_peak_meter.c src/cuvs_page_overlay.c \
 		-Wl,--gc-sections -lm -lpthread -lrt -lcurl -lssl -lcrypto -o test-hnsw-route-daemon
 	./test-hnsw-route-daemon
 

@@ -66,6 +66,10 @@ def main():
         "disabled-json-missing": ({"guc_off"}, 2),
     }
     args.output.mkdir(parents=True, exist_ok=True)
+    command = [sys.executable, str(repo / 'test/unit/test_connectivity_pg_interrupts.py')]
+    baseline = subprocess.run(command + ['--output', str(args.output / 'baseline')])
+    if baseline.returncode:
+        return 1
     rows = []
     for name, source in mutants.items():
         with tempfile.TemporaryDirectory(prefix="conn203-red-") as d:
