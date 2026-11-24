@@ -88,6 +88,10 @@ typedef struct CuvsCagraFoldRecord
     uint64      folded;
 } CuvsCagraFoldRecord;
 
+#define CUVS_CAGRA_FOLD_RECORDS_PER_PAGE \
+    ((BLCKSZ - MAXALIGN(SizeOfPageHeaderData) - MAXALIGN(sizeof(CuvsCagraFoldPage))) / \
+     sizeof(CuvsCagraFoldRecord))
+
 #ifdef CUVS_TEST_HOOKS
 static bool cuvs_test_abort_staged_fold;
 #endif
@@ -511,21 +515,28 @@ fold_base_matches(const CuvsCagraMeta *meta, const CuvsCagraFoldCandidate *candi
         meta->folded == candidate->parent_folded;
 }
 
+static bool
+fold_candidate_valid(const CuvsCagraFoldCandidate *candidate)
+{
+    const uint64 capacity = (uint64) CUVS_CAGRA_PAGE_DIR *
+        CUVS_CAGRA_PAGE_EXTENT * CUVS_CAGRA_TIDS_PER_PAGE;
+
+    return candidate->positions != 0 && candidate->graph_nonce != 0 &&
+        candidate->parent_graph_nonce != 0 &&
+        candidate->graph_nonce != candidate->parent_graph_nonce &&
+        candidate->parent_n_slots <= capacity &&
+        candidate->positions <= capacity - candidate->parent_n_slots &&
+        candidate->parent_folded <= candidate->parent_n_slots;
+}
+
 CuvsCagraFoldStatus
 cuvs_cagra_prepare_fold(Relation index, const CuvsCagraFoldCandidate *candidate,
                         CuvsCagraMeta *base, CuvsCagraPendingLocation *locations)
 {
-    const uint64 capacity = (uint64) CUVS_CAGRA_PAGE_DIR *
-        CUVS_CAGRA_PAGE_EXTENT * CUVS_CAGRA_TIDS_PER_PAGE;
     CuvsCagraMeta meta;
     BlockNumber blocks;
 
-    if (candidate->positions == 0 || candidate->graph_nonce == 0 ||
-        candidate->parent_graph_nonce == 0 ||
-        candidate->graph_nonce == candidate->parent_graph_nonce ||
-        candidate->parent_n_slots > capacity ||
-        candidate->positions > capacity - candidate->parent_n_slots ||
-        candidate->parent_folded > candidate->parent_n_slots)
+    if (!fold_candidate_valid(candidate))
         return CUVS_CAGRA_FOLD_DISCARD;
 
     /* Use the same heavyweight fence as VACUUM. No metapage buffer lock is
@@ -757,13 +768,73 @@ fold_stage_tid_pages(Relation index, const CuvsCagraMeta *directory,
     return dead;
 }
 
+static CuvsCagraFoldPage *
+fold_log_tail(Relation index, const CuvsCagraMeta *meta, Page page)
+{
+    CuvsCagraFoldPage *tag;
+    CuvsCagraFoldRecord *record;
+
+    if (PageIsNew(page) || PageGetSpecialSize(page) != MAXALIGN(sizeof(*tag)))
+        bad_page(index, meta->foldlog_tail);
+    tag = (CuvsCagraFoldPage *) PageGetSpecialPointer(page);
+    if (tag->kind != CUVS_PAGE_FOLDLOG || tag->flags != 0 ||
+        tag->count == 0 || tag->count > CUVS_CAGRA_FOLD_RECORDS_PER_PAGE ||
+        BlockNumberIsValid(tag->next) ||
+        ((PageHeader) page)->pd_lower != MAXALIGN(SizeOfPageHeaderData) +
+            tag->count * sizeof(*record) ||
+        ((PageHeader) page)->pd_lower > ((PageHeader) page)->pd_upper)
+        bad_page(index, meta->foldlog_tail);
+    record = (CuvsCagraFoldRecord *) PageGetContents(page) + tag->count - 1;
+    if (record->graph_nonce != meta->graph_nonce || record->n_slots != meta->n_slots ||
+        record->folded != meta->folded)
+        bad_page(index, meta->foldlog_tail);
+    return tag;
+}
+
+/* The event is retained by the daemon until acknowledged. A replacement
+ * worker can prove the same publication from the current metapage and log. */
+static CuvsCagraFoldStatus
+fold_retry_ack(Relation index, const CuvsCagraFoldCandidate *candidate, XLogRecPtr *commit_lsn)
+{
+    CuvsCagraMeta meta;
+    XLogRecPtr lsn = InvalidXLogRecPtr;
+
+    if (!ConditionalLockPage(index, 0, ShareLock))
+        return CUVS_CAGRA_FOLD_DEFERRED;
+    if (cuvs_cagra_has_pages(index) && cuvs_cagra_read_meta(index, &meta) &&
+        meta.index_nonce == candidate->index_nonce &&
+        meta.base_nonce == candidate->base_nonce &&
+        meta.graph_nonce == candidate->graph_nonce &&
+        meta.n_slots == candidate->parent_n_slots + candidate->positions &&
+        meta.folded == candidate->parent_folded + candidate->positions)
+    {
+        Buffer buffer;
+        Page page;
+
+        if (!BlockNumberIsValid(meta.foldlog_tail) || meta.foldlog_tail == 0 ||
+            meta.foldlog_tail >= RelationGetNumberOfBlocks(index))
+            bad_page(index, 0);
+        buffer = ReadBuffer(index, meta.foldlog_tail);
+        LockBuffer(buffer, BUFFER_LOCK_SHARE);
+        page = BufferGetPage(buffer);
+        (void) fold_log_tail(index, &meta, page);
+        lsn = PageGetLSN(page);
+        if (XLogRecPtrIsInvalid(lsn))
+            bad_page(index, meta.foldlog_tail);
+        UnlockReleaseBuffer(buffer);
+    }
+    UnlockPage(index, 0, ShareLock);
+    if (XLogRecPtrIsInvalid(lsn))
+        return CUVS_CAGRA_FOLD_DISCARD;
+    XLogFlush(lsn);
+    *commit_lsn = lsn;
+    return CUVS_CAGRA_FOLD_PUBLISHED;
+}
+
 static CuvsCagraFoldStatus
 publish_fold(Relation index, const CuvsCagraFoldCandidate *candidate, XLogRecPtr *commit_lsn)
 {
     const uint64 extent_slots = (uint64) CUVS_CAGRA_PAGE_EXTENT * CUVS_CAGRA_TIDS_PER_PAGE;
-    const uint32 log_capacity =
-        (BLCKSZ - MAXALIGN(SizeOfPageHeaderData) - MAXALIGN(sizeof(CuvsCagraFoldPage))) /
-        sizeof(CuvsCagraFoldRecord);
     CuvsCagraPendingLocation *locations;
     CuvsCagraMeta directory;
     CuvsCagraMeta *meta;
@@ -806,21 +877,8 @@ publish_fold(Relation index, const CuvsCagraFoldCandidate *candidate, XLogRecPtr
         bad_page(index, 0);
     log_buffer = ReadBuffer(index, directory.foldlog_tail);
     LockBuffer(log_buffer, BUFFER_LOCK_SHARE);
-    page = BufferGetPage(log_buffer);
-    if (PageIsNew(page) || PageGetSpecialSize(page) != MAXALIGN(sizeof(*tag)))
-        bad_page(index, directory.foldlog_tail);
-    tag = (CuvsCagraFoldPage *) PageGetSpecialPointer(page);
-    if (tag->kind != CUVS_PAGE_FOLDLOG || tag->flags != 0 ||
-        tag->count == 0 || tag->count > log_capacity || BlockNumberIsValid(tag->next) ||
-        ((PageHeader) page)->pd_lower != MAXALIGN(SizeOfPageHeaderData) +
-            tag->count * sizeof(*record) ||
-        ((PageHeader) page)->pd_lower > ((PageHeader) page)->pd_upper)
-        bad_page(index, directory.foldlog_tail);
-    record = (CuvsCagraFoldRecord *) PageGetContents(page) + tag->count - 1;
-    if (record->graph_nonce != directory.graph_nonce || record->n_slots != directory.n_slots ||
-        record->folded != directory.folded)
-        bad_page(index, directory.foldlog_tail);
-    rollover = tag->count == log_capacity;
+    tag = fold_log_tail(index, &directory, BufferGetPage(log_buffer));
+    rollover = tag->count == CUVS_CAGRA_FOLD_RECORDS_PER_PAGE;
     LockBuffer(log_buffer, BUFFER_LOCK_UNLOCK);
 
     if (end > (uint64) directory.n_extents * extent_slots)
@@ -966,11 +1024,17 @@ CuvsCagraFoldStatus
 cuvs_cagra_publish_fold(Relation index, const CuvsCagraFoldCandidate *candidate,
                         XLogRecPtr *commit_lsn)
 {
+    CuvsCagraFoldStatus status;
+
     if (!IsBackgroundWorker || !IsTransactionState() || IsTransactionBlock() ||
         IsSubTransaction() || IsInParallelMode() || XactReadOnly || RecoveryInProgress() ||
         TransactionIdIsValid(GetTopTransactionIdIfAny()))
         ereport(ERROR, (errmsg("CAGRA fold publication requires a standalone background worker operation")));
-    return publish_fold(index, candidate, commit_lsn);
+    status = publish_fold(index, candidate, commit_lsn);
+    if (status == CUVS_CAGRA_FOLD_DISCARD && RelationNeedsWAL(index) &&
+        fold_candidate_valid(candidate))
+        return fold_retry_ack(index, candidate, commit_lsn);
+    return status;
 }
 
 #ifdef CUVS_TEST_HOOKS

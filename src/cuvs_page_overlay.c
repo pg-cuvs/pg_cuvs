@@ -93,6 +93,37 @@ cuvs_page_overlay_start_boot(CuvsPageOverlay *overlay, uint64_t boot_id, uint64_
     return previous;
 }
 
+CuvsPageOverlayChunk *
+cuvs_page_overlay_advance_fold(CuvsPageOverlay *overlay, uint64_t folded)
+{
+    CuvsPageOverlayChunk **link = &overlay->head;
+    CuvsPageOverlayChunk *obsolete;
+    bool reader_can_reach_cut = false;
+
+    /* Keep the unpublished suffix and at most one chunk crossing its start.
+     * Each registry link owns a reference, including the head. */
+    while (*link && (*link)->from + (*link)->positions > folded)
+    {
+        if (__atomic_load_n(&(*link)->refs, __ATOMIC_ACQUIRE) > 1)
+            reader_can_reach_cut = true;
+        link = &(*link)->next;
+    }
+    if (!*link)
+        return NULL;
+
+    if (reader_can_reach_cut)
+    {
+        /* An older search can still traverse this link outside the lock.
+         * Detach the registry's view and let PostgreSQL supply the suffix. */
+        link = &overlay->head;
+        overlay->covered_upto = folded;
+        ++overlay->generation;
+    }
+    obsolete = *link;
+    *link = NULL;
+    return obsolete;
+}
+
 uint32_t
 cuvs_page_overlay_supply(CuvsPageOverlay *overlay, const CuvsPageOverlayRequest *request,
                          CuvsPageOverlayChunk **chunk, CuvsPageOverlayChunk **obsolete)

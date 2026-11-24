@@ -12,6 +12,7 @@
  * Configured via cuvs.socket_path GUC.
  */
 
+#include <stdbool.h>
 #include <stdint.h>
 #include <stddef.h>
 #include <sys/types.h>
@@ -169,6 +170,9 @@ int cuvs_ipc_build_hnsw_file_idle(const char *socket_path, int vectors_fd,
 #define CUVS_OP_DROP_PAGES_INDEX      52 /* fixed index_dir after the v6 command */
 #define CUVS_OP_SEARCH_PAGE_OVERLAY   56
 #define CUVS_OP_SEARCH_PAGE_OVERLAY_BATCH 57
+#define CUVS_OP_FOLD_READY            58
+#define CUVS_OP_FOLD_COMMITTED        59
+#define CUVS_OP_FOLD_DISCARD          60
 #define CUVS_PAGE_INDEX_DIR_SIZE 256 /* fixed path field on the wire */
 #define CUVS_PAGE_SLOT_INVALID UINT64_MAX
 #define CUVS_PAGE_BUILD_DEFER_LEGACY 1U
@@ -263,6 +267,47 @@ int cuvs_ipc_search_page_overlay(const char *socket_path, uint32_t db_oid, uint3
     uint32_t search_mode, uint32_t bf_precision, const CuvsPageSupplement *supplement,
     CuvsPageOverlayResult *results, int *count, uint32_t *latency_us, CuvsPageProgress *progress);
 
+typedef struct CuvsPageFoldQuery
+{
+    uint32_t length;
+    uint32_t reserved;
+    uint64_t system_identifier;
+    uint64_t boot_id;
+} CuvsPageFoldQuery;
+
+typedef struct CuvsPageFoldEvent
+{
+    uint32_t length;
+    uint32_t db_oid;
+    uint32_t index_oid;
+    uint32_t positions;
+    uint64_t system_identifier;
+    uint64_t boot_id;
+    uint64_t daemon_id;
+    uint64_t index_nonce;
+    uint64_t base_nonce;
+    uint64_t parent_graph_nonce;
+    uint64_t graph_nonce;
+    uint64_t parent_n_slots;
+    uint64_t parent_folded;
+} CuvsPageFoldEvent;
+
+typedef struct CuvsPageFoldResult
+{
+    CuvsPageFoldEvent event;
+    uint64_t transition_lsn;
+} CuvsPageFoldResult;
+
+bool cuvs_page_fold_event_valid(const CuvsPageFoldEvent *event);
+
+/* READY returns one fixed event on OK and no payload on NOT_FOUND.
+ * The output is written only after a complete, validated OK reply. */
+int cuvs_ipc_page_fold_ready(const char *socket_path, uint32_t db_oid,
+    uint64_t system_identifier, uint64_t boot_id, CuvsPageFoldEvent *event);
+
+/* A nonzero LSN sends COMMITTED. Zero sends DISCARD. Both replies are status-only. */
+int cuvs_ipc_page_fold_result(const char *socket_path, const CuvsPageFoldEvent *event,
+    uint64_t transition_lsn);
 
 
 
@@ -413,9 +458,13 @@ typedef struct CuvsReplyHeader {
 #if defined(__cplusplus)
 static_assert(CUVS_PROTO_VERSION == CUVS_ADMISSION_IPC_VERSION,
               "the I3 wire version is the shared admission contract version");
+static_assert(sizeof(CuvsPageFoldQuery) == 24 && sizeof(CuvsPageFoldEvent) == 88 &&
+              sizeof(CuvsPageFoldResult) == 96, "page fold wire sizes");
 #else
 _Static_assert(CUVS_PROTO_VERSION == CUVS_ADMISSION_IPC_VERSION,
                "the I3 wire version is the shared admission contract version");
+_Static_assert(sizeof(CuvsPageFoldQuery) == 24 && sizeof(CuvsPageFoldEvent) == 88 &&
+               sizeof(CuvsPageFoldResult) == 96, "page fold wire sizes");
 #endif
 
 /* err_out / notice_out of the last reply header this thread received through
