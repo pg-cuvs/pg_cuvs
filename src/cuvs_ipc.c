@@ -821,8 +821,13 @@ cuvs_ipc_supply_pages(const char *socket_path, uint32_t db_oid, uint32_t index_o
     int count;
     uint32_t latency_us;
 
-    if (!progress || !supplement)
+    if (!progress)
         return CUVS_STATUS_ERROR;
+    if (!supplement)
+    {
+        memset(progress, 0, sizeof(*progress));
+        return CUVS_STATUS_ERROR;
+    }
     return page_overlay_exchange(socket_path, &cmd, &frame, NULL,
                                   supplement, NULL, &count, &latency_us, progress);
 }
