@@ -5200,8 +5200,8 @@ page_search_filtered(Oid oid, Relation heap, Snapshot snapshot, const float *que
 }
 
 /* Resolve the merged shortlist under the scan snapshot before emitting a row.
- * The daemon has no visibility information for base graph slots. If invisible
- * candidates leave too few answers, the executor must start over on the heap. */
+ * Invisible candidates can leave fewer answers than cuvs.k. A bad slot identity
+ * invalidates the shortlist before the scan has emitted any rows. */
 static bool
 page_resolve_overlay(IndexScanDesc scan, CuvsScanState *ss, const CuvsCagraMeta *meta,
                      const CuvsPageSearchRequest *request,
@@ -5210,7 +5210,7 @@ page_resolve_overlay(IndexScanDesc scan, CuvsScanState *ss, const CuvsCagraMeta 
     Relation heap = scan->heapRelation;
     IndexFetchTableData *fetch = table_index_fetch_begin(heap);
     TupleTableSlot *tuple = table_slot_create(heap, NULL);
-    bool valid = true, discarded = false;
+    bool valid = true;
 
     ss->n_results = 0;
     for (int i = 0; i < count && ss->n_results < cuvs_k; ++i)
@@ -5243,19 +5243,13 @@ page_resolve_overlay(IndexScanDesc scan, CuvsScanState *ss, const CuvsCagraMeta 
             break;
         }
         if (state == CUVS_CAGRA_SLOT_DEAD)
-        {
-            discarded = true;
             continue;
-        }
         /* Heap fetch may replace the root with a visible HOT child. The
          * PostgreSQL index scan must still give its caller the root TID. */
         visible = root;
         table_index_fetch_reset(fetch);
         if (!table_index_fetch_tuple(fetch, &visible, scan->xs_snapshot, tuple, &again, &dead))
-        {
-            discarded = true;
             continue;
-        }
         ss->page_results[ss->n_results++] = (CuvsResult) {
             .tid = cuvs_tid_encode(ItemPointerGetBlockNumber(&root),
                                    ItemPointerGetOffsetNumber(&root)),
@@ -5264,7 +5258,7 @@ page_resolve_overlay(IndexScanDesc scan, CuvsScanState *ss, const CuvsCagraMeta 
     }
     table_index_fetch_end(fetch);
     ExecDropSingleTupleTableSlot(tuple);
-    return valid && (!discarded || ss->n_results == cuvs_k);
+    return valid;
 }
 
 static bool
