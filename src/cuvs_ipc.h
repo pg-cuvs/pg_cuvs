@@ -173,6 +173,32 @@ int cuvs_ipc_build_hnsw_file_idle(const char *socket_path, int vectors_fd,
 #define CUVS_OP_FOLD_READY            58
 #define CUVS_OP_FOLD_COMMITTED        59
 #define CUVS_OP_FOLD_DISCARD          60
+
+/* An opt-in legacy CAGRA command. The v6 command and reply headers stay fixed.
+ * The command is followed by CuvsExtraSearchRequest and dim floats.
+ * An OK reply carries CuvsExtraSearchReply followed by n_results CuvsResults. */
+#define CUVS_OP_SEARCH_EXTRA             61
+#define CUVS_EXTRA_SEARCH_VERSION         1u
+#define CUVS_EXTRA_SEARCH_MAX_K         512u
+#define CUVS_EXTRA_SEARCH_MAX_DIM      3072u
+#define CUVS_EXTRA_SEARCH_MAX_ROWS    32768u
+#define CUVS_EXTRA_SEARCH_MAX_COMPONENTS (8u * 1024u * 1024u)
+#define CUVS_EXTRA_SEARCH_TIMEOUT_MS   3000
+
+typedef struct CuvsExtraSearchRequest {
+    uint32_t version;
+    uint32_t max_components;  /* zero for the first, ordinary CAGRA search */
+    uint64_t generation;      /* zero for first, exact first-reply token for extra */
+    uint64_t dir_dev;         /* heap backend's sidecar-directory device */
+    uint64_t dir_ino;         /* sidecar-directory inode, nonzero */
+    int64_t  deadline_ms;     /* shared statement CLOCK_MONOTONIC deadline */
+} CuvsExtraSearchRequest;
+
+typedef struct CuvsExtraSearchReply {
+    uint64_t generation;
+    uint32_t scored_rows;     /* extra search only */
+    uint32_t components;      /* completed row × dimension evaluations */
+} CuvsExtraSearchReply;
 #define CUVS_PAGE_INDEX_DIR_SIZE 256 /* fixed path field on the wire */
 #define CUVS_PAGE_SLOT_INVALID UINT64_MAX
 #define CUVS_PAGE_BUILD_DEFER_LEGACY 1U
@@ -351,6 +377,12 @@ int cuvs_ipc_page_fold_result(const char *socket_path, const CuvsPageFoldEvent *
 #define CUVS_STATUS_PAGE_NEED          18
 #define CUVS_STATUS_PAGE_OVERLAY_FULL  19
 #define CUVS_STATUS_PAGE_OVERLAY_HOST_FULL 20 /* daemon host budget: use exact heap search */
+
+#define CUVS_EXTRA_SEARCH_UNSUPPORTED 21
+#define CUVS_EXTRA_SEARCH_GENERATION  22
+#define CUVS_EXTRA_SEARCH_BUDGET      23
+#define CUVS_EXTRA_SEARCH_DEADLINE    24
+#define CUVS_EXTRA_SEARCH_ANN_FAILED  25 /* initial ANN ran and failed */
 
 /* ----------------------------------------------------------------
  * Command frame (sent over UDS, fixed size)
@@ -555,6 +587,15 @@ typedef struct CuvsResult {
     uint64_t tid;           /* heap TID encoded as block<<16|offset */
     float    distance;
 } CuvsResult;
+
+/* A single absolute monotonic deadline covers both optional-path requests. */
+int64_t cuvs_ipc_extra_search_deadline_ms(void);
+int cuvs_ipc_search_extra(const char *socket_path, uint32_t db_oid,
+                          uint32_t index_oid, const float *query, int dim, int k,
+                          uint64_t generation, uint32_t max_components,
+                          uint64_t dir_dev, uint64_t dir_ino,
+                          int64_t deadline_ms, CuvsResult *results, int *count,
+                          CuvsExtraSearchReply *details, uint32_t *latency_us);
 
 int cuvs_ipc_search_pages(const char *socket_path, uint32_t db_oid, uint32_t index_oid,
     const CuvsPageSearchRequest *request, const float *queries, int nq, int dim, int k,

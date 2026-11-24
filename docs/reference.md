@@ -173,11 +173,39 @@ Defaults and ranges are from source. "Set by" is the minimum role/scope: `USERSE
 | `cuvs.daemon_uid` | int | `-1` | -1– | SUSET | Expected owner uid of `cuvs.socket_path`; backend refuses to connect if the socket is owned by a different uid. `-1` disables the check. See playbooks/daemon-restart-recovery.md § Security / hardening |
 | `cuvs.index_dir` | string | `$PGDATA/cuvs_indexes` | — | SUSET | Artifact directory (empty = resolved at runtime) |
 | `cuvs.k` | int | `100` | 1–2000 | USERSET | GPU candidates fetched per CAGRA scan; the AM does not read SQL `LIMIT`, which the executor applies afterward. Set high enough for the desired LIMIT and recall |
+| `cuvs.search_more` | bool | `off` | — | USERSET | Experimental. For eligible CAGRA L2 queries, try one additional candidate search before returning the first row when the first results have too few visible rows |
+| `cuvs.search_more_max_components` | int | `8388608` | 0–8388608 | USERSET | Maximum row-by-dimension evaluations in the additional GPU pass. Zero permits only the initial CAGRA search |
 | `cuvs.rmm_pool_mb` | int/status | daemon value | 0–INT_MAX, or `unavailable` | read-only (INTERNAL) | Applied initial RMM pool reservation per GPU, queried from the daemon. `0` = disabled; `unavailable` = no compatible daemon reply. Set using the daemon CLI and restart, not SQL SET. Record with each benchmark run |
 | `cuvs.rmm_pool_max_percent` | int/status | daemon value | 0–100, or `unavailable` | read-only (INTERNAL) | Applied upstream pool quota as a percentage of total CUDA memory on each GPU. `0` when the pool is disabled |
 | `cuvs.rmm_pool_status` | string/status | daemon value | JSON, or `unavailable` | read-only (INTERNAL) | Applied initial MiB, quota percentage, per-device maximum/reserved/used pool bytes, and `hnsw_auto_overflow` (`ace` or `error`, from `--hnsw-auto-overflow`). Counters cover RMM pool allocations; they are live snapshots, not process-wide GPU memory |
 | `cuvs.circuit_breaker_threshold` | int | `3` | 1–100 | USERSET | Consecutive GPU errors before the (per-backend) breaker trips |
 | `cuvs.circuit_breaker_transient_ttl_s` | int | `30` | 0–3600 | USERSET | Seconds before a breaker opened by a transient reason half-opens and allows one GPU attempt. `0` = half-open immediately. Breakers opened by a permanent reason ignore it. See § 5 `pg_cuvs_reset_circuit` |
+
+`cuvs.search_more` applies to a forward L2 scan of a clean, resident, unsharded
+legacy CAGRA index in the daemon's default index directory. Use a single heap
+table, a non-null vector column, a constant query vector and a positive constant
+`LIMIT <= cuvs.k <= 512`. Plans with filters, joins, or parallel scans keep their
+existing route. Both passes use the same statement snapshot and compare the
+daemon's graph and TID generation. The extra pass scores only a bounded prefix
+of the resident dataset, up to 32,768 rows. The daemon scores at most 1,024
+rows and 262,144 vector components per submission, releases the registry lock
+between submissions and checks for cancellation before each new submission.
+A submitted chunk can finish after a backend cancellation. The configured
+limit counts scored vector components in the extra pass. The initial ANN,
+GPU time and the number of visible rows found are separate.
+`EXPLAIN (ANALYZE)` reports candidate counts,
+additional requests, scored rows and the reason the node stopped.
+
+**Known limitations.** Replacing the configured index directory after the
+final BUILD identity check, while auxiliary sidecars are being published, can
+leave the new files in the previous directory. A subsequent reload from the
+configured path can find missing or older artifacts.
+
+In the [#284 A100 trial](https://github.com/pg-cuvs/pg_cuvs/pull/284), the
+additional search raised median total execution time from 0.575 ms with the
+option off to 5.572 ms with it on. This was a single PostgreSQL 16.16 fixture on
+an A100 80GB with 10,000 seed rows, 768 dimensions, 100 deletions, one additional
+insert and `LIMIT 100`, using 24 `EXPLAIN (ANALYZE)` samples per mode.
 
 Unlocked CAGRA builds reserve estimated RMM quota separately from logical index
 residency under the registry mutex. Admission subtracts all in-flight reservations

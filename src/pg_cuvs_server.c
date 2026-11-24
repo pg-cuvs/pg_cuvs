@@ -59,6 +59,7 @@
 #include <sys/mman.h>
 #include <sys/random.h>   /* getrandom(2): CSPRNG suffix for reply shm key names, #87 */
 #include <fcntl.h>
+#include <math.h>
 #include <time.h>
 #include <stdint.h>
 #include <poll.h>
@@ -283,6 +284,10 @@ typedef struct IndexEntry {
     int             pinned;             /* daemon-lifetime pin; kept by REINDEX */
     time_t          loaded_at;          /* registration time (order key) */
     int             file_current;       /* I-FC: 1 iff graph/tids == .cagra/.tids */
+    uint64_t        extra_search_generation; /* optional opcode, protected by g_index_mutex */
+    int             extra_search_default_dir;
+    dev_t           extra_search_dir_dev;
+    ino_t           extra_search_dir_ino;
 } IndexEntry;
 
 /* Zero just the stat counters of a (re)initialized entry. The slot may carry
@@ -324,6 +329,8 @@ reset_entry_stats(IndexEntry *e)
     e->last_search        = 0;
     e->loaded_at          = time(NULL);
     e->file_current       = 0;
+    e->extra_search_generation = 0;
+    e->extra_search_default_dir = 0;
 }
 
 /* Record a completed search on an entry. Caller MUST hold g_index_mutex. */
@@ -1964,6 +1971,80 @@ delta_file_path(char *out, size_t outlen,
     snprintf(out, outlen, "%s/%u_%u.delta", dir, db_oid, index_oid);
 }
 
+typedef struct ExtraSearchRoot {
+    int fd;
+    struct stat identity;
+    char path[32];
+} ExtraSearchRoot;
+
+/* Keep the directory behind SDK pathname I/O stable across renames. When
+ * descriptor paths are unavailable the ordinary path can still run. */
+static bool
+extra_search_open_root(const char *dir, ExtraSearchRoot *root)
+{
+    struct stat st;
+    int fd = open(dir, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+
+    if (fd < 0)
+        return false;
+    snprintf(root->path, sizeof(root->path), "/proc/self/fd/%d", fd);
+    if (fstat(fd, &root->identity) != 0 || stat(root->path, &st) != 0 ||
+        st.st_dev != root->identity.st_dev || st.st_ino != root->identity.st_ino)
+    {
+        close(fd);
+        return false;
+    }
+    root->fd = fd;
+    return true;
+}
+
+static void
+extra_search_attest_directory(IndexEntry *e, const ExtraSearchRoot *root)
+{
+    if (!root)
+        return;
+    e->extra_search_dir_dev = root->identity.st_dev;
+    e->extra_search_dir_ino = root->identity.st_ino;
+    e->extra_search_default_dir = 1;
+}
+
+static const char *
+extra_search_build_dir(const CuvsCmdFrame *cmd, const char *dir, ExtraSearchRoot *root)
+{
+    if (cmd->op == CUVS_OP_BUILD && cmd->metric == CUVS_METRIC_L2 &&
+        strcmp(dir, g_index_dir) == 0 && extra_search_open_root(dir, root))
+        return root->path;
+    return dir;
+}
+
+/* The held FD anchors I/O. BUILD can only publish a resident entry when
+ * the configured path also names that directory at the commit boundary. */
+static bool
+extra_search_build_root_matches(const ExtraSearchRoot *root, const char *dir)
+{
+    struct stat st;
+
+    return !root ||
+           (lstat(dir, &st) == 0 && S_ISDIR(st.st_mode) &&
+            st.st_dev == root->identity.st_dev && st.st_ino == root->identity.st_ino);
+}
+
+/* LOAD attests only files opened directly in the held directory. Follow
+ * symlinks only on the ordinary, unattested fallback path. */
+static int
+extra_search_open_base_file(int root_fd, const char *name)
+{
+    struct stat st;
+    int fd = openat(root_fd, name, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
+
+    if (fd >= 0 && (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode)))
+    {
+        close(fd);
+        fd = -1;
+    }
+    return fd;
+}
+
 /* Phase 3L: raw vector matrix sidecar for GPU brute-force search; written at
  * build time alongside `.cagra`/`.tids`, loaded into a resident CuvsBfIndex. */
 static void
@@ -2828,24 +2909,72 @@ build_rev_tid_map(IndexEntry *e)
     e->rev_item_ids = ri;
 }
 
+typedef struct ExtraSearchLoad {
+    ExtraSearchRoot root;
+    int graph_fd;
+    int tids_fd;
+} ExtraSearchLoad;
+
+/* For the optional path, classify and open the base under a single root.
+ * The caller takes ownership of all three FDs on success. */
+static bool
+extra_search_pin_load(uint32_t db_oid, uint32_t index_oid, ExtraSearchLoad *load,
+                      char idx_path[512], char tids_path[512])
+{
+    if (!extra_search_open_root(g_index_dir, &load->root))
+        return false;
+
+    char manifest[512];
+    struct stat st;
+    shards_manifest_path(manifest, sizeof(manifest), load->root.path, db_oid, index_oid);
+    if (lstat(manifest, &st) != 0 && errno == ENOENT)
+    {
+        char graph_name[64], tids_name[64];
+        snprintf(graph_name, sizeof(graph_name), "%u_%u.cagra", db_oid, index_oid);
+        snprintf(tids_name, sizeof(tids_name), "%u_%u.tids", db_oid, index_oid);
+        load->graph_fd = extra_search_open_base_file(load->root.fd, graph_name);
+        if (load->graph_fd >= 0)
+        {
+            load->tids_fd = extra_search_open_base_file(load->root.fd, tids_name);
+            if (load->tids_fd >= 0)
+            {
+                snprintf(idx_path, 512, "/proc/self/fd/%d", load->graph_fd);
+                snprintf(tids_path, 512, "/proc/self/fd/%d", load->tids_fd);
+                return true;
+            }
+            close(load->graph_fd);
+        }
+    }
+    close(load->root.fd);
+    return false;
+}
+
 static int
 load_index(uint32_t db_oid, uint32_t index_oid, CuvsRequester rq)
 {
+    ExtraSearchLoad load;
+    char idx_path[512], tids_path[512];
+    const ExtraSearchRoot *root = extra_search_pin_load(db_oid, index_oid, &load,
+                                                       idx_path, tids_path) ? &load.root : NULL;
+    int rc = -1;
     g_cur_requester_idx = index_oid;
     g_last_admit_reason = CUVS_ADMISSION_NONE;   /* never report a stale reason */
-    char idx_path[512], tids_path[512];
+    const char *io_dir = root ? root->path : g_index_dir;
 
     memset(&t_reload_rej, 0, sizeof(t_reload_rej));
     t_reload_rej.reason = CUVS_ADMISSION_NONE;
-    index_file_path(idx_path, sizeof(idx_path), g_index_dir, db_oid, index_oid);
-    tids_file_path(tids_path, sizeof(tids_path), g_index_dir, db_oid, index_oid);
+    if (!root)
+    {
+        index_file_path(idx_path, sizeof(idx_path), g_index_dir, db_oid, index_oid);
+        tids_file_path(tids_path, sizeof(tids_path), g_index_dir, db_oid, index_oid);
+    }
 
     /* Read + validate the versioned, checksummed .tids sidecar. A reject
      * (bad magic/version/range/crc, legacy headerless format) means this
      * pair must be skipped; the index must be REINDEXed. */
     FILE *f = fopen(tids_path, "rb");
     if (!f)
-        return -1;
+        goto done;
 
     CuvsTidsHeader thdr;
     uint64_t *tids = NULL;
@@ -2854,7 +2983,7 @@ load_index(uint32_t db_oid, uint32_t index_oid, CuvsRequester rq)
         fclose(f);
         LOG_ERROR("pg_cuvs_server: .tids validation failed for %u/%u, skip\n",
                 db_oid, index_oid);
-        return -1;
+        goto done;
     }
     fclose(f);
 
@@ -2869,13 +2998,16 @@ load_index(uint32_t db_oid, uint32_t index_oid, CuvsRequester rq)
         LOG_ERROR("pg_cuvs_server: .tids header dim=0 for %u/%u, skip\n",
                 db_oid, index_oid);
         free(tids);
-        return -1;
+        goto done;
     }
 
-    /* Phase 3F: if a `.shards` manifest exists, this is a sharded logical index.
+    /* The anchored caller already selected an unsharded base in its held
+     * directory. Never consult the logical path with those pinned TIDs.
+     * Phase 3F: if a `.shards` manifest exists, this is a sharded logical index.
      * Load via the shard path (which takes ownership of tids on success). A
      * present-but-invalid manifest fails closed (no unsharded fallback — there
      * is no single .cagra to fall back to). */
+    if (!root)
     {
         int src = load_index_sharded(db_oid, index_oid, &thdr, tids, rq);
         if (src == 0)
@@ -2894,6 +3026,7 @@ load_index(uint32_t db_oid, uint32_t index_oid, CuvsRequester rq)
      * search (refresh_main_bf_cache), so we reserve no graph VRAM here. Detected
      * before the cagra VRAM make-room so a flat load never over-reserves or evicts
      * a cagra index for a graph it will not allocate. */
+    if (!root)
     {
         char fcagra[512], fivfpq[512], fvecs[512];
         index_file_path(fcagra, sizeof(fcagra), g_index_dir, db_oid, index_oid);
@@ -2991,7 +3124,8 @@ load_index(uint32_t db_oid, uint32_t index_oid, CuvsRequester rq)
         LOG_WARN("pg_cuvs_server: no GPU can fit %u/%u (%zu bytes), skip\n",
                  db_oid, index_oid, needed);
         free(tids);
-        return -2;  /* VRAM: index too large for any GPU budget */
+        rc = -2;  /* VRAM: index too large for any GPU budget */
+        goto done;
     }
     AdmitLine al = {.op = "LOAD",
                     .path = admission_load_path(rq),
@@ -3010,7 +3144,8 @@ load_index(uint32_t db_oid, uint32_t index_oid, CuvsRequester rq)
                  total_vram_used(target_gpu) / (1024*1024),
                  needed / (1024*1024));
         free(tids);
-        return -2;  /* VRAM: exhausted after eviction */
+        rc = -2;  /* VRAM: exhausted after eviction */
+        goto done;
     }
 
     if (t_manual_loading)
@@ -3022,13 +3157,13 @@ load_index(uint32_t db_oid, uint32_t index_oid, CuvsRequester rq)
     {
         /* No .cagra sidecar — try .ivfpq (3P IVF-PQ index). */
         char ivfpq_path[512];
-        ivfpq_file_path(ivfpq_path, sizeof(ivfpq_path), g_index_dir, db_oid, index_oid);
+        ivfpq_file_path(ivfpq_path, sizeof(ivfpq_path), io_dir, db_oid, index_oid);
         if (access(ivfpq_path, F_OK) == 0)
             ivfpq_handle = cuvs_ivfpq_deserialize(ivfpq_path, target_gpu);
         if (!ivfpq_handle)
         {
             free(tids);
-            return -1;
+            goto done;
         }
     }
 
@@ -3043,7 +3178,7 @@ load_index(uint32_t db_oid, uint32_t index_oid, CuvsRequester rq)
         if (handle)       cuvs_cagra_free(handle, target_gpu);
         if (ivfpq_handle) cuvs_ivfpq_free(ivfpq_handle, target_gpu);
         free(tids);
-        return -1;
+        goto done;
     }
 
     IndexEntry *e = registry_new_slot();
@@ -3084,13 +3219,15 @@ load_index(uint32_t db_oid, uint32_t index_oid, CuvsRequester rq)
     /* I-FC (ii): just loaded from the files. Only CAGRA single is ever saved
      * by eviction; other kinds keep 0 (unused). */
     e->file_current = handle != NULL;
+    if (handle && metric == CUVS_METRIC_L2)
+        extra_search_attest_directory(e, root);
 
     /* Restore staleness from the .stale sidecar so a daemon restart does not
      * silently resurrect a write-stale index as fresh. */
     {
         char stale_path[512];
         struct stat st;
-        stale_file_path(stale_path, sizeof(stale_path), g_index_dir, db_oid, index_oid);
+        stale_file_path(stale_path, sizeof(stale_path), io_dir, db_oid, index_oid);
         if (stat(stale_path, &st) == 0)
         {
             e->stale = 1;
@@ -3105,7 +3242,15 @@ load_index(uint32_t db_oid, uint32_t index_oid, CuvsRequester rq)
 
     LOG_INFO("pg_cuvs_server: loaded index %u/%u (%lld vecs, %zu MB VRAM)\n",
             db_oid, index_oid, (long long)n_vecs, needed / (1024*1024));
-    return 0;
+    rc = 0;
+done:
+    if (root)
+    {
+        close(load.tids_fd);
+        close(load.graph_fd);
+        close(load.root.fd);
+    }
+    return rc;
 }
 
 /* I3-B usage stats file (UC-1 4c): beside the index files, a dot-name so
@@ -3455,6 +3600,8 @@ registry_new_slot(void)
     e->pinned       = 0;
     e->inflight     = 0;
     e->file_current = 0;
+    e->extra_search_generation = 0;
+    e->extra_search_default_dir = 0;
     e->bf_verdict.valid = 0;            /* #238: never another index's verdict */
     e->hits         = 0;
     e->last_search  = 0;
@@ -7067,6 +7214,7 @@ typedef struct {
     char     gcs_key_file[512];
     char     cagra_path[512];
     char     tids_path[512];
+    int      artifact_dir_fd;   /* keeps descriptor paths valid for the detached upload */
     uint32_t db_oid;
     uint32_t table_oid;
     uint32_t index_oid;
@@ -7102,6 +7250,8 @@ objstore_upload_thread(void *arg)
     else
         LOG_WARN("objstore: upload FAILED for index %u/%u (non-fatal, local artifact intact)\n",
                  a->db_oid, a->index_oid);
+    if (a->artifact_dir_fd >= 0)
+        close(a->artifact_dir_fd);
     free(a);
     return NULL;
 }
@@ -7653,7 +7803,8 @@ build_sharded(int client_fd, const CuvsCmdFrame *cmd, const char *index_dir,
 static void handle_build_multi(int client_fd, const CuvsCmdFrame *cmd,
                                const char *index_dir);
 static void finish_build_commit(int client_fd, const CuvsCmdFrame *cmd,
-                                const char *save_dir, CuvsCagraIndex new_handle,
+                                const char *save_dir, const ExtraSearchRoot *root,
+                                CuvsCagraIndex new_handle,
                                 uint64_t *new_tids, int target_gpu, size_t needed,
                                 int vectors_committed, const char *vecs_tmp,
                                 const char *vecs_final, uint32_t base_generation,
@@ -8429,6 +8580,8 @@ handle_build(int client_fd, const CuvsCmdFrame *cmd)
     /* --- Disk persistence: tmp -> rename pattern --- */
     const char *save_dir = (index_dir[0] != '\0') ? index_dir : g_index_dir;
     mkdir(save_dir, 0700);
+    ExtraSearchRoot root = {.fd = -1};
+    const char *io_dir = extra_search_build_dir(cmd, save_dir, &root);
 
     /* Phase 3L: persist the raw vector matrix as a `.vectors` sidecar for GPU
      * brute-force search, written from `vecs` (the shm payload) while it is
@@ -8439,7 +8592,7 @@ handle_build(int client_fd, const CuvsCmdFrame *cmd)
     uint32_t tids_gen = cuvs_crc32(new_tids, (size_t)cmd->n_vecs * sizeof(uint64_t));
     char vecs_final[512], vecs_tmp[576];
     int  vectors_committed = 0;
-    vectors_file_path(vecs_final, sizeof(vecs_final), save_dir, cmd->db_oid, cmd->index_oid);
+    vectors_file_path(vecs_final, sizeof(vecs_final), io_dir, cmd->db_oid, cmd->index_oid);
     snprintf(vecs_tmp, sizeof(vecs_tmp), "%s.tmp", vecs_final);
     {
         FILE *vf = fopen(vecs_tmp, "wb");
@@ -8454,7 +8607,6 @@ handle_build(int client_fd, const CuvsCmdFrame *cmd)
             vectors_committed = 1;   /* tmp ready; renamed at the commit point */
         } else {
             if (vf) unlink(vecs_tmp);
-            unlink(vecs_final);      /* drop any stale prior sidecar */
             LOG_WARN("[handle_build] .vectors sidecar not written for %u/%u; "
                      "brute_force unavailable until REINDEX\n",
                      cmd->db_oid, cmd->index_oid);
@@ -8464,9 +8616,11 @@ handle_build(int client_fd, const CuvsCmdFrame *cmd)
 
     /* ADR-059: the persist/commit/registry/reply sequence is shared with the
      * multi-partial build path (handle_build_multi). */
-    finish_build_commit(client_fd, cmd, save_dir, new_handle, new_tids,
+    finish_build_commit(client_fd, cmd, save_dir, root.fd >= 0 ? &root : NULL, new_handle, new_tids,
                         target_gpu, final, vectors_committed, vecs_tmp, vecs_final,
                         tids_gen, NULL, -1, NULL);
+    if (root.fd >= 0)
+        close(root.fd);
 }
 
 /* Direct .cagra check (PG_CUVS_DIRECT_CAGRA_VERIFY=1): serialize the same index
@@ -8529,11 +8683,75 @@ cagra_direct_verify(CuvsCagraIndex handle, const char *direct_path, int target_g
     return first_diff < 0 ? 1 : 0;
 }
 
+typedef struct CagraBuildBackup {
+    char dir[64];
+    char tids[80], graph[80];
+    bool had_tids, had_graph;
+} CagraBuildBackup;
+
+static bool
+backup_cagra_file(const char *path, const char *backup, bool *present)
+{
+    if (linkat(AT_FDCWD, path, AT_FDCWD, backup, 0) == 0)
+    {
+        *present = true;
+        return true;
+    }
+    /* A missing prior final needs no backup. Preserve symlink entries as
+     * entries, including dangling links, rather than following targets. */
+    struct stat st;
+    return errno == ENOENT && lstat(path, &st) < 0 && errno == ENOENT;
+}
+
+static bool
+backup_cagra_base(const ExtraSearchRoot *root, const char *tids, const char *graph,
+                  CagraBuildBackup *backup)
+{
+    snprintf(backup->dir, sizeof(backup->dir), "%s/.cagra-build-XXXXXX", root->path);
+    if (!mkdtemp(backup->dir))
+    {
+        backup->dir[0] = '\0';
+        return false;
+    }
+    snprintf(backup->tids, sizeof(backup->tids), "%s/tids", backup->dir);
+    snprintf(backup->graph, sizeof(backup->graph), "%s/graph", backup->dir);
+    return backup_cagra_file(tids, backup->tids, &backup->had_tids) &&
+           backup_cagra_file(graph, backup->graph, &backup->had_graph);
+}
+
+static void
+discard_cagra_build_backup(const CagraBuildBackup *backup)
+{
+    if (!backup->dir[0])
+        return;
+    if (backup->had_tids)
+        unlink(backup->tids);
+    if (backup->had_graph)
+        unlink(backup->graph);
+    if (rmdir(backup->dir) != 0)
+        LOG_WARN("[handle_build] cannot remove backup directory %s: %s\n",
+                 backup->dir, strerror(errno));
+}
+
+static bool
+restore_cagra_file(const char *path, const char *backup, bool had_prior)
+{
+    int rc = had_prior ? rename(backup, path) : unlink(path);
+
+    if (rc == 0 || (!had_prior && errno == ENOENT))
+        return true;
+    LOG_ERROR("[handle_build] cannot restore %s: %s\n", path, strerror(errno));
+    return false;
+}
+
 /* Persist a freshly built CAGRA index (tmp+rename), swap it into the registry,
  * and reply OK — the durable commit tail shared by the single-corpus and ADR-059
  * multi-partial build paths. On entry the caller holds g_index_mutex, has built
  * new_handle, assembled the contiguous new_tids, and staged the .vectors sidecar
- * (vectors_committed + vecs_tmp/vecs_final). This releases g_index_mutex.
+ * (vectors_committed + vecs_tmp/vecs_final). If root is present, the caller
+ * has staged all its temporaries under root->path and keeps the FD open
+ * through this call. save_dir remains the logical path. This releases
+ * g_index_mutex.
  *
  * pre_cagra_tmp/pre_cagra_fd/pre_layout (NULL/-1/NULL = none) are a
  * .cagra temp file whose dataset body the caller already wrote at the layout's
@@ -8544,6 +8762,7 @@ cagra_direct_verify(CuvsCagraIndex handle, const char *direct_path, int target_g
  * cuvs_cagra_serialize as before. On failure the temp file is deleted. */
 static void
 finish_build_commit(int client_fd, const CuvsCmdFrame *cmd, const char *save_dir,
+                    const ExtraSearchRoot *root,
                     CuvsCagraIndex new_handle, uint64_t *new_tids, int target_gpu,
                     size_t needed, int vectors_committed, const char *vecs_tmp,
                     const char *vecs_final, uint32_t base_generation,
@@ -8552,10 +8771,20 @@ finish_build_commit(int client_fd, const CuvsCmdFrame *cmd, const char *save_dir
 {
     char idx_final[512],  idx_tmp[576];
     char tids_final[512], tids_tmp[576];
+    char hnsw_path[512], hnsw_tmp[96] = "";
+    int hnsw_rc = CUVS_HNSW_SERIALIZE_SKIPPED;
+    const char *io_dir = root ? root->path : save_dir;
+    const char *persist_error = "disk persistence failed";
+    const ExtraSearchRoot *attested_root = NULL;
     int  cagra_fd = pre_cagra_fd;
     int  cagra_direct = 0;
-    index_file_path(idx_final,  sizeof(idx_final),  save_dir, cmd->db_oid, cmd->index_oid);
-    tids_file_path(tids_final,  sizeof(tids_final), save_dir, cmd->db_oid, cmd->index_oid);
+    bool tids_published = false, graph_published = false;
+    CagraBuildBackup backup = {0};
+    IndexEntry *previous = find_index(cmd->db_oid, cmd->index_oid);
+    if (previous)
+        previous->extra_search_generation = 0;
+    index_file_path(idx_final,  sizeof(idx_final),  io_dir, cmd->db_oid, cmd->index_oid);
+    tids_file_path(tids_final,  sizeof(tids_final), io_dir, cmd->db_oid, cmd->index_oid);
     snprintf(idx_tmp,  sizeof(idx_tmp),  "%s.tmp", idx_final);
     snprintf(tids_tmp, sizeof(tids_tmp), "%s.tmp", tids_final);
 
@@ -8624,51 +8853,119 @@ finish_build_commit(int client_fd, const CuvsCmdFrame *cmd, const char *save_dir
         goto persist_fail;
     }
 #endif
+    if (!extra_search_build_root_matches(root, save_dir))
+        goto root_changed;
+    if (root)
+    {
+        /* Both old names must be recoverable before either is replaced.
+         * Hard links retain the prior pair without copying the corpus. */
+        if (!backup_cagra_base(root, tids_final, idx_final, &backup))
+        {
+            persist_error = "could not back up the prior CAGRA artifacts";
+            LOG_WARN("[handle_build] %u/%u: %s: %s\n",
+                     cmd->db_oid, cmd->index_oid, persist_error, strerror(errno));
+            goto persist_fail;
+        }
+        if (!extra_search_build_root_matches(root, save_dir))
+            goto root_changed;
+    }
     if (rename(tids_tmp, tids_final) != 0) {
         LOG_ERROR("[handle_build] rename %s -> %s FAILED errno=%d (%s)\n",
                 tids_tmp, tids_final, errno, strerror(errno));
         goto persist_fail;
     }
+    tids_published = true;
+    if (root && previous)
+        previous->file_current = 0;    /* I-FC: the prior pair changed on disk */
+    if (!extra_search_build_root_matches(root, save_dir))
+        goto root_changed;
 #ifdef CUVS_TEST_HOOKS
     if (cuvs_fault("CUVS_FAULT_RENAME_CAGRA")) {
         LOG_ERROR("[handle_build] fault injection: CUVS_FAULT_RENAME_CAGRA\n");
-        unlink(tids_final);
+        if (!root)
+            unlink(tids_final);
         goto persist_fail;
     }
 #endif
     if (rename(idx_tmp, idx_final) != 0) {
         LOG_ERROR("[handle_build] rename %s -> %s FAILED errno=%d (%s); "
-                  "unlinking tids to avoid mismatch\n",
+                  "recovering tids to avoid mismatch\n",
                 idx_tmp, idx_final, errno, strerror(errno));
-        unlink(tids_final);
+        if (!root)
+            unlink(tids_final);
         goto persist_fail;
     }
+    graph_published = true;
     /* fsync directory so the rename(s) are durable. */
-    int dir_fd = open(save_dir, O_RDONLY);
+    int dir_fd = open(io_dir, O_RDONLY);
     if (dir_fd >= 0) { fsync(dir_fd); close(dir_fd); }
+    if (!extra_search_build_root_matches(root, save_dir))
+        goto root_changed;
 
-    /* Phase 3L: commit the .vectors sidecar. Non-fatal — the index is already
-     * durably committed above (cagra + tids renamed); a rename failure only
-     * disables brute_force. The generation token guards a torn post-cagra,
-     * pre-vectors crash: a stale sidecar is rejected at load. */
-    if (vectors_committed) {
-        if (rename(vecs_tmp, vecs_final) != 0) {
-            LOG_WARN("[handle_build] rename %s -> %s failed errno=%d; brute_force unavailable\n",
-                     vecs_tmp, vecs_final, errno);
-            unlink(vecs_tmp);
-            unlink(vecs_final);
-            vectors_committed = 0;
-        } else {
-            int vdir_fd = open(save_dir, O_RDONLY);
-            if (vdir_fd >= 0) { fsync(vdir_fd); close(vdir_fd); }
+    /* A temporary symlink can survive rename. Only attest regular files in
+     * the held directory after both names have been published. */
+    struct stat published;
+    if (root && lstat(idx_final, &published) == 0 && S_ISREG(published.st_mode) &&
+        lstat(tids_final, &published) == 0 && S_ISREG(published.st_mode))
+        attested_root = root;
+
+    /* The HNSW conversion can take time. For an anchored build, stage it
+     * inside the private backup directory so the prior sidecar is still
+     * available if the root changes before the final publication check. */
+    if (cmd->use_cpu_hnsw)
+    {
+        hnsw_file_path(hnsw_path, sizeof(hnsw_path), io_dir, cmd->db_oid, cmd->index_oid);
+        if (root)
+        {
+            snprintf(hnsw_tmp, sizeof(hnsw_tmp), "%s/staged.hnsw", backup.dir);
+            hnsw_rc = cuvs_hnsw_serialize(new_handle, hnsw_tmp, target_gpu);
         }
     }
+
+    IndexEntry *existing = find_index(cmd->db_oid, cmd->index_oid);
+    int registry_full = 0;
+    if (!existing)
+    {
+        g_cur_requester_idx = cmd->index_oid;
+        if (g_n_indexes >= g_max_indexes)
+        {
+            if (!extra_search_build_root_matches(root, save_dir))
+                goto root_changed;
+            (void) make_slot(target_gpu, CUVS_RQ_BUILD_CAGRA);
+        }
+        registry_full = g_n_indexes >= g_max_indexes;
+#ifdef CUVS_TEST_HOOKS
+        registry_full |= cuvs_fault("CUVS_FAULT_REGISTRY_FULL");
+#endif
+    }
+
+    /* Both a resident publish and the registry-full disk-only success
+     * depend on this check. Do not retire any prior sidecars above it. */
+    if (!extra_search_build_root_matches(root, save_dir))
+        goto root_changed;
+
+    /* A failed or missing .vectors stage leaves BF unavailable for this
+     * newly committed base. All changes to its final name happen here. */
+    if (vectors_committed && rename(vecs_tmp, vecs_final) != 0)
+    {
+        LOG_WARN("[handle_build] rename %s -> %s failed errno=%d; brute_force unavailable\n",
+                 vecs_tmp, vecs_final, errno);
+        unlink(vecs_tmp);
+        vectors_committed = 0;
+    }
+    if (vectors_committed)
+    {
+        int vdir_fd = open(io_dir, O_RDONLY);
+        if (vdir_fd >= 0) { fsync(vdir_fd); close(vdir_fd); }
+    }
+    else
+        unlink(vecs_final);
 
     /* A rebuild produces a fresh graph reflecting the current heap — clear any
      * persisted staleness marker. */
     {
         char stale_path[512];
-        stale_file_path(stale_path, sizeof(stale_path), save_dir,
+        stale_file_path(stale_path, sizeof(stale_path), io_dir,
                         cmd->db_oid, cmd->index_oid);
         unlink(stale_path);
     }
@@ -8678,19 +8975,17 @@ finish_build_commit(int client_fd, const CuvsCmdFrame *cmd, const char *save_dir
      * take the sharded path), then the contiguous shard .cagra files. */
     {
         char shards_path[512];
-        shards_manifest_path(shards_path, sizeof(shards_path), save_dir,
+        shards_manifest_path(shards_path, sizeof(shards_path), io_dir,
                              cmd->db_oid, cmd->index_oid);
         unlink(shards_path);
         for (uint32_t s = 0; s < CUVS_SHARDS_MAX; s++)
         {
             char sp[512];
-            shard_cagra_path(sp, sizeof(sp), save_dir, cmd->db_oid, cmd->index_oid, s);
+            shard_cagra_path(sp, sizeof(sp), io_dir, cmd->db_oid, cmd->index_oid, s);
             if (unlink(sp) != 0)
                 break;   /* contiguous ids: first miss => no more shards */
         }
     }
-
-    LOG_DEBUG("[handle_build] disk commit OK\n");
 
     /* Phase 3I-1: write CPU HNSW fallback sidecar — only when the backend
      * requested it (cuvs.cpu_hnsw_fallback=on or a 3I import_hnsw flow).
@@ -8698,17 +8993,25 @@ finish_build_commit(int client_fd, const CuvsCmdFrame *cmd, const char *save_dir
      * work that would never be used. */
     if (cmd->use_cpu_hnsw)
     {
-        char hnsw_path[512];
-        hnsw_file_path(hnsw_path, sizeof(hnsw_path), save_dir,
-                       cmd->db_oid, cmd->index_oid);
-        int hrc = cuvs_hnsw_serialize(new_handle, hnsw_path, target_gpu);
-        if (hrc == CUVS_HNSW_SERIALIZE_SKIPPED)
+        if (root)
+        {
+            if (hnsw_rc == CUVS_HNSW_SERIALIZE_OK && rename(hnsw_tmp, hnsw_path) != 0)
+            {
+                LOG_WARN("[handle_build] rename %s -> %s failed errno=%d\n",
+                         hnsw_tmp, hnsw_path, errno);
+                hnsw_rc = -1;
+            }
+            unlink(hnsw_tmp);
+        }
+        else
+            hnsw_rc = cuvs_hnsw_serialize(new_handle, hnsw_path, target_gpu);
+        if (hnsw_rc == CUVS_HNSW_SERIALIZE_SKIPPED)
             /* #106: no file was written — say so, so the log does not claim a
              * sidecar that a later cpu_hnsw search will fail to open. */
             LOG_WARN("[handle_build] no HNSW fallback sidecar for %u/%u: "
                      "fewer than %d vectors; cpu_hnsw searches will use GPU CAGRA\n",
                      cmd->db_oid, cmd->index_oid, CUVS_HNSW_MIN_ELEMENTS);
-        else if (hrc != CUVS_HNSW_SERIALIZE_OK)
+        else if (hnsw_rc != CUVS_HNSW_SERIALIZE_OK)
             LOG_WARN("[handle_build] HNSW fallback sidecar not saved for %u/%u\n",
                      cmd->db_oid, cmd->index_oid);
         else
@@ -8719,8 +9022,9 @@ finish_build_commit(int client_fd, const CuvsCmdFrame *cmd, const char *save_dir
         }
     }
 
+    LOG_DEBUG("[handle_build] disk commit OK\n");
+
     /* --- Swap into registry --- */
-    IndexEntry *existing = find_index(cmd->db_oid, cmd->index_oid);
     if (existing) {
         /* Phase 3F: a prior sharded instance is replaced by this unsharded
          * build — free all its shard handles, not a (NULL) single handle. */
@@ -8758,18 +9062,11 @@ finish_build_commit(int client_fd, const CuvsCmdFrame *cmd, const char *save_dir
         /* I-FC (i): build saved its files first, but eviction saves/reloads
          * through g_index_dir only, so a per-index index_dir is never current. */
         existing->file_current = strcmp(save_dir, g_index_dir) == 0;
+        extra_search_attest_directory(existing, attested_root);
         existing->compact_count++;     /* every rebuild counts as a compaction */
         existing->last_compact_at = time(NULL);
         build_rev_tid_map(existing);   /* rebuild map for new tids/n_vecs */
     } else {
-        int registry_full;
-        g_cur_requester_idx = cmd->index_oid;
-        if (g_n_indexes >= g_max_indexes)
-            (void) make_slot(target_gpu, CUVS_RQ_BUILD_CAGRA);
-        registry_full = g_n_indexes >= g_max_indexes;
-#ifdef CUVS_TEST_HOOKS
-        registry_full |= cuvs_fault("CUVS_FAULT_REGISTRY_FULL");
-#endif
         if (registry_full) {
             /* Registry full and the LRU couldn't be evicted (e.g. all entries
              * inflight on other GPUs). The artifacts are already durable on
@@ -8779,7 +9076,6 @@ finish_build_commit(int client_fd, const CuvsCmdFrame *cmd, const char *save_dir
              * requester gets a NOTICE through notice_out instead of silence. */
             LOG_WARN("[handle_build] registry full; %u/%u persisted, will reload on demand\n",
                      cmd->db_oid, cmd->index_oid);
-            (void) vectors_committed;   /* .vectors stays on disk for the reload */
             cuvs_cagra_free(new_handle, target_gpu);
             free(new_tids);
             pthread_mutex_unlock(&g_index_mutex);
@@ -8791,6 +9087,7 @@ finish_build_commit(int client_fd, const CuvsCmdFrame *cmd, const char *save_dir
                      g_max_indexes);
             attach_build_notices(&hdr_ok);
             send_all(client_fd, &hdr_ok, sizeof(hdr_ok));
+            discard_cagra_build_backup(&backup);
             return;
         }
         IndexEntry *e = registry_new_slot();
@@ -8835,6 +9132,7 @@ finish_build_commit(int client_fd, const CuvsCmdFrame *cmd, const char *save_dir
         reset_entry_stats(e);
         e->graph_degree = (int)cmd->graph_degree;  /* for extend/compact VRAM est */
         e->file_current = strcmp(save_dir, g_index_dir) == 0;   /* I-FC (i), as above */
+        extra_search_attest_directory(e, attested_root);
     }
 
     pthread_mutex_unlock(&g_index_mutex);
@@ -8847,6 +9145,7 @@ finish_build_commit(int client_fd, const CuvsCmdFrame *cmd, const char *save_dir
     hdr_ok.status = CUVS_STATUS_OK;
     attach_build_notices(&hdr_ok);
     send_all(client_fd, &hdr_ok, sizeof(hdr_ok));
+    discard_cagra_build_backup(&backup);
 
     /* Phase 3C: upload to GCS in a detached thread after replying OK.
      * CREATE INDEX has already returned; upload failure is non-fatal. */
@@ -8855,11 +9154,27 @@ finish_build_commit(int client_fd, const CuvsCmdFrame *cmd, const char *save_dir
         UploadThreadArgs *ua = malloc(sizeof(*ua));
         if (ua)
         {
+            const char *upload_dir = save_dir;
+            char pinned_dir[32];
+            ua->artifact_dir_fd = -1;
+            if (root)
+            {
+                ua->artifact_dir_fd = fcntl(root->fd, F_DUPFD_CLOEXEC, 0);
+                if (ua->artifact_dir_fd < 0)
+                {
+                    LOG_WARN("objstore: cannot pin artifact directory for %u/%u\n",
+                             cmd->db_oid, cmd->index_oid);
+                    free(ua);
+                    return;
+                }
+                snprintf(pinned_dir, sizeof(pinned_dir), "/proc/self/fd/%d", ua->artifact_dir_fd);
+                upload_dir = pinned_dir;
+            }
             strncpy(ua->snapshot_uri, g_snapshot_uri, sizeof(ua->snapshot_uri) - 1);
             strncpy(ua->cluster_id,   g_cluster_id,   sizeof(ua->cluster_id)   - 1);
             strncpy(ua->gcs_key_file, g_gcs_key_file, sizeof(ua->gcs_key_file) - 1);
-            strncpy(ua->cagra_path,   idx_final,       sizeof(ua->cagra_path)   - 1);
-            strncpy(ua->tids_path,    tids_final,      sizeof(ua->tids_path)    - 1);
+            index_file_path(ua->cagra_path, sizeof(ua->cagra_path), upload_dir, cmd->db_oid, cmd->index_oid);
+            tids_file_path(ua->tids_path, sizeof(ua->tids_path), upload_dir, cmd->db_oid, cmd->index_oid);
             ua->db_oid      = cmd->db_oid;
             ua->table_oid   = cmd->table_oid;
             ua->index_oid   = cmd->index_oid;
@@ -8877,6 +9192,8 @@ finish_build_commit(int client_fd, const CuvsCmdFrame *cmd, const char *save_dir
             {
                 LOG_WARN("objstore: failed to spawn upload thread for %u/%u\n",
                          cmd->db_oid, cmd->index_oid);
+                if (ua->artifact_dir_fd >= 0)
+                    close(ua->artifact_dir_fd);
                 free(ua);
             }
             pthread_attr_destroy(&upload_attr);
@@ -8884,11 +9201,35 @@ finish_build_commit(int client_fd, const CuvsCmdFrame *cmd, const char *save_dir
     }
     return;
 
+root_changed:
+    persist_error = "index directory changed during CAGRA build publication";
+    LOG_WARN("[handle_build] %u/%u: %s (tids_published=%d graph_published=%d)\n",
+             cmd->db_oid, cmd->index_oid, persist_error, tids_published, graph_published);
+    if (previous)
+        previous->file_current = 0;
 persist_fail:
-    /* Disk persistence failed before commit. Existing entry (if any) remains
-     * intact in registry. Clean up new resources and tmp files. The prior
-     * `.vectors` (if any) is left intact — it still matches the surviving
-     * (un-renamed) prior `.tids`/`.cagra`; only our new tmp is removed. */
+    if (hnsw_tmp[0])
+        unlink(hnsw_tmp);
+    if (root && tids_published)
+    {
+        bool restored = restore_cagra_file(tids_final, backup.tids, backup.had_tids);
+        if (graph_published && !restore_cagra_file(idx_final, backup.graph, backup.had_graph))
+            restored = false;
+        if (restored)
+            discard_cagra_build_backup(&backup);
+        else
+        {
+            persist_error = "CAGRA publication failed and prior artifacts need recovery";
+            LOG_ERROR("[handle_build] %u/%u: %s; retained backups in %s\n",
+                      cmd->db_oid, cmd->index_oid, persist_error, backup.dir);
+        }
+        if (fsync(root->fd) != 0)
+            LOG_WARN("[handle_build] cannot fsync rolled back index directory: %s\n",
+                     strerror(errno));
+    }
+    else
+        discard_cagra_build_backup(&backup);
+    /* Keep the existing resident handles and release the failed build. */
     if (cagra_fd >= 0)
         close(cagra_fd);                    /* pre-written file never reached the prefix step */
     if (pre_cagra_tmp)
@@ -8899,7 +9240,7 @@ persist_fail:
     cuvs_cagra_free(new_handle, target_gpu);
     free(new_tids);
     pthread_mutex_unlock(&g_index_mutex);
-    send_error_code(client_fd, CUVS_STATUS_PERSIST_FAILED, "disk persistence failed");
+    send_error_code(client_fd, CUVS_STATUS_PERSIST_FAILED, persist_error);
 }
 
 /* The .vectors sidecar of a multi-partial build is written by a
@@ -9052,6 +9393,7 @@ handle_build_multi(int client_fd, const CuvsCmdFrame *cmd, const char *index_dir
     int            status     = CUVS_STATUS_ERROR;
     int            resolved_sc;
     const char    *save_dir;
+    ExtraSearchRoot root = {.fd = -1};
     CuvsAdmissionFields rej;          /* I3: err_out of a rejection reply */
     int            rej_set    = 0;
 
@@ -9301,12 +9643,13 @@ handle_build_multi(int client_fd, const CuvsCmdFrame *cmd, const char *index_dir
         log_admit(&al, CUVS_ADMISSION_NONE);
         pthread_mutex_unlock(&g_index_mutex);
 
-        /* Stage the .vectors sidecar while the GPU builds. */
+        /* Stage both temporaries under the directory used by the commit. */
+        const char *io_dir = extra_search_build_dir(cmd, save_dir, &root);
         VecsWriteJob vjob;
         pthread_t    vth;
         int          vth_started = 0;
         memset(&vjob, 0, sizeof(vjob));
-        vectors_file_path(vecs_final, sizeof(vecs_final), save_dir, cmd->db_oid, cmd->index_oid);
+        vectors_file_path(vecs_final, sizeof(vecs_final), io_dir, cmd->db_oid, cmd->index_oid);
         char btok[64];
         build_token(btok, sizeof(btok));   /* one token for every temp file of this build */
         /* A truncated temp name could collide with another build's, so a
@@ -9344,7 +9687,7 @@ handle_build_multi(int client_fd, const CuvsCmdFrame *cmd, const char *index_dir
             else
             {
                 char cagra_final[512];
-                index_file_path(cagra_final, sizeof(cagra_final), save_dir,
+                index_file_path(cagra_final, sizeof(cagra_final), io_dir,
                                 cmd->db_oid, cmd->index_oid);
                 if ((size_t)snprintf(cagra_tmp, sizeof(cagra_tmp), "%s.%s.tmp", cagra_final, btok)
                     >= sizeof(cagra_tmp))
@@ -9471,7 +9814,6 @@ handle_build_multi(int client_fd, const CuvsCmdFrame *cmd, const char *index_dir
             else
             {
                 unlink(vecs_tmp);
-                unlink(vecs_final);
                 LOG_WARN("[handle_build_multi] .vectors sidecar not written for %u/%u; "
                          "brute_force unavailable until REINDEX\n",
                          cmd->db_oid, cmd->index_oid);
@@ -9483,14 +9825,18 @@ handle_build_multi(int client_fd, const CuvsCmdFrame *cmd, const char *index_dir
             munmap(maps[j], map_lens[j]);
         free(descs); free(part_vecs); free(n_each); free(maps); free(map_lens);
 
-        finish_build_commit(client_fd, cmd, save_dir, new_handle, new_tids,
+        finish_build_commit(client_fd, cmd, save_dir, root.fd >= 0 ? &root : NULL, new_handle, new_tids,
                             target_gpu, final, vectors_committed, vecs_tmp, vecs_final,
                             tids_gen, cagra_fd >= 0 ? cagra_tmp : NULL, cagra_fd,
                             cagra_fd >= 0 ? &cagra_layout : NULL);
+        if (root.fd >= 0)
+            close(root.fd);
         return;   /* new_tids ownership passed to the registry */
     }
 
 fail:
+    if (root.fd >= 0)
+        close(root.fd);
     for (int j = 0; j < nmapped; j++)
         munmap(maps[j], map_lens[j]);
     free(new_tids);
@@ -9649,6 +9995,7 @@ handle_mark_stale(int client_fd, const CuvsCmdFrame *cmd)
     IndexEntry *e = find_index(cmd->db_oid, cmd->index_oid);
     if (e && !e->stale)
     {
+        e->extra_search_generation = 0;
         e->stale = 1;
         e->stale_since = now;
     }
@@ -10145,6 +10492,465 @@ client_gone(void *arg)
     if (p.revents & (POLLHUP | POLLERR | POLLRDHUP | POLLNVAL))
         return 1;
     return (p.revents & POLLIN) && recv(fd, &c, 1, MSG_PEEK | MSG_DONTWAIT) == 0;
+}
+
+/* Opcode 58 alone has bounded inline I/O. The backend owns its own deadline
+ * across both connections; this local bound starts after the v6 frame. */
+static uint32_t
+extra_search_io(int fd, void *buf, size_t len, bool sending, uint64_t deadline)
+{
+    char *p = buf;
+    while (len > 0)
+    {
+        uint64_t now = admission_mono_us();
+        if (now >= deadline)
+            return CUVS_EXTRA_SEARCH_DEADLINE;
+
+        ssize_t n = sending ? send(fd, p, len, MSG_DONTWAIT) : recv(fd, p, len, MSG_DONTWAIT);
+        if (n > 0)
+        {
+            p += n;
+            len -= (size_t) n;
+        }
+        else if (n == 0)
+            return CUVS_STATUS_CANCELED;
+        else if (errno == EAGAIN || errno == EWOULDBLOCK)
+        {
+            struct pollfd pollfd = {.fd = fd, .events = sending ? POLLOUT : POLLIN};
+            if (poll(&pollfd, 1, (int) ((deadline - now + 999) / 1000)) < 0 && errno != EINTR)
+                return CUVS_STATUS_ERROR;
+        }
+        else if (errno != EINTR)
+            return CUVS_STATUS_ERROR;
+    }
+    return CUVS_STATUS_OK;
+}
+
+typedef struct ExtraSearchControl {
+    int client_fd;
+    uint64_t deadline_us;
+    uint32_t stop_status;
+} ExtraSearchControl;
+
+typedef struct ExtraSearchWork {
+    uint32_t ann_started, ann_completed;
+    uint32_t chunks_started, chunks_completed;
+    uint32_t rows_started, rows_completed;
+} ExtraSearchWork;
+
+/* The status is sticky for the wrapper's pre-submit callback. */
+static int
+extra_search_stop(void *arg)
+{
+    ExtraSearchControl *control = arg;
+
+    if (control->stop_status == CUVS_STATUS_OK)
+    {
+        if (client_gone(&control->client_fd))
+            control->stop_status = CUVS_STATUS_CANCELED;
+        else if (admission_mono_us() >= control->deadline_us)
+            control->stop_status = CUVS_EXTRA_SEARCH_DEADLINE;
+    }
+    return control->stop_status != CUVS_STATUS_OK;
+}
+
+static uint32_t
+extra_search_wait_lock(ExtraSearchControl *control)
+{
+    for (;;)
+    {
+        if (extra_search_stop(control))
+            return control->stop_status;
+        int rc = pthread_mutex_trylock(&g_index_mutex);
+        if (rc == 0)
+            return CUVS_STATUS_OK;
+        if (rc != EBUSY)
+            return CUVS_STATUS_ERROR;
+        uint64_t now = admission_mono_us();
+        if (now >= control->deadline_us)
+            continue;
+        uint64_t left_us = control->deadline_us - now;
+        struct pollfd pollfd = {.fd = control->client_fd, .events = POLLRDHUP};
+        (void) poll(&pollfd, 1, left_us >= 5000 ? 5 : (int) ((left_us + 999) / 1000));
+    }
+}
+
+/* The server and backend can discover state from sidecars. A dangling
+ * symlink, inaccessible directory, or unexpected stat error is not absence. */
+static bool
+extra_search_clean(const IndexEntry *e)
+{
+    static const char *suffix[] = {"delta", "stale", "tombstone", "shards"};
+    struct stat st;
+    char name[64];
+    bool clean = false;
+
+    if (e->stale || e->delta_idx || e->n_delta != 0 || !e->extra_search_default_dir)
+        return false;
+    int fd = open(g_index_dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (fd < 0)
+        return false;
+    if (fstat(fd, &st) != 0 || st.st_dev != e->extra_search_dir_dev ||
+        st.st_ino != e->extra_search_dir_ino)
+        goto done;
+
+    for (size_t i = 0; i < sizeof(suffix) / sizeof(suffix[0]); i++)
+    {
+        snprintf(name, sizeof(name), "%u_%u.%s", e->db_oid, e->index_oid, suffix[i]);
+        if (fstatat(fd, name, &st, AT_SYMLINK_NOFOLLOW) == 0 || errno != ENOENT)
+            goto done;
+    }
+    clean = true;
+done:
+    close(fd);
+    return clean;
+}
+
+/* Caller holds g_index_mutex. Once work was submitted this request must
+ * never be interpreted as eligible to fall back to the ordinary search. */
+static uint32_t
+extra_search_source(IndexEntry *e, const CuvsCmdFrame *cmd,
+                    const CuvsExtraSearchRequest *request, bool dispatched,
+                    const char **error)
+{
+    uint32_t unavailable = dispatched ? CUVS_STATUS_STALE : CUVS_EXTRA_SEARCH_UNSUPPORTED;
+
+    if (request->generation && (!e || request->generation != e->extra_search_generation))
+    {
+        *error = "resident CAGRA generation changed";
+        return CUVS_EXTRA_SEARCH_GENERATION;
+    }
+    if (!e || !entry_is_cagra_single(e) || !e->tids ||
+        e->metric != CUVS_METRIC_L2 || e->dim != cmd->dim ||
+        !cuvs_cagra_extra_search_supported(e->handle, e->n_vecs, (int) cmd->dim))
+    {
+        *error = "no compatible resident legacy CAGRA L2 index";
+        return unavailable;
+    }
+    if (!request->dir_ino || request->dir_dev != (uint64_t) e->extra_search_dir_dev ||
+        request->dir_ino != (uint64_t) e->extra_search_dir_ino)
+    {
+        *error = "the backend and daemon use different sidecar directories";
+        return unavailable;
+    }
+    if (!extra_search_clean(e))
+    {
+        e->extra_search_generation = 0;
+        *error = dispatched ? "legacy CAGRA sidecars changed during search" :
+                              "legacy CAGRA sidecars are not clean";
+        return unavailable;
+    }
+    return CUVS_STATUS_OK;
+}
+
+static uint32_t
+extra_search_initial(const CuvsCmdFrame *cmd, const CuvsExtraSearchRequest *request,
+                     const float *query, ExtraSearchControl *control, uint64_t started,
+                     ExtraSearchWork *work, CuvsExtraSearchReply *details,
+                     CuvsReplyHeader *reply, CuvsResult *results, const char **error)
+{
+    CuvsSearchResult raw[CUVS_EXTRA_SEARCH_MAX_K];
+    uint32_t status = extra_search_wait_lock(control);
+    if (status != CUVS_STATUS_OK)
+        return status;
+
+    IndexEntry *e = find_index(cmd->db_oid, cmd->index_oid);
+    status = extra_search_source(e, cmd, request, false, error);
+    if (status != CUVS_STATUS_OK)
+        goto unlock;
+    if (request->max_components != 0)
+    {
+        status = CUVS_EXTRA_SEARCH_BUDGET;
+        *error = "the initial search requires a zero component budget";
+        goto unlock;
+    }
+    if (extra_search_stop(control))
+    {
+        status = control->stop_status;
+        goto unlock;
+    }
+
+    work->ann_started = 1;
+    int rc = cuvs_cagra_search(e->handle, query, (int) cmd->dim, (int) cmd->k, raw,
+                               (int) e->gpu_device_id, cmd->itopk_size, cmd->search_width);
+    work->ann_completed = rc == 0;
+    if (extra_search_stop(control))
+    {
+        status = control->stop_status;
+        goto unlock;
+    }
+    if (rc != 0)
+    {
+        /* Match ordinary SEARCH's dimension vs transient failure split. */
+        status = rc == 2 ? CUVS_STATUS_DIM_MISMATCH : CUVS_EXTRA_SEARCH_ANN_FAILED;
+        *error = rc == 2 ? "query dim != index dim" : "resident CAGRA search failed";
+        goto unlock;
+    }
+
+    /* External writers can change sidecars while the registry is locked. */
+    status = extra_search_source(e, cmd, request, true, error);
+    if (status != CUVS_STATUS_OK)
+        goto unlock;
+    if (!e->extra_search_generation)
+    {
+        uint64_t generation = 0;
+        if (shm_key_random((unsigned char *) &generation, sizeof(generation)) != 0 || !generation)
+        {
+            status = CUVS_STATUS_ERROR;
+            *error = "could not create a resident CAGRA generation";
+            goto unlock;
+        }
+        e->extra_search_generation = generation;
+    }
+    if (extra_search_stop(control))
+    {
+        status = control->stop_status;
+        goto unlock;
+    }
+    details->generation = e->extra_search_generation;
+    reply->n_results = (uint32_t) cagra_finish_one(e, raw, (int) cmd->k, NULL, 0, results, NULL);
+
+    /* One search/hit per successful initial ANN. A supplemental request can
+     * refresh last use but must not add a second hit for the statement. */
+    record_search_stat(e, CUVS_STATUS_OK, (uint32_t) (admission_mono_us() - started), NULL);
+    e->last_requested_k = cmd->k;
+    e->last_returned_k = reply->n_results;
+    e->last_search_mode = 0;
+    e->delta_cpu_last = 0;
+unlock:
+    pthread_mutex_unlock(&g_index_mutex);
+    return status;
+}
+
+typedef struct ExtraSearchCandidate {
+    double distance;
+    uint32_t row;
+} ExtraSearchCandidate;
+
+static int
+extra_search_candidate_cmp(const void *a, const void *b)
+{
+    const ExtraSearchCandidate *left = a, *right = b;
+    if (left->distance < right->distance)
+        return -1;
+    if (left->distance > right->distance)
+        return 1;
+    return (left->row > right->row) - (left->row < right->row);
+}
+
+static uint32_t
+extra_search_supplemental(const CuvsCmdFrame *cmd, const CuvsExtraSearchRequest *request,
+                          const float *query, ExtraSearchControl *control,
+                          ExtraSearchWork *work, CuvsExtraSearchReply *details,
+                          CuvsReplyHeader *reply, CuvsResult *results, const char **error)
+{
+    ExtraSearchCandidate candidates[CUVS_EXTRA_SEARCH_MAX_K + CUVS_EXTRA_SEARCH_CHUNK_ROWS];
+    double distances[CUVS_EXTRA_SEARCH_CHUNK_ROWS];
+    uint32_t total_rows = 0;
+    uint32_t kept = 0;
+    uint32_t chunk_cap = CUVS_EXTRA_SEARCH_CHUNK_COMPONENTS / cmd->dim;
+
+    if (chunk_cap > CUVS_EXTRA_SEARCH_CHUNK_ROWS)
+        chunk_cap = CUVS_EXTRA_SEARCH_CHUNK_ROWS;
+
+    for (;;)
+    {
+        uint32_t status = extra_search_wait_lock(control);
+        if (status != CUVS_STATUS_OK)
+            return status;
+
+        IndexEntry *e = find_index(cmd->db_oid, cmd->index_oid);
+        status = extra_search_source(e, cmd, request, work->chunks_started != 0, error);
+        if (status != CUVS_STATUS_OK)
+        {
+            pthread_mutex_unlock(&g_index_mutex);
+            return status;
+        }
+        if (total_rows == 0)
+        {
+            total_rows = request->max_components / cmd->dim;
+            if (total_rows > CUVS_EXTRA_SEARCH_MAX_ROWS)
+                total_rows = CUVS_EXTRA_SEARCH_MAX_ROWS;
+            if (total_rows > e->n_vecs)
+                total_rows = (uint32_t) e->n_vecs;
+            if (total_rows == 0 || chunk_cap == 0 ||
+                request->max_components > CUVS_EXTRA_SEARCH_MAX_COMPONENTS)
+            {
+                pthread_mutex_unlock(&g_index_mutex);
+                *error = "invalid extra search component budget";
+                return CUVS_EXTRA_SEARCH_BUDGET;
+            }
+        }
+        if (extra_search_stop(control))
+        {
+            pthread_mutex_unlock(&g_index_mutex);
+            return control->stop_status;
+        }
+
+        uint32_t offset = work->rows_completed;
+        if (offset == total_rows)
+        {
+            /* Reached only after reacquiring the registry and checking the
+             * generation and directory again. No TIDs were kept across locks. */
+            for (uint32_t i = 0; i < kept; i++)
+            {
+                results[i].tid = e->tids[candidates[i].row];
+                results[i].distance = (float) candidates[i].distance;
+            }
+            e->last_search = time(NULL);
+            pthread_mutex_unlock(&g_index_mutex);
+            reply->n_results = kept;
+            details->generation = request->generation;
+            details->scored_rows = offset;
+            details->components = offset * cmd->dim;
+            return CUVS_STATUS_OK;
+        }
+
+        uint32_t chunk_rows = total_rows - offset;
+        if (chunk_rows > chunk_cap)
+            chunk_rows = chunk_cap;
+        CuvsExtraSearchProgress progress = {0};
+        CuvsCagraScoreStatus rc = cuvs_cagra_score_range(e->handle, query, (int) cmd->dim,
+            offset, chunk_rows, distances, (int) e->gpu_device_id,
+            extra_search_stop, control, &progress);
+        pthread_mutex_unlock(&g_index_mutex);
+
+        if (progress.submitted)
+        {
+            work->chunks_started++;
+            work->rows_started += chunk_rows;
+        }
+        if (progress.completed)
+        {
+            work->chunks_completed++;
+            work->rows_completed += chunk_rows;
+        }
+        if (rc == CUVS_CAGRA_SCORE_STOPPED || extra_search_stop(control))
+            return control->stop_status;
+        if (rc != CUVS_CAGRA_SCORE_OK || !progress.completed)
+        {
+            *error = "resident CAGRA scoring failed";
+            return CUVS_STATUS_ERROR;
+        }
+
+        for (uint32_t i = 0; i < chunk_rows; i++)
+        {
+            if (!isfinite(distances[i]))
+            {
+                *error = "nonfinite resident CAGRA distance";
+                return CUVS_STATUS_ERROR;
+            }
+            candidates[kept + i] = (ExtraSearchCandidate) {distances[i], offset + i};
+        }
+        qsort(candidates, kept + chunk_rows, sizeof(*candidates), extra_search_candidate_cmp);
+        kept += chunk_rows;
+        if (kept > cmd->k)
+            kept = cmd->k;
+    }
+}
+
+static void
+handle_search_extra(int client_fd, const CuvsCmdFrame *cmd)
+{
+    uint64_t started = admission_mono_us();
+    const uint64_t receive_cap_us = CUVS_EXTRA_SEARCH_TIMEOUT_MS * UINT64_C(1000);
+    uint64_t deadline = started > UINT64_MAX - receive_cap_us ?
+                        UINT64_MAX : started + receive_cap_us;
+    ExtraSearchControl control = {.client_fd = client_fd, .deadline_us = deadline};
+    ExtraSearchWork work = {0};
+    CuvsExtraSearchRequest request = {0};
+    CuvsExtraSearchReply details = {0};
+    CuvsReplyHeader reply = {0};
+    float query[CUVS_EXTRA_SEARCH_MAX_DIM];
+    CuvsResult results[CUVS_EXTRA_SEARCH_MAX_K] = {0};
+    const char *error = NULL;
+
+    if (cmd->dim == 0 || cmd->dim > CUVS_EXTRA_SEARCH_MAX_DIM ||
+        cmd->k == 0 || cmd->k > CUVS_EXTRA_SEARCH_MAX_K ||
+        cmd->metric != CUVS_METRIC_L2 || cmd->search_mode || cmd->use_cpu_hnsw ||
+        cmd->n_filter_tids || cmd->use_prefilter)
+    {
+        reply.status = CUVS_EXTRA_SEARCH_UNSUPPORTED;
+        error = "unsupported extra search command";
+        goto done;
+    }
+    reply.status = extra_search_io(client_fd, &request, sizeof(request), false, deadline);
+    if (reply.status != CUVS_STATUS_OK)
+        goto done;
+    if (request.version != CUVS_EXTRA_SEARCH_VERSION)
+    {
+        reply.status = CUVS_EXTRA_SEARCH_UNSUPPORTED;
+        error = "unsupported extra search request version";
+        goto done;
+    }
+    if (request.deadline_ms <= 0)
+    {
+        reply.status = CUVS_EXTRA_SEARCH_DEADLINE;
+        error = "invalid extra search deadline";
+        goto done;
+    }
+    /* Compare before multiplying so an outsize wire value cannot wrap. */
+    if ((uint64_t) request.deadline_ms <= deadline / 1000)
+        deadline = (uint64_t) request.deadline_ms * 1000;
+    control.deadline_us = deadline;
+
+    reply.status = extra_search_io(client_fd, query, cmd->dim * sizeof(*query), false, deadline);
+    if (reply.status != CUVS_STATUS_OK)
+        goto done;
+    for (uint32_t d = 0; d < cmd->dim; d++)
+    {
+        if (!isfinite(query[d]))
+        {
+            reply.status = CUVS_STATUS_ERROR;
+            error = "nonfinite extra search query";
+            goto done;
+        }
+    }
+
+    if (request.generation)
+        reply.status = extra_search_supplemental(cmd, &request, query, &control,
+                                                 &work, &details, &reply, results, &error);
+    else
+        reply.status = extra_search_initial(cmd, &request, query, &control, started,
+                                            &work, &details, &reply, results, &error);
+
+done:
+    bool disconnected = client_gone(&client_fd);
+    if (reply.status == CUVS_STATUS_OK && extra_search_stop(&control))
+    {
+        reply.status = control.stop_status;
+        reply.n_results = 0;
+    }
+    if (error)
+        snprintf(reply.error, sizeof(reply.error), "%s", error);
+    reply.latency_us = (uint32_t) (admission_mono_us() - started);
+    uint32_t send_status = CUVS_STATUS_CANCELED;
+    if (!disconnected)
+    {
+        /* Try to get a deadline refusal out even when the request's time
+         * expired. This write never waits for the reader. */
+        if (admission_mono_us() >= deadline)
+            send_status = send(client_fd, &reply, sizeof(reply), MSG_DONTWAIT) == (ssize_t) sizeof(reply)
+                          ? CUVS_STATUS_OK : CUVS_EXTRA_SEARCH_DEADLINE;
+        else
+            send_status = extra_search_io(client_fd, &reply, sizeof(reply), true, deadline);
+        if (send_status == CUVS_STATUS_OK && reply.status == CUVS_STATUS_OK)
+        {
+            send_status = extra_search_io(client_fd, &details, sizeof(details), true, deadline);
+            if (send_status == CUVS_STATUS_OK)
+                send_status = extra_search_io(client_fd, results,
+                                               reply.n_results * sizeof(*results), true, deadline);
+        }
+    }
+    LOG_INFO("[extra_search] db=%u idx=%u phase=%s status=%u send_status=%u k=%u "
+             "dim=%u max_components=%u ann_started=%u ann_completed=%u "
+             "chunks_started=%u chunks_completed=%u rows_started=%u rows_completed=%u "
+             "scored_rows=%u components=%u n_results=%u latency_us=%u\n",
+             cmd->db_oid, cmd->index_oid, request.generation ? "extra" : "first",
+             reply.status, send_status, cmd->k, cmd->dim, request.max_components,
+             work.ann_started, work.ann_completed, work.chunks_started, work.chunks_completed,
+             work.rows_started, work.rows_completed, work.rows_completed,
+             work.rows_completed * cmd->dim, reply.n_results, reply.latency_us);
 }
 
 /* ----------------------------------------------------------------
@@ -11289,6 +12095,11 @@ handle_extend(int client_fd, const CuvsCmdFrame *cmd)
         return;
     }
 
+    /* Even a failed EXTEND can have changed storage in place. */
+    e->extra_search_generation = 0;
+    if (index_dir[0] && (strnlen(index_dir, sizeof(index_dir)) == sizeof(index_dir) ||
+                        strcmp(index_dir, g_index_dir) != 0))
+        e->extra_search_default_dir = 0;
     int64_t  old_n = e->n_vecs;
     int64_t  n_new = cmd->n_vecs;
 
@@ -11525,6 +12336,9 @@ handle_compact(int client_fd, const CuvsCmdFrame *cmd)
                               "GPU physical memory pressure; retry later", &physical_rej);
         return;
     }
+    e->extra_search_generation = 0;
+    if (strcmp(save_dir, g_index_dir) != 0)
+        e->extra_search_default_dir = 0;
     int ivfpq_retry = 0;
     CuvsCagraIndex new_handle = cuvs_cagra_compact(
         e->handle, keep_bits, n_vecs, e->metric, (int)e->gpu_device_id, &ivfpq_retry);
@@ -13743,6 +14557,9 @@ connection_thread(void *arg)
     {
         case CUVS_OP_SEARCH:
             handle_search(client_fd, &cmd);
+            break;
+        case CUVS_OP_SEARCH_EXTRA:
+            handle_search_extra(client_fd, &cmd);
             break;
         case CUVS_OP_SEARCH_BATCH:
             handle_search_batch(client_fd, &cmd);

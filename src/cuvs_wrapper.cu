@@ -1697,6 +1697,100 @@ cuvs_cagra_search(
     }
 }
 
+extern "C" int
+cuvs_cagra_extra_search_supported(CuvsCagraIndex index, int64_t n_vecs, int dim)
+{
+    if (!index || n_vecs <= 0 || dim <= 0)
+        return 0;
+
+    const auto &idx = static_cast<CuvsCagraIndexImpl *>(index)->idx;
+    if (idx.metric() != cuvs_distance_type(CUVS_METRIC_L2) ||
+        idx.dataset_fd().has_value() || idx.graph_fd().has_value() ||
+        idx.source_indices().has_value() || idx.mapping_fd().has_value())
+        return 0;
+
+    const auto dataset = idx.dataset();
+    const auto graph = idx.graph();
+    return dataset.data_handle() && graph.data_handle() &&
+           graph.extent(0) == n_vecs && dataset.extent(0) == n_vecs &&
+           dataset.extent(1) == dim && dataset.stride(0) >= dim &&
+           dataset.stride(1) == 1;
+}
+
+static __global__ void
+cagra_extra_l2(const float *dataset, int64_t stride, const float *query,
+               int dim, uint32_t rows, double *distances)
+{
+    uint32_t row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= rows)
+        return;
+
+    const float *vec = dataset + (int64_t) row * stride;
+    double distance = 0.0;
+    for (int d = 0; d < dim; d++) {
+        double diff = (double) vec[d] - query[d];
+        distance += diff * diff;
+    }
+    distances[row] = distance;
+}
+
+extern "C" CuvsCagraScoreStatus
+cuvs_cagra_score_range(CuvsCagraIndex index, const float *query, int dim,
+                       uint32_t offset, uint32_t rows, double *distances,
+                       int device_id, CuvsExtraSearchStop stop, void *stop_arg,
+                       CuvsExtraSearchProgress *progress)
+{
+    *progress = {};
+    if (!index || dim <= 0 || rows == 0 || rows > CUVS_EXTRA_SEARCH_CHUNK_ROWS ||
+        rows > CUVS_EXTRA_SEARCH_CHUNK_COMPONENTS / (uint32_t) dim ||
+        offset > CUVS_EXTRA_SEARCH_MAX_ROWS - rows)
+        return CUVS_CAGRA_SCORE_ERROR;
+
+    const auto &idx = static_cast<CuvsCagraIndexImpl *>(index)->idx;
+    if (offset + rows > idx.size() || !cuvs_cagra_extra_search_supported(index, idx.size(), dim))
+        return CUVS_CAGRA_SCORE_ERROR;
+    if (stop(stop_arg))
+        return CUVS_CAGRA_SCORE_STOPPED;
+
+    const auto dataset = idx.dataset();
+    const float *first_row = dataset.data_handle() + (int64_t) offset * dataset.stride(0);
+    std::unique_ptr<PooledRes> resources;
+    try {
+        resources = std::make_unique<PooledRes>(device_id);
+        auto &res = resources->get();
+        auto d_query = raft::make_device_vector<float, int64_t>(res, dim);
+        auto d_distances = raft::make_device_vector<double, int64_t>(res, rows);
+        if (stop(stop_arg))
+            return CUVS_CAGRA_SCORE_STOPPED;
+        raft::copy(d_query.data_handle(), query, dim, res.get_stream());
+        if (stop(stop_arg)) {
+            res.sync_stream();
+            return CUVS_CAGRA_SCORE_STOPPED;
+        }
+        constexpr uint32_t threads = 128;
+        cagra_extra_l2<<<(rows + threads - 1) / threads, threads, 0, res.get_stream().value()>>>(
+            first_row, dataset.stride(0), d_query.data_handle(), dim, rows,
+            d_distances.data_handle());
+        RAFT_CUDA_TRY(cudaGetLastError());
+        progress->submitted = 1;
+        raft::copy(distances, d_distances.data_handle(), rows, res.get_stream());
+        res.sync_stream();
+        progress->completed = 1;
+        resources->fence_check();
+        return CUVS_CAGRA_SCORE_OK;
+    } catch (const std::exception &e) {
+        fprintf(stderr, "[cuvs_cagra_score_range] exception: %s\n", e.what());
+    } catch (...) {
+        fprintf(stderr, "[cuvs_cagra_score_range] unknown exception\n");
+    }
+    if (resources) {
+        if (cudaStreamSynchronize(resources->get().get_stream().value()) == cudaSuccess)
+            progress->completed = progress->submitted;
+        resources->poison();
+    }
+    return CUVS_CAGRA_SCORE_ERROR;
+}
+
 /* ----------------------------------------------------------------
  * Phase 3M: batched search — Q queries in one GPU dispatch.
  * queries is Q*dim row-major; results is Q*top_k row-major

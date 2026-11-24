@@ -396,6 +396,45 @@ cuvs_cagra_search(CuvsCagraIndex index, const float *query_vec, int dim,
 }
 
 int
+cuvs_cagra_extra_search_supported(CuvsCagraIndex index, int64_t n_vecs, int dim)
+{
+    const ShimIndex *ix = (const ShimIndex *) index;
+    return ix && ix->vecs && n_vecs > 0 && dim > 0 &&
+           ix->metric == CUVS_METRIC_L2 && ix->n == n_vecs && ix->dim == dim;
+}
+
+CuvsCagraScoreStatus
+cuvs_cagra_score_range(CuvsCagraIndex index, const float *query, int dim,
+                       uint32_t offset, uint32_t rows, double *distances,
+                       int device_id, CuvsExtraSearchStop stop, void *stop_arg,
+                       CuvsExtraSearchProgress *progress)
+{
+    const ShimIndex *ix = (const ShimIndex *) index;
+    (void) device_id;
+    *progress = (CuvsExtraSearchProgress) {0};
+    if (!ix || dim <= 0 || rows == 0 || rows > CUVS_EXTRA_SEARCH_CHUNK_ROWS ||
+        rows > CUVS_EXTRA_SEARCH_CHUNK_COMPONENTS / (uint32_t) dim ||
+        offset > CUVS_EXTRA_SEARCH_MAX_ROWS - rows ||
+        offset + rows > ix->n || !cuvs_cagra_extra_search_supported(index, ix->n, dim))
+        return CUVS_CAGRA_SCORE_ERROR;
+    if (stop(stop_arg))
+        return CUVS_CAGRA_SCORE_STOPPED;
+
+    progress->submitted = 1;
+    for (uint32_t row = 0; row < rows; row++) {
+        const float *vec = ix->vecs + (size_t) (offset + row) * dim;
+        double distance = 0.0;
+        for (int d = 0; d < dim; d++) {
+            double diff = (double) vec[d] - query[d];
+            distance += diff * diff;
+        }
+        distances[row] = distance;
+    }
+    progress->completed = 1;
+    return CUVS_CAGRA_SCORE_OK;
+}
+
+int
 cuvs_cagra_search_filtered(CuvsCagraIndex index, const float *query_vec, int dim,
                            int top_k, const uint32_t *bitset_words,
                            int64_t bitset_bits, CuvsSearchResult *results,
