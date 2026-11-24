@@ -33,6 +33,7 @@ void cuvs_cagra_require_legacy(Relation index);
 #define CUVS_CAGRA_PAGE_EXTENT 64
 #define CUVS_CAGRA_PAGE_DIR 1950
 #define CUVS_CAGRA_TIDS_PER_PAGE 1357
+#define CUVS_CAGRA_SLOTS_PER_EXTENT (CUVS_CAGRA_PAGE_EXTENT * CUVS_CAGRA_TIDS_PER_PAGE)
 #define CUVS_CAGRA_PENDING_PER_PAGE 1356
 #define CUVS_CAGRA_PENDING_VECTOR 2U
 
@@ -126,6 +127,19 @@ CuvsCagraSlotResult cuvs_cagra_pending_tid(Relation index, const CuvsCagraMeta *
                                          uint64 position, ItemPointer tid);
 CuvsCagraSlotResult cuvs_cagra_slot_tid(Relation index, const CuvsCagraMeta *meta,
                                       BlockNumber nblocks, uint64 slot, ItemPointer tid);
+
+typedef struct CuvsCagraSlotExtent
+{
+    uint64 index_nonce;
+    uint64 base_nonce;
+    uint64 delete_generation;
+    uint32 count;
+} CuvsCagraSlotExtent;
+
+/* Caller holds the index lock and supplies one extent of private storage.
+ * A valid stamp describes only the populated prefix. Discard the copy on false. */
+bool cuvs_cagra_copy_slot_extent(Relation index, uint32 extent, ItemPointer tids,
+                               CuvsCagraSlotExtent *stamp);
 bool cuvs_cagra_slot_filter(Relation index, const CuvsCagraMeta *meta,
                             BlockNumber nblocks, const uint64 *roots, int nroots,
                             uint32 *excluded);
@@ -142,7 +156,7 @@ IndexBulkDeleteResult *cuvs_cagra_page_bulkdelete(IndexVacuumInfo *info,
 IndexBulkDeleteResult *cuvs_cagra_page_vacuumcleanup(IndexVacuumInfo *info,
     IndexBulkDeleteResult *stats);
 #ifdef CUVS_TEST_HOOKS
-void cuvs_cagra_vacuum_init_test_hook(void);
+void cuvs_cagra_pages_init_test_hooks(void);
 #endif
 #endif
 

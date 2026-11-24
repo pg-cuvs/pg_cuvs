@@ -1242,7 +1242,7 @@ _PG_init(void)
 #ifdef CUVS_PAGE_FORMAT
     cuvs_page_preloaded = process_shared_preload_libraries_in_progress;
 #ifdef CUVS_TEST_HOOKS
-    cuvs_cagra_vacuum_init_test_hook();
+    cuvs_cagra_pages_init_test_hooks();
 #endif
 #endif
     /* Phase 3K: register pg_cuvs_hnsw WITH(source, mode, ...) reloptions. */

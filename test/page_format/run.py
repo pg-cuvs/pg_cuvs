@@ -553,6 +553,11 @@ FOLD_PUBLISH_SQL = """
     AS '$libdir/pg_cuvs','cuvs_test_fold_publish' LANGUAGE C STRICT VOLATILE PARALLEL UNSAFE;
 """
 
+SLOT_EXTENT_SQL = """
+    CREATE FUNCTION pg_temp.slot_extent(regclass,integer,integer) RETURNS text
+    AS '$libdir/pg_cuvs','cuvs_test_slot_extent' LANGUAGE C STRICT VOLATILE PARALLEL UNSAFE;
+"""
+
 
 def fold_query(cluster, db, label, sql):
     cluster.sql(db, label, "-qAt", "-c", sql)
@@ -692,8 +697,96 @@ def check_fold_extent_reuse(cluster, db):
     last_page = fold_raw_page(cluster, db, second_extent + 63, "fold_extent_idx")
     if struct.unpack_from("=II", last_page) == (0, 0):
         raise RuntimeError("WAL did not reserve the full extent on a fresh standby")
+    for extent, offset, count, row_id in ((0, 86847, 86848, 100001), (1, 0, 1358, 100002)):
+        copied = fold_query(cluster, db, f"fold-extent-snapshot-{extent}", SLOT_EXTENT_SQL + f"""
+            SELECT split_part(copied,'|',1) || '|' ||
+                   (split_part(copied,'|',3) = ctid::text)::text
+            FROM (SELECT pg_temp.slot_extent('fold_extent_idx',{extent},{offset}) AS copied) AS s,
+                 fold_extent WHERE id={row_id};
+        """)
+        if copied != f"{count}|true":
+            raise RuntimeError(f"slot extent snapshot crossed its extent boundary: {copied}")
     cluster.sql(db, "fold-extent-vacuum", "-c", "VACUUM (INDEX_CLEANUP ON, TRUNCATE OFF) fold_extent;")
     print("Fold extent rollover and reuse: PASS", flush=True)
+
+
+def check_slot_extent_snapshot(cluster):
+    db = "slot_extent"
+    cluster.run("createdb", [db], "createdb-slot-extent")
+    cluster.sql(db, "slot-extent-setup", "-c", """
+        CREATE EXTENSION vector;
+        CREATE EXTENSION pg_cuvs;
+        CREATE TABLE slot_extent(id integer PRIMARY KEY, v vector(3));
+        INSERT INTO slot_extent SELECT i, ARRAY[i::real,0,0]::vector FROM generate_series(1,1358) i;
+        CREATE INDEX slot_extent_idx ON slot_extent USING cagra(v vector_l2_ops);
+        INSERT INTO slot_extent VALUES (2000,'[0,0,1]');
+    """)
+    def copy_sql(extent, offset):
+        return SLOT_EXTENT_SQL + f"""
+            SELECT coalesce(pg_temp.slot_extent('slot_extent_idx',{extent},{offset}),'rejected');
+        """
+
+    first = fold_query(cluster, db, "slot-extent-first", copy_sql(0, 0)).split("|")
+    last = fold_query(cluster, db, "slot-extent-last", copy_sql(0, 1357)).split("|")
+    tids = fold_query(cluster, db, "slot-extent-heap-tids", """
+        SELECT string_agg(ctid::text, '|' ORDER BY id) FROM slot_extent WHERE id IN (1,1358);
+    """).split("|")
+    if (len(first) != 3 or len(last) != 3 or len(tids) != 2 or
+            first != ["1358", last[1], tids[0]] or last != ["1358", first[1], tids[1]]):
+        raise RuntimeError(f"extent snapshot did not copy the published cross-page prefix: {first}, {last}")
+    for extent, offset in ((-1, 0), (1, 0), (0, 1358)):
+        if fold_query(cluster, db, f"slot-extent-bounds-{extent}-{offset}", copy_sql(extent, offset)) != "rejected":
+            raise RuntimeError(f"extent snapshot accepted an unpublished slot: {extent}, {offset}")
+
+    # The reader starts after DELETE so its snapshot permits VACUUM to clear
+    # the dead TID. Hold the copy between V1 and V2 while VACUUM advances G.
+    cluster.sql(db, "slot-extent-delete", "-c", "DELETE FROM slot_extent WHERE id=1;")
+    with subprocess.Popen(["psql", "-XqAt", "-v", "ON_ERROR_STOP=1", "-d", db],
+                          stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                          env=cluster.env, text=True) as gate:
+        try:
+            gate.stdin.write("SELECT 'locked' FROM pg_advisory_lock(523091::bigint);\n")
+            gate.stdin.flush()
+            if not select.select([gate.stdout], [], [], 10)[0] or gate.stdout.readline().strip() != "locked":
+                raise RuntimeError("could not hold the slot extent test gate")
+            output = cluster.logs / "slot-extent-paused-copy.log"
+            with output.open("w") as log, subprocess.Popen(
+                ["psql", "-XqAt", "-v", "ON_ERROR_STOP=1", "-d", db,
+                 "-c", "SET cuvs.test_pause_slot_extent=on;", "-c", copy_sql(0, 0)],
+                stdout=log, stderr=subprocess.STDOUT,
+                env={**cluster.env, "PGAPPNAME": "slot-extent-copy"},
+            ) as reader:
+                try:
+                    for _ in range(120):
+                        waiting = fold_query(cluster, db, "slot-extent-waiting", """
+                            SELECT count(*) FROM pg_locks l JOIN pg_stat_activity a USING (pid)
+                            WHERE a.application_name='slot-extent-copy' AND l.locktype='advisory'
+                              AND l.classid=0 AND l.objid=523091 AND l.objsubid=1 AND NOT l.granted;
+                        """)
+                        if waiting == "1":
+                            break
+                        if reader.poll() is not None:
+                            raise RuntimeError(output.read_text())
+                        time.sleep(0.05)
+                    else:
+                        raise RuntimeError("slot extent copy did not reach its second metapage read")
+                    cluster.sql(db, "slot-extent-vacuum", "-c",
+                                "VACUUM (INDEX_CLEANUP ON, TRUNCATE OFF) slot_extent;")
+                finally:
+                    gate.stdin.close()
+                    gate.wait(timeout=10)
+                if reader.wait(timeout=10) != 0 or output.read_text().strip() != "rejected":
+                    raise RuntimeError(f"slot extent snapshot accepted a different generation: {output.read_text()}")
+        finally:
+            if gate.poll() is None:
+                gate.kill()
+                gate.wait(timeout=5)
+
+    after = fold_query(cluster, db, "slot-extent-after-vacuum", copy_sql(0, 0))
+    if after != f"1358|{int(first[1])+1}|dead":
+        raise RuntimeError(f"slot extent snapshot did not copy the new VACUUM generation: {after}")
+    print("Slot extent snapshot: published prefix, cross-page TIDs and concurrent VACUUM fence: PASS",
+          flush=True)
 
 
 def check_slots(cluster, source):
@@ -1007,6 +1100,7 @@ def run(work, logs):
             cluster.run("createdb", ["beta3a_fold_publish"], "createdb-beta3a-fold-publish")
             check_fold_publish(cluster, "beta3a_fold_publish")
             check_fold_extent_reuse(cluster, "beta3a_fold_publish")
+            check_slot_extent_snapshot(cluster)
             check_slots(cluster, source_on)
             cluster.file("postgres", "pending_overlay_scan")
             cluster.file("beta1a", "beta1a_rollback")
@@ -1157,6 +1251,7 @@ def run_slots_only(work, logs):
             check_fold_prepare_fcl_release(cluster, "beta3a_fold_prepare")
             cluster.run("createdb", ["beta3a_fold_publish"], "createdb-beta3a-fold-publish")
             check_fold_publish(cluster, "beta3a_fold_publish")
+            check_slot_extent_snapshot(cluster)
         finally:
             cluster.stop()
     check_overlay_budget(Cluster(work / "budget", bindir, logs), source)
