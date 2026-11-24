@@ -1,0 +1,11 @@
+\set ECHO none
+t
+ERROR:  pg_cuvs: source CAGRA index "hsm_trunc_c" does not match the current heap generation
+HINT:  REINDEX the source CAGRA index before converting it, or build the HNSW index from the heap.
+t
+0
+t
+t
+t
+t
+t

@@ -178,6 +178,14 @@ exists for 0.9.0.
   The planner flags now pass it, as the SDK's own build does. Builds without the
   planner are unchanged. 0.9.1 and 0.9.2 have the same defect.
 
+### Upgrading
+
+- When rebuilding an existing source-based HNSW index during PostgreSQL table
+  maintenance, an unusable CAGRA source falls back to a pgvector heap build.
+  Explicit conversions require matching definitions and the current heap
+  generation. The deprecated conversion function blocks table writes through
+  transaction end.
+
 ## [0.9.2] - 2026-11-15
 
 Micro-batched index scans no longer fail with 64 or more concurrent clients

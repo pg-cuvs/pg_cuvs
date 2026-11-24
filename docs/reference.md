@@ -522,6 +522,13 @@ the same index key and predicate as the source. A cast of the same vector key
 to `halfvec` is supported. The deprecated `pg_cuvs_build_hnsw()` function creates
 its target with the source key and predicate.
 
+During a regular `REINDEX` or table maintenance that rebuilds an existing
+index, pgvector builds the target from the current heap if the CAGRA source
+has pending changes, belongs to a previous heap generation, or cannot supply
+a matching file export. The stored `source` option is preserved. Explicit
+source conversions still require a verified source. The deprecated function
+holds a table lock that blocks writes until its transaction ends.
+
 The `hnswlib_file` mode requires a build-time binding to the source CAGRA's TID
 file. A source mutation invalidates that binding. For an older or copied
 `.hnsw` file whose binding cannot be verified, run `REINDEX` after setting

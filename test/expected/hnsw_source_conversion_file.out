@@ -9,3 +9,7 @@ Limit
         Order By: (v <-> '[500,500,500]'::vector)
 1000
 1000
+Limit
+  ->  Index Scan using hsc_file_dst on hsc_file
+        Order By: (v <-> '[500,500,500]'::vector)
+1000

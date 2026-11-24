@@ -43,4 +43,18 @@ RESET enable_seqscan;
 SET enable_indexscan = off;
 SET enable_bitmapscan = off;
 SELECT id FROM hsc_file ORDER BY v <-> '[500,500,500]' LIMIT 1;
+RESET enable_indexscan;
+RESET enable_bitmapscan;
+DROP INDEX hsc_file_nsw;
+
+-- REINDEX TABLE can rebuild the CAGRA source with fallback disabled, leaving
+-- no current on-disk HNSW export for the dependent target to import.
+REINDEX INDEX hsc_file_src;
+CREATE INDEX hsc_file_dst ON hsc_file USING pg_cuvs_hnsw (v vector_l2_ops)
+    WITH (source = hsc_file_src, mode = 'hnswlib_file');
+RESET cuvs.cpu_hnsw_fallback;
+REINDEX TABLE hsc_file;
+SET enable_seqscan = off;
+EXPLAIN (COSTS OFF) SELECT id FROM hsc_file ORDER BY v <-> '[500,500,500]' LIMIT 1;
+SELECT id FROM hsc_file ORDER BY v <-> '[500,500,500]' LIMIT 1;
 DROP TABLE hsc_file;

@@ -4434,9 +4434,9 @@ hnsw_require_legacy_cagra_source(Relation source)
 
 /* A pending file with a valid empty header contains no work. Treat missing
  * files as empty, but refuse files whose emptiness cannot be established. */
-static void
-hnsw_require_empty_pending_file(Relation source, const char *stem,
-                                const char *suffix)
+static bool
+hnsw_pending_file_empty(const char *stem,
+                        const char *suffix)
 {
     char path[MAXPGPATH];
     struct stat st;
@@ -4448,7 +4448,7 @@ hnsw_require_empty_pending_file(Relation source, const char *stem,
                         errmsg("pg_cuvs: CAGRA source path is too long")));
     file = AllocateFile(path, PG_BINARY_R);
     if (file == NULL && errno == ENOENT)
-        return;
+        return true;
     if (file != NULL)
     {
         if (fstat(fileno(file), &st) == 0 && S_ISREG(st.st_mode))
@@ -4470,49 +4470,87 @@ hnsw_require_empty_pending_file(Relation source, const char *stem,
         }
         FreeFile(file);
     }
-    if (!empty)
-        ereport(ERROR,
-                (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-                 strcmp(suffix, "delta") == 0
-                 ? errmsg("pg_cuvs: source CAGRA index \"%s\" has pending inserts or an unreadable delta file",
-                          RelationGetRelationName(source))
-                 : errmsg("pg_cuvs: source CAGRA index \"%s\" has pending deletes or an unreadable tombstone file",
-                          RelationGetRelationName(source)),
-                 errhint("REINDEX the source CAGRA index before converting it, or build the HNSW index from the heap.")));
+    return empty;
 }
 
-static void
-hnsw_check_cagra_source(Relation source)
+static const char *
+hnsw_cagra_source_problem(Relation source, Relation heap)
 {
     char stem[MAXPGPATH];
     char path[MAXPGPATH];
     struct stat st;
+    FILE *file;
+    uint32 heap_rfn, table_oid;
+    bool same_heap;
 
     hnsw_require_legacy_cagra_source(source);
     if (!source->rd_index->indisvalid || !source->rd_index->indislive)
-        ereport(ERROR,
-                (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-                 errmsg("pg_cuvs: source CAGRA index \"%s\" is not valid", RelationGetRelationName(source)),
-                 errhint("Use a valid CAGRA index or build the HNSW index from the heap.")));
+        return "is not valid";
 
-    if (snprintf(stem, sizeof(stem), "%s/%u_%u", cuvs_resolve_index_dir_rel(source),
-                 MyDatabaseId, RelationGetRelid(source)) >= sizeof(stem) ||
-        snprintf(path, sizeof(path), "%s.stale", stem) >= sizeof(path))
+    if ((size_t) snprintf(stem, sizeof(stem), "%s/%u_%u",
+                          cuvs_resolve_index_dir_rel(source), MyDatabaseId,
+                          RelationGetRelid(source)) > sizeof(path) - sizeof(".relfilenode"))
         ereport(ERROR, (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
                         errmsg("pg_cuvs: CAGRA source path is too long")));
+    snprintf(path, sizeof(path), "%s.stale", stem);
     if (stat(path, &st) == 0)
-        ereport(ERROR,
-                (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-                 errmsg("pg_cuvs: source CAGRA index \"%s\" is stale", RelationGetRelationName(source)),
-                 errhint("REINDEX the source CAGRA index before converting it, or build the HNSW index from the heap.")));
+        return "is stale";
     if (errno != ENOENT)
-        ereport(ERROR,
-                (errcode_for_file_access(),
-                 errmsg("pg_cuvs: cannot check CAGRA source stale marker \"%s\": %m", path),
-                 errhint("Check the source index directory, or build the HNSW index from the heap.")));
+        return "has an unreadable stale marker";
 
-    hnsw_require_empty_pending_file(source, stem, "delta");
-    hnsw_require_empty_pending_file(source, stem, "tombstone");
+    /* The sidecar describes the heap whose TIDs were exported by CAGRA.
+     * VACUUM FULL and CLUSTER can rebuild the HNSW target before CAGRA. */
+    snprintf(path, sizeof(path), "%s.relfilenode", stem);
+    file = AllocateFile(path, PG_BINARY_R);
+    same_heap = file != NULL &&
+        fscanf(file, "%u %u", &heap_rfn, &table_oid) == 2 &&
+        table_oid == RelationGetRelid(heap) && heap_rfn == heap->rd_rel->relfilenode;
+    if (file != NULL)
+        FreeFile(file);
+    if (!same_heap)
+        return "does not match the current heap generation";
+
+    if (!hnsw_pending_file_empty(stem, "delta"))
+        return "has pending inserts or an unreadable delta file";
+    if (!hnsw_pending_file_empty(stem, "tombstone"))
+        return "has pending deletes or an unreadable tombstone file";
+    return NULL;
+}
+
+static void
+hnsw_report_source_problem(Relation source, const char *problem)
+{
+    ereport(ERROR,
+            (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+             errmsg("pg_cuvs: source CAGRA index \"%s\" %s",
+                    RelationGetRelationName(source), problem),
+             errhint("REINDEX the source CAGRA index before converting it, or build the HNSW index from the heap.")));
+}
+
+static bool
+hnsw_file_source_available(Relation source)
+{
+    const char *dir = cuvs_resolve_index_dir_rel(source);
+    char graph_path[MAXPGPATH];
+    char tids_path[MAXPGPATH];
+    FILE *graph;
+    FILE *tids;
+    bool available;
+
+    if ((size_t) snprintf(graph_path, sizeof(graph_path), "%s/%u_%u.hnsw",
+                          dir, MyDatabaseId, RelationGetRelid(source)) >= sizeof(graph_path) ||
+        (size_t) snprintf(tids_path, sizeof(tids_path), "%s/%u_%u.tids",
+                          dir, MyDatabaseId, RelationGetRelid(source)) >= sizeof(tids_path))
+        return false;
+    graph = AllocateFile(graph_path, PG_BINARY_R);
+    tids = AllocateFile(tids_path, PG_BINARY_R);
+    available = graph != NULL && tids != NULL &&
+                hnsw_source_binding_matches(graph_path, graph, tids);
+    if (graph != NULL)
+        FreeFile(graph);
+    if (tids != NULL)
+        FreeFile(tids);
+    return available;
 }
 
 /* The existing vector -> halfvec import applies the pgvector cast in the
@@ -4602,7 +4640,9 @@ pg_cuvs_build_hnsw(PG_FUNCTION_ARGS)
         ereport(ERROR,
                 (errmsg("pg_cuvs_build_hnsw: \"%s\" is not a cagra index",
                         get_rel_name(cagra_oid))));
-    hnsw_check_cagra_source(cagra_rel);
+    const char *problem = hnsw_cagra_source_problem(cagra_rel, heap_rel);
+    if (problem != NULL)
+        hnsw_report_source_problem(cagra_rel, problem);
     dim = (int) TupleDescAttr(RelationGetDescr(cagra_rel), 0)->atttypmod;
     graph_degree = cuvs_cagra_reloption_graph_degree(cagra_rel);
     check_hnsw_page_fit(dim, 4, Min(graph_degree, 64) / 2, 5);
@@ -4886,6 +4926,19 @@ pg_cuvs_hnsw_build_info(PG_FUNCTION_ARGS)
  *                               heap with no source dependency. The CAGRA is an
  *                               intermediate build artifact (like a .o), so it
  *                               is dropped — to keep a CAGRA, use source mode. */
+/* A stored source is an accelerator for a rebuild. If it cannot describe
+ * the current heap, pgvector can rebuild the target using its own IndexInfo.
+ * CuvsHnswOptions has the prefix expected by pgvector's ambuild. */
+static IndexBuildResult *
+hnsw_maintenance_build(Relation heap, Relation index, IndexInfo *index_info)
+{
+    IndexAmRoutine *hnsw = GetIndexAmRoutineByAmId(get_am_oid("hnsw", false), false);
+    ambuild_function build = hnsw->ambuild;
+
+    pfree(hnsw);
+    return build(heap, index, index_info);
+}
+
 static IndexBuildResult *
 cuvs_hnsw_ambuild(Relation heapRel, Relation indexRel, IndexInfo *indexInfo)
 {
@@ -4969,6 +5022,16 @@ cuvs_hnsw_ambuild(Relation heapRel, Relation indexRel, IndexInfo *indexInfo)
     }
 
     /* ── Source mode: reuse an existing CAGRA index. ── */
+    bool rebuilding = ReindexIsProcessingIndex(self_oid);
+
+    /* TRUNCATE calls ambuild before any new rows exist. There is no source
+     * graph for that heap, even if the daemon still has the old one. */
+    if (rebuilding && RelationGetNumberOfBlocks(heapRel) == 0)
+    {
+        pfree(result);
+        return hnsw_maintenance_build(heapRel, indexRel, indexInfo);
+    }
+
     /* Resolve source name (schema-qualified, search_path aware) to an OID. */
     Oid cagra_oid = DatumGetObjectId(
         DirectFunctionCall1(regclassin, CStringGetDatum((char *) source_name)));
@@ -5029,14 +5092,35 @@ cuvs_hnsw_ambuild(Relation heapRel, Relation indexRel, IndexInfo *indexInfo)
         }
     }
 
-    hnsw_check_cagra_source(cagra_rel);
-    if (!equal(RelationGetIndexPredicate(cagra_rel),
-               RelationGetIndexPredicate(indexRel)))
+    const char *problem = hnsw_cagra_source_problem(cagra_rel, heapRel);
+    bool predicate_matches = equal(RelationGetIndexPredicate(cagra_rel),
+                                  RelationGetIndexPredicate(indexRel));
+    bool key_matches = predicate_matches && hnsw_source_key_matches(cagra_rel, indexRel);
+    if (rebuilding && problem == NULL)
+    {
+        if (!predicate_matches || !key_matches)
+            problem = "does not match the target definition";
+        else if (strcmp(mode, "hnswlib_file") == 0 &&
+                 !hnsw_file_source_available(cagra_rel))
+            problem = "has no matching HNSW file binding";
+    }
+    if (problem != NULL && rebuilding)
+    {
+        ereport(NOTICE,
+                (errmsg("pg_cuvs_hnsw: rebuilding from the heap because source CAGRA index \"%s\" %s",
+                        RelationGetRelationName(cagra_rel), problem)));
+        index_close(cagra_rel, AccessShareLock);
+        pfree(result);
+        return hnsw_maintenance_build(heapRel, indexRel, indexInfo);
+    }
+    if (problem != NULL)
+        hnsw_report_source_problem(cagra_rel, problem);
+    if (!predicate_matches)
         ereport(ERROR,
                 (errcode(ERRCODE_INVALID_TABLE_DEFINITION),
                  errmsg("pg_cuvs_hnsw: source CAGRA predicate does not match the target"),
                  errhint("Use the same WHERE clause as the source index, or build from the heap without a source.")));
-    if (!hnsw_source_key_matches(cagra_rel, indexRel))
+    if (!key_matches)
         ereport(ERROR,
                 (errcode(ERRCODE_INVALID_TABLE_DEFINITION),
                  errmsg("pg_cuvs_hnsw: source CAGRA index key does not match the target"),
