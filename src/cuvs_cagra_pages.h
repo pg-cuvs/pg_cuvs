@@ -115,8 +115,8 @@ CuvsCagraFoldStatus cuvs_cagra_prepare_fold(Relation index,
                         const CuvsCagraFoldCandidate *candidate,
                         CuvsCagraMeta *base, CuvsCagraPendingLocation *locations);
 
-/* Standalone background worker operation on a WAL-logged index. The caller
- * holds RowExclusiveLock and has verified the candidate's origin and PG life.
+/* Standalone writable background worker operation on a WAL-logged index. The
+ * caller holds RowExclusiveLock and has verified the candidate's origin and PG life.
  * PUBLISHED returns a flushed physical transition LSN and no FCL. That is
  * the first point at which the caller may send FOLD_COMMITTED. */
 CuvsCagraFoldStatus cuvs_cagra_publish_fold(Relation index,

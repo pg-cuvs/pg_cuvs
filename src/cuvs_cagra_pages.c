@@ -851,7 +851,7 @@ cuvs_cagra_publish_fold(Relation index, const CuvsCagraFoldCandidate *candidate,
                         XLogRecPtr *commit_lsn)
 {
     if (!IsBackgroundWorker || !IsTransactionState() || IsTransactionBlock() ||
-        IsSubTransaction() || IsInParallelMode() ||
+        IsSubTransaction() || IsInParallelMode() || XactReadOnly || RecoveryInProgress() ||
         TransactionIdIsValid(GetTopTransactionIdIfAny()))
         ereport(ERROR, (errmsg("CAGRA fold publication requires a standalone background worker operation")));
     return publish_fold(index, candidate, commit_lsn);
