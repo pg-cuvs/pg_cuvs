@@ -356,6 +356,12 @@ static IndexEntry *g_indexes      = NULL;   /* calloc(g_max_indexes) at startup 
 static int         g_n_indexes   = 0;
 static pthread_mutex_t g_index_mutex = PTHREAD_MUTEX_INITIALIZER;
 
+typedef struct PageCagraRetiredBoot
+{
+    struct PageCagraRetiredBoot *next;
+    uint64_t boot_id;
+} PageCagraRetiredBoot;
+
 /* Page-format graphs never participate in the OID-only legacy registry. */
 typedef struct PageCagraGraph
 {
@@ -384,6 +390,7 @@ typedef struct PageCagraGraph
     time_t last_search;
     uint32_t hits;
     CuvsPageOverlay overlay;
+    PageCagraRetiredBoot *retired_boots;
     uint32_t fold_pins;
     bool fold_retired;
     struct PageCagraGraph *fold_candidate;
@@ -451,6 +458,13 @@ release_page_graph_resources(PageCagraGraph *entry)
 static void
 finish_page_graph_dispose(PageCagraGraph *entry)
 {
+    while (entry->retired_boots)
+    {
+        PageCagraRetiredBoot *boot = entry->retired_boots;
+
+        entry->retired_boots = boot->next;
+        free(boot);
+    }
     g_page_graph_bytes[entry->gpu] -= entry->bytes + entry->bf_bytes[0] + entry->bf_bytes[1];
     defer_page_overlay_release(entry->overlay.head);
     free(entry);
@@ -625,13 +639,32 @@ page_graph_register_fold_locked(const PageGraphFoldRef *source,
     return true;
 }
 
-/* Only a validated graph operation can change its active overlay lifetime.
- * A READY poll for another boot must not dispose an active candidate. */
-static void
-discard_page_fold_from_old_boot_locked(PageCagraGraph *graph, uint64_t boot_id)
+/* A boot ID is opaque. Remember replaced IDs for this graph lineage so a
+ * delayed request cannot restore an earlier overlay lifetime. */
+static bool
+page_graph_use_boot_locked(PageCagraGraph *graph, uint64_t boot_id,
+                           CuvsPageOverlayChunk **obsolete)
 {
-    if (graph->overlay.boot_id != boot_id)
-        discard_page_fold_locked(graph);
+    *obsolete = NULL;
+    if (graph->overlay.boot_id == boot_id)
+        return true;
+    for (const PageCagraRetiredBoot *boot = graph->retired_boots; boot; boot = boot->next)
+        if (boot->boot_id == boot_id)
+            return false;
+
+    if (graph->overlay.boot_id)
+    {
+        PageCagraRetiredBoot *boot = malloc(sizeof(*boot));
+
+        if (!boot)
+            return false;
+        boot->boot_id = graph->overlay.boot_id;
+        boot->next = graph->retired_boots;
+        graph->retired_boots = boot;
+    }
+    discard_page_fold_locked(graph);
+    *obsolete = cuvs_page_overlay_start_boot(&graph->overlay, boot_id, graph->folded);
+    return true;
 }
 
 static void
@@ -13159,6 +13192,8 @@ page_fold_result_locked(const CuvsPageFoldResult *result)
         parent->fold_candidate = NULL;
         candidate->overlay = parent->overlay;
         parent->overlay = (CuvsPageOverlay) {0};
+        candidate->retired_boots = parent->retired_boots;
+        parent->retired_boots = NULL;
         candidate->fold_lsn = result->transition_lsn;
         candidate->loaded_at = time(NULL);
         candidate->next = parent->next;
@@ -13254,10 +13289,10 @@ find_page_overlay_graph(const CuvsCmdFrame *cmd, const CuvsPageOverlayRequest *r
              * volatile candidate cannot serve it or keep the parent pinned. */
             if (observe)
             {
-                discard_page_fold_locked(parent);
-                defer_page_overlay_release(cuvs_page_overlay_start_boot(&parent->overlay,
-                                                                      request->boot_id,
-                                                                      parent->folded));
+                CuvsPageOverlayChunk *obsolete;
+
+                if (page_graph_use_boot_locked(parent, request->boot_id, &obsolete))
+                    defer_page_overlay_release(obsolete);
             }
             return NULL;
         }
@@ -13343,7 +13378,7 @@ handle_page_supply(int client_fd, const CuvsCmdFrame *cmd)
     CuvsPageOverlayRequest request;
     CuvsReplyHeader reply = {0};
     CuvsPageProgress progress = {0};
-    CuvsPageOverlayChunk *chunk = NULL, *obsolete = NULL;
+    CuvsPageOverlayChunk *chunk = NULL, *obsolete = NULL, *previous;
     PageCagraGraph *graph, *owner;
     uint64_t registered_order, generation;
 
@@ -13357,18 +13392,18 @@ handle_page_supply(int client_fd, const CuvsCmdFrame *cmd)
 
     pthread_mutex_lock(&g_index_mutex);
     graph = find_page_overlay_graph(cmd, &request, &owner, true);
-    if (!graph)
+    if (!graph || !page_graph_use_boot_locked(owner, request.boot_id, &previous))
     {
         pthread_mutex_unlock(&g_index_mutex);
         reply.status = CUVS_STATUS_NOT_FOUND;
         goto done;
     }
-    discard_page_fold_from_old_boot_locked(owner, request.boot_id);
     reply.status = cuvs_page_overlay_supply(&owner->overlay, &request, &chunk, &obsolete);
     progress.covered_upto = owner->overlay.covered_upto;
     registered_order = graph->registered_order;
     generation = owner->overlay.generation;
     pthread_mutex_unlock(&g_index_mutex);
+    cuvs_page_overlay_release(previous);
     cuvs_page_overlay_release(obsolete);
     obsolete = NULL;
     if (reply.status != CUVS_STATUS_OK || request.base.tail <= progress.covered_upto)
@@ -13480,10 +13515,8 @@ handle_page_overlay_search(int client_fd, const CuvsCmdFrame *cmd)
         pthread_mutex_lock(&g_index_mutex);
         graph = find_page_overlay_graph(cmd, &request, &owner, true);
         reply.status = CUVS_STATUS_NOT_FOUND;
-        if (graph)
+        if (graph && page_graph_use_boot_locked(owner, request.boot_id, &obsolete))
         {
-            discard_page_fold_from_old_boot_locked(owner, request.boot_id);
-            obsolete = cuvs_page_overlay_start_boot(&owner->overlay, request.boot_id, owner->folded);
             registered_order = graph->registered_order;
             generation = owner->overlay.generation;
             progress.covered_upto = owner->overlay.covered_upto;
@@ -13515,13 +13548,12 @@ handle_page_overlay_search(int client_fd, const CuvsCmdFrame *cmd)
     pthread_mutex_lock(&g_index_mutex);
     graph = find_page_overlay_graph(cmd, &request, &owner, !request.positions);
     if (!graph || (supplement && (graph->registered_order != registered_order ||
-                                 owner->overlay.generation != generation)))
+                                 owner->overlay.generation != generation)) ||
+        !page_graph_use_boot_locked(owner, request.boot_id, &obsolete))
     {
         reply.status = CUVS_STATUS_NOT_FOUND;
         goto unlock;
     }
-    discard_page_fold_from_old_boot_locked(owner, request.boot_id);
-    obsolete = cuvs_page_overlay_start_boot(&owner->overlay, request.boot_id, owner->folded);
     progress.covered_upto = owner->overlay.covered_upto;
     reply.status = page_overlay_search_status(cmd, &request, graph, &owner->overlay);
     if (reply.status != CUVS_STATUS_OK)

@@ -216,6 +216,7 @@ test_discard_drop_and_boot(void)
     FoldHandle old = {0}, discarded = {0}, stale = {0}, dropped = {0};
     PageGraphFoldRef source = {0}, fresh = {0};
     CuvsPageFoldEvent event = make_event(), received;
+    CuvsPageOverlayChunk *obsolete;
     PageCagraGraph *parent;
 
     pthread_mutex_lock(&g_index_mutex);
@@ -230,8 +231,7 @@ test_discard_drop_and_boot(void)
     ++event.graph_nonce;
     pthread_mutex_lock(&g_index_mutex);
     CHECK(page_graph_register_fold_locked(&source, &event, &stale, 80));
-    discard_page_fold_from_old_boot_locked(parent, 8);
-    CHECK(!cuvs_page_overlay_start_boot(&parent->overlay, 8, 0));
+    CHECK(page_graph_use_boot_locked(parent, 8, &obsolete) && !obsolete);
     pthread_mutex_unlock(&g_index_mutex);
     release_retired_fold_graphs();
     CHECK(stale.frees == 1 && !old.frees && g_page_graph_bytes[0] == 100);
@@ -239,7 +239,8 @@ test_discard_drop_and_boot(void)
     CHECK(fold_result(CUVS_OP_FOLD_COMMITTED, 2, event, 90) == CUVS_STATUS_NOT_FOUND);
 
     pthread_mutex_lock(&g_index_mutex);
-    CHECK(!cuvs_page_overlay_start_boot(&parent->overlay, 6, 0));
+    CHECK(!page_graph_use_boot_locked(parent, 6, &obsolete));
+    event.boot_id = 8;
     parent->overlay.covered_upto = 4;
     CHECK(!page_graph_register_fold_locked(&source, &event, &dropped, 80));
     CHECK(page_graph_fold_pin_locked(parent, &fresh) == &old);
@@ -473,6 +474,61 @@ test_ready_visits_other_indexes(void)
     puts("PASS outstanding READY retains its candidate and does not hide another index");
 }
 
+static void
+test_delayed_older_boot_preserves_current_fold(void)
+{
+    FoldHandle old = {.nearest = 10}, child = {.nearest = 64};
+    PageGraphFoldRef pin = {0};
+    CuvsPageFoldEvent event = make_event();
+    CuvsPageOverlayRequest parent_request = {
+        .base = {
+            .system_identifier = 1, .index_nonce = 4, .base_nonce = 5,
+            .graph_nonce = 5, .n_slots = 64,
+        },
+        .boot_id = 8,
+    };
+    CuvsPageOverlayRequest child_request;
+    CuvsPageOverlayResult rows[3];
+    PageCagraGraph *parent;
+    int n;
+
+    pthread_mutex_lock(&g_index_mutex);
+    parent = make_parent(&old);
+    pthread_mutex_unlock(&g_index_mutex);
+    CHECK(page_search(true, parent_request, rows, &n) == CUVS_STATUS_OK);
+    parent_request.boot_id = 9;
+    CHECK(page_search(true, parent_request, rows, &n) == CUVS_STATUS_OK);
+
+    event.boot_id = parent_request.boot_id;
+    pthread_mutex_lock(&g_index_mutex);
+    parent->overlay.covered_upto = event.positions;
+    CHECK(page_graph_fold_pin_locked(parent, &pin) == &old);
+    CHECK(page_graph_register_fold_locked(&pin, &event, &child, 80));
+    pthread_mutex_unlock(&g_index_mutex);
+    page_graph_fold_unpin(&pin);
+
+    child_request = parent_request;
+    child_request.base.graph_nonce = event.graph_nonce;
+    child_request.base.n_slots = event.parent_n_slots + event.positions;
+    child_request.base.folded = child_request.base.tail = child_request.from = event.positions;
+    CHECK(page_search(true, child_request, rows, &n) == CUVS_STATUS_OK);
+
+    parent_request.boot_id = 6;
+    CHECK(page_search(true, parent_request, rows, &n) == CUVS_STATUS_NOT_FOUND);
+    parent_request.boot_id = 8;
+    CHECK(page_search(true, parent_request, rows, &n) == CUVS_STATUS_NOT_FOUND);
+    CHECK(!child.frees && parent->overlay.boot_id == event.boot_id);
+    CHECK(fold_result(CUVS_OP_FOLD_COMMITTED, 2, event, 90) == CUVS_STATUS_OK);
+
+    child_request.boot_id = 6;
+    CHECK(page_search(true, child_request, rows, &n) == CUVS_STATUS_NOT_FOUND);
+    child_request.boot_id = event.boot_id;
+    CHECK(page_search(true, child_request, rows, &n) == CUVS_STATUS_OK);
+    drop_index();
+    CHECK(old.frees == 1 && child.frees == 1 && !g_page_graph_bytes[0]);
+    puts("PASS delayed retired PG lifetimes cannot displace the current fold");
+}
+
 int
 main(void)
 {
@@ -484,5 +540,6 @@ main(void)
     test_discard_drop_and_boot();
     test_search_before_and_after_ack();
     test_ready_visits_other_indexes();
+    test_delayed_older_boot_preserves_current_fold();
     return 0;
 }
