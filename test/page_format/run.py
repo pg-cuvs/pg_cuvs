@@ -113,7 +113,8 @@ checkpoint_timeout = '30min'
         self.sql(db, case, "-f", CASES / f"{case}.sql", **kwargs)
 
     @contextmanager
-    def daemon(self, binary, label, *, seed_bf=False, fault=None, vram_mib=None, max_indexes=None):
+    def daemon(self, binary, label, *, seed_bf=False, fault=None, vram_mib=None, max_indexes=None,
+               overlay_host_bytes=None):
         env = self.env.copy()
         for key, enabled in (
             ("CUVS_FAULT_PAGE_BF_FIXTURE", seed_bf),
@@ -128,6 +129,8 @@ checkpoint_timeout = '30min'
             args.extend(["--max-vram-mb", str(vram_mib)])
         if max_indexes is not None:
             args.extend(["--max-indexes", str(max_indexes)])
+        if overlay_host_bytes is not None:
+            args.extend(["--page-overlay-host-bytes", str(overlay_host_bytes)])
         with (self.logs / f"daemon-{label}.log").open("w") as log, subprocess.Popen(
             args, stdout=log, stderr=subprocess.STDOUT, env=env, cwd=self.data.parent,
         ) as daemon:
@@ -810,7 +813,7 @@ def run(work, logs):
     daemon_alias = cluster.data.parent / "daemon-root"
     daemon_alias.symlink_to(cluster.indexdir, target_is_directory=True)
     cluster.daemon_root = str(daemon_alias)
-    with cluster.daemon(source_on / "pg_cuvs_server", "on") as daemon:
+    with cluster.daemon(source_on / "pg_cuvs_server", "on", overlay_host_bytes=4 * 1024**3) as daemon:
         cluster.start()
         try:
             for case in ("alpha1", "alpha2_basic", "truncate", "relcache", "beta1a", "beta1b_expression"):
@@ -951,7 +954,7 @@ def run_slots_only(work, logs):
     build(source, 1, logs / "build-on.log")
     build(source, 1, logs / "install.log", install=stage)
     cluster = Cluster(work / "main", bindir, logs)
-    with cluster.daemon(source / "pg_cuvs_server", "on"):
+    with cluster.daemon(source / "pg_cuvs_server", "on", overlay_host_bytes=4 * 1024**3):
         cluster.start()
         try:
             cluster.run("createdb", ["beta1a"], "createdb-beta1a")

@@ -390,6 +390,7 @@ static uint64_t g_page_access;
 static uint64_t g_page_daemon_id;
 static pthread_once_t g_page_daemon_once = PTHREAD_ONCE_INIT;
 static size_t g_page_graph_bytes[CUVS_MAX_GPUS];
+static CuvsPageOverlayBudget g_page_overlay_budget;
 static _Thread_local CuvsPageOverlayChunk *g_retired_page_overlays;
 
 /* A graph removal only detaches its overlay under the registry lock. The
@@ -12700,21 +12701,32 @@ reclaim_thread(void *arg)
 }
 
 
+static int
+open_page_shm(const char *key, size_t key_size, size_t bytes)
+{
+    int fd;
+
+    if (!memchr(key, '\0', key_size))
+        return -1;
+    fd = shm_open(key, O_RDONLY, 0);
+    if (fd >= 0 && (!shm_check_peer_owner(fd, g_peer_uid) || !page_corpus_fits(fd, bytes)))
+    {
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
+
 static void *
 map_page_shm(const char *key, size_t key_size, size_t bytes)
 {
-    int fd;
-    void *mem = MAP_FAILED;
+    int fd = open_page_shm(key, key_size, bytes);
+    void *mem;
 
-    if (!memchr(key, '\0', key_size))
-        return mem;
-    fd = shm_open(key, O_RDONLY, 0);
-    if (fd >= 0)
-    {
-        if (shm_check_peer_owner(fd, g_peer_uid) && page_corpus_fits(fd, bytes))
-            mem = mmap(NULL, bytes, PROT_READ, MAP_SHARED, fd, 0);
-        close(fd);
-    }
+    if (fd < 0)
+        return MAP_FAILED;
+    mem = mmap(NULL, bytes, PROT_READ, MAP_SHARED, fd, 0);
+    close(fd);
     return mem;
 }
 
@@ -12899,19 +12911,46 @@ receive_page_overlay(int client_fd, const CuvsCmdFrame *cmd, CuvsPageOverlayRequ
     return g_page_daemon_id ? CUVS_STATUS_OK : CUVS_STATUS_ERROR;
 }
 
-static CuvsPageOverlayChunk *
-read_page_overlay_chunk(const CuvsPageOverlayRequest *request, uint32_t dim, bool shared)
+static PageCagraGraph *
+find_page_overlay_graph(const CuvsCmdFrame *cmd, const CuvsPageOverlayRequest *request)
+{
+    PageCagraGraph *graph = find_page_graph(cmd, &request->base);
+
+    return graph && graph->dim == cmd->dim && graph->metric == cmd->metric ? graph : NULL;
+}
+
+static uint32_t
+read_page_overlay_chunk(const CuvsPageOverlayRequest *request, uint32_t dim, bool shared,
+                        CuvsPageOverlayChunk **result)
 {
     size_t bytes = (size_t) request->positions * sizeof(CuvsPagePosition) +
                    (size_t) request->vector_rows * dim * sizeof(float);
-    void *mapping = map_page_shm(request->supplement_shm, sizeof(request->supplement_shm), bytes);
-    CuvsPageOverlayChunk *chunk;
+    int fd = open_page_shm(request->supplement_shm, sizeof(request->supplement_shm), bytes);
+    uint32_t status;
+    size_t offset = 0;
 
-    if (mapping == MAP_FAILED)
-        return NULL;
-    chunk = cuvs_page_overlay_copy(request, mapping, bytes, shared);
-    munmap(mapping, bytes);
-    return chunk;
+    if (fd < 0)
+        return CUVS_STATUS_ERROR;
+    status = cuvs_page_overlay_alloc(&g_page_overlay_budget, request, bytes, result);
+    if (status == CUVS_STATUS_OK)
+    {
+        /* Read into the reserved chunk directly. There is no daemon-side
+         * staging mapping or second buffer to overlap this allocation. */
+        while (offset < bytes)
+        {
+            ssize_t n = pread(fd, (char *) (*result)->marks + offset, bytes - offset, (off_t) offset);
+
+            if (n < 0 && errno == EINTR)
+                continue;
+            if (n <= 0)
+                break;
+            offset += (size_t) n;
+        }
+        if (offset != bytes || !cuvs_page_overlay_valid(*result, request->vector_rows, shared))
+            status = CUVS_STATUS_ERROR;
+    }
+    close(fd);
+    return status;
 }
 
 static bool
@@ -12919,7 +12958,8 @@ send_page_overlay_reply(int client_fd, const CuvsReplyHeader *reply, const CuvsP
 {
     return send_all(client_fd, reply, sizeof(*reply)) == 0 &&
         (reply->status == CUVS_STATUS_OK || reply->status == CUVS_STATUS_PAGE_NEED ||
-         reply->status == CUVS_STATUS_PAGE_OVERLAY_FULL) &&
+         reply->status == CUVS_STATUS_PAGE_OVERLAY_FULL ||
+         reply->status == CUVS_STATUS_PAGE_OVERLAY_HOST_FULL) &&
         send_all(client_fd, progress, sizeof(*progress)) == 0;
 }
 
@@ -12931,6 +12971,7 @@ handle_page_supply(int client_fd, const CuvsCmdFrame *cmd)
     CuvsPageProgress progress = {0};
     CuvsPageOverlayChunk *chunk = NULL, *obsolete = NULL;
     PageCagraGraph *graph;
+    uint64_t registered_order, generation;
 
     reply.status = receive_page_overlay(client_fd, cmd, &request);
     if (reply.status != CUVS_STATUS_OK)
@@ -12939,13 +12980,32 @@ handle_page_supply(int client_fd, const CuvsCmdFrame *cmd)
     if (cmd->n_vecs || cmd->k || !request.positions)
         goto done;
     progress.daemon_id = g_page_daemon_id;
-    chunk = read_page_overlay_chunk(&request, cmd->dim, true);
-    if (!chunk)
+
+    pthread_mutex_lock(&g_index_mutex);
+    graph = find_page_overlay_graph(cmd, &request);
+    if (!graph)
+    {
+        pthread_mutex_unlock(&g_index_mutex);
+        reply.status = CUVS_STATUS_NOT_FOUND;
+        goto done;
+    }
+    reply.status = cuvs_page_overlay_supply(&graph->overlay, &request, &chunk, &obsolete);
+    progress.covered_upto = graph->overlay.covered_upto;
+    registered_order = graph->registered_order;
+    generation = graph->overlay.generation;
+    pthread_mutex_unlock(&g_index_mutex);
+    cuvs_page_overlay_release(obsolete);
+    obsolete = NULL;
+    if (reply.status != CUVS_STATUS_OK || request.base.tail <= progress.covered_upto)
+        goto done;
+
+    reply.status = read_page_overlay_chunk(&request, cmd->dim, true, &chunk);
+    if (reply.status != CUVS_STATUS_OK)
         goto done;
 
     pthread_mutex_lock(&g_index_mutex);
-    graph = find_page_graph(cmd, &request.base);
-    if (graph && graph->dim == cmd->dim && graph->metric == cmd->metric)
+    graph = find_page_overlay_graph(cmd, &request);
+    if (graph && graph->registered_order == registered_order && graph->overlay.generation == generation)
     {
         reply.status = cuvs_page_overlay_supply(&graph->overlay, &request, &chunk, &obsolete);
         progress.covered_upto = graph->overlay.covered_upto;
@@ -12958,6 +13018,20 @@ done:
     cuvs_page_overlay_release(chunk);
     cuvs_page_overlay_release(obsolete);
     (void) send_page_overlay_reply(client_fd, &reply, &progress);
+}
+
+/* Caller holds the registry lock and has validated the graph incarnation. */
+static uint32_t
+page_overlay_search_status(const CuvsCmdFrame *cmd, const CuvsPageOverlayRequest *request,
+                           const PageCagraGraph *graph)
+{
+    if (request->base.tail - request->base.folded > CUVS_PAGE_OVERLAY_MAX)
+        return CUVS_STATUS_PAGE_OVERLAY_FULL;
+    if (request->from > graph->overlay.covered_upto)
+        return CUVS_STATUS_PAGE_NEED;
+    if (cmd->search_mode == 1 && !graph->bf[cmd->bf_precision])
+        return CUVS_STATUS_NO_VECTORS;
+    return CUVS_STATUS_OK;
 }
 
 static void
@@ -12991,10 +13065,27 @@ handle_page_overlay_search(int client_fd, const CuvsCmdFrame *cmd)
     progress.daemon_id = g_page_daemon_id;
     if (request.positions)
     {
-        supplement = read_page_overlay_chunk(&request, cmd->dim, false);
-        if (!supplement)
+        pthread_mutex_lock(&g_index_mutex);
+        graph = find_page_overlay_graph(cmd, &request);
+        reply.status = CUVS_STATUS_NOT_FOUND;
+        if (graph)
+        {
+            obsolete = cuvs_page_overlay_start_boot(&graph->overlay, request.boot_id, request.base.folded);
+            registered_order = graph->registered_order;
+            generation = graph->overlay.generation;
+            progress.covered_upto = graph->overlay.covered_upto;
+            reply.status = page_overlay_search_status(cmd, &request, graph);
+        }
+        pthread_mutex_unlock(&g_index_mutex);
+        cuvs_page_overlay_release(obsolete);
+        obsolete = NULL;
+        if (reply.status != CUVS_STATUS_OK)
+            goto done;
+        reply.status = read_page_overlay_chunk(&request, cmd->dim, false, &supplement);
+        if (reply.status != CUVS_STATUS_OK)
             goto done;
     }
+    reply.status = CUVS_STATUS_ERROR;
     bytes = prefix + (size_t) cmd->n_vecs * cmd->dim * sizeof(float);
     query = map_page_shm(cmd->shm_key, sizeof(cmd->shm_key), bytes);
     if (query == MAP_FAILED ||
@@ -13009,29 +13100,18 @@ handle_page_overlay_search(int client_fd, const CuvsCmdFrame *cmd)
 
     started = admission_mono_us();
     pthread_mutex_lock(&g_index_mutex);
-    graph = find_page_graph(cmd, &request.base);
-    if (!graph || graph->dim != cmd->dim || graph->metric != cmd->metric)
+    graph = find_page_overlay_graph(cmd, &request);
+    if (!graph || (supplement && (graph->registered_order != registered_order ||
+                                 graph->overlay.generation != generation)))
     {
         reply.status = CUVS_STATUS_NOT_FOUND;
         goto unlock;
     }
     obsolete = cuvs_page_overlay_start_boot(&graph->overlay, request.boot_id, request.base.folded);
     progress.covered_upto = graph->overlay.covered_upto;
-    if (request.base.tail - request.base.folded > CUVS_PAGE_OVERLAY_MAX)
-    {
-        reply.status = CUVS_STATUS_PAGE_OVERLAY_FULL;
+    reply.status = page_overlay_search_status(cmd, &request, graph);
+    if (reply.status != CUVS_STATUS_OK)
         goto unlock;
-    }
-    if (request.from > progress.covered_upto)
-    {
-        reply.status = CUVS_STATUS_PAGE_NEED;
-        goto unlock;
-    }
-    if (cmd->search_mode == 1 && !graph->bf[cmd->bf_precision])
-    {
-        reply.status = CUVS_STATUS_NO_VECTORS;
-        goto unlock;
-    }
 
     k = (int) (graph->n_slots < cmd->k ? graph->n_slots : cmd->k);
     if (page_graph_search(graph, cmd, vectors, (int) cmd->n_vecs, k, NULL, raw) != 0)
@@ -13099,7 +13179,7 @@ unlock:
         reply.n_results += written;
     }
     pthread_mutex_lock(&g_index_mutex);
-    graph = find_page_graph(cmd, &request.base);
+    graph = find_page_overlay_graph(cmd, &request);
     if (!graph || graph->registered_order != registered_order ||
         graph->overlay.generation != generation)
     {
@@ -13990,6 +14070,21 @@ main(int argc, char **argv)
             strncpy(g_index_dir, argv[++i], sizeof(g_index_dir) - 1);
         else if (strcmp(argv[i], "--max-vram-mb") == 0 && i+1 < argc)
             g_max_vram_bytes = (size_t)atol(argv[++i]) * 1024 * 1024;
+        else if (strcmp(argv[i], "--page-overlay-host-bytes") == 0)
+        {
+            const char *value = i + 1 < argc ? argv[++i] : "";
+            char *end;
+            unsigned long long bytes;
+
+            errno = 0;
+            bytes = strtoull(value, &end, 10);
+            if (*value < '0' || *value > '9' || *end || errno || bytes != (size_t) bytes)
+            {
+                LOG_ERROR("--page-overlay-host-bytes requires a nonnegative byte count\n");
+                return 1;
+            }
+            g_page_overlay_budget.limit = (size_t) bytes;
+        }
         else if (strcmp(argv[i], "--rmm-pool-mb") == 0)
         {
             if (i + 1 >= argc || cuvs_parse_rmm_pool_mb(argv[++i], &g_rmm_pool_mb) != 0)

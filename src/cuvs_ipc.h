@@ -305,6 +305,7 @@ int cuvs_ipc_search_page_overlay(const char *socket_path, uint32_t db_oid, uint3
 /* 14/15 are reserved by other changes. 17 is INVALID_PAGE_ROOT. */
 #define CUVS_STATUS_PAGE_NEED          18
 #define CUVS_STATUS_PAGE_OVERLAY_FULL  19
+#define CUVS_STATUS_PAGE_OVERLAY_HOST_FULL 20 /* daemon host budget: use exact heap search */
 
 /* ----------------------------------------------------------------
  * Command frame (sent over UDS, fixed size)

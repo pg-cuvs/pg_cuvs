@@ -4,19 +4,46 @@
 #include <stdlib.h>
 #include <string.h>
 
-CuvsPageOverlayChunk *
-cuvs_page_overlay_copy(const CuvsPageOverlayRequest *request, const void *payload, size_t bytes, bool shared)
+uint32_t
+cuvs_page_overlay_alloc(CuvsPageOverlayBudget *budget, const CuvsPageOverlayRequest *request,
+                        size_t bytes, CuvsPageOverlayChunk **result)
 {
-    CuvsPageOverlayChunk *chunk = malloc(sizeof(*chunk) + bytes);
-    uint32_t vectors = 0;
+    CuvsPageOverlayChunk *chunk;
+    size_t charge, used;
 
+    *result = NULL;
+    if (bytes > SIZE_MAX - sizeof(*chunk))
+        return CUVS_STATUS_PAGE_OVERLAY_HOST_FULL;
+    charge = sizeof(*chunk) + bytes;
+    used = __atomic_load_n(&budget->used, __ATOMIC_RELAXED);
+    do
+    {
+        if (charge > budget->limit - used)
+            return CUVS_STATUS_PAGE_OVERLAY_HOST_FULL;
+    } while (!__atomic_compare_exchange_n(&budget->used, &used, used + charge, true,
+                                          __ATOMIC_RELAXED, __ATOMIC_RELAXED));
+
+    chunk = malloc(charge);
     if (!chunk)
-        return NULL;
+    {
+        __atomic_fetch_sub(&budget->used, charge, __ATOMIC_RELAXED);
+        return CUVS_STATUS_OOM_FALLBACK;
+    }
     chunk->next = NULL;
     chunk->refs = 1;
+    chunk->budget = budget;
+    chunk->charged_bytes = charge;
     chunk->from = request->from;
     chunk->positions = request->positions;
-    memcpy(chunk->marks, payload, bytes);
+    *result = chunk;
+    return CUVS_STATUS_OK;
+}
+
+bool
+cuvs_page_overlay_valid(const CuvsPageOverlayChunk *chunk, uint32_t vector_rows, bool shared)
+{
+    uint32_t vectors = 0;
+
     for (uint32_t i = 0; i < chunk->positions; ++i)
     {
         const CuvsPagePosition *mark = &chunk->marks[i];
@@ -26,14 +53,9 @@ cuvs_page_overlay_copy(const CuvsPageOverlayRequest *request, const void *payloa
             ++vectors;
         else if (mark->state != CUVS_PAGE_POSITION_DEAD &&
                  (shared || mark->state != CUVS_PAGE_POSITION_INVISIBLE))
-            goto invalid;
+            return false;
     }
-    if (vectors == request->vector_rows)
-        return chunk;
-
-invalid:
-    free(chunk);
-    return NULL;
+    return vectors == vector_rows;
 }
 
 void
@@ -49,8 +71,11 @@ cuvs_page_overlay_release(CuvsPageOverlayChunk *chunk)
     while (chunk && __atomic_fetch_sub(&chunk->refs, 1, __ATOMIC_ACQ_REL) == 1)
     {
         CuvsPageOverlayChunk *next = chunk->next;
+        CuvsPageOverlayBudget *budget = chunk->budget;
+        size_t charge = chunk->charged_bytes;
 
         free(chunk);
+        __atomic_fetch_sub(&budget->used, charge, __ATOMIC_RELAXED);
         chunk = next;
     }
 }
@@ -79,6 +104,8 @@ cuvs_page_overlay_supply(CuvsPageOverlay *overlay, const CuvsPageOverlayRequest 
         return CUVS_STATUS_OK;
     if (request->from != overlay->covered_upto)
         return CUVS_STATUS_PAGE_NEED;
+    if (!*chunk)
+        return CUVS_STATUS_OK; /* preflight before reserving and reading a contiguous chunk */
 
     /* Move the registry's prefix reference into the new chunk. A reader
      * that retained the former head can still walk exactly its own prefix. */

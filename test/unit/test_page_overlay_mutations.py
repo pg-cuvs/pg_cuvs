@@ -24,6 +24,14 @@ MUTATIONS = {
         "__atomic_fetch_add(&chunk->refs, 1, __ATOMIC_RELAXED);",
         "(void) chunk;",
     ),
+    "accept a host budget overcommit": (
+        "if (charge > budget->limit - used)",
+        "if (charge > budget->limit)",
+    ),
+    "never return the charge for a released chunk": (
+        "__atomic_fetch_sub(&budget->used, charge, __ATOMIC_RELAXED);\n        chunk = next;",
+        "(void) budget;\n        (void) charge;\n        chunk = next;",
+    ),
 }
 
 with tempfile.TemporaryDirectory(prefix="pgcuvs-overlay-test-") as path:

@@ -767,7 +767,7 @@ page_overlay_exchange(const char *socket_path, CuvsCmdFrame *cmd, CuvsPageOverla
     }
     status = (int) reply.status;
     if (status == CUVS_STATUS_OK || status == CUVS_STATUS_PAGE_NEED ||
-        status == CUVS_STATUS_PAGE_OVERLAY_FULL)
+        status == CUVS_STATUS_PAGE_OVERLAY_FULL || status == CUVS_STATUS_PAGE_OVERLAY_HOST_FULL)
     {
         waiting = recv_all_interruptible(sock, progress, sizeof(*progress), 30);
         if (waiting != 0)
