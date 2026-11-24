@@ -375,6 +375,7 @@ typedef struct PageCagraGraph
     size_t bf_bytes[2];
     uint32_t bf_miss_reported;
     size_t bytes;
+    uint64_t registered_order;
     uint64_t last_use;
     time_t loaded_at;
     time_t last_search;
@@ -426,13 +427,37 @@ drop_page_graphs(uint32_t db_oid, uint32_t index_oid)
 }
 
 static bool
+page_superseded_since_use(const PageCagraGraph *page)
+{
+    for (const PageCagraGraph *p = g_page_graphs; p; p = p->next)
+        if (p->system_identifier == page->system_identifier &&
+            p->db_oid == page->db_oid && p->index_oid == page->index_oid &&
+            p->index_nonce != page->index_nonce &&
+            p->registered_order > page->registered_order &&
+            p->registered_order > page->last_use)
+            return true;
+    return false;
+}
+
+static bool
+page_evicted_before(const PageCagraGraph *candidate, const PageCagraGraph *previous)
+{
+    bool candidate_old = page_superseded_since_use(candidate);
+    bool previous_old = page_superseded_since_use(previous);
+    uint64_t candidate_age = candidate->last_use ? candidate->last_use : candidate->registered_order;
+    uint64_t previous_age = previous->last_use ? previous->last_use : previous->registered_order;
+
+    return candidate_old != previous_old ? candidate_old : candidate_age < previous_age;
+}
+
+static bool
 evict_page_graph(int gpu)
 {
     PageCagraGraph **victim = NULL;
 
     for (PageCagraGraph **link = &g_page_graphs; *link; link = &(*link)->next)
         if ((gpu < 0 || (*link)->gpu == gpu) &&
-            (!victim || (*link)->last_use < (*victim)->last_use))
+            (!victim || page_evicted_before(*link, *victim)))
             victim = link;
     if (!victim)
         return false;
@@ -3462,16 +3487,19 @@ make_room(int device_id, CuvsRequester rq, uint64_t need, int slot_mode,
             keys[n].legacy.index_oid = e->index_oid;
             n++;
         }
-        for (PageCagraGraph *page = g_page_graphs; page; page = page->next)
+        for (PageCagraGraph *page = slot_mode ? NULL : g_page_graphs; page; page = page->next)
         {
+            bool superseded;
+
             if (page->gpu != device_id)
                 continue;
+            superseded = page_superseded_since_use(page);
             cands[n] = (CuvsEvictCand) {
                 .db_oid = page->db_oid, .index_oid = page->index_oid,
-                .last_use = page->last_search, .hits = page->hits,
-                /* With the same LRU policy, put never-served page graphs first. */
-                .loaded_at = page->last_search ? page->loaded_at : 0,
-                .bytes = slot_mode ? 1 : page->bytes + page->bf_bytes[0] + page->bf_bytes[1],
+                .last_use = superseded ? 0 : page->last_search,
+                .loaded_at = superseded ? 0 : page->loaded_at,
+                .hits = page->hits,
+                .bytes = page->bytes + page->bf_bytes[0] + page->bf_bytes[1],
             };
             keys[n].page = page;
             n++;
@@ -8024,6 +8052,7 @@ handle_build(int client_fd, const CuvsCmdFrame *cmd)
             entry->gpu = target_gpu;
             entry->handle = new_handle;
             entry->loaded_at = time(NULL);
+            entry->registered_order = ++g_page_access;
             entry->cpu_hnsw = page_cpu_hnsw;
             entry->bytes = final;
             entry->next = g_page_graphs;
