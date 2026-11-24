@@ -2,6 +2,7 @@
 #define CUVS_CAGRA_PAGES_H
 
 #include "access/amapi.h"
+#include "access/xlogdefs.h"
 #include "storage/bufmgr.h"
 #include "utils/rel.h"
 
@@ -98,20 +99,28 @@ typedef struct CuvsCagraFoldCandidate
     uint32 positions;
 } CuvsCagraFoldCandidate;
 
-typedef enum CuvsCagraFoldPrepareResult
+typedef enum CuvsCagraFoldStatus
 {
     CUVS_CAGRA_FOLD_PREPARED,
+    CUVS_CAGRA_FOLD_PUBLISHED,
     CUVS_CAGRA_FOLD_DEFERRED,
     CUVS_CAGRA_FOLD_DISCARD
-} CuvsCagraFoldPrepareResult;
+} CuvsCagraFoldStatus;
 
 /* Caller holds the relation lock and supplies storage for candidate->positions
  * entries. A successful preparation retains the exclusive FCL (page lock 0).
  * Use the copied positions only under that lock. Failure retains no FCL.
  * Preparation does not change any published page. */
-CuvsCagraFoldPrepareResult cuvs_cagra_prepare_fold(Relation index,
+CuvsCagraFoldStatus cuvs_cagra_prepare_fold(Relation index,
                         const CuvsCagraFoldCandidate *candidate,
                         CuvsCagraMeta *base, CuvsCagraPendingLocation *locations);
+
+/* Standalone background worker operation on a WAL-logged index. The caller
+ * holds RowExclusiveLock and has verified the candidate's origin and PG life.
+ * PUBLISHED returns a flushed physical transition LSN and no FCL. That is
+ * the first point at which the caller may send FOLD_COMMITTED. */
+CuvsCagraFoldStatus cuvs_cagra_publish_fold(Relation index,
+                        const CuvsCagraFoldCandidate *candidate, XLogRecPtr *commit_lsn);
 CuvsCagraSlotResult cuvs_cagra_pending_tid(Relation index, const CuvsCagraMeta *meta,
                                          BlockNumber nblocks, BlockNumber block,
                                          uint64 position, ItemPointer tid);

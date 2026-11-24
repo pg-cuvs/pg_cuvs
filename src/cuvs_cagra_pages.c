@@ -32,6 +32,8 @@ cuvs_cagra_require_legacy(Relation index)
 
 #include "access/generic_xlog.h"
 #include "access/genam.h"
+#include "access/xact.h"
+#include "access/xlog.h"
 #include "access/xloginsert.h"
 #include "cuvs_util.h"
 #include "lib/stringinfo.h"
@@ -40,6 +42,7 @@ cuvs_cagra_require_legacy(Relation index)
 #include "storage/lmgr.h"
 #include "utils/builtins.h"
 #include "utils/guc.h"
+#include "utils/timestamp.h"
 
 enum CuvsCagraPageKind
 {
@@ -494,7 +497,17 @@ cuvs_cagra_copy_pending(Relation index, const CuvsCagraMeta *meta, BlockNumber n
     return true;
 }
 
-CuvsCagraFoldPrepareResult
+static bool
+fold_base_matches(const CuvsCagraMeta *meta, const CuvsCagraFoldCandidate *candidate)
+{
+    return meta->index_nonce == candidate->index_nonce &&
+        meta->base_nonce == candidate->base_nonce &&
+        meta->graph_nonce == candidate->parent_graph_nonce &&
+        meta->n_slots == candidate->parent_n_slots &&
+        meta->folded == candidate->parent_folded;
+}
+
+CuvsCagraFoldStatus
 cuvs_cagra_prepare_fold(Relation index, const CuvsCagraFoldCandidate *candidate,
                         CuvsCagraMeta *base, CuvsCagraPendingLocation *locations)
 {
@@ -518,11 +531,7 @@ cuvs_cagra_prepare_fold(Relation index, const CuvsCagraFoldCandidate *candidate,
 
     blocks = RelationGetNumberOfBlocks(index);
     if (blocks == 0 || !cuvs_cagra_read_meta(index, &meta) ||
-        meta.index_nonce != candidate->index_nonce ||
-        meta.base_nonce != candidate->base_nonce ||
-        meta.graph_nonce != candidate->parent_graph_nonce ||
-        meta.n_slots != candidate->parent_n_slots ||
-        meta.folded != candidate->parent_folded ||
+        !fold_base_matches(&meta, candidate) ||
         !cuvs_cagra_copy_pending(index, &meta, RelationGetNumberOfBlocks(index), meta.folded,
                                  meta.folded + candidate->positions, locations, NULL))
     {
@@ -533,42 +542,306 @@ cuvs_cagra_prepare_fold(Relation index, const CuvsCagraFoldCandidate *candidate,
     return CUVS_CAGRA_FOLD_PREPARED;
 }
 
-#ifdef CUVS_TEST_HOOKS
-PG_FUNCTION_INFO_V1(cuvs_test_fold_prepare);
-
-Datum
-cuvs_test_fold_prepare(PG_FUNCTION_ARGS)
+/* Concurrent appends can extend the relation too. Reserve a full contiguous
+ * TID extent before touching any existing data buffers. */
+static BlockNumber
+fold_reserve_extent(Relation index)
 {
-    Oid oid = PG_GETARG_OID(0);
-    int32 positions = PG_GETARG_INT32(1);
-    int32 mismatch = PG_GETARG_INT32(2);
-    Relation index;
-    CuvsCagraMeta meta;
-    CuvsCagraFoldCandidate candidate;
-    CuvsCagraPendingLocation *locations;
-    CuvsCagraFoldPrepareResult status;
-    StringInfoData result;
+    Buffer buffers[CUVS_CAGRA_PAGE_EXTENT];
+    BlockNumber first = InvalidBlockNumber;
+    uint32 done = 0;
 
-    if (positions < 0 ||
-        (Size) positions > MaxAllocSize / sizeof(*locations))
-        ereport(ERROR, (errmsg("invalid fold test position count")));
-
-    index = index_open(oid, RowExclusiveLock);
-    if (RelationGetNumberOfBlocks(index) == 0 ||
-        !cuvs_cagra_read_meta(index, &meta))
+    LockRelationForExtension(index, ExclusiveLock);
+    while (done < CUVS_CAGRA_PAGE_EXTENT)
     {
-        index_close(index, RowExclusiveLock);
-        PG_RETURN_TEXT_P(cstring_to_text("discard"));
+        uint32 extended;
+        BlockNumber start = ExtendBufferedRelBy(BMR_REL(index), MAIN_FORKNUM, NULL,
+            EB_SKIP_EXTENSION_LOCK, CUVS_CAGRA_PAGE_EXTENT - done, buffers, &extended);
+
+        if (done == 0)
+            first = start;
+        else if (start != first + done)
+            bad_page(index, start);
+        for (uint32 i = 0; i < extended; ++i)
+            ReleaseBuffer(buffers[i]);
+        done += extended;
     }
-    candidate = (CuvsCagraFoldCandidate) {
-        .index_nonce = meta.index_nonce,
-        .base_nonce = meta.base_nonce,
-        .parent_graph_nonce = meta.graph_nonce,
-        .parent_n_slots = meta.n_slots,
-        .parent_folded = meta.folded,
+    UnlockRelationForExtension(index, ExclusiveLock);
+    return first;
+}
+
+static uint32
+fold_write_slots(Page page, uint32 offset, uint32 count,
+                 const CuvsCagraPendingLocation *locations)
+{
+    ItemPointerData *items = (ItemPointerData *) PageGetContents(page) + offset;
+    CuvsCagraTidPage *tag = (CuvsCagraTidPage *) PageGetSpecialPointer(page);
+    uint32 dead = 0;
+
+    for (uint32 i = 0; i < count; ++i)
+    {
+        items[i] = locations[i].tid;
+        if (!ItemPointerIsValid(&items[i]))
+            ++dead;
+    }
+    tag->dead += dead;
+    set_lower(page, (offset + count) * sizeof(*items));
+    return dead;
+}
+
+static BlockNumber
+fold_slot_block(Relation index, const CuvsCagraMeta *directory,
+                BlockNumber nblocks, uint64 slot)
+{
+    uint64 page_no = slot / CUVS_CAGRA_TIDS_PER_PAGE;
+    uint32 extent = page_no / CUVS_CAGRA_PAGE_EXTENT;
+    BlockNumber first;
+
+    if (extent >= directory->n_extents)
+        bad_page(index, 0);
+    first = directory->extents[extent];
+    if (first == 0 || first >= nblocks || nblocks - first < CUVS_CAGRA_PAGE_EXTENT)
+        bad_page(index, 0);
+    return first + page_no % CUVS_CAGRA_PAGE_EXTENT;
+}
+
+/* These pages contain no old published slots, so their page tags and TIDs
+ * can be written ahead of the metapage. A partial old page is handled in
+ * the transition record because VACUUM also reads its dead count. */
+static uint64
+fold_stage_tid_pages(Relation index, const CuvsCagraMeta *directory,
+                     BlockNumber nblocks, uint64 slot, uint64 end,
+                     const CuvsCagraPendingLocation *locations)
+{
+    uint64 dead = 0;
+
+    while (slot < end)
+    {
+        Buffer buffers[MAX_GENERIC_XLOG_PAGES];
+        int count = 0;
+        GenericXLogState *state = GenericXLogStart(index);
+
+        CHECK_FOR_INTERRUPTS();
+        while (slot < end && count < lengthof(buffers))
+        {
+            uint32 positions = Min((uint64) CUVS_CAGRA_TIDS_PER_PAGE, end - slot);
+            BlockNumber block = fold_slot_block(index, directory, nblocks, slot);
+            Buffer buffer;
+            Page page;
+            CuvsCagraTidPage *tag;
+
+            for (int i = 0; i < count; ++i)
+                if (BufferGetBlockNumber(buffers[i]) == block)
+                    bad_page(index, block);
+            buffer = ReadBuffer(index, block);
+            LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
+            buffers[count++] = buffer;
+            page = BufferGetPage(buffer);
+            /* A previous fold may have reserved this block without using it. */
+            if (!PageIsNew(page))
+            {
+                if (PageGetSpecialSize(page) != sizeof(*tag))
+                    bad_page(index, block);
+                tag = (CuvsCagraTidPage *) PageGetSpecialPointer(page);
+                if (tag->kind != CUVS_PAGE_TIDS || tag->flags != 0 ||
+                    tag->base_nonce != directory->base_nonce || tag->first_slot != slot)
+                    bad_page(index, block);
+            }
+            page = new_page(state, buffer, sizeof(*tag));
+            tag = (CuvsCagraTidPage *) PageGetSpecialPointer(page);
+            tag->kind = CUVS_PAGE_TIDS;
+            tag->base_nonce = directory->base_nonce;
+            tag->first_slot = slot;
+            dead += fold_write_slots(page, 0, positions, locations);
+            slot += positions;
+            locations += positions;
+        }
+        GenericXLogFinish(state);
+        while (count)
+            UnlockReleaseBuffer(buffers[--count]);
+    }
+    return dead;
+}
+
+static CuvsCagraFoldStatus
+publish_fold(Relation index, const CuvsCagraFoldCandidate *candidate, XLogRecPtr *commit_lsn)
+{
+    const uint64 extent_slots = (uint64) CUVS_CAGRA_PAGE_EXTENT * CUVS_CAGRA_TIDS_PER_PAGE;
+    const uint32 log_capacity =
+        (BLCKSZ - MAXALIGN(SizeOfPageHeaderData) - MAXALIGN(sizeof(CuvsCagraFoldPage))) /
+        sizeof(CuvsCagraFoldRecord);
+    CuvsCagraPendingLocation *locations;
+    CuvsCagraMeta directory;
+    CuvsCagraMeta *meta;
+    CuvsCagraFoldStatus status;
+    uint64 end, dead, xid;
+    BlockNumber nblocks;
+    uint32 old_extents;
+    uint32 offset, partial;
+    TimestampTz finished;
+    Buffer tid_buffer = InvalidBuffer;
+    Buffer log_buffer, next_log = InvalidBuffer, meta_buffer;
+    Page page;
+    CuvsCagraFoldPage *tag;
+    CuvsCagraFoldRecord *record;
+    GenericXLogState *state;
+    XLogRecPtr lsn;
+
+    *commit_lsn = InvalidXLogRecPtr;
+    if (!RelationNeedsWAL(index) || candidate->positions == 0 ||
+        candidate->positions > MaxAllocSize / sizeof(*locations))
+        return CUVS_CAGRA_FOLD_DISCARD;
+    locations = palloc((Size) candidate->positions * sizeof(*locations));
+    status = cuvs_cagra_prepare_fold(index, candidate, &directory, locations);
+    if (status != CUVS_CAGRA_FOLD_PREPARED)
+    {
+        pfree(locations);
+        return status;
+    }
+
+    old_extents = directory.n_extents;
+    end = directory.n_slots + candidate->positions;
+    while (end > (uint64) directory.n_extents * extent_slots)
+    {
+        CHECK_FOR_INTERRUPTS();
+        directory.extents[directory.n_extents++] = fold_reserve_extent(index);
+    }
+    offset = directory.n_slots % CUVS_CAGRA_TIDS_PER_PAGE;
+    partial = offset ? Min(candidate->positions, CUVS_CAGRA_TIDS_PER_PAGE - offset) : 0;
+    nblocks = RelationGetNumberOfBlocks(index);
+    dead = fold_stage_tid_pages(index, &directory, nblocks, directory.n_slots + partial,
+                               end, locations + partial);
+
+    xid = U64FromFullTransactionId(GetTopFullTransactionId());
+    finished = GetCurrentTimestamp();
+    CHECK_FOR_INTERRUPTS();
+    state = GenericXLogStart(index);
+    if (partial)
+    {
+        BlockNumber block = fold_slot_block(index, &directory, nblocks, directory.n_slots);
+        CuvsCagraTidPage *tid_tag;
+
+        tid_buffer = ReadBuffer(index, block);
+        LockBuffer(tid_buffer, BUFFER_LOCK_EXCLUSIVE);
+        page = BufferGetPage(tid_buffer);
+        if (PageIsNew(page) || PageGetSpecialSize(page) != sizeof(*tid_tag) ||
+            ((PageHeader) page)->pd_lower < MAXALIGN(SizeOfPageHeaderData) +
+                offset * sizeof(ItemPointerData) ||
+            ((PageHeader) page)->pd_lower > ((PageHeader) page)->pd_upper)
+            bad_page(index, block);
+        tid_tag = (CuvsCagraTidPage *) PageGetSpecialPointer(page);
+        if (tid_tag->kind != CUVS_PAGE_TIDS || tid_tag->flags != 0 ||
+            tid_tag->base_nonce != directory.base_nonce ||
+            tid_tag->first_slot != directory.n_slots - offset || tid_tag->dead > offset)
+            bad_page(index, block);
+        page = GenericXLogRegisterBuffer(state, tid_buffer, 0);
+        dead += fold_write_slots(page, offset, partial, locations);
+    }
+
+    if (!BlockNumberIsValid(directory.foldlog_tail) || directory.foldlog_tail == 0 ||
+        directory.foldlog_tail >= nblocks)
+        bad_page(index, 0);
+    log_buffer = ReadBuffer(index, directory.foldlog_tail);
+    LockBuffer(log_buffer, BUFFER_LOCK_EXCLUSIVE);
+    page = BufferGetPage(log_buffer);
+    if (PageIsNew(page) || PageGetSpecialSize(page) != MAXALIGN(sizeof(*tag)))
+        bad_page(index, directory.foldlog_tail);
+    tag = (CuvsCagraFoldPage *) PageGetSpecialPointer(page);
+    if (tag->kind != CUVS_PAGE_FOLDLOG || tag->flags != 0 ||
+        tag->count == 0 || tag->count > log_capacity || BlockNumberIsValid(tag->next) ||
+        ((PageHeader) page)->pd_lower != MAXALIGN(SizeOfPageHeaderData) +
+            tag->count * sizeof(*record) ||
+        ((PageHeader) page)->pd_lower > ((PageHeader) page)->pd_upper)
+        bad_page(index, directory.foldlog_tail);
+    record = (CuvsCagraFoldRecord *) PageGetContents(page) + tag->count - 1;
+    if (record->graph_nonce != directory.graph_nonce || record->n_slots != directory.n_slots ||
+        record->folded != directory.folded)
+        bad_page(index, directory.foldlog_tail);
+
+    page = GenericXLogRegisterBuffer(state, log_buffer, 0);
+    tag = (CuvsCagraFoldPage *) PageGetSpecialPointer(page);
+    if (tag->count == log_capacity)
+    {
+        next_log = extend_page(index, MAIN_FORKNUM);
+        tag->next = BufferGetBlockNumber(next_log);
+        page = new_page(state, next_log, sizeof(*tag));
+        tag = (CuvsCagraFoldPage *) PageGetSpecialPointer(page);
+        tag->kind = CUVS_PAGE_FOLDLOG;
+        tag->next = InvalidBlockNumber;
+    }
+    record = (CuvsCagraFoldRecord *) PageGetContents(page) + tag->count++;
+    *record = (CuvsCagraFoldRecord) {.graph_nonce = candidate->graph_nonce,
+        .n_slots = end, .folded = directory.folded + candidate->positions};
+    set_lower(page, tag->count * sizeof(*record));
+
+    /* Lock the metapage last and preserve any concurrent append's tail. */
+    meta_buffer = ReadBuffer(index, 0);
+    LockBuffer(meta_buffer, BUFFER_LOCK_EXCLUSIVE);
+    meta = page_meta(BufferGetPage(meta_buffer));
+    if (!meta || !fold_base_matches(meta, candidate) ||
+        meta->foldlog_tail != directory.foldlog_tail ||
+        meta->n_extents != old_extents ||
+        memcmp(meta->extents, directory.extents, old_extents * sizeof(BlockNumber)) != 0 ||
+        meta->dead_slots > meta->n_slots)
+        bad_page(index, 0);
+    meta = page_meta(GenericXLogRegisterBuffer(state, meta_buffer, 0));
+    Assert(meta != NULL);
+    for (uint32 extent = meta->n_extents; extent < directory.n_extents; ++extent)
+        meta->extents[extent] = directory.extents[extent];
+    meta->n_extents = directory.n_extents;
+    meta->graph_nonce = candidate->graph_nonce;
+    meta->n_slots = end;
+    meta->folded += candidate->positions;
+    meta->dead_slots += dead;
+    meta->last_fold_xid = xid;
+    meta->last_fold_time = finished;
+    if (BufferIsValid(next_log))
+        meta->foldlog_tail = BufferGetBlockNumber(next_log);
+
+    /* This is the irreversible PG publication point. Never undo it on
+     * cancellation or restart. Redo decides which complete record is visible. */
+    lsn = GenericXLogFinish(state);
+    UnlockReleaseBuffer(meta_buffer);
+    if (BufferIsValid(next_log))
+        UnlockReleaseBuffer(next_log);
+    UnlockReleaseBuffer(log_buffer);
+    if (BufferIsValid(tid_buffer))
+        UnlockReleaseBuffer(tid_buffer);
+    UnlockPage(index, 0, ExclusiveLock);
+    XLogFlush(lsn);
+    *commit_lsn = lsn;
+    pfree(locations);
+    return CUVS_CAGRA_FOLD_PUBLISHED;
+}
+
+CuvsCagraFoldStatus
+cuvs_cagra_publish_fold(Relation index, const CuvsCagraFoldCandidate *candidate,
+                        XLogRecPtr *commit_lsn)
+{
+    if (!IsBackgroundWorker || !IsTransactionState() || IsTransactionBlock() ||
+        IsSubTransaction() || IsInParallelMode() ||
+        TransactionIdIsValid(GetTopTransactionIdIfAny()))
+        ereport(ERROR, (errmsg("CAGRA fold publication requires a standalone background worker operation")));
+    return publish_fold(index, candidate, commit_lsn);
+}
+
+#ifdef CUVS_TEST_HOOKS
+static CuvsCagraFoldCandidate
+test_fold_candidate(const CuvsCagraMeta *meta, int32 positions, int32 mismatch)
+{
+    CuvsCagraFoldCandidate candidate = {
+        .index_nonce = meta->index_nonce,
+        .base_nonce = meta->base_nonce,
+        .parent_graph_nonce = meta->graph_nonce,
+        .parent_n_slots = meta->n_slots,
+        .parent_folded = meta->folded,
         .graph_nonce = cuvs_cagra_nonce(),
         .positions = (uint32) positions,
     };
+
+    if (positions < 0 || (Size) positions > MaxAllocSize / sizeof(CuvsCagraPendingLocation))
+        ereport(ERROR, (errmsg("invalid fold test position count")));
+
     switch (mismatch)
     {
         case 0: break;
@@ -580,7 +853,28 @@ cuvs_test_fold_prepare(PG_FUNCTION_ARGS)
         case 6: candidate.graph_nonce = candidate.parent_graph_nonce; break;
         default: ereport(ERROR, (errmsg("invalid fold test mismatch")));
     }
+    return candidate;
+}
 
+PG_FUNCTION_INFO_V1(cuvs_test_fold_prepare);
+
+Datum
+cuvs_test_fold_prepare(PG_FUNCTION_ARGS)
+{
+    Relation index = index_open(PG_GETARG_OID(0), RowExclusiveLock);
+    int32 positions = PG_GETARG_INT32(1);
+    CuvsCagraMeta meta;
+    CuvsCagraFoldCandidate candidate;
+    CuvsCagraPendingLocation *locations;
+    CuvsCagraFoldStatus status;
+    StringInfoData result;
+
+    if (RelationGetNumberOfBlocks(index) == 0 || !cuvs_cagra_read_meta(index, &meta))
+    {
+        index_close(index, RowExclusiveLock);
+        PG_RETURN_TEXT_P(cstring_to_text("discard"));
+    }
+    candidate = test_fold_candidate(&meta, positions, PG_GETARG_INT32(2));
     locations = palloc((Size) positions * sizeof(*locations));
     status = cuvs_cagra_prepare_fold(index, &candidate, &meta, locations);
     if (status != CUVS_CAGRA_FOLD_PREPARED)
@@ -604,6 +898,39 @@ cuvs_test_fold_prepare(PG_FUNCTION_ARGS)
     UnlockPage(index, 0, ExclusiveLock);
     index_close(index, RowExclusiveLock);
     PG_RETURN_TEXT_P(cstring_to_text(result.data));
+}
+
+PG_FUNCTION_INFO_V1(cuvs_test_fold_publish);
+
+Datum
+cuvs_test_fold_publish(PG_FUNCTION_ARGS)
+{
+    Relation index = index_open(PG_GETARG_OID(0), RowExclusiveLock);
+    CuvsCagraMeta meta;
+    CuvsCagraFoldCandidate candidate;
+    CuvsCagraFoldStatus status;
+    XLogRecPtr lsn;
+
+    if (RelationGetNumberOfBlocks(index) == 0 || !cuvs_cagra_read_meta(index, &meta))
+    {
+        index_close(index, RowExclusiveLock);
+        PG_RETURN_TEXT_P(cstring_to_text("discard"));
+    }
+    candidate = test_fold_candidate(&meta, PG_GETARG_INT32(1), 0);
+    /* The fixture can model a synthetic candidate or check the production gate. */
+    if (PG_GETARG_BOOL(2))
+        status = cuvs_cagra_publish_fold(index, &candidate, &lsn);
+    else
+        status = publish_fold(index, &candidate, &lsn);
+    index_close(index, RowExclusiveLock);
+    if (status == CUVS_CAGRA_FOLD_PUBLISHED)
+    {
+        if (XLogRecPtrIsInvalid(lsn) || lsn > GetFlushRecPtr(NULL))
+            ereport(ERROR, (errmsg("fold returned an unflushed publication LSN")));
+        PG_RETURN_TEXT_P(cstring_to_text(psprintf("published %X/%X", LSN_FORMAT_ARGS(lsn))));
+    }
+    PG_RETURN_TEXT_P(cstring_to_text(status == CUVS_CAGRA_FOLD_DEFERRED ?
+                                    "deferred" : "discard"));
 }
 
 PG_FUNCTION_INFO_V1(cuvs_test_pending_first);
