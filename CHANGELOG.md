@@ -88,10 +88,13 @@ exists for 0.9.0.
 
 ### Fixed
 
-- `pg_cuvs_hnsw` stores its configured `ef_construction` in the metapage
-  for heap and source builds. The build receipt still records the SDK's
-  effective settings. Heap builds cap the intermediate graph width at 1024
-  and report the cap with a NOTICE when it limits the requested width.
+- `pg_cuvs_hnsw` applies `ef_construction` to the applicable SDK settings for
+  direct heap builds and records the configured value in the index metapage.
+  Conversions from legacy CAGRA indexes use the option only for the target
+  metapage value during the build. For later inserts, pgvector reads EF from
+  the index reloption. Heap builds cap the intermediate graph width at the
+  SDK limit of 1024 and emit a NOTICE when a higher request yields that width.
+  The build receipt reports the serialized hnswlib EF separately.
 
 - `CREATE INDEX CONCURRENTLY ... USING pg_cuvs_hnsw` and `REINDEX INDEX CONCURRENTLY` of a `pg_cuvs_hnsw` index
   built from the heap (without `source`) no longer make the table's queries wait for a lock. The build opened the
