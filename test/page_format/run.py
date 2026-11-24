@@ -678,6 +678,29 @@ def check_fold_extent_reuse(cluster, db):
         INSERT INTO fold_extent
         SELECT i, ARRAY[i::real,0,0]::vector FROM generate_series(100001,101359) i;
     """)
+    size_sql = "SELECT pg_relation_size('fold_extent_idx') / current_setting('block_size')::int;"
+    before_blocks = int(fold_query(cluster, db, "fold-extent-before", size_sql))
+    before_meta = fold_raw_page(cluster, db, 0, "fold_extent_idx")
+    cluster.sql(db, "fold-extent-interrupt", "-c", FOLD_PUBLISH_SQL + """
+        SET cuvs.test_abort_staged_fold = on;
+        SELECT pg_temp.publish_fold('fold_extent_idx',2,false);
+    """, expect=["stopped the fold after staging its TID pages"])
+    staged_blocks = int(fold_query(cluster, db, "fold-extent-staged", size_sql))
+    if staged_blocks != before_blocks + 64:
+        raise RuntimeError("interrupted fold did not reserve one complete extent")
+    if fold_raw_page(cluster, db, 0, "fold_extent_idx") != before_meta:
+        raise RuntimeError("interrupted extent reservation published a new directory")
+    staged_last = fold_raw_page(cluster, db, staged_blocks - 1, "fold_extent_idx")
+
+    cluster.sql(db, "fold-extent-later-appends", "-c", """
+        INSERT INTO fold_extent
+        SELECT i, ARRAY[i::real,0,0]::vector FROM generate_series(200001,201500) i;
+    """, "-c", "CHECKPOINT;")
+    before_retry = int(fold_query(cluster, db, "fold-extent-before-retry", size_sql))
+    if before_retry <= staged_blocks:
+        raise RuntimeError("the pending list did not extend beyond the orphaned extent")
+    cluster.stop(mode="immediate")
+    cluster.start(label="fold-extent-restart")
     for count in (2, 1357):
         result = fold_query(cluster, db, f"fold-extent-publish-{count}", FOLD_PUBLISH_SQL +
             f"SELECT pg_temp.publish_fold('fold_extent_idx',{count},false);")
@@ -686,13 +709,69 @@ def check_fold_extent_reuse(cluster, db):
     meta = fold_raw_page(cluster, db, 0, "fold_extent_idx")
     extent_count, = struct.unpack_from("=I", meta, 132)
     second_extent, = struct.unpack_from("=I", meta, 164)
+    retry_blocks = int(fold_query(cluster, db, "fold-extent-after-retry", size_sql))
+    if retry_blocks != before_retry or second_extent != before_blocks:
+        raise RuntimeError("retry did not reclaim the orphaned extent after restart")
     next_page = fold_raw_page(cluster, db, second_extent + 1, "fold_extent_idx")
     if extent_count != 2 or struct.unpack_from("=Q", next_page, 8184)[0] != 88205:
         raise RuntimeError("the second fold did not use the next page of the existing extent")
     last_page = fold_raw_page(cluster, db, second_extent + 63, "fold_extent_idx")
-    if struct.unpack_from("=II", last_page) == (0, 0):
-        raise RuntimeError("WAL did not reserve the full extent on a fresh standby")
+    if struct.unpack_from("=II", last_page) <= struct.unpack_from("=II", staged_last):
+        raise RuntimeError("reclaiming the extent did not WAL-log its final block")
     cluster.sql(db, "fold-extent-vacuum", "-c", "VACUUM (INDEX_CLEANUP ON, TRUNCATE OFF) fold_extent;")
+    remaining = fold_query(cluster, db, "fold-extent-pending-suffix", FOLD_PREPARE_SQL + """
+        SELECT pg_temp.prepare_fold('fold_extent_idx',1500,0) =
+               (SELECT 'prepared ' || string_agg(ctid::text, ' ' ORDER BY id)
+                FROM fold_extent WHERE id >= 200001);
+    """)
+    if remaining != "t":
+        raise RuntimeError("extent reuse changed the pending TIDs appended after the interruption")
+
+    published = fold_raw_page(cluster, db, second_extent, "fold_extent_idx")
+    cluster.sql(db, "fold-extent-next-pending", "-c", """
+        INSERT INTO fold_extent
+        SELECT i, ARRAY[i::real,0,0]::vector FROM generate_series(300001,383991) i;
+    """)
+    before_third = int(fold_query(cluster, db, "fold-extent-before-third", size_sql))
+    result = fold_query(cluster, db, "fold-extent-publish-third", FOLD_PUBLISH_SQL + """
+        SELECT pg_temp.publish_fold('fold_extent_idx',85491,false);
+    """)
+    if not result.startswith("published "):
+        raise RuntimeError(f"fold crossing the third extent failed: {result}")
+    meta = fold_raw_page(cluster, db, 0, "fold_extent_idx")
+    extent_count, = struct.unpack_from("=I", meta, 132)
+    second_after, third_extent = struct.unpack_from("=2I", meta, 164)
+    if (extent_count, second_after, third_extent) != (3, second_extent, before_third):
+        raise RuntimeError("a published extent was reclaimed")
+    if fold_raw_page(cluster, db, second_extent, "fold_extent_idx") != published:
+        raise RuntimeError("crossing into the third extent rewrote published TIDs")
+
+    reclaim_from, = struct.unpack_from("=I", meta, 136)
+    if reclaim_from != third_extent:
+        raise RuntimeError("a fresh allocation did not advance the reclaim scan")
+    cluster.stop(mode="immediate")
+    cluster.start(label="fold-reclaim-watermark-restart")
+    if fold_raw_page(cluster, db, 0, "fold_extent_idx") != meta:
+        raise RuntimeError("WAL replay changed the reclaim boundary or extent directory")
+    third_first = fold_raw_page(cluster, db, third_extent, "fold_extent_idx")
+    cluster.sql(db, "fold-extent-fourth-pending", "-c", """
+        INSERT INTO fold_extent
+        SELECT i, ARRAY[i::real,0,0]::vector FROM generate_series(400001,486848) i;
+    """)
+    before_fourth = int(fold_query(cluster, db, "fold-extent-before-fourth", size_sql))
+    result = fold_query(cluster, db, "fold-extent-publish-fourth", FOLD_PUBLISH_SQL + """
+        SELECT pg_temp.publish_fold('fold_extent_idx',86848,false);
+    """)
+    if not result.startswith("published "):
+        raise RuntimeError(f"fold crossing the fourth extent failed: {result}")
+    meta = fold_raw_page(cluster, db, 0, "fold_extent_idx")
+    extent_count, = struct.unpack_from("=I", meta, 132)
+    third_after, fourth_extent = struct.unpack_from("=2I", meta, 168)
+    if (extent_count, third_after, fourth_extent) != (4, third_extent, before_fourth):
+        raise RuntimeError("a scanned published extent was reclaimed")
+    old_tid = third_first[24:30]
+    if fold_raw_page(cluster, db, third_extent, "fold_extent_idx")[24:30] != old_tid:
+        raise RuntimeError("crossing into the fourth extent overwrote a published TID")
     print("Fold extent rollover and reuse: PASS", flush=True)
 
 
