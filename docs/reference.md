@@ -25,12 +25,37 @@ pg_cuvs registers four index AMs. All reuse pgvector's `vector` type and operato
 | `ivfpq` | `CREATE INDEX i ON t USING ivfpq (col vector_l2_ops)` | `n_lists`, `pq_bits`, `pq_dim`, `index_dir` | GPU daemon | `.ivfpq`, `.tids` |
 | `pg_cuvs_hnsw` | `CREATE INDEX i ON t USING pg_cuvs_hnsw (col vector_l2_ops) WITH (source='my_cagra', mode='nsw')` | `source`, `mode`, `m`, `ef_construction`, `build_algo` | **pgvector** (CPU) | pgvector-format pages in this index's PostgreSQL relation; optional `.hnsw` hnswlib conversion sidecar, not the index storage |
 
-**Vector dimensions.** `cagra`, `flat`, and `ivfpq` infer the dimension of an untyped
-`vector` column from the first non-NULL row selected for the index. A later row
-with a different dimension aborts `CREATE INDEX` with SQLSTATE 22000. The error
-reports the heap TID and both dimensions. An insert also has to match the
-dimension once an existing build has recorded it. Use a column declared as
-`vector(n)` to enforce its dimension at the table boundary.
+**Vector dimensions.** For a column declared as `vector` with no dimension,
+`cagra`, `flat`, and `ivfpq` infer the dimension from the first live,
+non-NULL vector visited during the index build. For a partial index, only
+rows satisfying its predicate participate. A different dimension aborts
+`CREATE INDEX` or `REINDEX` with SQLSTATE 22000. The error names the table
+and index, both dimensions, and the index TID (which can be the root of a
+HOT update chain). Inserts into a built index must match its recorded
+dimension. After `TRUNCATE` or a build with no eligible vectors, the index
+has no recorded dimension and searches use the heap until a nonempty
+`REINDEX`. Use `vector(n)` to enforce a fixed dimension at the table boundary.
+
+Earlier releases could build an index over mixed dimensions and silently
+omit rows. Upgrading does not repair those indexes. For example, audit an
+untyped column named `embedding` as follows, adding the index predicate to
+the `WHERE` clause for a partial index:
+
+```sql
+SELECT vector_dims(embedding), count(*)
+FROM items
+WHERE embedding IS NOT NULL
+GROUP BY 1;
+```
+
+Review and correct rows with the unintended dimension. Where the entire
+column uses a single dimension, consider declaring it as `vector(n)`. Run
+`REINDEX INDEX` to rebuild the affected index after correcting the data.
+A manual or automatic concurrent rebuild of a mixed-dimension index can
+fail with 22000 until the data is corrected. If auto-compaction retries the
+build, pause it while repairing the data. Inspect `pg_index.indisvalid` and
+remove any invalid temporary `_ccnew` indexes left by the failed attempt
+before retrying.
 
 `flat` is the first-class exact GPU brute-force AM (ADR-073, extension v0.4.0). It builds only a
 `.tids` + `.vectors` store — no CAGRA graph — so the build is O(N) copy rather than graph

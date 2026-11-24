@@ -88,11 +88,13 @@ exists for 0.9.0.
 
 ### Fixed
 
-- CAGRA, flat, and IVF-PQ builds now reject mixed vector dimensions with SQLSTATE
-  22000. Builds that previously succeeded after dropping mismatched rows now report
-  the heap TID and both dimensions. A uniform column declared as vector still
-  infers its dimension from the first indexed row. A later insert into an untyped
-  column must match the dimension recorded by the existing build.
+- CAGRA, flat, and IVF-PQ builds and rebuilds now reject mixed vector
+  dimensions with SQLSTATE 22000. Earlier indexes may have silently omitted
+  mismatched rows. Audit the column with `vector_dims`, correct the data,
+  and rebuild the affected indexes. See [Vector dimensions](docs/reference.md#1-index-access-methods)
+  for the audit query and concurrent rebuild recovery. Inserts into a built
+  index must match the recorded dimension. An empty rebuild or `TRUNCATE`
+  clears that requirement until a nonempty `REINDEX`.
 
 - `CREATE INDEX CONCURRENTLY ... USING pg_cuvs_hnsw` and `REINDEX INDEX CONCURRENTLY` of a `pg_cuvs_hnsw` index
   built from the heap (without `source`) no longer make the table's queries wait for a lock. The build opened the

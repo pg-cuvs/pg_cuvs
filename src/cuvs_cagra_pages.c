@@ -2,6 +2,79 @@
 
 #include "cuvs_cagra_pages.h"
 #include "utils/memutils.h"
+#include "access/xlog.h"
+#include "storage/bufpage.h"
+
+#define CUVS_LEGACY_EMPTY_MAGIC 0x4356454dU
+
+static bool
+cuvs_legacy_empty_metapage(Relation index)
+{
+    Buffer buf = ReadBuffer(index, 0);
+    Page page;
+    bool empty;
+
+    LockBuffer(buf, BUFFER_LOCK_SHARE);
+    page = BufferGetPage(buf);
+    empty = !PageIsNew(page) &&
+        ((PageHeader) page)->pd_lower == MAXALIGN(SizeOfPageHeaderData) + sizeof(uint32) &&
+        *((uint32 *) PageGetContents(page)) == CUVS_LEGACY_EMPTY_MAGIC;
+    UnlockReleaseBuffer(buf);
+    return empty;
+}
+
+bool
+cuvs_cagra_has_pages(Relation index)
+{
+    BlockNumber blocks = RelationGetNumberOfBlocks(index);
+
+    return blocks > 1 || (blocks == 1 && !cuvs_legacy_empty_metapage(index));
+}
+
+bool
+cuvs_legacy_index_is_empty(Relation index)
+{
+    return RelationGetNumberOfBlocks(index) == 1 && cuvs_legacy_empty_metapage(index);
+}
+
+void
+cuvs_legacy_index_init_empty(Relation index, ForkNumber fork)
+{
+    Buffer buf;
+    Page page;
+
+    /*
+     * PostgreSQL installs a new index relfilenode for a transactional
+     * TRUNCATE or REINDEX. Record the empty build in that relation so
+     * rollback restores the previous state. OID-keyed daemon files may
+     * still describe the previous build.
+     */
+    buf = ExtendBufferedRel(BMR_REL(index), fork, NULL,
+                            EB_LOCK_FIRST | EB_CREATE_FORK_IF_NEEDED);
+    page = BufferGetPage(buf);
+    START_CRIT_SECTION();
+    PageInit(page, BLCKSZ, 0);
+    *((uint32 *) PageGetContents(page)) = CUVS_LEGACY_EMPTY_MAGIC;
+    ((PageHeader) page)->pd_lower = MAXALIGN(SizeOfPageHeaderData) + sizeof(uint32);
+    MarkBufferDirty(buf);
+    if (RelationNeedsWAL(index) || fork == INIT_FORKNUM)
+        log_newpage_buffer(buf, true);
+    END_CRIT_SECTION();
+    if (fork == INIT_FORKNUM)
+        FlushOneBuffer(buf);
+    UnlockReleaseBuffer(buf);
+}
+
+void
+cuvs_legacy_index_require_base(Relation index)
+{
+    if (cuvs_legacy_index_is_empty(index))
+        ereport(ERROR,
+                (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+                 errmsg("pg_cuvs: index \"%s\" has no built vectors",
+                        RelationGetRelationName(index)),
+                 errhint("Load vectors and run REINDEX INDEX.")));
+}
 
 CuvsCagraRelCache *
 cuvs_cagra_relation_cache(Relation index)
