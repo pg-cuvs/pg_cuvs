@@ -639,7 +639,8 @@ def check_corrupt_prefix(cluster, binary):
                 CREATE EXTENSION pageinspect;
                 CREATE TABLE broken_prefix(id int PRIMARY KEY, v vector(3));
                 INSERT INTO broken_prefix VALUES (1, '[1,2,3]'), (2, '[2,0,0]');
-            """ + "".join(f"CREATE INDEX {name} ON broken_prefix USING cagra(v vector_l2_ops);"
+                CREATE TABLE prefix_reclaimed AS SELECT ctid AS old_tid FROM broken_prefix WHERE id=2;
+            """ + "".join(f"CREATE INDEX {name} ON broken_prefix USING cagra(v vector_l2_ops) WHERE id <= 2;"
                           for name in indexes))
             cluster.sql("postgres", "paths", "-At", "-c", f"""
                 SELECT name, pg_relation_filepath(name::regclass), current_setting('block_size')
@@ -651,10 +652,12 @@ def check_corrupt_prefix(cluster, binary):
                 raise RuntimeError("did not resolve every damaged index fixture")
             cluster.stop()
             relations = {}
+            pristine_meta = {}
             for row in rows:
                 name, filename, block_size = row.split("|")
                 relation = cluster.data / filename
                 images = bytearray(relation.read_bytes())
+                pristine_meta[name] = bytes(images[:int(block_size)])
                 if name in ("future_idx", "short_idx"):
                     struct.pack_into("=H", images, 12, 36 if name == "future_idx" else 35)
                     struct.pack_into("=HHI", images, 28, 777, 12, 128)
@@ -683,11 +686,45 @@ def check_corrupt_prefix(cluster, binary):
                 DO $$ BEGIN
                     IF NOT test_cagra_reindex_required('future_idx')
                         OR NOT test_cagra_reindex_required('bad_slot_idx')
-                        OR test_cagra_reindex_required('short_idx')
-                        OR test_cagra_reindex_required('bad_magic_idx')
-                        OR test_cagra_reindex_required('bad_header_idx')
+                        OR NOT test_cagra_reindex_required('short_idx')
+                        OR NOT test_cagra_reindex_required('bad_magic_idx')
+                        OR NOT test_cagra_reindex_required('bad_header_idx')
                         OR test_cagra_reindex_required('broken_prefix_pkey') THEN
                         RAISE EXCEPTION 'the rebuild worker reader misclassified a metapage';
+                    END IF;
+                END $$;
+            """)
+            # A durable commit after VACUUM flushes its WAL. Restore the earlier
+            # undamaged copies of block zero while the cluster is stopped, then
+            # check what PostgreSQL redo applies to those copies.
+            cluster.sql("postgres", "flush-marker-wal", "-c", "CREATE TABLE prefix_wal_barrier(id int);")
+            cluster.stop("immediate")
+            repaired_by_image = ("short_idx", "bad_magic_idx", "bad_header_idx")
+            for name in repaired_by_image:
+                relation, _, _ = relations[name]
+                with relation.open("r+b") as file:
+                    file.write(pristine_meta[name])
+            cluster.start("replay-old-prefix")
+            cluster.sql("postgres", "replayed-prefix", "-c", """
+                DO $$ BEGIN
+                    IF NOT test_cagra_reindex_required('short_idx')
+                        OR NOT test_cagra_reindex_required('bad_magic_idx')
+                        OR NOT test_cagra_reindex_required('bad_header_idx') THEN
+                        RAISE EXCEPTION 'WAL redo did not mark the undamaged copies of block zero';
+                    END IF;
+                END $$;
+
+                INSERT INTO broken_prefix VALUES (3, '[2,0,0]');
+                SET enable_seqscan=off;
+                DO $$ BEGIN
+                    IF (SELECT ctid FROM broken_prefix WHERE id=3)
+                       IS DISTINCT FROM (SELECT old_tid FROM prefix_reclaimed) THEN
+                        RAISE EXCEPTION 'fixture did not reuse the vacuumed heap TID';
+                    END IF;
+                    IF (SELECT id FROM broken_prefix WHERE id <= 2
+                        ORDER BY v <-> '[2,0,0]' LIMIT 1) IS DISTINCT FROM 1
+                        OR pg_cuvs_last_search_k() IS NOT NULL THEN
+                        RAISE EXCEPTION 'a repaired prefix did not force the visible heap result';
                     END IF;
                 END $$;
             """)
@@ -699,9 +736,13 @@ def check_corrupt_prefix(cluster, binary):
                     expected = 129 if name == "future_idx" else 1
                     if flag != expected or after[block_size:] != before[block_size:]:
                         raise RuntimeError(f"incorrect marker or data changes for {name}")
-                elif after != before:
-                    raise RuntimeError(f"VACUUM changed an index without a valid common prefix: {name}")
-            print("damaged prefix: cleanup-only and bulk delete, guarded writes and warning scope: PASS",
+                else:
+                    lower = struct.unpack_from("=H", after, 12)[0]
+                    magic, _, _, flags = struct.unpack_from("=IHHI", after, 24)
+                    if (lower != 36 or magic != 0x43565047 or flags != 1
+                            or after[block_size:] != before[block_size:]):
+                        raise RuntimeError(f"incorrect marker-only metapage or data changes for {name}")
+            print("Damaged prefix: marker-only full-image replay onto valid metadata and TID reuse: PASS",
                   flush=True)
         finally:
             cluster.stop()

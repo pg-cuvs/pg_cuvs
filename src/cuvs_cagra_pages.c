@@ -228,20 +228,31 @@ read_meta_buffer(Relation index, BufferAccessStrategy strategy)
     return buf;
 }
 
-bool
-cuvs_cagra_read_meta(Relation index, CuvsCagraMeta *meta)
+static bool
+read_cagra_meta(Relation index, BufferAccessStrategy strategy, CuvsCagraMeta *meta,
+                bool *prefix_readable)
 {
-    Buffer buf = read_meta_buffer(index, NULL);
+    Buffer buf = read_meta_buffer(index, strategy);
     CuvsCagraMeta *found;
 
+    if (prefix_readable)
+        *prefix_readable = false;
     if (!BufferIsValid(buf))
         return false;
     LockBuffer(buf, BUFFER_LOCK_SHARE);
     found = page_meta(BufferGetPage(buf));
     if (found != NULL)
         memcpy(meta, found, sizeof(*meta));
+    if (prefix_readable)
+        *prefix_readable = found != NULL || page_meta_prefix(BufferGetPage(buf)) != NULL;
     UnlockReleaseBuffer(buf);
     return found != NULL;
+}
+
+bool
+cuvs_cagra_read_meta(Relation index, CuvsCagraMeta *meta)
+{
+    return read_cagra_meta(index, NULL, meta, NULL);
 }
 
 bool
@@ -762,20 +773,47 @@ vacuum_warn_reindex(Relation index)
 }
 
 static void
-vacuum_mark_reindex(Relation index, BufferAccessStrategy strategy)
+vacuum_mark_reindex(Relation index, BufferAccessStrategy strategy, bool prefix_readable)
 {
-    Buffer buf = read_meta_buffer(index, strategy);
-    CuvsCagraMeta *prefix;
+    Buffer buf = InvalidBuffer;
+    CuvsCagraMeta *prefix = NULL;
 
+    /* Count the earlier read if it failed to read the common prefix. */
+    for (int attempts = prefix_readable ? 2 : 1; attempts > 0; --attempts)
+    {
+        buf = read_meta_buffer(index, strategy);
+        if (!BufferIsValid(buf))
+            continue;
+        LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
+        prefix = page_meta_prefix(BufferGetPage(buf));
+        if (prefix != NULL || attempts == 1)
+            break;
+        UnlockReleaseBuffer(buf);
+        buf = InvalidBuffer;
+    }
     if (!BufferIsValid(buf))
-        return;
-    LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
-    prefix = page_meta_prefix(BufferGetPage(buf));
-    if (prefix != NULL && !(prefix->flags & CUVS_CAGRA_REINDEX_REQUIRED))
+    {
+        buf = ReadBufferExtended(index, MAIN_FORKNUM, 0, RBM_ZERO_AND_LOCK, strategy);
+        prefix = page_meta_prefix(BufferGetPage(buf));
+    }
+
+    if (prefix == NULL || !(prefix->flags & CUVS_CAGRA_REINDEX_REQUIRED))
     {
         GenericXLogState *wal = GenericXLogStart(index);
+        Page image = GenericXLogRegisterBuffer(wal, buf, prefix == NULL ? GENERIC_XLOG_FULL_IMAGE : 0);
 
-        prefix = (CuvsCagraMeta *) PageGetContents(GenericXLogRegisterBuffer(wal, buf, 0));
+        if (prefix == NULL)
+        {
+            /* Standbys and restored copies can still have valid old bytes.
+             * Publish a complete image before VACUUM frees heap TIDs. */
+            PageInit(image, BLCKSZ, 0);
+            prefix = (CuvsCagraMeta *) PageGetContents(image);
+            prefix->magic = CUVS_CAGRA_PAGE_MAGIC;
+            prefix->major = CUVS_CAGRA_PAGE_MAJOR;
+            set_lower(image, CAGRA_META_PREFIX_SIZE);
+        }
+        else
+            prefix = (CuvsCagraMeta *) PageGetContents(image);
         prefix->flags |= CUVS_CAGRA_REINDEX_REQUIRED;
         GenericXLogFinish(wal);
     }
@@ -783,7 +821,7 @@ vacuum_mark_reindex(Relation index, BufferAccessStrategy strategy)
 }
 
 static IndexBulkDeleteResult *
-vacuum_skip(IndexVacuumInfo *info, BlockNumber block)
+vacuum_skip(IndexVacuumInfo *info, BlockNumber block, bool prefix_readable)
 {
     Relation index = info->index;
 
@@ -791,7 +829,7 @@ vacuum_skip(IndexVacuumInfo *info, BlockNumber block)
     if (info->report_progress)
         bad_page(index, block);
 
-    vacuum_mark_reindex(index, info->strategy);
+    vacuum_mark_reindex(index, info->strategy, prefix_readable);
     UnlockPage(index, 0, ExclusiveLock);
     vacuum_warn_reindex(index);
     return NULL;
@@ -815,12 +853,12 @@ vacuum_lock(CagraVacuum *vac, BlockNumber block)
 {
     Buffer buf;
 
-    CHECK_FOR_INTERRUPTS();
     vac->block = block;
     if (block == 0 || block >= vac->nblocks)
         return InvalidBuffer;
     if (vac->nheld == lengthof(vac->held))
         vacuum_finish_batch(vac);
+    CHECK_FOR_INTERRUPTS();
     buf = ReadBufferExtended(vac->index, MAIN_FORKNUM, block, RBM_NORMAL, vac->strategy);
     LockBuffer(buf, vac->validate_only ? BUFFER_LOCK_SHARE : BUFFER_LOCK_EXCLUSIVE);
     vac->held[vac->nheld++] = buf;
@@ -1013,9 +1051,12 @@ cuvs_cagra_page_bulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
     CuvsCagraMeta *updated;
     GenericXLogState *wal;
 
+    bool prefix_readable;
+
     LockPage(index, 0, ExclusiveLock);
-    if (!cuvs_cagra_read_meta(index, &meta) || !vacuum_validate(&vac, &meta))
-        return vacuum_skip(info, vac.block);
+    if (!read_cagra_meta(index, info->strategy, &meta, &prefix_readable) ||
+        !vacuum_validate(&vac, &meta))
+        return vacuum_skip(info, vac.block, prefix_readable);
     if (!vacuum_pending(&vac, &meta) || !vacuum_slots(&vac, &meta))
         bad_page(index, vac.block);
     vacuum_finish_batch(&vac);
@@ -1063,14 +1104,15 @@ cuvs_cagra_page_vacuumcleanup(IndexVacuumInfo *info, IndexBulkDeleteResult *stat
 {
     CuvsCagraMeta meta;
     CagraVacuum vac = {.index = info->index, .strategy = info->strategy};
+    bool prefix_readable;
 
     if (info->analyze_only)
         return stats;
 
     LockPage(info->index, 0, ExclusiveLock);
-    if (!cuvs_cagra_read_meta(info->index, &meta) ||
+    if (!read_cagra_meta(info->index, info->strategy, &meta, &prefix_readable) ||
         (stats == NULL && !vacuum_validate(&vac, &meta)))
-        return vacuum_skip(info, vac.block);
+        return vacuum_skip(info, vac.block, prefix_readable);
     if (stats != NULL)
         stats->num_pages = RelationGetNumberOfBlocks(info->index);
     UnlockPage(info->index, 0, ExclusiveLock);

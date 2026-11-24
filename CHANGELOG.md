@@ -90,8 +90,9 @@ exists for 0.9.0.
 
 - With the experimental CAGRA page format enabled, VACUUM skips indexes with an
   unrecognized format or damaged pages, warns once per affected index with a
-  REINDEX hint, and continues cleaning the table. A readable common metapage
-  prefix records that REINDEX is required.
+  REINDEX hint, and continues cleaning the table. The REINDEX flag is logged
+  before heap TIDs can be reused. An unreadable common metapage prefix is
+  replaced with a minimal marker in a full-page WAL record.
 
 - `CREATE INDEX CONCURRENTLY ... USING pg_cuvs_hnsw` and `REINDEX INDEX CONCURRENTLY` of a `pg_cuvs_hnsw` index
   built from the heap (without `source`) no longer make the table's queries wait for a lock. The build opened the
