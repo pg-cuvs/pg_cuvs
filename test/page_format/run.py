@@ -17,14 +17,14 @@ CASES = Path(__file__).resolve().parent
 ROOT = CASES.parents[1]
 MUTATIONS = {
     "wal-buffer": (
-        "        append_item(image, tid);",
-        "        append_item(BufferGetPage(full ? nb : tb), tid);",
+        "        append_item(image, tid, vector);",
+        "        append_item(BufferGetPage(full ? nb : tb), tid, vector);",
     ),
-    "wal-lower": ("    set_lower(page, pending->count * sizeof(*items));", ""),
+    "wal-lower": ("    set_lower(page, pending->count * stride);", ""),
     "unknown": ("    meta.major = CUVS_CAGRA_PAGE_MAJOR;",
                 "    meta.major = CUVS_CAGRA_PAGE_MAJOR + 1;"),
-    "flags": ("    meta.major = CUVS_CAGRA_PAGE_MAJOR;",
-              "    meta.major = CUVS_CAGRA_PAGE_MAJOR;\n    meta.flags = 1;"),
+    "flags": ("    meta.flags = pending_vectors ? CUVS_CAGRA_PENDING_VECTOR : 0;",
+              "    meta.flags = 1;"),
 }
 
 
@@ -519,7 +519,7 @@ def run(work, logs):
     with cluster.daemon(source_on / "pg_cuvs_server", "on") as daemon:
         cluster.start()
         try:
-            for case in ("alpha1", "alpha2_basic", "truncate", "relcache", "beta1a"):
+            for case in ("alpha1", "alpha2_basic", "truncate", "relcache", "beta1a", "beta1b_expression"):
                 cluster.run("createdb", [case], f"createdb-{case}")
                 cluster.file(case, case)
                 print(f"{case}: PASS", flush=True)

@@ -68,7 +68,7 @@ def concurrent_validation(label, incoming, expect_error):
                    (page_header(get_raw_page('{idx}',65))).lower
             FROM pg_index i WHERE i.indexrelid='{idx}'::regclass;
         """)
-        if state != "t|2|1|30":
+        if state != "t|2|1|42":
             raise RuntimeError(f"CIC did not add the post-snapshot row in validation: {state}")
         if sql(f"""
              SET enable_seqscan=off;
