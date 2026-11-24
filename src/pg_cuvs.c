@@ -49,7 +49,6 @@
 #include "catalog/index.h"
 #include "catalog/namespace.h"
 #include "catalog/pg_am_d.h"
-#include "utils/hsearch.h"
 #include "catalog/pg_type.h"
 #include "commands/defrem.h"
 #include "commands/tablespace.h"
@@ -223,6 +222,9 @@ static int32    cuvs_last_n_results = -1;        /* -1 = no scan yet */
 static int32    cuvs_last_k_requested = 0;
 static Oid      cuvs_last_index_oid = InvalidOid;
 static uint32_t cuvs_last_metric    = 0;
+#ifdef CUVS_PAGE_FORMAT
+static uint64   cuvs_page_bad_slots;
+#endif
 
 void _PG_init(void);
 
@@ -3810,7 +3812,9 @@ cuvs_build_cagra_from_heap_impl(Relation heapRel, Relation indexRel, IndexInfo *
                     ereport(ERROR,
                             (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
                              errmsg("page-format CAGRA build failed (status %d)", rc),
-                             errhint("Use a daemon that supports the page format and check its log.")));
+                             errhint("%s", rc == CUVS_STATUS_OOM_FALLBACK
+                                     ? "Check the daemon log. A legacy graph is kept resident until the replacement commits."
+                                     : "Use a daemon that supports the page format and check its log.")));
                 /* DDL durability contract: fail the transaction so the catalog
                  * entry rolls back and the user knows to retry. */
                 const char *hint;
@@ -5156,9 +5160,18 @@ page_gettuple(IndexScanDesc scan, CuvsScanState *ss)
                 continue;
             if (state == CUVS_CAGRA_SLOT_BAD)
             {
+                bool out_of_range = candidate->tid >= ss->page_meta->n_slots;
+
+                if (out_of_range)
+                    ++cuvs_page_bad_slots;
                 if (ss->page_returned != 0)
                     ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
                                     errmsg("CAGRA slot identity changed during the scan")));
+                if (out_of_range)
+                    ereport(WARNING,
+                            (errmsg("CAGRA daemon returned a slot outside the index range"),
+                             errdetail("Out-of-range page slots in this backend: " UINT64_FORMAT,
+                                       cuvs_page_bad_slots)));
                 page_start_exact(scan, ss);
                 break;
             }
@@ -7022,6 +7035,7 @@ pg_cuvs_hw_profile(PG_FUNCTION_ARGS)
     return (Datum) 0;
 }
 
+#ifdef CUVS_PAGE_FORMAT
 static bool
 cuvs_relation_is_page_cagra(Relation index)
 {
@@ -7032,13 +7046,18 @@ cuvs_relation_is_page_cagra(Relation index)
 static bool
 cuvs_oid_is_page_cagra(Oid oid)
 {
-    Relation index = try_relation_open(oid, AccessShareLock);
-    bool page_format;
+    Relation index;
+    bool page_format = false;
 
-    if (!index)
+    if (!ConditionalLockRelationOid(oid, AccessShareLock))
         return false;
-    page_format = index->rd_rel->relkind == RELKIND_INDEX && cuvs_relation_is_page_cagra(index);
-    relation_close(index, AccessShareLock);
+    index = try_relation_open(oid, NoLock);
+    if (index)
+    {
+        page_format = index->rd_rel->relkind == RELKIND_INDEX && cuvs_relation_is_page_cagra(index);
+        relation_close(index, NoLock);
+    }
+    UnlockRelationOid(oid, AccessShareLock);
     return page_format;
 }
 
@@ -7050,6 +7069,7 @@ cuvs_require_legacy_operation(Relation index)
                 (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
                  errmsg("this operation requires a legacy CAGRA index")));
 }
+#endif
 
 PG_FUNCTION_INFO_V1(pg_cuvs_gpu_search_stats);
 Datum
@@ -7097,8 +7117,10 @@ pg_cuvs_gpu_search_stats(PG_FUNCTION_ARGS)
         char   *relname;
         double  avg_us;
 
+#ifdef CUVS_PAGE_FORMAT
         if (cuvs_oid_is_page_cagra((Oid) s->index_oid))
             continue;
+#endif
         memset(nulls, 0, sizeof(nulls));
 
         values[0] = ObjectIdGetDatum((Oid) s->db_oid);
@@ -7519,7 +7541,9 @@ pg_cuvs_compact(PG_FUNCTION_ARGS)
                  errmsg("index %u does not exist", index_oid)));
 
     cuvs_require_index_owner(index_oid);
+#ifdef CUVS_PAGE_FORMAT
     cuvs_require_legacy_operation(indexRel);
+#endif
 
     rc = cuvs_ipc_compact(cuvs_socket_path,
                           (uint32_t) MyDatabaseId,
@@ -7863,19 +7887,40 @@ static Datum
 cuvs_manual_rel(FunctionCallInfo fcinfo, uint32 op)
 {
     Oid  relid = PG_GETARG_OID(0);
-    Relation target;
     char msg[CUVS_MANUAL_MSG_LEN];
     int  rc;
 
     cuvs_manual_check_index(relid);
-    target = index_open(relid, AccessShareLock);
-    cuvs_require_legacy_operation(target);
+#ifdef CUVS_PAGE_FORMAT
+    if (!ConditionalLockRelationOid(relid, AccessShareLock))
+        ereport(ERROR, (errcode(ERRCODE_LOCK_NOT_AVAILABLE),
+                        errmsg("could not check the index format while its relation is locked")));
+    Relation target = index_open(relid, NoLock);
+    if (cuvs_relation_is_page_cagra(target))
+    {
+        if (op != CUVS_OP_UNLOAD && op != CUVS_OP_UNPIN)
+            cuvs_require_legacy_operation(target);
+        if (target->rd_createSubid != InvalidSubTransactionId ||
+            target->rd_newRelfilelocatorSubid != InvalidSubTransactionId)
+            ereport(ERROR,
+                    (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+                     errmsg("cannot unload or unpin the legacy graph before the page-format build commits"),
+                     errhint("Run the operation after committing the index build.")));
+        if (op == CUVS_OP_UNLOAD)
+            op = CUVS_OP_UNLOAD_PAGE_LEGACY;
+    }
+    index_close(target, NoLock);
+    UnlockRelationOid(relid, AccessShareLock);
+#endif
     rc = cuvs_ipc_manual(cuvs_socket_path, op, (uint32_t) MyDatabaseId,
                          (uint32_t) relid, msg, sizeof(msg));
     cuvs_report_build_notice(relid);
     if (rc != CUVS_STATUS_OK && (op == CUVS_OP_LOAD || op == CUVS_OP_PIN))
+    {
+        Relation target = index_open(relid, AccessShareLock);
         cuvs_report_admission(CUVS_ADMISSION_OBJ_LOAD, relid, target);
-    index_close(target, AccessShareLock);
+        index_close(target, AccessShareLock);
+    }
     return cuvs_manual_result(rc, msg);
 }
 
@@ -8146,8 +8191,11 @@ cuvs_status_emit(FunctionCallInfo fcinfo, uint32 op, const char *header,
                 (void) cuvs_status_index_info(row_index, &qualname, &owns);
             if (!cuvs_status_row_visible(is_priv, row_db, MyDatabaseId, owns))
                 continue;
-            if (row_db == MyDatabaseId && cuvs_oid_is_page_cagra(row_index))
+#ifdef CUVS_PAGE_FORMAT
+            if (row_db == MyDatabaseId && strcmp(f[3], "page_cagra") != 0 &&
+                cuvs_oid_is_page_cagra(row_index))
                 continue;
+#endif
             nulls[0] = qualname == NULL;
             values[0] = qualname ? CStringGetTextDatum(qualname) : (Datum) 0;
         }
@@ -8580,6 +8628,7 @@ typedef struct CuvsFilteredScanState {
     CustomScanState css;
 #ifdef CUVS_PAGE_FORMAT
     bool page_format;
+    bool page_search_succeeded;
 #endif
     Oid         index_oid;
     uint32_t    metric;
@@ -8797,9 +8846,11 @@ cuvs_cs_build(CuvsFilteredScanState *state, EState *estate)
 
         state->result_tids = palloc(k * sizeof(*state->result_tids));
         state->result_dists = palloc(k * sizeof(*state->result_dists));
-        if (!page_search_filtered(state->index_oid, state->heap_rel, snapshot, qvec->x,
-                                  dim, k, tids, ntids, state->result_tids,
-                                  state->result_dists, &state->n_results, &latency))
+        state->page_search_succeeded =
+            page_search_filtered(state->index_oid, state->heap_rel, snapshot, qvec->x,
+                                 dim, k, tids, ntids, state->result_tids,
+                                 state->result_dists, &state->n_results, &latency);
+        if (!state->page_search_succeeded)
         {
             PushActiveSnapshot(snapshot);
             state->n_results = cuvs_cagra_sql_exact(state->index_oid, state->metric,
@@ -8992,6 +9043,11 @@ cuvs_cs_rescan(CustomScanState *node)
     state->built    = false;
     state->cursor   = 0;
     state->n_results = 0;
+#ifdef CUVS_PAGE_FORMAT
+    state->page_search_succeeded = false;
+    if (state->page_format)
+        state->last_latency_us = 0;
+#endif
     if (state->result_tids)  { pfree(state->result_tids);  state->result_tids  = NULL; }
     if (state->result_dists) { pfree(state->result_dists); state->result_dists = NULL; }
 }
@@ -9001,7 +9057,12 @@ static void
 cuvs_cs_explain(CustomScanState *node, List *ancestors, ExplainState *es)
 {
     CuvsFilteredScanState *state = (CuvsFilteredScanState *) node;
-    if (es->analyze && state->last_latency_us > 0)
+    bool searched = state->last_latency_us > 0;
+#ifdef CUVS_PAGE_FORMAT
+    if (state->page_format)
+        searched = state->page_search_succeeded;
+#endif
+    if (es->analyze && searched)
         ExplainPropertyInteger("GPU IPC latency", "us",
                                (int64) state->last_latency_us, es);
 }

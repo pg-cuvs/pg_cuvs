@@ -164,6 +164,7 @@ int cuvs_ipc_build_hnsw_file_idle(const char *socket_path, int vectors_fd,
 #define CUVS_OP_SEARCH_PAGES_BATCH    47
 #define CUVS_OP_SEARCH_PAGES_FILTERED 48
 #define CUVS_OP_MARK_PAGES_EMPTY      49
+#define CUVS_OP_UNLOAD_PAGE_LEGACY    50
 #define CUVS_PAGE_SLOT_INVALID UINT64_MAX
 #define CUVS_PAGE_BUILD_DEFER_LEGACY 1U
 

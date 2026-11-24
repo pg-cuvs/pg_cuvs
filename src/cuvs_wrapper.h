@@ -448,10 +448,6 @@ int cuvs_cagra_extract_adjacency(
     int             device_id
 );
 
-/* Copy the attached graph dataset, in slot order, to a caller buffer. */
-int cuvs_cagra_copy_dataset(CuvsCagraIndex index, float *vectors,
-                            int64_t n, int dim, int device_id);
-
 /*
  * cuvs_cagra_serialize / cuvs_cagra_deserialize
  * Persist/restore a CAGRA index to/from a file path using cuVS native format.

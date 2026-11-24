@@ -4,6 +4,7 @@ from contextlib import contextmanager
 import hashlib
 import os
 from pathlib import Path
+import select
 import shutil
 import struct
 import subprocess
@@ -44,7 +45,8 @@ def command(args, output, *, expect=None, env=None, timeout=300):
 
 def build(source, flag, output, *, install=None):
     options = [f"PG_CONFIG={PG_CONFIG}", "PGCUVS_CPU_SHIM=1", f"CUVS_PAGE_FORMAT={flag}",
-               "with_llvm=no", "PG_CFLAGS=-DCUVS_TEST_HOOKS"]
+               "with_llvm=no", "PG_CFLAGS=-DCUVS_TEST_HOOKS",
+               "EXTRA_SERVER_CFLAGS=-DCUVS_TEST_HOOKS"]
     targets = ["all", "server"] if install is None else ["install", f"DESTDIR={install}"]
     jobs = min(8, len(os.sched_getaffinity(0)))
     command(["make", "-C", source, f"-j{jobs}", *options, *targets], output, timeout=900)
@@ -106,10 +108,21 @@ checkpoint_timeout = '30min'
         self.sql(db, case, "-f", CASES / f"{case}.sql", **kwargs)
 
     @contextmanager
-    def daemon(self, binary, label):
+    def daemon(self, binary, label, *, seed_bf=False, fault=None, vram_mib=None):
+        env = self.env.copy()
+        for key, enabled in (
+            ("CUVS_FAULT_PAGE_BF_FIXTURE", seed_bf),
+            ("CUVS_FAULT_PAGE_PERSIST", fault == "persist"),
+            ("CUVS_FAULT_PAGE_ATTACH", fault == "attach"),
+        ):
+            env.pop(key, None)
+            if enabled:
+                env[key] = "1"
+        args = [binary, "--socket", self.socket, "--index-dir", self.indexdir, "--gpu-devices", "0"]
+        if vram_mib is not None:
+            args.extend(["--max-vram-mb", str(vram_mib)])
         with (self.logs / f"daemon-{label}.log").open("w") as log, subprocess.Popen(
-            [binary, "--socket", self.socket, "--index-dir", self.indexdir, "--gpu-devices", "0"],
-            stdout=log, stderr=subprocess.STDOUT, env=self.env,
+            args, stdout=log, stderr=subprocess.STDOUT, env=env,
         ) as daemon:
             try:
                 for _ in range(200):
@@ -120,7 +133,7 @@ checkpoint_timeout = '30min'
                     time.sleep(0.05)
                 else:
                     raise RuntimeError(f"CPU daemon did not start: {log.name}")
-                yield
+                yield daemon
             finally:
                 if daemon.poll() is None:
                     daemon.terminate()
@@ -167,6 +180,7 @@ def check_off(cluster):
     try:
         cluster.run("createdb", ["legacy"], "createdb-legacy")
         cluster.file("legacy", "legacy")
+        check_monitor_during_reindex(cluster)
         cluster.sql("alpha1", "m8-analyze", "-c", "ANALYZE page_vectors;")
         for name, statement in {
             "search": "SET enable_seqscan=off; SELECT id FROM page_vectors ORDER BY v <-> '[0,0,0]' LIMIT 2;",
@@ -182,6 +196,112 @@ def check_off(cluster):
         print("Flag-off legacy, ANALYZE and five page-format refusals: PASS", flush=True)
     finally:
         cluster.stop()
+
+
+def check_monitor_during_reindex(cluster):
+    with (cluster.logs / "legacy-reindex-session.log").open("w") as err, subprocess.Popen(
+        ["psql", "-XqAt", "-v", "ON_ERROR_STOP=1", "-d", "legacy"],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=err, text=True, env=cluster.env,
+    ) as guard:
+        try:
+            guard.stdin.write("BEGIN; REINDEX INDEX legacy_cagra_idx;\n\\echo locked\n")
+            guard.stdin.flush()
+            if not select.select([guard.stdout], [], [], 20)[0] or guard.stdout.readline().strip() != "locked":
+                raise RuntimeError("fixture did not acquire the REINDEX lock")
+            cluster.sql("legacy", "monitor-during-reindex", "-c", """
+                SET lock_timeout = '500ms';
+                DO $$
+                BEGIN
+                    IF NOT EXISTS (SELECT FROM pg_cuvs_gpu_search_stats()) OR
+                       NOT EXISTS (SELECT FROM pg_cuvs_index_status()) THEN
+                        RAISE EXCEPTION 'fixture did not expose a resident legacy index';
+                    END IF;
+                END $$;
+            """)
+        finally:
+            if guard.poll() is None:
+                guard.stdin.close()
+                guard.wait(timeout=15)
+
+
+def check_page_lookup(cluster, db, label, expected_k):
+    cluster.sql(db, label, "-c", f"""
+        SET enable_seqscan=off;
+        SET cuvs.k=6;
+        DO $$
+        BEGIN
+            IF (SELECT id FROM g14_pages
+                 ORDER BY v <-> '[1,1,1,1,1,1,1,1]' LIMIT 1) IS DISTINCT FROM 1
+               OR pg_cuvs_last_search_k() IS DISTINCT FROM {expected_k} THEN
+                RAISE EXCEPTION 'wrong row or execution path for the page-format index';
+            END IF;
+        END $$;
+    """)
+
+
+def check_index_directory_aliases(cluster):
+    symlink = cluster.data.parent / "aliases"
+    symlink.symlink_to(cluster.indexdir, target_is_directory=True)
+    cluster.sql("beta1a", "index-dir-aliases", "-c", f"""
+        CREATE TABLE page_dir(v vector(3));
+        INSERT INTO page_dir VALUES ('[1,0,0]'), ('[2,0,0]');
+        CREATE INDEX page_dir_slash_idx ON page_dir USING cagra (v vector_l2_ops)
+            WITH (index_dir = '{cluster.indexdir}/');
+        CREATE INDEX page_dir_symlink_idx ON page_dir USING cagra (v vector_l2_ops)
+            WITH (index_dir = '{symlink}');
+    """)
+    cluster.sql("beta1a", "index-dir-drop-key", "-At", "-c", """
+        SELECT (SELECT oid FROM pg_database WHERE datname=current_database()) ||
+               '_' || 'page_dir_symlink_idx'::regclass::oid;
+    """)
+    key = (cluster.logs / "main-index-dir-drop-key.log").read_text().splitlines()[-1]
+    marker = cluster.indexdir / key
+    if not marker.is_dir():
+        raise RuntimeError("DROP fixture did not have graph storage")
+    cluster.sql("beta1a", "index-dir-drop", "-c", "DROP INDEX page_dir_symlink_idx;")
+    if marker.exists():
+        raise RuntimeError("committed DROP retained the page directory")
+
+
+def check_failed_persist(cluster, daemon):
+    with cluster.daemon(daemon, "failed-persist", fault="persist"):
+        cluster.start()
+        try:
+            cluster.sql("postgres", "setup", "-c", """
+                CREATE EXTENSION vector; CREATE EXTENSION pg_cuvs;
+                CREATE TABLE page_fail(v vector(3));
+                INSERT INTO page_fail VALUES ('[1,0,0]'), ('[2,0,0]');
+            """)
+            cluster.sql("postgres", "failed-build", "-c",
+                        "CREATE INDEX ON page_fail USING cagra(v vector_l2_ops);",
+                        expect=["page-format CAGRA build failed (status 6)"])
+            if any(path.is_dir() for path in cluster.indexdir.iterdir()):
+                raise RuntimeError("failed BUILD retained a private page directory")
+        finally:
+            cluster.stop()
+
+
+def check_missing_dataset(cluster, daemon):
+    with cluster.daemon(daemon, "missing-dataset", fault="attach"):
+        cluster.start()
+        try:
+            cluster.sql("postgres", "attach", "-c", """
+                CREATE EXTENSION vector; CREATE EXTENSION pg_cuvs; CREATE EXTENSION pageinspect;
+                CREATE TABLE page_graphless(id int, v vector(3));
+                INSERT INTO page_graphless VALUES (1,'[1,0,0]'), (2,'[2,0,0]');
+                CREATE INDEX page_graphless_idx ON page_graphless USING cagra(v vector_l2_ops);
+                SET enable_seqscan=off;
+                DO $$
+                BEGIN
+                    IF substr(get_raw_page('page_graphless_idx',0),65,8) <> decode('0000000000000000','hex')
+                       OR (SELECT id FROM page_graphless ORDER BY v <-> '[1,0,0]' LIMIT 1)
+                           IS DISTINCT FROM 1 OR pg_cuvs_last_search_k() IS NOT NULL THEN
+                        RAISE EXCEPTION 'missing dataset did not produce a usable exact index without a graph';
+                    END IF;
+                END $$;
+            """)
+        finally:
+            cluster.stop()
 
 
 def check_slots(cluster, source):
@@ -236,8 +356,8 @@ def check_deferral(cluster, daemon, library, enabled, disabled, *, mutant=False)
         try:
             cluster.file("postgres", "g13_setup")
             legacy_files = sorted(cluster.indexdir.glob("*.cagra")) + sorted(cluster.indexdir.glob("*.tids"))
-            if len(legacy_files) != 6:
-                raise RuntimeError("expected three legacy graphs and TID files")
+            if len(legacy_files) != 8:
+                raise RuntimeError("expected four legacy graphs and TID files")
             before = {path: hashlib.sha256(path.read_bytes()).digest() for path in legacy_files}
         finally:
             cluster.stop()
@@ -262,14 +382,28 @@ def check_deferral(cluster, daemon, library, enabled, disabled, *, mutant=False)
                     END IF;
                 END $$;
             """)
+            cluster.sql("postgres", "g13-unload", "-c", """
+                SELECT pg_cuvs_unpin('page_to_one_idx'::regclass);
+                SELECT pg_cuvs_unload('page_to_one_idx'::regclass);
+            """)
             if any(hashlib.sha256(path.read_bytes()).digest() != digest
                    for path, digest in before.items()):
                 raise RuntimeError("REINDEX rewrote a legacy graph or TID file")
             local = list(cluster.indexdir.glob("*/*/empty.xid"))
-            redirected = list(cluster.indexdir.glob("*/*/legacy.xid"))
-            custom = list((cluster.data.parent / "custom").glob("*/*/empty.xid"))
-            if any(len(paths) != 1 or not int(paths[0].read_text()) for paths in (local, redirected, custom)):
-                raise RuntimeError("missing marked xid for an empty build or its directory override")
+            if len(local) != 2 or any(not int(path.read_text()) for path in local) or (
+                    cluster.data.parent / "custom").exists():
+                raise RuntimeError("empty builds did not use the daemon's index directory")
+            cluster.sql("postgres", "unmarked-key", "-At", "-c", """
+                SELECT (SELECT oid FROM pg_database WHERE datname=current_database()) ||
+                       '_' || 'page_unmarked_idx'::regclass::oid;
+            """)
+            record = cluster.logs / f"{cluster.data.parent.name}-unmarked-key.log"
+            key = record.read_text().splitlines()[-1]
+            partial = cluster.indexdir / key / "0123456789abcdff"
+            partial.mkdir(parents=True)
+            (partial / "empty.xid").touch()
+            (partial / "build.xid.tmp").write_text("1\n")
+            (partial.parent / "build.xid").write_text("1\n")
         finally:
             cluster.stop()
 
@@ -278,12 +412,16 @@ def check_deferral(cluster, daemon, library, enabled, disabled, *, mutant=False)
         cluster.start(label)
         try:
             startup = (cluster.logs / f"daemon-{label}.log").read_text()
-            if "[startup] loaded 0 index(es)" not in startup:
-                raise RuntimeError("startup loaded an index marked for legacy deferral")
+            if "[startup] loaded 1 index(es)" not in startup:
+                raise RuntimeError("startup did not distinguish completed and partial markers")
             cluster.sql("postgres", "g13-explicit", "-c", """
                 SET enable_seqscan=off;
                 DO $$
                 BEGIN
+                    IF (SELECT count(*) FROM pg_cuvs_gpu_search_stats()
+                         WHERE index_oid='page_unmarked_idx'::regclass AND resident) <> 1 THEN
+                        RAISE EXCEPTION 'partial marker incorrectly suppressed legacy startup';
+                    END IF;
                     IF (SELECT id FROM page_dirty ORDER BY v <-> '[0,0,0,0,0,0,0,0]' LIMIT 1)
                        IS DISTINCT FROM 0 OR pg_cuvs_last_search_k() IS NULL THEN
                         RAISE EXCEPTION 'rollback legacy index could not explicitly reload';
@@ -294,6 +432,61 @@ def check_deferral(cluster, daemon, library, enabled, disabled, *, mutant=False)
             cluster.stop()
     print("G13: rollback EXTEND row, 0/1-row markers, deferral across restart and explicit v6 reload: PASS",
           flush=True)
+
+
+def check_page_eviction(cluster, daemon, library, enabled, disabled):
+    shutil.copy2(disabled, library)
+    with cluster.daemon(daemon, "eviction-legacy"):
+        cluster.start()
+        try:
+            cluster.sql("postgres", "legacy", "-c", """
+                CREATE EXTENSION vector; CREATE EXTENSION pg_cuvs;
+                CREATE TABLE legacy_big(v vector(8));
+                INSERT INTO legacy_big SELECT array_fill(i::real, ARRAY[8])::vector
+                    FROM generate_series(1,100000) AS i;
+                CREATE INDEX legacy_big_idx ON legacy_big USING cagra(v vector_l2_ops);
+            """)
+        finally:
+            cluster.stop()
+
+    shutil.copy2(enabled, library)
+    with cluster.daemon(daemon, "eviction-low-budget", vram_mib=64):
+        cluster.start("low-budget")
+        try:
+            cluster.sql("postgres", "prepare-eviction", "-c", """
+                SELECT pg_cuvs_unload('legacy_big_idx'::regclass);
+                CREATE TABLE page_lru(id int, v vector(8));
+                INSERT INTO page_lru SELECT i,array_fill(i::real, ARRAY[8])::vector
+                    FROM generate_series(1,4096) AS i;
+                CREATE INDEX page_lru_idx ON page_lru USING cagra (v vector_l2_ops);
+                SET enable_seqscan=off;
+                SELECT id FROM page_lru ORDER BY v <-> '[1,1,1,1,1,1,1,1]' LIMIT 1;
+            """)
+            cluster.sql("postgres", "orphan-graphs", "-c", "BEGIN; REINDEX INDEX page_lru_idx; ROLLBACK;" * 40)
+            cluster.sql("postgres", "load-with-eviction", "-c", """
+                DO $$
+                DECLARE
+                    graphs integer := (SELECT count(*) FROM pg_cuvs_index_status()
+                        WHERE index_oid='page_lru_idx'::regclass AND kind='page_cagra');
+                BEGIN
+                    IF graphs < 40 THEN
+                        RAISE EXCEPTION 'fixture did not retain the unsearched page graphs';
+                    END IF;
+                    PERFORM pg_cuvs_load('legacy_big_idx'::regclass);
+                    IF (SELECT count(*) FROM pg_cuvs_index_status()
+                        WHERE index_oid='page_lru_idx'::regclass AND kind='page_cagra') >= graphs OR
+                       NOT EXISTS (SELECT FROM pg_cuvs_index_status()
+                        WHERE index_oid='page_lru_idx'::regclass AND kind='page_cagra'
+                              AND last_use IS NOT NULL) THEN
+                        RAISE EXCEPTION 'legacy LOAD did not prefer unsearched page graphs for eviction';
+                    END IF;
+                END $$;
+            """)
+            if "[page-evict]" not in (cluster.logs / "daemon-eviction-low-budget.log").read_text():
+                raise RuntimeError("the legacy LOAD never evicted a page graph")
+        finally:
+            cluster.stop()
+    print("Legacy LOAD reclaimed unsearched page graphs while retaining the active graph: PASS", flush=True)
 
 
 def run(work, logs):
@@ -323,7 +516,7 @@ def run(work, logs):
         build(source_base, 0, logs / "build-base.log")
 
     cluster = Cluster(work / "main", bindir, logs)
-    with cluster.daemon(source_on / "pg_cuvs_server", "on"):
+    with cluster.daemon(source_on / "pg_cuvs_server", "on") as daemon:
         cluster.start()
         try:
             for case in ("alpha1", "alpha2_basic", "truncate", "relcache", "beta1a"):
@@ -331,6 +524,11 @@ def run(work, logs):
                 cluster.file(case, case)
                 print(f"{case}: PASS", flush=True)
             check_slots(cluster, source_on)
+            cluster.file("beta1a", "beta1a_rollback")
+            check_index_directory_aliases(cluster)
+            cluster.run("createdb", ["-T", "beta1a", "page_template"], "template-copy")
+            check_page_lookup(cluster, "page_template", "template-lookup", "NULL")
+            check_page_lookup(cluster, "beta1a", "original-lookup", 6)
             cluster.run(sys.executable, [CASES / "alpha1_concurrency.py", "alpha1"], "alpha1-concurrency")
             cluster.run(sys.executable, [CASES / "alpha2_concurrency.py", "alpha2_basic", cluster.log],
                         "alpha2-concurrency")
@@ -338,6 +536,13 @@ def run(work, logs):
             cluster.run(sys.executable, [CASES / "alpha2_lifecycle.py", "lifecycle", cluster.data, logs],
                         "lifecycle")
             print("Dimension, pending tail, CIC, canceled VACUUM, standby and no-preload: PASS", flush=True)
+            cluster.stop()
+            cluster.start("before-daemon-kill")
+            check_page_lookup(cluster, "beta1a", "before-daemon-kill", 6)
+            daemon.kill()
+            daemon.wait(timeout=10)
+            check_page_lookup(cluster, "beta1a", "after-daemon-kill", "NULL")
+            print("Template identity, rolled-back TRUNCATE and REINDEX, daemon SIGKILL: PASS", flush=True)
         finally:
             cluster.stop()
 
@@ -349,8 +554,20 @@ def run(work, logs):
             finally:
                 cluster.stop()
 
+    dead = Cluster(work / "dead", bindir, logs)
+    with dead.daemon(source_on / "pg_cuvs_server", "seeded-filter", seed_bf=True):
+        dead.start()
+        try:
+            dead.file("postgres", "beta1a_dead")
+        finally:
+            dead.stop()
+
     check_deferral(Cluster(work / "g13", bindir, logs), source_on / "pg_cuvs_server",
                    lib, enabled, disabled)
+    check_failed_persist(Cluster(work / "failed", bindir, logs), source_on / "pg_cuvs_server")
+    check_missing_dataset(Cluster(work / "missing", bindir, logs), source_on / "pg_cuvs_server")
+    check_page_eviction(Cluster(work / "eviction", bindir, logs), source_on / "pg_cuvs_server",
+                        lib, enabled, disabled)
 
     wal(Cluster(work / "wal", bindir, logs))
     changed = source_on / "src/cuvs_cagra_pages.c"

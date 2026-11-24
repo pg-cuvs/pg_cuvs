@@ -1482,8 +1482,9 @@ cuvs_ipc_build(
         goto cleanup;
 
     rc = (int)hdr.status;
+    /* A zero nonce means BUILD accepted page storage without a searchable graph. */
     if (page_build && rc == CUVS_STATUS_OK &&
-        (recv_all(sock, graph_nonce_out, sizeof(*graph_nonce_out)) < 0 || *graph_nonce_out == 0))
+        recv_all(sock, graph_nonce_out, sizeof(*graph_nonce_out)) < 0)
         rc = CUVS_STATUS_ERROR;
 
 cleanup:

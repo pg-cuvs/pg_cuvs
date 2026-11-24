@@ -51,6 +51,9 @@ main(int argc, char **argv)
 
     if (try_search(argv[1], db, idx, &request, CUVS_STATUS_OK))
         return 1;
+    if (try_search(argv[1], db ^ 1, idx, &request, CUVS_STATUS_NOT_FOUND) ||
+        try_search(argv[1], db, idx ^ 1, &request, CUVS_STATUS_NOT_FOUND))
+        return 1;
 
     const float queries[2][8] = {
         {1,1,1,1,1,1,1,1},
@@ -77,6 +80,6 @@ main(int argc, char **argv)
             return 1;
         *keys[i] ^= 1;
     }
-    puts("single and batch slots; six mismatched requests: PASS");
+    puts("single and batch slots; eight mismatched requests: PASS");
     return 0;
 }

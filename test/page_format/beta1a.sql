@@ -87,8 +87,8 @@ BEGIN
         seen := seen OR line."QUERY PLAN" LIKE '%Custom Scan%';
         gpu := gpu OR line."QUERY PLAN" LIKE '%GPU IPC latency%';
     END LOOP;
-    IF NOT seen OR NOT gpu THEN
-        RAISE EXCEPTION 'the page-format filtered Custom Scan did not use the daemon (plan %, IPC %)', seen, gpu;
+    IF NOT seen OR gpu THEN
+        RAISE EXCEPTION 'Custom Scan did not use exact fallback without a BF copy (plan %, IPC %)', seen, gpu;
     END IF;
     IF (SELECT array_agg(id) FROM
          (SELECT id FROM page_search WHERE id % 2 = 0
@@ -100,11 +100,12 @@ END $$;
 RESET enable_indexscan;
 RESET cuvs.filtered_knn_hook;
 SET cuvs.search_mode=brute_force;
+SET cuvs.k=9;
 DO $$
 BEGIN
     IF (SELECT id FROM page_search ORDER BY v <-> '[2,2,2,2,2,2,2,2]' LIMIT 1)
-        IS DISTINCT FROM 2 THEN
-        RAISE EXCEPTION 'BF on the attached page-format dataset returned the wrong row';
+        IS DISTINCT FROM 2 OR pg_cuvs_last_search_k() IS NOT DISTINCT FROM 9 THEN
+        RAISE EXCEPTION 'BF without a materialized copy did not return the exact row';
     END IF;
 END $$;
 RESET cuvs.search_mode;

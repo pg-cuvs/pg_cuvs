@@ -550,18 +550,6 @@ int cuvs_hnsw_search(CuvsHnswIndex hidx, const float *query, int dim, int k,
 
 void cuvs_hnsw_free(CuvsHnswIndex hidx) { shim_free((ShimIndex *)hidx); }
 
-int
-cuvs_cagra_copy_dataset(CuvsCagraIndex index, float *vectors, int64_t n,
-                         int dim, int device_id)
-{
-    ShimIndex *ix = (ShimIndex *) index;
-    (void) device_id;
-    if (!ix || !vectors || n <= 0 || dim <= 0 || n != ix->n || dim != ix->dim)
-        return -1;
-    memcpy(vectors, ix->vecs, (size_t) n * dim * sizeof(float));
-    return 0;
-}
-
 /* 3J export: real exact-kNN adjacency so the exported pgvector HNSW is correct. */
 int
 cuvs_cagra_extract_adjacency(CuvsCagraIndex handle, uint32_t **adj_out,
