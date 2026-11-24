@@ -42,10 +42,10 @@ ACE 영수증의 조각 수는 pg_cuvs를 빌드할 때 SDK 소스를 지정했�
 
 ## ef_construction
 
-기본 64는 검증된 실제 설정을 유지한다: resident 중간 차수 128, hierarchy 200. ACE 품질은 아래 절의 규칙으로 240이다.
+기본 64에서 resident의 중간 차수는 128이고 hnswlib 파일에 쓰는 EF는 200이다. ACE 품질은 아래 절의 규칙으로 240이다.
 값을 바꾸면 각 기준값에 `ef_construction / 64`를 곱하고 올림한다.
-중간 차수는 최종 차수 이상, 4096 이하 및 데이터 행 수 범위로 제한한다.
-Hierarchy와 ACE 요청 설정은 4–65535 범위다. hnswlib는 native ef를 M 이상으로 제한하며 영수증에는 직렬화된 실제 값을 기록한다. 훈련 비율, probe 수, seed는 이 옵션으로 바꾸지 않는다.
+중간 차수는 최종 차수 이상, SDK 상한 1024 이하 및 데이터 행 수 범위로 제한한다. SDK 상한에 걸린 빌드는 NOTICE를 낸다.
+hnswlib 파일 EF와 ACE 요청 설정은 4–65535 범위다. hnswlib는 native EF를 M 이상으로 제한한다. 영수증의 `hierarchy_ef_construction`은 파일에서 읽은 EF다. GPU 상위 그래프 빌더는 SDK의 이웃 행렬과 예산을 받아 동작한다. 훈련 비율, probe 수, seed는 그대로다.
 이는 생성 노력의 전달 계약이며 recall의 단조 증가를 보장하지 않는다.
 `tiny` 경로는 전체 이웃을 다루므로 이 옵션이 그래프 품질을 바꾸지 않는다.
 `m`은 기존처럼 정보용이며 실제 graph degree가 레이아웃을 결정한다.

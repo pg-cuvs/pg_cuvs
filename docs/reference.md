@@ -577,11 +577,14 @@ tablespace needs a further `n × dim × 4` bytes for the input spool. The `[hnsw
 line then has `status=5` and still names the decided route (`route=none` only when no
 route was decided, such as an over-budget refusal).
 
-`m` remains informational. Direct `ef_construction` scales intermediate degree from128,
-hierarchy construction effort from200, and ACE effort from240 at the default64 (ACE: the
-`--hnsw-ace-build-quality auto` rule, 20 NN-descent iterations per partition at 64);
-receipts record the consumed/clamped values. The SDK limits the intermediate width to 1024. A
-build that reaches that ceiling with a higher requested width issues a NOTICE. ACE indexes also record a partition-builder
+`m` remains informational. With the default `ef_construction = 64`, direct builds use
+a planned intermediate width of 128 and an hnswlib serialization EF of 200. The
+`hierarchy_ef_construction` receipt field reports the value read from that serialized
+file. The GPU upper-graph builder takes its neighbors and budgets through the SDK.
+The SDK limits the intermediate width to 1024. A build that reaches that ceiling
+with a higher requested width issues a NOTICE. Under `--hnsw-ace-build-quality auto`,
+the default ACE effort is 240 (20 NN-descent iterations per small partition with
+cuVS 26.04). ACE indexes also record a partition-builder
 readback (`ace_build_quality`, `ace_local_intermediate_degree` = 3 × (graph_degree / 2),
 `ace_local_nn_descent_iterations`); the receipt's `intermediate_degree` is the resident width
 and the ACE memory-plan input, not the width ACE partitions build and optimize with.
