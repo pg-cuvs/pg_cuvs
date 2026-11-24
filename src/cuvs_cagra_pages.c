@@ -43,6 +43,11 @@ cuvs_cagra_require_legacy(Relation index)
 #include "utils/builtins.h"
 #include "utils/guc.h"
 #include "utils/timestamp.h"
+#ifdef CUVS_TEST_HOOKS
+#include "storage/lock.h"
+
+static bool cuvs_test_pause_slot_extent;
+#endif
 
 enum CuvsCagraPageKind
 {
@@ -1084,6 +1089,91 @@ cuvs_cagra_slot_tid(Relation index, const CuvsCagraMeta *meta,
     return ItemPointerIsValid(tid) ? CUVS_CAGRA_SLOT_LIVE : CUVS_CAGRA_SLOT_DEAD;
 }
 
+bool
+cuvs_cagra_copy_slot_extent(Relation index, uint32 extent, ItemPointer tids,
+                            CuvsCagraSlotExtent *stamp)
+{
+    uint64 first_slot = (uint64) extent * CUVS_CAGRA_SLOTS_PER_EXTENT;
+    BlockNumber nblocks = RelationGetNumberOfBlocks(index);
+    CuvsCagraMeta meta;
+    CuvsCagraSlotExtent copied;
+    BlockNumber first_block;
+    uint64 n_slots;
+
+    stamp->count = 0;
+    if (nblocks == 0 || !cuvs_cagra_read_meta(index, &meta) ||
+        extent >= meta.n_extents || first_slot >= meta.n_slots)
+        return false;
+
+    n_slots = meta.n_slots;
+    first_block = meta.extents[extent];
+    copied = (CuvsCagraSlotExtent) {
+        .index_nonce = meta.index_nonce,
+        .base_nonce = meta.base_nonce,
+        .delete_generation = meta.delete_generation,
+        .count = Min(n_slots - first_slot, (uint64) CUVS_CAGRA_SLOTS_PER_EXTENT),
+    };
+    for (uint32 offset = 0; offset < copied.count; offset += CUVS_CAGRA_TIDS_PER_PAGE)
+    {
+        uint32 count = Min(copied.count - offset, CUVS_CAGRA_TIDS_PER_PAGE);
+
+        CHECK_FOR_INTERRUPTS();
+        if (!read_slots(index, &meta, nblocks, first_slot + offset, count, tids + offset))
+            return false;
+    }
+
+#ifdef CUVS_TEST_HOOKS
+    if (cuvs_test_pause_slot_extent)
+    {
+        LOCKTAG tag;
+
+        /* Match pg_advisory_lock(523091::bigint) in the test controller. */
+        SET_LOCKTAG_ADVISORY(tag, MyDatabaseId, 0, 523091, 1);
+        LockAcquire(&tag, ExclusiveLock, false, false);
+        LockRelease(&tag, ExclusiveLock, false);
+    }
+#endif
+    if (!cuvs_cagra_read_meta(index, &meta) ||
+        meta.index_nonce != copied.index_nonce || meta.base_nonce != copied.base_nonce ||
+        meta.delete_generation != copied.delete_generation || meta.n_slots != n_slots ||
+        extent >= meta.n_extents || meta.extents[extent] != first_block)
+        return false;
+
+    *stamp = copied;
+    return true;
+}
+
+#ifdef CUVS_TEST_HOOKS
+PG_FUNCTION_INFO_V1(cuvs_test_slot_extent);
+
+Datum
+cuvs_test_slot_extent(PG_FUNCTION_ARGS)
+{
+    Relation index = index_open(PG_GETARG_OID(0), AccessShareLock);
+    uint32 extent = PG_GETARG_INT32(1);
+    uint32 offset = PG_GETARG_INT32(2);
+    ItemPointerData *tids = palloc(CUVS_CAGRA_SLOTS_PER_EXTENT * sizeof(*tids));
+    CuvsCagraSlotExtent stamp;
+    bool copied = cuvs_cagra_copy_slot_extent(index, extent, tids, &stamp);
+    char *tid;
+
+    index_close(index, AccessShareLock);
+    if (!copied || offset >= stamp.count)
+    {
+        pfree(tids);
+        PG_RETURN_NULL();
+    }
+    if (ItemPointerIsValid(&tids[offset]))
+        tid = psprintf("(%u,%u)", ItemPointerGetBlockNumber(&tids[offset]),
+                       ItemPointerGetOffsetNumber(&tids[offset]));
+    else
+        tid = "dead";
+    pfree(tids);
+    PG_RETURN_TEXT_P(cstring_to_text(psprintf("%u|" UINT64_FORMAT "|%s",
+                                             stamp.count, stamp.delete_generation, tid)));
+}
+#endif
+
 static int
 compare_root(const void *a, const void *b)
 {
@@ -1265,11 +1355,15 @@ typedef struct CagraVacuum
 static bool cuvs_test_pause_page_vacuum;
 
 void
-cuvs_cagra_vacuum_init_test_hook(void)
+cuvs_cagra_pages_init_test_hooks(void)
 {
     DefineCustomBoolVariable("cuvs.test_pause_page_vacuum",
                              "Pause a page-format VACUUM after the TID records.",
                              NULL, &cuvs_test_pause_page_vacuum, false, PGC_SUSET,
+                             GUC_NOT_IN_SAMPLE, NULL, NULL, NULL);
+    DefineCustomBoolVariable("cuvs.test_pause_slot_extent",
+                             "Pause a slot extent copy before its second metapage read.",
+                             NULL, &cuvs_test_pause_slot_extent, false, PGC_SUSET,
                              GUC_NOT_IN_SAMPLE, NULL, NULL, NULL);
 }
 #endif
