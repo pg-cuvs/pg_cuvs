@@ -20,14 +20,16 @@ mutations={
  'skip consumer header':('        dependency=f.parent/name\n', "        if name == 'consumer_row_sort_plan.hpp': continue\n        dependency=f.parent/name\n"),
  'accept unknown planner':(reject_unknown[0], "    variant='unknown'"),
 }
+command = [sys.executable, '-I', '-B', str(root/'test/unit/test_hnsw_sdk_plan_verifier.py'),
+           '--canonical-header', str(a.canonical_header), '--row-sort-src', str(a.row_sort_src)]
+subprocess.run(command, check=True)
 with tempfile.TemporaryDirectory(prefix='pgcuvs-plan-mutants-') as tmp:
  d=Path(tmp);(d/'scripts').mkdir();(d/'infra/cuvs-patches').mkdir(parents=True)
  shutil.copyfile(root/'infra/cuvs-patches/patchset-manifest.json',d/'infra/cuvs-patches/patchset-manifest.json')
  for name,(old,new) in mutations.items():
   assert source.count(old)==1,name
   verifier=d/'scripts/verify-hnsw-sdk-plan.py';verifier.write_text(source.replace(old,new))
-  command=[sys.executable,'-I','-B',str(root/'test/unit/test_hnsw_sdk_plan_verifier.py'), '--canonical-header',str(a.canonical_header), '--row-sort-src',str(a.row_sort_src), '--verifier',str(verifier)]
-  result=subprocess.run(command,capture_output=True,text=True)
+  result=subprocess.run(command + ['--verifier', str(verifier)], capture_output=True, text=True)
   if result.returncode==0:raise AssertionError(name+' survived')
   if 'AssertionError' not in result.stderr:raise AssertionError(name+' failed for an unexpected reason: '+result.stderr)
   print(name+': detected')

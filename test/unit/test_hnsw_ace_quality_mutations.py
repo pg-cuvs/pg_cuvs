@@ -6,6 +6,7 @@ the tree (needs pg_config)."""
 from pathlib import Path
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -58,9 +59,17 @@ MUTATIONS = {
 
 
 def run_converter(tree):
-    r = subprocess.run(['make', '-s', 'test-hnsw-converter'], cwd=tree, capture_output=True, timeout=600)
-    tail = (r.stdout + r.stderr).decode(errors='replace').strip().splitlines()
-    return ('GREEN' if r.returncode == 0 else 'RED'), (tail[-1] if tail else '')
+    built = subprocess.run(['make', '-s', 'test-hnsw-converter-build'],
+                           cwd=tree, capture_output=True, text=True, timeout=600)
+    if built.returncode:
+        return 'BUILD-FAIL', built.stderr.strip()[-400:]
+    run = subprocess.run(['./test-hnsw-converter'], cwd=tree, capture_output=True,
+                         text=True, timeout=60)
+    if run.returncode == 0:
+        return 'GREEN', run.stdout.strip()
+    if run.returncode == -signal.SIGABRT and 'Assertion' in run.stderr:
+        return 'RED', run.stderr.strip()
+    return 'UNEXPECTED-FAIL', run.stderr.strip() or f'exit {run.returncode}'
 
 
 def copy_tree(dst):

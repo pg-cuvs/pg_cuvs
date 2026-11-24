@@ -197,11 +197,23 @@ def run(argv, cwd):
     try:
         q = subprocess.run(argv, cwd=cwd, capture_output=True, text=True, timeout=120)
     except subprocess.TimeoutExpired:
-        return 124, 'FAIL timeout after 120 s'
+        with (Path(cwd) / 'COMMANDS.jsonl').open('a') as log:
+            log.write(json.dumps({'argv': argv, 'exit': 124, 'output': 'timeout after 120 s'}) + '\n')
+        return 124, 'timeout after 120 s'
     text = q.stdout + q.stderr
     with (Path(cwd) / 'COMMANDS.jsonl').open('a') as log:
         log.write(json.dumps({'argv': argv, 'exit': q.returncode, 'output': text}) + '\n')
     return q.returncode, text
+
+
+def run_status(rc, output):
+    if rc == 0:
+        return 'PASS'
+    if rc == 124:
+        return 'TIMEOUT'
+    if rc == 1 and any(line.startswith(('FAIL', 'AssertionError')) for line in output.splitlines()):
+        return 'RED (run)'
+    return 'RUN-BROKEN'
 
 
 def build_and_run(tree):
@@ -235,7 +247,7 @@ def build_and_run(tree):
         if name == 'docs':   # a check, not a build
             rc, text = run(argv, tree)
             lines = [l for l in text.splitlines() if l.startswith(('FAIL', 'PASS'))]
-            out[name] = ('PASS' if rc == 0 else 'RED (run)', lines[:1] or [''])
+            out[name] = (run_status(rc, text), lines[:1] or [''])
             continue
         rc, text = run(argv, tree)
         if name == 'server':  # helper binary for the startup test
@@ -249,7 +261,7 @@ def build_and_run(tree):
         argv_run = ['./bin-' + name] + (['./bin-server'] if name == 'startup' else [])
         rc, text = run(argv_run, tree)
         lines = [l for l in text.splitlines() if l.startswith(('FAIL', 'PASS', 'test_lw'))]
-        out[name] = ('PASS' if rc == 0 else 'RED (run)', lines[:1] or text.strip().splitlines()[-1:])
+        out[name] = (run_status(rc, text), lines[:1] or text.strip().splitlines()[-1:])
     return out
 
 
@@ -291,7 +303,7 @@ def main(argv):
         res = build_and_run(tree)
         expect_here = {t for t in expect if t in res}
         reds = {t for t, (s, _) in res.items() if s == 'RED (run)'}
-        broken = {t for t, (s, _) in res.items() if s == 'BUILD-BROKEN'}
+        broken = {t for t, (s, _) in res.items() if s in ('BUILD-BROKEN', 'RUN-BROKEN', 'TIMEOUT')}
         ok = bool(reds) and expect_here <= reds and not broken
         red += ok
         detail = '; '.join(f'{t}={s} {tail[0] if tail else ""}'.strip() for t, (s, tail) in res.items()

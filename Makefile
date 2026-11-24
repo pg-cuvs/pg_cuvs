@@ -800,14 +800,17 @@ HNSW_CONVERTER_UNIT_LINK = -Wl,--gc-sections \
                           -L$(shell $(PG_CONFIG) --pkglibdir) -lpgcommon -lpgport -lm
 endif
 HNSW_UNIT_CPPFLAGS ?=
-test-hnsw-converter: test/unit/test_hnsw_converter.c src/hnsw_export.c \
-                     src/hnsw_export.h src/cuvs_util.c $(wildcard src/*.h)
+.PHONY: test-hnsw-converter-build
+test-hnsw-converter: test-hnsw-converter-build
+	./$@
+
+test-hnsw-converter-build: test/unit/test_hnsw_converter.c src/hnsw_export.c \
+                           src/hnsw_export.h src/cuvs_util.c $(wildcard src/*.h)
 	$(CC) -std=gnu11 -O0 -Wall -Wextra -Wno-unused-parameter \
 		-ffunction-sections -fdata-sections -I src \
 		-I$(shell $(PG_CONFIG) --includedir) -I$(shell $(PG_CONFIG) --includedir-server) \
-		$(HNSW_UNIT_CPPFLAGS) -o $@ test/unit/test_hnsw_converter.c src/cuvs_util.c \
+		$(HNSW_UNIT_CPPFLAGS) -o test-hnsw-converter test/unit/test_hnsw_converter.c src/cuvs_util.c \
 		$(HNSW_CONVERTER_UNIT_LINK) $(TEST_RT_LIB)
-	./$@
 
 EXTRA_CLEAN += test-hnsw-build test-hnsw-build-ipc test-hnsw-owner-lease test-hnsw-ace-quality test-hnsw-converter test-hnsw-admission test-hnsw-explicit-route test-hnsw-policy \
                test-admission-contract test-admission-contract-cxx test-admission-contract-util.o \

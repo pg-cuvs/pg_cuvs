@@ -99,6 +99,9 @@ echo "OK: patch set, planner source and planner build flags"
 if [[ "$manual_checks" == 1 ]]; then
   git -C "$TMP/cuvs" show level-0005:cpp/src/neighbors/detail/cagra/cagra_build.cuh > "$TMP/canonical.cuh"
   ulimit -c 0
-  python3 -B "$ROOT/test/unit/run_manual_checks.py" \
-    --sdk-source "$SRC" --canonical-header "$TMP/canonical.cuh"
+  manual_args=(--sdk-source "$SRC" --canonical-header "$TMP/canonical.cuh")
+  if [[ -n "${PGCUVS_MANUAL_CHECKS_OUTPUT:-}" ]]; then
+    manual_args+=(--output "$PGCUVS_MANUAL_CHECKS_OUTPUT")
+  fi
+  python3 -B "$ROOT/test/unit/run_manual_checks.py" "${manual_args[@]}"
 fi

@@ -207,6 +207,7 @@ jobs:
         timeout-minutes: 35
         env:
           PGCUVS_CUVS_GIT: ${{ runner.temp }}/pgcuvs-sdk-check.git
+          PGCUVS_MANUAL_CHECKS_OUTPUT: ${{ runner.temp }}/pgcuvs-manual-checks
         run: |
           export PATH=/usr/lib/postgresql/16/bin:$PATH
           scripts/check-sdk-patch-path.sh --manual-checks
@@ -294,6 +295,8 @@ jobs:
             test/*.diffs
             /tmp/shim_daemon.log
             /tmp/pg_cuvs_fault_daemon.log
+            ${{ runner.temp }}/pgcuvs-manual-checks/*.log
+            ${{ runner.temp }}/pgcuvs-manual-checks/summary.tsv
           retention-days: 7
 
       - name: Stale scan integration (fresh shim daemon)
