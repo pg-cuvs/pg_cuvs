@@ -161,6 +161,16 @@ OBS_SRCS = ['test/unit/test_i3e_observation.c', 'src/cuvs_ipc.c', 'src/cuvs_util
             'src/cuvs_wrapper_shim_cpu.c', 'src/cuvs_cache_policy.c', 'src/cuvs_peak_meter.c', 'src/cuvs_page_overlay.c']
 
 
+def run_status(rc, output):
+    if rc == 0:
+        return 'PASS'
+    if rc == 124:
+        return 'TIMEOUT'
+    if rc == 1 and any(line.startswith('FAIL') for line in output.splitlines()):
+        return 'RED (run)'
+    return 'RUN-BROKEN'
+
+
 def build_and_run(tree):
     out = {}
     rc, text = run([CC, '-std=gnu11', '-O1', '-DPGCUVS_CPU_SHIM', '-ffunction-sections',
@@ -172,10 +182,10 @@ def build_and_run(tree):
     else:
         rc, text = run(['./bin-obs'], tree)
         lines = [l for l in text.splitlines() if l.startswith(('FAIL', 'PASS', 'test_i3e'))]
-        out['obs'] = ('PASS' if rc == 0 else 'RED (run)', lines[:1] or text.strip().splitlines()[-1:])
+        out['obs'] = (run_status(rc, text), lines[:1] or text.strip().splitlines()[-1:])
     rc, text = run([sys.executable, '-I', 'test/unit/check_i3e_sql.py', '.'], tree)
     lines = [l for l in text.splitlines() if l.startswith(('FAIL', 'check_i3e'))]
-    out['sql'] = ('PASS' if rc == 0 else 'RED (run)', lines[:1] or [''])
+    out['sql'] = (run_status(rc, text), lines[:1] or [''])
     return out
 
 
@@ -215,7 +225,7 @@ def main(argv):
             path.write_text(text.replace(old, new))
         res = build_and_run(tree)
         reds = {t for t, (s, _) in res.items() if s == 'RED (run)'}
-        broken = {t for t, (s, _) in res.items() if s == 'BUILD-BROKEN'}
+        broken = {t for t, (s, _) in res.items() if s in ('BUILD-BROKEN', 'RUN-BROKEN', 'TIMEOUT')}
         ok = expect <= reds and not broken
         red += ok
         detail = '; '.join(f'{t}={s} {tail[0] if tail else ""}'.strip() for t, (s, tail) in res.items()

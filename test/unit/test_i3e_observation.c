@@ -144,6 +144,16 @@ col_index(const char *header, const char *name)
     return -1;
 }
 
+static void
+split_row(char *buf, size_t length, char **fields, int expected)
+{
+    int count = cuvs_status_split(buf, length, fields, expected);
+
+    CHECK(count == expected);
+    if (count != expected)
+        exit(1);
+}
+
 /* Row of the given gpu (column 0) from a memory_status reply; every field
  * must parse with its declared kind. Returns 1 when found. */
 static int
@@ -160,7 +170,7 @@ mem_row(int gpu, Row *out)
         assert(ll < sizeof(r.buf));
         memcpy(r.buf, line, ll);
         r.buf[ll] = '\0';
-        CHECK(cuvs_status_split(r.buf, ll, r.f, MEM_N) == MEM_N);
+        split_row(r.buf, ll, r.f, MEM_N);
         for (int c = 0; c < MEM_N; c++)
         {
             int64_t v;
@@ -557,7 +567,7 @@ test_index_status(void)
         int isnull;
         memcpy(buf, line, ll);
         buf[ll] = '\0';
-        CHECK(cuvs_status_split(buf, ll, f, IDX_N) == IDX_N);
+        split_row(buf, ll, f, IDX_N);
         CHECK(cuvs_status_parse_field(IDX_KINDS[IDX_N - 1], f[IDX_N - 1], &v, &isnull) == 0);
         CHECK(isnull == 1);            /* dataset_attached NULL in this release */
         rows++;
