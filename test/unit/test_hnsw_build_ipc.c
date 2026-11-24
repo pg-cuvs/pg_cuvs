@@ -206,7 +206,7 @@ int main(void) {
                 close(result);
                 if (waitpid(child, &child_status, 0) != child)
                     return 2;
-                fprintf(stderr, "FAIL IPC fixture %d accepted an invalid reply\n", fixture_case);
+                fprintf(stderr, "\nFAIL IPC fixture %d accepted an invalid reply\n", fixture_case);
                 return 1;
             }
             assert(rc == CUVS_STATUS_ERROR && result == -1);

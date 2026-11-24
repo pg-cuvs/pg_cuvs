@@ -1644,7 +1644,7 @@ test_ace_readback_metapage_roundtrip(void)
     meta = (Page)chain_test_pages[chain_test_nblocks - 1];
     if (((PageHeader)meta)->pd_lower != prefix + sizeof(p) + sizeof(ace))
     {
-        fputs("FAIL ACE metapage extent omits the readback\n", stderr);
+        fputs("\nFAIL ACE metapage extent omits the readback\n", stderr);
         exit(1);
     }
     assert(memcmp((char *)meta + prefix, &p, sizeof(p)) == 0); /* receipt bytes unchanged */
@@ -1654,7 +1654,7 @@ test_ace_readback_metapage_roundtrip(void)
     assert(memcmp(&out, &p, sizeof(p)) == 0);
     if (hnsw_read_disk_ace(meta, &out, &ace_out) != CUVS_HNSW_POLICY_RECORDED)
     {
-        fputs("FAIL ACE metapage readback could not be decoded\n", stderr);
+        fputs("\nFAIL ACE metapage readback could not be decoded\n", stderr);
         exit(1);
     }
     assert(memcmp(&ace_out, &ace, sizeof(ace)) == 0);
