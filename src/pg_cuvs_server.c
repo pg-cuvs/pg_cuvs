@@ -605,8 +605,8 @@ page_legacy_deferred(uint32_t db_oid, uint32_t index_oid)
     return fd >= 0 && page_has_completed_xid(fd, 2);
 }
 
-/* Drop and failed-build cleanup are rooted in the daemon's directory. Do
- * not follow symlinks, even when an artifact was created by an older build. */
+/* Drop and failed-build cleanup use the selected index root. Do not follow
+ * symlinks inside it, even for artifacts created by an older build. */
 static void
 remove_page_tree_at(int parent, const char *name)
 {
@@ -7430,17 +7430,49 @@ sync_build_path(const char *path, int flags)
     return result;
 }
 
+/* BUILD, the empty marker and targeted DROP all resolve names in the
+ * daemon's filesystem. Keep its configured spelling for aliases of its root. */
+static bool
+resolve_page_root(const char requested[CUVS_PAGE_INDEX_DIR_SIZE],
+                  char root[CUVS_PAGE_INDEX_DIR_SIZE])
+{
+    struct stat selected, configured;
+    char *resolved;
+    bool valid = false;
+
+    if (!memchr(requested, '\0', CUVS_PAGE_INDEX_DIR_SIZE))
+        return false;
+    resolved = realpath(requested[0] ? requested : g_index_dir, NULL);
+    if (resolved && stat(resolved, &selected) == 0 &&
+        S_ISDIR(selected.st_mode) && selected.st_uid == geteuid())
+    {
+        const char *path = resolved;
+
+        if (stat(g_index_dir, &configured) == 0 &&
+            selected.st_dev == configured.st_dev && selected.st_ino == configured.st_ino)
+            path = g_index_dir;
+        if (strlen(path) < CUVS_PAGE_INDEX_DIR_SIZE)
+        {
+            strcpy(root, path);
+            valid = true;
+            LOG_DEBUG("pg_cuvs_server: page-format index_dir %s resolved to %s\n",
+                      requested, root);
+        }
+    }
+    free(resolved);
+    return valid;
+}
+
 static int
 page_incarnation_dirs(const CuvsCmdFrame *cmd, const CuvsPageBuildRequest *request,
-                      char index_path[512], char incarnation[512])
+                      const char *root, char index_path[512], char incarnation[512])
 {
     struct stat st;
 
-    if (snprintf(index_path, 512, "%s/%u_%u", g_index_dir,
+    if (snprintf(index_path, 512, "%s/%u_%u", root,
                  cmd->db_oid, cmd->index_oid) >= 512 ||
         snprintf(incarnation, 512, "%s/%016llx", index_path,
                  (unsigned long long) request->index_nonce) >= 512 ||
-        (mkdir(g_index_dir, 0700) != 0 && errno != EEXIST) ||
         (mkdir(index_path, 0700) != 0 && errno != EEXIST) ||
         lstat(index_path, &st) != 0 || !S_ISDIR(st.st_mode))
         return -1;
@@ -7490,24 +7522,25 @@ write_page_build_xid(const char *path, const char *name, uint64_t xid)
 }
 
 static int
-sync_page_incarnation(const char *index_path, const char *incarnation)
+sync_page_incarnation(const char *root, const char *index_path, const char *incarnation)
 {
     return (sync_build_path(incarnation, O_DIRECTORY) != 0 ||
             sync_build_path(index_path, O_DIRECTORY) != 0 ||
-            sync_build_path(g_index_dir, O_DIRECTORY) != 0) ? -1 : 0;
+            sync_build_path(root, O_DIRECTORY) != 0) ? -1 : 0;
 }
 
 static int
-persist_empty_page_build(const CuvsCmdFrame *cmd, const CuvsPageBuildRequest *request)
+persist_empty_page_build(const CuvsCmdFrame *cmd, const CuvsPageBuildRequest *request,
+                         const char *root)
 {
     char index_path[512], incarnation[512];
 
-    if (page_incarnation_dirs(cmd, request, index_path, incarnation) != 0)
+    if (page_incarnation_dirs(cmd, request, root, index_path, incarnation) != 0)
         return -1;
     if (write_page_build_xid(incarnation, "empty.xid", request->build_xid) == 0)
     {
         int dir;
-        if (sync_page_incarnation(index_path, incarnation) == 0)
+        if (sync_page_incarnation(root, index_path, incarnation) == 0)
             return 0;
         dir = open(incarnation, O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
         if (dir >= 0)
@@ -7524,7 +7557,7 @@ persist_empty_page_build(const CuvsCmdFrame *cmd, const CuvsPageBuildRequest *re
 /* An unregistered page-format graph is identified by both nonces. */
 static int
 persist_page_build(const CuvsCmdFrame *cmd, const CuvsPageBuildRequest *request,
-                   CuvsCagraIndex handle, int gpu, uint64_t *graph_nonce,
+                   const char *root, CuvsCagraIndex handle, int gpu, uint64_t *graph_nonce,
                    CuvsHnswIndex *cpu_hnsw)
 {
     char index_path[512], incarnation[512], graph[512], filename[512], graph_name[17];
@@ -7536,7 +7569,7 @@ persist_page_build(const CuvsCmdFrame *cmd, const CuvsPageBuildRequest *request,
             return -1;
     } while (nonce == 0);
     snprintf(graph_name, sizeof(graph_name), "%016llx", (unsigned long long) nonce);
-    if (page_incarnation_dirs(cmd, request, index_path, incarnation) != 0)
+    if (page_incarnation_dirs(cmd, request, root, index_path, incarnation) != 0)
         return -1;
     if (snprintf(graph, sizeof(graph), "%s/%s", incarnation, graph_name) >= (int) sizeof(graph) ||
         snprintf(filename, sizeof(filename), "%s/index.cagra", graph) >= (int) sizeof(filename) ||
@@ -7551,7 +7584,7 @@ persist_page_build(const CuvsCmdFrame *cmd, const CuvsPageBuildRequest *request,
         sync_build_path(filename, 0) != 0 ||
         write_page_build_xid(graph, "build.xid", request->build_xid) != 0 ||
         sync_build_path(graph, O_DIRECTORY) != 0 ||
-        sync_page_incarnation(index_path, incarnation) != 0)
+        sync_page_incarnation(root, index_path, incarnation) != 0)
         goto failed;
     if (cmd->use_cpu_hnsw &&
         snprintf(filename, sizeof(filename), "%s/index.hnsw", graph) < (int) sizeof(filename) &&
@@ -7593,7 +7626,7 @@ static void
 handle_mark_pages_empty(int client_fd, const CuvsCmdFrame *cmd)
 {
     CuvsPageBuildRequest request;
-    char index_dir[256] = "";
+    char index_dir[CUVS_PAGE_INDEX_DIR_SIZE], root[CUVS_PAGE_INDEX_DIR_SIZE];
     int fd = -1;
     CuvsReplyHeader reply = {.status = CUVS_STATUS_PERSIST_FAILED};
 
@@ -7606,7 +7639,12 @@ handle_mark_pages_empty(int client_fd, const CuvsCmdFrame *cmd)
         send_error(client_fd, "invalid empty page-format BUILD notification");
         return;
     }
-    if (persist_empty_page_build(cmd, &request) == 0)
+    if (!resolve_page_root(index_dir, root))
+    {
+        send_error_code(client_fd, CUVS_STATUS_INVALID_PAGE_ROOT, "invalid page-format index_dir");
+        return;
+    }
+    if (persist_empty_page_build(cmd, &request, root) == 0)
     {
         pthread_mutex_lock(&g_index_mutex);
         ++g_page_deferral_epoch;
@@ -7642,7 +7680,8 @@ handle_build(int client_fd, const CuvsCmdFrame *cmd)
     }
     clear_build_notices();
     LOG_DEBUG("[handle_build] reading index_dir...\n");
-    char index_dir[256] = {0};
+    char index_dir[CUVS_PAGE_INDEX_DIR_SIZE] = {0};
+    char page_root[CUVS_PAGE_INDEX_DIR_SIZE];
     /* ADR-057: the backend may pass the corpus as an SCM_RIGHTS memfd alongside
      * index_dir (memfd tier); passed_fd is -1 for the shm/heap tiers. */
     int  passed_fd = -1;
@@ -7650,6 +7689,13 @@ handle_build(int client_fd, const CuvsCmdFrame *cmd)
     {
         LOG_ERROR("[handle_build] recv index_dir FAILED errno=%d\n", errno);
         send_error(client_fd, "recv index_dir failed");
+        return;
+    }
+    if (page_build && !resolve_page_root(index_dir, page_root))
+    {
+        if (passed_fd >= 0)
+            close(passed_fd);
+        send_error_code(client_fd, CUVS_STATUS_INVALID_PAGE_ROOT, "invalid page-format index_dir");
         return;
     }
     LOG_DEBUG("[handle_build] got index_dir=%s passed_fd=%d\n", index_dir, passed_fd);
@@ -7951,10 +7997,10 @@ handle_build(int client_fd, const CuvsCmdFrame *cmd)
     uint64_t page_graph_nonce = 0;
     CuvsHnswIndex page_cpu_hnsw = NULL;
     int page_status = page_build && new_handle ?
-        persist_page_build(cmd, page_build, new_handle, target_gpu,
+        persist_page_build(cmd, page_build, page_root, new_handle, target_gpu,
                            &page_graph_nonce, &page_cpu_hnsw) : 0;
     if (page_build && build_att)
-        page_status = persist_empty_page_build(cmd, page_build);
+        page_status = persist_empty_page_build(cmd, page_build, page_root);
 #ifdef CUVS_TEST_HOOKS
     /* With no production BF builder in this stage, a fixture can attach one
      * while BUILD still owns the input corpus and does not hold L0. */
@@ -9371,6 +9417,17 @@ handle_drop(int client_fd, const CuvsCmdFrame *cmd)
     uint32_t db  = cmd->db_oid;
     uint32_t idx = cmd->index_oid;
     char     p[512];
+    char     root[CUVS_PAGE_INDEX_DIR_SIZE];
+    const char *directory = g_index_dir;
+
+    if (cmd->op == CUVS_OP_DROP_PAGES_INDEX)
+    {
+        char requested[CUVS_PAGE_INDEX_DIR_SIZE];
+
+        if (recv_all(client_fd, requested, sizeof(requested)) != 0)
+            return;
+        directory = resolve_page_root(requested, root) ? root : NULL;
+    }
 
     pthread_mutex_lock(&g_index_mutex);
 
@@ -9412,19 +9469,27 @@ handle_drop(int client_fd, const CuvsCmdFrame *cmd)
             break;
         }
 
+    /* The committed DROP invalidates residency even without a usable root. */
+    if (!directory)
+    {
+        pthread_mutex_unlock(&g_index_mutex);
+        send_error_code(client_fd, CUVS_STATUS_INVALID_PAGE_ROOT, "invalid page-format index_dir for DROP");
+        return;
+    }
+
     /* Unlink every per-index artifact so a restart won't reload a zombie. */
-    index_file_path(p, sizeof(p), g_index_dir, db, idx);       unlink(p); /* .cagra */
-    tids_file_path(p, sizeof(p), g_index_dir, db, idx);        unlink(p); /* .tids */
-    shards_manifest_path(p, sizeof(p), g_index_dir, db, idx);  unlink(p); /* .shards */
-    delta_file_path(p, sizeof(p), g_index_dir, db, idx);       unlink(p); /* .delta */
-    vectors_file_path(p, sizeof(p), g_index_dir, db, idx);     unlink(p); /* .vectors */
-    stale_file_path(p, sizeof(p), g_index_dir, db, idx);       unlink(p); /* .stale */
-    relfilenode_file_path(p, sizeof(p), g_index_dir, db, idx); unlink(p); /* .relfilenode */
-    snprintf(p, sizeof(p), "%s/%u_%u.tombstone", g_index_dir, db, idx); unlink(p);
+    index_file_path(p, sizeof(p), directory, db, idx);       unlink(p); /* .cagra */
+    tids_file_path(p, sizeof(p), directory, db, idx);        unlink(p); /* .tids */
+    shards_manifest_path(p, sizeof(p), directory, db, idx);  unlink(p); /* .shards */
+    delta_file_path(p, sizeof(p), directory, db, idx);       unlink(p); /* .delta */
+    vectors_file_path(p, sizeof(p), directory, db, idx);     unlink(p); /* .vectors */
+    stale_file_path(p, sizeof(p), directory, db, idx);       unlink(p); /* .stale */
+    relfilenode_file_path(p, sizeof(p), directory, db, idx); unlink(p); /* .relfilenode */
+    snprintf(p, sizeof(p), "%s/%u_%u.tombstone", directory, db, idx); unlink(p);
     /* Shard artifacts have contiguous ids; stop at the first missing one. */
     for (uint32_t s = 0; s < CUVS_SHARDS_MAX; s++)
     {
-        shard_cagra_path(p, sizeof(p), g_index_dir, db, idx, s);
+        shard_cagra_path(p, sizeof(p), directory, db, idx, s);
         if (unlink(p) != 0)
             break;
     }
@@ -9433,7 +9498,7 @@ handle_drop(int client_fd, const CuvsCmdFrame *cmd)
 
     pthread_mutex_unlock(&g_index_mutex);
 
-    int rootfd = open(g_index_dir, O_RDONLY | O_DIRECTORY);
+    int rootfd = open(directory, O_RDONLY | O_DIRECTORY);
     if (rootfd >= 0)
     {
         char name[32];
@@ -13035,6 +13100,7 @@ connection_thread(void *arg)
             handle_shard_stats(client_fd, &cmd);
             break;
         case CUVS_OP_DROP_INDEX:
+        case CUVS_OP_DROP_PAGES_INDEX:
             handle_drop(client_fd, &cmd);
             break;
         case CUVS_OP_EXPORT_ADJACENCY:

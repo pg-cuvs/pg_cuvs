@@ -31,3 +31,12 @@ BEGIN
         RAISE EXCEPTION 'an older daemon blocked an empty or single-row page build';
     END IF;
 END $$;
+
+-- The old daemon cannot handle the targeted notification; catalog DROP commits.
+DROP INDEX page_one_old_daemon_idx;
+DO $$
+BEGIN
+    IF to_regclass('page_one_old_daemon_idx') IS NOT NULL THEN
+        RAISE EXCEPTION 'an older daemon blocked page-format DROP';
+    END IF;
+END $$;
