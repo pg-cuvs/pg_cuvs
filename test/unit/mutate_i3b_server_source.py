@@ -32,10 +32,17 @@ M = [
      "        build_oom = !new_handle && cuvs_last_build_was_oom();",
      "        (void)evict_lru(target_gpu, CUVS_RQ_BUILD_CAGRA);\n"
      "        build_oom = !new_handle && cuvs_last_build_was_oom();"),
-    ("second skip site", "graceful_shutdown(void)\n{", "graceful_shutdown(void)\n{\n    if (!g_indexes[0].file_current) {}"),
+    ("SIGTERM tests file_current", "graceful_shutdown(void)\n{", "graceful_shutdown(void)\n{\n    if (!g_indexes[0].file_current) {}"),
+    ("legacy discard saves the graph", "if (save_legacy && !e->file_current)", "if (!e->file_current)"),
+    ("eviction ignores file_current", "if (save_legacy && !e->file_current)", "if (save_legacy)"),
+    ("compaction skips a save", "    if (save_index(e) != 0)",
+     "    if (e->valid && !e->file_current && save_index(e) != 0)"),
+    ("eviction saves outside its guard", "        if (save_legacy && !e->file_current)",
+     "        save_index(e);\n        if (save_legacy && !e->file_current)"),
     ("wrapper: peak CAS before the upstream allocate",
-     "        std::size_t level = cuvs_peak_meter_reserve(dev_, sz);\n        try {\n            void *p = upstream_.allocate(stream, bytes);\n            cuvs_peak_meter_commit(dev_, level);",
-     "        std::size_t level = cuvs_peak_meter_reserve(dev_, sz);\n        cuvs_peak_meter_commit(dev_, level);\n        try {\n            void *p = upstream_.allocate(stream, bytes);"),
+     "        std::size_t level = cuvs_peak_meter_reserve(dev_, sz);\n        try {",
+     "        std::size_t level = cuvs_peak_meter_reserve(dev_, sz);\n"
+     "        cuvs_peak_meter_commit(dev_, level);\n        try {"),
 ]
 WRAP = os.path.join(ROOT, "src", "cuvs_wrapper.cu")
 orig = open(SRC).read()

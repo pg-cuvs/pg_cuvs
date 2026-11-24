@@ -177,9 +177,18 @@ if not (m1 and m2 and m2.start() > m1.start()):
     fail("CK-37 (a): handle_extend does not clear file_current after the memory-only change")
 if "e->file_current = 1;" not in funcs.get("save_index", ""):
     fail("CK-37 (a): save_index success does not set file_current")
-skip_sites = len(re.findall(r"if \(!e->file_current\)", src))
-if skip_sites != 1 or "if (!e->file_current)" not in funcs.get("evict_entry", ""):
-    fail(f"CK-37 (a): save skip decided in {skip_sites} places (want exactly evict_entry)")
+# Count negative file_current guards even when combined with another predicate.
+skip_guard = (r"\bif\s*\([^;{}]*?!\s*\w+(?:\[[^\]\n]+\])?"
+              r"\s*(?:->|\.)\s*file_current\b")
+skip_sites = len(re.findall(skip_guard, src))
+evict = funcs.get("evict_entry", "")
+guarded_save = (r"\bif\s*\(\s*save_legacy\s*&&\s*!\s*e->file_current\s*\)\s*\{\s*"
+                r"[^{}]*?\bsave_index\s*\(\s*e\s*\)")
+if skip_sites != 1 or not re.search(guarded_save, evict):
+    fail(f"CK-37 (a): expected one file_current save guard in evict_entry "
+         f"(save_legacy && !e->file_current), found {skip_sites} negative guards")
+if len(re.findall(r"\bsave_index\s*\(", evict)) != 1:
+    fail("CK-37 (a): evict_entry must make exactly one guarded save_index call")
 for name in ("graceful_shutdown",):
     if "file_current" in funcs.get(name, ""):
         fail(f"CK-37 (a): {name} reads file_current (SIGTERM must always save)")
