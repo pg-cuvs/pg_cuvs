@@ -54,6 +54,30 @@ expect_supply(const char *socket, uint32_t db, uint32_t index,
 }
 
 static int
+expect_overlay_search(const char *socket, uint32_t db, uint32_t index,
+                      const CuvsPageOverlayRequest *request, const CuvsPageSupplement *rows,
+                      int nq, int expected, uint64_t covered)
+{
+    const float query[2][8] = {{0}, {1,1,1,1,1,1,1,1}};
+    CuvsPageOverlayResult results[2];
+    CuvsPageProgress progress;
+    int count;
+    uint32_t latency;
+    int status = cuvs_ipc_search_page_overlay(socket, db, index, request, &query[0][0], nq, 8, 1,
+        CUVS_METRIC_L2, 0, 0, 0, 0, 0, rows, results, &count, &latency, &progress);
+
+    if (status == expected && progress.covered_upto == covered &&
+        (status != CUVS_STATUS_OK ||
+         (count == nq && results[0].slot == request->base.n_slots + 1 &&
+          results[0].block == 65 && results[0].distance == 0 &&
+          (nq == 1 || results[1].slot == 0))))
+        return 0;
+    fprintf(stderr, "OVERLAY SEARCH status=%d count=%d coverage=%llu, expected status=%d\n",
+            status, count, (unsigned long long) progress.covered_upto, expected);
+    return 1;
+}
+
+static int
 check_supply(const char *socket, uint32_t db, uint32_t index, CuvsPageSearchRequest base)
 {
     const float vector[8] = {0};
@@ -72,6 +96,10 @@ check_supply(const char *socket, uint32_t db, uint32_t index, CuvsPageSearchRequ
     if (expect_supply(socket, db, index, &request, &rows, CUVS_STATUS_OK, 2) ||
         expect_supply(socket, db, index, &request, &rows, CUVS_STATUS_OK, 2))
         return 1;
+    request.from = 2;
+    if (expect_overlay_search(socket, db, index, &request, NULL, 1, CUVS_STATUS_OK, 2) ||
+        expect_overlay_search(socket, db, index, &request, NULL, 2, CUVS_STATUS_OK, 2))
+        return 1;
     request.from = 1;
     request.base.tail = 3;
     if (expect_supply(socket, db, index, &request, &rows, CUVS_STATUS_PAGE_NEED, 2))
@@ -82,7 +110,11 @@ check_supply(const char *socket, uint32_t db, uint32_t index, CuvsPageSearchRequ
     request.from = 0;
     request.base.tail = 2;
     marks[0].state = CUVS_PAGE_POSITION_INVISIBLE;
-    return expect_supply(socket, db, index, &request, &rows, CUVS_STATUS_ERROR, 0);
+    if (expect_supply(socket, db, index, &request, &rows, CUVS_STATUS_ERROR, 0) ||
+        expect_overlay_search(socket, db, index, &request, &rows, 1, CUVS_STATUS_OK, 0))
+        return 1;
+    request.from = 2;
+    return expect_overlay_search(socket, db, index, &request, NULL, 1, CUVS_STATUS_PAGE_NEED, 0);
 }
 
 int

@@ -12761,48 +12761,68 @@ initialize_page_daemon_id(void)
         g_page_daemon_id = id ? id : 1;
 }
 
+static uint32_t
+receive_page_overlay(int client_fd, const CuvsCmdFrame *cmd, CuvsPageOverlayRequest *request)
+{
+    if (recv_all(client_fd, &request->base.length, sizeof(request->base.length)) < 0 ||
+        request->base.length != sizeof(*request) ||
+        recv_all(client_fd, (char *) request + sizeof(request->base.length),
+                 sizeof(*request) - sizeof(request->base.length)) < 0)
+        return CUVS_STATUS_ERROR;
+    if (cmd->dim == 0 || cmd->dim > 65535 || cmd->n_filter_tids ||
+        request->base.resume_count || request->base.resume_distance || request->base.reserved ||
+        !request->boot_id || request->from < request->base.folded ||
+        request->from > request->base.tail ||
+        request->base.tail - request->from != request->positions ||
+        request->positions > CUVS_PAGE_BATCH_MAX || request->vector_rows > request->positions)
+        return CUVS_STATUS_ERROR;
+    if (request->base.folded != 0)
+        return CUVS_STATUS_NOT_FOUND;
+    (void) pthread_once(&g_page_daemon_once, initialize_page_daemon_id);
+    return g_page_daemon_id ? CUVS_STATUS_OK : CUVS_STATUS_ERROR;
+}
+
+static CuvsPageOverlayChunk *
+read_page_overlay_chunk(const CuvsPageOverlayRequest *request, uint32_t dim, bool shared)
+{
+    size_t bytes = (size_t) request->positions * sizeof(CuvsPagePosition) +
+                   (size_t) request->vector_rows * dim * sizeof(float);
+    void *mapping = map_page_shm(request->supplement_shm, sizeof(request->supplement_shm), bytes);
+    CuvsPageOverlayChunk *chunk;
+
+    if (mapping == MAP_FAILED)
+        return NULL;
+    chunk = cuvs_page_overlay_copy(request, mapping, bytes, shared);
+    munmap(mapping, bytes);
+    return chunk;
+}
+
+static bool
+send_page_overlay_reply(int client_fd, const CuvsReplyHeader *reply, const CuvsPageProgress *progress)
+{
+    return send_all(client_fd, reply, sizeof(*reply)) == 0 &&
+        (reply->status == CUVS_STATUS_OK || reply->status == CUVS_STATUS_PAGE_NEED ||
+         reply->status == CUVS_STATUS_PAGE_OVERLAY_FULL) &&
+        send_all(client_fd, progress, sizeof(*progress)) == 0;
+}
+
 static void
 handle_page_supply(int client_fd, const CuvsCmdFrame *cmd)
 {
     CuvsPageOverlayRequest request;
-    CuvsReplyHeader reply = {.status = CUVS_STATUS_ERROR};
+    CuvsReplyHeader reply = {0};
     CuvsPageProgress progress = {0};
     CuvsPageOverlayChunk *chunk = NULL, *obsolete = NULL;
-    size_t bytes;
-    void *mapping;
     PageCagraGraph *graph;
 
-    if (recv_all(client_fd, &request.base.length, sizeof(request.base.length)) < 0 ||
-        request.base.length != sizeof(request) ||
-        recv_all(client_fd, (char *) &request + sizeof(request.base.length),
-                 sizeof(request) - sizeof(request.base.length)) < 0)
+    reply.status = receive_page_overlay(client_fd, cmd, &request);
+    if (reply.status != CUVS_STATUS_OK)
         goto done;
-    if (cmd->dim == 0 || cmd->dim > 65535 || cmd->n_vecs || cmd->k || cmd->n_filter_tids ||
-        request.base.resume_count || request.base.resume_distance || request.base.reserved ||
-        !request.boot_id || request.from < request.base.folded ||
-        request.from > request.base.tail ||
-        request.base.tail - request.from != request.positions ||
-        !request.positions || request.positions > CUVS_PAGE_BATCH_MAX ||
-        request.vector_rows > request.positions)
-        goto done;
-    if (request.base.folded != 0)
-    {
-        reply.status = CUVS_STATUS_NOT_FOUND;
-        goto done;
-    }
-
-    /* Legacy-only daemons need no overlay identity. */
-    (void) pthread_once(&g_page_daemon_once, initialize_page_daemon_id);
-    if (!g_page_daemon_id)
+    reply.status = CUVS_STATUS_ERROR;
+    if (cmd->n_vecs || cmd->k || !request.positions)
         goto done;
     progress.daemon_id = g_page_daemon_id;
-    bytes = (size_t) request.positions * sizeof(CuvsPagePosition) +
-            (size_t) request.vector_rows * cmd->dim * sizeof(float);
-    mapping = map_page_shm(request.supplement_shm, sizeof(request.supplement_shm), bytes);
-    if (mapping == MAP_FAILED)
-        goto done;
-    chunk = cuvs_page_overlay_copy(&request, mapping, bytes);
-    munmap(mapping, bytes);
+    chunk = read_page_overlay_chunk(&request, cmd->dim, true);
     if (!chunk)
         goto done;
 
@@ -12818,12 +12838,127 @@ handle_page_supply(int client_fd, const CuvsCmdFrame *cmd)
     pthread_mutex_unlock(&g_index_mutex);
 
 done:
-    free(chunk);
+    cuvs_page_overlay_free(chunk);
     cuvs_page_overlay_free(obsolete);
-    if (send_all(client_fd, &reply, sizeof(reply)) == 0 &&
-        (reply.status == CUVS_STATUS_OK || reply.status == CUVS_STATUS_PAGE_NEED ||
-         reply.status == CUVS_STATUS_PAGE_OVERLAY_FULL))
-        (void) send_all(client_fd, &progress, sizeof(progress));
+    (void) send_page_overlay_reply(client_fd, &reply, &progress);
+}
+
+static void
+handle_page_overlay_search(int client_fd, const CuvsCmdFrame *cmd)
+{
+    CuvsPageOverlayRequest request;
+    CuvsReplyHeader reply = {0};
+    CuvsPageProgress progress = {0};
+    CuvsPageOverlayChunk *supplement = NULL, *obsolete = NULL;
+    CuvsSearchResult *raw = NULL;
+    CuvsPageOverlayResult *results = NULL;
+    void *query = MAP_FAILED;
+    size_t bytes = 0;
+    bool batch = cmd->op == CUVS_OP_SEARCH_PAGE_OVERLAY_BATCH;
+    uint32_t prefix = batch ? 2 * sizeof(uint32_t) : 0;
+    uint64_t started;
+    PageCagraGraph *graph;
+
+    reply.status = receive_page_overlay(client_fd, cmd, &request);
+    if (reply.status != CUVS_STATUS_OK)
+        goto done;
+    reply.status = CUVS_STATUS_ERROR;
+    if (cmd->k == 0 || cmd->k > 4000 || cmd->n_vecs < 1 || cmd->n_vecs > 1024 ||
+        batch != (cmd->n_vecs > 1) || cmd->search_mode > 1 || cmd->bf_precision > 1)
+        goto done;
+    progress.daemon_id = g_page_daemon_id;
+    if (request.positions)
+    {
+        supplement = read_page_overlay_chunk(&request, cmd->dim, false);
+        if (!supplement)
+            goto done;
+    }
+    bytes = prefix + (size_t) cmd->n_vecs * cmd->dim * sizeof(float);
+    query = map_page_shm(cmd->shm_key, sizeof(cmd->shm_key), bytes);
+    if (query == MAP_FAILED ||
+        (batch && (((const uint32_t *) query)[0] != (uint32_t) cmd->n_vecs ||
+                   ((const uint32_t *) query)[1] != cmd->dim)))
+        goto done;
+    raw = malloc((size_t) cmd->n_vecs * cmd->k * sizeof(*raw));
+    results = calloc((size_t) cmd->n_vecs * cmd->k, sizeof(*results));
+    if (!raw || !results)
+        goto done;
+
+    started = admission_mono_us();
+    pthread_mutex_lock(&g_index_mutex);
+    graph = find_page_graph(cmd, &request.base);
+    if (!graph || graph->dim != cmd->dim || graph->metric != cmd->metric)
+    {
+        reply.status = CUVS_STATUS_NOT_FOUND;
+        goto unlock;
+    }
+    obsolete = cuvs_page_overlay_start_boot(&graph->overlay, request.boot_id, request.base.folded);
+    progress.covered_upto = graph->overlay.covered_upto;
+    if (request.base.tail - request.base.folded > CUVS_PAGE_OVERLAY_MAX)
+    {
+        reply.status = CUVS_STATUS_PAGE_OVERLAY_FULL;
+        goto unlock;
+    }
+    if (request.from > progress.covered_upto)
+    {
+        reply.status = CUVS_STATUS_PAGE_NEED;
+        goto unlock;
+    }
+    if (cmd->search_mode == 1 && !graph->bf[cmd->bf_precision])
+    {
+        reply.status = CUVS_STATUS_NO_VECTORS;
+        goto unlock;
+    }
+
+    int k = (int) (graph->n_slots < cmd->k ? graph->n_slots : cmd->k);
+    const float *vectors = (const float *) ((const char *) query + prefix);
+    if (page_graph_search(graph, cmd, vectors, (int) cmd->n_vecs, k, NULL, raw) != 0)
+    {
+        reply.status = CUVS_STATUS_OOM_FALLBACK;
+        goto unlock;
+    }
+
+    graph->last_use = ++g_page_access;
+    graph->last_search = time(NULL);
+    if (graph->hits < UINT32_MAX)
+        ++graph->hits;
+    for (int q = 0; q < (int) cmd->n_vecs; ++q)
+    {
+        int written = 0;
+        CuvsPageOverlayResult *row = results + (size_t) q * cmd->k;
+        const float *vector = vectors + (size_t) q * cmd->dim;
+
+        for (int i = 0; i < k; ++i)
+        {
+            const CuvsSearchResult *candidate = &raw[(size_t) q * k + i];
+            if (candidate->item_id >= 0 && (uint64_t) candidate->item_id < graph->n_slots)
+            {
+                row[written].slot = (uint64_t) candidate->item_id;
+                row[written++].distance = candidate->distance;
+            }
+        }
+        for (const CuvsPageOverlayChunk *chunk = graph->overlay.head;
+             chunk && chunk->from < request.from; chunk = chunk->next)
+            cuvs_page_overlay_score(chunk, request.from, &request.base, vector, cmd, row, &written);
+        cuvs_page_overlay_score(supplement, request.base.tail, &request.base, vector, cmd, row, &written);
+        if (batch)
+            while ((uint32_t) written < cmd->k)
+                row[written++].slot = CUVS_PAGE_SLOT_INVALID;
+        reply.n_results += written;
+    }
+    reply.status = CUVS_STATUS_OK;
+unlock:
+    pthread_mutex_unlock(&g_index_mutex);
+    reply.latency_us = (uint32_t) (admission_mono_us() - started);
+done:
+    if (query != MAP_FAILED)
+        munmap(query, bytes);
+    free(raw);
+    cuvs_page_overlay_free(supplement);
+    cuvs_page_overlay_free(obsolete);
+    if (send_page_overlay_reply(client_fd, &reply, &progress) && reply.n_results)
+        (void) send_all(client_fd, results, reply.n_results * sizeof(*results));
+    free(results);
 }
 
 static void *
@@ -12940,6 +13075,10 @@ connection_thread(void *arg)
             break;
         case CUVS_OP_MARK_PAGES_EMPTY:
             handle_mark_pages_empty(client_fd, &cmd);
+            break;
+        case CUVS_OP_SEARCH_PAGE_OVERLAY:
+        case CUVS_OP_SEARCH_PAGE_OVERLAY_BATCH:
+            handle_page_overlay_search(client_fd, &cmd);
             break;
         case CUVS_OP_SUPPLY_PAGES:
             handle_page_supply(client_fd, &cmd);

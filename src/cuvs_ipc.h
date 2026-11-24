@@ -166,6 +166,8 @@ int cuvs_ipc_build_hnsw_file_idle(const char *socket_path, int vectors_fd,
 #define CUVS_OP_MARK_PAGES_EMPTY      49
 #define CUVS_OP_UNLOAD_PAGE_LEGACY    50
 #define CUVS_OP_SUPPLY_PAGES          51
+#define CUVS_OP_SEARCH_PAGE_OVERLAY   56
+#define CUVS_OP_SEARCH_PAGE_OVERLAY_BATCH 57
 #define CUVS_PAGE_SLOT_INVALID UINT64_MAX
 #define CUVS_PAGE_BUILD_DEFER_LEGACY 1U
 #define CUVS_PAGE_BATCH_MAX 4096U
@@ -201,7 +203,7 @@ typedef struct CuvsPageSearchRequest
     uint32_t reserved;
 } CuvsPageSearchRequest;
 
-/* Only SUPPLY_PAGES uses the extended frame. The existing page search
+/* Only new overlay opcodes use this extended frame. Existing page search
  * opcodes keep their original request and result layouts. */
 typedef struct CuvsPageOverlayRequest
 {
@@ -240,9 +242,23 @@ typedef struct CuvsPageProgress
     uint64_t covered_upto;
 } CuvsPageProgress;
 
+typedef struct CuvsPageOverlayResult
+{
+    uint64_t slot;
+    float distance;
+    uint32_t block;
+} CuvsPageOverlayResult;
+
 int cuvs_ipc_supply_pages(const char *socket_path, uint32_t db_oid, uint32_t index_oid,
     const CuvsPageOverlayRequest *request, int dim, uint32_t metric,
     const CuvsPageSupplement *supplement, CuvsPageProgress *progress);
+
+int cuvs_ipc_search_page_overlay(const char *socket_path, uint32_t db_oid, uint32_t index_oid,
+    const CuvsPageOverlayRequest *request, const float *queries, int nq, int dim, int k,
+    uint32_t metric, uint32_t itopk_size, uint32_t search_width, uint32_t use_cpu_hnsw,
+    uint32_t search_mode, uint32_t bf_precision, const CuvsPageSupplement *supplement,
+    CuvsPageOverlayResult *results, int *count, uint32_t *latency_us, CuvsPageProgress *progress);
+
 
 
 
