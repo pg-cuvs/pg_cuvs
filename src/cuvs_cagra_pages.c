@@ -1,9 +1,10 @@
 #include "postgres.h"
 
 #include "cuvs_cagra_pages.h"
-#include "utils/memutils.h"
-#include "access/xlog.h"
+#include "access/xloginsert.h"
+#include "miscadmin.h"
 #include "storage/bufpage.h"
+#include "utils/memutils.h"
 
 #define CUVS_LEGACY_EMPTY_MAGIC 0x4356454dU
 
@@ -104,10 +105,7 @@ cuvs_cagra_require_legacy(Relation index)
 #ifdef CUVS_PAGE_FORMAT
 
 #include "access/generic_xlog.h"
-#include "access/xloginsert.h"
 #include "cuvs_util.h"
-#include "storage/bufpage.h"
-#include "miscadmin.h"
 #include "storage/lmgr.h"
 #include "utils/builtins.h"
 #include "utils/guc.h"
