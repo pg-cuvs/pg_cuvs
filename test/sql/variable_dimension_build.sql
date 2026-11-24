@@ -53,7 +53,7 @@ EXCEPTION WHEN data_exception THEN
     RETURN false;
 END;
 $$;
-CREATE FUNCTION pg_temp.vdim_same_rows(table_name regclass, index_name regclass,
+CREATE FUNCTION pg_temp.vdim_same_rows(table_name regclass, index_regclass regclass,
                                        query_vector vector, predicate text DEFAULT 'true')
 RETURNS boolean LANGUAGE plpgsql AS $$
 DECLARE
@@ -70,9 +70,9 @@ BEGIN
     EXECUTE stmt INTO exact_ids;
     PERFORM set_config('enable_cuvs', 'on', false);
     PERFORM set_config('enable_seqscan', 'off', false);
-    SELECT search_count INTO searches_before FROM pg_stat_gpu_search WHERE index_oid = index_name;
+    SELECT search_count INTO searches_before FROM pg_stat_gpu_search WHERE index_oid = index_regclass;
     EXECUTE stmt INTO index_ids;
-    SELECT search_count INTO searches_after FROM pg_stat_gpu_search WHERE index_oid = index_name;
+    SELECT search_count INTO searches_after FROM pg_stat_gpu_search WHERE index_oid = index_regclass;
     PERFORM set_config('enable_seqscan', 'on', false);
     RETURN index_ids = exact_ids AND searches_after > searches_before;
 END;
