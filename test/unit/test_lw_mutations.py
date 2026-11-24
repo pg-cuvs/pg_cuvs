@@ -209,7 +209,7 @@ def run(argv, cwd):
 STARTUP_FAILURES = {
     'oom_apply_call_deleted': 'pid_adj(&r) == explicit_value',
     'oom_apply_wrong_path': 'pid_adj(&r) == explicit_value',
-    'startup_line_drops_margin': 'strstr(log, line) != NULL',
+    'startup_line_drops_margin': 'LW startup log uses lw_margin instead of lw_margin_permille',
 }
 
 

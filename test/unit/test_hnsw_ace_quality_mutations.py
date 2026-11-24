@@ -83,7 +83,7 @@ def run_converter(tree, mutant=None):
     built = subprocess.run(['make', '-s', 'test-hnsw-converter-build'],
                            cwd=tree, capture_output=True, text=True, timeout=600)
     if built.returncode:
-        return 'BUILD-FAIL', built.stderr.strip()[-400:]
+        return 'BUILD-FAIL', (built.stdout + built.stderr).strip()
     run = subprocess.run(['./test-hnsw-converter'], cwd=tree, capture_output=True,
                          text=True, timeout=60)
     return test_result(run, mutant)
@@ -104,7 +104,7 @@ def build_and_run(src, work, test, mutant=None):
                 str(src / 'cuvs_util.c'), str(src / 'cuvs_build_corpus.c'), '-lpthread', '-lm'] + RT
     b = subprocess.run(argv, capture_output=True, timeout=120)
     if b.returncode:
-        return 'BUILD-FAIL', b.stderr.decode(errors='replace')[-400:]
+        return 'BUILD-FAIL', (b.stdout + b.stderr).decode(errors='replace').strip()
     r = subprocess.run([str(exe)], capture_output=True, text=True, timeout=60)
     return test_result(r, mutant)
 
@@ -125,15 +125,21 @@ def main():
                 (src / f).write_text(body.replace(old, new, 1))
                 test = {'cuvs_ipc.c': 'build_ipc', 'hnsw_export.c': 'converter'}.get(f, 'ace_quality')
             if name == 'unmutated':
-                states = [build_and_run(src, src.parent, t) for t in ('ace_quality', 'build_ipc')] + [run_converter(tree)]
-                ok = all(s == 'GREEN' for s, _ in states)
-                results.append((name, ok, ' / '.join(s for s, _ in states), states[0][1].strip()))
+                tests = ('ace_quality', 'build_ipc', 'converter')
+                states = [build_and_run(src, src.parent, t) for t in tests[:2]] + [run_converter(tree)]
+                ok = all(state == 'GREEN' for state, _ in states)
+                for test_name, (state, output) in zip(tests, states):
+                    if state != 'GREEN':
+                        print(f'Unmutated {test_name}: {state}\n{output}', file=sys.stderr)
+                results.append((name, ok, ' / '.join(state for state, _ in states), states[0][1]))
             else:
                 if test == 'converter':
                     state, tail = run_converter(tree, name)
                 else:
                     state, tail = build_and_run(src, src.parent, test, name)
-                results.append((name, state == 'RED', state, tail.strip().splitlines()[-1] if tail.strip() else ''))
+                if state != 'RED':
+                    print(f'{name}: {state}\n{tail}', file=sys.stderr)
+                results.append((name, state == 'RED', state, tail.splitlines()[-1] if tail else ''))
     for name, ok, state, tail in results:
         print('%-38s %-6s %s  %s' % (name, 'OK' if ok else 'WRONG', state, tail[:160]))
     bad = [n for n, ok, _, _ in results if not ok]

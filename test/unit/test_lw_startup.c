@@ -44,14 +44,20 @@ set_own_adj(int v)
     return ok;
 }
 
-static char *
+static const char *
 slurp(const char *path)
 {
     static char buf[1 << 16];
     FILE *f = fopen(path, "r");
-    size_t n = 0;
-    buf[0] = '\0';
-    if (f) { n = fread(buf, 1, sizeof(buf) - 1, f); fclose(f); }
+    size_t n;
+    int complete;
+
+    if (!f)
+        return NULL;
+    n = fread(buf, 1, sizeof(buf) - 1, f);
+    complete = !ferror(f) && feof(f);
+    if (fclose(f) != 0 || !complete)
+        return NULL;
     buf[n] = '\0';
     return buf;
 }
@@ -114,10 +120,26 @@ require_start(Run *r, int tag, const char *const *flags, int flag_count)
 {
     if (start(r, tag, flags, flag_count) != 0)
     {
-        fprintf(stderr, "cannot start LW fixture %d: %s\n", tag, slurp(r->log));
+        const char *log = slurp(r->log);
+        fprintf(stderr, "cannot start LW fixture %d: %s\n", tag,
+                log ? log : "log unavailable");
         stop(r);
         exit(2);
     }
+}
+
+static const char *
+require_log(Run *r)
+{
+    const char *log = slurp(r->log);
+
+    if (!log || !*log)
+    {
+        fprintf(stderr, "cannot read a complete LW fixture startup log %s\n", r->log);
+        stop(r);
+        exit(2);
+    }
+    return log;
 }
 
 static int
@@ -155,7 +177,13 @@ expect_status(const Run *r, uint32_t policy, uint32_t overcommit, uint32_t margi
 int
 main(int argc, char **argv)
 {
+    const char *startup_format = "managed large_workspace: cagra_build_overflow=%s "
+                                 "managed_overcommit=%s %s=%d";
+    const char *overflow = cuvs_lw_overflow_name(CUVS_CAGRA_BUILD_OVERFLOW_DEFAULT);
+    const char *overcommit = CUVS_MANAGED_OVERCOMMIT_DEFAULT ? "on" : "off";
+    const int default_margin = CUVS_MANAGED_LW_MARGIN_PERMILLE_DEFAULT;
     char line[256], expect[160];
+    const char *log;
     int inherited, baseline, default_effective, explicit_value, kept_value;
     Run r;
     if (argc != 2) { fprintf(stderr, "usage: %s <pg_cuvs_server>\n", argv[0]); return 2; }
@@ -177,28 +205,26 @@ main(int argc, char **argv)
     CHECK(pid_adj(&r) == default_effective);
     snprintf(expect, sizeof(expect), baseline < default_effective ? "oom_score_adj=%d applied" :
              "oom_score_adj kept current %d", default_effective);
-    snprintf(line, sizeof(line), "managed large_workspace: cagra_build_overflow=%s "
-             "managed_overcommit=%s lw_margin_permille=%d",
-             cuvs_lw_overflow_name(CUVS_CAGRA_BUILD_OVERFLOW_DEFAULT),
-             CUVS_MANAGED_OVERCOMMIT_DEFAULT ? "on" : "off",
-             (int)CUVS_MANAGED_LW_MARGIN_PERMILLE_DEFAULT);
-    const char *log = slurp(r.log);
-    if (!*log)
-    {
-        fprintf(stderr, "cannot read LW fixture startup log %s\n", r.log);
-        stop(&r);
-        return 2;
-    }
+    snprintf(line, sizeof(line), startup_format, overflow, overcommit,
+             "lw_margin_permille", default_margin);
+    log = require_log(&r);
     CHECK(strstr(log, line) != NULL);
-    CHECK(strstr(slurp(r.log), expect) != NULL);
-    CHECK(strstr(slurp(r.log), "build admission model: scratch_permille=") != NULL);
-    CHECK(strstr(slurp(r.log), "validated_overflow_policy=managed") != NULL);
+    if (!strstr(log, line))
+    {
+        snprintf(line, sizeof(line), startup_format, overflow, overcommit,
+                 "lw_margin", default_margin);
+        if (strstr(log, line))
+            fputs("FAIL LW startup log uses lw_margin instead of lw_margin_permille\n", stderr);
+    }
+    CHECK(strstr(log, expect) != NULL);
+    CHECK(strstr(log, "build admission model: scratch_permille=") != NULL);
+    CHECK(strstr(log, "validated_overflow_policy=managed") != NULL);
     /* The GPU Q1 measured rho* on (run 20261108-q-02 startup line). */
-    CHECK(strstr(slurp(r.log), "validated_gpu=\"NVIDIA A100-SXM4-80GB\"") != NULL);
-    CHECK(strstr(slurp(r.log), "overflow=managed overcommit=on") != NULL);
-    CHECK(strstr(slurp(r.log), "dedicated_stream=on peak_meter=on") != NULL);
-    CHECK(strstr(slurp(r.log), "evict_min_idle_s=600 evict_hit_bonus_s=30 evict_hit_cap=20") != NULL);
-    CHECK(strstr(slurp(r.log), "recalibrate scratch_permille for the active policy") == NULL);
+    CHECK(strstr(log, "validated_gpu=\"NVIDIA A100-SXM4-80GB\"") != NULL);
+    CHECK(strstr(log, "overflow=managed overcommit=on") != NULL);
+    CHECK(strstr(log, "dedicated_stream=on peak_meter=on") != NULL);
+    CHECK(strstr(log, "evict_min_idle_s=600 evict_hit_bonus_s=30 evict_hit_cap=20") != NULL);
+    CHECK(strstr(log, "recalibrate scratch_permille for the active policy") == NULL);
     expect_status(&r, CUVS_CAGRA_BUILD_OVERFLOW_DEFAULT, CUVS_MANAGED_OVERCOMMIT_DEFAULT,
                   CUVS_MANAGED_LW_MARGIN_PERMILLE_DEFAULT, CUVS_OOM_SCORE_ADJ_DEFAULT,
                   default_effective, expect);
@@ -213,11 +239,12 @@ main(int argc, char **argv)
         snprintf(setting, sizeof(setting), "%d", explicit_value);
         snprintf(expect, sizeof(expect), "oom_score_adj=%d applied", explicit_value);
         require_start(&r, 2, flags, 8);
+        log = require_log(&r);
         CHECK(pid_adj(&r) == explicit_value);
-        CHECK(strstr(slurp(r.log), "managed large_workspace: cagra_build_overflow=error "
+        CHECK(strstr(log, "managed large_workspace: cagra_build_overflow=error "
                                    "managed_overcommit=off lw_margin_permille=1300") != NULL);
-        CHECK(strstr(slurp(r.log), expect) != NULL);
-        CHECK(strstr(slurp(r.log), "recalibrate scratch_permille for the active policy") != NULL);
+        CHECK(strstr(log, expect) != NULL);
+        CHECK(strstr(log, "recalibrate scratch_permille for the active policy") != NULL);
         expect_status(&r, CUVS_LW_OVERFLOW_ERROR, 0, 1300, explicit_value, explicit_value, expect);
         stop(&r);
     }
@@ -230,9 +257,10 @@ main(int argc, char **argv)
         return 2;
     }
     require_start(&r, 3, NULL, 0);
+    log = require_log(&r);
     CHECK(pid_adj(&r) == kept_value);
     snprintf(expect, sizeof(expect), "oom_score_adj kept current %d", kept_value);
-    CHECK(strstr(slurp(r.log), expect) != NULL);
+    CHECK(strstr(log, expect) != NULL);
     expect_status(&r, CUVS_CAGRA_BUILD_OVERFLOW_DEFAULT, CUVS_MANAGED_OVERCOMMIT_DEFAULT,
                   CUVS_MANAGED_LW_MARGIN_PERMILLE_DEFAULT, CUVS_OOM_SCORE_ADJ_DEFAULT,
                   kept_value, expect);
@@ -242,8 +270,9 @@ main(int argc, char **argv)
     {
         const char *flags[] = {"--oom-score-adj", "0"};
         require_start(&r, 4, flags, 2);
+        log = require_log(&r);
         CHECK(pid_adj(&r) == kept_value);
-        CHECK(strstr(slurp(r.log), "oom_score_adj not applied: value 0") != NULL);
+        CHECK(strstr(log, "oom_score_adj not applied: value 0") != NULL);
         stop(&r);
     }
 
