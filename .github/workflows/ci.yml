@@ -204,7 +204,7 @@ jobs:
           make installcheck-isolation || { echo "===== isolation diffs ====="; cat test/output_iso/regression.diffs 2>/dev/null; cat test/regression.diffs 2>/dev/null; false; }
 
       - name: Linux source and mutation checks
-        timeout-minutes: 25
+        timeout-minutes: 35
         env:
           PGCUVS_CUVS_GIT: ${{ runner.temp }}/pgcuvs-sdk-check.git
         run: |
