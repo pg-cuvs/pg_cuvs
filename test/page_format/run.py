@@ -109,7 +109,7 @@ checkpoint_timeout = '30min'
         self.sql(db, case, "-f", CASES / f"{case}.sql", **kwargs)
 
     @contextmanager
-    def daemon(self, binary, label, *, seed_bf=False, fault=None, vram_mib=None):
+    def daemon(self, binary, label, *, seed_bf=False, fault=None, vram_mib=None, max_indexes=None):
         env = self.env.copy()
         for key, enabled in (
             ("CUVS_FAULT_PAGE_BF_FIXTURE", seed_bf),
@@ -122,6 +122,8 @@ checkpoint_timeout = '30min'
         args = [binary, "--socket", self.socket, "--index-dir", self.daemon_root, "--gpu-devices", "0"]
         if vram_mib is not None:
             args.extend(["--max-vram-mb", str(vram_mib)])
+        if max_indexes is not None:
+            args.extend(["--max-indexes", str(max_indexes)])
         with (self.logs / f"daemon-{label}.log").open("w") as log, subprocess.Popen(
             args, stdout=log, stderr=subprocess.STDOUT, env=env, cwd=self.data.parent,
         ) as daemon:
@@ -657,6 +659,9 @@ def check_page_eviction(cluster, daemon, library, enabled, disabled):
                 INSERT INTO legacy_big SELECT array_fill(i::real, ARRAY[8])::vector
                     FROM generate_series(1,100000) AS i;
                 CREATE INDEX legacy_big_idx ON legacy_big USING cagra(v vector_l2_ops);
+                CREATE TABLE legacy_small(v vector(8));
+                INSERT INTO legacy_small SELECT v FROM legacy_big LIMIT 2;
+                CREATE INDEX legacy_small_idx ON legacy_small USING cagra(v vector_l2_ops);
             """)
         finally:
             cluster.stop()
@@ -676,21 +681,29 @@ def check_page_eviction(cluster, daemon, library, enabled, disabled):
             """)
             cluster.sql("postgres", "orphan-graphs", "-c", "BEGIN; REINDEX INDEX page_lru_idx; ROLLBACK;" * 40)
             cluster.sql("postgres", "load-with-eviction", "-c", """
+                CREATE TEMP TABLE previous_graphs AS
+                    SELECT warmup_state FROM pg_cuvs_index_status()
+                      WHERE index_oid='page_lru_idx'::regclass AND kind='page_cagra';
+                REINDEX INDEX page_lru_idx;
                 DO $$
                 DECLARE
                     graphs integer := (SELECT count(*) FROM pg_cuvs_index_status()
                         WHERE index_oid='page_lru_idx'::regclass AND kind='page_cagra');
+                    newest text;
                 BEGIN
                     IF graphs < 40 THEN
                         RAISE EXCEPTION 'fixture did not retain the unsearched page graphs';
                     END IF;
+                    SELECT warmup_state INTO STRICT newest FROM pg_cuvs_index_status()
+                        WHERE index_oid='page_lru_idx'::regclass AND kind='page_cagra'
+                              AND warmup_state NOT IN (SELECT warmup_state FROM previous_graphs);
                     PERFORM pg_cuvs_load('legacy_big_idx'::regclass);
                     IF (SELECT count(*) FROM pg_cuvs_index_status()
                         WHERE index_oid='page_lru_idx'::regclass AND kind='page_cagra') >= graphs OR
                        NOT EXISTS (SELECT FROM pg_cuvs_index_status()
                         WHERE index_oid='page_lru_idx'::regclass AND kind='page_cagra'
-                              AND last_use IS NOT NULL) THEN
-                        RAISE EXCEPTION 'legacy LOAD did not prefer unsearched page graphs for eviction';
+                              AND warmup_state=newest AND last_use IS NULL) THEN
+                        RAISE EXCEPTION 'legacy LOAD did not prefer superseded page graphs for eviction';
                     END IF;
                 END $$;
             """)
@@ -698,7 +711,49 @@ def check_page_eviction(cluster, daemon, library, enabled, disabled):
                 raise RuntimeError("the legacy LOAD never evicted a page graph")
         finally:
             cluster.stop()
-    print("Legacy LOAD reclaimed unsearched page graphs while retaining the active graph: PASS", flush=True)
+    print("Legacy LOAD reclaimed superseded page graphs before the new unsearched graph: PASS", flush=True)
+
+    with cluster.daemon(daemon, "eviction-legacy-slots", max_indexes=1):
+        cluster.start("legacy-slots")
+        try:
+            cluster.sql("postgres", "legacy-slot-pressure", "-c", """
+                SELECT pg_cuvs_unload('legacy_big_idx'::regclass);
+                SELECT pg_cuvs_unload('legacy_small_idx'::regclass);
+                CREATE TABLE page_slot(v vector(8));
+                INSERT INTO page_slot SELECT v FROM legacy_big LIMIT 32;
+                CREATE INDEX page_slot_idx ON page_slot USING cagra(v vector_l2_ops);
+                SELECT pg_cuvs_load('legacy_big_idx'::regclass);
+                DO $$
+                BEGIN
+                    IF NOT EXISTS (SELECT FROM pg_cuvs_index_status()
+                                   WHERE index_oid='page_slot_idx'::regclass AND kind='page_cagra') THEN
+                        RAISE EXCEPTION 'fixture has no resident page graph';
+                    END IF;
+                    PERFORM pg_cuvs_load('legacy_small_idx'::regclass);
+                    IF NOT EXISTS (SELECT FROM pg_cuvs_gpu_search_stats()
+                                   WHERE index_oid='legacy_small_idx'::regclass AND resident) THEN
+                        RAISE EXCEPTION 'legacy LOAD did not replace the existing resident';
+                    END IF;
+                    IF NOT EXISTS (SELECT FROM pg_cuvs_index_status()
+                                   WHERE index_oid='page_slot_idx'::regclass AND kind='page_cagra') THEN
+                        RAISE EXCEPTION 'legacy slot pressure evicted a page graph';
+                    END IF;
+
+                    PERFORM pg_cuvs_pin('legacy_small_idx'::regclass);
+                    BEGIN
+                        PERFORM pg_cuvs_load('legacy_big_idx'::regclass);
+                    EXCEPTION WHEN internal_error THEN
+                        NULL; -- the single legacy registry slot is pinned
+                    END;
+                    IF NOT EXISTS (SELECT FROM pg_cuvs_index_status()
+                                   WHERE index_oid='page_slot_idx'::regclass AND kind='page_cagra') THEN
+                        RAISE EXCEPTION 'full pinned legacy registry evicted a page graph';
+                    END IF;
+                END $$;
+            """)
+        finally:
+            cluster.stop()
+    print("Legacy slot pressure leaves separately registered page graphs resident: PASS", flush=True)
 
 
 def run(work, logs):

@@ -27,6 +27,7 @@
 #endif
 
 #include "cuvs_ipc.h"
+#include "cuvs_page_overlay.h"
 #include "cuvs_util.h"
 #include "cuvs_cache_policy.h"
 #include "cuvs_bf_verdict.h"     /* #238: remembered brute_force unavailable verdict */
@@ -375,15 +376,19 @@ typedef struct PageCagraGraph
     size_t bf_bytes[2];
     uint32_t bf_miss_reported;
     size_t bytes;
+    uint64_t registered_order;
     uint64_t last_use;
     time_t loaded_at;
     time_t last_search;
     uint32_t hits;
+    CuvsPageOverlay overlay;
 } PageCagraGraph;
 
 static PageCagraGraph *g_page_graphs;
 static int g_n_page_graphs;
 static uint64_t g_page_access;
+static uint64_t g_page_daemon_id;
+static pthread_once_t g_page_daemon_once = PTHREAD_ONCE_INIT;
 static size_t g_page_graph_bytes[CUVS_MAX_GPUS];
 
 /* These helpers run under the registry lock. The disk directories outlive
@@ -397,6 +402,7 @@ dispose_page_graph(PageCagraGraph *entry)
             cuvs_bf_free(entry->bf[precision], entry->gpu);
     if (entry->cpu_hnsw) cuvs_hnsw_free(entry->cpu_hnsw);
     cuvs_cagra_free(entry->handle, entry->gpu);
+    cuvs_page_overlay_free(entry->overlay.head);
     free(entry);
 }
 
@@ -426,13 +432,37 @@ drop_page_graphs(uint32_t db_oid, uint32_t index_oid)
 }
 
 static bool
+page_superseded_since_use(const PageCagraGraph *page)
+{
+    for (const PageCagraGraph *p = g_page_graphs; p; p = p->next)
+        if (p->system_identifier == page->system_identifier &&
+            p->db_oid == page->db_oid && p->index_oid == page->index_oid &&
+            p->index_nonce != page->index_nonce &&
+            p->registered_order > page->registered_order &&
+            p->registered_order > page->last_use)
+            return true;
+    return false;
+}
+
+static bool
+page_evicted_before(const PageCagraGraph *candidate, const PageCagraGraph *previous)
+{
+    bool candidate_old = page_superseded_since_use(candidate);
+    bool previous_old = page_superseded_since_use(previous);
+    uint64_t candidate_age = candidate->last_use ? candidate->last_use : candidate->registered_order;
+    uint64_t previous_age = previous->last_use ? previous->last_use : previous->registered_order;
+
+    return candidate_old != previous_old ? candidate_old : candidate_age < previous_age;
+}
+
+static bool
 evict_page_graph(int gpu)
 {
     PageCagraGraph **victim = NULL;
 
     for (PageCagraGraph **link = &g_page_graphs; *link; link = &(*link)->next)
         if ((gpu < 0 || (*link)->gpu == gpu) &&
-            (!victim || (*link)->last_use < (*victim)->last_use))
+            (!victim || page_evicted_before(*link, *victim)))
             victim = link;
     if (!victim)
         return false;
@@ -3462,16 +3492,19 @@ make_room(int device_id, CuvsRequester rq, uint64_t need, int slot_mode,
             keys[n].legacy.index_oid = e->index_oid;
             n++;
         }
-        for (PageCagraGraph *page = g_page_graphs; page; page = page->next)
+        for (PageCagraGraph *page = slot_mode ? NULL : g_page_graphs; page; page = page->next)
         {
+            bool superseded;
+
             if (page->gpu != device_id)
                 continue;
+            superseded = page_superseded_since_use(page);
             cands[n] = (CuvsEvictCand) {
                 .db_oid = page->db_oid, .index_oid = page->index_oid,
-                .last_use = page->last_search, .hits = page->hits,
-                /* With the same LRU policy, put never-served page graphs first. */
-                .loaded_at = page->last_search ? page->loaded_at : 0,
-                .bytes = slot_mode ? 1 : page->bytes + page->bf_bytes[0] + page->bf_bytes[1],
+                .last_use = superseded ? 0 : page->last_search,
+                .loaded_at = superseded ? 0 : page->loaded_at,
+                .hits = page->hits,
+                .bytes = page->bytes + page->bf_bytes[0] + page->bf_bytes[1],
             };
             keys[n].page = page;
             n++;
@@ -8070,6 +8103,7 @@ handle_build(int client_fd, const CuvsCmdFrame *cmd)
             entry->gpu = target_gpu;
             entry->handle = new_handle;
             entry->loaded_at = time(NULL);
+            entry->registered_order = ++g_page_access;
             entry->cpu_hnsw = page_cpu_hnsw;
             entry->bytes = final;
             entry->next = g_page_graphs;
@@ -12812,6 +12846,80 @@ done:
     free(results);
 }
 
+static void
+initialize_page_daemon_id(void)
+{
+    uint64_t id;
+
+    if (shm_key_random((unsigned char *) &id, sizeof(id)) == 0)
+        g_page_daemon_id = id ? id : 1;
+}
+
+static void
+handle_page_supply(int client_fd, const CuvsCmdFrame *cmd)
+{
+    CuvsPageOverlayRequest request;
+    CuvsReplyHeader reply = {.status = CUVS_STATUS_ERROR};
+    CuvsPageProgress progress = {0};
+    CuvsPageOverlayChunk *chunk = NULL, *obsolete = NULL;
+    size_t bytes;
+    void *mapping;
+    PageCagraGraph *graph;
+
+    if (recv_all(client_fd, &request.base.length, sizeof(request.base.length)) < 0 ||
+        request.base.length != sizeof(request) ||
+        recv_all(client_fd, (char *) &request + sizeof(request.base.length),
+                 sizeof(request) - sizeof(request.base.length)) < 0)
+        goto done;
+    if (cmd->dim == 0 || cmd->dim > 65535 || cmd->n_vecs || cmd->k || cmd->n_filter_tids ||
+        request.base.resume_count || request.base.resume_distance || request.base.reserved ||
+        !request.boot_id || request.from < request.base.folded ||
+        request.from > request.base.tail ||
+        request.base.tail - request.from != request.positions ||
+        !request.positions || request.positions > CUVS_PAGE_BATCH_MAX ||
+        request.vector_rows > request.positions)
+        goto done;
+    if (request.base.folded != 0)
+    {
+        reply.status = CUVS_STATUS_NOT_FOUND;
+        goto done;
+    }
+
+    /* Legacy-only daemons need no overlay identity. */
+    (void) pthread_once(&g_page_daemon_once, initialize_page_daemon_id);
+    if (!g_page_daemon_id)
+        goto done;
+    progress.daemon_id = g_page_daemon_id;
+    bytes = (size_t) request.positions * sizeof(CuvsPagePosition) +
+            (size_t) request.vector_rows * cmd->dim * sizeof(float);
+    mapping = map_page_shm(request.supplement_shm, sizeof(request.supplement_shm), bytes);
+    if (mapping == MAP_FAILED)
+        goto done;
+    chunk = cuvs_page_overlay_copy(&request, mapping, bytes);
+    munmap(mapping, bytes);
+    if (!chunk)
+        goto done;
+
+    pthread_mutex_lock(&g_index_mutex);
+    graph = find_page_graph(cmd, &request.base);
+    if (graph && graph->dim == cmd->dim && graph->metric == cmd->metric)
+    {
+        reply.status = cuvs_page_overlay_supply(&graph->overlay, &request, &chunk, &obsolete);
+        progress.covered_upto = graph->overlay.covered_upto;
+    }
+    else
+        reply.status = CUVS_STATUS_NOT_FOUND;
+    pthread_mutex_unlock(&g_index_mutex);
+
+done:
+    free(chunk);
+    cuvs_page_overlay_free(obsolete);
+    if (send_all(client_fd, &reply, sizeof(reply)) == 0 &&
+        (reply.status == CUVS_STATUS_OK || reply.status == CUVS_STATUS_PAGE_NEED ||
+         reply.status == CUVS_STATUS_PAGE_OVERLAY_FULL))
+        (void) send_all(client_fd, &progress, sizeof(progress));
+}
+
 static void *
 connection_thread(void *arg)
 {
@@ -12926,6 +13034,9 @@ connection_thread(void *arg)
             break;
         case CUVS_OP_MARK_PAGES_EMPTY:
             handle_mark_pages_empty(client_fd, &cmd);
+            break;
+        case CUVS_OP_SUPPLY_PAGES:
+            handle_page_supply(client_fd, &cmd);
             break;
         case CUVS_OP_SEARCH_PAGES:
         case CUVS_OP_SEARCH_PAGES_BATCH:
