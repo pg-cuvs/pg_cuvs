@@ -84,6 +84,9 @@ typedef struct CuvsCagraPendingLocation
 bool cuvs_cagra_copy_pending(Relation index, const CuvsCagraMeta *meta,
                              BlockNumber nblocks, uint64 from, uint64 upto,
                              CuvsCagraPendingLocation *locations, float *vectors);
+CuvsCagraSlotResult cuvs_cagra_pending_tid(Relation index, const CuvsCagraMeta *meta,
+                                         BlockNumber nblocks, BlockNumber block,
+                                         uint64 position, ItemPointer tid);
 CuvsCagraSlotResult cuvs_cagra_slot_tid(Relation index, const CuvsCagraMeta *meta,
                                       BlockNumber nblocks, uint64 slot, ItemPointer tid);
 bool cuvs_cagra_slot_filter(Relation index, const CuvsCagraMeta *meta,

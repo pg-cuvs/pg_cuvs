@@ -573,6 +573,16 @@ def check_overlay_budget(cluster, source):
     print("Daemon host budget, boot ABA, pinned overlay and in-flight receive: PASS", flush=True)
 
 
+def check_sql_overlay_budget(cluster, source):
+    with cluster.daemon(source / "pg_cuvs_server", "sql-overlay-budget", overlay_host_bytes=1):
+        cluster.start()
+        try:
+            cluster.file("postgres", "sql_overlay_budget")
+        finally:
+            cluster.stop()
+    print("SQL heap fallback on host-budget exhaustion and continued writes: PASS", flush=True)
+
+
 def old_daemon_search(cluster):
     cluster.sql("beta1a", "old-daemon-search", "-c", """
         SET enable_seqscan=off;
@@ -868,6 +878,7 @@ def run(work, logs):
             cluster.stop()
 
     check_overlay_budget(Cluster(work / "budget", bindir, logs), source_on)
+    check_sql_overlay_budget(Cluster(work / "sql-budget", bindir, logs), source_on)
 
     if legacy_source:
         with cluster.daemon(source_base / "pg_cuvs_server", "historical"):
@@ -981,9 +992,11 @@ def run_slots_only(work, logs):
             cluster.run("createdb", ["beta1a"], "createdb-beta1a")
             cluster.file("beta1a", "beta1a")
             check_slots(cluster, source)
+            cluster.file("postgres", "pending_overlay_scan")
         finally:
             cluster.stop()
     check_overlay_budget(Cluster(work / "budget", bindir, logs), source)
+    check_sql_overlay_budget(Cluster(work / "sql-budget", bindir, logs), source)
     print("Overlay IPC slots: PASS", flush=True)
 
 

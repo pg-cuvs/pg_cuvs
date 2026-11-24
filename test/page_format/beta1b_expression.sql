@@ -48,8 +48,8 @@ SET enable_seqscan=off;
 DO $$
 BEGIN
     IF (SELECT id FROM page_expr ORDER BY ((v + '[1,0,0]'::vector)::vector(3)) <-> '[4,0,0]'
-        LIMIT 1) IS DISTINCT FROM 3 OR pg_cuvs_last_search_k() IS NOT NULL THEN
-        RAISE EXCEPTION 'a pending expression row did not use the exact heap fallback';
+        LIMIT 1) IS DISTINCT FROM 3 OR pg_cuvs_last_search_k() IS NULL THEN
+        RAISE EXCEPTION 'a pending expression row did not use the daemon overlay';
     END IF;
 END $$;
 RESET enable_seqscan;
