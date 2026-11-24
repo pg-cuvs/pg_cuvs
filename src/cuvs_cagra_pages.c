@@ -31,6 +31,7 @@ cuvs_cagra_require_legacy(Relation index)
 #ifdef CUVS_PAGE_FORMAT
 
 #include "access/generic_xlog.h"
+#include "access/genam.h"
 #include "access/xloginsert.h"
 #include "cuvs_util.h"
 #include "storage/bufpage.h"
@@ -43,7 +44,8 @@ enum CuvsCagraPageKind
 {
     CUVS_PAGE_TIDS = 1,
     CUVS_PAGE_PENDING = 2,
-    CUVS_PAGE_FOLDLOG = 3
+    CUVS_PAGE_FOLDLOG = 3,
+    CUVS_PAGE_PENDING_VECTOR = 4
 };
 
 typedef struct CuvsCagraTidPage
@@ -62,7 +64,7 @@ typedef struct CuvsCagraPending
     uint16      flags;
     uint32      count;
     BlockNumber next;
-    uint32      reserved;
+    uint32      vector_dim;
     uint64      index_nonce;
     uint64      first_pos;
 } CuvsCagraPending;
@@ -93,6 +95,34 @@ StaticAssertDecl(MAXALIGN(SizeOfPageHeaderData) + sizeof(CuvsCagraTidPage) +
 StaticAssertDecl(MAXALIGN(SizeOfPageHeaderData) + sizeof(CuvsCagraPending) +
                  CUVS_CAGRA_PENDING_PER_PAGE * sizeof(ItemPointerData) <= BLCKSZ,
                  "CAGRA pending page must fit");
+
+bool
+cuvs_cagra_can_store_pending_vector(int dim)
+{
+    /* Reserve the pgvector header's eight bytes when defining the layout limit. */
+    const Size usable = BLCKSZ - MAXALIGN(SizeOfPageHeaderData) - sizeof(CuvsCagraPending);
+
+    return dim > 0 && (Size) dim <= (usable - sizeof(ItemPointerData) - 8) / sizeof(float);
+}
+
+static Size
+pending_stride(uint32 vector_dim)
+{
+    return sizeof(ItemPointerData) + (Size) vector_dim * sizeof(float);
+}
+
+static uint32
+pending_capacity(uint32 vector_dim)
+{
+    return (BLCKSZ - MAXALIGN(SizeOfPageHeaderData) - sizeof(CuvsCagraPending)) /
+        pending_stride(vector_dim);
+}
+
+static uint32
+pending_vector_dim(const CuvsCagraMeta *meta)
+{
+    return (meta->flags & CUVS_CAGRA_PENDING_VECTOR) ? meta->dim : 0;
+}
 
 uint64
 cuvs_cagra_nonce(void)
@@ -134,7 +164,10 @@ page_meta(Page page)
         return NULL;
     meta = (CuvsCagraMeta *) PageGetContents(page);
     if (meta->magic != CUVS_CAGRA_PAGE_MAGIC || meta->major != CUVS_CAGRA_PAGE_MAJOR ||
-        meta->minor != 0 || meta->flags != 0 || meta->index_nonce == 0 || meta->base_nonce == 0 ||
+        meta->minor != 0 || (meta->flags & ~CUVS_CAGRA_PENDING_VECTOR) != 0 ||
+        ((meta->flags & CUVS_CAGRA_PENDING_VECTOR) &&
+         !cuvs_cagra_can_store_pending_vector(meta->dim)) ||
+        meta->index_nonce == 0 || meta->base_nonce == 0 ||
         meta->n_extents > CUVS_CAGRA_PAGE_DIR ||
         meta->folded > meta->n_slots || meta->base_slots != meta->n_slots - meta->folded ||
         meta->n_slots > (uint64) meta->n_extents * CUVS_CAGRA_PAGE_EXTENT * CUVS_CAGRA_TIDS_PER_PAGE ||
@@ -188,11 +221,12 @@ finish_page(GenericXLogState *wal, Buffer buf, ForkNumber fork)
 }
 
 static CuvsCagraPending *
-init_pending(Page page, uint64 nonce, uint64 first_pos)
+init_pending(Page page, uint64 nonce, uint64 first_pos, uint32 vector_dim)
 {
     CuvsCagraPending *pending = (CuvsCagraPending *) PageGetSpecialPointer(page);
 
-    pending->kind = CUVS_PAGE_PENDING;
+    pending->kind = vector_dim ? CUVS_PAGE_PENDING_VECTOR : CUVS_PAGE_PENDING;
+    pending->vector_dim = vector_dim;
     pending->index_nonce = nonce;
     pending->first_pos = first_pos;
     pending->next = InvalidBlockNumber;
@@ -202,7 +236,7 @@ init_pending(Page page, uint64 nonce, uint64 first_pos)
 void
 cuvs_cagra_init_pages(Relation index, ForkNumber fork, uint64 index_nonce,
                       uint64 graph_nonce, int dim, uint32 metric,
-                      const uint64 *tids, int64 n)
+                      const uint64 *tids, int64 n, bool pending_vectors)
 {
     CuvsCagraMeta meta = {0};
     Buffer mb;
@@ -219,6 +253,7 @@ cuvs_cagra_init_pages(Relation index, ForkNumber fork, uint64 index_nonce,
                         errmsg("CAGRA build exceeds the page directory capacity")));
     meta.magic = CUVS_CAGRA_PAGE_MAGIC;
     meta.major = CUVS_CAGRA_PAGE_MAJOR;
+    meta.flags = pending_vectors ? CUVS_CAGRA_PENDING_VECTOR : 0;
     meta.dim = dim;
     meta.metric = metric;
     meta.index_nonce = index_nonce;
@@ -280,7 +315,7 @@ cuvs_cagra_init_pages(Relation index, ForkNumber fork, uint64 index_nonce,
     meta.pending_head = meta.pending_tail = BufferGetBlockNumber(buf);
     wal = GenericXLogStart(index);
     page = new_page(wal, buf, sizeof(CuvsCagraPending));
-    init_pending(page, index_nonce, 0);
+    init_pending(page, index_nonce, 0, pending_vector_dim(&meta));
     finish_page(wal, buf, fork);
 
     buf = extend_page(index, fork);
@@ -331,7 +366,7 @@ cuvs_cagra_check_query_dim(Relation index, int dim)
 }
 
 static CuvsCagraPending *
-pending_tag(Page page, BlockNumber block, uint64 nonce)
+pending_tag(Page page, BlockNumber block, uint64 nonce, uint32 vector_dim)
 {
     CuvsCagraPending *pending;
     PageHeader header = (PageHeader) page;
@@ -339,18 +374,19 @@ pending_tag(Page page, BlockNumber block, uint64 nonce)
     if (PageIsNew(page) || PageGetSpecialSize(page) != sizeof(*pending))
         return NULL;
     pending = (CuvsCagraPending *) PageGetSpecialPointer(page);
-    if (pending->kind != CUVS_PAGE_PENDING || pending->index_nonce != nonce ||
-        pending->flags != 0 || pending->count > CUVS_CAGRA_PENDING_PER_PAGE ||
-        header->pd_lower != MAXALIGN(SizeOfPageHeaderData) + pending->count * sizeof(ItemPointerData) ||
+    if (pending->kind != (vector_dim ? CUVS_PAGE_PENDING_VECTOR : CUVS_PAGE_PENDING) ||
+        pending->index_nonce != nonce || pending->vector_dim != vector_dim ||
+        pending->flags != 0 || pending->count > pending_capacity(vector_dim) ||
+        header->pd_lower != MAXALIGN(SizeOfPageHeaderData) + pending->count * pending_stride(vector_dim) ||
         pending->next == block || pending->next == 0)
         return NULL;
     return pending;
 }
 
 static CuvsCagraPending *
-page_pending(Relation index, BlockNumber block, Page page, uint64 nonce)
+page_pending(Relation index, BlockNumber block, Page page, uint64 nonce, uint32 vector_dim)
 {
-    CuvsCagraPending *pending = pending_tag(page, block, nonce);
+    CuvsCagraPending *pending = pending_tag(page, block, nonce, vector_dim);
 
     if (!pending)
         bad_page(index, block);
@@ -369,7 +405,8 @@ cuvs_cagra_read_tail(Relation index, const CuvsCagraMeta *meta,
         return false;
     buf = ReadBuffer(index, meta->pending_tail);
     LockBuffer(buf, BUFFER_LOCK_SHARE);
-    tag = pending_tag(BufferGetPage(buf), meta->pending_tail, meta->index_nonce);
+    tag = pending_tag(BufferGetPage(buf), meta->pending_tail, meta->index_nonce,
+                      pending_vector_dim(meta));
     valid = tag && !BlockNumberIsValid(tag->next) &&
         tag->first_pos <= UINT64_MAX - tag->count;
     if (valid)
@@ -377,6 +414,103 @@ cuvs_cagra_read_tail(Relation index, const CuvsCagraMeta *meta,
     UnlockReleaseBuffer(buf);
     return valid;
 }
+
+bool
+cuvs_cagra_copy_pending(Relation index, const CuvsCagraMeta *meta, BlockNumber nblocks,
+                        uint64 from, uint64 upto, CuvsCagraPendingLocation *locations,
+                        float *vectors)
+{
+    BlockNumber block = meta->pending_tail;
+    bool seek_tail = true;
+    uint32 vector_dim = pending_vector_dim(meta);
+    Size stride = pending_stride(vector_dim);
+    uint64 position = from;
+    uint64 next_position = 0;
+
+    if (from < meta->folded || from > upto)
+        return false;
+    while (position < upto)
+    {
+        Buffer buf;
+        Page page;
+        const CuvsCagraPending *tag;
+        BlockNumber next;
+        uint64 end;
+
+        CHECK_FOR_INTERRUPTS();
+        if (block == 0 || block >= nblocks)
+            return false;
+        buf = ReadBuffer(index, block);
+        LockBuffer(buf, BUFFER_LOCK_SHARE);
+        page = BufferGetPage(buf);
+        tag = pending_tag(page, block, meta->index_nonce, vector_dim);
+        if (!tag || tag->first_pos > UINT64_MAX - tag->count ||
+            (!seek_tail && tag->first_pos != next_position))
+        {
+            UnlockReleaseBuffer(buf);
+            return false;
+        }
+        if (seek_tail && position < tag->first_pos)
+        {
+            UnlockReleaseBuffer(buf);
+            block = meta->pending_head;
+            seek_tail = false;
+            continue;
+        }
+
+        end = tag->first_pos + tag->count;
+        next = tag->next;
+        for (; position < Min(end, upto); ++position)
+        {
+            CuvsCagraPendingLocation *item = &locations[position - from];
+            const char *entry = (char *) PageGetContents(page) +
+                (position - tag->first_pos) * stride;
+
+            item->block = block;
+            memcpy(&item->tid, entry, sizeof(item->tid));
+            if (vector_dim && vectors && ItemPointerIsValid(&item->tid))
+                memcpy(vectors + (position - from) * vector_dim,
+                       entry + sizeof(item->tid), (Size) vector_dim * sizeof(float));
+        }
+        seek_tail = false;
+        if (position < upto && (!BlockNumberIsValid(next) || !tag->count))
+        {
+            UnlockReleaseBuffer(buf);
+            return false;
+        }
+        UnlockReleaseBuffer(buf);
+        next_position = end;
+        block = next;
+    }
+    return true;
+}
+
+#ifdef CUVS_TEST_HOOKS
+PG_FUNCTION_INFO_V1(cuvs_test_pending_first);
+
+Datum
+cuvs_test_pending_first(PG_FUNCTION_ARGS)
+{
+    Relation index = index_open(PG_GETARG_OID(0), AccessShareLock);
+    int64 requested = PG_GETARG_INT64(1);
+    CuvsCagraMeta meta;
+    CuvsCagraPendingLocation location;
+    float *vector;
+    bool valid;
+
+    if (requested < 0 || !cuvs_cagra_read_meta(index, &meta) ||
+        !(meta.flags & CUVS_CAGRA_PENDING_VECTOR))
+        ereport(ERROR, (errmsg("expected a vector-bearing CAGRA pending list")));
+    vector = palloc((Size) meta.dim * sizeof(float));
+    valid = cuvs_cagra_copy_pending(index, &meta, RelationGetNumberOfBlocks(index),
+                                   (uint64) requested, (uint64) requested + 1,
+                                   &location, vector);
+    index_close(index, AccessShareLock);
+    if (!valid || !ItemPointerIsValid(&location.tid))
+        ereport(ERROR, (errmsg("could not read the CAGRA pending vector")));
+    PG_RETURN_FLOAT8((double) vector[0]);
+}
+#endif
 
 static bool
 read_slots(Relation index, const CuvsCagraMeta *meta,
@@ -472,22 +606,27 @@ cuvs_cagra_slot_filter(Relation index, const CuvsCagraMeta *meta,
 }
 
 static void
-append_item(Page page, ItemPointer tid)
+append_item(Page page, ItemPointer tid, const float *vector)
 {
     CuvsCagraPending *pending = (CuvsCagraPending *) PageGetSpecialPointer(page);
-    ItemPointerData *items = (ItemPointerData *) PageGetContents(page);
+    Size stride = pending_stride(pending->vector_dim);
+    char *item = (char *) PageGetContents(page) + stride * pending->count;
 
-    items[pending->count++] = *tid;
-    set_lower(page, pending->count * sizeof(*items));
+    memcpy(item, tid, sizeof(*tid));
+    if (pending->vector_dim)
+        memcpy(item + sizeof(*tid), vector, (Size) pending->vector_dim * sizeof(float));
+    ++pending->count;
+    set_lower(page, pending->count * stride);
 }
 
 void
-cuvs_cagra_append_pending(Relation index, ItemPointer tid, int dim)
+cuvs_cagra_append_pending(Relation index, ItemPointer tid, int dim, const float *vector)
 {
     /* Buffer operations may outlive an rd_amcache allocation. */
     CuvsCagraRelCache cached = *cuvs_cagra_relation_cache(index);
     BlockNumber tail;
     uint64 next_pos = 0;
+    uint32 vector_dim, capacity;
 
     if (cached.index_nonce == 0)
     {
@@ -498,8 +637,11 @@ cuvs_cagra_append_pending(Relation index, ItemPointer tid, int dim)
         cached.tail = meta.pending_tail;
         cached.index_nonce = meta.index_nonce;
         cached.dim = meta.dim;
+        cached.pending_vectors = (meta.flags & CUVS_CAGRA_PENDING_VECTOR) != 0;
     }
     cuvs_cagra_check_dim(cached.dim, dim);
+    vector_dim = cached.pending_vectors ? dim : 0;
+    capacity = pending_capacity(vector_dim);
     tail = cached.tail;
 
     for (;;)
@@ -515,12 +657,12 @@ cuvs_cagra_append_pending(Relation index, ItemPointer tid, int dim)
         CuvsCagraRelCache *cache;
 
         LockBuffer(tb, BUFFER_LOCK_EXCLUSIVE);
-        pending = page_pending(index, tail, BufferGetPage(tb), cached.index_nonce);
+        pending = page_pending(index, tail, BufferGetPage(tb), cached.index_nonce, vector_dim);
         if (next_pos != 0 && pending->first_pos != next_pos)
             bad_page(index, tail);
         if (BlockNumberIsValid(pending->next))
         {
-            if (pending->count != CUVS_CAGRA_PENDING_PER_PAGE ||
+            if (pending->count != capacity ||
                 pending->first_pos > UINT64_MAX - pending->count)
                 bad_page(index, tail);
             next_pos = pending->first_pos + pending->count;
@@ -529,7 +671,7 @@ cuvs_cagra_append_pending(Relation index, ItemPointer tid, int dim)
             continue;
         }
 
-        full = pending->count == CUVS_CAGRA_PENDING_PER_PAGE;
+        full = pending->count == capacity;
         if (full && cached.dim == 0)
         {
             CuvsCagraMeta current;
@@ -561,10 +703,10 @@ cuvs_cagra_append_pending(Relation index, ItemPointer tid, int dim)
 
             old->next = next;
             image = new_page(wal, nb, sizeof(*pending));
-            init_pending(image, cached.index_nonce, old->first_pos + old->count);
+            init_pending(image, cached.index_nonce, old->first_pos + old->count, vector_dim);
             tail = next;
         }
-        append_item(image, tid);
+        append_item(image, tid, vector);
         if (meta != NULL)
         {
             CuvsCagraMeta *updated = (CuvsCagraMeta *)
@@ -583,6 +725,7 @@ cuvs_cagra_append_pending(Relation index, ItemPointer tid, int dim)
         cache->index_nonce = cached.index_nonce;
         cache->tail = tail;
         cache->dim = dim;
+        cache->pending_vectors = cached.pending_vectors;
         return;
     }
 }
@@ -642,18 +785,19 @@ vacuum_lock(CagraVacuum *vac, BlockNumber block)
 
 static void
 vacuum_tids(CagraVacuum *vac, Buffer buf, uint32 start, uint32 count,
-            const CuvsCagraTidPage *tid_tag)
+            Size stride, const CuvsCagraTidPage *tid_tag)
 {
     Page page = BufferGetPage(buf);
-    const ItemPointerData *items = (ItemPointerData *) PageGetContents(page);
+    const char *items = (const char *) PageGetContents(page);
     Page image = NULL;
     uint32 old_dead = 0;
     uint32 removed = 0;
 
     for (uint32 i = start; i < count; ++i)
     {
-        ItemPointerData tid = items[i];
+        ItemPointerData tid;
 
+        memcpy(&tid, items + i * stride, sizeof(tid));
         if (!ItemPointerIsValid(&tid))
         {
             ++old_dead;
@@ -670,7 +814,8 @@ vacuum_tids(CagraVacuum *vac, Buffer buf, uint32 start, uint32 count,
                 vac->wal = GenericXLogStart(vac->index);
             image = GenericXLogRegisterBuffer(vac->wal, buf, 0);
         }
-        ItemPointerSetInvalid(&((ItemPointerData *) PageGetContents(image))[i]);
+        ItemPointerSetInvalid(&tid);
+        memcpy((char *) PageGetContents(image) + i * stride, &tid, sizeof(tid));
         ++removed;
     }
 
@@ -690,12 +835,13 @@ vacuum_pending(CagraVacuum *vac, const CuvsCagraMeta *meta)
 {
     BlockNumber block = meta->pending_head;
     uint64 expected = 0;
+    uint32 vector_dim = pending_vector_dim(meta);
 
     for (;;)
     {
         Buffer buf = vacuum_lock(vac, block);
         CuvsCagraPending *tag = page_pending(vac->index, block, BufferGetPage(buf),
-                                            meta->index_nonce);
+                                            meta->index_nonce, vector_dim);
         uint32 start = 0;
 
         if ((expected && tag->first_pos != expected) ||
@@ -703,13 +849,13 @@ vacuum_pending(CagraVacuum *vac, const CuvsCagraMeta *meta)
             bad_page(vac->index, block);
         if (meta->folded > tag->first_pos)
             start = Min(meta->folded - tag->first_pos, (uint64) tag->count);
-        vacuum_tids(vac, buf, start, tag->count, NULL);
+        vacuum_tids(vac, buf, start, tag->count, pending_stride(vector_dim), NULL);
         /* Inserts can append after the metapage snapshot. Their TIDs are not
          * old enough to be removed by this VACUUM. Validation also only needs
          * pending entries present when it read the metapage. */
         if (block == meta->pending_tail)
             break;
-        if (!BlockNumberIsValid(tag->next) || tag->count != CUVS_CAGRA_PENDING_PER_PAGE)
+        if (!BlockNumberIsValid(tag->next) || tag->count != pending_capacity(vector_dim))
             bad_page(vac->index, block);
         expected = tag->first_pos + tag->count;
         block = tag->next;
@@ -748,7 +894,7 @@ vacuum_slots(CagraVacuum *vac, const CuvsCagraMeta *meta)
             if (tag->kind != CUVS_PAGE_TIDS || tag->base_nonce != meta->base_nonce ||
                 tag->first_slot != slot || tag->flags != 0 || tag->dead > count)
                 bad_page(vac->index, block);
-            vacuum_tids(vac, buf, 0, count, tag);
+            vacuum_tids(vac, buf, 0, count, sizeof(ItemPointerData), tag);
             slot += count;
         }
     }
