@@ -121,7 +121,7 @@ static void
 expect_status(const Run *r, uint32_t policy, uint32_t overcommit, uint32_t margin,
               int setting, int effective, const char *result)
 {
-    CuvsRmmPoolStatus st;
+    CuvsRmmPoolStatus st = {0};
     CHECK(cuvs_ipc_rmm_pool_status(r->sock, &st) == CUVS_STATUS_OK);
     CHECK(st.cagra_build_overflow == policy);
     CHECK(st.managed_overcommit == overcommit);
@@ -136,22 +136,27 @@ int
 main(int argc, char **argv)
 {
     char line[256], expect[160];
+    int inherited, baseline, default_effective, explicit_value, kept_value;
     Run r;
     if (argc != 2) { fprintf(stderr, "usage: %s <pg_cuvs_server>\n", argv[0]); return 2; }
     daemon_bin = argv[1];
     snprintf(tmpdir, sizeof(tmpdir), "/tmp/lw_startup_%d", (int)getpid());
     mkdir(tmpdir, 0700);
-    if (read_adj("/proc/self/oom_score_adj") > 100 || !set_own_adj(100))
+    inherited = read_adj("/proc/self/oom_score_adj");
+    baseline = inherited < 100 ? 100 : inherited;
+    if (inherited < -CUVS_OOM_SCORE_ADJ_MAX || baseline >= CUVS_OOM_SCORE_ADJ_MAX ||
+        (baseline != inherited && !set_own_adj(baseline)))
     {
-        fprintf(stderr, "cannot start from oom_score_adj 100 (current %d)\n",
-                read_adj("/proc/self/oom_score_adj"));
-        return 1;
+        fprintf(stderr, "cannot start the oom_score_adj raise fixture from %d\n", inherited);
+        return 2;
     }
 
-    /* 1. Defaults: raise the inherited 100 to the default 500. */
+    /* 1. The default raises a low baseline and keeps one at or above it. */
+    default_effective = baseline < CUVS_OOM_SCORE_ADJ_DEFAULT ? CUVS_OOM_SCORE_ADJ_DEFAULT : baseline;
     CHECK(start(&r, 1, NULL, 0) == 0);
-    CHECK(pid_adj(r.pid) == CUVS_OOM_SCORE_ADJ_DEFAULT);
-    snprintf(expect, sizeof(expect), "oom_score_adj=%d applied", CUVS_OOM_SCORE_ADJ_DEFAULT);
+    CHECK(pid_adj(r.pid) == default_effective);
+    snprintf(expect, sizeof(expect), baseline < default_effective ? "oom_score_adj=%d applied" :
+             "oom_score_adj kept current %d", default_effective);
     snprintf(line, sizeof(line), "managed large_workspace: cagra_build_overflow=%s "
              "managed_overcommit=%s lw_margin_permille=%d",
              cuvs_lw_overflow_name(CUVS_CAGRA_BUILD_OVERFLOW_DEFAULT),
@@ -169,38 +174,44 @@ main(int argc, char **argv)
     CHECK(strstr(slurp(r.log), "recalibrate scratch_permille for the active policy") == NULL);
     expect_status(&r, CUVS_CAGRA_BUILD_OVERFLOW_DEFAULT, CUVS_MANAGED_OVERCOMMIT_DEFAULT,
                   CUVS_MANAGED_LW_MARGIN_PERMILLE_DEFAULT, CUVS_OOM_SCORE_ADJ_DEFAULT,
-                  CUVS_OOM_SCORE_ADJ_DEFAULT, expect);
+                  default_effective, expect);
     stop(&r);
 
-    /* 2. Explicit values for all four knobs. */
+    /* 2. An explicit value above the inherited baseline exercises the write. */
     {
+        char setting[16];
         const char *flags[] = {"--cagra-build-overflow", "error", "--managed-overcommit", "off",
-                               "--managed-lw-margin-permille", "1300", "--oom-score-adj", "650"};
+                               "--managed-lw-margin-permille", "1300", "--oom-score-adj", setting};
+        explicit_value = baseline < 650 ? 650 : baseline + 1;
+        snprintf(setting, sizeof(setting), "%d", explicit_value);
+        snprintf(expect, sizeof(expect), "oom_score_adj=%d applied", explicit_value);
         CHECK(start(&r, 2, flags, 8) == 0);
-        CHECK(pid_adj(r.pid) == 650);
+        CHECK(pid_adj(r.pid) == explicit_value);
         CHECK(strstr(slurp(r.log), "managed large_workspace: cagra_build_overflow=error "
                                    "managed_overcommit=off lw_margin_permille=1300") != NULL);
-        CHECK(strstr(slurp(r.log), "oom_score_adj=650 applied") != NULL);
+        CHECK(strstr(slurp(r.log), expect) != NULL);
         CHECK(strstr(slurp(r.log), "recalibrate scratch_permille for the active policy") != NULL);
-        expect_status(&r, CUVS_LW_OVERFLOW_ERROR, 0, 1300, 650, 650, "oom_score_adj=650 applied");
+        expect_status(&r, CUVS_LW_OVERFLOW_ERROR, 0, 1300, explicit_value, explicit_value, expect);
         stop(&r);
     }
 
     /* 3. A higher inherited value is kept, never lowered. */
-    CHECK(set_own_adj(800));
+    kept_value = baseline < 800 ? 800 : baseline;
+    CHECK(set_own_adj(kept_value));
     CHECK(start(&r, 3, NULL, 0) == 0);
-    CHECK(pid_adj(r.pid) == 800);
-    CHECK(strstr(slurp(r.log), "oom_score_adj kept current 800") != NULL);
+    CHECK(pid_adj(r.pid) == kept_value);
+    snprintf(expect, sizeof(expect), "oom_score_adj kept current %d", kept_value);
+    CHECK(strstr(slurp(r.log), expect) != NULL);
     expect_status(&r, CUVS_CAGRA_BUILD_OVERFLOW_DEFAULT, CUVS_MANAGED_OVERCOMMIT_DEFAULT,
-                  CUVS_MANAGED_LW_MARGIN_PERMILLE_DEFAULT, CUVS_OOM_SCORE_ADJ_DEFAULT, 800,
-                  "oom_score_adj kept current 800");
+                  CUVS_MANAGED_LW_MARGIN_PERMILLE_DEFAULT, CUVS_OOM_SCORE_ADJ_DEFAULT,
+                  kept_value, expect);
     stop(&r);
 
     /* 4. 0 leaves the inherited value untouched. */
     {
         const char *flags[] = {"--oom-score-adj", "0"};
         CHECK(start(&r, 4, flags, 2) == 0);
-        CHECK(pid_adj(r.pid) == 800);
+        CHECK(pid_adj(r.pid) == kept_value);
         CHECK(strstr(slurp(r.log), "oom_score_adj not applied: value 0") != NULL);
         stop(&r);
     }
@@ -211,7 +222,7 @@ main(int argc, char **argv)
         return 1;
     }
     printf("PASS lw startup: real shim daemon applies --oom-score-adj to /proc/<pid> "
-           "(default raise, explicit, keep higher, 0 untouched), startup lines and pool-status "
+           "(default raise or keep, explicit raise, keep higher, 0 untouched), startup lines and pool-status "
            "IPC match the macros and flags\n");
     return 0;
 }
