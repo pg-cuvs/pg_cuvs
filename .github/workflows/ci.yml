@@ -325,6 +325,34 @@ jobs:
           export PATH=/usr/lib/postgresql/16/bin:$PATH
           make test-k3-digest
 
+  page-format:
+    name: CAGRA page format (CPU shim)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install PostgreSQL 16 and test dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y postgresql-common
+          sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y
+          sudo apt-get install -y postgresql-16 postgresql-server-dev-16 \
+              postgresql-16-pgvector gcc make strace libcurl4-openssl-dev libssl-dev
+
+      - name: Page format, WAL mutations and mixed-build regression
+        timeout-minutes: 25
+        env:
+          PAGE_TEST_OUTPUT: ${{ runner.temp }}/pgcuvs-pages-logs
+        run: make PG_CONFIG=/usr/lib/postgresql/16/bin/pg_config test-page-format
+
+      - name: Upload page-format test logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cagra-page-format-logs
+          path: ${{ runner.temp }}/pgcuvs-pages-logs
+          retention-days: 7
+
 # ── Tier 2 (real A100 regression) lives in .github/workflows/gpu.yml ───────
 # Run on demand from the Actions UI ("Run workflow"); a hosted runner starts the
 # GPU VM (keyless WIF auth), a self-hosted runner on the VM runs the real

@@ -1292,7 +1292,9 @@ cuvs_ipc_build(
     uint32_t       use_cpu_hnsw,
     uint32_t       graph_degree,
     uint32_t       intermediate_graph_degree,
-    uint32_t       build_algo)
+    uint32_t       build_algo,
+    const CuvsPageBuildRequest *page_build,
+    uint64_t       *graph_nonce_out)
 {
     char shm_key[64] = "";
     int  legacy_shm_fd = -1;   /* CORPUS_HEAP only: created + unlinked here */
@@ -1335,7 +1337,7 @@ cuvs_ipc_build(
     }
 
     memset(&cmd, 0, sizeof(cmd));
-    cmd.op           = CUVS_OP_BUILD;
+    cmd.op           = page_build ? CUVS_OP_BUILD_PAGES : CUVS_OP_BUILD;
     cmd.db_oid       = db_oid;
     cmd.index_oid    = index_oid;
     cmd.metric       = metric;
@@ -1353,6 +1355,9 @@ cuvs_ipc_build(
     if (send_cmd(sock, &cmd) < 0)
         goto cleanup;
 
+    if (page_build && send_all(sock, page_build, sizeof(*page_build)) < 0)
+        goto cleanup;
+
     /* index_dir (fixed 256B) carries the SCM_RIGHTS fd for the memfd tier; for
      * shm/heap pass_fd is -1 and only the bytes are sent. Daemon recvmsg's both. */
     if (index_dir)
@@ -1364,6 +1369,9 @@ cuvs_ipc_build(
         goto cleanup;
 
     rc = (int)hdr.status;
+    if (page_build && rc == CUVS_STATUS_OK &&
+        (recv_all(sock, graph_nonce_out, sizeof(*graph_nonce_out)) < 0 || *graph_nonce_out == 0))
+        rc = CUVS_STATUS_ERROR;
 
 cleanup:
     if (sock >= 0)
