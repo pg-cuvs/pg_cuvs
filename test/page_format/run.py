@@ -114,8 +114,11 @@ checkpoint_timeout = '30min'
 
     @contextmanager
     def daemon(self, binary, label, *, seed_bf=False, fault=None, vram_mib=None, max_indexes=None,
-               overlay_host_bytes=None):
+               overlay_host_bytes=None, overlay_score_gate=None):
         env = self.env.copy()
+        env.pop("CUVS_TEST_PAGE_OVERLAY_SCORE_FIFO", None)
+        if overlay_score_gate is not None:
+            env["CUVS_TEST_PAGE_OVERLAY_SCORE_FIFO"] = str(overlay_score_gate)
         for key, enabled in (
             ("CUVS_FAULT_PAGE_BF_FIXTURE", seed_bf),
             ("CUVS_FAULT_PAGE_PERSIST", fault == "persist"),
@@ -525,33 +528,45 @@ def check_missing_dataset(cluster, daemon):
             cluster.stop()
 
 
-def check_slots(cluster, source):
-    cluster.sql("beta1a", "pageinspect", "-c", "CREATE EXTENSION pageinspect;")
-    cluster.sql("beta1a", "slots-meta", "-At", "-c", """
+def page_slot_keys(cluster, index):
+    label = f"{index}-slots-meta"
+    cluster.sql("beta1a", label, "-At", "-c", f"""
         SELECT (SELECT oid FROM pg_database WHERE datname=current_database()),
-               'g14_idx'::regclass::oid, system_identifier,
-               encode(get_raw_page('g14_idx',0),'hex')
+               '{index}'::regclass::oid, system_identifier,
+               encode(get_raw_page('{index}',0),'hex')
           FROM pg_control_system();
     """)
-    record = (cluster.logs / "main-slots-meta.log").read_text().splitlines()[-1]
+    record = (cluster.logs / f"{cluster.data.parent.name}-{label}.log").read_text().splitlines()[-1]
     db, oid, sysid, raw = record.split("|")
-    nonces_and_slots = struct.unpack_from("=QQQQ", bytes.fromhex(raw), 48)
+    return db, oid, sysid, *struct.unpack_from("=QQQQ", bytes.fromhex(raw), 48)
+
+
+def check_slots(cluster, source):
+    cluster.sql("beta1a", "pageinspect", "-c", "CREATE EXTENSION pageinspect;")
     binary = source / "slots-test"
     command(["cc", "-std=gnu11", "-O2", "-I", source / "src", "-o", binary,
              CASES / "beta1a_slots.c", source / "src/cuvs_ipc.c",
              source / "src/cuvs_util.c", source / "src/cuvs_build_corpus.c",
              "-lm", "-lpthread", "-lrt"], cluster.logs / "slots-build.log")
-    cluster.run(binary, [cluster.socket, db, oid, sysid, *nonces_and_slots], "slots")
+    cluster.run(binary, [cluster.socket, *page_slot_keys(cluster, "g14_idx")], "slots")
+    cluster.run(binary, [cluster.socket, *page_slot_keys(cluster, "page_ip_idx"), "ip"], "slots-ip")
 
-    cluster.sql("beta1a", "ip-slots-meta", "-At", "-c", """
-        SELECT (SELECT oid FROM pg_database WHERE datname=current_database()),
-               'page_ip_idx'::regclass::oid, system_identifier,
-               encode(get_raw_page('page_ip_idx',0),'hex')
-          FROM pg_control_system();
-    """)
-    db, oid, sysid, raw = (cluster.logs / "main-ip-slots-meta.log").read_text().splitlines()[-1].split("|")
-    nonces_and_slots = struct.unpack_from("=QQQQ", bytes.fromhex(raw), 48)
-    cluster.run(binary, [cluster.socket, db, oid, sysid, *nonces_and_slots, "ip"], "slots-ip")
+
+def check_overlay_budget(cluster, source):
+    gate = cluster.data.parent / "score.fifo"
+    os.mkfifo(gate)
+    with cluster.daemon(source / "pg_cuvs_server", "overlay-budget", overlay_host_bytes=128,
+                        overlay_score_gate=gate):
+        cluster.start()
+        try:
+            cluster.run("createdb", ["beta1a"], "createdb-beta1a")
+            cluster.file("beta1a", "beta1a")
+            cluster.sql("beta1a", "pageinspect", "-c", "CREATE EXTENSION pageinspect;")
+            cluster.run(source / "slots-test", [cluster.socket, *page_slot_keys(cluster, "g14_idx"),
+                        "budget", *page_slot_keys(cluster, "page_ip_idx"), gate], "slots-budget", timeout=100)
+        finally:
+            cluster.stop()
+    print("Daemon host budget, boot ABA and pinned overlay release: PASS", flush=True)
 
 
 def old_daemon_search(cluster):
@@ -848,6 +863,8 @@ def run(work, logs):
         finally:
             cluster.stop()
 
+    check_overlay_budget(Cluster(work / "budget", bindir, logs), source_on)
+
     if legacy_source:
         with cluster.daemon(source_base / "pg_cuvs_server", "historical"):
             cluster.start("historical")
@@ -962,6 +979,7 @@ def run_slots_only(work, logs):
             check_slots(cluster, source)
         finally:
             cluster.stop()
+    check_overlay_budget(Cluster(work / "budget", bindir, logs), source)
     print("Overlay IPC slots: PASS", flush=True)
 
 

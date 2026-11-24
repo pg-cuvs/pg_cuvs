@@ -1,9 +1,14 @@
 #include "cuvs_ipc.h"
 
+#include <errno.h>
+#include <fcntl.h>
+#include <pthread.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
 #include <math.h>
 
 static uint64_t
@@ -14,6 +19,19 @@ arg64(const char *text)
     if (!text[0] || *tail)
         exit(64);
     return number;
+}
+
+static CuvsPageSearchRequest
+page_base(char **keys)
+{
+    return (CuvsPageSearchRequest) {
+        .length = sizeof(CuvsPageSearchRequest),
+        .system_identifier = arg64(keys[0]),
+        .index_nonce = arg64(keys[1]),
+        .base_nonce = arg64(keys[2]),
+        .graph_nonce = arg64(keys[3]),
+        .n_slots = arg64(keys[4]),
+    };
 }
 
 static int
@@ -45,7 +63,8 @@ expect_supply(const char *socket, uint32_t db, uint32_t index,
                                        rows, &progress);
 
     bool has_progress = expected == CUVS_STATUS_OK || expected == CUVS_STATUS_PAGE_NEED ||
-                        expected == CUVS_STATUS_PAGE_OVERLAY_FULL;
+                        expected == CUVS_STATUS_PAGE_OVERLAY_FULL ||
+                        expected == CUVS_STATUS_PAGE_OVERLAY_HOST_FULL;
     if (status != expected || (has_progress &&
                               (!progress.daemon_id || progress.covered_upto != covered)))
     {
@@ -295,21 +314,124 @@ check_merge_ip(const char *socket, uint32_t db, uint32_t index, CuvsPageSearchRe
     return 0;
 }
 
+typedef struct PinnedSearch
+{
+    const char *socket;
+    uint32_t db, index;
+    CuvsPageOverlayRequest request;
+    int status, count;
+} PinnedSearch;
+
+static void *
+pinned_search(void *arg)
+{
+    PinnedSearch *search = arg;
+    const float query[8] = {0};
+    CuvsPageOverlayResult row;
+    CuvsPageProgress progress;
+    uint32_t latency;
+
+    search->status = cuvs_ipc_search_page_overlay(search->socket, search->db, search->index,
+        &search->request, query, 1, 8, 1, CUVS_METRIC_L2, 0, 0, 0, 0, 0, NULL,
+        &row, &search->count, &latency, &progress);
+    return NULL;
+}
+
+static int
+check_host_budget(const char *socket, uint32_t db, uint32_t index,
+                  CuvsPageSearchRequest base, char **other, const char *fifo)
+{
+    const float vector[8] = {0};
+    CuvsPagePosition marks[2] = {
+        {.state = CUVS_PAGE_POSITION_DEAD},
+        {.block = 65, .state = CUVS_PAGE_POSITION_VECTOR},
+    };
+    CuvsPageSupplement rows = {.marks = marks, .vectors = vector, .positions = 2, .vector_rows = 1};
+    CuvsPageOverlayRequest supply = {.base = base, .boot_id = 1};
+    CuvsPageOverlayRequest ip = {.base = page_base(other + 2), .boot_id = 1};
+    uint32_t ip_db = (uint32_t) arg64(other[0]), ip_index = (uint32_t) arg64(other[1]);
+    CuvsPageProgress progress;
+    CuvsPageOverlayResult row;
+    uint32_t latency;
+    int count, status, gate = -1;
+    pthread_t thread;
+
+    supply.base.tail = ip.base.tail = 2;
+    if (expect_supply(socket, db, index, &supply, &rows, CUVS_STATUS_OK, 2) ||
+        expect_supply(socket, db, index, &supply, &rows, CUVS_STATUS_OK, 2))
+        return 1;
+    status = cuvs_ipc_search_page_overlay(socket, ip_db, ip_index, &ip, vector, 1, 8, 1,
+        CUVS_METRIC_IP, 0, 0, 0, 0, 0, &rows, &row, &count, &latency, &progress);
+    if (status != CUVS_STATUS_PAGE_OVERLAY_HOST_FULL || count != 0 || progress.covered_upto != 0)
+    {
+        fprintf(stderr, "resident limit: status=%d count=%d\n", status, count);
+        return 1;
+    }
+
+    PinnedSearch pending = {.socket = socket, .db = db, .index = index, .request = supply};
+    pending.request.from = 2;
+    if (pthread_create(&thread, NULL, pinned_search, &pending) != 0)
+        return 1;
+    for (int i = 0; i < 500 && gate < 0; ++i)
+    {
+        gate = open(fifo, O_WRONLY | O_NONBLOCK);
+        if (gate < 0 && errno != ENXIO)
+            break;
+        if (gate < 0)
+            usleep(10000);
+    }
+    if (gate < 0)
+    {
+        fputs("search did not reach the unlocked scoring gate\n", stderr);
+        return 1;
+    }
+
+    /* Replace the boot and then reuse its ID while the old prefix is pinned. */
+    PinnedSearch reboot = {.socket = socket, .db = db, .index = index,
+                           .request = {.base = base, .boot_id = 2}};
+    (void) pinned_search(&reboot);
+    bool switched = reboot.status == CUVS_STATUS_OK && reboot.count == 1;
+    reboot.request.boot_id = 1;
+    (void) pinned_search(&reboot);
+    switched = switched && reboot.status == CUVS_STATUS_OK && reboot.count == 1;
+    status = cuvs_ipc_supply_pages(socket, ip_db, ip_index, &ip, 8, CUVS_METRIC_IP, &rows, &progress);
+    bool pinned_charge = status == CUVS_STATUS_PAGE_OVERLAY_HOST_FULL && progress.covered_upto == 0;
+    close(gate);
+    if (pthread_join(thread, NULL) != 0)
+        return 1;
+    if (!switched || !pinned_charge || pending.status != CUVS_STATUS_NOT_FOUND || pending.count != 0)
+    {
+        fprintf(stderr, "boot ABA or detached charge: switched=%d supply=%d search=%d count=%d\n",
+                switched, status, pending.status, pending.count);
+        return 1;
+    }
+
+    status = cuvs_ipc_supply_pages(socket, ip_db, ip_index, &ip, 8, CUVS_METRIC_IP, &rows, &progress);
+    if (status != CUVS_STATUS_OK || progress.covered_upto != 2)
+    {
+        fprintf(stderr, "released charge: supply=%d covered=%llu\n", status,
+                (unsigned long long) progress.covered_upto);
+        return 1;
+    }
+    puts("Daemon host budget, boot ABA and pinned overlay release: PASS");
+    return 0;
+}
+
 int
 main(int argc, char **argv)
 {
-    if (argc != 9 && argc != 10)
+    if (argc != 9 && argc != 10 && argc != 18)
         return 64;
     uint32_t db = (uint32_t) arg64(argv[2]);
     uint32_t idx = (uint32_t) arg64(argv[3]);
-    CuvsPageSearchRequest request = {
-        .length = sizeof(request),
-        .system_identifier = arg64(argv[4]),
-        .index_nonce = arg64(argv[5]),
-        .base_nonce = arg64(argv[6]),
-        .graph_nonce = arg64(argv[7]),
-        .n_slots = arg64(argv[8])
-    };
+    CuvsPageSearchRequest request = page_base(argv + 4);
+
+    if (argc == 18)
+    {
+        if (strcmp(argv[9], "budget") != 0)
+            return 64;
+        return check_host_budget(argv[1], db, idx, request, argv + 10, argv[17]);
+    }
 
     if (argc == 10)
         return check_merge_ip(argv[1], db, idx, request);

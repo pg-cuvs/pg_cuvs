@@ -13034,6 +13034,27 @@ page_overlay_search_status(const CuvsCmdFrame *cmd, const CuvsPageOverlayRequest
     return CUVS_STATUS_OK;
 }
 
+#ifdef CUVS_TEST_HOOKS
+/* Gate a pinned search so the fixture can change the registry before scoring. */
+static void
+page_overlay_test_score_gate(void)
+{
+    const char *path = getenv("CUVS_TEST_PAGE_OVERLAY_SCORE_FIFO");
+
+    if (path)
+    {
+        int fd = open(path, O_RDONLY | O_CLOEXEC);
+        char release;
+
+        if (fd >= 0)
+        {
+            (void) read(fd, &release, 1);
+            close(fd);
+        }
+    }
+}
+#endif
+
 static void
 handle_page_overlay_search(int client_fd, const CuvsCmdFrame *cmd)
 {
@@ -13141,6 +13162,10 @@ unlock:
     if (reply.status != CUVS_STATUS_OK)
         goto timed;
 
+#ifdef CUVS_TEST_HOOKS
+    if (snapshot)
+        page_overlay_test_score_gate();
+#endif
     /* Only the copied base results and an immutable overlay prefix are used
      * below. Concurrent appends leave this search's covered range intact. */
     const CuvsPageOverlayChunk *first = snapshot;
