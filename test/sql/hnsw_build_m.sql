@@ -53,7 +53,6 @@ SELECT bool_and((pg_cuvs_hnsw_layer_counts(idx)).m = m) AS source_m_matches
 FROM (VALUES ('hbm_source'::regclass, 16), ('hbm_source_match', 16),
              ('hbm_source_cap', 32), ('hbm_source_legacy', 16)) AS expected(idx, m);
 
-SET client_min_messages = notice;
 CREATE INDEX hbm_bad_default ON hbm USING pg_cuvs_hnsw (v vector_l2_ops)
     WITH (source = 'hbm_c32', m = 32);
 CREATE INDEX hbm_bad_cap ON hbm USING pg_cuvs_hnsw (v vector_l2_ops)
@@ -62,7 +61,6 @@ CREATE INDEX hbm_bad_legacy ON hbm USING pg_cuvs_hnsw (v vector_l2_ops)
     WITH (source = 'hbm_c32', m = 32, mode = 'hnswlib');
 ALTER INDEX hbm_source SET (m = 32);
 REINDEX INDEX hbm_source;
-SET client_min_messages = warning;
 SELECT (pg_cuvs_hnsw_layer_counts('hbm_source')).m = 16 AS after_reindex_notice;
 ALTER INDEX hbm_source RESET (m);
 REINDEX INDEX hbm_source;
