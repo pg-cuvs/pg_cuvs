@@ -40,6 +40,7 @@ CREATE INDEX hef_ivf ON hef USING pg_cuvs_hnsw (v vector_l2_ops)
 SET client_min_messages = warning;
 SELECT pg_temp.hef_meta('hef_ivf');
 SELECT pg_cuvs_hnsw_build_info('hef_ivf') ->> 'intermediate_degree';
+SELECT pg_cuvs_hnsw_build_info('hef_ivf') ->> 'hierarchy_ef_construction';
 CREATE INDEX hef_nn ON hef USING pg_cuvs_hnsw (v vector_l2_ops)
     WITH (m = 32, ef_construction = 1000, build_algo = 'nn_descent');
 SELECT pg_temp.hef_meta('hef_nn');
@@ -54,6 +55,7 @@ CREATE INDEX hef_low ON hef USING pg_cuvs_hnsw (v vector_l2_ops)
     WITH (m = 32, ef_construction = 4, build_algo = 'ivf_pq');
 SELECT pg_temp.hef_meta('hef_low');
 SELECT pg_cuvs_hnsw_build_info('hef_low') ->> 'intermediate_degree';
+SELECT pg_cuvs_hnsw_build_info('hef_low') ->> 'hierarchy_ef_construction';
 CREATE INDEX hef_tiny_i ON hef_tiny USING pg_cuvs_hnsw (v vector_l2_ops)
     WITH (ef_construction = 4);
 SELECT pg_temp.hef_meta('hef_tiny_i');

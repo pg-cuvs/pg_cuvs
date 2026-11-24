@@ -578,16 +578,18 @@ line then has `status=5` and still names the decided route (`route=none` only wh
 route was decided, such as an over-budget refusal).
 
 `m` remains informational. With the default `ef_construction = 64`, direct builds use
-a planned intermediate width of 128 and an hnswlib serialization EF of 200. The
+a planned intermediate width of 128 before the row-count adjustment, and an
+hnswlib serialization EF of 200. The tiny route uses its own graph width. The
 `hierarchy_ef_construction` receipt field reports the value read from that serialized
 file. The GPU upper-graph builder takes its neighbors and budgets through the SDK.
 The SDK limits the intermediate width to 1024. A build that reaches that ceiling
 with a higher requested width issues a NOTICE. Under `--hnsw-ace-build-quality auto`,
 the default ACE effort is 240 (20 NN-descent iterations per small partition with
 cuVS 26.04). ACE indexes also record a partition-builder
-readback (`ace_build_quality`, `ace_local_intermediate_degree` = 3 × (graph_degree / 2),
+readback computed from the pinned SDK policy (`ace_build_quality`, `ace_local_intermediate_degree` = 3 × (graph_degree / 2),
 `ace_local_nn_descent_iterations`); the receipt's `intermediate_degree` is the resident width
 and the ACE memory-plan input, not the width ACE partitions build and optimize with.
+The readback reports a configured iteration limit. The SDK logs describe individual partitions.
 `ace_partitions` is the effective partition count (`ace_partitions_origin` =
 `same_SDK_stable_explicit_plan`) when pg_cuvs was built with `CUVS_SDK_SOURCE_INCLUDE`. Built
 without it, an ACE build still runs on the patched SDK but records the requested count:

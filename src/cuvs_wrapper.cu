@@ -3124,6 +3124,7 @@ static int execute_hnsw_file_build(const CuvsHnswFileBuild *params, int owner_fd
             ? cuvs::distance::DistanceType::InnerProduct : cuvs_distance_type(params->metric);
         cp.graph_degree = degree;
         cp.intermediate_graph_degree = intermediate;
+        receipt.intermediate = (uint32_t) cp.intermediate_graph_degree;
         cp.attach_dataset_on_build = false;
         hnsw::index_params hp;
         hp.hierarchy = params->hierarchy ? hnsw::HnswHierarchy::GPU : hnsw::HnswHierarchy::NONE;
@@ -3399,7 +3400,6 @@ cuvs_hnsw_build_file(int vectors_fd, int owner_fd,
         receipt.route_flags = prepared.route.overflowed ? CUVS_HNSW_ROUTE_FLAG_AUTO_OVERFLOW : 0;
         receipt.requested_ef = params->ef_construction;
         receipt.degree = degree;
-        receipt.intermediate = intermediate;
         receipt.hierarchy = params->hierarchy;
         receipt.n_rows = params->n_vecs;
         receipt.dim = params->dim;
