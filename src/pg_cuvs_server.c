@@ -12919,6 +12919,27 @@ find_page_overlay_graph(const CuvsCmdFrame *cmd, const CuvsPageOverlayRequest *r
     return graph && graph->dim == cmd->dim && graph->metric == cmd->metric ? graph : NULL;
 }
 
+#ifdef CUVS_TEST_HOOKS
+/* Suspend a receive or search after it has obtained its budgeted reference. */
+static void
+page_overlay_test_gate(const char *name)
+{
+    const char *path = getenv(name);
+
+    if (path)
+    {
+        int fd = open(path, O_RDONLY | O_CLOEXEC);
+        char release;
+
+        if (fd >= 0)
+        {
+            (void) read(fd, &release, 1);
+            close(fd);
+        }
+    }
+}
+#endif
+
 static uint32_t
 read_page_overlay_chunk(const CuvsPageOverlayRequest *request, uint32_t dim, bool shared,
                         CuvsPageOverlayChunk **result)
@@ -12934,6 +12955,9 @@ read_page_overlay_chunk(const CuvsPageOverlayRequest *request, uint32_t dim, boo
     status = cuvs_page_overlay_alloc(&g_page_overlay_budget, request, bytes, result);
     if (status == CUVS_STATUS_OK)
     {
+#ifdef CUVS_TEST_HOOKS
+        page_overlay_test_gate("CUVS_TEST_PAGE_OVERLAY_RECEIVE_FIFO");
+#endif
         /* Read into the reserved chunk directly. There is no daemon-side
          * staging mapping or second buffer to overlap this allocation. */
         while (offset < bytes)
@@ -13033,27 +13057,6 @@ page_overlay_search_status(const CuvsCmdFrame *cmd, const CuvsPageOverlayRequest
         return CUVS_STATUS_NO_VECTORS;
     return CUVS_STATUS_OK;
 }
-
-#ifdef CUVS_TEST_HOOKS
-/* Gate a pinned search so the fixture can change the registry before scoring. */
-static void
-page_overlay_test_score_gate(void)
-{
-    const char *path = getenv("CUVS_TEST_PAGE_OVERLAY_SCORE_FIFO");
-
-    if (path)
-    {
-        int fd = open(path, O_RDONLY | O_CLOEXEC);
-        char release;
-
-        if (fd >= 0)
-        {
-            (void) read(fd, &release, 1);
-            close(fd);
-        }
-    }
-}
-#endif
 
 static void
 handle_page_overlay_search(int client_fd, const CuvsCmdFrame *cmd)
@@ -13164,7 +13167,7 @@ unlock:
 
 #ifdef CUVS_TEST_HOOKS
     if (snapshot)
-        page_overlay_test_score_gate();
+        page_overlay_test_gate("CUVS_TEST_PAGE_OVERLAY_SCORE_FIFO");
 #endif
     /* Only the copied base results and an immutable overlay prefix are used
      * below. Concurrent appends leave this search's covered range intact. */

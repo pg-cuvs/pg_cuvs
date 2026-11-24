@@ -8,6 +8,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #include <math.h>
 
@@ -337,9 +338,43 @@ pinned_search(void *arg)
     return NULL;
 }
 
+typedef struct ReceivingSupply
+{
+    const char *socket;
+    uint32_t db, index;
+    const CuvsPageOverlayRequest *request;
+    const CuvsPageSupplement *rows;
+    int failed;
+} ReceivingSupply;
+
+static void *
+receiving_supply(void *arg)
+{
+    ReceivingSupply *supply = arg;
+
+    supply->failed = expect_supply(supply->socket, supply->db, supply->index, supply->request,
+                                   supply->rows, CUVS_STATUS_OK, 2);
+    return NULL;
+}
+
+static int
+wait_gate(const char *fifo)
+{
+    for (int i = 0; i < 500; ++i)
+    {
+        int fd = open(fifo, O_WRONLY | O_NONBLOCK);
+
+        if (fd >= 0 || errno != ENXIO)
+            return fd;
+        usleep(10000);
+    }
+    return -1;
+}
+
 static int
 check_host_budget(const char *socket, uint32_t db, uint32_t index,
-                  CuvsPageSearchRequest base, char **other, const char *fifo)
+                  CuvsPageSearchRequest base, char **other, const char *score_fifo,
+                  const char *receive_fifo)
 {
     const float vector[8] = {0};
     CuvsPagePosition marks[2] = {
@@ -353,7 +388,7 @@ check_host_budget(const char *socket, uint32_t db, uint32_t index,
     CuvsPageProgress progress;
     CuvsPageOverlayResult row;
     uint32_t latency;
-    int count, status, gate = -1;
+    int count, status, gate;
     pthread_t thread;
 
     supply.base.tail = ip.base.tail = 2;
@@ -372,14 +407,7 @@ check_host_budget(const char *socket, uint32_t db, uint32_t index,
     pending.request.from = 2;
     if (pthread_create(&thread, NULL, pinned_search, &pending) != 0)
         return 1;
-    for (int i = 0; i < 500 && gate < 0; ++i)
-    {
-        gate = open(fifo, O_WRONLY | O_NONBLOCK);
-        if (gate < 0 && errno != ENXIO)
-            break;
-        if (gate < 0)
-            usleep(10000);
-    }
+    gate = wait_gate(score_fifo);
     if (gate < 0)
     {
         fputs("search did not reach the unlocked scoring gate\n", stderr);
@@ -406,6 +434,39 @@ check_host_budget(const char *socket, uint32_t db, uint32_t index,
         return 1;
     }
 
+    ReceivingSupply receiving = {.socket = socket, .db = db, .index = index,
+                                 .request = &supply, .rows = &rows};
+    if (mkfifo(receive_fifo, 0600) != 0 || pthread_create(&thread, NULL, receiving_supply, &receiving) != 0)
+        return 1;
+    gate = wait_gate(receive_fifo);
+    if (gate < 0)
+    {
+        fputs("supply did not reach the reserved receive gate\n", stderr);
+        return 1;
+    }
+    if (unlink(receive_fifo) != 0)
+        return 1;
+    status = cuvs_ipc_supply_pages(socket, ip_db, ip_index, &ip, 8, CUVS_METRIC_IP, &rows, &progress);
+    close(gate);
+    if (pthread_join(thread, NULL) != 0 || receiving.failed ||
+        status != CUVS_STATUS_PAGE_OVERLAY_HOST_FULL || progress.covered_upto != 0)
+    {
+        fprintf(stderr, "in-flight receive charge: supply=%d accepted=%d\n", status, !receiving.failed);
+        return 1;
+    }
+    reboot.request.boot_id = 2;
+    (void) pinned_search(&reboot);
+    if (reboot.status != CUVS_STATUS_OK || reboot.count != 1)
+        return 1;
+
+    marks[1].block = 0;
+    status = cuvs_ipc_supply_pages(socket, ip_db, ip_index, &ip, 8, CUVS_METRIC_IP, &rows, &progress);
+    if (status != CUVS_STATUS_ERROR)
+    {
+        fprintf(stderr, "invalid supply: status=%d\n", status);
+        return 1;
+    }
+    marks[1].block = 65;
     status = cuvs_ipc_supply_pages(socket, ip_db, ip_index, &ip, 8, CUVS_METRIC_IP, &rows, &progress);
     if (status != CUVS_STATUS_OK || progress.covered_upto != 2)
     {
@@ -413,24 +474,24 @@ check_host_budget(const char *socket, uint32_t db, uint32_t index,
                 (unsigned long long) progress.covered_upto);
         return 1;
     }
-    puts("Daemon host budget, boot ABA and pinned overlay release: PASS");
+    puts("Daemon host budget, boot ABA, pinned overlay and in-flight receive: PASS");
     return 0;
 }
 
 int
 main(int argc, char **argv)
 {
-    if (argc != 9 && argc != 10 && argc != 18)
+    if (argc != 9 && argc != 10 && argc != 19)
         return 64;
     uint32_t db = (uint32_t) arg64(argv[2]);
     uint32_t idx = (uint32_t) arg64(argv[3]);
     CuvsPageSearchRequest request = page_base(argv + 4);
 
-    if (argc == 18)
+    if (argc == 19)
     {
         if (strcmp(argv[9], "budget") != 0)
             return 64;
-        return check_host_budget(argv[1], db, idx, request, argv + 10, argv[17]);
+        return check_host_budget(argv[1], db, idx, request, argv + 10, argv[17], argv[18]);
     }
 
     if (argc == 10)

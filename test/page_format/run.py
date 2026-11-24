@@ -114,11 +114,13 @@ checkpoint_timeout = '30min'
 
     @contextmanager
     def daemon(self, binary, label, *, seed_bf=False, fault=None, vram_mib=None, max_indexes=None,
-               overlay_host_bytes=None, overlay_score_gate=None):
+               overlay_host_bytes=None, overlay_gate_dir=None):
         env = self.env.copy()
-        env.pop("CUVS_TEST_PAGE_OVERLAY_SCORE_FIFO", None)
-        if overlay_score_gate is not None:
-            env["CUVS_TEST_PAGE_OVERLAY_SCORE_FIFO"] = str(overlay_score_gate)
+        for gate in ("score", "receive"):
+            key = f"CUVS_TEST_PAGE_OVERLAY_{gate.upper()}_FIFO"
+            env.pop(key, None)
+            if overlay_gate_dir is not None:
+                env[key] = str(overlay_gate_dir / f"{gate}.fifo")
         for key, enabled in (
             ("CUVS_FAULT_PAGE_BF_FIXTURE", seed_bf),
             ("CUVS_FAULT_PAGE_PERSIST", fault == "persist"),
@@ -553,20 +555,22 @@ def check_slots(cluster, source):
 
 
 def check_overlay_budget(cluster, source):
-    gate = cluster.data.parent / "score.fifo"
-    os.mkfifo(gate)
+    gate_dir = cluster.data.parent
+    score_gate = gate_dir / "score.fifo"
+    os.mkfifo(score_gate)
     with cluster.daemon(source / "pg_cuvs_server", "overlay-budget", overlay_host_bytes=128,
-                        overlay_score_gate=gate):
+                        overlay_gate_dir=gate_dir):
         cluster.start()
         try:
             cluster.run("createdb", ["beta1a"], "createdb-beta1a")
             cluster.file("beta1a", "beta1a")
             cluster.sql("beta1a", "pageinspect", "-c", "CREATE EXTENSION pageinspect;")
             cluster.run(source / "slots-test", [cluster.socket, *page_slot_keys(cluster, "g14_idx"),
-                        "budget", *page_slot_keys(cluster, "page_ip_idx"), gate], "slots-budget", timeout=100)
+                        "budget", *page_slot_keys(cluster, "page_ip_idx"), score_gate,
+                        gate_dir / "receive.fifo"], "slots-budget", timeout=100)
         finally:
             cluster.stop()
-    print("Daemon host budget, boot ABA and pinned overlay release: PASS", flush=True)
+    print("Daemon host budget, boot ABA, pinned overlay and in-flight receive: PASS", flush=True)
 
 
 def old_daemon_search(cluster):
