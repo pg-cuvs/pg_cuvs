@@ -453,7 +453,8 @@ cuvs_ipc_set_wait_callback(int (*cb)(void))
  * wait instead of blocking the backend uninterruptibly. Returns 0 on full read,
  * -1 on error/EOF/overall-timeout, 1 if the wait callback asked to abort. */
 static int
-recv_all_interruptible(int fd, void *buf, size_t len, int timeout_sec)
+recv_all_interruptible_with_deadline(int fd, void *buf, size_t len, int timeout_sec,
+                                     bool limit_partial_reads)
 {
     char  *p = buf;
     size_t got = 0;
@@ -463,7 +464,26 @@ recv_all_interruptible(int fd, void *buf, size_t len, int timeout_sec)
     while (got < len)
     {
         struct pollfd pfd = { .fd = fd, .events = POLLIN, .revents = 0 };
-        int pr = poll(&pfd, 1, 250 /* ms slice */);
+        int slice_ms = 250;
+        int pr;
+
+        if (limit_partial_reads)
+        {
+            struct timespec now;
+            long long remaining_ms;
+
+            if (g_wait_cb && g_wait_cb())
+                return 1;
+            clock_gettime(CLOCK_MONOTONIC, &now);
+            remaining_ms = (long long) timeout_sec * 1000 -
+                ((long long) (now.tv_sec - start.tv_sec) * 1000 +
+                 (now.tv_nsec - start.tv_nsec) / 1000000);
+            if (remaining_ms <= 0)
+                return -1;
+            if (remaining_ms < slice_ms)
+                slice_ms = (int) remaining_ms;
+        }
+        pr = poll(&pfd, 1, slice_ms);
 
         if (pr < 0)
         {
@@ -480,6 +500,8 @@ recv_all_interruptible(int fd, void *buf, size_t len, int timeout_sec)
             struct timespec now;
             if (g_wait_cb && g_wait_cb())
                 return 1;
+            if (limit_partial_reads)
+                continue;   /* the next iteration checks the precise deadline */
             clock_gettime(CLOCK_MONOTONIC, &now);
             if ((now.tv_sec - start.tv_sec) >= timeout_sec)
                 return -1;      /* daemon never replied within the budget */
@@ -498,6 +520,12 @@ recv_all_interruptible(int fd, void *buf, size_t len, int timeout_sec)
         got += (size_t)n;
     }
     return 0;
+}
+
+static int
+recv_all_interruptible(int fd, void *buf, size_t len, int timeout_sec)
+{
+    return recv_all_interruptible_with_deadline(fd, buf, len, timeout_sec, false);
 }
 
 /* ----------------------------------------------------------------
@@ -964,6 +992,96 @@ cuvs_ipc_mark_pages_empty(const char *socket_path, uint32_t db_oid, uint32_t ind
         rc = (int) reply.status;
     close(sock);
     return rc;
+}
+
+bool
+cuvs_page_fold_event_valid(const CuvsPageFoldEvent *event)
+{
+    return event && event->length == sizeof(*event) &&
+        event->db_oid && event->index_oid && event->system_identifier &&
+        event->boot_id && event->daemon_id && event->index_nonce && event->base_nonce &&
+        event->parent_graph_nonce && event->graph_nonce &&
+        event->parent_graph_nonce != event->graph_nonce &&
+        event->positions > 0 && event->positions <= CUVS_PAGE_OVERLAY_MAX &&
+        event->parent_folded <= event->parent_n_slots &&
+        event->parent_n_slots <= UINT64_MAX - event->positions;
+}
+
+static int
+page_fold_exchange(const char *socket_path, CuvsCmdFrame *cmd,
+                   const void *payload, size_t payload_size, CuvsPageFoldEvent *candidate)
+{
+    const int timeout_sec = 1;
+    CuvsReplyHeader reply;
+    int sock, canceled, waiting;
+    int status = CUVS_STATUS_ERROR;
+
+    if (!socket_path || !socket_path[0])
+        return CUVS_STATUS_UNAVAILABLE;
+    if (g_wait_cb && g_wait_cb())
+        return CUVS_STATUS_CANCELED;
+    sock = uds_connect_wait(socket_path, timeout_sec, &canceled);
+    if (sock < 0)
+        return canceled ? CUVS_STATUS_CANCELED : CUVS_STATUS_UNAVAILABLE;
+
+    if (send_cmd(sock, cmd) == 0 && send_all(sock, payload, payload_size) == 0)
+    {
+        waiting = recv_all_interruptible_with_deadline(sock, &reply, sizeof(reply), timeout_sec, true);
+        if (waiting == 0)
+        {
+            remember_reply(&reply);
+            status = (int) reply.status;
+            if (status == CUVS_STATUS_OK && candidate)
+            {
+                waiting = recv_all_interruptible_with_deadline(sock, candidate, sizeof(*candidate),
+                                                               timeout_sec, true);
+                if (waiting != 0)
+                    status = waiting == 1 ? CUVS_STATUS_CANCELED : CUVS_STATUS_ERROR;
+            }
+        }
+        else if (waiting == 1)
+            status = CUVS_STATUS_CANCELED;
+    }
+    close(sock);
+    return status;
+}
+
+int
+cuvs_ipc_page_fold_ready(const char *socket_path, uint32_t db_oid,
+                         uint64_t system_identifier, uint64_t boot_id, CuvsPageFoldEvent *event)
+{
+    CuvsCmdFrame cmd = {.op = CUVS_OP_FOLD_READY, .db_oid = db_oid};
+    CuvsPageFoldQuery query = {.length = sizeof(query), .system_identifier = system_identifier,
+                              .boot_id = boot_id};
+    CuvsPageFoldEvent candidate;
+    int status;
+
+    forget_reply();
+    if (!event || !db_oid || !system_identifier || !boot_id)
+        return CUVS_STATUS_ERROR;
+    status = page_fold_exchange(socket_path, &cmd, &query, sizeof(query), &candidate);
+    if (status != CUVS_STATUS_OK)
+        return status;
+    if (!cuvs_page_fold_event_valid(&candidate) || candidate.db_oid != db_oid ||
+        candidate.system_identifier != system_identifier || candidate.boot_id != boot_id)
+        return CUVS_STATUS_ERROR;
+    *event = candidate;
+    return CUVS_STATUS_OK;
+}
+
+int
+cuvs_ipc_page_fold_result(const char *socket_path, const CuvsPageFoldEvent *event,
+                          uint64_t transition_lsn)
+{
+    forget_reply();
+    if (!cuvs_page_fold_event_valid(event))
+        return CUVS_STATUS_ERROR;
+
+    CuvsCmdFrame cmd = {.op = transition_lsn ? CUVS_OP_FOLD_COMMITTED : CUVS_OP_FOLD_DISCARD,
+                        .db_oid = event->db_oid, .index_oid = event->index_oid};
+    CuvsPageFoldResult result = {.event = *event, .transition_lsn = transition_lsn};
+
+    return page_fold_exchange(socket_path, &cmd, &result, sizeof(result), NULL);
 }
 
 /* ----------------------------------------------------------------

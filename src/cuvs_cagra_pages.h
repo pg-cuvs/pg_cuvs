@@ -65,6 +65,7 @@ typedef struct CuvsCagraMeta
 } CuvsCagraMeta;
 
 uint64 cuvs_cagra_nonce(void);
+uint64 cuvs_cagra_pg_boot_id(void);
 bool cuvs_cagra_read_meta(Relation index, CuvsCagraMeta *meta);
 
 typedef enum CuvsCagraSlotResult
@@ -117,8 +118,9 @@ CuvsCagraFoldStatus cuvs_cagra_prepare_fold(Relation index,
 
 /* Standalone writable background worker operation on a WAL-logged index. The
  * caller holds RowExclusiveLock and has verified the candidate's origin and PG life.
- * PUBLISHED returns a flushed physical transition LSN and no FCL. That is
- * the first point at which the caller may send FOLD_COMMITTED. */
+ * PUBLISHED returns a flushed physical transition LSN and no FCL, including
+ * for a redelivered candidate that is already the published head. The
+ * caller may send FOLD_COMMITTED after this result. */
 CuvsCagraFoldStatus cuvs_cagra_publish_fold(Relation index,
                         const CuvsCagraFoldCandidate *candidate, XLogRecPtr *commit_lsn);
 CuvsCagraSlotResult cuvs_cagra_pending_tid(Relation index, const CuvsCagraMeta *meta,

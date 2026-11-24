@@ -62,6 +62,7 @@
 #include "storage/fd.h"
 #include "storage/itemptr.h"
 #include "storage/ipc.h"       /* shmem_request_hook, shmem_startup_hook */
+#include "storage/lmgr.h"
 #include "storage/lwlock.h"    /* AddinShmemInitLock */
 #include "storage/shmem.h"     /* ShmemInitStruct, RequestAddinShmemSpace */
 #include "storage/spin.h"      /* slock_t — fallback-stats array guard */
@@ -957,6 +958,15 @@ typedef struct CuvsFbShmem
 static CuvsFbShmem *g_fb = NULL;
 static shmem_request_hook_type prev_shmem_request_hook = NULL;
 static shmem_startup_hook_type prev_shmem_startup_hook = NULL;
+#ifdef CUVS_PAGE_FORMAT
+static uint64 *cuvs_page_boot_id;
+
+uint64
+cuvs_cagra_pg_boot_id(void)
+{
+    return cuvs_page_boot_id ? *cuvs_page_boot_id : 0;
+}
+#endif
 
 static const char *
 cuvs_fb_reason_name(int r)
@@ -988,6 +998,9 @@ cuvs_fb_shmem_request(void)
     if (prev_shmem_request_hook)
         prev_shmem_request_hook();
     RequestAddinShmemSpace(cuvs_fb_memsize());
+#ifdef CUVS_PAGE_FORMAT
+    RequestAddinShmemSpace(sizeof(*cuvs_page_boot_id));
+#endif
 }
 
 static void
@@ -1005,6 +1018,13 @@ cuvs_fb_shmem_startup(void)
         SpinLockInit(&g_fb->mutex);
         memset(g_fb->slots, 0, sizeof(g_fb->slots));  /* InvalidOid == 0 => all empty */
     }
+#ifdef CUVS_PAGE_FORMAT
+    /* A backend crash can recreate shared memory in the same postmaster. */
+    cuvs_page_boot_id = ShmemInitStruct("pg_cuvs page boot identity",
+                                       sizeof(*cuvs_page_boot_id), &found);
+    if (!found)
+        *cuvs_page_boot_id = cuvs_cagra_nonce();
+#endif
     LWLockRelease(AddinShmemInitLock);
 }
 
@@ -5280,7 +5300,7 @@ page_start_search(IndexScanDesc scan, CuvsScanState *ss)
         return false;
     k = cuvs_k + (int) Min(meta.dead_slots, (uint64) cuvs_k);
 
-    if (request.tail == request.folded)
+    if (request.tail == request.folded && request.folded == 0)
     {
         ss->page_results = palloc(k * sizeof(*ss->page_results));
         rc = cuvs_ipc_search_pages(cuvs_socket_path, MyDatabaseId, RelationGetRelid(index),
@@ -5291,14 +5311,17 @@ page_start_search(IndexScanDesc scan, CuvsScanState *ss)
     }
     else
     {
-        CuvsPageOverlayRequest overlay = {.base = request, .boot_id = (uint64) PgStartTime,
+        CuvsPageOverlayRequest overlay = {.base = request, .boot_id = cuvs_cagra_pg_boot_id(),
                                           .from = request.folded};
         CuvsPageSupplement supplement = {0};
         CuvsPageProgress progress;
         CuvsPageOverlayResult *results;
         int count;
 
-        if (!cuvs_cagra_local_supplement(index, scan->heapRelation, scan->xs_snapshot,
+        /* A folded generation carries its PG life even with no pending
+         * suffix, so the daemon can recognize it before the worker's ACK. */
+        if (request.tail != request.folded &&
+            !cuvs_cagra_local_supplement(index, scan->heapRelation, scan->xs_snapshot,
                                          &meta, ss->page_blocks, overlay.from, request.tail,
                                          &supplement))
             return false;
@@ -5306,7 +5329,8 @@ page_start_search(IndexScanDesc scan, CuvsScanState *ss)
         rc = cuvs_ipc_search_page_overlay(cuvs_socket_path, MyDatabaseId, RelationGetRelid(index),
                                           &overlay, query->x, 1, query->dim, k, meta.metric,
                                           cuvs_itopk_size, cuvs_search_width, cuvs_cpu_hnsw_fallback,
-                                          cuvs_search_mode, cuvs_bf_precision, &supplement,
+                                          cuvs_search_mode, cuvs_bf_precision,
+                                          supplement.positions ? &supplement : NULL,
                                           results, &count, &latency, &progress);
         cuvs_cagra_free_supplement(&supplement);
         if (rc == CUVS_STATUS_OK)
