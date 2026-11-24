@@ -543,6 +543,159 @@ def page_slot_keys(cluster, index):
     return db, oid, sysid, *struct.unpack_from("=QQQQ", bytes.fromhex(raw), 48)
 
 
+FOLD_PREPARE_SQL = """
+    CREATE FUNCTION pg_temp.prepare_fold(regclass,integer,integer) RETURNS text
+    AS '$libdir/pg_cuvs','cuvs_test_fold_prepare' LANGUAGE C STRICT VOLATILE PARALLEL UNSAFE;
+"""
+
+FOLD_PUBLISH_SQL = """
+    CREATE FUNCTION pg_temp.publish_fold(regclass,integer,boolean) RETURNS text
+    AS '$libdir/pg_cuvs','cuvs_test_fold_publish' LANGUAGE C STRICT VOLATILE PARALLEL UNSAFE;
+"""
+
+
+def fold_query(cluster, db, label, sql):
+    cluster.sql(db, label, "-qAt", "-c", sql)
+    return (cluster.logs / f"{cluster.data.parent.name}-{label}.log").read_text().splitlines()[-1]
+
+
+def check_fold_prepare_fcl_release(cluster, db):
+    for mode, expected in ((0, "prepared "), (2, "discard")):
+        with subprocess.Popen(["psql", "-XqAt", "-v", "ON_ERROR_STOP=1", "-d", db],
+                              stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                              env=cluster.env, text=True) as backend:
+            try:
+                backend.stdin.write(FOLD_PREPARE_SQL + "BEGIN;\n" +
+                    f"SELECT pg_temp.prepare_fold('fold_prepare_idx',3,{mode});\n")
+                backend.stdin.flush()
+                if not select.select([backend.stdout], [], [], 10)[0]:
+                    raise RuntimeError(f"fold preparation mode {mode} did not return")
+                first = backend.stdout.readline().strip()
+                if not first.startswith(expected):
+                    raise RuntimeError(f"fold preparation mode {mode} returned {first!r}")
+                second = fold_query(cluster, db, f"fold-fcl-release-{mode}", FOLD_PREPARE_SQL +
+                    "SELECT pg_temp.prepare_fold('fold_prepare_idx',3,0);")
+                if not second.startswith("prepared "):
+                    raise RuntimeError(f"fold preparation mode {mode} retained the FCL: {second}")
+            finally:
+                backend.stdin.close()
+                try:
+                    backend.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    backend.kill()
+                    backend.wait(timeout=5)
+
+
+def setup_fold_publish(cluster, db):
+    cluster.sql(db, "fold-publish-setup", "-c", """
+        CREATE EXTENSION vector;
+        CREATE EXTENSION pg_cuvs;
+        CREATE EXTENSION pageinspect;
+        CREATE TABLE fold_pub(id integer PRIMARY KEY, v vector(3));
+        INSERT INTO fold_pub SELECT i, ARRAY[i::real,0,0]::vector FROM generate_series(1,1356) i;
+        CREATE INDEX fold_pub_idx ON fold_pub USING cagra(v vector_l2_ops);
+        INSERT INTO fold_pub VALUES (2001,'[1,0,0]'), (2002,'[2,0,0]'),
+                                    (2003,'[3,0,0]'), (2004,'[4,0,0]');
+        DELETE FROM fold_pub WHERE id=2002;
+    """, "-c", "VACUUM (INDEX_CLEANUP ON, TRUNCATE OFF) fold_pub;")
+
+
+def fold_raw_page(cluster, db, block, index="fold_pub_idx"):
+    return bytes.fromhex(fold_query(cluster, db, f"{index}-block-{block}",
+        f"SELECT encode(get_raw_page('{index}',{block}),'hex');"))
+
+
+def check_fold_published_pages(cluster, db, before, transition_lsn):
+    meta = fold_raw_page(cluster, db, 0)
+    first = fold_raw_page(cluster, db, 1)
+    second = fold_raw_page(cluster, db, 2)
+    log_block, = struct.unpack_from("=I", meta, 124)
+    log = fold_raw_page(cluster, db, log_block)
+    n_slots, folded, base_slots, _, dead_slots = struct.unpack_from("=5Q", meta, 72)
+    if meta[48:64] != before[48:64] or meta[64:72] == before[64:72]:
+        raise RuntimeError("fold modified its base identity or retained the old graph identity")
+    if (n_slots, folded, base_slots, dead_slots) != (1359, 3, 1356, 1):
+        raise RuntimeError(f"invalid post-fold counts: {(n_slots, folded, base_slots, dead_slots)}")
+    if log[48:72] != meta[64:88] or struct.unpack_from("=I", log, 8180)[0] != 2:
+        raise RuntimeError("fold log and metapage disagree")
+    if [struct.unpack_from("=H", page, 8172)[0] for page in (first, second)] != [0, 1]:
+        raise RuntimeError("partial and staged TID page dead counts disagree")
+    if transition_lsn is not None:
+        page_lsns = [struct.unpack_from("=II", page) for page in (meta, first, log)]
+        if page_lsns != [transition_lsn] * 3:
+            raise RuntimeError(f"metadata, partial TID and fold log used different WAL: {page_lsns}")
+
+    rows = fold_query(cluster, db, "fold-publish-live", """
+        SELECT string_agg(ctid::text, ' ' ORDER BY id) FROM fold_pub WHERE id IN (2001,2003,2004);
+    """).split()
+    slots = []
+    for page, offset in ((first, 1356), (second, 0), (second, 1)):
+        hi, low, item = struct.unpack_from("=3H", page, 24 + offset * 6)
+        slots.append(f"({(hi << 16) | low},{item})" if item else None)
+    if slots != [rows[0], None, rows[1]]:
+        raise RuntimeError(f"fold changed slot order or lost a dead position: {slots}")
+    remaining = fold_query(cluster, db, "fold-publish-suffix", FOLD_PREPARE_SQL +
+        "SELECT pg_temp.prepare_fold('fold_pub_idx',1,0);")
+    if remaining != f"prepared {rows[2]}":
+        raise RuntimeError(f"fold changed the pending suffix: {remaining}")
+    return meta, first, second, log
+
+
+def check_fold_publish(cluster, db):
+    setup_fold_publish(cluster, db)
+    before = fold_raw_page(cluster, db, 0)
+    cluster.sql(db, "fold-publish-worker-gate", "-qAt", "-c", FOLD_PUBLISH_SQL +
+        "SELECT pg_temp.publish_fold('fold_pub_idx',3,true);",
+        expect=["CAGRA fold publication requires a standalone background worker operation"])
+    if fold_raw_page(cluster, db, 0) != before:
+        raise RuntimeError("a user SQL call published the fold")
+    result = fold_query(cluster, db, "fold-publish", FOLD_PUBLISH_SQL + """
+        BEGIN;
+        SELECT pg_temp.publish_fold('fold_pub_idx',3,false);
+        ROLLBACK;
+    """)
+    status, lsn = result.split()
+    if status != "published":
+        raise RuntimeError(f"synthetic fold failed: {result}")
+    transition_lsn = tuple(int(word, 16) for word in lsn.split("/"))
+    pages = check_fold_published_pages(cluster, db, before, transition_lsn)
+    cluster.stop(mode="immediate")
+    cluster.start(label="fold-publish-restart")
+    if check_fold_published_pages(cluster, db, before, transition_lsn) != pages:
+        raise RuntimeError("fold publication changed during immediate restart")
+    cluster.sql(db, "fold-publish-vacuum", "-c", "DELETE FROM fold_pub WHERE id=2003;",
+        "-c", "VACUUM (INDEX_CLEANUP ON, TRUNCATE OFF) fold_pub;")
+    if struct.unpack_from("=Q", fold_raw_page(cluster, db, 0), 104)[0] != 2:
+        raise RuntimeError("VACUUM did not invalidate the folded TID")
+    print("Fold publication, flush, immediate restart and VACUUM: PASS", flush=True)
+
+
+def check_fold_extent_reuse(cluster, db):
+    cluster.sql(db, "fold-extent-setup", "-c", """
+        CREATE TABLE fold_extent(id integer PRIMARY KEY, v vector(3));
+        INSERT INTO fold_extent SELECT i, ARRAY[i::real,0,0]::vector FROM generate_series(1,86847) i;
+        CREATE INDEX fold_extent_idx ON fold_extent USING cagra(v vector_l2_ops);
+        INSERT INTO fold_extent
+        SELECT i, ARRAY[i::real,0,0]::vector FROM generate_series(100001,101359) i;
+    """)
+    for count in (2, 1357):
+        result = fold_query(cluster, db, f"fold-extent-publish-{count}", FOLD_PUBLISH_SQL +
+            f"SELECT pg_temp.publish_fold('fold_extent_idx',{count},false);")
+        if not result.startswith("published "):
+            raise RuntimeError(f"fold of {count} positions failed: {result}")
+    meta = fold_raw_page(cluster, db, 0, "fold_extent_idx")
+    extent_count, = struct.unpack_from("=I", meta, 132)
+    second_extent, = struct.unpack_from("=I", meta, 164)
+    next_page = fold_raw_page(cluster, db, second_extent + 1, "fold_extent_idx")
+    if extent_count != 2 or struct.unpack_from("=Q", next_page, 8184)[0] != 88205:
+        raise RuntimeError("the second fold did not use the next page of the existing extent")
+    last_page = fold_raw_page(cluster, db, second_extent + 63, "fold_extent_idx")
+    if struct.unpack_from("=II", last_page) == (0, 0):
+        raise RuntimeError("WAL did not reserve the full extent on a fresh standby")
+    cluster.sql(db, "fold-extent-vacuum", "-c", "VACUUM (INDEX_CLEANUP ON, TRUNCATE OFF) fold_extent;")
+    print("Fold extent rollover and reuse: PASS", flush=True)
+
+
 def check_slots(cluster, source):
     cluster.sql("beta1a", "pageinspect", "-c", "CREATE EXTENSION pageinspect;")
     binary = source / "slots-test"
@@ -845,10 +998,15 @@ def run(work, logs):
     with cluster.daemon(source_on / "pg_cuvs_server", "on", overlay_host_bytes=4 * 1024**3) as daemon:
         cluster.start()
         try:
-            for case in ("alpha1", "alpha2_basic", "truncate", "relcache", "beta1a", "beta1b_expression"):
+            for case in ("alpha1", "alpha2_basic", "truncate", "relcache", "beta1a",
+                         "beta1b_expression", "beta3a_fold_prepare"):
                 cluster.run("createdb", [case], f"createdb-{case}")
                 cluster.file(case, case)
                 print(f"{case}: PASS", flush=True)
+            check_fold_prepare_fcl_release(cluster, "beta3a_fold_prepare")
+            cluster.run("createdb", ["beta3a_fold_publish"], "createdb-beta3a-fold-publish")
+            check_fold_publish(cluster, "beta3a_fold_publish")
+            check_fold_extent_reuse(cluster, "beta3a_fold_publish")
             check_slots(cluster, source_on)
             cluster.file("postgres", "pending_overlay_scan")
             cluster.file("beta1a", "beta1a_rollback")
@@ -994,6 +1152,11 @@ def run_slots_only(work, logs):
             cluster.file("beta1a", "beta1a")
             check_slots(cluster, source)
             cluster.file("postgres", "pending_overlay_scan")
+            cluster.run("createdb", ["beta3a_fold_prepare"], "createdb-beta3a-fold-prepare")
+            cluster.file("beta3a_fold_prepare", "beta3a_fold_prepare")
+            check_fold_prepare_fcl_release(cluster, "beta3a_fold_prepare")
+            cluster.run("createdb", ["beta3a_fold_publish"], "createdb-beta3a-fold-publish")
+            check_fold_publish(cluster, "beta3a_fold_publish")
         finally:
             cluster.stop()
     check_overlay_budget(Cluster(work / "budget", bindir, logs), source)

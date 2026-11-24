@@ -2,6 +2,7 @@
 #define CUVS_CAGRA_PAGES_H
 
 #include "access/amapi.h"
+#include "access/xlogdefs.h"
 #include "storage/bufmgr.h"
 #include "utils/rel.h"
 
@@ -84,6 +85,42 @@ typedef struct CuvsCagraPendingLocation
 bool cuvs_cagra_copy_pending(Relation index, const CuvsCagraMeta *meta,
                              BlockNumber nblocks, uint64 from, uint64 upto,
                              CuvsCagraPendingLocation *locations, float *vectors);
+
+/* Local PG storage input. The caller has already authenticated the worker's
+ * database, relation and postmaster lifetime before preparing this candidate. */
+typedef struct CuvsCagraFoldCandidate
+{
+    uint64 index_nonce;
+    uint64 base_nonce;
+    uint64 parent_graph_nonce;
+    uint64 parent_n_slots;
+    uint64 parent_folded;
+    uint64 graph_nonce;
+    uint32 positions;
+} CuvsCagraFoldCandidate;
+
+typedef enum CuvsCagraFoldStatus
+{
+    CUVS_CAGRA_FOLD_PREPARED,
+    CUVS_CAGRA_FOLD_PUBLISHED,
+    CUVS_CAGRA_FOLD_DEFERRED,
+    CUVS_CAGRA_FOLD_DISCARD
+} CuvsCagraFoldStatus;
+
+/* Caller holds the relation lock and supplies storage for candidate->positions
+ * entries. A successful preparation retains the exclusive FCL (page lock 0).
+ * Use the copied positions only under that lock. Failure retains no FCL.
+ * Preparation does not change any published page. */
+CuvsCagraFoldStatus cuvs_cagra_prepare_fold(Relation index,
+                        const CuvsCagraFoldCandidate *candidate,
+                        CuvsCagraMeta *base, CuvsCagraPendingLocation *locations);
+
+/* Standalone writable background worker operation on a WAL-logged index. The
+ * caller holds RowExclusiveLock and has verified the candidate's origin and PG life.
+ * PUBLISHED returns a flushed physical transition LSN and no FCL. That is
+ * the first point at which the caller may send FOLD_COMMITTED. */
+CuvsCagraFoldStatus cuvs_cagra_publish_fold(Relation index,
+                        const CuvsCagraFoldCandidate *candidate, XLogRecPtr *commit_lsn);
 CuvsCagraSlotResult cuvs_cagra_pending_tid(Relation index, const CuvsCagraMeta *meta,
                                          BlockNumber nblocks, BlockNumber block,
                                          uint64 position, ItemPointer tid);
