@@ -13,6 +13,7 @@ cuvs_page_overlay_copy(const CuvsPageOverlayRequest *request, const void *payloa
     if (!chunk)
         return NULL;
     chunk->next = NULL;
+    chunk->refs = 1;
     chunk->from = request->from;
     chunk->positions = request->positions;
     memcpy(chunk->marks, payload, bytes);
@@ -36,9 +37,16 @@ invalid:
 }
 
 void
-cuvs_page_overlay_free(CuvsPageOverlayChunk *chunk)
+cuvs_page_overlay_retain(CuvsPageOverlayChunk *chunk)
 {
-    while (chunk)
+    if (chunk)
+        __atomic_fetch_add(&chunk->refs, 1, __ATOMIC_RELAXED);
+}
+
+void
+cuvs_page_overlay_release(CuvsPageOverlayChunk *chunk)
+{
+    while (chunk && __atomic_fetch_sub(&chunk->refs, 1, __ATOMIC_ACQ_REL) == 1)
     {
         CuvsPageOverlayChunk *next = chunk->next;
 
@@ -55,7 +63,8 @@ cuvs_page_overlay_start_boot(CuvsPageOverlay *overlay, uint64_t boot_id, uint64_
     if (boot_id == overlay->boot_id)
         return NULL;
     previous = overlay->head;
-    *overlay = (CuvsPageOverlay) {.boot_id = boot_id, .covered_upto = folded};
+    *overlay = (CuvsPageOverlay) {.boot_id = boot_id, .generation = overlay->generation + 1,
+                                  .covered_upto = folded};
     return previous;
 }
 
@@ -71,11 +80,10 @@ cuvs_page_overlay_supply(CuvsPageOverlay *overlay, const CuvsPageOverlayRequest 
     if (request->from != overlay->covered_upto)
         return CUVS_STATUS_PAGE_NEED;
 
-    if (overlay->tail)
-        overlay->tail->next = *chunk;
-    else
-        overlay->head = *chunk;
-    overlay->tail = *chunk;
+    /* Move the registry's prefix reference into the new chunk. A reader
+     * that retained the former head can still walk exactly its own prefix. */
+    (*chunk)->next = overlay->head;
+    overlay->head = *chunk;
     overlay->covered_upto = request->base.tail;
     *chunk = NULL;
     return CUVS_STATUS_OK;

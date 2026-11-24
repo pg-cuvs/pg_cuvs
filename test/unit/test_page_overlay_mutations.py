@@ -16,6 +16,14 @@ MUTATIONS = {
         "if (boot_id == overlay->boot_id)",
         "if (overlay->boot_id != 0)",
     ),
+    "reuse the boot generation": (
+        ".generation = overlay->generation + 1",
+        ".generation = overlay->generation",
+    ),
+    "drop the search's prefix reference": (
+        "__atomic_fetch_add(&chunk->refs, 1, __ATOMIC_RELAXED);",
+        "(void) chunk;",
+    ),
 }
 
 with tempfile.TemporaryDirectory(prefix="pgcuvs-overlay-test-") as path:

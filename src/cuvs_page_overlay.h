@@ -7,7 +7,10 @@
 
 typedef struct CuvsPageOverlayChunk
 {
+    /* An immutable link to the older prefix once this chunk is published. */
     struct CuvsPageOverlayChunk *next;
+    struct CuvsPageOverlayChunk *retired_next;
+    size_t refs;
     uint64_t from;
     uint32_t positions;
     CuvsPagePosition marks[];
@@ -16,14 +19,17 @@ typedef struct CuvsPageOverlayChunk
 typedef struct CuvsPageOverlay
 {
     uint64_t boot_id;
+    uint64_t generation;
     uint64_t covered_upto;
     CuvsPageOverlayChunk *head;
-    CuvsPageOverlayChunk *tail;
 } CuvsPageOverlay;
 
 CuvsPageOverlayChunk *cuvs_page_overlay_copy(const CuvsPageOverlayRequest *request,
                                              const void *payload, size_t bytes, bool shared);
-void cuvs_page_overlay_free(CuvsPageOverlayChunk *chunk);
+/* Retain while already owning a reference or while holding the registry lock.
+ * Release can free a chain and must run outside the registry lock. */
+void cuvs_page_overlay_retain(CuvsPageOverlayChunk *chunk);
+void cuvs_page_overlay_release(CuvsPageOverlayChunk *chunk);
 /* These operations run under the graph registry lock. */
 CuvsPageOverlayChunk *cuvs_page_overlay_start_boot(CuvsPageOverlay *overlay, uint64_t boot_id,
                                                    uint64_t folded);

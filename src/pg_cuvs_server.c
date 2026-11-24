@@ -390,6 +390,21 @@ static uint64_t g_page_access;
 static uint64_t g_page_daemon_id;
 static pthread_once_t g_page_daemon_once = PTHREAD_ONCE_INIT;
 static size_t g_page_graph_bytes[CUVS_MAX_GPUS];
+static _Thread_local CuvsPageOverlayChunk *g_retired_page_overlays;
+
+/* A graph removal only detaches its overlay under the registry lock. The
+ * connection or worker drains these references after leaving the registry. */
+static void
+release_retired_page_overlays(void)
+{
+    while (g_retired_page_overlays)
+    {
+        CuvsPageOverlayChunk *head = g_retired_page_overlays;
+
+        g_retired_page_overlays = head->retired_next;
+        cuvs_page_overlay_release(head);
+    }
+}
 
 /* These helpers run under the registry lock. The disk directories outlive
  * residency and are reconciled against the committed catalog separately. */
@@ -402,7 +417,11 @@ dispose_page_graph(PageCagraGraph *entry)
             cuvs_bf_free(entry->bf[precision], entry->gpu);
     if (entry->cpu_hnsw) cuvs_hnsw_free(entry->cpu_hnsw);
     cuvs_cagra_free(entry->handle, entry->gpu);
-    cuvs_page_overlay_free(entry->overlay.head);
+    if (entry->overlay.head)
+    {
+        entry->overlay.head->retired_next = g_retired_page_overlays;
+        g_retired_page_overlays = entry->overlay.head;
+    }
     free(entry);
 }
 
@@ -937,6 +956,7 @@ warmup_worker_thread(void *arg)
             if (target_ce)
                 target_ce->warmup_state = WARMUP_FAILED;
             pthread_mutex_unlock(&g_index_mutex);
+            release_retired_page_overlays();
             continue;
         }
 
@@ -974,6 +994,7 @@ warmup_worker_thread(void *arg)
         }
 
         pthread_mutex_unlock(&g_index_mutex);
+        release_retired_page_overlays();
 
         /* Clean up stale delta/tombstone sidecars from a previous generation. */
         {
@@ -7971,6 +7992,7 @@ handle_build(int client_fd, const CuvsCmdFrame *cmd)
                   cmd->db_oid, cmd->index_oid);
     log_admit(&al, CUVS_ADMISSION_NONE);
     pthread_mutex_unlock(&g_index_mutex);
+    release_retired_page_overlays();
 
     LOG_DEBUG("[handle_build] calling cuvs_cagra_build n_vecs=%lld dim=%u gpu=%d...\n",
             (long long)cmd->n_vecs, cmd->dim, target_gpu);
@@ -12669,6 +12691,7 @@ reclaim_thread(void *arg)
             for (int i = 0; i < n_usable_gpus(); i++)
                 reclaim_gpu(usable_gpu(i), now);
         pthread_mutex_unlock(&g_index_mutex);
+        release_retired_page_overlays();
         /* UC-1 4c: written every tick whatever the mode (CK-24). */
         if (g_reclaim.usage_file)
             usage_stats_write();
@@ -12932,8 +12955,8 @@ handle_page_supply(int client_fd, const CuvsCmdFrame *cmd)
     pthread_mutex_unlock(&g_index_mutex);
 
 done:
-    cuvs_page_overlay_free(chunk);
-    cuvs_page_overlay_free(obsolete);
+    cuvs_page_overlay_release(chunk);
+    cuvs_page_overlay_release(obsolete);
     (void) send_page_overlay_reply(client_fd, &reply, &progress);
 }
 
@@ -12944,13 +12967,18 @@ handle_page_overlay_search(int client_fd, const CuvsCmdFrame *cmd)
     CuvsReplyHeader reply = {0};
     CuvsPageProgress progress = {0};
     CuvsPageOverlayChunk *supplement = NULL, *obsolete = NULL;
+    CuvsPageOverlayChunk *snapshot = NULL;
     CuvsSearchResult *raw = NULL;
     CuvsPageOverlayResult *results = NULL;
     void *query = MAP_FAILED;
     size_t bytes = 0;
     bool batch = cmd->op == CUVS_OP_SEARCH_PAGE_OVERLAY_BATCH;
+    bool normalize_hnsw_ip = false;
     uint32_t prefix = batch ? 2 * sizeof(uint32_t) : 0;
     uint64_t started;
+    uint64_t registered_order = 0, generation = 0;
+    int k = 0;
+    const float *vectors;
     PageCagraGraph *graph;
 
     reply.status = receive_page_overlay(client_fd, cmd, &request);
@@ -12973,6 +13001,7 @@ handle_page_overlay_search(int client_fd, const CuvsCmdFrame *cmd)
         (batch && (((const uint32_t *) query)[0] != (uint32_t) cmd->n_vecs ||
                    ((const uint32_t *) query)[1] != cmd->dim)))
         goto done;
+    vectors = (const float *) ((const char *) query + prefix);
     raw = malloc((size_t) cmd->n_vecs * cmd->k * sizeof(*raw));
     results = calloc((size_t) cmd->n_vecs * cmd->k, sizeof(*results));
     if (!raw || !results)
@@ -13004,8 +13033,7 @@ handle_page_overlay_search(int client_fd, const CuvsCmdFrame *cmd)
         goto unlock;
     }
 
-    int k = (int) (graph->n_slots < cmd->k ? graph->n_slots : cmd->k);
-    const float *vectors = (const float *) ((const char *) query + prefix);
+    k = (int) (graph->n_slots < cmd->k ? graph->n_slots : cmd->k);
     if (page_graph_search(graph, cmd, vectors, (int) cmd->n_vecs, k, NULL, raw) != 0)
     {
         reply.status = CUVS_STATUS_OOM_FALLBACK;
@@ -13016,6 +13044,28 @@ handle_page_overlay_search(int client_fd, const CuvsCmdFrame *cmd)
     graph->last_search = time(NULL);
     if (graph->hits < UINT32_MAX)
         ++graph->hits;
+
+    registered_order = graph->registered_order;
+    generation = graph->overlay.generation;
+    normalize_hnsw_ip = cmd->metric == CUVS_METRIC_IP && cmd->search_mode == 0 &&
+                       cmd->use_cpu_hnsw && graph->cpu_hnsw;
+    if (request.from > request.base.folded)
+    {
+        snapshot = graph->overlay.head;
+        cuvs_page_overlay_retain(snapshot);
+    }
+    reply.status = CUVS_STATUS_OK;
+unlock:
+    pthread_mutex_unlock(&g_index_mutex);
+    cuvs_page_overlay_release(obsolete);
+    if (reply.status != CUVS_STATUS_OK)
+        goto timed;
+
+    /* Only the copied base results and an immutable overlay prefix are used
+     * below. Concurrent appends leave this search's covered range intact. */
+    const CuvsPageOverlayChunk *first = snapshot;
+    while (first && first->from >= request.from)
+        first = first->next;
     for (int q = 0; q < (int) cmd->n_vecs; ++q)
     {
         int written = 0;
@@ -13025,15 +13075,14 @@ handle_page_overlay_search(int client_fd, const CuvsCmdFrame *cmd)
         for (int i = 0; i < k; ++i)
         {
             const CuvsSearchResult *candidate = &raw[(size_t) q * k + i];
-            if (candidate->item_id >= 0 && (uint64_t) candidate->item_id < graph->n_slots)
+            if (candidate->item_id >= 0 && (uint64_t) candidate->item_id < request.base.n_slots)
             {
                 float distance = candidate->distance;
 
                 /* HNSW IP returns 1-dot; overlay and CAGRA IP use raw dot.
                  * This conversion belongs to the new merge path only: the
                  * base-only page reply keeps its existing HNSW distance. */
-                if (cmd->metric == CUVS_METRIC_IP && cmd->search_mode == 0 &&
-                    cmd->use_cpu_hnsw && graph->cpu_hnsw)
+                if (normalize_hnsw_ip)
                     distance = 1.0f - distance;
                 if (!isfinite(distance))
                     continue;
@@ -13041,8 +13090,7 @@ handle_page_overlay_search(int client_fd, const CuvsCmdFrame *cmd)
                 row[written++].distance = distance;
             }
         }
-        for (const CuvsPageOverlayChunk *chunk = graph->overlay.head;
-             chunk && chunk->from < request.from; chunk = chunk->next)
+        for (const CuvsPageOverlayChunk *chunk = first; chunk; chunk = chunk->next)
             cuvs_page_overlay_score(chunk, request.from, &request.base, vector, cmd, row, &written);
         cuvs_page_overlay_score(supplement, request.base.tail, &request.base, vector, cmd, row, &written);
         if (batch)
@@ -13050,16 +13098,24 @@ handle_page_overlay_search(int client_fd, const CuvsCmdFrame *cmd)
                 row[written++].slot = CUVS_PAGE_SLOT_INVALID;
         reply.n_results += written;
     }
-    reply.status = CUVS_STATUS_OK;
-unlock:
+    pthread_mutex_lock(&g_index_mutex);
+    graph = find_page_graph(cmd, &request.base);
+    if (!graph || graph->registered_order != registered_order ||
+        graph->overlay.generation != generation)
+    {
+        reply.status = CUVS_STATUS_NOT_FOUND;
+        reply.n_results = 0;
+    }
     pthread_mutex_unlock(&g_index_mutex);
+
+timed:
     reply.latency_us = (uint32_t) (admission_mono_us() - started);
 done:
     if (query != MAP_FAILED)
         munmap(query, bytes);
     free(raw);
-    cuvs_page_overlay_free(supplement);
-    cuvs_page_overlay_free(obsolete);
+    cuvs_page_overlay_release(supplement);
+    cuvs_page_overlay_release(snapshot);
     if (send_page_overlay_reply(client_fd, &reply, &progress) && reply.n_results)
         (void) send_all(client_fd, results, reply.n_results * sizeof(*results));
     free(results);
@@ -13323,6 +13379,7 @@ connection_thread(void *arg)
             break;
     }
 
+    release_retired_page_overlays();
     close(client_fd);
     return NULL;
 }
@@ -13624,6 +13681,7 @@ batch_process_locked(void)
             cagra_batch_run_group(batch, gid, n, g);
         else
             bf_batch_run_group(batch, gid, n, g);
+        release_retired_page_overlays();
     }
 
     pthread_mutex_lock(&g_batch_mtx);
