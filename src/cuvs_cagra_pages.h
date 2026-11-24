@@ -19,6 +19,7 @@ typedef struct CuvsCagraRelCache
     uint64      index_nonce;
     BlockNumber tail;
     int         dim;
+    bool        pending_vectors;
 #endif
 } CuvsCagraRelCache;
 
@@ -32,6 +33,7 @@ void cuvs_cagra_require_legacy(Relation index);
 #define CUVS_CAGRA_PAGE_DIR 1950
 #define CUVS_CAGRA_TIDS_PER_PAGE 1357
 #define CUVS_CAGRA_PENDING_PER_PAGE 1356
+#define CUVS_CAGRA_PENDING_VECTOR 2U
 
 typedef struct CuvsCagraMeta
 {
@@ -73,6 +75,15 @@ typedef enum CuvsCagraSlotResult
 
 bool cuvs_cagra_read_tail(Relation index, const CuvsCagraMeta *meta,
                           BlockNumber nblocks, uint64 *tail);
+typedef struct CuvsCagraPendingLocation
+{
+    BlockNumber block;
+    ItemPointerData tid;
+} CuvsCagraPendingLocation;
+
+bool cuvs_cagra_copy_pending(Relation index, const CuvsCagraMeta *meta,
+                             BlockNumber nblocks, uint64 from, uint64 upto,
+                             CuvsCagraPendingLocation *locations, float *vectors);
 CuvsCagraSlotResult cuvs_cagra_slot_tid(Relation index, const CuvsCagraMeta *meta,
                                       BlockNumber nblocks, uint64 slot, ItemPointer tid);
 bool cuvs_cagra_slot_filter(Relation index, const CuvsCagraMeta *meta,
@@ -80,8 +91,10 @@ bool cuvs_cagra_slot_filter(Relation index, const CuvsCagraMeta *meta,
                             uint32 *excluded);
 void cuvs_cagra_init_pages(Relation index, ForkNumber fork, uint64 index_nonce,
                           uint64 graph_nonce, int dim, uint32 metric,
-                          const uint64 *tids, int64 n);
-void cuvs_cagra_append_pending(Relation index, ItemPointer tid, int dim);
+                          const uint64 *tids, int64 n, bool pending_vectors);
+bool cuvs_cagra_can_store_pending_vector(int dim);
+void cuvs_cagra_append_pending(Relation index, ItemPointer tid, int dim,
+                               const float *vector);
 void cuvs_cagra_check_dim(int expected, int actual);
 void cuvs_cagra_check_query_dim(Relation index, int dim);
 IndexBulkDeleteResult *cuvs_cagra_page_bulkdelete(IndexVacuumInfo *info,

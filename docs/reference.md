@@ -496,6 +496,16 @@ cagra/ivfpq") rather than silently failing.
 | `build_algo` | enum | `auto` | `auto`, `ivf_pq`, `nn_descent` | CAGRA build algorithm. The IVF-PQ kNN search (`ivf_pq`, or `auto` when cuVS picks IVF-PQ) uses fp32 LUT, internal and coarse distances when 4 x max\|x\|^2 of the corpus (max\|x\|^2 for inner product and cosine) reaches 65504, the fp16 maximum; otherwise cuVS's fp16 defaults stay. The daemon logs `[cuvs_cagra_build_multi] knn precision` with the bound and the choice. Compaction (`pg_cuvs_compact`, VACUUM) rebuilds the kept rows with cuVS's `auto` choice under the same rule and logs `[cuvs_cagra_compact] knn precision` |
 | `index_dir` | string | (uses `cuvs.index_dir`) | path | Per-index artifact directory (ADR-045); self-describes in `reloptions` so no-GUC sessions still find it |
 
+**Experimental page format (`CUVS_PAGE_FORMAT=1`).** An expression CAGRA index
+uses page storage only when its result type declares `vector(n)` with
+`1 ≤ n ≤ 2030`; an expression without a declared dimension or above that limit
+uses legacy storage, regardless of table contents, TRUNCATE, or REINDEX. Pending
+page records hold the vector evaluated by PostgreSQL. After a future fold moves
+those records into TID slots, graph recovery must reevaluate the expression. If
+that evaluation fails, recovery must leave searches on the exact heap path;
+GPU search can remain unavailable until the row is removed or the index is
+rebuilt. This fold/recovery path is not implemented in this slice.
+
 ### `ivfpq`
 
 | Reloption | Type | Default | Range | Notes |
