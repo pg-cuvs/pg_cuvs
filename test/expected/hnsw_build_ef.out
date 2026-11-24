@@ -18,8 +18,11 @@ CREATE FUNCTION pg_temp.hef_meta(idx text) RETURNS integer LANGUAGE sql AS $$
     SELECT get_byte(p, 38) + 256 * get_byte(p, 39) FROM (SELECT get_raw_page(idx, 0) AS p) raw
     WHERE get_byte(p, 24) = 83 AND get_byte(p, 25) = 169 AND get_byte(p, 26) = 83 AND get_byte(p, 27) = 169;
 $$;
+SET client_min_messages = notice;
 CREATE INDEX hef_ivf ON hef USING pg_cuvs_hnsw (v vector_l2_ops)
     WITH (m = 32, ef_construction = 1000, build_algo = 'ivf_pq');
+NOTICE:  pg_cuvs: HNSW intermediate graph degree capped at 1024 (requested 2000)
+SET client_min_messages = warning;
 SELECT pg_temp.hef_meta('hef_ivf');
 1000
 SELECT pg_cuvs_hnsw_build_info('hef_ivf') ->> 'intermediate_degree';
