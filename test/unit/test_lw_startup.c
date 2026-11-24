@@ -121,11 +121,20 @@ require_start(Run *r, int tag, const char *const *flags, int flag_count)
 }
 
 static int
-pid_adj(pid_t pid)
+pid_adj(Run *r)
 {
     char path[64];
-    snprintf(path, sizeof(path), "/proc/%d/oom_score_adj", (int)pid);
-    return read_adj(path);
+    int value;
+
+    snprintf(path, sizeof(path), "/proc/%d/oom_score_adj", (int)r->pid);
+    value = read_adj(path);
+    if (value < -CUVS_OOM_SCORE_ADJ_MAX || value > CUVS_OOM_SCORE_ADJ_MAX)
+    {
+        fprintf(stderr, "cannot read LW fixture OOM score from %s\n", path);
+        stop(r);
+        exit(2);
+    }
+    return value;
 }
 
 static void
@@ -165,7 +174,7 @@ main(int argc, char **argv)
     /* 1. The default raises a low baseline and keeps one at or above it. */
     default_effective = baseline < CUVS_OOM_SCORE_ADJ_DEFAULT ? CUVS_OOM_SCORE_ADJ_DEFAULT : baseline;
     require_start(&r, 1, NULL, 0);
-    CHECK(pid_adj(r.pid) == default_effective);
+    CHECK(pid_adj(&r) == default_effective);
     snprintf(expect, sizeof(expect), baseline < default_effective ? "oom_score_adj=%d applied" :
              "oom_score_adj kept current %d", default_effective);
     snprintf(line, sizeof(line), "managed large_workspace: cagra_build_overflow=%s "
@@ -173,7 +182,14 @@ main(int argc, char **argv)
              cuvs_lw_overflow_name(CUVS_CAGRA_BUILD_OVERFLOW_DEFAULT),
              CUVS_MANAGED_OVERCOMMIT_DEFAULT ? "on" : "off",
              (int)CUVS_MANAGED_LW_MARGIN_PERMILLE_DEFAULT);
-    CHECK(strstr(slurp(r.log), line) != NULL);
+    const char *log = slurp(r.log);
+    if (!*log)
+    {
+        fprintf(stderr, "cannot read LW fixture startup log %s\n", r.log);
+        stop(&r);
+        return 2;
+    }
+    CHECK(strstr(log, line) != NULL);
     CHECK(strstr(slurp(r.log), expect) != NULL);
     CHECK(strstr(slurp(r.log), "build admission model: scratch_permille=") != NULL);
     CHECK(strstr(slurp(r.log), "validated_overflow_policy=managed") != NULL);
@@ -197,7 +213,7 @@ main(int argc, char **argv)
         snprintf(setting, sizeof(setting), "%d", explicit_value);
         snprintf(expect, sizeof(expect), "oom_score_adj=%d applied", explicit_value);
         require_start(&r, 2, flags, 8);
-        CHECK(pid_adj(r.pid) == explicit_value);
+        CHECK(pid_adj(&r) == explicit_value);
         CHECK(strstr(slurp(r.log), "managed large_workspace: cagra_build_overflow=error "
                                    "managed_overcommit=off lw_margin_permille=1300") != NULL);
         CHECK(strstr(slurp(r.log), expect) != NULL);
@@ -208,9 +224,13 @@ main(int argc, char **argv)
 
     /* 3. A higher inherited value is kept, never lowered. */
     kept_value = baseline < 800 ? 800 : baseline;
-    CHECK(set_own_adj(kept_value));
+    if (!set_own_adj(kept_value))
+    {
+        fprintf(stderr, "cannot set the LW fixture OOM score to %d\n", kept_value);
+        return 2;
+    }
     require_start(&r, 3, NULL, 0);
-    CHECK(pid_adj(r.pid) == kept_value);
+    CHECK(pid_adj(&r) == kept_value);
     snprintf(expect, sizeof(expect), "oom_score_adj kept current %d", kept_value);
     CHECK(strstr(slurp(r.log), expect) != NULL);
     expect_status(&r, CUVS_CAGRA_BUILD_OVERFLOW_DEFAULT, CUVS_MANAGED_OVERCOMMIT_DEFAULT,
@@ -222,7 +242,7 @@ main(int argc, char **argv)
     {
         const char *flags[] = {"--oom-score-adj", "0"};
         require_start(&r, 4, flags, 2);
-        CHECK(pid_adj(r.pid) == kept_value);
+        CHECK(pid_adj(&r) == kept_value);
         CHECK(strstr(slurp(r.log), "oom_score_adj not applied: value 0") != NULL);
         stop(&r);
     }

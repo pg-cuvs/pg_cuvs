@@ -6,7 +6,6 @@ the tree (needs pg_config)."""
 from pathlib import Path
 import os
 import shutil
-import signal
 import subprocess
 import sys
 import tempfile
@@ -58,32 +57,43 @@ MUTATIONS = {
 }
 
 
-def test_result(run):
+# These fixtures also assert setup prerequisites. Require the failure emitted by
+# the intended check rather than counting an abort anywhere in the executable.
+EXPECTED_FAILURES = {
+    'client_skips_ace_readback': 'FAIL IPC fixture 17 accepted an invalid reply',
+    'client_skips_policy_validation': 'FAIL IPC fixture 4 accepted an invalid reply',
+    'client_accepts_readback_on_resident': 'FAIL IPC fixture 18 accepted an invalid reply',
+    'meta_pd_lower_not_bumped': 'FAIL ACE metapage extent omits the readback',
+    'meta_read_wrong_offset': 'FAIL ACE metapage readback could not be decoded',
+}
+
+
+def test_result(run, mutant=None):
     output = (run.stdout + run.stderr).strip()
     if run.returncode == 0:
         return 'GREEN', output
-    if run.returncode == -signal.SIGABRT and 'Assertion' in run.stderr:
-        return 'RED', output
-    if run.returncode == 1 and any(line.startswith('FAIL') for line in output.splitlines()):
+    expected = EXPECTED_FAILURES.get(mutant)
+    failures = [line for line in output.splitlines() if line.startswith('FAIL ')]
+    if mutant is not None and run.returncode == 1 and (expected in failures if expected else failures):
         return 'RED', output
     return 'UNEXPECTED-FAIL', output or f'exit {run.returncode}'
 
 
-def run_converter(tree):
+def run_converter(tree, mutant=None):
     built = subprocess.run(['make', '-s', 'test-hnsw-converter-build'],
                            cwd=tree, capture_output=True, text=True, timeout=600)
     if built.returncode:
         return 'BUILD-FAIL', built.stderr.strip()[-400:]
     run = subprocess.run(['./test-hnsw-converter'], cwd=tree, capture_output=True,
                          text=True, timeout=60)
-    return test_result(run)
+    return test_result(run, mutant)
 
 
 def copy_tree(dst):
     shutil.copytree(ROOT, dst, ignore=shutil.ignore_patterns('.git', '.ccache', '*.o', '*.so', 'test-*', 'pg_cuvs_server', '*.bc'))
 
 
-def build_and_run(src, work, test):
+def build_and_run(src, work, test, mutant=None):
     exe = work / test
     if test == 'ace_quality':
         argv = [CC, '-std=gnu11', '-Wall', '-Wextra', '-I', str(src), '-o', str(exe),
@@ -96,7 +106,7 @@ def build_and_run(src, work, test):
     if b.returncode:
         return 'BUILD-FAIL', b.stderr.decode(errors='replace')[-400:]
     r = subprocess.run([str(exe)], capture_output=True, text=True, timeout=60)
-    return test_result(r)
+    return test_result(r, mutant)
 
 
 def main():
@@ -119,7 +129,10 @@ def main():
                 ok = all(s == 'GREEN' for s, _ in states)
                 results.append((name, ok, ' / '.join(s for s, _ in states), states[0][1].strip()))
             else:
-                state, tail = run_converter(tree) if test == 'converter' else build_and_run(src, src.parent, test)
+                if test == 'converter':
+                    state, tail = run_converter(tree, name)
+                else:
+                    state, tail = build_and_run(src, src.parent, test, name)
                 results.append((name, state == 'RED', state, tail.strip().splitlines()[-1] if tail.strip() else ''))
     for name, ok, state, tail in results:
         print('%-38s %-6s %s  %s' % (name, 'OK' if ok else 'WRONG', state, tail[:160]))

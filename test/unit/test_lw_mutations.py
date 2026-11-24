@@ -206,17 +206,28 @@ def run(argv, cwd):
     return q.returncode, text
 
 
-def run_status(rc, output):
+STARTUP_FAILURES = {
+    'oom_apply_call_deleted': 'pid_adj(&r) == explicit_value',
+    'oom_apply_wrong_path': 'pid_adj(&r) == explicit_value',
+    'startup_line_drops_margin': 'strstr(log, line) != NULL',
+}
+
+
+def run_status(rc, output, expected_check=None):
     if rc == 0:
         return 'PASS'
     if rc == 124:
         return 'TIMEOUT'
-    if rc == 1 and any(line.startswith(('FAIL', 'AssertionError')) for line in output.splitlines()):
+    if rc == 1 and any(
+        line.startswith(('FAIL ', 'AssertionError'))
+        and (expected_check is None or line.endswith(' ' + expected_check))
+        for line in output.splitlines()
+    ):
         return 'RED (run)'
     return 'RUN-BROKEN'
 
 
-def build_and_run(tree):
+def build_and_run(tree, startup_check=None):
     """Returns {test: (status, tail)} with status PASS, RED (run) or RED (build)."""
     out = {}
     jobs = {
@@ -261,7 +272,8 @@ def build_and_run(tree):
         argv_run = ['./bin-' + name] + (['./bin-server'] if name == 'startup' else [])
         rc, text = run(argv_run, tree)
         lines = [l for l in text.splitlines() if l.startswith(('FAIL', 'PASS', 'test_lw'))]
-        out[name] = (run_status(rc, text), lines[:1] or text.strip().splitlines()[-1:])
+        expected = startup_check if name == 'startup' else None
+        out[name] = (run_status(rc, text, expected), lines[:1] or text.strip().splitlines()[-1:])
     return out
 
 
@@ -300,7 +312,7 @@ def main(argv):
                 return 1
             text = text.replace(old, new)
         path.write_text(text)
-        res = build_and_run(tree)
+        res = build_and_run(tree, STARTUP_FAILURES.get(name))
         expect_here = {t for t in expect if t in res}
         reds = {t for t, (s, _) in res.items() if s == 'RED (run)'}
         broken = {t for t, (s, _) in res.items() if s in ('BUILD-BROKEN', 'RUN-BROKEN', 'TIMEOUT')}
