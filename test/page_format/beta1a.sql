@@ -137,3 +137,13 @@ END $$;
 RESET enable_seqscan;
 CREATE TABLE g14_pages AS SELECT id,v FROM page_search WHERE id > 0 ORDER BY id;
 CREATE INDEX g14_idx ON g14_pages USING cagra (v vector_l2_ops);
+
+-- The sidecar is required to exercise the CPU HNSW 1-dot distance contract.
+CREATE TABLE page_ip(id int, v vector(8));
+INSERT INTO page_ip
+SELECT i, array_fill((CASE i WHEN 1 THEN 0.9 WHEN 2 THEN 0.45 ELSE 0.1 END)::real,
+                     ARRAY[8])::vector
+FROM generate_series(1,256) AS i;
+SET cuvs.cpu_hnsw_fallback=on;
+CREATE INDEX page_ip_idx ON page_ip USING cagra (v vector_ip_ops);
+RESET cuvs.cpu_hnsw_fallback;

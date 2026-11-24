@@ -531,6 +531,34 @@ cuvs_test_pending_first(PG_FUNCTION_ARGS)
 }
 #endif
 
+CuvsCagraSlotResult
+cuvs_cagra_pending_tid(Relation index, const CuvsCagraMeta *meta, BlockNumber nblocks,
+                       BlockNumber block, uint64 position, ItemPointer tid)
+{
+    Buffer buf;
+    Page page;
+    const CuvsCagraPending *tag;
+    CuvsCagraSlotResult result = CUVS_CAGRA_SLOT_BAD;
+    uint32 vector_dim = pending_vector_dim(meta);
+
+    if (block == 0 || block >= nblocks || position < meta->folded)
+        return result;
+    buf = ReadBuffer(index, block);
+    LockBuffer(buf, BUFFER_LOCK_SHARE);
+    page = BufferGetPage(buf);
+    tag = pending_tag(page, block, meta->index_nonce, vector_dim);
+    if (tag && position >= tag->first_pos && position - tag->first_pos < tag->count)
+    {
+        const char *entry = (char *) PageGetContents(page) +
+            (position - tag->first_pos) * pending_stride(vector_dim);
+
+        memcpy(tid, entry, sizeof(*tid));
+        result = ItemPointerIsValid(tid) ? CUVS_CAGRA_SLOT_LIVE : CUVS_CAGRA_SLOT_DEAD;
+    }
+    UnlockReleaseBuffer(buf);
+    return result;
+}
+
 static bool
 read_slots(Relation index, const CuvsCagraMeta *meta,
                     BlockNumber nblocks, uint64 slot, uint32 count, ItemPointer tids)

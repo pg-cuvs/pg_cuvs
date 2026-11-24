@@ -13,8 +13,24 @@ MUTATIONS = {
         "if (request->from < overlay->covered_upto)",
     ),
     "retain a prior boot": (
-        "if (request->boot_id != overlay->boot_id)",
-        "if (!overlay->boot_id)",
+        "if (boot_id == overlay->boot_id)",
+        "if (overlay->boot_id != 0)",
+    ),
+    "reuse the boot generation": (
+        ".generation = overlay->generation + 1",
+        ".generation = overlay->generation",
+    ),
+    "drop the search's prefix reference": (
+        "__atomic_fetch_add(&chunk->refs, 1, __ATOMIC_RELAXED);",
+        "(void) chunk;",
+    ),
+    "accept a host budget overcommit": (
+        "if (charge > budget->limit - used)",
+        "if (charge > budget->limit)",
+    ),
+    "never return the charge for a released chunk": (
+        "__atomic_fetch_sub(&budget->used, charge, __ATOMIC_RELAXED);\n        chunk = next;",
+        "(void) budget;\n        (void) charge;\n        chunk = next;",
     ),
 }
 

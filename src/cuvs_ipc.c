@@ -709,6 +709,107 @@ shm_write_page_supplement(const char *key, const CuvsPageSupplement *supplement,
     return fd;
 }
 
+static int
+page_overlay_exchange(const char *socket_path, CuvsCmdFrame *cmd, CuvsPageOverlayRequest *frame,
+                      const float *queries, const CuvsPageSupplement *supplement,
+                      CuvsPageOverlayResult *results, int *count, uint32_t *latency_us,
+                      CuvsPageProgress *progress)
+{
+    CuvsReplyHeader reply;
+    int status = CUVS_STATUS_ERROR;
+    int query_fd = -1, supplement_fd = -1, sock = -1;
+    int canceled, waiting;
+
+    *count = 0;
+    *latency_us = 0;
+    memset(progress, 0, sizeof(*progress));
+    if (cmd->dim == 0 || cmd->dim > 65535 || cmd->n_vecs > 1024 || cmd->k > 4000)
+        return status;
+    if (queries)
+    {
+        if (make_shm_key(cmd->shm_key, sizeof(cmd->shm_key)) != 0)
+            goto done;
+        query_fd = cmd->n_vecs > 1 ?
+            shm_write_query_batch(cmd->shm_key, queries, cmd->n_vecs, cmd->dim) :
+            shm_write_query(cmd->shm_key, queries, cmd->dim);
+        if (query_fd < 0)
+            goto done;
+    }
+    frame->base.length = sizeof(*frame);
+    frame->positions = frame->vector_rows = 0;
+    if (supplement)
+    {
+        if (!supplement->positions || supplement->positions > CUVS_PAGE_BATCH_MAX ||
+            supplement->vector_rows > supplement->positions || !supplement->marks ||
+            (supplement->vector_rows && !supplement->vectors) ||
+            make_shm_key(frame->supplement_shm, sizeof(frame->supplement_shm)) != 0)
+            goto done;
+        supplement_fd = shm_write_page_supplement(frame->supplement_shm, supplement, cmd->dim);
+        if (supplement_fd < 0)
+            goto done;
+        frame->positions = supplement->positions;
+        frame->vector_rows = supplement->vector_rows;
+    }
+    sock = uds_connect_wait(socket_path, 30, &canceled);
+    if (sock < 0)
+    {
+        status = canceled ? CUVS_STATUS_CANCELED : CUVS_STATUS_UNAVAILABLE;
+        goto done;
+    }
+    if (send_cmd(sock, cmd) < 0 || send_all(sock, frame, sizeof(*frame)) < 0)
+        goto done;
+    waiting = recv_reply_interruptible(sock, &reply, 30);
+    if (waiting != 0)
+    {
+        if (waiting == 1)
+            status = CUVS_STATUS_CANCELED;
+        goto done;
+    }
+    status = (int) reply.status;
+    if (status == CUVS_STATUS_OK || status == CUVS_STATUS_PAGE_NEED ||
+        status == CUVS_STATUS_PAGE_OVERLAY_FULL || status == CUVS_STATUS_PAGE_OVERLAY_HOST_FULL)
+    {
+        waiting = recv_all_interruptible(sock, progress, sizeof(*progress), 30);
+        if (waiting != 0)
+        {
+            status = waiting == 1 ? CUVS_STATUS_CANCELED : CUVS_STATUS_ERROR;
+            goto done;
+        }
+        if (status == CUVS_STATUS_OK)
+        {
+            if (reply.n_results > cmd->n_vecs * cmd->k)
+            {
+                status = CUVS_STATUS_ERROR;
+                goto done;
+            }
+            waiting = reply.n_results ?
+                recv_all_interruptible(sock, results, reply.n_results * sizeof(*results), 30) : 0;
+            if (waiting != 0)
+                status = waiting == 1 ? CUVS_STATUS_CANCELED : CUVS_STATUS_ERROR;
+            else
+            {
+                *count = (int) reply.n_results;
+                *latency_us = reply.latency_us;
+            }
+        }
+    }
+
+done:
+    if (sock >= 0)
+        close(sock);
+    if (query_fd >= 0)
+    {
+        close(query_fd);
+        shm_unlink(cmd->shm_key);
+    }
+    if (supplement_fd >= 0)
+    {
+        close(supplement_fd);
+        shm_unlink(frame->supplement_shm);
+    }
+    return status;
+}
+
 int
 cuvs_ipc_supply_pages(const char *socket_path, uint32_t db_oid, uint32_t index_oid,
     const CuvsPageOverlayRequest *request, int dim, uint32_t metric,
@@ -717,54 +818,38 @@ cuvs_ipc_supply_pages(const char *socket_path, uint32_t db_oid, uint32_t index_o
     CuvsCmdFrame cmd = {.op = CUVS_OP_SUPPLY_PAGES, .db_oid = db_oid, .index_oid = index_oid,
         .dim = (uint32_t) dim, .metric = metric};
     CuvsPageOverlayRequest frame = *request;
-    CuvsReplyHeader reply;
-    int status = CUVS_STATUS_ERROR;
-    int fd, sock, canceled, waiting;
+    int count;
+    uint32_t latency_us;
 
     if (!progress)
-        return status;
-    memset(progress, 0, sizeof(*progress));
-    if (!supplement || dim < 1 || dim > 65535)
-        return status;
-    if (!supplement->positions || supplement->positions > CUVS_PAGE_BATCH_MAX ||
-        supplement->vector_rows > supplement->positions || !supplement->marks ||
-        (supplement->vector_rows && !supplement->vectors) ||
-        make_shm_key(frame.supplement_shm, sizeof(frame.supplement_shm)) != 0)
-        return status;
-
-    frame.base.length = sizeof(frame);
-    frame.positions = supplement->positions;
-    frame.vector_rows = supplement->vector_rows;
-    fd = shm_write_page_supplement(frame.supplement_shm, supplement, cmd.dim);
-    if (fd < 0)
-        return status;
-    sock = uds_connect_wait(socket_path, 30, &canceled);
-    if (sock < 0)
-        status = canceled ? CUVS_STATUS_CANCELED : CUVS_STATUS_UNAVAILABLE;
-    else
+        return CUVS_STATUS_ERROR;
+    if (!supplement)
     {
-        if (send_cmd(sock, &cmd) == 0 && send_all(sock, &frame, sizeof(frame)) == 0)
-        {
-            waiting = recv_reply_interruptible(sock, &reply, 30);
-            if (waiting == 1)
-                status = CUVS_STATUS_CANCELED;
-            else if (waiting == 0)
-            {
-                status = reply.status;
-                if (status == CUVS_STATUS_OK || status == CUVS_STATUS_PAGE_NEED ||
-                    status == CUVS_STATUS_PAGE_OVERLAY_FULL)
-                {
-                    waiting = recv_all_interruptible(sock, progress, sizeof(*progress), 30);
-                    if (waiting)
-                        status = waiting == 1 ? CUVS_STATUS_CANCELED : CUVS_STATUS_ERROR;
-                }
-            }
-        }
-        close(sock);
+        memset(progress, 0, sizeof(*progress));
+        return CUVS_STATUS_ERROR;
     }
-    close(fd);
-    shm_unlink(frame.supplement_shm);
-    return status;
+    return page_overlay_exchange(socket_path, &cmd, &frame, NULL,
+                                  supplement, NULL, &count, &latency_us, progress);
+}
+
+int
+cuvs_ipc_search_page_overlay(const char *socket_path, uint32_t db_oid, uint32_t index_oid,
+    const CuvsPageOverlayRequest *request, const float *queries, int nq, int dim, int k,
+    uint32_t metric, uint32_t itopk_size, uint32_t search_width, uint32_t use_cpu_hnsw,
+    uint32_t search_mode, uint32_t bf_precision, const CuvsPageSupplement *supplement,
+    CuvsPageOverlayResult *results, int *count, uint32_t *latency_us, CuvsPageProgress *progress)
+{
+    CuvsCmdFrame cmd = {.op = nq > 1 ? CUVS_OP_SEARCH_PAGE_OVERLAY_BATCH : CUVS_OP_SEARCH_PAGE_OVERLAY,
+        .db_oid = db_oid, .index_oid = index_oid, .dim = (uint32_t) dim, .k = (uint32_t) k,
+        .metric = metric, .itopk_size = itopk_size, .search_width = search_width,
+        .n_vecs = nq, .search_mode = search_mode, .bf_precision = bf_precision,
+        .use_cpu_hnsw = use_cpu_hnsw};
+    CuvsPageOverlayRequest frame = *request;
+
+    if (!queries || !results || !count || !latency_us || !progress || nq < 1 || k < 1)
+        return CUVS_STATUS_ERROR;
+    return page_overlay_exchange(socket_path, &cmd, &frame, queries,
+                                  supplement, results, count, latency_us, progress);
 }
 
 /* A page reply uses CuvsResult.tid as a zero-based slot number. */
