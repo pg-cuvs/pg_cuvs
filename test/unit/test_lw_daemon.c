@@ -132,6 +132,33 @@ read_file(const char *path, char *buf, size_t len)
 }
 
 static void
+expect_oom_error(const char *path, const char *expected)
+{
+    int status;
+    pid_t child = fork();
+
+    if (child < 0)
+    {
+        perror("fork OOM score fixture");
+        exit(2);
+    }
+    if (child == 0)
+    {
+        int before = failures;
+
+        apply_oom_score_adj(path);
+        CHECK(strncmp(g_oom_score_adj_result, expected, strlen(expected)) == 0);
+        _exit(failures != before);
+    }
+    if (waitpid(child, &status, 0) != child || !WIFEXITED(status) || WEXITSTATUS(status) > 1)
+    {
+        fprintf(stderr, "OOM score fixture did not complete normally\n");
+        exit(2);
+    }
+    CHECK(WEXITSTATUS(status) == 0);
+}
+
+static void
 test_oom_score_adj(void)
 {
     char path[320], buf[64];
@@ -162,8 +189,7 @@ test_oom_score_adj(void)
     if (geteuid() != 0)                                /* EACCES on write */
     {
         write_file(path, "0\n", 0444);
-        apply_oom_score_adj(path);
-        CHECK(strcmp(g_oom_score_adj_result, "oom_score_adj not applied: permission denied") == 0);
+        expect_oom_error(path, "oom_score_adj not applied: permission denied");
         read_file(path, buf, sizeof(buf));
         CHECK(strcmp(buf, "0\n") == 0);
         chmod(path, 0600);
@@ -172,8 +198,7 @@ test_oom_score_adj(void)
         fprintf(stderr, "NOTE running as root: permission-denied branch not exercised\n");
 
     snprintf(path, sizeof(path), "%s/missing/oom_score_adj", tmpdir);
-    apply_oom_score_adj(path);                         /* returns; daemon keeps going */
-    CHECK(strncmp(g_oom_score_adj_result, "oom_score_adj not applied: ", 27) == 0);
+    expect_oom_error(path, "oom_score_adj not applied: ");
     g_oom_score_adj = CUVS_OOM_SCORE_ADJ_DEFAULT;
 }
 
