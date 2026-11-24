@@ -616,6 +616,17 @@ test-admission-ipc: test/unit/test_admission_ipc.c src/cuvs_ipc.c src/cuvs_ipc.h
 		-lpthread -lm $(TEST_RT_LIB)
 	./$@
 
+test-unit: test-extra-search-ipc
+test-extra-search-ipc: test/unit/test_extra_search_ipc.c src/cuvs_ipc.c src/cuvs_ipc.h \
+                       src/cuvs_util.c src/cuvs_build_corpus.c $(wildcard src/*.h)
+	$(CC) -std=gnu11 -Wall -Wextra -Werror -Dsend=cuvs_test_send -I src -o $@ \
+		test/unit/test_extra_search_ipc.c src/cuvs_ipc.c src/cuvs_util.c src/cuvs_build_corpus.c \
+		-lpthread -lm $(TEST_RT_LIB)
+	./$@
+
+EXTRA_CLEAN += test-extra-search-ipc
+.PHONY: test-extra-search-ipc
+
 # #224: a connect() that waits for a full listen backlog retries after EINTR
 # and expired slices within the call's budget, a pending cancel ends it as
 # CANCELED, and the connection gets its full send timeout back. Linux only: on
