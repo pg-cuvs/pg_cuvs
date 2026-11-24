@@ -9300,16 +9300,29 @@ handle_export_hnsw_shm(int client_fd, const CuvsCmdFrame *cmd)
     }
     /* SQL holds an AccessShareLock on the source index. The in-use guard
      * also keeps EXTEND, COMPACT and eviction from changing its graph/TIDs. */
-    const uint64_t *source_tids = e->tids;
+    uint64_t *source_tids = NULL;
     int64_t source_n = e->n_vecs;
     uint32_t source_dim = e->dim;
     uint32_t source_metric = e->metric;
+    if (paired)
+    {
+        source_tids = malloc((size_t) source_n * sizeof(*source_tids));
+        if (source_tids == NULL)
+        {
+            pthread_mutex_unlock(&g_index_mutex);
+            close(mfd);
+            send_error(client_fd, "cannot snapshot matching HNSW TIDs");
+            return;
+        }
+        memcpy(source_tids, e->tids, (size_t) source_n * sizeof(*source_tids));
+    }
     e->inflight++;
     g_unlocked_gpu_jobs++;
     pthread_mutex_unlock(&g_index_mutex);
     int hrc = cuvs_hnsw_serialize(handle, shm_path, gpu);
     if (paired && hrc == CUVS_HNSW_SERIALIZE_OK)
         tids_fd = hnsw_export_tids_fd(source_n, source_dim, source_metric, source_tids);
+    free(source_tids);
     pthread_mutex_lock(&g_index_mutex);
     g_unlocked_gpu_jobs--;
     e = find_index(db, idx);

@@ -17,3 +17,9 @@ Limit
   ->  Index Scan using hsc_file_dst on hsc_file
         Order By: (v <-> '[500,500,500]'::vector)
 1000
+t
+Limit
+  ->  Index Scan using hsc_file_shm on hsc_file
+        Order By: (v <-> '[700,700,700]'::vector)
+3000
+3000

@@ -511,8 +511,8 @@ cagra/ivfpq") rather than silently failing.
 |-----------|------|---------|--------|-------|
 | `source` | string | `` | a `cagra` index name on the same table | empty = private direct HNSW file build from the heap (op23), without a persistent CAGRA index |
 | `mode` | string | `nsw` | `nsw`, `hnswlib`, `hnsw`, `hnswlib_file` | `nsw` and `hnswlib` are recommended. With `source`, `nsw` and `hnsw` give the same graph: level 0 from the CAGRA graph and upper layers built by the daemon on the host. Since 0.9.3 this path checks the pgvector version as the heap build does (outside the supported range is an error, not a warning) |
-| `m` | int | `16` | 2–100 | **informational** — the CAGRA graph degree drives the HNSW layout, not `m` |
-| `ef_construction` | int | `64` | 4–1000 | Direct heap build: construction effort; source reuse: informational |
+| `m` | int | `16` | 2–100 | pgvector maintenance fallback uses this value. Imported graphs use the source graph degree |
+| `ef_construction` | int | `64` | 4–1000 | Direct heap build: construction effort. pgvector maintenance fallback: at least `2 * m`. Source reuse: informational |
 | `build_algo` | enum | `auto` | `auto`, `ivf_pq`, `nn_descent`, `ace` | Direct heap build only; cannot be combined with explicit `source` |
 
 A CAGRA source must be valid and free of pending inserts and deletes. A stale
@@ -529,13 +529,27 @@ a matching file export. The stored `source` option is preserved. Explicit
 source conversions still require a verified source. The deprecated function
 holds a table lock that blocks writes until its transaction ends.
 
-The `hnswlib_file` mode requires a build-time binding to the source CAGRA's TID
-file. A source mutation invalidates that binding. For an older or copied
+The heap build can take longer and uses `maintenance_work_mem`. Its graph
+may differ from the source graph. It uses the stored `m` and raises
+`ef_construction` to at least `2 * m` for the build if needed. When it raises
+that value, the build runs serially and leaves the catalog options unchanged.
+
+Source-based `CREATE INDEX CONCURRENTLY` and `REINDEX INDEX CONCURRENTLY`
+require a source without pending changes. Rebuild that source before retrying,
+or use an ordinary rebuild of the existing HNSW index. A heap tablespace move
+changes the heap generation and requires a new source build for explicit
+conversion.
+
+The `hnswlib_file` mode opens files in the source index directory and
+requires a build-time binding to the source CAGRA's TID file. A source mutation invalidates that binding. For an older or copied
 `.hnsw` file whose binding cannot be verified, run `REINDEX` after setting
 `cuvs.cpu_hnsw_fallback = on`, or choose `mode = 'nsw'` on a clean source.
 The in-memory `hnswlib` mode exports the graph and TIDs together. Restart the
-daemon after upgrading the extension so both support paired export. A source
-whose export contains duplicate heap TIDs requires a rebuild before conversion.
+daemon after upgrading the extension so both support paired export. When an
+export repeats a TID with the same vector, the target is built from the heap
+using pgvector. An explicit conversion rejects repeated TIDs that carry
+different vectors. Maintenance can rebuild the target from the heap in either
+case.
 
 For direct heap construction, `auto` uses tiny exact GPU construction below 16 rows and
 otherwise the resident IVF-PQ route while its estimate fits the host and GPU budgets.

@@ -26,3 +26,6 @@ t|t
 ERROR:  pg_cuvs: source CAGRA index "hsc_stale_src" is stale
 HINT:  REINDEX the source CAGRA index before converting it, or build the HNSW index from the heap.
 f
+t
+t
+t|t

@@ -84,3 +84,81 @@ RESET cuvs.socket_path;
 REINDEX TABLE hsm_order;
 SELECT pg_temp.correct_neighbor('hsm_order', '[2000,0,0]');
 DROP TABLE hsm_order;
+
+-- A source graph can be created with m=48 and the default ef_construction=64.
+-- Force a pending insert so REINDEX INDEX has to use the actual CPU fallback.
+SET cuvs.hnsw_exact_scan = off;
+CREATE TABLE hsm_wide (id int PRIMARY KEY, v vector(3))
+    WITH (autovacuum_enabled = off, parallel_workers = 2);
+INSERT INTO hsm_wide SELECT g, ARRAY[g,0,0]::real[]::vector FROM generate_series(1,100) g;
+CREATE INDEX hsm_wide_c ON hsm_wide USING cagra (v vector_l2_ops);
+CREATE INDEX hsm_wide_h ON hsm_wide USING pg_cuvs_hnsw (v vector_l2_ops)
+    WITH (source = hsm_wide_c, m = 48);
+SET cuvs.socket_path = '';
+INSERT INTO hsm_wide VALUES (1000, '[1000,0,0]');
+RESET cuvs.socket_path;
+SELECT (pg_stat_file(format('%s/%s_%s.delta', current_setting('cuvs.index_dir'),
+       (SELECT oid FROM pg_database WHERE datname = current_database()),
+       'hsm_wide_c'::regclass::oid))).size > 32 AS pending_on_disk;
+BEGIN;
+SET LOCAL max_parallel_maintenance_workers = 2;
+SET LOCAL client_min_messages = notice;
+REINDEX INDEX hsm_wide_h;
+SET LOCAL client_min_messages = warning;
+SELECT current_setting('max_parallel_maintenance_workers') = '2';
+COMMIT;
+SELECT reloptions @> ARRAY['source=hsm_wide_c', 'm=48']
+   AND NOT EXISTS (SELECT FROM unnest(reloptions) AS r(opt) WHERE opt LIKE 'ef_construction=%')
+FROM pg_class WHERE oid = 'hsm_wide_h'::regclass;
+SELECT m = 48 AND elements = 101 FROM pg_cuvs_hnsw_layer_counts('hsm_wide_h');
+SELECT pg_temp.correct_neighbor('hsm_wide', '[1000,0,0]');
+DROP TABLE hsm_wide;
+
+-- The first TRUNCATE gives the heap a fresh filenode. The second TRUNCATE
+-- is in place on PG16; verify it rebuilds an empty graph before reusing TIDs.
+CREATE TABLE hsm_repeat (id int PRIMARY KEY, v vector(3)) WITH (autovacuum_enabled = off);
+INSERT INTO hsm_repeat SELECT g, ARRAY[g,0,0]::real[]::vector FROM generate_series(1,100) g;
+CREATE INDEX hsm_repeat_c ON hsm_repeat USING cagra (v vector_l2_ops);
+CREATE INDEX hsm_repeat_h ON hsm_repeat USING pg_cuvs_hnsw (v vector_l2_ops)
+    WITH (source = hsm_repeat_c, m = 48, ef_construction = 64);
+BEGIN;
+TRUNCATE hsm_repeat;
+SELECT pg_relation_filenode('hsm_repeat') AS first_filenode \gset
+SET LOCAL cuvs.socket_path = '';
+INSERT INTO hsm_repeat VALUES (1000, '[1000,0,0]');
+TRUNCATE hsm_repeat;
+SELECT pg_relation_filenode('hsm_repeat') = :'first_filenode'::oid;
+SELECT m = 48 AND elements = 0 FROM pg_cuvs_hnsw_layer_counts('hsm_repeat_h');
+INSERT INTO hsm_repeat
+SELECT g+2000, ARRAY[400-g,0,0]::real[]::vector FROM generate_series(1,100) g;
+COMMIT;
+SELECT reloptions @> ARRAY['source=hsm_repeat_c', 'm=48', 'ef_construction=64']
+FROM pg_class WHERE oid = 'hsm_repeat_h'::regclass;
+SELECT pg_temp.correct_neighbor('hsm_repeat', '[1,0,0]');
+DROP TABLE hsm_repeat;
+
+-- A built index created in this transaction also takes the in-place path.
+BEGIN;
+CREATE TABLE hsm_new (id int PRIMARY KEY, v vector(3)) WITH (autovacuum_enabled = off);
+INSERT INTO hsm_new SELECT g, ARRAY[g,0,0]::real[]::vector FROM generate_series(1,100) g;
+CREATE INDEX hsm_new_c ON hsm_new USING cagra (v vector_l2_ops);
+CREATE INDEX hsm_new_h ON hsm_new USING pg_cuvs_hnsw (v vector_l2_ops) WITH (source = hsm_new_c);
+TRUNCATE hsm_new;
+SELECT elements = 0 FROM pg_cuvs_hnsw_layer_counts('hsm_new_h');
+INSERT INTO hsm_new
+SELECT g+2000, ARRAY[400-g,0,0]::real[]::vector FROM generate_series(1,100) g;
+COMMIT;
+SELECT pg_temp.correct_neighbor('hsm_new', '[1,0,0]');
+DROP TABLE hsm_new;
+
+-- A fresh CREATE on an empty heap still has to validate its source.
+CREATE TABLE hsm_empty_ddl (id int PRIMARY KEY, v vector(3));
+CREATE INDEX hsm_empty_ddl_c ON hsm_empty_ddl USING cagra (v vector_l2_ops);
+\set ON_ERROR_STOP off
+CREATE INDEX hsm_empty_ddl_h ON hsm_empty_ddl USING pg_cuvs_hnsw (v vector_l2_ops)
+    WITH (source = hsm_empty_ddl_pkey);
+CREATE INDEX hsm_empty_ddl_h ON hsm_empty_ddl USING pg_cuvs_hnsw (v vector_cosine_ops)
+    WITH (source = hsm_empty_ddl_c);
+\set ON_ERROR_STOP on
+SELECT to_regclass('hsm_empty_ddl_h') IS NULL;
+DROP TABLE hsm_empty_ddl;

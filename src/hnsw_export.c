@@ -100,6 +100,8 @@ extern char *cuvs_socket_path;
 extern int cuvs_cagra_reloption_graph_degree(Relation cagra_rel);
 
 static uint32_t cagra_index_metric(Oid index_oid);
+static IndexBuildResult *hnsw_cpu_build(Relation heap, Relation index,
+                                       IndexInfo *index_info, const char *reason);
 
 /* ----------------------------------------------------------------
  * pgvector HNSW on-disk constants (must match pgvector source)
@@ -1583,6 +1585,13 @@ free_elem_descs(ElemDesc *elems, size_t n, size_t maxM0)
  * PG_TRY/PG_FINALLY wrappers below run hnsw_fill_res_free() on both the
  * success and the error path.
  * ---------------------------------------------------------------- */
+typedef enum HnswSourceTidResult
+{
+    HNSW_SOURCE_TIDS_UNIQUE,
+    HNSW_SOURCE_TIDS_REDUNDANT,
+    HNSW_SOURCE_TIDS_CONFLICTING
+} HnswSourceTidResult;
+
 typedef struct HnswFillRes
 {
     FILE     *hf;           /* .hnsw sidecar */
@@ -1597,6 +1606,7 @@ typedef struct HnswFillRes
     int      *cand_buf;     /* heuristic candidate scratch */
     int       shm_fd;       /* #165: SCM_RIGHTS sidecar fd (-1 = none) */
     int       tids_fd;      /* EXPORT_HNSW_UPPER TID memfd (-1 = none) */
+    HnswSourceTidResult tid_result;
 } HnswFillRes;
 
 /*
@@ -2023,44 +2033,155 @@ cuvs_warn_pgvector_version(void)
 /* ================================================================
  * Main SQL function
  * ================================================================ */
-static int
-hnsw_compare_tid(const void *a, const void *b)
+typedef struct HnswTidMember
 {
-    uint64_t x = *(const uint64_t *) a;
-    uint64_t y = *(const uint64_t *) b;
+    uint64_t tid;
+    uint32_t label;
+} HnswTidMember;
+
+static int
+hnsw_compare_tid_member(const void *a, const void *b)
+{
+    uint64_t x = ((const HnswTidMember *) a)->tid;
+    uint64_t y = ((const HnswTidMember *) b)->tid;
 
     return (x > y) - (x < y);
 }
 
-static void
-hnsw_require_unique_tids(const uint64_t *tids, size_t n)
+/* Keep original graph labels in the sorted copy. The common heap-order
+ * source needs neither sorting nor vector reads. */
+static HnswTidMember *
+hnsw_duplicate_members(const uint64_t *tids, size_t n)
 {
-    uint64_t *ordered;
+    HnswTidMember *members;
     size_t i;
 
     if (n < 2)
-        return;
-    /* Heap-order builds are already sorted. Preserve graph label order
-     * when an EXTEND or a parallel build needs a separate sort. */
+        return NULL;
     for (i = 1; i < n && tids[i - 1] < tids[i]; i++)
         ;
     if (i == n)
-        return;
-    ordered = palloc_extended(n * sizeof(*ordered), MCXT_ALLOC_HUGE);
-    memcpy(ordered, tids, n * sizeof(*ordered));
-    qsort(ordered, n, sizeof(*ordered), hnsw_compare_tid);
-    for (i = 1; i < n && ordered[i - 1] != ordered[i]; i++)
+        return NULL;
+    if (n > CUVS_TIDS_MAX_VECS)
+        ereport(ERROR, (errmsg("pg_cuvs: exported CAGRA TID count is out of range")));
+    members = palloc_extended(n * sizeof(*members), MCXT_ALLOC_HUGE);
+    for (i = 0; i < n; i++)
+    {
+        members[i].tid = tids[i];
+        members[i].label = (uint32_t) i;
+    }
+    qsort(members, n, sizeof(*members), hnsw_compare_tid_member);
+    for (i = 1; i < n && members[i - 1].tid != members[i].tid; i++)
         ;
-    pfree(ordered);
-    if (i != n)
-        ereport(ERROR,
-                (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-                 errmsg("pg_cuvs: source CAGRA index has duplicate heap TIDs"),
-                 errhint("REINDEX the source CAGRA index before converting it, or build the HNSW index from the heap.")));
+    if (i < n)
+        return members;
+    pfree(members);
+    return NULL;
+}
+
+static bool
+hnsw_source_vectors_equal(const float *a, const float *b, uint32_t dim)
+{
+    if (memcmp(a, b, (size_t) dim * sizeof(*a)) == 0)
+        return true;
+    for (uint32_t i = 0; i < dim; i++)
+        if (a[i] != b[i])
+            return false;
+    return true;
+}
+
+static HnswSourceTidResult
+hnsw_array_tid_result(const uint64_t *tids, const float *vecs, size_t n, uint32_t dim)
+{
+    HnswTidMember *members = hnsw_duplicate_members(tids, n);
+    HnswSourceTidResult result = HNSW_SOURCE_TIDS_REDUNDANT;
+
+    if (members == NULL)
+        return HNSW_SOURCE_TIDS_UNIQUE;
+    for (size_t i = 1; i < n; i++)
+        if (members[i - 1].tid == members[i].tid &&
+            !hnsw_source_vectors_equal(vecs + (size_t) members[i - 1].label * dim,
+                                       vecs + (size_t) members[i].label * dim, dim))
+        {
+            result = HNSW_SOURCE_TIDS_CONFLICTING;
+            break;
+        }
+    pfree(members);
+    return result;
+}
+
+static HnswSourceTidResult
+hnsw_file_tid_result(int graph_fd, int tids_fd, const uint64_t *tids,
+                     const CuvsTidsHeader *tids_header, int bytes_per_dim)
+{
+    size_t n = (size_t) tids_header->n_vecs;
+    uint32_t dim = tids_header->dim;
+    HnswTidMember *members = hnsw_duplicate_members(tids, n);
+    HnswlibHeader header;
+    char error[160];
+    HnswReadWindow window;
+    void *window_buffer;
+    uint32_t *row_for_label;
+    float *a, *b;
+    size_t vector_bytes;
+    HnswSourceTidResult result = HNSW_SOURCE_TIDS_REDUNDANT;
+
+    if (members == NULL)
+        return HNSW_SOURCE_TIDS_UNIQUE;
+    if (!hnsw_file_preflight(graph_fd, tids_fd, n, dim, tids_header->metric,
+                             bytes_per_dim, false, &header, NULL, NULL, NULL,
+                             NULL, error, sizeof(error)))
+        ereport(ERROR, (errmsg("pg_cuvs: cannot validate duplicate source entries: %s", error)));
+
+    /* Level-0 rows need not be in label order. Validate the label mapping
+     * and only compare vectors in duplicate TID groups. */
+    row_for_label = palloc_extended(n * sizeof(*row_for_label), MCXT_ALLOC_HUGE);
+    memset(row_for_label, 0xff, n * sizeof(*row_for_label));
+    window_buffer = palloc(HNSW_READ_WINDOW_BYTES);
+    hnsw_window_init(&window, graph_fd, window_buffer, HNSW_READ_WINDOW_BYTES);
+    for (size_t node = 0; node < n; node++)
+    {
+        uint64_t offset = HNSWLIB_HEADER_BYTES +
+                          (uint64_t) node * header.sizeDataPerElement + header.labelOffset;
+        size_t label;
+
+        CHECK_FOR_INTERRUPTS();
+        if (!hnsw_window_read(&window, &label, sizeof(label), offset) ||
+            label >= n || row_for_label[label] != UINT32_MAX)
+            ereport(ERROR, (errmsg("pg_cuvs: invalid source graph label mapping")));
+        row_for_label[label] = (uint32_t) node;
+    }
+
+    vector_bytes = (size_t) dim * sizeof(float);
+    a = palloc(vector_bytes);
+    b = palloc(vector_bytes);
+    for (size_t i = 1; i < n; i++)
+    {
+        if (members[i - 1].tid != members[i].tid)
+            continue;
+        uint64_t offset_a = HNSWLIB_HEADER_BYTES + header.offsetData +
+            (uint64_t) row_for_label[members[i - 1].label] * header.sizeDataPerElement;
+        uint64_t offset_b = HNSWLIB_HEADER_BYTES + header.offsetData +
+            (uint64_t) row_for_label[members[i].label] * header.sizeDataPerElement;
+        if (!hnsw_pread_exact(graph_fd, a, vector_bytes, offset_a) ||
+            !hnsw_pread_exact(graph_fd, b, vector_bytes, offset_b))
+            ereport(ERROR, (errmsg("pg_cuvs: cannot read duplicate source vectors")));
+        if (!hnsw_source_vectors_equal(a, b, dim))
+        {
+            result = HNSW_SOURCE_TIDS_CONFLICTING;
+            break;
+        }
+    }
+    pfree(a);
+    pfree(b);
+    pfree(window_buffer);
+    pfree(row_for_label);
+    pfree(members);
+    return result;
 }
 
 static void
-hnsw_check_exported_tids(HnswFillRes *res)
+hnsw_check_exported_tids(HnswFillRes *res, int bytes_per_dim)
 {
     FILE *file = hnsw_open_stream("exported CAGRA TIDs", res->tids_fd);
     CuvsTidsHeader header;
@@ -2072,9 +2193,19 @@ hnsw_check_exported_tids(HnswFillRes *res)
     fclose(file);
     if (rc != 0)
         ereport(ERROR, (errmsg("pg_cuvs: invalid exported CAGRA TIDs")));
-    hnsw_require_unique_tids(res->tids, (size_t) header.n_vecs);
+    res->tid_result = hnsw_file_tid_result(res->shm_fd, res->tids_fd, res->tids,
+                                          &header, bytes_per_dim);
     free(res->tids);
     res->tids = NULL;
+}
+
+static void
+hnsw_reject_conflicting_source_tids(void)
+{
+    ereport(ERROR,
+            (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+             errmsg("pg_cuvs: source CAGRA index has duplicate heap TIDs with different vectors"),
+             errhint("REINDEX the source CAGRA index before converting it, or build the HNSW index from the heap.")));
 }
 
 static bool
@@ -2274,20 +2405,28 @@ fill_hnsw_from_hnswlib_impl(Oid cagra_oid, Oid hnsw_oid, bool use_shm,
     }
 
     CuvsTidsHeader tids_hdr;
-    uint64_t      *tids = NULL;
-    int tids_rc = cuvs_tids_read(tf, &tids_hdr, &tids);
-    if (use_shm)
-        fclose(tf);
-    else
-        FreeFile(tf);
-    if (tids_rc != 0)
+    uint64_t *tids = NULL;
+
+    PG_TRY();
     {
-        ereport(ERROR,
-                (errmsg("pg_cuvs: failed to read/validate .tids sidecar \"%s\"",
-                        tids_path)));
+        if (cuvs_tids_read(tf, &tids_hdr, &tids) != 0)
+            ereport(ERROR,
+                    (errmsg("pg_cuvs: failed to read/validate .tids sidecar \"%s\"",
+                            tids_path)));
+        res->tids = tids;
+        res->tid_result = hnsw_file_tid_result(fileno(hf), fileno(tf), tids,
+                                               &tids_hdr, bytes_per_dim);
     }
-    res->tids = tids;
-    hnsw_require_unique_tids(tids, (size_t) tids_hdr.n_vecs);
+    PG_FINALLY();
+    {
+        if (use_shm)
+            fclose(tf);
+        else
+            FreeFile(tf);
+    }
+    PG_END_TRY();
+    if (res->tid_result != HNSW_SOURCE_TIDS_UNIQUE)
+        return;
 
     HnswlibHeader hdr;
     memset(&hdr, 0, sizeof(hdr));
@@ -2731,7 +2870,8 @@ fill_hnsw_from_hnswlib_impl(Oid cagra_oid, Oid hnsw_oid, bool use_shm,
  * scalar) and is unreachable on the error path, where PG_TRY's longjmp
  * skips the return entirely — no stale-value case to guard against. */
 static size_t
-fill_hnsw_from_hnswlib(Oid cagra_oid, Oid hnsw_oid, bool use_shm)
+fill_hnsw_from_hnswlib(Oid cagra_oid, Oid hnsw_oid, bool use_shm,
+                       HnswSourceTidResult *tid_result)
 {
     /*
      * #166 review 3: `res` is written inside PG_TRY (through the pointer the
@@ -2754,6 +2894,7 @@ fill_hnsw_from_hnswlib(Oid cagra_oid, Oid hnsw_oid, bool use_shm)
         hnsw_fill_res_free((HnswFillRes *) &res);
     }
     PG_END_TRY();
+    *tid_result = res.tid_result;
     return res.n_elems;
 }
 
@@ -4031,7 +4172,9 @@ fill_hnsw_from_cagra_ipc_impl(Oid cagra_oid, Oid hnsw_oid, const char *mode,
             build.n_vecs  = up_n;
             build.dim     = (uint32_t) up_dim;
             build.metric  = tgt_metric;
-            hnsw_check_exported_tids(res);
+            hnsw_check_exported_tids(res, bytes_per_dim);
+            if (res->tid_result != HNSW_SOURCE_TIDS_UNIQUE)
+                return;
             target = index_open(hnsw_oid, AccessExclusiveLock);
             hnsw_import_build_result(target, &build, false, false);
             index_close(target, AccessExclusiveLock);
@@ -4084,7 +4227,9 @@ fill_hnsw_from_cagra_ipc_impl(Oid cagra_oid, Oid hnsw_oid, const char *mode,
     res->adj  = adj;
     res->vecs = vecs;
     res->tids = tids;
-    hnsw_require_unique_tids(tids, N);
+    res->tid_result = hnsw_array_tid_result(tids, vecs, N, (uint32_t) ipc_dim);
+    if (res->tid_result != HNSW_SOURCE_TIDS_UNIQUE)
+        return;
 
     /* Metric mismatch check */
     if (src_metric != tgt_metric)
@@ -4340,7 +4485,8 @@ fill_hnsw_from_cagra_ipc_impl(Oid cagra_oid, Oid hnsw_oid, const char *mode,
 /* #161: returns the actual element count — see the matching comment on
  * fill_hnsw_from_hnswlib(). */
 static size_t
-fill_hnsw_from_cagra_ipc(Oid cagra_oid, Oid hnsw_oid, const char *mode)
+fill_hnsw_from_cagra_ipc(Oid cagra_oid, Oid hnsw_oid, const char *mode,
+                       HnswSourceTidResult *tid_result)
 {
     /* #166 review 3: volatile across the longjmp — see fill_hnsw_from_hnswlib. */
     volatile HnswFillRes res;
@@ -4358,7 +4504,18 @@ fill_hnsw_from_cagra_ipc(Oid cagra_oid, Oid hnsw_oid, const char *mode)
         hnsw_fill_res_free((HnswFillRes *) &res);
     }
     PG_END_TRY();
+    *tid_result = res.tid_result;
     return res.n_elems;
+}
+
+static size_t
+hnsw_fill_source(Oid source, Oid target, const char *mode,
+                 HnswSourceTidResult *tid_result)
+{
+    if (strcmp(mode, "nsw") == 0 || strcmp(mode, "hnsw") == 0)
+        return fill_hnsw_from_cagra_ipc(source, target, mode, tid_result);
+    return fill_hnsw_from_hnswlib(source, target, strcmp(mode, "hnswlib") == 0,
+                                  tid_result);
 }
 
 /* ================================================================
@@ -4725,12 +4882,19 @@ pg_cuvs_build_hnsw(PG_FUNCTION_ARGS)
      *                    Retained pending future improvement of level assignment.
      *   'hnswlib_file' — on-disk .hnsw sidecar; superceded by 'hnswlib' (shm).
      */
-    if (strcmp(mode, "nsw") == 0 || strcmp(mode, "hnsw") == 0)
-        fill_hnsw_from_cagra_ipc(cagra_oid, hnsw_oid, mode);
-    else if (strcmp(mode, "hnswlib") == 0)
-        fill_hnsw_from_hnswlib(cagra_oid, hnsw_oid, true);
-    else  /* hnswlib_file */
-        fill_hnsw_from_hnswlib(cagra_oid, hnsw_oid, false);
+    HnswSourceTidResult tid_result;
+
+    (void) hnsw_fill_source(cagra_oid, hnsw_oid, mode, &tid_result);
+    if (tid_result == HNSW_SOURCE_TIDS_CONFLICTING)
+        hnsw_reject_conflicting_source_tids();
+    if (tid_result == HNSW_SOURCE_TIDS_REDUNDANT)
+    {
+        Relation target = index_open(hnsw_oid, AccessExclusiveLock);
+        IndexInfo *index_info = BuildIndexInfo(target);
+
+        pfree(hnsw_cpu_build(heap_rel, target, index_info, "the source has redundant entries"));
+        index_close(target, AccessExclusiveLock);
+    }
 
     index_close(cagra_rel, AccessShareLock);
     /* As in a regular CREATE INDEX, block table writes through commit of the
@@ -4749,10 +4913,9 @@ pg_cuvs_build_hnsw(PG_FUNCTION_ARGS)
  *
  * ambuild() writes pgvector-HNSW page format into the index's OWN relation
  * (reusing fill_hnsw_from_cagra_ipc / fill_hnsw_from_hnswlib). The read path
- * (scan/cost/insert/bulkdelete/vacuum) is delegated to pgvector's hnsw AM by
- * copying its IndexAmRoutine and overriding only ambuild + amoptions. A single
- * catalog index results, so pg_indexes / DROP INDEX / REINDEX / pg_dump behave
- * naturally.
+ * (scan/cost/insert/bulkdelete/vacuum) delegates to pgvector's hnsw AM. The
+ * wrapper supplies the build callbacks and reloption parser. A single catalog
+ * index results, so pg_indexes / DROP INDEX / REINDEX / pg_dump behave naturally.
  * ================================================================ */
 
 /* WITH() storage. The m / ef_construction prefix mirrors pgvector's HnswOptions
@@ -4808,7 +4971,7 @@ cuvs_hnsw_init_reloptions(void)
                          "HNSW route: auto=tiny/resident IVF-PQ, explicit ivf_pq, nn_descent or ace; estimates are not memory upper bounds",
                          "auto", cuvs_hnsw_validate_build_algo, AccessExclusiveLock);
     add_int_reloption(cuvs_hnsw_relopt_kind, "m",
-                      "pgvector HNSW M; informational (graph degree drives layout)",
+                      "HNSW M for the pgvector maintenance fallback; imported graphs use the source graph degree",
                       16, 2, 100, AccessExclusiveLock);
     add_int_reloption(cuvs_hnsw_relopt_kind, "ef_construction",
                       "Construction effort: default 64 preserves route defaults; changes intermediate degree / ACE effort",
@@ -4986,17 +5149,65 @@ pg_cuvs_hnsw_build_info(PG_FUNCTION_ARGS)
  *                               heap with no source dependency. The CAGRA is an
  *                               intermediate build artifact (like a .o), so it
  *                               is dropped — to keep a CAGRA, use source mode. */
-/* A stored source is an accelerator for a rebuild. If it cannot describe
- * the current heap, pgvector can rebuild the target using its own IndexInfo.
- * CuvsHnswOptions has the prefix expected by pgvector's ambuild. */
+/* pgvector uses the target's IndexInfo and reads its options from the
+ * pgvector-compatible prefix of CuvsHnswOptions. A source index can store
+ * a pair that pgvector would reject at build time, so raise ef locally.
+ * A NULL heap skips the scan. A NULL IndexInfo selects the init fork. */
 static IndexBuildResult *
-hnsw_maintenance_build(Relation heap, Relation index, IndexInfo *index_info)
+hnsw_cpu_build(Relation heap, Relation index, IndexInfo *index_info,
+               const char *reason)
 {
     IndexAmRoutine *hnsw = GetIndexAmRoutineByAmId(get_am_oid("hnsw", false), false);
     ambuild_function build = hnsw->ambuild;
+    ambuildempty_function build_empty = hnsw->ambuildempty;
+    CuvsHnswOptions *opts = (CuvsHnswOptions *) index->rd_options;
+    int m = opts ? opts->m : 16;
+    int configured_ef = opts ? opts->ef_construction : 64;
+    bool adjust_ef = opts != NULL && opts->source_offset != 0 &&
+        ((const char *) opts)[opts->source_offset] != '\0' &&
+        configured_ef < 2 * m;
+    int build_ef = adjust_ef ? 2 * m : configured_ef;
+    int guc_nestlevel = adjust_ef && heap != NULL ? NewGUCNestLevel() : 0;
+    IndexBuildResult *result = NULL;
 
     pfree(hnsw);
-    return build(heap, index, index_info);
+    PG_TRY();
+    {
+        /* Workers reopen the index and read the catalog's unadjusted
+         * options. pgvector chooses its own worker count via this GUC. */
+        if (guc_nestlevel != 0)
+            set_config_option("max_parallel_maintenance_workers", "0",
+                              PGC_USERSET, PGC_S_SESSION, GUC_ACTION_SAVE,
+                              true, ERROR, false);
+        if (adjust_ef)
+            opts->ef_construction = build_ef;
+        if (index_info != NULL)
+            result = build(heap, index, index_info);
+        else
+            build_empty(index);
+    }
+    PG_FINALLY();
+    {
+        /* If relcache reloaded the options, it restored the catalog value. */
+        if (adjust_ef && index->rd_options == (bytea *) opts)
+            opts->ef_construction = configured_ef;
+        if (guc_nestlevel != 0)
+            AtEOXact_GUC(false, guc_nestlevel);
+    }
+    PG_END_TRY();
+
+    if (reason != NULL)
+        ereport(NOTICE,
+                (errmsg("pg_cuvs_hnsw: rebuilt from the heap because %s", reason),
+                 errdetail("pgvector build used m = %d, ef_construction = %d (configured ef_construction = %d).",
+                           m, build_ef, configured_ef)));
+    return result;
+}
+
+static void
+cuvs_hnsw_ambuildempty(Relation index)
+{
+    (void) hnsw_cpu_build(NULL, index, NULL, NULL);
 }
 
 static IndexBuildResult *
@@ -5084,12 +5295,20 @@ cuvs_hnsw_ambuild(Relation heapRel, Relation indexRel, IndexInfo *indexInfo)
     /* ── Source mode: reuse an existing CAGRA index. ── */
     bool rebuilding = ReindexIsProcessingIndex(self_oid);
 
-    /* TRUNCATE calls ambuild before any new rows exist. There is no source
-     * graph for that heap, even if the daemon still has the old one. */
-    if (rebuilding && RelationGetNumberOfBlocks(heapRel) == 0)
+    /* In-place TRUNCATE rebuilds an existing index without setting the
+     * reindex flag. A regular CREATE has a newly created index with relpages
+     * zero until index_build() records the pages, even for an empty HNSW.
+     * Concurrent CREATE also gets a new index, in an earlier transaction.
+     * Leave both CREATE paths subject to the source checks below. */
+    bool existing_index = !indexInfo->ii_Concurrent &&
+        (indexRel->rd_createSubid == InvalidSubTransactionId ||
+         indexRel->rd_rel->relpages > 0);
+    if ((rebuilding || existing_index) && RelationGetNumberOfBlocks(heapRel) == 0)
     {
         pfree(result);
-        return hnsw_maintenance_build(heapRel, indexRel, indexInfo);
+        /* pgvector can initialize the main fork without planning a scan or
+         * consulting expressions/predicates from the dummy IndexInfo. */
+        return hnsw_cpu_build(NULL, indexRel, indexInfo, "the heap is empty");
     }
 
     /* Resolve source name (schema-qualified, search_path aware) to an OID. */
@@ -5166,12 +5385,12 @@ cuvs_hnsw_ambuild(Relation heapRel, Relation indexRel, IndexInfo *indexInfo)
     }
     if (problem != NULL && rebuilding)
     {
-        ereport(NOTICE,
-                (errmsg("pg_cuvs_hnsw: rebuilding from the heap because source CAGRA index \"%s\" %s",
-                        RelationGetRelationName(cagra_rel), problem)));
+        char *reason = psprintf("source CAGRA index \"%s\" %s",
+                                RelationGetRelationName(cagra_rel), problem);
+
         index_close(cagra_rel, AccessShareLock);
         pfree(result);
-        return hnsw_maintenance_build(heapRel, indexRel, indexInfo);
+        return hnsw_cpu_build(heapRel, indexRel, indexInfo, reason);
     }
     if (problem != NULL)
         hnsw_report_source_problem(cagra_rel, problem);
@@ -5193,13 +5412,17 @@ cuvs_hnsw_ambuild(Relation heapRel, Relation indexRel, IndexInfo *indexInfo)
      * only, so there the request waits for the table's writers and queues new
      * ones behind it. The freshly created relation has 0 blocks so no truncate
      * happens. */
-    size_t n_elems_written;
-    if (strcmp(mode, "nsw") == 0 || strcmp(mode, "hnsw") == 0)
-        n_elems_written = fill_hnsw_from_cagra_ipc(cagra_oid, self_oid, mode);
-    else if (strcmp(mode, "hnswlib") == 0)
-        n_elems_written = fill_hnsw_from_hnswlib(cagra_oid, self_oid, true);
-    else  /* hnswlib_file */
-        n_elems_written = fill_hnsw_from_hnswlib(cagra_oid, self_oid, false);
+    HnswSourceTidResult tid_result;
+    size_t n_elems_written = hnsw_fill_source(cagra_oid, self_oid, mode, &tid_result);
+
+    if (tid_result == HNSW_SOURCE_TIDS_CONFLICTING && !rebuilding)
+        hnsw_reject_conflicting_source_tids();
+    if (tid_result != HNSW_SOURCE_TIDS_UNIQUE)
+    {
+        index_close(cagra_rel, AccessShareLock);
+        pfree(result);
+        return hnsw_cpu_build(heapRel, indexRel, indexInfo, "the source contains duplicate TIDs");
+    }
     index_close(cagra_rel, AccessShareLock);
 
     /* #161: element count from fill_*'s own return, not inferred from block
@@ -5388,9 +5611,10 @@ pg_cuvs_hnsw_handler(PG_FUNCTION_ARGS)
     IndexAmRoutine *amroutine = (IndexAmRoutine *)
         DatumGetPointer(OidFunctionCall1(amhandler, (Datum) 0));
 
-    amroutine->ambuild   = cuvs_hnsw_ambuild;   /* GPU CAGRA -> HNSW pages */
+    amroutine->ambuild = cuvs_hnsw_ambuild;   /* GPU CAGRA -> HNSW pages */
+    amroutine->ambuildempty = cuvs_hnsw_ambuildempty;
     amroutine->amoptions = cuvs_hnsw_amoptions;  /* WITH (source, mode, ...) */
-    /* Writes/maintenance retain pgvector's behavior. The scan wrapper keeps
+    /* Inserts and vacuum retain pgvector's behavior. The scan wrapper keeps
      * its delegate path and connects the explicitly selected exact heap mode. */
     cuvs_hnsw_scan_wrap(amroutine);
 

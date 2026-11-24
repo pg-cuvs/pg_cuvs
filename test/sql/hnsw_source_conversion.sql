@@ -221,3 +221,22 @@ CREATE INDEX CONCURRENTLY hsc_stale_cic ON hsc_stale USING pg_cuvs_hnsw (v vecto
 SELECT indisvalid AS concurrent_index_valid FROM pg_index
 WHERE indexrelid = 'hsc_stale_cic'::regclass;
 DROP TABLE hsc_stale;
+
+-- Duplicate source entries with identical vectors describe the same live
+-- heap row. This fixture creates that payload without timing assumptions.
+CREATE TABLE hsc_same (id int PRIMARY KEY, v vector(3)) WITH (autovacuum_enabled = off);
+INSERT INTO hsc_same SELECT g, ARRAY[g,0,0]::real[]::vector FROM generate_series(1,100) g;
+CREATE INDEX hsc_same_src ON hsc_same USING cagra (v vector_l2_ops);
+INSERT INTO hsc_same VALUES (200, '[200,0,0]');
+CREATE TEMP TABLE hsc_same_old AS SELECT ctid AS old_tid FROM hsc_same WHERE id=200;
+DELETE FROM hsc_same WHERE id=200;
+VACUUM (INDEX_CLEANUP ON, TRUNCATE OFF) hsc_same;
+INSERT INTO hsc_same VALUES (1000, '[200,0,0]');
+SELECT r.ctid=o.old_tid FROM hsc_same r, hsc_same_old o WHERE r.id=1000;
+SELECT n_vecs=102 AND extend_count=2 FROM pg_stat_gpu_search WHERE index_oid='hsc_same_src'::regclass;
+SELECT pg_temp.check_conversion(
+    'CREATE INDEX hsc_same_dst ON hsc_same USING pg_cuvs_hnsw (v vector_l2_ops) WITH (source = hsc_same_src)',
+    'hsc_same_dst', 'SELECT id FROM hsc_same ORDER BY v <-> ''[200,0,0]'' LIMIT 1'),
+    pg_temp.check_conversion('SELECT pg_cuvs_build_hnsw(''hsc_same_src'', ''hnsw'')',
+    NULL, 'SELECT id FROM hsc_same ORDER BY v <-> ''[200,0,0]'' LIMIT 1');
+DROP TABLE hsc_same;

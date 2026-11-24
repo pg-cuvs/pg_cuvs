@@ -88,10 +88,14 @@ exists for 0.9.0.
 
 ### Fixed
 
-- Reject stale CAGRA sources and sources with pending inserts or deletes
+- Reject CAGRA sources with a stale marker and sources with pending inserts or deletes
   before converting them to HNSW. Source-based DDL checks the index key and
   predicate, and `pg_cuvs_build_hnsw()` preserves both. The existing
   vector-to-halfvec conversion on the same key is supported.
+- An explicit conversion rejects duplicate heap TIDs that hold different
+  vectors. When the duplicates hold the same vector, pgvector builds the
+  target from the current heap. Rebuilds of existing indexes can use a
+  heap build in both cases.
 - `hnswlib_file` now requires a build-time binding between the `.hnsw` and
   `.tids` files. Older sidecars without a verifiable binding must be regenerated
   once with `REINDEX` and `cuvs.cpu_hnsw_fallback = on`. To convert a clean
@@ -180,6 +184,8 @@ exists for 0.9.0.
 
 ### Upgrading
 
+- Upgrade the extension and daemon together and restart the daemon before
+  using the paired `hnswlib` export.
 - When rebuilding an existing source-based HNSW index during PostgreSQL table
   maintenance, an unusable CAGRA source falls back to a pgvector heap build.
   Explicit conversions require matching definitions and the current heap

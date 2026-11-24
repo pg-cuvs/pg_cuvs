@@ -9,3 +9,21 @@ t
 t
 t
 t
+t
+NOTICE:  pg_cuvs_hnsw: rebuilt from the heap because source CAGRA index "hsm_wide_c" has pending inserts or an unreadable delta file
+DETAIL:  pgvector build used m = 48, ef_construction = 96 (configured ef_construction = 64).
+t
+t
+t
+t
+t
+t
+t
+t
+t
+t
+ERROR:  pg_cuvs_hnsw: source "hsm_empty_ddl_pkey" must be a cagra index
+HINT:  Build it first: CREATE INDEX ... USING cagra (col opclass).
+ERROR:  pg_cuvs_hnsw: metric mismatch: source cagra "hsm_empty_ddl_c" uses l2 but this index uses cosine
+HINT:  Use the same opclass (vector_l2_ops / vector_cosine_ops / vector_ip_ops) as the source cagra index.
+t

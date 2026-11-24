@@ -67,4 +67,22 @@ REINDEX TABLE hsc_file;
 SET enable_seqscan = off;
 EXPLAIN (COSTS OFF) SELECT id FROM hsc_file ORDER BY v <-> '[500,500,500]' LIMIT 1;
 SELECT id FROM hsc_file ORDER BY v <-> '[500,500,500]' LIMIT 1;
+RESET enable_seqscan;
+DROP INDEX hsc_file_dst;
+
+INSERT INTO hsc_file VALUES (2000, '[700,700,700]');
+CREATE TEMP TABLE hsc_file_old AS SELECT ctid AS old_tid FROM hsc_file WHERE id=2000;
+DELETE FROM hsc_file WHERE id=2000;
+VACUUM (INDEX_CLEANUP ON, TRUNCATE OFF) hsc_file;
+INSERT INTO hsc_file VALUES (3000, '[700,700,700]');
+SELECT r.ctid=o.old_tid FROM hsc_file r, hsc_file_old o WHERE r.id=3000;
+CREATE INDEX hsc_file_shm ON hsc_file USING pg_cuvs_hnsw (v vector_l2_ops)
+    WITH (source = hsc_file_src, mode = 'hnswlib');
+SET enable_seqscan = off;
+EXPLAIN (COSTS OFF) SELECT id FROM hsc_file ORDER BY v <-> '[700,700,700]' LIMIT 1;
+SELECT id FROM hsc_file ORDER BY v <-> '[700,700,700]' LIMIT 1;
+RESET enable_seqscan;
+SET enable_indexscan = off;
+SET enable_bitmapscan = off;
+SELECT id FROM hsc_file ORDER BY v <-> '[700,700,700]' LIMIT 1;
 DROP TABLE hsc_file;
