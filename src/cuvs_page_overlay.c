@@ -4,29 +4,44 @@
 #include <stdlib.h>
 #include <string.h>
 
+bool
+cuvs_page_overlay_reserve(CuvsPageOverlayBudget *budget, size_t bytes)
+{
+    size_t used = __atomic_load_n(&budget->used, __ATOMIC_RELAXED);
+
+    do
+    {
+        if (used > budget->limit || bytes > budget->limit - used)
+            return false;
+    } while (!__atomic_compare_exchange_n(&budget->used, &used, used + bytes, true,
+                                          __ATOMIC_RELAXED, __ATOMIC_RELAXED));
+    return true;
+}
+
+void
+cuvs_page_overlay_unreserve(CuvsPageOverlayBudget *budget, size_t bytes)
+{
+    __atomic_fetch_sub(&budget->used, bytes, __ATOMIC_RELAXED);
+}
+
 uint32_t
 cuvs_page_overlay_alloc(CuvsPageOverlayBudget *budget, const CuvsPageOverlayRequest *request,
                         size_t bytes, CuvsPageOverlayChunk **result)
 {
     CuvsPageOverlayChunk *chunk;
-    size_t charge, used;
+    size_t charge;
 
     *result = NULL;
     if (bytes > SIZE_MAX - sizeof(*chunk))
         return CUVS_STATUS_PAGE_OVERLAY_HOST_FULL;
     charge = sizeof(*chunk) + bytes;
-    used = __atomic_load_n(&budget->used, __ATOMIC_RELAXED);
-    do
-    {
-        if (charge > budget->limit - used)
-            return CUVS_STATUS_PAGE_OVERLAY_HOST_FULL;
-    } while (!__atomic_compare_exchange_n(&budget->used, &used, used + charge, true,
-                                          __ATOMIC_RELAXED, __ATOMIC_RELAXED));
+    if (!cuvs_page_overlay_reserve(budget, charge))
+        return CUVS_STATUS_PAGE_OVERLAY_HOST_FULL;
 
     chunk = malloc(charge);
     if (!chunk)
     {
-        __atomic_fetch_sub(&budget->used, charge, __ATOMIC_RELAXED);
+        cuvs_page_overlay_unreserve(budget, charge);
         return CUVS_STATUS_OOM_FALLBACK;
     }
     chunk->next = NULL;
@@ -75,7 +90,7 @@ cuvs_page_overlay_release(CuvsPageOverlayChunk *chunk)
         size_t charge = chunk->charged_bytes;
 
         free(chunk);
-        __atomic_fetch_sub(&budget->used, charge, __ATOMIC_RELAXED);
+        cuvs_page_overlay_unreserve(budget, charge);
         chunk = next;
     }
 }

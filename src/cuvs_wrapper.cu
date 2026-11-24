@@ -11,6 +11,11 @@
  */
 
 #include "cuvs_wrapper.h"
+#ifdef PGCUVS_BETA3A_GPU_FOLD
+#include "cuvs_cagra_fold_capacity.h"
+#include "cuvs_cagra_fold.h"
+#include "cuvs_cagra_fold_sdk.hpp"
+#endif
 #include "cuvs_hnsw_build_common.h"
 #include "cuvs_ipc.h"   /* CUVS_METRIC_* (PG-free, CUDA-free defines) */
 #include "cuvs_util.h"  /* ADR-075: CUVS_HWPROBE_* bits (PG-free, CUDA-free) */
@@ -2331,6 +2336,152 @@ cuvs_cagra_extend(CuvsCagraIndex index,
         return 1;
     }
 }
+
+#ifdef PGCUVS_BETA3A_GPU_FOLD
+
+extern "C" int
+cuvs_cagra_fold_shape(CuvsCagraIndex source, CuvsCagraFoldShape *shape)
+{
+    if (!source || !shape)
+        return -1;
+    const auto& graph = static_cast<const CuvsCagraIndexImpl *>(source)->idx;
+    using RowId = decltype(graph.data().n_rows());
+    if (graph.dataset_fd().has_value() ||
+        dynamic_cast<const cuvs::neighbors::strided_dataset<float, RowId> *>(&graph.data()) == nullptr)
+        return -1;
+    const auto dataset = graph.dataset();
+    *shape = {uint64_t(graph.size()), uint64_t(graph.dim()),
+              uint64_t(dataset.stride(0)), uint64_t(graph.graph_degree())};
+    return 0;
+}
+
+static bool cagra_fold_stream_confirmed(PooledRes *scope, bool allow_oom = true)
+{
+    if (!scope || (scope->fence && scope->fence->failures() > 0))
+        return false;
+    cudaError_t status = cudaStreamSynchronize(scope->get().get_stream().value());
+    cudaError_t last = cudaGetLastError();
+    return status == cudaSuccess &&
+           (last == cudaSuccess || (allow_oom && last == cudaErrorMemoryAllocation));
+}
+
+extern "C" CuvsCagraFoldStatus
+cuvs_cagra_fold_reuse(CuvsCagraIndex source, const float *new_vectors,
+                      int64_t n_new, int dim, int device_id, CuvsCagraIndex *result)
+{
+    return cuvs_cagra_fold_reuse_with_yield(source, new_vectors, n_new, dim, device_id,
+                                          result, nullptr);
+}
+
+extern "C" CuvsCagraFoldStatus
+cuvs_cagra_fold_reuse_with_yield(CuvsCagraIndex source, const float *new_vectors,
+                                 int64_t n_new, int dim, int device_id, CuvsCagraIndex *result,
+                                 const CuvsCagraFoldControl *control)
+{
+    if (!source || !new_vectors || !result || *result ||
+        n_new <= 0 || dim <= 0 || device_id < 0 || device_id >= CUVS_MAX_GPUS)
+        return CUVS_CAGRA_FOLD_INVALID;
+
+    const auto& old = *static_cast<const CuvsCagraIndexImpl *>(source);
+    const RmmUpstream::NoGrowth keep_backing(g_rmm_registry ?
+        g_rmm_registry->upstreams[device_id].get() : nullptr);
+    std::optional<PooledRes> scope;
+    bool may_have_gpu_work = false;
+    try {
+        using DatasetRowId = decltype(old.idx.data().n_rows());
+        if (old.idx.dataset_fd().has_value() ||
+            dynamic_cast<const cuvs::neighbors::strided_dataset<float, DatasetRowId> *>(&old.idx.data()) == nullptr)
+            return CUVS_CAGRA_FOLD_INVALID;
+
+        const auto old_dataset = old.idx.dataset();
+        const auto old_graph = old.idx.graph();
+        const auto n_old = static_cast<uint64_t>(old.idx.size());
+        const auto stride = old_dataset.stride(0);
+        const auto degree = old.idx.graph_degree();
+        constexpr uint64_t max_rows = UINT32_MAX - 1;
+        if (!n_old || n_old > max_rows || uint64_t(n_new) > max_rows - n_old ||
+            old.idx.dim() != dim || stride < dim || !degree ||
+            !old_dataset.data_handle() || !old_graph.data_handle() ||
+            uint64_t(old_dataset.extent(0)) != n_old || uint64_t(old_graph.extent(0)) != n_old)
+            return CUVS_CAGRA_FOLD_INVALID;
+        if (control && control->filled_rows && control->placeholder_slot >= n_old)
+            return CUVS_CAGRA_FOLD_INVALID;
+        const auto total = static_cast<int64_t>(n_old + uint64_t(n_new));
+        const auto max_float_columns = std::min<uint64_t>(SIZE_MAX, INT64_MAX) / sizeof(float) / total;
+        const auto max_index_columns = std::min<uint64_t>(SIZE_MAX, INT64_MAX) / sizeof(uint32_t) / total;
+        if (uint64_t(stride) > max_float_columns || uint64_t(degree) > max_index_columns)
+            return CUVS_CAGRA_FOLD_INVALID;
+
+        cuvs_cagra_fold_checkpoint(control);
+        scope.emplace(device_id);
+        auto& resources = scope->get();
+        for (const void *pointer : {static_cast<const void *>(old_dataset.data_handle()),
+                                    static_cast<const void *>(old_graph.data_handle())}) {
+            cudaPointerAttributes attributes{};
+            RAFT_CUDA_TRY(cudaPointerGetAttributes(&attributes, pointer));
+            if (attributes.type != cudaMemoryTypeDevice || attributes.device != device_id)
+                return CUVS_CAGRA_FOLD_INVALID;
+        }
+
+        cuvs_cagra_fold_checkpoint(control);
+        /* Device allocation itself can enqueue CUDA work. From this point,
+         * keep the owner and its inputs until the request stream is checked. */
+        may_have_gpu_work = true;
+        auto added = raft::make_device_matrix<float, int64_t>(resources, n_new, int64_t(dim));
+        raft::copy(added.data_handle(), new_vectors, size_t(n_new) * size_t(dim), resources.get_stream());
+        resources.sync_stream();
+        cuvs_cagra_fold_checkpoint(control);
+        if (control && control->filled_rows) {
+            const float *sample = old_dataset.data_handle() + uint64_t(control->placeholder_slot) * stride;
+            for (int64_t from = 0; from < n_new; from += CUVS_CAGRA_FOLD_BATCH_ROWS) {
+                for (int64_t row = from; row < std::min(n_new, from + CUVS_CAGRA_FOLD_BATCH_ROWS); ++row)
+                    if (!control->filled_rows[row])
+                        RAFT_CUDA_TRY(cudaMemcpyAsync(added.data_handle() + row * dim, sample,
+                            size_t(dim) * sizeof(float), cudaMemcpyDeviceToDevice, resources.get_stream().value()));
+                resources.sync_stream();
+                cuvs_cagra_fold_checkpoint(control);
+            }
+        }
+        auto dataset = raft::make_device_matrix<float, int64_t>(resources, total, stride);
+        auto dataset_view = raft::make_device_strided_matrix_view<float, int64_t>(
+            dataset.data_handle(), total, dim, stride);
+        cuvs::neighbors::cagra::index<float, uint32_t> next(resources, old.idx.metric());
+        cuvs_cagra_fold_sdk(resources, old.idx, raft::make_const_mdspan(added.view()), dataset_view,
+                            next, control);
+        resources.sync_stream();
+        scope->fence_check();
+
+        if (next.size() != total || next.dataset().data_handle() != dataset.data_handle() ||
+            next.graph().data_handle() == old_graph.data_handle())
+            throw std::runtime_error("completed CAGRA fold has invalid ownership");
+        cuvs_cagra_fold_checkpoint(control);
+        auto completed = std::make_unique<CuvsCagraIndexImpl>(std::move(dataset), std::move(next), old.metric);
+        *result = completed.release();
+        return CUVS_CAGRA_FOLD_OK;
+    } catch (const CuvsCagraFoldYield &) {
+        /* Unwind the temporary buffers first. A healthy stop leaves the
+         * borrowed stream alive for existing allocations that use it. */
+        if (!may_have_gpu_work || cagra_fold_stream_confirmed(scope ? &*scope : nullptr, false))
+            return CUVS_CAGRA_FOLD_YIELDED;
+        if (scope) scope->poison();
+        return CUVS_CAGRA_FOLD_CUDA_UNCONFIRMED;
+    } catch (const std::bad_alloc &) {
+        if (!may_have_gpu_work)
+            return CUVS_CAGRA_FOLD_OOM;
+        bool confirmed = cagra_fold_stream_confirmed(scope ? &*scope : nullptr);
+        if (scope) scope->poison();
+        return confirmed ? CUVS_CAGRA_FOLD_OOM : CUVS_CAGRA_FOLD_CUDA_UNCONFIRMED;
+    } catch (const std::exception &error) {
+        fprintf(stderr, "[cuvs_cagra_fold_reuse] %s\n", error.what());
+    } catch (...) {
+        fprintf(stderr, "[cuvs_cagra_fold_reuse] unknown exception\n");
+    }
+    bool confirmed = cagra_fold_stream_confirmed(scope ? &*scope : nullptr);
+    if (scope) scope->poison();
+    return confirmed ? CUVS_CAGRA_FOLD_ERROR : CUVS_CAGRA_FOLD_CUDA_UNCONFIRMED;
+}
+
+#endif /* PGCUVS_BETA3A_GPU_FOLD */
 
 /* ----------------------------------------------------------------
  * 3Q: cuvs_cagra_compact — merge-compact a CAGRA index removing dead vectors.

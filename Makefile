@@ -122,19 +122,34 @@ else
 CUVS_SDK_PLAN_NOTE = @echo "pg_cuvs: CUVS_SDK_SOURCE_INCLUDE is not set: the ACE effective partition count guarantee is OFF; the HNSW receipt will record the requested count (set CUVS_SDK_SOURCE_INCLUDE to the patched SDK cpp/src to turn it on)"
 endif
 
+# β3a GPU objects are opt-in. CPU and disabled native builds provide the
+# same unavailable C entry point without including SDK source or CUDA.
+PGCUVS_BETA3A_GPU_FOLD ?= 0
+CUVS_BETA3A_SDK_SOURCE ?= $(CUVS_SDK_SOURCE_INCLUDE)
+CUVS_FOLD_NATIVE = 0
+CUVS_FOLD_OBJ = src/cuvs_cagra_fold_unavailable.o
+
 # ---- CI Tier 1: CPU-reference shim (no CUDA/cuVS) -------------------------
 # `make PGCUVS_CPU_SHIM=1` swaps the nvcc-built cuVS wrapper for a pure-C CPU
 # shim (src/cuvs_wrapper_shim_cpu.c) so the extension + daemon build and run on
 # a GPU-less hosted CI runner — zero CUDA toolkit. See design/ci-strategy.md
 # (ADR-067). cuvs_wrapper.h is the single GPU boundary, so nothing else changes.
 ifdef PGCUVS_CPU_SHIM
-WRAPPER_OBJ      = src/cuvs_wrapper_shim_cpu.o
+WRAPPER_OBJ      = src/cuvs_wrapper_shim_cpu.o $(CUVS_FOLD_OBJ)
 CUVS_SO_LINK     = -lm
 CUVS_SERVER_LINK = -lm
 CUVS_LOGGER_LINK =
 else
-WRAPPER_OBJ      = src/cuvs_wrapper.o
-CUVS_SO_LINK     = -L$(CUVS_LIB) -lcuvs -lcudart -Wl,-rpath,$(CUVS_LIB)
+ifeq ($(CUVS_PAGE_FORMAT)$(PGCUVS_BETA3A_GPU_FOLD),11)
+CUVS_FOLD_NATIVE = 1
+CUVS_FOLD_OBJ = src/cuvs_cagra_fold_sdk.o
+CUVS_FOLD_CPPFLAGS = -DPGCUVS_BETA3A_GPU_FOLD
+CUVS_FOLD_PRODUCT_CPPFLAGS = -DCUVS_CAGRA_FOLD_ENABLED
+CUVS_FOLD_LINK = -fopenmp
+CUVS_FOLD_SO_LINK = -lrmm
+endif
+WRAPPER_OBJ      = src/cuvs_wrapper.o $(CUVS_FOLD_OBJ)
+CUVS_SO_LINK     = -L$(CUVS_LIB) -lcuvs $(CUVS_FOLD_SO_LINK) -lcudart -Wl,-rpath,$(CUVS_LIB)
 CUVS_SERVER_LINK = -L$(CUVS_LIB) -lcuvs -lrmm -lcudart -Wl,-rpath,$(CUVS_LIB)
 # The wrapper expands RMM_LOG_* (rmm/mr/pool_memory_resource.hpp), which call
 # rapids_logger::logger::log, defined in librapids_logger.so. libcuvs.so and
@@ -149,10 +164,14 @@ PG_CPPFLAGS    = -I$(CUVS_INCLUDE) -I$(CUVS_RAPIDS_INCLUDE) -I./src
 ifeq ($(CUVS_PAGE_FORMAT),1)
 PG_CPPFLAGS += -DCUVS_PAGE_FORMAT
 endif
+PG_CPPFLAGS += $(CUVS_FOLD_PRODUCT_CPPFLAGS)
 # -Wl,-rpath embeds the cuVS lib path so postmaster finds libcuvs.so
 # without LD_LIBRARY_PATH being set (ADR-007).
-SHLIB_LINK     = $(CUVS_SO_LINK) $(CUVS_LOGGER_LINK) $(CUVS_SDK_PLAN_LINK) \
+SHLIB_LINK     = $(CUVS_SO_LINK) $(CUVS_LOGGER_LINK) $(CUVS_SDK_PLAN_LINK) $(CUVS_FOLD_LINK) \
                  -Wl,-Bstatic -lstdc++ -Wl,-Bdynamic -lrt
+
+EXTRA_CLEAN += src/.cuvs-fold-mode src/cuvs_cagra_fold_sdk.o src/cuvs_cagra_fold_sdk.bc \
+               src/cuvs_cagra_fold_unavailable.o src/cuvs_cagra_fold_unavailable.bc
 
 PG_CONFIG     ?= pg_config
 PGXS         := $(shell $(PG_CONFIG) --pgxs)
@@ -164,6 +183,7 @@ include $(PGXS)
 # daemon. Force every extension object to rebuild when ANY project header
 # changes. (The daemon objects get the same blanket rule via SERVER_ALL_OBJS.)
 $(OBJS): $(wildcard src/*.h)
+$(OBJS) $(OBJS:.o=.bc): src/.cuvs-fold-mode
 
 # Build CUDA object before linking the .so. Pattern rule overrides PGXS
 # default for this specific file since .cu needs nvcc, not gcc.
@@ -176,9 +196,38 @@ endif
 
 src/cuvs_wrapper.o: src/cuvs_wrapper.cu src/cuvs_wrapper.h src/cuvs_hnsw_sdk_plan.cuh \
                     src/cuvs_hnsw_nn_sdk_params.cuh src/cuvs_hnsw_nn_precision.h src/cuvs_hnsw_nn_capacity.h src/cuvs_hnsw_nn_upper_contract.h src/cuvs_hnsw_nn_center.h \
-                    src/cuvs_failed_allocation.hpp src/cuvs_rmm_failure_resource.hpp
+                    src/cuvs_failed_allocation.hpp src/cuvs_rmm_failure_resource.hpp \
+                    src/cuvs_cagra_fold.h src/cuvs_cagra_fold_capacity.h src/cuvs_cagra_fold_sdk.hpp src/.cuvs-fold-mode
 	$(CUVS_SDK_PLAN_NOTE)
-	$(NVCC) $(NVCC_FLAGS) $(CUVS_SDK_PLAN_FLAGS) -I$(CUVS_INCLUDE) -I$(CUVS_RAPIDS_INCLUDE) -I./src -c $< -o $@
+	$(NVCC) $(NVCC_FLAGS) $(CUVS_SDK_PLAN_FLAGS) $(CUVS_FOLD_CPPFLAGS) -I$(CUVS_INCLUDE) -I$(CUVS_RAPIDS_INCLUDE) -I./src -c $< -o $@
+
+# A mode change must relink the products even when switching back to older
+# OFF prerequisites in the same build directory.
+.PHONY: cuvs-force-fold-mode
+src/.cuvs-fold-mode: cuvs-force-fold-mode
+	@tmp=$$(mktemp "$@.XXXXXX") && \
+	  printf '%s\n' '$(CUVS_FOLD_NATIVE) $(if $(filter 1,$(CUVS_PAGE_FORMAT)),1,0)' > "$$tmp" && \
+	  if cmp -s "$$tmp" "$@"; then rm "$$tmp"; else mv "$$tmp" "$@"; fi
+
+# Match the existing wrapper objects' C linkage on disabled builds.
+src/cuvs_cagra_fold_unavailable.o: src/cuvs_cagra_fold_unavailable.c src/cuvs_cagra_fold.h src/cuvs_wrapper.h
+	$(CC) -O2 -g -fPIC -I./src -std=gnu11 -c $< -o $@
+
+ifeq ($(CUVS_FOLD_NATIVE),1)
+.PHONY: verify-cagra-fold-sdk
+verify-cagra-fold-sdk:
+	python3 scripts/verify-cagra-fold-sdk.py --source '$(CUVS_BETA3A_SDK_SOURCE)'
+
+src/cuvs_cagra_fold_sdk.o: src/cuvs_cagra_fold_sdk.cu src/cuvs_cagra_fold_sdk.hpp src/cuvs_cagra_fold_capacity.h | verify-cagra-fold-sdk
+	$(NVCC) $(filter-out -std=%,$(NVCC_FLAGS)) -std=c++20 --expt-relaxed-constexpr \
+	    -DCUDA_API_PER_THREAD_DEFAULT_STREAM -Xcompiler=-fopenmp \
+	    -I$(CUVS_INCLUDE) -I$(CUVS_RAPIDS_INCLUDE) -I./src \
+	    -I'$(CUVS_BETA3A_SDK_SOURCE)/neighbors/detail/cagra' -c $< -o $@
+
+# PGXS links one bitcode file per object. CUDA entry points live in the ELF.
+src/cuvs_cagra_fold_sdk.bc: src/cuvs_cagra_fold_sdk.cu
+	printf 'void cuvs_cagra_fold_sdk_jit_stub(void){}\n' | $(CLANG) -x c -emit-llvm -c - -o $@
+endif
 
 # PGXS generates LLVM bitcode (.bc) from .c sources for JIT. The .cu file
 # has no PG-callable functions, so emit a stub bitcode so PGXS doesn't fail.
@@ -201,11 +250,11 @@ SERVER_CFLAGS  = -O2 -g -Wall -Wextra -I./src \
                  -D_POSIX_C_SOURCE=200809L
 # Optional sanitizer/debug hooks for the daemon (e.g. CI ASAN job passes
 # EXTRA_SERVER_CFLAGS="-fsanitize=address -fno-omit-frame-pointer"). Empty by default.
-SERVER_CFLAGS += $(EXTRA_SERVER_CFLAGS)
+SERVER_CFLAGS += $(EXTRA_SERVER_CFLAGS) $(CUVS_FOLD_PRODUCT_CPPFLAGS)
 ifdef PGCUVS_CPU_SHIM
 SERVER_CFLAGS += -DPGCUVS_CPU_SHIM
 endif
-SERVER_LDFLAGS = $(CUVS_SERVER_LINK) $(CUVS_LOGGER_LINK) $(CUVS_SDK_PLAN_LINK) -lstdc++ \
+SERVER_LDFLAGS = $(CUVS_SERVER_LINK) $(CUVS_LOGGER_LINK) $(CUVS_SDK_PLAN_LINK) $(CUVS_FOLD_LINK) -lstdc++ \
                  -lpthread -lrt \
                  -lcurl -lssl -lcrypto
 SERVER_LDFLAGS += $(EXTRA_SERVER_LDFLAGS)
@@ -228,7 +277,7 @@ SERVER_ALL_OBJS = src/pg_cuvs_server.o src/cuvs_objstore_server.o \
 $(SERVER_ALL_OBJS): $(wildcard src/*.h)
 
 # server .c → .o (not via PGXS — separate rule with no PG headers)
-src/pg_cuvs_server.o: src/pg_cuvs_server.c src/cuvs_ipc.h src/cuvs_page_overlay.h src/cuvs_util.h src/cuvs_wrapper.h src/cuvs_objstore.h src/cuvs_build_corpus.h src/cuvs_bf_verdict.h
+src/pg_cuvs_server.o: src/pg_cuvs_server.c src/cuvs_ipc.h src/cuvs_page_overlay.h src/cuvs_util.h src/cuvs_wrapper.h src/cuvs_objstore.h src/cuvs_build_corpus.h src/cuvs_bf_verdict.h src/.cuvs-fold-mode
 	$(CC) $(SERVER_CFLAGS) -c $< -o $@
 
 # cuvs_objstore.o for server (GCS client — not linked into the PG extension .so)
@@ -288,7 +337,7 @@ install-server: server
 SERVER_TEST_BIN     = pg_cuvs_server_test
 SERVER_TEST_CFLAGS  = $(SERVER_CFLAGS) -DCUVS_TEST_HOOKS
 
-src/pg_cuvs_server_test.o: src/pg_cuvs_server.c src/cuvs_ipc.h src/cuvs_page_overlay.h src/cuvs_util.h src/cuvs_wrapper.h src/cuvs_objstore.h src/cuvs_bf_verdict.h
+src/pg_cuvs_server_test.o: src/pg_cuvs_server.c src/cuvs_ipc.h src/cuvs_page_overlay.h src/cuvs_util.h src/cuvs_wrapper.h src/cuvs_objstore.h src/cuvs_bf_verdict.h src/.cuvs-fold-mode
 	$(CC) $(SERVER_TEST_CFLAGS) -c $< -o $@
 
 src/cuvs_ipc_server_test.o: src/cuvs_ipc.c src/cuvs_ipc.h src/cuvs_build_corpus.h
@@ -597,10 +646,37 @@ test-admission-wire: test/unit/test_admission_wire.c src/cuvs_admission_contract
 
 # GPU-only (real CUDA build, not the shim): I3-A wrapper checks (dim%4 padded
 # single dataset copy, attach, self-queries). Run after `make all server`.
-test-gpu-wrapper-i3: test/gpu/test_wrapper_i3.c src/cuvs_wrapper.o src/cuvs_util_server.o src/cuvs_peak_meter_server.o
-	$(CC) -std=gnu11 -Wall -Wextra -I src -c test/gpu/test_wrapper_i3.c -o $@.o
-	$(CXX) -o $@ $@.o src/cuvs_wrapper.o src/cuvs_util_server.o src/cuvs_peak_meter_server.o $(SHLIB_LINK) -lpthread -lm
+test-gpu-wrapper-i3: test/gpu/test_wrapper_i3.c src/cuvs_wrapper.o $(CUVS_FOLD_OBJ) src/cuvs_util_server.o src/cuvs_peak_meter_server.o
+	$(CC) -std=gnu11 -Wall -Wextra -I src -c $< -o $@.o
+	$(CXX) -o $@ $@.o $(filter %.o,$^) $(SHLIB_LINK) -lpthread -lm
 	./$@
+
+# Exercise the actual mode-selected wrapper and fold objects from plain C.
+.PHONY: test-cagra-fold-build
+test-cagra-fold-build: test/unit/test_cagra_fold_build.c test/gpu/test_cagra_fold_early.cpp $(WRAPPER_OBJ) src/cuvs_util_server.o src/cuvs_peak_meter_server.o
+	$(CC) -std=gnu11 -Wall -Wextra -Werror -I src -DCUVS_EXPECT_GPU_FOLD=$(CUVS_FOLD_NATIVE) -c $< -o $@.o
+	$(CXX) -std=c++17 -Wall -Wextra -Werror -I src -c test/gpu/test_cagra_fold_early.cpp -o $@.early.o
+	$(CXX) -o $@ $@.o $@.early.o $(filter %.o,$^) $(SERVER_LDFLAGS) -Wl,--wrap=_Znwm -lm
+	./$@
+EXTRA_CLEAN += test-cagra-fold-build test-cagra-fold-build.o test-cagra-fold-build.early.o
+
+.PHONY: test-rmm-fold-backing
+test-rmm-fold-backing: test/i3b/gpu_failed_upstream.cu src/cuvs_rmm_failure_resource.hpp src/cuvs_admission_contract.h
+	$(NVCC) $(NVCC_FLAGS) -DPGCUVS_BETA3A_GPU_FOLD -I$(CUVS_INCLUDE) -I$(CUVS_RAPIDS_INCLUDE) -I src -c $< -o $@.o
+	$(CXX) -o $@ $@.o $(SERVER_LDFLAGS)
+	./$@
+EXTRA_CLEAN += test-rmm-fold-backing test-rmm-fold-backing.o
+
+.PHONY: test-page-fold-gate-log
+test-page-fold-gate-log:
+	python3 -B test/page_format/test_fold_gate_log.py
+
+.PHONY: test-cagra-fold-capacity
+test-unit: test-cagra-fold-capacity
+test-cagra-fold-capacity: test/unit/test_cagra_fold_capacity.c src/cuvs_cagra_fold_capacity.h src/cuvs_admission_contract.h
+	$(CC) -std=gnu11 -Wall -Wextra -Werror -I src -o $@ $<
+	./$@
+EXTRA_CLEAN += test-cagra-fold-capacity
 
 # The build-OOM flag is per thread (CPU shim mirrors the GPU wrapper).
 test-build-oom-thread: test/unit/test_build_oom_thread.c src/cuvs_wrapper_shim_cpu.c src/cuvs_wrapper.h
@@ -1382,6 +1458,22 @@ test-hnsw-route-daemon:
 		src/cuvs_cache_policy.c src/cuvs_peak_meter.c src/cuvs_page_overlay.c \
 		-Wl,--gc-sections -lm -lpthread -lrt -lcurl -lssl -lcrypto -o test-hnsw-route-daemon
 	./test-hnsw-route-daemon
+
+# Fold-enabled daemon admission with the CPU shim and controlled claims.
+EXTRA_CLEAN += test-page-fold-admission
+FOLD_ADMISSION_CASE ?=
+.PHONY: test-page-fold-admission
+ifeq ($(shell uname -s),Linux)
+test-unit: test-page-fold-admission
+endif
+test-page-fold-admission:
+	$(CC) -std=gnu11 -O1 -DPGCUVS_CPU_SHIM -DCUVS_CAGRA_FOLD_ENABLED -ffunction-sections -fdata-sections -I src \
+		test/unit/test_hnsw_route_daemon.c src/cuvs_ipc.c src/cuvs_util.c \
+		src/cuvs_objstore.c src/cuvs_build_corpus.c src/cuvs_wrapper_shim_cpu.c \
+		src/cuvs_cache_policy.c src/cuvs_peak_meter.c src/cuvs_page_overlay.c src/cuvs_hnsw_upper.c \
+		src/cuvs_cagra_fold_unavailable.c \
+		-Wl,--gc-sections -lm -lpthread -lrt -lcurl -lssl -lcrypto -o $@
+	./$@ $(FOLD_ADMISSION_CASE)
 
 # Each planted AR8 defect must turn an AR8 test RED. The daemon cases need
 # Linux (elsewhere they are SKIP and the run fails). AR8_MUTATION_OUT must be

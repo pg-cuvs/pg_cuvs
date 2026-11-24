@@ -5100,6 +5100,12 @@ page_search_request(Relation index, Snapshot snapshot, int dim,
     *blocks = RelationGetNumberOfBlocks(index);
     if (!cuvs_cagra_read_meta(index, meta))
         return false;
+#ifdef CUVS_CAGRA_FOLD_ENABLED
+    /* The physical transition can be newer than this query's MVCC snapshot.
+     * Avoid ranking its newly folded rows for a snapshot that predates it. */
+    if (meta->last_fold_xid && XidInMVCCSnapshot((TransactionId) meta->last_fold_xid, snapshot))
+        return false;
+#endif
     cuvs_cagra_check_dim(meta->dim, dim);
     if (!meta->graph_nonce || !cuvs_cagra_read_tail(index, meta, *blocks, &request->tail) ||
         request->tail < meta->folded)
@@ -5258,6 +5264,9 @@ page_resolve_overlay(IndexScanDesc scan, CuvsScanState *ss, const CuvsCagraMeta 
     IndexFetchTableData *fetch = table_index_fetch_begin(heap);
     TupleTableSlot *tuple = table_slot_create(heap, NULL);
     bool valid = true;
+#ifdef CUVS_CAGRA_FOLD_ENABLED
+    uint64 physical_dead = 0;
+#endif
 
     ss->n_results = 0;
     for (int i = 0; i < count && ss->n_results < cuvs_k; ++i)
@@ -5290,7 +5299,18 @@ page_resolve_overlay(IndexScanDesc scan, CuvsScanState *ss, const CuvsCagraMeta 
             break;
         }
         if (state == CUVS_CAGRA_SLOT_DEAD)
+        {
+#ifdef CUVS_CAGRA_FOLD_ENABLED
+            /* VACUUM can WAL-log TID pages before publishing their count.
+             * Use exact search if the physical losses exhaust the allowance. */
+            if (request->folded && ++physical_dead > request->dead_slots)
+            {
+                valid = false;
+                break;
+            }
+#endif
             continue;
+        }
         /* Heap fetch may replace the root with a visible HOT child. The
          * PostgreSQL index scan must still give its caller the root TID. */
         visible = root;
@@ -5326,6 +5346,16 @@ page_start_search(IndexScanDesc scan, CuvsScanState *ss)
                              &meta, &ss->page_blocks, &request))
         return false;
     k = cuvs_k + (int) Min(meta.dead_slots, (uint64) cuvs_k);
+#ifdef CUVS_CAGRA_FOLD_ENABLED
+    if (request.folded != 0)
+    {
+        /* Known invalid slots consume places in the daemon's ranked list.
+         * Ordinary MVCC invisibility is handled by the existing resolver. */
+        if (meta.dead_slots > (uint64) (CUVS_PAGE_SEARCH_MAX_K - cuvs_k))
+            return false;
+        k = cuvs_k + (int) meta.dead_slots;
+    }
+#endif
 
     if (request.tail == request.folded && request.folded == 0)
     {
@@ -7822,6 +7852,20 @@ pg_cuvs_compact(PG_FUNCTION_ARGS)
 
     cuvs_require_index_owner(index_oid);
 #ifdef CUVS_PAGE_FORMAT
+#ifdef CUVS_CAGRA_FOLD_ENABLED
+    if (cuvs_relation_is_page_cagra(indexRel))
+    {
+        if (XactReadOnly)
+            ereport(ERROR, (errcode(ERRCODE_READ_ONLY_SQL_TRANSACTION),
+                            errmsg("CAGRA fold cannot run in a read-only transaction")));
+        if (IsTransactionBlock() || IsSubTransaction())
+            ereport(ERROR, (errcode(ERRCODE_ACTIVE_SQL_TRANSACTION),
+                            errmsg("CAGRA fold cannot run inside a transaction block or subtransaction")));
+        cuvs_cagra_run_fold_worker(indexRel);
+        index_close(indexRel, AccessShareLock);
+        PG_RETURN_VOID();
+    }
+#endif
     cuvs_require_legacy_operation(indexRel);
 #endif
 

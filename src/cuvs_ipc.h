@@ -202,6 +202,7 @@ typedef struct CuvsExtraSearchReply {
 #define CUVS_PAGE_INDEX_DIR_SIZE 256 /* fixed path field on the wire */
 #define CUVS_PAGE_SLOT_INVALID UINT64_MAX
 #define CUVS_PAGE_BUILD_DEFER_LEGACY 1U
+#define CUVS_PAGE_SEARCH_MAX_K 4000
 #define CUVS_PAGE_BATCH_MAX 4096U
 #define CUVS_PAGE_OVERLAY_MAX 200000U
 
@@ -232,7 +233,7 @@ typedef struct CuvsPageSearchRequest
     uint64_t tail;
     uint64_t dead_slots;
     float    resume_distance;
-    uint32_t reserved;
+    uint32_t reserved; /* Fold-enabled SUPPLY_PAGES carries a one-based live base slot hint. */
 } CuvsPageSearchRequest;
 
 /* Only new overlay opcodes use this extended frame. Existing page search
@@ -284,6 +285,8 @@ typedef struct CuvsPageOverlayResult
 int cuvs_ipc_supply_pages(const char *socket_path, uint32_t db_oid, uint32_t index_oid,
     const CuvsPageOverlayRequest *request, int dim, uint32_t metric,
     const CuvsPageSupplement *supplement, CuvsPageProgress *progress);
+int cuvs_ipc_query_page_supply(const char *socket_path, uint32_t db_oid, uint32_t index_oid,
+    const CuvsPageOverlayRequest *request, int dim, uint32_t metric, CuvsPageProgress *progress);
 
 /* results must hold nq * k entries. Batch rows pad unused positions with
  * CUVS_PAGE_SLOT_INVALID; base graph rows use block=0 (no heap block hint). */
@@ -330,6 +333,9 @@ bool cuvs_page_fold_event_valid(const CuvsPageFoldEvent *event);
  * The output is written only after a complete, validated OK reply. */
 int cuvs_ipc_page_fold_ready(const char *socket_path, uint32_t db_oid,
     uint64_t system_identifier, uint64_t boot_id, CuvsPageFoldEvent *event);
+/* An index-specific consumer receives events only for that incarnation. */
+int cuvs_ipc_page_fold_ready_index(const char *socket_path, uint32_t db_oid, uint32_t index_oid,
+    uint64_t index_nonce, uint64_t system_identifier, uint64_t boot_id, CuvsPageFoldEvent *event);
 
 /* A nonzero LSN sends COMMITTED. Zero sends DISCARD. Both replies are status-only. */
 int cuvs_ipc_page_fold_result(const char *socket_path, const CuvsPageFoldEvent *event,

@@ -32,6 +32,11 @@ typedef struct CuvsPageOverlay
     CuvsPageOverlayChunk *head;
 } CuvsPageOverlay;
 
+/* Charge externally allocated fold staging before it can coexist with the
+ * packed overlay chunks. Every successful reservation owns one release. */
+bool cuvs_page_overlay_reserve(CuvsPageOverlayBudget *budget, size_t bytes);
+void cuvs_page_overlay_unreserve(CuvsPageOverlayBudget *budget, size_t bytes);
+
 uint32_t cuvs_page_overlay_alloc(CuvsPageOverlayBudget *budget,
                                  const CuvsPageOverlayRequest *request, size_t bytes,
                                  CuvsPageOverlayChunk **result);

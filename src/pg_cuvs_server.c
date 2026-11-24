@@ -34,6 +34,10 @@
 #include "cuvs_peak_meter.h"
 #include <stdarg.h>
 #include "cuvs_wrapper.h"
+#include "cuvs_cagra_fold.h"
+#ifdef CUVS_CAGRA_FOLD_ENABLED
+#include "cuvs_cagra_fold_capacity.h"
+#endif
 #include "cuvs_hnsw_build_common.h"
 #include "cuvs_hnsw_upper.h"
 #include "cuvs_objstore.h"
@@ -405,6 +409,12 @@ typedef struct PageCagraGraph
     uint64_t fold_lsn;
     uint64_t fold_offer_order;
     bool fold_seen_by_pg;
+#ifdef CUVS_CAGRA_FOLD_ENABLED
+    uint64_t fold_pending_since;
+    uint64_t fold_retry_after;
+    uint32_t fold_live_base_slot;
+    uint64_t fold_protected_us;
+#endif
 } PageCagraGraph;
 
 /* An initialized token belongs to one fold and must be released on all
@@ -425,6 +435,22 @@ static size_t g_page_graph_bytes[CUVS_MAX_GPUS];
 static CuvsPageOverlayBudget g_page_overlay_budget;
 static _Thread_local CuvsPageOverlayChunk *g_retired_page_overlays;
 static _Thread_local PageCagraGraph *g_retired_fold_graphs;
+
+#ifdef CUVS_CAGRA_FOLD_ENABLED
+static uint64_t admission_mono_us(void);
+static void initialize_page_daemon_id(void);
+#define FOLD_EVENT_LOG " daemon_id=%llu system_identifier=%llu boot_id=%llu index_nonce=%llu graph_nonce=%llu"
+#define FOLD_EVENT_FIELDS(event) \
+    (unsigned long long) (event).daemon_id, (unsigned long long) (event).system_identifier, \
+    (unsigned long long) (event).boot_id, (unsigned long long) (event).index_nonce, \
+    (unsigned long long) (event).graph_nonce
+
+static uint64_t g_fold_request_sequence;
+static _Thread_local const CuvsCmdFrame *t_fold_request;
+static _Thread_local const char *t_fold_request_op;
+static _Thread_local uint64_t t_fold_request_id;
+static _Thread_local uint64_t t_fold_request_started;
+#endif
 
 static void
 defer_page_overlay_release(CuvsPageOverlayChunk *head)
@@ -503,12 +529,20 @@ release_retired_fold_graphs(void)
 /* Candidates are owned by their parent until an ACK installs them in the
  * registry. A search only uses the candidate handle under g_index_mutex. */
 static void
-discard_page_fold_locked(PageCagraGraph *parent)
+discard_page_fold_locked(PageCagraGraph *parent, const char *reason)
 {
     PageCagraGraph *candidate = parent->fold_candidate;
 
     if (candidate)
     {
+#ifdef CUVS_CAGRA_FOLD_ENABLED
+        if (candidate->fold_protected_us || candidate->fold_seen_by_pg)
+            LOG_INFO("[page_fold_end] db=%u index=%u gpu=%d reason=%s mono_us=%llu" FOLD_EVENT_LOG "\n",
+                     candidate->db_oid, candidate->index_oid, candidate->gpu, reason,
+                     (unsigned long long) admission_mono_us(), FOLD_EVENT_FIELDS(candidate->fold_event));
+#else
+        (void) reason;
+#endif
         parent->fold_candidate = NULL;
         defer_fold_graph_dispose(candidate);
     }
@@ -519,7 +553,7 @@ retire_page_graph_locked(PageCagraGraph *entry, bool defer_dispose)
 {
     entry->next = NULL;
     entry->fold_retired = true;
-    discard_page_fold_locked(entry);
+    discard_page_fold_locked(entry, "retired");
     if (entry->fold_pins == 0)
     {
         if (defer_dispose)
@@ -669,8 +703,13 @@ page_graph_use_boot_locked(PageCagraGraph *graph, uint64_t boot_id,
         boot->next = graph->retired_boots;
         graph->retired_boots = boot;
     }
-    discard_page_fold_locked(graph);
+    discard_page_fold_locked(graph, "pg_lifetime");
     *obsolete = cuvs_page_overlay_start_boot(&graph->overlay, boot_id, graph->folded);
+#ifdef CUVS_CAGRA_FOLD_ENABLED
+    graph->fold_pending_since = 0;
+    graph->fold_retry_after = 0;
+    graph->fold_live_base_slot = 0;
+#endif
     return true;
 }
 
@@ -789,6 +828,15 @@ static uint64_t g_cache_persist_fail[CUVS_MAX_GPUS];
  * g_indexes, so total_vram_used() adds this so concurrent admission/eviction
  * still accounts for the build's VRAM. Mutated under g_index_mutex. */
 static size_t   g_pending_build_vram[CUVS_MAX_GPUS];
+#ifdef CUVS_CAGRA_FOLD_ENABLED
+/* One producer per device. Admission waits with the registry unlocked. */
+static bool g_fold_active[CUVS_MAX_GPUS];
+static size_t g_fold_claim[CUVS_MAX_GPUS];
+static unsigned g_fold_waiters[CUVS_MAX_GPUS];
+static pthread_cond_t g_fold_finished = PTHREAD_COND_INITIALIZER;
+static pthread_t g_fold_threads[CUVS_MAX_GPUS];
+static bool g_fold_thread_started[CUVS_MAX_GPUS];
+#endif
 static int      g_pending_build_count[CUVS_MAX_GPUS];   /* I3-B: solo flag */
 
 /* Existing lock-free shard searches and HNSW exports may allocate GPU scratch
@@ -1338,6 +1386,10 @@ gpu_free_vram_bytes(int device_id)
     size_t available = cuvs_vram_free_bytes_on(device_id);
     size_t pending = g_rmm_pool_limits[device_id] > 0
         ? g_pending_rmm_build_vram[device_id] : 0;
+#ifdef CUVS_CAGRA_FOLD_ENABLED
+    if (g_rmm_pool_limits[device_id] == 0 && g_fold_claim[device_id])
+        pending = g_pending_build_vram[device_id];
+#endif
     return pending < available ? available - pending : 0;
 }
 
@@ -3859,17 +3911,23 @@ evict_skipped(const EvictSkip *sk, int n, const IndexEntry *e)
     return 0;
 }
 
+#ifdef CUVS_CAGRA_FOLD_ENABLED
+static uint64_t page_fold_unoffered_bytes_locked(int device);
+static size_t page_fold_reclaim_unoffered_locked(int device);
+#endif
+
 /*
  * Free `need` bytes on device_id for requester rq under the C1 RQ table:
  * one pre-summed pick (nothing evicted on a reject), then victims in order.
  * A victim whose save fails is skipped and the pick is redone for the
  * remainder (EV-3/EV-4 save-failure rule). slot_mode treats every entry as
  * 1 "byte" so the same rules choose a registry slot (reason `slot`).
+ * A preview stops after the policy pick, before returning any resources.
  * Returns 0 when satisfied, -1 otherwise; *pick_out gets the last pick.
  */
 static int
 make_room(int device_id, CuvsRequester rq, uint64_t need, int slot_mode,
-          CuvsEvictPick *pick_out)
+          CuvsEvictPick *pick_out, bool allow_fold_candidates, bool preview)
 {
     EvictSkip skip[64];
     int n_skip = 0;
@@ -3928,6 +3986,12 @@ make_room(int device_id, CuvsRequester rq, uint64_t need, int slot_mode,
         req.scope = g_reclaim.scope;
         req.soft_evict = g_reclaim.soft_evict;
         req.need = need;
+#ifdef CUVS_CAGRA_FOLD_ENABLED
+        uint64_t fold_bytes = allow_fold_candidates ? page_fold_unoffered_bytes_locked(device_id) : 0;
+        req.need -= fold_bytes < need ? fold_bytes : need;
+#else
+        (void) allow_fold_candidates;
+#endif
         req.now = (int64_t)time(NULL);
         CuvsEvictParams pp = evict_params_now();
         cuvs_evict_pick(cands, n, &pp, &req, victims, reasons, pick_out);
@@ -3936,8 +4000,28 @@ make_room(int device_id, CuvsRequester rq, uint64_t need, int slot_mode,
             free(cands); free(victims); free(reasons); free(keys);
             return -1;
         }
+        if (preview)
+        {
+            free(cands); free(victims); free(reasons); free(keys);
+            return 0;
+        }
         int failed = 0;
-        for (int v = 0; v < pick_out->n_victims; v++)
+#ifdef CUVS_CAGRA_FOLD_ENABLED
+        /* Only apply the credit after the ordinary policy approves the
+         * remainder. Its candidate list still excludes both fold parents. */
+        while (need > req.need)
+        {
+            size_t reclaimed = page_fold_reclaim_unoffered_locked(device_id);
+
+            if (!reclaimed)
+            {
+                free(cands); free(victims); free(reasons); free(keys);
+                return -1;
+            }
+            need = reclaimed >= need ? 0 : need - reclaimed;
+        }
+#endif
+        for (int v = 0; v < pick_out->n_victims && need; v++)
         {
             EvictTarget key = keys[victims[v]];
             uint64_t unit = slot_mode ? 1 : cands[victims[v]].bytes;
@@ -3992,7 +4076,7 @@ make_slot(int device_id, CuvsRequester rq)
 {
     if (g_n_indexes < g_max_indexes)
         return 1;
-    (void) make_room(device_id, rq, 1, 1, NULL);
+    (void) make_room(device_id, rq, 1, 1, NULL, false, false);
     return g_n_indexes < g_max_indexes;
 }
 
@@ -4003,7 +4087,7 @@ static size_t
 evict_lru(int device_id, CuvsRequester rq)
 {
     size_t before = resident_bytes(device_id) + g_page_graph_bytes[device_id];
-    if (make_room(device_id, rq, 1, 0, NULL) != 0)
+    if (make_room(device_id, rq, 1, 0, NULL, false, false) != 0)
         return 0;
     size_t after = resident_bytes(device_id) + g_page_graph_bytes[device_id];
     return before > after ? before - after : 0;
@@ -4029,6 +4113,194 @@ release_build_vram(size_t needed, int device_id)
     if (g_rmm_pool_limits[device_id] > 0)
         g_pending_rmm_build_vram[device_id] -= needed;
 }
+
+#ifdef CUVS_CAGRA_FOLD_ENABLED
+static int
+page_fold_should_yield(void *context)
+{
+    const int device = *(const int *) context;
+
+    return __atomic_load_n(&g_fold_waiters[device], __ATOMIC_SEQ_CST) != 0;
+}
+
+static uint32_t
+page_fold_active_devices_locked(void)
+{
+    uint32_t devices = 0;
+
+    for (int dev = 0; dev < CUVS_MAX_GPUS; ++dev)
+        if (g_fold_active[dev])
+            devices |= UINT32_C(1) << dev;
+    return devices;
+}
+
+static PageCagraGraph *
+page_fold_unoffered_parent_locked(int device)
+{
+    for (PageCagraGraph *parent = g_page_graphs; parent; parent = parent->next)
+    {
+        const PageCagraGraph *candidate = parent->fold_candidate;
+
+        if (parent->gpu == device && candidate && candidate->bytes &&
+            !candidate->fold_protected_us && !candidate->fold_seen_by_pg)
+            return parent;
+    }
+    return NULL;
+}
+
+static uint64_t
+page_fold_unoffered_bytes_locked(int device)
+{
+    uint64_t bytes = 0;
+
+    for (const PageCagraGraph *parent = g_page_graphs; parent; parent = parent->next)
+    {
+        const PageCagraGraph *candidate = parent->fold_candidate;
+
+        if (parent->gpu == device && candidate &&
+            !candidate->fold_protected_us && !candidate->fold_seen_by_pg)
+            bytes = cuvs_admission_sat_add(bytes, candidate->bytes);
+    }
+    return bytes;
+}
+
+/* Leave ordinary placement alone if that device can fit. If it cannot,
+ * consider devices whose reclaimable READY candidates cover the shortfall. */
+static int
+pick_gpu_for_build(size_t needed, CuvsRequester rq)
+{
+    int preferred = pick_gpu_for_index(needed);
+    int alternative = -1;
+    uint64_t best_room = 0;
+
+    for (int i = 0; preferred >= 0 && i < n_usable_gpus(); ++i)
+    {
+        int dev = usable_gpu(i);
+        uint64_t reclaimable = page_fold_unoffered_bytes_locked(dev);
+        uint64_t limit = budget_eff_bytes(dev);
+
+        if (!reclaimable || (limit && needed > limit))
+            continue;
+        uint64_t free = gpu_free_vram_bytes(dev);
+        uint64_t projected_used = cuvs_admission_sat_add(total_vram_used(dev), needed);
+        uint64_t physical_short = needed > free ? needed - free : 0;
+        uint64_t budget_short = limit && projected_used > limit ? projected_used - limit : 0;
+        uint64_t room = cuvs_admission_sat_add(free, reclaimable);
+        if (limit)
+        {
+            uint64_t used = total_vram_used(dev);
+            uint64_t still_used = used > reclaimable ? used - reclaimable : 0;
+            uint64_t remaining = still_used < limit ? limit - still_used : 0;
+
+            if (remaining < room)
+                room = remaining;
+        }
+        if (room < needed)
+        {
+            uint64_t shortfall = physical_short > budget_short ? physical_short : budget_short;
+
+            /* A child that cannot cover the shortfall alone can still fit
+             * together with the victims already allowed by this request's
+             * policy. Use the same pick as admission, without freeing here. */
+            if (make_room(dev, rq, shortfall, 0, NULL, true, true) != 0)
+                continue;
+            room = needed;
+        }
+        if (room >= needed && room > best_room)
+        {
+            best_room = room;
+            alternative = dev;
+        }
+    }
+    if (alternative >= 0)
+    {
+        uint64_t limit = budget_eff_bytes(preferred);
+        uint64_t used = total_vram_used(preferred);
+
+        if (gpu_free_vram_bytes(preferred) < needed ||
+            (limit && (used >= limit || needed > limit - used)))
+            return alternative;
+    }
+    return preferred;
+}
+
+/* Under admission pressure only. READY and preview lookup use the same
+ * mutex. Free the unexposed child before returning its charge to admission. */
+static size_t
+page_fold_reclaim_unoffered_locked(int device)
+{
+    PageCagraGraph *parent = page_fold_unoffered_parent_locked(device);
+
+    if (!parent)
+        return 0;
+    PageCagraGraph *candidate = parent->fold_candidate;
+    size_t bytes = candidate->bytes;
+    parent->fold_candidate = NULL;
+    parent->fold_retry_after = admission_mono_us() + UINT64_C(1000000);
+    LOG_INFO("[page_fold_reclaim] gpu=%d db=%u index=%u bytes=%zu\n",
+             device, parent->db_oid, parent->index_oid, candidate->bytes);
+    release_page_graph_resources(candidate);
+    finish_page_graph_dispose(candidate);
+    return bytes;
+}
+
+/* Call with the registry lock held. After a wait, callers re-resolve all
+ * registry pointers and admission state while still holding the lock.
+ * A sharded build can use any allowed device, including its fallback. */
+static bool
+page_fold_wait_locked(int device, int client_fd, const CuvsCmdFrame *cmd, const char *op)
+{
+    uint64_t start;
+    uint32_t devices = 0;
+    bool withdrawn = false;
+
+    if (device >= 0)
+        devices = UINT32_C(1) << device;
+    else
+        for (int i = 0; i < n_usable_gpus(); ++i)
+            devices |= UINT32_C(1) << usable_gpu(i);
+    if (!(page_fold_active_devices_locked() & devices))
+        return true;
+    start = admission_mono_us();
+    for (int dev = 0; dev < CUVS_MAX_GPUS; ++dev)
+        if (devices & (UINT32_C(1) << dev))
+            __atomic_fetch_add(&g_fold_waiters[dev], 1, __ATOMIC_SEQ_CST);
+    for (;;)
+    {
+        struct timespec wake;
+        struct pollfd peer = {.fd = client_fd, .events = 0};
+
+        if (poll(&peer, 1, 0) > 0 && (peer.revents & (POLLHUP | POLLERR | POLLNVAL)))
+        {
+            withdrawn = true;
+            break;
+        }
+        if (!(page_fold_active_devices_locked() & devices))
+            break;
+        clock_gettime(CLOCK_REALTIME, &wake);
+        wake.tv_nsec += 100000000;
+        if (wake.tv_nsec >= 1000000000)
+        {
+            wake.tv_nsec -= 1000000000;
+            ++wake.tv_sec;
+        }
+        pthread_cond_timedwait(&g_fold_finished, &g_index_mutex, &wake);
+    }
+    for (int dev = 0; dev < CUVS_MAX_GPUS; ++dev)
+        if (devices & (UINT32_C(1) << dev))
+            __atomic_fetch_sub(&g_fold_waiters[dev], 1, __ATOMIC_SEQ_CST);
+    uint64_t finished = admission_mono_us();
+    LOG_INFO("[page_fold_admission] op=%s db=%u index=%u gpu=%d wait_us=%llu withdrawn=%d gpu_mask=%X"
+             " daemon_id=%llu request_id=%llu wait_started_us=%llu mono_us=%llu\n",
+             op, cmd->db_oid, cmd->index_oid, device,
+             (unsigned long long) (finished - start), withdrawn, devices,
+             (unsigned long long) g_page_daemon_id, (unsigned long long) t_fold_request_id,
+             (unsigned long long) start, (unsigned long long) finished);
+    return !withdrawn;
+}
+#else
+#define pick_gpu_for_build(needed, rq) pick_gpu_for_index(needed)
+#endif
 
 /* Reason for a failed pre-summed pick (nothing was evicted). AR5: the
  * requester's set is short but the EV-1-only set would fit. Otherwise the
@@ -4084,6 +4356,9 @@ ensure_vram(size_t needed, int device_id, CuvsRequester rq, CuvsAdmissionFields 
     size_t quota = g_rmm_pool_limits[device_id];
     size_t pending = quota > 0 ? g_pending_rmm_build_vram[device_id] : 0;
     size_t beff = budget_eff_bytes(device_id);
+#ifdef CUVS_CAGRA_FOLD_ENABLED
+retry_fold_reclaim:
+#endif
     if (line && !line->cache_valid)
     {
         admission_cache_totals(device_id, &line->cache);
@@ -4156,6 +4431,22 @@ ensure_vram(size_t needed, int device_id, CuvsRequester rq, CuvsAdmissionFields 
         /* AR6/AR7 before any eviction: a refusal evicts nothing. */
         if (wr != CUVS_ADMISSION_NONE)
         {
+#ifdef CUVS_CAGRA_FOLD_ENABLED
+            uint64_t reclaimable = page_fold_unoffered_bytes_locked(device_id);
+            CuvsAdmissionWorkspaceInput projected = line->workspace;
+
+            if (quota)
+                projected.pool_used -= reclaimable < projected.pool_used ? reclaimable : projected.pool_used;
+            else
+                projected.phys_free = cuvs_admission_sat_add(projected.phys_free, reclaimable);
+            if (!line->self_res && reclaimable &&
+                cuvs_admission_workspace_check(&projected) == CUVS_ADMISSION_NONE &&
+                page_fold_reclaim_unoffered_locked(device_id))
+            {
+                line->cache_valid = line->workspace_valid = line->pool_valid = 0;
+                goto retry_fold_reclaim;
+            }
+#endif
             g_last_admit_reason = wr;
             goto admission_rejected;
         }
@@ -4184,7 +4475,12 @@ ensure_vram(size_t needed, int device_id, CuvsRequester rq, CuvsAdmissionFields 
     uint64_t need = budget_short > phys_short ? budget_short : phys_short;
     if (pool_short > need)
         need = pool_short;
-    if (need > 0 && make_room(device_id, rq, need, 0, &pk) != 0)
+    bool allow_fold_candidates = false;
+#ifdef CUVS_CAGRA_FOLD_ENABLED
+    allow_fold_candidates = (!line || !line->self_res) &&
+        (rq == CUVS_RQ_BUILD_CAGRA || rq == CUVS_RQ_BUILD_IVFPQ || rq == CUVS_RQ_BUILD_SHARD);
+#endif
+    if (need > 0 && make_room(device_id, rq, need, 0, &pk, allow_fold_candidates, false) != 0)
     {
         g_last_admit_reason = pick_reason(&pk, phys_short > budget_short, pool_short);
         goto admission_rejected;
@@ -4699,6 +4995,89 @@ recv_all(int fd, void *buf, size_t len)
     return 0;
 }
 
+#ifdef CUVS_CAGRA_FOLD_ENABLED
+static const char *
+page_fold_request_operation(const CuvsCmdFrame *cmd)
+{
+    switch (cmd->op)
+    {
+        case CUVS_OP_BUILD: return cmd->n_partials ? "BUILD_MULTI" : "BUILD";
+        case CUVS_OP_BUILD_PAGES: return "BUILD_PAGES";
+        case CUVS_OP_BUILD_IVFPQ: return "BUILD_IVFPQ";
+        case CUVS_OP_BUILD_HNSW_FILE: return "HNSW";
+        case CUVS_OP_HNSW_ROUTE_PREFLIGHT: return "HNSW_PREFLIGHT";
+        case CUVS_OP_EXTEND: return "EXTEND";
+        case CUVS_OP_COMPACT: return "COMPACT";
+        default: return NULL;
+    }
+}
+
+static void
+page_fold_log_hex(char *out, const char *value, size_t len)
+{
+    const char digits[] = "0123456789abcdef";
+
+    for (size_t i = 0; i < len && value[i]; ++i)
+    {
+        unsigned char b = (unsigned char) value[i];
+        *out++ = digits[b >> 4];
+        *out++ = digits[b & 15];
+    }
+    *out = '\0';
+}
+
+static void
+page_fold_log_reply(const CuvsReplyHeader *reply, bool sent, uint64_t when)
+{
+    if (!t_fold_request)
+        return;
+    char error[2 * sizeof(reply->error) + 1] = {0};
+    char err_out[2 * sizeof(reply->err_out) + 1] = {0};
+
+    if (reply)
+    {
+        page_fold_log_hex(error, reply->error, sizeof(reply->error));
+        page_fold_log_hex(err_out, reply->err_out, sizeof(reply->err_out));
+    }
+    LOG_INFO("[page_fold_foreground] op=%s db=%u index=%u daemon_id=%llu request_id=%llu "
+             "started_us=%llu mono_us=%llu response=%s status=%lld error_hex=%s err_out_hex=%s\n",
+             t_fold_request_op, t_fold_request->db_oid, t_fold_request->index_oid,
+             (unsigned long long) g_page_daemon_id, (unsigned long long) t_fold_request_id,
+             (unsigned long long) t_fold_request_started, (unsigned long long) when,
+             !reply ? "missing" : sent ? "sent" : "send_failed", reply ? (long long) reply->status : -1,
+             error, err_out);
+    t_fold_request = NULL;  /* one terminal result for this connection */
+}
+#endif
+
+static int
+send_foreground_reply(int fd, const CuvsReplyHeader *reply)
+{
+#ifdef CUVS_CAGRA_FOLD_ENABLED
+    uint64_t when = t_fold_request ? admission_mono_us() : 0;
+#endif
+    int rc = send_all(fd, reply, sizeof(*reply));
+#ifdef CUVS_CAGRA_FOLD_ENABLED
+    page_fold_log_reply(reply, rc == 0, when);
+#endif
+    return rc;
+}
+
+static void
+send_page_build_reply(int fd, const CuvsReplyHeader *reply, uint64_t graph_nonce)
+{
+#ifdef CUVS_CAGRA_FOLD_ENABLED
+    uint64_t when = t_fold_request ? admission_mono_us() : 0;
+#endif
+    bool sent = send_all(fd, reply, sizeof(*reply)) == 0 &&
+        send_all(fd, &graph_nonce, sizeof(graph_nonce)) == 0;
+#ifdef CUVS_CAGRA_FOLD_ENABLED
+    page_fold_log_reply(reply, sent, when);
+#else
+    (void) sent;
+#endif
+}
+
 static void
 append_notice_logged(CuvsReplyHeader *hdr, const char *msg, const char *detail)
 {
@@ -4750,7 +5129,7 @@ send_error_code(int client_fd, int status, const char *msg)
     hdr.n_results = 0;
     strncpy(hdr.error, msg, sizeof(hdr.error) - 1);
     attach_build_notices(&hdr);
-    send_all(client_fd, &hdr, sizeof(hdr));
+    send_foreground_reply(client_fd, &hdr);
 }
 
 static void
@@ -4801,7 +5180,7 @@ send_admission_reject(int client_fd, int status, const char *legacy_error,
         hdr.err_out[0] = '\0';
     LOG_WARN("[admit_reject] status=%d err_out=\"%s\"\n", status, hdr.err_out);
     attach_build_notices(&hdr);
-    send_all(client_fd, &hdr, sizeof(hdr));
+    send_foreground_reply(client_fd, &hdr);
 }
 
 /* Call with g_index_mutex held, before entering the SDK build.
@@ -4816,6 +5195,13 @@ physical_build_check(int dev, const char *op, const CuvsCmdFrame *cmd,
                      CuvsAdmissionFields *rej)
 {
     uint64_t raw_free = cuvs_vram_raw_free_bytes_on(dev);
+#ifdef CUVS_CAGRA_FOLD_ENABLED
+    if (cmd->op == CUVS_OP_BUILD || cmd->op == CUVS_OP_BUILD_PAGES || cmd->op == CUVS_OP_BUILD_IVFPQ)
+        while (cuvs_build_physical_refuse(raw_free) &&
+               CUVS_BUILD_PHYSICAL_FLOOR_BYTES - raw_free <= page_fold_unoffered_bytes_locked(dev) &&
+               page_fold_reclaim_unoffered_locked(dev))
+            raw_free = cuvs_vram_raw_free_bytes_on(dev);
+#endif
     if (!cuvs_build_physical_refuse(raw_free))
         return 0;
     memset(rej, 0, sizeof(*rej));
@@ -7357,6 +7743,17 @@ build_sharded(int client_fd, const CuvsCmdFrame *cmd, const char *index_dir,
     memcpy(new_tids, tids_in, tid_bytes);
 
     pthread_mutex_lock(&g_index_mutex);
+#ifdef CUVS_CAGRA_FOLD_ENABLED
+    /* Drain before the first shard allocates. Both the round-robin devices
+     * and the alternative selected by pick_gpu_for_index are covered. */
+    if (!page_fold_wait_locked(-1, client_fd, cmd, "BUILD_SHARD"))
+    {
+        pthread_mutex_unlock(&g_index_mutex);
+        free(new_tids); free(shards); free(recs); free(shard_tmp); free(shard_final);
+        munmap(mem, total);
+        return;
+    }
+#endif
 
     /* --- Build + place each shard over a contiguous range. --- */
     int64_t base   = n_vecs / sc;
@@ -7405,7 +7802,7 @@ build_sharded(int client_fd, const CuvsCmdFrame *cmd, const char *index_dir,
         al.evictions_before = g_cache_evictions[dev];
         if (ensure_vram(needed, dev, CUVS_RQ_BUILD_SHARD, NULL, &al) != 0)
         {
-            int alt = pick_gpu_for_index(needed);
+            int alt = pick_gpu_for_build(needed, CUVS_RQ_BUILD_SHARD);
             al.gpu = alt;
             if (alt < 0)
                 admission_fill(&shard_rej, CUVS_ADMISSION_AR0, needed, -1);
@@ -7687,7 +8084,7 @@ build_sharded(int client_fd, const CuvsCmdFrame *cmd, const char *index_dir,
                      cmd->db_oid, cmd->index_oid);
             CuvsReplyHeader hdr_ok = {0};
             hdr_ok.status = CUVS_STATUS_OK;
-            send_all(client_fd, &hdr_ok, sizeof(hdr_ok));
+            send_foreground_reply(client_fd, &hdr_ok);
             return;
         }
         e = registry_new_slot();
@@ -7733,7 +8130,7 @@ build_sharded(int client_fd, const CuvsCmdFrame *cmd, const char *index_dir,
 
     CuvsReplyHeader hdr_ok = {0};
     hdr_ok.status = CUVS_STATUS_OK;
-    send_all(client_fd, &hdr_ok, sizeof(hdr_ok));
+    send_foreground_reply(client_fd, &hdr_ok);
 
     /* Phase 3G.2: snapshot the whole sharded artifact set to GCS (detached,
      * non-fatal). The local artifacts are already durable; upload failure only
@@ -8285,7 +8682,26 @@ handle_build(int client_fd, const CuvsCmdFrame *cmd)
                                                     cmd->graph_degree,
                                                     cmd->intermediate_graph_degree,
                                                     cmd->build_algo)};
-    int target_gpu = pick_gpu_for_index(needed);
+#ifdef CUVS_CAGRA_FOLD_ENABLED
+    if (!page_fold_wait_locked(-1, client_fd, cmd, "BUILD"))
+    {
+        pthread_mutex_unlock(&g_index_mutex);
+        munmap(mem, total);
+        return;
+    }
+#endif
+#ifdef CUVS_CAGRA_FOLD_ENABLED
+    /* The same-OID legacy graph remains available until the new page
+     * relation commits, so it cannot finance the placement preview. */
+    IndexEntry *preview_legacy = page_build ? find_index(cmd->db_oid, cmd->index_oid) : NULL;
+    if (preview_legacy)
+        ++preview_legacy->inflight;
+#endif
+    int target_gpu = pick_gpu_for_build(needed, CUVS_RQ_BUILD_CAGRA);
+#ifdef CUVS_CAGRA_FOLD_ENABLED
+    if (preview_legacy)
+        --preview_legacy->inflight;
+#endif
     if (target_gpu < 0)
     {
         LOG_WARN("[handle_build] index %u/%u (%zu bytes) too large for any GPU budget\n",
@@ -8312,7 +8728,12 @@ handle_build(int client_fd, const CuvsCmdFrame *cmd)
 
         while (budget && needed <= budget &&
                total_vram_used(target_gpu) > budget - needed &&
-               evict_page_graph(target_gpu))
+               (
+#ifdef CUVS_CAGRA_FOLD_ENABLED
+                (total_vram_used(target_gpu) - (budget - needed) <= page_fold_unoffered_bytes_locked(target_gpu) &&
+                 page_fold_reclaim_unoffered_locked(target_gpu)) ||
+#endif
+                evict_page_graph(target_gpu)))
             ;
         while (g_n_indexes + g_n_page_graphs >= g_max_indexes && evict_page_graph(-1))
             ;
@@ -8453,8 +8874,7 @@ handle_build(int client_fd, const CuvsCmdFrame *cmd)
         munmap(mem, total);
         LOG_WARN("pg_cuvs_server: page-format BUILD %u/%u has no attached dataset; using exact heap search\n",
                  cmd->db_oid, cmd->index_oid);
-        if (send_all(client_fd, &reply, sizeof(reply)) == 0)
-            send_all(client_fd, &page_graph_nonce, sizeof(page_graph_nonce));
+        send_page_build_reply(client_fd, &reply, page_graph_nonce);
         return;
     }
 
@@ -8561,8 +8981,7 @@ handle_build(int client_fd, const CuvsCmdFrame *cmd)
             LOG_WARN("pg_cuvs_server: page-format graph %u/%u persisted without a resident entry\n",
                      cmd->db_oid, cmd->index_oid);
         reply.status = CUVS_STATUS_OK;
-        if (send_all(client_fd, &reply, sizeof(reply)) == 0)
-            send_all(client_fd, &page_graph_nonce, sizeof(page_graph_nonce));
+        send_page_build_reply(client_fd, &reply, page_graph_nonce);
         return;
     }
 
@@ -9086,7 +9505,7 @@ finish_build_commit(int client_fd, const CuvsCmdFrame *cmd, const char *save_dir
                      "was saved to disk and loads into GPU memory on its first query",
                      g_max_indexes);
             attach_build_notices(&hdr_ok);
-            send_all(client_fd, &hdr_ok, sizeof(hdr_ok));
+            send_foreground_reply(client_fd, &hdr_ok);
             discard_cagra_build_backup(&backup);
             return;
         }
@@ -9144,7 +9563,7 @@ finish_build_commit(int client_fd, const CuvsCmdFrame *cmd, const char *save_dir
     CuvsReplyHeader hdr_ok = {0};
     hdr_ok.status = CUVS_STATUS_OK;
     attach_build_notices(&hdr_ok);
-    send_all(client_fd, &hdr_ok, sizeof(hdr_ok));
+    send_foreground_reply(client_fd, &hdr_ok);
     discard_cagra_build_backup(&backup);
 
     /* Phase 3C: upload to GCS in a detached thread after replying OK.
@@ -9561,7 +9980,16 @@ handle_build_multi(int client_fd, const CuvsCmdFrame *cmd, const char *index_dir
     {
         size_t final  = estimate_vram_bytes(total, (int)cmd->dim, (int)cmd->graph_degree);
         size_t needed = admission_needed_bytes(final);
-        int    target_gpu = pick_gpu_for_index(needed);
+#ifdef CUVS_CAGRA_FOLD_ENABLED
+        if (!page_fold_wait_locked(-1, client_fd, cmd, "BUILD_MULTI"))
+        {
+            pthread_mutex_unlock(&g_index_mutex);
+            status = CUVS_STATUS_CANCELED;
+            err = "build owner disconnected";
+            goto fail;
+        }
+#endif
+        int    target_gpu = pick_gpu_for_build(needed, CUVS_RQ_BUILD_CAGRA);
         CuvsCagraIndex new_handle;
         CuvsAdmissionFields oom_rej;
         uint32_t tids_gen;
@@ -11641,6 +12069,14 @@ handle_build_ivfpq(int client_fd, const CuvsCmdFrame *cmd)
     size_t needed = (size_t)cmd->n_vecs * pq_dim * (pq_bits / 8 + 1);
 
     pthread_mutex_lock(&g_index_mutex);
+#ifdef CUVS_CAGRA_FOLD_ENABLED
+    if (!page_fold_wait_locked(-1, client_fd, cmd, "BUILD_IVFPQ"))
+    {
+        pthread_mutex_unlock(&g_index_mutex);
+        munmap(mem, total);
+        return;
+    }
+#endif
 
     /* I3 (C5, UC-2 (a)): IVF-PQ admission rejections carry err_out; its own
      * estimate is unchanged (C3's N applies to CAGRA). */
@@ -11648,7 +12084,7 @@ handle_build_ivfpq(int client_fd, const CuvsCmdFrame *cmd)
     AdmitLine al = {.op = "BUILD_IVFPQ", .path = "ivfpq", .algo = "ivf_pq", .gpu = -1,
                     .db = cmd->db_oid, .idx = cmd->index_oid, .dim = cmd->dim,
                     .n = cmd->n_vecs, .final = needed, .needed = needed};
-    int target_gpu = pick_gpu_for_index(needed);
+    int target_gpu = pick_gpu_for_build(needed, CUVS_RQ_BUILD_IVFPQ);
     if (target_gpu < 0)
     {
         admission_fill(&rej, CUVS_ADMISSION_AR0, needed, -1);
@@ -11810,7 +12246,7 @@ handle_build_ivfpq(int client_fd, const CuvsCmdFrame *cmd)
                 {
                     CuvsReplyHeader hdr_ok = {0};
                     hdr_ok.status = CUVS_STATUS_OK;
-                    send_all(client_fd, &hdr_ok, sizeof(hdr_ok));
+                    send_foreground_reply(client_fd, &hdr_ok);
                 }
                 return;
             }
@@ -11856,7 +12292,7 @@ handle_build_ivfpq(int client_fd, const CuvsCmdFrame *cmd)
 
     CuvsReplyHeader ok = {0};
     ok.status = CUVS_STATUS_OK;
-    send_all(client_fd, &ok, sizeof(ok));
+    send_foreground_reply(client_fd, &ok);
     return;
 
 persist_fail:
@@ -12079,6 +12515,20 @@ handle_extend(int client_fd, const CuvsCmdFrame *cmd)
     pthread_mutex_lock(&g_index_mutex);
 
     IndexEntry *e = find_index(cmd->db_oid, cmd->index_oid);
+#ifdef CUVS_CAGRA_FOLD_ENABLED
+    int waited_device = -1;
+    while (e && e->handle && g_fold_active[e->gpu_device_id])
+    {
+        waited_device = (int) e->gpu_device_id;
+        if (!page_fold_wait_locked(waited_device, client_fd, cmd, "EXTEND"))
+        {
+            pthread_mutex_unlock(&g_index_mutex);
+            munmap(mem, total);
+            return;
+        }
+        e = find_index(cmd->db_oid, cmd->index_oid);
+    }
+#endif
     if (!e || !e->handle)
     {
         pthread_mutex_unlock(&g_index_mutex);
@@ -12091,7 +12541,7 @@ handle_extend(int client_fd, const CuvsCmdFrame *cmd)
         snprintf(hdr.error, sizeof(hdr.error),
                  "index %u/%u not loaded or not extendable (extend is cagra-only)",
                  cmd->db_oid, cmd->index_oid);
-        send_all(client_fd, &hdr, sizeof(hdr));
+        send_foreground_reply(client_fd, &hdr);
         return;
     }
 
@@ -12110,14 +12560,33 @@ handle_extend(int client_fd, const CuvsCmdFrame *cmd)
     size_t new_vram   = estimate_vram_bytes(old_n + n_new, (int)e->dim, e->graph_degree);
     size_t delta_vram = (new_vram > e->vram_bytes) ? new_vram - e->vram_bytes : 0;
     int    dev        = (int)e->gpu_device_id;
-    if (delta_vram > 0 &&
-        g_max_vram_per_gpu[dev] > 0 &&
-        total_vram_used(dev) + delta_vram > g_max_vram_per_gpu[dev])
+    if (delta_vram > 0 && g_max_vram_per_gpu[dev] > 0)
     {
-        pthread_mutex_unlock(&g_index_mutex);
-        munmap(mem, total);
-        send_error_code(client_fd, CUVS_STATUS_BUILD_FAILED, "not enough VRAM for extend");
-        return;
+        size_t budget = g_max_vram_per_gpu[dev];
+        size_t used = total_vram_used(dev);
+#ifdef CUVS_CAGRA_FOLD_ENABLED
+        if (waited_device == dev)
+        {
+            uint64_t projected = cuvs_admission_sat_add(used, delta_vram);
+
+            /* The wait already re-resolved the legacy entry. Under this lock
+             * reclaim only children that PostgreSQL has never been offered;
+             * their teardown cannot shift the legacy registry. */
+            while (projected > budget && projected - budget <= page_fold_unoffered_bytes_locked(dev) &&
+                   page_fold_reclaim_unoffered_locked(dev))
+            {
+                used = total_vram_used(dev);
+                projected = cuvs_admission_sat_add(used, delta_vram);
+            }
+        }
+#endif
+        if (used + delta_vram > budget)
+        {
+            pthread_mutex_unlock(&g_index_mutex);
+            munmap(mem, total);
+            send_error_code(client_fd, CUVS_STATUS_BUILD_FAILED, "not enough VRAM for extend");
+            return;
+        }
     }
 
     /* Grow TIDs array before the GPU call; failure here is cheap to handle. */
@@ -12163,16 +12632,19 @@ handle_extend(int client_fd, const CuvsCmdFrame *cmd)
     free(e->rev_item_ids); e->rev_item_ids = NULL;
     build_rev_tid_map(e);
 
+    /* The registry can move as soon as L0 is released. */
+    int64_t total_rows = e->n_vecs;
+    int64_t extended_rows = e->n_extended;
     pthread_mutex_unlock(&g_index_mutex);
     munmap(mem, total);
 
     LOG_INFO("[handle_extend] %u/%u: added %lld vecs (total %lld, n_extended %lld)\n",
              cmd->db_oid, cmd->index_oid,
-             (long long)n_new, (long long)e->n_vecs, (long long)e->n_extended);
+             (long long)n_new, (long long)total_rows, (long long)extended_rows);
 
     CuvsReplyHeader ok = {0};
     ok.status = CUVS_STATUS_OK;
-    send_all(client_fd, &ok, sizeof(ok));
+    send_foreground_reply(client_fd, &ok);
 }
 
 /* Comparator for qsort/bsearch on raw uint64_t arrays. */
@@ -12217,7 +12689,7 @@ handle_compact(int client_fd, const CuvsCmdFrame *cmd)
         /* No tombstone: nothing to compact. Reply OK. */
         CuvsReplyHeader ok = {0};
         ok.status = CUVS_STATUS_OK;
-        send_all(client_fd, &ok, sizeof(ok));
+        send_foreground_reply(client_fd, &ok);
         return;
     }
 
@@ -12257,6 +12729,18 @@ handle_compact(int client_fd, const CuvsCmdFrame *cmd)
     pthread_mutex_lock(&g_index_mutex);
 
     IndexEntry *e = find_index(cmd->db_oid, cmd->index_oid);
+#ifdef CUVS_CAGRA_FOLD_ENABLED
+    while (e && e->handle && g_fold_active[e->gpu_device_id])
+    {
+        if (!page_fold_wait_locked((int) e->gpu_device_id, client_fd, cmd, "COMPACT"))
+        {
+            pthread_mutex_unlock(&g_index_mutex);
+            free(dead_tids);
+            return;
+        }
+        e = find_index(cmd->db_oid, cmd->index_oid);
+    }
+#endif
     if (!e || !e->handle)
     {
         pthread_mutex_unlock(&g_index_mutex);
@@ -12300,7 +12784,7 @@ handle_compact(int client_fd, const CuvsCmdFrame *cmd)
         unlink(tombstone_path);
         CuvsReplyHeader ok = {0};
         ok.status = CUVS_STATUS_OK;
-        send_all(client_fd, &ok, sizeof(ok));
+        send_foreground_reply(client_fd, &ok);
         return;
     }
 
@@ -12359,7 +12843,7 @@ handle_compact(int client_fd, const CuvsCmdFrame *cmd)
         snprintf(failed.error, sizeof(failed.error), "cuvs_cagra_compact failed");
         if (compact_notice[0])
             cuvs_notice_append(failed.notice_out, sizeof(failed.notice_out), compact_notice, "The original index and tombstones are retained.");
-        send_all(client_fd, &failed, sizeof(failed));
+        send_foreground_reply(client_fd, &failed);
         return;
     }
 
@@ -12402,7 +12886,7 @@ handle_compact(int client_fd, const CuvsCmdFrame *cmd)
     ok.status = CUVS_STATUS_OK;
     if (compact_notice[0])
         cuvs_notice_append(ok.notice_out, sizeof(ok.notice_out), compact_notice, "");
-    send_all(client_fd, &ok, sizeof(ok));
+    send_foreground_reply(client_fd, &ok);
 }
 
 /* ----------------------------------------------------------------
@@ -12639,7 +13123,12 @@ hnsw_gpu_work_pending(void *unused)
     int busy = g_unlocked_gpu_jobs != 0;
     (void)unused;
     for (int gpu = 0; gpu < CUVS_MAX_GPUS; gpu++)
+    {
         if (g_pending_build_vram[gpu]) busy = 1;
+#ifdef CUVS_CAGRA_FOLD_ENABLED
+        if (g_fold_active[gpu]) busy = 1;
+#endif
+    }
     for (int i = 0; i < g_n_indexes; i++)
         if (g_indexes[i].inflight > 0) busy = 1;
 #ifdef CUVS_TEST_HOOKS
@@ -12680,6 +13169,28 @@ hnsw_pool_used(int device)
     CuvsRmmPoolStats st;
     return cuvs_rmm_pool_stats(device, &st) == 0 ? st.used_bytes : 0;
 }
+
+#ifdef CUVS_CAGRA_FOLD_ENABLED
+/* Check the same resolver's partition budget with a projected upper bound.
+ * Actual capacity is always re-read after freeing each child. */
+static bool
+hnsw_fold_reclaim_can_admit(const CuvsHnswFileBuild *params, int device)
+{
+    CuvsHnswForecast projected;
+    char error[128];
+    uint64_t reclaimable = page_fold_unoffered_bytes_locked(device);
+    uint64_t limit = admission_limit(device);
+    uint64_t gpu = cuvs_admission_sat_add(params->gpu_budget, reclaimable);
+
+    if (limit && gpu > limit)
+        gpu = limit;
+    return reclaimable && gpu > params->gpu_budget &&
+        cuvs_hnsw_forecast_route(params->n_vecs, params->dim, params->graph_degree,
+            params->intermediate_degree, params->hierarchy, params->build_algo,
+            params->ef_construction, params->auto_overflow, params->host_budget, gpu,
+            &projected, error, sizeof(error)) == CUVS_STATUS_OK;
+}
+#endif
 
 /* [hnsw_route]: one line per decision, pre-spool forecast or build. Q4-5/Q4-6
  * read est_host and route from it; route must equal the receipt's route.
@@ -12741,6 +13252,10 @@ handle_hnsw_route_preflight(int client_fd)
     reply.auto_overflow = g_hnsw_auto_overflow;
     reply.header.status = CUVS_STATUS_BUILD_FAILED;
     if (recv_all(client_fd, &request, sizeof(request)) < 0) return;
+#ifdef CUVS_CAGRA_FOLD_ENABLED
+    if (request.after_scan == 1 && t_fold_request)
+        t_fold_request_op = "HNSW_POSTSCAN";
+#endif
     reply.n_estimate = request.n_estimate;
     snprintf(reply.index_dir, sizeof(reply.index_dir), "%s", g_index_dir);
     if (request.version != CUVS_HNSW_PREFLIGHT_VERSION || request.hierarchy > 1
@@ -12756,6 +13271,17 @@ handle_hnsw_route_preflight(int client_fd)
         if (pthread_mutex_trylock(&g_index_mutex) == 0) locked = 1;
         else (void)poll(NULL, 0, 100);
     }
+#ifdef CUVS_CAGRA_FOLD_ENABLED
+    /* The file build drains fold work before checking capacity. The forecast
+     * has no owner lease and cannot reject using a transient fold snapshot. */
+    if (!locked || page_fold_active_devices_locked() || page_fold_unoffered_parent_locked(usable_gpu(0)))
+    {
+        if (locked)
+            pthread_mutex_unlock(&g_index_mutex);
+        reply.header.status = CUVS_STATUS_UNAVAILABLE;
+        goto send;
+    }
+#endif
     int device = usable_gpu(0);
     reply.header.error[0] = '\0';
     uint64_t host = hnsw_host_headroom(request.host_budget, reply.header.error, sizeof(reply.header.error));
@@ -12790,7 +13316,16 @@ handle_hnsw_route_preflight(int client_fd)
     reply.host_budget = f.host_budget; reply.gpu_budget = f.gpu_budget;
     reply.disk_need = f.disk_need; reply.disk_avail = f.disk_avail;
  send:
+#ifdef CUVS_CAGRA_FOLD_ENABLED
+    {
+        uint64_t when = admission_mono_us();
+        bool sent = send_all(client_fd, &reply, sizeof(reply)) == 0;
+
+        page_fold_log_reply(&reply.header, sent, when);
+    }
+#else
     send_all(client_fd, &reply, sizeof(reply));
+#endif
 }
 
 static void
@@ -12839,13 +13374,45 @@ handle_build_hnsw_file(int client_fd, const CuvsCmdFrame *cmd)
     params.ace_quality = g_hnsw_ace_quality;
     params.policy = &wire.policy;
     params.nn_readback = &wire.nn;
-    if (cuvs_hnsw_wait_for_idle(&g_index_mutex, owner_fd, hnsw_gpu_work_pending, NULL))
+#ifdef CUVS_CAGRA_FOLD_ENABLED
+    uint64_t fold_wait_started = admission_mono_us();
+    bool fold_waited = false;
+
+    for (int i = 0; i < n_usable_gpus(); ++i)
+        __atomic_fetch_add(&g_fold_waiters[usable_gpu(i)], 1, __ATOMIC_SEQ_CST);
+    for (int i = 0; i < n_usable_gpus(); ++i)
+        fold_waited |= __atomic_load_n(&g_fold_active[usable_gpu(i)], __ATOMIC_SEQ_CST);
+#endif
+    int wait_rc = cuvs_hnsw_wait_for_idle(&g_index_mutex, owner_fd, hnsw_gpu_work_pending, NULL);
+#ifdef CUVS_CAGRA_FOLD_ENABLED
+    for (int i = 0; i < n_usable_gpus(); ++i)
+        __atomic_fetch_sub(&g_fold_waiters[usable_gpu(i)], 1, __ATOMIC_SEQ_CST);
+    if (fold_waited)
+    {
+        uint64_t finished = admission_mono_us();
+        LOG_INFO("[page_fold_admission] op=HNSW db=%u index=%u wait_us=%llu withdrawn=%d"
+                 " daemon_id=%llu request_id=%llu wait_started_us=%llu mono_us=%llu\n",
+                 cmd->db_oid, cmd->index_oid, (unsigned long long) (finished - fold_wait_started),
+                 wait_rc != 0, (unsigned long long) g_page_daemon_id,
+                 (unsigned long long) t_fold_request_id, (unsigned long long) fold_wait_started,
+                 (unsigned long long) finished);
+    }
+#endif
+    if (wait_rc)
         goto cancelled;
     locked = 1;
     reply.error[0] = '\0';
     params.host_budget = hnsw_host_headroom(request.host_budget, reply.error, sizeof(reply.error));
     int device = usable_gpu(0);
     CuvsAdmissionFields physical_rej;
+#ifdef CUVS_CAGRA_FOLD_ENABLED
+    while (params.host_budget && page_fold_unoffered_parent_locked(device) &&
+           cuvs_build_physical_refuse(cuvs_vram_raw_free_bytes_on(device)))
+    {
+        if (cuvs_hnsw_owner_cancelled(owner_fd)) goto cancelled;
+        (void) page_fold_reclaim_unoffered_locked(device);
+    }
+#endif
     if (physical_build_check(device, "BUILD_HNSW_FILE", cmd, &physical_rej))
     {
         reply.status = CUVS_STATUS_OOM_FALLBACK;
@@ -12854,10 +13421,24 @@ handle_build_hnsw_file(int client_fd, const CuvsCmdFrame *cmd)
         attach_build_notices(&reply);
         goto done;
     }
+#ifdef CUVS_CAGRA_FOLD_ENABLED
+retry_hnsw_gpu_budget:
+    reply.status = CUVS_STATUS_BUILD_FAILED;
+    if (params.host_budget)
+        reply.error[0] = '\0';
+#endif
     params.gpu_budget = hnsw_gpu_budget(device, 1, &wire.budget.logical_used);
     wire.budget.pool_used = hnsw_pool_used(device);
     if (!params.host_budget || !params.gpu_budget)
     {
+#ifdef CUVS_CAGRA_FOLD_ENABLED
+        if (params.host_budget && hnsw_fold_reclaim_can_admit(&params, device))
+        {
+            if (cuvs_hnsw_owner_cancelled(owner_fd)) goto cancelled;
+            (void) page_fold_reclaim_unoffered_locked(device);
+            goto retry_hnsw_gpu_budget;
+        }
+#endif
         if (!reply.error[0])
             snprintf(reply.error, sizeof(reply.error), "HNSW host/GPU/cgroup headroom unavailable");
         goto done;
@@ -12870,6 +13451,14 @@ handle_build_hnsw_file(int client_fd, const CuvsCmdFrame *cmd)
         params.graph_degree, params.intermediate_degree, params.hierarchy,
         params.build_algo, params.ef_construction, params.auto_overflow,
         params.host_budget, params.gpu_budget, &route, reply.error, sizeof(reply.error));
+#ifdef CUVS_CAGRA_FOLD_ENABLED
+    if (reply.status != CUVS_STATUS_OK && hnsw_fold_reclaim_can_admit(&params, device))
+    {
+        if (cuvs_hnsw_owner_cancelled(owner_fd)) goto cancelled;
+        (void) page_fold_reclaim_unoffered_locked(device);
+        goto retry_hnsw_gpu_budget;
+    }
+#endif
     wire.budget.host_estimate = route.host_estimate;
     wire.budget.host_budget = route.host_budget;
     wire.budget.gpu_estimate = route.gpu_estimate;
@@ -12993,9 +13582,15 @@ handle_build_hnsw_file(int client_fd, const CuvsCmdFrame *cmd)
     { close(result_fd); result_fd = -1; }
     wire.header = reply;
     token = 'R';
-    if (send_all(client_fd, &token, 1) == 0
-        && cuvs_fd_send(client_fd, result_fd, &wire, sizeof(wire)) == 0
-        && reply.status == CUVS_STATUS_OK)
+#ifdef CUVS_CAGRA_FOLD_ENABLED
+    uint64_t when = admission_mono_us();
+#endif
+    bool sent = send_all(client_fd, &token, 1) == 0 &&
+        cuvs_fd_send(client_fd, result_fd, &wire, sizeof(wire)) == 0;
+#ifdef CUVS_CAGRA_FOLD_ENABLED
+    page_fold_log_reply(&reply, sent, when);
+#endif
+    if (sent && reply.status == CUVS_STATUS_OK)
     {
         /* The backend ACKs receipt of its own kernel reference; it then owns
          * the temporary file through PG conversion and closes it on ERROR. */
@@ -13844,7 +14439,7 @@ handle_page_search(int client_fd, const CuvsCmdFrame *cmd)
                  sizeof(request) - sizeof(request.length)) < 0 ||
         request.resume_count != 0 || request.resume_distance != 0 ||
         request.reserved != 0 || cmd->dim == 0 || cmd->dim > 65535 ||
-        cmd->k == 0 || cmd->k > 4000 || cmd->search_mode > 1 || cmd->bf_precision > 1 ||
+        cmd->k == 0 || cmd->k > CUVS_PAGE_SEARCH_MAX_K || cmd->search_mode > 1 || cmd->bf_precision > 1 ||
         cmd->n_vecs < 1 || cmd->n_vecs > 1024 || batch != (cmd->n_vecs > 1) ||
         request.n_slots == 0 || request.n_slots > INT32_MAX ||
         (filtered ? cmd->n_filter_tids != (request.n_slots + 31) / 32 :
@@ -13949,9 +14544,281 @@ initialize_page_daemon_id(void)
         g_page_daemon_id = id ? id : 1;
 }
 
+#ifdef CUVS_CAGRA_FOLD_ENABLED
+#define PAGE_FOLD_MIN_POSITIONS 100U
+#define PAGE_FOLD_MAX_POSITIONS (4U * CUVS_PAGE_BATCH_MAX)
+#define PAGE_FOLD_IDLE_US (300 * UINT64_C(1000000))
+
+static PageCagraGraph *
+page_fold_pick_locked(int device, uint64_t now)
+{
+    PageCagraGraph *best = NULL;
+    uint64_t best_priority = 0;
+    time_t recent = time(NULL) - 60;
+
+    for (PageCagraGraph *entry = g_page_graphs; entry; entry = entry->next)
+    {
+        uint64_t pending, priority;
+
+        if (entry->gpu != device || !entry->handle || !entry->n_slots ||
+            !entry->overlay.boot_id || entry->overlay.covered_upto <= entry->folded)
+        {
+            if (entry->gpu == device)
+                entry->fold_pending_since = 0;
+            continue;
+        }
+        if (!entry->fold_pending_since)
+            entry->fold_pending_since = now;
+        pending = entry->overlay.covered_upto - entry->folded;
+        if (entry->fold_candidate || entry->fold_retry_after > now ||
+            (pending < PAGE_FOLD_MIN_POSITIONS && now - entry->fold_pending_since < PAGE_FOLD_IDLE_US))
+            continue;
+        priority = pending * (1 + (entry->last_search >= recent ? (uint64_t) entry->hits : 0));
+        if (priority > best_priority)
+        {
+            best = entry;
+            best_priority = priority;
+        }
+    }
+    return best;
+}
+
+/* The retained prefix is immutable. Copy packed vectors into slot order and
+ * fill dead positions from the first live row of their 64-slot batch. */
+static uint32_t
+page_fold_copy_rows(const CuvsPageOverlayChunk *chunk, uint64_t from, uint64_t upto,
+                     uint32_t dim, float *vectors, unsigned char *live, bool base_sample)
+{
+    size_t row_bytes = (size_t) dim * sizeof(float);
+    uint32_t count = (uint32_t) (upto - from);
+    uint64_t cursor = chunk ? chunk->from + chunk->positions : 0;
+
+    while (chunk && cursor > from)
+    {
+        const float *packed = (const float *) (chunk->marks + chunk->positions);
+
+        if (chunk->from + chunk->positions != cursor)
+            return 0;
+        for (uint32_t i = 0; i < chunk->positions; ++i)
+        {
+            uint64_t position = chunk->from + i;
+
+            if (position >= upto)
+                break;
+            if (chunk->marks[i].state != CUVS_PAGE_POSITION_VECTOR)
+                continue;
+            if (position >= from)
+            {
+                uint32_t slot = (uint32_t) (position - from);
+
+                memcpy(vectors + (size_t) slot * dim, packed, row_bytes);
+                live[slot] = 1;
+            }
+            packed += dim;
+        }
+        cursor = chunk->from;
+        chunk = chunk->next;
+    }
+    if (cursor > from)
+        return 0;
+
+    for (uint32_t first = 0; first < count; first += CUVS_CAGRA_FOLD_BATCH_ROWS)
+    {
+        uint32_t end = count - first < CUVS_CAGRA_FOLD_BATCH_ROWS ? count : first + CUVS_CAGRA_FOLD_BATCH_ROWS;
+        uint32_t sample = first;
+
+        while (sample < end && !live[sample])
+            ++sample;
+        if (sample == end)
+        {
+            if (!base_sample)
+                return first;
+            memset(vectors + (size_t) first * dim, 0, (end - first) * row_bytes);
+            continue;
+        }
+        for (uint32_t i = first; i < end; ++i)
+            if (!live[i])
+            {
+                memcpy(vectors + (size_t) i * dim, vectors + (size_t) sample * dim, row_bytes);
+                live[i] = 1;
+            }
+    }
+    return count;
+}
+
+static void
+page_fold_run(int device)
+{
+    PageGraphFoldRef source = {0};
+    PageCagraGraph *parent;
+    CuvsPageOverlayChunk *snapshot, *staging = NULL;
+    CuvsPageFoldEvent event;
+    CuvsCagraIndex old_handle, new_handle = NULL;
+    CuvsCagraFoldShape shape;
+    CuvsCagraFoldControl control = {.should_yield = page_fold_should_yield, .context = &device};
+    CuvsCagraFoldStatus status = CUVS_CAGRA_FOLD_INVALID;
+    uint64_t now = admission_mono_us();
+    size_t peak, limit, used, host_bytes, host_mirror_charge = 0;
+    uint64_t pending, retained, claim;
+    uint32_t wanted, dim, base_sample;
+    uint32_t staging_status;
+    bool offered = false;
+
+    (void) pthread_once(&g_page_daemon_once, initialize_page_daemon_id);
+    if (!g_page_daemon_id)
+        return;
+
+    pthread_mutex_lock(&g_index_mutex);
+    if (g_pending_build_vram[device] || g_unlocked_gpu_jobs || page_fold_should_yield(&device))
+        goto defer;
+    parent = page_fold_pick_locked(device, now);
+    if (!parent)
+        goto defer;
+    parent->fold_retry_after = now + UINT64_C(1000000);
+    pending = parent->overlay.covered_upto - parent->folded;
+    wanted = pending < PAGE_FOLD_MAX_POSITIONS ? (uint32_t) pending : PAGE_FOLD_MAX_POSITIONS;
+    dim = parent->dim;
+    base_sample = parent->fold_live_base_slot;
+    if (!dim || wanted > (SIZE_MAX - wanted) / sizeof(float) / dim ||
+        cuvs_cagra_fold_shape(parent->handle, &shape) != 0 ||
+        shape.rows != parent->n_slots || shape.dim != dim)
+        goto defer;
+    claim = cuvs_cagra_fold_peak_bytes(shape.rows, wanted, dim, shape.stride, shape.degree, &retained);
+    if (claim >= CUVS_ADMISSION_BYTES_SATURATED || claim > SIZE_MAX)
+        goto defer;
+    peak = (size_t) claim;
+    limit = budget_eff_bytes(device);
+    used = total_vram_used(device);
+    if ((limit && (used >= limit || peak > limit - used)) || peak > gpu_free_vram_bytes(device))
+        goto defer;
+
+    event = (CuvsPageFoldEvent) {
+        .length = sizeof(event), .db_oid = parent->db_oid, .index_oid = parent->index_oid,
+        .system_identifier = parent->system_identifier, .boot_id = parent->overlay.boot_id,
+        .daemon_id = g_page_daemon_id, .index_nonce = parent->index_nonce, .base_nonce = parent->base_nonce,
+        .parent_graph_nonce = parent->graph_nonce, .parent_n_slots = parent->n_slots,
+        .parent_folded = parent->folded,
+    };
+    if (page_fold_should_yield(&device))
+        goto defer;
+    old_handle = page_graph_fold_pin_locked(parent, &source);
+    if (!old_handle)
+        goto defer;
+    snapshot = parent->overlay.head;
+    cuvs_page_overlay_retain(snapshot);
+    reserve_build_vram(peak, device);
+    g_fold_claim[device] = peak;
+    __atomic_store_n(&g_fold_active[device], true, __ATOMIC_SEQ_CST);
+    uint64_t started = admission_mono_us();
+    pthread_mutex_unlock(&g_index_mutex);
+    LOG_INFO("[page_fold_begin] gpu=%d db=%u index=%u positions=%u reserve=%zu mono_us=%llu daemon_id=%llu\n",
+             device, event.db_oid, event.index_oid, wanted, peak,
+             (unsigned long long) started, (unsigned long long) event.daemon_id);
+
+    host_bytes = (size_t) wanted * dim * sizeof(float);
+    staging_status = cuvs_page_overlay_alloc(&g_page_overlay_budget, &(CuvsPageOverlayRequest) {0},
+                                             host_bytes + wanted, &staging);
+    if (staging_status == CUVS_STATUS_OK)
+    {
+        float *rows = (float *) staging->marks;
+        unsigned char *live = (unsigned char *) rows + host_bytes;
+
+        memset(live, 0, wanted);
+        event.positions = page_fold_copy_rows(snapshot, event.parent_folded,
+                                             event.parent_folded + wanted, dim, rows, live, base_sample != 0);
+        if (memchr(live, 0, event.positions))
+        {
+            control.filled_rows = live;
+            control.placeholder_slot = base_sample - 1;
+        }
+        if (event.positions && shm_key_random((unsigned char *) &event.graph_nonce, sizeof(event.graph_nonce)) == 0 &&
+            event.graph_nonce && event.graph_nonce != event.parent_graph_nonce && event.graph_nonce != event.base_nonce)
+        {
+            /* SDK host_graph and host_dataset mirror the output layout.
+             * Account for both while the packed input and overlay are live. */
+            retained = retained / (shape.rows + wanted) * (shape.rows + event.positions);
+            size_t mirrors = (size_t) retained;
+
+            if (cuvs_page_overlay_reserve(&g_page_overlay_budget, mirrors))
+            {
+                host_mirror_charge = mirrors;
+                status = cuvs_cagra_fold_reuse_with_yield(old_handle, rows, event.positions,
+                                                          (int) dim, device, &new_handle, &control);
+            }
+            else
+                staging_status = CUVS_STATUS_PAGE_OVERLAY_HOST_FULL;
+        }
+    }
+
+    if (status == CUVS_CAGRA_FOLD_CUDA_UNCONFIRMED)
+    {
+        /* Completion of accesses to the borrowed graph and host vectors is
+         * unknown. Preserve their lifetime until the CUDA context exits. */
+        LOG_ERROR("[page_fold] CUDA completion unconfirmed gpu=%d db=%u index=%u\n",
+                  device, event.db_oid, event.index_oid);
+        _Exit(EXIT_FAILURE);
+    }
+    if (host_mirror_charge)
+        cuvs_page_overlay_unreserve(&g_page_overlay_budget, host_mirror_charge);
+    if (status == CUVS_CAGRA_FOLD_OK)
+    {
+        pthread_mutex_lock(&g_index_mutex);
+        if (!page_fold_should_yield(&device))
+            offered = page_graph_register_fold_locked(&source, &event, new_handle, (size_t) retained);
+        if (offered)
+        {
+            release_build_vram(peak, device);
+            g_fold_claim[device] = 0;
+        }
+        pthread_mutex_unlock(&g_index_mutex);
+    }
+    if (new_handle && !offered)
+        cuvs_cagra_free(new_handle, device);
+    cuvs_page_overlay_release(staging);
+    cuvs_page_overlay_release(snapshot);
+    page_graph_fold_unpin(&source);
+
+    pthread_mutex_lock(&g_index_mutex);
+    if (!offered)
+    {
+        release_build_vram(peak, device);
+        g_fold_claim[device] = 0;
+    }
+    __atomic_store_n(&g_fold_active[device], false, __ATOMIC_SEQ_CST);
+    uint64_t finished = admission_mono_us();
+    pthread_cond_broadcast(&g_fold_finished);
+    pthread_mutex_unlock(&g_index_mutex);
+    LOG_INFO("[page_fold] gpu=%d db=%u index=%u positions=%u status=%d offered=%d elapsed_us=%llu staging_status=%u"
+             " daemon_id=%llu started_us=%llu mono_us=%llu\n",
+             device, event.db_oid, event.index_oid, event.positions, status, offered,
+             (unsigned long long) (finished - now), staging_status, (unsigned long long) event.daemon_id,
+             (unsigned long long) started, (unsigned long long) finished);
+    return;
+
+defer:
+    pthread_mutex_unlock(&g_index_mutex);
+}
+
+static void *
+page_fold_thread(void *arg)
+{
+    int device = (int) (intptr_t) arg;
+
+    while (!g_shutdown)
+    {
+        page_fold_run(device);
+        struct timespec delay = {.tv_nsec = 100000000};
+
+        nanosleep(&delay, NULL);
+    }
+    return NULL;
+}
+#endif
+
 static bool
-page_fold_ready_locked(uint32_t db_oid, const CuvsPageFoldQuery *query,
-                        CuvsPageFoldEvent *event)
+page_fold_ready_locked(uint32_t db_oid, uint32_t index_oid, uint64_t index_nonce,
+                        const CuvsPageFoldQuery *query,
+                        CuvsPageFoldEvent *event, int *device, uint64_t *protected_us)
 {
     PageCagraGraph *selected = NULL;
 
@@ -13959,7 +14826,16 @@ page_fold_ready_locked(uint32_t db_oid, const CuvsPageFoldQuery *query,
     {
         PageCagraGraph *candidate = parent->fold_candidate;
 
+#ifdef CUVS_CAGRA_FOLD_ENABLED
+        /* A new handoff may not turn a reclaimable candidate into a protected
+         * one while an active fold's foreground waiters are resuming. A
+         * waiter keeps its claim until it reacquires this same mutex. */
+        if (candidate && !candidate->fold_protected_us &&
+            (g_fold_active[parent->gpu] || __atomic_load_n(&g_fold_waiters[parent->gpu], __ATOMIC_SEQ_CST)))
+            continue;
+#endif
         if (candidate && parent->db_oid == db_oid &&
+            (!index_oid || (parent->index_oid == index_oid && parent->index_nonce == index_nonce)) &&
             parent->system_identifier == query->system_identifier &&
             parent->overlay.boot_id == query->boot_id &&
             candidate->fold_event.boot_id == query->boot_id &&
@@ -13971,15 +14847,35 @@ page_fold_ready_locked(uint32_t db_oid, const CuvsPageFoldQuery *query,
 
     /* Leave the event outstanding while allowing another index to be
      * offered if this one is waiting on DDL or VACUUM. */
+#ifdef CUVS_CAGRA_FOLD_ENABLED
+    /* Once the handler can send any READY bytes, delivery is uncertain.
+     * Keep the event and graph until the existing PG lifetime resolves it. */
+    if (!selected->fold_protected_us)
+    {
+        selected->fold_protected_us = admission_mono_us();
+        LOG_INFO("[page_fold_protected] db=%u index=%u gpu=%d mono_us=%llu" FOLD_EVENT_LOG "\n",
+                 selected->db_oid, selected->index_oid, selected->gpu,
+                 (unsigned long long) selected->fold_protected_us, FOLD_EVENT_FIELDS(selected->fold_event));
+    }
+    if (protected_us)
+        *protected_us = selected->fold_protected_us;
+#else
+    (void) protected_us;
+#endif
     selected->fold_offer_order = ++g_page_fold_offer_order;
     *event = selected->fold_event;
+    if (device)
+        *device = selected->gpu;
     return true;
 }
 
 /* The wire event is a fixed, padding-free sequence of integer fields. */
 static uint32_t
-page_fold_result_locked(const CuvsPageFoldResult *result)
+page_fold_result_locked(const CuvsPageFoldResult *result, uint64_t received_us)
 {
+#ifndef CUVS_CAGRA_FOLD_ENABLED
+    (void) received_us;
+#endif
     for (PageCagraGraph **link = &g_page_graphs; *link; link = &(*link)->next)
     {
         PageCagraGraph *parent = *link;
@@ -13997,7 +14893,7 @@ page_fold_result_locked(const CuvsPageFoldResult *result)
         {
             if (candidate->fold_seen_by_pg)
                 return CUVS_STATUS_NOT_FOUND;
-            discard_page_fold_locked(parent);
+            discard_page_fold_locked(parent, "discard");
             return CUVS_STATUS_OK;
         }
 
@@ -14011,9 +14907,20 @@ page_fold_result_locked(const CuvsPageFoldResult *result)
         parent->retired_boots = NULL;
         candidate->fold_lsn = result->transition_lsn;
         candidate->loaded_at = time(NULL);
+#ifdef CUVS_CAGRA_FOLD_ENABLED
+        candidate->fold_pending_since = parent->fold_pending_since;
+#endif
         candidate->next = parent->next;
         *link = candidate;
         retire_page_graph_locked(parent, true);
+#ifdef CUVS_CAGRA_FOLD_ENABLED
+        LOG_INFO("[page_fold_commit] db=%u index=%u positions=%u folded=%llu lsn=%llX mono_us=%llu gpu=%d accepted_us=%llu"
+                 FOLD_EVENT_LOG "\n",
+                 candidate->db_oid, candidate->index_oid, candidate->fold_event.positions,
+                 (unsigned long long) candidate->folded, (unsigned long long) candidate->fold_lsn,
+                 (unsigned long long) received_us, candidate->gpu,
+                 (unsigned long long) admission_mono_us(), FOLD_EVENT_FIELDS(candidate->fold_event));
+#endif
         return CUVS_STATUS_OK;
     }
     return CUVS_STATUS_NOT_FOUND;
@@ -14025,18 +14932,41 @@ handle_page_fold_ready(int client_fd, const CuvsCmdFrame *cmd)
     CuvsPageFoldQuery query;
     CuvsPageFoldEvent event;
     CuvsReplyHeader reply = {.status = CUVS_STATUS_ERROR};
+    uint64_t index_nonce = 0;
+    uint64_t protected_us = 0;
+    int device = -1;
 
     if (recv_all(client_fd, &query, sizeof(query)) == 0 &&
-        cmd->db_oid && !cmd->index_oid && query.length == sizeof(query) &&
-        !query.reserved && query.system_identifier && query.boot_id)
+        cmd->db_oid && !query.reserved && query.system_identifier && query.boot_id &&
+        ((!cmd->index_oid && query.length == sizeof(query)) ||
+         (cmd->index_oid && query.length == sizeof(query) + sizeof(index_nonce) &&
+          recv_all(client_fd, &index_nonce, sizeof(index_nonce)) == 0 && index_nonce)))
     {
         pthread_mutex_lock(&g_index_mutex);
-        reply.status = page_fold_ready_locked(cmd->db_oid, &query, &event) ?
+        reply.status = page_fold_ready_locked(cmd->db_oid, cmd->index_oid, index_nonce, &query, &event,
+                                               &device, &protected_us) ?
             CUVS_STATUS_OK : CUVS_STATUS_NOT_FOUND;
         pthread_mutex_unlock(&g_index_mutex);
     }
-    if (send_all(client_fd, &reply, sizeof(reply)) == 0 && reply.status == CUVS_STATUS_OK)
-        (void) send_all(client_fd, &event, sizeof(event));
+    if (reply.status == CUVS_STATUS_OK)
+    {
+#ifdef CUVS_CAGRA_FOLD_ENABLED
+        uint64_t start = admission_mono_us();
+#endif
+        bool sent = send_all(client_fd, &reply, sizeof(reply)) == 0 &&
+            send_all(client_fd, &event, sizeof(event)) == 0;
+#ifdef CUVS_CAGRA_FOLD_ENABLED
+        LOG_INFO("[page_fold_ready] db=%u index=%u gpu=%d protected_us=%llu send_started_us=%llu mono_us=%llu sent=%d"
+                 FOLD_EVENT_LOG "\n", event.db_oid, event.index_oid, device,
+                 (unsigned long long) protected_us, (unsigned long long) start,
+                 (unsigned long long) admission_mono_us(), sent,
+                 FOLD_EVENT_FIELDS(event));
+#else
+        (void) sent;
+#endif
+    }
+    else
+        (void) send_all(client_fd, &reply, sizeof(reply));
 }
 
 static void
@@ -14050,10 +14980,29 @@ handle_page_fold_result(int client_fd, const CuvsCmdFrame *cmd)
         cmd->db_oid == result.event.db_oid && cmd->index_oid == result.event.index_oid &&
         (cmd->op == CUVS_OP_FOLD_COMMITTED) == (result.transition_lsn != 0))
     {
+#ifdef CUVS_CAGRA_FOLD_ENABLED
+        uint64_t received_us = admission_mono_us();
+#else
+        uint64_t received_us = 0;
+#endif
         (void) pthread_once(&g_page_daemon_once, initialize_page_daemon_id);
+#if defined(CUVS_TEST_HOOKS) && defined(CUVS_CAGRA_FOLD_ENABLED)
+        static bool lost_ack;
+
+        if (result.transition_lsn && result.event.daemon_id == g_page_daemon_id &&
+            cuvs_fault("CUVS_FAULT_PAGE_FOLD_ACK_ONCE") &&
+            !__atomic_exchange_n(&lost_ack, true, __ATOMIC_RELAXED))
+        {
+            LOG_INFO("[page_fold_ack_drop] db=%u index=%u lsn=%llX mono_us=%llu" FOLD_EVENT_LOG "\n",
+                     result.event.db_oid, result.event.index_oid,
+                     (unsigned long long) result.transition_lsn, (unsigned long long) received_us,
+                     FOLD_EVENT_FIELDS(result.event));
+            return;
+        }
+#endif
         pthread_mutex_lock(&g_index_mutex);
         reply.status = result.event.daemon_id == g_page_daemon_id ?
-            page_fold_result_locked(&result) : CUVS_STATUS_NOT_FOUND;
+            page_fold_result_locked(&result, received_us) : CUVS_STATUS_NOT_FOUND;
         pthread_mutex_unlock(&g_index_mutex);
     }
     (void) send_all(client_fd, &reply, sizeof(reply));
@@ -14068,7 +15017,13 @@ receive_page_overlay(int client_fd, const CuvsCmdFrame *cmd, CuvsPageOverlayRequ
                  sizeof(*request) - sizeof(request->base.length)) < 0)
         return CUVS_STATUS_ERROR;
     if (cmd->dim == 0 || cmd->dim > 65535 || cmd->n_filter_tids ||
-        request->base.resume_count || request->base.resume_distance || request->base.reserved ||
+        request->base.resume_count || request->base.resume_distance ||
+#ifdef CUVS_CAGRA_FOLD_ENABLED
+        (request->base.reserved &&
+         (cmd->op != CUVS_OP_SUPPLY_PAGES || request->base.reserved > request->base.n_slots)) ||
+#else
+        request->base.reserved ||
+#endif
         !request->boot_id || request->from < request->base.folded ||
         request->from > request->base.tail ||
         request->base.tail - request->from != request->positions ||
@@ -14201,8 +15156,12 @@ handle_page_supply(int client_fd, const CuvsCmdFrame *cmd)
     if (reply.status != CUVS_STATUS_OK)
         goto done;
     reply.status = CUVS_STATUS_ERROR;
-    if (cmd->n_vecs || cmd->k || !request.positions)
+    if (cmd->n_vecs || cmd->k)
         goto done;
+#ifndef CUVS_CAGRA_FOLD_ENABLED
+    if (!request.positions)
+        goto done;
+#endif
     progress.daemon_id = g_page_daemon_id;
 
     pthread_mutex_lock(&g_index_mutex);
@@ -14214,6 +15173,10 @@ handle_page_supply(int client_fd, const CuvsCmdFrame *cmd)
         goto done;
     }
     reply.status = cuvs_page_overlay_supply(&owner->overlay, &request, &chunk, &obsolete);
+#ifdef CUVS_CAGRA_FOLD_ENABLED
+    if (reply.status == CUVS_STATUS_OK)
+        graph->fold_live_base_slot = request.base.reserved;
+#endif
     progress.covered_upto = owner->overlay.covered_upto;
     registered_order = graph->registered_order;
     generation = owner->overlay.generation;
@@ -14321,7 +15284,7 @@ handle_page_overlay_search(int client_fd, const CuvsCmdFrame *cmd)
     if (reply.status != CUVS_STATUS_OK)
         goto done;
     reply.status = CUVS_STATUS_ERROR;
-    if (cmd->k == 0 || cmd->k > 4000 || cmd->n_vecs < 1 || cmd->n_vecs > 1024 ||
+    if (cmd->k == 0 || cmd->k > CUVS_PAGE_SEARCH_MAX_K || cmd->n_vecs < 1 || cmd->n_vecs > 1024 ||
         batch != (cmd->n_vecs > 1) || cmd->search_mode > 1 || cmd->bf_precision > 1)
         goto done;
     progress.daemon_id = g_page_daemon_id;
@@ -14553,6 +15516,21 @@ connection_thread(void *arg)
             cmd.op, cmd.db_oid, cmd.index_oid, cmd.dim, (long long)cmd.n_vecs, cmd.shm_key);
     fflush(stderr);
 
+#ifdef CUVS_CAGRA_FOLD_ENABLED
+    t_fold_request_op = page_fold_request_operation(&cmd);
+    if (t_fold_request_op)
+    {
+        (void) pthread_once(&g_page_daemon_once, initialize_page_daemon_id);
+        t_fold_request = &cmd;
+        t_fold_request_id = __atomic_add_fetch(&g_fold_request_sequence, 1, __ATOMIC_RELAXED);
+        t_fold_request_started = admission_mono_us();
+        LOG_INFO("[page_fold_request] op=%s db=%u index=%u daemon_id=%llu request_id=%llu mono_us=%llu\n",
+                 t_fold_request_op, cmd.db_oid, cmd.index_oid,
+                 (unsigned long long) g_page_daemon_id, (unsigned long long) t_fold_request_id,
+                 (unsigned long long) t_fold_request_started);
+    }
+#endif
+
     switch (cmd.op)
     {
         case CUVS_OP_SEARCH:
@@ -14748,6 +15726,10 @@ connection_thread(void *arg)
             break;
     }
 
+#ifdef CUVS_CAGRA_FOLD_ENABLED
+    if (t_fold_request)
+        page_fold_log_reply(NULL, false, admission_mono_us());
+#endif
     release_retired_fold_graphs();
     release_retired_page_overlays();
     close(client_fd);
@@ -15118,6 +16100,11 @@ graceful_shutdown(void)
 {
     LOG_INFO("pg_cuvs_server: SIGTERM received, serializing indexes...\n");
 
+#ifdef CUVS_CAGRA_FOLD_ENABLED
+    for (int device = 0; device < CUVS_MAX_GPUS; ++device)
+        if (g_fold_thread_started[device])
+            pthread_join(g_fold_threads[device], NULL);
+#endif
     /* I3-B: stop the reclaim thread before the final saves so no tick
      * evicts concurrently with them (it checks g_shutdown every second). */
     if (g_reclaim_started)
@@ -15840,6 +16827,18 @@ main(int argc, char **argv)
     else
         LOG_ERROR("pg_cuvs_server: failed to spawn BF batch worker; "
                   "brute_force micro-batching disabled (immediate dispatch only)\n");
+
+#ifdef CUVS_CAGRA_FOLD_ENABLED
+    for (int i = 0; i < n_usable_gpus(); ++i)
+    {
+        int device = usable_gpu(i);
+
+        if (pthread_create(&g_fold_threads[device], NULL, page_fold_thread, (void *) (intptr_t) device) == 0)
+            g_fold_thread_started[device] = true;
+        else
+            LOG_WARN("[page_fold] could not start the producer for gpu=%d\n", device);
+    }
+#endif
 
     /* Accept loop */
     while (!g_shutdown)
