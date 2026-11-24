@@ -1816,7 +1816,7 @@ cuvs_reloption_index_dir(Relation indexRel)
 
 /* Resolver for callers holding an open index Relation (build/insert/bulkdelete):
  * reads rd_options directly, so no relcache open. */
-static const char *
+const char *
 cuvs_resolve_index_dir_rel(Relation indexRel)
 {
     const char *reldir = cuvs_reloption_index_dir(indexRel);

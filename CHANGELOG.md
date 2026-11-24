@@ -88,6 +88,15 @@ exists for 0.9.0.
 
 ### Fixed
 
+- Reject stale CAGRA sources and sources with pending inserts or deletes
+  before converting them to HNSW. Source-based DDL checks the index key and
+  predicate, and `pg_cuvs_build_hnsw()` preserves both. The existing
+  vector-to-halfvec conversion on the same key is supported.
+- `hnswlib_file` now requires a build-time binding between the `.hnsw` and
+  `.tids` files. Older sidecars without a verifiable binding must be regenerated
+  once with `REINDEX` and `cuvs.cpu_hnsw_fallback = on`. To convert a clean
+  resident source without regenerating a sidecar, use `mode = 'nsw'`.
+
 - `CREATE INDEX CONCURRENTLY ... USING pg_cuvs_hnsw` and `REINDEX INDEX CONCURRENTLY` of a `pg_cuvs_hnsw` index
   built from the heap (without `source`) no longer make the table's queries wait for a lock. The build opened the
   index it writes with `AccessExclusiveLock`, while a concurrent build holds `RowExclusiveLock` on it. Every write

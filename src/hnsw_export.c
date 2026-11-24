@@ -37,6 +37,7 @@
 #include "access/genam.h"
 #include "access/heapam.h"
 #include "catalog/pg_attribute.h"  /* Form_pg_attribute, ATTNUM */
+#include "catalog/pg_cast.h"
 #include "catalog/pg_class.h"
 #include "catalog/pg_index.h"      /* Anum_pg_index_indclass */
 #include "catalog/pg_opclass.h"    /* Form_pg_opclass, CLAOID */
@@ -61,6 +62,7 @@
 #include "miscadmin.h"
 #include "libpq/pqsignal.h"
 #include "nodes/pg_list.h"       /* list_make1 */
+#include "nodes/makefuncs.h"
 #include "access/genam.h"        /* GetSysCacheOid3 */
 #include "access/table.h"        /* table_open/table_close (pgvector version guard) */
 #include "access/stratnum.h"     /* BTEqualStrategyNumber */
@@ -88,6 +90,7 @@
 #include "hnsw_export.h"
 #include "cuvs_hnsw_scan.h"
 #include "storage/buffile.h"
+#include "storage/fd.h"
 
 /* GUC declared in pg_cuvs.c — socket path for daemon IPC */
 extern char *cuvs_socket_path;
@@ -1437,23 +1440,6 @@ done:
 }
 
 /* ----------------------------------------------------------------
- * External GUCs declared in pg_cuvs.c
- * ---------------------------------------------------------------- */
-extern char *cuvs_index_dir;
-
-/* Forward declaration of get_index_dir from pg_cuvs.c — we replicate the
- * logic here to avoid exposing it as a public symbol. */
-static const char *
-hnsw_get_index_dir(void)
-{
-    static char buf[1024];
-    if (cuvs_index_dir && cuvs_index_dir[0] != '\0')
-        return cuvs_index_dir;
-    snprintf(buf, sizeof(buf), "%s/cuvs_indexes", DataDir);
-    return buf;
-}
-
-/* ----------------------------------------------------------------
  * In-memory element descriptor (filled during parse phase)
  * ---------------------------------------------------------------- */
 typedef struct {
@@ -2037,6 +2023,23 @@ cuvs_warn_pgvector_version(void)
 /* ================================================================
  * Main SQL function
  * ================================================================ */
+static bool
+hnsw_source_binding_matches(const char *graph_path, FILE *graph, FILE *tids)
+{
+    char path[1056];
+    CuvsHnswSourceBinding recorded;
+    FILE *file;
+    bool found;
+
+    snprintf(path, sizeof(path), "%s%s", graph_path, CUVS_HNSW_SOURCE_SUFFIX);
+    file = AllocateFile(path, PG_BINARY_R);
+    if (file == NULL)
+        return false;
+    found = cuvs_hnsw_source_binding_read(file, fileno(graph), fileno(tids), &recorded);
+    FreeFile(file);
+    return found;
+}
+
 /* Internal helper: fill an existing HNSW index from hnswlib sidecar.
  * Called by pg_cuvs_build_hnsw() for modes 'hnswlib' and 'hnswlib_file'.
  * use_shm=true  → daemon runs from_cagra() → /dev/shm (no disk I/O)
@@ -2065,6 +2068,7 @@ fill_hnsw_from_hnswlib_impl(Oid cagra_oid, Oid hnsw_oid, bool use_shm,
 
     uint32_t db_oid    = (uint32_t)MyDatabaseId;
     uint32_t index_oid = (uint32_t)cagra_oid;
+    const char *idir   = pstrdup(cuvs_resolve_index_dir_rel(cagra_rel));
 
     /* Infer dim from the index tuple descriptor (atttypmod on the first attr). */
     int dim = 0;
@@ -2164,7 +2168,6 @@ fill_hnsw_from_hnswlib_impl(Oid cagra_oid, Oid hnsw_oid, bool use_shm,
     /* ---- 2. Build sidecar paths ---- */
     char hnsw_path[1024];
     char tids_path[1024];
-    const char *idir = hnsw_get_index_dir();
 
     if (use_shm)
     {
@@ -2197,6 +2200,36 @@ fill_hnsw_from_hnswlib_impl(Oid cagra_oid, Oid hnsw_oid, bool use_shm,
                 (errmsg("pg_cuvs: cannot open .hnsw sidecar \"%s\": %m",
                         hnsw_path)));
     res->hf = hf;
+
+    /* Read the matching TID file before parsing the graph. */
+    FILE *tf = fopen(tids_path, "rb");
+    if (!tf)
+    {
+        ereport(ERROR,
+                (errmsg("pg_cuvs: cannot open .tids sidecar \"%s\": %m",
+                        tids_path)));
+    }
+
+    if (!use_shm && !hnsw_source_binding_matches(hnsw_path, hf, tf))
+    {
+        fclose(tf);
+        ereport(ERROR,
+                (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+                 errmsg("pg_cuvs: hnswlib_file sidecar has no matching CAGRA generation binding"),
+                 errhint("Use mode 'nsw' to convert the current CAGRA graph, or REINDEX the source with cuvs.cpu_hnsw_fallback enabled.")));
+    }
+
+    CuvsTidsHeader tids_hdr;
+    uint64_t      *tids = NULL;
+    if (cuvs_tids_read(tf, &tids_hdr, &tids) != 0)
+    {
+        fclose(tf);
+        ereport(ERROR,
+                (errmsg("pg_cuvs: failed to read/validate .tids sidecar \"%s\"",
+                        tids_path)));
+    }
+    fclose(tf);
+    res->tids = tids;
 
     HnswlibHeader hdr;
     memset(&hdr, 0, sizeof(hdr));
@@ -2234,32 +2267,13 @@ fill_hnsw_from_hnswlib_impl(Oid cagra_oid, Oid hnsw_oid, bool use_shm,
                                M, M0)));
     }
 
-    /* ---- 4. Read .tids sidecar ---- */
-    FILE *tf = fopen(tids_path, "rb");
-    if (!tf)
+    if ((size_t)tids_hdr.n_vecs != N)
     {
         ereport(ERROR,
-                (errmsg("pg_cuvs: cannot open .tids sidecar \"%s\": %m",
-                        tids_path)));
-    }
-
-    CuvsTidsHeader tids_hdr;
-    uint64_t      *tids = NULL;
-    if (cuvs_tids_read(tf, &tids_hdr, &tids) != 0)
-    {
-        fclose(tf);
-        ereport(ERROR,
-                (errmsg("pg_cuvs: failed to read/validate .tids sidecar \"%s\"",
-                        tids_path)));
-    }
-    fclose(tf);
-    res->tids = tids;
-
-    if ((size_t)tids_hdr.n_vecs < N)
-    {
-        ereport(ERROR,
-                (errmsg("pg_cuvs: .tids has %lld entries but .hnsw has %zu elements",
-                        (long long)tids_hdr.n_vecs, N)));
+                (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+                 errmsg("pg_cuvs: .tids has %lld entries but .hnsw has %zu elements",
+                        (long long)tids_hdr.n_vecs, N),
+                 errhint("Build the HNSW index from the heap, or use mode 'nsw' to convert the resident CAGRA graph.")));
     }
 
     /* ---- 4b. Metric (opclass) compatibility check ---- */
@@ -4357,35 +4371,17 @@ cagra_index_metric(Oid cagra_oid)
 
 /* ---- create empty HNSW on parent table, no CPU build ---- */
 static Oid
-create_empty_hnsw(Oid cagra_oid)
+create_empty_hnsw(Relation heap_rel, Relation cagra_rel)
 {
-    HeapTuple ix_tup = SearchSysCache1(INDEXRELID, ObjectIdGetDatum(cagra_oid));
-    if (!HeapTupleIsValid(ix_tup))
-        ereport(ERROR, (errmsg("pg_cuvs: CAGRA index %u not found", cagra_oid)));
-    Oid heap_oid = ((Form_pg_index) GETSTRUCT(ix_tup))->indrelid;
-    ReleaseSysCache(ix_tup);
-
-    if (!object_ownercheck(RelationRelationId, heap_oid, GetUserId()))
-        aclcheck_error(ACLCHECK_NOT_OWNER, OBJECT_TABLE,
-                       get_rel_name(heap_oid));
-
+    Oid      cagra_oid    = RelationGetRelid(cagra_rel);
     uint32_t metric       = cagra_index_metric(cagra_oid);
     Oid      hnsw_opclass = find_hnsw_opclass_oid(metric);
-
-    Relation heap_rel  = table_open(heap_oid, ShareLock);
-    Relation cagra_rel = index_open(cagra_oid, AccessShareLock);
-
-    AttrNumber col_attnum = cagra_rel->rd_index->indkey.values[0];
-    Form_pg_attribute att = TupleDescAttr(heap_rel->rd_att, col_attnum - 1);
+    Form_pg_attribute att = TupleDescAttr(RelationGetDescr(cagra_rel), 0);
     char  *col_name  = pstrdup(NameStr(att->attname));
-    Oid    collation = att->attcollation;
+    Oid    collation = cagra_rel->rd_indcollation[0];
     int16  coloption = 0;
 
     IndexInfo *iinfo = BuildIndexInfo(cagra_rel);
-    iinfo->ii_Predicate      = NIL;
-    iinfo->ii_PredicateState = NULL;
-
-    index_close(cagra_rel, AccessShareLock);
 
     /* Include a sequence so multiple calls with the same CAGRA produce unique names. */
     static int hnsw_build_seq = 0;
@@ -4419,7 +4415,6 @@ create_empty_hnsw(Oid cagra_oid)
         true,                 /* is_internal */
         NULL);                /* constraintId */
 
-    table_close(heap_rel, ShareLock);
     CommandCounterIncrement();
     return hnsw_oid;
 }
@@ -4437,6 +4432,131 @@ hnsw_require_legacy_cagra_source(Relation source)
 #endif
 }
 
+/* A pending file with a valid empty header contains no work. Treat missing
+ * files as empty, but refuse files whose emptiness cannot be established. */
+static void
+hnsw_require_empty_pending_file(Relation source, const char *stem,
+                                const char *suffix)
+{
+    char path[MAXPGPATH];
+    struct stat st;
+    FILE *file;
+    bool empty = false;
+
+    if (snprintf(path, sizeof(path), "%s.%s", stem, suffix) >= sizeof(path))
+        ereport(ERROR, (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+                        errmsg("pg_cuvs: CAGRA source path is too long")));
+    file = AllocateFile(path, PG_BINARY_R);
+    if (file == NULL && errno == ENOENT)
+        return;
+    if (file != NULL)
+    {
+        if (fstat(fileno(file), &st) == 0 && S_ISREG(st.st_mode))
+        {
+            if (strcmp(suffix, "delta") == 0)
+            {
+                CuvsDeltaHeader header;
+                empty = st.st_size == sizeof(header) &&
+                    cuvs_delta_read_header(file, &header) == 0 &&
+                    cuvs_delta_validate(&header, 0) == 0;
+            }
+            else
+            {
+                CuvsTombstoneHeader header;
+                empty = st.st_size == sizeof(header) &&
+                    cuvs_tombstone_read_header(file, &header) == 0 &&
+                    cuvs_tombstone_validate(&header, 0) == 0;
+            }
+        }
+        FreeFile(file);
+    }
+    if (!empty)
+        ereport(ERROR,
+                (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+                 strcmp(suffix, "delta") == 0
+                 ? errmsg("pg_cuvs: source CAGRA index \"%s\" has pending inserts or an unreadable delta file",
+                          RelationGetRelationName(source))
+                 : errmsg("pg_cuvs: source CAGRA index \"%s\" has pending deletes or an unreadable tombstone file",
+                          RelationGetRelationName(source)),
+                 errhint("REINDEX the source CAGRA index before converting it, or build the HNSW index from the heap.")));
+}
+
+static void
+hnsw_check_cagra_source(Relation source)
+{
+    char stem[MAXPGPATH];
+    char path[MAXPGPATH];
+    struct stat st;
+
+    hnsw_require_legacy_cagra_source(source);
+    if (!source->rd_index->indisvalid || !source->rd_index->indislive)
+        ereport(ERROR,
+                (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+                 errmsg("pg_cuvs: source CAGRA index \"%s\" is not valid", RelationGetRelationName(source)),
+                 errhint("Use a valid CAGRA index or build the HNSW index from the heap.")));
+
+    if (snprintf(stem, sizeof(stem), "%s/%u_%u", cuvs_resolve_index_dir_rel(source),
+                 MyDatabaseId, RelationGetRelid(source)) >= sizeof(stem) ||
+        snprintf(path, sizeof(path), "%s.stale", stem) >= sizeof(path))
+        ereport(ERROR, (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+                        errmsg("pg_cuvs: CAGRA source path is too long")));
+    if (stat(path, &st) == 0)
+        ereport(ERROR,
+                (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+                 errmsg("pg_cuvs: source CAGRA index \"%s\" is stale", RelationGetRelationName(source)),
+                 errhint("REINDEX the source CAGRA index before converting it, or build the HNSW index from the heap.")));
+    if (errno != ENOENT)
+        ereport(ERROR,
+                (errcode_for_file_access(),
+                 errmsg("pg_cuvs: cannot check CAGRA source stale marker \"%s\": %m", path),
+                 errhint("Check the source index directory, or build the HNSW index from the heap.")));
+
+    hnsw_require_empty_pending_file(source, stem, "delta");
+    hnsw_require_empty_pending_file(source, stem, "tombstone");
+}
+
+/* The existing vector -> halfvec import applies the pgvector cast in the
+ * page writer. Keep that conversion when it wraps exactly the source key. */
+static bool
+hnsw_source_key_matches(Relation source, Relation target)
+{
+    AttrNumber src_attno = source->rd_index->indkey.values[0];
+    AttrNumber dst_attno = target->rd_index->indkey.values[0];
+    List *src_exprs = RelationGetIndexExpressions(source);
+    List *dst_exprs = RelationGetIndexExpressions(target);
+    Form_pg_attribute src = TupleDescAttr(RelationGetDescr(source), 0);
+    Form_pg_attribute dst = TupleDescAttr(RelationGetDescr(target), 0);
+    FuncExpr *cast;
+    HeapTuple cast_tuple;
+    Oid cast_function;
+    Node *source_key;
+
+    if (src_attno == dst_attno && equal(src_exprs, dst_exprs))
+        return true;
+    if (dst_attno != 0 || list_length(dst_exprs) != 1 ||
+        !IsA(linitial(dst_exprs), FuncExpr) ||
+        bytes_per_dim_for_typid(dst->atttypid) != 2 ||
+        src->atttypmod != dst->atttypmod)
+        return false;
+
+    cast = linitial_node(FuncExpr, dst_exprs);
+    cast_tuple = SearchSysCache2(CASTSOURCETARGET,
+                                ObjectIdGetDatum(src->atttypid),
+                                ObjectIdGetDatum(dst->atttypid));
+    if (!HeapTupleIsValid(cast_tuple))
+        return false;
+    cast_function = ((Form_pg_cast) GETSTRUCT(cast_tuple))->castfunc;
+    ReleaseSysCache(cast_tuple);
+    if (cast->funcid != cast_function || cast->args == NIL)
+        return false;
+
+    source_key = src_attno != 0
+        ? (Node *) makeVar(1, src_attno, src->atttypid, src->atttypmod,
+                          src->attcollation, 0)
+        : linitial(src_exprs);
+    return equal(source_key, linitial(cast->args));
+}
+
 PG_FUNCTION_INFO_V1(pg_cuvs_build_hnsw);
 Datum
 pg_cuvs_build_hnsw(PG_FUNCTION_ARGS)
@@ -4444,6 +4564,12 @@ pg_cuvs_build_hnsw(PG_FUNCTION_ARGS)
     Oid         cagra_oid = PG_GETARG_OID(0);
     const char *mode = (PG_NARGS() >= 2 && !PG_ARGISNULL(1)) ?
                        text_to_cstring(PG_GETARG_TEXT_PP(1)) : "nsw";
+    Oid heap_oid = IndexGetRelation(cagra_oid, false);
+    Relation heap_rel;
+    Relation cagra_rel;
+    int graph_degree;
+    int dim;
+    Oid hnsw_oid;
 
     /* Phase 3K (ADR-038): the function form is deprecated in favor of the
      * CREATE INDEX ... USING pg_cuvs_hnsw DDL, which integrates with the
@@ -4468,27 +4594,21 @@ pg_cuvs_build_hnsw(PG_FUNCTION_ARGS)
      * rd_options to CuvsCagraOptions, so a non-cagra argument here would
      * read that AM's option struct at CuvsCagraOptions's field offsets
      * instead of failing with a clear "not a cagra index" error. */
-    {
-        Relation cagra_rel_pc = index_open(cagra_oid, AccessShareLock);
-        if (cagra_rel_pc->rd_rel->relam != get_am_oid("cagra", false))
-        {
-            index_close(cagra_rel_pc, AccessShareLock);
-            ereport(ERROR,
-                    (errmsg("pg_cuvs_build_hnsw: \"%s\" is not a cagra index",
-                            get_rel_name(cagra_oid))));
-        }
-        hnsw_require_legacy_cagra_source(cagra_rel_pc);
-        int precheck_dim = (int) TupleDescAttr(RelationGetDescr(cagra_rel_pc), 0)->atttypmod;
-        int graph_degree  = cuvs_cagra_reloption_graph_degree(cagra_rel_pc);
-        index_close(cagra_rel_pc, AccessShareLock);
-        int m0 = (graph_degree < 64) ? graph_degree : 64;
-        /* 'nsw' builds upper layers too, so the conservative bound of the other modes applies. */
-        int precheck_maxlevel = 5;
-        check_hnsw_page_fit(precheck_dim, 4, m0 / 2, precheck_maxlevel);
-    }
+    if (!object_ownercheck(RelationRelationId, heap_oid, GetUserId()))
+        aclcheck_error(ACLCHECK_NOT_OWNER, OBJECT_TABLE, get_rel_name(heap_oid));
+    heap_rel = table_open(heap_oid, ShareLock);
+    cagra_rel = index_open(cagra_oid, AccessShareLock);
+    if (cagra_rel->rd_rel->relam != get_am_oid("cagra", false))
+        ereport(ERROR,
+                (errmsg("pg_cuvs_build_hnsw: \"%s\" is not a cagra index",
+                        get_rel_name(cagra_oid))));
+    hnsw_check_cagra_source(cagra_rel);
+    dim = (int) TupleDescAttr(RelationGetDescr(cagra_rel), 0)->atttypmod;
+    graph_degree = cuvs_cagra_reloption_graph_degree(cagra_rel);
+    check_hnsw_page_fit(dim, 4, Min(graph_degree, 64) / 2, 5);
 
     /* Create empty HNSW on parent table — INDEX_CREATE_SKIP_BUILD, no CPU build */
-    Oid hnsw_oid = create_empty_hnsw(cagra_oid);
+    hnsw_oid = create_empty_hnsw(heap_rel, cagra_rel);
 
     /* Dispatch to internal C helpers — no SQL/SPI overhead.
      *
@@ -4512,6 +4632,10 @@ pg_cuvs_build_hnsw(PG_FUNCTION_ARGS)
     else  /* hnswlib_file */
         fill_hnsw_from_hnswlib(cagra_oid, hnsw_oid, false);
 
+    index_close(cagra_rel, AccessShareLock);
+    /* As in a regular CREATE INDEX, block table writes through commit of the
+     * populated, ready index. The source probe and the import use one lock. */
+    table_close(heap_rel, NoLock);
     PG_RETURN_OID(hnsw_oid);
 }
 
@@ -4848,6 +4972,7 @@ cuvs_hnsw_ambuild(Relation heapRel, Relation indexRel, IndexInfo *indexInfo)
     /* Resolve source name (schema-qualified, search_path aware) to an OID. */
     Oid cagra_oid = DatumGetObjectId(
         DirectFunctionCall1(regclassin, CStringGetDatum((char *) source_name)));
+    Relation cagra_rel;
 
     /* Source must be a cagra index on the same table we are indexing. */
     {
@@ -4876,15 +5001,10 @@ cuvs_hnsw_ambuild(Relation heapRel, Relation indexRel, IndexInfo *indexInfo)
 
         /* #162: dim-ceiling pre-check using the source CAGRA's own
          * graph_degree reloption, before paying the IPC round-trip. */
-        {
-            Relation cagra_rel_gd = index_open(cagra_oid, AccessShareLock);
-            hnsw_require_legacy_cagra_source(cagra_rel_gd);
-            int graph_degree = cuvs_cagra_reloption_graph_degree(cagra_rel_gd);
-            index_close(cagra_rel_gd, AccessShareLock);
-            int m0 = (graph_degree < 64) ? graph_degree : 64;
-            check_hnsw_page_fit(precheck_dim, precheck_bytes_per_dim,
-                                 m0 / 2, safe_maxlevel);
-        }
+        cagra_rel = index_open(cagra_oid, AccessShareLock);
+        int graph_degree = cuvs_cagra_reloption_graph_degree(cagra_rel);
+        check_hnsw_page_fit(precheck_dim, precheck_bytes_per_dim,
+                            Min(graph_degree, 64) / 2, safe_maxlevel);
 
         /* Fail fast: the source CAGRA's metric must match this index's opclass
          * BEFORE paying an IPC round-trip. cagra_index_metric() is opclass-name
@@ -4909,6 +5029,19 @@ cuvs_hnsw_ambuild(Relation heapRel, Relation indexRel, IndexInfo *indexInfo)
         }
     }
 
+    hnsw_check_cagra_source(cagra_rel);
+    if (!equal(RelationGetIndexPredicate(cagra_rel),
+               RelationGetIndexPredicate(indexRel)))
+        ereport(ERROR,
+                (errcode(ERRCODE_INVALID_TABLE_DEFINITION),
+                 errmsg("pg_cuvs_hnsw: source CAGRA predicate does not match the target"),
+                 errhint("Use the same WHERE clause as the source index, or build from the heap without a source.")));
+    if (!hnsw_source_key_matches(cagra_rel, indexRel))
+        ereport(ERROR,
+                (errcode(ERRCODE_INVALID_TABLE_DEFINITION),
+                 errmsg("pg_cuvs_hnsw: source CAGRA index key does not match the target"),
+                 errhint("Use the same column or expression as the source index, or build from the heap without a source.")));
+
     /* Fill THIS index's relation (pgvector page format) from the CAGRA graph.
      * fill_* open the target by OID with AccessExclusiveLock. For CREATE INDEX
      * and REINDEX this backend already holds that lock on the index under
@@ -4923,6 +5056,7 @@ cuvs_hnsw_ambuild(Relation heapRel, Relation indexRel, IndexInfo *indexInfo)
         n_elems_written = fill_hnsw_from_hnswlib(cagra_oid, self_oid, true);
     else  /* hnswlib_file */
         n_elems_written = fill_hnsw_from_hnswlib(cagra_oid, self_oid, false);
+    index_close(cagra_rel, AccessShareLock);
 
     /* #161: element count from fill_*'s own return, not inferred from block
      * count. nblocks-1 == N only holds while every page carries exactly one

@@ -1,0 +1,11 @@
+\set ECHO none
+53
+t
+ERROR:  pg_cuvs: hnswlib_file sidecar has no matching CAGRA generation binding
+HINT:  Use mode 'nsw' to convert the current CAGRA graph, or REINDEX the source with cuvs.cpu_hnsw_fallback enabled.
+t
+Limit
+  ->  Index Scan using hsc_file_nsw on hsc_file
+        Order By: (v <-> '[500,500,500]'::vector)
+1000
+1000

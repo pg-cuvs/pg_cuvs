@@ -515,6 +515,18 @@ cagra/ivfpq") rather than silently failing.
 | `ef_construction` | int | `64` | 4–1000 | Direct heap build: construction effort; source reuse: informational |
 | `build_algo` | enum | `auto` | `auto`, `ivf_pq`, `nn_descent`, `ace` | Direct heap build only; cannot be combined with explicit `source` |
 
+A CAGRA source must be valid and free of pending inserts and deletes. A stale
+source or pending sidecar records cause the conversion to fail with a hint to
+rebuild the source or build the HNSW index from the heap. The target must use
+the same index key and predicate as the source. A cast of the same vector key
+to `halfvec` is supported. The deprecated `pg_cuvs_build_hnsw()` function creates
+its target with the source key and predicate.
+
+The `hnswlib_file` mode requires a build-time binding to the source CAGRA's TID
+file. A source mutation invalidates that binding. For an older or copied
+`.hnsw` file whose binding cannot be verified, run `REINDEX` after setting
+`cuvs.cpu_hnsw_fallback = on`, or choose `mode = 'nsw'` on a clean source.
+
 For direct heap construction, `auto` uses tiny exact GPU construction below 16 rows and
 otherwise the resident IVF-PQ route while its estimate fits the host and GPU budgets.
 Over the budget, `auto` spills to ACE on disk by default and says so with a NOTICE

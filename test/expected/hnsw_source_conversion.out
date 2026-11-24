@@ -1,0 +1,25 @@
+\set ECHO none
+t
+nsw|t|t
+hnsw|t|t
+hnswlib|t|t
+hnswlib_file|t|t
+ERROR:  pg_cuvs: source CAGRA index "hsc_delta_src" has pending inserts or an unreadable delta file
+HINT:  REINDEX the source CAGRA index before converting it, or build the HNSW index from the heap.
+f
+t
+51
+51
+t
+t
+t
+t
+t
+t
+t
+t
+t
+t|t
+ERROR:  pg_cuvs: source CAGRA index "hsc_stale_src" is stale
+HINT:  REINDEX the source CAGRA index before converting it, or build the HNSW index from the heap.
+f
