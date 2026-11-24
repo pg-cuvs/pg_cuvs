@@ -355,6 +355,105 @@ static IndexEntry *g_indexes      = NULL;   /* calloc(g_max_indexes) at startup 
 static int         g_n_indexes   = 0;
 static pthread_mutex_t g_index_mutex = PTHREAD_MUTEX_INITIALIZER;
 
+/* Page-format graphs never participate in the OID-only legacy registry. */
+typedef struct PageCagraGraph
+{
+    struct PageCagraGraph *next;
+    uint64_t system_identifier;
+    uint32_t db_oid;
+    uint32_t index_oid;
+    uint64_t index_nonce;
+    uint64_t graph_nonce;
+    uint64_t build_xid;
+    uint64_t n_slots;
+    uint32_t dim;
+    uint32_t metric;
+    int gpu;
+    CuvsCagraIndex handle;
+    CuvsHnswIndex cpu_hnsw;
+    CuvsBfIndex bf[2];
+    size_t bf_bytes[2];
+    uint32_t bf_miss_reported;
+    size_t bytes;
+    uint64_t last_use;
+    time_t loaded_at;
+    time_t last_search;
+    uint32_t hits;
+} PageCagraGraph;
+
+static PageCagraGraph *g_page_graphs;
+static int g_n_page_graphs;
+static uint64_t g_page_access;
+static size_t g_page_graph_bytes[CUVS_MAX_GPUS];
+
+/* These helpers run under the registry lock. The disk directories outlive
+ * residency and are reconciled against the committed catalog separately. */
+static void
+dispose_page_graph(PageCagraGraph *entry)
+{
+    g_page_graph_bytes[entry->gpu] -= entry->bytes + entry->bf_bytes[0] + entry->bf_bytes[1];
+    for (int precision = 0; precision < 2; ++precision)
+        if (entry->bf[precision])
+            cuvs_bf_free(entry->bf[precision], entry->gpu);
+    if (entry->cpu_hnsw) cuvs_hnsw_free(entry->cpu_hnsw);
+    cuvs_cagra_free(entry->handle, entry->gpu);
+    free(entry);
+}
+
+static void
+free_page_graph(PageCagraGraph **link)
+{
+    PageCagraGraph *entry = *link;
+
+    *link = entry->next;
+    --g_n_page_graphs;
+    dispose_page_graph(entry);
+}
+
+static void
+drop_page_graphs(uint32_t db_oid, uint32_t index_oid)
+{
+    PageCagraGraph **link = &g_page_graphs;
+
+    while (*link)
+    {
+        PageCagraGraph *entry = *link;
+        if (entry->db_oid == db_oid && entry->index_oid == index_oid)
+            free_page_graph(link);
+        else
+            link = &entry->next;
+    }
+}
+
+static bool
+evict_page_graph(int gpu)
+{
+    PageCagraGraph **victim = NULL;
+
+    for (PageCagraGraph **link = &g_page_graphs; *link; link = &(*link)->next)
+        if ((gpu < 0 || (*link)->gpu == gpu) &&
+            (!victim || (*link)->last_use < (*victim)->last_use))
+            victim = link;
+    if (!victim)
+        return false;
+    free_page_graph(victim);
+    return true;
+}
+
+static PageCagraGraph *
+find_page_graph(const CuvsCmdFrame *cmd, const CuvsPageSearchRequest *request)
+{
+    for (PageCagraGraph *entry = g_page_graphs; entry; entry = entry->next)
+        if (entry->system_identifier == request->system_identifier &&
+            entry->db_oid == cmd->db_oid && entry->index_oid == cmd->index_oid &&
+            entry->index_nonce == request->index_nonce &&
+            entry->graph_nonce == request->graph_nonce &&
+            request->base_nonce == entry->graph_nonce &&
+            entry->n_slots == request->n_slots)
+            return entry;
+    return NULL;
+}
+
 /* Phase 3D: cold index registry — indexes known from .relfilenode sidecars but
  * not yet VRAM-resident. Protected by g_index_mutex. When warmup completes,
  * the entry is removed here and load_index() adds it to g_indexes. */
@@ -408,6 +507,102 @@ static size_t   g_max_vram_per_gpu[CUVS_MAX_GPUS];
  * ---------------------------------------------------------------- */
 static char   g_socket_path[256]  = "/tmp/.s.pg_cuvs.server";
 static char   g_index_dir[256]    = "/tmp/pg_cuvs_indexes";
+
+/* Acknowledged page builds publish the durable marker before advancing this
+ * counter under the registry lock. */
+static uint64_t g_page_deferral_epoch;
+
+static bool
+page_xid_complete(int dirfd, const char *name)
+{
+    char text[32];
+    char *end;
+    struct stat st;
+    int fd = openat(dirfd, name, O_RDONLY | O_NOFOLLOW | O_NONBLOCK);
+    ssize_t len;
+
+    if (fd < 0)
+        return false;
+    len = (fstat(fd, &st) == 0 && S_ISREG(st.st_mode)) ? read(fd, text, sizeof(text) - 1) : -1;
+    close(fd);
+    if (len < 2 || st.st_size != len || text[0] < '1' || text[0] > '9')
+        return false;
+    text[len] = '\0';
+    errno = 0;
+    (void) strtoull(text, &end, 10);
+    return errno == 0 && end == text + len - 1 && *end == '\n';
+}
+
+/* Consume fd. Older development graphs put build.xid one level below the
+ * incarnation, so check both layouts while those artifacts may remain. */
+static bool
+page_has_completed_xid(int fd, unsigned depth)
+{
+    bool complete = depth < 2 &&
+        (page_xid_complete(fd, "build.xid") || page_xid_complete(fd, "empty.xid"));
+    DIR *dir;
+    struct dirent *ent;
+
+    if (complete || depth == 0 || !(dir = fdopendir(fd)))
+    {
+        close(fd);
+        return complete;
+    }
+    while (!complete && (ent = readdir(dir)))
+    {
+        int child;
+
+        if (strlen(ent->d_name) != 16 || strspn(ent->d_name, "0123456789abcdef") != 16)
+            continue;
+        child = openat(fd, ent->d_name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
+        if (child >= 0)
+            complete = page_has_completed_xid(child, depth - 1);
+    }
+    closedir(dir);
+    return complete;
+}
+
+static bool
+page_legacy_deferred(uint32_t db_oid, uint32_t index_oid)
+{
+    char path[512];
+    int len = snprintf(path, sizeof(path), "%s/%u_%u", g_index_dir, db_oid, index_oid);
+    int fd;
+
+    if (len < 0 || len >= (int) sizeof(path))
+        return false;
+    fd = open(path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
+    return fd >= 0 && page_has_completed_xid(fd, 2);
+}
+
+/* Drop and failed-build cleanup are rooted in the daemon's directory. Do
+ * not follow symlinks, even when an artifact was created by an older build. */
+static void
+remove_page_tree_at(int parent, const char *name)
+{
+    int fd = openat(parent, name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
+    DIR *dir;
+    struct dirent *ent;
+
+    if (fd < 0)
+    {
+        if (errno == ENOTDIR || errno == ELOOP)
+            unlinkat(parent, name, 0);
+        return;
+    }
+    dir = fdopendir(fd);
+    if (!dir)
+    {
+        close(fd);
+        return;
+    }
+    while ((ent = readdir(dir)))
+        if (strcmp(ent->d_name, ".") != 0 && strcmp(ent->d_name, "..") != 0)
+            remove_page_tree_at(fd, ent->d_name);
+    closedir(dir);
+    unlinkat(parent, name, AT_REMOVEDIR);
+}
+
 static size_t g_max_vram_bytes    = 0;   /* 0 = use default fraction; >0 = explicit --max-vram-mb */
 #ifdef PGCUVS_CPU_SHIM
 static uint32_t g_rmm_pool_mb     = 0;   /* CPU fixture has no GPU allocator */
@@ -609,6 +804,26 @@ warmup_dequeue(WarmupJob *out)
 static int  load_index(uint32_t db_oid, uint32_t index_oid, CuvsRequester rq);
 static void build_rev_tid_map(IndexEntry *e);  /* 3O: TID→item_id reverse map */
 
+/* Returns with g_index_mutex held. Recheck after a concurrent publication
+ * without performing a filesystem lookup under that lock. */
+static bool
+lock_warmup_registry(const WarmupJob *job)
+{
+    pthread_mutex_lock(&g_index_mutex);
+    while (!job->from_cache_miss)
+    {
+        uint64_t epoch = g_page_deferral_epoch;
+        bool deferred;
+
+        pthread_mutex_unlock(&g_index_mutex);
+        deferred = page_legacy_deferred(job->db_oid, job->index_oid);
+        pthread_mutex_lock(&g_index_mutex);
+        if (epoch == g_page_deferral_epoch)
+            return !deferred;
+    }
+    return true;
+}
+
 static void *
 warmup_worker_thread(void *arg)
 {
@@ -618,23 +833,22 @@ warmup_worker_thread(void *arg)
         WarmupJob job;
         if (warmup_dequeue(&job) != 0)
             break;
-
-        LOG_INFO("warmup: downloading %u/%u from GCS\n",
-                 job.db_oid, job.index_oid);
-
         /* Update cold entry state -> DOWNLOADING (under g_index_mutex). */
-        pthread_mutex_lock(&g_index_mutex);
+        bool allowed = lock_warmup_registry(&job);
         for (int i = 0; i < g_n_cold_indexes; i++)
         {
             ColdIndexEntry *ce = &g_cold_indexes[i];
             if (ce->valid && ce->db_oid == job.db_oid &&
                 ce->index_oid == job.index_oid)
             {
-                ce->warmup_state = WARMUP_DOWNLOADING;
+                ce->warmup_state = allowed ? WARMUP_DOWNLOADING : WARMUP_COLD;
                 break;
             }
         }
         pthread_mutex_unlock(&g_index_mutex);
+        if (!allowed)
+            continue;
+        LOG_INFO("warmup: downloading %u/%u from GCS\n", job.db_oid, job.index_oid);
 
         struct timespec t0, t1;
         clock_gettime(CLOCK_MONOTONIC, &t0);
@@ -664,7 +878,7 @@ warmup_worker_thread(void *arg)
         }
 
         /* Download succeeded — load into VRAM. */
-        pthread_mutex_lock(&g_index_mutex);
+        allowed = lock_warmup_registry(&job);
 
         /* Mark LOADING. */
         ColdIndexEntry *target_ce = NULL;
@@ -674,10 +888,16 @@ warmup_worker_thread(void *arg)
             if (ce->valid && ce->db_oid == job.db_oid &&
                 ce->index_oid == job.index_oid)
             {
-                ce->warmup_state = WARMUP_LOADING;
+                ce->warmup_state = allowed ? WARMUP_LOADING : WARMUP_COLD;
                 target_ce = ce;
                 break;
             }
+        }
+
+        if (!allowed)
+        {
+            pthread_mutex_unlock(&g_index_mutex);
+            continue;
         }
 
         if (load_index(job.db_oid, job.index_oid, CUVS_RQ_LOAD_WARMUP) != 0)
@@ -802,7 +1022,7 @@ total_vram_used(int device_id)
     /* ADR-070 Bug #2: include VRAM reserved by in-flight builds on this device
      * (released the mutex for the GPU build; not yet in g_indexes). */
     if (device_id >= 0 && device_id < CUVS_MAX_GPUS)
-        total += g_pending_build_vram[device_id];
+        total += g_pending_build_vram[device_id] + g_page_graph_bytes[device_id];
     return total;
 }
 
@@ -2657,7 +2877,8 @@ startup_load_ordered(CuvsLoadKey *keys, int n, const CuvsUsageStat *st,
     for (int i = 0; i < n; i++)
     {
         const CuvsLoadKey *k = &keys[perm[i]];
-        if (find_index(k->db_oid, k->index_oid))
+        if (find_index(k->db_oid, k->index_oid) ||
+            page_legacy_deferred(k->db_oid, k->index_oid))
             continue;
         if (load_index(k->db_oid, k->index_oid, CUVS_RQ_LOAD_STARTUP) == 0)
             (*loaded)++;
@@ -2776,7 +2997,8 @@ startup_load_indexes(void)
     while ((ent = readdir(dir)) != NULL)
     {
         uint32_t db_oid, index_oid;
-        if (sscanf(ent->d_name, "%u_%u.relfilenode", &db_oid, &index_oid) != 2)
+        if (sscanf(ent->d_name, "%u_%u.relfilenode", &db_oid, &index_oid) != 2 ||
+            page_legacy_deferred(db_oid, index_oid))
             continue;
 
         int already_loaded = 0;
@@ -3055,7 +3277,7 @@ admission_cache_totals(int dev, AdmissionCacheTotals *out)
  * stays resident). Writes the [evict] line and the counters (EV-7). */
 static size_t
 evict_entry(IndexEntry *e, int device_id, CuvsEvictReason why, int self_replace,
-            CuvsRequester rq, int *persist_failed)
+            CuvsRequester rq, int *persist_failed, bool save_legacy)
 {
     CuvsEvictParams pp = evict_params_now();
     CuvsEvictCand   c = entry_cand(e, device_id);
@@ -3110,7 +3332,7 @@ evict_entry(IndexEntry *e, int device_id, CuvsEvictReason why, int self_replace,
         /* I-FC (v6 C1 impact 3): the files already equal the graph only when
          * file_current == 1; then the save is skipped. This is the ONLY place
          * the skip is decided (SIGTERM always saves). */
-        if (!e->file_current)
+        if (save_legacy && !e->file_current)
         {
             uint64_t t0 = mono_us();
             int src = save_index(e);
@@ -3179,6 +3401,11 @@ evict_entry(IndexEntry *e, int device_id, CuvsEvictReason why, int self_replace,
 
 /* Keys a make-room pass must not pick again (their save failed). */
 typedef struct EvictSkip { uint32_t db_oid, index_oid; } EvictSkip;
+typedef struct EvictTarget
+{
+    EvictSkip legacy;
+    PageCagraGraph *page;
+} EvictTarget;
 
 static int
 evict_skipped(const EvictSkip *sk, int n, const IndexEntry *e)
@@ -3211,10 +3438,11 @@ make_room(int device_id, CuvsRequester rq, uint64_t need, int slot_mode,
     for (int round = 0; round < 64 && need > 0; round++)
     {
         int n = 0;
-        CuvsEvictCand *cands = calloc((size_t)(g_n_indexes > 0 ? g_n_indexes : 1), sizeof(CuvsEvictCand));
-        int *victims = calloc((size_t)(g_n_indexes > 0 ? g_n_indexes : 1), sizeof(int));
-        CuvsEvictReason *reasons = calloc((size_t)(g_n_indexes > 0 ? g_n_indexes : 1), sizeof(CuvsEvictReason));
-        EvictSkip *keys = calloc((size_t)(g_n_indexes > 0 ? g_n_indexes : 1), sizeof(EvictSkip));
+        size_t capacity = (size_t) g_n_indexes + g_n_page_graphs + 1;
+        CuvsEvictCand *cands = calloc(capacity, sizeof(*cands));
+        int *victims = calloc(capacity, sizeof(*victims));
+        CuvsEvictReason *reasons = calloc(capacity, sizeof(*reasons));
+        EvictTarget *keys = calloc(capacity, sizeof(*keys));
         if (!cands || !victims || !reasons || !keys)
         {
             free(cands); free(victims); free(reasons); free(keys);
@@ -3230,8 +3458,22 @@ make_room(int device_id, CuvsRequester rq, uint64_t need, int slot_mode,
                 cands[n].bytes = 1;
             else if (cands[n].bytes == 0)
                 continue;   /* evicting it frees no VRAM on this device */
-            keys[n].db_oid = e->db_oid;
-            keys[n].index_oid = e->index_oid;
+            keys[n].legacy.db_oid = e->db_oid;
+            keys[n].legacy.index_oid = e->index_oid;
+            n++;
+        }
+        for (PageCagraGraph *page = g_page_graphs; page; page = page->next)
+        {
+            if (page->gpu != device_id)
+                continue;
+            cands[n] = (CuvsEvictCand) {
+                .db_oid = page->db_oid, .index_oid = page->index_oid,
+                .last_use = page->last_search, .hits = page->hits,
+                /* With the same LRU policy, put never-served page graphs first. */
+                .loaded_at = page->last_search ? page->loaded_at : 0,
+                .bytes = slot_mode ? 1 : page->bytes + page->bf_bytes[0] + page->bf_bytes[1],
+            };
+            keys[n].page = page;
             n++;
         }
         CuvsEvictRequest req;
@@ -3251,7 +3493,26 @@ make_room(int device_id, CuvsRequester rq, uint64_t need, int slot_mode,
         int failed = 0;
         for (int v = 0; v < pick_out->n_victims; v++)
         {
-            EvictSkip k = keys[victims[v]];
+            EvictTarget key = keys[victims[v]];
+            uint64_t unit = slot_mode ? 1 : cands[victims[v]].bytes;
+            if (key.page)
+            {
+                PageCagraGraph **link = &g_page_graphs;
+
+                while (*link && *link != key.page)
+                    link = &(*link)->next;
+                if (*link)
+                {
+                    LOG_INFO("[page-evict] %u/%u incarnation=%016llx bytes=%llu\n",
+                             key.page->db_oid, key.page->index_oid,
+                             (unsigned long long) key.page->index_nonce,
+                             (unsigned long long) unit);
+                    free_page_graph(link);
+                    need = unit >= need ? 0 : need - unit;
+                }
+                continue;
+            }
+            EvictSkip k = key.legacy;
             IndexEntry *e = find_index(k.db_oid, k.index_oid);
             int pf = 0;
             if (!e)
@@ -3259,8 +3520,7 @@ make_room(int device_id, CuvsRequester rq, uint64_t need, int slot_mode,
             CuvsEvictReason why = reasons[v];
             if (slot_mode && why != CUVS_EVICT_SOFT)
                 why = CUVS_EVICT_SLOT;
-            uint64_t unit = slot_mode ? 1 : cands[victims[v]].bytes;
-            if (evict_entry(e, device_id, why, 0, rq, &pf) == 0 && pf)
+            if (evict_entry(e, device_id, why, 0, rq, &pf, true) == 0 && pf)
             {
                 /* Stop here and re-pick the remainder: victims not yet
                  * evicted stay candidates, and a re-pick that rejects leaves
@@ -3296,10 +3556,10 @@ make_slot(int device_id, CuvsRequester rq)
 static size_t
 evict_lru(int device_id, CuvsRequester rq)
 {
-    size_t before = resident_bytes(device_id);
+    size_t before = resident_bytes(device_id) + g_page_graph_bytes[device_id];
     if (make_room(device_id, rq, 1, 0, NULL) != 0)
         return 0;
-    size_t after = resident_bytes(device_id);
+    size_t after = resident_bytes(device_id) + g_page_graph_bytes[device_id];
     return before > after ? before - after : 0;
 }
 
@@ -3611,7 +3871,7 @@ admit_build_cagra(size_t needed, int device_id, uint32_t db_oid,
     }
     int pf = 0;
     size_t freed = evict_entry(old, device_id, CUVS_EVICT_ADMIT_BUILD, 1,
-                               CUVS_RQ_BUILD_CAGRA, &pf);
+                               CUVS_RQ_BUILD_CAGRA, &pf, true);
     if (pf)
     {
         g_last_admit_reason = reason;
@@ -7137,53 +7397,190 @@ sync_build_path(const char *path, int flags)
     return result;
 }
 
-/* An unregistered page-format graph is identified by both nonces. Never
- * write the legacy OID-keyed files here: the catalog update can roll back. */
+static int
+page_incarnation_dirs(const CuvsCmdFrame *cmd, const CuvsPageBuildRequest *request,
+                      char index_path[512], char incarnation[512])
+{
+    struct stat st;
+
+    if (snprintf(index_path, 512, "%s/%u_%u", g_index_dir,
+                 cmd->db_oid, cmd->index_oid) >= 512 ||
+        snprintf(incarnation, 512, "%s/%016llx", index_path,
+                 (unsigned long long) request->index_nonce) >= 512 ||
+        (mkdir(g_index_dir, 0700) != 0 && errno != EEXIST) ||
+        (mkdir(index_path, 0700) != 0 && errno != EEXIST) ||
+        lstat(index_path, &st) != 0 || !S_ISDIR(st.st_mode))
+        return -1;
+    if ((mkdir(incarnation, 0700) != 0 && errno != EEXIST) ||
+        lstat(incarnation, &st) != 0 || !S_ISDIR(st.st_mode))
+    {
+        rmdir(index_path);
+        return -1;
+    }
+    return 0;
+}
+
+/* Publish a complete marker once. The caller synchronizes its directories. */
+static int
+write_page_build_xid(const char *path, const char *name, uint64_t xid)
+{
+    char file[512], temporary[512];
+    FILE *marker;
+    int failed;
+
+    if (snprintf(file, sizeof(file), "%s/%s", path, name) >= (int) sizeof(file) ||
+        snprintf(temporary, sizeof(temporary), "%s.tmp", file) >= (int) sizeof(temporary))
+        return -1;
+    marker = fopen(temporary, "wx");
+    if (!marker)
+        return -1;
+    failed = fprintf(marker, "%llu\n", (unsigned long long) xid) < 0 ||
+        fflush(marker) != 0 || fsync(fileno(marker)) != 0;
+    if (fclose(marker) != 0)
+        failed = 1;
+    if (!failed)
+    {
+#ifdef __linux__
+        if (renameat2(AT_FDCWD, temporary, AT_FDCWD, file, RENAME_NOREPLACE) == 0)
+            return 0;
+        if (errno != ENOSYS && errno != EINVAL && errno != EOPNOTSUPP)
+            failed = 1;
+#endif
+        if (!failed && link(temporary, file) == 0)
+        {
+            unlink(temporary);
+            return 0;
+        }
+    }
+    unlink(temporary);
+    return -1;
+}
+
+static int
+sync_page_incarnation(const char *index_path, const char *incarnation)
+{
+    return (sync_build_path(incarnation, O_DIRECTORY) != 0 ||
+            sync_build_path(index_path, O_DIRECTORY) != 0 ||
+            sync_build_path(g_index_dir, O_DIRECTORY) != 0) ? -1 : 0;
+}
+
+static int
+persist_empty_page_build(const CuvsCmdFrame *cmd, const CuvsPageBuildRequest *request)
+{
+    char index_path[512], incarnation[512];
+
+    if (page_incarnation_dirs(cmd, request, index_path, incarnation) != 0)
+        return -1;
+    if (write_page_build_xid(incarnation, "empty.xid", request->build_xid) == 0)
+    {
+        int dir;
+        if (sync_page_incarnation(index_path, incarnation) == 0)
+            return 0;
+        dir = open(incarnation, O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
+        if (dir >= 0)
+        {
+            unlinkat(dir, "empty.xid", 0);
+            close(dir);
+        }
+    }
+    rmdir(incarnation);
+    rmdir(index_path);
+    return -1;
+}
+
+/* An unregistered page-format graph is identified by both nonces. */
 static int
 persist_page_build(const CuvsCmdFrame *cmd, const CuvsPageBuildRequest *request,
-                   const char *index_dir, CuvsCagraIndex handle, int gpu,
-                   uint64_t *graph_nonce)
+                   CuvsCagraIndex handle, int gpu, uint64_t *graph_nonce,
+                   CuvsHnswIndex *cpu_hnsw)
 {
-    const char *root = index_dir[0] ? index_dir : g_index_dir;
-    char index_path[512], generation[512], graph[512], filename[512];
+    char index_path[512], incarnation[512], graph[512], filename[512], graph_name[17];
+    bool graph_created = false;
     uint64_t nonce;
-    FILE *marker;
-    int result;
 
     do {
         if (shm_key_random((unsigned char *) &nonce, sizeof(nonce)) != 0)
             return -1;
     } while (nonce == 0);
-    if (snprintf(index_path, sizeof(index_path), "%s/%u_%u", root,
-                 cmd->db_oid, cmd->index_oid) >= (int) sizeof(index_path) ||
-        snprintf(generation, sizeof(generation), "%s/%016llx", index_path,
-                 (unsigned long long) request->index_nonce) >= (int) sizeof(generation) ||
-        snprintf(graph, sizeof(graph), "%s/%016llx", generation,
-                 (unsigned long long) nonce) >= (int) sizeof(graph) ||
-        snprintf(filename, sizeof(filename), "%s/index.cagra", graph) >= (int) sizeof(filename))
+    snprintf(graph_name, sizeof(graph_name), "%016llx", (unsigned long long) nonce);
+    if (page_incarnation_dirs(cmd, request, index_path, incarnation) != 0)
         return -1;
-    if ((mkdir(root, 0700) != 0 && errno != EEXIST) ||
-        (mkdir(index_path, 0700) != 0 && errno != EEXIST) ||
-        mkdir(generation, 0700) != 0 || mkdir(graph, 0700) != 0)
-        return -1;
+    if (snprintf(graph, sizeof(graph), "%s/%s", incarnation, graph_name) >= (int) sizeof(graph) ||
+        snprintf(filename, sizeof(filename), "%s/index.cagra", graph) >= (int) sizeof(filename) ||
+        mkdir(graph, 0700) != 0)
+        goto failed;
+    graph_created = true;
+#ifdef CUVS_TEST_HOOKS
+    if (cuvs_fault("CUVS_FAULT_PAGE_PERSIST"))
+        goto failed;
+#endif
     if (cuvs_cagra_serialize(handle, filename, gpu) != 0 ||
         sync_build_path(filename, 0) != 0 ||
-        snprintf(filename, sizeof(filename), "%s/build.xid", graph) >= (int) sizeof(filename))
-        return -1;
-    marker = fopen(filename, "wx");
-    if (!marker)
-        return -1;
-    result = fprintf(marker, "%llu\n", (unsigned long long) request->build_xid) < 0 ||
-             fflush(marker) != 0 || fsync(fileno(marker)) != 0;
-    if (fclose(marker) != 0)
-        result = -1;
-    if (result || sync_build_path(graph, O_DIRECTORY) != 0 ||
-        sync_build_path(generation, O_DIRECTORY) != 0 ||
-        sync_build_path(index_path, O_DIRECTORY) != 0 ||
-        sync_build_path(root, O_DIRECTORY) != 0)
-        return -1;
+        write_page_build_xid(graph, "build.xid", request->build_xid) != 0 ||
+        sync_build_path(graph, O_DIRECTORY) != 0 ||
+        sync_page_incarnation(index_path, incarnation) != 0)
+        goto failed;
+    if (cmd->use_cpu_hnsw &&
+        snprintf(filename, sizeof(filename), "%s/index.hnsw", graph) < (int) sizeof(filename) &&
+        cuvs_hnsw_serialize(handle, filename, gpu) == CUVS_HNSW_SERIALIZE_OK)
+        *cpu_hnsw = cuvs_hnsw_deserialize(filename, (int) cmd->dim, cmd->metric, gpu);
+    if (cmd->use_cpu_hnsw && !*cpu_hnsw)
+        LOG_WARN("pg_cuvs_server: page-format CPU HNSW unavailable for %u/%u; using CAGRA\n",
+                 cmd->db_oid, cmd->index_oid);
     *graph_nonce = nonce;
     return 0;
+
+failed:
+    if (graph_created)
+    {
+        int dir = open(incarnation, O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
+        if (dir >= 0)
+        {
+            remove_page_tree_at(dir, graph_name);
+            close(dir);
+        }
+    }
+    rmdir(incarnation);
+    rmdir(index_path);
+    return -1;
+}
+
+static bool
+receive_page_build(int client_fd, CuvsPageBuildRequest *request)
+{
+    return recv_all(client_fd, &request->length, sizeof(request->length)) == 0 &&
+        request->length == sizeof(*request) &&
+        recv_all(client_fd, (char *) request + sizeof(request->length),
+                 sizeof(*request) - sizeof(request->length)) == 0 &&
+        !(request->flags & ~CUVS_PAGE_BUILD_DEFER_LEGACY) &&
+        request->index_nonce && request->build_xid && request->system_identifier;
+}
+
+static void
+handle_mark_pages_empty(int client_fd, const CuvsCmdFrame *cmd)
+{
+    CuvsPageBuildRequest request;
+    char index_dir[256] = "";
+    int fd = -1;
+    CuvsReplyHeader reply = {.status = CUVS_STATUS_PERSIST_FAILED};
+
+    if (!receive_page_build(client_fd, &request) ||
+        !(request.flags & CUVS_PAGE_BUILD_DEFER_LEGACY) ||
+        cuvs_fd_recv(client_fd, index_dir, sizeof(index_dir), &fd) < 0 || fd >= 0)
+    {
+        if (fd >= 0)
+            close(fd);
+        send_error(client_fd, "invalid empty page-format BUILD notification");
+        return;
+    }
+    if (persist_empty_page_build(cmd, &request) == 0)
+    {
+        pthread_mutex_lock(&g_index_mutex);
+        ++g_page_deferral_epoch;
+        pthread_mutex_unlock(&g_index_mutex);
+        reply.status = CUVS_STATUS_OK;
+    }
+    send_all(client_fd, &reply, sizeof(reply));
 }
 
 static int
@@ -7203,9 +7600,7 @@ handle_build(int client_fd, const CuvsCmdFrame *cmd)
 
     if (cmd->op == CUVS_OP_BUILD_PAGES)
     {
-        if (recv_all(client_fd, &request, sizeof(request)) < 0 ||
-            request.length != sizeof(request) || request.flags != 0 ||
-            !request.index_nonce || !request.build_xid)
+        if (!receive_page_build(client_fd, &request))
         {
             send_error(client_fd, "invalid page-format BUILD frame");
             return;
@@ -7227,7 +7622,7 @@ handle_build(int client_fd, const CuvsCmdFrame *cmd)
     LOG_DEBUG("[handle_build] got index_dir=%s passed_fd=%d\n", index_dir, passed_fd);
 
     if (page_build && (cmd->n_partials != 0 || cmd->shard_count != 1 ||
-                       cmd->use_cpu_hnsw != 0))
+                       cmd->use_cpu_hnsw > 1))
     {
         if (passed_fd >= 0)
             close(passed_fd);
@@ -7415,13 +7810,37 @@ handle_build(int client_fd, const CuvsCmdFrame *cmd)
                               "GPU physical memory pressure; retry later", &rej);
         return;
     }
+    if (page_build)
+    {
+        size_t budget = g_max_vram_per_gpu[target_gpu];
+
+        while (budget && needed <= budget &&
+               total_vram_used(target_gpu) > budget - needed &&
+               evict_page_graph(target_gpu))
+            ;
+        while (g_n_indexes + g_n_page_graphs >= g_max_indexes && evict_page_graph(-1))
+            ;
+    }
     al.gpu = target_gpu;
     al.pending_before = g_pending_rmm_build_vram[target_gpu];
     al.evictions_before = g_cache_evictions[target_gpu];
     uint64_t self_unloaded = 0;
+    /* Until the page-format DDL commits, even a dirty legacy graph may be
+     * the only copy containing successful EXTENDs. Protect it from the
+     * configured legacy admission eviction as well as self-replace. */
+    IndexEntry *legacy = page_build ? find_index(cmd->db_oid, cmd->index_oid) : NULL;
+    bool protect_legacy = legacy != NULL;
+    if (protect_legacy)
+        ++legacy->inflight;
     int admit_rc = admit_build_cagra(needed, target_gpu, cmd->db_oid,
                                      page_build ? 0 : cmd->index_oid,
                                      &self_unloaded, &al);
+    if (protect_legacy)
+    {
+        /* Evicting another index may shift the legacy registry. */
+        legacy = find_index(cmd->db_oid, cmd->index_oid);
+        --legacy->inflight;
+    }
     note_build_admission(cmd->db_oid, cmd->index_oid, needed, target_gpu,
                          admit_rc == 0, self_unloaded);
     if (admit_rc < 0)
@@ -7482,13 +7901,34 @@ handle_build(int client_fd, const CuvsCmdFrame *cmd)
                                                  (int)cmd->intermediate_graph_degree,
                                                  cmd->build_algo, target_gpu, lw_policy, &lw_stats);
     al.build_finished_us = admission_mono_us();
+    bool force_no_dataset = false;
+#ifdef CUVS_TEST_HOOKS
+    if (page_build && new_handle && cuvs_fault("CUVS_FAULT_PAGE_ATTACH"))
+    {
+        cuvs_cagra_free(new_handle, target_gpu);
+        new_handle = NULL;
+        force_no_dataset = true;
+    }
+#endif
     /* ADR-086 (I3): an out-of-memory build after admission fails without
      * evicting any resident index; ADR-070's evict-to-fit retry is removed. */
     int build_oom = !new_handle && cuvs_last_build_was_oom();
-    int build_att = !new_handle && !build_oom && cuvs_last_build_attach_failed();
+    int build_att = !new_handle && !build_oom &&
+        (force_no_dataset || cuvs_last_build_attach_failed());
     uint64_t page_graph_nonce = 0;
+    CuvsHnswIndex page_cpu_hnsw = NULL;
     int page_status = page_build && new_handle ?
-        persist_page_build(cmd, page_build, index_dir, new_handle, target_gpu, &page_graph_nonce) : 0;
+        persist_page_build(cmd, page_build, new_handle, target_gpu,
+                           &page_graph_nonce, &page_cpu_hnsw) : 0;
+    if (page_build && build_att)
+        page_status = persist_empty_page_build(cmd, page_build);
+#ifdef CUVS_TEST_HOOKS
+    /* With no production BF builder in this stage, a fixture can attach one
+     * while BUILD still owns the input corpus and does not hold L0. */
+    CuvsBfIndex fixture_bf = NULL;
+    if (page_build && new_handle && page_status == 0 && cuvs_fault("CUVS_FAULT_PAGE_BF_FIXTURE"))
+        fixture_bf = cuvs_bf_build(vecs, cmd->n_vecs, cmd->dim, cmd->metric, 0, target_gpu);
+#endif
 
     /* Reacquire for the durable-commit + registry tail (finish_build_commit
      * expects the lock held). Release the build reservation now: on success the
@@ -7505,6 +7945,21 @@ handle_build(int client_fd, const CuvsCmdFrame *cmd)
                           lw_ub, &lw_stats, lw_notice, sizeof(lw_notice));
     log_release("BUILD", target_gpu, cmd->db_oid, cmd->index_oid, needed,
                 new_handle ? "built" : build_oom ? "oom" : build_att ? "att" : "failed");
+
+    if (page_build && build_att && page_status == 0)
+    {
+        CuvsReplyHeader reply = {.status = CUVS_STATUS_OK};
+
+        if (page_build->flags & CUVS_PAGE_BUILD_DEFER_LEGACY)
+            ++g_page_deferral_epoch;
+        pthread_mutex_unlock(&g_index_mutex);
+        munmap(mem, total);
+        LOG_WARN("pg_cuvs_server: page-format BUILD %u/%u has no attached dataset; using exact heap search\n",
+                 cmd->db_oid, cmd->index_oid);
+        if (send_all(client_fd, &reply, sizeof(reply)) == 0)
+            send_all(client_fd, &page_graph_nonce, sizeof(page_graph_nonce));
+        return;
+    }
 
     if (build_att)
     {
@@ -7551,7 +8006,51 @@ handle_build(int client_fd, const CuvsCmdFrame *cmd)
     {
         CuvsReplyHeader reply = {0};
 
-        cuvs_cagra_free(new_handle, target_gpu);
+        PageCagraGraph *entry = NULL;
+
+        if (page_status == 0 && g_n_indexes + g_n_page_graphs < g_max_indexes)
+            entry = calloc(1, sizeof(*entry));
+        if (entry != NULL)
+        {
+            entry->system_identifier = page_build->system_identifier;
+            entry->db_oid = cmd->db_oid;
+            entry->index_oid = cmd->index_oid;
+            entry->index_nonce = page_build->index_nonce;
+            entry->graph_nonce = page_graph_nonce;
+            entry->build_xid = page_build->build_xid;
+            entry->n_slots = cmd->n_vecs;
+            entry->dim = cmd->dim;
+            entry->metric = cmd->metric;
+            entry->gpu = target_gpu;
+            entry->handle = new_handle;
+            entry->loaded_at = time(NULL);
+            entry->cpu_hnsw = page_cpu_hnsw;
+            entry->bytes = final;
+            entry->next = g_page_graphs;
+            g_page_graphs = entry;
+            ++g_n_page_graphs;
+            g_page_graph_bytes[target_gpu] += final;
+#ifdef CUVS_TEST_HOOKS
+            if (fixture_bf)
+            {
+                entry->bf[0] = fixture_bf;
+                entry->bf_bytes[0] = (size_t) cmd->n_vecs * cmd->dim * sizeof(float);
+                g_page_graph_bytes[target_gpu] += entry->bf_bytes[0];
+            }
+#endif
+        }
+        else
+        {
+#ifdef CUVS_TEST_HOOKS
+            if (fixture_bf)
+                cuvs_bf_free(fixture_bf, target_gpu);
+#endif
+            if (page_cpu_hnsw)
+                cuvs_hnsw_free(page_cpu_hnsw);
+            cuvs_cagra_free(new_handle, target_gpu);
+        }
+        if (page_status == 0 && (page_build->flags & CUVS_PAGE_BUILD_DEFER_LEGACY))
+            ++g_page_deferral_epoch;
         pthread_mutex_unlock(&g_index_mutex);
         munmap(mem, total);
         if (page_status != 0)
@@ -7559,6 +8058,9 @@ handle_build(int client_fd, const CuvsCmdFrame *cmd)
             send_error_code(client_fd, CUVS_STATUS_PERSIST_FAILED, "could not persist page-format graph");
             return;
         }
+        if (entry == NULL)
+            LOG_WARN("pg_cuvs_server: page-format graph %u/%u persisted without a resident entry\n",
+                     cmd->db_oid, cmd->index_oid);
         reply.status = CUVS_STATUS_OK;
         if (send_all(client_fd, &reply, sizeof(reply)) == 0)
             send_all(client_fd, &page_graph_nonce, sizeof(page_graph_nonce));
@@ -8838,6 +9340,8 @@ handle_drop(int client_fd, const CuvsCmdFrame *cmd)
 
     pthread_mutex_lock(&g_index_mutex);
 
+    drop_page_graphs(db, idx);
+
     /* Free the resident entry (if any) and compact the registry. */
     IndexEntry *e = find_index(db, idx);
     if (e)
@@ -8894,6 +9398,22 @@ handle_drop(int client_fd, const CuvsCmdFrame *cmd)
     LOG_INFO("pg_cuvs_server: dropped index %u/%u (freed + artifacts unlinked)\n", db, idx);
 
     pthread_mutex_unlock(&g_index_mutex);
+
+    int rootfd = open(g_index_dir, O_RDONLY | O_DIRECTORY);
+    if (rootfd >= 0)
+    {
+        char name[32];
+
+        snprintf(name, sizeof(name), "%u_%u", db, idx);
+        /* DROP was committed by PostgreSQL. The subtree is a cache. */
+        struct stat st;
+        if (fstatat(rootfd, name, &st, AT_SYMLINK_NOFOLLOW) == 0 && S_ISDIR(st.st_mode))
+        {
+            remove_page_tree_at(rootfd, name);
+            (void) fsync(rootfd);
+        }
+        close(rootfd);
+    }
 
     CuvsReplyHeader hdr = {0};
     hdr.status = CUVS_STATUS_OK;
@@ -11406,6 +11926,7 @@ handle_manual(int client_fd, const CuvsCmdFrame *cmd)
     switch (cmd->op)
     {
         case CUVS_OP_UNLOAD:
+        case CUVS_OP_UNLOAD_PAGE_LEGACY:
         {
             if (!e)
             {
@@ -11429,11 +11950,12 @@ handle_manual(int client_fd, const CuvsCmdFrame *cmd)
             }
             /* Warn when this save rewrites .tids under a delta/tombstone
              * sidecar of a CAGRA index that changed since it was saved. */
-            int warn = entry_is_cagra_single(e) && !e->file_current &&
+            bool save_legacy = cmd->op == CUVS_OP_UNLOAD;
+            int warn = save_legacy && entry_is_cagra_single(e) && !e->file_current &&
                        cuvs_entry_sidecar_kind(g_index_dir, db, idx) != CUVS_SIDECAR_NONE;
             int pf = 0;
             (void) evict_entry(e, entry_home_gpu(e), CUVS_EVICT_MANUAL_UNLOAD, 0,
-                               CUVS_RQ_MANUAL, &pf);
+                               CUVS_RQ_MANUAL, &pf, save_legacy);
             pthread_mutex_unlock(&g_index_mutex);
             if (pf)
                 reply_msg(client_fd, CUVS_STATUS_ERROR,
@@ -11696,6 +12218,25 @@ entry_kind(const IndexEntry *e)
     return "cagra";
 }
 
+static void
+page_status_row(TextBuf *b, const PageCagraGraph *page)
+{
+    const CuvsEvictParams params = evict_params_now();
+    CuvsEvictCand candidate = {.last_use = page->last_search, .hits = page->hits};
+    int64_t protect_until = page->last_search ? page->last_search +
+        cuvs_evict_protect_s(page->hits, params.t_min_s, params.bonus_s, params.hits_cap) : 0;
+    int eligible = cuvs_evict_eligible(&candidate, time(NULL), &params);
+
+    /* Keep the v6 columns. A page graph has no legacy warmup state; report
+     * the incarnation there so the resident generations can be distinguished. */
+    tb_printf(b, "%u\t%u\tresident\tpage_cagra\t%d\t%zu\t%lld\t%lld\t%u\t0\t0\t%lld\t%d"
+                 "\tnone\t1\t0\tincarnation:%016llx\t0\t0\t\t-1\t0\t1\n",
+              page->db_oid, page->index_oid, page->gpu,
+              page->bytes + page->bf_bytes[0] + page->bf_bytes[1],
+              (long long) page->last_search, (long long) page->loaded_at, page->hits,
+              (long long) protect_until, eligible, (unsigned long long) page->index_nonce);
+}
+
 static int
 key_known(uint32_t db, uint32_t idx)
 {
@@ -11721,6 +12262,8 @@ handle_index_status(int client_fd)
             index_status_row(&b, e->db_oid, e->index_oid, "resident", entry_kind(e), e,
                              warmup_state_name(e->warmup_state));
     }
+    for (const PageCagraGraph *page = g_page_graphs; page; page = page->next)
+        page_status_row(&b, page);
     for (int i = 0; i < g_n_cold_indexes; i++)
     {
         const ColdIndexEntry *ce = &g_cold_indexes[i];
@@ -11923,7 +12466,7 @@ reclaim_gpu(int dev, time_t now)
             continue;
         }
         int pf = 0;
-        size_t freed = evict_entry(e, dev, CUVS_EVICT_RECLAIM, 0, CUVS_RQ_RECLAIM, &pf);
+        size_t freed = evict_entry(e, dev, CUVS_EVICT_RECLAIM, 0, CUVS_RQ_RECLAIM, &pf, true);
         if (pf)
             continue;   /* persist failure: skip this victim (persist_failures) */
         resident = freed > resident ? 0 : resident - freed;
@@ -12032,6 +12575,176 @@ reclaim_thread(void *arg)
             usage_stats_write();
     }
     return NULL;
+}
+
+
+static void *
+map_page_shm(const char *key, size_t key_size, size_t bytes)
+{
+    int fd;
+    void *mem = MAP_FAILED;
+
+    if (!memchr(key, '\0', key_size))
+        return mem;
+    fd = shm_open(key, O_RDONLY, 0);
+    if (fd >= 0)
+    {
+        if (shm_check_peer_owner(fd, g_peer_uid) && page_corpus_fits(fd, bytes))
+            mem = mmap(NULL, bytes, PROT_READ, MAP_SHARED, fd, 0);
+        close(fd);
+    }
+    return mem;
+}
+
+static int
+page_graph_search(PageCagraGraph *graph, const CuvsCmdFrame *cmd, const float *queries,
+                  int nq, int k, const uint32_t *excluded, CuvsSearchResult *raw)
+{
+    if (excluded || cmd->search_mode == 1)
+    {
+        CuvsBfIndex bf = graph->bf[cmd->bf_precision];
+
+        if (excluded)
+            return cuvs_bf_search_filtered(bf, queries, graph->dim, k,
+                                           excluded, graph->n_slots, raw, graph->gpu);
+        if (nq == 1)
+            return cuvs_bf_search(bf, queries, graph->dim, k, raw, graph->gpu);
+        return cuvs_bf_search_batch(bf, queries, nq, graph->dim, k, raw, graph->gpu);
+    }
+    if (cmd->use_cpu_hnsw && graph->cpu_hnsw)
+    {
+        for (int q = 0; q < nq; ++q)
+            if (cuvs_hnsw_search(graph->cpu_hnsw, queries + (size_t) q * graph->dim,
+                                 graph->dim, k, 0, raw + (size_t) q * k) != 0)
+                return 1;
+        return 0;
+    }
+    if (nq == 1)
+        return cuvs_cagra_search(graph->handle, queries, graph->dim, k, raw,
+                                 graph->gpu, cmd->itopk_size, cmd->search_width);
+    return cuvs_cagra_search_batch(graph->handle, queries, nq, graph->dim, k, raw,
+                                   graph->gpu, cmd->itopk_size, cmd->search_width);
+}
+
+/* Base-only serving. Slot ranges are independent from the legacy registry. */
+static void
+handle_page_search(int client_fd, const CuvsCmdFrame *cmd)
+{
+    CuvsPageSearchRequest request;
+    CuvsReplyHeader reply = {0};
+    void *query = MAP_FAILED, *filter = MAP_FAILED;
+    const float *vectors;
+    CuvsSearchResult *raw = NULL;
+    CuvsResult *results = NULL;
+    size_t bytes = 0, filter_bytes = 0;
+    int nq = 1;
+    bool report_missing_bf = false;
+    bool batch = cmd->op == CUVS_OP_SEARCH_PAGES_BATCH;
+    bool filtered = cmd->op == CUVS_OP_SEARCH_PAGES_FILTERED;
+    uint32_t prefix = batch ? 2 * sizeof(uint32_t) : 0;
+    struct timespec start, finish;
+
+    reply.status = CUVS_STATUS_ERROR;
+    if (recv_all(client_fd, &request.length, sizeof(request.length)) < 0 ||
+        request.length != sizeof(request) ||
+        recv_all(client_fd, (char *) &request + sizeof(request.length),
+                 sizeof(request) - sizeof(request.length)) < 0 ||
+        request.resume_count != 0 || request.resume_distance != 0 ||
+        request.reserved != 0 || cmd->dim == 0 || cmd->dim > 65535 ||
+        cmd->k == 0 || cmd->k > 4000 || cmd->search_mode > 1 || cmd->bf_precision > 1 ||
+        cmd->n_vecs < 1 || cmd->n_vecs > 1024 || batch != (cmd->n_vecs > 1) ||
+        request.n_slots == 0 || request.n_slots > INT32_MAX ||
+        (filtered ? cmd->n_filter_tids != (request.n_slots + 31) / 32 :
+                    cmd->n_filter_tids != 0))
+        goto done;
+    if (request.folded != 0 || request.tail != request.folded)
+    {
+        reply.status = CUVS_STATUS_NOT_FOUND;
+        goto done;
+    }
+
+    nq = (int) cmd->n_vecs;
+    bytes = prefix + (size_t) nq * cmd->dim * sizeof(float);
+    query = map_page_shm(cmd->shm_key, sizeof(cmd->shm_key), bytes);
+    if (query == MAP_FAILED)
+        goto done;
+    if (batch && (((const uint32_t *) query)[0] != (uint32_t) nq ||
+                  ((const uint32_t *) query)[1] != cmd->dim))
+        goto done;
+    if (filtered)
+    {
+        filter_bytes = (size_t) cmd->n_filter_tids * sizeof(uint32_t);
+        filter = map_page_shm(cmd->filter_shm_key, sizeof(cmd->filter_shm_key), filter_bytes);
+        if (filter == MAP_FAILED)
+            goto done;
+    }
+    vectors = (const float *) ((const char *) query + prefix);
+    raw = malloc((size_t) nq * cmd->k * sizeof(*raw));
+    results = calloc((size_t) nq * cmd->k, sizeof(*results));
+    if (raw == NULL || results == NULL)
+        goto done;
+
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    pthread_mutex_lock(&g_index_mutex);
+    PageCagraGraph *graph = find_page_graph(cmd, &request);
+    if (!graph || graph->dim != cmd->dim || graph->metric != cmd->metric)
+        reply.status = CUVS_STATUS_NOT_FOUND;
+    else if ((filtered || cmd->search_mode == 1) && !graph->bf[cmd->bf_precision])
+    {
+        uint32_t bit = 1u << cmd->bf_precision;
+
+        report_missing_bf = (graph->bf_miss_reported & bit) == 0;
+        graph->bf_miss_reported |= bit;
+        reply.status = CUVS_STATUS_NO_VECTORS;
+    }
+    else
+    {
+        int k = (int) (graph->n_slots < cmd->k ? graph->n_slots : cmd->k);
+        int rc = page_graph_search(graph, cmd, vectors, nq, k, filtered ? filter : NULL, raw);
+
+        reply.status = rc == 0 ? CUVS_STATUS_OK : CUVS_STATUS_OOM_FALLBACK;
+        if (rc == 0)
+        {
+            graph->last_use = ++g_page_access;
+            graph->last_search = time(NULL);
+            if (graph->hits < UINT32_MAX)
+                ++graph->hits;
+            for (int q = 0; q < nq; ++q)
+            {
+                int written = 0;
+                CuvsResult *row = results + (size_t) q * cmd->k;
+
+                for (int i = 0; i < k; ++i)
+                {
+                    CuvsSearchResult *candidate = &raw[(size_t) q * k + i];
+                    if (candidate->item_id >= 0 && (uint64_t) candidate->item_id < graph->n_slots)
+                    {
+                        row[written].tid = (uint64_t) candidate->item_id;
+                        row[written++].distance = candidate->distance;
+                    }
+                }
+                if (batch)
+                    while ((uint32_t) written < cmd->k)
+                        row[written++].tid = CUVS_PAGE_SLOT_INVALID;
+                reply.n_results += written;
+            }
+        }
+    }
+    pthread_mutex_unlock(&g_index_mutex);
+    if (report_missing_bf)
+        LOG_INFO("[page-bf] %u/%u precision=%u missing; use exact heap search\n",
+                 cmd->db_oid, cmd->index_oid, cmd->bf_precision);
+    clock_gettime(CLOCK_MONOTONIC, &finish);
+    reply.latency_us = (uint32_t) ((finish.tv_sec - start.tv_sec) * 1000000 +
+                                  (finish.tv_nsec - start.tv_nsec) / 1000);
+
+done:
+    if (query != MAP_FAILED) munmap(query, bytes);
+    if (filter != MAP_FAILED) munmap(filter, filter_bytes);
+    free(raw);
+    if (send_all(client_fd, &reply, sizeof(reply)) == 0 && reply.n_results)
+        send_all(client_fd, results, reply.n_results * sizeof(*results));
+    free(results);
 }
 
 static void *
@@ -12146,8 +12859,13 @@ connection_thread(void *arg)
         case CUVS_OP_BUILD_PAGES:
             handle_build(client_fd, &cmd);
             break;
+        case CUVS_OP_MARK_PAGES_EMPTY:
+            handle_mark_pages_empty(client_fd, &cmd);
+            break;
         case CUVS_OP_SEARCH_PAGES:
-            send_error_code(client_fd, CUVS_STATUS_NOT_FOUND, "page-format graph is not registered");
+        case CUVS_OP_SEARCH_PAGES_BATCH:
+        case CUVS_OP_SEARCH_PAGES_FILTERED:
+            handle_page_search(client_fd, &cmd);
             break;
         case CUVS_OP_STATUS:
             handle_stats(client_fd, &cmd);
@@ -12256,6 +12974,7 @@ connection_thread(void *arg)
             handle_search_bf_transient(client_fd, &cmd);
             break;
         case CUVS_OP_UNLOAD:
+        case CUVS_OP_UNLOAD_PAGE_LEGACY:
         case CUVS_OP_LOAD:
         case CUVS_OP_PIN:
         case CUVS_OP_UNPIN:

@@ -343,7 +343,13 @@ jobs:
         timeout-minutes: 25
         env:
           PAGE_TEST_OUTPUT: ${{ runner.temp }}/pgcuvs-pages-logs
-        run: make PG_CONFIG=/usr/lib/postgresql/16/bin/pg_config test-page-format
+          PAGE_TEST_LEGACY_SOURCE: ${{ runner.temp }}/pgcuvs-v6-reference
+        run: |
+          reference=0d3a4c9090983f2dd9d7a563e694b8cdf482a68d
+          git fetch --no-tags --depth=1 origin "$reference"
+          mkdir "$PAGE_TEST_LEGACY_SOURCE"
+          git archive "$reference" | tar -x -C "$PAGE_TEST_LEGACY_SOURCE"
+          make PG_CONFIG=/usr/lib/postgresql/16/bin/pg_config test-page-format
 
       - name: Upload page-format test logs
         if: always()

@@ -63,6 +63,21 @@ typedef struct CuvsCagraMeta
 
 uint64 cuvs_cagra_nonce(void);
 bool cuvs_cagra_read_meta(Relation index, CuvsCagraMeta *meta);
+
+typedef enum CuvsCagraSlotResult
+{
+    CUVS_CAGRA_SLOT_BAD,
+    CUVS_CAGRA_SLOT_DEAD,
+    CUVS_CAGRA_SLOT_LIVE
+} CuvsCagraSlotResult;
+
+bool cuvs_cagra_read_tail(Relation index, const CuvsCagraMeta *meta,
+                          BlockNumber nblocks, uint64 *tail);
+CuvsCagraSlotResult cuvs_cagra_slot_tid(Relation index, const CuvsCagraMeta *meta,
+                                      BlockNumber nblocks, uint64 slot, ItemPointer tid);
+bool cuvs_cagra_slot_filter(Relation index, const CuvsCagraMeta *meta,
+                            BlockNumber nblocks, const uint64 *roots, int nroots,
+                            uint32 *excluded);
 void cuvs_cagra_init_pages(Relation index, ForkNumber fork, uint64 index_nonce,
                           uint64 graph_nonce, int dim, uint32 metric,
                           const uint64 *tids, int64 n);

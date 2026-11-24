@@ -48,6 +48,7 @@
 #include "utils/array.h"           /* deconstruct_array, ARR_ELEMTYPE (Phase 3M) */
 #include "catalog/index.h"
 #include "catalog/namespace.h"
+#include "catalog/pg_am_d.h"
 #include "catalog/pg_type.h"
 #include "commands/defrem.h"
 #include "commands/tablespace.h"
@@ -221,6 +222,9 @@ static int32    cuvs_last_n_results = -1;        /* -1 = no scan yet */
 static int32    cuvs_last_k_requested = 0;
 static Oid      cuvs_last_index_oid = InvalidOid;
 static uint32_t cuvs_last_metric    = 0;
+#ifdef CUVS_PAGE_FORMAT
+static uint64   cuvs_page_bad_slots;
+#endif
 
 void _PG_init(void);
 
@@ -3630,9 +3634,10 @@ cuvs_build_cagra_from_heap_impl(Relation heapRel, Relation indexRel, IndexInfo *
     if (page_format)
     {
         page_request.length = sizeof(page_request);
+        page_request.flags = CUVS_PAGE_BUILD_DEFER_LEGACY;
         page_request.index_nonce = cuvs_cagra_nonce();
+        page_request.system_identifier = GetSystemIdentifier();
         shard_count = 1;
-        use_cpu_hnsw = false;
     }
 #endif
     bs.metric = cuvs_index_metric(indexRel);  /* baked into the CAGRA graph */
@@ -3807,7 +3812,9 @@ cuvs_build_cagra_from_heap_impl(Relation heapRel, Relation indexRel, IndexInfo *
                     ereport(ERROR,
                             (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
                              errmsg("page-format CAGRA build failed (status %d)", rc),
-                             errhint("Use a daemon that supports the page format and check its log.")));
+                             errhint("%s", rc == CUVS_STATUS_OOM_FALLBACK
+                                     ? "Check the daemon log. A legacy graph is kept resident until the replacement commits."
+                                     : "Use a daemon that supports the page format and check its log.")));
                 /* DDL durability contract: fail the transaction so the catalog
                  * entry rolls back and the user knows to retry. */
                 const char *hint;
@@ -3843,9 +3850,17 @@ cuvs_build_cagra_from_heap_impl(Relation heapRel, Relation indexRel, IndexInfo *
 
 #ifdef CUVS_PAGE_FORMAT
         if (page_format)
+        {
+            if (bs.n_vecs < 2)
+            {
+                page_request.build_xid = U64FromFullTransactionId(GetTopFullTransactionId());
+                cuvs_ipc_mark_pages_empty(cuvs_socket_path, MyDatabaseId, build_index_oid,
+                                          cuvs_resolve_index_dir_rel(indexRel), &page_request);
+            }
             cuvs_cagra_init_pages(indexRel, MAIN_FORKNUM, page_request.index_nonce,
                                   graph_nonce, bs.dim > 0 ? bs.dim : Max(typmod, 0),
                                   bs.metric, bs.tids, bs.n_vecs);
+        }
 #endif
     }
     PG_FINALLY();
@@ -3901,7 +3916,7 @@ cuvs_ambuild(Relation heapRel, Relation indexRel, IndexInfo *indexInfo)
                             errmsg("the experimental CAGRA page format is not sharded")));
         cuvs_resolve_build_params_rel(indexRel, &gd, &igd, &algo);
         cuvs_build_cagra_from_heap_impl(heapRel, indexRel, indexInfo,
-                                      RelationGetRelid(indexRel), 1, false,
+                                      RelationGetRelid(indexRel), 1, cuvs_cpu_hnsw_fallback,
                                       gd, igd, algo, &n_vecs, &reltuples, true);
         result->heap_tuples = reltuples;
         result->index_tuples = n_vecs;
@@ -4275,6 +4290,10 @@ typedef struct CuvsScanState {
     bool      page_format;
 #ifdef CUVS_PAGE_FORMAT
     CuvsHnswExact *page_exact;
+    CuvsCagraMeta *page_meta;
+    CuvsResult *page_results;
+    BlockNumber page_blocks;
+    int page_returned;
 #endif
 } CuvsScanState;
 
@@ -4858,6 +4877,9 @@ cuvs_rescan(IndexScanDesc scan, ScanKey keys, int nkeys,
 #ifdef CUVS_PAGE_FORMAT
     cuvs_hnsw_exact_end(ss->page_exact);
     ss->page_exact = NULL;
+    if (ss->page_meta) { pfree(ss->page_meta); ss->page_meta = NULL; }
+    if (ss->page_results) { pfree(ss->page_results); ss->page_results = NULL; }
+    ss->page_returned = 0;
 #endif
     ss->searched  = false;
     ss->cur       = 0;
@@ -4904,6 +4926,275 @@ cuvs_report_stale(Oid index_oid)
                      name ? quote_identifier(name) : "<index>")));
 }
 
+
+#ifdef CUVS_PAGE_FORMAT
+static bool
+page_search_request(Relation index, Snapshot snapshot, int dim,
+                    CuvsCagraMeta *meta, BlockNumber *blocks, CuvsPageSearchRequest *request)
+{
+    if (!enable_cuvs || !cuvs_page_preloaded || RecoveryInProgress() ||
+        !snapshot || !IsMVCCSnapshot(snapshot))
+        return false;
+    *blocks = RelationGetNumberOfBlocks(index);
+    if (!cuvs_cagra_read_meta(index, meta))
+        return false;
+    cuvs_cagra_check_dim(meta->dim, dim);
+    if (!meta->graph_nonce || !cuvs_cagra_read_tail(index, meta, *blocks, &request->tail) ||
+        request->tail != meta->folded)
+        return false;
+
+    request->length = sizeof(*request);
+    request->system_identifier = GetSystemIdentifier();
+    request->index_nonce = meta->index_nonce;
+    request->base_nonce = meta->base_nonce;
+    request->graph_nonce = meta->graph_nonce;
+    request->n_slots = meta->n_slots;
+    request->folded = meta->folded;
+    request->dead_slots = meta->dead_slots;
+    return true;
+}
+
+static uint64 *
+page_filter_roots(Relation heap, const uint64 *visible, int count, int *nroots)
+{
+    OffsetNumber roots[MaxHeapTuplesPerPage];
+    BlockNumber previous = InvalidBlockNumber;
+    BlockNumber nblocks = RelationGetNumberOfBlocks(heap);
+    uint64 *out = palloc((size_t) count * sizeof(*out));
+
+    *nroots = 0;
+    for (int i = 0; i < count; ++i)
+    {
+        uint32 block;
+        uint16 offset;
+
+        CHECK_FOR_INTERRUPTS();
+        cuvs_tid_decode(visible[i], &block, &offset);
+        if (block >= nblocks || !OffsetNumberIsValid(offset) || offset > MaxHeapTuplesPerPage)
+            continue;
+        if (block != previous)
+        {
+            Buffer buf = ReadBuffer(heap, block);
+
+            LockBuffer(buf, BUFFER_LOCK_SHARE);
+            memset(roots, 0, sizeof(roots));
+            heap_get_root_tuples(BufferGetPage(buf), roots);
+            UnlockReleaseBuffer(buf);
+            previous = block;
+        }
+        if (OffsetNumberIsValid(roots[offset - 1]))
+            out[(*nroots)++] = cuvs_tid_encode(block, roots[offset - 1]);
+    }
+    qsort(out, *nroots, sizeof(*out), page_tid_cmp);
+    return out;
+}
+
+static bool
+page_resolve_filtered(Relation index, Relation heap, Snapshot snapshot,
+                      const CuvsCagraMeta *meta, BlockNumber blocks,
+                      const CuvsResult *results, int count, int k,
+                      const uint64 *visible, int nvisible,
+                      uint64 *tids, float *dists, int *emitted)
+{
+    IndexFetchTableData *fetch = table_index_fetch_begin(heap);
+    TupleTableSlot *slot = table_slot_create(heap, NULL);
+    bool valid = true;
+
+    *emitted = 0;
+    for (int i = 0; i < count && *emitted < k; ++i)
+    {
+        ItemPointerData root;
+        CuvsCagraSlotResult quality;
+        bool again = false;
+        bool dead;
+        uint64 tid;
+
+        CHECK_FOR_INTERRUPTS();
+        quality = cuvs_cagra_slot_tid(index, meta, blocks, results[i].tid, &root);
+        if (quality == CUVS_CAGRA_SLOT_BAD)
+        {
+            valid = false;
+            break;
+        }
+        if (quality != CUVS_CAGRA_SLOT_LIVE ||
+            !table_index_fetch_tuple(fetch, &root, snapshot, slot, &again, &dead))
+            continue;
+        tid = cuvs_tid_encode(ItemPointerGetBlockNumber(&slot->tts_tid),
+                              ItemPointerGetOffsetNumber(&slot->tts_tid));
+        if (!bsearch(&tid, visible, nvisible, sizeof(tid), page_tid_cmp))
+            continue;
+        tids[*emitted] = tid;
+        dists[(*emitted)++] = results[i].distance;
+    }
+    table_index_fetch_end(fetch);
+    ExecDropSingleTupleTableSlot(slot);
+    return valid;
+}
+
+static bool
+page_search_filtered(Oid oid, Relation heap, Snapshot snapshot, const float *query,
+                     int dim, int k, const uint64 *visible, int nvisible,
+                     uint64 *tids, float *dists, int *nresults, uint32 *latency)
+{
+    Relation index;
+    CuvsCagraMeta meta;
+    CuvsPageSearchRequest request = {0};
+    BlockNumber blocks;
+    uint64 *roots;
+    uint32 *excluded;
+    uint32 words;
+    int nroots, search_k, rc, count;
+    bool ok = false;
+
+    if (check_enable_rls(RelationGetRelid(heap), InvalidOid, true) != RLS_NONE ||
+        RelationGetForm(heap)->relam != HEAP_TABLE_AM_OID)
+        return false;
+    index = index_open(oid, AccessShareLock);
+    if (!page_search_request(index, snapshot, dim, &meta, &blocks, &request))
+    {
+        index_close(index, AccessShareLock);
+        return false;
+    }
+
+    search_k = k + (int) Min(meta.dead_slots, (uint64) k);
+    roots = page_filter_roots(heap, visible, nvisible, &nroots);
+    words = (meta.n_slots + 31) / 32;
+    excluded = palloc((size_t) words * sizeof(*excluded));
+    if (cuvs_cagra_slot_filter(index, &meta, blocks, roots, nroots, excluded))
+    {
+        CuvsResult *results = palloc((size_t) search_k * sizeof(*results));
+
+        rc = cuvs_ipc_search_pages(cuvs_socket_path, MyDatabaseId, oid, &request, query,
+                                   1, dim, search_k, meta.metric, cuvs_itopk_size,
+                                   cuvs_search_width, cuvs_cpu_hnsw_fallback, 1,
+                                   cuvs_bf_precision, excluded, words, results, &count, latency);
+        if (rc == CUVS_STATUS_CANCELED)
+            CHECK_FOR_INTERRUPTS();
+        if (rc == CUVS_STATUS_OK)
+            ok = page_resolve_filtered(index, heap, snapshot, &meta, blocks, results,
+                                       count, k, visible, nvisible, tids, dists, nresults);
+        pfree(results);
+    }
+    pfree(excluded);
+    pfree(roots);
+    index_close(index, AccessShareLock);
+    if (!ok)
+        *latency = 0;
+    return ok;
+}
+
+static bool
+page_start_search(IndexScanDesc scan, CuvsScanState *ss)
+{
+    Relation index = scan->indexRelation;
+    CuvsCagraMeta meta;
+    CuvsPageSearchRequest request = {0};
+    PgVector *query;
+    uint32_t latency;
+    int rc, k;
+
+    if (scan->numberOfOrderBys != 1 || !scan->orderByData ||
+        (scan->orderByData[0].sk_flags & SK_ISNULL))
+        return false;
+    query = DatumGetPgVector(scan->orderByData[0].sk_argument);
+    if (!page_search_request(index, scan->xs_snapshot, query->dim,
+                             &meta, &ss->page_blocks, &request))
+        return false;
+    k = cuvs_k + (int) Min(meta.dead_slots, (uint64) cuvs_k);
+
+    ss->page_results = palloc(k * sizeof(*ss->page_results));
+    rc = cuvs_ipc_search_pages(cuvs_socket_path, MyDatabaseId, RelationGetRelid(index),
+                               &request, query->x, 1, query->dim, k, meta.metric,
+                               cuvs_itopk_size, cuvs_search_width, cuvs_cpu_hnsw_fallback,
+                               cuvs_search_mode, cuvs_bf_precision, NULL, 0,
+                               ss->page_results, &ss->n_results, &latency);
+    if (rc == CUVS_STATUS_CANCELED)
+        CHECK_FOR_INTERRUPTS();
+    if (rc != CUVS_STATUS_OK)
+        return false;
+
+    ss->page_meta = palloc(sizeof(*ss->page_meta));
+    *ss->page_meta = meta;
+    cuvs_last_latency_us = latency;
+    cuvs_last_n_results = ss->n_results;
+    cuvs_last_k_requested = k;
+    cuvs_last_index_oid = RelationGetRelid(index);
+    cuvs_last_metric = meta.metric;
+    return true;
+}
+
+static void
+page_start_exact(IndexScanDesc scan, CuvsScanState *ss)
+{
+    int dim = 0;
+
+    if (scan->numberOfOrderBys == 1 && scan->orderByData != NULL &&
+        !(scan->orderByData[0].sk_flags & SK_ISNULL))
+        dim = DatumGetPgVector(scan->orderByData[0].sk_argument)->dim;
+    cuvs_cagra_check_query_dim(scan->indexRelation, dim);
+    ss->page_exact = cuvs_hnsw_exact_begin(scan);
+}
+
+static bool
+page_gettuple(IndexScanDesc scan, CuvsScanState *ss)
+{
+    scan->xs_recheck = false;
+    scan->xs_recheckorderby = false;
+    if (!ss->searched)
+    {
+        ss->searched = true;
+        if (!page_start_search(scan, ss))
+            page_start_exact(scan, ss);
+    }
+
+    if (!ss->page_exact)
+    {
+        while (ss->cur < ss->n_results && ss->page_returned < cuvs_k)
+        {
+            CuvsResult *candidate = &ss->page_results[ss->cur++];
+            CuvsCagraSlotResult state = cuvs_cagra_slot_tid(scan->indexRelation,
+                ss->page_meta, ss->page_blocks, candidate->tid, &scan->xs_heaptid);
+            double distance = candidate->distance;
+
+            if (state == CUVS_CAGRA_SLOT_DEAD)
+                continue;
+            if (state == CUVS_CAGRA_SLOT_BAD)
+            {
+                bool out_of_range = candidate->tid >= ss->page_meta->n_slots;
+
+                if (out_of_range)
+                    ++cuvs_page_bad_slots;
+                if (ss->page_returned != 0)
+                    ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
+                                    errmsg("CAGRA slot identity changed during the scan")));
+                if (out_of_range)
+                    ereport(WARNING,
+                            (errmsg("CAGRA daemon returned a slot outside the index range"),
+                             errdetail("Out-of-range page slots in this backend: " UINT64_FORMAT,
+                                       cuvs_page_bad_slots)));
+                page_start_exact(scan, ss);
+                break;
+            }
+            if (ss->page_meta->metric == CUVS_METRIC_L2)
+                distance = sqrt(Max(distance, 0.0));
+            else if (ss->page_meta->metric == CUVS_METRIC_IP)
+                distance = -distance;
+            scan->xs_orderbyvals[0] = Float8GetDatum(distance);
+            scan->xs_orderbynulls[0] = false;
+            ++ss->page_returned;
+            return true;
+        }
+    }
+
+    if (!ss->page_exact || ss->page_returned >= cuvs_k ||
+        !cuvs_hnsw_exact_next(ss->page_exact, &scan->xs_heaptid,
+                             &scan->xs_orderbyvals[0], &scan->xs_orderbynulls[0]))
+        return false;
+    ++ss->page_returned;
+    return true;
+}
+#endif
+
 static bool
 cuvs_gettuple(IndexScanDesc scan, ScanDirection dir)
 {
@@ -4913,24 +5204,7 @@ cuvs_gettuple(IndexScanDesc scan, ScanDirection dir)
     if (ss->page_format)
     {
 #ifdef CUVS_PAGE_FORMAT
-        if (!ss->page_exact)
-        {
-            int dim = 0;
-
-            if (scan->numberOfOrderBys == 1 && scan->orderByData != NULL &&
-                !(scan->orderByData[0].sk_flags & SK_ISNULL))
-                dim = DatumGetPgVector(scan->orderByData[0].sk_argument)->dim;
-            cuvs_cagra_check_query_dim(scan->indexRelation, dim);
-            ss->page_exact = cuvs_hnsw_exact_begin(scan);
-        }
-        if (ss->cur >= cuvs_k ||
-            !cuvs_hnsw_exact_next(ss->page_exact, &scan->xs_heaptid,
-                                  &scan->xs_orderbyvals[0], &scan->xs_orderbynulls[0]))
-            return false;
-        ++ss->cur;
-        scan->xs_recheck = false;
-        scan->xs_recheckorderby = false;
-        return true;
+        return page_gettuple(scan, ss);
 #else
         cuvs_cagra_require_legacy(scan->indexRelation);
 #endif
@@ -5456,6 +5730,8 @@ cuvs_endscan(IndexScanDesc scan)
     CuvsScanState *ss = (CuvsScanState *)scan->opaque;
 #ifdef CUVS_PAGE_FORMAT
     cuvs_hnsw_exact_end(ss->page_exact);
+    if (ss->page_meta) pfree(ss->page_meta);
+    if (ss->page_results) pfree(ss->page_results);
 #endif
     if (ss->tids)      pfree(ss->tids);
     if (ss->distances) pfree(ss->distances);
@@ -6759,6 +7035,42 @@ pg_cuvs_hw_profile(PG_FUNCTION_ARGS)
     return (Datum) 0;
 }
 
+#ifdef CUVS_PAGE_FORMAT
+static bool
+cuvs_relation_is_page_cagra(Relation index)
+{
+    return index->rd_rel->relam == get_am_oid("cagra", true) &&
+        cuvs_cagra_has_pages(index);
+}
+
+static bool
+cuvs_oid_is_page_cagra(Oid oid)
+{
+    Relation index;
+    bool page_format = false;
+
+    if (!ConditionalLockRelationOid(oid, AccessShareLock))
+        return false;
+    index = try_relation_open(oid, NoLock);
+    if (index)
+    {
+        page_format = index->rd_rel->relkind == RELKIND_INDEX && cuvs_relation_is_page_cagra(index);
+        relation_close(index, NoLock);
+    }
+    UnlockRelationOid(oid, AccessShareLock);
+    return page_format;
+}
+
+static void
+cuvs_require_legacy_operation(Relation index)
+{
+    if (cuvs_relation_is_page_cagra(index))
+        ereport(ERROR,
+                (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                 errmsg("this operation requires a legacy CAGRA index")));
+}
+#endif
+
 PG_FUNCTION_INFO_V1(pg_cuvs_gpu_search_stats);
 Datum
 pg_cuvs_gpu_search_stats(PG_FUNCTION_ARGS)
@@ -6805,6 +7117,10 @@ pg_cuvs_gpu_search_stats(PG_FUNCTION_ARGS)
         char   *relname;
         double  avg_us;
 
+#ifdef CUVS_PAGE_FORMAT
+        if (cuvs_oid_is_page_cagra((Oid) s->index_oid))
+            continue;
+#endif
         memset(nulls, 0, sizeof(nulls));
 
         values[0] = ObjectIdGetDatum((Oid) s->db_oid);
@@ -7225,6 +7541,9 @@ pg_cuvs_compact(PG_FUNCTION_ARGS)
                  errmsg("index %u does not exist", index_oid)));
 
     cuvs_require_index_owner(index_oid);
+#ifdef CUVS_PAGE_FORMAT
+    cuvs_require_legacy_operation(indexRel);
+#endif
 
     rc = cuvs_ipc_compact(cuvs_socket_path,
                           (uint32_t) MyDatabaseId,
@@ -7572,6 +7891,27 @@ cuvs_manual_rel(FunctionCallInfo fcinfo, uint32 op)
     int  rc;
 
     cuvs_manual_check_index(relid);
+#ifdef CUVS_PAGE_FORMAT
+    if (!ConditionalLockRelationOid(relid, AccessShareLock))
+        ereport(ERROR, (errcode(ERRCODE_LOCK_NOT_AVAILABLE),
+                        errmsg("could not check the index format while its relation is locked")));
+    Relation target = index_open(relid, NoLock);
+    if (cuvs_relation_is_page_cagra(target))
+    {
+        if (op != CUVS_OP_UNLOAD && op != CUVS_OP_UNPIN)
+            cuvs_require_legacy_operation(target);
+        if (target->rd_createSubid != InvalidSubTransactionId ||
+            target->rd_newRelfilelocatorSubid != InvalidSubTransactionId)
+            ereport(ERROR,
+                    (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+                     errmsg("cannot unload or unpin the legacy graph before the page-format build commits"),
+                     errhint("Run the operation after committing the index build.")));
+        if (op == CUVS_OP_UNLOAD)
+            op = CUVS_OP_UNLOAD_PAGE_LEGACY;
+    }
+    index_close(target, NoLock);
+    UnlockRelationOid(relid, AccessShareLock);
+#endif
     rc = cuvs_ipc_manual(cuvs_socket_path, op, (uint32_t) MyDatabaseId,
                          (uint32_t) relid, msg, sizeof(msg));
     cuvs_report_build_notice(relid);
@@ -7851,6 +8191,11 @@ cuvs_status_emit(FunctionCallInfo fcinfo, uint32 op, const char *header,
                 (void) cuvs_status_index_info(row_index, &qualname, &owns);
             if (!cuvs_status_row_visible(is_priv, row_db, MyDatabaseId, owns))
                 continue;
+#ifdef CUVS_PAGE_FORMAT
+            if (row_db == MyDatabaseId && strcmp(f[3], "page_cagra") != 0 &&
+                cuvs_oid_is_page_cagra(row_index))
+                continue;
+#endif
             nulls[0] = qualname == NULL;
             values[0] = qualname ? CStringGetTextDatum(qualname) : (Datum) 0;
         }
@@ -8281,6 +8626,10 @@ cuvs_filtered_knn(PG_FUNCTION_ARGS)
 /* ---- per-scan state ---- */
 typedef struct CuvsFilteredScanState {
     CustomScanState css;
+#ifdef CUVS_PAGE_FORMAT
+    bool page_format;
+    bool page_search_succeeded;
+#endif
     Oid         index_oid;
     uint32_t    metric;
     Datum       query_datum;
@@ -8384,6 +8733,9 @@ cuvs_cs_begin(CustomScanState *node, EState *estate, int eflags)
     {
         Relation indexRel = index_open(state->index_oid, AccessShareLock);
         state->metric = cuvs_index_metric(indexRel);
+#ifdef CUVS_PAGE_FORMAT
+        state->page_format = cuvs_cagra_has_pages(indexRel);
+#endif
         index_close(indexRel, AccessShareLock);
     }
 }
@@ -8434,7 +8786,11 @@ cuvs_cs_build(CuvsFilteredScanState *state, EState *estate)
     slot  = table_slot_create(state->heap_rel, NULL);
     tids  = palloc((size_t)cap * sizeof(uint64_t));
 
-    scan = table_beginscan(state->heap_rel, GetTransactionSnapshot(), 0, NULL);
+    scan = table_beginscan(state->heap_rel,
+#ifdef CUVS_PAGE_FORMAT
+                           state->page_format ? estate->es_snapshot :
+#endif
+                           GetTransactionSnapshot(), 0, NULL);
     while (table_scan_getnextslot(scan, ForwardScanDirection, slot))
     {
         ItemPointer iptr;
@@ -8472,6 +8828,7 @@ cuvs_cs_build(CuvsFilteredScanState *state, EState *estate)
         state->n_results = 0;
         state->built     = true;
         state->cursor    = 0;
+        pfree(tids);
         return;
     }
 
@@ -8480,6 +8837,33 @@ cuvs_cs_build(CuvsFilteredScanState *state, EState *estate)
     int       dim  = qvec->dim;
     int       k    = (int) cuvs_k;
 
+
+#ifdef CUVS_PAGE_FORMAT
+    if (state->page_format)
+    {
+        Snapshot snapshot = estate->es_snapshot;
+        uint32 latency = 0;
+
+        state->result_tids = palloc(k * sizeof(*state->result_tids));
+        state->result_dists = palloc(k * sizeof(*state->result_dists));
+        state->page_search_succeeded =
+            page_search_filtered(state->index_oid, state->heap_rel, snapshot, qvec->x,
+                                 dim, k, tids, ntids, state->result_tids,
+                                 state->result_dists, &state->n_results, &latency);
+        if (!state->page_search_succeeded)
+        {
+            PushActiveSnapshot(snapshot);
+            state->n_results = cuvs_cagra_sql_exact(state->index_oid, state->metric,
+                dim, qvec->x, 1, k, tids, ntids, state->result_tids, state->result_dists);
+            PopActiveSnapshot();
+        }
+        state->last_latency_us = latency;
+        state->built = true;
+        state->cursor = 0;
+        pfree(tids);
+        return;
+    }
+#endif
     bool use_prefilter = false;
     bool use_stream_bf = false;
     if (ntids > 0 && state->heap_rel->rd_rel->reltuples > 0.0
@@ -8598,6 +8982,9 @@ cuvs_cs_exec(CustomScanState *node)
 
         ExecClearTuple(fetch);
         if (!table_tuple_fetch_row_version(state->heap_rel, &iptr,
+#ifdef CUVS_PAGE_FORMAT
+                                           state->page_format ? node->ss.ps.state->es_snapshot :
+#endif
                                            GetTransactionSnapshot(), fetch))
             continue;   /* dead / invisible tuple */
 
@@ -8618,6 +9005,10 @@ cuvs_cs_exec(CustomScanState *node)
         ExecStoreVirtualTuple(scan);
 
         node->ss.ps.ps_ExprContext->ecxt_scantuple = scan;
+#ifdef CUVS_PAGE_FORMAT
+        if (state->page_format && !node->ss.ps.ps_ProjInfo)
+            return scan;
+#endif
         return ExecProject(node->ss.ps.ps_ProjInfo);
     }
 
@@ -8652,6 +9043,11 @@ cuvs_cs_rescan(CustomScanState *node)
     state->built    = false;
     state->cursor   = 0;
     state->n_results = 0;
+#ifdef CUVS_PAGE_FORMAT
+    state->page_search_succeeded = false;
+    if (state->page_format)
+        state->last_latency_us = 0;
+#endif
     if (state->result_tids)  { pfree(state->result_tids);  state->result_tids  = NULL; }
     if (state->result_dists) { pfree(state->result_dists); state->result_dists = NULL; }
 }
@@ -8661,7 +9057,12 @@ static void
 cuvs_cs_explain(CustomScanState *node, List *ancestors, ExplainState *es)
 {
     CuvsFilteredScanState *state = (CuvsFilteredScanState *) node;
-    if (es->analyze && state->last_latency_us > 0)
+    bool searched = state->last_latency_us > 0;
+#ifdef CUVS_PAGE_FORMAT
+    if (state->page_format)
+        searched = state->page_search_succeeded;
+#endif
+    if (es->analyze && searched)
         ExplainPropertyInteger("GPU IPC latency", "us",
                                (int64) state->last_latency_us, es);
 }
@@ -8743,13 +9144,19 @@ cuvs_dwedge_add_path(PlannerInfo *root, RelOptInfo *rel,
             ioi->indexkeys[0] == vcol->varattno)
         {
             Relation index = try_index_open(ioi->indexoid, NoLock);
-            bool page_format;
+            bool usable;
 
             if (index == NULL)
                 continue;
-            page_format = cuvs_cagra_has_pages(index);
+            usable = !cuvs_cagra_has_pages(index);
+#ifdef CUVS_PAGE_FORMAT
+            if (!usable)
+                usable = !root->parse->hasRowSecurity && rte->securityQuals == NIL &&
+                    check_enable_rls(rte->relid, InvalidOid, true) == RLS_NONE &&
+                    RelationGetIndexPredicate(index) == NIL;
+#endif
             index_close(index, NoLock);
-            if (!page_format)
+            if (usable)
             {
                 index_oid = ioi->indexoid;
                 break;

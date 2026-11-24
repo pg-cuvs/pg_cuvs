@@ -13,6 +13,9 @@ BEGIN
     IF (SELECT id FROM legacy_cagra ORDER BY v <-> '[0,0,0]' LIMIT 1) IS DISTINCT FROM 1 THEN
         RAISE EXCEPTION 'feature-off CAGRA returned the wrong row';
     END IF;
+    IF pg_cuvs_last_search_n_results() IS DISTINCT FROM 3 THEN
+        RAISE EXCEPTION 'legacy CAGRA did not get three candidates from the daemon';
+    END IF;
 END $$;
 
 SET cuvs.max_delta_rows=0;

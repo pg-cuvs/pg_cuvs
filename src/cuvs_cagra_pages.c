@@ -331,20 +331,144 @@ cuvs_cagra_check_query_dim(Relation index, int dim)
 }
 
 static CuvsCagraPending *
-page_pending(Relation index, BlockNumber block, Page page, uint64 nonce)
+pending_tag(Page page, BlockNumber block, uint64 nonce)
 {
     CuvsCagraPending *pending;
     PageHeader header = (PageHeader) page;
 
     if (PageIsNew(page) || PageGetSpecialSize(page) != sizeof(*pending))
-        bad_page(index, block);
+        return NULL;
     pending = (CuvsCagraPending *) PageGetSpecialPointer(page);
     if (pending->kind != CUVS_PAGE_PENDING || pending->index_nonce != nonce ||
         pending->flags != 0 || pending->count > CUVS_CAGRA_PENDING_PER_PAGE ||
         header->pd_lower != MAXALIGN(SizeOfPageHeaderData) + pending->count * sizeof(ItemPointerData) ||
         pending->next == block || pending->next == 0)
+        return NULL;
+    return pending;
+}
+
+static CuvsCagraPending *
+page_pending(Relation index, BlockNumber block, Page page, uint64 nonce)
+{
+    CuvsCagraPending *pending = pending_tag(page, block, nonce);
+
+    if (!pending)
         bad_page(index, block);
     return pending;
+}
+
+bool
+cuvs_cagra_read_tail(Relation index, const CuvsCagraMeta *meta,
+                     BlockNumber nblocks, uint64 *tail)
+{
+    Buffer buf;
+    const CuvsCagraPending *tag;
+    bool valid;
+
+    if (meta->pending_tail >= nblocks)
+        return false;
+    buf = ReadBuffer(index, meta->pending_tail);
+    LockBuffer(buf, BUFFER_LOCK_SHARE);
+    tag = pending_tag(BufferGetPage(buf), meta->pending_tail, meta->index_nonce);
+    valid = tag && !BlockNumberIsValid(tag->next) &&
+        tag->first_pos <= UINT64_MAX - tag->count;
+    if (valid)
+        *tail = tag->first_pos + tag->count;
+    UnlockReleaseBuffer(buf);
+    return valid;
+}
+
+static bool
+read_slots(Relation index, const CuvsCagraMeta *meta,
+                    BlockNumber nblocks, uint64 slot, uint32 count, ItemPointer tids)
+{
+    uint64 page_no = slot / CUVS_CAGRA_TIDS_PER_PAGE;
+    uint64 extent = page_no / CUVS_CAGRA_PAGE_EXTENT;
+    uint32 offset = slot % CUVS_CAGRA_TIDS_PER_PAGE;
+    BlockNumber start, block;
+    Buffer buf;
+    Page page;
+    const CuvsCagraTidPage *tag;
+    bool valid = false;
+
+    if (slot >= meta->n_slots || count > meta->n_slots - slot ||
+        extent >= meta->n_extents || count > CUVS_CAGRA_TIDS_PER_PAGE - offset)
+        return false;
+    start = meta->extents[extent];
+    if (start == 0 || start >= InvalidBlockNumber - CUVS_CAGRA_PAGE_EXTENT)
+        return false;
+    block = start + page_no % CUVS_CAGRA_PAGE_EXTENT;
+    if (block >= nblocks)
+        return false;
+
+    buf = ReadBuffer(index, block);
+    LockBuffer(buf, BUFFER_LOCK_SHARE);
+    page = BufferGetPage(buf);
+    if (!PageIsNew(page) && PageGetSpecialSize(page) == sizeof(*tag) &&
+        ((PageHeader) page)->pd_lower >= MAXALIGN(SizeOfPageHeaderData) +
+            (offset + count) * sizeof(ItemPointerData) &&
+        ((PageHeader) page)->pd_lower <= ((PageHeader) page)->pd_upper)
+    {
+        tag = (CuvsCagraTidPage *) PageGetSpecialPointer(page);
+        if (tag->kind == CUVS_PAGE_TIDS && tag->base_nonce == meta->base_nonce &&
+            tag->first_slot == slot - offset && (tag->flags & ~1U) == 0)
+        {
+            memcpy(tids, (ItemPointerData *) PageGetContents(page) + offset,
+                   count * sizeof(ItemPointerData));
+            valid = true;
+        }
+    }
+    UnlockReleaseBuffer(buf);
+    return valid;
+}
+
+
+CuvsCagraSlotResult
+cuvs_cagra_slot_tid(Relation index, const CuvsCagraMeta *meta,
+                    BlockNumber nblocks, uint64 slot, ItemPointer tid)
+{
+    if (!read_slots(index, meta, nblocks, slot, 1, tid))
+        return CUVS_CAGRA_SLOT_BAD;
+    return ItemPointerIsValid(tid) ? CUVS_CAGRA_SLOT_LIVE : CUVS_CAGRA_SLOT_DEAD;
+}
+
+static int
+compare_root(const void *a, const void *b)
+{
+    uint64 x = *(const uint64 *) a;
+    uint64 y = *(const uint64 *) b;
+
+    return (x > y) - (x < y);
+}
+
+bool
+cuvs_cagra_slot_filter(Relation index, const CuvsCagraMeta *meta,
+                      BlockNumber nblocks, const uint64 *roots, int nroots,
+                      uint32 *excluded)
+{
+    ItemPointerData segment[CUVS_CAGRA_TIDS_PER_PAGE];
+
+    memset(excluded, 0xff, ((meta->n_slots + 31) / 32) * sizeof(*excluded));
+    for (uint64 slot = 0; slot < meta->n_slots; slot += CUVS_CAGRA_TIDS_PER_PAGE)
+    {
+        uint32 count = Min((uint64) CUVS_CAGRA_TIDS_PER_PAGE, meta->n_slots - slot);
+
+        CHECK_FOR_INTERRUPTS();
+        if (!read_slots(index, meta, nblocks, slot, count, segment))
+            return false;
+        for (uint32 i = 0; i < count; ++i)
+        {
+            ItemPointer tid = &segment[i];
+            uint64 root;
+
+            if (!ItemPointerIsValid(tid))
+                continue;
+            root = cuvs_tid_encode(ItemPointerGetBlockNumber(tid), ItemPointerGetOffsetNumber(tid));
+            if (bsearch(&root, roots, nroots, sizeof(root), compare_root))
+                excluded[(slot + i) / 32] &= ~((uint32) 1 << ((slot + i) % 32));
+        }
+    }
+    return true;
 }
 
 static void
