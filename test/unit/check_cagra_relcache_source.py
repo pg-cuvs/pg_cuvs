@@ -9,8 +9,8 @@ from check_hnsw_explicit_source import function
 
 
 ROOT = Path(__file__).resolve().parents[2]
-DETOAST = "int dim = DatumGetPgVector(values[0])->dim;"
-APPEND = "cuvs_cagra_append_pending(indexRel, heap_tid, dim);"
+DETOAST = "PgVector *value = DatumGetPgVector(values[0]);"
+APPEND = "cuvs_cagra_append_pending(indexRel, heap_tid, value->dim, value->x);"
 REFRESH = "cuvs_cagra_relation_cache(indexRel)->stale_sent = true;"
 SNAPSHOT = "CuvsCagraRelCache cached = *cuvs_cagra_relation_cache(index);"
 PUBLISH = "cache = cuvs_cagra_relation_cache(index);"
