@@ -512,7 +512,7 @@ cagra/ivfpq") rather than silently failing.
 | `source` | string | `` | a `cagra` index name on the same table | empty = private direct HNSW file build from the heap (op23), without a persistent CAGRA index |
 | `mode` | string | `nsw` | `nsw`, `hnswlib`, `hnsw`, `hnswlib_file` | `nsw` and `hnswlib` are recommended. With `source`, `nsw` and `hnsw` give the same graph: level 0 from the CAGRA graph and upper layers built by the daemon on the host. Since 0.9.3 this path checks the pgvector version as the heap build does (outside the supported range is an error, not a warning) |
 | `m` | int | `16` | 2–100 | **informational** — the CAGRA graph degree drives the HNSW layout, not `m` |
-| `ef_construction` | int | `64` | 4–1000 | Direct heap build: construction effort; source reuse: informational |
+| `ef_construction` | int | `64` | 4–1000 | Heap construction effort. Builds store the configured value in the metapage, including empty and source builds. Source builds reuse the source graph. |
 | `build_algo` | enum | `auto` | `auto`, `ivf_pq`, `nn_descent`, `ace` | Direct heap build only; cannot be combined with explicit `source` |
 
 For direct heap construction, `auto` uses tiny exact GPU construction below 16 rows and
@@ -580,7 +580,8 @@ route was decided, such as an over-budget refusal).
 `m` remains informational. Direct `ef_construction` scales intermediate degree from128,
 hierarchy construction effort from200, and ACE effort from240 at the default64 (ACE: the
 `--hnsw-ace-build-quality auto` rule, 20 NN-descent iterations per partition at 64);
-receipts record the consumed/clamped values. ACE indexes also record a partition-builder
+receipts record the consumed/clamped values. The SDK limits the intermediate width to 1024. A
+build that reaches that ceiling with a higher requested width issues a NOTICE. ACE indexes also record a partition-builder
 readback (`ace_build_quality`, `ace_local_intermediate_degree` = 3 × (graph_degree / 2),
 `ace_local_nn_descent_iterations`); the receipt's `intermediate_degree` is the resident width
 and the ACE memory-plan input, not the width ACE partitions build and optimize with.

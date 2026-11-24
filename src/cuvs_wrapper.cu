@@ -3014,7 +3014,7 @@ static int prepare_hnsw_settings(const CuvsHnswFileBuild *params, int vectors_fd
     degree = params->graph_degree;
     auto &intermediate = prepared.intermediate;
     intermediate = cuvs_hnsw_scaled_quality(params->intermediate_degree,
-        params->ef_construction, degree, 4096);
+        params->ef_construction, degree, CUVS_HNSW_MAX_INTERMEDIATE_DEGREE);
     if (params->policy) memset(params->policy, 0, sizeof(*params->policy));
     if (!cuvs_hnsw_algo_supported(params->build_algo)
         || params->ef_construction < 4 || params->ef_construction > 1000)

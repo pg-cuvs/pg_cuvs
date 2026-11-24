@@ -88,6 +88,11 @@ exists for 0.9.0.
 
 ### Fixed
 
+- `pg_cuvs_hnsw` stores its configured `ef_construction` in the metapage
+  for heap and source builds. The build receipt still records the SDK's
+  effective settings. Heap builds cap the intermediate graph width at 1024
+  and report the cap with a NOTICE when it limits the requested width.
+
 - `CREATE INDEX CONCURRENTLY ... USING pg_cuvs_hnsw` and `REINDEX INDEX CONCURRENTLY` of a `pg_cuvs_hnsw` index
   built from the heap (without `source`) no longer make the table's queries wait for a lock. The build opened the
   index it writes with `AccessExclusiveLock`, while a concurrent build holds `RowExclusiveLock` on it. Every write
