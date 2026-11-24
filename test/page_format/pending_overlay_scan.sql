@@ -71,12 +71,12 @@ BEGIN
 END $$;
 ROLLBACK;
 
-SET cuvs.k=3;
+SET cuvs.k=1;
 DO $$
 BEGIN
     IF (SELECT id FROM pending_expression
         ORDER BY ((v + '[10,10,10]'::vector)::vector(3)) <-> '[10,10,10]' LIMIT 1)
-       IS DISTINCT FROM 1 OR pg_cuvs_last_search_k() IS DISTINCT FROM 3 THEN
+       IS DISTINCT FROM 1 OR pg_cuvs_last_search_k() IS DISTINCT FROM 1 THEN
         RAISE EXCEPTION 'the request-local overlay did not exclude an aborted expression entry';
     END IF;
 END $$;
