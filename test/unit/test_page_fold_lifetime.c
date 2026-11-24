@@ -179,11 +179,11 @@ test_pinned_graph_is_not_reclaimable(void)
     entry = register_graph(&old, 5, 8192);
     register_graph(&reclaimable, 6, 4096);
     CHECK(page_graph_fold_pin_locked(entry, &ref) == &old, "pin pressured graph");
-    CHECK(make_room(0, CUVS_RQ_LOAD, 8192, 0, &pick) != 0,
+    CHECK(make_room(0, CUVS_RQ_LOAD, 8192, 0, &pick, false, false) != 0,
           "capacity picker counted pinned bytes as reclaimable");
     CHECK(!old.frees && !reclaimable.frees && g_page_graph_bytes[0] == 12288,
           "failed room pick freed a graph");
-    CHECK(make_room(0, CUVS_RQ_LOAD, 4096, 0, &pick) == 0,
+    CHECK(make_room(0, CUVS_RQ_LOAD, 4096, 0, &pick, false, false) == 0,
           "room picker failed to reclaim the unpinned graph");
     CHECK(!old.frees && reclaimable.frees == 1 && g_page_graph_bytes[0] == 8192,
           "room picker reclaimed the wrong graph");

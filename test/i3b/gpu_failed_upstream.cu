@@ -1,5 +1,6 @@
-/* DEV-only native test: real RMM limiter/pool, a few KiB, no ANN workload. */
+/* DEV-only native test: real RMM limiter/pool, no ANN workload. */
 #include "cuvs_rmm_failure_resource.hpp"
+#include "cuvs_admission_contract.h"
 #include <rmm/mr/cuda_memory_resource.hpp>
 #include <rmm/mr/pool_memory_resource.hpp>
 #include <cassert>
@@ -36,5 +37,32 @@ int main()
         pool.deallocate(stream,b,1500);
         pool.deallocate(stream,a,3000);
     }
+#ifdef PGCUVS_BETA3A_GPU_FOLD
+    {
+        constexpr std::size_t mib = 1u << 20;
+        /* Start with 80 MiB outside the modelled pool. Real RMM growth is
+         * measured below; 80 MiB is a deterministic raw-free fixture. */
+        CuvsRmmFailureUpstream limited(&device, 96 * mib);
+        rmm::mr::pool_memory_resource<CuvsRmmFailureUpstream> pool(&limited, 32 * mib);
+        auto raw = [&] { return 80 * mib - limited.get_allocated_bytes(); };
+        auto *resident = pool.allocate(stream, 31 * mib);
+        assert(raw() == 48 * mib);
+        {
+            CuvsRmmFailureUpstream::NoGrowth fold(&limited);
+            auto *idle = pool.allocate(stream, mib);
+            try { pool.allocate(stream, 8 * mib); assert(false); }
+            catch (const rmm::out_of_memory &) {}
+            pool.deallocate(stream, idle, mib);
+            assert(raw() == 48 * mib && !cuvs_build_physical_refuse(raw()));
+        }
+        /* Without the fold guard the next allocation expands upstream by
+         * 32 MiB. Freeing the live allocation does not return that backing. */
+        auto *grown = pool.allocate(stream, 8 * mib);
+        pool.deallocate(stream, grown, 8 * mib);
+        assert(raw() == 16 * mib && cuvs_build_physical_refuse(raw()));
+        pool.deallocate(stream, resident, 31 * mib);
+        std::puts("PASS RMM fold can reuse backing, cannot grow it; ungated backing persists after free");
+    }
+#endif
     std::puts("PASS real RMM quota X=4096, successful backoff clears X, final failed X=3072 != logical 3000");
 }

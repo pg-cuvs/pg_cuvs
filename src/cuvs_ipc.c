@@ -968,7 +968,7 @@ page_overlay_exchange(const char *socket_path, CuvsCmdFrame *cmd, CuvsPageOverla
     *count = 0;
     *latency_us = 0;
     memset(progress, 0, sizeof(*progress));
-    if (cmd->dim == 0 || cmd->dim > 65535 || cmd->n_vecs > 1024 || cmd->k > 4000)
+    if (cmd->dim == 0 || cmd->dim > 65535 || cmd->n_vecs > 1024 || cmd->k > CUVS_PAGE_SEARCH_MAX_K)
         return status;
     if (queries)
     {
@@ -1055,8 +1055,8 @@ done:
     return status;
 }
 
-int
-cuvs_ipc_supply_pages(const char *socket_path, uint32_t db_oid, uint32_t index_oid,
+static int
+page_overlay_supply(const char *socket_path, uint32_t db_oid, uint32_t index_oid,
     const CuvsPageOverlayRequest *request, int dim, uint32_t metric,
     const CuvsPageSupplement *supplement, CuvsPageProgress *progress)
 {
@@ -1068,13 +1068,31 @@ cuvs_ipc_supply_pages(const char *socket_path, uint32_t db_oid, uint32_t index_o
 
     if (!progress)
         return CUVS_STATUS_ERROR;
-    if (!supplement)
-    {
-        memset(progress, 0, sizeof(*progress));
-        return CUVS_STATUS_ERROR;
-    }
     return page_overlay_exchange(socket_path, &cmd, &frame, NULL,
                                   supplement, NULL, &count, &latency_us, progress);
+}
+
+int
+cuvs_ipc_supply_pages(const char *socket_path, uint32_t db_oid, uint32_t index_oid,
+    const CuvsPageOverlayRequest *request, int dim, uint32_t metric,
+    const CuvsPageSupplement *supplement, CuvsPageProgress *progress)
+{
+    if (!supplement)
+    {
+        if (progress)
+            memset(progress, 0, sizeof(*progress));
+        return CUVS_STATUS_ERROR;
+    }
+    return page_overlay_supply(socket_path, db_oid, index_oid, request, dim, metric, supplement, progress);
+}
+
+int
+cuvs_ipc_query_page_supply(const char *socket_path, uint32_t db_oid, uint32_t index_oid,
+    const CuvsPageOverlayRequest *request, int dim, uint32_t metric, CuvsPageProgress *progress)
+{
+    if (request->base.tail != request->from)
+        return CUVS_STATUS_ERROR;
+    return page_overlay_supply(socket_path, db_oid, index_oid, request, dim, metric, NULL, progress);
 }
 
 int
@@ -1263,27 +1281,50 @@ page_fold_exchange(const char *socket_path, CuvsCmdFrame *cmd,
     return status;
 }
 
-int
-cuvs_ipc_page_fold_ready(const char *socket_path, uint32_t db_oid,
-                         uint64_t system_identifier, uint64_t boot_id, CuvsPageFoldEvent *event)
+static int
+page_fold_ready(const char *socket_path, uint32_t db_oid, uint32_t index_oid,
+                uint64_t index_nonce, uint64_t system_identifier, uint64_t boot_id,
+                CuvsPageFoldEvent *event)
 {
-    CuvsCmdFrame cmd = {.op = CUVS_OP_FOLD_READY, .db_oid = db_oid};
-    CuvsPageFoldQuery query = {.length = sizeof(query), .system_identifier = system_identifier,
-                              .boot_id = boot_id};
+    CuvsCmdFrame cmd = {.op = CUVS_OP_FOLD_READY, .db_oid = db_oid, .index_oid = index_oid};
+    struct {
+        CuvsPageFoldQuery query;
+        uint64_t index_nonce;
+    } payload = {.query = {.system_identifier = system_identifier, .boot_id = boot_id},
+                 .index_nonce = index_nonce};
     CuvsPageFoldEvent candidate;
     int status;
 
     forget_reply();
-    if (!event || !db_oid || !system_identifier || !boot_id)
+    if (!event || !db_oid || !system_identifier || !boot_id || (!!index_oid != !!index_nonce))
         return CUVS_STATUS_ERROR;
-    status = page_fold_exchange(socket_path, &cmd, &query, sizeof(query), &candidate);
+    payload.query.length = index_oid ? sizeof(payload) : sizeof(payload.query);
+    status = page_fold_exchange(socket_path, &cmd, &payload, payload.query.length, &candidate);
     if (status != CUVS_STATUS_OK)
         return status;
     if (!cuvs_page_fold_event_valid(&candidate) || candidate.db_oid != db_oid ||
+        (index_oid && (candidate.index_oid != index_oid || candidate.index_nonce != index_nonce)) ||
         candidate.system_identifier != system_identifier || candidate.boot_id != boot_id)
         return CUVS_STATUS_ERROR;
     *event = candidate;
     return CUVS_STATUS_OK;
+}
+
+int
+cuvs_ipc_page_fold_ready_index(const char *socket_path, uint32_t db_oid, uint32_t index_oid,
+                               uint64_t index_nonce, uint64_t system_identifier, uint64_t boot_id,
+                               CuvsPageFoldEvent *event)
+{
+    if (!index_oid)
+        return CUVS_STATUS_ERROR;
+    return page_fold_ready(socket_path, db_oid, index_oid, index_nonce, system_identifier, boot_id, event);
+}
+
+int
+cuvs_ipc_page_fold_ready(const char *socket_path, uint32_t db_oid,
+                         uint64_t system_identifier, uint64_t boot_id, CuvsPageFoldEvent *event)
+{
+    return page_fold_ready(socket_path, db_oid, 0, 0, system_identifier, boot_id, event);
 }
 
 int

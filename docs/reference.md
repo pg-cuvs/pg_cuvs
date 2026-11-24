@@ -529,11 +529,59 @@ cagra/ivfpq") rather than silently failing.
 uses page storage only when its result type declares `vector(n)` with
 `1 ≤ n ≤ 2030`; an expression without a declared dimension or above that limit
 uses legacy storage, regardless of table contents, TRUNCATE, or REINDEX. Pending
-page records hold the vector evaluated by PostgreSQL. After a future fold moves
-those records into TID slots, graph recovery must reevaluate the expression. If
-that evaluation fails, recovery must leave searches on the exact heap path;
-GPU search can remain unavailable until the row is removed or the index is
-rebuilt. This fold/recovery path is not implemented in this slice.
+page records hold the vector evaluated by PostgreSQL. Folded records use TID
+slots. Rebuilding the graph from those slots requires reevaluating the expression.
+
+**Experimental page-format fold (`PGCUVS_BETA3A_GPU_FOLD=1`).** Build both the
+extension and daemon with this option and `CUVS_PAGE_FORMAT=1`, using the
+matching cuVS `cpp/src` tree as `CUVS_BETA3A_SDK_SOURCE`. The fold option defaults
+to `0`. On a preloaded primary, `SELECT pg_cuvs_compact('index_name');` can
+supply committed pending rows or publish one ready fold for the specified
+page-format CAGRA index. The function uses the existing index-owner check and
+reports the outcome as a `NOTICE`. Repeat the call to publish a candidate that
+was still being prepared. Use a writable statement outside a transaction
+block or subtransaction. Folding requires an existing base GPU graph. After a
+daemon or PostgreSQL restart, PostgreSQL
+retains the WAL-published page state and can use exact heap search if the
+matching GPU graph is unavailable.
+Set the daemon's `--page-overlay-host-bytes` to cover the supplied overlay,
+packed input and the fold's host copies of the expanded dataset and graph.
+With the RMM pool enabled, a fold reuses the pool's existing backing and can
+defer when that backing cannot satisfy its allocations. A fold cannot grow the
+pool's backing, which could stay resident after the fold yields to a build.
+
+The daemon preserves the parent and candidate under memory pressure once it
+has selected a `FOLD_READY` reply for transmission. The graphs stay protected
+until the matching `FOLD_COMMITTED` or a PostgreSQL lifetime change. A lost
+reply or acknowledgment can therefore leave two graphs resident. Competing
+builds in that interval can receive existing admission rejections, including
+`AR8` when the RMM pool cannot provide the required capacity. The foreground
+zero-new-rejections gate covers requests without memory pressure during the
+GPU fold before READY. Zero new rejections under pressure, including the
+READY-to-COMMITTED interval, will be revalidated in γ.
+
+Known admission limits of the experimental flag (sizes in MiB):
+
+- BUILD placement can choose a GPU without accounting for the RMM headroom
+  that the actual admission check requires. For two GPUs with budget and
+  quota 2,048 each, a BUILD needing 1,280 and headroom 256, GPU 0 can admit
+  the build by evicting an eligible LRU of 1,280 out of its 1,536 used. GPU 1
+  uses 1,537, including an unoffered candidate of 641 and eligible LRU of
+  256. Together they cover the placement shortfall of 769. They cannot
+  cover the actual pool shortfall of 1,025, so placement on GPU 1 can still
+  return `AR8`.
+- A legacy EXTEND can wait for a fold on GPU 0 while UNLOAD then LOAD moves
+  its index to GPU 1. With 1,537 used on GPU 1, a 600 increase and a 2,048
+  cap, the request is short by 89. An unoffered candidate of 513 on GPU 1
+  stays in place because the request waited on GPU 0, so EXTEND returns the
+  existing status 5 (`not enough VRAM for extend`).
+- With RMM, discarding an unoffered candidate of at least 16 can reduce the
+  live ledger while the pool keeps its backing. If raw free memory remains
+  16 after the discard, the unchanged 32 MiB floor can still reject the
+  build with `PHYS`.
+
+Sustained inserts can still drive search p99 into seconds when pending rows
+force exact heap search.
 
 ### `ivfpq`
 

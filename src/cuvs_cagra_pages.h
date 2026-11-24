@@ -123,6 +123,9 @@ CuvsCagraFoldStatus cuvs_cagra_prepare_fold(Relation index,
  * caller may send FOLD_COMMITTED after this result. */
 CuvsCagraFoldStatus cuvs_cagra_publish_fold(Relation index,
                         const CuvsCagraFoldCandidate *candidate, XLogRecPtr *commit_lsn);
+#ifdef CUVS_CAGRA_FOLD_ENABLED
+void cuvs_cagra_run_fold_worker(Relation index);
+#endif
 CuvsCagraSlotResult cuvs_cagra_pending_tid(Relation index, const CuvsCagraMeta *meta,
                                          BlockNumber nblocks, BlockNumber block,
                                          uint64 position, ItemPointer tid);

@@ -83,16 +83,19 @@ make_event(void)
 }
 
 static uint32_t
-ready(uint32_t db, uint64_t system, uint64_t boot, CuvsPageFoldEvent *event)
+ready_for(uint32_t db, uint32_t index, uint64_t nonce,
+          uint64_t system, uint64_t boot, CuvsPageFoldEvent *event)
 {
-    CuvsCmdFrame cmd = {.op = CUVS_OP_FOLD_READY, .db_oid = db};
-    CuvsPageFoldQuery request = {.length = sizeof(request), .system_identifier = system,
+    CuvsCmdFrame cmd = {.op = CUVS_OP_FOLD_READY, .db_oid = db, .index_oid = index};
+    CuvsPageFoldQuery request = {.length = sizeof(request) + (index ? sizeof(nonce) : 0), .system_identifier = system,
                                  .boot_id = boot};
     CuvsReplyHeader reply;
     int pair[2];
 
     CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, pair) == 0);
     CHECK(send_all(pair[0], &request, sizeof(request)) == 0);
+    if (index)
+        CHECK(send_all(pair[0], &nonce, sizeof(nonce)) == 0);
     handle_page_fold_ready(pair[1], &cmd);
     close(pair[1]);
     CHECK(recv_all(pair[0], &reply, sizeof(reply)) == 0);
@@ -101,6 +104,12 @@ ready(uint32_t db, uint64_t system, uint64_t boot, CuvsPageFoldEvent *event)
     CHECK(recv(pair[0], &request, 1, 0) == 0);
     close(pair[0]);
     return reply.status;
+}
+
+static uint32_t
+ready(uint32_t db, uint64_t system, uint64_t boot, CuvsPageFoldEvent *event)
+{
+    return ready_for(db, 0, 0, system, boot, event);
 }
 
 static uint32_t
@@ -514,6 +523,12 @@ test_ready_visits_other_indexes(void)
     page_graph_fold_unpin(&left_pin);
     page_graph_fold_unpin(&right_pin);
 
+    CHECK(ready_for(2, 8, first.index_nonce, 1, 6, &event) == CUVS_STATUS_NOT_FOUND);
+    CHECK(ready_for(2, first.index_oid, second.index_nonce, 1, 6, &event) == CUVS_STATUS_NOT_FOUND);
+    CHECK(ready_for(2, second.index_oid, second.index_nonce, 1, 6, &event) == CUVS_STATUS_OK);
+    CHECK(memcmp(&event, &second, sizeof(event)) == 0);
+    CHECK(ready_for(2, first.index_oid, first.index_nonce, 1, 6, &event) == CUVS_STATUS_OK);
+    CHECK(memcmp(&event, &first, sizeof(event)) == 0);
     CHECK(ready(2, 1, 6, &event) == CUVS_STATUS_OK);
     first_oid = event.index_oid;
     CHECK(ready(2, 1, 6, &event) == CUVS_STATUS_OK);

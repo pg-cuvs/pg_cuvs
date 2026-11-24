@@ -40,10 +40,10 @@ copy_visible_vector(TupleTableSlot *slot, AttrNumber attribute, uint32 dim, floa
     return valid;
 }
 
-bool
-cuvs_cagra_local_supplement(Relation index, Relation heap, Snapshot snapshot,
-                            const CuvsCagraMeta *meta, BlockNumber blocks,
-                            uint64 from, uint64 upto, CuvsPageSupplement *supplement)
+static bool
+copy_supplement(Relation index, Relation heap, Snapshot snapshot,
+                const CuvsCagraMeta *meta, BlockNumber blocks, uint64 from,
+                uint64 upto, CuvsPageSupplement *supplement, bool shared)
 {
     bool expression = (meta->flags & CUVS_CAGRA_PENDING_VECTOR) != 0;
     AttrNumber attribute = index->rd_index->indkey.values[0];
@@ -81,6 +81,13 @@ cuvs_cagra_local_supplement(Relation index, Relation heap, Snapshot snapshot,
             table_index_fetch_reset(fetch);
             if (!table_index_fetch_tuple(fetch, &items[i].tid, snapshot, slot, &again, &dead))
             {
+                /* A different snapshot may still see this row. Only a
+                 * physically invalid pending TID is a shared dead slot. */
+                if (shared)
+                {
+                    count = i;
+                    break;
+                }
                 marks[i].state = CUVS_PAGE_POSITION_INVISIBLE;
                 continue;
             }
@@ -110,6 +117,24 @@ cuvs_cagra_local_supplement(Relation index, Relation heap, Snapshot snapshot,
         .positions = count, .vector_rows = packed};
     return true;
 }
+
+bool
+cuvs_cagra_local_supplement(Relation index, Relation heap, Snapshot snapshot,
+                            const CuvsCagraMeta *meta, BlockNumber blocks,
+                            uint64 from, uint64 upto, CuvsPageSupplement *supplement)
+{
+    return copy_supplement(index, heap, snapshot, meta, blocks, from, upto, supplement, false);
+}
+
+#ifdef CUVS_CAGRA_FOLD_ENABLED
+bool
+cuvs_cagra_fold_supplement(Relation index, Relation heap, Snapshot snapshot,
+                           const CuvsCagraMeta *meta, BlockNumber blocks,
+                           uint64 from, uint64 upto, CuvsPageSupplement *supplement)
+{
+    return copy_supplement(index, heap, snapshot, meta, blocks, from, upto, supplement, true);
+}
+#endif
 
 void
 cuvs_cagra_free_supplement(CuvsPageSupplement *supplement)
