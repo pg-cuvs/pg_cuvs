@@ -13187,11 +13187,12 @@ page_fold_result_locked(const CuvsPageFoldResult *result)
             return CUVS_STATUS_OK;
         }
 
-        /* Move the overlay reference, including supply since READY. Requests
-         * already scoring the old prefix own their own chunk reference. */
+        /* Move the unpublished suffix, including supply since READY. */
         parent->fold_candidate = NULL;
         candidate->overlay = parent->overlay;
         parent->overlay = (CuvsPageOverlay) {0};
+        defer_page_overlay_release(
+            cuvs_page_overlay_advance_fold(&candidate->overlay, candidate->folded));
         candidate->retired_boots = parent->retired_boots;
         parent->retired_boots = NULL;
         candidate->fold_lsn = result->transition_lsn;

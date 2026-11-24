@@ -255,6 +255,87 @@ test_discard_drop_and_boot(void)
     puts("PASS DISCARD, boot ABA and DROP invalidate the exact pending graph");
 }
 
+static CuvsPageOverlayChunk *
+supply_dead_positions(PageCagraGraph *parent, uint32_t positions)
+{
+    CuvsPageOverlayRequest request = {
+        .base = {.folded = parent->folded, .tail = parent->overlay.covered_upto + positions},
+        .boot_id = parent->overlay.boot_id, .from = parent->overlay.covered_upto,
+        .positions = positions
+    };
+    CuvsPageOverlayChunk *chunk, *obsolete, *head;
+
+    CHECK(cuvs_page_overlay_alloc(&g_page_overlay_budget, &request,
+                                  positions * sizeof(*chunk->marks), &chunk) == CUVS_STATUS_OK);
+    for (uint32_t i = 0; i < positions; ++i)
+        chunk->marks[i] = (CuvsPagePosition) {.state = CUVS_PAGE_POSITION_DEAD};
+    head = chunk;
+    CHECK(cuvs_page_overlay_supply(&parent->overlay, &request, &chunk, &obsolete) == CUVS_STATUS_OK);
+    CHECK(!chunk && !obsolete);
+    return head;
+}
+
+static void
+test_committed_reclaims_folded_overlay(void)
+{
+    FoldHandle handles[4] = {{0}};
+    PageCagraGraph *parent;
+
+    pthread_mutex_lock(&g_index_mutex);
+    parent = make_parent(&handles[0]);
+    parent->overlay.covered_upto = 0;
+    pthread_mutex_unlock(&g_index_mutex);
+
+    for (int i = 1; i <= 3; ++i)
+    {
+        PageGraphFoldRef pin = {0};
+        CuvsPageFoldEvent event = make_event();
+        CuvsPageOverlayChunk *fresh, *prefix;
+        uint64_t folded;
+        size_t suffix_bytes;
+        bool reading = i == 3;
+
+        pthread_mutex_lock(&g_index_mutex);
+        event.parent_graph_nonce = parent->graph_nonce;
+        event.parent_n_slots = parent->n_slots;
+        event.parent_folded = parent->folded;
+        event.graph_nonce += i;
+        folded = parent->folded + event.positions;
+        prefix = supply_dead_positions(parent, folded - parent->overlay.covered_upto);
+        fresh = supply_dead_positions(parent, 1);
+        suffix_bytes = fresh->charged_bytes;
+        if (reading)
+            cuvs_page_overlay_retain(fresh);
+        CHECK(page_graph_fold_pin_locked(parent, &pin) == &handles[i - 1]);
+        CHECK(page_graph_register_fold_locked(&pin, &event, &handles[i], 80));
+        pthread_mutex_unlock(&g_index_mutex);
+        page_graph_fold_unpin(&pin);
+
+        CHECK(fold_result(CUVS_OP_FOLD_COMMITTED, 2, event, 90 + i) == CUVS_STATUS_OK);
+        parent = g_page_graphs;
+        if (!reading)
+        {
+            CHECK(parent->overlay.head == fresh && !fresh->next);
+            CHECK(parent->overlay.covered_upto == folded + 1);
+            CHECK(g_page_overlay_budget.used == suffix_bytes);
+        }
+        else
+        {
+            CHECK(!parent->overlay.head && parent->overlay.covered_upto == folded);
+            CHECK(fresh->next == prefix && prefix->from < folded);
+            CHECK(g_page_overlay_budget.used > suffix_bytes);
+            cuvs_page_overlay_release(fresh);
+            CHECK(!g_page_overlay_budget.used);
+            pthread_mutex_lock(&g_index_mutex);
+            CHECK(supply_dead_positions(parent, 1)->from == folded);
+            pthread_mutex_unlock(&g_index_mutex);
+        }
+    }
+    drop_index();
+    CHECK(!g_page_overlay_budget.used);
+    puts("PASS repeated COMMITTED reclaims folded chunks without shortening a pinned reader");
+}
+
 static uint32_t
 page_search(bool overlay, CuvsPageOverlayRequest request, CuvsPageOverlayResult *rows, int *n)
 {
@@ -538,6 +619,7 @@ main(void)
     g_page_overlay_budget.limit = 4096;
     test_commit();
     test_discard_drop_and_boot();
+    test_committed_reclaims_folded_overlay();
     test_search_before_and_after_ack();
     test_ready_visits_other_indexes();
     test_delayed_older_boot_preserves_current_fold();
