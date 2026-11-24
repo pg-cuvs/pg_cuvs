@@ -2023,6 +2023,60 @@ cuvs_warn_pgvector_version(void)
 /* ================================================================
  * Main SQL function
  * ================================================================ */
+static int
+hnsw_compare_tid(const void *a, const void *b)
+{
+    uint64_t x = *(const uint64_t *) a;
+    uint64_t y = *(const uint64_t *) b;
+
+    return (x > y) - (x < y);
+}
+
+static void
+hnsw_require_unique_tids(const uint64_t *tids, size_t n)
+{
+    uint64_t *ordered;
+    size_t i;
+
+    if (n < 2)
+        return;
+    /* Heap-order builds are already sorted. Preserve graph label order
+     * when an EXTEND or a parallel build needs a separate sort. */
+    for (i = 1; i < n && tids[i - 1] < tids[i]; i++)
+        ;
+    if (i == n)
+        return;
+    ordered = palloc_extended(n * sizeof(*ordered), MCXT_ALLOC_HUGE);
+    memcpy(ordered, tids, n * sizeof(*ordered));
+    qsort(ordered, n, sizeof(*ordered), hnsw_compare_tid);
+    for (i = 1; i < n && ordered[i - 1] != ordered[i]; i++)
+        ;
+    pfree(ordered);
+    if (i != n)
+        ereport(ERROR,
+                (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+                 errmsg("pg_cuvs: source CAGRA index has duplicate heap TIDs"),
+                 errhint("REINDEX the source CAGRA index before converting it, or build the HNSW index from the heap.")));
+}
+
+static void
+hnsw_check_exported_tids(HnswFillRes *res)
+{
+    FILE *file = hnsw_open_stream("exported CAGRA TIDs", res->tids_fd);
+    CuvsTidsHeader header;
+    int rc;
+
+    if (file == NULL)
+        ereport(ERROR, (errmsg("pg_cuvs: cannot open exported CAGRA TIDs: %m")));
+    rc = cuvs_tids_read(file, &header, &res->tids);
+    fclose(file);
+    if (rc != 0)
+        ereport(ERROR, (errmsg("pg_cuvs: invalid exported CAGRA TIDs")));
+    hnsw_require_unique_tids(res->tids, (size_t) header.n_vecs);
+    free(res->tids);
+    res->tids = NULL;
+}
+
 static bool
 hnsw_source_binding_matches(const char *graph_path, FILE *graph, FILE *tids)
 {
@@ -2176,7 +2230,7 @@ fill_hnsw_from_hnswlib_impl(Oid cagra_oid, Oid hnsw_oid, bool use_shm,
             ereport(ERROR, (errmsg("pg_cuvs: daemon socket not set")));
         int shm_rc = cuvs_ipc_export_hnsw_shm(
             cuvs_socket_path, db_oid, index_oid, hnsw_path, sizeof(hnsw_path),
-            &res->shm_fd);
+            &res->shm_fd, &res->tids_fd);
         if (shm_rc != CUVS_STATUS_OK)
         {
             cuvs_report_proto_mismatch(shm_rc);
@@ -2184,8 +2238,7 @@ fill_hnsw_from_hnswlib_impl(Oid cagra_oid, Oid hnsw_oid, bool use_shm,
                     (errmsg("pg_cuvs: export_hnsw_shm failed (status=%d); "
                             "ensure cagra index %u is loaded in daemon", shm_rc, cagra_oid)));
         }
-        /* .tids comes from the regular index_dir sidecar */
-        snprintf(tids_path, sizeof(tids_path), "%s/%u_%u.tids", idir, db_oid, index_oid);
+        snprintf(tids_path, sizeof(tids_path), "exported CAGRA TIDs");
     }
     else
     {
@@ -2202,7 +2255,8 @@ fill_hnsw_from_hnswlib_impl(Oid cagra_oid, Oid hnsw_oid, bool use_shm,
     res->hf = hf;
 
     /* Read the matching TID file before parsing the graph. */
-    FILE *tf = fopen(tids_path, "rb");
+    FILE *tf = use_shm ? hnsw_open_stream(tids_path, res->tids_fd)
+                      : AllocateFile(tids_path, PG_BINARY_R);
     if (!tf)
     {
         ereport(ERROR,
@@ -2212,7 +2266,7 @@ fill_hnsw_from_hnswlib_impl(Oid cagra_oid, Oid hnsw_oid, bool use_shm,
 
     if (!use_shm && !hnsw_source_binding_matches(hnsw_path, hf, tf))
     {
-        fclose(tf);
+        FreeFile(tf);
         ereport(ERROR,
                 (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
                  errmsg("pg_cuvs: hnswlib_file sidecar has no matching CAGRA generation binding"),
@@ -2221,15 +2275,19 @@ fill_hnsw_from_hnswlib_impl(Oid cagra_oid, Oid hnsw_oid, bool use_shm,
 
     CuvsTidsHeader tids_hdr;
     uint64_t      *tids = NULL;
-    if (cuvs_tids_read(tf, &tids_hdr, &tids) != 0)
-    {
+    int tids_rc = cuvs_tids_read(tf, &tids_hdr, &tids);
+    if (use_shm)
         fclose(tf);
+    else
+        FreeFile(tf);
+    if (tids_rc != 0)
+    {
         ereport(ERROR,
                 (errmsg("pg_cuvs: failed to read/validate .tids sidecar \"%s\"",
                         tids_path)));
     }
-    fclose(tf);
     res->tids = tids;
+    hnsw_require_unique_tids(tids, (size_t) tids_hdr.n_vecs);
 
     HnswlibHeader hdr;
     memset(&hdr, 0, sizeof(hdr));
@@ -3973,6 +4031,7 @@ fill_hnsw_from_cagra_ipc_impl(Oid cagra_oid, Oid hnsw_oid, const char *mode,
             build.n_vecs  = up_n;
             build.dim     = (uint32_t) up_dim;
             build.metric  = tgt_metric;
+            hnsw_check_exported_tids(res);
             target = index_open(hnsw_oid, AccessExclusiveLock);
             hnsw_import_build_result(target, &build, false, false);
             index_close(target, AccessExclusiveLock);
@@ -4025,6 +4084,7 @@ fill_hnsw_from_cagra_ipc_impl(Oid cagra_oid, Oid hnsw_oid, const char *mode,
     res->adj  = adj;
     res->vecs = vecs;
     res->tids = tids;
+    hnsw_require_unique_tids(tids, N);
 
     /* Metric mismatch check */
     if (src_metric != tgt_metric)

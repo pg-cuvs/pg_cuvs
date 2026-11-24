@@ -8946,6 +8946,13 @@ handle_drop(int client_fd, const CuvsCmdFrame *cmd)
 
     /* Free the resident entry (if any) and compact the registry. */
     IndexEntry *e = find_index(db, idx);
+    if (e && e->handle && e->inflight > 0)
+    {
+        pthread_mutex_unlock(&g_index_mutex);
+        send_error_code(client_fd, CUVS_STATUS_BUILD_FAILED,
+                        "source graph is being exported; retry drop");
+        return;
+    }
     if (e)
     {
         free_delta_cache(e);
@@ -9192,11 +9199,43 @@ handle_export_adjacency(int client_fd, const CuvsCmdFrame *cmd)
  * /dev/shm path in reply.error[] so the backend can open and parse it,
  * then unlink after reading.
  * ---------------------------------------------------------------- */
+static int
+hnsw_export_tids_fd(int64_t n, uint32_t dim, uint32_t metric, const uint64_t *tids)
+{
+    int fd = memfd_create("pg_cuvs_hnsw_tids", MFD_CLOEXEC | MFD_ALLOW_SEALING);
+    int writer;
+    FILE *file;
+    bool ok;
+
+    if (fd < 0)
+        return -1;
+    writer = dup(fd);
+    file = writer >= 0 ? fdopen(writer, "wb") : NULL;
+    if (file == NULL)
+    {
+        if (writer >= 0) close(writer);
+        close(fd);
+        return -1;
+    }
+    ok = cuvs_tids_write(file, n, dim, metric, tids) == 0;
+    if (fclose(file) != 0)
+        ok = false;
+    if (!ok || fcntl(fd, F_ADD_SEALS,
+                     F_SEAL_WRITE | F_SEAL_GROW | F_SEAL_SHRINK | F_SEAL_SEAL) != 0)
+    {
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
+
 static void
 handle_export_hnsw_shm(int client_fd, const CuvsCmdFrame *cmd)
 {
     uint32_t db  = cmd->db_oid;
     uint32_t idx = cmd->index_oid;
+    bool paired = cmd->k == CUVS_HNSW_EXPORT_PAIRED;
+    int tids_fd = -1;
 
     pthread_mutex_lock(&g_index_mutex);
     IndexEntry *e = find_index(db, idx);
@@ -9259,14 +9298,22 @@ handle_export_hnsw_shm(int client_fd, const CuvsCmdFrame *cmd)
         send_error_code(client_fd, CUVS_STATUS_NOT_FOUND, "index evicted during export");
         return;
     }
+    /* SQL holds an AccessShareLock on the source index. The in-use guard
+     * also keeps EXTEND, COMPACT and eviction from changing its graph/TIDs. */
+    const uint64_t *source_tids = e->tids;
+    int64_t source_n = e->n_vecs;
+    uint32_t source_dim = e->dim;
+    uint32_t source_metric = e->metric;
     e->inflight++;
     g_unlocked_gpu_jobs++;
     pthread_mutex_unlock(&g_index_mutex);
     int hrc = cuvs_hnsw_serialize(handle, shm_path, gpu);
+    if (paired && hrc == CUVS_HNSW_SERIALIZE_OK)
+        tids_fd = hnsw_export_tids_fd(source_n, source_dim, source_metric, source_tids);
     pthread_mutex_lock(&g_index_mutex);
     g_unlocked_gpu_jobs--;
     e = find_index(db, idx);
-    if (e && e->inflight > 0)
+    if (e && e->handle == handle && e->inflight > 0)
         e->inflight--;
     pthread_mutex_unlock(&g_index_mutex);
     if (hrc != CUVS_HNSW_SERIALIZE_OK)
@@ -9283,6 +9330,12 @@ handle_export_hnsw_shm(int client_fd, const CuvsCmdFrame *cmd)
                             "index too small for an HNSW sidecar");
         else
             send_error(client_fd, "from_cagra/serialize failed");
+        return;
+    }
+    if (paired && tids_fd < 0)
+    {
+        close(mfd);
+        send_error(client_fd, "cannot export matching HNSW TIDs");
         return;
     }
 
@@ -9306,6 +9359,7 @@ handle_export_hnsw_shm(int client_fd, const CuvsCmdFrame *cmd)
     {
         LOG_ERROR("[handle_export_hnsw_shm] F_ADD_SEALS failed errno=%d\n", errno);
         close(mfd);
+        if (tids_fd >= 0) close(tids_fd);
         send_error(client_fd, "cannot seal hnsw sidecar");
         return;
     }
@@ -9321,12 +9375,16 @@ handle_export_hnsw_shm(int client_fd, const CuvsCmdFrame *cmd)
      */
     CuvsReplyHeader reply = {0};
     reply.status = CUVS_STATUS_OK;
+    reply.n_results = paired ? 2 : 0;
     /* error[] carries a label for log correlation only (#165); there is no
      * longer a filesystem path to report. */
     snprintf(reply.error, sizeof(reply.error), "memfd:pg_cuvs_hnsw %u/%u", db, idx);
     if (cuvs_fd_send(client_fd, mfd, &reply, sizeof(reply)) != 0)
         LOG_ERROR("[handle_export_hnsw_shm] fd handoff failed for %u/%u\n", db, idx);
+    else if (paired && cuvs_fd_send(client_fd, tids_fd, "", 1) != 0)
+        LOG_ERROR("[handle_export_hnsw_shm] TID handoff failed for %u/%u\n", db, idx);
     close(mfd);
+    if (tids_fd >= 0) close(tids_fd);
 }
 
 static int
@@ -10513,6 +10571,15 @@ handle_extend(int client_fd, const CuvsCmdFrame *cmd)
     int64_t  old_n = e->n_vecs;
     int64_t  n_new = cmd->n_vecs;
 
+    if (e->inflight > 0)
+    {
+        pthread_mutex_unlock(&g_index_mutex);
+        munmap(mem, total);
+        send_error_code(client_fd, CUVS_STATUS_BUILD_FAILED,
+                        "source graph is being exported; buffer the insert in delta");
+        return;
+    }
+
     /* Pre-flight VRAM budget check.
      * Cannot call ensure_vram here: evict_lru shifts g_indexes[], invalidating
      * this IndexEntry *e pointer.  A budget-only check is sufficient — the
@@ -10684,6 +10751,15 @@ handle_compact(int client_fd, const CuvsCmdFrame *cmd)
         free(dead_tids);
         send_error_code(client_fd, CUVS_STATUS_NOT_FOUND,
                         "CAGRA index not loaded for compact");
+        return;
+    }
+
+    if (e->inflight > 0)
+    {
+        pthread_mutex_unlock(&g_index_mutex);
+        free(dead_tids);
+        send_error_code(client_fd, CUVS_STATUS_BUILD_FAILED,
+                        "source graph is being exported; retry compaction");
         return;
     }
 

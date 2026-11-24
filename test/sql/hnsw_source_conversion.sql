@@ -164,6 +164,28 @@ SELECT pg_temp.check_conversion(
     'pending deletes') AS tombstone_rejected;
 DROP TABLE hsc_tomb;
 
+-- VACUUM cannot see an EXTEND-only row in the build-time TID file. Reusing
+-- the slot leaves two exported vectors for one heap TID.
+CREATE TABLE hsc_reuse (id int PRIMARY KEY, v vector(3)) WITH (autovacuum_enabled = off);
+INSERT INTO hsc_reuse SELECT g, ARRAY[g,0,0]::real[]::vector FROM generate_series(1,100) g;
+CREATE INDEX hsc_reuse_src ON hsc_reuse USING cagra (v vector_l2_ops);
+INSERT INTO hsc_reuse VALUES (200, '[200,0,0]');
+CREATE TEMP TABLE hsc_reuse_old AS SELECT ctid AS old_tid FROM hsc_reuse WHERE id=200;
+DELETE FROM hsc_reuse WHERE id=200;
+VACUUM (INDEX_CLEANUP ON, TRUNCATE OFF) hsc_reuse;
+INSERT INTO hsc_reuse VALUES (1000, '[1000,0,0]');
+SELECT r.ctid=o.old_tid
+FROM hsc_reuse r, hsc_reuse_old o WHERE r.id=1000;
+SELECT extend_count=2 FROM pg_stat_gpu_search WHERE index_oid='hsc_reuse_src'::regclass;
+SELECT pg_temp.check_conversion(
+    'CREATE INDEX hsc_reuse_dst ON hsc_reuse USING pg_cuvs_hnsw (v vector_l2_ops) WITH (source = hsc_reuse_src)',
+    'hsc_reuse_dst', 'SELECT id FROM hsc_reuse ORDER BY v <-> ''[200,0,0]'' LIMIT 1',
+    'duplicate heap TIDs') AS duplicate_ddl_rejected,
+    pg_temp.check_conversion('SELECT pg_cuvs_build_hnsw(''hsc_reuse_src'', ''hnsw'')',
+    NULL, 'SELECT id FROM hsc_reuse ORDER BY v <-> ''[200,0,0]'' LIMIT 1',
+    'duplicate heap TIDs') AS duplicate_function_rejected;
+DROP TABLE hsc_reuse;
+
 -- C. Reuse dead heap slots while the source still has the old vectors.
 SET cuvs.max_delta_rows = 10000;
 CREATE TABLE hsc_stale (id int PRIMARY KEY, v vector(8)) WITH (autovacuum_enabled = off);

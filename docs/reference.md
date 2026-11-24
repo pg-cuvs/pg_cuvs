@@ -533,6 +533,9 @@ The `hnswlib_file` mode requires a build-time binding to the source CAGRA's TID
 file. A source mutation invalidates that binding. For an older or copied
 `.hnsw` file whose binding cannot be verified, run `REINDEX` after setting
 `cuvs.cpu_hnsw_fallback = on`, or choose `mode = 'nsw'` on a clean source.
+The in-memory `hnswlib` mode exports the graph and TIDs together. Restart the
+daemon after upgrading the extension so both support paired export. A source
+whose export contains duplicate heap TIDs requires a rebuild before conversion.
 
 For direct heap construction, `auto` uses tiny exact GPU construction below 16 rows and
 otherwise the resident IVF-PQ route while its estimate fits the host and GPU budgets.

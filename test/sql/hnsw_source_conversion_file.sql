@@ -33,6 +33,16 @@ CREATE INDEX hsc_file_dst ON hsc_file USING pg_cuvs_hnsw (v vector_l2_ops)
 SELECT to_regclass('hsc_file_dst') IS NULL;
 DROP INDEX IF EXISTS hsc_file_dst;
 
+-- The in-memory hnswlib export has the EXTENDed row and must carry the same
+-- generation's TIDs. The original disk TID file still has only 100 rows.
+CREATE INDEX hsc_file_shm ON hsc_file USING pg_cuvs_hnsw (v vector_l2_ops)
+    WITH (source = hsc_file_src, mode = 'hnswlib');
+SET enable_seqscan = off;
+EXPLAIN (COSTS OFF) SELECT id FROM hsc_file ORDER BY v <-> '[500,500,500]' LIMIT 1;
+SELECT id FROM hsc_file ORDER BY v <-> '[500,500,500]' LIMIT 1;
+DROP INDEX hsc_file_shm;
+RESET enable_seqscan;
+
 -- The resident export sees that row. It remains a valid conversion source.
 CREATE INDEX hsc_file_nsw ON hsc_file USING pg_cuvs_hnsw (v vector_l2_ops)
     WITH (source = hsc_file_src, mode = 'nsw');
