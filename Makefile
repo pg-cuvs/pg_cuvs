@@ -1303,7 +1303,7 @@ EXTRA_CLEAN += test-lw-startup test-lw-startup-server
 .PHONY: test-lw-startup
 LW_SHIM_DAEMON_SRCS = src/pg_cuvs_server.c src/cuvs_ipc.c src/cuvs_util.c src/cuvs_objstore.c \
                       src/cuvs_build_corpus.c src/cuvs_wrapper_shim_cpu.c \
-                      src/cuvs_cache_policy.c src/cuvs_peak_meter.c src/cuvs_page_overlay.c
+                      src/cuvs_cache_policy.c src/cuvs_peak_meter.c src/cuvs_page_overlay.c src/cuvs_hnsw_upper.c
 test-lw-startup:
 	$(CC) -std=gnu11 -O1 -DPGCUVS_CPU_SHIM -D_POSIX_C_SOURCE=200809L -I src $(LW_SHIM_DAEMON_SRCS) \
 		-lm -lpthread -lrt -lcurl -lssl -lcrypto -o test-lw-startup-server

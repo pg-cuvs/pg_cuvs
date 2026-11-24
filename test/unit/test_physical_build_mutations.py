@@ -18,7 +18,7 @@ mutations = {
     "status_count_lost": (SERVER, "g_physical_build_rejects[dev]++;", "/* lost count */"),
     "sqlstate_permanent": ("cuvs_util.c", "if (reason == CUVS_ADMISSION_AR0)\n        return CUVS_ADMISSION_SQLSTATE_LIMIT;", "if (reason == CUVS_ADMISSION_AR0 || reason == CUVS_ADMISSION_PHYS)\n        return CUVS_ADMISSION_SQLSTATE_LIMIT;"),
     "hnsw_reply_lost": ("cuvs_ipc.c", "reply = wire.header;\n        remember_reply(&reply);", "reply = wire.header;"),
-    "hnsw_reply_stale": ("cuvs_ipc.c", "char token = 'O';\n    forget_reply();", "char token = 'O';"),
+    "hnsw_reply_stale": ("cuvs_ipc.c", "char token = 'O';\n    g_hnsw_backend_cancel = 0;\n    forget_reply();", "char token = 'O';\n    g_hnsw_backend_cancel = 0;"),
 }
 for name, call in {
     "single": 'physical_build_check(target_gpu, "BUILD", cmd, &rej)',

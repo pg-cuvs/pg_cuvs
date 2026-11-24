@@ -218,7 +218,8 @@ def build_and_run(tree):
         jobs['server'] = [CC, '-std=gnu11', '-O1', '-DPGCUVS_CPU_SHIM', '-D_POSIX_C_SOURCE=200809L',
                           '-I', 'src', 'src/pg_cuvs_server.c', 'src/cuvs_ipc.c', 'src/cuvs_util.c',
                           'src/cuvs_objstore.c', 'src/cuvs_build_corpus.c',
-                          'src/cuvs_wrapper_shim_cpu.c', 'src/cuvs_cache_policy.c', 'src/cuvs_peak_meter.c', 'src/cuvs_page_overlay.c', '-lm', '-lpthread', '-lrt', '-lcurl',
+                          'src/cuvs_wrapper_shim_cpu.c', 'src/cuvs_cache_policy.c', 'src/cuvs_peak_meter.c',
+                          'src/cuvs_page_overlay.c', 'src/cuvs_hnsw_upper.c', '-lm', '-lpthread', '-lrt', '-lcurl',
                           '-lssl', '-lcrypto', '-o', 'bin-server']
         jobs['startup'] = [CC, '-std=gnu11', '-Wall', '-Wextra', '-I', 'src', '-o', 'bin-startup',
                            'test/unit/test_lw_startup.c', 'src/cuvs_ipc.c', 'src/cuvs_util.c',

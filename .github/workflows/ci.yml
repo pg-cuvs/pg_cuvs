@@ -203,6 +203,14 @@ jobs:
           make installcheck-tier1 || { echo "===== regression.diffs ====="; cat test/regression.diffs; false; }
           make installcheck-isolation || { echo "===== isolation diffs ====="; cat test/output_iso/regression.diffs 2>/dev/null; cat test/regression.diffs 2>/dev/null; false; }
 
+      - name: Linux source and mutation checks
+        timeout-minutes: 25
+        env:
+          PGCUVS_CUVS_GIT: ${{ runner.temp }}/pgcuvs-sdk-check.git
+        run: |
+          export PATH=/usr/lib/postgresql/16/bin:$PATH
+          scripts/check-sdk-patch-path.sh --manual-checks
+
       # The ACE receipt / readback mutations (Makefile: test-hnsw-ace-quality-mutations)
       # build test-hnsw-converter, which needs the PostgreSQL server headers and Linux libc
       # (posix_fallocate, mkdtemp): it is red on macOS and the CPU-only job above has no
