@@ -297,6 +297,10 @@ jobs:
             /tmp/pg_cuvs_fault_daemon.log
             ${{ runner.temp }}/pgcuvs-manual-checks/*.log
             ${{ runner.temp }}/pgcuvs-manual-checks/summary.tsv
+            ${{ runner.temp }}/pgcuvs-manual-checks/**/COMMANDS.jsonl
+            ${{ runner.temp }}/pgcuvs-manual-checks/**/compile.log
+            ${{ runner.temp }}/pgcuvs-manual-checks/**/result.json
+            ${{ runner.temp }}/pgcuvs-manual-checks/**/server.log
           retention-days: 7
 
       - name: Stale scan integration (fresh shim daemon)

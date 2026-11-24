@@ -109,6 +109,17 @@ stop(Run *r)
     r->pid = -1;
 }
 
+static void
+require_start(Run *r, int tag, const char *const *flags, int flag_count)
+{
+    if (start(r, tag, flags, flag_count) != 0)
+    {
+        fprintf(stderr, "cannot start LW fixture %d: %s\n", tag, slurp(r->log));
+        stop(r);
+        exit(2);
+    }
+}
+
 static int
 pid_adj(pid_t pid)
 {
@@ -153,7 +164,7 @@ main(int argc, char **argv)
 
     /* 1. The default raises a low baseline and keeps one at or above it. */
     default_effective = baseline < CUVS_OOM_SCORE_ADJ_DEFAULT ? CUVS_OOM_SCORE_ADJ_DEFAULT : baseline;
-    CHECK(start(&r, 1, NULL, 0) == 0);
+    require_start(&r, 1, NULL, 0);
     CHECK(pid_adj(r.pid) == default_effective);
     snprintf(expect, sizeof(expect), baseline < default_effective ? "oom_score_adj=%d applied" :
              "oom_score_adj kept current %d", default_effective);
@@ -185,7 +196,7 @@ main(int argc, char **argv)
         explicit_value = baseline < 650 ? 650 : baseline + 1;
         snprintf(setting, sizeof(setting), "%d", explicit_value);
         snprintf(expect, sizeof(expect), "oom_score_adj=%d applied", explicit_value);
-        CHECK(start(&r, 2, flags, 8) == 0);
+        require_start(&r, 2, flags, 8);
         CHECK(pid_adj(r.pid) == explicit_value);
         CHECK(strstr(slurp(r.log), "managed large_workspace: cagra_build_overflow=error "
                                    "managed_overcommit=off lw_margin_permille=1300") != NULL);
@@ -198,7 +209,7 @@ main(int argc, char **argv)
     /* 3. A higher inherited value is kept, never lowered. */
     kept_value = baseline < 800 ? 800 : baseline;
     CHECK(set_own_adj(kept_value));
-    CHECK(start(&r, 3, NULL, 0) == 0);
+    require_start(&r, 3, NULL, 0);
     CHECK(pid_adj(r.pid) == kept_value);
     snprintf(expect, sizeof(expect), "oom_score_adj kept current %d", kept_value);
     CHECK(strstr(slurp(r.log), expect) != NULL);
@@ -210,7 +221,7 @@ main(int argc, char **argv)
     /* 4. 0 leaves the inherited value untouched. */
     {
         const char *flags[] = {"--oom-score-adj", "0"};
-        CHECK(start(&r, 4, flags, 2) == 0);
+        require_start(&r, 4, flags, 2);
         CHECK(pid_adj(r.pid) == kept_value);
         CHECK(strstr(slurp(r.log), "oom_score_adj not applied: value 0") != NULL);
         stop(&r);

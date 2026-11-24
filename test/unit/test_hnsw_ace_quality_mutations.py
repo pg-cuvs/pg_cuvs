@@ -58,6 +58,17 @@ MUTATIONS = {
 }
 
 
+def test_result(run):
+    output = (run.stdout + run.stderr).strip()
+    if run.returncode == 0:
+        return 'GREEN', output
+    if run.returncode == -signal.SIGABRT and 'Assertion' in run.stderr:
+        return 'RED', output
+    if run.returncode == 1 and any(line.startswith('FAIL') for line in output.splitlines()):
+        return 'RED', output
+    return 'UNEXPECTED-FAIL', output or f'exit {run.returncode}'
+
+
 def run_converter(tree):
     built = subprocess.run(['make', '-s', 'test-hnsw-converter-build'],
                            cwd=tree, capture_output=True, text=True, timeout=600)
@@ -65,11 +76,7 @@ def run_converter(tree):
         return 'BUILD-FAIL', built.stderr.strip()[-400:]
     run = subprocess.run(['./test-hnsw-converter'], cwd=tree, capture_output=True,
                          text=True, timeout=60)
-    if run.returncode == 0:
-        return 'GREEN', run.stdout.strip()
-    if run.returncode == -signal.SIGABRT and 'Assertion' in run.stderr:
-        return 'RED', run.stderr.strip()
-    return 'UNEXPECTED-FAIL', run.stderr.strip() or f'exit {run.returncode}'
+    return test_result(run)
 
 
 def copy_tree(dst):
@@ -88,8 +95,8 @@ def build_and_run(src, work, test):
     b = subprocess.run(argv, capture_output=True, timeout=120)
     if b.returncode:
         return 'BUILD-FAIL', b.stderr.decode(errors='replace')[-400:]
-    r = subprocess.run([str(exe)], capture_output=True, timeout=60)
-    return ('GREEN' if r.returncode == 0 else 'RED'), (r.stdout + r.stderr).decode(errors='replace')[-300:]
+    r = subprocess.run([str(exe)], capture_output=True, text=True, timeout=60)
+    return test_result(r)
 
 
 def main():
