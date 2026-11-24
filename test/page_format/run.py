@@ -322,6 +322,16 @@ def check_slots(cluster, source):
              "-lm", "-lpthread", "-lrt"], cluster.logs / "slots-build.log")
     cluster.run(binary, [cluster.socket, db, oid, sysid, *nonces_and_slots], "slots")
 
+    cluster.sql("beta1a", "ip-slots-meta", "-At", "-c", """
+        SELECT (SELECT oid FROM pg_database WHERE datname=current_database()),
+               'page_ip_idx'::regclass::oid, system_identifier,
+               encode(get_raw_page('page_ip_idx',0),'hex')
+          FROM pg_control_system();
+    """)
+    db, oid, sysid, raw = (cluster.logs / "main-ip-slots-meta.log").read_text().splitlines()[-1].split("|")
+    nonces_and_slots = struct.unpack_from("=QQQQ", bytes.fromhex(raw), 48)
+    cluster.run(binary, [cluster.socket, db, oid, sysid, *nonces_and_slots, "ip"], "slots-ip")
+
 
 def old_daemon_search(cluster):
     cluster.sql("beta1a", "old-daemon-search", "-c", """
@@ -639,6 +649,30 @@ def run(work, logs):
               flush=True)
 
 
+def run_slots_only(work, logs):
+    """Exercise the overlay IPC fixture with one private build and cluster."""
+    paths = {key: Path(subprocess.check_output([PG_CONFIG, "--" + key], text=True).strip())
+             for key in ("bindir", "pkglibdir", "sharedir")}
+    stage = work / "pg"
+    for path in paths.values():
+        shutil.copytree(path, stage / path.relative_to("/"), symlinks=True)
+    bindir = stage / paths["bindir"].relative_to("/")
+    source = work / "on"
+    copy_source(ROOT, source)
+    build(source, 1, logs / "build-on.log")
+    build(source, 1, logs / "install.log", install=stage)
+    cluster = Cluster(work / "main", bindir, logs)
+    with cluster.daemon(source / "pg_cuvs_server", "on"):
+        cluster.start()
+        try:
+            cluster.run("createdb", ["beta1a"], "createdb-beta1a")
+            cluster.file("beta1a", "beta1a")
+            check_slots(cluster, source)
+        finally:
+            cluster.stop()
+    print("Overlay IPC slots: PASS", flush=True)
+
+
 if __name__ == "__main__":
     pg_config = shutil.which(sys.argv[1])
     if pg_config is None:
@@ -648,4 +682,7 @@ if __name__ == "__main__":
         scratch = Path(directory)
         output = Path(os.environ.get("PAGE_TEST_OUTPUT", scratch / "logs")).resolve()
         output.mkdir(parents=True, exist_ok=True)
-        run(scratch, output)
+        if os.environ.get("PAGE_TEST_SLOTS_ONLY") == "1":
+            run_slots_only(scratch, output)
+        else:
+            run(scratch, output)

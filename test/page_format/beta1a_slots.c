@@ -4,6 +4,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <math.h>
 
 static uint64_t
 arg64(const char *text)
@@ -161,10 +162,143 @@ check_supply(const char *socket, uint32_t db, uint32_t index, CuvsPageSearchRequ
     return expect_overlay_search(socket, db, index, &request, NULL, 1, CUVS_STATUS_PAGE_NEED, 0);
 }
 
+static int
+check_merge_l2(const char *socket, uint32_t db, uint32_t index, CuvsPageSearchRequest base)
+{
+    const float query[2][8] = {{0}, {1,1,1,1,1,1,1,1}};
+    const float shared_vectors[2][8] = {{1,1,1,1,1,1,1,1}, {0}};
+    const float supplement_vector[8] = {0};
+    CuvsPagePosition shared_marks[2] = {
+        {.block = 66, .state = CUVS_PAGE_POSITION_VECTOR},
+        {.block = 67, .state = CUVS_PAGE_POSITION_VECTOR}
+    };
+    CuvsPagePosition supplement_marks[2] = {
+        {.state = CUVS_PAGE_POSITION_INVISIBLE},
+        {.block = 68, .state = CUVS_PAGE_POSITION_VECTOR}
+    };
+    CuvsPageSupplement shared = {shared_marks, &shared_vectors[0][0], 2, 2};
+    CuvsPageSupplement supplement = {supplement_marks, supplement_vector, 2, 1};
+    CuvsPageOverlayRequest request = {.base = base, .boot_id = 3, .from = 0};
+    CuvsPageProgress progress = {0};
+    CuvsPageOverlayResult results[520] = {0};
+    uint32_t latency;
+    int count = 0;
+
+    request.base.tail = 2;
+    if (cuvs_ipc_supply_pages(socket, db, index, &request, 8, CUVS_METRIC_L2,
+                              &shared, &progress) != CUVS_STATUS_OK || progress.covered_upto != 2)
+        return 1;
+    request.from = 1;  /* Cut the shared [0,2) chunk in its middle. */
+    request.base.tail = 3;
+    int status = cuvs_ipc_search_page_overlay(socket, db, index, &request, &query[0][0],
+        2, 8, 3, CUVS_METRIC_L2, 0, 0, 0, 0, 0, &supplement,
+        results, &count, &latency, &progress);
+    if (status != CUVS_STATUS_OK || count != 6 || progress.covered_upto != 2 ||
+        results[0].slot != base.n_slots + 2 || results[0].distance != 0 ||
+        results[1].slot != 0 || results[1].distance != 8 ||
+        results[2].slot != base.n_slots || results[2].distance != 8 ||
+        results[3].slot != 0 || results[4].slot != base.n_slots || results[5].slot != 1)
+    {
+        fprintf(stderr, "L2 mixed/cut/trim status=%d count=%d slots=%llu,%llu,%llu,%llu,%llu,%llu\n",
+            status, count, (unsigned long long) results[0].slot,
+            (unsigned long long) results[1].slot, (unsigned long long) results[2].slot,
+            (unsigned long long) results[3].slot, (unsigned long long) results[4].slot,
+            (unsigned long long) results[5].slot);
+        return 1;
+    }
+    status = cuvs_ipc_search_page_overlay(socket, db, index, &request, &query[0][0],
+        2, 8, 260, CUVS_METRIC_L2, 0, 0, 0, 0, 0, &supplement,
+        results, &count, &latency, &progress);
+    if (status != CUVS_STATUS_OK || count != 520 ||
+        results[258].slot != CUVS_PAGE_SLOT_INVALID ||
+        results[259].slot != CUVS_PAGE_SLOT_INVALID ||
+        results[518].slot != CUVS_PAGE_SLOT_INVALID ||
+        results[519].slot != CUVS_PAGE_SLOT_INVALID)
+    {
+        fprintf(stderr, "L2 batch short fill status=%d count=%d\n", status, count);
+        return 1;
+    }
+    return 0;
+}
+
+static int
+check_merge_ip(const char *socket, uint32_t db, uint32_t index, CuvsPageSearchRequest base)
+{
+    const float query[8] = {1,1,1,1,1,1,1,1};
+    const float shared_vectors[2][8] = {{0.45,0.45,0.45,0.45,0.45,0.45,0.45,0.45},
+                                         {0.75,0.75,0.75,0.75,0.75,0.75,0.75,0.75}};
+    const float supplement_vector[8] = {0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5};
+    const float weak_vector[8] = {0.15,0.15,0.15,0.15,0.15,0.15,0.15,0.15};
+    CuvsPagePosition shared_marks[2] = {
+        {.block = 76, .state = CUVS_PAGE_POSITION_VECTOR},
+        {.block = 77, .state = CUVS_PAGE_POSITION_VECTOR}
+    };
+    CuvsPagePosition supplement_marks[2] = {
+        {.state = CUVS_PAGE_POSITION_INVISIBLE},
+        {.block = 78, .state = CUVS_PAGE_POSITION_VECTOR}
+    };
+    CuvsPageSupplement shared = {shared_marks, &shared_vectors[0][0], 2, 2};
+    CuvsPageSupplement supplement = {supplement_marks, supplement_vector, 2, 1};
+    CuvsPageSupplement weak_supplement = {supplement_marks, weak_vector, 2, 1};
+    CuvsPageOverlayRequest request = {.base = base, .boot_id = 4, .from = 0};
+    CuvsPageProgress progress = {0};
+    CuvsResult old[4] = {0};
+    CuvsPageOverlayResult results[4] = {0};
+    uint32_t latency;
+    int count = 0;
+    int status = cuvs_ipc_search_pages(socket, db, index, &base, query, 1, 8, 4,
+        CUVS_METRIC_IP, 0, 0, 1, 0, 0, NULL, 0, old, &count, &latency);
+    if (status != CUVS_STATUS_OK || count != 4 || old[0].tid != 0 ||
+        fabsf(old[0].distance - (1.0f - 7.2f)) > 0.001f)
+    {
+        fprintf(stderr, "old CPU HNSW IP contract status=%d count=%d slot=%llu distance=%g\n",
+                status, count, (unsigned long long) old[0].tid, old[0].distance);
+        return 1;
+    }
+    request.base.tail = 2;
+    if (cuvs_ipc_supply_pages(socket, db, index, &request, 8, CUVS_METRIC_IP,
+                              &shared, &progress) != CUVS_STATUS_OK || progress.covered_upto != 2)
+        return 1;
+    request.from = 1;
+    request.base.tail = 3;
+    status = cuvs_ipc_search_page_overlay(socket, db, index, &request, query, 1, 8, 4,
+        CUVS_METRIC_IP, 0, 0, 1, 0, 0, &supplement,
+        results, &count, &latency, &progress);
+    if (status != CUVS_STATUS_OK || count != 4 || progress.covered_upto != 2 ||
+        results[0].slot != 0 || fabsf(results[0].distance - 7.2f) > 0.001f ||
+        results[1].slot != base.n_slots + 2 || results[1].distance != 4 ||
+        results[2].slot != 1 || fabsf(results[2].distance - 3.6f) > 0.001f ||
+        results[3].slot != base.n_slots || fabsf(results[3].distance - 3.6f) > 0.001f)
+    {
+        fprintf(stderr, "IP mixed/cut/order/trim status=%d count=%d slots=%llu,%llu,%llu,%llu distances=%g,%g,%g,%g\n",
+            status, count, (unsigned long long) results[0].slot,
+            (unsigned long long) results[1].slot, (unsigned long long) results[2].slot,
+            (unsigned long long) results[3].slot, results[0].distance,
+            results[1].distance, results[2].distance, results[3].distance);
+        return 1;
+    }
+    /* This supplement enters exactly at the final retained position. */
+    status = cuvs_ipc_search_page_overlay(socket, db, index, &request, query, 1, 8, 4,
+        CUVS_METRIC_IP, 0, 0, 1, 0, 0, &weak_supplement,
+        results, &count, &latency, &progress);
+    if (status != CUVS_STATUS_OK || count != 4 ||
+        results[0].slot != 0 || results[1].slot != 1 ||
+        results[2].slot != base.n_slots || results[3].slot != base.n_slots + 2 ||
+        fabsf(results[3].distance - 1.2f) > 0.001f)
+    {
+        fprintf(stderr, "IP last retained slot status=%d count=%d slots=%llu,%llu,%llu,%llu\n",
+            status, count, (unsigned long long) results[0].slot,
+            (unsigned long long) results[1].slot, (unsigned long long) results[2].slot,
+            (unsigned long long) results[3].slot);
+        return 1;
+    }
+    return 0;
+}
+
 int
 main(int argc, char **argv)
 {
-    if (argc != 9)
+    if (argc != 9 && argc != 10)
         return 64;
     uint32_t db = (uint32_t) arg64(argv[2]);
     uint32_t idx = (uint32_t) arg64(argv[3]);
@@ -176,6 +310,9 @@ main(int argc, char **argv)
         .graph_nonce = arg64(argv[7]),
         .n_slots = arg64(argv[8])
     };
+
+    if (argc == 10)
+        return check_merge_ip(argv[1], db, idx, request);
 
     if (try_search(argv[1], db, idx, &request, CUVS_STATUS_OK))
         return 1;
@@ -210,6 +347,8 @@ main(int argc, char **argv)
     }
     if (check_supply(argv[1], db, idx, request))
         return 1;
-    puts("single and batch slots, eight mismatches, supply acknowledgments and boot fencing: PASS");
+    if (check_merge_l2(argv[1], db, idx, request))
+        return 1;
+    puts("single/batch slots, overlay merge and fill, mismatches, supply and boot fencing: PASS");
     return 0;
 }

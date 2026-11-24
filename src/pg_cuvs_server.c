@@ -12933,8 +12933,18 @@ handle_page_overlay_search(int client_fd, const CuvsCmdFrame *cmd)
             const CuvsSearchResult *candidate = &raw[(size_t) q * k + i];
             if (candidate->item_id >= 0 && (uint64_t) candidate->item_id < graph->n_slots)
             {
+                float distance = candidate->distance;
+
+                /* HNSW IP returns 1-dot; overlay and CAGRA IP use raw dot.
+                 * This conversion belongs to the new merge path only: the
+                 * base-only page reply keeps its existing HNSW distance. */
+                if (cmd->metric == CUVS_METRIC_IP && cmd->search_mode == 0 &&
+                    cmd->use_cpu_hnsw && graph->cpu_hnsw)
+                    distance = 1.0f - distance;
+                if (!isfinite(distance))
+                    continue;
                 row[written].slot = (uint64_t) candidate->item_id;
-                row[written++].distance = candidate->distance;
+                row[written++].distance = distance;
             }
         }
         for (const CuvsPageOverlayChunk *chunk = graph->overlay.head;

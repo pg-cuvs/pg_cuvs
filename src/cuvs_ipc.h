@@ -253,6 +253,8 @@ int cuvs_ipc_supply_pages(const char *socket_path, uint32_t db_oid, uint32_t ind
     const CuvsPageOverlayRequest *request, int dim, uint32_t metric,
     const CuvsPageSupplement *supplement, CuvsPageProgress *progress);
 
+/* results must hold nq * k entries. Batch rows pad unused positions with
+ * CUVS_PAGE_SLOT_INVALID; base graph rows use block=0 (no heap block hint). */
 int cuvs_ipc_search_page_overlay(const char *socket_path, uint32_t db_oid, uint32_t index_oid,
     const CuvsPageOverlayRequest *request, const float *queries, int nq, int dim, int k,
     uint32_t metric, uint32_t itopk_size, uint32_t search_width, uint32_t use_cpu_hnsw,
