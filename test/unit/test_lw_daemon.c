@@ -691,7 +691,7 @@ test_callers(void)
         CHECK(victim != NULL);
         if (victim)
             CHECK(evict_entry(victim, entry_home_gpu(victim), CUVS_EVICT_RELOAD,
-                              0, CUVS_RQ_LOAD, &persist_failed) > 0);
+                              0, CUVS_RQ_LOAD, &persist_failed, true) > 0);
         CHECK(persist_failed == 0);
         attach_build_notices(&reply);
         CHECK(cuvs_notice_decode(reply.notice_out, sizeof(reply.notice_out), &batch) == 0);

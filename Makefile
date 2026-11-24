@@ -1248,7 +1248,7 @@ test-lw-daemon:
 	$(CC) -std=gnu11 -O1 -DPGCUVS_CPU_SHIM -ffunction-sections -fdata-sections -I src \
 		test/unit/test_lw_daemon.c src/cuvs_ipc.c src/cuvs_util.c \
 		src/cuvs_objstore.c src/cuvs_build_corpus.c src/cuvs_wrapper_shim_cpu.c \
-		src/cuvs_cache_policy.c src/cuvs_peak_meter.c src/cuvs_page_overlay.c \
+		src/cuvs_cache_policy.c src/cuvs_peak_meter.c src/cuvs_page_overlay.c src/cuvs_hnsw_upper.c \
 		-Wl,--gc-sections -lm -lpthread -lrt -lcurl -lssl -lcrypto -o test-lw-daemon
 	./test-lw-daemon
 
@@ -1331,7 +1331,7 @@ test-ar8-daemon:
 	$(CC) -std=gnu11 -O1 -DPGCUVS_CPU_SHIM -ffunction-sections -fdata-sections -I src \
 		test/unit/test_ar8_daemon.c src/cuvs_ipc.c src/cuvs_util.c \
 		src/cuvs_objstore.c src/cuvs_build_corpus.c src/cuvs_wrapper_shim_cpu.c \
-		src/cuvs_cache_policy.c src/cuvs_peak_meter.c src/cuvs_page_overlay.c \
+		src/cuvs_cache_policy.c src/cuvs_peak_meter.c src/cuvs_page_overlay.c src/cuvs_hnsw_upper.c \
 		-Wl,--gc-sections -lm -lpthread -lrt -lcurl -lssl -lcrypto -o test-ar8-daemon
 	./test-ar8-daemon
 

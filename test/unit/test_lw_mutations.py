@@ -228,7 +228,8 @@ def build_and_run(tree):
                           '-fdata-sections', '-I', 'src', '-o', 'bin-daemon',
                           'test/unit/test_lw_daemon.c', 'src/cuvs_ipc.c', 'src/cuvs_util.c',
                           'src/cuvs_objstore.c', 'src/cuvs_build_corpus.c',
-                          'src/cuvs_wrapper_shim_cpu.c', 'src/cuvs_cache_policy.c', 'src/cuvs_peak_meter.c', 'src/cuvs_page_overlay.c', '-Wl,--gc-sections', '-lm', '-lpthread',
+                          'src/cuvs_wrapper_shim_cpu.c', 'src/cuvs_cache_policy.c', 'src/cuvs_peak_meter.c',
+                          'src/cuvs_page_overlay.c', 'src/cuvs_hnsw_upper.c', '-Wl,--gc-sections', '-lm', '-lpthread',
                           '-lrt', '-lcurl', '-lssl', '-lcrypto']
     for name, argv in jobs.items():
         if name == 'docs':   # a check, not a build
