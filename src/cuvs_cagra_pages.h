@@ -58,7 +58,7 @@ typedef struct CuvsCagraMeta
     BlockNumber foldlog_tail;
     BlockNumber foldlog_spare;
     uint32      n_extents;
-    BlockNumber extent_overflow;
+    BlockNumber extent_reclaim_from; /* first block to inspect for orphaned extents */
     uint64      last_fold_xid;
     int64       last_fold_time;
     BlockNumber extents[CUVS_CAGRA_PAGE_DIR];
@@ -142,7 +142,7 @@ IndexBulkDeleteResult *cuvs_cagra_page_bulkdelete(IndexVacuumInfo *info,
 IndexBulkDeleteResult *cuvs_cagra_page_vacuumcleanup(IndexVacuumInfo *info,
     IndexBulkDeleteResult *stats);
 #ifdef CUVS_TEST_HOOKS
-void cuvs_cagra_vacuum_init_test_hook(void);
+void cuvs_cagra_init_test_hooks(void);
 #endif
 #endif
 
