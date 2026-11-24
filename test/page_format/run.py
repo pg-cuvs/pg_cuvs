@@ -381,6 +381,8 @@ def check_invalid_index_drop(cluster, custom):
         ("missing", cluster.data.parent / "missing-root"),
         ("overlong", cluster.data.parent / ("x" * 200) / ("y" * 80)),
     )
+    cluster.sql("beta1a", "invalid-drop-control", "-c",
+                "CREATE INDEX page_drop_control_idx ON page_custom USING cagra (v vector_l2_ops);")
     for label, bad_root in bad_roots:
         cluster.sql("beta1a", f"invalid-drop-setup-{label}", "-At", "-c", f"""
             CREATE INDEX page_bad_drop_idx ON page_custom USING cagra (v vector_l2_ops)
@@ -408,12 +410,17 @@ def check_invalid_index_drop(cluster, custom):
         """)
         cluster.sql("beta1a", f"invalid-drop-after-{label}", "-At", "-c", f"""
             SELECT to_regclass('page_bad_drop_idx') IS NULL;
+            SELECT EXISTS (
+                SELECT FROM pg_cuvs_index_status()
+                WHERE index_oid='page_drop_control_idx'::regclass AND kind='page_cagra'
+            );
             SELECT count(*) FROM pg_cuvs_index_status()
             WHERE index_oid={oid} AND kind='page_cagra';
         """)
         result = (cluster.logs / f"main-invalid-drop-{label}.log").read_text()
         after = (cluster.logs / f"main-invalid-drop-after-{label}.log").read_text().splitlines()
-        if ("page-format DROP-notify failed" not in result or after[-2] != "t"
+        if ("page-format DROP-notify failed" not in result or "(status 17)" not in result
+                or after[-3:-1] != ["t", "t"]
                 or not witness.is_file() or not other.is_dir() or bad_root.exists()):
             raise RuntimeError(f"{label}: invalid DROP root did not warn, commit and leave both roots alone")
         if after[-1] != "0":
