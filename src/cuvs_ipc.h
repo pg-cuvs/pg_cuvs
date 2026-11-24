@@ -276,11 +276,13 @@ int cuvs_ipc_supply_pages(const char *socket_path, uint32_t db_oid, uint32_t ind
 #define CUVS_STATUS_CANCELED      11   /* 3S: backend aborted the wait (statement_timeout / query cancel) */
 #define CUVS_STATUS_PROTO_MISMATCH 12  /* #77: daemon/extension wire-protocol skew (co-deploy both) */
 #define CUVS_STATUS_HNSW_RESIDENT_BUDGET_EXCEEDED 13 /* AUTO/explicit IVF estimate only; not tiny/ACE/OOM */
-#define CUVS_STATUS_PAGE_NEED 14
-#define CUVS_STATUS_PAGE_OVERLAY_FULL 15
 #define CUVS_STATUS_HNSW_UPPER_SKIPPED 16 /* EXPORT_HNSW_UPPER built no upper layers (the
                                            * graph degree is below 4, so M < 2); the backend
                                            * keeps its own level assignment */
+
+/* 14/15 are reserved by other changes. 17 is INVALID_PAGE_ROOT. */
+#define CUVS_STATUS_PAGE_NEED          18
+#define CUVS_STATUS_PAGE_OVERLAY_FULL  19
 
 /* ----------------------------------------------------------------
  * Command frame (sent over UDS, fixed size)

@@ -721,9 +721,11 @@ cuvs_ipc_supply_pages(const char *socket_path, uint32_t db_oid, uint32_t index_o
     int status = CUVS_STATUS_ERROR;
     int fd, sock, canceled, waiting;
 
-    if (!progress || !supplement || dim < 1 || dim > 65535)
+    if (!progress)
         return status;
     memset(progress, 0, sizeof(*progress));
+    if (!supplement || dim < 1 || dim > 65535)
+        return status;
     if (!supplement->positions || supplement->positions > CUVS_PAGE_BATCH_MAX ||
         supplement->vector_rows > supplement->positions || !supplement->marks ||
         (supplement->vector_rows && !supplement->vectors) ||

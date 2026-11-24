@@ -223,7 +223,8 @@ SERVER_ALL_OBJS = src/pg_cuvs_server.o src/cuvs_objstore_server.o \
                   src/cuvs_build_corpus_server.o \
                   src/pg_cuvs_server_test.o src/cuvs_objstore_server_test.o \
                   src/cuvs_ipc_server_test.o src/cuvs_util_server_test.o \
-                  src/cuvs_build_corpus_server_test.o
+                  src/cuvs_build_corpus_server_test.o \
+                  src/cuvs_page_overlay_server.o src/cuvs_page_overlay_server_test.o
 $(SERVER_ALL_OBJS): $(wildcard src/*.h)
 
 # server .c → .o (not via PGXS — separate rule with no PG headers)
@@ -311,7 +312,10 @@ src/cuvs_peak_meter_server_test.o: src/cuvs_peak_meter.c src/cuvs_peak_meter.h
 src/cuvs_hnsw_upper_server_test.o: src/cuvs_hnsw_upper.c src/cuvs_hnsw_upper.h
 	$(CC) $(SERVER_TEST_CFLAGS) -c $< -o $@
 
-$(SERVER_TEST_BIN): src/pg_cuvs_server_test.o src/cuvs_ipc_server_test.o src/cuvs_util_server_test.o src/cuvs_objstore_server_test.o src/cuvs_build_corpus_server_test.o src/cuvs_cache_policy_server_test.o src/cuvs_peak_meter_server_test.o src/cuvs_hnsw_upper_server_test.o src/cuvs_page_overlay_server.o $(WRAPPER_OBJ)
+src/cuvs_page_overlay_server_test.o: src/cuvs_page_overlay.c src/cuvs_page_overlay.h src/cuvs_ipc.h
+	$(CC) $(SERVER_TEST_CFLAGS) -c $< -o $@
+
+$(SERVER_TEST_BIN): src/pg_cuvs_server_test.o src/cuvs_ipc_server_test.o src/cuvs_util_server_test.o src/cuvs_objstore_server_test.o src/cuvs_build_corpus_server_test.o src/cuvs_cache_policy_server_test.o src/cuvs_peak_meter_server_test.o src/cuvs_hnsw_upper_server_test.o src/cuvs_page_overlay_server_test.o $(WRAPPER_OBJ)
 	$(CXX) -o $@ $^ $(SERVER_LDFLAGS)
 
 server-test: $(SERVER_TEST_BIN)
@@ -669,6 +673,12 @@ test-i3b-source: test/unit/check_i3b_server_source.py src/pg_cuvs_server.c test/
 	python3 test/unit/check_i3b_docs.py
 
 .PHONY: test-i3b-source
+
+test-unit: test-page-overlay
+.PHONY: test-page-overlay
+test-page-overlay:
+	ulimit -c 0; CC="$(CC)" python3 -I -B test/unit/test_page_overlay_mutations.py
+
 
 # CK-34: the peak meter under 8 concurrent threads, reset, and off.
 test-peak-meter: test/unit/test_peak_meter.c src/cuvs_peak_meter.c src/cuvs_peak_meter.h

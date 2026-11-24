@@ -1,5 +1,6 @@
 #include "cuvs_ipc.h"
 
+#include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -42,7 +43,9 @@ expect_supply(const char *socket, uint32_t db, uint32_t index,
     int status = cuvs_ipc_supply_pages(socket, db, index, request, 8, CUVS_METRIC_L2,
                                        rows, &progress);
 
-    if (status != expected || (expected != CUVS_STATUS_ERROR &&
+    bool has_progress = expected == CUVS_STATUS_OK || expected == CUVS_STATUS_PAGE_NEED ||
+                        expected == CUVS_STATUS_PAGE_OVERLAY_FULL;
+    if (status != expected || (has_progress &&
                               (!progress.daemon_id || progress.covered_upto != covered)))
     {
         fprintf(stderr, "SUPPLY returned status=%d coverage=%llu; want status=%d coverage=%llu\n",
@@ -76,11 +79,52 @@ check_supply(const char *socket, uint32_t db, uint32_t index, CuvsPageSearchRequ
     request.base.tail = 3;
     if (expect_supply(socket, db, index, &request, &rows, CUVS_STATUS_PAGE_NEED, 2))
         return 1;
+    request.from = 2;
+    request.base.tail = 4;
+    if (expect_supply(socket, db, index, &request, &rows, CUVS_STATUS_OK, 4))
+        return 1;
+
+    CuvsPageProgress progress;
+    if (cuvs_ipc_supply_pages(socket, db, index, &request, 7, CUVS_METRIC_L2, &rows, &progress)
+            != CUVS_STATUS_NOT_FOUND ||
+        cuvs_ipc_supply_pages(socket, db, index, &request, 8, CUVS_METRIC_IP, &rows, &progress)
+            != CUVS_STATUS_NOT_FOUND ||
+        expect_supply(socket, db + 1, index, &request, &rows, CUVS_STATUS_NOT_FOUND, 0) ||
+        expect_supply(socket, db, index + 1, &request, &rows, CUVS_STATUS_NOT_FOUND, 0))
+        return 1;
+    uint64_t *identity[] = {&request.base.system_identifier, &request.base.index_nonce,
+                           &request.base.base_nonce, &request.base.graph_nonce, &request.base.n_slots};
+    for (size_t i = 0; i < sizeof(identity) / sizeof(*identity); ++i)
+    {
+        *identity[i] ^= 1;
+        if (expect_supply(socket, db, index, &request, &rows, CUVS_STATUS_NOT_FOUND, 0))
+            return 1;
+        *identity[i] ^= 1;
+    }
+    request.base.folded = 1;
+    if (expect_supply(socket, db, index, &request, &rows, CUVS_STATUS_NOT_FOUND, 0))
+        return 1;
+    request.base.folded = 0;
+    request.from = CUVS_PAGE_OVERLAY_MAX;
+    request.base.tail = request.from + 2;
+    if (expect_supply(socket, db, index, &request, &rows, CUVS_STATUS_PAGE_OVERLAY_FULL, 4))
+        return 1;
+
     request.boot_id = 2;
+    request.from = 1;
+    request.base.tail = 3;
     if (expect_supply(socket, db, index, &request, &rows, CUVS_STATUS_PAGE_NEED, 0))
         return 1;
     request.from = 0;
     request.base.tail = 2;
+    rows.vector_rows = 0;
+    if (expect_supply(socket, db, index, &request, &rows, CUVS_STATUS_ERROR, 0))
+        return 1;
+    rows.vector_rows = 1;
+    marks[1].block = 0;
+    if (expect_supply(socket, db, index, &request, &rows, CUVS_STATUS_ERROR, 0))
+        return 1;
+    marks[1].block = 65;
     marks[0].state = CUVS_PAGE_POSITION_INVISIBLE;
     return expect_supply(socket, db, index, &request, &rows, CUVS_STATUS_ERROR, 0);
 }
