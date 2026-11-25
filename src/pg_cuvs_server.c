@@ -5356,6 +5356,8 @@ prepare_delta_cache(IndexEntry **entry, uint32_t mode, int *delta_ready)
     return CUVS_STATUS_SEARCH_RETRY;
 }
 
+static int send_all(int fd, const void *buf, size_t len);
+
 static void
 send_delta_prepare_error(int client_fd, int status)
 {

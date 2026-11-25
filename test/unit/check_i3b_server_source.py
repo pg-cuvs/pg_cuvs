@@ -96,7 +96,7 @@ for fn, n in arity.items():
         if fn == "load_index":
             load_rq.setdefault(rq, []).append(line)
 
-want = {"CUVS_RQ_LOAD_STARTUP": 1, "CUVS_RQ_LOAD_WARMUP": 1, "CUVS_RQ_LOAD": 7}
+want = {"CUVS_RQ_LOAD_STARTUP": 1, "CUVS_RQ_LOAD_WARMUP": 1, "CUVS_RQ_LOAD": 8}
 for rq, n in want.items():
     got = len(load_rq.get(rq, []))
     if got != n:
@@ -111,6 +111,9 @@ if "CUVS_RQ_LOAD_WARMUP" not in funcs.get("warmup_worker_thread", ""):
 if "CUVS_RQ_LOAD_STARTUP" in funcs.get("handle_search", "") or \
    "CUVS_RQ_LOAD_WARMUP" in funcs.get("handle_search", ""):
     fail("CK-36 (a): search side uses a startup/warmup requester")
+if not re.search(r"\bload_index\(db_oid,\s*index_oid,\s*CUVS_RQ_LOAD\)",
+                 funcs.get("prepare_delta_cache", "")):
+    fail("CK-36 (a): delta cache reload must use LOAD")
 
 # Per-handler requester (review BLOCK 4): every build path names its own
 # BUILD_* kind on every admission, slot and post-admission OOM retry call,
