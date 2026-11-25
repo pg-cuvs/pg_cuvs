@@ -39,6 +39,10 @@ M = [
      "    if (e->valid && !e->file_current && save_index(e) != 0)"),
     ("compaction returns before saving", "    if (save_index(e) != 0)",
      "    if (e->file_current == 0)\n        return;\n    if (save_index(e) != 0)"),
+    ("HNSW binding check skips the base save",
+     "        preserve_binding = read_hnsw_source(hnsw_final, tids_final, &old_binding);\n",
+     "        preserve_binding = read_hnsw_source(hnsw_final, tids_final, &old_binding);\n"
+     "        return 0;\n"),
     ("eviction saves outside its guard", "        if (save_legacy && !e->file_current)",
      "        save_index(e);\n        if (save_legacy && !e->file_current)"),
     ("wrapper: peak CAS before the upstream allocate",

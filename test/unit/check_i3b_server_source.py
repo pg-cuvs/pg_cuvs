@@ -191,12 +191,20 @@ if len(save_call.findall(evict)) != 1:
 # caller for reads, since an early return can bypass a later save_index call.
 # Plain assignments publish the state and cannot suppress a save.
 file_current_read = re.compile(r"\bfile_current\b(?!\s*=(?!=))")
+# The optional HNSW binding snapshot only reads the old files. Accept the
+# block only when both calls complete and control continues to the base save.
+binding_snapshot = re.compile(r"\bif\s*\(\s*e->file_current\s*\)\s*\{\s*"
+                              r"hnsw_file_path\([^;{}]*\);\s*"
+                              r"preserve_binding\s*=\s*read_hnsw_source\([^;{}]*\);\s*"
+                              r"\}(?!\s*else\b)")
 for name, body in funcs.items():
     if name not in ("save_index", "graceful_shutdown") and not save_call.search(body):
         continue
     if name == "evict_entry" and guarded_save:
         start, end = guarded_save.span("guard")
         body = body[:start] + body[end:]
+    if name == "save_index":
+        body = binding_snapshot.sub("", body, count=1)
     if file_current_read.search(body):
         fail(f"CK-37 (a): {name} reads file_current outside the eviction save guard")
 if not save_call.search(funcs.get("graceful_shutdown", "")):
