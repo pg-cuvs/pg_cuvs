@@ -82,6 +82,7 @@ ISOLATION_GPU  = pg_cuvs_hnsw_cic_writes
 # PGXS only knows how to build .c → .o; the .cu → .o rule is custom,
 # but the resulting object MUST be listed in OBJS to be linked into the .so.
 OBJS           = src/pg_cuvs.o src/cuvs_ipc.o src/cuvs_util.o $(WRAPPER_OBJ) src/hnsw_export.o src/cuvs_hnsw_scan.o src/cuvs_hnsw_rls.o src/cuvs_hnsw_exact.o src/cuvs_build_corpus.o src/pg_cuvs_compaction.o src/cuvs_status_text.o src/cuvs_peak_meter.o src/cuvs_cagra_pages.o src/cuvs_cagra_pending_search.o src/cuvs_cagra_fold_worker.o
+OBJS           += src/cuvs_cagra_history.o src/cuvs_cagra_resident_supply.o
 
 # nvcc settings (Phase 1: brute-force only; CAGRA added later)
 NVCC          ?= nvcc
@@ -251,6 +252,9 @@ SERVER_CFLAGS  = -O2 -g -Wall -Wextra -I./src \
 # Optional sanitizer/debug hooks for the daemon (e.g. CI ASAN job passes
 # EXTRA_SERVER_CFLAGS="-fsanitize=address -fno-omit-frame-pointer"). Empty by default.
 SERVER_CFLAGS += $(EXTRA_SERVER_CFLAGS) $(CUVS_FOLD_PRODUCT_CPPFLAGS)
+ifeq ($(CUVS_PAGE_FORMAT),1)
+SERVER_CFLAGS += -DCUVS_PAGE_FORMAT
+endif
 ifdef PGCUVS_CPU_SHIM
 SERVER_CFLAGS += -DPGCUVS_CPU_SHIM
 endif

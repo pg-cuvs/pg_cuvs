@@ -537,6 +537,21 @@ uses legacy storage, regardless of table contents, TRUNCATE, or REINDEX. Pending
 page records hold the vector evaluated by PostgreSQL. Folded records use TID
 slots. Rebuilding the graph from those slots requires reevaluating the expression.
 
+**Experimental resident pending search.** With matching page-format builds of
+PostgreSQL's extension and its daemon, set `cuvs.page_resident_search=on` in
+`postgresql.conf` and restart the preloaded primary. This setting defaults to
+`off`. A regular CAGRA Index Scan can reuse the daemon's committed pending
+prefix and send at most 4,096 remaining positions. PostgreSQL scores larger
+unsupplied ranges in 4,096-position chunks. The search admits up to 200,000
+pending positions relative to the selected graph and verifies each returned
+candidate against the scan snapshot. Retained graphs for old snapshots count
+toward the daemon's VRAM budget.
+
+With native page-format fold support, `cuvs.resident_supply=on` starts a
+background supplier that visits page-format CAGRA indexes and releases expired
+graph history. This postmaster setting also defaults to `off`. The worker uses
+the daemon's `--page-overlay-host-bytes` budget.
+
 **Experimental page-format fold (`PGCUVS_BETA3A_GPU_FOLD=1`).** Build both the
 extension and daemon with this option and `CUVS_PAGE_FORMAT=1`, using the
 matching cuVS `cpp/src` tree as `CUVS_BETA3A_SDK_SOURCE`. The fold option defaults

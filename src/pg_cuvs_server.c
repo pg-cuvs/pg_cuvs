@@ -411,6 +411,9 @@ typedef struct PageCagraGraph
     PageCagraRetiredBoot *retired_boots;
     uint32_t fold_pins;
     bool fold_retired;
+    bool search_invalidated;
+    uint32_t ancestor_until_xid;
+    uint64_t pg_boot_started_us;
     struct PageCagraGraph *fold_candidate;
     CuvsPageFoldEvent fold_event;
     uint64_t fold_lsn;
@@ -433,6 +436,7 @@ typedef struct PageGraphFoldRef
 } PageGraphFoldRef;
 
 static PageCagraGraph *g_page_graphs;
+static PageCagraGraph *g_page_ancestors;
 static int g_n_page_graphs;
 static uint64_t g_page_access;
 static uint64_t g_page_fold_offer_order;
@@ -440,7 +444,7 @@ static uint64_t g_page_daemon_id;
 static pthread_once_t g_page_daemon_once = PTHREAD_ONCE_INIT;
 static size_t g_page_graph_bytes[CUVS_MAX_GPUS];
 static CuvsPageOverlayBudget g_page_overlay_budget;
-static _Thread_local CuvsPageOverlayChunk *g_retired_page_overlays;
+static CuvsPageOverlayChunk *g_retired_page_overlays;
 static _Thread_local PageCagraGraph *g_retired_fold_graphs;
 
 #ifdef CUVS_CAGRA_FOLD_ENABLED
@@ -462,10 +466,12 @@ static _Thread_local uint64_t t_fold_request_started;
 static void
 defer_page_overlay_release(CuvsPageOverlayChunk *head)
 {
-    if (head)
+    /* The registry lock serializes both queuing and detaching the work.
+     * Distinct graphs can place separate references to one head here. */
+    if (head && head->deferred_releases++ == 0)
     {
-        head->retired_next = g_retired_page_overlays;
-        g_retired_page_overlays = head;
+        head->retired_next = __atomic_load_n(&g_retired_page_overlays, __ATOMIC_RELAXED);
+        __atomic_store_n(&g_retired_page_overlays, head, __ATOMIC_RELEASE);
     }
 }
 
@@ -474,12 +480,27 @@ defer_page_overlay_release(CuvsPageOverlayChunk *head)
 static void
 release_retired_page_overlays(void)
 {
-    while (g_retired_page_overlays)
+    for (;;)
     {
-        CuvsPageOverlayChunk *head = g_retired_page_overlays;
+        CuvsPageOverlayChunk *head;
+        size_t releases;
 
-        g_retired_page_overlays = head->retired_next;
-        cuvs_page_overlay_release(head);
+        if (!__atomic_load_n(&g_retired_page_overlays, __ATOMIC_ACQUIRE))
+            return;
+        pthread_mutex_lock(&g_index_mutex);
+        head = __atomic_load_n(&g_retired_page_overlays, __ATOMIC_RELAXED);
+        if (!head)
+        {
+            pthread_mutex_unlock(&g_index_mutex);
+            return;
+        }
+        __atomic_store_n(&g_retired_page_overlays, head->retired_next, __ATOMIC_RELEASE);
+        releases = head->deferred_releases;
+        head->retired_next = NULL;
+        head->deferred_releases = 0;
+        pthread_mutex_unlock(&g_index_mutex);
+        while (releases--)
+            cuvs_page_overlay_release(head);
     }
 }
 
@@ -534,7 +555,7 @@ release_retired_fold_graphs(void)
 }
 
 /* Candidates are owned by their parent until an ACK installs them in the
- * registry. A search only uses the candidate handle under g_index_mutex. */
+ * registry. A resident search can pin a candidate before that ACK. */
 static void
 discard_page_fold_locked(PageCagraGraph *parent, const char *reason)
 {
@@ -551,7 +572,10 @@ discard_page_fold_locked(PageCagraGraph *parent, const char *reason)
         (void) reason;
 #endif
         parent->fold_candidate = NULL;
-        defer_fold_graph_dispose(candidate);
+        candidate->fold_retired = true;
+        candidate->search_invalidated = true;
+        if (candidate->fold_pins == 0)
+            defer_fold_graph_dispose(candidate);
     }
 }
 
@@ -560,6 +584,7 @@ retire_page_graph_locked(PageCagraGraph *entry, bool defer_dispose)
 {
     entry->next = NULL;
     entry->fold_retired = true;
+    entry->search_invalidated = !defer_dispose;
     discard_page_fold_locked(entry, "retired");
     if (entry->fold_pins == 0)
     {
@@ -581,6 +606,33 @@ free_page_graph(PageCagraGraph **link)
     *link = entry->next;
     --g_n_page_graphs;
     retire_page_graph_locked(entry, false);
+}
+
+/* Normal XIDs use PostgreSQL's wraparound comparison. A zero horizon
+ * retires the entire matching scope on DROP or a postmaster change. */
+static void
+prune_page_ancestors_locked(uint32_t db, uint32_t index, uint64_t system,
+                            uint64_t nonce, uint64_t base, uint64_t boot, uint32_t horizon)
+{
+    PageCagraGraph **link = &g_page_ancestors;
+
+    while (*link)
+    {
+        PageCagraGraph *old = *link;
+
+        if (old->db_oid == db && old->index_oid == index &&
+            (!system || old->system_identifier == system) &&
+            (!nonce || old->index_nonce == nonce) && (!base || old->base_nonce == base) &&
+            (!boot || old->overlay.boot_id == boot) &&
+            (!horizon || (int32_t) (old->ancestor_until_xid - horizon) < 0))
+        {
+            *link = old->next;
+            retire_page_graph_locked(old, true);
+            old->search_invalidated = horizon == 0;
+        }
+        else
+            link = &old->next;
+    }
 }
 
 /* Caller holds g_index_mutex and supplies the selected registered graph.
@@ -711,7 +763,11 @@ page_graph_use_boot_locked(PageCagraGraph *graph, uint64_t boot_id,
         graph->retired_boots = boot;
     }
     discard_page_fold_locked(graph, "pg_lifetime");
+    if (graph->overlay.boot_id)
+        prune_page_ancestors_locked(graph->db_oid, graph->index_oid, graph->system_identifier,
+                                    graph->index_nonce, graph->base_nonce, graph->overlay.boot_id, 0);
     *obsolete = cuvs_page_overlay_start_boot(&graph->overlay, boot_id, graph->folded);
+    graph->pg_boot_started_us = 0;
 #ifdef CUVS_CAGRA_FOLD_ENABLED
     graph->fold_pending_since = 0;
     graph->fold_retry_after = 0;
@@ -725,6 +781,7 @@ drop_page_graphs(uint32_t db_oid, uint32_t index_oid)
 {
     PageCagraGraph **link = &g_page_graphs;
 
+    prune_page_ancestors_locked(db_oid, index_oid, 0, 0, 0, 0, 0);
     while (*link)
     {
         PageCagraGraph *entry = *link;
@@ -15254,13 +15311,14 @@ page_fold_thread(void *arg)
 #endif
 
 static bool
-page_fold_ready_locked(uint32_t db_oid, uint32_t index_oid, uint64_t index_nonce,
-                        const CuvsPageFoldQuery *query,
+page_fold_ready_for_boot_locked(uint32_t db_oid, uint32_t index_oid, uint64_t index_nonce,
+                        const CuvsPageFoldQuery *query, uint64_t boot_started_us,
                         CuvsPageFoldEvent *event, int *device, uint64_t *protected_us)
 {
     PageCagraGraph *selected = NULL;
+    PageCagraGraph *selected_parent = NULL;
 
-    for (const PageCagraGraph *parent = g_page_graphs; parent; parent = parent->next)
+    for (PageCagraGraph *parent = g_page_graphs; parent; parent = parent->next)
     {
         PageCagraGraph *candidate = parent->fold_candidate;
 
@@ -15276,12 +15334,19 @@ page_fold_ready_locked(uint32_t db_oid, uint32_t index_oid, uint64_t index_nonce
             (!index_oid || (parent->index_oid == index_oid && parent->index_nonce == index_nonce)) &&
             parent->system_identifier == query->system_identifier &&
             parent->overlay.boot_id == query->boot_id &&
+            (!boot_started_us || !parent->pg_boot_started_us ||
+             parent->pg_boot_started_us == boot_started_us) &&
             candidate->fold_event.boot_id == query->boot_id &&
             (!selected || candidate->fold_offer_order < selected->fold_offer_order))
+        {
             selected = candidate;
+            selected_parent = parent;
+        }
     }
     if (!selected)
         return false;
+    if (boot_started_us)
+        selected_parent->pg_boot_started_us = boot_started_us;
 
     /* Leave the event outstanding while allowing another index to be
      * offered if this one is waiting on DDL or VACUUM. */
@@ -15307,9 +15372,19 @@ page_fold_ready_locked(uint32_t db_oid, uint32_t index_oid, uint64_t index_nonce
     return true;
 }
 
+static bool
+page_fold_ready_locked(uint32_t db_oid, uint32_t index_oid, uint64_t index_nonce,
+                       const CuvsPageFoldQuery *query, CuvsPageFoldEvent *event,
+                       int *device, uint64_t *protected_us)
+{
+    return page_fold_ready_for_boot_locked(db_oid, index_oid, index_nonce, query, 0,
+                                           event, device, protected_us);
+}
+
 /* The wire event is a fixed, padding-free sequence of integer fields. */
 static uint32_t
-page_fold_result_locked(const CuvsPageFoldResult *result, uint64_t received_us)
+page_fold_result_with_history_locked(const CuvsPageFoldResult *result, uint64_t received_us,
+                                     uint32_t transition_xid)
 {
 #ifndef CUVS_CAGRA_FOLD_ENABLED
     (void) received_us;
@@ -15318,6 +15393,7 @@ page_fold_result_locked(const CuvsPageFoldResult *result, uint64_t received_us)
     {
         PageCagraGraph *parent = *link;
         PageCagraGraph *candidate = parent->fold_candidate;
+        bool keep_history = transition_xid && parent->pg_boot_started_us;
 
         if (parent->overlay.boot_id != result->event.boot_id)
             continue;
@@ -15338,9 +15414,19 @@ page_fold_result_locked(const CuvsPageFoldResult *result, uint64_t received_us)
         /* Move the unpublished suffix, including supply since READY. */
         parent->fold_candidate = NULL;
         candidate->overlay = parent->overlay;
-        parent->overlay = (CuvsPageOverlay) {0};
-        defer_page_overlay_release(
-            cuvs_page_overlay_advance_fold(&candidate->overlay, candidate->folded));
+        candidate->pg_boot_started_us = parent->pg_boot_started_us;
+        if (keep_history)
+        {
+            cuvs_page_overlay_retain(candidate->overlay.head);
+            defer_page_overlay_release(
+                cuvs_page_overlay_prune_folded(&candidate->overlay, candidate->folded));
+        }
+        else
+        {
+            parent->overlay = (CuvsPageOverlay) {0};
+            defer_page_overlay_release(
+                cuvs_page_overlay_advance_fold(&candidate->overlay, candidate->folded));
+        }
         candidate->retired_boots = parent->retired_boots;
         parent->retired_boots = NULL;
         candidate->fold_lsn = result->transition_lsn;
@@ -15350,7 +15436,14 @@ page_fold_result_locked(const CuvsPageFoldResult *result, uint64_t received_us)
 #endif
         candidate->next = parent->next;
         *link = candidate;
-        retire_page_graph_locked(parent, true);
+        if (keep_history)
+        {
+            parent->ancestor_until_xid = transition_xid;
+            parent->next = g_page_ancestors;
+            g_page_ancestors = parent;
+        }
+        else
+            retire_page_graph_locked(parent, true);
 #ifdef CUVS_CAGRA_FOLD_ENABLED
         LOG_INFO("[page_fold_commit] db=%u index=%u positions=%u folded=%llu lsn=%llX mono_us=%llu gpu=%d accepted_us=%llu"
                  FOLD_EVENT_LOG "\n",
@@ -15364,6 +15457,12 @@ page_fold_result_locked(const CuvsPageFoldResult *result, uint64_t received_us)
     return CUVS_STATUS_NOT_FOUND;
 }
 
+static uint32_t
+page_fold_result_locked(const CuvsPageFoldResult *result, uint64_t received_us)
+{
+    return page_fold_result_with_history_locked(result, received_us, 0);
+}
+
 static void
 handle_page_fold_ready(int client_fd, const CuvsCmdFrame *cmd)
 {
@@ -15371,19 +15470,28 @@ handle_page_fold_ready(int client_fd, const CuvsCmdFrame *cmd)
     CuvsPageFoldEvent event;
     CuvsReplyHeader reply = {.status = CUVS_STATUS_ERROR};
     uint64_t index_nonce = 0;
+    uint64_t boot_started_us = 0;
     uint64_t protected_us = 0;
     int device = -1;
 
     if (recv_all(client_fd, &query, sizeof(query)) == 0 &&
         cmd->db_oid && !query.reserved && query.system_identifier && query.boot_id &&
-        ((!cmd->index_oid && query.length == sizeof(query)) ||
-         (cmd->index_oid && query.length == sizeof(query) + sizeof(index_nonce) &&
-          recv_all(client_fd, &index_nonce, sizeof(index_nonce)) == 0 && index_nonce)))
+        (cmd->op == CUVS_OP_FOLD_RESIDENT_READY ?
+         (query.length == sizeof(CuvsPageResidentFoldQuery) &&
+          recv_all(client_fd, &index_nonce, sizeof(index_nonce)) == 0 &&
+          recv_all(client_fd, &boot_started_us, sizeof(boot_started_us)) == 0 &&
+          (!!cmd->index_oid == !!index_nonce) && boot_started_us) :
+         ((!cmd->index_oid && query.length == sizeof(query)) ||
+          (cmd->index_oid && query.length == sizeof(query) + sizeof(index_nonce) &&
+           recv_all(client_fd, &index_nonce, sizeof(index_nonce)) == 0 && index_nonce))))
     {
         pthread_mutex_lock(&g_index_mutex);
-        reply.status = page_fold_ready_locked(cmd->db_oid, cmd->index_oid, index_nonce, &query, &event,
-                                               &device, &protected_us) ?
-            CUVS_STATUS_OK : CUVS_STATUS_NOT_FOUND;
+        bool ready = boot_started_us ?
+            page_fold_ready_for_boot_locked(cmd->db_oid, cmd->index_oid, index_nonce, &query,
+                                             boot_started_us, &event, &device, &protected_us) :
+            page_fold_ready_locked(cmd->db_oid, cmd->index_oid, index_nonce, &query,
+                                    &event, &device, &protected_us);
+        reply.status = ready ? CUVS_STATUS_OK : CUVS_STATUS_NOT_FOUND;
         pthread_mutex_unlock(&g_index_mutex);
     }
     if (reply.status == CUVS_STATUS_OK)
@@ -15411,12 +15519,17 @@ static void
 handle_page_fold_result(int client_fd, const CuvsCmdFrame *cmd)
 {
     CuvsPageFoldResult result;
+    uint32_t history[2] = {0};
     CuvsReplyHeader reply = {.status = CUVS_STATUS_ERROR};
+    bool resident = cmd->op == CUVS_OP_FOLD_RESIDENT_COMMITTED;
+    bool committed = resident || cmd->op == CUVS_OP_FOLD_COMMITTED;
 
     if (recv_all(client_fd, &result, sizeof(result)) == 0 &&
+        (!resident || (recv_all(client_fd, history, sizeof(history)) == 0 &&
+                       history[0] >= 3 && !history[1])) &&
         cuvs_page_fold_event_valid(&result.event) &&
         cmd->db_oid == result.event.db_oid && cmd->index_oid == result.event.index_oid &&
-        (cmd->op == CUVS_OP_FOLD_COMMITTED) == (result.transition_lsn != 0))
+        committed == (result.transition_lsn != 0))
     {
 #ifdef CUVS_CAGRA_FOLD_ENABLED
         uint64_t received_us = admission_mono_us();
@@ -15439,8 +15552,12 @@ handle_page_fold_result(int client_fd, const CuvsCmdFrame *cmd)
         }
 #endif
         pthread_mutex_lock(&g_index_mutex);
-        reply.status = result.event.daemon_id == g_page_daemon_id ?
-            page_fold_result_locked(&result, received_us) : CUVS_STATUS_NOT_FOUND;
+        if (result.event.daemon_id == g_page_daemon_id)
+            reply.status = resident ?
+                page_fold_result_with_history_locked(&result, received_us, history[0]) :
+                page_fold_result_locked(&result, received_us);
+        else
+            reply.status = CUVS_STATUS_NOT_FOUND;
         pthread_mutex_unlock(&g_index_mutex);
     }
     (void) send_all(client_fd, &reply, sizeof(reply));
@@ -15456,11 +15573,14 @@ receive_page_overlay(int client_fd, const CuvsCmdFrame *cmd, CuvsPageOverlayRequ
         return CUVS_STATUS_ERROR;
     if (cmd->dim == 0 || cmd->dim > 65535 || cmd->n_filter_tids ||
         request->base.resume_count || request->base.resume_distance ||
+        (cmd->op == CUVS_OP_SEARCH_PAGE_RESIDENT && request->base.reserved > 0 &&
+         request->base.reserved < 3) ||
 #ifdef CUVS_CAGRA_FOLD_ENABLED
         (request->base.reserved &&
+         cmd->op != CUVS_OP_SEARCH_PAGE_RESIDENT &&
          (cmd->op != CUVS_OP_SUPPLY_PAGES || request->base.reserved > request->base.n_slots)) ||
 #else
-        request->base.reserved ||
+        (request->base.reserved && cmd->op != CUVS_OP_SEARCH_PAGE_RESIDENT) ||
 #endif
         !request->boot_id || request->from < request->base.folded ||
         request->from > request->base.tail ||
@@ -15509,6 +15629,15 @@ find_page_overlay_graph(const CuvsCmdFrame *cmd, const CuvsPageOverlayRequest *r
         *overlay_owner = parent;
         return candidate;
     }
+    if (cmd->op == CUVS_OP_SEARCH_PAGE_RESIDENT)
+        for (graph = g_page_ancestors; graph; graph = graph->next)
+            if (page_graph_matches(graph, cmd, &request->base) &&
+                graph->dim == cmd->dim && graph->metric == cmd->metric &&
+                graph->overlay.boot_id == request->boot_id)
+            {
+                *overlay_owner = graph;
+                return graph;
+            }
     return NULL;
 }
 
@@ -15579,6 +15708,94 @@ send_page_overlay_reply(int client_fd, const CuvsReplyHeader *reply, const CuvsP
          reply->status == CUVS_STATUS_PAGE_OVERLAY_HOST_FULL) &&
         send_all(client_fd, progress, sizeof(*progress)) == 0;
 }
+
+#ifdef CUVS_PAGE_FORMAT
+static bool
+page_history_prune_matches(const PageCagraGraph *old, const CuvsCmdFrame *cmd,
+                            const CuvsPageHistoryPrune *request)
+{
+    return old->db_oid == cmd->db_oid && old->index_oid == cmd->index_oid &&
+        old->system_identifier == request->base.system_identifier &&
+        old->index_nonce == request->base.index_nonce && old->base_nonce == request->base.base_nonce &&
+        old->folded < request->base.folded;
+}
+
+/* The PostgreSQL boot stamp comes from the same host's monotonic clock.
+ * Once it advances, no PostgreSQL snapshot from the earlier boot survives. */
+static void
+prune_previous_page_boots_locked(const CuvsCmdFrame *cmd, const CuvsPageHistoryPrune *request)
+{
+    PageCagraGraph **link = &g_page_ancestors;
+
+    while (*link)
+    {
+        PageCagraGraph *old = *link;
+
+        if (page_history_prune_matches(old, cmd, request) && old->pg_boot_started_us &&
+            old->pg_boot_started_us < request->boot_started_us)
+        {
+            *link = old->next;
+            retire_page_graph_locked(old, true);
+            old->search_invalidated = true;
+        }
+        else
+            link = &old->next;
+    }
+}
+
+static void
+handle_page_history_prune(int fd, const CuvsCmdFrame *cmd)
+{
+    CuvsPageHistoryPrune request;
+    CuvsReplyHeader reply = {.status = CUVS_STATUS_ERROR};
+
+    if (recv_all(fd, &request, sizeof(request)) == 0 &&
+        request.base.length == sizeof(request) && request.boot_id && request.boot_started_us &&
+        request.base.reserved >= 3 &&
+        request.base.system_identifier && request.base.index_nonce && request.base.base_nonce &&
+        request.base.graph_nonce)
+    {
+        PageCagraGraph *graph;
+        CuvsPageOverlayChunk *obsolete = NULL;
+        bool matching;
+
+        pthread_mutex_lock(&g_index_mutex);
+        graph = find_page_graph(cmd, &request.base);
+        matching = false;
+        if (graph)
+        {
+            if (graph->overlay.boot_id == request.boot_id)
+                matching = !graph->pg_boot_started_us ||
+                    graph->pg_boot_started_us == request.boot_started_us;
+            else if (!graph->overlay.boot_id || (graph->pg_boot_started_us &&
+                     graph->pg_boot_started_us < request.boot_started_us))
+                matching = page_graph_use_boot_locked(graph, request.boot_id, &obsolete);
+            if (matching)
+                graph->pg_boot_started_us = request.boot_started_us;
+        }
+        else
+            for (const PageCagraGraph *old = g_page_ancestors; old && !matching; old = old->next)
+                matching = page_history_prune_matches(old, cmd, &request) &&
+                    ((old->overlay.boot_id == request.boot_id &&
+                      old->pg_boot_started_us == request.boot_started_us) ||
+                     (old->pg_boot_started_us && old->pg_boot_started_us < request.boot_started_us));
+        reply.status = CUVS_STATUS_NOT_FOUND;
+        if (matching)
+        {
+            prune_previous_page_boots_locked(cmd, &request);
+            prune_page_ancestors_locked(cmd->db_oid, cmd->index_oid, request.base.system_identifier,
+                                        request.base.index_nonce, request.base.base_nonce,
+                                        request.boot_id, request.base.reserved);
+            if (graph)
+                defer_page_overlay_release(cuvs_page_overlay_prune_folded(&graph->overlay, graph->folded));
+            reply.status = CUVS_STATUS_OK;
+        }
+        pthread_mutex_unlock(&g_index_mutex);
+        cuvs_page_overlay_release(obsolete);
+    }
+    (void) send_all(fd, &reply, sizeof(reply));
+}
+#endif
 
 static void
 handle_page_supply(int client_fd, const CuvsCmdFrame *cmd)
@@ -15660,6 +15877,26 @@ page_overlay_search_status(const CuvsCmdFrame *cmd, const CuvsPageOverlayRequest
     return CUVS_STATUS_OK;
 }
 
+/* A valid PostgreSQL horizon can release ancestors but cannot invalidate an
+ * already approved query. Revisit the active prefix after readers unpin. */
+static PageCagraGraph *
+find_resident_search_graph_locked(const CuvsCmdFrame *cmd, const CuvsPageOverlayRequest *request,
+                                  PageCagraGraph **owner, bool observe)
+{
+    PageCagraGraph *graph;
+
+    if (cmd->op == CUVS_OP_SEARCH_PAGE_RESIDENT && request->base.reserved)
+        prune_page_ancestors_locked(cmd->db_oid, cmd->index_oid, request->base.system_identifier,
+                                    request->base.index_nonce, request->base.base_nonce, request->boot_id,
+                                    request->base.reserved);
+    graph = find_page_overlay_graph(cmd, request, owner, observe);
+    if (cmd->op == CUVS_OP_SEARCH_PAGE_RESIDENT && graph &&
+        !(*owner)->ancestor_until_xid && (*owner)->overlay.boot_id == request->boot_id)
+        defer_page_overlay_release(
+            cuvs_page_overlay_prune_folded(&(*owner)->overlay, (*owner)->folded));
+    return graph;
+}
+
 /* At most one shared chunk straddles the fold boundary. Clip it once per
  * search under the host budget, preserving the packed vector order. Older
  * chunks remain intact for a parent that is still serving before ACK. */
@@ -15697,6 +15934,235 @@ clip_page_overlay_chunk(const CuvsPageOverlayChunk *chunk, uint64_t folded,
     return status;
 }
 
+static int
+page_resident_compare(const CuvsPageOverlayResult *a, const CuvsPageOverlayResult *b,
+                       bool descending)
+{
+    if (a->distance != b->distance)
+        return (a->distance < b->distance) != descending ? -1 : 1;
+    return (a->slot > b->slot) - (a->slot < b->slot);
+}
+
+static int
+page_resident_ascending(const void *a, const void *b)
+{
+    return page_resident_compare(a, b, false);
+}
+
+static int
+page_resident_descending(const void *a, const void *b)
+{
+    return page_resident_compare(a, b, true);
+}
+
+/* The graph pin protects its storage. The admission counter protects the
+ * separate lifetime of temporary GPU allocations made by this call. */
+static int
+page_resident_graph_search(PageCagraGraph *graph, const CuvsCmdFrame *cmd,
+                            const float *query, int k, const uint32_t *excluded,
+                            CuvsSearchResult *raw)
+{
+    int rc;
+
+    pthread_mutex_lock(&g_index_mutex);
+    ++g_unlocked_gpu_jobs;
+    pthread_mutex_unlock(&g_index_mutex);
+    if (!excluded)
+        rc = page_graph_search(graph, cmd, query, 1, k, NULL, raw);
+    else if (cmd->search_mode == 1)
+        rc = cuvs_bf_search_filtered(graph->bf[cmd->bf_precision], query, graph->dim, k,
+                                      excluded, graph->n_slots, raw, graph->gpu);
+    else
+        rc = cuvs_cagra_search_filtered(graph->handle, query, graph->dim, k,
+                                         excluded, graph->n_slots, raw, graph->gpu,
+                                         cmd->itopk_size, cmd->search_width);
+    pthread_mutex_lock(&g_index_mutex);
+    --g_unlocked_gpu_jobs;
+    pthread_mutex_unlock(&g_index_mutex);
+    return rc;
+}
+
+static uint32_t
+page_resident_base_results(const PageCagraGraph *graph, const CuvsSearchResult *raw,
+                           uint32_t k, bool normalize_ip, CuvsPageOverlayResult *out)
+{
+    uint32_t count = 0;
+
+    for (uint32_t i = 0; i < k && i < graph->n_slots; ++i)
+    {
+        float distance = normalize_ip ? 1.0f - raw[i].distance : raw[i].distance;
+
+        if (raw[i].item_id >= 0 && (uint64_t) raw[i].item_id < graph->n_slots &&
+            isfinite(distance))
+            out[count++] = (CuvsPageOverlayResult) {.slot = (uint64_t) raw[i].item_id,
+                                                   .distance = distance};
+    }
+    return count;
+}
+
+static bool
+page_resident_recv_advance(int fd, CuvsPageResidentAdvance *advance)
+{
+    const struct timeval work_timeout = {.tv_sec = 30};
+
+    while (recv_all(fd, advance, sizeof(*advance)) == 0)
+    {
+        if (advance->reserved != CUVS_PAGE_RESIDENT_KEEPALIVE)
+            return true;
+        if (advance->base_k || advance->pending_limit || advance->filter_words ||
+            setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &work_timeout, sizeof(work_timeout)) < 0)
+            return false;
+    }
+    return false;
+}
+
+/* The connection is the cursor. It owns the query, fixed range and graph
+ * pin for every reply. Pending distances are computed once. A larger ANN
+ * request replaces the prior base stream because ANN prefixes can change. */
+static void
+serve_page_resident_search(int fd, const CuvsCmdFrame *cmd, const CuvsPageOverlayRequest *request,
+                            PageCagraGraph *graph, const CuvsPageOverlayChunk *snapshot,
+                            const CuvsPageOverlayChunk *supplement, const float *query,
+                            CuvsSearchResult *raw, CuvsPageOverlayResult *base,
+                            const CuvsPageProgress *progress, bool normalize_ip, uint64_t started)
+{
+    CuvsReplyHeader reply = {.status = CUVS_STATUS_PAGE_OVERLAY_HOST_FULL};
+    CuvsPageOverlayResult *pending = NULL;
+    size_t charge = (size_t) (request->base.tail - request->base.folded) * sizeof(*pending);
+    int npending = 0;
+    uint32_t pending_read = 0;
+    CuvsPageResidentAdvance advance = {.base_k = cmd->k, .pending_limit = cmd->k};
+    uint32_t base_k = cmd->k;
+    bool filtered = false;
+    const struct timeval timeout = {.tv_sec = 5};
+
+    if (!cuvs_page_overlay_reserve(&g_page_overlay_budget, charge))
+    {
+        (void) send_page_overlay_reply(fd, &reply, progress);
+        return;
+    }
+    if (charge && !(pending = malloc(charge)))
+        goto fail;
+    if (setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) < 0 ||
+        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout)) < 0)
+    {
+        reply.status = CUVS_STATUS_ERROR;
+        goto fail;
+    }
+
+    for (const CuvsPageOverlayChunk *chunk = snapshot; chunk; chunk = chunk->next)
+    {
+        if (chunk->from < request->base.folded &&
+            request->base.folded - chunk->from >= chunk->positions)
+            break;
+        cuvs_page_overlay_collect_range(chunk, request->base.folded, request->from,
+                                         &request->base, query, cmd, pending, &npending);
+    }
+    cuvs_page_overlay_collect_range(supplement, request->from, request->base.tail,
+                                     &request->base, query, cmd, pending, &npending);
+    if (npending > 1)
+        qsort(pending, (size_t) npending, sizeof(*pending),
+              cmd->metric == CUVS_METRIC_IP ? page_resident_descending : page_resident_ascending);
+
+    for (;;)
+    {
+        CuvsPageResidentWindow window = {.base_k = base_k};
+        bool valid;
+
+        pthread_mutex_lock(&g_index_mutex);
+        valid = !graph->search_invalidated &&
+            (graph->fold_retired || !graph->overlay.boot_id ||
+             graph->overlay.boot_id == request->boot_id);
+        pthread_mutex_unlock(&g_index_mutex);
+        if (!valid)
+        {
+            reply.status = CUVS_STATUS_NOT_FOUND;
+            goto fail;
+        }
+        if (advance.base_k)
+        {
+            window.base_count = page_resident_base_results(graph, raw, base_k,
+                                                           normalize_ip && !filtered, base);
+            qsort(base, window.base_count, sizeof(*base),
+                  cmd->metric == CUVS_METRIC_IP ? page_resident_descending : page_resident_ascending);
+        }
+        window.pending_count = advance.pending_limit < (uint32_t) npending - pending_read ?
+            advance.pending_limit : (uint32_t) npending - pending_read;
+        window.pending_left = (uint32_t) npending - pending_read - window.pending_count;
+        reply.status = CUVS_STATUS_OK;
+        reply.n_results = window.base_count + window.pending_count;
+        reply.latency_us = (uint32_t) (admission_mono_us() - started);
+        if (!send_page_overlay_reply(fd, &reply, progress) ||
+            send_all(fd, &window, sizeof(window)) < 0 ||
+            (window.base_count && send_all(fd, base, window.base_count * sizeof(*base)) < 0) ||
+            (window.pending_count &&
+             send_all(fd, pending + pending_read, window.pending_count * sizeof(*pending)) < 0))
+            break;
+        pending_read += window.pending_count;
+        if ((!window.pending_left && !filtered && base_k >= graph->n_slots) ||
+            !page_resident_recv_advance(fd, &advance))
+            break;
+        if (advance.reserved || advance.base_k > CUVS_PAGE_RESIDENT_BASE_MAX_K ||
+            (advance.filter_words && ((!filtered && base_k != CUVS_PAGE_RESIDENT_BASE_MAX_K) ||
+             !advance.base_k || advance.filter_words != (graph->n_slots + 31) / 32)) ||
+            (!advance.filter_words && advance.base_k && (filtered || advance.base_k <= base_k)) ||
+            advance.pending_limit > CUVS_PAGE_SEARCH_MAX_K ||
+            (!advance.base_k && (!advance.pending_limit || !window.pending_left)))
+        {
+            reply.status = CUVS_STATUS_ERROR;
+            goto fail;
+        }
+#ifdef CUVS_TEST_HOOKS
+        page_overlay_test_gate("CUVS_TEST_PAGE_OVERLAY_NEXT_FIFO");
+#endif
+        if (advance.base_k)
+        {
+            uint32_t search_k = graph->n_slots < advance.base_k ? (uint32_t) graph->n_slots : advance.base_k;
+            size_t filter_bytes = (size_t) advance.filter_words * sizeof(uint32_t);
+            uint32_t *excluded = NULL;
+            int rc;
+
+            if (filter_bytes)
+            {
+                if (!cuvs_page_overlay_reserve(&g_page_overlay_budget, filter_bytes))
+                {
+                    reply.status = CUVS_STATUS_PAGE_OVERLAY_HOST_FULL;
+                    goto fail;
+                }
+                excluded = malloc(filter_bytes);
+                if (!excluded || recv_all(fd, excluded, filter_bytes) < 0)
+                {
+                    free(excluded);
+                    cuvs_page_overlay_unreserve(&g_page_overlay_budget, filter_bytes);
+                    reply.status = CUVS_STATUS_ERROR;
+                    goto fail;
+                }
+                filtered = true;
+            }
+            rc = page_resident_graph_search(graph, cmd, query, (int) search_k, excluded, raw);
+            if (excluded)
+            {
+                free(excluded);
+                cuvs_page_overlay_unreserve(&g_page_overlay_budget, filter_bytes);
+            }
+            if (rc != 0)
+            {
+                reply.status = CUVS_STATUS_OOM_FALLBACK;
+                goto fail;
+            }
+            base_k = advance.base_k;
+        }
+    }
+    goto done;
+
+fail:
+    reply.n_results = 0;
+    (void) send_page_overlay_reply(fd, &reply, progress);
+done:
+    free(pending);
+    cuvs_page_overlay_unreserve(&g_page_overlay_budget, charge);
+}
+
 static void
 handle_page_overlay_search(int client_fd, const CuvsCmdFrame *cmd)
 {
@@ -15705,11 +16171,14 @@ handle_page_overlay_search(int client_fd, const CuvsCmdFrame *cmd)
     CuvsPageProgress progress = {0};
     CuvsPageOverlayChunk *supplement = NULL, *obsolete = NULL;
     CuvsPageOverlayChunk *snapshot = NULL, *clipped = NULL;
+    PageGraphFoldRef search_ref = {0};
     CuvsSearchResult *raw = NULL;
     CuvsPageOverlayResult *results = NULL;
     void *query = MAP_FAILED;
     size_t bytes = 0;
     bool batch = cmd->op == CUVS_OP_SEARCH_PAGE_OVERLAY_BATCH;
+    bool resident = cmd->op == CUVS_OP_SEARCH_PAGE_RESIDENT;
+    bool resident_sent = false;
     bool normalize_hnsw_ip = false;
     uint32_t prefix = batch ? 2 * sizeof(uint32_t) : 0;
     uint64_t started;
@@ -15722,14 +16191,15 @@ handle_page_overlay_search(int client_fd, const CuvsCmdFrame *cmd)
     if (reply.status != CUVS_STATUS_OK)
         goto done;
     reply.status = CUVS_STATUS_ERROR;
-    if (cmd->k == 0 || cmd->k > CUVS_PAGE_SEARCH_MAX_K || cmd->n_vecs < 1 || cmd->n_vecs > 1024 ||
+    if (cmd->k == 0 || cmd->k > CUVS_PAGE_SEARCH_MAX_K ||
+        (resident && cmd->k > CUVS_PAGE_RESIDENT_BASE_MAX_K) || cmd->n_vecs < 1 || cmd->n_vecs > 1024 ||
         batch != (cmd->n_vecs > 1) || cmd->search_mode > 1 || cmd->bf_precision > 1)
         goto done;
     progress.daemon_id = g_page_daemon_id;
     if (request.positions)
     {
         pthread_mutex_lock(&g_index_mutex);
-        graph = find_page_overlay_graph(cmd, &request, &owner, true);
+        graph = find_resident_search_graph_locked(cmd, &request, &owner, true);
         reply.status = CUVS_STATUS_NOT_FOUND;
         if (graph && page_graph_use_boot_locked(owner, request.boot_id, &obsolete))
         {
@@ -15737,6 +16207,16 @@ handle_page_overlay_search(int client_fd, const CuvsCmdFrame *cmd)
             generation = owner->overlay.generation;
             progress.covered_upto = owner->overlay.covered_upto;
             reply.status = page_overlay_search_status(cmd, &request, graph, &owner->overlay);
+            if (resident && reply.status == CUVS_STATUS_OK)
+            {
+                if (!page_graph_fold_pin_locked(graph, &search_ref))
+                    reply.status = CUVS_STATUS_NOT_FOUND;
+                else if (request.from > request.base.folded)
+                {
+                    snapshot = owner->overlay.head;
+                    cuvs_page_overlay_retain(snapshot);
+                }
+            }
         }
         pthread_mutex_unlock(&g_index_mutex);
         cuvs_page_overlay_release(obsolete);
@@ -15755,28 +16235,66 @@ handle_page_overlay_search(int client_fd, const CuvsCmdFrame *cmd)
                    ((const uint32_t *) query)[1] != cmd->dim)))
         goto done;
     vectors = (const float *) ((const char *) query + prefix);
-    raw = malloc((size_t) cmd->n_vecs * cmd->k * sizeof(*raw));
-    results = calloc((size_t) cmd->n_vecs * cmd->k, sizeof(*results));
+    raw = malloc((resident ? CUVS_PAGE_SEARCH_MAX_K : (size_t) cmd->n_vecs * cmd->k) * sizeof(*raw));
+    results = calloc(resident ? CUVS_PAGE_SEARCH_MAX_K : (size_t) cmd->n_vecs * cmd->k, sizeof(*results));
     if (!raw || !results)
         goto done;
 
     started = admission_mono_us();
     pthread_mutex_lock(&g_index_mutex);
-    graph = find_page_overlay_graph(cmd, &request, &owner, !request.positions);
-    if (!graph || (supplement && (graph->registered_order != registered_order ||
-                                 owner->overlay.generation != generation)) ||
-        !page_graph_use_boot_locked(owner, request.boot_id, &obsolete))
+    if (search_ref.entry)
     {
-        reply.status = CUVS_STATUS_NOT_FOUND;
-        goto unlock;
+        graph = search_ref.entry;
+        if (graph->search_invalidated)
+        {
+            reply.status = CUVS_STATUS_NOT_FOUND;
+            goto unlock;
+        }
     }
-    progress.covered_upto = owner->overlay.covered_upto;
-    reply.status = page_overlay_search_status(cmd, &request, graph, &owner->overlay);
-    if (reply.status != CUVS_STATUS_OK)
-        goto unlock;
+    else
+    {
+        graph = find_resident_search_graph_locked(cmd, &request, &owner, !request.positions);
+        if (!graph || (supplement && (graph->registered_order != registered_order ||
+                                     owner->overlay.generation != generation)) ||
+            !page_graph_use_boot_locked(owner, request.boot_id, &obsolete))
+        {
+            reply.status = CUVS_STATUS_NOT_FOUND;
+            goto unlock;
+        }
+        progress.covered_upto = owner->overlay.covered_upto;
+        reply.status = page_overlay_search_status(cmd, &request, graph, &owner->overlay);
+        if (reply.status != CUVS_STATUS_OK)
+            goto unlock;
+        if (resident)
+        {
+            if (!page_graph_fold_pin_locked(graph, &search_ref))
+            {
+                reply.status = CUVS_STATUS_NOT_FOUND;
+                goto unlock;
+            }
+            if (request.from > request.base.folded)
+            {
+                snapshot = owner->overlay.head;
+                cuvs_page_overlay_retain(snapshot);
+            }
+        }
+    }
 
     k = (int) (graph->n_slots < cmd->k ? graph->n_slots : cmd->k);
-    if (page_graph_search(graph, cmd, vectors, (int) cmd->n_vecs, k, NULL, raw) != 0)
+    if (resident)
+    {
+        int rc;
+
+        pthread_mutex_unlock(&g_index_mutex);
+        rc = page_resident_graph_search(graph, cmd, vectors, k, NULL, raw);
+        pthread_mutex_lock(&g_index_mutex);
+        if (rc != 0)
+        {
+            reply.status = CUVS_STATUS_OOM_FALLBACK;
+            goto unlock;
+        }
+    }
+    else if (page_graph_search(graph, cmd, vectors, (int) cmd->n_vecs, k, NULL, raw) != 0)
     {
         reply.status = CUVS_STATUS_OOM_FALLBACK;
         goto unlock;
@@ -15787,14 +16305,17 @@ handle_page_overlay_search(int client_fd, const CuvsCmdFrame *cmd)
     if (graph->hits < UINT32_MAX)
         ++graph->hits;
 
-    registered_order = graph->registered_order;
-    generation = owner->overlay.generation;
     normalize_hnsw_ip = cmd->metric == CUVS_METRIC_IP && cmd->search_mode == 0 &&
                        cmd->use_cpu_hnsw && graph->cpu_hnsw;
-    if (request.from > request.base.folded)
+    if (!resident)
     {
-        snapshot = owner->overlay.head;
-        cuvs_page_overlay_retain(snapshot);
+        registered_order = graph->registered_order;
+        generation = owner->overlay.generation;
+        if (request.from > request.base.folded)
+        {
+            snapshot = owner->overlay.head;
+            cuvs_page_overlay_retain(snapshot);
+        }
     }
     reply.status = CUVS_STATUS_OK;
 unlock:
@@ -15807,6 +16328,13 @@ unlock:
     if (snapshot)
         page_overlay_test_gate("CUVS_TEST_PAGE_OVERLAY_SCORE_FIFO");
 #endif
+    if (resident)
+    {
+        serve_page_resident_search(client_fd, cmd, &request, graph, snapshot, supplement,
+                                    vectors, raw, results, &progress, normalize_hnsw_ip, started);
+        resident_sent = true;
+        goto done;
+    }
     /* Only the copied base results and an immutable overlay prefix are used
      * below. Concurrent appends leave this search's covered range intact. */
     const CuvsPageOverlayChunk *first = snapshot;
@@ -15876,8 +16404,9 @@ done:
     cuvs_page_overlay_release(supplement);
     cuvs_page_overlay_release(clipped);
     cuvs_page_overlay_release(snapshot);
-    if (send_page_overlay_reply(client_fd, &reply, &progress) && reply.n_results)
+    if (!resident_sent && send_page_overlay_reply(client_fd, &reply, &progress) && reply.n_results)
         (void) send_all(client_fd, results, reply.n_results * sizeof(*results));
+    page_graph_fold_unpin(&search_ref);
     free(results);
 }
 
@@ -16016,16 +16545,30 @@ connection_thread(void *arg)
             break;
         case CUVS_OP_SEARCH_PAGE_OVERLAY:
         case CUVS_OP_SEARCH_PAGE_OVERLAY_BATCH:
+#ifdef CUVS_PAGE_FORMAT
+        case CUVS_OP_SEARCH_PAGE_RESIDENT:
+#endif
             handle_page_overlay_search(client_fd, &cmd);
             break;
         case CUVS_OP_SUPPLY_PAGES:
             handle_page_supply(client_fd, &cmd);
             break;
+#ifdef CUVS_PAGE_FORMAT
+        case CUVS_OP_PAGE_HISTORY_PRUNE:
+            handle_page_history_prune(client_fd, &cmd);
+            break;
+#endif
         case CUVS_OP_FOLD_READY:
+#ifdef CUVS_PAGE_FORMAT
+        case CUVS_OP_FOLD_RESIDENT_READY:
+#endif
             handle_page_fold_ready(client_fd, &cmd);
             break;
         case CUVS_OP_FOLD_COMMITTED:
         case CUVS_OP_FOLD_DISCARD:
+#ifdef CUVS_PAGE_FORMAT
+        case CUVS_OP_FOLD_RESIDENT_COMMITTED:
+#endif
             handle_page_fold_result(client_fd, &cmd);
             break;
         case CUVS_OP_SEARCH_PAGES:
