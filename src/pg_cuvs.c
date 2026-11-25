@@ -7227,7 +7227,7 @@ cuvs_aminsert(Relation indexRel, Datum *values, bool *isnull,
             ereport(ERROR,
                     (errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
                      errmsg("pg_cuvs: cannot insert while CAGRA compaction is pending"),
-                     errhint("Complete compaction of the index, then retry the transaction.")));
+                     errhint("Complete compaction, or REINDEX if the index is stale, then retry the transaction.")));
         /* BUILD_FAILED / daemon down → fall through to delta. */
     }
 

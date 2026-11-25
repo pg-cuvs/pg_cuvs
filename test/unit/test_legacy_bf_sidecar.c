@@ -465,9 +465,62 @@ begin_compact_with_prior_extend(bool published)
 }
 
 static void
-compact_pending_shutdown(bool published)
+assert_stale_compact_blocks_reuse(void)
+{
+    IndexEntry *e = find_index(db, idx);
+    int64_t old_n = e->n_vecs;
+    uint32_t status = run_extend(104, 10);
+    if (status == CUVS_STATUS_OK)
+    {
+        /* The old vector must not still claim distance zero for the slot
+         * now holding the newly inserted vector. Expose that exact RED. */
+        assert_graph_hit(e, 4, 104);
+        assert_graph_hit(e, 10, 104);
+    }
+    assert(status == CUVS_STATUS_STALE);
+    assert(e->stale && e->n_vecs == old_n);
+
+    /* A stale SEARCH must reply before opening a query payload. */
+    int sockets[2];
+    assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
+    CuvsCmdFrame cmd = {.op = CUVS_OP_SEARCH, .db_oid = db, .index_oid = idx,
+                        .dim = dim, .metric = CUVS_METRIC_L2, .k = 1};
+    handle_search(sockets[1], &cmd);
+    assert(reply_status(sockets) == CUVS_STATUS_STALE);
+}
+
+static void
+reuse_compacted_tid(bool needs_reindex)
+{
+    if (needs_reindex)
+    {
+        /* A fresh heap build includes all survivors, including the prior
+         * EXTEND, but omits the deleted incarnation of TID 104. */
+        const float live_vecs[] = {1, 0, 2, 0, 3, 0, 9, 0};
+        const uint64_t live_tids[] = {101, 102, 103, 105};
+        assert(build(g_index_dir, live_vecs, live_tids) == CUVS_STATUS_OK);
+    }
+    IndexEntry *e = find_index(db, idx);
+    assert(!e->stale && !e->compact_save_pending);
+    assert(run_extend(104, 10) == CUVS_STATUS_OK);
+    assert(save_index(e) == 0);
+    e = reload_from_disk();
+    assert_graph_hit(e, 9, 105);
+    assert_graph_hit(e, 10, 104);
+    int n_reused = 0;
+    for (int64_t i = 0; i < e->n_vecs; i++)
+        n_reused += e->tids[i] == 104;
+    assert(n_reused == 1);
+}
+
+static void
+compact_pending_shutdown(bool published, bool missing_tombstone)
 {
     begin_compact_with_prior_extend(published);
+    char tombstone[512];
+    snprintf(tombstone, sizeof(tombstone), "%s/%u_%u.tombstone", g_index_dir, db, idx);
+    if (missing_tombstone)
+        assert(unlink(tombstone) == 0);
     fault = NO_FAULT;
     pid_t child = fork();
     assert(child >= 0);
@@ -492,9 +545,18 @@ compact_pending_shutdown(bool published)
     IndexEntry *e = reload_from_disk();
     assert(e->n_vecs == (published ? 4 : 5));
     assert_graph_hit(e, 9, 105);
-    char tombstone[512];
-    snprintf(tombstone, sizeof(tombstone), "%s/%u_%u.tombstone", g_index_dir, db, idx);
-    assert(unlink(tombstone) == 0); /* Shutdown must have kept the tombstones. */
+    assert(!e->compact_save_pending);
+    if (!missing_tombstone)
+    {
+        assert(access(tombstone, F_OK) == 0); /* Shutdown kept the file. */
+        if (published)
+            assert(run_compact() == CUVS_STATUS_OK);
+        else
+            assert(unlink(tombstone) == 0);
+    }
+    if (!published)
+        assert_stale_compact_blocks_reuse();
+    reuse_compacted_tid(!published);
 }
 
 static void
@@ -520,16 +582,23 @@ compact_pending_missing_tombstone(bool published)
     fault = NO_FAULT;
     char alias[sizeof(g_index_dir) + sizeof("/.")];
     snprintf(alias, sizeof(alias), "%s/.", g_index_dir);
-    assert(run_compact_in(alias) == CUVS_STATUS_OK);
-    IndexEntry *e = find_index(db, idx);
-    uint32_t disk_crc;
-    assert(tids_body_crc_of(e, &disk_crc) == 0);
-    assert(disk_crc == cuvs_crc32(e->tids, (size_t)e->n_vecs * sizeof(*e->tids)));
-    assert(run_extend(106, 10) == CUVS_STATUS_OK);
-    assert(save_index(e) == 0);
-    e = reload_from_disk();
-    assert_graph_hit(e, 9, 105);
-    assert_graph_hit(e, 10, 106);
+    uint32_t status = run_compact_in(alias);
+    if (published)
+    {
+        assert(status == CUVS_STATUS_OK);
+        IndexEntry *e = find_index(db, idx);
+        uint32_t disk_crc;
+        assert(tids_body_crc_of(e, &disk_crc) == 0);
+        assert(disk_crc == cuvs_crc32(e->tids, (size_t)e->n_vecs * sizeof(*e->tids)));
+    }
+    else
+    {
+        /* Fail at the actual reused slot on the old code, before checking
+         * the status of the cleanup that incorrectly allowed it. */
+        assert_stale_compact_blocks_reuse();
+        assert(status == CUVS_STATUS_PERSIST_FAILED);
+    }
+    reuse_compacted_tid(!published);
 }
 
 static void
@@ -597,9 +666,11 @@ main(int argc, char **argv)
     else if (strcmp(argv[1], "compact-retry-tombstone") == 0)
         compact_save_retry(COMPACT_TOMBSTONE_UNLINK_FAIL);
     else if (strcmp(argv[1], "compact-shutdown-before") == 0)
-        compact_pending_shutdown(false);
+        compact_pending_shutdown(false, false);
     else if (strcmp(argv[1], "compact-shutdown-after") == 0)
-        compact_pending_shutdown(true);
+        compact_pending_shutdown(true, false);
+    else if (strcmp(argv[1], "compact-shutdown-before-enoent") == 0)
+        compact_pending_shutdown(false, true);
     else if (strcmp(argv[1], "compact-enoent-before") == 0)
         compact_pending_missing_tombstone(false);
     else if (strcmp(argv[1], "compact-enoent-after") == 0)

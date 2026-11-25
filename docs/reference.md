@@ -51,6 +51,9 @@ corpora that require exhaustive search; use `cagra`/`ivfpq` for approximate sear
 > If a legacy CAGRA compaction fails to save or remove its tombstones, an
 > INSERT that would extend that resident index reports SQLSTATE `40001`.
 > Complete compaction, then retry the transaction.
+> If the tombstones disappear before their rows are removed, or the daemon
+> shuts down with those rows still in the resident graph, the index is marked
+> stale. Use `REINDEX` to restore GPU searches and writes to the graph.
 
 **NULL query vector.** A `cagra` / `flat` / `ivfpq` index scan cannot answer
 `ORDER BY col <-> NULL` — there is no vector to search with — so it raises

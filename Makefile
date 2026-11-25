@@ -1414,7 +1414,8 @@ test-physical-build-mutations:
 # Legacy sidecar validity through the actual daemon with a CPU wrapper.
 LEGACY_BF_CASES ?= reused-tid streaming alias rollback build-crash build-fsync-rollback \
 	compact-retry-unlink compact-retry-fsync compact-retry-publish compact-retry-tombstone binding-other-dir \
-	compact-shutdown-before compact-shutdown-after compact-enoent-before compact-enoent-after
+	compact-shutdown-before compact-shutdown-after compact-shutdown-before-enoent \
+	compact-enoent-before compact-enoent-after
 EXTRA_CLEAN += test-legacy-bf-sidecar
 .PHONY: test-legacy-bf-sidecar
 test-legacy-bf-sidecar:
