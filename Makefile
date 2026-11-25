@@ -196,7 +196,7 @@ endif
 
 src/cuvs_wrapper.o: src/cuvs_wrapper.cu src/cuvs_wrapper.h src/cuvs_hnsw_sdk_plan.cuh \
                     src/cuvs_hnsw_nn_sdk_params.cuh src/cuvs_hnsw_nn_precision.h src/cuvs_hnsw_nn_capacity.h src/cuvs_hnsw_nn_upper_contract.h src/cuvs_hnsw_nn_center.h \
-                    src/cuvs_failed_allocation.hpp src/cuvs_rmm_failure_resource.hpp \
+                    src/cuvs_failed_allocation.hpp src/cuvs_rmm_failure_resource.hpp src/cuvs_search_staging.hpp \
                     src/cuvs_cagra_fold.h src/cuvs_cagra_fold_capacity.h src/cuvs_cagra_fold_sdk.hpp src/.cuvs-fold-mode
 	$(CUVS_SDK_PLAN_NOTE)
 	$(NVCC) $(NVCC_FLAGS) $(CUVS_SDK_PLAN_FLAGS) $(CUVS_FOLD_CPPFLAGS) -I$(CUVS_INCLUDE) -I$(CUVS_RAPIDS_INCLUDE) -I./src -c $< -o $@
@@ -660,6 +660,35 @@ test-cagra-fold-build: test/unit/test_cagra_fold_build.c test/gpu/test_cagra_fol
 	./$@
 EXTRA_CLEAN += test-cagra-fold-build test-cagra-fold-build.o test-cagra-fold-build.early.o
 
+# C7: run real GPU search with pinned staging, with staging disabled, and over cap.
+.PHONY: test-gpu-search-staging
+ifdef PGCUVS_CPU_SHIM
+test-gpu-search-staging:
+	@echo "test-gpu-search-staging requires the native CUDA wrapper" >&2; exit 2
+else
+test-gpu-search-staging: test/gpu/test_search_staging.c $(WRAPPER_OBJ) src/cuvs_util_server.o src/cuvs_peak_meter_server.o
+	$(CC) -std=gnu11 -Wall -Wextra -Werror -I src -c $< -o $@.o
+	$(CXX) -o $@ $@.o $(filter %.o,$^) $(SERVER_LDFLAGS) -lm
+	@set -eu; work=$$(mktemp -d); trap 'rm -rf "$$work"' EXIT; \
+	page=$$(getconf PAGESIZE); \
+	run() { mode=$$1; shift; \
+		if ! env "$$@" ./$@ "$$mode" >"$$work/$$mode.log" 2>&1; then cat "$$work/$$mode.log"; return 1; fi; \
+		cat "$$work/$$mode.log"; \
+		grep -E '^(exact|anchor) ' "$$work/$$mode.log" >"$$work/$$mode.exact"; \
+	}; \
+	run pinned CUVS_PIN_STAGE_MAX_BYTES=67108864 CUVS_PIN_STAGE_PREWARM=2; \
+	run off CUVS_PIN_STAGE_MAX_BYTES=0 CUVS_PIN_STAGE_PREWARM=0; \
+	run over-cap CUVS_PIN_STAGE_MAX_BYTES="$$page" CUVS_PIN_STAGE_PREWARM=1; \
+	grep -Fq 'prewarmed 2 region(s)' "$$work/pinned.log"; \
+	! grep -Fq '[pin_stage]' "$$work/off.log" || exit 1; \
+	grep -Fq 'prewarmed 1 region(s)' "$$work/over-cap.log"; \
+	grep -Fq "exceeds pinned cap $$page; using pageable buffers" "$$work/over-cap.log"; \
+	diff -u "$$work/pinned.exact" "$$work/off.exact"; \
+	diff -u "$$work/pinned.exact" "$$work/over-cap.exact"; \
+	echo "test-gpu-search-staging: exact and CAGRA anchor IDs and distances match across all three modes"
+endif
+EXTRA_CLEAN += test-gpu-search-staging test-gpu-search-staging.o
+
 .PHONY: test-rmm-fold-backing
 test-rmm-fold-backing: test/i3b/gpu_failed_upstream.cu src/cuvs_rmm_failure_resource.hpp src/cuvs_admission_contract.h
 	$(NVCC) $(NVCC_FLAGS) -DPGCUVS_BETA3A_GPU_FOLD -I$(CUVS_INCLUDE) -I$(CUVS_RAPIDS_INCLUDE) -I src -c $< -o $@.o
@@ -807,6 +836,14 @@ test-lw-guard: test/unit/test_lw_guard.cpp src/cuvs_lw_guard.hpp src/cuvs_lw_pol
                src/cuvs_admission_contract.h
 	$(CXX) -std=c++17 -Wall -Wextra -Werror -pthread -I src -o $@ test/unit/test_lw_guard.cpp
 	./$@
+
+# C7: fake CUDA exercises staging ownership and stream-error cleanup.
+.PHONY: test-search-staging
+test-unit: test-search-staging
+test-search-staging: test/unit/test_search_staging.cpp src/cuvs_search_staging.hpp
+	$(CXX) -std=c++17 -Wall -Wextra -Werror -pthread -I src -o $@ $<
+	./$@
+EXTRA_CLEAN += test-search-staging
 
 # Q6: RAFT host frees inside a request wait for its stream (cuvs_host_free_fence.hpp).
 test-host-free-fence: test/unit/test_host_free_fence.cpp src/cuvs_host_free_fence.hpp

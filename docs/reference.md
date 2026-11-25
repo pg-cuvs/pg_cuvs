@@ -349,6 +349,47 @@ daemon-only ones have no session equivalent.
 | `--gcs-key-file PATH` | separate daemon flag; backend GUC is not forwarded | `` | Service-account JSON path |
 | `--warmup-threads N` | separate daemon flag; backend GUC is not forwarded | `2` | Background GCS warmup pool size |
 
+### GPU search host staging
+
+The daemon reads `CUVS_PIN_STAGE_MAX_BYTES` at startup. It limits the total
+CUDA pinned search staging capacity **per GPU** to 64 MiB by default. The
+setting is rounded down to a host page and `0` disables pinned staging.
+`CUVS_PIN_STAGE_PREWARM` requests up to 32 two-MiB regions per GPU by default
+(range 0–1024, with 0 disabling prewarm). Prewarm draws from the same budget
+as search.
+
+The budget includes active, idle and quarantined regions, and the full size
+of any allocation in progress. An idle region may be freed to make room for
+a larger request. Its charge remains until CUDA confirms the free. If CUDA
+reports a failed free, or a stream wait fails with a staging copy outstanding,
+the affected region stays charged and the pool keeps it out of circulation
+until process exit.
+
+When pinned staging cannot fit or allocate a region, search uses pageable
+scratch. Under normal operation the host allocator determines whether the
+scratch can be allocated. This applies to large results, large filters,
+concurrent requests and pinned-off mode.
+
+If a submitted pageable copy cannot be confirmed complete, the wrapper
+quarantines only the affected scratch and attempts to record a CUDA event on
+the borrowing stream before the slot is returned. Later pageable requests
+on that GPU can query one pending event without synchronizing. A successful
+query releases the corresponding addresses. If event recording fails or
+the query returns an error other than not-ready, the addresses stay
+quarantined until process exit. Other requests continue to use the host
+allocator normally. A CPU allocation failure returns a search error before
+GPU search work starts and returns the healthy resource slot to its pool.
+Errors after GPU work starts follow the existing resource error path.
+
+`make test-search-staging` covers pinned budget contention, large and
+concurrent pageable requests, allocation and free failures, and pageable
+event recovery with fake CUDA operations. Tier 2 runs
+`make test-gpu-search-staging` against native CUDA. That target checks path
+diagnostics and compares exact results and CAGRA self-match IDs and
+distances across pinned, off and over-cap modes. It checks each CAGRA
+distance against the returned corpus row and prints the full CAGRA and
+IVF-PQ results for diagnosis.
+
 ### RMM quota and memory accounting
 
 The current device resource is installed before hardware probes, index reload,

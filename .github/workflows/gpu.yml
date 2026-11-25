@@ -87,6 +87,7 @@ jobs:
       - name: Full regression (installcheck + isolation)
         run: |
           source ~/miniforge3/bin/activate cuvs_dev
+          make test-gpu-search-staging
           make installcheck
           make installcheck-isolation
           make installcheck-isolation-gpu
