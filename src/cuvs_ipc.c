@@ -314,6 +314,27 @@ uds_connect_ex(const char *socket_path, int recv_timeout_sec)
     return uds_connect_wait(socket_path, recv_timeout_sec, NULL);
 }
 
+/* BUILD retains the connect and send budgets. After sending the request,
+ * keep waiting for the daemon's terminal reply with the PostgreSQL locks
+ * held. Clear the receive timeout before sending any request bytes. */
+static int
+uds_connect_build(const char *socket_path)
+{
+    const struct timeval no_timeout = {0};
+    int fd = uds_connect_ex(socket_path, 600);
+
+    if (fd < 0)
+        return -1;
+    if (setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &no_timeout, sizeof(no_timeout)) != 0)
+    {
+        int err = errno;
+        close(fd);
+        errno = err;
+        return -1;
+    }
+    return fd;
+}
+
 static int
 uds_connect(const char *socket_path)
 {
@@ -2013,7 +2034,7 @@ cuvs_ipc_build(
     LOG_DEBUG("[cuvs_ipc_build] tier=%d shm_key=%s pass_fd=%d socket=%s n_vecs=%lld dim=%d\n",
         (int)corpus->kind, shm_key, pass_fd, socket_path, (long long)n_vecs, dim);
 
-    sock = uds_connect_ex(socket_path, 600);  /* BUILD can take minutes */
+    sock = uds_connect_build(socket_path);
     if (sock < 0) {
         LOG_ERROR("[cuvs_ipc_build] uds_connect FAILED errno=%d (%s)\n",
                 errno, strerror(errno));
@@ -2128,7 +2149,7 @@ cuvs_ipc_build_flat(
     LOG_DEBUG("[cuvs_ipc_build_flat] tier=%d shm_key=%s pass_fd=%d socket=%s n_vecs=%lld dim=%d\n",
         (int)corpus->kind, shm_key, pass_fd, socket_path, (long long)n_vecs, dim);
 
-    sock = uds_connect_ex(socket_path, 600);  /* BUILD can take a while */
+    sock = uds_connect_build(socket_path);
     if (sock < 0) {
         LOG_ERROR("[cuvs_ipc_build_flat] uds_connect FAILED errno=%d (%s)\n",
                 errno, strerror(errno));
@@ -2214,7 +2235,7 @@ cuvs_ipc_build_multi(
         return CUVS_STATUS_ERROR;
     }
 
-    sock = uds_connect_ex(socket_path, 600);  /* BUILD can take minutes */
+    sock = uds_connect_build(socket_path);
     if (sock < 0) {
         LOG_ERROR("[cuvs_ipc_build_multi] uds_connect FAILED errno=%d (%s)\n",
                 errno, strerror(errno));
@@ -3068,7 +3089,7 @@ cuvs_ipc_build_ivfpq(
         goto cleanup;
     }
 
-    sock = uds_connect_ex(socket_path, 600);  /* IVF-PQ build can take minutes */
+    sock = uds_connect_build(socket_path);
     if (sock < 0) {
         LOG_ERROR("[cuvs_ipc_build_ivfpq] uds_connect FAILED errno=%d (%s)\n",
                   errno, strerror(errno));
