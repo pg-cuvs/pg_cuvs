@@ -118,9 +118,11 @@ exists for 0.9.0.
   them, as they did before.
 - `pg_cuvs_hnsw` heap builds now use `m` for neighbor capacity, with default
   32. When an input has 1–64 rows, a default build now stores M 32 and reserves
-  slots accordingly even though the graph width is smaller. An explicit `m`
-  already recorded by an earlier release takes effect on the next rebuild or
-  restore. Use the [catalog query](docs/reference.md#pg_cuvs_hnsw) to find indexes
+  slots accordingly even though the graph width is smaller, so such an index
+  can grow slightly after `REINDEX` (16 KB to 24 KB for a 15-row sample) while
+  returning the same search results. An explicit `m` already recorded by an
+  earlier release takes effect on the next rebuild or restore, which can change
+  the index size, build time and search quality. Use the [catalog query](docs/reference.md#pg_cuvs_hnsw) to find indexes
   where the configured and built values differ. Source builds inherit the
   converted M and warn once when an explicit `m` differs. `ALTER INDEX ...
   SET (m = ...)` applies on the next rebuild.
