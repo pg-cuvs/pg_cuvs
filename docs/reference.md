@@ -48,6 +48,10 @@ corpora that require exhaustive search; use `cagra`/`ivfpq` for approximate sear
 > includes index scans and `pg_cuvs_batch_search` in `brute_force` mode, and
 > `cuvs_filtered_knn` with a NULL filter. Use `REINDEX` to rebuild the sidecar.
 
+> If a legacy CAGRA compaction fails to save or remove its tombstones, an
+> INSERT that would extend that resident index reports SQLSTATE `40001`.
+> Complete compaction, then retry the transaction.
+
 **NULL query vector.** A `cagra` / `flat` / `ivfpq` index scan cannot answer
 `ORDER BY col <-> NULL` — there is no vector to search with — so it raises
 `ERROR 0A000 (feature_not_supported)` rather than returning zero rows. A literal

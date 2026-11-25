@@ -6466,6 +6466,11 @@ cuvs_aminsert(Relation indexRel, Datum *values, bool *isnull,
                                  cuvs_resolve_index_dir_rel(indexRel));
         if (rc == CUVS_STATUS_OK)
             return false;
+        if (rc == CUVS_STATUS_STALE)
+            ereport(ERROR,
+                    (errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+                     errmsg("pg_cuvs: cannot insert while CAGRA compaction is pending"),
+                     errhint("Complete compaction of the index, then retry the transaction.")));
         /* BUILD_FAILED / daemon down → fall through to delta. */
     }
 

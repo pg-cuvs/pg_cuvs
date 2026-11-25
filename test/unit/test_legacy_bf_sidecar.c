@@ -24,7 +24,8 @@ static const float replacement_vecs[] = {1, 0, 2, 0, 3, 0, 9, 0};
 static const uint64_t base_tids[] = {101, 102, 103, 104};
 
 typedef enum {
-    NO_FAULT, BUILD_CRASH, BUILD_SYNC_FAIL, COMPACT_UNLINK_FAIL, COMPACT_SYNC_FAIL
+    NO_FAULT, BUILD_CRASH, BUILD_SYNC_FAIL, COMPACT_UNLINK_FAIL, COMPACT_SYNC_FAIL,
+    COMPACT_PUBLISH_SYNC_FAIL, COMPACT_TOMBSTONE_UNLINK_FAIL
 } FixtureFault;
 static FixtureFault fault;
 static bool graph_renamed;
@@ -40,7 +41,8 @@ has_suffix(const char *path, const char *suffix)
 static int
 fixture_unlink(const char *path)
 {
-    if (fault == COMPACT_UNLINK_FAIL && has_suffix(path, ".vectors"))
+    if ((fault == COMPACT_UNLINK_FAIL && has_suffix(path, ".vectors")) ||
+        (fault == COMPACT_TOMBSTONE_UNLINK_FAIL && has_suffix(path, ".tombstone")))
     {
         errno = EACCES;
         return -1;
@@ -52,8 +54,8 @@ static int
 fixture_rename(const char *from, const char *to)
 {
     int rc = rename(from, to);
-    if (rc == 0 && (fault == BUILD_CRASH || fault == BUILD_SYNC_FAIL) &&
-        has_suffix(to, ".cagra"))
+    if (rc == 0 && (fault == BUILD_CRASH || fault == BUILD_SYNC_FAIL ||
+                    fault == COMPACT_PUBLISH_SYNC_FAIL) && has_suffix(to, ".cagra"))
         graph_renamed = true;
     return rc;
 }
@@ -63,7 +65,9 @@ fixture_fsync(int fd)
 {
     struct stat st;
     bool directory = fault != NO_FAULT && fstat(fd, &st) == 0 && S_ISDIR(st.st_mode);
-    if (directory && (fault == COMPACT_SYNC_FAIL || (fault == BUILD_SYNC_FAIL && graph_renamed)))
+    if (directory && (fault == COMPACT_SYNC_FAIL ||
+                      (graph_renamed && (fault == BUILD_SYNC_FAIL ||
+                                         fault == COMPACT_PUBLISH_SYNC_FAIL))))
     {
         if (fault == BUILD_SYNC_FAIL)
             fault = NO_FAULT; /* The rollback can still sync its restored files. */
@@ -154,8 +158,8 @@ compact(uint64_t dead_tid)
     assert(run_compact() == CUVS_STATUS_OK);
 }
 
-static void
-extend(uint64_t tid)
+static uint32_t
+run_extend(uint64_t tid)
 {
     struct { float vec[2]; uint64_t tid; } row = {{9, 0}, tid};
     char dir[256] = {0};
@@ -174,7 +178,13 @@ extend(uint64_t tid)
     assert(cuvs_fd_send(sockets[0], -1, dir, sizeof(dir)) == 0);
     handle_extend(sockets[1], &cmd);
     assert(shm_unlink(cmd.shm_key) == 0);
-    assert(reply_status(sockets) == CUVS_STATUS_OK);
+    return reply_status(sockets);
+}
+
+static void
+extend(uint64_t tid)
+{
+    assert(run_extend(tid) == CUVS_STATUS_OK);
 }
 
 static void
@@ -370,16 +380,38 @@ compact_save_retry(FixtureFault save_fault)
     snprintf(tombstone, sizeof(tombstone), "%s/%u_%u.tombstone", g_index_dir, db, idx);
     uint32_t before, after;
     assert(tids_body_crc_of(e, &before) == 0);
+    CuvsCagraIndex old_graph = e->handle;
+    uint64_t *old_tids = e->tids;
+    bool published = save_fault == COMPACT_PUBLISH_SYNC_FAIL ||
+                     save_fault == COMPACT_TOMBSTONE_UNLINK_FAIL;
     write_tombstone(104);
     fault = save_fault;
+    graph_renamed = false;
     assert(run_compact() == CUVS_STATUS_PERSIST_FAILED);
-    assert(e->n_vecs == 3 && e->compact_count == 1 && !e->file_current);
+    if (published)
+        assert(e->n_vecs == 3 && e->compact_count == 1);
+    else
+    {
+        assert(e->handle == old_graph && e->tids == old_tids);
+        assert(e->n_vecs == 4 && e->compact_count == 0 && e->file_current);
+        assert_graph_hit(e, 4, 104);
+    }
     assert(access(tombstone, F_OK) == 0);
 
-    /* The dead TID is already gone in memory, but the disk is still old. */
+    /* No new vector or eviction while the retry can still see the old TID. */
+    CuvsCagraIndex retained = e->handle;
+    assert(run_extend(104) == CUVS_STATUS_STALE);
+    assert(e->handle == retained && e->n_extended == 0);
+    int persist_failed = 0;
+    assert(evict_entry(e, 0, CUVS_EVICT_MANUAL_UNLOAD, 0,
+                       CUVS_RQ_MANUAL, &persist_failed, true) == 0);
+    assert(persist_failed && find_index(db, idx) == e);
+    assert(save_index(e) != 0);
+    graph_renamed = false;
     assert(run_compact() == CUVS_STATUS_PERSIST_FAILED);
     assert(access(tombstone, F_OK) == 0);
-    assert(tids_body_crc_of(e, &after) == 0 && before == after);
+    assert(tids_body_crc_of(e, &after) == 0 && (before != after) == published);
+    assert(e->handle == retained);
 
     fault = NO_FAULT;
     assert(run_compact() == CUVS_STATUS_OK);
@@ -387,6 +419,41 @@ compact_save_retry(FixtureFault save_fault)
     assert(access(tombstone, F_OK) != 0 && errno == ENOENT);
     e = reload_from_disk();
     assert(e->n_vecs == 3 && e->tids[2] == 103);
+    assert_graph_hit(e, 3, 103);
+    extend(104);
+    assert(save_index(e) == 0);
+    e = reload_from_disk();
+    assert_graph_hit(e, 9, 104);
+}
+
+static void
+binding_after_other_dir_rollback(void)
+{
+    assert(build(g_index_dir, base_vecs, base_tids) == CUVS_STATUS_OK);
+    IndexEntry *e = find_index(db, idx);
+    char hnsw[512], tids[512], binding_path[576], other_dir[576];
+    hnsw_file_path(hnsw, sizeof(hnsw), g_index_dir, db, idx);
+    tids_file_path(tids, sizeof(tids), g_index_dir, db, idx);
+    snprintf(binding_path, sizeof(binding_path), "%s%s", hnsw, CUVS_HNSW_SOURCE_SUFFIX);
+    snprintf(other_dir, sizeof(other_dir), "%s/other-XXXXXX", g_index_dir);
+    assert(mkdtemp(other_dir));
+
+    FILE *file = fopen(hnsw, "wb");
+    assert(file);
+    assert(fputs("binding artifact", file) >= 0 && fclose(file) == 0);
+    assert(bind_hnsw_source(g_index_dir, hnsw, tids, NULL) == 0);
+    CuvsHnswSourceBinding before, after;
+    assert(read_hnsw_source(hnsw, tids, &before));
+    assert(setenv("CUVS_FAULT_RENAME_CAGRA", "1", 1) == 0);
+    assert(build(other_dir, replacement_vecs, base_tids) == CUVS_STATUS_PERSIST_FAILED);
+    assert(unsetenv("CUVS_FAULT_RENAME_CAGRA") == 0);
+    assert(read_hnsw_source(hnsw, tids, &after) && before.tids.inode == after.tids.inode);
+    assert(save_index(e) == 0);
+    assert(read_hnsw_source(hnsw, tids, &after) && before.tids.inode != after.tids.inode);
+
+    assert(unlink(binding_path) == 0);
+    assert(unlink(hnsw) == 0);
+    assert(rmdir(other_dir) == 0);
 }
 
 int
@@ -419,6 +486,12 @@ main(int argc, char **argv)
         compact_save_retry(COMPACT_UNLINK_FAIL);
     else if (strcmp(argv[1], "compact-retry-fsync") == 0)
         compact_save_retry(COMPACT_SYNC_FAIL);
+    else if (strcmp(argv[1], "compact-retry-publish") == 0)
+        compact_save_retry(COMPACT_PUBLISH_SYNC_FAIL);
+    else if (strcmp(argv[1], "compact-retry-tombstone") == 0)
+        compact_save_retry(COMPACT_TOMBSTONE_UNLINK_FAIL);
+    else if (strcmp(argv[1], "binding-other-dir") == 0)
+        binding_after_other_dir_rollback();
     else
         return 2;
 

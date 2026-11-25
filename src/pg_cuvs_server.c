@@ -290,7 +290,7 @@ typedef struct IndexEntry {
     int             pinned;             /* daemon-lifetime pin; kept by REINDEX */
     time_t          loaded_at;          /* registration time (order key) */
     int             file_current;       /* I-FC: 1 iff graph/tids == .cagra/.tids */
-    bool            compact_save_pending; /* graph swapped, tombstones still need a durable save */
+    bool            compact_save_pending; /* failed compact must finish before accepting EXTEND */
     uint64_t        extra_search_generation; /* optional opcode, protected by g_index_mutex */
     int             extra_search_default_dir;
     dev_t           extra_search_dir_dev;
@@ -2714,13 +2714,18 @@ static int make_slot(int device_id, CuvsRequester rq);
 static IndexEntry *registry_new_slot(void);
 static size_t entry_bytes_on(const IndexEntry *e, int device_id);
 
-/* save_index: persist a registry entry to disk atomically.
+/* save_index: persist a registry entry to disk.
  * Same contract as handle_build's persistence path: tmp + rename + fsync.
- * Returns 0 on success, -1 on any failure (caller must NOT proceed to free
- * VRAM state, e.g., evict_lru must abort eviction on failure). */
+ * Returns 0 on success, -1 before either rename, and SAVE_INDEX_PUBLISH_FAILED
+ * after publishing .tids. Eviction must retain the entry on either failure. */
+enum { SAVE_INDEX_PUBLISH_FAILED = -2 };
+
 static int
 save_index(IndexEntry *e)
 {
+    /* Only COMPACT may publish a candidate while its tombstones are pending. */
+    if (e->compact_save_pending)
+        return -1;
 #ifdef CUVS_TEST_HOOKS
     if (cuvs_fault("CUVS_FAULT_SAVE_INDEX")) {
         LOG_ERROR("save_index: CUVS_FAULT_SAVE_INDEX -> forced failure for %u/%u\n",
@@ -2803,19 +2808,18 @@ save_index(IndexEntry *e)
                 idx_tmp, idx_final, errno, strerror(errno));
         unlink(tids_final);
         unlink(idx_tmp);
-        return -1;
+        return SAVE_INDEX_PUBLISH_FAILED;
     }
     if (fsync_path(g_index_dir) != 0)
     {
         LOG_ERROR("save_index: fsync %s failed errno=%d\n", g_index_dir, errno);
-        return -1;
+        return SAVE_INDEX_PUBLISH_FAILED;
     }
 
     if (preserve_binding &&
         bind_hnsw_source(g_index_dir, hnsw_final, tids_final, &old_binding.graph) != 0)
         LOG_WARN("save_index: cannot renew the HNSW binding for %u/%u\n", e->db_oid, e->index_oid);
     e->file_current = 1;   /* I-FC (iii) */
-    e->compact_save_pending = false;
     LOG_INFO("pg_cuvs_server: saved index %u/%u (%lld vecs)\n",
             e->db_oid, e->index_oid, (long long)e->n_vecs);
     return 0;
@@ -3867,6 +3871,12 @@ evict_entry(IndexEntry *e, int device_id, CuvsEvictReason why, int self_replace,
 
     if (persist_failed)
         *persist_failed = 0;
+    if (save_legacy && e->compact_save_pending)
+    {
+        if (persist_failed)
+            *persist_failed = 1;
+        return 0;
+    }
     freed = entry_bytes_on(e, device_id);
 
     if (e->shard_count >= 2)
@@ -9355,6 +9365,7 @@ finish_build_commit(int client_fd, const CuvsCmdFrame *cmd, const char *save_dir
     bool vectors_retired = false, tids_published = false, graph_published = false;
     CagraBuildBackup backup = {0};
     IndexEntry *previous = find_index(cmd->db_oid, cmd->index_oid);
+    int previous_file_current = previous ? previous->file_current : 0;
     if (previous)
         previous->extra_search_generation = 0;
     index_file_path(idx_final,  sizeof(idx_final),  io_dir, cmd->db_oid, cmd->index_oid);
@@ -9824,7 +9835,11 @@ persist_fail:
              fsync_path(io_dir) != 0))
             restored = false;
         if (restored)
+        {
+            if (previous && extra_search_build_root_matches(root, save_dir))
+                previous->file_current = previous_file_current;
             discard_cagra_build_backup(&backup);
+        }
         else
         {
             persist_error = "CAGRA publication failed and prior artifacts need recovery";
@@ -12804,6 +12819,16 @@ handle_extend(int client_fd, const CuvsCmdFrame *cmd)
         return;
     }
 
+    /* A retained tombstone can refer to a slot this INSERT is reusing. */
+    if (e->compact_save_pending)
+    {
+        pthread_mutex_unlock(&g_index_mutex);
+        munmap(mem, total);
+        send_error_code(client_fd, CUVS_STATUS_STALE,
+                        "previous compaction has not finished");
+        return;
+    }
+
     /* Even a failed EXTEND can have changed storage in place. */
     e->extra_search_generation = 0;
     if (index_dir[0] && (strnlen(index_dir, sizeof(index_dir)) == sizeof(index_dir) ||
@@ -12937,6 +12962,15 @@ cmp_u64(const void *a, const void *b)
     return (x > y) - (x < y);
 }
 
+/* Caller holds g_index_mutex. A retained tombstone must not outlive the
+ * guard against appending a new row at the same TID. */
+static bool
+finish_compact_tombstones(IndexEntry *e, const char *path)
+{
+    e->compact_save_pending = unlink(path) != 0 && errno != ENOENT;
+    return !e->compact_save_pending;
+}
+
 /* ----------------------------------------------------------------
  * 3Q: handle_compact — remove tombstoned vectors via cagra::merge.
  *
@@ -12967,6 +13001,16 @@ handle_compact(int client_fd, const CuvsCmdFrame *cmd)
     FILE *tf = fopen(tombstone_path, "rb");
     if (!tf)
     {
+        pthread_mutex_lock(&g_index_mutex);
+        IndexEntry *e = find_index(cmd->db_oid, cmd->index_oid);
+        bool pending = e && e->compact_save_pending;
+        pthread_mutex_unlock(&g_index_mutex);
+        if (pending)
+        {
+            send_error_code(client_fd, CUVS_STATUS_PERSIST_FAILED,
+                            "cannot read tombstones for pending compaction");
+            return;
+        }
         /* No tombstone: nothing to compact. Reply OK. */
         CuvsReplyHeader ok = {0};
         ok.status = CUVS_STATUS_OK;
@@ -13070,16 +13114,28 @@ handle_compact(int client_fd, const CuvsCmdFrame *cmd)
     if (dead_count == 0)
     {
         free(keep_bits);
-        /* A previous COMPACT may have swapped the graph but failed to save
-         * it. The tombstones are still needed until that swap is durable. */
-        if (e->compact_save_pending && save_index(e) != 0)
+        /* A previous attempt may have published the compacted TIDs before
+         * failing. Retry its resident graph without replaying the merge. */
+        if (e->compact_save_pending)
+        {
+            IndexEntry compacted = *e;
+            compacted.compact_save_pending = false;
+            if (save_index(&compacted) != 0)
+            {
+                pthread_mutex_unlock(&g_index_mutex);
+                send_error_code(client_fd, CUVS_STATUS_PERSIST_FAILED,
+                                "save_index failed after compact");
+                return;
+            }
+            e->file_current = 1;
+        }
+        if (!finish_compact_tombstones(e, tombstone_path))
         {
             pthread_mutex_unlock(&g_index_mutex);
             send_error_code(client_fd, CUVS_STATUS_PERSIST_FAILED,
-                            "save_index failed after compact");
+                            "cannot remove compacted tombstones");
             return;
         }
-        unlink(tombstone_path);
         pthread_mutex_unlock(&g_index_mutex);
         CuvsReplyHeader ok = {0};
         ok.status = CUVS_STATUS_OK;
@@ -13155,14 +13211,34 @@ handle_compact(int client_fd, const CuvsCmdFrame *cmd)
         return;
     }
 
+    /* Stage the candidate without replacing the resident graph. Once its
+     * TIDs have been published, keep that candidate for a save retry. */
+    IndexEntry compacted = *e;
+    compacted.handle = new_handle;
+    compacted.tids = new_tids;
+    compacted.n_vecs = new_n;
+    compacted.file_current = 0;
+    compacted.compact_save_pending = false;
+    compacted.legacy_vectors_stale = true;
+    int save_status = save_index(&compacted);
+    if (save_status != 0 && save_status != SAVE_INDEX_PUBLISH_FAILED)
+    {
+        e->compact_save_pending = true;
+        cuvs_cagra_free(new_handle, (int)e->gpu_device_id);
+        free(new_tids);
+        pthread_mutex_unlock(&g_index_mutex);
+        send_error_code(client_fd, CUVS_STATUS_PERSIST_FAILED,
+                        "save_index failed after compact");
+        return;
+    }
+
     /* Swap handle + tids. */
     CuvsCagraIndex old_handle = e->handle;
     e->handle = new_handle;
     free(e->tids);
     e->tids = new_tids;
     e->n_vecs      = new_n;
-    e->file_current = 0;   /* I-FC: merged in memory; save_index sets 1 */
-    e->compact_save_pending = true;
+    e->file_current = save_status == 0;
     e->legacy_vectors_stale = true;
     free_main_bf_cache(e); /* Compact changed the item-id to TID mapping. */
     e->n_extended       = 0;
@@ -13177,16 +13253,21 @@ handle_compact(int client_fd, const CuvsCmdFrame *cmd)
     free(e->rev_item_ids); e->rev_item_ids = NULL;
     build_rev_tid_map(e);
 
-    /* Persist to disk. */
-    if (save_index(e) != 0)
+    if (save_status != 0)
     {
+        e->compact_save_pending = true;
         pthread_mutex_unlock(&g_index_mutex);
         send_error_code(client_fd, CUVS_STATUS_PERSIST_FAILED,
                         "save_index failed after compact");
         return;
     }
-
-    unlink(tombstone_path);
+    if (!finish_compact_tombstones(e, tombstone_path))
+    {
+        pthread_mutex_unlock(&g_index_mutex);
+        send_error_code(client_fd, CUVS_STATUS_PERSIST_FAILED,
+                        "cannot remove compacted tombstones");
+        return;
+    }
 
     pthread_mutex_unlock(&g_index_mutex);
 
