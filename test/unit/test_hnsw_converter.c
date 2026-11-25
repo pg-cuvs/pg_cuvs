@@ -97,6 +97,32 @@ test_fault_pread(int fd, void *buffer, size_t length, off_t offset)
 #define pread test_fault_pread
 
 #include "../../src/hnsw_export.c"
+/* Records what the source-less writer reports to pg_stat_progress_create_index. */
+#define TEST_PROGRESS_PARAMS 32
+static int64 test_progress_last[TEST_PROGRESS_PARAMS];
+static unsigned test_progress_updates[TEST_PROGRESS_PARAMS];
+static int64 test_progress_done[256];
+static bool test_progress_record;
+
+void
+pgstat_progress_update_param(int index, int64 val)
+{
+    assert(index >= 0 && index < TEST_PROGRESS_PARAMS);
+    if (index == PROGRESS_CREATEIDX_TUPLES_DONE && test_progress_record)
+    {
+        assert(test_progress_updates[index] < lengthof(test_progress_done));
+        test_progress_done[test_progress_updates[index]] = val;
+    }
+    test_progress_last[index] = val;
+    test_progress_updates[index]++;
+}
+
+static void
+test_progress_reset(void)
+{
+    memset(test_progress_last, 0, sizeof(test_progress_last));
+    memset(test_progress_updates, 0, sizeof(test_progress_updates));
+}
 
 /* Normal-path PG_TRY scaffolding for this standalone fixture. Real PG error
  * propagation and cleanup are tested by test-connectivity-pg-interrupts. */
@@ -809,6 +835,30 @@ test_legacy_writer_page_chains(void)
     assert_source_data_page_chain(3);
 }
 
+/* pg_stat_progress_create_index shows "building index: <name>". */
+static void
+test_build_phase_names(void)
+{
+    assert(strcmp(cuvs_hnsw_build_phase_name(PROGRESS_CREATEIDX_SUBPHASE_INITIALIZE),
+                  "initializing") == 0);
+    assert(strcmp(cuvs_hnsw_build_phase_name(CUVS_HNSW_SUBPHASE_SPOOL),
+                  "spooling heap rows") == 0);
+    assert(strcmp(cuvs_hnsw_build_phase_name(CUVS_HNSW_SUBPHASE_DAEMON),
+                  "building graph in the GPU daemon") == 0);
+    assert(strcmp(cuvs_hnsw_build_phase_name(CUVS_HNSW_SUBPHASE_CHECK),
+                  "checking graph files") == 0);
+    assert(strcmp(cuvs_hnsw_build_phase_name(CUVS_HNSW_SUBPHASE_WRITE),
+                  "writing index pages") == 0);
+    assert(cuvs_hnsw_build_phase_name(0) == NULL);
+    /* pgvector's subphase 2 is unassigned here. */
+    assert(cuvs_hnsw_build_phase_name(2) == NULL);
+    assert(cuvs_hnsw_build_phase_name(CUVS_HNSW_SUBPHASE_WRITE + 1) == NULL);
+    assert(cuvs_hnsw_buildphasename(CUVS_HNSW_SUBPHASE_WRITE) ==
+           (char *)cuvs_hnsw_build_phase_name(CUVS_HNSW_SUBPHASE_WRITE));
+    printf("PASS build phase names\n");
+    fflush(stdout);
+}
+
 static void
 test_disk_writer_page_chain_case(bool hierarchical, uint16_t heap_m)
 {
@@ -831,8 +881,10 @@ test_disk_writer_page_chain_case(bool hierarchical, uint16_t heap_m)
 
     int layout_m = heap_m ? heap_m : (int)header.M;
     chain_test_reset();
+    test_progress_reset();
     hnsw_write_disk_pages(NULL, f.hnsw_fd, f.tids_fd, &header, layout_m, 2, 2, 4,
-                          1, true, &locations);
+                          1, true, heap_m != 0, &locations);
+    assert(test_progress_updates[PROGRESS_CREATEIDX_SUBPHASE] == (heap_m != 0));
     assert_source_data_page_chain(1);
     Page page = (Page)chain_test_pages[1];
     assert(PageGetMaxOffsetNumber(page) == 4);
@@ -1072,8 +1124,8 @@ test_hierarchical_native_packing_case(int dim, int bytes_per_dim, int m)
     assert(hnsw_location_table_rewind(&table, N));
     for (int node = 0; node < N; node++)
         assert(hnsw_location_table_lookup(&table, (uint32_t)node, &locations[node]));
-    n_pages = locations[N - 1].elem_blkno;
-    assert(n_pages > 0 && n_pages <= N);
+    n_pages = hnsw_location_neigh_blkno(&locations[N - 1]);
+    assert(n_pages > 0 && n_pages <= 2 * N);
     policy.magic = CUVS_HNSW_POLICY_MAGIC;
     policy.version = CUVS_HNSW_POLICY_VERSION;
     policy.bytes = sizeof(policy);
@@ -1085,11 +1137,37 @@ test_hierarchical_native_packing_case(int dim, int bytes_per_dim, int m)
     chain_test_nblocks = 0;
     hnsw_write_disk_metapage(NULL, &parsed, (uint16_t)parsed.M, (uint32_t)dim, n_pages,
                              false, &table, &policy, NULL, NULL, NULL);
+    test_progress_reset();
+    test_progress_record = true;
     hnsw_write_disk_pages(NULL, f.hnsw_fd, f.tids_fd, &parsed, (int)parsed.M, N,
-                          (uint32_t)dim, bytes_per_dim, n_pages, false, &table);
+                          (uint32_t)dim, bytes_per_dim, n_pages, false, true, &table);
+    test_progress_record = false;
+    /* One write phase; total nodes; done starts at 0, then rises once per
+     * published data page and ends at the node count. */
+    assert(test_progress_updates[PROGRESS_CREATEIDX_SUBPHASE] == 1);
+    assert(test_progress_last[PROGRESS_CREATEIDX_SUBPHASE] == CUVS_HNSW_SUBPHASE_WRITE);
+    assert(test_progress_updates[PROGRESS_CREATEIDX_TUPLES_TOTAL] == 1);
+    assert(test_progress_last[PROGRESS_CREATEIDX_TUPLES_TOTAL] == N);
+    assert(test_progress_updates[PROGRESS_CREATEIDX_TUPLES_DONE] == n_pages + 1);
+    assert(test_progress_last[PROGRESS_CREATEIDX_TUPLES_DONE] == N);
+    for (uint32_t block = 0, complete = 0; block <= (uint32_t)n_pages; block++)
+    {
+        while (complete < N && hnsw_location_neigh_blkno(&locations[complete]) <= block)
+            complete++;
+        assert(test_progress_done[block] == (int64)complete);
+    }
     assert(chain_test_wal_images == n_pages + 1);
     assert(CritSectionCount == 0);
     assert_source_data_page_chain(n_pages);
+    if (dim == 1900)
+    {
+        /* The level-2 neighbor tuple spills onto the next page. The legacy
+         * reference writer below can render only unsplit pairs. */
+        assert(hnsw_location_neigh_blkno(&locations[1]) > locations[1].elem_blkno);
+        BufFileClose(&table_file);
+        fixture_close(&f);
+        return;
+    }
     {
         PgvHnswMeta *meta = (PgvHnswMeta *)PageGetContents(chain_test_pages[0]);
         assert(meta->entryBlkno == locations[1].elem_blkno &&
@@ -1192,6 +1270,7 @@ test_hierarchical_native_packing_shapes(void)
 {
     test_hierarchical_native_packing_case(768, 4, 32);
     test_hierarchical_native_packing_case(1536, 4, 32);
+    test_hierarchical_native_packing_case(1900, 4, 32);
     test_hierarchical_native_packing_case(768, 2, 32);
     test_hierarchical_native_packing_case(1536, 2, 32);
     test_hierarchical_native_packing_case(3072, 2, 32);
@@ -2190,6 +2269,7 @@ main(int argc, char **argv)
     test_packed_writer_split_pairs();
     test_hierarchical_native_packing_shapes();
     test_pgvector_page_version_range();
+    test_build_phase_names();
     test_buffered_location_table_contract();
     test_location_readback_interrupt();
     test_address_formula_independent_of_levels(false);
