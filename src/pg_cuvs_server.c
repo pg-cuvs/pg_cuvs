@@ -28,6 +28,9 @@
 
 #include "cuvs_ipc.h"
 #include "cuvs_page_overlay.h"
+#ifdef CUVS_PAGE_OVERLAY_GPU
+#include "cuvs_page_overlay_gpu.h"
+#endif
 #include "cuvs_util.h"
 #include "cuvs_hnsw_source.h"
 #include "cuvs_cache_policy.h"
@@ -446,6 +449,17 @@ static uint64_t g_page_daemon_id;
 static pthread_once_t g_page_daemon_once = PTHREAD_ONCE_INIT;
 static size_t g_page_graph_bytes[CUVS_MAX_GPUS];
 static CuvsPageOverlayBudget g_page_overlay_budget;
+#ifdef CUVS_PAGE_OVERLAY_GPU
+static uint32_t g_page_gpu_min_rows;
+static uint32_t g_page_gpu_cache_mib = 1024;
+static bool g_page_gpu_trace;
+static size_t g_page_gpu_live[CUVS_MAX_GPUS];
+static size_t g_page_gpu_reserved[CUVS_MAX_GPUS];
+/* A hold belongs to the registered graph that failed admission. */
+static uint64_t g_page_gpu_fold_waiting[CUVS_MAX_GPUS];
+static int g_page_gpu_host_fold_device = -1;
+static uint64_t g_page_gpu_host_fold_order; /* under g_index_mutex */
+#endif
 static CuvsPageOverlayChunk *g_retired_page_overlays;
 static _Thread_local PageCagraGraph *g_retired_fold_graphs;
 
@@ -1218,6 +1232,11 @@ warmup_dequeue(WarmupJob *out)
 /* Forward declarations for warmup worker. */
 static int  load_index(uint32_t db_oid, uint32_t index_oid, CuvsRequester rq);
 static void build_rev_tid_map(IndexEntry *e);  /* 3O: TID→item_id reverse map */
+/* Release in one place: every path that lets go of what an entry holds goes through these (defined after free_index_shards). */
+static void entry_release(IndexEntry *e);
+static void entry_detach(IndexEntry *e, IndexEntry *old);
+static void registry_remove(IndexEntry *e);
+static uint32_t delta_gpu_of(const IndexEntry *e);
 
 /* Returns with g_index_mutex held. Recheck after a concurrent publication
  * without performing a filesystem lookup under that lock. */
@@ -1427,6 +1446,9 @@ total_vram_used(int device_id)
                     e->shards[s].gpu_device_id == (uint32_t)device_id)
                     total += e->shards[s].vram_bytes
                            + e->shards[s].bf_vram_bytes;
+            /* the delta cache of a sharded index lives on shard 0's GPU (delta_gpu_of) and was not counted anywhere. */
+            if (delta_gpu_of(e) == (uint32_t)device_id)
+                total += e->delta_vram_bytes;
         }
         else if (e->gpu_device_id == (uint32_t)device_id)
         {
@@ -1439,7 +1461,12 @@ total_vram_used(int device_id)
     /* ADR-070 Bug #2: include VRAM reserved by in-flight builds on this device
      * (released the mutex for the GPU build; not yet in g_indexes). */
     if (device_id >= 0 && device_id < CUVS_MAX_GPUS)
+    {
         total += g_pending_build_vram[device_id] + g_page_graph_bytes[device_id];
+#ifdef CUVS_PAGE_OVERLAY_GPU
+        total += g_page_gpu_live[device_id];
+#endif
+    }
     return total;
 }
 
@@ -1497,22 +1524,13 @@ admission_mono_us(void)
     return (uint64_t) t.tv_sec * 1000000u + (uint64_t) t.tv_nsec / 1000u;
 }
 
-/* Bytes an entry holds on `dev`, in total_vram_used() terms. */
+static size_t entry_bytes_on(const IndexEntry *e, int device_id);
+
+/* Bytes an entry holds on `dev`, in total_vram_used() terms (the same function, not a copy of its terms). */
 static size_t
 admission_entry_bytes_on(const IndexEntry *e, int dev)
 {
-    size_t total = 0;
-    if (!e->valid)
-        return 0;
-    if (e->shard_count >= 2)
-    {
-        for (int s = 0; s < e->shard_count; s++)
-            if (e->shards[s].valid && e->shards[s].gpu_device_id == (uint32_t) dev)
-                total += e->shards[s].vram_bytes + e->shards[s].bf_vram_bytes;
-    }
-    else if (e->gpu_device_id == (uint32_t) dev)
-        total = e->vram_bytes + e->delta_vram_bytes + e->main_bf_vram_bytes;
-    return total;
+    return e->valid ? entry_bytes_on(e, dev) : 0;
 }
 
 static size_t
@@ -2199,6 +2217,54 @@ relfilenode_file_path(char *out, size_t outlen,
                       const char *dir, uint32_t db_oid, uint32_t index_oid)
 {
     snprintf(out, outlen, "%s/%u_%u.relfilenode", dir, db_oid, index_oid);
+}
+
+/* the artifacts that make load_index take one kind of index, as one table. A build of one kind removes, in the directory it saved
+ * to, the artifacts of the other kinds an earlier build of the same OID may have left, and the .stale marker; DROP removes everything
+ * by prefix instead (drop_unlink_index_files). Each build used to keep its own list, and the lists had drifted: an IVF-PQ build left
+ * .shards (the next load tried the sharded path first), a sharded build left .ivfpq and .hnsw, a flat build left the .sNNN graphs,
+ * and no build removed an old .hnsw (a CAGRA build replaces it only when it writes one), which a cpu_hnsw search would load.
+ *
+ *   build            removes
+ *   CAGRA            .stale, .shards + every .sNNN.cagra, .ivfpq, .hnsw (a new .hnsw is written after, when asked for)
+ *   sharded (sc)     .stale, .cagra, .sNNN.cagra from sc up (the new manifest stays), .ivfpq, .hnsw
+ *   flat             .stale, .cagra, .shards + every .sNNN.cagra, .ivfpq, .hnsw
+ *   IVF-PQ           .stale, .cagra, .shards + every .sNNN.cagra, .hnsw
+ */
+#define ART_STALE   0x01u
+#define ART_CAGRA   0x02u
+#define ART_SHARDS  0x04u   /* the manifest when shards_from == 0, and the .sNNN.cagra graphs from shards_from up */
+#define ART_IVFPQ   0x08u
+#define ART_HNSW    0x10u
+#define ART_REMOVED_BY_BUILD_CAGRA   (ART_STALE | ART_SHARDS | ART_IVFPQ | ART_HNSW)
+#define ART_REMOVED_BY_BUILD_SHARDED (ART_STALE | ART_CAGRA | ART_SHARDS | ART_IVFPQ | ART_HNSW)
+#define ART_REMOVED_BY_BUILD_FLAT    (ART_STALE | ART_CAGRA | ART_SHARDS | ART_IVFPQ | ART_HNSW)
+#define ART_REMOVED_BY_BUILD_IVFPQ   (ART_STALE | ART_CAGRA | ART_SHARDS | ART_HNSW)
+static void
+remove_other_kind_artifacts(const char *dir, uint32_t db, uint32_t idx, unsigned what, uint32_t shards_from)
+{
+    char p[512];
+    if (what & ART_STALE)  { stale_file_path(p, sizeof(p), dir, db, idx); unlink(p); }
+    if (what & ART_SHARDS)
+    {
+        /* The manifest first, so a reload can never take the sharded path with graphs half gone. */
+        if (shards_from == 0) { shards_manifest_path(p, sizeof(p), dir, db, idx); unlink(p); }
+        for (uint32_t s = shards_from; s < CUVS_SHARDS_MAX; s++)
+        {
+            shard_cagra_path(p, sizeof(p), dir, db, idx, s);
+            if (unlink(p) != 0)
+                break;   /* contiguous ids: first miss => no more shards */
+        }
+    }
+    if (what & ART_CAGRA)  { index_file_path(p, sizeof(p), dir, db, idx); unlink(p); }
+    if (what & ART_IVFPQ)  { ivfpq_file_path(p, sizeof(p), dir, db, idx); unlink(p); }
+    if (what & ART_HNSW)
+    {
+        hnsw_file_path(p, sizeof(p), dir, db, idx);
+        unlink(p);
+        snprintf(p, sizeof(p), "%s/%u_%u.hnsw%s", dir, db, idx, CUVS_HNSW_SOURCE_SUFFIX);
+        unlink(p);
+    }
 }
 
 static int
@@ -3826,9 +3892,10 @@ static IndexEntry *
 registry_new_slot(void)
 {
     IndexEntry *e = &g_indexes[g_n_indexes++];
-    /* After compaction this slot holds a byte copy of the entry shifted
-     * down: never inherit its owned pointers (the CAGRA reload path does
-     * not assign them all; a stale hnsw_idx is a wrong-result + UAF). */
+    /* registry_remove zeroes the slot past the end, so this slot is zero
+     * unless it was never used; the fields are still set here so that a new
+     * entry starts with no owned pointers and no per-index policy state (the
+     * CAGRA reload path does not assign them all). */
     e->hnsw_idx     = NULL;
     e->rev_tids     = NULL;
     e->rev_item_ids = NULL;
@@ -3855,6 +3922,8 @@ entry_bytes_on(const IndexEntry *e, int device_id)
             if (e->shards[s].valid &&
                 e->shards[s].gpu_device_id == (uint32_t)device_id)
                 b += e->shards[s].vram_bytes + e->shards[s].bf_vram_bytes;
+        if (delta_gpu_of(e) == (uint32_t)device_id)   /* same term as total_vram_used */
+            b += e->delta_vram_bytes;
         return b;
     }
     if (e->gpu_device_id == (uint32_t)device_id)
@@ -3983,33 +4052,16 @@ evict_entry(IndexEntry *e, int device_id, CuvsEvictReason why, int self_replace,
          * whole logical index (all shards across their GPUs) as a unit. A later
          * query reloads it from the .shards manifest. `freed` counts only this
          * device's shards; freeing also releases the index's other shards. */
-        free_delta_cache(e);
-        free_main_bf_cache(e);
-        free_index_shards(e);
-        free(e->tids);
-        free(e->rev_tids);     e->rev_tids     = NULL;
-        free(e->rev_item_ids); e->rev_item_ids = NULL;
     }
     else if (e->ivfpq_handle)
     {
         /* 3P IVF-PQ: `.ivfpq`/`.tids` are durable on disk, so eviction needs
-         * no save (save_index assumes a CAGRA handle: ADR-070). The
-         * ivfpq_handle itself is freed by the shared cleanup below. */
-        free_delta_cache(e);
-        free_main_bf_cache(e);
-        free(e->tids);
-        free(e->rev_tids);     e->rev_tids     = NULL;
-        free(e->rev_item_ids); e->rev_item_ids = NULL;
+         * no save (save_index assumes a CAGRA handle: ADR-070). */
     }
     else if (e->is_flat)
     {
         /* ADR-073: flat's .tids + .vectors are durable on disk; MUST NOT call
          * save_index (handle == NULL -> refuses -> un-evictable). */
-        free_delta_cache(e);
-        free_main_bf_cache(e);
-        free(e->tids);
-        free(e->rev_tids);     e->rev_tids     = NULL;
-        free(e->rev_item_ids); e->rev_item_ids = NULL;
     }
     else
     {
@@ -4032,18 +4084,10 @@ evict_entry(IndexEntry *e, int device_id, CuvsEvictReason why, int self_replace,
             }
             saved = 1;
         }
-        free_delta_cache(e);
-        free_main_bf_cache(e);
-        cuvs_cagra_free(e->handle, e->gpu_device_id);
-        free(e->tids);
-        free(e->rev_tids);     e->rev_tids     = NULL;
-        free(e->rev_item_ids); e->rev_item_ids = NULL;
     }
 
-    /* Phase 3I-1: free CPU HNSW sidecar (RAM-only; no VRAM). */
-    if (e->hnsw_idx) { cuvs_hnsw_free(e->hnsw_idx); e->hnsw_idx = NULL; }
-    /* 3P: free IVF-PQ GPU index. */
-    if (e->ivfpq_handle) { cuvs_ivfpq_free(e->ivfpq_handle, e->gpu_device_id); e->ivfpq_handle = NULL; }
+    /* everything the entry holds (graph or shards, delta and main BF caches, IVF-PQ handle, CPU HNSW, TIDs, reverse map). */
+    entry_release(e);
 
     /* ADR-086 [evict] schema (13): op gpu db idx reason requester_idx idle_s
      * protect_s hits vram_bytes saved_ms mono_us self_replace. idle_s = -1
@@ -4064,10 +4108,7 @@ evict_entry(IndexEntry *e, int device_id, CuvsEvictReason why, int self_replace,
         record_eviction_notice(db, idx, c.last_use ? (int64_t)(now - c.last_use) : -1,
             cuvs_evict_protect_s(c.hits, pp.t_min_s, pp.bonus_s, pp.hits_cap), why);
 
-    int idx_pos = (int)(e - g_indexes);
-    for (int i = idx_pos; i < g_n_indexes - 1; i++)
-        g_indexes[i] = g_indexes[i+1];
-    g_n_indexes--;
+    registry_remove(e);
 
     g_cache_evictions[device_id]++;
     g_evict_by_reason[device_id][why]++;
@@ -7847,6 +7888,63 @@ free_index_shards(IndexEntry *e)
     e->shard_count = 0;
 }
 
+/* the one release of everything an entry owns: the CAGRA graph or the shards (with their BF caches), the delta cache, the main
+ * BF cache, the IVF-PQ handle, the CPU HNSW structure, the TID array and the reverse TID map. Every pointer is left NULL. The order
+ * matters: the delta and main BF caches live on delta_gpu_of(e), which reads shards[0], so they go before the shards. The entry's
+ * slot and its files are not touched (registry_remove, handle_drop). Caller holds g_index_mutex. */
+static void
+entry_release(IndexEntry *e)
+{
+    free_delta_cache(e);
+    free_main_bf_cache(e);
+    if (e->shard_count >= 2 || e->shards)
+        free_index_shards(e);
+    else if (e->handle)
+        cuvs_cagra_free(e->handle, e->gpu_device_id);
+    e->handle = NULL;
+    if (e->ivfpq_handle) { cuvs_ivfpq_free(e->ivfpq_handle, e->gpu_device_id); e->ivfpq_handle = NULL; }
+    if (e->hnsw_idx)     { cuvs_hnsw_free(e->hnsw_idx); e->hnsw_idx = NULL; }
+    free(e->tids);         e->tids         = NULL;
+    free(e->rev_tids);     e->rev_tids     = NULL;
+    free(e->rev_item_ids); e->rev_item_ids = NULL;
+    e->file_current = 0;   /* CK-37: an entry without its graph no longer equals its files */
+}
+
+/* a rebuild that replaces an entry in place takes the old build's resources off it as one unit, installs the new ones, and then
+ * releases the old unit with entry_release. `old` is a copy of the entry made before anything changed, so the old resources are
+ * freed on the devices they were allocated on even when the rebuild moved the entry to another GPU, and nothing the old build
+ * cached (main BF, reverse map, CPU HNSW, IVF-PQ handle, shards) stays on the new one. Release happens where the old code freed:
+ * under g_index_mutex, at the swap, never earlier. */
+static void
+entry_detach(IndexEntry *e, IndexEntry *old)
+{
+    *old = *e;
+    e->handle = NULL;          e->tids = NULL;
+    e->shards = NULL;          e->shard_count = 0;
+    e->delta_idx = NULL;       e->delta_tids = NULL;    e->delta_vecs_host = NULL;
+    e->n_delta = 0;            e->delta_n_cached = 0;   e->delta_generation = 0;
+    e->delta_mtime = 0;        e->delta_vram_bytes = 0;
+    e->main_bf_idx = NULL;     e->main_bf_n = 0;        e->main_bf_vram_bytes = 0;
+    e->main_bf_mtime = 0;      e->main_bf_generation = 0;
+    e->rev_tids = NULL;        e->rev_item_ids = NULL;
+    e->hnsw_idx = NULL;        e->ivfpq_handle = NULL;
+    e->file_current = 0;       /* CK-37: the caller sets it again for the new build */
+}
+
+/* the one removal of an entry from the registry, after entry_release. The entries behind it move down one slot and the slot
+ * that falls off the end is zeroed, so it no longer holds a byte copy of a live entry's pointers (registry_new_slot still clears
+ * the per-index fields of a new slot). Paths that work outside the lock already found their entry again by key after re-locking,
+ * never by an old pointer; that is unchanged. Caller holds g_index_mutex. */
+static void
+registry_remove(IndexEntry *e)
+{
+    int slot = (int)(e - g_indexes);
+    for (int i = slot; i < g_n_indexes - 1; i++)
+        g_indexes[i] = g_indexes[i + 1];
+    g_n_indexes--;
+    memset(&g_indexes[g_n_indexes], 0, sizeof(g_indexes[0]));
+}
+
 /* ----------------------------------------------------------------
  * Phase 3C: detached upload thread — spawned after OK reply so that
  * CREATE INDEX returns immediately. Upload failure is non-fatal; the
@@ -8300,30 +8398,16 @@ build_sharded(int client_fd, const CuvsCmdFrame *cmd, const char *index_dir,
     /* Clear staleness marker and any legacy unsharded .cagra for this OID so a
      * reload sees only the sharded artifacts. Also remove orphan shard files
      * left by a prior build with a HIGHER shard count (e.g. REINDEX 4->2). */
-    {
-        char stale_path[512], legacy_cagra[512];
-        stale_file_path(stale_path, sizeof(stale_path), save_dir, cmd->db_oid, cmd->index_oid);
-        unlink(stale_path);
-        index_file_path(legacy_cagra, sizeof(legacy_cagra), save_dir,
-                        cmd->db_oid, cmd->index_oid);
-        unlink(legacy_cagra);
-        for (uint32_t s = (uint32_t)sc; s < CUVS_SHARDS_MAX; s++)
-        {
-            char sp[512];
-            shard_cagra_path(sp, sizeof(sp), save_dir, cmd->db_oid, cmd->index_oid, s);
-            if (unlink(sp) != 0)
-                break;   /* contiguous ids: first miss => no more orphans */
-        }
-    }
+    remove_other_kind_artifacts(save_dir, cmd->db_oid, cmd->index_oid, ART_REMOVED_BY_BUILD_SHARDED, (uint32_t)sc);
 
     /* --- Register the entry (no more eviction past this point). --- */
     IndexEntry *e = find_index(cmd->db_oid, cmd->index_oid);
+    IndexEntry old_build = {0};
+    int        had_old = 0;
     if (e)
     {
-        free_delta_cache(e);
-        if (e->shard_count >= 2) free_index_shards(e);
-        else if (e->handle) cuvs_cagra_free(e->handle, e->gpu_device_id);
-        free(e->tids);
+        entry_detach(e, &old_build);   /* the old build's resources, released after the swap below */
+        had_old = 1;
     }
     else
     {
@@ -8373,6 +8457,8 @@ build_sharded(int client_fd, const CuvsCmdFrame *cmd, const char *index_dir,
     e->shards        = shards;        /* transfer ownership of the local array */
     e->inflight      = 0;             /* Phase 3G.4 */
     reset_entry_stats(e);
+    if (had_old)
+        entry_release(&old_build);    /* graph or shards, caches, reverse map, CPU HNSW, IVF-PQ of the replaced build */
 
     LOG_INFO("pg_cuvs_server: built sharded index %u/%u (%lld vecs, %d shards)\n",
              cmd->db_oid, cmd->index_oid, (long long)n_vecs, sc);
@@ -9662,31 +9748,8 @@ finish_build_commit(int client_fd, const CuvsCmdFrame *cmd, const char *save_dir
                      io_dir, strerror(errno));
     }
 
-    /* A rebuild produces a fresh graph reflecting the current heap — clear any
-     * persisted staleness marker. */
-    {
-        char stale_path[512];
-        stale_file_path(stale_path, sizeof(stale_path), io_dir,
-                        cmd->db_oid, cmd->index_oid);
-        unlink(stale_path);
-    }
-
-    /* Phase 3F: this unsharded build replaces any prior sharded artifacts for
-     * the same OID. Remove the .shards manifest FIRST (so a reload can never
-     * take the sharded path), then the contiguous shard .cagra files. */
-    {
-        char shards_path[512];
-        shards_manifest_path(shards_path, sizeof(shards_path), io_dir,
-                             cmd->db_oid, cmd->index_oid);
-        unlink(shards_path);
-        for (uint32_t s = 0; s < CUVS_SHARDS_MAX; s++)
-        {
-            char sp[512];
-            shard_cagra_path(sp, sizeof(sp), io_dir, cmd->db_oid, cmd->index_oid, s);
-            if (unlink(sp) != 0)
-                break;   /* contiguous ids: first miss => no more shards */
-        }
-    }
+    /* Retire old sidecars only after the publication check, in the pinned directory. */
+    remove_other_kind_artifacts(io_dir, cmd->db_oid, cmd->index_oid, ART_REMOVED_BY_BUILD_CAGRA, 0);
 
     /* Phase 3I-1: write CPU HNSW fallback sidecar — only when the backend
      * requested it (cuvs.cpu_hnsw_fallback=on or a 3I import_hnsw flow).
@@ -9730,18 +9793,10 @@ finish_build_commit(int client_fd, const CuvsCmdFrame *cmd, const char *save_dir
 
     /* --- Swap into registry --- */
     if (existing) {
-        free_main_bf_cache(existing);
-        /* Phase 3F: a prior sharded instance is replaced by this unsharded
-         * build — free all its shard handles, not a (NULL) single handle. */
-        if (existing->shard_count >= 2)
-            free_index_shards(existing);
-        else
-            cuvs_cagra_free(existing->handle, existing->gpu_device_id);
-        free(existing->tids);
-        free(existing->rev_tids);     existing->rev_tids     = NULL;
-        free(existing->rev_item_ids); existing->rev_item_ids = NULL;
-        existing->shard_count = 0;
-        existing->shards      = NULL;
+        /* take the old build off as one unit before anything changes, so it is released on the device it lives on (the
+         * device id changes just below) and nothing it cached (sharded graphs, main BF, reverse map, CPU HNSW, IVF-PQ) stays. */
+        IndexEntry old_build;
+        entry_detach(existing, &old_build);
         existing->gpu_device_id = (uint32_t)target_gpu;
         existing->dim         = cmd->dim;
         existing->metric      = cmd->metric;
@@ -9753,13 +9808,8 @@ finish_build_commit(int client_fd, const CuvsCmdFrame *cmd, const char *save_dir
         existing->valid       = 1;
         existing->stale       = 0;     /* rebuilt -> fresh */
         existing->stale_since = 0;
-        /* The rebuilt base obsoletes the old delta cache (the backend unlinks
-         * .delta on a successful build); drop the resident GPU delta now. */
-        free_delta_cache(existing);
-        /* Phase 3I-1: drop cached CPU HNSW (new sidecar was just written). */
-        if (existing->hnsw_idx) { cuvs_hnsw_free(existing->hnsw_idx); existing->hnsw_idx = NULL; }
-        /* 3P: CAGRA rebuild clears any prior IVF-PQ handle on the same slot. */
-        if (existing->ivfpq_handle) { cuvs_ivfpq_free(existing->ivfpq_handle, existing->gpu_device_id); existing->ivfpq_handle = NULL; }
+        /* The rebuilt base obsoletes the old delta cache (the backend unlinks .delta on a successful build), the old CPU HNSW (a new
+         * sidecar was just written) and any IVF-PQ handle on the same slot: all of them went with old_build. */
         existing->last_search_mode = 0;
         reset_entry_stats(existing);   /* fresh index instance */
         existing->legacy_vectors_stale = !vectors_in_daemon_dir;
@@ -9772,6 +9822,7 @@ finish_build_commit(int client_fd, const CuvsCmdFrame *cmd, const char *save_dir
         existing->compact_count++;     /* every rebuild counts as a compaction */
         existing->last_compact_at = time(NULL);
         build_rev_tid_map(existing);   /* rebuild map for new tids/n_vecs */
+        entry_release(&old_build);     /* where the old code freed: at the swap, under the lock */
     } else {
         if (registry_full) {
             /* Registry full and the LRU couldn't be evicted (e.g. all entries
@@ -10752,12 +10803,41 @@ handle_mark_stale(int client_fd, const CuvsCmdFrame *cmd)
  * (this is why sharded indexes need no inflight guard here; see ADR-022/023).
  * Idempotent: a missing index or missing files are not errors.
  * ---------------------------------------------------------------- */
+/* DROP removes every file of the index in g_index_dir by its name prefix "<db>_<idx>." (.cagra, .tids, .shards, .sNNN.cagra,
+ * .ivfpq, .vectors, .hnsw, .delta, .tombstone, .stale, .relfilenode and their .tmp files), instead of a list of extensions that had
+ * to be kept in step with every new artifact. The trailing dot keeps "<db>_<idx>" from matching "<db>_<idx>0". Only regular files
+ * and links are removed. Only DROP removes by prefix; a rebuild removes the artifacts of the other index kinds by name
+ * (remove_other_kind_artifacts). A per-index index_dir (reloption) is not reached here. */
+static void
+drop_unlink_index_files(uint32_t db, uint32_t idx)
+{
+    char prefix[32];
+    int  n = snprintf(prefix, sizeof(prefix), "%u_%u.", db, idx);
+    DIR *dir = opendir(g_index_dir);
+    if (!dir || n <= 0 || n >= (int)sizeof(prefix))
+    {
+        if (dir) closedir(dir);
+        return;
+    }
+    struct dirent *ent;
+    while ((ent = readdir(dir)) != NULL)
+    {
+        if (strncmp(ent->d_name, prefix, (size_t)n) != 0)
+            continue;
+        struct stat st;
+        if (fstatat(dirfd(dir), ent->d_name, &st, AT_SYMLINK_NOFOLLOW) != 0)
+            continue;
+        if (S_ISREG(st.st_mode) || S_ISLNK(st.st_mode))
+            (void) unlinkat(dirfd(dir), ent->d_name, 0);
+    }
+    closedir(dir);
+}
+
 static void
 handle_drop(int client_fd, const CuvsCmdFrame *cmd)
 {
     uint32_t db  = cmd->db_oid;
     uint32_t idx = cmd->index_oid;
-    char     p[512];
     char     root[CUVS_PAGE_INDEX_DIR_SIZE];
     const char *directory = g_index_dir;
 
@@ -10785,22 +10865,8 @@ handle_drop(int client_fd, const CuvsCmdFrame *cmd)
     }
     if (e)
     {
-        free_delta_cache(e);
-        /* ADR-073: free the resident main BF cache — flat's ONLY GPU allocation
-         * (handle is NULL), and a cagra index's secondary BF cache. NULL-safe.
-         * (Note: e->ivfpq_handle is still not freed here — a pre-existing IVF-PQ
-         * VRAM-on-drop leak, out of scope for ADR-073.) */
-        free_main_bf_cache(e);
-        if (e->shard_count >= 2) free_index_shards(e);
-        else if (e->handle)      cuvs_cagra_free(e->handle, e->gpu_device_id);
-        free(e->tids);
-        free(e->rev_tids);     e->rev_tids     = NULL;
-        free(e->rev_item_ids); e->rev_item_ids = NULL;
-
-        int slot = (int)(e - g_indexes);
-        for (int i = slot; i < g_n_indexes - 1; i++)
-            g_indexes[i] = g_indexes[i + 1];
-        g_n_indexes--;
+        entry_release(e);    /* everything the entry holds, as eviction releases it */
+        registry_remove(e);
         g_cache_drops++;   /* EV-7: DROP cleanup is not a policy eviction */
     }
     evict_history_drop(db, idx);   /* C8: history goes with the index */
@@ -10826,22 +10892,33 @@ handle_drop(int client_fd, const CuvsCmdFrame *cmd)
     }
 
     /* Unlink every per-index artifact so a restart won't reload a zombie. */
-    index_file_path(p, sizeof(p), directory, db, idx);       unlink(p); /* .cagra */
-    tids_file_path(p, sizeof(p), directory, db, idx);        unlink(p); /* .tids */
-    shards_manifest_path(p, sizeof(p), directory, db, idx);  unlink(p); /* .shards */
-    delta_file_path(p, sizeof(p), directory, db, idx);       unlink(p); /* .delta */
-    vectors_file_path(p, sizeof(p), directory, db, idx);     unlink(p); /* .vectors */
-    stale_file_path(p, sizeof(p), directory, db, idx);       unlink(p); /* .stale */
-    relfilenode_file_path(p, sizeof(p), directory, db, idx); unlink(p); /* .relfilenode */
-    snprintf(p, sizeof(p), "%s/%u_%u.tombstone", directory, db, idx); unlink(p);
-    snprintf(p, sizeof(p), "%s/%u_%u.hnsw%s", directory, db, idx,
-             CUVS_HNSW_SOURCE_SUFFIX); unlink(p);
-    /* Shard artifacts have contiguous ids; stop at the first missing one. */
-    for (uint32_t s = 0; s < CUVS_SHARDS_MAX; s++)
+    if (cmd->op == CUVS_OP_DROP_PAGES_INDEX)
     {
-        shard_cagra_path(p, sizeof(p), directory, db, idx, s);
-        if (unlink(p) != 0)
-            break;
+        char p[512];
+
+        index_file_path(p, sizeof(p), directory, db, idx);       unlink(p); /* .cagra */
+        tids_file_path(p, sizeof(p), directory, db, idx);        unlink(p); /* .tids */
+        shards_manifest_path(p, sizeof(p), directory, db, idx);  unlink(p); /* .shards */
+        delta_file_path(p, sizeof(p), directory, db, idx);       unlink(p); /* .delta */
+        vectors_file_path(p, sizeof(p), directory, db, idx);     unlink(p); /* .vectors */
+        stale_file_path(p, sizeof(p), directory, db, idx);       unlink(p); /* .stale */
+        relfilenode_file_path(p, sizeof(p), directory, db, idx); unlink(p); /* .relfilenode */
+        ivfpq_file_path(p, sizeof(p), directory, db, idx);       unlink(p); /* .ivfpq */
+        hnsw_file_path(p, sizeof(p), directory, db, idx);        unlink(p); /* .hnsw */
+        snprintf(p, sizeof(p), "%s/%u_%u.tombstone", directory, db, idx); unlink(p);
+        snprintf(p, sizeof(p), "%s/%u_%u.hnsw%s", directory, db, idx,
+                 CUVS_HNSW_SOURCE_SUFFIX); unlink(p);
+        /* Shard artifacts have contiguous ids; stop at the first missing one. */
+        for (uint32_t s = 0; s < CUVS_SHARDS_MAX; s++)
+        {
+            shard_cagra_path(p, sizeof(p), directory, db, idx, s);
+            if (unlink(p) != 0)
+                break;
+        }
+    }
+    else
+    {
+        drop_unlink_index_files(db, idx);
     }
 
     LOG_INFO("pg_cuvs_server: dropped index %u/%u (freed + artifacts unlinked)\n", db, idx);
@@ -12264,15 +12341,8 @@ handle_build_flat(int client_fd, const CuvsCmdFrame *cmd)
         if (dir_fd >= 0) { fsync(dir_fd); close(dir_fd); }
     }
 
-    /* Remove any stale CAGRA / IVF-PQ / .shards / .stale artifacts for this OID so
-     * load_index unambiguously takes the flat branch. */
-    {
-        char p[512];
-        index_file_path(p, sizeof(p), save_dir, cmd->db_oid, cmd->index_oid);   unlink(p);
-        ivfpq_file_path(p, sizeof(p), save_dir, cmd->db_oid, cmd->index_oid);   unlink(p);
-        stale_file_path(p, sizeof(p), save_dir, cmd->db_oid, cmd->index_oid);   unlink(p);
-        shards_manifest_path(p, sizeof(p), save_dir, cmd->db_oid, cmd->index_oid); unlink(p);
-    }
+    /* Remove what a prior build of another kind left for this OID so load_index unambiguously takes the flat branch. */
+    remove_other_kind_artifacts(save_dir, cmd->db_oid, cmd->index_oid, ART_REMOVED_BY_BUILD_FLAT, 0);
 
     /* Register (or replace) in the hot registry — handle == NULL, is_flat = 1. */
     pthread_mutex_lock(&g_index_mutex);
@@ -12282,14 +12352,8 @@ handle_build_flat(int client_fd, const CuvsCmdFrame *cmd)
         IndexEntry *existing = find_index(cmd->db_oid, cmd->index_oid);
         if (existing)
         {
-            if (existing->handle)       cuvs_cagra_free(existing->handle, existing->gpu_device_id);
-            if (existing->ivfpq_handle) cuvs_ivfpq_free(existing->ivfpq_handle, existing->gpu_device_id);
-            free(existing->tids);
-            free_delta_cache(existing);
-            free_main_bf_cache(existing);
-            if (existing->hnsw_idx) { cuvs_hnsw_free(existing->hnsw_idx); existing->hnsw_idx = NULL; }
-            existing->handle         = NULL;
-            existing->ivfpq_handle   = NULL;
+            IndexEntry old_build;
+            entry_detach(existing, &old_build);   /* shards included (they were overwritten with NULL before) */
             existing->ivfpq_n_vecs   = 0;
             existing->ivfpq_vram_bytes = 0;
             existing->tids           = new_tids;
@@ -12310,11 +12374,10 @@ handle_build_flat(int client_fd, const CuvsCmdFrame *cmd)
             existing->last_compact_at = 0;
             existing->warmup_state   = WARMUP_HOT;
             existing->last_search_mode = 3; /* gpu_bf */
-            free(existing->rev_tids);     existing->rev_tids     = NULL;
-            free(existing->rev_item_ids); existing->rev_item_ids = NULL;
             build_rev_tid_map(existing);
             reset_entry_stats(existing);
             existing->is_flat        = 1;   /* MUST be after reset_entry_stats */
+            entry_release(&old_build);
         }
         else
         {
@@ -12558,28 +12621,16 @@ handle_build_ivfpq(int client_fd, const CuvsCmdFrame *cmd)
         if (dir_fd >= 0) { fsync(dir_fd); close(dir_fd); }
     }
 
-    /* Remove any stale CAGRA artifacts for this OID so load_index takes the IVF-PQ path. */
-    {
-        char cagra_path[512];
-        index_file_path(cagra_path, sizeof(cagra_path), save_dir, cmd->db_oid, cmd->index_oid);
-        unlink(cagra_path);
-        char stale_path[512];
-        stale_file_path(stale_path, sizeof(stale_path), save_dir, cmd->db_oid, cmd->index_oid);
-        unlink(stale_path);
-    }
+    /* Remove what a prior build of another kind left for this OID so load_index takes the IVF-PQ path. */
+    remove_other_kind_artifacts(save_dir, cmd->db_oid, cmd->index_oid, ART_REMOVED_BY_BUILD_IVFPQ, 0);
 
     /* Register (or replace) in the hot index registry. */
     {
         IndexEntry *existing = find_index(cmd->db_oid, cmd->index_oid);
         if (existing)
         {
-            if (existing->handle)       cuvs_cagra_free(existing->handle, existing->gpu_device_id);
-            if (existing->ivfpq_handle) cuvs_ivfpq_free(existing->ivfpq_handle, existing->gpu_device_id);
-            free(existing->tids);
-            free_delta_cache(existing);
-            free_main_bf_cache(existing);
-            if (existing->hnsw_idx) { cuvs_hnsw_free(existing->hnsw_idx); existing->hnsw_idx = NULL; }
-            existing->handle         = NULL;
+            IndexEntry old_build;
+            entry_detach(existing, &old_build);   /* shards included (they were left on the entry before) */
             existing->ivfpq_handle   = new_handle;
             existing->ivfpq_n_vecs   = cmd->n_vecs;
             existing->ivfpq_vram_bytes = needed;
@@ -12596,9 +12647,8 @@ handle_build_ivfpq(int client_fd, const CuvsCmdFrame *cmd)
             existing->last_search_mode = 5; /* ivfpq */
             reset_entry_stats(existing);
             existing->n_extended = 0;
-            free(existing->rev_tids);     existing->rev_tids     = NULL;
-            free(existing->rev_item_ids); existing->rev_item_ids = NULL;
             build_rev_tid_map(existing);
+            entry_release(&old_build);
         }
         else
         {
@@ -15296,7 +15346,7 @@ page_fold_reserve_mirrors(size_t mirrors, size_t graph_bytes,
 }
 
 static PageCagraGraph *
-page_fold_pick_locked(int device, uint64_t now)
+page_fold_pick_locked(int device, uint64_t now, bool ignore_retry, uint64_t registered_order)
 {
     PageCagraGraph *best = NULL;
     uint64_t best_priority = 0;
@@ -15306,6 +15356,8 @@ page_fold_pick_locked(int device, uint64_t now)
     {
         uint64_t pending, priority;
 
+        if (registered_order && entry->registered_order != registered_order)
+            continue;
         if (entry->gpu != device || !entry->handle || !entry->n_slots ||
             !entry->overlay.boot_id || entry->overlay.covered_upto <= entry->folded)
         {
@@ -15316,7 +15368,7 @@ page_fold_pick_locked(int device, uint64_t now)
         if (!entry->fold_pending_since)
             entry->fold_pending_since = now;
         pending = entry->overlay.covered_upto - entry->folded;
-        if (entry->fold_candidate || entry->fold_retry_after > now ||
+        if (entry->fold_candidate || (!ignore_retry && entry->fold_retry_after > now) ||
             (!g_page_fold_batch_rows && pending < PAGE_FOLD_MIN_POSITIONS &&
              now - entry->fold_pending_since < PAGE_FOLD_IDLE_US))
             continue;
@@ -15329,6 +15381,26 @@ page_fold_pick_locked(int device, uint64_t now)
     }
     return best;
 }
+
+#ifdef CUVS_PAGE_OVERLAY_GPU
+static void
+page_gpu_clear_host_hold_locked(void)
+{
+    g_page_gpu_host_fold_order = 0;
+    __atomic_store_n(&g_page_gpu_host_fold_device, -1, __ATOMIC_RELEASE);
+}
+
+static uint32_t
+page_gpu_allocated_devices_locked(bool include_pending)
+{
+    uint32_t mask = 0;
+
+    for (int device = 0; device < CUVS_MAX_GPUS; ++device)
+        if (g_page_gpu_live[device] || (include_pending && g_page_gpu_reserved[device]))
+            mask |= UINT32_C(1) << device;
+    return mask;
+}
+#endif
 
 /* Copy the pinned overlay into slot order. A live row in the chunk is the
  * first choice for filling dead positions. An optimized fold without a live
@@ -15438,17 +15510,60 @@ page_fold_run(int device)
     uint32_t wanted, dim, base_sample;
     uint32_t staging_status;
     bool offered = false, mirrors_reserved = false;
+#ifdef CUVS_PAGE_OVERLAY_GPU
+    bool retried_after_reclaim = false;
+    uint64_t selected_order = 0;
+    bool host_fold_can_fit;
+    uint64_t fold_retry_after;
+    uint32_t reclaim_devices = 0;
+#endif
 
     (void) pthread_once(&g_page_daemon_once, initialize_page_daemon_id);
     if (!g_page_daemon_id)
         return;
 
+#ifdef CUVS_PAGE_OVERLAY_GPU
+retry_admission:
+#endif
     pthread_mutex_lock(&g_index_mutex);
     if (g_pending_build_vram[device] || g_unlocked_gpu_jobs || page_fold_should_yield(&device))
         goto defer;
-    parent = page_fold_pick_locked(device, now);
+#ifdef CUVS_PAGE_OVERLAY_GPU
+    if (g_page_gpu_fold_waiting[device] &&
+        !page_fold_pick_locked(device, now, true, g_page_gpu_fold_waiting[device]))
+        __atomic_store_n(&g_page_gpu_fold_waiting[device], 0, __ATOMIC_RELEASE);
+    if (g_page_gpu_host_fold_device == device &&
+        !page_fold_pick_locked(device, now, true, g_page_gpu_host_fold_order))
+        page_gpu_clear_host_hold_locked();
+    if (!retried_after_reclaim)
+    {
+        /* Host staging shares its budget across devices. Give its blocked
+         * fold the pinned workspaces from all devices before the retry. */
+        if (g_page_gpu_host_fold_device == device)
+            reclaim_devices = page_gpu_allocated_devices_locked(false);
+        if (g_page_gpu_fold_waiting[device] && g_page_gpu_live[device])
+            reclaim_devices |= UINT32_C(1) << device;
+        if (reclaim_devices)
+            goto reclaim_cache;
+    }
+#endif
+    parent = NULL;
+#ifdef CUVS_PAGE_OVERLAY_GPU
+    /* Give a ready hold owner the reclaimed capacity before ordinary
+     * priority can pick another graph. Backoff still applies. */
+    if (g_page_gpu_host_fold_device == device)
+        parent = page_fold_pick_locked(device, now, false, g_page_gpu_host_fold_order);
+    if (!parent && g_page_gpu_fold_waiting[device])
+        parent = page_fold_pick_locked(device, now, false, g_page_gpu_fold_waiting[device]);
+#endif
+    if (!parent)
+        parent = page_fold_pick_locked(device, now, false, 0);
     if (!parent)
         goto defer;
+#ifdef CUVS_PAGE_OVERLAY_GPU
+    selected_order = parent->registered_order;
+    fold_retry_after = parent->fold_retry_after;
+#endif
     parent->fold_retry_after = now + UINT64_C(1000000);
     pending = parent->overlay.covered_upto - parent->folded;
     wanted = pending < max_positions ? (uint32_t) pending : max_positions;
@@ -15465,7 +15580,22 @@ page_fold_run(int device)
     limit = budget_eff_bytes(device);
     used = total_vram_used(device);
     if ((limit && (used >= limit || peak > limit - used)) || peak > gpu_free_vram_bytes(device))
+    {
+#ifdef CUVS_PAGE_OVERLAY_GPU
+        if (!retried_after_reclaim && g_page_gpu_live[device])
+        {
+            /* Stop new scoring and allocations before trying to surrender
+             * optional backing. The active search owns the workspace until
+             * its result has been assembled. Retry without a stale graph pin. */
+            if (!g_page_gpu_fold_waiting[device])
+                __atomic_store_n(&g_page_gpu_fold_waiting[device], selected_order, __ATOMIC_RELEASE);
+            parent->fold_retry_after = fold_retry_after;
+            reclaim_devices = UINT32_C(1) << device;
+            goto reclaim_cache;
+        }
+#endif
         goto defer;
+    }
 
     event = (CuvsPageFoldEvent) {
         .length = sizeof(event), .db_oid = parent->db_oid, .index_oid = parent->index_oid,
@@ -15484,6 +15614,10 @@ page_fold_run(int device)
     reserve_build_vram(peak, device);
     g_fold_claim[device] = peak;
     __atomic_store_n(&g_fold_active[device], true, __ATOMIC_SEQ_CST);
+#ifdef CUVS_PAGE_OVERLAY_GPU
+    if (g_page_gpu_fold_waiting[device] == selected_order)
+        __atomic_store_n(&g_page_gpu_fold_waiting[device], 0, __ATOMIC_RELEASE);
+#endif
     uint64_t started = admission_mono_us();
     pthread_mutex_unlock(&g_index_mutex);
     LOG_INFO("[page_fold_begin] gpu=%d db=%u index=%u positions=%u reserve=%zu mono_us=%llu daemon_id=%llu\n",
@@ -15513,6 +15647,14 @@ page_fold_run(int device)
 
     host_bytes = (size_t) wanted * dim * sizeof(float);
     const CuvsPageOverlayRequest staging_request = {0};
+#ifdef CUVS_PAGE_OVERLAY_GPU
+    size_t staging_charge;
+    uint64_t minimum_mirror = (retained / (shape.rows + wanted)) * (shape.rows + 1);
+
+    host_fold_can_fit = cuvs_page_overlay_allocation_bytes(host_bytes + wanted, &staging_charge) &&
+        staging_charge <= g_page_overlay_budget.limit &&
+        minimum_mirror <= g_page_overlay_budget.limit - staging_charge;
+#endif
     staging_status = cuvs_page_overlay_alloc(&g_page_overlay_budget, &staging_request,
                                              host_bytes + wanted, &staging);
     if (staging_status == CUVS_STATUS_PAGE_OVERLAY_HOST_FULL && cache.graph)
@@ -15546,6 +15688,10 @@ page_fold_run(int device)
             size_t graph_bytes = control.optimized ? (size_t) (output_rows * shape.degree * sizeof(uint32_t)) : 0;
             size_t mirrors = control.optimized && shape.stride == dim ? graph_bytes : (size_t) retained;
 
+#ifdef CUVS_PAGE_OVERLAY_GPU
+            host_fold_can_fit = staging->charged_bytes <= g_page_overlay_budget.limit &&
+                mirrors <= g_page_overlay_budget.limit - staging->charged_bytes;
+#endif
             mirrors_reserved = page_fold_reserve_mirrors(mirrors, graph_bytes, &cache, &control,
                                                          &result_device_graph, &host_mirror_charge);
             if (!mirrors_reserved)
@@ -15606,6 +15752,25 @@ page_fold_run(int device)
         release_build_vram(peak, device);
         g_fold_claim[device] = 0;
     }
+#ifdef CUVS_PAGE_OVERLAY_GPU
+    /* The pool may have enough aggregate bytes and still refuse a backing
+     * allocation. Let the next fold attempt reclaim before it tries again. */
+    if (g_page_gpu_live[device] && status == CUVS_CAGRA_FOLD_OOM && !g_page_gpu_fold_waiting[device])
+        __atomic_store_n(&g_page_gpu_fold_waiting[device], selected_order, __ATOMIC_RELEASE);
+    if (g_page_gpu_min_rows && staging_status == CUVS_STATUS_PAGE_OVERLAY_HOST_FULL && host_fold_can_fit &&
+        page_gpu_allocated_devices_locked(true))
+    {
+        if (g_page_gpu_host_fold_device < 0)
+        {
+            g_page_gpu_host_fold_order = selected_order;
+            __atomic_store_n(&g_page_gpu_host_fold_device, device, __ATOMIC_RELEASE);
+        }
+    }
+    else if (g_page_gpu_host_fold_device == device && g_page_gpu_host_fold_order == selected_order)
+        /* This fold reached an actual retry. With no optional claims left,
+         * further suspension would not make its host budget larger. */
+        page_gpu_clear_host_hold_locked();
+#endif
     __atomic_store_n(&g_fold_active[device], false, __ATOMIC_SEQ_CST);
     uint64_t finished = admission_mono_us();
     pthread_cond_broadcast(&g_fold_finished);
@@ -15633,7 +15798,41 @@ page_fold_run(int device)
     return;
 
 defer:
+#ifdef CUVS_PAGE_OVERLAY_GPU
+    if (selected_order)
+    {
+        /* A retry reached selection and failed before staging. Keep a hold
+         * only while there are still optional allocations to surrender. */
+        if (g_page_gpu_host_fold_device == device && g_page_gpu_host_fold_order == selected_order &&
+            !page_gpu_allocated_devices_locked(true))
+            page_gpu_clear_host_hold_locked();
+        if (g_page_gpu_fold_waiting[device] == selected_order &&
+            !g_page_gpu_live[device] && !g_page_gpu_reserved[device])
+            __atomic_store_n(&g_page_gpu_fold_waiting[device], 0, __ATOMIC_RELEASE);
+    }
+#endif
     pthread_mutex_unlock(&g_index_mutex);
+    return;
+#ifdef CUVS_PAGE_OVERLAY_GPU
+reclaim_cache:
+    pthread_mutex_unlock(&g_index_mutex);
+    bool reclaimed = true;
+
+    for (int cached = 0; cached < CUVS_MAX_GPUS; ++cached)
+    {
+        if (!(reclaim_devices & (UINT32_C(1) << cached)))
+            continue;
+        if (!cuvs_page_overlay_gpu_reclaim(cached))
+            reclaimed = false;
+        else
+            LOG_INFO("[page_overlay_gpu_reclaim] gpu=%d fold_gpu=%d released cache\n", cached, device);
+    }
+    if (!reclaimed)
+        return;
+    retried_after_reclaim = true;
+    selected_order = 0;
+    goto retry_admission;
+#endif
 }
 
 static void *
@@ -16367,6 +16566,67 @@ page_resident_recv_advance(int fd, CuvsPageResidentAdvance *advance)
     return false;
 }
 
+#ifdef CUVS_PAGE_OVERLAY_GPU
+static bool
+page_gpu_reserve(int device, size_t bytes)
+{
+    CuvsRmmPoolStats stats;
+    size_t cap = (size_t) g_page_gpu_cache_mib * 1024 * 1024;
+    bool reserved = false;
+
+    pthread_mutex_lock(&g_index_mutex);
+    size_t claimed = g_page_gpu_live[device] + g_page_gpu_reserved[device];
+    size_t limit = budget_eff_bytes(device);
+    size_t used = total_vram_used(device);
+
+    /* Cache hits allocate nothing during a fold. Defer new RMM allocations
+     * while a fold is live, and leave the rest of the backing to claims
+     * already made by the existing admission controller. */
+    if (!g_fold_active[device] && !g_page_gpu_fold_waiting[device] && g_page_gpu_host_fold_device < 0 &&
+        claimed <= cap && bytes <= cap - claimed &&
+        (!limit || (used <= limit && bytes <= limit - used)) &&
+        cuvs_rmm_pool_stats(device, &stats) == 0 && stats.used_bytes <= stats.reserved_bytes)
+    {
+        uint64_t available = stats.reserved_bytes - stats.used_bytes;
+        size_t pending = g_pending_rmm_build_vram[device];
+
+        if (pending <= available && bytes <= available - pending)
+        {
+            g_page_gpu_reserved[device] += bytes;
+            reserve_build_vram(bytes, device);
+            reserved = true;
+        }
+    }
+    pthread_mutex_unlock(&g_index_mutex);
+    return reserved;
+}
+
+static void
+page_gpu_finish(int device, size_t bytes, bool resident)
+{
+    pthread_mutex_lock(&g_index_mutex);
+    g_page_gpu_reserved[device] -= bytes;
+    release_build_vram(bytes, device);
+    if (resident)
+        g_page_gpu_live[device] += bytes;
+    pthread_mutex_unlock(&g_index_mutex);
+}
+
+static void
+page_gpu_release(int device, size_t bytes)
+{
+    pthread_mutex_lock(&g_index_mutex);
+    g_page_gpu_live[device] -= bytes;
+    pthread_mutex_unlock(&g_index_mutex);
+}
+
+static const CuvsPageOverlayGpuAdmission page_gpu_admission = {
+    .reserve = page_gpu_reserve,
+    .finish = page_gpu_finish,
+    .release = page_gpu_release,
+};
+#endif
+
 /* The connection is the cursor. It owns the query, fixed range and graph
  * pin for every reply. Pending distances are computed once. A larger ANN
  * request replaces the prior base stream because ANN prefixes can change. */
@@ -16401,16 +16661,38 @@ serve_page_resident_search(int fd, const CuvsCmdFrame *cmd, const CuvsPageOverla
         goto fail;
     }
 
-    for (const CuvsPageOverlayChunk *chunk = snapshot; chunk; chunk = chunk->next)
+#ifdef CUVS_PAGE_OVERLAY_GPU
+    uint64_t score_start = g_page_gpu_trace ? admission_mono_us() : 0;
+    uint32_t gpu_rows = 0;
+
+    if (g_page_gpu_min_rows && !g_shutdown &&
+        __atomic_load_n(&g_page_gpu_host_fold_device, __ATOMIC_ACQUIRE) < 0 &&
+        !__atomic_load_n(&g_page_gpu_fold_waiting[graph->gpu], __ATOMIC_ACQUIRE))
+        gpu_rows = cuvs_page_overlay_gpu_collect(graph->gpu, g_page_gpu_min_rows,
+            &page_gpu_admission, &g_page_overlay_budget, snapshot, request->from,
+            &request->base, query, cmd, pending, &npending);
+
+    if (!gpu_rows)
+#endif
     {
-        if (chunk->from < request->base.folded &&
-            request->base.folded - chunk->from >= chunk->positions)
-            break;
-        cuvs_page_overlay_collect_range(chunk, request->base.folded, request->from,
-                                         &request->base, query, cmd, pending, &npending);
+        for (const CuvsPageOverlayChunk *chunk = snapshot; chunk; chunk = chunk->next)
+        {
+            if (chunk->from < request->base.folded &&
+                request->base.folded - chunk->from >= chunk->positions)
+                break;
+            cuvs_page_overlay_collect_range(chunk, request->base.folded, request->from,
+                                             &request->base, query, cmd, pending, &npending);
+        }
     }
     cuvs_page_overlay_collect_range(supplement, request->from, request->base.tail,
                                      &request->base, query, cmd, pending, &npending);
+#ifdef CUVS_PAGE_OVERLAY_GPU
+    if (g_page_gpu_trace)
+        LOG_INFO("[page_overlay_gpu_score] gpu=%d index=%u resident_positions=%llu pending_rows=%d cuda_rows=%u score_us=%llu\n",
+                 graph->gpu, graph->index_oid,
+                 (unsigned long long) (request->from - request->base.folded), npending, gpu_rows,
+                 (unsigned long long) (admission_mono_us() - score_start));
+#endif
     if (npending > 1)
         qsort(pending, (size_t) npending, sizeof(*pending),
               cmd->metric == CUVS_METRIC_IP ? page_resident_descending : page_resident_ascending);
@@ -17713,6 +17995,27 @@ main(int argc, char **argv)
                 return 1;
             }
         }
+#ifdef CUVS_PAGE_OVERLAY_GPU
+        else if (strcmp(argv[i], "--page-overlay-gpu-min-rows") == 0)
+        {
+            if (i + 1 >= argc || cuvs_parse_rmm_pool_mb(argv[++i], &g_page_gpu_min_rows) != 0 ||
+                g_page_gpu_min_rows > CUVS_PAGE_OVERLAY_MAX)
+            {
+                LOG_ERROR("--page-overlay-gpu-min-rows requires an integer from 0 to %u\n",
+                          CUVS_PAGE_OVERLAY_MAX);
+                return 1;
+            }
+        }
+        else if (strcmp(argv[i], "--page-overlay-gpu-cache-mb") == 0)
+        {
+            if (i + 1 >= argc || cuvs_parse_rmm_pool_mb(argv[++i], &g_page_gpu_cache_mib) != 0 ||
+                (uint64_t) g_page_gpu_cache_mib * 1024 * 1024 > SIZE_MAX)
+            {
+                LOG_ERROR("--page-overlay-gpu-cache-mb requires a nonnegative integer MiB value\n");
+                return 1;
+            }
+        }
+#endif
         else if (strcmp(argv[i], "--rmm-scratch-permille") == 0)
         {
             if (i + 1 >= argc ||
@@ -17973,6 +18276,22 @@ main(int argc, char **argv)
         }
     }
     LOG_INFO("RMM initial pool reservation: %u MiB per GPU (0=disabled)\n", g_rmm_pool_mb);
+#ifdef CUVS_PAGE_OVERLAY_GPU
+    if (g_page_gpu_min_rows)
+    {
+        if (!g_rmm_pool_mb || !g_page_gpu_cache_mib)
+        {
+            LOG_ERROR("GPU page overlay scoring requires an RMM pool and a positive cache budget\n");
+            return 1;
+        }
+        cuvs_page_overlay_gpu_init();
+        LOG_INFO("GPU page overlay scoring: min_rows=%u cache_mib_per_gpu=%u\n",
+                  g_page_gpu_min_rows, g_page_gpu_cache_mib);
+    }
+    const char *page_gpu_trace = getenv("CUVS_PAGE_OVERLAY_GPU_TRACE");
+
+    g_page_gpu_trace = page_gpu_trace && strcmp(page_gpu_trace, "1") == 0;
+#endif
     LOG_INFO("RMM maximum pool quota: %u%% of total device memory\n",
              g_rmm_pool_mb > 0 ? g_rmm_pool_max_percent : 0);
     LOG_INFO("CAGRA build scratch: rmm_scratch_permille=%u (admission N = final + "
@@ -18217,6 +18536,14 @@ main(int argc, char **argv)
      * serialize / file I/O). In-flight detached connection threads holding
      * g_index_mutex are waited on by the lock inside graceful_shutdown. */
     graceful_shutdown();
+
+#ifdef CUVS_PAGE_OVERLAY_GPU
+    /* Detached connections can still hold GPU scoring or mirror references.
+     * Let process exit retire them and the CUDA context together, after the
+     * existing index saves and socket cleanup. */
+    if (g_page_gpu_min_rows)
+        _Exit(EXIT_SUCCESS);
+#endif
 
     return 0;
 }
