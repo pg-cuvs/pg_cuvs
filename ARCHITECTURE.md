@@ -113,13 +113,22 @@ Key differences from cagra:
   they reload from `.vectors` on next use.
 - On daemon restart: `startup_load_indexes` detects `.vectors` present without `.cagra`/`.ivfpq`
   and registers the entry as `is_flat=1` (restart-durable).
-- DROP: `cuvs_object_access` notifies the daemon of the drop of a `cagra`, `flat` or `ivfpq`
-  index when the transaction that drops it commits; `DROP INDEX CONCURRENTLY` commits several
-  times and the notice goes at its first internal commit, while the index is still in the catalog.
-  A DROP inside a transaction that is prepared (`PREPARE TRANSACTION`) is not notified.
-  `handle_drop` releases what the entry holds (the CAGRA graph, the resident BF cache, the IVF-PQ
-  handle, the CPU HNSW structure) and removes the index's files from the daemon's `index_dir`;
-  files written to a per-index `index_dir` (reloption) stay.
+- DROP: `cuvs_object_access` notifies the daemon of the drop of an index whose access method keeps
+  daemon state (`cuvs_daemon_entry_ams`: `cagra`, `ivfpq`, `flat`) when the transaction that drops
+  it commits; `DROP INDEX CONCURRENTLY` commits several times and the notice goes at its first
+  internal commit, while the index is still in the catalog. A DROP inside a transaction that is
+  prepared (`PREPARE TRANSACTION`) is not notified. For legacy indexes `handle_drop` releases the
+  entry and removes files in the daemon's `index_dir` (`--index-dir`) whose names start with
+  `<db>_<index>.`. Page-format CAGRA sends its index directory for targeted cleanup.
+- Release in one place: `entry_release` frees everything an entry owns (the CAGRA graph or the
+  shards with their BF caches, the delta and main BF caches, the IVF-PQ handle, the CPU HNSW
+  structure, the TID array, the reverse TID map). Eviction and DROP call it and then
+  `registry_remove`, which compacts the registry and zeroes the slot that falls off the end. A
+  rebuild that replaces an entry in place (`finish_build_commit`, `build_sharded`,
+  `handle_build_flat`, `handle_build_ivfpq`) first takes the old build off with `entry_detach`,
+  installs the new one, and releases the old unit with `entry_release`, at the same point under the
+  registry lock as before. A rebuild removes the artifacts the other index kinds left for the OID
+  from one table (`remove_other_kind_artifacts`); only DROP removes by prefix.
 
 ### 3.1b GPU-built CPU HNSW (`USING pg_cuvs_hnsw`)
 
