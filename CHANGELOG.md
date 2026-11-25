@@ -205,6 +205,15 @@ exists for 0.9.0.
   `CROSS JOIN LATERAL ... ORDER BY ... LIMIT` form, which follows HOT chains.
   `docs/reference.md` also notes the brute_force cache defects #237 and #239. The
   functions are unchanged.
+- `DROP INDEX`, `DROP TABLE` and the dropped old index of `REINDEX CONCURRENTLY` on an
+  `ivfpq` index did not release what the daemon held for it. The backend notified the
+  daemon of the drop of `cagra` and `flat` indexes only, so the entry of an `ivfpq`
+  index stayed in `pg_cuvs_index_status()` with its IVF-PQ handle, and
+  `pg_cuvs_memory_status().resident_bytes` grew with every index created and dropped.
+  The notice is now sent for `ivfpq` indexes too. The daemon frees the IVF-PQ handle and
+  the CPU HNSW structure of the dropped index, which the drop did not free for any index
+  type, and removes its `.ivfpq` and `.hnsw` files from the daemon's `index_dir` (files
+  written to a per-index `index_dir` reloption stay, as they did for every index type).
 - A GPU build without `CUVS_SDK_SOURCE_INCLUDE` failed to link with
   `ld: .../librapids_logger.so: error adding symbols: DSO missing from command line`.
   The wrapper expands `RMM_LOG_*`, which call `rapids_logger::logger::log`, and
