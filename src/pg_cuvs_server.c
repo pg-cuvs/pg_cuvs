@@ -29,6 +29,7 @@
 #include "cuvs_ipc.h"
 #include "cuvs_page_overlay.h"
 #include "cuvs_util.h"
+#include "cuvs_hnsw_source.h"
 #include "cuvs_cache_policy.h"
 #include "cuvs_bf_verdict.h"     /* #238: remembered brute_force unavailable verdict */
 #include "cuvs_peak_meter.h"
@@ -7561,7 +7562,7 @@ read_hnsw_source(const char *graph_path, const char *tids_path,
     graph_fd = open(graph_path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
     tids_fd = open(tids_path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
     found = (graph_fd >= 0 && tids_fd >= 0 &&
-             cuvs_hnsw_source_binding_read(file, graph_fd, tids_fd, binding));
+             cuvs_hnsw_source_binding_read(file, graph_fd, tids_fd, binding, NULL));
     if (graph_fd >= 0) close(graph_fd);
     if (tids_fd >= 0) close(tids_fd);
     fclose(file);

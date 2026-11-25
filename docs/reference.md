@@ -633,7 +633,10 @@ conversion.
 
 The `hnswlib_file` mode opens files in the source index directory and
 requires a build-time binding between the HNSW graph and the source CAGRA's
-TID file. Earlier versions could import an older graph after the source
+TID file. The binding records each file's device, inode, size and SHA-256.
+Verification reads both files to compute their digests.
+A failed CAGRA rebuild preserves the binding when it restores the same files
+with unchanged contents. Earlier versions could import an older graph after the source
 changed. A missing or invalid binding now causes conversion to fail with
 SQLSTATE `55000`. Choose `mode = 'nsw'` for a clean resident source, or set
 `cuvs.cpu_hnsw_fallback = on` and run `REINDEX` on the source to regenerate

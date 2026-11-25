@@ -168,7 +168,7 @@ PG_CPPFLAGS += $(CUVS_FOLD_PRODUCT_CPPFLAGS)
 # -Wl,-rpath embeds the cuVS lib path so postmaster finds libcuvs.so
 # without LD_LIBRARY_PATH being set (ADR-007).
 SHLIB_LINK     = $(CUVS_SO_LINK) $(CUVS_LOGGER_LINK) $(CUVS_SDK_PLAN_LINK) $(CUVS_FOLD_LINK) \
-                 -Wl,-Bstatic -lstdc++ -Wl,-Bdynamic -lrt
+                 -Wl,-Bstatic -lstdc++ -Wl,-Bdynamic -lrt -lcrypto
 
 EXTRA_CLEAN += src/.cuvs-fold-mode src/cuvs_cagra_fold_sdk.o src/cuvs_cagra_fold_sdk.bc \
                src/cuvs_cagra_fold_unavailable.o src/cuvs_cagra_fold_unavailable.bc
@@ -887,6 +887,13 @@ HNSW_CONVERTER_UNIT_LINK = -Wl,--gc-sections \
                           -L$(shell $(PG_CONFIG) --pkglibdir) -lpgcommon -lpgport -lm
 endif
 HNSW_UNIT_CPPFLAGS ?=
+test-unit: test-hnsw-source-binding
+test-hnsw-source-binding: test/unit/test_hnsw_source_binding.c src/cuvs_hnsw_source.h
+	$(CC) -std=gnu11 -Wall -Wextra -Werror -I src -o $@ $< -lcrypto
+	./$@
+EXTRA_CLEAN += test-hnsw-source-binding
+.PHONY: test-hnsw-source-binding
+
 .PHONY: test-hnsw-converter-build
 test-hnsw-converter: test-hnsw-converter-build
 	./$@

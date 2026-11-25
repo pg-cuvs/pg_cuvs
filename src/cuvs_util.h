@@ -144,27 +144,6 @@ typedef struct CuvsTidsHeader {
     uint32_t reserved;     /* must be 0 */
 } CuvsTidsHeader;          /* 32 bytes, LE-only, x86-64 daemon */
 
-/* Binding created with an optional on-disk HNSW export. A zero magic is
- * durably written before the first in-memory mutation of that generation. */
-#define CUVS_HNSW_SOURCE_MAGIC 0x53574e48u
-#define CUVS_HNSW_SOURCE_VERSION 1u
-#define CUVS_HNSW_SOURCE_SUFFIX ".source"
-
-typedef struct CuvsHnswFileIdentity {
-    uint64_t device;
-    uint64_t inode;
-    uint64_t bytes;
-    uint64_t change_sec;
-    uint64_t change_nsec;
-} CuvsHnswFileIdentity;
-
-typedef struct CuvsHnswSourceBinding {
-    uint32_t magic;
-    uint32_t version;
-    CuvsHnswFileIdentity graph;
-    CuvsHnswFileIdentity tids;
-} CuvsHnswSourceBinding;
-
 /* Standard table-based CRC-32 (IEEE 802.3, reflected, poly 0xEDB88320). */
 /* C linkage, so a C++ translation unit that includes this header and calls
  * these functions links against the C symbols. (cuvs_wrapper.cu includes it
@@ -172,9 +151,6 @@ typedef struct CuvsHnswSourceBinding {
 #ifdef __cplusplus
 extern "C" {
 #endif
-int cuvs_hnsw_file_identity(int fd, CuvsHnswFileIdentity *out);
-bool cuvs_hnsw_source_binding_read(FILE *binding_file, int graph_fd, int tids_fd,
-                                  CuvsHnswSourceBinding *out);
 uint32_t cuvs_crc32(const void *data, size_t len);
 
 /* Streaming CRC-32 for data that does not fit in one buffer (e.g. a large

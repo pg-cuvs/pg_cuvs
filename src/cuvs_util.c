@@ -24,41 +24,6 @@
 #include <time.h>     /* time(): legacy breaker wrappers */
 #include <pthread.h>  /* crc32 table once-init, parallel crc verifier */
 #include <unistd.h>   /* sysconf: parallel crc thread count */
-#include <sys/stat.h>
-
-int
-cuvs_hnsw_file_identity(int fd, CuvsHnswFileIdentity *out)
-{
-    struct stat st;
-
-    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode))
-        return -1;
-    out->device = (uint64_t) st.st_dev;
-    out->inode = (uint64_t) st.st_ino;
-    out->bytes = (uint64_t) st.st_size;
-#ifdef __APPLE__
-    out->change_sec = (uint64_t) st.st_ctimespec.tv_sec;
-    out->change_nsec = (uint64_t) st.st_ctimespec.tv_nsec;
-#else
-    out->change_sec = (uint64_t) st.st_ctim.tv_sec;
-    out->change_nsec = (uint64_t) st.st_ctim.tv_nsec;
-#endif
-    return 0;
-}
-
-bool
-cuvs_hnsw_source_binding_read(FILE *binding_file, int graph_fd, int tids_fd,
-                             CuvsHnswSourceBinding *out)
-{
-    CuvsHnswSourceBinding current = { .magic = CUVS_HNSW_SOURCE_MAGIC,
-                                      .version = CUVS_HNSW_SOURCE_VERSION };
-
-    return fread(out, sizeof(*out), 1, binding_file) == 1 &&
-           fgetc(binding_file) == EOF && !ferror(binding_file) &&
-           cuvs_hnsw_file_identity(graph_fd, &current.graph) == 0 &&
-           cuvs_hnsw_file_identity(tids_fd, &current.tids) == 0 &&
-           memcmp(out, &current, sizeof(current)) == 0;
-}
 
 int
 cuvs_notice_decode(const char *wire, size_t len, CuvsNoticeBatch *out)

@@ -86,6 +86,7 @@
 
 #include "cuvs_ipc.h"
 #include "cuvs_util.h"
+#include "cuvs_hnsw_source.h"
 #include "cuvs_hnsw_build.h"
 #include "hnsw_export.h"
 #include "cuvs_hnsw_scan.h"
@@ -2227,6 +2228,12 @@ hnsw_reject_conflicting_source_tids(void)
 }
 
 static bool
+hnsw_source_binding_cancel_pending(void)
+{
+    return QueryCancelPending || ProcDiePending;
+}
+
+static bool
 hnsw_source_binding_matches(const char *graph_path, FILE *graph, FILE *tids)
 {
     char path[1056];
@@ -2238,8 +2245,10 @@ hnsw_source_binding_matches(const char *graph_path, FILE *graph, FILE *tids)
     file = AllocateFile(path, PG_BINARY_R);
     if (file == NULL)
         return false;
-    found = cuvs_hnsw_source_binding_read(file, fileno(graph), fileno(tids), &recorded);
+    found = cuvs_hnsw_source_binding_read(file, fileno(graph), fileno(tids),
+                                         &recorded, hnsw_source_binding_cancel_pending);
     FreeFile(file);
+    CHECK_FOR_INTERRUPTS();
     return found;
 }
 

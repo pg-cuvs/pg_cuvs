@@ -118,7 +118,8 @@ exists for 0.9.0.
   `mode = 'nsw'` or regenerate the files by enabling
   `cuvs.cpu_hnsw_fallback` and running `REINDEX` on the source. If a failed
   `CREATE INDEX CONCURRENTLY` leaves an invalid target index, drop it before
-  retrying.
+  retrying. A failed rebuild preserves the binding when it restores the same
+  graph and TID files with unchanged contents.
 
 - `CREATE INDEX CONCURRENTLY ... USING pg_cuvs_hnsw` and `REINDEX INDEX CONCURRENTLY` of a `pg_cuvs_hnsw` index
   built from the heap (without `source`) no longer make the table's queries wait for a lock. The build opened the
