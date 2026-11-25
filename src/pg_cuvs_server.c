@@ -2401,9 +2401,8 @@ stat_mtime_ns(const struct stat *st)
     return (int64_t) st->st_mtim.tv_sec * 1000000000LL + (int64_t) st->st_mtim.tv_nsec;
 }
 
-/* Phase 3L: make e's resident main brute-force index match the current
- * `.vectors` sidecar and the requested precision. Lazily (re)built on the first
- * brute_force search and whenever the sidecar's mtime or the precision changes.
+/* Phase 3L: make e's resident main brute-force index match the current base
+ * and the requested precision. Lazily built from the `.vectors` sidecar.
  * Leaves main_bf_idx == NULL (so the caller fails closed with NO_VECTORS) when
  * the sidecar is missing, stale (generation mismatch with the current .tids),
  * corrupt, shape-mismatched, or cannot fit. Best-effort, NON-evicting:
@@ -2422,6 +2421,14 @@ refresh_main_bf_cache(IndexEntry *e, uint32_t want_precision)
     uint32_t          dg = delta_gpu_of(e);   /* unsharded: the index's GPU */
     int               rc;
 
+    /* After an unsaved CAGRA mutation the disk files can still agree with
+     * each other even when their rows no longer match the resident graph. */
+    if (e->handle && !e->file_current)
+    {
+        free_main_bf_cache(e);
+        return;
+    }
+
     vectors_file_path(path, sizeof(path), g_index_dir, e->db_oid, e->index_oid);
     if (stat(path, &st) != 0)
     {
@@ -2430,8 +2437,15 @@ refresh_main_bf_cache(IndexEntry *e, uint32_t want_precision)
     }
     if (e->main_bf_idx
         && (int64_t) st.st_mtime == e->main_bf_mtime
-        && e->bf_precision == want_precision)
-        return;                         /* unchanged + same precision -> reuse */
+        && e->bf_precision == want_precision
+        && e->main_bf_n == e->n_vecs)
+    {
+        uint32_t cur_tids_crc;
+
+        if (tids_body_crc_of(e, &cur_tids_crc) == 0 &&
+            cur_tids_crc == e->main_bf_generation)
+            return;
+    }
 
     /* #238: the same `.vectors` file as the last "unavailable" verdict -> decide
      * from what that read found, against the current row count, shape and
@@ -2449,7 +2463,7 @@ refresh_main_bf_cache(IndexEntry *e, uint32_t want_precision)
             return;
     }
 
-    /* Sidecar changed or precision toggled: drop the old index and rebuild.
+    /* The cached index cannot be reused: drop it and try to rebuild.
      * A failure below leaves main_bf_idx NULL, so the next search comes back
      * here; the read is skipped then only for a failure noted in bf_verdict
      * or when the VRAM pre-check below fails (which is checked again on every
@@ -9445,6 +9459,7 @@ finish_build_commit(int client_fd, const CuvsCmdFrame *cmd, const char *save_dir
 
     /* --- Swap into registry --- */
     if (existing) {
+        free_main_bf_cache(existing);
         /* Phase 3F: a prior sharded instance is replaced by this unsharded
          * build — free all its shard handles, not a (NULL) single handle. */
         if (existing->shard_count >= 2)
@@ -12625,6 +12640,7 @@ handle_extend(int client_fd, const CuvsCmdFrame *cmd)
     e->n_vecs     += n_new;
     e->n_extended += n_new;
     e->file_current = 0;   /* I-FC (1): graph now differs from the files */
+    free_main_bf_cache(e); /* `.vectors` does not contain the extended rows. */
     e->vram_bytes  = estimate_vram_bytes(e->n_vecs, (int)e->dim, e->graph_degree);
 
     /* Rebuild rev_tids to include new item_ids (needed for 3O prefilter). */
@@ -12854,6 +12870,7 @@ handle_compact(int client_fd, const CuvsCmdFrame *cmd)
     e->tids = new_tids;
     e->n_vecs      = new_n;
     e->file_current = 0;   /* I-FC: merged in memory; save_index sets 1 */
+    free_main_bf_cache(e); /* Compact changed the item-id to TID mapping. */
     e->n_extended       = 0;
     e->compact_count++;
     e->last_compact_at  = time(NULL);

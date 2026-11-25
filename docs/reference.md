@@ -41,11 +41,11 @@ corpora that require exhaustive search; use `cagra`/`ivfpq` for approximate sear
 > path couples an exact-BF workload to an unnecessary graph build and cannot be independently cost-
 > calibrated by the planner.
 
-> **Known issue (#237, #239):** once a brute_force search has loaded the daemon's
-> brute-force cache for a `cagra` index, a later INSERT (#237) or a VACUUM that removes dead
-> rows (#239) can make the brute_force path return missing or different rows without an
-> error. The path covers index scans with `cuvs.search_mode = 'brute_force'`,
-> `pg_cuvs_batch_search` in that mode and `cuvs_filtered_knn`. REINDEX the index to recover.
+> For an unsharded legacy `cagra` index, an INSERT that extends the graph or a VACUUM
+> that compacts it invalidates the resident brute-force cache (#237, #239). Searches
+> that need the build-time `.vectors` sidecar report an error while it is stale. This
+> includes index scans and `pg_cuvs_batch_search` in `brute_force` mode, and
+> `cuvs_filtered_knn` with a NULL filter. Use `REINDEX` to rebuild the sidecar.
 
 **NULL query vector.** A `cagra` / `flat` / `ivfpq` index scan cannot answer
 `ORDER BY col <-> NULL` — there is no vector to search with — so it raises
