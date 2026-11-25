@@ -97,6 +97,15 @@ exists for 0.9.0.
 
 ### Fixed
 
+- The daemon no longer dies with SIGSEGV when it frees an index after a failed request. A
+  failed request discarded its pooled resource slot together with the slot's dedicated
+  CUDA stream (`--rmm-dedicated-stream`, on by default), while device buffers that an
+  earlier request on that slot had allocated, such as the graph of an index built there,
+  still referred to the stream; RMM's pool looked the destroyed stream up when the index
+  was dropped or compacted. Any failed request poisons its slot, including host-side
+  failures such as a missing HNSW sidecar. The slot's handles are still discarded, but the
+  stream is now kept and reused once `cudaStreamQuery` reports it idle, and a kept stream
+  is never destroyed.
 - `pg_cuvs_hnsw` applies `ef_construction` to the applicable SDK settings for
   direct heap builds and records the configured value in the index metapage.
   Conversions from legacy CAGRA indexes use the option only for the target
