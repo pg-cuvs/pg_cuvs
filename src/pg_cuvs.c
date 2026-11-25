@@ -3251,6 +3251,13 @@ cuvs_build_hnsw_from_heap(Relation heapRel, Relation indexRel, IndexInfo *indexI
                                 errhint("%s", CUVS_HNSW_DISK_HINT)));
             if (rc != CUVS_STATUS_OK)
                 ereport(ERROR, (errmsg("pg_cuvs: temporary HNSW build failed (status %d): %s", rc, error)));
+            uint32_t requested_intermediate = cuvs_hnsw_scaled_quality(
+                128, ef_construction, 64, UINT32_MAX);
+            if (requested_intermediate > CUVS_HNSW_MAX_INTERMEDIATE_DEGREE &&
+                out->policy.intermediate == CUVS_HNSW_MAX_INTERMEDIATE_DEGREE)
+                ereport(NOTICE,
+                        (errmsg("pg_cuvs: HNSW intermediate graph degree capped at %u (requested %u)",
+                                CUVS_HNSW_MAX_INTERMEDIATE_DEGREE, requested_intermediate)));
             out->policy.route_flags |= cuvs_hnsw_timing_flags(stats_rows, prespool);
             /* CK-17 (13): every auto -> ACE receipt gets its NOTICE lines. */
             notices = cuvs_hnsw_build_notices(&out->policy, transition_sent);
