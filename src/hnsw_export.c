@@ -1007,6 +1007,25 @@ hnsw_page_pair_fits(int dim, int bytes_per_dim, int m, int level)
         neigh_tuple_size(level, m) + 2 * PGV_ITEM_OVERHEAD <= PGV_USABLE_BYTES;
 }
 
+/* Metapage plus the data pages needed when every node is level 0. Upper
+ * levels can increase the page count. A split level-0 pair consumes two
+ * pages: the next element cannot share the previous neighbor's page. */
+uint64_t
+cuvs_hnsw_estimate_index_bytes(uint64_t n, int dim, int bytes_per_dim, int m)
+{
+    uint32_t pairs_per_page;
+    uint64_t data_pages;
+
+    if (n == 0 || n >= InvalidBlockNumber ||
+        !hnsw_page_pair_fits(dim, bytes_per_dim, m, 0))
+        return 0;
+    if (hnsw_compute_pack_k(dim, bytes_per_dim, m, &pairs_per_page))
+        data_pages = 1 + (n - 1) / pairs_per_page;
+    else
+        data_pages = 2 * n;
+    return data_pages < InvalidBlockNumber ? (data_pages + 1) * BLCKSZ : 0;
+}
+
 /* A bounded cursor assigns hierarchical rows in their serialized order.
  * The reservation matches the existing page-fit check, including its
  * conservative item-pointer margin. Node/edge order never changes. */

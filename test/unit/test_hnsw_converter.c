@@ -647,6 +647,21 @@ test_valid_flat_and_original_labels(void)
     fixture_close(&f);
 }
 
+/* 88M ACE import (87,555,327 x 768 fp32, M 32): the location spill's last
+ * elem_blkno was 43,777,664, i.e. two pairs per page, plus the metapage. */
+static void
+test_index_estimate_matches_the_88m_layout(void)
+{
+    assert(cuvs_hnsw_estimate_index_bytes(87555327, 768, 4, 32) ==
+           (UINT64_C(43777664) + 1) * BLCKSZ);
+    assert(cuvs_hnsw_estimate_index_bytes(1, 768, 4, 32) == 2 * BLCKSZ);
+    assert(cuvs_hnsw_estimate_index_bytes(0, 768, 4, 32) == 0);
+    assert(cuvs_hnsw_estimate_index_bytes(10, 2000, 4, 32) == 21 * BLCKSZ);
+    assert(cuvs_hnsw_estimate_index_bytes(10, 4000, 4, 32) == 0); /* element alone exceeds a page */
+    printf("PASS index estimate matches the 88M layout\n");
+    fflush(stdout);
+}
+
 static void
 test_valid_hierarchy(void)
 {
@@ -1074,6 +1089,13 @@ test_hierarchical_native_packing_case(int dim, int bytes_per_dim, int m)
         assert(hnsw_location_table_lookup(&table, (uint32_t)node, &locations[node]));
     n_pages = locations[N - 1].elem_blkno;
     assert(n_pages > 0 && n_pages <= N);
+    /* The pre-build estimate packs every node as level 0: never above the
+     * real layout, and equal where upper levels still fit two per page. */
+    assert(cuvs_hnsw_estimate_index_bytes(N, dim, bytes_per_dim, m) <=
+           (uint64_t)(n_pages + 1) * BLCKSZ);
+    if (dim == 768 && bytes_per_dim == 4 && m == 32)
+        assert(cuvs_hnsw_estimate_index_bytes(N, dim, bytes_per_dim, m) ==
+               (uint64_t)(n_pages + 1) * BLCKSZ);
     policy.magic = CUVS_HNSW_POLICY_MAGIC;
     policy.version = CUVS_HNSW_POLICY_VERSION;
     policy.bytes = sizeof(policy);
@@ -2177,6 +2199,7 @@ main(int argc, char **argv)
     test_stored_policy_versions();
     test_ace_readback_metapage_roundtrip();
     test_valid_flat_and_original_labels();
+    test_index_estimate_matches_the_88m_layout();
     test_valid_hierarchy();
     test_disk_location_layout();
     test_empty_page_images();

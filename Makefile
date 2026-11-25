@@ -400,6 +400,14 @@ test-circuit-source: test/unit/check_circuit_source.py src/pg_cuvs.c
 
 .PHONY: test-unit test-circuit-source
 
+.PHONY: test-hnsw-disk-plan
+test-unit: test-hnsw-disk-plan
+test-hnsw-disk-plan: test/unit/test_hnsw_disk_plan.c src/cuvs_hnsw_disk_plan.h src/cuvs_hnsw_build_common.h
+	$(CC) -std=gnu11 -O2 -Wall -Wextra -Werror -I src -o $@ $<
+	./$@
+
+EXTRA_CLEAN += test-hnsw-disk-plan
+
 # Source structure checks of the HNSW build routes, run by the CPU job of
 # .github/workflows/ci.yml. The three check_* scripts read src/ as text, enforce
 # the invariants the approved route design relies on, and replay planted
@@ -1523,6 +1531,10 @@ test-stale-interim:
 .PHONY: test-k3-digest
 test-k3-digest:
 	python3 test/k3_digest_integration.py
+
+.PHONY: test-hnsw-disk-plan-live
+test-hnsw-disk-plan-live:
+	python3 test/hnsw_disk_plan_integration.py
 
 # #203: PostgreSQL/CUDA-free structural checks (real file adapter also lives in
 # test-hnsw-converter). No ANN search-policy defaults are altered.

@@ -95,6 +95,7 @@
 #include "postmaster/bgworker.h"    /* BackgroundWorker, RegisterBackgroundWorker */
 
 #include <sys/stat.h>
+#include <sys/statvfs.h> /* local disk plan of source-less HNSW builds */
 #include <sys/file.h>   /* flock */
 #include <sys/mman.h>   /* shm_open/mmap (§4A-2 parallel partial merge) */
 #include <fcntl.h>      /* O_RDWR, O_CREAT */
@@ -119,6 +120,9 @@
 #include "cuvs_hnsw_build.h"
 #include "cuvs_hnsw_build_common.h"
 #include "cuvs_status_text.h"   /* I3-B status text parsing */
+#include "cuvs_hnsw_disk_plan.h"
+#include "common/relpath.h"         /* GetDatabasePath */
+#include "access/xlog_internal.h"    /* XLOGDIR */
 #include "cuvs_route_preflight.h"
 #include "cuvs_vacuum_policy.h"   /* amvacuumcleanup: no compaction on ANALYZE */
 
@@ -3096,17 +3100,159 @@ cuvs_hnsw_budget_error(uint32_t build_algo, const CuvsHnswBudgetSnapshot *budget
         : errhint("Use build_algo=ace for an explicit disk build; explicit ivf_pq never spills to ACE.")));
 }
 
+static void
+cuvs_disk_probe(CuvsHnswDiskItem *item, const char *path)
+{
+    struct stat st;
+    struct statvfs vfs;
+
+    item->path = path;
+    if (path && stat(path, &st) == 0 && statvfs(path, &vfs) == 0)
+    {
+        long double bytes = (long double)vfs.f_bavail * vfs.f_frsize;
+        item->known = true;
+        item->fs = (uint64_t)st.st_dev;
+        item->avail = bytes > (long double)UINT64_MAX ? UINT64_MAX : (uint64_t)bytes;
+    }
+}
+
+static void
+cuvs_disk_probe_temp_path(CuvsHnswDiskItem *item, Oid spc)
+{
+    char path[MAXPGPATH];
+
+    TempTablespacePath(path, OidIsValid(spc) ? spc : MyDatabaseTableSpace);
+    cuvs_disk_probe(item, pstrdup(path));
+    if (!item->known && errno == ENOENT)
+    {
+        /* PostgreSQL can create pgsql_tmp on demand. */
+        char *slash = strrchr(path, '/');
+
+        Assert(slash != NULL);
+        *slash = '\0';
+        cuvs_disk_probe(item, pstrdup(path));
+    }
+}
+
+/* OpenTemporaryFile may use any configured tablespace or fall back to the
+ * database default. Enforce a sum only when they resolve to one filesystem. */
+static void
+cuvs_disk_probe_temp(CuvsHnswDiskItem *item)
+{
+    const char *setting = GetConfigOption("temp_tablespaces", false, false);
+    int capacity = 1;
+    Oid *spaces;
+    int n;
+
+    /* Each list entry requires a delimiter or a character in the GUC. */
+    for (const char *ch = setting; *ch; ch++)
+        if (*ch == ',')
+            capacity++;
+    spaces = palloc_array(Oid, capacity);
+    n = GetTempTablespaces(spaces, capacity);
+    cuvs_disk_probe_temp_path(item, InvalidOid);
+    for (int i = 0; i < n && item->known; i++)
+    {
+        CuvsHnswDiskItem other = {0};
+        cuvs_disk_probe_temp_path(&other, spaces[i]);
+        if (!other.known || other.fs != item->fs)
+        {
+            item->known = false;
+            item->path = "temp_tablespaces and the database default";
+        }
+        else if (other.avail < item->avail)
+            item->avail = other.avail;
+    }
+    pfree(spaces);
+}
+
+/* The daemon checks only its private workdir. Before any GPU work, add what
+ * else this build puts on local disk in each of its two phases -- the daemon
+ * build (workdir, input spool) and the index write (the daemon's graph file,
+ * the TID file and node-location spill, the index pages, WAL shown but not
+ * enforced) -- sum each phase per filesystem, and refuse when one cannot hold
+ * its items. An ACE build announces the plan. Pure arithmetic in
+ * cuvs_hnsw_disk_plan.h. spool_pending is false after the heap scan, when the
+ * spool and TID file already occupy their space. */
+static void
+cuvs_hnsw_disk_plan_check(Relation indexRel, const CuvsHnswPreflightReply *reply,
+                          uint64_t n, uint32_t dim, int bytes_per_dim, int m,
+                          File vector_spool, const char *when)
+{
+    CuvsHnswDiskItem items[CUVS_HNSW_DISK_ITEMS];
+    CuvsHnswDiskVerdict verdict;
+    char detail[1200];
+    uint64_t index_bytes = cuvs_hnsw_estimate_index_bytes(n, (int)dim, bytes_per_dim, m);
+    bool spool_pending = vector_spool < 0;
+    Oid index_spc = indexRel->rd_rel->reltablespace;
+
+    memset(items, 0, sizeof(items));
+    PrepareTempTablespaces();
+
+    items[CUVS_HNSW_DISK_WORKDIR].need = reply->disk_need;
+    cuvs_disk_probe(&items[CUVS_HNSW_DISK_WORKDIR],
+                    is_absolute_path(reply->index_dir) ? reply->index_dir : NULL);
+    if (!items[CUVS_HNSW_DISK_WORKDIR].path)
+        items[CUVS_HNSW_DISK_WORKDIR].path = "the daemon index directory";
+    /* The graph file stays in the (otherwise removed) workdir's filesystem. */
+    items[CUVS_HNSW_DISK_GRAPH] = items[CUVS_HNSW_DISK_WORKDIR];
+    items[CUVS_HNSW_DISK_GRAPH].need = cuvs_hnsw_graph_file_need(n, dim, (uint32_t)m);
+    items[CUVS_HNSW_DISK_SPOOL].need = spool_pending ? cuvs_hnsw_spool_need(n, dim) : 0;
+    cuvs_disk_probe_temp(&items[CUVS_HNSW_DISK_SPOOL]);
+    /* The TID file (8 bytes per row) outlives the vector spool. */
+    items[CUVS_HNSW_DISK_LOCATIONS] = items[CUVS_HNSW_DISK_SPOOL];
+    items[CUVS_HNSW_DISK_LOCATIONS].need = cuvs_hnsw_disk_add(cuvs_hnsw_location_need(n),
+        spool_pending ? cuvs_hnsw_disk_rows(n, 8) : 0);
+    items[CUVS_HNSW_DISK_INDEX].need = index_bytes;
+    cuvs_disk_probe(&items[CUVS_HNSW_DISK_INDEX],
+                    GetDatabasePath(MyDatabaseId,
+                                    OidIsValid(index_spc) ? index_spc : MyDatabaseTableSpace));
+    items[CUVS_HNSW_DISK_WAL].need = RelationNeedsWAL(indexRel) ? index_bytes : 0;
+    cuvs_disk_probe(&items[CUVS_HNSW_DISK_WAL], XLOGDIR);
+    /* After the scan the vector spool is on disk now but is removed before
+     * the index write: credit it to that phase's items on its filesystem. */
+    if (!spool_pending)
+    {
+        struct stat st;
+        if (fstat(FileGetRawDesc(vector_spool), &st) == 0 && st.st_blocks > 0)
+            cuvs_hnsw_disk_credit_vector_spool(items, (uint64_t)st.st_dev,
+                                                (uint64_t)st.st_blocks * 512);
+    }
+
+    cuvs_hnsw_disk_evaluate(items, &verdict);
+    cuvs_hnsw_disk_detail(items, detail, sizeof(detail));
+    if (!verdict.fits)
+        ereport(ERROR, (errcode(ERRCODE_DISK_FULL),
+                        errmsg("pg_cuvs: HNSW build needs %llu MiB of local disk on the filesystem of %s during the %s; %llu MiB are available for that phase",
+                               cuvs_hnsw_disk_need_mib(verdict.short_need),
+                               items[verdict.short_item].path,
+                               cuvs_hnsw_disk_phase_name(verdict.short_phase),
+                               (unsigned long long)(verdict.short_avail >> 20)),
+                        errdetail("%s. Decided %s; no GPU work was started.", detail, when),
+                        spool_pending
+                        ? errhint("Free space on that filesystem, or move temporary files (temp_tablespaces) or the index (TABLESPACE) to another one. The row count came from table statistics; if they are stale, run ANALYZE and retry.")
+                        : errhint("Free space on that filesystem, or move temporary files (temp_tablespaces) or the index (TABLESPACE) to another one.")));
+    if (reply->route == CUVS_HNSW_ROUTE_ACE)
+        ereport(NOTICE, (errmsg("pg_cuvs: ACE-disk build needs about %llu MiB of additional local disk at its peak%s",
+                                cuvs_hnsw_disk_need_mib(verdict.peak_need),
+                                verdict.wal_tight ? "; estimated WAL may exceed available space" : ""),
+                         errdetail("%s. Decided %s.", detail, when)));
+}
+
 /* Op 40 with a row count; returns the backend action (pure decision in
  * cuvs_route_preflight.h). On NOTICE_OVERFLOW the transition NOTICE is sent
  * here, so it always precedes the scan or the build op. */
 static CuvsHnswPrespoolAction
-cuvs_hnsw_preflight(double rows, uint32_t dim, uint32_t hierarchy, uint32_t build_algo,
-                    uint32_t ef_construction, uint32_t graph_degree, uint64_t host_cap, bool may_reject,
+cuvs_hnsw_preflight(Relation indexRel, double rows, uint32_t dim, int bytes_per_dim,
+                    uint32_t hierarchy, uint32_t build_algo,
+                    uint32_t ef_construction, uint32_t graph_degree, uint64_t host_cap,
+                    File vector_spool,
                     const char *when)
 {
     CuvsHnswPreflightRequest request = {0};
     CuvsHnswPreflightReply reply;
     CuvsHnswPrespoolAction action;
+    bool may_reject = vector_spool < 0;
     int rc;
     request.version = CUVS_HNSW_PREFLIGHT_VERSION;
     request.hierarchy = hierarchy;
@@ -3153,6 +3299,10 @@ cuvs_hnsw_preflight(double rows, uint32_t dim, uint32_t hierarchy, uint32_t buil
         cuvs_hnsw_transition_notice(reply.host_estimate, reply.host_budget,
             reply.gpu_estimate, reply.gpu_budget, reply.disk_need, reply.disk_avail,
             reply.index_dir, when);
+    if (action == CUVS_HNSW_PRESPOOL_PROCEED || action == CUVS_HNSW_PRESPOOL_NOTICE_OVERFLOW)
+        /* The HNSW file serializes M = graph_degree / 2. */
+        cuvs_hnsw_disk_plan_check(indexRel, &reply, request.n_estimate, dim, bytes_per_dim,
+                                  (int)(request.graph_degree / 2), vector_spool, when);
     return action;
 }
 
@@ -3206,8 +3356,9 @@ cuvs_build_hnsw_from_heap(Relation heapRel, Relation indexRel, IndexInfo *indexI
         CuvsHnswPrespoolAction prespool;
         bool transition_sent;
         snprintf(when, sizeof(when), "before the heap scan from reltuples=%.6g", stats_rows);
-        prespool = cuvs_hnsw_preflight(stats_rows, spool->dim, hierarchy, build_algo,
-                                       ef_construction, 2 * m, cap, true, when);
+        prespool = cuvs_hnsw_preflight(indexRel, stats_rows, spool->dim,
+                                       spool->halfvec ? 2 : 4, hierarchy, build_algo,
+                                       ef_construction, 2 * m, cap, -1, when);
         transition_sent = prespool == CUVS_HNSW_PRESPOOL_NOTICE_OVERFLOW;
         spool->input_hash = pg_cryptohash_create(PG_SHA256);
         if (!spool->input_hash || pg_cryptohash_init(spool->input_hash) < 0)
@@ -3243,8 +3394,9 @@ cuvs_build_hnsw_from_heap(Relation heapRel, Relation indexRel, IndexInfo *indexI
                 snprintf(when, sizeof(when), "after the heap scan (%s) from %llu spooled rows",
                          cuvs_hnsw_after_scan_reason(stats_rows),
                          (unsigned long long)spool->n);
-                transition_sent = cuvs_hnsw_preflight((double)spool->n, spool->dim, hierarchy,
-                    build_algo, ef_construction, 2 * m, cap, false, when)
+                transition_sent = cuvs_hnsw_preflight(indexRel, (double)spool->n, spool->dim,
+                    spool->halfvec ? 2 : 4, hierarchy,
+                    build_algo, ef_construction, 2 * m, cap, spool->vectors, when)
                     == CUVS_HNSW_PRESPOOL_NOTICE_OVERFLOW;
             }
             /* K3: hash the spool while the daemon builds; join after the reply. */

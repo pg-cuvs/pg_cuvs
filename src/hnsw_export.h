@@ -41,6 +41,10 @@ Datum pg_cuvs_build_hnsw(PG_FUNCTION_ARGS);
  * and must be called once from _PG_init before any CREATE INDEX runs.
  */
 void  cuvs_hnsw_init_reloptions(void);
+
+/* Pre-build size of a source-less pg_cuvs_hnsw index (metapage + level-0
+ * packed data pages); a lower bound for hierarchical graphs. 0 = unknown. */
+uint64_t cuvs_hnsw_estimate_index_bytes(uint64_t n, int dim, int bytes_per_dim, int m);
 Datum pg_cuvs_hnsw_handler(PG_FUNCTION_ARGS);
 void  cuvs_report_proto_mismatch(int rc);
 const char *cuvs_resolve_index_dir_rel(Relation indexRel);

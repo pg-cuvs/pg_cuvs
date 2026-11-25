@@ -778,6 +778,25 @@ tablespace needs a further `n × dim × 4` bytes for the input spool. The `[hnsw
 line then has `status=5` and still names the decided route (`route=none` only when no
 route was decided, such as an over-budget refusal).
 
+After a successful route forecast, the backend also estimates the PostgreSQL-side disk
+needs. It uses `reltuples` before the heap scan, or the spooled row count when the
+pre-scan forecast falls back. The daemon-build estimate adds the fp32 input spool and
+the TID file to the daemon's workdir estimate. The index-write estimate covers the
+unlinked graph file, TIDs, the node-location spill and index pages. The page estimate uses
+the level-0 layout, including split pairs when needed. Actual upper levels can require
+more pages. When the spool already exists, its allocated blocks are credited to the
+index-write phase on its actual filesystem.
+
+Each phase groups known paths by filesystem. Temporary files are checked as a group
+when the configured temporary tablespaces and the database default, PostgreSQL's fallback,
+resolve to one filesystem. The daemon's absolute index path participates when the
+backend can probe it. A phase estimate beyond available capacity fails with SQLSTATE
+53100 and reports the path, phase and item estimates. The pre-scan error suggests
+`ANALYZE` because stale table statistics can affect the decision. For a logged index,
+the plan displays an estimated WAL amount using the level-0 page estimate. WAL does
+not trigger the refusal. When the forecast selects ACE, a NOTICE reports the estimated
+peak additional local disk and the item breakdown. Capacity can change after the probe.
+
 Direct `ef_construction` scales the planned intermediate width from 4 × `m` before the
 row-count adjustment and the hnswlib serialization EF from 200 at the default 64.
 The tiny route uses its own graph width. The
