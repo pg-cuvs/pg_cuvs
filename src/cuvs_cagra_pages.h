@@ -28,6 +28,8 @@ CuvsCagraRelCache *cuvs_cagra_relation_cache(Relation index);
 void cuvs_cagra_require_legacy(Relation index);
 
 #ifdef CUVS_PAGE_FORMAT
+#include "storage/bufpage.h"
+
 #define CUVS_CAGRA_PAGE_MAGIC 0x43565047U
 #define CUVS_CAGRA_PAGE_MAJOR 0   /* development format, never accepted by a release */
 #define CUVS_CAGRA_PAGE_EXTENT 64
@@ -35,6 +37,28 @@ void cuvs_cagra_require_legacy(Relation index);
 #define CUVS_CAGRA_TIDS_PER_PAGE 1357
 #define CUVS_CAGRA_PENDING_PER_PAGE 1356
 #define CUVS_CAGRA_PENDING_VECTOR 2U
+
+/* WAL fold log layout shared by publication and ACK recovery. */
+#define CUVS_PAGE_FOLDLOG 3
+
+typedef struct CuvsCagraFoldPage
+{
+    uint16      kind;
+    uint16      flags;
+    uint32      count;
+    BlockNumber next;
+} CuvsCagraFoldPage;
+
+typedef struct CuvsCagraFoldRecord
+{
+    uint64      graph_nonce;
+    uint64      n_slots;
+    uint64      folded;
+} CuvsCagraFoldRecord;
+
+#define CUVS_CAGRA_FOLD_RECORDS_PER_PAGE \
+    ((BLCKSZ - MAXALIGN(SizeOfPageHeaderData) - MAXALIGN(sizeof(CuvsCagraFoldPage))) / \
+     sizeof(CuvsCagraFoldRecord))
 
 typedef struct CuvsCagraMeta
 {
@@ -66,6 +90,7 @@ typedef struct CuvsCagraMeta
 
 uint64 cuvs_cagra_nonce(void);
 uint64 cuvs_cagra_pg_boot_id(void);
+uint64 cuvs_cagra_pg_boot_started_us(void);
 bool cuvs_cagra_read_meta(Relation index, CuvsCagraMeta *meta);
 
 typedef enum CuvsCagraSlotResult
@@ -134,6 +159,10 @@ CuvsCagraSlotResult cuvs_cagra_slot_tid(Relation index, const CuvsCagraMeta *met
 bool cuvs_cagra_slot_filter(Relation index, const CuvsCagraMeta *meta,
                             BlockNumber nblocks, const uint64 *roots, int nroots,
                             uint32 *excluded);
+bool cuvs_cagra_snapshot_filter(Relation index, Relation heap, Snapshot snapshot,
+                                const CuvsCagraMeta *meta, BlockNumber blocks, uint64 limit,
+                                uint32 *excluded, uint64 *visible,
+                                bool (*visit)(void *), void *visit_arg);
 void cuvs_cagra_init_pages(Relation index, ForkNumber fork, uint64 index_nonce,
                           uint64 graph_nonce, int dim, uint32 metric,
                           const uint64 *tids, int64 n, bool pending_vectors);

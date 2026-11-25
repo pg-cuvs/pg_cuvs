@@ -3355,20 +3355,7 @@ static int prepare_hnsw_settings(const CuvsHnswFileBuild *params, int vectors_fd
     }
     prepared.tiny = params->n_vecs > 0 && params->n_vecs < CUVS_HNSW_MIN_ELEMENTS;
     const bool tiny = prepared.tiny;
-    if (tiny)
-    {
-        // A bounded <=15-row GPU exact graph avoids IVF-PQ's minimum training
-        // population and keeps M>=2 even for one/two input rows.
-        degree = std::max<uint32_t>(4, (uint32_t)(params->n_vecs & ~UINT64_C(1)));
-        intermediate = degree;
-    }
-    else
-    {
-        if (degree >= params->n_vecs && params->n_vecs)
-            degree = (uint32_t)((params->n_vecs - 1) & ~UINT64_C(1));
-        if (intermediate >= params->n_vecs && params->n_vecs)
-            intermediate = (uint32_t)(params->n_vecs - 1);
-    }
+    cuvs_hnsw_limit_graph_degrees(params->n_vecs, &degree, &intermediate);
     int capacity_status;
     if (params->build_algo == CUVS_HNSW_ALGO_NN_DESCENT)
     {

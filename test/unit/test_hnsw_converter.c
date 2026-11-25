@@ -623,7 +623,7 @@ preflight(Fixture *f, uint64_t n, uint32_t dim, uint32_t metric,
     bool ok;
 
     ok = hnsw_file_preflight(f->hnsw_fd, f->tids_fd, n, dim, metric,
-                             4, packed_nsw, out, &tids_hdr,
+                             4, packed_nsw, 0, out, &tids_hdr,
                              NULL, NULL, NULL, error, sizeof(error));
     if (!ok)
         fprintf(stderr, "preflight rejected fixture: %s\n", error);
@@ -810,7 +810,7 @@ test_legacy_writer_page_chains(void)
 }
 
 static void
-test_disk_writer_page_chain_case(bool hierarchical)
+test_disk_writer_page_chain_case(bool hierarchical, uint16_t heap_m)
 {
     Fixture f = fixture_create(hierarchical);
     struct BufFile table_file = {.fd = make_temp_fd()};
@@ -823,17 +823,30 @@ test_disk_writer_page_chain_case(bool hierarchical)
     locations.file = &table_file;
     locations.n_nodes = 2;
     assert(hnsw_file_preflight(f.hnsw_fd, f.tids_fd, 2, 2,
-                               CUVS_METRIC_COSINE, 4, !hierarchical,
+                               CUVS_METRIC_COSINE, 4, !hierarchical, heap_m,
                                &header, &tids_header,
                                hnsw_location_table_append, &locations, NULL,
                                error, sizeof(error)));
     assert(locations.n_written == 2);
 
+    int layout_m = heap_m ? heap_m : (int)header.M;
     chain_test_reset();
-    hnsw_write_disk_pages(NULL, f.hnsw_fd, f.tids_fd, &header, 2, 2, 4,
+    hnsw_write_disk_pages(NULL, f.hnsw_fd, f.tids_fd, &header, layout_m, 2, 2, 4,
                           1, true, &locations);
     assert_source_data_page_chain(1);
-    assert(PageGetMaxOffsetNumber((Page)chain_test_pages[1]) == 4);
+    Page page = (Page)chain_test_pages[1];
+    assert(PageGetMaxOffsetNumber(page) == 4);
+    if (hierarchical)
+    {
+        ItemId iid = PageGetItemId(page, 2);
+        PgvHnswNeighHdr *tuple = (PgvHnswNeighHdr *)PageGetItem(page, iid);
+        PgvItemPointer *neighbors = (PgvItemPointer *)((char *)tuple + sizeof(*tuple));
+
+        assert(tuple->count == 3 * layout_m);
+        assert(ItemPointerGetOffsetNumber((ItemPointer)&neighbors[0]) == 3);
+        assert(ItemPointerGetOffsetNumber((ItemPointer)&neighbors[layout_m]) == 3);
+        assert(!ItemPointerIsValid((ItemPointer)&neighbors[2 * layout_m]));
+    }
 
     BufFileClose(&table_file);
     fixture_close(&f);
@@ -842,8 +855,9 @@ test_disk_writer_page_chain_case(bool hierarchical)
 static void
 test_disk_writer_page_chain(void)
 {
-    test_disk_writer_page_chain_case(true);
-    test_disk_writer_page_chain_case(false);
+    test_disk_writer_page_chain_case(true, 0);
+    test_disk_writer_page_chain_case(false, 0);
+    test_disk_writer_page_chain_case(true, 24);
 }
 
 static void
@@ -861,7 +875,7 @@ test_hierarchical_preflight_packs_locations(void)
     locations.file = &table_file;
     locations.n_nodes = 2;
     assert(hnsw_file_preflight(f.hnsw_fd, f.tids_fd, 2, 2,
-                               CUVS_METRIC_COSINE, 4, false,
+                               CUVS_METRIC_COSINE, 4, false, 0,
                                &header, &tids_header,
                                hnsw_location_table_append, &locations, NULL,
                                error, sizeof(error)));
@@ -1052,7 +1066,7 @@ test_hierarchical_native_packing_case(int dim, int bytes_per_dim, int m)
     assert(write(f.tids_fd, &tids_header, sizeof(tids_header)) == sizeof(tids_header));
     assert(write(f.tids_fd, tids, sizeof(tids)) == sizeof(tids));
     assert(hnsw_file_preflight(f.hnsw_fd, f.tids_fd, N, (uint32_t)dim,
-                               CUVS_METRIC_L2, bytes_per_dim, false,
+                               CUVS_METRIC_L2, bytes_per_dim, false, 0,
                                &parsed, &parsed_tids, hnsw_location_table_append,
                                &table, NULL, error, sizeof(error)));
     assert(hnsw_location_table_rewind(&table, N));
@@ -1069,9 +1083,9 @@ test_hierarchical_native_packing_case(int dim, int bytes_per_dim, int m)
     policy.guard_passed = 1;
     chain_test_reset();
     chain_test_nblocks = 0;
-    hnsw_write_disk_metapage(NULL, &parsed, (uint32_t)dim, n_pages,
+    hnsw_write_disk_metapage(NULL, &parsed, (uint16_t)parsed.M, (uint32_t)dim, n_pages,
                              false, &table, &policy, NULL, NULL, NULL);
-    hnsw_write_disk_pages(NULL, f.hnsw_fd, f.tids_fd, &parsed, N,
+    hnsw_write_disk_pages(NULL, f.hnsw_fd, f.tids_fd, &parsed, (int)parsed.M, N,
                           (uint32_t)dim, bytes_per_dim, n_pages, false, &table);
     assert(chain_test_wal_images == n_pages + 1);
     assert(CritSectionCount == 0);
@@ -1409,7 +1423,7 @@ test_disk_location_table_roundtrip(void)
     table.file = &fake_file;
     table.n_nodes = 2;
     assert(hnsw_file_preflight(f.hnsw_fd, f.tids_fd, 2, 2,
-                               CUVS_METRIC_COSINE, 4, true,
+                               CUVS_METRIC_COSINE, 4, true, 0,
                                &hnsw_hdr, &tids_hdr,
                                hnsw_location_table_append, &table, NULL,
                                error, sizeof(error)));
@@ -1610,7 +1624,7 @@ test_ace_readback_metapage_roundtrip(void)
     memset(&table, 0, sizeof(table));
     table.file = &fake_file;
     table.n_nodes = 2;
-    assert(hnsw_file_preflight(f.hnsw_fd, f.tids_fd, 2, 2, CUVS_METRIC_COSINE, 4, true,
+    assert(hnsw_file_preflight(f.hnsw_fd, f.tids_fd, 2, 2, CUVS_METRIC_COSINE, 4, true, 0,
                                &hdr, &tids_hdr, hnsw_location_table_append, &table, NULL,
                                error, sizeof(error)));
     p.magic = CUVS_HNSW_POLICY_MAGIC; p.version = CUVS_HNSW_POLICY_VERSION; p.bytes = sizeof(p);
@@ -1627,20 +1641,20 @@ test_ace_readback_metapage_roundtrip(void)
         CuvsConnectivity c={0}, readback;
         c.magic=CUVS_CONNECTIVITY_MAGIC;c.version=1;c.available=1;c.nodes=p.n_rows;c.unreachable=70;c.wcc_all=1;
         chain_test_reset();
-        hnsw_write_disk_metapage(NULL,&hdr,2,1,true,&table,&p,&ace,NULL,&c);
+        hnsw_write_disk_metapage(NULL,&hdr,(uint16_t)hdr.M,2,1,true,&table,&p,&ace,NULL,&c);
         meta=(Page)chain_test_pages[chain_test_nblocks-1];
         readback=hnsw_read_connectivity(meta);
         assert(readback.magic==c.magic && readback.unreachable==70 && readback.wcc_all==1);
     }
     /* a graph converted from a CAGRA index carries no build receipt. */
     chain_test_reset();
-    hnsw_write_disk_metapage(NULL, &hdr, 2, 1, true, &table, NULL, NULL, NULL, NULL);
+    hnsw_write_disk_metapage(NULL, &hdr, (uint16_t)hdr.M, 2, 1, true, &table, NULL, NULL, NULL, NULL);
     meta = (Page)chain_test_pages[chain_test_nblocks - 1];
     assert(((PageHeader)meta)->pd_lower == prefix);
     assert(hnsw_read_disk_policy(meta, &out) == CUVS_HNSW_POLICY_NOT_RECORDED);
     assert(((PgvHnswMeta *)PageGetContents(meta))->dimensions == 2);
     chain_test_reset();
-    hnsw_write_disk_metapage(NULL, &hdr, 2, 1, true, &table, &p, &ace, NULL, NULL);
+    hnsw_write_disk_metapage(NULL, &hdr, (uint16_t)hdr.M, 2, 1, true, &table, &p, &ace, NULL, NULL);
     meta = (Page)chain_test_pages[chain_test_nblocks - 1];
     if (((PageHeader)meta)->pd_lower != prefix + sizeof(p) + sizeof(ace))
     {
@@ -1680,7 +1694,7 @@ test_ace_readback_metapage_roundtrip(void)
         marked.route_flags |= CUVS_HNSW_ROUTE_FLAG_ACE_PARTITIONS_REQUESTED;
         assert(cuvs_hnsw_policy_valid(&marked));
         chain_test_reset();
-        hnsw_write_disk_metapage(NULL, &hdr, 2, 1, true, &table, &marked, &ace, NULL, NULL);
+        hnsw_write_disk_metapage(NULL, &hdr, (uint16_t)hdr.M, 2, 1, true, &table, &marked, &ace, NULL, NULL);
         meta = (Page)chain_test_pages[chain_test_nblocks - 1];
         assert(((PageHeader)meta)->pd_lower == prefix + sizeof(marked) + sizeof(ace));
         assert(memcmp((char *)meta + prefix, &marked, sizeof(marked)) == 0);
@@ -1691,7 +1705,7 @@ test_ace_readback_metapage_roundtrip(void)
         assert(memcmp(&ace_out, &ace, sizeof(ace)) == 0);
         /* The page bytes of an unmarked receipt are the ones stored before the mark existed. */
         chain_test_reset();
-        hnsw_write_disk_metapage(NULL, &hdr, 2, 1, true, &table, &p, &ace, NULL, NULL);
+        hnsw_write_disk_metapage(NULL, &hdr, (uint16_t)hdr.M, 2, 1, true, &table, &p, &ace, NULL, NULL);
         meta = (Page)chain_test_pages[chain_test_nblocks - 1];
         assert(hnsw_read_disk_policy(meta, &out) == CUVS_HNSW_POLICY_RECORDED
                && out.route_flags == 0 && !cuvs_hnsw_ace_partitions_unverified(&out));
@@ -1703,7 +1717,7 @@ test_ace_readback_metapage_roundtrip(void)
     resident.requested_algo = CUVS_HNSW_ALGO_IVF_PQ; resident.partitions = 0;
     assert(cuvs_hnsw_policy_valid(&resident));
     chain_test_reset();
-    hnsw_write_disk_metapage(NULL, &hdr, 2, 1, true, &table, &resident, &ace, NULL, NULL);
+    hnsw_write_disk_metapage(NULL, &hdr, (uint16_t)hdr.M, 2, 1, true, &table, &resident, &ace, NULL, NULL);
     meta = (Page)chain_test_pages[chain_test_nblocks - 1];
     assert(((PageHeader)meta)->pd_lower == prefix + sizeof(resident));
 
@@ -1717,7 +1731,7 @@ test_ace_readback_metapage_roundtrip(void)
         bad.local_intermediate = 128;
         assert(freopen("/dev/null", "w", stderr) != NULL);
         chain_test_reset();
-        hnsw_write_disk_metapage(NULL, &hdr, 2, 1, true, &table, &p, &bad, NULL, NULL);
+        hnsw_write_disk_metapage(NULL, &hdr, (uint16_t)hdr.M, 2, 1, true, &table, &p, &bad, NULL, NULL);
         _exit(0); /* reaching here means the writer accepted it */
     }
     assert(waitpid(child, &status, 0) == child);
@@ -1733,7 +1747,7 @@ test_ace_readback_metapage_roundtrip(void)
     nn.graph_degree = 128; nn.internal_degree = 192; nn.sdk_default_iterations = 20;
     nn.max_iterations = 20; nn.dtype = CUVS_HNSW_NN_DTYPE_FP32; nn.termination_threshold = 0.0001f;
     chain_test_reset();
-    hnsw_write_disk_metapage(NULL, &hdr, 2, 1, true, &table, &p, &ace, &nn, NULL);
+    hnsw_write_disk_metapage(NULL, &hdr, (uint16_t)hdr.M, 2, 1, true, &table, &p, &ace, &nn, NULL);
     meta = (Page)chain_test_pages[chain_test_nblocks - 1];
     assert(((PageHeader)meta)->pd_lower == prefix + sizeof(p) + sizeof(nn));
     assert(hnsw_read_disk_policy(meta, &out) == CUVS_HNSW_POLICY_RECORDED);
@@ -1751,7 +1765,7 @@ test_ace_readback_metapage_roundtrip(void)
         for (int i = 0; i < 2; i++)
         {
             chain_test_reset();
-            hnsw_write_disk_metapage(NULL, &hdr, 2, 1, true, &table, &p, &ace, &nn, records[i]);
+            hnsw_write_disk_metapage(NULL, &hdr, (uint16_t)hdr.M, 2, 1, true, &table, &p, &ace, &nn, records[i]);
             meta = (Page)chain_test_pages[chain_test_nblocks - 1];
             assert(((PageHeader)meta)->pd_lower == prefix + sizeof(p) + sizeof(nn));
             assert(hnsw_read_disk_policy(meta, &out) == CUVS_HNSW_POLICY_RECORDED);
@@ -1846,7 +1860,7 @@ test_row_reader_reserves_records(void)
     write_at(f.tids_fd, &tids_header, sizeof(tids_header), 0);
     write_at(f.tids_fd, tids, sizeof(tids), sizeof(tids_header));
     assert(hnsw_file_preflight(f.hnsw_fd, f.tids_fd, N, DIM, CUVS_METRIC_L2,
-                               4, true, &parsed, &parsed_tids,
+                               4, true, 0, &parsed, &parsed_tids,
                                hnsw_location_table_append, &table, NULL,
                                error, sizeof(error)));
     assert(hnsw_location_table_rewind(&table, N));

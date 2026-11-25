@@ -86,12 +86,13 @@ SELECT pg_temp.correct_neighbor('hsm_order', '[2000,0,0]');
 DROP TABLE hsm_order;
 
 -- A source graph can be created with m=48 and the default ef_construction=64.
+-- graph_degree = 32 gives the source M 16 on GPU and CPU shim builds alike.
 -- Force a pending insert so REINDEX INDEX has to use the actual CPU fallback.
 SET cuvs.hnsw_exact_scan = off;
 CREATE TABLE hsm_wide (id int PRIMARY KEY, v vector(3))
     WITH (autovacuum_enabled = off, parallel_workers = 2);
 INSERT INTO hsm_wide SELECT g, ARRAY[g,0,0]::real[]::vector FROM generate_series(1,100) g;
-CREATE INDEX hsm_wide_c ON hsm_wide USING cagra (v vector_l2_ops);
+CREATE INDEX hsm_wide_c ON hsm_wide USING cagra (v vector_l2_ops) WITH (graph_degree = 32);
 CREATE INDEX hsm_wide_h ON hsm_wide USING pg_cuvs_hnsw (v vector_l2_ops)
     WITH (source = hsm_wide_c, m = 48);
 SET cuvs.socket_path = '';
@@ -118,7 +119,7 @@ DROP TABLE hsm_wide;
 -- is in place on PG16; verify it rebuilds an empty graph before reusing TIDs.
 CREATE TABLE hsm_repeat (id int PRIMARY KEY, v vector(3)) WITH (autovacuum_enabled = off);
 INSERT INTO hsm_repeat SELECT g, ARRAY[g,0,0]::real[]::vector FROM generate_series(1,100) g;
-CREATE INDEX hsm_repeat_c ON hsm_repeat USING cagra (v vector_l2_ops);
+CREATE INDEX hsm_repeat_c ON hsm_repeat USING cagra (v vector_l2_ops) WITH (graph_degree = 32);
 CREATE INDEX hsm_repeat_h ON hsm_repeat USING pg_cuvs_hnsw (v vector_l2_ops)
     WITH (source = hsm_repeat_c, m = 48, ef_construction = 64);
 BEGIN;
