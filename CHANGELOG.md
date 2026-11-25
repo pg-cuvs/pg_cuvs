@@ -162,6 +162,16 @@ exists for 0.9.0.
   still reads the sidecar on every search; and the first failing search after a daemon
   start or a reload after eviction still reads the whole file under the lock (moving the
   read out of the lock is not part of this change).
+- A row appended to `.delta` in the second in which the daemon built its delta cache was
+  missing from `cagra` searches with `cuvs.delta_search` `auto` (the default) or `gpu`
+  until a write in a later second or a REINDEX: the cache compared the file's mtime in
+  whole seconds. It now compares size and nanosecond mtime, and reads the header again when
+  it met an append in progress. A search of an unchanged index does no more work. After an
+  append the daemon reads only the new rows and compares them on the CPU; it rebuilds the
+  GPU index of the delta when more than 32 rows plus 1/128 of the indexed ones are waiting,
+  when they have not changed for a second, or when they would cost a micro-batch too much.
+  With no VRAM for that rebuild it keeps the index it has while no more than twice that
+  many rows wait, and drops the cache past that.
 - Documentation: the README batch example, `docs/reference.md` and ADR-040 said that
   joining the results of `pg_cuvs_batch_search` and `cuvs_filtered_knn` on `ctid` gives
   the visible rows. That join silently drops HOT-updated rows, because the functions
