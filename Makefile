@@ -655,6 +655,15 @@ test-gpu-wrapper-i3: test/gpu/test_wrapper_i3.c src/cuvs_wrapper.o $(CUVS_FOLD_O
 	$(CXX) -o $@ $@.o $(filter %.o,$^) $(SHLIB_LINK) -lpthread -lm
 	./$@
 
+# GPU-only: a failed request must not destroy the pooled stream that buffers
+# of an index built on the same slot still refer to. Run after `make all server`.
+test-gpu-pooled-stream-lifetime: test/gpu/test_pooled_stream_lifetime.c src/cuvs_wrapper.o $(CUVS_FOLD_OBJ) src/cuvs_util_server.o src/cuvs_peak_meter_server.o
+	$(CC) -std=gnu11 -Wall -Wextra -I src -c $< -o $@.o
+	$(CXX) -o $@ $@.o $(filter %.o,$^) $(SHLIB_LINK) -lpthread -lm
+	./$@
+EXTRA_CLEAN += test-gpu-pooled-stream-lifetime test-gpu-pooled-stream-lifetime.o
+.PHONY: test-gpu-pooled-stream-lifetime
+
 # Exercise the actual mode-selected wrapper and fold objects from plain C.
 .PHONY: test-cagra-fold-build
 test-cagra-fold-build: test/unit/test_cagra_fold_build.c test/gpu/test_cagra_fold_early.cpp $(WRAPPER_OBJ) src/cuvs_util_server.o src/cuvs_peak_meter_server.o

@@ -111,6 +111,10 @@ struct RaftResTraits {
     using Res = raft::device_resources;
     using Stream = rmm::cuda_stream;
     static std::unique_ptr<Stream> make_stream() { return std::make_unique<Stream>(); }
+    static bool stream_ready(Stream *stream) noexcept
+    {
+        return cudaStreamQuery(stream->view().value()) == cudaSuccess;
+    }
     static std::unique_ptr<Res> make_res(Stream *stream)
     {
         return stream ? std::make_unique<Res>(stream->view()) : std::make_unique<Res>();
@@ -367,32 +371,36 @@ static void cagra_knn_precision(raft::device_resources &res, const float *rows_d
  * call threw, the stream/handles may carry a sticky error; reusing such a
  * resource from the pool can abort a later, unrelated request (the whole
  * daemon, since one process serves every backend). poison() makes the
- * destructor DESTROY the resource instead of pooling it, so a failed request
- * cannot corrupt healthy ones. Declare PooledRes OUTSIDE the try block and
- * call poison() in the catch so it is still alive when the catch runs.
+ * destructor discard the handles instead of pooling them, while retaining
+ * the dedicated stream for buffers that still refer to it. Declare
+ * PooledRes OUTSIDE the try block and call poison() in the catch.
  *
  * cudaSetDevice is per-thread state. Since the daemon spawns one pthread per
  * connection and each handles exactly one request, setting the device in the
  * constructor is safe -- no other thread can race the device selection within
  * the same PooledRes lifetime. */
 struct PooledRes {
-    std::unique_ptr<ResSlot> r; /* poisoned: destroyed with its own stream */
+    std::unique_ptr<ResSlot> r;
     int dev;
     bool poisoned = false;
     /* Q6: host frees on this thread wait for the borrowed stream until the
      * resource is returned or destroyed (closed first in the destructor). */
     std::optional<CuvsHostFreeFence::Scope> fence;
     explicit PooledRes(int device_id) : r(acquire_res(device_id)), dev(device_id) {
-        cudaError_t err = cudaSetDevice(device_id);
-        if (err != cudaSuccess) {
-            fprintf(stderr, "[PooledRes] cudaSetDevice(%d) failed: %s\n",
-                    device_id, cudaGetErrorString(err));
-            poisoned = true;
-            throw std::runtime_error("cudaSetDevice failed");
+        try {
+            cudaError_t err = cudaSetDevice(device_id);
+            if (err != cudaSuccess) {
+                fprintf(stderr, "[PooledRes] cudaSetDevice(%d) failed: %s\n",
+                        device_id, cudaGetErrorString(err));
+                throw std::runtime_error("cudaSetDevice failed");
+            }
+            ensure_fenced_host_resource();
+            fence.emplace(static_cast<void *>(r->res->get_stream().value()), fence_sync_stream,
+                          device_id, fence_log_failure);
+        } catch (...) {
+            g_device_pools[dev].retire(std::move(r));
+            throw;
         }
-        ensure_fenced_host_resource();
-        fence.emplace(static_cast<void *>(r->res->get_stream().value()), fence_sync_stream,
-                      device_id, fence_log_failure);
     }
     ~PooledRes()
     {
@@ -406,6 +414,7 @@ struct PooledRes {
             poisoned = true;
         }
         if (r && !poisoned) release_res(dev, std::move(r));
+        else if (r) g_device_pools[dev].retire(std::move(r));
     }
     raft::device_resources &get() { return *r->res; }
     void poison() { poisoned = true; }
