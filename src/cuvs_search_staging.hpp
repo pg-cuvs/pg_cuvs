@@ -3,6 +3,7 @@
 
 #include <cstddef>
 #include <cstdlib>
+#include <exception>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -11,8 +12,19 @@
 
 namespace cuvs_search_staging {
 
-/* A pool belongs to one device. Idle blocks have process lifetime because
- * CUDA is not necessarily available during static destruction. */
+// This error is confined to CPU scratch preparation, before any search copy.
+class PageableAllocationError : public std::exception {
+public:
+    explicit PageableAllocationError(const char *reason) noexcept : reason_{reason} {}
+    const char *what() const noexcept override { return reason_; }
+
+private:
+    const char *reason_;
+};
+
+/* Each device has independent pinned and pageable budgets. Pinned charges
+ * cover active, idle, quarantined and in-flight allocations/frees. CUDA
+ * calls run outside the mutex, with their full charge held until settlement. */
 template <class Ops>
 class Pool {
 public:
@@ -22,46 +34,99 @@ public:
         Block *next = nullptr;
     };
 
+    struct Pageable {
+        void *data = nullptr;
+        void *extra = nullptr;
+        size_t capacity = 0;
+        Pageable *next = nullptr;
+
+        ~Pageable()
+        {
+            std::free(data);
+            std::free(extra);
+        }
+    };
+
+    static constexpr size_t default_pageable_cap = size_t{256} << 20;
+    explicit Pool(size_t pageable_cap = default_pageable_cap)
+        : pageable_cap_{pageable_cap}
+    {}
+
+    // The caller supplies the same startup cap for every pinned request on this device.
     Block *acquire(size_t bytes, size_t cap)
     {
-        if (cap == 0 || bytes > cap)
+        if (bytes == 0 || bytes > cap)
             return nullptr;
-
-        Block *block = nullptr;
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            if (idle_) {
-                block = idle_;
-                idle_ = block->next;
-                block->next = nullptr;
-            }
-        }
-        if (!block) {
-            block = new (std::nothrow) Block;
-            if (!block)
-                return nullptr;
-        }
-        if (bytes <= block->capacity)
-            return block;
+        const size_t granularity = Ops::pin_granularity();
+        if (!granularity)
+            return nullptr;
+        cap -= cap % granularity;
+        if (bytes > cap)
+            return nullptr;
 
         size_t capacity = min_block_bytes < cap ? min_block_bytes : cap;
         while (capacity < bytes)
             capacity = capacity <= cap / 2 ? capacity * 2 : cap;
+        if (const size_t remainder = capacity % granularity)
+            capacity += granularity - remainder;
 
-        /* Do not hold the pool mutex while CUDA allocates or frees. */
-        void *data = Ops::allocate_pinned(capacity);
-        if (!data) {
-            if (block->data)
-                release(block);
-            else
-                delete block;
-            return nullptr;
+        for (;;) {
+            Block *victim;
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                Block **fit = nullptr;
+                size_t idle_bytes = 0;
+                for (Block **link = &idle_; *link; link = &(*link)->next) {
+                    idle_bytes += (*link)->capacity;
+                    if ((*link)->capacity >= bytes &&
+                        (!fit || (*link)->capacity < (*fit)->capacity))
+                        fit = link;
+                }
+                if (fit) {
+                    Block *block = *fit;
+                    *fit = block->next;
+                    block->next = nullptr;
+                    return block;
+                }
+
+                if (pinned_charged_ <= cap && capacity <= cap - pinned_charged_) {
+                    pinned_charged_ += capacity;
+                    break;
+                }
+                // Leave the idle pool intact when even reclaiming it cannot fit.
+                const size_t unreclaimable = pinned_charged_ - idle_bytes;
+                if (unreclaimable > cap || capacity > cap - unreclaimable)
+                    return nullptr;
+                // The remaining candidates are idle with confirmed DMA completion.
+                victim = idle_;
+                idle_ = victim->next;
+                victim->next = nullptr;
+            }
+
+            if (!Ops::free_pinned(victim->data)) {
+                quarantine(victim, nullptr);
+                return nullptr;
+            }
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                pinned_charged_ -= victim->capacity;
+            }
+            delete victim;
         }
-        if (block->data)
-            Ops::free_pinned(block->data);
-        block->data = data;
-        block->capacity = capacity;
-        return block;
+
+        auto block = std::unique_ptr<Block>(new (std::nothrow) Block);
+        if (block) {
+            block->capacity = capacity;
+            if (Ops::allocate_pinned(&block->data, capacity) && block->data)
+                return block.release();
+            if (block->data) {
+                quarantine(block.release(), nullptr);
+                return nullptr;
+            }
+        }
+        std::lock_guard<std::mutex> lock(mutex_);
+        pinned_charged_ -= capacity;
+        return nullptr;
     }
 
     void release(Block *block) noexcept
@@ -71,10 +136,72 @@ public:
         idle_ = block;
     }
 
+    Pageable *acquire_pageable(size_t bytes, size_t extra)
+    {
+        if (!bytes && !extra)
+            return nullptr;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            const size_t available = pageable_cap_ - pageable_charged_;
+            if (bytes > available || extra > available - bytes)
+                throw PageableAllocationError("search pageable staging budget exhausted");
+            pageable_charged_ += bytes + extra;
+        }
+        try {
+            auto block = std::make_unique<Pageable>();
+            block->capacity = bytes + extra;
+            block->data = allocate_pageable(bytes);
+            block->extra = allocate_pageable(extra);
+            return block.release();
+        } catch (const std::bad_alloc &) {
+            std::lock_guard<std::mutex> lock(mutex_);
+            pageable_charged_ -= bytes + extra;
+            throw PageableAllocationError("search pageable staging allocation failed");
+        }
+    }
+
+    void release_pageable(Pageable *block) noexcept
+    {
+        if (!block)
+            return;
+        const size_t bytes = block->capacity;
+        delete block;
+        std::lock_guard<std::mutex> lock(mutex_);
+        pageable_charged_ -= bytes;
+    }
+
+    void quarantine(Block *pinned, Pageable *pageable) noexcept
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (pinned) {
+            pinned->next = pinned_quarantine_;
+            pinned_quarantine_ = pinned;
+        }
+        if (pageable) {
+            pageable->next = pageable_quarantine_;
+            pageable_quarantine_ = pageable;
+        }
+    }
+
 private:
+    static void *allocate_pageable(size_t bytes)
+    {
+        if (!bytes)
+            return nullptr;
+        if (void *data = Ops::allocate_pageable(bytes))
+            return data;
+        throw std::bad_alloc{};
+    }
+
     static constexpr size_t min_block_bytes = 256 * 1024;
+    const size_t pageable_cap_;
     std::mutex mutex_;
+    size_t pinned_charged_ = 0;
+    size_t pageable_charged_ = 0;
+    // Keep ownership until process exit, without CUDA calls at teardown.
     Block *idle_ = nullptr;
+    Block *pinned_quarantine_ = nullptr;
+    Pageable *pageable_quarantine_ = nullptr;
 };
 
 class Layout {
@@ -101,59 +228,66 @@ private:
     size_t size_ = 0;
 };
 
-/* The caller owns the stream and outlives this lease. Mark before enqueueing
- * a copy and clear only after a successful wait. On unwind, a failed wait
- * deliberately strands the storage (pinned and pageable) so pending DMA
- * cannot touch freed storage or storage leased to another request. */
+/* The stream owner outlives this lease. Mark staging before enqueueing
+ * a copy and clear it only after a successful wait. */
 template <class Ops>
 class Lease {
 public:
-    Lease(Pool<Ops> *pool, size_t cap, typename Ops::Stream stream,
+    Lease(Pool<Ops> &pool, size_t cap, typename Ops::Stream stream,
           size_t bytes, size_t fallback_bytes, size_t extra_bytes)
-        : pool_{pool}, stream_{stream}, extra_{allocate(extra_bytes), &std::free}
+        : pool_{pool}, stream_{stream}, pinned_{pool.acquire(bytes, cap)}
     {
-        if (pool_ && bytes)
-            pinned_ = pool_->acquire(bytes, cap);
-        if (!pinned_)
-            pageable_.reset(allocate(fallback_bytes));
+        try {
+            pageable_ = pool_.acquire_pageable(pinned_ ? 0 : fallback_bytes, extra_bytes);
+        } catch (...) {
+            if (pinned_)
+                pool_.release(pinned_);
+            throw;
+        }
     }
     Lease(const Lease &) = delete;
     Lease &operator=(const Lease &) = delete;
 
     ~Lease() noexcept
     {
-        if (pending_ && !Ops::wait(stream_)) {
+        if ((pin_pending_ || page_pending_) && !Ops::wait(stream_)) {
             Ops::quarantine();
-            (void)pageable_.release();
-            (void)extra_.release();
-            return;
+            pool_.quarantine(pin_pending_ ? pinned_ : nullptr,
+                             page_pending_ ? pageable_ : nullptr);
+            if (pin_pending_)
+                pinned_ = nullptr;
+            if (page_pending_)
+                pageable_ = nullptr;
         }
         if (pinned_)
-            pool_->release(pinned_);
+            pool_.release(pinned_);
+        pool_.release_pageable(pageable_);
     }
 
     bool pinned() const { return pinned_ != nullptr; }
-    void *data() const { return pinned_ ? pinned_->data : pageable_.get(); }
-    void *extra() const { return extra_.get(); }
-    void mark_pending() { pending_ = true; }
-    void completed() { pending_ = false; }
+    void *data() const
+    {
+        if (pinned_)
+            return pinned_->data;
+        return pageable_ ? pageable_->data : nullptr;
+    }
+    void *extra() const { return pageable_ ? pageable_->extra : nullptr; }
+    void mark_pending(bool pinned)
+    {
+        if (pinned)
+            pin_pending_ = true;
+        else
+            page_pending_ = true;
+    }
+    void completed() { pin_pending_ = page_pending_ = false; }
 
 private:
-    static void *allocate(size_t bytes)
-    {
-        if (bytes == 0)
-            return nullptr;
-        if (void *data = std::malloc(bytes))
-            return data;
-        throw std::bad_alloc{};
-    }
-
-    Pool<Ops> *pool_;
+    Pool<Ops> &pool_;
     typename Ops::Stream stream_;
-    std::unique_ptr<void, decltype(&std::free)> pageable_{nullptr, &std::free};
-    std::unique_ptr<void, decltype(&std::free)> extra_;
-    typename Pool<Ops>::Block *pinned_ = nullptr;
-    bool pending_ = false;
+    typename Pool<Ops>::Block *pinned_;
+    typename Pool<Ops>::Pageable *pageable_ = nullptr;
+    bool pin_pending_ = false;
+    bool page_pending_ = false;
 };
 
 } // namespace cuvs_search_staging

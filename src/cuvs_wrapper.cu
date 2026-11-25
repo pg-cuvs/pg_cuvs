@@ -983,21 +983,39 @@ namespace {
 struct SearchStageCuda {
     using Stream = cudaStream_t;
 
-    static void *allocate_pinned(size_t bytes) noexcept
+    static size_t pin_granularity() noexcept
     {
-        void *data = nullptr;
-        if (cudaMallocHost(&data, bytes) != cudaSuccess) {
+        static const size_t bytes = [] {
+            const long value = sysconf(_SC_PAGESIZE);
+            return value > 0 ? (size_t)value : size_t{0};
+        }();
+        return bytes;
+    }
+
+    static bool allocate_pinned(void **data, size_t bytes) noexcept
+    {
+        if (cudaMallocHost(data, bytes) != cudaSuccess) {
             (void)cudaGetLastError();
             static std::atomic<bool> warned{false};
             if (!warned.exchange(true))
                 fprintf(stderr, "[pin_stage] cudaMallocHost(%zu) failed; using pageable buffers\n", bytes);
-            return nullptr;
+            return false;
         }
         fprintf(stderr, "[pin_stage] region grown to %zu bytes\n", bytes);
-        return data;
+        return true;
     }
 
-    static void free_pinned(void *data) noexcept { (void)cudaFreeHost(data); }
+    static void *allocate_pageable(size_t bytes) noexcept { return std::malloc(bytes); }
+
+    static bool free_pinned(void *data) noexcept
+    {
+        const cudaError_t status = cudaFreeHost(data);
+        if (status == cudaSuccess)
+            return true;
+        fprintf(stderr, "[pin_stage] cudaFreeHost failed (%s); retaining the budget charge\n",
+                cudaGetErrorString(status));
+        return false;
+    }
 
     static bool wait(Stream stream) noexcept
     {
@@ -1006,13 +1024,20 @@ struct SearchStageCuda {
 
     static void quarantine() noexcept
     {
-        fprintf(stderr, "[pin_stage] stream completion unconfirmed; abandoning staging buffers\n");
+        fprintf(stderr, "[pin_stage] stream completion unconfirmed; quarantining staging buffers\n");
     }
 };
 
 using SearchStagePool = cuvs_search_staging::Pool<SearchStageCuda>;
 using SearchStageLease = cuvs_search_staging::Lease<SearchStageCuda>;
 static SearchStagePool g_search_stage_pools[CUVS_MAX_GPUS];
+
+static SearchStagePool &search_stage_pool(int device)
+{
+    if (device < 0 || device >= CUVS_MAX_GPUS)
+        throw std::out_of_range("search staging device out of range");
+    return g_search_stage_pools[device];
+}
 
 static size_t pin_stage_env(const char *name, size_t fallback, size_t maximum)
 {
@@ -1027,7 +1052,11 @@ static size_t pin_stage_env(const char *name, size_t fallback, size_t maximum)
 
 static size_t pin_stage_max_bytes()
 {
-    static const size_t cap = pin_stage_env("CUVS_PIN_STAGE_MAX_BYTES", 64ULL << 20, SIZE_MAX);
+    static const size_t cap = [] {
+        const size_t bytes = pin_stage_env("CUVS_PIN_STAGE_MAX_BYTES", 64ULL << 20, SIZE_MAX);
+        const size_t granularity = SearchStageCuda::pin_granularity();
+        return granularity ? bytes - bytes % granularity : size_t{0};
+    }();
     return cap;
 }
 
@@ -1087,20 +1116,34 @@ public:
     SearchHostIo(raft::device_resources &res, int device, size_t queries, size_t results,
                  size_t words = 0, bool fp16 = false)
         : res_{res}, queries_{queries}, results_{results}, words_{words},
-          offsets_{queries, results, words, fp16},
-          lease_{device >= 0 && device < CUVS_MAX_GPUS ? &g_search_stage_pools[device] : nullptr,
-                 pin_stage_max_bytes(), res.get_stream().value(),
-                 offsets_.bytes, offsets_.fallback_bytes, offsets_.extra_bytes}
-    {}
+          offsets_{queries, results, words, fp16}
+    {
+        try {
+            const size_t cap = pin_stage_max_bytes();
+            lease_.emplace(search_stage_pool(device), cap, res.get_stream().value(),
+                           offsets_.bytes, offsets_.fallback_bytes, offsets_.extra_bytes);
+            if (cap && offsets_.bytes > cap) {
+                static std::atomic<bool> reported{false};
+                if (!reported.exchange(true))
+                    fprintf(stderr, "[pin_stage] request %zu exceeds pinned cap %zu; using pageable buffers\n",
+                            offsets_.bytes, cap);
+            }
+        } catch (const cuvs_search_staging::PageableAllocationError &error) {
+            // Only CPU staging preparation is handled here, before GPU work.
+            fprintf(stderr, "[pin_stage] %s\n", error.what());
+        }
+    }
+
+    explicit operator bool() const { return lease_.has_value(); }
 
     void upload_query(float *dst, const float *src)
     {
         if (!queries_)
             return;
-        if (lease_.pinned()) {
+        if (lease_->pinned()) {
             float *query = at<float>(offsets_.query);
             std::memcpy(query, src, queries_ * sizeof(float));
-            copy(dst, query, queries_);
+            copy(dst, query, queries_, true);
         } else {
             raft::copy(dst, src, queries_, res_.get_stream());
         }
@@ -1111,29 +1154,29 @@ public:
         half *query = at<half>(offsets_.query);
         for (size_t i = 0; i < queries_; ++i)
             query[i] = __float2half(src[i]);
-        copy(dst, query, queries_);
+        copy(dst, query, queries_, lease_->pinned());
     }
 
     void upload_filter(uint32_t *dst, const uint32_t *src)
     {
-        uint32_t *filter = offsets_.extra_bytes ? static_cast<uint32_t *>(lease_.extra())
+        uint32_t *filter = offsets_.extra_bytes ? static_cast<uint32_t *>(lease_->extra())
                                                : at<uint32_t>(offsets_.filter);
         /* The daemon supplies EXCLUDE bits, and cuVS consumes INCLUDE bits. */
         for (size_t i = 0; i < words_; ++i)
             filter[i] = ~src[i];
-        copy(dst, filter, words_);
+        copy(dst, filter, words_, !offsets_.extra_bytes && lease_->pinned());
     }
 
     void sync()
     {
         res_.sync_stream();
-        lease_.completed();
+        lease_->completed();
     }
 
     void download(const Id *indices_d, const float *distances_d)
     {
-        copy(at<Id>(offsets_.indices), indices_d, results_);
-        copy(at<float>(offsets_.distances), distances_d, results_);
+        copy(at<Id>(offsets_.indices), indices_d, results_, lease_->pinned());
+        copy(at<float>(offsets_.distances), distances_d, results_, lease_->pinned());
         sync();
     }
 
@@ -1144,22 +1187,22 @@ private:
     template <class T>
     T *at(size_t offset) const
     {
-        return reinterpret_cast<T *>(static_cast<char *>(lease_.data()) + offset);
+        return reinterpret_cast<T *>(static_cast<char *>(lease_->data()) + offset);
     }
 
     template <class T>
-    void copy(T *dst, const T *src, size_t count)
+    void copy(T *dst, const T *src, size_t count, bool pinned)
     {
         if (!count)
             return;
-        lease_.mark_pending();
+        lease_->mark_pending(pinned);
         raft::copy(dst, src, count, res_.get_stream());
     }
 
     raft::device_resources &res_;
     size_t queries_, results_, words_;
     Offsets offsets_;
-    SearchStageLease lease_;
+    std::optional<SearchStageLease> lease_;
 };
 
 } // namespace
@@ -1196,6 +1239,8 @@ cuvs_brute_force_search(
         raft::device_resources &res = _pr.get();
 
         SearchHostIo<int64_t> io(res, device_id, dim, bk);
+        if (!io)
+            return 1;
 
         auto d_corpus = raft::make_device_matrix<float, int64_t>(res, n_corpus, (int64_t)dim);
         raft::copy(d_corpus.data_handle(), corpus_vecs, n_corpus * dim, res.get_stream());
@@ -1326,6 +1371,8 @@ cuvs_bf_search(
         raft::device_resources &res = _pr.get();
 
         SearchHostIo<int64_t> io(res, device_id, dim, bk, 0, impl->precision == 1);
+        if (!io)
+            return 1;
 
         auto d_indices   = raft::make_device_matrix<int64_t, int64_t>(res, 1, bk);
         auto d_distances = raft::make_device_matrix<float,   int64_t>(res, 1, bk);
@@ -1432,6 +1479,8 @@ cuvs_bf_search_filtered(
 
         const int64_t n_words = bitset_bits / 32 + (bitset_bits % 32 != 0);
         SearchHostIo<int64_t> io(res, device_id, dim, bk, n_words, impl->precision == 1);
+        if (!io)
+            return 1;
 
         auto d_indices   = raft::make_device_matrix<int64_t, int64_t>(res, 1, bk);
         auto d_distances = raft::make_device_matrix<float,   int64_t>(res, 1, bk);
@@ -1555,6 +1604,8 @@ cuvs_cagra_search_filtered(
 
         const int64_t n_words = bitset_bits / 32 + (bitset_bits % 32 != 0);
         SearchHostIo<uint32_t> io(res, device_id, dim, bk, n_words);
+        if (!io)
+            return 1;
 
         auto d_queries   = raft::make_device_matrix<float,    int64_t>(res, (int64_t)1, (int64_t)dim);
         auto d_indices   = raft::make_device_matrix<uint32_t, int64_t>(res, 1, bk);
@@ -1830,6 +1881,8 @@ cuvs_cagra_search(
         raft::device_resources &res = _pr.get();
 
         SearchHostIo<uint32_t> io(res, device_id, dim, bk);
+        if (!io)
+            return 1;
 
         auto d_queries = raft::make_device_matrix<float, int64_t>(res, (int64_t)1, (int64_t)dim);
         io.upload_query(d_queries.data_handle(), query_vec);
@@ -2016,6 +2069,8 @@ cuvs_cagra_search_batch(
         size_t  n = (size_t)Q * (size_t)bk;
 
         SearchHostIo<uint32_t> io(res, device_id, (size_t)Q * dim, n);
+        if (!io)
+            return 1;
 
         auto d_queries = raft::make_device_matrix<float, int64_t>(res, Q, (int64_t)dim);
         io.upload_query(d_queries.data_handle(), queries);
@@ -2093,6 +2148,8 @@ cuvs_bf_search_batch(
         size_t  nb = (size_t)Q * (size_t)bk;
 
         SearchHostIo<int64_t> io(res, device_id, (size_t)Q * dim, nb, 0, impl->precision == 1);
+        if (!io)
+            return 1;
 
         auto d_indices   = raft::make_device_matrix<int64_t, int64_t>(res, Q, bk);
         auto d_distances = raft::make_device_matrix<float,   int64_t>(res, Q, bk);
@@ -2869,6 +2926,8 @@ cuvs_ivfpq_search(
         raft::device_resources &res = _pr.get();
 
         SearchHostIo<int64_t> io(res, device_id, dim, bk);
+        if (!io)
+            return 1;
 
         auto d_queries   = raft::make_device_matrix<float,   int64_t>(res, (int64_t)1, (int64_t)dim);
         auto d_indices   = raft::make_device_matrix<int64_t, int64_t>(res, 1, bk);

@@ -662,12 +662,31 @@ EXTRA_CLEAN += test-cagra-fold-build test-cagra-fold-build.o test-cagra-fold-bui
 
 # C7: run real GPU search with pinned staging, with staging disabled, and over cap.
 .PHONY: test-gpu-search-staging
+ifdef PGCUVS_CPU_SHIM
+test-gpu-search-staging:
+	@echo "test-gpu-search-staging requires the native CUDA wrapper" >&2; exit 2
+else
 test-gpu-search-staging: test/gpu/test_search_staging.c $(WRAPPER_OBJ) src/cuvs_util_server.o src/cuvs_peak_meter_server.o
 	$(CC) -std=gnu11 -Wall -Wextra -Werror -I src -c $< -o $@.o
 	$(CXX) -o $@ $@.o $(filter %.o,$^) $(SERVER_LDFLAGS) -lm
-	CUVS_PIN_STAGE_MAX_BYTES=67108864 CUVS_PIN_STAGE_PREWARM=2 ./$@
-	CUVS_PIN_STAGE_MAX_BYTES=0 ./$@
-	CUVS_PIN_STAGE_MAX_BYTES=1 CUVS_PIN_STAGE_PREWARM=0 ./$@
+	@set -eu; work=$$(mktemp -d); trap 'rm -rf "$$work"' EXIT; \
+	page=$$(getconf PAGESIZE); \
+	run() { mode=$$1; shift; \
+		if ! env "$$@" ./$@ "$$mode" >"$$work/$$mode.log" 2>&1; then cat "$$work/$$mode.log"; return 1; fi; \
+		cat "$$work/$$mode.log"; \
+		grep -E '^(exact|anchor) ' "$$work/$$mode.log" >"$$work/$$mode.exact"; \
+	}; \
+	run pinned CUVS_PIN_STAGE_MAX_BYTES=67108864 CUVS_PIN_STAGE_PREWARM=2; \
+	run off CUVS_PIN_STAGE_MAX_BYTES=0 CUVS_PIN_STAGE_PREWARM=0; \
+	run over-cap CUVS_PIN_STAGE_MAX_BYTES="$$page" CUVS_PIN_STAGE_PREWARM=1; \
+	grep -Fq 'prewarmed 2 region(s)' "$$work/pinned.log"; \
+	! grep -Fq '[pin_stage]' "$$work/off.log" || exit 1; \
+	grep -Fq 'prewarmed 1 region(s)' "$$work/over-cap.log"; \
+	grep -Fq "exceeds pinned cap $$page; using pageable buffers" "$$work/over-cap.log"; \
+	diff -u "$$work/pinned.exact" "$$work/off.exact"; \
+	diff -u "$$work/pinned.exact" "$$work/over-cap.exact"; \
+	echo "test-gpu-search-staging: exact and CAGRA anchor IDs and distances match across all three modes"
+endif
 EXTRA_CLEAN += test-gpu-search-staging test-gpu-search-staging.o
 
 .PHONY: test-rmm-fold-backing

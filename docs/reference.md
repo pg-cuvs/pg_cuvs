@@ -349,6 +349,41 @@ daemon-only ones have no session equivalent.
 | `--gcs-key-file PATH` | separate daemon flag; backend GUC is not forwarded | `` | Service-account JSON path |
 | `--warmup-threads N` | separate daemon flag; backend GUC is not forwarded | `2` | Background GCS warmup pool size |
 
+### GPU search host staging
+
+The daemon reads `CUVS_PIN_STAGE_MAX_BYTES` at startup. It limits the total
+CUDA pinned search staging capacity **per GPU** to 64 MiB by default. The
+setting is rounded down to a host page and `0` disables pinned staging.
+`CUVS_PIN_STAGE_PREWARM` requests up to 32 two-MiB regions per GPU by default
+(range 0–1024, with 0 disabling prewarm). Prewarm draws from the same budget
+as search.
+
+The budget includes active, idle and quarantined regions, and the full size
+of any allocation in progress. An idle region may be freed to make room for
+a larger request. Its charge remains until CUDA confirms the free. If CUDA
+reports a failed free, or a stream wait fails with a staging copy outstanding,
+the affected region stays charged and the pool keeps it out of circulation
+until process exit.
+
+When pinned staging cannot fit or allocate a region, search uses pageable
+scratch. Active, reserved and quarantined pageable scratch share a separate
+256 MiB budget per GPU, including oversized filter scratch. A pageable
+buffer with unconfirmed completion stays charged until process exit. If the
+pageable budget cannot admit a request or the CPU allocation fails, the
+wrapper returns a search error before GPU search work starts and returns
+the healthy resource slot to its pool. Errors after GPU work starts follow
+the existing resource error path. These budgets cover search staging
+allocations owned by the wrapper. CUDA runtime allocations, corpus uploads
+and other daemon host memory have their own accounting boundaries.
+
+`make test-search-staging` covers budget contention, allocation and free
+failures, and quarantine with fake CUDA operations. Tier 2 runs
+`make test-gpu-search-staging` against native CUDA. That target checks path
+diagnostics and compares exact results and CAGRA self-match IDs and
+distances across pinned, off and over-cap modes. It checks each CAGRA
+distance against the returned corpus row and prints the full CAGRA and
+IVF-PQ results for diagnosis.
+
 ### RMM quota and memory accounting
 
 The current device resource is installed before hardware probes, index reload,
