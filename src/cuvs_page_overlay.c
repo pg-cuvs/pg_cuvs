@@ -4,29 +4,44 @@
 #include <stdlib.h>
 #include <string.h>
 
+bool
+cuvs_page_overlay_reserve(CuvsPageOverlayBudget *budget, size_t bytes)
+{
+    size_t used = __atomic_load_n(&budget->used, __ATOMIC_RELAXED);
+
+    do
+    {
+        if (used > budget->limit || bytes > budget->limit - used)
+            return false;
+    } while (!__atomic_compare_exchange_n(&budget->used, &used, used + bytes, true,
+                                          __ATOMIC_RELAXED, __ATOMIC_RELAXED));
+    return true;
+}
+
+void
+cuvs_page_overlay_unreserve(CuvsPageOverlayBudget *budget, size_t bytes)
+{
+    __atomic_fetch_sub(&budget->used, bytes, __ATOMIC_RELAXED);
+}
+
 uint32_t
 cuvs_page_overlay_alloc(CuvsPageOverlayBudget *budget, const CuvsPageOverlayRequest *request,
                         size_t bytes, CuvsPageOverlayChunk **result)
 {
     CuvsPageOverlayChunk *chunk;
-    size_t charge, used;
+    size_t charge;
 
     *result = NULL;
     if (bytes > SIZE_MAX - sizeof(*chunk))
         return CUVS_STATUS_PAGE_OVERLAY_HOST_FULL;
     charge = sizeof(*chunk) + bytes;
-    used = __atomic_load_n(&budget->used, __ATOMIC_RELAXED);
-    do
-    {
-        if (charge > budget->limit - used)
-            return CUVS_STATUS_PAGE_OVERLAY_HOST_FULL;
-    } while (!__atomic_compare_exchange_n(&budget->used, &used, used + charge, true,
-                                          __ATOMIC_RELAXED, __ATOMIC_RELAXED));
+    if (!cuvs_page_overlay_reserve(budget, charge))
+        return CUVS_STATUS_PAGE_OVERLAY_HOST_FULL;
 
     chunk = malloc(charge);
     if (!chunk)
     {
-        __atomic_fetch_sub(&budget->used, charge, __ATOMIC_RELAXED);
+        cuvs_page_overlay_unreserve(budget, charge);
         return CUVS_STATUS_OOM_FALLBACK;
     }
     chunk->next = NULL;
@@ -75,7 +90,7 @@ cuvs_page_overlay_release(CuvsPageOverlayChunk *chunk)
         size_t charge = chunk->charged_bytes;
 
         free(chunk);
-        __atomic_fetch_sub(&budget->used, charge, __ATOMIC_RELAXED);
+        cuvs_page_overlay_unreserve(budget, charge);
         chunk = next;
     }
 }
@@ -91,6 +106,37 @@ cuvs_page_overlay_start_boot(CuvsPageOverlay *overlay, uint64_t boot_id, uint64_
     *overlay = (CuvsPageOverlay) {.boot_id = boot_id, .generation = overlay->generation + 1,
                                   .covered_upto = folded};
     return previous;
+}
+
+CuvsPageOverlayChunk *
+cuvs_page_overlay_advance_fold(CuvsPageOverlay *overlay, uint64_t folded)
+{
+    CuvsPageOverlayChunk **link = &overlay->head;
+    CuvsPageOverlayChunk *obsolete;
+    bool reader_can_reach_cut = false;
+
+    /* Keep the unpublished suffix and at most one chunk crossing its start.
+     * Each registry link owns a reference, including the head. */
+    while (*link && (*link)->from + (*link)->positions > folded)
+    {
+        if (__atomic_load_n(&(*link)->refs, __ATOMIC_ACQUIRE) > 1)
+            reader_can_reach_cut = true;
+        link = &(*link)->next;
+    }
+    if (!*link)
+        return NULL;
+
+    if (reader_can_reach_cut)
+    {
+        /* An older search can still traverse this link outside the lock.
+         * Detach the registry's view and let PostgreSQL supply the suffix. */
+        link = &overlay->head;
+        overlay->covered_upto = folded;
+        ++overlay->generation;
+    }
+    obsolete = *link;
+    *link = NULL;
+    return obsolete;
 }
 
 uint32_t

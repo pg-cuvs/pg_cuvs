@@ -107,7 +107,6 @@ static uint32_t cagra_index_metric(Oid index_oid);
 #define PGV_HNSW_PAGE_ID        0xFF90u
 /* Heap builds default to M 32, which requests a graph degree of 64. */
 #define CUVS_HNSW_DEFAULT_M     32
-#define CUVS_HNSW_BUILD_EF      128
 
 /* Byte size of the 13-field hnswlib binary header (fixed across versions):
  * 10 × size_t(8) + 2 × int(4) + 1 × double(8) = 96 bytes. */
@@ -2065,7 +2064,7 @@ hnsw_report_source_m(int requested_m, int actual_m)
  * use_shm=false → reads pre-built .hnsw sidecar from index_dir */
 static void
 fill_hnsw_from_hnswlib_impl(Oid cagra_oid, Oid hnsw_oid, bool use_shm,
-                            int source_m, HnswFillRes *res)
+                           int source_m, uint16_t metapage_ef, HnswFillRes *res)
 {
 
     /* ---- 0. pgvector compatibility check ---- */
@@ -2595,7 +2594,7 @@ fill_hnsw_from_hnswlib_impl(Oid cagra_oid, Oid hnsw_oid, bool use_shm,
         metap->version       = PGV_HNSW_VERSION;
         metap->dimensions    = (uint32_t)dim;
         metap->m             = (uint16_t)M;
-        metap->efConstruction = (uint16_t)hdr.efConstruction;
+        metap->efConstruction = metapage_ef ? metapage_ef : (uint16_t)hdr.efConstruction;
 
         /* entrypoint: the node with the highest level (= hdr.enterpointNode) */
         int ep = hdr.enterpointNode;
@@ -2683,7 +2682,8 @@ fill_hnsw_from_hnswlib_impl(Oid cagra_oid, Oid hnsw_oid, bool use_shm,
  * scalar) and is unreachable on the error path, where PG_TRY's longjmp
  * skips the return entirely — no stale-value case to guard against. */
 static size_t
-fill_hnsw_from_hnswlib(Oid cagra_oid, Oid hnsw_oid, bool use_shm, int source_m)
+fill_hnsw_from_hnswlib(Oid cagra_oid, Oid hnsw_oid, bool use_shm,
+                      int source_m, uint16_t metapage_ef)
 {
     /*
      * #166 review 3: `res` is written inside PG_TRY (through the pointer the
@@ -2698,7 +2698,7 @@ fill_hnsw_from_hnswlib(Oid cagra_oid, Oid hnsw_oid, bool use_shm, int source_m)
     res.tids_fd = -1;
     PG_TRY();
     {
-        fill_hnsw_from_hnswlib_impl(cagra_oid, hnsw_oid, use_shm, source_m,
+        fill_hnsw_from_hnswlib_impl(cagra_oid, hnsw_oid, use_shm, source_m, metapage_ef,
                                     (HnswFillRes *) &res);
     }
     PG_FINALLY();
@@ -3541,7 +3541,8 @@ hnsw_validate_build_target(Relation indexRel,
 
 static void
 hnsw_import_empty_build_result(Relation indexRel,
-                               const CuvsHnswBuildResult *build, uint16_t m)
+                               const CuvsHnswBuildResult *build,
+                               uint16_t m, uint16_t metapage_ef)
 {
     volatile HnswDiskImportState state;
     bool skip_wal;
@@ -3559,7 +3560,7 @@ hnsw_import_empty_build_result(Relation indexRel,
             ereport(ERROR,
                     (errmsg("pg_cuvs: empty HNSW build returned files or a nonzero count")));
         if (!hnsw_init_empty_pages(metapage, first_data_page, build->dim,
-                                   m, CUVS_HNSW_BUILD_EF))
+                                   m, metapage_ef))
             ereport(ERROR, (errmsg("pg_cuvs: cannot initialize empty HNSW pages")));
 
         {
@@ -3616,7 +3617,8 @@ hnsw_import_empty_build_result(Relation indexRel,
 static void
 hnsw_import_build_result(Relation indexRel,
                          const CuvsHnswBuildResult *build,
-                         bool packed_nsw, uint16_t heap_m, int source_m)
+                         bool packed_nsw, uint16_t heap_m, int source_m,
+                         uint16_t metapage_ef)
 {
     volatile HnswDiskImportState state;
     HnswlibHeader header;
@@ -3696,6 +3698,10 @@ hnsw_import_build_result(Relation indexRel,
             }
             RelationSetTargetBlock(s->target, InvalidBlockNumber);
         }
+        /* The receipt already records the effective serialized effort.
+         * Build-time SQL options belong in the PostgreSQL metapage. */
+        if (metapage_ef)
+            header.efConstruction = metapage_ef;
         hnsw_write_disk_metapage(s->target, &header, layout_m, build->dim,
                                  data_page_count, skip_wal, &s->locations,
                                  /* Only direct heap builds carry a native receipt. */
@@ -3825,7 +3831,7 @@ cagra_assign_level(int M, unsigned int *seed)
  * heuristic neighbor selection among each row's CAGRA neighbors only when it builds none ('nsw' was level 0 only) */
 static void
 fill_hnsw_from_cagra_ipc_impl(Oid cagra_oid, Oid hnsw_oid, const char *mode,
-                              int source_m, HnswFillRes *res)
+                             int source_m, uint16_t metapage_ef, HnswFillRes *res)
 {
     /* 'nsw' assigns levels and links the upper layers too. A graph with layer 0 only lets pgvector's insert make a new element
      * the entry point (hnswinsert.c, HNSW_UPDATE_ENTRY_GREATER) and link the upper layers among inserted rows only, so a search
@@ -3986,7 +3992,7 @@ fill_hnsw_from_cagra_ipc_impl(Oid cagra_oid, Oid hnsw_oid, const char *mode,
             build.dim     = (uint32_t) up_dim;
             build.metric  = tgt_metric;
             target = index_open(hnsw_oid, AccessExclusiveLock);
-            hnsw_import_build_result(target, &build, false, 0, source_m);
+            hnsw_import_build_result(target, &build, false, 0, source_m, metapage_ef);
             index_close(target, AccessExclusiveLock);
             ereport(NOTICE,
                     (errmsg("pg_cuvs: direct import %zu elements (dim=%d, M=%d, "
@@ -4239,7 +4245,7 @@ fill_hnsw_from_cagra_ipc_impl(Oid cagra_oid, Oid hnsw_oid, const char *mode,
         metap->version        = PGV_HNSW_VERSION;
         metap->dimensions     = (uint16_t)ipc_dim;
         metap->m              = (uint16_t)M;
-        metap->efConstruction = (uint16_t)(M0 * 2);  /* reasonable default */
+        metap->efConstruction = metapage_ef ? metapage_ef : (uint16_t)(M0 * 2);
         if (N > 0)
         {
             /* entry_elem is the node with highest level (0 for flat NSW).
@@ -4293,7 +4299,8 @@ fill_hnsw_from_cagra_ipc_impl(Oid cagra_oid, Oid hnsw_oid, const char *mode,
 /* #161: returns the actual element count — see the matching comment on
  * fill_hnsw_from_hnswlib(). */
 static size_t
-fill_hnsw_from_cagra_ipc(Oid cagra_oid, Oid hnsw_oid, const char *mode, int source_m)
+fill_hnsw_from_cagra_ipc(Oid cagra_oid, Oid hnsw_oid, const char *mode,
+                        int source_m, uint16_t metapage_ef)
 {
     /* #166 review 3: volatile across the longjmp — see fill_hnsw_from_hnswlib. */
     volatile HnswFillRes res;
@@ -4303,7 +4310,7 @@ fill_hnsw_from_cagra_ipc(Oid cagra_oid, Oid hnsw_oid, const char *mode, int sour
     res.tids_fd = -1;
     PG_TRY();
     {
-        fill_hnsw_from_cagra_ipc_impl(cagra_oid, hnsw_oid, mode, source_m,
+        fill_hnsw_from_cagra_ipc_impl(cagra_oid, hnsw_oid, mode, source_m, metapage_ef,
                                       (HnswFillRes *) &res);
     }
     PG_FINALLY();
@@ -4533,11 +4540,11 @@ pg_cuvs_build_hnsw(PG_FUNCTION_ARGS)
      *   'hnswlib_file' — on-disk .hnsw sidecar; superceded by 'hnswlib' (shm).
      */
     if (strcmp(mode, "nsw") == 0 || strcmp(mode, "hnsw") == 0)
-        fill_hnsw_from_cagra_ipc(cagra_oid, hnsw_oid, mode, 0);
+        fill_hnsw_from_cagra_ipc(cagra_oid, hnsw_oid, mode, 0, 0);
     else if (strcmp(mode, "hnswlib") == 0)
-        fill_hnsw_from_hnswlib(cagra_oid, hnsw_oid, true, 0);
+        fill_hnsw_from_hnswlib(cagra_oid, hnsw_oid, true, 0, 0);
     else  /* hnswlib_file */
-        fill_hnsw_from_hnswlib(cagra_oid, hnsw_oid, false, 0);
+        fill_hnsw_from_hnswlib(cagra_oid, hnsw_oid, false, 0, 0);
 
     PG_RETURN_OID(hnsw_oid);
 }
@@ -4881,9 +4888,11 @@ cuvs_hnsw_ambuild(Relation heapRel, Relation indexRel, IndexInfo *indexInfo)
             result->heap_tuples = b->reltuples;
             result->index_tuples = (double)b->n_vecs;
             if (b->n_vecs > 0)
-                hnsw_import_build_result(indexRel, b, false, (uint16_t)requested_m, 0);	/* the graph has upper layers, so not the level-0-only packing */
+                hnsw_import_build_result(indexRel, b, false, (uint16_t)requested_m, 0,
+                                         (uint16_t)requested_ef);	/* the graph has upper layers, so not the level-0-only packing */
             else
-                hnsw_import_empty_build_result(indexRel, b, (uint16_t) requested_m);
+                hnsw_import_empty_build_result(indexRel, b, (uint16_t)requested_m,
+                                               (uint16_t)requested_ef);
         }
         PG_FINALLY();
         {
@@ -4980,11 +4989,14 @@ cuvs_hnsw_ambuild(Relation heapRel, Relation indexRel, IndexInfo *indexInfo)
      * happens. */
     size_t n_elems_written;
     if (strcmp(mode, "nsw") == 0 || strcmp(mode, "hnsw") == 0)
-        n_elems_written = fill_hnsw_from_cagra_ipc(cagra_oid, self_oid, mode, source_m);
+        n_elems_written = fill_hnsw_from_cagra_ipc(cagra_oid, self_oid, mode,
+                                                  source_m, (uint16_t)requested_ef);
     else if (strcmp(mode, "hnswlib") == 0)
-        n_elems_written = fill_hnsw_from_hnswlib(cagra_oid, self_oid, true, source_m);
+        n_elems_written = fill_hnsw_from_hnswlib(cagra_oid, self_oid, true,
+                                               source_m, (uint16_t)requested_ef);
     else  /* hnswlib_file */
-        n_elems_written = fill_hnsw_from_hnswlib(cagra_oid, self_oid, false, source_m);
+        n_elems_written = fill_hnsw_from_hnswlib(cagra_oid, self_oid, false,
+                                               source_m, (uint16_t)requested_ef);
 
     /* #161: element count from fill_*'s own return, not inferred from block
      * count. nblocks-1 == N only holds while every page carries exactly one

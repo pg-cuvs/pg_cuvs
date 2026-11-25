@@ -58,13 +58,14 @@ typedef struct CuvsCagraMeta
     BlockNumber foldlog_tail;
     BlockNumber foldlog_spare;
     uint32      n_extents;
-    BlockNumber extent_overflow;
+    BlockNumber extent_reclaim_from; /* first block to inspect for orphaned extents */
     uint64      last_fold_xid;
     int64       last_fold_time;
     BlockNumber extents[CUVS_CAGRA_PAGE_DIR];
 } CuvsCagraMeta;
 
 uint64 cuvs_cagra_nonce(void);
+uint64 cuvs_cagra_pg_boot_id(void);
 bool cuvs_cagra_read_meta(Relation index, CuvsCagraMeta *meta);
 
 typedef enum CuvsCagraSlotResult
@@ -117,10 +118,14 @@ CuvsCagraFoldStatus cuvs_cagra_prepare_fold(Relation index,
 
 /* Standalone writable background worker operation on a WAL-logged index. The
  * caller holds RowExclusiveLock and has verified the candidate's origin and PG life.
- * PUBLISHED returns a flushed physical transition LSN and no FCL. That is
- * the first point at which the caller may send FOLD_COMMITTED. */
+ * PUBLISHED returns a flushed physical transition LSN and no FCL, including
+ * for a redelivered candidate that is already the published head. The
+ * caller may send FOLD_COMMITTED after this result. */
 CuvsCagraFoldStatus cuvs_cagra_publish_fold(Relation index,
                         const CuvsCagraFoldCandidate *candidate, XLogRecPtr *commit_lsn);
+#ifdef CUVS_CAGRA_FOLD_ENABLED
+void cuvs_cagra_run_fold_worker(Relation index);
+#endif
 CuvsCagraSlotResult cuvs_cagra_pending_tid(Relation index, const CuvsCagraMeta *meta,
                                          BlockNumber nblocks, BlockNumber block,
                                          uint64 position, ItemPointer tid);
@@ -142,7 +147,7 @@ IndexBulkDeleteResult *cuvs_cagra_page_bulkdelete(IndexVacuumInfo *info,
 IndexBulkDeleteResult *cuvs_cagra_page_vacuumcleanup(IndexVacuumInfo *info,
     IndexBulkDeleteResult *stats);
 #ifdef CUVS_TEST_HOOKS
-void cuvs_cagra_vacuum_init_test_hook(void);
+void cuvs_cagra_init_test_hooks(void);
 #endif
 #endif
 

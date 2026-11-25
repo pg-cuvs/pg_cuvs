@@ -26,8 +26,13 @@ int main(void)
     assert(route(15, 128, 64, budget, budget, &f, error) != CUVS_STATUS_OK);
     assert(route(16, 128, 64, budget, budget, &f, error) == CUVS_STATUS_OK);
     assert(f.decision.route == CUVS_HNSW_ROUTE_NN_DESCENT);
-    assert(route(10000, 128, 1000, budget, budget, &f, error) != CUVS_STATUS_OK);
-    assert(f.decision.route == 0); /* SDK graph sorter accepts at most 1024 neighbors */
+    CuvsHnswNnCapacity capped;
+    assert(cuvs_hnsw_nn_capacity(10000, 128, 64, 1024, 1,
+                                 CUVS_HNSW_NN_FP32, &capped) == 0);
+    assert(route(10000, 128, 1000, budget, budget, &f, error) == CUVS_STATUS_OK);
+    assert(f.decision.route == CUVS_HNSW_ROUTE_NN_DESCENT && !f.decision.overflowed);
+    assert(f.host_estimate == capped.host_peak && f.gpu_estimate == capped.gpu_peak);
+    assert(route(10000, 128, 1001, budget, budget, &f, error) != CUVS_STATUS_OK);
     assert(!cuvs_hnsw_graph_failure_to_ace(CUVS_HNSW_ALGO_NN_DESCENT,
         CUVS_HNSW_ROUTE_NN_DESCENT, CUVS_HNSW_OVERFLOW_ACE, 10000, CUVS_HNSW_GRAPH_KNN_REJECTED));
     puts("direct NN route, tiny, clamp, budget and no fallback: PASS");

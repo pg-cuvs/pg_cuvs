@@ -12,6 +12,7 @@
  * Configured via cuvs.socket_path GUC.
  */
 
+#include <stdbool.h>
 #include <stdint.h>
 #include <stddef.h>
 #include <sys/types.h>
@@ -169,9 +170,39 @@ int cuvs_ipc_build_hnsw_file_idle(const char *socket_path, int vectors_fd,
 #define CUVS_OP_DROP_PAGES_INDEX      52 /* fixed index_dir after the v6 command */
 #define CUVS_OP_SEARCH_PAGE_OVERLAY   56
 #define CUVS_OP_SEARCH_PAGE_OVERLAY_BATCH 57
+#define CUVS_OP_FOLD_READY            58
+#define CUVS_OP_FOLD_COMMITTED        59
+#define CUVS_OP_FOLD_DISCARD          60
+
+/* An opt-in legacy CAGRA command. The v6 command and reply headers stay fixed.
+ * The command is followed by CuvsExtraSearchRequest and dim floats.
+ * An OK reply carries CuvsExtraSearchReply followed by n_results CuvsResults. */
+#define CUVS_OP_SEARCH_EXTRA             61
+#define CUVS_EXTRA_SEARCH_VERSION         1u
+#define CUVS_EXTRA_SEARCH_MAX_K         512u
+#define CUVS_EXTRA_SEARCH_MAX_DIM      3072u
+#define CUVS_EXTRA_SEARCH_MAX_ROWS    32768u
+#define CUVS_EXTRA_SEARCH_MAX_COMPONENTS (8u * 1024u * 1024u)
+#define CUVS_EXTRA_SEARCH_TIMEOUT_MS   3000
+
+typedef struct CuvsExtraSearchRequest {
+    uint32_t version;
+    uint32_t max_components;  /* zero for the first, ordinary CAGRA search */
+    uint64_t generation;      /* zero for first, exact first-reply token for extra */
+    uint64_t dir_dev;         /* heap backend's sidecar-directory device */
+    uint64_t dir_ino;         /* sidecar-directory inode, nonzero */
+    int64_t  deadline_ms;     /* shared statement CLOCK_MONOTONIC deadline */
+} CuvsExtraSearchRequest;
+
+typedef struct CuvsExtraSearchReply {
+    uint64_t generation;
+    uint32_t scored_rows;     /* extra search only */
+    uint32_t components;      /* completed row × dimension evaluations */
+} CuvsExtraSearchReply;
 #define CUVS_PAGE_INDEX_DIR_SIZE 256 /* fixed path field on the wire */
 #define CUVS_PAGE_SLOT_INVALID UINT64_MAX
 #define CUVS_PAGE_BUILD_DEFER_LEGACY 1U
+#define CUVS_PAGE_SEARCH_MAX_K 4000
 #define CUVS_PAGE_BATCH_MAX 4096U
 #define CUVS_PAGE_OVERLAY_MAX 200000U
 
@@ -202,7 +233,7 @@ typedef struct CuvsPageSearchRequest
     uint64_t tail;
     uint64_t dead_slots;
     float    resume_distance;
-    uint32_t reserved;
+    uint32_t reserved; /* Fold-enabled SUPPLY_PAGES carries a one-based live base slot hint. */
 } CuvsPageSearchRequest;
 
 /* Only new overlay opcodes use this extended frame. Existing page search
@@ -254,6 +285,8 @@ typedef struct CuvsPageOverlayResult
 int cuvs_ipc_supply_pages(const char *socket_path, uint32_t db_oid, uint32_t index_oid,
     const CuvsPageOverlayRequest *request, int dim, uint32_t metric,
     const CuvsPageSupplement *supplement, CuvsPageProgress *progress);
+int cuvs_ipc_query_page_supply(const char *socket_path, uint32_t db_oid, uint32_t index_oid,
+    const CuvsPageOverlayRequest *request, int dim, uint32_t metric, CuvsPageProgress *progress);
 
 /* results must hold nq * k entries. Batch rows pad unused positions with
  * CUVS_PAGE_SLOT_INVALID; base graph rows use block=0 (no heap block hint). */
@@ -263,6 +296,50 @@ int cuvs_ipc_search_page_overlay(const char *socket_path, uint32_t db_oid, uint3
     uint32_t search_mode, uint32_t bf_precision, const CuvsPageSupplement *supplement,
     CuvsPageOverlayResult *results, int *count, uint32_t *latency_us, CuvsPageProgress *progress);
 
+typedef struct CuvsPageFoldQuery
+{
+    uint32_t length;
+    uint32_t reserved;
+    uint64_t system_identifier;
+    uint64_t boot_id;
+} CuvsPageFoldQuery;
+
+typedef struct CuvsPageFoldEvent
+{
+    uint32_t length;
+    uint32_t db_oid;
+    uint32_t index_oid;
+    uint32_t positions;
+    uint64_t system_identifier;
+    uint64_t boot_id;
+    uint64_t daemon_id;
+    uint64_t index_nonce;
+    uint64_t base_nonce;
+    uint64_t parent_graph_nonce;
+    uint64_t graph_nonce;
+    uint64_t parent_n_slots;
+    uint64_t parent_folded;
+} CuvsPageFoldEvent;
+
+typedef struct CuvsPageFoldResult
+{
+    CuvsPageFoldEvent event;
+    uint64_t transition_lsn;
+} CuvsPageFoldResult;
+
+bool cuvs_page_fold_event_valid(const CuvsPageFoldEvent *event);
+
+/* READY returns one fixed event on OK and no payload on NOT_FOUND.
+ * The output is written only after a complete, validated OK reply. */
+int cuvs_ipc_page_fold_ready(const char *socket_path, uint32_t db_oid,
+    uint64_t system_identifier, uint64_t boot_id, CuvsPageFoldEvent *event);
+/* An index-specific consumer receives events only for that incarnation. */
+int cuvs_ipc_page_fold_ready_index(const char *socket_path, uint32_t db_oid, uint32_t index_oid,
+    uint64_t index_nonce, uint64_t system_identifier, uint64_t boot_id, CuvsPageFoldEvent *event);
+
+/* A nonzero LSN sends COMMITTED. Zero sends DISCARD. Both replies are status-only. */
+int cuvs_ipc_page_fold_result(const char *socket_path, const CuvsPageFoldEvent *event,
+    uint64_t transition_lsn);
 
 
 
@@ -306,6 +383,12 @@ int cuvs_ipc_search_page_overlay(const char *socket_path, uint32_t db_oid, uint3
 #define CUVS_STATUS_PAGE_NEED          18
 #define CUVS_STATUS_PAGE_OVERLAY_FULL  19
 #define CUVS_STATUS_PAGE_OVERLAY_HOST_FULL 20 /* daemon host budget: use exact heap search */
+
+#define CUVS_EXTRA_SEARCH_UNSUPPORTED 21
+#define CUVS_EXTRA_SEARCH_GENERATION  22
+#define CUVS_EXTRA_SEARCH_BUDGET      23
+#define CUVS_EXTRA_SEARCH_DEADLINE    24
+#define CUVS_EXTRA_SEARCH_ANN_FAILED  25 /* initial ANN ran and failed */
 
 /* ----------------------------------------------------------------
  * Command frame (sent over UDS, fixed size)
@@ -413,9 +496,13 @@ typedef struct CuvsReplyHeader {
 #if defined(__cplusplus)
 static_assert(CUVS_PROTO_VERSION == CUVS_ADMISSION_IPC_VERSION,
               "the I3 wire version is the shared admission contract version");
+static_assert(sizeof(CuvsPageFoldQuery) == 24 && sizeof(CuvsPageFoldEvent) == 88 &&
+              sizeof(CuvsPageFoldResult) == 96, "page fold wire sizes");
 #else
 _Static_assert(CUVS_PROTO_VERSION == CUVS_ADMISSION_IPC_VERSION,
                "the I3 wire version is the shared admission contract version");
+_Static_assert(sizeof(CuvsPageFoldQuery) == 24 && sizeof(CuvsPageFoldEvent) == 88 &&
+               sizeof(CuvsPageFoldResult) == 96, "page fold wire sizes");
 #endif
 
 /* err_out / notice_out of the last reply header this thread received through
@@ -506,6 +593,15 @@ typedef struct CuvsResult {
     uint64_t tid;           /* heap TID encoded as block<<16|offset */
     float    distance;
 } CuvsResult;
+
+/* A single absolute monotonic deadline covers both optional-path requests. */
+int64_t cuvs_ipc_extra_search_deadline_ms(void);
+int cuvs_ipc_search_extra(const char *socket_path, uint32_t db_oid,
+                          uint32_t index_oid, const float *query, int dim, int k,
+                          uint64_t generation, uint32_t max_components,
+                          uint64_t dir_dev, uint64_t dir_ino,
+                          int64_t deadline_ms, CuvsResult *results, int *count,
+                          CuvsExtraSearchReply *details, uint32_t *latency_us);
 
 int cuvs_ipc_search_pages(const char *socket_path, uint32_t db_oid, uint32_t index_oid,
     const CuvsPageSearchRequest *request, const float *queries, int nq, int dim, int k,
