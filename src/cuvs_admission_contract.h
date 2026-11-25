@@ -154,6 +154,13 @@ cuvs_admission_estimate_final_bytes(int64_t n, int32_t dim, int32_t graph_degree
     return cuvs_admission_sat_mul((uint64_t)n, row);
 }
 
+/* Charge the persisted IVF-PQ index size plus 1/16 for reload headroom. */
+static inline uint64_t
+cuvs_admission_estimate_ivfpq_reload_bytes(uint64_t artifact_bytes)
+{
+    return cuvs_admission_sat_add(artifact_bytes, artifact_bytes / 16u);
+}
+
 static inline uint64_t
 cuvs_admission_needed_bytes(uint64_t final_bytes, uint64_t corpus_h2d,
                             uint32_t scratch_rho_permille, uint64_t margin)

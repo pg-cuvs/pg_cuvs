@@ -299,6 +299,21 @@ test_ar8_pool_shortfall(void)
                   cuvs_admission_pool_refuses(q, 1, u, 3, 2));
 }
 
+static void
+test_ivfpq_reload_estimate(void)
+{
+    CHECK_EQ("IVF-PQ reload rounds slack down", cuvs_admission_estimate_ivfpq_reload_bytes(31), 32);
+    CHECK_EQ("IVF-PQ reload charges artifact plus slack",
+             cuvs_admission_estimate_ivfpq_reload_bytes(UINT64_C(32) << 30), UINT64_C(34) << 30);
+    CHECK_EQ("IVF-PQ empty artifact estimate", cuvs_admission_estimate_ivfpq_reload_bytes(0), 0);
+    CHECK_EQ("IVF-PQ reload saturates near the cap",
+             cuvs_admission_estimate_ivfpq_reload_bytes(SAT - 1), SAT);
+    CHECK_EQ("IVF-PQ reload saturates at the cap",
+             cuvs_admission_estimate_ivfpq_reload_bytes(SAT), SAT);
+    CHECK_EQ("IVF-PQ reload saturates before unsigned wrap",
+             cuvs_admission_estimate_ivfpq_reload_bytes(UINT64_MAX), SAT);
+}
+
 int
 main(void)
 {
@@ -313,6 +328,7 @@ main(void)
     test_c3_admission_table();
     test_ar8_pool_capacity();
     test_ar8_pool_shortfall();
+    test_ivfpq_reload_estimate();
     if (g_failures) {
         fprintf(stderr, "test_admission_contract: %d failure(s)\n", g_failures);
         return 1;
