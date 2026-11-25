@@ -12,6 +12,10 @@ exists for 0.9.0.
 
 ### Added
 
+- Experimental page-format CAGRA scans can reuse the daemon's pending rows
+  with `cuvs.page_resident_search=on`. `cuvs.resident_supply=on` enables
+  background supply on builds with native page-format folding. Both settings
+  default to `off`.
 - `pg_cuvs_hnsw_layer_counts(regclass)` and `pg_cuvs_hnsw_layer_status()`: the elements of
   a `pg_cuvs_hnsw` index above level 0, and whether each index has the upper layers that
   `mode = 'nsw'` did not build before 0.9.3 (such an index needs `REINDEX INDEX`) and links
@@ -140,6 +144,19 @@ exists for 0.9.0.
   Not changed: the concurrent build and `REINDEX ... CONCURRENTLY` of a `pg_cuvs_hnsw` index with `source = ...`
   still ask for `AccessExclusiveLock` on the index while they convert, so the table's reads and writes wait for
   them, as they did before.
+- `pg_cuvs_hnsw` heap builds now use `m` for neighbor capacity, with default
+  32. When an input has 1–64 rows, a default build now stores M 32 and reserves
+  slots accordingly even though the graph width is smaller, so such an index
+  can grow slightly after `REINDEX` (16 KB to 24 KB for a 15-row sample) while
+  returning the same search results. An explicit `m` already recorded by an
+  earlier release takes effect on the next rebuild or restore, which can change
+  the index size, build time and search quality. Use the [catalog query](docs/reference.md#pg_cuvs_hnsw) to find indexes
+  where the configured and built values differ. Source builds inherit the
+  converted M and warn once when an explicit `m` differs; that `m` still
+  applies when maintenance rebuilds the index from the heap. When maintenance
+  rebuilds a source-based index from the heap through pgvector, an index
+  without an explicit `m` now gets M 32 instead of 16. `ALTER INDEX ...
+  SET (m = ...)` applies on the next rebuild.
 - `cuvs.delta_search = 'cpu'` returned every row of a pending `.delta` twice, pushing
   correct rows out of the top k: the daemon merged its GPU delta cache whatever the mode
   was and the backend merged `.delta` again. The SEARCH request now carries the mode, and

@@ -9,6 +9,7 @@ t
 t
 t
 t
+WARNING:  pg_cuvs_hnsw: source graph uses M = 16, ignoring m = 48
 t
 NOTICE:  pg_cuvs_hnsw: rebuilt from the heap because source CAGRA index "hsm_wide_c" has pending inserts or an unreadable delta file
 DETAIL:  pgvector build used m = 48, ef_construction = 96 (configured ef_construction = 64).
@@ -16,6 +17,7 @@ t
 t
 t
 t
+WARNING:  pg_cuvs_hnsw: source graph uses M = 16, ignoring m = 48
 t
 t
 t

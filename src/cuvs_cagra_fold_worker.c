@@ -7,6 +7,7 @@
 #include "access/xlog.h"
 #include "catalog/pg_class_d.h"
 #include "commands/defrem.h"
+#include "cuvs_cagra_history.h"
 #include "cuvs_cagra_pages.h"
 #include "cuvs_cagra_pending_search.h"
 #include "cuvs_ipc.h"
@@ -144,6 +145,7 @@ cuvs_cagra_fold_worker_main(Datum arg)
     CuvsCagraFoldCandidate candidate;
     CuvsCagraFoldStatus status = CUVS_CAGRA_FOLD_DEFERRED;
     XLogRecPtr lsn = InvalidXLogRecPtr;
+    uint32 transition_xid = InvalidTransactionId;
     Oid target = InvalidOid;
     bool ready;
 #ifdef CUVS_CAGRA_FOLD_ENABLED
@@ -176,11 +178,19 @@ cuvs_cagra_fold_worker_main(Datum arg)
     int ready_rc;
 #ifdef CUVS_CAGRA_FOLD_ENABLED
     if (report)
-        ready_rc = cuvs_ipc_page_fold_ready_index(cuvs_socket_path, MyDatabaseId, target,
-                                                  scope.index_nonce, system_identifier, boot_id, &event);
+        ready_rc = cuvs_page_resident_search ?
+            cuvs_ipc_page_fold_resident_ready(cuvs_socket_path, MyDatabaseId, target,
+                                               scope.index_nonce, system_identifier, boot_id,
+                                               cuvs_cagra_pg_boot_started_us(), &event) :
+            cuvs_ipc_page_fold_ready_index(cuvs_socket_path, MyDatabaseId, target,
+                                            scope.index_nonce, system_identifier, boot_id, &event);
     else
 #endif
-        ready_rc = cuvs_ipc_page_fold_ready(cuvs_socket_path, MyDatabaseId, system_identifier, boot_id, &event);
+        ready_rc = cuvs_page_resident_search ?
+            cuvs_ipc_page_fold_resident_ready(cuvs_socket_path, MyDatabaseId, 0, 0,
+                                               system_identifier, boot_id,
+                                               cuvs_cagra_pg_boot_started_us(), &event) :
+            cuvs_ipc_page_fold_ready(cuvs_socket_path, MyDatabaseId, system_identifier, boot_id, &event);
     ready = ready_rc == CUVS_STATUS_OK;
 #ifdef CUVS_CAGRA_FOLD_ENABLED
     if (report && ready_rc != CUVS_STATUS_OK && ready_rc != CUVS_STATUS_NOT_FOUND)
@@ -222,7 +232,12 @@ cuvs_cagra_fold_worker_main(Datum arg)
                 index->rd_index->indislive && cuvs_cagra_has_pages(index))
             {
                 if (ready)
+                {
                     status = cuvs_cagra_publish_fold(index, &candidate, &lsn);
+                    if (cuvs_page_resident_search && status == CUVS_CAGRA_FOLD_PUBLISHED)
+                        (void) cuvs_cagra_history_transition_lookup(index, &candidate,
+                                                                   &transition_xid);
+                }
 #ifdef CUVS_CAGRA_FOLD_ENABLED
                 else
                     outcome = fold_supply_index(index, system_identifier, boot_id, scope.index_nonce);
@@ -231,13 +246,30 @@ cuvs_cagra_fold_worker_main(Datum arg)
             relation_close(index, NoLock);
         }
     }
+    if (!XactReadOnly && ready && cuvs_page_resident_search && status == CUVS_CAGRA_FOLD_DEFERRED)
+        cuvs_cagra_history_collect_database(get_am_oid("cagra", true), GetActiveSnapshot());
     PopActiveSnapshot();
     CommitTransactionCommand();
 
     CHECK_FOR_INTERRUPTS();
     if (ready && (status == CUVS_CAGRA_FOLD_PUBLISHED || status == CUVS_CAGRA_FOLD_DISCARD))
     {
-        int rc = cuvs_ipc_page_fold_result(cuvs_socket_path, &event, lsn);
+        int rc = CUVS_STATUS_NOT_FOUND;
+
+        if (cuvs_page_resident_search && status == CUVS_CAGRA_FOLD_PUBLISHED)
+        {
+            /* A published page is irreversible. If its original XID could
+             * not be proved, leave READY outstanding for another attempt. */
+            if (TransactionIdIsNormal(transition_xid))
+            {
+                rc = cuvs_ipc_page_fold_resident_result(cuvs_socket_path, &event, lsn,
+                                                         transition_xid);
+                if (rc == CUVS_STATUS_OK)
+                    cuvs_cagra_history_acknowledged(target, &candidate, transition_xid);
+            }
+        }
+        else
+            rc = cuvs_ipc_page_fold_result(cuvs_socket_path, &event, lsn);
 
 #ifdef CUVS_CAGRA_FOLD_ENABLED
         if (status == CUVS_CAGRA_FOLD_PUBLISHED)
