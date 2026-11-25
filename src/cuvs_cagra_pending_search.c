@@ -43,7 +43,7 @@ copy_visible_vector(TupleTableSlot *slot, AttrNumber attribute, uint32 dim, floa
 static bool
 copy_supplement(Relation index, Relation heap, Snapshot snapshot,
                 const CuvsCagraMeta *meta, BlockNumber blocks, uint64 from,
-                uint64 upto, CuvsPageSupplement *supplement, bool shared)
+                uint64 upto, CuvsPageSupplement *supplement, bool shared, bool resident)
 {
     bool expression = (meta->flags & CUVS_CAGRA_PENDING_VECTOR) != 0;
     AttrNumber attribute = index->rd_index->indkey.values[0];
@@ -52,6 +52,7 @@ copy_supplement(Relation index, Relation heap, Snapshot snapshot,
     float *vectors;
     uint32 packed = 0;
     uint32 count;
+    CuvsCagraMeta canonical;
 
     if (!heap || RelationGetForm(heap)->relam != HEAP_TABLE_AM_OID ||
         !IsMVCCSnapshot(snapshot) || (!expression && attribute <= 0) ||
@@ -64,6 +65,13 @@ copy_supplement(Relation index, Relation heap, Snapshot snapshot,
     vectors = palloc(sizeof(float) * (Size) count * meta->dim);
     bool ok = cuvs_cagra_copy_pending(index, meta, blocks, from, upto, items,
                                      expression ? vectors : NULL);
+    if (ok && resident)
+    {
+        ok = cuvs_cagra_read_meta(index, &canonical) &&
+            canonical.index_nonce == meta->index_nonce && canonical.base_nonce == meta->base_nonce &&
+            canonical.base_slots == meta->base_slots && canonical.folded >= meta->folded;
+        blocks = RelationGetNumberOfBlocks(index);
+    }
 
     if (ok)
     {
@@ -76,6 +84,21 @@ copy_supplement(Relation index, Relation heap, Snapshot snapshot,
             float *destination = vectors + (Size) packed * meta->dim;
 
             CHECK_FOR_INTERRUPTS();
+            if (resident && from + i < canonical.folded)
+            {
+                ItemPointerData root;
+                CuvsCagraSlotResult state = cuvs_cagra_slot_tid(index, &canonical, blocks,
+                                                               canonical.base_slots + from + i, &root);
+
+                if (state == CUVS_CAGRA_SLOT_DEAD)
+                    continue;
+                if (state != CUVS_CAGRA_SLOT_LIVE || !ItemPointerIsValid(&items[i].tid) ||
+                    !ItemPointerEquals(&root, &items[i].tid))
+                {
+                    ok = false;
+                    break;
+                }
+            }
             if (!ItemPointerIsValid(&items[i].tid))
                 continue;
             table_index_fetch_reset(fetch);
@@ -123,7 +146,20 @@ cuvs_cagra_local_supplement(Relation index, Relation heap, Snapshot snapshot,
                             const CuvsCagraMeta *meta, BlockNumber blocks,
                             uint64 from, uint64 upto, CuvsPageSupplement *supplement)
 {
-    return copy_supplement(index, heap, snapshot, meta, blocks, from, upto, supplement, false);
+    return copy_supplement(index, heap, snapshot, meta, blocks, from, upto, supplement, false, false);
+}
+
+bool
+cuvs_cagra_resident_supplement(Relation index, Relation heap, Snapshot snapshot,
+                               const CuvsCagraMeta *meta, BlockNumber blocks, uint64 from,
+                               uint64 upto, CuvsPageSupplement *supplement)
+{
+    /* The selected graph may predate the latest metapage. The append-only
+     * pending pages still carry vectors, but their roots can be obsolete. */
+    CuvsCagraMeta source = *meta;
+
+    source.folded = Min(from, meta->folded);
+    return copy_supplement(index, heap, snapshot, &source, blocks, from, upto, supplement, false, true);
 }
 
 #ifdef CUVS_CAGRA_FOLD_ENABLED
@@ -132,7 +168,7 @@ cuvs_cagra_fold_supplement(Relation index, Relation heap, Snapshot snapshot,
                            const CuvsCagraMeta *meta, BlockNumber blocks,
                            uint64 from, uint64 upto, CuvsPageSupplement *supplement)
 {
-    return copy_supplement(index, heap, snapshot, meta, blocks, from, upto, supplement, true);
+    return copy_supplement(index, heap, snapshot, meta, blocks, from, upto, supplement, true, false);
 }
 #endif
 
