@@ -718,15 +718,30 @@ an index does the same. Build such an index without `CONCURRENTLY` at a quiet ti
 | `pg_cuvs_hnsw_layer_status()` | SETOF (index regclass, access_method name, current boolean, reason text) | Every `pg_cuvs_hnsw` index the caller can read that is ready (`indisready`; one a concurrent build or reindex is still writing is left out): whether it has upper layers, and why not. `mode='nsw'` before 0.9.3 wrote level 0 only, so rows inserted afterwards held the upper layers alone and searches could miss the built rows; such an index needs `REINDEX INDEX`. A heap build is judged from its recorded hierarchy flag; a CAGRA-source build from the share of elements above level 0 (about 1/m expected, under a quarter of that means none), and NULL below 16 × m elements. With two or more elements above level 0, any of them without a level-1 link makes an index not current, whatever built it (a single upper element, the entry point, has nobody to link to) |
 | `pg_cuvs_build_hnsw(cagra regclass, mode text DEFAULT 'nsw')` | regclass | Build a pgvector HNSW from a CAGRA index without pgvector's CPU build. **Deprecated** in favor of `CREATE INDEX ... USING pg_cuvs_hnsw`; the older two-step `pg_cuvs_import_hnsw` form (empty `USING hnsw` target + import) is removed |
 | `pg_cuvs_compact(index regclass)` | void | Remove tombstoned vectors via `cuvsCagraMerge`, rebuild `.cagra`/`.tids`, drop `.tombstone`. The rebuild uses fp32 IVF-PQ kNN distances under the `build_algo` fp16 rule. If the initial NN-descent or auto merge runs out of memory, retry once with explicit IVF-PQ under that same rule. A pinned IVF-PQ failure is not retried |
-| `pg_cuvs_batch_search(rel regclass, queries vector[], k int)` | SETOF (query_idx int, ctid tid, distance real) | Q queries in one IPC/GPU dispatch; JOIN on `ctid` for visible rows, which drops HOT-updated rows (see the note below the table); honors `search_mode`/`bf_precision` |
-| `cuvs_filtered_knn(index regclass, query vector, filter_tids bigint[], k int)` | TABLE (ctid tid, distance float4) | Exact GPU BF restricted to a sorted TID set (`block<<16\|off`); NULL = unfiltered. A `ctid` join drops HOT-updated rows (see the note below the table) |
-| `cuvs_filtered_knn(index regclass, query vector, filter_tids tid[], k int)` | TABLE (ctid tid, distance float4) | Type-safe `tid[]` overload (accepts `ctid` directly; a HOT-updated row's current `ctid` does not match, see the note below the table) |
+| `pg_cuvs_batch_search(rel regclass, queries vector[], k int)` | SETOF (query_idx int, ctid tid, distance real) | Batches Q queries in one GPU dispatch when eligible. Honors `search_mode` and `bf_precision` on the GPU path |
+| `cuvs_filtered_knn(index regclass, query vector, filter_tids bigint[], k int)` | TABLE (ctid tid, distance float4) | Brute-force kNN over the TID set (`block<<16\|off`). NULL means unfiltered, and an empty array returns zero rows |
+| `cuvs_filtered_knn(index regclass, query vector, filter_tids tid[], k int)` | TABLE (ctid tid, distance float4) | Type-safe overload that accepts `ctid` directly |
 | `pg_cuvs_gc_orphans(do_delete bool DEFAULT false)` | SETOF (db_oid oid, index_oid oid, reason text, action text) | Reconcile `index_dir` vs catalog; dry-run by default (ADR-046) |
 | `pg_cuvs_last_search_latency_us()` / `_n_results()` / `_k()` / `_index()` / `_metric()` | int / int / int / oid / text | Process-local stats for the most recent scan in this backend; NULL if none |
 | `pg_cuvs_hw_profile()` | SETOF (gpu_name text, n_gpus int, total_vram_bytes bigint, link_bw_bytes_per_us float8, hbm_bw_bytes_per_us float8, gpu_bf_tput float8, ipc_rtt_us float8, measured_at_epoch bigint, probe_status int, source text, matches_running_daemon bool, cpu_dist_tput float8, gpu_cagra_lat_us float8) | The measured (or DEFAULT) hardware profile the daemon wrote at boot, consumed by the ADR-075 cost model. `source` = `measured` \| `default`; `probe_status` is a bitmask of which coefficients were measured; `matches_running_daemon` = false flags a stale profile (GPU swap / migration). Read-only, no CUDA/IPC |
 
-> **Note (`ctid` results, #243):** `pg_cuvs_batch_search` and `cuvs_filtered_knn` return
-> the TID the index holds. For a row updated by HOT (an UPDATE that changes no indexed
+> With experimental page-format CAGRA indexes, both functions return the
+> `ctid` visible in the caller's snapshot. A `filter_tids` array matches those
+> visible `ctid` values. The GPU path checks candidates in heap block order.
+> The functions can use exact heap search, for example when the GPU shortlist
+> contains fewer than `k` visible rows. Current standard builds supply no GPU
+> brute-force dataset for page-format indexes, so `cuvs_filtered_knn` uses exact
+> heap search on those indexes.
+>
+> In the `pg_cuvs_batch_search` visibility benchmark on an A100 80 GB PCIe,
+> an FP32 brute-force test fixture held 100,000 vectors of 128 dimensions.
+> For Q=32 and k=100, checking visibility by heap block raised p50 from
+> 1.82 ms to 2.40 ms and from 1.74 ms to 2.36 ms in two repetitions. The
+> prototype measured 2.02 ms to 2.69 ms under the same workload. These comparisons
+> used a read-only workload with no HOT updates.
+>
+> With legacy CAGRA indexes (#243), both functions return the TID the index
+> holds. For a row updated by HOT (an UPDATE that changes no indexed
 > column and fits in the same heap page), that TID is the root of the HOT chain, not the
 > current row version, so `JOIN ... ON t.ctid = b.ctid` finds no row: the row is silently
 > missing and a query can return fewer than `k` rows. A `tid[]` or `bigint[]` filter built

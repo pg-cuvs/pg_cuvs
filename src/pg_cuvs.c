@@ -5259,6 +5259,241 @@ page_search_filtered(Oid oid, Relation heap, Snapshot snapshot, const float *que
     return ok;
 }
 
+typedef struct PageVisibleTid
+{
+    uint64 slot;
+    uint64 tid;
+} PageVisibleTid;
+
+static int
+page_heap_probe_cmp(const void *a, const void *b)
+{
+    const PageVisibleTid *left = *(PageVisibleTid *const *) a;
+    const PageVisibleTid *right = *(PageVisibleTid *const *) b;
+
+    return page_tid_cmp(&left->tid, &right->tid);
+}
+
+/* Slot order often follows the heap, but can diverge after a fold. Probe in
+ * block order while leaving the slot map in place for result emission. */
+static void
+page_check_visible_tids(Relation heap, Snapshot snapshot, PageVisibleTid *mapping,
+                        size_t count, bool ordered)
+{
+    PageVisibleTid **probes = NULL;
+    Buffer buffer = InvalidBuffer;
+    BlockNumber previous = InvalidBlockNumber;
+    HeapTupleData tuple;
+
+    if (!ordered)
+    {
+        size_t nprobes = 0;
+
+        probes = palloc(count * sizeof(*probes));
+        for (size_t i = 0; i < count; ++i)
+            if (mapping[i].tid != 0)
+                probes[nprobes++] = &mapping[i];
+        qsort(probes, nprobes, sizeof(*probes), page_heap_probe_cmp);
+        count = nprobes;
+    }
+    for (size_t i = 0; i < count; ++i)
+    {
+        PageVisibleTid *row = probes ? probes[i] : &mapping[i];
+        BlockNumber block;
+        uint16 offset;
+        ItemPointerData tid;
+
+        if (row->tid == 0)
+            continue;
+        cuvs_tid_decode(row->tid, &block, &offset);
+        if (block != previous || !BufferIsValid(buffer))
+        {
+            if (BufferIsValid(buffer))
+                UnlockReleaseBuffer(buffer);
+            CHECK_FOR_INTERRUPTS();
+            buffer = ReadBuffer(heap, block);
+            LockBuffer(buffer, BUFFER_LOCK_SHARE);
+            previous = block;
+        }
+        ItemPointerSet(&tid, block, offset);
+        row->tid = heap_hot_search_buffer(&tid, heap, buffer, snapshot, &tuple, NULL, true) ?
+            cuvs_tid_encode(block, ItemPointerGetOffsetNumber(&tid)) : 0;
+    }
+    if (BufferIsValid(buffer))
+        UnlockReleaseBuffer(buffer);
+    if (probes)
+        pfree(probes);
+}
+
+static bool
+page_resolve_sql_rows(Relation index, Relation heap, Snapshot snapshot,
+                      const CuvsCagraMeta *meta, BlockNumber blocks,
+                      const CuvsResult *results, int nq, int stride, int k,
+                      const uint64 *visible, int nvisible,
+                      uint64 *tids, float *dists)
+{
+    size_t count = (size_t) nq * stride;
+    PageVisibleTid *mapping = palloc(count * sizeof(*mapping));
+    size_t nslots = 0;
+    size_t unique = 0;
+    BlockNumber previous = 0;
+    bool ordered = true;
+    bool complete = true;
+
+    for (size_t i = 0; i < count; ++i)
+        if (results[i].tid != CUVS_PAGE_SLOT_INVALID)
+            mapping[nslots++].slot = results[i].tid;
+    qsort(mapping, nslots, sizeof(*mapping), page_tid_cmp);
+    for (size_t i = 0; i < nslots; ++i)
+    {
+        uint64 number = mapping[i].slot;
+        ItemPointerData root;
+        CuvsCagraSlotResult quality;
+
+        if (unique && number == mapping[unique - 1].slot)
+            continue;
+        CHECK_FOR_INTERRUPTS();
+        quality = cuvs_cagra_slot_tid(index, meta, blocks, number, &root);
+        if (quality == CUVS_CAGRA_SLOT_BAD)
+        {
+            pfree(mapping);
+            return false;
+        }
+        mapping[unique] = (PageVisibleTid) {.slot = number};
+        if (quality == CUVS_CAGRA_SLOT_LIVE)
+        {
+            BlockNumber block = ItemPointerGetBlockNumber(&root);
+
+            ordered = ordered && block >= previous;
+            previous = block;
+            mapping[unique].tid = cuvs_tid_encode(block, ItemPointerGetOffsetNumber(&root));
+        }
+        ++unique;
+    }
+    page_check_visible_tids(heap, snapshot, mapping, unique, ordered);
+
+    memset(tids, 0, (size_t) nq * k * sizeof(*tids));
+    for (int q = 0; q < nq; ++q)
+    {
+        int emitted = 0;
+
+        for (int i = 0; i < stride && emitted < k; ++i)
+        {
+            const CuvsResult *item = &results[(size_t) q * stride + i];
+            const PageVisibleTid *row;
+            size_t output = (size_t) q * k + emitted;
+
+            if (item->tid == CUVS_PAGE_SLOT_INVALID || !isfinite(item->distance))
+                continue;
+            row = bsearch(&item->tid, mapping, unique, sizeof(*mapping), page_tid_cmp);
+            Assert(row != NULL);
+            if (!row->tid || (visible &&
+                !bsearch(&row->tid, visible, nvisible, sizeof(*visible), page_tid_cmp)))
+                continue;
+            tids[output] = row->tid;
+            dists[output] = item->distance;
+            ++emitted;
+        }
+        complete = complete && emitted == k;
+    }
+    pfree(mapping);
+    return complete;
+}
+
+static bool
+page_sql_index_visible(Relation index, Snapshot snapshot)
+{
+    HeapTuple tuple;
+    TransactionId xmin;
+
+    if (!index->rd_index->indisvalid ||
+        (index->rd_index->indcheckxmin &&
+         !TransactionIdPrecedes(HeapTupleHeaderGetXmin(index->rd_indextuple->t_data),
+                                TransactionXmin)))
+        return false;
+
+    /* REINDEX can replace the graph behind the same OID. Its new pg_class
+     * version tracks the relfilenumber change, even if indcheckxmin is clear.
+     * A snapshot older than that version must read the heap to find rows the
+     * rebuilt graph could have omitted. The caller holds the index lock. */
+    tuple = SearchSysCache1(RELOID, ObjectIdGetDatum(RelationGetRelid(index)));
+    if (!HeapTupleIsValid(tuple))
+        return false;
+    xmin = HeapTupleHeaderGetXmin(tuple->t_data);
+    ReleaseSysCache(tuple);
+    return !TransactionIdIsNormal(xmin) ||
+        (!TransactionIdIsCurrentTransactionId(xmin) && !XidInMVCCSnapshot(xmin, snapshot));
+}
+
+static bool
+page_search_sql(Oid index_oid, Oid heap_oid, const float *queries, int nq, int dim,
+                int k, int search_mode, uint64 *visible, int nvisible,
+                uint64 *tids, float *dists)
+{
+    Relation heap = table_open(heap_oid, AccessShareLock);
+    Relation index = index_open(index_oid, AccessShareLock);
+    Snapshot snapshot = GetActiveSnapshot();
+    CuvsCagraMeta meta;
+    CuvsPageSearchRequest request = {0};
+    BlockNumber blocks;
+    uint64 *roots = NULL;
+    uint32 *excluded = NULL;
+    uint32 words = 0;
+    CuvsResult *results = NULL;
+    uint32 latency;
+    int search_k, count, rc;
+    bool ok = false;
+
+    /* Let the executor track the heap predicate for serializable reads,
+     * including rows outside the shortlist and future inserts. */
+    if (IsolationIsSerializable() ||
+        nq > 1024 || RelationGetForm(heap)->relam != HEAP_TABLE_AM_OID ||
+        check_enable_rls(heap_oid, InvalidOid, true) != RLS_NONE ||
+        index->rd_index->indkey.values[0] <= 0 || RelationGetIndexPredicate(index) != NIL ||
+        !page_search_request(index, snapshot, dim, &meta, &blocks, &request) ||
+        !page_sql_index_visible(index, snapshot) ||
+        request.tail != request.folded)
+        goto done;
+
+    if (visible)
+    {
+        int nroots;
+
+        qsort(visible, nvisible, sizeof(*visible), page_tid_cmp);
+        roots = page_filter_roots(heap, visible, nvisible, &nroots);
+        words = (meta.n_slots + 31) / 32;
+        excluded = palloc((size_t) words * sizeof(*excluded));
+        if (!cuvs_cagra_slot_filter(index, &meta, blocks, roots, nroots, excluded))
+            goto done;
+    }
+    search_k = k + (int) Min(meta.dead_slots, (uint64) k);
+    results = palloc((size_t) nq * search_k * sizeof(*results));
+    /* The base page reply uses the HNSW distance unchanged (1 - dot).
+     * SQL inner-product results use raw dot on both search paths. */
+    rc = cuvs_ipc_search_pages(cuvs_socket_path, MyDatabaseId, index_oid, &request, queries,
+                              nq, dim, search_k, meta.metric, cuvs_itopk_size, cuvs_search_width,
+                              cuvs_cpu_hnsw_fallback && meta.metric != CUVS_METRIC_IP,
+                              search_mode, cuvs_bf_precision,
+                              excluded, words, results, &count, &latency);
+    if (rc == CUVS_STATUS_CANCELED)
+        CHECK_FOR_INTERRUPTS();
+    if (rc == CUVS_STATUS_OK && (nq == 1 || count == nq * search_k))
+        ok = page_resolve_sql_rows(index, heap, snapshot, &meta, blocks, results,
+                                   nq, nq == 1 ? count : search_k, k, visible, nvisible,
+                                   tids, dists);
+
+done:
+    if (results)
+        pfree(results);
+    if (excluded)
+        pfree(excluded);
+    if (roots)
+        pfree(roots);
+    index_close(index, AccessShareLock);
+    table_close(heap, AccessShareLock);
+    return ok;
+}
+
 /* Resolve the merged shortlist under the scan snapshot before emitting a row.
  * Invisible candidates can leave fewer answers than cuvs.k. A bad slot identity
  * invalidates the shortlist before the scan has emitted any rows. */
@@ -7026,11 +7261,9 @@ cuvs_require_index_owner(Oid index_oid)
  *   RETURNS TABLE(query_idx int, ctid tid, distance float4)
  *
  * Sends Q queries to the daemon in one IPC round-trip (one batched GPU
- * dispatch) and returns up to K = min(k, n_vecs) neighbors per query. Mirrors
- * the single-query semantics: raw ctids + daemon distance, no internal heap
- * visibility filtering (the caller JOINs on ctid for MVCC, exactly like the AM
- * scan sets xs_recheck). Honors cuvs.search_mode / cuvs.bf_precision, so it
- * works in brute_force mode too once a .vectors sidecar exists.
+ * dispatch) and returns up to K = min(k, n_vecs) neighbors per query.
+ * Legacy indexes return the daemon's stored TIDs. Page-format indexes
+ * resolve the caller's visible ctids or use the exact heap search.
  * ---------------------------------------------------------------- */
 PG_FUNCTION_INFO_V1(pg_cuvs_batch_search);
 Datum
@@ -7158,7 +7391,9 @@ pg_cuvs_batch_search(PG_FUNCTION_ARGS)
 #ifdef CUVS_PAGE_FORMAT
             if (page_format)
             {
-                cuvs_cagra_sql_exact(index_oid, metric, dim, qbuf, Q, k, NULL, 0, tids, dists);
+                if (!page_search_sql(index_oid, table_oid, qbuf, Q, dim, k, cuvs_search_mode,
+                                     NULL, 0, tids, dists))
+                    cuvs_cagra_sql_exact(index_oid, metric, dim, qbuf, Q, k, NULL, 0, tids, dists);
                 Kout = k;
                 rc = CUVS_STATUS_OK;
             }
@@ -8813,8 +9048,12 @@ cuvs_filtered_knn(PG_FUNCTION_ARGS)
 #ifdef CUVS_PAGE_FORMAT
         if (page_format)
         {
-            n_results = cuvs_cagra_sql_exact(index_oid, metric, dim, qvec->x, 1, k,
-                                             filter_arr, n_filter, tids_out, dists_out);
+            if (page_search_sql(index_oid, heap_oid, qvec->x, 1, dim, k, 1,
+                                filter_arr, n_filter, tids_out, dists_out))
+                n_results = k;
+            else
+                n_results = cuvs_cagra_sql_exact(index_oid, metric, dim, qvec->x, 1, k,
+                                                 filter_arr, n_filter, tids_out, dists_out);
             rc = CUVS_STATUS_OK;
         }
         else
