@@ -114,7 +114,9 @@ exists for 0.9.0.
   heap build in both cases.
 - `hnswlib_file` could previously import an older graph after the CAGRA source
   changed. It now rejects a missing or invalid build-time binding between
-  `.hnsw` and `.tids` with SQLSTATE `55000`. For a clean resident source, use
+  `.hnsw` and `.tids` with SQLSTATE `55000`. Files written by earlier versions
+  have no binding, so a conversion that used to proceed from them now fails
+  until the files are regenerated. For a clean resident source, use
   `mode = 'nsw'` or regenerate the files by enabling
   `cuvs.cpu_hnsw_fallback` and running `REINDEX` on the source. If a failed
   `CREATE INDEX CONCURRENTLY` leaves an invalid target index, drop it before

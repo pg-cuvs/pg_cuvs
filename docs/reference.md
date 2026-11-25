@@ -638,7 +638,8 @@ Verification reads both files to compute their digests.
 A failed CAGRA rebuild preserves the binding when it restores the same files
 with unchanged contents. Earlier versions could import an older graph after the source
 changed. A missing or invalid binding now causes conversion to fail with
-SQLSTATE `55000`. Choose `mode = 'nsw'` for a clean resident source, or set
+SQLSTATE `55000`. Files written by earlier versions have no binding, so their
+conversion fails until the files are regenerated. Choose `mode = 'nsw'` for a clean resident source, or set
 `cuvs.cpu_hnsw_fallback = on` and run `REINDEX` on the source to regenerate
 its files. If a failed `CREATE INDEX CONCURRENTLY` leaves its target in
 `pg_index` with `indisvalid = false`, run `DROP INDEX` on that invalid
