@@ -10788,11 +10788,12 @@ handle_drop(int client_fd, const CuvsCmdFrame *cmd)
         free_delta_cache(e);
         /* ADR-073: free the resident main BF cache — flat's ONLY GPU allocation
          * (handle is NULL), and a cagra index's secondary BF cache. NULL-safe.
-         * (Note: e->ivfpq_handle is still not freed here — a pre-existing IVF-PQ
-         * VRAM-on-drop leak, out of scope for ADR-073.) */
+         * The IVF-PQ handle and the CPU HNSW structure are released below as well. */
         free_main_bf_cache(e);
         if (e->shard_count >= 2) free_index_shards(e);
         else if (e->handle)      cuvs_cagra_free(e->handle, e->gpu_device_id);
+        if (e->ivfpq_handle)     cuvs_ivfpq_free(e->ivfpq_handle, e->gpu_device_id);
+        if (e->hnsw_idx)         cuvs_hnsw_free(e->hnsw_idx);
         free(e->tids);
         free(e->rev_tids);     e->rev_tids     = NULL;
         free(e->rev_item_ids); e->rev_item_ids = NULL;
@@ -10833,6 +10834,8 @@ handle_drop(int client_fd, const CuvsCmdFrame *cmd)
     vectors_file_path(p, sizeof(p), directory, db, idx);     unlink(p); /* .vectors */
     stale_file_path(p, sizeof(p), directory, db, idx);       unlink(p); /* .stale */
     relfilenode_file_path(p, sizeof(p), directory, db, idx); unlink(p); /* .relfilenode */
+    ivfpq_file_path(p, sizeof(p), directory, db, idx);       unlink(p); /* .ivfpq */
+    hnsw_file_path(p, sizeof(p), directory, db, idx);        unlink(p); /* .hnsw */
     snprintf(p, sizeof(p), "%s/%u_%u.tombstone", directory, db, idx); unlink(p);
     snprintf(p, sizeof(p), "%s/%u_%u.hnsw%s", directory, db, idx,
              CUVS_HNSW_SOURCE_SUFFIX); unlink(p);
