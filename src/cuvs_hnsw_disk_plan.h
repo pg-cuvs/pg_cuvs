@@ -6,18 +6,18 @@
  * pg_cuvs_hnsw without source). PostgreSQL- and CUDA-free so the unit test
  * runs exactly what the backend evaluates.
  *
- * The build has two disk phases that do not overlap:
+ * The post-scan plan estimates additional space in two phases:
  *
  *   daemon build  the daemon's private workdir (input copy, reorder, graph,
- *                 serialization) while the backend's input spool (fp32 rows
- *                 and TIDs) still exists;
+ *                 serialization);
  *   index write   after the reply the daemon has removed its workdir except
  *                 the open, unlinked graph file, and the backend has closed
- *                 the vector spool; the TID file, the node-location spill and
- *                 the index pages (and their WAL) are written.
+ *                 the vector spool; the node-location spill and index pages
+ *                 (and their WAL) are written. The TID spool already exists.
  *
- * Within each phase, items on one filesystem (same st_dev) are summed and
- * compared with that filesystem's free space. WAL is shown but not enforced:
+ * Within each phase, probed PostgreSQL files on one filesystem (same st_dev)
+ * are summed and compared with its free space. Daemon mounts are not
+ * identified by the backend. WAL is shown but not enforced:
  * checkpoints recycle it, so its peak depends on max_wal_size, archiving and
  * replication slots, not on the index alone. An item whose filesystem could
  * not be probed is shown and never refuses.
@@ -28,9 +28,8 @@
 
 typedef enum CuvsHnswDiskItemKind {
     CUVS_HNSW_DISK_WORKDIR = 0, /* daemon build: private workdir under --index-dir */
-    CUVS_HNSW_DISK_SPOOL,       /* daemon build: input spool, fp32 rows + TIDs */
     CUVS_HNSW_DISK_GRAPH,       /* index write: the daemon's graph file */
-    CUVS_HNSW_DISK_LOCATIONS,   /* index write: node-location spill (+ TIDs) */
+    CUVS_HNSW_DISK_LOCATIONS,   /* index write: node-location spill */
     CUVS_HNSW_DISK_INDEX,       /* index write: index relation pages */
     CUVS_HNSW_DISK_WAL,         /* index write: illustrative WAL estimate */
     CUVS_HNSW_DISK_ITEMS
@@ -57,7 +56,7 @@ typedef struct CuvsHnswDiskVerdict {
     uint64_t peak_need;   /* the larger phase */
 } CuvsHnswDiskVerdict;
 
-/* The TID file header and the hnswlib file header stay far below this. */
+/* The hnswlib file header stays far below this. */
 #define CUVS_HNSW_DISK_HEADER_BOUND UINT64_C(4096)
 
 static inline uint64_t
@@ -74,14 +73,6 @@ cuvs_hnsw_disk_rows(uint64_t n, uint64_t row)
     if (row != 0 && n > (UINT64_MAX - CUVS_HNSW_DISK_HEADER_BOUND) / row)
         return UINT64_MAX;
     return n * row + CUVS_HNSW_DISK_HEADER_BOUND;
-}
-
-/* Input spool: one fp32 row and one 8-byte encoded TID per vector (halfvec
- * input is spooled as fp32 too). */
-static inline uint64_t
-cuvs_hnsw_spool_need(uint64_t n, uint32_t dim)
-{
-    return cuvs_hnsw_disk_rows(n, (uint64_t)dim * 4 + 8);
 }
 
 /* The daemon's hnswlib graph file: per node the level-0 record (link count,
@@ -105,7 +96,7 @@ cuvs_hnsw_location_need(uint64_t n)
 static inline int
 cuvs_hnsw_disk_phase(int kind)
 {
-    return kind == CUVS_HNSW_DISK_WORKDIR || kind == CUVS_HNSW_DISK_SPOOL ? 0 : 1;
+    return kind == CUVS_HNSW_DISK_WORKDIR ? 0 : 1;
 }
 
 /* Already allocated spool blocks can be reused in the write phase only. */
@@ -127,7 +118,8 @@ cuvs_hnsw_disk_need_mib(uint64_t bytes)
 static inline bool
 cuvs_hnsw_disk_enforced(int kind, const CuvsHnswDiskItem *it)
 {
-    return kind != CUVS_HNSW_DISK_WAL && it->need > 0 && it->known;
+    return (kind == CUVS_HNSW_DISK_LOCATIONS || kind == CUVS_HNSW_DISK_INDEX)
+        && it->need > 0 && it->known;
 }
 
 /* Enforced bytes of `phase` on the filesystem `fs`. */
@@ -192,7 +184,6 @@ cuvs_hnsw_disk_label(int kind)
     switch (kind)
     {
         case CUVS_HNSW_DISK_WORKDIR: return "daemon workdir";
-        case CUVS_HNSW_DISK_SPOOL: return "input spool";
         case CUVS_HNSW_DISK_GRAPH: return "graph file";
         case CUVS_HNSW_DISK_LOCATIONS: return "node-location spill";
         case CUVS_HNSW_DISK_INDEX: return "index pages";

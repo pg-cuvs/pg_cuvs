@@ -130,7 +130,8 @@ def check(src):
     # --- backend order (CK-17 (14)) -----------------------------------------
     b = function(code['backend'], 'cuvs_build_hnsw_from_heap(Relation heapRel')
     ordered(b, ['cuvs_hnsw_preflight(stats_rows', 'table_index_build_scan(',
-                'prespool == CUVS_HNSW_PRESPOOL_FALLBACK', 'cuvs_ipc_build_hnsw_file_idle(',
+                'prespool == CUVS_HNSW_PRESPOOL_FALLBACK', 'cuvs_hnsw_preflight((double)spool->n',
+                'cuvs_hnsw_disk_plan_check(', 'cuvs_ipc_build_hnsw_file_idle(',
                 'cuvs_hnsw_timing_flags(stats_rows, prespool)', 'cuvs_hnsw_build_notices(&out->policy, transition_sent)'],
             'BACKEND_ORDER')
     assert 'heapRel->rd_rel->reltuples' in b.split('table_index_build_scan(', 1)[0], 'STATS_BEFORE_SCAN'
@@ -159,14 +160,21 @@ def check(src):
     seg = disk[1].split(';', 1)[0] + disk[1].split('if (rc != CUVS_STATUS_OK)', 1)[0]
     assert 'errmsg("%s", error)' in seg and 'errhint("%s", CUVS_HNSW_DISK_HINT)' in seg, 'POSTSCAN_DISK_SURFACE'
     p = function(code['backend'], 'cuvs_hnsw_preflight(double rows')
+    nonempty = function(b, 'if (spool->n > 0)')
+    assert 'cuvs_hnsw_disk_plan_check(' not in p and b.count('cuvs_hnsw_disk_plan_check(') == 1, 'DISK_CHECK_POSTSCAN_ONLY'
+    assert re.search(r'if \(postscan == CUVS_HNSW_PRESPOOL_PROCEED \|\| postscan == CUVS_HNSW_PRESPOOL_NOTICE_OVERFLOW\)\s*'
+                     r'cuvs_hnsw_disk_plan_check\(indexRel, &postscan_reply, spool, m, when\);', nonempty), 'DISK_CHECK_SUCCESSFUL_FORECAST_ONLY'
+    assert 'ef_construction, 2 * m, cap, true, when, NULL' in b.split('table_index_build_scan(', 1)[0], 'PRESPOOL_ROUTE_ADMISSION'
+    assert 'ef_construction, 2 * m, cap, false,' in nonempty, 'POSTSCAN_FORECAST_DEFERS_ROUTE_ADMISSION'
+    assert 'announce_after_scan ? when : NULL, &postscan_reply' in b, 'NO_DUPLICATE_TRANSITION'
     rb = p.split('action == CUVS_HNSW_PRESPOOL_REJECT_BUDGET', 1)[1].split('return action;', 1)[0]
     assert 'cuvs_hnsw_preflight_budget(&reply)' in rb.split('cuvs_hnsw_budget_error(build_algo, &budget);', 1)[0], 'PRESPOOL_STATUS13_BUDGET'
     pd = p.split('cuvs_hnsw_disk_refusal(rc, reply.header.error)', 1)
     assert len(pd) == 2 and 'errmsg("%s", reply.header.error)' in pd[1].split(';', 1)[0] + pd[1].split('if (action == CUVS_HNSW_PRESPOOL_REJECT)', 1)[0], 'PRESPOOL_DISK_MESSAGE'
     assert 'errhint("%s", CUVS_HNSW_DISK_HINT)' in pd[1].split('if (action == CUVS_HNSW_PRESPOOL_REJECT)', 1)[0], 'PRESPOOL_DISK_HINT'
-    rj = pd[1].split('if (action == CUVS_HNSW_PRESPOOL_REJECT)', 1)[1].split('if (action == CUVS_HNSW_PRESPOOL_NOTICE_OVERFLOW)', 1)[0]
+    rj = pd[1].split('if (action == CUVS_HNSW_PRESPOOL_REJECT)', 1)[1].split('if (action == CUVS_HNSW_PRESPOOL_NOTICE_OVERFLOW && when)', 1)[0]
     assert 'cuvs_hnsw_budget_detail(detail, sizeof(detail), &budget)' in rj and 'errdetail("%s", detail)' in rj, 'PRESPOOL_STATUS5_DETAIL'
-    assert 'action == CUVS_HNSW_PRESPOOL_NOTICE_OVERFLOW' in p and 'cuvs_hnsw_transition_notice(' in p.split('CUVS_HNSW_PRESPOOL_NOTICE_OVERFLOW)', 1)[1], 'PN1_NOTICE'
+    assert re.search(r'if \(action == CUVS_HNSW_PRESPOOL_NOTICE_OVERFLOW && when\)\s*cuvs_hnsw_transition_notice\(', p), 'PN1_NOTICE'
     t = function(code['backend'], 'cuvs_hnsw_transition_notice(uint64_t host_est')
     assert 'build_algo=auto exceeded the resident budget (need %u MiB, budget %u MiB); building with ACE on disk' in src['backend'], 'TRANSITION_TEXT'
     assert 'ereport(NOTICE' in t, 'TRANSITION_IS_NOTICE'
@@ -188,10 +196,21 @@ MUTANTS = [
      '            if (notices & CUVS_HNSW_NOTICE_TRANSITION)\n                cuvs_hnsw_transition_notice(',
      '            if (0)\n                (void)('),
     ('pn1_notice_dropped', 'backend',
-     '    if (action == CUVS_HNSW_PRESPOOL_NOTICE_OVERFLOW)\n        cuvs_hnsw_transition_notice(',
-     '    if (action == CUVS_HNSW_PRESPOOL_NOTICE_OVERFLOW)\n        (void)('),
+     '    if (action == CUVS_HNSW_PRESPOOL_NOTICE_OVERFLOW && when)\n        cuvs_hnsw_transition_notice(',
+     '    if (action == CUVS_HNSW_PRESPOOL_NOTICE_OVERFLOW && when)\n        (void)('),
     ('decision_after_spool', 'backend',
      '        prespool = cuvs_hnsw_preflight(stats_rows,', '        prespool = CUVS_HNSW_PRESPOOL_FALLBACK; (void)(stats_rows,'),
+    ('disk_check_uses_stats_rows', 'backend',
+     'postscan = cuvs_hnsw_preflight((double)spool->n,', 'postscan = cuvs_hnsw_preflight(stats_rows,'),
+    ('disk_check_without_accepted_forecast', 'backend',
+     '            if (postscan == CUVS_HNSW_PRESPOOL_PROCEED || postscan == CUVS_HNSW_PRESPOOL_NOTICE_OVERFLOW)',
+     '            if (postscan != CUVS_HNSW_PRESPOOL_REJECT)'),
+    ('prespool_route_admission_disabled', 'backend',
+     'cap, true, when, NULL', 'cap, false, when, NULL'),
+    ('postscan_forecast_rejects_route', 'backend',
+     'cap, false,\n                                         announce_after_scan', 'cap, true,\n                                         announce_after_scan'),
+    ('postscan_transition_repeated', 'backend',
+     'announce_after_scan ? when : NULL, &postscan_reply', 'when, &postscan_reply'),
     ('daemon_decision_after_mkdtemp', 'server',
      '    CuvsHnswForecast route;\n', '    CuvsHnswForecast route; (void)mkdtemp(workdir);\n'),
     ('daemon_disk_check_removed', 'server',

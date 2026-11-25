@@ -778,24 +778,32 @@ tablespace needs a further `n × dim × 4` bytes for the input spool. The `[hnsw
 line then has `status=5` and still names the decided route (`route=none` only when no
 route was decided, such as an over-budget refusal).
 
-After a successful route forecast, the backend also estimates the PostgreSQL-side disk
-needs. It uses `reltuples` before the heap scan, or the spooled row count when the
-pre-scan forecast falls back. The daemon-build estimate adds the fp32 input spool and
-the TID file to the daemon's workdir estimate. The index-write estimate covers the
-unlinked graph file, TIDs, the node-location spill and index pages. The page estimate uses
-the level-0 layout, including split pairs when needed. Actual upper levels can require
-more pages. When the spool already exists, its allocated blocks are credited to the
-index-write phase on its actual filesystem.
+The backend checks additional PostgreSQL disk needs after the heap scan and before
+sending the build request. It uses a fresh successful route forecast for the number of
+vectors actually spooled. An empty spool skips this check. The earlier route forecast
+and daemon workdir admission still use `reltuples` when statistics are available.
 
-Each phase groups known paths by filesystem. Temporary files are checked as a group
-when the configured temporary tablespaces and the database default, PostgreSQL's fallback,
-resolve to one filesystem. The daemon's absolute index path participates when the
-backend can probe it. A phase estimate beyond available capacity fails with SQLSTATE
-53100 and reports the path, phase and item estimates. The pre-scan error suggests
-`ANALYZE` because stale table statistics can affect the decision. For a logged index,
-the plan displays an estimated WAL amount using the level-0 page estimate. WAL does
-not trigger the refusal. When the forecast selects ACE, a NOTICE reports the estimated
-peak additional local disk and the item breakdown. Capacity can change after the probe.
+The vector and TID spools already occupy space when the backend probes capacity. It
+credits the vector spool's allocated blocks to the index-write phase on the spool's
+filesystem, since it closes that file before writing pages. It checks the additional
+node-location spill and index pages, grouping probed PostgreSQL paths by filesystem.
+The spill contributes to the check if the configured temporary tablespaces and the
+database default resolve to one filesystem. The page estimate uses the level-0 layout,
+including split pairs. Actual upper levels can require more pages. Insufficient space
+for the checked estimates fails with SQLSTATE 53100 and reports the path and phase.
+
+An ACE forecast reports the estimated peak additional disk and item breakdown. The
+daemon workdir and surviving graph file are advisory items because the forecast's
+directory string does not establish a shared mount, even when the path is absolute.
+The daemon enforces its own workdir check. Separate checks can miss a shortfall when
+the daemon and PostgreSQL share a filesystem and their combined needs exceed its space.
+An unavailable post-scan forecast leaves the build request to the daemon's existing
+admission checks. Capacity may change after the probe.
+
+The advisory WAL amount uses the level-0 page estimate for the heap writer's page
+logging, including new permanent indexes at `wal_level=minimal`. The writer skips
+this page WAL for UNLOGGED indexes. Actual WAL usage and retained space depend on
+record overhead, compression, checkpoints and retention settings.
 
 Direct `ef_construction` scales the planned intermediate width from 4 × `m` before the
 row-count adjustment and the hnswlib serialization EF from 200 at the default 64.
