@@ -7322,8 +7322,9 @@ done:
  * for the rebuild; without them the merge used the cuVS defaults (64, 128).
  * Unlike the build resolver this does not raise an error, since VACUUM calls
  * it: reloptions that CREATE INDEX would reject (intermediate below
- * graph_degree, possible after ALTER INDEX ... SET) send 0, and the daemon
- * keeps the resident graph's width. Other AMs (ivfpq, flat) have different
+ * graph_degree, possible after ALTER INDEX ... SET) send 0, the daemon keeps
+ * the resident graph's width, and a WARNING says so. A width change (e.g.
+ * after ALTER INDEX ... SET (graph_degree)) gets a NOTICE. Other AMs (ivfpq, flat) have different
  * rd_options layouts and send 0 (they have no CAGRA graph to rebuild). */
 static int
 cuvs_compact_rel(Relation indexRel, Oid index_oid)
@@ -7331,19 +7332,50 @@ cuvs_compact_rel(Relation indexRel, Oid index_oid)
     int      graph_degree = 0;
     int      intermediate_graph_degree = 0;
     uint32_t build_algo = CUVS_CAGRA_BUILD_AUTO;
+    bool     keep_width = false;
+    uint32_t width_before = 0;
+    uint32_t width_after = 0;
+    int      rc;
 
     if (indexRel->rd_indam->amoptions == cuvs_cagra_amoptions)
         cuvs_cagra_reloption_build_params(indexRel, &graph_degree,
                                           &intermediate_graph_degree, &build_algo);
     if (intermediate_graph_degree < graph_degree)
-        graph_degree = intermediate_graph_degree = 0;
+        keep_width = true;
     /* build_algo is not sent: compaction keeps cuVS's auto builder. */
-    return cuvs_ipc_compact(cuvs_socket_path,
-                            (uint32_t) MyDatabaseId,
-                            (uint32_t) index_oid,
-                            cuvs_resolve_index_dir_rel(indexRel),
-                            (uint32_t) graph_degree,
-                            (uint32_t) intermediate_graph_degree);
+    rc = cuvs_ipc_compact(cuvs_socket_path,
+                          (uint32_t) MyDatabaseId,
+                          (uint32_t) index_oid,
+                          cuvs_resolve_index_dir_rel(indexRel),
+                          keep_width ? 0 : (uint32_t) graph_degree,
+                          keep_width ? 0 : (uint32_t) intermediate_graph_degree,
+                          &width_before, &width_after);
+    /* A compaction ran when the daemon reports the width it built. One
+     * message per compaction and index; nothing when there was nothing to
+     * compact. A WARNING also reaches the server log from autovacuum. */
+    if (rc == CUVS_STATUS_OK && width_after > 0)
+    {
+        if (keep_width)
+            ereport(WARNING,
+                    (errmsg("pg_cuvs: compaction of index \"%s\" kept graph width %u: "
+                            "intermediate_graph_degree (%d) is below graph_degree (%d)",
+                            RelationGetRelationName(indexRel), width_after,
+                            intermediate_graph_degree, graph_degree),
+                     errhint("Set intermediate_graph_degree to at least graph_degree with "
+                             "ALTER INDEX ... SET; the next compaction or REINDEX then "
+                             "builds the graph at graph_degree.")));
+        /* Only a move to the configured width (an ALTERed graph_degree, or
+         * a graph an earlier version compacted to 64): cuVS also narrows the
+         * graph below the row count, which is no setting change. */
+        else if (width_before > 0 && width_before != width_after &&
+                 width_after == (uint32_t) graph_degree)
+            ereport(NOTICE,
+                    (errmsg("pg_cuvs: compaction rebuilt index \"%s\" at graph width %u (was %u)",
+                            RelationGetRelationName(indexRel), width_after, width_before),
+                     errdetail("The index's graph_degree is %d. The graph's GPU memory "
+                               "changes with its width.", graph_degree)));
+    }
+    return rc;
 }
 
 /* ambulkdelete: Phase 3A-4 records dead TIDs as tombstones instead of

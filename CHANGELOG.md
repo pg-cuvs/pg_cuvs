@@ -102,6 +102,16 @@ exists for 0.9.0.
 
 ### Fixed
 
+- A compaction that keeps a legacy CAGRA index's graph width because its
+  reloptions have `intermediate_graph_degree` below `graph_degree` (possible
+  after `ALTER INDEX ... SET`) now raises a WARNING naming the index, the two
+  settings and the kept width, with a hint; it used to be silent. A compaction
+  that moves the graph to `graph_degree` (after `ALTER INDEX ... SET
+  (graph_degree = ...)`, or for a graph an earlier version compacted to width
+  64) raises a NOTICE with the new and old width, since the graph's GPU memory
+  changes with it. One message per compaction and index; VACUUM does not fail.
+  Follow-up to #261.
+
 - Compaction of a legacy CAGRA index (VACUUM after deletions, or `pg_cuvs_compact()`)
   rebuilds the kept rows with the index's `graph_degree` and `intermediate_graph_degree`
   reloptions (#261). It used to rebuild them with cuVS's defaults, 64 and 128, while

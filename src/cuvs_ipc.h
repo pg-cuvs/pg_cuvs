@@ -1386,7 +1386,9 @@ int cuvs_ipc_compact(
     uint32_t    index_oid,
     const char *index_dir,
     uint32_t    graph_degree,              /* 0 = keep the resident width */
-    uint32_t    intermediate_graph_degree  /* 0 = 128 */
+    uint32_t    intermediate_graph_degree, /* 0 = 128 */
+    uint32_t   *width_before,              /* out, nullable: graph width before, 0 = none */
+    uint32_t   *width_after                /* out, nullable: graph width after, 0 = none */
 );
 
 int cuvs_ipc_set_vram_budget(

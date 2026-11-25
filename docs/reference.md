@@ -300,9 +300,17 @@ used cuVS's defaults, 64 and 128) and logs
 An index compacted to width 64 by an earlier version gets its `graph_degree`
 back at its next compaction. The values are read at each compaction, so a value
 set by `ALTER INDEX ... SET` applies from the next compaction, before any
-`REINDEX`. If the reloptions have `intermediate_graph_degree` below
+`REINDEX`, and the session that ran the compaction gets a NOTICE
+`pg_cuvs: compaction rebuilt index "..." at graph width N (was M)` when the width
+moved to `graph_degree` (a graph that cuVS narrows because the index has
+fewer rows than the degree gets no NOTICE). If the reloptions have `intermediate_graph_degree` below
 `graph_degree`, which `CREATE INDEX` rejects, compaction keeps the current
-graph width. Compaction initially preserves the auto
+graph width and raises a WARNING (`pg_cuvs: compaction of index "..." kept graph width
+N: intermediate_graph_degree (...) is below graph_degree (...)`, with a hint)
+instead of an error. Each message appears once per compaction and index, and
+not when there was nothing to compact. Under autovacuum the WARNING goes to
+the server log (the NOTICE does so only if `log_min_messages` is `notice` or
+lower). Compaction initially preserves the auto
 builder choice. A memory failure from NN-descent or an unresolved auto choice
 triggers one IVF-PQ merge retry after the first merge's allocations unwind.
 The retry caps the IVF-PQ internal search batch at 4096 rows (the ordinary

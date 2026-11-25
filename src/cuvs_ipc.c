@@ -3586,7 +3586,9 @@ cuvs_ipc_compact(
     uint32_t    index_oid,
     const char *index_dir,
     uint32_t    graph_degree,
-    uint32_t    intermediate_graph_degree)
+    uint32_t    intermediate_graph_degree,
+    uint32_t   *width_before,
+    uint32_t   *width_after)
 {
     int  sock = -1;
     int  rc   = CUVS_STATUS_ERROR;
@@ -3594,6 +3596,8 @@ cuvs_ipc_compact(
     char            dir_buf[256] = {0};
     CuvsReplyHeader hdr;
 
+    if (width_before) *width_before = 0;
+    if (width_after)  *width_after  = 0;
     sock = uds_connect_ex(socket_path, 120);
     if (sock < 0)
         return CUVS_STATUS_UNAVAILABLE;
@@ -3618,6 +3622,12 @@ cuvs_ipc_compact(
         goto cleanup;
 
     rc = (int)hdr.status;
+    /* A compaction that ran reports the graph width before and after it. */
+    if (rc == CUVS_STATUS_OK)
+    {
+        if (width_before) *width_before = hdr.latency_us;
+        if (width_after)  *width_after  = hdr.n_results;
+    }
 
 cleanup:
     if (sock >= 0) close(sock);
