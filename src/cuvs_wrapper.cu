@@ -15,6 +15,7 @@
 #include "cuvs_cagra_fold_capacity.h"
 #include "cuvs_cagra_fold.h"
 #include "cuvs_cagra_fold_sdk.hpp"
+#include "cuvs_page_overlay_gpu_rmm.hpp"
 #endif
 #include "cuvs_hnsw_build_common.h"
 #include "cuvs_ipc.h"   /* CUVS_METRIC_* (PG-free, CUDA-free defines) */
@@ -578,6 +579,29 @@ cuvs_rmm_pool_stats(int device_id, CuvsRmmPoolStats *out)
     out->peak_bytes = g_rmm_registry->usages[device_id]->get_peak_bytes();   /* I3-B */
     return 0;
 }
+
+#ifdef PGCUVS_BETA3A_GPU_FOLD
+void *
+cuvs_page_overlay_rmm_allocate(int device, std::size_t bytes, cudaStream_t stream) noexcept
+{
+    if (!g_rmm_registry || device < 0 || device >= CUVS_MAX_GPUS ||
+        !g_rmm_registry->usages[device])
+        return nullptr;
+    const RmmUpstream::NoGrowth existing_backing(g_rmm_registry->upstreams[device].get());
+    try {
+        return g_rmm_registry->usages[device]->allocate(rmm::cuda_stream_view{stream}, bytes);
+    } catch (...) {
+        cuvs_failed_allocation::clear();
+        return nullptr;
+    }
+}
+
+void
+cuvs_page_overlay_rmm_free(int device, void *data, std::size_t bytes, cudaStream_t stream) noexcept
+{
+    g_rmm_registry->usages[device]->deallocate(rmm::cuda_stream_view{stream}, data, bytes);
+}
+#endif
 
 /* I3-B: lock-free peak of live pool allocations since the last reset. */
 extern "C" size_t

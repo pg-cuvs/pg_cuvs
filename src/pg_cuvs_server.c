@@ -28,6 +28,9 @@
 
 #include "cuvs_ipc.h"
 #include "cuvs_page_overlay.h"
+#ifdef CUVS_PAGE_OVERLAY_GPU
+#include "cuvs_page_overlay_gpu.h"
+#endif
 #include "cuvs_util.h"
 #include "cuvs_hnsw_source.h"
 #include "cuvs_cache_policy.h"
@@ -446,6 +449,17 @@ static uint64_t g_page_daemon_id;
 static pthread_once_t g_page_daemon_once = PTHREAD_ONCE_INIT;
 static size_t g_page_graph_bytes[CUVS_MAX_GPUS];
 static CuvsPageOverlayBudget g_page_overlay_budget;
+#ifdef CUVS_PAGE_OVERLAY_GPU
+static uint32_t g_page_gpu_min_rows;
+static uint32_t g_page_gpu_cache_mib = 1024;
+static bool g_page_gpu_trace;
+static size_t g_page_gpu_live[CUVS_MAX_GPUS];
+static size_t g_page_gpu_reserved[CUVS_MAX_GPUS];
+/* A hold belongs to the registered graph that failed admission. */
+static uint64_t g_page_gpu_fold_waiting[CUVS_MAX_GPUS];
+static int g_page_gpu_host_fold_device = -1;
+static uint64_t g_page_gpu_host_fold_order; /* under g_index_mutex */
+#endif
 static CuvsPageOverlayChunk *g_retired_page_overlays;
 static _Thread_local PageCagraGraph *g_retired_fold_graphs;
 
@@ -1447,7 +1461,12 @@ total_vram_used(int device_id)
     /* ADR-070 Bug #2: include VRAM reserved by in-flight builds on this device
      * (released the mutex for the GPU build; not yet in g_indexes). */
     if (device_id >= 0 && device_id < CUVS_MAX_GPUS)
+    {
         total += g_pending_build_vram[device_id] + g_page_graph_bytes[device_id];
+#ifdef CUVS_PAGE_OVERLAY_GPU
+        total += g_page_gpu_live[device_id];
+#endif
+    }
     return total;
 }
 
@@ -15124,7 +15143,7 @@ initialize_page_daemon_id(void)
 #define PAGE_FOLD_IDLE_US (300 * UINT64_C(1000000))
 
 static PageCagraGraph *
-page_fold_pick_locked(int device, uint64_t now)
+page_fold_pick_locked(int device, uint64_t now, bool ignore_retry, uint64_t registered_order)
 {
     PageCagraGraph *best = NULL;
     uint64_t best_priority = 0;
@@ -15134,6 +15153,8 @@ page_fold_pick_locked(int device, uint64_t now)
     {
         uint64_t pending, priority;
 
+        if (registered_order && entry->registered_order != registered_order)
+            continue;
         if (entry->gpu != device || !entry->handle || !entry->n_slots ||
             !entry->overlay.boot_id || entry->overlay.covered_upto <= entry->folded)
         {
@@ -15144,7 +15165,7 @@ page_fold_pick_locked(int device, uint64_t now)
         if (!entry->fold_pending_since)
             entry->fold_pending_since = now;
         pending = entry->overlay.covered_upto - entry->folded;
-        if (entry->fold_candidate || entry->fold_retry_after > now ||
+        if (entry->fold_candidate || (!ignore_retry && entry->fold_retry_after > now) ||
             (pending < PAGE_FOLD_MIN_POSITIONS && now - entry->fold_pending_since < PAGE_FOLD_IDLE_US))
             continue;
         priority = pending * (1 + (entry->last_search >= recent ? (uint64_t) entry->hits : 0));
@@ -15156,6 +15177,26 @@ page_fold_pick_locked(int device, uint64_t now)
     }
     return best;
 }
+
+#ifdef CUVS_PAGE_OVERLAY_GPU
+static void
+page_gpu_clear_host_hold_locked(void)
+{
+    g_page_gpu_host_fold_order = 0;
+    __atomic_store_n(&g_page_gpu_host_fold_device, -1, __ATOMIC_RELEASE);
+}
+
+static uint32_t
+page_gpu_allocated_devices_locked(bool include_pending)
+{
+    uint32_t mask = 0;
+
+    for (int device = 0; device < CUVS_MAX_GPUS; ++device)
+        if (g_page_gpu_live[device] || (include_pending && g_page_gpu_reserved[device]))
+            mask |= UINT32_C(1) << device;
+    return mask;
+}
+#endif
 
 /* The retained prefix is immutable. Copy packed vectors into slot order and
  * fill dead positions from the first live row of their 64-slot batch. */
@@ -15237,17 +15278,60 @@ page_fold_run(int device)
     uint32_t wanted, dim, base_sample;
     uint32_t staging_status;
     bool offered = false;
+#ifdef CUVS_PAGE_OVERLAY_GPU
+    bool retried_after_reclaim = false;
+    uint64_t selected_order = 0;
+    bool host_fold_can_fit;
+    uint64_t fold_retry_after;
+    uint32_t reclaim_devices = 0;
+#endif
 
     (void) pthread_once(&g_page_daemon_once, initialize_page_daemon_id);
     if (!g_page_daemon_id)
         return;
 
+#ifdef CUVS_PAGE_OVERLAY_GPU
+retry_admission:
+#endif
     pthread_mutex_lock(&g_index_mutex);
     if (g_pending_build_vram[device] || g_unlocked_gpu_jobs || page_fold_should_yield(&device))
         goto defer;
-    parent = page_fold_pick_locked(device, now);
+#ifdef CUVS_PAGE_OVERLAY_GPU
+    if (g_page_gpu_fold_waiting[device] &&
+        !page_fold_pick_locked(device, now, true, g_page_gpu_fold_waiting[device]))
+        __atomic_store_n(&g_page_gpu_fold_waiting[device], 0, __ATOMIC_RELEASE);
+    if (g_page_gpu_host_fold_device == device &&
+        !page_fold_pick_locked(device, now, true, g_page_gpu_host_fold_order))
+        page_gpu_clear_host_hold_locked();
+    if (!retried_after_reclaim)
+    {
+        /* Host staging shares its budget across devices. Give its blocked
+         * fold the pinned workspaces from all devices before the retry. */
+        if (g_page_gpu_host_fold_device == device)
+            reclaim_devices = page_gpu_allocated_devices_locked(false);
+        if (g_page_gpu_fold_waiting[device] && g_page_gpu_live[device])
+            reclaim_devices |= UINT32_C(1) << device;
+        if (reclaim_devices)
+            goto reclaim_cache;
+    }
+#endif
+    parent = NULL;
+#ifdef CUVS_PAGE_OVERLAY_GPU
+    /* Give a ready hold owner the reclaimed capacity before ordinary
+     * priority can pick another graph. Backoff still applies. */
+    if (g_page_gpu_host_fold_device == device)
+        parent = page_fold_pick_locked(device, now, false, g_page_gpu_host_fold_order);
+    if (!parent && g_page_gpu_fold_waiting[device])
+        parent = page_fold_pick_locked(device, now, false, g_page_gpu_fold_waiting[device]);
+#endif
+    if (!parent)
+        parent = page_fold_pick_locked(device, now, false, 0);
     if (!parent)
         goto defer;
+#ifdef CUVS_PAGE_OVERLAY_GPU
+    selected_order = parent->registered_order;
+    fold_retry_after = parent->fold_retry_after;
+#endif
     parent->fold_retry_after = now + UINT64_C(1000000);
     pending = parent->overlay.covered_upto - parent->folded;
     wanted = pending < PAGE_FOLD_MAX_POSITIONS ? (uint32_t) pending : PAGE_FOLD_MAX_POSITIONS;
@@ -15264,7 +15348,22 @@ page_fold_run(int device)
     limit = budget_eff_bytes(device);
     used = total_vram_used(device);
     if ((limit && (used >= limit || peak > limit - used)) || peak > gpu_free_vram_bytes(device))
+    {
+#ifdef CUVS_PAGE_OVERLAY_GPU
+        if (!retried_after_reclaim && g_page_gpu_live[device])
+        {
+            /* Stop new scoring and allocations before trying to surrender
+             * optional backing. The active search owns the workspace until
+             * its result has been assembled. Retry without a stale graph pin. */
+            if (!g_page_gpu_fold_waiting[device])
+                __atomic_store_n(&g_page_gpu_fold_waiting[device], selected_order, __ATOMIC_RELEASE);
+            parent->fold_retry_after = fold_retry_after;
+            reclaim_devices = UINT32_C(1) << device;
+            goto reclaim_cache;
+        }
+#endif
         goto defer;
+    }
 
     event = (CuvsPageFoldEvent) {
         .length = sizeof(event), .db_oid = parent->db_oid, .index_oid = parent->index_oid,
@@ -15283,6 +15382,10 @@ page_fold_run(int device)
     reserve_build_vram(peak, device);
     g_fold_claim[device] = peak;
     __atomic_store_n(&g_fold_active[device], true, __ATOMIC_SEQ_CST);
+#ifdef CUVS_PAGE_OVERLAY_GPU
+    if (g_page_gpu_fold_waiting[device] == selected_order)
+        __atomic_store_n(&g_page_gpu_fold_waiting[device], 0, __ATOMIC_RELEASE);
+#endif
     uint64_t started = admission_mono_us();
     pthread_mutex_unlock(&g_index_mutex);
     LOG_INFO("[page_fold_begin] gpu=%d db=%u index=%u positions=%u reserve=%zu mono_us=%llu daemon_id=%llu\n",
@@ -15290,6 +15393,14 @@ page_fold_run(int device)
              (unsigned long long) started, (unsigned long long) event.daemon_id);
 
     host_bytes = (size_t) wanted * dim * sizeof(float);
+#ifdef CUVS_PAGE_OVERLAY_GPU
+    size_t staging_charge;
+    uint64_t minimum_mirror = (retained / (shape.rows + wanted)) * (shape.rows + 1);
+
+    host_fold_can_fit = cuvs_page_overlay_allocation_bytes(host_bytes + wanted, &staging_charge) &&
+        staging_charge <= g_page_overlay_budget.limit &&
+        minimum_mirror <= g_page_overlay_budget.limit - staging_charge;
+#endif
     staging_status = cuvs_page_overlay_alloc(&g_page_overlay_budget, &(CuvsPageOverlayRequest) {0},
                                              host_bytes + wanted, &staging);
     if (staging_status == CUVS_STATUS_OK)
@@ -15313,6 +15424,10 @@ page_fold_run(int device)
             retained = retained / (shape.rows + wanted) * (shape.rows + event.positions);
             size_t mirrors = (size_t) retained;
 
+#ifdef CUVS_PAGE_OVERLAY_GPU
+            host_fold_can_fit = staging->charged_bytes <= g_page_overlay_budget.limit &&
+                mirrors <= g_page_overlay_budget.limit - staging->charged_bytes;
+#endif
             if (cuvs_page_overlay_reserve(&g_page_overlay_budget, mirrors))
             {
                 host_mirror_charge = mirrors;
@@ -15358,6 +15473,25 @@ page_fold_run(int device)
         release_build_vram(peak, device);
         g_fold_claim[device] = 0;
     }
+#ifdef CUVS_PAGE_OVERLAY_GPU
+    /* The pool may have enough aggregate bytes and still refuse a backing
+     * allocation. Let the next fold attempt reclaim before it tries again. */
+    if (g_page_gpu_live[device] && status == CUVS_CAGRA_FOLD_OOM && !g_page_gpu_fold_waiting[device])
+        __atomic_store_n(&g_page_gpu_fold_waiting[device], selected_order, __ATOMIC_RELEASE);
+    if (g_page_gpu_min_rows && staging_status == CUVS_STATUS_PAGE_OVERLAY_HOST_FULL && host_fold_can_fit &&
+        page_gpu_allocated_devices_locked(true))
+    {
+        if (g_page_gpu_host_fold_device < 0)
+        {
+            g_page_gpu_host_fold_order = selected_order;
+            __atomic_store_n(&g_page_gpu_host_fold_device, device, __ATOMIC_RELEASE);
+        }
+    }
+    else if (g_page_gpu_host_fold_device == device && g_page_gpu_host_fold_order == selected_order)
+        /* This fold reached an actual retry. With no optional claims left,
+         * further suspension would not make its host budget larger. */
+        page_gpu_clear_host_hold_locked();
+#endif
     __atomic_store_n(&g_fold_active[device], false, __ATOMIC_SEQ_CST);
     uint64_t finished = admission_mono_us();
     pthread_cond_broadcast(&g_fold_finished);
@@ -15370,7 +15504,41 @@ page_fold_run(int device)
     return;
 
 defer:
+#ifdef CUVS_PAGE_OVERLAY_GPU
+    if (selected_order)
+    {
+        /* A retry reached selection and failed before staging. Keep a hold
+         * only while there are still optional allocations to surrender. */
+        if (g_page_gpu_host_fold_device == device && g_page_gpu_host_fold_order == selected_order &&
+            !page_gpu_allocated_devices_locked(true))
+            page_gpu_clear_host_hold_locked();
+        if (g_page_gpu_fold_waiting[device] == selected_order &&
+            !g_page_gpu_live[device] && !g_page_gpu_reserved[device])
+            __atomic_store_n(&g_page_gpu_fold_waiting[device], 0, __ATOMIC_RELEASE);
+    }
+#endif
     pthread_mutex_unlock(&g_index_mutex);
+    return;
+#ifdef CUVS_PAGE_OVERLAY_GPU
+reclaim_cache:
+    pthread_mutex_unlock(&g_index_mutex);
+    bool reclaimed = true;
+
+    for (int cached = 0; cached < CUVS_MAX_GPUS; ++cached)
+    {
+        if (!(reclaim_devices & (UINT32_C(1) << cached)))
+            continue;
+        if (!cuvs_page_overlay_gpu_reclaim(cached))
+            reclaimed = false;
+        else
+            LOG_INFO("[page_overlay_gpu_reclaim] gpu=%d fold_gpu=%d released cache\n", cached, device);
+    }
+    if (!reclaimed)
+        return;
+    retried_after_reclaim = true;
+    selected_order = 0;
+    goto retry_admission;
+#endif
 }
 
 static void *
@@ -16095,6 +16263,67 @@ page_resident_recv_advance(int fd, CuvsPageResidentAdvance *advance)
     return false;
 }
 
+#ifdef CUVS_PAGE_OVERLAY_GPU
+static bool
+page_gpu_reserve(int device, size_t bytes)
+{
+    CuvsRmmPoolStats stats;
+    size_t cap = (size_t) g_page_gpu_cache_mib * 1024 * 1024;
+    bool reserved = false;
+
+    pthread_mutex_lock(&g_index_mutex);
+    size_t claimed = g_page_gpu_live[device] + g_page_gpu_reserved[device];
+    size_t limit = budget_eff_bytes(device);
+    size_t used = total_vram_used(device);
+
+    /* Cache hits allocate nothing during a fold. Defer new RMM allocations
+     * while a fold is live, and leave the rest of the backing to claims
+     * already made by the existing admission controller. */
+    if (!g_fold_active[device] && !g_page_gpu_fold_waiting[device] && g_page_gpu_host_fold_device < 0 &&
+        claimed <= cap && bytes <= cap - claimed &&
+        (!limit || (used <= limit && bytes <= limit - used)) &&
+        cuvs_rmm_pool_stats(device, &stats) == 0 && stats.used_bytes <= stats.reserved_bytes)
+    {
+        uint64_t available = stats.reserved_bytes - stats.used_bytes;
+        size_t pending = g_pending_rmm_build_vram[device];
+
+        if (pending <= available && bytes <= available - pending)
+        {
+            g_page_gpu_reserved[device] += bytes;
+            reserve_build_vram(bytes, device);
+            reserved = true;
+        }
+    }
+    pthread_mutex_unlock(&g_index_mutex);
+    return reserved;
+}
+
+static void
+page_gpu_finish(int device, size_t bytes, bool resident)
+{
+    pthread_mutex_lock(&g_index_mutex);
+    g_page_gpu_reserved[device] -= bytes;
+    release_build_vram(bytes, device);
+    if (resident)
+        g_page_gpu_live[device] += bytes;
+    pthread_mutex_unlock(&g_index_mutex);
+}
+
+static void
+page_gpu_release(int device, size_t bytes)
+{
+    pthread_mutex_lock(&g_index_mutex);
+    g_page_gpu_live[device] -= bytes;
+    pthread_mutex_unlock(&g_index_mutex);
+}
+
+static const CuvsPageOverlayGpuAdmission page_gpu_admission = {
+    .reserve = page_gpu_reserve,
+    .finish = page_gpu_finish,
+    .release = page_gpu_release,
+};
+#endif
+
 /* The connection is the cursor. It owns the query, fixed range and graph
  * pin for every reply. Pending distances are computed once. A larger ANN
  * request replaces the prior base stream because ANN prefixes can change. */
@@ -16129,16 +16358,38 @@ serve_page_resident_search(int fd, const CuvsCmdFrame *cmd, const CuvsPageOverla
         goto fail;
     }
 
-    for (const CuvsPageOverlayChunk *chunk = snapshot; chunk; chunk = chunk->next)
+#ifdef CUVS_PAGE_OVERLAY_GPU
+    uint64_t score_start = g_page_gpu_trace ? admission_mono_us() : 0;
+    uint32_t gpu_rows = 0;
+
+    if (g_page_gpu_min_rows && !g_shutdown &&
+        __atomic_load_n(&g_page_gpu_host_fold_device, __ATOMIC_ACQUIRE) < 0 &&
+        !__atomic_load_n(&g_page_gpu_fold_waiting[graph->gpu], __ATOMIC_ACQUIRE))
+        gpu_rows = cuvs_page_overlay_gpu_collect(graph->gpu, g_page_gpu_min_rows,
+            &page_gpu_admission, &g_page_overlay_budget, snapshot, request->from,
+            &request->base, query, cmd, pending, &npending);
+
+    if (!gpu_rows)
+#endif
     {
-        if (chunk->from < request->base.folded &&
-            request->base.folded - chunk->from >= chunk->positions)
-            break;
-        cuvs_page_overlay_collect_range(chunk, request->base.folded, request->from,
-                                         &request->base, query, cmd, pending, &npending);
+        for (const CuvsPageOverlayChunk *chunk = snapshot; chunk; chunk = chunk->next)
+        {
+            if (chunk->from < request->base.folded &&
+                request->base.folded - chunk->from >= chunk->positions)
+                break;
+            cuvs_page_overlay_collect_range(chunk, request->base.folded, request->from,
+                                             &request->base, query, cmd, pending, &npending);
+        }
     }
     cuvs_page_overlay_collect_range(supplement, request->from, request->base.tail,
                                      &request->base, query, cmd, pending, &npending);
+#ifdef CUVS_PAGE_OVERLAY_GPU
+    if (g_page_gpu_trace)
+        LOG_INFO("[page_overlay_gpu_score] gpu=%d index=%u resident_positions=%llu pending_rows=%d cuda_rows=%u score_us=%llu\n",
+                 graph->gpu, graph->index_oid,
+                 (unsigned long long) (request->from - request->base.folded), npending, gpu_rows,
+                 (unsigned long long) (admission_mono_us() - score_start));
+#endif
     if (npending > 1)
         qsort(pending, (size_t) npending, sizeof(*pending),
               cmd->metric == CUVS_METRIC_IP ? page_resident_descending : page_resident_ascending);
@@ -17441,6 +17692,27 @@ main(int argc, char **argv)
                 return 1;
             }
         }
+#ifdef CUVS_PAGE_OVERLAY_GPU
+        else if (strcmp(argv[i], "--page-overlay-gpu-min-rows") == 0)
+        {
+            if (i + 1 >= argc || cuvs_parse_rmm_pool_mb(argv[++i], &g_page_gpu_min_rows) != 0 ||
+                g_page_gpu_min_rows > CUVS_PAGE_OVERLAY_MAX)
+            {
+                LOG_ERROR("--page-overlay-gpu-min-rows requires an integer from 0 to %u\n",
+                          CUVS_PAGE_OVERLAY_MAX);
+                return 1;
+            }
+        }
+        else if (strcmp(argv[i], "--page-overlay-gpu-cache-mb") == 0)
+        {
+            if (i + 1 >= argc || cuvs_parse_rmm_pool_mb(argv[++i], &g_page_gpu_cache_mib) != 0 ||
+                (uint64_t) g_page_gpu_cache_mib * 1024 * 1024 > SIZE_MAX)
+            {
+                LOG_ERROR("--page-overlay-gpu-cache-mb requires a nonnegative integer MiB value\n");
+                return 1;
+            }
+        }
+#endif
         else if (strcmp(argv[i], "--rmm-scratch-permille") == 0)
         {
             if (i + 1 >= argc ||
@@ -17698,6 +17970,22 @@ main(int argc, char **argv)
         }
     }
     LOG_INFO("RMM initial pool reservation: %u MiB per GPU (0=disabled)\n", g_rmm_pool_mb);
+#ifdef CUVS_PAGE_OVERLAY_GPU
+    if (g_page_gpu_min_rows)
+    {
+        if (!g_rmm_pool_mb || !g_page_gpu_cache_mib)
+        {
+            LOG_ERROR("GPU page overlay scoring requires an RMM pool and a positive cache budget\n");
+            return 1;
+        }
+        cuvs_page_overlay_gpu_init();
+        LOG_INFO("GPU page overlay scoring: min_rows=%u cache_mib_per_gpu=%u\n",
+                  g_page_gpu_min_rows, g_page_gpu_cache_mib);
+    }
+    const char *page_gpu_trace = getenv("CUVS_PAGE_OVERLAY_GPU_TRACE");
+
+    g_page_gpu_trace = page_gpu_trace && strcmp(page_gpu_trace, "1") == 0;
+#endif
     LOG_INFO("RMM maximum pool quota: %u%% of total device memory\n",
              g_rmm_pool_mb > 0 ? g_rmm_pool_max_percent : 0);
     LOG_INFO("CAGRA build scratch: rmm_scratch_permille=%u (admission N = final + "
@@ -17942,6 +18230,14 @@ main(int argc, char **argv)
      * serialize / file I/O). In-flight detached connection threads holding
      * g_index_mutex are waited on by the lock inside graceful_shutdown. */
     graceful_shutdown();
+
+#ifdef CUVS_PAGE_OVERLAY_GPU
+    /* Detached connections can still hold GPU scoring or mirror references.
+     * Let process exit retire them and the CUDA context together, after the
+     * existing index saves and socket cleanup. */
+    if (g_page_gpu_min_rows)
+        _Exit(EXIT_SUCCESS);
+#endif
 
     return 0;
 }
