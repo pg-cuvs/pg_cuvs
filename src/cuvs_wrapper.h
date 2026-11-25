@@ -353,6 +353,8 @@ int            cuvs_ivfpq_search(CuvsIvfPqIndex index, const float *query_vec,
 int            cuvs_ivfpq_serialize(CuvsIvfPqIndex index, const char *path,
                                      int device_id);
 CuvsIvfPqIndex cuvs_ivfpq_deserialize(const char *path, int device_id);
+/* Consume the open index file at its current offset and close it on return. */
+CuvsIvfPqIndex cuvs_ivfpq_deserialize_fd(int fd, int device_id);
 void           cuvs_ivfpq_free(CuvsIvfPqIndex index, int device_id);
 
 /*

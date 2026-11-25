@@ -3180,7 +3180,6 @@ load_index(uint32_t db_oid, uint32_t index_oid, CuvsRequester rq)
             goto done;
         }
         reload_bytes = cuvs_admission_estimate_ivfpq_reload_bytes((uint64_t) st.st_size);
-        snprintf(ivfpq_path, sizeof(ivfpq_path), "/proc/self/fd/%d", ivfpq_fd);
     }
     else
         /* CAGRA graph_degree is not persisted in .tids: use the default. */
@@ -3230,7 +3229,12 @@ load_index(uint32_t db_oid, uint32_t index_oid, CuvsRequester rq)
     CuvsIvfPqIndex ivfpq_handle = NULL;
     if (!handle)
     {
-        if (ivfpq_reload || access(ivfpq_path, F_OK) == 0)
+        if (ivfpq_reload)
+        {
+            ivfpq_handle = cuvs_ivfpq_deserialize_fd(ivfpq_fd, target_gpu);
+            ivfpq_fd = -1;    /* consumed by the deserializer */
+        }
+        else if (access(ivfpq_path, F_OK) == 0)
             ivfpq_handle = cuvs_ivfpq_deserialize(ivfpq_path, target_gpu);
         if (!ivfpq_handle)
         {

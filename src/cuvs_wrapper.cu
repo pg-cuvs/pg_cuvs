@@ -60,6 +60,7 @@
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>   /* Phase 3L: half precision for brute-force (cuvs.bf_precision) */
 #include <algorithm>
+#include <cstdio>
 #include <cstring>
 #include <cerrno>
 #include <sstream>
@@ -77,6 +78,7 @@
 #include <utility>
 #include <variant>
 #include <filesystem>
+#include <ext/stdio_filebuf.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/file.h>
@@ -2767,14 +2769,24 @@ cuvs_ivfpq_serialize(CuvsIvfPqIndex index, const char *path, int device_id)
 }
 
 extern "C" CuvsIvfPqIndex
-cuvs_ivfpq_deserialize(const char *path, int device_id)
+cuvs_ivfpq_deserialize_fd(int fd, int device_id)
 {
-    if (!path)
+    if (fd < 0)
         return nullptr;
+    std::unique_ptr<FILE, decltype(&std::fclose)> file(fdopen(fd, "rb"), std::fclose);
+    if (!file) {
+        close(fd);
+        return nullptr;
+    }
     try {
+        /* The filebuf borrows FILE*. Keep its owner alive until it is gone. */
+        __gnu_cxx::stdio_filebuf<char> buffer(file.get(), std::ios::in | std::ios::binary);
+        if (!buffer.is_open())
+            return nullptr;
+        std::istream input(&buffer);
         PooledRes _pr(device_id); raft::device_resources &res = _pr.get();
         cuvs::neighbors::ivf_pq::index<int64_t> idx(res);
-        cuvs::neighbors::ivf_pq::deserialize(res, std::string(path), &idx);
+        cuvs::neighbors::ivf_pq::deserialize(res, input, &idx);
         res.sync_stream();
         _pr.fence_check();
         int64_t  n   = (int64_t)idx.size();
@@ -2788,6 +2800,14 @@ cuvs_ivfpq_deserialize(const char *path, int device_id)
         fprintf(stderr, "[cuvs_ivfpq_deserialize] unknown exception\n");
         return nullptr;
     }
+}
+
+extern "C" CuvsIvfPqIndex
+cuvs_ivfpq_deserialize(const char *path, int device_id)
+{
+    if (!path)
+        return nullptr;
+    return cuvs_ivfpq_deserialize_fd(open(path, O_RDONLY | O_CLOEXEC), device_id);
 }
 
 extern "C" void

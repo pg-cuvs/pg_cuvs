@@ -63,15 +63,20 @@ sql 'CREATE EXTENSION vector; CREATE EXTENSION pg_cuvs;
      SELECT setseed(0.42);
      INSERT INTO pq_items SELECT g, array_agg(random()::real ORDER BY i)::vector
        FROM generate_series(1, 8192) g CROSS JOIN generate_series(1, 128) i GROUP BY g;
-     CREATE TABLE cagra_items AS SELECT * FROM pq_items;
      CREATE INDEX pq_idx ON pq_items USING ivfpq (v vector_l2_ops)
-       WITH (n_lists = 32, pq_bits = 8, pq_dim = 16);
-     CREATE INDEX cagra_idx ON cagra_items USING cagra (v vector_l2_ops)
+       WITH (n_lists = 32, pq_bits = 8, pq_dim = 16);' >/dev/null
+# The vector addition has no result typmod, so this is a legacy expression
+# index even when the extension is built with CUVS_PAGE_FORMAT=1.
+sql 'CREATE INDEX cagra_idx ON pq_items USING cagra ((v + v) vector_l2_ops)
        WITH (graph_degree = 32, intermediate_graph_degree = 64);' >/dev/null
 db_oid=$(sql 'SELECT oid FROM pg_database WHERE datname = current_database()')
 pq_oid=$(sql "SELECT 'pq_idx'::regclass::oid")
 cagra_oid=$(sql "SELECT 'cagra_idx'::regclass::oid")
 artifact=$indexes/${db_oid}_${pq_oid}.ivfpq
+if [[ ! -s "$indexes/${db_oid}_${cagra_oid}.cagra" ]]; then
+    echo "CAGRA control did not create a legacy artifact" >&2
+    exit 2
+fi
 stop_daemon
 
 artifact_bytes=$(stat -c '%s' "$artifact")
@@ -118,11 +123,12 @@ fi
 
 [[ $(sql "SELECT pg_cuvs_unload('pq_idx')") == unloaded ]]
 mv "$artifact" "$artifact.saved"
-for fixture in missing empty directory unreadable; do
+for fixture in missing empty directory unreadable corrupt; do
     case "$fixture" in
         empty) touch "$artifact" ;;
         directory) rm "$artifact"; mkdir "$artifact" ;;
         unreadable) rmdir "$artifact"; cp "$artifact.saved" "$artifact"; chmod 000 "$artifact" ;;
+        corrupt) rm "$artifact"; printf 'bad' >"$artifact" ;;
     esac
     if sql "SELECT pg_cuvs_load('pq_idx')" >"$tmp/file-error.log" 2>&1; then
         echo "IVF-PQ loaded with a $fixture artifact" >&2
