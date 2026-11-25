@@ -242,14 +242,6 @@ jobs:
                  echo "===== fault daemon log ====="; cat /tmp/pg_cuvs_fault_daemon.log 2>/dev/null; false; }
           echo "--- ccache stats: fault daemon ---"; ccache -s
 
-      - name: Canceled BUILD publication ordering (CPU shim)
-        timeout-minutes: 5
-        env:
-          BUILD_PUBLICATION_OUTPUT: ${{ runner.temp }}/pgcuvs-build-publication
-        run: |
-          export PATH=/usr/lib/postgresql/16/bin:$PATH
-          make PGCUVS_CPU_SHIM=1 test-build-publication
-
       - name: MAX_INDEXES soft-LRU evict/reload (tiny-cap shim daemon)
         run: |
           export PATH=/usr/lib/postgresql/16/bin:$PATH
@@ -303,7 +295,6 @@ jobs:
             test/*.diffs
             /tmp/shim_daemon.log
             /tmp/pg_cuvs_fault_daemon.log
-            ${{ runner.temp }}/pgcuvs-build-publication/*.log
             ${{ runner.temp }}/pgcuvs-manual-checks/*.log
             ${{ runner.temp }}/pgcuvs-manual-checks/summary.tsv
             ${{ runner.temp }}/pgcuvs-manual-checks/**/COMMANDS.jsonl

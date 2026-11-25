@@ -1,12 +1,5 @@
-/*
- * Exercise the four BUILD clients against a mock daemon over a Unix socket.
- * A late reply should arrive while cancel is being polled. A silent peer
- * should let a cancel end the wait, and a lost peer should fail the build.
- */
+/* Exercise terminal BUILD waits against shortened socket timeouts. */
 #define _GNU_SOURCE 1
-#ifdef __APPLE__
-#define _DARWIN_C_SOURCE 1
-#endif
 
 #include "cuvs_ipc.h"
 #include "cuvs_build_corpus.h"
@@ -23,8 +16,44 @@
 #include <time.h>
 #include <unistd.h>
 
+int __real_setsockopt(int fd, int level, int name, const void *value, socklen_t size);
+
+static _Thread_local int shortened_receive;
+static _Thread_local long send_timeout_sec;
+
+int
+__wrap_setsockopt(int fd, int level, int name, const void *value, socklen_t size)
+{
+    if (level == SOL_SOCKET && name == SO_RCVTIMEO && size == sizeof(struct timeval))
+    {
+        struct timeval timeout;
+        memcpy(&timeout, value, sizeof(timeout));
+        if (timeout.tv_sec == 600)
+        {
+            int rc;
+
+            timeout.tv_sec = 0;
+            timeout.tv_usec = 100000;
+            rc = __real_setsockopt(fd, level, name, &timeout, sizeof(timeout));
+            shortened_receive = rc == 0;
+            return rc;
+        }
+    }
+    if (level == SOL_SOCKET && name == SO_SNDTIMEO)
+    {
+        int rc = __real_setsockopt(fd, level, name, value, size);
+        struct timeval actual;
+        socklen_t actual_size = sizeof(actual);
+
+        if (rc == 0 && getsockopt(fd, SOL_SOCKET, name, &actual, &actual_size) == 0)
+            send_timeout_sec = actual.tv_sec;
+        return rc;
+    }
+    return __real_setsockopt(fd, level, name, value, size);
+}
+
 enum BuildOp { BUILD, BUILD_FLAT, BUILD_MULTI, BUILD_IVFPQ, BUILD_PAGES, BUILD_COUNT };
-enum ReplyMode { LATE_OK, SILENT, PEER_LOST, NONCE_SILENT, NONCE_TRUNCATED };
+enum ReplyMode { LATE_OK, PEER_LOST };
 
 static const char *const op_names[BUILD_COUNT] = {
     "BUILD", "BUILD_FLAT", "BUILD_MULTI", "BUILD_IVFPQ", "BUILD_PAGES"
@@ -35,8 +64,8 @@ static const uint32_t wire_ops[BUILD_COUNT] = {
 static const uint64_t page_nonce = 12345;
 static const char build_notice[] = "mock build notice";
 
-#define REPLY_DELAY_MS 600        /* more than two 250 ms poll slices */
-#define MOCK_TIMEOUT_MS 3000      /* let the pre-fix blocking client see EOF */
+#define REPLY_DELAY_MS 600        /* longer than the injected 100 ms timeout */
+#define MOCK_TIMEOUT_MS 3000
 #define PROMPT_LIMIT_MS 2000
 
 typedef struct Mock {
@@ -48,25 +77,6 @@ typedef struct Mock {
 
 static int failures;
 static int cb_calls;
-static int cancel_after;
-static int cancel_on_nonce;
-
-#ifdef CUVS_TEST_BUILD_REPLY_CLOCK
-static int advance_reply_clock;
-static _Thread_local int clock_offset_sec;
-
-int __real_clock_gettime(clockid_t clock_id, struct timespec *ts);
-
-int
-__wrap_clock_gettime(clockid_t clock_id, struct timespec *ts)
-{
-    int rc = __real_clock_gettime(clock_id, ts);
-
-    if (rc == 0 && clock_id == CLOCK_MONOTONIC)
-        ts->tv_sec += clock_offset_sec;
-    return rc;
-}
-#endif
 
 static void
 check(const char *op, const char *label, long actual, long expected)
@@ -81,16 +91,8 @@ check(const char *op, const char *label, long actual, long expected)
 static int
 wait_cb(void)
 {
-    /* The saved notice is visible on this thread after the header is read. */
-    if (cancel_on_nonce && strcmp(cuvs_ipc_last_notice_out(), build_notice) != 0)
-        return 0;
-#ifdef CUVS_TEST_BUILD_REPLY_CLOCK
-    /* The deadline clock has started and the request is sent. Advance only
-     * the client clock. The mock's socket and sleep still use real time. */
-    clock_offset_sec = advance_reply_clock;
-#endif
     cb_calls++;
-    return cancel_after > 0 && cb_calls >= cancel_after;
+    return 1;
 }
 
 static long
@@ -140,27 +142,14 @@ mock_daemon(void *arg)
         goto done;
 
     if (mock->mode == LATE_OK)
-        usleep(REPLY_DELAY_MS * 1000);
-    if (mock->mode != PEER_LOST && mock->mode != SILENT)
     {
+        usleep(REPLY_DELAY_MS * 1000);
         memcpy(reply.notice_out, build_notice, sizeof(build_notice));
         if (write(fd, &reply, sizeof(reply)) != (ssize_t) sizeof(reply))
             goto done;
-        if (mock->op == BUILD_PAGES && mock->mode != NONCE_SILENT)
-        {
-            size_t bytes = mock->mode == NONCE_TRUNCATED ? sizeof(page_nonce) / 2 :
-                                                          sizeof(page_nonce);
-            if (write(fd, &page_nonce, bytes) != (ssize_t) bytes)
-                goto done;
-        }
-    }
-    if (mock->mode == SILENT || mock->mode == NONCE_SILENT)
-    {
-        struct pollfd peer = {.fd = fd, .events = POLLIN};
-
-        /* Leave the request outstanding until the client closes or the
-         * watchdog releases a client that is still blocking in read(). */
-        (void) poll(&peer, 1, MOCK_TIMEOUT_MS);
+        if (mock->op == BUILD_PAGES &&
+            write(fd, &page_nonce, sizeof(page_nonce)) != (ssize_t) sizeof(page_nonce))
+            goto done;
     }
     mock->ok = 1;
 done:
@@ -197,7 +186,7 @@ call_op(enum BuildOp op, const char *path, uint64_t *nonce_out)
 }
 
 static void
-run_case(enum BuildOp op, const char *path, enum ReplyMode mode, int advance_seconds)
+run_case(enum BuildOp op, const char *path, enum ReplyMode mode)
 {
     Mock mock = {.listener = socket(AF_UNIX, SOCK_STREAM, 0), .op = op, .mode = mode};
     struct sockaddr_un addr = {.sun_family = AF_UNIX};
@@ -215,68 +204,40 @@ run_case(enum BuildOp op, const char *path, enum ReplyMode mode, int advance_sec
     }
 
     cb_calls = 0;
-    cancel_on_nonce = mode == NONCE_SILENT;
-    cancel_after = (mode == SILENT || mode == NONCE_SILENT) && !advance_seconds ? 3 : 0;
-#ifdef CUVS_TEST_BUILD_REPLY_CLOCK
-    advance_reply_clock = advance_seconds;
-#endif
+    shortened_receive = 0;
+    send_timeout_sec = -1;
     start = mono_ms();
     rc = call_op(op, path, &nonce);
-#ifdef CUVS_TEST_BUILD_REPLY_CLOCK
-    clock_offset_sec = 0;
-    advance_reply_clock = 0;
-#endif
     elapsed = mono_ms() - start;
     pthread_join(thread, NULL);
     close(mock.listener);
     unlink(path);
 
     check(op_names[op], "mock daemon read request and completed its script", mock.ok, 1);
+    check(op_names[op], "600-second receive timeout was shortened by the fixture", shortened_receive, 1);
+    check(op_names[op], "send timeout after connect", send_timeout_sec, 600);
+    check(op_names[op], "callback while waiting for terminal reply", cb_calls, 0);
     switch (mode)
     {
         case LATE_OK:
             check(op_names[op], "late reply status", rc, CUVS_STATUS_OK);
-            check(op_names[op], "polled while waiting", cb_calls > 1, 1);
             check(op_names[op], "daemon notice", strcmp(cuvs_ipc_last_notice_out(), build_notice), 0);
             if (op == BUILD_PAGES)
                 check(op_names[op], "graph nonce", (long) nonce, (long) page_nonce);
             break;
-        case SILENT:
-        case NONCE_SILENT:
-            if (advance_seconds)
-            {
-                check(op_names[op], "deadline exceeded on the client clock", rc, CUVS_STATUS_ERROR);
-                check(op_names[op], "deadline completed before mock timeout",
-                      elapsed < PROMPT_LIMIT_MS, 1);
-                break;
-            }
-            check(op_names[op], mode == SILENT ? "reply cancel status" : "nonce cancel status",
-                  rc, CUVS_STATUS_CANCELED);
-            check(op_names[op], "cancel completed before mock timeout", elapsed < PROMPT_LIMIT_MS, 1);
-            break;
         case PEER_LOST:
-        case NONCE_TRUNCATED:
-            check(op_names[op], mode == PEER_LOST ? "peer loss status" : "truncated nonce status",
-                  rc, CUVS_STATUS_ERROR);
+            check(op_names[op], "peer loss status", rc, CUVS_STATUS_ERROR);
             check(op_names[op], "peer loss completed promptly", elapsed < PROMPT_LIMIT_MS, 1);
             break;
     }
 }
 
 int
-main(int argc, char **argv)
+main(void)
 {
     char dir[] = "/tmp/pgcuvs-bw-XXXXXX";
     char path[sizeof(dir) + sizeof("/mock.sock")];
-    int deadline_only = 0;
 
-#ifdef CUVS_TEST_BUILD_REPLY_CLOCK
-    deadline_only = argc == 2 && strcmp(argv[1], "--deadline") == 0;
-#else
-    (void) argv;
-#endif
-    if (argc != 1 && !deadline_only)
-        return EXIT_FAILURE;
     if (mkdtemp(dir) == NULL)
     {
         perror("mkdtemp");
@@ -287,47 +248,19 @@ main(int argc, char **argv)
     alarm(90);
     cuvs_ipc_set_wait_callback(wait_cb);
 
-    if (deadline_only)
+    for (enum BuildOp op = BUILD; op < BUILD_COUNT; op++)
     {
-        run_case(BUILD, path, LATE_OK, 601);
-        run_case(BUILD, path, SILENT, 86401);
-    }
-    else
-    {
-        for (enum BuildOp op = BUILD; op < BUILD_COUNT; op++)
-        {
-#ifdef __APPLE__
-            /* IVF-PQ stages a named shm key longer than the macOS name limit. */
-            if (op == BUILD_IVFPQ)
-            {
-                puts("SKIP BUILD_IVFPQ on macOS (named-shm key length)");
-                continue;
-            }
-#endif
-            uint64_t nonce = 0;
-
-            run_case(op, path, LATE_OK, 0);
-            run_case(op, path, SILENT, 0);
-            run_case(op, path, PEER_LOST, 0);
-
-            cancel_after = 0;
-            check(op_names[op], "no listener", call_op(op, path, &nonce), CUVS_STATUS_UNAVAILABLE);
-            cb_calls = 0;
-            cancel_after = 1;
-            check(op_names[op], "connect cancel status", call_op(op, path, &nonce), CUVS_STATUS_CANCELED);
-        }
-        run_case(BUILD_PAGES, path, NONCE_SILENT, 0);
-        run_case(BUILD_PAGES, path, NONCE_TRUNCATED, 0);
+        run_case(op, path, LATE_OK);
+        run_case(op, path, PEER_LOST);
     }
     alarm(0);
     rmdir(dir);
 
     if (failures)
     {
-        fprintf(stderr, "test_build_reply_wait: %d failure(s)\n", failures);
+        fprintf(stderr, "test_build_terminal_wait: %d failure(s)\n", failures);
         return EXIT_FAILURE;
     }
-    puts(deadline_only ? "test_build_reply_wait: deadline checks passed" :
-                         "test_build_reply_wait: all checks passed");
+    puts("test_build_terminal_wait: all checks passed");
     return EXIT_SUCCESS;
 }

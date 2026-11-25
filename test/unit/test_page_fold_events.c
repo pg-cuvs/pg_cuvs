@@ -1,4 +1,5 @@
 /* Standalone CPU test of the daemon wire handlers and graph ownership. */
+#define CUVS_PAGE_FORMAT
 #define main pg_cuvs_server_program_main
 #define cuvs_cagra_free fold_test_free
 #define cuvs_cagra_search fold_test_search
@@ -625,6 +626,119 @@ test_delayed_older_boot_preserves_current_fold(void)
     puts("PASS delayed retired PG lifetimes cannot displace the current fold");
 }
 
+static void
+test_deferred_shared_prefix(void)
+{
+    CuvsPageOverlayChunk *head;
+    CuvsPageOverlayRequest request = {0};
+    size_t before = g_page_overlay_budget.used;
+
+    CHECK(cuvs_page_overlay_alloc(&g_page_overlay_budget, &request, 0, &head) == CUVS_STATUS_OK);
+    cuvs_page_overlay_retain(head);
+    pthread_mutex_lock(&g_index_mutex);
+    defer_page_overlay_release(head);
+    defer_page_overlay_release(head);
+    CHECK(g_retired_page_overlays == head && head->retired_next == NULL);
+    pthread_mutex_unlock(&g_index_mutex);
+    release_retired_page_overlays();
+    CHECK(g_retired_page_overlays == NULL && g_page_overlay_budget.used == before);
+    puts("PASS deferred disposal releases both owners of one overlay head");
+}
+
+static uint32_t
+prune_without_head(CuvsPageHistoryPrune request)
+{
+    CuvsCmdFrame cmd = {.op = CUVS_OP_PAGE_HISTORY_PRUNE, .db_oid = 2, .index_oid = 3};
+    CuvsReplyHeader reply;
+    int pair[2];
+
+    CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, pair) == 0);
+    CHECK(send_all(pair[0], &request, sizeof(request)) == 0);
+    handle_page_history_prune(pair[1], &cmd);
+    CHECK(recv_all(pair[0], &reply, sizeof(reply)) == 0);
+    close(pair[0]);
+    close(pair[1]);
+    release_retired_fold_graphs();
+    release_retired_page_overlays();
+    return reply.status;
+}
+
+static void
+test_background_prune(bool keep_head, bool restart)
+{
+    FoldHandle old = {0}, child = {0};
+    CuvsPageFoldEvent event = make_event();
+    CuvsPageFoldResult fold = {.event = event, .transition_lsn = 90};
+    CuvsPageFoldQuery ready = {.system_identifier = event.system_identifier, .boot_id = event.boot_id};
+    CuvsPageFoldEvent offered;
+    CuvsPageHistoryPrune prune = {
+        .base = {.length = sizeof(prune), .system_identifier = 1, .index_nonce = 4,
+                 .base_nonce = 5, .graph_nonce = 7, .n_slots = 68, .folded = 4,
+                 .tail = 4, .reserved = 51},
+        .boot_id = 6, .boot_started_us = 100,
+    };
+    CuvsPageOverlayRequest range = {.positions = restart ? 4 : 8};
+    PageGraphFoldRef ref = {0};
+    PageCagraGraph *parent;
+
+    pthread_mutex_lock(&g_index_mutex);
+    parent = make_parent(&old);
+    CHECK(cuvs_page_overlay_alloc(&g_page_overlay_budget, &range,
+                                    range.positions * sizeof(CuvsPagePosition),
+                                    &parent->overlay.head) == CUVS_STATUS_OK);
+    parent->overlay.covered_upto = range.positions;
+    CHECK(page_graph_fold_pin_locked(parent, &ref) == &old);
+    CHECK(page_graph_register_fold_locked(&ref, &event, &child, 80));
+    CHECK(page_fold_ready_for_boot_locked(event.db_oid, event.index_oid, event.index_nonce,
+                                           &ready, 100, &offered, NULL, NULL));
+    CHECK(memcmp(&offered, &event, sizeof(event)) == 0);
+    CHECK(page_fold_result_with_history_locked(&fold, 1, 50) == CUVS_STATUS_OK);
+    if (!keep_head)
+        free_page_graph(&g_page_graphs);
+    pthread_mutex_unlock(&g_index_mutex);
+    page_graph_fold_unpin(&ref);
+    release_retired_page_overlays();
+    CHECK(child.frees == (keep_head ? 0 : 1) && old.frees == 0 &&
+          g_page_graph_bytes[0] == (keep_head ? 180 : 100));
+    CHECK(g_page_overlay_budget.used > 0);
+    prune.boot_id = 9;
+    CHECK(prune_without_head(prune) == CUVS_STATUS_NOT_FOUND);
+    prune.boot_id = 6;
+    prune.base.reserved = 50;
+    CHECK(prune_without_head(prune) == CUVS_STATUS_OK && old.frees == 0);
+    if (restart)
+    {
+        prune.boot_id = 7;
+        prune.boot_started_us = 200;
+    }
+    else
+        prune.base.reserved = 51;
+    CHECK(prune_without_head(prune) == CUVS_STATUS_OK);
+    CHECK(old.frees == 1 && old.freed_outside_registry &&
+          g_page_graph_bytes[0] == (keep_head ? 80 : 0));
+    CHECK(!g_page_ancestors && g_page_overlay_budget.used == 0);
+    if (restart)
+    {
+        prune.boot_id = 6;
+        prune.boot_started_us = 100;
+        CHECK(prune_without_head(prune) == CUVS_STATUS_NOT_FOUND);
+        if (keep_head)
+        {
+            CHECK(g_page_graphs->overlay.boot_id == 7 &&
+                  g_page_graphs->pg_boot_started_us == 200);
+            pthread_mutex_lock(&g_index_mutex);
+            free_page_graph(&g_page_graphs);
+            pthread_mutex_unlock(&g_index_mutex);
+            release_retired_page_overlays();
+        }
+        CHECK(child.frees == 1 && g_page_graph_bytes[0] == 0);
+        printf("PASS background prune after PostgreSQL restart (%s active head)\n",
+               keep_head ? "with" : "without");
+    }
+    else
+        puts("PASS background prune releases expired ancestors after the active head was evicted");
+}
+
 int
 main(void)
 {
@@ -632,6 +746,10 @@ main(void)
     (void) pthread_once(&g_page_daemon_once, initialize_page_daemon_id);
     CHECK(g_page_daemon_id);
     g_page_overlay_budget.limit = 4096;
+    test_deferred_shared_prefix();
+    test_background_prune(false, false);
+    test_background_prune(false, true);
+    test_background_prune(true, true);
     test_commit();
     test_discard_drop_and_boot();
     test_committed_reclaims_folded_overlay();

@@ -532,6 +532,21 @@ uses legacy storage, regardless of table contents, TRUNCATE, or REINDEX. Pending
 page records hold the vector evaluated by PostgreSQL. Folded records use TID
 slots. Rebuilding the graph from those slots requires reevaluating the expression.
 
+**Experimental resident pending search.** With matching page-format builds of
+PostgreSQL's extension and its daemon, set `cuvs.page_resident_search=on` in
+`postgresql.conf` and restart the preloaded primary. This setting defaults to
+`off`. A regular CAGRA Index Scan can reuse the daemon's committed pending
+prefix and send at most 4,096 remaining positions. PostgreSQL scores larger
+unsupplied ranges in 4,096-position chunks. The search admits up to 200,000
+pending positions relative to the selected graph and verifies each returned
+candidate against the scan snapshot. Retained graphs for old snapshots count
+toward the daemon's VRAM budget.
+
+With native page-format fold support, `cuvs.resident_supply=on` starts a
+background supplier that visits page-format CAGRA indexes and releases expired
+graph history. This postmaster setting also defaults to `off`. The worker uses
+the daemon's `--page-overlay-host-bytes` budget.
+
 **Experimental page-format fold (`PGCUVS_BETA3A_GPU_FOLD=1`).** Build both the
 extension and daemon with this option and `CUVS_PAGE_FORMAT=1`, using the
 matching cuVS `cpp/src` tree as `CUVS_BETA3A_SDK_SOURCE`. The fold option defaults
@@ -598,13 +613,59 @@ force exact heap search.
 |-----------|------|---------|--------|-------|
 | `source` | string | `` | a legacy `cagra` index name on the same table | empty = private direct HNSW file build from the heap (op23), without a persistent CAGRA index |
 | `mode` | string | `nsw` | `nsw`, `hnswlib`, `hnsw`, `hnswlib_file` | `nsw` and `hnswlib` are recommended. With `source`, `nsw` and `hnsw` give the same graph: level 0 from the CAGRA graph and upper layers built by the daemon on the host. Since 0.9.3 this path checks the pgvector version as the heap build does (outside the supported range is an error, not a warning) |
-| `m` | int | `16` | 2–100 | **informational** — the CAGRA graph degree drives the HNSW layout, not `m` |
-| `ef_construction` | int | `64` | 4–1000 | Sets construction effort for direct heap builds. The build records the configured value in the index metapage. A conversion from a legacy CAGRA index uses the option only for that metapage value during the build. |
+| `m` | int | `16` | 2–100 | pgvector maintenance fallback uses this value. Imported graphs use the source graph degree |
+| `ef_construction` | int | `64` | 4–1000 | Sets construction effort for direct heap builds. A legacy CAGRA conversion records it in the target metapage. pgvector maintenance fallback uses at least `2 * m`. |
 | `build_algo` | enum | `auto` | `auto`, `ivf_pq`, `nn_descent`, `ace` | Direct heap build only; cannot be combined with explicit `source` |
 
 For later inserts, pgvector reads `ef_construction` from the index reloption.
 `ALTER INDEX … SET (ef_construction = …)` changes that option for subsequent
 inserts. The value recorded in the metapage is refreshed by `REINDEX`.
+
+A CAGRA source must be valid and free of pending inserts and deletes. A stale
+source or pending sidecar records cause the conversion to fail with a hint to
+rebuild the source or build the HNSW index from the heap. The target must use
+the same index key and predicate as the source. A cast of the same vector key
+to `halfvec` is supported. The deprecated `pg_cuvs_build_hnsw()` function creates
+its target with the source key and predicate.
+
+During a regular `REINDEX` or table maintenance that rebuilds an existing
+index, pgvector builds the target from the current heap if the CAGRA source
+has pending changes, belongs to a previous heap generation, or cannot supply
+a matching file export. The stored `source` option is preserved. Explicit
+source conversions still require a verified source. The deprecated function
+holds a table lock that blocks writes until its transaction ends.
+
+The heap build can take longer and uses `maintenance_work_mem`. Its graph
+may differ from the source graph. It uses the stored `m` and raises
+`ef_construction` to at least `2 * m` for the build if needed. When it raises
+that value, the build runs serially and leaves the catalog options unchanged.
+
+Source-based `CREATE INDEX CONCURRENTLY` and `REINDEX INDEX CONCURRENTLY`
+require a source without pending changes. Rebuild that source before retrying,
+or use an ordinary rebuild of the existing HNSW index. A heap tablespace move
+changes the heap generation and requires a new source build for explicit
+conversion.
+
+The `hnswlib_file` mode opens files in the source index directory and
+requires a build-time binding between the HNSW graph and the source CAGRA's
+TID file. The binding records each file's device, inode, size and SHA-256.
+Verification reads both files to compute their digests.
+A failed CAGRA rebuild preserves the binding when it restores the same files
+with unchanged contents. Earlier versions could import an older graph after the source
+changed. A missing or invalid binding now causes conversion to fail with
+SQLSTATE `55000`. Files written by earlier versions have no binding, so their
+conversion fails until the files are regenerated. Choose `mode = 'nsw'` for a clean resident source, or set
+`cuvs.cpu_hnsw_fallback = on` and run `REINDEX` on the source to regenerate
+its files. If a failed `CREATE INDEX CONCURRENTLY` leaves its target in
+`pg_index` with `indisvalid = false`, run `DROP INDEX` on that invalid
+target before retrying.
+
+The in-memory `hnswlib` mode exports the graph and TIDs together. Restart the
+daemon after upgrading the extension so both support paired export. When an
+export repeats a TID with the same vector, the target is built from the heap
+using pgvector. An explicit conversion rejects repeated TIDs that carry
+different vectors. Maintenance can rebuild the target from the heap in either
+case.
 
 For direct heap construction, `auto` uses tiny exact GPU construction below 16 rows and
 otherwise the resident IVF-PQ route while its estimate fits the host and GPU budgets.

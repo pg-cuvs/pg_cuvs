@@ -1,0 +1,30 @@
+\set ECHO none
+53
+t
+ERROR:  pg_cuvs: hnswlib_file sidecar has no matching CAGRA generation binding
+HINT:  Use mode 'nsw' to convert the current CAGRA graph, or REINDEX the source with cuvs.cpu_hnsw_fallback enabled. If CREATE INDEX CONCURRENTLY left an invalid target index, drop that index before retrying.
+t
+ERROR:  pg_cuvs: hnswlib_file sidecar has no matching CAGRA generation binding
+HINT:  Use mode 'nsw' to convert the current CAGRA graph, or REINDEX the source with cuvs.cpu_hnsw_fallback enabled. If CREATE INDEX CONCURRENTLY left an invalid target index, drop that index before retrying.
+55000
+t
+t
+Limit
+  ->  Index Scan using hsc_file_shm on hsc_file
+        Order By: (v <-> '[500,500,500]'::vector)
+1000
+Limit
+  ->  Index Scan using hsc_file_nsw on hsc_file
+        Order By: (v <-> '[500,500,500]'::vector)
+1000
+1000
+Limit
+  ->  Index Scan using hsc_file_dst on hsc_file
+        Order By: (v <-> '[500,500,500]'::vector)
+1000
+t
+Limit
+  ->  Index Scan using hsc_file_shm on hsc_file
+        Order By: (v <-> '[700,700,700]'::vector)
+3000
+3000

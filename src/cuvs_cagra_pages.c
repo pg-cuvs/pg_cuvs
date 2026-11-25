@@ -32,10 +32,13 @@ cuvs_cagra_require_legacy(Relation index)
 
 #include "access/generic_xlog.h"
 #include "access/genam.h"
+#include "access/tableam.h"
 #include "access/xact.h"
 #include "access/xlog.h"
 #include "access/xloginsert.h"
+#include "cuvs_cagra_history.h"
 #include "cuvs_util.h"
+#include "executor/tuptable.h"
 #include "lib/stringinfo.h"
 #include "storage/bufpage.h"
 #include "miscadmin.h"
@@ -48,7 +51,6 @@ enum CuvsCagraPageKind
 {
     CUVS_PAGE_TIDS = 1,
     CUVS_PAGE_PENDING = 2,
-    CUVS_PAGE_FOLDLOG = 3,
     CUVS_PAGE_PENDING_VECTOR = 4
 };
 
@@ -72,25 +74,6 @@ typedef struct CuvsCagraPending
     uint64      index_nonce;
     uint64      first_pos;
 } CuvsCagraPending;
-
-typedef struct CuvsCagraFoldPage
-{
-    uint16      kind;
-    uint16      flags;
-    uint32      count;
-    BlockNumber next;
-} CuvsCagraFoldPage;
-
-typedef struct CuvsCagraFoldRecord
-{
-    uint64      graph_nonce;
-    uint64      n_slots;
-    uint64      folded;
-} CuvsCagraFoldRecord;
-
-#define CUVS_CAGRA_FOLD_RECORDS_PER_PAGE \
-    ((BLCKSZ - MAXALIGN(SizeOfPageHeaderData) - MAXALIGN(sizeof(CuvsCagraFoldPage))) / \
-     sizeof(CuvsCagraFoldRecord))
 
 #ifdef CUVS_TEST_HOOKS
 static bool cuvs_test_abort_staged_fold;
@@ -427,10 +410,10 @@ cuvs_cagra_read_tail(Relation index, const CuvsCagraMeta *meta,
     return valid;
 }
 
-bool
-cuvs_cagra_copy_pending(Relation index, const CuvsCagraMeta *meta, BlockNumber nblocks,
-                        uint64 from, uint64 upto, CuvsCagraPendingLocation *locations,
-                        float *vectors)
+static bool
+copy_pending_positions(Relation index, const CuvsCagraMeta *meta, BlockNumber nblocks,
+                       uint64 from, uint64 upto, CuvsCagraPendingLocation *locations,
+                       float *vectors)
 {
     BlockNumber block = meta->pending_tail;
     bool seek_tail = true;
@@ -440,7 +423,7 @@ cuvs_cagra_copy_pending(Relation index, const CuvsCagraMeta *meta, BlockNumber n
     uint64 position = from;
     uint64 next_position = 0;
 
-    if (from < meta->folded || from > upto)
+    if (from > upto)
         return false;
     while (position < upto)
     {
@@ -505,6 +488,65 @@ cuvs_cagra_copy_pending(Relation index, const CuvsCagraMeta *meta, BlockNumber n
     return true;
 }
 
+static bool read_slots(Relation index, const CuvsCagraMeta *meta,
+                       BlockNumber nblocks, uint64 slot, uint32 count, ItemPointer tids);
+
+bool
+cuvs_cagra_copy_pending(Relation index, const CuvsCagraMeta *meta, BlockNumber nblocks,
+                        uint64 from, uint64 upto, CuvsCagraPendingLocation *locations,
+                        float *vectors)
+{
+    CuvsCagraMeta current;
+    bool valid = false;
+    uint64 end;
+
+    if (!cuvs_page_resident_search)
+        return from >= meta->folded &&
+            copy_pending_positions(index, meta, nblocks, from, upto, locations, vectors);
+
+    /* Fold and VACUUM may have moved a position to the slot directory since
+     * the scan read its metadata. Read both maps under the same fence. */
+    LockPage(index, 0, ShareLock);
+    if (!cuvs_cagra_read_meta(index, &current) || current.index_nonce != meta->index_nonce ||
+        current.base_nonce != meta->base_nonce || current.base_slots != meta->base_slots ||
+        current.folded < meta->folded || current.dim != meta->dim || current.flags != meta->flags)
+        goto done;
+
+    nblocks = RelationGetNumberOfBlocks(index);
+    if (!copy_pending_positions(index, &current, nblocks, from, upto, locations, vectors))
+        goto done;
+
+    end = Min(upto, current.folded);
+    for (uint64 position = from; position < end;)
+    {
+        ItemPointerData tids[CUVS_CAGRA_TIDS_PER_PAGE];
+        uint64 slot = current.base_slots + position;
+        uint32 count = Min(end - position,
+                           CUVS_CAGRA_TIDS_PER_PAGE - slot % CUVS_CAGRA_TIDS_PER_PAGE);
+
+        CHECK_FOR_INTERRUPTS();
+        if (!read_slots(index, &current, nblocks, slot, count, tids))
+            goto done;
+        for (uint32 i = 0; i < count; ++i)
+        {
+            ItemPointer root = &locations[position - from + i].tid;
+
+            /* The pending vector is still usable only for its original root.
+             * VACUUM clears the canonical slot and leaves the old bytes. */
+            if (!ItemPointerIsValid(&tids[i]))
+                ItemPointerSetInvalid(root);
+            else if (!ItemPointerIsValid(root) || !ItemPointerEquals(root, &tids[i]))
+                goto done;
+        }
+        position += count;
+    }
+    valid = true;
+
+done:
+    UnlockPage(index, 0, ShareLock);
+    return valid;
+}
+
 static bool
 fold_base_matches(const CuvsCagraMeta *meta, const CuvsCagraFoldCandidate *candidate)
 {
@@ -547,8 +589,8 @@ cuvs_cagra_prepare_fold(Relation index, const CuvsCagraFoldCandidate *candidate,
     blocks = RelationGetNumberOfBlocks(index);
     if (blocks == 0 || !cuvs_cagra_read_meta(index, &meta) ||
         !fold_base_matches(&meta, candidate) ||
-        !cuvs_cagra_copy_pending(index, &meta, RelationGetNumberOfBlocks(index), meta.folded,
-                                 meta.folded + candidate->positions, locations, NULL))
+        !copy_pending_positions(index, &meta, RelationGetNumberOfBlocks(index), meta.folded,
+                                meta.folded + candidate->positions, locations, NULL))
     {
         UnlockPage(index, 0, ExclusiveLock);
         return CUVS_CAGRA_FOLD_DISCARD;
@@ -798,13 +840,17 @@ fold_retry_ack(Relation index, const CuvsCagraFoldCandidate *candidate, XLogRecP
 {
     CuvsCagraMeta meta;
     XLogRecPtr lsn = InvalidXLogRecPtr;
+    bool have_meta;
+    bool same_lineage;
+    bool uncertain;
 
     if (!ConditionalLockPage(index, 0, ShareLock))
         return CUVS_CAGRA_FOLD_DEFERRED;
-    if (cuvs_cagra_has_pages(index) && cuvs_cagra_read_meta(index, &meta) &&
-        meta.index_nonce == candidate->index_nonce &&
-        meta.base_nonce == candidate->base_nonce &&
-        meta.graph_nonce == candidate->graph_nonce &&
+    have_meta = cuvs_cagra_has_pages(index) && cuvs_cagra_read_meta(index, &meta);
+    same_lineage = have_meta && meta.index_nonce == candidate->index_nonce &&
+        meta.base_nonce == candidate->base_nonce;
+    uncertain = !have_meta || (same_lineage && !fold_base_matches(&meta, candidate));
+    if (same_lineage && meta.graph_nonce == candidate->graph_nonce &&
         meta.n_slots == candidate->parent_n_slots + candidate->positions &&
         meta.folded == candidate->parent_folded + candidate->positions)
     {
@@ -825,7 +871,13 @@ fold_retry_ack(Relation index, const CuvsCagraFoldCandidate *candidate, XLogRecP
     }
     UnlockPage(index, 0, ShareLock);
     if (XLogRecPtrIsInvalid(lsn))
+    {
+        /* A concurrent worker can present an event whose child was already
+         * published and superseded. Never discard an uncertain publication. */
+        if (cuvs_page_resident_search && uncertain)
+            return CUVS_CAGRA_FOLD_DEFERRED;
         return CUVS_CAGRA_FOLD_DISCARD;
+    }
     XLogFlush(lsn);
     *commit_lsn = lsn;
     return CUVS_CAGRA_FOLD_PUBLISHED;
@@ -839,7 +891,7 @@ publish_fold(Relation index, const CuvsCagraFoldCandidate *candidate, XLogRecPtr
     CuvsCagraMeta directory;
     CuvsCagraMeta *meta;
     CuvsCagraFoldStatus status;
-    uint64 end, dead, xid;
+    uint64 end, dead, xid = 0;
     BlockNumber nblocks, partial_block = InvalidBlockNumber;
     uint32 old_extents;
     uint32 offset, partial;
@@ -863,6 +915,19 @@ publish_fold(Relation index, const CuvsCagraFoldCandidate *candidate, XLogRecPtr
     {
         pfree(locations);
         return status;
+    }
+
+    if (cuvs_page_resident_search)
+    {
+        FullTransactionId transition = GetTopFullTransactionId();
+
+        if (!cuvs_cagra_history_reserve(index, &directory, candidate, transition))
+        {
+            UnlockPage(index, 0, ExclusiveLock);
+            pfree(locations);
+            return CUVS_CAGRA_FOLD_DEFERRED;
+        }
+        xid = U64FromFullTransactionId(transition);
     }
 
     old_extents = directory.n_extents;
@@ -937,7 +1002,8 @@ publish_fold(Relation index, const CuvsCagraFoldCandidate *candidate, XLogRecPtr
         LockBuffer(next_log, BUFFER_LOCK_UNLOCK);
     }
 
-    xid = U64FromFullTransactionId(GetTopFullTransactionId());
+    if (!xid)
+        xid = U64FromFullTransactionId(GetTopFullTransactionId());
     finished = GetCurrentTimestamp();
     CHECK_FOR_INTERRUPTS();
     state = GenericXLogStart(index);
@@ -1301,6 +1367,50 @@ cuvs_cagra_slot_filter(Relation index, const CuvsCagraMeta *meta,
         }
     }
     return true;
+}
+
+/* The ANN window is exhausted. Enumerate only the selected graph's index
+ * slots, and inspect visibility without reading ranking vectors. */
+bool
+cuvs_cagra_snapshot_filter(Relation index, Relation heap, Snapshot snapshot,
+                            const CuvsCagraMeta *meta, BlockNumber blocks, uint64 limit,
+                            uint32 *excluded, uint64 *visible,
+                            bool (*visit)(void *), void *visit_arg)
+{
+    ItemPointerData segment[CUVS_CAGRA_TIDS_PER_PAGE];
+    IndexFetchTableData *fetch = table_index_fetch_begin(heap);
+    TupleTableSlot *slot = table_slot_create(heap, NULL);
+    bool valid = true;
+
+    *visible = 0;
+    memset(excluded, 0xff, ((limit + 31) / 32) * sizeof(*excluded));
+    for (uint64 pos = 0; pos < limit; pos += CUVS_CAGRA_TIDS_PER_PAGE)
+    {
+        uint32 count = Min((uint64) CUVS_CAGRA_TIDS_PER_PAGE, limit - pos);
+
+        if (!visit(visit_arg) || !read_slots(index, meta, blocks, pos, count, segment))
+        {
+            valid = false;
+            break;
+        }
+        for (uint32 i = 0; i < count; ++i)
+        {
+            bool again = false, dead = false;
+
+            CHECK_FOR_INTERRUPTS();
+            if (!ItemPointerIsValid(&segment[i]))
+                continue;
+            table_index_fetch_reset(fetch);
+            if (table_index_fetch_tuple(fetch, &segment[i], snapshot, slot, &again, &dead))
+            {
+                excluded[(pos + i) / 32] &= ~((uint32) 1 << ((pos + i) % 32));
+                ++*visible;
+            }
+        }
+    }
+    table_index_fetch_end(fetch);
+    ExecDropSingleTupleTableSlot(slot);
+    return valid;
 }
 
 static void

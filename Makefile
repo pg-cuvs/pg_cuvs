@@ -40,7 +40,7 @@ DATA           = sql/pg_cuvs--0.1.0.sql \
                  sql/pg_cuvs--0.9.2--0.9.3.sql \
                  sql/pg_cuvs--0.9.3.sql
 MODULE_big     = pg_cuvs
-REGRESS        = smoke upgrade_path cpu_fallback edge_cases cpu_hnsw_fallback build_hnsw build_hnsw_edge build_hnsw_halfvec build_hnsw_packing hnsw_insert_shift hnsw_layer_status hnsw_build_ef pg_cuvs_hnsw metrics brute_force pg_cuvs_batch reloption_dir gc_orphans release_hardening pending_delta delta_recall build_params drop_subxact partition_prune filter_comparison prefilter_short_fill_guard ivfpq_smoke cagra_streaming cagra_dynbatch cagra_search_params auto_compact extend_vram_fallback stream_bf_recall fallback_stat vram_accounting build_lock flat_smoke transient_bf hw_profile routing_golden routing_golden_measured multi_vector daemon_uid_owner unordered_scan null_query_vector rmm_pool admission_reject
+REGRESS        = smoke upgrade_path cpu_fallback edge_cases cpu_hnsw_fallback build_hnsw build_hnsw_edge build_hnsw_halfvec build_hnsw_packing hnsw_insert_shift hnsw_layer_status hnsw_build_ef hnsw_source_conversion hnsw_source_maintenance hnsw_source_conversion_file pg_cuvs_hnsw metrics brute_force pg_cuvs_batch reloption_dir gc_orphans release_hardening pending_delta delta_recall build_params drop_subxact partition_prune filter_comparison prefilter_short_fill_guard ivfpq_smoke cagra_streaming cagra_dynbatch cagra_search_params auto_compact extend_vram_fallback stream_bf_recall fallback_stat vram_accounting build_lock flat_smoke transient_bf hw_profile routing_golden routing_golden_measured multi_vector daemon_uid_owner unordered_scan null_query_vector rmm_pool admission_reject
 REGRESS_OPTS   = --inputdir=test --outputdir=test
 
 # Tier-1 CI (CPU-reference shim, PGCUVS_CPU_SHIM=1) runs a SUBSET of REGRESS.
@@ -48,7 +48,7 @@ REGRESS_OPTS   = --inputdir=test --outputdir=test
 #   build_hnsw/build_hnsw_edge/pg_cuvs_hnsw/build_hnsw_halfvec/
 #     build_hnsw_packing/hnsw_insert_shift — CAGRA->pgvector HNSW *graph export* (real graph
 #     structure; a Tier-2 / real-GPU concern).
-REGRESS_TIER2_ONLY = build_hnsw build_hnsw_edge build_hnsw_halfvec build_hnsw_packing hnsw_insert_shift hnsw_build_ef pg_cuvs_hnsw routing_golden_measured
+REGRESS_TIER2_ONLY = build_hnsw build_hnsw_edge build_hnsw_halfvec build_hnsw_packing hnsw_insert_shift hnsw_build_ef hnsw_source_conversion_file pg_cuvs_hnsw routing_golden_measured
 REGRESS_TIER1      = $(filter-out $(REGRESS_TIER2_ONLY),$(REGRESS))
 
 # #124: build_oom, build_multi_oom, build_oom_evict_to_fit, and extend_cuda_oom
@@ -82,6 +82,7 @@ ISOLATION_GPU  = pg_cuvs_hnsw_cic_writes
 # PGXS only knows how to build .c → .o; the .cu → .o rule is custom,
 # but the resulting object MUST be listed in OBJS to be linked into the .so.
 OBJS           = src/pg_cuvs.o src/cuvs_ipc.o src/cuvs_util.o $(WRAPPER_OBJ) src/hnsw_export.o src/cuvs_hnsw_scan.o src/cuvs_hnsw_rls.o src/cuvs_hnsw_exact.o src/cuvs_build_corpus.o src/pg_cuvs_compaction.o src/cuvs_status_text.o src/cuvs_peak_meter.o src/cuvs_cagra_pages.o src/cuvs_cagra_pending_search.o src/cuvs_cagra_fold_worker.o
+OBJS           += src/cuvs_cagra_history.o src/cuvs_cagra_resident_supply.o
 
 # nvcc settings (Phase 1: brute-force only; CAGRA added later)
 NVCC          ?= nvcc
@@ -168,7 +169,7 @@ PG_CPPFLAGS += $(CUVS_FOLD_PRODUCT_CPPFLAGS)
 # -Wl,-rpath embeds the cuVS lib path so postmaster finds libcuvs.so
 # without LD_LIBRARY_PATH being set (ADR-007).
 SHLIB_LINK     = $(CUVS_SO_LINK) $(CUVS_LOGGER_LINK) $(CUVS_SDK_PLAN_LINK) $(CUVS_FOLD_LINK) \
-                 -Wl,-Bstatic -lstdc++ -Wl,-Bdynamic -lrt
+                 -Wl,-Bstatic -lstdc++ -Wl,-Bdynamic -lrt -lcrypto
 
 EXTRA_CLEAN += src/.cuvs-fold-mode src/cuvs_cagra_fold_sdk.o src/cuvs_cagra_fold_sdk.bc \
                src/cuvs_cagra_fold_unavailable.o src/cuvs_cagra_fold_unavailable.bc
@@ -251,6 +252,9 @@ SERVER_CFLAGS  = -O2 -g -Wall -Wextra -I./src \
 # Optional sanitizer/debug hooks for the daemon (e.g. CI ASAN job passes
 # EXTRA_SERVER_CFLAGS="-fsanitize=address -fno-omit-frame-pointer"). Empty by default.
 SERVER_CFLAGS += $(EXTRA_SERVER_CFLAGS) $(CUVS_FOLD_PRODUCT_CPPFLAGS)
+ifeq ($(CUVS_PAGE_FORMAT),1)
+SERVER_CFLAGS += -DCUVS_PAGE_FORMAT
+endif
 ifdef PGCUVS_CPU_SHIM
 SERVER_CFLAGS += -DPGCUVS_CPU_SHIM
 endif
@@ -692,28 +696,19 @@ test-admission-ipc: test/unit/test_admission_ipc.c src/cuvs_ipc.c src/cuvs_ipc.h
 		-lpthread -lm $(TEST_RT_LIB)
 	./$@
 
-# BUILD reply waits against a mock daemon, including cancellation and peer loss.
+# Linux UDS fixture with a shortened receive timeout injected at setsockopt().
 ifeq ($(shell uname -s),Linux)
-BUILD_REPLY_CLOCK_FLAGS := -DCUVS_TEST_BUILD_REPLY_CLOCK -Wl,--wrap=clock_gettime
+test-unit: test-build-terminal-wait
 endif
-test-unit: test-build-reply-wait
-test-build-reply-wait: test/unit/test_build_reply_wait.c src/cuvs_ipc.c src/cuvs_ipc.h \
-                       src/cuvs_util.c src/cuvs_build_corpus.c $(wildcard src/*.h)
-	$(CC) -std=gnu11 -Wall -Wextra -Werror $(ADMISSION_TEST_SAN) $(BUILD_REPLY_CLOCK_FLAGS) -I src -o $@ \
-		test/unit/test_build_reply_wait.c src/cuvs_ipc.c src/cuvs_util.c src/cuvs_build_corpus.c \
-		-lpthread -lm $(TEST_RT_LIB)
+test-build-terminal-wait: test/unit/test_build_terminal_wait.c src/cuvs_ipc.c \
+                          src/cuvs_util.c src/cuvs_build_corpus.c $(wildcard src/*.h)
+	$(CC) -std=gnu11 -Wall -Wextra -Werror $(ADMISSION_TEST_SAN) -Wl,--wrap=setsockopt \
+		-I src -o $@ test/unit/test_build_terminal_wait.c src/cuvs_ipc.c \
+		src/cuvs_util.c src/cuvs_build_corpus.c -lpthread -lm $(TEST_RT_LIB)
 	./$@
-ifeq ($(shell uname -s),Linux)
-	./$@ --deadline
-endif
 
-EXTRA_CLEAN += test-build-reply-wait
-.PHONY: test-build-reply-wait
-
-# Private PostgreSQL cluster with the installed CPU-shim extension.
-.PHONY: test-build-publication
-test-build-publication: server-test
-	python3 -B test/unit/test_build_publication.py "$(PG_CONFIG)" "./$(SERVER_TEST_BIN)" "$(CC)"
+EXTRA_CLEAN += test-build-terminal-wait
+.PHONY: test-build-terminal-wait
 
 test-unit: test-extra-search-ipc
 test-extra-search-ipc: test/unit/test_extra_search_ipc.c src/cuvs_ipc.c src/cuvs_ipc.h \
@@ -910,6 +905,13 @@ HNSW_CONVERTER_UNIT_LINK = -Wl,--gc-sections \
                           -L$(shell $(PG_CONFIG) --pkglibdir) -lpgcommon -lpgport -lm
 endif
 HNSW_UNIT_CPPFLAGS ?=
+test-unit: test-hnsw-source-binding
+test-hnsw-source-binding: test/unit/test_hnsw_source_binding.c src/cuvs_hnsw_source.h
+	$(CC) -std=gnu11 -Wall -Wextra -Werror -I src -o $@ $< -lcrypto
+	./$@
+EXTRA_CLEAN += test-hnsw-source-binding
+.PHONY: test-hnsw-source-binding
+
 .PHONY: test-hnsw-converter-build
 test-hnsw-converter: test-hnsw-converter-build
 	./$@
@@ -969,6 +971,15 @@ installcheck-isolation-gpu:
 # requires a (shim) daemon up, same as installcheck.
 installcheck-tier1:
 	$(pg_regress_installcheck) $(REGRESS_OPTS) $(REGRESS_TIER1)
+
+# Focused source-conversion regression. Also runs in both regression tiers.
+installcheck-hnsw-source:
+	$(pg_regress_installcheck) $(REGRESS_OPTS) hnsw_source_conversion hnsw_source_maintenance $(HNSW_SOURCE_FILE_TEST)
+
+# Set HNSW_SOURCE_FILE_TEST=hnsw_source_conversion_file with a real GPU daemon.
+HNSW_SOURCE_FILE_TEST ?=
+
+.PHONY: installcheck-hnsw-source
 
 # ---- Fault-injection installcheck (CUVS_TEST_HOOKS daemon) ----------------
 # #124: REGRESS_FAULT needs the CUVS_OP_INJECT_* opcodes, which only exist in

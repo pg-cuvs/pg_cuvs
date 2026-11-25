@@ -314,6 +314,27 @@ uds_connect_ex(const char *socket_path, int recv_timeout_sec)
     return uds_connect_wait(socket_path, recv_timeout_sec, NULL);
 }
 
+/* BUILD retains the connect and send budgets. After sending the request,
+ * keep waiting for the daemon's terminal reply with the PostgreSQL locks
+ * held. Clear the receive timeout before sending any request bytes. */
+static int
+uds_connect_build(const char *socket_path)
+{
+    const struct timeval no_timeout = {0};
+    int fd = uds_connect_ex(socket_path, 600);
+
+    if (fd < 0)
+        return -1;
+    if (setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &no_timeout, sizeof(no_timeout)) != 0)
+    {
+        int err = errno;
+        close(fd);
+        errno = err;
+        return -1;
+    }
+    return fd;
+}
+
 static int
 uds_connect(const char *socket_path)
 {
@@ -321,13 +342,14 @@ uds_connect(const char *socket_path)
 }
 
 static int
-send_all(int fd, const void *buf, size_t len)
+send_all_flags(int fd, const void *buf, size_t len, int flags)
 {
     const char *p = buf;
     size_t sent = 0;
     while (sent < len)
     {
-        ssize_t n = write(fd, p + sent, len - sent);
+        ssize_t n = flags ? send(fd, p + sent, len - sent, flags) :
+                            write(fd, p + sent, len - sent);
         if (n < 0)
         {
             if (errno == EINTR)
@@ -339,6 +361,22 @@ send_all(int fd, const void *buf, size_t len)
         sent += (size_t)n;
     }
     return 0;
+}
+
+static int
+send_all(int fd, const void *buf, size_t len)
+{
+    return send_all_flags(fd, buf, len, 0);
+}
+
+static int
+send_page_resident(int fd, const void *buf, size_t len)
+{
+#ifdef MSG_NOSIGNAL
+    return send_all_flags(fd, buf, len, MSG_NOSIGNAL);
+#else
+    return send_all(fd, buf, len);
+#endif
 }
 
 /* Every client-side reply header is read through these two, so per-reply
@@ -413,6 +451,8 @@ send_cmd(int fd, CuvsCmdFrame *cmd)
         cmd->itopk_size = g_cagra_itopk_size;
         cmd->search_width = g_cagra_search_width;
     }
+    if (cmd->op == CUVS_OP_SEARCH_PAGE_RESIDENT)
+        return send_page_resident(fd, cmd, sizeof(*cmd));
     return send_all(fd, cmd, sizeof(*cmd));
 }
 
@@ -644,7 +684,11 @@ recv_all(int fd, void *buf, size_t len)
         if (n < 0)
         {
             if (errno == EINTR)
-                continue;   /* retry: a signal interrupted the read */
+                continue;   /* retry: a signal interrupted the read. Large
+                             * builds block here for minutes, so a stray
+                             * backend signal must not abort the wait and
+                             * spuriously fail a CREATE INDEX the daemon
+                             * actually completed. */
             return -1;
         }
         if (n == 0)
@@ -950,31 +994,33 @@ shm_write_page_supplement(const char *key, const CuvsPageSupplement *supplement,
     return fd;
 }
 
-static int
-page_overlay_exchange(const char *socket_path, CuvsCmdFrame *cmd, CuvsPageOverlayRequest *frame,
-                      const float *queries, const CuvsPageSupplement *supplement,
-                      CuvsPageOverlayResult *results, int *count, uint32_t *latency_us,
-                      CuvsPageProgress *progress)
+typedef struct PageOverlayConnection
 {
-    CuvsReplyHeader reply;
-    int status = CUVS_STATUS_ERROR;
-    int query_fd = -1, supplement_fd = -1, sock = -1;
-    int canceled, waiting;
+    int sock;
+    int query_fd;
+    int supplement_fd;
+} PageOverlayConnection;
 
-    *count = 0;
-    *latency_us = 0;
-    memset(progress, 0, sizeof(*progress));
+static int
+page_overlay_send_request(const char *socket_path, CuvsCmdFrame *cmd, CuvsPageOverlayRequest *frame,
+                          const float *queries, const CuvsPageSupplement *supplement,
+                          PageOverlayConnection *connection)
+{
+    bool resident = cmd->op == CUVS_OP_SEARCH_PAGE_RESIDENT;
+    int canceled;
+
+    *connection = (PageOverlayConnection) {.sock = -1, .query_fd = -1, .supplement_fd = -1};
     if (cmd->dim == 0 || cmd->dim > 65535 || cmd->n_vecs > 1024 || cmd->k > CUVS_PAGE_SEARCH_MAX_K)
-        return status;
+        return CUVS_STATUS_ERROR;
     if (queries)
     {
         if (make_shm_key(cmd->shm_key, sizeof(cmd->shm_key)) != 0)
-            goto done;
-        query_fd = cmd->n_vecs > 1 ?
+            return CUVS_STATUS_ERROR;
+        connection->query_fd = cmd->n_vecs > 1 ?
             shm_write_query_batch(cmd->shm_key, queries, cmd->n_vecs, cmd->dim) :
             shm_write_query(cmd->shm_key, queries, cmd->dim);
-        if (query_fd < 0)
-            goto done;
+        if (connection->query_fd < 0)
+            return CUVS_STATUS_ERROR;
     }
     frame->base.length = sizeof(*frame);
     frame->positions = frame->vector_rows = 0;
@@ -984,21 +1030,77 @@ page_overlay_exchange(const char *socket_path, CuvsCmdFrame *cmd, CuvsPageOverla
             supplement->vector_rows > supplement->positions || !supplement->marks ||
             (supplement->vector_rows && !supplement->vectors) ||
             make_shm_key(frame->supplement_shm, sizeof(frame->supplement_shm)) != 0)
-            goto done;
-        supplement_fd = shm_write_page_supplement(frame->supplement_shm, supplement, cmd->dim);
-        if (supplement_fd < 0)
-            goto done;
+            return CUVS_STATUS_ERROR;
+        connection->supplement_fd = shm_write_page_supplement(frame->supplement_shm, supplement,
+                                                               cmd->dim);
+        if (connection->supplement_fd < 0)
+            return CUVS_STATUS_ERROR;
         frame->positions = supplement->positions;
         frame->vector_rows = supplement->vector_rows;
     }
-    sock = uds_connect_wait(socket_path, 30, &canceled);
-    if (sock < 0)
+    connection->sock = uds_connect_wait(socket_path, 30, &canceled);
+    if (connection->sock < 0)
+        return canceled ? CUVS_STATUS_CANCELED : CUVS_STATUS_UNAVAILABLE;
+#ifdef SO_NOSIGPIPE
+    if (resident)
     {
-        status = canceled ? CUVS_STATUS_CANCELED : CUVS_STATUS_UNAVAILABLE;
-        goto done;
+        int enabled = 1;
+
+        if (setsockopt(connection->sock, SOL_SOCKET, SO_NOSIGPIPE, &enabled, sizeof(enabled)) < 0)
+            return CUVS_STATUS_ERROR;
     }
-    if (send_cmd(sock, cmd) < 0 || send_all(sock, frame, sizeof(*frame)) < 0)
+#endif
+    if (send_cmd(connection->sock, cmd) < 0)
+        return CUVS_STATUS_ERROR;
+    if ((resident ? send_page_resident(connection->sock, frame, sizeof(*frame)) :
+                    send_all(connection->sock, frame, sizeof(*frame))) < 0)
+        return CUVS_STATUS_ERROR;
+    return CUVS_STATUS_OK;
+}
+
+static void
+page_overlay_cleanup(const CuvsCmdFrame *cmd, const CuvsPageOverlayRequest *frame,
+                     const PageOverlayConnection *connection)
+{
+    if (connection->sock >= 0)
+        close(connection->sock);
+    if (connection->query_fd >= 0)
+    {
+        close(connection->query_fd);
+        shm_unlink(cmd->shm_key);
+    }
+    if (connection->supplement_fd >= 0)
+    {
+        close(connection->supplement_fd);
+        shm_unlink(frame->supplement_shm);
+    }
+}
+
+static bool
+page_overlay_has_progress(uint32_t status)
+{
+    return status == CUVS_STATUS_OK || status == CUVS_STATUS_PAGE_NEED ||
+        status == CUVS_STATUS_PAGE_OVERLAY_FULL || status == CUVS_STATUS_PAGE_OVERLAY_HOST_FULL;
+}
+
+static int
+page_overlay_exchange(const char *socket_path, CuvsCmdFrame *cmd, CuvsPageOverlayRequest *frame,
+                      const float *queries, const CuvsPageSupplement *supplement,
+                      CuvsPageOverlayResult *results, int *count, uint32_t *latency_us,
+                      CuvsPageProgress *progress)
+{
+    CuvsReplyHeader reply;
+    PageOverlayConnection connection;
+    int sock, status, waiting;
+
+    *count = 0;
+    *latency_us = 0;
+    memset(progress, 0, sizeof(*progress));
+    status = page_overlay_send_request(socket_path, cmd, frame, queries, supplement, &connection);
+    if (status != CUVS_STATUS_OK)
         goto done;
+    sock = connection.sock;
+    status = CUVS_STATUS_ERROR;
     waiting = recv_reply_interruptible(sock, &reply, 30);
     if (waiting != 0)
     {
@@ -1007,8 +1109,7 @@ page_overlay_exchange(const char *socket_path, CuvsCmdFrame *cmd, CuvsPageOverla
         goto done;
     }
     status = (int) reply.status;
-    if (status == CUVS_STATUS_OK || status == CUVS_STATUS_PAGE_NEED ||
-        status == CUVS_STATUS_PAGE_OVERLAY_FULL || status == CUVS_STATUS_PAGE_OVERLAY_HOST_FULL)
+    if (page_overlay_has_progress(reply.status))
     {
         waiting = recv_all_interruptible(sock, progress, sizeof(*progress), 30);
         if (waiting != 0)
@@ -1036,18 +1137,7 @@ page_overlay_exchange(const char *socket_path, CuvsCmdFrame *cmd, CuvsPageOverla
     }
 
 done:
-    if (sock >= 0)
-        close(sock);
-    if (query_fd >= 0)
-    {
-        close(query_fd);
-        shm_unlink(cmd->shm_key);
-    }
-    if (supplement_fd >= 0)
-    {
-        close(supplement_fd);
-        shm_unlink(frame->supplement_shm);
-    }
+    page_overlay_cleanup(cmd, frame, &connection);
     return status;
 }
 
@@ -1109,6 +1199,174 @@ cuvs_ipc_search_page_overlay(const char *socket_path, uint32_t db_oid, uint32_t 
         return CUVS_STATUS_ERROR;
     return page_overlay_exchange(socket_path, &cmd, &frame, queries,
                                   supplement, results, count, latency_us, progress);
+}
+
+static bool
+page_resident_buffer_valid(const CuvsPageOverlayResult *results, size_t capacity, uint32_t limit)
+{
+    return limit <= CUVS_PAGE_SEARCH_MAX_K && (limit == 0 || (results && capacity >= limit));
+}
+
+static int
+page_resident_read(int sock, void *buffer, size_t bytes)
+{
+    int waiting;
+
+    if (!bytes)
+        return CUVS_STATUS_OK;
+    waiting = recv_all_interruptible_with_deadline(sock, buffer, bytes, 30, true);
+    if (waiting == 0)
+        return CUVS_STATUS_OK;
+    return waiting == 1 ? CUVS_STATUS_CANCELED : CUVS_STATUS_ERROR;
+}
+
+static int
+page_resident_recv(int sock, const CuvsPageResidentAdvance *limits,
+                   CuvsPageOverlayResult *base_results, CuvsPageOverlayResult *pending_results,
+                   CuvsPageResidentWindow *window, uint32_t *latency_us, CuvsPageProgress *progress)
+{
+    CuvsReplyHeader reply;
+    CuvsPageProgress coverage;
+    CuvsPageResidentWindow received;
+    uint32_t expected_base_k = limits->base_k ? limits->base_k : window->base_k;
+    int status;
+
+    status = page_resident_read(sock, &reply, sizeof(reply));
+    if (status != CUVS_STATUS_OK)
+        return status;
+    remember_reply(&reply);
+    if (!page_overlay_has_progress(reply.status))
+        return (int) reply.status;
+    status = page_resident_read(sock, &coverage, sizeof(coverage));
+    if (status != CUVS_STATUS_OK)
+        return status;
+    *progress = coverage;
+    if (reply.status != CUVS_STATUS_OK)
+        return (int) reply.status;
+
+    status = page_resident_read(sock, &received, sizeof(received));
+    if (status != CUVS_STATUS_OK)
+        return status;
+    if (received.base_count > limits->base_k || received.pending_count > limits->pending_limit ||
+        received.base_k != expected_base_k ||
+        reply.n_results != received.base_count + received.pending_count)
+        return CUVS_STATUS_ERROR;
+
+    status = page_resident_read(sock, base_results, received.base_count * sizeof(*base_results));
+    if (status == CUVS_STATUS_OK)
+        status = page_resident_read(sock, pending_results,
+                                    received.pending_count * sizeof(*pending_results));
+    if (status == CUVS_STATUS_OK)
+    {
+        *window = received;
+        *latency_us = reply.latency_us;
+    }
+    return status;
+}
+
+int
+cuvs_ipc_search_page_resident(const char *socket_path, uint32_t db_oid, uint32_t index_oid,
+    const CuvsPageOverlayRequest *request, const float *query, int dim, int k,
+    uint32_t metric, uint32_t itopk_size, uint32_t search_width, uint32_t use_cpu_hnsw,
+    uint32_t search_mode, uint32_t bf_precision, const CuvsPageSupplement *supplement,
+    CuvsPageResidentCursor *cursor,
+    CuvsPageOverlayResult *base_results, size_t base_capacity,
+    CuvsPageOverlayResult *pending_results, size_t pending_capacity,
+    CuvsPageResidentWindow *window, uint32_t *latency_us, CuvsPageProgress *progress)
+{
+    CuvsCmdFrame cmd = {.op = CUVS_OP_SEARCH_PAGE_RESIDENT,
+        .db_oid = db_oid, .index_oid = index_oid, .dim = (uint32_t) dim, .k = (uint32_t) k,
+        .metric = metric, .itopk_size = itopk_size, .search_width = search_width,
+        .n_vecs = 1, .search_mode = search_mode, .bf_precision = bf_precision,
+        .use_cpu_hnsw = use_cpu_hnsw};
+    CuvsPageResidentAdvance limits = {.base_k = cmd.k, .pending_limit = cmd.k};
+    CuvsPageOverlayRequest frame;
+    PageOverlayConnection connection;
+    int status;
+
+    forget_reply();
+    if (!socket_path || !request || !query || k < 1 || !cursor || cursor->fd != -1 ||
+        !window || !latency_us || !progress ||
+        !page_resident_buffer_valid(base_results, base_capacity, limits.base_k) ||
+        !page_resident_buffer_valid(pending_results, pending_capacity, limits.pending_limit))
+        return CUVS_STATUS_ERROR;
+    *latency_us = 0;
+    memset(progress, 0, sizeof(*progress));
+    if (g_wait_cb && g_wait_cb())
+        return CUVS_STATUS_CANCELED;
+
+    frame = *request;
+    status = page_overlay_send_request(socket_path, &cmd, &frame, query, supplement, &connection);
+    if (status == CUVS_STATUS_OK)
+        status = page_resident_recv(connection.sock, &limits, base_results, pending_results,
+                                    window, latency_us, progress);
+    if (status == CUVS_STATUS_OK)
+    {
+        cursor->fd = connection.sock;
+        connection.sock = -1;
+    }
+    page_overlay_cleanup(&cmd, &frame, &connection);
+    return status;
+}
+
+int
+cuvs_ipc_advance_page_resident(CuvsPageResidentCursor *cursor,
+    uint32_t base_k, uint32_t pending_limit,
+    const uint32_t *excluded, uint32_t filter_words,
+    CuvsPageOverlayResult *base_results, size_t base_capacity,
+    CuvsPageOverlayResult *pending_results, size_t pending_capacity,
+    CuvsPageResidentWindow *window, uint32_t *latency_us, CuvsPageProgress *progress)
+{
+    CuvsPageResidentAdvance advance = {.base_k = base_k, .pending_limit = pending_limit,
+                                       .filter_words = filter_words};
+    int status = CUVS_STATUS_ERROR;
+
+    forget_reply();
+    if (!cursor || cursor->fd < 0)
+        return status;
+    if (!window || window->base_k == 0 || window->base_k > CUVS_PAGE_SEARCH_MAX_K ||
+        (base_k && !filter_words && base_k <= window->base_k) || !latency_us || !progress ||
+        (filter_words && (!excluded || !base_k || filter_words > UINT32_MAX / sizeof(*excluded))) ||
+        !page_resident_buffer_valid(base_results, base_capacity, base_k) ||
+        !page_resident_buffer_valid(pending_results, pending_capacity, pending_limit))
+        goto done;
+    *latency_us = 0;
+    memset(progress, 0, sizeof(*progress));
+    if (g_wait_cb && g_wait_cb())
+        status = CUVS_STATUS_CANCELED;
+    else if (send_page_resident(cursor->fd, &advance, sizeof(advance)) == 0 &&
+             (!filter_words || send_page_resident(cursor->fd, excluded,
+                                                  (size_t) filter_words * sizeof(*excluded)) == 0))
+        status = page_resident_recv(cursor->fd, &advance, base_results, pending_results,
+                                    window, latency_us, progress);
+
+done:
+    if (status != CUVS_STATUS_OK)
+        cuvs_ipc_close_page_resident(cursor);
+    return status;
+}
+
+void
+cuvs_ipc_close_page_resident(CuvsPageResidentCursor *cursor)
+{
+    if (cursor && cursor->fd >= 0)
+    {
+        int fd = cursor->fd;
+
+        cursor->fd = -1;
+        close(fd);
+    }
+}
+
+bool
+cuvs_ipc_hold_page_resident(CuvsPageResidentCursor *cursor)
+{
+    CuvsPageResidentAdvance hold = {.reserved = CUVS_PAGE_RESIDENT_KEEPALIVE};
+
+    if (cursor && cursor->fd >= 0 && send_page_resident(cursor->fd, &hold, sizeof(hold)) == 0)
+        return true;
+    cuvs_ipc_close_page_resident(cursor);
+    return false;
 }
 
 /* A page reply uses CuvsResult.tid as a zero-based slot number. */
@@ -1280,21 +1538,22 @@ page_fold_exchange(const char *socket_path, CuvsCmdFrame *cmd,
 static int
 page_fold_ready(const char *socket_path, uint32_t db_oid, uint32_t index_oid,
                 uint64_t index_nonce, uint64_t system_identifier, uint64_t boot_id,
-                CuvsPageFoldEvent *event)
+                uint64_t boot_started_us, CuvsPageFoldEvent *event)
 {
-    CuvsCmdFrame cmd = {.op = CUVS_OP_FOLD_READY, .db_oid = db_oid, .index_oid = index_oid};
-    struct {
-        CuvsPageFoldQuery query;
-        uint64_t index_nonce;
-    } payload = {.query = {.system_identifier = system_identifier, .boot_id = boot_id},
-                 .index_nonce = index_nonce};
+    CuvsCmdFrame cmd = {.op = boot_started_us ? CUVS_OP_FOLD_RESIDENT_READY : CUVS_OP_FOLD_READY,
+                        .db_oid = db_oid, .index_oid = index_oid};
+    CuvsPageResidentFoldQuery payload = {
+        .query = {.system_identifier = system_identifier, .boot_id = boot_id},
+        .index_nonce = index_nonce, .boot_started_us = boot_started_us,
+    };
     CuvsPageFoldEvent candidate;
     int status;
 
     forget_reply();
     if (!event || !db_oid || !system_identifier || !boot_id || (!!index_oid != !!index_nonce))
         return CUVS_STATUS_ERROR;
-    payload.query.length = index_oid ? sizeof(payload) : sizeof(payload.query);
+    payload.query.length = boot_started_us ? sizeof(payload) :
+        (index_oid ? sizeof(payload.query) + sizeof(payload.index_nonce) : sizeof(payload.query));
     status = page_fold_exchange(socket_path, &cmd, &payload, payload.query.length, &candidate);
     if (status != CUVS_STATUS_OK)
         return status;
@@ -1313,14 +1572,26 @@ cuvs_ipc_page_fold_ready_index(const char *socket_path, uint32_t db_oid, uint32_
 {
     if (!index_oid)
         return CUVS_STATUS_ERROR;
-    return page_fold_ready(socket_path, db_oid, index_oid, index_nonce, system_identifier, boot_id, event);
+    return page_fold_ready(socket_path, db_oid, index_oid,
+                            index_nonce, system_identifier, boot_id, 0, event);
 }
 
 int
 cuvs_ipc_page_fold_ready(const char *socket_path, uint32_t db_oid,
                          uint64_t system_identifier, uint64_t boot_id, CuvsPageFoldEvent *event)
 {
-    return page_fold_ready(socket_path, db_oid, 0, 0, system_identifier, boot_id, event);
+    return page_fold_ready(socket_path, db_oid, 0, 0, system_identifier, boot_id, 0, event);
+}
+
+int
+cuvs_ipc_page_fold_resident_ready(const char *socket_path, uint32_t db_oid, uint32_t index_oid,
+                                  uint64_t index_nonce, uint64_t system_identifier, uint64_t boot_id,
+                                  uint64_t boot_started_us, CuvsPageFoldEvent *event)
+{
+    if (!boot_started_us)
+        return CUVS_STATUS_ERROR;
+    return page_fold_ready(socket_path, db_oid, index_oid, index_nonce, system_identifier,
+                            boot_id, boot_started_us, event);
 }
 
 int
@@ -1336,6 +1607,42 @@ cuvs_ipc_page_fold_result(const char *socket_path, const CuvsPageFoldEvent *even
     CuvsPageFoldResult result = {.event = *event, .transition_lsn = transition_lsn};
 
     return page_fold_exchange(socket_path, &cmd, &result, sizeof(result), NULL);
+}
+
+int
+cuvs_ipc_page_fold_resident_result(const char *socket_path, const CuvsPageFoldEvent *event,
+                                   uint64_t transition_lsn, uint32_t transition_xid)
+{
+    CuvsCmdFrame cmd;
+    CuvsPageResidentFoldResult result;
+
+    forget_reply();
+    if (!transition_lsn || transition_xid < 3 || !cuvs_page_fold_event_valid(event))
+        return CUVS_STATUS_ERROR;
+    cmd = (CuvsCmdFrame) {.op = CUVS_OP_FOLD_RESIDENT_COMMITTED, .db_oid = event->db_oid,
+                          .index_oid = event->index_oid};
+    result = (CuvsPageResidentFoldResult) {
+        .fold = {.event = *event, .transition_lsn = transition_lsn},
+        .transition_xid = transition_xid,
+    };
+    return page_fold_exchange(socket_path, &cmd, &result, sizeof(result), NULL);
+}
+
+int
+cuvs_ipc_page_history_prune(const char *socket_path, uint32_t db_oid, uint32_t index_oid,
+                            const CuvsPageOverlayRequest *request, uint32_t horizon,
+                            uint64_t boot_started_us)
+{
+    CuvsCmdFrame cmd = {.op = CUVS_OP_PAGE_HISTORY_PRUNE, .db_oid = db_oid, .index_oid = index_oid};
+    CuvsPageHistoryPrune prune = {.base = request->base, .boot_id = request->boot_id,
+                                  .boot_started_us = boot_started_us};
+
+    forget_reply();
+    if (!prune.boot_id || !prune.boot_started_us || horizon < 3)
+        return CUVS_STATUS_ERROR;
+    prune.base.length = sizeof(prune);
+    prune.base.reserved = horizon;
+    return page_fold_exchange(socket_path, &cmd, &prune, sizeof(prune), NULL);
 }
 
 /* ----------------------------------------------------------------
@@ -1946,37 +2253,6 @@ cuvs_ipc_drop_pages(const char *socket_path, uint32_t db_oid, uint32_t index_oid
     return ipc_drop(socket_path, db_oid, index_oid, index_dir ? index_dir : "");
 }
 
-#define CUVS_BUILD_SOCKET_TIMEOUT_SEC 600
-#define CUVS_BUILD_REPLY_WAIT_SEC 86400  /* same budget as BUILD_HNSW_FILE */
-
-/* The GPU build can outlast the socket timeout. Poll the backend's
- * cancel callback with a separate deadline for the reply header. */
-static int
-recv_build_reply(int sock, uint64_t *graph_nonce_out)
-{
-    CuvsReplyHeader reply;
-    int waiting = recv_all_interruptible_with_deadline(sock, &reply, sizeof(reply),
-                                                       CUVS_BUILD_REPLY_WAIT_SEC, true);
-
-    if (waiting != 0)
-        return waiting == 1 ? CUVS_STATUS_CANCELED : CUVS_STATUS_ERROR;
-    remember_reply(&reply);
-
-    /* A successful page BUILD has a trailing nonce. Preserve its shorter
-     * timeout and poll for cancel while reading it too. */
-    if (reply.status == CUVS_STATUS_OK && graph_nonce_out)
-    {
-        uint64_t nonce;
-
-        waiting = recv_all_interruptible_with_deadline(sock, &nonce, sizeof(nonce),
-                                                       CUVS_BUILD_SOCKET_TIMEOUT_SEC, true);
-        if (waiting != 0)
-            return waiting == 1 ? CUVS_STATUS_CANCELED : CUVS_STATUS_ERROR;
-        *graph_nonce_out = nonce;
-    }
-    return (int) reply.status;
-}
-
 /* ----------------------------------------------------------------
  * Public API: cuvs_ipc_build
  *
@@ -2009,18 +2285,13 @@ cuvs_ipc_build(
     int  legacy_shm_fd = -1;   /* CORPUS_HEAP only: created + unlinked here */
     int  pass_fd = -1;         /* CORPUS_MEMFD only: passed via SCM_RIGHTS */
     int  sock = -1;
-    int  canceled;
     int  rc   = CUVS_STATUS_ERROR;
     CuvsCmdFrame cmd;
     char dir_buf[CUVS_PAGE_INDEX_DIR_SIZE] = {0};
+    CuvsReplyHeader hdr;
 
-    if (page_build)
-    {
-        if (index_dir && strlen(index_dir) >= sizeof(dir_buf))
-            return CUVS_STATUS_INVALID_PAGE_ROOT;
-        if (!graph_nonce_out)
-            return CUVS_STATUS_ERROR;
-    }
+    if (page_build && index_dir && strlen(index_dir) >= sizeof(dir_buf))
+        return CUVS_STATUS_INVALID_PAGE_ROOT;
 
     /* Stage the payload by tier. */
     if (corpus->kind == CORPUS_MEMFD)
@@ -2045,12 +2316,8 @@ cuvs_ipc_build(
     LOG_DEBUG("[cuvs_ipc_build] tier=%d shm_key=%s pass_fd=%d socket=%s n_vecs=%lld dim=%d\n",
         (int)corpus->kind, shm_key, pass_fd, socket_path, (long long)n_vecs, dim);
 
-    sock = uds_connect_wait(socket_path, CUVS_BUILD_SOCKET_TIMEOUT_SEC, &canceled);
+    sock = uds_connect_build(socket_path);
     if (sock < 0) {
-        if (canceled) {
-            rc = CUVS_STATUS_CANCELED;
-            goto cleanup;
-        }
         LOG_ERROR("[cuvs_ipc_build] uds_connect FAILED errno=%d (%s)\n",
                 errno, strerror(errno));
         rc = CUVS_STATUS_UNAVAILABLE;   /* daemon not reachable */
@@ -2086,8 +2353,14 @@ cuvs_ipc_build(
     if (cuvs_fd_send(sock, pass_fd, dir_buf, sizeof(dir_buf)) < 0)
         goto cleanup;
 
+    if (recv_reply(sock, &hdr) < 0)
+        goto cleanup;
+
+    rc = (int)hdr.status;
     /* A zero nonce means BUILD accepted page storage without a searchable graph. */
-    rc = recv_build_reply(sock, page_build ? graph_nonce_out : NULL);
+    if (page_build && rc == CUVS_STATUS_OK &&
+        recv_all(sock, graph_nonce_out, sizeof(*graph_nonce_out)) < 0)
+        rc = CUVS_STATUS_ERROR;
 
 cleanup:
     if (sock >= 0)
@@ -2130,10 +2403,10 @@ cuvs_ipc_build_flat(
     int  legacy_shm_fd = -1;   /* CORPUS_HEAP only: created + unlinked here */
     int  pass_fd = -1;         /* CORPUS_MEMFD only: passed via SCM_RIGHTS */
     int  sock = -1;
-    int  canceled;
     int  rc   = CUVS_STATUS_ERROR;
     CuvsCmdFrame cmd;
     char dir_buf[256] = {0};
+    CuvsReplyHeader hdr;
 
     /* Stage the payload by tier (identical to cuvs_ipc_build). */
     if (corpus->kind == CORPUS_MEMFD)
@@ -2158,12 +2431,8 @@ cuvs_ipc_build_flat(
     LOG_DEBUG("[cuvs_ipc_build_flat] tier=%d shm_key=%s pass_fd=%d socket=%s n_vecs=%lld dim=%d\n",
         (int)corpus->kind, shm_key, pass_fd, socket_path, (long long)n_vecs, dim);
 
-    sock = uds_connect_wait(socket_path, CUVS_BUILD_SOCKET_TIMEOUT_SEC, &canceled);
+    sock = uds_connect_build(socket_path);
     if (sock < 0) {
-        if (canceled) {
-            rc = CUVS_STATUS_CANCELED;
-            goto cleanup;
-        }
         LOG_ERROR("[cuvs_ipc_build_flat] uds_connect FAILED errno=%d (%s)\n",
                 errno, strerror(errno));
         rc = CUVS_STATUS_UNAVAILABLE;   /* daemon not reachable */
@@ -2192,7 +2461,10 @@ cuvs_ipc_build_flat(
     if (cuvs_fd_send(sock, pass_fd, dir_buf, sizeof(dir_buf)) < 0)
         goto cleanup;
 
-    rc = recv_build_reply(sock, NULL);
+    if (recv_reply(sock, &hdr) < 0)
+        goto cleanup;
+
+    rc = (int)hdr.status;
 
 cleanup:
     if (sock >= 0)
@@ -2234,10 +2506,10 @@ cuvs_ipc_build_multi(
     uint32_t       build_algo)
 {
     int  sock = -1;
-    int  canceled;
     int  rc   = CUVS_STATUS_ERROR;
     CuvsCmdFrame cmd;
     char dir_buf[256] = {0};
+    CuvsReplyHeader hdr;
 
     if (n_partials == 0 || partials == NULL)
     {
@@ -2245,10 +2517,8 @@ cuvs_ipc_build_multi(
         return CUVS_STATUS_ERROR;
     }
 
-    sock = uds_connect_wait(socket_path, CUVS_BUILD_SOCKET_TIMEOUT_SEC, &canceled);
+    sock = uds_connect_build(socket_path);
     if (sock < 0) {
-        if (canceled)
-            return CUVS_STATUS_CANCELED;
         LOG_ERROR("[cuvs_ipc_build_multi] uds_connect FAILED errno=%d (%s)\n",
                 errno, strerror(errno));
         return CUVS_STATUS_UNAVAILABLE;
@@ -2287,7 +2557,10 @@ cuvs_ipc_build_multi(
     if (send_all(sock, partials, (size_t)n_partials * sizeof(CuvsPartialDesc)) < 0)
         goto cleanup;
 
-    rc = recv_build_reply(sock, NULL);
+    if (recv_reply(sock, &hdr) < 0)
+        goto cleanup;
+
+    rc = (int)hdr.status;
 
 cleanup:
     if (sock >= 0)
@@ -2429,13 +2702,15 @@ cuvs_ipc_export_hnsw_shm(
     uint32_t    index_oid,
     char       *shm_path_out,
     size_t      shm_path_len,
-    int        *fd_out)
+    int        *fd_out,
+    int        *tids_fd_out)
 {
     int sock    = -1;
     int rc      = CUVS_STATUS_ERROR;
     int pass_fd = -1;
+    int tids_fd = -1;
 
-    if (fd_out) *fd_out = -1;
+    *fd_out = *tids_fd_out = -1;
 
     /* from_cagra() can take 30s+ for large indexes */
     sock = uds_connect_ex(socket_path, 120);
@@ -2446,6 +2721,7 @@ cuvs_ipc_export_hnsw_shm(
         .op        = CUVS_OP_EXPORT_HNSW_SHM,
         .db_oid    = db_oid,
         .index_oid = index_oid,
+        .k         = CUVS_HNSW_EXPORT_PAIRED,
     };
     if (send_cmd(sock, &cmd) < 0)
         goto cleanup;
@@ -2459,6 +2735,10 @@ cuvs_ipc_export_hnsw_shm(
         rc = (int)hdr.status;
         goto cleanup;
     }
+    if (hdr.n_results != 2) {
+        rc = CUVS_STATUS_PROTO_MISMATCH;
+        goto cleanup;
+    }
 
     if (pass_fd < 0) {
         LOG_ERROR("[export_hnsw_shm] no SCM_RIGHTS fd in reply -- daemon and "
@@ -2470,6 +2750,10 @@ cuvs_ipc_export_hnsw_shm(
         LOG_ERROR("[export_hnsw_shm] sidecar owner mismatch on passed fd\n");
         goto cleanup;
     }
+    char token;
+    if (cuvs_fd_recv(sock, &token, 1, &tids_fd) < 0 || tids_fd < 0 ||
+        !shm_check_daemon_owner(sock, tids_fd))
+        goto cleanup;
 
     /*
      * #166 review: do NOT hand back a "/proc/self/fd/N" path. Opening that
@@ -2481,12 +2765,14 @@ cuvs_ipc_export_hnsw_shm(
      */
     strncpy(shm_path_out, hdr.error, shm_path_len - 1);
     shm_path_out[shm_path_len - 1] = '\0';
-    if (fd_out) *fd_out = pass_fd;
-    pass_fd = -1;                  /* ownership transferred to the caller */
+    *fd_out = pass_fd;
+    *tids_fd_out = tids_fd;
+    pass_fd = tids_fd = -1;        /* ownership transferred to the caller */
     rc = CUVS_STATUS_OK;
 
 cleanup:
     if (pass_fd >= 0) close(pass_fd);
+    if (tids_fd >= 0) close(tids_fd);
     if (sock >= 0)    close(sock);
     return rc;
 }
@@ -3071,10 +3357,10 @@ cuvs_ipc_build_ivfpq(
     char shm_key[64] = "";
     int  shm_fd  = -1;
     int  sock    = -1;
-    int  canceled;
     int  rc      = CUVS_STATUS_ERROR;
     CuvsCmdFrame    cmd;
     char            dir_buf[256] = {0};
+    CuvsReplyHeader hdr;
 
     if (make_shm_key(shm_key, sizeof(shm_key)) != 0)   /* #87 finding 2 */
         goto cleanup;
@@ -3085,12 +3371,8 @@ cuvs_ipc_build_ivfpq(
         goto cleanup;
     }
 
-    sock = uds_connect_wait(socket_path, CUVS_BUILD_SOCKET_TIMEOUT_SEC, &canceled);
+    sock = uds_connect_build(socket_path);
     if (sock < 0) {
-        if (canceled) {
-            rc = CUVS_STATUS_CANCELED;
-            goto cleanup;
-        }
         LOG_ERROR("[cuvs_ipc_build_ivfpq] uds_connect FAILED errno=%d (%s)\n",
                   errno, strerror(errno));
         rc = CUVS_STATUS_UNAVAILABLE;
@@ -3119,7 +3401,10 @@ cuvs_ipc_build_ivfpq(
     if (cuvs_fd_send(sock, -1, dir_buf, sizeof(dir_buf)) < 0)
         goto cleanup;
 
-    rc = recv_build_reply(sock, NULL);
+    if (recv_reply(sock, &hdr) < 0)
+        goto cleanup;
+
+    rc = (int)hdr.status;
 
 cleanup:
     if (sock >= 0) close(sock);
