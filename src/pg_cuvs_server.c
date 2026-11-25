@@ -13389,8 +13389,12 @@ handle_compact(int client_fd, const CuvsCmdFrame *cmd)
     if (strcmp(save_dir, g_index_dir) != 0)
         e->extra_search_default_dir = 0;
     int ivfpq_retry = 0;
+    /* #261: rebuild with the index's own graph degrees. The backend sends its
+     * reloptions in the BUILD fields; a frame without them (0) keeps the
+     * resident graph's width (cuvs_cagra_compact). */
     CuvsCagraIndex new_handle = cuvs_cagra_compact(
-        e->handle, keep_bits, n_vecs, e->metric, (int)e->gpu_device_id, &ivfpq_retry);
+        e->handle, keep_bits, n_vecs, e->metric, (int)cmd->graph_degree,
+        (int)cmd->intermediate_graph_degree, (int)e->gpu_device_id, &ivfpq_retry);
     free(keep_bits);
 
     char compact_notice[256] = {0};
@@ -13445,6 +13449,8 @@ handle_compact(int client_fd, const CuvsCmdFrame *cmd)
     e->n_extended       = 0;
     e->compact_count++;
     e->last_compact_at  = time(NULL);
+    if (cmd->graph_degree > 0)
+        e->graph_degree = (int)cmd->graph_degree;
     e->vram_bytes  = estimate_vram_bytes(new_n, (int)e->dim, e->graph_degree);
 
     cuvs_cagra_free(old_handle, (int)e->gpu_device_id);

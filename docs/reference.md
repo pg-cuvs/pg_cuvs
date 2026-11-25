@@ -293,7 +293,16 @@ These backend GUCs are registered but are not read by the backend build/search p
 | `cuvs.gcs_key_file` | string | `` | — | SUSET | Registered backend setting only; does not configure daemon credentials |
 | `cuvs.warmup_threads` | int | `2` | 1–8 | SUSET | Registered backend setting only; does not configure daemon warmup threads |
 
-CAGRA compaction (`pg_cuvs_compact` and VACUUM) initially preserves the auto
+CAGRA compaction (`pg_cuvs_compact` and VACUUM) rebuilds the kept rows with the
+index's `graph_degree` and `intermediate_graph_degree` reloptions (before #261 it
+used cuVS's defaults, 64 and 128) and logs
+`[cuvs_cagra_compact] rebuild graph_degree=... intermediate_graph_degree=...`.
+An index compacted to width 64 by an earlier version gets its `graph_degree`
+back at its next compaction. The values are read at each compaction, so a value
+set by `ALTER INDEX ... SET` applies from the next compaction, before any
+`REINDEX`. If the reloptions have `intermediate_graph_degree` below
+`graph_degree`, which `CREATE INDEX` rejects, compaction keeps the current
+graph width. Compaction initially preserves the auto
 builder choice. A memory failure from NN-descent or an unresolved auto choice
 triggers one IVF-PQ merge retry after the first merge's allocations unwind.
 The retry caps the IVF-PQ internal search batch at 4096 rows (the ordinary
@@ -528,7 +537,7 @@ cagra/ivfpq") rather than silently failing.
 
 | Reloption | Type | Default | Range / values | Notes |
 |-----------|------|---------|----------------|-------|
-| `graph_degree` | int | `64` | 8–512 | CAGRA output graph degree |
+| `graph_degree` | int | `64` | 8–512 | CAGRA output graph degree. Compaction rebuilds the graph at this degree |
 | `intermediate_graph_degree` | int | `128` | 8–1024 | Must be ≥ `graph_degree` (fail-closed) |
 | `build_algo` | enum | `auto` | `auto`, `ivf_pq`, `nn_descent` | CAGRA build algorithm. The IVF-PQ kNN search (`ivf_pq`, or `auto` when cuVS picks IVF-PQ) uses fp32 LUT, internal and coarse distances when 4 x max\|x\|^2 of the corpus (max\|x\|^2 for inner product and cosine) reaches 65504, the fp16 maximum; otherwise cuVS's fp16 defaults stay. The daemon logs `[cuvs_cagra_build_multi] knn precision` with the bound and the choice. Compaction (`pg_cuvs_compact`, VACUUM) rebuilds the kept rows with cuVS's `auto` choice under the same rule and logs `[cuvs_cagra_compact] knn precision` |
 | `index_dir` | string | (uses `cuvs.index_dir`) | path | Per-index artifact directory (ADR-045); self-describes in `reloptions` so no-GUC sessions still find it |
@@ -876,7 +885,7 @@ an index does the same. Build such an index without `CONCURRENTLY` at a quiet ti
 | `pg_cuvs_hnsw_layer_counts(index regclass)` | record (elements bigint, upper_elements bigint, m integer, entry_level integer, built_hierarchy integer, level1_unlinked bigint) | One `pg_cuvs_hnsw` index that is ready (`indisready`; an index a concurrent build or reindex has not finished writing, failed while writing, or that is being dropped concurrently is refused with SQLSTATE 55000): elements not marked deleted, how many are above level 0, the metapage `m` and entry level, the hierarchy flag its heap build recorded (NULL when none, e.g. a CAGRA-source build), and how many elements above level 0 have no level-1 link (0 when the upper layer is connected; a search descending through level 1 stops at such an element). Reads every page; requires SELECT on the table |
 | `pg_cuvs_hnsw_layer_status()` | SETOF (index regclass, access_method name, current boolean, reason text) | Every `pg_cuvs_hnsw` index the caller can read that is ready (`indisready`; one a concurrent build or reindex is still writing is left out): whether it has upper layers, and why not. `mode='nsw'` before 0.9.3 wrote level 0 only, so rows inserted afterwards held the upper layers alone and searches could miss the built rows; such an index needs `REINDEX INDEX`. A heap build is judged from its recorded hierarchy flag; a CAGRA-source build from the share of elements above level 0 (about 1/m expected, under a quarter of that means none), and NULL below 16 × m elements. With two or more elements above level 0, any of them without a level-1 link makes an index not current, whatever built it (a single upper element, the entry point, has nobody to link to) |
 | `pg_cuvs_build_hnsw(cagra regclass, mode text DEFAULT 'nsw')` | regclass | Build a pgvector HNSW from a CAGRA index without pgvector's CPU build. **Deprecated** in favor of `CREATE INDEX ... USING pg_cuvs_hnsw`; the older two-step `pg_cuvs_import_hnsw` form (empty `USING hnsw` target + import) is removed |
-| `pg_cuvs_compact(index regclass)` | void | Remove tombstoned vectors via `cuvsCagraMerge`, rebuild `.cagra`/`.tids`, drop `.tombstone`. The rebuild uses fp32 IVF-PQ kNN distances under the `build_algo` fp16 rule. If the initial NN-descent or auto merge runs out of memory, retry once with explicit IVF-PQ under that same rule. A pinned IVF-PQ failure is not retried |
+| `pg_cuvs_compact(index regclass)` | void | Remove tombstoned vectors via `cuvsCagraMerge`, rebuild `.cagra`/`.tids` at the index's `graph_degree` and `intermediate_graph_degree`, drop `.tombstone`. The rebuild uses fp32 IVF-PQ kNN distances under the `build_algo` fp16 rule. If the initial NN-descent or auto merge runs out of memory, retry once with explicit IVF-PQ under that same rule. A pinned IVF-PQ failure is not retried |
 | `pg_cuvs_batch_search(rel regclass, queries vector[], k int)` | SETOF (query_idx int, ctid tid, distance real) | Batches Q queries in one GPU dispatch when eligible. Honors `search_mode` and `bf_precision` on the GPU path |
 | `cuvs_filtered_knn(index regclass, query vector, filter_tids bigint[], k int)` | TABLE (ctid tid, distance float4) | Brute-force kNN over the TID set (`block<<16\|off`). NULL means unfiltered, and an empty array returns zero rows |
 | `cuvs_filtered_knn(index regclass, query vector, filter_tids tid[], k int)` | TABLE (ctid tid, distance float4) | Type-safe overload that accepts `ctid` directly |

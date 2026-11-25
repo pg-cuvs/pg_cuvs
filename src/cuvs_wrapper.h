@@ -324,12 +324,18 @@ int cuvs_cagra_extend(CuvsCagraIndex index,
  * keep_bits_words: host uint32_t bitset (bit[i]=1 → keep vector i).
  * n_total: total vector count (= bitset width = current index size).
  * metric: CUVS_METRIC_* — preserved in the rebuilt graph.
+ * graph_degree / intermediate_graph_degree: the index's reloptions, with
+ * which the kept rows are rebuilt (#261). graph_degree <= 0 keeps the
+ * resident graph's width; intermediate <= 0 means 128; the intermediate
+ * degree is raised to graph_degree if below it. The builder is cuVS auto.
  * Returns a NEW CuvsCagraIndex; caller must cuvs_cagra_free the old one.
  * Returns NULL on failure. */
 CuvsCagraIndex cuvs_cagra_compact(CuvsCagraIndex  index,
                                    const uint32_t *keep_bits_words,
                                    int64_t         n_total,
                                    uint32_t        metric,
+                                   int             graph_degree,
+                                   int             intermediate_graph_degree,
                                    int             device_id,
                                    int            *ivfpq_retry);
 /* Optional ivfpq_retry output: 0 = no retry selected, 1 = fp16 IVF-PQ retry,

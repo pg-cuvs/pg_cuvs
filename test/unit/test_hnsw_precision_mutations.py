@@ -63,7 +63,7 @@ EXPORT = SRC / "hnsw_export.c"
 WIRING = {
     "compact_retry_success_notice": (SERVER, r'cuvs_notice_append\(ok.notice_out, sizeof\(ok.notice_out\), compact_notice, ""\);'),
     "compact_retry_failure_notice": (SERVER, r'cuvs_notice_append\(failed.notice_out, sizeof\(failed.notice_out\), compact_notice,'),
-    "compact_retry_telemetry": (SERVER, r'cuvs_cagra_compact\([\s\S]{0,150}&ivfpq_retry\);'),
+    "compact_retry_telemetry": (SERVER, r'cuvs_cagra_compact\([^;]*&ivfpq_retry\);'),
     "norm_uses_rmm_policy": (WRAPPER, r"return thrust::transform_reduce\(raft::resource::get_thrust_policy\(res\),"),
     "norm_policy_header": (WRAPPER, r"#include <raft/core/resource/thrust_policy.hpp>"),
     "precision_resident_only": (WRAPPER, r"if \(!tiny && !disk && prepared\.route\.route == CUVS_HNSW_ROUTE_IVF_PQ\)\s*\{\s*const double max_sq = cuvs_hnsw_max_sq_norm\("
@@ -166,7 +166,7 @@ def run_tests(src_dir: pathlib.Path, work: pathlib.Path) -> int:
 def wiring_ok(texts: dict) -> dict:
     checks = {name: re.search(pat, texts[path]) is not None for name, (path, pat) in WIRING.items()}
     checks["compact_all_three_notice_consumers"] = len(re.findall(
-        r"cuvs_ipc_compact\([^;]+;\s*cuvs_report_build_notice\(index_oid\);", texts[BACKEND])) == 3
+        r"cuvs_compact_rel\(indexRel, index_oid\);\s*cuvs_report_build_notice\(index_oid\);", texts[BACKEND])) == 3
     return checks
 
 
