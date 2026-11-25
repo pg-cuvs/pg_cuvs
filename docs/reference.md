@@ -173,11 +173,39 @@ Defaults and ranges are from source. "Set by" is the minimum role/scope: `USERSE
 | `cuvs.daemon_uid` | int | `-1` | -1– | SUSET | Expected owner uid of `cuvs.socket_path`; backend refuses to connect if the socket is owned by a different uid. `-1` disables the check. See playbooks/daemon-restart-recovery.md § Security / hardening |
 | `cuvs.index_dir` | string | `$PGDATA/cuvs_indexes` | — | SUSET | Artifact directory (empty = resolved at runtime) |
 | `cuvs.k` | int | `100` | 1–2000 | USERSET | GPU candidates fetched per CAGRA scan; the AM does not read SQL `LIMIT`, which the executor applies afterward. Set high enough for the desired LIMIT and recall |
+| `cuvs.search_more` | bool | `off` | — | USERSET | Experimental. For eligible CAGRA L2 queries, try one additional candidate search before returning the first row when the first results have too few visible rows |
+| `cuvs.search_more_max_components` | int | `8388608` | 0–8388608 | USERSET | Maximum row-by-dimension evaluations in the additional GPU pass. Zero permits only the initial CAGRA search |
 | `cuvs.rmm_pool_mb` | int/status | daemon value | 0–INT_MAX, or `unavailable` | read-only (INTERNAL) | Applied initial RMM pool reservation per GPU, queried from the daemon. `0` = disabled; `unavailable` = no compatible daemon reply. Set using the daemon CLI and restart, not SQL SET. Record with each benchmark run |
 | `cuvs.rmm_pool_max_percent` | int/status | daemon value | 0–100, or `unavailable` | read-only (INTERNAL) | Applied upstream pool quota as a percentage of total CUDA memory on each GPU. `0` when the pool is disabled |
 | `cuvs.rmm_pool_status` | string/status | daemon value | JSON, or `unavailable` | read-only (INTERNAL) | Applied initial MiB, quota percentage, per-device maximum/reserved/used pool bytes, and `hnsw_auto_overflow` (`ace` or `error`, from `--hnsw-auto-overflow`). Counters cover RMM pool allocations; they are live snapshots, not process-wide GPU memory |
 | `cuvs.circuit_breaker_threshold` | int | `3` | 1–100 | USERSET | Consecutive GPU errors before the (per-backend) breaker trips |
 | `cuvs.circuit_breaker_transient_ttl_s` | int | `30` | 0–3600 | USERSET | Seconds before a breaker opened by a transient reason half-opens and allows one GPU attempt. `0` = half-open immediately. Breakers opened by a permanent reason ignore it. See § 5 `pg_cuvs_reset_circuit` |
+
+`cuvs.search_more` applies to a forward L2 scan of a clean, resident, unsharded
+legacy CAGRA index in the daemon's default index directory. Use a single heap
+table, a non-null vector column, a constant query vector and a positive constant
+`LIMIT <= cuvs.k <= 512`. Plans with filters, joins, or parallel scans keep their
+existing route. Both passes use the same statement snapshot and compare the
+daemon's graph and TID generation. The extra pass scores only a bounded prefix
+of the resident dataset, up to 32,768 rows. The daemon scores at most 1,024
+rows and 262,144 vector components per submission, releases the registry lock
+between submissions and checks for cancellation before each new submission.
+A submitted chunk can finish after a backend cancellation. The configured
+limit counts scored vector components in the extra pass. The initial ANN,
+GPU time and the number of visible rows found are separate.
+`EXPLAIN (ANALYZE)` reports candidate counts,
+additional requests, scored rows and the reason the node stopped.
+
+**Known limitations.** Replacing the configured index directory after the
+final BUILD identity check, while auxiliary sidecars are being published, can
+leave the new files in the previous directory. A subsequent reload from the
+configured path can find missing or older artifacts.
+
+In the [#284 A100 trial](https://github.com/pg-cuvs/pg_cuvs/pull/284), the
+additional search raised median total execution time from 0.575 ms with the
+option off to 5.572 ms with it on. This was a single PostgreSQL 16.16 fixture on
+an A100 80GB with 10,000 seed rows, 768 dimensions, 100 deletions, one additional
+insert and `LIMIT 100`, using 24 `EXPLAIN (ANALYZE)` samples per mode.
 
 Unlocked CAGRA builds reserve estimated RMM quota separately from logical index
 residency under the registry mutex. Admission subtracts all in-flight reservations
@@ -306,6 +334,7 @@ daemon-only ones have no session equivalent.
 | `--rmm-pool-max-percent N` | `cuvs.rmm_pool_max_percent` (read-only status) | `50` | Hard upstream quota: total CUDA memory × N%, rounded down to 256 bytes, on each allowed GPU. Range 1–100; initial reservation must fit. Preserves the pool's doubling/backoff growth policy |
 | `--rmm-scratch-permille N` | — (daemon-only, `scratch_permille` in `cuvs.rmm_pool_status`) | `9593` (Q1 qualification on one NVIDIA A100-SXM4-80GB host with `--cagra-build-overflow managed`; recalibrate for other GPUs or overflow policies) | CAGRA build scratch coefficient ρ. Admission, reservation and GPU choice use `N = final + ceil(final × ρ / 1000)`; residency accounting keeps `final`. Range 0–100000. Restart to change |
 | `--max-indexes N` | — (daemon-only) | `1024` | **Soft** LRU working-set cap (ADR-068), not a hard wall (was 64). At the cap, a reload or `pg_cuvs_load` frees a slot under the § 8 rules (cold first, then soft eviction; reason `slot`); a build over the cap does not evict (with the default `--build-evict-scope none`): its files are saved and the first query reloads it |
+| `--page-overlay-host-bytes N` | — (daemon-only) | `0` | Explicit host budget for page-overlay chunks during receive, residency and active searches. A zero budget disables chunk allocation. Overlay IPC returns `PAGE_OVERLAY_HOST_FULL` to the caller on budget exhaustion. The per-index row limit also applies. |
 | `--build-evict-scope …` and the other cache flags | — (daemon-only) | see § 8 | Cache, eviction and reclaim knobs (§ 8.2) |
 | `--hnsw-auto-overflow ace\|error` | `hnsw_auto_overflow` in `cuvs.rmm_pool_status` (read-only) | `ace` | What `pg_cuvs_hnsw` `build_algo=auto` does over the resident budget: `ace` spills to ACE-disk with a NOTICE, `error` refuses with SQLSTATE 54000. The same value decides an auto build whose resident IVF-PQ kNN graph cuVS rejects: `ace` rebuilds on ACE-disk with a NOTICE (receipt `graph_fallback`), `error` fails. Startup-only; logged at startup. Explicit `ivf_pq`/`ace` ignore it |
 | `--hnsw-ace-build-quality auto\|Q` | — (daemon-only, restart) | `auto` | ACE partition build quality handed to cuVS (`ace_params.ef_construction` = A; the SDK uses q = A/16, NN-descent runs 5 + q iterations per partition under 1e6 rows). `auto`: q = (the SDK's default NN-descent iterations, 20) − 5 at `ef_construction` 64, i.e. A 240, scaled by `ef_construction`/64. `Q` (0–4095): A = 16·Q for every ACE build, ignoring `ef_construction`. Logged at startup; recorded per index in `pg_cuvs_hnsw_build_info` (`ace_build_quality_source`, `ace_build_quality`). Resident builds ignore it |
@@ -495,6 +524,64 @@ cagra/ivfpq") rather than silently failing.
 | `intermediate_graph_degree` | int | `128` | 8–1024 | Must be ≥ `graph_degree` (fail-closed) |
 | `build_algo` | enum | `auto` | `auto`, `ivf_pq`, `nn_descent` | CAGRA build algorithm. The IVF-PQ kNN search (`ivf_pq`, or `auto` when cuVS picks IVF-PQ) uses fp32 LUT, internal and coarse distances when 4 x max\|x\|^2 of the corpus (max\|x\|^2 for inner product and cosine) reaches 65504, the fp16 maximum; otherwise cuVS's fp16 defaults stay. The daemon logs `[cuvs_cagra_build_multi] knn precision` with the bound and the choice. Compaction (`pg_cuvs_compact`, VACUUM) rebuilds the kept rows with cuVS's `auto` choice under the same rule and logs `[cuvs_cagra_compact] knn precision` |
 | `index_dir` | string | (uses `cuvs.index_dir`) | path | Per-index artifact directory (ADR-045); self-describes in `reloptions` so no-GUC sessions still find it |
+
+**Experimental page format (`CUVS_PAGE_FORMAT=1`).** An expression CAGRA index
+uses page storage only when its result type declares `vector(n)` with
+`1 ≤ n ≤ 2030`; an expression without a declared dimension or above that limit
+uses legacy storage, regardless of table contents, TRUNCATE, or REINDEX. Pending
+page records hold the vector evaluated by PostgreSQL. Folded records use TID
+slots. Rebuilding the graph from those slots requires reevaluating the expression.
+
+**Experimental page-format fold (`PGCUVS_BETA3A_GPU_FOLD=1`).** Build both the
+extension and daemon with this option and `CUVS_PAGE_FORMAT=1`, using the
+matching cuVS `cpp/src` tree as `CUVS_BETA3A_SDK_SOURCE`. The fold option defaults
+to `0`. On a preloaded primary, `SELECT pg_cuvs_compact('index_name');` can
+supply committed pending rows or publish one ready fold for the specified
+page-format CAGRA index. The function uses the existing index-owner check and
+reports the outcome as a `NOTICE`. Repeat the call to publish a candidate that
+was still being prepared. Use a writable statement outside a transaction
+block or subtransaction. Folding requires an existing base GPU graph. After a
+daemon or PostgreSQL restart, PostgreSQL
+retains the WAL-published page state and can use exact heap search if the
+matching GPU graph is unavailable.
+Set the daemon's `--page-overlay-host-bytes` to cover the supplied overlay,
+packed input and the fold's host copies of the expanded dataset and graph.
+With the RMM pool enabled, a fold reuses the pool's existing backing and can
+defer when that backing cannot satisfy its allocations. A fold cannot grow the
+pool's backing, which could stay resident after the fold yields to a build.
+
+The daemon preserves the parent and candidate under memory pressure once it
+has selected a `FOLD_READY` reply for transmission. The graphs stay protected
+until the matching `FOLD_COMMITTED` or a PostgreSQL lifetime change. A lost
+reply or acknowledgment can therefore leave two graphs resident. Competing
+builds in that interval can receive existing admission rejections, including
+`AR8` when the RMM pool cannot provide the required capacity. The foreground
+zero-new-rejections gate covers requests without memory pressure during the
+GPU fold before READY. Zero new rejections under pressure, including the
+READY-to-COMMITTED interval, will be revalidated in γ.
+
+Known admission limits of the experimental flag (sizes in MiB):
+
+- BUILD placement can choose a GPU without accounting for the RMM headroom
+  that the actual admission check requires. For two GPUs with budget and
+  quota 2,048 each, a BUILD needing 1,280 and headroom 256, GPU 0 can admit
+  the build by evicting an eligible LRU of 1,280 out of its 1,536 used. GPU 1
+  uses 1,537, including an unoffered candidate of 641 and eligible LRU of
+  256. Together they cover the placement shortfall of 769. They cannot
+  cover the actual pool shortfall of 1,025, so placement on GPU 1 can still
+  return `AR8`.
+- A legacy EXTEND can wait for a fold on GPU 0 while UNLOAD then LOAD moves
+  its index to GPU 1. With 1,537 used on GPU 1, a 600 increase and a 2,048
+  cap, the request is short by 89. An unoffered candidate of 513 on GPU 1
+  stays in place because the request waited on GPU 0, so EXTEND returns the
+  existing status 5 (`not enough VRAM for extend`).
+- With RMM, discarding an unoffered candidate of at least 16 can reduce the
+  live ledger while the pool keeps its backing. If raw free memory remains
+  16 after the discard, the unchanged 32 MiB floor can still reject the
+  build with `PHYS`.
+
+Sustained inserts can still drive search p99 into seconds when pending rows
+force exact heap search.
 
 ### `ivfpq`
 

@@ -3,6 +3,7 @@
 
 from pathlib import Path
 import argparse
+import re
 import sys
 
 
@@ -125,11 +126,17 @@ def main() -> int:
     parent_call_end = hnsw.index(";", parent_call_start)
     parent_call = hnsw[parent_call_start:parent_call_end]
     require(
-        "cagra_index.metric()" in parent_call
-        and "host_budget" not in parent_call
-        and "gpu_budget" not in parent_call,
-        "non-serializer HNSW parent-build call unexpectedly acquired serializer-only memory limits",
+        re.search(r"cagra_index\.metric\(\),\s*resident_host_budget,\s*resident_gpu_budget,\s*"
+                  r"resident_nn_upper \? resident_guard\.npartitions : 0\)", parent_call),
+        "resident HNSW upper builder does not receive the CAGRA metric and resident guard",
     )
+    for device in ("host", "gpu"):
+        require(
+            re.search(rf"resident_{device}_budget = resident_nn_upper\s*\?\s*"
+                      rf"memory_guard::budget_bytes_from_gib\(resident_guard\.max_{device}_memory_gb\)"
+                      rf"\s*:\s*std::nullopt;", hnsw),
+            f"resident HNSW upper builder does not preserve its no-budget default for {device}",
+        )
     print("PASS: actual HNSW ACE source path propagates the requested metric through factory, build, and metadata")
     return 0
 

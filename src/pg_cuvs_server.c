@@ -27,12 +27,17 @@
 #endif
 
 #include "cuvs_ipc.h"
+#include "cuvs_page_overlay.h"
 #include "cuvs_util.h"
 #include "cuvs_cache_policy.h"
 #include "cuvs_bf_verdict.h"     /* #238: remembered brute_force unavailable verdict */
 #include "cuvs_peak_meter.h"
 #include <stdarg.h>
 #include "cuvs_wrapper.h"
+#include "cuvs_cagra_fold.h"
+#ifdef CUVS_CAGRA_FOLD_ENABLED
+#include "cuvs_cagra_fold_capacity.h"
+#endif
 #include "cuvs_hnsw_build_common.h"
 #include "cuvs_hnsw_upper.h"
 #include "cuvs_objstore.h"
@@ -58,6 +63,7 @@
 #include <sys/mman.h>
 #include <sys/random.h>   /* getrandom(2): CSPRNG suffix for reply shm key names, #87 */
 #include <fcntl.h>
+#include <math.h>
 #include <time.h>
 #include <stdint.h>
 #include <poll.h>
@@ -282,6 +288,10 @@ typedef struct IndexEntry {
     int             pinned;             /* daemon-lifetime pin; kept by REINDEX */
     time_t          loaded_at;          /* registration time (order key) */
     int             file_current;       /* I-FC: 1 iff graph/tids == .cagra/.tids */
+    uint64_t        extra_search_generation; /* optional opcode, protected by g_index_mutex */
+    int             extra_search_default_dir;
+    dev_t           extra_search_dir_dev;
+    ino_t           extra_search_dir_ino;
 } IndexEntry;
 
 /* Zero just the stat counters of a (re)initialized entry. The slot may carry
@@ -323,6 +333,8 @@ reset_entry_stats(IndexEntry *e)
     e->last_search        = 0;
     e->loaded_at          = time(NULL);
     e->file_current       = 0;
+    e->extra_search_generation = 0;
+    e->extra_search_default_dir = 0;
 }
 
 /* Record a completed search on an entry. Caller MUST hold g_index_mutex. */
@@ -355,6 +367,12 @@ static IndexEntry *g_indexes      = NULL;   /* calloc(g_max_indexes) at startup 
 static int         g_n_indexes   = 0;
 static pthread_mutex_t g_index_mutex = PTHREAD_MUTEX_INITIALIZER;
 
+typedef struct PageCagraRetiredBoot
+{
+    struct PageCagraRetiredBoot *next;
+    uint64_t boot_id;
+} PageCagraRetiredBoot;
+
 /* Page-format graphs never participate in the OID-only legacy registry. */
 typedef struct PageCagraGraph
 {
@@ -366,6 +384,8 @@ typedef struct PageCagraGraph
     uint64_t graph_nonce;
     uint64_t build_xid;
     uint64_t n_slots;
+    uint64_t base_nonce;
+    uint64_t folded;
     uint32_t dim;
     uint32_t metric;
     int gpu;
@@ -375,29 +395,175 @@ typedef struct PageCagraGraph
     size_t bf_bytes[2];
     uint32_t bf_miss_reported;
     size_t bytes;
+    uint64_t registered_order;
     uint64_t last_use;
     time_t loaded_at;
     time_t last_search;
     uint32_t hits;
+    CuvsPageOverlay overlay;
+    PageCagraRetiredBoot *retired_boots;
+    uint32_t fold_pins;
+    bool fold_retired;
+    struct PageCagraGraph *fold_candidate;
+    CuvsPageFoldEvent fold_event;
+    uint64_t fold_lsn;
+    uint64_t fold_offer_order;
+    bool fold_seen_by_pg;
+#ifdef CUVS_CAGRA_FOLD_ENABLED
+    uint64_t fold_pending_since;
+    uint64_t fold_retry_after;
+    uint32_t fold_live_base_slot;
+    uint64_t fold_protected_us;
+#endif
 } PageCagraGraph;
+
+/* An initialized token belongs to one fold and must be released on all
+ * exits. It keeps the exact source object, even after OID replacement. */
+typedef struct PageGraphFoldRef
+{
+    PageCagraGraph *entry;
+    uint64_t overlay_generation;
+} PageGraphFoldRef;
 
 static PageCagraGraph *g_page_graphs;
 static int g_n_page_graphs;
 static uint64_t g_page_access;
+static uint64_t g_page_fold_offer_order;
+static uint64_t g_page_daemon_id;
+static pthread_once_t g_page_daemon_once = PTHREAD_ONCE_INIT;
 static size_t g_page_graph_bytes[CUVS_MAX_GPUS];
+static CuvsPageOverlayBudget g_page_overlay_budget;
+static _Thread_local CuvsPageOverlayChunk *g_retired_page_overlays;
+static _Thread_local PageCagraGraph *g_retired_fold_graphs;
 
-/* These helpers run under the registry lock. The disk directories outlive
- * residency and are reconciled against the committed catalog separately. */
+#ifdef CUVS_CAGRA_FOLD_ENABLED
+static uint64_t admission_mono_us(void);
+static void initialize_page_daemon_id(void);
+#define FOLD_EVENT_LOG " daemon_id=%llu system_identifier=%llu boot_id=%llu index_nonce=%llu graph_nonce=%llu"
+#define FOLD_EVENT_FIELDS(event) \
+    (unsigned long long) (event).daemon_id, (unsigned long long) (event).system_identifier, \
+    (unsigned long long) (event).boot_id, (unsigned long long) (event).index_nonce, \
+    (unsigned long long) (event).graph_nonce
+
+static uint64_t g_fold_request_sequence;
+static _Thread_local const CuvsCmdFrame *t_fold_request;
+static _Thread_local const char *t_fold_request_op;
+static _Thread_local uint64_t t_fold_request_id;
+static _Thread_local uint64_t t_fold_request_started;
+#endif
+
 static void
-dispose_page_graph(PageCagraGraph *entry)
+defer_page_overlay_release(CuvsPageOverlayChunk *head)
 {
-    g_page_graph_bytes[entry->gpu] -= entry->bytes + entry->bf_bytes[0] + entry->bf_bytes[1];
+    if (head)
+    {
+        head->retired_next = g_retired_page_overlays;
+        g_retired_page_overlays = head;
+    }
+}
+
+/* A graph removal only detaches its overlay under the registry lock. The
+ * connection or worker drains these references after leaving the registry. */
+static void
+release_retired_page_overlays(void)
+{
+    while (g_retired_page_overlays)
+    {
+        CuvsPageOverlayChunk *head = g_retired_page_overlays;
+
+        g_retired_page_overlays = head->retired_next;
+        cuvs_page_overlay_release(head);
+    }
+}
+
+static void
+release_page_graph_resources(PageCagraGraph *entry)
+{
     for (int precision = 0; precision < 2; ++precision)
         if (entry->bf[precision])
             cuvs_bf_free(entry->bf[precision], entry->gpu);
     if (entry->cpu_hnsw) cuvs_hnsw_free(entry->cpu_hnsw);
     cuvs_cagra_free(entry->handle, entry->gpu);
+}
+
+/* Under the registry lock, after the resource destructors return. Disk
+ * directories are still reconciled against the committed catalog. */
+static void
+finish_page_graph_dispose(PageCagraGraph *entry)
+{
+    while (entry->retired_boots)
+    {
+        PageCagraRetiredBoot *boot = entry->retired_boots;
+
+        entry->retired_boots = boot->next;
+        free(boot);
+    }
+    g_page_graph_bytes[entry->gpu] -= entry->bytes + entry->bf_bytes[0] + entry->bf_bytes[1];
+    defer_page_overlay_release(entry->overlay.head);
     free(entry);
+}
+
+static void
+defer_fold_graph_dispose(PageCagraGraph *entry)
+{
+    entry->next = g_retired_fold_graphs;
+    g_retired_fold_graphs = entry;
+}
+
+/* A detached graph remains charged until its handle has been freed. */
+static void
+release_retired_fold_graphs(void)
+{
+    while (g_retired_fold_graphs)
+    {
+        PageCagraGraph *entry = g_retired_fold_graphs;
+
+        g_retired_fold_graphs = entry->next;
+        release_page_graph_resources(entry);
+        pthread_mutex_lock(&g_index_mutex);
+        finish_page_graph_dispose(entry);
+        pthread_mutex_unlock(&g_index_mutex);
+    }
+}
+
+/* Candidates are owned by their parent until an ACK installs them in the
+ * registry. A search only uses the candidate handle under g_index_mutex. */
+static void
+discard_page_fold_locked(PageCagraGraph *parent, const char *reason)
+{
+    PageCagraGraph *candidate = parent->fold_candidate;
+
+    if (candidate)
+    {
+#ifdef CUVS_CAGRA_FOLD_ENABLED
+        if (candidate->fold_protected_us || candidate->fold_seen_by_pg)
+            LOG_INFO("[page_fold_end] db=%u index=%u gpu=%d reason=%s mono_us=%llu" FOLD_EVENT_LOG "\n",
+                     candidate->db_oid, candidate->index_oid, candidate->gpu, reason,
+                     (unsigned long long) admission_mono_us(), FOLD_EVENT_FIELDS(candidate->fold_event));
+#else
+        (void) reason;
+#endif
+        parent->fold_candidate = NULL;
+        defer_fold_graph_dispose(candidate);
+    }
+}
+
+static void
+retire_page_graph_locked(PageCagraGraph *entry, bool defer_dispose)
+{
+    entry->next = NULL;
+    entry->fold_retired = true;
+    discard_page_fold_locked(entry, "retired");
+    if (entry->fold_pins == 0)
+    {
+        if (defer_dispose)
+            defer_fold_graph_dispose(entry);
+        else
+        {
+            release_page_graph_resources(entry);
+            finish_page_graph_dispose(entry);
+        }
+    }
 }
 
 static void
@@ -407,7 +573,144 @@ free_page_graph(PageCagraGraph **link)
 
     *link = entry->next;
     --g_n_page_graphs;
-    dispose_page_graph(entry);
+    retire_page_graph_locked(entry, false);
+}
+
+/* Caller holds g_index_mutex and supplies the selected registered graph.
+ * The handle remains usable outside the mutex until this token is released. */
+static inline CuvsCagraIndex
+page_graph_fold_pin_locked(PageCagraGraph *entry, PageGraphFoldRef *ref)
+{
+    if (!entry || !entry->handle || entry->fold_retired || ref->entry ||
+        entry->fold_pins == UINT32_MAX)
+        return NULL;
+
+    ++entry->fold_pins;
+    ref->entry = entry;
+    ref->overlay_generation = entry->overlay.generation;
+    return entry->handle;
+}
+
+/* Called outside g_index_mutex. The last pin of a detached graph owns
+ * reclamation, and the VRAM charge stays in place while it frees it. */
+static inline void
+page_graph_fold_unpin(PageGraphFoldRef *ref)
+{
+    PageCagraGraph *entry = ref->entry;
+    bool dispose;
+
+    if (!entry)
+        return;
+    ref->entry = NULL;
+    pthread_mutex_lock(&g_index_mutex);
+    dispose = --entry->fold_pins == 0 && entry->fold_retired;
+    pthread_mutex_unlock(&g_index_mutex);
+    if (dispose)
+    {
+        release_page_graph_resources(entry);
+        pthread_mutex_lock(&g_index_mutex);
+        finish_page_graph_dispose(entry);
+        pthread_mutex_unlock(&g_index_mutex);
+        release_retired_page_overlays();
+    }
+}
+
+/* Called by the clone producer with g_index_mutex held and its source pin
+ * still active. Ownership of handle moves only on success. The caller has
+ * reserved device capacity and built the same contiguous prefix. */
+static inline bool
+page_graph_register_fold_locked(const PageGraphFoldRef *source,
+                                 const CuvsPageFoldEvent *event,
+                                 CuvsCagraIndex handle, size_t bytes)
+{
+    const PageCagraGraph *entry;
+    PageCagraGraph *parent = source->entry;
+    PageCagraGraph *candidate;
+
+    if (!parent || parent->fold_retired || parent->fold_candidate || !handle ||
+        !cuvs_page_fold_event_valid(event) ||
+        event->system_identifier != parent->system_identifier ||
+        event->db_oid != parent->db_oid || event->index_oid != parent->index_oid ||
+        event->index_nonce != parent->index_nonce || event->base_nonce != parent->base_nonce ||
+        event->parent_graph_nonce != parent->graph_nonce ||
+        event->parent_n_slots != parent->n_slots || event->parent_folded != parent->folded ||
+        event->boot_id != parent->overlay.boot_id ||
+        source->overlay_generation != parent->overlay.generation ||
+        event->daemon_id != g_page_daemon_id ||
+        event->parent_folded + event->positions > parent->overlay.covered_upto ||
+        event->graph_nonce == parent->base_nonce ||
+        bytes > SIZE_MAX - g_page_graph_bytes[parent->gpu])
+        return false;
+
+    for (entry = g_page_graphs; entry; entry = entry->next)
+    {
+        if (entry->handle == handle ||
+            (entry->fold_candidate && entry->fold_candidate->handle == handle))
+            return false;
+        if (entry->system_identifier == event->system_identifier &&
+            entry->db_oid == event->db_oid && entry->index_oid == event->index_oid &&
+            entry->index_nonce == event->index_nonce &&
+            (entry->graph_nonce == event->graph_nonce ||
+             (entry->fold_candidate && entry->fold_candidate->graph_nonce == event->graph_nonce)))
+            return false;
+    }
+
+    candidate = calloc(1, sizeof(*candidate));
+    if (!candidate)
+        return false;
+    candidate->system_identifier = event->system_identifier;
+    candidate->db_oid = event->db_oid;
+    candidate->index_oid = event->index_oid;
+    candidate->index_nonce = event->index_nonce;
+    candidate->base_nonce = event->base_nonce;
+    candidate->graph_nonce = event->graph_nonce;
+    candidate->n_slots = event->parent_n_slots + event->positions;
+    candidate->folded = event->parent_folded + event->positions;
+    candidate->build_xid = parent->build_xid;
+    candidate->dim = parent->dim;
+    candidate->metric = parent->metric;
+    candidate->gpu = parent->gpu;
+    candidate->handle = handle;
+    candidate->bytes = bytes;
+    candidate->registered_order = ++g_page_access;
+    candidate->fold_event = *event;
+    candidate->fold_offer_order = ++g_page_fold_offer_order;
+    g_page_graph_bytes[parent->gpu] += bytes;
+    parent->fold_candidate = candidate;
+    return true;
+}
+
+/* A boot ID is opaque. Remember replaced IDs for this graph lineage so a
+ * delayed request cannot restore an earlier overlay lifetime. */
+static bool
+page_graph_use_boot_locked(PageCagraGraph *graph, uint64_t boot_id,
+                           CuvsPageOverlayChunk **obsolete)
+{
+    *obsolete = NULL;
+    if (graph->overlay.boot_id == boot_id)
+        return true;
+    for (const PageCagraRetiredBoot *boot = graph->retired_boots; boot; boot = boot->next)
+        if (boot->boot_id == boot_id)
+            return false;
+
+    if (graph->overlay.boot_id)
+    {
+        PageCagraRetiredBoot *boot = malloc(sizeof(*boot));
+
+        if (!boot)
+            return false;
+        boot->boot_id = graph->overlay.boot_id;
+        boot->next = graph->retired_boots;
+        graph->retired_boots = boot;
+    }
+    discard_page_fold_locked(graph, "pg_lifetime");
+    *obsolete = cuvs_page_overlay_start_boot(&graph->overlay, boot_id, graph->folded);
+#ifdef CUVS_CAGRA_FOLD_ENABLED
+    graph->fold_pending_since = 0;
+    graph->fold_retry_after = 0;
+    graph->fold_live_base_slot = 0;
+#endif
+    return true;
 }
 
 static void
@@ -426,13 +729,43 @@ drop_page_graphs(uint32_t db_oid, uint32_t index_oid)
 }
 
 static bool
+page_superseded_since_use(const PageCagraGraph *page)
+{
+    for (const PageCagraGraph *p = g_page_graphs; p; p = p->next)
+        if (p->system_identifier == page->system_identifier &&
+            p->db_oid == page->db_oid && p->index_oid == page->index_oid &&
+            p->index_nonce != page->index_nonce &&
+            p->registered_order > page->registered_order &&
+            p->registered_order > page->last_use)
+            return true;
+    return false;
+}
+
+static bool
+page_evicted_before(const PageCagraGraph *candidate, const PageCagraGraph *previous)
+{
+    bool candidate_old = page_superseded_since_use(candidate);
+    bool previous_old = page_superseded_since_use(previous);
+    uint64_t candidate_age = candidate->last_use ? candidate->last_use : candidate->registered_order;
+    uint64_t previous_age = previous->last_use ? previous->last_use : previous->registered_order;
+
+    return candidate_old != previous_old ? candidate_old : candidate_age < previous_age;
+}
+
+static bool
+page_graph_reclaimable(const PageCagraGraph *entry)
+{
+    return !entry->fold_pins && !entry->fold_candidate;
+}
+
+static bool
 evict_page_graph(int gpu)
 {
     PageCagraGraph **victim = NULL;
 
     for (PageCagraGraph **link = &g_page_graphs; *link; link = &(*link)->next)
-        if ((gpu < 0 || (*link)->gpu == gpu) &&
-            (!victim || (*link)->last_use < (*victim)->last_use))
+        if ((gpu < 0 || (*link)->gpu == gpu) && page_graph_reclaimable(*link) &&
+            (!victim || page_evicted_before(*link, *victim)))
             victim = link;
     if (!victim)
         return false;
@@ -440,16 +773,23 @@ evict_page_graph(int gpu)
     return true;
 }
 
+static bool
+page_graph_matches(const PageCagraGraph *entry, const CuvsCmdFrame *cmd,
+                   const CuvsPageSearchRequest *request)
+{
+    return entry->system_identifier == request->system_identifier &&
+        entry->db_oid == cmd->db_oid && entry->index_oid == cmd->index_oid &&
+        entry->index_nonce == request->index_nonce &&
+        entry->graph_nonce == request->graph_nonce &&
+        (entry->folded ? entry->base_nonce : entry->graph_nonce) == request->base_nonce &&
+        entry->n_slots == request->n_slots && entry->folded == request->folded;
+}
+
 static PageCagraGraph *
 find_page_graph(const CuvsCmdFrame *cmd, const CuvsPageSearchRequest *request)
 {
     for (PageCagraGraph *entry = g_page_graphs; entry; entry = entry->next)
-        if (entry->system_identifier == request->system_identifier &&
-            entry->db_oid == cmd->db_oid && entry->index_oid == cmd->index_oid &&
-            entry->index_nonce == request->index_nonce &&
-            entry->graph_nonce == request->graph_nonce &&
-            request->base_nonce == entry->graph_nonce &&
-            entry->n_slots == request->n_slots)
+        if (page_graph_matches(entry, cmd, request))
             return entry;
     return NULL;
 }
@@ -488,6 +828,15 @@ static uint64_t g_cache_persist_fail[CUVS_MAX_GPUS];
  * g_indexes, so total_vram_used() adds this so concurrent admission/eviction
  * still accounts for the build's VRAM. Mutated under g_index_mutex. */
 static size_t   g_pending_build_vram[CUVS_MAX_GPUS];
+#ifdef CUVS_CAGRA_FOLD_ENABLED
+/* One producer per device. Admission waits with the registry unlocked. */
+static bool g_fold_active[CUVS_MAX_GPUS];
+static size_t g_fold_claim[CUVS_MAX_GPUS];
+static unsigned g_fold_waiters[CUVS_MAX_GPUS];
+static pthread_cond_t g_fold_finished = PTHREAD_COND_INITIALIZER;
+static pthread_t g_fold_threads[CUVS_MAX_GPUS];
+static bool g_fold_thread_started[CUVS_MAX_GPUS];
+#endif
 static int      g_pending_build_count[CUVS_MAX_GPUS];   /* I3-B: solo flag */
 
 /* Existing lock-free shard searches and HNSW exports may allocate GPU scratch
@@ -575,8 +924,8 @@ page_legacy_deferred(uint32_t db_oid, uint32_t index_oid)
     return fd >= 0 && page_has_completed_xid(fd, 2);
 }
 
-/* Drop and failed-build cleanup are rooted in the daemon's directory. Do
- * not follow symlinks, even when an artifact was created by an older build. */
+/* Drop and failed-build cleanup use the selected index root. Do not follow
+ * symlinks inside it, even for artifacts created by an older build. */
 static void
 remove_page_tree_at(int parent, const char *name)
 {
@@ -907,6 +1256,7 @@ warmup_worker_thread(void *arg)
             if (target_ce)
                 target_ce->warmup_state = WARMUP_FAILED;
             pthread_mutex_unlock(&g_index_mutex);
+            release_retired_page_overlays();
             continue;
         }
 
@@ -944,6 +1294,7 @@ warmup_worker_thread(void *arg)
         }
 
         pthread_mutex_unlock(&g_index_mutex);
+        release_retired_page_overlays();
 
         /* Clean up stale delta/tombstone sidecars from a previous generation. */
         {
@@ -1035,6 +1386,10 @@ gpu_free_vram_bytes(int device_id)
     size_t available = cuvs_vram_free_bytes_on(device_id);
     size_t pending = g_rmm_pool_limits[device_id] > 0
         ? g_pending_rmm_build_vram[device_id] : 0;
+#ifdef CUVS_CAGRA_FOLD_ENABLED
+    if (g_rmm_pool_limits[device_id] == 0 && g_fold_claim[device_id])
+        pending = g_pending_build_vram[device_id];
+#endif
     return pending < available ? available - pending : 0;
 }
 
@@ -1666,6 +2021,80 @@ delta_file_path(char *out, size_t outlen,
                 const char *dir, uint32_t db_oid, uint32_t index_oid)
 {
     snprintf(out, outlen, "%s/%u_%u.delta", dir, db_oid, index_oid);
+}
+
+typedef struct ExtraSearchRoot {
+    int fd;
+    struct stat identity;
+    char path[32];
+} ExtraSearchRoot;
+
+/* Keep the directory behind SDK pathname I/O stable across renames. When
+ * descriptor paths are unavailable the ordinary path can still run. */
+static bool
+extra_search_open_root(const char *dir, ExtraSearchRoot *root)
+{
+    struct stat st;
+    int fd = open(dir, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+
+    if (fd < 0)
+        return false;
+    snprintf(root->path, sizeof(root->path), "/proc/self/fd/%d", fd);
+    if (fstat(fd, &root->identity) != 0 || stat(root->path, &st) != 0 ||
+        st.st_dev != root->identity.st_dev || st.st_ino != root->identity.st_ino)
+    {
+        close(fd);
+        return false;
+    }
+    root->fd = fd;
+    return true;
+}
+
+static void
+extra_search_attest_directory(IndexEntry *e, const ExtraSearchRoot *root)
+{
+    if (!root)
+        return;
+    e->extra_search_dir_dev = root->identity.st_dev;
+    e->extra_search_dir_ino = root->identity.st_ino;
+    e->extra_search_default_dir = 1;
+}
+
+static const char *
+extra_search_build_dir(const CuvsCmdFrame *cmd, const char *dir, ExtraSearchRoot *root)
+{
+    if (cmd->op == CUVS_OP_BUILD && cmd->metric == CUVS_METRIC_L2 &&
+        strcmp(dir, g_index_dir) == 0 && extra_search_open_root(dir, root))
+        return root->path;
+    return dir;
+}
+
+/* The held FD anchors I/O. BUILD can only publish a resident entry when
+ * the configured path also names that directory at the commit boundary. */
+static bool
+extra_search_build_root_matches(const ExtraSearchRoot *root, const char *dir)
+{
+    struct stat st;
+
+    return !root ||
+           (lstat(dir, &st) == 0 && S_ISDIR(st.st_mode) &&
+            st.st_dev == root->identity.st_dev && st.st_ino == root->identity.st_ino);
+}
+
+/* LOAD attests only files opened directly in the held directory. Follow
+ * symlinks only on the ordinary, unattested fallback path. */
+static int
+extra_search_open_base_file(int root_fd, const char *name)
+{
+    struct stat st;
+    int fd = openat(root_fd, name, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
+
+    if (fd >= 0 && (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode)))
+    {
+        close(fd);
+        fd = -1;
+    }
+    return fd;
 }
 
 /* Phase 3L: raw vector matrix sidecar for GPU brute-force search; written at
@@ -2532,24 +2961,72 @@ build_rev_tid_map(IndexEntry *e)
     e->rev_item_ids = ri;
 }
 
+typedef struct ExtraSearchLoad {
+    ExtraSearchRoot root;
+    int graph_fd;
+    int tids_fd;
+} ExtraSearchLoad;
+
+/* For the optional path, classify and open the base under a single root.
+ * The caller takes ownership of all three FDs on success. */
+static bool
+extra_search_pin_load(uint32_t db_oid, uint32_t index_oid, ExtraSearchLoad *load,
+                      char idx_path[512], char tids_path[512])
+{
+    if (!extra_search_open_root(g_index_dir, &load->root))
+        return false;
+
+    char manifest[512];
+    struct stat st;
+    shards_manifest_path(manifest, sizeof(manifest), load->root.path, db_oid, index_oid);
+    if (lstat(manifest, &st) != 0 && errno == ENOENT)
+    {
+        char graph_name[64], tids_name[64];
+        snprintf(graph_name, sizeof(graph_name), "%u_%u.cagra", db_oid, index_oid);
+        snprintf(tids_name, sizeof(tids_name), "%u_%u.tids", db_oid, index_oid);
+        load->graph_fd = extra_search_open_base_file(load->root.fd, graph_name);
+        if (load->graph_fd >= 0)
+        {
+            load->tids_fd = extra_search_open_base_file(load->root.fd, tids_name);
+            if (load->tids_fd >= 0)
+            {
+                snprintf(idx_path, 512, "/proc/self/fd/%d", load->graph_fd);
+                snprintf(tids_path, 512, "/proc/self/fd/%d", load->tids_fd);
+                return true;
+            }
+            close(load->graph_fd);
+        }
+    }
+    close(load->root.fd);
+    return false;
+}
+
 static int
 load_index(uint32_t db_oid, uint32_t index_oid, CuvsRequester rq)
 {
+    ExtraSearchLoad load;
+    char idx_path[512], tids_path[512];
+    const ExtraSearchRoot *root = extra_search_pin_load(db_oid, index_oid, &load,
+                                                       idx_path, tids_path) ? &load.root : NULL;
+    int rc = -1;
     g_cur_requester_idx = index_oid;
     g_last_admit_reason = CUVS_ADMISSION_NONE;   /* never report a stale reason */
-    char idx_path[512], tids_path[512];
+    const char *io_dir = root ? root->path : g_index_dir;
 
     memset(&t_reload_rej, 0, sizeof(t_reload_rej));
     t_reload_rej.reason = CUVS_ADMISSION_NONE;
-    index_file_path(idx_path, sizeof(idx_path), g_index_dir, db_oid, index_oid);
-    tids_file_path(tids_path, sizeof(tids_path), g_index_dir, db_oid, index_oid);
+    if (!root)
+    {
+        index_file_path(idx_path, sizeof(idx_path), g_index_dir, db_oid, index_oid);
+        tids_file_path(tids_path, sizeof(tids_path), g_index_dir, db_oid, index_oid);
+    }
 
     /* Read + validate the versioned, checksummed .tids sidecar. A reject
      * (bad magic/version/range/crc, legacy headerless format) means this
      * pair must be skipped; the index must be REINDEXed. */
     FILE *f = fopen(tids_path, "rb");
     if (!f)
-        return -1;
+        goto done;
 
     CuvsTidsHeader thdr;
     uint64_t *tids = NULL;
@@ -2558,7 +3035,7 @@ load_index(uint32_t db_oid, uint32_t index_oid, CuvsRequester rq)
         fclose(f);
         LOG_ERROR("pg_cuvs_server: .tids validation failed for %u/%u, skip\n",
                 db_oid, index_oid);
-        return -1;
+        goto done;
     }
     fclose(f);
 
@@ -2573,13 +3050,16 @@ load_index(uint32_t db_oid, uint32_t index_oid, CuvsRequester rq)
         LOG_ERROR("pg_cuvs_server: .tids header dim=0 for %u/%u, skip\n",
                 db_oid, index_oid);
         free(tids);
-        return -1;
+        goto done;
     }
 
-    /* Phase 3F: if a `.shards` manifest exists, this is a sharded logical index.
+    /* The anchored caller already selected an unsharded base in its held
+     * directory. Never consult the logical path with those pinned TIDs.
+     * Phase 3F: if a `.shards` manifest exists, this is a sharded logical index.
      * Load via the shard path (which takes ownership of tids on success). A
      * present-but-invalid manifest fails closed (no unsharded fallback — there
      * is no single .cagra to fall back to). */
+    if (!root)
     {
         int src = load_index_sharded(db_oid, index_oid, &thdr, tids, rq);
         if (src == 0)
@@ -2598,6 +3078,7 @@ load_index(uint32_t db_oid, uint32_t index_oid, CuvsRequester rq)
      * search (refresh_main_bf_cache), so we reserve no graph VRAM here. Detected
      * before the cagra VRAM make-room so a flat load never over-reserves or evicts
      * a cagra index for a graph it will not allocate. */
+    if (!root)
     {
         char fcagra[512], fivfpq[512], fvecs[512];
         index_file_path(fcagra, sizeof(fcagra), g_index_dir, db_oid, index_oid);
@@ -2695,7 +3176,8 @@ load_index(uint32_t db_oid, uint32_t index_oid, CuvsRequester rq)
         LOG_WARN("pg_cuvs_server: no GPU can fit %u/%u (%zu bytes), skip\n",
                  db_oid, index_oid, needed);
         free(tids);
-        return -2;  /* VRAM: index too large for any GPU budget */
+        rc = -2;  /* VRAM: index too large for any GPU budget */
+        goto done;
     }
     AdmitLine al = {.op = "LOAD",
                     .path = admission_load_path(rq),
@@ -2714,7 +3196,8 @@ load_index(uint32_t db_oid, uint32_t index_oid, CuvsRequester rq)
                  total_vram_used(target_gpu) / (1024*1024),
                  needed / (1024*1024));
         free(tids);
-        return -2;  /* VRAM: exhausted after eviction */
+        rc = -2;  /* VRAM: exhausted after eviction */
+        goto done;
     }
 
     if (t_manual_loading)
@@ -2726,13 +3209,13 @@ load_index(uint32_t db_oid, uint32_t index_oid, CuvsRequester rq)
     {
         /* No .cagra sidecar — try .ivfpq (3P IVF-PQ index). */
         char ivfpq_path[512];
-        ivfpq_file_path(ivfpq_path, sizeof(ivfpq_path), g_index_dir, db_oid, index_oid);
+        ivfpq_file_path(ivfpq_path, sizeof(ivfpq_path), io_dir, db_oid, index_oid);
         if (access(ivfpq_path, F_OK) == 0)
             ivfpq_handle = cuvs_ivfpq_deserialize(ivfpq_path, target_gpu);
         if (!ivfpq_handle)
         {
             free(tids);
-            return -1;
+            goto done;
         }
     }
 
@@ -2747,7 +3230,7 @@ load_index(uint32_t db_oid, uint32_t index_oid, CuvsRequester rq)
         if (handle)       cuvs_cagra_free(handle, target_gpu);
         if (ivfpq_handle) cuvs_ivfpq_free(ivfpq_handle, target_gpu);
         free(tids);
-        return -1;
+        goto done;
     }
 
     IndexEntry *e = registry_new_slot();
@@ -2788,13 +3271,15 @@ load_index(uint32_t db_oid, uint32_t index_oid, CuvsRequester rq)
     /* I-FC (ii): just loaded from the files. Only CAGRA single is ever saved
      * by eviction; other kinds keep 0 (unused). */
     e->file_current = handle != NULL;
+    if (handle && metric == CUVS_METRIC_L2)
+        extra_search_attest_directory(e, root);
 
     /* Restore staleness from the .stale sidecar so a daemon restart does not
      * silently resurrect a write-stale index as fresh. */
     {
         char stale_path[512];
         struct stat st;
-        stale_file_path(stale_path, sizeof(stale_path), g_index_dir, db_oid, index_oid);
+        stale_file_path(stale_path, sizeof(stale_path), io_dir, db_oid, index_oid);
         if (stat(stale_path, &st) == 0)
         {
             e->stale = 1;
@@ -2809,7 +3294,15 @@ load_index(uint32_t db_oid, uint32_t index_oid, CuvsRequester rq)
 
     LOG_INFO("pg_cuvs_server: loaded index %u/%u (%lld vecs, %zu MB VRAM)\n",
             db_oid, index_oid, (long long)n_vecs, needed / (1024*1024));
-    return 0;
+    rc = 0;
+done:
+    if (root)
+    {
+        close(load.tids_fd);
+        close(load.graph_fd);
+        close(load.root.fd);
+    }
+    return rc;
 }
 
 /* I3-B usage stats file (UC-1 4c): beside the index files, a dot-name so
@@ -3159,6 +3652,8 @@ registry_new_slot(void)
     e->pinned       = 0;
     e->inflight     = 0;
     e->file_current = 0;
+    e->extra_search_generation = 0;
+    e->extra_search_default_dir = 0;
     e->bf_verdict.valid = 0;            /* #238: never another index's verdict */
     e->hits         = 0;
     e->last_search  = 0;
@@ -3416,17 +3911,23 @@ evict_skipped(const EvictSkip *sk, int n, const IndexEntry *e)
     return 0;
 }
 
+#ifdef CUVS_CAGRA_FOLD_ENABLED
+static uint64_t page_fold_unoffered_bytes_locked(int device);
+static size_t page_fold_reclaim_unoffered_locked(int device);
+#endif
+
 /*
  * Free `need` bytes on device_id for requester rq under the C1 RQ table:
  * one pre-summed pick (nothing evicted on a reject), then victims in order.
  * A victim whose save fails is skipped and the pick is redone for the
  * remainder (EV-3/EV-4 save-failure rule). slot_mode treats every entry as
  * 1 "byte" so the same rules choose a registry slot (reason `slot`).
+ * A preview stops after the policy pick, before returning any resources.
  * Returns 0 when satisfied, -1 otherwise; *pick_out gets the last pick.
  */
 static int
 make_room(int device_id, CuvsRequester rq, uint64_t need, int slot_mode,
-          CuvsEvictPick *pick_out)
+          CuvsEvictPick *pick_out, bool allow_fold_candidates, bool preview)
 {
     EvictSkip skip[64];
     int n_skip = 0;
@@ -3462,16 +3963,19 @@ make_room(int device_id, CuvsRequester rq, uint64_t need, int slot_mode,
             keys[n].legacy.index_oid = e->index_oid;
             n++;
         }
-        for (PageCagraGraph *page = g_page_graphs; page; page = page->next)
+        for (PageCagraGraph *page = slot_mode ? NULL : g_page_graphs; page; page = page->next)
         {
-            if (page->gpu != device_id)
+            bool superseded;
+
+            if (page->gpu != device_id || !page_graph_reclaimable(page))
                 continue;
+            superseded = page_superseded_since_use(page);
             cands[n] = (CuvsEvictCand) {
                 .db_oid = page->db_oid, .index_oid = page->index_oid,
-                .last_use = page->last_search, .hits = page->hits,
-                /* With the same LRU policy, put never-served page graphs first. */
-                .loaded_at = page->last_search ? page->loaded_at : 0,
-                .bytes = slot_mode ? 1 : page->bytes + page->bf_bytes[0] + page->bf_bytes[1],
+                .last_use = superseded ? 0 : page->last_search,
+                .loaded_at = superseded ? 0 : page->loaded_at,
+                .hits = page->hits,
+                .bytes = page->bytes + page->bf_bytes[0] + page->bf_bytes[1],
             };
             keys[n].page = page;
             n++;
@@ -3482,6 +3986,12 @@ make_room(int device_id, CuvsRequester rq, uint64_t need, int slot_mode,
         req.scope = g_reclaim.scope;
         req.soft_evict = g_reclaim.soft_evict;
         req.need = need;
+#ifdef CUVS_CAGRA_FOLD_ENABLED
+        uint64_t fold_bytes = allow_fold_candidates ? page_fold_unoffered_bytes_locked(device_id) : 0;
+        req.need -= fold_bytes < need ? fold_bytes : need;
+#else
+        (void) allow_fold_candidates;
+#endif
         req.now = (int64_t)time(NULL);
         CuvsEvictParams pp = evict_params_now();
         cuvs_evict_pick(cands, n, &pp, &req, victims, reasons, pick_out);
@@ -3490,8 +4000,28 @@ make_room(int device_id, CuvsRequester rq, uint64_t need, int slot_mode,
             free(cands); free(victims); free(reasons); free(keys);
             return -1;
         }
+        if (preview)
+        {
+            free(cands); free(victims); free(reasons); free(keys);
+            return 0;
+        }
         int failed = 0;
-        for (int v = 0; v < pick_out->n_victims; v++)
+#ifdef CUVS_CAGRA_FOLD_ENABLED
+        /* Only apply the credit after the ordinary policy approves the
+         * remainder. Its candidate list still excludes both fold parents. */
+        while (need > req.need)
+        {
+            size_t reclaimed = page_fold_reclaim_unoffered_locked(device_id);
+
+            if (!reclaimed)
+            {
+                free(cands); free(victims); free(reasons); free(keys);
+                return -1;
+            }
+            need = reclaimed >= need ? 0 : need - reclaimed;
+        }
+#endif
+        for (int v = 0; v < pick_out->n_victims && need; v++)
         {
             EvictTarget key = keys[victims[v]];
             uint64_t unit = slot_mode ? 1 : cands[victims[v]].bytes;
@@ -3501,7 +4031,7 @@ make_room(int device_id, CuvsRequester rq, uint64_t need, int slot_mode,
 
                 while (*link && *link != key.page)
                     link = &(*link)->next;
-                if (*link)
+                if (*link && page_graph_reclaimable(*link))
                 {
                     LOG_INFO("[page-evict] %u/%u incarnation=%016llx bytes=%llu\n",
                              key.page->db_oid, key.page->index_oid,
@@ -3546,7 +4076,7 @@ make_slot(int device_id, CuvsRequester rq)
 {
     if (g_n_indexes < g_max_indexes)
         return 1;
-    (void) make_room(device_id, rq, 1, 1, NULL);
+    (void) make_room(device_id, rq, 1, 1, NULL, false, false);
     return g_n_indexes < g_max_indexes;
 }
 
@@ -3557,7 +4087,7 @@ static size_t
 evict_lru(int device_id, CuvsRequester rq)
 {
     size_t before = resident_bytes(device_id) + g_page_graph_bytes[device_id];
-    if (make_room(device_id, rq, 1, 0, NULL) != 0)
+    if (make_room(device_id, rq, 1, 0, NULL, false, false) != 0)
         return 0;
     size_t after = resident_bytes(device_id) + g_page_graph_bytes[device_id];
     return before > after ? before - after : 0;
@@ -3583,6 +4113,194 @@ release_build_vram(size_t needed, int device_id)
     if (g_rmm_pool_limits[device_id] > 0)
         g_pending_rmm_build_vram[device_id] -= needed;
 }
+
+#ifdef CUVS_CAGRA_FOLD_ENABLED
+static int
+page_fold_should_yield(void *context)
+{
+    const int device = *(const int *) context;
+
+    return __atomic_load_n(&g_fold_waiters[device], __ATOMIC_SEQ_CST) != 0;
+}
+
+static uint32_t
+page_fold_active_devices_locked(void)
+{
+    uint32_t devices = 0;
+
+    for (int dev = 0; dev < CUVS_MAX_GPUS; ++dev)
+        if (g_fold_active[dev])
+            devices |= UINT32_C(1) << dev;
+    return devices;
+}
+
+static PageCagraGraph *
+page_fold_unoffered_parent_locked(int device)
+{
+    for (PageCagraGraph *parent = g_page_graphs; parent; parent = parent->next)
+    {
+        const PageCagraGraph *candidate = parent->fold_candidate;
+
+        if (parent->gpu == device && candidate && candidate->bytes &&
+            !candidate->fold_protected_us && !candidate->fold_seen_by_pg)
+            return parent;
+    }
+    return NULL;
+}
+
+static uint64_t
+page_fold_unoffered_bytes_locked(int device)
+{
+    uint64_t bytes = 0;
+
+    for (const PageCagraGraph *parent = g_page_graphs; parent; parent = parent->next)
+    {
+        const PageCagraGraph *candidate = parent->fold_candidate;
+
+        if (parent->gpu == device && candidate &&
+            !candidate->fold_protected_us && !candidate->fold_seen_by_pg)
+            bytes = cuvs_admission_sat_add(bytes, candidate->bytes);
+    }
+    return bytes;
+}
+
+/* Leave ordinary placement alone if that device can fit. If it cannot,
+ * consider devices whose reclaimable READY candidates cover the shortfall. */
+static int
+pick_gpu_for_build(size_t needed, CuvsRequester rq)
+{
+    int preferred = pick_gpu_for_index(needed);
+    int alternative = -1;
+    uint64_t best_room = 0;
+
+    for (int i = 0; preferred >= 0 && i < n_usable_gpus(); ++i)
+    {
+        int dev = usable_gpu(i);
+        uint64_t reclaimable = page_fold_unoffered_bytes_locked(dev);
+        uint64_t limit = budget_eff_bytes(dev);
+
+        if (!reclaimable || (limit && needed > limit))
+            continue;
+        uint64_t free = gpu_free_vram_bytes(dev);
+        uint64_t projected_used = cuvs_admission_sat_add(total_vram_used(dev), needed);
+        uint64_t physical_short = needed > free ? needed - free : 0;
+        uint64_t budget_short = limit && projected_used > limit ? projected_used - limit : 0;
+        uint64_t room = cuvs_admission_sat_add(free, reclaimable);
+        if (limit)
+        {
+            uint64_t used = total_vram_used(dev);
+            uint64_t still_used = used > reclaimable ? used - reclaimable : 0;
+            uint64_t remaining = still_used < limit ? limit - still_used : 0;
+
+            if (remaining < room)
+                room = remaining;
+        }
+        if (room < needed)
+        {
+            uint64_t shortfall = physical_short > budget_short ? physical_short : budget_short;
+
+            /* A child that cannot cover the shortfall alone can still fit
+             * together with the victims already allowed by this request's
+             * policy. Use the same pick as admission, without freeing here. */
+            if (make_room(dev, rq, shortfall, 0, NULL, true, true) != 0)
+                continue;
+            room = needed;
+        }
+        if (room >= needed && room > best_room)
+        {
+            best_room = room;
+            alternative = dev;
+        }
+    }
+    if (alternative >= 0)
+    {
+        uint64_t limit = budget_eff_bytes(preferred);
+        uint64_t used = total_vram_used(preferred);
+
+        if (gpu_free_vram_bytes(preferred) < needed ||
+            (limit && (used >= limit || needed > limit - used)))
+            return alternative;
+    }
+    return preferred;
+}
+
+/* Under admission pressure only. READY and preview lookup use the same
+ * mutex. Free the unexposed child before returning its charge to admission. */
+static size_t
+page_fold_reclaim_unoffered_locked(int device)
+{
+    PageCagraGraph *parent = page_fold_unoffered_parent_locked(device);
+
+    if (!parent)
+        return 0;
+    PageCagraGraph *candidate = parent->fold_candidate;
+    size_t bytes = candidate->bytes;
+    parent->fold_candidate = NULL;
+    parent->fold_retry_after = admission_mono_us() + UINT64_C(1000000);
+    LOG_INFO("[page_fold_reclaim] gpu=%d db=%u index=%u bytes=%zu\n",
+             device, parent->db_oid, parent->index_oid, candidate->bytes);
+    release_page_graph_resources(candidate);
+    finish_page_graph_dispose(candidate);
+    return bytes;
+}
+
+/* Call with the registry lock held. After a wait, callers re-resolve all
+ * registry pointers and admission state while still holding the lock.
+ * A sharded build can use any allowed device, including its fallback. */
+static bool
+page_fold_wait_locked(int device, int client_fd, const CuvsCmdFrame *cmd, const char *op)
+{
+    uint64_t start;
+    uint32_t devices = 0;
+    bool withdrawn = false;
+
+    if (device >= 0)
+        devices = UINT32_C(1) << device;
+    else
+        for (int i = 0; i < n_usable_gpus(); ++i)
+            devices |= UINT32_C(1) << usable_gpu(i);
+    if (!(page_fold_active_devices_locked() & devices))
+        return true;
+    start = admission_mono_us();
+    for (int dev = 0; dev < CUVS_MAX_GPUS; ++dev)
+        if (devices & (UINT32_C(1) << dev))
+            __atomic_fetch_add(&g_fold_waiters[dev], 1, __ATOMIC_SEQ_CST);
+    for (;;)
+    {
+        struct timespec wake;
+        struct pollfd peer = {.fd = client_fd, .events = 0};
+
+        if (poll(&peer, 1, 0) > 0 && (peer.revents & (POLLHUP | POLLERR | POLLNVAL)))
+        {
+            withdrawn = true;
+            break;
+        }
+        if (!(page_fold_active_devices_locked() & devices))
+            break;
+        clock_gettime(CLOCK_REALTIME, &wake);
+        wake.tv_nsec += 100000000;
+        if (wake.tv_nsec >= 1000000000)
+        {
+            wake.tv_nsec -= 1000000000;
+            ++wake.tv_sec;
+        }
+        pthread_cond_timedwait(&g_fold_finished, &g_index_mutex, &wake);
+    }
+    for (int dev = 0; dev < CUVS_MAX_GPUS; ++dev)
+        if (devices & (UINT32_C(1) << dev))
+            __atomic_fetch_sub(&g_fold_waiters[dev], 1, __ATOMIC_SEQ_CST);
+    uint64_t finished = admission_mono_us();
+    LOG_INFO("[page_fold_admission] op=%s db=%u index=%u gpu=%d wait_us=%llu withdrawn=%d gpu_mask=%X"
+             " daemon_id=%llu request_id=%llu wait_started_us=%llu mono_us=%llu\n",
+             op, cmd->db_oid, cmd->index_oid, device,
+             (unsigned long long) (finished - start), withdrawn, devices,
+             (unsigned long long) g_page_daemon_id, (unsigned long long) t_fold_request_id,
+             (unsigned long long) start, (unsigned long long) finished);
+    return !withdrawn;
+}
+#else
+#define pick_gpu_for_build(needed, rq) pick_gpu_for_index(needed)
+#endif
 
 /* Reason for a failed pre-summed pick (nothing was evicted). AR5: the
  * requester's set is short but the EV-1-only set would fit. Otherwise the
@@ -3638,6 +4356,9 @@ ensure_vram(size_t needed, int device_id, CuvsRequester rq, CuvsAdmissionFields 
     size_t quota = g_rmm_pool_limits[device_id];
     size_t pending = quota > 0 ? g_pending_rmm_build_vram[device_id] : 0;
     size_t beff = budget_eff_bytes(device_id);
+#ifdef CUVS_CAGRA_FOLD_ENABLED
+retry_fold_reclaim:
+#endif
     if (line && !line->cache_valid)
     {
         admission_cache_totals(device_id, &line->cache);
@@ -3710,6 +4431,22 @@ ensure_vram(size_t needed, int device_id, CuvsRequester rq, CuvsAdmissionFields 
         /* AR6/AR7 before any eviction: a refusal evicts nothing. */
         if (wr != CUVS_ADMISSION_NONE)
         {
+#ifdef CUVS_CAGRA_FOLD_ENABLED
+            uint64_t reclaimable = page_fold_unoffered_bytes_locked(device_id);
+            CuvsAdmissionWorkspaceInput projected = line->workspace;
+
+            if (quota)
+                projected.pool_used -= reclaimable < projected.pool_used ? reclaimable : projected.pool_used;
+            else
+                projected.phys_free = cuvs_admission_sat_add(projected.phys_free, reclaimable);
+            if (!line->self_res && reclaimable &&
+                cuvs_admission_workspace_check(&projected) == CUVS_ADMISSION_NONE &&
+                page_fold_reclaim_unoffered_locked(device_id))
+            {
+                line->cache_valid = line->workspace_valid = line->pool_valid = 0;
+                goto retry_fold_reclaim;
+            }
+#endif
             g_last_admit_reason = wr;
             goto admission_rejected;
         }
@@ -3738,7 +4475,12 @@ ensure_vram(size_t needed, int device_id, CuvsRequester rq, CuvsAdmissionFields 
     uint64_t need = budget_short > phys_short ? budget_short : phys_short;
     if (pool_short > need)
         need = pool_short;
-    if (need > 0 && make_room(device_id, rq, need, 0, &pk) != 0)
+    bool allow_fold_candidates = false;
+#ifdef CUVS_CAGRA_FOLD_ENABLED
+    allow_fold_candidates = (!line || !line->self_res) &&
+        (rq == CUVS_RQ_BUILD_CAGRA || rq == CUVS_RQ_BUILD_IVFPQ || rq == CUVS_RQ_BUILD_SHARD);
+#endif
+    if (need > 0 && make_room(device_id, rq, need, 0, &pk, allow_fold_candidates, false) != 0)
     {
         g_last_admit_reason = pick_reason(&pk, phys_short > budget_short, pool_short);
         goto admission_rejected;
@@ -4253,6 +4995,89 @@ recv_all(int fd, void *buf, size_t len)
     return 0;
 }
 
+#ifdef CUVS_CAGRA_FOLD_ENABLED
+static const char *
+page_fold_request_operation(const CuvsCmdFrame *cmd)
+{
+    switch (cmd->op)
+    {
+        case CUVS_OP_BUILD: return cmd->n_partials ? "BUILD_MULTI" : "BUILD";
+        case CUVS_OP_BUILD_PAGES: return "BUILD_PAGES";
+        case CUVS_OP_BUILD_IVFPQ: return "BUILD_IVFPQ";
+        case CUVS_OP_BUILD_HNSW_FILE: return "HNSW";
+        case CUVS_OP_HNSW_ROUTE_PREFLIGHT: return "HNSW_PREFLIGHT";
+        case CUVS_OP_EXTEND: return "EXTEND";
+        case CUVS_OP_COMPACT: return "COMPACT";
+        default: return NULL;
+    }
+}
+
+static void
+page_fold_log_hex(char *out, const char *value, size_t len)
+{
+    const char digits[] = "0123456789abcdef";
+
+    for (size_t i = 0; i < len && value[i]; ++i)
+    {
+        unsigned char b = (unsigned char) value[i];
+        *out++ = digits[b >> 4];
+        *out++ = digits[b & 15];
+    }
+    *out = '\0';
+}
+
+static void
+page_fold_log_reply(const CuvsReplyHeader *reply, bool sent, uint64_t when)
+{
+    if (!t_fold_request)
+        return;
+    char error[2 * sizeof(reply->error) + 1] = {0};
+    char err_out[2 * sizeof(reply->err_out) + 1] = {0};
+
+    if (reply)
+    {
+        page_fold_log_hex(error, reply->error, sizeof(reply->error));
+        page_fold_log_hex(err_out, reply->err_out, sizeof(reply->err_out));
+    }
+    LOG_INFO("[page_fold_foreground] op=%s db=%u index=%u daemon_id=%llu request_id=%llu "
+             "started_us=%llu mono_us=%llu response=%s status=%lld error_hex=%s err_out_hex=%s\n",
+             t_fold_request_op, t_fold_request->db_oid, t_fold_request->index_oid,
+             (unsigned long long) g_page_daemon_id, (unsigned long long) t_fold_request_id,
+             (unsigned long long) t_fold_request_started, (unsigned long long) when,
+             !reply ? "missing" : sent ? "sent" : "send_failed", reply ? (long long) reply->status : -1,
+             error, err_out);
+    t_fold_request = NULL;  /* one terminal result for this connection */
+}
+#endif
+
+static int
+send_foreground_reply(int fd, const CuvsReplyHeader *reply)
+{
+#ifdef CUVS_CAGRA_FOLD_ENABLED
+    uint64_t when = t_fold_request ? admission_mono_us() : 0;
+#endif
+    int rc = send_all(fd, reply, sizeof(*reply));
+#ifdef CUVS_CAGRA_FOLD_ENABLED
+    page_fold_log_reply(reply, rc == 0, when);
+#endif
+    return rc;
+}
+
+static void
+send_page_build_reply(int fd, const CuvsReplyHeader *reply, uint64_t graph_nonce)
+{
+#ifdef CUVS_CAGRA_FOLD_ENABLED
+    uint64_t when = t_fold_request ? admission_mono_us() : 0;
+#endif
+    bool sent = send_all(fd, reply, sizeof(*reply)) == 0 &&
+        send_all(fd, &graph_nonce, sizeof(graph_nonce)) == 0;
+#ifdef CUVS_CAGRA_FOLD_ENABLED
+    page_fold_log_reply(reply, sent, when);
+#else
+    (void) sent;
+#endif
+}
+
 static void
 append_notice_logged(CuvsReplyHeader *hdr, const char *msg, const char *detail)
 {
@@ -4304,7 +5129,7 @@ send_error_code(int client_fd, int status, const char *msg)
     hdr.n_results = 0;
     strncpy(hdr.error, msg, sizeof(hdr.error) - 1);
     attach_build_notices(&hdr);
-    send_all(client_fd, &hdr, sizeof(hdr));
+    send_foreground_reply(client_fd, &hdr);
 }
 
 static void
@@ -4355,7 +5180,7 @@ send_admission_reject(int client_fd, int status, const char *legacy_error,
         hdr.err_out[0] = '\0';
     LOG_WARN("[admit_reject] status=%d err_out=\"%s\"\n", status, hdr.err_out);
     attach_build_notices(&hdr);
-    send_all(client_fd, &hdr, sizeof(hdr));
+    send_foreground_reply(client_fd, &hdr);
 }
 
 /* Call with g_index_mutex held, before entering the SDK build.
@@ -4370,6 +5195,13 @@ physical_build_check(int dev, const char *op, const CuvsCmdFrame *cmd,
                      CuvsAdmissionFields *rej)
 {
     uint64_t raw_free = cuvs_vram_raw_free_bytes_on(dev);
+#ifdef CUVS_CAGRA_FOLD_ENABLED
+    if (cmd->op == CUVS_OP_BUILD || cmd->op == CUVS_OP_BUILD_PAGES || cmd->op == CUVS_OP_BUILD_IVFPQ)
+        while (cuvs_build_physical_refuse(raw_free) &&
+               CUVS_BUILD_PHYSICAL_FLOOR_BYTES - raw_free <= page_fold_unoffered_bytes_locked(dev) &&
+               page_fold_reclaim_unoffered_locked(dev))
+            raw_free = cuvs_vram_raw_free_bytes_on(dev);
+#endif
     if (!cuvs_build_physical_refuse(raw_free))
         return 0;
     memset(rej, 0, sizeof(*rej));
@@ -6768,6 +7600,7 @@ typedef struct {
     char     gcs_key_file[512];
     char     cagra_path[512];
     char     tids_path[512];
+    int      artifact_dir_fd;   /* keeps descriptor paths valid for the detached upload */
     uint32_t db_oid;
     uint32_t table_oid;
     uint32_t index_oid;
@@ -6803,6 +7636,8 @@ objstore_upload_thread(void *arg)
     else
         LOG_WARN("objstore: upload FAILED for index %u/%u (non-fatal, local artifact intact)\n",
                  a->db_oid, a->index_oid);
+    if (a->artifact_dir_fd >= 0)
+        close(a->artifact_dir_fd);
     free(a);
     return NULL;
 }
@@ -6908,6 +7743,17 @@ build_sharded(int client_fd, const CuvsCmdFrame *cmd, const char *index_dir,
     memcpy(new_tids, tids_in, tid_bytes);
 
     pthread_mutex_lock(&g_index_mutex);
+#ifdef CUVS_CAGRA_FOLD_ENABLED
+    /* Drain before the first shard allocates. Both the round-robin devices
+     * and the alternative selected by pick_gpu_for_index are covered. */
+    if (!page_fold_wait_locked(-1, client_fd, cmd, "BUILD_SHARD"))
+    {
+        pthread_mutex_unlock(&g_index_mutex);
+        free(new_tids); free(shards); free(recs); free(shard_tmp); free(shard_final);
+        munmap(mem, total);
+        return;
+    }
+#endif
 
     /* --- Build + place each shard over a contiguous range. --- */
     int64_t base   = n_vecs / sc;
@@ -6956,7 +7802,7 @@ build_sharded(int client_fd, const CuvsCmdFrame *cmd, const char *index_dir,
         al.evictions_before = g_cache_evictions[dev];
         if (ensure_vram(needed, dev, CUVS_RQ_BUILD_SHARD, NULL, &al) != 0)
         {
-            int alt = pick_gpu_for_index(needed);
+            int alt = pick_gpu_for_build(needed, CUVS_RQ_BUILD_SHARD);
             al.gpu = alt;
             if (alt < 0)
                 admission_fill(&shard_rej, CUVS_ADMISSION_AR0, needed, -1);
@@ -7238,7 +8084,7 @@ build_sharded(int client_fd, const CuvsCmdFrame *cmd, const char *index_dir,
                      cmd->db_oid, cmd->index_oid);
             CuvsReplyHeader hdr_ok = {0};
             hdr_ok.status = CUVS_STATUS_OK;
-            send_all(client_fd, &hdr_ok, sizeof(hdr_ok));
+            send_foreground_reply(client_fd, &hdr_ok);
             return;
         }
         e = registry_new_slot();
@@ -7284,7 +8130,7 @@ build_sharded(int client_fd, const CuvsCmdFrame *cmd, const char *index_dir,
 
     CuvsReplyHeader hdr_ok = {0};
     hdr_ok.status = CUVS_STATUS_OK;
-    send_all(client_fd, &hdr_ok, sizeof(hdr_ok));
+    send_foreground_reply(client_fd, &hdr_ok);
 
     /* Phase 3G.2: snapshot the whole sharded artifact set to GCS (detached,
      * non-fatal). The local artifacts are already durable; upload failure only
@@ -7354,7 +8200,8 @@ build_sharded(int client_fd, const CuvsCmdFrame *cmd, const char *index_dir,
 static void handle_build_multi(int client_fd, const CuvsCmdFrame *cmd,
                                const char *index_dir);
 static void finish_build_commit(int client_fd, const CuvsCmdFrame *cmd,
-                                const char *save_dir, CuvsCagraIndex new_handle,
+                                const char *save_dir, const ExtraSearchRoot *root,
+                                CuvsCagraIndex new_handle,
                                 uint64_t *new_tids, int target_gpu, size_t needed,
                                 int vectors_committed, const char *vecs_tmp,
                                 const char *vecs_final, uint32_t base_generation,
@@ -7397,17 +8244,49 @@ sync_build_path(const char *path, int flags)
     return result;
 }
 
+/* BUILD, the empty marker and targeted DROP all resolve names in the
+ * daemon's filesystem. Keep its configured spelling for aliases of its root. */
+static bool
+resolve_page_root(const char requested[CUVS_PAGE_INDEX_DIR_SIZE],
+                  char root[CUVS_PAGE_INDEX_DIR_SIZE])
+{
+    struct stat selected, configured;
+    char *resolved;
+    bool valid = false;
+
+    if (!memchr(requested, '\0', CUVS_PAGE_INDEX_DIR_SIZE))
+        return false;
+    resolved = realpath(requested[0] ? requested : g_index_dir, NULL);
+    if (resolved && stat(resolved, &selected) == 0 &&
+        S_ISDIR(selected.st_mode) && selected.st_uid == geteuid())
+    {
+        const char *path = resolved;
+
+        if (stat(g_index_dir, &configured) == 0 &&
+            selected.st_dev == configured.st_dev && selected.st_ino == configured.st_ino)
+            path = g_index_dir;
+        if (strlen(path) < CUVS_PAGE_INDEX_DIR_SIZE)
+        {
+            strcpy(root, path);
+            valid = true;
+            LOG_DEBUG("pg_cuvs_server: page-format index_dir %s resolved to %s\n",
+                      requested, root);
+        }
+    }
+    free(resolved);
+    return valid;
+}
+
 static int
 page_incarnation_dirs(const CuvsCmdFrame *cmd, const CuvsPageBuildRequest *request,
-                      char index_path[512], char incarnation[512])
+                      const char *root, char index_path[512], char incarnation[512])
 {
     struct stat st;
 
-    if (snprintf(index_path, 512, "%s/%u_%u", g_index_dir,
+    if (snprintf(index_path, 512, "%s/%u_%u", root,
                  cmd->db_oid, cmd->index_oid) >= 512 ||
         snprintf(incarnation, 512, "%s/%016llx", index_path,
                  (unsigned long long) request->index_nonce) >= 512 ||
-        (mkdir(g_index_dir, 0700) != 0 && errno != EEXIST) ||
         (mkdir(index_path, 0700) != 0 && errno != EEXIST) ||
         lstat(index_path, &st) != 0 || !S_ISDIR(st.st_mode))
         return -1;
@@ -7457,24 +8336,25 @@ write_page_build_xid(const char *path, const char *name, uint64_t xid)
 }
 
 static int
-sync_page_incarnation(const char *index_path, const char *incarnation)
+sync_page_incarnation(const char *root, const char *index_path, const char *incarnation)
 {
     return (sync_build_path(incarnation, O_DIRECTORY) != 0 ||
             sync_build_path(index_path, O_DIRECTORY) != 0 ||
-            sync_build_path(g_index_dir, O_DIRECTORY) != 0) ? -1 : 0;
+            sync_build_path(root, O_DIRECTORY) != 0) ? -1 : 0;
 }
 
 static int
-persist_empty_page_build(const CuvsCmdFrame *cmd, const CuvsPageBuildRequest *request)
+persist_empty_page_build(const CuvsCmdFrame *cmd, const CuvsPageBuildRequest *request,
+                         const char *root)
 {
     char index_path[512], incarnation[512];
 
-    if (page_incarnation_dirs(cmd, request, index_path, incarnation) != 0)
+    if (page_incarnation_dirs(cmd, request, root, index_path, incarnation) != 0)
         return -1;
     if (write_page_build_xid(incarnation, "empty.xid", request->build_xid) == 0)
     {
         int dir;
-        if (sync_page_incarnation(index_path, incarnation) == 0)
+        if (sync_page_incarnation(root, index_path, incarnation) == 0)
             return 0;
         dir = open(incarnation, O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
         if (dir >= 0)
@@ -7491,7 +8371,7 @@ persist_empty_page_build(const CuvsCmdFrame *cmd, const CuvsPageBuildRequest *re
 /* An unregistered page-format graph is identified by both nonces. */
 static int
 persist_page_build(const CuvsCmdFrame *cmd, const CuvsPageBuildRequest *request,
-                   CuvsCagraIndex handle, int gpu, uint64_t *graph_nonce,
+                   const char *root, CuvsCagraIndex handle, int gpu, uint64_t *graph_nonce,
                    CuvsHnswIndex *cpu_hnsw)
 {
     char index_path[512], incarnation[512], graph[512], filename[512], graph_name[17];
@@ -7503,7 +8383,7 @@ persist_page_build(const CuvsCmdFrame *cmd, const CuvsPageBuildRequest *request,
             return -1;
     } while (nonce == 0);
     snprintf(graph_name, sizeof(graph_name), "%016llx", (unsigned long long) nonce);
-    if (page_incarnation_dirs(cmd, request, index_path, incarnation) != 0)
+    if (page_incarnation_dirs(cmd, request, root, index_path, incarnation) != 0)
         return -1;
     if (snprintf(graph, sizeof(graph), "%s/%s", incarnation, graph_name) >= (int) sizeof(graph) ||
         snprintf(filename, sizeof(filename), "%s/index.cagra", graph) >= (int) sizeof(filename) ||
@@ -7518,7 +8398,7 @@ persist_page_build(const CuvsCmdFrame *cmd, const CuvsPageBuildRequest *request,
         sync_build_path(filename, 0) != 0 ||
         write_page_build_xid(graph, "build.xid", request->build_xid) != 0 ||
         sync_build_path(graph, O_DIRECTORY) != 0 ||
-        sync_page_incarnation(index_path, incarnation) != 0)
+        sync_page_incarnation(root, index_path, incarnation) != 0)
         goto failed;
     if (cmd->use_cpu_hnsw &&
         snprintf(filename, sizeof(filename), "%s/index.hnsw", graph) < (int) sizeof(filename) &&
@@ -7560,7 +8440,7 @@ static void
 handle_mark_pages_empty(int client_fd, const CuvsCmdFrame *cmd)
 {
     CuvsPageBuildRequest request;
-    char index_dir[256] = "";
+    char index_dir[CUVS_PAGE_INDEX_DIR_SIZE], root[CUVS_PAGE_INDEX_DIR_SIZE];
     int fd = -1;
     CuvsReplyHeader reply = {.status = CUVS_STATUS_PERSIST_FAILED};
 
@@ -7573,7 +8453,12 @@ handle_mark_pages_empty(int client_fd, const CuvsCmdFrame *cmd)
         send_error(client_fd, "invalid empty page-format BUILD notification");
         return;
     }
-    if (persist_empty_page_build(cmd, &request) == 0)
+    if (!resolve_page_root(index_dir, root))
+    {
+        send_error_code(client_fd, CUVS_STATUS_INVALID_PAGE_ROOT, "invalid page-format index_dir");
+        return;
+    }
+    if (persist_empty_page_build(cmd, &request, root) == 0)
     {
         pthread_mutex_lock(&g_index_mutex);
         ++g_page_deferral_epoch;
@@ -7609,7 +8494,8 @@ handle_build(int client_fd, const CuvsCmdFrame *cmd)
     }
     clear_build_notices();
     LOG_DEBUG("[handle_build] reading index_dir...\n");
-    char index_dir[256] = {0};
+    char index_dir[CUVS_PAGE_INDEX_DIR_SIZE] = {0};
+    char page_root[CUVS_PAGE_INDEX_DIR_SIZE];
     /* ADR-057: the backend may pass the corpus as an SCM_RIGHTS memfd alongside
      * index_dir (memfd tier); passed_fd is -1 for the shm/heap tiers. */
     int  passed_fd = -1;
@@ -7617,6 +8503,13 @@ handle_build(int client_fd, const CuvsCmdFrame *cmd)
     {
         LOG_ERROR("[handle_build] recv index_dir FAILED errno=%d\n", errno);
         send_error(client_fd, "recv index_dir failed");
+        return;
+    }
+    if (page_build && !resolve_page_root(index_dir, page_root))
+    {
+        if (passed_fd >= 0)
+            close(passed_fd);
+        send_error_code(client_fd, CUVS_STATUS_INVALID_PAGE_ROOT, "invalid page-format index_dir");
         return;
     }
     LOG_DEBUG("[handle_build] got index_dir=%s passed_fd=%d\n", index_dir, passed_fd);
@@ -7789,7 +8682,26 @@ handle_build(int client_fd, const CuvsCmdFrame *cmd)
                                                     cmd->graph_degree,
                                                     cmd->intermediate_graph_degree,
                                                     cmd->build_algo)};
-    int target_gpu = pick_gpu_for_index(needed);
+#ifdef CUVS_CAGRA_FOLD_ENABLED
+    if (!page_fold_wait_locked(-1, client_fd, cmd, "BUILD"))
+    {
+        pthread_mutex_unlock(&g_index_mutex);
+        munmap(mem, total);
+        return;
+    }
+#endif
+#ifdef CUVS_CAGRA_FOLD_ENABLED
+    /* The same-OID legacy graph remains available until the new page
+     * relation commits, so it cannot finance the placement preview. */
+    IndexEntry *preview_legacy = page_build ? find_index(cmd->db_oid, cmd->index_oid) : NULL;
+    if (preview_legacy)
+        ++preview_legacy->inflight;
+#endif
+    int target_gpu = pick_gpu_for_build(needed, CUVS_RQ_BUILD_CAGRA);
+#ifdef CUVS_CAGRA_FOLD_ENABLED
+    if (preview_legacy)
+        --preview_legacy->inflight;
+#endif
     if (target_gpu < 0)
     {
         LOG_WARN("[handle_build] index %u/%u (%zu bytes) too large for any GPU budget\n",
@@ -7816,7 +8728,12 @@ handle_build(int client_fd, const CuvsCmdFrame *cmd)
 
         while (budget && needed <= budget &&
                total_vram_used(target_gpu) > budget - needed &&
-               evict_page_graph(target_gpu))
+               (
+#ifdef CUVS_CAGRA_FOLD_ENABLED
+                (total_vram_used(target_gpu) - (budget - needed) <= page_fold_unoffered_bytes_locked(target_gpu) &&
+                 page_fold_reclaim_unoffered_locked(target_gpu)) ||
+#endif
+                evict_page_graph(target_gpu)))
             ;
         while (g_n_indexes + g_n_page_graphs >= g_max_indexes && evict_page_graph(-1))
             ;
@@ -7892,6 +8809,7 @@ handle_build(int client_fd, const CuvsCmdFrame *cmd)
                   cmd->db_oid, cmd->index_oid);
     log_admit(&al, CUVS_ADMISSION_NONE);
     pthread_mutex_unlock(&g_index_mutex);
+    release_retired_page_overlays();
 
     LOG_DEBUG("[handle_build] calling cuvs_cagra_build n_vecs=%lld dim=%u gpu=%d...\n",
             (long long)cmd->n_vecs, cmd->dim, target_gpu);
@@ -7918,10 +8836,10 @@ handle_build(int client_fd, const CuvsCmdFrame *cmd)
     uint64_t page_graph_nonce = 0;
     CuvsHnswIndex page_cpu_hnsw = NULL;
     int page_status = page_build && new_handle ?
-        persist_page_build(cmd, page_build, new_handle, target_gpu,
+        persist_page_build(cmd, page_build, page_root, new_handle, target_gpu,
                            &page_graph_nonce, &page_cpu_hnsw) : 0;
     if (page_build && build_att)
-        page_status = persist_empty_page_build(cmd, page_build);
+        page_status = persist_empty_page_build(cmd, page_build, page_root);
 #ifdef CUVS_TEST_HOOKS
     /* With no production BF builder in this stage, a fixture can attach one
      * while BUILD still owns the input corpus and does not hold L0. */
@@ -7956,8 +8874,7 @@ handle_build(int client_fd, const CuvsCmdFrame *cmd)
         munmap(mem, total);
         LOG_WARN("pg_cuvs_server: page-format BUILD %u/%u has no attached dataset; using exact heap search\n",
                  cmd->db_oid, cmd->index_oid);
-        if (send_all(client_fd, &reply, sizeof(reply)) == 0)
-            send_all(client_fd, &page_graph_nonce, sizeof(page_graph_nonce));
+        send_page_build_reply(client_fd, &reply, page_graph_nonce);
         return;
     }
 
@@ -8016,6 +8933,7 @@ handle_build(int client_fd, const CuvsCmdFrame *cmd)
             entry->db_oid = cmd->db_oid;
             entry->index_oid = cmd->index_oid;
             entry->index_nonce = page_build->index_nonce;
+            entry->base_nonce = page_graph_nonce;
             entry->graph_nonce = page_graph_nonce;
             entry->build_xid = page_build->build_xid;
             entry->n_slots = cmd->n_vecs;
@@ -8024,6 +8942,7 @@ handle_build(int client_fd, const CuvsCmdFrame *cmd)
             entry->gpu = target_gpu;
             entry->handle = new_handle;
             entry->loaded_at = time(NULL);
+            entry->registered_order = ++g_page_access;
             entry->cpu_hnsw = page_cpu_hnsw;
             entry->bytes = final;
             entry->next = g_page_graphs;
@@ -8062,8 +8981,7 @@ handle_build(int client_fd, const CuvsCmdFrame *cmd)
             LOG_WARN("pg_cuvs_server: page-format graph %u/%u persisted without a resident entry\n",
                      cmd->db_oid, cmd->index_oid);
         reply.status = CUVS_STATUS_OK;
-        if (send_all(client_fd, &reply, sizeof(reply)) == 0)
-            send_all(client_fd, &page_graph_nonce, sizeof(page_graph_nonce));
+        send_page_build_reply(client_fd, &reply, page_graph_nonce);
         return;
     }
 
@@ -8081,6 +8999,8 @@ handle_build(int client_fd, const CuvsCmdFrame *cmd)
     /* --- Disk persistence: tmp -> rename pattern --- */
     const char *save_dir = (index_dir[0] != '\0') ? index_dir : g_index_dir;
     mkdir(save_dir, 0700);
+    ExtraSearchRoot root = {.fd = -1};
+    const char *io_dir = extra_search_build_dir(cmd, save_dir, &root);
 
     /* Phase 3L: persist the raw vector matrix as a `.vectors` sidecar for GPU
      * brute-force search, written from `vecs` (the shm payload) while it is
@@ -8091,7 +9011,7 @@ handle_build(int client_fd, const CuvsCmdFrame *cmd)
     uint32_t tids_gen = cuvs_crc32(new_tids, (size_t)cmd->n_vecs * sizeof(uint64_t));
     char vecs_final[512], vecs_tmp[576];
     int  vectors_committed = 0;
-    vectors_file_path(vecs_final, sizeof(vecs_final), save_dir, cmd->db_oid, cmd->index_oid);
+    vectors_file_path(vecs_final, sizeof(vecs_final), io_dir, cmd->db_oid, cmd->index_oid);
     snprintf(vecs_tmp, sizeof(vecs_tmp), "%s.tmp", vecs_final);
     {
         FILE *vf = fopen(vecs_tmp, "wb");
@@ -8106,7 +9026,6 @@ handle_build(int client_fd, const CuvsCmdFrame *cmd)
             vectors_committed = 1;   /* tmp ready; renamed at the commit point */
         } else {
             if (vf) unlink(vecs_tmp);
-            unlink(vecs_final);      /* drop any stale prior sidecar */
             LOG_WARN("[handle_build] .vectors sidecar not written for %u/%u; "
                      "brute_force unavailable until REINDEX\n",
                      cmd->db_oid, cmd->index_oid);
@@ -8116,9 +9035,11 @@ handle_build(int client_fd, const CuvsCmdFrame *cmd)
 
     /* ADR-059: the persist/commit/registry/reply sequence is shared with the
      * multi-partial build path (handle_build_multi). */
-    finish_build_commit(client_fd, cmd, save_dir, new_handle, new_tids,
+    finish_build_commit(client_fd, cmd, save_dir, root.fd >= 0 ? &root : NULL, new_handle, new_tids,
                         target_gpu, final, vectors_committed, vecs_tmp, vecs_final,
                         tids_gen, NULL, -1, NULL);
+    if (root.fd >= 0)
+        close(root.fd);
 }
 
 /* Direct .cagra check (PG_CUVS_DIRECT_CAGRA_VERIFY=1): serialize the same index
@@ -8181,11 +9102,75 @@ cagra_direct_verify(CuvsCagraIndex handle, const char *direct_path, int target_g
     return first_diff < 0 ? 1 : 0;
 }
 
+typedef struct CagraBuildBackup {
+    char dir[64];
+    char tids[80], graph[80];
+    bool had_tids, had_graph;
+} CagraBuildBackup;
+
+static bool
+backup_cagra_file(const char *path, const char *backup, bool *present)
+{
+    if (linkat(AT_FDCWD, path, AT_FDCWD, backup, 0) == 0)
+    {
+        *present = true;
+        return true;
+    }
+    /* A missing prior final needs no backup. Preserve symlink entries as
+     * entries, including dangling links, rather than following targets. */
+    struct stat st;
+    return errno == ENOENT && lstat(path, &st) < 0 && errno == ENOENT;
+}
+
+static bool
+backup_cagra_base(const ExtraSearchRoot *root, const char *tids, const char *graph,
+                  CagraBuildBackup *backup)
+{
+    snprintf(backup->dir, sizeof(backup->dir), "%s/.cagra-build-XXXXXX", root->path);
+    if (!mkdtemp(backup->dir))
+    {
+        backup->dir[0] = '\0';
+        return false;
+    }
+    snprintf(backup->tids, sizeof(backup->tids), "%s/tids", backup->dir);
+    snprintf(backup->graph, sizeof(backup->graph), "%s/graph", backup->dir);
+    return backup_cagra_file(tids, backup->tids, &backup->had_tids) &&
+           backup_cagra_file(graph, backup->graph, &backup->had_graph);
+}
+
+static void
+discard_cagra_build_backup(const CagraBuildBackup *backup)
+{
+    if (!backup->dir[0])
+        return;
+    if (backup->had_tids)
+        unlink(backup->tids);
+    if (backup->had_graph)
+        unlink(backup->graph);
+    if (rmdir(backup->dir) != 0)
+        LOG_WARN("[handle_build] cannot remove backup directory %s: %s\n",
+                 backup->dir, strerror(errno));
+}
+
+static bool
+restore_cagra_file(const char *path, const char *backup, bool had_prior)
+{
+    int rc = had_prior ? rename(backup, path) : unlink(path);
+
+    if (rc == 0 || (!had_prior && errno == ENOENT))
+        return true;
+    LOG_ERROR("[handle_build] cannot restore %s: %s\n", path, strerror(errno));
+    return false;
+}
+
 /* Persist a freshly built CAGRA index (tmp+rename), swap it into the registry,
  * and reply OK — the durable commit tail shared by the single-corpus and ADR-059
  * multi-partial build paths. On entry the caller holds g_index_mutex, has built
  * new_handle, assembled the contiguous new_tids, and staged the .vectors sidecar
- * (vectors_committed + vecs_tmp/vecs_final). This releases g_index_mutex.
+ * (vectors_committed + vecs_tmp/vecs_final). If root is present, the caller
+ * has staged all its temporaries under root->path and keeps the FD open
+ * through this call. save_dir remains the logical path. This releases
+ * g_index_mutex.
  *
  * pre_cagra_tmp/pre_cagra_fd/pre_layout (NULL/-1/NULL = none) are a
  * .cagra temp file whose dataset body the caller already wrote at the layout's
@@ -8196,6 +9181,7 @@ cagra_direct_verify(CuvsCagraIndex handle, const char *direct_path, int target_g
  * cuvs_cagra_serialize as before. On failure the temp file is deleted. */
 static void
 finish_build_commit(int client_fd, const CuvsCmdFrame *cmd, const char *save_dir,
+                    const ExtraSearchRoot *root,
                     CuvsCagraIndex new_handle, uint64_t *new_tids, int target_gpu,
                     size_t needed, int vectors_committed, const char *vecs_tmp,
                     const char *vecs_final, uint32_t base_generation,
@@ -8204,10 +9190,20 @@ finish_build_commit(int client_fd, const CuvsCmdFrame *cmd, const char *save_dir
 {
     char idx_final[512],  idx_tmp[576];
     char tids_final[512], tids_tmp[576];
+    char hnsw_path[512], hnsw_tmp[96] = "";
+    int hnsw_rc = CUVS_HNSW_SERIALIZE_SKIPPED;
+    const char *io_dir = root ? root->path : save_dir;
+    const char *persist_error = "disk persistence failed";
+    const ExtraSearchRoot *attested_root = NULL;
     int  cagra_fd = pre_cagra_fd;
     int  cagra_direct = 0;
-    index_file_path(idx_final,  sizeof(idx_final),  save_dir, cmd->db_oid, cmd->index_oid);
-    tids_file_path(tids_final,  sizeof(tids_final), save_dir, cmd->db_oid, cmd->index_oid);
+    bool tids_published = false, graph_published = false;
+    CagraBuildBackup backup = {0};
+    IndexEntry *previous = find_index(cmd->db_oid, cmd->index_oid);
+    if (previous)
+        previous->extra_search_generation = 0;
+    index_file_path(idx_final,  sizeof(idx_final),  io_dir, cmd->db_oid, cmd->index_oid);
+    tids_file_path(tids_final,  sizeof(tids_final), io_dir, cmd->db_oid, cmd->index_oid);
     snprintf(idx_tmp,  sizeof(idx_tmp),  "%s.tmp", idx_final);
     snprintf(tids_tmp, sizeof(tids_tmp), "%s.tmp", tids_final);
 
@@ -8276,51 +9272,119 @@ finish_build_commit(int client_fd, const CuvsCmdFrame *cmd, const char *save_dir
         goto persist_fail;
     }
 #endif
+    if (!extra_search_build_root_matches(root, save_dir))
+        goto root_changed;
+    if (root)
+    {
+        /* Both old names must be recoverable before either is replaced.
+         * Hard links retain the prior pair without copying the corpus. */
+        if (!backup_cagra_base(root, tids_final, idx_final, &backup))
+        {
+            persist_error = "could not back up the prior CAGRA artifacts";
+            LOG_WARN("[handle_build] %u/%u: %s: %s\n",
+                     cmd->db_oid, cmd->index_oid, persist_error, strerror(errno));
+            goto persist_fail;
+        }
+        if (!extra_search_build_root_matches(root, save_dir))
+            goto root_changed;
+    }
     if (rename(tids_tmp, tids_final) != 0) {
         LOG_ERROR("[handle_build] rename %s -> %s FAILED errno=%d (%s)\n",
                 tids_tmp, tids_final, errno, strerror(errno));
         goto persist_fail;
     }
+    tids_published = true;
+    if (root && previous)
+        previous->file_current = 0;    /* I-FC: the prior pair changed on disk */
+    if (!extra_search_build_root_matches(root, save_dir))
+        goto root_changed;
 #ifdef CUVS_TEST_HOOKS
     if (cuvs_fault("CUVS_FAULT_RENAME_CAGRA")) {
         LOG_ERROR("[handle_build] fault injection: CUVS_FAULT_RENAME_CAGRA\n");
-        unlink(tids_final);
+        if (!root)
+            unlink(tids_final);
         goto persist_fail;
     }
 #endif
     if (rename(idx_tmp, idx_final) != 0) {
         LOG_ERROR("[handle_build] rename %s -> %s FAILED errno=%d (%s); "
-                  "unlinking tids to avoid mismatch\n",
+                  "recovering tids to avoid mismatch\n",
                 idx_tmp, idx_final, errno, strerror(errno));
-        unlink(tids_final);
+        if (!root)
+            unlink(tids_final);
         goto persist_fail;
     }
+    graph_published = true;
     /* fsync directory so the rename(s) are durable. */
-    int dir_fd = open(save_dir, O_RDONLY);
+    int dir_fd = open(io_dir, O_RDONLY);
     if (dir_fd >= 0) { fsync(dir_fd); close(dir_fd); }
+    if (!extra_search_build_root_matches(root, save_dir))
+        goto root_changed;
 
-    /* Phase 3L: commit the .vectors sidecar. Non-fatal — the index is already
-     * durably committed above (cagra + tids renamed); a rename failure only
-     * disables brute_force. The generation token guards a torn post-cagra,
-     * pre-vectors crash: a stale sidecar is rejected at load. */
-    if (vectors_committed) {
-        if (rename(vecs_tmp, vecs_final) != 0) {
-            LOG_WARN("[handle_build] rename %s -> %s failed errno=%d; brute_force unavailable\n",
-                     vecs_tmp, vecs_final, errno);
-            unlink(vecs_tmp);
-            unlink(vecs_final);
-            vectors_committed = 0;
-        } else {
-            int vdir_fd = open(save_dir, O_RDONLY);
-            if (vdir_fd >= 0) { fsync(vdir_fd); close(vdir_fd); }
+    /* A temporary symlink can survive rename. Only attest regular files in
+     * the held directory after both names have been published. */
+    struct stat published;
+    if (root && lstat(idx_final, &published) == 0 && S_ISREG(published.st_mode) &&
+        lstat(tids_final, &published) == 0 && S_ISREG(published.st_mode))
+        attested_root = root;
+
+    /* The HNSW conversion can take time. For an anchored build, stage it
+     * inside the private backup directory so the prior sidecar is still
+     * available if the root changes before the final publication check. */
+    if (cmd->use_cpu_hnsw)
+    {
+        hnsw_file_path(hnsw_path, sizeof(hnsw_path), io_dir, cmd->db_oid, cmd->index_oid);
+        if (root)
+        {
+            snprintf(hnsw_tmp, sizeof(hnsw_tmp), "%s/staged.hnsw", backup.dir);
+            hnsw_rc = cuvs_hnsw_serialize(new_handle, hnsw_tmp, target_gpu);
         }
     }
+
+    IndexEntry *existing = find_index(cmd->db_oid, cmd->index_oid);
+    int registry_full = 0;
+    if (!existing)
+    {
+        g_cur_requester_idx = cmd->index_oid;
+        if (g_n_indexes >= g_max_indexes)
+        {
+            if (!extra_search_build_root_matches(root, save_dir))
+                goto root_changed;
+            (void) make_slot(target_gpu, CUVS_RQ_BUILD_CAGRA);
+        }
+        registry_full = g_n_indexes >= g_max_indexes;
+#ifdef CUVS_TEST_HOOKS
+        registry_full |= cuvs_fault("CUVS_FAULT_REGISTRY_FULL");
+#endif
+    }
+
+    /* Both a resident publish and the registry-full disk-only success
+     * depend on this check. Do not retire any prior sidecars above it. */
+    if (!extra_search_build_root_matches(root, save_dir))
+        goto root_changed;
+
+    /* A failed or missing .vectors stage leaves BF unavailable for this
+     * newly committed base. All changes to its final name happen here. */
+    if (vectors_committed && rename(vecs_tmp, vecs_final) != 0)
+    {
+        LOG_WARN("[handle_build] rename %s -> %s failed errno=%d; brute_force unavailable\n",
+                 vecs_tmp, vecs_final, errno);
+        unlink(vecs_tmp);
+        vectors_committed = 0;
+    }
+    if (vectors_committed)
+    {
+        int vdir_fd = open(io_dir, O_RDONLY);
+        if (vdir_fd >= 0) { fsync(vdir_fd); close(vdir_fd); }
+    }
+    else
+        unlink(vecs_final);
 
     /* A rebuild produces a fresh graph reflecting the current heap — clear any
      * persisted staleness marker. */
     {
         char stale_path[512];
-        stale_file_path(stale_path, sizeof(stale_path), save_dir,
+        stale_file_path(stale_path, sizeof(stale_path), io_dir,
                         cmd->db_oid, cmd->index_oid);
         unlink(stale_path);
     }
@@ -8330,19 +9394,17 @@ finish_build_commit(int client_fd, const CuvsCmdFrame *cmd, const char *save_dir
      * take the sharded path), then the contiguous shard .cagra files. */
     {
         char shards_path[512];
-        shards_manifest_path(shards_path, sizeof(shards_path), save_dir,
+        shards_manifest_path(shards_path, sizeof(shards_path), io_dir,
                              cmd->db_oid, cmd->index_oid);
         unlink(shards_path);
         for (uint32_t s = 0; s < CUVS_SHARDS_MAX; s++)
         {
             char sp[512];
-            shard_cagra_path(sp, sizeof(sp), save_dir, cmd->db_oid, cmd->index_oid, s);
+            shard_cagra_path(sp, sizeof(sp), io_dir, cmd->db_oid, cmd->index_oid, s);
             if (unlink(sp) != 0)
                 break;   /* contiguous ids: first miss => no more shards */
         }
     }
-
-    LOG_DEBUG("[handle_build] disk commit OK\n");
 
     /* Phase 3I-1: write CPU HNSW fallback sidecar — only when the backend
      * requested it (cuvs.cpu_hnsw_fallback=on or a 3I import_hnsw flow).
@@ -8350,17 +9412,25 @@ finish_build_commit(int client_fd, const CuvsCmdFrame *cmd, const char *save_dir
      * work that would never be used. */
     if (cmd->use_cpu_hnsw)
     {
-        char hnsw_path[512];
-        hnsw_file_path(hnsw_path, sizeof(hnsw_path), save_dir,
-                       cmd->db_oid, cmd->index_oid);
-        int hrc = cuvs_hnsw_serialize(new_handle, hnsw_path, target_gpu);
-        if (hrc == CUVS_HNSW_SERIALIZE_SKIPPED)
+        if (root)
+        {
+            if (hnsw_rc == CUVS_HNSW_SERIALIZE_OK && rename(hnsw_tmp, hnsw_path) != 0)
+            {
+                LOG_WARN("[handle_build] rename %s -> %s failed errno=%d\n",
+                         hnsw_tmp, hnsw_path, errno);
+                hnsw_rc = -1;
+            }
+            unlink(hnsw_tmp);
+        }
+        else
+            hnsw_rc = cuvs_hnsw_serialize(new_handle, hnsw_path, target_gpu);
+        if (hnsw_rc == CUVS_HNSW_SERIALIZE_SKIPPED)
             /* #106: no file was written — say so, so the log does not claim a
              * sidecar that a later cpu_hnsw search will fail to open. */
             LOG_WARN("[handle_build] no HNSW fallback sidecar for %u/%u: "
                      "fewer than %d vectors; cpu_hnsw searches will use GPU CAGRA\n",
                      cmd->db_oid, cmd->index_oid, CUVS_HNSW_MIN_ELEMENTS);
-        else if (hrc != CUVS_HNSW_SERIALIZE_OK)
+        else if (hnsw_rc != CUVS_HNSW_SERIALIZE_OK)
             LOG_WARN("[handle_build] HNSW fallback sidecar not saved for %u/%u\n",
                      cmd->db_oid, cmd->index_oid);
         else
@@ -8371,8 +9441,9 @@ finish_build_commit(int client_fd, const CuvsCmdFrame *cmd, const char *save_dir
         }
     }
 
+    LOG_DEBUG("[handle_build] disk commit OK\n");
+
     /* --- Swap into registry --- */
-    IndexEntry *existing = find_index(cmd->db_oid, cmd->index_oid);
     if (existing) {
         /* Phase 3F: a prior sharded instance is replaced by this unsharded
          * build — free all its shard handles, not a (NULL) single handle. */
@@ -8410,18 +9481,11 @@ finish_build_commit(int client_fd, const CuvsCmdFrame *cmd, const char *save_dir
         /* I-FC (i): build saved its files first, but eviction saves/reloads
          * through g_index_dir only, so a per-index index_dir is never current. */
         existing->file_current = strcmp(save_dir, g_index_dir) == 0;
+        extra_search_attest_directory(existing, attested_root);
         existing->compact_count++;     /* every rebuild counts as a compaction */
         existing->last_compact_at = time(NULL);
         build_rev_tid_map(existing);   /* rebuild map for new tids/n_vecs */
     } else {
-        int registry_full;
-        g_cur_requester_idx = cmd->index_oid;
-        if (g_n_indexes >= g_max_indexes)
-            (void) make_slot(target_gpu, CUVS_RQ_BUILD_CAGRA);
-        registry_full = g_n_indexes >= g_max_indexes;
-#ifdef CUVS_TEST_HOOKS
-        registry_full |= cuvs_fault("CUVS_FAULT_REGISTRY_FULL");
-#endif
         if (registry_full) {
             /* Registry full and the LRU couldn't be evicted (e.g. all entries
              * inflight on other GPUs). The artifacts are already durable on
@@ -8431,7 +9495,6 @@ finish_build_commit(int client_fd, const CuvsCmdFrame *cmd, const char *save_dir
              * requester gets a NOTICE through notice_out instead of silence. */
             LOG_WARN("[handle_build] registry full; %u/%u persisted, will reload on demand\n",
                      cmd->db_oid, cmd->index_oid);
-            (void) vectors_committed;   /* .vectors stays on disk for the reload */
             cuvs_cagra_free(new_handle, target_gpu);
             free(new_tids);
             pthread_mutex_unlock(&g_index_mutex);
@@ -8442,7 +9505,8 @@ finish_build_commit(int client_fd, const CuvsCmdFrame *cmd, const char *save_dir
                      "was saved to disk and loads into GPU memory on its first query",
                      g_max_indexes);
             attach_build_notices(&hdr_ok);
-            send_all(client_fd, &hdr_ok, sizeof(hdr_ok));
+            send_foreground_reply(client_fd, &hdr_ok);
+            discard_cagra_build_backup(&backup);
             return;
         }
         IndexEntry *e = registry_new_slot();
@@ -8487,6 +9551,7 @@ finish_build_commit(int client_fd, const CuvsCmdFrame *cmd, const char *save_dir
         reset_entry_stats(e);
         e->graph_degree = (int)cmd->graph_degree;  /* for extend/compact VRAM est */
         e->file_current = strcmp(save_dir, g_index_dir) == 0;   /* I-FC (i), as above */
+        extra_search_attest_directory(e, attested_root);
     }
 
     pthread_mutex_unlock(&g_index_mutex);
@@ -8498,7 +9563,8 @@ finish_build_commit(int client_fd, const CuvsCmdFrame *cmd, const char *save_dir
     CuvsReplyHeader hdr_ok = {0};
     hdr_ok.status = CUVS_STATUS_OK;
     attach_build_notices(&hdr_ok);
-    send_all(client_fd, &hdr_ok, sizeof(hdr_ok));
+    send_foreground_reply(client_fd, &hdr_ok);
+    discard_cagra_build_backup(&backup);
 
     /* Phase 3C: upload to GCS in a detached thread after replying OK.
      * CREATE INDEX has already returned; upload failure is non-fatal. */
@@ -8507,11 +9573,27 @@ finish_build_commit(int client_fd, const CuvsCmdFrame *cmd, const char *save_dir
         UploadThreadArgs *ua = malloc(sizeof(*ua));
         if (ua)
         {
+            const char *upload_dir = save_dir;
+            char pinned_dir[32];
+            ua->artifact_dir_fd = -1;
+            if (root)
+            {
+                ua->artifact_dir_fd = fcntl(root->fd, F_DUPFD_CLOEXEC, 0);
+                if (ua->artifact_dir_fd < 0)
+                {
+                    LOG_WARN("objstore: cannot pin artifact directory for %u/%u\n",
+                             cmd->db_oid, cmd->index_oid);
+                    free(ua);
+                    return;
+                }
+                snprintf(pinned_dir, sizeof(pinned_dir), "/proc/self/fd/%d", ua->artifact_dir_fd);
+                upload_dir = pinned_dir;
+            }
             strncpy(ua->snapshot_uri, g_snapshot_uri, sizeof(ua->snapshot_uri) - 1);
             strncpy(ua->cluster_id,   g_cluster_id,   sizeof(ua->cluster_id)   - 1);
             strncpy(ua->gcs_key_file, g_gcs_key_file, sizeof(ua->gcs_key_file) - 1);
-            strncpy(ua->cagra_path,   idx_final,       sizeof(ua->cagra_path)   - 1);
-            strncpy(ua->tids_path,    tids_final,      sizeof(ua->tids_path)    - 1);
+            index_file_path(ua->cagra_path, sizeof(ua->cagra_path), upload_dir, cmd->db_oid, cmd->index_oid);
+            tids_file_path(ua->tids_path, sizeof(ua->tids_path), upload_dir, cmd->db_oid, cmd->index_oid);
             ua->db_oid      = cmd->db_oid;
             ua->table_oid   = cmd->table_oid;
             ua->index_oid   = cmd->index_oid;
@@ -8529,6 +9611,8 @@ finish_build_commit(int client_fd, const CuvsCmdFrame *cmd, const char *save_dir
             {
                 LOG_WARN("objstore: failed to spawn upload thread for %u/%u\n",
                          cmd->db_oid, cmd->index_oid);
+                if (ua->artifact_dir_fd >= 0)
+                    close(ua->artifact_dir_fd);
                 free(ua);
             }
             pthread_attr_destroy(&upload_attr);
@@ -8536,11 +9620,35 @@ finish_build_commit(int client_fd, const CuvsCmdFrame *cmd, const char *save_dir
     }
     return;
 
+root_changed:
+    persist_error = "index directory changed during CAGRA build publication";
+    LOG_WARN("[handle_build] %u/%u: %s (tids_published=%d graph_published=%d)\n",
+             cmd->db_oid, cmd->index_oid, persist_error, tids_published, graph_published);
+    if (previous)
+        previous->file_current = 0;
 persist_fail:
-    /* Disk persistence failed before commit. Existing entry (if any) remains
-     * intact in registry. Clean up new resources and tmp files. The prior
-     * `.vectors` (if any) is left intact — it still matches the surviving
-     * (un-renamed) prior `.tids`/`.cagra`; only our new tmp is removed. */
+    if (hnsw_tmp[0])
+        unlink(hnsw_tmp);
+    if (root && tids_published)
+    {
+        bool restored = restore_cagra_file(tids_final, backup.tids, backup.had_tids);
+        if (graph_published && !restore_cagra_file(idx_final, backup.graph, backup.had_graph))
+            restored = false;
+        if (restored)
+            discard_cagra_build_backup(&backup);
+        else
+        {
+            persist_error = "CAGRA publication failed and prior artifacts need recovery";
+            LOG_ERROR("[handle_build] %u/%u: %s; retained backups in %s\n",
+                      cmd->db_oid, cmd->index_oid, persist_error, backup.dir);
+        }
+        if (fsync(root->fd) != 0)
+            LOG_WARN("[handle_build] cannot fsync rolled back index directory: %s\n",
+                     strerror(errno));
+    }
+    else
+        discard_cagra_build_backup(&backup);
+    /* Keep the existing resident handles and release the failed build. */
     if (cagra_fd >= 0)
         close(cagra_fd);                    /* pre-written file never reached the prefix step */
     if (pre_cagra_tmp)
@@ -8551,7 +9659,7 @@ persist_fail:
     cuvs_cagra_free(new_handle, target_gpu);
     free(new_tids);
     pthread_mutex_unlock(&g_index_mutex);
-    send_error_code(client_fd, CUVS_STATUS_PERSIST_FAILED, "disk persistence failed");
+    send_error_code(client_fd, CUVS_STATUS_PERSIST_FAILED, persist_error);
 }
 
 /* The .vectors sidecar of a multi-partial build is written by a
@@ -8704,6 +9812,7 @@ handle_build_multi(int client_fd, const CuvsCmdFrame *cmd, const char *index_dir
     int            status     = CUVS_STATUS_ERROR;
     int            resolved_sc;
     const char    *save_dir;
+    ExtraSearchRoot root = {.fd = -1};
     CuvsAdmissionFields rej;          /* I3: err_out of a rejection reply */
     int            rej_set    = 0;
 
@@ -8871,7 +9980,16 @@ handle_build_multi(int client_fd, const CuvsCmdFrame *cmd, const char *index_dir
     {
         size_t final  = estimate_vram_bytes(total, (int)cmd->dim, (int)cmd->graph_degree);
         size_t needed = admission_needed_bytes(final);
-        int    target_gpu = pick_gpu_for_index(needed);
+#ifdef CUVS_CAGRA_FOLD_ENABLED
+        if (!page_fold_wait_locked(-1, client_fd, cmd, "BUILD_MULTI"))
+        {
+            pthread_mutex_unlock(&g_index_mutex);
+            status = CUVS_STATUS_CANCELED;
+            err = "build owner disconnected";
+            goto fail;
+        }
+#endif
+        int    target_gpu = pick_gpu_for_build(needed, CUVS_RQ_BUILD_CAGRA);
         CuvsCagraIndex new_handle;
         CuvsAdmissionFields oom_rej;
         uint32_t tids_gen;
@@ -8953,12 +10071,13 @@ handle_build_multi(int client_fd, const CuvsCmdFrame *cmd, const char *index_dir
         log_admit(&al, CUVS_ADMISSION_NONE);
         pthread_mutex_unlock(&g_index_mutex);
 
-        /* Stage the .vectors sidecar while the GPU builds. */
+        /* Stage both temporaries under the directory used by the commit. */
+        const char *io_dir = extra_search_build_dir(cmd, save_dir, &root);
         VecsWriteJob vjob;
         pthread_t    vth;
         int          vth_started = 0;
         memset(&vjob, 0, sizeof(vjob));
-        vectors_file_path(vecs_final, sizeof(vecs_final), save_dir, cmd->db_oid, cmd->index_oid);
+        vectors_file_path(vecs_final, sizeof(vecs_final), io_dir, cmd->db_oid, cmd->index_oid);
         char btok[64];
         build_token(btok, sizeof(btok));   /* one token for every temp file of this build */
         /* A truncated temp name could collide with another build's, so a
@@ -8996,7 +10115,7 @@ handle_build_multi(int client_fd, const CuvsCmdFrame *cmd, const char *index_dir
             else
             {
                 char cagra_final[512];
-                index_file_path(cagra_final, sizeof(cagra_final), save_dir,
+                index_file_path(cagra_final, sizeof(cagra_final), io_dir,
                                 cmd->db_oid, cmd->index_oid);
                 if ((size_t)snprintf(cagra_tmp, sizeof(cagra_tmp), "%s.%s.tmp", cagra_final, btok)
                     >= sizeof(cagra_tmp))
@@ -9123,7 +10242,6 @@ handle_build_multi(int client_fd, const CuvsCmdFrame *cmd, const char *index_dir
             else
             {
                 unlink(vecs_tmp);
-                unlink(vecs_final);
                 LOG_WARN("[handle_build_multi] .vectors sidecar not written for %u/%u; "
                          "brute_force unavailable until REINDEX\n",
                          cmd->db_oid, cmd->index_oid);
@@ -9135,14 +10253,18 @@ handle_build_multi(int client_fd, const CuvsCmdFrame *cmd, const char *index_dir
             munmap(maps[j], map_lens[j]);
         free(descs); free(part_vecs); free(n_each); free(maps); free(map_lens);
 
-        finish_build_commit(client_fd, cmd, save_dir, new_handle, new_tids,
+        finish_build_commit(client_fd, cmd, save_dir, root.fd >= 0 ? &root : NULL, new_handle, new_tids,
                             target_gpu, final, vectors_committed, vecs_tmp, vecs_final,
                             tids_gen, cagra_fd >= 0 ? cagra_tmp : NULL, cagra_fd,
                             cagra_fd >= 0 ? &cagra_layout : NULL);
+        if (root.fd >= 0)
+            close(root.fd);
         return;   /* new_tids ownership passed to the registry */
     }
 
 fail:
+    if (root.fd >= 0)
+        close(root.fd);
     for (int j = 0; j < nmapped; j++)
         munmap(maps[j], map_lens[j]);
     free(new_tids);
@@ -9301,6 +10423,7 @@ handle_mark_stale(int client_fd, const CuvsCmdFrame *cmd)
     IndexEntry *e = find_index(cmd->db_oid, cmd->index_oid);
     if (e && !e->stale)
     {
+        e->extra_search_generation = 0;
         e->stale = 1;
         e->stale_since = now;
     }
@@ -9337,6 +10460,17 @@ handle_drop(int client_fd, const CuvsCmdFrame *cmd)
     uint32_t db  = cmd->db_oid;
     uint32_t idx = cmd->index_oid;
     char     p[512];
+    char     root[CUVS_PAGE_INDEX_DIR_SIZE];
+    const char *directory = g_index_dir;
+
+    if (cmd->op == CUVS_OP_DROP_PAGES_INDEX)
+    {
+        char requested[CUVS_PAGE_INDEX_DIR_SIZE];
+
+        if (recv_all(client_fd, requested, sizeof(requested)) != 0)
+            return;
+        directory = resolve_page_root(requested, root) ? root : NULL;
+    }
 
     pthread_mutex_lock(&g_index_mutex);
 
@@ -9378,19 +10512,27 @@ handle_drop(int client_fd, const CuvsCmdFrame *cmd)
             break;
         }
 
+    /* The committed DROP invalidates residency even without a usable root. */
+    if (!directory)
+    {
+        pthread_mutex_unlock(&g_index_mutex);
+        send_error_code(client_fd, CUVS_STATUS_INVALID_PAGE_ROOT, "invalid page-format index_dir for DROP");
+        return;
+    }
+
     /* Unlink every per-index artifact so a restart won't reload a zombie. */
-    index_file_path(p, sizeof(p), g_index_dir, db, idx);       unlink(p); /* .cagra */
-    tids_file_path(p, sizeof(p), g_index_dir, db, idx);        unlink(p); /* .tids */
-    shards_manifest_path(p, sizeof(p), g_index_dir, db, idx);  unlink(p); /* .shards */
-    delta_file_path(p, sizeof(p), g_index_dir, db, idx);       unlink(p); /* .delta */
-    vectors_file_path(p, sizeof(p), g_index_dir, db, idx);     unlink(p); /* .vectors */
-    stale_file_path(p, sizeof(p), g_index_dir, db, idx);       unlink(p); /* .stale */
-    relfilenode_file_path(p, sizeof(p), g_index_dir, db, idx); unlink(p); /* .relfilenode */
-    snprintf(p, sizeof(p), "%s/%u_%u.tombstone", g_index_dir, db, idx); unlink(p);
+    index_file_path(p, sizeof(p), directory, db, idx);       unlink(p); /* .cagra */
+    tids_file_path(p, sizeof(p), directory, db, idx);        unlink(p); /* .tids */
+    shards_manifest_path(p, sizeof(p), directory, db, idx);  unlink(p); /* .shards */
+    delta_file_path(p, sizeof(p), directory, db, idx);       unlink(p); /* .delta */
+    vectors_file_path(p, sizeof(p), directory, db, idx);     unlink(p); /* .vectors */
+    stale_file_path(p, sizeof(p), directory, db, idx);       unlink(p); /* .stale */
+    relfilenode_file_path(p, sizeof(p), directory, db, idx); unlink(p); /* .relfilenode */
+    snprintf(p, sizeof(p), "%s/%u_%u.tombstone", directory, db, idx); unlink(p);
     /* Shard artifacts have contiguous ids; stop at the first missing one. */
     for (uint32_t s = 0; s < CUVS_SHARDS_MAX; s++)
     {
-        shard_cagra_path(p, sizeof(p), g_index_dir, db, idx, s);
+        shard_cagra_path(p, sizeof(p), directory, db, idx, s);
         if (unlink(p) != 0)
             break;
     }
@@ -9399,7 +10541,7 @@ handle_drop(int client_fd, const CuvsCmdFrame *cmd)
 
     pthread_mutex_unlock(&g_index_mutex);
 
-    int rootfd = open(g_index_dir, O_RDONLY | O_DIRECTORY);
+    int rootfd = open(directory, O_RDONLY | O_DIRECTORY);
     if (rootfd >= 0)
     {
         char name[32];
@@ -9778,6 +10920,465 @@ client_gone(void *arg)
     if (p.revents & (POLLHUP | POLLERR | POLLRDHUP | POLLNVAL))
         return 1;
     return (p.revents & POLLIN) && recv(fd, &c, 1, MSG_PEEK | MSG_DONTWAIT) == 0;
+}
+
+/* Opcode 58 alone has bounded inline I/O. The backend owns its own deadline
+ * across both connections; this local bound starts after the v6 frame. */
+static uint32_t
+extra_search_io(int fd, void *buf, size_t len, bool sending, uint64_t deadline)
+{
+    char *p = buf;
+    while (len > 0)
+    {
+        uint64_t now = admission_mono_us();
+        if (now >= deadline)
+            return CUVS_EXTRA_SEARCH_DEADLINE;
+
+        ssize_t n = sending ? send(fd, p, len, MSG_DONTWAIT) : recv(fd, p, len, MSG_DONTWAIT);
+        if (n > 0)
+        {
+            p += n;
+            len -= (size_t) n;
+        }
+        else if (n == 0)
+            return CUVS_STATUS_CANCELED;
+        else if (errno == EAGAIN || errno == EWOULDBLOCK)
+        {
+            struct pollfd pollfd = {.fd = fd, .events = sending ? POLLOUT : POLLIN};
+            if (poll(&pollfd, 1, (int) ((deadline - now + 999) / 1000)) < 0 && errno != EINTR)
+                return CUVS_STATUS_ERROR;
+        }
+        else if (errno != EINTR)
+            return CUVS_STATUS_ERROR;
+    }
+    return CUVS_STATUS_OK;
+}
+
+typedef struct ExtraSearchControl {
+    int client_fd;
+    uint64_t deadline_us;
+    uint32_t stop_status;
+} ExtraSearchControl;
+
+typedef struct ExtraSearchWork {
+    uint32_t ann_started, ann_completed;
+    uint32_t chunks_started, chunks_completed;
+    uint32_t rows_started, rows_completed;
+} ExtraSearchWork;
+
+/* The status is sticky for the wrapper's pre-submit callback. */
+static int
+extra_search_stop(void *arg)
+{
+    ExtraSearchControl *control = arg;
+
+    if (control->stop_status == CUVS_STATUS_OK)
+    {
+        if (client_gone(&control->client_fd))
+            control->stop_status = CUVS_STATUS_CANCELED;
+        else if (admission_mono_us() >= control->deadline_us)
+            control->stop_status = CUVS_EXTRA_SEARCH_DEADLINE;
+    }
+    return control->stop_status != CUVS_STATUS_OK;
+}
+
+static uint32_t
+extra_search_wait_lock(ExtraSearchControl *control)
+{
+    for (;;)
+    {
+        if (extra_search_stop(control))
+            return control->stop_status;
+        int rc = pthread_mutex_trylock(&g_index_mutex);
+        if (rc == 0)
+            return CUVS_STATUS_OK;
+        if (rc != EBUSY)
+            return CUVS_STATUS_ERROR;
+        uint64_t now = admission_mono_us();
+        if (now >= control->deadline_us)
+            continue;
+        uint64_t left_us = control->deadline_us - now;
+        struct pollfd pollfd = {.fd = control->client_fd, .events = POLLRDHUP};
+        (void) poll(&pollfd, 1, left_us >= 5000 ? 5 : (int) ((left_us + 999) / 1000));
+    }
+}
+
+/* The server and backend can discover state from sidecars. A dangling
+ * symlink, inaccessible directory, or unexpected stat error is not absence. */
+static bool
+extra_search_clean(const IndexEntry *e)
+{
+    static const char *suffix[] = {"delta", "stale", "tombstone", "shards"};
+    struct stat st;
+    char name[64];
+    bool clean = false;
+
+    if (e->stale || e->delta_idx || e->n_delta != 0 || !e->extra_search_default_dir)
+        return false;
+    int fd = open(g_index_dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (fd < 0)
+        return false;
+    if (fstat(fd, &st) != 0 || st.st_dev != e->extra_search_dir_dev ||
+        st.st_ino != e->extra_search_dir_ino)
+        goto done;
+
+    for (size_t i = 0; i < sizeof(suffix) / sizeof(suffix[0]); i++)
+    {
+        snprintf(name, sizeof(name), "%u_%u.%s", e->db_oid, e->index_oid, suffix[i]);
+        if (fstatat(fd, name, &st, AT_SYMLINK_NOFOLLOW) == 0 || errno != ENOENT)
+            goto done;
+    }
+    clean = true;
+done:
+    close(fd);
+    return clean;
+}
+
+/* Caller holds g_index_mutex. Once work was submitted this request must
+ * never be interpreted as eligible to fall back to the ordinary search. */
+static uint32_t
+extra_search_source(IndexEntry *e, const CuvsCmdFrame *cmd,
+                    const CuvsExtraSearchRequest *request, bool dispatched,
+                    const char **error)
+{
+    uint32_t unavailable = dispatched ? CUVS_STATUS_STALE : CUVS_EXTRA_SEARCH_UNSUPPORTED;
+
+    if (request->generation && (!e || request->generation != e->extra_search_generation))
+    {
+        *error = "resident CAGRA generation changed";
+        return CUVS_EXTRA_SEARCH_GENERATION;
+    }
+    if (!e || !entry_is_cagra_single(e) || !e->tids ||
+        e->metric != CUVS_METRIC_L2 || e->dim != cmd->dim ||
+        !cuvs_cagra_extra_search_supported(e->handle, e->n_vecs, (int) cmd->dim))
+    {
+        *error = "no compatible resident legacy CAGRA L2 index";
+        return unavailable;
+    }
+    if (!request->dir_ino || request->dir_dev != (uint64_t) e->extra_search_dir_dev ||
+        request->dir_ino != (uint64_t) e->extra_search_dir_ino)
+    {
+        *error = "the backend and daemon use different sidecar directories";
+        return unavailable;
+    }
+    if (!extra_search_clean(e))
+    {
+        e->extra_search_generation = 0;
+        *error = dispatched ? "legacy CAGRA sidecars changed during search" :
+                              "legacy CAGRA sidecars are not clean";
+        return unavailable;
+    }
+    return CUVS_STATUS_OK;
+}
+
+static uint32_t
+extra_search_initial(const CuvsCmdFrame *cmd, const CuvsExtraSearchRequest *request,
+                     const float *query, ExtraSearchControl *control, uint64_t started,
+                     ExtraSearchWork *work, CuvsExtraSearchReply *details,
+                     CuvsReplyHeader *reply, CuvsResult *results, const char **error)
+{
+    CuvsSearchResult raw[CUVS_EXTRA_SEARCH_MAX_K];
+    uint32_t status = extra_search_wait_lock(control);
+    if (status != CUVS_STATUS_OK)
+        return status;
+
+    IndexEntry *e = find_index(cmd->db_oid, cmd->index_oid);
+    status = extra_search_source(e, cmd, request, false, error);
+    if (status != CUVS_STATUS_OK)
+        goto unlock;
+    if (request->max_components != 0)
+    {
+        status = CUVS_EXTRA_SEARCH_BUDGET;
+        *error = "the initial search requires a zero component budget";
+        goto unlock;
+    }
+    if (extra_search_stop(control))
+    {
+        status = control->stop_status;
+        goto unlock;
+    }
+
+    work->ann_started = 1;
+    int rc = cuvs_cagra_search(e->handle, query, (int) cmd->dim, (int) cmd->k, raw,
+                               (int) e->gpu_device_id, cmd->itopk_size, cmd->search_width);
+    work->ann_completed = rc == 0;
+    if (extra_search_stop(control))
+    {
+        status = control->stop_status;
+        goto unlock;
+    }
+    if (rc != 0)
+    {
+        /* Match ordinary SEARCH's dimension vs transient failure split. */
+        status = rc == 2 ? CUVS_STATUS_DIM_MISMATCH : CUVS_EXTRA_SEARCH_ANN_FAILED;
+        *error = rc == 2 ? "query dim != index dim" : "resident CAGRA search failed";
+        goto unlock;
+    }
+
+    /* External writers can change sidecars while the registry is locked. */
+    status = extra_search_source(e, cmd, request, true, error);
+    if (status != CUVS_STATUS_OK)
+        goto unlock;
+    if (!e->extra_search_generation)
+    {
+        uint64_t generation = 0;
+        if (shm_key_random((unsigned char *) &generation, sizeof(generation)) != 0 || !generation)
+        {
+            status = CUVS_STATUS_ERROR;
+            *error = "could not create a resident CAGRA generation";
+            goto unlock;
+        }
+        e->extra_search_generation = generation;
+    }
+    if (extra_search_stop(control))
+    {
+        status = control->stop_status;
+        goto unlock;
+    }
+    details->generation = e->extra_search_generation;
+    reply->n_results = (uint32_t) cagra_finish_one(e, raw, (int) cmd->k, NULL, 0, results, NULL);
+
+    /* One search/hit per successful initial ANN. A supplemental request can
+     * refresh last use but must not add a second hit for the statement. */
+    record_search_stat(e, CUVS_STATUS_OK, (uint32_t) (admission_mono_us() - started), NULL);
+    e->last_requested_k = cmd->k;
+    e->last_returned_k = reply->n_results;
+    e->last_search_mode = 0;
+    e->delta_cpu_last = 0;
+unlock:
+    pthread_mutex_unlock(&g_index_mutex);
+    return status;
+}
+
+typedef struct ExtraSearchCandidate {
+    double distance;
+    uint32_t row;
+} ExtraSearchCandidate;
+
+static int
+extra_search_candidate_cmp(const void *a, const void *b)
+{
+    const ExtraSearchCandidate *left = a, *right = b;
+    if (left->distance < right->distance)
+        return -1;
+    if (left->distance > right->distance)
+        return 1;
+    return (left->row > right->row) - (left->row < right->row);
+}
+
+static uint32_t
+extra_search_supplemental(const CuvsCmdFrame *cmd, const CuvsExtraSearchRequest *request,
+                          const float *query, ExtraSearchControl *control,
+                          ExtraSearchWork *work, CuvsExtraSearchReply *details,
+                          CuvsReplyHeader *reply, CuvsResult *results, const char **error)
+{
+    ExtraSearchCandidate candidates[CUVS_EXTRA_SEARCH_MAX_K + CUVS_EXTRA_SEARCH_CHUNK_ROWS];
+    double distances[CUVS_EXTRA_SEARCH_CHUNK_ROWS];
+    uint32_t total_rows = 0;
+    uint32_t kept = 0;
+    uint32_t chunk_cap = CUVS_EXTRA_SEARCH_CHUNK_COMPONENTS / cmd->dim;
+
+    if (chunk_cap > CUVS_EXTRA_SEARCH_CHUNK_ROWS)
+        chunk_cap = CUVS_EXTRA_SEARCH_CHUNK_ROWS;
+
+    for (;;)
+    {
+        uint32_t status = extra_search_wait_lock(control);
+        if (status != CUVS_STATUS_OK)
+            return status;
+
+        IndexEntry *e = find_index(cmd->db_oid, cmd->index_oid);
+        status = extra_search_source(e, cmd, request, work->chunks_started != 0, error);
+        if (status != CUVS_STATUS_OK)
+        {
+            pthread_mutex_unlock(&g_index_mutex);
+            return status;
+        }
+        if (total_rows == 0)
+        {
+            total_rows = request->max_components / cmd->dim;
+            if (total_rows > CUVS_EXTRA_SEARCH_MAX_ROWS)
+                total_rows = CUVS_EXTRA_SEARCH_MAX_ROWS;
+            if (total_rows > e->n_vecs)
+                total_rows = (uint32_t) e->n_vecs;
+            if (total_rows == 0 || chunk_cap == 0 ||
+                request->max_components > CUVS_EXTRA_SEARCH_MAX_COMPONENTS)
+            {
+                pthread_mutex_unlock(&g_index_mutex);
+                *error = "invalid extra search component budget";
+                return CUVS_EXTRA_SEARCH_BUDGET;
+            }
+        }
+        if (extra_search_stop(control))
+        {
+            pthread_mutex_unlock(&g_index_mutex);
+            return control->stop_status;
+        }
+
+        uint32_t offset = work->rows_completed;
+        if (offset == total_rows)
+        {
+            /* Reached only after reacquiring the registry and checking the
+             * generation and directory again. No TIDs were kept across locks. */
+            for (uint32_t i = 0; i < kept; i++)
+            {
+                results[i].tid = e->tids[candidates[i].row];
+                results[i].distance = (float) candidates[i].distance;
+            }
+            e->last_search = time(NULL);
+            pthread_mutex_unlock(&g_index_mutex);
+            reply->n_results = kept;
+            details->generation = request->generation;
+            details->scored_rows = offset;
+            details->components = offset * cmd->dim;
+            return CUVS_STATUS_OK;
+        }
+
+        uint32_t chunk_rows = total_rows - offset;
+        if (chunk_rows > chunk_cap)
+            chunk_rows = chunk_cap;
+        CuvsExtraSearchProgress progress = {0};
+        CuvsCagraScoreStatus rc = cuvs_cagra_score_range(e->handle, query, (int) cmd->dim,
+            offset, chunk_rows, distances, (int) e->gpu_device_id,
+            extra_search_stop, control, &progress);
+        pthread_mutex_unlock(&g_index_mutex);
+
+        if (progress.submitted)
+        {
+            work->chunks_started++;
+            work->rows_started += chunk_rows;
+        }
+        if (progress.completed)
+        {
+            work->chunks_completed++;
+            work->rows_completed += chunk_rows;
+        }
+        if (rc == CUVS_CAGRA_SCORE_STOPPED || extra_search_stop(control))
+            return control->stop_status;
+        if (rc != CUVS_CAGRA_SCORE_OK || !progress.completed)
+        {
+            *error = "resident CAGRA scoring failed";
+            return CUVS_STATUS_ERROR;
+        }
+
+        for (uint32_t i = 0; i < chunk_rows; i++)
+        {
+            if (!isfinite(distances[i]))
+            {
+                *error = "nonfinite resident CAGRA distance";
+                return CUVS_STATUS_ERROR;
+            }
+            candidates[kept + i] = (ExtraSearchCandidate) {distances[i], offset + i};
+        }
+        qsort(candidates, kept + chunk_rows, sizeof(*candidates), extra_search_candidate_cmp);
+        kept += chunk_rows;
+        if (kept > cmd->k)
+            kept = cmd->k;
+    }
+}
+
+static void
+handle_search_extra(int client_fd, const CuvsCmdFrame *cmd)
+{
+    uint64_t started = admission_mono_us();
+    const uint64_t receive_cap_us = CUVS_EXTRA_SEARCH_TIMEOUT_MS * UINT64_C(1000);
+    uint64_t deadline = started > UINT64_MAX - receive_cap_us ?
+                        UINT64_MAX : started + receive_cap_us;
+    ExtraSearchControl control = {.client_fd = client_fd, .deadline_us = deadline};
+    ExtraSearchWork work = {0};
+    CuvsExtraSearchRequest request = {0};
+    CuvsExtraSearchReply details = {0};
+    CuvsReplyHeader reply = {0};
+    float query[CUVS_EXTRA_SEARCH_MAX_DIM];
+    CuvsResult results[CUVS_EXTRA_SEARCH_MAX_K] = {0};
+    const char *error = NULL;
+
+    if (cmd->dim == 0 || cmd->dim > CUVS_EXTRA_SEARCH_MAX_DIM ||
+        cmd->k == 0 || cmd->k > CUVS_EXTRA_SEARCH_MAX_K ||
+        cmd->metric != CUVS_METRIC_L2 || cmd->search_mode || cmd->use_cpu_hnsw ||
+        cmd->n_filter_tids || cmd->use_prefilter)
+    {
+        reply.status = CUVS_EXTRA_SEARCH_UNSUPPORTED;
+        error = "unsupported extra search command";
+        goto done;
+    }
+    reply.status = extra_search_io(client_fd, &request, sizeof(request), false, deadline);
+    if (reply.status != CUVS_STATUS_OK)
+        goto done;
+    if (request.version != CUVS_EXTRA_SEARCH_VERSION)
+    {
+        reply.status = CUVS_EXTRA_SEARCH_UNSUPPORTED;
+        error = "unsupported extra search request version";
+        goto done;
+    }
+    if (request.deadline_ms <= 0)
+    {
+        reply.status = CUVS_EXTRA_SEARCH_DEADLINE;
+        error = "invalid extra search deadline";
+        goto done;
+    }
+    /* Compare before multiplying so an outsize wire value cannot wrap. */
+    if ((uint64_t) request.deadline_ms <= deadline / 1000)
+        deadline = (uint64_t) request.deadline_ms * 1000;
+    control.deadline_us = deadline;
+
+    reply.status = extra_search_io(client_fd, query, cmd->dim * sizeof(*query), false, deadline);
+    if (reply.status != CUVS_STATUS_OK)
+        goto done;
+    for (uint32_t d = 0; d < cmd->dim; d++)
+    {
+        if (!isfinite(query[d]))
+        {
+            reply.status = CUVS_STATUS_ERROR;
+            error = "nonfinite extra search query";
+            goto done;
+        }
+    }
+
+    if (request.generation)
+        reply.status = extra_search_supplemental(cmd, &request, query, &control,
+                                                 &work, &details, &reply, results, &error);
+    else
+        reply.status = extra_search_initial(cmd, &request, query, &control, started,
+                                            &work, &details, &reply, results, &error);
+
+done:
+    bool disconnected = client_gone(&client_fd);
+    if (reply.status == CUVS_STATUS_OK && extra_search_stop(&control))
+    {
+        reply.status = control.stop_status;
+        reply.n_results = 0;
+    }
+    if (error)
+        snprintf(reply.error, sizeof(reply.error), "%s", error);
+    reply.latency_us = (uint32_t) (admission_mono_us() - started);
+    uint32_t send_status = CUVS_STATUS_CANCELED;
+    if (!disconnected)
+    {
+        /* Try to get a deadline refusal out even when the request's time
+         * expired. This write never waits for the reader. */
+        if (admission_mono_us() >= deadline)
+            send_status = send(client_fd, &reply, sizeof(reply), MSG_DONTWAIT) == (ssize_t) sizeof(reply)
+                          ? CUVS_STATUS_OK : CUVS_EXTRA_SEARCH_DEADLINE;
+        else
+            send_status = extra_search_io(client_fd, &reply, sizeof(reply), true, deadline);
+        if (send_status == CUVS_STATUS_OK && reply.status == CUVS_STATUS_OK)
+        {
+            send_status = extra_search_io(client_fd, &details, sizeof(details), true, deadline);
+            if (send_status == CUVS_STATUS_OK)
+                send_status = extra_search_io(client_fd, results,
+                                               reply.n_results * sizeof(*results), true, deadline);
+        }
+    }
+    LOG_INFO("[extra_search] db=%u idx=%u phase=%s status=%u send_status=%u k=%u "
+             "dim=%u max_components=%u ann_started=%u ann_completed=%u "
+             "chunks_started=%u chunks_completed=%u rows_started=%u rows_completed=%u "
+             "scored_rows=%u components=%u n_results=%u latency_us=%u\n",
+             cmd->db_oid, cmd->index_oid, request.generation ? "extra" : "first",
+             reply.status, send_status, cmd->k, cmd->dim, request.max_components,
+             work.ann_started, work.ann_completed, work.chunks_started, work.chunks_completed,
+             work.rows_started, work.rows_completed, work.rows_completed,
+             work.rows_completed * cmd->dim, reply.n_results, reply.latency_us);
 }
 
 /* ----------------------------------------------------------------
@@ -10468,6 +12069,14 @@ handle_build_ivfpq(int client_fd, const CuvsCmdFrame *cmd)
     size_t needed = (size_t)cmd->n_vecs * pq_dim * (pq_bits / 8 + 1);
 
     pthread_mutex_lock(&g_index_mutex);
+#ifdef CUVS_CAGRA_FOLD_ENABLED
+    if (!page_fold_wait_locked(-1, client_fd, cmd, "BUILD_IVFPQ"))
+    {
+        pthread_mutex_unlock(&g_index_mutex);
+        munmap(mem, total);
+        return;
+    }
+#endif
 
     /* I3 (C5, UC-2 (a)): IVF-PQ admission rejections carry err_out; its own
      * estimate is unchanged (C3's N applies to CAGRA). */
@@ -10475,7 +12084,7 @@ handle_build_ivfpq(int client_fd, const CuvsCmdFrame *cmd)
     AdmitLine al = {.op = "BUILD_IVFPQ", .path = "ivfpq", .algo = "ivf_pq", .gpu = -1,
                     .db = cmd->db_oid, .idx = cmd->index_oid, .dim = cmd->dim,
                     .n = cmd->n_vecs, .final = needed, .needed = needed};
-    int target_gpu = pick_gpu_for_index(needed);
+    int target_gpu = pick_gpu_for_build(needed, CUVS_RQ_BUILD_IVFPQ);
     if (target_gpu < 0)
     {
         admission_fill(&rej, CUVS_ADMISSION_AR0, needed, -1);
@@ -10637,7 +12246,7 @@ handle_build_ivfpq(int client_fd, const CuvsCmdFrame *cmd)
                 {
                     CuvsReplyHeader hdr_ok = {0};
                     hdr_ok.status = CUVS_STATUS_OK;
-                    send_all(client_fd, &hdr_ok, sizeof(hdr_ok));
+                    send_foreground_reply(client_fd, &hdr_ok);
                 }
                 return;
             }
@@ -10683,7 +12292,7 @@ handle_build_ivfpq(int client_fd, const CuvsCmdFrame *cmd)
 
     CuvsReplyHeader ok = {0};
     ok.status = CUVS_STATUS_OK;
-    send_all(client_fd, &ok, sizeof(ok));
+    send_foreground_reply(client_fd, &ok);
     return;
 
 persist_fail:
@@ -10906,6 +12515,20 @@ handle_extend(int client_fd, const CuvsCmdFrame *cmd)
     pthread_mutex_lock(&g_index_mutex);
 
     IndexEntry *e = find_index(cmd->db_oid, cmd->index_oid);
+#ifdef CUVS_CAGRA_FOLD_ENABLED
+    int waited_device = -1;
+    while (e && e->handle && g_fold_active[e->gpu_device_id])
+    {
+        waited_device = (int) e->gpu_device_id;
+        if (!page_fold_wait_locked(waited_device, client_fd, cmd, "EXTEND"))
+        {
+            pthread_mutex_unlock(&g_index_mutex);
+            munmap(mem, total);
+            return;
+        }
+        e = find_index(cmd->db_oid, cmd->index_oid);
+    }
+#endif
     if (!e || !e->handle)
     {
         pthread_mutex_unlock(&g_index_mutex);
@@ -10918,10 +12541,15 @@ handle_extend(int client_fd, const CuvsCmdFrame *cmd)
         snprintf(hdr.error, sizeof(hdr.error),
                  "index %u/%u not loaded or not extendable (extend is cagra-only)",
                  cmd->db_oid, cmd->index_oid);
-        send_all(client_fd, &hdr, sizeof(hdr));
+        send_foreground_reply(client_fd, &hdr);
         return;
     }
 
+    /* Even a failed EXTEND can have changed storage in place. */
+    e->extra_search_generation = 0;
+    if (index_dir[0] && (strnlen(index_dir, sizeof(index_dir)) == sizeof(index_dir) ||
+                        strcmp(index_dir, g_index_dir) != 0))
+        e->extra_search_default_dir = 0;
     int64_t  old_n = e->n_vecs;
     int64_t  n_new = cmd->n_vecs;
 
@@ -10932,14 +12560,33 @@ handle_extend(int client_fd, const CuvsCmdFrame *cmd)
     size_t new_vram   = estimate_vram_bytes(old_n + n_new, (int)e->dim, e->graph_degree);
     size_t delta_vram = (new_vram > e->vram_bytes) ? new_vram - e->vram_bytes : 0;
     int    dev        = (int)e->gpu_device_id;
-    if (delta_vram > 0 &&
-        g_max_vram_per_gpu[dev] > 0 &&
-        total_vram_used(dev) + delta_vram > g_max_vram_per_gpu[dev])
+    if (delta_vram > 0 && g_max_vram_per_gpu[dev] > 0)
     {
-        pthread_mutex_unlock(&g_index_mutex);
-        munmap(mem, total);
-        send_error_code(client_fd, CUVS_STATUS_BUILD_FAILED, "not enough VRAM for extend");
-        return;
+        size_t budget = g_max_vram_per_gpu[dev];
+        size_t used = total_vram_used(dev);
+#ifdef CUVS_CAGRA_FOLD_ENABLED
+        if (waited_device == dev)
+        {
+            uint64_t projected = cuvs_admission_sat_add(used, delta_vram);
+
+            /* The wait already re-resolved the legacy entry. Under this lock
+             * reclaim only children that PostgreSQL has never been offered;
+             * their teardown cannot shift the legacy registry. */
+            while (projected > budget && projected - budget <= page_fold_unoffered_bytes_locked(dev) &&
+                   page_fold_reclaim_unoffered_locked(dev))
+            {
+                used = total_vram_used(dev);
+                projected = cuvs_admission_sat_add(used, delta_vram);
+            }
+        }
+#endif
+        if (used + delta_vram > budget)
+        {
+            pthread_mutex_unlock(&g_index_mutex);
+            munmap(mem, total);
+            send_error_code(client_fd, CUVS_STATUS_BUILD_FAILED, "not enough VRAM for extend");
+            return;
+        }
     }
 
     /* Grow TIDs array before the GPU call; failure here is cheap to handle. */
@@ -10985,16 +12632,19 @@ handle_extend(int client_fd, const CuvsCmdFrame *cmd)
     free(e->rev_item_ids); e->rev_item_ids = NULL;
     build_rev_tid_map(e);
 
+    /* The registry can move as soon as L0 is released. */
+    int64_t total_rows = e->n_vecs;
+    int64_t extended_rows = e->n_extended;
     pthread_mutex_unlock(&g_index_mutex);
     munmap(mem, total);
 
     LOG_INFO("[handle_extend] %u/%u: added %lld vecs (total %lld, n_extended %lld)\n",
              cmd->db_oid, cmd->index_oid,
-             (long long)n_new, (long long)e->n_vecs, (long long)e->n_extended);
+             (long long)n_new, (long long)total_rows, (long long)extended_rows);
 
     CuvsReplyHeader ok = {0};
     ok.status = CUVS_STATUS_OK;
-    send_all(client_fd, &ok, sizeof(ok));
+    send_foreground_reply(client_fd, &ok);
 }
 
 /* Comparator for qsort/bsearch on raw uint64_t arrays. */
@@ -11039,7 +12689,7 @@ handle_compact(int client_fd, const CuvsCmdFrame *cmd)
         /* No tombstone: nothing to compact. Reply OK. */
         CuvsReplyHeader ok = {0};
         ok.status = CUVS_STATUS_OK;
-        send_all(client_fd, &ok, sizeof(ok));
+        send_foreground_reply(client_fd, &ok);
         return;
     }
 
@@ -11079,6 +12729,18 @@ handle_compact(int client_fd, const CuvsCmdFrame *cmd)
     pthread_mutex_lock(&g_index_mutex);
 
     IndexEntry *e = find_index(cmd->db_oid, cmd->index_oid);
+#ifdef CUVS_CAGRA_FOLD_ENABLED
+    while (e && e->handle && g_fold_active[e->gpu_device_id])
+    {
+        if (!page_fold_wait_locked((int) e->gpu_device_id, client_fd, cmd, "COMPACT"))
+        {
+            pthread_mutex_unlock(&g_index_mutex);
+            free(dead_tids);
+            return;
+        }
+        e = find_index(cmd->db_oid, cmd->index_oid);
+    }
+#endif
     if (!e || !e->handle)
     {
         pthread_mutex_unlock(&g_index_mutex);
@@ -11122,7 +12784,7 @@ handle_compact(int client_fd, const CuvsCmdFrame *cmd)
         unlink(tombstone_path);
         CuvsReplyHeader ok = {0};
         ok.status = CUVS_STATUS_OK;
-        send_all(client_fd, &ok, sizeof(ok));
+        send_foreground_reply(client_fd, &ok);
         return;
     }
 
@@ -11158,6 +12820,9 @@ handle_compact(int client_fd, const CuvsCmdFrame *cmd)
                               "GPU physical memory pressure; retry later", &physical_rej);
         return;
     }
+    e->extra_search_generation = 0;
+    if (strcmp(save_dir, g_index_dir) != 0)
+        e->extra_search_default_dir = 0;
     int ivfpq_retry = 0;
     CuvsCagraIndex new_handle = cuvs_cagra_compact(
         e->handle, keep_bits, n_vecs, e->metric, (int)e->gpu_device_id, &ivfpq_retry);
@@ -11178,7 +12843,7 @@ handle_compact(int client_fd, const CuvsCmdFrame *cmd)
         snprintf(failed.error, sizeof(failed.error), "cuvs_cagra_compact failed");
         if (compact_notice[0])
             cuvs_notice_append(failed.notice_out, sizeof(failed.notice_out), compact_notice, "The original index and tombstones are retained.");
-        send_all(client_fd, &failed, sizeof(failed));
+        send_foreground_reply(client_fd, &failed);
         return;
     }
 
@@ -11221,7 +12886,7 @@ handle_compact(int client_fd, const CuvsCmdFrame *cmd)
     ok.status = CUVS_STATUS_OK;
     if (compact_notice[0])
         cuvs_notice_append(ok.notice_out, sizeof(ok.notice_out), compact_notice, "");
-    send_all(client_fd, &ok, sizeof(ok));
+    send_foreground_reply(client_fd, &ok);
 }
 
 /* ----------------------------------------------------------------
@@ -11458,7 +13123,12 @@ hnsw_gpu_work_pending(void *unused)
     int busy = g_unlocked_gpu_jobs != 0;
     (void)unused;
     for (int gpu = 0; gpu < CUVS_MAX_GPUS; gpu++)
+    {
         if (g_pending_build_vram[gpu]) busy = 1;
+#ifdef CUVS_CAGRA_FOLD_ENABLED
+        if (g_fold_active[gpu]) busy = 1;
+#endif
+    }
     for (int i = 0; i < g_n_indexes; i++)
         if (g_indexes[i].inflight > 0) busy = 1;
 #ifdef CUVS_TEST_HOOKS
@@ -11499,6 +13169,28 @@ hnsw_pool_used(int device)
     CuvsRmmPoolStats st;
     return cuvs_rmm_pool_stats(device, &st) == 0 ? st.used_bytes : 0;
 }
+
+#ifdef CUVS_CAGRA_FOLD_ENABLED
+/* Check the same resolver's partition budget with a projected upper bound.
+ * Actual capacity is always re-read after freeing each child. */
+static bool
+hnsw_fold_reclaim_can_admit(const CuvsHnswFileBuild *params, int device)
+{
+    CuvsHnswForecast projected;
+    char error[128];
+    uint64_t reclaimable = page_fold_unoffered_bytes_locked(device);
+    uint64_t limit = admission_limit(device);
+    uint64_t gpu = cuvs_admission_sat_add(params->gpu_budget, reclaimable);
+
+    if (limit && gpu > limit)
+        gpu = limit;
+    return reclaimable && gpu > params->gpu_budget &&
+        cuvs_hnsw_forecast_route(params->n_vecs, params->dim, params->graph_degree,
+            params->intermediate_degree, params->hierarchy, params->build_algo,
+            params->ef_construction, params->auto_overflow, params->host_budget, gpu,
+            &projected, error, sizeof(error)) == CUVS_STATUS_OK;
+}
+#endif
 
 /* [hnsw_route]: one line per decision, pre-spool forecast or build. Q4-5/Q4-6
  * read est_host and route from it; route must equal the receipt's route.
@@ -11560,6 +13252,10 @@ handle_hnsw_route_preflight(int client_fd)
     reply.auto_overflow = g_hnsw_auto_overflow;
     reply.header.status = CUVS_STATUS_BUILD_FAILED;
     if (recv_all(client_fd, &request, sizeof(request)) < 0) return;
+#ifdef CUVS_CAGRA_FOLD_ENABLED
+    if (request.after_scan == 1 && t_fold_request)
+        t_fold_request_op = "HNSW_POSTSCAN";
+#endif
     reply.n_estimate = request.n_estimate;
     snprintf(reply.index_dir, sizeof(reply.index_dir), "%s", g_index_dir);
     if (request.version != CUVS_HNSW_PREFLIGHT_VERSION || request.hierarchy > 1
@@ -11575,6 +13271,17 @@ handle_hnsw_route_preflight(int client_fd)
         if (pthread_mutex_trylock(&g_index_mutex) == 0) locked = 1;
         else (void)poll(NULL, 0, 100);
     }
+#ifdef CUVS_CAGRA_FOLD_ENABLED
+    /* The file build drains fold work before checking capacity. The forecast
+     * has no owner lease and cannot reject using a transient fold snapshot. */
+    if (!locked || page_fold_active_devices_locked() || page_fold_unoffered_parent_locked(usable_gpu(0)))
+    {
+        if (locked)
+            pthread_mutex_unlock(&g_index_mutex);
+        reply.header.status = CUVS_STATUS_UNAVAILABLE;
+        goto send;
+    }
+#endif
     int device = usable_gpu(0);
     reply.header.error[0] = '\0';
     uint64_t host = hnsw_host_headroom(request.host_budget, reply.header.error, sizeof(reply.header.error));
@@ -11609,7 +13316,16 @@ handle_hnsw_route_preflight(int client_fd)
     reply.host_budget = f.host_budget; reply.gpu_budget = f.gpu_budget;
     reply.disk_need = f.disk_need; reply.disk_avail = f.disk_avail;
  send:
+#ifdef CUVS_CAGRA_FOLD_ENABLED
+    {
+        uint64_t when = admission_mono_us();
+        bool sent = send_all(client_fd, &reply, sizeof(reply)) == 0;
+
+        page_fold_log_reply(&reply.header, sent, when);
+    }
+#else
     send_all(client_fd, &reply, sizeof(reply));
+#endif
 }
 
 static void
@@ -11658,13 +13374,45 @@ handle_build_hnsw_file(int client_fd, const CuvsCmdFrame *cmd)
     params.ace_quality = g_hnsw_ace_quality;
     params.policy = &wire.policy;
     params.nn_readback = &wire.nn;
-    if (cuvs_hnsw_wait_for_idle(&g_index_mutex, owner_fd, hnsw_gpu_work_pending, NULL))
+#ifdef CUVS_CAGRA_FOLD_ENABLED
+    uint64_t fold_wait_started = admission_mono_us();
+    bool fold_waited = false;
+
+    for (int i = 0; i < n_usable_gpus(); ++i)
+        __atomic_fetch_add(&g_fold_waiters[usable_gpu(i)], 1, __ATOMIC_SEQ_CST);
+    for (int i = 0; i < n_usable_gpus(); ++i)
+        fold_waited |= __atomic_load_n(&g_fold_active[usable_gpu(i)], __ATOMIC_SEQ_CST);
+#endif
+    int wait_rc = cuvs_hnsw_wait_for_idle(&g_index_mutex, owner_fd, hnsw_gpu_work_pending, NULL);
+#ifdef CUVS_CAGRA_FOLD_ENABLED
+    for (int i = 0; i < n_usable_gpus(); ++i)
+        __atomic_fetch_sub(&g_fold_waiters[usable_gpu(i)], 1, __ATOMIC_SEQ_CST);
+    if (fold_waited)
+    {
+        uint64_t finished = admission_mono_us();
+        LOG_INFO("[page_fold_admission] op=HNSW db=%u index=%u wait_us=%llu withdrawn=%d"
+                 " daemon_id=%llu request_id=%llu wait_started_us=%llu mono_us=%llu\n",
+                 cmd->db_oid, cmd->index_oid, (unsigned long long) (finished - fold_wait_started),
+                 wait_rc != 0, (unsigned long long) g_page_daemon_id,
+                 (unsigned long long) t_fold_request_id, (unsigned long long) fold_wait_started,
+                 (unsigned long long) finished);
+    }
+#endif
+    if (wait_rc)
         goto cancelled;
     locked = 1;
     reply.error[0] = '\0';
     params.host_budget = hnsw_host_headroom(request.host_budget, reply.error, sizeof(reply.error));
     int device = usable_gpu(0);
     CuvsAdmissionFields physical_rej;
+#ifdef CUVS_CAGRA_FOLD_ENABLED
+    while (params.host_budget && page_fold_unoffered_parent_locked(device) &&
+           cuvs_build_physical_refuse(cuvs_vram_raw_free_bytes_on(device)))
+    {
+        if (cuvs_hnsw_owner_cancelled(owner_fd)) goto cancelled;
+        (void) page_fold_reclaim_unoffered_locked(device);
+    }
+#endif
     if (physical_build_check(device, "BUILD_HNSW_FILE", cmd, &physical_rej))
     {
         reply.status = CUVS_STATUS_OOM_FALLBACK;
@@ -11673,10 +13421,24 @@ handle_build_hnsw_file(int client_fd, const CuvsCmdFrame *cmd)
         attach_build_notices(&reply);
         goto done;
     }
+#ifdef CUVS_CAGRA_FOLD_ENABLED
+retry_hnsw_gpu_budget:
+    reply.status = CUVS_STATUS_BUILD_FAILED;
+    if (params.host_budget)
+        reply.error[0] = '\0';
+#endif
     params.gpu_budget = hnsw_gpu_budget(device, 1, &wire.budget.logical_used);
     wire.budget.pool_used = hnsw_pool_used(device);
     if (!params.host_budget || !params.gpu_budget)
     {
+#ifdef CUVS_CAGRA_FOLD_ENABLED
+        if (params.host_budget && hnsw_fold_reclaim_can_admit(&params, device))
+        {
+            if (cuvs_hnsw_owner_cancelled(owner_fd)) goto cancelled;
+            (void) page_fold_reclaim_unoffered_locked(device);
+            goto retry_hnsw_gpu_budget;
+        }
+#endif
         if (!reply.error[0])
             snprintf(reply.error, sizeof(reply.error), "HNSW host/GPU/cgroup headroom unavailable");
         goto done;
@@ -11689,6 +13451,14 @@ handle_build_hnsw_file(int client_fd, const CuvsCmdFrame *cmd)
         params.graph_degree, params.intermediate_degree, params.hierarchy,
         params.build_algo, params.ef_construction, params.auto_overflow,
         params.host_budget, params.gpu_budget, &route, reply.error, sizeof(reply.error));
+#ifdef CUVS_CAGRA_FOLD_ENABLED
+    if (reply.status != CUVS_STATUS_OK && hnsw_fold_reclaim_can_admit(&params, device))
+    {
+        if (cuvs_hnsw_owner_cancelled(owner_fd)) goto cancelled;
+        (void) page_fold_reclaim_unoffered_locked(device);
+        goto retry_hnsw_gpu_budget;
+    }
+#endif
     wire.budget.host_estimate = route.host_estimate;
     wire.budget.host_budget = route.host_budget;
     wire.budget.gpu_estimate = route.gpu_estimate;
@@ -11812,9 +13582,15 @@ handle_build_hnsw_file(int client_fd, const CuvsCmdFrame *cmd)
     { close(result_fd); result_fd = -1; }
     wire.header = reply;
     token = 'R';
-    if (send_all(client_fd, &token, 1) == 0
-        && cuvs_fd_send(client_fd, result_fd, &wire, sizeof(wire)) == 0
-        && reply.status == CUVS_STATUS_OK)
+#ifdef CUVS_CAGRA_FOLD_ENABLED
+    uint64_t when = admission_mono_us();
+#endif
+    bool sent = send_all(client_fd, &token, 1) == 0 &&
+        cuvs_fd_send(client_fd, result_fd, &wire, sizeof(wire)) == 0;
+#ifdef CUVS_CAGRA_FOLD_ENABLED
+    page_fold_log_reply(&reply, sent, when);
+#endif
+    if (sent && reply.status == CUVS_STATUS_OK)
     {
         /* The backend ACKs receipt of its own kernel reference; it then owns
          * the temporary file through PG conversion and closes it on ERROR. */
@@ -12570,6 +14346,7 @@ reclaim_thread(void *arg)
             for (int i = 0; i < n_usable_gpus(); i++)
                 reclaim_gpu(usable_gpu(i), now);
         pthread_mutex_unlock(&g_index_mutex);
+        release_retired_page_overlays();
         /* UC-1 4c: written every tick whatever the mode (CK-24). */
         if (g_reclaim.usage_file)
             usage_stats_write();
@@ -12578,21 +14355,32 @@ reclaim_thread(void *arg)
 }
 
 
+static int
+open_page_shm(const char *key, size_t key_size, size_t bytes)
+{
+    int fd;
+
+    if (!memchr(key, '\0', key_size))
+        return -1;
+    fd = shm_open(key, O_RDONLY, 0);
+    if (fd >= 0 && (!shm_check_peer_owner(fd, g_peer_uid) || !page_corpus_fits(fd, bytes)))
+    {
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
+
 static void *
 map_page_shm(const char *key, size_t key_size, size_t bytes)
 {
-    int fd;
-    void *mem = MAP_FAILED;
+    int fd = open_page_shm(key, key_size, bytes);
+    void *mem;
 
-    if (!memchr(key, '\0', key_size))
-        return mem;
-    fd = shm_open(key, O_RDONLY, 0);
-    if (fd >= 0)
-    {
-        if (shm_check_peer_owner(fd, g_peer_uid) && page_corpus_fits(fd, bytes))
-            mem = mmap(NULL, bytes, PROT_READ, MAP_SHARED, fd, 0);
-        close(fd);
-    }
+    if (fd < 0)
+        return MAP_FAILED;
+    mem = mmap(NULL, bytes, PROT_READ, MAP_SHARED, fd, 0);
+    close(fd);
     return mem;
 }
 
@@ -12651,13 +14439,13 @@ handle_page_search(int client_fd, const CuvsCmdFrame *cmd)
                  sizeof(request) - sizeof(request.length)) < 0 ||
         request.resume_count != 0 || request.resume_distance != 0 ||
         request.reserved != 0 || cmd->dim == 0 || cmd->dim > 65535 ||
-        cmd->k == 0 || cmd->k > 4000 || cmd->search_mode > 1 || cmd->bf_precision > 1 ||
+        cmd->k == 0 || cmd->k > CUVS_PAGE_SEARCH_MAX_K || cmd->search_mode > 1 || cmd->bf_precision > 1 ||
         cmd->n_vecs < 1 || cmd->n_vecs > 1024 || batch != (cmd->n_vecs > 1) ||
         request.n_slots == 0 || request.n_slots > INT32_MAX ||
         (filtered ? cmd->n_filter_tids != (request.n_slots + 31) / 32 :
                     cmd->n_filter_tids != 0))
         goto done;
-    if (request.folded != 0 || request.tail != request.folded)
+    if (request.tail != request.folded)
     {
         reply.status = CUVS_STATUS_NOT_FOUND;
         goto done;
@@ -12747,6 +14535,914 @@ done:
     free(results);
 }
 
+static void
+initialize_page_daemon_id(void)
+{
+    uint64_t id;
+
+    if (shm_key_random((unsigned char *) &id, sizeof(id)) == 0)
+        g_page_daemon_id = id ? id : 1;
+}
+
+#ifdef CUVS_CAGRA_FOLD_ENABLED
+#define PAGE_FOLD_MIN_POSITIONS 100U
+#define PAGE_FOLD_MAX_POSITIONS (4U * CUVS_PAGE_BATCH_MAX)
+#define PAGE_FOLD_IDLE_US (300 * UINT64_C(1000000))
+
+static PageCagraGraph *
+page_fold_pick_locked(int device, uint64_t now)
+{
+    PageCagraGraph *best = NULL;
+    uint64_t best_priority = 0;
+    time_t recent = time(NULL) - 60;
+
+    for (PageCagraGraph *entry = g_page_graphs; entry; entry = entry->next)
+    {
+        uint64_t pending, priority;
+
+        if (entry->gpu != device || !entry->handle || !entry->n_slots ||
+            !entry->overlay.boot_id || entry->overlay.covered_upto <= entry->folded)
+        {
+            if (entry->gpu == device)
+                entry->fold_pending_since = 0;
+            continue;
+        }
+        if (!entry->fold_pending_since)
+            entry->fold_pending_since = now;
+        pending = entry->overlay.covered_upto - entry->folded;
+        if (entry->fold_candidate || entry->fold_retry_after > now ||
+            (pending < PAGE_FOLD_MIN_POSITIONS && now - entry->fold_pending_since < PAGE_FOLD_IDLE_US))
+            continue;
+        priority = pending * (1 + (entry->last_search >= recent ? (uint64_t) entry->hits : 0));
+        if (priority > best_priority)
+        {
+            best = entry;
+            best_priority = priority;
+        }
+    }
+    return best;
+}
+
+/* The retained prefix is immutable. Copy packed vectors into slot order and
+ * fill dead positions from the first live row of their 64-slot batch. */
+static uint32_t
+page_fold_copy_rows(const CuvsPageOverlayChunk *chunk, uint64_t from, uint64_t upto,
+                     uint32_t dim, float *vectors, unsigned char *live, bool base_sample)
+{
+    size_t row_bytes = (size_t) dim * sizeof(float);
+    uint32_t count = (uint32_t) (upto - from);
+    uint64_t cursor = chunk ? chunk->from + chunk->positions : 0;
+
+    while (chunk && cursor > from)
+    {
+        const float *packed = (const float *) (chunk->marks + chunk->positions);
+
+        if (chunk->from + chunk->positions != cursor)
+            return 0;
+        for (uint32_t i = 0; i < chunk->positions; ++i)
+        {
+            uint64_t position = chunk->from + i;
+
+            if (position >= upto)
+                break;
+            if (chunk->marks[i].state != CUVS_PAGE_POSITION_VECTOR)
+                continue;
+            if (position >= from)
+            {
+                uint32_t slot = (uint32_t) (position - from);
+
+                memcpy(vectors + (size_t) slot * dim, packed, row_bytes);
+                live[slot] = 1;
+            }
+            packed += dim;
+        }
+        cursor = chunk->from;
+        chunk = chunk->next;
+    }
+    if (cursor > from)
+        return 0;
+
+    for (uint32_t first = 0; first < count; first += CUVS_CAGRA_FOLD_BATCH_ROWS)
+    {
+        uint32_t end = count - first < CUVS_CAGRA_FOLD_BATCH_ROWS ? count : first + CUVS_CAGRA_FOLD_BATCH_ROWS;
+        uint32_t sample = first;
+
+        while (sample < end && !live[sample])
+            ++sample;
+        if (sample == end)
+        {
+            if (!base_sample)
+                return first;
+            memset(vectors + (size_t) first * dim, 0, (end - first) * row_bytes);
+            continue;
+        }
+        for (uint32_t i = first; i < end; ++i)
+            if (!live[i])
+            {
+                memcpy(vectors + (size_t) i * dim, vectors + (size_t) sample * dim, row_bytes);
+                live[i] = 1;
+            }
+    }
+    return count;
+}
+
+static void
+page_fold_run(int device)
+{
+    PageGraphFoldRef source = {0};
+    PageCagraGraph *parent;
+    CuvsPageOverlayChunk *snapshot, *staging = NULL;
+    CuvsPageFoldEvent event;
+    CuvsCagraIndex old_handle, new_handle = NULL;
+    CuvsCagraFoldShape shape;
+    CuvsCagraFoldControl control = {.should_yield = page_fold_should_yield, .context = &device};
+    CuvsCagraFoldStatus status = CUVS_CAGRA_FOLD_INVALID;
+    uint64_t now = admission_mono_us();
+    size_t peak, limit, used, host_bytes, host_mirror_charge = 0;
+    uint64_t pending, retained, claim;
+    uint32_t wanted, dim, base_sample;
+    uint32_t staging_status;
+    bool offered = false;
+
+    (void) pthread_once(&g_page_daemon_once, initialize_page_daemon_id);
+    if (!g_page_daemon_id)
+        return;
+
+    pthread_mutex_lock(&g_index_mutex);
+    if (g_pending_build_vram[device] || g_unlocked_gpu_jobs || page_fold_should_yield(&device))
+        goto defer;
+    parent = page_fold_pick_locked(device, now);
+    if (!parent)
+        goto defer;
+    parent->fold_retry_after = now + UINT64_C(1000000);
+    pending = parent->overlay.covered_upto - parent->folded;
+    wanted = pending < PAGE_FOLD_MAX_POSITIONS ? (uint32_t) pending : PAGE_FOLD_MAX_POSITIONS;
+    dim = parent->dim;
+    base_sample = parent->fold_live_base_slot;
+    if (!dim || wanted > (SIZE_MAX - wanted) / sizeof(float) / dim ||
+        cuvs_cagra_fold_shape(parent->handle, &shape) != 0 ||
+        shape.rows != parent->n_slots || shape.dim != dim)
+        goto defer;
+    claim = cuvs_cagra_fold_peak_bytes(shape.rows, wanted, dim, shape.stride, shape.degree, &retained);
+    if (claim >= CUVS_ADMISSION_BYTES_SATURATED || claim > SIZE_MAX)
+        goto defer;
+    peak = (size_t) claim;
+    limit = budget_eff_bytes(device);
+    used = total_vram_used(device);
+    if ((limit && (used >= limit || peak > limit - used)) || peak > gpu_free_vram_bytes(device))
+        goto defer;
+
+    event = (CuvsPageFoldEvent) {
+        .length = sizeof(event), .db_oid = parent->db_oid, .index_oid = parent->index_oid,
+        .system_identifier = parent->system_identifier, .boot_id = parent->overlay.boot_id,
+        .daemon_id = g_page_daemon_id, .index_nonce = parent->index_nonce, .base_nonce = parent->base_nonce,
+        .parent_graph_nonce = parent->graph_nonce, .parent_n_slots = parent->n_slots,
+        .parent_folded = parent->folded,
+    };
+    if (page_fold_should_yield(&device))
+        goto defer;
+    old_handle = page_graph_fold_pin_locked(parent, &source);
+    if (!old_handle)
+        goto defer;
+    snapshot = parent->overlay.head;
+    cuvs_page_overlay_retain(snapshot);
+    reserve_build_vram(peak, device);
+    g_fold_claim[device] = peak;
+    __atomic_store_n(&g_fold_active[device], true, __ATOMIC_SEQ_CST);
+    uint64_t started = admission_mono_us();
+    pthread_mutex_unlock(&g_index_mutex);
+    LOG_INFO("[page_fold_begin] gpu=%d db=%u index=%u positions=%u reserve=%zu mono_us=%llu daemon_id=%llu\n",
+             device, event.db_oid, event.index_oid, wanted, peak,
+             (unsigned long long) started, (unsigned long long) event.daemon_id);
+
+    host_bytes = (size_t) wanted * dim * sizeof(float);
+    staging_status = cuvs_page_overlay_alloc(&g_page_overlay_budget, &(CuvsPageOverlayRequest) {0},
+                                             host_bytes + wanted, &staging);
+    if (staging_status == CUVS_STATUS_OK)
+    {
+        float *rows = (float *) staging->marks;
+        unsigned char *live = (unsigned char *) rows + host_bytes;
+
+        memset(live, 0, wanted);
+        event.positions = page_fold_copy_rows(snapshot, event.parent_folded,
+                                             event.parent_folded + wanted, dim, rows, live, base_sample != 0);
+        if (memchr(live, 0, event.positions))
+        {
+            control.filled_rows = live;
+            control.placeholder_slot = base_sample - 1;
+        }
+        if (event.positions && shm_key_random((unsigned char *) &event.graph_nonce, sizeof(event.graph_nonce)) == 0 &&
+            event.graph_nonce && event.graph_nonce != event.parent_graph_nonce && event.graph_nonce != event.base_nonce)
+        {
+            /* SDK host_graph and host_dataset mirror the output layout.
+             * Account for both while the packed input and overlay are live. */
+            retained = retained / (shape.rows + wanted) * (shape.rows + event.positions);
+            size_t mirrors = (size_t) retained;
+
+            if (cuvs_page_overlay_reserve(&g_page_overlay_budget, mirrors))
+            {
+                host_mirror_charge = mirrors;
+                status = cuvs_cagra_fold_reuse_with_yield(old_handle, rows, event.positions,
+                                                          (int) dim, device, &new_handle, &control);
+            }
+            else
+                staging_status = CUVS_STATUS_PAGE_OVERLAY_HOST_FULL;
+        }
+    }
+
+    if (status == CUVS_CAGRA_FOLD_CUDA_UNCONFIRMED)
+    {
+        /* Completion of accesses to the borrowed graph and host vectors is
+         * unknown. Preserve their lifetime until the CUDA context exits. */
+        LOG_ERROR("[page_fold] CUDA completion unconfirmed gpu=%d db=%u index=%u\n",
+                  device, event.db_oid, event.index_oid);
+        _Exit(EXIT_FAILURE);
+    }
+    if (host_mirror_charge)
+        cuvs_page_overlay_unreserve(&g_page_overlay_budget, host_mirror_charge);
+    if (status == CUVS_CAGRA_FOLD_OK)
+    {
+        pthread_mutex_lock(&g_index_mutex);
+        if (!page_fold_should_yield(&device))
+            offered = page_graph_register_fold_locked(&source, &event, new_handle, (size_t) retained);
+        if (offered)
+        {
+            release_build_vram(peak, device);
+            g_fold_claim[device] = 0;
+        }
+        pthread_mutex_unlock(&g_index_mutex);
+    }
+    if (new_handle && !offered)
+        cuvs_cagra_free(new_handle, device);
+    cuvs_page_overlay_release(staging);
+    cuvs_page_overlay_release(snapshot);
+    page_graph_fold_unpin(&source);
+
+    pthread_mutex_lock(&g_index_mutex);
+    if (!offered)
+    {
+        release_build_vram(peak, device);
+        g_fold_claim[device] = 0;
+    }
+    __atomic_store_n(&g_fold_active[device], false, __ATOMIC_SEQ_CST);
+    uint64_t finished = admission_mono_us();
+    pthread_cond_broadcast(&g_fold_finished);
+    pthread_mutex_unlock(&g_index_mutex);
+    LOG_INFO("[page_fold] gpu=%d db=%u index=%u positions=%u status=%d offered=%d elapsed_us=%llu staging_status=%u"
+             " daemon_id=%llu started_us=%llu mono_us=%llu\n",
+             device, event.db_oid, event.index_oid, event.positions, status, offered,
+             (unsigned long long) (finished - now), staging_status, (unsigned long long) event.daemon_id,
+             (unsigned long long) started, (unsigned long long) finished);
+    return;
+
+defer:
+    pthread_mutex_unlock(&g_index_mutex);
+}
+
+static void *
+page_fold_thread(void *arg)
+{
+    int device = (int) (intptr_t) arg;
+
+    while (!g_shutdown)
+    {
+        page_fold_run(device);
+        struct timespec delay = {.tv_nsec = 100000000};
+
+        nanosleep(&delay, NULL);
+    }
+    return NULL;
+}
+#endif
+
+static bool
+page_fold_ready_locked(uint32_t db_oid, uint32_t index_oid, uint64_t index_nonce,
+                        const CuvsPageFoldQuery *query,
+                        CuvsPageFoldEvent *event, int *device, uint64_t *protected_us)
+{
+    PageCagraGraph *selected = NULL;
+
+    for (const PageCagraGraph *parent = g_page_graphs; parent; parent = parent->next)
+    {
+        PageCagraGraph *candidate = parent->fold_candidate;
+
+#ifdef CUVS_CAGRA_FOLD_ENABLED
+        /* A new handoff may not turn a reclaimable candidate into a protected
+         * one while an active fold's foreground waiters are resuming. A
+         * waiter keeps its claim until it reacquires this same mutex. */
+        if (candidate && !candidate->fold_protected_us &&
+            (g_fold_active[parent->gpu] || __atomic_load_n(&g_fold_waiters[parent->gpu], __ATOMIC_SEQ_CST)))
+            continue;
+#endif
+        if (candidate && parent->db_oid == db_oid &&
+            (!index_oid || (parent->index_oid == index_oid && parent->index_nonce == index_nonce)) &&
+            parent->system_identifier == query->system_identifier &&
+            parent->overlay.boot_id == query->boot_id &&
+            candidate->fold_event.boot_id == query->boot_id &&
+            (!selected || candidate->fold_offer_order < selected->fold_offer_order))
+            selected = candidate;
+    }
+    if (!selected)
+        return false;
+
+    /* Leave the event outstanding while allowing another index to be
+     * offered if this one is waiting on DDL or VACUUM. */
+#ifdef CUVS_CAGRA_FOLD_ENABLED
+    /* Once the handler can send any READY bytes, delivery is uncertain.
+     * Keep the event and graph until the existing PG lifetime resolves it. */
+    if (!selected->fold_protected_us)
+    {
+        selected->fold_protected_us = admission_mono_us();
+        LOG_INFO("[page_fold_protected] db=%u index=%u gpu=%d mono_us=%llu" FOLD_EVENT_LOG "\n",
+                 selected->db_oid, selected->index_oid, selected->gpu,
+                 (unsigned long long) selected->fold_protected_us, FOLD_EVENT_FIELDS(selected->fold_event));
+    }
+    if (protected_us)
+        *protected_us = selected->fold_protected_us;
+#else
+    (void) protected_us;
+#endif
+    selected->fold_offer_order = ++g_page_fold_offer_order;
+    *event = selected->fold_event;
+    if (device)
+        *device = selected->gpu;
+    return true;
+}
+
+/* The wire event is a fixed, padding-free sequence of integer fields. */
+static uint32_t
+page_fold_result_locked(const CuvsPageFoldResult *result, uint64_t received_us)
+{
+#ifndef CUVS_CAGRA_FOLD_ENABLED
+    (void) received_us;
+#endif
+    for (PageCagraGraph **link = &g_page_graphs; *link; link = &(*link)->next)
+    {
+        PageCagraGraph *parent = *link;
+        PageCagraGraph *candidate = parent->fold_candidate;
+
+        if (parent->overlay.boot_id != result->event.boot_id)
+            continue;
+        if (parent->fold_lsn && parent->fold_lsn == result->transition_lsn &&
+            memcmp(&parent->fold_event, &result->event, sizeof(result->event)) == 0)
+            return CUVS_STATUS_OK;
+        if (!candidate ||
+            memcmp(&candidate->fold_event, &result->event, sizeof(result->event)) != 0)
+            continue;
+        if (!result->transition_lsn)
+        {
+            if (candidate->fold_seen_by_pg)
+                return CUVS_STATUS_NOT_FOUND;
+            discard_page_fold_locked(parent, "discard");
+            return CUVS_STATUS_OK;
+        }
+
+        /* Move the unpublished suffix, including supply since READY. */
+        parent->fold_candidate = NULL;
+        candidate->overlay = parent->overlay;
+        parent->overlay = (CuvsPageOverlay) {0};
+        defer_page_overlay_release(
+            cuvs_page_overlay_advance_fold(&candidate->overlay, candidate->folded));
+        candidate->retired_boots = parent->retired_boots;
+        parent->retired_boots = NULL;
+        candidate->fold_lsn = result->transition_lsn;
+        candidate->loaded_at = time(NULL);
+#ifdef CUVS_CAGRA_FOLD_ENABLED
+        candidate->fold_pending_since = parent->fold_pending_since;
+#endif
+        candidate->next = parent->next;
+        *link = candidate;
+        retire_page_graph_locked(parent, true);
+#ifdef CUVS_CAGRA_FOLD_ENABLED
+        LOG_INFO("[page_fold_commit] db=%u index=%u positions=%u folded=%llu lsn=%llX mono_us=%llu gpu=%d accepted_us=%llu"
+                 FOLD_EVENT_LOG "\n",
+                 candidate->db_oid, candidate->index_oid, candidate->fold_event.positions,
+                 (unsigned long long) candidate->folded, (unsigned long long) candidate->fold_lsn,
+                 (unsigned long long) received_us, candidate->gpu,
+                 (unsigned long long) admission_mono_us(), FOLD_EVENT_FIELDS(candidate->fold_event));
+#endif
+        return CUVS_STATUS_OK;
+    }
+    return CUVS_STATUS_NOT_FOUND;
+}
+
+static void
+handle_page_fold_ready(int client_fd, const CuvsCmdFrame *cmd)
+{
+    CuvsPageFoldQuery query;
+    CuvsPageFoldEvent event;
+    CuvsReplyHeader reply = {.status = CUVS_STATUS_ERROR};
+    uint64_t index_nonce = 0;
+    uint64_t protected_us = 0;
+    int device = -1;
+
+    if (recv_all(client_fd, &query, sizeof(query)) == 0 &&
+        cmd->db_oid && !query.reserved && query.system_identifier && query.boot_id &&
+        ((!cmd->index_oid && query.length == sizeof(query)) ||
+         (cmd->index_oid && query.length == sizeof(query) + sizeof(index_nonce) &&
+          recv_all(client_fd, &index_nonce, sizeof(index_nonce)) == 0 && index_nonce)))
+    {
+        pthread_mutex_lock(&g_index_mutex);
+        reply.status = page_fold_ready_locked(cmd->db_oid, cmd->index_oid, index_nonce, &query, &event,
+                                               &device, &protected_us) ?
+            CUVS_STATUS_OK : CUVS_STATUS_NOT_FOUND;
+        pthread_mutex_unlock(&g_index_mutex);
+    }
+    if (reply.status == CUVS_STATUS_OK)
+    {
+#ifdef CUVS_CAGRA_FOLD_ENABLED
+        uint64_t start = admission_mono_us();
+#endif
+        bool sent = send_all(client_fd, &reply, sizeof(reply)) == 0 &&
+            send_all(client_fd, &event, sizeof(event)) == 0;
+#ifdef CUVS_CAGRA_FOLD_ENABLED
+        LOG_INFO("[page_fold_ready] db=%u index=%u gpu=%d protected_us=%llu send_started_us=%llu mono_us=%llu sent=%d"
+                 FOLD_EVENT_LOG "\n", event.db_oid, event.index_oid, device,
+                 (unsigned long long) protected_us, (unsigned long long) start,
+                 (unsigned long long) admission_mono_us(), sent,
+                 FOLD_EVENT_FIELDS(event));
+#else
+        (void) sent;
+#endif
+    }
+    else
+        (void) send_all(client_fd, &reply, sizeof(reply));
+}
+
+static void
+handle_page_fold_result(int client_fd, const CuvsCmdFrame *cmd)
+{
+    CuvsPageFoldResult result;
+    CuvsReplyHeader reply = {.status = CUVS_STATUS_ERROR};
+
+    if (recv_all(client_fd, &result, sizeof(result)) == 0 &&
+        cuvs_page_fold_event_valid(&result.event) &&
+        cmd->db_oid == result.event.db_oid && cmd->index_oid == result.event.index_oid &&
+        (cmd->op == CUVS_OP_FOLD_COMMITTED) == (result.transition_lsn != 0))
+    {
+#ifdef CUVS_CAGRA_FOLD_ENABLED
+        uint64_t received_us = admission_mono_us();
+#else
+        uint64_t received_us = 0;
+#endif
+        (void) pthread_once(&g_page_daemon_once, initialize_page_daemon_id);
+#if defined(CUVS_TEST_HOOKS) && defined(CUVS_CAGRA_FOLD_ENABLED)
+        static bool lost_ack;
+
+        if (result.transition_lsn && result.event.daemon_id == g_page_daemon_id &&
+            cuvs_fault("CUVS_FAULT_PAGE_FOLD_ACK_ONCE") &&
+            !__atomic_exchange_n(&lost_ack, true, __ATOMIC_RELAXED))
+        {
+            LOG_INFO("[page_fold_ack_drop] db=%u index=%u lsn=%llX mono_us=%llu" FOLD_EVENT_LOG "\n",
+                     result.event.db_oid, result.event.index_oid,
+                     (unsigned long long) result.transition_lsn, (unsigned long long) received_us,
+                     FOLD_EVENT_FIELDS(result.event));
+            return;
+        }
+#endif
+        pthread_mutex_lock(&g_index_mutex);
+        reply.status = result.event.daemon_id == g_page_daemon_id ?
+            page_fold_result_locked(&result, received_us) : CUVS_STATUS_NOT_FOUND;
+        pthread_mutex_unlock(&g_index_mutex);
+    }
+    (void) send_all(client_fd, &reply, sizeof(reply));
+}
+
+static uint32_t
+receive_page_overlay(int client_fd, const CuvsCmdFrame *cmd, CuvsPageOverlayRequest *request)
+{
+    if (recv_all(client_fd, &request->base.length, sizeof(request->base.length)) < 0 ||
+        request->base.length != sizeof(*request) ||
+        recv_all(client_fd, (char *) request + sizeof(request->base.length),
+                 sizeof(*request) - sizeof(request->base.length)) < 0)
+        return CUVS_STATUS_ERROR;
+    if (cmd->dim == 0 || cmd->dim > 65535 || cmd->n_filter_tids ||
+        request->base.resume_count || request->base.resume_distance ||
+#ifdef CUVS_CAGRA_FOLD_ENABLED
+        (request->base.reserved &&
+         (cmd->op != CUVS_OP_SUPPLY_PAGES || request->base.reserved > request->base.n_slots)) ||
+#else
+        request->base.reserved ||
+#endif
+        !request->boot_id || request->from < request->base.folded ||
+        request->from > request->base.tail ||
+        request->base.tail - request->from != request->positions ||
+        request->positions > CUVS_PAGE_BATCH_MAX || request->vector_rows > request->positions)
+        return CUVS_STATUS_ERROR;
+    (void) pthread_once(&g_page_daemon_once, initialize_page_daemon_id);
+    return g_page_daemon_id ? CUVS_STATUS_OK : CUVS_STATUS_ERROR;
+}
+
+static PageCagraGraph *
+find_page_overlay_graph(const CuvsCmdFrame *cmd, const CuvsPageOverlayRequest *request,
+                        PageCagraGraph **overlay_owner, bool observe)
+{
+    PageCagraGraph *graph = find_page_graph(cmd, &request->base);
+
+    if (graph)
+    {
+        *overlay_owner = graph;
+        return graph->dim == cmd->dim && graph->metric == cmd->metric ? graph : NULL;
+    }
+
+    for (PageCagraGraph *parent = g_page_graphs; parent; parent = parent->next)
+    {
+        PageCagraGraph *candidate = parent->fold_candidate;
+
+        if (!candidate || !page_graph_matches(candidate, cmd, &request->base) ||
+            candidate->dim != cmd->dim || candidate->metric != cmd->metric)
+            continue;
+        if (candidate->fold_event.boot_id != request->boot_id ||
+            parent->overlay.boot_id != request->boot_id)
+        {
+            /* A new PG lifetime may have replayed the child nonce. The
+             * volatile candidate cannot serve it or keep the parent pinned. */
+            if (observe)
+            {
+                CuvsPageOverlayChunk *obsolete;
+
+                if (page_graph_use_boot_locked(parent, request->boot_id, &obsolete))
+                    defer_page_overlay_release(obsolete);
+            }
+            return NULL;
+        }
+        if (observe)
+            candidate->fold_seen_by_pg = true;
+        *overlay_owner = parent;
+        return candidate;
+    }
+    return NULL;
+}
+
+#ifdef CUVS_TEST_HOOKS
+/* Suspend a receive or search after it has obtained its budgeted reference. */
+static void
+page_overlay_test_gate(const char *name)
+{
+    const char *path = getenv(name);
+
+    if (path)
+    {
+        int fd = open(path, O_RDONLY | O_CLOEXEC);
+        char release;
+
+        if (fd >= 0)
+        {
+            (void) read(fd, &release, 1);
+            close(fd);
+        }
+    }
+}
+#endif
+
+static uint32_t
+read_page_overlay_chunk(const CuvsPageOverlayRequest *request, uint32_t dim, bool shared,
+                        CuvsPageOverlayChunk **result)
+{
+    size_t bytes = (size_t) request->positions * sizeof(CuvsPagePosition) +
+                   (size_t) request->vector_rows * dim * sizeof(float);
+    int fd = open_page_shm(request->supplement_shm, sizeof(request->supplement_shm), bytes);
+    uint32_t status;
+    size_t offset = 0;
+
+    if (fd < 0)
+        return CUVS_STATUS_ERROR;
+    status = cuvs_page_overlay_alloc(&g_page_overlay_budget, request, bytes, result);
+    if (status == CUVS_STATUS_OK)
+    {
+#ifdef CUVS_TEST_HOOKS
+        page_overlay_test_gate("CUVS_TEST_PAGE_OVERLAY_RECEIVE_FIFO");
+#endif
+        /* Read into the reserved chunk directly. There is no daemon-side
+         * staging mapping or second buffer to overlap this allocation. */
+        while (offset < bytes)
+        {
+            ssize_t n = pread(fd, (char *) (*result)->marks + offset, bytes - offset, (off_t) offset);
+
+            if (n < 0 && errno == EINTR)
+                continue;
+            if (n <= 0)
+                break;
+            offset += (size_t) n;
+        }
+        if (offset != bytes || !cuvs_page_overlay_valid(*result, request->vector_rows, shared))
+            status = CUVS_STATUS_ERROR;
+    }
+    close(fd);
+    return status;
+}
+
+static bool
+send_page_overlay_reply(int client_fd, const CuvsReplyHeader *reply, const CuvsPageProgress *progress)
+{
+    return send_all(client_fd, reply, sizeof(*reply)) == 0 &&
+        (reply->status == CUVS_STATUS_OK || reply->status == CUVS_STATUS_PAGE_NEED ||
+         reply->status == CUVS_STATUS_PAGE_OVERLAY_FULL ||
+         reply->status == CUVS_STATUS_PAGE_OVERLAY_HOST_FULL) &&
+        send_all(client_fd, progress, sizeof(*progress)) == 0;
+}
+
+static void
+handle_page_supply(int client_fd, const CuvsCmdFrame *cmd)
+{
+    CuvsPageOverlayRequest request;
+    CuvsReplyHeader reply = {0};
+    CuvsPageProgress progress = {0};
+    CuvsPageOverlayChunk *chunk = NULL, *obsolete = NULL, *previous;
+    PageCagraGraph *graph, *owner;
+    uint64_t registered_order, generation;
+
+    reply.status = receive_page_overlay(client_fd, cmd, &request);
+    if (reply.status != CUVS_STATUS_OK)
+        goto done;
+    reply.status = CUVS_STATUS_ERROR;
+    if (cmd->n_vecs || cmd->k)
+        goto done;
+#ifndef CUVS_CAGRA_FOLD_ENABLED
+    if (!request.positions)
+        goto done;
+#endif
+    progress.daemon_id = g_page_daemon_id;
+
+    pthread_mutex_lock(&g_index_mutex);
+    graph = find_page_overlay_graph(cmd, &request, &owner, true);
+    if (!graph || !page_graph_use_boot_locked(owner, request.boot_id, &previous))
+    {
+        pthread_mutex_unlock(&g_index_mutex);
+        reply.status = CUVS_STATUS_NOT_FOUND;
+        goto done;
+    }
+    reply.status = cuvs_page_overlay_supply(&owner->overlay, &request, &chunk, &obsolete);
+#ifdef CUVS_CAGRA_FOLD_ENABLED
+    if (reply.status == CUVS_STATUS_OK)
+        graph->fold_live_base_slot = request.base.reserved;
+#endif
+    progress.covered_upto = owner->overlay.covered_upto;
+    registered_order = graph->registered_order;
+    generation = owner->overlay.generation;
+    pthread_mutex_unlock(&g_index_mutex);
+    cuvs_page_overlay_release(previous);
+    cuvs_page_overlay_release(obsolete);
+    obsolete = NULL;
+    if (reply.status != CUVS_STATUS_OK || request.base.tail <= progress.covered_upto)
+        goto done;
+
+    reply.status = read_page_overlay_chunk(&request, cmd->dim, true, &chunk);
+    if (reply.status != CUVS_STATUS_OK)
+        goto done;
+
+    pthread_mutex_lock(&g_index_mutex);
+    graph = find_page_overlay_graph(cmd, &request, &owner, false);
+    if (graph && graph->registered_order == registered_order && owner->overlay.generation == generation)
+    {
+        reply.status = cuvs_page_overlay_supply(&owner->overlay, &request, &chunk, &obsolete);
+        progress.covered_upto = owner->overlay.covered_upto;
+    }
+    else
+        reply.status = CUVS_STATUS_NOT_FOUND;
+    pthread_mutex_unlock(&g_index_mutex);
+
+done:
+    cuvs_page_overlay_release(chunk);
+    cuvs_page_overlay_release(obsolete);
+    (void) send_page_overlay_reply(client_fd, &reply, &progress);
+}
+
+/* Caller holds the registry lock and has validated the graph incarnation. */
+static uint32_t
+page_overlay_search_status(const CuvsCmdFrame *cmd, const CuvsPageOverlayRequest *request,
+                           const PageCagraGraph *graph, const CuvsPageOverlay *overlay)
+{
+    if (request->base.tail - request->base.folded > CUVS_PAGE_OVERLAY_MAX)
+        return CUVS_STATUS_PAGE_OVERLAY_FULL;
+    if (request->from > overlay->covered_upto)
+        return CUVS_STATUS_PAGE_NEED;
+    if (cmd->search_mode == 1 && !graph->bf[cmd->bf_precision])
+        return CUVS_STATUS_NO_VECTORS;
+    return CUVS_STATUS_OK;
+}
+
+/* At most one shared chunk straddles the fold boundary. Clip it once per
+ * search under the host budget, preserving the packed vector order. Older
+ * chunks remain intact for a parent that is still serving before ACK. */
+static uint32_t
+clip_page_overlay_chunk(const CuvsPageOverlayChunk *chunk, uint64_t folded,
+                        uint64_t upto, uint32_t dim, CuvsPageOverlayChunk **clipped)
+{
+    CuvsPageOverlayRequest slice = {.from = folded};
+    uint32_t first, end, skip = 0, rows = 0;
+    size_t marks, vectors;
+    uint32_t status;
+
+    if (!chunk || folded - chunk->from >= chunk->positions)
+        return CUVS_STATUS_OK;
+    first = (uint32_t) (folded - chunk->from);
+    end = upto - chunk->from < chunk->positions ?
+        (uint32_t) (upto - chunk->from) : chunk->positions;
+    if (first >= end)
+        return CUVS_STATUS_OK;
+    for (uint32_t i = 0; i < first; ++i)
+        skip += chunk->marks[i].state == CUVS_PAGE_POSITION_VECTOR;
+    for (uint32_t i = first; i < end; ++i)
+        rows += chunk->marks[i].state == CUVS_PAGE_POSITION_VECTOR;
+    slice.positions = end - first;
+    marks = (size_t) slice.positions * sizeof(CuvsPagePosition);
+    vectors = (size_t) rows * dim * sizeof(float);
+    status = cuvs_page_overlay_alloc(&g_page_overlay_budget, &slice, marks + vectors, clipped);
+    if (status == CUVS_STATUS_OK)
+    {
+        const float *data = (const float *) (chunk->marks + chunk->positions);
+
+        memcpy((*clipped)->marks, chunk->marks + first, marks);
+        memcpy((*clipped)->marks + slice.positions, data + (size_t) skip * dim, vectors);
+    }
+    return status;
+}
+
+static void
+handle_page_overlay_search(int client_fd, const CuvsCmdFrame *cmd)
+{
+    CuvsPageOverlayRequest request;
+    CuvsReplyHeader reply = {0};
+    CuvsPageProgress progress = {0};
+    CuvsPageOverlayChunk *supplement = NULL, *obsolete = NULL;
+    CuvsPageOverlayChunk *snapshot = NULL, *clipped = NULL;
+    CuvsSearchResult *raw = NULL;
+    CuvsPageOverlayResult *results = NULL;
+    void *query = MAP_FAILED;
+    size_t bytes = 0;
+    bool batch = cmd->op == CUVS_OP_SEARCH_PAGE_OVERLAY_BATCH;
+    bool normalize_hnsw_ip = false;
+    uint32_t prefix = batch ? 2 * sizeof(uint32_t) : 0;
+    uint64_t started;
+    uint64_t registered_order = 0, generation = 0;
+    int k = 0;
+    const float *vectors;
+    PageCagraGraph *graph, *owner;
+
+    reply.status = receive_page_overlay(client_fd, cmd, &request);
+    if (reply.status != CUVS_STATUS_OK)
+        goto done;
+    reply.status = CUVS_STATUS_ERROR;
+    if (cmd->k == 0 || cmd->k > CUVS_PAGE_SEARCH_MAX_K || cmd->n_vecs < 1 || cmd->n_vecs > 1024 ||
+        batch != (cmd->n_vecs > 1) || cmd->search_mode > 1 || cmd->bf_precision > 1)
+        goto done;
+    progress.daemon_id = g_page_daemon_id;
+    if (request.positions)
+    {
+        pthread_mutex_lock(&g_index_mutex);
+        graph = find_page_overlay_graph(cmd, &request, &owner, true);
+        reply.status = CUVS_STATUS_NOT_FOUND;
+        if (graph && page_graph_use_boot_locked(owner, request.boot_id, &obsolete))
+        {
+            registered_order = graph->registered_order;
+            generation = owner->overlay.generation;
+            progress.covered_upto = owner->overlay.covered_upto;
+            reply.status = page_overlay_search_status(cmd, &request, graph, &owner->overlay);
+        }
+        pthread_mutex_unlock(&g_index_mutex);
+        cuvs_page_overlay_release(obsolete);
+        obsolete = NULL;
+        if (reply.status != CUVS_STATUS_OK)
+            goto done;
+        reply.status = read_page_overlay_chunk(&request, cmd->dim, false, &supplement);
+        if (reply.status != CUVS_STATUS_OK)
+            goto done;
+    }
+    reply.status = CUVS_STATUS_ERROR;
+    bytes = prefix + (size_t) cmd->n_vecs * cmd->dim * sizeof(float);
+    query = map_page_shm(cmd->shm_key, sizeof(cmd->shm_key), bytes);
+    if (query == MAP_FAILED ||
+        (batch && (((const uint32_t *) query)[0] != (uint32_t) cmd->n_vecs ||
+                   ((const uint32_t *) query)[1] != cmd->dim)))
+        goto done;
+    vectors = (const float *) ((const char *) query + prefix);
+    raw = malloc((size_t) cmd->n_vecs * cmd->k * sizeof(*raw));
+    results = calloc((size_t) cmd->n_vecs * cmd->k, sizeof(*results));
+    if (!raw || !results)
+        goto done;
+
+    started = admission_mono_us();
+    pthread_mutex_lock(&g_index_mutex);
+    graph = find_page_overlay_graph(cmd, &request, &owner, !request.positions);
+    if (!graph || (supplement && (graph->registered_order != registered_order ||
+                                 owner->overlay.generation != generation)) ||
+        !page_graph_use_boot_locked(owner, request.boot_id, &obsolete))
+    {
+        reply.status = CUVS_STATUS_NOT_FOUND;
+        goto unlock;
+    }
+    progress.covered_upto = owner->overlay.covered_upto;
+    reply.status = page_overlay_search_status(cmd, &request, graph, &owner->overlay);
+    if (reply.status != CUVS_STATUS_OK)
+        goto unlock;
+
+    k = (int) (graph->n_slots < cmd->k ? graph->n_slots : cmd->k);
+    if (page_graph_search(graph, cmd, vectors, (int) cmd->n_vecs, k, NULL, raw) != 0)
+    {
+        reply.status = CUVS_STATUS_OOM_FALLBACK;
+        goto unlock;
+    }
+
+    graph->last_use = ++g_page_access;
+    graph->last_search = time(NULL);
+    if (graph->hits < UINT32_MAX)
+        ++graph->hits;
+
+    registered_order = graph->registered_order;
+    generation = owner->overlay.generation;
+    normalize_hnsw_ip = cmd->metric == CUVS_METRIC_IP && cmd->search_mode == 0 &&
+                       cmd->use_cpu_hnsw && graph->cpu_hnsw;
+    if (request.from > request.base.folded)
+    {
+        snapshot = owner->overlay.head;
+        cuvs_page_overlay_retain(snapshot);
+    }
+    reply.status = CUVS_STATUS_OK;
+unlock:
+    pthread_mutex_unlock(&g_index_mutex);
+    cuvs_page_overlay_release(obsolete);
+    if (reply.status != CUVS_STATUS_OK)
+        goto timed;
+
+#ifdef CUVS_TEST_HOOKS
+    if (snapshot)
+        page_overlay_test_gate("CUVS_TEST_PAGE_OVERLAY_SCORE_FIFO");
+#endif
+    /* Only the copied base results and an immutable overlay prefix are used
+     * below. Concurrent appends leave this search's covered range intact. */
+    const CuvsPageOverlayChunk *first = snapshot;
+    while (first && first->from >= request.from)
+        first = first->next;
+    if (request.base.folded && first)
+    {
+        const CuvsPageOverlayChunk *boundary = first;
+
+        while (boundary && boundary->from >= request.base.folded)
+            boundary = boundary->next;
+        reply.status = clip_page_overlay_chunk(boundary, request.base.folded, request.from,
+                                               cmd->dim, &clipped);
+        if (reply.status != CUVS_STATUS_OK)
+            goto timed;
+    }
+    for (int q = 0; q < (int) cmd->n_vecs; ++q)
+    {
+        int written = 0;
+        CuvsPageOverlayResult *row = results + (size_t) q * cmd->k;
+        const float *vector = vectors + (size_t) q * cmd->dim;
+
+        for (int i = 0; i < k; ++i)
+        {
+            const CuvsSearchResult *candidate = &raw[(size_t) q * k + i];
+            if (candidate->item_id >= 0 && (uint64_t) candidate->item_id < request.base.n_slots)
+            {
+                float distance = candidate->distance;
+
+                /* HNSW IP returns 1-dot; overlay and CAGRA IP use raw dot.
+                 * This conversion belongs to the new merge path only: the
+                 * base-only page reply keeps its existing HNSW distance. */
+                if (normalize_hnsw_ip)
+                    distance = 1.0f - distance;
+                if (!isfinite(distance))
+                    continue;
+                row[written].slot = (uint64_t) candidate->item_id;
+                row[written++].distance = distance;
+            }
+        }
+        for (const CuvsPageOverlayChunk *chunk = first;
+             chunk && chunk->from >= request.base.folded; chunk = chunk->next)
+            cuvs_page_overlay_score(chunk, request.from, &request.base, vector, cmd, row, &written);
+        cuvs_page_overlay_score(clipped, request.from, &request.base, vector, cmd, row, &written);
+        cuvs_page_overlay_score(supplement, request.base.tail, &request.base, vector, cmd, row, &written);
+        if (batch)
+            while ((uint32_t) written < cmd->k)
+                row[written++].slot = CUVS_PAGE_SLOT_INVALID;
+        reply.n_results += written;
+    }
+    pthread_mutex_lock(&g_index_mutex);
+    graph = find_page_overlay_graph(cmd, &request, &owner, false);
+    if (!graph || graph->registered_order != registered_order ||
+        owner->overlay.generation != generation)
+    {
+        reply.status = CUVS_STATUS_NOT_FOUND;
+        reply.n_results = 0;
+    }
+    pthread_mutex_unlock(&g_index_mutex);
+
+timed:
+    reply.latency_us = (uint32_t) (admission_mono_us() - started);
+done:
+    if (query != MAP_FAILED)
+        munmap(query, bytes);
+    free(raw);
+    cuvs_page_overlay_release(supplement);
+    cuvs_page_overlay_release(clipped);
+    cuvs_page_overlay_release(snapshot);
+    if (send_page_overlay_reply(client_fd, &reply, &progress) && reply.n_results)
+        (void) send_all(client_fd, results, reply.n_results * sizeof(*results));
+    free(results);
+}
+
 static void *
 connection_thread(void *arg)
 {
@@ -12820,10 +15516,28 @@ connection_thread(void *arg)
             cmd.op, cmd.db_oid, cmd.index_oid, cmd.dim, (long long)cmd.n_vecs, cmd.shm_key);
     fflush(stderr);
 
+#ifdef CUVS_CAGRA_FOLD_ENABLED
+    t_fold_request_op = page_fold_request_operation(&cmd);
+    if (t_fold_request_op)
+    {
+        (void) pthread_once(&g_page_daemon_once, initialize_page_daemon_id);
+        t_fold_request = &cmd;
+        t_fold_request_id = __atomic_add_fetch(&g_fold_request_sequence, 1, __ATOMIC_RELAXED);
+        t_fold_request_started = admission_mono_us();
+        LOG_INFO("[page_fold_request] op=%s db=%u index=%u daemon_id=%llu request_id=%llu mono_us=%llu\n",
+                 t_fold_request_op, cmd.db_oid, cmd.index_oid,
+                 (unsigned long long) g_page_daemon_id, (unsigned long long) t_fold_request_id,
+                 (unsigned long long) t_fold_request_started);
+    }
+#endif
+
     switch (cmd.op)
     {
         case CUVS_OP_SEARCH:
             handle_search(client_fd, &cmd);
+            break;
+        case CUVS_OP_SEARCH_EXTRA:
+            handle_search_extra(client_fd, &cmd);
             break;
         case CUVS_OP_SEARCH_BATCH:
             handle_search_batch(client_fd, &cmd);
@@ -12861,6 +15575,20 @@ connection_thread(void *arg)
             break;
         case CUVS_OP_MARK_PAGES_EMPTY:
             handle_mark_pages_empty(client_fd, &cmd);
+            break;
+        case CUVS_OP_SEARCH_PAGE_OVERLAY:
+        case CUVS_OP_SEARCH_PAGE_OVERLAY_BATCH:
+            handle_page_overlay_search(client_fd, &cmd);
+            break;
+        case CUVS_OP_SUPPLY_PAGES:
+            handle_page_supply(client_fd, &cmd);
+            break;
+        case CUVS_OP_FOLD_READY:
+            handle_page_fold_ready(client_fd, &cmd);
+            break;
+        case CUVS_OP_FOLD_COMMITTED:
+        case CUVS_OP_FOLD_DISCARD:
+            handle_page_fold_result(client_fd, &cmd);
             break;
         case CUVS_OP_SEARCH_PAGES:
         case CUVS_OP_SEARCH_PAGES_BATCH:
@@ -12924,6 +15652,7 @@ connection_thread(void *arg)
             handle_shard_stats(client_fd, &cmd);
             break;
         case CUVS_OP_DROP_INDEX:
+        case CUVS_OP_DROP_PAGES_INDEX:
             handle_drop(client_fd, &cmd);
             break;
         case CUVS_OP_EXPORT_ADJACENCY:
@@ -12997,6 +15726,12 @@ connection_thread(void *arg)
             break;
     }
 
+#ifdef CUVS_CAGRA_FOLD_ENABLED
+    if (t_fold_request)
+        page_fold_log_reply(NULL, false, admission_mono_us());
+#endif
+    release_retired_fold_graphs();
+    release_retired_page_overlays();
     close(client_fd);
     return NULL;
 }
@@ -13298,6 +16033,7 @@ batch_process_locked(void)
             cagra_batch_run_group(batch, gid, n, g);
         else
             bf_batch_run_group(batch, gid, n, g);
+        release_retired_page_overlays();
     }
 
     pthread_mutex_lock(&g_batch_mtx);
@@ -13364,6 +16100,11 @@ graceful_shutdown(void)
 {
     LOG_INFO("pg_cuvs_server: SIGTERM received, serializing indexes...\n");
 
+#ifdef CUVS_CAGRA_FOLD_ENABLED
+    for (int device = 0; device < CUVS_MAX_GPUS; ++device)
+        if (g_fold_thread_started[device])
+            pthread_join(g_fold_threads[device], NULL);
+#endif
     /* I3-B: stop the reclaim thread before the final saves so no tick
      * evicts concurrently with them (it checks g_shutdown every second). */
     if (g_reclaim_started)
@@ -13606,6 +16347,21 @@ main(int argc, char **argv)
             strncpy(g_index_dir, argv[++i], sizeof(g_index_dir) - 1);
         else if (strcmp(argv[i], "--max-vram-mb") == 0 && i+1 < argc)
             g_max_vram_bytes = (size_t)atol(argv[++i]) * 1024 * 1024;
+        else if (strcmp(argv[i], "--page-overlay-host-bytes") == 0)
+        {
+            const char *value = i + 1 < argc ? argv[++i] : "";
+            char *end;
+            unsigned long long bytes;
+
+            errno = 0;
+            bytes = strtoull(value, &end, 10);
+            if (*value < '0' || *value > '9' || *end || errno || bytes != (size_t) bytes)
+            {
+                LOG_ERROR("--page-overlay-host-bytes requires a nonnegative byte count\n");
+                return 1;
+            }
+            g_page_overlay_budget.limit = (size_t) bytes;
+        }
         else if (strcmp(argv[i], "--rmm-pool-mb") == 0)
         {
             if (i + 1 >= argc || cuvs_parse_rmm_pool_mb(argv[++i], &g_rmm_pool_mb) != 0)
@@ -14071,6 +16827,18 @@ main(int argc, char **argv)
     else
         LOG_ERROR("pg_cuvs_server: failed to spawn BF batch worker; "
                   "brute_force micro-batching disabled (immediate dispatch only)\n");
+
+#ifdef CUVS_CAGRA_FOLD_ENABLED
+    for (int i = 0; i < n_usable_gpus(); ++i)
+    {
+        int device = usable_gpu(i);
+
+        if (pthread_create(&g_fold_threads[device], NULL, page_fold_thread, (void *) (intptr_t) device) == 0)
+            g_fold_thread_started[device] = true;
+        else
+            LOG_WARN("[page_fold] could not start the producer for gpu=%d\n", device);
+    }
+#endif
 
     /* Accept loop */
     while (!g_shutdown)

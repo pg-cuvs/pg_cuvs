@@ -44,11 +44,7 @@ RECHECK = ('    if (pool_short > 0)\n'
            '        }\n'
            '    }\n')
 PICK_AR8 = '    if (pool_short > 0 && pk->lru_total < pool_short)\n        return CUVS_ADMISSION_AR8;\n'
-WR_IF = ('        if (wr != CUVS_ADMISSION_NONE)\n'
-         '        {\n'
-         '            g_last_admit_reason = wr;\n'
-         '            goto admission_rejected;\n'
-         '        }\n')
+WR_IF = '        if (wr != CUVS_ADMISSION_NONE)\n'
 OLD_AR8 = ('        if (cuvs_admission_pool_refuses(quota, line->pool_pending, line->pool_used,\n'
            '                                        needed, line->pool_headroom))\n'
            '        {\n'
@@ -249,11 +245,23 @@ def run(argv, cwd):
     try:
         q = subprocess.run(argv, cwd=cwd, capture_output=True, text=True, timeout=120)
     except subprocess.TimeoutExpired:
-        return 124, 'FAIL timeout after 120 s'
+        with (Path(cwd) / 'COMMANDS.jsonl').open('a') as log:
+            log.write(json.dumps({'argv': argv, 'exit': 124, 'output': 'timeout after 120 s'}) + '\n')
+        return 124, 'timeout after 120 s'
     text = q.stdout + q.stderr
     with (Path(cwd) / 'COMMANDS.jsonl').open('a') as log:
         log.write(json.dumps({'argv': argv, 'exit': q.returncode, 'output': text}) + '\n')
     return q.returncode, text
+
+
+def run_status(rc, output):
+    if rc == 0:
+        return 'PASS'
+    if rc == 124:
+        return 'TIMEOUT'
+    if rc == 1 and any(line.startswith(('FAIL', 'AssertionError')) for line in output.splitlines()):
+        return 'RED (run)'
+    return 'RUN-BROKEN'
 
 
 def build_and_run(tree):
@@ -273,7 +281,8 @@ def build_and_run(tree):
                           'test/unit/test_ar8_daemon.c', 'src/cuvs_ipc.c', 'src/cuvs_util.c',
                           'src/cuvs_objstore.c', 'src/cuvs_build_corpus.c',
                           'src/cuvs_wrapper_shim_cpu.c', 'src/cuvs_cache_policy.c',
-                          'src/cuvs_peak_meter.c', '-Wl,--gc-sections', '-lm', '-lpthread',
+                          'src/cuvs_peak_meter.c', 'src/cuvs_page_overlay.c', 'src/cuvs_hnsw_upper.c',
+                          '-Wl,--gc-sections', '-lm', '-lpthread',
                           '-lrt', '-lcurl', '-lssl', '-lcrypto']
     for name, argv in jobs.items():
         rc, text = run(argv, tree)
@@ -284,10 +293,10 @@ def build_and_run(tree):
         fails = [l for l in text.splitlines() if l.startswith('FAIL')]
         lines = [l for l in text.splitlines() if l.startswith(('FAIL', 'PASS', 'test_'))]
         tail = [' | '.join(fails[:3])] if fails else lines[:1] or text.strip().splitlines()[-1:]
-        out[name] = ('PASS' if rc == 0 else 'RED (run)', tail)
+        out[name] = (run_status(rc, text), tail)
     rc, text = run([sys.executable, '-I', '-B', 'test/unit/test_i3_logs.py'], tree)
     lines = [l for l in text.splitlines() if l.startswith(('FAIL', 'OK', 'Ran'))]
-    out['logs'] = ('PASS' if rc == 0 else 'RED (run)', lines[:1] or [''])
+    out['logs'] = (run_status(rc, text), lines[:1] or [''])
     return out
 
 
@@ -331,7 +340,7 @@ def main(argv):
             print(f'SKIP  {name}: needs {sorted(expect)} (Linux only)')
             continue
         reds = {t for t, (s, _) in res.items() if s == 'RED (run)'}
-        broken = {t for t, (s, _) in res.items() if s == 'BUILD-BROKEN'}
+        broken = {t for t, (s, _) in res.items() if s in ('BUILD-BROKEN', 'RUN-BROKEN', 'TIMEOUT')}
         ok = expect_here <= reds and not broken
         red += ok
         detail = '; '.join(f'{t}={s} {tail[0] if tail else ""}'.strip()

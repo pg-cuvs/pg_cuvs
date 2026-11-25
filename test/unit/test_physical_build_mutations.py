@@ -18,7 +18,7 @@ mutations = {
     "status_count_lost": (SERVER, "g_physical_build_rejects[dev]++;", "/* lost count */"),
     "sqlstate_permanent": ("cuvs_util.c", "if (reason == CUVS_ADMISSION_AR0)\n        return CUVS_ADMISSION_SQLSTATE_LIMIT;", "if (reason == CUVS_ADMISSION_AR0 || reason == CUVS_ADMISSION_PHYS)\n        return CUVS_ADMISSION_SQLSTATE_LIMIT;"),
     "hnsw_reply_lost": ("cuvs_ipc.c", "reply = wire.header;\n        remember_reply(&reply);", "reply = wire.header;"),
-    "hnsw_reply_stale": ("cuvs_ipc.c", "char token = 'O';\n    forget_reply();", "char token = 'O';"),
+    "hnsw_reply_stale": ("cuvs_ipc.c", "char token = 'O';\n    g_hnsw_backend_cancel = 0;\n    forget_reply();", "char token = 'O';\n    g_hnsw_backend_cancel = 0;"),
 }
 for name, call in {
     "single": 'physical_build_check(target_gpu, "BUILD", cmd, &rej)',
@@ -45,7 +45,7 @@ def run_case(name, mutation):
             p.write_text(text.replace(before, after))
         cmd = [CC, "-std=gnu11", "-O1", "-DPGCUVS_CPU_SHIM", "-ffunction-sections", "-fdata-sections", "-I", str(work / "src"),
                str(work / "test/unit/test_physical_build_guard.c"),
-               *[str(work / "src" / f) for f in ("cuvs_ipc.c", "cuvs_util.c", "cuvs_objstore.c", "cuvs_build_corpus.c", "cuvs_wrapper_shim_cpu.c", "cuvs_cache_policy.c", "cuvs_peak_meter.c")],
+               *[str(work / "src" / f) for f in ("cuvs_ipc.c", "cuvs_util.c", "cuvs_objstore.c", "cuvs_build_corpus.c", "cuvs_wrapper_shim_cpu.c", "cuvs_cache_policy.c", "cuvs_peak_meter.c", "cuvs_page_overlay.c")],
                "-Wl,--gc-sections", "-lm", "-lpthread", "-lrt", "-lcurl", "-lssl", "-lcrypto", "-o", str(work / "test-guard")]
         built = subprocess.run(cmd, capture_output=True, text=True)
         if built.returncode:
