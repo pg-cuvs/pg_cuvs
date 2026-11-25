@@ -692,6 +692,18 @@ test-admission-ipc: test/unit/test_admission_ipc.c src/cuvs_ipc.c src/cuvs_ipc.h
 		-lpthread -lm $(TEST_RT_LIB)
 	./$@
 
+# BUILD reply waits against a mock daemon, including cancellation and peer loss.
+test-unit: test-build-reply-wait
+test-build-reply-wait: test/unit/test_build_reply_wait.c src/cuvs_ipc.c src/cuvs_ipc.h \
+                       src/cuvs_util.c src/cuvs_build_corpus.c $(wildcard src/*.h)
+	$(CC) -std=gnu11 -Wall -Wextra -Werror $(ADMISSION_TEST_SAN) -I src -o $@ \
+		test/unit/test_build_reply_wait.c src/cuvs_ipc.c src/cuvs_util.c src/cuvs_build_corpus.c \
+		-lpthread -lm $(TEST_RT_LIB)
+	./$@
+
+EXTRA_CLEAN += test-build-reply-wait
+.PHONY: test-build-reply-wait
+
 test-unit: test-extra-search-ipc
 test-extra-search-ipc: test/unit/test_extra_search_ipc.c src/cuvs_ipc.c src/cuvs_ipc.h \
                        src/cuvs_util.c src/cuvs_build_corpus.c $(wildcard src/*.h)

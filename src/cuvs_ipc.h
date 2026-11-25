@@ -713,16 +713,12 @@ typedef struct CuvsIndexStats {
  *   or the reply wait.
  */
 
-/* 3S: register a callback the search reply-wait polls (~250ms) to detect a
- * pending query cancel / statement_timeout. Return nonzero to abort the wait
- * (cuvs_ipc_search then returns CUVS_STATUS_CANCELED after cleanup). Every
- * connect() is asked about after each failed attempt as well (#224; a wait for
- * the listen backlog runs in 250 ms slices, so a pending cancel is seen within
- * one slice); a nonzero answer ends that connect as a failure, which
- * cuvs_ipc_search reports as CUVS_STATUS_CANCELED and the other calls as their
- * usual connect-failure status. The callback must NOT longjmp (no CHECK_FOR_INTERRUPTS) — it only inspects flags; the PG
- * caller raises the interrupt after cuvs_ipc_search returns. NULL = no cancel
- * checking (blocking wait, legacy behavior). */
+/* Register a callback polled during interruptible replies (e.g. SEARCH and
+ * BUILD) and after failed connect() attempts, including listen backlog waits
+ * in 250 ms slices. Return nonzero to abort the wait. Canceled SEARCH and
+ * BUILD calls return CUVS_STATUS_CANCELED after cleanup. The callback only
+ * inspects flags and must not longjmp. The PostgreSQL caller raises the
+ * interrupt after IPC returns. NULL disables callback checks. */
 void cuvs_ipc_set_wait_callback(int (*cb)(void));
 
 /* #119: register the expected owner uid of cuvs.socket_path. Backend refuses
@@ -981,7 +977,11 @@ int cuvs_ipc_search_batch(
  *   CORPUS_HEAP  — heap_vecs/heap_tids are copied into a fresh named shm here
  *                  and unlinked here before returning (legacy path).
  *
- * Returns CUVS_STATUS_OK on success.
+ * This call and cuvs_ipc_build_flat, _multi and _ivfpq return CUVS_STATUS_OK on
+ * success, CUVS_STATUS_CANCELED when the wait callback aborts connect or reply,
+ * and CUVS_STATUS_ERROR if the connection is lost before the complete reply.
+ * A canceled reply wait closes the socket while daemon work can continue.
+ * A non-NULL page_build requires graph_nonce_out for the success reply.
  */
 struct CuvsBuildCorpus;   /* full definition in cuvs_build_corpus.h */
 int cuvs_ipc_build(

@@ -912,10 +912,9 @@ cuvs_resolve_flat_precision(Relation indexRel)
     return (uint32_t) cuvs_bf_precision;   /* GUC fallback */
 }
 
-/* 3S: polled by cuvs_ipc_search's reply wait. Reports a pending query cancel /
- * statement_timeout / backend termination WITHOUT servicing it (no longjmp — the
- * IPC layer must still close its socket and free shm). The caller raises the
- * interrupt via CHECK_FOR_INTERRUPTS once cuvs_ipc_search returns CANCELED. */
+/* Reports a pending query cancel, statement_timeout or backend termination to
+ * IPC waits. The caller runs CHECK_FOR_INTERRUPTS after IPC has closed its
+ * socket and cleaned up any shared memory it owns. */
 static int
 cuvs_search_wait_should_abort(void)
 {
@@ -1792,7 +1791,7 @@ _PG_init(void)
     object_access_hook = cuvs_object_access;
     RegisterXactCallback(cuvs_xact_callback, NULL);
     RegisterSubXactCallback(cuvs_subxact_callback, NULL);  /* ADR-060 */
-    cuvs_ipc_set_wait_callback(cuvs_search_wait_should_abort);  /* 3S: cancelable search */
+    cuvs_ipc_set_wait_callback(cuvs_search_wait_should_abort);
     cuvs_ipc_set_daemon_uid(cuvs_daemon_uid);  /* #119: seed from GUC default at load time */
 
     /* ADR-057: test seam — CUVS_FORCE_CORPUS=memfd|shm|heap pins the build tier
@@ -3680,6 +3679,8 @@ cuvs_build_parallel(Relation heapRel, Relation indexRel, IndexInfo *indexInfo,
                 shard_count, use_cpu_hnsw ? 1 : 0,
                 (uint32_t) graph_degree, (uint32_t) intermediate_graph_degree, build_algo);
 
+            if (rc == CUVS_STATUS_CANCELED)
+                CHECK_FOR_INTERRUPTS();
             cuvs_report_build_notice(build_index_oid);
             if (rc != CUVS_STATUS_OK)
             {
@@ -3946,6 +3947,8 @@ cuvs_build_cagra_from_heap_impl(Relation heapRel, Relation indexRel, IndexInfo *
                 build_algo,
                 page_format ? &page_request : NULL, &graph_nonce);
 
+            if (rc == CUVS_STATUS_CANCELED)
+                CHECK_FOR_INTERRUPTS();
 #ifdef CUVS_PAGE_FORMAT
             if (page_format)
                 check_page_build_root(rc);
@@ -4293,6 +4296,8 @@ cuvs_build_flat_from_heap(Relation heapRel, Relation indexRel, IndexInfo *indexI
                 heap_table_oid,
                 heap_relfilenode);
 
+            if (rc == CUVS_STATUS_CANCELED)
+                CHECK_FOR_INTERRUPTS();
             if (rc != CUVS_STATUS_OK)
             {
                 const char *hint;
@@ -6739,6 +6744,8 @@ ivfpq_ambuild(Relation heapRel, Relation indexRel, IndexInfo *indexInfo)
                 relfilenode,
                 n_lists, pq_bits, pq_dim);
 
+            if (rc == CUVS_STATUS_CANCELED)
+                CHECK_FOR_INTERRUPTS();
             cuvs_report_build_notice(RelationGetRelid(indexRel));
 
             if (rc != CUVS_STATUS_OK)

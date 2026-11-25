@@ -644,11 +644,7 @@ recv_all(int fd, void *buf, size_t len)
         if (n < 0)
         {
             if (errno == EINTR)
-                continue;   /* retry: a signal interrupted the read. Large
-                             * builds block here for minutes, so a stray
-                             * backend signal must not abort the wait and
-                             * spuriously fail a CREATE INDEX the daemon
-                             * actually completed. */
+                continue;   /* retry: a signal interrupted the read */
             return -1;
         }
         if (n == 0)
@@ -1950,6 +1946,37 @@ cuvs_ipc_drop_pages(const char *socket_path, uint32_t db_oid, uint32_t index_oid
     return ipc_drop(socket_path, db_oid, index_oid, index_dir ? index_dir : "");
 }
 
+#define CUVS_BUILD_SOCKET_TIMEOUT_SEC 600
+#define CUVS_BUILD_REPLY_WAIT_SEC 86400  /* same budget as BUILD_HNSW_FILE */
+
+/* The GPU build can outlast the socket timeout. Poll the backend's
+ * cancel callback with a separate deadline for the reply header. */
+static int
+recv_build_reply(int sock, uint64_t *graph_nonce_out)
+{
+    CuvsReplyHeader reply;
+    int waiting = recv_all_interruptible_with_deadline(sock, &reply, sizeof(reply),
+                                                       CUVS_BUILD_REPLY_WAIT_SEC, true);
+
+    if (waiting != 0)
+        return waiting == 1 ? CUVS_STATUS_CANCELED : CUVS_STATUS_ERROR;
+    remember_reply(&reply);
+
+    /* A successful page BUILD has a trailing nonce. Preserve its shorter
+     * timeout and poll for cancel while reading it too. */
+    if (reply.status == CUVS_STATUS_OK && graph_nonce_out)
+    {
+        uint64_t nonce;
+
+        waiting = recv_all_interruptible_with_deadline(sock, &nonce, sizeof(nonce),
+                                                       CUVS_BUILD_SOCKET_TIMEOUT_SEC, true);
+        if (waiting != 0)
+            return waiting == 1 ? CUVS_STATUS_CANCELED : CUVS_STATUS_ERROR;
+        *graph_nonce_out = nonce;
+    }
+    return (int) reply.status;
+}
+
 /* ----------------------------------------------------------------
  * Public API: cuvs_ipc_build
  *
@@ -1982,13 +2009,18 @@ cuvs_ipc_build(
     int  legacy_shm_fd = -1;   /* CORPUS_HEAP only: created + unlinked here */
     int  pass_fd = -1;         /* CORPUS_MEMFD only: passed via SCM_RIGHTS */
     int  sock = -1;
+    int  canceled;
     int  rc   = CUVS_STATUS_ERROR;
     CuvsCmdFrame cmd;
     char dir_buf[CUVS_PAGE_INDEX_DIR_SIZE] = {0};
-    CuvsReplyHeader hdr;
 
-    if (page_build && index_dir && strlen(index_dir) >= sizeof(dir_buf))
-        return CUVS_STATUS_INVALID_PAGE_ROOT;
+    if (page_build)
+    {
+        if (index_dir && strlen(index_dir) >= sizeof(dir_buf))
+            return CUVS_STATUS_INVALID_PAGE_ROOT;
+        if (!graph_nonce_out)
+            return CUVS_STATUS_ERROR;
+    }
 
     /* Stage the payload by tier. */
     if (corpus->kind == CORPUS_MEMFD)
@@ -2013,8 +2045,12 @@ cuvs_ipc_build(
     LOG_DEBUG("[cuvs_ipc_build] tier=%d shm_key=%s pass_fd=%d socket=%s n_vecs=%lld dim=%d\n",
         (int)corpus->kind, shm_key, pass_fd, socket_path, (long long)n_vecs, dim);
 
-    sock = uds_connect_ex(socket_path, 600);  /* BUILD can take minutes */
+    sock = uds_connect_wait(socket_path, CUVS_BUILD_SOCKET_TIMEOUT_SEC, &canceled);
     if (sock < 0) {
+        if (canceled) {
+            rc = CUVS_STATUS_CANCELED;
+            goto cleanup;
+        }
         LOG_ERROR("[cuvs_ipc_build] uds_connect FAILED errno=%d (%s)\n",
                 errno, strerror(errno));
         rc = CUVS_STATUS_UNAVAILABLE;   /* daemon not reachable */
@@ -2050,14 +2086,8 @@ cuvs_ipc_build(
     if (cuvs_fd_send(sock, pass_fd, dir_buf, sizeof(dir_buf)) < 0)
         goto cleanup;
 
-    if (recv_reply(sock, &hdr) < 0)
-        goto cleanup;
-
-    rc = (int)hdr.status;
     /* A zero nonce means BUILD accepted page storage without a searchable graph. */
-    if (page_build && rc == CUVS_STATUS_OK &&
-        recv_all(sock, graph_nonce_out, sizeof(*graph_nonce_out)) < 0)
-        rc = CUVS_STATUS_ERROR;
+    rc = recv_build_reply(sock, page_build ? graph_nonce_out : NULL);
 
 cleanup:
     if (sock >= 0)
@@ -2100,10 +2130,10 @@ cuvs_ipc_build_flat(
     int  legacy_shm_fd = -1;   /* CORPUS_HEAP only: created + unlinked here */
     int  pass_fd = -1;         /* CORPUS_MEMFD only: passed via SCM_RIGHTS */
     int  sock = -1;
+    int  canceled;
     int  rc   = CUVS_STATUS_ERROR;
     CuvsCmdFrame cmd;
     char dir_buf[256] = {0};
-    CuvsReplyHeader hdr;
 
     /* Stage the payload by tier (identical to cuvs_ipc_build). */
     if (corpus->kind == CORPUS_MEMFD)
@@ -2128,8 +2158,12 @@ cuvs_ipc_build_flat(
     LOG_DEBUG("[cuvs_ipc_build_flat] tier=%d shm_key=%s pass_fd=%d socket=%s n_vecs=%lld dim=%d\n",
         (int)corpus->kind, shm_key, pass_fd, socket_path, (long long)n_vecs, dim);
 
-    sock = uds_connect_ex(socket_path, 600);  /* BUILD can take a while */
+    sock = uds_connect_wait(socket_path, CUVS_BUILD_SOCKET_TIMEOUT_SEC, &canceled);
     if (sock < 0) {
+        if (canceled) {
+            rc = CUVS_STATUS_CANCELED;
+            goto cleanup;
+        }
         LOG_ERROR("[cuvs_ipc_build_flat] uds_connect FAILED errno=%d (%s)\n",
                 errno, strerror(errno));
         rc = CUVS_STATUS_UNAVAILABLE;   /* daemon not reachable */
@@ -2158,10 +2192,7 @@ cuvs_ipc_build_flat(
     if (cuvs_fd_send(sock, pass_fd, dir_buf, sizeof(dir_buf)) < 0)
         goto cleanup;
 
-    if (recv_reply(sock, &hdr) < 0)
-        goto cleanup;
-
-    rc = (int)hdr.status;
+    rc = recv_build_reply(sock, NULL);
 
 cleanup:
     if (sock >= 0)
@@ -2203,10 +2234,10 @@ cuvs_ipc_build_multi(
     uint32_t       build_algo)
 {
     int  sock = -1;
+    int  canceled;
     int  rc   = CUVS_STATUS_ERROR;
     CuvsCmdFrame cmd;
     char dir_buf[256] = {0};
-    CuvsReplyHeader hdr;
 
     if (n_partials == 0 || partials == NULL)
     {
@@ -2214,8 +2245,10 @@ cuvs_ipc_build_multi(
         return CUVS_STATUS_ERROR;
     }
 
-    sock = uds_connect_ex(socket_path, 600);  /* BUILD can take minutes */
+    sock = uds_connect_wait(socket_path, CUVS_BUILD_SOCKET_TIMEOUT_SEC, &canceled);
     if (sock < 0) {
+        if (canceled)
+            return CUVS_STATUS_CANCELED;
         LOG_ERROR("[cuvs_ipc_build_multi] uds_connect FAILED errno=%d (%s)\n",
                 errno, strerror(errno));
         return CUVS_STATUS_UNAVAILABLE;
@@ -2254,10 +2287,7 @@ cuvs_ipc_build_multi(
     if (send_all(sock, partials, (size_t)n_partials * sizeof(CuvsPartialDesc)) < 0)
         goto cleanup;
 
-    if (recv_reply(sock, &hdr) < 0)
-        goto cleanup;
-
-    rc = (int)hdr.status;
+    rc = recv_build_reply(sock, NULL);
 
 cleanup:
     if (sock >= 0)
@@ -3041,10 +3071,10 @@ cuvs_ipc_build_ivfpq(
     char shm_key[64] = "";
     int  shm_fd  = -1;
     int  sock    = -1;
+    int  canceled;
     int  rc      = CUVS_STATUS_ERROR;
     CuvsCmdFrame    cmd;
     char            dir_buf[256] = {0};
-    CuvsReplyHeader hdr;
 
     if (make_shm_key(shm_key, sizeof(shm_key)) != 0)   /* #87 finding 2 */
         goto cleanup;
@@ -3055,8 +3085,12 @@ cuvs_ipc_build_ivfpq(
         goto cleanup;
     }
 
-    sock = uds_connect_ex(socket_path, 600);  /* IVF-PQ build can take minutes */
+    sock = uds_connect_wait(socket_path, CUVS_BUILD_SOCKET_TIMEOUT_SEC, &canceled);
     if (sock < 0) {
+        if (canceled) {
+            rc = CUVS_STATUS_CANCELED;
+            goto cleanup;
+        }
         LOG_ERROR("[cuvs_ipc_build_ivfpq] uds_connect FAILED errno=%d (%s)\n",
                   errno, strerror(errno));
         rc = CUVS_STATUS_UNAVAILABLE;
@@ -3085,10 +3119,7 @@ cuvs_ipc_build_ivfpq(
     if (cuvs_fd_send(sock, -1, dir_buf, sizeof(dir_buf)) < 0)
         goto cleanup;
 
-    if (recv_reply(sock, &hdr) < 0)
-        goto cleanup;
-
-    rc = (int)hdr.status;
+    rc = recv_build_reply(sock, NULL);
 
 cleanup:
     if (sock >= 0) close(sock);
