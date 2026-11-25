@@ -1,0 +1,44 @@
+-- delta_cache_same_second.sql: a row appended to .delta in the second in which the
+-- daemon built its delta cache is returned by the next search (auto and gpu), and
+-- stays returned. The daemon used to compare the file's mtime in whole seconds.
+-- The VRAM budget makes EXTEND fail, so the rows go to .delta; it is lifted for the
+-- searches, so that the daemon can build the cache.
+
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS vector;
+CREATE EXTENSION IF NOT EXISTS pg_cuvs;
+RESET client_min_messages;
+SET cuvs.index_dir = '/tmp/cuvs_indexes';
+SELECT pg_cuvs_set_vram_budget(0) \g /dev/null
+CREATE TABLE dcs (id int, v vector(4));
+INSERT INTO dcs SELECT g, ('['||g||',1,0,0]')::vector FROM generate_series(1,200) g;
+CREATE INDEX dcs_cagra ON dcs USING cagra (v vector_l2_ops);
+SELECT vram_bytes AS vb FROM pg_stat_gpu_search WHERE index_oid = 'dcs_cagra'::regclass \gset
+SELECT '/tmp/cuvs_indexes/' || d.oid || '_' || 'dcs_cagra'::regclass::oid || '.delta' AS delta_path
+FROM pg_database d WHERE d.datname = current_database() \gset
+SET enable_seqscan = off;
+-- start just after a second boundary, so that all three appends share one second
+SELECT pg_sleep(1 - (extract(epoch FROM clock_timestamp())::numeric % 1)::float8 + 0.02) \g /dev/null
+SELECT pg_cuvs_set_vram_budget(:vb) \g /dev/null
+INSERT INTO dcs VALUES (901, '[900,1,0,0]');
+SELECT pg_cuvs_set_vram_budget(0) \g /dev/null
+SELECT (pg_stat_file(:'delta_path')).modification AS mt_first \gset
+SELECT id AS first_row FROM dcs ORDER BY v <-> '[900,1,0,0]'::vector LIMIT 1;
+SELECT delta_merged_count > 0 AS cache_built
+FROM pg_stat_gpu_search WHERE index_oid = 'dcs_cagra'::regclass;
+SELECT pg_cuvs_set_vram_budget(:vb) \g /dev/null
+INSERT INTO dcs VALUES (902, '[950,1,0,0]');
+SELECT pg_cuvs_set_vram_budget(0) \g /dev/null
+SELECT id AS second_row_auto FROM dcs ORDER BY v <-> '[950,1,0,0]'::vector LIMIT 1;
+SELECT pg_cuvs_set_vram_budget(:vb) \g /dev/null
+INSERT INTO dcs VALUES (903, '[990,1,0,0]');
+SELECT pg_cuvs_set_vram_budget(0) \g /dev/null
+SET cuvs.delta_search = 'gpu';
+SELECT id AS third_row_gpu FROM dcs ORDER BY v <-> '[990,1,0,0]'::vector LIMIT 1;
+RESET cuvs.delta_search;
+SELECT (pg_stat_file(:'delta_path')).modification = :'mt_first'::timestamptz AS appends_shared_one_second,
+       (pg_stat_file(:'delta_path')).size = 104 AS three_rows_in_delta;
+SELECT pg_sleep(1.1) \g /dev/null
+SELECT id AS second_row_later FROM dcs ORDER BY v <-> '[950,1,0,0]'::vector LIMIT 1;
+RESET enable_seqscan;
+DROP TABLE dcs;
