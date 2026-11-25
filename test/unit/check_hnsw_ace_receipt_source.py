@@ -81,6 +81,10 @@ def check(src):
     planned, unplanned = execute[start:other], execute[other:end]
     head = execute[:start]
     assert 'ace.npartitions = partitions;' in head, 'REQUESTED_COUNT_REACHES_SDK'
+    assert 'ace.ef_construction = receipt.ace_ef;' in head, 'ACE_QUALITY_REACHES_BUILD'
+    sdk_params = execute[end:]
+    assert 'cp.graph_build_params = ace;' in sdk_params, 'ACE_QUALITY_REACHES_CAGRA'
+    assert 'hp.graph_build_params = ace;' in sdk_params, 'ACE_QUALITY_REACHES_SERIALIZER'
     # planner present: exactly today's behaviour, not marked
     assert planned.count('cuvs_hnsw_sdk_ace_plan(') == 2, 'PLANNER_TWICE'
     assert 'if (effective != rechecked)' in planned and 'ACE SDK partition plan is not stable' in planned, 'PLANNER_STABILITY_REFUSAL'
@@ -165,6 +169,12 @@ def check(src):
 OLD_THROW = 'throw std::runtime_error("ACE metadata requires matching pinned SDK source planner; set CUVS_SDK_SOURCE_INCLUDE");'
 MARK = '            receipt.route_flags |= ' + FLAG + ';\n'
 MUTANTS = [
+    ('ace_build_ignores_requested_quality', 'wrapper',
+     '            ace.ef_construction = receipt.ace_ef;', '            ace.ef_construction = 240;'),
+    ('ace_cagra_parameters_dropped', 'wrapper',
+     '            cp.graph_build_params = ace;', ''),
+    ('ace_serializer_parameters_dropped', 'wrapper',
+     '            hp.graph_build_params = ace;', ''),
     ('planner_absent_refuses_again', 'wrapper', MARK, '            ' + OLD_THROW + '\n'),
     ('planner_absent_not_marked', 'wrapper', MARK, ''),
     ('planner_absent_mark_overwrites_other_flags', 'wrapper',

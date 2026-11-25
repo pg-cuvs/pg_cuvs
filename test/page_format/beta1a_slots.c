@@ -414,14 +414,16 @@ check_host_budget(const char *socket, uint32_t db, uint32_t index,
         return 1;
     }
 
-    /* Replace the boot and then reuse its ID while the old prefix is pinned. */
+    /* Replace the boot and replay an old request while its prefix is pinned. */
     PinnedSearch reboot = {.socket = socket, .db = db, .index = index,
                            .request = {.base = base, .boot_id = 2}};
     (void) pinned_search(&reboot);
     bool switched = reboot.status == CUVS_STATUS_OK && reboot.count == 1;
     reboot.request.boot_id = 1;
     (void) pinned_search(&reboot);
-    switched = switched && reboot.status == CUVS_STATUS_OK && reboot.count == 1;
+    switched = switched && reboot.status == CUVS_STATUS_NOT_FOUND && reboot.count == 0;
+    switched = switched &&
+        !expect_supply(socket, db, index, &supply, &rows, CUVS_STATUS_NOT_FOUND, 0);
     status = cuvs_ipc_supply_pages(socket, ip_db, ip_index, &ip, 8, CUVS_METRIC_IP, &rows, &progress);
     bool pinned_charge = status == CUVS_STATUS_PAGE_OVERLAY_HOST_FULL && progress.covered_upto == 0;
     close(gate);
@@ -434,6 +436,7 @@ check_host_budget(const char *socket, uint32_t db, uint32_t index,
         return 1;
     }
 
+    supply.boot_id = 2;
     ReceivingSupply receiving = {.socket = socket, .db = db, .index = index,
                                  .request = &supply, .rows = &rows};
     if (mkfifo(receive_fifo, 0600) != 0 || pthread_create(&thread, NULL, receiving_supply, &receiving) != 0)
@@ -454,7 +457,7 @@ check_host_budget(const char *socket, uint32_t db, uint32_t index,
         fprintf(stderr, "in-flight receive charge: supply=%d accepted=%d\n", status, !receiving.failed);
         return 1;
     }
-    reboot.request.boot_id = 2;
+    reboot.request.boot_id = 3;
     (void) pinned_search(&reboot);
     if (reboot.status != CUVS_STATUS_OK || reboot.count != 1)
         return 1;

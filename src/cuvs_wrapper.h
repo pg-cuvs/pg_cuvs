@@ -255,6 +255,34 @@ int cuvs_cagra_search(
     uint32_t         search_width
 );
 
+/* Metadata-only check that ANN IDs and dataset rows share the TID map's shape. */
+int cuvs_cagra_extra_search_supported(CuvsCagraIndex index, int64_t n_vecs, int dim);
+
+#define CUVS_EXTRA_SEARCH_CHUNK_ROWS 1024u
+#define CUVS_EXTRA_SEARCH_CHUNK_COMPONENTS 262144u
+
+typedef int (*CuvsExtraSearchStop)(void *);
+
+typedef struct CuvsExtraSearchProgress {
+    int submitted;
+    int completed;
+} CuvsExtraSearchProgress;
+
+typedef enum CuvsCagraScoreStatus {
+    CUVS_CAGRA_SCORE_OK,
+    CUVS_CAGRA_SCORE_ERROR,
+    CUVS_CAGRA_SCORE_STOPPED
+} CuvsCagraScoreStatus;
+
+/* Score one row range of the attached L2 dataset into distances[rows].
+ * The caller holds the graph stable throughout. The stop callback is required
+ * and checked before GPU work and again before the scoring kernel. Progress
+ * describes that kernel. */
+CuvsCagraScoreStatus cuvs_cagra_score_range(CuvsCagraIndex index, const float *query, int dim,
+                                           uint32_t offset, uint32_t rows, double *distances,
+                                           int device_id, CuvsExtraSearchStop stop, void *stop_arg,
+                                           CuvsExtraSearchProgress *progress);
+
 /*
  * cuvs_cagra_search_filtered — GPU CAGRA search with BITSET prefilter (3O).
  *

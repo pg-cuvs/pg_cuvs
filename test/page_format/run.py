@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import select
 import shutil
+import socket
 import struct
 import subprocess
 import sys
@@ -553,6 +554,11 @@ FOLD_PUBLISH_SQL = """
     AS '$libdir/pg_cuvs','cuvs_test_fold_publish' LANGUAGE C STRICT VOLATILE PARALLEL UNSAFE;
 """
 
+FOLD_LAUNCH_SQL = """
+    CREATE FUNCTION pg_temp.cuvs_test_launch_fold_worker() RETURNS void
+    AS '$libdir/pg_cuvs','cuvs_test_launch_fold_worker' LANGUAGE C VOLATILE PARALLEL UNSAFE;
+"""
+
 
 def fold_query(cluster, db, label, sql):
     cluster.sql(db, label, "-qAt", "-c", sql)
@@ -678,6 +684,29 @@ def check_fold_extent_reuse(cluster, db):
         INSERT INTO fold_extent
         SELECT i, ARRAY[i::real,0,0]::vector FROM generate_series(100001,101359) i;
     """)
+    size_sql = "SELECT pg_relation_size('fold_extent_idx') / current_setting('block_size')::int;"
+    before_blocks = int(fold_query(cluster, db, "fold-extent-before", size_sql))
+    before_meta = fold_raw_page(cluster, db, 0, "fold_extent_idx")
+    cluster.sql(db, "fold-extent-interrupt", "-c", FOLD_PUBLISH_SQL + """
+        SET cuvs.test_abort_staged_fold = on;
+        SELECT pg_temp.publish_fold('fold_extent_idx',2,false);
+    """, expect=["stopped the fold after staging its TID pages"])
+    staged_blocks = int(fold_query(cluster, db, "fold-extent-staged", size_sql))
+    if staged_blocks != before_blocks + 64:
+        raise RuntimeError("interrupted fold did not reserve one complete extent")
+    if fold_raw_page(cluster, db, 0, "fold_extent_idx") != before_meta:
+        raise RuntimeError("interrupted extent reservation published a new directory")
+    staged_last = fold_raw_page(cluster, db, staged_blocks - 1, "fold_extent_idx")
+
+    cluster.sql(db, "fold-extent-later-appends", "-c", """
+        INSERT INTO fold_extent
+        SELECT i, ARRAY[i::real,0,0]::vector FROM generate_series(200001,201500) i;
+    """, "-c", "CHECKPOINT;")
+    before_retry = int(fold_query(cluster, db, "fold-extent-before-retry", size_sql))
+    if before_retry <= staged_blocks:
+        raise RuntimeError("the pending list did not extend beyond the orphaned extent")
+    cluster.stop(mode="immediate")
+    cluster.start(label="fold-extent-restart")
     for count in (2, 1357):
         result = fold_query(cluster, db, f"fold-extent-publish-{count}", FOLD_PUBLISH_SQL +
             f"SELECT pg_temp.publish_fold('fold_extent_idx',{count},false);")
@@ -686,14 +715,352 @@ def check_fold_extent_reuse(cluster, db):
     meta = fold_raw_page(cluster, db, 0, "fold_extent_idx")
     extent_count, = struct.unpack_from("=I", meta, 132)
     second_extent, = struct.unpack_from("=I", meta, 164)
+    retry_blocks = int(fold_query(cluster, db, "fold-extent-after-retry", size_sql))
+    if retry_blocks != before_retry or second_extent != before_blocks:
+        raise RuntimeError("retry did not reclaim the orphaned extent after restart")
     next_page = fold_raw_page(cluster, db, second_extent + 1, "fold_extent_idx")
     if extent_count != 2 or struct.unpack_from("=Q", next_page, 8184)[0] != 88205:
         raise RuntimeError("the second fold did not use the next page of the existing extent")
     last_page = fold_raw_page(cluster, db, second_extent + 63, "fold_extent_idx")
-    if struct.unpack_from("=II", last_page) == (0, 0):
-        raise RuntimeError("WAL did not reserve the full extent on a fresh standby")
+    if struct.unpack_from("=II", last_page) <= struct.unpack_from("=II", staged_last):
+        raise RuntimeError("reclaiming the extent did not WAL-log its final block")
     cluster.sql(db, "fold-extent-vacuum", "-c", "VACUUM (INDEX_CLEANUP ON, TRUNCATE OFF) fold_extent;")
+    remaining = fold_query(cluster, db, "fold-extent-pending-suffix", FOLD_PREPARE_SQL + """
+        SELECT pg_temp.prepare_fold('fold_extent_idx',1500,0) =
+               (SELECT 'prepared ' || string_agg(ctid::text, ' ' ORDER BY id)
+                FROM fold_extent WHERE id >= 200001);
+    """)
+    if remaining != "t":
+        raise RuntimeError("extent reuse changed the pending TIDs appended after the interruption")
+
+    published = fold_raw_page(cluster, db, second_extent, "fold_extent_idx")
+    cluster.sql(db, "fold-extent-next-pending", "-c", """
+        INSERT INTO fold_extent
+        SELECT i, ARRAY[i::real,0,0]::vector FROM generate_series(300001,383991) i;
+    """)
+    before_third = int(fold_query(cluster, db, "fold-extent-before-third", size_sql))
+    result = fold_query(cluster, db, "fold-extent-publish-third", FOLD_PUBLISH_SQL + """
+        SELECT pg_temp.publish_fold('fold_extent_idx',85491,false);
+    """)
+    if not result.startswith("published "):
+        raise RuntimeError(f"fold crossing the third extent failed: {result}")
+    meta = fold_raw_page(cluster, db, 0, "fold_extent_idx")
+    extent_count, = struct.unpack_from("=I", meta, 132)
+    second_after, third_extent = struct.unpack_from("=2I", meta, 164)
+    if (extent_count, second_after, third_extent) != (3, second_extent, before_third):
+        raise RuntimeError("a published extent was reclaimed")
+    if fold_raw_page(cluster, db, second_extent, "fold_extent_idx") != published:
+        raise RuntimeError("crossing into the third extent rewrote published TIDs")
+
+    reclaim_from, = struct.unpack_from("=I", meta, 136)
+    if reclaim_from != third_extent:
+        raise RuntimeError("a fresh allocation did not advance the reclaim scan")
+    cluster.stop(mode="immediate")
+    cluster.start(label="fold-reclaim-watermark-restart")
+    if fold_raw_page(cluster, db, 0, "fold_extent_idx") != meta:
+        raise RuntimeError("WAL replay changed the reclaim boundary or extent directory")
+    third_first = fold_raw_page(cluster, db, third_extent, "fold_extent_idx")
+    cluster.sql(db, "fold-extent-fourth-pending", "-c", """
+        INSERT INTO fold_extent
+        SELECT i, ARRAY[i::real,0,0]::vector FROM generate_series(400001,486848) i;
+    """)
+    before_fourth = int(fold_query(cluster, db, "fold-extent-before-fourth", size_sql))
+    result = fold_query(cluster, db, "fold-extent-publish-fourth", FOLD_PUBLISH_SQL + """
+        SELECT pg_temp.publish_fold('fold_extent_idx',86848,false);
+    """)
+    if not result.startswith("published "):
+        raise RuntimeError(f"fold crossing the fourth extent failed: {result}")
+    meta = fold_raw_page(cluster, db, 0, "fold_extent_idx")
+    extent_count, = struct.unpack_from("=I", meta, 132)
+    third_after, fourth_extent = struct.unpack_from("=2I", meta, 168)
+    if (extent_count, third_after, fourth_extent) != (4, third_extent, before_fourth):
+        raise RuntimeError("a scanned published extent was reclaimed")
+    old_tid = third_first[24:30]
+    if fold_raw_page(cluster, db, third_extent, "fold_extent_idx")[24:30] != old_tid:
+        raise RuntimeError("crossing into the fourth extent overwrote a published TID")
     print("Fold extent rollover and reuse: PASS", flush=True)
+
+
+def check_fold_worker_wire(cluster, source):
+    db = "postgres"
+    work = cluster.data.parent
+    event_wire = struct.Struct("=IIIIQQQQQQQQQ")
+    query_wire = struct.Struct("=IIQQ")
+
+    def read_frame(peer, size):
+        frame = bytearray()
+        while len(frame) < size:
+            chunk = peer.recv(size - len(frame))
+            if not chunk:
+                raise EOFError("incomplete fold frame")
+            frame.extend(chunk)
+        return frame
+
+    probe = work / "frame.c"
+    probe.write_text(r"""
+        #include <stddef.h>
+        #include <stdio.h>
+        #include "cuvs_ipc.h"
+        int main(void) {
+            printf("%zu %zu %zu %u %u %d %d %d\n", sizeof(CuvsCmdFrame),
+                   sizeof(CuvsReplyHeader), offsetof(CuvsReplyHeader, status),
+                   CUVS_PROTO_MAGIC, CUVS_PROTO_VERSION, CUVS_OP_FOLD_READY,
+                   CUVS_OP_FOLD_COMMITTED, CUVS_OP_FOLD_DISCARD);
+            return 0;
+        }
+    """)
+    subprocess.run(["cc", "-I", str(source / "src"), probe, "-o", work / "frame"], check=True)
+    cmd_size, reply_size, status_offset, magic, version, ready, committed, discard = map(
+        int, subprocess.check_output([work / "frame"], text=True).split())
+
+    # PostgreSQL logs registration even for a launcher with no database connection.
+    with (cluster.data / "postgresql.conf").open("a") as config:
+        config.write("log_min_messages = debug1\n")
+    with cluster.daemon(source / "pg_cuvs_server", "setup", overlay_host_bytes=4 * 1024**3):
+        cluster.start()
+        try:
+            setup_fold_publish(cluster, db)
+            value = fold_query(cluster, db, "index-identity", """
+                SELECT (SELECT oid FROM pg_database WHERE datname=current_database()),
+                       'fold_pub_idx'::regclass::oid, system_identifier
+                  FROM pg_control_system();
+            """)
+            db_oid, index_oid, sysid = map(int, value.split("|"))
+            old_meta = fold_raw_page(cluster, db, 0)
+        finally:
+            cluster.stop()
+
+    index_nonce, base_nonce, parent_nonce, parent_l, parent_f = struct.unpack_from("=5Q", old_meta, 48)
+    nonce, stale_nonce = [value for value in (1, 2, 3) if value != parent_nonce][:2]
+    old_log_block, = struct.unpack_from("=I", old_meta, 124)
+
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener:
+        listener.bind(str(cluster.socket))
+        listener.listen(16)
+        listener.settimeout(10)
+
+        @contextmanager
+        def request(label, op, target_index):
+            try:
+                peer, _ = listener.accept()
+            except TimeoutError as error:
+                raise RuntimeError(f"{label}: no IPC request for operation {op}") from error
+            with peer:
+                peer.settimeout(3)
+                header = struct.unpack_from("=IIIII", read_frame(peer, cmd_size))
+                if header != (magic, version, op, db_oid, target_index):
+                    raise RuntimeError(f"{label}: unexpected IPC header {header}")
+                yield peer
+
+        def reply(peer, body=b""):
+            header = bytearray(reply_size)
+            struct.pack_into("=I", header, status_offset, 0)
+            peer.sendall(header + body)
+
+        def check_workers(label, expected):
+            state = fold_query(cluster, db, f"{label}-workers", """
+                SELECT count(*), count(*) FILTER (
+                    WHERE datname=current_database() AND backend_type='pg_cuvs fold worker')
+                  FROM pg_stat_activity
+                 WHERE backend_type LIKE 'pg_cuvs fold %' OR backend_type LIKE 'pg_cuvs page %';
+            """)
+            if state != f"{expected}|{expected}":
+                raise RuntimeError(f"{label}: expected {expected} fold worker(s), got {state}")
+
+        def check_idle(label):
+            check_workers(label, 0)
+            if select.select([listener], [], [], 0)[0]:
+                raise RuntimeError(f"{label}: unexpected IPC connection outside a fold step")
+
+        def launch(label, graph_nonce, result_op=None, *, lose_ack=False):
+            check_idle(f"{label}-before")
+            output = cluster.logs / f"{work.name}-{label}-launch.log"
+            with output.open("w") as log, subprocess.Popen(
+                ["psql", "-XqAt", "-v", "ON_ERROR_STOP=1", "-d", db, "-c", FOLD_LAUNCH_SQL,
+                 "-c", "SELECT pg_temp.cuvs_test_launch_fold_worker();"],
+                env=cluster.env, stdout=log, stderr=subprocess.STDOUT,
+            ) as launcher:
+                try:
+                    with request(label, ready, 0) as peer:
+                        length, reserved, current_sysid, boot = query_wire.unpack(
+                            read_frame(peer, query_wire.size))
+                        if (length, reserved, current_sysid) != (query_wire.size, 0, sysid) or not boot:
+                            raise RuntimeError(f"{label}: invalid READY query")
+                        check_workers(f"{label}-ready", 1)
+                        event = event_wire.pack(event_wire.size, db_oid, index_oid, 3, sysid, boot,
+                                                0xD00D, index_nonce, base_nonce, parent_nonce,
+                                                graph_nonce, parent_l, parent_f)
+                        reply(peer, event)
+                    lsn = 0
+                    if result_op is not None:
+                        with request(label, result_op, index_oid) as peer:
+                            result = read_frame(peer, event_wire.size + 8)
+                            lsn, = struct.unpack_from("=Q", result, event_wire.size)
+                            if result[:event_wire.size] != event or bool(lsn) != (result_op == committed):
+                                raise RuntimeError(f"{label}: unexpected fold result or LSN {lsn:#x}")
+                            # Closing after reading COMMITTED simulates a lost ACK.
+                            if not lose_ack:
+                                reply(peer)
+                    if launcher.wait(timeout=10) != 0:
+                        raise RuntimeError(f"{label}: SQL launcher failed\n{output.read_text()}")
+                finally:
+                    if launcher.poll() is None:
+                        launcher.kill()
+            check_idle(f"{label}-after")
+            return event, lsn
+
+        def fence_pid():
+            return fold_query(cluster, db, "fold-fence-pid", """
+                SELECT coalesce(max(a.pid),0)
+                  FROM pg_stat_activity a JOIN pg_locks l ON a.pid=l.pid
+                 WHERE a.datname=current_database() AND a.application_name='fold-worker-fence'
+                   AND l.database=a.datid AND l.relation='fold_pub_idx'::regclass AND l.page=0
+                   AND l.locktype='page' AND l.mode='ExclusiveLock' AND l.granted;
+            """)
+
+        cluster.start()
+        try:
+            check_idle("postmaster-start")
+            registrations = [line for line in cluster.log.read_text().splitlines()
+                             if 'registering background worker "pg_cuvs fold ' in line
+                             or 'registering background worker "pg_cuvs page ' in line]
+            if registrations:
+                raise RuntimeError(f"automatic fold worker registration: {registrations}")
+            old_log = fold_raw_page(cluster, db, old_log_block)
+            cluster.sql(db, "make-base-dead", "-c", "DELETE FROM fold_pub WHERE id=42;")
+            vacuum_log = cluster.logs / f"{work.name}-vacuum-fence.log"
+            with vacuum_log.open("w") as log, subprocess.Popen(
+                ["psql", "-XqAt", "-v", "ON_ERROR_STOP=1", "-d", db,
+                 "-c", "SET cuvs.test_pause_page_vacuum=on",
+                 "-c", "VACUUM (INDEX_CLEANUP ON, TRUNCATE OFF) fold_pub"],
+                env={**cluster.env, "PGAPPNAME": "fold-worker-fence"},
+                stdout=log, stderr=subprocess.STDOUT,
+            ) as vacuum:
+                try:
+                    for _ in range(200):
+                        if "page-format VACUUM paused before publishing its generation" in cluster.log.read_text():
+                            break
+                        if vacuum.poll() is not None:
+                            raise RuntimeError(f"VACUUM exited before the FCL pause: {vacuum_log.read_text()}")
+                        time.sleep(0.05)
+                    else:
+                        raise RuntimeError("VACUUM did not reach the FCL pause")
+                    pid = int(fence_pid())
+                    if not pid:
+                        raise RuntimeError("paused VACUUM does not hold the FCL")
+                    deferred, _ = launch("fold-deferred", nonce)
+                    if int(fence_pid()) != pid:
+                        raise RuntimeError("VACUUM released the FCL during the deferred attempt")
+                    if (fold_raw_page(cluster, db, 0), fold_raw_page(cluster, db, old_log_block)) != (old_meta, old_log):
+                        raise RuntimeError("fold changed metadata or its log while VACUUM held the FCL")
+                    if fold_query(cluster, db, "release-fence", f"SELECT pg_cancel_backend({pid});") != "t":
+                        raise RuntimeError("could not cancel the fenced VACUUM")
+                    if vacuum.wait(timeout=10) == 0 or "canceling statement due to user request" not in vacuum_log.read_text():
+                        raise RuntimeError(f"expected VACUUM cancellation: {vacuum_log.read_text()}")
+                finally:
+                    if vacuum.poll() is None:
+                        vacuum.kill()
+
+            published, lsn = launch("fold-publish-lost-ack", nonce, committed, lose_ack=True)
+            meta = fold_raw_page(cluster, db, 0)
+            if struct.unpack_from("=4Q", meta, 64) != (nonce, parent_l + 3, parent_f + 3, parent_l):
+                raise RuntimeError("fold did not publish the offered generation")
+            log_block, = struct.unpack_from("=I", meta, 124)
+            fold_log = fold_raw_page(cluster, db, log_block)
+            hi, lo = struct.unpack_from("=II", fold_log)
+            fold_lsn = (hi << 32) | lo
+            if struct.unpack_from("=I", fold_log, 8180)[0] != 2 or lsn != fold_lsn:
+                raise RuntimeError("COMMITTED LSN did not match the published fold log")
+
+            replayed, replay_lsn = launch("fold-replay", nonce, committed)
+            if deferred != published or published != replayed or lsn != replay_lsn:
+                raise RuntimeError("READY redelivery or COMMITTED replay changed the event or LSN")
+            if (fold_raw_page(cluster, db, 0), fold_raw_page(cluster, db, log_block)) != (meta, fold_log):
+                raise RuntimeError("replayed COMMITTED changed the published metapage or fold log")
+
+            launch("fold-discard-stale-parent", stale_nonce, discard)
+            if (fold_raw_page(cluster, db, 0), fold_raw_page(cluster, db, log_block)) != (meta, fold_log):
+                raise RuntimeError("stale parent changed the published metapage or fold log")
+            check_idle("fold-complete")
+        finally:
+            cluster.stop()
+    print("Fold worker: FCL deferred, READY redelivered, lost ACK replayed at the same LSN, "
+          "stale parent discarded, no automatic or residual worker: PASS", flush=True)
+
+
+def check_fold_worker_ddl(cluster):
+    db = "fold_target"
+
+    @contextmanager
+    def session(role):
+        output = cluster.logs / f"{cluster.data.parent.name}-{role}-session.log"
+        with output.open("w") as log, subprocess.Popen(
+            ["psql", "-XqAt", "-v", "ON_ERROR_STOP=1", "-U", role, "-d", db],
+            env=cluster.env, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=log, text=True,
+        ) as holder:
+            try:
+                holder.stdin.write("SELECT pg_backend_pid();\n")
+                holder.stdin.flush()
+                if not select.select([holder.stdout], [], [], 10)[0]:
+                    raise RuntimeError(f"{role}: database session did not start")
+                pid = holder.stdout.readline().strip()
+                if not pid.isdecimal():
+                    raise RuntimeError(f"{role}: failed to get a backend PID: {output.read_text()}")
+                yield int(pid)
+            finally:
+                holder.stdin.close()
+                try:
+                    holder.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    holder.kill()
+                    holder.wait(timeout=5)
+
+    def state(label, pid):
+        value = fold_query(cluster, "postgres", label, f"""
+            SELECT coalesce((SELECT oid FROM pg_database WHERE datname='{db}'),0),
+                   count(*) FROM pg_stat_activity
+             WHERE pid={pid} AND datname='{db}' AND backend_type='client backend';
+        """)
+        return tuple(map(int, value.split("|")))
+
+    cluster.start()
+    try:
+        cluster.sql("postgres", "fold-ddl-roles", "-c", """
+            CREATE ROLE fold_owner LOGIN;
+            CREATE ROLE fold_other LOGIN;
+        """)
+        create_db = f"CREATE DATABASE {db} OWNER fold_owner;"
+        force_drop = f"DROP DATABASE {db} WITH (FORCE);"
+        cluster.sql("postgres", "fold-ddl-create", "-c", create_db)
+        with session("fold_owner") as pid:
+            before = state("fold-ddl-owner-before", pid)
+            if before[0] == 0 or before[1] != 1:
+                raise RuntimeError(f"missing owner session or database: {before}")
+            for label, sql in (("drop", f"DROP DATABASE {db};"), ("force", force_drop)):
+                cluster.sql("postgres", f"fold-ddl-nonowner-{label}", "-U", "fold_other",
+                            "-v", "VERBOSITY=verbose", "-c", sql,
+                            expect=["42501", "must be owner of database"])
+                if state(f"fold-ddl-nonowner-{label}-after", pid) != before:
+                    raise RuntimeError(f"non-owner {label} changed the database or owner session")
+
+            cluster.sql("postgres", "fold-ddl-owner-force", "-U", "fold_owner", "-c", force_drop)
+            if state("fold-ddl-owner-force-after", pid) != (0, 0):
+                raise RuntimeError("owner FORCE left the database or owner session")
+
+        cluster.sql("postgres", "fold-ddl-recreate", "-c", create_db)
+        with session("fold_other") as pid:
+            before = state("fold-ddl-other-before", pid)
+            if before[0] == 0 or before[1] != 1:
+                raise RuntimeError(f"missing other-role session or database: {before}")
+            cluster.sql("postgres", "fold-ddl-owner-force-other", "-U", "fold_owner",
+                        "-v", "VERBOSITY=verbose", "-c", force_drop,
+                        expect=["42501", "permission denied to terminate process"])
+            if state("fold-ddl-owner-force-other-after", pid) != before:
+                raise RuntimeError("denied owner FORCE changed the database or other-role session")
+    finally:
+        cluster.stop()
+    print("Database DDL: non-owner denied, owner FORCE drops with own session, "
+          "other-role session preserved on FORCE denial: PASS", flush=True)
 
 
 def check_slots(cluster, source):
@@ -1038,6 +1405,8 @@ def run(work, logs):
 
     check_overlay_budget(Cluster(work / "budget", bindir, logs), source_on)
     check_sql_overlay_budget(Cluster(work / "sql-budget", bindir, logs), source_on)
+    check_fold_worker_wire(Cluster(work / "fold-worker", bindir, logs), source_on)
+    check_fold_worker_ddl(Cluster(work / "fold-worker-ddl", bindir, logs))
 
     if legacy_source:
         with cluster.daemon(source_base / "pg_cuvs_server", "historical"):
@@ -1161,6 +1530,8 @@ def run_slots_only(work, logs):
             cluster.stop()
     check_overlay_budget(Cluster(work / "budget", bindir, logs), source)
     check_sql_overlay_budget(Cluster(work / "sql-budget", bindir, logs), source)
+    check_fold_worker_wire(Cluster(work / "fold-worker", bindir, logs), source)
+    check_fold_worker_ddl(Cluster(work / "fold-worker-ddl", bindir, logs))
     print("Overlay IPC slots: PASS", flush=True)
 
 

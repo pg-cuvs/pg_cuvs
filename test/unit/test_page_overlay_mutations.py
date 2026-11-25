@@ -25,11 +25,11 @@ MUTATIONS = {
         "(void) chunk;",
     ),
     "accept a host budget overcommit": (
-        "if (charge > budget->limit - used)",
-        "if (charge > budget->limit)",
+        "if (used > budget->limit || bytes > budget->limit - used)",
+        "if (used > budget->limit || bytes > budget->limit)",
     ),
     "never return the charge for a released chunk": (
-        "__atomic_fetch_sub(&budget->used, charge, __ATOMIC_RELAXED);\n        chunk = next;",
+        "cuvs_page_overlay_unreserve(budget, charge);\n        chunk = next;",
         "(void) budget;\n        (void) charge;\n        chunk = next;",
     ),
 }

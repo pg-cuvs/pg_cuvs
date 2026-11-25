@@ -416,6 +416,223 @@ send_cmd(int fd, CuvsCmdFrame *cmd)
     return send_all(fd, cmd, sizeof(*cmd));
 }
 
+/* The legacy socket helpers keep their per-call timeouts. Only the opt-in
+ * request uses one deadline across both sockets and their complete replies. */
+static int64_t
+extra_search_now_ms(void)
+{
+    struct timespec now;
+
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0)
+        return -1;
+    return (int64_t) now.tv_sec * 1000 + now.tv_nsec / 1000000;
+}
+
+int64_t
+cuvs_ipc_extra_search_deadline_ms(void)
+{
+    int64_t now = extra_search_now_ms();
+
+    return now < 0 ? -1 : now + CUVS_EXTRA_SEARCH_TIMEOUT_MS;
+}
+
+static int
+extra_search_io(int fd, void *buffer, size_t len, int sending,
+                int64_t deadline_ms)
+{
+    char *bytes = buffer;
+    size_t done = 0;
+    int send_flags = MSG_DONTWAIT;
+
+#ifdef MSG_NOSIGNAL
+    send_flags |= MSG_NOSIGNAL;
+#endif
+    while (done < len)
+    {
+        struct pollfd pfd = {.fd = fd, .events = sending ? POLLOUT : POLLIN};
+        int64_t now = extra_search_now_ms();
+        int64_t left_ms = deadline_ms - now;
+        ssize_t n;
+
+        if (g_wait_cb && g_wait_cb())
+            return CUVS_STATUS_CANCELED;
+        if (now < 0 || left_ms <= 0)
+            return CUVS_EXTRA_SEARCH_DEADLINE;
+
+        n = sending ? send(fd, bytes + done, len - done, send_flags)
+                    : recv(fd, bytes + done, len - done, MSG_DONTWAIT);
+        if (n > 0)
+        {
+            done += (size_t) n;
+            continue;
+        }
+        if (n == 0)
+            return CUVS_STATUS_ERROR;
+        if (errno == EINTR)
+            continue;
+        if (errno != EAGAIN && errno != EWOULDBLOCK)
+            return CUVS_STATUS_ERROR;
+        if (poll(&pfd, 1, left_ms < 25 ? (int) left_ms : 25) < 0 &&
+            errno != EINTR)
+            return CUVS_STATUS_ERROR;
+    }
+    return CUVS_STATUS_OK;
+}
+
+int
+cuvs_ipc_search_extra(const char *socket_path, uint32_t db_oid,
+                      uint32_t index_oid, const float *query, int dim, int k,
+                      uint64_t generation, uint32_t max_components,
+                      uint64_t dir_dev, uint64_t dir_ino,
+                      int64_t deadline_ms, CuvsResult *results, int *count,
+                      CuvsExtraSearchReply *details, uint32_t *latency_us)
+{
+    CuvsExtraSearchRequest request = {
+        .version = CUVS_EXTRA_SEARCH_VERSION,
+        .max_components = max_components,
+        .generation = generation,
+        .dir_dev = dir_dev,
+        .dir_ino = dir_ino,
+        .deadline_ms = deadline_ms
+    };
+    CuvsCmdFrame cmd = {
+        .proto_magic = CUVS_PROTO_MAGIC,
+        .proto_version = CUVS_PROTO_VERSION,
+        .op = CUVS_OP_SEARCH_EXTRA,
+        .db_oid = db_oid,
+        .index_oid = index_oid,
+        .k = (uint32_t) k,
+        .metric = CUVS_METRIC_L2,
+        .dim = (uint32_t) dim,
+        .itopk_size = g_cagra_itopk_size,
+        .search_width = g_cagra_search_width
+    };
+    CuvsReplyHeader header;
+    CuvsExtraSearchReply reply;
+    int64_t now;
+    int64_t left_ms;
+    int canceled = 0;
+    int payload_status;
+    int status;
+    int fd;
+
+    *count = 0;
+    memset(details, 0, sizeof(*details));
+    if (latency_us)
+        *latency_us = 0;
+    if (dim < 1 || (uint32_t) dim > CUVS_EXTRA_SEARCH_MAX_DIM ||
+        k < 1 || (uint32_t) k > CUVS_EXTRA_SEARCH_MAX_K ||
+        (generation == 0) != (max_components == 0) ||
+        max_components > CUVS_EXTRA_SEARCH_MAX_COMPONENTS || !dir_ino)
+        return CUVS_STATUS_ERROR;
+    if (g_wait_cb && g_wait_cb())
+        return CUVS_STATUS_CANCELED;
+
+    now = extra_search_now_ms();
+    if (deadline_ms <= 0 || now < 0 || deadline_ms <= now)
+        return CUVS_EXTRA_SEARCH_DEADLINE;
+    left_ms = deadline_ms - now;
+    /* The shared connector accepts whole seconds and checks peer identity.
+     * Round down so a full backlog cannot outlive the remaining deadline. */
+    if (left_ms < 1000)
+        return CUVS_EXTRA_SEARCH_DEADLINE;
+    if (left_ms > CUVS_EXTRA_SEARCH_TIMEOUT_MS)
+        left_ms = CUVS_EXTRA_SEARCH_TIMEOUT_MS;
+    fd = uds_connect_wait(socket_path, (int) (left_ms / 1000), &canceled);
+    if (fd < 0)
+    {
+        if (canceled)
+            return CUVS_STATUS_CANCELED;
+        if (errno == EAGAIN || errno == EINTR || errno == ETIMEDOUT)
+            return CUVS_EXTRA_SEARCH_DEADLINE;
+        return CUVS_STATUS_UNAVAILABLE;
+    }
+#ifdef SO_NOSIGPIPE
+    {
+        int enabled = 1;
+        setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &enabled, sizeof(enabled));
+    }
+#endif
+
+    status = extra_search_io(fd, &cmd, sizeof(cmd), 1, deadline_ms);
+    if (status != CUVS_STATUS_OK)
+        goto out;
+
+    payload_status = extra_search_io(fd, &request, sizeof(request), 1, deadline_ms);
+    if (payload_status == CUVS_STATUS_OK)
+        payload_status = extra_search_io(fd, (void *) query, (size_t) dim * sizeof(*query),
+                                         1, deadline_ms);
+    if (payload_status != CUVS_STATUS_OK && payload_status != CUVS_STATUS_ERROR)
+    {
+        status = payload_status;
+        goto out;
+    }
+
+    /* An older daemon can reject the complete command frame and close before
+     * it reads the payload. An explicit pre-dispatch refusal already queued
+     * on the socket is still authoritative after a payload write error. */
+    status = extra_search_io(fd, &header, sizeof(header), 0, deadline_ms);
+    if (status == CUVS_STATUS_CANCELED)
+        goto out;
+    if (status == CUVS_STATUS_OK && header.n_results == 0 &&
+        (header.status == CUVS_EXTRA_SEARCH_UNSUPPORTED ||
+         (header.status == CUVS_STATUS_ERROR &&
+          strncmp(header.error, "unknown op", sizeof(header.error)) == 0)))
+    {
+        status = CUVS_EXTRA_SEARCH_UNSUPPORTED;
+        goto out;
+    }
+    if (payload_status != CUVS_STATUS_OK)
+        status = payload_status;
+    if (status != CUVS_STATUS_OK)
+        goto out;
+    if (header.status != CUVS_STATUS_OK)
+    {
+        /* UNAVAILABLE here is a reply, never a failure to connect. Neither
+         * it nor an error carrying results can authorize a legacy retry. */
+        status = header.n_results || header.status == CUVS_STATUS_UNAVAILABLE ?
+            CUVS_STATUS_ERROR : (int) header.status;
+        goto out;
+    }
+    if (header.n_results > (uint32_t) k)
+    {
+        status = CUVS_STATUS_ERROR;
+        goto out;
+    }
+
+    status = extra_search_io(fd, &reply, sizeof(reply), 0, deadline_ms);
+    if (status != CUVS_STATUS_OK)
+        goto out;
+    if (!reply.generation || (generation && reply.generation != generation))
+    {
+        status = CUVS_EXTRA_SEARCH_GENERATION;
+        goto out;
+    }
+    if ((!generation && (reply.components || reply.scored_rows)) ||
+        (generation && (!reply.scored_rows ||
+                        reply.scored_rows > CUVS_EXTRA_SEARCH_MAX_ROWS ||
+                        reply.scored_rows < header.n_results ||
+                        reply.components != (uint64_t) reply.scored_rows * dim ||
+                        reply.components > max_components)))
+    {
+        status = CUVS_STATUS_ERROR;
+        goto out;
+    }
+
+    status = extra_search_io(fd, results, header.n_results * sizeof(*results),
+                             0, deadline_ms);
+    if (status == CUVS_STATUS_OK)
+    {
+        *details = reply;
+        *count = (int) header.n_results;
+        if (latency_us)
+            *latency_us = header.latency_us;
+    }
+out:
+    close(fd);
+    return status;
+}
+
 static int
 recv_all(int fd, void *buf, size_t len)
 {
@@ -453,7 +670,8 @@ cuvs_ipc_set_wait_callback(int (*cb)(void))
  * wait instead of blocking the backend uninterruptibly. Returns 0 on full read,
  * -1 on error/EOF/overall-timeout, 1 if the wait callback asked to abort. */
 static int
-recv_all_interruptible(int fd, void *buf, size_t len, int timeout_sec)
+recv_all_interruptible_with_deadline(int fd, void *buf, size_t len, int timeout_sec,
+                                     bool limit_partial_reads)
 {
     char  *p = buf;
     size_t got = 0;
@@ -463,7 +681,26 @@ recv_all_interruptible(int fd, void *buf, size_t len, int timeout_sec)
     while (got < len)
     {
         struct pollfd pfd = { .fd = fd, .events = POLLIN, .revents = 0 };
-        int pr = poll(&pfd, 1, 250 /* ms slice */);
+        int slice_ms = 250;
+        int pr;
+
+        if (limit_partial_reads)
+        {
+            struct timespec now;
+            long long remaining_ms;
+
+            if (g_wait_cb && g_wait_cb())
+                return 1;
+            clock_gettime(CLOCK_MONOTONIC, &now);
+            remaining_ms = (long long) timeout_sec * 1000 -
+                ((long long) (now.tv_sec - start.tv_sec) * 1000 +
+                 (now.tv_nsec - start.tv_nsec) / 1000000);
+            if (remaining_ms <= 0)
+                return -1;
+            if (remaining_ms < slice_ms)
+                slice_ms = (int) remaining_ms;
+        }
+        pr = poll(&pfd, 1, slice_ms);
 
         if (pr < 0)
         {
@@ -480,6 +717,8 @@ recv_all_interruptible(int fd, void *buf, size_t len, int timeout_sec)
             struct timespec now;
             if (g_wait_cb && g_wait_cb())
                 return 1;
+            if (limit_partial_reads)
+                continue;   /* the next iteration checks the precise deadline */
             clock_gettime(CLOCK_MONOTONIC, &now);
             if ((now.tv_sec - start.tv_sec) >= timeout_sec)
                 return -1;      /* daemon never replied within the budget */
@@ -498,6 +737,12 @@ recv_all_interruptible(int fd, void *buf, size_t len, int timeout_sec)
         got += (size_t)n;
     }
     return 0;
+}
+
+static int
+recv_all_interruptible(int fd, void *buf, size_t len, int timeout_sec)
+{
+    return recv_all_interruptible_with_deadline(fd, buf, len, timeout_sec, false);
 }
 
 /* ----------------------------------------------------------------
@@ -723,7 +968,7 @@ page_overlay_exchange(const char *socket_path, CuvsCmdFrame *cmd, CuvsPageOverla
     *count = 0;
     *latency_us = 0;
     memset(progress, 0, sizeof(*progress));
-    if (cmd->dim == 0 || cmd->dim > 65535 || cmd->n_vecs > 1024 || cmd->k > 4000)
+    if (cmd->dim == 0 || cmd->dim > 65535 || cmd->n_vecs > 1024 || cmd->k > CUVS_PAGE_SEARCH_MAX_K)
         return status;
     if (queries)
     {
@@ -810,8 +1055,8 @@ done:
     return status;
 }
 
-int
-cuvs_ipc_supply_pages(const char *socket_path, uint32_t db_oid, uint32_t index_oid,
+static int
+page_overlay_supply(const char *socket_path, uint32_t db_oid, uint32_t index_oid,
     const CuvsPageOverlayRequest *request, int dim, uint32_t metric,
     const CuvsPageSupplement *supplement, CuvsPageProgress *progress)
 {
@@ -823,13 +1068,31 @@ cuvs_ipc_supply_pages(const char *socket_path, uint32_t db_oid, uint32_t index_o
 
     if (!progress)
         return CUVS_STATUS_ERROR;
-    if (!supplement)
-    {
-        memset(progress, 0, sizeof(*progress));
-        return CUVS_STATUS_ERROR;
-    }
     return page_overlay_exchange(socket_path, &cmd, &frame, NULL,
                                   supplement, NULL, &count, &latency_us, progress);
+}
+
+int
+cuvs_ipc_supply_pages(const char *socket_path, uint32_t db_oid, uint32_t index_oid,
+    const CuvsPageOverlayRequest *request, int dim, uint32_t metric,
+    const CuvsPageSupplement *supplement, CuvsPageProgress *progress)
+{
+    if (!supplement)
+    {
+        if (progress)
+            memset(progress, 0, sizeof(*progress));
+        return CUVS_STATUS_ERROR;
+    }
+    return page_overlay_supply(socket_path, db_oid, index_oid, request, dim, metric, supplement, progress);
+}
+
+int
+cuvs_ipc_query_page_supply(const char *socket_path, uint32_t db_oid, uint32_t index_oid,
+    const CuvsPageOverlayRequest *request, int dim, uint32_t metric, CuvsPageProgress *progress)
+{
+    if (request->base.tail != request->from)
+        return CUVS_STATUS_ERROR;
+    return page_overlay_supply(socket_path, db_oid, index_oid, request, dim, metric, NULL, progress);
 }
 
 int
@@ -964,6 +1227,119 @@ cuvs_ipc_mark_pages_empty(const char *socket_path, uint32_t db_oid, uint32_t ind
         rc = (int) reply.status;
     close(sock);
     return rc;
+}
+
+bool
+cuvs_page_fold_event_valid(const CuvsPageFoldEvent *event)
+{
+    return event && event->length == sizeof(*event) &&
+        event->db_oid && event->index_oid && event->system_identifier &&
+        event->boot_id && event->daemon_id && event->index_nonce && event->base_nonce &&
+        event->parent_graph_nonce && event->graph_nonce &&
+        event->parent_graph_nonce != event->graph_nonce &&
+        event->positions > 0 && event->positions <= CUVS_PAGE_OVERLAY_MAX &&
+        event->parent_folded <= event->parent_n_slots &&
+        event->parent_n_slots <= UINT64_MAX - event->positions;
+}
+
+static int
+page_fold_exchange(const char *socket_path, CuvsCmdFrame *cmd,
+                   const void *payload, size_t payload_size, CuvsPageFoldEvent *candidate)
+{
+    const int timeout_sec = 1;
+    CuvsReplyHeader reply;
+    int sock, canceled, waiting;
+    int status = CUVS_STATUS_ERROR;
+
+    if (!socket_path || !socket_path[0])
+        return CUVS_STATUS_UNAVAILABLE;
+    if (g_wait_cb && g_wait_cb())
+        return CUVS_STATUS_CANCELED;
+    sock = uds_connect_wait(socket_path, timeout_sec, &canceled);
+    if (sock < 0)
+        return canceled ? CUVS_STATUS_CANCELED : CUVS_STATUS_UNAVAILABLE;
+
+    if (send_cmd(sock, cmd) == 0 && send_all(sock, payload, payload_size) == 0)
+    {
+        waiting = recv_all_interruptible_with_deadline(sock, &reply, sizeof(reply), timeout_sec, true);
+        if (waiting == 0)
+        {
+            remember_reply(&reply);
+            status = (int) reply.status;
+            if (status == CUVS_STATUS_OK && candidate)
+            {
+                waiting = recv_all_interruptible_with_deadline(sock, candidate, sizeof(*candidate),
+                                                               timeout_sec, true);
+                if (waiting != 0)
+                    status = waiting == 1 ? CUVS_STATUS_CANCELED : CUVS_STATUS_ERROR;
+            }
+        }
+        else if (waiting == 1)
+            status = CUVS_STATUS_CANCELED;
+    }
+    close(sock);
+    return status;
+}
+
+static int
+page_fold_ready(const char *socket_path, uint32_t db_oid, uint32_t index_oid,
+                uint64_t index_nonce, uint64_t system_identifier, uint64_t boot_id,
+                CuvsPageFoldEvent *event)
+{
+    CuvsCmdFrame cmd = {.op = CUVS_OP_FOLD_READY, .db_oid = db_oid, .index_oid = index_oid};
+    struct {
+        CuvsPageFoldQuery query;
+        uint64_t index_nonce;
+    } payload = {.query = {.system_identifier = system_identifier, .boot_id = boot_id},
+                 .index_nonce = index_nonce};
+    CuvsPageFoldEvent candidate;
+    int status;
+
+    forget_reply();
+    if (!event || !db_oid || !system_identifier || !boot_id || (!!index_oid != !!index_nonce))
+        return CUVS_STATUS_ERROR;
+    payload.query.length = index_oid ? sizeof(payload) : sizeof(payload.query);
+    status = page_fold_exchange(socket_path, &cmd, &payload, payload.query.length, &candidate);
+    if (status != CUVS_STATUS_OK)
+        return status;
+    if (!cuvs_page_fold_event_valid(&candidate) || candidate.db_oid != db_oid ||
+        (index_oid && (candidate.index_oid != index_oid || candidate.index_nonce != index_nonce)) ||
+        candidate.system_identifier != system_identifier || candidate.boot_id != boot_id)
+        return CUVS_STATUS_ERROR;
+    *event = candidate;
+    return CUVS_STATUS_OK;
+}
+
+int
+cuvs_ipc_page_fold_ready_index(const char *socket_path, uint32_t db_oid, uint32_t index_oid,
+                               uint64_t index_nonce, uint64_t system_identifier, uint64_t boot_id,
+                               CuvsPageFoldEvent *event)
+{
+    if (!index_oid)
+        return CUVS_STATUS_ERROR;
+    return page_fold_ready(socket_path, db_oid, index_oid, index_nonce, system_identifier, boot_id, event);
+}
+
+int
+cuvs_ipc_page_fold_ready(const char *socket_path, uint32_t db_oid,
+                         uint64_t system_identifier, uint64_t boot_id, CuvsPageFoldEvent *event)
+{
+    return page_fold_ready(socket_path, db_oid, 0, 0, system_identifier, boot_id, event);
+}
+
+int
+cuvs_ipc_page_fold_result(const char *socket_path, const CuvsPageFoldEvent *event,
+                          uint64_t transition_lsn)
+{
+    forget_reply();
+    if (!cuvs_page_fold_event_valid(event))
+        return CUVS_STATUS_ERROR;
+
+    CuvsCmdFrame cmd = {.op = transition_lsn ? CUVS_OP_FOLD_COMMITTED : CUVS_OP_FOLD_DISCARD,
+                        .db_oid = event->db_oid, .index_oid = event->index_oid};
+    CuvsPageFoldResult result = {.event = *event, .transition_lsn = transition_lsn};
+
+    return page_fold_exchange(socket_path, &cmd, &result, sizeof(result), NULL);
 }
 
 /* ----------------------------------------------------------------

@@ -88,6 +88,17 @@ exists for 0.9.0.
 
 ### Fixed
 
+- `pg_cuvs_hnsw` applies `ef_construction` to the applicable SDK settings for
+  direct heap builds and records the configured value in the index metapage.
+  Conversions from legacy CAGRA indexes use the option only for the target
+  metapage value during the build. For later inserts, pgvector reads EF from
+  the index reloption. Heap builds cap the intermediate graph width at the
+  SDK limit of 1024 and emit a NOTICE when a higher request yields that width.
+  The build receipt reports the serialized hnswlib EF separately.
+  An existing explicit `ef_construction` setting now takes effect on the next
+  direct heap build or `REINDEX`, which can change build time and the resulting
+  graph.
+
 - Reject CAGRA sources with a stale marker and sources with pending inserts or deletes
   before converting them to HNSW. Source-based DDL checks the index key and
   predicate, and `pg_cuvs_build_hnsw()` preserves both. The existing
@@ -96,10 +107,13 @@ exists for 0.9.0.
   vectors. When the duplicates hold the same vector, pgvector builds the
   target from the current heap. Rebuilds of existing indexes can use a
   heap build in both cases.
-- `hnswlib_file` now requires a build-time binding between the `.hnsw` and
-  `.tids` files. Older sidecars without a verifiable binding must be regenerated
-  once with `REINDEX` and `cuvs.cpu_hnsw_fallback = on`. To convert a clean
-  resident source without regenerating a sidecar, use `mode = 'nsw'`.
+- `hnswlib_file` could previously import an older graph after the CAGRA source
+  changed. It now rejects a missing or invalid build-time binding between
+  `.hnsw` and `.tids` with SQLSTATE `55000`. For a clean resident source, use
+  `mode = 'nsw'` or regenerate the files by enabling
+  `cuvs.cpu_hnsw_fallback` and running `REINDEX` on the source. If a failed
+  `CREATE INDEX CONCURRENTLY` leaves an invalid target index, drop it before
+  retrying.
 
 - `CREATE INDEX CONCURRENTLY ... USING pg_cuvs_hnsw` and `REINDEX INDEX CONCURRENTLY` of a `pg_cuvs_hnsw` index
   built from the heap (without `source`) no longer make the table's queries wait for a lock. The build opened the

@@ -26,6 +26,7 @@
 #include "nodes/makefuncs.h"
 #include "parser/parsetree.h"
 #include "utils/builtins.h"
+#include "utils/float.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/timestamp.h"
@@ -47,10 +48,14 @@
 #include "access/reloptions.h"     /* CAGRA index_dir reloption (ADR-045) */
 #include "utils/array.h"           /* deconstruct_array, ARR_ELEMTYPE (Phase 3M) */
 #include "catalog/index.h"
+#include "catalog/dependency.h"
 #include "catalog/namespace.h"
 #include "catalog/pg_am_d.h"
+#include "catalog/pg_operator_d.h"
+#include "catalog/pg_proc_d.h"
 #include "catalog/pg_type.h"
 #include "commands/defrem.h"
+#include "commands/extension.h"
 #include "commands/tablespace.h"
 #include "common/cryptohash.h"
 #include "cuvs_hnsw_digest.h"
@@ -62,6 +67,7 @@
 #include "storage/fd.h"
 #include "storage/itemptr.h"
 #include "storage/ipc.h"       /* shmem_request_hook, shmem_startup_hook */
+#include "storage/lmgr.h"
 #include "storage/lwlock.h"    /* AddinShmemInitLock */
 #include "storage/shmem.h"     /* ShmemInitStruct, RequestAddinShmemSpace */
 #include "storage/spin.h"      /* slock_t — fallback-stats array guard */
@@ -80,9 +86,11 @@
 #include "catalog/pg_authid.h"      /* ROLE_PG_MONITOR (I3-B status visibility) */
 #include "nodes/extensible.h"       /* CustomPath, CustomScan (Option A D-wedge) */
 #include "optimizer/paths.h"        /* set_rel_pathlist_hook */
+#include "optimizer/planner.h"
 #include "optimizer/pathnode.h"     /* add_path */
 #include "optimizer/tlist.h"        /* get_sortgroupclause_tle */
 #include "executor/executor.h"      /* ExecInitQual, ExecQual */
+#include "storage/predicate.h"
 #include "postmaster/bgworker.h"    /* BackgroundWorker, RegisterBackgroundWorker */
 
 #include <sys/stat.h>
@@ -139,6 +147,8 @@ int   cuvs_daemon_uid             = -1;    /* #119: expected owner uid of cuvs.s
 int   cuvs_circuit_breaker_threshold = 3;
 static int cuvs_circuit_breaker_transient_ttl_s = 30; /* UC-2: transient breaker half-open TTL */
 int   cuvs_k                      = 100;   /* GPU top-k (pgvector ef_search analog) */
+static bool cuvs_search_more      = false;
+static int cuvs_search_more_max_components = CUVS_EXTRA_SEARCH_MAX_COMPONENTS;
 static int cuvs_itopk_size        = 0;     /* CAGRA intermediate buffer floor; 0=legacy */
 static int cuvs_search_width      = 0;     /* 0=SDK default */
 
@@ -213,7 +223,8 @@ static const struct config_enum_entry cuvs_gpu_bruteforce_options[] = {
 /* ----------------------------------------------------------------
  * Last-search stats (process-local; one slot per backend)
  *
- * Populated at the end of cuvs_gettuple on a successful CAGRA search.
+ * Populated on a successful search. For search_more, these describe the
+ * verified initial request. Supplemental stats are available in EXPLAIN.
  * Exposed via pg_cuvs_last_search_* SQL functions and (when
  * cuvs.debug = on) via NOTICE messages that interleave with EXPLAIN
  * VERBOSE client output.
@@ -511,6 +522,9 @@ pg_cuvs_last_rejection(PG_FUNCTION_ARGS)
 
 static object_access_hook_type prev_object_access_hook = NULL;
 static set_rel_pathlist_hook_type prev_set_rel_pathlist_hook = NULL; /* ADR-063 */
+static planner_hook_type prev_planner_hook = NULL;
+static PlannedStmt *cuvs_more_planner(Query *parse, const char *query_string,
+                                     int cursor_options, ParamListInfo bound_params);
 
 /* Forward declarations for ADR-063 Option A custom scan (defined at file end). */
 static void cuvs_filtered_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel,
@@ -953,6 +967,15 @@ typedef struct CuvsFbShmem
 static CuvsFbShmem *g_fb = NULL;
 static shmem_request_hook_type prev_shmem_request_hook = NULL;
 static shmem_startup_hook_type prev_shmem_startup_hook = NULL;
+#ifdef CUVS_PAGE_FORMAT
+static uint64 *cuvs_page_boot_id;
+
+uint64
+cuvs_cagra_pg_boot_id(void)
+{
+    return cuvs_page_boot_id ? *cuvs_page_boot_id : 0;
+}
+#endif
 
 static const char *
 cuvs_fb_reason_name(int r)
@@ -984,6 +1007,9 @@ cuvs_fb_shmem_request(void)
     if (prev_shmem_request_hook)
         prev_shmem_request_hook();
     RequestAddinShmemSpace(cuvs_fb_memsize());
+#ifdef CUVS_PAGE_FORMAT
+    RequestAddinShmemSpace(sizeof(*cuvs_page_boot_id));
+#endif
 }
 
 static void
@@ -1001,6 +1027,13 @@ cuvs_fb_shmem_startup(void)
         SpinLockInit(&g_fb->mutex);
         memset(g_fb->slots, 0, sizeof(g_fb->slots));  /* InvalidOid == 0 => all empty */
     }
+#ifdef CUVS_PAGE_FORMAT
+    /* A backend crash can recreate shared memory in the same postmaster. */
+    cuvs_page_boot_id = ShmemInitStruct("pg_cuvs page boot identity",
+                                       sizeof(*cuvs_page_boot_id), &found);
+    if (!found)
+        *cuvs_page_boot_id = cuvs_cagra_nonce();
+#endif
     LWLockRelease(AddinShmemInitLock);
 }
 
@@ -1238,7 +1271,7 @@ _PG_init(void)
 #ifdef CUVS_PAGE_FORMAT
     cuvs_page_preloaded = process_shared_preload_libraries_in_progress;
 #ifdef CUVS_TEST_HOOKS
-    cuvs_cagra_vacuum_init_test_hook();
+    cuvs_cagra_init_test_hooks();
 #endif
 #endif
     /* Phase 3K: register pg_cuvs_hnsw WITH(source, mode, ...) reloptions. */
@@ -1346,6 +1379,18 @@ _PG_init(void)
         100, 1, 2000,
         PGC_USERSET,
         0, NULL, NULL, NULL);
+
+    DefineCustomBoolVariable(
+        "cuvs.search_more",
+        "Try one additional search for eligible CAGRA queries with too few visible rows.",
+        NULL, &cuvs_search_more, false, PGC_USERSET, 0, NULL, NULL, NULL);
+
+    DefineCustomIntVariable(
+        "cuvs.search_more_max_components",
+        "Maximum row-by-dimension evaluations for the additional CAGRA search.",
+        "Zero allows only the initial search.", &cuvs_search_more_max_components,
+        CUVS_EXTRA_SEARCH_MAX_COMPONENTS, 0, CUVS_EXTRA_SEARCH_MAX_COMPONENTS,
+        PGC_USERSET, 0, NULL, NULL, NULL);
 
     DefineCustomIntVariable(
         "cuvs.itopk_size",
@@ -1723,6 +1768,8 @@ _PG_init(void)
     cuvs_register_custom_scan();
     prev_set_rel_pathlist_hook = set_rel_pathlist_hook;
     set_rel_pathlist_hook = cuvs_filtered_set_rel_pathlist;
+    prev_planner_hook = planner_hook;
+    planner_hook = cuvs_more_planner;
 
     DefineCustomBoolVariable(
         "cuvs.filtered_knn_hook",
@@ -3200,6 +3247,13 @@ cuvs_build_hnsw_from_heap(Relation heapRel, Relation indexRel, IndexInfo *indexI
                                 errhint("%s", CUVS_HNSW_DISK_HINT)));
             if (rc != CUVS_STATUS_OK)
                 ereport(ERROR, (errmsg("pg_cuvs: temporary HNSW build failed (status %d): %s", rc, error)));
+            uint32_t requested_intermediate = cuvs_hnsw_scaled_quality(
+                128, ef_construction, 64, UINT32_MAX);
+            if (requested_intermediate > CUVS_HNSW_MAX_INTERMEDIATE_DEGREE &&
+                out->policy.intermediate == CUVS_HNSW_MAX_INTERMEDIATE_DEGREE)
+                ereport(NOTICE,
+                        (errmsg("pg_cuvs: HNSW intermediate graph degree capped at %u (requested %u)",
+                                CUVS_HNSW_MAX_INTERMEDIATE_DEGREE, requested_intermediate)));
             out->policy.route_flags |= cuvs_hnsw_timing_flags(stats_rows, prespool);
             /* CK-17 (13): every auto -> ACE receipt gets its NOTICE lines. */
             notices = cuvs_hnsw_build_notices(&out->policy, transition_sent);
@@ -5049,6 +5103,12 @@ page_search_request(Relation index, Snapshot snapshot, int dim,
     *blocks = RelationGetNumberOfBlocks(index);
     if (!cuvs_cagra_read_meta(index, meta))
         return false;
+#ifdef CUVS_CAGRA_FOLD_ENABLED
+    /* The physical transition can be newer than this query's MVCC snapshot.
+     * Avoid ranking its newly folded rows for a snapshot that predates it. */
+    if (meta->last_fold_xid && XidInMVCCSnapshot((TransactionId) meta->last_fold_xid, snapshot))
+        return false;
+#endif
     cuvs_cagra_check_dim(meta->dim, dim);
     if (!meta->graph_nonce || !cuvs_cagra_read_tail(index, meta, *blocks, &request->tail) ||
         request->tail < meta->folded)
@@ -5207,6 +5267,9 @@ page_resolve_overlay(IndexScanDesc scan, CuvsScanState *ss, const CuvsCagraMeta 
     IndexFetchTableData *fetch = table_index_fetch_begin(heap);
     TupleTableSlot *tuple = table_slot_create(heap, NULL);
     bool valid = true;
+#ifdef CUVS_CAGRA_FOLD_ENABLED
+    uint64 physical_dead = 0;
+#endif
 
     ss->n_results = 0;
     for (int i = 0; i < count && ss->n_results < cuvs_k; ++i)
@@ -5239,7 +5302,18 @@ page_resolve_overlay(IndexScanDesc scan, CuvsScanState *ss, const CuvsCagraMeta 
             break;
         }
         if (state == CUVS_CAGRA_SLOT_DEAD)
+        {
+#ifdef CUVS_CAGRA_FOLD_ENABLED
+            /* VACUUM can WAL-log TID pages before publishing their count.
+             * Use exact search if the physical losses exhaust the allowance. */
+            if (request->folded && ++physical_dead > request->dead_slots)
+            {
+                valid = false;
+                break;
+            }
+#endif
             continue;
+        }
         /* Heap fetch may replace the root with a visible HOT child. The
          * PostgreSQL index scan must still give its caller the root TID. */
         visible = root;
@@ -5275,8 +5349,18 @@ page_start_search(IndexScanDesc scan, CuvsScanState *ss)
                              &meta, &ss->page_blocks, &request))
         return false;
     k = cuvs_k + (int) Min(meta.dead_slots, (uint64) cuvs_k);
+#ifdef CUVS_CAGRA_FOLD_ENABLED
+    if (request.folded != 0)
+    {
+        /* Known invalid slots consume places in the daemon's ranked list.
+         * Ordinary MVCC invisibility is handled by the existing resolver. */
+        if (meta.dead_slots > (uint64) (CUVS_PAGE_SEARCH_MAX_K - cuvs_k))
+            return false;
+        k = cuvs_k + (int) meta.dead_slots;
+    }
+#endif
 
-    if (request.tail == request.folded)
+    if (request.tail == request.folded && request.folded == 0)
     {
         ss->page_results = palloc(k * sizeof(*ss->page_results));
         rc = cuvs_ipc_search_pages(cuvs_socket_path, MyDatabaseId, RelationGetRelid(index),
@@ -5287,14 +5371,17 @@ page_start_search(IndexScanDesc scan, CuvsScanState *ss)
     }
     else
     {
-        CuvsPageOverlayRequest overlay = {.base = request, .boot_id = (uint64) PgStartTime,
+        CuvsPageOverlayRequest overlay = {.base = request, .boot_id = cuvs_cagra_pg_boot_id(),
                                           .from = request.folded};
         CuvsPageSupplement supplement = {0};
         CuvsPageProgress progress;
         CuvsPageOverlayResult *results;
         int count;
 
-        if (!cuvs_cagra_local_supplement(index, scan->heapRelation, scan->xs_snapshot,
+        /* A folded generation carries its PG life even with no pending
+         * suffix, so the daemon can recognize it before the worker's ACK. */
+        if (request.tail != request.folded &&
+            !cuvs_cagra_local_supplement(index, scan->heapRelation, scan->xs_snapshot,
                                          &meta, ss->page_blocks, overlay.from, request.tail,
                                          &supplement))
             return false;
@@ -5302,7 +5389,8 @@ page_start_search(IndexScanDesc scan, CuvsScanState *ss)
         rc = cuvs_ipc_search_page_overlay(cuvs_socket_path, MyDatabaseId, RelationGetRelid(index),
                                           &overlay, query->x, 1, query->dim, k, meta.metric,
                                           cuvs_itopk_size, cuvs_search_width, cuvs_cpu_hnsw_fallback,
-                                          cuvs_search_mode, cuvs_bf_precision, &supplement,
+                                          cuvs_search_mode, cuvs_bf_precision,
+                                          supplement.positions ? &supplement : NULL,
                                           results, &count, &latency, &progress);
         cuvs_cagra_free_supplement(&supplement);
         if (rc == CUVS_STATUS_OK)
@@ -7767,6 +7855,20 @@ pg_cuvs_compact(PG_FUNCTION_ARGS)
 
     cuvs_require_index_owner(index_oid);
 #ifdef CUVS_PAGE_FORMAT
+#ifdef CUVS_CAGRA_FOLD_ENABLED
+    if (cuvs_relation_is_page_cagra(indexRel))
+    {
+        if (XactReadOnly)
+            ereport(ERROR, (errcode(ERRCODE_READ_ONLY_SQL_TRANSACTION),
+                            errmsg("CAGRA fold cannot run in a read-only transaction")));
+        if (IsTransactionBlock() || IsSubTransaction())
+            ereport(ERROR, (errcode(ERRCODE_ACTIVE_SQL_TRANSACTION),
+                            errmsg("CAGRA fold cannot run inside a transaction block or subtransaction")));
+        cuvs_cagra_run_fold_worker(indexRel);
+        index_close(indexRel, AccessShareLock);
+        PG_RETURN_VOID();
+    }
+#endif
     cuvs_require_legacy_operation(indexRel);
 #endif
 
@@ -9967,10 +10069,620 @@ cuvs_tbf_explain(CustomScanState *node, List *ancestors, ExplainState *es)
                                (int64) state->last_latency_us, es);
 }
 
+/* M-65: wrap the already selected index scan, keeping it as the fallback. */
+typedef struct CuvsMoreCandidate
+{
+    ItemPointerData tid;
+    double          distance;
+} CuvsMoreCandidate;
+
+typedef struct CuvsMoreState
+{
+    CustomScanState    css;
+    IndexScanState    *child;
+    const char        *reason;
+    bool               enabled_at_start;
+    bool               prepared;
+    bool               fallback;
+    int                cursor;
+    int                count;
+    CuvsMoreCandidate *results;
+    int                first_attempts;
+    int                first_requested;
+    int                first_candidates;
+    int                first_visible;
+    int                extra_attempts;
+    int                extra_requested;
+    int                extra_candidates;
+    uint32             extra_budget;
+    uint32             extra_scored_rows;
+    uint32             extra_components;
+} CuvsMoreState;
+
+static bool
+cuvs_more_query_shape(Query *q)
+{
+    RangeTblEntry   *rte;
+    RangeTblRef     *ref;
+    SortGroupClause *order;
+
+    if (q->commandType != CMD_SELECT || q->resultRelation || q->setOperations ||
+        q->hasRowSecurity || q->rowMarks || q->hasAggs || q->hasWindowFuncs ||
+        q->hasTargetSRFs || q->hasSubLinks || q->hasModifyingCTE || q->cteList ||
+        q->groupClause || q->groupingSets || q->havingQual || q->distinctClause ||
+        q->limitOffset || !q->limitCount || q->limitOption != LIMIT_OPTION_COUNT ||
+        !q->jointree || q->jointree->quals ||
+        list_length(q->jointree->fromlist) != 1 || list_length(q->rtable) != 1 ||
+        list_length(q->sortClause) != 1 || contain_volatile_functions((Node *) q->targetList))
+        return false;
+
+    ref = linitial(q->jointree->fromlist);
+    if (!IsA(ref, RangeTblRef) || ref->rtindex != 1)
+        return false;
+    rte = linitial_node(RangeTblEntry, q->rtable);
+    order = linitial_node(SortGroupClause, q->sortClause);
+    return rte->rtekind == RTE_RELATION && rte->relkind == RELKIND_RELATION &&
+        !rte->security_barrier && !rte->securityQuals && !rte->tablesample &&
+        order->sortop == Float8LessOperator && !order->nulls_first;
+}
+
+static bool
+cuvs_more_index_shape(IndexScan *scan, RangeTblEntry *rte, Var *column, Const *query)
+{
+    Relation heap;
+    Relation index;
+    bool     valid = false;
+
+    heap = table_open(rte->relid, NoLock);
+    index = index_open(scan->indexid, NoLock);
+    if (heap->rd_rel->relkind == RELKIND_RELATION && !heap->rd_rel->relispartition &&
+        heap->rd_rel->relam == HEAP_TABLE_AM_OID && !heap->rd_rel->relrowsecurity &&
+        !heap->rd_rel->relhassubclass && index->rd_rel->relam == get_am_oid("cagra", true) &&
+        index->rd_index->indrelid == rte->relid && index->rd_index->indisvalid &&
+        index->rd_index->indnatts == 1 && index->rd_index->indkey.values[0] == column->varattno &&
+        RelationGetIndexExpressions(index) == NIL && RelationGetIndexPredicate(index) == NIL &&
+        !cuvs_cagra_has_pages(index) && cuvs_index_metric(index) == CUVS_METRIC_L2 &&
+        column->varattno <= RelationGetDescr(heap)->natts)
+    {
+        Form_pg_attribute attr = TupleDescAttr(RelationGetDescr(heap), column->varattno - 1);
+
+        if (attr->attnotnull && !attr->attisdropped && attr->atttypid == column->vartype &&
+            attr->atttypmod > 0 && attr->atttypmod <= (int) CUVS_EXTRA_SEARCH_MAX_DIM)
+        {
+            PgVector *vector = DatumGetPgVector(query->constvalue);
+
+            valid = vector->dim == attr->atttypmod;
+            if ((Pointer) vector != DatumGetPointer(query->constvalue))
+                pfree(vector);
+        }
+    }
+    index_close(index, NoLock);
+    table_close(heap, NoLock);
+    return valid;
+}
+
+static bool
+cuvs_more_clean_source(Relation index, uint64_t *dir_dev, uint64_t *dir_ino)
+{
+    static const char *const dirty_suffixes[] = {"stale", "delta", "tombstone", "shards"};
+    const char *dir = cuvs_resolve_index_dir_rel(index);
+    Oid oid = RelationGetRelid(index);
+    struct stat st;
+    uint64_t device, inode;
+    char name[64];
+    bool clean = false;
+    int fd = open(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+
+    if (fd < 0)
+        return false;
+    if (fstat(fd, &st) != 0 || st.st_ino == 0)
+        goto done;
+    device = (uint64_t) st.st_dev;
+    inode = (uint64_t) st.st_ino;
+    if (*dir_ino && (*dir_dev != device || *dir_ino != inode))
+        goto done;
+    snprintf(name, sizeof(name), "%u_%u.tids", MyDatabaseId, oid);
+    if (fstatat(fd, name, &st, 0) != 0 || !S_ISREG(st.st_mode))
+        goto done;
+    for (int i = 0; i < lengthof(dirty_suffixes); i++)
+    {
+        snprintf(name, sizeof(name), "%u_%u.%s", MyDatabaseId, oid, dirty_suffixes[i]);
+        if (fstatat(fd, name, &st, AT_SYMLINK_NOFOLLOW) == 0 || errno != ENOENT)
+            goto done;
+    }
+    *dir_dev = device;
+    *dir_ino = inode;
+    clean = true;
+done:
+    close(fd);
+    return clean;
+}
+
+static bool
+cuvs_more_search_settings(void)
+{
+    return enable_cuvs && cuvs_search_mode == 0 && !cuvs_cpu_hnsw_fallback &&
+        cuvs_shard_overfetch == 0 && cuvs_cagra_batch_wait_us == 0 &&
+        cuvs_k <= (int) CUVS_EXTRA_SEARCH_MAX_K;
+}
+
+static int
+cuvs_more_compare(const void *left, const void *right)
+{
+    const CuvsMoreCandidate *a = left;
+    const CuvsMoreCandidate *b = right;
+    int cmp = float8_cmp_internal(a->distance, b->distance);
+
+    return cmp ? cmp : ItemPointerCompare((ItemPointer) &a->tid, (ItemPointer) &b->tid);
+}
+
+/* Sort by SQL distance, using the visible heap TID as the tie-breaker. A
+ * visible TID always has the same distance under this statement's snapshot. */
+static void
+cuvs_more_sort(CuvsMoreState *state)
+{
+    int unique_count = 0;
+
+    qsort(state->results, state->count, sizeof(*state->results), cuvs_more_compare);
+    for (int i = 0; i < state->count; i++)
+    {
+        if (unique_count == 0 ||
+            !ItemPointerEquals(&state->results[i].tid, &state->results[unique_count - 1].tid))
+            state->results[unique_count++] = state->results[i];
+    }
+    state->count = unique_count;
+}
+
+static bool
+cuvs_more_collect(CuvsMoreState *state, const CuvsResult *candidates, int count,
+                  Datum query, AttrNumber attno, FmgrInfo *distance_fn)
+{
+    ScanState       *scan = &state->css.ss;
+    Relation         heap = scan->ss_currentRelation;
+    TupleTableSlot  *slot = scan->ss_ScanTupleSlot;
+    ExprContext     *context = scan->ps.ps_ExprContext;
+    Snapshot         snapshot = scan->ps.state->es_snapshot;
+    BlockNumber      nblocks = RelationGetNumberOfBlocks(heap);
+    int              start_count = state->count;
+    bool             valid = true;
+    IndexFetchTableData *fetch = table_index_fetch_begin(heap);
+
+    for (int i = 0; i < count; i++)
+    {
+        uint32           block;
+        uint16           offset;
+        ItemPointerData  tid;
+        bool             again = false;
+        bool             isnull;
+        Datum            vector;
+        MemoryContext    old;
+        double           distance;
+
+        CHECK_FOR_INTERRUPTS();
+        cuvs_tid_decode(candidates[i].tid, &block, &offset);
+        if (candidates[i].tid >> 48 || block >= nblocks ||
+            offset == InvalidOffsetNumber || offset > MaxHeapTuplesPerPage)
+        {
+            valid = false;
+            break;
+        }
+        ItemPointerSet(&tid, block, offset);
+        ExecClearTuple(slot);
+        if (!table_index_fetch_tuple(fetch, &tid, snapshot, slot, &again, NULL))
+            continue;
+        Assert(!again);        /* heap returns at most one version under MVCC */
+
+        old = MemoryContextSwitchTo(context->ecxt_per_tuple_memory);
+        vector = slot_getattr(slot, attno, &isnull);
+        if (isnull)
+            elog(ERROR, "pg_cuvs: NULL CAGRA candidate in a NOT NULL vector column");
+        distance = DatumGetFloat8(FunctionCall2Coll(distance_fn, InvalidOid, vector, query));
+        MemoryContextSwitchTo(old);
+        ResetExprContext(context);
+        state->results[state->count++] = (CuvsMoreCandidate) {slot->tts_tid, distance};
+    }
+
+    ExecClearTuple(slot);
+    table_index_fetch_end(fetch);
+    if (!valid)
+        state->count = start_count;
+    return valid;
+}
+
+static const char *
+cuvs_more_status_reason(int rc)
+{
+    switch (rc)
+    {
+        case CUVS_EXTRA_SEARCH_UNSUPPORTED: return "unsupported";
+        case CUVS_STATUS_UNAVAILABLE: return "unavailable";
+        case CUVS_EXTRA_SEARCH_GENERATION: return "generation";
+        case CUVS_EXTRA_SEARCH_BUDGET: return "budget";
+        case CUVS_EXTRA_SEARCH_DEADLINE: return "deadline";
+        case CUVS_EXTRA_SEARCH_ANN_FAILED: return "ann_failed";
+        case CUVS_STATUS_STALE: return "dirty_source";
+        default: break;
+    }
+    return "error";
+}
+
+static void
+cuvs_more_check_cancel(int rc)
+{
+    CHECK_FOR_INTERRUPTS();
+    if (rc == CUVS_STATUS_CANCELED)
+        ereport(ERROR, (errcode(ERRCODE_QUERY_CANCELED),
+                        errmsg("pg_cuvs: CAGRA search canceled")));
+}
+
+/* NULL means the optional path has an answer, including a valid shortfall.
+ * A non-NULL return authorizes the ordinary child only before a GPU launch
+ * was possible. Once the initial list is verified, extra failures keep it. */
+static const char *
+cuvs_more_build(CuvsMoreState *state)
+{
+    CustomScan        *plan = castNode(CustomScan, state->css.ss.ps.plan);
+    ScanState         *scan = &state->css.ss;
+    EState            *estate = scan->ps.state;
+    Relation           index = state->child->iss_RelationDesc;
+    Oid                oid = RelationGetRelid(index);
+    AttrNumber         attno = intVal(linitial(plan->custom_private));
+    int                limit = intVal(lsecond(plan->custom_private));
+    int                k = cuvs_k;
+    int                extra_k;
+    int                rc;
+    int                count;
+    uint32_t           initial_latency = 0;
+    CuvsExtraSearchReply details;
+    CuvsResult         candidates[CUVS_EXTRA_SEARCH_MAX_K];
+    Const             *constant = linitial_node(Const, plan->custom_exprs);
+    PgVector          *query;
+    MemoryContext      old;
+    FmgrInfo           distance_fn;
+    int64_t            deadline;
+    int64_t            now_plus_timeout;
+    uint64_t           generation;
+    uint64_t           dir_dev = 0;
+    uint64_t           dir_ino = 0;
+
+    Assert(state->first_attempts == 0);
+    if (!state->enabled_at_start || !cuvs_search_more)
+        return "disabled";
+    if (!cuvs_more_search_settings() || k < limit ||
+        !IsMVCCSnapshot(estate->es_snapshot) || estate->es_epq_active ||
+        !ScanDirectionIsForward(estate->es_direction) ||
+        cuvs_breaker_state(oid) == CUVS_CIRCUIT_OPEN)
+        return "ineligible";
+    if (!cuvs_more_clean_source(index, &dir_dev, &dir_ino))
+        return "dirty_source";
+
+    old = MemoryContextSwitchTo(estate->es_query_cxt);
+    query = DatumGetPgVector(constant->constvalue);
+    fmgr_info((Oid) intVal(lthird(plan->custom_private)), &distance_fn);
+    MemoryContextSwitchTo(old);
+    extra_k = Min(k * 2, (int) CUVS_EXTRA_SEARCH_MAX_K);
+    state->extra_budget = (uint32) cuvs_search_more_max_components;
+
+    /* Match index_beginscan's SSI lock before reading the daemon index. */
+    PredicateLockRelation(index, estate->es_snapshot);
+    deadline = cuvs_ipc_extra_search_deadline_ms();
+    CHECK_FOR_INTERRUPTS();
+    state->first_attempts++;
+    state->first_requested = k;
+    rc = cuvs_ipc_search_extra(cuvs_socket_path, MyDatabaseId, oid, query->x, query->dim,
+                               k, 0, 0, dir_dev, dir_ino, deadline, candidates, &count,
+                               &details, &initial_latency);
+    cuvs_more_check_cancel(rc);
+    /* IPC reserves UNSUPPORTED for pre-dispatch refusals and UNAVAILABLE
+     * for connection failure. A failure after dispatch cannot authorize v6. */
+    if (rc == CUVS_EXTRA_SEARCH_UNSUPPORTED || rc == CUVS_STATUS_UNAVAILABLE)
+        return cuvs_more_status_reason(rc);
+    if (rc != CUVS_STATUS_OK)
+    {
+        /* Match the v6 wrapper failure's transient breaker classification. */
+        if (rc == CUVS_EXTRA_SEARCH_ANN_FAILED)
+            cuvs_circuit_record_status((uint32_t) oid, cuvs_circuit_breaker_threshold,
+                                       CUVS_STATUS_OOM_FALLBACK);
+        cuvs_report_proto_mismatch(rc);
+        ereport(ERROR,
+                (errcode(rc == CUVS_EXTRA_SEARCH_DEADLINE ? ERRCODE_QUERY_CANCELED :
+                         ERRCODE_EXTERNAL_ROUTINE_EXCEPTION),
+                 errmsg("pg_cuvs: initial CAGRA search_more failed (%s)", cuvs_more_status_reason(rc)),
+                 errdetail("IPC status %d.", rc)));
+    }
+    generation = details.generation;
+    if (count < 0 || count > k || generation == 0)
+        ereport(ERROR, (errcode(ERRCODE_PROTOCOL_VIOLATION),
+                        errmsg("pg_cuvs: invalid initial CAGRA search_more reply")));
+    if (!cuvs_more_clean_source(index, &dir_dev, &dir_ino))
+        ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+                        errmsg("pg_cuvs: sidecars changed during initial CAGRA search_more")));
+
+    state->first_candidates = count;
+    state->results = MemoryContextAlloc(estate->es_query_cxt,
+                                       (k + extra_k) * sizeof(*state->results));
+    if (!cuvs_more_collect(state, candidates, count, PointerGetDatum(query), attno, &distance_fn))
+        ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
+                        errmsg("pg_cuvs: invalid heap candidate in initial CAGRA search_more reply")));
+    if (!cuvs_more_clean_source(index, &dir_dev, &dir_ino))
+        ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+                        errmsg("pg_cuvs: sidecars changed during initial CAGRA search_more")));
+    cuvs_more_sort(state);
+    state->first_visible = state->count;
+    cuvs_circuit_record_success((uint32_t) oid);
+    /* The last-search statistics describe the verified initial reply. */
+    cuvs_last_latency_us = initial_latency;
+    cuvs_last_n_results = state->first_candidates;
+    cuvs_last_k_requested = k;
+    cuvs_last_index_oid = oid;
+    cuvs_last_metric = CUVS_METRIC_L2;
+
+    if (state->count >= limit)
+        state->reason = "enough";
+    else if (state->extra_budget < (uint32) query->dim || state->extra_attempts != 0)
+        state->reason = "budget";
+    else if (!cuvs_more_clean_source(index, &dir_dev, &dir_ino))
+        state->reason = "dirty_source";
+    else if ((now_plus_timeout = cuvs_ipc_extra_search_deadline_ms()) < 0 ||
+             now_plus_timeout - CUVS_EXTRA_SEARCH_TIMEOUT_MS >= deadline)
+        state->reason = "deadline";
+    else
+    {
+        CHECK_FOR_INTERRUPTS();
+        state->extra_attempts++;
+        state->extra_requested = extra_k;
+        rc = cuvs_ipc_search_extra(cuvs_socket_path, MyDatabaseId, oid, query->x, query->dim,
+                                   extra_k, generation, state->extra_budget, dir_dev, dir_ino,
+                                   deadline, candidates, &count, &details, NULL);
+        cuvs_more_check_cancel(rc);
+        if (rc != CUVS_STATUS_OK)
+            state->reason = cuvs_more_status_reason(rc);
+        else if (details.generation != generation)
+            state->reason = "generation";
+        else if (count < 0 || count > extra_k)
+            state->reason = "error";
+        else if (!cuvs_more_clean_source(index, &dir_dev, &dir_ino))
+            state->reason = "dirty_source";
+        else
+        {
+            state->extra_candidates = count;
+            state->extra_scored_rows = details.scored_rows;
+            state->extra_components = details.components;
+            if (!cuvs_more_collect(state, candidates, count, PointerGetDatum(query), attno, &distance_fn))
+                state->reason = "error";
+            else if (!cuvs_more_clean_source(index, &dir_dev, &dir_ino))
+            {
+                /* Collection only appends. Discard the suffix before sorting. */
+                state->count = state->first_visible;
+                state->reason = "dirty_source";
+            }
+            else
+            {
+                cuvs_more_sort(state);
+                state->reason = state->count >= limit ? "filled" : "shortfall";
+            }
+        }
+    }
+
+    state->count = Min(state->count, limit);
+    return NULL;
+}
+
+static void
+cuvs_more_begin(CustomScanState *node, EState *estate, int eflags)
+{
+    CuvsMoreState *state = (CuvsMoreState *) node;
+    CustomScan    *plan = castNode(CustomScan, node->ss.ps.plan);
+
+    state->child = castNode(IndexScanState,
+                            ExecInitNode(linitial(plan->custom_plans), estate, eflags));
+    node->custom_ps = list_make1(state->child);
+    state->enabled_at_start = cuvs_search_more &&
+        !(eflags & (EXEC_FLAG_BACKWARD | EXEC_FLAG_MARK));
+}
+
+static TupleTableSlot *
+cuvs_more_exec(CustomScanState *node)
+{
+    CuvsMoreState  *state = (CuvsMoreState *) node;
+    ScanState      *scan = &node->ss;
+    TupleTableSlot *slot = scan->ss_ScanTupleSlot;
+    ExprContext    *context = scan->ps.ps_ExprContext;
+
+    if (!state->prepared)
+    {
+        const char *fallback_reason = cuvs_more_build(state);
+
+        if (fallback_reason)
+        {
+            state->reason = fallback_reason;
+            state->fallback = true;
+            state->count = 0;
+        }
+        state->prepared = true;
+    }
+    if (state->fallback)
+        return ExecProcNode(&state->child->ss.ps);
+
+    ResetExprContext(context);
+    ExecClearTuple(slot);
+    if (state->cursor == state->count)
+        return NULL;
+    if (!table_tuple_fetch_row_version(scan->ss_currentRelation,
+                                       &state->results[state->cursor++].tid,
+                                       scan->ps.state->es_snapshot, slot))
+        elog(ERROR, "pg_cuvs: visible CAGRA candidate disappeared within the statement snapshot");
+    if (!scan->ps.ps_ProjInfo)
+        return slot;
+
+    context->ecxt_scantuple = slot;
+    return ExecProject(scan->ps.ps_ProjInfo);
+}
+
+static void
+cuvs_more_end(CustomScanState *node)
+{
+    CuvsMoreState *state = (CuvsMoreState *) node;
+
+    ExecEndNode(&state->child->ss.ps);
+}
+
+static void
+cuvs_more_rescan(CustomScanState *node)
+{
+    CuvsMoreState *state = (CuvsMoreState *) node;
+
+    if (state->first_attempts != 0)
+        ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                        errmsg("pg_cuvs: cannot rescan CAGRA search_more after the initial attempt")));
+
+    ExecScanReScan(&node->ss);
+    ExecReScan(&state->child->ss.ps);
+    state->prepared = false;
+    state->fallback = false;
+    state->reason = NULL;
+    state->count = 0;
+    state->cursor = 0;
+    if (state->results)
+    {
+        pfree(state->results);
+        state->results = NULL;
+    }
+}
+
+static void
+cuvs_more_explain(CustomScanState *node, List *ancestors, ExplainState *es)
+{
+    CuvsMoreState *state = (CuvsMoreState *) node;
+
+    if (!es->analyze)
+        return;
+    ExplainPropertyInteger("First Attempts", NULL, state->first_attempts, es);
+    ExplainPropertyInteger("First Requested", NULL, state->first_requested, es);
+    ExplainPropertyInteger("First Candidates", NULL, state->first_candidates, es);
+    ExplainPropertyInteger("First Visible", NULL, state->first_visible, es);
+    ExplainPropertyInteger("Extra Attempts", NULL, state->extra_attempts, es);
+    ExplainPropertyInteger("Extra Requested", NULL, state->extra_requested, es);
+    ExplainPropertyInteger("Extra Candidates", NULL, state->extra_candidates, es);
+    ExplainPropertyInteger("Extra Component Budget", NULL, state->extra_budget, es);
+    ExplainPropertyInteger("Extra Scored Rows", NULL, state->extra_scored_rows, es);
+    ExplainPropertyInteger("Extra Components", NULL, state->extra_components, es);
+    ExplainPropertyText("Extra Reason", state->reason ? state->reason : "not_run", es);
+}
+
+static const CustomExecMethods cuvs_more_exec_methods = {
+    .CustomName = "CuvsSearchMore",
+    .BeginCustomScan = cuvs_more_begin,
+    .ExecCustomScan = cuvs_more_exec,
+    .EndCustomScan = cuvs_more_end,
+    .ReScanCustomScan = cuvs_more_rescan,
+    .ExplainCustomScan = cuvs_more_explain,
+};
+
+static Node *
+cuvs_more_create_state(CustomScan *plan)
+{
+    CuvsMoreState *state = palloc0(sizeof(*state));
+
+    NodeSetTag(state, T_CustomScanState);
+    state->css.methods = &cuvs_more_exec_methods;
+    state->css.slotOps = &TTSOpsBufferHeapTuple;
+    return (Node *) state;
+}
+
+static const CustomScanMethods cuvs_more_scan_methods = {
+    .CustomName = "CuvsSearchMore",
+    .CreateCustomScanState = cuvs_more_create_state,
+};
+
+static PlannedStmt *
+cuvs_more_planner(Query *parse, const char *query_string,
+                  int cursor_options, ParamListInfo bound_params)
+{
+    bool eligible = cuvs_search_more && cuvs_more_search_settings() && !bound_params &&
+        !(cursor_options & CURSOR_OPT_SCROLL) && cuvs_more_query_shape(parse);
+    PlannedStmt *stmt = prev_planner_hook ?
+        prev_planner_hook(parse, query_string, cursor_options, bound_params) :
+        standard_planner(parse, query_string, cursor_options, bound_params);
+    Limit         *limit;
+    IndexScan     *scan;
+    OpExpr        *op;
+    Var           *column;
+    Const         *query;
+    Const         *count;
+    int64          k;
+    Oid            vector_extension;
+    CustomScan    *wrapper;
+
+    if (!eligible || stmt->parallelModeNeeded || stmt->subplans || stmt->rowMarks ||
+        !IsA(stmt->planTree, Limit))
+        return stmt;
+    limit = castNode(Limit, stmt->planTree);
+    if (limit->limitOffset || limit->limitOption != LIMIT_OPTION_COUNT ||
+        !IsA(limit->limitCount, Const) || !IsA(limit->plan.lefttree, IndexScan))
+        return stmt;
+    count = castNode(Const, limit->limitCount);
+    if (count->constisnull || count->consttype != INT8OID)
+        return stmt;
+    k = DatumGetInt64(count->constvalue);
+    if (k < 1 || k > cuvs_k || cuvs_k > (int) CUVS_EXTRA_SEARCH_MAX_K)
+        return stmt;
+
+    scan = castNode(IndexScan, limit->plan.lefttree);
+    if (scan->scan.plan.parallel_aware || scan->scan.plan.qual || scan->indexqual ||
+        scan->indexqualorig || scan->indexorderdir != ForwardScanDirection ||
+        list_length(scan->indexorderbyorig) != 1 || !IsA(linitial(scan->indexorderbyorig), OpExpr))
+        return stmt;
+    op = castNode(OpExpr, linitial(scan->indexorderbyorig));
+    if (list_length(op->args) != 2 || op->opresulttype != FLOAT8OID)
+        return stmt;
+    if (IsA(linitial(op->args), Var) && IsA(lsecond(op->args), Const))
+    {
+        column = linitial_node(Var, op->args);
+        query = lsecond_node(Const, op->args);
+    }
+    else if (IsA(linitial(op->args), Const) && IsA(lsecond(op->args), Var))
+    {
+        query = linitial_node(Const, op->args);
+        column = lsecond_node(Var, op->args);
+    }
+    else
+        return stmt;
+
+    vector_extension = get_extension_oid("vector", true);
+    if (!OidIsValid(vector_extension) || column->varno != scan->scan.scanrelid ||
+        column->varattno <= 0 || column->varlevelsup || query->constisnull ||
+        column->vartype != query->consttype ||
+        getExtensionOfObject(TypeRelationId, column->vartype) != vector_extension ||
+        getExtensionOfObject(OperatorRelationId, op->opno) != vector_extension ||
+        getExtensionOfObject(ProcedureRelationId, op->opfuncid) != vector_extension ||
+        strcmp(get_opname(op->opno), "<->") != 0 ||
+        strcmp(get_func_name(op->opfuncid), "l2_distance") != 0 ||
+        !cuvs_more_index_shape(scan, rt_fetch(scan->scan.scanrelid, stmt->rtable), column, query))
+        return stmt;
+
+    /* The Limit still receives exactly the original IndexScan's target list.
+     * The wrapper projects it from the same heap slot type as the IndexScan. */
+    wrapper = makeNode(CustomScan);
+    wrapper->scan.plan = scan->scan.plan;
+    NodeSetTag(wrapper, T_CustomScan);
+    wrapper->scan.plan.plan_node_id = Max(limit->plan.plan_node_id, scan->scan.plan.plan_node_id) + 1;
+    wrapper->scan.plan.parallel_safe = false;
+    wrapper->scan.scanrelid = scan->scan.scanrelid;
+    wrapper->custom_plans = list_make1(scan);
+    wrapper->custom_exprs = list_make1(copyObject(query));
+    wrapper->custom_private = list_make3(makeInteger(column->varattno), makeInteger((int) k),
+                                        makeInteger((int) op->opfuncid));
+    wrapper->methods = &cuvs_more_scan_methods;
+    limit->plan.lefttree = &wrapper->scan.plan;
+    return stmt;
+}
+
 /* Register the Custom Scan methods so the executor can deserialize the node. */
 void
 cuvs_register_custom_scan(void)
 {
     RegisterCustomScanMethods(&cuvs_filtered_scan_methods);
     RegisterCustomScanMethods(&cuvs_transient_bf_scan_methods);
+    RegisterCustomScanMethods(&cuvs_more_scan_methods);
 }

@@ -33,6 +33,17 @@ CREATE INDEX hsc_file_dst ON hsc_file USING pg_cuvs_hnsw (v vector_l2_ops)
 SELECT to_regclass('hsc_file_dst') IS NULL;
 DROP INDEX IF EXISTS hsc_file_dst;
 
+-- A refused concurrent build leaves an invalid target for the caller to drop.
+\set ON_ERROR_STOP off
+CREATE INDEX CONCURRENTLY hsc_file_cic_dst ON hsc_file USING pg_cuvs_hnsw (v vector_l2_ops)
+    WITH (source = hsc_file_src, mode = 'hnswlib_file');
+\echo :SQLSTATE
+\set ON_ERROR_STOP on
+SELECT NOT indisvalid AND NOT indisready
+FROM pg_index WHERE indexrelid = 'hsc_file_cic_dst'::regclass;
+DROP INDEX hsc_file_cic_dst;
+SELECT to_regclass('hsc_file_cic_dst') IS NULL;
+
 -- The in-memory hnswlib export has the EXTENDed row and must carry the same
 -- generation's TIDs. The original disk TID file still has only 100 rows.
 CREATE INDEX hsc_file_shm ON hsc_file USING pg_cuvs_hnsw (v vector_l2_ops)

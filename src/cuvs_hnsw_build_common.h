@@ -475,6 +475,10 @@ typedef struct CuvsHnswForecast {
     uint64_t disk_need, disk_avail;
 } CuvsHnswForecast;
 
+/* cuVS CAGRA accepts at most 1024 neighbors in the input kNN graph.
+ * Resident NN-descent also checks this width before admission. */
+#define CUVS_HNSW_MAX_INTERMEDIATE_DEGREE 1024u
+
 static inline int
 cuvs_hnsw_forecast_route(uint64_t n, uint32_t dim, uint32_t graph_degree,
     uint32_t intermediate_degree, uint32_t hierarchy, uint32_t algo,
@@ -491,7 +495,8 @@ cuvs_hnsw_forecast_route(uint64_t n, uint32_t dim, uint32_t graph_degree,
         snprintf(error, error_len, "HNSW route decision needs positive row count, dimension and ef_construction");
         return (int)out->status;
     }
-    intermediate = cuvs_hnsw_scaled_quality(intermediate_degree, ef_construction, degree, 4096);
+    intermediate = cuvs_hnsw_scaled_quality(intermediate_degree, ef_construction,
+                                             degree, CUVS_HNSW_MAX_INTERMEDIATE_DEGREE);
     if (n < CUVS_HNSW_MIN_ELEMENTS)
     {
         degree = (uint32_t)(n & ~UINT64_C(1));

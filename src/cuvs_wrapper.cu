@@ -11,6 +11,11 @@
  */
 
 #include "cuvs_wrapper.h"
+#ifdef PGCUVS_BETA3A_GPU_FOLD
+#include "cuvs_cagra_fold_capacity.h"
+#include "cuvs_cagra_fold.h"
+#include "cuvs_cagra_fold_sdk.hpp"
+#endif
 #include "cuvs_hnsw_build_common.h"
 #include "cuvs_ipc.h"   /* CUVS_METRIC_* (PG-free, CUDA-free defines) */
 #include "cuvs_util.h"  /* ADR-075: CUVS_HWPROBE_* bits (PG-free, CUDA-free) */
@@ -1697,6 +1702,100 @@ cuvs_cagra_search(
     }
 }
 
+extern "C" int
+cuvs_cagra_extra_search_supported(CuvsCagraIndex index, int64_t n_vecs, int dim)
+{
+    if (!index || n_vecs <= 0 || dim <= 0)
+        return 0;
+
+    const auto &idx = static_cast<CuvsCagraIndexImpl *>(index)->idx;
+    if (idx.metric() != cuvs_distance_type(CUVS_METRIC_L2) ||
+        idx.dataset_fd().has_value() || idx.graph_fd().has_value() ||
+        idx.source_indices().has_value() || idx.mapping_fd().has_value())
+        return 0;
+
+    const auto dataset = idx.dataset();
+    const auto graph = idx.graph();
+    return dataset.data_handle() && graph.data_handle() &&
+           graph.extent(0) == n_vecs && dataset.extent(0) == n_vecs &&
+           dataset.extent(1) == dim && dataset.stride(0) >= dim &&
+           dataset.stride(1) == 1;
+}
+
+static __global__ void
+cagra_extra_l2(const float *dataset, int64_t stride, const float *query,
+               int dim, uint32_t rows, double *distances)
+{
+    uint32_t row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= rows)
+        return;
+
+    const float *vec = dataset + (int64_t) row * stride;
+    double distance = 0.0;
+    for (int d = 0; d < dim; d++) {
+        double diff = (double) vec[d] - query[d];
+        distance += diff * diff;
+    }
+    distances[row] = distance;
+}
+
+extern "C" CuvsCagraScoreStatus
+cuvs_cagra_score_range(CuvsCagraIndex index, const float *query, int dim,
+                       uint32_t offset, uint32_t rows, double *distances,
+                       int device_id, CuvsExtraSearchStop stop, void *stop_arg,
+                       CuvsExtraSearchProgress *progress)
+{
+    *progress = {};
+    if (!index || dim <= 0 || rows == 0 || rows > CUVS_EXTRA_SEARCH_CHUNK_ROWS ||
+        rows > CUVS_EXTRA_SEARCH_CHUNK_COMPONENTS / (uint32_t) dim ||
+        offset > CUVS_EXTRA_SEARCH_MAX_ROWS - rows)
+        return CUVS_CAGRA_SCORE_ERROR;
+
+    const auto &idx = static_cast<CuvsCagraIndexImpl *>(index)->idx;
+    if (offset + rows > idx.size() || !cuvs_cagra_extra_search_supported(index, idx.size(), dim))
+        return CUVS_CAGRA_SCORE_ERROR;
+    if (stop(stop_arg))
+        return CUVS_CAGRA_SCORE_STOPPED;
+
+    const auto dataset = idx.dataset();
+    const float *first_row = dataset.data_handle() + (int64_t) offset * dataset.stride(0);
+    std::unique_ptr<PooledRes> resources;
+    try {
+        resources = std::make_unique<PooledRes>(device_id);
+        auto &res = resources->get();
+        auto d_query = raft::make_device_vector<float, int64_t>(res, dim);
+        auto d_distances = raft::make_device_vector<double, int64_t>(res, rows);
+        if (stop(stop_arg))
+            return CUVS_CAGRA_SCORE_STOPPED;
+        raft::copy(d_query.data_handle(), query, dim, res.get_stream());
+        if (stop(stop_arg)) {
+            res.sync_stream();
+            return CUVS_CAGRA_SCORE_STOPPED;
+        }
+        constexpr uint32_t threads = 128;
+        cagra_extra_l2<<<(rows + threads - 1) / threads, threads, 0, res.get_stream().value()>>>(
+            first_row, dataset.stride(0), d_query.data_handle(), dim, rows,
+            d_distances.data_handle());
+        RAFT_CUDA_TRY(cudaGetLastError());
+        progress->submitted = 1;
+        raft::copy(distances, d_distances.data_handle(), rows, res.get_stream());
+        res.sync_stream();
+        progress->completed = 1;
+        resources->fence_check();
+        return CUVS_CAGRA_SCORE_OK;
+    } catch (const std::exception &e) {
+        fprintf(stderr, "[cuvs_cagra_score_range] exception: %s\n", e.what());
+    } catch (...) {
+        fprintf(stderr, "[cuvs_cagra_score_range] unknown exception\n");
+    }
+    if (resources) {
+        if (cudaStreamSynchronize(resources->get().get_stream().value()) == cudaSuccess)
+            progress->completed = progress->submitted;
+        resources->poison();
+    }
+    return CUVS_CAGRA_SCORE_ERROR;
+}
+
 /* ----------------------------------------------------------------
  * Phase 3M: batched search — Q queries in one GPU dispatch.
  * queries is Q*dim row-major; results is Q*top_k row-major
@@ -2237,6 +2336,152 @@ cuvs_cagra_extend(CuvsCagraIndex index,
         return 1;
     }
 }
+
+#ifdef PGCUVS_BETA3A_GPU_FOLD
+
+extern "C" int
+cuvs_cagra_fold_shape(CuvsCagraIndex source, CuvsCagraFoldShape *shape)
+{
+    if (!source || !shape)
+        return -1;
+    const auto& graph = static_cast<const CuvsCagraIndexImpl *>(source)->idx;
+    using RowId = decltype(graph.data().n_rows());
+    if (graph.dataset_fd().has_value() ||
+        dynamic_cast<const cuvs::neighbors::strided_dataset<float, RowId> *>(&graph.data()) == nullptr)
+        return -1;
+    const auto dataset = graph.dataset();
+    *shape = {uint64_t(graph.size()), uint64_t(graph.dim()),
+              uint64_t(dataset.stride(0)), uint64_t(graph.graph_degree())};
+    return 0;
+}
+
+static bool cagra_fold_stream_confirmed(PooledRes *scope, bool allow_oom = true)
+{
+    if (!scope || (scope->fence && scope->fence->failures() > 0))
+        return false;
+    cudaError_t status = cudaStreamSynchronize(scope->get().get_stream().value());
+    cudaError_t last = cudaGetLastError();
+    return status == cudaSuccess &&
+           (last == cudaSuccess || (allow_oom && last == cudaErrorMemoryAllocation));
+}
+
+extern "C" CuvsCagraFoldStatus
+cuvs_cagra_fold_reuse(CuvsCagraIndex source, const float *new_vectors,
+                      int64_t n_new, int dim, int device_id, CuvsCagraIndex *result)
+{
+    return cuvs_cagra_fold_reuse_with_yield(source, new_vectors, n_new, dim, device_id,
+                                          result, nullptr);
+}
+
+extern "C" CuvsCagraFoldStatus
+cuvs_cagra_fold_reuse_with_yield(CuvsCagraIndex source, const float *new_vectors,
+                                 int64_t n_new, int dim, int device_id, CuvsCagraIndex *result,
+                                 const CuvsCagraFoldControl *control)
+{
+    if (!source || !new_vectors || !result || *result ||
+        n_new <= 0 || dim <= 0 || device_id < 0 || device_id >= CUVS_MAX_GPUS)
+        return CUVS_CAGRA_FOLD_INVALID;
+
+    const auto& old = *static_cast<const CuvsCagraIndexImpl *>(source);
+    const RmmUpstream::NoGrowth keep_backing(g_rmm_registry ?
+        g_rmm_registry->upstreams[device_id].get() : nullptr);
+    std::optional<PooledRes> scope;
+    bool may_have_gpu_work = false;
+    try {
+        using DatasetRowId = decltype(old.idx.data().n_rows());
+        if (old.idx.dataset_fd().has_value() ||
+            dynamic_cast<const cuvs::neighbors::strided_dataset<float, DatasetRowId> *>(&old.idx.data()) == nullptr)
+            return CUVS_CAGRA_FOLD_INVALID;
+
+        const auto old_dataset = old.idx.dataset();
+        const auto old_graph = old.idx.graph();
+        const auto n_old = static_cast<uint64_t>(old.idx.size());
+        const auto stride = old_dataset.stride(0);
+        const auto degree = old.idx.graph_degree();
+        constexpr uint64_t max_rows = UINT32_MAX - 1;
+        if (!n_old || n_old > max_rows || uint64_t(n_new) > max_rows - n_old ||
+            old.idx.dim() != dim || stride < dim || !degree ||
+            !old_dataset.data_handle() || !old_graph.data_handle() ||
+            uint64_t(old_dataset.extent(0)) != n_old || uint64_t(old_graph.extent(0)) != n_old)
+            return CUVS_CAGRA_FOLD_INVALID;
+        if (control && control->filled_rows && control->placeholder_slot >= n_old)
+            return CUVS_CAGRA_FOLD_INVALID;
+        const auto total = static_cast<int64_t>(n_old + uint64_t(n_new));
+        const auto max_float_columns = std::min<uint64_t>(SIZE_MAX, INT64_MAX) / sizeof(float) / total;
+        const auto max_index_columns = std::min<uint64_t>(SIZE_MAX, INT64_MAX) / sizeof(uint32_t) / total;
+        if (uint64_t(stride) > max_float_columns || uint64_t(degree) > max_index_columns)
+            return CUVS_CAGRA_FOLD_INVALID;
+
+        cuvs_cagra_fold_checkpoint(control);
+        scope.emplace(device_id);
+        auto& resources = scope->get();
+        for (const void *pointer : {static_cast<const void *>(old_dataset.data_handle()),
+                                    static_cast<const void *>(old_graph.data_handle())}) {
+            cudaPointerAttributes attributes{};
+            RAFT_CUDA_TRY(cudaPointerGetAttributes(&attributes, pointer));
+            if (attributes.type != cudaMemoryTypeDevice || attributes.device != device_id)
+                return CUVS_CAGRA_FOLD_INVALID;
+        }
+
+        cuvs_cagra_fold_checkpoint(control);
+        /* Device allocation itself can enqueue CUDA work. From this point,
+         * keep the owner and its inputs until the request stream is checked. */
+        may_have_gpu_work = true;
+        auto added = raft::make_device_matrix<float, int64_t>(resources, n_new, int64_t(dim));
+        raft::copy(added.data_handle(), new_vectors, size_t(n_new) * size_t(dim), resources.get_stream());
+        resources.sync_stream();
+        cuvs_cagra_fold_checkpoint(control);
+        if (control && control->filled_rows) {
+            const float *sample = old_dataset.data_handle() + uint64_t(control->placeholder_slot) * stride;
+            for (int64_t from = 0; from < n_new; from += CUVS_CAGRA_FOLD_BATCH_ROWS) {
+                for (int64_t row = from; row < std::min(n_new, from + CUVS_CAGRA_FOLD_BATCH_ROWS); ++row)
+                    if (!control->filled_rows[row])
+                        RAFT_CUDA_TRY(cudaMemcpyAsync(added.data_handle() + row * dim, sample,
+                            size_t(dim) * sizeof(float), cudaMemcpyDeviceToDevice, resources.get_stream().value()));
+                resources.sync_stream();
+                cuvs_cagra_fold_checkpoint(control);
+            }
+        }
+        auto dataset = raft::make_device_matrix<float, int64_t>(resources, total, stride);
+        auto dataset_view = raft::make_device_strided_matrix_view<float, int64_t>(
+            dataset.data_handle(), total, dim, stride);
+        cuvs::neighbors::cagra::index<float, uint32_t> next(resources, old.idx.metric());
+        cuvs_cagra_fold_sdk(resources, old.idx, raft::make_const_mdspan(added.view()), dataset_view,
+                            next, control);
+        resources.sync_stream();
+        scope->fence_check();
+
+        if (next.size() != total || next.dataset().data_handle() != dataset.data_handle() ||
+            next.graph().data_handle() == old_graph.data_handle())
+            throw std::runtime_error("completed CAGRA fold has invalid ownership");
+        cuvs_cagra_fold_checkpoint(control);
+        auto completed = std::make_unique<CuvsCagraIndexImpl>(std::move(dataset), std::move(next), old.metric);
+        *result = completed.release();
+        return CUVS_CAGRA_FOLD_OK;
+    } catch (const CuvsCagraFoldYield &) {
+        /* Unwind the temporary buffers first. A healthy stop leaves the
+         * borrowed stream alive for existing allocations that use it. */
+        if (!may_have_gpu_work || cagra_fold_stream_confirmed(scope ? &*scope : nullptr, false))
+            return CUVS_CAGRA_FOLD_YIELDED;
+        if (scope) scope->poison();
+        return CUVS_CAGRA_FOLD_CUDA_UNCONFIRMED;
+    } catch (const std::bad_alloc &) {
+        if (!may_have_gpu_work)
+            return CUVS_CAGRA_FOLD_OOM;
+        bool confirmed = cagra_fold_stream_confirmed(scope ? &*scope : nullptr);
+        if (scope) scope->poison();
+        return confirmed ? CUVS_CAGRA_FOLD_OOM : CUVS_CAGRA_FOLD_CUDA_UNCONFIRMED;
+    } catch (const std::exception &error) {
+        fprintf(stderr, "[cuvs_cagra_fold_reuse] %s\n", error.what());
+    } catch (...) {
+        fprintf(stderr, "[cuvs_cagra_fold_reuse] unknown exception\n");
+    }
+    bool confirmed = cagra_fold_stream_confirmed(scope ? &*scope : nullptr);
+    if (scope) scope->poison();
+    return confirmed ? CUVS_CAGRA_FOLD_ERROR : CUVS_CAGRA_FOLD_CUDA_UNCONFIRMED;
+}
+
+#endif /* PGCUVS_BETA3A_GPU_FOLD */
 
 /* ----------------------------------------------------------------
  * 3Q: cuvs_cagra_compact — merge-compact a CAGRA index removing dead vectors.
@@ -3014,7 +3259,7 @@ static int prepare_hnsw_settings(const CuvsHnswFileBuild *params, int vectors_fd
     degree = params->graph_degree;
     auto &intermediate = prepared.intermediate;
     intermediate = cuvs_hnsw_scaled_quality(params->intermediate_degree,
-        params->ef_construction, degree, 4096);
+        params->ef_construction, degree, CUVS_HNSW_MAX_INTERMEDIATE_DEGREE);
     if (params->policy) memset(params->policy, 0, sizeof(*params->policy));
     if (!cuvs_hnsw_algo_supported(params->build_algo)
         || params->ef_construction < 4 || params->ef_construction > 1000)
@@ -3124,6 +3369,7 @@ static int execute_hnsw_file_build(const CuvsHnswFileBuild *params, int owner_fd
             ? cuvs::distance::DistanceType::InnerProduct : cuvs_distance_type(params->metric);
         cp.graph_degree = degree;
         cp.intermediate_graph_degree = intermediate;
+        receipt.intermediate = (uint32_t) cp.intermediate_graph_degree;
         cp.attach_dataset_on_build = false;
         hnsw::index_params hp;
         hp.hierarchy = params->hierarchy ? hnsw::HnswHierarchy::GPU : hnsw::HnswHierarchy::NONE;
@@ -3399,7 +3645,6 @@ cuvs_hnsw_build_file(int vectors_fd, int owner_fd,
         receipt.route_flags = prepared.route.overflowed ? CUVS_HNSW_ROUTE_FLAG_AUTO_OVERFLOW : 0;
         receipt.requested_ef = params->ef_construction;
         receipt.degree = degree;
-        receipt.intermediate = intermediate;
         receipt.hierarchy = params->hierarchy;
         receipt.n_rows = params->n_vecs;
         receipt.dim = params->dim;
