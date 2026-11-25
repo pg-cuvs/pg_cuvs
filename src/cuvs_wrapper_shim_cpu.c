@@ -497,9 +497,11 @@ cuvs_cagra_extend(CuvsCagraIndex index, const float *new_vecs, int64_t n_new,
 
 CuvsCagraIndex
 cuvs_cagra_compact(CuvsCagraIndex index, const uint32_t *keep_bits_words,
-                   int64_t n_total, uint32_t metric, int device_id, int *ivfpq_retry)
+                   int64_t n_total, uint32_t metric, int graph_degree,
+                   int intermediate_graph_degree, int device_id, int *ivfpq_retry)
 {
     if (ivfpq_retry) *ivfpq_retry = 0;
+    (void)graph_degree; (void)intermediate_graph_degree;
     (void)device_id;
     ShimIndex *ix = (ShimIndex *)index;
     if (!ix) return NULL;

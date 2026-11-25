@@ -40,7 +40,7 @@ DATA           = sql/pg_cuvs--0.1.0.sql \
                  sql/pg_cuvs--0.9.2--0.9.3.sql \
                  sql/pg_cuvs--0.9.3.sql
 MODULE_big     = pg_cuvs
-REGRESS        = smoke upgrade_path cpu_fallback edge_cases cpu_hnsw_fallback build_hnsw build_hnsw_edge build_hnsw_halfvec build_hnsw_packing hnsw_insert_shift hnsw_layer_status hnsw_build_m hnsw_build_ef hnsw_source_conversion hnsw_source_maintenance hnsw_source_conversion_file pg_cuvs_hnsw metrics brute_force brute_force_after_extend brute_force_after_compact pg_cuvs_batch reloption_dir gc_orphans release_hardening pending_delta delta_recall build_params drop_subxact partition_prune filter_comparison prefilter_short_fill_guard ivfpq_smoke ivfpq_drop_release cagra_streaming cagra_dynbatch cagra_search_params auto_compact extend_vram_fallback stream_bf_recall fallback_stat vram_accounting build_lock flat_smoke transient_bf hw_profile routing_golden routing_golden_measured multi_vector daemon_uid_owner unordered_scan null_query_vector rmm_pool admission_reject
+REGRESS        = smoke upgrade_path cpu_fallback edge_cases cpu_hnsw_fallback build_hnsw build_hnsw_edge build_hnsw_halfvec build_hnsw_packing hnsw_insert_shift hnsw_layer_status hnsw_build_m hnsw_build_ef hnsw_source_conversion hnsw_source_maintenance hnsw_source_conversion_file pg_cuvs_hnsw metrics brute_force brute_force_after_extend brute_force_after_compact pg_cuvs_batch reloption_dir gc_orphans release_hardening pending_delta delta_recall build_params drop_subxact partition_prune filter_comparison prefilter_short_fill_guard ivfpq_smoke ivfpq_drop_release cagra_streaming cagra_dynbatch cagra_search_params auto_compact extend_vram_fallback stream_bf_recall fallback_stat vram_accounting build_lock flat_smoke transient_bf hw_profile routing_golden routing_golden_measured multi_vector daemon_uid_owner unordered_scan null_query_vector rmm_pool admission_reject compact_graph_degree
 REGRESS_OPTS   = --inputdir=test --outputdir=test
 
 # Tier-1 CI (CPU-reference shim, PGCUVS_CPU_SHIM=1) runs a SUBSET of REGRESS.
@@ -48,7 +48,9 @@ REGRESS_OPTS   = --inputdir=test --outputdir=test
 #   build_hnsw/build_hnsw_edge/pg_cuvs_hnsw/build_hnsw_halfvec/
 #     build_hnsw_packing/hnsw_insert_shift/hnsw_build_m — CAGRA->pgvector HNSW *graph export* (real graph
 #     structure; a Tier-2 / real-GPU concern).
-REGRESS_TIER2_ONLY = build_hnsw build_hnsw_edge build_hnsw_halfvec build_hnsw_packing hnsw_insert_shift hnsw_build_m hnsw_build_ef hnsw_source_conversion_file pg_cuvs_hnsw routing_golden_measured
+#   compact_graph_degree — the width of the compacted CAGRA graph (#261); the shim
+#     keeps no graph and writes its own index file format.
+REGRESS_TIER2_ONLY = build_hnsw build_hnsw_edge build_hnsw_halfvec build_hnsw_packing hnsw_insert_shift hnsw_build_m hnsw_build_ef hnsw_source_conversion_file pg_cuvs_hnsw routing_golden_measured compact_graph_degree
 REGRESS_TIER1      = $(filter-out $(REGRESS_TIER2_ONLY),$(REGRESS))
 
 # #124: build_oom, build_multi_oom, build_oom_evict_to_fit, and extend_cuda_oom

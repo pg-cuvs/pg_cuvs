@@ -1970,14 +1970,14 @@ cuvs_resolve_index_dir_rel(Relation indexRel)
     return reldir != NULL ? reldir : get_index_dir();
 }
 
-/* 3R: resolve CAGRA build params from a cagra index's reloptions. ints carry
+/* 3R: read CAGRA build params from a cagra index's reloptions. ints carry
  * their reloption default (64/128) when rd_options is set; defaults are applied
  * when the index has no reloptions at all. build_algo string -> CUVS_CAGRA_BUILD_*.
- * Validates intermediate_graph_degree >= graph_degree (a cuVS requirement).
- * Only called from the CAGRA ambuild path (indexRel is a cagra index). */
+ * No validation: also read by compaction (cuvs_compact_rel), inside VACUUM.
+ * indexRel must be a cagra index. */
 static void
-cuvs_resolve_build_params_rel(Relation indexRel, int *graph_degree,
-                              int *intermediate_graph_degree, uint32_t *build_algo)
+cuvs_cagra_reloption_build_params(Relation indexRel, int *graph_degree,
+                                  int *intermediate_graph_degree, uint32_t *build_algo)
 {
     CuvsCagraOptions *opts = (CuvsCagraOptions *) indexRel->rd_options;
 
@@ -1999,7 +1999,16 @@ cuvs_resolve_build_params_rel(Relation indexRel, int *graph_degree,
             /* else "auto"/"" -> AUTO */
         }
     }
+}
 
+/* The CAGRA ambuild resolver: the reloptions above, validated
+ * intermediate_graph_degree >= graph_degree (a cuVS requirement). */
+static void
+cuvs_resolve_build_params_rel(Relation indexRel, int *graph_degree,
+                              int *intermediate_graph_degree, uint32_t *build_algo)
+{
+    cuvs_cagra_reloption_build_params(indexRel, graph_degree,
+                                      intermediate_graph_degree, build_algo);
     if (*intermediate_graph_degree < *graph_degree)
         ereport(ERROR,
                 (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
@@ -7308,6 +7317,35 @@ done:
     return ok;
 }
 
+/* #261: COMPACT for a legacy index. cagra::merge rebuilds the kept rows, so a
+ * CAGRA index sends its graph_degree and intermediate_graph_degree reloptions
+ * for the rebuild; without them the merge used the cuVS defaults (64, 128).
+ * Unlike the build resolver this does not raise an error, since VACUUM calls
+ * it: reloptions that CREATE INDEX would reject (intermediate below
+ * graph_degree, possible after ALTER INDEX ... SET) send 0, and the daemon
+ * keeps the resident graph's width. Other AMs (ivfpq, flat) have different
+ * rd_options layouts and send 0 (they have no CAGRA graph to rebuild). */
+static int
+cuvs_compact_rel(Relation indexRel, Oid index_oid)
+{
+    int      graph_degree = 0;
+    int      intermediate_graph_degree = 0;
+    uint32_t build_algo = CUVS_CAGRA_BUILD_AUTO;
+
+    if (indexRel->rd_indam->amoptions == cuvs_cagra_amoptions)
+        cuvs_cagra_reloption_build_params(indexRel, &graph_degree,
+                                          &intermediate_graph_degree, &build_algo);
+    if (intermediate_graph_degree < graph_degree)
+        graph_degree = intermediate_graph_degree = 0;
+    /* build_algo is not sent: compaction keeps cuVS's auto builder. */
+    return cuvs_ipc_compact(cuvs_socket_path,
+                            (uint32_t) MyDatabaseId,
+                            (uint32_t) index_oid,
+                            cuvs_resolve_index_dir_rel(indexRel),
+                            (uint32_t) graph_degree,
+                            (uint32_t) intermediate_graph_degree);
+}
+
 /* ambulkdelete: Phase 3A-4 records dead TIDs as tombstones instead of
  * unconditionally marking stale. Falls back to mark-stale if tombstone
  * append fails or exceeds the cap. */
@@ -7384,10 +7422,7 @@ cuvs_ambulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
                 (double) stats->tuples_removed / (double) n_total_vecs
                     >= cuvs_compact_delete_ratio)
             {
-                (void) cuvs_ipc_compact(cuvs_socket_path,
-                                        (uint32_t) MyDatabaseId,
-                                        (uint32_t) index_oid,
-                                        cuvs_resolve_index_dir_rel(indexRel));
+                (void) cuvs_compact_rel(indexRel, index_oid);
                 cuvs_report_build_notice(index_oid);
             }
         }
@@ -7443,10 +7478,7 @@ cuvs_amvacuumcleanup(IndexVacuumInfo *info, IndexBulkDeleteResult *stats)
         cuvs_tombstone_path(index_oid, tpath, sizeof(tpath));
         if (stat(tpath, &st) == 0)
         {
-            (void) cuvs_ipc_compact(cuvs_socket_path,
-                                    (uint32_t) MyDatabaseId,
-                                    (uint32_t) index_oid,
-                                    cuvs_resolve_index_dir_rel(indexRel));
+            (void) cuvs_compact_rel(indexRel, index_oid);
             cuvs_report_build_notice(index_oid);
         }
     }
@@ -8880,10 +8912,7 @@ pg_cuvs_compact(PG_FUNCTION_ARGS)
     cuvs_require_legacy_operation(indexRel);
 #endif
 
-    rc = cuvs_ipc_compact(cuvs_socket_path,
-                          (uint32_t) MyDatabaseId,
-                          (uint32_t) index_oid,
-                          cuvs_resolve_index_dir_rel(indexRel));
+    rc = cuvs_compact_rel(indexRel, index_oid);
     cuvs_report_build_notice(index_oid);
 
     index_close(indexRel, AccessShareLock);

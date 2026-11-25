@@ -102,6 +102,21 @@ exists for 0.9.0.
 
 ### Fixed
 
+- Compaction of a legacy CAGRA index (VACUUM after deletions, or `pg_cuvs_compact()`)
+  rebuilds the kept rows with the index's `graph_degree` and `intermediate_graph_degree`
+  reloptions (#261). It used to rebuild them with cuVS's defaults, 64 and 128, while
+  `pg_class.reloptions` kept the values given at `CREATE INDEX`; nothing reported the
+  change. A `graph_degree = 32` or `128` index had a graph of width 64 after its first
+  compaction. An index that an earlier version compacted to width 64 gets its
+  `graph_degree` back at its next compaction, also after a daemon restart. The graph of
+  that index then takes `rows x graph_degree x 4` bytes again instead of `rows x 64 x 4`,
+  so its GPU memory grows or shrinks with the width, and the compaction itself may take a
+  different time (not measured). Measured once on an A100 (100,000 random 64-dimension
+  rows, `graph_degree = 128`, 20% deleted, 200 queries): recall@10 after compaction was
+  0.9430 with the width-64 graph and 0.9945 with the width-128 graph. `build_algo` is
+  unchanged: compaction still lets cuVS choose the graph builder (`auto`). The daemon logs
+  `[cuvs_cagra_compact] rebuild graph_degree=... intermediate_graph_degree=...`.
+
 - The daemon no longer dies with SIGSEGV when it frees an index after a failed request. A
   failed request discarded its pooled resource slot together with the slot's dedicated
   CUDA stream (`--rmm-dedicated-stream`, on by default), while device buffers that an

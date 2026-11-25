@@ -2543,6 +2543,8 @@ cuvs_cagra_compact(CuvsCagraIndex  index,
                    const uint32_t *keep_bits_words,
                    int64_t         n_total,
                    uint32_t        metric,
+                   int             graph_degree,
+                   int             intermediate_graph_degree,
                    int             device_id,
                    int            *ivfpq_retry)
 {
@@ -2568,6 +2570,21 @@ cuvs_cagra_compact(CuvsCagraIndex  index,
 
         cuvs::neighbors::cagra::index_params params;
         params.metric = cuvs_distance_type(metric);
+        /* #261: cagra::merge rebuilds the kept rows with these params, so the
+         * graph degrees must be the index's own, not index_params{} defaults
+         * (64 and 128). The caller passes the index's reloptions; 0 (a caller
+         * that sends none) keeps the resident graph's width, and the
+         * intermediate degree is never below it. The builder stays auto. */
+        params.graph_degree = graph_degree > 0 ? (size_t)graph_degree
+                                               : (size_t)impl->idx.graph_degree();
+        params.intermediate_graph_degree = intermediate_graph_degree > 0
+            ? (size_t)intermediate_graph_degree : (size_t)128;
+        if (params.intermediate_graph_degree < params.graph_degree)
+            params.intermediate_graph_degree = params.graph_degree;
+        fprintf(stderr, "[cuvs_cagra_compact] rebuild graph_degree=%zu "
+                        "intermediate_graph_degree=%zu (resident width %u)\n",
+                (size_t)params.graph_degree, (size_t)params.intermediate_graph_degree,
+                (unsigned)impl->idx.graph_degree());
         /* B1: cagra::merge rebuilds the kept rows with these params
          * (cagra_merge.cuh -> cagra::build), so the build's fp16 kNN bound
          * applies here too: bound over the index dataset (a superset of the

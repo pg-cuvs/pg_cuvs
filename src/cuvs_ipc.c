@@ -3573,8 +3573,10 @@ cleanup:
 /* ----------------------------------------------------------------
  * 3Q: cuvs_ipc_compact
  *
- * Sends CUVS_OP_COMPACT with no extra payload — the daemon reads the
- * .tombstone sidecar directly from index_dir. Timeout is 120 s because
+ * Sends CUVS_OP_COMPACT with no payload beyond the frame and index_dir — the
+ * daemon reads the .tombstone sidecar directly from index_dir. graph_degree and
+ * intermediate_graph_degree ride in the BUILD fields of the frame
+ * (0 = not sent; the daemon then keeps the resident graph's width). Timeout is 120 s because
  * cagra::merge rebuilds the graph (O(new_n * graph_degree)).
  * ---------------------------------------------------------------- */
 int
@@ -3582,7 +3584,9 @@ cuvs_ipc_compact(
     const char *socket_path,
     uint32_t    db_oid,
     uint32_t    index_oid,
-    const char *index_dir)
+    const char *index_dir,
+    uint32_t    graph_degree,
+    uint32_t    intermediate_graph_degree)
 {
     int  sock = -1;
     int  rc   = CUVS_STATUS_ERROR;
@@ -3598,6 +3602,9 @@ cuvs_ipc_compact(
     cmd.op        = CUVS_OP_COMPACT;
     cmd.db_oid    = db_oid;
     cmd.index_oid = index_oid;
+    /* #261: the merge rebuilds the graph with these degrees. */
+    cmd.graph_degree              = graph_degree;
+    cmd.intermediate_graph_degree = intermediate_graph_degree;
 
     if (send_cmd(sock, &cmd) < 0)
         goto cleanup;
