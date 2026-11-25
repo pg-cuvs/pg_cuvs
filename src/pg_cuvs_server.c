@@ -29,6 +29,7 @@
 #include "cuvs_ipc.h"
 #include "cuvs_page_overlay.h"
 #include "cuvs_util.h"
+#include "cuvs_hnsw_source.h"
 #include "cuvs_cache_policy.h"
 #include "cuvs_bf_verdict.h"     /* #238: remembered brute_force unavailable verdict */
 #include "cuvs_peak_meter.h"
@@ -1986,6 +1987,26 @@ hnsw_file_path(char *out, size_t outlen,
     snprintf(out, outlen, "%s/%u_%u.hnsw", dir, db_oid, index_oid);
 }
 
+/* Invalidation is durable before the GPU graph can change. Keep the invalid
+ * record so a sync failure can be retried before accepting another EXTEND. */
+static int
+invalidate_hnsw_source(const char *dir, uint32_t db, uint32_t index)
+{
+    char path[576];
+    uint32_t zero = 0;
+    int fd;
+    int rc;
+
+    snprintf(path, sizeof(path), "%s/%u_%u.hnsw%s", dir, db, index,
+             CUVS_HNSW_SOURCE_SUFFIX);
+    fd = open(path, O_WRONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (fd < 0)
+        return errno == ENOENT ? 0 : -1;
+    rc = (pwrite(fd, &zero, sizeof(zero), 0) == sizeof(zero)) ? fsync(fd) : -1;
+    close(fd);
+    return rc;
+}
+
 /* 3P: IVF-PQ serialized index. */
 static void
 ivfpq_file_path(char *out, size_t outlen,
@@ -2664,6 +2685,10 @@ static int write_tids_atomic(const char *tids_tmp,
                              int64_t n_vecs, uint32_t dim, uint32_t metric,
                              const uint64_t *tids);
 static int fsync_path(const char *path);
+static bool read_hnsw_source(const char *graph_path, const char *tids_path,
+                             CuvsHnswSourceBinding *binding);
+static int bind_hnsw_source(const char *dir, const char *graph_path, const char *tids_path,
+                            const CuvsHnswFileIdentity *previous_graph);
 static void fchmod_sidecar(FILE *f, const char *path);
 static void chmod_sidecar(const char *path);
 static CuvsAdmissionReason lw_admission_check(int device_id, uint64_t needed,
@@ -2706,8 +2731,18 @@ save_index(IndexEntry *e)
 
     char idx_final[512],  idx_tmp[576];
     char tids_final[512], tids_tmp[576];
+    char hnsw_final[512];
+    CuvsHnswSourceBinding old_binding;
+    bool preserve_binding = false;
     index_file_path(idx_final,  sizeof(idx_final),  g_index_dir, e->db_oid, e->index_oid);
     tids_file_path(tids_final,  sizeof(tids_final), g_index_dir, e->db_oid, e->index_oid);
+    if (e->file_current)
+    {
+        /* SIGTERM rewrites even an unchanged TID file. Carry forward only
+         * a binding that matched the current file before the rewrite. */
+        hnsw_file_path(hnsw_final, sizeof(hnsw_final), g_index_dir, e->db_oid, e->index_oid);
+        preserve_binding = read_hnsw_source(hnsw_final, tids_final, &old_binding);
+    }
     snprintf(idx_tmp,  sizeof(idx_tmp),  "%s.tmp", idx_final);
     snprintf(tids_tmp, sizeof(tids_tmp), "%s.tmp", tids_final);
 
@@ -2742,6 +2777,9 @@ save_index(IndexEntry *e)
     int dir_fd = open(g_index_dir, O_RDONLY);
     if (dir_fd >= 0) { fsync(dir_fd); close(dir_fd); }
 
+    if (preserve_binding &&
+        bind_hnsw_source(g_index_dir, hnsw_final, tids_final, &old_binding.graph) != 0)
+        LOG_WARN("save_index: cannot renew the HNSW binding for %u/%u\n", e->db_oid, e->index_oid);
     e->file_current = 1;   /* I-FC (iii) */
     LOG_INFO("pg_cuvs_server: saved index %u/%u (%lld vecs)\n",
             e->db_oid, e->index_oid, (long long)e->n_vecs);
@@ -7673,6 +7711,72 @@ fsync_path(const char *path)
     return rc;
 }
 
+static bool
+read_hnsw_source(const char *graph_path, const char *tids_path,
+                 CuvsHnswSourceBinding *binding)
+{
+    char path[576];
+    FILE *file;
+    int graph_fd;
+    int tids_fd;
+    bool found;
+
+    snprintf(path, sizeof(path), "%s%s", graph_path, CUVS_HNSW_SOURCE_SUFFIX);
+    file = fopen(path, "rb");
+    if (file == NULL)
+        return false;
+    graph_fd = open(graph_path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    tids_fd = open(tids_path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    found = (graph_fd >= 0 && tids_fd >= 0 &&
+             cuvs_hnsw_source_binding_read(file, graph_fd, tids_fd, binding, NULL));
+    if (graph_fd >= 0) close(graph_fd);
+    if (tids_fd >= 0) close(tids_fd);
+    fclose(file);
+    return found;
+}
+
+/* Publish the binding after both artifact identities are stable. A clean
+ * save may replace .tids while leaving the same .hnsw file in place. */
+static int
+bind_hnsw_source(const char *dir, const char *graph_path, const char *tids_path,
+                 const CuvsHnswFileIdentity *previous_graph)
+{
+    CuvsHnswSourceBinding binding = { .magic = CUVS_HNSW_SOURCE_MAGIC,
+                                      .version = CUVS_HNSW_SOURCE_VERSION };
+    char path[576];
+    char tmp[608];
+    int graph_fd = open(graph_path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    int tids_fd = open(tids_path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    int fd;
+    bool ok = graph_fd >= 0 && tids_fd >= 0 &&
+              fsync(graph_fd) == 0 &&
+              cuvs_hnsw_file_identity(graph_fd, &binding.graph) == 0 &&
+              cuvs_hnsw_file_identity(tids_fd, &binding.tids) == 0 &&
+              (previous_graph == NULL ||
+               memcmp(previous_graph, &binding.graph, sizeof(binding.graph)) == 0);
+    if (graph_fd >= 0) close(graph_fd);
+    if (tids_fd >= 0) close(tids_fd);
+    if (!ok)
+        return -1;
+
+    snprintf(path, sizeof(path), "%s%s", graph_path, CUVS_HNSW_SOURCE_SUFFIX);
+    snprintf(tmp, sizeof(tmp), "%s.tmp.XXXXXX", path);
+    fd = mkstemp(tmp);
+    if (fd < 0)
+        return -1;
+    ok = fchmod(fd, 0644) == 0 &&
+         write(fd, &binding, sizeof(binding)) == sizeof(binding) &&
+         fsync(fd) == 0;
+    if (close(fd) != 0)
+        ok = false;
+    if (!ok || rename(tmp, path) != 0)
+    {
+        unlink(tmp);
+        return -1;
+    }
+    return fsync_path(dir);
+}
+
 /*
  * #167: force persistent index_dir sidecars (.tids/.vectors/.shards/.cagra/
  * .hnsw) to 0644 regardless of the daemon's umask.
@@ -9596,6 +9700,9 @@ finish_build_commit(int client_fd, const CuvsCmdFrame *cmd, const char *save_dir
         else
         {
             chmod_sidecar(hnsw_path);
+            if (bind_hnsw_source(io_dir, hnsw_path, tids_final, NULL) != 0)
+                LOG_WARN("[handle_build] cannot bind HNSW fallback %u/%u to its source\n",
+                         cmd->db_oid, cmd->index_oid);
             LOG_INFO("pg_cuvs_server: saved HNSW fallback %u/%u\n",
                      cmd->db_oid, cmd->index_oid);
         }
@@ -10636,6 +10743,13 @@ handle_drop(int client_fd, const CuvsCmdFrame *cmd)
 
     /* Free the resident entry (if any) and compact the registry. */
     IndexEntry *e = find_index(db, idx);
+    if (e && e->handle && e->inflight > 0)
+    {
+        pthread_mutex_unlock(&g_index_mutex);
+        send_error_code(client_fd, CUVS_STATUS_BUILD_FAILED,
+                        "source graph is being exported; retry drop");
+        return;
+    }
     if (e)
     {
         free_delta_cache(e);
@@ -10687,6 +10801,8 @@ handle_drop(int client_fd, const CuvsCmdFrame *cmd)
     stale_file_path(p, sizeof(p), directory, db, idx);       unlink(p); /* .stale */
     relfilenode_file_path(p, sizeof(p), directory, db, idx); unlink(p); /* .relfilenode */
     snprintf(p, sizeof(p), "%s/%u_%u.tombstone", directory, db, idx); unlink(p);
+    snprintf(p, sizeof(p), "%s/%u_%u.hnsw%s", directory, db, idx,
+             CUVS_HNSW_SOURCE_SUFFIX); unlink(p);
     /* Shard artifacts have contiguous ids; stop at the first missing one. */
     for (uint32_t s = 0; s < CUVS_SHARDS_MAX; s++)
     {
@@ -10904,11 +11020,43 @@ handle_export_adjacency(int client_fd, const CuvsCmdFrame *cmd)
  * /dev/shm path in reply.error[] so the backend can open and parse it,
  * then unlink after reading.
  * ---------------------------------------------------------------- */
+static int
+hnsw_export_tids_fd(int64_t n, uint32_t dim, uint32_t metric, const uint64_t *tids)
+{
+    int fd = memfd_create("pg_cuvs_hnsw_tids", MFD_CLOEXEC | MFD_ALLOW_SEALING);
+    int writer;
+    FILE *file;
+    bool ok;
+
+    if (fd < 0)
+        return -1;
+    writer = dup(fd);
+    file = writer >= 0 ? fdopen(writer, "wb") : NULL;
+    if (file == NULL)
+    {
+        if (writer >= 0) close(writer);
+        close(fd);
+        return -1;
+    }
+    ok = cuvs_tids_write(file, n, dim, metric, tids) == 0;
+    if (fclose(file) != 0)
+        ok = false;
+    if (!ok || fcntl(fd, F_ADD_SEALS,
+                     F_SEAL_WRITE | F_SEAL_GROW | F_SEAL_SHRINK | F_SEAL_SEAL) != 0)
+    {
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
+
 static void
 handle_export_hnsw_shm(int client_fd, const CuvsCmdFrame *cmd)
 {
     uint32_t db  = cmd->db_oid;
     uint32_t idx = cmd->index_oid;
+    bool paired = cmd->k == CUVS_HNSW_EXPORT_PAIRED;
+    int tids_fd = -1;
 
     pthread_mutex_lock(&g_index_mutex);
     IndexEntry *e = find_index(db, idx);
@@ -10971,14 +11119,35 @@ handle_export_hnsw_shm(int client_fd, const CuvsCmdFrame *cmd)
         send_error_code(client_fd, CUVS_STATUS_NOT_FOUND, "index evicted during export");
         return;
     }
+    /* SQL holds an AccessShareLock on the source index. The in-use guard
+     * also keeps EXTEND, COMPACT and eviction from changing its graph/TIDs. */
+    uint64_t *source_tids = NULL;
+    int64_t source_n = e->n_vecs;
+    uint32_t source_dim = e->dim;
+    uint32_t source_metric = e->metric;
+    if (paired)
+    {
+        source_tids = malloc((size_t) source_n * sizeof(*source_tids));
+        if (source_tids == NULL)
+        {
+            pthread_mutex_unlock(&g_index_mutex);
+            close(mfd);
+            send_error(client_fd, "cannot snapshot matching HNSW TIDs");
+            return;
+        }
+        memcpy(source_tids, e->tids, (size_t) source_n * sizeof(*source_tids));
+    }
     e->inflight++;
     g_unlocked_gpu_jobs++;
     pthread_mutex_unlock(&g_index_mutex);
     int hrc = cuvs_hnsw_serialize(handle, shm_path, gpu);
+    if (paired && hrc == CUVS_HNSW_SERIALIZE_OK)
+        tids_fd = hnsw_export_tids_fd(source_n, source_dim, source_metric, source_tids);
+    free(source_tids);
     pthread_mutex_lock(&g_index_mutex);
     g_unlocked_gpu_jobs--;
     e = find_index(db, idx);
-    if (e && e->inflight > 0)
+    if (e && e->handle == handle && e->inflight > 0)
         e->inflight--;
     pthread_mutex_unlock(&g_index_mutex);
     if (hrc != CUVS_HNSW_SERIALIZE_OK)
@@ -10995,6 +11164,12 @@ handle_export_hnsw_shm(int client_fd, const CuvsCmdFrame *cmd)
                             "index too small for an HNSW sidecar");
         else
             send_error(client_fd, "from_cagra/serialize failed");
+        return;
+    }
+    if (paired && tids_fd < 0)
+    {
+        close(mfd);
+        send_error(client_fd, "cannot export matching HNSW TIDs");
         return;
     }
 
@@ -11018,6 +11193,7 @@ handle_export_hnsw_shm(int client_fd, const CuvsCmdFrame *cmd)
     {
         LOG_ERROR("[handle_export_hnsw_shm] F_ADD_SEALS failed errno=%d\n", errno);
         close(mfd);
+        if (tids_fd >= 0) close(tids_fd);
         send_error(client_fd, "cannot seal hnsw sidecar");
         return;
     }
@@ -11033,12 +11209,16 @@ handle_export_hnsw_shm(int client_fd, const CuvsCmdFrame *cmd)
      */
     CuvsReplyHeader reply = {0};
     reply.status = CUVS_STATUS_OK;
+    reply.n_results = paired ? 2 : 0;
     /* error[] carries a label for log correlation only (#165); there is no
      * longer a filesystem path to report. */
     snprintf(reply.error, sizeof(reply.error), "memfd:pg_cuvs_hnsw %u/%u", db, idx);
     if (cuvs_fd_send(client_fd, mfd, &reply, sizeof(reply)) != 0)
         LOG_ERROR("[handle_export_hnsw_shm] fd handoff failed for %u/%u\n", db, idx);
+    else if (paired && cuvs_fd_send(client_fd, tids_fd, "", 1) != 0)
+        LOG_ERROR("[handle_export_hnsw_shm] TID handoff failed for %u/%u\n", db, idx);
     close(mfd);
+    if (tids_fd >= 0) close(tids_fd);
 }
 
 static int
@@ -12702,6 +12882,15 @@ handle_extend(int client_fd, const CuvsCmdFrame *cmd)
     int64_t  old_n = e->n_vecs;
     int64_t  n_new = cmd->n_vecs;
 
+    if (e->inflight > 0)
+    {
+        pthread_mutex_unlock(&g_index_mutex);
+        munmap(mem, total);
+        send_error_code(client_fd, CUVS_STATUS_BUILD_FAILED,
+                        "source graph is being exported; buffer the insert in delta");
+        return;
+    }
+
     /* Pre-flight VRAM budget check.
      * Cannot call ensure_vram here: evict_lru shifts g_indexes[], invalidating
      * this IndexEntry *e pointer.  A budget-only check is sufficient — the
@@ -12736,6 +12925,17 @@ handle_extend(int client_fd, const CuvsCmdFrame *cmd)
             send_error_code(client_fd, CUVS_STATUS_BUILD_FAILED, "not enough VRAM for extend");
             return;
         }
+    }
+
+    if (e->n_extended == 0 &&
+        invalidate_hnsw_source(index_dir[0] != '\0' ? index_dir : g_index_dir,
+                               cmd->db_oid, cmd->index_oid) != 0)
+    {
+        pthread_mutex_unlock(&g_index_mutex);
+        munmap(mem, total);
+        send_error_code(client_fd, CUVS_STATUS_PERSIST_FAILED,
+                        "cannot invalidate the on-disk HNSW source binding");
+        return;
     }
 
     /* Grow TIDs array before the GPU call; failure here is cheap to handle. */
@@ -12894,6 +13094,15 @@ handle_compact(int client_fd, const CuvsCmdFrame *cmd)
         return;
     }
 
+    if (e->inflight > 0)
+    {
+        pthread_mutex_unlock(&g_index_mutex);
+        free(dead_tids);
+        send_error_code(client_fd, CUVS_STATUS_BUILD_FAILED,
+                        "source graph is being exported; retry compaction");
+        return;
+    }
+
     /* Build keep_bits: bit[i]=1 → keep vector i (not tombstoned). */
     int64_t   n_vecs   = e->n_vecs;
     int64_t   n_words  = (n_vecs + 31) / 32;
@@ -12962,6 +13171,15 @@ handle_compact(int client_fd, const CuvsCmdFrame *cmd)
         free(new_tids);
         send_admission_reject(client_fd, CUVS_STATUS_OOM_FALLBACK,
                               "GPU physical memory pressure; retry later", &physical_rej);
+        return;
+    }
+    if (invalidate_hnsw_source(save_dir, cmd->db_oid, cmd->index_oid) != 0)
+    {
+        pthread_mutex_unlock(&g_index_mutex);
+        free(keep_bits);
+        free(new_tids);
+        send_error_code(client_fd, CUVS_STATUS_PERSIST_FAILED,
+                        "cannot invalidate the on-disk HNSW source binding");
         return;
     }
     e->extra_search_generation = 0;

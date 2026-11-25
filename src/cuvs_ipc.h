@@ -1083,20 +1083,24 @@ int cuvs_ipc_build_multi(
  * #165: the sidecar is handed over as an SCM_RIGHTS fd with its /dev/shm name
  * already unlinked daemon-side — there is nothing for the caller to unlink, and
  * the caller could not have done so anyway (different uid, sticky /dev/shm).
- * The caller reads through *fd_out and MUST close() it when done. shm_path_out
+ * Requests with k = CUVS_HNSW_EXPORT_PAIRED receive a second, sealed fd for
+ * the matching CAGRA TIDs. The caller closes both returned descriptors.
+ * shm_path_out
  * receives the daemon's former path for diagnostics only — it no longer exists,
  * and a "/proc/self/fd/N" substitute would not work either: reopening that
  * symlink re-checks inode permissions and fails EACCES cross-uid whenever the
  * daemon's umask leaves the segment 0600 (#166 review).
  * Returns CUVS_STATUS_OK on success, NOT_FOUND if index not loaded.
  */
+#define CUVS_HNSW_EXPORT_PAIRED 1
 int cuvs_ipc_export_hnsw_shm(
     const char *socket_path,
     uint32_t    db_oid,
     uint32_t    index_oid,
     char       *shm_path_out,  /* caller-allocated, at least 128 chars */
     size_t      shm_path_len,
-    int        *fd_out         /* receives the passed fd; caller closes */
+    int        *fd_out,
+    int        *tids_fd_out
 );
 
 int cuvs_ipc_export_adjacency(
