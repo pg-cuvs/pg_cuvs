@@ -555,6 +555,26 @@ background supplier that visits page-format CAGRA indexes and releases expired
 graph history. This postmaster setting also defaults to `off`. The worker uses
 the daemon's `--page-overlay-host-bytes` budget.
 
+Native page-format daemons can opt into GPU scoring for the resident prefix
+with `--page-overlay-gpu-min-rows`. The default `0` keeps CPU scoring.
+`--page-overlay-gpu-cache-mb` caps the mirrors and scoring workspace per GPU
+(default `1024` MiB). GPU scoring requires an RMM pool. New allocations use
+existing pool backing and defer while a fold is active. A fold that needs
+backing can suspend GPU scoring and reclaim the device allocations and the
+workspace. When a fold cannot reserve host staging, the daemon can reclaim
+workspaces across all devices for its next attempt. If enough rows cannot use
+the GPU, the daemon scores the prefix on the CPU.
+
+Each cached device mirror follows its immutable host chunk. It is released
+when the last graph or cursor releases that chunk. The host budget charges
+packed vectors and mirror metadata together at chunk allocation, and charges
+the pinned scoring workspace separately. The GPU cap and
+daemon VRAM admission also account for the device allocations. Nonstandard
+host floating-point modes use the CPU. The selected
+device returns scores through pinned memory. The daemon resolves uncertain
+scores with its existing ordered CPU calculation and passes all finite scores
+to the resident cursor's visibility checks.
+
 **Experimental page-format fold (`PGCUVS_BETA3A_GPU_FOLD=1`).** Build both the
 extension and daemon with this option and `CUVS_PAGE_FORMAT=1`, using the
 matching cuVS `cpp/src` tree as `CUVS_BETA3A_SDK_SOURCE`. The fold option defaults

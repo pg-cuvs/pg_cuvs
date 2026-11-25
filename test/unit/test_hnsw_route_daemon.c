@@ -360,6 +360,67 @@ static unsigned fold_calls;
 static size_t expected_host_charge;
 static CuvsCagraFoldStatus fold_device_status;
 
+#ifdef CUVS_PAGE_OVERLAY_GPU
+static unsigned overlay_reclaims;
+
+bool
+cuvs_page_overlay_gpu_reclaim(int device)
+{
+    assert(device == 1 && pthread_mutex_trylock(&g_index_mutex) == 0);
+    CHECK(g_page_gpu_host_fold_device == 0 && g_page_gpu_host_fold_order == 11 &&
+          g_page_gpu_live[1] == MiB);
+    g_page_gpu_live[1] = 0;
+    g_max_vram_per_gpu[0] = 32 * MiB;  /* changed after the host-pressure hold */
+    ++overlay_reclaims;
+    pthread_mutex_unlock(&g_index_mutex);
+    return true;
+}
+
+static void
+test_gpu_host_retry_vram(bool other_ready)
+{
+    PageCagraGraph parent = {.n_slots = 512, .dim = 32, .index_oid = 31, .registered_order = 11,
+        .overlay = {.boot_id = 9, .covered_upto = 100}};
+    PageCagraGraph other = parent;
+
+    reset(CUVS_HNSW_OVERFLOW_ERROR, 0);
+    g_n_gpus = 2;
+    parent.handle = &parent;
+    if (other_ready)
+    {
+        parent.fold_retry_after = UINT64_MAX;
+        parent.next = &other;
+        other.handle = &other;
+        other.index_oid = 32;
+        other.registered_order = 12;
+    }
+    g_page_graphs = &parent;
+    g_page_gpu_min_rows = 1;
+    g_page_gpu_host_fold_device = 0;
+    g_page_gpu_host_fold_order = parent.registered_order;
+    g_page_gpu_live[1] = MiB;
+    overlay_reclaims = 0;
+    page_fold_run(0);
+    CHECK(overlay_reclaims == 1 && g_page_gpu_live[1] == 0);
+    if (other_ready)
+    {
+        CHECK(other.fold_retry_after > 0);
+        CHECK(g_page_gpu_host_fold_device == 0);
+        CHECK(g_page_gpu_host_fold_order == parent.registered_order);
+        parent.fold_retry_after = 0;
+        other.fold_retry_after = 0;
+        other.last_search = time(NULL);
+        other.hits = 100;  /* ordinary selection would pick this graph again */
+        page_fold_run(0);
+        CHECK(other.fold_retry_after == 0);
+    }
+    CHECK(parent.fold_retry_after > 0 && fold_calls == 0);
+    CHECK(g_page_gpu_host_fold_device == -1);
+    CHECK(!g_pending_build_vram[0] && !g_fold_active[0]);
+    g_page_graphs = NULL;
+}
+#endif
+
 int
 fixture_fold_shape(CuvsCagraIndex handle, CuvsCagraFoldShape *shape)
 {
@@ -1254,6 +1315,13 @@ main(int argc, char **argv)
             test_extend_after_wait(false, true);
         else if (strcmp(argv[1], "build-rmm-phys-limit") == 0)
             test_build_rmm_phys_limit();
+#ifdef CUVS_PAGE_OVERLAY_GPU
+        else if (strcmp(argv[1], "gpu-host-retry-vram") == 0)
+        {
+            test_gpu_host_retry_vram(false);
+            test_gpu_host_retry_vram(true);
+        }
+#endif
         else
             return 2;
         goto done;
