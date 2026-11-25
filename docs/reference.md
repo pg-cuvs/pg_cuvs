@@ -585,8 +585,9 @@ buffer for the next fold of the same graph chain, with its allocated capacity
 charged to the same budget. The producer frees it when switching chains,
 after 30 seconds without a successful update, or on thread exit. The fold
 can use an SDK-owned host graph when the cache allocation cannot fit.
-Supply requests under host-budget pressure reclaim idle buffers and cause
-producers to release active buffers when their current fold finishes.
+Supply and fold requests under host-budget pressure reclaim idle buffers
+across devices. Producers release borrowed buffers when their current fold
+finishes if a request reported pressure in the meantime.
 
 With the RMM pool enabled, a fold reuses the pool's existing backing and can
 defer when that backing cannot satisfy its allocations. A fold cannot grow the

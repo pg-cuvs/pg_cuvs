@@ -15199,19 +15199,25 @@ page_fold_host_graph_expire(int device, uint64_t now)
     pthread_mutex_unlock(&g_page_fold_cache_mutex);
 }
 
-/* A supply can reclaim idle mirrors immediately. A borrowed mirror remains
- * owned by the producer until its CUDA work completes, then it is released
- * rather than republished if a supply registered pressure in the meantime. */
+/* Caller holds the cache mutex across reclaim and retry. Borrowed mirrors
+ * stay with their producers until CUDA completes and cannot return idle
+ * after any request registers pressure. */
+static void
+page_fold_reclaim_idle_caches_locked(void)
+{
+    ++g_page_fold_cache_epoch;
+    for (int gpu = 0; gpu < CUVS_MAX_GPUS; ++gpu)
+        page_fold_host_graph_release(&g_page_fold_idle_cache[gpu]);
+}
+
 static uint32_t
-page_fold_retry_supply(const CuvsPageOverlayRequest *request, size_t bytes,
-                       CuvsPageOverlayChunk **result)
+page_fold_retry_host_alloc(const CuvsPageOverlayRequest *request, size_t bytes,
+                           CuvsPageOverlayChunk **result)
 {
     uint32_t status;
 
     pthread_mutex_lock(&g_page_fold_cache_mutex);
-    ++g_page_fold_cache_epoch;
-    for (int gpu = 0; gpu < CUVS_MAX_GPUS; ++gpu)
-        page_fold_host_graph_release(&g_page_fold_idle_cache[gpu]);
+    page_fold_reclaim_idle_caches_locked();
     status = cuvs_page_overlay_alloc(&g_page_overlay_budget, request, bytes, result);
     pthread_mutex_unlock(&g_page_fold_cache_mutex);
     return status;
@@ -15276,10 +15282,17 @@ page_fold_reserve_mirrors(size_t mirrors, size_t graph_bytes,
         page_fold_host_graph_release(cache);
     }
 
-    if (!cuvs_page_overlay_reserve(&g_page_overlay_budget, mirrors))
-        return false;
-    *charge = mirrors;
-    return true;
+    bool reserved = cuvs_page_overlay_reserve(&g_page_overlay_budget, mirrors);
+    if (!reserved && control->optimized)
+    {
+        pthread_mutex_lock(&g_page_fold_cache_mutex);
+        page_fold_reclaim_idle_caches_locked();
+        reserved = cuvs_page_overlay_reserve(&g_page_overlay_budget, mirrors);
+        pthread_mutex_unlock(&g_page_fold_cache_mutex);
+    }
+    if (reserved)
+        *charge = mirrors;
+    return reserved;
 }
 
 static PageCagraGraph *
@@ -15508,6 +15521,8 @@ page_fold_run(int device)
         staging_status = cuvs_page_overlay_alloc(&g_page_overlay_budget, &staging_request,
                                                  host_bytes + wanted, &staging);
     }
+    if (staging_status == CUVS_STATUS_PAGE_OVERLAY_HOST_FULL && control.optimized)
+        staging_status = page_fold_retry_host_alloc(&staging_request, host_bytes + wanted, &staging);
     if (staging_status == CUVS_STATUS_OK)
     {
         rows = (float *) staging->marks;
@@ -16009,7 +16024,7 @@ read_page_overlay_chunk(const CuvsPageOverlayRequest *request, uint32_t dim, boo
     status = cuvs_page_overlay_alloc(&g_page_overlay_budget, request, bytes, result);
 #ifdef CUVS_CAGRA_FOLD_ENABLED
     if (shared && g_page_fold_batch_rows && status == CUVS_STATUS_PAGE_OVERLAY_HOST_FULL)
-        status = page_fold_retry_supply(request, bytes, result);
+        status = page_fold_retry_host_alloc(request, bytes, result);
 #endif
     if (status == CUVS_STATUS_OK)
     {
