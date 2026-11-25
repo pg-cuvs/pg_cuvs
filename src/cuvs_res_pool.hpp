@@ -10,6 +10,7 @@
  *   static std::unique_ptr<Stream> make_stream();             // dedicated stream
  *   static std::unique_ptr<Res> make_res(Stream *stream);     // nullptr = default
  *                                                              // (per-thread) stream
+ *   static bool stream_ready(Stream *stream) noexcept;
  * A slot destroys its Res before the Stream it was built on (member order). */
 #include <memory>
 #include <mutex>
@@ -25,12 +26,24 @@ struct CuvsResSlot {
     using Stream = typename Traits::Stream;
     std::unique_ptr<Stream> stream; /* null: --rmm-dedicated-stream off */
     std::unique_ptr<Res> res;       /* declared after stream: destroyed first */
+    std::unique_ptr<CuvsResSlot> next_retired;
+    bool stream_retired = false;
+
+    ~CuvsResSlot()
+    {
+        /* A detached request can free a buffer during daemon teardown.
+         * Retired streams keep their handle until CUDA exits, including when
+         * a stream was recycled into a healthy slot and later cleared. */
+        if (stream_retired) (void)stream.release();
+    }
 };
 
 template <class Traits>
 class CuvsResPool {
 public:
     using Slot = CuvsResSlot<Traits>;
+
+    ~CuvsResPool() { clear(); }
 
     /* Mode is fixed before the first acquisition (daemon startup flag), so
      * the pool never mixes slots with and without a dedicated stream. */
@@ -48,6 +61,7 @@ public:
     std::unique_ptr<Slot> acquire()
     {
         bool dedicated;
+        std::unique_ptr<Slot> slot;
         {
             std::lock_guard<std::mutex> lk(mutex_);
             acquired_ = true;
@@ -57,11 +71,40 @@ public:
                 free_.pop_back();
                 return slot;
             }
+            slot = take_retired_locked();
         }
-        auto slot = std::make_unique<Slot>();
-        if (dedicated) slot->stream = Traits::make_stream();
-        slot->res = Traits::make_res(slot->stream.get());
+        /* Probe one retired stream per miss, without holding the pool lock.
+         * A buffer can still free on this stream while its handles are gone. */
+        if (slot && !Traits::stream_ready(slot->stream.get()))
+            retire(std::move(slot));
+        const bool recycled = slot != nullptr;
+        if (!slot) {
+            slot = std::make_unique<Slot>();
+            if (dedicated) slot->stream = Traits::make_stream();
+        }
+        try {
+            slot->res = Traits::make_res(slot->stream.get());
+        } catch (...) {
+            if (recycled) retire(std::move(slot));
+            throw;
+        }
         return slot;
+    }
+
+    /* Failed handles never go back to the free list. Retain the dedicated
+     * stream in its existing slot so retirement needs no allocation. */
+    void retire(std::unique_ptr<Slot> slot) noexcept
+    {
+        slot->res.reset();
+        if (!slot->stream) return;
+        slot->stream_retired = true;
+        std::lock_guard<std::mutex> lk(mutex_);
+        Slot *tail = slot.get();
+        if (retired_tail_)
+            retired_tail_->next_retired = std::move(slot);
+        else
+            retired_ = std::move(slot);
+        retired_tail_ = tail;
     }
 
     /* Normal completion: keep the handles (and their descriptor caches). */
@@ -76,6 +119,7 @@ public:
     {
         std::lock_guard<std::mutex> lk(mutex_);
         free_.clear();
+        while (retired_) take_retired_locked();
     }
     void abandon() /* lost CUDA context: let the driver reclaim */
     {
@@ -88,6 +132,8 @@ public:
             }
         }
         free_.clear();
+        (void)retired_.release();
+        retired_tail_ = nullptr;
     }
     size_t free_count()
     {
@@ -96,8 +142,21 @@ public:
     }
 
 private:
+    /* Caller holds mutex_. Detach the link before destroying a slot. */
+    std::unique_ptr<Slot> take_retired_locked()
+    {
+        auto slot = std::move(retired_);
+        if (slot) {
+            retired_ = std::move(slot->next_retired);
+            if (!retired_) retired_tail_ = nullptr;
+        }
+        return slot;
+    }
+
     std::mutex mutex_;
     std::vector<std::unique_ptr<Slot>> free_;
+    std::unique_ptr<Slot> retired_;
+    Slot *retired_tail_ = nullptr;
     bool dedicated_ = CUVS_RMM_DEDICATED_STREAM_DEFAULT != 0;
     bool acquired_ = false;
 };
