@@ -370,18 +370,20 @@ scratch. Under normal operation the host allocator determines whether the
 scratch can be allocated. This applies to large results, large filters,
 concurrent requests and pinned-off mode.
 
-If a submitted pageable copy cannot be confirmed complete, the pool retains
-the affected address and closes admission to new pageable scratch on that
-GPU until the daemon restarts. Only leases admitted before the closure can
-add to the quarantine, and any scratch with no outstanding copy is released.
-Pinned-only requests and pageable requests on other GPUs can still proceed.
-A closed admission or a CPU allocation failure returns a search error
-before GPU search work starts and returns the healthy resource slot to its
-pool. Errors after GPU work starts follow the existing resource error path.
+If a submitted pageable copy cannot be confirmed complete, the wrapper
+quarantines only the affected scratch and attempts to record a CUDA event on
+the borrowing stream before the slot is returned. Later pageable requests
+on that GPU can query one pending event without synchronizing. A successful
+query releases the corresponding addresses. If event recording fails or
+the query returns an error other than not-ready, the addresses stay
+quarantined until process exit. Other requests continue to use the host
+allocator normally. A CPU allocation failure returns a search error before
+GPU search work starts and returns the healthy resource slot to its pool.
+Errors after GPU work starts follow the existing resource error path.
 
 `make test-search-staging` covers pinned budget contention, large and
-concurrent pageable requests, allocation and free failures, and quarantine
-with fake CUDA operations. Tier 2 runs
+concurrent pageable requests, allocation and free failures, and pageable
+event recovery with fake CUDA operations. Tier 2 runs
 `make test-gpu-search-staging` against native CUDA. That target checks path
 diagnostics and compares exact results and CAGRA self-match IDs and
 distances across pinned, off and over-cap modes. It checks each CAGRA

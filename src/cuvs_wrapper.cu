@@ -982,6 +982,7 @@ namespace {
  * pool. PooledRes still owns the stream, and outlives every staging lease. */
 struct SearchStageCuda {
     using Stream = cudaStream_t;
+    using Event = cudaEvent_t;
 
     static size_t pin_granularity() noexcept
     {
@@ -1006,6 +1007,7 @@ struct SearchStageCuda {
     }
 
     static void *allocate_pageable(size_t bytes) noexcept { return std::malloc(bytes); }
+    static void free_pageable(void *data) noexcept { std::free(data); }
 
     static bool free_pinned(void *data) noexcept
     {
@@ -1020,6 +1022,39 @@ struct SearchStageCuda {
     static bool wait(Stream stream) noexcept
     {
         return cudaStreamSynchronize(stream) == cudaSuccess;
+    }
+
+    static Event record_event(Stream stream) noexcept
+    {
+        Event event = nullptr;
+        if (cudaEventCreateWithFlags(&event, cudaEventDisableTiming) != cudaSuccess)
+            return nullptr;
+        if (cudaEventRecord(event, stream) == cudaSuccess)
+            return event;
+        destroy_event(event);
+        return nullptr;
+    }
+
+    static cuvs_search_staging::EventState query_event(Event event) noexcept
+    {
+        using cuvs_search_staging::EventState;
+        // Leave any error already present on the borrowing thread untouched.
+        if (cudaPeekAtLastError() != cudaSuccess)
+            return EventState::pending;
+        const cudaError_t status = cudaEventQuery(event);
+        if (status == cudaSuccess)
+            return EventState::complete;
+        if (cudaPeekAtLastError() == status)
+            (void)cudaGetLastError();
+        return status == cudaErrorNotReady ? EventState::pending : EventState::failed;
+    }
+
+    static void destroy_event(Event event) noexcept
+    {
+        const cudaError_t previous = cudaPeekAtLastError();
+        const cudaError_t status = cudaEventDestroy(event);
+        if (previous == cudaSuccess && status != cudaSuccess && cudaPeekAtLastError() == status)
+            (void)cudaGetLastError();
     }
 
     static void quarantine() noexcept

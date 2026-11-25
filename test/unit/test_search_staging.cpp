@@ -59,6 +59,8 @@ private:
 
 struct FakeCuda {
     using Stream = int;
+    using Event = int;
+    using EventState = cuvs_search_staging::EventState;
     static inline Gate allocation_gate;
     static inline Gate free_gate;
     static inline Gate pageable_gate;
@@ -73,6 +75,12 @@ struct FakeCuda {
     static inline std::atomic<int> frees{0};
     static inline int waits = 0;
     static inline int quarantines = 0;
+    static inline int events_recorded = 0;
+    static inline int events_queried = 0;
+    static inline int events_destroyed = 0;
+    static inline bool fail_event_record = false;
+    static inline EventState event_state = EventState::pending;
+    static inline std::atomic<int> pageable_frees{0};
 
     static size_t pin_granularity() { return 4096; }
 
@@ -112,6 +120,28 @@ struct FakeCuda {
         assert(stream != 0);
         ++waits;
         return idle;
+    }
+    static Event record_event(Stream stream)
+    {
+        assert(stream != 0);
+        ++events_recorded;
+        return fail_event_record ? Event{} : events_recorded;
+    }
+    static EventState query_event(Event event)
+    {
+        assert(event != 0);
+        ++events_queried;
+        return event_state;
+    }
+    static void destroy_event(Event event)
+    {
+        assert(event != 0);
+        ++events_destroyed;
+    }
+    static void free_pageable(void *data)
+    {
+        ++pageable_frees;
+        std::free(data);
     }
     static void quarantine() { ++quarantines; }
 };
@@ -284,56 +314,67 @@ void large_pageable_requests()
     FakeCuda::emulate_large_pageable = false;
 }
 
-void quarantine_closes_only_pageable_admission()
+void failed_event_record_preserves_healthy_leases()
 {
     Pool pool;
-    void *normal = nullptr;
-    const int waits = FakeCuda::waits;
-    const int quarantines = FakeCuda::quarantines;
-    try {
-        Lease lease(pool, cap, 1, region, 64, 0);
-        normal = lease.data();
-        lease.mark_pending(true);
-        throw 1;
-    } catch (int) {
-        assert(FakeCuda::waits == waits + 1);
+    FakeCuda::idle = false;
+    FakeCuda::fail_event_record = true;
+    const int queries = FakeCuda::events_queried;
+    const int frees = FakeCuda::pageable_frees;
+    {
+        Lease failed(pool, 0, 3, region, 64, 128);
+        failed.mark_pending(false, true);
     }
+    assert(FakeCuda::pageable_frees == frees + 1); // Only the unused main buffer.
+    for (int i = 0; i < 3; ++i) {
+        Lease same_gpu(pool, 0, 4, region, 64, 128);
+        assert(same_gpu.data() && same_gpu.extra());
+    }
+    assert(FakeCuda::events_queried == queries);
+    assert(FakeCuda::pageable_frees == frees + 7);
+    FakeCuda::fail_event_record = false;
+    FakeCuda::idle = true;
+}
+
+void pageable_event_recovery(cuvs_search_staging::EventState final_state)
+{
+    using EventState = cuvs_search_staging::EventState;
+    Pool pool, other_gpu;
+    const int recorded = FakeCuda::events_recorded;
+    const int queried = FakeCuda::events_queried;
+    const int destroyed = FakeCuda::events_destroyed;
+    const int waits = FakeCuda::waits;
 
     FakeCuda::idle = false;
+    FakeCuda::event_state = EventState::pending;
     {
-        Lease lease(pool, cap, 2, region, 64, 128);
-        assert(lease.data() == normal);
-        lease.mark_pending(true);
-        // The unused pageable buffer is released and admission stays open.
+        Lease failed(pool, 0, 1, region, 64, 128);
+        failed.mark_pending(false);
     }
-    auto first = std::make_unique<Lease>(pool, 0, 3, region, 64, 128);
-    Lease concurrent(pool, 0, 4, region, 64, 128);
-    assert(first->data() != concurrent.data() && first->extra() != concurrent.extra());
-    first->mark_pending(false, true);
-    first.reset();
+    assert(FakeCuda::waits == waits + 1 && FakeCuda::events_recorded == recorded + 1);
+    FakeCuda::idle = true;
+    {
+        Lease unrelated(other_gpu, 0, 2, region, 64, 0);
+        assert(unrelated.data() && FakeCuda::events_queried == queried);
+    }
+    const int frees = FakeCuda::pageable_frees;
+    {
+        Lease while_pending(pool, 0, 3, region, 64, 0);
+        assert(while_pending.data() && FakeCuda::events_queried == queried + 1);
+        assert(FakeCuda::events_destroyed == destroyed && FakeCuda::pageable_frees == frees);
+    }
 
-    for (int i = 0; i < 3; ++i) {
-        try {
-            Lease rejected(pool, 0, 5, region, 64, 0);
-            assert(false);
-        } catch (const cuvs_search_staging::PageableAllocationError &) {
-            assert(FakeCuda::quarantines == quarantines + 2);
-        }
+    FakeCuda::event_state = final_state;
+    {
+        Lease follow_up(pool, 0, 4, region, 64, 0);
+        assert(follow_up.data() && FakeCuda::events_queried == queried + 2);
+        assert(FakeCuda::events_destroyed == destroyed + 1);
+        const int reclaimed = final_state == EventState::complete ? 1 : 0;
+        assert(FakeCuda::pageable_frees == frees + 1 + reclaimed);
     }
-    try {
-        Lease rejected(pool, cap, 6, region, 64, 128);
-        assert(false);
-    } catch (const cuvs_search_staging::PageableAllocationError &) {
-    }
-    Lease pinned(pool, cap, 6, region, 64, 0);
-    assert(pinned.pinned() && pinned.data() != normal);
-    Pool other_device;
-    Lease pageable(other_device, 0, 7, region, 64, 0);
-    assert(pageable.data() && !pageable.pinned());
-
-    // A second, already admitted lease can also become unconfirmed.
-    concurrent.mark_pending(false);
-    assert(FakeCuda::waits == waits + 3);
+    Lease next(pool, 0, 5, region, 64, 0);
+    assert(next.data() && FakeCuda::events_queried == queried + 2);
+    assert(FakeCuda::waits == waits + 1);
 }
 
 void retain_only_submitted_pageable_address()
@@ -408,7 +449,9 @@ int main()
     reservations_under_contention(true);
     pageable_admission_under_contention();
     large_pageable_requests();
-    quarantine_closes_only_pageable_admission();
+    failed_event_record_preserves_healthy_leases();
+    pageable_event_recovery(cuvs_search_staging::EventState::complete);
+    pageable_event_recovery(cuvs_search_staging::EventState::failed);
     retain_only_submitted_pageable_address();
     pinned_quarantine_stays_capped();
     cpu_allocation_failure_is_recoverable();

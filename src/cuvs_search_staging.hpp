@@ -1,6 +1,7 @@
 #ifndef CUVS_SEARCH_STAGING_HPP
 #define CUVS_SEARCH_STAGING_HPP
 
+#include <atomic>
 #include <cstddef>
 #include <cstdlib>
 #include <exception>
@@ -22,9 +23,11 @@ private:
     const char *reason_;
 };
 
+enum class EventState { pending, complete, failed };
+
 /* Each device has a pinned budget for active, idle, quarantined and in-flight
  * allocations/frees. CUDA calls run outside the mutex with their full charge
- * held until settlement. Pageable admission closes on unconfirmed DMA. */
+ * held until settlement. Pageable quarantine does not restrict admission. */
 template <class Ops>
 class Pool {
 public:
@@ -38,11 +41,14 @@ public:
         void *data = nullptr;
         void *extra = nullptr;
         Pageable *next = nullptr;
+        typename Ops::Event event{};
 
         ~Pageable()
         {
-            std::free(data);
-            std::free(extra);
+            if (data)
+                Ops::free_pageable(data);
+            if (extra)
+                Ops::free_pageable(extra);
         }
     };
 
@@ -134,12 +140,7 @@ public:
     {
         if (!bytes && !extra)
             return nullptr;
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            // Allocations admitted before this latch closes may still finish.
-            if (pageable_blocked_)
-                throw PageableAllocationError("search pageable staging blocked by unconfirmed DMA");
-        }
+        reap_pageable();
         try {
             auto block = std::make_unique<Pageable>();
             block->data = allocate_pageable(bytes);
@@ -151,32 +152,80 @@ public:
     }
 
     void quarantine(Block *pinned, Pageable *pageable,
-                    bool keep_data = false, bool keep_extra = false) noexcept
+                    bool keep_data = false, bool keep_extra = false,
+                    typename Ops::Event event = {}) noexcept
     {
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            if (pinned) {
-                pinned->next = pinned_quarantine_;
-                pinned_quarantine_ = pinned;
+        if (pageable) {
+            if (!keep_data && pageable->data) {
+                Ops::free_pageable(pageable->data);
+                pageable->data = nullptr;
             }
-            if (pageable) {
-                pageable_blocked_ = true;
-                pageable->next = pageable_quarantine_;
-                pageable_quarantine_ = pageable;
+            if (!keep_extra && pageable->extra) {
+                Ops::free_pageable(pageable->extra);
+                pageable->extra = nullptr;
             }
+            pageable->event = event;
         }
-        // Neither the pool nor any other lease accesses the retained addresses.
-        if (pageable && !keep_data) {
-            std::free(pageable->data);
-            pageable->data = nullptr;
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (pinned) {
+            pinned->next = pinned_quarantine_;
+            pinned_quarantine_ = pinned;
         }
-        if (pageable && !keep_extra) {
-            std::free(pageable->extra);
-            pageable->extra = nullptr;
-        }
+        if (pageable)
+            retain_pageable(pageable);
     }
 
 private:
+    // Called under mutex_. Eventless addresses are retained until process exit.
+    void retain_pageable(Pageable *block) noexcept
+    {
+        if (!block->event) {
+            block->next = pageable_quarantine_;
+            pageable_quarantine_ = block;
+            return;
+        }
+        block->next = nullptr;
+        if (event_tail_)
+            event_tail_->next = block;
+        else
+            event_head_ = block;
+        event_tail_ = block;
+        events_pending_.store(true, std::memory_order_relaxed);
+    }
+
+    void reap_pageable() noexcept
+    {
+        if (!events_pending_.load(std::memory_order_relaxed))
+            return;
+
+        Pageable *block;
+        {
+            std::unique_lock<std::mutex> lock(mutex_, std::try_to_lock);
+            if (!lock || !event_head_)
+                return;
+            block = event_head_;
+            event_head_ = block->next;
+            if (!event_head_) {
+                event_tail_ = nullptr;
+                events_pending_.store(false, std::memory_order_relaxed);
+            }
+        }
+
+        // Probe at most one event per request. Rotate incomplete entries so
+        // a slow stream does not hide completed entries behind it.
+        const EventState status = Ops::query_event(block->event);
+        if (status != EventState::pending) {
+            Ops::destroy_event(block->event);
+            block->event = {};
+        }
+        if (status == EventState::complete) {
+            delete block;
+        } else {
+            std::lock_guard<std::mutex> lock(mutex_);
+            retain_pageable(block);
+        }
+    }
+
     static void *allocate_pageable(size_t bytes)
     {
         if (!bytes)
@@ -189,11 +238,13 @@ private:
     static constexpr size_t min_block_bytes = 256 * 1024;
     std::mutex mutex_;
     size_t pinned_charged_ = 0;
-    bool pageable_blocked_ = false;
     // Keep ownership until process exit, without CUDA calls at teardown.
     Block *idle_ = nullptr;
     Block *pinned_quarantine_ = nullptr;
     Pageable *pageable_quarantine_ = nullptr;
+    Pageable *event_head_ = nullptr;
+    Pageable *event_tail_ = nullptr;
+    std::atomic<bool> events_pending_{false};
 };
 
 class Layout {
@@ -244,9 +295,12 @@ public:
     {
         const bool pageable_pending = page_pending_ || extra_pending_;
         if ((pin_pending_ || pageable_pending) && !Ops::wait(stream_)) {
+            typename Ops::Event event{};
+            if (pageable_pending)
+                event = Ops::record_event(stream_);
             pool_.quarantine(pin_pending_ ? pinned_ : nullptr,
                              pageable_pending ? pageable_ : nullptr,
-                             page_pending_, extra_pending_);
+                             page_pending_, extra_pending_, event);
             Ops::quarantine();
             if (pin_pending_)
                 pinned_ = nullptr;
