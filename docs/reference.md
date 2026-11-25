@@ -366,18 +366,22 @@ the affected region stays charged and the pool keeps it out of circulation
 until process exit.
 
 When pinned staging cannot fit or allocate a region, search uses pageable
-scratch. Active, reserved and quarantined pageable scratch share a separate
-256 MiB budget per GPU, including oversized filter scratch. A pageable
-buffer with unconfirmed completion stays charged until process exit. If the
-pageable budget cannot admit a request or the CPU allocation fails, the
-wrapper returns a search error before GPU search work starts and returns
-the healthy resource slot to its pool. Errors after GPU work starts follow
-the existing resource error path. These budgets cover search staging
-allocations owned by the wrapper. CUDA runtime allocations, corpus uploads
-and other daemon host memory have their own accounting boundaries.
+scratch. Under normal operation the host allocator determines whether the
+scratch can be allocated. This applies to large results, large filters,
+concurrent requests and pinned-off mode.
 
-`make test-search-staging` covers budget contention, allocation and free
-failures, and quarantine with fake CUDA operations. Tier 2 runs
+If a submitted pageable copy cannot be confirmed complete, the pool retains
+the affected address and closes admission to new pageable scratch on that
+GPU until the daemon restarts. Only leases admitted before the closure can
+add to the quarantine, and any scratch with no outstanding copy is released.
+Pinned-only requests and pageable requests on other GPUs can still proceed.
+A closed admission or a CPU allocation failure returns a search error
+before GPU search work starts and returns the healthy resource slot to its
+pool. Errors after GPU work starts follow the existing resource error path.
+
+`make test-search-staging` covers pinned budget contention, large and
+concurrent pageable requests, allocation and free failures, and quarantine
+with fake CUDA operations. Tier 2 runs
 `make test-gpu-search-staging` against native CUDA. That target checks path
 diagnostics and compares exact results and CAGRA self-match IDs and
 distances across pinned, off and over-cap modes. It checks each CAGRA

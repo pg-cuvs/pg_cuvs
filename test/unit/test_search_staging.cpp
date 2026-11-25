@@ -66,6 +66,8 @@ struct FakeCuda {
     static inline bool ambiguous_alloc = false;
     static inline bool fail_free = false;
     static inline int fail_pageable_at = 0;
+    static inline bool emulate_large_pageable = false;
+    static inline size_t large_pageable_bytes = 0;
     static inline bool idle = true;
     static inline std::atomic<int> allocations{0};
     static inline std::atomic<int> frees{0};
@@ -88,6 +90,10 @@ struct FakeCuda {
         pageable_gate.pause_once();
         if (fail_pageable_at && --fail_pageable_at == 0)
             return nullptr;
+        if (emulate_large_pageable && bytes > 64) {
+            large_pageable_bytes = bytes;
+            return std::malloc(64); // Check requested size without touching a large buffer.
+        }
         return std::malloc(bytes);
     }
 
@@ -241,9 +247,9 @@ void reservations_under_contention(bool freeing)
     pool.release(block);
 }
 
-void pageable_reservation_under_contention()
+void pageable_admission_under_contention()
 {
-    Pool pool(128);
+    Pool pool;
     Gate &gate = FakeCuda::pageable_gate;
     gate.arm();
     auto first = std::async(std::launch::async, [&] {
@@ -251,27 +257,36 @@ void pageable_reservation_under_contention()
     });
     const bool entered = gate.entered();
     auto competing = std::async(std::launch::async, [&] {
-        try {
-            Lease unexpected(pool, 0, 1, region, 1, 0);
-            return false;
-        } catch (const cuvs_search_staging::PageableAllocationError &) {
-            return true;
-        }
+        Lease lease(pool, 0, 1, region, 48, 80);
+        return lease.data() && lease.extra();
     });
     const auto status = competing.wait_for(5s);
     gate.resume();
     auto *block = first.get();
-    const bool rejected = competing.get();
-    assert(entered && status == std::future_status::ready && rejected);
+    const bool admitted = competing.get();
+    assert(entered && status == std::future_status::ready && admitted);
     assert(block && block->data && block->extra);
-    pool.release_pageable(block);
-    Lease reused(pool, 0, 1, region, 128, 0);
-    assert(reused.data());
+    delete block;
 }
 
-void quarantine_and_pageable_bound()
+void large_pageable_requests()
 {
-    Pool pool(128);
+    Pool pool;
+    constexpr size_t result_bytes = size_t{16384} * 2048 * (sizeof(int64_t) + sizeof(float));
+    constexpr size_t slots = std::numeric_limits<int32_t>::max();
+    constexpr size_t filter_bytes = ((slots + 31) / 32) * sizeof(uint32_t);
+    FakeCuda::emulate_large_pageable = true;
+    Lease bf(pool, 0, 1, result_bytes, result_bytes, 0);
+    assert(!bf.pinned() && bf.data() && FakeCuda::large_pageable_bytes == result_bytes);
+    Lease filtered(pool, 0, 2, region, 64, filter_bytes);
+    assert(!filtered.pinned() && filtered.data() && filtered.extra());
+    assert(FakeCuda::large_pageable_bytes == filter_bytes);
+    FakeCuda::emulate_large_pageable = false;
+}
+
+void quarantine_closes_only_pageable_admission()
+{
+    Pool pool;
     void *normal = nullptr;
     const int waits = FakeCuda::waits;
     const int quarantines = FakeCuda::quarantines;
@@ -289,35 +304,59 @@ void quarantine_and_pageable_bound()
         Lease lease(pool, cap, 2, region, 64, 128);
         assert(lease.data() == normal);
         lease.mark_pending(true);
-        // The extra pageable buffer was not submitted and is released.
+        // The unused pageable buffer is released and admission stays open.
     }
-    {
-        Lease lease(pool, cap, 3, region, 64, 128);
-        assert(lease.pinned() && lease.data() != normal && lease.extra());
-        lease.mark_pending(false); // Only the extra buffer is quarantined.
-    }
-    assert(FakeCuda::quarantines == quarantines + 2);
-    assert(!pool.acquire(cap, cap)); // A quarantined pinned region stays charged.
+    auto first = std::make_unique<Lease>(pool, 0, 3, region, 64, 128);
+    Lease concurrent(pool, 0, 4, region, 64, 128);
+    assert(first->data() != concurrent.data() && first->extra() != concurrent.extra());
+    first->mark_pending(false, true);
+    first.reset();
 
-    Pool pageable(128);
-    for (int i = 0; i < 2; ++i) {
-        Lease lease(pageable, 0, 4, region, 32, 32);
-        assert(lease.data() && lease.extra() && !lease.pinned());
-        lease.mark_pending(false);
-    }
     for (int i = 0; i < 3; ++i) {
         try {
-            Lease rejected(pageable, 0, 5, region, 1, 0);
+            Lease rejected(pool, 0, 5, region, 64, 0);
             assert(false);
         } catch (const cuvs_search_staging::PageableAllocationError &) {
-            assert(FakeCuda::quarantines == quarantines + 4);
+            assert(FakeCuda::quarantines == quarantines + 2);
         }
     }
+    try {
+        Lease rejected(pool, cap, 6, region, 64, 128);
+        assert(false);
+    } catch (const cuvs_search_staging::PageableAllocationError &) {
+    }
+    Lease pinned(pool, cap, 6, region, 64, 0);
+    assert(pinned.pinned() && pinned.data() != normal);
+    Pool other_device;
+    Lease pageable(other_device, 0, 7, region, 64, 0);
+    assert(pageable.data() && !pageable.pinned());
 
-    Pool pinned_only;
+    // A second, already admitted lease can also become unconfirmed.
+    concurrent.mark_pending(false);
+    assert(FakeCuda::waits == waits + 3);
+}
+
+void retain_only_submitted_pageable_address()
+{
+    Pool pool;
+    auto *extra_only = pool.acquire_pageable(64, 128);
+    auto *main_only = pool.acquire_pageable(64, 128);
+    assert(extra_only && main_only);
+    const auto *extra = extra_only->extra;
+    const auto *data = main_only->data;
+    pool.quarantine(nullptr, extra_only, false, true);
+    pool.quarantine(nullptr, main_only, true, false);
+    assert(extra_only->data == nullptr && extra_only->extra == extra);
+    assert(main_only->data == data && main_only->extra == nullptr);
+}
+
+void pinned_quarantine_stays_capped()
+{
+    Pool pool;
+    FakeCuda::idle = false;
     void *addresses[4];
     for (size_t i = 0; i < 4; ++i) {
-        Lease lease(pinned_only, cap, 6, region, 64, 0);
+        Lease lease(pool, cap, 6, region, 64, 0);
         assert(lease.pinned());
         addresses[i] = lease.data();
         for (size_t previous = 0; previous < i; ++previous)
@@ -327,38 +366,16 @@ void quarantine_and_pageable_bound()
     const int pinned_calls = FakeCuda::allocations;
     const int free_calls = FakeCuda::frees;
     for (int i = 0; i < 3; ++i) {
-        Lease fallback(pinned_only, cap, 7, region, 64, 0);
+        Lease fallback(pool, cap, 7, region, 64, 0);
         assert(!fallback.pinned() && fallback.data());
     }
     assert(FakeCuda::allocations == pinned_calls && FakeCuda::frees == free_calls);
-
     FakeCuda::idle = true;
-    Pool active(128);
-    {
-        Lease busy(active, 0, 6, region, 64, 64);
-        try {
-            Lease rejected(active, 0, 7, region, 1, 0);
-            assert(false);
-        } catch (const cuvs_search_staging::PageableAllocationError &) {
-        }
-        try {
-            Lease rejected(active, region, 8, region, 64, 1);
-            assert(false);
-        } catch (const cuvs_search_staging::PageableAllocationError &) {
-        }
-        Lease pinned_available(active, region, 9, region, 64, 0);
-        assert(pinned_available.pinned()); // Failed construction returned the pinned lease.
-        busy.mark_pending(false);
-        busy.completed();
-    }
-    Lease available(active, 0, 8, region, 128, 0);
-    assert(available.data());
-    assert(FakeCuda::waits == waits + 9);
 }
 
 void cpu_allocation_failure_is_recoverable()
 {
-    Pool pool(128);
+    Pool pool;
     const int waits = FakeCuda::waits;
     for (int mode = 0; mode < 3; ++mode) {
         const size_t pin_cap = mode == 0 ? 0 : region;
@@ -389,8 +406,11 @@ int main()
     failed_free_and_ambiguous_allocation();
     reservations_under_contention(false);
     reservations_under_contention(true);
-    pageable_reservation_under_contention();
-    quarantine_and_pageable_bound();
+    pageable_admission_under_contention();
+    large_pageable_requests();
+    quarantine_closes_only_pageable_admission();
+    retain_only_submitted_pageable_address();
+    pinned_quarantine_stays_capped();
     cpu_allocation_failure_is_recoverable();
     std::puts("test_search_staging: all checks passed");
 }

@@ -1159,12 +1159,13 @@ public:
 
     void upload_filter(uint32_t *dst, const uint32_t *src)
     {
-        uint32_t *filter = offsets_.extra_bytes ? static_cast<uint32_t *>(lease_->extra())
-                                               : at<uint32_t>(offsets_.filter);
+        const bool extra = offsets_.extra_bytes != 0;
+        uint32_t *filter = extra ? static_cast<uint32_t *>(lease_->extra())
+                                 : at<uint32_t>(offsets_.filter);
         /* The daemon supplies EXCLUDE bits, and cuVS consumes INCLUDE bits. */
         for (size_t i = 0; i < words_; ++i)
             filter[i] = ~src[i];
-        copy(dst, filter, words_, !offsets_.extra_bytes && lease_->pinned());
+        copy(dst, filter, words_, !extra && lease_->pinned(), extra);
     }
 
     void sync()
@@ -1191,11 +1192,11 @@ private:
     }
 
     template <class T>
-    void copy(T *dst, const T *src, size_t count, bool pinned)
+    void copy(T *dst, const T *src, size_t count, bool pinned, bool extra = false)
     {
         if (!count)
             return;
-        lease_->mark_pending(pinned);
+        lease_->mark_pending(pinned, extra);
         raft::copy(dst, src, count, res_.get_stream());
     }
 
