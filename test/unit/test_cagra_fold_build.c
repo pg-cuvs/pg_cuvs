@@ -4,10 +4,11 @@
 #include <math.h>
 #include <stdio.h>
 
-enum { ROWS=512, ADD=32, DIM=32 };
-static float corpus[ROWS*DIM], added[ADD*DIM];
+enum { ROWS=512, ADD=32, OPT_ADD=80, DIM=32 };
+static float corpus[ROWS*DIM], added[2*OPT_ADD*DIM];
 int test_cagra_fold_early_oom(CuvsCagraIndex source, const float *added, int dim);
 int test_cagra_fold_rank_oom(CuvsCagraIndex source, const float *added, int dim);
+int test_cagra_fold_optimized(CuvsCagraIndex source, const float *added, int count, int dim);
 
 static int in_range(CuvsCagraIndex index, const float *query, int64_t rows)
 {
@@ -25,7 +26,7 @@ int main(void)
     int passed=0;
     for (int i=0; i<ROWS*DIM; ++i)
         corpus[i]=sinf(i*.041f)+cosf(i*.037f);
-    for (int i=0; i<ADD*DIM; ++i)
+    for (int i=0; i<2*OPT_ADD*DIM; ++i)
         added[i]=sinf(i*.051f)+cosf(i*.113f);
     CuvsCagraIndex base=cuvs_cagra_build(corpus,ROWS,DIM,CUVS_METRIC_L2,64,128,
                                       CUVS_CAGRA_BUILD_AUTO,0,CUVS_LW_OVERFLOW_ERROR,NULL);
@@ -34,6 +35,8 @@ int main(void)
         goto done;
     if (CUVS_EXPECT_GPU_FOLD && (!test_cagra_fold_early_oom(base, added, DIM) ||
                                 !test_cagra_fold_rank_oom(base, added, DIM) || !in_range(base, corpus, ROWS)))
+        goto done;
+    if (CUVS_EXPECT_GPU_FOLD && !test_cagra_fold_optimized(base, added, OPT_ADD, DIM))
         goto done;
     CuvsCagraFoldStatus status=cuvs_cagra_fold_reuse(base,added,ADD,DIM,0,&next);
     if (CUVS_EXPECT_GPU_FOLD) {

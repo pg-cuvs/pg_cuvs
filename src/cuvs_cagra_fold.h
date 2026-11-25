@@ -1,6 +1,7 @@
 #pragma once
 
 #include "cuvs_wrapper.h"
+#include <stdbool.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -16,12 +17,35 @@ typedef enum CuvsCagraFoldStatus {
     CUVS_CAGRA_FOLD_YIELDED = 6
 } CuvsCagraFoldStatus;
 
+typedef struct CuvsCagraFoldPhases {
+    uint64_t input_us;
+    uint64_t dataset_us;
+    uint64_t graph_setup_us;
+    uint64_t incoming_us;
+    uint64_t search_us;
+    uint64_t rank_us;
+    uint64_t reverse_us;
+    uint64_t scatter_us;
+    uint64_t final_graph_us;
+    bool host_graph_cache_hit;
+} CuvsCagraFoldPhases;
+
 typedef struct CuvsCagraFoldControl {
     int (*should_yield)(void *context);
     void *context;
     /* Replace any unfilled row with this verified slot in the old graph. */
     const unsigned char *filled_rows;
     uint32_t placeholder_slot;
+    bool optimized;
+    /* Optional accumulator, initialized by the caller. May add stream fences. */
+    CuvsCagraFoldPhases *phases;
+    /* Optimized calls may borrow a host graph of (old + new) * degree entries.
+     * Pass a cached device pointer only when the host prefix belongs to the
+     * exact immutable source generation and shape. The fold overwrites the
+     * host buffer even on failure. Only OK writes the output device pointer. */
+    uint32_t *host_graph;
+    const void *cached_device_graph;
+    const void **result_device_graph;
 } CuvsCagraFoldControl;
 
 typedef struct CuvsCagraFoldShape {

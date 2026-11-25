@@ -1,11 +1,14 @@
 """Exercise the native, manually launched page-fold product path on Linux.
 
-Use a disposable PostgreSQL installation with the opt-in extension installed,
-and pg_cuvs_server_test so the first COMMITTED delivery can be dropped.
+Use a disposable PostgreSQL installation with the native fold extension.
+The existing ACK-loss case requires pg_cuvs_server_test. The batch cases and
+the original-graph case also work with the production daemon. Run the latter
+on an A100 with the matching cuVS SDK, whose AUTO selects SINGLE_CTA for
+512 queries at itopk_size=64.
 """
 
 import argparse
-import os
+from itertools import groupby
 from pathlib import Path
 import re
 import select
@@ -14,8 +17,17 @@ import subprocess
 import tempfile
 import time
 
-from run import Cluster, fold_query, fold_raw_page
+from run import ROOT, Cluster, fold_query, fold_raw_page
 from fold_gate_log import publication_windows, read_records, requests_from
+
+
+BATCH_INDEX = "fold_batch_cagra"
+BASE_ROWS = 512
+BATCH_ROWS = 64
+PENDING_ROWS = 105
+CACHE_BATCH_ROWS = 16
+CACHE_HOST_BUDGET = 256 << 10
+DAEMON_FOLD_ENV = ("CUVS_PAGE_FOLD_BATCH_ROWS", "CUVS_PAGE_FOLD_PROFILE", "CUVS_FAULT_PAGE_FOLD_ACK_ONCE")
 
 
 def compact(cluster, db, index, label):
@@ -318,24 +330,384 @@ def check_low_host_budget(cluster):
         raise RuntimeError(f"host-budget refusal changed fold state or was not reported: {output}")
 
 
+def batch_fixture(cluster):
+    cluster.sql("postgres", "batch-setup", "-c", f"""
+        CREATE EXTENSION vector;
+        CREATE EXTENSION pg_cuvs;
+        CREATE EXTENSION pageinspect;
+        CREATE TABLE fold_batch(id integer PRIMARY KEY, v vector(32));
+        INSERT INTO fold_batch
+            SELECT i, array_fill(i::real, ARRAY[32])::vector
+            FROM generate_series(1,{BASE_ROWS}) i;
+        CREATE INDEX {BATCH_INDEX} ON fold_batch USING cagra(v vector_l2_ops);
+    """)
+    oid = fold_query(cluster, "postgres", "batch-index-oid", f"SELECT '{BATCH_INDEX}'::regclass::oid")
+    meta = batch_meta(cluster)
+    index_nonce, base, graph, *counts = meta
+    if not index_nonce or not base or base != graph or counts != [BASE_ROWS, 0, BASE_ROWS]:
+        raise RuntimeError(f"expected a {BASE_ROWS}-row base graph without folds, got {meta}")
+    return oid, meta
+
+
+def batch_meta(cluster, index=BATCH_INDEX):
+    return struct.unpack_from("=6Q", fold_raw_page(cluster, "postgres", 0, index), 48)
+
+
+def batch_insert(cluster, previous, total):
+    cluster.sql("postgres", f"batch-insert-{total}", "-c", f"""
+        INSERT INTO fold_batch
+            SELECT i, array_fill(i::real, ARRAY[32])::vector
+            FROM generate_series({BASE_ROWS + previous + 1},{BASE_ROWS + total}) i;
+    """)
+
+
+def batch_compact(cluster, label, notice, *, index=BATCH_INDEX):
+    output = compact(cluster, "postgres", index, label)
+    notices = [line.removeprefix("NOTICE:").strip() for line in output.splitlines()
+               if line.startswith("NOTICE:")]
+    if notice not in notices:
+        raise RuntimeError(f"{label}: expected {notice!r}, got {output}")
+
+
+def wait_for_offer(daemon, log_path, oid, ordinal, positions):
+    deadline = time.monotonic() + 60
+    while time.monotonic() < deadline and daemon.poll() is None:
+        offers = [r for r in read_records([log_path])["page_fold"]
+                  if r["index"] == oid and r["status"] == "0" and r["offered"] == "1"]
+        if len(offers) >= ordinal:
+            offer = offers[ordinal - 1]
+            actual = int(offer["positions"])
+            if actual != positions:
+                raise RuntimeError(f"offer {ordinal}: expected {positions} positions, got {actual}")
+            return offer
+        time.sleep(0.05)
+    raise RuntimeError(f"offer {ordinal} for index {oid} was not produced: {log_path}")
+
+
+def publish_batch(cluster, log_path, oid, before, positions, *, index=BATCH_INDEX):
+    index_nonce, base_nonce, graph, slots, folded, base_slots = before
+    label = "batch-publish" if index == BATCH_INDEX else f"{index}-publish"
+    batch_compact(cluster, f"{label}-{folded + positions}", "CAGRA fold published", index=index)
+    after = batch_meta(cluster, index)
+    new_graph = after[2]
+    expected = (index_nonce, base_nonce, new_graph, slots + positions, folded + positions, base_slots)
+    if new_graph in (0, graph, base_nonce) or after != expected:
+        raise RuntimeError(f"{positions}-position fold produced unexpected metapage {after}, from {before}")
+
+    commits = [r for r in read_records([log_path])["page_fold_commit"]
+               if r["index"] == oid and int(r["graph_nonce"]) == new_graph]
+    if [(int(r["positions"]), int(r["folded"])) for r in commits] != [(positions, folded + positions)]:
+        raise RuntimeError(f"daemon did not commit the published generation {new_graph}: {commits}")
+    return after
+
+
+def check_batch_policy(cluster, daemon, log_path, limit):
+    oid, initial = batch_fixture(cluster)
+
+    small = 65
+    if not limit:
+        # Supply an ineligible backlog first, then cross the old threshold on
+        # the same graph. The later publication witnesses a working producer.
+        batch_insert(cluster, 0, small)
+        batch_compact(cluster, "batch-supply-small", "CAGRA pending rows supplied or already queued")
+        deadline = time.monotonic() + 1
+        while time.monotonic() < deadline and daemon.poll() is None:
+            starts = read_records([log_path])["page_fold_begin"]
+            if any(r["index"] == oid for r in starts):
+                raise RuntimeError(f"default policy started folding only {small} pending positions")
+            time.sleep(0.05)
+        batch_compact(cluster, "batch-still-small", "CAGRA pending rows supplied or already queued")
+        if batch_meta(cluster) != initial:
+            raise RuntimeError("the default policy published a sub-threshold batch")
+        batch_insert(cluster, small, PENDING_ROWS)
+        expected_sizes = (PENDING_ROWS,)
+    else:
+        batch_insert(cluster, 0, PENDING_ROWS)
+        expected_sizes = (limit, PENDING_ROWS - limit)
+
+    batch_compact(cluster, "batch-supply-all", "CAGRA pending rows supplied or already queued")
+    meta = initial
+    for ordinal, positions in enumerate(expected_sizes, start=1):
+        wait_for_offer(daemon, log_path, oid, ordinal, positions)
+        if batch_meta(cluster) != meta:
+            raise RuntimeError("the daemon offer changed the metapage before pg_cuvs_compact")
+        # The second offer consumes the retained suffix without adding rows or
+        # issuing another supply call, even though it is below both thresholds.
+        meta = publish_batch(cluster, log_path, oid, meta, positions)
+    batch_compact(cluster, "batch-drained", "no eligible CAGRA pending rows to fold")
+    if batch_meta(cluster) != meta:
+        raise RuntimeError("compacting an empty suffix changed the graph generation")
+    if not limit and any(r["index"] == oid and int(r["positions"]) == small
+                         for r in read_records([log_path])["page_fold_begin"]):
+        raise RuntimeError(f"default policy started folding only {small} pending positions")
+    print(f"PASS native fold batch policy ({limit=}, publications={expected_sizes})")
+
+
+def build_original_graph_probe(cluster):
+    work = cluster.data.parent
+    probe = work / "original-graph.c"
+    probe.write_text(r"""
+#include <inttypes.h>
+#include <math.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "cuvs_ipc.h"
+
+int main(int argc, char **argv)
+{
+    enum { NQ = 512, DIM = 32, K = 10 };
+    float queries[NQ][DIM];
+    CuvsResult answers[NQ * K];
+    int count = 0;
+    uint32_t latency;
+
+    if (argc != 10 && argc != 12)
+        return 2;
+    const int check_sample = argc == 12;
+    const float sample_value = check_sample ? strtof(argv[11], NULL) : 0.0f;
+    const uint64_t folded = check_sample ? strtoull(argv[10], NULL, 10) : 0;
+    CuvsPageSearchRequest request = {
+        .length = sizeof(request),
+        .system_identifier = strtoull(argv[4], NULL, 10),
+        .index_nonce = strtoull(argv[5], NULL, 10),
+        .base_nonce = strtoull(argv[6], NULL, 10),
+        .graph_nonce = strtoull(argv[7], NULL, 10),
+        .n_slots = strtoull(argv[8], NULL, 10),
+        .folded = folded,
+        .tail = folded,
+    };
+    for (int q = 0; q < NQ; ++q)
+        for (int d = 0; d < DIM; ++d)
+            queries[q][d] = check_sample ? sample_value : (float) (q + 1);
+    int status = cuvs_ipc_search_pages(argv[1], strtoul(argv[2], NULL, 10),
+        strtoul(argv[3], NULL, 10), &request, &queries[0][0], NQ, DIM, K,
+        CUVS_METRIC_L2, check_sample ? 512 : 64, 1, 0, 0, 0, NULL, 0, answers, &count, &latency);
+    printf("status=%d count=%d\n", status, count);
+    if (strcmp(argv[9], "retired") == 0)
+        return status == CUVS_STATUS_NOT_FOUND ? 0 : 1;
+    if (status != CUVS_STATUS_OK || count != NQ * K)
+        return 1;
+    int sample_hits = 0;
+    for (int i = 0; i < count; ++i) {
+        if (answers[i].tid >= request.n_slots || !isfinite(answers[i].distance))
+            return 1;
+        if (check_sample && answers[i].tid == request.n_slots - 1 && answers[i].distance == 0.0f)
+            ++sample_hits;
+        printf("%d %" PRIu64 " %a\n", i / K, answers[i].tid, (double) answers[i].distance);
+    }
+    if (check_sample && !sample_hits) {
+        fputs("published dead slot did not match the live suffix vector\n", stderr);
+        return 1;
+    }
+    return 0;
+}
+""")
+    binary = work / "original-graph-probe"
+    src = ROOT / "src"
+    cluster.run("cc", ["-std=gnu11", "-O2", "-I", src, "-o", binary, probe,
+                       src / "cuvs_ipc.c", src / "cuvs_util.c", src / "cuvs_build_corpus.c",
+                       "-lm", "-lpthread", "-lrt"], "build-original-graph-probe")
+    return binary
+
+
+def check_original_graph(cluster, daemon, log_path):
+    probe = build_original_graph_probe(cluster)
+    oid, original = batch_fixture(cluster)
+    db_oid, sysid = fold_query(cluster, "postgres", "original-graph-identity", """
+        SELECT (SELECT oid FROM pg_database WHERE datname = current_database()), system_identifier
+        FROM pg_control_system();
+    """).split("|")
+    keys = [cluster.socket, db_oid, oid, sysid, *original[:4]]
+
+    def search(label, state="live"):
+        cluster.run(probe, [*keys, state], label)
+        path = cluster.logs / f"{cluster.data.parent.name}-{label}.log"
+        return path.read_text().splitlines()[2:]
+
+    before = search("parent-before-supply")
+    batch_insert(cluster, 0, BATCH_ROWS)
+    batch_compact(cluster, "parent-supply", "CAGRA pending rows supplied or already queued")
+    wait_for_offer(daemon, log_path, oid, 1, BATCH_ROWS)
+    if batch_meta(cluster) != original:
+        raise RuntimeError("the graph changed before the original-generation comparison")
+
+    # Both base-only IPC requests select the same physical generation and
+    # omit the pending overlay. SQL cannot select this old GPU handle after
+    # the worker commits the new generation.
+    after = search("parent-after-offer")
+
+    # Preserve rank and distance. Normalize only candidate order within ties.
+    def with_ties_sorted(rows):
+        return [sorted(tied) for _, tied in groupby(map(str.split, rows), lambda row: (row[0], row[2]))]
+
+    if with_ties_sorted(before) != with_ties_sorted(after):
+        raise RuntimeError("original graph CAGRA results changed after the daemon offered the candidate")
+
+    publish_batch(cluster, log_path, oid, original, BATCH_ROWS)
+    search("parent-after-commit", "retired")
+    print("PASS native fold original generation before publication and retirement after COMMITTED")
+
+
+def check_dead_head_batch(cluster, daemon, log_path):
+    db = "postgres"
+    probe = build_original_graph_probe(cluster)
+    oid, initial = batch_fixture(cluster)
+    batch_insert(cluster, 0, 2)
+    cluster.sql(db, "dead-head-delete", "-c", f"DELETE FROM fold_batch WHERE id <= {BASE_ROWS + 1}")
+    cluster.sql(db, "dead-head-vacuum", "-c", "VACUUM (INDEX_CLEANUP ON, TRUNCATE OFF) fold_batch")
+
+    vacuumed = fold_raw_page(cluster, db, 0, BATCH_INDEX)
+    slots_block, = struct.unpack_from("=I", vacuumed, 160)
+    pending_block, = struct.unpack_from("=I", vacuumed, 112)
+    dead_tid = struct.pack("=3H", 65535, 65535, 0)
+    slots_page = fold_raw_page(cluster, db, slots_block, BATCH_INDEX)
+    pending_page = fold_raw_page(cluster, db, pending_block, BATCH_INDEX)
+    first_slot = 24 + BASE_ROWS * len(dead_tid)
+    hi, lo, off = struct.unpack_from("=3H", pending_page, 30)
+    suffix_tid = fold_query(cluster, db, "dead-head-suffix-tid",
+                            f"SELECT ctid FROM fold_batch WHERE id = {BASE_ROWS + 2}")
+    if (struct.unpack_from("=6Q", vacuumed, 48) != initial or
+            struct.unpack_from("=Q", vacuumed, 104)[0] != BASE_ROWS or
+            slots_page[24:first_slot] != dead_tid * BASE_ROWS or
+            pending_page[24:30] != dead_tid or suffix_tid != f"({(hi << 16) | lo},{off})"):
+        raise RuntimeError("fixture must retain only a live suffix behind the physically dead head and base")
+
+    # Both marks are supplied together. The first offer has no live slot in
+    # its batch or base, so the producer can use the retained live suffix.
+    batch_compact(cluster, "dead-head-supply", "CAGRA pending rows supplied or already queued")
+    wait_for_offer(daemon, log_path, oid, 1, 1)
+    head = publish_batch(cluster, log_path, oid, initial, 1)
+    slots_page = fold_raw_page(cluster, db, slots_block, BATCH_INDEX)
+    if (struct.unpack_from("=Q", fold_raw_page(cluster, db, 0, BATCH_INDEX), 104)[0] != BASE_ROWS + 1 or
+            slots_page[first_slot:first_slot + 6] != dead_tid):
+        raise RuntimeError("the first published position must retain its invalid TID and increment dead_slots")
+
+    # Query the published GPU generation before the suffix is published.
+    # Search the stored graph alone so the pending vector cannot score zero
+    # through the overlay in place of the newly published dead slot.
+    db_oid, sysid = fold_query(cluster, db, "dead-head-identity", """
+        SELECT (SELECT oid FROM pg_database WHERE datname = current_database()), system_identifier
+        FROM pg_control_system();
+    """).split("|")
+    cluster.run(probe, [cluster.socket, db_oid, oid, sysid, *head[:4], "sample", head[4], BASE_ROWS + 2],
+                "dead-head-gpu-sample")
+
+    # The live sample is still pending and its own TID must land in slot 513.
+    wait_for_offer(daemon, log_path, oid, 2, 1)
+    publish_batch(cluster, log_path, oid, head, 1)
+    slots_page = fold_raw_page(cluster, db, slots_block, BATCH_INDEX)
+    if (struct.unpack_from("=Q", fold_raw_page(cluster, db, 0, BATCH_INDEX), 104)[0] != BASE_ROWS + 1 or
+            slots_page[first_slot:first_slot + 12] != dead_tid + pending_page[30:36]):
+        raise RuntimeError("the live suffix fold did not preserve both independently published TIDs")
+    print("PASS native fold dead head with no live base and a retained live suffix")
+
+
+def check_idle_cache_pressure(cluster, daemon, log_path):
+    db = "postgres"
+    first_oid, first = batch_fixture(cluster)
+    second_index = "fold_pressure_cagra"
+    # The first graph retains >= 544 * 64 * 4 = 139264 bytes. The second
+    # supply needs 1200 * (8 + 32 * 4) = 163200 bytes plus its chunk header.
+    # Each fits 256 KiB on its own; their sum cannot fit. An 8-degree second
+    # graph keeps its own fold mirror small enough to fit with its overlay.
+    cluster.sql(db, "cache-pressure-setup", "-c", f"""
+        CREATE TABLE fold_pressure (LIKE fold_batch);
+        INSERT INTO fold_pressure SELECT * FROM fold_batch;
+        CREATE INDEX {second_index} ON fold_pressure USING cagra(v vector_l2_ops) WITH (graph_degree=8);
+        INSERT INTO fold_pressure
+            SELECT i, array_fill(i::real, ARRAY[32])::vector
+            FROM generate_series({BASE_ROWS + 1},{BASE_ROWS + 1200}) i;
+    """)
+    second_oid = fold_query(cluster, db, "cache-pressure-oid", f"SELECT '{second_index}'::regclass::oid")
+    second = batch_meta(cluster, second_index)
+
+    batch_insert(cluster, 0, 2 * CACHE_BATCH_ROWS)
+    batch_compact(cluster, "cache-prime-supply", "CAGRA pending rows supplied or already queued")
+    wait_for_offer(daemon, log_path, first_oid, 1, CACHE_BATCH_ROWS)
+    first = publish_batch(cluster, log_path, first_oid, first, CACHE_BATCH_ROWS)
+    offer = wait_for_offer(daemon, log_path, first_oid, 2, CACHE_BATCH_ROWS)
+    # Both clocks are CLOCK_MONOTONIC on Linux. Measure from the daemon's
+    # completion, which starts the 30-second expiry, not from log readback.
+    deadline = int(offer["mono_us"]) / 1_000_000 + 25
+    publish_batch(cluster, log_path, first_oid, first, CACHE_BATCH_ROWS)
+    phase = (rf"\[page_fold_phases\] gpu=0 db=\d+ index={first_oid} positions={CACHE_BATCH_ROWS} "
+             r"status=0 offered=1 [^\n]*host_graph_cache_hit=([01])\n")
+    hits = []
+    while time.monotonic() < deadline and daemon.poll() is None:
+        hits = re.findall(phase, log_path.read_text())
+        if len(hits) >= 2:
+            break
+        time.sleep(0.05)
+    if hits != ["0", "1"]:
+        raise RuntimeError(f"first index did not reuse a retained host graph before pressure: {hits}")
+
+    batch_compact(cluster, "cache-pressure-supply", "CAGRA pending rows supplied or already queued",
+                  index=second_index)
+    if time.monotonic() >= deadline:
+        raise RuntimeError("second supply did not finish inside the cache-expiry control window")
+    wait_for_offer(daemon, log_path, second_oid, 1, CACHE_BATCH_ROWS)
+    publish_batch(cluster, log_path, second_oid, second, CACHE_BATCH_ROWS, index=second_index)
+    print("PASS native fold reclaimed the first index's idle host graph during the second supply")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("pg_config", type=Path)
     parser.add_argument("daemon", type=Path)
     parser.add_argument("logs", type=Path)
+    batch_limits = {"batch-unset": None, "batch-zero": 0, "batch-64": BATCH_ROWS,
+                    "original-graph": BATCH_ROWS, "batch-dead-head": 1,
+                    "cache-pressure": CACHE_BATCH_ROWS}
+    parser.add_argument("--case", choices=("existing", *batch_limits), default="existing")
     args = parser.parse_args()
     args.logs.mkdir(parents=True, exist_ok=True)
+    logs = args.logs.resolve()
     bindir = subprocess.check_output([args.pg_config, "--bindir"], text=True).strip()
-    os.environ["CUVS_FAULT_PAGE_FOLD_ACK_ONCE"] = "1"
     with tempfile.TemporaryDirectory(prefix="fold-product-", dir="/tmp") as work:
-        cluster = Cluster(Path(work) / "native", bindir, args.logs.resolve())
+        if args.case != "existing":
+            limit = batch_limits[args.case]
+            cluster = Cluster(Path(work) / args.case, bindir, logs)
+            for key in DAEMON_FOLD_ENV:
+                cluster.env.pop(key, None)
+            cluster.start()
+            try:
+                if limit is not None:
+                    cluster.env["CUVS_PAGE_FOLD_BATCH_ROWS"] = str(limit)
+                host_budget = 128 << 20
+                if args.case == "cache-pressure":
+                    cluster.env["CUVS_PAGE_FOLD_PROFILE"] = "1"
+                    host_budget = CACHE_HOST_BUDGET
+                with cluster.daemon(args.daemon.resolve(), args.case, overlay_host_bytes=host_budget) as daemon:
+                    for key in DAEMON_FOLD_ENV:
+                        cluster.env.pop(key, None)
+                    log_path = logs / f"daemon-{args.case}.log"
+                    if args.case == "original-graph":
+                        check_original_graph(cluster, daemon, log_path)
+                    elif args.case == "batch-dead-head":
+                        check_dead_head_batch(cluster, daemon, log_path)
+                    elif args.case == "cache-pressure":
+                        check_idle_cache_pressure(cluster, daemon, log_path)
+                    else:
+                        check_batch_policy(cluster, daemon, log_path, limit)
+            finally:
+                cluster.stop()
+            return
+
+        cluster = Cluster(Path(work) / "native", bindir, logs)
+        for key in DAEMON_FOLD_ENV:
+            cluster.env.pop(key, None)
+        cluster.env["CUVS_FAULT_PAGE_FOLD_ACK_ONCE"] = "1"
         with cluster.daemon(args.daemon.resolve(), "fold-product", overlay_host_bytes=128 << 20) as daemon:
             cluster.start()
             try:
-                check(cluster, args.logs.resolve(), daemon)
+                check(cluster, logs, daemon)
             finally:
                 cluster.stop()
-        limited = Cluster(Path(work) / "limited", bindir, args.logs.resolve())
+        limited = Cluster(Path(work) / "limited", bindir, logs)
+        for key in DAEMON_FOLD_ENV:
+            limited.env.pop(key, None)
         with limited.daemon(args.daemon.resolve(), "fold-low-budget", overlay_host_bytes=1):
             limited.start()
             try:

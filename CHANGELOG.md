@@ -12,6 +12,11 @@ exists for 0.9.0.
 
 ### Added
 
+- Native experimental page-format CAGRA folding accepts
+  `CUVS_PAGE_FOLD_BATCH_ROWS` to cap each fold and allow small pending
+  prefixes. A positive limit enables the optimized fold implementation
+  and the default is `0`. `CUVS_PAGE_FOLD_PROFILE=1` logs per-phase fold
+  timings.
 - Experimental page-format CAGRA scans can reuse the daemon's pending rows
   with `cuvs.page_resident_search=on`. `cuvs.resident_supply=on` enables
   background supply on builds with native page-format folding. Both settings
