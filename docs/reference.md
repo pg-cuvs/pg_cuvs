@@ -596,11 +596,15 @@ force exact heap search.
 
 | Reloption | Type | Default | Values | Notes |
 |-----------|------|---------|--------|-------|
-| `source` | string | `` | a `cagra` index name on the same table | empty = private direct HNSW file build from the heap (op23), without a persistent CAGRA index |
+| `source` | string | `` | a legacy `cagra` index name on the same table | empty = private direct HNSW file build from the heap (op23), without a persistent CAGRA index |
 | `mode` | string | `nsw` | `nsw`, `hnswlib`, `hnsw`, `hnswlib_file` | `nsw` and `hnswlib` are recommended. With `source`, `nsw` and `hnsw` give the same graph: level 0 from the CAGRA graph and upper layers built by the daemon on the host. Since 0.9.3 this path checks the pgvector version as the heap build does (outside the supported range is an error, not a warning) |
 | `m` | int | `16` | 2–100 | **informational** — the CAGRA graph degree drives the HNSW layout, not `m` |
-| `ef_construction` | int | `64` | 4–1000 | Direct heap build: construction effort; source reuse: informational |
+| `ef_construction` | int | `64` | 4–1000 | Sets construction effort for direct heap builds. The build records the configured value in the index metapage. A conversion from a legacy CAGRA index uses the option only for that metapage value during the build. |
 | `build_algo` | enum | `auto` | `auto`, `ivf_pq`, `nn_descent`, `ace` | Direct heap build only; cannot be combined with explicit `source` |
+
+For later inserts, pgvector reads `ef_construction` from the index reloption.
+`ALTER INDEX … SET (ef_construction = …)` changes that option for subsequent
+inserts. The value recorded in the metapage is refreshed by `REINDEX`.
 
 For direct heap construction, `auto` uses tiny exact GPU construction below 16 rows and
 otherwise the resident IVF-PQ route while its estimate fits the host and GPU budgets.
@@ -629,9 +633,9 @@ certain AR0 (estimated final size over the per-GPU limit, unsharded) before its 
 when statistics exist.
 Explicit `ace` consumes the matching patched SDK/planner and a private disk workdir.
 `nn_descent` requests a resident NN-descent base graph and never falls back to another
-builder. It rejects fewer than 16 rows, an effective intermediate degree above 1024,
-nonfinite inputs and inputs whose conservative FP32 distance bound overflows. Its
-base dtype is FP32 when dim <= 16, any element exceeds half range, or the resident
+builder. It rejects fewer than 16 rows, nonfinite inputs and inputs whose conservative
+FP32 distance bound overflows. The build applies the SDK's intermediate width limit of
+1024 and the row-count adjustment before the NN-descent capacity check. Its base dtype is FP32 when dim <= 16, any element exceeds half range, or the resident
 IVF-PQ norm bound reaches 65504 (4 x max\|x\|^2 for L2, max\|x\|^2 for inner product and
 cosine), because the SDK's FP16 path mixes FP32 norms with half dot products; otherwise FP16.
 Because the SDK computes L2 as ||a||^2 + ||b||^2 - 2a.b in float32 on both paths, L2 builds
@@ -664,13 +668,19 @@ tablespace needs a further `n × dim × 4` bytes for the input spool. The `[hnsw
 line then has `status=5` and still names the decided route (`route=none` only when no
 route was decided, such as an over-budget refusal).
 
-`m` remains informational. Direct `ef_construction` scales intermediate degree from128,
-hierarchy construction effort from200, and ACE effort from240 at the default64 (ACE: the
-`--hnsw-ace-build-quality auto` rule, 20 NN-descent iterations per partition at 64);
-receipts record the consumed/clamped values. ACE indexes also record a partition-builder
-readback (`ace_build_quality`, `ace_local_intermediate_degree` = 3 × (graph_degree / 2),
+`m` remains informational. With the default `ef_construction = 64`, direct builds use
+a planned intermediate width of 128 before the row-count adjustment, and an
+hnswlib serialization EF of 200. The tiny route uses its own graph width. The
+`hierarchy_ef_construction` receipt field reports the value read from that serialized
+file. The GPU upper-graph builder takes its neighbors and budgets through the SDK.
+Heap builds cap the intermediate width at the SDK limit of 1024. A build that reaches that ceiling
+with a higher requested width issues a NOTICE. Under `--hnsw-ace-build-quality auto`,
+the default ACE effort is 240 (20 NN-descent iterations per small partition with
+cuVS 26.04). ACE indexes also record a partition-builder
+readback computed from the pinned SDK policy (`ace_build_quality`, `ace_local_intermediate_degree` = 3 × (graph_degree / 2),
 `ace_local_nn_descent_iterations`); the receipt's `intermediate_degree` is the resident width
 and the ACE memory-plan input, not the width ACE partitions build and optimize with.
+The readback reports a configured iteration limit. The SDK logs describe individual partitions.
 `ace_partitions` is the effective partition count (`ace_partitions_origin` =
 `same_SDK_stable_explicit_plan`) when pg_cuvs was built with `CUVS_SDK_SOURCE_INCLUDE`. Built
 without it, an ACE build still runs on the patched SDK but records the requested count:

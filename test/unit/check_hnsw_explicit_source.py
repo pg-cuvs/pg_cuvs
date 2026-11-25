@@ -15,6 +15,9 @@ BASELINE = ROOT / 'test/unit/fixtures/hnsw_build_file.42f8a43d.cu.txt'
 # removed before the token comparison; any other change still fails
 # NATIVE_EXECUTION_BODY_CHANGED.
 APPROVED_NATIVE_DELTAS = [
+    ('cp.intermediate_graph_degree = intermediate;',
+     'receipt.intermediate = (uint32_t) cp.intermediate_graph_degree;',
+     'record the intermediate width in the parameters sent to the graph builder'),
     ('if (cuvs_hnsw_owner_cancelled(owner_fd)) return CUVS_STATUS_CANCELED;',
      'resources.fence_check();',
      'fence review B1 (8b64728): a RAFT host free whose request-stream wait failed '
