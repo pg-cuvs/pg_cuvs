@@ -2293,6 +2293,14 @@ cuvs_cagra_deserialize(const char *path, int dim, int device_id)
     }
 }
 
+extern "C" int
+cuvs_cagra_graph_degree(CuvsCagraIndex index)
+{
+    if (!index)
+        return 0;
+    return (int) static_cast<const CuvsCagraIndexImpl *>(index)->idx.graph_degree();
+}
+
 /* ----------------------------------------------------------------
  * CAGRA index free
  * ---------------------------------------------------------------- */

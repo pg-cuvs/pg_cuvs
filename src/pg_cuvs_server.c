@@ -13389,6 +13389,7 @@ handle_compact(int client_fd, const CuvsCmdFrame *cmd)
     if (strcmp(save_dir, g_index_dir) != 0)
         e->extra_search_default_dir = 0;
     int ivfpq_retry = 0;
+    const int width_before = cuvs_cagra_graph_degree(e->handle);
     /* #261: rebuild with the index's own graph degrees. The backend sends its
      * reloptions in the BUILD fields; a frame without them (0) keeps the
      * resident graph's width (cuvs_cagra_compact). */
@@ -13449,7 +13450,10 @@ handle_compact(int client_fd, const CuvsCmdFrame *cmd)
     e->n_extended       = 0;
     e->compact_count++;
     e->last_compact_at  = time(NULL);
-    if (cmd->graph_degree > 0)
+    const int width_after = cuvs_cagra_graph_degree(new_handle);
+    if (width_after > 0)
+        e->graph_degree = width_after;
+    else if (cmd->graph_degree > 0)
         e->graph_degree = (int)cmd->graph_degree;
     e->vram_bytes  = estimate_vram_bytes(new_n, (int)e->dim, e->graph_degree);
 
@@ -13478,11 +13482,15 @@ handle_compact(int client_fd, const CuvsCmdFrame *cmd)
 
     pthread_mutex_unlock(&g_index_mutex);
 
-    LOG_INFO("[handle_compact] %u/%u: compact OK, %lld vecs remaining\n",
-             cmd->db_oid, cmd->index_oid, (long long)new_n);
+    LOG_INFO("[handle_compact] %u/%u: compact OK, %lld vecs remaining, graph width %d -> %d\n",
+             cmd->db_oid, cmd->index_oid, (long long)new_n, width_before, width_after);
 
     CuvsReplyHeader ok = {0};
     ok.status = CUVS_STATUS_OK;
+    /* The graph width before and after this compaction (0 = unknown); the
+     * backend reports a change or a kept width (cuvs_ipc_compact). */
+    ok.latency_us = width_before > 0 ? (uint32_t)width_before : 0;
+    ok.n_results  = width_after > 0 ? (uint32_t)width_after : 0;
     if (compact_notice[0])
         cuvs_notice_append(ok.notice_out, sizeof(ok.notice_out), compact_notice, "");
     send_foreground_reply(client_fd, &ok);

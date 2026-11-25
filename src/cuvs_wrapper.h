@@ -309,6 +309,9 @@ int cuvs_cagra_search_filtered(
 
 void cuvs_cagra_free(CuvsCagraIndex index, int device_id);
 
+/* Width (graph_degree) of the index's graph; 0 if unknown. Host metadata only. */
+int cuvs_cagra_graph_degree(CuvsCagraIndex index);
+
 /* 3Q: Extend a CAGRA index in-place with n_new additional vectors.
  * new_vecs: row-major float32 [n_new × dim] on host.
  * max_chunk_size: 0 = auto (cagra::extend_params.max_chunk_size).
