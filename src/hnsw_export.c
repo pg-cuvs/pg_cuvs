@@ -37,6 +37,7 @@
 #include "access/genam.h"
 #include "access/heapam.h"
 #include "catalog/pg_attribute.h"  /* Form_pg_attribute, ATTNUM */
+#include "catalog/pg_cast.h"
 #include "catalog/pg_class.h"
 #include "catalog/pg_index.h"      /* Anum_pg_index_indclass */
 #include "catalog/pg_opclass.h"    /* Form_pg_opclass, CLAOID */
@@ -62,6 +63,7 @@
 #include "libpq/pqsignal.h"
 #include "nodes/pg_list.h"       /* list_make1 */
 #include "nodes/parsenodes.h"    /* DefElem */
+#include "nodes/makefuncs.h"
 #include "access/genam.h"        /* GetSysCacheOid3 */
 #include "access/table.h"        /* table_open/table_close (pgvector version guard) */
 #include "access/stratnum.h"     /* BTEqualStrategyNumber */
@@ -85,10 +87,12 @@
 
 #include "cuvs_ipc.h"
 #include "cuvs_util.h"
+#include "cuvs_hnsw_source.h"
 #include "cuvs_hnsw_build.h"
 #include "hnsw_export.h"
 #include "cuvs_hnsw_scan.h"
 #include "storage/buffile.h"
+#include "storage/fd.h"
 
 /* GUC declared in pg_cuvs.c — socket path for daemon IPC */
 extern char *cuvs_socket_path;
@@ -683,7 +687,8 @@ typedef struct HnswNodeAddress
 _Static_assert(sizeof(HnswNodeAddress) <= sizeof(HnswNodeLocation),
                "HNSW address template must fit in one location-table page");
 
-typedef void (*HnswInterruptCheck)(void);
+/* The callback owns the two scratch allocations only if it throws. */
+typedef void (*HnswInterruptCheck)(int *links, void *window_buffer);
 typedef bool (*HnswLocationWriter)(void *arg, uint64_t node,
                                    const HnswNodeLocation *location,
                                    char *error, size_t error_size);
@@ -1158,7 +1163,7 @@ hnsw_file_preflight(int hnsw_fd, int tids_fd,
         uint64_t *chunk_tids = (uint64_t *)crc_buffer;
 
         if (check_interrupts)
-            check_interrupts();
+            check_interrupts(links, window_buffer);
         if (!hnsw_pread_exact(tids_fd, crc_buffer, chunk, tids_offset))
         {
             hnsw_set_file_error(error, error_size,
@@ -1285,7 +1290,7 @@ hnsw_file_preflight(int hnsw_fd, int tids_fd,
         size_t label;
 
         if (check_interrupts)
-            check_interrupts();
+            check_interrupts(links, window_buffer);
         if (hnsw_mul_u64(node, h.sizeDataPerElement, &row_offset) &&
             hnsw_add_u64(HNSWLIB_HEADER_BYTES, row_offset, &base))
             hnsw_window_reserve(&window, base, h.sizeDataPerElement);
@@ -1339,7 +1344,7 @@ hnsw_file_preflight(int hnsw_fd, int tids_fd,
         HnswNodeLocation location;
 
         if (check_interrupts)
-            check_interrupts();
+            check_interrupts(links, window_buffer);
         if (file_cursor > (uint64_t)hs.st_size ||
             (uint64_t)hs.st_size - file_cursor < sizeof(list_bytes) ||
             !hnsw_window_read(&window, &list_bytes, sizeof(list_bytes), file_cursor))
@@ -1445,23 +1450,6 @@ done:
     free(window_buffer);
     free(links);
     return ok;
-}
-
-/* ----------------------------------------------------------------
- * External GUCs declared in pg_cuvs.c
- * ---------------------------------------------------------------- */
-extern char *cuvs_index_dir;
-
-/* Forward declaration of get_index_dir from pg_cuvs.c — we replicate the
- * logic here to avoid exposing it as a public symbol. */
-static const char *
-hnsw_get_index_dir(void)
-{
-    static char buf[1024];
-    if (cuvs_index_dir && cuvs_index_dir[0] != '\0')
-        return cuvs_index_dir;
-    snprintf(buf, sizeof(buf), "%s/cuvs_indexes", DataDir);
-    return buf;
 }
 
 /* ----------------------------------------------------------------
@@ -1608,6 +1596,13 @@ free_elem_descs(ElemDesc *elems, size_t n, size_t maxM0)
  * PG_TRY/PG_FINALLY wrappers below run hnsw_fill_res_free() on both the
  * success and the error path.
  * ---------------------------------------------------------------- */
+typedef enum HnswSourceTidResult
+{
+    HNSW_SOURCE_TIDS_UNIQUE,
+    HNSW_SOURCE_TIDS_REDUNDANT,
+    HNSW_SOURCE_TIDS_CONFLICTING
+} HnswSourceTidResult;
+
 typedef struct HnswFillRes
 {
     FILE     *hf;           /* .hnsw sidecar */
@@ -1622,6 +1617,7 @@ typedef struct HnswFillRes
     int      *cand_buf;     /* heuristic candidate scratch */
     int       shm_fd;       /* #165: SCM_RIGHTS sidecar fd (-1 = none) */
     int       tids_fd;      /* EXPORT_HNSW_UPPER TID memfd (-1 = none) */
+    HnswSourceTidResult tid_result;
 } HnswFillRes;
 
 /*
@@ -2058,6 +2054,226 @@ hnsw_report_source_m(int requested_m, int actual_m)
                         actual_m, requested_m)));
 }
 
+typedef struct HnswTidMember
+{
+    uint64_t tid;
+    uint32_t label;
+} HnswTidMember;
+
+static int
+hnsw_compare_tid_member(const void *a, const void *b)
+{
+    uint64_t x = ((const HnswTidMember *) a)->tid;
+    uint64_t y = ((const HnswTidMember *) b)->tid;
+
+    return (x > y) - (x < y);
+}
+
+/* Keep original graph labels in the sorted copy. The common heap-order
+ * source needs neither sorting nor vector reads. */
+static HnswTidMember *
+hnsw_duplicate_members(const uint64_t *tids, size_t n)
+{
+    HnswTidMember *members;
+    size_t i;
+
+    if (n < 2)
+        return NULL;
+    for (i = 1; i < n && tids[i - 1] < tids[i]; i++)
+        ;
+    if (i == n)
+        return NULL;
+    if (n > CUVS_TIDS_MAX_VECS)
+        ereport(ERROR, (errmsg("pg_cuvs: exported CAGRA TID count is out of range")));
+    members = palloc_extended(n * sizeof(*members), MCXT_ALLOC_HUGE);
+    for (i = 0; i < n; i++)
+    {
+        members[i].tid = tids[i];
+        members[i].label = (uint32_t) i;
+    }
+    qsort(members, n, sizeof(*members), hnsw_compare_tid_member);
+    for (i = 1; i < n && members[i - 1].tid != members[i].tid; i++)
+        ;
+    if (i < n)
+        return members;
+    pfree(members);
+    return NULL;
+}
+
+static bool
+hnsw_source_vectors_equal(const float *a, const float *b, uint32_t dim)
+{
+    if (memcmp(a, b, (size_t) dim * sizeof(*a)) == 0)
+        return true;
+    for (uint32_t i = 0; i < dim; i++)
+        if (a[i] != b[i])
+            return false;
+    return true;
+}
+
+static HnswSourceTidResult
+hnsw_array_tid_result(const uint64_t *tids, const float *vecs, size_t n, uint32_t dim)
+{
+    HnswTidMember *members = hnsw_duplicate_members(tids, n);
+    HnswSourceTidResult result = HNSW_SOURCE_TIDS_REDUNDANT;
+
+    if (members == NULL)
+        return HNSW_SOURCE_TIDS_UNIQUE;
+    for (size_t i = 1; i < n; i++)
+        if (members[i - 1].tid == members[i].tid &&
+            !hnsw_source_vectors_equal(vecs + (size_t) members[i - 1].label * dim,
+                                       vecs + (size_t) members[i].label * dim, dim))
+        {
+            result = HNSW_SOURCE_TIDS_CONFLICTING;
+            break;
+        }
+    pfree(members);
+    return result;
+}
+
+static void
+hnsw_pg_check_interrupts(int *links, void *window_buffer)
+{
+    if (!INTERRUPTS_PENDING_CONDITION())
+        return;
+
+    PG_TRY();
+    {
+        CHECK_FOR_INTERRUPTS();
+    }
+    PG_CATCH();
+    {
+        free(window_buffer);
+        free(links);
+        PG_RE_THROW();
+    }
+    PG_END_TRY();
+}
+
+static HnswSourceTidResult
+hnsw_file_tid_result(int graph_fd, int tids_fd, const uint64_t *tids,
+                     const CuvsTidsHeader *tids_header, int bytes_per_dim)
+{
+    size_t n = (size_t) tids_header->n_vecs;
+    uint32_t dim = tids_header->dim;
+    HnswTidMember *members = hnsw_duplicate_members(tids, n);
+    HnswlibHeader header;
+    char error[160];
+    HnswReadWindow window;
+    void *window_buffer;
+    uint32_t *row_for_label;
+    float *a, *b;
+    size_t vector_bytes;
+    HnswSourceTidResult result = HNSW_SOURCE_TIDS_REDUNDANT;
+
+    if (members == NULL)
+        return HNSW_SOURCE_TIDS_UNIQUE;
+    if (!hnsw_file_preflight(graph_fd, tids_fd, n, dim, tids_header->metric,
+                             bytes_per_dim, false, &header, NULL, NULL, NULL,
+                             hnsw_pg_check_interrupts, error, sizeof(error)))
+        ereport(ERROR, (errmsg("pg_cuvs: cannot validate duplicate source entries: %s", error)));
+
+    /* Level-0 rows need not be in label order. Validate the label mapping
+     * and only compare vectors in duplicate TID groups. */
+    row_for_label = palloc_extended(n * sizeof(*row_for_label), MCXT_ALLOC_HUGE);
+    memset(row_for_label, 0xff, n * sizeof(*row_for_label));
+    window_buffer = palloc(HNSW_READ_WINDOW_BYTES);
+    hnsw_window_init(&window, graph_fd, window_buffer, HNSW_READ_WINDOW_BYTES);
+    for (size_t node = 0; node < n; node++)
+    {
+        uint64_t offset = HNSWLIB_HEADER_BYTES +
+                          (uint64_t) node * header.sizeDataPerElement + header.labelOffset;
+        size_t label;
+
+        CHECK_FOR_INTERRUPTS();
+        if (!hnsw_window_read(&window, &label, sizeof(label), offset) ||
+            label >= n || row_for_label[label] != UINT32_MAX)
+            ereport(ERROR, (errmsg("pg_cuvs: invalid source graph label mapping")));
+        row_for_label[label] = (uint32_t) node;
+    }
+
+    vector_bytes = (size_t) dim * sizeof(float);
+    a = palloc(vector_bytes);
+    b = palloc(vector_bytes);
+    for (size_t i = 1; i < n; i++)
+    {
+        if (members[i - 1].tid != members[i].tid)
+            continue;
+        CHECK_FOR_INTERRUPTS();
+        uint64_t offset_a = HNSWLIB_HEADER_BYTES + header.offsetData +
+            (uint64_t) row_for_label[members[i - 1].label] * header.sizeDataPerElement;
+        uint64_t offset_b = HNSWLIB_HEADER_BYTES + header.offsetData +
+            (uint64_t) row_for_label[members[i].label] * header.sizeDataPerElement;
+        if (!hnsw_pread_exact(graph_fd, a, vector_bytes, offset_a) ||
+            !hnsw_pread_exact(graph_fd, b, vector_bytes, offset_b))
+            ereport(ERROR, (errmsg("pg_cuvs: cannot read duplicate source vectors")));
+        if (!hnsw_source_vectors_equal(a, b, dim))
+        {
+            result = HNSW_SOURCE_TIDS_CONFLICTING;
+            break;
+        }
+    }
+    pfree(a);
+    pfree(b);
+    pfree(window_buffer);
+    pfree(row_for_label);
+    pfree(members);
+    return result;
+}
+
+static void
+hnsw_check_exported_tids(HnswFillRes *res, int bytes_per_dim)
+{
+    FILE *file = hnsw_open_stream("exported CAGRA TIDs", res->tids_fd);
+    CuvsTidsHeader header;
+    int rc;
+
+    if (file == NULL)
+        ereport(ERROR, (errmsg("pg_cuvs: cannot open exported CAGRA TIDs: %m")));
+    rc = cuvs_tids_read(file, &header, &res->tids);
+    fclose(file);
+    if (rc != 0)
+        ereport(ERROR, (errmsg("pg_cuvs: invalid exported CAGRA TIDs")));
+    res->tid_result = hnsw_file_tid_result(res->shm_fd, res->tids_fd, res->tids,
+                                          &header, bytes_per_dim);
+    free(res->tids);
+    res->tids = NULL;
+}
+
+static void
+hnsw_reject_conflicting_source_tids(void)
+{
+    ereport(ERROR,
+            (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+             errmsg("pg_cuvs: source CAGRA index has duplicate heap TIDs with different vectors"),
+             errhint("REINDEX the source CAGRA index before converting it, or build the HNSW index from the heap.")));
+}
+
+static bool
+hnsw_source_binding_cancel_pending(void)
+{
+    return QueryCancelPending || ProcDiePending;
+}
+
+static bool
+hnsw_source_binding_matches(const char *graph_path, FILE *graph, FILE *tids)
+{
+    char path[1056];
+    CuvsHnswSourceBinding recorded;
+    FILE *file;
+    bool found;
+
+    snprintf(path, sizeof(path), "%s%s", graph_path, CUVS_HNSW_SOURCE_SUFFIX);
+    file = AllocateFile(path, PG_BINARY_R);
+    if (file == NULL)
+        return false;
+    found = cuvs_hnsw_source_binding_read(file, fileno(graph), fileno(tids),
+                                         &recorded, hnsw_source_binding_cancel_pending);
+    FreeFile(file);
+    CHECK_FOR_INTERRUPTS();
+    return found;
+}
+
 /* Internal helper: fill an existing HNSW index from hnswlib sidecar.
  * Called by pg_cuvs_build_hnsw() for modes 'hnswlib' and 'hnswlib_file'.
  * use_shm=true  → daemon runs from_cagra() → /dev/shm (no disk I/O)
@@ -2086,6 +2302,7 @@ fill_hnsw_from_hnswlib_impl(Oid cagra_oid, Oid hnsw_oid, bool use_shm,
 
     uint32_t db_oid    = (uint32_t)MyDatabaseId;
     uint32_t index_oid = (uint32_t)cagra_oid;
+    const char *idir   = pstrdup(cuvs_resolve_index_dir_rel(cagra_rel));
 
     /* Infer dim from the index tuple descriptor (atttypmod on the first attr). */
     int dim = 0;
@@ -2185,7 +2402,6 @@ fill_hnsw_from_hnswlib_impl(Oid cagra_oid, Oid hnsw_oid, bool use_shm,
     /* ---- 2. Build sidecar paths ---- */
     char hnsw_path[1024];
     char tids_path[1024];
-    const char *idir = hnsw_get_index_dir();
 
     if (use_shm)
     {
@@ -2194,7 +2410,7 @@ fill_hnsw_from_hnswlib_impl(Oid cagra_oid, Oid hnsw_oid, bool use_shm,
             ereport(ERROR, (errmsg("pg_cuvs: daemon socket not set")));
         int shm_rc = cuvs_ipc_export_hnsw_shm(
             cuvs_socket_path, db_oid, index_oid, hnsw_path, sizeof(hnsw_path),
-            &res->shm_fd);
+            &res->shm_fd, &res->tids_fd);
         if (shm_rc != CUVS_STATUS_OK)
         {
             cuvs_report_proto_mismatch(shm_rc);
@@ -2202,8 +2418,7 @@ fill_hnsw_from_hnswlib_impl(Oid cagra_oid, Oid hnsw_oid, bool use_shm,
                     (errmsg("pg_cuvs: export_hnsw_shm failed (status=%d); "
                             "ensure cagra index %u is loaded in daemon", shm_rc, cagra_oid)));
         }
-        /* .tids comes from the regular index_dir sidecar */
-        snprintf(tids_path, sizeof(tids_path), "%s/%u_%u.tids", idir, db_oid, index_oid);
+        snprintf(tids_path, sizeof(tids_path), "exported CAGRA TIDs");
     }
     else
     {
@@ -2218,6 +2433,50 @@ fill_hnsw_from_hnswlib_impl(Oid cagra_oid, Oid hnsw_oid, bool use_shm,
                 (errmsg("pg_cuvs: cannot open .hnsw sidecar \"%s\": %m",
                         hnsw_path)));
     res->hf = hf;
+
+    /* Read the matching TID file before parsing the graph. */
+    FILE *tf = use_shm ? hnsw_open_stream(tids_path, res->tids_fd)
+                      : AllocateFile(tids_path, PG_BINARY_R);
+    if (!tf)
+    {
+        ereport(ERROR,
+                (errmsg("pg_cuvs: cannot open .tids sidecar \"%s\": %m",
+                        tids_path)));
+    }
+
+    if (!use_shm && !hnsw_source_binding_matches(hnsw_path, hf, tf))
+    {
+        FreeFile(tf);
+        ereport(ERROR,
+                (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+                 errmsg("pg_cuvs: hnswlib_file sidecar has no matching CAGRA generation binding"),
+                 errhint("Use mode 'nsw' to convert the current CAGRA graph, or REINDEX the source with cuvs.cpu_hnsw_fallback enabled. "
+                         "If CREATE INDEX CONCURRENTLY left an invalid target index, drop that index before retrying.")));
+    }
+
+    CuvsTidsHeader tids_hdr;
+    uint64_t *tids = NULL;
+
+    PG_TRY();
+    {
+        if (cuvs_tids_read(tf, &tids_hdr, &tids) != 0)
+            ereport(ERROR,
+                    (errmsg("pg_cuvs: failed to read/validate .tids sidecar \"%s\"",
+                            tids_path)));
+        res->tids = tids;
+        res->tid_result = hnsw_file_tid_result(fileno(hf), fileno(tf), tids,
+                                               &tids_hdr, bytes_per_dim);
+    }
+    PG_FINALLY();
+    {
+        if (use_shm)
+            fclose(tf);
+        else
+            FreeFile(tf);
+    }
+    PG_END_TRY();
+    if (res->tid_result != HNSW_SOURCE_TIDS_UNIQUE)
+        return;
 
     HnswlibHeader hdr;
     memset(&hdr, 0, sizeof(hdr));
@@ -2257,32 +2516,13 @@ fill_hnsw_from_hnswlib_impl(Oid cagra_oid, Oid hnsw_oid, bool use_shm,
 
     hnsw_report_source_m(source_m, M);
 
-    /* ---- 4. Read .tids sidecar ---- */
-    FILE *tf = fopen(tids_path, "rb");
-    if (!tf)
+    if ((size_t)tids_hdr.n_vecs != N)
     {
         ereport(ERROR,
-                (errmsg("pg_cuvs: cannot open .tids sidecar \"%s\": %m",
-                        tids_path)));
-    }
-
-    CuvsTidsHeader tids_hdr;
-    uint64_t      *tids = NULL;
-    if (cuvs_tids_read(tf, &tids_hdr, &tids) != 0)
-    {
-        fclose(tf);
-        ereport(ERROR,
-                (errmsg("pg_cuvs: failed to read/validate .tids sidecar \"%s\"",
-                        tids_path)));
-    }
-    fclose(tf);
-    res->tids = tids;
-
-    if ((size_t)tids_hdr.n_vecs < N)
-    {
-        ereport(ERROR,
-                (errmsg("pg_cuvs: .tids has %lld entries but .hnsw has %zu elements",
-                        (long long)tids_hdr.n_vecs, N)));
+                (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+                 errmsg("pg_cuvs: .tids has %lld entries but .hnsw has %zu elements",
+                        (long long)tids_hdr.n_vecs, N),
+                 errhint("Build the HNSW index from the heap, or use mode 'nsw' to convert the resident CAGRA graph.")));
     }
 
     /* ---- 4b. Metric (opclass) compatibility check ---- */
@@ -2683,7 +2923,7 @@ fill_hnsw_from_hnswlib_impl(Oid cagra_oid, Oid hnsw_oid, bool use_shm,
  * skips the return entirely — no stale-value case to guard against. */
 static size_t
 fill_hnsw_from_hnswlib(Oid cagra_oid, Oid hnsw_oid, bool use_shm,
-                      int source_m, uint16_t metapage_ef)
+                      int source_m, uint16_t metapage_ef, HnswSourceTidResult *tid_result)
 {
     /*
      * #166 review 3: `res` is written inside PG_TRY (through the pointer the
@@ -2706,6 +2946,7 @@ fill_hnsw_from_hnswlib(Oid cagra_oid, Oid hnsw_oid, bool use_shm,
         hnsw_fill_res_free((HnswFillRes *) &res);
     }
     PG_END_TRY();
+    *tid_result = res.tid_result;
     return res.n_elems;
 }
 
@@ -3088,12 +3329,6 @@ hnsw_location_table_address_lookup(void *arg, uint32_t node,
     address->elem_blkno = location.elem_blkno;
     address->elem_offno = location.elem_offno;
     return true;
-}
-
-static void
-hnsw_pg_check_interrupts(void)
-{
-    CHECK_FOR_INTERRUPTS();
 }
 
 static void
@@ -3991,6 +4226,9 @@ fill_hnsw_from_cagra_ipc_impl(Oid cagra_oid, Oid hnsw_oid, const char *mode,
             build.n_vecs  = up_n;
             build.dim     = (uint32_t) up_dim;
             build.metric  = tgt_metric;
+            hnsw_check_exported_tids(res, bytes_per_dim);
+            if (res->tid_result != HNSW_SOURCE_TIDS_UNIQUE)
+                return;
             target = index_open(hnsw_oid, AccessExclusiveLock);
             hnsw_import_build_result(target, &build, false, 0, source_m, metapage_ef);
             index_close(target, AccessExclusiveLock);
@@ -4043,6 +4281,9 @@ fill_hnsw_from_cagra_ipc_impl(Oid cagra_oid, Oid hnsw_oid, const char *mode,
     res->adj  = adj;
     res->vecs = vecs;
     res->tids = tids;
+    res->tid_result = hnsw_array_tid_result(tids, vecs, N, (uint32_t) ipc_dim);
+    if (res->tid_result != HNSW_SOURCE_TIDS_UNIQUE)
+        return;
 
     /* Metric mismatch check */
     if (src_metric != tgt_metric)
@@ -4300,7 +4541,7 @@ fill_hnsw_from_cagra_ipc_impl(Oid cagra_oid, Oid hnsw_oid, const char *mode,
  * fill_hnsw_from_hnswlib(). */
 static size_t
 fill_hnsw_from_cagra_ipc(Oid cagra_oid, Oid hnsw_oid, const char *mode,
-                        int source_m, uint16_t metapage_ef)
+                        int source_m, uint16_t metapage_ef, HnswSourceTidResult *tid_result)
 {
     /* #166 review 3: volatile across the longjmp — see fill_hnsw_from_hnswlib. */
     volatile HnswFillRes res;
@@ -4318,14 +4559,25 @@ fill_hnsw_from_cagra_ipc(Oid cagra_oid, Oid hnsw_oid, const char *mode,
         hnsw_fill_res_free((HnswFillRes *) &res);
     }
     PG_END_TRY();
+    *tid_result = res.tid_result;
     return res.n_elems;
+}
+
+static size_t
+hnsw_fill_source(Oid source, Oid target, const char *mode, int source_m,
+                 uint16_t metapage_ef, HnswSourceTidResult *tid_result)
+{
+    if (strcmp(mode, "nsw") == 0 || strcmp(mode, "hnsw") == 0)
+        return fill_hnsw_from_cagra_ipc(source, target, mode, source_m, metapage_ef, tid_result);
+    return fill_hnsw_from_hnswlib(source, target, strcmp(mode, "hnswlib") == 0,
+                                  source_m, metapage_ef, tid_result);
 }
 
 /* ================================================================
  * pg_cuvs_build_hnsw — unified GPU import: creates HNSW WITHOUT CPU build.
  *
- * Uses INDEX_CREATE_SKIP_BUILD so pgvector's CPU ambuild() is never called.
- * The 285s CPU HNSW build is eliminated entirely.
+ * Creates the target with INDEX_CREATE_SKIP_BUILD. Import normally populates
+ * it directly. Redundant source entries require an ordinary heap build.
  *
  * Usage: SELECT pg_cuvs_build_hnsw('my_cagra'::regclass, 'hnsw');
  * Returns: OID of the newly created HNSW index (regclass).
@@ -4391,35 +4643,17 @@ cagra_index_metric(Oid cagra_oid)
 
 /* ---- create empty HNSW on parent table, no CPU build ---- */
 static Oid
-create_empty_hnsw(Oid cagra_oid)
+create_empty_hnsw(Relation heap_rel, Relation cagra_rel)
 {
-    HeapTuple ix_tup = SearchSysCache1(INDEXRELID, ObjectIdGetDatum(cagra_oid));
-    if (!HeapTupleIsValid(ix_tup))
-        ereport(ERROR, (errmsg("pg_cuvs: CAGRA index %u not found", cagra_oid)));
-    Oid heap_oid = ((Form_pg_index) GETSTRUCT(ix_tup))->indrelid;
-    ReleaseSysCache(ix_tup);
-
-    if (!object_ownercheck(RelationRelationId, heap_oid, GetUserId()))
-        aclcheck_error(ACLCHECK_NOT_OWNER, OBJECT_TABLE,
-                       get_rel_name(heap_oid));
-
+    Oid      cagra_oid    = RelationGetRelid(cagra_rel);
     uint32_t metric       = cagra_index_metric(cagra_oid);
     Oid      hnsw_opclass = find_hnsw_opclass_oid(metric);
-
-    Relation heap_rel  = table_open(heap_oid, ShareLock);
-    Relation cagra_rel = index_open(cagra_oid, AccessShareLock);
-
-    AttrNumber col_attnum = cagra_rel->rd_index->indkey.values[0];
-    Form_pg_attribute att = TupleDescAttr(heap_rel->rd_att, col_attnum - 1);
+    Form_pg_attribute att = TupleDescAttr(RelationGetDescr(cagra_rel), 0);
     char  *col_name  = pstrdup(NameStr(att->attname));
-    Oid    collation = att->attcollation;
+    Oid    collation = cagra_rel->rd_indcollation[0];
     int16  coloption = 0;
 
     IndexInfo *iinfo = BuildIndexInfo(cagra_rel);
-    iinfo->ii_Predicate      = NIL;
-    iinfo->ii_PredicateState = NULL;
-
-    index_close(cagra_rel, AccessShareLock);
 
     /* Include a sequence so multiple calls with the same CAGRA produce unique names. */
     static int hnsw_build_seq = 0;
@@ -4453,7 +4687,6 @@ create_empty_hnsw(Oid cagra_oid)
         true,                 /* is_internal */
         NULL);                /* constraintId */
 
-    table_close(heap_rel, ShareLock);
     CommandCounterIncrement();
     return hnsw_oid;
 }
@@ -4471,6 +4704,169 @@ hnsw_require_legacy_cagra_source(Relation source)
 #endif
 }
 
+/* A pending file with a valid empty header contains no work. Treat missing
+ * files as empty, but refuse files whose emptiness cannot be established. */
+static bool
+hnsw_pending_file_empty(const char *stem,
+                        const char *suffix)
+{
+    char path[MAXPGPATH];
+    struct stat st;
+    FILE *file;
+    bool empty = false;
+
+    if (snprintf(path, sizeof(path), "%s.%s", stem, suffix) >= sizeof(path))
+        ereport(ERROR, (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+                        errmsg("pg_cuvs: CAGRA source path is too long")));
+    file = AllocateFile(path, PG_BINARY_R);
+    if (file == NULL && errno == ENOENT)
+        return true;
+    if (file != NULL)
+    {
+        if (fstat(fileno(file), &st) == 0 && S_ISREG(st.st_mode))
+        {
+            if (strcmp(suffix, "delta") == 0)
+            {
+                CuvsDeltaHeader header;
+                empty = st.st_size == sizeof(header) &&
+                    cuvs_delta_read_header(file, &header) == 0 &&
+                    cuvs_delta_validate(&header, 0) == 0;
+            }
+            else
+            {
+                CuvsTombstoneHeader header;
+                empty = st.st_size == sizeof(header) &&
+                    cuvs_tombstone_read_header(file, &header) == 0 &&
+                    cuvs_tombstone_validate(&header, 0) == 0;
+            }
+        }
+        FreeFile(file);
+    }
+    return empty;
+}
+
+static const char *
+hnsw_cagra_source_problem(Relation source, Relation heap)
+{
+    char stem[MAXPGPATH];
+    char path[MAXPGPATH];
+    struct stat st;
+    FILE *file;
+    uint32 heap_rfn, table_oid;
+    bool same_heap;
+
+    hnsw_require_legacy_cagra_source(source);
+    if (!source->rd_index->indisvalid || !source->rd_index->indislive)
+        return "is not valid";
+
+    if ((size_t) snprintf(stem, sizeof(stem), "%s/%u_%u",
+                          cuvs_resolve_index_dir_rel(source), MyDatabaseId,
+                          RelationGetRelid(source)) > sizeof(path) - sizeof(".relfilenode"))
+        ereport(ERROR, (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+                        errmsg("pg_cuvs: CAGRA source path is too long")));
+    snprintf(path, sizeof(path), "%s.stale", stem);
+    if (stat(path, &st) == 0)
+        return "is stale";
+    if (errno != ENOENT)
+        return "has an unreadable stale marker";
+
+    /* The sidecar describes the heap whose TIDs were exported by CAGRA.
+     * VACUUM FULL and CLUSTER can rebuild the HNSW target before CAGRA. */
+    snprintf(path, sizeof(path), "%s.relfilenode", stem);
+    file = AllocateFile(path, PG_BINARY_R);
+    same_heap = file != NULL &&
+        fscanf(file, "%u %u", &heap_rfn, &table_oid) == 2 &&
+        table_oid == RelationGetRelid(heap) && heap_rfn == heap->rd_rel->relfilenode;
+    if (file != NULL)
+        FreeFile(file);
+    if (!same_heap)
+        return "does not match the current heap generation";
+
+    if (!hnsw_pending_file_empty(stem, "delta"))
+        return "has pending inserts or an unreadable delta file";
+    if (!hnsw_pending_file_empty(stem, "tombstone"))
+        return "has pending deletes or an unreadable tombstone file";
+    return NULL;
+}
+
+static void
+hnsw_report_source_problem(Relation source, const char *problem)
+{
+    ereport(ERROR,
+            (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+             errmsg("pg_cuvs: source CAGRA index \"%s\" %s",
+                    RelationGetRelationName(source), problem),
+             errhint("REINDEX the source CAGRA index before converting it, or build the HNSW index from the heap.")));
+}
+
+static bool
+hnsw_file_source_available(Relation source)
+{
+    const char *dir = cuvs_resolve_index_dir_rel(source);
+    char graph_path[MAXPGPATH];
+    char tids_path[MAXPGPATH];
+    FILE *graph;
+    FILE *tids;
+    bool available;
+
+    if ((size_t) snprintf(graph_path, sizeof(graph_path), "%s/%u_%u.hnsw",
+                          dir, MyDatabaseId, RelationGetRelid(source)) >= sizeof(graph_path) ||
+        (size_t) snprintf(tids_path, sizeof(tids_path), "%s/%u_%u.tids",
+                          dir, MyDatabaseId, RelationGetRelid(source)) >= sizeof(tids_path))
+        return false;
+    graph = AllocateFile(graph_path, PG_BINARY_R);
+    tids = AllocateFile(tids_path, PG_BINARY_R);
+    available = graph != NULL && tids != NULL &&
+                hnsw_source_binding_matches(graph_path, graph, tids);
+    if (graph != NULL)
+        FreeFile(graph);
+    if (tids != NULL)
+        FreeFile(tids);
+    return available;
+}
+
+/* The existing vector -> halfvec import applies the pgvector cast in the
+ * page writer. Keep that conversion when it wraps exactly the source key. */
+static bool
+hnsw_source_key_matches(Relation source, Relation target)
+{
+    AttrNumber src_attno = source->rd_index->indkey.values[0];
+    AttrNumber dst_attno = target->rd_index->indkey.values[0];
+    List *src_exprs = RelationGetIndexExpressions(source);
+    List *dst_exprs = RelationGetIndexExpressions(target);
+    Form_pg_attribute src = TupleDescAttr(RelationGetDescr(source), 0);
+    Form_pg_attribute dst = TupleDescAttr(RelationGetDescr(target), 0);
+    FuncExpr *cast;
+    HeapTuple cast_tuple;
+    Oid cast_function;
+    Node *source_key;
+
+    if (src_attno == dst_attno && equal(src_exprs, dst_exprs))
+        return true;
+    if (dst_attno != 0 || list_length(dst_exprs) != 1 ||
+        !IsA(linitial(dst_exprs), FuncExpr) ||
+        bytes_per_dim_for_typid(dst->atttypid) != 2 ||
+        src->atttypmod != dst->atttypmod)
+        return false;
+
+    cast = linitial_node(FuncExpr, dst_exprs);
+    cast_tuple = SearchSysCache2(CASTSOURCETARGET,
+                                ObjectIdGetDatum(src->atttypid),
+                                ObjectIdGetDatum(dst->atttypid));
+    if (!HeapTupleIsValid(cast_tuple))
+        return false;
+    cast_function = ((Form_pg_cast) GETSTRUCT(cast_tuple))->castfunc;
+    ReleaseSysCache(cast_tuple);
+    if (cast->funcid != cast_function || cast->args == NIL)
+        return false;
+
+    source_key = src_attno != 0
+        ? (Node *) makeVar(1, src_attno, src->atttypid, src->atttypmod,
+                          src->attcollation, 0)
+        : linitial(src_exprs);
+    return equal(source_key, linitial(cast->args));
+}
+
 PG_FUNCTION_INFO_V1(pg_cuvs_build_hnsw);
 Datum
 pg_cuvs_build_hnsw(PG_FUNCTION_ARGS)
@@ -4478,6 +4874,12 @@ pg_cuvs_build_hnsw(PG_FUNCTION_ARGS)
     Oid         cagra_oid = PG_GETARG_OID(0);
     const char *mode = (PG_NARGS() >= 2 && !PG_ARGISNULL(1)) ?
                        text_to_cstring(PG_GETARG_TEXT_PP(1)) : "nsw";
+    Oid heap_oid = IndexGetRelation(cagra_oid, false);
+    Relation heap_rel;
+    Relation cagra_rel;
+    int graph_degree;
+    int dim;
+    Oid hnsw_oid;
 
     /* Phase 3K (ADR-038): the function form is deprecated in favor of the
      * CREATE INDEX ... USING pg_cuvs_hnsw DDL, which integrates with the
@@ -4502,27 +4904,23 @@ pg_cuvs_build_hnsw(PG_FUNCTION_ARGS)
      * rd_options to CuvsCagraOptions, so a non-cagra argument here would
      * read that AM's option struct at CuvsCagraOptions's field offsets
      * instead of failing with a clear "not a cagra index" error. */
-    {
-        Relation cagra_rel_pc = index_open(cagra_oid, AccessShareLock);
-        if (cagra_rel_pc->rd_rel->relam != get_am_oid("cagra", false))
-        {
-            index_close(cagra_rel_pc, AccessShareLock);
-            ereport(ERROR,
-                    (errmsg("pg_cuvs_build_hnsw: \"%s\" is not a cagra index",
-                            get_rel_name(cagra_oid))));
-        }
-        hnsw_require_legacy_cagra_source(cagra_rel_pc);
-        int precheck_dim = (int) TupleDescAttr(RelationGetDescr(cagra_rel_pc), 0)->atttypmod;
-        int graph_degree  = cuvs_cagra_reloption_graph_degree(cagra_rel_pc);
-        index_close(cagra_rel_pc, AccessShareLock);
-        int m0 = (graph_degree < 64) ? graph_degree : 64;
-        /* 'nsw' builds upper layers too, so the conservative bound of the other modes applies. */
-        int precheck_maxlevel = 5;
-        check_hnsw_page_fit(precheck_dim, 4, m0 / 2, precheck_maxlevel);
-    }
+    if (!object_ownercheck(RelationRelationId, heap_oid, GetUserId()))
+        aclcheck_error(ACLCHECK_NOT_OWNER, OBJECT_TABLE, get_rel_name(heap_oid));
+    heap_rel = table_open(heap_oid, ShareLock);
+    cagra_rel = index_open(cagra_oid, AccessShareLock);
+    if (cagra_rel->rd_rel->relam != get_am_oid("cagra", false))
+        ereport(ERROR,
+                (errmsg("pg_cuvs_build_hnsw: \"%s\" is not a cagra index",
+                        get_rel_name(cagra_oid))));
+    const char *problem = hnsw_cagra_source_problem(cagra_rel, heap_rel);
+    if (problem != NULL)
+        hnsw_report_source_problem(cagra_rel, problem);
+    dim = (int) TupleDescAttr(RelationGetDescr(cagra_rel), 0)->atttypmod;
+    graph_degree = cuvs_cagra_reloption_graph_degree(cagra_rel);
+    check_hnsw_page_fit(dim, 4, Min(graph_degree, 64) / 2, 5);
 
     /* Create empty HNSW on parent table — INDEX_CREATE_SKIP_BUILD, no CPU build */
-    Oid hnsw_oid = create_empty_hnsw(cagra_oid);
+    hnsw_oid = create_empty_hnsw(heap_rel, cagra_rel);
 
     /* Dispatch to internal C helpers — no SQL/SPI overhead.
      *
@@ -4539,13 +4937,28 @@ pg_cuvs_build_hnsw(PG_FUNCTION_ARGS)
      *                    Retained pending future improvement of level assignment.
      *   'hnswlib_file' — on-disk .hnsw sidecar; superceded by 'hnswlib' (shm).
      */
-    if (strcmp(mode, "nsw") == 0 || strcmp(mode, "hnsw") == 0)
-        fill_hnsw_from_cagra_ipc(cagra_oid, hnsw_oid, mode, 0, 0);
-    else if (strcmp(mode, "hnswlib") == 0)
-        fill_hnsw_from_hnswlib(cagra_oid, hnsw_oid, true, 0, 0);
-    else  /* hnswlib_file */
-        fill_hnsw_from_hnswlib(cagra_oid, hnsw_oid, false, 0, 0);
+    HnswSourceTidResult tid_result;
 
+    (void) hnsw_fill_source(cagra_oid, hnsw_oid, mode, 0, 0, &tid_result);
+    if (tid_result == HNSW_SOURCE_TIDS_CONFLICTING)
+        hnsw_reject_conflicting_source_tids();
+    if (tid_result == HNSW_SOURCE_TIDS_REDUNDANT)
+    {
+        Relation target = index_open(hnsw_oid, AccessExclusiveLock);
+        IndexInfo *index_info = BuildIndexInfo(target);
+
+        /* Let PostgreSQL run expressions and predicates as the heap owner,
+         * with security-restricted operations and command-local GUCs. */
+        index_build(heap_rel, target, index_info, false, false);
+        ereport(NOTICE,
+                (errmsg("pg_cuvs_hnsw: rebuilt from the heap because the source has redundant entries")));
+        index_close(target, AccessExclusiveLock);
+    }
+
+    index_close(cagra_rel, AccessShareLock);
+    /* As in a regular CREATE INDEX, block table writes through commit of the
+     * populated, ready index. The source probe and the import use one lock. */
+    table_close(heap_rel, NoLock);
     PG_RETURN_OID(hnsw_oid);
 }
 
@@ -4559,10 +4972,9 @@ pg_cuvs_build_hnsw(PG_FUNCTION_ARGS)
  *
  * ambuild() writes pgvector-HNSW page format into the index's OWN relation
  * (reusing fill_hnsw_from_cagra_ipc / fill_hnsw_from_hnswlib). The read path
- * (scan/cost/insert/bulkdelete/vacuum) is delegated to pgvector's hnsw AM by
- * copying its IndexAmRoutine and overriding only ambuild + amoptions. A single
- * catalog index results, so pg_indexes / DROP INDEX / REINDEX / pg_dump behave
- * naturally.
+ * (scan/cost/insert/bulkdelete/vacuum) delegates to pgvector's hnsw AM. The
+ * wrapper supplies the build callbacks and reloption parser. A single catalog
+ * index results, so pg_indexes / DROP INDEX / REINDEX / pg_dump behave naturally.
  * ================================================================ */
 
 /* WITH() storage. The m / ef_construction prefix mirrors pgvector's HnswOptions
@@ -4828,6 +5240,67 @@ cuvs_hnsw_m_is_explicit(Oid index_oid)
  *                               heap with no source dependency. The CAGRA is an
  *                               intermediate build artifact (like a .o), so it
  *                               is dropped — to keep a CAGRA, use source mode. */
+/* pgvector uses the target's IndexInfo and reads its options from the
+ * pgvector-compatible prefix of CuvsHnswOptions. A source index can store
+ * a pair that pgvector would reject at build time, so raise ef locally.
+ * A NULL heap skips the scan. A NULL IndexInfo selects the init fork. */
+static IndexBuildResult *
+hnsw_cpu_build(Relation heap, Relation index, IndexInfo *index_info,
+               const char *reason)
+{
+    IndexAmRoutine *hnsw = GetIndexAmRoutineByAmId(get_am_oid("hnsw", false), false);
+    ambuild_function build = hnsw->ambuild;
+    ambuildempty_function build_empty = hnsw->ambuildempty;
+    CuvsHnswOptions *opts = (CuvsHnswOptions *) index->rd_options;
+    int m = opts ? opts->m : 16;
+    int configured_ef = opts ? opts->ef_construction : 64;
+    bool adjust_ef = opts != NULL && opts->source_offset != 0 &&
+        ((const char *) opts)[opts->source_offset] != '\0' &&
+        configured_ef < 2 * m;
+    int build_ef = adjust_ef ? 2 * m : configured_ef;
+    int guc_nestlevel = adjust_ef && heap != NULL ? NewGUCNestLevel() : 0;
+    IndexBuildResult *result = NULL;
+
+    pfree(hnsw);
+    PG_TRY();
+    {
+        /* Workers reopen the index and read the catalog's unadjusted
+         * options. pgvector chooses its own worker count via this GUC. */
+        if (guc_nestlevel != 0)
+            set_config_option("max_parallel_maintenance_workers", "0",
+                              PGC_USERSET, PGC_S_SESSION, GUC_ACTION_SAVE,
+                              true, ERROR, false);
+        if (adjust_ef)
+            opts->ef_construction = build_ef;
+        if (index_info != NULL)
+            result = build(heap, index, index_info);
+        else
+            build_empty(index);
+    }
+    PG_FINALLY();
+    {
+        /* If relcache reloaded the options, it restored the catalog value. */
+        if (adjust_ef && index->rd_options == (bytea *) opts)
+            opts->ef_construction = configured_ef;
+        if (guc_nestlevel != 0)
+            AtEOXact_GUC(false, guc_nestlevel);
+    }
+    PG_END_TRY();
+
+    if (reason != NULL)
+        ereport(NOTICE,
+                (errmsg("pg_cuvs_hnsw: rebuilt from the heap because %s", reason),
+                 errdetail("pgvector build used m = %d, ef_construction = %d (configured ef_construction = %d).",
+                           m, build_ef, configured_ef)));
+    return result;
+}
+
+static void
+cuvs_hnsw_ambuildempty(Relation index)
+{
+    (void) hnsw_cpu_build(NULL, index, NULL, NULL);
+}
+
 static IndexBuildResult *
 cuvs_hnsw_ambuild(Relation heapRel, Relation indexRel, IndexInfo *indexInfo)
 {
@@ -4914,9 +5387,28 @@ cuvs_hnsw_ambuild(Relation heapRel, Relation indexRel, IndexInfo *indexInfo)
     }
 
     /* ── Source mode: reuse an existing CAGRA index. ── */
+    bool rebuilding = ReindexIsProcessingIndex(self_oid);
+
+    /* In-place TRUNCATE rebuilds an existing index without setting the
+     * reindex flag. A regular CREATE has a newly created index with relpages
+     * zero until index_build() records the pages, even for an empty HNSW.
+     * Concurrent CREATE also gets a new index, in an earlier transaction.
+     * Leave both CREATE paths subject to the source checks below. */
+    bool existing_index = !indexInfo->ii_Concurrent &&
+        (indexRel->rd_createSubid == InvalidSubTransactionId ||
+         indexRel->rd_rel->relpages > 0);
+    if ((rebuilding || existing_index) && RelationGetNumberOfBlocks(heapRel) == 0)
+    {
+        pfree(result);
+        /* pgvector can initialize the main fork without planning a scan or
+         * consulting expressions/predicates from the dummy IndexInfo. */
+        return hnsw_cpu_build(NULL, indexRel, indexInfo, "the heap is empty");
+    }
+
     /* Resolve source name (schema-qualified, search_path aware) to an OID. */
     Oid cagra_oid = DatumGetObjectId(
         DirectFunctionCall1(regclassin, CStringGetDatum((char *) source_name)));
+    Relation cagra_rel;
 
     /* Source must be a cagra index on the same table we are indexing. */
     {
@@ -4945,15 +5437,10 @@ cuvs_hnsw_ambuild(Relation heapRel, Relation indexRel, IndexInfo *indexInfo)
 
         /* #162: dim-ceiling pre-check using the source CAGRA's own
          * graph_degree reloption, before paying the IPC round-trip. */
-        {
-            Relation cagra_rel_gd = index_open(cagra_oid, AccessShareLock);
-            hnsw_require_legacy_cagra_source(cagra_rel_gd);
-            int graph_degree = cuvs_cagra_reloption_graph_degree(cagra_rel_gd);
-            index_close(cagra_rel_gd, AccessShareLock);
-            int m0 = (graph_degree < 64) ? graph_degree : 64;
-            check_hnsw_page_fit(precheck_dim, precheck_bytes_per_dim,
-                                 m0 / 2, safe_maxlevel);
-        }
+        cagra_rel = index_open(cagra_oid, AccessShareLock);
+        int graph_degree = cuvs_cagra_reloption_graph_degree(cagra_rel);
+        check_hnsw_page_fit(precheck_dim, precheck_bytes_per_dim,
+                            Min(graph_degree, 64) / 2, safe_maxlevel);
 
         /* Fail fast: the source CAGRA's metric must match this index's opclass
          * BEFORE paying an IPC round-trip. cagra_index_metric() is opclass-name
@@ -4979,6 +5466,39 @@ cuvs_hnsw_ambuild(Relation heapRel, Relation indexRel, IndexInfo *indexInfo)
     }
 
     int source_m = cuvs_hnsw_m_is_explicit(self_oid) ? (int) requested_m : 0;
+    const char *problem = hnsw_cagra_source_problem(cagra_rel, heapRel);
+    bool predicate_matches = equal(RelationGetIndexPredicate(cagra_rel),
+                                  RelationGetIndexPredicate(indexRel));
+    bool key_matches = predicate_matches && hnsw_source_key_matches(cagra_rel, indexRel);
+    if (rebuilding && problem == NULL)
+    {
+        if (!predicate_matches || !key_matches)
+            problem = "does not match the target definition";
+        else if (strcmp(mode, "hnswlib_file") == 0 &&
+                 !hnsw_file_source_available(cagra_rel))
+            problem = "has no matching HNSW file binding";
+    }
+    if (problem != NULL && rebuilding)
+    {
+        char *reason = psprintf("source CAGRA index \"%s\" %s",
+                                RelationGetRelationName(cagra_rel), problem);
+
+        index_close(cagra_rel, AccessShareLock);
+        pfree(result);
+        return hnsw_cpu_build(heapRel, indexRel, indexInfo, reason);
+    }
+    if (problem != NULL)
+        hnsw_report_source_problem(cagra_rel, problem);
+    if (!predicate_matches)
+        ereport(ERROR,
+                (errcode(ERRCODE_INVALID_TABLE_DEFINITION),
+                 errmsg("pg_cuvs_hnsw: source CAGRA predicate does not match the target"),
+                 errhint("Use the same WHERE clause as the source index, or build from the heap without a source.")));
+    if (!key_matches)
+        ereport(ERROR,
+                (errcode(ERRCODE_INVALID_TABLE_DEFINITION),
+                 errmsg("pg_cuvs_hnsw: source CAGRA index key does not match the target"),
+                 errhint("Use the same column or expression as the source index, or build from the heap without a source.")));
 
     /* Fill THIS index's relation (pgvector page format) from the CAGRA graph.
      * fill_* open the target by OID with AccessExclusiveLock. For CREATE INDEX
@@ -4987,16 +5507,19 @@ cuvs_hnsw_ambuild(Relation heapRel, Relation indexRel, IndexInfo *indexInfo)
      * only, so there the request waits for the table's writers and queues new
      * ones behind it. The freshly created relation has 0 blocks so no truncate
      * happens. */
-    size_t n_elems_written;
-    if (strcmp(mode, "nsw") == 0 || strcmp(mode, "hnsw") == 0)
-        n_elems_written = fill_hnsw_from_cagra_ipc(cagra_oid, self_oid, mode,
-                                                  source_m, (uint16_t)requested_ef);
-    else if (strcmp(mode, "hnswlib") == 0)
-        n_elems_written = fill_hnsw_from_hnswlib(cagra_oid, self_oid, true,
-                                               source_m, (uint16_t)requested_ef);
-    else  /* hnswlib_file */
-        n_elems_written = fill_hnsw_from_hnswlib(cagra_oid, self_oid, false,
-                                               source_m, (uint16_t)requested_ef);
+    HnswSourceTidResult tid_result;
+    size_t n_elems_written = hnsw_fill_source(cagra_oid, self_oid, mode, source_m,
+                                             (uint16_t)requested_ef, &tid_result);
+
+    if (tid_result == HNSW_SOURCE_TIDS_CONFLICTING && !rebuilding)
+        hnsw_reject_conflicting_source_tids();
+    if (tid_result != HNSW_SOURCE_TIDS_UNIQUE)
+    {
+        index_close(cagra_rel, AccessShareLock);
+        pfree(result);
+        return hnsw_cpu_build(heapRel, indexRel, indexInfo, "the source contains duplicate TIDs");
+    }
+    index_close(cagra_rel, AccessShareLock);
 
     /* #161: element count from fill_*'s own return, not inferred from block
      * count. nblocks-1 == N only holds while every page carries exactly one
@@ -5184,9 +5707,10 @@ pg_cuvs_hnsw_handler(PG_FUNCTION_ARGS)
     IndexAmRoutine *amroutine = (IndexAmRoutine *)
         DatumGetPointer(OidFunctionCall1(amhandler, (Datum) 0));
 
-    amroutine->ambuild   = cuvs_hnsw_ambuild;   /* GPU CAGRA -> HNSW pages */
+    amroutine->ambuild = cuvs_hnsw_ambuild;   /* GPU CAGRA -> HNSW pages */
+    amroutine->ambuildempty = cuvs_hnsw_ambuildempty;
     amroutine->amoptions = cuvs_hnsw_amoptions;  /* WITH (source, mode, ...) */
-    /* Writes/maintenance retain pgvector's behavior. The scan wrapper keeps
+    /* Inserts and vacuum retain pgvector's behavior. The scan wrapper keeps
      * its delegate path and connects the explicitly selected exact heap mode. */
     cuvs_hnsw_scan_wrap(amroutine);
 

@@ -6,6 +6,10 @@
  * PostgreSQL, CUDA, or cuVS dependencies.
  */
 
+#if !defined(__APPLE__) && !defined(_POSIX_C_SOURCE)
+#define _POSIX_C_SOURCE 200809L
+#endif
+
 #include "cuvs_util.h"
 #include "cuvs_ipc.h"   /* CUVS_STATUS_* defines (PG-free, CUDA-free) */
 #include "cuvs_admission_contract.h"   /* CuvsAdmissionReason (breaker classification) */
