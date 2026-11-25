@@ -6,9 +6,11 @@ import concurrent.futures
 import fcntl
 import os
 from pathlib import Path
+import shlex
 import stat
 import struct
 import subprocess
+import tempfile
 import time
 import uuid
 
@@ -330,11 +332,54 @@ class Fixture:
         self.expect_sqlstate(result, "55000")
         assert "is stale" in result.stderr
 
-    def shard_stale_without_delta(self, *, delta_mode, search_mode):
+    def shard_stale_cpu(self):
         self.replace(901, 902)
         assert self.race("shard-fanout",
-                         lambda: self.nearest(150, delta_mode=delta_mode, search_mode=search_mode),
+                         lambda: self.nearest(150, delta_mode="cpu"),
                          self.mark_stale) == 150
+
+    def shard_stale_bf(self):
+        self.replace(901, 902)
+        index = f"'{self.schema}.d_i'::regclass"
+        assert self.sql(
+            f"SELECT count(*) FROM pg_stat_gpu_shards WHERE index_oid = {index} AND resident"
+        ) == "2"
+        db_oid, index_oid = self.delta.stem.split("_")
+        socket = self.sql("SHOW cuvs.socket_path")
+        expected_ctid = self.sql(f"SELECT ctid FROM {self.schema}.d WHERE id = 150")
+        assert expected_ctid
+        root = Path(__file__).resolve().parents[3]
+
+        with tempfile.TemporaryDirectory(prefix="delta-shard-bf-") as temp:
+            client = Path(temp) / "search-client"
+            subprocess.run(
+                [*shlex.split(os.environ.get("CC", "cc")), "-std=gnu11", "-Wall",
+                 "-Wextra", "-Werror", "-I", "src", "-o", str(client),
+                 "infra/scripts/tests/shard-bf-search-client.c", "src/cuvs_ipc.c",
+                 "src/cuvs_util.c", "src/cuvs_build_corpus.c", "-lpthread", "-lm", "-lrt"],
+                cwd=root, check=True, timeout=120,
+            )
+
+            def search_bf():
+                result = subprocess.run(
+                    [str(client), socket, db_oid, index_oid],
+                    check=True, capture_output=True, text=True, timeout=15,
+                )
+                status, count, merged, ctid, distance = result.stdout.strip().split()
+                return status, int(count), int(merged), ctid, float(distance)
+
+            expected = ("ok", 1, 0, expected_ctid, 0.0)
+            control = search_bf()
+            assert control == expected, ("quiescent shard BF", control, expected)
+            assert self.sql(
+                f"SELECT search_mode FROM pg_stat_gpu_search WHERE index_oid = {index}"
+            ) == "brute_force"
+            raced = self.race("shard-fanout", search_bf, self.mark_stale)
+            assert raced == expected, ("in-flight shard BF after MARK_STALE", raced, expected)
+            after = search_bf()
+            assert after[:3] == ("stale", 0, 0), ("new shard BF after MARK_STALE", after)
+            print(f"shard BF replies: control={control!r}, in-flight={raced!r}, new={after!r}",
+                  flush=True)
 
     def cases(self):
         return {
@@ -369,8 +414,8 @@ def main():
     selected = args.case or list(cases)
     if args.mode == "sharded":
         cases.update({
-            "shard-stale-cpu": lambda: fixture.shard_stale_without_delta(delta_mode="cpu", search_mode="cagra"),
-            "shard-stale-bf": lambda: fixture.shard_stale_without_delta(delta_mode="gpu", search_mode="brute_force"),
+            "shard-stale-cpu": fixture.shard_stale_cpu,
+            "shard-stale-bf": fixture.shard_stale_bf,
         })
     if any(name not in cases for name in selected):
         parser.error("available cases: " + ", ".join(cases))
