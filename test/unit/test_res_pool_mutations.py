@@ -46,6 +46,9 @@ def wiring(w, s, sh):
     destructor = w[w.index('~PooledRes()'):w.index('raft::device_resources &get()')]
     assert 'if (r && !poisoned) release_res(dev, std::move(r));' in destructor, 'POOL_HEALTHY_HANDLES'
     assert 'else if (r) g_device_pools[dev].retire(std::move(r));' in destructor, 'POISON_RETIRES'
+    ctor = w[w.index('explicit PooledRes(int device_id)'):w.index('~PooledRes()')]
+    assert re.search(r'catch \(\.\.\.\) \{\s*g_device_pools\[dev\]\.retire\(std::move\(r\)\);\s*throw;', ctor), \
+        'CTOR_FAILURE_RETIRES'
     assert 'raft::device_resources &get() { return *r->res; }' in w, 'GET_SLOT_RES'
     main = s[s.index('\nmain(int argc'):]
     a = main.index('cuvs_rmm_set_dedicated_stream(g_rmm_dedicated_stream)')
@@ -58,6 +61,8 @@ SOURCE = [
     ('traits_ignore_stream', 'w', 'stream ? std::make_unique<Res>(stream->view()) : std::make_unique<Res>()', 'std::make_unique<Res>()'),
     ('poisoned_slot_pooled', 'w', 'if (r && !poisoned) release_res(dev, std::move(r));', 'if (r) release_res(dev, std::move(r));'),
     ('poisoned_slot_destroyed', 'w', 'else if (r) g_device_pools[dev].retire(std::move(r));', 'else if (r) r.reset();'),
+    ('ctor_failure_destroys_slot', 'w', '        } catch (...) {\n            g_device_pools[dev].retire(std::move(r));\n',
+     '        } catch (...) {\n'),
     ('mode_set_after_pool_init', 's', '    /* Before the pool, probes, loads and warmup acquire any RAFT resource. */\n    if (cuvs_rmm_set_dedicated_stream(g_rmm_dedicated_stream) != 0)',
      '    if (0)'),
     ('daemon_default_off', 's', 'static int g_rmm_dedicated_stream = CUVS_RMM_DEDICATED_STREAM_DEFAULT;', 'static int g_rmm_dedicated_stream = 0;'),
