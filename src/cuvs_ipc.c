@@ -2399,13 +2399,15 @@ cuvs_ipc_export_hnsw_shm(
     uint32_t    index_oid,
     char       *shm_path_out,
     size_t      shm_path_len,
-    int        *fd_out)
+    int        *fd_out,
+    int        *tids_fd_out)
 {
     int sock    = -1;
     int rc      = CUVS_STATUS_ERROR;
     int pass_fd = -1;
+    int tids_fd = -1;
 
-    if (fd_out) *fd_out = -1;
+    *fd_out = *tids_fd_out = -1;
 
     /* from_cagra() can take 30s+ for large indexes */
     sock = uds_connect_ex(socket_path, 120);
@@ -2416,6 +2418,7 @@ cuvs_ipc_export_hnsw_shm(
         .op        = CUVS_OP_EXPORT_HNSW_SHM,
         .db_oid    = db_oid,
         .index_oid = index_oid,
+        .k         = CUVS_HNSW_EXPORT_PAIRED,
     };
     if (send_cmd(sock, &cmd) < 0)
         goto cleanup;
@@ -2429,6 +2432,10 @@ cuvs_ipc_export_hnsw_shm(
         rc = (int)hdr.status;
         goto cleanup;
     }
+    if (hdr.n_results != 2) {
+        rc = CUVS_STATUS_PROTO_MISMATCH;
+        goto cleanup;
+    }
 
     if (pass_fd < 0) {
         LOG_ERROR("[export_hnsw_shm] no SCM_RIGHTS fd in reply -- daemon and "
@@ -2440,6 +2447,10 @@ cuvs_ipc_export_hnsw_shm(
         LOG_ERROR("[export_hnsw_shm] sidecar owner mismatch on passed fd\n");
         goto cleanup;
     }
+    char token;
+    if (cuvs_fd_recv(sock, &token, 1, &tids_fd) < 0 || tids_fd < 0 ||
+        !shm_check_daemon_owner(sock, tids_fd))
+        goto cleanup;
 
     /*
      * #166 review: do NOT hand back a "/proc/self/fd/N" path. Opening that
@@ -2451,12 +2462,14 @@ cuvs_ipc_export_hnsw_shm(
      */
     strncpy(shm_path_out, hdr.error, shm_path_len - 1);
     shm_path_out[shm_path_len - 1] = '\0';
-    if (fd_out) *fd_out = pass_fd;
-    pass_fd = -1;                  /* ownership transferred to the caller */
+    *fd_out = pass_fd;
+    *tids_fd_out = tids_fd;
+    pass_fd = tids_fd = -1;        /* ownership transferred to the caller */
     rc = CUVS_STATUS_OK;
 
 cleanup:
     if (pass_fd >= 0) close(pass_fd);
+    if (tids_fd >= 0) close(tids_fd);
     if (sock >= 0)    close(sock);
     return rc;
 }

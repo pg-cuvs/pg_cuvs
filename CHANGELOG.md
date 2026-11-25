@@ -104,6 +104,25 @@ exists for 0.9.0.
   direct heap build or `REINDEX`, which can change build time and the resulting
   graph.
 
+- Reject CAGRA sources with a stale marker and sources with pending inserts or deletes
+  before converting them to HNSW. Source-based DDL checks the index key and
+  predicate, and `pg_cuvs_build_hnsw()` preserves both. The existing
+  vector-to-halfvec conversion on the same key is supported.
+- An explicit conversion rejects duplicate heap TIDs that hold different
+  vectors. When the duplicates hold the same vector, pgvector builds the
+  target from the current heap. Rebuilds of existing indexes can use a
+  heap build in both cases.
+- `hnswlib_file` could previously import an older graph after the CAGRA source
+  changed. It now rejects a missing or invalid build-time binding between
+  `.hnsw` and `.tids` with SQLSTATE `55000`. Files written by earlier versions
+  have no binding, so a conversion that used to proceed from them now fails
+  until the files are regenerated. For a clean resident source, use
+  `mode = 'nsw'` or regenerate the files by enabling
+  `cuvs.cpu_hnsw_fallback` and running `REINDEX` on the source. If a failed
+  `CREATE INDEX CONCURRENTLY` leaves an invalid target index, drop it before
+  retrying. A failed rebuild preserves the binding when it restores the same
+  graph and TID files with unchanged contents.
+
 - `CREATE INDEX CONCURRENTLY ... USING pg_cuvs_hnsw` and `REINDEX INDEX CONCURRENTLY` of a `pg_cuvs_hnsw` index
   built from the heap (without `source`) no longer make the table's queries wait for a lock. The build opened the
   index it writes with `AccessExclusiveLock`, while a concurrent build holds `RowExclusiveLock` on it. Every write
@@ -184,6 +203,16 @@ exists for 0.9.0.
   function from device code, and nvcc rejects that without `--expt-relaxed-constexpr`.
   The planner flags now pass it, as the SDK's own build does. Builds without the
   planner are unchanged. 0.9.1 and 0.9.2 have the same defect.
+
+### Upgrading
+
+- Upgrade the extension and daemon together and restart the daemon before
+  using the paired `hnswlib` export.
+- When rebuilding an existing source-based HNSW index during PostgreSQL table
+  maintenance, an unusable CAGRA source falls back to a pgvector heap build.
+  Explicit conversions require matching definitions and the current heap
+  generation. The deprecated conversion function blocks table writes through
+  transaction end.
 
 ## [0.9.2] - 2026-11-15
 
