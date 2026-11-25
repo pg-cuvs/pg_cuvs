@@ -42,6 +42,11 @@ exists for 0.9.0.
 
 ### Changed
 
+- With experimental page-format CAGRA indexes, `pg_cuvs_batch_search` and
+  `cuvs_filtered_knn` return the row's `ctid` in the caller's snapshot,
+  including after a HOT update. Standard builds use exact heap search for
+  `cuvs_filtered_knn` on these indexes.
+
 - A CAGRA build that the daemon receives in several partials does less work while it
   holds the daemon's index lock after the GPU build. A helper thread writes the
   `.vectors` sidecar and the dataset body of the `.cagra` file while the GPU builds;

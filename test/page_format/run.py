@@ -1421,6 +1421,13 @@ def run(work, logs):
         dead.start()
         try:
             dead.file("postgres", "beta1a_dead")
+            dead.run("createdb", ["u13"], "createdb-u13")
+            dead.sql("u13", "u13-extensions", "-c",
+                     "CREATE EXTENSION vector; CREATE EXTENSION pg_cuvs; CREATE EXTENSION pageinspect;")
+            dead.file("u13", "u13")
+            dead.run(sys.executable, [CASES / "u13-concurrent.py", "u13", "--observe-page-hits"],
+                     "u13-concurrent")
+            print("Page SQL snapshot, HOT, filter and SSI cases: PASS", flush=True)
         finally:
             dead.stop()
 
