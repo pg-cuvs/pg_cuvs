@@ -14548,6 +14548,196 @@ initialize_page_daemon_id(void)
 #define PAGE_FOLD_MIN_POSITIONS 100U
 #define PAGE_FOLD_MAX_POSITIONS (4U * CUVS_PAGE_BATCH_MAX)
 #define PAGE_FOLD_IDLE_US (300 * UINT64_C(1000000))
+#define PAGE_FOLD_CACHE_IDLE_US (30 * UINT64_C(1000000))
+
+static uint32_t g_page_fold_batch_rows;
+static bool g_page_fold_profile;
+
+typedef struct PageFoldHostGraphBinding
+{
+    const void *device_graph;
+    uint64_t daemon_id;
+    uint64_t boot_id;
+    uint64_t graph_nonce;
+    uint64_t registered_order;
+    uint64_t rows;
+    uint64_t degree;
+} PageFoldHostGraphBinding;
+
+typedef struct PageFoldHostGraphCache
+{
+    uint32_t *graph;
+    size_t bytes;
+    uint64_t expires_us;
+    PageFoldHostGraphBinding binding;
+} PageFoldHostGraphCache;
+
+static pthread_mutex_t g_page_fold_cache_mutex = PTHREAD_MUTEX_INITIALIZER;
+static PageFoldHostGraphCache g_page_fold_idle_cache[CUVS_MAX_GPUS];
+static uint64_t g_page_fold_cache_epoch;
+
+static void
+page_fold_configure(void)
+{
+    const char *batch = getenv("CUVS_PAGE_FOLD_BATCH_ROWS");
+    const char *profile = getenv("CUVS_PAGE_FOLD_PROFILE");
+
+    if (batch)
+    {
+        char *end;
+        unsigned long rows;
+
+        errno = 0;
+        rows = strtoul(batch, &end, 10);
+        if (*batch < '0' || *batch > '9' || *end || errno || rows > PAGE_FOLD_MAX_POSITIONS)
+            LOG_WARN("[page_fold] CUVS_PAGE_FOLD_BATCH_ROWS must be 0..%u; using the default fold policy\n",
+                     PAGE_FOLD_MAX_POSITIONS);
+        else
+            g_page_fold_batch_rows = (uint32_t) rows;
+    }
+    if (profile)
+    {
+        g_page_fold_profile = strcmp(profile, "1") == 0;
+        if (!g_page_fold_profile && strcmp(profile, "0") != 0)
+            LOG_WARN("[page_fold] CUVS_PAGE_FOLD_PROFILE must be 0 or 1; profiling is off\n");
+    }
+    if (batch || profile)
+        LOG_INFO("[page_fold] optimized=%d min_positions=%u max_positions=%u profile=%d\n",
+                 g_page_fold_batch_rows != 0, g_page_fold_batch_rows ? 1U : PAGE_FOLD_MIN_POSITIONS,
+                 g_page_fold_batch_rows ? g_page_fold_batch_rows : PAGE_FOLD_MAX_POSITIONS,
+                 g_page_fold_profile);
+}
+
+static void
+page_fold_host_graph_release(PageFoldHostGraphCache *cache)
+{
+    if (cache->graph)
+    {
+        free(cache->graph);
+        cuvs_page_overlay_unreserve(&g_page_overlay_budget, cache->bytes);
+        *cache = (PageFoldHostGraphCache) {0};
+    }
+}
+
+static void
+page_fold_host_graph_return(int device, PageFoldHostGraphCache *cache, uint64_t epoch)
+{
+    if (!cache->graph)
+        return;
+    pthread_mutex_lock(&g_page_fold_cache_mutex);
+    if (epoch == g_page_fold_cache_epoch)
+    {
+        g_page_fold_idle_cache[device] = *cache;
+        *cache = (PageFoldHostGraphCache) {0};
+    }
+    pthread_mutex_unlock(&g_page_fold_cache_mutex);
+    page_fold_host_graph_release(cache);
+}
+
+static uint64_t
+page_fold_host_graph_take(int device, PageFoldHostGraphCache *cache)
+{
+    uint64_t epoch;
+
+    pthread_mutex_lock(&g_page_fold_cache_mutex);
+    epoch = g_page_fold_cache_epoch;
+    *cache = g_page_fold_idle_cache[device];
+    g_page_fold_idle_cache[device] = (PageFoldHostGraphCache) {0};
+    pthread_mutex_unlock(&g_page_fold_cache_mutex);
+    return epoch;
+}
+
+static void
+page_fold_host_graph_expire(int device, uint64_t now)
+{
+    pthread_mutex_lock(&g_page_fold_cache_mutex);
+    if (g_page_fold_idle_cache[device].graph && now >= g_page_fold_idle_cache[device].expires_us)
+        page_fold_host_graph_release(&g_page_fold_idle_cache[device]);
+    pthread_mutex_unlock(&g_page_fold_cache_mutex);
+}
+
+/* A supply can reclaim idle mirrors immediately. A borrowed mirror remains
+ * owned by the producer until its CUDA work completes, then it is released
+ * rather than republished if a supply registered pressure in the meantime. */
+static uint32_t
+page_fold_retry_supply(const CuvsPageOverlayRequest *request, size_t bytes,
+                       CuvsPageOverlayChunk **result)
+{
+    uint32_t status;
+
+    pthread_mutex_lock(&g_page_fold_cache_mutex);
+    ++g_page_fold_cache_epoch;
+    for (int gpu = 0; gpu < CUVS_MAX_GPUS; ++gpu)
+        page_fold_host_graph_release(&g_page_fold_idle_cache[gpu]);
+    status = cuvs_page_overlay_alloc(&g_page_overlay_budget, request, bytes, result);
+    pthread_mutex_unlock(&g_page_fold_cache_mutex);
+    return status;
+}
+
+static bool
+page_fold_host_graph_grow(PageFoldHostGraphCache *cache, size_t bytes)
+{
+    if (bytes <= cache->bytes)
+        return true;
+
+    /* A little spare capacity lets successive folds reuse the allocation.
+     * Charge both buffers while realloc can still need the old storage. */
+    size_t capacity = bytes + bytes / 8;
+    if (capacity < bytes || !cuvs_page_overlay_reserve(&g_page_overlay_budget, capacity))
+    {
+        capacity = bytes;
+        if (!cuvs_page_overlay_reserve(&g_page_overlay_budget, capacity))
+            return false;
+    }
+    uint32_t *graph = realloc(cache->graph, capacity);
+    if (!graph)
+    {
+        cuvs_page_overlay_unreserve(&g_page_overlay_budget, capacity);
+        return false;
+    }
+    if (cache->bytes)
+        cuvs_page_overlay_unreserve(&g_page_overlay_budget, cache->bytes);
+    cache->graph = graph;
+    cache->bytes = capacity;
+    return true;
+}
+
+/* The SDK can own the graph mirror when the retained allocation cannot fit.
+ * Reserve any dataset mirror before growing the cache so that its spare
+ * capacity cannot consume the active fold's dataset budget. */
+static bool
+page_fold_reserve_mirrors(size_t mirrors, size_t graph_bytes,
+                          PageFoldHostGraphCache *cache, CuvsCagraFoldControl *control,
+                          const void **result_device_graph, size_t *charge)
+{
+    if (control->optimized)
+    {
+        size_t dataset_bytes = mirrors - graph_bytes;
+        const void *cached_device_graph = cache->binding.device_graph;
+
+        /* The SDK may overwrite the host graph even on failure. */
+        cache->binding = (PageFoldHostGraphBinding) {0};
+        if (!dataset_bytes || cuvs_page_overlay_reserve(&g_page_overlay_budget, dataset_bytes))
+        {
+            if (page_fold_host_graph_grow(cache, graph_bytes))
+            {
+                control->host_graph = cache->graph;
+                control->cached_device_graph = cached_device_graph;
+                control->result_device_graph = result_device_graph;
+                *charge = dataset_bytes;
+                return true;
+            }
+            if (dataset_bytes)
+                cuvs_page_overlay_unreserve(&g_page_overlay_budget, dataset_bytes);
+        }
+        page_fold_host_graph_release(cache);
+    }
+
+    if (!cuvs_page_overlay_reserve(&g_page_overlay_budget, mirrors))
+        return false;
+    *charge = mirrors;
+    return true;
+}
 
 static PageCagraGraph *
 page_fold_pick_locked(int device, uint64_t now)
@@ -14571,7 +14761,8 @@ page_fold_pick_locked(int device, uint64_t now)
             entry->fold_pending_since = now;
         pending = entry->overlay.covered_upto - entry->folded;
         if (entry->fold_candidate || entry->fold_retry_after > now ||
-            (pending < PAGE_FOLD_MIN_POSITIONS && now - entry->fold_pending_since < PAGE_FOLD_IDLE_US))
+            (!g_page_fold_batch_rows && pending < PAGE_FOLD_MIN_POSITIONS &&
+             now - entry->fold_pending_since < PAGE_FOLD_IDLE_US))
             continue;
         priority = pending * (1 + (entry->last_search >= recent ? (uint64_t) entry->hits : 0));
         if (priority > best_priority)
@@ -14583,15 +14774,19 @@ page_fold_pick_locked(int device, uint64_t now)
     return best;
 }
 
-/* The retained prefix is immutable. Copy packed vectors into slot order and
- * fill dead positions from the first live row of their 64-slot batch. */
+/* Copy the pinned overlay into slot order. A live row in the chunk is the
+ * first choice for filling dead positions. An optimized fold without a live
+ * base slot may use another supplied vector when its batch is all dead. */
 static uint32_t
 page_fold_copy_rows(const CuvsPageOverlayChunk *chunk, uint64_t from, uint64_t upto,
-                     uint32_t dim, float *vectors, unsigned char *live, bool base_sample)
+                     uint32_t dim, float *vectors, unsigned char *live, bool base_sample,
+                     bool allow_overlay_sample)
 {
     size_t row_bytes = (size_t) dim * sizeof(float);
     uint32_t count = (uint32_t) (upto - from);
     uint64_t cursor = chunk ? chunk->from + chunk->positions : 0;
+    const float *overlay_sample = NULL;
+    uint64_t sample_position = UINT64_MAX;
 
     while (chunk && cursor > from)
     {
@@ -14603,12 +14798,19 @@ page_fold_copy_rows(const CuvsPageOverlayChunk *chunk, uint64_t from, uint64_t u
         {
             uint64_t position = chunk->from + i;
 
-            if (position >= upto)
+            if (position >= upto && (!allow_overlay_sample || position >= sample_position))
                 break;
             if (chunk->marks[i].state != CUVS_PAGE_POSITION_VECTOR)
                 continue;
             if (position >= from)
             {
+                if (allow_overlay_sample && position < sample_position)
+                {
+                    overlay_sample = packed;
+                    sample_position = position;
+                }
+                if (position >= upto)
+                    break;
                 uint32_t slot = (uint32_t) (position - from);
 
                 memcpy(vectors + (size_t) slot * dim, packed, row_bytes);
@@ -14632,8 +14834,15 @@ page_fold_copy_rows(const CuvsPageOverlayChunk *chunk, uint64_t from, uint64_t u
         if (sample == end)
         {
             if (!base_sample)
-                return first;
-            memset(vectors + (size_t) first * dim, 0, (end - first) * row_bytes);
+            {
+                if (!overlay_sample)
+                    return first;
+                for (uint32_t row = first; row < end; ++row)
+                    memcpy(vectors + (size_t) row * dim, overlay_sample, row_bytes);
+                memset(live + first, 1, end - first);
+            }
+            else
+                memset(vectors + (size_t) first * dim, 0, (end - first) * row_bytes);
             continue;
         }
         for (uint32_t i = first; i < end; ++i)
@@ -14655,14 +14864,24 @@ page_fold_run(int device)
     CuvsPageFoldEvent event;
     CuvsCagraIndex old_handle, new_handle = NULL;
     CuvsCagraFoldShape shape;
-    CuvsCagraFoldControl control = {.should_yield = page_fold_should_yield, .context = &device};
+    CuvsCagraFoldPhases phases;
+    CuvsCagraFoldControl control = {
+        .should_yield = page_fold_should_yield, .context = &device,
+        .optimized = g_page_fold_batch_rows != 0,
+    };
     CuvsCagraFoldStatus status = CUVS_CAGRA_FOLD_INVALID;
     uint64_t now = admission_mono_us();
+    uint64_t staging_us = 0;
+    PageFoldHostGraphCache cache = {0};
+    uint64_t cache_epoch = 0;
+    const void *result_device_graph = NULL;
+    float *rows = NULL;
     size_t peak, limit, used, host_bytes, host_mirror_charge = 0;
     uint64_t pending, retained, claim;
+    uint32_t max_positions = control.optimized ? g_page_fold_batch_rows : PAGE_FOLD_MAX_POSITIONS;
     uint32_t wanted, dim, base_sample;
     uint32_t staging_status;
-    bool offered = false;
+    bool offered = false, mirrors_reserved = false;
 
     (void) pthread_once(&g_page_daemon_once, initialize_page_daemon_id);
     if (!g_page_daemon_id)
@@ -14676,7 +14895,7 @@ page_fold_run(int device)
         goto defer;
     parent->fold_retry_after = now + UINT64_C(1000000);
     pending = parent->overlay.covered_upto - parent->folded;
-    wanted = pending < PAGE_FOLD_MAX_POSITIONS ? (uint32_t) pending : PAGE_FOLD_MAX_POSITIONS;
+    wanted = pending < max_positions ? (uint32_t) pending : max_positions;
     dim = parent->dim;
     base_sample = parent->fold_live_base_slot;
     if (!dim || wanted > (SIZE_MAX - wanted) / sizeof(float) / dim ||
@@ -14715,17 +14934,46 @@ page_fold_run(int device)
              device, event.db_oid, event.index_oid, wanted, peak,
              (unsigned long long) started, (unsigned long long) event.daemon_id);
 
+    uint64_t staging_started = 0;
+    if (g_page_fold_profile)
+    {
+        phases = (CuvsCagraFoldPhases) {0};
+        control.phases = &phases;
+        staging_started = admission_mono_us();
+    }
+    if (control.optimized)
+    {
+        /* Select and pin the source before borrowing its cache so no-work
+         * polls leave the cache available to concurrent supply. */
+        cache_epoch = page_fold_host_graph_take(device, &cache);
+        const PageFoldHostGraphBinding *binding = &cache.binding;
+        if (cache.graph &&
+            (started >= cache.expires_us ||
+             binding->daemon_id != event.daemon_id || binding->boot_id != event.boot_id ||
+             binding->graph_nonce != event.parent_graph_nonce || binding->registered_order != parent->registered_order ||
+             binding->rows != shape.rows || binding->degree != shape.degree))
+            page_fold_host_graph_release(&cache);
+    }
+
     host_bytes = (size_t) wanted * dim * sizeof(float);
-    staging_status = cuvs_page_overlay_alloc(&g_page_overlay_budget, &(CuvsPageOverlayRequest) {0},
+    const CuvsPageOverlayRequest staging_request = {0};
+    staging_status = cuvs_page_overlay_alloc(&g_page_overlay_budget, &staging_request,
                                              host_bytes + wanted, &staging);
+    if (staging_status == CUVS_STATUS_PAGE_OVERLAY_HOST_FULL && cache.graph)
+    {
+        page_fold_host_graph_release(&cache);
+        staging_status = cuvs_page_overlay_alloc(&g_page_overlay_budget, &staging_request,
+                                                 host_bytes + wanted, &staging);
+    }
     if (staging_status == CUVS_STATUS_OK)
     {
-        float *rows = (float *) staging->marks;
+        rows = (float *) staging->marks;
         unsigned char *live = (unsigned char *) rows + host_bytes;
 
         memset(live, 0, wanted);
         event.positions = page_fold_copy_rows(snapshot, event.parent_folded,
-                                             event.parent_folded + wanted, dim, rows, live, base_sample != 0);
+                                             event.parent_folded + wanted, dim, rows, live,
+                                             base_sample != 0, control.optimized && !base_sample);
         if (memchr(live, 0, event.positions))
         {
             control.filled_rows = live;
@@ -14734,21 +14982,23 @@ page_fold_run(int device)
         if (event.positions && shm_key_random((unsigned char *) &event.graph_nonce, sizeof(event.graph_nonce)) == 0 &&
             event.graph_nonce && event.graph_nonce != event.parent_graph_nonce && event.graph_nonce != event.base_nonce)
         {
-            /* SDK host_graph and host_dataset mirror the output layout.
-             * Account for both while the packed input and overlay are live. */
-            retained = retained / (shape.rows + wanted) * (shape.rows + event.positions);
-            size_t mirrors = (size_t) retained;
+            uint64_t output_rows = shape.rows + event.positions;
+            /* The peak check bounded the graph and dataset for shape.rows + wanted. */
+            retained = retained / (shape.rows + wanted) * output_rows;
+            size_t graph_bytes = control.optimized ? (size_t) (output_rows * shape.degree * sizeof(uint32_t)) : 0;
+            size_t mirrors = control.optimized && shape.stride == dim ? graph_bytes : (size_t) retained;
 
-            if (cuvs_page_overlay_reserve(&g_page_overlay_budget, mirrors))
-            {
-                host_mirror_charge = mirrors;
-                status = cuvs_cagra_fold_reuse_with_yield(old_handle, rows, event.positions,
-                                                          (int) dim, device, &new_handle, &control);
-            }
-            else
+            mirrors_reserved = page_fold_reserve_mirrors(mirrors, graph_bytes, &cache, &control,
+                                                         &result_device_graph, &host_mirror_charge);
+            if (!mirrors_reserved)
                 staging_status = CUVS_STATUS_PAGE_OVERLAY_HOST_FULL;
         }
     }
+    if (control.phases)
+        staging_us = admission_mono_us() - staging_started;
+    if (mirrors_reserved)
+        status = cuvs_cagra_fold_reuse_with_yield(old_handle, rows, event.positions,
+                                                 (int) dim, device, &new_handle, &control);
 
     if (status == CUVS_CAGRA_FOLD_CUDA_UNCONFIRMED)
     {
@@ -14767,11 +15017,25 @@ page_fold_run(int device)
             offered = page_graph_register_fold_locked(&source, &event, new_handle, (size_t) retained);
         if (offered)
         {
+            if (control.host_graph && result_device_graph)
+            {
+                const PageCagraGraph *candidate = parent->fold_candidate;
+
+                /* ACK installs this same candidate object as the next source. */
+                cache.binding = (PageFoldHostGraphBinding) {
+                    .device_graph = result_device_graph, .daemon_id = event.daemon_id,
+                    .boot_id = event.boot_id, .graph_nonce = candidate->graph_nonce,
+                    .registered_order = candidate->registered_order,
+                    .rows = candidate->n_slots, .degree = shape.degree,
+                };
+            }
             release_build_vram(peak, device);
             g_fold_claim[device] = 0;
         }
         pthread_mutex_unlock(&g_index_mutex);
     }
+    if (control.host_graph && !cache.binding.device_graph)
+        page_fold_host_graph_release(&cache);
     if (new_handle && !offered)
         cuvs_cagra_free(new_handle, device);
     cuvs_page_overlay_release(staging);
@@ -14788,11 +15052,26 @@ page_fold_run(int device)
     uint64_t finished = admission_mono_us();
     pthread_cond_broadcast(&g_fold_finished);
     pthread_mutex_unlock(&g_index_mutex);
+    if (offered && cache.binding.device_graph)
+        cache.expires_us = finished + PAGE_FOLD_CACHE_IDLE_US;
+    page_fold_host_graph_return(device, &cache, cache_epoch);
     LOG_INFO("[page_fold] gpu=%d db=%u index=%u positions=%u status=%d offered=%d elapsed_us=%llu staging_status=%u"
              " daemon_id=%llu started_us=%llu mono_us=%llu\n",
              device, event.db_oid, event.index_oid, event.positions, status, offered,
              (unsigned long long) (finished - now), staging_status, (unsigned long long) event.daemon_id,
              (unsigned long long) started, (unsigned long long) finished);
+    if (control.phases)
+        LOG_INFO("[page_fold_phases] gpu=%d db=%u index=%u positions=%u status=%d offered=%d"
+                 " daemon_id=%llu started_us=%llu staging_us=%llu input_us=%llu dataset_us=%llu"
+                 " graph_setup_us=%llu incoming_us=%llu search_us=%llu rank_us=%llu reverse_us=%llu"
+                 " scatter_us=%llu final_graph_us=%llu host_graph_cache_hit=%d\n",
+                 device, event.db_oid, event.index_oid, event.positions, status, offered,
+                 (unsigned long long) event.daemon_id, (unsigned long long) started, (unsigned long long) staging_us,
+                 (unsigned long long) phases.input_us, (unsigned long long) phases.dataset_us,
+                 (unsigned long long) phases.graph_setup_us, (unsigned long long) phases.incoming_us,
+                 (unsigned long long) phases.search_us, (unsigned long long) phases.rank_us,
+                 (unsigned long long) phases.reverse_us, (unsigned long long) phases.scatter_us,
+                 (unsigned long long) phases.final_graph_us, phases.host_graph_cache_hit);
     return;
 
 defer:
@@ -14806,11 +15085,16 @@ page_fold_thread(void *arg)
 
     while (!g_shutdown)
     {
-        page_fold_run(device);
-        struct timespec delay = {.tv_nsec = 100000000};
+        const struct timespec delay = {.tv_nsec = 100000000};
 
+        page_fold_run(device);
+        if (g_page_fold_batch_rows)
+            page_fold_host_graph_expire(device, admission_mono_us());
         nanosleep(&delay, NULL);
     }
+    pthread_mutex_lock(&g_page_fold_cache_mutex);
+    page_fold_host_graph_release(&g_page_fold_idle_cache[device]);
+    pthread_mutex_unlock(&g_page_fold_cache_mutex);
     return NULL;
 }
 #endif
@@ -15108,6 +15392,10 @@ read_page_overlay_chunk(const CuvsPageOverlayRequest *request, uint32_t dim, boo
     if (fd < 0)
         return CUVS_STATUS_ERROR;
     status = cuvs_page_overlay_alloc(&g_page_overlay_budget, request, bytes, result);
+#ifdef CUVS_CAGRA_FOLD_ENABLED
+    if (shared && g_page_fold_batch_rows && status == CUVS_STATUS_PAGE_OVERLAY_HOST_FULL)
+        status = page_fold_retry_supply(request, bytes, result);
+#endif
     if (status == CUVS_STATUS_OK)
     {
 #ifdef CUVS_TEST_HOOKS
@@ -16484,6 +16772,9 @@ main(int argc, char **argv)
         }
     }
 
+#ifdef CUVS_CAGRA_FOLD_ENABLED
+    page_fold_configure();
+#endif
     {
         char err[256], scope[32];
         if (cuvs_reclaim_params_check(&g_reclaim, err, sizeof(err)) != 0)

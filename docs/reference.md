@@ -334,7 +334,7 @@ daemon-only ones have no session equivalent.
 | `--rmm-pool-max-percent N` | `cuvs.rmm_pool_max_percent` (read-only status) | `50` | Hard upstream quota: total CUDA memory × N%, rounded down to 256 bytes, on each allowed GPU. Range 1–100; initial reservation must fit. Preserves the pool's doubling/backoff growth policy |
 | `--rmm-scratch-permille N` | — (daemon-only, `scratch_permille` in `cuvs.rmm_pool_status`) | `9593` (Q1 qualification on one NVIDIA A100-SXM4-80GB host with `--cagra-build-overflow managed`; recalibrate for other GPUs or overflow policies) | CAGRA build scratch coefficient ρ. Admission, reservation and GPU choice use `N = final + ceil(final × ρ / 1000)`; residency accounting keeps `final`. Range 0–100000. Restart to change |
 | `--max-indexes N` | — (daemon-only) | `1024` | **Soft** LRU working-set cap (ADR-068), not a hard wall (was 64). At the cap, a reload or `pg_cuvs_load` frees a slot under the § 8 rules (cold first, then soft eviction; reason `slot`); a build over the cap does not evict (with the default `--build-evict-scope none`): its files are saved and the first query reloads it |
-| `--page-overlay-host-bytes N` | — (daemon-only) | `0` | Explicit host budget for page-overlay chunks during receive, residency and active searches. A zero budget disables chunk allocation. Overlay IPC returns `PAGE_OVERLAY_HOST_FULL` to the caller on budget exhaustion. The per-index row limit also applies. |
+| `--page-overlay-host-bytes N` | — (daemon-only) | `0` | Host budget for page-overlay chunks during receive, residency and active searches, plus fold staging, mirrors and retained host graph buffers when folding is enabled. A zero budget disables chunk allocation. Overlay IPC returns `PAGE_OVERLAY_HOST_FULL` to the caller on budget exhaustion. The per-index row limit also applies. |
 | `--build-evict-scope …` and the other cache flags | — (daemon-only) | see § 8 | Cache, eviction and reclaim knobs (§ 8.2) |
 | `--hnsw-auto-overflow ace\|error` | `hnsw_auto_overflow` in `cuvs.rmm_pool_status` (read-only) | `ace` | What `pg_cuvs_hnsw` `build_algo=auto` does over the resident budget: `ace` spills to ACE-disk with a NOTICE, `error` refuses with SQLSTATE 54000. The same value decides an auto build whose resident IVF-PQ kNN graph cuVS rejects: `ace` rebuilds on ACE-disk with a NOTICE (receipt `graph_fallback`), `error` fails. Startup-only; logged at startup. Explicit `ivf_pq`/`ace` ignore it |
 | `--hnsw-ace-build-quality auto\|Q` | — (daemon-only, restart) | `auto` | ACE partition build quality handed to cuVS (`ace_params.ef_construction` = A; the SDK uses q = A/16, NN-descent runs 5 + q iterations per partition under 1e6 rows). `auto`: q = (the SDK's default NN-descent iterations, 20) − 5 at `ef_construction` 64, i.e. A 240, scaled by `ef_construction`/64. `Q` (0–4095): A = 16·Q for every ACE build, ignoring `ef_construction`. Logged at startup; recorded per index in `pg_cuvs_hnsw_build_info` (`ace_build_quality_source`, `ace_build_quality`). Resident builds ignore it |
@@ -544,8 +544,27 @@ block or subtransaction. Folding requires an existing base GPU graph. After a
 daemon or PostgreSQL restart, PostgreSQL
 retains the WAL-published page state and can use exact heap search if the
 matching GPU graph is unavailable.
-Set the daemon's `--page-overlay-host-bytes` to cover the supplied overlay,
-packed input and the fold's host copies of the expanded dataset and graph.
+
+The daemon reads these environment variables at startup. Restart it to apply
+a change.
+
+| Variable | Default | Effect |
+|----------|---------|--------|
+| `CUVS_PAGE_FOLD_BATCH_ROWS` | `0` (or unset) | Uses the existing GPU fold algorithm, with up to 16,384 pending positions per fold. A graph becomes eligible at 100 pending positions or after 300 seconds with pending positions. An integer from `1` to `16384` enables optimized folding, caps the number of positions at that value and makes the graph eligible from the first pending position. Other values log a warning and use the default policy. |
+| `CUVS_PAGE_FOLD_PROFILE` | `0` (or unset) | `1` enables diagnostic `[page_fold_phases]` lines in either fold mode. The lines report `staging_us`, `input_us`, `dataset_us`, `graph_setup_us`, `incoming_us`, `search_us`, `rank_us`, `reverse_us`, `scatter_us`, `final_graph_us` and `host_graph_cache_hit`. Timing can add GPU synchronization. Other values log a warning and leave profiling off. |
+
+Set `--page-overlay-host-bytes` to cover the supplied overlay, packed fold
+input and host mirrors of the expanded output. The existing path mirrors the
+graph and dataset. Optimized folds can copy the dataset directly between GPU
+buffers when the dataset row stride equals the vector dimension. That path
+only needs a host graph mirror. Each fold producer can retain one host graph
+buffer for the next fold of the same graph chain, with its allocated capacity
+charged to the same budget. The producer frees it when switching chains,
+after 30 seconds without a successful update, or on thread exit. The fold
+can use an SDK-owned host graph when the cache allocation cannot fit.
+Supply requests under host-budget pressure reclaim idle buffers and cause
+producers to release active buffers when their current fold finishes.
+
 With the RMM pool enabled, a fold reuses the pool's existing backing and can
 defer when that backing cannot satisfy its allocations. A fold cannot grow the
 pool's backing, which could stay resident after the fold yields to a build.

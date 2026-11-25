@@ -2427,6 +2427,7 @@ cuvs_cagra_fold_reuse_with_yield(CuvsCagraIndex source, const float *new_vectors
         /* Device allocation itself can enqueue CUDA work. From this point,
          * keep the owner and its inputs until the request stream is checked. */
         may_have_gpu_work = true;
+        CuvsCagraFoldTimer input_timer(control);
         auto added = raft::make_device_matrix<float, int64_t>(resources, n_new, int64_t(dim));
         raft::copy(added.data_handle(), new_vectors, size_t(n_new) * size_t(dim), resources.get_stream());
         resources.sync_stream();
@@ -2442,6 +2443,7 @@ cuvs_cagra_fold_reuse_with_yield(CuvsCagraIndex source, const float *new_vectors
                 cuvs_cagra_fold_checkpoint(control);
             }
         }
+        input_timer.finish(&CuvsCagraFoldPhases::input_us);
         auto dataset = raft::make_device_matrix<float, int64_t>(resources, total, stride);
         auto dataset_view = raft::make_device_strided_matrix_view<float, int64_t>(
             dataset.data_handle(), total, dim, stride);
@@ -2456,6 +2458,8 @@ cuvs_cagra_fold_reuse_with_yield(CuvsCagraIndex source, const float *new_vectors
             throw std::runtime_error("completed CAGRA fold has invalid ownership");
         cuvs_cagra_fold_checkpoint(control);
         auto completed = std::make_unique<CuvsCagraIndexImpl>(std::move(dataset), std::move(next), old.metric);
+        if (control && control->result_device_graph)
+            *control->result_device_graph = completed->idx.graph().data_handle();
         *result = completed.release();
         return CUVS_CAGRA_FOLD_OK;
     } catch (const CuvsCagraFoldYield &) {

@@ -817,9 +817,86 @@ test_fold_dead_batch_without_base(void)
 
     assert(cuvs_page_overlay_alloc(&budget, &request, bytes, &chunk) == CUVS_STATUS_OK);
     memset(chunk->marks, 0, bytes);
-    CHECK(page_fold_copy_rows(chunk, 0, request.positions, 1, vectors, live, false) == 0);
+    CHECK(page_fold_copy_rows(chunk, 0, request.positions, 1, vectors, live, false, false) == 0);
+    CHECK(page_fold_copy_rows(chunk, 0, 1, 1, vectors, live, false, true) == 0);
     cuvs_page_overlay_release(chunk);
     CHECK(budget.used == 0);
+}
+
+static void
+test_fold_dead_prefix_with_live_suffix(void)
+{
+    CuvsPageOverlayBudget budget = {.limit = 4096};
+    const CuvsPageOverlayRequest first = {.positions = 1};
+    const CuvsPageOverlayRequest rest = {.from = 1, .positions = 2};
+    CuvsPageOverlayChunk *prefix, *suffix;
+    const float sample = 42.0f;
+    float row = -1;
+    unsigned char live = 0;
+
+    assert(cuvs_page_overlay_alloc(&budget, &first, sizeof(CuvsPagePosition), &prefix) == CUVS_STATUS_OK);
+    assert(cuvs_page_overlay_alloc(&budget, &rest, 2 * sizeof(CuvsPagePosition) + sizeof(sample),
+                                   &suffix) == CUVS_STATUS_OK);
+    prefix->marks[0] = (CuvsPagePosition) {.state = CUVS_PAGE_POSITION_DEAD};
+    suffix->marks[0] = (CuvsPagePosition) {.state = CUVS_PAGE_POSITION_DEAD};
+    suffix->marks[1] = (CuvsPagePosition) {.block = 1, .state = CUVS_PAGE_POSITION_VECTOR};
+    memcpy(suffix->marks + 2, &sample, sizeof(sample));
+    suffix->next = prefix;
+
+    CHECK(page_fold_copy_rows(suffix, 0, 1, 1, &row, &live, false, false) == 0);
+    CHECK(page_fold_copy_rows(suffix, 0, 1, 1, &row, &live, false, true) == 1);
+    CHECK(live == 1 && row == sample);
+    cuvs_page_overlay_release(suffix);
+    CHECK(budget.used == 0);
+}
+
+static void
+test_fold_cache_supply_pressure(void)
+{
+    CuvsPageOverlayRequest request = {.positions = 1, .vector_rows = 1};
+    CuvsPageOverlayChunk *chunk = NULL;
+    const CuvsPagePosition mark = {.block = 1, .state = CUVS_PAGE_POSITION_VECTOR};
+    const float sample = 42.0f;
+    const size_t bytes = sizeof(mark) + sizeof(sample);
+    PageFoldHostGraphCache cache = {0};
+    const uid_t saved_peer = g_peer_uid;
+
+    reset(CUVS_HNSW_OVERFLOW_ERROR, 0);
+    g_page_fold_batch_rows = 1;
+    g_page_overlay_budget.limit = 1024;
+    g_peer_uid = geteuid();
+    snprintf(request.supplement_shm, sizeof(request.supplement_shm),
+             "/fold-supply-pressure-%ld", (long) getpid());
+    int fd = shm_open(request.supplement_shm, O_RDWR | O_CREAT | O_EXCL, 0600);
+    assert(fd >= 0 && write(fd, &mark, sizeof(mark)) == sizeof(mark) &&
+           write(fd, &sample, sizeof(sample)) == sizeof(sample));
+    close(fd);
+
+    /* A retained but idle mirror is reclaimable by the real supply read. */
+    assert(page_fold_host_graph_grow(&cache, 1024));
+    page_fold_host_graph_return(0, &cache, g_page_fold_cache_epoch);
+    CHECK(!cache.graph && g_page_fold_idle_cache[0].graph);
+    CHECK(read_page_overlay_chunk(&request, 1, true, &chunk) == CUVS_STATUS_OK);
+    CHECK(!g_page_fold_idle_cache[0].graph && g_page_overlay_budget.used == sizeof(*chunk) + bytes);
+    CHECK(chunk && memcmp(chunk->marks + 1, &sample, sizeof(sample)) == 0);
+    cuvs_page_overlay_release(chunk);
+    page_fold_host_graph_release(&g_page_fold_idle_cache[0]);
+
+    /* The supply may not take a mirror while a producer borrows it. Its
+     * retirement on completion frees space for the next supply. */
+    assert(page_fold_host_graph_grow(&cache, 1024));
+    page_fold_host_graph_return(0, &cache, g_page_fold_cache_epoch);
+    uint64_t epoch = page_fold_host_graph_take(0, &cache);
+    CHECK(read_page_overlay_chunk(&request, 1, true, &chunk) == CUVS_STATUS_PAGE_OVERLAY_HOST_FULL);
+    CHECK(!chunk && cache.graph && g_page_overlay_budget.used == 1024);
+    page_fold_host_graph_return(0, &cache, epoch);
+    CHECK(!cache.graph && !g_page_fold_idle_cache[0].graph && !g_page_overlay_budget.used);
+    CHECK(read_page_overlay_chunk(&request, 1, true, &chunk) == CUVS_STATUS_OK);
+    cuvs_page_overlay_release(chunk);
+    shm_unlink(request.supplement_shm);
+    CHECK(!g_page_overlay_budget.used);
+    g_page_fold_batch_rows = 0;
+    g_peer_uid = saved_peer;
 }
 
 static PageCagraGraph *
@@ -1254,6 +1331,10 @@ main(int argc, char **argv)
             test_extend_after_wait(false, true);
         else if (strcmp(argv[1], "build-rmm-phys-limit") == 0)
             test_build_rmm_phys_limit();
+        else if (strcmp(argv[1], "fold-dead-prefix") == 0)
+            test_fold_dead_prefix_with_live_suffix();
+        else if (strcmp(argv[1], "fold-cache-supply") == 0)
+            test_fold_cache_supply_pressure();
         else
             return 2;
         goto done;
@@ -1286,6 +1367,8 @@ main(int argc, char **argv)
     test_shard_fallback_wait(true);
     test_shard_fallback_wait(false);
     test_fold_dead_batch_without_base();
+    test_fold_dead_prefix_with_live_suffix();
+    test_fold_cache_supply_pressure();
     test_fold_host_charge();
     test_build_combined_device(false, false);
     test_build_combined_device(true, false);
