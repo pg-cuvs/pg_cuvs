@@ -2399,6 +2399,8 @@ typedef struct DeltaRead {
     FILE *stream;                  /* keeps LOCK_SH through path revalidation */
     DeltaRows *rows;
     DeltaFileStamp file, tids_file;
+    bool have_file;
+    bool open_missing;
     int64_t n, from;
     uint32_t generation;
     int replace_rows;
@@ -2445,7 +2447,10 @@ delta_read_change(const char *path, const char *tids_path, DeltaFileStamp cached
 {
     int fd = open(path, O_RDONLY | O_NONBLOCK);
     if (fd < 0)
+    {
+        read->open_missing = errno == ENOENT;
         return 0;
+    }
     FILE *f = fdopen(fd, "rb");
     if (!f)
     {
@@ -2477,6 +2482,7 @@ delta_read_change(const char *path, const char *tids_path, DeltaFileStamp cached
     if (locked != 0 || fstat(fd, &st) != 0 || !S_ISREG(st.st_mode))
         return 0;
     read->file = delta_file_stamp(&st);
+    read->have_file = true;
     if (read->file.size < (off_t) sizeof(hdr) || cuvs_delta_read_header(f, &hdr) != 0
         || hdr.dim != dim || hdr.metric != metric
         || cuvs_delta_validate(&hdr, read->file.size - (off_t) sizeof(hdr)) != 0)
@@ -2547,7 +2553,12 @@ delta_read_change(const char *path, const char *tids_path, DeltaFileStamp cached
 
 done:
     /* Catch a truncate or rewrite during the read even if it did not flock. */
-    if (fstat(fd, &st) != 0 || !delta_same_stamp(read->file, delta_file_stamp(&st)))
+    if (fstat(fd, &st) != 0)
+    {
+        read->have_file = false;
+        ready = 0;
+    }
+    else if (!delta_same_stamp(read->file, delta_file_stamp(&st)))
         ready = 0;
     free(rec);
     return ready;
@@ -2633,7 +2644,10 @@ refresh_delta_cache(IndexEntry **entry)
         delta_rows_release(prefix);
         e = find_index(db_oid, index_oid);
         int same_entry = e && e->delta_residency == resident && !e->stale;
-        int same_delta = same_entry && stat(path, &st) == 0
+        int can_check_path = same_entry && (read.have_file || read.open_missing);
+        int path_stat = can_check_path ? stat(path, &st) : -1;
+        int path_missing = can_check_path && path_stat != 0 && errno == ENOENT;
+        int same_delta = path_stat == 0 && read.have_file
                          && delta_same_stamp(read.file, delta_file_stamp(&st));
         int same_tids = same_delta && ready > 0 && stat(tids_path, &tids_st) == 0
                         && delta_same_stamp(read.tids_file, delta_file_stamp(&tids_st));
@@ -2647,20 +2661,23 @@ refresh_delta_cache(IndexEntry **entry)
             delta_rows_release(read.rows);
             return DELTA_CACHE_RETRY;
         }
-        if (e->delta_revision != revision || !same_delta)
+        /* An I/O failure before we had a file stamp is a cache miss.
+         * ENOENT during open can still identify a disappearing path. */
+        if (can_check_path &&
+            (e->delta_revision != revision || path_missing || (path_stat == 0 && !same_delta)))
         {
             delta_rows_release(read.rows);
             continue;
+        }
+        if (path_stat != 0 || !ready)
+        {
+            delta_rows_release(read.rows);
+            return DELTA_CACHE_MISS;
         }
         if (ready < 0)
         {
             free_delta_cache(e);
             continue;
-        }
-        if (!ready)
-        {
-            delta_rows_release(read.rows);
-            return DELTA_CACHE_MISS;
         }
         if (!same_tids)
         {
@@ -6986,9 +7003,11 @@ handle_search(int client_fd, const CuvsCmdFrame *cmd)
             return;
         }
 
+        int use_gpu_delta = !use_bf && cmd->delta_search_mode != CUVS_DELTA_SEARCH_CPU;
         int delta_ready = 0;
-        int delta_status = use_bf ? CUVS_STATUS_OK
-                           : prepare_delta_cache(&e, cmd->delta_search_mode, &delta_ready);
+        int delta_status = use_gpu_delta
+                           ? prepare_delta_cache(&e, cmd->delta_search_mode, &delta_ready)
+                           : CUVS_STATUS_OK;
         if (delta_status != CUVS_STATUS_OK)
         {
             munmap(query, vec_bytes);
@@ -7080,6 +7099,7 @@ handle_search(int client_fd, const CuvsCmdFrame *cmd)
 
         pthread_mutex_unlock(&g_index_mutex);   /* ---- lock-free GPU dispatch ---- */
 #ifdef CUVS_TEST_HOOKS
+        delta_test_pause("shard-fanout");
         {
             const char *pause = getenv("CUVS_TEST_SHARD_PAUSE_MS");
             if (pause)
@@ -7126,10 +7146,10 @@ handle_search(int client_fd, const CuvsCmdFrame *cmd)
         int same_resident = e && e->delta_residency == fanout_residency;
         if (same_resident && e->inflight > 0)
             e->inflight--;
-        if (!same_resident || e->stale)
+        if (!same_resident || (use_gpu_delta && e->stale))
         {
-            /* Cannot happen for the supported workload (ADR-022 invariant);
-             * fail closed to CPU rather than risk touching freed memory. */
+            /* Shard results belong to the original resident base. A GPU
+             * delta search also needs that base to stay valid. */
             for (int s = 0; s < sc; s++) free(args[s].out);
             free(args); free(threads);
             munmap(query, vec_bytes);

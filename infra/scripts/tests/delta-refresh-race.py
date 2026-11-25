@@ -6,6 +6,7 @@ import concurrent.futures
 import fcntl
 import os
 from pathlib import Path
+import stat
 import struct
 import subprocess
 import time
@@ -93,12 +94,13 @@ class Fixture:
             fcntl.flock(handle, fcntl.LOCK_EX)
             self.write_append(handle, row)
 
-    def search(self, q, *, table="d", delta_mode="gpu", wait=None, timeout=15):
+    def search(self, q, *, table="d", delta_mode="gpu", search_mode="cagra", wait=None, timeout=15):
         if wait is None:
             wait = self.batch_wait
         settings = (
             "SET enable_seqscan = off; "
             f"SET cuvs.delta_search = '{delta_mode}'; "
+            f"SET cuvs.search_mode = '{search_mode}'; "
             f"SET cuvs.cagra_batch_wait_us = {wait}; "
         )
         query = f"SELECT id FROM {self.schema}.{table} ORDER BY v <-> '[{q},1,0,0]'::vector LIMIT 1"
@@ -218,6 +220,22 @@ class Fixture:
             handle.write(self.header_for(3))
         assert self.nearest(990) == 903
 
+    def unreadable_delta(self):
+        self.replace(901, 902)
+        permissions = stat.S_IMODE(self.delta.stat().st_mode)
+        merged_before = self.stats().split()[1]
+
+        def deny_read():
+            self.delta.chmod(0)
+            assert not os.access(self.delta, os.R_OK)
+
+        try:
+            assert self.race("request", lambda: self.nearest(950), deny_read) == 200
+            assert self.stats().split()[1] == merged_before
+        finally:
+            self.delta.chmod(permissions)
+        assert self.nearest(950) == 902
+
     def generation_change(self, *, warm):
         self.replace(901, 902)
         if warm:
@@ -300,14 +318,23 @@ class Fixture:
                 parked_tids.replace(self.tids)
         assert self.nearest(950) == 902
 
-    def stale_after_read(self):
-        self.replace(901, 902)
-        result = self.race("read", lambda: self.search(950), lambda: self.sql(
+    def mark_stale(self):
+        self.sql(
             "SET cuvs.max_delta_rows = 0; "
             f"INSERT INTO {self.schema}.d VALUES (904, '[1000,1,0,0]')"
-        ))
+        )
+
+    def stale_after_read(self):
+        self.replace(901, 902)
+        result = self.race("read", lambda: self.search(950), self.mark_stale)
         self.expect_sqlstate(result, "55000")
         assert "is stale" in result.stderr
+
+    def shard_stale_without_delta(self, *, delta_mode, search_mode):
+        self.replace(901, 902)
+        assert self.race("shard-fanout",
+                         lambda: self.nearest(150, delta_mode=delta_mode, search_mode=search_mode),
+                         self.mark_stale) == 150
 
     def cases(self):
         return {
@@ -316,6 +343,7 @@ class Fixture:
             "delta-replace": self.delta_replace,
             "delta-truncate": self.delta_truncate,
             "late-header": self.late_header,
+            "unreadable-delta": self.unreadable_delta,
             "tids-during-read": lambda: self.generation_change(warm=False),
             "tids-warm": lambda: self.generation_change(warm=True),
             "reload-read": self.reload_read,
@@ -339,6 +367,11 @@ def main():
     fixture = Fixture(args.barrier_dir, args.index_dir, args.mode)
     cases = fixture.cases()
     selected = args.case or list(cases)
+    if args.mode == "sharded":
+        cases.update({
+            "shard-stale-cpu": lambda: fixture.shard_stale_without_delta(delta_mode="cpu", search_mode="cagra"),
+            "shard-stale-bf": lambda: fixture.shard_stale_without_delta(delta_mode="gpu", search_mode="brute_force"),
+        })
     if any(name not in cases for name in selected):
         parser.error("available cases: " + ", ".join(cases))
     try:
