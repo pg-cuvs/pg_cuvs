@@ -291,6 +291,8 @@ typedef struct IndexEntry {
     time_t          loaded_at;          /* registration time (order key) */
     int             file_current;       /* I-FC: 1 iff graph/tids == .cagra/.tids */
     bool            compact_save_pending; /* failed compact must finish before accepting EXTEND */
+    dev_t           compact_tombstone_dev;
+    ino_t           compact_tombstone_ino;
     uint64_t        extra_search_generation; /* optional opcode, protected by g_index_mutex */
     int             extra_search_default_dir;
     dev_t           extra_search_dir_dev;
@@ -2823,6 +2825,19 @@ save_index(IndexEntry *e)
     LOG_INFO("pg_cuvs_server: saved index %u/%u (%lld vecs)\n",
             e->db_oid, e->index_oid, (long long)e->n_vecs);
     return 0;
+}
+
+/* Save the resident graph without clearing the tombstone guard. COMPACT
+ * controls when EXTEND may resume. Shutdown needs only to persist the rows. */
+static int
+save_pending_compact(IndexEntry *e)
+{
+    IndexEntry resident = *e;
+    resident.compact_save_pending = false;
+    int rc = save_index(&resident);
+    if (rc == 0)
+        e->file_current = 1;
+    return rc;
 }
 
 /* Phase 3F: reload a sharded logical index from its `.shards` manifest. The
@@ -12962,13 +12977,42 @@ cmp_u64(const void *a, const void *b)
     return (x > y) - (x < y);
 }
 
-/* Caller holds g_index_mutex. A retained tombstone must not outlive the
- * guard against appending a new row at the same TID. */
-static bool
-finish_compact_tombstones(IndexEntry *e, const char *path)
+/* Caller holds g_index_mutex. Record the directory that owns the guard. */
+static void
+mark_compact_pending(IndexEntry *e, const char *dir)
 {
-    e->compact_save_pending = unlink(path) != 0 && errno != ENOENT;
-    return !e->compact_save_pending;
+    if (e->compact_save_pending)
+        return;
+    struct stat st;
+    e->compact_tombstone_ino = 0;
+    if (stat(dir, &st) == 0 && S_ISDIR(st.st_mode))
+    {
+        e->compact_tombstone_dev = st.st_dev;
+        e->compact_tombstone_ino = st.st_ino;
+    }
+    e->compact_save_pending = true;
+}
+
+/* A retained tombstone must not outlive the guard against TID reuse. */
+static bool
+finish_compact_tombstones(IndexEntry *e, const char *dir, const char *path)
+{
+    if (unlink(path) != 0 && errno != ENOENT)
+    {
+        mark_compact_pending(e, dir);
+        return false;
+    }
+    e->compact_save_pending = false;
+    return true;
+}
+
+static bool
+compact_tombstones_absent(const IndexEntry *e, const char *dir, const char *path)
+{
+    struct stat st;
+    return e->compact_tombstone_ino != 0 && stat(dir, &st) == 0 &&
+           st.st_dev == e->compact_tombstone_dev && st.st_ino == e->compact_tombstone_ino &&
+           lstat(path, &st) != 0 && errno == ENOENT;
 }
 
 /* ----------------------------------------------------------------
@@ -13001,14 +13045,22 @@ handle_compact(int client_fd, const CuvsCmdFrame *cmd)
     FILE *tf = fopen(tombstone_path, "rb");
     if (!tf)
     {
+        int open_error = errno;
         pthread_mutex_lock(&g_index_mutex);
         IndexEntry *e = find_index(cmd->db_oid, cmd->index_oid);
+        /* If the tombstones are already gone, persist whichever graph is
+         * resident before ending the write hold. An unreadable file is not
+         * equivalent to an absent one. Recheck after the save as well. */
+        if (e && e->compact_save_pending && open_error == ENOENT &&
+            compact_tombstones_absent(e, save_dir, tombstone_path) &&
+            save_pending_compact(e) == 0 && compact_tombstones_absent(e, save_dir, tombstone_path))
+            e->compact_save_pending = false;
         bool pending = e && e->compact_save_pending;
         pthread_mutex_unlock(&g_index_mutex);
         if (pending)
         {
             send_error_code(client_fd, CUVS_STATUS_PERSIST_FAILED,
-                            "cannot read tombstones for pending compaction");
+                            "cannot finish pending compaction");
             return;
         }
         /* No tombstone: nothing to compact. Reply OK. */
@@ -13116,20 +13168,14 @@ handle_compact(int client_fd, const CuvsCmdFrame *cmd)
         free(keep_bits);
         /* A previous attempt may have published the compacted TIDs before
          * failing. Retry its resident graph without replaying the merge. */
-        if (e->compact_save_pending)
+        if (e->compact_save_pending && save_pending_compact(e) != 0)
         {
-            IndexEntry compacted = *e;
-            compacted.compact_save_pending = false;
-            if (save_index(&compacted) != 0)
-            {
-                pthread_mutex_unlock(&g_index_mutex);
-                send_error_code(client_fd, CUVS_STATUS_PERSIST_FAILED,
-                                "save_index failed after compact");
-                return;
-            }
-            e->file_current = 1;
+            pthread_mutex_unlock(&g_index_mutex);
+            send_error_code(client_fd, CUVS_STATUS_PERSIST_FAILED,
+                            "save_index failed after compact");
+            return;
         }
-        if (!finish_compact_tombstones(e, tombstone_path))
+        if (!finish_compact_tombstones(e, save_dir, tombstone_path))
         {
             pthread_mutex_unlock(&g_index_mutex);
             send_error_code(client_fd, CUVS_STATUS_PERSIST_FAILED,
@@ -13223,7 +13269,7 @@ handle_compact(int client_fd, const CuvsCmdFrame *cmd)
     int save_status = save_index(&compacted);
     if (save_status != 0 && save_status != SAVE_INDEX_PUBLISH_FAILED)
     {
-        e->compact_save_pending = true;
+        mark_compact_pending(e, save_dir);
         cuvs_cagra_free(new_handle, (int)e->gpu_device_id);
         free(new_tids);
         pthread_mutex_unlock(&g_index_mutex);
@@ -13255,13 +13301,13 @@ handle_compact(int client_fd, const CuvsCmdFrame *cmd)
 
     if (save_status != 0)
     {
-        e->compact_save_pending = true;
+        mark_compact_pending(e, save_dir);
         pthread_mutex_unlock(&g_index_mutex);
         send_error_code(client_fd, CUVS_STATUS_PERSIST_FAILED,
                         "save_index failed after compact");
         return;
     }
-    if (!finish_compact_tombstones(e, tombstone_path))
+    if (!finish_compact_tombstones(e, save_dir, tombstone_path))
     {
         pthread_mutex_unlock(&g_index_mutex);
         send_error_code(client_fd, CUVS_STATUS_PERSIST_FAILED,
@@ -16532,15 +16578,17 @@ graceful_shutdown(void)
     int saved = 0, failed = 0;
     for (int i = 0; i < g_n_indexes; i++)
     {
-        if (!g_indexes[i].valid)
+        IndexEntry *e = &g_indexes[i];
+        if (!e->valid)
             continue;
-        if (save_index(&g_indexes[i]) == 0) {
+        int rc = e->compact_save_pending ? save_pending_compact(e) : save_index(e);
+        if (rc == 0) {
             saved++;
         } else {
             failed++;
             LOG_ERROR("sigterm: save_index FAILED for %u/%u "
                       "(operator must REINDEX after restart)\n",
-                    g_indexes[i].db_oid, g_indexes[i].index_oid);
+                      e->db_oid, e->index_oid);
         }
     }
     pthread_mutex_unlock(&g_index_mutex);

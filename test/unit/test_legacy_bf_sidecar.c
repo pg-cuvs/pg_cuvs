@@ -25,7 +25,7 @@ static const uint64_t base_tids[] = {101, 102, 103, 104};
 
 typedef enum {
     NO_FAULT, BUILD_CRASH, BUILD_SYNC_FAIL, COMPACT_UNLINK_FAIL, COMPACT_SYNC_FAIL,
-    COMPACT_PUBLISH_SYNC_FAIL, COMPACT_TOMBSTONE_UNLINK_FAIL
+    COMPACT_PUBLISH_SYNC_FAIL, COMPACT_TOMBSTONE_UNLINK_FAIL, COMPACT_PUBLISH_RENAME_FAIL
 } FixtureFault;
 static FixtureFault fault;
 static bool graph_renamed;
@@ -53,6 +53,11 @@ fixture_unlink(const char *path)
 static int
 fixture_rename(const char *from, const char *to)
 {
+    if (fault == COMPACT_PUBLISH_RENAME_FAIL && has_suffix(to, ".cagra"))
+    {
+        errno = EIO;
+        return -1;
+    }
     int rc = rename(from, to);
     if (rc == 0 && (fault == BUILD_CRASH || fault == BUILD_SYNC_FAIL ||
                     fault == COMPACT_PUBLISH_SYNC_FAIL) && has_suffix(to, ".cagra"))
@@ -139,16 +144,22 @@ write_tombstone(uint64_t dead_tid)
 }
 
 static uint32_t
-run_compact(void)
+run_compact_in(const char *index_dir)
 {
     char dir[256] = {0};
-    snprintf(dir, sizeof(dir), "%s", g_index_dir);
+    snprintf(dir, sizeof(dir), "%s", index_dir);
     int sockets[2];
     assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
     assert(cuvs_fd_send(sockets[0], -1, dir, sizeof(dir)) == 0);
     CuvsCmdFrame cmd = {.op = CUVS_OP_COMPACT, .db_oid = db, .index_oid = idx};
     handle_compact(sockets[1], &cmd);
     return reply_status(sockets);
+}
+
+static uint32_t
+run_compact(void)
+{
+    return run_compact_in(g_index_dir);
 }
 
 static void
@@ -159,9 +170,9 @@ compact(uint64_t dead_tid)
 }
 
 static uint32_t
-run_extend(uint64_t tid)
+run_extend(uint64_t tid, float first)
 {
-    struct { float vec[2]; uint64_t tid; } row = {{9, 0}, tid};
+    struct { float vec[2]; uint64_t tid; } row = {{first, 0}, tid};
     char dir[256] = {0};
     snprintf(dir, sizeof(dir), "%s", g_index_dir);
     CuvsCmdFrame cmd = {.op = CUVS_OP_EXTEND, .db_oid = db, .index_oid = idx,
@@ -184,7 +195,7 @@ run_extend(uint64_t tid)
 static void
 extend(uint64_t tid)
 {
-    assert(run_extend(tid) == CUVS_STATUS_OK);
+    assert(run_extend(tid, 9) == CUVS_STATUS_OK);
 }
 
 static void
@@ -400,7 +411,7 @@ compact_save_retry(FixtureFault save_fault)
 
     /* No new vector or eviction while the retry can still see the old TID. */
     CuvsCagraIndex retained = e->handle;
-    assert(run_extend(104) == CUVS_STATUS_STALE);
+    assert(run_extend(104, 9) == CUVS_STATUS_STALE);
     assert(e->handle == retained && e->n_extended == 0);
     int persist_failed = 0;
     assert(evict_entry(e, 0, CUVS_EVICT_MANUAL_UNLOAD, 0,
@@ -424,6 +435,101 @@ compact_save_retry(FixtureFault save_fault)
     assert(save_index(e) == 0);
     e = reload_from_disk();
     assert_graph_hit(e, 9, 104);
+}
+
+/* Before publication the old disk graph lacks the accepted EXTEND. After
+ * .tids has been renamed, fail the graph rename itself so the new pair is
+ * also unavailable on disk. Either case needs the resident graph saved. */
+static void
+begin_compact_with_prior_extend(bool published)
+{
+    assert(build(g_index_dir, base_vecs, base_tids) == CUVS_STATUS_OK);
+    IndexEntry *e = find_index(db, idx);
+    uint32_t original_crc, disk_crc;
+    assert(tids_body_crc_of(e, &original_crc) == 0);
+    extend(105);
+    write_tombstone(104);
+    fault = published ? COMPACT_PUBLISH_RENAME_FAIL : COMPACT_UNLINK_FAIL;
+    assert(run_compact() == CUVS_STATUS_PERSIST_FAILED);
+    assert(e->compact_save_pending && e->n_vecs == (published ? 4 : 5));
+    assert(e->compact_count == (published ? 1 : 0));
+    assert_graph_hit(e, 9, 105);
+    if (published)
+    {
+        char tids_path[512];
+        tids_file_path(tids_path, sizeof(tids_path), g_index_dir, db, idx);
+        assert(access(tids_path, F_OK) != 0 && errno == ENOENT);
+    }
+    else
+        assert(tids_body_crc_of(e, &disk_crc) == 0 && disk_crc == original_crc);
+}
+
+static void
+compact_pending_shutdown(bool published)
+{
+    begin_compact_with_prior_extend(published);
+    fault = NO_FAULT;
+    pid_t child = fork();
+    assert(child >= 0);
+    if (child == 0)
+    {
+        struct sigaction sa = {.sa_handler = sigterm_handler};
+        sigemptyset(&sa.sa_mask);
+        assert(sigaction(SIGTERM, &sa, NULL) == 0);
+        sigset_t unblocked;
+        sigemptyset(&unblocked);
+        sigaddset(&unblocked, SIGTERM);
+        assert(sigprocmask(SIG_UNBLOCK, &unblocked, NULL) == 0);
+        assert(raise(SIGTERM) == 0 && g_shutdown);
+        graceful_shutdown();
+        _exit(0);
+    }
+    int status;
+    assert(waitpid(child, &status, 0) == child);
+    assert(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+
+    /* Drop the parent's in-memory copy without saving to test disk reload. */
+    IndexEntry *e = reload_from_disk();
+    assert(e->n_vecs == (published ? 4 : 5));
+    assert_graph_hit(e, 9, 105);
+    char tombstone[512];
+    snprintf(tombstone, sizeof(tombstone), "%s/%u_%u.tombstone", g_index_dir, db, idx);
+    assert(unlink(tombstone) == 0); /* Shutdown must have kept the tombstones. */
+}
+
+static void
+compact_pending_missing_tombstone(bool published)
+{
+    begin_compact_with_prior_extend(published);
+    FixtureFault save_fault = fault;
+    char other_dir[576];
+    snprintf(other_dir, sizeof(other_dir), "%s/other-XXXXXX", g_index_dir);
+    assert(mkdtemp(other_dir));
+    fault = NO_FAULT;
+    assert(run_compact_in(other_dir) == CUVS_STATUS_PERSIST_FAILED);
+    assert(run_extend(106, 10) == CUVS_STATUS_STALE);
+    assert(rmdir(other_dir) == 0);
+
+    char tombstone[512];
+    snprintf(tombstone, sizeof(tombstone), "%s/%u_%u.tombstone", g_index_dir, db, idx);
+    assert(unlink(tombstone) == 0);
+    fault = save_fault;
+    assert(run_compact() == CUVS_STATUS_PERSIST_FAILED); /* I/O is still blocked. */
+    assert(run_extend(106, 10) == CUVS_STATUS_STALE);
+
+    fault = NO_FAULT;
+    char alias[sizeof(g_index_dir) + sizeof("/.")];
+    snprintf(alias, sizeof(alias), "%s/.", g_index_dir);
+    assert(run_compact_in(alias) == CUVS_STATUS_OK);
+    IndexEntry *e = find_index(db, idx);
+    uint32_t disk_crc;
+    assert(tids_body_crc_of(e, &disk_crc) == 0);
+    assert(disk_crc == cuvs_crc32(e->tids, (size_t)e->n_vecs * sizeof(*e->tids)));
+    assert(run_extend(106, 10) == CUVS_STATUS_OK);
+    assert(save_index(e) == 0);
+    e = reload_from_disk();
+    assert_graph_hit(e, 9, 105);
+    assert_graph_hit(e, 10, 106);
 }
 
 static void
@@ -490,6 +596,14 @@ main(int argc, char **argv)
         compact_save_retry(COMPACT_PUBLISH_SYNC_FAIL);
     else if (strcmp(argv[1], "compact-retry-tombstone") == 0)
         compact_save_retry(COMPACT_TOMBSTONE_UNLINK_FAIL);
+    else if (strcmp(argv[1], "compact-shutdown-before") == 0)
+        compact_pending_shutdown(false);
+    else if (strcmp(argv[1], "compact-shutdown-after") == 0)
+        compact_pending_shutdown(true);
+    else if (strcmp(argv[1], "compact-enoent-before") == 0)
+        compact_pending_missing_tombstone(false);
+    else if (strcmp(argv[1], "compact-enoent-after") == 0)
+        compact_pending_missing_tombstone(true);
     else if (strcmp(argv[1], "binding-other-dir") == 0)
         binding_after_other_dir_rollback();
     else
