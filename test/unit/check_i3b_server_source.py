@@ -180,23 +180,38 @@ if not (m1 and m2 and m2.start() > m1.start()):
     fail("CK-37 (a): handle_extend does not clear file_current after the memory-only change")
 if "e->file_current = 1;" not in funcs.get("save_index", ""):
     fail("CK-37 (a): save_index success does not set file_current")
-# Count negative file_current guards even when combined with another predicate.
-skip_guard = (r"\bif\s*\([^;{}]*?!\s*\w+(?:\[[^\]\n]+\])?"
-              r"\s*(?:->|\.)\s*file_current\b")
-skip_sites = len(re.findall(skip_guard, src))
 evict = funcs.get("evict_entry", "")
-guarded_save = (r"\bif\s*\(\s*save_legacy\s*&&\s*!\s*e->file_current\s*\)\s*\{\s*"
-                r"[^{}]*?\bsave_index\s*\(\s*e\s*\)")
-if skip_sites != 1 or not re.search(guarded_save, evict):
-    fail(f"CK-37 (a): expected one file_current save guard in evict_entry "
-         f"(save_legacy && !e->file_current), found {skip_sites} negative guards")
-if len(re.findall(r"\bsave_index\s*\(", evict)) != 1:
+guarded_save = re.search(r"(?P<guard>\bif\s*\(\s*save_legacy\s*&&\s*!\s*e->file_current\s*\))"
+                         r"\s*\{[^{}]*?\bint\s+\w+\s*=\s*save_index\s*\(\s*e\s*\)\s*;", evict)
+save_call = re.compile(r"\bsave_index\s*\(")
+if not guarded_save:
+    fail("CK-37 (a): expected one file_current save guard in evict_entry "
+         "(save_legacy && !e->file_current)")
+if len(save_call.findall(evict)) != 1:
     fail("CK-37 (a): evict_entry must make exactly one guarded save_index call")
-for name in ("graceful_shutdown",):
-    if "file_current" in funcs.get(name, ""):
-        fail(f"CK-37 (a): {name} reads file_current (SIGTERM must always save)")
-if "graceful_shutdown" not in funcs:
-    fail("CK-37 (a): SIGTERM save function not found (scan out of date)")
+
+# Only persistence paths can gate a save on file_current. Check the entire
+# caller for reads, since an early return can bypass a later save_index call.
+# Plain assignments publish the state and cannot suppress a save.
+file_current_read = re.compile(r"\bfile_current\b(?!\s*=(?!=))")
+# The optional HNSW binding snapshot only reads the old files. Accept the
+# block only when both calls complete and control continues to the base save.
+binding_snapshot = re.compile(r"\bif\s*\(\s*e->file_current\s*\)\s*\{\s*"
+                              r"hnsw_file_path\([^;{}]*\);\s*"
+                              r"preserve_binding\s*=\s*read_hnsw_source\([^;{}]*\);\s*"
+                              r"\}(?!\s*else\b)")
+for name, body in funcs.items():
+    if name not in ("save_index", "graceful_shutdown") and not save_call.search(body):
+        continue
+    if name == "evict_entry" and guarded_save:
+        start, end = guarded_save.span("guard")
+        body = body[:start] + body[end:]
+    if name == "save_index":
+        body = binding_snapshot.sub("", body, count=1)
+    if file_current_read.search(body):
+        fail(f"CK-37 (a): {name} reads file_current outside the eviction save guard")
+if not save_call.search(funcs.get("graceful_shutdown", "")):
+    fail("CK-37 (a): SIGTERM path must call save_index")
 
 # r5: the RMM adaptor raises the peak only after the upstream allocation
 # succeeded (a failed allocation must not leave a peak).
