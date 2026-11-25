@@ -30,6 +30,7 @@
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/timestamp.h"
+#include "portability/instr_time.h"
 #include "utils/tuplestore.h"
 #include "utils/json.h"          /* escape_json: I4 pool status text */
 #include "access/amapi.h"
@@ -105,6 +106,8 @@
 
 #include "cuvs_wrapper.h"
 #include "cuvs_cagra_pages.h"
+#include "cuvs_cagra_history.h"
+#include "cuvs_cagra_resident_supply.h"
 #include "cuvs_cagra_pending_search.h"
 #include "cuvs_hnsw_exact.h"
 #include "cuvs_ipc.h"
@@ -535,10 +538,6 @@ static void cuvs_transient_bf_add_path(PlannerInfo *root, RelOptInfo *rel,
                                        Index rti, RangeTblEntry *rte);    /* ADR-073 B */
 static int  cuvs_metric_from_order_op(Oid opno);   /* defined below; used by both hooks */
 void cuvs_register_custom_scan(void);
-
-#ifdef CUVS_PAGE_FORMAT
-static const char *cuvs_resolve_index_dir_rel(Relation indexRel);
-#endif
 
 /* A pending DROP and the subtransaction that observed it (ADR-060). */
 typedef struct CuvsPendingDrop
@@ -972,12 +971,26 @@ static CuvsFbShmem *g_fb = NULL;
 static shmem_request_hook_type prev_shmem_request_hook = NULL;
 static shmem_startup_hook_type prev_shmem_startup_hook = NULL;
 #ifdef CUVS_PAGE_FORMAT
-static uint64 *cuvs_page_boot_id;
+static struct
+{
+    uint64 id;
+    uint64 started_us;
+} *cuvs_page_boot;
+bool cuvs_page_resident_search;
+#ifdef CUVS_TEST_HOOKS
+static int cuvs_resident_filter_pause_ms;
+#endif
 
 uint64
 cuvs_cagra_pg_boot_id(void)
 {
-    return cuvs_page_boot_id ? *cuvs_page_boot_id : 0;
+    return cuvs_page_boot ? cuvs_page_boot->id : 0;
+}
+
+uint64
+cuvs_cagra_pg_boot_started_us(void)
+{
+    return cuvs_page_boot ? cuvs_page_boot->started_us : 0;
 }
 #endif
 
@@ -1012,7 +1025,9 @@ cuvs_fb_shmem_request(void)
         prev_shmem_request_hook();
     RequestAddinShmemSpace(cuvs_fb_memsize());
 #ifdef CUVS_PAGE_FORMAT
-    RequestAddinShmemSpace(sizeof(*cuvs_page_boot_id));
+    RequestAddinShmemSpace(sizeof(*cuvs_page_boot));
+    if (cuvs_page_resident_search)
+        RequestAddinShmemSpace(cuvs_cagra_history_shmem_memsize());
 #endif
 }
 
@@ -1033,10 +1048,18 @@ cuvs_fb_shmem_startup(void)
     }
 #ifdef CUVS_PAGE_FORMAT
     /* A backend crash can recreate shared memory in the same postmaster. */
-    cuvs_page_boot_id = ShmemInitStruct("pg_cuvs page boot identity",
-                                       sizeof(*cuvs_page_boot_id), &found);
+    cuvs_page_boot = ShmemInitStruct("pg_cuvs page boot identity",
+                                    sizeof(*cuvs_page_boot), &found);
     if (!found)
-        *cuvs_page_boot_id = cuvs_cagra_nonce();
+    {
+        instr_time started;
+
+        INSTR_TIME_SET_CURRENT(started);
+        cuvs_page_boot->id = cuvs_cagra_nonce();
+        cuvs_page_boot->started_us = INSTR_TIME_GET_MICROSEC(started);
+    }
+    if (cuvs_page_resident_search)
+        cuvs_cagra_history_shmem_startup();
 #endif
     LWLockRelease(AddinShmemInitLock);
 }
@@ -1274,8 +1297,22 @@ _PG_init(void)
 {
 #ifdef CUVS_PAGE_FORMAT
     cuvs_page_preloaded = process_shared_preload_libraries_in_progress;
+    if (cuvs_page_preloaded)
+    {
+        DefineCustomBoolVariable(
+            "cuvs.page_resident_search",
+            "Use the daemon's resident pending rows for experimental page-format index scans.",
+            NULL, &cuvs_page_resident_search, false, PGC_POSTMASTER, 0, NULL, NULL, NULL);
+#ifdef CUVS_CAGRA_FOLD_ENABLED
+        cuvs_cagra_resident_supply_register();
+#endif
+    }
 #ifdef CUVS_TEST_HOOKS
     cuvs_cagra_init_test_hooks();
+    DefineCustomIntVariable("cuvs.test_resident_filter_pause_ms",
+                             "Pause while the resident cursor holds its snapshot filter lease.",
+                             NULL, &cuvs_resident_filter_pause_ms, 0, 0, 20000, PGC_SUSET,
+                             GUC_NOT_IN_SAMPLE, NULL, NULL, NULL);
 #endif
 #endif
     /* Phase 3K: register pg_cuvs_hnsw WITH(source, mode, ...) reloptions. */
@@ -1914,7 +1951,7 @@ cuvs_reloption_index_dir(Relation indexRel)
 
 /* Resolver for callers holding an open index Relation (build/insert/bulkdelete):
  * reads rd_options directly, so no relcache open. */
-static const char *
+const char *
 cuvs_resolve_index_dir_rel(Relation indexRel)
 {
     const char *reldir = cuvs_reloption_index_dir(indexRel);
@@ -3064,7 +3101,7 @@ cuvs_hnsw_budget_error(uint32_t build_algo, const CuvsHnswBudgetSnapshot *budget
  * here, so it always precedes the scan or the build op. */
 static CuvsHnswPrespoolAction
 cuvs_hnsw_preflight(double rows, uint32_t dim, uint32_t hierarchy, uint32_t build_algo,
-                    uint32_t ef_construction, uint64_t host_cap, bool may_reject,
+                    uint32_t ef_construction, uint32_t graph_degree, uint64_t host_cap, bool may_reject,
                     const char *when)
 {
     CuvsHnswPreflightRequest request = {0};
@@ -3076,8 +3113,8 @@ cuvs_hnsw_preflight(double rows, uint32_t dim, uint32_t hierarchy, uint32_t buil
     request.build_algo = build_algo;
     request.ef_construction = ef_construction;
     request.dim = dim;
-    request.graph_degree = 64;
-    request.intermediate_degree = 128;
+    request.graph_degree = graph_degree;
+    request.intermediate_degree = 2 * graph_degree;
     request.after_scan = may_reject ? 0 : 1;
     request.n_estimate = cuvs_prespool_rows(rows);
     request.host_budget = host_cap;
@@ -3122,7 +3159,7 @@ cuvs_hnsw_preflight(double rows, uint32_t dim, uint32_t hierarchy, uint32_t buil
 void
 cuvs_build_hnsw_from_heap(Relation heapRel, Relation indexRel, IndexInfo *indexInfo,
                           const char *mode, uint32_t build_algo,
-                          uint32_t ef_construction, CuvsHnswBuildResult *out)
+                          uint32_t ef_construction, uint32_t m, CuvsHnswBuildResult *out)
 {
     CuvsHnswSpool *spool = palloc0(sizeof(*spool));
     Form_pg_attribute attr = TupleDescAttr(RelationGetDescr(indexRel), 0);
@@ -3170,7 +3207,7 @@ cuvs_build_hnsw_from_heap(Relation heapRel, Relation indexRel, IndexInfo *indexI
         bool transition_sent;
         snprintf(when, sizeof(when), "before the heap scan from reltuples=%.6g", stats_rows);
         prespool = cuvs_hnsw_preflight(stats_rows, spool->dim, hierarchy, build_algo,
-                                       ef_construction, cap, true, when);
+                                       ef_construction, 2 * m, cap, true, when);
         transition_sent = prespool == CUVS_HNSW_PRESPOOL_NOTICE_OVERFLOW;
         spool->input_hash = pg_cryptohash_create(PG_SHA256);
         if (!spool->input_hash || pg_cryptohash_init(spool->input_hash) < 0)
@@ -3207,13 +3244,13 @@ cuvs_build_hnsw_from_heap(Relation heapRel, Relation indexRel, IndexInfo *indexI
                          cuvs_hnsw_after_scan_reason(stats_rows),
                          (unsigned long long)spool->n);
                 transition_sent = cuvs_hnsw_preflight((double)spool->n, spool->dim, hierarchy,
-                    build_algo, ef_construction, cap, false, when)
+                    build_algo, ef_construction, 2 * m, cap, false, when)
                     == CUVS_HNSW_PRESPOOL_NOTICE_OVERFLOW;
             }
             /* K3: hash the spool while the daemon builds; join after the reply. */
             rc = cuvs_ipc_build_hnsw_file_idle(cuvs_socket_path,
                 FileGetRawDesc(spool->vectors), spool->n, spool->dim, spool->metric,
-                64, 128, hierarchy, cap,
+                2 * m, 4 * m, hierarchy, cap,	/* HNSW M = m: level 0 holds 2 * m neighbours, as pgvector's */
                 build_algo, ef_construction, &out->policy, &budget, &out->ace, &out->nn,
                 &out->hnsw_fd, error, sizeof(error), cuvs_hnsw_digest_step, &digest);
             /* The digest LOG also covers failed builds (daemon error reply,
@@ -5097,8 +5134,82 @@ cuvs_report_stale(Oid index_oid)
 
 
 #ifdef CUVS_PAGE_FORMAT
+#ifdef CUVS_TEST_HOOKS
+static struct
+{
+    Oid index_oid;
+    uint64 scan_starts;
+    uint64 exact_entries;
+    uint64 capacity_entries;
+    bool capacity;
+    bool valid;
+    CuvsPageSearchRequest request;
+    uint64 boot_id;
+    uint64 daemon_id;
+    uint64 covered;
+    uint64 wire;
+    uint64 local;
+    int windows;
+    int first_resident_candidates;
+    int first_resident_visible;
+    bool exhausted;
+    bool base_filtered;
+    int cursor_status;
+} page_resident_proof;
+
+PG_FUNCTION_INFO_V1(pg_cuvs_test_page_exact_stats);
+
+Datum
+pg_cuvs_test_page_exact_stats(PG_FUNCTION_ARGS)
+{
+    Oid oid = PG_GETARG_OID(0);
+    bool reset = PG_GETARG_BOOL(1);
+    const CuvsPageSearchRequest *request = &page_resident_proof.request;
+    StringInfoData json;
+
+    if (!superuser())
+        ereport(ERROR, (errmsg("page search test diagnostics require a superuser")));
+    if (reset || page_resident_proof.index_oid != oid)
+    {
+        memset(&page_resident_proof, 0, sizeof(page_resident_proof));
+        page_resident_proof.index_oid = oid;
+    }
+    initStringInfo(&json);
+    appendStringInfo(&json, "{\"scan_starts\":" UINT64_FORMAT ",\"exact_entries\":" UINT64_FORMAT
+                     ",\"reasons\":{\"page_overlay_capacity\":" UINT64_FORMAT "},"
+                     "\"cursor_status\":%d,\"candidate_windows\":%d,\"last_page_search\":",
+                     page_resident_proof.scan_starts, page_resident_proof.exact_entries,
+                     page_resident_proof.capacity_entries, page_resident_proof.cursor_status,
+                     page_resident_proof.windows);
+    if (page_resident_proof.valid)
+        appendStringInfo(&json,
+                         "{\"scan_start\":" UINT64_FORMAT ",\"index_nonce\":" UINT64_FORMAT
+                         ",\"base_nonce\":" UINT64_FORMAT ",\"graph_nonce\":" UINT64_FORMAT
+                         ",\"postmaster_boot_id\":" UINT64_FORMAT ",\"daemon_id\":" UINT64_FORMAT
+                         ",\"folded\":" UINT64_FORMAT ",\"tail\":" UINT64_FORMAT
+                         ",\"covered_upto\":" UINT64_FORMAT ",\"resident_positions\":" UINT64_FORMAT
+                         ",\"wire_positions\":" UINT64_FORMAT ",\"local_positions\":" UINT64_FORMAT
+                         ",\"candidate_windows\":%d,\"first_resident_candidates\":%d"
+                         ",\"first_resident_visible\":%d,\"candidates_exhausted\":%s"
+                         ",\"base_visibility_filter\":%s}",
+                         page_resident_proof.scan_starts, request->index_nonce, request->base_nonce,
+                         request->graph_nonce, page_resident_proof.boot_id, page_resident_proof.daemon_id,
+                         request->folded, request->tail, page_resident_proof.covered,
+                         page_resident_proof.covered - request->folded,
+                         page_resident_proof.wire, page_resident_proof.local,
+                         page_resident_proof.windows, page_resident_proof.first_resident_candidates,
+                         page_resident_proof.first_resident_visible,
+                         page_resident_proof.exhausted ? "true" : "false",
+                         page_resident_proof.base_filtered ? "true" : "false");
+    else
+        appendStringInfoString(&json, "null");
+    appendStringInfoChar(&json, '}');
+    PG_RETURN_DATUM(DirectFunctionCall1(jsonb_in, CStringGetDatum(json.data)));
+}
+#endif
+
 static bool
-page_search_request(Relation index, Snapshot snapshot, int dim,
+page_search_request(Relation index, Relation heap, Snapshot snapshot, int dim, bool resident,
                     CuvsCagraMeta *meta, BlockNumber *blocks, CuvsPageSearchRequest *request)
 {
     if (!enable_cuvs || !cuvs_page_preloaded || RecoveryInProgress() ||
@@ -5110,7 +5221,8 @@ page_search_request(Relation index, Snapshot snapshot, int dim,
 #ifdef CUVS_CAGRA_FOLD_ENABLED
     /* The physical transition can be newer than this query's MVCC snapshot.
      * Avoid ranking its newly folded rows for a snapshot that predates it. */
-    if (meta->last_fold_xid && XidInMVCCSnapshot((TransactionId) meta->last_fold_xid, snapshot))
+    if (!resident && meta->last_fold_xid &&
+        XidInMVCCSnapshot((TransactionId) meta->last_fold_xid, snapshot))
         return false;
 #endif
     cuvs_cagra_check_dim(meta->dim, dim);
@@ -5126,7 +5238,7 @@ page_search_request(Relation index, Snapshot snapshot, int dim,
     request->n_slots = meta->n_slots;
     request->folded = meta->folded;
     request->dead_slots = meta->dead_slots;
-    return true;
+    return !resident || cuvs_cagra_history_select(index, heap, snapshot, meta, request);
 }
 
 static uint64 *
@@ -5225,7 +5337,7 @@ page_search_filtered(Oid oid, Relation heap, Snapshot snapshot, const float *que
         RelationGetForm(heap)->relam != HEAP_TABLE_AM_OID)
         return false;
     index = index_open(oid, AccessShareLock);
-    if (!page_search_request(index, snapshot, dim, &meta, &blocks, &request) ||
+    if (!page_search_request(index, heap, snapshot, dim, false, &meta, &blocks, &request) ||
         request.tail != request.folded)
     {
         index_close(index, AccessShareLock);
@@ -5450,7 +5562,7 @@ page_search_sql(Oid index_oid, Oid heap_oid, const float *queries, int nq, int d
         nq > 1024 || RelationGetForm(heap)->relam != HEAP_TABLE_AM_OID ||
         check_enable_rls(heap_oid, InvalidOid, true) != RLS_NONE ||
         index->rd_index->indkey.values[0] <= 0 || RelationGetIndexPredicate(index) != NIL ||
-        !page_search_request(index, snapshot, dim, &meta, &blocks, &request) ||
+        !page_search_request(index, heap, snapshot, dim, false, &meta, &blocks, &request) ||
         !page_sql_index_visible(index, snapshot) ||
         request.tail != request.folded)
         goto done;
@@ -5500,12 +5612,17 @@ done:
 static bool
 page_resolve_overlay(IndexScanDesc scan, CuvsScanState *ss, const CuvsCagraMeta *meta,
                      const CuvsPageSearchRequest *request,
+                     BlockNumber blocks, bool remap_folded,
                      const CuvsPageOverlayResult *results, int count)
 {
     Relation heap = scan->heapRelation;
     IndexFetchTableData *fetch = table_index_fetch_begin(heap);
     TupleTableSlot *tuple = table_slot_create(heap, NULL);
     bool valid = true;
+#ifdef CUVS_TEST_HOOKS
+    bool first = remap_folded && page_resident_proof.windows == 1 &&
+        page_resident_proof.index_oid == RelationGetRelid(scan->indexRelation);
+#endif
 #ifdef CUVS_CAGRA_FOLD_ENABLED
     uint64 physical_dead = 0;
 #endif
@@ -5517,14 +5634,21 @@ page_resolve_overlay(IndexScanDesc scan, CuvsScanState *ss, const CuvsCagraMeta 
         ItemPointerData root, visible;
         CuvsCagraSlotResult state;
         bool again = false, dead = false;
+#ifdef CUVS_TEST_HOOKS
+        bool resident = first && candidate->slot >= request->n_slots &&
+            candidate->slot - request->n_slots < page_resident_proof.covered - request->folded;
+
+        if (resident)
+            ++page_resident_proof.first_resident_candidates;
+#endif
 
         CHECK_FOR_INTERRUPTS();
-        if (candidate->slot < meta->n_slots)
-            state = cuvs_cagra_slot_tid(scan->indexRelation, meta, ss->page_blocks,
+        if (candidate->slot < request->n_slots)
+            state = cuvs_cagra_slot_tid(scan->indexRelation, meta, blocks,
                                         candidate->slot, &root);
         else
         {
-            uint64 pending = candidate->slot - meta->n_slots;
+            uint64 pending = candidate->slot - request->n_slots;
 
             if (pending >= request->tail - request->folded)
             {
@@ -5532,8 +5656,13 @@ page_resolve_overlay(IndexScanDesc scan, CuvsScanState *ss, const CuvsCagraMeta 
                 valid = false;
                 break;
             }
-            state = cuvs_cagra_pending_tid(scan->indexRelation, meta, ss->page_blocks,
-                                           candidate->block, request->folded + pending, &root);
+            pending += request->folded;
+            if (remap_folded && pending < meta->folded)
+                state = cuvs_cagra_slot_tid(scan->indexRelation, meta, blocks,
+                                            meta->base_slots + pending, &root);
+            else
+                state = cuvs_cagra_pending_tid(scan->indexRelation, meta, blocks,
+                                               candidate->block, pending, &root);
         }
         if (state == CUVS_CAGRA_SLOT_BAD)
         {
@@ -5545,7 +5674,7 @@ page_resolve_overlay(IndexScanDesc scan, CuvsScanState *ss, const CuvsCagraMeta 
 #ifdef CUVS_CAGRA_FOLD_ENABLED
             /* VACUUM can WAL-log TID pages before publishing their count.
              * Use exact search if the physical losses exhaust the allowance. */
-            if (request->folded && ++physical_dead > request->dead_slots)
+            if (!remap_folded && request->folded && ++physical_dead > request->dead_slots)
             {
                 valid = false;
                 break;
@@ -5559,6 +5688,10 @@ page_resolve_overlay(IndexScanDesc scan, CuvsScanState *ss, const CuvsCagraMeta 
         table_index_fetch_reset(fetch);
         if (!table_index_fetch_tuple(fetch, &visible, scan->xs_snapshot, tuple, &again, &dead))
             continue;
+#ifdef CUVS_TEST_HOOKS
+        if (resident)
+            ++page_resident_proof.first_resident_visible;
+#endif
         ss->page_results[ss->n_results++] = (CuvsResult) {
             .tid = cuvs_tid_encode(ItemPointerGetBlockNumber(&root),
                                    ItemPointerGetOffsetNumber(&root)),
@@ -5568,6 +5701,599 @@ page_resolve_overlay(IndexScanDesc scan, CuvsScanState *ss, const CuvsCagraMeta 
     table_index_fetch_end(fetch);
     ExecDropSingleTupleTableSlot(tuple);
     return valid;
+}
+
+static bool
+page_candidate_before(const CuvsPageOverlayResult *a, const CuvsPageOverlayResult *b,
+                      uint32 metric)
+{
+    if (a->distance == b->distance)
+        return a->slot < b->slot;
+    return metric == CUVS_METRIC_IP ? a->distance > b->distance : a->distance < b->distance;
+}
+
+static int
+page_candidate_cmp(const void *a, const void *b, void *arg)
+{
+    uint32 metric = *(const uint32 *) arg;
+
+    if (page_candidate_before(a, b, metric))
+        return -1;
+    return page_candidate_before(b, a, metric) ? 1 : 0;
+}
+
+/* Score only the suffix the daemon has not accepted. Reuse the regular
+ * snapshot reader, including its treatment of HOT and expression indexes. */
+static bool
+page_local_candidates(IndexScanDesc scan, const CuvsCagraMeta *meta, BlockNumber blocks,
+                      const CuvsPageSearchRequest *request, const float *query,
+                      uint64 from, CuvsPageOverlayResult *results, int *nresults)
+{
+    uint32 metric = meta->metric;
+
+    *nresults = 0;
+    while (from < request->tail)
+    {
+        uint64 end = from + Min(request->tail - from, (uint64) CUVS_PAGE_BATCH_MAX);
+        CuvsPageSupplement supplement = {0};
+        const float *vector;
+
+        if (!cuvs_cagra_resident_supplement(scan->indexRelation, scan->heapRelation,
+                                         scan->xs_snapshot, meta, blocks, from, end,
+                                         &supplement))
+            return false;
+        vector = supplement.vectors;
+        for (uint32 pos = 0; pos < supplement.positions; ++pos)
+        {
+            float distance;
+
+            if (supplement.marks[pos].state != CUVS_PAGE_POSITION_VECTOR)
+                continue;
+            distance = cuvs_cpu_distance(metric, query, vector, meta->dim);
+            vector += meta->dim;
+            if (isfinite(distance))
+                results[(*nresults)++] = (CuvsPageOverlayResult) {
+                    .slot = request->n_slots + from + pos - request->folded,
+                    .distance = distance,
+                    .block = supplement.marks[pos].block,
+                };
+        }
+        cuvs_cagra_free_supplement(&supplement);
+        from = end;
+    }
+    qsort_arg(results, *nresults, sizeof(*results), page_candidate_cmp, &metric);
+    return true;
+}
+
+static bool
+page_read_resident_meta(IndexScanDesc scan, const CuvsPageSearchRequest *request,
+                        CuvsCagraMeta *current, BlockNumber *blocks)
+{
+    Relation index = scan->indexRelation;
+
+    if (!cuvs_cagra_read_meta(index, current) ||
+        current->index_nonce != request->index_nonce || current->base_nonce != request->base_nonce ||
+        current->folded < request->folded ||
+        (current->folded == request->folded && current->graph_nonce != request->graph_nonce) ||
+        current->base_slots != request->n_slots - request->folded)
+        return false;
+    *blocks = RelationGetNumberOfBlocks(index);
+    return true;
+}
+
+static bool
+page_resolve_resident(IndexScanDesc scan, CuvsScanState *ss, const CuvsPageSearchRequest *request,
+                      const CuvsPageOverlayResult *results, int count)
+{
+    CuvsCagraMeta current;
+    BlockNumber blocks;
+
+    return page_read_resident_meta(scan, request, &current, &blocks) &&
+        page_resolve_overlay(scan, ss, &current, request, blocks, true, results, count);
+}
+
+typedef enum PageResidentSourceKind
+{
+    PAGE_RESIDENT_BASE, PAGE_RESIDENT_PENDING, PAGE_RESIDENT_LOCAL, PAGE_RESIDENT_SOURCES
+} PageResidentSourceKind;
+
+typedef struct PageResidentSource
+{
+    CuvsResult *rows;
+    int count;
+    float boundary;
+    bool have_boundary;
+} PageResidentSource;
+
+typedef struct PageResidentHeartbeat
+{
+    CuvsPageResidentCursor *cursor;
+    instr_time last;
+} PageResidentHeartbeat;
+
+static bool
+page_resident_heartbeat(void *arg)
+{
+    PageResidentHeartbeat *heartbeat = arg;
+    instr_time now, elapsed;
+
+    INSTR_TIME_SET_CURRENT(now);
+    elapsed = now;
+    INSTR_TIME_SUBTRACT(elapsed, heartbeat->last);
+    if (INSTR_TIME_GET_MICROSEC(elapsed) < 1000000)
+        return true;
+    heartbeat->last = now;
+    return cuvs_ipc_hold_page_resident(heartbeat->cursor);
+}
+
+static bool
+page_distance_before(uint32 metric, float a, float b)
+{
+    return metric == CUVS_METRIC_IP ? a > b : a < b;
+}
+
+static int
+page_visible_cmp(const void *a, const void *b, void *arg)
+{
+    const CuvsResult *left = a;
+    const CuvsResult *right = b;
+    uint32 metric = *(const uint32 *) arg;
+
+    if (left->distance != right->distance)
+        return page_distance_before(metric, left->distance, right->distance) ? -1 : 1;
+    return (left->tid > right->tid) - (left->tid < right->tid);
+}
+
+static void
+page_offer_visible(PageResidentSource *source, CuvsResult result, uint32 metric)
+{
+    int lo = 0, hi = source->count;
+
+    while (lo < hi)
+    {
+        int mid = lo + (hi - lo) / 2;
+
+        if (page_visible_cmp(&result, &source->rows[mid], &metric) < 0)
+            hi = mid;
+        else
+            lo = mid + 1;
+    }
+    if (lo == cuvs_k)
+        return;
+    if (source->count < cuvs_k)
+        ++source->count;
+    memmove(source->rows + lo + 1, source->rows + lo,
+            (source->count - lo - 1) * sizeof(*source->rows));
+    source->rows[lo] = result;
+}
+
+/* A sparse or disconnected filtered graph can exhaust its ANN candidates.
+ * Rank the remaining visible base slots themselves with bounded memory. */
+static bool
+page_rank_visible_base(IndexScanDesc scan, const CuvsPageSearchRequest *request,
+                       const CuvsCagraMeta *meta, BlockNumber blocks, const uint32 *excluded,
+                       uint64 visible, PageResidentSource *source, PageResidentHeartbeat *heartbeat)
+{
+    IndexInfo *info = BuildIndexInfo(scan->indexRelation);
+    EState *estate = CreateExecutorState();
+    ExprContext *context = GetPerTupleExprContext(estate);
+    Relation heap = scan->heapRelation;
+    IndexFetchTableData *fetch = table_index_fetch_begin(heap);
+    TupleTableSlot *tuple = table_slot_create(heap, NULL);
+    uint32 metric = meta->metric;
+    ScanKey order = &scan->orderByData[0];
+    uint64 examined = 0;
+    bool valid = true;
+
+    for (uint64 pos = 0; pos < request->n_slots; ++pos)
+    {
+        ItemPointerData root, lookup;
+        Datum values[INDEX_MAX_KEYS];
+        bool nulls[INDEX_MAX_KEYS];
+        bool again = false, dead = false;
+        float8 distance;
+        MemoryContext old;
+
+        CHECK_FOR_INTERRUPTS();
+        if (pos % CUVS_CAGRA_TIDS_PER_PAGE == 0 && !page_resident_heartbeat(heartbeat))
+        {
+            valid = false;
+            break;
+        }
+        if (excluded[pos / 32] & ((uint32) 1 << (pos % 32)))
+            continue;
+        if (examined == visible ||
+            cuvs_cagra_slot_tid(scan->indexRelation, meta, blocks, pos, &root) != CUVS_CAGRA_SLOT_LIVE)
+        {
+            valid = false;
+            break;
+        }
+        ++examined;
+        lookup = root;
+        table_index_fetch_reset(fetch);
+        if (!table_index_fetch_tuple(fetch, &lookup, scan->xs_snapshot, tuple, &again, &dead))
+        {
+            valid = false;
+            break;
+        }
+        ResetExprContext(context);
+        context->ecxt_scantuple = tuple;
+        old = MemoryContextSwitchTo(context->ecxt_per_tuple_memory);
+        FormIndexDatum(info, tuple, estate, values, nulls);
+        distance = nulls[0] ? NAN : DatumGetFloat8(FunctionCall2Coll(&order->sk_func,
+                                                                    order->sk_collation,
+                                                                    values[0], order->sk_argument));
+        MemoryContextSwitchTo(old);
+        if (!isfinite(distance))
+            continue;
+        page_offer_visible(source, (CuvsResult) {
+            .tid = cuvs_tid_encode(ItemPointerGetBlockNumber(&root), ItemPointerGetOffsetNumber(&root)),
+            .distance = metric == CUVS_METRIC_L2 ? (float) (distance * distance) :
+                (float) (metric == CUVS_METRIC_IP ? -distance : distance),
+        }, metric);
+    }
+    table_index_fetch_end(fetch);
+    ExecDropSingleTupleTableSlot(tuple);
+    FreeExecutorState(estate);
+    pfree(info);
+    return valid && examined == visible;
+}
+
+static void
+page_merge_visible(CuvsScanState *ss, PageResidentSource *sources, uint32 metric)
+{
+    int next[PAGE_RESIDENT_SOURCES] = {0};
+
+    ss->n_results = 0;
+    while (ss->n_results < cuvs_k)
+    {
+        int best = -1;
+
+        for (int source = 0; source < PAGE_RESIDENT_SOURCES; ++source)
+        {
+            if (next[source] == sources[source].count)
+                continue;
+            if (best < 0 || page_distance_before(metric, sources[source].rows[next[source]].distance,
+                                                 sources[best].rows[next[best]].distance))
+                best = source;
+        }
+        if (best < 0)
+            break;
+        ss->page_results[ss->n_results++] = sources[best].rows[next[best]++];
+    }
+}
+
+/* If the stream's remaining rows cannot displace the kth visible result,
+ * there is no need to continue that stream. */
+static bool
+page_more_visible(const CuvsScanState *ss, const PageResidentSource *source, uint32 metric)
+{
+    return source->count < cuvs_k &&
+        (ss->n_results < cuvs_k || !source->have_boundary ||
+         page_distance_before(metric, source->boundary, ss->page_results[cuvs_k - 1].distance));
+}
+
+static bool
+page_accept_resident_window(IndexScanDesc scan, CuvsScanState *scratch,
+                            const CuvsPageSearchRequest *request, PageResidentSource *source,
+                            const CuvsPageOverlayResult *rows, int count)
+{
+    int take;
+
+    if (!count)
+        return true;
+    source->boundary = rows[count - 1].distance;
+    source->have_boundary = true;
+    if (!page_resolve_resident(scan, scratch, request, rows, count))
+        return false;
+    take = Min(scratch->n_results, cuvs_k - source->count);
+    memcpy(source->rows + source->count, scratch->page_results, take * sizeof(*source->rows));
+    source->count += take;
+    return true;
+}
+
+static bool
+page_finish_resident(IndexScanDesc scan, CuvsScanState *ss, CuvsPageResidentCursor *cursor,
+                      const CuvsPageSearchRequest *request, const CuvsPageOverlayRequest *overlay,
+                      uint32 metric, CuvsPageOverlayResult *base, CuvsPageOverlayResult *pending,
+                      const CuvsPageOverlayResult *local, int nlocal, CuvsPageResidentWindow *window,
+                      int *search_k, uint32 *latency, CuvsPageProgress *progress)
+{
+    CuvsResult *storage = palloc(PAGE_RESIDENT_SOURCES * cuvs_k * sizeof(*storage));
+    CuvsScanState scratch = {.page_results = palloc(cuvs_k * sizeof(CuvsResult))};
+    PageResidentSource sources[PAGE_RESIDENT_SOURCES] = {{0}};
+    PageResidentSource *base_source = &sources[PAGE_RESIDENT_BASE];
+    PageResidentSource *pending_source = &sources[PAGE_RESIDENT_PENDING];
+    uint32 next_base = window->base_k;
+    uint64 daemon = progress->daemon_id;
+    uint32 *base_filter = NULL;
+    uint32 base_filter_words = 0;
+    uint64 filtered_remaining = 0;
+    bool valid = false;
+    bool filtered_base = false;
+#ifdef CUVS_TEST_HOOKS
+    bool prove = page_resident_proof.index_oid == RelationGetRelid(scan->indexRelation);
+#endif
+
+    for (int source = 0; source < PAGE_RESIDENT_SOURCES; ++source)
+        sources[source].rows = storage + source * cuvs_k;
+    if (nlocal && !page_accept_resident_window(scan, &scratch, request,
+                                               &sources[PAGE_RESIDENT_LOCAL], local, nlocal))
+        goto done;
+
+    for (;;)
+    {
+        uint32 next_pending;
+        uint32 filter_words = 0;
+        bool missing_base;
+        int rc;
+
+#ifdef CUVS_TEST_HOOKS
+        if (prove)
+        {
+            ++page_resident_proof.windows;
+            page_resident_proof.covered = overlay->from;
+        }
+#endif
+        if (next_base)
+        {
+            if (!filtered_base)
+            {
+                base_source->count = 0;
+                base_source->have_boundary = false;
+            }
+            if (!page_accept_resident_window(scan, &scratch, request, base_source,
+                                             base, (int) window->base_count))
+                break;
+            if (filtered_base)
+            {
+                bool malformed = false;
+
+                if (!window->base_count && filtered_remaining)
+                {
+                    CuvsCagraMeta current;
+                    BlockNumber blocks;
+                    PageResidentHeartbeat heartbeat = {.cursor = cursor};
+
+                    if (!cuvs_ipc_hold_page_resident(cursor) ||
+                        !page_read_resident_meta(scan, request, &current, &blocks))
+                        break;
+                    INSTR_TIME_SET_CURRENT(heartbeat.last);
+                    if (!page_rank_visible_base(scan, request, &current, blocks, base_filter,
+                                                filtered_remaining, base_source, &heartbeat))
+                        break;
+                    filtered_remaining = 0;
+                }
+                for (uint32 i = 0; i < window->base_count; ++i)
+                {
+                    uint64 slot = base[i].slot;
+                    uint32 bit = (uint32) 1 << (slot % 32);
+
+                    if (slot >= request->n_slots || (base_filter[slot / 32] & bit))
+                    {
+                        malformed = true;
+                        break;
+                    }
+                    base_filter[slot / 32] |= bit;
+                    --filtered_remaining;
+                }
+                if (malformed)
+                    break;
+                qsort_arg(base_source->rows, base_source->count, sizeof(*base_source->rows),
+                          page_visible_cmp, &metric);
+            }
+        }
+        if (!page_accept_resident_window(scan, &scratch, request, pending_source,
+                                         pending, (int) window->pending_count))
+            break;
+        page_merge_visible(ss, sources, metric);
+        *search_k = (int) window->base_k;
+        missing_base = (filtered_base ? filtered_remaining != 0 : window->base_k < request->n_slots) &&
+            page_more_visible(ss, base_source, metric);
+        next_base = 0;
+        if (missing_base && !filtered_base && window->base_k < CUVS_PAGE_RESIDENT_BASE_MAX_K)
+            next_base = Min(window->base_k * 2, CUVS_PAGE_RESIDENT_BASE_MAX_K);
+        else if (missing_base && !filtered_base)
+        {
+            CuvsCagraMeta current;
+            BlockNumber blocks;
+            PageResidentHeartbeat heartbeat = {.cursor = cursor};
+
+            if (!cuvs_ipc_hold_page_resident(cursor) ||
+                !page_read_resident_meta(scan, request, &current, &blocks))
+                break;
+            INSTR_TIME_SET_CURRENT(heartbeat.last);
+#ifdef CUVS_TEST_HOOKS
+            for (int left = cuvs_resident_filter_pause_ms; left > 0; left -= 250)
+            {
+                pg_usleep(Min(left, 250) * 1000L);
+                CHECK_FOR_INTERRUPTS();
+                if (!page_resident_heartbeat(&heartbeat))
+                    break;
+            }
+            if (cursor->fd < 0)
+                break;
+#endif
+            base_filter_words = (uint32) ((request->n_slots + 31) / 32);
+            base_filter = palloc((Size) base_filter_words * sizeof(*base_filter));
+            if (!cuvs_cagra_snapshot_filter(scan->indexRelation, scan->heapRelation,
+                                            scan->xs_snapshot, &current, blocks, request->n_slots,
+                                            base_filter, &filtered_remaining,
+                                            page_resident_heartbeat, &heartbeat))
+                break;
+            filtered_base = true;
+#ifdef CUVS_TEST_HOOKS
+            if (prove)
+                page_resident_proof.base_filtered = true;
+#endif
+            base_source->count = 0;
+            base_source->have_boundary = false;
+            if (filtered_remaining && filtered_remaining <= CUVS_PAGE_RESIDENT_BASE_MAX_K)
+            {
+                if (!page_rank_visible_base(scan, request, &current, blocks, base_filter,
+                                            filtered_remaining, base_source, &heartbeat))
+                    break;
+                filtered_remaining = 0;
+            }
+            page_merge_visible(ss, sources, metric);
+            missing_base = filtered_remaining != 0;
+        }
+        if (missing_base && filtered_base)
+        {
+            next_base = Min(Min((uint64) (cuvs_k - base_source->count), filtered_remaining),
+                            (uint64) CUVS_PAGE_RESIDENT_BASE_MAX_K);
+            filter_words = base_filter_words;
+        }
+        next_pending = window->pending_left && page_more_visible(ss, pending_source, metric)
+            ? Min(window->pending_left, CUVS_PAGE_SEARCH_MAX_K) : 0;
+        if (!next_base && !next_pending)
+        {
+            valid = !missing_base;
+            break;
+        }
+        rc = cuvs_ipc_advance_page_resident(cursor, next_base, next_pending, base_filter, filter_words,
+                                           base, CUVS_PAGE_SEARCH_MAX_K, pending,
+                                           CUVS_PAGE_SEARCH_MAX_K, window, latency, progress);
+#ifdef CUVS_TEST_HOOKS
+        if (prove)
+            page_resident_proof.cursor_status = rc;
+#endif
+        if (rc == CUVS_STATUS_CANCELED)
+            CHECK_FOR_INTERRUPTS();
+        if (rc != CUVS_STATUS_OK || progress->daemon_id != daemon ||
+            progress->covered_upto < overlay->from)
+            break;
+    }
+done:
+    if (base_filter)
+        pfree(base_filter);
+    pfree(scratch.page_results);
+    pfree(storage);
+    return valid;
+}
+
+static bool
+page_start_resident(IndexScanDesc scan, CuvsScanState *ss, const CuvsCagraMeta *meta,
+                    const CuvsPageSearchRequest *request, const PgVector *query,
+                    int *search_k, uint32 *latency)
+{
+    Oid oid = RelationGetRelid(scan->indexRelation);
+    CuvsPageOverlayRequest overlay = {.base = *request, .boot_id = cuvs_cagra_pg_boot_id(),
+                                      .from = request->tail};
+    CuvsPageProgress progress = {0};
+    CuvsPageResidentWindow window = {0};
+    CuvsPageOverlayResult *base, *pending, *local = NULL;
+    CuvsPageResidentCursor *cursor;
+    bool force_local = false;
+    bool valid = false;
+
+    if (request->tail - request->folded > CUVS_PAGE_OVERLAY_MAX)
+    {
+#ifdef CUVS_TEST_HOOKS
+        if (page_resident_proof.index_oid == oid)
+            page_resident_proof.capacity = true;
+#endif
+        return false;
+    }
+    if (!overlay.boot_id)
+        return false;
+    overlay.base.reserved = cuvs_cagra_history_horizon(scan->heapRelation, scan->xs_snapshot);
+    *search_k = Min(*search_k, (int) CUVS_PAGE_RESIDENT_BASE_MAX_K);
+    base = palloc(CUVS_PAGE_SEARCH_MAX_K * sizeof(*base));
+    pending = palloc(CUVS_PAGE_SEARCH_MAX_K * sizeof(*pending));
+    cursor = palloc(sizeof(*cursor));
+    cursor->fd = -1;
+    ss->page_results = palloc(cuvs_k * sizeof(*ss->page_results));
+    for (int coverage_attempt = 0; coverage_attempt < 3; ++coverage_attempt)
+    {
+        CuvsPageSupplement supplement = {0};
+        bool local_suffix = force_local || request->tail - overlay.from > CUVS_PAGE_BATCH_MAX;
+        int nlocal = 0;
+        int rc;
+
+        overlay.base.tail = local_suffix ? overlay.from : request->tail;
+        if (local_suffix)
+        {
+            if (!local)
+                local = palloc((request->tail - request->folded) * sizeof(*local));
+            if (!page_local_candidates(scan, meta, ss->page_blocks, request, query->x,
+                                       overlay.from, local, &nlocal))
+                break;
+        }
+        else if (overlay.from < overlay.base.tail &&
+                 !cuvs_cagra_resident_supplement(scan->indexRelation, scan->heapRelation,
+                                                scan->xs_snapshot, meta, ss->page_blocks,
+                                                overlay.from, overlay.base.tail, &supplement))
+            break;
+
+        rc = cuvs_ipc_search_page_resident(cuvs_socket_path, MyDatabaseId, oid, &overlay,
+                                          query->x, query->dim, *search_k, meta->metric,
+                                          cuvs_itopk_size, cuvs_search_width, cuvs_cpu_hnsw_fallback,
+                                          cuvs_search_mode, cuvs_bf_precision,
+                                          supplement.positions ? &supplement : NULL, cursor, base,
+                                          CUVS_PAGE_SEARCH_MAX_K, pending, CUVS_PAGE_SEARCH_MAX_K,
+                                          &window, latency, &progress);
+#ifdef CUVS_TEST_HOOKS
+        if (page_resident_proof.index_oid == oid)
+            page_resident_proof.cursor_status = rc;
+#endif
+        cuvs_cagra_free_supplement(&supplement);
+        if (rc == CUVS_STATUS_CANCELED)
+            CHECK_FOR_INTERRUPTS();
+        if (rc == CUVS_STATUS_OK)
+        {
+            PG_TRY();
+            {
+                valid = progress.daemon_id && progress.covered_upto >= overlay.from &&
+                    page_finish_resident(scan, ss, cursor, request, &overlay, meta->metric,
+                                         base, pending, local, nlocal, &window, search_k,
+                                         latency, &progress);
+            }
+            PG_FINALLY();
+            {
+                cuvs_ipc_close_page_resident(cursor);
+            }
+            PG_END_TRY();
+            break;
+        }
+        if (rc == CUVS_STATUS_PAGE_OVERLAY_HOST_FULL && !force_local &&
+            request->tail > request->folded)
+        {
+            force_local = true;
+            overlay.from = request->folded;
+        }
+        else if (rc == CUVS_STATUS_PAGE_NEED && progress.daemon_id &&
+                 progress.covered_upto >= request->folded && progress.covered_upto < overlay.from)
+            overlay.from = progress.covered_upto;
+        else
+            break;
+    }
+
+    pfree(cursor);
+    pfree(base);
+    pfree(pending);
+    if (local)
+        pfree(local);
+    if (!valid)
+    {
+        pfree(ss->page_results);
+        ss->page_results = NULL;
+        return false;
+    }
+    ss->page_heap_tids = true;
+#ifdef CUVS_TEST_HOOKS
+    if (page_resident_proof.index_oid == oid)
+    {
+        page_resident_proof.valid = true;
+        page_resident_proof.request = *request;
+        page_resident_proof.boot_id = overlay.boot_id;
+        page_resident_proof.daemon_id = progress.daemon_id;
+        page_resident_proof.wire = overlay.base.tail - overlay.from;
+        page_resident_proof.local = request->tail - overlay.base.tail;
+        page_resident_proof.exhausted = !window.pending_left && window.base_k >= request->n_slots;
+    }
+#endif
+    return true;
 }
 
 static bool
@@ -5584,12 +6310,13 @@ page_start_search(IndexScanDesc scan, CuvsScanState *ss)
         (scan->orderByData[0].sk_flags & SK_ISNULL))
         return false;
     query = DatumGetPgVector(scan->orderByData[0].sk_argument);
-    if (!page_search_request(index, scan->xs_snapshot, query->dim,
+    if (!page_search_request(index, scan->heapRelation, scan->xs_snapshot, query->dim,
+                             cuvs_page_resident_search,
                              &meta, &ss->page_blocks, &request))
         return false;
     k = cuvs_k + (int) Min(meta.dead_slots, (uint64) cuvs_k);
 #ifdef CUVS_CAGRA_FOLD_ENABLED
-    if (request.folded != 0)
+    if (request.folded != 0 && !cuvs_page_resident_search)
     {
         /* Known invalid slots consume places in the daemon's ranked list.
          * Ordinary MVCC invisibility is handled by the existing resolver. */
@@ -5599,7 +6326,12 @@ page_start_search(IndexScanDesc scan, CuvsScanState *ss)
     }
 #endif
 
-    if (request.tail == request.folded && request.folded == 0)
+    if (cuvs_page_resident_search)
+    {
+        rc = page_start_resident(scan, ss, &meta, &request, query, &k, &latency)
+            ? CUVS_STATUS_OK : CUVS_STATUS_NOT_FOUND;
+    }
+    else if (request.tail == request.folded && request.folded == 0)
     {
         ss->page_results = palloc(k * sizeof(*ss->page_results));
         rc = cuvs_ipc_search_pages(cuvs_socket_path, MyDatabaseId, RelationGetRelid(index),
@@ -5635,7 +6367,7 @@ page_start_search(IndexScanDesc scan, CuvsScanState *ss)
         if (rc == CUVS_STATUS_OK)
         {
             ss->page_results = palloc(k * sizeof(*ss->page_results));
-            if (page_resolve_overlay(scan, ss, &meta, &request, results, count))
+            if (page_resolve_overlay(scan, ss, &meta, &request, ss->page_blocks, false, results, count))
                 ss->page_heap_tids = true;
             else
             {
@@ -5672,6 +6404,14 @@ page_start_exact(IndexScanDesc scan, CuvsScanState *ss)
         !(scan->orderByData[0].sk_flags & SK_ISNULL))
         dim = DatumGetPgVector(scan->orderByData[0].sk_argument)->dim;
     cuvs_cagra_check_query_dim(scan->indexRelation, dim);
+#ifdef CUVS_TEST_HOOKS
+    if (page_resident_proof.index_oid == RelationGetRelid(scan->indexRelation))
+    {
+        ++page_resident_proof.exact_entries;
+        if (page_resident_proof.capacity)
+            ++page_resident_proof.capacity_entries;
+    }
+#endif
     cuvs_last_n_results = -1;
     ss->page_exact = cuvs_hnsw_exact_begin(scan);
 }
@@ -5684,6 +6424,19 @@ page_gettuple(IndexScanDesc scan, CuvsScanState *ss)
     if (!ss->searched)
     {
         ss->searched = true;
+#ifdef CUVS_TEST_HOOKS
+        if (page_resident_proof.index_oid == RelationGetRelid(scan->indexRelation))
+        {
+            ++page_resident_proof.scan_starts;
+            page_resident_proof.capacity = false;
+            page_resident_proof.valid = false;
+            page_resident_proof.windows = 0;
+            page_resident_proof.first_resident_candidates = 0;
+            page_resident_proof.first_resident_visible = 0;
+            page_resident_proof.base_filtered = false;
+            page_resident_proof.cursor_status = -1;
+        }
+#endif
         if (!page_start_search(scan, ss))
             page_start_exact(scan, ss);
     }

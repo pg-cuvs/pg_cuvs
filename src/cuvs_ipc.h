@@ -178,6 +178,10 @@ int cuvs_ipc_build_hnsw_file_idle(const char *socket_path, int vectors_fd,
  * The command is followed by CuvsExtraSearchRequest and dim floats.
  * An OK reply carries CuvsExtraSearchReply followed by n_results CuvsResults. */
 #define CUVS_OP_SEARCH_EXTRA             61
+#define CUVS_OP_SEARCH_PAGE_RESIDENT     62
+#define CUVS_OP_FOLD_RESIDENT_COMMITTED  63
+#define CUVS_OP_FOLD_RESIDENT_READY      66
+#define CUVS_OP_PAGE_HISTORY_PRUNE       68
 #define CUVS_EXTRA_SEARCH_VERSION         1u
 #define CUVS_EXTRA_SEARCH_MAX_K         512u
 #define CUVS_EXTRA_SEARCH_MAX_DIM      3072u
@@ -203,6 +207,9 @@ typedef struct CuvsExtraSearchReply {
 #define CUVS_PAGE_SLOT_INVALID UINT64_MAX
 #define CUVS_PAGE_BUILD_DEFER_LEGACY 1U
 #define CUVS_PAGE_SEARCH_MAX_K 4000
+/* The resident cursor can continue pending ranks independently of the
+ * supported cuVS CAGRA kernel output width for its base graph. */
+#define CUVS_PAGE_RESIDENT_BASE_MAX_K 1024U
 #define CUVS_PAGE_BATCH_MAX 4096U
 #define CUVS_PAGE_OVERLAY_MAX 200000U
 
@@ -282,6 +289,34 @@ typedef struct CuvsPageOverlayResult
     uint32_t block;
 } CuvsPageOverlayResult;
 
+/* Op 62 appends this window and the base and pending arrays after an OK
+ * reply's progress. Each count is bounded by CUVS_PAGE_SEARCH_MAX_K.
+ * The reply header's n_results is the sum of the two counts. */
+typedef struct CuvsPageResidentWindow
+{
+    uint32_t base_count;
+    uint32_t pending_count;
+    uint32_t pending_left;
+    uint32_t base_k;
+} CuvsPageResidentWindow;
+
+/* The first window uses cmd.k for both limits. Later windows take this
+ * frame on the same socket. Zero base_k retains the previous base list. */
+typedef struct CuvsPageResidentAdvance
+{
+    uint32_t base_k;
+    uint32_t pending_limit;
+    uint32_t filter_words; /* optional PG snapshot exclusion bitmap follows */
+    uint32_t reserved;
+} CuvsPageResidentAdvance;
+
+#define CUVS_PAGE_RESIDENT_KEEPALIVE 1u
+
+typedef struct CuvsPageResidentCursor
+{
+    int fd;
+} CuvsPageResidentCursor;
+
 int cuvs_ipc_supply_pages(const char *socket_path, uint32_t db_oid, uint32_t index_oid,
     const CuvsPageOverlayRequest *request, int dim, uint32_t metric,
     const CuvsPageSupplement *supplement, CuvsPageProgress *progress);
@@ -296,6 +331,35 @@ int cuvs_ipc_search_page_overlay(const char *socket_path, uint32_t db_oid, uint3
     uint32_t search_mode, uint32_t bf_precision, const CuvsPageSupplement *supplement,
     CuvsPageOverlayResult *results, int *count, uint32_t *latency_us, CuvsPageProgress *progress);
 
+/* Initialize cursor with .fd = -1. It owns the socket after a complete OK
+ * reply. Capacities are counts of elements and must cover the requested
+ * limits. Window and result arrays are usable on OK. */
+int cuvs_ipc_search_page_resident(const char *socket_path, uint32_t db_oid, uint32_t index_oid,
+    const CuvsPageOverlayRequest *request, const float *query, int dim, int k,
+    uint32_t metric, uint32_t itopk_size, uint32_t search_width, uint32_t use_cpu_hnsw,
+    uint32_t search_mode, uint32_t bf_precision, const CuvsPageSupplement *supplement,
+    CuvsPageResidentCursor *cursor,
+    CuvsPageOverlayResult *base_results, size_t base_capacity,
+    CuvsPageOverlayResult *pending_results, size_t pending_capacity,
+    CuvsPageResidentWindow *window, uint32_t *latency_us, CuvsPageProgress *progress);
+
+/* Pass the window from the previous OK reply. A positive base_k must exceed
+ * the previous base_k and returns a replacement base list. A zero limit
+ * permits a NULL array and returns zero rows for that array. Keep the
+ * preceding base array and its count when base_k is zero. Any non-OK return
+ * closes the cursor. */
+int cuvs_ipc_advance_page_resident(CuvsPageResidentCursor *cursor,
+    uint32_t base_k, uint32_t pending_limit,
+    const uint32_t *excluded, uint32_t filter_words,
+    CuvsPageOverlayResult *base_results, size_t base_capacity,
+    CuvsPageOverlayResult *pending_results, size_t pending_capacity,
+    CuvsPageResidentWindow *window, uint32_t *latency_us, CuvsPageProgress *progress);
+
+/* Idempotent cleanup for normal completion and caller exception paths. */
+void cuvs_ipc_close_page_resident(CuvsPageResidentCursor *cursor);
+/* Extend the idle wait while PostgreSQL is visiting base index slots. */
+bool cuvs_ipc_hold_page_resident(CuvsPageResidentCursor *cursor);
+
 typedef struct CuvsPageFoldQuery
 {
     uint32_t length;
@@ -303,6 +367,13 @@ typedef struct CuvsPageFoldQuery
     uint64_t system_identifier;
     uint64_t boot_id;
 } CuvsPageFoldQuery;
+
+typedef struct CuvsPageResidentFoldQuery
+{
+    CuvsPageFoldQuery query;
+    uint64_t index_nonce;
+    uint64_t boot_started_us;
+} CuvsPageResidentFoldQuery;
 
 typedef struct CuvsPageFoldEvent
 {
@@ -327,6 +398,20 @@ typedef struct CuvsPageFoldResult
     uint64_t transition_lsn;
 } CuvsPageFoldResult;
 
+typedef struct CuvsPageResidentFoldResult
+{
+    CuvsPageFoldResult fold;
+    uint32_t transition_xid;
+    uint32_t reserved;
+} CuvsPageResidentFoldResult;
+
+typedef struct CuvsPageHistoryPrune
+{
+    CuvsPageSearchRequest base;
+    uint64_t boot_id;
+    uint64_t boot_started_us;
+} CuvsPageHistoryPrune;
+
 bool cuvs_page_fold_event_valid(const CuvsPageFoldEvent *event);
 
 /* READY returns one fixed event on OK and no payload on NOT_FOUND.
@@ -336,10 +421,18 @@ int cuvs_ipc_page_fold_ready(const char *socket_path, uint32_t db_oid,
 /* An index-specific consumer receives events only for that incarnation. */
 int cuvs_ipc_page_fold_ready_index(const char *socket_path, uint32_t db_oid, uint32_t index_oid,
     uint64_t index_nonce, uint64_t system_identifier, uint64_t boot_id, CuvsPageFoldEvent *event);
+/* A resident READY proves support for the matching resident ACK before WAL publication. */
+int cuvs_ipc_page_fold_resident_ready(const char *socket_path, uint32_t db_oid, uint32_t index_oid,
+    uint64_t index_nonce, uint64_t system_identifier, uint64_t boot_id,
+    uint64_t boot_started_us, CuvsPageFoldEvent *event);
 
 /* A nonzero LSN sends COMMITTED. Zero sends DISCARD. Both replies are status-only. */
 int cuvs_ipc_page_fold_result(const char *socket_path, const CuvsPageFoldEvent *event,
     uint64_t transition_lsn);
+int cuvs_ipc_page_fold_resident_result(const char *socket_path, const CuvsPageFoldEvent *event,
+    uint64_t transition_lsn, uint32_t transition_xid);
+int cuvs_ipc_page_history_prune(const char *socket_path, uint32_t db_oid, uint32_t index_oid,
+    const CuvsPageOverlayRequest *request, uint32_t horizon, uint64_t boot_started_us);
 
 
 
@@ -498,11 +591,19 @@ static_assert(CUVS_PROTO_VERSION == CUVS_ADMISSION_IPC_VERSION,
               "the I3 wire version is the shared admission contract version");
 static_assert(sizeof(CuvsPageFoldQuery) == 24 && sizeof(CuvsPageFoldEvent) == 88 &&
               sizeof(CuvsPageFoldResult) == 96, "page fold wire sizes");
+static_assert(sizeof(CuvsPageResidentFoldQuery) == 40 &&
+              sizeof(CuvsPageResidentFoldResult) == 104, "resident page fold wire sizes");
+static_assert(sizeof(CuvsPageResidentWindow) == 16 && sizeof(CuvsPageResidentAdvance) == 16,
+              "page resident search wire sizes");
 #else
 _Static_assert(CUVS_PROTO_VERSION == CUVS_ADMISSION_IPC_VERSION,
                "the I3 wire version is the shared admission contract version");
 _Static_assert(sizeof(CuvsPageFoldQuery) == 24 && sizeof(CuvsPageFoldEvent) == 88 &&
                sizeof(CuvsPageFoldResult) == 96, "page fold wire sizes");
+_Static_assert(sizeof(CuvsPageResidentFoldQuery) == 40 &&
+               sizeof(CuvsPageResidentFoldResult) == 104, "resident page fold wire sizes");
+_Static_assert(sizeof(CuvsPageResidentWindow) == 16 && sizeof(CuvsPageResidentAdvance) == 16,
+               "page resident search wire sizes");
 #endif
 
 /* err_out / notice_out of the last reply header this thread received through
@@ -1083,20 +1184,24 @@ int cuvs_ipc_build_multi(
  * #165: the sidecar is handed over as an SCM_RIGHTS fd with its /dev/shm name
  * already unlinked daemon-side — there is nothing for the caller to unlink, and
  * the caller could not have done so anyway (different uid, sticky /dev/shm).
- * The caller reads through *fd_out and MUST close() it when done. shm_path_out
+ * Requests with k = CUVS_HNSW_EXPORT_PAIRED receive a second, sealed fd for
+ * the matching CAGRA TIDs. The caller closes both returned descriptors.
+ * shm_path_out
  * receives the daemon's former path for diagnostics only — it no longer exists,
  * and a "/proc/self/fd/N" substitute would not work either: reopening that
  * symlink re-checks inode permissions and fails EACCES cross-uid whenever the
  * daemon's umask leaves the segment 0600 (#166 review).
  * Returns CUVS_STATUS_OK on success, NOT_FOUND if index not loaded.
  */
+#define CUVS_HNSW_EXPORT_PAIRED 1
 int cuvs_ipc_export_hnsw_shm(
     const char *socket_path,
     uint32_t    db_oid,
     uint32_t    index_oid,
     char       *shm_path_out,  /* caller-allocated, at least 128 chars */
     size_t      shm_path_len,
-    int        *fd_out         /* receives the passed fd; caller closes */
+    int        *fd_out,
+    int        *tids_fd_out
 );
 
 int cuvs_ipc_export_adjacency(

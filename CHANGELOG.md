@@ -12,6 +12,10 @@ exists for 0.9.0.
 
 ### Added
 
+- Experimental page-format CAGRA scans can reuse the daemon's pending rows
+  with `cuvs.page_resident_search=on`. `cuvs.resident_supply=on` enables
+  background supply on builds with native page-format folding. Both settings
+  default to `off`.
 - `pg_cuvs_hnsw_layer_counts(regclass)` and `pg_cuvs_hnsw_layer_status()`: the elements of
   a `pg_cuvs_hnsw` index above level 0, and whether each index has the upper layers that
   `mode = 'nsw'` did not build before 0.9.3 (such an index needs `REINDEX INDEX`) and links
@@ -93,6 +97,15 @@ exists for 0.9.0.
 
 ### Fixed
 
+- The daemon no longer dies with SIGSEGV when it frees an index after a failed request. A
+  failed request discarded its pooled resource slot together with the slot's dedicated
+  CUDA stream (`--rmm-dedicated-stream`, on by default), while device buffers that an
+  earlier request on that slot had allocated, such as the graph of an index built there,
+  still referred to the stream; RMM's pool looked the destroyed stream up when the index
+  was dropped or compacted. Any failed request poisons its slot, including host-side
+  failures such as a missing HNSW sidecar. The slot's handles are still discarded, but the
+  stream is now kept and reused once `cudaStreamQuery` reports it idle, and a kept stream
+  is never destroyed.
 - `pg_cuvs_hnsw` applies `ef_construction` to the applicable SDK settings for
   direct heap builds and records the configured value in the index metapage.
   Conversions from legacy CAGRA indexes use the option only for the target
@@ -103,6 +116,25 @@ exists for 0.9.0.
   An existing explicit `ef_construction` setting now takes effect on the next
   direct heap build or `REINDEX`, which can change build time and the resulting
   graph.
+
+- Reject CAGRA sources with a stale marker and sources with pending inserts or deletes
+  before converting them to HNSW. Source-based DDL checks the index key and
+  predicate, and `pg_cuvs_build_hnsw()` preserves both. The existing
+  vector-to-halfvec conversion on the same key is supported.
+- An explicit conversion rejects duplicate heap TIDs that hold different
+  vectors. When the duplicates hold the same vector, pgvector builds the
+  target from the current heap. Rebuilds of existing indexes can use a
+  heap build in both cases.
+- `hnswlib_file` could previously import an older graph after the CAGRA source
+  changed. It now rejects a missing or invalid build-time binding between
+  `.hnsw` and `.tids` with SQLSTATE `55000`. Files written by earlier versions
+  have no binding, so a conversion that used to proceed from them now fails
+  until the files are regenerated. For a clean resident source, use
+  `mode = 'nsw'` or regenerate the files by enabling
+  `cuvs.cpu_hnsw_fallback` and running `REINDEX` on the source. If a failed
+  `CREATE INDEX CONCURRENTLY` leaves an invalid target index, drop it before
+  retrying. A failed rebuild preserves the binding when it restores the same
+  graph and TID files with unchanged contents.
 
 - `CREATE INDEX CONCURRENTLY ... USING pg_cuvs_hnsw` and `REINDEX INDEX CONCURRENTLY` of a `pg_cuvs_hnsw` index
   built from the heap (without `source`) no longer make the table's queries wait for a lock. The build opened the
@@ -121,6 +153,19 @@ exists for 0.9.0.
   Not changed: the concurrent build and `REINDEX ... CONCURRENTLY` of a `pg_cuvs_hnsw` index with `source = ...`
   still ask for `AccessExclusiveLock` on the index while they convert, so the table's reads and writes wait for
   them, as they did before.
+- `pg_cuvs_hnsw` heap builds now use `m` for neighbor capacity, with default
+  32. When an input has 1–64 rows, a default build now stores M 32 and reserves
+  slots accordingly even though the graph width is smaller, so such an index
+  can grow slightly after `REINDEX` (16 KB to 24 KB for a 15-row sample) while
+  returning the same search results. An explicit `m` already recorded by an
+  earlier release takes effect on the next rebuild or restore, which can change
+  the index size, build time and search quality. Use the [catalog query](docs/reference.md#pg_cuvs_hnsw) to find indexes
+  where the configured and built values differ. Source builds inherit the
+  converted M and warn once when an explicit `m` differs; that `m` still
+  applies when maintenance rebuilds the index from the heap. When maintenance
+  rebuilds a source-based index from the heap through pgvector, an index
+  without an explicit `m` now gets M 32 instead of 16. `ALTER INDEX ...
+  SET (m = ...)` applies on the next rebuild.
 - `cuvs.delta_search = 'cpu'` returned every row of a pending `.delta` twice, pushing
   correct rows out of the top k: the daemon merged its GPU delta cache whatever the mode
   was and the backend merged `.delta` again. The SEARCH request now carries the mode, and
@@ -184,6 +229,16 @@ exists for 0.9.0.
   function from device code, and nvcc rejects that without `--expt-relaxed-constexpr`.
   The planner flags now pass it, as the SDK's own build does. Builds without the
   planner are unchanged. 0.9.1 and 0.9.2 have the same defect.
+
+### Upgrading
+
+- Upgrade the extension and daemon together and restart the daemon before
+  using the paired `hnswlib` export.
+- When rebuilding an existing source-based HNSW index during PostgreSQL table
+  maintenance, an unusable CAGRA source falls back to a pgvector heap build.
+  Explicit conversions require matching definitions and the current heap
+  generation. The deprecated conversion function blocks table writes through
+  transaction end.
 
 ## [0.9.2] - 2026-11-15
 
