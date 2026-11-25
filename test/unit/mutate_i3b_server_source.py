@@ -5,8 +5,8 @@ ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)
 SRC = os.path.join(ROOT, "src", "pg_cuvs_server.c")
 SCAN = os.path.join(ROOT, "test", "unit", "check_i3b_server_source.py")
 M = [
-    ("startup loads as LOAD", "CUVS_RQ_LOAD_STARTUP) == 0)", "CUVS_RQ_LOAD) == 0)"),
-    ("warmup loads as LOAD", "job.index_oid, CUVS_RQ_LOAD_WARMUP)", "job.index_oid, CUVS_RQ_LOAD)"),
+    ("startup loads as LOAD", "CUVS_RQ_LOAD_STARTUP, -1) == 0)", "CUVS_RQ_LOAD, -1) == 0)"),
+    ("warmup loads as LOAD", "job.index_oid, CUVS_RQ_LOAD_WARMUP, -1)", "job.index_oid, CUVS_RQ_LOAD, -1)"),
     ("search reload as LOAD_STARTUP",
      "    if (!e && load_index(cmd->db_oid, cmd->index_oid, CUVS_RQ_LOAD, client_fd) == 0)",
      "    if (!e && load_index(cmd->db_oid, cmd->index_oid, CUVS_RQ_LOAD_STARTUP, client_fd) == 0)"),
