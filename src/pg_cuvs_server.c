@@ -29,6 +29,7 @@
 #include "cuvs_ipc.h"
 #include "cuvs_page_overlay.h"
 #include "cuvs_util.h"
+#include "cuvs_hnsw_source.h"
 #include "cuvs_cache_policy.h"
 #include "cuvs_bf_verdict.h"     /* #238: remembered brute_force unavailable verdict */
 #include "cuvs_peak_meter.h"
@@ -224,6 +225,7 @@ typedef struct IndexEntry {
     size_t          main_bf_vram_bytes; /* estimated VRAM held by main_bf_idx */
     int64_t         main_bf_mtime;      /* .vectors st_mtime when the BF was built */
     uint32_t        main_bf_generation; /* base .tids body_crc32 the BF was built on */
+    bool            legacy_vectors_stale; /* default .vectors cannot serve this graph */
     uint32_t        bf_precision;       /* precision of the resident BF index(es):
                                          * 0=float32, 1=float16 (cuvs.bf_precision) */
     /* #238: remembered "brute_force unavailable" verdict for the unsharded BF
@@ -288,6 +290,10 @@ typedef struct IndexEntry {
     int             pinned;             /* daemon-lifetime pin; kept by REINDEX */
     time_t          loaded_at;          /* registration time (order key) */
     int             file_current;       /* I-FC: 1 iff graph/tids == .cagra/.tids */
+    bool            compact_save_pending; /* failed compact must finish before accepting EXTEND */
+    bool            compact_tombstones_unapplied; /* resident graph still has deleted slots */
+    dev_t           compact_tombstone_dev;
+    ino_t           compact_tombstone_ino;
     uint64_t        extra_search_generation; /* optional opcode, protected by g_index_mutex */
     int             extra_search_default_dir;
     dev_t           extra_search_dir_dev;
@@ -333,6 +339,9 @@ reset_entry_stats(IndexEntry *e)
     e->last_search        = 0;
     e->loaded_at          = time(NULL);
     e->file_current       = 0;
+    e->compact_save_pending = false;
+    e->compact_tombstones_unapplied = false;
+    e->legacy_vectors_stale = false;
     e->extra_search_generation = 0;
     e->extra_search_default_dir = 0;
 }
@@ -404,6 +413,9 @@ typedef struct PageCagraGraph
     PageCagraRetiredBoot *retired_boots;
     uint32_t fold_pins;
     bool fold_retired;
+    bool search_invalidated;
+    uint32_t ancestor_until_xid;
+    uint64_t pg_boot_started_us;
     struct PageCagraGraph *fold_candidate;
     CuvsPageFoldEvent fold_event;
     uint64_t fold_lsn;
@@ -426,6 +438,7 @@ typedef struct PageGraphFoldRef
 } PageGraphFoldRef;
 
 static PageCagraGraph *g_page_graphs;
+static PageCagraGraph *g_page_ancestors;
 static int g_n_page_graphs;
 static uint64_t g_page_access;
 static uint64_t g_page_fold_offer_order;
@@ -433,7 +446,7 @@ static uint64_t g_page_daemon_id;
 static pthread_once_t g_page_daemon_once = PTHREAD_ONCE_INIT;
 static size_t g_page_graph_bytes[CUVS_MAX_GPUS];
 static CuvsPageOverlayBudget g_page_overlay_budget;
-static _Thread_local CuvsPageOverlayChunk *g_retired_page_overlays;
+static CuvsPageOverlayChunk *g_retired_page_overlays;
 static _Thread_local PageCagraGraph *g_retired_fold_graphs;
 
 #ifdef CUVS_CAGRA_FOLD_ENABLED
@@ -455,10 +468,12 @@ static _Thread_local uint64_t t_fold_request_started;
 static void
 defer_page_overlay_release(CuvsPageOverlayChunk *head)
 {
-    if (head)
+    /* The registry lock serializes both queuing and detaching the work.
+     * Distinct graphs can place separate references to one head here. */
+    if (head && head->deferred_releases++ == 0)
     {
-        head->retired_next = g_retired_page_overlays;
-        g_retired_page_overlays = head;
+        head->retired_next = __atomic_load_n(&g_retired_page_overlays, __ATOMIC_RELAXED);
+        __atomic_store_n(&g_retired_page_overlays, head, __ATOMIC_RELEASE);
     }
 }
 
@@ -467,12 +482,27 @@ defer_page_overlay_release(CuvsPageOverlayChunk *head)
 static void
 release_retired_page_overlays(void)
 {
-    while (g_retired_page_overlays)
+    for (;;)
     {
-        CuvsPageOverlayChunk *head = g_retired_page_overlays;
+        CuvsPageOverlayChunk *head;
+        size_t releases;
 
-        g_retired_page_overlays = head->retired_next;
-        cuvs_page_overlay_release(head);
+        if (!__atomic_load_n(&g_retired_page_overlays, __ATOMIC_ACQUIRE))
+            return;
+        pthread_mutex_lock(&g_index_mutex);
+        head = __atomic_load_n(&g_retired_page_overlays, __ATOMIC_RELAXED);
+        if (!head)
+        {
+            pthread_mutex_unlock(&g_index_mutex);
+            return;
+        }
+        __atomic_store_n(&g_retired_page_overlays, head->retired_next, __ATOMIC_RELEASE);
+        releases = head->deferred_releases;
+        head->retired_next = NULL;
+        head->deferred_releases = 0;
+        pthread_mutex_unlock(&g_index_mutex);
+        while (releases--)
+            cuvs_page_overlay_release(head);
     }
 }
 
@@ -527,7 +557,7 @@ release_retired_fold_graphs(void)
 }
 
 /* Candidates are owned by their parent until an ACK installs them in the
- * registry. A search only uses the candidate handle under g_index_mutex. */
+ * registry. A resident search can pin a candidate before that ACK. */
 static void
 discard_page_fold_locked(PageCagraGraph *parent, const char *reason)
 {
@@ -544,7 +574,10 @@ discard_page_fold_locked(PageCagraGraph *parent, const char *reason)
         (void) reason;
 #endif
         parent->fold_candidate = NULL;
-        defer_fold_graph_dispose(candidate);
+        candidate->fold_retired = true;
+        candidate->search_invalidated = true;
+        if (candidate->fold_pins == 0)
+            defer_fold_graph_dispose(candidate);
     }
 }
 
@@ -553,6 +586,7 @@ retire_page_graph_locked(PageCagraGraph *entry, bool defer_dispose)
 {
     entry->next = NULL;
     entry->fold_retired = true;
+    entry->search_invalidated = !defer_dispose;
     discard_page_fold_locked(entry, "retired");
     if (entry->fold_pins == 0)
     {
@@ -574,6 +608,33 @@ free_page_graph(PageCagraGraph **link)
     *link = entry->next;
     --g_n_page_graphs;
     retire_page_graph_locked(entry, false);
+}
+
+/* Normal XIDs use PostgreSQL's wraparound comparison. A zero horizon
+ * retires the entire matching scope on DROP or a postmaster change. */
+static void
+prune_page_ancestors_locked(uint32_t db, uint32_t index, uint64_t system,
+                            uint64_t nonce, uint64_t base, uint64_t boot, uint32_t horizon)
+{
+    PageCagraGraph **link = &g_page_ancestors;
+
+    while (*link)
+    {
+        PageCagraGraph *old = *link;
+
+        if (old->db_oid == db && old->index_oid == index &&
+            (!system || old->system_identifier == system) &&
+            (!nonce || old->index_nonce == nonce) && (!base || old->base_nonce == base) &&
+            (!boot || old->overlay.boot_id == boot) &&
+            (!horizon || (int32_t) (old->ancestor_until_xid - horizon) < 0))
+        {
+            *link = old->next;
+            retire_page_graph_locked(old, true);
+            old->search_invalidated = horizon == 0;
+        }
+        else
+            link = &old->next;
+    }
 }
 
 /* Caller holds g_index_mutex and supplies the selected registered graph.
@@ -704,7 +765,11 @@ page_graph_use_boot_locked(PageCagraGraph *graph, uint64_t boot_id,
         graph->retired_boots = boot;
     }
     discard_page_fold_locked(graph, "pg_lifetime");
+    if (graph->overlay.boot_id)
+        prune_page_ancestors_locked(graph->db_oid, graph->index_oid, graph->system_identifier,
+                                    graph->index_nonce, graph->base_nonce, graph->overlay.boot_id, 0);
     *obsolete = cuvs_page_overlay_start_boot(&graph->overlay, boot_id, graph->folded);
+    graph->pg_boot_started_us = 0;
 #ifdef CUVS_CAGRA_FOLD_ENABLED
     graph->fold_pending_since = 0;
     graph->fold_retry_after = 0;
@@ -718,6 +783,7 @@ drop_page_graphs(uint32_t db_oid, uint32_t index_oid)
 {
     PageCagraGraph **link = &g_page_graphs;
 
+    prune_page_ancestors_locked(db_oid, index_oid, 0, 0, 0, 0, 0);
     while (*link)
     {
         PageCagraGraph *entry = *link;
@@ -1980,6 +2046,26 @@ hnsw_file_path(char *out, size_t outlen,
     snprintf(out, outlen, "%s/%u_%u.hnsw", dir, db_oid, index_oid);
 }
 
+/* Invalidation is durable before the GPU graph can change. Keep the invalid
+ * record so a sync failure can be retried before accepting another EXTEND. */
+static int
+invalidate_hnsw_source(const char *dir, uint32_t db, uint32_t index)
+{
+    char path[576];
+    uint32_t zero = 0;
+    int fd;
+    int rc;
+
+    snprintf(path, sizeof(path), "%s/%u_%u.hnsw%s", dir, db, index,
+             CUVS_HNSW_SOURCE_SUFFIX);
+    fd = open(path, O_WRONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (fd < 0)
+        return errno == ENOENT ? 0 : -1;
+    rc = (pwrite(fd, &zero, sizeof(zero), 0) == sizeof(zero)) ? fsync(fd) : -1;
+    close(fd);
+    return rc;
+}
+
 /* 3P: IVF-PQ serialized index. */
 static void
 ivfpq_file_path(char *out, size_t outlen,
@@ -2401,9 +2487,8 @@ stat_mtime_ns(const struct stat *st)
     return (int64_t) st->st_mtim.tv_sec * 1000000000LL + (int64_t) st->st_mtim.tv_nsec;
 }
 
-/* Phase 3L: make e's resident main brute-force index match the current
- * `.vectors` sidecar and the requested precision. Lazily (re)built on the first
- * brute_force search and whenever the sidecar's mtime or the precision changes.
+/* Phase 3L: make e's resident main brute-force index match the current base
+ * and the requested precision. Lazily built from the `.vectors` sidecar.
  * Leaves main_bf_idx == NULL (so the caller fails closed with NO_VECTORS) when
  * the sidecar is missing, stale (generation mismatch with the current .tids),
  * corrupt, shape-mismatched, or cannot fit. Best-effort, NON-evicting:
@@ -2422,6 +2507,14 @@ refresh_main_bf_cache(IndexEntry *e, uint32_t want_precision)
     uint32_t          dg = delta_gpu_of(e);   /* unsharded: the index's GPU */
     int               rc;
 
+    /* After EXTEND or COMPACT, build-time vectors may no longer match the
+     * resident graph even if the old sidecars still agree with each other. */
+    if (e->legacy_vectors_stale)
+    {
+        free_main_bf_cache(e);
+        return;
+    }
+
     vectors_file_path(path, sizeof(path), g_index_dir, e->db_oid, e->index_oid);
     if (stat(path, &st) != 0)
     {
@@ -2430,8 +2523,15 @@ refresh_main_bf_cache(IndexEntry *e, uint32_t want_precision)
     }
     if (e->main_bf_idx
         && (int64_t) st.st_mtime == e->main_bf_mtime
-        && e->bf_precision == want_precision)
-        return;                         /* unchanged + same precision -> reuse */
+        && e->bf_precision == want_precision
+        && e->main_bf_n == e->n_vecs)
+    {
+        uint32_t cur_tids_crc;
+
+        if (tids_body_crc_of(e, &cur_tids_crc) == 0 &&
+            cur_tids_crc == e->main_bf_generation)
+            return;
+    }
 
     /* #238: the same `.vectors` file as the last "unavailable" verdict -> decide
      * from what that read found, against the current row count, shape and
@@ -2449,7 +2549,7 @@ refresh_main_bf_cache(IndexEntry *e, uint32_t want_precision)
             return;
     }
 
-    /* Sidecar changed or precision toggled: drop the old index and rebuild.
+    /* The cached index cannot be reused: drop it and try to rebuild.
      * A failure below leaves main_bf_idx NULL, so the next search comes back
      * here; the read is skipped then only for a failure noted in bf_verdict
      * or when the VRAM pre-check below fails (which is checked again on every
@@ -2658,6 +2758,10 @@ static int write_tids_atomic(const char *tids_tmp,
                              int64_t n_vecs, uint32_t dim, uint32_t metric,
                              const uint64_t *tids);
 static int fsync_path(const char *path);
+static bool read_hnsw_source(const char *graph_path, const char *tids_path,
+                             CuvsHnswSourceBinding *binding);
+static int bind_hnsw_source(const char *dir, const char *graph_path, const char *tids_path,
+                            const CuvsHnswFileIdentity *previous_graph);
 static void fchmod_sidecar(FILE *f, const char *path);
 static void chmod_sidecar(const char *path);
 static CuvsAdmissionReason lw_admission_check(int device_id, uint64_t needed,
@@ -2671,13 +2775,18 @@ static int make_slot(int device_id, CuvsRequester rq);
 static IndexEntry *registry_new_slot(void);
 static size_t entry_bytes_on(const IndexEntry *e, int device_id);
 
-/* save_index: persist a registry entry to disk atomically.
+/* save_index: persist a registry entry to disk.
  * Same contract as handle_build's persistence path: tmp + rename + fsync.
- * Returns 0 on success, -1 on any failure (caller must NOT proceed to free
- * VRAM state, e.g., evict_lru must abort eviction on failure). */
+ * Returns 0 on success, -1 before either rename, and SAVE_INDEX_PUBLISH_FAILED
+ * after publishing .tids. Eviction must retain the entry on either failure. */
+enum { SAVE_INDEX_PUBLISH_FAILED = -2 };
+
 static int
 save_index(IndexEntry *e)
 {
+    /* Only COMPACT may publish a candidate while its tombstones are pending. */
+    if (e->compact_save_pending)
+        return -1;
 #ifdef CUVS_TEST_HOOKS
     if (cuvs_fault("CUVS_FAULT_SAVE_INDEX")) {
         LOG_ERROR("save_index: CUVS_FAULT_SAVE_INDEX -> forced failure for %u/%u\n",
@@ -2697,8 +2806,18 @@ save_index(IndexEntry *e)
 
     char idx_final[512],  idx_tmp[576];
     char tids_final[512], tids_tmp[576];
+    char hnsw_final[512];
+    CuvsHnswSourceBinding old_binding;
+    bool preserve_binding = false;
     index_file_path(idx_final,  sizeof(idx_final),  g_index_dir, e->db_oid, e->index_oid);
     tids_file_path(tids_final,  sizeof(tids_final), g_index_dir, e->db_oid, e->index_oid);
+    if (e->file_current)
+    {
+        /* SIGTERM rewrites even an unchanged TID file. Carry forward only
+         * a binding that matched the current file before the rewrite. */
+        hnsw_file_path(hnsw_final, sizeof(hnsw_final), g_index_dir, e->db_oid, e->index_oid);
+        preserve_binding = read_hnsw_source(hnsw_final, tids_final, &old_binding);
+    }
     snprintf(idx_tmp,  sizeof(idx_tmp),  "%s.tmp", idx_final);
     snprintf(tids_tmp, sizeof(tids_tmp), "%s.tmp", tids_final);
 
@@ -2713,7 +2832,29 @@ save_index(IndexEntry *e)
     }
     chmod_sidecar(idx_tmp);
     if (fsync_path(idx_tmp) != 0)
-        LOG_WARN("save_index: fsync %s failed errno=%d\n", idx_tmp, errno);
+    {
+        LOG_ERROR("save_index: fsync %s failed errno=%d\n", idx_tmp, errno);
+        unlink(tids_tmp);
+        unlink(idx_tmp);
+        return -1;
+    }
+
+    /* Retire the build vectors durably before publishing a changed graph.
+     * Reused heap slots can leave the TID array and its CRC unchanged even
+     * though the new graph contains different vectors. */
+    if (e->legacy_vectors_stale)
+    {
+        char vectors_path[512];
+        vectors_file_path(vectors_path, sizeof(vectors_path), g_index_dir,
+                          e->db_oid, e->index_oid);
+        if ((unlink(vectors_path) != 0 && errno != ENOENT) || fsync_path(g_index_dir) != 0)
+        {
+            LOG_ERROR("save_index: cannot retire %s errno=%d\n", vectors_path, errno);
+            unlink(tids_tmp);
+            unlink(idx_tmp);
+            return -1;
+        }
+    }
 
     if (rename(tids_tmp, tids_final) != 0) {
         LOG_ERROR("save_index: rename %s -> %s FAILED errno=%d (%s)\n",
@@ -2728,15 +2869,57 @@ save_index(IndexEntry *e)
                 idx_tmp, idx_final, errno, strerror(errno));
         unlink(tids_final);
         unlink(idx_tmp);
-        return -1;
+        return SAVE_INDEX_PUBLISH_FAILED;
     }
-    int dir_fd = open(g_index_dir, O_RDONLY);
-    if (dir_fd >= 0) { fsync(dir_fd); close(dir_fd); }
+    if (fsync_path(g_index_dir) != 0)
+    {
+        LOG_ERROR("save_index: fsync %s failed errno=%d\n", g_index_dir, errno);
+        return SAVE_INDEX_PUBLISH_FAILED;
+    }
 
+    if (preserve_binding &&
+        bind_hnsw_source(g_index_dir, hnsw_final, tids_final, &old_binding.graph) != 0)
+        LOG_WARN("save_index: cannot renew the HNSW binding for %u/%u\n", e->db_oid, e->index_oid);
     e->file_current = 1;   /* I-FC (iii) */
     LOG_INFO("pg_cuvs_server: saved index %u/%u (%lld vecs)\n",
             e->db_oid, e->index_oid, (long long)e->n_vecs);
     return 0;
+}
+
+/* Save the resident graph without clearing the tombstone guard. COMPACT
+ * controls when EXTEND may resume. Shutdown needs only to persist the rows. */
+static int
+save_pending_compact(IndexEntry *e)
+{
+    IndexEntry resident = *e;
+    resident.compact_save_pending = false;
+    int rc = save_index(&resident);
+    if (rc == 0)
+        e->file_current = 1;
+    return rc;
+}
+
+/* The old graph cannot be made searchable or extendable without its
+ * tombstones. Publish the existing stale marker before a shutdown save. */
+static int
+mark_unapplied_compact_stale(IndexEntry *e)
+{
+    e->extra_search_generation = 0;
+    if (!e->stale)
+    {
+        e->stale = 1;
+        e->stale_since = time(NULL);
+    }
+
+    char path[512];
+    stale_file_path(path, sizeof(path), g_index_dir, e->db_oid, e->index_oid);
+    int fd = open(path, O_WRONLY | O_CREAT | O_NOFOLLOW | O_CLOEXEC, 0600);
+    if (fd < 0)
+        return -1;
+    int rc = fsync(fd);
+    if (close(fd) != 0)
+        rc = -1;
+    return rc == 0 ? fsync_path(g_index_dir) : rc;
 }
 
 /* Phase 3F: reload a sharded logical index from its `.shards` manifest. The
@@ -3785,6 +3968,12 @@ evict_entry(IndexEntry *e, int device_id, CuvsEvictReason why, int self_replace,
 
     if (persist_failed)
         *persist_failed = 0;
+    if (save_legacy && e->compact_save_pending)
+    {
+        if (persist_failed)
+            *persist_failed = 1;
+        return 0;
+    }
     freed = entry_bytes_on(e, device_id);
 
     if (e->shard_count >= 2)
@@ -5355,7 +5544,7 @@ search_filter_exact(IndexEntry *e, const float *query,
     int status = CUVS_STATUS_ERROR;
 
     *pn = 0;
-    if (!e->rev_tids || !e->rev_item_ids || e->n_vecs <= 0)
+    if (e->legacy_vectors_stale || !e->rev_tids || !e->rev_item_ids || e->n_vecs <= 0)
         return CUVS_STATUS_NO_VECTORS;
 
     item_ids = malloc((size_t)n_filter * sizeof(*item_ids));
@@ -5397,6 +5586,7 @@ search_filter_exact(IndexEntry *e, const float *query,
 
     char vpath[512];
     CuvsVectorsHeader vh;
+    uint32_t tids_crc;
     vectors_file_path(vpath, sizeof(vpath), g_index_dir, e->db_oid, e->index_oid);
     vfd = open(vpath, O_RDONLY);
     if (vfd < 0
@@ -5404,7 +5594,9 @@ search_filter_exact(IndexEntry *e, const float *query,
         || vh.magic != CUVS_VECTORS_MAGIC
         || vh.dim != e->dim
         || vh.metric != e->metric
-        || vh.n_vecs != e->n_vecs)
+        || vh.n_vecs != e->n_vecs
+        || tids_body_crc_of(e, &tids_crc) != 0
+        || vh.base_tids_crc32 != tids_crc)
     {
         status = CUVS_STATUS_NO_VECTORS;
         goto cleanup;
@@ -7507,6 +7699,72 @@ fsync_path(const char *path)
     return rc;
 }
 
+static bool
+read_hnsw_source(const char *graph_path, const char *tids_path,
+                 CuvsHnswSourceBinding *binding)
+{
+    char path[576];
+    FILE *file;
+    int graph_fd;
+    int tids_fd;
+    bool found;
+
+    snprintf(path, sizeof(path), "%s%s", graph_path, CUVS_HNSW_SOURCE_SUFFIX);
+    file = fopen(path, "rb");
+    if (file == NULL)
+        return false;
+    graph_fd = open(graph_path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    tids_fd = open(tids_path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    found = (graph_fd >= 0 && tids_fd >= 0 &&
+             cuvs_hnsw_source_binding_read(file, graph_fd, tids_fd, binding, NULL));
+    if (graph_fd >= 0) close(graph_fd);
+    if (tids_fd >= 0) close(tids_fd);
+    fclose(file);
+    return found;
+}
+
+/* Publish the binding after both artifact identities are stable. A clean
+ * save may replace .tids while leaving the same .hnsw file in place. */
+static int
+bind_hnsw_source(const char *dir, const char *graph_path, const char *tids_path,
+                 const CuvsHnswFileIdentity *previous_graph)
+{
+    CuvsHnswSourceBinding binding = { .magic = CUVS_HNSW_SOURCE_MAGIC,
+                                      .version = CUVS_HNSW_SOURCE_VERSION };
+    char path[576];
+    char tmp[608];
+    int graph_fd = open(graph_path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    int tids_fd = open(tids_path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    int fd;
+    bool ok = graph_fd >= 0 && tids_fd >= 0 &&
+              fsync(graph_fd) == 0 &&
+              cuvs_hnsw_file_identity(graph_fd, &binding.graph) == 0 &&
+              cuvs_hnsw_file_identity(tids_fd, &binding.tids) == 0 &&
+              (previous_graph == NULL ||
+               memcmp(previous_graph, &binding.graph, sizeof(binding.graph)) == 0);
+    if (graph_fd >= 0) close(graph_fd);
+    if (tids_fd >= 0) close(tids_fd);
+    if (!ok)
+        return -1;
+
+    snprintf(path, sizeof(path), "%s%s", graph_path, CUVS_HNSW_SOURCE_SUFFIX);
+    snprintf(tmp, sizeof(tmp), "%s.tmp.XXXXXX", path);
+    fd = mkstemp(tmp);
+    if (fd < 0)
+        return -1;
+    ok = fchmod(fd, 0644) == 0 &&
+         write(fd, &binding, sizeof(binding)) == sizeof(binding) &&
+         fsync(fd) == 0;
+    if (close(fd) != 0)
+        ok = false;
+    if (!ok || rename(tmp, path) != 0)
+    {
+        unlink(tmp);
+        return -1;
+    }
+    return fsync_path(dir);
+}
+
 /*
  * #167: force persistent index_dir sidecars (.tids/.vectors/.shards/.cagra/
  * .hnsw) to 0644 regardless of the daemon's umask.
@@ -9103,9 +9361,9 @@ cagra_direct_verify(CuvsCagraIndex handle, const char *direct_path, int target_g
 }
 
 typedef struct CagraBuildBackup {
-    char dir[64];
-    char tids[80], graph[80];
-    bool had_tids, had_graph;
+    char dir[576];
+    char tids[592], graph[592], vectors[592];
+    bool had_tids, had_graph, had_vectors;
 } CagraBuildBackup;
 
 static bool
@@ -9123,10 +9381,10 @@ backup_cagra_file(const char *path, const char *backup, bool *present)
 }
 
 static bool
-backup_cagra_base(const ExtraSearchRoot *root, const char *tids, const char *graph,
-                  CagraBuildBackup *backup)
+backup_cagra_base(const char *dir, const char *tids, const char *graph,
+                  const char *vectors, CagraBuildBackup *backup)
 {
-    snprintf(backup->dir, sizeof(backup->dir), "%s/.cagra-build-XXXXXX", root->path);
+    snprintf(backup->dir, sizeof(backup->dir), "%s/.cagra-build-XXXXXX", dir);
     if (!mkdtemp(backup->dir))
     {
         backup->dir[0] = '\0';
@@ -9134,8 +9392,10 @@ backup_cagra_base(const ExtraSearchRoot *root, const char *tids, const char *gra
     }
     snprintf(backup->tids, sizeof(backup->tids), "%s/tids", backup->dir);
     snprintf(backup->graph, sizeof(backup->graph), "%s/graph", backup->dir);
+    snprintf(backup->vectors, sizeof(backup->vectors), "%s/vectors", backup->dir);
     return backup_cagra_file(tids, backup->tids, &backup->had_tids) &&
-           backup_cagra_file(graph, backup->graph, &backup->had_graph);
+           backup_cagra_file(graph, backup->graph, &backup->had_graph) &&
+           backup_cagra_file(vectors, backup->vectors, &backup->had_vectors);
 }
 
 static void
@@ -9147,6 +9407,8 @@ discard_cagra_build_backup(const CagraBuildBackup *backup)
         unlink(backup->tids);
     if (backup->had_graph)
         unlink(backup->graph);
+    if (backup->had_vectors)
+        unlink(backup->vectors);
     if (rmdir(backup->dir) != 0)
         LOG_WARN("[handle_build] cannot remove backup directory %s: %s\n",
                  backup->dir, strerror(errno));
@@ -9190,16 +9452,17 @@ finish_build_commit(int client_fd, const CuvsCmdFrame *cmd, const char *save_dir
 {
     char idx_final[512],  idx_tmp[576];
     char tids_final[512], tids_tmp[576];
-    char hnsw_path[512], hnsw_tmp[96] = "";
+    char hnsw_path[512], hnsw_tmp[592] = "";
     int hnsw_rc = CUVS_HNSW_SERIALIZE_SKIPPED;
     const char *io_dir = root ? root->path : save_dir;
     const char *persist_error = "disk persistence failed";
     const ExtraSearchRoot *attested_root = NULL;
     int  cagra_fd = pre_cagra_fd;
     int  cagra_direct = 0;
-    bool tids_published = false, graph_published = false;
+    bool vectors_retired = false, tids_published = false, graph_published = false;
     CagraBuildBackup backup = {0};
     IndexEntry *previous = find_index(cmd->db_oid, cmd->index_oid);
+    int previous_file_current = previous ? previous->file_current : 0;
     if (previous)
         previous->extra_search_generation = 0;
     index_file_path(idx_final,  sizeof(idx_final),  io_dir, cmd->db_oid, cmd->index_oid);
@@ -9263,9 +9526,7 @@ finish_build_commit(int client_fd, const CuvsCmdFrame *cmd, const char *save_dir
     }
     LOG_DEBUG("[handle_build] cagra.tmp written + fsynced\n");
 
-    /* Commit point: atomic renames. tids first, then cagra (the file
-     * startup_load_indexes scans for). If second rename fails, log and
-     * unlink whatever we renamed to leave consistent state. */
+    /* Retain the prior files for rollback without copying the corpus. */
 #ifdef CUVS_TEST_HOOKS
     if (cuvs_fault("CUVS_FAULT_RENAME_TIDS")) {
         LOG_ERROR("[handle_build] fault injection: CUVS_FAULT_RENAME_TIDS\n");
@@ -9274,35 +9535,45 @@ finish_build_commit(int client_fd, const CuvsCmdFrame *cmd, const char *save_dir
 #endif
     if (!extra_search_build_root_matches(root, save_dir))
         goto root_changed;
-    if (root)
+    if (!backup_cagra_base(io_dir, tids_final, idx_final, vecs_final, &backup))
     {
-        /* Both old names must be recoverable before either is replaced.
-         * Hard links retain the prior pair without copying the corpus. */
-        if (!backup_cagra_base(root, tids_final, idx_final, &backup))
-        {
-            persist_error = "could not back up the prior CAGRA artifacts";
-            LOG_WARN("[handle_build] %u/%u: %s: %s\n",
-                     cmd->db_oid, cmd->index_oid, persist_error, strerror(errno));
-            goto persist_fail;
-        }
-        if (!extra_search_build_root_matches(root, save_dir))
-            goto root_changed;
+        persist_error = "could not back up the prior CAGRA artifacts";
+        LOG_WARN("[handle_build] %u/%u: %s: %s\n",
+                 cmd->db_oid, cmd->index_oid, persist_error, strerror(errno));
+        goto persist_fail;
     }
+    if (!extra_search_build_root_matches(root, save_dir))
+        goto root_changed;
+
+    /* A rebuild can keep the same TID array while replacing its vectors.
+     * Make the old .vectors name durably absent before publishing either
+     * base file, so a restart can never pair it with the new graph. */
+    if (unlink(vecs_final) == 0)
+        vectors_retired = true;
+    else if (errno != ENOENT)
+    {
+        persist_error = "could not retire the prior CAGRA vectors";
+        goto persist_fail;
+    }
+    if (fsync_path(io_dir) != 0)
+    {
+        persist_error = "could not sync retirement of the prior CAGRA vectors";
+        goto persist_fail;
+    }
+
     if (rename(tids_tmp, tids_final) != 0) {
         LOG_ERROR("[handle_build] rename %s -> %s FAILED errno=%d (%s)\n",
                 tids_tmp, tids_final, errno, strerror(errno));
         goto persist_fail;
     }
     tids_published = true;
-    if (root && previous)
+    if (previous)
         previous->file_current = 0;    /* I-FC: the prior pair changed on disk */
     if (!extra_search_build_root_matches(root, save_dir))
         goto root_changed;
 #ifdef CUVS_TEST_HOOKS
     if (cuvs_fault("CUVS_FAULT_RENAME_CAGRA")) {
         LOG_ERROR("[handle_build] fault injection: CUVS_FAULT_RENAME_CAGRA\n");
-        if (!root)
-            unlink(tids_final);
         goto persist_fail;
     }
 #endif
@@ -9310,14 +9581,15 @@ finish_build_commit(int client_fd, const CuvsCmdFrame *cmd, const char *save_dir
         LOG_ERROR("[handle_build] rename %s -> %s FAILED errno=%d (%s); "
                   "recovering tids to avoid mismatch\n",
                 idx_tmp, idx_final, errno, strerror(errno));
-        if (!root)
-            unlink(tids_final);
         goto persist_fail;
     }
     graph_published = true;
-    /* fsync directory so the rename(s) are durable. */
-    int dir_fd = open(io_dir, O_RDONLY);
-    if (dir_fd >= 0) { fsync(dir_fd); close(dir_fd); }
+    /* The new base must be durable before its .vectors becomes visible. */
+    if (fsync_path(io_dir) != 0)
+    {
+        persist_error = "could not sync the new CAGRA base";
+        goto persist_fail;
+    }
     if (!extra_search_build_root_matches(root, save_dir))
         goto root_changed;
 
@@ -9359,26 +9631,36 @@ finish_build_commit(int client_fd, const CuvsCmdFrame *cmd, const char *save_dir
     }
 
     /* Both a resident publish and the registry-full disk-only success
-     * depend on this check. Do not retire any prior sidecars above it. */
+     * depend on this check. The prior base and vectors can still be restored. */
     if (!extra_search_build_root_matches(root, save_dir))
         goto root_changed;
 
-    /* A failed or missing .vectors stage leaves BF unavailable for this
-     * newly committed base. All changes to its final name happen here. */
-    if (vectors_committed && rename(vecs_tmp, vecs_final) != 0)
+    /* BF reads the daemon directory. A different spelling of the same
+     * directory still publishes the vectors where BF can find them. */
+    bool vectors_in_daemon_dir = strcmp(save_dir, g_index_dir) == 0;
+    if (!vectors_in_daemon_dir)
     {
-        LOG_WARN("[handle_build] rename %s -> %s failed errno=%d; brute_force unavailable\n",
-                 vecs_tmp, vecs_final, errno);
-        unlink(vecs_tmp);
-        vectors_committed = 0;
+        struct stat build_dir, daemon_dir;
+        vectors_in_daemon_dir = stat(io_dir, &build_dir) == 0 &&
+                                stat(g_index_dir, &daemon_dir) == 0 &&
+                                build_dir.st_dev == daemon_dir.st_dev &&
+                                build_dir.st_ino == daemon_dir.st_ino;
     }
+
+    /* A failed or missing .vectors stage leaves BF unavailable for this
+     * newly committed base. The old final name is already absent. */
     if (vectors_committed)
     {
-        int vdir_fd = open(io_dir, O_RDONLY);
-        if (vdir_fd >= 0) { fsync(vdir_fd); close(vdir_fd); }
+        if (rename(vecs_tmp, vecs_final) != 0)
+        {
+            LOG_WARN("[handle_build] rename %s -> %s failed errno=%d; brute_force unavailable\n",
+                     vecs_tmp, vecs_final, errno);
+            unlink(vecs_tmp);
+        }
+        else if (fsync_path(io_dir) != 0)
+            LOG_WARN("[handle_build] cannot sync %s after publishing vectors: %s\n",
+                     io_dir, strerror(errno));
     }
-    else
-        unlink(vecs_final);
 
     /* A rebuild produces a fresh graph reflecting the current heap — clear any
      * persisted staleness marker. */
@@ -9436,6 +9718,9 @@ finish_build_commit(int client_fd, const CuvsCmdFrame *cmd, const char *save_dir
         else
         {
             chmod_sidecar(hnsw_path);
+            if (bind_hnsw_source(io_dir, hnsw_path, tids_final, NULL) != 0)
+                LOG_WARN("[handle_build] cannot bind HNSW fallback %u/%u to its source\n",
+                         cmd->db_oid, cmd->index_oid);
             LOG_INFO("pg_cuvs_server: saved HNSW fallback %u/%u\n",
                      cmd->db_oid, cmd->index_oid);
         }
@@ -9445,6 +9730,7 @@ finish_build_commit(int client_fd, const CuvsCmdFrame *cmd, const char *save_dir
 
     /* --- Swap into registry --- */
     if (existing) {
+        free_main_bf_cache(existing);
         /* Phase 3F: a prior sharded instance is replaced by this unsharded
          * build — free all its shard handles, not a (NULL) single handle. */
         if (existing->shard_count >= 2)
@@ -9476,6 +9762,7 @@ finish_build_commit(int client_fd, const CuvsCmdFrame *cmd, const char *save_dir
         if (existing->ivfpq_handle) { cuvs_ivfpq_free(existing->ivfpq_handle, existing->gpu_device_id); existing->ivfpq_handle = NULL; }
         existing->last_search_mode = 0;
         reset_entry_stats(existing);   /* fresh index instance */
+        existing->legacy_vectors_stale = !vectors_in_daemon_dir;
         existing->graph_degree = (int)cmd->graph_degree;  /* for extend/compact VRAM est */
         existing->n_extended = 0;      /* REINDEX resets the extend counter */
         /* I-FC (i): build saved its files first, but eviction saves/reloads
@@ -9549,6 +9836,7 @@ finish_build_commit(int client_fd, const CuvsCmdFrame *cmd, const char *save_dir
          * handle_build and handle_build_multi (both finalize through here). */
         build_rev_tid_map(e);
         reset_entry_stats(e);
+        e->legacy_vectors_stale = !vectors_in_daemon_dir;
         e->graph_degree = (int)cmd->graph_degree;  /* for extend/compact VRAM est */
         e->file_current = strcmp(save_dir, g_index_dir) == 0;   /* I-FC (i), as above */
         extra_search_attest_directory(e, attested_root);
@@ -9629,22 +9917,32 @@ root_changed:
 persist_fail:
     if (hnsw_tmp[0])
         unlink(hnsw_tmp);
-    if (root && tids_published)
+    if (vectors_retired || tids_published || graph_published)
     {
-        bool restored = restore_cagra_file(tids_final, backup.tids, backup.had_tids);
+        bool restored = true;
+        if (tids_published && !restore_cagra_file(tids_final, backup.tids, backup.had_tids))
+            restored = false;
         if (graph_published && !restore_cagra_file(idx_final, backup.graph, backup.had_graph))
             restored = false;
+        /* Expose the prior vectors only once their own base is durable. */
+        if (fsync_path(io_dir) != 0)
+            restored = false;
+        if (restored && vectors_retired &&
+            (!restore_cagra_file(vecs_final, backup.vectors, backup.had_vectors) ||
+             fsync_path(io_dir) != 0))
+            restored = false;
         if (restored)
+        {
+            if (previous && extra_search_build_root_matches(root, save_dir))
+                previous->file_current = previous_file_current;
             discard_cagra_build_backup(&backup);
+        }
         else
         {
             persist_error = "CAGRA publication failed and prior artifacts need recovery";
             LOG_ERROR("[handle_build] %u/%u: %s; retained backups in %s\n",
                       cmd->db_oid, cmd->index_oid, persist_error, backup.dir);
         }
-        if (fsync(root->fd) != 0)
-            LOG_WARN("[handle_build] cannot fsync rolled back index directory: %s\n",
-                     strerror(errno));
     }
     else
         discard_cagra_build_backup(&backup);
@@ -10478,6 +10776,13 @@ handle_drop(int client_fd, const CuvsCmdFrame *cmd)
 
     /* Free the resident entry (if any) and compact the registry. */
     IndexEntry *e = find_index(db, idx);
+    if (e && e->handle && e->inflight > 0)
+    {
+        pthread_mutex_unlock(&g_index_mutex);
+        send_error_code(client_fd, CUVS_STATUS_BUILD_FAILED,
+                        "source graph is being exported; retry drop");
+        return;
+    }
     if (e)
     {
         free_delta_cache(e);
@@ -10529,6 +10834,8 @@ handle_drop(int client_fd, const CuvsCmdFrame *cmd)
     stale_file_path(p, sizeof(p), directory, db, idx);       unlink(p); /* .stale */
     relfilenode_file_path(p, sizeof(p), directory, db, idx); unlink(p); /* .relfilenode */
     snprintf(p, sizeof(p), "%s/%u_%u.tombstone", directory, db, idx); unlink(p);
+    snprintf(p, sizeof(p), "%s/%u_%u.hnsw%s", directory, db, idx,
+             CUVS_HNSW_SOURCE_SUFFIX); unlink(p);
     /* Shard artifacts have contiguous ids; stop at the first missing one. */
     for (uint32_t s = 0; s < CUVS_SHARDS_MAX; s++)
     {
@@ -10746,11 +11053,43 @@ handle_export_adjacency(int client_fd, const CuvsCmdFrame *cmd)
  * /dev/shm path in reply.error[] so the backend can open and parse it,
  * then unlink after reading.
  * ---------------------------------------------------------------- */
+static int
+hnsw_export_tids_fd(int64_t n, uint32_t dim, uint32_t metric, const uint64_t *tids)
+{
+    int fd = memfd_create("pg_cuvs_hnsw_tids", MFD_CLOEXEC | MFD_ALLOW_SEALING);
+    int writer;
+    FILE *file;
+    bool ok;
+
+    if (fd < 0)
+        return -1;
+    writer = dup(fd);
+    file = writer >= 0 ? fdopen(writer, "wb") : NULL;
+    if (file == NULL)
+    {
+        if (writer >= 0) close(writer);
+        close(fd);
+        return -1;
+    }
+    ok = cuvs_tids_write(file, n, dim, metric, tids) == 0;
+    if (fclose(file) != 0)
+        ok = false;
+    if (!ok || fcntl(fd, F_ADD_SEALS,
+                     F_SEAL_WRITE | F_SEAL_GROW | F_SEAL_SHRINK | F_SEAL_SEAL) != 0)
+    {
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
+
 static void
 handle_export_hnsw_shm(int client_fd, const CuvsCmdFrame *cmd)
 {
     uint32_t db  = cmd->db_oid;
     uint32_t idx = cmd->index_oid;
+    bool paired = cmd->k == CUVS_HNSW_EXPORT_PAIRED;
+    int tids_fd = -1;
 
     pthread_mutex_lock(&g_index_mutex);
     IndexEntry *e = find_index(db, idx);
@@ -10813,14 +11152,35 @@ handle_export_hnsw_shm(int client_fd, const CuvsCmdFrame *cmd)
         send_error_code(client_fd, CUVS_STATUS_NOT_FOUND, "index evicted during export");
         return;
     }
+    /* SQL holds an AccessShareLock on the source index. The in-use guard
+     * also keeps EXTEND, COMPACT and eviction from changing its graph/TIDs. */
+    uint64_t *source_tids = NULL;
+    int64_t source_n = e->n_vecs;
+    uint32_t source_dim = e->dim;
+    uint32_t source_metric = e->metric;
+    if (paired)
+    {
+        source_tids = malloc((size_t) source_n * sizeof(*source_tids));
+        if (source_tids == NULL)
+        {
+            pthread_mutex_unlock(&g_index_mutex);
+            close(mfd);
+            send_error(client_fd, "cannot snapshot matching HNSW TIDs");
+            return;
+        }
+        memcpy(source_tids, e->tids, (size_t) source_n * sizeof(*source_tids));
+    }
     e->inflight++;
     g_unlocked_gpu_jobs++;
     pthread_mutex_unlock(&g_index_mutex);
     int hrc = cuvs_hnsw_serialize(handle, shm_path, gpu);
+    if (paired && hrc == CUVS_HNSW_SERIALIZE_OK)
+        tids_fd = hnsw_export_tids_fd(source_n, source_dim, source_metric, source_tids);
+    free(source_tids);
     pthread_mutex_lock(&g_index_mutex);
     g_unlocked_gpu_jobs--;
     e = find_index(db, idx);
-    if (e && e->inflight > 0)
+    if (e && e->handle == handle && e->inflight > 0)
         e->inflight--;
     pthread_mutex_unlock(&g_index_mutex);
     if (hrc != CUVS_HNSW_SERIALIZE_OK)
@@ -10837,6 +11197,12 @@ handle_export_hnsw_shm(int client_fd, const CuvsCmdFrame *cmd)
                             "index too small for an HNSW sidecar");
         else
             send_error(client_fd, "from_cagra/serialize failed");
+        return;
+    }
+    if (paired && tids_fd < 0)
+    {
+        close(mfd);
+        send_error(client_fd, "cannot export matching HNSW TIDs");
         return;
     }
 
@@ -10860,6 +11226,7 @@ handle_export_hnsw_shm(int client_fd, const CuvsCmdFrame *cmd)
     {
         LOG_ERROR("[handle_export_hnsw_shm] F_ADD_SEALS failed errno=%d\n", errno);
         close(mfd);
+        if (tids_fd >= 0) close(tids_fd);
         send_error(client_fd, "cannot seal hnsw sidecar");
         return;
     }
@@ -10875,12 +11242,16 @@ handle_export_hnsw_shm(int client_fd, const CuvsCmdFrame *cmd)
      */
     CuvsReplyHeader reply = {0};
     reply.status = CUVS_STATUS_OK;
+    reply.n_results = paired ? 2 : 0;
     /* error[] carries a label for log correlation only (#165); there is no
      * longer a filesystem path to report. */
     snprintf(reply.error, sizeof(reply.error), "memfd:pg_cuvs_hnsw %u/%u", db, idx);
     if (cuvs_fd_send(client_fd, mfd, &reply, sizeof(reply)) != 0)
         LOG_ERROR("[handle_export_hnsw_shm] fd handoff failed for %u/%u\n", db, idx);
+    else if (paired && cuvs_fd_send(client_fd, tids_fd, "", 1) != 0)
+        LOG_ERROR("[handle_export_hnsw_shm] TID handoff failed for %u/%u\n", db, idx);
     close(mfd);
+    if (tids_fd >= 0) close(tids_fd);
 }
 
 static int
@@ -12545,6 +12916,17 @@ handle_extend(int client_fd, const CuvsCmdFrame *cmd)
         return;
     }
 
+    /* A retained tombstone can refer to a slot this INSERT is reusing. */
+    if (e->stale || e->compact_save_pending)
+    {
+        const char *error = e->stale ? "index is stale; REINDEX required" :
+                                      "previous compaction has not finished";
+        pthread_mutex_unlock(&g_index_mutex);
+        munmap(mem, total);
+        send_error_code(client_fd, CUVS_STATUS_STALE, error);
+        return;
+    }
+
     /* Even a failed EXTEND can have changed storage in place. */
     e->extra_search_generation = 0;
     if (index_dir[0] && (strnlen(index_dir, sizeof(index_dir)) == sizeof(index_dir) ||
@@ -12552,6 +12934,15 @@ handle_extend(int client_fd, const CuvsCmdFrame *cmd)
         e->extra_search_default_dir = 0;
     int64_t  old_n = e->n_vecs;
     int64_t  n_new = cmd->n_vecs;
+
+    if (e->inflight > 0)
+    {
+        pthread_mutex_unlock(&g_index_mutex);
+        munmap(mem, total);
+        send_error_code(client_fd, CUVS_STATUS_BUILD_FAILED,
+                        "source graph is being exported; buffer the insert in delta");
+        return;
+    }
 
     /* Pre-flight VRAM budget check.
      * Cannot call ensure_vram here: evict_lru shifts g_indexes[], invalidating
@@ -12587,6 +12978,17 @@ handle_extend(int client_fd, const CuvsCmdFrame *cmd)
             send_error_code(client_fd, CUVS_STATUS_BUILD_FAILED, "not enough VRAM for extend");
             return;
         }
+    }
+
+    if (e->n_extended == 0 &&
+        invalidate_hnsw_source(index_dir[0] != '\0' ? index_dir : g_index_dir,
+                               cmd->db_oid, cmd->index_oid) != 0)
+    {
+        pthread_mutex_unlock(&g_index_mutex);
+        munmap(mem, total);
+        send_error_code(client_fd, CUVS_STATUS_PERSIST_FAILED,
+                        "cannot invalidate the on-disk HNSW source binding");
+        return;
     }
 
     /* Grow TIDs array before the GPU call; failure here is cheap to handle. */
@@ -12625,6 +13027,8 @@ handle_extend(int client_fd, const CuvsCmdFrame *cmd)
     e->n_vecs     += n_new;
     e->n_extended += n_new;
     e->file_current = 0;   /* I-FC (1): graph now differs from the files */
+    e->legacy_vectors_stale = true;
+    free_main_bf_cache(e); /* `.vectors` does not contain the extended rows. */
     e->vram_bytes  = estimate_vram_bytes(e->n_vecs, (int)e->dim, e->graph_degree);
 
     /* Rebuild rev_tids to include new item_ids (needed for 3O prefilter). */
@@ -12654,6 +13058,46 @@ cmp_u64(const void *a, const void *b)
     uint64_t x = *(const uint64_t *)a;
     uint64_t y = *(const uint64_t *)b;
     return (x > y) - (x < y);
+}
+
+/* Caller holds g_index_mutex. Record the directory that owns the guard. */
+static void
+mark_compact_pending(IndexEntry *e, const char *dir, bool unapplied)
+{
+    e->compact_tombstones_unapplied = unapplied;
+    if (e->compact_save_pending)
+        return;
+    struct stat st;
+    e->compact_tombstone_ino = 0;
+    if (stat(dir, &st) == 0 && S_ISDIR(st.st_mode))
+    {
+        e->compact_tombstone_dev = st.st_dev;
+        e->compact_tombstone_ino = st.st_ino;
+    }
+    e->compact_save_pending = true;
+}
+
+/* A retained tombstone must not outlive the guard against TID reuse. */
+static bool
+finish_compact_tombstones(IndexEntry *e, const char *dir, const char *path)
+{
+    if (unlink(path) != 0 && errno != ENOENT)
+    {
+        mark_compact_pending(e, dir, false);
+        return false;
+    }
+    e->compact_save_pending = false;
+    e->compact_tombstones_unapplied = false;
+    return true;
+}
+
+static bool
+compact_tombstones_absent(const IndexEntry *e, const char *dir, const char *path)
+{
+    struct stat st;
+    return e->compact_tombstone_ino != 0 && stat(dir, &st) == 0 &&
+           st.st_dev == e->compact_tombstone_dev && st.st_ino == e->compact_tombstone_ino &&
+           lstat(path, &st) != 0 && errno == ENOENT;
 }
 
 /* ----------------------------------------------------------------
@@ -12686,6 +13130,34 @@ handle_compact(int client_fd, const CuvsCmdFrame *cmd)
     FILE *tf = fopen(tombstone_path, "rb");
     if (!tf)
     {
+        int open_error = errno;
+        pthread_mutex_lock(&g_index_mutex);
+        IndexEntry *e = find_index(cmd->db_oid, cmd->index_oid);
+        /* An absent tombstone only permits resuming if its dead rows were
+         * already removed. Otherwise the existing TIDs must not be reused. */
+        if (e && e->compact_save_pending && open_error == ENOENT &&
+            compact_tombstones_absent(e, save_dir, tombstone_path))
+        {
+            if (e->compact_tombstones_unapplied)
+            {
+                if (mark_unapplied_compact_stale(e) != 0)
+                    LOG_ERROR("compact: could not persist stale marker for %u/%u\n",
+                              e->db_oid, e->index_oid);
+            }
+            else if (save_pending_compact(e) == 0 &&
+                     compact_tombstones_absent(e, save_dir, tombstone_path))
+                e->compact_save_pending = false;
+        }
+        bool pending = e && e->compact_save_pending;
+        bool needs_reindex = pending && e->compact_tombstones_unapplied && e->stale;
+        pthread_mutex_unlock(&g_index_mutex);
+        if (pending)
+        {
+            send_error_code(client_fd, CUVS_STATUS_PERSIST_FAILED,
+                            needs_reindex ? "unapplied tombstones are missing; REINDEX required" :
+                                            "cannot finish pending compaction");
+            return;
+        }
         /* No tombstone: nothing to compact. Reply OK. */
         CuvsReplyHeader ok = {0};
         ok.status = CUVS_STATUS_OK;
@@ -12750,6 +13222,15 @@ handle_compact(int client_fd, const CuvsCmdFrame *cmd)
         return;
     }
 
+    if (e->inflight > 0)
+    {
+        pthread_mutex_unlock(&g_index_mutex);
+        free(dead_tids);
+        send_error_code(client_fd, CUVS_STATUS_BUILD_FAILED,
+                        "source graph is being exported; retry compaction");
+        return;
+    }
+
     /* Build keep_bits: bit[i]=1 → keep vector i (not tombstoned). */
     int64_t   n_vecs   = e->n_vecs;
     int64_t   n_words  = (n_vecs + 31) / 32;
@@ -12779,9 +13260,34 @@ handle_compact(int client_fd, const CuvsCmdFrame *cmd)
 
     if (dead_count == 0)
     {
-        pthread_mutex_unlock(&g_index_mutex);
         free(keep_bits);
-        unlink(tombstone_path);
+        if (e->compact_save_pending && e->compact_tombstones_unapplied)
+        {
+            if (mark_unapplied_compact_stale(e) != 0)
+                LOG_ERROR("compact: could not persist stale marker for %u/%u\n",
+                          e->db_oid, e->index_oid);
+            pthread_mutex_unlock(&g_index_mutex);
+            send_error_code(client_fd, CUVS_STATUS_PERSIST_FAILED,
+                            "no matching unapplied tombstones; REINDEX required");
+            return;
+        }
+        /* A previous attempt may have published the compacted TIDs before
+         * failing. Retry its resident graph without replaying the merge. */
+        if (e->compact_save_pending && save_pending_compact(e) != 0)
+        {
+            pthread_mutex_unlock(&g_index_mutex);
+            send_error_code(client_fd, CUVS_STATUS_PERSIST_FAILED,
+                            "save_index failed after compact");
+            return;
+        }
+        if (!finish_compact_tombstones(e, save_dir, tombstone_path))
+        {
+            pthread_mutex_unlock(&g_index_mutex);
+            send_error_code(client_fd, CUVS_STATUS_PERSIST_FAILED,
+                            "cannot remove compacted tombstones");
+            return;
+        }
+        pthread_mutex_unlock(&g_index_mutex);
         CuvsReplyHeader ok = {0};
         ok.status = CUVS_STATUS_OK;
         send_foreground_reply(client_fd, &ok);
@@ -12820,6 +13326,15 @@ handle_compact(int client_fd, const CuvsCmdFrame *cmd)
                               "GPU physical memory pressure; retry later", &physical_rej);
         return;
     }
+    if (invalidate_hnsw_source(save_dir, cmd->db_oid, cmd->index_oid) != 0)
+    {
+        pthread_mutex_unlock(&g_index_mutex);
+        free(keep_bits);
+        free(new_tids);
+        send_error_code(client_fd, CUVS_STATUS_PERSIST_FAILED,
+                        "cannot invalidate the on-disk HNSW source binding");
+        return;
+    }
     e->extra_search_generation = 0;
     if (strcmp(save_dir, g_index_dir) != 0)
         e->extra_search_default_dir = 0;
@@ -12847,13 +13362,36 @@ handle_compact(int client_fd, const CuvsCmdFrame *cmd)
         return;
     }
 
+    /* Stage the candidate without replacing the resident graph. Once its
+     * TIDs have been published, keep that candidate for a save retry. */
+    IndexEntry compacted = *e;
+    compacted.handle = new_handle;
+    compacted.tids = new_tids;
+    compacted.n_vecs = new_n;
+    compacted.file_current = 0;
+    compacted.compact_save_pending = false;
+    compacted.legacy_vectors_stale = true;
+    int save_status = save_index(&compacted);
+    if (save_status != 0 && save_status != SAVE_INDEX_PUBLISH_FAILED)
+    {
+        mark_compact_pending(e, save_dir, true);
+        cuvs_cagra_free(new_handle, (int)e->gpu_device_id);
+        free(new_tids);
+        pthread_mutex_unlock(&g_index_mutex);
+        send_error_code(client_fd, CUVS_STATUS_PERSIST_FAILED,
+                        "save_index failed after compact");
+        return;
+    }
+
     /* Swap handle + tids. */
     CuvsCagraIndex old_handle = e->handle;
     e->handle = new_handle;
     free(e->tids);
     e->tids = new_tids;
     e->n_vecs      = new_n;
-    e->file_current = 0;   /* I-FC: merged in memory; save_index sets 1 */
+    e->file_current = save_status == 0;
+    e->legacy_vectors_stale = true;
+    free_main_bf_cache(e); /* Compact changed the item-id to TID mapping. */
     e->n_extended       = 0;
     e->compact_count++;
     e->last_compact_at  = time(NULL);
@@ -12866,16 +13404,21 @@ handle_compact(int client_fd, const CuvsCmdFrame *cmd)
     free(e->rev_item_ids); e->rev_item_ids = NULL;
     build_rev_tid_map(e);
 
-    /* Persist to disk. */
-    if (save_index(e) != 0)
+    if (save_status != 0)
     {
+        mark_compact_pending(e, save_dir, false);
         pthread_mutex_unlock(&g_index_mutex);
         send_error_code(client_fd, CUVS_STATUS_PERSIST_FAILED,
                         "save_index failed after compact");
         return;
     }
-
-    unlink(tombstone_path);
+    if (!finish_compact_tombstones(e, save_dir, tombstone_path))
+    {
+        pthread_mutex_unlock(&g_index_mutex);
+        send_error_code(client_fd, CUVS_STATUS_PERSIST_FAILED,
+                        "cannot remove compacted tombstones");
+        return;
+    }
 
     pthread_mutex_unlock(&g_index_mutex);
 
@@ -15100,13 +15643,14 @@ page_fold_thread(void *arg)
 #endif
 
 static bool
-page_fold_ready_locked(uint32_t db_oid, uint32_t index_oid, uint64_t index_nonce,
-                        const CuvsPageFoldQuery *query,
+page_fold_ready_for_boot_locked(uint32_t db_oid, uint32_t index_oid, uint64_t index_nonce,
+                        const CuvsPageFoldQuery *query, uint64_t boot_started_us,
                         CuvsPageFoldEvent *event, int *device, uint64_t *protected_us)
 {
     PageCagraGraph *selected = NULL;
+    PageCagraGraph *selected_parent = NULL;
 
-    for (const PageCagraGraph *parent = g_page_graphs; parent; parent = parent->next)
+    for (PageCagraGraph *parent = g_page_graphs; parent; parent = parent->next)
     {
         PageCagraGraph *candidate = parent->fold_candidate;
 
@@ -15122,12 +15666,19 @@ page_fold_ready_locked(uint32_t db_oid, uint32_t index_oid, uint64_t index_nonce
             (!index_oid || (parent->index_oid == index_oid && parent->index_nonce == index_nonce)) &&
             parent->system_identifier == query->system_identifier &&
             parent->overlay.boot_id == query->boot_id &&
+            (!boot_started_us || !parent->pg_boot_started_us ||
+             parent->pg_boot_started_us == boot_started_us) &&
             candidate->fold_event.boot_id == query->boot_id &&
             (!selected || candidate->fold_offer_order < selected->fold_offer_order))
+        {
             selected = candidate;
+            selected_parent = parent;
+        }
     }
     if (!selected)
         return false;
+    if (boot_started_us)
+        selected_parent->pg_boot_started_us = boot_started_us;
 
     /* Leave the event outstanding while allowing another index to be
      * offered if this one is waiting on DDL or VACUUM. */
@@ -15153,9 +15704,19 @@ page_fold_ready_locked(uint32_t db_oid, uint32_t index_oid, uint64_t index_nonce
     return true;
 }
 
+static bool
+page_fold_ready_locked(uint32_t db_oid, uint32_t index_oid, uint64_t index_nonce,
+                       const CuvsPageFoldQuery *query, CuvsPageFoldEvent *event,
+                       int *device, uint64_t *protected_us)
+{
+    return page_fold_ready_for_boot_locked(db_oid, index_oid, index_nonce, query, 0,
+                                           event, device, protected_us);
+}
+
 /* The wire event is a fixed, padding-free sequence of integer fields. */
 static uint32_t
-page_fold_result_locked(const CuvsPageFoldResult *result, uint64_t received_us)
+page_fold_result_with_history_locked(const CuvsPageFoldResult *result, uint64_t received_us,
+                                     uint32_t transition_xid)
 {
 #ifndef CUVS_CAGRA_FOLD_ENABLED
     (void) received_us;
@@ -15164,6 +15725,7 @@ page_fold_result_locked(const CuvsPageFoldResult *result, uint64_t received_us)
     {
         PageCagraGraph *parent = *link;
         PageCagraGraph *candidate = parent->fold_candidate;
+        bool keep_history = transition_xid && parent->pg_boot_started_us;
 
         if (parent->overlay.boot_id != result->event.boot_id)
             continue;
@@ -15184,9 +15746,19 @@ page_fold_result_locked(const CuvsPageFoldResult *result, uint64_t received_us)
         /* Move the unpublished suffix, including supply since READY. */
         parent->fold_candidate = NULL;
         candidate->overlay = parent->overlay;
-        parent->overlay = (CuvsPageOverlay) {0};
-        defer_page_overlay_release(
-            cuvs_page_overlay_advance_fold(&candidate->overlay, candidate->folded));
+        candidate->pg_boot_started_us = parent->pg_boot_started_us;
+        if (keep_history)
+        {
+            cuvs_page_overlay_retain(candidate->overlay.head);
+            defer_page_overlay_release(
+                cuvs_page_overlay_prune_folded(&candidate->overlay, candidate->folded));
+        }
+        else
+        {
+            parent->overlay = (CuvsPageOverlay) {0};
+            defer_page_overlay_release(
+                cuvs_page_overlay_advance_fold(&candidate->overlay, candidate->folded));
+        }
         candidate->retired_boots = parent->retired_boots;
         parent->retired_boots = NULL;
         candidate->fold_lsn = result->transition_lsn;
@@ -15196,7 +15768,14 @@ page_fold_result_locked(const CuvsPageFoldResult *result, uint64_t received_us)
 #endif
         candidate->next = parent->next;
         *link = candidate;
-        retire_page_graph_locked(parent, true);
+        if (keep_history)
+        {
+            parent->ancestor_until_xid = transition_xid;
+            parent->next = g_page_ancestors;
+            g_page_ancestors = parent;
+        }
+        else
+            retire_page_graph_locked(parent, true);
 #ifdef CUVS_CAGRA_FOLD_ENABLED
         LOG_INFO("[page_fold_commit] db=%u index=%u positions=%u folded=%llu lsn=%llX mono_us=%llu gpu=%d accepted_us=%llu"
                  FOLD_EVENT_LOG "\n",
@@ -15210,6 +15789,12 @@ page_fold_result_locked(const CuvsPageFoldResult *result, uint64_t received_us)
     return CUVS_STATUS_NOT_FOUND;
 }
 
+static uint32_t
+page_fold_result_locked(const CuvsPageFoldResult *result, uint64_t received_us)
+{
+    return page_fold_result_with_history_locked(result, received_us, 0);
+}
+
 static void
 handle_page_fold_ready(int client_fd, const CuvsCmdFrame *cmd)
 {
@@ -15217,19 +15802,28 @@ handle_page_fold_ready(int client_fd, const CuvsCmdFrame *cmd)
     CuvsPageFoldEvent event;
     CuvsReplyHeader reply = {.status = CUVS_STATUS_ERROR};
     uint64_t index_nonce = 0;
+    uint64_t boot_started_us = 0;
     uint64_t protected_us = 0;
     int device = -1;
 
     if (recv_all(client_fd, &query, sizeof(query)) == 0 &&
         cmd->db_oid && !query.reserved && query.system_identifier && query.boot_id &&
-        ((!cmd->index_oid && query.length == sizeof(query)) ||
-         (cmd->index_oid && query.length == sizeof(query) + sizeof(index_nonce) &&
-          recv_all(client_fd, &index_nonce, sizeof(index_nonce)) == 0 && index_nonce)))
+        (cmd->op == CUVS_OP_FOLD_RESIDENT_READY ?
+         (query.length == sizeof(CuvsPageResidentFoldQuery) &&
+          recv_all(client_fd, &index_nonce, sizeof(index_nonce)) == 0 &&
+          recv_all(client_fd, &boot_started_us, sizeof(boot_started_us)) == 0 &&
+          (!!cmd->index_oid == !!index_nonce) && boot_started_us) :
+         ((!cmd->index_oid && query.length == sizeof(query)) ||
+          (cmd->index_oid && query.length == sizeof(query) + sizeof(index_nonce) &&
+           recv_all(client_fd, &index_nonce, sizeof(index_nonce)) == 0 && index_nonce))))
     {
         pthread_mutex_lock(&g_index_mutex);
-        reply.status = page_fold_ready_locked(cmd->db_oid, cmd->index_oid, index_nonce, &query, &event,
-                                               &device, &protected_us) ?
-            CUVS_STATUS_OK : CUVS_STATUS_NOT_FOUND;
+        bool ready = boot_started_us ?
+            page_fold_ready_for_boot_locked(cmd->db_oid, cmd->index_oid, index_nonce, &query,
+                                             boot_started_us, &event, &device, &protected_us) :
+            page_fold_ready_locked(cmd->db_oid, cmd->index_oid, index_nonce, &query,
+                                    &event, &device, &protected_us);
+        reply.status = ready ? CUVS_STATUS_OK : CUVS_STATUS_NOT_FOUND;
         pthread_mutex_unlock(&g_index_mutex);
     }
     if (reply.status == CUVS_STATUS_OK)
@@ -15257,12 +15851,17 @@ static void
 handle_page_fold_result(int client_fd, const CuvsCmdFrame *cmd)
 {
     CuvsPageFoldResult result;
+    uint32_t history[2] = {0};
     CuvsReplyHeader reply = {.status = CUVS_STATUS_ERROR};
+    bool resident = cmd->op == CUVS_OP_FOLD_RESIDENT_COMMITTED;
+    bool committed = resident || cmd->op == CUVS_OP_FOLD_COMMITTED;
 
     if (recv_all(client_fd, &result, sizeof(result)) == 0 &&
+        (!resident || (recv_all(client_fd, history, sizeof(history)) == 0 &&
+                       history[0] >= 3 && !history[1])) &&
         cuvs_page_fold_event_valid(&result.event) &&
         cmd->db_oid == result.event.db_oid && cmd->index_oid == result.event.index_oid &&
-        (cmd->op == CUVS_OP_FOLD_COMMITTED) == (result.transition_lsn != 0))
+        committed == (result.transition_lsn != 0))
     {
 #ifdef CUVS_CAGRA_FOLD_ENABLED
         uint64_t received_us = admission_mono_us();
@@ -15285,8 +15884,12 @@ handle_page_fold_result(int client_fd, const CuvsCmdFrame *cmd)
         }
 #endif
         pthread_mutex_lock(&g_index_mutex);
-        reply.status = result.event.daemon_id == g_page_daemon_id ?
-            page_fold_result_locked(&result, received_us) : CUVS_STATUS_NOT_FOUND;
+        if (result.event.daemon_id == g_page_daemon_id)
+            reply.status = resident ?
+                page_fold_result_with_history_locked(&result, received_us, history[0]) :
+                page_fold_result_locked(&result, received_us);
+        else
+            reply.status = CUVS_STATUS_NOT_FOUND;
         pthread_mutex_unlock(&g_index_mutex);
     }
     (void) send_all(client_fd, &reply, sizeof(reply));
@@ -15302,11 +15905,14 @@ receive_page_overlay(int client_fd, const CuvsCmdFrame *cmd, CuvsPageOverlayRequ
         return CUVS_STATUS_ERROR;
     if (cmd->dim == 0 || cmd->dim > 65535 || cmd->n_filter_tids ||
         request->base.resume_count || request->base.resume_distance ||
+        (cmd->op == CUVS_OP_SEARCH_PAGE_RESIDENT && request->base.reserved > 0 &&
+         request->base.reserved < 3) ||
 #ifdef CUVS_CAGRA_FOLD_ENABLED
         (request->base.reserved &&
+         cmd->op != CUVS_OP_SEARCH_PAGE_RESIDENT &&
          (cmd->op != CUVS_OP_SUPPLY_PAGES || request->base.reserved > request->base.n_slots)) ||
 #else
-        request->base.reserved ||
+        (request->base.reserved && cmd->op != CUVS_OP_SEARCH_PAGE_RESIDENT) ||
 #endif
         !request->boot_id || request->from < request->base.folded ||
         request->from > request->base.tail ||
@@ -15355,6 +15961,15 @@ find_page_overlay_graph(const CuvsCmdFrame *cmd, const CuvsPageOverlayRequest *r
         *overlay_owner = parent;
         return candidate;
     }
+    if (cmd->op == CUVS_OP_SEARCH_PAGE_RESIDENT)
+        for (graph = g_page_ancestors; graph; graph = graph->next)
+            if (page_graph_matches(graph, cmd, &request->base) &&
+                graph->dim == cmd->dim && graph->metric == cmd->metric &&
+                graph->overlay.boot_id == request->boot_id)
+            {
+                *overlay_owner = graph;
+                return graph;
+            }
     return NULL;
 }
 
@@ -15429,6 +16044,94 @@ send_page_overlay_reply(int client_fd, const CuvsReplyHeader *reply, const CuvsP
          reply->status == CUVS_STATUS_PAGE_OVERLAY_HOST_FULL) &&
         send_all(client_fd, progress, sizeof(*progress)) == 0;
 }
+
+#ifdef CUVS_PAGE_FORMAT
+static bool
+page_history_prune_matches(const PageCagraGraph *old, const CuvsCmdFrame *cmd,
+                            const CuvsPageHistoryPrune *request)
+{
+    return old->db_oid == cmd->db_oid && old->index_oid == cmd->index_oid &&
+        old->system_identifier == request->base.system_identifier &&
+        old->index_nonce == request->base.index_nonce && old->base_nonce == request->base.base_nonce &&
+        old->folded < request->base.folded;
+}
+
+/* The PostgreSQL boot stamp comes from the same host's monotonic clock.
+ * Once it advances, no PostgreSQL snapshot from the earlier boot survives. */
+static void
+prune_previous_page_boots_locked(const CuvsCmdFrame *cmd, const CuvsPageHistoryPrune *request)
+{
+    PageCagraGraph **link = &g_page_ancestors;
+
+    while (*link)
+    {
+        PageCagraGraph *old = *link;
+
+        if (page_history_prune_matches(old, cmd, request) && old->pg_boot_started_us &&
+            old->pg_boot_started_us < request->boot_started_us)
+        {
+            *link = old->next;
+            retire_page_graph_locked(old, true);
+            old->search_invalidated = true;
+        }
+        else
+            link = &old->next;
+    }
+}
+
+static void
+handle_page_history_prune(int fd, const CuvsCmdFrame *cmd)
+{
+    CuvsPageHistoryPrune request;
+    CuvsReplyHeader reply = {.status = CUVS_STATUS_ERROR};
+
+    if (recv_all(fd, &request, sizeof(request)) == 0 &&
+        request.base.length == sizeof(request) && request.boot_id && request.boot_started_us &&
+        request.base.reserved >= 3 &&
+        request.base.system_identifier && request.base.index_nonce && request.base.base_nonce &&
+        request.base.graph_nonce)
+    {
+        PageCagraGraph *graph;
+        CuvsPageOverlayChunk *obsolete = NULL;
+        bool matching;
+
+        pthread_mutex_lock(&g_index_mutex);
+        graph = find_page_graph(cmd, &request.base);
+        matching = false;
+        if (graph)
+        {
+            if (graph->overlay.boot_id == request.boot_id)
+                matching = !graph->pg_boot_started_us ||
+                    graph->pg_boot_started_us == request.boot_started_us;
+            else if (!graph->overlay.boot_id || (graph->pg_boot_started_us &&
+                     graph->pg_boot_started_us < request.boot_started_us))
+                matching = page_graph_use_boot_locked(graph, request.boot_id, &obsolete);
+            if (matching)
+                graph->pg_boot_started_us = request.boot_started_us;
+        }
+        else
+            for (const PageCagraGraph *old = g_page_ancestors; old && !matching; old = old->next)
+                matching = page_history_prune_matches(old, cmd, &request) &&
+                    ((old->overlay.boot_id == request.boot_id &&
+                      old->pg_boot_started_us == request.boot_started_us) ||
+                     (old->pg_boot_started_us && old->pg_boot_started_us < request.boot_started_us));
+        reply.status = CUVS_STATUS_NOT_FOUND;
+        if (matching)
+        {
+            prune_previous_page_boots_locked(cmd, &request);
+            prune_page_ancestors_locked(cmd->db_oid, cmd->index_oid, request.base.system_identifier,
+                                        request.base.index_nonce, request.base.base_nonce,
+                                        request.boot_id, request.base.reserved);
+            if (graph)
+                defer_page_overlay_release(cuvs_page_overlay_prune_folded(&graph->overlay, graph->folded));
+            reply.status = CUVS_STATUS_OK;
+        }
+        pthread_mutex_unlock(&g_index_mutex);
+        cuvs_page_overlay_release(obsolete);
+    }
+    (void) send_all(fd, &reply, sizeof(reply));
+}
+#endif
 
 static void
 handle_page_supply(int client_fd, const CuvsCmdFrame *cmd)
@@ -15510,6 +16213,26 @@ page_overlay_search_status(const CuvsCmdFrame *cmd, const CuvsPageOverlayRequest
     return CUVS_STATUS_OK;
 }
 
+/* A valid PostgreSQL horizon can release ancestors but cannot invalidate an
+ * already approved query. Revisit the active prefix after readers unpin. */
+static PageCagraGraph *
+find_resident_search_graph_locked(const CuvsCmdFrame *cmd, const CuvsPageOverlayRequest *request,
+                                  PageCagraGraph **owner, bool observe)
+{
+    PageCagraGraph *graph;
+
+    if (cmd->op == CUVS_OP_SEARCH_PAGE_RESIDENT && request->base.reserved)
+        prune_page_ancestors_locked(cmd->db_oid, cmd->index_oid, request->base.system_identifier,
+                                    request->base.index_nonce, request->base.base_nonce, request->boot_id,
+                                    request->base.reserved);
+    graph = find_page_overlay_graph(cmd, request, owner, observe);
+    if (cmd->op == CUVS_OP_SEARCH_PAGE_RESIDENT && graph &&
+        !(*owner)->ancestor_until_xid && (*owner)->overlay.boot_id == request->boot_id)
+        defer_page_overlay_release(
+            cuvs_page_overlay_prune_folded(&(*owner)->overlay, (*owner)->folded));
+    return graph;
+}
+
 /* At most one shared chunk straddles the fold boundary. Clip it once per
  * search under the host budget, preserving the packed vector order. Older
  * chunks remain intact for a parent that is still serving before ACK. */
@@ -15547,6 +16270,235 @@ clip_page_overlay_chunk(const CuvsPageOverlayChunk *chunk, uint64_t folded,
     return status;
 }
 
+static int
+page_resident_compare(const CuvsPageOverlayResult *a, const CuvsPageOverlayResult *b,
+                       bool descending)
+{
+    if (a->distance != b->distance)
+        return (a->distance < b->distance) != descending ? -1 : 1;
+    return (a->slot > b->slot) - (a->slot < b->slot);
+}
+
+static int
+page_resident_ascending(const void *a, const void *b)
+{
+    return page_resident_compare(a, b, false);
+}
+
+static int
+page_resident_descending(const void *a, const void *b)
+{
+    return page_resident_compare(a, b, true);
+}
+
+/* The graph pin protects its storage. The admission counter protects the
+ * separate lifetime of temporary GPU allocations made by this call. */
+static int
+page_resident_graph_search(PageCagraGraph *graph, const CuvsCmdFrame *cmd,
+                            const float *query, int k, const uint32_t *excluded,
+                            CuvsSearchResult *raw)
+{
+    int rc;
+
+    pthread_mutex_lock(&g_index_mutex);
+    ++g_unlocked_gpu_jobs;
+    pthread_mutex_unlock(&g_index_mutex);
+    if (!excluded)
+        rc = page_graph_search(graph, cmd, query, 1, k, NULL, raw);
+    else if (cmd->search_mode == 1)
+        rc = cuvs_bf_search_filtered(graph->bf[cmd->bf_precision], query, graph->dim, k,
+                                      excluded, graph->n_slots, raw, graph->gpu);
+    else
+        rc = cuvs_cagra_search_filtered(graph->handle, query, graph->dim, k,
+                                         excluded, graph->n_slots, raw, graph->gpu,
+                                         cmd->itopk_size, cmd->search_width);
+    pthread_mutex_lock(&g_index_mutex);
+    --g_unlocked_gpu_jobs;
+    pthread_mutex_unlock(&g_index_mutex);
+    return rc;
+}
+
+static uint32_t
+page_resident_base_results(const PageCagraGraph *graph, const CuvsSearchResult *raw,
+                           uint32_t k, bool normalize_ip, CuvsPageOverlayResult *out)
+{
+    uint32_t count = 0;
+
+    for (uint32_t i = 0; i < k && i < graph->n_slots; ++i)
+    {
+        float distance = normalize_ip ? 1.0f - raw[i].distance : raw[i].distance;
+
+        if (raw[i].item_id >= 0 && (uint64_t) raw[i].item_id < graph->n_slots &&
+            isfinite(distance))
+            out[count++] = (CuvsPageOverlayResult) {.slot = (uint64_t) raw[i].item_id,
+                                                   .distance = distance};
+    }
+    return count;
+}
+
+static bool
+page_resident_recv_advance(int fd, CuvsPageResidentAdvance *advance)
+{
+    const struct timeval work_timeout = {.tv_sec = 30};
+
+    while (recv_all(fd, advance, sizeof(*advance)) == 0)
+    {
+        if (advance->reserved != CUVS_PAGE_RESIDENT_KEEPALIVE)
+            return true;
+        if (advance->base_k || advance->pending_limit || advance->filter_words ||
+            setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &work_timeout, sizeof(work_timeout)) < 0)
+            return false;
+    }
+    return false;
+}
+
+/* The connection is the cursor. It owns the query, fixed range and graph
+ * pin for every reply. Pending distances are computed once. A larger ANN
+ * request replaces the prior base stream because ANN prefixes can change. */
+static void
+serve_page_resident_search(int fd, const CuvsCmdFrame *cmd, const CuvsPageOverlayRequest *request,
+                            PageCagraGraph *graph, const CuvsPageOverlayChunk *snapshot,
+                            const CuvsPageOverlayChunk *supplement, const float *query,
+                            CuvsSearchResult *raw, CuvsPageOverlayResult *base,
+                            const CuvsPageProgress *progress, bool normalize_ip, uint64_t started)
+{
+    CuvsReplyHeader reply = {.status = CUVS_STATUS_PAGE_OVERLAY_HOST_FULL};
+    CuvsPageOverlayResult *pending = NULL;
+    size_t charge = (size_t) (request->base.tail - request->base.folded) * sizeof(*pending);
+    int npending = 0;
+    uint32_t pending_read = 0;
+    CuvsPageResidentAdvance advance = {.base_k = cmd->k, .pending_limit = cmd->k};
+    uint32_t base_k = cmd->k;
+    bool filtered = false;
+    const struct timeval timeout = {.tv_sec = 5};
+
+    if (!cuvs_page_overlay_reserve(&g_page_overlay_budget, charge))
+    {
+        (void) send_page_overlay_reply(fd, &reply, progress);
+        return;
+    }
+    if (charge && !(pending = malloc(charge)))
+        goto fail;
+    if (setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) < 0 ||
+        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout)) < 0)
+    {
+        reply.status = CUVS_STATUS_ERROR;
+        goto fail;
+    }
+
+    for (const CuvsPageOverlayChunk *chunk = snapshot; chunk; chunk = chunk->next)
+    {
+        if (chunk->from < request->base.folded &&
+            request->base.folded - chunk->from >= chunk->positions)
+            break;
+        cuvs_page_overlay_collect_range(chunk, request->base.folded, request->from,
+                                         &request->base, query, cmd, pending, &npending);
+    }
+    cuvs_page_overlay_collect_range(supplement, request->from, request->base.tail,
+                                     &request->base, query, cmd, pending, &npending);
+    if (npending > 1)
+        qsort(pending, (size_t) npending, sizeof(*pending),
+              cmd->metric == CUVS_METRIC_IP ? page_resident_descending : page_resident_ascending);
+
+    for (;;)
+    {
+        CuvsPageResidentWindow window = {.base_k = base_k};
+        bool valid;
+
+        pthread_mutex_lock(&g_index_mutex);
+        valid = !graph->search_invalidated &&
+            (graph->fold_retired || !graph->overlay.boot_id ||
+             graph->overlay.boot_id == request->boot_id);
+        pthread_mutex_unlock(&g_index_mutex);
+        if (!valid)
+        {
+            reply.status = CUVS_STATUS_NOT_FOUND;
+            goto fail;
+        }
+        if (advance.base_k)
+        {
+            window.base_count = page_resident_base_results(graph, raw, base_k,
+                                                           normalize_ip && !filtered, base);
+            qsort(base, window.base_count, sizeof(*base),
+                  cmd->metric == CUVS_METRIC_IP ? page_resident_descending : page_resident_ascending);
+        }
+        window.pending_count = advance.pending_limit < (uint32_t) npending - pending_read ?
+            advance.pending_limit : (uint32_t) npending - pending_read;
+        window.pending_left = (uint32_t) npending - pending_read - window.pending_count;
+        reply.status = CUVS_STATUS_OK;
+        reply.n_results = window.base_count + window.pending_count;
+        reply.latency_us = (uint32_t) (admission_mono_us() - started);
+        if (!send_page_overlay_reply(fd, &reply, progress) ||
+            send_all(fd, &window, sizeof(window)) < 0 ||
+            (window.base_count && send_all(fd, base, window.base_count * sizeof(*base)) < 0) ||
+            (window.pending_count &&
+             send_all(fd, pending + pending_read, window.pending_count * sizeof(*pending)) < 0))
+            break;
+        pending_read += window.pending_count;
+        if ((!window.pending_left && !filtered && base_k >= graph->n_slots) ||
+            !page_resident_recv_advance(fd, &advance))
+            break;
+        if (advance.reserved || advance.base_k > CUVS_PAGE_RESIDENT_BASE_MAX_K ||
+            (advance.filter_words && ((!filtered && base_k != CUVS_PAGE_RESIDENT_BASE_MAX_K) ||
+             !advance.base_k || advance.filter_words != (graph->n_slots + 31) / 32)) ||
+            (!advance.filter_words && advance.base_k && (filtered || advance.base_k <= base_k)) ||
+            advance.pending_limit > CUVS_PAGE_SEARCH_MAX_K ||
+            (!advance.base_k && (!advance.pending_limit || !window.pending_left)))
+        {
+            reply.status = CUVS_STATUS_ERROR;
+            goto fail;
+        }
+#ifdef CUVS_TEST_HOOKS
+        page_overlay_test_gate("CUVS_TEST_PAGE_OVERLAY_NEXT_FIFO");
+#endif
+        if (advance.base_k)
+        {
+            uint32_t search_k = graph->n_slots < advance.base_k ? (uint32_t) graph->n_slots : advance.base_k;
+            size_t filter_bytes = (size_t) advance.filter_words * sizeof(uint32_t);
+            uint32_t *excluded = NULL;
+            int rc;
+
+            if (filter_bytes)
+            {
+                if (!cuvs_page_overlay_reserve(&g_page_overlay_budget, filter_bytes))
+                {
+                    reply.status = CUVS_STATUS_PAGE_OVERLAY_HOST_FULL;
+                    goto fail;
+                }
+                excluded = malloc(filter_bytes);
+                if (!excluded || recv_all(fd, excluded, filter_bytes) < 0)
+                {
+                    free(excluded);
+                    cuvs_page_overlay_unreserve(&g_page_overlay_budget, filter_bytes);
+                    reply.status = CUVS_STATUS_ERROR;
+                    goto fail;
+                }
+                filtered = true;
+            }
+            rc = page_resident_graph_search(graph, cmd, query, (int) search_k, excluded, raw);
+            if (excluded)
+            {
+                free(excluded);
+                cuvs_page_overlay_unreserve(&g_page_overlay_budget, filter_bytes);
+            }
+            if (rc != 0)
+            {
+                reply.status = CUVS_STATUS_OOM_FALLBACK;
+                goto fail;
+            }
+            base_k = advance.base_k;
+        }
+    }
+    goto done;
+
+fail:
+    reply.n_results = 0;
+    (void) send_page_overlay_reply(fd, &reply, progress);
+done:
+    free(pending);
+    cuvs_page_overlay_unreserve(&g_page_overlay_budget, charge);
+}
+
 static void
 handle_page_overlay_search(int client_fd, const CuvsCmdFrame *cmd)
 {
@@ -15555,11 +16507,14 @@ handle_page_overlay_search(int client_fd, const CuvsCmdFrame *cmd)
     CuvsPageProgress progress = {0};
     CuvsPageOverlayChunk *supplement = NULL, *obsolete = NULL;
     CuvsPageOverlayChunk *snapshot = NULL, *clipped = NULL;
+    PageGraphFoldRef search_ref = {0};
     CuvsSearchResult *raw = NULL;
     CuvsPageOverlayResult *results = NULL;
     void *query = MAP_FAILED;
     size_t bytes = 0;
     bool batch = cmd->op == CUVS_OP_SEARCH_PAGE_OVERLAY_BATCH;
+    bool resident = cmd->op == CUVS_OP_SEARCH_PAGE_RESIDENT;
+    bool resident_sent = false;
     bool normalize_hnsw_ip = false;
     uint32_t prefix = batch ? 2 * sizeof(uint32_t) : 0;
     uint64_t started;
@@ -15572,14 +16527,15 @@ handle_page_overlay_search(int client_fd, const CuvsCmdFrame *cmd)
     if (reply.status != CUVS_STATUS_OK)
         goto done;
     reply.status = CUVS_STATUS_ERROR;
-    if (cmd->k == 0 || cmd->k > CUVS_PAGE_SEARCH_MAX_K || cmd->n_vecs < 1 || cmd->n_vecs > 1024 ||
+    if (cmd->k == 0 || cmd->k > CUVS_PAGE_SEARCH_MAX_K ||
+        (resident && cmd->k > CUVS_PAGE_RESIDENT_BASE_MAX_K) || cmd->n_vecs < 1 || cmd->n_vecs > 1024 ||
         batch != (cmd->n_vecs > 1) || cmd->search_mode > 1 || cmd->bf_precision > 1)
         goto done;
     progress.daemon_id = g_page_daemon_id;
     if (request.positions)
     {
         pthread_mutex_lock(&g_index_mutex);
-        graph = find_page_overlay_graph(cmd, &request, &owner, true);
+        graph = find_resident_search_graph_locked(cmd, &request, &owner, true);
         reply.status = CUVS_STATUS_NOT_FOUND;
         if (graph && page_graph_use_boot_locked(owner, request.boot_id, &obsolete))
         {
@@ -15587,6 +16543,16 @@ handle_page_overlay_search(int client_fd, const CuvsCmdFrame *cmd)
             generation = owner->overlay.generation;
             progress.covered_upto = owner->overlay.covered_upto;
             reply.status = page_overlay_search_status(cmd, &request, graph, &owner->overlay);
+            if (resident && reply.status == CUVS_STATUS_OK)
+            {
+                if (!page_graph_fold_pin_locked(graph, &search_ref))
+                    reply.status = CUVS_STATUS_NOT_FOUND;
+                else if (request.from > request.base.folded)
+                {
+                    snapshot = owner->overlay.head;
+                    cuvs_page_overlay_retain(snapshot);
+                }
+            }
         }
         pthread_mutex_unlock(&g_index_mutex);
         cuvs_page_overlay_release(obsolete);
@@ -15605,28 +16571,66 @@ handle_page_overlay_search(int client_fd, const CuvsCmdFrame *cmd)
                    ((const uint32_t *) query)[1] != cmd->dim)))
         goto done;
     vectors = (const float *) ((const char *) query + prefix);
-    raw = malloc((size_t) cmd->n_vecs * cmd->k * sizeof(*raw));
-    results = calloc((size_t) cmd->n_vecs * cmd->k, sizeof(*results));
+    raw = malloc((resident ? CUVS_PAGE_SEARCH_MAX_K : (size_t) cmd->n_vecs * cmd->k) * sizeof(*raw));
+    results = calloc(resident ? CUVS_PAGE_SEARCH_MAX_K : (size_t) cmd->n_vecs * cmd->k, sizeof(*results));
     if (!raw || !results)
         goto done;
 
     started = admission_mono_us();
     pthread_mutex_lock(&g_index_mutex);
-    graph = find_page_overlay_graph(cmd, &request, &owner, !request.positions);
-    if (!graph || (supplement && (graph->registered_order != registered_order ||
-                                 owner->overlay.generation != generation)) ||
-        !page_graph_use_boot_locked(owner, request.boot_id, &obsolete))
+    if (search_ref.entry)
     {
-        reply.status = CUVS_STATUS_NOT_FOUND;
-        goto unlock;
+        graph = search_ref.entry;
+        if (graph->search_invalidated)
+        {
+            reply.status = CUVS_STATUS_NOT_FOUND;
+            goto unlock;
+        }
     }
-    progress.covered_upto = owner->overlay.covered_upto;
-    reply.status = page_overlay_search_status(cmd, &request, graph, &owner->overlay);
-    if (reply.status != CUVS_STATUS_OK)
-        goto unlock;
+    else
+    {
+        graph = find_resident_search_graph_locked(cmd, &request, &owner, !request.positions);
+        if (!graph || (supplement && (graph->registered_order != registered_order ||
+                                     owner->overlay.generation != generation)) ||
+            !page_graph_use_boot_locked(owner, request.boot_id, &obsolete))
+        {
+            reply.status = CUVS_STATUS_NOT_FOUND;
+            goto unlock;
+        }
+        progress.covered_upto = owner->overlay.covered_upto;
+        reply.status = page_overlay_search_status(cmd, &request, graph, &owner->overlay);
+        if (reply.status != CUVS_STATUS_OK)
+            goto unlock;
+        if (resident)
+        {
+            if (!page_graph_fold_pin_locked(graph, &search_ref))
+            {
+                reply.status = CUVS_STATUS_NOT_FOUND;
+                goto unlock;
+            }
+            if (request.from > request.base.folded)
+            {
+                snapshot = owner->overlay.head;
+                cuvs_page_overlay_retain(snapshot);
+            }
+        }
+    }
 
     k = (int) (graph->n_slots < cmd->k ? graph->n_slots : cmd->k);
-    if (page_graph_search(graph, cmd, vectors, (int) cmd->n_vecs, k, NULL, raw) != 0)
+    if (resident)
+    {
+        int rc;
+
+        pthread_mutex_unlock(&g_index_mutex);
+        rc = page_resident_graph_search(graph, cmd, vectors, k, NULL, raw);
+        pthread_mutex_lock(&g_index_mutex);
+        if (rc != 0)
+        {
+            reply.status = CUVS_STATUS_OOM_FALLBACK;
+            goto unlock;
+        }
+    }
+    else if (page_graph_search(graph, cmd, vectors, (int) cmd->n_vecs, k, NULL, raw) != 0)
     {
         reply.status = CUVS_STATUS_OOM_FALLBACK;
         goto unlock;
@@ -15637,14 +16641,17 @@ handle_page_overlay_search(int client_fd, const CuvsCmdFrame *cmd)
     if (graph->hits < UINT32_MAX)
         ++graph->hits;
 
-    registered_order = graph->registered_order;
-    generation = owner->overlay.generation;
     normalize_hnsw_ip = cmd->metric == CUVS_METRIC_IP && cmd->search_mode == 0 &&
                        cmd->use_cpu_hnsw && graph->cpu_hnsw;
-    if (request.from > request.base.folded)
+    if (!resident)
     {
-        snapshot = owner->overlay.head;
-        cuvs_page_overlay_retain(snapshot);
+        registered_order = graph->registered_order;
+        generation = owner->overlay.generation;
+        if (request.from > request.base.folded)
+        {
+            snapshot = owner->overlay.head;
+            cuvs_page_overlay_retain(snapshot);
+        }
     }
     reply.status = CUVS_STATUS_OK;
 unlock:
@@ -15657,6 +16664,13 @@ unlock:
     if (snapshot)
         page_overlay_test_gate("CUVS_TEST_PAGE_OVERLAY_SCORE_FIFO");
 #endif
+    if (resident)
+    {
+        serve_page_resident_search(client_fd, cmd, &request, graph, snapshot, supplement,
+                                    vectors, raw, results, &progress, normalize_hnsw_ip, started);
+        resident_sent = true;
+        goto done;
+    }
     /* Only the copied base results and an immutable overlay prefix are used
      * below. Concurrent appends leave this search's covered range intact. */
     const CuvsPageOverlayChunk *first = snapshot;
@@ -15726,8 +16740,9 @@ done:
     cuvs_page_overlay_release(supplement);
     cuvs_page_overlay_release(clipped);
     cuvs_page_overlay_release(snapshot);
-    if (send_page_overlay_reply(client_fd, &reply, &progress) && reply.n_results)
+    if (!resident_sent && send_page_overlay_reply(client_fd, &reply, &progress) && reply.n_results)
         (void) send_all(client_fd, results, reply.n_results * sizeof(*results));
+    page_graph_fold_unpin(&search_ref);
     free(results);
 }
 
@@ -15866,16 +16881,30 @@ connection_thread(void *arg)
             break;
         case CUVS_OP_SEARCH_PAGE_OVERLAY:
         case CUVS_OP_SEARCH_PAGE_OVERLAY_BATCH:
+#ifdef CUVS_PAGE_FORMAT
+        case CUVS_OP_SEARCH_PAGE_RESIDENT:
+#endif
             handle_page_overlay_search(client_fd, &cmd);
             break;
         case CUVS_OP_SUPPLY_PAGES:
             handle_page_supply(client_fd, &cmd);
             break;
+#ifdef CUVS_PAGE_FORMAT
+        case CUVS_OP_PAGE_HISTORY_PRUNE:
+            handle_page_history_prune(client_fd, &cmd);
+            break;
+#endif
         case CUVS_OP_FOLD_READY:
+#ifdef CUVS_PAGE_FORMAT
+        case CUVS_OP_FOLD_RESIDENT_READY:
+#endif
             handle_page_fold_ready(client_fd, &cmd);
             break;
         case CUVS_OP_FOLD_COMMITTED:
         case CUVS_OP_FOLD_DISCARD:
+#ifdef CUVS_PAGE_FORMAT
+        case CUVS_OP_FOLD_RESIDENT_COMMITTED:
+#endif
             handle_page_fold_result(client_fd, &cmd);
             break;
         case CUVS_OP_SEARCH_PAGES:
@@ -16428,15 +17457,26 @@ graceful_shutdown(void)
     int saved = 0, failed = 0;
     for (int i = 0; i < g_n_indexes; i++)
     {
-        if (!g_indexes[i].valid)
+        IndexEntry *e = &g_indexes[i];
+        if (!e->valid)
             continue;
-        if (save_index(&g_indexes[i]) == 0) {
+        int rc = 0;
+        if (e->compact_save_pending && e->compact_tombstones_unapplied &&
+            mark_unapplied_compact_stale(e) != 0)
+        {
+            LOG_ERROR("sigterm: could not persist stale marker for %u/%u\n",
+                      e->db_oid, e->index_oid);
+            rc = -1;
+        }
+        if (rc == 0)
+            rc = e->compact_save_pending ? save_pending_compact(e) : save_index(e);
+        if (rc == 0) {
             saved++;
         } else {
             failed++;
             LOG_ERROR("sigterm: save_index FAILED for %u/%u "
                       "(operator must REINDEX after restart)\n",
-                    g_indexes[i].db_oid, g_indexes[i].index_oid);
+                      e->db_oid, e->index_oid);
         }
     }
     pthread_mutex_unlock(&g_index_mutex);

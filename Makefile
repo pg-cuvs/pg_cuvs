@@ -40,15 +40,15 @@ DATA           = sql/pg_cuvs--0.1.0.sql \
                  sql/pg_cuvs--0.9.2--0.9.3.sql \
                  sql/pg_cuvs--0.9.3.sql
 MODULE_big     = pg_cuvs
-REGRESS        = smoke upgrade_path cpu_fallback edge_cases cpu_hnsw_fallback build_hnsw build_hnsw_edge build_hnsw_halfvec build_hnsw_packing hnsw_insert_shift hnsw_layer_status hnsw_build_ef pg_cuvs_hnsw metrics brute_force pg_cuvs_batch reloption_dir gc_orphans release_hardening pending_delta delta_recall build_params drop_subxact partition_prune filter_comparison prefilter_short_fill_guard ivfpq_smoke cagra_streaming cagra_dynbatch cagra_search_params auto_compact extend_vram_fallback stream_bf_recall fallback_stat vram_accounting build_lock flat_smoke transient_bf hw_profile routing_golden routing_golden_measured multi_vector daemon_uid_owner unordered_scan null_query_vector rmm_pool admission_reject
+REGRESS        = smoke upgrade_path cpu_fallback edge_cases cpu_hnsw_fallback build_hnsw build_hnsw_edge build_hnsw_halfvec build_hnsw_packing hnsw_insert_shift hnsw_layer_status hnsw_build_m hnsw_build_ef hnsw_source_conversion hnsw_source_maintenance hnsw_source_conversion_file pg_cuvs_hnsw metrics brute_force brute_force_after_extend brute_force_after_compact pg_cuvs_batch reloption_dir gc_orphans release_hardening pending_delta delta_recall build_params drop_subxact partition_prune filter_comparison prefilter_short_fill_guard ivfpq_smoke cagra_streaming cagra_dynbatch cagra_search_params auto_compact extend_vram_fallback stream_bf_recall fallback_stat vram_accounting build_lock flat_smoke transient_bf hw_profile routing_golden routing_golden_measured multi_vector daemon_uid_owner unordered_scan null_query_vector rmm_pool admission_reject
 REGRESS_OPTS   = --inputdir=test --outputdir=test
 
 # Tier-1 CI (CPU-reference shim, PGCUVS_CPU_SHIM=1) runs a SUBSET of REGRESS.
 # Excluded = tests the shim cannot/should not reproduce on CPU:
 #   build_hnsw/build_hnsw_edge/pg_cuvs_hnsw/build_hnsw_halfvec/
-#     build_hnsw_packing/hnsw_insert_shift — CAGRA->pgvector HNSW *graph export* (real graph
+#     build_hnsw_packing/hnsw_insert_shift/hnsw_build_m — CAGRA->pgvector HNSW *graph export* (real graph
 #     structure; a Tier-2 / real-GPU concern).
-REGRESS_TIER2_ONLY = build_hnsw build_hnsw_edge build_hnsw_halfvec build_hnsw_packing hnsw_insert_shift hnsw_build_ef pg_cuvs_hnsw routing_golden_measured
+REGRESS_TIER2_ONLY = build_hnsw build_hnsw_edge build_hnsw_halfvec build_hnsw_packing hnsw_insert_shift hnsw_build_m hnsw_build_ef hnsw_source_conversion_file pg_cuvs_hnsw routing_golden_measured
 REGRESS_TIER1      = $(filter-out $(REGRESS_TIER2_ONLY),$(REGRESS))
 
 # #124: build_oom, build_multi_oom, build_oom_evict_to_fit, and extend_cuda_oom
@@ -82,6 +82,7 @@ ISOLATION_GPU  = pg_cuvs_hnsw_cic_writes
 # PGXS only knows how to build .c → .o; the .cu → .o rule is custom,
 # but the resulting object MUST be listed in OBJS to be linked into the .so.
 OBJS           = src/pg_cuvs.o src/cuvs_ipc.o src/cuvs_util.o $(WRAPPER_OBJ) src/hnsw_export.o src/cuvs_hnsw_scan.o src/cuvs_hnsw_rls.o src/cuvs_hnsw_exact.o src/cuvs_build_corpus.o src/pg_cuvs_compaction.o src/cuvs_status_text.o src/cuvs_peak_meter.o src/cuvs_cagra_pages.o src/cuvs_cagra_pending_search.o src/cuvs_cagra_fold_worker.o
+OBJS           += src/cuvs_cagra_history.o src/cuvs_cagra_resident_supply.o
 
 # nvcc settings (Phase 1: brute-force only; CAGRA added later)
 NVCC          ?= nvcc
@@ -168,7 +169,7 @@ PG_CPPFLAGS += $(CUVS_FOLD_PRODUCT_CPPFLAGS)
 # -Wl,-rpath embeds the cuVS lib path so postmaster finds libcuvs.so
 # without LD_LIBRARY_PATH being set (ADR-007).
 SHLIB_LINK     = $(CUVS_SO_LINK) $(CUVS_LOGGER_LINK) $(CUVS_SDK_PLAN_LINK) $(CUVS_FOLD_LINK) \
-                 -Wl,-Bstatic -lstdc++ -Wl,-Bdynamic -lrt
+                 -Wl,-Bstatic -lstdc++ -Wl,-Bdynamic -lrt -lcrypto
 
 EXTRA_CLEAN += src/.cuvs-fold-mode src/cuvs_cagra_fold_sdk.o src/cuvs_cagra_fold_sdk.bc \
                src/cuvs_cagra_fold_unavailable.o src/cuvs_cagra_fold_unavailable.bc
@@ -251,6 +252,9 @@ SERVER_CFLAGS  = -O2 -g -Wall -Wextra -I./src \
 # Optional sanitizer/debug hooks for the daemon (e.g. CI ASAN job passes
 # EXTRA_SERVER_CFLAGS="-fsanitize=address -fno-omit-frame-pointer"). Empty by default.
 SERVER_CFLAGS += $(EXTRA_SERVER_CFLAGS) $(CUVS_FOLD_PRODUCT_CPPFLAGS)
+ifeq ($(CUVS_PAGE_FORMAT),1)
+SERVER_CFLAGS += -DCUVS_PAGE_FORMAT
+endif
 ifdef PGCUVS_CPU_SHIM
 SERVER_CFLAGS += -DPGCUVS_CPU_SHIM
 endif
@@ -651,6 +655,15 @@ test-gpu-wrapper-i3: test/gpu/test_wrapper_i3.c src/cuvs_wrapper.o $(CUVS_FOLD_O
 	$(CXX) -o $@ $@.o $(filter %.o,$^) $(SHLIB_LINK) -lpthread -lm
 	./$@
 
+# GPU-only: a failed request must not destroy the pooled stream that buffers
+# of an index built on the same slot still refer to. Run after `make all server`.
+test-gpu-pooled-stream-lifetime: test/gpu/test_pooled_stream_lifetime.c src/cuvs_wrapper.o $(CUVS_FOLD_OBJ) src/cuvs_util_server.o src/cuvs_peak_meter_server.o
+	$(CC) -std=gnu11 -Wall -Wextra -I src -c $< -o $@.o
+	$(CXX) -o $@ $@.o $(filter %.o,$^) $(SHLIB_LINK) -lpthread -lm
+	./$@
+EXTRA_CLEAN += test-gpu-pooled-stream-lifetime test-gpu-pooled-stream-lifetime.o
+.PHONY: test-gpu-pooled-stream-lifetime
+
 # Exercise the actual mode-selected wrapper and fold objects from plain C.
 .PHONY: test-cagra-fold-build
 test-cagra-fold-build: test/unit/test_cagra_fold_build.c test/gpu/test_cagra_fold_early.cpp $(WRAPPER_OBJ) src/cuvs_util_server.o src/cuvs_peak_meter_server.o
@@ -887,6 +900,13 @@ HNSW_CONVERTER_UNIT_LINK = -Wl,--gc-sections \
                           -L$(shell $(PG_CONFIG) --pkglibdir) -lpgcommon -lpgport -lm
 endif
 HNSW_UNIT_CPPFLAGS ?=
+test-unit: test-hnsw-source-binding
+test-hnsw-source-binding: test/unit/test_hnsw_source_binding.c src/cuvs_hnsw_source.h
+	$(CC) -std=gnu11 -Wall -Wextra -Werror -I src -o $@ $< -lcrypto
+	./$@
+EXTRA_CLEAN += test-hnsw-source-binding
+.PHONY: test-hnsw-source-binding
+
 .PHONY: test-hnsw-converter-build
 test-hnsw-converter: test-hnsw-converter-build
 	./$@
@@ -946,6 +966,15 @@ installcheck-isolation-gpu:
 # requires a (shim) daemon up, same as installcheck.
 installcheck-tier1:
 	$(pg_regress_installcheck) $(REGRESS_OPTS) $(REGRESS_TIER1)
+
+# Focused source-conversion regression. Also runs in both regression tiers.
+installcheck-hnsw-source:
+	$(pg_regress_installcheck) $(REGRESS_OPTS) hnsw_source_conversion hnsw_source_maintenance $(HNSW_SOURCE_FILE_TEST)
+
+# Set HNSW_SOURCE_FILE_TEST=hnsw_source_conversion_file with a real GPU daemon.
+HNSW_SOURCE_FILE_TEST ?=
+
+.PHONY: installcheck-hnsw-source
 
 # ---- Fault-injection installcheck (CUVS_TEST_HOOKS daemon) ----------------
 # #124: REGRESS_FAULT needs the CUVS_OP_INJECT_* opcodes, which only exist in
@@ -1367,6 +1396,7 @@ EXTRA_CLEAN += test-physical-build-guard
 .PHONY: test-physical-build-guard test-physical-build-mutations
 ifeq ($(shell uname -s),Linux)
 test-unit: test-physical-build-guard
+test-unit: test-legacy-bf-sidecar
 
 # the host upper-layer builder: levels and file size fixed by the input whatever the thread count,
 # every element above level 0 linked on level 1, level 0 without self links or duplicates, the cancel stop.
@@ -1389,6 +1419,21 @@ test-physical-build-guard:
 
 test-physical-build-mutations:
 	CC=$(CC) python3 -I test/unit/test_physical_build_mutations.py
+
+# Legacy sidecar validity through the actual daemon with a CPU wrapper.
+LEGACY_BF_CASES ?= reused-tid streaming alias rollback build-crash build-fsync-rollback \
+	compact-retry-unlink compact-retry-fsync compact-retry-publish compact-retry-tombstone binding-other-dir \
+	compact-shutdown-before compact-shutdown-after compact-shutdown-before-enoent \
+	compact-enoent-before compact-enoent-after
+EXTRA_CLEAN += test-legacy-bf-sidecar
+.PHONY: test-legacy-bf-sidecar
+test-legacy-bf-sidecar:
+	$(CC) -std=gnu11 -O1 -DPGCUVS_CPU_SHIM -DCUVS_TEST_HOOKS -ffunction-sections -fdata-sections -I src \
+		test/unit/test_legacy_bf_sidecar.c src/cuvs_ipc.c src/cuvs_util.c \
+		src/cuvs_objstore.c src/cuvs_build_corpus.c src/cuvs_wrapper_shim_cpu.c \
+		src/cuvs_cache_policy.c src/cuvs_peak_meter.c src/cuvs_page_overlay.c src/cuvs_hnsw_upper.c \
+		-Wl,--gc-sections -lm -lpthread -lrt -lcurl -lssl -lcrypto -o $@
+	@set -e; for scenario in $(LEGACY_BF_CASES); do ./$@ "$$scenario"; done
 
 # I3-E / C8: rejection counters, memory_status I3-E columns, build_status rows
 # for in-flight unlocked CAGRA builds, through the actual daemon source (CPU

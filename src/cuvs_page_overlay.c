@@ -45,6 +45,8 @@ cuvs_page_overlay_alloc(CuvsPageOverlayBudget *budget, const CuvsPageOverlayRequ
         return CUVS_STATUS_OOM_FALLBACK;
     }
     chunk->next = NULL;
+    chunk->retired_next = NULL;
+    chunk->deferred_releases = 0;
     chunk->refs = 1;
     chunk->budget = budget;
     chunk->charged_bytes = charge;
@@ -108,8 +110,8 @@ cuvs_page_overlay_start_boot(CuvsPageOverlay *overlay, uint64_t boot_id, uint64_
     return previous;
 }
 
-CuvsPageOverlayChunk *
-cuvs_page_overlay_advance_fold(CuvsPageOverlay *overlay, uint64_t folded)
+static CuvsPageOverlayChunk *
+page_overlay_advance_fold(CuvsPageOverlay *overlay, uint64_t folded, bool defer_pinned)
 {
     CuvsPageOverlayChunk **link = &overlay->head;
     CuvsPageOverlayChunk *obsolete;
@@ -120,7 +122,12 @@ cuvs_page_overlay_advance_fold(CuvsPageOverlay *overlay, uint64_t folded)
     while (*link && (*link)->from + (*link)->positions > folded)
     {
         if (__atomic_load_n(&(*link)->refs, __ATOMIC_ACQUIRE) > 1)
+        {
+            /* This retained chunk can still reach the link we would cut. */
+            if (defer_pinned)
+                return NULL;
             reader_can_reach_cut = true;
+        }
         link = &(*link)->next;
     }
     if (!*link)
@@ -137,6 +144,18 @@ cuvs_page_overlay_advance_fold(CuvsPageOverlay *overlay, uint64_t folded)
     obsolete = *link;
     *link = NULL;
     return obsolete;
+}
+
+CuvsPageOverlayChunk *
+cuvs_page_overlay_advance_fold(CuvsPageOverlay *overlay, uint64_t folded)
+{
+    return page_overlay_advance_fold(overlay, folded, false);
+}
+
+CuvsPageOverlayChunk *
+cuvs_page_overlay_prune_folded(CuvsPageOverlay *overlay, uint64_t folded)
+{
+    return page_overlay_advance_fold(overlay, folded, true);
 }
 
 uint32_t
@@ -221,17 +240,29 @@ page_add_result(CuvsPageOverlayResult *results, int *count, int k,
     results[lo] = candidate;
 }
 
-void
-cuvs_page_overlay_score(const CuvsPageOverlayChunk *chunk, uint64_t upto,
-                   const CuvsPageSearchRequest *request, const float *query,
-                   const CuvsCmdFrame *cmd, CuvsPageOverlayResult *results, int *count)
+static void
+page_overlay_score_range(const CuvsPageOverlayChunk *chunk, uint64_t from, uint64_t upto,
+                         const CuvsPageSearchRequest *request, const float *query,
+                         const CuvsCmdFrame *cmd, CuvsPageOverlayResult *results, int *count,
+                         bool ranked)
 {
+    uint64_t first, upto_offset;
+    uint32_t end, skipped_rows = 0;
     const float *vector;
 
-    if (!chunk || chunk->from >= upto)
+    if (!chunk || from >= upto || chunk->from >= upto)
         return;
-    vector = (const float *) (chunk->marks + chunk->positions);
-    for (uint32_t i = 0; i < chunk->positions && chunk->from + i < upto; ++i)
+    first = from > chunk->from ? from - chunk->from : 0;
+    if (first >= chunk->positions)
+        return;
+    upto_offset = upto - chunk->from;
+    end = upto_offset < chunk->positions ? (uint32_t) upto_offset : chunk->positions;
+
+    /* Only VECTOR marks have rows in the packed payload. */
+    for (uint32_t i = 0; i < first; ++i)
+        skipped_rows += chunk->marks[i].state == CUVS_PAGE_POSITION_VECTOR;
+    vector = (const float *) (chunk->marks + chunk->positions) + (size_t) skipped_rows * cmd->dim;
+    for (uint32_t i = (uint32_t) first; i < end; ++i)
     {
         CuvsPagePosition mark = chunk->marks[i];
 
@@ -243,8 +274,39 @@ cuvs_page_overlay_score(const CuvsPageOverlayChunk *chunk, uint64_t upto,
                 .block = mark.block,
             };
 
-            page_add_result(results, count, cmd->k, candidate, cmd->metric);
+            if (ranked)
+                page_add_result(results, count, cmd->k, candidate, cmd->metric);
+            else if (isfinite(candidate.distance))
+                results[(*count)++] = candidate;
             vector += cmd->dim;
         }
     }
+}
+
+void
+cuvs_page_overlay_score(const CuvsPageOverlayChunk *chunk, uint64_t upto,
+                        const CuvsPageSearchRequest *request, const float *query,
+                        const CuvsCmdFrame *cmd, CuvsPageOverlayResult *results, int *count)
+{
+    page_overlay_score_range(chunk, 0, upto, request, query, cmd, results, count, true);
+}
+
+void
+cuvs_page_overlay_score_range(const CuvsPageOverlayChunk *chunk, uint64_t from, uint64_t upto,
+                              const CuvsPageSearchRequest *request, const float *query,
+                              const CuvsCmdFrame *cmd, CuvsPageOverlayResult *results, int *count)
+{
+    if (from < request->folded)
+        from = request->folded;
+    page_overlay_score_range(chunk, from, upto, request, query, cmd, results, count, true);
+}
+
+void
+cuvs_page_overlay_collect_range(const CuvsPageOverlayChunk *chunk, uint64_t from, uint64_t upto,
+                               const CuvsPageSearchRequest *request, const float *query,
+                               const CuvsCmdFrame *cmd, CuvsPageOverlayResult *results, int *count)
+{
+    if (from < request->folded)
+        from = request->folded;
+    page_overlay_score_range(chunk, from, upto, request, query, cmd, results, count, false);
 }
