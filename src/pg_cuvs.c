@@ -2984,7 +2984,8 @@ cuvs_hnsw_spool_callback(Relation index, ItemPointer tid, Datum *values,
             ereport(ERROR, (errcode(ERRCODE_DATA_EXCEPTION),
                            errmsg("pg_cuvs: HNSW input contains nonfinite values")));
         spool->row[j] = f;
-        norm2 += (double)f * f;
+        if (spool->metric == CUVS_METRIC_COSINE)
+            norm2 += (double)f * f;
     }
     if ((void *)v != DatumGetPointer(values[0])) pfree(v);
     /* Match pgvector cosine builds: zero vectors are not index entries. */
