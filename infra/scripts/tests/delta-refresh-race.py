@@ -181,6 +181,55 @@ class Fixture:
             # snapshot. The daemon must read the completed append after LOCK_SH.
             assert self.race("wait-file-lock", lambda: self.nearest(990), publish) == 903
 
+    def metadata_append(self, *, rewrite_boundary=False):
+        self.replace(901)
+        self.delta.chmod(0o644)
+        assert self.nearest(900) == 901
+        state_sql = (
+            "SELECT delta_rows, delta_vram_bytes, delta_merged_count "
+            f"FROM pg_stat_gpu_search WHERE index_oid = '{self.schema}.d_i'::regclass"
+        )
+        cached, indexed_bytes, merged = map(int, self.sql(state_sql).split("|"))
+        assert (cached, indexed_bytes) == (1, RECORD_BYTES)
+
+        with self.delta.open("r+b") as writer:
+            fd = writer.fileno()
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            before = os.fstat(fd)
+            deadline = time.monotonic() + 2
+            while True:
+                os.fchmod(fd, 0o644)
+                changed = os.fstat(fd)
+                if changed.st_ctime_ns != before.st_ctime_ns:
+                    break
+                assert time.monotonic() < deadline, "fchmod did not advance ctime"
+                time.sleep(0.005)
+            assert (changed.st_ino, changed.st_size, changed.st_mtime_ns) == (
+                before.st_ino, HEADER.size + RECORD_BYTES, before.st_mtime_ns
+            )
+
+            def publish():
+                try:
+                    if rewrite_boundary:
+                        writer.seek(HEADER.size)
+                        writer.write(self.records[2])
+                        writer.seek(0)
+                    self.write_append(writer, 902)
+                finally:
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+
+            # The wait barrier follows the daemon's initial stat. Until then
+            # the writer has changed only metadata, with no second row on disk.
+            query = 990 if rewrite_boundary else 950
+            expected_id = 903 if rewrite_boundary else 902
+            assert self.race("wait-file-lock", lambda: self.nearest(query), publish) == expected_id
+
+        expected_bytes = 2 * RECORD_BYTES if rewrite_boundary else indexed_bytes
+        state = tuple(map(int, self.sql(state_sql).split("|")))
+        expected = (2, expected_bytes, merged + 1)
+        assert state == expected, ("delta rows, indexed bytes, merged searches", state, expected)
+        print(f"delta cache (rows, indexed bytes, merged searches): {state}", flush=True)
+
     def competing_publish(self):
         self.replace(901, 902)
 
@@ -384,6 +433,8 @@ class Fixture:
     def cases(self):
         return {
             "writer-lock": self.writer_lock,
+            "metadata-append": self.metadata_append,
+            "metadata-append-boundary": lambda: self.metadata_append(rewrite_boundary=True),
             "competing-publish": self.competing_publish,
             "delta-replace": self.delta_replace,
             "delta-truncate": self.delta_truncate,

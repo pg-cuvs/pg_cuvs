@@ -2500,7 +2500,7 @@ static int
 delta_read_change(const char *path, const char *tids_path, DeltaFileStamp cached_file,
                   int64_t max_rows, uint32_t dim, uint32_t metric,
                   const DeltaRows *prefix, int64_t from, uint32_t generation,
-                  int read_body, DeltaRead *read)
+                  bool try_same_size_prefix, int read_body, DeltaRead *read)
 {
     int fd = open(path, O_RDONLY | O_NONBLOCK);
     if (fd < 0)
@@ -2583,8 +2583,16 @@ delta_read_change(const char *path, const char *tids_path, DeltaFileStamp cached
             || memcmp(rec + sizeof(uint64_t), prefix->vectors + (size_t) (from - 1) * dim,
                       vec_bytes) != 0)
         {
-            ready = -1;       /* rebuild from row zero */
-            goto done;
+            if (!try_same_size_prefix)
+            {
+                ready = -1;       /* rebuild from row zero */
+                goto done;
+            }
+            /* The preflight already allowed a full read for this case. */
+            from = 0;
+            read->from = 0;
+            if (fseeko(f, (off_t) sizeof(hdr), SEEK_SET) != 0)
+                goto done;
         }
     }
 
@@ -2686,6 +2694,15 @@ refresh_delta_cache(IndexEntry **entry)
         uint32_t generation = e->delta_generation;
         DeltaFileStamp cached_file = e->delta_file;
         int64_t max_rows = n + 2 * delta_tail_max(indexed);
+        /* A writer can change ctime before growing the file. Keep the
+         * original full-read preflight and let the locked snapshot decide
+         * whether the cached rows are a verified append prefix. */
+        bool try_same_size_prefix = e->delta_idx && delta_same_file(file, cached_file) &&
+                                    file.size == cached_file.size &&
+                                    file.mtime.tv_sec == cached_file.mtime.tv_sec &&
+                                    file.mtime.tv_nsec == cached_file.mtime.tv_nsec;
+        if (try_same_size_prefix)
+            from = e->n_delta;
         DeltaRows *prefix = from > 0 ? e->delta_rows : NULL;
         if (prefix)
             prefix->refs++;
@@ -2693,7 +2710,8 @@ refresh_delta_cache(IndexEntry **entry)
 
         pthread_mutex_unlock(&g_index_mutex);
         int ready = delta_read_change(path, tids_path, cached_file, max_rows, dim, metric,
-                                      prefix, from, generation, read_body, &read);
+                                      prefix, from, generation, try_same_size_prefix,
+                                      read_body, &read);
 #ifdef CUVS_TEST_HOOKS
         delta_test_pause("read");
 #endif
