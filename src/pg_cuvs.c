@@ -553,6 +553,22 @@ typedef struct CuvsPendingDrop
 
 static List *cuvs_pending_drops = NIL;   /* of CuvsPendingDrop*, in TopMemoryContext */
 
+/* the access methods whose indexes have a daemon entry (a GPU handle or cache) and files in index_dir, as one table. The DROP
+ * notice and the planner's "has a pg_cuvs vector index" test read it; an access method added to pg_cuvs that keeps daemon state is
+ * added here once. pg_cuvs_hnsw is not in it: its index lives in PostgreSQL pages and the daemon keeps nothing for it. */
+static const char *const cuvs_daemon_entry_ams[] = {"cagra", "ivfpq", "flat"};
+
+static bool
+cuvs_am_has_daemon_entry(Oid relam)
+{
+    if (!OidIsValid(relam))
+        return false;
+    for (size_t i = 0; i < lengthof(cuvs_daemon_entry_ams); i++)
+        if (relam == get_am_oid(cuvs_daemon_entry_ams[i], true))
+            return true;
+    return false;
+}
+
 static void
 cuvs_object_access(ObjectAccessType access, Oid classId, Oid objectId,
                    int subId, void *arg)
@@ -566,15 +582,9 @@ cuvs_object_access(ObjectAccessType access, Oid classId, Oid objectId,
         if (HeapTupleIsValid(tup))
         {
             Form_pg_class cf = (Form_pg_class) GETSTRUCT(tup);
-            /* ADR-073: a flat index also persists daemon artifacts (.tids/.vectors)
-             * and a resident BF cache, so its DROP must notify the daemon too —
-             * otherwise the artifacts orphan and a restart reloads them as zombies. */
-            Oid cagra_am = get_am_oid("cagra", true);
-            Oid flat_am  = get_am_oid("flat", true);
-            Oid ivfpq_am = get_am_oid("ivfpq", true);   /* handle + .ivfpq/.tids */
-            if (cf->relkind == RELKIND_INDEX &&
-                OidIsValid(cf->relam) &&
-                (cf->relam == cagra_am || cf->relam == flat_am || cf->relam == ivfpq_am))
+            /* Every index whose access method keeps a daemon entry and daemon files must notify the daemon of its
+             * drop, or the entry and the files orphan and a restart reloads them as zombies. */
+            if (cf->relkind == RELKIND_INDEX && cuvs_am_has_daemon_entry(cf->relam))
             {
                 CuvsPendingDrop pending = {
                     .oid = objectId, .subid = GetCurrentSubTransactionId()
@@ -583,7 +593,7 @@ cuvs_object_access(ObjectAccessType access, Oid classId, Oid objectId,
                 CuvsPendingDrop *pd;
 
 #ifdef CUVS_PAGE_FORMAT
-                if (cf->relam == cagra_am)
+                if (cf->relam == get_am_oid("cagra", true))
                 {
                     /* The deletion path already holds a lock on the index.
                      * Read reloptions before the catalog entry is removed. */
@@ -10626,14 +10636,11 @@ cuvs_metric_from_order_op(Oid opno)
 static bool
 cuvs_rel_has_vector_index(RelOptInfo *rel, int attno)
 {
-    Oid       cagra_am = get_am_oid("cagra", true);
-    Oid       ivfpq_am = get_am_oid("ivfpq", true);
-    Oid       flat_am  = get_am_oid("flat",  true);
     ListCell *lc;
     foreach(lc, rel->indexlist)
     {
         IndexOptInfo *ioi = lfirst_node(IndexOptInfo, lc);
-        if (ioi->relam != cagra_am && ioi->relam != ivfpq_am && ioi->relam != flat_am)
+        if (!cuvs_am_has_daemon_entry(ioi->relam))
             continue;
         if (ioi->nkeycolumns >= 1 && ioi->indexkeys[0] == attno)
             return true;
