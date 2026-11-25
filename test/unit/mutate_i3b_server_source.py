@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Mutations for check_i3b_server_source.py: each must turn the scan RED."""
+"""Check that the scan rejects broken save paths and accepts a BF-only guard."""
 import os, subprocess, sys, tempfile
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 SRC = os.path.join(ROOT, "src", "pg_cuvs_server.c")
@@ -35,8 +35,14 @@ M = [
     ("SIGTERM tests file_current", "graceful_shutdown(void)\n{", "graceful_shutdown(void)\n{\n    if (!g_indexes[0].file_current) {}"),
     ("legacy discard saves the graph", "if (save_legacy && !e->file_current)", "if (!e->file_current)"),
     ("eviction ignores file_current", "if (save_legacy && !e->file_current)", "if (save_legacy)"),
-    ("compaction skips a save", "    if (save_index(e) != 0)",
-     "    if (e->valid && !e->file_current && save_index(e) != 0)"),
+    ("compaction skips a save", "    int save_status = save_index(&compacted);",
+     "    int save_status = e->file_current ? 0 : save_index(&compacted);"),
+    ("compaction returns before saving", "    int save_status = save_index(&compacted);",
+     "    if (e->file_current == 0)\n        return;\n    int save_status = save_index(&compacted);"),
+    ("HNSW binding check skips the base save",
+     "        preserve_binding = read_hnsw_source(hnsw_final, tids_final, &old_binding);\n",
+     "        preserve_binding = read_hnsw_source(hnsw_final, tids_final, &old_binding);\n"
+     "        return 0;\n"),
     ("eviction saves outside its guard", "        if (save_legacy && !e->file_current)",
      "        save_index(e);\n        if (save_legacy && !e->file_current)"),
     ("wrapper: peak CAS before the upstream allocate",
@@ -50,7 +56,11 @@ worig = open(WRAP).read()
 base = subprocess.run([sys.executable, SCAN, SRC], capture_output=True, text=True)
 print("baseline:", base.stdout.strip().splitlines()[-1])
 bad = 0 if base.returncode == 0 else 1
-for name, old, new in M:
+refresh = "refresh_main_bf_cache(IndexEntry *e, uint32_t want_precision)\n{"
+cases = [(name, old, new, True) for name, old, new in M]
+cases.append(("BF validity can read file_current", refresh,
+              refresh + "\n    if (e->handle && !e->file_current)\n        return;", False))
+for name, old, new, want_red in cases:
     is_wrap = name.startswith("wrapper:")
     text = worig if is_wrap else orig
     if text.count(old) != 1:
@@ -62,8 +72,10 @@ for name, old, new in M:
     r = subprocess.run([sys.executable, SCAN, os.path.join(d, "pg_cuvs_server.c")],
                        capture_output=True, text=True)
     red = r.returncode != 0
-    bad += 0 if red else 1
+    matched = red == want_red
+    bad += 0 if matched else 1
     first = next((l for l in r.stdout.splitlines() if l.startswith("FAIL")), "")
-    print(f"{'RED ' if red else 'MISS'} {name}: {first}")
-print(f"mutations: {len(M)}, survived/invalid: {bad}")
+    outcome = ("RED" if red else "GREEN") if matched else "MISS"
+    print(f"{outcome} {name}: {first}")
+print(f"cases: {len(cases)}, unexpected/invalid: {bad}")
 sys.exit(1 if bad else 0)

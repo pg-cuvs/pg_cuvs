@@ -73,7 +73,9 @@ static void run_case(int dtype,int fail_merge,int fail_persist)
         assert(file_bytes(tomb,new_tomb,sizeof(new_tomb))==tomb_size && !memcmp(old_tomb,new_tomb,tomb_size));
     } else if(fail_persist) {
         assert(hdr.status==CUVS_STATUS_PERSIST_FAILED);
-        assert(e->handle!=old_handle && e->n_vecs==3 && e->compact_count==1 && !e->file_current);
+        assert(e->handle==old_handle && e->tids==old_tids && e->n_vecs==4 && e->compact_count==0);
+        assert(e->file_current && e->compact_save_pending);
+        assert(file_bytes(index_path,new_disk,sizeof(new_disk))==old_size && !memcmp(old_disk,new_disk,old_size));
         assert(access(tomb,F_OK)==0);
         printf("OBSERVATION persist failure after retry: notice_empty=%d old_handle_retained=%d tombstone_retained=1\n",!hdr.notice_out[0],e->handle==old_handle);
     } else {
