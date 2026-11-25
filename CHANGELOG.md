@@ -12,6 +12,10 @@ exists for 0.9.0.
 
 ### Added
 
+- Experimental page-format CAGRA scans can reuse the daemon's pending rows
+  with `cuvs.page_resident_search=on`. `cuvs.resident_supply=on` enables
+  background supply on builds with native page-format folding. Both settings
+  default to `off`.
 - `pg_cuvs_hnsw_layer_counts(regclass)` and `pg_cuvs_hnsw_layer_status()`: the elements of
   a `pg_cuvs_hnsw` index above level 0, and whether each index has the upper layers that
   `mode = 'nsw'` did not build before 0.9.3 (such an index needs `REINDEX INDEX`) and links

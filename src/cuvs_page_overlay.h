@@ -16,6 +16,7 @@ typedef struct CuvsPageOverlayChunk
     /* Link to the older prefix. Immutable while reachable by a reader. */
     struct CuvsPageOverlayChunk *next;
     struct CuvsPageOverlayChunk *retired_next;
+    size_t deferred_releases; /* registry lock protects the queue and count */
     size_t refs;
     CuvsPageOverlayBudget *budget;
     size_t charged_bytes;
@@ -50,9 +51,26 @@ CuvsPageOverlayChunk *cuvs_page_overlay_start_boot(CuvsPageOverlay *overlay, uin
                                                    uint64_t folded);
 /* Detach folded chunks after publication. Release the result outside the lock. */
 CuvsPageOverlayChunk *cuvs_page_overlay_advance_fold(CuvsPageOverlay *overlay, uint64_t folded);
+/* Prune whole folded chunks under the registry lock, preserving coverage and
+ * generation. A reader that can still traverse the link defers the cut.
+ * Retry with the current folded position after readers unpin. Release any
+ * returned reference outside the lock. */
+CuvsPageOverlayChunk *cuvs_page_overlay_prune_folded(CuvsPageOverlay *overlay, uint64_t folded);
 void cuvs_page_overlay_score(const CuvsPageOverlayChunk *chunk, uint64_t upto,
                              const CuvsPageSearchRequest *base, const float *query,
                              const CuvsCmdFrame *cmd, CuvsPageOverlayResult *results, int *count);
+/* Merge candidates from one retained chunk in [max(from, base->folded), upto).
+ * The caller owns a reference that keeps the chunk live during scoring. */
+void cuvs_page_overlay_score_range(const CuvsPageOverlayChunk *chunk, uint64_t from, uint64_t upto,
+                                   const CuvsPageSearchRequest *base, const float *query,
+                                   const CuvsCmdFrame *cmd, CuvsPageOverlayResult *results,
+                                   int *count);
+/* Append every finite VECTOR distance in the selected range. The caller
+ * supplies one result slot per physical position in the ranges it visits. */
+void cuvs_page_overlay_collect_range(const CuvsPageOverlayChunk *chunk, uint64_t from, uint64_t upto,
+                                     const CuvsPageSearchRequest *base, const float *query,
+                                     const CuvsCmdFrame *cmd, CuvsPageOverlayResult *results,
+                                     int *count);
 
 /* Registry lock required. A new boot detaches the old list for disposal. */
 uint32_t cuvs_page_overlay_supply(CuvsPageOverlay *overlay, const CuvsPageOverlayRequest *request,
