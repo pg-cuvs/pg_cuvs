@@ -5865,10 +5865,9 @@ cuvs_gettuple(IndexScanDesc scan, ScanDirection dir)
         if (rc != CUVS_STATUS_OK)
         {
             /* Record error for circuit breaker. DIM_MISMATCH and METRIC_MISMATCH
-             * are user/config errors, not repeatable GPU failures. STALE is
-             * already gated at plan time. Everything else — including UNAVAILABLE
-             * (connect failure after planning) — counts so the breaker opens and
-             * subsequent queries replan to CPU via the plan-time breaker gate. */
+             * are user/config errors. STALE is gated at plan time, and
+             * SEARCH_RETRY reports a concurrent change. Repeatable daemon
+             * failures count so subsequent queries can replan to CPU. */
             cuvs_circuit_record_status_reason((uint32_t)index_oid,
                                               cuvs_circuit_breaker_threshold,
                                               rc,
@@ -5879,6 +5878,12 @@ cuvs_gettuple(IndexScanDesc scan, ScanDirection dir)
             {
                 case CUVS_STATUS_STALE:
                     cuvs_report_stale(index_oid);
+                    break;
+                case CUVS_STATUS_SEARCH_RETRY:
+                    ereport(ERROR,
+                            (errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+                             errmsg("pg_cuvs: index changed during CAGRA search"),
+                             errhint("Retry the query.")));
                     break;
                 case CUVS_STATUS_METRIC_MISMATCH:
                     /* The index was built with a different metric (e.g. built

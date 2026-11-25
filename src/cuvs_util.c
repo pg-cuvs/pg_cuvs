@@ -248,6 +248,7 @@ cuvs_status_str(int status)
         case CUVS_STATUS_DIM_MISMATCH:   return "dim_mismatch";
         case CUVS_STATUS_METRIC_MISMATCH: return "metric_mismatch";
         case CUVS_STATUS_STALE:          return "stale";
+        case CUVS_STATUS_SEARCH_RETRY:   return "search_retry";
         case CUVS_STATUS_PROTO_MISMATCH: return "proto_mismatch";
         default:                       return "unknown";
     }
@@ -1183,7 +1184,7 @@ find_or_create_breaker(uint32_t index_oid)
 
 /* Statuses that never touch the breaker: success, the caller's own cancel,
  * user/config errors (DIM/METRIC), and states already gated at plan time
- * (STALE, NO_VECTORS). */
+ * (STALE, NO_VECTORS), or a concurrent change that can be retried. */
 static int
 circuit_status_is_counted(int status)
 {
@@ -1192,6 +1193,7 @@ circuit_status_is_counted(int status)
              || status == CUVS_STATUS_DIM_MISMATCH
              || status == CUVS_STATUS_METRIC_MISMATCH
              || status == CUVS_STATUS_STALE
+             || status == CUVS_STATUS_SEARCH_RETRY
              || status == CUVS_STATUS_NO_VECTORS);
 }
 
@@ -1389,7 +1391,7 @@ cuvs_batch_group(const CuvsBatchKey *keys, int n,
                 (keys[i].mode != 0 ||
                  (keys[j].itopk_size == keys[i].itopk_size &&
                   keys[j].search_width == keys[i].search_width &&
-                  keys[j].delta_cpu == keys[i].delta_cpu)))
+                  keys[j].delta_search_mode == keys[i].delta_search_mode)))
             {
                 g = group_id_out[j];
                 break;

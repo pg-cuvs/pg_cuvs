@@ -224,6 +224,7 @@ test_circuit_breaker_status_classification(void)
     cuvs_circuit_record_status(oid, threshold, CUVS_STATUS_DIM_MISMATCH);
     cuvs_circuit_record_status(oid, threshold, CUVS_STATUS_METRIC_MISMATCH);
     cuvs_circuit_record_status(oid, threshold, CUVS_STATUS_STALE);
+    cuvs_circuit_record_status(oid, threshold, CUVS_STATUS_SEARCH_RETRY);
     cuvs_circuit_record_status(oid, threshold, CUVS_STATUS_NO_VECTORS);
 
     /* Then they do not consume the error budget. */
@@ -425,7 +426,7 @@ test_circuit_reason_classification(void)
     {
         const int neutral[] = { CUVS_STATUS_OK, CUVS_STATUS_CANCELED, CUVS_STATUS_DIM_MISMATCH,
                                 CUVS_STATUS_METRIC_MISMATCH, CUVS_STATUS_STALE,
-                                CUVS_STATUS_NO_VECTORS };
+                                CUVS_STATUS_NO_VECTORS, CUVS_STATUS_SEARCH_RETRY };
         cuvs_circuit_reset_all();
         for (size_t i = 0; i < sizeof(neutral) / sizeof(neutral[0]); i++)
             cuvs_circuit_record_status_reason(60, 1, neutral[i], CUVS_ADMISSION_AR1, CB_T0);
@@ -1039,10 +1040,12 @@ test_bf_batch_group(void)
     /* A 4-field positional key means mode=0 (cagra); two of them still group. */
     {
         CuvsBatchKey kz[2] = { {1, 10, 0, 8}, {1, 10, 0, 8, 0} };
-        CuvsBatchKey kc[2] = { {1, 10, 0, 8}, {1, 10, 0, 8, .delta_cpu = 1} };
-        int gc[2], nc;
-        cuvs_batch_group(kc, 2, gc, &nc);
-        ASSERT(nc == 2, "cagra requests with and without the daemon delta merge never share a dispatch");
+        CuvsBatchKey kc[3] = { {1, 10, 0, 8},
+                               {1, 10, 0, 8, .delta_search_mode = CUVS_DELTA_SEARCH_CPU},
+                               {1, 10, 0, 8, .delta_search_mode = CUVS_DELTA_SEARCH_GPU} };
+        int gc[3], nc;
+        cuvs_batch_group(kc, 3, gc, &nc);
+        ASSERT(nc == 3, "cagra delta modes have distinct merge and retry policies");
         int g[2], n = -1;
         cuvs_batch_group(kz, 2, g, &n);
         ASSERT(n == 1, "omitted mode defaults to 0 and still groups");

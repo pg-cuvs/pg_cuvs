@@ -3,6 +3,7 @@
 
 import argparse
 import concurrent.futures
+import fcntl
 import os
 from pathlib import Path
 import struct
@@ -77,25 +78,43 @@ class Fixture:
             os.utime(next_image, ns=(stamp.st_atime_ns, stamp.st_mtime_ns))
         next_image.replace(self.delta)
 
-    def append(self, row, *, publish_header=True):
-        with self.delta.open("r+b") as handle:
-            count = HEADER.unpack(handle.read(HEADER.size))[2]
-            handle.seek(0, os.SEEK_END)
-            handle.write(self.records[row - 901])
-            if publish_header:
-                handle.seek(0)
-                handle.write(self.header_for(count + 1))
 
-    def nearest(self, q, *, table="d", delta_mode="gpu", wait=None, timeout=8):
+    def write_append(self, handle, row):
+        count = HEADER.unpack(handle.read(HEADER.size))[2]
+        handle.seek(0, os.SEEK_END)
+        handle.write(self.records[row - 901])
+        handle.seek(0)
+        handle.write(self.header_for(count + 1))
+        handle.flush()
+        os.fsync(handle.fileno())
+
+    def append(self, row):
+        with self.delta.open("r+b") as handle:
+            fcntl.flock(handle, fcntl.LOCK_EX)
+            self.write_append(handle, row)
+
+    def search(self, q, *, table="d", delta_mode="gpu", wait=None, timeout=15):
         if wait is None:
             wait = self.batch_wait
-        return int(self.sql(
+        settings = (
             "SET enable_seqscan = off; "
             f"SET cuvs.delta_search = '{delta_mode}'; "
             f"SET cuvs.cagra_batch_wait_us = {wait}; "
-            f"SELECT id FROM {self.schema}.{table} ORDER BY v <-> '[{q},1,0,0]'::vector LIMIT 1",
-            timeout=timeout,
-        ))
+        )
+        query = f"SELECT id FROM {self.schema}.{table} ORDER BY v <-> '[{q},1,0,0]'::vector LIMIT 1"
+        result = subprocess.run(
+            ["psql", "-XqAt", "-v", "ON_ERROR_STOP=1", "-v", "VERBOSITY=verbose",
+             "-c", settings, "-c", f"EXPLAIN (COSTS OFF) {query}", "-c", query],
+            capture_output=True, text=True, timeout=timeout,
+        )
+        index = "d_i" if table == "d" else "other_i"
+        assert f"Index Scan using {index} on " in result.stdout, (result.stdout, result.stderr)
+        return result
+
+    def nearest(self, q, **kwargs):
+        result = self.search(q, **kwargs)
+        result.check_returncode()
+        return int(result.stdout.strip().splitlines()[-1])
 
     def stats(self):
         return self.sql(
@@ -103,86 +122,145 @@ class Fixture:
             f"FROM pg_stat_gpu_search WHERE index_oid = '{self.schema}.d_i'::regclass"
         )
 
-    def race(self, phase, query, action):
+    def race(self, phase, query, *actions):
         arm = self.workdir / (phase + ".arm")
         reached = self.workdir / (phase + ".reached")
         arm.touch(exist_ok=False)
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
             search = pool.submit(query)
             try:
-                deadline = time.monotonic() + 5
-                while not reached.exists():
-                    if search.done():
-                        raise AssertionError(f"search returned {search.result()} before {phase} barrier")
-                    if time.monotonic() >= deadline:
-                        raise TimeoutError(f"daemon did not reach {phase} barrier")
-                    time.sleep(0.005)
-                # A different index must finish while this search is still parked.
-                assert self.nearest(100, table="other", wait=0, timeout=2) == 100
-                assert reached.exists() and not search.done()
-                action()
+                for i, action in enumerate(actions):
+                    deadline = time.monotonic() + 5
+                    while not reached.exists():
+                        if search.done():
+                            raise AssertionError(f"search returned {search.result()} before {phase} barrier")
+                        if time.monotonic() >= deadline:
+                            raise TimeoutError(f"daemon did not reach {phase} barrier")
+                        time.sleep(0.005)
+                    assert self.nearest(100, table="other", wait=0, timeout=2) == 100
+                    assert reached.exists() and not search.done()
+                    action()
+                    if i + 1 < len(actions):
+                        arm.touch(exist_ok=False)
+                    reached.unlink(missing_ok=True)
             finally:
                 reached.unlink(missing_ok=True)
                 arm.unlink(missing_ok=True)
             return search.result()
 
-    def run(self):
+    def writer_lock(self):
         self.replace(901)
         assert self.nearest(900) == 901
         self.append(902)
+        with self.delta.open("r+b") as writer:
+            fcntl.flock(writer, fcntl.LOCK_EX)
 
-        def competing_publish():
-            self.append(903)
+            def publish():
+                read_arm = self.workdir / "read.arm"
+                read_reached = self.workdir / "read.reached"
+                read_arm.touch(exist_ok=False)
+                (self.workdir / "wait-file-lock.reached").unlink()
+                try:
+                    assert self.nearest(100, table="other", wait=0, timeout=2) == 100
+                    deadline = time.monotonic() + 0.1
+                    while time.monotonic() < deadline:
+                        assert not read_reached.exists(), "reader ignored LOCK_EX"
+                        time.sleep(0.005)
+                    read_arm.unlink()
+                    self.write_append(writer, 903)
+                finally:
+                    read_arm.unlink(missing_ok=True)
+                    read_reached.unlink(missing_ok=True)
+                    fcntl.flock(writer, fcntl.LOCK_UN)
+
+            # All three heap rows committed during setup, before this query's
+            # snapshot. The daemon must read the completed append after LOCK_SH.
+            assert self.race("wait-file-lock", lambda: self.nearest(990), publish) == 903
+
+    def competing_publish(self):
+        self.replace(901, 902)
+
+        def publish():
+            self.replace(901, 902, 903)
             assert self.nearest(990, wait=0, timeout=2) == 903
 
-        assert self.race("read", lambda: self.nearest(990), competing_publish) == 903
+        assert self.race("read", lambda: self.nearest(990), publish) == 903
 
+    def delta_replace(self):
         self.replace(901, 902)
         assert self.race("read", lambda: self.nearest(990),
                          lambda: self.replace(901, 903, keep_mtime=True)) == 903
 
+    def delta_truncate(self):
         self.replace(901, 902, 903)
-        assert self.race("read", lambda: self.nearest(990),
-                         lambda: self.delta.write_bytes(self.image(901, 902))) == 902
 
+        def truncate_in_place():
+            # A non-cooperating file rewrite, while the reader holds LOCK_SH.
+            inode = self.delta.stat().st_ino
+            self.delta.write_bytes(self.image(901, 902))
+            assert self.delta.stat().st_ino == inode
+
+        assert self.race("read", lambda: self.nearest(990), truncate_in_place) == 902
+
+    def late_header(self):
         self.replace(901, 902)
         merged_before = self.stats().split()[1]
-        assert self.race("read", lambda: self.nearest(990),
-                         lambda: self.append(903, publish_header=False)) == 200
+
+        def incomplete_replacement():
+            next_image = self.delta.with_suffix(".test-next")
+            next_image.write_bytes(self.image(901, 902) + self.records[2])
+            next_image.replace(self.delta)
+
+        assert self.race("read", lambda: self.nearest(990), incomplete_replacement) == 200
         assert self.stats().split()[1] == merged_before
         with self.delta.open("r+b") as handle:
+            fcntl.flock(handle, fcntl.LOCK_EX)
             handle.write(self.header_for(3))
         assert self.nearest(990) == 903
 
+    def generation_change(self, *, warm):
+        self.replace(901, 902)
+        if warm:
+            assert self.nearest(950) == 902
         tids_image = self.tids.read_bytes()
         wrong_crc = struct.unpack_from("<I", tids_image, 24)[0] ^ 1
 
         def change_generation():
-            with self.tids.open("r+b") as handle:
-                handle.seek(24)
-                handle.write(struct.pack("<I", wrong_crc))
+            replacement = self.tids.with_suffix(".test-next")
+            changed = bytearray(tids_image)
+            struct.pack_into("<I", changed, 24, wrong_crc)
+            replacement.write_bytes(changed)
+            replacement.replace(self.tids)
 
-        self.replace(901, 902)
+        phase = "request" if warm else "read"
         try:
             merged_before = self.stats().split()[1]
-            assert self.race("read", lambda: self.nearest(950), change_generation) == 200
+            assert self.race(phase, lambda: self.nearest(950), change_generation) == 200
             assert self.stats().split()[1] == merged_before
         finally:
             self.tids.write_bytes(tids_image)
         assert self.nearest(950) == 902
 
-        def reload():
-            assert self.sql(f"SELECT pg_cuvs_unload('{self.schema}.d_i')").startswith("unloaded")
-            self.sql(f"SELECT pg_cuvs_load('{self.schema}.d_i')")
+    def unload(self):
+        assert self.sql(f"SELECT pg_cuvs_unload('{self.schema}.d_i')").startswith("unloaded")
 
+    def reload(self):
+        self.unload()
+        self.sql(f"SELECT pg_cuvs_load('{self.schema}.d_i')")
+
+    def reload_read(self):
         self.replace(901, 902)
-        assert self.race("read", lambda: self.nearest(950), reload) == 902
+        assert self.race("read", lambda: self.nearest(950), self.reload) == 902
+
+    def reload_score(self):
         self.replace(901)
         assert self.nearest(900) == 901
         self.append(902)
-        assert self.race("score", lambda: self.nearest(950), reload) == 902
+        assert self.race("score", lambda: self.nearest(950), self.reload) == 902
         assert self.stats().split() == ["0", "0", "0"]
 
+    def auto_fallback(self):
+        self.reload()
         self.replace(901, 902, 903)
         self.sql("SELECT pg_cuvs_set_vram_budget(1)")
         try:
@@ -193,22 +271,83 @@ class Fixture:
         finally:
             self.sql("SELECT pg_cuvs_set_vram_budget(0)")
 
+    @staticmethod
+    def expect_sqlstate(result, code):
+        assert result.returncode != 0 and f":  {code}:" in result.stderr, (
+            result.stdout, result.stderr
+        )
+
+    def repeated_replacement(self):
+        self.replace(901, 902, 903)
+        action = lambda: self.replace(901, 902, 903)
+        result = self.race("read", lambda: self.search(990), action, action, action)
+        self.expect_sqlstate(result, "40001")
+        assert self.nearest(990) == 903
+
+    def unload_without_files(self):
+        self.replace(901, 902)
+        parked_tids = self.tids.with_suffix(".test-parked")
+
+        def unload():
+            self.unload()
+            self.tids.rename(parked_tids)
+
+        try:
+            result = self.race("read", lambda: self.search(950), unload)
+            self.expect_sqlstate(result, "40001")
+        finally:
+            if parked_tids.exists():
+                parked_tids.replace(self.tids)
+        assert self.nearest(950) == 902
+
+    def stale_after_read(self):
+        self.replace(901, 902)
+        result = self.race("read", lambda: self.search(950), lambda: self.sql(
+            "SET cuvs.max_delta_rows = 0; "
+            f"INSERT INTO {self.schema}.d VALUES (904, '[1000,1,0,0]')"
+        ))
+        self.expect_sqlstate(result, "55000")
+        assert "is stale" in result.stderr
+
+    def cases(self):
+        return {
+            "writer-lock": self.writer_lock,
+            "competing-publish": self.competing_publish,
+            "delta-replace": self.delta_replace,
+            "delta-truncate": self.delta_truncate,
+            "late-header": self.late_header,
+            "tids-during-read": lambda: self.generation_change(warm=False),
+            "tids-warm": lambda: self.generation_change(warm=True),
+            "reload-read": self.reload_read,
+            "reload-score": self.reload_score,
+            "auto-fallback": self.auto_fallback,
+            "repeated-replacement": self.repeated_replacement,
+            "unload-without-files": self.unload_without_files,
+            "stale-after-read": self.stale_after_read,
+        }
+
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--barrier-dir", type=Path, required=True)
     parser.add_argument("--index-dir", type=Path, required=True)
     parser.add_argument("--mode", choices=("immediate", "sharded", "microbatch"), required=True)
+    parser.add_argument("--case", action="append", help="run a named case, repeatable")
     args = parser.parse_args()
     if os.environ.get("PGCUVS_DISPOSABLE_CLUSTER") != "1":
         parser.error("set PGCUVS_DISPOSABLE_CLUSTER=1 for the isolated test cluster")
     fixture = Fixture(args.barrier_dir, args.index_dir, args.mode)
+    cases = fixture.cases()
+    selected = args.case or list(cases)
+    if any(name not in cases for name in selected):
+        parser.error("available cases: " + ", ".join(cases))
     try:
         fixture.setup()
-        fixture.run()
+        for name in selected:
+            cases[name]()
+            print(f"{args.mode}/{name}: passed", flush=True)
     finally:
         fixture.sql(f"DROP SCHEMA IF EXISTS {fixture.schema} CASCADE")
-    print(f"{args.mode}: file races, unlocked tail, reload and auto-mode merge passed")
 
 
 if __name__ == "__main__":

@@ -389,6 +389,7 @@ int cuvs_ipc_page_fold_result(const char *socket_path, const CuvsPageFoldEvent *
 #define CUVS_EXTRA_SEARCH_BUDGET      23
 #define CUVS_EXTRA_SEARCH_DEADLINE    24
 #define CUVS_EXTRA_SEARCH_ANN_FAILED  25 /* initial ANN ran and failed */
+#define CUVS_STATUS_SEARCH_RETRY      26 /* index changed during CAGRA search */
 
 /* ----------------------------------------------------------------
  * Command frame (sent over UDS, fixed size)
