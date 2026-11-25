@@ -2169,7 +2169,7 @@ hnsw_file_tid_result(int graph_fd, int tids_fd, const uint64_t *tids,
     if (members == NULL)
         return HNSW_SOURCE_TIDS_UNIQUE;
     if (!hnsw_file_preflight(graph_fd, tids_fd, n, dim, tids_header->metric,
-                             bytes_per_dim, false, &header, NULL, NULL, NULL,
+                             bytes_per_dim, false, 0, &header, NULL, NULL, NULL,
                              hnsw_pg_check_interrupts, error, sizeof(error)))
         ereport(ERROR, (errmsg("pg_cuvs: cannot validate duplicate source entries: %s", error)));
 
