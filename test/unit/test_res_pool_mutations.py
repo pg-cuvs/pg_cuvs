@@ -24,6 +24,16 @@ BEHAVIOUR = [
      '    std::unique_ptr<Res> res;\n    std::unique_ptr<Stream> stream;'),
     ('mode_switch_after_use', 'cuvs_res_pool.hpp',
      '        if (acquired_ && on != dedicated_) return -1;\n', ''),
+    ('retirement_drops_the_stream', 'cuvs_res_pool.hpp',
+     '        if (!slot->stream) return;', '        return;'),
+    ('retired_stream_destroyed_at_teardown', 'cuvs_res_pool.hpp',
+     '        if (stream_retired) (void)stream.release();', ''),
+    ('reuse_without_readiness', 'cuvs_res_pool.hpp',
+     '        if (slot && !Traits::stream_ready(slot->stream.get()))', '        if (false)'),
+    ('retired_stream_never_reused', 'cuvs_res_pool.hpp',
+     '            slot = take_retired_locked();\n', ''),
+    ('rebuild_failure_drops_the_stream', 'cuvs_res_pool.hpp',
+     '            if (recycled) retire(std::move(slot));', '            if (recycled) slot.reset();'),
 ]
 
 
@@ -34,7 +44,8 @@ def wiring(w, s, sh):
     assert ': std::make_unique<Res>()' in traits, 'OFF_IS_PER_THREAD_DEFAULT'
     assert 'return g_device_pools[device_id].acquire();' in w, 'ACQUIRE_FROM_POOL'
     destructor = w[w.index('~PooledRes()'):w.index('raft::device_resources &get()')]
-    assert 'if (r && !poisoned) release_res(dev, std::move(r));' in destructor, 'POISON_DESTROYS'
+    assert 'if (r && !poisoned) release_res(dev, std::move(r));' in destructor, 'POOL_HEALTHY_HANDLES'
+    assert 'else if (r) g_device_pools[dev].retire(std::move(r));' in destructor, 'POISON_RETIRES'
     assert 'raft::device_resources &get() { return *r->res; }' in w, 'GET_SLOT_RES'
     main = s[s.index('\nmain(int argc'):]
     a = main.index('cuvs_rmm_set_dedicated_stream(g_rmm_dedicated_stream)')
@@ -46,6 +57,7 @@ def wiring(w, s, sh):
 SOURCE = [
     ('traits_ignore_stream', 'w', 'stream ? std::make_unique<Res>(stream->view()) : std::make_unique<Res>()', 'std::make_unique<Res>()'),
     ('poisoned_slot_pooled', 'w', 'if (r && !poisoned) release_res(dev, std::move(r));', 'if (r) release_res(dev, std::move(r));'),
+    ('poisoned_slot_destroyed', 'w', 'else if (r) g_device_pools[dev].retire(std::move(r));', 'else if (r) r.reset();'),
     ('mode_set_after_pool_init', 's', '    /* Before the pool, probes, loads and warmup acquire any RAFT resource. */\n    if (cuvs_rmm_set_dedicated_stream(g_rmm_dedicated_stream) != 0)',
      '    if (0)'),
     ('daemon_default_off', 's', 'static int g_rmm_dedicated_stream = CUVS_RMM_DEDICATED_STREAM_DEFAULT;', 'static int g_rmm_dedicated_stream = 0;'),
