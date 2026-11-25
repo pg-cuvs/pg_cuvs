@@ -21,6 +21,6 @@ typedef struct CuvsHnswBuildResult {
 
 void cuvs_build_hnsw_from_heap(Relation heapRel, Relation indexRel,
     IndexInfo *indexInfo, const char *mode, uint32_t build_algo,
-    uint32_t ef_construction, CuvsHnswBuildResult *out);
+    uint32_t ef_construction, uint32_t m, CuvsHnswBuildResult *out);
 
 #endif

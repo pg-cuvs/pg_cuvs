@@ -621,9 +621,58 @@ force exact heap search.
 |-----------|------|---------|--------|-------|
 | `source` | string | `` | a legacy `cagra` index name on the same table | empty = private direct HNSW file build from the heap (op23), without a persistent CAGRA index |
 | `mode` | string | `nsw` | `nsw`, `hnswlib`, `hnsw`, `hnswlib_file` | `nsw` and `hnswlib` are recommended. With `source`, `nsw` and `hnsw` give the same graph: level 0 from the CAGRA graph and upper layers built by the daemon on the host. Since 0.9.3 this path checks the pgvector version as the heap build does (outside the supported range is an error, not a warning) |
-| `m` | int | `16` | 2–100 | pgvector maintenance fallback uses this value. Imported graphs use the source graph degree |
-| `ef_construction` | int | `64` | 4–1000 | Sets construction effort for direct heap builds. A legacy CAGRA conversion records it in the target metapage. pgvector maintenance fallback uses at least `2 * m`. |
+| `m` | int | `32` | 2–100 | Heap builds use `m` as the HNSW neighbor capacity, including the pgvector maintenance fallback of a source index. With `source`, the converted graph supplies M. A differing explicit value produces a warning. |
+| `ef_construction` | int | `64` | 4–1000 | Sets construction effort for direct heap builds. The build records the configured value in the index metapage. A conversion from a legacy CAGRA index uses the option only for that metapage value during the build. pgvector maintenance fallback uses at least `2 * m`. |
 | `build_algo` | enum | `auto` | `auto`, `ivf_pq`, `nn_descent`, `ace` | Direct heap build only; cannot be combined with explicit `source` |
+
+A heap build reserves `m` neighbors per upper layer and 2 × `m` at level 0. The metapage records
+`m`, which later inserts use. The GPU requests degree 2 × `m` and reduces it for small inputs.
+`pg_cuvs_hnsw_build_info()` reports the constructed graph width as `graph_degree` and adds
+`graph_degree_limited_by: "input_rows"` when that width was reduced. Tiny graphs may include
+padding in their serialized width. The daemon removes that padding from the serialized neighbor counts before import.
+Choose `m` above 3 for general use. Values 2 and 3 substantially lowered recall in a 5,000-row
+test (128 dimensions), and quality depends on the data.
+
+In source modes `nsw` and `hnsw`, the converter caps the CAGRA degree at 64 and rounds it down
+to an even number, then divides by two. Modes `hnswlib` and `hnswlib_file` read M from the SDK
+or file header. Omit `m` to inherit that value, including an existing header with M above 32.
+A differing explicit `m` produces one warning per build and the build uses the graph's M.
+The explicit value still applies when maintenance rebuilds the index from the heap through
+pgvector, so the index then has that M.
+Use `(pg_cuvs_hnsw_layer_counts('index_name')).m` to see the built value.
+`ALTER INDEX ... SET (m = ...)` changes the stored option without rebuilding the index. The new
+setting applies on the next `REINDEX` or other rebuild.
+Use `ALTER INDEX ... RESET (m)` to restore the default for a future heap build or inherit M on the
+next source conversion.
+
+An `m` stored on an existing heap-built index by an earlier release starts
+affecting its graph on the next rebuild, including a restore. A heap build without
+an explicit `m` on a table with 1–64 rows now stores M 32 and reserves slots
+for it. The graph itself can still use its smaller width from the row count.
+
+The query below finds valid heap-built indexes whose explicit option differs
+from the M they currently store. It reads index pages through
+`pg_cuvs_hnsw_layer_counts` and requires SELECT on those tables.
+
+```sql
+WITH heap_indexes AS MATERIALIZED (
+    SELECT c.oid::regclass AS index_name, opt.option_value::integer AS configured_m
+    FROM pg_class c
+    JOIN pg_am a ON a.oid = c.relam
+    JOIN pg_index i ON i.indexrelid = c.oid
+    CROSS JOIN LATERAL pg_options_to_table(c.reloptions) opt
+    WHERE a.amname = 'pg_cuvs_hnsw' AND c.relkind = 'i' AND i.indisvalid AND i.indisready
+      AND opt.option_name = 'm'
+      AND NOT EXISTS (
+          SELECT FROM pg_options_to_table(c.reloptions) src
+          WHERE src.option_name = 'source' AND src.option_value <> ''
+      )
+), sizes AS MATERIALIZED (
+    SELECT index_name, configured_m, (pg_cuvs_hnsw_layer_counts(index_name)).m AS built_m
+    FROM heap_indexes
+)
+SELECT * FROM sizes WHERE configured_m IS DISTINCT FROM built_m;
+```
 
 For later inserts, pgvector reads `ef_construction` from the index reloption.
 `ALTER INDEX … SET (ef_construction = …)` changes that option for subsequent
@@ -737,14 +786,15 @@ tablespace needs a further `n × dim × 4` bytes for the input spool. The `[hnsw
 line then has `status=5` and still names the decided route (`route=none` only when no
 route was decided, such as an over-budget refusal).
 
-`m` remains informational. With the default `ef_construction = 64`, direct builds use
-a planned intermediate width of 128 before the row-count adjustment, and an
-hnswlib serialization EF of 200. The tiny route uses its own graph width. The
+Direct `ef_construction` scales the planned intermediate width from 4 × `m` before the
+row-count adjustment and the hnswlib serialization EF from 200 at the default 64.
+The tiny route uses its own graph width. The
 `hierarchy_ef_construction` receipt field reports the value read from that serialized
 file. The GPU upper-graph builder takes its neighbors and budgets through the SDK.
-Heap builds cap the intermediate width at the SDK limit of 1024. A build that reaches that ceiling
-with a higher requested width issues a NOTICE. Under `--hnsw-ace-build-quality auto`,
-the default ACE effort is 240 (20 NN-descent iterations per small partition with
+Heap builds cap the intermediate width at the SDK limit of 1024. With the default `m = 32`,
+a build that reaches that ceiling with a higher requested width issues a NOTICE.
+Under `--hnsw-ace-build-quality auto`,
+the ACE effort scales from 240 at the default 64 (20 NN-descent iterations per small partition with
 cuVS 26.04). ACE indexes also record a partition-builder
 readback computed from the pinned SDK policy (`ace_build_quality`, `ace_local_intermediate_degree` = 3 × (graph_degree / 2),
 `ace_local_nn_descent_iterations`); the receipt's `intermediate_degree` is the resident width

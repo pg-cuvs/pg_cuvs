@@ -38,7 +38,7 @@ static void appendStringInfo(Buffer *p, const char *fmt, ...) {
     assert(n >= 0 && (size_t)n < sizeof(p->data) - p->len); p->len += (size_t)n;
 }
 static void appendStringInfoString(Buffer *p, const char *s) { appendStringInfo(p, "%s", s); }
-static Buffer render(CuvsHnswPolicy policy, CuvsHnswPolicyReadStatus ace_status, CuvsHnswAceReadback ace) {
+static Buffer render(CuvsHnswPolicy policy, CuvsHnswPolicyReadStatus ace_status, CuvsHnswAceReadback ace, uint16_t meta_m) {
     Buffer json = {{0}, 0};
 '''
 SUFFIX = r'''
@@ -53,7 +53,7 @@ static CuvsHnswPolicy receipt(uint32_t route, uint64_t rows, uint32_t partitions
     p.partitions = route == CUVS_HNSW_ROUTE_ACE ? partitions : 0; p.route_flags = flags;
     return p;
 }
-static Buffer stored(uint32_t route, uint64_t rows, uint32_t partitions, uint32_t flags, int tail) {
+static Buffer stored(uint32_t route, uint64_t rows, uint32_t partitions, uint32_t flags, int tail, uint16_t meta_m) {
     CuvsHnswPolicy p = receipt(route, rows, partitions, flags), out;
     CuvsHnswAceReadback r, got = {0};
     unsigned char page[sizeof(CuvsHnswPolicy) + sizeof(CuvsHnswAceReadback)];
@@ -63,38 +63,42 @@ static Buffer stored(uint32_t route, uint64_t rows, uint32_t partitions, uint32_
     assert(cuvs_hnsw_policy_read(page, sizeof(p), &out) == CUVS_HNSW_POLICY_RECORDED);
     if (route == CUVS_HNSW_ROUTE_ACE && tail)
         ace_status = cuvs_hnsw_ace_readback_read(page + sizeof(p), sizeof(r), &out, &got);
-    return render(out, ace_status, got);
+    return render(out, ace_status, got, meta_m);
 }
 #define HAS(b, s) do { if (!strstr((b).data, (s))) { fprintf(stderr, "missing %s in %s\n", (s), (b).data); return 2; } } while (0)
 #define LACKS(b, s) do { if (strstr((b).data, (s))) { fprintf(stderr, "unexpected %s in %s\n", (s), (b).data); return 2; } } while (0)
 int main(void) {
     const uint32_t F = CUVS_HNSW_ROUTE_FLAG_ACE_PARTITIONS_REQUESTED;
     /* Receipt of a build with the planner (no mark): as before the mark existed. */
-    Buffer b = stored(CUVS_HNSW_ROUTE_ACE, 999000, 2, 0, 1);
+    Buffer b = stored(CUVS_HNSW_ROUTE_ACE, 999000, 2, 0, 1, 32);
     HAS(b, "\"ace_partitions\":2,\"ace_partitions_origin\":\"same_SDK_stable_explicit_plan\"");
     HAS(b, "\"ace_local_nn_descent_iterations\":20");
-    b = stored(CUVS_HNSW_ROUTE_ACE, 1000000, 2, 0, 1);
+    b = stored(CUVS_HNSW_ROUTE_ACE, 1000000, 2, 0, 1, 32);
     HAS(b, "\"ace_partitions_origin\":\"same_SDK_stable_explicit_plan\"");
     HAS(b, "\"ace_local_nn_descent_iterations\":20");
     /* Without the planner: the count is the requested one. */
-    b = stored(CUVS_HNSW_ROUTE_ACE, 999000, 2, F, 1);
+    b = stored(CUVS_HNSW_ROUTE_ACE, 999000, 2, F, 1, 32);
     HAS(b, "\"ace_partitions\":2,\"ace_partitions_origin\":\"requested_effective_not_guaranteed\"");
     LACKS(b, "same_SDK_stable_explicit_plan");
     HAS(b, "\"ace_local_nn_descent_iterations\":20");           /* under 1e6 rows: independent of the count */
-    b = stored(CUVS_HNSW_ROUTE_ACE, 1000000, 2, F, 1);
+    b = stored(CUVS_HNSW_ROUTE_ACE, 1000000, 2, F, 1, 32);
     HAS(b, "\"ace_partitions_origin\":\"requested_effective_not_guaranteed\"");
     HAS(b, "\"ace_local_nn_descent_iterations\":\"not_guaranteed\"");
     LACKS(b, "\"ace_local_nn_descent_iterations\":20");
-    b = stored(CUVS_HNSW_ROUTE_ACE, 3000000, 4, F, 1);
+    b = stored(CUVS_HNSW_ROUTE_ACE, 3000000, 4, F, 1, 32);
     HAS(b, "\"ace_local_nn_descent_iterations\":\"varies_by_partition\"");
-    b = stored(CUVS_HNSW_ROUTE_ACE, 1000000, 2, F, 0);          /* an index that has no readback tail */
+    b = stored(CUVS_HNSW_ROUTE_ACE, 1000000, 2, F, 0, 32);          /* an index that has no readback tail */
     HAS(b, "\"ace_partitions_origin\":\"requested_effective_not_guaranteed\"");
     HAS(b, "\"ace_readback\":\"not_recorded\"");
     LACKS(b, "ace_local_nn_descent_iterations");
     /* Off the ACE route there is nothing to say. */
-    b = stored(CUVS_HNSW_ROUTE_IVF_PQ, 999000, 0, 0, 0);
+    b = stored(CUVS_HNSW_ROUTE_IVF_PQ, 999000, 0, 0, 0, 32);
     HAS(b, "\"ace_partitions_origin\":\"not_applicable\"");
     HAS(b, "\"ace_readback\":\"not_applicable\"");
+    LACKS(b, "graph_degree_limited_by");
+    /* Width 64 fits 65 rows; the metapage reserves slots for requested M 48. */
+    b = stored(CUVS_HNSW_ROUTE_IVF_PQ, 65, 0, 0, 0, 48);
+    HAS(b, "\"graph_degree_limited_by\":\"input_rows\"");
     puts("ACE build_info JSON: planner receipt unchanged, requested-only receipt marked, exact iterations withheld from 1e6 rows: PASS (CPU fixture)");
     return 0;
 }
@@ -117,6 +121,8 @@ def run(source_text, label):
 MUTANTS = [
     ('fixed_origin', '        cuvs_hnsw_ace_partitions_origin(&policy),\n',
      '        policy.route == CUVS_HNSW_ROUTE_ACE ? "same_SDK_stable_explicit_plan" : "not_applicable",\n'),
+    ('marks_uncapped_degree', '    if (policy.degree < 2u * meta_m)',
+     '    if (policy.degree <= 2u * meta_m)'),
     ('iterations_always_exact', '        if (!cuvs_hnsw_ace_iterations_guaranteed(&policy, &ace))',
      '        if (0)'),
 ]
