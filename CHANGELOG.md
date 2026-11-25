@@ -95,6 +95,9 @@ exists for 0.9.0.
   the index reloption. Heap builds cap the intermediate graph width at the
   SDK limit of 1024 and emit a NOTICE when a higher request yields that width.
   The build receipt reports the serialized hnswlib EF separately.
+  An existing explicit `ef_construction` setting now takes effect on the next
+  direct heap build or `REINDEX`, which can change build time and the resulting
+  graph.
 
 - `CREATE INDEX CONCURRENTLY ... USING pg_cuvs_hnsw` and `REINDEX INDEX CONCURRENTLY` of a `pg_cuvs_hnsw` index
   built from the heap (without `source`) no longer make the table's queries wait for a lock. The build opened the
