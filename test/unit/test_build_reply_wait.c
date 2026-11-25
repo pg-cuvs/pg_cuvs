@@ -51,6 +51,23 @@ static int cb_calls;
 static int cancel_after;
 static int cancel_on_nonce;
 
+#ifdef CUVS_TEST_BUILD_REPLY_CLOCK
+static int advance_reply_clock;
+static _Thread_local int clock_offset_sec;
+
+int __real_clock_gettime(clockid_t clock_id, struct timespec *ts);
+
+int
+__wrap_clock_gettime(clockid_t clock_id, struct timespec *ts)
+{
+    int rc = __real_clock_gettime(clock_id, ts);
+
+    if (rc == 0 && clock_id == CLOCK_MONOTONIC)
+        ts->tv_sec += clock_offset_sec;
+    return rc;
+}
+#endif
+
 static void
 check(const char *op, const char *label, long actual, long expected)
 {
@@ -67,6 +84,11 @@ wait_cb(void)
     /* The saved notice is visible on this thread after the header is read. */
     if (cancel_on_nonce && strcmp(cuvs_ipc_last_notice_out(), build_notice) != 0)
         return 0;
+#ifdef CUVS_TEST_BUILD_REPLY_CLOCK
+    /* The deadline clock has started and the request is sent. Advance only
+     * the client clock. The mock's socket and sleep still use real time. */
+    clock_offset_sec = advance_reply_clock;
+#endif
     cb_calls++;
     return cancel_after > 0 && cb_calls >= cancel_after;
 }
@@ -175,7 +197,7 @@ call_op(enum BuildOp op, const char *path, uint64_t *nonce_out)
 }
 
 static void
-run_case(enum BuildOp op, const char *path, enum ReplyMode mode)
+run_case(enum BuildOp op, const char *path, enum ReplyMode mode, int advance_seconds)
 {
     Mock mock = {.listener = socket(AF_UNIX, SOCK_STREAM, 0), .op = op, .mode = mode};
     struct sockaddr_un addr = {.sun_family = AF_UNIX};
@@ -194,9 +216,16 @@ run_case(enum BuildOp op, const char *path, enum ReplyMode mode)
 
     cb_calls = 0;
     cancel_on_nonce = mode == NONCE_SILENT;
-    cancel_after = mode == SILENT || mode == NONCE_SILENT ? 3 : 0;
+    cancel_after = (mode == SILENT || mode == NONCE_SILENT) && !advance_seconds ? 3 : 0;
+#ifdef CUVS_TEST_BUILD_REPLY_CLOCK
+    advance_reply_clock = advance_seconds;
+#endif
     start = mono_ms();
     rc = call_op(op, path, &nonce);
+#ifdef CUVS_TEST_BUILD_REPLY_CLOCK
+    clock_offset_sec = 0;
+    advance_reply_clock = 0;
+#endif
     elapsed = mono_ms() - start;
     pthread_join(thread, NULL);
     close(mock.listener);
@@ -214,6 +243,13 @@ run_case(enum BuildOp op, const char *path, enum ReplyMode mode)
             break;
         case SILENT:
         case NONCE_SILENT:
+            if (advance_seconds)
+            {
+                check(op_names[op], "deadline exceeded on the client clock", rc, CUVS_STATUS_ERROR);
+                check(op_names[op], "deadline completed before mock timeout",
+                      elapsed < PROMPT_LIMIT_MS, 1);
+                break;
+            }
             check(op_names[op], mode == SILENT ? "reply cancel status" : "nonce cancel status",
                   rc, CUVS_STATUS_CANCELED);
             check(op_names[op], "cancel completed before mock timeout", elapsed < PROMPT_LIMIT_MS, 1);
@@ -228,11 +264,19 @@ run_case(enum BuildOp op, const char *path, enum ReplyMode mode)
 }
 
 int
-main(void)
+main(int argc, char **argv)
 {
     char dir[] = "/tmp/pgcuvs-bw-XXXXXX";
     char path[sizeof(dir) + sizeof("/mock.sock")];
+    int deadline_only = 0;
 
+#ifdef CUVS_TEST_BUILD_REPLY_CLOCK
+    deadline_only = argc == 2 && strcmp(argv[1], "--deadline") == 0;
+#else
+    (void) argv;
+#endif
+    if (argc != 1 && !deadline_only)
+        return EXIT_FAILURE;
     if (mkdtemp(dir) == NULL)
     {
         perror("mkdtemp");
@@ -243,30 +287,38 @@ main(void)
     alarm(90);
     cuvs_ipc_set_wait_callback(wait_cb);
 
-    for (enum BuildOp op = BUILD; op < BUILD_COUNT; op++)
+    if (deadline_only)
     {
-#ifdef __APPLE__
-        /* IVF-PQ stages a named shm key longer than the macOS name limit. */
-        if (op == BUILD_IVFPQ)
-        {
-            puts("SKIP BUILD_IVFPQ on macOS (named-shm key length)");
-            continue;
-        }
-#endif
-        uint64_t nonce = 0;
-
-        run_case(op, path, LATE_OK);
-        run_case(op, path, SILENT);
-        run_case(op, path, PEER_LOST);
-
-        cancel_after = 0;
-        check(op_names[op], "no listener", call_op(op, path, &nonce), CUVS_STATUS_UNAVAILABLE);
-        cb_calls = 0;
-        cancel_after = 1;
-        check(op_names[op], "connect cancel status", call_op(op, path, &nonce), CUVS_STATUS_CANCELED);
+        run_case(BUILD, path, LATE_OK, 601);
+        run_case(BUILD, path, SILENT, 86401);
     }
-    run_case(BUILD_PAGES, path, NONCE_SILENT);
-    run_case(BUILD_PAGES, path, NONCE_TRUNCATED);
+    else
+    {
+        for (enum BuildOp op = BUILD; op < BUILD_COUNT; op++)
+        {
+#ifdef __APPLE__
+            /* IVF-PQ stages a named shm key longer than the macOS name limit. */
+            if (op == BUILD_IVFPQ)
+            {
+                puts("SKIP BUILD_IVFPQ on macOS (named-shm key length)");
+                continue;
+            }
+#endif
+            uint64_t nonce = 0;
+
+            run_case(op, path, LATE_OK, 0);
+            run_case(op, path, SILENT, 0);
+            run_case(op, path, PEER_LOST, 0);
+
+            cancel_after = 0;
+            check(op_names[op], "no listener", call_op(op, path, &nonce), CUVS_STATUS_UNAVAILABLE);
+            cb_calls = 0;
+            cancel_after = 1;
+            check(op_names[op], "connect cancel status", call_op(op, path, &nonce), CUVS_STATUS_CANCELED);
+        }
+        run_case(BUILD_PAGES, path, NONCE_SILENT, 0);
+        run_case(BUILD_PAGES, path, NONCE_TRUNCATED, 0);
+    }
     alarm(0);
     rmdir(dir);
 
@@ -275,6 +327,7 @@ main(void)
         fprintf(stderr, "test_build_reply_wait: %d failure(s)\n", failures);
         return EXIT_FAILURE;
     }
-    puts("test_build_reply_wait: all checks passed");
+    puts(deadline_only ? "test_build_reply_wait: deadline checks passed" :
+                         "test_build_reply_wait: all checks passed");
     return EXIT_SUCCESS;
 }

@@ -693,16 +693,27 @@ test-admission-ipc: test/unit/test_admission_ipc.c src/cuvs_ipc.c src/cuvs_ipc.h
 	./$@
 
 # BUILD reply waits against a mock daemon, including cancellation and peer loss.
+ifeq ($(shell uname -s),Linux)
+BUILD_REPLY_CLOCK_FLAGS := -DCUVS_TEST_BUILD_REPLY_CLOCK -Wl,--wrap=clock_gettime
+endif
 test-unit: test-build-reply-wait
 test-build-reply-wait: test/unit/test_build_reply_wait.c src/cuvs_ipc.c src/cuvs_ipc.h \
                        src/cuvs_util.c src/cuvs_build_corpus.c $(wildcard src/*.h)
-	$(CC) -std=gnu11 -Wall -Wextra -Werror $(ADMISSION_TEST_SAN) -I src -o $@ \
+	$(CC) -std=gnu11 -Wall -Wextra -Werror $(ADMISSION_TEST_SAN) $(BUILD_REPLY_CLOCK_FLAGS) -I src -o $@ \
 		test/unit/test_build_reply_wait.c src/cuvs_ipc.c src/cuvs_util.c src/cuvs_build_corpus.c \
 		-lpthread -lm $(TEST_RT_LIB)
 	./$@
+ifeq ($(shell uname -s),Linux)
+	./$@ --deadline
+endif
 
 EXTRA_CLEAN += test-build-reply-wait
 .PHONY: test-build-reply-wait
+
+# Private PostgreSQL cluster with the installed CPU-shim extension.
+.PHONY: test-build-publication
+test-build-publication: server-test
+	python3 -B test/unit/test_build_publication.py "$(PG_CONFIG)" "./$(SERVER_TEST_BIN)" "$(CC)"
 
 test-unit: test-extra-search-ipc
 test-extra-search-ipc: test/unit/test_extra_search_ipc.c src/cuvs_ipc.c src/cuvs_ipc.h \

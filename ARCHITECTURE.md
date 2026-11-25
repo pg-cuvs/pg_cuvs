@@ -257,8 +257,13 @@ in `pg_stat_gpu_fallback`; daemon replies are recorded in `pg_stat_gpu_search`.
   and poll the same callback. The success nonce for page-format BUILD has its own
   600-second deadline and also checks for cancellation. The backend closes the
   connection and raises the PostgreSQL interrupt on cancellation. GPU work already
-  underway can continue and hold its reservation until it finishes. A peer close
-  before the complete reply yields a BUILD error.
+  underway can continue and hold its reservation until it finishes. Before
+  replacing OID-keyed legacy artifacts, the daemon checks for disconnect under
+  the same mutex that orders EXTEND. A disconnect observed there discards the
+  new build. After that check, disk and registry publication finish under the
+  mutex before a later EXTEND can run. Page BUILD uses separate incarnation
+  artifacts and PostgreSQL publishes their identity. A peer close before the
+  complete reply yields a BUILD error.
 - **Connect (#224):** each request opens its own connection. A `connect()` that waits for
   room in the daemon's listen backlog waits in 250 ms slices and is retried after a signal
   or an expired slice, within the call's timeout (30 s for SEARCH and 600 s for BUILD).

@@ -7681,6 +7681,28 @@ objstore_upload_sharded_thread(void *arg)
     return NULL;
 }
 
+/* Call with g_index_mutex held immediately before publishing OID-keyed
+ * artifacts. The backend closes its socket before unwinding a canceled DDL.
+ * If a later EXTEND already ran, we must see that close here. If publication
+ * wins this check, hold the mutex through disk and registry publication so
+ * a later EXTEND cannot run against the displaced entry. */
+static bool
+build_owner_present(int client_fd, const CuvsCmdFrame *cmd)
+{
+    struct pollfd peer = {.fd = client_fd, .events = 0};
+    int rc;
+
+    do {
+        rc = poll(&peer, 1, 0);
+    } while (rc < 0 && errno == EINTR);
+    if (rc >= 0 && !(peer.revents & (POLLHUP | POLLERR | POLLNVAL)))
+        return true;
+
+    LOG_INFO("[build_withdrawn] op=%u db=%u index=%u\n",
+             cmd->op, cmd->db_oid, cmd->index_oid);
+    return false;
+}
+
 /* ----------------------------------------------------------------
  * Phase 3F: sharded BUILD path (cuvs.shard_count >= 2).
  *
@@ -7926,7 +7948,6 @@ build_sharded(int client_fd, const CuvsCmdFrame *cmd, const char *index_dir,
             vectors_committed = 1;
         } else {
             if (vf) unlink(vecs_tmp);
-            unlink(vecs_final);   /* drop any stale prior sidecar */
             LOG_WARN("[build_sharded] .vectors sidecar not written for %u/%u; "
                      "brute_force unavailable until REINDEX\n",
                      cmd->db_oid, cmd->index_oid);
@@ -7983,17 +8004,21 @@ build_sharded(int client_fd, const CuvsCmdFrame *cmd, const char *index_dir,
             unlink(tids_tmp);
     }
 
-    if (!persisted)
+    bool withdrawn = persisted && !build_owner_present(client_fd, cmd);
+    if (!persisted || withdrawn)
     {
         for (int j = 0; j < sc; j++)
         {
             cuvs_cagra_free(shards[j].handle, shards[j].gpu_device_id);
             unlink(shard_tmp[j]);
         }
+        unlink(tids_tmp);
+        unlink(shards_tmp);
         unlink(vecs_tmp);   /* Phase 3L: drop our un-committed sidecar tmp */
         pthread_mutex_unlock(&g_index_mutex);
         free(new_tids); free(shards); free(recs); free(shard_tmp); free(shard_final);
-        send_error_code(client_fd, CUVS_STATUS_PERSIST_FAILED, "sharded persist failed");
+        send_error_code(client_fd, withdrawn ? CUVS_STATUS_CANCELED : CUVS_STATUS_PERSIST_FAILED,
+                        withdrawn ? "build owner disconnected" : "sharded persist failed");
         return;
     }
 
@@ -8038,6 +8063,8 @@ build_sharded(int client_fd, const CuvsCmdFrame *cmd, const char *index_dir,
             if (vdir_fd >= 0) { fsync(vdir_fd); close(vdir_fd); }
         }
     }
+    else
+        unlink(vecs_final);
 
     /* Clear staleness marker and any legacy unsharded .cagra for this OID so a
      * reload sees only the sharded artifacts. Also remove orphan shard files
@@ -9194,18 +9221,21 @@ finish_build_commit(int client_fd, const CuvsCmdFrame *cmd, const char *save_dir
     int hnsw_rc = CUVS_HNSW_SERIALIZE_SKIPPED;
     const char *io_dir = root ? root->path : save_dir;
     const char *persist_error = "disk persistence failed";
+    int persist_status = CUVS_STATUS_PERSIST_FAILED;
     const ExtraSearchRoot *attested_root = NULL;
     int  cagra_fd = pre_cagra_fd;
     int  cagra_direct = 0;
     bool tids_published = false, graph_published = false;
     CagraBuildBackup backup = {0};
     IndexEntry *previous = find_index(cmd->db_oid, cmd->index_oid);
-    if (previous)
-        previous->extra_search_generation = 0;
     index_file_path(idx_final,  sizeof(idx_final),  io_dir, cmd->db_oid, cmd->index_oid);
     tids_file_path(tids_final,  sizeof(tids_final), io_dir, cmd->db_oid, cmd->index_oid);
     snprintf(idx_tmp,  sizeof(idx_tmp),  "%s.tmp", idx_final);
     snprintf(tids_tmp, sizeof(tids_tmp), "%s.tmp", tids_final);
+
+    /* A long build may have finished after its owner released the SQL locks. */
+    if (!build_owner_present(client_fd, cmd))
+        goto owner_gone;
 
 #ifdef CUVS_TEST_HOOKS
     if (cuvs_fault("CUVS_FAULT_TIDS_WRITE")) {
@@ -9288,6 +9318,10 @@ finish_build_commit(int client_fd, const CuvsCmdFrame *cmd, const char *save_dir
         if (!extra_search_build_root_matches(root, save_dir))
             goto root_changed;
     }
+    if (!build_owner_present(client_fd, cmd))
+        goto owner_gone;
+    if (previous)
+        previous->extra_search_generation = 0;
     if (rename(tids_tmp, tids_final) != 0) {
         LOG_ERROR("[handle_build] rename %s -> %s FAILED errno=%d (%s)\n",
                 tids_tmp, tids_final, errno, strerror(errno));
@@ -9620,6 +9654,11 @@ finish_build_commit(int client_fd, const CuvsCmdFrame *cmd, const char *save_dir
     }
     return;
 
+owner_gone:
+    persist_status = CUVS_STATUS_CANCELED;
+    persist_error = "build owner disconnected";
+    goto persist_fail;
+
 root_changed:
     persist_error = "index directory changed during CAGRA build publication";
     LOG_WARN("[handle_build] %u/%u: %s (tids_published=%d graph_published=%d)\n",
@@ -9659,7 +9698,7 @@ persist_fail:
     cuvs_cagra_free(new_handle, target_gpu);
     free(new_tids);
     pthread_mutex_unlock(&g_index_mutex);
-    send_error_code(client_fd, CUVS_STATUS_PERSIST_FAILED, persist_error);
+    send_error_code(client_fd, persist_status, persist_error);
 }
 
 /* The .vectors sidecar of a multi-partial build is written by a
@@ -11838,10 +11877,20 @@ handle_build_flat(int client_fd, const CuvsCmdFrame *cmd)
 
     char tids_final[512], tids_tmp[576];
     char vecs_final[512], vecs_tmp[576];
+    char token[64];
+
     tids_file_path(tids_final, sizeof(tids_final), save_dir, cmd->db_oid, cmd->index_oid);
     vectors_file_path(vecs_final, sizeof(vecs_final), save_dir, cmd->db_oid, cmd->index_oid);
-    snprintf(tids_tmp, sizeof(tids_tmp), "%s.tmp", tids_final);
-    snprintf(vecs_tmp, sizeof(vecs_tmp), "%s.tmp", vecs_final);
+    /* A later build can stage its own files while a canceled one drains. */
+    build_token(token, sizeof(token));
+    if ((size_t) snprintf(tids_tmp, sizeof(tids_tmp), "%s.%s.tmp", tids_final, token) >= sizeof(tids_tmp) ||
+        (size_t) snprintf(vecs_tmp, sizeof(vecs_tmp), "%s.%s.tmp", vecs_final, token) >= sizeof(vecs_tmp))
+    {
+        free(new_tids);
+        munmap(mem, total);
+        send_error_code(client_fd, CUVS_STATUS_PERSIST_FAILED, "flat temp path too long");
+        return;
+    }
 
     /* .vectors (float32 body + generation token) while the corpus is still mapped. */
     {
@@ -11874,10 +11923,20 @@ handle_build_flat(int client_fd, const CuvsCmdFrame *cmd)
 
     /* Commit: rename .vectors then .tids. On a failure, unlink both so a partial
      * (e.g. .vectors but no .tids) never registers — load_index needs .tids. */
+    pthread_mutex_lock(&g_index_mutex);
+    if (!build_owner_present(client_fd, cmd))
+    {
+        unlink(vecs_tmp); unlink(tids_tmp);
+        free(new_tids);
+        pthread_mutex_unlock(&g_index_mutex);
+        send_error_code(client_fd, CUVS_STATUS_CANCELED, "build owner disconnected");
+        return;
+    }
     if (rename(vecs_tmp, vecs_final) != 0)
     {
         unlink(vecs_tmp); unlink(tids_tmp);
         free(new_tids);
+        pthread_mutex_unlock(&g_index_mutex);
         send_error_code(client_fd, CUVS_STATUS_PERSIST_FAILED, "flat .vectors rename failed");
         return;
     }
@@ -11885,6 +11944,7 @@ handle_build_flat(int client_fd, const CuvsCmdFrame *cmd)
     {
         unlink(tids_tmp); unlink(vecs_final);
         free(new_tids);
+        pthread_mutex_unlock(&g_index_mutex);
         send_error_code(client_fd, CUVS_STATUS_PERSIST_FAILED, "flat .tids rename failed");
         return;
     }
@@ -11904,7 +11964,6 @@ handle_build_flat(int client_fd, const CuvsCmdFrame *cmd)
     }
 
     /* Register (or replace) in the hot registry — handle == NULL, is_flat = 1. */
-    pthread_mutex_lock(&g_index_mutex);
     {
         int fgpu = pick_gpu_for_index(0);
         if (fgpu < 0) fgpu = usable_gpu(0);
@@ -12160,6 +12219,7 @@ handle_build_ivfpq(int client_fd, const CuvsCmdFrame *cmd)
 
     char tids_final[512], tids_tmp[576];
     char ivfpq_final[512], ivfpq_tmp[576];
+    int persist_status = CUVS_STATUS_PERSIST_FAILED;
     tids_file_path(tids_final, sizeof(tids_final), save_dir, cmd->db_oid, cmd->index_oid);
     ivfpq_file_path(ivfpq_final, sizeof(ivfpq_final), save_dir, cmd->db_oid, cmd->index_oid);
     snprintf(tids_tmp,  sizeof(tids_tmp),  "%s.tmp", tids_final);
@@ -12174,6 +12234,11 @@ handle_build_ivfpq(int client_fd, const CuvsCmdFrame *cmd)
         goto persist_fail;
     }
 
+    if (!build_owner_present(client_fd, cmd))
+    {
+        persist_status = CUVS_STATUS_CANCELED;
+        goto persist_fail;
+    }
     if (rename(tids_tmp, tids_final) != 0)
         goto persist_fail;
     if (rename(ivfpq_tmp, ivfpq_final) != 0)
@@ -12301,7 +12366,9 @@ persist_fail:
     unlink(tids_tmp);
     unlink(ivfpq_tmp);
     pthread_mutex_unlock(&g_index_mutex);
-    send_error_code(client_fd, CUVS_STATUS_PERSIST_FAILED, "IVF-PQ disk persist failed");
+    send_error_code(client_fd, persist_status,
+                    persist_status == CUVS_STATUS_CANCELED ? "build owner disconnected" :
+                                                             "IVF-PQ disk persist failed");
 }
 
 /* ----------------------------------------------------------------
