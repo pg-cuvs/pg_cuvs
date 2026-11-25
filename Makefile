@@ -1367,6 +1367,7 @@ EXTRA_CLEAN += test-physical-build-guard
 .PHONY: test-physical-build-guard test-physical-build-mutations
 ifeq ($(shell uname -s),Linux)
 test-unit: test-physical-build-guard
+test-unit: test-legacy-bf-sidecar
 
 # the host upper-layer builder: levels and file size fixed by the input whatever the thread count,
 # every element above level 0 linked on level 1, level 0 without self links or duplicates, the cancel stop.
@@ -1389,6 +1390,18 @@ test-physical-build-guard:
 
 test-physical-build-mutations:
 	CC=$(CC) python3 -I test/unit/test_physical_build_mutations.py
+
+# Legacy sidecar validity through the actual daemon with a CPU wrapper.
+LEGACY_BF_CASES ?= reused-tid streaming alias rollback
+EXTRA_CLEAN += test-legacy-bf-sidecar
+.PHONY: test-legacy-bf-sidecar
+test-legacy-bf-sidecar:
+	$(CC) -std=gnu11 -O1 -DPGCUVS_CPU_SHIM -DCUVS_TEST_HOOKS -ffunction-sections -fdata-sections -I src \
+		test/unit/test_legacy_bf_sidecar.c src/cuvs_ipc.c src/cuvs_util.c \
+		src/cuvs_objstore.c src/cuvs_build_corpus.c src/cuvs_wrapper_shim_cpu.c \
+		src/cuvs_cache_policy.c src/cuvs_peak_meter.c src/cuvs_page_overlay.c src/cuvs_hnsw_upper.c \
+		-Wl,--gc-sections -lm -lpthread -lrt -lcurl -lssl -lcrypto -o $@
+	@set -e; for scenario in $(LEGACY_BF_CASES); do ./$@ "$$scenario"; done
 
 # I3-E / C8: rejection counters, memory_status I3-E columns, build_status rows
 # for in-flight unlocked CAGRA builds, through the actual daemon source (CPU

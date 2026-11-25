@@ -42,8 +42,9 @@ corpora that require exhaustive search; use `cagra`/`ivfpq` for approximate sear
 > calibrated by the planner.
 
 > For an unsharded legacy `cagra` index, an INSERT that extends the graph or a VACUUM
-> that compacts it invalidates the resident brute-force cache (#237, #239). Searches
-> that need the build-time `.vectors` sidecar report an error while it is stale. This
+> that compacts it invalidates the resident brute-force cache (#237, #239). Before
+> saving the changed graph, the daemon removes its old `.vectors` sidecar. Searches
+> that require that sidecar report an error until it is rebuilt. This
 > includes index scans and `pg_cuvs_batch_search` in `brute_force` mode, and
 > `cuvs_filtered_knn` with a NULL filter. Use `REINDEX` to rebuild the sidecar.
 

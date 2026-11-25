@@ -224,6 +224,7 @@ typedef struct IndexEntry {
     size_t          main_bf_vram_bytes; /* estimated VRAM held by main_bf_idx */
     int64_t         main_bf_mtime;      /* .vectors st_mtime when the BF was built */
     uint32_t        main_bf_generation; /* base .tids body_crc32 the BF was built on */
+    bool            legacy_vectors_stale; /* default .vectors cannot serve this graph */
     uint32_t        bf_precision;       /* precision of the resident BF index(es):
                                          * 0=float32, 1=float16 (cuvs.bf_precision) */
     /* #238: remembered "brute_force unavailable" verdict for the unsharded BF
@@ -333,6 +334,7 @@ reset_entry_stats(IndexEntry *e)
     e->last_search        = 0;
     e->loaded_at          = time(NULL);
     e->file_current       = 0;
+    e->legacy_vectors_stale = false;
     e->extra_search_generation = 0;
     e->extra_search_default_dir = 0;
 }
@@ -2421,9 +2423,9 @@ refresh_main_bf_cache(IndexEntry *e, uint32_t want_precision)
     uint32_t          dg = delta_gpu_of(e);   /* unsharded: the index's GPU */
     int               rc;
 
-    /* After an unsaved CAGRA mutation the disk files can still agree with
-     * each other even when their rows no longer match the resident graph. */
-    if (e->handle && !e->file_current)
+    /* After EXTEND or COMPACT, build-time vectors may no longer match the
+     * resident graph even if the old sidecars still agree with each other. */
+    if (e->legacy_vectors_stale)
     {
         free_main_bf_cache(e);
         return;
@@ -2728,6 +2730,23 @@ save_index(IndexEntry *e)
     chmod_sidecar(idx_tmp);
     if (fsync_path(idx_tmp) != 0)
         LOG_WARN("save_index: fsync %s failed errno=%d\n", idx_tmp, errno);
+
+    /* Retire the build vectors durably before publishing a changed graph.
+     * Reused heap slots can leave the TID array and its CRC unchanged even
+     * though the new graph contains different vectors. */
+    if (e->legacy_vectors_stale)
+    {
+        char vectors_path[512];
+        vectors_file_path(vectors_path, sizeof(vectors_path), g_index_dir,
+                          e->db_oid, e->index_oid);
+        if ((unlink(vectors_path) != 0 && errno != ENOENT) || fsync_path(g_index_dir) != 0)
+        {
+            LOG_ERROR("save_index: cannot retire %s errno=%d\n", vectors_path, errno);
+            unlink(tids_tmp);
+            unlink(idx_tmp);
+            return -1;
+        }
+    }
 
     if (rename(tids_tmp, tids_final) != 0) {
         LOG_ERROR("save_index: rename %s -> %s FAILED errno=%d (%s)\n",
@@ -5369,7 +5388,7 @@ search_filter_exact(IndexEntry *e, const float *query,
     int status = CUVS_STATUS_ERROR;
 
     *pn = 0;
-    if (!e->rev_tids || !e->rev_item_ids || e->n_vecs <= 0)
+    if (e->legacy_vectors_stale || !e->rev_tids || !e->rev_item_ids || e->n_vecs <= 0)
         return CUVS_STATUS_NO_VECTORS;
 
     item_ids = malloc((size_t)n_filter * sizeof(*item_ids));
@@ -5411,6 +5430,7 @@ search_filter_exact(IndexEntry *e, const float *query,
 
     char vpath[512];
     CuvsVectorsHeader vh;
+    uint32_t tids_crc;
     vectors_file_path(vpath, sizeof(vpath), g_index_dir, e->db_oid, e->index_oid);
     vfd = open(vpath, O_RDONLY);
     if (vfd < 0
@@ -5418,7 +5438,9 @@ search_filter_exact(IndexEntry *e, const float *query,
         || vh.magic != CUVS_VECTORS_MAGIC
         || vh.dim != e->dim
         || vh.metric != e->metric
-        || vh.n_vecs != e->n_vecs)
+        || vh.n_vecs != e->n_vecs
+        || tids_body_crc_of(e, &tids_crc) != 0
+        || vh.base_tids_crc32 != tids_crc)
     {
         status = CUVS_STATUS_NO_VECTORS;
         goto cleanup;
@@ -9377,6 +9399,18 @@ finish_build_commit(int client_fd, const CuvsCmdFrame *cmd, const char *save_dir
     if (!extra_search_build_root_matches(root, save_dir))
         goto root_changed;
 
+    /* BF reads the daemon directory. A different spelling of the same
+     * directory still publishes the vectors where BF can find them. */
+    bool vectors_in_daemon_dir = strcmp(save_dir, g_index_dir) == 0;
+    if (!vectors_in_daemon_dir)
+    {
+        struct stat build_dir, daemon_dir;
+        vectors_in_daemon_dir = stat(io_dir, &build_dir) == 0 &&
+                                stat(g_index_dir, &daemon_dir) == 0 &&
+                                build_dir.st_dev == daemon_dir.st_dev &&
+                                build_dir.st_ino == daemon_dir.st_ino;
+    }
+
     /* A failed or missing .vectors stage leaves BF unavailable for this
      * newly committed base. All changes to its final name happen here. */
     if (vectors_committed && rename(vecs_tmp, vecs_final) != 0)
@@ -9491,6 +9525,7 @@ finish_build_commit(int client_fd, const CuvsCmdFrame *cmd, const char *save_dir
         if (existing->ivfpq_handle) { cuvs_ivfpq_free(existing->ivfpq_handle, existing->gpu_device_id); existing->ivfpq_handle = NULL; }
         existing->last_search_mode = 0;
         reset_entry_stats(existing);   /* fresh index instance */
+        existing->legacy_vectors_stale = !vectors_in_daemon_dir;
         existing->graph_degree = (int)cmd->graph_degree;  /* for extend/compact VRAM est */
         existing->n_extended = 0;      /* REINDEX resets the extend counter */
         /* I-FC (i): build saved its files first, but eviction saves/reloads
@@ -9564,6 +9599,7 @@ finish_build_commit(int client_fd, const CuvsCmdFrame *cmd, const char *save_dir
          * handle_build and handle_build_multi (both finalize through here). */
         build_rev_tid_map(e);
         reset_entry_stats(e);
+        e->legacy_vectors_stale = !vectors_in_daemon_dir;
         e->graph_degree = (int)cmd->graph_degree;  /* for extend/compact VRAM est */
         e->file_current = strcmp(save_dir, g_index_dir) == 0;   /* I-FC (i), as above */
         extra_search_attest_directory(e, attested_root);
@@ -12640,6 +12676,7 @@ handle_extend(int client_fd, const CuvsCmdFrame *cmd)
     e->n_vecs     += n_new;
     e->n_extended += n_new;
     e->file_current = 0;   /* I-FC (1): graph now differs from the files */
+    e->legacy_vectors_stale = true;
     free_main_bf_cache(e); /* `.vectors` does not contain the extended rows. */
     e->vram_bytes  = estimate_vram_bytes(e->n_vecs, (int)e->dim, e->graph_degree);
 
@@ -12870,6 +12907,7 @@ handle_compact(int client_fd, const CuvsCmdFrame *cmd)
     e->tids = new_tids;
     e->n_vecs      = new_n;
     e->file_current = 0;   /* I-FC: merged in memory; save_index sets 1 */
+    e->legacy_vectors_stale = true;
     free_main_bf_cache(e); /* Compact changed the item-id to TID mapping. */
     e->n_extended       = 0;
     e->compact_count++;
