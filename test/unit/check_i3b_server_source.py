@@ -78,7 +78,7 @@ def split_args(a):
     return parts
 
 
-arity = {"ensure_vram": 5, "evict_lru": 2, "make_slot": 2, "load_index": 3}
+arity = {"ensure_vram": 5, "evict_lru": 2, "make_slot": 2, "load_index": 4}
 load_rq = {}
 for fn, n in arity.items():
     for line, args, before in calls(fn):
@@ -90,7 +90,7 @@ for fn, n in arity.items():
         if len(a) != n:
             fail(f"CK-36 (a): {fn}() at line {line} has {len(a)} args (requester missing?)")
             continue
-        rq = a[2] if fn == "ensure_vram" else a[-1]
+        rq = a[2] if fn in ("ensure_vram", "load_index") else a[-1]
         if not (rq.startswith("CUVS_RQ_") or rq == "rq"):
             fail(f"CK-36 (a): {fn}() at line {line} passes '{rq}', not a requester")
         if fn == "load_index":

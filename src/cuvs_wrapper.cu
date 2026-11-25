@@ -1105,6 +1105,92 @@ cuvs_bf_build(const float *vecs, int64_t n, int dim, uint32_t metric,
     }
 }
 
+static __global__ void
+copy_cagra_dataset_to_half(const float *source, size_t stride, size_t dim,
+                           size_t rows, half *target)
+{
+    for (size_t row = blockIdx.x; row < rows; row += gridDim.x) {
+        const float *input = source + row * stride;
+        half *output = target + row * dim;
+        for (size_t col = threadIdx.x; col < dim; col += blockDim.x)
+            output[col] = __float2half(input[col]);
+    }
+}
+
+extern "C" CuvsBfBuildStatus
+cuvs_bf_build_from_cagra(CuvsCagraIndex source, int64_t n, int dim, uint32_t metric,
+                        uint32_t precision, int device_id, CuvsBfIndex *result)
+{
+    if (!result || *result || !source || n <= 0 || dim <= 0 || precision > 1 ||
+        (uint64_t) n > SIZE_MAX / sizeof(float) / (size_t) dim)
+        return CUVS_BF_BUILD_FAILED;
+
+    std::unique_ptr<PooledRes> resources;
+    std::unique_ptr<CuvsBfIndexImpl> impl;
+    try {
+        const auto &base = *static_cast<const CuvsCagraIndexImpl *>(source);
+        const auto &idx = base.idx;
+        if (base.metric != metric || idx.size() != n || idx.dim() != dim ||
+            idx.dataset_fd().has_value() || idx.source_indices().has_value() ||
+            idx.mapping_fd().has_value())
+            return CUVS_BF_BUILD_FAILED;
+        const auto dataset = idx.dataset();
+        if (!dataset.data_handle() || dataset.extent(0) != n || dataset.extent(1) != dim ||
+            dataset.stride(0) < dim || dataset.stride(1) != 1)
+            return CUVS_BF_BUILD_FAILED;
+
+        resources = std::make_unique<PooledRes>(device_id);
+        auto &res = resources->get();
+        auto distance = cuvs_distance_type(metric);
+        impl = std::make_unique<CuvsBfIndexImpl>(dim, n, precision, metric);
+
+        if (precision == 1) {
+            constexpr unsigned threads = 256;
+            unsigned blocks = (unsigned) std::min<int64_t>(n, 65535);
+            impl->ds_f16 = new raft::device_matrix<half, int64_t>(
+                raft::make_device_matrix<half, int64_t>(res, n, (int64_t) dim));
+            copy_cagra_dataset_to_half<<<blocks, threads, 0, res.get_stream().value()>>>(
+                dataset.data_handle(), dataset.stride(0), dim, n,
+                impl->ds_f16->data_handle());
+            RAFT_CUDA_TRY(cudaGetLastError());
+            auto bf = cuvs::neighbors::brute_force::build(
+                res, raft::make_const_mdspan(impl->ds_f16->view()), distance);
+            impl->idx_f16 = new cuvs::neighbors::brute_force::index<half, float>(std::move(bf));
+        } else {
+            const size_t width = (size_t) dim * sizeof(float);
+            impl->ds_f32 = new raft::device_matrix<float, int64_t>(
+                raft::make_device_matrix<float, int64_t>(res, n, (int64_t) dim));
+            RAFT_CUDA_TRY(cudaMemcpy2DAsync(impl->ds_f32->data_handle(), width,
+                dataset.data_handle(), dataset.stride(0) * sizeof(float), width, n,
+                cudaMemcpyDeviceToDevice, res.get_stream().value()));
+            auto bf = cuvs::neighbors::brute_force::build(
+                res, raft::make_const_mdspan(impl->ds_f32->view()), distance);
+            impl->idx_f32 = new cuvs::neighbors::brute_force::index<float>(std::move(bf));
+        }
+        res.sync_stream();
+        resources->fence_check();
+        *result = impl.release();
+        return CUVS_BF_BUILD_OK;
+    } catch (const std::exception &e) {
+        fprintf(stderr, "[cuvs_bf_build_from_cagra] exception: %s\n", e.what());
+    } catch (...) {
+        fprintf(stderr, "[cuvs_bf_build_from_cagra] unknown exception\n");
+    }
+    if (resources) {
+        const cudaError_t sync = cudaStreamSynchronize(resources->get().get_stream().value());
+        const cudaError_t last = cudaGetLastError();
+        if (sync != cudaSuccess || (last != cudaSuccess && last != cudaErrorMemoryAllocation) ||
+            (resources->fence && resources->fence->failures() > 0)) {
+            /* Queued GPU work may still use both graphs and the stream. */
+            (void) impl.release();
+            (void) resources.release();
+            return CUVS_BF_BUILD_CUDA_UNCONFIRMED;
+        }
+        resources->poison();
+    }
+    return CUVS_BF_BUILD_FAILED;
+}
+
 extern "C" int
 cuvs_bf_search(
     CuvsBfIndex       index,

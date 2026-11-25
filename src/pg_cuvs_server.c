@@ -394,6 +394,7 @@ typedef struct PageCagraGraph
     CuvsBfIndex bf[2];
     size_t bf_bytes[2];
     uint32_t bf_miss_reported;
+    uint64_t bf_retry_after[2];
     size_t bytes;
     uint64_t registered_order;
     uint64_t last_use;
@@ -828,6 +829,9 @@ static uint64_t g_cache_persist_fail[CUVS_MAX_GPUS];
  * g_indexes, so total_vram_used() adds this so concurrent admission/eviction
  * still accounts for the build's VRAM. Mutated under g_index_mutex. */
 static size_t   g_pending_build_vram[CUVS_MAX_GPUS];
+static size_t   g_page_bf_claim[CUVS_MAX_GPUS];
+static unsigned g_page_bf_waiters[CUVS_MAX_GPUS];
+static pthread_cond_t g_page_bf_finished = PTHREAD_COND_INITIALIZER;
 #ifdef CUVS_CAGRA_FOLD_ENABLED
 /* One producer per device. Admission waits with the registry unlocked. */
 static bool g_fold_active[CUVS_MAX_GPUS];
@@ -1150,7 +1154,7 @@ warmup_dequeue(WarmupJob *out)
 }
 
 /* Forward declarations for warmup worker. */
-static int  load_index(uint32_t db_oid, uint32_t index_oid, CuvsRequester rq);
+static int  load_index(uint32_t db_oid, uint32_t index_oid, CuvsRequester rq, int client_fd);
 static void build_rev_tid_map(IndexEntry *e);  /* 3O: TID→item_id reverse map */
 
 /* Returns with g_index_mutex held. Recheck after a concurrent publication
@@ -1249,7 +1253,7 @@ warmup_worker_thread(void *arg)
             continue;
         }
 
-        if (load_index(job.db_oid, job.index_oid, CUVS_RQ_LOAD_WARMUP) != 0)
+        if (load_index(job.db_oid, job.index_oid, CUVS_RQ_LOAD_WARMUP, -1) != 0)
         {
             LOG_WARN("warmup: VRAM load failed for %u/%u\n",
                      job.db_oid, job.index_oid);
@@ -1386,10 +1390,12 @@ gpu_free_vram_bytes(int device_id)
     size_t available = cuvs_vram_free_bytes_on(device_id);
     size_t pending = g_rmm_pool_limits[device_id] > 0
         ? g_pending_rmm_build_vram[device_id] : 0;
+    bool page_claim = g_page_bf_claim[device_id] != 0;
 #ifdef CUVS_CAGRA_FOLD_ENABLED
-    if (g_rmm_pool_limits[device_id] == 0 && g_fold_claim[device_id])
-        pending = g_pending_build_vram[device_id];
+    page_claim = page_claim || g_fold_claim[device_id] != 0;
 #endif
+    if (g_rmm_pool_limits[device_id] == 0 && page_claim)
+        pending = g_pending_build_vram[device_id];
     return pending < available ? available - pending : 0;
 }
 
@@ -2670,6 +2676,9 @@ static size_t evict_lru(int device_id, CuvsRequester rq);
 static int make_slot(int device_id, CuvsRequester rq);
 static IndexEntry *registry_new_slot(void);
 static size_t entry_bytes_on(const IndexEntry *e, int device_id);
+static uint32_t page_bf_usable_devices(void);
+static bool page_bf_busy_locked(uint32_t devices);
+static bool page_bf_wait_locked(uint32_t devices, int client_fd);
 
 /* save_index: persist a registry entry to disk atomically.
  * Same contract as handle_build's persistence path: tmp + rename + fsync.
@@ -3002,19 +3011,37 @@ extra_search_pin_load(uint32_t db_oid, uint32_t index_oid, ExtraSearchLoad *load
 }
 
 static int
-load_index(uint32_t db_oid, uint32_t index_oid, CuvsRequester rq)
+load_index(uint32_t db_oid, uint32_t index_oid, CuvsRequester rq, int client_fd)
 {
     ExtraSearchLoad load;
     char idx_path[512], tids_path[512];
-    const ExtraSearchRoot *root = extra_search_pin_load(db_oid, index_oid, &load,
-                                                       idx_path, tids_path) ? &load.root : NULL;
+    const ExtraSearchRoot *root;
+    const char *io_dir;
     int rc = -1;
-    g_cur_requester_idx = index_oid;
-    g_last_admit_reason = CUVS_ADMISSION_NONE;   /* never report a stale reason */
-    const char *io_dir = root ? root->path : g_index_dir;
 
     memset(&t_reload_rej, 0, sizeof(t_reload_rej));
     t_reload_rej.reason = CUVS_ADMISSION_NONE;
+    if (rq == CUVS_RQ_LOAD && g_unlocked_gpu_jobs)
+    {
+        uint32_t devices = page_bf_usable_devices();
+
+        if (page_bf_busy_locked(devices))
+        {
+            /* Check for a concurrent LOAD before opening sidecars after
+             * releasing the lock. Keep the foreground reload contract. */
+            bool ready = page_bf_wait_locked(devices, client_fd);
+
+            g_last_admit_reason = CUVS_ADMISSION_NONE;
+            if (!ready)
+                return -1;
+            if (find_index(db_oid, index_oid))
+                return 0;
+        }
+    }
+    g_cur_requester_idx = index_oid;
+    g_last_admit_reason = CUVS_ADMISSION_NONE;   /* never report a stale reason */
+    root = extra_search_pin_load(db_oid, index_oid, &load, idx_path, tids_path) ? &load.root : NULL;
+    io_dir = root ? root->path : g_index_dir;
     if (!root)
     {
         index_file_path(idx_path, sizeof(idx_path), g_index_dir, db_oid, index_oid);
@@ -3050,6 +3077,23 @@ load_index(uint32_t db_oid, uint32_t index_oid, CuvsRequester rq)
         LOG_ERROR("pg_cuvs_server: .tids header dim=0 for %u/%u, skip\n",
                 db_oid, index_oid);
         free(tids);
+        goto done;
+    }
+
+    /* A reload can place a shard on any usable GPU and may evict even
+     * before allocating its first shard. Defer before that work if a page
+     * BF reservation can change physical capacity outside this lock. */
+    for (int i = 0; i < n_usable_gpus(); ++i)
+    {
+        int device = usable_gpu(i);
+
+        if (!g_page_bf_claim[device])
+            continue;
+        size_t needed = estimate_vram_bytes(n_vecs, (int) dim, 64);
+        g_last_admit_reason = CUVS_ADMISSION_AR2;
+        admission_fill(&t_reload_rej, CUVS_ADMISSION_AR2, needed, device);
+        free(tids);
+        rc = -2;
         goto done;
     }
 
@@ -3373,7 +3417,7 @@ startup_load_ordered(CuvsLoadKey *keys, int n, const CuvsUsageStat *st,
         if (find_index(k->db_oid, k->index_oid) ||
             page_legacy_deferred(k->db_oid, k->index_oid))
             continue;
-        if (load_index(k->db_oid, k->index_oid, CUVS_RQ_LOAD_STARTUP) == 0)
+        if (load_index(k->db_oid, k->index_oid, CUVS_RQ_LOAD_STARTUP, -1) == 0)
             (*loaded)++;
         else
         {
@@ -4301,6 +4345,128 @@ page_fold_wait_locked(int device, int client_fd, const CuvsCmdFrame *cmd, const 
 #else
 #define pick_gpu_for_build(needed, rq) pick_gpu_for_index(needed)
 #endif
+
+static bool
+page_bf_busy_locked(uint32_t devices)
+{
+    for (int device = 0; device < CUVS_MAX_GPUS; ++device)
+        if ((devices & (UINT32_C(1) << device)) && g_page_bf_claim[device])
+            return true;
+    return false;
+}
+
+static uint32_t
+page_bf_usable_devices(void)
+{
+    uint32_t devices = 0;
+
+    for (int i = 0; i < n_usable_gpus(); ++i)
+        devices |= UINT32_C(1) << usable_gpu(i);
+    return devices;
+}
+
+/* Give foreground admission priority over another optional copy. Check the
+ * peer even on the wake that clears the last claim. */
+static bool
+page_bf_wait_locked(uint32_t devices, int client_fd)
+{
+    bool withdrawn = false;
+
+    for (int device = 0; device < CUVS_MAX_GPUS; ++device)
+        if (devices & (UINT32_C(1) << device))
+            ++g_page_bf_waiters[device];
+    while (!g_shutdown)
+    {
+        struct timespec wake;
+        struct pollfd peer = {.fd = client_fd, .events = 0};
+
+        if (poll(&peer, 1, 0) > 0 && (peer.revents & (POLLHUP | POLLERR | POLLNVAL)))
+        {
+            withdrawn = true;
+            break;
+        }
+        if (!page_bf_busy_locked(devices))
+            break;
+        clock_gettime(CLOCK_REALTIME, &wake);
+        wake.tv_nsec += 100000000;
+        if (wake.tv_nsec >= 1000000000)
+        {
+            wake.tv_nsec -= 1000000000;
+            ++wake.tv_sec;
+        }
+        pthread_cond_timedwait(&g_page_bf_finished, &g_index_mutex, &wake);
+    }
+    for (int device = 0; device < CUVS_MAX_GPUS; ++device)
+        if (devices & (UINT32_C(1) << device))
+            --g_page_bf_waiters[device];
+    return !withdrawn && !g_shutdown;
+}
+
+/* Resolve placement and free capacity after waiting, before any eviction.
+ * BUILD may choose any usable GPU, including a fallback device. */
+static bool
+page_wait_before_build_locked(int client_fd, const CuvsCmdFrame *cmd, const char *op)
+{
+    uint32_t devices = page_bf_usable_devices();
+
+#ifndef CUVS_CAGRA_FOLD_ENABLED
+    (void) cmd;
+    (void) op;
+#endif
+    for (;;)
+    {
+#ifdef CUVS_CAGRA_FOLD_ENABLED
+        if (!page_fold_wait_locked(-1, client_fd, cmd, op))
+            return false;
+#endif
+        if (!page_bf_busy_locked(devices))
+            return true;
+        if (!page_bf_wait_locked(devices, client_fd))
+            return false;
+    }
+}
+
+/* EXTEND and COMPACT currently allocate without a separate physical
+ * reservation. Drain page work before they enter the SDK, and resolve the
+ * legacy entry again after every wait because its registry slot may move. */
+static bool
+page_wait_before_legacy_mutation_locked(int client_fd, const CuvsCmdFrame *cmd,
+                                         const char *op, IndexEntry **result,
+                                         int *fold_waited_device)
+{
+#ifndef CUVS_CAGRA_FOLD_ENABLED
+    (void) op;
+    (void) fold_waited_device;
+#endif
+    for (;;)
+    {
+        IndexEntry *entry = find_index(cmd->db_oid, cmd->index_oid);
+
+        if (entry && entry->handle)
+        {
+            int device = (int) entry->gpu_device_id;
+
+#ifdef CUVS_CAGRA_FOLD_ENABLED
+            if (g_fold_active[device])
+            {
+                if (fold_waited_device)
+                    *fold_waited_device = device;
+                if (!page_fold_wait_locked(device, client_fd, cmd, op))
+                    return false;
+                continue;
+            }
+#endif
+            if (g_page_bf_claim[device])
+            {
+                if (!page_bf_wait_locked(UINT32_C(1) << device, client_fd))
+                    return false;
+                continue;
+            }
+        }
+        *result = entry;
+        return true;
+    }
+}
 
 /* Reason for a failed pre-summed pick (nothing was evicted). AR5: the
  * requester's set is short but the EV-1-only set would fit. Otherwise the
@@ -5465,7 +5631,7 @@ handle_search_stream_bf(int client_fd, const CuvsCmdFrame *cmd)
     pthread_mutex_lock(&g_index_mutex);
 
     IndexEntry *e = find_index(cmd->db_oid, cmd->index_oid);
-    if (!e && load_index(cmd->db_oid, cmd->index_oid, CUVS_RQ_LOAD) == 0)
+    if (!e && load_index(cmd->db_oid, cmd->index_oid, CUVS_RQ_LOAD, client_fd) == 0)
         e = find_index(cmd->db_oid, cmd->index_oid);
     if (!e)
     {
@@ -5869,7 +6035,7 @@ handle_search(int client_fd, const CuvsCmdFrame *cmd)
     }
     else
     {
-        int load_rc = load_index(cmd->db_oid, cmd->index_oid, CUVS_RQ_LOAD);
+        int load_rc = load_index(cmd->db_oid, cmd->index_oid, CUVS_RQ_LOAD, client_fd);
         if (load_rc == 0)
         {
             e = find_index(cmd->db_oid, cmd->index_oid);
@@ -7118,7 +7284,7 @@ handle_search_batch(int client_fd, const CuvsCmdFrame *cmd)
     }
     else
     {
-        int load_rc = load_index(cmd->db_oid, cmd->index_oid, CUVS_RQ_LOAD);
+        int load_rc = load_index(cmd->db_oid, cmd->index_oid, CUVS_RQ_LOAD, client_fd);
         if (load_rc == 0)
             e = find_index(cmd->db_oid, cmd->index_oid);
         if (!e)
@@ -7743,18 +7909,15 @@ build_sharded(int client_fd, const CuvsCmdFrame *cmd, const char *index_dir,
     memcpy(new_tids, tids_in, tid_bytes);
 
     pthread_mutex_lock(&g_index_mutex);
-#ifdef CUVS_CAGRA_FOLD_ENABLED
     /* Drain before the first shard allocates. Both the round-robin devices
      * and the alternative selected by pick_gpu_for_index are covered. */
-    if (!page_fold_wait_locked(-1, client_fd, cmd, "BUILD_SHARD"))
+    if (!page_wait_before_build_locked(client_fd, cmd, "BUILD_SHARD"))
     {
         pthread_mutex_unlock(&g_index_mutex);
         free(new_tids); free(shards); free(recs); free(shard_tmp); free(shard_final);
         munmap(mem, total);
         return;
     }
-#endif
-
     /* --- Build + place each shard over a contiguous range. --- */
     int64_t base   = n_vecs / sc;
     int64_t rem    = n_vecs % sc;
@@ -8682,14 +8845,12 @@ handle_build(int client_fd, const CuvsCmdFrame *cmd)
                                                     cmd->graph_degree,
                                                     cmd->intermediate_graph_degree,
                                                     cmd->build_algo)};
-#ifdef CUVS_CAGRA_FOLD_ENABLED
-    if (!page_fold_wait_locked(-1, client_fd, cmd, "BUILD"))
+    if (!page_wait_before_build_locked(client_fd, cmd, "BUILD"))
     {
         pthread_mutex_unlock(&g_index_mutex);
         munmap(mem, total);
         return;
     }
-#endif
 #ifdef CUVS_CAGRA_FOLD_ENABLED
     /* The same-OID legacy graph remains available until the new page
      * relation commits, so it cannot finance the placement preview. */
@@ -8841,8 +9002,7 @@ handle_build(int client_fd, const CuvsCmdFrame *cmd)
     if (page_build && build_att)
         page_status = persist_empty_page_build(cmd, page_build, page_root);
 #ifdef CUVS_TEST_HOOKS
-    /* With no production BF builder in this stage, a fixture can attach one
-     * while BUILD still owns the input corpus and does not hold L0. */
+    /* Some fixtures need a BF copy from the first query. */
     CuvsBfIndex fixture_bf = NULL;
     if (page_build && new_handle && page_status == 0 && cuvs_fault("CUVS_FAULT_PAGE_BF_FIXTURE"))
         fixture_bf = cuvs_bf_build(vecs, cmd->n_vecs, cmd->dim, cmd->metric, 0, target_gpu);
@@ -9980,15 +10140,13 @@ handle_build_multi(int client_fd, const CuvsCmdFrame *cmd, const char *index_dir
     {
         size_t final  = estimate_vram_bytes(total, (int)cmd->dim, (int)cmd->graph_degree);
         size_t needed = admission_needed_bytes(final);
-#ifdef CUVS_CAGRA_FOLD_ENABLED
-        if (!page_fold_wait_locked(-1, client_fd, cmd, "BUILD_MULTI"))
+        if (!page_wait_before_build_locked(client_fd, cmd, "BUILD_MULTI"))
         {
             pthread_mutex_unlock(&g_index_mutex);
             status = CUVS_STATUS_CANCELED;
             err = "build owner disconnected";
             goto fail;
         }
-#endif
         int    target_gpu = pick_gpu_for_build(needed, CUVS_RQ_BUILD_CAGRA);
         CuvsCagraIndex new_handle;
         CuvsAdmissionFields oom_rej;
@@ -12069,15 +12227,12 @@ handle_build_ivfpq(int client_fd, const CuvsCmdFrame *cmd)
     size_t needed = (size_t)cmd->n_vecs * pq_dim * (pq_bits / 8 + 1);
 
     pthread_mutex_lock(&g_index_mutex);
-#ifdef CUVS_CAGRA_FOLD_ENABLED
-    if (!page_fold_wait_locked(-1, client_fd, cmd, "BUILD_IVFPQ"))
+    if (!page_wait_before_build_locked(client_fd, cmd, "BUILD_IVFPQ"))
     {
         pthread_mutex_unlock(&g_index_mutex);
         munmap(mem, total);
         return;
     }
-#endif
-
     /* I3 (C5, UC-2 (a)): IVF-PQ admission rejections carry err_out; its own
      * estimate is unchanged (C3's N applies to CAGRA). */
     CuvsAdmissionFields rej;
@@ -12318,7 +12473,7 @@ handle_search_ivfpq(int client_fd, const CuvsCmdFrame *cmd)
     IndexEntry *e = find_index(cmd->db_oid, cmd->index_oid);
     if (!e)
     {
-        int load_rc = load_index(cmd->db_oid, cmd->index_oid, CUVS_RQ_LOAD);
+        int load_rc = load_index(cmd->db_oid, cmd->index_oid, CUVS_RQ_LOAD, client_fd);
         if (load_rc == 0)
             e = find_index(cmd->db_oid, cmd->index_oid);
     }
@@ -12514,21 +12669,15 @@ handle_extend(int client_fd, const CuvsCmdFrame *cmd)
 
     pthread_mutex_lock(&g_index_mutex);
 
-    IndexEntry *e = find_index(cmd->db_oid, cmd->index_oid);
-#ifdef CUVS_CAGRA_FOLD_ENABLED
+    IndexEntry *e;
     int waited_device = -1;
-    while (e && e->handle && g_fold_active[e->gpu_device_id])
+
+    if (!page_wait_before_legacy_mutation_locked(client_fd, cmd, "EXTEND", &e, &waited_device))
     {
-        waited_device = (int) e->gpu_device_id;
-        if (!page_fold_wait_locked(waited_device, client_fd, cmd, "EXTEND"))
-        {
-            pthread_mutex_unlock(&g_index_mutex);
-            munmap(mem, total);
-            return;
-        }
-        e = find_index(cmd->db_oid, cmd->index_oid);
+        pthread_mutex_unlock(&g_index_mutex);
+        munmap(mem, total);
+        return;
     }
-#endif
     if (!e || !e->handle)
     {
         pthread_mutex_unlock(&g_index_mutex);
@@ -12728,19 +12877,14 @@ handle_compact(int client_fd, const CuvsCmdFrame *cmd)
 
     pthread_mutex_lock(&g_index_mutex);
 
-    IndexEntry *e = find_index(cmd->db_oid, cmd->index_oid);
-#ifdef CUVS_CAGRA_FOLD_ENABLED
-    while (e && e->handle && g_fold_active[e->gpu_device_id])
+    IndexEntry *e;
+
+    if (!page_wait_before_legacy_mutation_locked(client_fd, cmd, "COMPACT", &e, NULL))
     {
-        if (!page_fold_wait_locked((int) e->gpu_device_id, client_fd, cmd, "COMPACT"))
-        {
-            pthread_mutex_unlock(&g_index_mutex);
-            free(dead_tids);
-            return;
-        }
-        e = find_index(cmd->db_oid, cmd->index_oid);
+        pthread_mutex_unlock(&g_index_mutex);
+        free(dead_tids);
+        return;
     }
-#endif
     if (!e || !e->handle)
     {
         pthread_mutex_unlock(&g_index_mutex);
@@ -13748,7 +13892,7 @@ handle_manual(int client_fd, const CuvsCmdFrame *cmd)
             if (!e)
             {
                 t_manual_loading = 1;
-                int load_rc = load_index(db, idx, CUVS_RQ_LOAD);
+                int load_rc = load_index(db, idx, CUVS_RQ_LOAD, client_fd);
                 t_manual_loading = 0;
                 if (load_rc != 0)
                 {
@@ -14384,6 +14528,100 @@ map_page_shm(const char *key, size_t key_size, size_t bytes)
     return mem;
 }
 
+typedef struct PageBfBuild
+{
+    PageGraphFoldRef graph_ref;
+    CuvsCagraIndex source;
+    size_t resident_bytes;
+    size_t reservation;
+    uint32_t precision;
+} PageBfBuild;
+
+/* Before replying to a BF miss, reserve capacity and pin the exact graph.
+ * Optional BF copies do not evict another graph to obtain capacity. */
+static void
+page_bf_claim_locked(PageCagraGraph *graph, uint32_t precision, PageBfBuild *build)
+{
+    const int gpu = graph->gpu;
+    const size_t vector_width = (size_t) graph->dim * (precision == 1 ? 2 : 4);
+    const size_t row_bytes = vector_width + sizeof(float); /* includes cuVS norms */
+    uint64_t now = cuvs_hnsw_monotonic_us();
+    size_t limit, used, resident, peak;
+
+    if (g_shutdown || g_unlocked_gpu_jobs || g_pending_build_vram[gpu] || g_page_bf_waiters[gpu] ||
+        now < graph->bf_retry_after[precision] || graph->n_slots > SIZE_MAX / row_bytes)
+        return;
+#ifdef CUVS_CAGRA_FOLD_ENABLED
+    if (__atomic_load_n(&g_fold_waiters[gpu], __ATOMIC_SEQ_CST))
+        return;
+#endif
+    graph->bf_retry_after[precision] = now + UINT64_C(1000000);
+    resident = (size_t) graph->n_slots * row_bytes;
+    peak = admission_needed_bytes(resident);
+    limit = budget_eff_bytes(gpu);
+    used = total_vram_used(gpu);
+    if (peak >= CUVS_ADMISSION_BYTES_SATURATED ||
+        resident > SIZE_MAX - g_page_graph_bytes[gpu] ||
+        (limit && (used >= limit || peak > limit - used)) || peak > gpu_free_vram_bytes(gpu))
+        return;
+
+    build->source = page_graph_fold_pin_locked(graph, &build->graph_ref);
+    if (!build->source)
+        return;
+    build->resident_bytes = resident;
+    build->reservation = peak;
+    build->precision = precision;
+    reserve_build_vram(peak, gpu);
+    g_page_bf_claim[gpu] = peak;
+    ++g_unlocked_gpu_jobs;
+}
+
+/* The connection thread can materialize the copy after delivering the
+ * fallback reply. GPU allocation and copying happen outside g_index_mutex. */
+static void
+page_bf_complete(PageBfBuild *build, bool replied)
+{
+    PageCagraGraph *graph = build->graph_ref.entry;
+    CuvsBfIndex bf = NULL;
+    CuvsBfBuildStatus status = CUVS_BF_BUILD_FAILED;
+    uint32_t precision = build->precision;
+
+    if (!graph)
+        return;
+    if (replied && !g_shutdown)
+        status = cuvs_bf_build_from_cagra(build->source, graph->n_slots, graph->dim,
+                                         graph->metric, precision, graph->gpu, &bf);
+    if (status == CUVS_BF_BUILD_CUDA_UNCONFIRMED)
+    {
+        /* Preserve the borrowed graph and its charge until context teardown. */
+        LOG_ERROR("[page-bf] CUDA completion unconfirmed gpu=%d db=%u index=%u precision=%u\n",
+                  graph->gpu, graph->db_oid, graph->index_oid, precision);
+        _Exit(EXIT_FAILURE);
+    }
+
+    pthread_mutex_lock(&g_index_mutex);
+    if (bf && !graph->fold_retired && !g_shutdown)
+    {
+        graph->bf[precision] = bf;
+        graph->bf_bytes[precision] = build->resident_bytes;
+        g_page_graph_bytes[graph->gpu] += build->resident_bytes;
+        bf = NULL;
+    }
+    if (bf)
+    {
+        pthread_mutex_unlock(&g_index_mutex);
+        cuvs_bf_free(bf, graph->gpu);
+        pthread_mutex_lock(&g_index_mutex);
+    }
+    graph->bf_retry_after[precision] = cuvs_hnsw_monotonic_us() + UINT64_C(1000000);
+    release_build_vram(build->reservation, graph->gpu);
+    g_page_bf_claim[graph->gpu] = 0;
+    --g_unlocked_gpu_jobs;
+    pthread_cond_broadcast(&g_page_bf_finished);
+    pthread_mutex_unlock(&g_index_mutex);
+    page_graph_fold_unpin(&build->graph_ref);
+}
+
 static int
 page_graph_search(PageCagraGraph *graph, const CuvsCmdFrame *cmd, const float *queries,
                   int nq, int k, const uint32_t *excluded, CuvsSearchResult *raw)
@@ -14420,6 +14658,7 @@ handle_page_search(int client_fd, const CuvsCmdFrame *cmd)
 {
     CuvsPageSearchRequest request;
     CuvsReplyHeader reply = {0};
+    PageBfBuild bf_build = {0};
     void *query = MAP_FAILED, *filter = MAP_FAILED;
     const float *vectors;
     CuvsSearchResult *raw = NULL;
@@ -14427,6 +14666,7 @@ handle_page_search(int client_fd, const CuvsCmdFrame *cmd)
     size_t bytes = 0, filter_bytes = 0;
     int nq = 1;
     bool report_missing_bf = false;
+    bool replied;
     bool batch = cmd->op == CUVS_OP_SEARCH_PAGES_BATCH;
     bool filtered = cmd->op == CUVS_OP_SEARCH_PAGES_FILTERED;
     uint32_t prefix = batch ? 2 * sizeof(uint32_t) : 0;
@@ -14483,6 +14723,7 @@ handle_page_search(int client_fd, const CuvsCmdFrame *cmd)
 
         report_missing_bf = (graph->bf_miss_reported & bit) == 0;
         graph->bf_miss_reported |= bit;
+        page_bf_claim_locked(graph, cmd->bf_precision, &bf_build);
         reply.status = CUVS_STATUS_NO_VECTORS;
     }
     else
@@ -14530,9 +14771,11 @@ done:
     if (query != MAP_FAILED) munmap(query, bytes);
     if (filter != MAP_FAILED) munmap(filter, filter_bytes);
     free(raw);
-    if (send_all(client_fd, &reply, sizeof(reply)) == 0 && reply.n_results)
+    replied = send_all(client_fd, &reply, sizeof(reply)) == 0;
+    if (replied && reply.n_results)
         send_all(client_fd, results, reply.n_results * sizeof(*results));
     free(results);
+    page_bf_complete(&bf_build, replied);
 }
 
 static void
@@ -15784,7 +16027,7 @@ bf_batch_run_group(CuvsBatchRequest **batch, const int *gid, int n, int g)
 
     pthread_mutex_lock(&g_index_mutex);
     IndexEntry *e = find_index(r0->key.db_oid, r0->key.index_oid);
-    if (!e && load_index(r0->key.db_oid, r0->key.index_oid, CUVS_RQ_LOAD) == 0)
+    if (!e && load_index(r0->key.db_oid, r0->key.index_oid, CUVS_RQ_LOAD, -1) == 0)
         e = find_index(r0->key.db_oid, r0->key.index_oid);
 
     int status = CUVS_STATUS_OK;
@@ -15898,7 +16141,7 @@ cagra_batch_run_group(CuvsBatchRequest **batch, const int *gid, int n, int g)
 
     pthread_mutex_lock(&g_index_mutex);
     IndexEntry *e = find_index(r0->key.db_oid, r0->key.index_oid);
-    if (!e && load_index(r0->key.db_oid, r0->key.index_oid, CUVS_RQ_LOAD) == 0)
+    if (!e && load_index(r0->key.db_oid, r0->key.index_oid, CUVS_RQ_LOAD, -1) == 0)
         e = find_index(r0->key.db_oid, r0->key.index_oid);
 
     int status = CUVS_STATUS_OK;

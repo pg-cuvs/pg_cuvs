@@ -44,8 +44,9 @@ exists for 0.9.0.
 
 - With experimental page-format CAGRA indexes, `pg_cuvs_batch_search` and
   `cuvs_filtered_knn` return the row's `ctid` in the caller's snapshot,
-  including after a HOT update. Standard builds use exact heap search for
-  `cuvs_filtered_knn` on these indexes.
+  including after a HOT update. The daemon prepares per-precision GPU
+  brute-force copies on demand for resident page graphs. The exact heap path
+  serves search requests while the copy is unavailable.
 
 - A CAGRA build that the daemon receives in several partials does less work while it
   holds the daemon's index lock after the GPU build. A helper thread writes the
