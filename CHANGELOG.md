@@ -97,6 +97,15 @@ exists for 0.9.0.
 
 ### Fixed
 
+- The daemon no longer dies with SIGSEGV when it frees an index after a failed request. A
+  failed request discarded its pooled resource slot together with the slot's dedicated
+  CUDA stream (`--rmm-dedicated-stream`, on by default), while device buffers that an
+  earlier request on that slot had allocated, such as the graph of an index built there,
+  still referred to the stream; RMM's pool looked the destroyed stream up when the index
+  was dropped or compacted. Any failed request poisons its slot, including host-side
+  failures such as a missing HNSW sidecar. The slot's handles are still discarded, but the
+  stream is now kept and reused once `cudaStreamQuery` reports it idle, and a kept stream
+  is never destroyed.
 - `pg_cuvs_hnsw` applies `ef_construction` to the applicable SDK settings for
   direct heap builds and records the configured value in the index metapage.
   Conversions from legacy CAGRA indexes use the option only for the target
@@ -236,7 +245,7 @@ exists for 0.9.0.
   The notice is now sent for `ivfpq` indexes too. The daemon frees the IVF-PQ handle and
   the CPU HNSW structure of the dropped index, which the drop did not free for any index
   type, and removes its `.ivfpq` and `.hnsw` files from the daemon's `index_dir` (files
-  written to a per-index `index_dir` reloption stay, as they did for every index type).
+  written to a per-index `index_dir` reloption stay for legacy index formats).
 - A GPU build without `CUVS_SDK_SOURCE_INCLUDE` failed to link with
   `ld: .../librapids_logger.so: error adding symbols: DSO missing from command line`.
   The wrapper expands `RMM_LOG_*`, which call `rapids_logger::logger::log`, and
