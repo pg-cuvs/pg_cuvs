@@ -1392,7 +1392,8 @@ test-physical-build-mutations:
 	CC=$(CC) python3 -I test/unit/test_physical_build_mutations.py
 
 # Legacy sidecar validity through the actual daemon with a CPU wrapper.
-LEGACY_BF_CASES ?= reused-tid streaming alias rollback
+LEGACY_BF_CASES ?= reused-tid streaming alias rollback build-crash build-fsync-rollback \
+	compact-retry-unlink compact-retry-fsync
 EXTRA_CLEAN += test-legacy-bf-sidecar
 .PHONY: test-legacy-bf-sidecar
 test-legacy-bf-sidecar:

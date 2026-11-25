@@ -289,6 +289,7 @@ typedef struct IndexEntry {
     int             pinned;             /* daemon-lifetime pin; kept by REINDEX */
     time_t          loaded_at;          /* registration time (order key) */
     int             file_current;       /* I-FC: 1 iff graph/tids == .cagra/.tids */
+    bool            compact_save_pending; /* graph swapped, tombstones still need a durable save */
     uint64_t        extra_search_generation; /* optional opcode, protected by g_index_mutex */
     int             extra_search_default_dir;
     dev_t           extra_search_dir_dev;
@@ -334,6 +335,7 @@ reset_entry_stats(IndexEntry *e)
     e->last_search        = 0;
     e->loaded_at          = time(NULL);
     e->file_current       = 0;
+    e->compact_save_pending = false;
     e->legacy_vectors_stale = false;
     e->extra_search_generation = 0;
     e->extra_search_default_dir = 0;
@@ -2729,7 +2731,12 @@ save_index(IndexEntry *e)
     }
     chmod_sidecar(idx_tmp);
     if (fsync_path(idx_tmp) != 0)
-        LOG_WARN("save_index: fsync %s failed errno=%d\n", idx_tmp, errno);
+    {
+        LOG_ERROR("save_index: fsync %s failed errno=%d\n", idx_tmp, errno);
+        unlink(tids_tmp);
+        unlink(idx_tmp);
+        return -1;
+    }
 
     /* Retire the build vectors durably before publishing a changed graph.
      * Reused heap slots can leave the TID array and its CRC unchanged even
@@ -2763,10 +2770,14 @@ save_index(IndexEntry *e)
         unlink(idx_tmp);
         return -1;
     }
-    int dir_fd = open(g_index_dir, O_RDONLY);
-    if (dir_fd >= 0) { fsync(dir_fd); close(dir_fd); }
+    if (fsync_path(g_index_dir) != 0)
+    {
+        LOG_ERROR("save_index: fsync %s failed errno=%d\n", g_index_dir, errno);
+        return -1;
+    }
 
     e->file_current = 1;   /* I-FC (iii) */
+    e->compact_save_pending = false;
     LOG_INFO("pg_cuvs_server: saved index %u/%u (%lld vecs)\n",
             e->db_oid, e->index_oid, (long long)e->n_vecs);
     return 0;
@@ -9139,9 +9150,9 @@ cagra_direct_verify(CuvsCagraIndex handle, const char *direct_path, int target_g
 }
 
 typedef struct CagraBuildBackup {
-    char dir[64];
-    char tids[80], graph[80];
-    bool had_tids, had_graph;
+    char dir[576];
+    char tids[592], graph[592], vectors[592];
+    bool had_tids, had_graph, had_vectors;
 } CagraBuildBackup;
 
 static bool
@@ -9159,10 +9170,10 @@ backup_cagra_file(const char *path, const char *backup, bool *present)
 }
 
 static bool
-backup_cagra_base(const ExtraSearchRoot *root, const char *tids, const char *graph,
-                  CagraBuildBackup *backup)
+backup_cagra_base(const char *dir, const char *tids, const char *graph,
+                  const char *vectors, CagraBuildBackup *backup)
 {
-    snprintf(backup->dir, sizeof(backup->dir), "%s/.cagra-build-XXXXXX", root->path);
+    snprintf(backup->dir, sizeof(backup->dir), "%s/.cagra-build-XXXXXX", dir);
     if (!mkdtemp(backup->dir))
     {
         backup->dir[0] = '\0';
@@ -9170,8 +9181,10 @@ backup_cagra_base(const ExtraSearchRoot *root, const char *tids, const char *gra
     }
     snprintf(backup->tids, sizeof(backup->tids), "%s/tids", backup->dir);
     snprintf(backup->graph, sizeof(backup->graph), "%s/graph", backup->dir);
+    snprintf(backup->vectors, sizeof(backup->vectors), "%s/vectors", backup->dir);
     return backup_cagra_file(tids, backup->tids, &backup->had_tids) &&
-           backup_cagra_file(graph, backup->graph, &backup->had_graph);
+           backup_cagra_file(graph, backup->graph, &backup->had_graph) &&
+           backup_cagra_file(vectors, backup->vectors, &backup->had_vectors);
 }
 
 static void
@@ -9183,6 +9196,8 @@ discard_cagra_build_backup(const CagraBuildBackup *backup)
         unlink(backup->tids);
     if (backup->had_graph)
         unlink(backup->graph);
+    if (backup->had_vectors)
+        unlink(backup->vectors);
     if (rmdir(backup->dir) != 0)
         LOG_WARN("[handle_build] cannot remove backup directory %s: %s\n",
                  backup->dir, strerror(errno));
@@ -9226,14 +9241,14 @@ finish_build_commit(int client_fd, const CuvsCmdFrame *cmd, const char *save_dir
 {
     char idx_final[512],  idx_tmp[576];
     char tids_final[512], tids_tmp[576];
-    char hnsw_path[512], hnsw_tmp[96] = "";
+    char hnsw_path[512], hnsw_tmp[592] = "";
     int hnsw_rc = CUVS_HNSW_SERIALIZE_SKIPPED;
     const char *io_dir = root ? root->path : save_dir;
     const char *persist_error = "disk persistence failed";
     const ExtraSearchRoot *attested_root = NULL;
     int  cagra_fd = pre_cagra_fd;
     int  cagra_direct = 0;
-    bool tids_published = false, graph_published = false;
+    bool vectors_retired = false, tids_published = false, graph_published = false;
     CagraBuildBackup backup = {0};
     IndexEntry *previous = find_index(cmd->db_oid, cmd->index_oid);
     if (previous)
@@ -9299,9 +9314,7 @@ finish_build_commit(int client_fd, const CuvsCmdFrame *cmd, const char *save_dir
     }
     LOG_DEBUG("[handle_build] cagra.tmp written + fsynced\n");
 
-    /* Commit point: atomic renames. tids first, then cagra (the file
-     * startup_load_indexes scans for). If second rename fails, log and
-     * unlink whatever we renamed to leave consistent state. */
+    /* Retain the prior files for rollback without copying the corpus. */
 #ifdef CUVS_TEST_HOOKS
     if (cuvs_fault("CUVS_FAULT_RENAME_TIDS")) {
         LOG_ERROR("[handle_build] fault injection: CUVS_FAULT_RENAME_TIDS\n");
@@ -9310,35 +9323,45 @@ finish_build_commit(int client_fd, const CuvsCmdFrame *cmd, const char *save_dir
 #endif
     if (!extra_search_build_root_matches(root, save_dir))
         goto root_changed;
-    if (root)
+    if (!backup_cagra_base(io_dir, tids_final, idx_final, vecs_final, &backup))
     {
-        /* Both old names must be recoverable before either is replaced.
-         * Hard links retain the prior pair without copying the corpus. */
-        if (!backup_cagra_base(root, tids_final, idx_final, &backup))
-        {
-            persist_error = "could not back up the prior CAGRA artifacts";
-            LOG_WARN("[handle_build] %u/%u: %s: %s\n",
-                     cmd->db_oid, cmd->index_oid, persist_error, strerror(errno));
-            goto persist_fail;
-        }
-        if (!extra_search_build_root_matches(root, save_dir))
-            goto root_changed;
+        persist_error = "could not back up the prior CAGRA artifacts";
+        LOG_WARN("[handle_build] %u/%u: %s: %s\n",
+                 cmd->db_oid, cmd->index_oid, persist_error, strerror(errno));
+        goto persist_fail;
     }
+    if (!extra_search_build_root_matches(root, save_dir))
+        goto root_changed;
+
+    /* A rebuild can keep the same TID array while replacing its vectors.
+     * Make the old .vectors name durably absent before publishing either
+     * base file, so a restart can never pair it with the new graph. */
+    if (unlink(vecs_final) == 0)
+        vectors_retired = true;
+    else if (errno != ENOENT)
+    {
+        persist_error = "could not retire the prior CAGRA vectors";
+        goto persist_fail;
+    }
+    if (fsync_path(io_dir) != 0)
+    {
+        persist_error = "could not sync retirement of the prior CAGRA vectors";
+        goto persist_fail;
+    }
+
     if (rename(tids_tmp, tids_final) != 0) {
         LOG_ERROR("[handle_build] rename %s -> %s FAILED errno=%d (%s)\n",
                 tids_tmp, tids_final, errno, strerror(errno));
         goto persist_fail;
     }
     tids_published = true;
-    if (root && previous)
+    if (previous)
         previous->file_current = 0;    /* I-FC: the prior pair changed on disk */
     if (!extra_search_build_root_matches(root, save_dir))
         goto root_changed;
 #ifdef CUVS_TEST_HOOKS
     if (cuvs_fault("CUVS_FAULT_RENAME_CAGRA")) {
         LOG_ERROR("[handle_build] fault injection: CUVS_FAULT_RENAME_CAGRA\n");
-        if (!root)
-            unlink(tids_final);
         goto persist_fail;
     }
 #endif
@@ -9346,14 +9369,15 @@ finish_build_commit(int client_fd, const CuvsCmdFrame *cmd, const char *save_dir
         LOG_ERROR("[handle_build] rename %s -> %s FAILED errno=%d (%s); "
                   "recovering tids to avoid mismatch\n",
                 idx_tmp, idx_final, errno, strerror(errno));
-        if (!root)
-            unlink(tids_final);
         goto persist_fail;
     }
     graph_published = true;
-    /* fsync directory so the rename(s) are durable. */
-    int dir_fd = open(io_dir, O_RDONLY);
-    if (dir_fd >= 0) { fsync(dir_fd); close(dir_fd); }
+    /* The new base must be durable before its .vectors becomes visible. */
+    if (fsync_path(io_dir) != 0)
+    {
+        persist_error = "could not sync the new CAGRA base";
+        goto persist_fail;
+    }
     if (!extra_search_build_root_matches(root, save_dir))
         goto root_changed;
 
@@ -9395,7 +9419,7 @@ finish_build_commit(int client_fd, const CuvsCmdFrame *cmd, const char *save_dir
     }
 
     /* Both a resident publish and the registry-full disk-only success
-     * depend on this check. Do not retire any prior sidecars above it. */
+     * depend on this check. The prior base and vectors can still be restored. */
     if (!extra_search_build_root_matches(root, save_dir))
         goto root_changed;
 
@@ -9412,21 +9436,19 @@ finish_build_commit(int client_fd, const CuvsCmdFrame *cmd, const char *save_dir
     }
 
     /* A failed or missing .vectors stage leaves BF unavailable for this
-     * newly committed base. All changes to its final name happen here. */
-    if (vectors_committed && rename(vecs_tmp, vecs_final) != 0)
-    {
-        LOG_WARN("[handle_build] rename %s -> %s failed errno=%d; brute_force unavailable\n",
-                 vecs_tmp, vecs_final, errno);
-        unlink(vecs_tmp);
-        vectors_committed = 0;
-    }
+     * newly committed base. The old final name is already absent. */
     if (vectors_committed)
     {
-        int vdir_fd = open(io_dir, O_RDONLY);
-        if (vdir_fd >= 0) { fsync(vdir_fd); close(vdir_fd); }
+        if (rename(vecs_tmp, vecs_final) != 0)
+        {
+            LOG_WARN("[handle_build] rename %s -> %s failed errno=%d; brute_force unavailable\n",
+                     vecs_tmp, vecs_final, errno);
+            unlink(vecs_tmp);
+        }
+        else if (fsync_path(io_dir) != 0)
+            LOG_WARN("[handle_build] cannot sync %s after publishing vectors: %s\n",
+                     io_dir, strerror(errno));
     }
-    else
-        unlink(vecs_final);
 
     /* A rebuild produces a fresh graph reflecting the current heap — clear any
      * persisted staleness marker. */
@@ -9680,10 +9702,19 @@ root_changed:
 persist_fail:
     if (hnsw_tmp[0])
         unlink(hnsw_tmp);
-    if (root && tids_published)
+    if (vectors_retired || tids_published || graph_published)
     {
-        bool restored = restore_cagra_file(tids_final, backup.tids, backup.had_tids);
+        bool restored = true;
+        if (tids_published && !restore_cagra_file(tids_final, backup.tids, backup.had_tids))
+            restored = false;
         if (graph_published && !restore_cagra_file(idx_final, backup.graph, backup.had_graph))
+            restored = false;
+        /* Expose the prior vectors only once their own base is durable. */
+        if (fsync_path(io_dir) != 0)
+            restored = false;
+        if (restored && vectors_retired &&
+            (!restore_cagra_file(vecs_final, backup.vectors, backup.had_vectors) ||
+             fsync_path(io_dir) != 0))
             restored = false;
         if (restored)
             discard_cagra_build_backup(&backup);
@@ -9693,9 +9724,6 @@ persist_fail:
             LOG_ERROR("[handle_build] %u/%u: %s; retained backups in %s\n",
                       cmd->db_oid, cmd->index_oid, persist_error, backup.dir);
         }
-        if (fsync(root->fd) != 0)
-            LOG_WARN("[handle_build] cannot fsync rolled back index directory: %s\n",
-                     strerror(errno));
     }
     else
         discard_cagra_build_backup(&backup);
@@ -12832,9 +12860,18 @@ handle_compact(int client_fd, const CuvsCmdFrame *cmd)
 
     if (dead_count == 0)
     {
-        pthread_mutex_unlock(&g_index_mutex);
         free(keep_bits);
+        /* A previous COMPACT may have swapped the graph but failed to save
+         * it. The tombstones are still needed until that swap is durable. */
+        if (e->compact_save_pending && save_index(e) != 0)
+        {
+            pthread_mutex_unlock(&g_index_mutex);
+            send_error_code(client_fd, CUVS_STATUS_PERSIST_FAILED,
+                            "save_index failed after compact");
+            return;
+        }
         unlink(tombstone_path);
+        pthread_mutex_unlock(&g_index_mutex);
         CuvsReplyHeader ok = {0};
         ok.status = CUVS_STATUS_OK;
         send_foreground_reply(client_fd, &ok);
@@ -12907,6 +12944,7 @@ handle_compact(int client_fd, const CuvsCmdFrame *cmd)
     e->tids = new_tids;
     e->n_vecs      = new_n;
     e->file_current = 0;   /* I-FC: merged in memory; save_index sets 1 */
+    e->compact_save_pending = true;
     e->legacy_vectors_stale = true;
     free_main_bf_cache(e); /* Compact changed the item-id to TID mapping. */
     e->n_extended       = 0;

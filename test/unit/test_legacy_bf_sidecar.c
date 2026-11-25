@@ -1,13 +1,80 @@
 /* Exercise the legacy daemon paths with the CPU wrapper and real sidecars. */
 #define _GNU_SOURCE
+#include <stdio.h>
+#include <unistd.h>
+
+static int fixture_fsync(int fd);
+static int fixture_rename(const char *from, const char *to);
+static int fixture_unlink(const char *path);
+#define fsync fixture_fsync
+#define rename fixture_rename
+#define unlink fixture_unlink
 #define main pg_cuvs_server_program_main
 #include "../../src/pg_cuvs_server.c"
 #undef main
+#undef unlink
+#undef rename
+#undef fsync
 #include <assert.h>
+#include <sys/wait.h>
 
 static const uint32_t db = 1, idx = 2, dim = 2;
 static const float base_vecs[] = {1, 0, 2, 0, 3, 0, 4, 0};
+static const float replacement_vecs[] = {1, 0, 2, 0, 3, 0, 9, 0};
 static const uint64_t base_tids[] = {101, 102, 103, 104};
+
+typedef enum {
+    NO_FAULT, BUILD_CRASH, BUILD_SYNC_FAIL, COMPACT_UNLINK_FAIL, COMPACT_SYNC_FAIL
+} FixtureFault;
+static FixtureFault fault;
+static bool graph_renamed;
+enum { EXIT_AFTER_GRAPH_SYNC = 37 };
+
+static bool
+has_suffix(const char *path, const char *suffix)
+{
+    size_t len = strlen(path), suffix_len = strlen(suffix);
+    return len >= suffix_len && strcmp(path + len - suffix_len, suffix) == 0;
+}
+
+static int
+fixture_unlink(const char *path)
+{
+    if (fault == COMPACT_UNLINK_FAIL && has_suffix(path, ".vectors"))
+    {
+        errno = EACCES;
+        return -1;
+    }
+    return unlink(path);
+}
+
+static int
+fixture_rename(const char *from, const char *to)
+{
+    int rc = rename(from, to);
+    if (rc == 0 && (fault == BUILD_CRASH || fault == BUILD_SYNC_FAIL) &&
+        has_suffix(to, ".cagra"))
+        graph_renamed = true;
+    return rc;
+}
+
+static int
+fixture_fsync(int fd)
+{
+    struct stat st;
+    bool directory = fault != NO_FAULT && fstat(fd, &st) == 0 && S_ISDIR(st.st_mode);
+    if (directory && (fault == COMPACT_SYNC_FAIL || (fault == BUILD_SYNC_FAIL && graph_renamed)))
+    {
+        if (fault == BUILD_SYNC_FAIL)
+            fault = NO_FAULT; /* The rollback can still sync its restored files. */
+        errno = EIO;
+        return -1;
+    }
+    int rc = fsync(fd);
+    if (rc == 0 && directory && fault == BUILD_CRASH && graph_renamed)
+        _exit(EXIT_AFTER_GRAPH_SYNC);
+    return rc;
+}
 
 static uint32_t
 reply_status(int sockets[2])
@@ -54,11 +121,10 @@ build(const char *dir, const float *vecs, const uint64_t *tids)
 }
 
 static void
-compact(uint64_t dead_tid)
+write_tombstone(uint64_t dead_tid)
 {
-    char tombstone[512], dir[256] = {0};
-    snprintf(dir, sizeof(dir), "%s", g_index_dir);
-    snprintf(tombstone, sizeof(tombstone), "%s/%u_%u.tombstone", dir, db, idx);
+    char tombstone[512];
+    snprintf(tombstone, sizeof(tombstone), "%s/%u_%u.tombstone", g_index_dir, db, idx);
     CuvsTombstoneHeader header = {.magic = CUVS_TOMBSTONE_MAGIC, .version = 1, .n_entries = 1};
     CuvsTombstoneRecord record = {.tid = dead_tid, .delete_xid = 1};
     FILE *file = fopen(tombstone, "wb");
@@ -66,13 +132,26 @@ compact(uint64_t dead_tid)
     assert(fwrite(&header, sizeof(header), 1, file) == 1);
     assert(fwrite(&record, sizeof(record), 1, file) == 1);
     assert(fclose(file) == 0);
+}
 
+static uint32_t
+run_compact(void)
+{
+    char dir[256] = {0};
+    snprintf(dir, sizeof(dir), "%s", g_index_dir);
     int sockets[2];
     assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
     assert(cuvs_fd_send(sockets[0], -1, dir, sizeof(dir)) == 0);
     CuvsCmdFrame cmd = {.op = CUVS_OP_COMPACT, .db_oid = db, .index_oid = idx};
     handle_compact(sockets[1], &cmd);
-    assert(reply_status(sockets) == CUVS_STATUS_OK);
+    return reply_status(sockets);
+}
+
+static void
+compact(uint64_t dead_tid)
+{
+    write_tombstone(dead_tid);
+    assert(run_compact() == CUVS_STATUS_OK);
 }
 
 static void
@@ -163,8 +242,7 @@ alias_directory(void)
     assert(build(alias, base_vecs, base_tids) == CUVS_STATUS_OK);
     IndexEntry *e = find_index(db, idx);
     assert_bf_hit(e, 4, 104);
-    const float replacement[] = {1, 0, 2, 0, 3, 0, 9, 0};
-    assert(build(alias, replacement, base_tids) == CUVS_STATUS_OK);
+    assert(build(alias, replacement_vecs, base_tids) == CUVS_STATUS_OK);
     assert_bf_hit(e, 9, 104);
 }
 
@@ -181,7 +259,134 @@ failed_rebuild_rollback(void)
     assert(build(g_index_dir, base_vecs, new_tids) == CUVS_STATUS_PERSIST_FAILED);
     assert(unsetenv("CUVS_FAULT_RENAME_CAGRA") == 0);
     assert(tids_body_crc_of(e, &after) == 0 && before == after);
+    free_main_bf_cache(e); /* Verify the restored .vectors with a cold cache. */
     assert_bf_hit(e, 4, 104);
+}
+
+static IndexEntry *
+reload_from_disk(void)
+{
+    pthread_mutex_lock(&g_index_mutex);
+    (void) evict_entry(find_index(db, idx), 0, CUVS_EVICT_MANUAL_UNLOAD, 0,
+                       CUVS_RQ_MANUAL, NULL, false);
+    assert(find_index(db, idx) == NULL);
+    assert(load_index(db, idx, CUVS_RQ_LOAD) == 0);
+    pthread_mutex_unlock(&g_index_mutex);
+    return find_index(db, idx);
+}
+
+static void
+assert_graph_hit(IndexEntry *e, float first, uint64_t tid)
+{
+    float query[] = {first, 0};
+    CuvsSearchResult result;
+    assert(e && e->handle);
+    assert(cuvs_cagra_search(e->handle, query, dim, 1, &result, 0, 0, 0) == 0);
+    assert(result.distance == 0 && result.item_id >= 0 && result.item_id < e->n_vecs);
+    assert(e->tids[result.item_id] == tid);
+}
+
+static void
+cleanup_interrupted_build(void)
+{
+    DIR *dir = opendir(g_index_dir);
+    assert(dir);
+    struct dirent *entry;
+    while ((entry = readdir(dir)) != NULL)
+    {
+        if (strncmp(entry->d_name, ".cagra-build-", strlen(".cagra-build-")) != 0)
+            continue;
+        char backup[576];
+        snprintf(backup, sizeof(backup), "%s/%s", g_index_dir, entry->d_name);
+        const char *names[] = {"tids", "graph", "vectors"};
+        for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++)
+        {
+            char path[592];
+            snprintf(path, sizeof(path), "%s/%s", backup, names[i]);
+            assert(unlink(path) == 0 || errno == ENOENT);
+        }
+        assert(rmdir(backup) == 0);
+    }
+    closedir(dir);
+
+    char vectors[512], tmp[576];
+    vectors_file_path(vectors, sizeof(vectors), g_index_dir, db, idx);
+    snprintf(tmp, sizeof(tmp), "%s.tmp", vectors);
+    assert(unlink(tmp) == 0);
+}
+
+static void
+rebuild_crash_after_base_sync(void)
+{
+    assert(build(g_index_dir, base_vecs, base_tids) == CUVS_STATUS_OK);
+    IndexEntry *e = find_index(db, idx);
+    assert_bf_hit(e, 4, 104);
+    uint32_t before, after;
+    assert(tids_body_crc_of(e, &before) == 0);
+
+    pid_t child = fork();
+    assert(child >= 0);
+    if (child == 0)
+    {
+        fault = BUILD_CRASH;
+        (void) build(g_index_dir, replacement_vecs, base_tids);
+        _exit(1); /* The sync checkpoint was not reached. */
+    }
+    int status;
+    assert(waitpid(child, &status, 0) == child);
+    assert(WIFEXITED(status) && WEXITSTATUS(status) == EXIT_AFTER_GRAPH_SYNC);
+
+    e = reload_from_disk();
+    assert_graph_hit(e, 9, 104);
+    assert(tids_body_crc_of(e, &after) == 0 && before == after);
+    refresh_main_bf_cache(e, 0);
+    assert(!e->main_bf_idx);
+    cleanup_interrupted_build();
+}
+
+static void
+failed_build_fsync_rollback(void)
+{
+    assert(build(g_index_dir, base_vecs, base_tids) == CUVS_STATUS_OK);
+    assert_bf_hit(find_index(db, idx), 4, 104);
+    char alias[sizeof(g_index_dir) + sizeof("/.")];
+    snprintf(alias, sizeof(alias), "%s/.", g_index_dir);
+    const uint64_t new_tids[] = {201, 202, 203, 204};
+    fault = BUILD_SYNC_FAIL;
+    assert(build(alias, replacement_vecs, new_tids) == CUVS_STATUS_PERSIST_FAILED);
+    assert(graph_renamed && fault == NO_FAULT);
+
+    IndexEntry *e = reload_from_disk();
+    assert_graph_hit(e, 4, 104);
+    assert_bf_hit(e, 4, 104);
+}
+
+static void
+compact_save_retry(FixtureFault save_fault)
+{
+    assert(build(g_index_dir, base_vecs, base_tids) == CUVS_STATUS_OK);
+    IndexEntry *e = find_index(db, idx);
+    char tombstone[512];
+    snprintf(tombstone, sizeof(tombstone), "%s/%u_%u.tombstone", g_index_dir, db, idx);
+    uint32_t before, after;
+    assert(tids_body_crc_of(e, &before) == 0);
+    write_tombstone(104);
+    fault = save_fault;
+    assert(run_compact() == CUVS_STATUS_PERSIST_FAILED);
+    assert(e->n_vecs == 3 && e->compact_count == 1 && !e->file_current);
+    assert(access(tombstone, F_OK) == 0);
+
+    /* The dead TID is already gone in memory, but the disk is still old. */
+    assert(run_compact() == CUVS_STATUS_PERSIST_FAILED);
+    assert(access(tombstone, F_OK) == 0);
+    assert(tids_body_crc_of(e, &after) == 0 && before == after);
+
+    fault = NO_FAULT;
+    assert(run_compact() == CUVS_STATUS_OK);
+    assert(e->n_vecs == 3 && e->compact_count == 1 && e->file_current);
+    assert(access(tombstone, F_OK) != 0 && errno == ENOENT);
+    e = reload_from_disk();
+    assert(e->n_vecs == 3 && e->tids[2] == 103);
 }
 
 int
@@ -206,6 +411,14 @@ main(int argc, char **argv)
         alias_directory();
     else if (strcmp(argv[1], "rollback") == 0)
         failed_rebuild_rollback();
+    else if (strcmp(argv[1], "build-crash") == 0)
+        rebuild_crash_after_base_sync();
+    else if (strcmp(argv[1], "build-fsync-rollback") == 0)
+        failed_build_fsync_rollback();
+    else if (strcmp(argv[1], "compact-retry-unlink") == 0)
+        compact_save_retry(COMPACT_UNLINK_FAIL);
+    else if (strcmp(argv[1], "compact-retry-fsync") == 0)
+        compact_save_retry(COMPACT_SYNC_FAIL);
     else
         return 2;
 
