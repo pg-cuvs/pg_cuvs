@@ -119,7 +119,8 @@ Key differences from cagra:
   A DROP inside a transaction that is prepared (`PREPARE TRANSACTION`) is not notified.
   `handle_drop` releases what the entry holds (the CAGRA graph, the resident BF cache, the IVF-PQ
   handle, the CPU HNSW structure) and removes the index's files from the daemon's `index_dir`;
-  files written to a per-index `index_dir` (reloption) stay.
+  for legacy index formats, files written to a per-index `index_dir` (reloption) stay.
+  Page-format CAGRA sends its index directory in the DROP notice.
 
 ### 3.1b GPU-built CPU HNSW (`USING pg_cuvs_hnsw`)
 

@@ -213,7 +213,7 @@ exists for 0.9.0.
   The notice is now sent for `ivfpq` indexes too. The daemon frees the IVF-PQ handle and
   the CPU HNSW structure of the dropped index, which the drop did not free for any index
   type, and removes its `.ivfpq` and `.hnsw` files from the daemon's `index_dir` (files
-  written to a per-index `index_dir` reloption stay, as they did for every index type).
+  written to a per-index `index_dir` reloption stay for legacy index formats).
 - A GPU build without `CUVS_SDK_SOURCE_INCLUDE` failed to link with
   `ld: .../librapids_logger.so: error adding symbols: DSO missing from command line`.
   The wrapper expands `RMM_LOG_*`, which call `rapids_logger::logger::log`, and
