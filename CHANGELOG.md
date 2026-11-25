@@ -148,7 +148,8 @@ exists for 0.9.0.
   earlier release takes effect on the next rebuild or restore, which can change
   the index size, build time and search quality. Use the [catalog query](docs/reference.md#pg_cuvs_hnsw) to find indexes
   where the configured and built values differ. Source builds inherit the
-  converted M and warn once when an explicit `m` differs. When maintenance
+  converted M and warn once when an explicit `m` differs; that `m` still
+  applies when maintenance rebuilds the index from the heap. When maintenance
   rebuilds a source-based index from the heap through pgvector, an index
   without an explicit `m` now gets M 32 instead of 16. `ALTER INDEX ...
   SET (m = ...)` applies on the next rebuild.

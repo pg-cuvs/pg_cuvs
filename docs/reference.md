@@ -614,6 +614,8 @@ In source modes `nsw` and `hnsw`, the converter caps the CAGRA degree at 64 and 
 to an even number, then divides by two. Modes `hnswlib` and `hnswlib_file` read M from the SDK
 or file header. Omit `m` to inherit that value, including an existing header with M above 32.
 A differing explicit `m` produces one warning per build and the build uses the graph's M.
+The explicit value still applies when maintenance rebuilds the index from the heap through
+pgvector, so the index then has that M.
 Use `(pg_cuvs_hnsw_layer_counts('index_name')).m` to see the built value.
 `ALTER INDEX ... SET (m = ...)` changes the stored option without rebuilding the index. The new
 setting applies on the next `REINDEX` or other rebuild.
