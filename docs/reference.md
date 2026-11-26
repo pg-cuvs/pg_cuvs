@@ -310,7 +310,25 @@ N: intermediate_graph_degree (...) is below graph_degree (...)`, with a hint)
 instead of an error. Each message appears once per compaction and index, and
 not when there was nothing to compact. Under autovacuum the WARNING goes to
 the server log (the NOTICE does so only if `log_min_messages` is `notice` or
-lower). Compaction initially preserves the auto
+lower).
+
+Compaction rebuilds the graph with cuVS's automatic builder choice whatever
+the index's `build_algo` is; only `graph_degree` and
+`intermediate_graph_degree` are taken from the index. Compaction runs inside
+VACUUM, usually with nobody watching, so it uses the choice that falls back
+to another builder when memory is short: on fp16-safe data cuVS takes
+NN-descent when the device has enough memory for it and IVF-PQ otherwise
+(on fp16-unsafe data the daemon makes the same choice before the merge and
+uses fp32 IVF-PQ distances), and a memory failure leads to the explicit IVF-PQ
+retry described below. Measured on one A100 (100,000 rows of 768-dimension
+wiki embeddings, 20% deleted, then compacted; recall@10 over 500 queries; three
+runs per setting): an index built with `build_algo = 'ivf_pq'` had a
+recall@10 0.0002 to 0.0010 lower after compaction than after a `REINDEX` with
+`ivf_pq` (`graph_degree` 64 and 128), and an index built with `nn_descent`
+was within the run-to-run variation. All these values are 0.997 or higher; a
+lower search budget was not measured. To get a graph built with the
+index's `build_algo`, run `REINDEX`, which builds it with that method.
+Compaction initially preserves the auto
 builder choice. A memory failure from NN-descent or an unresolved auto choice
 triggers one IVF-PQ merge retry after the first merge's allocations unwind.
 The retry caps the IVF-PQ internal search batch at 4096 rows (the ordinary
@@ -547,7 +565,7 @@ cagra/ivfpq") rather than silently failing.
 |-----------|------|---------|----------------|-------|
 | `graph_degree` | int | `64` | 8–512 | CAGRA output graph degree. Compaction rebuilds the graph at this degree |
 | `intermediate_graph_degree` | int | `128` | 8–1024 | Must be ≥ `graph_degree` (fail-closed) |
-| `build_algo` | enum | `auto` | `auto`, `ivf_pq`, `nn_descent` | CAGRA build algorithm. The IVF-PQ kNN search (`ivf_pq`, or `auto` when cuVS picks IVF-PQ) uses fp32 LUT, internal and coarse distances when 4 x max\|x\|^2 of the corpus (max\|x\|^2 for inner product and cosine) reaches 65504, the fp16 maximum; otherwise cuVS's fp16 defaults stay. The daemon logs `[cuvs_cagra_build_multi] knn precision` with the bound and the choice. Compaction (`pg_cuvs_compact`, VACUUM) rebuilds the kept rows with cuVS's `auto` choice under the same rule and logs `[cuvs_cagra_compact] knn precision` |
+| `build_algo` | enum | `auto` | `auto`, `ivf_pq`, `nn_descent` | CAGRA build algorithm. The IVF-PQ kNN search (`ivf_pq`, or `auto` when cuVS picks IVF-PQ) uses fp32 LUT, internal and coarse distances when 4 x max\|x\|^2 of the corpus (max\|x\|^2 for inner product and cosine) reaches 65504, the fp16 maximum; otherwise cuVS's fp16 defaults stay. The daemon logs `[cuvs_cagra_build_multi] knn precision` with the bound and the choice. Compaction (`pg_cuvs_compact`, VACUUM) rebuilds the kept rows with cuVS's `auto` choice under the same rule, whatever this option is, and logs `[cuvs_cagra_compact] knn precision`; `REINDEX` rebuilds with this option |
 | `index_dir` | string | (uses `cuvs.index_dir`) | path | Per-index artifact directory (ADR-045); self-describes in `reloptions` so no-GUC sessions still find it |
 
 **Experimental page format (`CUVS_PAGE_FORMAT=1`).** An expression CAGRA index
