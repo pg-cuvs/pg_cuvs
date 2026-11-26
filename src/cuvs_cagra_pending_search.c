@@ -9,12 +9,17 @@
 #include "fmgr.h"
 #include "miscadmin.h"
 #include "utils/snapmgr.h"
+#ifdef CUVS_CAGRA_FOLD_ENABLED
+#include "access/htup_details.h"
+#include "catalog/index.h"
+#include "executor/executor.h"
+#include "utils/guc.h"
+#include "utils/memutils.h"
+#endif
 
 static bool
-copy_visible_vector(TupleTableSlot *slot, AttrNumber attribute, uint32 dim, float *out)
+copy_vector_datum(Datum datum, bool isnull, uint32 dim, float *out)
 {
-    bool isnull;
-    Datum datum = slot_getattr(slot, attribute, &isnull);
     struct varlena *full;
     int16 datum_dim;
     Size bytes = (Size) dim * sizeof(float);
@@ -38,6 +43,15 @@ copy_visible_vector(TupleTableSlot *slot, AttrNumber attribute, uint32 dim, floa
     if ((Pointer) full != DatumGetPointer(datum))
         pfree(full);
     return valid;
+}
+
+static bool
+copy_visible_vector(TupleTableSlot *slot, AttrNumber attribute, uint32 dim, float *out)
+{
+    bool isnull;
+    Datum datum = slot_getattr(slot, attribute, &isnull);
+
+    return copy_vector_datum(datum, isnull, dim, out);
 }
 
 static bool
@@ -163,6 +177,161 @@ cuvs_cagra_resident_supplement(Relation index, Relation heap, Snapshot snapshot,
 }
 
 #ifdef CUVS_CAGRA_FOLD_ENABLED
+static CuvsCagraSlotResult
+recovery_vector(Relation index, const CuvsCagraMeta *meta, BlockNumber blocks,
+                uint64 slot_number, IndexFetchTableData *fetch, TupleTableSlot *slot,
+                BlockNumber heap_blocks, Snapshot older, IndexInfo *info, EState *estate,
+                float *out, bool *dead_in_heap)
+{
+    ItemPointerData tid, original;
+    bool again = false;
+    CuvsCagraSlotResult state = cuvs_cagra_slot_tid(index, meta, blocks, slot_number, &tid);
+
+    *dead_in_heap = false;
+    if (state != CUVS_CAGRA_SLOT_LIVE)
+        return state;
+    if (ItemPointerGetBlockNumber(&tid) >= heap_blocks ||
+        ItemPointerGetOffsetNumber(&tid) > MaxHeapTuplesPerPage)
+        return CUVS_CAGRA_SLOT_BAD;
+    original = tid;
+    table_index_fetch_reset(fetch);
+    if (!table_index_fetch_tuple(fetch, &tid, GetActiveSnapshot(), slot, &again, NULL))
+    {
+        /* A delete invisible to the worker can still be visible to another
+         * snapshot using this head. Keep its original vector if readable. */
+        bool all_dead = false;
+
+        tid = original;
+        again = false;
+        table_index_fetch_reset(fetch);
+        if (!table_index_fetch_tuple(fetch, &tid, older, slot, &again, &all_dead))
+        {
+            *dead_in_heap = all_dead;
+            return all_dead ? CUVS_CAGRA_SLOT_DEAD : CUVS_CAGRA_SLOT_BAD;
+        }
+    }
+    if (info)
+    {
+        Datum values[INDEX_MAX_KEYS];
+        bool nulls[INDEX_MAX_KEYS];
+        ExprContext *expr = GetPerTupleExprContext(estate);
+        MemoryContext previous;
+
+        ResetExprContext(expr);
+        expr->ecxt_scantuple = slot;
+        previous = MemoryContextSwitchTo(expr->ecxt_per_tuple_memory);
+        FormIndexDatum(info, slot, estate, values, nulls);
+        bool valid = copy_vector_datum(values[0], nulls[0], meta->dim, out);
+        MemoryContextSwitchTo(previous);
+        return valid ? CUVS_CAGRA_SLOT_LIVE : CUVS_CAGRA_SLOT_BAD;
+    }
+    return copy_visible_vector(slot, index->rd_index->indkey.values[0], meta->dim, out) ?
+        CUVS_CAGRA_SLOT_LIVE : CUVS_CAGRA_SLOT_BAD;
+}
+
+/* The caller guards this heap against VACUUM while spooling. A physical
+ * invalid slot or a PG-confirmed globally dead HOT chain gets a placeholder.
+ * A merely invisible row must be recovered for older snapshots. */
+bool
+cuvs_cagra_spool_recovery(Relation index, Relation heap, const CuvsCagraMeta *meta,
+                         uint64 from, File file, uint32 *placeholder_rows, uint32 *physical_dead_slots)
+{
+    const uint32 batch_rows = 64;
+    Size row_bytes = (Size) meta->dim * sizeof(float);
+    BlockNumber blocks = RelationGetNumberOfBlocks(index);
+    BlockNumber heap_blocks = RelationGetNumberOfBlocks(heap);
+    float *sample, *batch;
+    uint64 sample_slot;
+    bool expression = index->rd_index->indkey.values[0] == 0;
+    bool ok = false;
+    Oid saved_user;
+    int saved_sec, nest_level = 0;
+    IndexInfo *info = NULL;
+    EState *estate = NULL;
+    SnapshotData older = {0};
+
+    if (heap->rd_rel->relam != HEAP_TABLE_AM_OID || !row_bytes ||
+        from >= meta->n_slots || meta->dead_slots == meta->n_slots)
+        return false;
+    *placeholder_rows = 0;
+    *physical_dead_slots = 0;
+    sample = palloc(row_bytes);
+    batch = palloc(batch_rows * row_bytes);
+    TupleTableSlot *slot = table_slot_create(heap, NULL);
+    IndexFetchTableData *fetch = table_index_fetch_begin(heap);
+    InitNonVacuumableSnapshot(older, GlobalVisTestFor(heap));
+
+    GetUserIdAndSecContext(&saved_user, &saved_sec);
+    if (expression)
+    {
+        SetUserIdAndSecContext(heap->rd_rel->relowner, saved_sec | SECURITY_RESTRICTED_OPERATION);
+        nest_level = NewGUCNestLevel();
+        estate = CreateExecutorState();
+        estate->es_snapshot = GetActiveSnapshot();
+        info = BuildIndexInfo(index);
+    }
+
+    for (sample_slot = 0; sample_slot < meta->n_slots; ++sample_slot)
+    {
+        bool dead_in_heap;
+
+        CHECK_FOR_INTERRUPTS();
+        if (recovery_vector(index, meta, blocks, sample_slot, fetch, slot,
+                            heap_blocks, &older, info, estate, sample, &dead_in_heap) == CUVS_CAGRA_SLOT_LIVE)
+            break;
+    }
+    if (sample_slot == meta->n_slots)
+        goto done;
+
+    for (uint64 start = from; start < meta->n_slots; start += batch_rows)
+    {
+        uint32 count = Min((uint64) batch_rows, meta->n_slots - start);
+        int bytes = count * row_bytes;
+
+        for (uint32 i = 0; i < count; ++i)
+        {
+            uint64 slot_number = start + i;
+            float *out = batch + (Size) i * meta->dim;
+            CuvsCagraSlotResult state;
+            bool dead_in_heap;
+
+            CHECK_FOR_INTERRUPTS();
+            if (slot_number == sample_slot)
+            {
+                memcpy(out, sample, row_bytes);
+                continue;
+            }
+            state = recovery_vector(index, meta, blocks, slot_number, fetch, slot,
+                                    heap_blocks, &older, info, estate, out, &dead_in_heap);
+            if (state == CUVS_CAGRA_SLOT_BAD)
+                goto done;
+            if (state == CUVS_CAGRA_SLOT_DEAD)
+            {
+                memcpy(out, sample, row_bytes);
+                ++*placeholder_rows;
+                if (!dead_in_heap)
+                    ++*physical_dead_slots;
+            }
+        }
+        if (FileWrite(file, (char *) batch, bytes, (off_t) (start - from) * row_bytes, 0) != bytes)
+            goto done;
+    }
+    ok = true;
+
+done:
+    if (expression)
+    {
+        FreeExecutorState(estate);
+        AtEOXact_GUC(false, nest_level);
+        SetUserIdAndSecContext(saved_user, saved_sec);
+    }
+    table_index_fetch_end(fetch);
+    ExecDropSingleTupleTableSlot(slot);
+    pfree(batch);
+    pfree(sample);
+    return ok;
+}
+
 bool
 cuvs_cagra_fold_supplement(Relation index, Relation heap, Snapshot snapshot,
                            const CuvsCagraMeta *meta, BlockNumber blocks,

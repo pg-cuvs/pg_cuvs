@@ -306,6 +306,14 @@ states (stale / delta / tombstone). All artifacts live under `index_dir` named
 only complete, valid pairs — everything else is skipped (fail-closed). Phase 3D registers
 cold indexes (those with a `.relfilenode` marker but no local `.cagra`) for background GCS warmup.
 
+With native page-format folding enabled, PostgreSQL's WAL-published head
+remains authoritative. The daemon checkpoints folded GPU graphs and can
+restore a matching graph or rebuild from the PostgreSQL heap. During
+shutdown it rejects new recovery GPU claims and drains existing ones,
+including GPU frees delegated to the final holder of a retired graph.
+If recovery still owns GPU resources after a 10-second drain, the daemon
+exits with failure without running normal CUDA resource teardown.
+
 ---
 
 ## 6. Memory admission, accounting, and eviction

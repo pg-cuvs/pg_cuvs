@@ -149,7 +149,13 @@ CuvsCagraFoldStatus cuvs_cagra_prepare_fold(Relation index,
 CuvsCagraFoldStatus cuvs_cagra_publish_fold(Relation index,
                         const CuvsCagraFoldCandidate *candidate, XLogRecPtr *commit_lsn);
 #ifdef CUVS_CAGRA_FOLD_ENABLED
+struct CuvsPageRecoveryHead;
+struct CuvsPageRecoveryHead *cuvs_cagra_read_lineage(Relation index,
+    const CuvsCagraMeta *expected, uint32 *count, XLogRecPtr *lsn);
 void cuvs_cagra_run_fold_worker(Relation index);
+void cuvs_cagra_register_recovery_launcher(void);
+const char *cuvs_cagra_recovery_options(Relation index, int *degree,
+                                      int *intermediate, uint32 *algo);
 #endif
 CuvsCagraSlotResult cuvs_cagra_pending_tid(Relation index, const CuvsCagraMeta *meta,
                                          BlockNumber nblocks, BlockNumber block,

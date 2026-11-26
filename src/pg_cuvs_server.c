@@ -41,6 +41,8 @@
 #include "cuvs_cagra_fold.h"
 #ifdef CUVS_CAGRA_FOLD_ENABLED
 #include "cuvs_cagra_fold_capacity.h"
+#include "cuvs_page_recovery.h"
+#include <limits.h>
 #endif
 #include "cuvs_hnsw_build_common.h"
 #include "cuvs_hnsw_upper.h"
@@ -425,6 +427,18 @@ typedef struct PageCagraGraph
     uint64_t fold_offer_order;
     bool fold_seen_by_pg;
 #ifdef CUVS_CAGRA_FOLD_ENABLED
+    CuvsPageGraphBoundary boundary;
+    CuvsPageOverlayChunk *proxy_rows;
+    uint64_t placeholder_boot;
+    uint64_t producer_boot; /* physical graph provenance, independent of overlay rollover */
+    bool recovery_placeholders;
+    bool recovery_retire_owner;
+    uint32_t recovery_physical_dead;
+    CuvsPageRecoveryHead saved_head;
+    uint64_t saved_at_us;
+    uint64_t save_retry_us;
+    uint64_t reconcile_after_us;
+    char storage_root[CUVS_PAGE_INDEX_DIR_SIZE];
     uint64_t fold_pending_since;
     uint64_t fold_retry_after;
     uint32_t fold_live_base_slot;
@@ -443,6 +457,92 @@ typedef struct PageGraphFoldRef
 static PageCagraGraph *g_page_graphs;
 static PageCagraGraph *g_page_ancestors;
 static int g_n_page_graphs;
+#ifdef CUVS_CAGRA_FOLD_ENABLED
+/* A gate protects one (db, index) namespace. File operations within it
+ * always select an exact incarnation. A page DROP covers that namespace. */
+typedef struct PageStorageScope
+{
+    struct PageStorageScope *next;
+    uint32_t db_oid, index_oid;
+    unsigned refs;
+    uint64_t authority_epoch;
+    uint64_t authority_sysid, authority_index_nonce, authority_base_nonce, authority_boot_id;
+    CuvsPageRecoveryHead authority_target;
+    pthread_mutex_t gate;
+} PageStorageScope;
+
+static pthread_mutex_t g_page_storage_scopes_mutex = PTHREAD_MUTEX_INITIALIZER;
+static PageStorageScope *g_page_storage_scopes;
+
+static PageStorageScope *
+page_storage_get(uint32_t db, uint32_t index)
+{
+    PageStorageScope *scope;
+
+    pthread_mutex_lock(&g_page_storage_scopes_mutex);
+    for (scope = g_page_storage_scopes; scope; scope = scope->next)
+        if (scope->db_oid == db && scope->index_oid == index)
+            break;
+    if (!scope)
+    {
+        scope = calloc(1, sizeof(*scope));
+        if (scope && pthread_mutex_init(&scope->gate, NULL) != 0)
+        {
+            free(scope);
+            scope = NULL;
+        }
+        if (scope)
+        {
+            scope->db_oid = db;
+            scope->index_oid = index;
+            scope->next = g_page_storage_scopes;
+            g_page_storage_scopes = scope;
+        }
+    }
+    if (scope)
+        ++scope->refs;
+    pthread_mutex_unlock(&g_page_storage_scopes_mutex);
+    return scope;
+}
+
+static void
+page_storage_put(PageStorageScope *scope)
+{
+    if (!scope)
+        return;
+    pthread_mutex_lock(&g_page_storage_scopes_mutex);
+    if (--scope->refs == 0)
+    {
+        PageStorageScope **link = &g_page_storage_scopes;
+
+        while (*link != scope)
+            link = &(*link)->next;
+        *link = scope->next;
+        pthread_mutex_destroy(&scope->gate);
+        free(scope);
+    }
+    pthread_mutex_unlock(&g_page_storage_scopes_mutex);
+}
+
+/* The caller holds L0. Legacy DROP revokes a same-OID job without
+ * waiting on its gate. No unrelated namespace takes that gate. */
+static void
+page_storage_invalidate(uint32_t db, uint32_t index)
+{
+    pthread_mutex_lock(&g_page_storage_scopes_mutex);
+    for (PageStorageScope *scope = g_page_storage_scopes; scope; scope = scope->next)
+        if (scope->db_oid == db && scope->index_oid == index)
+        {
+            ++scope->authority_epoch;
+            break;
+        }
+    pthread_mutex_unlock(&g_page_storage_scopes_mutex);
+}
+
+static bool g_page_recovery_active[CUVS_MAX_GPUS];
+/* Protected by L0. Includes retired handles until their GPU free completes. */
+static unsigned g_page_recovery_owners;
+#endif
 static uint64_t g_page_access;
 static uint64_t g_page_fold_offer_order;
 static uint64_t g_page_daemon_id;
@@ -544,6 +644,11 @@ finish_page_graph_dispose(PageCagraGraph *entry)
     }
     g_page_graph_bytes[entry->gpu] -= entry->bytes + entry->bf_bytes[0] + entry->bf_bytes[1];
     defer_page_overlay_release(entry->overlay.head);
+#ifdef CUVS_CAGRA_FOLD_ENABLED
+    defer_page_overlay_release(entry->proxy_rows);
+    if (entry->recovery_retire_owner)
+        --g_page_recovery_owners;
+#endif
     free(entry);
 }
 
@@ -746,6 +851,14 @@ page_graph_register_fold_locked(const PageGraphFoldRef *source,
     candidate->metric = parent->metric;
     candidate->gpu = parent->gpu;
     candidate->handle = handle;
+#ifdef CUVS_CAGRA_FOLD_ENABLED
+    candidate->boundary.graph_rows = candidate->n_slots;
+    candidate->placeholder_boot = parent->placeholder_boot;
+    candidate->producer_boot = event->boot_id;
+    candidate->recovery_placeholders = parent->recovery_placeholders;
+    candidate->recovery_physical_dead = parent->recovery_physical_dead;
+    memcpy(candidate->storage_root, parent->storage_root, sizeof(candidate->storage_root));
+#endif
     candidate->bytes = bytes;
     candidate->registered_order = ++g_page_access;
     candidate->fold_event = *event;
@@ -785,6 +898,8 @@ page_graph_use_boot_locked(PageCagraGraph *graph, uint64_t boot_id,
     *obsolete = cuvs_page_overlay_start_boot(&graph->overlay, boot_id, graph->folded);
     graph->pg_boot_started_us = 0;
 #ifdef CUVS_CAGRA_FOLD_ENABLED
+    if (!graph->producer_boot)
+        graph->producer_boot = boot_id;
     graph->fold_pending_since = 0;
     graph->fold_retry_after = 0;
     graph->fold_live_base_slot = 0;
@@ -802,7 +917,16 @@ drop_page_graphs(uint32_t db_oid, uint32_t index_oid)
     {
         PageCagraGraph *entry = *link;
         if (entry->db_oid == db_oid && entry->index_oid == index_oid)
+        {
+#ifdef CUVS_CAGRA_FOLD_ENABLED
+            *link = entry->next;
+            --g_n_page_graphs;
+            retire_page_graph_locked(entry, true);
+            entry->search_invalidated = true;
+#else
             free_page_graph(link);
+#endif
+        }
         else
             link = &entry->next;
     }
@@ -8712,20 +8836,347 @@ persist_empty_page_build(const CuvsCmdFrame *cmd, const CuvsPageBuildRequest *re
     return -1;
 }
 
+#ifdef CUVS_CAGRA_FOLD_ENABLED
+_Static_assert(sizeof(CuvsPageManifest) == 120, "page manifest layout");
+_Static_assert(offsetof(CuvsPageManifest, manifest_crc) == 116, "page manifest CRC position");
+_Static_assert(offsetof(CuvsPageManifest, placeholder_boot) == CUVS_PAGE_MANIFEST_V1_SIZE,
+               "page manifest v1 prefix");
+_Static_assert(sizeof(CuvsPageRecoveryAuthority) == 24 && sizeof(CuvsPageRecoveryOffer) == 128,
+               "page recovery grant frame layout");
+_Static_assert(sizeof(CuvsPageCheckpointRef) == 72, "page reconciliation frame layout");
+
+static bool
+page_checkpoint_paths(const char *root, uint32_t db, uint32_t index, uint64_t incarnation,
+                      uint64_t nonce, char graph[512], char artifact[512], char manifest[512])
+{
+    return snprintf(graph, 512, "%s/%u_%u/%016llx/%016llx", root, db, index,
+                    (unsigned long long) incarnation, (unsigned long long) nonce) < 512 &&
+        snprintf(artifact, 512, "%s/index.cagra", graph) < 512 &&
+        snprintf(manifest, 512, "%s/manifest", graph) < 512;
+}
+
+static int
+open_page_child_dir(int parent, const char *name)
+{
+    int child = openat(parent, name, O_RDONLY | O_NOFOLLOW | O_DIRECTORY);
+
+    close(parent);
+    return child;
+}
+
+static int
+open_page_incarnation(const char *root, const CuvsCmdFrame *cmd, uint64_t index_nonce)
+{
+    char name[32];
+    int dir = open(root, O_RDONLY | O_DIRECTORY);
+
+    if (dir < 0)
+        return -1;
+    snprintf(name, sizeof(name), "%u_%u", cmd->db_oid, cmd->index_oid);
+    dir = open_page_child_dir(dir, name);
+    if (dir < 0)
+        return -1;
+    snprintf(name, sizeof(name), "%016llx", (unsigned long long) index_nonce);
+    return open_page_child_dir(dir, name);
+}
+
+static bool
+read_page_manifest_at(int dir, const CuvsCmdFrame *cmd, const CuvsPageRecoveryRequest *request,
+                      uint64_t nonce, CuvsPageManifest *manifest)
+{
+    struct stat st;
+    bool valid;
+    int fd = openat(dir, "manifest", O_RDONLY | O_NOFOLLOW | O_NONBLOCK);
+
+    if (fd < 0)
+        return false;
+    memset(manifest, 0, sizeof(*manifest));
+    valid = fstat(fd, &st) == 0 && S_ISREG(st.st_mode) &&
+        (st.st_size == sizeof(*manifest) || st.st_size == CUVS_PAGE_MANIFEST_V1_SIZE) &&
+        read(fd, manifest, (size_t) st.st_size) == st.st_size;
+    close(fd);
+    if (!valid)
+        return false;
+    if (st.st_size == CUVS_PAGE_MANIFEST_V1_SIZE)
+    {
+        /* v1 lacks protection metadata. Keep its identity and receipt for
+         * checked GC, while disallowing native load under any PG boot. */
+        if (manifest->version != 1 ||
+            manifest->flags != cuvs_crc32(manifest, offsetof(CuvsPageManifest, flags)))
+            return false;
+        manifest->manifest_crc = manifest->flags;
+        manifest->flags = 0;
+    }
+    else if (manifest->version != CUVS_PAGE_MANIFEST_VERSION ||
+             manifest->manifest_crc != cuvs_crc32(manifest, offsetof(CuvsPageManifest, manifest_crc)) ||
+             !cuvs_page_manifest_protection_valid(manifest))
+        return false;
+    return manifest->magic == CUVS_PAGE_MANIFEST_MAGIC &&
+        manifest->graph_degree > 0 && manifest->graph_degree <= 512 &&
+        manifest->system_identifier == request->system_identifier &&
+        manifest->db_oid == cmd->db_oid && manifest->index_oid == cmd->index_oid &&
+        manifest->index_nonce == request->index_nonce && manifest->base_nonce == request->base_nonce &&
+        manifest->dim == cmd->dim && manifest->metric == cmd->metric && manifest->build_xid &&
+        manifest->head.graph_nonce == nonce &&
+        cuvs_page_recovery_lineage(&manifest->head, &manifest->head);
+}
+
+static bool
+read_page_manifest(const char *root, const CuvsCmdFrame *cmd,
+                   const CuvsPageRecoveryRequest *request, const CuvsPageRecoveryHead *head,
+                   CuvsPageManifest *manifest, int *artifact_fd)
+{
+    char name[17];
+    struct stat st;
+    bool valid;
+    int dir = open_page_incarnation(root, cmd, request->index_nonce);
+    int fd;
+
+    if (dir < 0)
+        return false;
+    snprintf(name, sizeof(name), "%016llx", (unsigned long long) head->graph_nonce);
+    dir = open_page_child_dir(dir, name);
+    if (dir < 0)
+        return false;
+    valid = read_page_manifest_at(dir, cmd, request, head->graph_nonce, manifest) &&
+        cuvs_page_manifest_boot_usable(manifest, request->boot_id) &&
+        cuvs_page_recovery_head_matches(&manifest->head, head);
+    if (valid)
+    {
+        fd = openat(dir, "index.cagra", O_RDONLY | O_NOFOLLOW | O_NONBLOCK);
+        valid = fd >= 0 && fstat(fd, &st) == 0 && S_ISREG(st.st_mode) && st.st_size > 0 &&
+            (uint64_t) st.st_size == manifest->artifact_bytes;
+        if (valid && artifact_fd)
+            *artifact_fd = fd;
+        else if (fd >= 0)
+            close(fd);
+    }
+    close(dir);
+    return valid;
+}
+
+#define PAGE_CHECKPOINT_CRC_BLOCK_BYTES ((size_t) 64 << 20)
+
+/* Keep checkpoint reads bounded and pinned to the caller's /proc/self/fd
+ * path. Only background checkpoint verification uses this reader. */
+static bool
+crc32_page_checkpoint(const char *path, uint64_t artifact_bytes, uint32_t *out)
+{
+    unsigned char serial_buffer[65536];
+    const size_t block_bytes = artifact_bytes < PAGE_CHECKPOINT_CRC_BLOCK_BYTES ?
+        (size_t) artifact_bytes : PAGE_CHECKPOINT_CRC_BLOCK_BYTES;
+    const long cpus = sysconf(_SC_NPROCESSORS_ONLN);
+    const int threads = cpus > 1 ? cuvs_crc_threads(cpus > INT_MAX ? INT_MAX : (int) cpus) : 1;
+    unsigned char *parallel_buffer;
+    unsigned char *buffer;
+    size_t capacity;
+    uint64_t remaining = artifact_bytes;
+    uint32_t crc;
+    bool complete;
+    FILE *file = fopen(path, "rb");
+
+    if (!file)
+        return false;
+    parallel_buffer = threads > 1 && block_bytes > CUVS_CRC_CHUNK_BYTES ? malloc(block_bytes) : NULL;
+    buffer = parallel_buffer ? parallel_buffer : serial_buffer;
+    capacity = parallel_buffer ? block_bytes : sizeof(serial_buffer);
+    /* The parallel helper returns a finalized IEEE CRC. Zero is the
+     * finalized CRC of an empty prefix for combine(). */
+    crc = parallel_buffer ? 0 : cuvs_crc32_stream_begin();
+    while (remaining)
+    {
+        size_t want = remaining < capacity ? (size_t) remaining : capacity;
+
+        if (fread(buffer, 1, want, file) != want)
+            break;
+        if (parallel_buffer)
+            crc = cuvs_crc32_combine(crc, cuvs_crc32_parallel(buffer, want, threads), want);
+        else
+            crc = cuvs_crc32_stream_update(crc, buffer, want);
+        remaining -= want;
+    }
+    complete = !remaining && fgetc(file) == EOF && !ferror(file);
+    if (complete && !parallel_buffer)
+        crc = cuvs_crc32_stream_end(crc);
+    free(parallel_buffer);
+    if (fclose(file) != 0 || !complete)
+        return false;
+    *out = crc;
+    return true;
+}
+
+/* Use the same inode for validation and native deserialization. */
+static bool
+validate_page_checkpoint(int fd, const CuvsPageManifest *manifest, char path[64])
+{
+    struct stat st;
+    uint32_t crc;
+
+    snprintf(path, 64, "/proc/self/fd/%d", fd);
+    return crc32_page_checkpoint(path, manifest->artifact_bytes, &crc) && crc == manifest->artifact_crc &&
+        fstat(fd, &st) == 0 && (uint64_t) st.st_size == manifest->artifact_bytes;
+}
+
+#ifdef CUVS_TEST_HOOKS
+static void page_overlay_test_gate(const char *name);
+
+static void
+page_checkpoint_test_point(const CuvsPageManifest *manifest, const char *phase)
+{
+    const char *selected = getenv("CUVS_TEST_PAGE_CHECKPOINT_PHASE");
+
+    if (!selected || manifest->head.folded < 256)
+        return;
+    LOG_INFO("[page_checkpoint_phase] nonce=%016llx phase=%s\n",
+             (unsigned long long) manifest->head.graph_nonce, phase);
+    if (!strcmp(selected, phase))
+        page_overlay_test_gate("CUVS_TEST_PAGE_CHECKPOINT_PHASE_FIFO");
+}
+#else
+#define page_checkpoint_test_point(manifest, phase) ((void) 0)
+#endif
+
+static int
+persist_page_checkpoint(const CuvsCmdFrame *cmd, const char *root, CuvsCagraIndex handle,
+                        int gpu, CuvsPageManifest *manifest, bool replace)
+{
+    CuvsPageBuildRequest build = {.index_nonce = manifest->index_nonce};
+    char index_path[512], incarnation[512], graph[512], temporary[512];
+    char artifact[512], filename[512];
+    struct stat st;
+    int parent, fd, result = -1;
+    bool renamed = false, exchanged = false, retain_old = false;
+
+    CuvsCagraFoldShape shape;
+
+    if (!cuvs_page_manifest_protection_valid(manifest) ||
+        cuvs_cagra_fold_shape(handle, &shape) != 0 ||
+        shape.rows != manifest->head.n_slots || shape.dim != manifest->dim ||
+        !shape.degree || shape.degree > 512)
+        return -1;
+    manifest->graph_degree = (uint32_t) shape.degree;
+    if (!page_checkpoint_paths(root, cmd->db_oid, cmd->index_oid, manifest->index_nonce,
+                               manifest->head.graph_nonce, graph, artifact, filename) ||
+        page_incarnation_dirs(cmd, &build, root, index_path, incarnation) != 0 ||
+        snprintf(temporary, sizeof(temporary), "%s/.save-XXXXXX", incarnation) >= (int) sizeof(temporary) ||
+        !mkdtemp(temporary))
+        return -1;
+
+    if (snprintf(artifact, sizeof(artifact), "%s/index.cagra", temporary) >= (int) sizeof(artifact) ||
+        snprintf(filename, sizeof(filename), "%s/manifest", temporary) >= (int) sizeof(filename))
+        goto done;
+#ifdef CUVS_TEST_HOOKS
+    if (cuvs_fault("CUVS_FAULT_PAGE_PERSIST"))
+        goto done;
+#endif
+    if (cuvs_cagra_serialize(handle, artifact, gpu) != 0 ||
+        lstat(artifact, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size <= 0 ||
+        crc32_file(artifact, &manifest->artifact_crc) != 0 ||
+        sync_build_path(artifact, O_NOFOLLOW) != 0)
+        goto done;
+    page_checkpoint_test_point(manifest, "artifact-fsynced");
+    manifest->magic = CUVS_PAGE_MANIFEST_MAGIC;
+    manifest->version = CUVS_PAGE_MANIFEST_VERSION;
+    manifest->artifact_bytes = (uint64_t) st.st_size;
+    manifest->manifest_crc = cuvs_crc32(manifest, offsetof(CuvsPageManifest, manifest_crc));
+    fd = open(filename, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0600);
+    if (fd < 0)
+        goto done;
+    bool synced = write(fd, manifest, sizeof(*manifest)) == sizeof(*manifest) && fsync(fd) == 0;
+    if (close(fd) != 0 || !synced ||
+        write_page_build_xid(temporary, "build.xid", manifest->build_xid) != 0)
+        goto done;
+    page_checkpoint_test_point(manifest, "before-staging-fsync");
+    if (sync_build_path(temporary, O_DIRECTORY) != 0)
+        goto done;
+    page_checkpoint_test_point(manifest, "after-staging-fsync");
+
+    /* A rehydration can replace a corrupt checkpoint of the same head.
+     * The exchanged directory stays private until it is removed below. */
+    if (rename(temporary, graph) == 0)
+        renamed = true;
+#ifdef __linux__
+    else if (replace && renameat2(AT_FDCWD, temporary, AT_FDCWD, graph, RENAME_EXCHANGE) == 0)
+        renamed = exchanged = true;
+#else
+    (void) replace;
+#endif
+    if (renamed)
+    {
+        page_checkpoint_test_point(manifest, "after-rename");
+        if (sync_page_incarnation(root, index_path, incarnation) == 0)
+        {
+            page_checkpoint_test_point(manifest, "after-parent-fsync");
+            result = 0;
+        }
+    }
+#ifdef __linux__
+    if (exchanged && result != 0)
+    {
+        if (renameat2(AT_FDCWD, temporary, AT_FDCWD, graph, RENAME_EXCHANGE) == 0)
+            (void) sync_page_incarnation(root, index_path, incarnation);
+        else
+            retain_old = true;
+    }
+#endif
+done:
+    parent = open(incarnation, O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
+    if (parent >= 0)
+    {
+        if (!retain_old)
+            remove_page_tree_at(parent, strrchr(temporary, '/') + 1);
+        if (renamed && result != 0 && !replace)
+            remove_page_tree_at(parent, strrchr(graph, '/') + 1);
+        (void) fsync(parent);
+        close(parent);
+    }
+    if (result != 0)
+    {
+        rmdir(incarnation);
+        rmdir(index_path);
+    }
+    return result;
+}
+#endif
+
 /* An unregistered page-format graph is identified by both nonces. */
 static int
 persist_page_build(const CuvsCmdFrame *cmd, const CuvsPageBuildRequest *request,
                    const char *root, CuvsCagraIndex handle, int gpu, uint64_t *graph_nonce,
                    CuvsHnswIndex *cpu_hnsw)
 {
-    char index_path[512], incarnation[512], graph[512], filename[512], graph_name[17];
+    char index_path[512], incarnation[512], graph[512], filename[512];
+#ifndef CUVS_CAGRA_FOLD_ENABLED
+    char graph_name[17];
     bool graph_created = false;
+#endif
     uint64_t nonce;
 
     do {
         if (shm_key_random((unsigned char *) &nonce, sizeof(nonce)) != 0)
             return -1;
     } while (nonce == 0);
+#ifdef CUVS_CAGRA_FOLD_ENABLED
+    CuvsPageManifest manifest = {
+        .system_identifier = request->system_identifier, .index_nonce = request->index_nonce,
+        .base_nonce = nonce, .build_xid = request->build_xid,
+        .head = {.graph_nonce = nonce, .n_slots = cmd->n_vecs},
+        .db_oid = cmd->db_oid, .index_oid = cmd->index_oid, .dim = cmd->dim, .metric = cmd->metric,
+    };
+
+    PageStorageScope *scope = page_storage_get(cmd->db_oid, cmd->index_oid);
+
+    if (!scope)
+        return -1;
+    pthread_mutex_lock(&scope->gate);
+    int result = persist_page_checkpoint(cmd, root, handle, gpu, &manifest, false);
+    pthread_mutex_unlock(&scope->gate);
+    page_storage_put(scope);
+    if (result != 0 ||
+        !page_checkpoint_paths(root, cmd->db_oid, cmd->index_oid, request->index_nonce,
+                               nonce, graph, index_path, incarnation))
+        return -1;
+#else
     snprintf(graph_name, sizeof(graph_name), "%016llx", (unsigned long long) nonce);
     if (page_incarnation_dirs(cmd, request, root, index_path, incarnation) != 0)
         return -1;
@@ -8744,6 +9195,7 @@ persist_page_build(const CuvsCmdFrame *cmd, const CuvsPageBuildRequest *request,
         sync_build_path(graph, O_DIRECTORY) != 0 ||
         sync_page_incarnation(root, index_path, incarnation) != 0)
         goto failed;
+#endif
     if (cmd->use_cpu_hnsw &&
         snprintf(filename, sizeof(filename), "%s/index.hnsw", graph) < (int) sizeof(filename) &&
         cuvs_hnsw_serialize(handle, filename, gpu) == CUVS_HNSW_SERIALIZE_OK)
@@ -8754,6 +9206,7 @@ persist_page_build(const CuvsCmdFrame *cmd, const CuvsPageBuildRequest *request,
     *graph_nonce = nonce;
     return 0;
 
+#ifndef CUVS_CAGRA_FOLD_ENABLED
 failed:
     if (graph_created)
     {
@@ -8767,6 +9220,7 @@ failed:
     rmdir(incarnation);
     rmdir(index_path);
     return -1;
+#endif
 }
 
 static bool
@@ -9289,6 +9743,14 @@ handle_build(int client_fd, const CuvsCmdFrame *cmd)
             entry->registered_order = ++g_page_access;
             entry->cpu_hnsw = page_cpu_hnsw;
             entry->bytes = final;
+#ifdef CUVS_CAGRA_FOLD_ENABLED
+            entry->boundary.graph_rows = entry->n_slots;
+            entry->saved_head = (CuvsPageRecoveryHead) {
+                .graph_nonce = entry->graph_nonce, .n_slots = entry->n_slots,
+            };
+            entry->saved_at_us = admission_mono_us();
+            memcpy(entry->storage_root, page_root, sizeof(entry->storage_root));
+#endif
             entry->next = g_page_graphs;
             g_page_graphs = entry;
             ++g_n_page_graphs;
@@ -10840,6 +11302,9 @@ handle_drop(int client_fd, const CuvsCmdFrame *cmd)
     uint32_t idx = cmd->index_oid;
     char     root[CUVS_PAGE_INDEX_DIR_SIZE];
     const char *directory = g_index_dir;
+#ifdef CUVS_CAGRA_FOLD_ENABLED
+    PageStorageScope *scope = NULL;
+#endif
 
     if (cmd->op == CUVS_OP_DROP_PAGES_INDEX)
     {
@@ -10850,15 +11315,50 @@ handle_drop(int client_fd, const CuvsCmdFrame *cmd)
         directory = resolve_page_root(requested, root) ? root : NULL;
     }
 
+#ifdef CUVS_CAGRA_FOLD_ENABLED
+    if (cmd->op == CUVS_OP_DROP_PAGES_INDEX && directory)
+    {
+        scope = page_storage_get(db, idx);
+        if (scope)
+            pthread_mutex_lock(&scope->gate);
+        else
+            directory = NULL;
+    }
+#endif
     pthread_mutex_lock(&g_index_mutex);
 
+#ifdef CUVS_CAGRA_FOLD_ENABLED
+    page_storage_invalidate(db, idx);
+#endif
     drop_page_graphs(db, idx);
 
     /* Free the resident entry (if any) and compact the registry. */
     IndexEntry *e = find_index(db, idx);
+#ifdef CUVS_CAGRA_FOLD_ENABLED
+    /* A page DROP can inherit the legacy graph of the same OID. The
+     * committed cleanup must outlive the socket, but that graph must stay
+     * alive until its existing export releases the last in-flight reference. */
+    if (cmd->op == CUVS_OP_DROP_PAGES_INDEX)
+    {
+        while (e && e->handle && e->inflight > 0 && !g_shutdown)
+        {
+            pthread_mutex_unlock(&g_index_mutex);
+            (void) poll(NULL, 0, 10);
+            pthread_mutex_lock(&g_index_mutex);
+            e = find_index(db, idx);
+        }
+    }
+#endif
     if (e && e->handle && e->inflight > 0)
     {
         pthread_mutex_unlock(&g_index_mutex);
+#ifdef CUVS_CAGRA_FOLD_ENABLED
+        if (scope)
+        {
+            pthread_mutex_unlock(&scope->gate);
+            page_storage_put(scope);
+        }
+#endif
         send_error_code(client_fd, CUVS_STATUS_BUILD_FAILED,
                         "source graph is being exported; retry drop");
         return;
@@ -10925,7 +11425,11 @@ handle_drop(int client_fd, const CuvsCmdFrame *cmd)
 
     pthread_mutex_unlock(&g_index_mutex);
 
+#ifdef CUVS_CAGRA_FOLD_ENABLED
+    int rootfd = scope ? open(directory, O_RDONLY | O_DIRECTORY) : -1;
+#else
     int rootfd = open(directory, O_RDONLY | O_DIRECTORY);
+#endif
     if (rootfd >= 0)
     {
         char name[32];
@@ -10941,6 +11445,13 @@ handle_drop(int client_fd, const CuvsCmdFrame *cmd)
         close(rootfd);
     }
 
+#ifdef CUVS_CAGRA_FOLD_ENABLED
+    if (scope)
+    {
+        pthread_mutex_unlock(&scope->gate);
+        page_storage_put(scope);
+    }
+#endif
     CuvsReplyHeader hdr = {0};
     hdr.status = CUVS_STATUS_OK;
     send_all(client_fd, &hdr, sizeof(hdr));
@@ -15084,6 +15595,13 @@ handle_page_search(int client_fd, const CuvsCmdFrame *cmd)
     PageCagraGraph *graph = find_page_graph(cmd, &request);
     if (!graph || graph->dim != cmd->dim || graph->metric != cmd->metric)
         reply.status = CUVS_STATUS_NOT_FOUND;
+#ifdef CUVS_CAGRA_FOLD_ENABLED
+    else if (graph->placeholder_boot)
+        reply.status = filtered || batch ? CUVS_STATUS_NOT_FOUND :
+            CUVS_STATUS_PAGE_NEED; /* An ordinary scan retries with its PG boot ID. */
+    else if (graph->proxy_rows)
+        reply.status = CUVS_STATUS_NOT_FOUND; /* This opcode has no slot-overlay merge. */
+#endif
     else if ((filtered || cmd->search_mode == 1) && !graph->bf[cmd->bf_precision])
     {
         uint32_t bit = 1u << cmd->bf_precision;
@@ -15521,7 +16039,7 @@ page_fold_run(int device)
     size_t peak, limit, used, host_bytes, host_mirror_charge = 0;
     uint64_t pending, retained, claim;
     uint32_t max_positions = control.optimized ? g_page_fold_batch_rows : PAGE_FOLD_MAX_POSITIONS;
-    uint32_t wanted, dim, base_sample;
+    uint32_t wanted, dim, base_sample, proxy_count;
     uint32_t staging_status;
     bool offered = false, mirrors_reserved = false;
 #ifdef CUVS_PAGE_OVERLAY_GPU
@@ -15583,11 +16101,14 @@ retry_admission:
     wanted = pending < max_positions ? (uint32_t) pending : max_positions;
     dim = parent->dim;
     base_sample = parent->fold_live_base_slot;
-    if (!dim || wanted > (SIZE_MAX - wanted) / sizeof(float) / dim ||
+    proxy_count = (uint32_t) (parent->n_slots - parent->boundary.graph_rows);
+    if (!dim || wanted + proxy_count > (SIZE_MAX - wanted - proxy_count) / sizeof(float) / dim ||
         cuvs_cagra_fold_shape(parent->handle, &shape) != 0 ||
-        shape.rows != parent->n_slots || shape.dim != dim)
+        shape.rows != parent->boundary.graph_rows || shape.dim != dim ||
+        (proxy_count && !parent->proxy_rows))
         goto defer;
-    claim = cuvs_cagra_fold_peak_bytes(shape.rows, wanted, dim, shape.stride, shape.degree, &retained);
+    claim = cuvs_cagra_fold_peak_bytes(shape.rows, wanted + proxy_count, dim, shape.stride,
+                                       shape.degree, &retained);
     if (claim >= CUVS_ADMISSION_BYTES_SATURATED || claim > SIZE_MAX)
         goto defer;
     peak = (size_t) claim;
@@ -15659,46 +16180,66 @@ retry_admission:
             page_fold_host_graph_release(&cache);
     }
 
-    host_bytes = (size_t) wanted * dim * sizeof(float);
+    host_bytes = (size_t) (wanted + proxy_count) * dim * sizeof(float);
+    size_t staging_bytes = host_bytes + wanted + proxy_count;
     const CuvsPageOverlayRequest staging_request = {0};
 #ifdef CUVS_PAGE_OVERLAY_GPU
     size_t staging_charge;
-    uint64_t minimum_mirror = (retained / (shape.rows + wanted)) * (shape.rows + 1);
+    uint64_t minimum_mirror = (retained / (shape.rows + proxy_count + wanted)) *
+        (shape.rows + proxy_count + 1);
 
-    host_fold_can_fit = cuvs_page_overlay_allocation_bytes(host_bytes + wanted, &staging_charge) &&
+    host_fold_can_fit = cuvs_page_overlay_allocation_bytes(staging_bytes, &staging_charge) &&
         staging_charge <= g_page_overlay_budget.limit &&
         minimum_mirror <= g_page_overlay_budget.limit - staging_charge;
 #endif
     staging_status = cuvs_page_overlay_alloc(&g_page_overlay_budget, &staging_request,
-                                             host_bytes + wanted, &staging);
+                                             staging_bytes, &staging);
     if (staging_status == CUVS_STATUS_PAGE_OVERLAY_HOST_FULL && cache.graph)
     {
         page_fold_host_graph_release(&cache);
         staging_status = cuvs_page_overlay_alloc(&g_page_overlay_budget, &staging_request,
-                                                 host_bytes + wanted, &staging);
+                                                 staging_bytes, &staging);
     }
     if (staging_status == CUVS_STATUS_PAGE_OVERLAY_HOST_FULL && control.optimized)
-        staging_status = page_fold_retry_host_alloc(&staging_request, host_bytes + wanted, &staging);
+        staging_status = page_fold_retry_host_alloc(&staging_request, staging_bytes, &staging);
     if (staging_status == CUVS_STATUS_OK)
     {
         rows = (float *) staging->marks;
         unsigned char *live = (unsigned char *) rows + host_bytes;
+        size_t proxy_bytes = (size_t) proxy_count * dim * sizeof(float);
+        bool base_placeholder = base_sample && base_sample <= shape.rows;
 
-        memset(live, 0, wanted);
+        if (proxy_count)
+            memcpy(rows, parent->proxy_rows->marks, proxy_bytes);
+        memset(live, 1, proxy_count);
+        memset(live + proxy_count, 0, wanted);
         event.positions = page_fold_copy_rows(snapshot, event.parent_folded,
-                                             event.parent_folded + wanted, dim, rows, live,
-                                             base_sample != 0, control.optimized && !base_sample);
-        if (memchr(live, 0, event.positions))
+                                             event.parent_folded + wanted, dim,
+                                             rows + (size_t) proxy_count * dim,
+                                             live + proxy_count, base_sample != 0,
+                                             control.optimized && !base_sample);
+        if (memchr(live + proxy_count, 0, event.positions))
         {
-            control.filled_rows = live;
-            control.placeholder_slot = base_sample - 1;
+            if (base_placeholder)
+            {
+                control.filled_rows = live;
+                control.placeholder_slot = base_sample - 1;
+            }
+            else if (base_sample)
+            {
+                const float *sample = rows + (size_t) (base_sample - 1 - shape.rows) * dim;
+
+                for (uint32_t i = proxy_count; i < proxy_count + event.positions; ++i)
+                    if (!live[i])
+                        memcpy(rows + (size_t) i * dim, sample, (size_t) dim * sizeof(float));
+            }
         }
         if (event.positions && shm_key_random((unsigned char *) &event.graph_nonce, sizeof(event.graph_nonce)) == 0 &&
             event.graph_nonce && event.graph_nonce != event.parent_graph_nonce && event.graph_nonce != event.base_nonce)
         {
-            uint64_t output_rows = shape.rows + event.positions;
-            /* The peak check bounded the graph and dataset for shape.rows + wanted. */
-            retained = retained / (shape.rows + wanted) * output_rows;
+            uint64_t output_rows = shape.rows + proxy_count + event.positions;
+            /* The peak check bounded the graph, proxy rows and pending batch. */
+            retained = retained / (shape.rows + proxy_count + wanted) * output_rows;
             size_t graph_bytes = control.optimized ? (size_t) (output_rows * shape.degree * sizeof(uint32_t)) : 0;
             size_t mirrors = control.optimized && shape.stride == dim ? graph_bytes : (size_t) retained;
 
@@ -15715,7 +16256,7 @@ retry_admission:
     if (control.phases)
         staging_us = admission_mono_us() - staging_started;
     if (mirrors_reserved)
-        status = cuvs_cagra_fold_reuse_with_yield(old_handle, rows, event.positions,
+        status = cuvs_cagra_fold_reuse_with_yield(old_handle, rows, proxy_count + event.positions,
                                                  (int) dim, device, &new_handle, &control);
 
     if (status == CUVS_CAGRA_FOLD_CUDA_UNCONFIRMED)
@@ -15849,6 +16390,94 @@ reclaim_cache:
 #endif
 }
 
+#define PAGE_CHECKPOINT_INTERVAL_US (UINT64_C(60) * 1000000)
+#define PAGE_CHECKPOINT_ROWS UINT64_C(100000)
+
+static void
+page_checkpoint_run(int device)
+{
+    PageGraphFoldRef ref = {0};
+    CuvsPageManifest manifest;
+    CuvsPageRecoveryHead previous;
+    uint64_t now = admission_mono_us();
+    int saved = -1;
+    char requested[CUVS_PAGE_INDEX_DIR_SIZE], root[CUVS_PAGE_INDEX_DIR_SIZE];
+
+    pthread_mutex_lock(&g_index_mutex);
+    for (PageCagraGraph *entry = g_page_graphs; entry; entry = entry->next)
+    {
+        if (entry->gpu != device || !entry->storage_root[0] || entry->proxy_rows ||
+            entry->graph_nonce == entry->saved_head.graph_nonce ||
+            now < entry->save_retry_us ||
+            (entry->saved_head.graph_nonce && now - entry->saved_at_us < PAGE_CHECKPOINT_INTERVAL_US &&
+             entry->n_slots - entry->saved_head.n_slots < PAGE_CHECKPOINT_ROWS))
+            continue;
+        if (!page_graph_fold_pin_locked(entry, &ref))
+            continue;
+        entry->save_retry_us = now + UINT64_C(5000000);
+        previous = entry->saved_head;
+        memcpy(requested, entry->storage_root, sizeof(requested));
+        manifest = (CuvsPageManifest) {
+            .system_identifier = entry->system_identifier, .index_nonce = entry->index_nonce,
+            .base_nonce = entry->base_nonce, .build_xid = entry->build_xid,
+            .head = {.graph_nonce = entry->graph_nonce, .n_slots = entry->n_slots,
+                     .folded = entry->folded},
+            .db_oid = entry->db_oid, .index_oid = entry->index_oid,
+            .dim = entry->dim, .metric = entry->metric,
+            .flags = entry->recovery_placeholders ? CUVS_PAGE_MANIFEST_RECOVERY_PLACEHOLDERS : 0,
+            .placeholder_boot = entry->placeholder_boot, .physical_dead_slots = entry->recovery_physical_dead,
+        };
+        break;
+    }
+    pthread_mutex_unlock(&g_index_mutex);
+    if (!ref.entry)
+        return;
+
+    PageCagraGraph *source = ref.entry;
+    CuvsCmdFrame cmd = {.db_oid = manifest.db_oid, .index_oid = manifest.index_oid};
+
+#ifdef CUVS_TEST_HOOKS
+    page_overlay_test_gate("CUVS_TEST_PAGE_CHECKPOINT_PIN_FIFO");
+#endif
+    PageStorageScope *scope = page_storage_get(cmd.db_oid, cmd.index_oid);
+
+    if (!scope)
+    {
+        page_graph_fold_unpin(&ref);
+        return;
+    }
+    pthread_mutex_lock(&scope->gate);
+    pthread_mutex_lock(&g_index_mutex);
+    bool retired = source->fold_retired;
+    pthread_mutex_unlock(&g_index_mutex);
+    if (!retired && resolve_page_root(requested, root))
+        saved = persist_page_checkpoint(&cmd, root, source->handle, device, &manifest, true);
+    if (saved == 0)
+    {
+        pthread_mutex_lock(&g_index_mutex);
+        /* ACK may have advanced the same lineage during the save. */
+        for (PageCagraGraph *entry = g_page_graphs; entry; entry = entry->next)
+            if (entry->db_oid == manifest.db_oid && entry->index_oid == manifest.index_oid &&
+                entry->system_identifier == manifest.system_identifier &&
+                entry->index_nonce == manifest.index_nonce && entry->base_nonce == manifest.base_nonce &&
+                entry->n_slots >= manifest.head.n_slots &&
+                entry->saved_head.graph_nonce == previous.graph_nonce)
+            {
+                entry->saved_head = manifest.head;
+                strcpy(entry->storage_root, root);
+                entry->saved_at_us = now;
+                entry->reconcile_after_us = 0;
+            }
+        pthread_mutex_unlock(&g_index_mutex);
+        LOG_INFO("[page_checkpoint] db=%u index=%u nonce=%016llx slots=%llu\n",
+                 manifest.db_oid, manifest.index_oid, (unsigned long long) manifest.head.graph_nonce,
+                 (unsigned long long) manifest.head.n_slots);
+    }
+    page_graph_fold_unpin(&ref);
+    pthread_mutex_unlock(&scope->gate);
+    page_storage_put(scope);
+}
+
 static void *
 page_fold_thread(void *arg)
 {
@@ -15857,6 +16486,7 @@ page_fold_thread(void *arg)
     while (!g_shutdown)
     {
         const struct timespec delay = {.tv_nsec = 100000000};
+        page_checkpoint_run(device);
 
         page_fold_run(device);
         if (g_page_fold_batch_rows)
@@ -15993,6 +16623,9 @@ page_fold_result_with_history_locked(const CuvsPageFoldResult *result, uint64_t 
         candidate->loaded_at = time(NULL);
 #ifdef CUVS_CAGRA_FOLD_ENABLED
         candidate->fold_pending_since = parent->fold_pending_since;
+        candidate->saved_head = parent->saved_head;
+        candidate->saved_at_us = parent->saved_at_us;
+        candidate->reconcile_after_us = parent->reconcile_after_us;
 #endif
         candidate->next = parent->next;
         *link = candidate;
@@ -16159,6 +16792,10 @@ find_page_overlay_graph(const CuvsCmdFrame *cmd, const CuvsPageOverlayRequest *r
 
     if (graph)
     {
+#ifdef CUVS_CAGRA_FOLD_ENABLED
+        if (graph->placeholder_boot && graph->placeholder_boot != request->boot_id)
+            return NULL;
+#endif
         *overlay_owner = graph;
         return graph->dim == cmd->dim && graph->metric == cmd->metric ? graph : NULL;
     }
@@ -16436,6 +17073,17 @@ page_overlay_search_status(const CuvsCmdFrame *cmd, const CuvsPageOverlayRequest
         return CUVS_STATUS_PAGE_OVERLAY_FULL;
     if (request->from > overlay->covered_upto)
         return CUVS_STATUS_PAGE_NEED;
+#ifdef CUVS_CAGRA_FOLD_ENABLED
+    /* The resident window cannot carry a recovery slot suffix or its
+     * placeholder guard. Let its caller fall back through the exact path. */
+    if (cmd->op == CUVS_OP_SEARCH_PAGE_RESIDENT &&
+        (graph->proxy_rows || graph->recovery_placeholders))
+        return CUVS_STATUS_NOT_FOUND;
+    if (graph->recovery_physical_dead > request->base.dead_slots)
+        return CUVS_STATUS_NOT_FOUND;
+    if (graph->proxy_rows && cmd->search_mode == 1)
+        return CUVS_STATUS_NO_VECTORS;
+#endif
     if (cmd->search_mode == 1 && !graph->bf[cmd->bf_precision])
         return CUVS_STATUS_NO_VECTORS;
     return CUVS_STATUS_OK;
@@ -16828,6 +17476,10 @@ handle_page_overlay_search(int client_fd, const CuvsCmdFrame *cmd)
     bool resident_sent = false;
     bool normalize_hnsw_ip = false;
     uint32_t prefix = batch ? 2 * sizeof(uint32_t) : 0;
+    uint64_t graph_rows;
+#ifdef CUVS_CAGRA_FOLD_ENABLED
+    CuvsPageOverlayChunk *proxy = NULL;
+#endif
     uint64_t started;
     uint64_t registered_order = 0, generation = 0;
     int k = 0;
@@ -16927,7 +17579,11 @@ handle_page_overlay_search(int client_fd, const CuvsCmdFrame *cmd)
         }
     }
 
-    k = (int) (graph->n_slots < cmd->k ? graph->n_slots : cmd->k);
+    graph_rows = graph->n_slots;
+#ifdef CUVS_CAGRA_FOLD_ENABLED
+    graph_rows = graph->boundary.graph_rows;
+#endif
+    k = (int) (graph_rows < cmd->k ? graph_rows : cmd->k);
     if (resident)
     {
         int rc;
@@ -16952,6 +17608,12 @@ handle_page_overlay_search(int client_fd, const CuvsCmdFrame *cmd)
     if (graph->hits < UINT32_MAX)
         ++graph->hits;
 
+#ifdef CUVS_CAGRA_FOLD_ENABLED
+    if (graph->recovery_placeholders)
+        reply.delta_merged = CUVS_PAGE_OVERLAY_RECOVERY_PLACEHOLDERS;
+    proxy = graph->proxy_rows;
+    cuvs_page_overlay_retain(proxy);
+#endif
     normalize_hnsw_ip = cmd->metric == CUVS_METRIC_IP && cmd->search_mode == 0 &&
                        cmd->use_cpu_hnsw && graph->cpu_hnsw;
     if (!resident)
@@ -17007,7 +17669,7 @@ unlock:
         for (int i = 0; i < k; ++i)
         {
             const CuvsSearchResult *candidate = &raw[(size_t) q * k + i];
-            if (candidate->item_id >= 0 && (uint64_t) candidate->item_id < request.base.n_slots)
+            if (candidate->item_id >= 0 && (uint64_t) candidate->item_id < graph_rows)
             {
                 float distance = candidate->distance;
 
@@ -17022,6 +17684,10 @@ unlock:
                 row[written++].distance = distance;
             }
         }
+#ifdef CUVS_CAGRA_FOLD_ENABLED
+        if (proxy)
+            cuvs_page_proxy_score(proxy, graph_rows, request.base.n_slots, vector, cmd, row, &written);
+#endif
         for (const CuvsPageOverlayChunk *chunk = first;
              chunk && chunk->from >= request.base.folded; chunk = chunk->next)
             cuvs_page_overlay_score(chunk, request.from, &request.base, vector, cmd, row, &written);
@@ -17048,6 +17714,9 @@ done:
     if (query != MAP_FAILED)
         munmap(query, bytes);
     free(raw);
+#ifdef CUVS_CAGRA_FOLD_ENABLED
+    cuvs_page_overlay_release(proxy);
+#endif
     cuvs_page_overlay_release(supplement);
     cuvs_page_overlay_release(clipped);
     cuvs_page_overlay_release(snapshot);
@@ -17056,6 +17725,996 @@ done:
     page_graph_fold_unpin(&search_ref);
     free(results);
 }
+
+#ifdef CUVS_CAGRA_FOLD_ENABLED
+/* Exact resident identity used to tie a reconciliation to the PG life
+ * that requested it. An unresolved FOLD_READY candidate grants no authority. */
+static PageCagraGraph *
+page_reconcile_current_locked(const CuvsCmdFrame *cmd, const CuvsPageRecoveryRequest *request)
+{
+    CuvsPageSearchRequest head = {
+        .system_identifier = request->system_identifier, .index_nonce = request->index_nonce,
+        .base_nonce = request->base_nonce, .graph_nonce = request->target.graph_nonce,
+        .n_slots = request->target.n_slots, .folded = request->target.folded,
+    };
+    PageCagraGraph *entry = find_page_graph(cmd, &head);
+
+    return entry && entry->overlay.boot_id == request->boot_id &&
+        entry->dim == cmd->dim && entry->metric == cmd->metric ? entry : NULL;
+}
+
+static bool
+read_page_checkpoint_ref(int dir, const CuvsCmdFrame *cmd,
+                         const CuvsPageRecoveryRequest *request, uint64_t nonce,
+                         CuvsPageCheckpointRef *ref)
+{
+    CuvsPageManifest manifest;
+    struct stat dir_stat, marker_stat;
+    char expected[32], marker[32];
+    int length, fd;
+    bool valid;
+
+    if (fstat(dir, &dir_stat) != 0 || !S_ISDIR(dir_stat.st_mode) ||
+        dir_stat.st_uid != geteuid() || !read_page_manifest_at(dir, cmd, request, nonce, &manifest) ||
+        manifest.head.n_slots - manifest.head.folded != request->target.n_slots - request->target.folded)
+        return false;
+    length = snprintf(expected, sizeof(expected), "%llu\n", (unsigned long long) manifest.build_xid);
+    fd = openat(dir, "build.xid", O_RDONLY | O_NOFOLLOW | O_NONBLOCK);
+    if (fd < 0)
+        return false;
+    valid = fstat(fd, &marker_stat) == 0 && S_ISREG(marker_stat.st_mode) &&
+        marker_stat.st_uid == geteuid() && marker_stat.st_size == length &&
+        read(fd, marker, sizeof(marker)) == length && memcmp(marker, expected, length) == 0;
+    close(fd);
+    if (!valid)
+        return false;
+    *ref = (CuvsPageCheckpointRef) {
+        .head = manifest.head, .build_xid = manifest.build_xid,
+        .device = dir_stat.st_dev, .inode = dir_stat.st_ino,
+        .change_sec = dir_stat.st_ctim.tv_sec, .change_nsec = dir_stat.st_ctim.tv_nsec,
+        .manifest_crc = manifest.manifest_crc,
+    };
+    return true;
+}
+
+static int
+page_checkpoint_ref_cmp(const void *a, const void *b)
+{
+    const CuvsPageCheckpointRef *left = a, *right = b;
+
+    return (left->head.graph_nonce > right->head.graph_nonce) -
+           (left->head.graph_nonce < right->head.graph_nonce);
+}
+
+/* readdir order is filesystem-dependent. Keep the next lowest nonces
+ * above the cursor so a removed entry cannot shift later pages. */
+static uint32_t
+list_page_checkpoints(int incarnation, const CuvsCmdFrame *cmd,
+                      const CuvsPageRecoveryRequest *request, CuvsPageCheckpointRef *refs,
+                      uint32_t *count)
+{
+    int scanfd = dup(incarnation);
+    DIR *scan = scanfd < 0 ? NULL : fdopendir(scanfd);
+    uint32_t used = 0;
+    uint32_t status = CUVS_STATUS_OK;
+
+    if (!scan)
+    {
+        if (scanfd >= 0)
+            close(scanfd);
+        return CUVS_STATUS_ERROR;
+    }
+    for (;;)
+    {
+        struct dirent *entry;
+        uint64_t nonce;
+        int dir;
+        CuvsPageCheckpointRef ref;
+
+        errno = 0;
+        entry = readdir(scan);
+        if (!entry)
+        {
+            if (errno)
+                status = CUVS_STATUS_ERROR;
+            break;
+        }
+        nonce = cuvs_page_checkpoint_name_nonce(entry->d_name);
+        if (!nonce || nonce <= request->source.graph_nonce ||
+            (used == CUVS_PAGE_RECOVERY_BATCH && nonce >= refs[used - 1].head.graph_nonce))
+            continue;
+        dir = openat(incarnation, entry->d_name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
+        if (dir < 0)
+            continue;
+        bool matched = read_page_checkpoint_ref(dir, cmd, request, nonce, &ref);
+        close(dir);
+        if (!matched)
+            continue;
+        if (used < CUVS_PAGE_RECOVERY_BATCH)
+            ++used;
+        refs[used - 1] = ref;
+        qsort(refs, used, sizeof(*refs), page_checkpoint_ref_cmp);
+    }
+    closedir(scan);
+    if (status == CUVS_STATUS_OK)
+        *count = used;
+    return status;
+}
+
+static bool
+page_checkpoint_in_use_locked(const CuvsCmdFrame *cmd, const CuvsPageRecoveryRequest *request,
+                              uint64_t nonce)
+{
+    for (const PageCagraGraph *entry = g_page_graphs; entry; entry = entry->next)
+        if (entry->system_identifier == request->system_identifier && entry->db_oid == cmd->db_oid &&
+            entry->index_oid == cmd->index_oid && entry->index_nonce == request->index_nonce &&
+            entry->base_nonce == request->base_nonce &&
+            (entry->graph_nonce == nonce || entry->saved_head.graph_nonce == nonce ||
+             (entry->fold_candidate && entry->fold_candidate->graph_nonce == nonce)))
+            return true;
+    return false;
+}
+
+static const char *const page_checkpoint_files[] = {"index.cagra", "index.hnsw", "build.xid", "manifest"};
+
+static bool
+page_checkpoint_has_only_owned_files(int dir)
+{
+    int scanfd = dup(dir);
+    DIR *scan = scanfd < 0 ? NULL : fdopendir(scanfd);
+    bool valid = false;
+
+    if (!scan)
+    {
+        if (scanfd >= 0)
+            close(scanfd);
+        return false;
+    }
+    for (;;)
+    {
+        struct dirent *entry;
+        struct stat st;
+        size_t file;
+
+        errno = 0;
+        entry = readdir(scan);
+        if (!entry)
+        {
+            valid = errno == 0;
+            break;
+        }
+        if (!strcmp(entry->d_name, ".") || !strcmp(entry->d_name, ".."))
+            continue;
+        for (file = 0; file < sizeof(page_checkpoint_files) / sizeof(page_checkpoint_files[0]); ++file)
+            if (!strcmp(entry->d_name, page_checkpoint_files[file]))
+                break;
+        if (file == sizeof(page_checkpoint_files) / sizeof(page_checkpoint_files[0]) ||
+            fstatat(dir, entry->d_name, &st, AT_SYMLINK_NOFOLLOW) != 0 ||
+            !S_ISREG(st.st_mode) || st.st_uid != geteuid() || st.st_nlink != 1)
+            break;
+    }
+    closedir(scan);
+    return valid;
+}
+
+/* L1 (the storage mutex) spans candidate revalidation and unlink. The
+ * relation identity and WAL decision are supplied by the connected PG worker. */
+static bool
+prune_page_checkpoint(int client_fd, int incarnation, const char *root, const CuvsCmdFrame *cmd,
+                      const CuvsPageRecoveryRequest *request, const CuvsPageCheckpointRef *ref)
+{
+    char name[17];
+    uint64_t nonce = ref->head.graph_nonce;
+    CuvsPageCheckpointRef actual;
+    struct stat named;
+    bool usable, replaceable;
+    int dir;
+
+    if (!nonce || nonce == request->target.graph_nonce || ref->reserved ||
+        (ref->action != CUVS_PAGE_CHECKPOINT_PRUNE_FOREIGN &&
+         ref->action != CUVS_PAGE_CHECKPOINT_PRUNE_ANCESTOR))
+        return false;
+    snprintf(name, sizeof(name), "%016llx", (unsigned long long) nonce);
+#ifdef CUVS_TEST_HOOKS
+    page_overlay_test_gate("CUVS_TEST_PAGE_RECONCILE_PRUNE_FIFO");
+#endif
+    dir = openat(incarnation, name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
+    if (dir < 0)
+        return false;
+    bool same_ref = read_page_checkpoint_ref(dir, cmd, request, nonce, &actual) &&
+        cuvs_page_checkpoint_ref_matches(ref, &actual);
+#ifdef CUVS_TEST_HOOKS
+    if (!same_ref && cuvs_fault("CUVS_TEST_PAGE_RECONCILE_DRY_RUN"))
+        LOG_INFO("[page_checkpoint_reconcile] nonce=%016llx stale_ref=1\n", (unsigned long long) nonce);
+#endif
+    usable = same_ref && page_checkpoint_has_only_owned_files(dir) &&
+        fstatat(incarnation, name, &named, AT_SYMLINK_NOFOLLOW) == 0 &&
+        S_ISDIR(named.st_mode) && (uint64_t) named.st_dev == actual.device &&
+        (uint64_t) named.st_ino == actual.inode &&
+        named.st_ctim.tv_sec == actual.change_sec && named.st_ctim.tv_nsec == actual.change_nsec;
+    pthread_mutex_lock(&g_index_mutex);
+    PageCagraGraph *current = page_reconcile_current_locked(cmd, request);
+    replaceable = current && !strcmp(current->storage_root, root) &&
+        !page_checkpoint_in_use_locked(cmd, request, nonce) &&
+        (ref->action != CUVS_PAGE_CHECKPOINT_PRUNE_ANCESTOR ||
+         cuvs_page_recovery_head_matches(&current->saved_head, &request->target));
+    pthread_mutex_unlock(&g_index_mutex);
+    if (!usable || !replaceable || client_gone(&client_fd))
+    {
+        close(dir);
+        return false;
+    }
+#ifdef CUVS_TEST_HOOKS
+    if (cuvs_fault("CUVS_TEST_PAGE_RECONCILE_DRY_RUN"))
+    {
+        LOG_INFO("[page_checkpoint_reconcile] db=%u index=%u nonce=%016llx action=%u dry_run=1\n",
+                 cmd->db_oid, cmd->index_oid, (unsigned long long) nonce, ref->action);
+        close(dir);
+        return true;
+    }
+#endif
+    for (size_t file = 0; file < sizeof(page_checkpoint_files) / sizeof(page_checkpoint_files[0]); ++file)
+        if (unlinkat(dir, page_checkpoint_files[file], 0) != 0 && errno != ENOENT)
+        {
+            close(dir);
+            return false;
+        }
+    usable = fstatat(incarnation, name, &named, AT_SYMLINK_NOFOLLOW) == 0 &&
+        S_ISDIR(named.st_mode) && (uint64_t) named.st_dev == actual.device &&
+        (uint64_t) named.st_ino == actual.inode;
+    close(dir);
+    return usable && unlinkat(incarnation, name, AT_REMOVEDIR) == 0 && fsync(incarnation) == 0;
+}
+
+/* A validated copy may have been placed in the cache root since startup.
+ * Make the replacement durable locally before reclaiming a WAL ancestor. */
+static bool
+sync_page_reconcile_anchor(int incarnation, const char *root, const CuvsCmdFrame *cmd,
+                           const CuvsPageRecoveryRequest *request)
+{
+    char graph[512], artifact[512], manifest_path[512], marker[512], index_path[512];
+    CuvsPageManifest manifest;
+    CuvsPageCheckpointRef ref;
+    char pinned[64], name[17];
+    int fd = -1, dir;
+    bool durable;
+
+    if (!page_checkpoint_paths(root, cmd->db_oid, cmd->index_oid, request->index_nonce,
+                               request->target.graph_nonce, graph, artifact, manifest_path) ||
+        snprintf(marker, sizeof(marker), "%s/build.xid", graph) >= (int) sizeof(marker) ||
+        snprintf(index_path, sizeof(index_path), "%s/%u_%u", root,
+                 cmd->db_oid, cmd->index_oid) >= (int) sizeof(index_path))
+        return false;
+    snprintf(name, sizeof(name), "%016llx", (unsigned long long) request->target.graph_nonce);
+    dir = openat(incarnation, name, O_RDONLY | O_NOFOLLOW | O_DIRECTORY);
+    if (dir < 0)
+        return false;
+    durable = read_page_checkpoint_ref(dir, cmd, request, request->target.graph_nonce, &ref) &&
+        read_page_manifest(root, cmd, request, &request->target, &manifest, &fd) &&
+        !manifest.placeholder_boot && validate_page_checkpoint(fd, &manifest, pinned) && fsync(fd) == 0 &&
+        sync_build_path(manifest_path, O_NOFOLLOW) == 0 && sync_build_path(marker, O_NOFOLLOW) == 0 &&
+        fsync(dir) == 0 && fsync(incarnation) == 0 &&
+        sync_build_path(index_path, O_DIRECTORY | O_NOFOLLOW) == 0 &&
+        sync_build_path(root, O_DIRECTORY) == 0;
+    if (fd >= 0)
+        close(fd);
+    close(dir);
+    return durable;
+}
+
+static uint32_t
+reconcile_page_checkpoints(int client_fd, const char *root, const CuvsCmdFrame *cmd,
+                           const CuvsPageRecoveryRequest *request, CuvsPageCheckpointRef *refs,
+                           uint32_t *count)
+{
+    uint32_t status = CUVS_STATUS_NOT_FOUND;
+    int incarnation = -1;
+
+    PageStorageScope *scope = page_storage_get(cmd->db_oid, cmd->index_oid);
+
+    if (!scope)
+        return CUVS_STATUS_ERROR;
+    pthread_mutex_lock(&scope->gate);
+    pthread_mutex_lock(&g_index_mutex);
+    PageCagraGraph *current = page_reconcile_current_locked(cmd, request);
+    bool authorized = current && !strcmp(current->storage_root, root);
+    bool exact_checkpoint = authorized &&
+        cuvs_page_recovery_head_matches(&current->saved_head, &request->target);
+    pthread_mutex_unlock(&g_index_mutex);
+    if (!authorized)
+        goto done;
+    if (request->operation == CUVS_PAGE_RECOVERY_LIST && exact_checkpoint)
+    {
+        CuvsPageManifest manifest;
+
+        if (!read_page_manifest(root, cmd, request, &request->target, &manifest, NULL))
+        {
+            pthread_mutex_lock(&g_index_mutex);
+            current = page_reconcile_current_locked(cmd, request);
+            if (current && cuvs_page_recovery_head_matches(&current->saved_head, &request->target))
+            {
+                current->saved_head = (CuvsPageRecoveryHead) {0};
+                current->save_retry_us = 0;
+            }
+            pthread_mutex_unlock(&g_index_mutex);
+        }
+    }
+    incarnation = open_page_incarnation(root, cmd, request->index_nonce);
+    if (incarnation < 0)
+        goto done;
+    if (request->operation == CUVS_PAGE_RECOVERY_LIST)
+        status = list_page_checkpoints(incarnation, cmd, request, refs, count);
+    else
+    {
+        bool anchor_checked = false, anchor_valid = false;
+
+        for (uint32_t i = 0; i < request->count; ++i)
+        {
+            if (refs[i].action == CUVS_PAGE_CHECKPOINT_PRUNE_ANCESTOR)
+            {
+                if (!anchor_checked && exact_checkpoint)
+                {
+                    anchor_valid = sync_page_reconcile_anchor(incarnation, root, cmd, request);
+                    anchor_checked = true;
+                }
+            }
+            if (!cuvs_page_checkpoint_can_prune(refs[i].action, anchor_valid))
+                continue;
+            if (prune_page_checkpoint(client_fd, incarnation, root, cmd, request, &refs[i]))
+                ++*count;
+        }
+        status = CUVS_STATUS_OK;
+    }
+done:
+    if (incarnation >= 0)
+        close(incarnation);
+    pthread_mutex_unlock(&scope->gate);
+    page_storage_put(scope);
+    return status;
+}
+
+static PageCagraGraph *
+page_recovery_lookup_locked(const CuvsCmdFrame *cmd, const CuvsPageRecoveryRequest *request,
+                           PageCagraGraph **owner)
+{
+    CuvsPageOverlayRequest query = {
+        .base = {.system_identifier = request->system_identifier, .index_nonce = request->index_nonce,
+                 .base_nonce = request->base_nonce, .graph_nonce = request->target.graph_nonce,
+                 .n_slots = request->target.n_slots, .folded = request->target.folded},
+        .boot_id = request->boot_id,
+    };
+
+    return find_page_overlay_graph(cmd, &query, owner, false);
+}
+
+static bool
+page_recovery_serving_locked(const CuvsCmdFrame *cmd, const CuvsPageRecoveryRequest *request)
+{
+    PageCagraGraph *owner;
+
+    return page_recovery_lookup_locked(cmd, request, &owner) && owner->overlay.boot_id == request->boot_id;
+}
+
+static bool
+page_recovery_resident_locked(const CuvsCmdFrame *cmd, const CuvsPageRecoveryRequest *request)
+{
+    PageCagraGraph *owner;
+    PageCagraGraph *graph = page_recovery_lookup_locked(cmd, request, &owner);
+    CuvsPageOverlayChunk *obsolete;
+
+    if (!graph || !page_graph_use_boot_locked(owner, request->boot_id, &obsolete))
+        return false;
+    if (graph != owner)
+        graph->fold_seen_by_pg = true;
+    defer_page_overlay_release(obsolete);
+    return true;
+}
+
+static int
+page_recovery_device_locked(size_t needed)
+{
+    for (int i = 0; i < n_usable_gpus(); ++i)
+    {
+        int dev = usable_gpu(i);
+        size_t limit = budget_eff_bytes(dev);
+        size_t used = total_vram_used(dev);
+
+        if (!g_page_recovery_active[dev] && !g_pending_build_vram[dev] &&
+            needed < CUVS_ADMISSION_BYTES_SATURATED &&
+            (!limit || (used < limit && needed <= limit - used)) &&
+            needed <= gpu_free_vram_bytes(dev))
+            return dev;
+    }
+    return -1;
+}
+
+/* Recovery uses the usual build reservation. Promotion and refund each
+ * update the reservation, the graph charge and the active flag under L0. */
+static void
+page_recovery_reserve_locked(int device, size_t needed)
+{
+    g_page_recovery_active[device] = true;
+    reserve_build_vram(needed, device);
+}
+
+static void
+page_recovery_finish_claim_locked(int device, size_t needed, size_t retained)
+{
+    g_page_graph_bytes[device] += retained;
+    release_build_vram(needed, device);
+    g_page_recovery_active[device] = false;
+}
+
+static bool
+page_recovery_same_incarnation(const PageCagraGraph *entry, const CuvsCmdFrame *cmd,
+                               const CuvsPageRecoveryRequest *request)
+{
+    return entry->system_identifier == request->system_identifier && entry->db_oid == cmd->db_oid &&
+        entry->index_oid == cmd->index_oid && entry->index_nonce == request->index_nonce &&
+        entry->base_nonce == request->base_nonce;
+}
+
+static const PageCagraGraph *
+page_recovery_previous_ancestor_locked(const CuvsCmdFrame *cmd, const CuvsPageRecoveryRequest *request)
+{
+    for (const PageCagraGraph *old = g_page_ancestors; old; old = old->next)
+        if (page_recovery_same_incarnation(old, cmd, request) &&
+            old->overlay.boot_id && old->overlay.boot_id != request->boot_id)
+            return old;
+    return NULL;
+}
+
+/* A later release may run on the last pin's thread, rather than the
+ * recovery connection. Keep ownership on the exact retired graph. */
+static void
+retire_recovery_graph_locked(PageCagraGraph *entry)
+{
+    entry->recovery_retire_owner = true;
+    ++g_page_recovery_owners;
+    if (entry->fold_candidate)
+    {
+        entry->fold_candidate->recovery_retire_owner = true;
+        ++g_page_recovery_owners;
+    }
+    retire_page_graph_locked(entry, true);
+    entry->search_invalidated = true;
+}
+
+/* A confirmed recovery grant belongs to the live PG boot. */
+static void
+retire_recovery_ancestors_locked(const CuvsCmdFrame *cmd, const CuvsPageRecoveryRequest *request)
+{
+    PageCagraGraph **link = &g_page_ancestors;
+
+    while (*link)
+    {
+        PageCagraGraph *old = *link;
+
+        if (page_recovery_same_incarnation(old, cmd, request) &&
+            old->overlay.boot_id && old->overlay.boot_id != request->boot_id)
+        {
+            *link = old->next;
+            retire_recovery_graph_locked(old);
+        }
+        else
+            link = &old->next;
+    }
+}
+
+/* A boot change alone leaves a clean exact checkpoint usable. A candidate
+ * from the current PG life retains its parent until normal fold publication. */
+static bool
+page_recovery_supersedes(const PageCagraGraph *entry, const CuvsCmdFrame *cmd,
+                         const CuvsPageRecoveryRequest *request, bool previous_boot_only)
+{
+    if (!page_recovery_same_incarnation(entry, cmd, request) ||
+        (entry->fold_candidate && entry->fold_candidate->fold_event.boot_id == request->boot_id))
+        return false;
+    if (entry->placeholder_boot && entry->placeholder_boot != request->boot_id)
+        return true;
+    if (entry->producer_boot && entry->producer_boot != request->boot_id &&
+        (entry->graph_nonce != request->target.graph_nonce ||
+         entry->n_slots != request->target.n_slots || entry->folded != request->target.folded))
+        return true;
+    return !previous_boot_only && entry->n_slots < request->target.n_slots;
+}
+
+static bool
+page_recovery_has_victim_locked(const CuvsCmdFrame *cmd, const CuvsPageRecoveryRequest *request,
+                                bool previous_boot_only)
+{
+    for (const PageCagraGraph *entry = g_page_graphs; entry; entry = entry->next)
+        if (page_recovery_supersedes(entry, cmd, request, previous_boot_only))
+            return true;
+    return false;
+}
+
+static bool
+page_recovery_has_slot_locked(const CuvsCmdFrame *cmd, const CuvsPageRecoveryRequest *request)
+{
+    return g_n_indexes + g_n_page_graphs < g_max_indexes ||
+        page_recovery_has_victim_locked(cmd, request, false);
+}
+
+static uint32_t
+retire_page_recovery_locked(const CuvsCmdFrame *cmd, const CuvsPageRecoveryRequest *request,
+                            bool previous_boot_only)
+{
+    PageCagraGraph **link = &g_page_graphs;
+    uint32_t retired = 0;
+
+    while (*link)
+    {
+        PageCagraGraph *entry = *link;
+
+        if (page_recovery_supersedes(entry, cmd, request, previous_boot_only))
+        {
+            *link = entry->next;
+            --g_n_page_graphs;
+            retire_recovery_graph_locked(entry);
+            ++retired;
+        }
+        else
+            link = &entry->next;
+    }
+    return retired;
+}
+
+/* A trusted worker's CHECK can invalidate work still staged for an
+ * earlier PG life or head. Scope fields are protected by L0. */
+static void
+page_storage_observe_locked(PageStorageScope *scope, const CuvsPageRecoveryRequest *request)
+{
+    if (scope->authority_sysid != request->system_identifier ||
+        scope->authority_index_nonce != request->index_nonce ||
+        scope->authority_base_nonce != request->base_nonce ||
+        scope->authority_boot_id != request->boot_id ||
+        !cuvs_page_recovery_head_matches(&scope->authority_target, &request->target))
+    {
+        scope->authority_sysid = request->system_identifier;
+        scope->authority_index_nonce = request->index_nonce;
+        scope->authority_base_nonce = request->base_nonce;
+        scope->authority_boot_id = request->boot_id;
+        scope->authority_target = request->target;
+        ++scope->authority_epoch;
+    }
+}
+
+static bool
+page_storage_recovery_epoch_locked(PageStorageScope *scope, const CuvsPageRecoveryRequest *request,
+                                   uint64_t *epoch)
+{
+    if (!scope->authority_boot_id)
+        page_storage_observe_locked(scope, request);
+    *epoch = scope->authority_epoch;
+    return scope->authority_sysid == request->system_identifier &&
+        scope->authority_index_nonce == request->index_nonce &&
+        scope->authority_base_nonce == request->base_nonce &&
+        scope->authority_boot_id == request->boot_id &&
+        cuvs_page_recovery_head_matches(&scope->authority_target, &request->target);
+}
+
+static bool
+page_recovery_grant(int client_fd, const CuvsCmdFrame *cmd, const CuvsPageRecoveryRequest *request,
+                    const CuvsPageRecoveryAuthority *authority)
+{
+    CuvsPageRecoveryOffer offer = {
+        .db_oid = cmd->db_oid, .index_oid = cmd->index_oid,
+        .system_identifier = request->system_identifier, .boot_id = request->boot_id,
+        .index_nonce = request->index_nonce, .base_nonce = request->base_nonce,
+        .target = request->target, .source = request->source, .authority = *authority,
+    };
+    CuvsPageRecoveryOffer reply;
+    CuvsReplyHeader ready = {.status = CUVS_STATUS_OK, .n_results = 1};
+    uint64_t deadline = admission_mono_us() + UINT64_C(5000000);
+
+    (void) pthread_once(&g_page_daemon_once, initialize_page_daemon_id);
+    offer.daemon_id = g_page_daemon_id;
+    if (!offer.daemon_id ||
+        shm_key_random((unsigned char *) &offer.challenge, sizeof(offer.challenge)) != 0 ||
+        !offer.challenge)
+        return false;
+    return extra_search_io(client_fd, &ready, sizeof(ready), true, deadline) == CUVS_STATUS_OK &&
+        extra_search_io(client_fd, &offer, sizeof(offer), true, deadline) == CUVS_STATUS_OK &&
+        extra_search_io(client_fd, &reply, sizeof(reply), false, deadline) == CUVS_STATUS_OK &&
+        memcmp(&offer, &reply, sizeof(offer)) == 0;
+}
+
+static void
+handle_page_recovery_retire(int client_fd, const CuvsCmdFrame *cmd,
+                            const CuvsPageRecoveryRequest *request,
+                            const CuvsPageRecoveryAuthority *authority)
+{
+    PageStorageScope *scope = page_storage_get(cmd->db_oid, cmd->index_oid);
+    CuvsReplyHeader reply = {.status = CUVS_STATUS_NOT_FOUND};
+    uint64_t epoch, deadline;
+    uint32_t retired = 0;
+
+    if (!scope)
+    {
+        send_all(client_fd, &reply, sizeof(reply));
+        return;
+    }
+    pthread_mutex_lock(&scope->gate);
+    pthread_mutex_lock(&g_index_mutex);
+    bool current = !g_shutdown && !client_gone(&client_fd) &&
+        page_storage_recovery_epoch_locked(scope, request, &epoch);
+    bool needs_grant = current && !page_recovery_serving_locked(cmd, request) &&
+        (page_recovery_has_victim_locked(cmd, request, true) ||
+         page_recovery_previous_ancestor_locked(cmd, request));
+    pthread_mutex_unlock(&g_index_mutex);
+
+    if (current && !needs_grant)
+        reply.status = CUVS_STATUS_OK;
+    if (needs_grant)
+    {
+        deadline = admission_mono_us() + UINT64_C(5000000);
+        if (page_recovery_grant(client_fd, cmd, request, authority))
+        {
+            pthread_mutex_lock(&g_index_mutex);
+            if (!g_shutdown && admission_mono_us() < deadline && !client_gone(&client_fd) &&
+                scope->authority_epoch == epoch)
+            {
+                if (!page_recovery_serving_locked(cmd, request))
+                {
+                    retired = retire_page_recovery_locked(cmd, request, true);
+                    retire_recovery_ancestors_locked(cmd, request);
+                }
+                reply.status = CUVS_STATUS_OK;
+            }
+            pthread_mutex_unlock(&g_index_mutex);
+        }
+    }
+    /* Release PG's FCL before destructors. A later INSTALL takes this same
+     * gate, so admission sees the true charge after any unpinned frees. */
+    (void) send_all(client_fd, &reply, sizeof(reply));
+    release_retired_fold_graphs();
+    release_retired_page_overlays();
+    pthread_mutex_unlock(&scope->gate);
+    page_storage_put(scope);
+    if (retired)
+        LOG_INFO("[page_recovery_retire] db=%u index=%u retired=%u\n", cmd->db_oid, cmd->index_oid, retired);
+}
+
+static uint32_t
+install_page_recovery(int client_fd, const CuvsCmdFrame *cmd, const char *root,
+                      const CuvsPageRecoveryRequest *request, const CuvsPageRecoveryAuthority *authority, int fd)
+{
+    const bool restore = request->source.graph_nonce != 0;
+    const uint64_t graph_rows = restore ? request->source.n_slots : request->target.n_slots;
+    const uint64_t input_rows = restore ? request->target.n_slots - graph_rows : graph_rows;
+    const size_t row_bytes = (size_t) cmd->dim * sizeof(float);
+    size_t final = estimate_vram_bytes(graph_rows, cmd->dim, cmd->graph_degree);
+    size_t needed = restore ? final : admission_needed_bytes(final);
+    CuvsPageManifest manifest;
+    char artifact[64];
+    CuvsPageOverlayChunk *proxy = NULL;
+    CuvsCagraIndex handle = NULL;
+    PageCagraGraph *entry = NULL;
+    void *rows = MAP_FAILED;
+    int device, artifact_fd = -1;
+    uint64_t authority_epoch;
+    uint32_t status = CUVS_STATUS_ERROR;
+    bool registered = false, owns_gpu = false;
+    PageStorageScope *scope = NULL;
+
+    if ((restore && !cuvs_page_recovery_lineage(&request->source, &request->target)) ||
+        (!restore && !request->build_xid) ||
+        (restore && input_rows > CUVS_PAGE_OVERLAY_MAX) ||
+        request->placeholder_rows > input_rows ||
+        (!!input_rows != (fd >= 0)) || input_rows > SIZE_MAX / row_bytes)
+        return status;
+    size_t bytes = (size_t) input_rows * row_bytes;
+    if (fd >= 0)
+    {
+        struct stat st;
+
+        if (!shm_check_peer_owner(fd, g_peer_uid) || fstat(fd, &st) != 0 ||
+            !S_ISREG(st.st_mode) || (uint64_t) st.st_size != bytes)
+            return status;
+        rows = mmap(NULL, bytes, PROT_READ, MAP_SHARED, fd, 0);
+        if (rows == MAP_FAILED)
+            return status;
+    }
+    scope = page_storage_get(cmd->db_oid, cmd->index_oid);
+    if (!scope)
+        goto done;
+    pthread_mutex_lock(&scope->gate);
+    pthread_mutex_lock(&g_index_mutex);
+    bool same_authority = page_storage_recovery_epoch_locked(scope, request, &authority_epoch);
+    pthread_mutex_unlock(&g_index_mutex);
+    if (!same_authority)
+        goto done;
+    if (restore)
+    {
+        if (!read_page_manifest(root, cmd, request, &request->source, &manifest, &artifact_fd) ||
+            !validate_page_checkpoint(artifact_fd, &manifest, artifact))
+        {
+            status = CUVS_STATUS_NOT_FOUND;
+            goto done;
+        }
+        final = estimate_vram_bytes(graph_rows, cmd->dim, manifest.graph_degree);
+        needed = final;
+        if (input_rows)
+        {
+            status = cuvs_page_overlay_alloc(&g_page_overlay_budget, &(CuvsPageOverlayRequest) {0},
+                                             bytes, &proxy);
+            if (status != CUVS_STATUS_OK)
+                goto done;
+            memcpy(proxy->marks, rows, bytes);
+        }
+    }
+    entry = calloc(1, sizeof(*entry));
+    if (!entry)
+    {
+        status = CUVS_STATUS_ERROR;
+        goto done;
+    }
+
+    pthread_mutex_lock(&g_index_mutex);
+    if (g_shutdown || scope->authority_epoch != authority_epoch || client_gone(&client_fd))
+    {
+        pthread_mutex_unlock(&g_index_mutex);
+        status = CUVS_STATUS_ERROR;
+        goto done;
+    }
+    if (page_recovery_serving_locked(cmd, request))
+    {
+        pthread_mutex_unlock(&g_index_mutex);
+        status = CUVS_STATUS_OK;
+        goto done;
+    }
+    device = page_recovery_device_locked(needed);
+    if (device < 0 || !page_recovery_has_slot_locked(cmd, request))
+    {
+        pthread_mutex_unlock(&g_index_mutex);
+#ifdef CUVS_TEST_HOOKS
+        if (cuvs_fault("CUVS_TEST_PAGE_CHECKPOINT_PIN_FIFO"))
+            LOG_INFO("[page_recovery_defer] db=%u index=%u no_capacity=1 needed=%zu\n",
+                     cmd->db_oid, cmd->index_oid, needed);
+#endif
+        status = CUVS_STATUS_OOM_FALLBACK;
+        goto done;
+    }
+    page_recovery_reserve_locked(device, needed);
+    ++g_page_recovery_owners;
+    owns_gpu = true;
+    pthread_mutex_unlock(&g_index_mutex);
+
+    if (restore)
+        handle = cuvs_cagra_deserialize(artifact, cmd->dim, device);
+    else
+        handle = cuvs_cagra_build(rows, graph_rows, cmd->dim, cmd->metric,
+                                  cmd->graph_degree, cmd->intermediate_graph_degree,
+                                  cmd->build_algo, device, CUVS_LW_OVERFLOW_ERROR, NULL);
+
+    CuvsCagraFoldShape shape;
+    bool usable = handle && cuvs_cagra_fold_shape(handle, &shape) == 0 &&
+        shape.rows == graph_rows && shape.dim == cmd->dim &&
+        (!restore || shape.degree == manifest.graph_degree);
+#ifdef CUVS_TEST_HOOKS
+    if (usable && proxy)
+        page_overlay_test_gate("CUVS_TEST_PAGE_RECOVERY_INSTALL_FIFO");
+#endif
+    uint64_t grant_deadline = admission_mono_us() + UINT64_C(5000000);
+    bool granted = usable && !g_shutdown && page_recovery_grant(client_fd, cmd, request, authority);
+    status = !usable && restore ? CUVS_STATUS_NOT_FOUND : CUVS_STATUS_ERROR;
+    pthread_mutex_lock(&g_index_mutex);
+    if (granted && !g_shutdown && admission_mono_us() < grant_deadline && !client_gone(&client_fd) &&
+        authority_epoch == scope->authority_epoch)
+    {
+        if (page_recovery_serving_locked(cmd, request))
+            status = CUVS_STATUS_OK;
+        else if (page_recovery_has_slot_locked(cmd, request))
+        {
+            retire_page_recovery_locked(cmd, request, false);
+            *entry = (PageCagraGraph) {
+                .system_identifier = request->system_identifier,
+                .db_oid = cmd->db_oid, .index_oid = cmd->index_oid,
+                .index_nonce = request->index_nonce, .base_nonce = request->base_nonce,
+                .graph_nonce = request->target.graph_nonce, .n_slots = request->target.n_slots,
+                .folded = request->target.folded,
+                .build_xid = restore ? manifest.build_xid : request->build_xid,
+                .dim = cmd->dim, .metric = cmd->metric, .gpu = device,
+                .handle = handle, .bytes = final,
+                .boundary = {.graph_rows = graph_rows}, .proxy_rows = proxy,
+                .producer_boot = request->boot_id,
+                .placeholder_boot = request->placeholder_rows ? request->boot_id :
+                    restore ? manifest.placeholder_boot : 0,
+                .recovery_placeholders = request->placeholder_rows > 0 ||
+                    (restore && (manifest.flags & CUVS_PAGE_MANIFEST_RECOVERY_PLACEHOLDERS)),
+                .recovery_physical_dead = authority->physical_dead_slots +
+                    (restore ? manifest.physical_dead_slots : 0),
+                .saved_head = request->source, .saved_at_us = admission_mono_us(),
+                .loaded_at = time(NULL), .registered_order = ++g_page_access,
+                .next = g_page_graphs,
+            };
+            strcpy(entry->storage_root, root);
+            (void) cuvs_page_overlay_start_boot(&entry->overlay, request->boot_id, entry->folded);
+            g_page_graphs = entry;
+            ++g_n_page_graphs;
+            entry = NULL;
+            proxy = NULL;
+            handle = NULL;
+            registered = true;
+            status = CUVS_STATUS_OK;
+            /* Reserve-to-resident is one L0 transition. An abandoned
+             * handle keeps its reservation until destruction instead. */
+            page_recovery_finish_claim_locked(device, needed, final);
+        }
+    }
+    pthread_mutex_unlock(&g_index_mutex);
+    if (handle)
+        cuvs_cagra_free(handle, device);
+    if (!registered)
+    {
+        pthread_mutex_lock(&g_index_mutex);
+        page_recovery_finish_claim_locked(device, needed, 0);
+        pthread_mutex_unlock(&g_index_mutex);
+    }
+done:
+    if (registered)
+        LOG_INFO("[page_recovery] db=%u index=%u nonce=%016llx mode=%s graph_rows=%llu slots=%llu placeholders=%u\n",
+                 cmd->db_oid, cmd->index_oid, (unsigned long long) request->target.graph_nonce,
+                 !restore ? "hydrate" : input_rows ? "proxy" : "checkpoint",
+                 (unsigned long long) graph_rows, (unsigned long long) request->target.n_slots,
+                 request->placeholder_rows > 0 ||
+                 (restore && (manifest.flags & CUVS_PAGE_MANIFEST_RECOVERY_PLACEHOLDERS)) ? 1U : 0U);
+    if (artifact_fd >= 0)
+        close(artifact_fd);
+    if (scope)
+    {
+        pthread_mutex_unlock(&scope->gate);
+        page_storage_put(scope);
+    }
+    if (rows != MAP_FAILED)
+        munmap(rows, bytes);
+    free(entry);
+    cuvs_page_overlay_release(proxy);
+    release_retired_page_overlays();
+    if (owns_gpu)
+    {
+        pthread_mutex_lock(&g_index_mutex);
+        --g_page_recovery_owners;
+        pthread_mutex_unlock(&g_index_mutex);
+    }
+    return status;
+}
+
+static void
+handle_page_recovery(int client_fd, const CuvsCmdFrame *cmd)
+{
+    CuvsPageRecoveryRequest request;
+    CuvsPageRecoveryHead found = {0};
+    CuvsPageRecoveryAuthority authority;
+    CuvsPageCheckpointRef refs[CUVS_PAGE_RECOVERY_BATCH];
+    CuvsReplyHeader reply = {.status = CUVS_STATUS_ERROR};
+    char requested[CUVS_PAGE_INDEX_DIR_SIZE], root[CUVS_PAGE_INDEX_DIR_SIZE];
+    int rows_fd = -1;
+
+    if (recv_all(client_fd, &request, sizeof(request)) != 0 ||
+        cuvs_fd_recv(client_fd, requested, sizeof(requested), &rows_fd) != 0)
+        goto done;
+    if (request.length != sizeof(request) ||
+        !cmd->db_oid || !cmd->index_oid || !cmd->dim || cmd->dim > INT16_MAX ||
+        cmd->metric > CUVS_METRIC_IP || cmd->graph_degree < 8 || cmd->graph_degree > 512 ||
+        cmd->intermediate_graph_degree < cmd->graph_degree || cmd->intermediate_graph_degree > 1024 ||
+        cmd->build_algo > CUVS_CAGRA_BUILD_NN_DESCENT || !request.system_identifier || !request.index_nonce ||
+        !request.base_nonce || !request.boot_id || request.target.n_slots > INT32_MAX ||
+        !cuvs_page_recovery_lineage(&request.target, &request.target) ||
+        request.count > CUVS_PAGE_RECOVERY_BATCH ||
+        (request.count && request.operation != CUVS_PAGE_RECOVERY_FIND &&
+         request.operation != CUVS_PAGE_RECOVERY_PRUNE) ||
+        request.operation == CUVS_PAGE_RECOVERY_INSTALL ||
+        (request.operation != CUVS_PAGE_RECOVERY_INSTALL_AUTHORIZED && (rows_fd >= 0 || request.placeholder_rows)))
+        goto done;
+
+    if (request.operation == CUVS_PAGE_RECOVERY_CHECK)
+    {
+        PageStorageScope *scope = page_storage_get(cmd->db_oid, cmd->index_oid);
+
+        pthread_mutex_lock(&g_index_mutex);
+        if (scope)
+            page_storage_observe_locked(scope, &request);
+        reply.status = page_recovery_resident_locked(cmd, &request) ?
+            CUVS_STATUS_OK : CUVS_STATUS_NOT_FOUND;
+        if (reply.status == CUVS_STATUS_OK)
+        {
+            PageCagraGraph *entry = page_reconcile_current_locked(cmd, &request);
+            uint64_t now = admission_mono_us();
+
+            if (entry && now >= entry->reconcile_after_us)
+            {
+                entry->reconcile_after_us = now + PAGE_CHECKPOINT_INTERVAL_US;
+                reply.n_results = 1;
+            }
+        }
+        pthread_mutex_unlock(&g_index_mutex);
+        page_storage_put(scope);
+        release_retired_page_overlays();
+        goto done;
+    }
+    if (request.operation == CUVS_PAGE_RECOVERY_INSTALL_AUTHORIZED ||
+        request.operation == CUVS_PAGE_RECOVERY_RETIRE_AUTHORIZED)
+    {
+        if (recv_all(client_fd, &authority, sizeof(authority)) != 0 ||
+            !authority.wal_lsn || !authority.tablespace_oid || authority.database_oid != cmd->db_oid ||
+            !authority.rel_number || authority.physical_dead_slots > request.placeholder_rows)
+            goto done;
+        if (request.operation == CUVS_PAGE_RECOVERY_RETIRE_AUTHORIZED)
+        {
+            if (request.source.graph_nonce || request.source.n_slots || request.source.folded)
+                goto done;
+            handle_page_recovery_retire(client_fd, cmd, &request, &authority);
+            return;
+        }
+    }
+    if (!resolve_page_root(requested, root))
+    {
+        /* A missing cache root need not prevent recovery in memory. */
+        if (request.operation != CUVS_PAGE_RECOVERY_INSTALL_AUTHORIZED || request.source.graph_nonce)
+        {
+            reply.status = CUVS_STATUS_NOT_FOUND;
+            goto done;
+        }
+        if (!memchr(requested, '\0', sizeof(requested)))
+            goto done;
+        strcpy(root, requested);
+    }
+    if (request.operation == CUVS_PAGE_RECOVERY_LIST ||
+        request.operation == CUVS_PAGE_RECOVERY_PRUNE)
+    {
+        if (request.operation == CUVS_PAGE_RECOVERY_PRUNE &&
+            (!request.count || recv_all(client_fd, refs, request.count * sizeof(*refs)) != 0))
+            goto done;
+        reply.status = reconcile_page_checkpoints(client_fd, root, cmd, &request, refs, &reply.n_results);
+        goto done;
+    }
+    if (request.operation == CUVS_PAGE_RECOVERY_FIND)
+    {
+        CuvsPageRecoveryHead lineage[CUVS_PAGE_RECOVERY_BATCH];
+
+        if (!request.count || recv_all(client_fd, lineage, request.count * sizeof(*lineage)) != 0)
+            goto done;
+        reply.status = CUVS_STATUS_NOT_FOUND;
+        PageStorageScope *scope = page_storage_get(cmd->db_oid, cmd->index_oid);
+
+        if (!scope)
+            goto done;
+        pthread_mutex_lock(&scope->gate);
+        for (uint32_t i = request.count; i > 0; --i)
+        {
+            CuvsPageManifest manifest;
+            const CuvsPageRecoveryHead *candidate = &lineage[i - 1];
+
+            if (cuvs_page_recovery_lineage(candidate, &request.target) &&
+                request.target.n_slots - candidate->n_slots <= CUVS_PAGE_OVERLAY_MAX &&
+                read_page_manifest(root, cmd, &request, candidate, &manifest, NULL))
+            {
+                found = *candidate;
+                reply.n_results = 1;
+                reply.status = CUVS_STATUS_OK;
+                break;
+            }
+        }
+        pthread_mutex_unlock(&scope->gate);
+        page_storage_put(scope);
+    }
+    else if (request.operation == CUVS_PAGE_RECOVERY_INSTALL_AUTHORIZED)
+        reply.status = install_page_recovery(client_fd, cmd, root, &request, &authority, rows_fd);
+
+done:
+    if (rows_fd >= 0)
+        close(rows_fd);
+    if (send_all(client_fd, &reply, sizeof(reply)) == 0 && reply.status == CUVS_STATUS_OK)
+    {
+        if (found.graph_nonce)
+            (void) send_all(client_fd, &found, sizeof(found));
+        else if (request.operation == CUVS_PAGE_RECOVERY_LIST && reply.n_results)
+            (void) send_all(client_fd, refs, reply.n_results * sizeof(*refs));
+    }
+}
+#endif
 
 static void *
 connection_thread(void *arg)
@@ -17203,6 +18862,11 @@ connection_thread(void *arg)
 #ifdef CUVS_PAGE_FORMAT
         case CUVS_OP_PAGE_HISTORY_PRUNE:
             handle_page_history_prune(client_fd, &cmd);
+            break;
+#endif
+#ifdef CUVS_CAGRA_FOLD_ENABLED
+        case CUVS_OP_PAGE_RECOVERY:
+            handle_page_recovery(client_fd, &cmd);
             break;
 #endif
         case CUVS_OP_FOLD_READY:
@@ -17719,10 +19383,28 @@ sigterm_handler(int sig)
     g_shutdown = 1;
 }
 
-/* Graceful shutdown — main-thread context, safe to use mutex/CUDA/file I/O.
- * Locking g_index_mutex waits for any in-flight connection thread to finish
- * its critical section before we serialize. Does NOT call exit(); the caller
- * returns from main() normally. */
+#ifdef CUVS_CAGRA_FOLD_ENABLED
+static void
+page_recovery_drain_shutdown_locked(void)
+{
+    const uint64_t deadline = admission_mono_us() + UINT64_C(10000000);
+
+    while (g_page_recovery_owners)
+    {
+        if (admission_mono_us() >= deadline)
+        {
+            LOG_ERROR("[page_recovery] shutdown timed out with %u active owners\n", g_page_recovery_owners);
+            _Exit(EXIT_FAILURE);
+        }
+        pthread_mutex_unlock(&g_index_mutex);
+        (void) poll(NULL, 0, 10);
+        pthread_mutex_lock(&g_index_mutex);
+    }
+}
+#endif
+
+/* Main-thread shutdown: drain recovery GPU owners that can run outside
+ * g_index_mutex before saving indexes and entering normal process teardown. */
 static void
 graceful_shutdown(void)
 {
@@ -17765,6 +19447,9 @@ graceful_shutdown(void)
     }
 
     pthread_mutex_lock(&g_index_mutex);
+#ifdef CUVS_CAGRA_FOLD_ENABLED
+    page_recovery_drain_shutdown_locked();
+#endif
     int saved = 0, failed = 0;
     for (int i = 0; i < g_n_indexes; i++)
     {

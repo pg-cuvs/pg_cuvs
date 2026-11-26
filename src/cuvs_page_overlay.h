@@ -56,6 +56,12 @@ CuvsPageOverlayChunk *cuvs_page_overlay_advance_fold(CuvsPageOverlay *overlay, u
  * Retry with the current folded position after readers unpin. Release any
  * returned reference outside the lock. */
 CuvsPageOverlayChunk *cuvs_page_overlay_prune_folded(CuvsPageOverlay *overlay, uint64_t folded);
+
+#ifdef CUVS_CAGRA_FOLD_ENABLED
+void cuvs_page_proxy_score(const CuvsPageOverlayChunk *proxy, uint64_t graph_rows,
+                           uint64_t n_slots, const float *query, const CuvsCmdFrame *cmd,
+                           CuvsPageOverlayResult *results, int *count);
+#endif
 void cuvs_page_overlay_score(const CuvsPageOverlayChunk *chunk, uint64_t upto,
                              const CuvsPageSearchRequest *base, const float *query,
                              const CuvsCmdFrame *cmd, CuvsPageOverlayResult *results, int *count);

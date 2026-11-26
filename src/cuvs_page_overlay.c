@@ -318,6 +318,25 @@ page_add_result(CuvsPageOverlayResult *results, int *count, int k,
     results[lo] = candidate;
 }
 
+#ifdef CUVS_CAGRA_FOLD_ENABLED
+void
+cuvs_page_proxy_score(const CuvsPageOverlayChunk *proxy, uint64_t graph_rows,
+                     uint64_t n_slots, const float *query, const CuvsCmdFrame *cmd,
+                     CuvsPageOverlayResult *results, int *count)
+{
+    const float *row = (const float *) proxy->marks;
+
+    for (uint64_t slot = graph_rows; slot < n_slots; ++slot, row += cmd->dim)
+    {
+        CuvsPageOverlayResult candidate = {
+            .slot = slot, .distance = page_distance(query, row, cmd->dim, cmd->metric),
+        };
+
+        page_add_result(results, count, cmd->k, candidate, cmd->metric);
+    }
+}
+#endif
+
 static void
 page_overlay_score_range(const CuvsPageOverlayChunk *chunk, uint64_t from, uint64_t upto,
                          const CuvsPageSearchRequest *request, const float *query,

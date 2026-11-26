@@ -356,8 +356,9 @@ done:
 }
 
 static bool
-read_fold_log_end(Relation index, BlockNumber block, CuvsCagraFoldPage *page_tag,
-                  CuvsCagraFoldRecord *last, CuvsCagraFoldRecord *previous)
+read_fold_log_page(Relation index, BlockNumber block, CuvsCagraFoldPage *page_tag,
+                   CuvsCagraFoldRecord *last, CuvsCagraFoldRecord *previous,
+                   CuvsCagraFoldRecord *all)
 {
     Buffer buf = ReadBuffer(index, block);
     Page page;
@@ -383,15 +384,34 @@ read_fold_log_end(Relation index, BlockNumber block, CuvsCagraFoldPage *page_tag
                 (const CuvsCagraFoldRecord *) PageGetContents(page);
 
             *page_tag = *tag;
-            *last = records[tag->count - 1];
+            if (last)
+                *last = records[tag->count - 1];
             if (previous && tag->count > 1)
                 *previous = records[tag->count - 2];
+            if (all)
+                memcpy(all, records, tag->count * sizeof(*records));
             valid = true;
         }
     }
     UnlockReleaseBuffer(buf);
     return valid;
 }
+
+static bool
+read_fold_log_end(Relation index, BlockNumber block, CuvsCagraFoldPage *page_tag,
+                  CuvsCagraFoldRecord *last, CuvsCagraFoldRecord *previous)
+{
+    return read_fold_log_page(index, block, page_tag, last, previous, NULL);
+}
+
+#ifdef CUVS_CAGRA_FOLD_ENABLED
+bool
+cuvs_cagra_history_read_fold_log_page(Relation index, BlockNumber block, CuvsCagraFoldPage *tag,
+                                      CuvsCagraFoldRecord *records)
+{
+    return read_fold_log_page(index, block, tag, NULL, NULL, records);
+}
+#endif
 
 /* Caller holds the page-0 fence. Fold log pages only grow at EOF. */
 static bool

@@ -618,10 +618,15 @@ supply committed pending rows or publish one ready fold for the specified
 page-format CAGRA index. The function uses the existing index-owner check and
 reports the outcome as a `NOTICE`. Repeat the call to publish a candidate that
 was still being prepared. Use a writable statement outside a transaction
-block or subtransaction. Folding requires an existing base GPU graph. After a
-daemon or PostgreSQL restart, PostgreSQL
-retains the WAL-published page state and can use exact heap search if the
-matching GPU graph is unavailable.
+block or subtransaction. Folding requires an existing base GPU graph.
+On a preloaded primary, a background worker recovers WAL-logged page-format
+CAGRA indexes after a daemon or PostgreSQL restart. It checks a saved GPU graph
+against the committed page history and reads any missing rows from PostgreSQL.
+The daemon stores checkpoints and their manifests in the index's storage
+directory, honoring its `index_dir` option.
+When a suitable checkpoint is unavailable, the worker can rebuild the GPU
+graph from PostgreSQL. Searches can use exact heap results while the GPU graph
+is unavailable.
 
 The daemon reads these environment variables at startup. Restart it to apply
 a change.

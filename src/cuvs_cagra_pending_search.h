@@ -13,6 +13,9 @@ bool cuvs_cagra_resident_supplement(Relation index, Relation heap, Snapshot snap
                                     const CuvsCagraMeta *meta, BlockNumber blocks, uint64 from,
                                     uint64 upto, CuvsPageSupplement *supplement);
 #ifdef CUVS_CAGRA_FOLD_ENABLED
+#include "storage/fd.h"
+bool cuvs_cagra_spool_recovery(Relation index, Relation heap, const CuvsCagraMeta *meta,
+                               uint64 from, File file, uint32 *placeholder_rows, uint32 *physical_dead_slots);
 bool cuvs_cagra_fold_supplement(Relation index, Relation heap, Snapshot snapshot,
                                 const CuvsCagraMeta *meta, BlockNumber blocks,
                                 uint64 from, uint64 upto, CuvsPageSupplement *supplement);

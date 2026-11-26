@@ -795,6 +795,14 @@ test-i3b-source: test/unit/check_i3b_server_source.py src/pg_cuvs_server.c test/
 
 .PHONY: test-i3b-source
 
+EXTRA_CLEAN += test-page-recovery
+.PHONY: test-page-recovery
+test-unit: test-page-recovery
+test-page-recovery:
+	$(CC) -std=gnu11 -O2 -Wall -Wextra -Werror -DCUVS_CAGRA_FOLD_ENABLED -I src \
+	    test/unit/test_page_recovery.c src/cuvs_page_overlay.c -lm -o $@
+	./$@
+
 test-unit: test-page-overlay test-page-overlay-gpu-cache
 .PHONY: test-page-overlay test-page-overlay-gpu-cache
 test-page-overlay:
@@ -1406,6 +1414,19 @@ test-unit: test-page-fold-lifetime test-page-fold-events
 endif
 test-page-fold-lifetime:
 	$(CC) -std=gnu11 -O1 -DPGCUVS_CPU_SHIM -ffunction-sections -fdata-sections -I src \
+	    test/unit/test_page_fold_lifetime.c src/cuvs_ipc.c src/cuvs_util.c \
+	    src/cuvs_objstore.c src/cuvs_build_corpus.c src/cuvs_wrapper_shim_cpu.c \
+	    src/cuvs_cache_policy.c src/cuvs_peak_meter.c src/cuvs_page_overlay.c src/cuvs_hnsw_upper.c \
+	    -Wl,--gc-sections -Wl,--wrap=cuvs_cagra_free -lm -lpthread -lrt -lcurl -lssl -lcrypto -o $@
+	./$@
+
+EXTRA_CLEAN += test-page-recovery-lifetime
+.PHONY: test-page-recovery-lifetime
+ifeq ($(shell uname -s),Linux)
+test-unit: test-page-recovery-lifetime
+endif
+test-page-recovery-lifetime:
+	$(CC) -std=gnu11 -O1 -DPGCUVS_CPU_SHIM -DCUVS_CAGRA_FOLD_ENABLED -ffunction-sections -fdata-sections -I src \
 	    test/unit/test_page_fold_lifetime.c src/cuvs_ipc.c src/cuvs_util.c \
 	    src/cuvs_objstore.c src/cuvs_build_corpus.c src/cuvs_wrapper_shim_cpu.c \
 	    src/cuvs_cache_policy.c src/cuvs_peak_meter.c src/cuvs_page_overlay.c src/cuvs_hnsw_upper.c \

@@ -1911,6 +1911,11 @@ _PG_init(void)
         RegisterBackgroundWorker(&worker);
     }
 
+#ifdef CUVS_CAGRA_FOLD_ENABLED
+    if (cuvs_page_preloaded)
+        cuvs_cagra_register_recovery_launcher();
+#endif
+
     /* Fallback observability: claim shared memory for the per-index fallback
      * counters (pg_stat_gpu_fallback). Only valid from shared_preload_libraries. */
     if (process_shared_preload_libraries_in_progress)
@@ -2016,6 +2021,15 @@ cuvs_resolve_build_params_rel(Relation indexRel, int *graph_degree,
                         "graph_degree (%d)",
                         *intermediate_graph_degree, *graph_degree)));
 }
+
+#ifdef CUVS_CAGRA_FOLD_ENABLED
+const char *
+cuvs_cagra_recovery_options(Relation index, int *degree, int *intermediate, uint32 *algo)
+{
+    cuvs_resolve_build_params_rel(index, degree, intermediate, algo);
+    return cuvs_resolve_index_dir_rel(index);
+}
+#endif
 
 /* #162: minimal read-only accessor so hnsw_export.c's pre-GPU dim-ceiling
  * check can read an existing cagra index's graph_degree without depending
@@ -5645,6 +5659,8 @@ page_resolve_overlay(IndexScanDesc scan, CuvsScanState *ss, const CuvsCagraMeta 
 #endif
 #ifdef CUVS_CAGRA_FOLD_ENABLED
     uint64 physical_dead = 0;
+    bool recovery_placeholders = !remap_folded && cuvs_ipc_page_overlay_used_recovery_placeholders();
+    bool invisible_base = false;
 #endif
 
     ss->n_results = 0;
@@ -5694,7 +5710,9 @@ page_resolve_overlay(IndexScanDesc scan, CuvsScanState *ss, const CuvsCagraMeta 
 #ifdef CUVS_CAGRA_FOLD_ENABLED
             /* VACUUM can WAL-log TID pages before publishing their count.
              * Use exact search if the physical losses exhaust the allowance. */
-            if (!remap_folded && request->folded && ++physical_dead > request->dead_slots)
+            if (!remap_folded &&
+                (request->folded || (recovery_placeholders && candidate->slot < request->n_slots)) &&
+                ++physical_dead > request->dead_slots)
             {
                 valid = false;
                 break;
@@ -5707,7 +5725,13 @@ page_resolve_overlay(IndexScanDesc scan, CuvsScanState *ss, const CuvsCagraMeta 
         visible = root;
         table_index_fetch_reset(fetch);
         if (!table_index_fetch_tuple(fetch, &visible, scan->xs_snapshot, tuple, &again, &dead))
+        {
+#ifdef CUVS_CAGRA_FOLD_ENABLED
+            if (recovery_placeholders && candidate->slot < request->n_slots)
+                invisible_base = true;
+#endif
             continue;
+        }
 #ifdef CUVS_TEST_HOOKS
         if (resident)
             ++page_resident_proof.first_resident_visible;
@@ -5720,6 +5744,13 @@ page_resolve_overlay(IndexScanDesc scan, CuvsScanState *ss, const CuvsCagraMeta 
     }
     table_index_fetch_end(fetch);
     ExecDropSingleTupleTableSlot(tuple);
+#ifdef CUVS_CAGRA_FOLD_ENABLED
+    /* Recovery may keep a globally dead chain's slot number even before
+     * VACUUM counts it. If it consumed a ranked position in an underfilled
+     * shortlist, let the exact executor path resolve the query. */
+    if (invisible_base && ss->n_results < cuvs_k)
+        return false;
+#endif
     return valid;
 }
 
@@ -6346,12 +6377,14 @@ page_start_search(IndexScanDesc scan, CuvsScanState *ss)
     }
 #endif
 
+    bool base_only = request.tail == request.folded && request.folded == 0;
+
     if (cuvs_page_resident_search)
     {
         rc = page_start_resident(scan, ss, &meta, &request, query, &k, &latency)
             ? CUVS_STATUS_OK : CUVS_STATUS_NOT_FOUND;
     }
-    else if (request.tail == request.folded && request.folded == 0)
+    else if (base_only)
     {
         ss->page_results = palloc(k * sizeof(*ss->page_results));
         rc = cuvs_ipc_search_pages(cuvs_socket_path, MyDatabaseId, RelationGetRelid(index),
@@ -6359,8 +6392,21 @@ page_start_search(IndexScanDesc scan, CuvsScanState *ss)
                                    cuvs_itopk_size, cuvs_search_width, cuvs_cpu_hnsw_fallback,
                                    cuvs_search_mode, cuvs_bf_precision, NULL, 0,
                                    ss->page_results, &ss->n_results, &latency);
+#ifdef CUVS_CAGRA_FOLD_ENABLED
+        if (rc == CUVS_STATUS_PAGE_NEED)
+        {
+            /* A rehydrated base with placeholders needs a boot-bearing
+             * request. Existing pending-position handling is unchanged. */
+            pfree(ss->page_results);
+            ss->page_results = NULL;
+            base_only = false;
+            if (meta.dead_slots > (uint64) (CUVS_PAGE_SEARCH_MAX_K - cuvs_k))
+                return false;
+            k = cuvs_k + (int) meta.dead_slots;
+        }
+#endif
     }
-    else
+    if (!cuvs_page_resident_search && !base_only)
     {
         CuvsPageOverlayRequest overlay = {.base = request, .boot_id = cuvs_cagra_pg_boot_id(),
                                           .from = request.folded};

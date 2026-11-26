@@ -32,6 +32,13 @@ bool cuvs_cagra_history_transition_lookup(Relation index,
 void cuvs_cagra_history_acknowledged(Oid index_oid, const CuvsCagraFoldCandidate *candidate,
                                      uint32 transition_xid);
 void cuvs_cagra_history_collect_database(Oid cagra_am, Snapshot snapshot);
+
+#ifdef CUVS_CAGRA_FOLD_ENABLED
+/* Caller holds the page-0 fence and has checked block against the
+ * relation size. records has CUVS_CAGRA_FOLD_RECORDS_PER_PAGE entries. */
+bool cuvs_cagra_history_read_fold_log_page(Relation index, BlockNumber block, CuvsCagraFoldPage *tag,
+                                            CuvsCagraFoldRecord *records);
+#endif
 #endif
 
 #endif
