@@ -102,6 +102,12 @@ exists for 0.9.0.
 
 ### Fixed
 
+- Documentation: `docs/reference.md` now says that CAGRA compaction rebuilds the graph
+  with cuVS's automatic builder choice whatever the index's `build_algo` is, why (it runs
+  inside VACUUM and falls back to another builder when memory is short), the recall@10
+  difference measured against a `REINDEX` with the same `build_algo`, and that `REINDEX`
+  rebuilds the graph with `build_algo`. Behaviour is unchanged.
+
 - A compaction that keeps a legacy CAGRA index's graph width because its
   reloptions have `intermediate_graph_degree` below `graph_degree` (possible
   after `ALTER INDEX ... SET`) now raises a WARNING naming the index, the two
