@@ -21,6 +21,8 @@
 # (test/native/hnsw-sdk/test_upper_level_precision.py, outside the scope by
 # directory). A new test that reads a file in the scope adds it to EXCLUDED.
 set -uo pipefail
+# Byte-wise character ranges in the path-name check below.
+export LC_ALL=C
 
 EXCLUDED=(docs/reference.md)
 
