@@ -1583,6 +1583,10 @@ test-stale-interim:
 test-k3-digest:
 	python3 test/k3_digest_integration.py
 
+.PHONY: test-hnsw-progress
+test-hnsw-progress:
+	python3 test/hnsw_progress_integration.py
+
 # #203: PostgreSQL/CUDA-free structural checks (real file adapter also lives in
 # test-hnsw-converter). No ANN search-policy defaults are altered.
 test-connectivity: test/unit/test_connectivity.c src/cuvs_connectivity.h

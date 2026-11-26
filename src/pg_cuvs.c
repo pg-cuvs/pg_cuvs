@@ -116,6 +116,9 @@
 #include "cuvs_build_corpus.h"   /* ADR-057: leak-safe tiered build-corpus handoff */
 #include "hnsw_export.h"
 #include "cuvs_hnsw_scan.h"
+#include "commands/progress.h"      /* PROGRESS_CREATEIDX_SUBPHASE */
+#include "utils/backend_progress.h" /* pgstat_progress_update_param */
+#include "cuvs_hnsw_progress.h"
 #include "cuvs_hnsw_build.h"
 #include "cuvs_hnsw_build_common.h"
 #include "cuvs_status_text.h"   /* I3-B status text parsing */
@@ -3233,6 +3236,7 @@ cuvs_build_hnsw_from_heap(Relation heapRel, Relation indexRel, IndexInfo *indexI
         if (!spool->input_hash || pg_cryptohash_init(spool->input_hash) < 0)
             ereport(ERROR, (errmsg("pg_cuvs: cannot initialize HNSW input digest")));
         PrepareTempTablespaces();
+        pgstat_progress_update_param(PROGRESS_CREATEIDX_SUBPHASE, CUVS_HNSW_SUBPHASE_SPOOL);
         out->reltuples = table_index_build_scan(heapRel, indexRel, indexInfo,
             true, true, cuvs_hnsw_spool_callback, spool, NULL);
         out->n_vecs = spool->n;
@@ -3268,6 +3272,7 @@ cuvs_build_hnsw_from_heap(Relation heapRel, Relation indexRel, IndexInfo *indexI
                     == CUVS_HNSW_PRESPOOL_NOTICE_OVERFLOW;
             }
             /* K3: hash the spool while the daemon builds; join after the reply. */
+            pgstat_progress_update_param(PROGRESS_CREATEIDX_SUBPHASE, CUVS_HNSW_SUBPHASE_DAEMON);
             rc = cuvs_ipc_build_hnsw_file_idle(cuvs_socket_path,
                 FileGetRawDesc(spool->vectors), spool->n, spool->dim, spool->metric,
                 2 * m, 4 * m, hierarchy, cap,	/* HNSW M = m: level 0 holds 2 * m neighbours, as pgvector's */

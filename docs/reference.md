@@ -1076,6 +1076,23 @@ search_count, error_count, resident, last_status`
 
 One row per shard; empty for unsharded indexes.
 
+### `pg_stat_progress_create_index` — `pg_cuvs_hnsw` heap builds
+
+A `pg_cuvs_hnsw` build without `source` reports its stage in PostgreSQL's own progress
+view as `phase = 'building index: <stage>'`:
+
+| Stage | Counters |
+|---|---|
+| `initializing` | — |
+| `spooling heap rows` | `blocks_done` / `blocks_total` of the heap scan |
+| `building graph in the GPU daemon` | none; the backend waits for the daemon's reply |
+| `checking graph files` | none; validates the returned graph and spills node locations |
+| `writing index pages` | `tuples_done` / `tuples_total` counts graph nodes after both their element and neighbor pages are published |
+
+`tuples_done` is updated after each data page is published. A build that reuses a
+`source` CAGRA graph stays at `initializing`. The daemon stage covers the
+backend's wait for the graph, including ACE partition work.
+
 ---
 
 ## 7. On-disk artifacts

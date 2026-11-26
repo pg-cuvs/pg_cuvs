@@ -75,6 +75,9 @@
 #include "funcapi.h"               /* get_call_result_type (layer counts) */
 #include "utils/guc.h"
 #include "catalog/pg_type.h"     /* Form_pg_type (#162: vector/halfvec type detection) */
+#include "commands/progress.h"
+#include "utils/backend_progress.h"
+#include "cuvs_hnsw_progress.h"
 
 #include <math.h>
 #include <errno.h>
@@ -3526,7 +3529,7 @@ static void
 hnsw_write_disk_pages(Relation rel, int hnsw_fd, int tids_fd,
                       const HnswlibHeader *header, int m, uint64_t n_nodes,
                       uint32_t dim, int bytes_per_dim, uint32_t data_page_count,
-                      bool skip_wal,
+                      bool skip_wal, bool report_progress,
                       HnswLocationTable *locations)
 {
     HnswDiskRow row;
@@ -3542,6 +3545,12 @@ hnsw_write_disk_pages(Relation rel, int hnsw_fd, int tids_fd,
         !hnsw_add_u64(HNSWLIB_HEADER_BYTES, level0_bytes, &upper_cursor))
         ereport(ERROR, (errmsg("pg_cuvs: HNSW level-0 offset overflow")));
     hnsw_disk_row_init(&row, header, dim);
+    if (report_progress)
+    {
+        pgstat_progress_update_param(PROGRESS_CREATEIDX_TUPLES_TOTAL, (int64)n_nodes);
+        pgstat_progress_update_param(PROGRESS_CREATEIDX_TUPLES_DONE, 0);
+        pgstat_progress_update_param(PROGRESS_CREATEIDX_SUBPHASE, CUVS_HNSW_SUBPHASE_WRITE);
+    }
 
     for (uint64_t node = 0; node < n_nodes; node++)
     {
@@ -3551,8 +3560,14 @@ hnsw_write_disk_pages(Relation rel, int hnsw_fd, int tids_fd,
         if (row.elem.elem_blkno != current_block)
         {
             if (current_block != 0)
+            {
                 hnsw_publish_staged_data_page(rel, staged, skip_wal,
                                               current_block, data_page_count, &batch);
+                /* With a split pair, the preceding node's neighbor page is still staged. */
+                if (report_progress)
+                    pgstat_progress_update_param(PROGRESS_CREATEIDX_TUPLES_DONE,
+                                                 (int64)node - next_started);
+            }
             if (next_started)
             {
                 /* the page holding the last split pair's neighbor tuple; the element may start on it or on the page after */
@@ -3563,8 +3578,12 @@ hnsw_write_disk_pages(Relation rel, int hnsw_fd, int tids_fd,
                 next_started = false;
                 current_block++;
                 if (row.elem.elem_blkno != current_block)
+                {
                     hnsw_publish_staged_data_page(rel, staged, skip_wal,
                                                   current_block, data_page_count, &batch);
+                    if (report_progress)
+                        pgstat_progress_update_param(PROGRESS_CREATEIDX_TUPLES_DONE, (int64)node);
+                }
             }
             if (row.elem.elem_blkno != current_block)
             {
@@ -3604,11 +3623,20 @@ hnsw_write_disk_pages(Relation rel, int hnsw_fd, int tids_fd,
         ereport(ERROR,
                 (errmsg("pg_cuvs: source-less HNSW page count differs from layout")));
     if (current_block != 0)
+    {
         hnsw_publish_staged_data_page(rel, staged, skip_wal,
                                       current_block, data_page_count, &batch);
+        if (report_progress)
+            pgstat_progress_update_param(PROGRESS_CREATEIDX_TUPLES_DONE,
+                                         (int64)n_nodes - next_started);
+    }
     if (next_started)
+    {
         hnsw_publish_staged_data_page(rel, next, skip_wal,
                                       current_block + 1, data_page_count, &batch);
+        if (report_progress)
+            pgstat_progress_update_param(PROGRESS_CREATEIDX_TUPLES_DONE, (int64)n_nodes);
+    }
     if (batch.next != batch.count)
         ereport(ERROR, (errmsg("pg_cuvs: unused HNSW extension buffers")));
 }
@@ -3878,6 +3906,8 @@ hnsw_import_build_result(Relation indexRel,
             ereport(ERROR,
                     (errmsg("pg_cuvs: source-less HNSW build returned invalid files or count")));
 
+        if (heap_m)
+            pgstat_progress_update_param(PROGRESS_CREATEIDX_SUBPHASE, CUVS_HNSW_SUBPHASE_CHECK);
         s->locations.n_nodes = build->n_vecs;
         s->locations.file = BufFileCreateTemp(false);
         if (!s->locations.file)
@@ -3944,7 +3974,7 @@ hnsw_import_build_result(Relation indexRel,
                                  &build->ace, &build->nn, &connectivity);
         hnsw_write_disk_pages(s->target, build->hnsw_fd, build->tids_fd,
                               &header, layout_m, build->n_vecs, build->dim,
-                              bytes_per_dim, data_page_count, skip_wal,
+                              bytes_per_dim, data_page_count, skip_wal, heap_m != 0,
                               &s->locations);
         index_close(s->target, NoLock);
         s->target = NULL;
@@ -5688,6 +5718,15 @@ pg_cuvs_hnsw_layer_counts(PG_FUNCTION_ARGS)
     PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(tupdesc, values, nulls)));
 }
 
+_Static_assert(CUVS_HNSW_SUBPHASE_INITIALIZE == PROGRESS_CREATEIDX_SUBPHASE_INITIALIZE,
+               "the AM's first subphase is PostgreSQL's initializing subphase");
+
+static char *
+cuvs_hnsw_buildphasename(int64 phasenum)
+{
+    return (char *)cuvs_hnsw_build_phase_name(phasenum);
+}
+
 PG_FUNCTION_INFO_V1(pg_cuvs_hnsw_handler);
 Datum
 pg_cuvs_hnsw_handler(PG_FUNCTION_ARGS)
@@ -5710,6 +5749,7 @@ pg_cuvs_hnsw_handler(PG_FUNCTION_ARGS)
     amroutine->ambuild = cuvs_hnsw_ambuild;   /* GPU CAGRA -> HNSW pages */
     amroutine->ambuildempty = cuvs_hnsw_ambuildempty;
     amroutine->amoptions = cuvs_hnsw_amoptions;  /* WITH (source, mode, ...) */
+    amroutine->ambuildphasename = cuvs_hnsw_buildphasename;
     /* Inserts and vacuum retain pgvector's behavior. The scan wrapper keeps
      * its delegate path and connects the explicitly selected exact heap mode. */
     cuvs_hnsw_scan_wrap(amroutine);
