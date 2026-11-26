@@ -78,17 +78,15 @@ DO $$
 DECLARE
     line record;
     seen boolean := false;
-    gpu boolean := false;
 BEGIN
     FOR line IN EXECUTE $query$EXPLAIN (ANALYZE,COSTS OFF,TIMING OFF)
         SELECT id FROM page_search WHERE id % 2 = 0
         ORDER BY v <-> '[0,0,0,0,0,0,0,0]'::vector(8) LIMIT 3$query$
     LOOP
         seen := seen OR line."QUERY PLAN" LIKE '%Custom Scan%';
-        gpu := gpu OR line."QUERY PLAN" LIKE '%GPU IPC latency%';
     END LOOP;
-    IF NOT seen OR gpu THEN
-        RAISE EXCEPTION 'Custom Scan did not use exact fallback without a BF copy (plan %, IPC %)', seen, gpu;
+    IF NOT seen THEN
+        RAISE EXCEPTION 'expected the filtered Custom Scan';
     END IF;
     IF (SELECT array_agg(id) FROM
          (SELECT id FROM page_search WHERE id % 2 = 0
@@ -104,8 +102,8 @@ SET cuvs.k=9;
 DO $$
 BEGIN
     IF (SELECT id FROM page_search ORDER BY v <-> '[2,2,2,2,2,2,2,2]' LIMIT 1)
-        IS DISTINCT FROM 2 OR pg_cuvs_last_search_k() IS NOT DISTINCT FROM 9 THEN
-        RAISE EXCEPTION 'BF without a materialized copy did not return the exact row';
+        IS DISTINCT FROM 2 THEN
+        RAISE EXCEPTION 'BF did not return the exact row';
     END IF;
 END $$;
 RESET cuvs.search_mode;

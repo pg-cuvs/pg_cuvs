@@ -1365,7 +1365,7 @@ def run(work, logs):
     with cluster.daemon(source_on / "pg_cuvs_server", "on", overlay_host_bytes=4 * 1024**3) as daemon:
         cluster.start()
         try:
-            for case in ("alpha1", "alpha2_basic", "truncate", "relcache", "beta1a",
+            for case in ("alpha1", "alpha2_basic", "truncate", "relcache", "beta1a", "page_bf",
                          "beta1b_expression", "beta3a_fold_prepare"):
                 cluster.run("createdb", [case], f"createdb-{case}")
                 cluster.file(case, case)

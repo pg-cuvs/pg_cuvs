@@ -237,6 +237,19 @@ cuvs_bf_build(const float *vecs, int64_t n, int dim, uint32_t metric,
               uint32_t precision, int device_id)
 { (void)precision; (void)device_id; return (CuvsBfIndex) shim_new(vecs, n, dim, metric); }
 
+CuvsBfBuildStatus
+cuvs_bf_build_from_cagra(CuvsCagraIndex source, int64_t n, int dim, uint32_t metric,
+                        uint32_t precision, int device_id, CuvsBfIndex *result)
+{
+    const ShimIndex *base = (const ShimIndex *) source;
+
+    if (!result || *result || !base || base->n != n || base->dim != dim ||
+        base->metric != metric || precision > 1)
+        return CUVS_BF_BUILD_FAILED;
+    *result = cuvs_bf_build(base->vecs, n, dim, metric, precision, device_id);
+    return *result ? CUVS_BF_BUILD_OK : CUVS_BF_BUILD_FAILED;
+}
+
 void cuvs_bf_free(CuvsBfIndex index, int device_id)
 { (void)device_id; shim_free((ShimIndex *)index); }
 

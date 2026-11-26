@@ -923,9 +923,11 @@ an index does the same. Build such an index without `CONCURRENTLY` at a quiet ti
 > `ctid` visible in the caller's snapshot. A `filter_tids` array matches those
 > visible `ctid` values. The GPU path checks candidates in heap block order.
 > The functions can use exact heap search, for example when the GPU shortlist
-> contains fewer than `k` visible rows. Current standard builds supply no GPU
-> brute-force dataset for page-format indexes, so `cuvs_filtered_knn` uses exact
-> heap search on those indexes.
+> contains fewer than `k` visible rows. When a resident page graph lacks a
+> brute-force dataset for the requested precision, the first request uses exact
+> heap search. The daemon can prepare the GPU copy after replying. Later
+> requests can use the ready copy, and searches continue to use the heap while
+> GPU capacity is unavailable or a copy is being built.
 >
 > In the `pg_cuvs_batch_search` visibility benchmark on an A100 80 GB PCIe,
 > an FP32 brute-force test fixture held 100,000 vectors of 128 dimensions.

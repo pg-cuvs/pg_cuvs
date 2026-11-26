@@ -146,6 +146,12 @@ CuvsBfIndex cuvs_bf_build(
     int          device_id
 );
 
+typedef enum CuvsBfBuildStatus {
+    CUVS_BF_BUILD_OK,
+    CUVS_BF_BUILD_FAILED,
+    CUVS_BF_BUILD_CUDA_UNCONFIRMED
+} CuvsBfBuildStatus;
+
 int cuvs_bf_search(
     CuvsBfIndex      index,
     const float     *query_vec,
@@ -187,6 +193,12 @@ int cuvs_bf_search_filtered(
  * All operations are pinned to a specific CUDA device.
  */
 typedef void *CuvsCagraIndex;
+
+/* Build a resident BF copy of the CAGRA dataset in slot order. Set result
+ * only on success. An unconfirmed stream still borrows the source graph. */
+CuvsBfBuildStatus cuvs_bf_build_from_cagra(
+    CuvsCagraIndex source, int64_t n, int dim, uint32_t metric,
+    uint32_t precision, int device_id, CuvsBfIndex *result);
 
 /* I4 / ADR-088: lw_overflow is a CuvsLwOverflow value (cuvs_lw_policy.h).
  * CUVS_LW_OVERFLOW_MANAGED installs a build-only, counted managed resource as
