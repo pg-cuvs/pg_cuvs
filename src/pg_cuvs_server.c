@@ -9648,6 +9648,14 @@ finish_build_commit(int client_fd, const CuvsCmdFrame *cmd, const char *save_dir
     }
     LOG_DEBUG("[handle_build] cagra.tmp written + fsynced\n");
 
+#ifdef CUVS_TEST_HOOKS
+    {
+        const char *delay = getenv("CUVS_FAULT_BUILD_PUBLISH_DELAY_MS");
+        if (delay)
+            usleep((useconds_t)strtoul(delay, NULL, 10) * 1000u);
+    }
+#endif
+
     if (!build_owner_connected(client_fd))
     {
         persist_error = "BUILD owner disconnected before publication";
