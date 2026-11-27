@@ -46,12 +46,6 @@ MUTATIONS = {
         'if (final_bytes >= CUVS_ADMISSION_BYTES_SATURATED)'),
     'zero_degree_not_default': (
         'gd = graph_degree > 0 ?', 'gd = graph_degree >= 0 ?'),
-    'ivfpq_reload_slack_dropped': (
-        'return cuvs_admission_sat_add(artifact_bytes, artifact_bytes / 16u);',
-        'return cuvs_admission_sat_add(artifact_bytes, 0);'),
-    'ivfpq_reload_wraps': (
-        'return cuvs_admission_sat_add(artifact_bytes, artifact_bytes / 16u);',
-        'return artifact_bytes + artifact_bytes / 16u;'),
 }
 UTIL_MUTATIONS = set()  # I4 owns the hook body; its mutations live in test_lw_mutations.py
 

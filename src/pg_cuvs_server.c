@@ -32,6 +32,7 @@
 #include "cuvs_page_overlay_gpu.h"
 #endif
 #include "cuvs_util.h"
+#include "cuvs_ivfpq_format.h"
 #include "cuvs_hnsw_source.h"
 #include "cuvs_cache_policy.h"
 #include "cuvs_bf_verdict.h"     /* #238: remembered brute_force unavailable verdict */
@@ -3428,7 +3429,16 @@ load_index(uint32_t db_oid, uint32_t index_oid, CuvsRequester rq)
             free(tids);
             goto done;
         }
-        reload_bytes = cuvs_admission_estimate_ivfpq_reload_bytes((uint64_t) st.st_size);
+        CuvsIvfPqResidentEstimate estimate;
+        if (cuvs_ivfpq_estimate_resident_fd(ivfpq_fd, (uint64_t) st.st_size, &estimate) != 0)
+        {
+            LOG_WARN("pg_cuvs_server: could not parse IVF-PQ metadata for %u/%u; refusing load
+",
+                     db_oid, index_oid);
+            free(tids);
+            goto done;
+        }
+        reload_bytes = estimate.bytes;
     }
     else
         /* CAGRA graph_degree is not persisted in .tids: use the default. */
