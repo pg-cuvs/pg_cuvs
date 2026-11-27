@@ -322,6 +322,29 @@ def main():
             check('I5b an index of the old symbol takes inserts and has no ledger page', not any(struct.unpack_from('<H', p, 8190)[0] == 0xC0E1 for p in pages))
         finally:
             c.drop()
+
+        # I11: the verification is on by default. A cluster started without the setting: SHOW says on, and rows inserted into a certified
+        # index that the search for their own vector finds get no ledger key; with the setting off the same kind of inserts get one key each.
+        c = dg.Cluster(o, 'i11', out, args.port)
+        c.verify_inserts = True
+        try:
+            o.install('new')
+            c.start()
+            c.scalar('CREATE EXTENSION vector')
+            c.scalar('CREATE EXTENSION pg_cuvs')
+            shown = c.scalar('SHOW cuvs.cover_verify_inserts')
+            check('I11 cuvs.cover_verify_inserts is on by default', shown == 'on', shown)
+            c.scalar('CREATE TABLE d(id int, v vector(3))')
+            c.scalar('CREATE INDEX di ON d USING pg_cuvs_hnsw (v vector_l2_ops)')
+            c.scalar("INSERT INTO d SELECT g, ARRAY[g, 1, 1]::real[]::vector FROM generate_series(1, 200) g")
+            st = json.loads(c.scalar("SELECT pg_cuvs_hnsw_cover_status('di')::text"))
+            check('I11 200 rows inserted with the default: the index is certified and no key was written',
+                  st.get('class') == 'certified' and st.get('ledger_keys') == 0, str(st))
+            rc, res = c.q("SET cuvs.cover_verify_inserts = off; INSERT INTO d SELECT g, ARRAY[g, 3, 3]::real[]::vector FROM generate_series(1001, 1010) g")
+            st = json.loads(c.scalar("SELECT pg_cuvs_hnsw_cover_status('di')::text"))
+            check('I11 10 rows inserted with the setting off: one key each', rc == 0 and st.get('ledger_keys') == 10, f'{res[:100]} {st}')
+        finally:
+            c.drop()
     finally:
         (out / 'transcript.txt').write_text('\n'.join(dg.TRANSCRIPT) + '\n')
         shutil.rmtree(root, ignore_errors=True)

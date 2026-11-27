@@ -8,15 +8,20 @@
  * exists (else 0). Without "<name>_armed" the gate does nothing. Gates: "walk" (the start of the reachability walk, after phase 1 released the
  * cover lock: inserts let through here are written before the walk reads the graph), "recert" (between the new chain and its publication),
  * "vacuum" (between the transition to LOST and pgvector's ambulkdelete), "insert" (between the ledger key and pgvector's insert), "extended"
- * (the index is extended for the new chain, the pages are not written yet).
+ * (the index is extended for the new chain, the pages are not written yet), "sweep" (a sweep worker has judged an index and not yet acted on it),
+ * "status" (the status function has read the descriptor and not yet the ledger chain).
  * CUVS_RECERT_GATE_GROWTH_PAGES replaces the limit of the growth monitor of an insert.
  * A process that waits at a gate answers cancel and terminate requests.
  */
 #ifdef CUVS_COVER_RECERT_TEST_GATE
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
 #include "miscadmin.h"
+
+/* A process held at a gate leaves it when this says so (cuvs_cover_worker.c: a background worker that would step aside in a walk). */
+extern bool (*cuvs_cover_test_gate_release) (void);
 
 static inline char
 cuvs_cover_test_gate(const char *name)
@@ -39,6 +44,8 @@ cuvs_cover_test_gate(const char *name)
 	for (n = 0; n < 600 && access(path, F_OK) != 0; n++)
 	{
 		CHECK_FOR_INTERRUPTS();	/* a test can cancel or terminate the process that waits here */
+		if (cuvs_cover_test_gate_release != NULL && cuvs_cover_test_gate_release())
+			break;
 		pg_usleep(100000);
 	}
 	snprintf(path, sizeof(path), "%s/%s_touch", dir, name);

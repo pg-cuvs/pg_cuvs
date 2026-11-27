@@ -1,0 +1,51 @@
+-- cover_insert_shift.sql — the cover guarantee of a pg_cuvs_hnsw index rests on a search descending through the upper layers as pgvector's
+-- does. A GPU-built index in the default mode, then 400 rows of another distribution inserted, half with the verification of inserts
+-- (the default) and half without: the index stays certified, each of 20 built rows is still its own first answer and so is each of 20
+-- inserted rows. A graph without upper layers (mode nsw before 0.9.3) left the index certified while searches missed the built rows.
+\set ON_ERROR_STOP on
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS vector;
+CREATE EXTENSION IF NOT EXISTS pg_cuvs;
+RESET client_min_messages;
+CREATE TABLE cs(id int PRIMARY KEY, v vector(16));
+INSERT INTO cs SELECT g, (SELECT array_agg(((hashtext(g::text || ':' || d::text) & 65535) / 65536.0)::real) FROM generate_series(1, 16) d)::vector
+FROM generate_series(1, 2000) g;
+ANALYZE cs;
+CREATE INDEX cs_i ON cs USING pg_cuvs_hnsw (v vector_l2_ops);
+SHOW cuvs.cover_verify_inserts;
+ cuvs.cover_verify_inserts 
+---------------------------
+ on
+(1 row)
+
+INSERT INTO cs SELECT g, (SELECT array_agg((3.0 + ((hashtext(g::text || ':' || d::text) & 65535) / 65536.0))::real) FROM generate_series(1, 16) d)::vector
+FROM generate_series(2001, 2200) g;
+SET cuvs.cover_verify_inserts = off;
+INSERT INTO cs SELECT g, (SELECT array_agg((3.0 + ((hashtext(g::text || ':' || d::text) & 65535) / 65536.0))::real) FROM generate_series(1, 16) d)::vector
+FROM generate_series(2201, 2400) g;
+RESET cuvs.cover_verify_inserts;
+SELECT pg_cuvs_hnsw_cover_status('cs_i')->>'class' AS class;
+   class   
+-----------
+ certified
+(1 row)
+
+SET enable_seqscan = off;
+SELECT count(*) AS built_own_first_of_20
+FROM generate_series(7, 2000, 100) s(g)
+WHERE (SELECT id FROM cs ORDER BY v <-> (SELECT v FROM cs WHERE id = s.g) LIMIT 1) = s.g;
+ built_own_first_of_20 
+-----------------------
+                    20
+(1 row)
+
+SELECT count(*) AS inserted_own_first_of_20
+FROM generate_series(2011, 2400, 20) s(g)
+WHERE (SELECT id FROM cs ORDER BY v <-> (SELECT v FROM cs WHERE id = s.g) LIMIT 1) = s.g;
+ inserted_own_first_of_20 
+--------------------------
+                       20
+(1 row)
+
+RESET enable_seqscan;
+DROP TABLE cs;

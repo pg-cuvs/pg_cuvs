@@ -6,6 +6,11 @@
 
 typedef int (*CuvsReachEmitFn)(void *ctx, uint32 heap_blk, uint16 heap_off);
 
+/* In the product library the worker module fills this hook. A standalone probe of the reach walk leaves it NULL;
+ * the hook is false by definition outside a background worker. */
+typedef bool (*CuvsCoverReachDbwaitHook)(void);
+extern CuvsCoverReachDbwaitHook cuvs_cover_reach_dbwait_hook;
+
 /* Result of a walk, plain integers so the caller needs no core header. */
 typedef struct CuvsReachCounts {
 	int			status;		/* 0 = ok; see CuvsReachStatus (2 over limit, 4 damaged) */

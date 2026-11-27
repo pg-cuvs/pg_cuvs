@@ -122,6 +122,7 @@
 #include "cuvs_status_text.h"   /* I3-B status text parsing */
 #include "cuvs_route_preflight.h"
 #include "cuvs_vacuum_policy.h"   /* amvacuumcleanup: no compaction on ANALYZE */
+#include "cuvs_cover_worker.h"    /* GUCs of the background recertification */
 
 PG_MODULE_MAGIC;
 
@@ -1351,12 +1352,12 @@ _PG_init(void)
 
     DefineCustomBoolVariable(
         "cuvs.cover_verify_inserts",
-        "Experimental: do not write a ledger key for an inserted row that a search for it finds.",
+        "Do not write a ledger key for an inserted row that a search for it finds.",
         "After the insert the row is searched for with its own vector through pgvector's scan; a row the search returns was reachable from the "
-        "entry point at that moment. Off by default; a row verified this way is outside the ledger, and a later insert that cuts it off from "
-        "the graph is outside the guarantee until the next recertification.",
+        "entry point at that moment. On by default; a row verified this way is outside the ledger, and a later insert that cuts it off from "
+        "the graph is outside the guarantee until the next recertification, as with pgvector. Off writes a key for every inserted row.",
         &cuvs_cover_verify_inserts,
-        false,
+        true,
         PGC_SUSET,
         0, NULL, NULL, NULL);
 
@@ -1892,6 +1893,8 @@ _PG_init(void)
         &cuvs_auto_compact_threshold,
         0.10, 0.01, 1.0,
         PGC_SIGHUP, 0, NULL, NULL, NULL);
+
+    cuvs_cover_worker_init();
 
     /* This worker and its startup-only setting belong to the postmaster.
      * A backend loading page-format support on demand can still serve and

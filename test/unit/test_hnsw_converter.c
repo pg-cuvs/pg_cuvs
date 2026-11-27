@@ -103,6 +103,11 @@ test_fault_pread(int fd, void *buffer, size_t length, off_t offset)
 sigjmp_buf *PG_exception_stack = NULL;
 ErrorContextCallback *error_context_stack = NULL;
 bool IsUnderPostmaster = false;
+
+/* The index the fixture writes for: no access method routine (rd_indam NULL), so hnsw_cover_enabled() is false and
+ * the writer builds it as an old-symbol index, without a cover descriptor. */
+static RelationData test_old_rel;
+#define TEST_OLD_REL (&test_old_rel)
 sigset_t BlockSig;
 void pg_re_throw(void)
 {
@@ -137,6 +142,13 @@ errmsg(const char *format, ...)
     va_start(args, format);
     vfprintf(stderr, format, args);
     va_end(args);
+    return 0;
+}
+
+int
+errcode(int sqlerrcode)
+{
+    (void)sqlerrcode; /* the ERROR itself fails the fixture in errfinish() */
     return 0;
 }
 
@@ -353,6 +365,20 @@ ReadBuffer(Relation rel, BlockNumber block_num)
     return (Buffer)(++chain_test_nblocks);
 }
 
+/* hnsw_export.c compares an index's ambuildempty with cuvs_cover_buildempty, so that wrapper and the metapage
+ * check it shares are linked; the fixture never reads a page through them. */
+Buffer
+ReadBufferExtended(Relation rel, ForkNumber fork, BlockNumber block_num,
+                   ReadBufferMode mode, BufferAccessStrategy strategy)
+{
+    (void)rel;
+    (void)fork;
+    (void)block_num;
+    (void)mode;
+    (void)strategy;
+    abort();
+}
+
 #if PG_VERSION_NUM >= 160000
 BlockNumber
 ExtendBufferedRelBy(BufferManagerRelation bmr, ForkNumber fork,
@@ -453,7 +479,7 @@ test_batched_data_page_publication(void)
                 for (uint32 block = 1; block <= count; block++)
                 {
                     memset(staged, (int)(block % 251), sizeof(staged));
-                    hnsw_publish_staged_data_page(NULL, staged, skip != 0,
+                    hnsw_publish_staged_data_page(TEST_OLD_REL, staged, skip != 0,
                                                   block, count, &batch);
                     assert(memcmp(chain_test_pages[block], staged, BLCKSZ) == 0);
                     assert(CritSectionCount == 0);
@@ -786,7 +812,7 @@ test_legacy_writer_page_chains(void)
 
     chain_test_reset();
     for (size_t node = 0; node < 3; node++)
-        write_elem_page(NULL, (uint32_t)node + 1, &elems[node], vectors[node],
+        write_elem_page(TEST_OLD_REL, (uint32_t)node + 1, &elems[node], vectors[node],
                         2, 4, 1, 3, true, hnsw_lookup_elem_array, elems);
     assert_source_data_page_chain(3);
 
@@ -804,7 +830,7 @@ test_legacy_writer_page_chains(void)
     }
 
     chain_test_reset();
-    write_elem_pages_packed(NULL, elems, &vectors[0][0], 2, 4, 1, 5,
+    write_elem_pages_packed(TEST_OLD_REL, elems, &vectors[0][0], 2, 4, 1, 5,
                             true, hnsw_lookup_elem_array, elems);
     assert_source_data_page_chain(3);
 }
@@ -831,7 +857,7 @@ test_disk_writer_page_chain_case(bool hierarchical, uint16_t heap_m)
 
     int layout_m = heap_m ? heap_m : (int)header.M;
     chain_test_reset();
-    hnsw_write_disk_pages(NULL, f.hnsw_fd, f.tids_fd, &header, layout_m, 2, 2, 4,
+    hnsw_write_disk_pages(TEST_OLD_REL, f.hnsw_fd, f.tids_fd, &header, layout_m, 2, 2, 4,
                           1, true, &locations);
     assert_source_data_page_chain(1);
     Page page = (Page)chain_test_pages[1];
@@ -969,7 +995,7 @@ test_packed_writer_split_pairs(void)
     assert(elems[0].neigh_blkno == 2 && elems[2].neigh_blkno == 6);
 
     chain_test_reset();
-    write_elem_pages_packed(NULL, elems, &vectors[0][0], D, 4, 32, N,
+    write_elem_pages_packed(TEST_OLD_REL, elems, &vectors[0][0], D, 4, 32, N,
                             true, hnsw_lookup_elem_array, elems);
     assert_source_data_page_chain(6);
     for (uint32_t block = 1; block <= 6; block++)
@@ -1083,9 +1109,9 @@ test_hierarchical_native_packing_case(int dim, int bytes_per_dim, int m)
     policy.guard_passed = 1;
     chain_test_reset();
     chain_test_nblocks = 0;
-    hnsw_write_disk_metapage(NULL, &parsed, (uint16_t)parsed.M, (uint32_t)dim, n_pages,
+    hnsw_write_disk_metapage(TEST_OLD_REL, &parsed, (uint16_t)parsed.M, (uint32_t)dim, n_pages,
                              false, &table, &policy, NULL, NULL, NULL);
-    hnsw_write_disk_pages(NULL, f.hnsw_fd, f.tids_fd, &parsed, (int)parsed.M, N,
+    hnsw_write_disk_pages(TEST_OLD_REL, f.hnsw_fd, f.tids_fd, &parsed, (int)parsed.M, N,
                           (uint32_t)dim, bytes_per_dim, n_pages, false, &table);
     assert(chain_test_wal_images == n_pages + 1);
     assert(CritSectionCount == 0);
@@ -1145,7 +1171,7 @@ test_hierarchical_native_packing_case(int dim, int bytes_per_dim, int m)
         row.elem.elem_blkno = row.elem.neigh_blkno = (uint32_t)node + 1;
         row.elem.elem_offno = 1;
         row.elem.neigh_offno = 2;
-        write_elem_page(NULL, (uint32_t)node + 1, &row.elem, row.vector,
+        write_elem_page(TEST_OLD_REL, (uint32_t)node + 1, &row.elem, row.vector,
                         dim, bytes_per_dim, m, N, true,
                         hnsw_lookup_elem_array, reference_locations);
     }
@@ -1641,20 +1667,20 @@ test_ace_readback_metapage_roundtrip(void)
         CuvsConnectivity c={0}, readback;
         c.magic=CUVS_CONNECTIVITY_MAGIC;c.version=1;c.available=1;c.nodes=p.n_rows;c.unreachable=70;c.wcc_all=1;
         chain_test_reset();
-        hnsw_write_disk_metapage(NULL,&hdr,(uint16_t)hdr.M,2,1,true,&table,&p,&ace,NULL,&c);
+        hnsw_write_disk_metapage(TEST_OLD_REL,&hdr,(uint16_t)hdr.M,2,1,true,&table,&p,&ace,NULL,&c);
         meta=(Page)chain_test_pages[chain_test_nblocks-1];
         readback=hnsw_read_connectivity(meta);
         assert(readback.magic==c.magic && readback.unreachable==70 && readback.wcc_all==1);
     }
     /* a graph converted from a CAGRA index carries no build receipt. */
     chain_test_reset();
-    hnsw_write_disk_metapage(NULL, &hdr, (uint16_t)hdr.M, 2, 1, true, &table, NULL, NULL, NULL, NULL);
+    hnsw_write_disk_metapage(TEST_OLD_REL, &hdr, (uint16_t)hdr.M, 2, 1, true, &table, NULL, NULL, NULL, NULL);
     meta = (Page)chain_test_pages[chain_test_nblocks - 1];
     assert(((PageHeader)meta)->pd_lower == prefix);
     assert(hnsw_read_disk_policy(meta, &out) == CUVS_HNSW_POLICY_NOT_RECORDED);
     assert(((PgvHnswMeta *)PageGetContents(meta))->dimensions == 2);
     chain_test_reset();
-    hnsw_write_disk_metapage(NULL, &hdr, (uint16_t)hdr.M, 2, 1, true, &table, &p, &ace, NULL, NULL);
+    hnsw_write_disk_metapage(TEST_OLD_REL, &hdr, (uint16_t)hdr.M, 2, 1, true, &table, &p, &ace, NULL, NULL);
     meta = (Page)chain_test_pages[chain_test_nblocks - 1];
     if (((PageHeader)meta)->pd_lower != prefix + sizeof(p) + sizeof(ace))
     {
@@ -1694,7 +1720,7 @@ test_ace_readback_metapage_roundtrip(void)
         marked.route_flags |= CUVS_HNSW_ROUTE_FLAG_ACE_PARTITIONS_REQUESTED;
         assert(cuvs_hnsw_policy_valid(&marked));
         chain_test_reset();
-        hnsw_write_disk_metapage(NULL, &hdr, (uint16_t)hdr.M, 2, 1, true, &table, &marked, &ace, NULL, NULL);
+        hnsw_write_disk_metapage(TEST_OLD_REL, &hdr, (uint16_t)hdr.M, 2, 1, true, &table, &marked, &ace, NULL, NULL);
         meta = (Page)chain_test_pages[chain_test_nblocks - 1];
         assert(((PageHeader)meta)->pd_lower == prefix + sizeof(marked) + sizeof(ace));
         assert(memcmp((char *)meta + prefix, &marked, sizeof(marked)) == 0);
@@ -1705,7 +1731,7 @@ test_ace_readback_metapage_roundtrip(void)
         assert(memcmp(&ace_out, &ace, sizeof(ace)) == 0);
         /* The page bytes of an unmarked receipt are the ones stored before the mark existed. */
         chain_test_reset();
-        hnsw_write_disk_metapage(NULL, &hdr, (uint16_t)hdr.M, 2, 1, true, &table, &p, &ace, NULL, NULL);
+        hnsw_write_disk_metapage(TEST_OLD_REL, &hdr, (uint16_t)hdr.M, 2, 1, true, &table, &p, &ace, NULL, NULL);
         meta = (Page)chain_test_pages[chain_test_nblocks - 1];
         assert(hnsw_read_disk_policy(meta, &out) == CUVS_HNSW_POLICY_RECORDED
                && out.route_flags == 0 && !cuvs_hnsw_ace_partitions_unverified(&out));
@@ -1717,7 +1743,7 @@ test_ace_readback_metapage_roundtrip(void)
     resident.requested_algo = CUVS_HNSW_ALGO_IVF_PQ; resident.partitions = 0;
     assert(cuvs_hnsw_policy_valid(&resident));
     chain_test_reset();
-    hnsw_write_disk_metapage(NULL, &hdr, (uint16_t)hdr.M, 2, 1, true, &table, &resident, &ace, NULL, NULL);
+    hnsw_write_disk_metapage(TEST_OLD_REL, &hdr, (uint16_t)hdr.M, 2, 1, true, &table, &resident, &ace, NULL, NULL);
     meta = (Page)chain_test_pages[chain_test_nblocks - 1];
     assert(((PageHeader)meta)->pd_lower == prefix + sizeof(resident));
 
@@ -1731,7 +1757,7 @@ test_ace_readback_metapage_roundtrip(void)
         bad.local_intermediate = 128;
         assert(freopen("/dev/null", "w", stderr) != NULL);
         chain_test_reset();
-        hnsw_write_disk_metapage(NULL, &hdr, (uint16_t)hdr.M, 2, 1, true, &table, &p, &bad, NULL, NULL);
+        hnsw_write_disk_metapage(TEST_OLD_REL, &hdr, (uint16_t)hdr.M, 2, 1, true, &table, &p, &bad, NULL, NULL);
         _exit(0); /* reaching here means the writer accepted it */
     }
     assert(waitpid(child, &status, 0) == child);
@@ -1747,7 +1773,7 @@ test_ace_readback_metapage_roundtrip(void)
     nn.graph_degree = 128; nn.internal_degree = 192; nn.sdk_default_iterations = 20;
     nn.max_iterations = 20; nn.dtype = CUVS_HNSW_NN_DTYPE_FP32; nn.termination_threshold = 0.0001f;
     chain_test_reset();
-    hnsw_write_disk_metapage(NULL, &hdr, (uint16_t)hdr.M, 2, 1, true, &table, &p, &ace, &nn, NULL);
+    hnsw_write_disk_metapage(TEST_OLD_REL, &hdr, (uint16_t)hdr.M, 2, 1, true, &table, &p, &ace, &nn, NULL);
     meta = (Page)chain_test_pages[chain_test_nblocks - 1];
     assert(((PageHeader)meta)->pd_lower == prefix + sizeof(p) + sizeof(nn));
     assert(hnsw_read_disk_policy(meta, &out) == CUVS_HNSW_POLICY_RECORDED);
@@ -1765,7 +1791,7 @@ test_ace_readback_metapage_roundtrip(void)
         for (int i = 0; i < 2; i++)
         {
             chain_test_reset();
-            hnsw_write_disk_metapage(NULL, &hdr, (uint16_t)hdr.M, 2, 1, true, &table, &p, &ace, &nn, records[i]);
+            hnsw_write_disk_metapage(TEST_OLD_REL, &hdr, (uint16_t)hdr.M, 2, 1, true, &table, &p, &ace, &nn, records[i]);
             meta = (Page)chain_test_pages[chain_test_nblocks - 1];
             assert(((PageHeader)meta)->pd_lower == prefix + sizeof(p) + sizeof(nn));
             assert(hnsw_read_disk_policy(meta, &out) == CUVS_HNSW_POLICY_RECORDED);

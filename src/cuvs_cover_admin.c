@@ -34,6 +34,7 @@
 #include "storage/lmgr.h"
 #include "storage/proc.h"
 #include "lib/stringinfo.h"
+#include "cuvs_cover_verify.h"
 #include "utils/builtins.h"
 #include "utils/jsonb.h"
 #include "utils/fmgroids.h"
@@ -44,11 +45,13 @@
 #include "utils/rel.h"
 #include "utils/timestamp.h"
 #include "utils/snapmgr.h"
+#include "cuvs_cover_worker.h"
 
 #include "cuvs_cover_format.h"
 #include "cuvs_cover_recert.h"
 #include "cuvs_cover_scan.h"
 #include "cuvs_cover_reach_pg.h"
+#include "cuvs_cover_testgate.h"
 #include "utils/acl.h"
 
 PG_FUNCTION_INFO_V1(pg_cuvs_cover_invalidate_all);
@@ -294,7 +297,8 @@ pending_text(uint8 reason)
 		case CUVS_COVER_REASON_UNCERTIFIED:
 			return "built without a certification: pg_cuvs_cover_recertify() or the next VACUUM certifies it; autovacuum vacuums the table by itself only after enough rows changed (autovacuum_vacuum_threshold and _scale_factor, or the insert variants), an unchanged table waits for a call; until then scans rank the heap";
 		case CUVS_COVER_REASON_VACUUM:
-			return "a VACUUM changed the graph: the cleanup of that VACUUM, the next VACUUM or pg_cuvs_cover_recertify() certifies it again";
+			return "a VACUUM changed the graph: the cleanup of that VACUUM, the next sweep after it, the next VACUUM or pg_cuvs_cover_recertify() certifies it again; "
+				"while that VACUUM runs scans merge the graph and the ledger, after it they rank the heap";
 		case CUVS_COVER_REASON_UNKEYED_WRITER:
 			return "rows were inserted without ledger keys (an older library?): pg_cuvs_cover_recertify() or the next VACUUM certifies it again";
 		case CUVS_COVER_REASON_RECERT_FAILED:
@@ -329,8 +333,9 @@ pg_cuvs_hnsw_cover_status(PG_FUNCTION_ARGS)
 	bool		have_growth = false, recommended = false, have_ledger = false, ledger_ok = false, marked = false;
 	uint64		ledger_keys = 0;
 	const char *ledger_why = "";
-	uint64		delta_keys = 0;
+	uint64		delta_keys = 0, pages_since = 0;
 	CuvsCoverDescriptor dsc;
+	int			attempt;
 
 	if (index_rel->rd_rel->relam != am_oid || !OidIsValid(am_oid))
 		ereport(ERROR, (errcode(ERRCODE_WRONG_OBJECT_TYPE),
@@ -355,21 +360,41 @@ pg_cuvs_hnsw_cover_status(PG_FUNCTION_ARGS)
 		index_close(index_rel, AccessShareLock);
 		PG_RETURN_DATUM(DirectFunctionCall1(jsonb_in, CStringGetDatum(e.data)));
 	}
-	have_head = copy_block(index_rel, 1, head);
-	have_meta = copy_block(index_rel, 0, meta);
-	if (have_meta)
-		cuvs_cover_classify(meta, have_head ? head : NULL, &res);
-	else
+	/*
+	 * The ledger is read without the cover lock, as a scan reads it: a recertification can publish a new chain while it is read, and a
+	 * later one can reuse the old chain's pages. A page of another generation then says that the chain was replaced, not that it is
+	 * damaged: read the descriptor again, at most three times, as cuvs_cover_scan_ledger does.
+	 */
+	for (attempt = 0;; attempt++)
 	{
-		memset(&res, 0, sizeof(res));
-		res.cls = CUVS_COVER_ERROR;
-	}
-	have_growth = res.writable && (res.cls == CUVS_COVER_CERTIFIED || res.cls == CUVS_COVER_LOST) &&
-		cuvs_cover_growth_status(index_rel, &dsc, &delta_keys, &recommended);
-	if (res.writable && (res.cls == CUVS_COVER_CERTIFIED || res.cls == CUVS_COVER_LOST) && res.ledger_head != CUVS_COVER_INVALID_BLOCK)
-	{
-		have_ledger = true;
-		ledger_ok = cuvs_cover_ledger_check(index_rel, &res, &ledger_keys, &ledger_why);
+		have_head = copy_block(index_rel, 1, head);
+		have_meta = copy_block(index_rel, 0, meta);
+		if (have_meta)
+			cuvs_cover_classify(meta, have_head ? head : NULL, &res);
+		else
+		{
+			memset(&res, 0, sizeof(res));
+			res.cls = CUVS_COVER_ERROR;
+		}
+		have_growth = res.writable && (res.cls == CUVS_COVER_CERTIFIED || res.cls == CUVS_COVER_LOST) &&
+			cuvs_cover_growth_status(index_rel, &dsc, &delta_keys, &recommended);
+		if (have_growth)
+			pages_since = cuvs_cover_pages_since_cert(index_rel, &dsc);
+		have_ledger = false;
+		ledger_ok = false;
+		ledger_keys = 0;
+		ledger_why = "";
+#ifdef CUVS_COVER_RECERT_TEST_GATE
+		if (attempt == 0)
+			(void) cuvs_cover_test_gate("status");	/* the descriptor is read, the chain is not */
+#endif
+		if (res.writable && (res.cls == CUVS_COVER_CERTIFIED || res.cls == CUVS_COVER_LOST) && res.ledger_head != CUVS_COVER_INVALID_BLOCK)
+		{
+			have_ledger = true;
+			ledger_ok = cuvs_cover_ledger_check(index_rel, &res, &ledger_keys, &ledger_why);
+		}
+		if (ledger_ok || !have_ledger || attempt >= 2 || !cuvs_cover_ledger_stale(ledger_why))
+			break;
 	}
 	marked = res.cls == CUVS_COVER_CERTIFIED && cuvs_cover_breakglass_marked();
 	index_close(index_rel, AccessShareLock);
@@ -399,15 +424,26 @@ pg_cuvs_hnsw_cover_status(PG_FUNCTION_ARGS)
 	/* The descriptor says CERTIFIED, this library may read it, the handler names the symbol that maintains the ledger, the break-glass
 	 * marker is absent AND the whole ledger chain reads: only then is the promise of decision A in force. The promise: every row the
 	 * graph could not reach when the index was last certified (the start of that recertification: the walk is not a snapshot), and every row
-	 * inserted after that, is a candidate of every ordered scan. Rows an insert after the certification cut off from the graph, the inserts
-	 * made during the walk included, are outside it until the next one. */
+	 * inserted after that whose insert the verification did not find (every one with cuvs.cover_verify_inserts off), is a candidate of
+	 * every ordered scan. Rows an insert after the certification cut off from the graph, the inserts made during the walk included, are
+	 * outside it until the next one. */
 	appendStringInfo(&out, ", \"handler_symbol\": \"%s\", \"guarantee_in_force\": %s", fn_name,
 					 (res.cls == CUVS_COVER_CERTIFIED && res.writable && strcmp(fn_name, "pg_cuvs_hnsw_handler_c1p") == 0 &&
 					  !marked && have_ledger && ledger_ok) ? "true" : "false");
 	if (res.cls == CUVS_COVER_CERTIFIED && res.writable && strcmp(fn_name, "pg_cuvs_hnsw_handler_c1p") == 0 && !marked && have_ledger && ledger_ok)
-		appendStringInfoString(&out, ", \"guarantee\": \"rows the graph could not reach when the last certification began (certified_at: the start of the recertification, which is not a snapshot) and every row inserted since are always candidates; "
-							   "a row that an insert since then cut off from the graph, the inserts made while that recertification ran included, is outside this until the next recertification "
-							   "(the cleanup step of a VACUUM (once the keys since the certification pass 5 percent of the rows it covered, or after a VACUUM took the index off), pg_cuvs_cover_recertify(), or REINDEX); how many rows that is depends on the graph and the data (measured ranges are in docs/reference.md)\"");
+		appendStringInfo(&out, ", \"guarantee\": \"%s; "
+						 "a row that an insert since then cut off from the graph, the inserts made while that recertification ran included, is outside this until the next recertification, which %s; how many rows that is depends on the graph and the data (measured ranges are in docs/reference.md)\"",
+						 /* With the verification (the default) a row the search found at its insert has no key, as a reachable row of the
+						  * certification has none; the session's setting decides which promise its inserts get. */
+						 cuvs_cover_verify_inserts
+						 ? "rows the graph could not reach when the last certification began (certified_at: the start of the recertification, which is not a snapshot) are always candidates, and so is every row inserted since that the search for its own vector did not find at its insert (cuvs.cover_verify_inserts is on); "
+						   "a row the search found at its insert is treated as a reachable row of the certification"
+						 : "rows the graph could not reach when the last certification began (certified_at: the start of the recertification, which is not a snapshot) and every row inserted since are always candidates (cuvs.cover_verify_inserts is off)",
+						 !cuvs_cover_auto_recertify_available()
+						 ? "only VACUUM or pg_cuvs_cover_recertify() makes (no background sweep: cuvs.cover_auto_recertify is off, or pg_cuvs is not in shared_preload_libraries)"
+						 : cuvs_cover_recert_max_age > 0
+						 ? "a background sweep starts within cuvs.cover_recertify_max_age of certified_at, plus its check period and the time of the recertification"
+						 : "a background sweep starts once the keys or the pages added pass the threshold, and otherwise only VACUUM or pg_cuvs_cover_recertify() makes (cuvs.cover_recertify_max_age is 0: no time bound)");
 	if (have_ledger)
 	{
 		appendStringInfo(&out, ", \"ledger_ok\": %s", ledger_ok ? "true" : "false");
@@ -429,11 +465,17 @@ pg_cuvs_hnsw_cover_status(PG_FUNCTION_ARGS)
 						 (unsigned long long) res.generation);
 	if (have_growth)
 	{
-		appendStringInfo(&out, ", \"base_rows\": %llu, \"base_unreached\": %llu, \"keys_since_certification\": %llu",
-						 (unsigned long long) dsc.base_rows, (unsigned long long) dsc.base_missing, (unsigned long long) delta_keys);
-		/* certified_at: the time the guarantee refers to (the recertification began: no insert was in flight then) */
+		appendStringInfo(&out, ", \"base_rows\": %llu, \"base_unreached\": %llu, \"keys_since_certification\": %llu, \"pages_since_certification\": %llu",
+						 (unsigned long long) dsc.base_rows, (unsigned long long) dsc.base_missing, (unsigned long long) delta_keys, (unsigned long long) pages_since);
+		/* certified_at: the time the guarantee refers to (the recertification began: no insert was in flight then); published_at: when it was published */
 		if (dsc.cert_time != 0)
 			appendStringInfo(&out, ", \"certified_at\": \"%s\"", timestamptz_to_str((TimestampTz) dsc.cert_time));
+		if (dsc.cert_published_time != 0)
+			appendStringInfo(&out, ", \"published_at\": \"%s\"", timestamptz_to_str((TimestampTz) dsc.cert_published_time));
+		/* without pg_cuvs in shared_preload_libraries (or with cuvs.cover_auto_recertify off) nothing recertifies by itself: VACUUM and the function remain */
+		appendStringInfo(&out, ", \"background_recertification\": %s", cuvs_cover_auto_recertify_available() ? "true" : "false");
+		/* an insert since the certification, keyed or not (what the time rule goes by besides keys and pages) */
+		appendStringInfo(&out, ", \"inserted_since_certification\": %s", (dsc.flags & CUVS_COVER_FLAG_INSERTED) != 0 ? "true" : "false");
 		if (res.cls == CUVS_COVER_CERTIFIED)
 		{
 			appendStringInfo(&out, ", \"recertify_recommended\": %s", (recommended || (have_ledger && !ledger_ok)) ? "true" : "false");
@@ -444,12 +486,25 @@ pg_cuvs_hnsw_cover_status(PG_FUNCTION_ARGS)
 				appendStringInfoString(&out, ", \"pending\": \"the ledger does not read (see ledger_problem): pg_cuvs_cover_recertify() or the next VACUUM builds a new one; "
 									   "until then scans rank the heap\"");
 			else if (recommended)
-				appendStringInfo(&out, ", \"pending\": \"the keys written since the certification passed %d percent of the rows it covered: "
-								 "the next VACUUM, pg_cuvs_cover_recertify() or REINDEX recertifies it; until then every one of those keys is ranked exactly on each scan, so searches slow down as the keys grow\"",
-								 CUVS_RECERT_GROWTH_PERCENT);
+				appendStringInfo(&out, ", \"pending\": \"the keys written, or the pages added, since the certification passed %d percent of what it covered: %s"
+								 "the next VACUUM or pg_cuvs_cover_recertify() recertifies it; until then every one of those keys is ranked exactly on each scan\"",
+								 cuvs_cover_recert_percent,
+								 cuvs_cover_auto_recertify_available()
+								 ? "the next sweep (every tenth of cuvs.cover_recertify_max_age, every 30 s when it is 0) starts a background recertification, and "
+								 : "no background worker is available (cuvs.cover_auto_recertify is off, or pg_cuvs is not in shared_preload_libraries), so ");
 			else if (have_growth && dsc.last_fail_nblocks != 0)
 				appendStringInfoString(&out, ", \"pending\": \"the last recertification of this index failed (see last_recertification_failure) and the guarantee in force is the one of the last certification; "
 									   "a VACUUM tries again once the table or the memory limit has changed, and pg_cuvs_cover_recertify() tries at once\"");
+			/* below the threshold a recertification is scheduled by time: the next sweep after the certification began cuvs.cover_recertify_max_age ago takes the index */
+			if (!recommended && !(have_ledger && !ledger_ok) && (delta_keys >= 1 || pages_since >= 1 || (dsc.flags & CUVS_COVER_FLAG_INSERTED) != 0) &&
+				cuvs_cover_auto_recertify_available() && cuvs_cover_recert_max_age > 0)
+			{
+				if (dsc.cert_time != 0)
+					appendStringInfo(&out, ", \"recertify_scheduled_at\": \"%s\"",
+									 timestamptz_to_str((TimestampTz) dsc.cert_time + (int64) cuvs_cover_recert_max_age * USECS_PER_SEC));
+				else
+					appendStringInfoString(&out, ", \"recertify_scheduled_at\": \"next sweep\"");
+			}
 		}
 		if (res.cls == CUVS_COVER_LOST)
 			appendStringInfo(&out, ", \"pending\": \"%s\"", pending_text(dsc.reason));

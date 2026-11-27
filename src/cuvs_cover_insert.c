@@ -6,7 +6,7 @@
  * therefore always in the ledger or reachable: the guarantee of the narrowed promise rests on this
  * order. A ledger key whose insert later rolls back stays (the safe direction, a recertification drops it).
  *
- * With cuvs.cover_verify_inserts (experimental, off by default) the order is the other way for a row that a search finds: pgvector inserts
+ * With cuvs.cover_verify_inserts (on by default) the order is the other way for a row that a search finds: pgvector inserts
  * first, the search runs, and a key is written afterwards only for a row the search does not find. The two records belong to one transaction,
  * so a crash between them leaves a row that never commits.
  *
@@ -38,6 +38,7 @@
 #include "cuvs_cover_testgate.h"
 #include "cuvs_cover_verify.h"
 #include "cuvs_cover_scan.h"
+#include "cuvs_cover_worker.h"
 
 #ifdef CUVS_COVER_RECERT_TEST_GATE
 #define cover_growth_pages() cuvs_cover_test_growth_pages(CUVS_COVER_GROWTH_PAGES)
@@ -50,7 +51,7 @@ static bool (*pgv_aminsert) (Relation, Datum *, bool *, ItemPointer, Relation, I
 /* Read the descriptor of `index` from a share-locked copy of block 0. Returns false if the index carries no
  * descriptor, or one that must not get keys (not CERTIFIED / LOST-with-chain, or a format this library may not write). */
 static bool
-cover_chain(Relation index, uint32 *tail, uint64 *generation, bool *certified)
+cover_chain(Relation index, uint32 *tail, uint64 *generation, bool *certified, uint16 *flags)
 {
 	Buffer		buf = ReadBuffer(index, 0);
 	uint8_t		meta[CUVS_COVER_PAGE_SIZE];
@@ -85,6 +86,7 @@ cover_chain(Relation index, uint32 *tail, uint64 *generation, bool *certified)
 		*tail = res.ledger_tail;
 		*generation = res.generation;
 		*certified = (res.cls == CUVS_COVER_CERTIFIED);
+		*flags = res.flags;
 		return true;
 	}
 	return false;
@@ -180,6 +182,7 @@ cuvs_cover_append_key(Relation index, uint32 tail, uint64 generation, bool certi
 {
 	CuvsLedgerKey key = *proto;
 	uint32		hops;
+	bool		took_off = false;	/* this call took the guarantee off (the growth monitor): a candidate of the sweeper */
 
 	for (hops = 0; hops < 1000000; hops++)
 	{
@@ -220,6 +223,13 @@ cuvs_cover_append_key(Relation index, uint32 tail, uint64 generation, bool certi
 		/* seen == 0 means "unknown" (a page written before the monitor existed): record it, do not judge */
 		suspect = certified && h.graph_nblocks_seen != 0 && nblocks > h.graph_nblocks_seen &&
 			nblocks - h.graph_nblocks_seen > cover_growth_pages();
+		/*
+		 * The sweeper's candidate of a certified index is written by its first insert after the certification (cover_mark_inserted), and stays
+		 * while anything was added since; a page added later in the same certification is not written again (the scan of the
+		 * candidate table under its spinlock ran once per page). What still writes one here is the move to LOST by the growth monitor.
+		 */
+		if (suspect)
+			took_off = true;
 		if (h.count < CUVS_LEDGER_CAPACITY)
 		{
 			if (cuvs_ledger_append_seen((uint8_t *) page, &key, nblocks) != CUVS_LEDGER_OK)
@@ -245,6 +255,8 @@ cuvs_cover_append_key(Relation index, uint32 tail, uint64 generation, bool certi
 			UnlockReleaseBuffer(buf);
 			if (tail_out)
 				*tail_out = tail;
+			if (took_off)
+				cuvs_cover_note_candidate(RelationGetRelid(index));
 			return;
 		}
 		/* the tail is full: add a page. The extension lock is held only while the block is allocated and locked. */
@@ -295,6 +307,8 @@ cuvs_cover_append_key(Relation index, uint32 tail, uint64 generation, bool certi
 			UnlockReleaseBuffer(buf);
 			if (tail_out)
 				*tail_out = newblk;
+			if (took_off)
+				cuvs_cover_note_candidate(RelationGetRelid(index));
 			return;
 		}
 	}
@@ -315,10 +329,10 @@ cover_append(Relation index, uint32 tail, uint64 generation, bool certified, Ite
 	return ordinal;
 }
 
-bool cuvs_cover_verify_inserts = false;
+bool cuvs_cover_verify_inserts = true;
 
 /*
- * Experimental (cuvs.cover_verify_inserts, off by default): a row that pgvector has inserted and that a search for its own vector finds
+ * cuvs.cover_verify_inserts (on by default): a row that pgvector has inserted and that a search for its own vector finds
  * (cuvs_cover_insert_searchable) is reachable from the entry point at that moment and gets no ledger key; a row the search does not find gets
  * its key after the insert. Only a CERTIFIED index is verified. The search reads no ledger, so a long ledger does not stop it.
  */
@@ -346,6 +360,7 @@ cover_note_verified(Relation index, uint32 tail, uint64 generation)
 {
 	uint32		hops;
 	BlockNumber nblocks = RelationGetNumberOfBlocks(index);
+	bool		took_off = false;
 
 	for (hops = 0; hops < 1000000; hops++)
 	{
@@ -386,6 +401,7 @@ cover_note_verified(Relation index, uint32 tail, uint64 generation)
 				return;
 			}
 			suspect = h2.graph_nblocks_seen != 0 && nblocks - h2.graph_nblocks_seen > cover_growth_pages();
+			took_off = suspect;	/* the candidate of a growth is the first insert's (cover_mark_inserted); a move to LOST writes one here */
 			h2.graph_nblocks_seen = nblocks;
 			cuvs_ledger_write_header((uint8_t *) page, &h2);
 			if (suspect)
@@ -401,8 +417,53 @@ cover_note_verified(Relation index, uint32 tail, uint64 generation)
 				GenericXLogFinish(xlog);
 			UnlockReleaseBuffer(buf);
 		}
+		if (took_off)
+			cuvs_cover_note_candidate(RelationGetRelid(index));
 		return;
 	}
+}
+
+/*
+ * say in the descriptor that a row was inserted since the certification (CUVS_COVER_FLAG_INSERTED) and since phase 1 of a
+ * recertification that may run now (INSERTED_SINCE_START), so that the time rule takes the index although the insert writes no key and adds no
+ * page, and a sweep after a restart knows it too. Only an insert that finds one of the two missing in its share-locked copy of block 0 comes here:
+ * the bits are looked at again under the exclusive lock, so that of several inserts that come together one writes the WAL record. The caller holds
+ * the cover lock in share mode (no recertification phase runs) and has not called pgvector's insert yet, which locks block 0 itself. The insert
+ * that writes the bits writes the candidate of the sweeper too. True if this insert wrote them.
+ */
+static bool
+cover_mark_inserted(Relation index, uint64 generation)
+{
+	const uint16 both = CUVS_COVER_FLAG_INSERTED | CUVS_COVER_FLAG_INSERTED_SINCE_START;
+	Buffer		metabuf = ReadBuffer(index, 0);
+	GenericXLogState *xlog;
+	Page		metapage;
+	CuvsCoverDescriptor d;
+	uint32_t	upper;
+	bool		wrote = false;
+
+	LockBuffer(metabuf, BUFFER_LOCK_EXCLUSIVE);
+	xlog = GenericXLogStart(index);
+	metapage = GenericXLogRegisterBuffer(xlog, metabuf, 0);
+	upper = cuvs_cover_get16((const uint8_t *) metapage, CUVS_COVER_OFF_UPPER);
+	memcpy(&d, (char *) metapage + upper, sizeof(d));
+	if (d.magic == CUVS_COVER_D_MAGIC && d.generation == generation && d.state == CUVS_COVER_STATE_CERTIFIED && (d.flags & both) != both)
+	{
+		d.flags |= both;
+		cuvs_cover_descriptor_seal(&d);
+		memcpy((char *) metapage + upper, &d, sizeof(d));
+		GenericXLogFinish(xlog);
+		wrote = true;
+	}
+	else
+		GenericXLogAbort(xlog);
+	UnlockReleaseBuffer(metabuf);
+	if (wrote)
+	{
+		elog(DEBUG1, "pg_cuvs: index \"%s\" marked as inserted into since its certification", RelationGetRelationName(index));
+		cuvs_cover_note_candidate(RelationGetRelid(index));
+	}
+	return wrote;
 }
 
 static bool
@@ -415,10 +476,14 @@ cuvs_cover_aminsert(Relation index, Datum *values, bool *isnull, ItemPointer hti
 	bool		certified = false;
 	bool		verify;
 	bool		result;
+	uint16		flags = 0;
 
 	/* the cover lock is a transaction lock in the lock manager; it is released as soon as the delegate insert is done */
 	LockDatabaseObject(RelationRelationId, RelationGetRelid(index), CUVS_COVER_LOCKSUBID, ShareLock);
-	keyed = cover_chain(index, &tail, &generation, &certified);
+	keyed = cover_chain(index, &tail, &generation, &certified, &flags);
+	if (keyed && certified && (flags & (CUVS_COVER_FLAG_INSERTED | CUVS_COVER_FLAG_INSERTED_SINCE_START)) !=
+		(CUVS_COVER_FLAG_INSERTED | CUVS_COVER_FLAG_INSERTED_SINCE_START))
+		(void) cover_mark_inserted(index, generation);
 	verify = keyed && certified && cuvs_cover_verify_inserts;
 	if (keyed && !verify)
 		(void) cover_append(index, tail, generation, certified, htid);

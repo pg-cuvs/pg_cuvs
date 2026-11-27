@@ -315,7 +315,8 @@ SELECT pg_cuvs_hnsw_cover_status('schema.index_name'::regclass);
 `pg_cuvs` must be in `shared_preload_libraries`. Without it the library cannot be loaded and
 `CREATE EXTENSION pg_cuvs` fails with `FATAL: cannot create PGC_POSTMASTER variables after
 startup` (executed: `test_downgrade_pg.py`, case S0). This is not a new requirement of
-0.9.3; the current library already needs it.
+0.9.3; the current library already needs it. The background recertification worker needs it
+as well.
 
 ### 7.3 `ALTER EXTENSION UPDATE` run before the restart
 
@@ -333,6 +334,14 @@ After the update, reconnect every pooled connection. A session opened before
 `ALTER EXTENSION pg_cuvs UPDATE` keeps the old index routine in its relation cache, and a
 `REINDEX` run from such a session builds the index as LEGACY again (executed in an
 independent review, script `st1.sh`; it is not one of the three test runners).
+
+### 7.4a Going back to an older 0.9.3 library
+
+A later 0.9.3 library marks the descriptor of an index after the first insert since its certification (two bits of its flags; the format
+version does not change). An older library of the same format reads such an index as before and keeps the bits through its own
+recertification, which ends normally (executed: `test/unit/test_cover_compat_pg.py`, case K5). Back on the later library, the index is
+walked once more and the bits are cleared. The two libraries never run in one server at the same time, so an older library's walk never
+meets an insert of the later one.
 
 ### 7.5 Not run for this procedure
 

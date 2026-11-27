@@ -116,6 +116,17 @@ class Cluster:
         opts = f'-p {self.port} -k {self.sock} -c listen_addresses= -c max_connections=30'
         if self.preload:
             opts += ' -c shared_preload_libraries=pg_cuvs'
+        # The tests count keys, chain pages and generations of indexes they fill by inserts; a background recertification would
+        # move all of them under their feet. test_cover_autorecert_pg.py is the test of that worker and sets auto_recert.
+        # PGCUVS_TEST_AUTORECERT=1 leaves the worker on for every runner, to see how the scenarios fare with it (assertions that count keys,
+        # chain pages or generations are expected to move; the others must hold)
+        if not getattr(self, 'auto_recert', False) and os.environ.get('PGCUVS_TEST_AUTORECERT') != '1':
+            opts += ' -c cuvs.cover_auto_recertify=off'
+        # Most tests count one key per insert after certification, which is cuvs.cover_verify_inserts = off. The verification is on by
+        # default: a cluster with verify_inserts set (or PGCUVS_TEST_VERIFY_INSERTS=1) keeps the default; the tests of the verification set
+        # it on in their session or database.
+        if not getattr(self, 'verify_inserts', False) and os.environ.get('PGCUVS_TEST_VERIFY_INSERTS') != '1':
+            opts += ' -c cuvs.cover_verify_inserts=off'
         opts += ' ' + getattr(self, 'extra_opts', '')
         # -t 300 (default 60): the runners start servers on a host that other jobs load; crash recovery after an immediate stop has taken
         # longer than a minute there, and a start that gives up leaves the test with a half-started cluster instead of a result

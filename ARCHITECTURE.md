@@ -449,10 +449,15 @@ prefix bytes:
   go to a free list and are reused.
 
 The access method handler wraps pgvector's. **Insert**: share cover lock, append the ledger key (WAL-logged first), delegate to the pgvector
-insert, release; an insert never leaves a row in the graph without a key. **Scan** (`cuvs_hnsw_scan.c`): a certified index merges the
+insert, release; with `cuvs.cover_verify_inserts` off an insert never leaves a row in the graph without a key, and with it on (the default) a row that
+the search for its own vector finds right after the insert gets none (it is reachable then; the first such insert after a certification marks
+the descriptor, so the time rule takes the index). **Scan** (`cuvs_hnsw_scan.c`): a certified index merges the
 graph's answers with all ledger keys, removes repeated TIDs and ranks the set exactly through the exact-scan module; any class that cannot
-promise the merge (lost, untrusted, unreadable ledger, newer format) is answered exactly from the heap with a NOTICE. **VACUUM**: `ambulkdelete`
-moves a certified index to `LOST` and bumps the graph epoch (WAL-logged) before pgvector changes the graph; `amvacuumcleanup` recertifies lost
+promise the merge (lost, untrusted, unreadable ledger, newer format) is answered exactly from the heap with a NOTICE, except a lost index while
+the VACUUM that took it off runs, which is merged (a standby merges while the stored reason is vacuum). **VACUUM**: `ambulkdelete`
+moves a certified index to `LOST` and bumps the graph epoch (WAL-logged) before pgvector changes the graph, and records its transaction (pid,
+backend id and local transaction id of the VACUUM's leader) in the sweeper's candidate slot, which is what the scan and the sweep ask whether it
+still runs; the sweep does not request a worker for such an index while it does; `amvacuumcleanup` recertifies lost
 indexes, indexes whose ledger outgrew the threshold and indexes whose ledger does not read.
 
 **Recertification** (`cuvs_cover_recertify`): phase 1 takes the cover lock exclusively (a short poll, then a queued request bounded by
@@ -461,10 +466,29 @@ is in flight at that instant. Phase 2 releases the lock and walks the graph page
 update lock, so inserts continue; it writes a private new chain (unreachable rows, then the keys written since `t_start`, minus those the walk
 already listed) and copies later keys in unlocked passes. Phase 3 retakes the lock, copies the last keys, compare-and-swaps the descriptor
 (generation, graph epoch, flags, state) and publishes it in one WAL record that also puts the replaced chain on the free list. The walk is
-therefore not a snapshot: an insert that runs during it can cut off an old row the walk had already counted as reached (`certified_at` is the instant of phase 1). Such a row is
-outside the guarantee, which names the certification time, and appears in the next recertification; a row inserted during the walk is always covered by its own key. The walk gives
-way (`deferred`, nothing written) when another session starts to wait for a lock that conflicts with its table lock, and it holds its lists of unreached rows and keys against the
-memory limit.
+therefore not a snapshot: an insert that runs during it can cut off an old row the walk had already counted as reached (`certified_at` is the instant of phase 1 and `published_at` the publication; keys written after `t_start`, the walk's own inserts included, count toward the recertification threshold). Such a row is
+outside the guarantee (it counts as inserted after the certification, which is the start of phase 1) and appears in the next recertification;
+a row inserted during the walk is always covered by its own key.
+
+**Background worker and request table.** Requests live in a shared-memory table (256 slots, one per database and index; it exists when
+`pg_cuvs` is in `shared_preload_libraries`). No insert requests a worker: the sweeper below is the only requester. A request sets the slot's
+"wanted" flag and, when no worker runs for that index, its `cuvs.cover_recertify_min_interval` is over and fewer than
+`cuvs.cover_recertify_max_workers` run in the server, registers a dynamic background worker. The worker looks (a transaction of its own, table
+and index locks taken without queueing, 2 s), recertifies when due, releases everything and waits up to 1 s for another request; the decision to
+end is taken under the same mutex where requests set the flag. A worker that certified nothing delays the next start for that index by
+`cuvs.cover_recertify_min_interval`. A request nobody can serve stays wanted until the next sweep asks again, except that a worker that ends
+starts a worker for an index whose request is waiting.
+A **sweeper** (a permanent background worker with no database, restarted by the postmaster, not started on a standby) is the trigger. It keeps a
+second shared-memory table of candidates (1,024 entries): an index is written there by the first insert after its certification and when a VACUUM
+or the growth monitor takes its guarantee off; a sweep keeps it while a key, a page or that insert's mark is there since the certification. That first insert also sets a flag in the
+descriptor (`CUVS_COVER_FLAG_INSERTED`, with `INSERTED_SINCE_START` for the inserts after phase 1 of a recertification that runs, which publication
+copies into it), so that an insert that writes no key and adds no page still makes the index due by time, after a restart too. Every
+`cuvs.cover_recertify_max_age / 10` seconds (10 s to 5 min, 30 s when the setting is `0`, which turns only the time rule off; nothing while `cuvs.cover_auto_recertify` is off)
+it asks a short-lived worker of each database that has a candidate to read the descriptor and the last ledger page of its candidates; a database
+without one is not connected to. An index that is `lost`, is past the threshold in keys or pages, or has at least one key, page or insert since a
+certification that began `cuvs.cover_recertify_max_age` ago gets a request; a candidate with nothing added since its certification is taken off the
+table and nothing is walked for it. The candidate table is empty after a restart and may overflow, so the first sweep after the start, and the
+first after an overflow, looks at every connectable database and every index of the access method (found through its operator classes) instead.
 
 The pages of the new chain come from the free list, then from the extension of the index, which is done in steps of 64 blocks while the tail page of
 the old chain is locked, and the size that page remembers is raised by the step: the growth monitor of an insert (the index grew by more than 256 pages since the
@@ -487,8 +511,7 @@ update scripts remove the marker.
 each key costs one exact distance per search (measured at 100,000 x 96: 3,000 keys add 1.87 ms p95). An index with a descriptor is
 answered on a table with row-level security or through a security barrier: a plain-column index as on any table, an index with an expression or
 a predicate by PostgreSQL's own Seq Scan + Sort (planning does not choose it for such a statement; `docs/reference.md` has the table and the one error that is left). Standby servers read the ledger like any page; recertification
-runs on the primary only. Nothing recertifies an index by itself except the cleanup step of a VACUUM, so the ledger of a table that is inserted into grows until a VACUUM,
-`pg_cuvs_cover_recertify()` or `REINDEX`.
+and the worker run on the primary only.
 
 ---
 

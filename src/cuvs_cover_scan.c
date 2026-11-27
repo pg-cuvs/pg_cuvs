@@ -128,6 +128,17 @@ cuvs_cover_ledger_is_empty(Relation index, const CuvsCoverResult *res)
 	return h.first_ordinal == 0 && h.count == 0 && cuvs_ledger_next(page) == CUVS_LEDGER_NO_BLOCK;
 }
 
+static const char cover_ledger_stale_why[] = "a ledger page belongs to another generation";
+
+/* Whether cuvs_cover_ledger_check failed because a page of the chain belongs to another generation: a reader without the cover lock
+ * (a scan, the status function) sees that when a recertification published a new chain and a later one reused the old chain's pages
+ * while it read; reading the descriptor again gives the chain in force. */
+bool
+cuvs_cover_ledger_stale(const char *why)
+{
+	return why == cover_ledger_stale_why;
+}
+
 bool
 cuvs_cover_ledger_check(Relation index, const CuvsCoverResult *res, uint64 *nkeys, const char **why)
 {
@@ -151,7 +162,7 @@ cuvs_cover_ledger_check(Relation index, const CuvsCoverResult *res, uint64 *nkey
 	}
 	*why = st == CUVS_LEDGER_WALK_UNREADABLE ? "a ledger page cannot be read" :
 		st == CUVS_LEDGER_WALK_INVALID ? "a ledger page is not a valid ledger page" :
-		st == CUVS_LEDGER_WALK_STALE ? "a ledger page belongs to another generation" :
+		st == CUVS_LEDGER_WALK_STALE ? cover_ledger_stale_why :
 		st == CUVS_LEDGER_WALK_GAP ? "the keys of two ledger pages do not follow each other" :
 		st == CUVS_LEDGER_WALK_TOO_LONG ? "the ledger chain is longer than the relation (a loop)" :
 		st == CUVS_LEDGER_WALK_BAD_KEY ? "a ledger key does not match its crc" :

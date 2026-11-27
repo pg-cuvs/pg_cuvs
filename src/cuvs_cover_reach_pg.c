@@ -24,6 +24,8 @@
 #include "cuvs_cover_reach.h"
 #include "cuvs_cover_reach_pg.h"
 
+CuvsCoverReachDbwaitHook cuvs_cover_reach_dbwait_hook = NULL;
+
 #define MAX_SPILL_MAPS 8
 
 typedef struct PgReach {
@@ -84,6 +86,9 @@ pg_reach_delay(void *c)
 	/* A statement that needs more than we hold (ALTER TABLE, DROP INDEX, TRUNCATE) queues behind this walk, and every reader and writer that
 	 * arrives after it queues behind that statement: stop, the walk is only repeated later. */
 	if (r->yield_heap != NULL && pg_reach_others_wait(r->yield_heap))
+		return 1;
+	/* a background worker steps aside for DROP DATABASE and the like on its database; every 256 pages, looked up at most every 100 ms */
+	if (cuvs_cover_reach_dbwait_hook != NULL && cuvs_cover_reach_dbwait_hook())
 		return 1;
 	return 0;
 }

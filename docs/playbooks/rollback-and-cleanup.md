@@ -399,7 +399,7 @@ and the marker is what it keys on.
   done in each database. A cluster whose databases are at different steps was not run.
 - **Lock note.** Recertification and VACUUM hold `ShareUpdateExclusiveLock` on the table while
   they walk it. If a DDL such as `ALTER TABLE` waits behind them, PostgreSQL's lock queue makes
-  later reads and writes wait for as long. A manual recertification gives way when another
+  later reads and writes wait for as long. A manual or background recertification gives way when another
   session starts to wait for a lock that conflicts with its table lock (status `deferred`,
   nothing written; `test_cover_walk_pg.py` W4), and does not take its locks while a statement
   that conflicts holds them. A VACUUM does not give way: it holds the lock for its own whole run.
