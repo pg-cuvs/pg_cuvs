@@ -6,8 +6,12 @@
  * therefore always in the ledger or reachable: the guarantee of the narrowed promise rests on this
  * order. A ledger key whose insert later rolls back stays (the safe direction, a recertification drops it).
  *
+ * With cuvs.cover_verify_inserts (experimental, off by default) the order is the other way for a row that a search finds: pgvector inserts
+ * first, the search runs, and a key is written afterwards only for a row the search does not find. The two records belong to one transaction,
+ * so a crash between them leaves a row that never commits.
+ *
  * Growth monitor: every key records the relation size at that moment in its ledger page. If the size
- * has grown by more than CUVS_COVER_GROWTH_PAGES since the previous key while the index is CERTIFIED, somebody added
+ * has grown by more than CUVS_COVER_GROWTH_PAGES since the previous event (a key, or a verified insert) while the index is CERTIFIED, somebody added
  * rows to the graph without writing keys (an older library, or the unsupported manual switch of the handler back to
  * the new symbol). The descriptor then moves to LOST (reason unkeyed_writer) with the persistent SUSPECT flag and
  * graph_epoch + 1, in the same WAL record as the key. Small unkeyed inserts are not caught; that limit is part of the
@@ -25,12 +29,15 @@
 #include "miscadmin.h"
 #include "storage/bufmgr.h"
 #include "storage/lmgr.h"
+#include "utils/memutils.h"
 #include "utils/rel.h"
 
 #include "cuvs_cover_format.h"
 #include "cuvs_cover_insert.h"
 #include "cuvs_cover_ledger.h"
 #include "cuvs_cover_testgate.h"
+#include "cuvs_cover_verify.h"
+#include "cuvs_cover_scan.h"
 
 #ifdef CUVS_COVER_RECERT_TEST_GATE
 #define cover_growth_pages() cuvs_cover_test_growth_pages(CUVS_COVER_GROWTH_PAGES)
@@ -308,6 +315,96 @@ cover_append(Relation index, uint32 tail, uint64 generation, bool certified, Ite
 	return ordinal;
 }
 
+bool cuvs_cover_verify_inserts = false;
+
+/*
+ * Experimental (cuvs.cover_verify_inserts, off by default): a row that pgvector has inserted and that a search for its own vector finds
+ * (cuvs_cover_insert_searchable) is reachable from the entry point at that moment and gets no ledger key; a row the search does not find gets
+ * its key after the insert. Only a CERTIFIED index is verified. The search reads no ledger, so a long ledger does not stop it.
+ */
+static bool
+cover_try_verified(Relation index, uint32 tail, uint64 generation, Datum *values, bool *isnull, ItemPointer htid)
+{
+	CuvsCoverResult res;
+
+	cuvs_cover_scan_classify(index, &res);
+	if (res.cls != CUVS_COVER_CERTIFIED || res.ledger_tail != tail || res.generation != generation)
+		return false;
+	return cuvs_cover_insert_searchable(index, values, isnull, htid);
+}
+
+/*
+ * A verified insert is an event of the ledger the way a key is, for the growth monitor (which finds rows inserted by a writer that does not
+ * know the ledger): the monitor compares the relation size with the size recorded at the last event, and takes growth of more than
+ * cover_growth_pages() between two events for rows inserted without keys. An insert that writes a key records the size and judges the growth
+ * in cuvs_cover_append_key; a verified insert does the same here, with the same threshold. The tail page is read under a share lock first,
+ * and locked exclusively (with one WAL record) only when the relation has grown since the recorded size, which is once in the few inserts
+ * that fill a page, so the verified inserts do not queue on the tail page the way key writers do.
+ */
+static void
+cover_note_verified(Relation index, uint32 tail, uint64 generation)
+{
+	uint32		hops;
+	BlockNumber nblocks = RelationGetNumberOfBlocks(index);
+
+	for (hops = 0; hops < 1000000; hops++)
+	{
+		Buffer		buf = ReadBuffer(index, tail);
+		uint8_t		img[CUVS_COVER_PAGE_SIZE];
+		CuvsLedgerHeader h;
+		uint32		next;
+
+		LockBuffer(buf, BUFFER_LOCK_SHARE);
+		memcpy(img, BufferGetPage(buf), BLCKSZ);
+		UnlockReleaseBuffer(buf);
+		if (cuvs_ledger_validate(img, &h) != CUVS_LEDGER_OK || h.generation != generation || h.kind != CUVS_LEDGER_KIND_KEYS)
+			return;				/* damage is found and handled by the next key */
+		next = cuvs_ledger_next(img);
+		if (next != CUVS_LEDGER_NO_BLOCK)
+		{
+			tail = next;
+			continue;
+		}
+		/* seen == 0 means "unknown": nothing to judge or record; no growth since the recorded size: nothing to do */
+		if (h.graph_nblocks_seen == 0 || nblocks <= h.graph_nblocks_seen)
+			return;
+		{
+			GenericXLogState *xlog;
+			Page		page;
+			CuvsLedgerHeader h2;
+			bool		suspect;
+
+			buf = ReadBuffer(index, tail);
+			LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
+			xlog = GenericXLogStart(index);
+			page = GenericXLogRegisterBuffer(xlog, buf, 0);
+			if (cuvs_ledger_validate((const uint8_t *) page, &h2) != CUVS_LEDGER_OK || h2.generation != generation ||
+				cuvs_ledger_next((const uint8_t *) page) != CUVS_LEDGER_NO_BLOCK || nblocks <= h2.graph_nblocks_seen)
+			{
+				GenericXLogAbort(xlog);		/* another backend moved on: it recorded the size, or added a page */
+				UnlockReleaseBuffer(buf);
+				return;
+			}
+			suspect = h2.graph_nblocks_seen != 0 && nblocks - h2.graph_nblocks_seen > cover_growth_pages();
+			h2.graph_nblocks_seen = nblocks;
+			cuvs_ledger_write_header((uint8_t *) page, &h2);
+			if (suspect)
+			{
+				Buffer		metabuf = ReadBuffer(index, 0);
+
+				LockBuffer(metabuf, BUFFER_LOCK_EXCLUSIVE);
+				cover_mark_suspect(GenericXLogRegisterBuffer(xlog, metabuf, 0), generation);
+				GenericXLogFinish(xlog);
+				UnlockReleaseBuffer(metabuf);
+			}
+			else
+				GenericXLogFinish(xlog);
+			UnlockReleaseBuffer(buf);
+		}
+		return;
+	}
+}
+
 static bool
 cuvs_cover_aminsert(Relation index, Datum *values, bool *isnull, ItemPointer htid, Relation heap,
 					IndexUniqueCheck check, bool unchanged, struct IndexInfo *info)
@@ -316,17 +413,26 @@ cuvs_cover_aminsert(Relation index, Datum *values, bool *isnull, ItemPointer hti
 	uint64		generation;
 	bool		keyed;
 	bool		certified = false;
+	bool		verify;
 	bool		result;
 
 	/* the cover lock is a transaction lock in the lock manager; it is released as soon as the delegate insert is done */
 	LockDatabaseObject(RelationRelationId, RelationGetRelid(index), CUVS_COVER_LOCKSUBID, ShareLock);
 	keyed = cover_chain(index, &tail, &generation, &certified);
-	if (keyed)
+	verify = keyed && certified && cuvs_cover_verify_inserts;
+	if (keyed && !verify)
 		(void) cover_append(index, tail, generation, certified, htid);
 #ifdef CUVS_COVER_RECERT_TEST_GATE
 	(void) cuvs_cover_test_gate("insert");
 #endif
 	result = pgv_aminsert(index, values, isnull, htid, heap, check, unchanged, info);
+	if (verify)
+	{
+		if (cover_try_verified(index, tail, generation, values, isnull, htid))
+			cover_note_verified(index, tail, generation);
+		else
+			(void) cover_append(index, tail, generation, certified, htid);
+	}
 	UnlockDatabaseObject(RelationRelationId, RelationGetRelid(index), CUVS_COVER_LOCKSUBID, ShareLock);
 	return result;
 }

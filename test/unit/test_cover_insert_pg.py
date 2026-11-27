@@ -285,6 +285,26 @@ def main():
             check('I8 a LOST index with a chain keeps getting keys and is not flagged again', len(ledger(pages)[0]) == keys_before + 2 and descriptor(pages)['epoch'] == 1)
             st = json.loads(c.scalar("SELECT pg_cuvs_hnsw_cover_status('mi')::text"))
             check('I8 the status function says lost, not in force', st.get('class') == 'lost' and st.get('guarantee_in_force') is False, str(st))
+
+            # I10: the same rows inserted without keys, noticed by the next insert when that insert is verified (cuvs.cover_verify_inserts = on) and
+            # needs no key: a verified insert is an event of the ledger like a key, with the same growth threshold
+            c.scalar('CREATE TABLE m2(id int, v vector(3))')
+            c.scalar('CREATE INDEX mi2 ON m2 USING pg_cuvs_hnsw (v vector_l2_ops)')
+            c.scalar("INSERT INTO m2 SELECT g, ARRAY[g, 1, 1]::real[]::vector FROM generate_series(1, 50) g")
+            c.stop()
+            o.install('old')
+            c.start()
+            c.scalar(f"CREATE OR REPLACE FUNCTION pg_cuvs_hnsw_handler(internal) RETURNS index_am_handler AS '$libdir/pg_cuvs', '{dg.OLD_SYMBOL}' LANGUAGE C")
+            c.scalar("INSERT INTO m2 SELECT 1000 + g, ARRAY[g, 2, 2]::real[]::vector FROM generate_series(1, 12000) g")
+            c.stop()
+            o.install('new')
+            c.start()
+            c.scalar(f"CREATE OR REPLACE FUNCTION pg_cuvs_hnsw_handler(internal) RETURNS index_am_handler AS '$libdir/pg_cuvs', '{dg.NEW_SYMBOL}' LANGUAGE C")
+            check('I10 before the next insert the descriptor still says certified', descriptor(index_pages(c, 'mi2'))['state'] == 1)
+            rc, res = c.q("SET cuvs.cover_verify_inserts = on; INSERT INTO m2 VALUES (99999, '[1,2,3]')")
+            dd = descriptor(index_pages(c, 'mi2'))
+            check('I10 the next insert, verified, moved the descriptor to LOST (unkeyed_writer) with the SUSPECT flag and graph_epoch 1',
+                  rc == 0 and dd['state'] == 2 and dd['reason'] == 7 and dd['flags'] & 2 and dd['epoch'] == 1 and dd['crc_ok'], f'{res[:100]} {dd}')
         finally:
             c.drop()
 

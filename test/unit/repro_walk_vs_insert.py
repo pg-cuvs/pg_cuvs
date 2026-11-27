@@ -68,6 +68,7 @@ def main():
             c.scalar(f"SELECT setseed(0.42); INSERT INTO g SELECT x, {clus} FROM generate_series(1, {args.rows}) x")
             c.scalar(f'CREATE INDEX gi ON g USING hnsw (v vector_l2_ops) WITH (m = {args.m}, ef_construction = {max(8, 2 * args.m)})')
             c.scalar("UPDATE pg_class SET relam = (SELECT oid FROM pg_am WHERE amname = 'pg_cuvs_hnsw') WHERE relname = 'gi'")
+            c.scalar("UPDATE pg_depend SET refobjid = (SELECT oid FROM pg_opclass WHERE opcname = 'vector_l2_ops' AND opcmethod = (SELECT oid FROM pg_am WHERE amname = 'pg_cuvs_hnsw')) WHERE classid = 'pg_class'::regclass AND objid = 'gi'::regclass AND refclassid = 'pg_opclass'::regclass")
             c.scalar("UPDATE pg_index SET indclass = (SELECT oid::text::oidvector FROM pg_opclass WHERE opcname = 'vector_l2_ops' AND opcmethod = (SELECT oid FROM pg_am WHERE amname = 'pg_cuvs_hnsw')) WHERE indexrelid = 'gi'::regclass")
             path = c.data / c.scalar("SELECT pg_relation_filepath('gi')")
             c.stop()
