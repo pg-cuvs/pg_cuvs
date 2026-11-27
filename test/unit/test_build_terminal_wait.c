@@ -53,7 +53,7 @@ __wrap_setsockopt(int fd, int level, int name, const void *value, socklen_t size
 }
 
 enum BuildOp { BUILD, BUILD_FLAT, BUILD_MULTI, BUILD_IVFPQ, BUILD_PAGES, BUILD_COUNT };
-enum ReplyMode { LATE_OK, PEER_LOST };
+enum ReplyMode { LATE_OK, PEER_LOST, SILENT };
 
 static const char *const op_names[BUILD_COUNT] = {
     "BUILD", "BUILD_FLAT", "BUILD_MULTI", "BUILD_IVFPQ", "BUILD_PAGES"
@@ -151,6 +151,13 @@ mock_daemon(void *arg)
             write(fd, &page_nonce, sizeof(page_nonce)) != (ssize_t) sizeof(page_nonce))
             goto done;
     }
+    else if (mock->mode == SILENT)
+    {
+        struct pollfd client = {.fd = fd, .events = POLLIN};
+        /* Stay connected without a reply until the cancelled client closes. */
+        if (poll(&client, 1, MOCK_TIMEOUT_MS) <= 0)
+            goto done;
+    }
     mock->ok = 1;
 done:
     close(fd);
@@ -204,6 +211,7 @@ run_case(enum BuildOp op, const char *path, enum ReplyMode mode)
     }
 
     cb_calls = 0;
+    cancel_after = mode == SILENT ? 2 : 0;
     shortened_receive = 0;
     send_timeout_sec = -1;
     start = mono_ms();
@@ -216,10 +224,10 @@ run_case(enum BuildOp op, const char *path, enum ReplyMode mode)
     check(op_names[op], "mock daemon read request and completed its script", mock.ok, 1);
     check(op_names[op], "600-second receive timeout was shortened by the fixture", shortened_receive, 1);
     check(op_names[op], "send timeout after connect", send_timeout_sec, 600);
-    check(op_names[op], "callback while waiting for terminal reply", cb_calls, 0);
     switch (mode)
     {
         case LATE_OK:
+            check(op_names[op], "wait callback was polled before the late reply", cb_calls > 0, 1);
             check(op_names[op], "late reply status", rc, CUVS_STATUS_OK);
             check(op_names[op], "daemon notice", strcmp(cuvs_ipc_last_notice_out(), build_notice), 0);
             if (op == BUILD_PAGES)
@@ -228,6 +236,11 @@ run_case(enum BuildOp op, const char *path, enum ReplyMode mode)
         case PEER_LOST:
             check(op_names[op], "peer loss status", rc, CUVS_STATUS_ERROR);
             check(op_names[op], "peer loss completed promptly", elapsed < PROMPT_LIMIT_MS, 1);
+            break;
+        case SILENT:
+            check(op_names[op], "silent daemon status", rc, CUVS_STATUS_CANCELED);
+            check(op_names[op], "silent daemon cancel was prompt", elapsed < PROMPT_LIMIT_MS, 1);
+            check(op_names[op], "silent daemon cancel callback", cb_calls >= cancel_after, 1);
             break;
     }
 }
@@ -252,6 +265,7 @@ main(void)
     {
         run_case(op, path, LATE_OK);
         run_case(op, path, PEER_LOST);
+        run_case(op, path, SILENT);
     }
     alarm(0);
     rmdir(dir);

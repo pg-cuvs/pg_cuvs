@@ -269,10 +269,13 @@ in `pg_stat_gpu_fallback`; daemon replies are recorded in `pg_stat_gpu_search`.
   of blocking indefinitely. The daemon ignores `SIGPIPE` to survive mid-reply client disconnect.
 - **BUILD replies:** CAGRA (including page format and parallel builds), flat and IVF-PQ
   keep their 600-second connect and send budgets. After sending the request, the backend
-  waits for the full reply without a receive timeout. PostgreSQL keeps the DDL relation
-  locks and defers cancellation during this wait so a concurrent writer cannot proceed
-  while the daemon is still publishing the build. EOF or a socket read error fails the
-  BUILD. A live daemon that stops replying can hold the DDL locks until its connection ends.
+  waits for the full reply without a fixed receive deadline, but polls the PostgreSQL
+  interrupt flags. A user cancel, statement timeout or backend termination closes the
+  socket and raises the interrupt, so transaction rollback releases the DDL locks. A
+  connected but silent daemon is therefore a deliberate wait until cancellation, not a
+  new timeout policy. Before publishing a build, the daemon checks that the requesting
+  client is still connected; a disconnected owner's result is discarded rather than
+  published late. EOF or a socket read error still fails the BUILD.
 - **Connect (#224):** each request opens its own connection. A `connect()` that waits for
   room in the daemon's listen backlog waits in 250 ms slices and is retried after a signal
   or an expired slice, within the call's timeout (30 s for SEARCH). The wait callback is

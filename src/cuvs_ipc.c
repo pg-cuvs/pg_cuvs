@@ -760,7 +760,7 @@ recv_all_interruptible_with_deadline(int fd, void *buf, size_t len, int timeout_
             if (limit_partial_reads)
                 continue;   /* the next iteration checks the precise deadline */
             clock_gettime(CLOCK_MONOTONIC, &now);
-            if ((now.tv_sec - start.tv_sec) >= timeout_sec)
+            if (timeout_sec > 0 && (now.tv_sec - start.tv_sec) >= timeout_sec)
                 return -1;      /* daemon never replied within the budget */
             continue;
         }
@@ -2353,14 +2353,20 @@ cuvs_ipc_build(
     if (cuvs_fd_send(sock, pass_fd, dir_buf, sizeof(dir_buf)) < 0)
         goto cleanup;
 
-    if (recv_reply(sock, &hdr) < 0)
-        goto cleanup;
+    {
+        int wr = recv_reply_interruptible(sock, &hdr, 0);
+        if (wr == 1) { rc = CUVS_STATUS_CANCELED; goto cleanup; }
+        if (wr < 0)  goto cleanup;
+    }
 
     rc = (int)hdr.status;
     /* A zero nonce means BUILD accepted page storage without a searchable graph. */
-    if (page_build && rc == CUVS_STATUS_OK &&
-        recv_all(sock, graph_nonce_out, sizeof(*graph_nonce_out)) < 0)
-        rc = CUVS_STATUS_ERROR;
+    if (page_build && rc == CUVS_STATUS_OK)
+    {
+        int nr = recv_all_interruptible(sock, graph_nonce_out, sizeof(*graph_nonce_out), 0);
+        if (nr != 0)
+            rc = nr == 1 ? CUVS_STATUS_CANCELED : CUVS_STATUS_ERROR;
+    }
 
 cleanup:
     if (sock >= 0)
@@ -2461,8 +2467,11 @@ cuvs_ipc_build_flat(
     if (cuvs_fd_send(sock, pass_fd, dir_buf, sizeof(dir_buf)) < 0)
         goto cleanup;
 
-    if (recv_reply(sock, &hdr) < 0)
-        goto cleanup;
+    {
+        int wr = recv_reply_interruptible(sock, &hdr, 0);
+        if (wr == 1) { rc = CUVS_STATUS_CANCELED; goto cleanup; }
+        if (wr < 0)  goto cleanup;
+    }
 
     rc = (int)hdr.status;
 
@@ -2557,8 +2566,11 @@ cuvs_ipc_build_multi(
     if (send_all(sock, partials, (size_t)n_partials * sizeof(CuvsPartialDesc)) < 0)
         goto cleanup;
 
-    if (recv_reply(sock, &hdr) < 0)
-        goto cleanup;
+    {
+        int wr = recv_reply_interruptible(sock, &hdr, 0);
+        if (wr == 1) { rc = CUVS_STATUS_CANCELED; goto cleanup; }
+        if (wr < 0)  goto cleanup;
+    }
 
     rc = (int)hdr.status;
 
@@ -3401,8 +3413,11 @@ cuvs_ipc_build_ivfpq(
     if (cuvs_fd_send(sock, -1, dir_buf, sizeof(dir_buf)) < 0)
         goto cleanup;
 
-    if (recv_reply(sock, &hdr) < 0)
-        goto cleanup;
+    {
+        int wr = recv_reply_interruptible(sock, &hdr, 0);
+        if (wr == 1) { rc = CUVS_STATUS_CANCELED; goto cleanup; }
+        if (wr < 0)  goto cleanup;
+    }
 
     rc = (int)hdr.status;
 

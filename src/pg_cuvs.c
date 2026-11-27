@@ -3738,6 +3738,7 @@ cuvs_build_parallel(Relation heapRel, Relation indexRel, IndexInfo *indexInfo,
                 (uint32_t) graph_degree, (uint32_t) intermediate_graph_degree, build_algo);
 
             cuvs_report_build_notice(build_index_oid);
+            if (rc == CUVS_STATUS_CANCELED) CHECK_FOR_INTERRUPTS();
             if (rc != CUVS_STATUS_OK)
             {
                 cuvs_report_proto_mismatch(rc);
@@ -4008,6 +4009,7 @@ cuvs_build_cagra_from_heap_impl(Relation heapRel, Relation indexRel, IndexInfo *
                 check_page_build_root(rc);
 #endif
             cuvs_report_build_notice(build_index_oid);
+            if (rc == CUVS_STATUS_CANCELED) CHECK_FOR_INTERRUPTS();
             if (rc != CUVS_STATUS_OK)
             {
                 if (page_format)
@@ -4350,6 +4352,7 @@ cuvs_build_flat_from_heap(Relation heapRel, Relation indexRel, IndexInfo *indexI
                 heap_table_oid,
                 heap_relfilenode);
 
+            if (rc == CUVS_STATUS_CANCELED) CHECK_FOR_INTERRUPTS();
             if (rc != CUVS_STATUS_OK)
             {
                 const char *hint;
@@ -7573,6 +7576,7 @@ ivfpq_ambuild(Relation heapRel, Relation indexRel, IndexInfo *indexInfo)
                 n_lists, pq_bits, pq_dim);
 
             cuvs_report_build_notice(RelationGetRelid(indexRel));
+            if (rc == CUVS_STATUS_CANCELED) CHECK_FOR_INTERRUPTS();
 
             if (rc != CUVS_STATUS_OK)
             {
