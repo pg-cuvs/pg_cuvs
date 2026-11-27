@@ -3432,8 +3432,7 @@ load_index(uint32_t db_oid, uint32_t index_oid, CuvsRequester rq)
         CuvsIvfPqResidentEstimate estimate;
         if (cuvs_ivfpq_estimate_resident_fd(ivfpq_fd, (uint64_t) st.st_size, &estimate) != 0)
         {
-            LOG_WARN("pg_cuvs_server: could not parse IVF-PQ metadata for %u/%u; refusing load
-",
+            LOG_WARN("pg_cuvs_server: could not parse IVF-PQ metadata for %u/%u; refusing load\n",
                      db_oid, index_oid);
             free(tids);
             goto done;
