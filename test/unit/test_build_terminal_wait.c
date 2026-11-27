@@ -77,6 +77,7 @@ typedef struct Mock {
 
 static int failures;
 static int cb_calls;
+static int cancel_after;
 
 static void
 check(const char *op, const char *label, long actual, long expected)
@@ -92,7 +93,7 @@ static int
 wait_cb(void)
 {
     cb_calls++;
-    return 1;
+    return cancel_after > 0 && cb_calls >= cancel_after;
 }
 
 static long
