@@ -78,6 +78,10 @@ if [[ ! -s "$indexes/${db_oid}_${cagra_oid}.cagra" ]]; then
     echo "CAGRA control did not create a legacy artifact" >&2
     exit 2
 fi
+# The IVF-PQ build has already persisted its artifact. Remove only the resident
+# entry before SIGTERM so the daemon's CAGRA-oriented shutdown save path cannot
+# fail the fixture before the cold-reload phase starts.
+[[ $(sql "SELECT pg_cuvs_unload('pq_idx')") == unloaded ]]
 stop_daemon
 
 artifact_bytes=$(stat -c '%s' "$artifact")
