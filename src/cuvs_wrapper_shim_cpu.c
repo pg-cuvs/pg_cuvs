@@ -178,23 +178,30 @@ shim_write(const ShimIndex *ix, const char *path)
 }
 
 static ShimIndex *
-shim_read(const char *path)
+shim_read_file(FILE *f)
 {
-    FILE *f = fopen(path, "rb");
-    if (!f) return NULL;
     uint32_t magic = 0, metric = 0;
     int dim = 0; int64_t n = 0;
     if (fread(&magic, sizeof(magic), 1, f) != 1 || magic != SHIM_MAGIC ||
         fread(&metric, sizeof(metric), 1, f) != 1 ||
         fread(&dim, sizeof(dim), 1, f) != 1 ||
-        fread(&n, sizeof(n), 1, f) != 1) { fclose(f); return NULL; }
+        fread(&n, sizeof(n), 1, f) != 1) return NULL;
     ShimIndex *ix = shim_new(NULL, n, dim, metric);
     if (ix && n > 0 &&
         fread(ix->vecs, sizeof(float), (size_t)n * dim, f) != (size_t)n * dim) {
-        shim_free(ix); fclose(f); return NULL;
+        shim_free(ix); return NULL;
     }
     if (ix && fread(&ix->degree, sizeof(ix->degree), 1, f) != 1)
         ix->degree = 0;
+    return ix;
+}
+
+static ShimIndex *
+shim_read(const char *path)
+{
+    FILE *f = fopen(path, "rb");
+    if (!f) return NULL;
+    ShimIndex *ix = shim_read_file(f);
     fclose(f);
     return ix;
 }
@@ -573,6 +580,21 @@ int cuvs_ivfpq_serialize(CuvsIvfPqIndex index, const char *path, int device_id)
 
 CuvsIvfPqIndex cuvs_ivfpq_deserialize(const char *path, int device_id)
 { (void)device_id; return (CuvsIvfPqIndex) shim_read(path); }
+
+CuvsIvfPqIndex
+cuvs_ivfpq_deserialize_fd(int fd, int device_id)
+{
+    (void)device_id;
+    if (fd < 0) return NULL;
+    FILE *f = fdopen(fd, "rb");
+    if (!f) {
+        close(fd);
+        return NULL;
+    }
+    CuvsIvfPqIndex index = (CuvsIvfPqIndex) shim_read_file(f);
+    fclose(f);
+    return index;
+}
 
 void cuvs_ivfpq_free(CuvsIvfPqIndex index, int device_id)
 { (void)device_id; shim_free((ShimIndex *)index); }

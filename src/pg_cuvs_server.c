@@ -32,6 +32,7 @@
 #include "cuvs_page_overlay_gpu.h"
 #endif
 #include "cuvs_util.h"
+#include "cuvs_ivfpq_format.h"
 #include "cuvs_hnsw_source.h"
 #include "cuvs_cache_policy.h"
 #include "cuvs_bf_verdict.h"     /* #238: remembered brute_force unavailable verdict */
@@ -3253,6 +3254,7 @@ extra_search_pin_load(uint32_t db_oid, uint32_t index_oid, ExtraSearchLoad *load
 static int
 load_index(uint32_t db_oid, uint32_t index_oid, CuvsRequester rq)
 {
+    int ivfpq_fd = -1;
     ExtraSearchLoad load;
     char idx_path[512], tids_path[512];
     const ExtraSearchRoot *root = extra_search_pin_load(db_oid, index_oid, &load,
@@ -3412,14 +3414,53 @@ load_index(uint32_t db_oid, uint32_t index_oid, CuvsRequester rq)
      * path as build, so a search miss on a non-resident index reloads it by
      * evicting the least-recently-used one. If it still won't fit after full
      * eviction, skip (caller falls back to CPU). */
-    /* cold reload: graph_degree not persisted in .tids -> default 64 */
-    size_t needed = estimate_vram_bytes(n_vecs, (int)dim, 64);
-    int target_gpu = pick_gpu_for_index(needed);
+    char ivfpq_path[512];
+    struct stat st;
+    uint64_t reload_bytes;
+    ivfpq_file_path(ivfpq_path, sizeof(ivfpq_path), io_dir, db_oid, index_oid);
+    if (!root && lstat(idx_path, &st) != 0 && errno == ENOENT)
+    {
+        /* Size and deserialize the same IVF-PQ file. Only use its estimate
+         * after establishing that the legacy CAGRA artifact is absent. */
+        ivfpq_fd = open(ivfpq_path, O_RDONLY | O_CLOEXEC | O_NONBLOCK);
+        if (ivfpq_fd < 0 || fstat(ivfpq_fd, &st) != 0 ||
+            !S_ISREG(st.st_mode) || st.st_size <= 0)
+        {
+            free(tids);
+            goto done;
+        }
+#ifdef PGCUVS_CPU_SHIM
+        /* The CPU reference shim persists its own self-describing corpus, not
+         * cuVS serialization v4; its resident corpus is the persisted corpus. */
+        reload_bytes = (uint64_t) st.st_size;
+#else
+        CuvsIvfPqResidentEstimate estimate;
+        if (cuvs_ivfpq_estimate_resident_fd(ivfpq_fd, (uint64_t) st.st_size, &estimate) != 0)
+        {
+            LOG_WARN("pg_cuvs_server: could not parse IVF-PQ metadata for %u/%u; refusing load\n",
+                     db_oid, index_oid);
+            free(tids);
+            goto done;
+        }
+        reload_bytes = estimate.bytes;
+#endif
+    }
+    else
+        /* CAGRA graph_degree is not persisted in .tids: use the default. */
+        reload_bytes = estimate_vram_bytes(n_vecs, (int)dim, 64);
+
+    bool ivfpq_reload = ivfpq_fd >= 0;
+    size_t needed = reload_bytes > SIZE_MAX ? SIZE_MAX : (size_t) reload_bytes;
+    int target_gpu = ivfpq_reload &&
+        (reload_bytes >= CUVS_ADMISSION_BYTES_SATURATED || reload_bytes > SIZE_MAX)
+        ? -1 : pick_gpu_for_index(needed);
+    AdmitLine al = {.op = "LOAD", .path = admission_load_path(rq),
+                    .algo = ivfpq_reload ? "ivf_pq" : "cagra", .gpu = target_gpu,
+                    .db = db_oid, .idx = index_oid, .dim = dim,
+                    .gd = ivfpq_reload ? 0 : 64, .igd = ivfpq_reload ? 0 : 128,
+                    .n = n_vecs, .final = needed, .needed = needed};
     if (target_gpu < 0)
     {
-        AdmitLine al = {.op = "LOAD", .path = admission_load_path(rq), .algo = "cagra", .gpu = -1,
-                        .db = db_oid, .idx = index_oid, .dim = dim, .gd = 64, .igd = 128,
-                        .n = n_vecs, .final = needed, .needed = needed};
         admission_fill(&t_reload_rej, CUVS_ADMISSION_AR0, needed, -1);
         log_admit(&al, CUVS_ADMISSION_AR0);
         LOG_WARN("pg_cuvs_server: no GPU can fit %u/%u (%zu bytes), skip\n",
@@ -3428,13 +3469,8 @@ load_index(uint32_t db_oid, uint32_t index_oid, CuvsRequester rq)
         rc = -2;  /* VRAM: index too large for any GPU budget */
         goto done;
     }
-    AdmitLine al = {.op = "LOAD",
-                    .path = admission_load_path(rq),
-                    .algo = "cagra", .gpu = target_gpu, .db = db_oid, .idx = index_oid,
-                    .dim = dim, .gd = 64, .igd = 128, .n = n_vecs,
-                    .final = needed, .needed = needed,
-                    .pending_before = g_pending_rmm_build_vram[target_gpu],
-                    .evictions_before = g_cache_evictions[target_gpu]};
+    al.pending_before = g_pending_rmm_build_vram[target_gpu];
+    al.evictions_before = g_cache_evictions[target_gpu];
     if (ensure_vram(needed, target_gpu, rq, &t_reload_rej, &al) != 0)
     {
         log_admit(&al, t_reload_rej.reason);
@@ -3452,14 +3488,17 @@ load_index(uint32_t db_oid, uint32_t index_oid, CuvsRequester rq)
     if (t_manual_loading)
         log_admit(&al, CUVS_ADMISSION_NONE);
 
-    CuvsCagraIndex handle       = cuvs_cagra_deserialize(idx_path, (int)dim, target_gpu);
+    CuvsCagraIndex handle       = ivfpq_reload ? NULL :
+                                 cuvs_cagra_deserialize(idx_path, (int)dim, target_gpu);
     CuvsIvfPqIndex ivfpq_handle = NULL;
     if (!handle)
     {
-        /* No .cagra sidecar — try .ivfpq (3P IVF-PQ index). */
-        char ivfpq_path[512];
-        ivfpq_file_path(ivfpq_path, sizeof(ivfpq_path), io_dir, db_oid, index_oid);
-        if (access(ivfpq_path, F_OK) == 0)
+        if (ivfpq_reload)
+        {
+            ivfpq_handle = cuvs_ivfpq_deserialize_fd(ivfpq_fd, target_gpu);
+            ivfpq_fd = -1;    /* consumed by the deserializer */
+        }
+        else if (access(ivfpq_path, F_OK) == 0)
             ivfpq_handle = cuvs_ivfpq_deserialize(ivfpq_path, target_gpu);
         if (!ivfpq_handle)
         {
@@ -3491,6 +3530,7 @@ load_index(uint32_t db_oid, uint32_t index_oid, CuvsRequester rq)
     e->handle       = handle;
     e->ivfpq_handle = ivfpq_handle;
     e->ivfpq_n_vecs = ivfpq_handle ? n_vecs : 0;
+    e->ivfpq_vram_bytes = ivfpq_handle ? needed : 0;
     e->tids         = tids;
     build_rev_tid_map(e);   /* 3O: TID → item_id reverse map */
     e->vram_bytes  = needed;
@@ -3508,8 +3548,6 @@ load_index(uint32_t db_oid, uint32_t index_oid, CuvsRequester rq)
     e->main_bf_idx = NULL; e->main_bf_n = 0; e->main_bf_vram_bytes = 0;
     e->main_bf_mtime = 0; e->main_bf_generation = 0; e->bf_precision = 0;
     e->bf_verdict.valid = 0; /* #238 */
-    /* 3P: ivfpq_vram_bytes already set above; ensure it's 0 for CAGRA entries */
-    if (!e->ivfpq_handle) e->ivfpq_vram_bytes = 0;
     e->warmup_state = WARMUP_HOT;
     reset_entry_stats(e);
     /* I3-B defect 3 (FACT-47): a reused slot must not carry the previous
@@ -3545,6 +3583,8 @@ load_index(uint32_t db_oid, uint32_t index_oid, CuvsRequester rq)
             db_oid, index_oid, (long long)n_vecs, needed / (1024*1024));
     rc = 0;
 done:
+    if (ivfpq_fd >= 0)
+        close(ivfpq_fd);
     if (root)
     {
         close(load.tids_fd);
