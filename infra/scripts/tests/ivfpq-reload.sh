@@ -5,6 +5,7 @@
 set -euo pipefail
 
 server=${SERVER_BIN:-./pg_cuvs_server}
+estimate_bin=${IVFPQ_ESTIMATE_BIN:-./test-ivfpq-resident-format}
 tmp=$(mktemp -d /tmp/pgcuvs-ivfpq-reload.XXXXXX)
 socket=$tmp/daemon.sock
 indexes=$tmp/indexes
@@ -80,7 +81,7 @@ fi
 stop_daemon
 
 artifact_bytes=$(stat -c '%s' "$artifact")
-needed=$((artifact_bytes + artifact_bytes / 16))
+needed=$("$estimate_bin" "$artifact")
 cagra_bytes=$((8192 * (4 * 128 + 4 * 64)))
 budget_mb=5
 budget_bytes=$((budget_mb * 1024 * 1024))

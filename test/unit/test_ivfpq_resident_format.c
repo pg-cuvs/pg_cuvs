@@ -136,9 +136,19 @@ run_case(const char *path, int conservative, uint32_t layout, uint64_t delta)
 }
 
 int
-main(void)
+main(int argc, char **argv)
 {
     char path[] = "/tmp/pgcuvs-ivfpq-format-XXXXXX";
+    if (argc == 2)
+    {
+        CuvsIvfPqResidentEstimate estimate;
+        int fd = open(argv[1], O_RDONLY);
+        if (fd < 0 || cuvs_ivfpq_estimate_resident_fd(fd, file_size(argv[1]), &estimate) != 0)
+            return 2;
+        printf("%llu\n", (unsigned long long)estimate.bytes);
+        close(fd);
+        return 0;
+    }
     int fd = mkstemp(path);
     if (fd < 0)
         return 2;
