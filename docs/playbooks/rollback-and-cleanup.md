@@ -243,3 +243,203 @@ EXPLAIN (ANALYZE, BUFFERS)
   `pg_cuvs_last_rejection()`, 데몬 journal을 함께 보존한다.
 - `DROP EXTENSION` 실패는 의존 객체와 DB별 범위를 확인한다. `CASCADE`로
   예상 밖 객체를 제거하지 않는다.
+
+---
+
+## 6. Going back from 0.9.3 to 0.9.2 (cover guarantee)
+
+Sections 1 and 3.2 above say the repository has no SQL downgrade script. That holds for
+every version except this one: `sql/pg_cuvs--0.9.3--0.9.2.sql` takes 0.9.3 back to 0.9.2,
+and `sql/pg_cuvs--0.9.2--0.9.3.sql` brings it forward again.
+
+The executed claims in this section come from three test runners:
+`test/unit/test_downgrade_pg.py` (cases S0 to S5), `test/unit/test_rollback_hazards_pg.py`
+(R1 to R3) and `test/unit/test_cover_breakglass_pg.py` (G1 to G4), run on relocated
+PostgreSQL 16.15 clusters. This document names them; it does not record a run of them at the
+time of writing. Their `pg_cuvs_hnsw` indexes were created by switching the access method of
+a pgvector `hnsw` index in the catalog, so they are not GPU-built indexes. Anything without an
+"executed" mark is not established by those runners and is also listed in section 6.4.
+
+### 6.1 Planned downgrade
+
+**Status: Current / Verified for the 0.9.3 branch under test, on the runners above; 0.9.3 is
+unreleased.**
+
+Do this before the package is replaced, while the 0.9.3 library is still loaded, in each
+database:
+
+```sql
+ALTER EXTENSION pg_cuvs UPDATE TO '0.9.2';
+SELECT extversion FROM pg_extension WHERE extname = 'pg_cuvs';   -- 0.9.2
+```
+
+If another session holds a temporary table with a `pg_cuvs_hnsw` index, the command stops
+with an error that names that index. Run it again after that session ends. Then downgrade the
+package and restart.
+
+The script does three things (executed: `test_downgrade_pg.py`, cases S2 and S5):
+
+1. `pg_cuvs_cover_invalidate_all()` takes the guarantee mark off every `pg_cuvs_hnsw` index.
+   If any index cannot be taken off, the script stops with an error and nothing changes. Every
+   backend then rebuilds its relation cache for the index.
+2. The handler goes back to the old C symbol.
+3. The functions that 0.9.3 added are dropped.
+
+What happens to each index state (executed: case S5, current build):
+
+| Index state | What the script does |
+|---|---|
+| LEGACY | Passes through unchanged. |
+| OFF, LOST, damaged (UNTRUSTED) | Pass through unchanged; none of them is a guarantee mark. |
+| CERTIFIED | Written as LOST with reason `downgrade` (`graph_epoch` + 1, crc recomputed). An UNLOGGED index is written in both the main fork and the init fork, because a crash reset copies the init fork over the main fork. A CERTIFIED index in a newer format that this library cannot write is refused, and the hint says to take the mark off with that newer library or to `DROP INDEX`. |
+
+To go forward again, install the new package, restart, and run
+`ALTER EXTENSION pg_cuvs UPDATE TO '0.9.3'` (executed: S2 round trip). An index that became
+LOST has to be recertified before the guarantee holds again; the status hint names
+`VACUUM` or `pg_cuvs_cover_recertify()` for that.
+
+### 6.2 Unplanned rollback: older package, SQL still at 0.9.3
+
+**Status: Current / Verified for the symptoms and the emergency action (R1 to R3, G1 to G4);
+Unverified for the recovery by plain reinstall and for the cases in section 6.4.**
+
+This is the state where the package was replaced with 0.9.2 but the database was not taken
+back with section 6.1. It is the intended trade-off: an older library must not write silently
+into an index of the new format, so it cannot open that index at all.
+
+#### Symptoms
+
+Executed: `test_rollback_hazards_pg.py`, R1 to R3, on indexes made with a real
+`CREATE INDEX USING pg_cuvs_hnsw` (created on an empty table and filled by inserts).
+
+On a table with a `pg_cuvs_hnsw` index, all of the following fail with `ERROR: could not find
+function "pg_cuvs_hnsw_handler_c1p" in file ".../pg_cuvs.so"`:
+
+- `SELECT` (even one that does not use the index, such as `SELECT 1 FROM t`), `INSERT`,
+  `UPDATE`, `DELETE`, `VACUUM`, `VACUUM (FREEZE)`, `REINDEX`, `TRUNCATE`, `DROP INDEX`,
+  `DROP TABLE` and `DROP EXTENSION pg_cuvs CASCADE`. An independent review also saw
+  `DROP SCHEMA ... CASCADE` and `ALTER TABLE ... DROP COLUMN` on the vector column fail.
+- **Logical backup.** A full `pg_dump` fails, because `pg_get_indexdef` opens the index.
+  The dump fails if any table that has a `pg_cuvs_hnsw` index is still part of it. In an
+  independent review with two such tables, `rt` and `rt2`, `-T rt` failed, `-T rt -T rt2`
+  passed, `-a -T rt` failed, and `-t other` (a table without such an index) passed. So `-T`
+  helps only when every table with a `pg_cuvs_hnsw` index is excluded. To get data out of a
+  table that has one, use `COPY t TO STDOUT`.
+- **Autovacuum keeps failing on that table.** The worker is always a new process, so it opens
+  the index and gets the same error. In the run it tried every naptime (2 seconds there), failed
+  each time, `last_autovacuum` stayed empty and `n_dead_tup` did not fall (3 or more attempts
+  within 40 seconds). A table without such an index in the same database was vacuumed normally.
+- **Anti-wraparound vacuum fails too.** The run set `autovacuum_freeze_max_age` to its minimum
+  (100000) on two tables, one with the index and one without, and consumed 130,000 transactions.
+  The table without the index was frozen by anti-wraparound autovacuum (its age fell to about
+  0, with `vacuum_freeze_min_age = 0`). The table with the index kept an `age(relfrozenxid)` of
+  130,000 or more, and each autovacuum attempt failed with the same error (2 or more extra
+  attempts after the consumption). While that table is not frozen, `datfrozenxid` of the
+  database cannot advance either. The run did not come near the real limit of about 2 billion
+  transactions, so do not leave this state in place for long.
+- What still works: tables without such an index, `ALTER TABLE ... ADD COLUMN`, and
+  `COPY t TO STDOUT` (it opens neither the planner path nor the index). `COPY (SELECT ...) TO`
+  fails.
+- `ALTER EXTENSION pg_cuvs UPDATE TO '0.9.2'` fails with the older library too, because the
+  script calls `pg_cuvs_cover_invalidate_all`, which that library does not have. After the
+  error the version and the symbol are unchanged.
+
+#### Recovery
+
+1. **Reinstall the new package and restart the server.** This is the expected recovery. The
+   older library could not open the indexes, so it wrote nothing to them, and the guarantee
+   marks are not expected to have changed. No runner exercises this plain reinstall as a case
+   of its own (see section 6.4).
+2. If the older package has to stay, a superuser runs one library-provided function in each
+   database (executed: `test_cover_breakglass_pg.py`, G1, with the older library installed):
+
+```sql
+SELECT pg_cuvs_cover_breakglass();
+```
+
+   The function is plain SQL, so it runs with either library installed. It does two things:
+   (1) it points the handler back at the old C symbol, and (2) it creates the marker function
+   `pg_cuvs_cover_breakglass_marker()` and makes it a member of the extension. Afterwards the
+   older library opens the indexes again, autovacuum and anti-wraparound vacuum run (in the
+   run, the table age fell from 130,000 to 1), and inserts work. The state is a **mismatch:
+   extension version 0.9.3 with the old symbol**. Running the function twice gives the same
+   state. Only a superuser can run it.
+
+#### How the guarantee cannot become silently invalid after the emergency action
+
+The older library records no ledger keys and its VACUUM changes the graph, so during this
+period a CERTIFIED mark can stop matching reality. The protection is on the new library's side,
+and the marker is what it keys on.
+
+- **While the marker function exists, the new library never answers from a guarantee mark
+  approximately.** Every CERTIFIED index reads as LOST with reason `break-glass`, whichever
+  symbol the handler names. With the new symbol, the scan reads CERTIFIED as LOST and answers
+  by exact heap ranking. With the old symbol (the state right after the emergency action), the
+  scan wrapper consults the marker for indexes that carry a cover descriptor and answers by the
+  same exact heap ranking; a LEGACY index has no descriptor and never had a guarantee, so it
+  behaves as in 0.9.2. Executed: G2, a scan in the old-symbol state returns the exact heap
+  answer and the "emergency rollback" notice. The status function returns
+  `guarantee_in_force: false`, `breakglass_marker: true` and the way to release it
+  (`pending`). VACUUM does not recertify, and `pg_cuvs_cover_recertify` refuses with
+  `not_applicable`. If an operator points the handler back at the new symbol by hand, the
+  stale CERTIFIED marks are still not read as valid (executed: G2).
+- **The only way back is two update steps.** With the new package installed and the server
+  restarted, run `ALTER EXTENSION pg_cuvs UPDATE TO '0.9.2'` (writes every CERTIFIED index as
+  LOST with reason `downgrade` and sets the old handler symbol), then
+  `ALTER EXTENSION pg_cuvs UPDATE TO '0.9.3'` (takes every CERTIFIED mark off once more, sets
+  the new symbol, and **drops the marker**). Only this update script drops the marker.
+  Afterwards the indexes are LOST, so scans answer exactly from the heap, and the guarantee
+  holds again only after recertification (`VACUUM` or `pg_cuvs_cover_recertify`). Executed:
+  G3; after recertification `guarantee_in_force` was `true` and scans merged again.
+- **Lifetime of the marker** (executed: G4). `pg_dump` does not carry the marker, because it is
+  an extension member, so a restored database has none; the restored indexes were rebuilt, so
+  that is correct. `pg_upgrade` (same version) carries the marker together with the index
+  files, so the indexes in the upgraded cluster stay outside the guarantee. The extension
+  version and the marker are per database, so the emergency action and the way back have to be
+  done in each database. A cluster whose databases are at different steps was not run.
+- **Lock note.** Recertification and VACUUM hold `ShareUpdateExclusiveLock` on the table while
+  they walk it. If a DDL such as `ALTER TABLE` waits behind them, PostgreSQL's lock queue makes
+  later reads and writes wait for as long. A manual recertification gives way when another
+  session starts to wait for a lock that conflicts with its table lock (status `deferred`,
+  nothing written; `test_cover_walk_pg.py` W4), and does not take its locks while a statement
+  that conflicts holds them. A VACUUM does not give way: it holds the lock for its own whole run.
+  Run a manual recertification of a large index when no DDL is pending.
+- **Do not** run `CREATE OR REPLACE FUNCTION pg_cuvs_hnsw_handler ...` by hand instead of the
+  function. It leaves no marker. While the older library is in use that is harmless, but when
+  the handler is later pointed back at the new symbol, stale CERTIFIED marks are read as valid
+  again. The new library cannot detect this: the resulting catalog equals the normal state.
+  This remaining path is closed by documentation only; if the function was used, it is closed.
+
+### 6.3 Checks
+
+```sql
+SELECT extversion FROM pg_extension WHERE extname = 'pg_cuvs';
+SELECT proname FROM pg_proc WHERE proname = 'pg_cuvs_cover_breakglass_marker';
+SELECT pg_cuvs_hnsw_cover_status('schema.index_name'::regclass);
+```
+
+A marker row means the database is in the emergency state of section 6.2 and has to go back
+through the two update steps.
+
+### 6.4 Not verified
+
+These were not run, or are inferred; none of them should be read as a tested statement above.
+
+- GPU-built indexes (indexes built on a table that already had rows): the environment had no
+  CAGRA daemon. The tests used an index created on an empty table and filled by inserts. A
+  `pg_dump` restore of a table with rows (the restore rebuilds the index) was not run either.
+- Causes of an unplanned rollback, such as an automatic package downgrade by the package
+  manager or the promotion of a standby that has the older package: inferred from the case
+  table of the working draft, not run. Standby promotion was not run.
+- A cluster whose databases are at different extension versions or marker states: inferred,
+  not run. (`pg_dump` restore and `pg_upgrade` were run, G4.)
+- The recovery by reinstalling the new package alone: expected, but not an executed case of its
+  own. The emergency path and the round trip through two updates were run (G1 to G4).
+- A real exhaustion of 2 billion transaction IDs. The failure of anti-wraparound vacuum was
+  shown with `autovacuum_freeze_max_age` at its minimum, not at the real limit.
+- A long-lived backend that keeps inserting during a downgrade (the relation cache is cleared
+  by `pg_cuvs_cover_invalidate_all`, but a statement already running in a connected session is
+  a separate case).
+- The lock-yield behaviour of recertification (section 6.2) under a pending DDL.
+- Linux with glibc is the only platform considered for "a replaced file is not used until the
+  restart".

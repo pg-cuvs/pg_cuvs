@@ -41,7 +41,10 @@ Datum pg_cuvs_build_hnsw(PG_FUNCTION_ARGS);
  * and must be called once from _PG_init before any CREATE INDEX runs.
  */
 void  cuvs_hnsw_init_reloptions(void);
+/* True for an index whose access method routine came from the new handler symbol (it has a cover descriptor). */
+bool  cuvs_hnsw_index_is_cover(Relation rel);
 Datum pg_cuvs_hnsw_handler(PG_FUNCTION_ARGS);
+Datum pg_cuvs_hnsw_handler_c1p(PG_FUNCTION_ARGS);
 void  cuvs_report_proto_mismatch(int rc);
 const char *cuvs_resolve_index_dir_rel(Relation indexRel);
 

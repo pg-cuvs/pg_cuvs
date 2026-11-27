@@ -428,6 +428,67 @@ IVF-PQ is an exception: `ivfpq_ambuild` does not remove an old tombstone sidecar
 so ordinary REINDEX can leave the reader blocked. #202 observed recovery with
 REINDEX CONCURRENTLY; verify the resulting plan and sidecar state.
 
+### 9.1 `pg_cuvs_hnsw`: cover descriptor, ledger, recertification (#203)
+
+**Status: current for CPU PostgreSQL 16 with pgvector 0.8.7; GPU-built indexes over existing rows are not verified.** User-facing
+contract, settings and measurements: [docs/reference.md](docs/reference.md#cover-guarantee-for-pg_cuvs_hnsw-203-extension-093).
+
+A `pg_cuvs_hnsw` index is pgvector's HNSW page layout. Index creation under 0.9.3 additionally writes, without changing pgvector's
+prefix bytes:
+
+- a **cover descriptor** (184 bytes at `pd_upper` of the metapage, in the space that pgvector leaves free): state (`OFF`,
+  `CERTIFIED`, `LOST`), reason, generation, graph epoch, ledger head/tail, the rows the last certification covered and the unreachable
+  ones among them, free-list head, the time of the last certification, the keys of inserts that the walk of that certification listed itself
+  (`cert_dropped_keys`: they are inserts since the certification but their keys are BASE keys), the first block of a new chain that a
+  recertification has written and not published (`pending_head`, with its generation), and the memory of the last failed recertification.
+  The bytes of the descriptor that this version does not name belong to one certification: the publication of a certification writes zeros
+  there and every other rewrite of the descriptor keeps them as they are, so that a later library version that keeps a value of its own in
+  them (published_at) never reads the one of the certification before;
+- **ledger pages** (page id `0xC0E1`, outside pgvector's graph chain, 338 keys per page): a chain of `BASE` pages (TIDs of rows the walk
+  could not reach) followed by `KEYS` pages (one key per insert after certification: ordinal, CRC-16, creator xid, heap TID). Replaced chains
+  go to a free list and are reused.
+
+The access method handler wraps pgvector's. **Insert**: share cover lock, append the ledger key (WAL-logged first), delegate to the pgvector
+insert, release; an insert never leaves a row in the graph without a key. **Scan** (`cuvs_hnsw_scan.c`): a certified index merges the
+graph's answers with all ledger keys, removes repeated TIDs and ranks the set exactly through the exact-scan module; any class that cannot
+promise the merge (lost, untrusted, unreadable ledger, newer format) is answered exactly from the heap with a NOTICE. **VACUUM**: `ambulkdelete`
+moves a certified index to `LOST` and bumps the graph epoch (WAL-logged) before pgvector changes the graph; `amvacuumcleanup` recertifies lost
+indexes, indexes whose ledger outgrew the threshold and indexes whose ledger does not read.
+
+**Recertification** (`cuvs_cover_recertify`): phase 1 takes the cover lock exclusively (a short poll, then a queued request bounded by
+`lock_timeout` so that continuous writers cannot starve it), reads the old chain and records `t_start`, the number of keys it holds; no insert
+is in flight at that instant. Phase 2 releases the lock and walks the graph page by page under share buffer locks only, without pgvector's
+update lock, so inserts continue; it writes a private new chain (unreachable rows, then the keys written since `t_start`, minus those the walk
+already listed) and copies later keys in unlocked passes. Phase 3 retakes the lock, copies the last keys, compare-and-swaps the descriptor
+(generation, graph epoch, flags, state) and publishes it in one WAL record that also puts the replaced chain on the free list. The walk is
+therefore not a snapshot: an insert that runs during it can cut off an old row the walk had already counted as reached (`certified_at` is the instant of phase 1). Such a row is
+outside the guarantee, which names the certification time, and appears in the next recertification; a row inserted during the walk is always covered by its own key. The walk gives
+way (`deferred`, nothing written) when another session starts to wait for a lock that conflicts with its table lock, and it holds its lists of unreached rows and keys against the
+memory limit.
+
+The pages of the new chain come from the free list, then from the extension of the index, which is done in steps of 64 blocks while the tail page of
+the old chain is locked, and the size that page remembers is raised by the step: the growth monitor of an insert (the index grew by more than 256 pages since the
+last key: somebody wrote rows without keys, so the guarantee is taken off) would otherwise take the new chain of a large index for such growth at the first insert after the
+extension. Once the pages are written the descriptor names the first one (`pending_head`). A recertification that does not publish (abandoned,
+deferred, failed, cancelled, or lost to a crash after that point) leaves them there, in no chain; the next recertification makes them free pages
+before it does anything else (`reclaimed_pages` in its answer), so repeated attempts do not grow the index. Pages of a crash between the extension and the
+record are lost to the free list and come back with REINDEX. The recertification is one transaction that has not committed while it runs, and the extension of the file
+is not WAL, so the records that say what the extension did (the size the tail page remembers, after each step) and `pending_head` are flushed to disk as they are
+written (`flush_wal_so_far`): otherwise a `kill -9` of the backend or a crash restart replays neither, the index comes back larger than its pages say, and the next insert
+takes the growth for rows written without keys (`test_cover_orphan_pg` O9 and O10).
+
+**Emergency rollback and upgrade.** `0.9.2--0.9.3` calls `pg_cuvs_cover_invalidate_all()` first (a certified index becomes lost with reason
+downgrade) and drops the rollback marker; `0.9.3--0.9.2` does the same before moving the handler back. `pg_cuvs_cover_breakglass()` points the
+handler at the older symbol and creates an extension-member marker function; while it exists the 0.9.3 library reads every certified index as
+lost (reason break-glass) on either symbol, so that no search answers approximately from a guarantee the older library cannot maintain. Only the
+update scripts remove the marker.
+
+**Boundaries.** The guarantee is about candidates, not recall of reachable rows. The ledger grows with writes between recertifications and
+each key costs one exact distance per search (measured at 100,000 x 96: 3,000 keys add 1.87 ms p95). Row-level security, index expressions and
+partial indexes are refused (SQLSTATE `0A000`) for an index with a descriptor. Standby servers read the ledger like any page; recertification
+runs on the primary only. Nothing recertifies an index by itself except the cleanup step of a VACUUM, so the ledger of a table that is inserted into grows until a VACUUM,
+`pg_cuvs_cover_recertify()` or `REINDEX`.
+
 ---
 
 ## 10. Key engineering techniques

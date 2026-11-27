@@ -46,9 +46,15 @@ FOR TYPE vector USING cagra AS
 -- amoptions, and wraps scans for the explicit cuvs.hnsw_exact_scan policy.
 -- The default scan remains pgvector HNSW. See src/hnsw_export.c.
 -- ----------------------------------------------------------------
+-- Since 0.9.3 the handler names the C symbol pg_cuvs_hnsw_handler_c1p, which a library older
+-- than 0.9.3 does not export: an older library cannot open the indexes of an updated database
+-- and fails loudly instead of writing into a new-format index. The old symbol stays exported
+-- by the new library for 0.9.2 and earlier SQL. Going back is
+--   ALTER EXTENSION pg_cuvs UPDATE TO '0.9.2'   (run BEFORE the package is replaced)
+-- see pg_cuvs--0.9.3--0.9.2.sql and docs/playbooks/release-upgrade.md.
 CREATE FUNCTION pg_cuvs_hnsw_handler(internal)
 RETURNS index_am_handler
-AS '$libdir/pg_cuvs', 'pg_cuvs_hnsw_handler'
+AS '$libdir/pg_cuvs', 'pg_cuvs_hnsw_handler_c1p'
 LANGUAGE C;
 
 CREATE ACCESS METHOD pg_cuvs_hnsw
@@ -1068,3 +1074,57 @@ ORDER BY c.oid
 $$;
 COMMENT ON FUNCTION pg_cuvs_hnsw_layer_status() IS
     'Every pg_cuvs_hnsw index the caller can read that is ready (one a concurrent build is writing is left out): whether it has the upper layers mode nsw lacked before 0.9.3, and why not. A heap build answers from its recorded hierarchy flag; a CAGRA-source build from the share of elements above level 0 (expected about 1/m; fewer than a quarter of that means no upper layers). Reads every page of every such index.';
+-- ----------------------------------------------------------------
+-- pg_cuvs_cover_invalidate_all(): take every guarantee mark off the pg_cuvs_hnsw indexes of
+-- this database. Run by the 0.9.3 -> 0.9.2 downgrade script; also safe to run by hand before
+-- replacing the library with an older one. Returns the number of indexes examined; raises an
+-- error if an index cannot be taken off its guarantee. Superuser only.
+-- ----------------------------------------------------------------
+CREATE FUNCTION pg_cuvs_cover_invalidate_all()
+RETURNS bigint
+AS '$libdir/pg_cuvs', 'pg_cuvs_cover_invalidate_all'
+LANGUAGE C;
+
+REVOKE ALL ON FUNCTION pg_cuvs_cover_invalidate_all() FROM PUBLIC;
+
+-- pg_cuvs_hnsw_cover_status(index): how the cover descriptor of a pg_cuvs_hnsw index reads (class, writable, ...).
+CREATE FUNCTION pg_cuvs_hnsw_cover_status(index regclass)
+RETURNS jsonb
+AS '$libdir/pg_cuvs', 'pg_cuvs_hnsw_cover_status'
+LANGUAGE C STABLE STRICT;
+
+-- pg_cuvs_cover_recertify(index): recertify a pg_cuvs_hnsw index now (owner of the table). Returns what happened.
+CREATE FUNCTION pg_cuvs_cover_recertify(index regclass)
+RETURNS jsonb
+AS '$libdir/pg_cuvs', 'pg_cuvs_cover_recertify'
+LANGUAGE C STRICT;
+
+-- pg_cuvs_cover_breakglass(): the one emergency action when the package has to go back to the older library before the
+-- database could be brought back to 0.9.2 by ALTER EXTENSION UPDATE (the older library cannot run that script). It is plain SQL,
+-- so it runs with either library installed. It points the access method handler back at the older C symbol, so that the
+-- older library can open the indexes again, and leaves a marker: while pg_cuvs_cover_breakglass_marker() exists the new
+-- library reads every CERTIFIED index as lost, because the older library inserts and vacuums without recording anything. The
+-- marker is dropped only by the update script to 0.9.3 (pg_cuvs--0.9.2--0.9.3.sql), after the new library has taken every
+-- guarantee off: ALTER EXTENSION UPDATE TO '0.9.2' and then TO '0.9.3', with the new library installed. Pointing the handler
+-- back by hand (CREATE OR REPLACE FUNCTION) leaves no marker and is not supported.
+CREATE FUNCTION pg_cuvs_cover_breakglass()
+RETURNS void
+LANGUAGE plpgsql
+AS $breakglass$
+DECLARE
+	ns text;
+BEGIN
+	SELECT quote_ident(n.nspname) INTO ns
+	FROM pg_extension e JOIN pg_namespace n ON n.oid = e.extnamespace
+	WHERE e.extname = 'pg_cuvs';
+	IF to_regprocedure(ns || '.pg_cuvs_cover_breakglass_marker()') IS NULL THEN
+		EXECUTE 'CREATE FUNCTION ' || ns || '.pg_cuvs_cover_breakglass_marker() RETURNS void LANGUAGE sql AS ''SELECT 1''';
+		EXECUTE 'ALTER EXTENSION pg_cuvs ADD FUNCTION ' || ns || '.pg_cuvs_cover_breakglass_marker()';
+	END IF;
+	EXECUTE 'CREATE OR REPLACE FUNCTION ' || ns || '.pg_cuvs_hnsw_handler(internal) RETURNS index_am_handler '
+		|| 'AS ''$libdir/pg_cuvs'', ''pg_cuvs_hnsw_handler'' LANGUAGE C';
+	RAISE NOTICE 'pg_cuvs: the access method handler names the older C symbol and the break-glass marker exists; install the new package again, restart, then ALTER EXTENSION pg_cuvs UPDATE TO ''0.9.2'' and TO ''0.9.3''';
+END
+$breakglass$;
+
+REVOKE ALL ON FUNCTION pg_cuvs_cover_breakglass() FROM PUBLIC;

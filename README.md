@@ -263,6 +263,14 @@ over the visible heap rows, including rows the approximate graph cannot reach. I
 default, reads the whole heap and stops with an error instead of returning approximate rows.
 See [docs/reference.md](docs/reference.md#explicit-exact-scans-for-pg_cuvs_hnsw-203).
 
+#### Cover guarantee for `pg_cuvs_hnsw` (0.9.3)
+
+New `pg_cuvs_hnsw` indexes keep a ledger of rows the graph may miss. A search merges the graph's answers with the ledger and ranks them
+exactly, so rows the graph could not reach at the last certification, and every row inserted after it, are always candidates. A row that a later
+insert cuts off from the graph is outside the guarantee until the next recertification, which a `VACUUM`, `pg_cuvs_cover_recertify()` or `REINDEX` makes
+(how many rows that is depends on the graph and the data; the measured ranges are in the reference). Until then every insert adds a key that each search ranks exactly, so searches slow down as the keys grow. This bounds the loss of rows in #203; it does not make the approximate graph exact, and
+GPU-built indexes over existing rows are not yet verified. See [docs/reference.md](docs/reference.md#cover-guarantee-for-pg_cuvs_hnsw-203-extension-093).
+
 ### 3. On-prem RAG with a GPU pool you already have
 
 On-prem and private RAG deployments often already run GPU servers for embedding models, rerankers, or batch embedding jobs.

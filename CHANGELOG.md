@@ -48,6 +48,24 @@ exists for 0.9.0.
   100,000 x 96 (Seq Scan + top-N Sort 11 ms) and 284 ms over 1,000,000 x 96 (143 ms).
   Tested on PostgreSQL 16 CPU only, not on GPU builds, other pgvector versions or in
   GitHub Actions at the time of writing.
+- A cover guarantee for `pg_cuvs_hnsw` indexes, a partial answer to #203 that does not
+  resolve it. A new index carries a cover descriptor in the metapage and a ledger of keys
+  on extra pages. A scan of a certified index merges the graph answers with every ledger
+  key and ranks them exactly. An insert writes a ledger key before the pgvector insert.
+  `VACUUM` takes a certified index off before it changes the graph and recertifies it
+  after.
+  An index is recertified by the cleanup step of a `VACUUM` (once the keys written since the last certification pass 5 percent of the rows it covered), by
+  `pg_cuvs_cover_recertify(regclass)`, or by `REINDEX`; nothing recertifies it by itself otherwise. New SQL functions:
+  `pg_cuvs_hnsw_cover_status(regclass)`, `pg_cuvs_cover_recertify(regclass)` and
+  `pg_cuvs_cover_breakglass()`. The upgrade script is `sql/pg_cuvs--0.9.2--0.9.3.sql` and
+  the downgrade script is `sql/pg_cuvs--0.9.3--0.9.2.sql`; the order of the steps, including
+  the restart, is in [docs/playbooks/release-upgrade.md](docs/playbooks/release-upgrade.md)
+  and [docs/playbooks/rollback-and-cleanup.md](docs/playbooks/rollback-and-cleanup.md).
+  What is guaranteed: the rows the graph could not reach at the last certification, and
+  every row inserted since, are always candidates of a scan of a certified index. What is
+  not: rows that later inserts cut off from the graph are outside the guarantee until the
+  next recertification (on one strongly clustered test table shape, twelve runs from two measurements: 0 to 1.4 percent of the original rows after about 15,000 inserts, against 0 to 0.7 percent for pgvector alone in twelve runs; the measurements do not tell the two kinds apart, and reference.md has the conditions and the runs). Not covered or not verified: GPU-built indexes over existing rows, performance
+  at large scale, and row-level security, index expression and partial index shapes.
 
 ### Changed
 

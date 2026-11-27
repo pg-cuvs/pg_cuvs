@@ -55,6 +55,11 @@ struct CuvsHnswExact {
     TupleTableSlot *sort_out;
     Tuplesortstate *distances;
     TableScanDesc table_scan;
+    /* Subset mode: only these index entry TIDs are examined (the ANN answers and the ledger keys of a certified
+     * index), each followed through its HOT chain to the version the snapshot sees. */
+    bool subset;
+    const ItemPointerData *cand;
+    Size ncand;
 };
 
 /* Visible heap-only TIDs are not valid index answers. Resolve a root while
@@ -256,8 +261,30 @@ exact_store(CuvsHnswExact *state, ItemPointer root)
 }
 
 static void
+exact_collect_subset(CuvsHnswExact *state)
+{
+    IndexFetchTableData *fetch = table_index_fetch_begin(state->scan->heapRelation);
+    Size at;
+
+    for (at = 0; at < state->ncand; at++) {
+        ItemPointerData tid = state->cand[at];
+        bool call_again = false, all_dead = false;
+
+        CHECK_FOR_INTERRUPTS();
+        /* A key may point at a tuple that was rolled back or vacuumed away: nothing visible, nothing to rank. */
+        if (table_index_fetch_tuple(fetch, &tid, state->scan->xs_snapshot, state->heap_slot, &call_again, &all_dead))
+            exact_store(state, &tid);
+    }
+    table_index_fetch_end(fetch);
+}
+
+static void
 exact_collect_heap(CuvsHnswExact *state)
 {
+    if (state->subset) {
+        exact_collect_subset(state);
+        return;
+    }
     state->root_cached = false;
     state->table_scan = table_beginscan(state->scan->heapRelation,
                                        state->scan->xs_snapshot, 0, NULL);
@@ -273,8 +300,22 @@ exact_collect_heap(CuvsHnswExact *state)
     state->table_scan = NULL;
 }
 
+static CuvsHnswExact *exact_begin_impl(IndexScanDesc scan, bool subset, const ItemPointerData *cand, Size ncand);
+
 CuvsHnswExact *
 cuvs_hnsw_exact_begin(IndexScanDesc scan)
+{
+    return exact_begin_impl(scan, false, NULL, 0);
+}
+
+CuvsHnswExact *
+cuvs_hnsw_exact_begin_tids(IndexScanDesc scan, const ItemPointerData *tids, Size ntids)
+{
+    return exact_begin_impl(scan, true, tids, ntids);
+}
+
+static CuvsHnswExact *
+exact_begin_impl(IndexScanDesc scan, bool subset, const ItemPointerData *cand, Size ncand)
 {
     CuvsHnswExact *state;
     MemoryContext previous;
@@ -301,6 +342,9 @@ cuvs_hnsw_exact_begin(IndexScanDesc scan)
                         errmsg("HNSW exact routing requires a strict scalar float8 ordering function")));
     state = palloc0(sizeof(*state));
     state->scan = scan;
+    state->subset = subset;
+    state->cand = cand;
+    state->ncand = ncand;
     state->context = AllocSetContextCreate(CurrentMemoryContext, "HNSW exact cover", ALLOCSET_DEFAULT_SIZES);
     previous = MemoryContextSwitchTo(state->context);
     PG_TRY();
