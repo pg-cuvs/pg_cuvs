@@ -1,0 +1,136 @@
+-- ivfpq_drop_release.sql — dropping an IVF-PQ index releases what the daemon holds for it.
+--
+-- For each IVF-PQ index the daemon keeps a resident entry (the IVF-PQ handle) and its
+-- .ivfpq and .tids files in cuvs.index_dir. Only a DROP that reaches the daemon frees
+-- them, so the backend has to notify the daemon of the drop of an ivfpq index (cagra
+-- and flat already were notified), and the daemon has to free the handle and unlink the
+-- files. A cagra index that served a cpu_hnsw search also holds the host copy of its
+-- CPU HNSW structure and a .hnsw file (case 5).
+--
+-- What this file asserts: the daemon's entries and the index's files in the daemon's
+-- index_dir, and the daemon's drop count. That the GPU or host memory of a handle is
+-- returned is not visible from SQL; the residue check of the test suite covers it.
+--
+-- Probes (superuser): pg_cuvs_index_status() has one row for every entry the daemon holds;
+-- pg_cuvs_memory_status() counts resident_bytes and the entries dropped; the files of the
+-- index are listed in cuvs.index_dir.
+--
+-- Paths covered: DROP INDEX, DROP TABLE, REINDEX (same OID, nothing is dropped),
+-- REINDEX CONCURRENTLY (the old index is dropped at the end), a rolled-back DROP INDEX
+-- (nothing is released), DROP SCHEMA ... CASCADE, and DROP TABLE of a cagra index whose
+-- CPU HNSW structure a cpu_hnsw search loaded.
+
+\set ON_ERROR_STOP on
+SET client_min_messages = WARNING;
+
+CREATE EXTENSION IF NOT EXISTS vector;
+CREATE EXTENSION IF NOT EXISTS pg_cuvs;
+
+SET cuvs.index_dir = '/tmp/cuvs_indexes';
+SET cuvs.ivfpq_n_probes = 4;
+SET cuvs.k = 4;
+
+SELECT oid AS dboid FROM pg_database WHERE datname = current_database() \gset
+SELECT current_setting('cuvs.index_dir') AS dir \gset
+
+CREATE TABLE idr_items (id int, embedding vector(4));
+INSERT INTO idr_items
+SELECT g, ARRAY[g % 17, g % 13, g % 11, g % 7]::real[]::vector(4)
+FROM generate_series(1, 300) g;
+
+SELECT coalesce(sum(drops), 0) AS drops_before FROM pg_cuvs_memory_status() \gset
+
+-- 1. DROP INDEX
+CREATE INDEX idr_idx ON idr_items USING ivfpq (embedding vector_l2_ops)
+    WITH (n_lists = 4, pq_bits = 8, pq_dim = 2);
+SET enable_seqscan = off;
+SELECT count(*) = 1 AS searched FROM (SELECT id FROM idr_items ORDER BY embedding <-> '[1,0,0,0]'::vector LIMIT 1) s;
+RESET enable_seqscan;
+SELECT 'idr_idx'::regclass::oid AS idx1 \gset
+SELECT format('%s_%s.', :dboid, :idx1) AS pfx1 \gset
+SELECT (SELECT count(*) FROM pg_cuvs_index_status() WHERE index_oid = :idx1) AS status_rows,
+       (SELECT count(*) FROM pg_ls_dir(:'dir') f WHERE starts_with(f, :'pfx1')) > 0 AS has_files;
+DROP INDEX idr_idx;
+SELECT (SELECT count(*) FROM pg_cuvs_index_status() WHERE index_oid = :idx1) AS status_rows,
+       (SELECT count(*) FROM pg_ls_dir(:'dir') f WHERE starts_with(f, :'pfx1')) AS files;
+
+-- 2. DROP TABLE (the index goes with it)
+CREATE INDEX idr_idx ON idr_items USING ivfpq (embedding vector_l2_ops)
+    WITH (n_lists = 4, pq_bits = 8, pq_dim = 2);
+SELECT 'idr_idx'::regclass::oid AS idx2 \gset
+SELECT format('%s_%s.', :dboid, :idx2) AS pfx2 \gset
+SELECT (SELECT count(*) FROM pg_cuvs_index_status() WHERE index_oid = :idx2) AS status_rows,
+       (SELECT count(*) FROM pg_ls_dir(:'dir') f WHERE starts_with(f, :'pfx2')) > 0 AS has_files;
+DROP TABLE idr_items;
+SELECT (SELECT count(*) FROM pg_cuvs_index_status() WHERE index_oid = :idx2) AS status_rows,
+       (SELECT count(*) FROM pg_ls_dir(:'dir') f WHERE starts_with(f, :'pfx2')) AS files;
+
+-- 3. REINDEX keeps the OID, REINDEX CONCURRENTLY drops the old index
+CREATE TABLE idr_items (id int, embedding vector(4));
+INSERT INTO idr_items
+SELECT g, ARRAY[g % 17, g % 13, g % 11, g % 7]::real[]::vector(4)
+FROM generate_series(1, 300) g;
+CREATE INDEX idr_idx ON idr_items USING ivfpq (embedding vector_l2_ops)
+    WITH (n_lists = 4, pq_bits = 8, pq_dim = 2);
+SELECT 'idr_idx'::regclass::oid AS idx3 \gset
+REINDEX INDEX idr_idx;
+SELECT 'idr_idx'::regclass::oid = :idx3 AS same_oid_after_reindex,
+       (SELECT count(*) FROM pg_cuvs_index_status() WHERE index_oid = :idx3) AS status_rows;
+REINDEX INDEX CONCURRENTLY idr_idx;
+SELECT 'idr_idx'::regclass::oid <> :idx3 AS new_oid_after_concurrently;
+SELECT format('%s_%s.', :dboid, :idx3) AS pfx3 \gset
+SELECT 'idr_idx'::regclass::oid AS idx3b \gset
+SELECT format('%s_%s.', :dboid, :idx3b) AS pfx3b \gset
+-- the old index is gone from the daemon, the new one is there
+SELECT (SELECT count(*) FROM pg_cuvs_index_status() WHERE index_oid = :idx3) AS old_status_rows,
+       (SELECT count(*) FROM pg_ls_dir(:'dir') f WHERE starts_with(f, :'pfx3')) AS old_files,
+       (SELECT count(*) FROM pg_cuvs_index_status() WHERE index_oid = :idx3b) AS new_status_rows,
+       (SELECT count(*) FROM pg_ls_dir(:'dir') f WHERE starts_with(f, :'pfx3b')) > 0 AS new_has_files;
+DROP TABLE idr_items;
+SELECT (SELECT count(*) FROM pg_cuvs_index_status() WHERE index_oid = :idx3b) AS status_rows,
+       (SELECT count(*) FROM pg_ls_dir(:'dir') f WHERE starts_with(f, :'pfx3b')) AS files;
+
+-- 4. A rolled-back DROP leaves the index in the daemon; DROP SCHEMA ... CASCADE drops it
+CREATE SCHEMA idr_s;
+CREATE TABLE idr_s.items (id int, embedding vector(4));
+INSERT INTO idr_s.items
+SELECT g, ARRAY[g % 17, g % 13, g % 11, g % 7]::real[]::vector(4)
+FROM generate_series(1, 300) g;
+CREATE INDEX idr_s_idx ON idr_s.items USING ivfpq (embedding vector_l2_ops)
+    WITH (n_lists = 4, pq_bits = 8, pq_dim = 2);
+SELECT 'idr_s.idr_s_idx'::regclass::oid AS idx4 \gset
+SELECT format('%s_%s.', :dboid, :idx4) AS pfx4 \gset
+BEGIN;
+DROP INDEX idr_s.idr_s_idx;
+ROLLBACK;
+SELECT (SELECT count(*) FROM pg_cuvs_index_status() WHERE index_oid = :idx4) AS status_rows,
+       (SELECT count(*) FROM pg_ls_dir(:'dir') f WHERE starts_with(f, :'pfx4')) > 0 AS has_files;
+DROP SCHEMA idr_s CASCADE;
+SELECT (SELECT count(*) FROM pg_cuvs_index_status() WHERE index_oid = :idx4) AS status_rows,
+       (SELECT count(*) FROM pg_ls_dir(:'dir') f WHERE starts_with(f, :'pfx4')) AS files;
+
+-- 5. A cagra index that served a cpu_hnsw search: DROP frees its CPU HNSW structure and
+--    removes its .hnsw file with the others.
+CREATE TABLE idr_h (id bigint, embedding vector(4));
+INSERT INTO idr_h
+SELECT g, ARRAY[g % 17, g % 13, g % 11, g % 7]::real[]::vector(4)
+FROM generate_series(1, 300) g;
+SET cuvs.cpu_hnsw_fallback = on;
+CREATE INDEX idr_h_idx ON idr_h USING cagra (embedding vector_l2_ops);
+SET enable_seqscan = off;
+SELECT count(*) = 1 AS searched FROM (SELECT id FROM idr_h ORDER BY embedding <-> '[1,0,0,0]'::vector LIMIT 1) s;
+RESET enable_seqscan;
+SET cuvs.cpu_hnsw_fallback = off;
+SELECT search_mode FROM pg_stat_gpu_search WHERE index_name = 'idr_h_idx';
+SELECT 'idr_h_idx'::regclass::oid AS idx5 \gset
+SELECT format('%s_%s.', :dboid, :idx5) AS pfx5 \gset
+SELECT (SELECT count(*) FROM pg_ls_dir(:'dir') f WHERE starts_with(f, :'pfx5') AND f LIKE '%.hnsw') AS hnsw_files;
+DROP TABLE idr_h;
+SELECT (SELECT count(*) FROM pg_cuvs_index_status() WHERE index_oid = :idx5) AS status_rows,
+       (SELECT count(*) FROM pg_ls_dir(:'dir') f WHERE starts_with(f, :'pfx5')) AS files;
+
+-- Nothing is left of the indexes this file dropped, and the daemon counted the six drops.
+-- (Only this file's OIDs are looked at; the drop count moves only on DROP.)
+SELECT count(*) AS entries_left FROM pg_cuvs_index_status()
+WHERE index_oid IN (:idx1, :idx2, :idx3, :idx3b, :idx4, :idx5);
+SELECT coalesce(sum(drops), 0) - :drops_before AS dropped_entries FROM pg_cuvs_memory_status();

@@ -40,6 +40,7 @@ typedef struct ShimIndex {
     int64_t  n;
     int      dim;
     uint32_t metric;
+    int      degree;  /* nominal graph_degree (the shim keeps no graph); 0 = unknown */
 } ShimIndex;
 
 static ShimIndex *
@@ -170,6 +171,8 @@ shim_write(const ShimIndex *ix, const char *path)
     if (ok && ix->n > 0)
         ok = (fwrite(ix->vecs, sizeof(float), (size_t)ix->n * ix->dim, f)
               == (size_t)ix->n * ix->dim);
+    /* Optional trailer: the nominal graph degree (files without it read as 0). */
+    if (ok) ok = fwrite(&ix->degree, sizeof(ix->degree), 1, f) == 1;
     if (fclose(f) != 0) ok = 0;
     return ok ? 0 : -1;
 }
@@ -190,6 +193,8 @@ shim_read(const char *path)
         fread(ix->vecs, sizeof(float), (size_t)n * dim, f) != (size_t)n * dim) {
         shim_free(ix); fclose(f); return NULL;
     }
+    if (ix && fread(&ix->degree, sizeof(ix->degree), 1, f) != 1)
+        ix->degree = 0;
     fclose(f);
     return ix;
 }
@@ -308,14 +313,16 @@ cuvs_cagra_build(const float *vecs, int64_t n_vecs, int dim, uint32_t metric,
                  int graph_degree, int intermediate_graph_degree,
                  uint32_t build_algo, int device_id,
                  uint32_t lw_overflow, CuvsLwBuildStats *lw_out)
-{ (void)graph_degree; (void)intermediate_graph_degree; (void)build_algo; (void)device_id;
+{ (void)intermediate_graph_degree; (void)build_algo; (void)device_id;
   shim_lw_record(lw_overflow, lw_out);
   if (shim_build_oom_armed()) return NULL;
   /* Test seam (CPU shim only): hold the build so a test can act while its
    * VRAM reservation is pending (I3-B reload-under-build scenario). */
   { const char *d = getenv("CUVS_SHIM_BUILD_DELAY_MS");
     if (d && atol(d) > 0) usleep((useconds_t)(atol(d) * 1000)); }
-  return (CuvsCagraIndex) shim_new(vecs, n_vecs, dim, metric); }
+  ShimIndex *ix = shim_new(vecs, n_vecs, dim, metric);
+  if (ix) ix->degree = graph_degree > 0 ? graph_degree : 64;
+  return (CuvsCagraIndex) ix; }
 
 CuvsCagraIndex
 cuvs_cagra_build_multi(const float **vecs, const int64_t *n_each, int n_parts,
@@ -324,11 +331,12 @@ cuvs_cagra_build_multi(const float **vecs, const int64_t *n_each, int n_parts,
                        uint32_t build_algo, int device_id,
                        uint32_t lw_overflow, CuvsLwBuildStats *lw_out)
 {
-    (void)graph_degree; (void)intermediate_graph_degree; (void)build_algo; (void)device_id;
+    (void)intermediate_graph_degree; (void)build_algo; (void)device_id;
     shim_lw_record(lw_overflow, lw_out);
     if (shim_build_oom_armed()) return NULL;
     ShimIndex *ix = shim_new(NULL, total, dim, metric);
     if (!ix) return NULL;
+    ix->degree = graph_degree > 0 ? graph_degree : 64;
     int64_t off = 0;
     for (int p = 0; p < n_parts; p++) {
         size_t rows;
@@ -339,6 +347,9 @@ cuvs_cagra_build_multi(const float **vecs, const int64_t *n_each, int n_parts,
     }
     return (CuvsCagraIndex) ix;
 }
+
+int cuvs_cagra_graph_degree(CuvsCagraIndex index)
+{ return index ? ((ShimIndex *)index)->degree : 0; }
 
 void cuvs_cagra_free(CuvsCagraIndex index, int device_id)
 { (void)device_id; shim_free((ShimIndex *)index); }
@@ -352,7 +363,7 @@ cuvs_brute_force_search(const float *corpus_vecs, const float *query_vec,
                         CuvsSearchResult *results, int device_id)
 {
     (void)device_id;
-    ShimIndex tmp = { (float *)corpus_vecs, n_corpus, dim, metric };
+    ShimIndex tmp = { (float *)corpus_vecs, n_corpus, dim, metric, 0 };
     shim_topk(&tmp, query_vec, dim, top_k, NULL, 0, results);
     return 0;
 }
@@ -497,14 +508,17 @@ cuvs_cagra_extend(CuvsCagraIndex index, const float *new_vecs, int64_t n_new,
 
 CuvsCagraIndex
 cuvs_cagra_compact(CuvsCagraIndex index, const uint32_t *keep_bits_words,
-                   int64_t n_total, uint32_t metric, int device_id, int *ivfpq_retry)
+                   int64_t n_total, uint32_t metric, int graph_degree,
+                   int intermediate_graph_degree, int device_id, int *ivfpq_retry)
 {
     if (ivfpq_retry) *ivfpq_retry = 0;
+    (void)intermediate_graph_degree;
     (void)device_id;
     ShimIndex *ix = (ShimIndex *)index;
     if (!ix) return NULL;
     ShimIndex *out = shim_new(NULL, 0, ix->dim, metric);
     if (!out) return NULL;
+    out->degree = graph_degree > 0 ? graph_degree : ix->degree;
     int64_t kept = 0;
     for (int64_t i = 0; i < n_total && i < ix->n; i++)
         if (keep_bits_words[i >> 5] & (1u << (i & 31))) kept++;

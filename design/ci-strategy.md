@@ -76,8 +76,10 @@ shim 빌드가 CUDA 툴킷 설치를 요구하면 hosted 러너 무료 이점이
 ## 5. 워크플로 2종
 
 ### `.github/workflows/ci.yml` (Tier 1, 자동)
-- on: `main`, `pr/**`, `design/**` push 및 `main` 대상 pull request
+- on: `main`, `release/**`, `pr/**`, `design/**` push 및 `main`, `release/**` 대상 pull request
 - runner: `ubuntu-22.04`; 별도 `build-check` 잡에서 `make docs-contract-check`와 `make test-unit` 실행
+- `scope` 잡(`CI scope`): pull request가 바꾼 파일이 모두 문서(최상위·`docs/`·`design/` 아래의 Markdown, 단 시험이 읽는 `docs/reference.md` 제외)이면 `tier1-shim`과 `page-format`을 건너뛴다. 판정은 `.github/scripts/ci-scope.sh`가 하고, 판정이 실패하거나 애매하면 모든 잡이 돈다. push에서는 모든 잡이 돈다.
+- `page-format` 잡: PG16 설치 → `make test-page-format`(CAGRA 페이지 형식, WAL 변이, 구판 혼합 빌드 회귀)
 - `tier1-shim` 잡: PG16 + pgvector 설치 → `make PGCUVS_CPU_SHIM=1` 확장 및 ASAN 데몬 빌드 → 데몬 기동 → `make installcheck-tier1` (`REGRESS_TIER2_ONLY` 제외) + `make installcheck-isolation`; ccache 사용
 - 기존 `.sql` 스위트 대부분 그대로 재사용(BF recall@10=1.0은 shim과 동일, CAGRA recall assert는 `>=`라 exact가 통과, mode assert는 데몬 로직이 진짜 도니 통과)
 

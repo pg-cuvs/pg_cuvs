@@ -553,6 +553,22 @@ typedef struct CuvsPendingDrop
 
 static List *cuvs_pending_drops = NIL;   /* of CuvsPendingDrop*, in TopMemoryContext */
 
+/* the access methods whose indexes have a daemon entry (a GPU handle or cache) and files in index_dir, as one table. The DROP
+ * notice and the planner's "has a pg_cuvs vector index" test read it; an access method added to pg_cuvs that keeps daemon state is
+ * added here once. pg_cuvs_hnsw is not in it: its index lives in PostgreSQL pages and the daemon keeps nothing for it. */
+static const char *const cuvs_daemon_entry_ams[] = {"cagra", "ivfpq", "flat"};
+
+static bool
+cuvs_am_has_daemon_entry(Oid relam)
+{
+    if (!OidIsValid(relam))
+        return false;
+    for (size_t i = 0; i < lengthof(cuvs_daemon_entry_ams); i++)
+        if (relam == get_am_oid(cuvs_daemon_entry_ams[i], true))
+            return true;
+    return false;
+}
+
 static void
 cuvs_object_access(ObjectAccessType access, Oid classId, Oid objectId,
                    int subId, void *arg)
@@ -566,14 +582,9 @@ cuvs_object_access(ObjectAccessType access, Oid classId, Oid objectId,
         if (HeapTupleIsValid(tup))
         {
             Form_pg_class cf = (Form_pg_class) GETSTRUCT(tup);
-            /* ADR-073: a flat index also persists daemon artifacts (.tids/.vectors)
-             * and a resident BF cache, so its DROP must notify the daemon too —
-             * otherwise the artifacts orphan and a restart reloads them as zombies. */
-            Oid cagra_am = get_am_oid("cagra", true);
-            Oid flat_am  = get_am_oid("flat", true);
-            if (cf->relkind == RELKIND_INDEX &&
-                OidIsValid(cf->relam) &&
-                (cf->relam == cagra_am || cf->relam == flat_am))
+            /* Every index whose access method keeps a daemon entry and daemon files must notify the daemon of its
+             * drop, or the entry and the files orphan and a restart reloads them as zombies. */
+            if (cf->relkind == RELKIND_INDEX && cuvs_am_has_daemon_entry(cf->relam))
             {
                 CuvsPendingDrop pending = {
                     .oid = objectId, .subid = GetCurrentSubTransactionId()
@@ -582,7 +593,7 @@ cuvs_object_access(ObjectAccessType access, Oid classId, Oid objectId,
                 CuvsPendingDrop *pd;
 
 #ifdef CUVS_PAGE_FORMAT
-                if (cf->relam == cagra_am)
+                if (cf->relam == get_am_oid("cagra", true))
                 {
                     /* The deletion path already holds a lock on the index.
                      * Read reloptions before the catalog entry is removed. */
@@ -1959,14 +1970,14 @@ cuvs_resolve_index_dir_rel(Relation indexRel)
     return reldir != NULL ? reldir : get_index_dir();
 }
 
-/* 3R: resolve CAGRA build params from a cagra index's reloptions. ints carry
+/* 3R: read CAGRA build params from a cagra index's reloptions. ints carry
  * their reloption default (64/128) when rd_options is set; defaults are applied
  * when the index has no reloptions at all. build_algo string -> CUVS_CAGRA_BUILD_*.
- * Validates intermediate_graph_degree >= graph_degree (a cuVS requirement).
- * Only called from the CAGRA ambuild path (indexRel is a cagra index). */
+ * No validation: also read by compaction (cuvs_compact_rel), inside VACUUM.
+ * indexRel must be a cagra index. */
 static void
-cuvs_resolve_build_params_rel(Relation indexRel, int *graph_degree,
-                              int *intermediate_graph_degree, uint32_t *build_algo)
+cuvs_cagra_reloption_build_params(Relation indexRel, int *graph_degree,
+                                  int *intermediate_graph_degree, uint32_t *build_algo)
 {
     CuvsCagraOptions *opts = (CuvsCagraOptions *) indexRel->rd_options;
 
@@ -1988,7 +1999,16 @@ cuvs_resolve_build_params_rel(Relation indexRel, int *graph_degree,
             /* else "auto"/"" -> AUTO */
         }
     }
+}
 
+/* The CAGRA ambuild resolver: the reloptions above, validated
+ * intermediate_graph_degree >= graph_degree (a cuVS requirement). */
+static void
+cuvs_resolve_build_params_rel(Relation indexRel, int *graph_degree,
+                              int *intermediate_graph_degree, uint32_t *build_algo)
+{
+    cuvs_cagra_reloption_build_params(indexRel, graph_degree,
+                                      intermediate_graph_degree, build_algo);
     if (*intermediate_graph_degree < *graph_degree)
         ereport(ERROR,
                 (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
@@ -3101,7 +3121,7 @@ cuvs_hnsw_budget_error(uint32_t build_algo, const CuvsHnswBudgetSnapshot *budget
  * here, so it always precedes the scan or the build op. */
 static CuvsHnswPrespoolAction
 cuvs_hnsw_preflight(double rows, uint32_t dim, uint32_t hierarchy, uint32_t build_algo,
-                    uint32_t ef_construction, uint64_t host_cap, bool may_reject,
+                    uint32_t ef_construction, uint32_t graph_degree, uint64_t host_cap, bool may_reject,
                     const char *when)
 {
     CuvsHnswPreflightRequest request = {0};
@@ -3113,8 +3133,8 @@ cuvs_hnsw_preflight(double rows, uint32_t dim, uint32_t hierarchy, uint32_t buil
     request.build_algo = build_algo;
     request.ef_construction = ef_construction;
     request.dim = dim;
-    request.graph_degree = 64;
-    request.intermediate_degree = 128;
+    request.graph_degree = graph_degree;
+    request.intermediate_degree = 2 * graph_degree;
     request.after_scan = may_reject ? 0 : 1;
     request.n_estimate = cuvs_prespool_rows(rows);
     request.host_budget = host_cap;
@@ -3159,7 +3179,7 @@ cuvs_hnsw_preflight(double rows, uint32_t dim, uint32_t hierarchy, uint32_t buil
 void
 cuvs_build_hnsw_from_heap(Relation heapRel, Relation indexRel, IndexInfo *indexInfo,
                           const char *mode, uint32_t build_algo,
-                          uint32_t ef_construction, CuvsHnswBuildResult *out)
+                          uint32_t ef_construction, uint32_t m, CuvsHnswBuildResult *out)
 {
     CuvsHnswSpool *spool = palloc0(sizeof(*spool));
     Form_pg_attribute attr = TupleDescAttr(RelationGetDescr(indexRel), 0);
@@ -3207,7 +3227,7 @@ cuvs_build_hnsw_from_heap(Relation heapRel, Relation indexRel, IndexInfo *indexI
         bool transition_sent;
         snprintf(when, sizeof(when), "before the heap scan from reltuples=%.6g", stats_rows);
         prespool = cuvs_hnsw_preflight(stats_rows, spool->dim, hierarchy, build_algo,
-                                       ef_construction, cap, true, when);
+                                       ef_construction, 2 * m, cap, true, when);
         transition_sent = prespool == CUVS_HNSW_PRESPOOL_NOTICE_OVERFLOW;
         spool->input_hash = pg_cryptohash_create(PG_SHA256);
         if (!spool->input_hash || pg_cryptohash_init(spool->input_hash) < 0)
@@ -3244,13 +3264,13 @@ cuvs_build_hnsw_from_heap(Relation heapRel, Relation indexRel, IndexInfo *indexI
                          cuvs_hnsw_after_scan_reason(stats_rows),
                          (unsigned long long)spool->n);
                 transition_sent = cuvs_hnsw_preflight((double)spool->n, spool->dim, hierarchy,
-                    build_algo, ef_construction, cap, false, when)
+                    build_algo, ef_construction, 2 * m, cap, false, when)
                     == CUVS_HNSW_PRESPOOL_NOTICE_OVERFLOW;
             }
             /* K3: hash the spool while the daemon builds; join after the reply. */
             rc = cuvs_ipc_build_hnsw_file_idle(cuvs_socket_path,
                 FileGetRawDesc(spool->vectors), spool->n, spool->dim, spool->metric,
-                64, 128, hierarchy, cap,
+                2 * m, 4 * m, hierarchy, cap,	/* HNSW M = m: level 0 holds 2 * m neighbours, as pgvector's */
                 build_algo, ef_construction, &out->policy, &budget, &out->ace, &out->nn,
                 &out->hnsw_fd, error, sizeof(error), cuvs_hnsw_digest_step, &digest);
             /* The digest LOG also covers failed builds (daemon error reply,
@@ -7223,6 +7243,11 @@ cuvs_aminsert(Relation indexRel, Datum *values, bool *isnull,
                                  cuvs_resolve_index_dir_rel(indexRel));
         if (rc == CUVS_STATUS_OK)
             return false;
+        if (rc == CUVS_STATUS_STALE)
+            ereport(ERROR,
+                    (errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+                     errmsg("pg_cuvs: cannot insert while CAGRA compaction is pending"),
+                     errhint("Complete compaction, or REINDEX if the index is stale, then retry the transaction.")));
         /* BUILD_FAILED / daemon down → fall through to delta. */
     }
 
@@ -7290,6 +7315,67 @@ done:
     flock(fd, LOCK_UN);
     CloseTransientFile(fd);
     return ok;
+}
+
+/* #261: COMPACT for a legacy index. cagra::merge rebuilds the kept rows, so a
+ * CAGRA index sends its graph_degree and intermediate_graph_degree reloptions
+ * for the rebuild; without them the merge used the cuVS defaults (64, 128).
+ * Unlike the build resolver this does not raise an error, since VACUUM calls
+ * it: reloptions that CREATE INDEX would reject (intermediate below
+ * graph_degree, possible after ALTER INDEX ... SET) send 0, the daemon keeps
+ * the resident graph's width, and a WARNING says so. A width change (e.g.
+ * after ALTER INDEX ... SET (graph_degree)) gets a NOTICE. Other AMs (ivfpq, flat) have different
+ * rd_options layouts and send 0 (they have no CAGRA graph to rebuild). */
+static int
+cuvs_compact_rel(Relation indexRel, Oid index_oid)
+{
+    int      graph_degree = 0;
+    int      intermediate_graph_degree = 0;
+    uint32_t build_algo = CUVS_CAGRA_BUILD_AUTO;
+    bool     keep_width = false;
+    uint32_t width_before = 0;
+    uint32_t width_after = 0;
+    int      rc;
+
+    if (indexRel->rd_indam->amoptions == cuvs_cagra_amoptions)
+        cuvs_cagra_reloption_build_params(indexRel, &graph_degree,
+                                          &intermediate_graph_degree, &build_algo);
+    if (intermediate_graph_degree < graph_degree)
+        keep_width = true;
+    /* build_algo is not sent: compaction keeps cuVS's auto builder. */
+    rc = cuvs_ipc_compact(cuvs_socket_path,
+                          (uint32_t) MyDatabaseId,
+                          (uint32_t) index_oid,
+                          cuvs_resolve_index_dir_rel(indexRel),
+                          keep_width ? 0 : (uint32_t) graph_degree,
+                          keep_width ? 0 : (uint32_t) intermediate_graph_degree,
+                          &width_before, &width_after);
+    /* A compaction ran when the daemon reports the width it built. One
+     * message per compaction and index; nothing when there was nothing to
+     * compact. A WARNING also reaches the server log from autovacuum. */
+    if (rc == CUVS_STATUS_OK && width_after > 0)
+    {
+        if (keep_width)
+            ereport(WARNING,
+                    (errmsg("pg_cuvs: compaction of index \"%s\" kept graph width %u: "
+                            "intermediate_graph_degree (%d) is below graph_degree (%d)",
+                            RelationGetRelationName(indexRel), width_after,
+                            intermediate_graph_degree, graph_degree),
+                     errhint("Set intermediate_graph_degree to at least graph_degree with "
+                             "ALTER INDEX ... SET; the next compaction or REINDEX then "
+                             "builds the graph at graph_degree.")));
+        /* Only a move to the configured width (an ALTERed graph_degree, or
+         * a graph an earlier version compacted to 64): cuVS also narrows the
+         * graph below the row count, which is no setting change. */
+        else if (width_before > 0 && width_before != width_after &&
+                 width_after == (uint32_t) graph_degree)
+            ereport(NOTICE,
+                    (errmsg("pg_cuvs: compaction rebuilt index \"%s\" at graph width %u (was %u)",
+                            RelationGetRelationName(indexRel), width_after, width_before),
+                     errdetail("The index's graph_degree is %d. The graph's GPU memory "
+                               "changes with its width.", graph_degree)));
+    }
+    return rc;
 }
 
 /* ambulkdelete: Phase 3A-4 records dead TIDs as tombstones instead of
@@ -7368,10 +7454,7 @@ cuvs_ambulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
                 (double) stats->tuples_removed / (double) n_total_vecs
                     >= cuvs_compact_delete_ratio)
             {
-                (void) cuvs_ipc_compact(cuvs_socket_path,
-                                        (uint32_t) MyDatabaseId,
-                                        (uint32_t) index_oid,
-                                        cuvs_resolve_index_dir_rel(indexRel));
+                (void) cuvs_compact_rel(indexRel, index_oid);
                 cuvs_report_build_notice(index_oid);
             }
         }
@@ -7427,10 +7510,7 @@ cuvs_amvacuumcleanup(IndexVacuumInfo *info, IndexBulkDeleteResult *stats)
         cuvs_tombstone_path(index_oid, tpath, sizeof(tpath));
         if (stat(tpath, &st) == 0)
         {
-            (void) cuvs_ipc_compact(cuvs_socket_path,
-                                    (uint32_t) MyDatabaseId,
-                                    (uint32_t) index_oid,
-                                    cuvs_resolve_index_dir_rel(indexRel));
+            (void) cuvs_compact_rel(indexRel, index_oid);
             cuvs_report_build_notice(index_oid);
         }
     }
@@ -8864,10 +8944,7 @@ pg_cuvs_compact(PG_FUNCTION_ARGS)
     cuvs_require_legacy_operation(indexRel);
 #endif
 
-    rc = cuvs_ipc_compact(cuvs_socket_path,
-                          (uint32_t) MyDatabaseId,
-                          (uint32_t) index_oid,
-                          cuvs_resolve_index_dir_rel(indexRel));
+    rc = cuvs_compact_rel(indexRel, index_oid);
     cuvs_report_build_notice(index_oid);
 
     index_close(indexRel, AccessShareLock);
@@ -10620,14 +10697,11 @@ cuvs_metric_from_order_op(Oid opno)
 static bool
 cuvs_rel_has_vector_index(RelOptInfo *rel, int attno)
 {
-    Oid       cagra_am = get_am_oid("cagra", true);
-    Oid       ivfpq_am = get_am_oid("ivfpq", true);
-    Oid       flat_am  = get_am_oid("flat",  true);
     ListCell *lc;
     foreach(lc, rel->indexlist)
     {
         IndexOptInfo *ioi = lfirst_node(IndexOptInfo, lc);
-        if (ioi->relam != cagra_am && ioi->relam != ivfpq_am && ioi->relam != flat_am)
+        if (!cuvs_am_has_daemon_entry(ioi->relam))
             continue;
         if (ioi->nkeycolumns >= 1 && ioi->indexkeys[0] == attno)
             return true;

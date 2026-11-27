@@ -23,6 +23,41 @@ on:
 # with OK, and with GNU make 3.81 on macOS it does so with PG_CONFIG pointing at
 # a file that does not exist.
 jobs:
+  # ── Job 0: CI scope ──────────────────────────────────────────────────────
+  # On a pull request whose changed files are all documentation (Markdown at the
+  # top level, under docs/ and under design/, minus files a test reads; see
+  # .github/scripts/ci-scope.sh), tier1-shim and page-format are skipped. A push
+  # always runs every job, so main gets a full run after each merge. The heavy
+  # jobs skip only when this job succeeded and printed docs_only=true: when it
+  # fails, or cannot classify the change, they run.
+  scope:
+    name: CI scope
+    runs-on: ubuntu-22.04
+    outputs:
+      docs_only: ${{ steps.classify.outputs.docs_only }}
+    steps:
+      # Depth 2: on a pull request the checkout is the merge commit, and its first
+      # parent is the base branch tip.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      # The self-test runs before the classification, so a broken classifier fails
+      # this job and the heavy jobs run instead of being skipped.
+      - name: Classifier self-test
+        run: bash .github/scripts/ci-scope.sh self-test
+
+      - name: Classify the change
+        id: classify
+        run: |
+          docs_only=false
+          if [ "$GITHUB_EVENT_NAME" = pull_request ]; then
+            docs_only=$(bash .github/scripts/ci-scope.sh diff HEAD^1 HEAD) || docs_only=false
+            echo "Changed files:"; git diff --name-only --no-renames HEAD^1 HEAD || true
+          fi
+          [ "$docs_only" = true ] || docs_only=false
+          echo "docs_only=$docs_only" | tee -a "$GITHUB_OUTPUT"
+
   build-check:
     name: Unit tests (CPU)
     runs-on: ubuntu-22.04
@@ -91,6 +126,10 @@ jobs:
 # real VRAM behavior are Tier 2 only. See design/ci-strategy.md (ADR-067).
   tier1-shim:
     name: Tier 1 — CPU shim (installcheck)
+    needs: scope
+    # Skipped only for a documentation-only pull request (job 0). !cancelled()
+    # keeps the job running when the scope job failed.
+    if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.scope.result != 'success' || needs.scope.outputs.docs_only != 'true') }}
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
@@ -344,6 +383,10 @@ jobs:
 
   page-format:
     name: CAGRA page format (CPU shim)
+    needs: scope
+    # Skipped only for a documentation-only pull request (job 0). !cancelled()
+    # keeps the job running when the scope job failed.
+    if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.scope.result != 'success' || needs.scope.outputs.docs_only != 'true') }}
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4

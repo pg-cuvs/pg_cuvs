@@ -15,6 +15,7 @@
 #include "cuvs_cagra_fold_capacity.h"
 #include "cuvs_cagra_fold.h"
 #include "cuvs_cagra_fold_sdk.hpp"
+#include "cuvs_page_overlay_gpu_rmm.hpp"
 #endif
 #include "cuvs_hnsw_build_common.h"
 #include "cuvs_ipc.h"   /* CUVS_METRIC_* (PG-free, CUDA-free defines) */
@@ -111,6 +112,10 @@ struct RaftResTraits {
     using Res = raft::device_resources;
     using Stream = rmm::cuda_stream;
     static std::unique_ptr<Stream> make_stream() { return std::make_unique<Stream>(); }
+    static bool stream_ready(Stream *stream) noexcept
+    {
+        return cudaStreamQuery(stream->view().value()) == cudaSuccess;
+    }
     static std::unique_ptr<Res> make_res(Stream *stream)
     {
         return stream ? std::make_unique<Res>(stream->view()) : std::make_unique<Res>();
@@ -367,32 +372,36 @@ static void cagra_knn_precision(raft::device_resources &res, const float *rows_d
  * call threw, the stream/handles may carry a sticky error; reusing such a
  * resource from the pool can abort a later, unrelated request (the whole
  * daemon, since one process serves every backend). poison() makes the
- * destructor DESTROY the resource instead of pooling it, so a failed request
- * cannot corrupt healthy ones. Declare PooledRes OUTSIDE the try block and
- * call poison() in the catch so it is still alive when the catch runs.
+ * destructor discard the handles instead of pooling them, while retaining
+ * the dedicated stream for buffers that still refer to it. Declare
+ * PooledRes OUTSIDE the try block and call poison() in the catch.
  *
  * cudaSetDevice is per-thread state. Since the daemon spawns one pthread per
  * connection and each handles exactly one request, setting the device in the
  * constructor is safe -- no other thread can race the device selection within
  * the same PooledRes lifetime. */
 struct PooledRes {
-    std::unique_ptr<ResSlot> r; /* poisoned: destroyed with its own stream */
+    std::unique_ptr<ResSlot> r;
     int dev;
     bool poisoned = false;
     /* Q6: host frees on this thread wait for the borrowed stream until the
      * resource is returned or destroyed (closed first in the destructor). */
     std::optional<CuvsHostFreeFence::Scope> fence;
     explicit PooledRes(int device_id) : r(acquire_res(device_id)), dev(device_id) {
-        cudaError_t err = cudaSetDevice(device_id);
-        if (err != cudaSuccess) {
-            fprintf(stderr, "[PooledRes] cudaSetDevice(%d) failed: %s\n",
-                    device_id, cudaGetErrorString(err));
-            poisoned = true;
-            throw std::runtime_error("cudaSetDevice failed");
+        try {
+            cudaError_t err = cudaSetDevice(device_id);
+            if (err != cudaSuccess) {
+                fprintf(stderr, "[PooledRes] cudaSetDevice(%d) failed: %s\n",
+                        device_id, cudaGetErrorString(err));
+                throw std::runtime_error("cudaSetDevice failed");
+            }
+            ensure_fenced_host_resource();
+            fence.emplace(static_cast<void *>(r->res->get_stream().value()), fence_sync_stream,
+                          device_id, fence_log_failure);
+        } catch (...) {
+            g_device_pools[dev].retire(std::move(r));
+            throw;
         }
-        ensure_fenced_host_resource();
-        fence.emplace(static_cast<void *>(r->res->get_stream().value()), fence_sync_stream,
-                      device_id, fence_log_failure);
     }
     ~PooledRes()
     {
@@ -406,6 +415,7 @@ struct PooledRes {
             poisoned = true;
         }
         if (r && !poisoned) release_res(dev, std::move(r));
+        else if (r) g_device_pools[dev].retire(std::move(r));
     }
     raft::device_resources &get() { return *r->res; }
     void poison() { poisoned = true; }
@@ -569,6 +579,29 @@ cuvs_rmm_pool_stats(int device_id, CuvsRmmPoolStats *out)
     out->peak_bytes = g_rmm_registry->usages[device_id]->get_peak_bytes();   /* I3-B */
     return 0;
 }
+
+#ifdef PGCUVS_BETA3A_GPU_FOLD
+void *
+cuvs_page_overlay_rmm_allocate(int device, std::size_t bytes, cudaStream_t stream) noexcept
+{
+    if (!g_rmm_registry || device < 0 || device >= CUVS_MAX_GPUS ||
+        !g_rmm_registry->usages[device])
+        return nullptr;
+    const RmmUpstream::NoGrowth existing_backing(g_rmm_registry->upstreams[device].get());
+    try {
+        return g_rmm_registry->usages[device]->allocate(rmm::cuda_stream_view{stream}, bytes);
+    } catch (...) {
+        cuvs_failed_allocation::clear();
+        return nullptr;
+    }
+}
+
+void
+cuvs_page_overlay_rmm_free(int device, void *data, std::size_t bytes, cudaStream_t stream) noexcept
+{
+    g_rmm_registry->usages[device]->deallocate(rmm::cuda_stream_view{stream}, data, bytes);
+}
+#endif
 
 /* I3-B: lock-free peak of live pool allocations since the last reset. */
 extern "C" size_t
@@ -2260,6 +2293,14 @@ cuvs_cagra_deserialize(const char *path, int dim, int device_id)
     }
 }
 
+extern "C" int
+cuvs_cagra_graph_degree(CuvsCagraIndex index)
+{
+    if (!index)
+        return 0;
+    return (int) static_cast<const CuvsCagraIndexImpl *>(index)->idx.graph_degree();
+}
+
 /* ----------------------------------------------------------------
  * CAGRA index free
  * ---------------------------------------------------------------- */
@@ -2427,6 +2468,7 @@ cuvs_cagra_fold_reuse_with_yield(CuvsCagraIndex source, const float *new_vectors
         /* Device allocation itself can enqueue CUDA work. From this point,
          * keep the owner and its inputs until the request stream is checked. */
         may_have_gpu_work = true;
+        CuvsCagraFoldTimer input_timer(control);
         auto added = raft::make_device_matrix<float, int64_t>(resources, n_new, int64_t(dim));
         raft::copy(added.data_handle(), new_vectors, size_t(n_new) * size_t(dim), resources.get_stream());
         resources.sync_stream();
@@ -2442,6 +2484,7 @@ cuvs_cagra_fold_reuse_with_yield(CuvsCagraIndex source, const float *new_vectors
                 cuvs_cagra_fold_checkpoint(control);
             }
         }
+        input_timer.finish(&CuvsCagraFoldPhases::input_us);
         auto dataset = raft::make_device_matrix<float, int64_t>(resources, total, stride);
         auto dataset_view = raft::make_device_strided_matrix_view<float, int64_t>(
             dataset.data_handle(), total, dim, stride);
@@ -2456,6 +2499,8 @@ cuvs_cagra_fold_reuse_with_yield(CuvsCagraIndex source, const float *new_vectors
             throw std::runtime_error("completed CAGRA fold has invalid ownership");
         cuvs_cagra_fold_checkpoint(control);
         auto completed = std::make_unique<CuvsCagraIndexImpl>(std::move(dataset), std::move(next), old.metric);
+        if (control && control->result_device_graph)
+            *control->result_device_graph = completed->idx.graph().data_handle();
         *result = completed.release();
         return CUVS_CAGRA_FOLD_OK;
     } catch (const CuvsCagraFoldYield &) {
@@ -2506,6 +2551,8 @@ cuvs_cagra_compact(CuvsCagraIndex  index,
                    const uint32_t *keep_bits_words,
                    int64_t         n_total,
                    uint32_t        metric,
+                   int             graph_degree,
+                   int             intermediate_graph_degree,
                    int             device_id,
                    int            *ivfpq_retry)
 {
@@ -2531,6 +2578,21 @@ cuvs_cagra_compact(CuvsCagraIndex  index,
 
         cuvs::neighbors::cagra::index_params params;
         params.metric = cuvs_distance_type(metric);
+        /* #261: cagra::merge rebuilds the kept rows with these params, so the
+         * graph degrees must be the index's own, not index_params{} defaults
+         * (64 and 128). The caller passes the index's reloptions; 0 (a caller
+         * that sends none) keeps the resident graph's width, and the
+         * intermediate degree is never below it. The builder stays auto. */
+        params.graph_degree = graph_degree > 0 ? (size_t)graph_degree
+                                               : (size_t)impl->idx.graph_degree();
+        params.intermediate_graph_degree = intermediate_graph_degree > 0
+            ? (size_t)intermediate_graph_degree : (size_t)128;
+        if (params.intermediate_graph_degree < params.graph_degree)
+            params.intermediate_graph_degree = params.graph_degree;
+        fprintf(stderr, "[cuvs_cagra_compact] rebuild graph_degree=%zu "
+                        "intermediate_graph_degree=%zu (resident width %u)\n",
+                (size_t)params.graph_degree, (size_t)params.intermediate_graph_degree,
+                (unsigned)impl->idx.graph_degree());
         /* B1: cagra::merge rebuilds the kept rows with these params
          * (cagra_merge.cuh -> cagra::build), so the build's fp16 kNN bound
          * applies here too: bound over the index dataset (a superset of the
@@ -3269,20 +3331,7 @@ static int prepare_hnsw_settings(const CuvsHnswFileBuild *params, int vectors_fd
     }
     prepared.tiny = params->n_vecs > 0 && params->n_vecs < CUVS_HNSW_MIN_ELEMENTS;
     const bool tiny = prepared.tiny;
-    if (tiny)
-    {
-        // A bounded <=15-row GPU exact graph avoids IVF-PQ's minimum training
-        // population and keeps M>=2 even for one/two input rows.
-        degree = std::max<uint32_t>(4, (uint32_t)(params->n_vecs & ~UINT64_C(1)));
-        intermediate = degree;
-    }
-    else
-    {
-        if (degree >= params->n_vecs && params->n_vecs)
-            degree = (uint32_t)((params->n_vecs - 1) & ~UINT64_C(1));
-        if (intermediate >= params->n_vecs && params->n_vecs)
-            intermediate = (uint32_t)(params->n_vecs - 1);
-    }
+    cuvs_hnsw_limit_graph_degrees(params->n_vecs, &degree, &intermediate);
     int capacity_status;
     if (params->build_algo == CUVS_HNSW_ALGO_NN_DESCENT)
     {

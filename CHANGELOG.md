@@ -12,6 +12,11 @@ exists for 0.9.0.
 
 ### Added
 
+- Native experimental page-format CAGRA folding accepts
+  `CUVS_PAGE_FOLD_BATCH_ROWS` to cap each fold and allow small pending
+  prefixes. A positive limit enables the optimized fold implementation
+  and the default is `0`. `CUVS_PAGE_FOLD_PROFILE=1` logs per-phase fold
+  timings.
 - Experimental page-format CAGRA scans can reuse the daemon's pending rows
   with `cuvs.page_resident_search=on`. `cuvs.resident_supply=on` enables
   background supply on builds with native page-format folding. Both settings
@@ -97,6 +102,46 @@ exists for 0.9.0.
 
 ### Fixed
 
+- Documentation: `docs/reference.md` now says that CAGRA compaction rebuilds the graph
+  with cuVS's automatic builder choice whatever the index's `build_algo` is, why (it runs
+  inside VACUUM and falls back to another builder when memory is short), the recall@10
+  difference measured against a `REINDEX` with the same `build_algo`, and that `REINDEX`
+  rebuilds the graph with `build_algo`. Behaviour is unchanged.
+
+- A compaction that keeps a legacy CAGRA index's graph width because its
+  reloptions have `intermediate_graph_degree` below `graph_degree` (possible
+  after `ALTER INDEX ... SET`) now raises a WARNING naming the index, the two
+  settings and the kept width, with a hint; it used to be silent. A compaction
+  that moves the graph to `graph_degree` (after `ALTER INDEX ... SET
+  (graph_degree = ...)`, or for a graph an earlier version compacted to width
+  64) raises a NOTICE with the new and old width, since the graph's GPU memory
+  changes with it. One message per compaction and index; VACUUM does not fail.
+  Follow-up to #261.
+
+- Compaction of a legacy CAGRA index (VACUUM after deletions, or `pg_cuvs_compact()`)
+  rebuilds the kept rows with the index's `graph_degree` and `intermediate_graph_degree`
+  reloptions (#261). It used to rebuild them with cuVS's defaults, 64 and 128, while
+  `pg_class.reloptions` kept the values given at `CREATE INDEX`; nothing reported the
+  change. A `graph_degree = 32` or `128` index had a graph of width 64 after its first
+  compaction. An index that an earlier version compacted to width 64 gets its
+  `graph_degree` back at its next compaction, also after a daemon restart. The graph of
+  that index then takes `rows x graph_degree x 4` bytes again instead of `rows x 64 x 4`,
+  so its GPU memory grows or shrinks with the width, and the compaction itself may take a
+  different time (not measured). Measured once on an A100 (100,000 random 64-dimension
+  rows, `graph_degree = 128`, 20% deleted, 200 queries): recall@10 after compaction was
+  0.9430 with the width-64 graph and 0.9945 with the width-128 graph. `build_algo` is
+  unchanged: compaction still lets cuVS choose the graph builder (`auto`). The daemon logs
+  `[cuvs_cagra_compact] rebuild graph_degree=... intermediate_graph_degree=...`.
+
+- The daemon no longer dies with SIGSEGV when it frees an index after a failed request. A
+  failed request discarded its pooled resource slot together with the slot's dedicated
+  CUDA stream (`--rmm-dedicated-stream`, on by default), while device buffers that an
+  earlier request on that slot had allocated, such as the graph of an index built there,
+  still referred to the stream; RMM's pool looked the destroyed stream up when the index
+  was dropped or compacted. Any failed request poisons its slot, including host-side
+  failures such as a missing HNSW sidecar. The slot's handles are still discarded, but the
+  stream is now kept and reused once `cudaStreamQuery` reports it idle, and a kept stream
+  is never destroyed.
 - `pg_cuvs_hnsw` applies `ef_construction` to the applicable SDK settings for
   direct heap builds and records the configured value in the index metapage.
   Conversions from legacy CAGRA indexes use the option only for the target
@@ -144,6 +189,19 @@ exists for 0.9.0.
   Not changed: the concurrent build and `REINDEX ... CONCURRENTLY` of a `pg_cuvs_hnsw` index with `source = ...`
   still ask for `AccessExclusiveLock` on the index while they convert, so the table's reads and writes wait for
   them, as they did before.
+- `pg_cuvs_hnsw` heap builds now use `m` for neighbor capacity, with default
+  32. When an input has 1–64 rows, a default build now stores M 32 and reserves
+  slots accordingly even though the graph width is smaller, so such an index
+  can grow slightly after `REINDEX` (16 KB to 24 KB for a 15-row sample) while
+  returning the same search results. An explicit `m` already recorded by an
+  earlier release takes effect on the next rebuild or restore, which can change
+  the index size, build time and search quality. Use the [catalog query](docs/reference.md#pg_cuvs_hnsw) to find indexes
+  where the configured and built values differ. Source builds inherit the
+  converted M and warn once when an explicit `m` differs; that `m` still
+  applies when maintenance rebuilds the index from the heap. When maintenance
+  rebuilds a source-based index from the heap through pgvector, an index
+  without an explicit `m` now gets M 32 instead of 16. `ALTER INDEX ...
+  SET (m = ...)` applies on the next rebuild.
 - `cuvs.delta_search = 'cpu'` returned every row of a pending `.delta` twice, pushing
   correct rows out of the top k: the daemon merged its GPU delta cache whatever the mode
   was and the backend merged `.delta` again. The SEARCH request now carries the mode, and
@@ -185,6 +243,29 @@ exists for 0.9.0.
   still reads the sidecar on every search; and the first failing search after a daemon
   start or a reload after eviction still reads the whole file under the lock (moving the
   read out of the lock is not part of this change).
+- A rebuild (`REINDEX`, or a `CREATE INDEX` that reuses an OID) left parts of the old build in
+  the daemon. The unsharded CAGRA rebuild kept the old resident brute-force cache, and freed the
+  old delta and IVF-PQ caches with the new GPU's device number; the sharded rebuild dropped the
+  pointer to the old brute-force cache without freeing it and kept the old reverse TID map (used
+  by TID-filtered exact searches, which could then read positions of the old build), the CPU
+  HNSW structure and an IVF-PQ handle; the flat rebuild dropped the pointer to old shards
+  without freeing them; the IVF-PQ rebuild left shards on the entry. All four now take the old
+  build off the entry as one unit and free it with the function eviction and `DROP` use, on the
+  devices it lives on. The brute-force cache is built again the next time a search needs it; the
+  sharded rebuild no longer keeps a reverse map, as a new sharded build has none.
+- A rebuild of one index kind left the artifacts of other kinds for the same OID: an IVF-PQ
+  build left `.shards` (the next load tried the sharded path first and failed), a sharded build
+  left `.ivfpq` and `.hnsw`, a flat build left the shard graphs, and no build removed an old
+  `.hnsw` (a CAGRA build replaces it only when it writes a new one), which a `cpu_hnsw` search
+  would load for the new index. Each build now removes the other kinds' artifacts from one
+  table. For legacy index formats, `DROP` removes files in the daemon's `index_dir` whose names
+  start with `<db>_<index>.`.
+- `pg_cuvs_memory_status().resident_bytes`, eviction and admission did not count the delta cache
+  of a sharded index (it lives on the first shard's GPU). Builds, loads and the brute-force and
+  delta cache checks on that GPU now count it, so they can refuse or evict where they did not
+  before.
+- A CAGRA rebuild removes the old `.hnsw` and its source binding. If the rebuild does not
+  request `cuvs.cpu_hnsw_fallback`, no graph remains for `mode='hnswlib_file'` to import.
 - Documentation: the README batch example, `docs/reference.md` and ADR-040 said that
   joining the results of `pg_cuvs_batch_search` and `cuvs_filtered_knn` on `ctid` gives
   the visible rows. That join silently drops HOT-updated rows, because the functions
@@ -192,6 +273,15 @@ exists for 0.9.0.
   `CROSS JOIN LATERAL ... ORDER BY ... LIMIT` form, which follows HOT chains.
   `docs/reference.md` also notes the brute_force cache defects #237 and #239. The
   functions are unchanged.
+- `DROP INDEX`, `DROP TABLE` and the dropped old index of `REINDEX CONCURRENTLY` on an
+  `ivfpq` index did not release what the daemon held for it. The backend notified the
+  daemon of the drop of `cagra` and `flat` indexes only, so the entry of an `ivfpq`
+  index stayed in `pg_cuvs_index_status()` with its IVF-PQ handle, and
+  `pg_cuvs_memory_status().resident_bytes` grew with every index created and dropped.
+  The notice is now sent for `ivfpq` indexes too. The daemon frees the IVF-PQ handle and
+  the CPU HNSW structure of the dropped index, which the drop did not free for any index
+  type, and removes its `.ivfpq` and `.hnsw` files from the daemon's `index_dir` (files
+  written to a per-index `index_dir` reloption stay for legacy index formats).
 - A GPU build without `CUVS_SDK_SOURCE_INCLUDE` failed to link with
   `ld: .../librapids_logger.so: error adding symbols: DSO missing from command line`.
   The wrapper expands `RMM_LOG_*`, which call `rapids_logger::logger::log`, and
