@@ -22,6 +22,7 @@ extern bool cuvs_cover_breakglass_marked(void);
  * number of keys when true; *why says what was wrong when false.
  */
 extern bool cuvs_cover_ledger_check(Relation index, const CuvsCoverResult *res, uint64 *nkeys, const char **why);
+extern bool cuvs_cover_ledger_stale(const char *why);
 
 /*
  * True when the ledger of the CERTIFIED index described by `res` holds no key at all (the last certification found nothing the

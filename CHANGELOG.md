@@ -53,9 +53,11 @@ exists for 0.9.0.
   on extra pages. A scan of a certified index merges the graph answers with every ledger
   key and ranks them exactly. An insert writes a ledger key before the pgvector insert.
   `VACUUM` takes a certified index off before it changes the graph and recertifies it
-  after.
-  An index is recertified by the cleanup step of a `VACUUM` (once the keys written since the last certification pass 5 percent of the rows it covered), by
-  `pg_cuvs_cover_recertify(regclass)`, or by `REINDEX`; nothing recertifies it by itself otherwise. New SQL functions:
+  after. A background worker recertifies an index when the keys written since the last
+  certification pass 5 percent of the rows it covered; it needs `pg_cuvs` in
+  `shared_preload_libraries`. Settings: `cuvs.cover_auto_recertify` (on),
+  `cuvs.cover_recertify_threshold_percent` (5), `cuvs.cover_recertify_min_interval`
+  (10 s), `cuvs.cover_recertify_max_workers` (2) and `cuvs.cover_recertify_max_age` (5 min, checked every 30 s: a certified index with any key written since its certification is also recertified once the certification is that old, so that rows cut off by a few inserts do not stay outside the ledger indefinitely). New SQL functions:
   `pg_cuvs_hnsw_cover_status(regclass)`, `pg_cuvs_cover_recertify(regclass)` and
   `pg_cuvs_cover_breakglass()`. The upgrade script is `sql/pg_cuvs--0.9.2--0.9.3.sql` and
   the downgrade script is `sql/pg_cuvs--0.9.3--0.9.2.sql`; the order of the steps, including

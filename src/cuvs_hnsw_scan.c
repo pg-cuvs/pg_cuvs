@@ -1,4 +1,5 @@
 #include "postgres.h"
+#include "access/xlog.h"
 #include "access/amapi.h"
 #include "access/relscan.h"
 #include "utils/guc.h"
@@ -7,6 +8,7 @@
 #include "utils/relcache.h"
 #include "cuvs_hnsw_exact.h"
 #include "cuvs_hnsw_scan.h"
+#include "cuvs_cover_worker.h"
 #include "cuvs_hnsw_rls.h"
 #include "hnsw_export.h"
 #include "cuvs_cover_scan.h"
@@ -145,9 +147,28 @@ cover_notice(Relation index, const char *why, bool reindex_only)
                      RelationGetRelationName(index))));
 }
 
+/* Whether a search during a VACUUM merges the graph's answers and the ledger (a user decision): only while the VACUUM
+ * that took the guarantee off really runs; before and after, and after a VACUUM that was cancelled, crashed or ended with its recertification
+ * deferred, skipped or abandoned (the stored reason stays vacuum then), a LOST index is answered exactly from the heap, as the decision of
+ * 2026-11-15 says for any index that cannot be trusted. The descriptor alone does not tell those apart: ambulkdelete records the VACUUM's
+ * transaction in the sweeper's candidate table (cuvs_cover_vacuum_running). A standby cannot see the primary's VACUUM and merges while the
+ * reason is vacuum (a user decision): until the primary's end-of-VACUUM recertification, or the next one of its sweeper,
+ * reaches it through the WAL. false here gives the VACUUM state the heap ranking as well. */
+#define CUVS_COVER_MERGE_DURING_VACUUM true
+
+static bool
+cover_vacuum_merge(Relation index, const CuvsCoverResult *res)
+{
+    /* after an emergency rollback the ledger is not kept on purpose, whatever the reason the descriptor stores */
+    return CUVS_COVER_MERGE_DURING_VACUUM && res->cls == CUVS_COVER_LOST && res->stored_reason == CUVS_COVER_REASON_VACUUM &&
+        res->ledger_head != CUVS_COVER_INVALID_BLOCK && res->writable && !cuvs_cover_breakglass_marked() &&
+        (RecoveryInProgress() || cuvs_cover_vacuum_running(RelationGetRelid(index)));
+}
+
 /* The cover: an index of the new handler symbol is read by its descriptor.
  *   LEGACY / OFF   as before (approximate)
  *   CERTIFIED      the ANN answers and every ledger key, ranked exactly
+ *   LOST (vacuum)  the same, while cover_vacuum_merge() says so
  *   LOST / other   the whole visible heap, ranked exactly, with a notice
  * The ranking evaluates the index's expression and predicate as the reading role. The one statement it cannot answer is the one
  * cover_unsafe_reason describes; a scan that cannot be answered exactly is never answered approximately. */
@@ -198,7 +219,7 @@ cover_choose_mode(IndexScanDesc scan, CuvsHnswScanState *state)
         cover_notice(scan->indexRelation, "its descriptor was written by a newer pg_cuvs, whose ledger this library does not judge", true);
         return;
     }
-    if (res.cls == CUVS_COVER_CERTIFIED) {
+    if (res.cls == CUVS_COVER_CERTIFIED || cover_vacuum_merge(scan->indexRelation, &res)) {
         if (cuvs_cover_ledger_is_empty(scan->indexRelation, &res)) {
             /* nothing to add to the graph's answers: the scan is the unwrapped one */
             elog(DEBUG1, "pg_cuvs: scan of \"%s\" delegated to the graph (the ledger holds no key)", RelationGetRelationName(scan->indexRelation));
@@ -224,7 +245,7 @@ cover_tid_cmp(const void *a, const void *b)
     return ItemPointerCompare((ItemPointer) a, (ItemPointer) b);
 }
 
-/* CERTIFIED: the ANN answers plus every ledger key, each once, handed to the exact module as a subset. */
+/* CERTIFIED (and LOST while cover_vacuum_merge() says so): the ANN answers plus every ledger key, each once, handed to the exact module as a subset. */
 static void
 cover_build_merge(IndexScanDesc scan, CuvsHnswScanState *state)
 {
@@ -236,7 +257,7 @@ cover_build_merge(IndexScanDesc scan, CuvsHnswScanState *state)
 
     state->merge_cxt = cxt;
     cuvs_cover_scan_classify(scan->indexRelation, &res);
-    if (res.cls != CUVS_COVER_CERTIFIED ||
+    if ((res.cls != CUVS_COVER_CERTIFIED && !cover_vacuum_merge(scan->indexRelation, &res)) ||
         !cuvs_cover_scan_ledger(scan->indexRelation, res.ledger_head, res.ledger_tail, res.generation, cxt, &ledger, &nledger)) {
         /* the descriptor changed or the ledger cannot be read: rank the whole heap, which is always right */
         MemoryContextSwitchTo(previous);

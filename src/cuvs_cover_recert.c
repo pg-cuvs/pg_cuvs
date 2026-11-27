@@ -5,7 +5,8 @@
  * certification time) is a key of the new ledger, and so is every row inserted while the walk and the copy ran. The walk is not a snapshot: it
  * reads the pages one after the other while inserts go on, and an insert can cut a row off after the walk counted it as reached (it is
  * then in neither part of the ledger, and is outside the promise, which names the certification time and not the end of the walk). The inserts
- * of the walk are inserts since the certification. Three phases:
+ * of the walk are inserts since the certification: they count for the next recertification, also when the walk listed their rows themselves
+ * and their keys were not carried over (cert_dropped_keys). Three phases:
  *
  *   1. Under the cover lock (exclusive, bounded wait) read the descriptor, make sure a ledger chain exists (so that rows
  *      inserted during the walk are keyed), and note T_start, the ordinal of the next key. Release.
@@ -52,6 +53,7 @@
 #include "cuvs_cover_recert.h"
 #include "cuvs_cover_scan.h"
 #include "cuvs_cover_testgate.h"
+#include "cuvs_cover_worker.h"
 
 #define EXCLUSIVE_WAIT_MS 2000
 #define EXCLUSIVE_POLL_MS 20
@@ -88,6 +90,8 @@ cover_lock_exclusive(Oid relid)
 	{
 		if (LockAcquire(&tag, ExclusiveLock, false, true) != LOCKACQUIRE_NOT_AVAIL)
 			return true;
+		if (cuvs_cover_db_command_waits())
+			return false;		/* a background worker steps aside for a command on its database */
 		CHECK_FOR_INTERRUPTS();
 		pg_usleep(1000);
 		waited += 1;
@@ -393,6 +397,11 @@ edit_publish(CuvsCoverDescriptor *d, void *arg)
 	d->state = CUVS_COVER_STATE_CERTIFIED;
 	d->reason = CUVS_COVER_REASON_NONE;
 	d->flags &= ~CUVS_COVER_FLAG_SUSPECT_UNKEYED_WRITER;
+	/* the new certification's cert_time is phase 1, and what was inserted since then is what phase 1 started to record */
+	if ((d->flags & CUVS_COVER_FLAG_INSERTED_SINCE_START) != 0)
+		d->flags |= CUVS_COVER_FLAG_INSERTED;
+	else
+		d->flags &= ~CUVS_COVER_FLAG_INSERTED;
 	d->generation = p->generation;
 	d->recert_generation = p->generation;
 	d->ledger_head = p->head;
@@ -403,7 +412,6 @@ edit_publish(CuvsCoverDescriptor *d, void *arg)
 	d->delta_count = p->kept;
 	d->cert_dropped_keys = p->dropped;
 	/* the bytes of the descriptor that belong to a certification and that this version does not use are the previous certification's: cleared */
-	memset(d->reserved1, 0, sizeof(d->reserved1));
 	d->reserved2 = 0;
 	memset(d->reserved3, 0, sizeof(d->reserved3));
 	d->pending_head = 0;
@@ -411,6 +419,7 @@ edit_publish(CuvsCoverDescriptor *d, void *arg)
 	d->graph_nblocks_at_cert = p->nblocks;
 	d->cert_lsn = GetXLogInsertRecPtr();
 	d->cert_time = p->cert_start != 0 ? p->cert_start : GetCurrentTimestamp();
+	d->cert_published_time = GetCurrentTimestamp();
 	d->last_fail_nblocks = 0;
 	d->last_fail_status = 0;
 	d->last_fail_limit = 0;
@@ -437,6 +446,13 @@ edit_touch(CuvsCoverDescriptor *d, void *arg)
 	}
 }
 #endif
+
+/* phase 1: from here on INSERTED_SINCE_START records the inserts after the cert_time this recertification will publish */
+static void
+edit_clear_since_start(CuvsCoverDescriptor *d, void *arg)
+{
+	d->flags &= ~CUVS_COVER_FLAG_INSERTED_SINCE_START;
+}
 
 static void
 edit_free_head(CuvsCoverDescriptor *d, void *arg)
@@ -700,12 +716,36 @@ growth_delta(Relation index, const CuvsCoverDescriptor *d, const CuvsCoverResult
 	return true;
 }
 
+/*
+ * The pages the relation has grown by since the certification (graph_nblocks_at_cert is taken after the pages of the new ledger chain were allocated,
+ * so a recertification's own pages are not counted). An insert that wrote a key and an insert that was verified and wrote none both grow the graph, which is
+ * why this, and not the number of keys, tells whether rows were inserted since the certification: with the insert verification (cuvs.cover_verify_inserts) a row
+ * that is reachable when it is inserted gets no key, and a later insert can still cut it off. A handful of inserts that fit in the free space of the last page
+ * do not move this; the growth rule and the time trigger take the index once the inserts have filled a page.
+ */
+uint64
+cuvs_cover_pages_since_cert(Relation index, const CuvsCoverDescriptor *d)
+{
+	BlockNumber nblocks = RelationGetNumberOfBlocks(index);
+
+	return nblocks > d->graph_nblocks_at_cert ? nblocks - d->graph_nblocks_at_cert : 0;
+}
+
+/* The same ratio as the keys: the pages added since the certification as a percent of the pages it covered (rows and pages grow together). */
+static bool
+pages_over_threshold(Relation index, const CuvsCoverDescriptor *d)
+{
+	uint64		pages = cuvs_cover_pages_since_cert(index, d);
+
+	return pages >= 1 && pages * 100 >= (uint64) cuvs_cover_recert_percent * (d->graph_nblocks_at_cert ? d->graph_nblocks_at_cert : 1);
+}
+
 static bool
 growth_over_threshold(const CuvsCoverDescriptor *d, uint64 delta)
 {
 	/* a ratio only: a small table is cheap to recertify, and one that is left uncertified reads slower at every rescan */
 	return delta >= 1 &&
-		delta * 100 >= (uint64) CUVS_RECERT_GROWTH_PERCENT * (d->base_rows ? d->base_rows : 1);
+		delta * 100 >= (uint64) cuvs_cover_recert_percent * (d->base_rows ? d->base_rows : 1);
 }
 
 /* Is a recertification of this CERTIFIED index due: the keys written since the certification are past the threshold, or the ledger
@@ -721,7 +761,75 @@ growth_due(Relation index, const CuvsCoverDescriptor *d, const CuvsCoverResult *
 		return false;
 	if (!cuvs_cover_ledger_check(index, res, &nkeys, &why))
 		return true;
-	return growth_over_threshold(d, nkeys > cuvs_cover_base_keys(d) ? nkeys - cuvs_cover_base_keys(d) : 0);
+	return growth_over_threshold(d, nkeys > cuvs_cover_base_keys(d) ? nkeys - cuvs_cover_base_keys(d) : 0) || pages_over_threshold(index, d);
+}
+
+/* Is a CERTIFIED index due for a recertification by the growth rule (or because its ledger does not read)? For the background worker,
+ * which runs again while inserts that arrived during its run have put the ledger past the threshold once more. */
+/* A CERTIFIED index with at least one key, one page or one insert (CUVS_COVER_FLAG_INSERTED) since its certification, or a ledger that does not read: what a time-based recertification takes. */
+static bool
+growth_nonzero(Relation index, const CuvsCoverDescriptor *d, const CuvsCoverResult *res)
+{
+	uint64		nkeys;
+	const char *why;
+
+	if (res->ledger_tail == CUVS_COVER_INVALID_BLOCK)
+		return false;
+	if ((d->flags & CUVS_COVER_FLAG_INSERTED) != 0)
+		return true;			/* an insert since the certification, keyed or not */
+	if (!cuvs_cover_ledger_check(index, res, &nkeys, &why))
+		return true;
+	return nkeys > cuvs_cover_base_keys(d) || cuvs_cover_pages_since_cert(index, d) > 0;
+}
+
+/*
+ * Is a time-based recertification due: the index is LOST (a recertification fixes it), or CERTIFIED and past the growth threshold, or CERTIFIED with at
+ * least one key or one page added since its certification, which began (cert_time) at least `max_age_us` ago, or CERTIFIED with a ledger that does not read. An index nobody inserted into since is
+ * never due: nothing could have cut a row off. The pages and the insert flag count because an insert that the verification found reachable writes no key
+ * and can still be cut off by a later one, in a page that was already there. Reads two or three pages; no lock beyond the caller's.
+ */
+bool
+cuvs_cover_sweep_due(Relation index, TimestampTz now, int64 max_age_us)
+{
+	CuvsCoverDescriptor d;
+	CuvsCoverResult res;
+
+	if (cuvs_cover_breakglass_marked() || !read_descriptor(index, &d, &res) || !res.writable)
+		return false;
+	/* a LOST index is due, except while the VACUUM that took it off runs: that VACUUM recertifies it at its end, and a worker now would only be
+	 * deferred by the VACUUM's lock at every sweep */
+	if (res.cls == CUVS_COVER_LOST)
+		return !(res.stored_reason == CUVS_COVER_REASON_VACUUM && cuvs_cover_vacuum_running(RelationGetRelid(index)));
+	if (res.cls != CUVS_COVER_CERTIFIED || !growth_nonzero(index, &d, &res))
+		return false;
+	/* past the growth threshold: at the next sweep, whatever the age (no insert asks for a worker in this version) */
+	if (growth_due(index, &d, &res))
+		return true;
+	if (max_age_us <= 0)
+		return false;			/* cuvs.cover_recertify_max_age = 0: no time rule */
+	return d.cert_time == 0 || now - d.cert_time >= max_age_us;
+}
+
+bool
+cuvs_cover_sweep_pending(Relation index)
+{
+	CuvsCoverDescriptor d;
+	CuvsCoverResult res;
+
+	if (cuvs_cover_breakglass_marked() || !read_descriptor(index, &d, &res) || !res.writable)
+		return false;
+	if (res.cls == CUVS_COVER_LOST)
+		return true;
+	return res.cls == CUVS_COVER_CERTIFIED && growth_nonzero(index, &d, &res);
+}
+
+bool
+cuvs_cover_recertify_due(Relation index)
+{
+	CuvsCoverDescriptor d;
+	CuvsCoverResult res;
+
+	return read_descriptor(index, &d, &res) && res.cls == CUVS_COVER_CERTIFIED && res.writable && growth_due(index, &d, &res);
 }
 
 /* For the status function: the descriptor of `index`, the keys written since the certification and whether that is past the
@@ -733,7 +841,7 @@ cuvs_cover_growth_status(Relation index, CuvsCoverDescriptor *d, uint64 *delta_k
 
 	if (!read_descriptor(index, d, &res) || !growth_delta(index, d, &res, delta_keys))
 		return false;
-	*recommended = res.cls == CUVS_COVER_CERTIFIED && growth_over_threshold(d, *delta_keys);
+	*recommended = res.cls == CUVS_COVER_CERTIFIED && (growth_over_threshold(d, *delta_keys) || pages_over_threshold(index, d));
 	return true;
 }
 
@@ -746,23 +854,30 @@ cover_u64_cmp(const void *a, const void *b)
 	return x < y ? -1 : x > y ? 1 : 0;
 }
 
-static void recertify_impl(Relation heap, Relation index, uint64 ram_limit, uint64 spill_limit, bool force, bool yield, CuvsRecertOutcome *out);
+static void recertify_impl(Relation heap, Relation index, uint64 ram_limit, uint64 spill_limit, bool force, bool aged, bool yield, CuvsRecertOutcome *out);
 
 void
 cuvs_cover_recertify(Relation heap, Relation index, uint64 ram_limit, uint64 spill_limit, bool force, CuvsRecertOutcome *out)
 {
-	recertify_impl(heap, index, ram_limit, spill_limit, force, false, out);
+	recertify_impl(heap, index, ram_limit, spill_limit, force, false, false, out);
 }
 
 /* The same for a caller that is not a VACUUM: the walk gives way to a session that waits for a lock on the table or the index. */
 void
 cuvs_cover_recertify_yielding(Relation heap, Relation index, uint64 ram_limit, uint64 spill_limit, bool force, CuvsRecertOutcome *out)
 {
-	recertify_impl(heap, index, ram_limit, spill_limit, force, true, out);
+	recertify_impl(heap, index, ram_limit, spill_limit, force, false, true, out);
+}
+
+/* The time-based recertification: a CERTIFIED index is taken when any key was written since its certification, however few. The failure memory applies. */
+void
+cuvs_cover_recertify_aged(Relation heap, Relation index, uint64 ram_limit, uint64 spill_limit, CuvsRecertOutcome *out)
+{
+	recertify_impl(heap, index, ram_limit, spill_limit, false, true, true, out);
 }
 
 static void
-recertify_impl(Relation heap, Relation index, uint64 ram_limit, uint64 spill_limit, bool force, bool yield, CuvsRecertOutcome *out)
+recertify_impl(Relation heap, Relation index, uint64 ram_limit, uint64 spill_limit, bool force, bool aged, bool yield, CuvsRecertOutcome *out)
 {
 	Oid			relid = RelationGetRelid(index);
 	MemoryContext cxt = AllocSetContextCreate(CurrentMemoryContext, "HNSW cover recert", ALLOCSET_DEFAULT_SIZES);
@@ -793,7 +908,7 @@ recertify_impl(Relation heap, Relation index, uint64 ram_limit, uint64 spill_lim
 
 	/* a CERTIFIED index is only taken when its ledger has grown enough: look first, without the lock, so that the many vacuums
 	 * that find nothing to do neither block inserts nor read the ledger */
-	if (!force && read_descriptor(index, &d0, &res) && res.cls == CUVS_COVER_CERTIFIED && !growth_due(index, &d0, &res))
+	if (!force && read_descriptor(index, &d0, &res) && res.cls == CUVS_COVER_CERTIFIED && !(aged ? growth_nonzero(index, &d0, &res) : growth_due(index, &d0, &res)))
 	{
 		out->detail = "certified, and not enough keys since";
 		goto done;
@@ -816,7 +931,7 @@ recertify_impl(Relation heap, Relation index, uint64 ram_limit, uint64 spill_lim
 		out->detail = "the index has no descriptor this library may rewrite";
 		goto done;
 	}
-	if (res.cls == CUVS_COVER_CERTIFIED && !force && !growth_due(index, &d0, &res))
+	if (res.cls == CUVS_COVER_CERTIFIED && !force && !(aged ? growth_nonzero(index, &d0, &res) : growth_due(index, &d0, &res)))
 	{
 		out->detail = "certified, and not enough keys since";
 		goto done;
@@ -892,6 +1007,9 @@ recertify_impl(Relation heap, Relation index, uint64 ram_limit, uint64 spill_lim
 		}
 		t_start = h.first_ordinal + h.count;
 	}
+	/* no insert runs now (the cover lock is ours): an insert after this sets the bit again, and an abandoned walk leaves INSERTED as it was */
+	if ((d0.flags & CUVS_COVER_FLAG_INSERTED_SINCE_START) != 0)
+		edit_descriptor(index, edit_clear_since_start, NULL);
 	new_generation = d0.generation + 1;
 	out->phase1_lock_us = (uint64) (GetCurrentTimestamp() - cert_start);
 	cover_unlock_exclusive(relid);
@@ -1074,6 +1192,13 @@ recertify_impl(Relation heap, Relation index, uint64 ram_limit, uint64 spill_lim
 				KeyList		more;
 				Size		raw_more;
 
+				if (cuvs_cover_db_command_waits())
+				{
+					out->status = CUVS_RECERT_ABANDONED;
+					out->detail = "a command on the database waits for its sessions: the background worker stepped aside";
+					goto done;
+				}
+
 				if (!read_keys_from(index, old_head, old_tail, d0.generation, copied_upto, cxt, &more))
 				{
 					out->status = CUVS_RECERT_ABANDONED;
@@ -1111,8 +1236,9 @@ recertify_impl(Relation heap, Relation index, uint64 ram_limit, uint64 spill_lim
 		}
 		locked = true;
 		lock3_at = GetCurrentTimestamp();
+		/* the two insert bits change during the walk by design (phase 1 cleared one, inserts set them): not a change of the graph */
 		if (!read_descriptor(index, &d1, &res) || d1.generation != d0.generation || d1.graph_epoch != d0.graph_epoch ||
-			d1.flags != d0.flags || d1.state != d0.state)
+			(d1.flags & ~CUVS_COVER_INSERT_FLAGS) != (d0.flags & ~CUVS_COVER_INSERT_FLAGS) || d1.state != d0.state)
 		{
 			out->status = CUVS_RECERT_ABANDONED;
 			out->detail = "the descriptor changed during the walk (a vacuum, a flag, another recertification)";
@@ -1250,7 +1376,10 @@ cuvs_cover_ambulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats, Ind
 		return r;
 	}
 	if (read_descriptor(info->index, &d, &res) && res.writable)
+	{
 		edit_descriptor(info->index, edit_vacuum_lost, NULL);
+		cuvs_cover_note_vacuum(RelationGetRelid(info->index));	/* a candidate that remembers this VACUUM */
+	}
 #ifdef CUVS_COVER_RECERT_TEST_GATE
 	(void) cuvs_cover_test_gate("vacuum");
 #endif

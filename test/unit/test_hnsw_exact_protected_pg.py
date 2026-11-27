@@ -16,6 +16,8 @@ import shlex
 import subprocess
 import threading
 import sys
+
+import hnsw_exact_cover_hold as cover_hold
 from test_connectivity_pg_interrupts import Session
 
 
@@ -88,6 +90,7 @@ def main():
     q20 = "SELECT id FROM {t} ORDER BY v <-> '[0,0]'::vector LIMIT 20"
     a = u = None
     cover_mode = False
+    held = False
     try:
         actual_dir = subprocess.check_output(base[:-2] + ['-U', args.user, '-d', args.database, '-c', 'SHOW data_directory;'], text=True).strip()
         assert actual_dir == args.expected_data_directory, (actual_dir, args.expected_data_directory)
@@ -101,6 +104,13 @@ def main():
         # cluster that has not been updated has.
         cover_mode = ask(a, "SELECT prosrc FROM pg_proc WHERE proname='pg_cuvs_hnsw_handler';")[-1].endswith('_c1p')
         result['handler'] = 'cover (pg_cuvs_hnsw_handler_c1p)' if cover_mode else 'older symbol (pg_cuvs_hnsw_handler)'
+        if cover_mode:
+            # the exact answers below rest on every inserted row being a ledger key: no background recertification during the run
+            cover_hold.hold(lambda q: ask(a, q))
+            held = True
+            # and no verification of the inserts, which is on by default and leaves a row it finds out of the ledger (the session that
+            # inserts the rows is this superuser one)
+            ask(a, 'SET cuvs.cover_verify_inserts = off;')
 
         def table(name, extra='', parent=None, owner=None, rows=True):
             cols = '(id int, v vector(2), g int, h int)'
@@ -168,6 +178,8 @@ def main():
             compare(name, q20.format(t='fx.' + table_name), who, hnsw_indexes)
 
         def compare(name, q, who, hnsw_indexes):
+            if cover_mode:
+                cover_hold.assert_not_recertified(lambda x: ask(a, x), s, hnsw_indexes, name)
             ask(who, 'SET cuvs.hnsw_exact_scan=off;')
             approximate = ids(who, q + ';')
             ask(who, 'SET cuvs.hnsw_exact_scan=on;')
@@ -440,6 +452,8 @@ def main():
         try:
             if a:
                 ask(a, f"RESET ALL; DROP SCHEMA IF EXISTS {s} CASCADE; DROP OWNED BY {role}; DROP ROLE IF EXISTS {role};")
+                if held:
+                    cover_hold.release(lambda q: ask(a, q))
         except Exception as e:
             result['cleanup_error'] = repr(e)
         (out / 'transcript.json').write_text(json.dumps(transcript, indent=1))

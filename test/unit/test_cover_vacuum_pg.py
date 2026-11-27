@@ -17,6 +17,7 @@ The oracle that reads relation files is test_cover_reach_pg.py's, which shares n
 import argparse
 import json
 import os
+import re
 from pathlib import Path
 import shutil
 import struct
@@ -145,9 +146,28 @@ def main():
             if args.gate:
                 c.scalar('CREATE TABLE gc(id int, v vector(8))')
                 c.scalar(clustered('gc', 1500))
+                # rows of one vector hang loose in the graph (as in V1): the ledger holds rows the graph cannot reach
+                c.scalar("INSERT INTO gc SELECT 100000 + x, '[0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5]'::vector FROM generate_series(1, 200) x")
                 hack_index(c, 'gc', 'gci', 'WITH (m = 8, ef_construction = 16)')
                 plant(c, plant_bin, 'gci', 'uncertified')
                 c.scalar("SELECT pg_cuvs_cover_recertify('gci')")
+                # rows the graph cannot reach that the ledger holds: one that stays and one that the DELETE below removes
+                c.scalar('CHECKPOINT')
+                gpath = c.data / c.scalar("SELECT pg_relation_filepath('gci')")
+                gkeys, _, _, _ = tr.ledger_all(ti.read_pages(gpath))
+                g_unreached, _ = tr.unreachable_tids(gpath)
+                held = sorted(t for t in g_unreached if t in {(k[1], k[2]) for k in gkeys})
+                tid_ids = {}
+                for line in c.scalar("SELECT ctid::text || '|' || id FROM gc").split('\n'):
+                    t_txt, i_txt = line.split('|')
+                    tid_ids[tuple(int(x) for x in t_txt.strip('()').split(','))] = int(i_txt)
+                held_ids = [tid_ids[t] for t in held if t in tid_ids]
+                stay = next((i for i in held_ids if i % 4 != 0), None)
+                gone = next((i for i in held_ids if i % 4 == 0), None)
+                rc_e0, res_e0 = c.q("SET enable_seqscan = off; EXPLAIN (ANALYZE, BUFFERS) SELECT id FROM gc ORDER BY v <-> (SELECT v FROM gc WHERE id = 1) LIMIT 3")
+                m0 = re.search(r'Index Scan using gci.*?Buffers: shared hit=(\d+)(?: read=(\d+))?', res_e0, re.S)
+                buffers_before = (int(m0.group(1)) + int(m0.group(2) or 0)) if m0 else None
+                c.scalar('CREATE TABLE gc_deleted AS SELECT id, v FROM gc WHERE id % 4 = 0')
                 c.scalar('DELETE FROM gc WHERE id % 4 = 0')
                 (gate / 'vacuum_armed').write_text('')
                 box = []
@@ -160,14 +180,121 @@ def main():
                 reached = (gate / 'vacuum_reached').exists()
                 st_mid = json.loads(c.scalar("SELECT pg_cuvs_hnsw_cover_status('gci')::text"))
                 rc_s, res_s = c.q("SET enable_seqscan = off; SELECT id FROM gc ORDER BY v <-> (SELECT v FROM gc WHERE id = 1) LIMIT 3")
+                rc_e, res_e = c.q("SET enable_seqscan = off; EXPLAIN (ANALYZE, BUFFERS) SELECT id FROM gc ORDER BY v <-> (SELECT v FROM gc WHERE id = 1) LIMIT 3")
+                m_buf = re.search(r'Index Scan using gci.*?Buffers: shared hit=(\d+)(?: read=(\d+))?', res_e, re.S)
+                scan_buffers = (int(m_buf.group(1)) + int(m_buf.group(2) or 0)) if m_buf else None
+                # the rows of one vector are all at distance 0: the 250 first answers hold every one of them that is an answer at all
+                rc_k, res_k = c.q(f"SET enable_seqscan = off; SELECT id FROM gc ORDER BY v <-> (SELECT v FROM gc WHERE id = {stay}) LIMIT 250") if stay is not None else (1, 'no row')
+                rc_g, res_g = (c.q(f"SET enable_seqscan = off; SELECT id FROM gc ORDER BY v <-> (SELECT v FROM gc_deleted WHERE id = {gone}) LIMIT 250")
+                               if gone is not None else (1, 'no row'))
                 (gate / 'vacuum_go').write_text('')
                 th.join()
                 (gate / 'vacuum_armed').unlink()
                 st_end = json.loads(c.scalar("SELECT pg_cuvs_hnsw_cover_status('gci')::text"))
                 check('V1c the VACUUM reached the point between the transition and pgvector', reached)
                 check('V1c there the index is LOST (vacuum), not in force', st_mid.get('class') == 'lost' and st_mid.get('stored_reason') == 4 and st_mid.get('guarantee_in_force') is False, str(st_mid))
-                check('V1c a scan there answers exactly from the heap', rc_s == 0 and 'answers from the heap' in res_s, res_s[-300:])
+                # the index is LOST because the graph is about to change, but its ledger reads: the scan answers from the graph and the ledger (no
+                # ranking of the whole heap, which made a search 180 times slower for the length of the VACUUM), and a row only the ledger holds is found.
+                # This is the one state that CUVS_COVER_MERGE_DURING_VACUUM in src/cuvs_hnsw_scan.c decides (a user decision: merge only
+                # while that VACUUM runs; V1d checks the heap ranking after it): with it false these three checks expect the heap ranking instead.
+                check('V1c a scan there answers from the graph and the ledger, not from the heap', rc_s == 0 and 'answers from the heap' not in res_s, res_s[-300:])
+                check('V1c and the scan reads about what it read before the VACUUM (%s against %s buffers; the whole heap ranked would be far more on a large table)' % (scan_buffers, buffers_before),
+                      scan_buffers is not None and buffers_before is not None and scan_buffers <= 2 * buffers_before + 10, res_e[-400:])
+                check('V1c a row the graph cannot reach and the ledger holds is an answer of a search with its own vector there', rc_k == 0 and str(stay) in res_k.split(), f'{stay} {res_k[-120:]}')
+                check('V1c a deleted row whose key is in the ledger is not an answer there', gone is not None and rc_g == 0 and str(gone) not in res_g.split(), f'{gone} {res_g[-200:]}')
                 check('V1c and the VACUUM ends with the index certified again', box and box[0][0] == 0 and st_end.get('class') == 'certified', str((box, st_end)))
+
+                # V1d: a VACUUM that ends normally but whose recertification at the end is deferred leaves the index LOST with the reason
+                # vacuum. The merge is only for the time that VACUUM runs: after it, the search is the exact ranking of the heap with its notice.
+                # An insert held at the "insert" gate holds the cover lock in share mode, so the end-of-VACUUM recertification cannot take it
+                # (at most 2 s) and is deferred.
+                c.scalar('CREATE TABLE gd(id int, v vector(8))')
+                c.scalar('CREATE INDEX gdi ON gd USING pg_cuvs_hnsw (v vector_l2_ops)')
+                c.scalar(clustered('gd', 400))			# built on an empty table: every row is a ledger key
+                c.scalar('DELETE FROM gd WHERE id % 5 = 0')
+                (gate / 'insert_armed').write_text('')
+                box_i = []
+                th_i = threading.Thread(target=lambda: box_i.append(c.q("INSERT INTO gd VALUES (99999, '[9,9,9,9,9,9,9,9]')")))
+                th_i.start()
+                for _ in range(300):
+                    if (gate / 'insert_reached').exists():
+                        break
+                    time.sleep(0.1)
+                held_i = (gate / 'insert_reached').exists()
+                rc_v, res_v = c.q('VACUUM gd')
+                st_d = json.loads(c.scalar("SELECT pg_cuvs_hnsw_cover_status('gdi')::text"))
+                (gate / 'insert_go').write_text('')
+                th_i.join()
+                (gate / 'insert_armed').unlink()
+                for f in ('insert_go', 'insert_reached'):
+                    (gate / f).unlink(missing_ok=True)
+                rc_d, res_d = c.q("SET enable_seqscan = off; SELECT id FROM gd ORDER BY v <-> (SELECT v FROM gd WHERE id = 1) LIMIT 20")
+                rc_h, res_h = c.q("SET enable_indexscan = off; SET enable_bitmapscan = off; SELECT id FROM gd ORDER BY v <-> (SELECT v FROM gd WHERE id = 1) LIMIT 20")
+                check('V1d setup: an insert held the cover lock, and the VACUUM ended with its recertification deferred (LOST, reason vacuum)',
+                      held_i and rc_v == 0 and st_d.get('class') == 'lost' and st_d.get('stored_reason') == 4 and 'recertification of index "gdi" by vacuum: deferred' in server_log(c), f'{held_i} {res_v[-200:]} {st_d}')
+                check('V1d after that VACUUM the search answers exactly from the heap, with the notice', rc_d == 0 and 'answers from the heap' in res_d
+                      and [x for x in res_d.split('\n') if x.isdigit()] == [x for x in res_h.split('\n') if x.isdigit()], f'{res_d[-300:]} / {res_h[-120:]}')
+
+                # V1e (parallel VACUUM): ambulkdelete records the VACUUM's leader (lockGroupLeader), so that an index vacuumed by a
+                # parallel worker that ends before the VACUUM does is still merged while the VACUUM runs. Six VACUUMs (PARALLEL 2, two btree indexes
+                # beside the cover index): each search during the held VACUUM must merge (with hnsw.ef_search = 1 the 50 rows of the exact ranking,
+                # which only the ledger can give, and no heap notice). On the server (2026-11-21, pgvector 0.8.x) two parallel workers ran every time
+                # and the leader vacuumed the cover index every time (12 of 12, the cover index created first or last): pgvector's hnsw does not
+                # seem to offer parallel bulk deletion, so the worker branch is not reached; which process recorded it is kept as information.
+                attempts, in_worker, merged_all = [], 0, True
+                c.scalar('ALTER SYSTEM SET log_min_messages = debug1')
+                c.scalar('SELECT pg_reload_conf()')
+                for att in range(6):
+                    t = f'gp{att}'
+                    c.scalar(f'CREATE TABLE {t}(id int, v vector(8))')
+                    # the leader takes the indexes in order too: the cover index comes last, so that a worker can be the one that takes it
+                    c.scalar(f'CREATE INDEX {t}_b1 ON {t} (id)')
+                    c.scalar(f'CREATE INDEX {t}_b2 ON {t} (id DESC)')
+                    c.scalar(f'CREATE INDEX {t}_i ON {t} USING pg_cuvs_hnsw (v vector_l2_ops)')
+                    c.scalar(clustered(t, 400))				# every row is a ledger key
+                    c.scalar(f'DELETE FROM {t} WHERE id % 5 = 0')
+                    oid_e = c.scalar(f"SELECT '{t}_i'::regclass::oid").strip().splitlines()[-1]
+                    mark_e = len(server_log(c))
+                    for f in ('vacuum_reached', 'vacuum_go'):
+                        (gate / f).unlink(missing_ok=True)
+                    (gate / 'vacuum_armed').write_text('')
+                    box_e = []
+
+                    def vac_e(t=t):
+                        # VACUUM cannot run in the transaction block of a multi-statement string: the settings go in PGOPTIONS
+                        r = subprocess.run(c.psql_cmd() + ['-c', f'VACUUM (PARALLEL 2, VERBOSE) {t}'], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                                           env=dict(os.environ, PGOPTIONS='-c min_parallel_index_scan_size=0 -c max_parallel_maintenance_workers=2'))
+                        box_e.append((r.returncode, r.stdout))
+                    th_e = threading.Thread(target=vac_e)
+                    th_e.start()
+                    for _ in range(300):
+                        if (gate / 'vacuum_reached').exists():
+                            break
+                        time.sleep(0.1)
+                    held_e = (gate / 'vacuum_reached').exists()
+                    q_e = f"SELECT id FROM {t} ORDER BY v <-> (SELECT v FROM {t} WHERE id = 1) LIMIT 50"
+                    rc_m, res_m = c.q(f'SET enable_seqscan = off; SET hnsw.ef_search = 1; {q_e}')
+                    rc_o, res_o = c.q(f'SET enable_indexscan = off; SET enable_bitmapscan = off; {q_e}')
+                    (gate / 'vacuum_go').write_text('')
+                    th_e.join()
+                    (gate / 'vacuum_armed').unlink()
+                    for f in ('vacuum_go', 'vacuum_reached'):
+                        (gate / f).unlink(missing_ok=True)
+                    rec = [l for l in server_log(c)[mark_e:].splitlines() if f'index {oid_e} taken off by a VACUUM' in l]
+                    m_e = re.search(r'process (\d+), VACUUM leader (\d+)', rec[-1]) if rec else None
+                    worker = bool(m_e) and m_e.group(1) != m_e.group(2)
+                    ids_m = [x for x in res_m.split('\n') if x.isdigit()]
+                    ok_m = held_e and rc_m == 0 and 'answers from the heap' not in res_m and len(ids_m) == 50 and ids_m == [x for x in res_o.split('\n') if x.isdigit()]
+                    pw = re.findall(r'launched \d+ parallel vacuum workers? for index \w+ \(planned: \d+\)', box_e[0][1]) if box_e else []
+                    attempts.append({'held': held_e, 'in_parallel_worker': worker, 'merged': ok_m, 'vacuum_rc': box_e[0][0] if box_e else None,
+                                     'record': rec[-1][-90:] if rec else None, 'parallel_workers': pw})
+                    merged_all &= ok_m
+                    in_worker += worker
+                check('V1e (information) parallel workers ran, and the cover index was vacuumed by a parallel worker in %d of %d VACUUMs' % (in_worker, len(attempts)),
+                      all(a['parallel_workers'] for a in attempts), str(attempts))
+                c.scalar('ALTER SYSTEM RESET log_min_messages')
+                c.scalar('SELECT pg_reload_conf()')
+                check('V1e and in every attempt the search merged the graph and the ledger while that VACUUM ran', merged_all, str(attempts))
 
             # V2
             c.scalar('CREATE TABLE q(id int, v vector(8))')
@@ -206,19 +333,22 @@ def main():
             c.scalar('CHECKPOINT')
             check('V2 the threshold is measured from the new certification: 50 keys (2.4 percent) do not trigger another one', descriptor_full(qpath)['generation'] == dq2['generation'])
 
-            # V2b: the percent clause. The covered row count is part of the descriptor; set it by hand (crc recomputed) to a size where
-            # 10500 keys are 1% and then 10.5%
-            def set_base_rows(n):
+            # V2b: the percent clause of the keys. The covered row count is part of the descriptor; set it by hand (crc recomputed) to a size where
+            # 10500 keys are 1% and then 10.5%. The pages the certification covered are set high as well, so that the clause of the pages (the
+            # relation grew by 5 percent since the certification) does not take the index first
+            def set_base_rows(n, nblocks_at_cert=None):
                 c.stop()
                 data = bytearray(qpath.read_bytes())
                 upper = struct.unpack_from('<H', data, 14)[0]
                 struct.pack_into('<Q', data, upper + 40, n)
+                if nblocks_at_cert is not None:
+                    struct.pack_into('<I', data, upper + 36, nblocks_at_cert)
                 struct.pack_into('<I', data, upper + 180, dg.crc32c(bytes(data[upper:upper + 180])))
                 qpath.write_bytes(bytes(data))
                 c.start()
 
             gen_before = descriptor_full(qpath)['generation']
-            set_base_rows(1000000)
+            set_base_rows(1000000, nblocks_at_cert=1000000)
             c.scalar(clustered('q', 10500).replace('SELECT x,', 'SELECT 50000 + x,'))
             s = dg.Session(c)
             s.run('SET client_min_messages = debug1')

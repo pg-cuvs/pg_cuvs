@@ -59,6 +59,17 @@ enum {
 
 #define CUVS_COVER_FLAG_HEAD_WITNESS 0x0001u
 #define CUVS_COVER_FLAG_SUSPECT_UNKEYED_WRITER 0x0002u
+/*
+ * whether anything was inserted since the certification in force (keys count by themselves; these two cover an insert the
+ * verification found reachable, which writes no key, into a page that was there). INSERTED: since cert_time. INSERTED_SINCE_START: since
+ * phase 1 of the recertification that runs now, whose cert_time that will be; phase 1 clears it, publication copies it into INSERTED. An insert
+ * writes block 0 only when one of the two is missing: once per certification and once per recertification, not once per insert. A reader of the
+ * same format_version that does not know the bits ignores them (cuvs_cover_classify looks only at SUSPECT), and an older library's
+ * recertification keeps them (it clears only SUSPECT): the next sweep walks the index once more and finds it quiet.
+ */
+#define CUVS_COVER_FLAG_INSERTED 0x0004u
+#define CUVS_COVER_FLAG_INSERTED_SINCE_START 0x0008u
+#define CUVS_COVER_INSERT_FLAGS (CUVS_COVER_FLAG_INSERTED | CUVS_COVER_FLAG_INSERTED_SINCE_START)
 
 /* The descriptor. Offsets are fixed by the static assertions below. */
 typedef struct CuvsCoverDescriptor {
@@ -86,15 +97,15 @@ typedef struct CuvsCoverDescriptor {
 	uint32_t last_fail_status;		/* 100  its CuvsReachStatus */
 	uint64_t last_fail_limit;		/* 104  RAM + spill limit it had */
 	uint64_t last_fail_needed;		/* 112  what it estimated it needed */
-	uint8_t reserved1[8];			/* 120  reserved for a later library. Everything in 120..179 that this version does not name belongs to one certification: a library that publishes
-						 *      a certification (edit_publish) writes zeros there, and every other rewrite of the descriptor keeps the bytes as they are */
+	int64_t cert_published_time;		/* 120  TimestampTz the recertification was published; 0 if the certification was not made by one (a build, or this field did not exist: a library that
+						 *      publishes a certification writes the time, one that does not know the field writes zeros) */
 	uint64_t cert_dropped_keys;		/* 128  keys written after the certification began (during the walk of the recertification that made it) whose row the walk listed itself:
 						 *      the key was not carried over (the row is a BASE key), but the insert is still an insert since the certification and counts as one; 0 for a build */
 	uint32_t pending_head;			/* 136  first block of the new ledger chain of a recertification that has written its pages and not published them (0 if none): the pages
 						 *      are in no other chain, and the next recertification takes them back (an abandoned or cancelled one leaves them here) */
 	uint32_t reserved2;			/* 140 */
 	uint64_t pending_generation;		/* 144  the generation of the pages of that chain */
-	uint8_t reserved3[28];			/* 152 */
+	uint8_t reserved3[28];			/* 152  everything in 120..179 that a version does not name belongs to one certification: the publication writes zeros there, every other rewrite keeps the bytes */
 	uint32_t crc32c;			/* 180 */
 } CuvsCoverDescriptor;
 
@@ -122,7 +133,7 @@ _Static_assert(offsetof(CuvsCoverDescriptor, last_fail_nblocks) == 96, "last_fai
 _Static_assert(offsetof(CuvsCoverDescriptor, last_fail_status) == 100, "last_fail_status offset");
 _Static_assert(offsetof(CuvsCoverDescriptor, last_fail_limit) == 104, "last_fail_limit offset");
 _Static_assert(offsetof(CuvsCoverDescriptor, last_fail_needed) == 112, "last_fail_needed offset");
-_Static_assert(offsetof(CuvsCoverDescriptor, reserved1) == 120, "reserved1 offset");
+_Static_assert(offsetof(CuvsCoverDescriptor, cert_published_time) == 120, "cert_published_time offset");
 _Static_assert(offsetof(CuvsCoverDescriptor, cert_dropped_keys) == 128, "cert_dropped_keys offset");
 _Static_assert(offsetof(CuvsCoverDescriptor, pending_head) == 136, "pending_head offset");
 _Static_assert(offsetof(CuvsCoverDescriptor, pending_generation) == 144, "pending_generation offset");
@@ -267,6 +278,7 @@ typedef struct CuvsCoverResult {
 	uint32_t ledger_head;
 	uint32_t ledger_tail;
 	uint64_t generation;
+	uint16_t flags;					/* descriptor.flags, for CERTIFIED and LOST */
 } CuvsCoverResult;
 
 static inline void
@@ -364,6 +376,7 @@ cuvs_cover_classify(const uint8_t *meta, const uint8_t *head, CuvsCoverResult *o
 		out->ledger_head = d.ledger_head;
 		out->ledger_tail = d.ledger_tail;
 		out->generation = d.generation;
+		out->flags = d.flags;
 		return;
 	case CUVS_COVER_STATE_CERTIFIED:
 		if (d.generation == 0 || d.ledger_head == CUVS_COVER_INVALID_BLOCK) {
@@ -381,6 +394,7 @@ cuvs_cover_classify(const uint8_t *meta, const uint8_t *head, CuvsCoverResult *o
 		out->ledger_head = d.ledger_head;
 		out->ledger_tail = d.ledger_tail;
 		out->generation = d.generation;
+		out->flags = d.flags;
 		return;
 	default:
 		cuvs_cover_set_untrusted(out, CUVS_COVER_UNTRUSTED_DESCRIPTOR_CORRUPT);

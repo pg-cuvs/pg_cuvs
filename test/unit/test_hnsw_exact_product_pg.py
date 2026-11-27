@@ -13,6 +13,8 @@ import json
 import re
 import subprocess
 import threading
+
+import hnsw_exact_cover_hold as cover_hold
 from test_connectivity_pg_interrupts import Session
 
 def main():
@@ -43,6 +45,7 @@ def main():
     transcript = []
     result = {'scope': 'installed pg_cuvs/vector CPU PG16; explicit D', 'candidate_sha256': library_sha, 'pgvector_library_sha256': hashlib.sha256((library_dir / 'vector.so').read_bytes()).hexdigest(), 'cases': []}
     a = b = None
+    held = False
 
     def ask(c, sql):
         sql = sql.replace('review_ops.', schema + '.').replace('CREATE SCHEMA review_ops;', 'CREATE SCHEMA ' + schema + ';')
@@ -88,6 +91,10 @@ def main():
         # with a partial index whose predicate is a user function: the older one serves the index, the new one never chooses it.
         cover_mode = ask(a, "SELECT prosrc FROM pg_proc WHERE proname='pg_cuvs_hnsw_handler';")[-1].endswith('_c1p')
         result['handler'] = 'cover (pg_cuvs_hnsw_handler_c1p)' if cover_mode else 'older symbol (pg_cuvs_hnsw_handler)'
+        if cover_mode:
+            # the cover cases below rest on every inserted row being a ledger key: no background recertification during the run
+            cover_hold.hold(lambda q: ask(a, q))
+            held = True
         result['extension_versions'] = versions
         result['source_sha256'] = {str(f): hashlib.sha256(f.read_bytes()).hexdigest() for f in [repo / 'src/cuvs_hnsw_scan.c', repo / 'src/cuvs_hnsw_exact.c', Path(__file__)]}
         ask(a, 'CREATE SCHEMA review_ops; CREATE OPERATOR CLASS review_ops.vector_ip_ops FOR TYPE vector USING pg_cuvs_hnsw AS OPERATOR 1 <#> (vector,vector) FOR ORDER BY float_ops,FUNCTION 1 vector_negative_inner_product(vector,vector); CREATE OPERATOR CLASS review_ops.vector_cosine_ops FOR TYPE vector USING pg_cuvs_hnsw AS OPERATOR 1 <=> (vector,vector) FOR ORDER BY float_ops,FUNCTION 1 vector_negative_inner_product(vector,vector),FUNCTION 2 vector_norm(vector);')
@@ -121,6 +128,7 @@ def main():
             bq = "SELECT id FROM review_ops.parallel_builtin WHERE id>0 ORDER BY v <-> '[0,0]'::vector"
             bplan = json.loads('\n'.join(ask(a, 'EXPLAIN(FORMAT JSON,COSTS OFF) ' + bq + ';')))[0]['Plan']
             assert any(n.get('Index Name') == 'parallel_bi' for n in nodes(bplan)), bplan
+            cover_hold.assert_not_recertified(lambda q: ask(a, q), schema, {'parallel_bi'}, 'builtin_partial_index_answered_exactly_in_a_parallel_plan')
             got = js(a, "SELECT jsonb_agg(x ORDER BY ord) FROM(SELECT id, row_number() OVER () ord FROM(" + bq + ")y)x;")
             ask(a, 'SET debug_parallel_query=off;SET enable_indexscan=off;SET enable_bitmapscan=off;SET enable_seqscan=on;')
             want = js(a, "SELECT jsonb_agg(x ORDER BY ord) FROM(SELECT id, row_number() OVER () ord FROM(" + bq + ")y)x;")
@@ -196,6 +204,8 @@ def main():
         # With the setting off, pgvector's graph does not hold the row with a NULL vector, so an index of the older handler returns 5 rows; an
         # index with a cover descriptor keeps every inserted row in its ledger and merges it in, so it returns the same 6 rows as the exact mode.
         for mode, want in [('off', 6 if cover_mode else 5), ('on', 6)]:
+            if cover_mode and mode == 'off':
+                cover_hold.assert_not_recertified(lambda q: ask(a, q), schema, {'rescan_i'}, 'exact_discriminating_parameterized_rescan')
             ask(a, 'SET cuvs.hnsw_exact_scan=' + mode + ';')
             actual = js(a, 'SELECT jsonb_agg(x) FROM(' + lateral + ')x;')
             assert all((sum((row['v'] == value for row in actual)) == want for value in ['[100,0]', '[102,0]'])), actual
@@ -214,6 +224,8 @@ def main():
         assert stats == {'custom': 1, 'generic': 0}, stats
         result['cases'].append({'name': 'actual_custom_plan', 'verdict': 'PASS', 'rows': actual, 'counts': stats})
         ask(a, 'SET plan_cache_mode=force_generic_plan; PREPARE g(vector) AS SELECT jsonb_agg(x) FROM(SELECT id FROM review_ops.rescan ORDER BY v <-> $1 LIMIT 6)x; SET cuvs.hnsw_exact_scan=off;')
+        if cover_mode:
+            cover_hold.assert_not_recertified(lambda q: ask(a, q), schema, {'rescan_i'}, 'actual_generic_plan')
         off = js(a, "EXECUTE g('[100,0]');")
         if cover_mode:
             assert len(off) == 6 and off[-1]['id'] == 5
@@ -266,6 +278,11 @@ def main():
         raise
     finally:
         if a:
+            if held:
+                try:
+                    cover_hold.release(lambda q: ask(a, q))
+                except Exception as e:
+                    result.setdefault('cleanup_error', repr(e))
             a.close()
         if b:
             b.close()

@@ -16,6 +16,8 @@ copy starts from. The gates let a test do what the timing of a real walk does no
   W1 (also) the inserts of the walk whose keys were not carried over still count as keys since the certification (cert_dropped_keys);
   W6 a descriptor with bytes in the reserved area that a later library version uses (published_at, and the rest) is read as it is (certified, in
      force); an insert and the take-off of a VACUUM keep the bytes; the publication of a new certification clears them.
+  W7 the status function reads the ledger without the cover lock: when recertifications replace the chain it read the descriptor of (gate
+     "status") and reuse that chain's pages, it reads the descriptor again and reports the chain in force (ledger_ok), not a damaged ledger.
 """
 import argparse
 import json
@@ -258,10 +260,46 @@ def main():
             after = raw()
             st_end = status(c, 'w2i')
             check('W6 the VACUUM ended with a new certification', box and box[0][0] == 0 and st_end.get('class') == 'certified', str(box))
-            check('W6 its publication cleared the bytes this version does not name (120..127, 152..179)', after[120:128] == bytes(8) and after[152:180] == bytes(28), after.hex())
+            check('W6 its publication cleared the bytes this version does not name (152..179) and replaced 120..127 (what was there before) by its own published_at',
+                  after[152:180] == bytes(28) and after[120:128] != marks['120..127'][2] and struct.unpack_from('<q', after, 120)[0] > 0 and 'published_at' in st_end, after.hex())
             check('W6 and set cert_dropped_keys itself (no insert ran during that walk: 0) and left no pending pages',
                   struct.unpack_from('<Q', after, 128)[0] == 0 and struct.unpack_from('<I', after, 136)[0] == 0 and dg.crc32c(after[:180]) == struct.unpack_from('<I', after, 180)[0],
                   f'dropped {struct.unpack_from("<Q", after, 128)[0]}')
+
+            # W7: the status function and recertifications that replace the chain under it
+            c.scalar('CREATE TABLE w3(id int, v vector(8))')
+            c.scalar('CREATE INDEX w3i ON w3 USING pg_cuvs_hnsw (v vector_l2_ops)')
+            c.scalar(f"INSERT INTO w3 SELECT x, {CONST} FROM generate_series(1, 3000) x")
+            c.scalar("SELECT pg_cuvs_cover_recertify('w3i')")
+            w3path = c.data / c.scalar("SELECT pg_relation_filepath('w3i')")
+            st0 = status(c, 'w3i')
+            for f in gate.iterdir():
+                f.unlink()
+            (gate / 'status_armed').write_text('')
+            box = []
+            th = threading.Thread(target=lambda: box.append(c.q("SELECT pg_cuvs_hnsw_cover_status('w3i')::text")))
+            th.start()
+            held = wait_for(gate / 'status_reached')
+            try:
+                for k in range(3):			# the second publication frees the first chain's pages, the third writes them again
+                    c.scalar(f"INSERT INTO w3 SELECT 100000 * {k + 1} + x, {CONST} FROM generate_series(1, 400) x")
+                    c.scalar("SELECT pg_cuvs_cover_recertify('w3i')")
+                c.scalar('CHECKPOINT')
+                with open(w3path, 'rb') as f:
+                    f.seek(8192 * st0['ledger_head'])
+                    page = f.read(8192)
+                magic, version, kind, old_head_gen, first, count, seen, crc = struct.unpack_from('<IHHQQIII', page, 24)		# the ledger page header
+                now = status(c, 'w3i').get('generation')
+            finally:
+                (gate / 'status_go').write_text('')
+                th.join()
+                (gate / 'status_armed').unlink()
+            st_held = jres(*box[0]) if box else {}
+            check('W7 the status call waited at its gate while three recertifications ran, and the head page of the chain it had read is a ledger page '
+                  'of a later generation now', held and magic == 0x4C45444C and crc == dg.crc32c(page[24:56]) and old_head_gen > st0.get('generation', 0),
+                  f'head {st0.get("ledger_head")}: magic {magic:#x} gen {old_head_gen}, before {st0.get("generation")}, now {now}')
+            check('W7 the status call that read the descriptor before the recertifications reports the chain in force, which reads',
+                  st_held.get('ledger_ok') is True and st_held.get('generation') == now, str(st_held))
         finally:
             c.drop()
     finally:

@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Try to reproduce a backend SIGBUS the independent review saw once (REVIEW-INDEP-COVER-af8d48e1 R6-7a): a table of 100,000 rows that all
 hold the same vector, a ledger of about 91,640 keys (an index filled by inserts, never recertified), 100 more inserts, then
-EXPLAIN (ANALYZE) of ordered scans. Runs the same configuration a number of times, with parallel statements; reports every server process that died by a signal. Prints JSON.
+EXPLAIN (ANALYZE) of ordered scans. Runs the same configuration a number of times, optionally with the background worker on and with a
+small /dev/shm-like pressure from parallel statements; reports every server process that died by a signal. Prints JSON.
 """
 import argparse
 import json
@@ -24,6 +25,7 @@ def main():
     ap.add_argument('--port', type=int, default=5851)
     ap.add_argument('--rows', type=int, default=100000)
     ap.add_argument('--queries', type=int, default=300)
+    ap.add_argument('--worker', action='store_true', help='leave the background recertification on')
     args = ap.parse_args()
     out = args.output.resolve()
     out.mkdir(parents=True, exist_ok=False)
@@ -32,6 +34,7 @@ def main():
     try:
         o = dg.Overlay(root, args.new_lib.resolve(), args.old_lib.resolve(), repo / 'sql', repo / 'pg_cuvs.control')
         c = dg.Cluster(o, 'sb', out, args.port)
+        c.auto_recert = args.worker
         c.extra_opts = '-c autovacuum=off -c max_parallel_maintenance_workers=0 -c shared_buffers=256MB -c max_wal_size=2GB'
         try:
             o.install('new')

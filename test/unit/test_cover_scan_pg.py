@@ -145,6 +145,20 @@ def main():
                 plant_mode(path, mode)
                 compare_exact(t, label, notice)
 
+            # S2b: a LOST index whose chain reads, for a reason other than a VACUUM (here the downgrade mark of
+            # pg_cuvs_cover_invalidate_all(), before an older library writes to the index), is answered from the heap, exactly, with a notice: for
+            # such a reason the ledger is known not to hold every row the graph may miss. The merge of a LOST index is kept only for one that a VACUUM
+            # took off (cover_vacuum_merge in src/cuvs_hnsw_scan.c). Built on an empty table, so all 300 rows are ledger keys and a merge would give
+            # no notice: the notice is what tells the two apart. The mark also takes ei (S1, S3) off, which nothing below reads.
+            c.scalar('CREATE TABLE h_dg(id int, v vector(3))')
+            c.scalar('CREATE INDEX h_dgi ON h_dg USING pg_cuvs_hnsw (v vector_l2_ops)')
+            c.scalar('INSERT INTO h_dg SELECT g, ARRAY[g, g % 7, g % 3]::real[]::vector FROM generate_series(1, 300) g')
+            c.scalar('SELECT pg_cuvs_cover_invalidate_all()')
+            st = json.loads(c.scalar("SELECT pg_cuvs_hnsw_cover_status('h_dgi')::text"))
+            check('S2b the downgrade mark leaves the index LOST with a chain that reads', st.get('class') == 'lost' and st.get('ledger_ok') is True
+                  and st.get('ledger_keys') == 300, str(st))
+            compare_exact('h_dg', 'S2b LOST (downgrade) whose chain reads', True)
+
             # S4
             c.make_index('h_legacy', 'h_legacyi')
             rc, res = c.q("SET enable_seqscan = off; SELECT count(*) FROM (SELECT id FROM h_legacy ORDER BY v <-> '[1,1,1]' LIMIT 15) x")

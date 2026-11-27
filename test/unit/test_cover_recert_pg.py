@@ -321,8 +321,8 @@ def main():
                 late_tids = {tuple(int(x) for x in t.strip('()').split(',')) for t in late}
                 check('C7 the gate was reached', reached)
                 st7 = json.loads(c.scalar("SELECT pg_cuvs_hnsw_cover_status('pi')::text"))
-                ts7 = c.scalar(f"SELECT '{st7.get('certified_at')}'::timestamptz < '{last_insert_at[0]}'::timestamptz")
-                check('C7 certified_at is the start of the recertification (before the insert that ran while its new chain waited)', ts7 == 't', str(st7) + ' insert at ' + str(last_insert_at[0]))
+                ts7 = c.scalar(f"SELECT '{st7.get('certified_at')}'::timestamptz < '{last_insert_at[0]}'::timestamptz AND '{last_insert_at[0]}'::timestamptz < '{st7.get('published_at')}'::timestamptz")
+                check('C7 certified_at is the start of the recertification (before the insert that ran while its new chain waited) and published_at is its publication (after it)', ts7 == 't', str(st7) + ' insert at ' + str(last_insert_at[0]))
                 check('C7 the keys since the certification are the 200 inserted after it began, the ones the walk did not cover (they count toward the 5 percent)', st7.get('keys_since_certification') == 200, str(st7))
                 check('C7 the recertification finished', rc == 0 and '"result": "done"' in res, res)
                 check('C7 the 200 rows inserted while the new chain waited have their keys in the published chain', late_tids <= have, f'{len(late_tids - have)} missing')

@@ -1488,9 +1488,13 @@ recall almost entirely). An index created under 0.9.3 therefore carries a *cover
 of heap TIDs on pages outside the graph chain. A search of a certified index combines the graph's answers with every ledger
 key and ranks the merged set by exact distance over MVCC-visible heap rows.
 
-**What is guaranteed.** Rows the graph could not reach at the last certification, and every row inserted after it, are
-always candidates of a search of that index. A row that was reachable at the last certification and that a later insert cuts
-off from the graph is outside the guarantee until the next recertification. How many rows that is depends on the graph's degree and on the data (measured below:
+**What is guaranteed.** Rows the graph could not reach at the last certification are always candidates of a search of that
+index. An inserted row is searched for with its own vector right after pgvector inserts it (`cuvs.cover_verify_inserts`, on by
+default): a row the search finds was reachable at that moment and gets no ledger key; a row it does not find gets a key and is
+always a candidate. A row that was reachable, at the last certification or when its insert was verified, and that a later insert
+or the graph repair of a `VACUUM` cuts off from the graph is outside the guarantee until the next recertification, as a row of a
+plain pgvector index is (which has no ledger that would still return it). With `cuvs.cover_verify_inserts = off` every row
+inserted after the certification gets a key and is always a candidate, at the cost described below. How many rows that is depends on the graph's degree and on the data (measured below:
 none to 1.4 percent of the original rows on a strongly clustered test table); a plain pgvector index loses rows to its inserts in the same way, and has no ledger that would still return them. The next recertification is made by the
 cleanup step of a `VACUUM` (once the keys since the certification pass 5 percent of the rows it covered, and after a `VACUUM` that removed rows took the index off), by `pg_cuvs_cover_recertify()`, or by `REINDEX`.
 "Last certification" means the moment the recertification *started* (the instant it holds the cover lock exclusively and
@@ -1498,7 +1502,16 @@ no insert is in flight). The walk is not a snapshot: it reads the pages one afte
 later inserts, and a row such an insert cuts off from the graph, after the walk counted it as reached, is
 outside the guarantee until the next recertification. `certified_at` in the status function is that instant.
 
-**What this costs while no recertification runs.** Every insert adds one key to the ledger, and every search of a certified index reads the whole ledger and
+**What the guarantee assumes.** A search reaches what pgvector's search reaches: it descends through the upper layers and walks level 0
+from where the descent ends. An index built with `mode = 'nsw'` before 0.9.3 has no upper layers, and rows inserted into it afterwards can
+hide the rows the build wrote while the index stays `certified`: on 100,000 wiki_all rows built that way, after 2,000 rows of another
+distribution were inserted, 59 of 60 sampled queries missed all ten of their nearest rows with the status `certified` (one A100 host,
+PGDATA on a virtual disk). On a build with upper layers the same inserts left none of the 60 queries with a miss (0 of 600
+nearest rows), also with the status `certified`. `pg_cuvs_hnsw_layer_status()` names the indexes without upper layers, and
+`REINDEX INDEX` rebuilds them with upper layers. The regression `cover_insert_shift` (GPU) checks it.
+
+**What this costs while no recertification runs.** With `cuvs.cover_verify_inserts = off` every insert adds one key to the ledger; with the
+default only an insert that the search for its own vector does not find adds one. Every search of a certified index reads the whole ledger and
 ranks its rows exactly, so the time of a search grows with the number of inserts since the last certification. Measured (100,000 rows of 96 dimensions, warm cache, the
 ledger at 0.03, 0.3 and 3 percent of the rows): the 95th percentile of a search is 1.03, 1.04 and 1.47 times that of an index with no ledger keys. `keys_since_certification`
 and `recertify_recommended` (set once the keys pass 5 percent of the rows the certification covered) in the status function show it.
@@ -1553,7 +1566,8 @@ list most of a clustered graph as unreachable (measured on 20,000 rows of 16 dim
 wider definition: a row that only an upper-layer slot leads to is not in the ledger, and a search finds it only when its descent ends on it. Graphs of m = 8 or more built from random
 vectors had no such row; at m = 4 there were 30 in 20,000 and an ordered scan by their own vectors found one of them (`test/unit/measure_upper_layer_reach.py`). Indexes built before 0.9.3 (class
 `legacy`) keep the old behavior. Indexes whose recertification failed, that a VACUUM changed since, or whose ledger does
-not read are answered from the heap (see the table), not from the graph.
+not read are answered from the heap (see the table), not from the graph. The one exception is the time a VACUUM really runs on an index
+whose guarantee it took off: then the graph's answers and the ledger are merged as for a certified index (a user decision; see `lost` below).
 
 **Row-level security, security barriers, index expressions and partial indexes, for an index with a descriptor** (the setting
 `cuvs.hnsw_exact_scan` off). By default no such statement ends in an error because of the index. What answers depends on the shape,
@@ -1561,10 +1575,10 @@ and the answer is as exact as the state of the index allows:
 
 | Index | Statement without row-level security | Statement with row-level security or a security barrier |
 |---|---|---|
-| plain column | the merge (certified) or the heap ranking (lost), as above | the same: the ranking applies the operator class's own distance function to a stored vector, as an index scan does for the rows that are hidden, and the executor applies the policy to the rows that come out, so a hidden row never comes back |
+| plain column | the merge (certified, or lost while its VACUUM runs) or the heap ranking (lost otherwise), as above | the same: the ranking applies the operator class's own distance function to a stored vector, as an index scan does for the rows that are hidden, and the executor applies the policy to the rows that come out, so a hidden row never comes back |
 | expression or partial | the same; the expression and the predicate are evaluated by the scan as the role that reads (no change of user) | the planner does not choose the index, and PostgreSQL's Seq Scan + Sort answers (slower, exact) |
 
-How many rows come back when the policy hides some depends on the state. The heap ranking (a lost or untrusted index) ranks every
+How many rows come back when the policy hides some depends on the state. The heap ranking (a lost index whose VACUUM does not run, or an untrusted one) ranks every
 visible row, so `LIMIT` is filled from the rows the policy shows. The merge of a certified index ranks the graph's own answers
 (about `hnsw.ef_search` of them, as with pgvector alone) and the ledger keys, and the policy is applied to that set afterwards: when it
 hides part of the set, fewer than `LIMIT` rows come back, exactly as with pgvector alone. The guarantee of the merge is the one in the
@@ -1622,7 +1636,7 @@ for a role that bypasses row-level security as well, because the check looks at 
 | Class | Meaning | Scan |
 |---|---|---|
 | `certified` | the descriptor is valid and its ledger reads | graph answers merged with all ledger keys, ranked exactly; a ledger with no key is scanned as the plain graph |
-| `lost` | the guarantee was withdrawn (reason in `pending`: built without certification, a VACUUM changed the graph, rows inserted by an older library, a recertification gave up, a damaged ledger page, a downgrade, an emergency rollback) | exact ranking over the heap, with a NOTICE that names the reason and what certifies it again |
+| `lost` | the guarantee was withdrawn (reason in `pending`: built without certification, a VACUUM changed the graph, rows inserted by an older library, a recertification gave up, a damaged ledger page, a downgrade, an emergency rollback) | exact ranking over the heap, with a NOTICE that names the reason and what certifies it again. While the VACUUM that took the guarantee off still runs (its transaction, recorded by `ambulkdelete` in the sweeper's shared memory; the leader of a parallel VACUUM), the graph's answers and the ledger are merged as for `certified`, with no NOTICE: rows that the VACUUM's repair cuts off are outside until its recertification at the end. A VACUUM that was cancelled or crashed, or ended with that recertification deferred, skipped or abandoned, leaves the heap ranking. Without `pg_cuvs` in `shared_preload_libraries` nothing is recorded and a VACUUM's lost index is ranked from the heap. A standby cannot see the primary's VACUUM: its scans merge while the reason is `vacuum`, until the WAL of the primary's recertification reaches it (the end of that VACUUM, or the primary's next sweep after a deferred one: about `cuvs.cover_recertify_max_age / 10` plus the recertification) |
 | `untrusted` | the descriptor does not read, or was written by a newer pg_cuvs whose ledger this library cannot judge | exact ranking over the heap |
 | `off`, `legacy` | the descriptor says off, or the index was built before 0.9.3 and has none | as before 0.9.3 (approximate, no NOTICE) |
 | `not_built` | the index has no pages (what a failed `CREATE INDEX CONCURRENTLY` leaves) | not used; `DROP INDEX` or `REINDEX INDEX` it |
@@ -1636,15 +1650,64 @@ index stays `lost` with a NOTICE). `CREATE INDEX CONCURRENTLY` and `REINDEX INDE
 **Recertification.** `SELECT pg_cuvs_cover_recertify('idx')` (owner of the table) walks the graph without blocking
 inserts, writes a new ledger (rows the walk could not reach, then the keys of inserts that ran meanwhile) and publishes it
 with one WAL record. It waits for the cover lock in the lock manager's queue for at most `min(lock_timeout, 2 s)` and
-answers `deferred` if it cannot get the table and index locks without waiting. The walk gives way (`deferred`, nothing written) when another session starts to wait for a lock that conflicts with its table lock (`ALTER TABLE`, `DROP INDEX`, `REINDEX`), so that the statement, and every reader and writer queued behind it, does not wait for the whole walk. VACUUM does the same work, without giving way; a ledger that
+answers `deferred` if it cannot get the table and index locks without waiting. VACUUM does the same work; a ledger that
 does not read is rebuilt by it too. The walk's memory limit is taken from `maintenance_work_mem`; beyond it the walk may use an unlinked spill file (at most half of the
 free disk space, none under a finite `temp_file_limit`). A walk that does not fit leaves a `last_recertification_failure` in the
 status, and VACUUM does not retry it at the same relation size and limit. A recertification that is abandoned, deferred or cancelled after it wrote its new ledger pages leaves them as free pages for the next one (`reclaimed_pages` in its answer): repeated attempts do not grow the index. The answer of `pg_cuvs_cover_recertify` also has `reused_pages`, the phase times and the memory it used.
 
+**Settings** (`SIGHUP` unless the table says otherwise):
+
+| GUC | Default | Meaning |
+|---|---|---|
+| `cuvs.cover_auto_recertify` | `on` | recertify in the background (through the sweeper below) an index that is past the threshold, past `cuvs.cover_recertify_max_age`, or `lost`. Needs `pg_cuvs` in `shared_preload_libraries` (the request and candidate tables live in shared memory); without it nothing runs by itself and VACUUM and the function remain |
+| `cuvs.cover_recertify_threshold_percent` | `5` | keys written since the last certification, as a percent of the rows it covered, or pages added to the index since then, as a percent of the pages it had, beyond which VACUUM, the sweeper and the status function recommend a recertification (no minimum number of keys or pages) |
+| `cuvs.cover_recertify_min_interval` | `10 s` | after a background worker that certified nothing (or failed), the next one for the same index starts no sooner than this |
+| `cuvs.cover_recertify_max_workers` | `2` | recertification workers running at once in the whole server; an index never has two |
+| `cuvs.cover_verify_inserts` | `on` | `SUSET`, unlike the others. Search for each inserted row with its own vector right after the insert and write a ledger key only for a row the search does not find. Off writes a key for every row inserted after the certification (the 0.9.3 development default). Measured on one 900,000-row wiki_all index built on the GPU, the settings alternated on the same index (one A100 host, PGDATA on a virtual disk, not NVMe, 8 cores, `perf` not profiled): insert latency p50 4.3 to 4.7 ms on, 4.6 to 4.7 off and 4.7 to 5.6 with pgvector's own insert for one client, 8.9 to 13.5 ms for all three with eight clients; the three were not told apart |
+| `cuvs.cover_recertify_max_age` | `5min` | a certified index with at least one key written or one page added since its certification, however few, is recertified in the background once the certification began this long ago. It also sets the sweep period (a tenth of it). `0` turns this time rule off: the sweep (every 30 s then) still takes an index past the threshold or `lost`. Without the time rule an index that is inserted into below the threshold and then left alone would keep the rows those inserts cut off outside the ledger for good |
+
+No insert starts a worker: the sweeper (below) is the only thing that requests a background recertification. A request starts a worker
+when none runs for the index, its `cuvs.cover_recertify_min_interval` is over and the server runs fewer than
+`cuvs.cover_recertify_max_workers`; the worker recertifies, looks again while requests keep coming, waits up to one second for another
+and ends. It holds no table lock, snapshot or transaction between looks. An index past the threshold therefore waits for the next sweep
+(30 s with the default settings); `recertify_recommended`, `pending` and `recertify_scheduled_at` in the status say so.
+
+A worker is a session of its database. `DROP DATABASE`, `ALTER DATABASE ... SET TABLESPACE` and `CREATE DATABASE ... TEMPLATE` wait up to 5 s for
+the other sessions of the database to end and then fail ("is being accessed by other users"); PostgreSQL ends only autovacuum workers for
+them. A recertification worker steps aside instead: while such a command holds its lock on the database object, the worker leaves its walk and
+ends (it looks every 256 pages of the walk and in each of its waits, at most every 100 ms), the command goes on, and a later sweep starts the
+recertification again; the log says "stepped aside". A worker that cannot look in time still makes the command fail as before: one waiting
+for the cover lock in the lock manager (at most `min(lock_timeout, 2 s)`), or one held in a single read that takes several seconds. Another
+command that takes a conflicting lock on the database object (`ALTER DATABASE ... RENAME`) makes the worker step aside as well.
+
+**Time bound.** Even if an insert cuts a row off from the graph, the row appears in searches again within at most 5 minutes (`cuvs.cover_recertify_max_age`, counted from `certified_at`) plus the check
+period (a tenth of that, 30 s) plus the time of the recertification; `cuvs.cover_recertify_max_age = 0` turns the time bound off. It holds when the background workers can run (`pg_cuvs` in `shared_preload_libraries`,
+`cuvs.cover_auto_recertify` on, the primary server, a free `max_worker_processes` slot) and the recertification is not deferred or failing (a conflicting lock, a memory limit): a deferred one is tried
+again after `cuvs.cover_recertify_min_interval`, a failed one is not tried again at the same relation size and limit. Indexes that are due together share
+`cuvs.cover_recertify_max_workers` (2) workers: an index that waits for one adds the recertification times of the indexes served before it to its bound. The recertification time depends on the size of the index: 0.09 s at 100,000 rows and
+0.71 s at 500,000 rows of 96 dimensions (CPU container, idle); nothing larger was measured.
+
+**The sweeper.** A permanent worker (the *sweeper*, started with the server, not run on a standby) wakes every `cuvs.cover_recertify_max_age / 10`
+(at least 10 s, at most 5 min; 30 s when it is `0`) and sweeps while `cuvs.cover_auto_recertify` is on. It does not look at every database. It
+keeps a table of candidates in shared memory (1,024 entries): an index is written there by the first insert after its certification (which also
+marks the descriptor, see below; once per certification, not once per page or insert), and when a VACUUM or the growth monitor takes its guarantee
+off. A sweep keeps a candidate while a key, a page or that mark is there since its certification. At each sweep a short-lived
+worker of each database that has a candidate looks at its candidates; a database without one is not connected to. Once after the server starts, and once after
+the table overflowed, the sweep looks instead at every connectable database and every index of the access method (found through its operator classes). An
+index is taken when its guarantee was withdrawn (`lost`), when the keys or the pages added since its certification are past the threshold, or when at least
+one key, one page or one insert was added since its certification and the certification began `cuvs.cover_recertify_max_age` ago (not when it is `0`). An
+insert the verification found reachable writes no key and may add no page: the first insert after a certification marks the descriptor instead (one WAL
+record per certification, `inserted_since_certification` in the status), which also survives a restart, so the full sweep after it walks only indexes with a key,
+a page or that mark since their certification. The status shows
+`recertify_scheduled_at` for it. A candidate with nothing added since its certification is taken off the table and never walked. The requests go through
+the same slots, the same server-wide worker limit and the same hand-over between workers; a recertification that fails (for example over its memory limit) is
+not retried at the same relation size and limit, and a worker that ends with an error waits `cuvs.cover_recertify_max_age` (300 s when it is `0`) or until a sweep finds the index grown. The sweep reads the descriptor and the last ledger page of each candidate; the walk of a recertification costs
+about 0.09 s at 100,000 rows. Workers use `max_worker_processes` slots; with none free the request is dropped and the next sweep asks again.
+
 **Functions.** `pg_cuvs_hnsw_cover_status(index regclass) -> jsonb` (needs SELECT on the table): `class`, `writable`,
-`guarantee_in_force`, `guarantee` (only while in force), `certified_at`, `generation`, `base_rows`, `base_unreached`,
-`ledger_keys`, `ledger_ok`, `ledger_problem`, `keys_since_certification`, `recertify_recommended`, `pending`,
-`last_recertification_failure`, `handler_symbol`, `stored_reason`, `breakglass_marker`. `pg_cuvs_cover_recertify(index regclass) -> jsonb`:
+`guarantee_in_force`, `guarantee` (only while in force), `certified_at`, `published_at`, `generation`, `base_rows`, `base_unreached`,
+`ledger_keys`, `ledger_ok`, `ledger_problem`, `keys_since_certification`, `pages_since_certification`, `inserted_since_certification`, `recertify_recommended`, `pending`,
+`recertify_scheduled_at`, `last_recertification_failure`, `background_recertification`, `handler_symbol`, `stored_reason`, `breakglass_marker`. `pg_cuvs_cover_recertify(index regclass) -> jsonb`:
 `result` is `done`, `not_applicable`, `deferred`, `failed`, `skipped` or `abandoned`, with `detail`. `pg_cuvs_cover_breakglass()`
 is the emergency action when the package has to go back to the older library while the SQL stays at 0.9.3 (superuser; see
 [rollback-and-cleanup](playbooks/rollback-and-cleanup.md)). `pg_cuvs_cover_invalidate_all()` is called by the
@@ -1666,6 +1729,7 @@ Inserts prune neighbors with that `m` and with the `ef_construction` reloption (
 
 **Not verified.** GPU-built indexes over existing rows (the CPU environment has no CAGRA daemon), including
 `certify_after_build` failing and `CREATE/REINDEX INDEX CONCURRENTLY` over rows; read latency at 1M rows and above, at 768
-dimensions and with a cold cache; the exposure to cut-off rows on strongly clustered data of other shapes than the one table measured, and on graphs converted from a CAGRA graph; one backend `SIGBUS` seen once on a table of identical vectors that three
+dimensions and with a cold cache; the exposure to cut-off rows on strongly clustered data of other shapes than the one table measured, and on graphs converted from a CAGRA graph; several databases requesting recertification at once; a server shutdown while a worker runs; `SIGTERM` during a
+walk (the worker looks at it between looks); one backend `SIGBUS` seen once on a table of identical vectors that three
 attempts could not reproduce; a slow start of the server seen now and then under load (not reproduced, cause not established); recertification time above 500,000 rows (a 1,000,000-row build in the 5.9 GB test VM ended
 when the server was shut down immediately during the index build, cause not established, so the walk time at that size is not measured; 0.11 s at 100,000 and 0.70 s at 500,000 rows says it grows about with the row count, which is a trend and not a measurement).

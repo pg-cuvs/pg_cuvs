@@ -42,22 +42,40 @@ typedef struct CuvsRecertOutcome {
 extern void cuvs_cover_recertify(Relation heap, Relation index, uint64 ram_limit, uint64 spill_limit, bool force,
 				 CuvsRecertOutcome *out);
 
-/* The same for a caller that is not a VACUUM (the manual function): the walk gives way, with result DEFERRED and nothing
+/* The same for a caller that is not a VACUUM (the manual function, the background worker): the walk gives way, with result DEFERRED and nothing
  * written, when another session waits for a lock that conflicts with the table's or the index's lock the caller holds. A VACUUM does not give
  * way: it holds the table's lock for its own whole run anyway. */
 extern void cuvs_cover_recertify_yielding(Relation heap, Relation index, uint64 ram_limit, uint64 spill_limit, bool force,
 					  CuvsRecertOutcome *out);
 
+/* The same for the time-based recertification (cuvs.cover_recertify_max_age): a CERTIFIED index is taken when any key was written since its
+ * certification, however few; the failure memory applies. Gives way like cuvs_cover_recertify_yielding. */
+extern void cuvs_cover_recertify_aged(Relation heap, Relation index, uint64 ram_limit, uint64 spill_limit, CuvsRecertOutcome *out);
+
+/* Is a time-based recertification due for `index` at `now` (see the definition). Reads the descriptor and the ledger tail only. */
+extern bool cuvs_cover_sweep_due(Relation index, TimestampTz now, int64 max_age_us);
+
+/* Has `index` anything since its certification that a later recertification must take (LOST, or a key or a page since)? The sweeper keeps
+ * such an index as a candidate. */
+extern bool cuvs_cover_sweep_pending(Relation index);
+
 /* Keys left to copy under the exclusive lock at most (after up to COPY_PASSES unlocked passes). */
 #define CUVS_RECERT_TAIL_KEYS 1000
 #define CUVS_RECERT_COPY_PASSES 5
 
-/* Ledger growth since the last certification, as a percent of the rows it covered, beyond which a CERTIFIED index is recertified by the
- * cleanup step of a VACUUM and shown as "recommended" by the status function. A ratio only: there is no minimum number of keys. */
+/* Default of cuvs.cover_recertify_threshold_percent: ledger growth since the last certification, as a percent of the rows it covered,
+ * beyond which a CERTIFIED index is recertified by VACUUM or the background worker and shown as "recommended" by the status
+ * function. A ratio only: there is no minimum number of keys. */
 #define CUVS_RECERT_GROWTH_PERCENT 5
 
 /* The descriptor, the keys written since the certification and whether that is past the recommendation threshold. */
 extern bool cuvs_cover_growth_status(Relation index, CuvsCoverDescriptor *d, uint64 *delta_keys, bool *recommended);
+
+/* The pages the relation has grown by since the certification the descriptor `d` describes (0 if it did not grow). */
+extern uint64 cuvs_cover_pages_since_cert(Relation index, const CuvsCoverDescriptor *d);
+
+/* Whether the growth rule (or an unreadable ledger) says a CERTIFIED index is due for a recertification. */
+extern bool cuvs_cover_recertify_due(Relation index);
 
 /* The tail of a build over rows: certify the new index now (it started LOST, uncertified). Never fails the build. */
 extern void cuvs_cover_certify_after_build(Relation heap, Relation index);
