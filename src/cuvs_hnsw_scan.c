@@ -72,18 +72,56 @@ cover_begin(Relation index, int keys, int orders)
     return scan;
 }
 
-/* Why a scan cannot run through the exact module, or NULL if it can. */
+/* The one statement shape that a scan of an index with a descriptor cannot answer: the index has an expression or a predicate,
+ * which the exact module evaluates (as the role that reads, with no change of user) for every row it ranks, and the statement has
+ * row-level security or a security barrier, which hide rows from the statement that those functions must not be run on. Planning
+ * does not choose such an index for such a statement (cuvs_hnsw_rls.c) and PostgreSQL's sequential scan answers; this is the net
+ * for a plan that kept it anyway. NULL when the scan can run. A plain-column index never refuses: the module computes the operator
+ * class's own distance of a stored vector, which an index scan does for the rows that are hidden, too. */
 static const char *
-cover_unexact_reason(IndexScanDesc scan)
+cover_unsafe_reason(IndexScanDesc scan)
 {
+    if (RelationGetIndexExpressions(scan->indexRelation) == NIL &&
+        RelationGetIndexPredicate(scan->indexRelation) == NIL)
+        return NULL;
+    if (!cuvs_hnsw_rls_statement_known())
+        return "the statement that runs the scan is not known (the scan does not run inside the executor)";
     if (cuvs_hnsw_rls_query_active())
-        return "row-level security or a security barrier applies to the statement";
+        return "a security barrier or a plan that depends on the role applies to the statement";
     if (scan->heapRelation && RelationGetForm(scan->heapRelation)->relrowsecurity)
         return "row-level security is enabled on the table";
-    if (RelationGetIndexExpressions(scan->indexRelation) != NIL ||
-        RelationGetIndexPredicate(scan->indexRelation) != NIL)
-        return "the index has expressions or a predicate";
+    /* a partition or an inheritance child whose parent has the policy: the child itself shows nothing */
+    if (cuvs_hnsw_rls_statement_has_rls_relation())
+        return "row-level security is enabled on a table of the statement";
     return NULL;
+}
+
+static void
+cover_require_safe(IndexScanDesc scan)
+{
+    const char *why = cover_unsafe_reason(scan);
+
+    if (why)
+        ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                        errmsg("pg_cuvs: index \"%s\" cannot answer this statement", RelationGetRelationName(scan->indexRelation)),
+                        errdetail("Its expression or predicate would be evaluated on rows that the statement is not allowed to see: %s.", why),
+                        errhint("Run the statement again, or SET cuvs.hnsw_exact_scan = on for it: PostgreSQL then reads the table itself and does not use this index.")));
+}
+
+bool
+cuvs_hnsw_scan_exact_served(Relation index)
+{
+    CuvsCoverResult res;
+
+    if (cuvs_hnsw_index_is_cover(index)) {
+        cuvs_cover_scan_classify(index, &res);
+        return res.cls != CUVS_COVER_LEGACY && res.cls != CUVS_COVER_OFF;
+    }
+    /* the older symbol: only while the break-glass marker exists, and then only an index that carries a descriptor */
+    if (!cuvs_cover_breakglass_marked())
+        return false;
+    cuvs_cover_scan_classify(index, &res);
+    return res.cls != CUVS_COVER_LEGACY && res.cls != CUVS_COVER_OFF && res.cls != CUVS_COVER_ERROR;
 }
 
 /* One notice per index and minute per backend: a heap-ranked answer is correct but slow, and says how to fix it. */
@@ -111,13 +149,12 @@ cover_notice(Relation index, const char *why, bool reindex_only)
  *   LEGACY / OFF   as before (approximate)
  *   CERTIFIED      the ANN answers and every ledger key, ranked exactly
  *   LOST / other   the whole visible heap, ranked exactly, with a notice
- * A scan that cannot run exactly (see cover_unexact_reason) is refused instead of answered approximately: the decision
- * for these shapes (P1/P2/P3, E1/E2) is still open, and an error is the only answer that cannot be wrong. */
+ * The ranking evaluates the index's expression and predicate as the reading role. The one statement it cannot answer is the one
+ * cover_unsafe_reason describes; a scan that cannot be answered exactly is never answered approximately. */
 static void
 cover_choose_mode(IndexScanDesc scan, CuvsHnswScanState *state)
 {
     CuvsCoverResult res;
-    const char *why;
 
     state->merge_mode = false;
     if (state->merge_cxt) {
@@ -135,12 +172,7 @@ cover_choose_mode(IndexScanDesc scan, CuvsHnswScanState *state)
             return;
         if (state->exact_mode)
             return;
-        why = cover_unexact_reason(scan);
-        if (why)
-            ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-                            errmsg("this scan of a pg_cuvs_hnsw index with a cover descriptor cannot run exactly"),
-                            errdetail("%s.", why),
-                            errhint("An emergency rollback was made (pg_cuvs_cover_breakglass()); ALTER EXTENSION pg_cuvs UPDATE TO '0.9.2' and then TO '0.9.3' with the new library installed ends it.")));
+        cover_require_safe(scan);
         state->exact_mode = true;
         cover_notice(scan->indexRelation, "an emergency rollback was made (pg_cuvs_cover_breakglass()): ALTER EXTENSION pg_cuvs UPDATE TO '0.9.2' and then TO '0.9.3' with the new library installed ends it", true);
         return;
@@ -159,14 +191,9 @@ cover_choose_mode(IndexScanDesc scan, CuvsHnswScanState *state)
             return;
         break;
     }
-    why = cover_unexact_reason(scan);
-    if (why)
-        ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-                        errmsg("this scan of a pg_cuvs_hnsw index with a cover descriptor cannot run exactly"),
-                        errdetail("%s.", why),
-                        errhint("Answering these statements is not decided yet; use cuvs.hnsw_exact_scan = off on an index without a cover descriptor, or REINDEX on an old build.")));
     if ((res.cls == CUVS_COVER_CERTIFIED || res.cls == CUVS_COVER_LOST) && !res.writable) {
         /* a descriptor of a newer format: this library reads the heap and says so (it cannot judge the ledger of that format) */
+        cover_require_safe(scan);
         state->exact_mode = true;
         cover_notice(scan->indexRelation, "its descriptor was written by a newer pg_cuvs, whose ledger this library does not judge", true);
         return;
@@ -177,9 +204,11 @@ cover_choose_mode(IndexScanDesc scan, CuvsHnswScanState *state)
             elog(DEBUG1, "pg_cuvs: scan of \"%s\" delegated to the graph (the ledger holds no key)", RelationGetRelationName(scan->indexRelation));
             return;
         }
+        cover_require_safe(scan);
         state->merge_mode = true;
         return;
     }
+    cover_require_safe(scan);
     state->exact_mode = true;
     cover_notice(scan->indexRelation,
                  res.cls != CUVS_COVER_LOST ? "its descriptor cannot be trusted" :
@@ -212,7 +241,7 @@ cover_build_merge(IndexScanDesc scan, CuvsHnswScanState *state)
         /* the descriptor changed or the ledger cannot be read: rank the whole heap, which is always right */
         MemoryContextSwitchTo(previous);
         cover_notice(scan->indexRelation, "its ledger could not be read (a damaged page or key)", false);
-        state->exact = cuvs_hnsw_exact_begin(scan);
+        state->exact = cuvs_hnsw_exact_begin_cover(scan);
         return;
     }
     /* the graph's own answers, in whatever order pgvector produces them */
@@ -259,8 +288,9 @@ cover_rescan(IndexScanDesc scan, ScanKey keys, int nkeys,
     }
     /* With the setting on, a scan either runs exactly or fails. A scan that was
      * planned before the setting changed may be one that exact mode never plans
-     * (security barrier, row-level security, index expression or predicate); it
-     * must not fall back to approximate results without telling the caller. */
+     * (security barrier, row-level security); it must not fall back to approximate
+     * results without telling the caller. An index expression or predicate is no
+     * reason to stop: the exact module evaluates it as the role that reads. */
     state->exact_mode = false;
     if (force_exact) {
         const char *why = NULL;
@@ -269,9 +299,14 @@ cover_rescan(IndexScanDesc scan, ScanKey keys, int nkeys,
             why = "row-level security or a security barrier applies to the statement";
         else if (scan->heapRelation && RelationGetForm(scan->heapRelation)->relrowsecurity)
             why = "row-level security is enabled on the table";
-        else if (RelationGetIndexExpressions(scan->indexRelation) != NIL ||
-                 RelationGetIndexPredicate(scan->indexRelation) != NIL)
-            why = "the index has expressions or a predicate";
+        else if ((RelationGetIndexExpressions(scan->indexRelation) != NIL ||
+                  RelationGetIndexPredicate(scan->indexRelation) != NIL) &&
+                 !cuvs_hnsw_rls_statement_known())
+            why = "the statement that runs the scan is not known (the scan does not run inside the executor)";
+        else if ((RelationGetIndexExpressions(scan->indexRelation) != NIL ||
+                  RelationGetIndexPredicate(scan->indexRelation) != NIL) &&
+                 cuvs_hnsw_rls_statement_has_rls_relation())
+            why = "row-level security is enabled on a table of the statement";
         if (why)
             ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
                             errmsg("cuvs.hnsw_exact_scan is on, but this scan cannot run exactly"),
@@ -310,7 +345,7 @@ cover_next(IndexScanDesc scan, ScanDirection direction)
             if (state->merge_mode)
                 cover_build_merge(scan, state);
             else
-                state->exact = cuvs_hnsw_exact_begin(scan);
+                state->exact = cuvs_hnsw_exact_begin_cover(scan);
         }
         found = cuvs_hnsw_exact_next(state->exact, &scan->xs_heaptid, &distance, &isnull);
         if (found) {

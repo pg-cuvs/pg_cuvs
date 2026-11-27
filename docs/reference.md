@@ -1440,9 +1440,10 @@ case only.
 | When | Shape | Message |
 |---|---|---|
 | Planning | a `pg_cuvs_hnsw` path that could not run exactly survived the second planning (another planner hook added it) | `an exact query retained an unsupported HNSW index path` |
-| Scan (re)start | the setting was turned on, or row-level security was enabled, after the statement was planned, and this scan is protected (security barrier, row-level security) or uses an index expression or predicate | `cuvs.hnsw_exact_scan is on, but this scan cannot run exactly`, with the reason in `DETAIL`; run the statement again |
+| Scan (re)start | the setting was turned on, or row-level security was enabled, after the statement was planned, and this scan is protected (security barrier, row-level security) | `cuvs.hnsw_exact_scan is on, but this scan cannot run exactly`, with the reason in `DETAIL`; run the statement again |
 | Reading further | more rows were fetched than one pass keeps, and a STABLE ordering function returned different values in between (for example after `SET LOCAL` between two `FETCH`es) | `the ordering function returned different results during one exact scan` |
-| First fetch | a direct caller of the exact scan on a table with row-level security enabled | `RLS exact scans require the PostgreSQL executor path` |
+| Scan start (default setting) | a plan kept an expression or partial index that the exact module serves on a statement with row-level security or a security barrier | `pg_cuvs: index "..." cannot answer this statement`, with the cause in `DETAIL`; run the statement again or set `cuvs.hnsw_exact_scan = on` |
+| First fetch | a direct caller of the exact scan on a table with row-level security enabled (the scan of an index with a descriptor is not a direct caller: it ranks a plain-column index on such a table, see below) | `RLS exact scans require the PostgreSQL executor path` |
 | First fetch | the scan is not a heap MVCC scan with one ordering operator, or the ordering function is not a strict scalar `float8` | `HNSW exact routing requires ...` |
 
 Turning the setting off while a statement runs returns to the delegate access method at
@@ -1520,9 +1521,69 @@ list most of a clustered graph as unreachable (measured on 20,000 rows of 16 dim
 wider definition: a row that only an upper-layer slot leads to is not in the ledger, and a search finds it only when its descent ends on it. Graphs of m = 8 or more built from random
 vectors had no such row; at m = 4 there were 30 in 20,000 and an ordered scan by their own vectors found one of them (`test/unit/measure_upper_layer_reach.py`). Indexes built before 0.9.3 (class
 `legacy`) keep the old behavior. Indexes whose recertification failed, that a VACUUM changed since, or whose ledger does
-not read are answered from the heap (see the table), not from the graph. Row-level security, index expressions and partial
-indexes: an index with a descriptor on such a table or shape is refused with SQLSTATE `0A000` ("cannot run exactly"); this
-is the current behavior and is open for decision.
+not read are answered from the heap (see the table), not from the graph.
+
+**Row-level security, security barriers, index expressions and partial indexes, for an index with a descriptor** (the setting
+`cuvs.hnsw_exact_scan` off). By default no such statement ends in an error because of the index. What answers depends on the shape,
+and the answer is as exact as the state of the index allows:
+
+| Index | Statement without row-level security | Statement with row-level security or a security barrier |
+|---|---|---|
+| plain column | the merge (certified) or the heap ranking (lost), as above | the same: the ranking applies the operator class's own distance function to a stored vector, as an index scan does for the rows that are hidden, and the executor applies the policy to the rows that come out, so a hidden row never comes back |
+| expression or partial | the same; the expression and the predicate are evaluated by the scan as the role that reads (no change of user) | the planner does not choose the index, and PostgreSQL's Seq Scan + Sort answers (slower, exact) |
+
+How many rows come back when the policy hides some depends on the state. The heap ranking (a lost or untrusted index) ranks every
+visible row, so `LIMIT` is filled from the rows the policy shows. The merge of a certified index ranks the graph's own answers
+(about `hnsw.ef_search` of them, as with pgvector alone) and the ledger keys, and the policy is applied to that set afterwards: when it
+hides part of the set, fewer than `LIMIT` rows come back, exactly as with pgvector alone. The guarantee of the merge is the one in the
+table above (rows that the graph cannot reach and rows inserted since are always candidates), not that the candidates are
+sufficient for a given `LIMIT` once rows are hidden. A table where the policy shows half of 4,000 rows, a certified index and
+`LIMIT 100` returned fewer than 100 rows in `test/unit/test_cover_scan_pg.py` (S9).
+
+An index that has no descriptor, or an OFF one, is answered as before in every row of this table.
+
+What runs on the rows. The expression of an index runs only when the statement wrote that expression: the planner makes an ordered
+index path only when the statement's `ORDER BY` expression equals the index expression (`equal()` on the simplified forms, the same
+simplification of both: a SQL-language wrapper function is replaced by its body in both), so the scan evaluates what the statement
+already contains, with the function privileges of the reading role. A predicate is different: the planner chooses a partial index when the
+statement's conditions imply the predicate, which does not make the predicate part of the statement (`id > 7` implies `id > 5 OR f(id)`).
+The scan therefore evaluates a predicate only when every function, operator and type in it is one that the system created (OID below
+`FirstNormalObjectId`; a domain, a user-defined type, a function or operator of an extension, `pgvector` included, and a node kind that is
+not on the list of simple nodes do not count), because a built-in function can still run user code through the type it works on. A
+partial index with a descriptor whose predicate is not built in only is never chosen by planning, whatever its state, and PostgreSQL's
+Seq Scan + Sort answers. The merge of a certified index evaluates a built-in predicate as a check; the candidates are index entries
+and satisfied it when they were inserted.
+
+What still ends in an error (SQLSTATE `0A000`, "index ... cannot answer this statement", with the cause in `DETAIL` and the action in
+`HINT`): a plan that kept an index of the cases above although planning removes it (another planner hook added the path again, a plan
+cache entry made before the index definition changed), and a scan that is asked to evaluate an expression or a predicate while no
+statement is known for it. The scan finds the statement through the executor hooks: `ExecutorStart` (an index scan that has no runtime
+keys starts there), `ExecutorRun` and `ExecutorFinish` (a data-modifying CTE that the main query does not read runs there). A nested
+statement (a function, SPI, a trigger, a cursor) replaces the remembered statement while it runs; a parallel worker has its own. The scan
+recognizes a protected statement by the statement's marker (a security barrier or a plan that depends on the role), by row-level security on
+its own table, or by row-level security on any table of the statement's range table, which includes a partitioned or inheritance parent
+whose policy reaches its children. `test/unit/test_cover_scan_pg.py` (S5 to S5d, S8, S12, S14) found no statement under the default
+settings that reaches the error without a second planner hook. A security barrier cannot enter a statement through an inlined scalar
+function: PostgreSQL inlines a scalar SQL function only when its body has no FROM or WHERE (`inline_function` in `clauses.c`,
+REL_16_STABLE), so it cannot read a table.
+
+When the index is not used, and how to see it. Planning leaves an index with a descriptor out of a statement, and PostgreSQL's Seq Scan +
+Sort answers (exactly, and slower), in two cases only:
+1. the index has an expression or a predicate, and the statement reads a table with row-level security enabled or through a security barrier.
+   The test is the table's flag, not whether a policy applies to the role or implies the predicate: the owner and a role that bypasses
+   row-level security are included, and so is a policy that implies the index predicate. An index without an expression and without a
+   predicate is never left out for this reason;
+2. the index has a predicate that is not built in only (a user function, a user-defined operator or type, a domain, an enum, a type of an
+   extension such as `vector`), whatever the statement.
+An index without a descriptor (built before 0.9.3 and not rebuilt) or an OFF one is not left out in either case. There is no notice and no
+counter for it: `EXPLAIN` shows the Seq Scan, and `pg_cuvs_hnsw_cover_status(index)` shows the state of the index but not that a statement left
+it out. `REINDEX` does not change this; a predicate of built-in functions only, or a statement without row-level security, does.
+
+Planning cost: every statement gets its index paths filtered as they are made. A statement that names a table with an index of the
+access method that has an expression or a predicate, a table that has partitions or inheritance children, or a SQL-language function in `FROM`
+(which may be inlined) is also checked after planning and planned again from a copy, which costs what the setting costs.
+Functions of other languages (`generate_series`, `unnest`) do not. A table with row-level security loses these paths for the owner and
+for a role that bypasses row-level security as well, because the check looks at the table's flag and not at the role.
 
 **Index classes** (`pg_cuvs_hnsw_cover_status(index)->>'class'`) and what a scan does:
 

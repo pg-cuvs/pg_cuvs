@@ -4,6 +4,10 @@
 #include "access/tableam.h"
 #include "catalog/index.h"
 #include "catalog/pg_am_d.h"
+#include "access/transam.h"
+#include "nodes/nodeFuncs.h"
+#include "nodes/makefuncs.h"
+#include "nodes/primnodes.h"
 #include "catalog/pg_type_d.h"
 #include "executor/executor.h"
 #include "miscadmin.h"
@@ -61,6 +65,118 @@ struct CuvsHnswExact {
     const ItemPointerData *cand;
     Size ncand;
 };
+
+/*
+ * A predicate that only PostgreSQL's own code can run. The exact module evaluates the predicate of a partial index for rows that the
+ * statement may never have mentioned (the planner chooses the index when the statement's conditions IMPLY the predicate), so a
+ * function that a user wrote must not run there. Every function, operator and type that the predicate uses must be one that the
+ * system created (OID below FirstNormalObjectId), and a node kind that is not listed is refused. Types count because a built-in
+ * function can call user code through its type: the operators of a user type, its input and output functions, a domain's CHECK.
+ * Collations do not: a collation selects a locale of the C library or of ICU.
+ */
+static bool
+exact_is_builtin_oid(Oid oid)
+{
+    return OidIsValid(oid) && oid < FirstNormalObjectId;
+}
+
+static bool
+exact_pred_unsafe(Node *node, void *context)
+{
+    if (node == NULL)
+        return false;
+    switch (nodeTag(node)) {
+    case T_List:
+    case T_Var:
+    case T_Const:
+    case T_RelabelType:
+    case T_NullTest:
+    case T_BooleanTest:
+    case T_BoolExpr:
+    case T_CaseExpr:
+    case T_CaseWhen:
+    case T_CaseTestExpr:
+    case T_CoalesceExpr:
+        break;
+    case T_FuncExpr: {
+        FuncExpr *f = (FuncExpr *) node;
+        ListCell *cell;
+
+        if (!exact_is_builtin_oid(f->funcid) || !exact_is_builtin_oid(f->funcresulttype))
+            return true;
+        foreach(cell, f->args)
+            if (!exact_is_builtin_oid(exprType((Node *) lfirst(cell))))
+                return true;
+        break;
+    }
+    case T_OpExpr:
+    case T_DistinctExpr:
+    case T_NullIfExpr: {
+        OpExpr *o = (OpExpr *) node;      /* the three have the same leading fields */
+        ListCell *cell;
+
+        set_opfuncid(o);
+        if (!exact_is_builtin_oid(o->opfuncid) || !exact_is_builtin_oid(o->opresulttype))
+            return true;
+        foreach(cell, o->args)
+            if (!exact_is_builtin_oid(exprType((Node *) lfirst(cell))))
+                return true;
+        break;
+    }
+    case T_ScalarArrayOpExpr: {
+        ScalarArrayOpExpr *a = (ScalarArrayOpExpr *) node;
+        ListCell *cell;
+
+        set_sa_opfuncid(a);
+        if (!exact_is_builtin_oid(a->opfuncid))
+            return true;
+        foreach(cell, a->args)
+            if (!exact_is_builtin_oid(exprType((Node *) lfirst(cell))))
+                return true;
+        break;
+    }
+    case T_CoerceViaIO: {
+        CoerceViaIO *c = (CoerceViaIO *) node;
+
+        if (!exact_is_builtin_oid(exprType((Node *) c->arg)) || !exact_is_builtin_oid(c->resulttype))
+            return true;
+        break;
+    }
+    case T_ArrayCoerceExpr: {
+        ArrayCoerceExpr *c = (ArrayCoerceExpr *) node;
+
+        if (!exact_is_builtin_oid(exprType((Node *) c->arg)) || !exact_is_builtin_oid(c->resulttype))
+            return true;
+        break;
+    }
+    case T_ArrayExpr: {
+        ArrayExpr *a = (ArrayExpr *) node;
+
+        if (!exact_is_builtin_oid(a->array_typeid) || !exact_is_builtin_oid(a->element_typeid))
+            return true;
+        break;
+    }
+    case T_MinMaxExpr: {
+        MinMaxExpr *m = (MinMaxExpr *) node;
+
+        if (!exact_is_builtin_oid(m->minmaxtype))
+            return true;
+        break;
+    }
+    default:
+        /* CoerceToDomain, RowExpr, FieldSelect, SubLink, SubscriptingRef, XmlExpr, SQLValueFunction, a Param, an Aggref ...: refused */
+        return true;
+    }
+    return expression_tree_walker(node, exact_pred_unsafe, context);
+}
+
+bool
+cuvs_hnsw_exact_predicate_builtin(Relation index)
+{
+    List *pred = RelationGetIndexPredicate(index);
+
+    return pred == NIL || !exact_pred_unsafe((Node *) pred, NULL);
+}
 
 /* Visible heap-only TIDs are not valid index answers. Resolve a root while
  * holding the page lock; release it before expressions, heap fetch or sorting. */
@@ -300,22 +416,28 @@ exact_collect_heap(CuvsHnswExact *state)
     state->table_scan = NULL;
 }
 
-static CuvsHnswExact *exact_begin_impl(IndexScanDesc scan, bool subset, const ItemPointerData *cand, Size ncand);
+static CuvsHnswExact *exact_begin_impl(IndexScanDesc scan, bool subset, const ItemPointerData *cand, Size ncand, bool cover);
 
 CuvsHnswExact *
 cuvs_hnsw_exact_begin(IndexScanDesc scan)
 {
-    return exact_begin_impl(scan, false, NULL, 0);
+    return exact_begin_impl(scan, false, NULL, 0, false);
+}
+
+CuvsHnswExact *
+cuvs_hnsw_exact_begin_cover(IndexScanDesc scan)
+{
+    return exact_begin_impl(scan, false, NULL, 0, true);
 }
 
 CuvsHnswExact *
 cuvs_hnsw_exact_begin_tids(IndexScanDesc scan, const ItemPointerData *tids, Size ntids)
 {
-    return exact_begin_impl(scan, true, tids, ntids);
+    return exact_begin_impl(scan, true, tids, ntids, true);
 }
 
 static CuvsHnswExact *
-exact_begin_impl(IndexScanDesc scan, bool subset, const ItemPointerData *cand, Size ncand)
+exact_begin_impl(IndexScanDesc scan, bool subset, const ItemPointerData *cand, Size ncand, bool cover)
 {
     CuvsHnswExact *state;
     MemoryContext previous;
@@ -327,10 +449,16 @@ exact_begin_impl(IndexScanDesc scan, bool subset, const ItemPointerData *cand, S
         RelationGetForm(scan->heapRelation)->relam != HEAP_TABLE_AM_OID)
         ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
                         errmsg("HNSW exact routing requires a heap MVCC scan with no search keys and one ordering operator")));
-    /* RLS quals must run before index expressions/predicates. Normal SQL
-     * exact scans use the native executor plan installed at ExecutorStart;
-     * a direct utility caller must not bypass that boundary. */
-    if (RelationGetForm(scan->heapRelation)->relrowsecurity)
+    /* RLS quals must run before index expressions/predicates: this module ranks rows the statement may not see, and an
+     * expression or a predicate is a function call on each of them. Those scans use the native executor plan, which
+     * planning chooses (cuvs_hnsw_rls.c); a direct utility caller must not bypass that boundary. A plain column is not
+     * a call of user code: the ordering function of the operator class is applied to a stored vector, as an index scan
+     * does for the rows that are hidden, and the executor applies the row-level quals to the rows that come out. Only the
+     * scan of an index with a cover descriptor (`cover`) relies on that; any other caller is refused on every such table. */
+    if (RelationGetForm(scan->heapRelation)->relrowsecurity &&
+        (!cover ||
+         RelationGetIndexExpressions(scan->indexRelation) != NIL ||
+         RelationGetIndexPredicate(scan->indexRelation) != NIL))
         ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
                         errmsg("RLS exact scans require the PostgreSQL executor path")));
     if (!OidIsValid(scan->orderByData[0].sk_func.fn_oid) ||
@@ -353,6 +481,11 @@ exact_begin_impl(IndexScanDesc scan, bool subset, const ItemPointerData *cand, S
         state->estate->es_snapshot = scan->xs_snapshot;
         state->expression = GetPerTupleExprContext(state->estate);
         state->index_info = BuildIndexInfo(scan->indexRelation);
+        if (state->index_info->ii_Predicate != NIL && !cuvs_hnsw_exact_predicate_builtin(scan->indexRelation))
+            ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                            errmsg("pg_cuvs: index \"%s\" cannot answer this statement", RelationGetRelationName(scan->indexRelation)),
+                            errdetail("The predicate of the index calls a function, operator or type that is not built in, and ranking rows by this index would run it."),
+                            errhint("Planning does not choose such an index; run the statement again, or use a predicate of built-in functions only.")));
         state->predicate = ExecPrepareQual(state->index_info->ii_Predicate, state->estate);
         state->heap_slot = table_slot_create(scan->heapRelation, NULL);
         descriptor = CreateTemplateTupleDesc(2);

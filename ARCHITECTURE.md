@@ -484,8 +484,9 @@ lost (reason break-glass) on either symbol, so that no search answers approximat
 update scripts remove the marker.
 
 **Boundaries.** The guarantee is about candidates, not recall of reachable rows. The ledger grows with writes between recertifications and
-each key costs one exact distance per search (measured at 100,000 x 96: 3,000 keys add 1.87 ms p95). Row-level security, index expressions and
-partial indexes are refused (SQLSTATE `0A000`) for an index with a descriptor. Standby servers read the ledger like any page; recertification
+each key costs one exact distance per search (measured at 100,000 x 96: 3,000 keys add 1.87 ms p95). An index with a descriptor is
+answered on a table with row-level security or through a security barrier: a plain-column index as on any table, an index with an expression or
+a predicate by PostgreSQL's own Seq Scan + Sort (planning does not choose it for such a statement; `docs/reference.md` has the table and the one error that is left). Standby servers read the ledger like any page; recertification
 runs on the primary only. Nothing recertifies an index by itself except the cleanup step of a VACUUM, so the ledger of a table that is inserted into grows until a VACUUM,
 `pg_cuvs_cover_recertify()` or `REINDEX`.
 

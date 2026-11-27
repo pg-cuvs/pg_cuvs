@@ -142,20 +142,33 @@ cuvs_cover_base_keys(const CuvsCoverDescriptor *d)
 _Static_assert(CUVS_COVER_PAGE_SIZE - CUVS_COVER_SPECIAL_SIZE - CUVS_COVER_CONN_SIZE - CUVS_COVER_D_SIZE == 7936,
 	"new pd_upper");
 
-/* CRC-32C (Castagnoli, reflected 0x82F63B78), the value written at the end of the descriptor. */
+/* CRC-32C (Castagnoli, reflected 0x82F63B78), the value written at the end of the descriptor. One table lookup per byte: the descriptor is
+ * read and checked by every scan of an index, and the bit-at-a-time loop this replaces took about 2 microseconds of a 450 microsecond
+ * search (perf of a certified 1,000-row search, symbol cuvs_cover_classify). The check value of "123456789" is in test_cover_format.c. */
 static inline uint32_t
 cuvs_cover_crc32c(const void *data, size_t len)
 {
+	static uint32_t table[256];
+	static int	ready = 0;
 	const uint8_t *p = (const uint8_t *) data;
 	uint32_t crc = 0xFFFFFFFFu;
 	size_t i;
-	int k;
 
-	for (i = 0; i < len; i++) {
-		crc ^= p[i];
-		for (k = 0; k < 8; k++)
-			crc = (crc >> 1) ^ (0x82F63B78u & (uint32_t) -(int32_t) (crc & 1u));
+	if (!ready) {
+		uint32_t n;
+		int k;
+
+		for (n = 0; n < 256; n++) {
+			uint32_t c = n;
+
+			for (k = 0; k < 8; k++)
+				c = (c >> 1) ^ (0x82F63B78u & (uint32_t) -(int32_t) (c & 1u));
+			table[n] = c;
+		}
+		ready = 1;
 	}
+	for (i = 0; i < len; i++)
+		crc = (crc >> 8) ^ table[(crc ^ p[i]) & 0xFFu];
 	return ~crc;
 }
 

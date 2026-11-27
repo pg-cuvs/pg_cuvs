@@ -40,6 +40,7 @@ def main():
     result = {"cases": [], "candidate_sha256": library_sha,
               "pgvector_sha256": hashlib.sha256((libdir / "vector.so").read_bytes()).hexdigest()}
     actor = control = None
+    cover_mode = False
     started = False
     repo = Path(__file__).resolve().parents[2]
     result["source_sha256"] = {str(f): hashlib.sha256(f.read_bytes()).hexdigest() for f in
@@ -106,6 +107,12 @@ def main():
     try:
         actor, control = Session(command), Session(command)
         assert ask(actor, "SHOW data_directory;") == [args.expected_data_directory]
+        # A cluster at 0.9.3 names pg_cuvs_hnsw_handler_c1p: its indexes have a cover descriptor, and with the setting off a statement on a table
+        # with row-level security does not choose an index with an expression or a predicate (the planner part removes the path and PostgreSQL's
+        # Seq Scan + Sort answers). A cluster at 0.9.2 (the older symbol) keeps the index path with the setting off. The cases below that expect
+        # an Index Scan for such a table expect the native plan in the first case.
+        cover_mode = ask(actor, "SELECT prosrc FROM pg_proc WHERE proname='pg_cuvs_hnsw_handler';")[-1].endswith("_c1p")
+        result["handler"] = "cover (pg_cuvs_hnsw_handler_c1p)" if cover_mode else "older symbol (pg_cuvs_hnsw_handler)"
         precondition = value(actor, "SELECT jsonb_build_object('actor',current_user,"
             "'admin',(SELECT rolsuper FROM pg_roles WHERE rolname=current_user),"
             "'superuser',rolsuper,'bypassrls',rolbypassrls,"
@@ -227,7 +234,10 @@ SET LOCAL cuvs.hnsw_exact_scan=on;
         toggle_query = "SELECT id FROM fixture.implied WHERE fixture.toggle(id) ORDER BY v <-> '[0,0]'::vector"
         offset = stage("midquery_toggle")
         toggle_plan = explain(toggle_query, "off", False)
-        assert any(node["Node Type"] == "Index Scan" for node in plan_nodes(toggle_plan)), toggle_plan
+        if cover_mode:
+            native(toggle_plan)
+        else:
+            assert any(node["Node Type"] == "Index Scan" for node in plan_nodes(toggle_plan)), toggle_plan
         toggle_rows = value(actor, "SELECT jsonb_agg(x) FROM(" + toggle_query + ")x;")
         toggle_notices = finish("midquery_toggle", offset)
         toggle_ids = [int(re.search(r" id=(\d+)", line).group(1)) for line in toggle_notices if "TOGGLE_QUAL role=pg_read_all_data" in line]
@@ -246,7 +256,7 @@ SET LOCAL cuvs.hnsw_exact_scan=on;
             actual = value(actor, "EXECUTE rls_q('[0,0]');")
             no_hidden(finish("generic_" + str(step), offset))
             assert actual == [{"id": 1}], actual
-            if mode == "on": native(plan)
+            if mode == "on" or cover_mode: native(plan)
             else: assert any(n["Node Type"] == "Index Scan" for n in plan_nodes(plan)), plan
             plans.append(plan); rows.append(actual)
         counts = value(actor, "SELECT jsonb_build_object('generic',generic_plans,'custom',custom_plans) FROM pg_prepared_statements WHERE name='rls_q';")
@@ -329,7 +339,11 @@ SET LOCAL cuvs.hnsw_exact_scan=on;
         ask(actor, "SET LOCAL cuvs.hnsw_exact_scan=on;DO $$BEGIN " + statement + " RAISE NOTICE 'ACL_ON_OK';EXCEPTION WHEN insufficient_privilege THEN RAISE NOTICE 'ACL_ON_DENIED';END$$;")
         ask(actor, "SET LOCAL cuvs.hnsw_exact_scan=off;SET LOCAL enable_indexscan=off;SET LOCAL enable_seqscan=on;DO $$BEGIN " + statement + " RAISE NOTICE 'ACL_SEQ_OK';EXCEPTION WHEN insufficient_privilege THEN RAISE NOTICE 'ACL_SEQ_DENIED';END$$;")
         notices = finish("non_rls_acl", offset)
-        assert all(any(tag in line for line in notices) for tag in ('ACL_OFF_OK','ACL_ON_DENIED','ACL_SEQ_DENIED')), notices
+        # The statement's own WHERE calls acl_pred, which the role may not execute. With an index of the older symbol and the setting off the
+        # planner serves the partial index and drops the qual that the predicate implies, so nothing prepares the function: ACL_OFF_OK. An index with
+        # a cover descriptor and a predicate that is not built in is not chosen: the table scan prepares the qual and is denied like the others.
+        expected_tags = ('ACL_OFF_DENIED', 'ACL_ON_DENIED', 'ACL_SEQ_DENIED') if cover_mode else ('ACL_OFF_OK', 'ACL_ON_DENIED', 'ACL_SEQ_DENIED')
+        assert all(any(tag in line for line in notices) for tag in expected_tags), notices
         assert not any('ACL_PRED role=pg_read_all_data' in line for line in notices), notices
         ask(actor, "SET LOCAL enable_indexscan=on;SET LOCAL enable_seqscan=off;SET LOCAL cuvs.hnsw_exact_scan=on;")
         result['cases'].append({'name': 'non_rls_predicate_execution_acl', 'verdict': 'PASS', 'notices': notices})

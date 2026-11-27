@@ -83,6 +83,11 @@ def main():
         assert ask(a, 'SHOW data_directory;') == [args.expected_data_directory], 'unexpected server data directory'
         versions = js(a, "SELECT jsonb_object_agg(extname,extversion) FROM pg_extension WHERE extname IN ('vector','pg_cuvs');")
         assert versions and 'pg_cuvs' in versions and ('vector' in versions), 'install vector and pg_cuvs first'
+        # Which access method handler the cluster has: a database created or updated to 0.9.3 names pg_cuvs_hnsw_handler_c1p (its indexes get a
+        # cover descriptor), one at 0.9.2 the older symbol (the indexes of a cluster that was not updated). They answer differently on a table
+        # with a partial index whose predicate is a user function: the older one serves the index, the new one never chooses it.
+        cover_mode = ask(a, "SELECT prosrc FROM pg_proc WHERE proname='pg_cuvs_hnsw_handler';")[-1].endswith('_c1p')
+        result['handler'] = 'cover (pg_cuvs_hnsw_handler_c1p)' if cover_mode else 'older symbol (pg_cuvs_hnsw_handler)'
         result['extension_versions'] = versions
         result['source_sha256'] = {str(f): hashlib.sha256(f.read_bytes()).hexdigest() for f in [repo / 'src/cuvs_hnsw_scan.c', repo / 'src/cuvs_hnsw_exact.c', Path(__file__)]}
         ask(a, 'CREATE SCHEMA review_ops; CREATE OPERATOR CLASS review_ops.vector_ip_ops FOR TYPE vector USING pg_cuvs_hnsw AS OPERATOR 1 <#> (vector,vector) FOR ORDER BY float_ops,FUNCTION 1 vector_negative_inner_product(vector,vector); CREATE OPERATOR CLASS review_ops.vector_cosine_ops FOR TYPE vector USING pg_cuvs_hnsw AS OPERATOR 1 <=> (vector,vector) FOR ORDER BY float_ops,FUNCTION 1 vector_negative_inner_product(vector,vector),FUNCTION 2 vector_norm(vector);')
@@ -108,22 +113,51 @@ def main():
         assert not any(n.get('Index Name') == 'parallel_i' for n in nodes(plan)), plan
         assert not any('PARALLEL_PRED stage=parallel_query' in x for x in notices), notices
         result['cases'].append({'name': 'parallel_unsafe_index_predicate', 'verdict': 'PASS', 'plan': plan, 'notices': notices})
-        # Exact mode planned off, switched on by a volatile function while the statement runs.
-        # A scan that exact mode never plans (expression/partial index) must fail loudly at its
-        # next rescan; it must not continue approximately and must not evaluate the predicate.
+        if cover_mode:
+            # A partial index of built-in functions only is chosen by planning and answered by the exact module (merge of the graph answers and
+            # the ledger), also inside a parallel plan (debug_parallel_query runs the whole plan in a worker, whose executor hooks give the scan its
+            # statement): the answer equals the table scan's.
+            ask(a, "CREATE TABLE review_ops.parallel_builtin(id int,v vector(2)); CREATE INDEX parallel_bi ON review_ops.parallel_builtin USING pg_cuvs_hnsw(v public.vector_l2_ops) WHERE id>0; INSERT INTO review_ops.parallel_builtin VALUES(-1,'[5,0]'),(1,'[1,0]'),(2,'[2,0]'),(3,'[3,0]'); SET debug_parallel_query=on;SET parallel_setup_cost=0;SET parallel_tuple_cost=0;SET max_parallel_workers_per_gather=2;SET cuvs.hnsw_exact_scan=off;")
+            bq = "SELECT id FROM review_ops.parallel_builtin WHERE id>0 ORDER BY v <-> '[0,0]'::vector"
+            bplan = json.loads('\n'.join(ask(a, 'EXPLAIN(FORMAT JSON,COSTS OFF) ' + bq + ';')))[0]['Plan']
+            assert any(n.get('Index Name') == 'parallel_bi' for n in nodes(bplan)), bplan
+            got = js(a, "SELECT jsonb_agg(x ORDER BY ord) FROM(SELECT id, row_number() OVER () ord FROM(" + bq + ")y)x;")
+            ask(a, 'SET debug_parallel_query=off;SET enable_indexscan=off;SET enable_bitmapscan=off;SET enable_seqscan=on;')
+            want = js(a, "SELECT jsonb_agg(x ORDER BY ord) FROM(SELECT id, row_number() OVER () ord FROM(" + bq + ")y)x;")
+            ask(a, 'SET enable_indexscan=on;SET enable_seqscan=off;')
+            assert [r['id'] for r in got] == [1, 2, 3] and got == want, (got, want)
+            result['cases'].append({'name': 'builtin_partial_index_answered_exactly_in_a_parallel_plan', 'verdict': 'PASS', 'plan': bplan, 'rows': got})
+        # Exact mode planned off, switched on by a volatile function while the statement runs. The predicate of this partial index calls a
+        # function that is not built in, and the exact module does not run such a predicate (the planner chose the index because the
+        # statement's conditions imply the predicate, which does not make the function part of the statement): the scan stops and the
+        # function does not run. (Before the decisions of 2026-11-19 this scan stopped with "cannot run exactly ... expressions or a predicate";
+        # for a predicate of built-in functions it is answered exactly, see test_cover_scan_pg.py.)
         ask(a, "CREATE FUNCTION review_ops.toggle_vec(v vector) RETURNS vector LANGUAGE plpgsql VOLATILE STRICT AS $$BEGIN PERFORM set_config('cuvs.hnsw_exact_scan','on',true);RETURN v;END$$; SET debug_parallel_query=off; SET rls_probe.tag='mid_toggle_nonrls'; SET cuvs.hnsw_exact_scan=off; \\set ON_ERROR_STOP off\nBEGIN;")
         lateral = "SELECT q.i,t.id FROM(VALUES(1,'[0,0]'::vector),(2,review_ops.toggle_vec('[1,0]'::vector)))q(i,v) CROSS JOIN LATERAL(SELECT id FROM review_ops.parallel_items WHERE id>0 ORDER BY v <-> q.v LIMIT 1)t ORDER BY q.i"
         plan = json.loads('\n'.join(ask(a, 'EXPLAIN(FORMAT JSON,COSTS OFF) ' + lateral + ';')))[0]['Plan']
-        assert any(n.get('Index Name') == 'parallel_i' for n in nodes(plan)), plan
         offset = len(a.errors)
-        ask(a, 'SELECT jsonb_agg(x) FROM(' + lateral + ')x;')
-        assert a.wait_error('cuvs.hnsw_exact_scan is on, but this scan cannot run exactly', 10), a.errors
-        assert a.wait_error('the index has expressions or a predicate', 10), a.errors
-        notices = a.errors[offset:]
-        assert not any('PARALLEL_PRED stage=mid_toggle_nonrls' in x for x in notices), notices
-        ask(a, 'ROLLBACK;')
-        assert ask(a, 'SHOW cuvs.hnsw_exact_scan;') == ['off']
-        result['cases'].append({'name': 'partial_midquery_toggle_fails_loudly', 'verdict': 'PASS', 'plan': plan, 'notices': notices})
+        if cover_mode:
+            # the index has a descriptor and a predicate that is not built in: planning does not choose it, PostgreSQL's table scan answers
+            # (here: the nearest row of each outer row, id 1 twice), and the predicate function of the owner does not run
+            assert not any(n.get('Index Name') == 'parallel_i' for n in nodes(plan)), plan
+            rows = js(a, 'SELECT jsonb_agg(x ORDER BY i) FROM(' + lateral + ')x;')
+            assert [r['id'] for r in rows] == [1, 1], rows
+            ask(a, "DO $$BEGIN RAISE NOTICE 'COVER_TOGGLE_END';END$$;")
+            assert a.wait_error('COVER_TOGGLE_END', 10), a.errors
+            notices = a.errors[offset:]
+            assert not any('PARALLEL_PRED stage=mid_toggle_nonrls' in x for x in notices), notices
+            ask(a, 'ROLLBACK;')
+            assert ask(a, 'SHOW cuvs.hnsw_exact_scan;') == ['off']
+            result['cases'].append({'name': 'partial_user_predicate_not_chosen_and_answered_by_table_scan', 'verdict': 'PASS', 'plan': plan, 'notices': notices})
+        else:
+            assert any(n.get('Index Name') == 'parallel_i' for n in nodes(plan)), plan
+            ask(a, 'SELECT jsonb_agg(x) FROM(' + lateral + ')x;')
+            assert a.wait_error('cannot answer this statement', 10), a.errors
+            notices = a.errors[offset:]
+            assert not any('PARALLEL_PRED stage=mid_toggle_nonrls' in x for x in notices), notices
+            ask(a, 'ROLLBACK;')
+            assert ask(a, 'SHOW cuvs.hnsw_exact_scan;') == ['off']
+            result['cases'].append({'name': 'partial_midquery_toggle_user_predicate_stops', 'verdict': 'PASS', 'plan': plan, 'notices': notices})
         # With the setting off the partial index keeps serving ANN across rescans and must not
         # evaluate its predicate (restored from the first version of this case).
         ask(a, "SET cuvs.hnsw_exact_scan=off; SET rls_probe.tag='partial_rescan_exact_off';")
@@ -133,7 +167,10 @@ def main():
         ask(a, "DO $$BEGIN RAISE NOTICE 'PARTIAL_RESCAN_END';END$$;")
         assert a.wait_error('PARTIAL_RESCAN_END', 10), a.errors
         loops = [n for n in nodes(loop_plan) if n.get('Index Name') == 'parallel_i' and n.get('Actual Loops') == 2]
-        assert len(loops) == 1, loop_plan
+        if cover_mode:
+            assert not loops and not any(n.get('Index Name') == 'parallel_i' for n in nodes(loop_plan)), loop_plan   # not chosen: see above
+        else:
+            assert len(loops) == 1, loop_plan
         assert not any('PARALLEL_PRED stage=partial_rescan_exact_off' in x for x in a.errors[loop_offset:]), a.errors[loop_offset:]
         result['cases'].append({'name': 'partial_rescan_exact_off_evaluates_no_predicate', 'verdict': 'PASS', 'plan': loop_plan})
         ask(a, '\\set ON_ERROR_STOP on')
@@ -156,11 +193,13 @@ def main():
         ask(a, "CREATE TABLE review_ops.rescan(id int,v vector(2)); CREATE INDEX rescan_i ON review_ops.rescan USING pg_cuvs_hnsw(v public.vector_l2_ops); INSERT INTO review_ops.rescan VALUES(0,'[0,0]'),(1,'[1,0]'),(2,'[2,0]'),(3,'[100,0]'),(4,'[101,0]'),(5,NULL); ANALYZE review_ops.rescan;")
         lateral = "SELECT q.v::text,t.id FROM(VALUES('[100,0]'::vector),('[102,0]'::vector))q(v) CROSS JOIN LATERAL(SELECT id FROM review_ops.rescan t ORDER BY t.v <-> q.v LIMIT 6)t"
         off = None
-        for mode, want in [('off', 5), ('on', 6)]:
+        # With the setting off, pgvector's graph does not hold the row with a NULL vector, so an index of the older handler returns 5 rows; an
+        # index with a cover descriptor keeps every inserted row in its ledger and merges it in, so it returns the same 6 rows as the exact mode.
+        for mode, want in [('off', 6 if cover_mode else 5), ('on', 6)]:
             ask(a, 'SET cuvs.hnsw_exact_scan=' + mode + ';')
             actual = js(a, 'SELECT jsonb_agg(x) FROM(' + lateral + ')x;')
             assert all((sum((row['v'] == value for row in actual)) == want for value in ['[100,0]', '[102,0]'])), actual
-            assert sum((row['id'] == 5 for row in actual)) == (2 if mode == 'on' else 0), actual
+            assert sum((row['id'] == 5 for row in actual)) == (2 if (mode == 'on' or cover_mode) else 0), actual
             if mode == 'on':
                 plan = json.loads('\n'.join(ask(a, 'EXPLAIN(ANALYZE,FORMAT JSON,COSTS OFF) ' + lateral + ';')))[0]['Plan']
                 inner = [n for n in nodes(plan) if n.get('Index Name') == 'rescan_i' and n.get('Actual Loops') == 2]
@@ -176,7 +215,10 @@ def main():
         result['cases'].append({'name': 'actual_custom_plan', 'verdict': 'PASS', 'rows': actual, 'counts': stats})
         ask(a, 'SET plan_cache_mode=force_generic_plan; PREPARE g(vector) AS SELECT jsonb_agg(x) FROM(SELECT id FROM review_ops.rescan ORDER BY v <-> $1 LIMIT 6)x; SET cuvs.hnsw_exact_scan=off;')
         off = js(a, "EXECUTE g('[100,0]');")
-        assert len(off) == 5 and all((row['id'] != 5 for row in off))
+        if cover_mode:
+            assert len(off) == 6 and off[-1]['id'] == 5
+        else:
+            assert len(off) == 5 and all((row['id'] != 5 for row in off))
         ask(a, 'SET cuvs.hnsw_exact_scan=on;')
         on = js(a, "EXECUTE g('[100,0]');")
         assert len(on) == 6 and on[-1]['id'] == 5
