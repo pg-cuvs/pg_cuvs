@@ -282,6 +282,10 @@ typedef struct CuvsPageProgress
     uint64_t covered_upto;
 } CuvsPageProgress;
 
+/* Overlay SEARCH replies use the v6 header's delta_merged field for this
+ * route-local flag. Legacy .delta commands retain their existing meaning. */
+#define CUVS_PAGE_OVERLAY_RECOVERY_PLACEHOLDERS 1U
+
 typedef struct CuvsPageOverlayResult
 {
     uint64_t slot;
@@ -360,6 +364,8 @@ void cuvs_ipc_close_page_resident(CuvsPageResidentCursor *cursor);
 /* Extend the idle wait while PostgreSQL is visiting base index slots. */
 bool cuvs_ipc_hold_page_resident(CuvsPageResidentCursor *cursor);
 
+bool cuvs_ipc_page_overlay_used_recovery_placeholders(void);
+
 typedef struct CuvsPageFoldQuery
 {
     uint32_t length;
@@ -435,6 +441,117 @@ int cuvs_ipc_page_history_prune(const char *socket_path, uint32_t db_oid, uint32
     const CuvsPageOverlayRequest *request, uint32_t horizon, uint64_t boot_started_us);
 
 
+
+/* Recovery uses v6 with a separate length-prefixed request. Only the PG
+ * worker supplies authoritative heads, from the metapage and its fold log. */
+#define CUVS_OP_PAGE_RECOVERY 69
+#define CUVS_PAGE_RECOVERY_BATCH 128U
+
+enum CuvsPageRecoveryOperation
+{
+    CUVS_PAGE_RECOVERY_CHECK = 1,
+    CUVS_PAGE_RECOVERY_FIND,
+    CUVS_PAGE_RECOVERY_INSTALL,
+    CUVS_PAGE_RECOVERY_LIST,
+    CUVS_PAGE_RECOVERY_PRUNE,
+    CUVS_PAGE_RECOVERY_INSTALL_AUTHORIZED,
+    CUVS_PAGE_RECOVERY_RETIRE_AUTHORIZED
+};
+
+typedef struct CuvsPageRecoveryHead
+{
+    uint64_t graph_nonce;
+    uint64_t n_slots;
+    uint64_t folded;
+} CuvsPageRecoveryHead;
+
+/* HNSW export boundary: graph IDs are [0, graph_rows). The consumer reads
+ * slot rows [graph_rows, L) and pending positions [F, T) from PostgreSQL. */
+typedef struct CuvsPageGraphBoundary
+{
+    uint64_t graph_rows;
+} CuvsPageGraphBoundary;
+
+typedef struct CuvsPageRecoveryRequest
+{
+    uint32_t length;
+    uint32_t operation;
+    uint64_t system_identifier;
+    uint64_t index_nonce;
+    uint64_t base_nonce;
+    uint64_t boot_id;
+    uint64_t build_xid;
+    CuvsPageRecoveryHead target;
+    CuvsPageRecoveryHead source;
+    uint32_t count;
+    uint32_t placeholder_rows;
+} CuvsPageRecoveryRequest;
+
+/* Authorized recovery requests carry this frame after the FD handoff.
+ * The daemon waits on the same socket for PG's grant before retiring an
+ * obsolete boot or registering a prepared graph. */
+typedef struct CuvsPageRecoveryAuthority
+{
+    uint64_t wal_lsn;
+    uint32_t tablespace_oid;
+    uint32_t database_oid;
+    uint32_t rel_number;
+    uint32_t physical_dead_slots;
+} CuvsPageRecoveryAuthority;
+
+typedef struct CuvsPageRecoveryOffer
+{
+    uint64_t daemon_id;
+    uint64_t challenge;
+    uint32_t db_oid;
+    uint32_t index_oid;
+    uint64_t system_identifier;
+    uint64_t boot_id;
+    uint64_t index_nonce;
+    uint64_t base_nonce;
+    CuvsPageRecoveryHead target;
+    CuvsPageRecoveryHead source;
+    CuvsPageRecoveryAuthority authority;
+} CuvsPageRecoveryOffer;
+
+enum CuvsPageCheckpointAction
+{
+    CUVS_PAGE_CHECKPOINT_KEEP,
+    CUVS_PAGE_CHECKPOINT_PRUNE_FOREIGN,
+    CUVS_PAGE_CHECKPOINT_PRUNE_ANCESTOR
+};
+
+/* LIST identifies one exact directory version. The PG worker returns only
+ * approved entries to PRUNE and includes its WAL classification. */
+typedef struct CuvsPageCheckpointRef
+{
+    CuvsPageRecoveryHead head;
+    uint64_t build_xid;
+    uint64_t device;
+    uint64_t inode;
+    int64_t change_sec;
+    uint32_t change_nsec;
+    uint32_t manifest_crc;
+    uint32_t action;
+    uint32_t reserved;
+} CuvsPageCheckpointRef;
+
+#ifdef CUVS_CAGRA_FOLD_ENABLED
+int cuvs_ipc_page_recover(const char *socket_path, uint32_t db_oid, uint32_t index_oid,
+    uint32_t dim, uint32_t metric, uint32_t degree, uint32_t intermediate,
+    uint32_t algo, const char *root, const CuvsPageRecoveryRequest *request,
+    const CuvsPageRecoveryHead *lineage, int rows_fd, CuvsPageRecoveryHead *found,
+    bool *reconcile_due);
+int cuvs_ipc_page_install_begin(const char *socket_path, uint32_t db_oid, uint32_t index_oid,
+    uint32_t dim, uint32_t metric, uint32_t degree, uint32_t intermediate,
+    uint32_t algo, const char *root, const CuvsPageRecoveryRequest *request, int rows_fd,
+    const CuvsPageRecoveryAuthority *authority, CuvsPageRecoveryOffer *offer, int *connection);
+int cuvs_ipc_page_install_confirm(int connection, const CuvsPageRecoveryOffer *offer);
+int cuvs_ipc_page_reconcile(const char *socket_path, uint32_t db_oid, uint32_t index_oid,
+    uint32_t dim, uint32_t metric, uint32_t degree, uint32_t intermediate,
+    uint32_t algo, const char *root, const CuvsPageRecoveryRequest *request,
+    CuvsPageCheckpointRef *entries, uint32_t *listed);
+#endif
 
 /* ----------------------------------------------------------------
  * Distance metrics (mirror pgvector operator names)

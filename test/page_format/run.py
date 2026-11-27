@@ -115,7 +115,7 @@ checkpoint_timeout = '30min'
 
     @contextmanager
     def daemon(self, binary, label, *, seed_bf=False, fault=None, vram_mib=None, max_indexes=None,
-               overlay_host_bytes=None, overlay_gate_dir=None):
+               overlay_host_bytes=None, overlay_gate_dir=None, syscall_trace=None):
         env = self.env.copy()
         for gate in ("score", "receive"):
             key = f"CUVS_TEST_PAGE_OVERLAY_{gate.upper()}_FIFO"
@@ -137,6 +137,15 @@ checkpoint_timeout = '30min'
             args.extend(["--max-indexes", str(max_indexes)])
         if overlay_host_bytes is not None:
             args.extend(["--page-overlay-host-bytes", str(overlay_host_bytes)])
+        if syscall_trace is not None:
+            tracer = shutil.which("strace", path=env["PATH"])
+            if tracer is None:
+                raise RuntimeError("the checkpoint syscall oracle requires Linux strace")
+            # -D keeps the daemon as the Popen child for the existing kill
+            # and wait operations. -ff gives each checkpoint writer its own log.
+            args = [tracer, "-D", "-ff", "-yy", "-s", "4096", "-e",
+                    "trace=mkdir,mkdirat,fsync,rename,renameat,renameat2,link,linkat",
+                    "-o", syscall_trace, *args]
         with (self.logs / f"daemon-{label}.log").open("w") as log, subprocess.Popen(
             args, stdout=log, stderr=subprocess.STDOUT, env=env, cwd=self.data.parent,
         ) as daemon:

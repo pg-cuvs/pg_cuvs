@@ -380,7 +380,7 @@ static void
 test_gpu_host_retry_vram(bool other_ready)
 {
     PageCagraGraph parent = {.n_slots = 512, .dim = 32, .index_oid = 31, .registered_order = 11,
-        .overlay = {.boot_id = 9, .covered_upto = 100}};
+        .boundary = {.graph_rows = 512}, .overlay = {.boot_id = 9, .covered_upto = 100}};
     PageCagraGraph other = parent;
 
     reset(CUVS_HNSW_OVERFLOW_ERROR, 0);
@@ -460,6 +460,7 @@ attach_fold_host_overlay(PageCagraGraph *parent, const CuvsPageOverlayRequest *r
         chunk->marks[i] = (CuvsPagePosition) {.block = 1, .state = CUVS_PAGE_POSITION_VECTOR};
     *parent = (PageCagraGraph) {.n_slots = 512, .dim = 32, .db_oid = 2, .index_oid = 31,
         .system_identifier = 1, .index_nonce = 5, .base_nonce = 8, .graph_nonce = 8,
+        .boundary = {.graph_rows = 512},
         .overlay = {.boot_id = 9, .covered_upto = request->positions, .head = chunk},
         .handle = parent};    /* the fold fixture never dereferences the parent handle */
     g_page_graphs = parent;
@@ -723,6 +724,7 @@ test_fold_candidate_pressure(bool ready_exposed, uint32_t algo, int requester, F
         .system_identifier = event.system_identifier, .index_nonce = event.index_nonce,
         .base_nonce = event.base_nonce, .graph_nonce = event.parent_graph_nonce,
         .n_slots = event.parent_n_slots, .dim = 32, .bytes = parent_bytes,
+        .boundary = {.graph_rows = event.parent_n_slots},
         .overlay = {.boot_id = event.boot_id, .covered_upto = 1}};
     parent->handle = cuvs_cagra_build(rows, 512, 32, CUVS_METRIC_L2, 64, 128,
         CUVS_CAGRA_BUILD_AUTO, 0, CUVS_LW_OVERFLOW_ERROR, NULL);
@@ -1080,7 +1082,7 @@ register_pressure_fold(int device, bool exposed, size_t parent_bytes, size_t chi
         .system_identifier = event.system_identifier, .index_nonce = event.index_nonce,
         .base_nonce = event.base_nonce, .graph_nonce = event.parent_graph_nonce,
         .n_slots = 4, .dim = 32, .gpu = device, .bytes = parent_bytes,
-        .overlay = {.boot_id = event.boot_id, .covered_upto = 1}};
+        .boundary = {.graph_rows = 4}, .overlay = {.boot_id = event.boot_id, .covered_upto = 1}};
     parent->handle = cuvs_cagra_build(rows, 4, 32, CUVS_METRIC_L2, 8, 16,
         CUVS_CAGRA_BUILD_AUTO, device, CUVS_LW_OVERFLOW_ERROR, NULL);
     CuvsCagraIndex child = cuvs_cagra_build(rows, 5, 32, CUVS_METRIC_L2, 8, 16,

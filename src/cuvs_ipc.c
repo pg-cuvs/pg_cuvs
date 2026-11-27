@@ -980,6 +980,14 @@ typedef struct PageOverlayConnection
     int supplement_fd;
 } PageOverlayConnection;
 
+static _Thread_local bool g_page_overlay_recovery_placeholders;
+
+bool
+cuvs_ipc_page_overlay_used_recovery_placeholders(void)
+{
+    return g_page_overlay_recovery_placeholders;
+}
+
 static int
 page_overlay_send_request(const char *socket_path, CuvsCmdFrame *cmd, CuvsPageOverlayRequest *frame,
                           const float *queries, const CuvsPageSupplement *supplement,
@@ -1074,6 +1082,7 @@ page_overlay_exchange(const char *socket_path, CuvsCmdFrame *cmd, CuvsPageOverla
 
     *count = 0;
     *latency_us = 0;
+    g_page_overlay_recovery_placeholders = false;
     memset(progress, 0, sizeof(*progress));
     status = page_overlay_send_request(socket_path, cmd, frame, queries, supplement, &connection);
     if (status != CUVS_STATUS_OK)
@@ -1109,6 +1118,8 @@ page_overlay_exchange(const char *socket_path, CuvsCmdFrame *cmd, CuvsPageOverla
                 status = waiting == 1 ? CUVS_STATUS_CANCELED : CUVS_STATUS_ERROR;
             else
             {
+                g_page_overlay_recovery_placeholders =
+                    reply.delta_merged == CUVS_PAGE_OVERLAY_RECOVERY_PLACEHOLDERS;
                 *count = (int) reply.n_results;
                 *latency_us = reply.latency_us;
             }
@@ -1623,6 +1634,135 @@ cuvs_ipc_page_history_prune(const char *socket_path, uint32_t db_oid, uint32_t i
     prune.base.reserved = horizon;
     return page_fold_exchange(socket_path, &cmd, &prune, sizeof(prune), NULL);
 }
+
+#ifdef CUVS_CAGRA_FOLD_ENABLED
+static int
+page_recovery_exchange(const char *socket_path, CuvsCmdFrame *cmd, const char *root,
+                       const CuvsPageRecoveryRequest *request, const void *input,
+                       size_t input_bytes, int rows_fd, void *output, size_t output_size,
+                       uint32_t output_limit, uint32_t *reported, int *continuation)
+{
+    const int timeout = request->operation == CUVS_PAGE_RECOVERY_INSTALL_AUTHORIZED ? 600 :
+        request->operation == CUVS_PAGE_RECOVERY_PRUNE ? 120 : 5;
+    CuvsReplyHeader reply;
+    char dir[CUVS_PAGE_INDEX_DIR_SIZE] = {0};
+    int canceled, waiting, sock;
+    int status = CUVS_STATUS_UNAVAILABLE;
+
+    *reported = 0;
+    if (continuation)
+        *continuation = -1;
+    if (!socket_path || !socket_path[0] || !root || strlen(root) >= sizeof(dir) ||
+        (input_bytes && !input))
+        return CUVS_STATUS_ERROR;
+    memcpy(dir, root, strlen(root));
+    sock = uds_connect_wait(socket_path, 1, &canceled);
+    if (sock < 0)
+        return canceled ? CUVS_STATUS_CANCELED : status;
+    if (send_cmd(sock, cmd) != 0 || send_all(sock, request, sizeof(*request)) != 0 ||
+        cuvs_fd_send(sock, rows_fd, dir, sizeof(dir)) != 0 ||
+        (input_bytes && send_all(sock, input, input_bytes) != 0))
+        goto done;
+    waiting = recv_all_interruptible_with_deadline(sock, &reply, sizeof(reply), timeout, true);
+    if (waiting == 0)
+    {
+        status = reply.status;
+        if (status == CUVS_STATUS_OK && request->operation == CUVS_PAGE_RECOVERY_FIND)
+            reply.n_results = 1; /* The initial recovery daemon sent the fixed payload with count zero. */
+        if (status == CUVS_STATUS_OK && output_size &&
+            (reply.n_results > output_limit ||
+             (reply.n_results && (!output ||
+              recv_all_interruptible_with_deadline(sock, output, reply.n_results * output_size,
+                                                   timeout, true) != 0))))
+            status = CUVS_STATUS_ERROR;
+        if (status == CUVS_STATUS_OK)
+            *reported = reply.n_results;
+    }
+    else if (waiting == 1)
+        status = CUVS_STATUS_CANCELED;
+done:
+    if (continuation && status == CUVS_STATUS_OK && *reported == 1)
+        *continuation = sock;
+    else
+        close(sock);
+    return status;
+}
+
+int
+cuvs_ipc_page_recover(const char *socket_path, uint32_t db_oid, uint32_t index_oid,
+                     uint32_t dim, uint32_t metric, uint32_t degree, uint32_t intermediate,
+                     uint32_t algo, const char *root, const CuvsPageRecoveryRequest *request,
+                     const CuvsPageRecoveryHead *lineage, int rows_fd,
+                     CuvsPageRecoveryHead *found, bool *reconcile_due)
+{
+    CuvsCmdFrame cmd = {.op = CUVS_OP_PAGE_RECOVERY, .db_oid = db_oid, .index_oid = index_oid,
+                       .dim = dim, .metric = metric, .graph_degree = degree,
+                       .intermediate_graph_degree = intermediate, .build_algo = algo};
+    uint32_t reported;
+    int status;
+
+    if (request->count > CUVS_PAGE_RECOVERY_BATCH)
+        return CUVS_STATUS_ERROR;
+    status = page_recovery_exchange(socket_path, &cmd, root, request, lineage,
+                                   request->count * sizeof(*lineage), rows_fd,
+                                   found, found ? sizeof(*found) : 0, 1, &reported, NULL);
+    if (reconcile_due)
+        *reconcile_due = status == CUVS_STATUS_OK && reported == 1;
+    if (found && status == CUVS_STATUS_OK && reported != 1)
+        return CUVS_STATUS_ERROR;
+    return status;
+}
+
+int
+cuvs_ipc_page_install_begin(const char *socket_path, uint32_t db_oid, uint32_t index_oid,
+                           uint32_t dim, uint32_t metric, uint32_t degree, uint32_t intermediate,
+                           uint32_t algo, const char *root, const CuvsPageRecoveryRequest *request,
+                           int rows_fd, const CuvsPageRecoveryAuthority *authority,
+                           CuvsPageRecoveryOffer *offer, int *connection)
+{
+    CuvsCmdFrame cmd = {.op = CUVS_OP_PAGE_RECOVERY, .db_oid = db_oid, .index_oid = index_oid,
+                       .dim = dim, .metric = metric, .graph_degree = degree,
+                       .intermediate_graph_degree = intermediate, .build_algo = algo};
+    uint32_t reported;
+
+    return page_recovery_exchange(socket_path, &cmd, root, request, authority, sizeof(*authority),
+                                  rows_fd, offer, sizeof(*offer), 1, &reported, connection);
+}
+
+int
+cuvs_ipc_page_install_confirm(int connection, const CuvsPageRecoveryOffer *offer)
+{
+    CuvsReplyHeader reply;
+    int waiting;
+
+    if (send_all(connection, offer, sizeof(*offer)) != 0)
+        return CUVS_STATUS_ERROR;
+    waiting = recv_all_interruptible_with_deadline(connection, &reply, sizeof(reply), 5, true);
+    if (waiting == 0)
+        return reply.status;
+    return waiting == 1 ? CUVS_STATUS_CANCELED : CUVS_STATUS_ERROR;
+}
+
+int
+cuvs_ipc_page_reconcile(const char *socket_path, uint32_t db_oid, uint32_t index_oid,
+                       uint32_t dim, uint32_t metric, uint32_t degree, uint32_t intermediate,
+                       uint32_t algo, const char *root, const CuvsPageRecoveryRequest *request,
+                       CuvsPageCheckpointRef *entries, uint32_t *listed)
+{
+    CuvsCmdFrame cmd = {.op = CUVS_OP_PAGE_RECOVERY, .db_oid = db_oid, .index_oid = index_oid,
+                       .dim = dim, .metric = metric, .graph_degree = degree,
+                       .intermediate_graph_degree = intermediate, .build_algo = algo};
+    const bool list = request->operation == CUVS_PAGE_RECOVERY_LIST;
+
+    if ((!list && request->operation != CUVS_PAGE_RECOVERY_PRUNE) ||
+        request->count > CUVS_PAGE_RECOVERY_BATCH)
+        return CUVS_STATUS_ERROR;
+    return page_recovery_exchange(socket_path, &cmd, root, request, list ? NULL : entries,
+                                  list ? 0 : request->count * sizeof(*entries), -1,
+                                  list ? entries : NULL, list ? sizeof(*entries) : 0,
+                                  CUVS_PAGE_RECOVERY_BATCH, listed, NULL);
+}
+#endif
 
 /* ----------------------------------------------------------------
  * Public API: cuvs_ipc_search

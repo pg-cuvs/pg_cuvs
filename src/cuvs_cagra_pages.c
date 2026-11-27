@@ -38,6 +38,9 @@ cuvs_cagra_require_legacy(Relation index)
 #include "access/xloginsert.h"
 #include "cuvs_cagra_history.h"
 #include "cuvs_util.h"
+#ifdef CUVS_CAGRA_FOLD_ENABLED
+#include "cuvs_page_recovery.h"
+#endif
 #include "executor/tuptable.h"
 #include "lib/stringinfo.h"
 #include "storage/bufpage.h"
@@ -832,6 +835,100 @@ fold_log_tail(Relation index, const CuvsCagraMeta *meta, Page page)
         bad_page(index, meta->foldlog_tail);
     return tag;
 }
+
+#ifdef CUVS_CAGRA_FOLD_ENABLED
+/* Copy one PG-authoritative lineage while publication is excluded. No IPC
+ * or heap scan runs under FCL. Any malformed or changing chain is rejected. */
+CuvsPageRecoveryHead *
+cuvs_cagra_read_lineage(Relation index, const CuvsCagraMeta *expected, uint32 *count, XLogRecPtr *lsn)
+{
+    CuvsCagraMeta meta;
+    CuvsPageRecoveryHead *heads = NULL;
+    uint32 capacity = 0;
+    uint32 used = 0;
+    BlockNumber block, blocks;
+    bool valid = false;
+    CuvsPageRecoveryHead target = {
+        .graph_nonce = expected->graph_nonce, .n_slots = expected->n_slots, .folded = expected->folded,
+    };
+
+    *count = 0;
+    if (!ConditionalLockPage(index, 0, ShareLock))
+        return NULL;
+    Buffer metapage = ReadBuffer(index, 0);
+    LockBuffer(metapage, BUFFER_LOCK_SHARE);
+    Page image = BufferGetPage(metapage);
+    const CuvsCagraMeta *current = page_meta(image);
+
+    if (current)
+        meta = *current;
+    *lsn = PageGetLSN(image);
+    UnlockReleaseBuffer(metapage);
+    if (!current || meta.index_nonce != expected->index_nonce ||
+        meta.base_nonce != expected->base_nonce || meta.graph_nonce != expected->graph_nonce ||
+        meta.n_slots != expected->n_slots || meta.folded != expected->folded ||
+        XLogRecPtrIsInvalid(*lsn))
+        goto done;
+
+    blocks = RelationGetNumberOfBlocks(index);
+    if (!meta.foldlog_head || meta.foldlog_head > meta.foldlog_tail || meta.foldlog_tail >= blocks)
+        goto done;
+    block = meta.foldlog_head;
+    for (;;)
+    {
+        CuvsCagraFoldPage tag;
+        CuvsCagraFoldRecord records[CUVS_CAGRA_FOLD_RECORDS_PER_PAGE];
+
+        CHECK_FOR_INTERRUPTS();
+        if (!cuvs_cagra_history_read_fold_log_page(index, block, &tag, records))
+            break;
+
+        for (uint32 i = 0; i < tag.count; ++i)
+        {
+            CuvsPageRecoveryHead head = {
+                .graph_nonce = records[i].graph_nonce, .n_slots = records[i].n_slots,
+                .folded = records[i].folded,
+            };
+
+            if ((!used && (head.graph_nonce != meta.base_nonce ||
+                           head.n_slots != meta.base_slots || head.folded)) ||
+                !cuvs_page_recovery_lineage(&head, &target) ||
+                (used && (head.n_slots <= heads[used - 1].n_slots ||
+                          !cuvs_page_recovery_lineage(&heads[used - 1], &head))))
+            {
+                goto done;
+            }
+            if (used == capacity)
+            {
+                capacity = capacity ? capacity * 2 : CUVS_PAGE_RECOVERY_BATCH;
+                if (!AllocSizeIsValid((Size) capacity * sizeof(*heads)))
+                    goto done;
+                heads = heads ? repalloc(heads, (Size) capacity * sizeof(*heads))
+                              : palloc((Size) capacity * sizeof(*heads));
+            }
+            heads[used++] = head;
+        }
+        if (block == meta.foldlog_tail)
+        {
+            valid = !BlockNumberIsValid(tag.next) && cuvs_page_recovery_head_matches(&heads[used - 1], &target);
+            break;
+        }
+        if (tag.count != CUVS_CAGRA_FOLD_RECORDS_PER_PAGE || tag.next <= block || tag.next > meta.foldlog_tail)
+            break;
+        block = tag.next;
+    }
+done:
+    UnlockPage(index, 0, ShareLock);
+    if (!valid)
+    {
+        if (heads)
+            pfree(heads);
+        return NULL;
+    }
+    *count = used;
+    return heads;
+}
+#endif
 
 /* The event is retained by the daemon until acknowledged. A replacement
  * worker can prove the same publication from the current metapage and log. */
