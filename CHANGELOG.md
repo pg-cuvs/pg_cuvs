@@ -65,7 +65,8 @@ exists for 0.9.0.
   every row inserted since, are always candidates of a scan of a certified index. What is
   not: rows that later inserts cut off from the graph are outside the guarantee until the
   next recertification (on one strongly clustered test table shape, twelve runs from two measurements: 0 to 1.4 percent of the original rows after about 15,000 inserts, against 0 to 0.7 percent for pgvector alone in twelve runs; the measurements do not tell the two kinds apart, and reference.md has the conditions and the runs). Not covered or not verified: GPU-built indexes over existing rows, performance
-  at large scale, and row-level security, index expression and partial index shapes.
+  at large scale. An index with a descriptor on a table with row-level security, behind a security barrier, or with an expression or predicate is
+  answered, never refused: see reference.md for what answers each shape.
 
 ### Changed
 

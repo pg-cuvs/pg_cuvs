@@ -148,12 +148,13 @@ class Cluster:
         assert rc == 0, out
         return out
 
-    def make_index(self, table='t', index='ti'):
+    def make_index(self, table='t', index='ti', key='v', where=''):
         """A pgvector hnsw index whose access method is switched to pg_cuvs_hnsw in the catalog: the pages
-        are exactly those of an index built by an older pg_cuvs without a cover descriptor (LEGACY)."""
+        are exactly those of an index built by an older pg_cuvs without a cover descriptor (LEGACY).
+        `key` is the indexed expression (a column by default), `where` the predicate of a partial index."""
         for sql in (f'CREATE TABLE {table}(id int, v vector(3))',
                     f'INSERT INTO {table} SELECT g, ARRAY[g, g % 7, g % 3]::real[]::vector FROM generate_series(1, 300) g',
-                    f'CREATE INDEX {index} ON {table} USING hnsw (v vector_l2_ops)',
+                    f'CREATE INDEX {index} ON {table} USING hnsw ({key} vector_l2_ops)' + (f' WHERE {where}' if where else ''),
                     f"UPDATE pg_class SET relam = (SELECT oid FROM pg_am WHERE amname = 'pg_cuvs_hnsw') WHERE relname = '{index}'",
                     f"UPDATE pg_index SET indclass = (SELECT oid::text::oidvector FROM pg_opclass WHERE opcname = 'vector_l2_ops' "
                     f"AND opcmethod = (SELECT oid FROM pg_am WHERE amname = 'pg_cuvs_hnsw')) WHERE indexrelid = '{index}'::regclass"):

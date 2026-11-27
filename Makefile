@@ -1748,6 +1748,22 @@ test-hnsw-exact-pg:
 	        --expected-data-directory $(HNSW_EXACT_DATADIR) --pg-bin $$(pg_config --bindir) \
 	        || exit 1; \
 	done
+	# The same four scripts again on a cluster that went back to 0.9.2, whose access method handler is the older symbol: what a cluster that
+	# was not updated has (its indexes carry no cover descriptor). Each script reads the handler and expects what that handler gives. The
+	# cluster is put back to 0.9.3 at the end, also when a script fails.
+	psql=$$(pg_config --bindir)/psql; \
+	conn="-X -h $(HNSW_EXACT_SOCKET) -p $(HNSW_EXACT_PORT) -U $(HNSW_EXACT_USER) -d $(HNSW_EXACT_DB)"; \
+	$$psql $$conn -c "ALTER EXTENSION pg_cuvs UPDATE TO '0.9.2'" || exit 1; \
+	run=$$(($$(date +%s) + 1)); rc=0; \
+	for t in pg product_pg rls_pg protected_pg; do \
+	    python3 test/unit/test_hnsw_exact_$$t.py --output $(HNSW_EXACT_OUT)/older-$$t \
+	        --schema hx$${run}_$$t --socket $(HNSW_EXACT_SOCKET) --port $(HNSW_EXACT_PORT) \
+	        --user $(HNSW_EXACT_USER) --database $(HNSW_EXACT_DB) \
+	        --expected-data-directory $(HNSW_EXACT_DATADIR) --pg-bin $$(pg_config --bindir) \
+	        || { rc=1; break; }; \
+	done; \
+	$$psql $$conn -c "ALTER EXTENSION pg_cuvs UPDATE TO '0.9.3'" || rc=1; \
+	exit $$rc
 
 # Isolated native PostgreSQL CPU regression; server/dev binaries and psql needed.
 # It starts its own Unix-socket cluster and does not connect to an existing DB.
