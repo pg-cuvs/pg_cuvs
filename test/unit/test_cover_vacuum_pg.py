@@ -55,6 +55,7 @@ def hack_index(c, table, index, opts=''):
     """A pgvector hnsw index whose access method is switched to pg_cuvs_hnsw (the pages of a row-built index)."""
     c.scalar(f"CREATE INDEX {index} ON {table} USING hnsw (v vector_l2_ops) {opts}")
     c.scalar(f"UPDATE pg_class SET relam = (SELECT oid FROM pg_am WHERE amname = 'pg_cuvs_hnsw') WHERE relname = '{index}'")
+    c.scalar(f"UPDATE pg_depend SET refobjid = (SELECT oid FROM pg_opclass WHERE opcname = 'vector_l2_ops' AND opcmethod = (SELECT oid FROM pg_am WHERE amname = 'pg_cuvs_hnsw')) WHERE classid = 'pg_class'::regclass AND objid = '{index}'::regclass AND refclassid = 'pg_opclass'::regclass")
     c.scalar(f"UPDATE pg_index SET indclass = (SELECT oid::text::oidvector FROM pg_opclass WHERE opcname = 'vector_l2_ops' "
              f"AND opcmethod = (SELECT oid FROM pg_am WHERE amname = 'pg_cuvs_hnsw')) WHERE indexrelid = '{index}'::regclass")
 

@@ -388,6 +388,13 @@ cover_end(IndexScanDesc scan)
     scan->opaque = NULL;
 }
 
+/* pgvector's own scan routines, for a caller that wants the graph search without the cover merge (the insert verification). */
+const IndexAmRoutine *
+cuvs_hnsw_scan_delegate(void)
+{
+    return &delegate;
+}
+
 void
 cuvs_hnsw_scan_wrap(IndexAmRoutine *routine)
 {

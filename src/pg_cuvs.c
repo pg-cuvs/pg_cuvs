@@ -32,6 +32,7 @@
 #include "utils/timestamp.h"
 #include "portability/instr_time.h"
 #include "utils/tuplestore.h"
+#include "cuvs_cover_verify.h"
 #include "utils/json.h"          /* escape_json: I4 pool status text */
 #include "access/amapi.h"
 #include "access/heapam.h"
@@ -1346,6 +1347,17 @@ _PG_init(void)
         &enable_cuvs,
         true,
         PGC_USERSET,
+        0, NULL, NULL, NULL);
+
+    DefineCustomBoolVariable(
+        "cuvs.cover_verify_inserts",
+        "Experimental: do not write a ledger key for an inserted row that a search for it finds.",
+        "After the insert the row is searched for with its own vector through pgvector's scan; a row the search returns was reachable from the "
+        "entry point at that moment. Off by default; a row verified this way is outside the ledger, and a later insert that cuts it off from "
+        "the graph is outside the guarantee until the next recertification.",
+        &cuvs_cover_verify_inserts,
+        false,
+        PGC_SUSET,
         0, NULL, NULL, NULL);
 
     DefineCustomBoolVariable(

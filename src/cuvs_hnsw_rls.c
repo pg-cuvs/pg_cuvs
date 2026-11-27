@@ -16,7 +16,10 @@
 #include "access/relation.h"
 #include "access/skey.h"
 #include "access/table.h"
+#include "catalog/indexing.h"
 #include "catalog/pg_class.h"
+#include "catalog/pg_depend.h"
+#include "catalog/pg_opclass.h"
 #include "catalog/pg_index.h"
 #include "catalog/pg_inherits.h"
 #include "catalog/pg_language.h"
@@ -55,7 +58,7 @@ static int executing_rls = -1;  /* -1: the range table was not looked at yet */
  * them has an expression or a predicate. Without an index that has an expression or a predicate, and without cuvs.hnsw_exact_scan, the
  * planning has nothing to remove or to look ahead for, and a statement passes through the planner and path hooks as if they were not
  * there; without any index of the access method no scan of one can start, and the executor hooks stand aside as well. The answer is
- * looked up in pg_class (the rows of the access method, then pg_index for each of them) and thrown away by the invalidation of any
+ * looked up through the dependencies on the operator classes of the access method (then pg_index for each index found) and thrown away by the invalidation of any
  * pg_index tuple, which every CREATE INDEX (also CONCURRENTLY, whose phases update the tuple), DROP INDEX, REINDEX and ATTACH PARTITION
  * that adds or removes an index sends, also for a change the backend made itself and when a transaction that made one rolls back, and by
  * the invalidation of any pg_am tuple (the extension is created or dropped). Changes of pg_class that nobody could use to turn a
@@ -74,38 +77,58 @@ cover_invalidate(Datum arg, int cacheid, uint32 hashvalue)
     cover_generation++;
 }
 
+/* The indexes of the access method are found through the dependency every index records on the operator classes of its key columns: the
+ * operator classes of the access method (a handful, by the index on pg_opclass), then the dependents of each (by the index on pg_depend).
+ * The work does not grow with the number of tables and indexes of the database, which matters because any index created anywhere, a
+ * temporary table's primary key included, makes every backend look again. */
 static void
 cover_lookup(bool *any, bool *exprpred)
 {
     Oid am = get_am_oid("pg_cuvs_hnsw", true);
-    Relation rel;
+    Relation oprel, deprel;
     SysScanDesc scan;
-    ScanKeyData key;
+    ScanKeyData key[2];
     HeapTuple tuple;
+    List *opclasses = NIL;
+    ListCell *cell;
 
     *any = false;
     *exprpred = false;
     if (!OidIsValid(am))
         return;
-    rel = table_open(RelationRelationId, AccessShareLock);
-    ScanKeyInit(&key, Anum_pg_class_relam, BTEqualStrategyNumber, F_OIDEQ, ObjectIdGetDatum(am));
-    scan = systable_beginscan(rel, InvalidOid, false, NULL, 1, &key);
-    while (!*exprpred && HeapTupleIsValid(tuple = systable_getnext(scan))) {
-        Form_pg_class form = (Form_pg_class) GETSTRUCT(tuple);
-        HeapTuple index_tuple;
+    oprel = table_open(OperatorClassRelationId, AccessShareLock);
+    ScanKeyInit(&key[0], Anum_pg_opclass_opcmethod, BTEqualStrategyNumber, F_OIDEQ, ObjectIdGetDatum(am));
+    scan = systable_beginscan(oprel, OpclassAmNameNspIndexId, true, NULL, 1, key);
+    while (HeapTupleIsValid(tuple = systable_getnext(scan)))
+        opclasses = lappend_oid(opclasses, ((Form_pg_opclass) GETSTRUCT(tuple))->oid);
+    systable_endscan(scan);
+    table_close(oprel, AccessShareLock);
 
-        if (form->relkind != RELKIND_INDEX && form->relkind != RELKIND_PARTITIONED_INDEX)
-            continue;
-        *any = true;
-        index_tuple = SearchSysCache1(INDEXRELID, ObjectIdGetDatum(form->oid));
-        if (HeapTupleIsValid(index_tuple)) {
+    deprel = table_open(DependRelationId, AccessShareLock);
+    foreach(cell, opclasses) {
+        if (*exprpred)
+            break;
+        ScanKeyInit(&key[0], Anum_pg_depend_refclassid, BTEqualStrategyNumber, F_OIDEQ, ObjectIdGetDatum(OperatorClassRelationId));
+        ScanKeyInit(&key[1], Anum_pg_depend_refobjid, BTEqualStrategyNumber, F_OIDEQ, ObjectIdGetDatum(lfirst_oid(cell)));
+        scan = systable_beginscan(deprel, DependReferenceIndexId, true, NULL, 2, key);
+        while (!*exprpred && HeapTupleIsValid(tuple = systable_getnext(scan))) {
+            Form_pg_depend dep = (Form_pg_depend) GETSTRUCT(tuple);
+            HeapTuple index_tuple;
+
+            if (dep->classid != RelationRelationId)
+                continue;
+            index_tuple = SearchSysCache1(INDEXRELID, ObjectIdGetDatum(dep->objid));
+            if (!HeapTupleIsValid(index_tuple))
+                continue;
+            *any = true;
             *exprpred = !heap_attisnull(index_tuple, Anum_pg_index_indexprs, NULL) ||
                 !heap_attisnull(index_tuple, Anum_pg_index_indpred, NULL);
             ReleaseSysCache(index_tuple);
         }
+        systable_endscan(scan);
     }
-    systable_endscan(scan);
-    table_close(rel, AccessShareLock);
+    table_close(deprel, AccessShareLock);
+    list_free(opclasses);
 }
 
 static void
@@ -213,12 +236,32 @@ relation_has_rls(Oid relid)
     return enabled;
 }
 
-/* A partition or an inheritance child enters the range table only while planning, and the look-ahead below does not open it: a statement
- * on the parent applies the policies of the parent only, so the flag of a child decides nothing at the start of a statement, and finding
- * it there would walk the catalog entries of every descendant on every statement on the parent (a partitioned table with a thousand
+/* A partition or an inheritance child enters the range table only while planning. Under the explicit setting (cuvs.hnsw_exact_scan = on) a
+ * statement that reaches a child with row-level security through a parent without it is looked up here, on the original Query, so that
+ * one decision serves planning and the later checks and the statement is planned once (a planning side effect, such as the NOTICE of an
+ * IMMUTABLE function evaluated on constants, happens once). Without the setting the look-ahead does not open the children: a statement on
+ * the parent applies the policies of the parent only, so the flag of a child decides nothing at the start of a statement, and finding it
+ * there would walk the catalog entries of every descendant on every statement on the parent (a partitioned table with a thousand
  * partitions paid 0.23 ms for it, pruned to one partition or not). The flag of a child that is planned is seen where it matters: the paths
  * of that child are made under protected_paths, which checks the child's own table, and the final range table is checked after planning
  * (statement_has_rls_relation), which plans the statement again without the paths of the scope when a scan that must not run is left. */
+static bool
+descendants_have_rls(Oid relid)
+{
+    List *all = find_all_inheritors(relid, NoLock, NULL);
+    ListCell *cell;
+    bool found = false;
+
+    foreach(cell, all) {
+        if (lfirst_oid(cell) != relid && relation_has_rls(lfirst_oid(cell))) {
+            found = true;
+            break;
+        }
+    }
+    list_free(all);
+    return found;
+}
+
 static bool
 query_has_barrier(Node *node, void *context)
 {
@@ -234,7 +277,8 @@ query_has_barrier(Node *node, void *context)
             if (rte->rtekind == RTE_SUBQUERY && rte->security_barrier)
                 return true;
             if (rte->rtekind == RTE_RELATION &&
-                relation_has_rls(rte->relid))
+                (relation_has_rls(rte->relid) ||
+                 (context && *(bool *) context && rte->inh && has_subclass(rte->relid) && descendants_have_rls(rte->relid))))
                 return true;
         }
         return query_tree_walker(query, query_has_barrier, context, 0);
@@ -543,7 +587,7 @@ protected_plan(Query *query, const char *text, int options, ParamListInfo params
     bool active = exact || (cover && query_touches_cover_exprpred((Node *) query, &am));
     /* Optimization only: a protected shape visible before planning is planned once, without
      * any pg_cuvs_hnsw path. What this misses is caught by the check after planning. */
-    bool security = active && query_has_barrier((Node *) query, NULL);
+    bool security = active && query_has_barrier((Node *) query, &exact);
     /* The planner scribbles on its input (it pulls subqueries up and replaces function
      * calls in place), and planning an already planned Query again is not something
      * PostgreSQL promises to support. A pristine copy is kept for the one case that needs

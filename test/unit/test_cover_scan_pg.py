@@ -531,6 +531,7 @@ def main():
             c.scalar("SELECT setseed(0.42); INSERT INTO sf SELECT x, (SELECT array_agg((((x % 25) * 7 + d * 3) % 41 + (random() - 0.5) * 0.05)::real) FROM generate_series(1, 8) d)::vector FROM generate_series(1, 4000) x")
             c.scalar('CREATE INDEX sfi ON sf USING hnsw (v vector_l2_ops) WITH (m = 4, ef_construction = 8)')
             c.scalar("UPDATE pg_class SET relam = (SELECT oid FROM pg_am WHERE amname = 'pg_cuvs_hnsw') WHERE relname = 'sfi'")
+            c.scalar("UPDATE pg_depend SET refobjid = (SELECT oid FROM pg_opclass WHERE opcname = 'vector_l2_ops' AND opcmethod = (SELECT oid FROM pg_am WHERE amname = 'pg_cuvs_hnsw')) WHERE classid = 'pg_class'::regclass AND objid = 'sfi'::regclass AND refclassid = 'pg_opclass'::regclass")
             c.scalar("UPDATE pg_index SET indclass = (SELECT oid::text::oidvector FROM pg_opclass WHERE opcname = 'vector_l2_ops' AND opcmethod = (SELECT oid FROM pg_am WHERE amname = 'pg_cuvs_hnsw')) WHERE indexrelid = 'sfi'::regclass")
             path = c.data / c.scalar("SELECT pg_relation_filepath('sfi')")
             c.stop()
@@ -768,6 +769,103 @@ def main():
                 if rc1 != 0 or id_list(got) != id_list(want) or not id_list(want):
                     bad += 1
             check('S15 a certified partial index after updates and deletes: 15 ordered scans equal the exact ranking', bad == 0, f'{bad} differ')
+            # S17: cuvs.cover_verify_inserts (experimental, off by default). A row that a search for its own vector finds right after pgvector
+            # inserted it was reachable from the entry point then and gets no ledger key; a row the search does not find gets one, as without
+            # the setting.
+            def ledger_keys(index):
+                return int(json.loads(c.scalar(f"SELECT pg_cuvs_hnsw_cover_status('{index}')::text")).get('ledger_keys', -1))
+
+            c.scalar("CREATE FUNCTION pg_cuvs_cover_probe_unreached(regclass) RETURNS tid[] LANGUAGE c AS '$libdir/pg_cuvs', 'pg_cuvs_cover_probe_unreached'")
+            c.scalar("CREATE FUNCTION pg_cuvs_cover_probe_keys(regclass) RETURNS tid[] LANGUAGE c AS '$libdir/pg_cuvs', 'pg_cuvs_cover_probe_keys'")
+            c.scalar("CREATE FUNCTION pg_cuvs_cover_search_probe(regclass, vector, tid) RETURNS boolean LANGUAGE c AS '$libdir/pg_cuvs', 'pg_cuvs_cover_search_probe'")
+
+            def unkeyed_unreached(index):
+                # rows the graph does not reach that hold no key: the rows the guarantee does not cover
+                return int(c.scalar(f"SELECT count(*) FROM unnest(pg_cuvs_cover_probe_unreached('{index}'::regclass)) u "
+                                    f"WHERE u <> ALL (pg_cuvs_cover_probe_keys('{index}'::regclass))"))
+
+            for tname, on in (('vf_off', False), ('vf_srch', True)):
+                c.scalar(f'CREATE TABLE {tname}(id int, v vector(8))')
+                c.scalar(f'CREATE INDEX {tname}_i ON {tname} USING pg_cuvs_hnsw (v vector_l2_ops)')
+                setting = f"SET cuvs.cover_verify_inserts = {'on' if on else 'off'};"
+                rc, res = c.q(f"{setting} SELECT setseed(0.31); INSERT INTO {tname} SELECT g, (SELECT array_agg((random() * 10)::real) FROM generate_series(1, 8) d WHERE g > 0)::vector FROM generate_series(1, 1500) g")
+                keys = ledger_keys(f'{tname}_i')
+                if on:
+                    check('S17 verification on: most of 1,500 inserted rows get no ledger key', rc == 0 and keys <= 150, f'{keys} keys {res[:120]}')
+                    check('S17 verification on: every row is reached by the graph or holds a key', unkeyed_unreached(f'{tname}_i') == 0, str(unkeyed_unreached(f'{tname}_i')))
+                else:
+                    check('S17 verification off: every inserted row gets a ledger key', rc == 0 and keys == 1500, f'{keys} keys {res[:120]}')
+            # the search itself (a test function): a row the graph reaches is found, a heap TID the index does not hold is not
+            rc, res = c.q("SELECT count(*) FILTER (WHERE pg_cuvs_cover_search_probe('vf_srch_i'::regclass, v, ctid)), count(*) FROM vf_srch")
+            found_all, total = [int(x) for x in res.split('|')]
+            check('S17 the search finds most rows of the index with their own vector', rc == 0 and found_all >= int(total * 0.9), res)
+            rc, res = c.q("SELECT pg_cuvs_cover_search_probe('vf_srch_i'::regclass, v, '(999999,1)'::tid) FROM vf_srch LIMIT 1")
+            check('S17 a heap TID that the index does not hold is not found', rc == 0 and res == 'f', res)
+
+            # S17 the two guards of the search that no SQL statement can reach, through test functions: without an active snapshot the search answers
+            # "not found" (and does not crash the backend), and the search leaves the memory of its caller where it was
+            c.scalar("CREATE FUNCTION pg_cuvs_cover_search_nosnapshot_probe(regclass, vector, tid) RETURNS boolean LANGUAGE c AS '$libdir/pg_cuvs', 'pg_cuvs_cover_search_nosnapshot_probe'")
+            c.scalar("CREATE FUNCTION pg_cuvs_cover_search_memory_probe(regclass, vector, tid, int) RETURNS bigint LANGUAGE c AS '$libdir/pg_cuvs', 'pg_cuvs_cover_search_memory_probe'")
+            rc, res = c.q("SELECT pg_cuvs_cover_search_nosnapshot_probe('vf_srch_i'::regclass, v, ctid) FROM vf_srch WHERE id = 7")
+            check('S17 without an active snapshot the search answers "not found" and the backend lives', rc == 0 and res == 'f', res)
+            rc, res = c.q("SELECT pg_cuvs_cover_search_memory_probe('vf_srch_i'::regclass, v, ctid, 2000) FROM vf_srch WHERE id = 7")
+            check('S17 2,000 searches in a row leave the memory of the caller within 64 KB of where it was', rc == 0 and int(res) < 65536, res)
+
+            # S17 duplicates: more than 200 rows with the same vector (distance 0): the search reads at most 200 rows, so some rows are not found and
+            # get a key; none may end up neither reached nor keyed
+            c.scalar('CREATE TABLE vf_dup(id int, v vector(3))')
+            c.scalar('CREATE INDEX vf_dup_i ON vf_dup USING pg_cuvs_hnsw (v vector_l2_ops)')
+            rc, res = c.q("SET cuvs.cover_verify_inserts = on; INSERT INTO vf_dup SELECT g, '[1,2,3]' FROM generate_series(1, 450) g")
+            check('S17 450 identical vectors: the insert succeeds and no row is left neither reached nor keyed', rc == 0 and unkeyed_unreached('vf_dup_i') == 0, f'{unkeyed_unreached("vf_dup_i")} {res[:100]}')
+
+            # S17 growth monitor with an insert that adds two pages (a vector too large for an element and its neighbor tuple to share a page): each
+            # verified insert is an event of the ledger like a key, so the relation size it records follows the growth, and a key that is written
+            # after hundreds of such inserts does not find "more than 256 pages since the last key"
+            c.scalar('CREATE TABLE vf_big(id int, v vector(1900))')
+            c.scalar('CREATE INDEX vf_big_i ON vf_big USING pg_cuvs_hnsw (v vector_l2_ops)')
+            rc, res = c.q("SET cuvs.cover_verify_inserts = on; SELECT setseed(0.5); INSERT INTO vf_big SELECT g, (SELECT array_agg(random()::real) FROM generate_series(1, 1900) d WHERE g > 0)::vector FROM generate_series(1, 300) g")
+            rc2, res2 = c.q("SET cuvs.cover_verify_inserts = off; INSERT INTO vf_big SELECT 1000, (SELECT array_agg(random()::real) FROM generate_series(1, 1900) d)::vector")
+            st = json.loads(c.scalar("SELECT pg_cuvs_hnsw_cover_status('vf_big_i')::text"))
+            pages_now = int(c.scalar("SELECT pg_relation_size('vf_big_i') / 8192"))
+            check('S17 300 verified inserts of a high-dimensional vector (more than 256 pages of growth), then a key: the index is still certified',
+                  rc == 0 and rc2 == 0 and st.get('class') == 'certified' and pages_now > 256, f"{st.get('class')} {pages_now} pages {res[:80]} {res2[:80]}")
+
+            # Cut-off-row case: an element C whose incoming edges were all cut by later inserts and a row E that only C points to.
+            # E is not reachable, and neither is C. The cut is made in the index file (graph_cut.py)
+            # while the cluster is stopped. The search does not find E (it is not reached from the entry point); the exposure that remains is the
+            # one the guarantee names: rows cut off after their check are outside it until the next recertification, which keys them.
+            c.make_index('nc', 'nci')
+            ncpath = c.data / c.scalar("SELECT pg_relation_filepath('nci')")
+            plant_mode(ncpath, 'uncertified')
+            c.scalar("SELECT pg_cuvs_cover_recertify('nci')")
+            keys0 = ledger_keys('nci')
+            unreached0 = c.scalar("SELECT cardinality(pg_cuvs_cover_probe_unreached('nci'::regclass))")
+            check('S17 cut-off rows setup: the certified index holds exactly the unreached rows as keys', str(keys0) == unreached0, f'{keys0} keys, {unreached0} unreached')
+            flaw = None
+            for cid, eid in ((11, 12), (21, 22), (31, 32), (41, 42)):
+                cb, co = [int(x) for x in c.scalar(f"SELECT replace(replace(ctid::text, '(', ''), ')', '') FROM nc WHERE id = {cid}").split(',')]
+                eb, eo = [int(x) for x in c.scalar(f"SELECT replace(replace(ctid::text, '(', ''), ')', '') FROM nc WHERE id = {eid}").split(',')]
+                c.stop()
+                rc = subprocess.run([sys.executable, str(repo / 'test/unit/graph_cut.py'), str(ncpath), str(cb), str(co), str(eb), str(eo)],
+                                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+                assert rc.returncode == 0, rc.stdout
+                c.start()
+                both = c.scalar(f"SELECT count(*) FROM unnest(pg_cuvs_cover_probe_unreached('nci'::regclass)) u WHERE u IN ((SELECT ctid FROM nc WHERE id = {cid}), (SELECT ctid FROM nc WHERE id = {eid}))")
+                if both == '2':
+                    flaw = (cid, eid)
+                    break
+            check('S17 cut-off rows: C and E are unreachable after the cut', flaw is not None, str(flaw))
+            if flaw is not None:
+                e_found = c.scalar(f"SELECT pg_cuvs_cover_search_probe('nci'::regclass, v, ctid) FROM nc WHERE id = {flaw[1]}")
+                ok_found = c.scalar("SELECT pg_cuvs_cover_search_probe('nci'::regclass, v, ctid) FROM nc WHERE id = 100")
+                check('S17 cut-off rows: the search does not find E, which the entry point does not lead to', e_found == 'f', e_found)
+                check('S17 the search finds a row the graph reaches', ok_found == 't', ok_found)
+                # the size of the exposure, deterministically: both rows are outside the ledger now, and a recertification keys them
+                gap = unkeyed_unreached('nci')
+                c.scalar("SELECT pg_cuvs_cover_recertify('nci')")
+                check('S17 cut-off rows: the two cut-off rows are outside the ledger until the next recertification, which keys them',
+                      gap >= 2 and unkeyed_unreached('nci') == 0, f'{gap} before, {unkeyed_unreached("nci")} after')
+
             # S16: the backend remembers that the database has no index of the access method with an expression or a predicate, and passes
             # statements through the planner hooks untouched. Another session (or the backend itself, in the open transaction) creates such an
             # index on a table with row-level security: the next statement must be planned without it, as it is when the hooks run.
@@ -825,6 +923,43 @@ def main():
                     again = sa.run("EXECUTE inv_q")
                     check('S16 a prepared statement planned before the index existed is answered after it exists, with the same rows',
                           'ERROR' not in again and again == first and len([x for x in again.split("\n") if x.isdigit()]) == 5, again[:200])
+                    # the same from other ways in which an index appears or the invalidations are lost; each starts from a database without such an
+                    # index (the backend looks, and remembers that there is none), then the index appears, then the same statement
+                    c2.scalar('DROP INDEX IF EXISTS inv_ci')
+                    for t in ('inv_d', 'inv_e', 'inv_f', 'inv_g'):
+                        c2.scalar(f"CREATE TABLE {t}(id int, v vector(3)); GRANT SELECT ON {t} TO inv_r; ALTER TABLE {t} ENABLE ROW LEVEL SECURITY; CREATE POLICY pol ON {t} USING (id % 2 = 0)")
+
+                    def appears(label, table, action):
+                        before = explain(table)
+                        action()
+                        c2.scalar(fill.format(t=table))
+                        after = explain(table)
+                        check(f'S16 {label}: not used on a table with row-level security (and the plan before it was the sequential one)', 'Index Scan' not in before and 'Index Scan' not in after, f'{before} || {after}')
+                    appears('an index created CONCURRENTLY by another session', 'inv_d', lambda: c2.scalar(f"CREATE INDEX CONCURRENTLY inv_di ON inv_d USING pg_cuvs_hnsw (({ordx}) vector_l2_ops)"))
+                    sb2 = dg.Session(c2)
+                    try:
+                        def rolled_back_then_real():
+                            sb2.run('BEGIN')
+                            sb2.run(f"CREATE INDEX inv_ei0 ON inv_e USING pg_cuvs_hnsw (({ordx}) vector_l2_ops)")
+                            sb2.run('ROLLBACK')
+                            check('S16 after a rolled-back creation the plan is still the sequential one', 'Index Scan' not in explain('inv_e'), explain('inv_e'))
+                            c2.scalar(f"CREATE INDEX inv_ei ON inv_e USING pg_cuvs_hnsw (({ordx}) vector_l2_ops)")
+                        appears('an index created after another one was created and rolled back', 'inv_e', rolled_back_then_real)
+                    finally:
+                        sb2.close()
+
+                    def overflow():
+                        # the queue of invalidation messages holds 4096: a burst of catalog changes while this backend is idle makes it reset its caches instead
+                        c2.scalar(f"CREATE INDEX inv_fi ON inv_f USING pg_cuvs_hnsw (({ordx}) vector_l2_ops)")
+                        for _ in range(8):
+                            c2.scalar("DO $$ BEGIN FOR i IN 1..400 LOOP EXECUTE 'CREATE TEMP TABLE ov_' || i || '(a int primary key, b text)'; END LOOP; END $$")
+                    appears('an index whose message was lost in an overflow of the invalidation queue', 'inv_f', overflow)
+
+                    def new_extension():
+                        c2.scalar('DROP EXTENSION pg_cuvs CASCADE')
+                        c2.scalar('CREATE EXTENSION pg_cuvs')
+                        c2.scalar(f"CREATE INDEX inv_gi ON inv_g USING pg_cuvs_hnsw (({ordx}) vector_l2_ops)")
+                    appears('an index of the access method of an extension that was dropped and created again', 'inv_g', new_extension)
                 finally:
                     sa.close()
             finally:

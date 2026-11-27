@@ -75,9 +75,15 @@ SET client_min_messages = 'notice';
 
 -- ── Case 1: index_bytes shrinks below the old 1-pair-per-page size ──
 -- Old layout: 1 (meta) + 500 (one per element) = 501 pages = 4,104,192 bytes.
--- Packed (k=9 for level-0 pairs, upper-layer pairs larger): 59 pages = 483,328 bytes.
+-- Packed (k=9 for level-0 pairs, upper-layer pairs larger): 59 graph pages = 483,328 bytes, plus the pages of the cover (an index created under 0.9.3
+-- carries them, see docs/reference.md, Cover guarantee).
+-- The graph is exactly blocks 0..58: the last two bytes of a pgvector page are its page id (0xFF90, bytes 90 ff), block 58 has them and block 59,
+-- the first block of the cover, does not. The relation ends with the ledger head.
+CREATE EXTENSION IF NOT EXISTS pageinspect;
 SELECT pg_relation_size('hp_hnsw') < 501 * 8192 AS packed_smaller_than_unpacked,
-       pg_relation_size('hp_hnsw') = 59 * 8192   AS packed_size_matches_k9;
+       substr(get_raw_page('hp_hnsw', 58), 8191, 2) = '\x90ff' AS last_graph_block_is_58,
+       substr(get_raw_page('hp_hnsw', 59), 8191, 2) <> '\x90ff' AS block_59_is_not_graph,
+       pg_relation_size('hp_hnsw') = ((pg_cuvs_hnsw_cover_status('hp_hnsw')->>'ledger_head')::int + 1) * 8192 AS ends_with_the_ledger_head;
 
 -- ── Case 2: full correctness sweep ──
 -- Every row must be its own exact-match (distance 0) nearest neighbor,
@@ -139,8 +145,10 @@ CREATE INDEX hp_hnsw2 ON hp_test2 USING pg_cuvs_hnsw
     (embedding vector_l2_ops) WITH (source = 'hp_cagra2', mode = 'nsw');
 SET client_min_messages = 'notice';
 
--- 504/9 = 56 exactly for level-0 pairs only; with the upper layers 1 (meta) + 58 pages.
-SELECT pg_relation_size('hp_hnsw2') = 59 * 8192 AS exact_multiple_size_matches;
+-- 504/9 = 56 exactly for level-0 pairs only; with the upper layers 1 (meta) + 58 pages, plus the pages of the cover (see Case 1).
+SELECT substr(get_raw_page('hp_hnsw2', 58), 8191, 2) = '\x90ff' AS last_graph_block_is_58,
+       substr(get_raw_page('hp_hnsw2', 59), 8191, 2) <> '\x90ff' AS block_59_is_not_graph,
+       pg_relation_size('hp_hnsw2') = ((pg_cuvs_hnsw_cover_status('hp_hnsw2')->>'ledger_head')::int + 1) * 8192 AS ends_with_the_ledger_head;
 
 SET enable_cuvs = off; SET enable_seqscan = off;
 SELECT count(*) AS mismatches_exact_multiple
@@ -167,3 +175,4 @@ ORDER BY embedding <-> (SELECT embedding FROM hp_test2 WHERE id = 505) LIMIT 1;
 RESET enable_cuvs; RESET enable_seqscan;
 
 DROP TABLE hp_test2 CASCADE;
+DROP EXTENSION pageinspect;

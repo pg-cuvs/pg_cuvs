@@ -1512,7 +1512,39 @@ clusters:20000x8/50/0.05 --m 32 --ef-construction 64 --writers 4 --switch`, diff
 The tool's six runs gave the product 0, 173, 0, 278, 0, 0 and 22, 173, 24, 278, 62, 0, and pgvector alone 2 to 136 and 14 to 296; the review's six gave the product 0 to 11 and 0 to 50, and pgvector alone 0 to 62 and 0 to 62
 (0 in four of its six runs at 15,000 inserts, the tool's runs in none). The two measurements put the runs in different places of these ranges and why is not established, so no end of a range is a bound. In both, the ranges of
 the two kinds overlap, and the measurements do not tell the two kinds apart: they neither show that the product cuts off as few rows as pgvector alone nor that it cuts off more. An independent review counted per recertification window on the product, same table shape and m, and found 14 cut-off rows in 15,443 inserts and 47 in 44,123 (about 0.1 percent of the inserted rows).
-Not measured: graphs converted from a GPU-built CAGRA graph over existing rows, other data shapes.
+
+**Graphs built on the GPU, what the ledger costs, and strongly clustered tables (measured 2026-11-20; one A100-SXM4-80GB, the patched SDK 0008
+with `build_algo` left on `auto`, which took the `resident_ivf_pq` route; PostgreSQL 16.16, pgvector 0.8.7; one client, simple protocol, three
+runs of 8 s, median; "pgvector scan" is pgvector's own scan over the same index pages, with the access method switched for the measurement).**
+
+| Table (768 dimensions) | Rows the graph did not reach at the build (`base_unreached`) | Single search of the certified index | pgvector scan | recall@10 (certified search; the pgvector scan where given) |
+|---|---|---|---|---|
+| wiki_all, 100,000 rows | 0 (one weak component) | 1.478 ms | 1.491 ms | 1.0 |
+| wiki_all, 999,000 rows (`ef_construction` 64 and 128) | 0 | 2.241 and 2.214 ms | 2.171 and 2.166 ms | 1.0 |
+| 100,000 random vectors | 0 | 3.059 ms | 3.068 ms | 0.335 (an approximate graph over random 768-dimensional vectors) |
+| 100,000 vectors in 50 tight clusters | 98,000 (50 weak components) | 275.8 ms | 1.08 ms | 1.0 (pgvector scan 0.033) |
+
+On the natural and the random table the graph the GPU builds reaches every row, the ledger is empty, and the certified search equals the pgvector scan
+within the measurement limit (3 percent). On the clustered table the converted graph falls into one component per cluster and a search from the entry
+point sees only its own cluster: the pgvector scan returns 3.3 percent of the true top ten, the certified search returns all of them because the ledger
+holds the 98,000 unreached rows, and pays for that with 2.8 microseconds per key. No setting of `pg_cuvs_hnsw` lowers `base_unreached` today:
+`guarantee_connectivity` of the SDK's CAGRA build (the MST optimization) ended the daemon in `cudaErrorIllegalAddress` on every table listed here.
+
+The cost of a key is the same wherever it comes from. For 768-dimensional vectors, which are stored out of line, ranking one key means a heap page, the TOAST
+chunk and the TOAST index (4.3 buffers per key): 2.5 to 2.9 microseconds, so a certified search takes about `pgvector time + 2.9 microseconds x ledger_keys`.
+Measured on the 100,000-row wiki_all index after inserts that were not recertified: 100 inserted rows 1.87 ms (pgvector 1.41), 1,000 rows 4.25 ms (1.39),
+5,000 rows 15.1 ms (1.32); on the 999,000-row index 1,000 rows 4.95 ms (1.98) and 10,000 rows 32.0 ms (1.93). A recertification empties the ledger of the
+rows that are reachable (after 10,000 inserted rows the keys were 0 and the search equalled the pgvector scan again) and costs 0.18 to 0.21 s at 100,000 rows
+and 1.96 to 1.99 s at 999,000 rows, almost all of it the walk, with the cover lock held exclusively for 6 to 620 microseconds in each of two short phases (the longer ones with 9,000 or more keys to carry over).
+
+To see where an index stands: `pg_cuvs_hnsw_cover_status(index)` gives `base_unreached` (the rows the graph did not reach when the guarantee was last
+established), `ledger_keys` and `keys_since_certification`, and with `cuvs.hnsw_connectivity_check = on` during the build
+`pg_cuvs_hnsw_connectivity_status(index)` records `unreachable` and the number of weak components (`wcc_l0`). `base_unreached` divided by the row count is the share of rows
+that a search of this index has to rank exactly every time. The new rows of a table (rows the table did not hold before, 100,001 to 200,000 of
+wiki_all inserted into the 100,000-row index) were all reachable after the inserts (a recertification counted 0 unreached rows at 110,000, 120,000 and 200,000 rows).
+Copies of existing rows are not a measurement of that: pgvector attaches the heap TID of an exact duplicate to the existing element and builds no new one.
+
+Not measured: other data shapes, a GPU graph that was built with a different `graph_degree` or `m`, inserts from several sessions at once.
 
 **What is not guaranteed.** Recall of the rows the graph does reach is still that of the finite-ef approximate search
 (the merged candidates are ranked exactly, but the graph supplies only part of them). "Reached" means that a path of neighbour slots of any layer leads to the
