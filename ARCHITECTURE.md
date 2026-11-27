@@ -264,9 +264,18 @@ in `pg_stat_gpu_fallback`; daemon replies are recorded in `pg_stat_gpu_search`.
   choose CPU paths. Deploy both binaries together; HNSW op 23 additionally checks
   its own payload v6 and returns a stored build-policy receipt with the ACE or
   NN-descent readback of the route it used.
-- **Interruptibility (Phase 3S):** the backend's reply wait is a `poll()` loop with a wait
+- **Search interruptibility (Phase 3S):** the backend's reply wait is a `poll()` loop with a wait
   callback, so `statement_timeout` / query-cancel break a long GPU search (~sub-second) instead
   of blocking indefinitely. The daemon ignores `SIGPIPE` to survive mid-reply client disconnect.
+- **BUILD replies:** CAGRA (including page format and parallel builds), flat and IVF-PQ
+  keep their 600-second connect and send budgets. After sending the request, the backend
+  waits for the full reply without a fixed receive deadline, but polls the PostgreSQL
+  interrupt flags. A user cancel, statement timeout or backend termination closes the
+  socket and raises the interrupt, so transaction rollback releases the DDL locks. A
+  connected but silent daemon is therefore a deliberate wait until cancellation, not a
+  new timeout policy. Before publishing a build, the daemon checks that the requesting
+  client is still connected; a disconnected owner's result is discarded rather than
+  published late. EOF or a socket read error still fails the BUILD.
 - **Connect (#224):** each request opens its own connection. A `connect()` that waits for
   room in the daemon's listen backlog waits in 250 ms slices and is retried after a signal
   or an expired slice, within the call's timeout (30 s for SEARCH). The wait callback is

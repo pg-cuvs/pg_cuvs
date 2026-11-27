@@ -9527,6 +9527,42 @@ restore_cagra_file(const char *path, const char *backup, bool had_prior)
  * index; on a shape mismatch or an error, or when PG_CUVS_DIRECT_CAGRA_VERIFY=1
  * does not confirm the file, it deletes it and serializes with
  * cuvs_cagra_serialize as before. On failure the temp file is deleted. */
+/* A BUILD owner that cancelled or disappeared must not receive a late
+ * publication. The backend never writes after its request, so readable/EOF,
+ * HUP or ERR means the owner is gone; no input means it is still waiting. */
+static int
+build_owner_connected(int fd)
+{
+    for (;;)
+    {
+        struct pollfd pfd = {.fd = fd, .events = POLLIN, .revents = 0};
+        int pr = poll(&pfd, 1, 0);
+        if (pr < 0)
+        {
+            if (errno == EINTR)
+                continue;
+            return 0;
+        }
+        if (pr == 0)
+            return 1;
+        if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL))
+            return 0;
+        if (pfd.revents & POLLIN)
+        {
+            char byte;
+            ssize_t n = recv(fd, &byte, 1, MSG_PEEK | MSG_DONTWAIT);
+            if (n == 0)
+                return 0;
+            if (n > 0)
+                return 1;
+            if (errno == EINTR)
+                continue;
+            return errno == EAGAIN || errno == EWOULDBLOCK;
+        }
+        return 1;
+    }
+}
+
 static void
 finish_build_commit(int client_fd, const CuvsCmdFrame *cmd, const char *save_dir,
                     const ExtraSearchRoot *root,
@@ -9611,6 +9647,21 @@ finish_build_commit(int client_fd, const CuvsCmdFrame *cmd, const char *save_dir
         goto persist_fail;
     }
     LOG_DEBUG("[handle_build] cagra.tmp written + fsynced\n");
+
+#ifdef CUVS_TEST_HOOKS
+    {
+        const char *delay = getenv("CUVS_FAULT_BUILD_PUBLISH_DELAY_MS");
+        if (delay)
+            usleep((useconds_t)strtoul(delay, NULL, 10) * 1000u);
+    }
+#endif
+
+    if (!build_owner_connected(client_fd))
+    {
+        persist_error = "BUILD owner disconnected before publication";
+        LOG_WARN("[handle_build] %u/%u: %s\n", cmd->db_oid, cmd->index_oid, persist_error);
+        goto persist_fail;
+    }
 
     /* Retain the prior files for rollback without copying the corpus. */
 #ifdef CUVS_TEST_HOOKS
@@ -12320,6 +12371,16 @@ handle_build_flat(int client_fd, const CuvsCmdFrame *cmd)
         return;
     }
 
+    if (!build_owner_connected(client_fd))
+    {
+        LOG_WARN("[handle_build_flat] %u/%u: BUILD owner disconnected before publication\n",
+                 cmd->db_oid, cmd->index_oid);
+        unlink(vecs_tmp); unlink(tids_tmp);
+        free(new_tids);
+        send_error_code(client_fd, CUVS_STATUS_ERROR, "BUILD owner disconnected before publication");
+        return;
+    }
+
     /* Commit: rename .vectors then .tids. On a failure, unlink both so a partial
      * (e.g. .vectors but no .tids) never registers — load_index needs .tids. */
     if (rename(vecs_tmp, vecs_final) != 0)
@@ -12605,6 +12666,13 @@ handle_build_ivfpq(int client_fd, const CuvsCmdFrame *cmd)
     if (cuvs_ivfpq_serialize(new_handle, ivfpq_tmp, target_gpu) != 0)
     {
         LOG_ERROR("[handle_build_ivfpq] cuvs_ivfpq_serialize FAILED\n");
+        goto persist_fail;
+    }
+
+    if (!build_owner_connected(client_fd))
+    {
+        LOG_WARN("[handle_build_ivfpq] %u/%u: BUILD owner disconnected before publication\n",
+                 cmd->db_oid, cmd->index_oid);
         goto persist_fail;
     }
 

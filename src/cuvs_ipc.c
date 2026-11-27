@@ -314,6 +314,27 @@ uds_connect_ex(const char *socket_path, int recv_timeout_sec)
     return uds_connect_wait(socket_path, recv_timeout_sec, NULL);
 }
 
+/* BUILD retains the connect and send budgets. After sending the request,
+ * keep waiting for the daemon's terminal reply with the PostgreSQL locks
+ * held. Clear the receive timeout before sending any request bytes. */
+static int
+uds_connect_build(const char *socket_path)
+{
+    const struct timeval no_timeout = {0};
+    int fd = uds_connect_ex(socket_path, 600);
+
+    if (fd < 0)
+        return -1;
+    if (setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &no_timeout, sizeof(no_timeout)) != 0)
+    {
+        int err = errno;
+        close(fd);
+        errno = err;
+        return -1;
+    }
+    return fd;
+}
+
 static int
 uds_connect(const char *socket_path)
 {
@@ -739,7 +760,7 @@ recv_all_interruptible_with_deadline(int fd, void *buf, size_t len, int timeout_
             if (limit_partial_reads)
                 continue;   /* the next iteration checks the precise deadline */
             clock_gettime(CLOCK_MONOTONIC, &now);
-            if ((now.tv_sec - start.tv_sec) >= timeout_sec)
+            if (timeout_sec > 0 && (now.tv_sec - start.tv_sec) >= timeout_sec)
                 return -1;      /* daemon never replied within the budget */
             continue;
         }
@@ -2295,7 +2316,7 @@ cuvs_ipc_build(
     LOG_DEBUG("[cuvs_ipc_build] tier=%d shm_key=%s pass_fd=%d socket=%s n_vecs=%lld dim=%d\n",
         (int)corpus->kind, shm_key, pass_fd, socket_path, (long long)n_vecs, dim);
 
-    sock = uds_connect_ex(socket_path, 600);  /* BUILD can take minutes */
+    sock = uds_connect_build(socket_path);
     if (sock < 0) {
         LOG_ERROR("[cuvs_ipc_build] uds_connect FAILED errno=%d (%s)\n",
                 errno, strerror(errno));
@@ -2332,14 +2353,20 @@ cuvs_ipc_build(
     if (cuvs_fd_send(sock, pass_fd, dir_buf, sizeof(dir_buf)) < 0)
         goto cleanup;
 
-    if (recv_reply(sock, &hdr) < 0)
-        goto cleanup;
+    {
+        int wr = recv_reply_interruptible(sock, &hdr, 0);
+        if (wr == 1) { rc = CUVS_STATUS_CANCELED; goto cleanup; }
+        if (wr < 0)  goto cleanup;
+    }
 
     rc = (int)hdr.status;
     /* A zero nonce means BUILD accepted page storage without a searchable graph. */
-    if (page_build && rc == CUVS_STATUS_OK &&
-        recv_all(sock, graph_nonce_out, sizeof(*graph_nonce_out)) < 0)
-        rc = CUVS_STATUS_ERROR;
+    if (page_build && rc == CUVS_STATUS_OK)
+    {
+        int nr = recv_all_interruptible(sock, graph_nonce_out, sizeof(*graph_nonce_out), 0);
+        if (nr != 0)
+            rc = nr == 1 ? CUVS_STATUS_CANCELED : CUVS_STATUS_ERROR;
+    }
 
 cleanup:
     if (sock >= 0)
@@ -2410,7 +2437,7 @@ cuvs_ipc_build_flat(
     LOG_DEBUG("[cuvs_ipc_build_flat] tier=%d shm_key=%s pass_fd=%d socket=%s n_vecs=%lld dim=%d\n",
         (int)corpus->kind, shm_key, pass_fd, socket_path, (long long)n_vecs, dim);
 
-    sock = uds_connect_ex(socket_path, 600);  /* BUILD can take a while */
+    sock = uds_connect_build(socket_path);
     if (sock < 0) {
         LOG_ERROR("[cuvs_ipc_build_flat] uds_connect FAILED errno=%d (%s)\n",
                 errno, strerror(errno));
@@ -2440,8 +2467,11 @@ cuvs_ipc_build_flat(
     if (cuvs_fd_send(sock, pass_fd, dir_buf, sizeof(dir_buf)) < 0)
         goto cleanup;
 
-    if (recv_reply(sock, &hdr) < 0)
-        goto cleanup;
+    {
+        int wr = recv_reply_interruptible(sock, &hdr, 0);
+        if (wr == 1) { rc = CUVS_STATUS_CANCELED; goto cleanup; }
+        if (wr < 0)  goto cleanup;
+    }
 
     rc = (int)hdr.status;
 
@@ -2496,7 +2526,7 @@ cuvs_ipc_build_multi(
         return CUVS_STATUS_ERROR;
     }
 
-    sock = uds_connect_ex(socket_path, 600);  /* BUILD can take minutes */
+    sock = uds_connect_build(socket_path);
     if (sock < 0) {
         LOG_ERROR("[cuvs_ipc_build_multi] uds_connect FAILED errno=%d (%s)\n",
                 errno, strerror(errno));
@@ -2536,8 +2566,11 @@ cuvs_ipc_build_multi(
     if (send_all(sock, partials, (size_t)n_partials * sizeof(CuvsPartialDesc)) < 0)
         goto cleanup;
 
-    if (recv_reply(sock, &hdr) < 0)
-        goto cleanup;
+    {
+        int wr = recv_reply_interruptible(sock, &hdr, 0);
+        if (wr == 1) { rc = CUVS_STATUS_CANCELED; goto cleanup; }
+        if (wr < 0)  goto cleanup;
+    }
 
     rc = (int)hdr.status;
 
@@ -3350,7 +3383,7 @@ cuvs_ipc_build_ivfpq(
         goto cleanup;
     }
 
-    sock = uds_connect_ex(socket_path, 600);  /* IVF-PQ build can take minutes */
+    sock = uds_connect_build(socket_path);
     if (sock < 0) {
         LOG_ERROR("[cuvs_ipc_build_ivfpq] uds_connect FAILED errno=%d (%s)\n",
                   errno, strerror(errno));
@@ -3380,8 +3413,11 @@ cuvs_ipc_build_ivfpq(
     if (cuvs_fd_send(sock, -1, dir_buf, sizeof(dir_buf)) < 0)
         goto cleanup;
 
-    if (recv_reply(sock, &hdr) < 0)
-        goto cleanup;
+    {
+        int wr = recv_reply_interruptible(sock, &hdr, 0);
+        if (wr == 1) { rc = CUVS_STATUS_CANCELED; goto cleanup; }
+        if (wr < 0)  goto cleanup;
+    }
 
     rc = (int)hdr.status;
 

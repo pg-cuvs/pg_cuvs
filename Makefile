@@ -726,6 +726,20 @@ test-admission-ipc: test/unit/test_admission_ipc.c src/cuvs_ipc.c src/cuvs_ipc.h
 		-lpthread -lm $(TEST_RT_LIB)
 	./$@
 
+# Linux UDS fixture with a shortened receive timeout injected at setsockopt().
+ifeq ($(shell uname -s),Linux)
+test-unit: test-build-terminal-wait
+endif
+test-build-terminal-wait: test/unit/test_build_terminal_wait.c src/cuvs_ipc.c \
+                          src/cuvs_util.c src/cuvs_build_corpus.c $(wildcard src/*.h)
+	$(CC) -std=gnu11 -Wall -Wextra -Werror $(ADMISSION_TEST_SAN) -Wl,--wrap=setsockopt \
+		-I src -o $@ test/unit/test_build_terminal_wait.c src/cuvs_ipc.c \
+		src/cuvs_util.c src/cuvs_build_corpus.c -lpthread -lm $(TEST_RT_LIB)
+	./$@
+
+EXTRA_CLEAN += test-build-terminal-wait
+.PHONY: test-build-terminal-wait
+
 test-unit: test-extra-search-ipc
 test-extra-search-ipc: test/unit/test_extra_search_ipc.c src/cuvs_ipc.c src/cuvs_ipc.h \
                        src/cuvs_util.c src/cuvs_build_corpus.c $(wildcard src/*.h)
